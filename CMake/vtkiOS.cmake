@@ -96,6 +96,16 @@ if(BUILD_TESTING)
   message(WARNING "Tests not supported for the iOS framework. BUILD_TESTING will be ignored.")
 endif()
 
+# Backward-compatibility aliases for older iOS configure arguments.
+if (Module_vtkDICOM)
+  set(VTK_MODULE_ENABLE_VTK_vtkDICOM ON CACHE BOOL
+    "Include remote vtkDICOM module" FORCE)
+endif()
+if (VTK_MODULE_ENABLE_VTK_DICOM)
+  set(VTK_MODULE_ENABLE_VTK_vtkDICOM ON CACHE BOOL
+    "Include remote vtkDICOM module" FORCE)
+endif()
+
 # expose some module options
 set(module_options
   FiltersModeling
@@ -176,6 +186,24 @@ set(ios_cmake_flags
   -DVTK_MODULE_ENABLE_VTK_RenderingLOD:STRING=${enable_option_RenderingLOD}
   -DVTK_MODULE_ENABLE_VTK_vtkDICOM:STRING=${enable_option_vtkDICOM}
 )
+
+# Optional passthrough for vtk-dicom-related settings.
+foreach (_vtkdicom_var IN ITEMS
+    BUILD_DICOM_PROGRAMS
+    USE_DCMTK
+    USE_GDCM
+    USE_ITK_GDCM
+    VTK_MODULE_ENABLE_VTK_vtkIOSQL)
+  if (DEFINED ${_vtkdicom_var})
+    if (_vtkdicom_var MATCHES "^VTK_MODULE_ENABLE_")
+      list(APPEND ios_cmake_flags
+        "-D${_vtkdicom_var}:STRING=${${_vtkdicom_var}}")
+    else ()
+      list(APPEND ios_cmake_flags
+        "-D${_vtkdicom_var}:BOOL=${${_vtkdicom_var}}")
+    endif ()
+  endif ()
+endforeach ()
 
 macro(crosscompile target toolchain_file)
   ExternalProject_Add(
