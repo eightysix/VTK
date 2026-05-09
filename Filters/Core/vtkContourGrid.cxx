@@ -169,7 +169,7 @@ void vtkContourGridExecute(vtkContourGrid* self, vtkDataSet* input, vtkPolyData*
     newPts->SetDataType(VTK_DOUBLE);
   }
 
-  newPts->Allocate(estimatedSize, estimatedSize);
+  newPts->Reserve(estimatedSize);
   newVerts = vtkCellArray::New();
   newVerts->AllocateEstimate(estimatedSize, 1);
   newLines = vtkCellArray::New();
@@ -177,7 +177,7 @@ void vtkContourGridExecute(vtkContourGrid* self, vtkDataSet* input, vtkPolyData*
   newPolys = vtkCellArray::New();
   newPolys->AllocateEstimate(estimatedSize, 4);
   cellScalars->SetNumberOfComponents(inScalars->GetNumberOfComponents());
-  cellScalars->Allocate(VTK_CELL_SIZE * inScalars->GetNumberOfComponents());
+  cellScalars->ReserveTuples(VTK_CELL_SIZE);
 
   // locator used to merge potentially duplicate points
   locator->InitPointInsertion(newPts, input->GetBounds(), input->GetNumberOfPoints());
@@ -191,8 +191,8 @@ void vtkContourGridExecute(vtkContourGrid* self, vtkDataSet* input, vtkPolyData*
   outPd->InterpolateAllocate(inPd, estimatedSize, estimatedSize);
   outCd->CopyAllocate(inCd, estimatedSize, estimatedSize);
 
-  vtkContourHelper helper(locator, newVerts, newLines, newPolys, inPd, inCd, outPd, outCd,
-    estimatedSize, generateTriangles);
+  vtkContourHelper helper(
+    locator, newVerts, newLines, newPolys, inPd, inCd, outPd, outCd, generateTriangles);
   // If enabled, build a scalar tree to accelerate search
   //
   if (!useScalarTree)

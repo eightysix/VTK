@@ -132,11 +132,11 @@ class TestWedge(Testing.vtkTest, CellTestBase):
     def setUp(self):
         self.Cell = GenerateCell(VTK_WEDGE,
             [ (-1.0, -1.0, -1.0),
-              ( 1.0, -1.0, -1.0),
               ( 0.0, -1.0,  1.0),
+              (1.0, -1.0, -1.0),
               (-1.0,  1.0, -1.0),
-              ( 1.0,  1.0, -1.0),
-              ( 0.0,  1.0,  0.0) ])
+              ( 0.0,  1.0,  0.0),
+              (1.0, 1.0, -1.0)])
 
 class TestPyramid(Testing.vtkTest, CellTestBase):
     def setUp(self):

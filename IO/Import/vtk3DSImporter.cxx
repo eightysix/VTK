@@ -143,6 +143,32 @@ std::string vtk3DSImporter::GetOutputsDescription()
   return ss.str();
 }
 
+//------------------------------------------------------------------------------
+bool vtk3DSImporter::CanReadFile(const std::string& filename)
+{
+  vtkNew<vtkFileResourceStream> stream;
+  if (!stream->Open(filename.c_str()))
+  {
+    return false;
+  }
+  return vtk3DSImporter::CanReadFile(stream);
+}
+
+//------------------------------------------------------------------------------
+bool vtk3DSImporter::CanReadFile(vtkResourceStream* stream)
+{
+  if (!stream)
+  {
+    return false;
+  }
+
+  stream->Seek(0, vtkResourceStream::SeekDirection::Begin);
+  vtk3DSChunk chunk;
+  start_chunk(stream, &chunk);
+  return chunk.tag == 0x4D4D ? true : false;
+}
+
+//------------------------------------------------------------------------------
 int vtk3DSImporter::Read3DS()
 {
   // Stream is higher priority than filename.
@@ -159,6 +185,7 @@ int vtk3DSImporter::Read3DS()
 
     this->TempStream = fileStream;
   }
+  this->TempStream->Seek(0, vtkResourceStream::SeekDirection::Begin);
 
   vtk3DSMatProp* aMaterial;
 
@@ -176,6 +203,7 @@ int vtk3DSImporter::Read3DS()
   return 1;
 }
 
+//------------------------------------------------------------------------------
 void vtk3DSImporter::ImportActors(vtkRenderer* renderer)
 {
   vtk3DSMatProp* material;
@@ -187,6 +215,7 @@ void vtk3DSImporter::ImportActors(vtkRenderer* renderer)
   vtkActor* actor;
 
   this->ActorCollection->RemoveAllItems();
+  this->SceneHierarchy = vtkSmartPointer<vtkDataAssembly>::New();
 
   // walk the list of meshes, creating actors
   for (mesh = this->MeshList; mesh != nullptr; mesh = (vtk3DSMesh*)mesh->next)
@@ -211,6 +240,15 @@ void vtk3DSImporter::ImportActors(vtkRenderer* renderer)
     else
     {
       polyStripper->SetInputData(polyData);
+    }
+
+    int nodeid = this->SceneHierarchy->AddNode("mesh");
+    this->SceneHierarchy->SetAttribute(
+      nodeid, "flat_actor_id", this->ActorCollection->GetNumberOfItems());
+
+    if (mesh->name[0] != '\0')
+    {
+      this->SceneHierarchy->SetAttribute(nodeid, "label", mesh->name);
     }
 
     polyMapper->SetInputConnection(polyStripper->GetOutputPort());
@@ -244,7 +282,7 @@ vtkPolyData* vtk3DSImporter::GeneratePolyData(vtk3DSMesh* mesh)
   }
 
   mesh->aPoints = vertices = vtkPoints::New();
-  vertices->Allocate(mesh->vertices);
+  vertices->Reserve(mesh->vertices);
   for (i = 0; i < mesh->vertices; i++)
   {
     vertices->InsertPoint(i, (float*)mesh->vertex[i]);

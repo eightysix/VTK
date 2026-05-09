@@ -14,12 +14,13 @@
 #include "vtkNew.h" // for iavr
 #include "vtkOpenGLCamera.h"
 #include "vtkRenderingVRModule.h" // For export macro
+#include "vtkWrappingHints.h"     // For VTK_MARSHALAUTO
 
 VTK_ABI_NAMESPACE_BEGIN
 class vtkMatrix4x4;
 class vtkVRRenderWindow;
 
-class VTKRENDERINGVR_EXPORT vtkVRCamera : public vtkOpenGLCamera
+class VTKRENDERINGVR_EXPORT VTK_MARSHALAUTO vtkVRCamera : public vtkOpenGLCamera
 {
 public:
   vtkTypeMacro(vtkVRCamera, vtkOpenGLCamera);

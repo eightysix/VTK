@@ -93,7 +93,7 @@ public:
    * This is so ids are unified between vtkCell and vtkPoints, and so vtkCell ids
    * can be used as inputs in algorithms such as vtkPolygon::ComputeNormal.
    */
-  const vtkIdType* GetEdgeArray(vtkIdType edgeId);
+  static const vtkIdType* GetEdgeArray(vtkIdType edgeId);
 
   /**
    * Given a line defined by two points p1 and p2, determine whether it intersects the triangle.
@@ -215,9 +215,9 @@ public:
 
 protected:
   vtkTriangle();
-  ~vtkTriangle() override;
+  ~vtkTriangle() override = default;
 
-  vtkLine* Line;
+  vtkSmartPointer<vtkLine> Line;
 
 private:
   vtkTriangle(const vtkTriangle&) = delete;

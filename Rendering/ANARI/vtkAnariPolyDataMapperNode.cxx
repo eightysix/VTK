@@ -2017,36 +2017,26 @@ void vtkAnariPolyDataMapperNodeInternals::SetAttributeArrays(
     size_t numAttribValues = attribArray.Array->GetNumberOfTuples();
     size_t numAttribComponents = attribArray.Array->GetNumberOfComponents();
 
-    bool convertDoubleToFloat =
-      attribArray.Array->GetDataType() == VTK_DOUBLE && this->DoubleToFloatEnabled;
+    const int inputDataType = attribArray.Array->GetDataType();
+    bool convertDoubleToFloat = inputDataType == VTK_DOUBLE && this->DoubleToFloatEnabled;
+    const int outputDataType = convertDoubleToFloat ? VTK_FLOAT : inputDataType;
 
     ANARIDataType anariType = ToAnariType(attribArray.Array, convertDoubleToFloat);
     size_t destEltSize = anari::sizeOf(anariType);
     size_t srcEltSize = attribArray.Array->GetDataTypeSize() * numAttribComponents;
 
-    if (anari::sizeOf(anariType) > 0 &&
+    if (destEltSize > 0 &&
       srcEltSize == (destEltSize * (convertDoubleToFloat ? 2 : 1))) // Filter out unusable types
     {
       // Write the data (anariTypeSize == GetDataTypeSize * GetNumberOfComponents)
       anari::Array1D anariArray = anari::newArray1D(this->AnariDevice, anariType, numAttribValues);
 
       void* anariDest = anariMapArray(this->AnariDevice, anariArray);
-      void* vtkSrc = attribArray.Array->WriteVoidPointer(0, numAttribValues);
 
-      if (convertDoubleToFloat)
-      {
-        for (size_t idx = 0; idx < numAttribValues * numAttribComponents; ++idx)
-        {
-          static_cast<float*>(anariDest)[idx] = static_cast<double*>(vtkSrc)[idx];
-        }
-      }
-      else
-      {
-        // Copy: (GetDataTypeSize * GetNumberOfComponents) * GetNumberOfTuples == GetDataTypeSize *
-        // GetDataSize
-        std::memcpy(anariDest, vtkSrc,
-          attribArray.Array->GetDataSize() * attribArray.Array->GetDataTypeSize());
-      }
+      auto destArray = vtk::TakeSmartPointer(vtkDataArray::CreateDataArray(outputDataType));
+      destArray->SetNumberOfComponents(numAttribComponents);
+      destArray->SetVoidArray(anariDest, attribArray.Array->GetDataSize(), /*save*/ true);
+      destArray->DeepCopy(attribArray.Array);
 
       anariUnmapArray(this->AnariDevice, anariArray);
 

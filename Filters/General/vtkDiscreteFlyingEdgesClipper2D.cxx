@@ -1473,7 +1473,7 @@ void vtkDiscreteClipperAlgorithm<TArray>::ContourImage(vtkDiscreteFlyingEdgesCli
   vtkIdType totalPts = numOutXPts + numOutYPts;
   if (totalPts > 0)
   {
-    newPts->GetData()->WriteVoidPointer(0, 3 * totalPts);
+    newPts->GetData()->SetNumberOfTuples(totalPts);
     algo.NewPoints = vtkAOSDataArrayTemplate<float>::FastDownCast(newPts->GetData())->GetPointer(0);
     newPolys->ResizeExact(numOutPolys, outConnLen - numOutPolys);
     newPolys->Dispatch(FinalizePolysImpl{}, numOutPolys, outConnLen - numOutPolys);
@@ -1481,7 +1481,7 @@ void vtkDiscreteClipperAlgorithm<TArray>::ContourImage(vtkDiscreteFlyingEdgesCli
     if (newScalars)
     {
       algo.HasNewScalars = true;
-      newScalars->WriteVoidPointer(0, numOutPolys);
+      newScalars->SetNumberOfValues(numOutPolys);
       algo.NewScalars = vtk::DataArrayValueRange<1>(TArray::FastDownCast(newScalars)).begin();
     }
 

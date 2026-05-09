@@ -4,6 +4,7 @@ vtk_add_test_cxx(vtkCommonExecutionModelCxxTests tests
   TestAbortExecuteFromOtherThread.cxx
   TestAbortSMPFilter.cxx
   TestCopyAttributeData.cxx
+  TestErrorCode.cxx
   TestForEach.cxx
   TestTemporalHelpers.cxx
   TestImageDataToStructuredGrid.cxx
@@ -13,6 +14,7 @@ vtk_add_test_cxx(vtkCommonExecutionModelCxxTests tests
   TestTemporalSupport.cxx
   TestThreadedImageAlgorithmSplitExtent.cxx
   TestTrivialConsumer.cxx
+  TestUpdate.cxx
   UnitTestSimpleScalarTree.cxx
   )
 

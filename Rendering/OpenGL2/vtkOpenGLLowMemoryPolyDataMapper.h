@@ -31,6 +31,7 @@ class vtkOpenGLLowMemoryCellTypeAgent;
 class vtkOpenGLLowMemoryVerticesAgent;
 class vtkOpenGLLowMemoryLinesAgent;
 class vtkOpenGLLowMemoryPolygonsAgent;
+class vtkOverrideAttribute;
 
 class VTKRENDERINGOPENGL2_EXPORT VTK_MARSHALAUTO vtkOpenGLLowMemoryPolyDataMapper
   : public vtkPolyDataMapper
@@ -40,6 +41,8 @@ class VTKRENDERINGOPENGL2_EXPORT VTK_MARSHALAUTO vtkOpenGLLowMemoryPolyDataMappe
 {
 public:
   static vtkOpenGLLowMemoryPolyDataMapper* New();
+  VTK_NEWINSTANCE
+  static vtkOverrideAttribute* CreateOverrideAttributes();
   vtkTypeMacro(vtkOpenGLLowMemoryPolyDataMapper, vtkPolyDataMapper);
   void PrintSelf(ostream& os, vtkIndent indent) override;
 
@@ -54,6 +57,12 @@ public:
    * polydata.
    */
   MapperHashType GenerateHash(vtkPolyData* polydata) override;
+
+  /**
+   * Returns the maximum number of triangles renderable based on OpenGL limits.
+   * Returns the maximum buffer object size as the limit of triangles that can be rendered.
+   */
+  vtkIdType GetMaximumNumberOfTriangles(vtkRenderer* ren) override;
 
   vtkPolyData* CurrentInput = nullptr;
   void RenderPiece(vtkRenderer* renderer, vtkActor* actor) override;
@@ -325,5 +334,7 @@ private:
   vtkNew<vtkMatrix4x4> TempMatrix4;
 };
 
+#define vtkOpenGLLowMemoryPolyDataMapper_OVERRIDE_ATTRIBUTES                                       \
+  vtkOpenGLLowMemoryPolyDataMapper::CreateOverrideAttributes()
 VTK_ABI_NAMESPACE_END
 #endif // vtkOpenGLLowMemoryPolyDataMapper_h

@@ -89,7 +89,11 @@ public:
   /// If the data in the ArrayHandle has a basic layout, this does a shallow copy.
   /// Otherwise, it does a deep copy.
   void* GetVoidPointer(vtkIdType valueIdx) override;
+  VTK_DEPRECATED_IN_9_7_0("Use vtkmDataArray::WritePointer(valueIdx, numValues) or "
+                          "vtkAbstractArray::SetNumberOf[Values/Tuples]() instead")
   void* WriteVoidPointer(vtkIdType valueIdx, vtkIdType numValues) override;
+  T* GetPointer(vtkIdType valueIdx);
+  T* WritePointer(vtkIdType valueIdx, vtkIdType numValues);
   vtkDataArray::MemorySpace GetMemorySpace() override;
   void* GetDeviceVoidPointer(vtkIdType valueIdx) override;
   ///@}

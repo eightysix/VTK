@@ -818,14 +818,14 @@ void vtkDiscreteFlyingEdges2DAlgorithm<TArray>::ContourImage(vtkDiscreteFlyingEd
     vtkIdType totalPts = numOutXPts + numOutYPts;
     if (totalPts > 0)
     {
-      newPts->GetData()->WriteVoidPointer(0, 3 * totalPts);
+      newPts->GetData()->SetNumberOfTuples(totalPts);
       algo.NewPoints =
         vtkAOSDataArrayTemplate<float>::FastDownCast(newPts->GetData())->GetPointer(0);
       newLines->ResizeExact(numOutLines, 2 * numOutLines);
       algo.NewLines = newLines;
       if (newScalars)
       {
-        newScalars->WriteVoidPointer(0, numOutXPts + numOutYPts);
+        newScalars->SetNumberOfValues(numOutXPts + numOutYPts);
         algo.NewScalars = vtk::DataArrayValueRange<1>(TArray::FastDownCast(newScalars)).begin();
         T TValue = static_cast<T>(value);
         std::fill_n(algo.NewScalars, totalPts, TValue);

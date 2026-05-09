@@ -16,6 +16,7 @@
 #include "vtkCellData.h"
 #include "vtkDataArraySelection.h"
 #include "vtkDoubleArray.h"
+#include "vtkFLUENTCFFInternal.h"
 #include "vtkFieldData.h"
 #include "vtkHexahedron.h"
 #include "vtkIdList.h"
@@ -602,7 +603,7 @@ void vtkFLUENTCFFReader::GetNodesGlobal()
   CHECK_HDF(H5Aread(attr, H5T_NATIVE_UINT64, &lastIndex));
   CHECK_HDF(H5Aclose(attr));
   CHECK_HDF(H5Gclose(group));
-  this->Points->Allocate(lastIndex);
+  this->Points->Reserve(lastIndex);
 }
 
 //------------------------------------------------------------------------------
@@ -2331,10 +2332,13 @@ int vtkFLUENTCFFReader::GetData()
           vtkErrorMacro("Unable to open HDF group (GetData data).");
           return 0;
         }
+        if (this->RenameArrays)
+        {
+          strSectionName = vtkFLUENTCFFInternal::GetMatchingFieldName(strSectionName);
+        }
         if (iphase > 1)
         {
-          strSectionName =
-            std::string("phase_") + vtk::to_string(iphase - 1) + std::string("-") + strSectionName;
+          strSectionName += std::string("-phase_") + vtk::to_string(iphase - 1);
         }
 
         if (this->CellDataArraySelection->ArrayIsEnabled(strSectionName.c_str()))
@@ -2515,10 +2519,13 @@ int vtkFLUENTCFFReader::GetMetaData()
           vtkErrorMacro("Unable to open HDF group (GetMetaData data).");
           return 0;
         }
+        if (this->RenameArrays)
+        {
+          strSectionName = vtkFLUENTCFFInternal::GetMatchingFieldName(strSectionName);
+        }
         if (iphase > 1)
         {
-          strSectionName =
-            std::string("phase_") + vtk::to_string(iphase - 1) + std::string("-") + strSectionName;
+          strSectionName += std::string("-phase_") + vtk::to_string(iphase - 1);
         }
 
         uint64_t nSections;

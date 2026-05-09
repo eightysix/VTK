@@ -695,21 +695,35 @@ void vtkAppendFilter::AppendArrays(int attributesType, vtkInformationVector** in
   }
 
   vtkDataSetAttributes* outputData = output->GetAttributes(attributesType);
-  outputData->CopyAllocate(fieldList, totalNumberOfElements);
-  outputData->SetNumberOfTuples(totalNumberOfElements);
-  // copy arrays.
-  vtkSMPTools::For(0, static_cast<vtkIdType>(datasets.size()),
-    [&](vtkIdType begin, vtkIdType end)
+
+  if (this->UseImplicitArray)
+  {
+    std::vector<vtkFieldData*> fieldsData;
+    fieldsData.reserve(datasets.size());
+    for (auto& dataset : datasets)
     {
-      for (vtkIdType idx = begin; idx < end; ++idx)
+      fieldsData.emplace_back(dataset->GetAttributes(attributesType));
+    }
+    fieldList.GenerateCompositeArray(fieldsData, outputData);
+  }
+  else
+  {
+    outputData->CopyAllocate(fieldList, totalNumberOfElements);
+    outputData->SetNumberOfTuples(totalNumberOfElements);
+    // copy arrays.
+    vtkSMPTools::For(0, static_cast<vtkIdType>(datasets.size()),
+      [&](vtkIdType begin, vtkIdType end)
       {
-        auto& dataSet = datasets[idx];
-        const auto& offset = offsets[idx];
-        auto inputData = dataSet->GetAttributes(attributesType);
-        const auto numberOfInputTuples = inputData->GetNumberOfTuples();
-        fieldList.CopyData(idx, inputData, 0, numberOfInputTuples, outputData, offset);
-      }
-    });
+        for (vtkIdType idx = begin; idx < end; ++idx)
+        {
+          auto& dataSet = datasets[idx];
+          const auto& offset = offsets[idx];
+          auto inputData = dataSet->GetAttributes(attributesType);
+          const auto numberOfInputTuples = inputData->GetNumberOfTuples();
+          fieldList.CopyData(idx, inputData, 0, numberOfInputTuples, outputData, offset);
+        }
+      });
+  }
 }
 
 //------------------------------------------------------------------------------

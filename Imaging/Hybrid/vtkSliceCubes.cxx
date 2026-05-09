@@ -6,10 +6,11 @@
 #include "vtkCharArray.h"
 #include "vtkDoubleArray.h"
 #include "vtkFloatArray.h"
+#include "vtkHexahedron.h"
 #include "vtkImageData.h"
 #include "vtkIntArray.h"
 #include "vtkLongArray.h"
-#include "vtkMarchingCubesTriangleCases.h"
+#include "vtkMarchingCellsContourCases.h"
 #include "vtkMath.h"
 #include "vtkObjectFactory.h"
 #include "vtkPointData.h"
@@ -134,24 +135,18 @@ int vtkSliceCubesContour(T* slice, S* scalars, int imageRange[2], int dims[3], d
   vtkDoubleArray* doubleScalars = nullptr;
   int numTriangles = 0, numComp = 0;
   double s[8];
-  int i, j, k, idx, jOffset, ii, index, *vert, jj, sliceSize = 0;
+  int i, j, k, idx, jOffset, ii, index, jj, sliceSize = 0;
   static const int CASE_MASK[8] = { 1, 2, 4, 8, 16, 32, 64, 128 };
-  vtkMarchingCubesTriangleCases *triCase, *triCases;
-  int* edge;
   double pts[8][3], grad[8][3];
   double t, *x1, *x2, *n1, *n2;
   double xp, yp, zp;
   float point[6];
-  static int edges[12][2] = { { 0, 1 }, { 1, 2 }, { 3, 2 }, { 0, 3 }, { 4, 5 }, { 5, 6 }, { 7, 6 },
-    { 4, 7 }, { 0, 4 }, { 1, 5 }, { 3, 7 }, { 2, 6 } };
-
-  triCases = vtkMarchingCubesTriangleCases::GetCases();
 
   if (slice == nullptr) // have to do conversion to double slice-by-slice
   {
     sliceSize = dims[0] * dims[1];
     doubleScalars = vtkDoubleArray::New();
-    doubleScalars->Allocate(sliceSize);
+    doubleScalars->ReserveValues(sliceSize);
   }
 
   slice2scalars = scalars;
@@ -313,14 +308,13 @@ int vtkSliceCubesContour(T* slice, S* scalars, int imageRange[2], int dims[3], d
         ComputePointGradient(i + 1, j + 1, k + 1, dims, Spacing, grad[6], slice1, slice2, slice3);
         ComputePointGradient(i, j + 1, k + 1, dims, Spacing, grad[7], slice1, slice2, slice3);
 
-        triCase = triCases + index;
-        edge = triCase->edges;
+        const int* edge = vtkMarchingCellsContourCases::GetHexahedronCase(index);
 
         for (; edge[0] > -1; edge += 3)
         {
           for (ii = 0; ii < 3; ii++) // insert triangle
           {
-            vert = edges[edge[ii]];
+            const vtkIdType* vert = vtkHexahedron::GetEdgeArray(edge[ii]);
             t = (value - s[vert[0]]) / (s[vert[1]] - s[vert[0]]);
             x1 = pts[vert[0]];
             x2 = pts[vert[1]];

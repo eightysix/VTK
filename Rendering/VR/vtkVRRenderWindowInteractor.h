@@ -12,6 +12,7 @@
 #include "vtkNew.h"       // for ivar
 #include "vtkRenderWindowInteractor3D.h"
 #include "vtkRenderingVRModule.h" // for export macro
+#include "vtkWrappingHints.h"     // For VTK_MARSHALAUTO
 
 #include <string> // for ivar
 
@@ -19,7 +20,8 @@ VTK_ABI_NAMESPACE_BEGIN
 class vtkMatrix4x4;
 class vtkVRRenderWindow;
 
-class VTKRENDERINGVR_EXPORT vtkVRRenderWindowInteractor : public vtkRenderWindowInteractor3D
+class VTKRENDERINGVR_EXPORT VTK_MARSHALAUTO vtkVRRenderWindowInteractor
+  : public vtkRenderWindowInteractor3D
 {
 public:
   vtkTypeMacro(vtkVRRenderWindowInteractor, vtkRenderWindowInteractor3D);

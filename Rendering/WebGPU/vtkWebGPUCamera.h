@@ -13,11 +13,14 @@
 VTK_ABI_NAMESPACE_BEGIN
 class vtkActor;
 class vtkMatrix3x3;
+class vtkOverrideAttribute;
 
 class VTKRENDERINGWEBGPU_EXPORT VTK_MARSHALAUTO vtkWebGPUCamera : public vtkCamera
 {
 public:
   static vtkWebGPUCamera* New();
+  VTK_NEWINSTANCE
+  static vtkOverrideAttribute* CreateOverrideAttributes();
   vtkTypeMacro(vtkWebGPUCamera, vtkCamera);
   void PrintSelf(ostream& os, vtkIndent indent) override;
 
@@ -68,7 +71,10 @@ protected:
 private:
   vtkWebGPUCamera(const vtkWebGPUCamera&) = delete;
   void operator=(const vtkWebGPUCamera&) = delete;
+
+  std::tuple<int, int, int, int> ComputeYInvertedViewport(vtkRenderer* renderer);
 };
 
+#define vtkWebGPUCamera_OVERRIDE_ATTRIBUTES vtkWebGPUCamera::CreateOverrideAttributes()
 VTK_ABI_NAMESPACE_END
 #endif

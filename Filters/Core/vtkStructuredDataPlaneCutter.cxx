@@ -15,8 +15,7 @@
 #include "vtkImageData.h"
 #include "vtkInformation.h"
 #include "vtkInformationVector.h"
-#include "vtkMarchingCubesPolygonCases.h"
-#include "vtkMarchingCubesTriangleCases.h"
+#include "vtkMarchingCellsContourCases.h"
 #include "vtkPlane.h"
 #include "vtkPointData.h"
 #include "vtkPoints.h"
@@ -272,15 +271,15 @@ bool SkipCell(const double s[8])
 }
 
 //------------------------------------------------------------------------------
-int* GetEdge(const bool& generatePolygon, const int& caseIndex)
+const int* GetEdge(const bool& generatePolygon, const int& caseIndex)
 {
   if (generatePolygon)
   {
-    return &(*(vtkMarchingCubesPolygonCases::GetCases() + caseIndex)->edges);
+    return vtkMarchingCellsContourCases::GetHexahedronWithPolygonCase(caseIndex);
   }
   else
   {
-    return &(*(vtkMarchingCubesTriangleCases::GetCases() + caseIndex)->edges);
+    return vtkMarchingCellsContourCases::GetHexahedronCase(caseIndex);
   }
 }
 
@@ -364,7 +363,6 @@ struct EvaluateCellsStructuredFunctor
     TInputIdType pointIndex1, pointIndex2;
     vtkIdType cellSize, cellIds[8];
     double cellPoint[3];
-    int* edge;
     int caseIndex, point1Index, point2Index, i;
     double s[8], point1ToPoint2, point1ToIso, point1Weight;
     bool needCell;
@@ -463,7 +461,7 @@ struct EvaluateCellsStructuredFunctor
             }
           }
 
-          edge = ::GetEdge(this->GeneratePolygons, caseIndex);
+          const int* edge = ::GetEdge(this->GeneratePolygons, caseIndex);
 
           // Produce the intersections
           while (*edge > -1) // for all polygons/triangles
@@ -647,7 +645,6 @@ struct ExtractCellsStructuredFunctor
     vtkIdType cellId, npts;
     TInputIdType pointIndex1, pointIndex2;
     vtkIdType cellSize, cellIds[8], newCellIds[12];
-    int* edge;
     int caseIndex, point1Index, point2Index, i;
     bool processCell;
     const auto cells = this->StructuredCellArray;
@@ -678,7 +675,7 @@ struct ExtractCellsStructuredFunctor
         {
           cells->GetCellAtId(cellId, cellSize, cellIds);
 
-          edge = ::GetEdge(this->GeneratePolygons, caseIndex);
+          const int* edge = ::GetEdge(this->GeneratePolygons, caseIndex);
 
           // Produce the intersections
           while (*edge > -1) // for all polygons/triangles

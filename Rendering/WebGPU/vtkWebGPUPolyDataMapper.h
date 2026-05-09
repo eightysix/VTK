@@ -17,6 +17,7 @@
 
 VTK_ABI_NAMESPACE_BEGIN
 class vtkCellArray;
+class vtkOverrideAttribute;
 class vtkWebGPUActor;
 class vtkWebGPURenderWindow;
 class vtkWebGPURenderer;
@@ -28,6 +29,8 @@ class VTKRENDERINGWEBGPU_EXPORT VTK_MARSHALAUTO vtkWebGPUPolyDataMapper : public
 {
 public:
   static vtkWebGPUPolyDataMapper* New();
+  VTK_NEWINSTANCE
+  static vtkOverrideAttribute* CreateOverrideAttributes();
   vtkTypeMacro(vtkWebGPUPolyDataMapper, vtkPolyDataMapper);
   void PrintSelf(ostream& os, vtkIndent indent) override;
 
@@ -335,6 +338,11 @@ protected:
    */
   void SetupGraphicsPipelines(const wgpu::Device& device, vtkRenderer* renderer, vtkActor* actor);
 
+  virtual std::vector<wgpu::VertexBufferLayout> GetVertexBufferLayouts() { return {}; }
+
+  virtual void SetVertexBuffers(const wgpu::RenderPassEncoder& vtkNotUsed(passEncoder)) {}
+  virtual void SetVertexBuffers(const wgpu::RenderBundleEncoder& vtkNotUsed(bundleEncoder)) {}
+
   /**
    * Generates vertex and fragment shader code
    */
@@ -605,5 +613,7 @@ private:
   vtkWebGPUPolyDataMapper(const vtkWebGPUPolyDataMapper&) = delete;
   void operator=(const vtkWebGPUPolyDataMapper&) = delete;
 };
+#define vtkWebGPUPolyDataMapper_OVERRIDE_ATTRIBUTES                                                \
+  vtkWebGPUPolyDataMapper::CreateOverrideAttributes()
 VTK_ABI_NAMESPACE_END
 #endif

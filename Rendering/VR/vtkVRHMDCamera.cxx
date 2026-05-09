@@ -43,7 +43,9 @@ void vtkVRHMDCamera::Render(vtkRenderer* ren)
   // if were on a stereo renderer draw to special parts of screen
   if (win->GetMultiSamples() && !ren->GetSelector())
   {
+#ifdef GL_MULTISAMPLE
     ostate->vtkglEnable(GL_MULTISAMPLE);
+#endif
   }
 
   ostate->vtkglViewport(0, 0, renSize[0], renSize[1]);

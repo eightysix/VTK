@@ -10,13 +10,11 @@
 #define vtkHDFUtilities_h
 
 #include "vtkDataArray.h"
-#include "vtkHDF5ScopedHandle.h"
+#include "vtkDeprecation.h" // For VTK_DEPRECATED_IN_9_7_0 VTK_DEPRECATED_IN_9_6_0
 #include "vtkIOHDFModule.h" // For export macro
-#include "vtkLogger.h"
-#include "vtkPolyData.h"
-#include "vtkSmartPointer.h"
 #include "vtkStringArray.h"
 #include "vtkType.h"
+#include "vtk_hdf5.h"
 
 #include <array>
 #include <string>
@@ -103,6 +101,8 @@ VTKIOHDF_EXPORT hid_t getH5TypeFromVtkType(int dataType);
 struct VTKIOHDF_EXPORT TemporalGeometryOffsets
 {
 public:
+  TemporalGeometryOffsets();
+
   VTK_DEPRECATED_IN_9_6_0("Member is deprecated. Please use GetOffsets instead.")
   bool Success = true;
 
@@ -144,15 +144,32 @@ public:
 
 /**
  * Open a VTK HDF file and checks if it is valid.
+ * Set quiet to true to avoid displaying errors.
  * On success, fileID is set to a valid hid and the function returns true
  */
+VTK_DEPRECATED_IN_9_7_0("Deprecated. Please use the version with quiet arg.")
 VTKIOHDF_EXPORT bool Open(const char* fileName, hid_t& fileID);
 
 /**
+ * Open a VTK HDF file and checks if it is valid.
+ * On success, fileID is set to a valid hid and the function returns true
+ */
+VTKIOHDF_EXPORT bool Open(const char* fileName, hid_t& fileID, bool quiet);
+
+/**
  * Open a VTK HDF file image from memory and checks if it is valid.
+ * Set quiet to true to avoid displaying errors.
  * On success, fileImageID is set to a valid hid and the function returns true
  */
+VTK_DEPRECATED_IN_9_7_0("Deprecated. Please use the version with quiet arg.")
 VTKIOHDF_EXPORT bool Open(vtkMemoryResourceStream* stream, hid_t& fileImageID);
+
+/**
+ * Open a VTK HDF file image from memory and checks if it is valid.
+ * Set quiet to true to avoid displaying errors.
+ * On success, fileImageID is set to a valid hid and the function returns true
+ */
+VTKIOHDF_EXPORT bool Open(vtkMemoryResourceStream* stream, hid_t& fileImageID, bool quiet);
 
 /**
  * Convert C++ template type T to HDF5 native type
@@ -186,9 +203,29 @@ VTKIOHDF_EXPORT std::vector<hsize_t> GetDimensions(hid_t fileID, const char* dat
 /**
  * Initialize meta information of the file.
  */
-VTKIOHDF_EXPORT bool RetrieveHDFInformation(hid_t& fileID, hid_t& groupID,
-  const std::string& rootName, std::array<int, 2>& version, int& dataSetType, int& numberOfPieces,
+VTK_DEPRECATED_IN_9_7_0("Deprecated. Please use the groupPrefix version instead.")
+VTKIOHDF_EXPORT
+bool RetrieveHDFInformation(hid_t& fileID, hid_t& groupID, const std::string& rootName,
+  std::array<int, 2>& version, int& dataSetType, int& numberOfPieces,
   std::array<hid_t, 3>& attributeDataGroup);
+
+/**
+ * Retrieve HDF information from provided rootId, rootName and groupPrefix
+ *
+ * @arg rootID The root to use to open a dataset from
+ * @arg rootName The path to open from the rootId
+ * @arg groupPrefix Prefix to add in front of the groupName like "Level0/" to access
+ * "Level0/FieldData"
+ * @arg groupId Set to the resulting id of the group being opened
+ * @arg version Set to the version of the file being opened
+ * @arg dataSetType Set to the type of the dataset being opened
+ * @arg numberOfPieces Set to the number of pieces in the dataset being opened
+ * @arg attributeDataGroup Set to the ids of the point/cell/field data group
+ * @return true on sucess, false otherwise
+ */
+VTKIOHDF_EXPORT bool RetrieveHDFInformation(hid_t& rootID, const std::string& rootName,
+  const std::string& groupPrefix, hid_t& groupID, std::array<int, 2>& version, int& dataSetType,
+  int& numberOfPieces, std::array<hid_t, 3>& attributeDataGroup);
 
 /**
  * Convenient callback method to retrieve a name when calling a H5Giterate()

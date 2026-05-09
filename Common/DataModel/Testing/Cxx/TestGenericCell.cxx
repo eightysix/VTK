@@ -5,7 +5,8 @@
 #include "vtkHigherOrderQuadrilateral.h"
 #include "vtkHigherOrderWedge.h"
 #include "vtkMath.h"
-#include "vtkSmartPointer.h"
+#include "vtkNew.h"
+#include "vtkPoints.h"
 #include "vtkTestErrorObserver.h"
 
 #include <iostream>
@@ -13,8 +14,8 @@
 int TestGenericCell(int, char*[])
 {
   int rval = 0;
-  auto cell = vtkSmartPointer<vtkGenericCell>::New();
-  auto errorObserver = vtkSmartPointer<vtkTest::ErrorObserver>::New();
+  vtkNew<vtkGenericCell> cell;
+  vtkNew<vtkTest::ErrorObserver> errorObserver;
   cell->AddObserver(vtkCommand::ErrorEvent, errorObserver);
   for (int i = 0; i < VTK_NUMBER_OF_CELL_TYPES; ++i)
   {
@@ -88,6 +89,44 @@ int TestGenericCell(int, char*[])
     if (cell->GetCellType() != i && cell->GetCellType() != VTK_EMPTY_CELL)
     {
       ++rval;
+    }
+
+    const auto checkCells = [&](vtkGenericCell* c1, vtkGenericCell* c2)
+    {
+      if (c1->GetCellType() != c2->GetCellType())
+      {
+        ++rval;
+      }
+
+      if (c1->GetNumberOfPoints() > 0 &&
+        (c1->GetPoints()->GetPoint(0)[0] != c2->GetPoints()->GetPoint(0)[0]))
+      {
+        ++rval;
+      }
+    };
+
+    {
+      vtkNew<vtkGenericCell> cell2;
+      cell2->ShallowCopy(cell);
+      checkCells(cell, cell2);
+    }
+
+    {
+      vtkNew<vtkGenericCell> cell2;
+      cell2->ShallowCopy(cell->GetRepresentativeCell());
+      checkCells(cell, cell2);
+    }
+
+    {
+      vtkNew<vtkGenericCell> cell2;
+      cell2->DeepCopy(cell);
+      checkCells(cell, cell2);
+    }
+
+    {
+      vtkNew<vtkGenericCell> cell2;
+      cell2->DeepCopy(cell->GetRepresentativeCell());
+      checkCells(cell, cell2);
     }
   }
 

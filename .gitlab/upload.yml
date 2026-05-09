@@ -62,7 +62,7 @@
         - pipx ensurepath
         - source $HOME/.bash_profile
         - pipx install twine==6.1.0
-        - twine upload -u __token__ -p $PYPI_UPLOAD_TOKEN dist/*
+        - twine upload --verbose -u __token__ -p $PYPI_UPLOAD_TOKEN dist/*
 
 .pypi_vtk_upload:
     image: "fedora:42"
@@ -79,7 +79,7 @@
         - pipx ensurepath
         - source $HOME/.bash_profile
         - pipx install twine==6.1.0
-        - twine upload -u gitlab-ci-token -p $CI_JOB_TOKEN --repository-url https://gitlab.kitware.com/api/v4/projects/$CI_PROJECT_ID/packages/pypi dist/*
+        - twine upload --verbose -u gitlab-ci-token -p $CI_JOB_TOKEN --repository-url https://gitlab.kitware.com/api/v4/projects/$CI_PROJECT_ID/packages/pypi dist/*
 
 .generic_vtk_wasm_emscripten_linux_upload:
     stage: upload

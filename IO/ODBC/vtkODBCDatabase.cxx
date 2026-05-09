@@ -421,7 +421,7 @@ const char* vtkODBCDatabase::GetLastErrorText()
 //------------------------------------------------------------------------------
 vtkStringArray* vtkODBCDatabase::GetTables()
 {
-  this->Tables->Resize(0);
+  this->Tables->Initialize();
   if (!this->IsOpen())
   {
     vtkErrorMacro(<< "GetTables(): Database is closed!");
@@ -474,8 +474,8 @@ vtkStringArray* vtkODBCDatabase::GetTables()
 //------------------------------------------------------------------------------
 vtkStringArray* vtkODBCDatabase::GetRecord(const char* table)
 {
-  this->Record->Reset();
-  this->Record->Allocate(20);
+  this->Record->Initialize();
+  this->Record->ReserveValues(20);
 
   if (!this->IsOpen())
   {

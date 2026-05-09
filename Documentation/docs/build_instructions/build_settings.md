@@ -5,6 +5,8 @@ to modify include:
 
   * `BUILD_SHARED_LIBS` (default `ON`): If set, shared libraries will be
     built. This is usually what is wanted.
+  * `VTK_USE_PCH` (default `ON`): If set, VTK will use precompiled headers
+    to speed up compilation.
   * `VTK_USE_CUDA` (default `OFF`): Whether [CUDA][cuda] support will be available or
     not.
   * `VTK_USE_MPI` (default `OFF`): Whether [MPI][mpi] support will be available or
@@ -289,14 +291,10 @@ currently exist for use with the VTK dispatch mechanism:
     "array-of-structure" ordered arrays derived from `vtkAOSDataArrayTemplate`
   * `VTK_DISPATCH_SOA_ARRAYS` (default `OFF`): includes dispatching for "structure-of-array"
     ordered arrays derived from `vtkSOADataArrayTemplate`
-  * `VTK_DISPATCH_SCALED_SOA_ARRAYS` (default `OFF`): includes dispatching for scaled "structure-of-array"
-     ordered arrays derived from `vtkScaledSOADataArrayTemplate`
   * `VTK_DISPATCH_AFFINE_ARRAYS` (default `OFF`): includes dispatching for linearly varying
     `vtkAffineArray`s as part of the implicit array framework
   * `VTK_DISPATCH_CONSTANT_ARRAYS` (default `OFF`): includes dispatching for constant arrays
     `vtkConstantArray` as part of the implicit array framework
-  * `VTK_DISPATCH_STD_FUNCTION_ARRAYS` (default `OFF`): includes dispatching for arrays with
-    an `std::function` backend `vtkStdFunctionArray` as part of the implicit array framework
   * `VTK_DISPATCH_STRIDED_ARRAYS` (default `OFF`): includes dispatching for strided arrays
     `vtkStridedArray` as part of the implicit array framework
   * `VTK_DISPATCH_STRUCTURED_POINT_ARRAYS` (default `OFF`): includes dispatching for structured point arrays

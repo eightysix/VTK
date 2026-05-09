@@ -59,14 +59,12 @@ struct AddOriginToArrayWorker
   template <typename ArrayT>
   void operator()(ArrayT* array, const double origin[3])
   {
-    VTK_ASSUME(array->GetNumberOfComponents() == 3);
-
-    vtkDataArrayAccessor<ArrayT> a(array);
+    auto a = vtk::DataArrayTupleRange<3>(array);
     for (vtkIdType tupleIdx = 0; tupleIdx < array->GetNumberOfTuples(); ++tupleIdx)
     {
       for (vtkIdType compIdx = 0; compIdx < 3; ++compIdx)
       {
-        a.Set(tupleIdx, compIdx, a.Get(tupleIdx, compIdx) + origin[compIdx]);
+        a[tupleIdx][compIdx] += origin[compIdx];
       }
     }
   }
@@ -192,7 +190,7 @@ void ProjectElement::ProcessDataFields(
             auto stringArray = file->ReadStringArrayFromStream(valuesUID);
             vtkNew<vtkStringArray> stringData;
             stringData->SetName(name.c_str());
-            stringData->Resize(dataArrayCasted->GetNumberOfValues());
+            stringData->ReserveValues(dataArrayCasted->GetNumberOfValues());
             for (int idx = 0; idx < dataArrayCasted->GetNumberOfValues(); ++idx)
             {
               auto val = dataArrayCasted->GetValue(idx);
@@ -492,7 +490,7 @@ void SurfaceElement::ProcessGeometry(
     sgrid->SetDimensions(dims[0], dims[1], dims[2]);
 
     vtkNew<vtkPoints> points;
-    points->Allocate(dims[0] * dims[1] * dims[2]);
+    points->Reserve(dims[0] * dims[1] * dims[2]);
     double pt[3];
     vtkIdType offsetWIdx = 0;
     for (int k = 0; k < dims[2]; ++k)
@@ -572,7 +570,7 @@ void VolumeElement::ProcessGeometry(
   sgrid->SetDimensions(dims[0], dims[1], dims[2]);
 
   vtkNew<vtkPoints> points;
-  points->Allocate(dims[0] * dims[1] * dims[2]);
+  points->Reserve(dims[0] * dims[1] * dims[2]);
   double pt[3];
   for (int k = 0; k < dims[2]; ++k)
   {

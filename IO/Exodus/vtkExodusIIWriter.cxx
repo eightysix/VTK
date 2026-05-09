@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright (c) Sandia Corporation
 // SPDX-License-Identifier: BSD-3-Clause
 #include "vtkExodusIIWriter.h"
-#include "vtkArrayIteratorIncludes.h"
 #include "vtkCellArray.h"
 #include "vtkCellData.h"
 #include "vtkCompositeDataIterator.h"
@@ -204,7 +203,7 @@ int vtkExodusIIWriter::RequestData(vtkInformation* request, vtkInformationVector
     request->Set(vtkStreamingDemandDrivenPipeline::CONTINUE_EXECUTING(), 1);
   }
 
-  this->WriteData();
+  bool ret = this->WriteDataAndReturn();
 
   this->CurrentTimeIndex++;
   if (this->CurrentTimeIndex >= this->NumberOfTimeSteps || this->TopologyChanged)
@@ -230,7 +229,7 @@ int vtkExodusIIWriter::RequestData(vtkInformation* request, vtkInformationVector
     assert(localContinue == 1);
     request->Set(vtkStreamingDemandDrivenPipeline::CONTINUE_EXECUTING(), 0);
   }
-  return 1;
+  return ret ? 1 : 0;
 }
 
 //------------------------------------------------------------------------------
@@ -240,7 +239,7 @@ int vtkExodusIIWriter::GlobalContinueExecuting(int localContinueExecution)
 }
 
 //------------------------------------------------------------------------------
-void vtkExodusIIWriter::WriteData()
+bool vtkExodusIIWriter::WriteDataAndReturn()
 {
   this->NewFlattenedInput.clear();
   this->NewFlattenedNames.clear();
@@ -249,7 +248,7 @@ void vtkExodusIIWriter::WriteData()
   if (!this->FlattenHierarchy(this->OriginalInput, "", newHierarchy))
   {
     vtkErrorMacro("vtkExodusIIWriter::WriteData Unable to flatten hierarchy");
-    return;
+    return false;
   }
   if (this->FlattenedInput.size() != this->NewFlattenedInput.size())
   {
@@ -262,7 +261,7 @@ void vtkExodusIIWriter::WriteData()
   {
     this->TopologyChanged = true;
     vtkErrorMacro("Temporal data with changing topology is not yet supported.");
-    return;
+    return false;
   }
 
   // Copies over the new results data in the new objects
@@ -277,8 +276,9 @@ void vtkExodusIIWriter::WriteData()
     if (!this->WriteNextTimeStep())
     {
       vtkErrorMacro("vtkExodusIIWriter::WriteData results");
+      return false;
     }
-    return;
+    return true;
   }
   else
   {
@@ -291,88 +291,89 @@ void vtkExodusIIWriter::WriteData()
     // The file has changed, initialize new file
     if (!this->CheckParameters())
     {
-      return;
+      return true;
     }
 
     // TODO this should increment a counter
     if (!this->CreateNewExodusFile())
     {
       vtkErrorMacro("vtkExodusIIWriter: WriteData can't create exodus file");
-      return;
+      return false;
     }
 
     if (!this->WriteInitializationParameters())
     {
       vtkErrorMacro(<< "vtkExodusIIWriter::WriteData init params");
-      return;
+      return false;
     }
 
     if (!this->WriteInformationRecords())
     {
       vtkErrorMacro("vtkExodusIIWriter::WriteData information records");
-      return;
+      return false;
     }
 
     if (!this->WritePoints())
     {
       vtkErrorMacro("vtkExodusIIWriter::WriteData points");
-      return;
+      return false;
     }
 
     if (!this->WriteCoordinateNames())
     {
       vtkErrorMacro("vtkExodusIIWriter::WriteData coordinate names");
-      return;
+      return false;
     }
 
     if (!this->WriteGlobalPointIds())
     {
       vtkErrorMacro("vtkExodusIIWriter::WriteData global point IDs");
-      return;
+      return false;
     }
 
     if (!this->WriteBlockInformation())
     {
       vtkErrorMacro("vtkExodusIIWriter::WriteData block information");
-      return;
+      return false;
     }
 
     if (!this->WriteGlobalElementIds())
     {
       vtkErrorMacro("vtkExodusIIWriter::WriteData global element IDs");
-      return;
+      return false;
     }
 
     if (!this->WriteVariableArrayNames())
     {
       vtkErrorMacro("vtkExodusIIWriter::WriteData variable array names");
-      return;
+      return false;
     }
 
     if (!this->WriteNodeSetInformation())
     {
       vtkErrorMacro("vtkExodusIIWriter::WriteData can't node sets");
-      return;
+      return false;
     }
 
     if (!this->WriteSideSetInformation())
     {
       vtkErrorMacro("vtkExodusIIWriter::WriteData can't side sets");
-      return;
+      return false;
     }
 
     if (!this->WriteProperties())
     {
       vtkErrorMacro("vtkExodusIIWriter::WriteData can't properties");
-      return;
+      return false;
     }
 
     if (!this->WriteNextTimeStep())
     {
       vtkErrorMacro("vtkExodusIIWriter::WriteData results");
-      return;
+      return false;
     }
   }
+  return true;
 }
 
 //------------------------------------------------------------------------------
@@ -1254,24 +1255,6 @@ char* vtkExodusIIWriter::GetCellTypeName(int t)
       break;
     case VTK_CONVEX_POINT_SET:
       strcpy(nm, "convex point set");
-      break;
-    case VTK_PARAMETRIC_CURVE:
-      strcpy(nm, "parametric curve");
-      break;
-    case VTK_PARAMETRIC_SURFACE:
-      strcpy(nm, "parametric surface");
-      break;
-    case VTK_PARAMETRIC_TRI_SURFACE:
-      strcpy(nm, "parametric tri surface");
-      break;
-    case VTK_PARAMETRIC_QUAD_SURFACE:
-      strcpy(nm, "parametric quad surface");
-      break;
-    case VTK_PARAMETRIC_TETRA_REGION:
-      strcpy(nm, "parametric tetra region");
-      break;
-    case VTK_PARAMETRIC_HEX_REGION:
-      strcpy(nm, "paramertric hex region");
       break;
     default:
       strcpy(nm, "unknown cell type");
@@ -2804,16 +2787,6 @@ int vtkExodusIIWriter::WriteProperties()
   return (rc >= 0);
 }
 
-//========================================================================
-//   VARIABLE ARRAYS:
-//========================================================================
-template <typename iterT>
-double vtkExodusIIWriterGetComponent(iterT* it, vtkIdType ind)
-{
-  vtkVariant v(it->GetValue(ind));
-  return v.ToDouble();
-}
-
 //------------------------------------------------------------------------------
 double vtkExodusIIWriter::ExtractGlobalData(const char* name, int comp, int ts)
 {
@@ -2853,7 +2826,6 @@ void vtkExodusIIWriter::ExtractCellData(const char* name, int comp, vtkDataArray
     int ncells = this->FlattenedInput[i]->GetNumberOfCells();
     if (da)
     {
-      vtkArrayIterator* arrayIter = da->NewIterator();
       vtkIdType ncomp = da->GetNumberOfComponents();
       for (vtkIdType j = 0; j < ncells; j++)
       {
@@ -2865,13 +2837,8 @@ void vtkExodusIIWriter::ExtractCellData(const char* name, int comp, vtkDataArray
           continue;
         }
         int index = blockIter->second.ElementStartIndex + CellToElementOffset[i][j];
-        switch (da->GetDataType())
-        {
-          vtkArrayIteratorTemplateMacro(buffer->SetTuple1(index,
-            vtkExodusIIWriterGetComponent(static_cast<VTK_TT*>(arrayIter), j * ncomp + comp)));
-        }
+        buffer->SetTuple1(index, da->GetVariantValue(j * ncomp + comp).ToDouble());
       }
-      arrayIter->Delete();
     }
     else
     {
@@ -2901,18 +2868,12 @@ void vtkExodusIIWriter::ExtractPointData(const char* name, int comp, vtkDataArra
     vtkDataArray* da = this->FlattenedInput[i]->GetPointData()->GetArray(name);
     if (da)
     {
-      vtkArrayIterator* iter = da->NewIterator();
       vtkIdType ncomp = da->GetNumberOfComponents();
       vtkIdType nvals = ncomp * da->GetNumberOfTuples();
       for (vtkIdType j = comp; j < nvals; j += ncomp)
       {
-        switch (da->GetDataType())
-        {
-          vtkArrayIteratorTemplateMacro(buffer->SetTuple1(
-            index++, vtkExodusIIWriterGetComponent(static_cast<VTK_TT*>(iter), j)));
-        }
+        buffer->SetTuple1(index++, da->GetVariantValue(j).ToDouble());
       }
-      iter->Delete();
     }
     else
     {

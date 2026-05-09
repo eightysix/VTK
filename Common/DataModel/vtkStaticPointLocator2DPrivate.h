@@ -238,6 +238,10 @@ struct BucketList2D : public vtkBucketList2D
   // difference between the offsets into the sorted points array.
   vtkIdType GetNumberOfIds(vtkIdType bucketNum)
   {
+    if (bucketNum < 0 || bucketNum >= this->NumBuckets)
+    {
+      return 0;
+    }
     return (this->Offsets[bucketNum + 1] - this->Offsets[bucketNum]);
   }
 
@@ -488,7 +492,7 @@ struct BucketList2D : public vtkBucketList2D
     void Initialize()
     {
       vtkIdList*& pIds = this->PIds.Local();
-      pIds->Allocate(128); // allocate some memory
+      pIds->Reserve(128); // allocate some memory
     }
 
     void operator()(vtkIdType ptId, vtkIdType endPtId)
@@ -535,6 +539,12 @@ struct BucketList2D : public vtkBucketList2D
           points, worker, this))
     {
       worker(points, this);
+    }
+
+    // Provide accelerated access to points. Needed for Voronoi bin iterators.
+    if (vtkDoubleArray::SafeDownCast(points))
+    {
+      this->FastPoints = static_cast<double*>(vtkDoubleArray::SafeDownCast(points)->GetPointer(0));
     }
 
     // Now gather the points into contiguous runs in buckets

@@ -7,7 +7,9 @@
  * vtkPolygon is a concrete implementation of vtkCell to represent a 2D
  * n-sided polygon. The polygons cannot have any internal holes, and cannot
  * self-intersect. Define the polygon with n-points ordered in the counter-
- * clockwise direction; do not repeat the last point.
+ * clockwise direction; do not repeat the last point. Also note that the
+ * polygon may be defined in 3D space; i.e., it is not constrained to the
+ * x-y plane.
  */
 
 #ifndef vtkPolygon_h
@@ -154,6 +156,16 @@ public:
   ///@}
 
   /**
+   * Compute a circle interior to a polygon. While this method does not enforce that the
+   * polygon is convex, concave polygons may produce unusual results. The incircle
+   * algorithm is simple: first the centroid is determined, then the minimum radius
+   * from the centroid to the polygon edges is returned. If the polygon is regular,
+   * then the method will produce an incircle.
+   */
+  static bool ComputeInteriorCircle(
+    vtkPoints* p, int numPts, const vtkIdType* ids, double center[3], double& radius2);
+
+  /**
    * Compute the area of a polygon in 3D. The area is returned, as well as
    * the normal (a side effect of using this method). If you desire to
    * compute the area of a triangle, use vtkTriangleArea which is faster.
@@ -267,7 +279,7 @@ public:
 
 protected:
   vtkPolygon();
-  ~vtkPolygon() override;
+  ~vtkPolygon() override = default;
 
   // Compute the interpolation functions using Mean Value Coordinate.
   void InterpolateFunctionsUsingMVC(const double x[3], double* weights);
@@ -277,14 +289,14 @@ protected:
   double Tol;              // Internal tolerance set by ComputeBounds()
   void ComputeTolerance(); // Compute the internal tolerance Tol
 
-  int SuccessfulTriangulation; // Stops recursive triangulation if necessary
-  vtkIdList* Tris;             // Output triangulation placed here
+  int SuccessfulTriangulation;     // Stops recursive triangulation if necessary
+  vtkSmartPointer<vtkIdList> Tris; // Output triangulation placed here
 
   // These are used for internal computation.
-  vtkTriangle* Triangle;
-  vtkQuad* Quad;
-  vtkDoubleArray* TriScalars;
-  vtkLine* Line;
+  vtkSmartPointer<vtkTriangle> Triangle;
+  vtkSmartPointer<vtkQuad> Quad;
+  vtkSmartPointer<vtkDoubleArray> TriScalars;
+  vtkSmartPointer<vtkLine> Line;
 
   // Parameter indicating whether to use Mean Value Coordinate algorithm
   // for interpolation. The parameter is false by default.

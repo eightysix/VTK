@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) Ken Martin, Will Schroeder, Bill Lorensen
 // SPDX-License-Identifier: BSD-3-Clause
+#define VTK_DEPRECATION_LEVEL 0
+
 #include "vtkSMPContourGrid.h"
 
 #include "vtkCellArray.h"
@@ -192,14 +194,14 @@ public:
     estimatedSize = estimatedSize / 1024 * 1024; // multiple of 1024
     estimatedSize = std::max<vtkIdType>(estimatedSize, 1024);
 
-    newPts->Allocate(estimatedSize, estimatedSize);
+    newPts->Reserve(estimatedSize);
 
-    vertCellOffsets->Allocate(estimatedSize);
-    vertConnOffsets->Allocate(estimatedSize);
-    lineCellOffsets->Allocate(estimatedSize);
-    lineConnOffsets->Allocate(estimatedSize);
-    polyCellOffsets->Allocate(estimatedSize);
-    polyConnOffsets->Allocate(estimatedSize);
+    vertCellOffsets->Reserve(estimatedSize);
+    vertConnOffsets->Reserve(estimatedSize);
+    lineCellOffsets->Reserve(estimatedSize);
+    lineConnOffsets->Reserve(estimatedSize);
+    polyCellOffsets->Reserve(estimatedSize);
+    polyConnOffsets->Reserve(estimatedSize);
 
     // locator->SetPoints(newPts);
     locator->InitPointInsertion(newPts, this->Input->GetBounds(), this->Input->GetNumberOfPoints());
@@ -219,7 +221,7 @@ public:
     vtkDataArray*& cellScalars = this->CellScalars.Local();
     cellScalars = this->InScalars->NewInstance();
     cellScalars->SetNumberOfComponents(this->InScalars->GetNumberOfComponents());
-    cellScalars->Allocate(VTK_CELL_SIZE * this->InScalars->GetNumberOfComponents());
+    cellScalars->ReserveTuples(VTK_CELL_SIZE);
 
     vtkPointData* outPd = output->GetPointData();
     vtkCellData* outCd = output->GetCellData();
@@ -293,6 +295,7 @@ public:
         cs->SetNumberOfTuples(pids->GetNumberOfIds());
         this->InScalars->GetTuples(pids, cs);
         int numCellScalars = cs->GetNumberOfComponents() * cs->GetNumberOfTuples();
+        // NOLINTNEXTLINE(bugprone-unsafe-functions)
         T* cellScalarPtr = static_cast<T*>(cs->GetVoidPointer(0));
 
         // find min and max values in scalar data

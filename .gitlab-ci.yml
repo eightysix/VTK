@@ -372,6 +372,17 @@ fedora42-x86_64-mpi-python-qt-stdthread:test:
     needs:
         - fedora42-x86_64-mpi-python-qt-tbb:build
 
+fedora42-x86_64-mpi-python-qt-tbb-serialization:test:
+    extends:
+        - .fedora42_x86_64_mpi_python_qt_tbb_serialization
+        - .ctest_new_cdash_submission
+        - .cmake_test_linux
+        - .linux_x86_64_tester_tags
+        - .cmake_test_artifacts
+        - .rules
+    needs:
+        - fedora42-x86_64-mpi-python-qt-tbb:build
+
 fedora42-x86_64-mangling:build:
     extends:
         - .fedora42_x86_64_mangling
@@ -507,7 +518,7 @@ wasm64-emscripten:vtk:upload:
     needs:
         - wasm64-emscripten:package
 
-# See https://gitlab.kitware.com/vtk/vtk/-/issues/19945
+# # See https://gitlab.kitware.com/vtk/vtk/-/issues/19945
 # ## Test the 'wasm32-emscripten' architecture on a windows host
 # wasm32-emscripten-windows-chrome:test-ext:
 #     extends:
@@ -517,12 +528,13 @@ wasm64-emscripten:vtk:upload:
 #         - .cmake_test_artifacts
 #         - .rules
 #     variables:
-#         CTEST_MAX_PARALLELISM: 8
+#         CTEST_MAX_PARALLELISM: 4
 #     needs:
 #         - wasm32-emscripten-linux:build
-#     timeout: 4 hours
+#     retry: 2
+#     timeout: 8 hours
 
-# See https://gitlab.kitware.com/vtk/vtk/-/issues/19945
+# # See https://gitlab.kitware.com/vtk/vtk/-/issues/19945
 # ## Test the 'wasm64-emscripten' architecture on a windows host
 # wasm64-emscripten-windows-chrome:test-ext:
 #     extends:
@@ -532,10 +544,11 @@ wasm64-emscripten:vtk:upload:
 #         - .cmake_test_artifacts
 #         - .rules
 #     variables:
-#         CTEST_MAX_PARALLELISM: 8
+#         CTEST_MAX_PARALLELISM: 4
 #     needs:
 #         - wasm64-emscripten-linux:build
-#     timeout: 5 hours
+#     retry: 2
+#     timeout: 8 hours
 
 ## Python x86_64 wheel builds
 
@@ -2330,7 +2343,7 @@ fedora42-x86_64-tidy:build:
 #     extends:
 #         - .fedora42_x86_64_asan
 #         - .cmake_memcheck_linux
-#         - .linux_x86_64_tester_priv_tags
+#         - .linux_x86_64_tester_tags
 #         - .cmake_test_artifacts
 #         - .rules
 #     needs:
@@ -2351,7 +2364,7 @@ fedora42-x86_64-tidy:build:
 #     extends:
 #         - .fedora42_x86_64_tsan
 #         - .cmake_memcheck_linux
-#         - .linux_x86_64_tester_priv_tags
+#         - .linux_x86_64_tester_tags
 #         - .cmake_test_artifacts
 #         - .rules
 #     needs:
@@ -2372,7 +2385,7 @@ fedora42-x86_64-tidy:build:
 #     extends:
 #         - .fedora42_x86_64_ubsan
 #         - .cmake_memcheck_linux
-#         - .linux_x86_64_tester_priv_tags
+#         - .linux_x86_64_tester_tags
 #         - .cmake_test_artifacts
 #         - .rules
 #     needs:
@@ -2717,6 +2730,17 @@ macos-arm64-kits-python-qt:test:
     needs:
         - macos-arm64-kits-python-qt:build
 
+macos-arm64-kits-python-qt-serialization:test:
+   extends:
+       - .macos_arm64_kits_python_qt_serialization
+       - .ctest_new_cdash_submission
+       - .cmake_test_macos
+       - .macos_arm64_builder_tags
+       - .cmake_test_artifacts
+       - .rules
+   needs:
+       - macos-arm64-kits-python-qt:build
+
 macos-x86_64-kits-python-qt:build:
     extends:
         - .macos_x86_64_kits_python_qt
@@ -2726,6 +2750,8 @@ macos-x86_64-kits-python-qt:build:
         - .rules
     variables:
         VTK_CI_RUN_MANUALLY: "true"
+        VTK_CI_MERGED_ONLY: "true"
+        VTK_CI_NIGHTLY_ONLY: "true"
     # Some of the macOS runners are not very powerful.
     timeout: 150 minutes
     needs: []
@@ -2737,6 +2763,9 @@ macos-x86_64-kits-python-qt:test:
         - .macos_x86_64_builder_tags
         - .cmake_test_artifacts
         - .rules
+    variables:
+        VTK_CI_MERGED_ONLY: "true"
+        VTK_CI_NIGHTLY_ONLY: "true"
     needs:
         - macos-x86_64-kits-python-qt:build
     timeout: 2 hours
@@ -2750,6 +2779,9 @@ macos-x86_64-kits-python-qt-stdthread:test:
         - .macos_x86_64_builder_tags
         - .cmake_test_artifacts
         - .rules
+    variables:
+        VTK_CI_MERGED_ONLY: "true"
+        VTK_CI_NIGHTLY_ONLY: "true"
     needs:
         - macos-x86_64-kits-python-qt:build
     timeout: 2 hours
@@ -2800,7 +2832,7 @@ wheel-macos-python39-x86_64:build:
         - .macos_x86_64_wheel_builder_tags
         - .cmake_wheel_artifacts
         - .rules_variables_wheel_older_build
-    timeout: 90 minutes
+    timeout: 120 minutes
     needs: []
 
 wheel-macos-python39-x86_64:test:
@@ -2839,7 +2871,7 @@ wheel-macos-python310-x86_64:build:
         - .macos_x86_64_wheel_builder_tags
         - .cmake_wheel_artifacts
         - .rules_variables_wheel_older_build
-    timeout: 90 minutes
+    timeout: 120 minutes
     needs: []
 
 wheel-macos-python310-x86_64:test:
@@ -2878,7 +2910,7 @@ wheel-macos-python311-x86_64:build:
         - .macos_x86_64_wheel_builder_tags
         - .cmake_wheel_artifacts
         - .rules_variables_wheel_older_build
-    timeout: 90 minutes
+    timeout: 120 minutes
     needs: []
 
 wheel-macos-python311-x86_64:test:
@@ -2917,7 +2949,7 @@ wheel-macos-python312-x86_64:build:
         - .macos_x86_64_wheel_builder_tags
         - .cmake_wheel_artifacts
         - .rules_variables_wheel_older_build
-    timeout: 90 minutes
+    timeout: 120 minutes
     needs: []
 
 wheel-macos-python312-x86_64:test:
@@ -2957,7 +2989,7 @@ wheel-macos-python313-x86_64:build:
         - .macos_x86_64_wheel_builder_tags
         - .cmake_wheel_artifacts
         - .rules_variables_wheel_previous_build
-    timeout: 90 minutes
+    timeout: 120 minutes
     needs: []
 
 wheel-macos-python313-x86_64:test:
@@ -2997,7 +3029,7 @@ wheel-macos-python314-x86_64:build:
         - .macos_x86_64_wheel_builder_tags
         - .cmake_wheel_artifacts
         - .rules_variables_wheel_latest_build
-    timeout: 90 minutes
+    timeout: 120 minutes
     needs: []
 
 wheel-macos-python314-x86_64:test:
@@ -3017,7 +3049,7 @@ wheel-macos-python314-x86_64:test:
 #        - .macos_arm64_wheel_builder_tags
 #        - .cmake_wheel_artifacts
 #        - .rules_variables_wheel_weekly_build
-#    timeout: 90 minutes
+#    timeout: 120 minutes
 #    needs: []
 #
 #wheel-macos-python314t-arm64:test:
@@ -3037,7 +3069,7 @@ wheel-macos-python314t-x86_64:build:
         - .macos_x86_64_wheel_builder_tags
         - .cmake_wheel_artifacts
         - .rules_variables_wheel_weekly_build
-    timeout: 90 minutes
+    timeout: 120 minutes
     needs: []
 
 wheel-macos-python314t-x86_64:test:
@@ -3146,6 +3178,16 @@ windows-vs2022-mpi-python-qt:build:
 windows-vs2022-mpi-python-qt:test:
     extends:
         - .windows_vs2022_mpi_python_qt
+        - .cmake_test_windows
+        - .windows_tester_tags
+        - .cmake_test_artifacts
+        - .rules
+    needs:
+        - windows-vs2022-mpi-python-qt:build
+
+windows-vs2022-mpi-python-qt-serialization:test:
+    extends:
+        - .windows_vs2022_mpi_python_qt_serialization
         - .cmake_test_windows
         - .windows_tester_tags
         - .cmake_test_artifacts

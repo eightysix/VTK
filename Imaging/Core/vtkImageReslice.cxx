@@ -40,8 +40,9 @@ vtkCxxSetObjectMacro(vtkImageReslice, ResliceTransform, vtkAbstractTransform);
 
 //------------------------------------------------------------------------------
 // typedef for pixel converter method
-typedef void (vtkImageReslice::*vtkImageResliceConvertScalarsType)(void* outPtr, void* inPtr,
-  int inputType, int inNumComponents, int count, int idX, int idY, int idZ, int threadId);
+typedef void (vtkImageReslice::*vtkImageResliceConvertScalarsType)(VTK_FUTURE_CONST void* outPtr,
+  void* inPtr, int inputType, int inNumComponents, int count, int idX, int idY, int idZ,
+  int threadId);
 
 // typedef for the floating point type used by the code
 typedef double vtkImageResliceFloatingPointType;
@@ -575,9 +576,10 @@ int vtkImageReslice::ConvertScalarInfo(int& vtkNotUsed(scalarType), int& vtkNotU
 }
 
 //------------------------------------------------------------------------------
-void vtkImageReslice::ConvertScalars(void* vtkNotUsed(inPtr), void* vtkNotUsed(outPtr),
-  int vtkNotUsed(inputType), int vtkNotUsed(inputComponents), int vtkNotUsed(count),
-  int vtkNotUsed(idX), int vtkNotUsed(idY), int vtkNotUsed(idZ), int vtkNotUsed(threadId))
+void vtkImageReslice::ConvertScalars(VTK_FUTURE_CONST void* vtkNotUsed(inPtr),
+  void* vtkNotUsed(outPtr), int vtkNotUsed(inputType), int vtkNotUsed(inputComponents),
+  int vtkNotUsed(count), int vtkNotUsed(idX), int vtkNotUsed(idY), int vtkNotUsed(idZ),
+  int vtkNotUsed(threadId))
 {
 }
 
@@ -888,7 +890,7 @@ namespace
 
 int vtkIsPermutationMatrix(vtkMatrix4x4* matrix)
 {
-  for (int i = 0; i < 3; i++)
+  for (int i = 0; i < 3; ++i)
   {
     if (matrix->GetElement(3, i) != 0)
     {
@@ -1865,7 +1867,7 @@ void vtkImageResliceRescaleScalars(
   m *= components;
   F shift = static_cast<F>(scalarShift);
   F scale = static_cast<F>(scalarScale);
-  for (vtkIdType i = 0; i < m; i++)
+  for (vtkIdType i = 0; i < m; ++i)
   {
     *floatData = (*floatData + shift) * scale;
     floatData++;
@@ -1960,7 +1962,7 @@ void vtkImageResliceExecute(vtkImageReslice* self, vtkDataArray* scalars,
   }
 
   // extra scalar info for nearest-neighbor optimization
-  const void* inPtr = scalars->GetVoidPointer(0);
+  const void* inPtr = scalars->GetVoidPointer(0); // NOLINT(bugprone-unsafe-functions)
   int inputScalarSize = scalars->GetDataTypeSize();
   int inputScalarType = scalars->GetDataType();
   int inComponents = interpolator->GetNumberOfComponents();
@@ -2061,6 +2063,8 @@ void vtkImageResliceExecute(vtkImageReslice* self, vtkDataArray* scalars,
   int idZ = outExt[4] - 1;
   F inPoint0[4] = { 0.0, 0.0, 0.0, 0.0 };
   F inPoint1[4] = { 0.0, 0.0, 0.0, 0.0 };
+
+  int floatType = vtkTypeTraits<F>::VTKTypeID();
 
   // create an iterator to march through the data
   vtkImagePointDataIterator iter(outData, outExt, stencil, self, threadId);
@@ -2195,9 +2199,8 @@ void vtkImageResliceExecute(vtkImageReslice* self, vtkDataArray* scalars,
 
             if (convertScalars)
             {
-              (self->*convertScalars)(tmpPtr - inComponents * (idX - startIdX), outPtr,
-                vtkTypeTraits<F>::VTKTypeID(), inComponents, numpixels, startIdX, idY, idZ,
-                threadId);
+              (self->*convertScalars)(tmpPtr - inComponents * (idX - startIdX), outPtr, floatType,
+                inComponents, numpixels, startIdX, idY, idZ, threadId);
 
               outPtr = static_cast<char*>(outPtr) + numpixels * outComponents * scalarSize;
             }
@@ -2780,6 +2783,8 @@ void vtkReslicePermuteExecute(vtkImageReslice* self, vtkDataArray* scalars,
     doConversion = false;
   }
 
+  int floatType = vtkTypeTraits<F>::VTKTypeID();
+
   // useful information from the interpolator
   int inComponents = interpolator->GetNumberOfComponents();
 
@@ -2911,18 +2916,20 @@ void vtkReslicePermuteExecute(vtkImageReslice* self, vtkDataArray* scalars,
           upperSkip = (upperSkip >= 0 ? upperSkip : 0);
           int idZ1 = idZ + lowerSkip;
           int nsamples1 = nsamples - lowerSkip - upperSkip;
+          bool hasManySamples = (nsamples1 > 1);
+          bool hasCompositeAndManySamples = (composite && hasManySamples);
 
           for (int isample = 0; isample < nsamples1; ++isample)
           {
-            F* tmpPtr = ((nsamples1 > 1) ? floatSumPtr : floatPtr);
+            F* tmpPtr = (hasManySamples ? floatSumPtr : floatPtr);
             interpolator->InterpolateRow(weights, idX, idY, idZ1, tmpPtr, span);
 
-            if (composite && (nsamples1 > 1))
+            if (hasCompositeAndManySamples)
             {
               composite(floatPtr, floatSumPtr, inComponents, span, isample, nsamples1);
             }
 
-            idZ1++;
+            ++idZ1;
           }
 
           if (rescaleScalars)
@@ -2932,8 +2939,8 @@ void vtkReslicePermuteExecute(vtkImageReslice* self, vtkDataArray* scalars,
 
           if (convertScalars)
           {
-            (self->*convertScalars)(floatPtr, outPtr, vtkTypeTraits<F>::VTKTypeID(), inComponents,
-              span, idXmin, idY, idZ, threadId);
+            (self->*convertScalars)(
+              floatPtr, outPtr, floatType, inComponents, span, idXmin, idY, idZ, threadId);
 
             outPtr =
               (static_cast<char*>(outPtr) + static_cast<size_t>(span) * outComponents * scalarSize);
@@ -3238,6 +3245,11 @@ void vtkImageReslice::ThreadedRequestData(vtkInformation* vtkNotUsed(request),
   if (!scalars)
   {
     // no data to reslice
+    return;
+  }
+  if (!scalars->HasStandardMemoryLayout())
+  {
+    vtkErrorMacro("vtkImageReslice can only be used with arrays having standard memory layout.");
     return;
   }
 

@@ -20,3 +20,4 @@ DEPENDS
 PRIVATE_DEPENDS
   VTK::CommonSystem
   VTK::ImagingSources
+INCLUDE_MARSHAL

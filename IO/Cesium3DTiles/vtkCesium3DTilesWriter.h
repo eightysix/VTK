@@ -5,11 +5,13 @@
  * @brief   Writes a dataset into 3D Tiles format.
  *
  *
- * Valid inputs include the vtkMultiBlockDataSet (as created by
- * vtkCityGMLReader) storing 3D buildings, vtkPointSet storing a point
- * cloud or vtkPolyData for storing a mesh.
+ * Valid inputs include the vtkMultiBlockDataSet of vtkPolyData (with material
+ * specification as fields: see vtkPolyDataMaterial) storing 3D buildings,
+ * vtkPointSet storing a point cloud or vtkPolyData for storing a
+ * mesh.
  *
  * @sa
+ * vtkPolyDataMaterial
  * vtkCityGMLReader
  * vtkMultiBlockDataSet
  * vtkPolyData
@@ -169,7 +171,7 @@ protected:
   int FillInputPortInformation(int port, vtkInformation* info) override;
 
   // Implementation of Write()
-  void WriteData() override;
+  bool WriteDataAndReturn() override;
 
   char* DirectoryName;
   char* TextureBaseDirectory;

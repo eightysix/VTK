@@ -4,7 +4,6 @@
 #include "vtkHyperTreeGridGradient.h"
 
 #include "vtkBitArray.h"
-#include "vtkCellArray.h"
 #include "vtkCellData.h"
 #include "vtkDoubleArray.h"
 #include "vtkHyperTree.h"
@@ -15,9 +14,7 @@
 #include "vtkLine.h"
 #include "vtkObjectFactory.h"
 #include "vtkPixel.h"
-#include "vtkPointData.h"
-#include "vtkPolyData.h"
-#include "vtkSMPTools.h"
+#include "vtkUnsignedCharArray.h"
 #include "vtkVoxel.h"
 
 #include <set>
@@ -453,7 +450,7 @@ int vtkHyperTreeGridGradient::ProcessTrees(vtkHyperTreeGrid* input, vtkDataObjec
     return 1;
   }
 
-  this->InMask = nullptr; // Masks aren't supported in this filter for now.
+  this->InMask = input->HasMask() ? input->GetMask() : nullptr;
   this->InGhostArray = input->GetGhostCells();
 
   // Gradient is always computed
@@ -463,26 +460,18 @@ int vtkHyperTreeGridGradient::ProcessTrees(vtkHyperTreeGrid* input, vtkDataObjec
   this->OutGradArray->SetNumberOfTuples(this->InArray->GetNumberOfTuples());
   GradientWorker gradientWorker(this->InArray, this->OutGradArray, this->ExtensiveComputation);
 
-  // For now HTG Gradient doesn't support masks because the unlimited cursors don't either.
-  // See https://gitlab.kitware.com/vtk/vtk/-/issues/19294
-  // So we need to make a copy of the input and remove its mask to perform the
-  // gradient processing.
-  vtkNew<vtkHyperTreeGrid> inputCopy;
-  inputCopy->ShallowCopy(input);
-  inputCopy->SetMask(nullptr);
-
-  // GradieGradientnt computation
+  // Gradient computation
 
   if (this->Mode == ComputeMode::UNLIMITED)
   {
     vtkIdType index;
     vtkHyperTreeGrid::vtkHyperTreeGridIterator it;
-    inputCopy->InitializeTreeIterator(it);
+    input->InitializeTreeIterator(it);
     vtkNew<vtkHyperTreeGridNonOrientedUnlimitedMooreSuperCursor> supercursor;
     while (it.GetNextTree(index))
     {
       // Initialize new cursor at root of current tree
-      inputCopy->InitializeNonOrientedUnlimitedMooreSuperCursor(supercursor, index);
+      input->InitializeNonOrientedUnlimitedMooreSuperCursor(supercursor, index);
       // Compute gradient recursively
       this->RecursivelyProcessGradientTree(supercursor.Get(), gradientWorker);
 
@@ -497,12 +486,12 @@ int vtkHyperTreeGridGradient::ProcessTrees(vtkHyperTreeGrid* input, vtkDataObjec
   {
     vtkIdType index;
     vtkHyperTreeGrid::vtkHyperTreeGridIterator it;
-    inputCopy->InitializeTreeIterator(it);
+    input->InitializeTreeIterator(it);
     vtkNew<vtkHyperTreeGridNonOrientedMooreSuperCursor> supercursor;
     while (it.GetNextTree(index))
     {
       // Initialize new cursor at root of current tree
-      inputCopy->InitializeNonOrientedMooreSuperCursor(supercursor, index);
+      input->InitializeNonOrientedMooreSuperCursor(supercursor, index);
       // Compute contours recursively
       this->RecursivelyProcessGradientTree(supercursor.Get(), gradientWorker);
 
@@ -581,6 +570,10 @@ void vtkHyperTreeGridGradient::RecursivelyProcessGradientTree(Cursor* supercurso
   vtkIdType id = supercursor->GetGlobalNodeIndex();
 
   if (this->InGhostArray && this->InGhostArray->GetTuple1(id))
+  {
+    return;
+  }
+  if (supercursor->IsMasked())
   {
     return;
   }

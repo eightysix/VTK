@@ -42,6 +42,7 @@
 #include "vtkInteractorStyle.h"
 #include "vtkNew.h"                 // ivars
 #include "vtkRenderingCoreModule.h" // For export macro
+#include "vtkWrappingHints.h"       // For VTK_MARSHALAUTO, VTK_MARSHALEXCLUDE
 
 VTK_ABI_NAMESPACE_BEGIN
 class vtkAbstractPropPicker;
@@ -52,7 +53,7 @@ class vtkMatrix4x4;
 class vtkTimerLog;
 class vtkTransform;
 
-class VTKRENDERINGCORE_EXPORT vtkInteractorStyle3D : public vtkInteractorStyle
+class VTKRENDERINGCORE_EXPORT VTK_MARSHALAUTO vtkInteractorStyle3D : public vtkInteractorStyle
 {
 public:
   static vtkInteractorStyle3D* New();
@@ -92,7 +93,9 @@ public:
    * Get/Set the interaction picker.
    * By default, a vtkPropPicker is instancied.
    */
+  VTK_MARSHALEXCLUDE(VTK_MARSHAL_EXCLUDE_REASON_IS_INTERNAL)
   vtkGetObjectMacro(InteractionPicker, vtkAbstractPropPicker);
+  VTK_MARSHALEXCLUDE(VTK_MARSHAL_EXCLUDE_REASON_IS_INTERNAL)
   void SetInteractionPicker(vtkAbstractPropPicker* prop);
 
 protected:

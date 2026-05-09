@@ -44,6 +44,7 @@
 #include "vtkOpenGLRenderWindow.h"
 #include "vtkRenderingVRModule.h" // For export macro
 #include "vtkSmartPointer.h"      // for vtkSmartPointer
+#include "vtkWrappingHints.h"     // For VTK_MARSHALAUTO
 #include "vtk_glad.h"             // used for methods
 
 #include <vector> // ivars
@@ -53,7 +54,7 @@ class vtkCamera;
 class vtkMatrix4x4;
 class vtkVRModel;
 
-class VTKRENDERINGVR_EXPORT vtkVRRenderWindow : public vtkOpenGLRenderWindow
+class VTKRENDERINGVR_EXPORT VTK_MARSHALAUTO vtkVRRenderWindow : public vtkOpenGLRenderWindow
 {
 public:
   enum

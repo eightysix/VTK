@@ -129,7 +129,11 @@ struct vtkPointSetToOctreeImageFilter::PointSetToImageFunctor
     unsigned char* octree = this->Octree->GetPointer(0);
 
     vtk::detail::ValueRange<vtkDataArray, 1> inField;
+#ifndef VTK_DEBUG_RANGE_ITERATORS
     vtk::detail::TupleRange<vtkAOSDataArrayTemplate<float>, vtk::detail::DynamicTupleSize> outField;
+#else
+    vtk::detail::TupleRange<vtkFloatArray, vtk::detail::DynamicTupleSize> outField;
+#endif
     if (this->UseFieldArray)
     {
       inField = vtk::DataArrayValueRange<1>(this->InField);

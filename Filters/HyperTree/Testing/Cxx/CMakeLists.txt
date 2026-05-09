@@ -38,17 +38,17 @@ set(test_sources
   TestHyperTreeGridBinary2DMaterial.cxx
   TestHyperTreeGridBinary2DMaterialIJK.cxx
   TestHyperTreeGridBinary2DThreshold.cxx
-  TestHyperTreeGridBinary2DThresholdImplicit.cxx
+  TestHyperTreeGridBinary2DThresholdImplicit.cxx,NO_SERDES
   TestHyperTreeGridBinary2DThresholdDeep.cxx
   TestHyperTreeGridBinary2DThresholdMaterial.cxx
   TestHyperTreeGridBinary2DThresholdMaterialDeep.cxx
-  TestHyperTreeGridBinary2DThresholdMaterialImplicit.cxx
+  TestHyperTreeGridBinary2DThresholdMaterialImplicit.cxx,NO_SERDES
   TestHyperTreeGridBinary2DVector.cxx
   TestHyperTreeGridBinary2DVectorAxisReflectionXCenter.cxx
   TestHyperTreeGridBinary2DVectorAxisReflectionYCenter.cxx
   TestHyperTreeGridBinary3DContour.cxx
   TestHyperTreeGridBinary3DContourDecomposePolyhedra.cxx
-  TestHyperTreeGridBinary3DContourImplicit.cxx
+  TestHyperTreeGridBinary3DContourImplicit.cxx,NO_SERDES
   TestHyperTreeGridBinary3DContourImplicitInteger.cxx,NO_VALID,NO_OUTPUT
   TestHyperTreeGridBinary3DFeatureEdges.cxx,LOOSE_VALID
   TestHyperTreeGridBinary3DGeometry.cxx
@@ -56,9 +56,11 @@ set(test_sources
   TestHyperTreeGridBinaryEllipseMaterial.cxx
   TestHyperTreeGridBinaryHyperbolicParaboloidMaterial.cxx
   TestHyperTreeGridEvaluateCoarse.cxx,NO_VALID,NO_OUTPUT
+  TestFeatureEdgesDispatcher.cxx
   TestHyperTreeGridExtractGhostCells.cxx,NO_VALID,NO_OUTPUT
   TestHyperTreeGridGenerateFields.cxx,NO_VALID,NO_OUTPUT
   TestHyperTreeGridGeometryPassCellIds.cxx
+  TestHyperTreeGridGradient.cxx,NO_VALID,NO_OUTPUT
   TestHyperTreeGridPlaneCutter.cxx,NO_VALID,NO_OUTPUT
   TestHyperTreeGridRemoveGhostCells.cxx,NO_VALID,NO_OUTPUT
   TestHyperTreeGridTernary2D.cxx
@@ -66,7 +68,7 @@ set(test_sources
   TestHyperTreeGridTernary2DFullMaterialBits.cxx
   TestHyperTreeGridTernary2DMaterial.cxx
   TestHyperTreeGridTernary2DMaterialBits.cxx
-  TestHyperTreeGridTernary3DAxisClipBox.cxx
+  TestHyperTreeGridTernary3DAxisClipBox.cxx,NO_SERDES
   TestHyperTreeGridTernary3DAxisClipCylinder.cxx
   TestHyperTreeGridTernary3DAxisClipPlanes.cxx
   TestHyperTreeGridTernary3DAxisCut.cxx
@@ -93,10 +95,10 @@ set(test_sources
   TestHyperTreeGridTernary3DPlaneCutterMaterial.cxx
   TestHyperTreeGridTernary3DThreshold.cxx
   TestHyperTreeGridTernary3DThresholdDeep.cxx
-  TestHyperTreeGridTernary3DThresholdImplicit.cxx
+  TestHyperTreeGridTernary3DThresholdImplicit.cxx,NO_SERDES
   TestHyperTreeGridTernary3DThresholdMaterial.cxx
   TestHyperTreeGridTernary3DThresholdMaterialDeep.cxx
-  TestHyperTreeGridTernary3DThresholdMaterialImplicit.cxx
+  TestHyperTreeGridTernary3DThresholdMaterialImplicit.cxx,NO_SERDES
   TestHyperTreeGridTernary3DUnstructured.cxx
   TestHyperTreeGridTernary3DUnstructuredMaterial.cxx
   TestHyperTreeGridTernaryHyperbola.cxx

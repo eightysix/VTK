@@ -19,6 +19,8 @@
 #include "PyVTKObject.h"
 #include "PyVTKMethodDescriptor.h"
 #include "vtkABINamespace.h"
+#include "vtkAbstractBuffer.h"
+#include "vtkCollection.h"
 #include "vtkDataArray.h"
 #include "vtkObjectBase.h"
 #include "vtkPythonCommand.h"
@@ -26,11 +28,17 @@
 #include "vtkStringFormatter.h"
 
 #include <cstddef>
+#include <cstdlib>
 #include <dictobject.h>
 #include <sstream>
+#include <unordered_map>
 
 // This will be set to the python type struct for vtkObjectBase
 static PyTypeObject* PyVTKObject_Type = nullptr;
+
+// Map from type to original tp_doc, used to restore docstrings when overrides are cancelled.
+// If a type is in this map, its current tp_doc was allocated with strdup and must be freed.
+static std::unordered_map<PyTypeObject*, const char*> OriginalDocStrings;
 
 VTK_ABI_NAMESPACE_BEGIN
 //------------------------------------------------------------------------------
@@ -67,7 +75,8 @@ static PyObject* PyVTKClass_override(PyObject* cls, PyObject* type)
 #endif
       )
       {
-        PyVTKClass* c = vtkPythonUtil::FindClass(vtkPythonUtil::StripModuleFromType(tp));
+        const char* tpName = vtkPythonUtil::StripModuleFromType(tp);
+        PyVTKClass* c = vtkPythonUtil::FindClass(vtkPythonUtil::VTKClassName(tpName));
         if (c && tp == c->py_type)
         {
           std::string str("method requires overriding with a pure python subclass of ");
@@ -78,11 +87,43 @@ static PyObject* PyVTKClass_override(PyObject* cls, PyObject* type)
         }
       }
 
-      // Set the override
-      PyVTKClass* thecls = vtkPythonUtil::FindClass(clsName.c_str());
+      // Set the override (use VTKClassName to translate Python name to C++ name
+      // for templated classes, whose Python and C++ names differ)
+      PyVTKClass* thecls = vtkPythonUtil::FindClass(vtkPythonUtil::VTKClassName(clsName.c_str()));
+      if (!thecls)
+      {
+        std::string str("could not find class ");
+        str += clsName;
+        PyErr_SetString(PyExc_TypeError, str.c_str());
+        return nullptr;
+      }
       thecls->py_type = newtypeobj;
       // Store override in dict of old type, to keep a reference to it
       PyDict_SetItemString(typeobj->tp_dict, "__override__", type);
+
+      // Copy the override's __doc__ to the base type so that
+      // help(BaseType) shows the Python documentation at the top
+      // instead of only under __override__.
+      PyObject* overrideDoc = PyObject_GetAttrString(type, "__doc__");
+      if (overrideDoc && PyUnicode_Check(overrideDoc))
+      {
+        const char* docStr = PyUnicode_AsUTF8(overrideDoc);
+        if (docStr)
+        {
+          // Save the original tp_doc on first override for this type
+          if (OriginalDocStrings.find(typeobj) == OriginalDocStrings.end())
+          {
+            OriginalDocStrings[typeobj] = typeobj->tp_doc;
+          }
+          else
+          {
+            // Free the previously strdup'd override doc
+            free(const_cast<char*>(typeobj->tp_doc));
+          }
+          typeobj->tp_doc = strdup(docStr);
+        }
+      }
+      Py_XDECREF(overrideDoc);
     }
     else
     {
@@ -94,9 +135,20 @@ static PyObject* PyVTKClass_override(PyObject* cls, PyObject* type)
   }
   else if (type == Py_None)
   {
-    // Clear the override
-    PyVTKClass* thecls = vtkPythonUtil::FindClass(clsName.c_str());
-    thecls->py_type = typeobj;
+    // Clear the override (use VTKClassName for templated classes)
+    PyVTKClass* thecls = vtkPythonUtil::FindClass(vtkPythonUtil::VTKClassName(clsName.c_str()));
+    if (thecls)
+    {
+      thecls->py_type = typeobj;
+    }
+    // Restore the original docstring if it was overridden
+    auto it = OriginalDocStrings.find(typeobj);
+    if (it != OriginalDocStrings.end())
+    {
+      free(const_cast<char*>(typeobj->tp_doc));
+      typeobj->tp_doc = it->second;
+      OriginalDocStrings.erase(it);
+    }
     // Delete the __override__ attribute if it exists
     if (PyDict_DelItemString(typeobj->tp_dict, "__override__") == -1)
     {
@@ -128,6 +180,124 @@ static PyMethodDef PyVTKClass_override_def = { "override", PyVTKClass_override, 
   "The main objective of this functionality is to enable developers to\n"
   "extend VTK classes with more pythonic subclasses that contain\n"
   "convenience functionality.\n" };
+
+//------------------------------------------------------------------------------
+// Pythonic methods for vtkCollection (append, insert, remove, clear).
+// Defined here so they are available to PyVTKClass_Add below.
+//------------------------------------------------------------------------------
+
+static PyObject* PyVTKCollection_Append(PyObject* self, PyObject* args)
+{
+  PyObject* obj;
+  if (!PyArg_ParseTuple(args, "O", &obj))
+  {
+    return nullptr;
+  }
+
+  if (!PyVTKObject_Check(obj))
+  {
+    PyErr_SetString(PyExc_TypeError, "argument must be a VTK object");
+    return nullptr;
+  }
+
+  vtkCollection* coll = vtkCollection::SafeDownCast(((PyVTKObject*)self)->vtk_ptr);
+  vtkObject* item = vtkObject::SafeDownCast(((PyVTKObject*)obj)->vtk_ptr);
+  if (!item)
+  {
+    PyErr_SetString(PyExc_TypeError, "argument must be a vtkObject");
+    return nullptr;
+  }
+
+  coll->AddItem(item);
+  Py_RETURN_NONE;
+}
+
+static PyObject* PyVTKCollection_Insert(PyObject* self, PyObject* args)
+{
+  int index;
+  PyObject* obj;
+  if (!PyArg_ParseTuple(args, "iO", &index, &obj))
+  {
+    return nullptr;
+  }
+
+  if (!PyVTKObject_Check(obj))
+  {
+    PyErr_SetString(PyExc_TypeError, "argument must be a VTK object");
+    return nullptr;
+  }
+
+  vtkCollection* coll = vtkCollection::SafeDownCast(((PyVTKObject*)self)->vtk_ptr);
+  vtkObject* item = vtkObject::SafeDownCast(((PyVTKObject*)obj)->vtk_ptr);
+  if (!item)
+  {
+    PyErr_SetString(PyExc_TypeError, "argument must be a vtkObject");
+    return nullptr;
+  }
+
+  // Python's list.insert(i, x) inserts before position i.
+  // vtkCollection::InsertItem(i, x) inserts after position i.
+  // Map: insert(i, x) -> InsertItem(i-1, x), with i >= n -> AddItem.
+  int n = coll->GetNumberOfItems();
+  if (index < 0)
+  {
+    index += n;
+  }
+  if (index <= 0)
+  {
+    coll->InsertItem(-1, item);
+  }
+  else if (index >= n)
+  {
+    coll->AddItem(item);
+  }
+  else
+  {
+    coll->InsertItem(index - 1, item);
+  }
+  Py_RETURN_NONE;
+}
+
+static PyObject* PyVTKCollection_Remove(PyObject* self, PyObject* args)
+{
+  PyObject* obj;
+  if (!PyArg_ParseTuple(args, "O", &obj))
+  {
+    return nullptr;
+  }
+
+  if (!PyVTKObject_Check(obj))
+  {
+    PyErr_SetString(PyExc_TypeError, "argument must be a VTK object");
+    return nullptr;
+  }
+
+  vtkCollection* coll = vtkCollection::SafeDownCast(((PyVTKObject*)self)->vtk_ptr);
+  vtkObject* item = vtkObject::SafeDownCast(((PyVTKObject*)obj)->vtk_ptr);
+  if (!item)
+  {
+    PyErr_SetString(PyExc_TypeError, "argument must be a vtkObject");
+    return nullptr;
+  }
+
+  coll->RemoveItem(item);
+  Py_RETURN_NONE;
+}
+
+static PyObject* PyVTKCollection_Clear(PyObject* self, PyObject* /*args*/)
+{
+  vtkCollection* coll = vtkCollection::SafeDownCast(((PyVTKObject*)self)->vtk_ptr);
+  coll->RemoveAllItems();
+  Py_RETURN_NONE;
+}
+
+static PyMethodDef PyVTKCollection_Methods[] = {
+  { "append", PyVTKCollection_Append, METH_VARARGS, "Append an item to the collection." },
+  { "insert", PyVTKCollection_Insert, METH_VARARGS, "Insert an item at a given index." },
+  { "remove", PyVTKCollection_Remove, METH_VARARGS, "Remove the first occurrence of an item." },
+  { "clear", PyVTKCollection_Clear, METH_NOARGS, "Remove all items from the collection." },
+  { nullptr, nullptr, 0, nullptr },
+};
 
 //------------------------------------------------------------------------------
 // Add a class, add methods and members to its type object.  A return
@@ -174,6 +344,17 @@ PyTypeObject* PyVTKClass_Add(
     PyDict_SetItemString(pytype->tp_dict, PyVTKClass_override_def.ml_name, func);
     Py_DECREF(func);
   }
+
+  // Add Pythonic methods to vtkCollection (inherited by all subclasses)
+  if (strcmp(classname, "vtkCollection") == 0)
+  {
+    for (PyMethodDef* meth = PyVTKCollection_Methods; meth->ml_name; meth++)
+    {
+      PyObject* func = PyVTKMethodDescriptor_New(pytype, meth);
+      PyDict_SetItemString(pytype->tp_dict, meth->ml_name, func);
+      Py_DECREF(func);
+    }
+  }
   return pytype;
 }
 
@@ -211,8 +392,10 @@ void PyVTKClass_AddCombinedGetSetDefinitions(PyTypeObject* pytype, PyGetSetDef* 
           getset->set = superGetSet->set;
           if (getset->closure)
           {
-            static_cast<PyVTKGetSet*>(getset->closure)->set =
-              static_cast<PyVTKGetSet*>(superGetSet->closure)->set;
+            auto* subClosure = static_cast<PyVTKGetSet*>(getset->closure);
+            auto* superClosure = static_cast<PyVTKGetSet*>(superGetSet->closure);
+            subClosure->set = superClosure->set;
+            subClosure->add = superClosure->add;
           }
         }
         Py_DECREF(key);
@@ -292,27 +475,24 @@ int PyVTKObject_Traverse(PyObject* o, visitproc visit, void* arg)
 PyObject* PyVTKObject_New(PyTypeObject* tp, PyObject* args, PyObject* /*kwds*/)
 {
   // XXX(python3-abi3): all types will be heap types in abi3
-  // If type was subclassed within python, then skip arg checks and
-  // simply create a new object.
-  PyObject* o = nullptr;
+  // Handle SWIG pointer reconstruction: exactly one string argument
+  // containing an encoded pointer address.  All other arguments are
+  // passed through to tp_init (__init__) by type_call, allowing
+  // Python override classes to define rich constructors.
   if ((PyType_GetFlags(tp) & Py_TPFLAGS_HEAPTYPE) == 0)
   {
-    if (!PyArg_UnpackTuple(args, vtkPythonUtil::GetTypeName(tp), 0, 1, &o))
+    if (PyTuple_GET_SIZE(args) == 1)
     {
-      return nullptr;
-    }
-
-    if (o)
-    {
-      // used to create a VTK object from a SWIG pointer
-      return vtkPythonUtil::GetObjectFromObject(o, vtkPythonUtil::StripModuleFromType(tp));
+      PyObject* o = PyTuple_GET_ITEM(args, 0);
+      if (PyUnicode_Check(o))
+      {
+        return vtkPythonUtil::GetObjectFromObject(o, vtkPythonUtil::StripModuleFromType(tp));
+      }
     }
   }
 
   // if PyVTKObject_FromPointer gets nullptr, it creates a new object.
-  o = PyVTKObject_FromPointer(tp, nullptr, nullptr);
-
-  return o;
+  return PyVTKObject_FromPointer(tp, nullptr, nullptr);
 }
 
 //------------------------------------------------------------------------------
@@ -435,6 +615,50 @@ int PyVTKObject_SetPropertyMulti(PyObject* op, PyObject* value, void* methods)
 }
 
 //------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+// Setter for Add/RemoveAll sequence properties (e.g. renderer.lights = [l1, l2])
+
+int PyVTKObject_SetPropertySequence(PyObject* op, PyObject* value, void* methods)
+{
+  PyVTKGetSet* getset = static_cast<PyVTKGetSet*>(methods);
+
+  // First call RemoveAll (stored in 'set') with no arguments
+  PyObject* emptyArgs = PyTuple_New(0);
+  PyObject* result = getset->set(op, emptyArgs);
+  Py_DECREF(emptyArgs);
+  if (result == nullptr)
+  {
+    return -1;
+  }
+  Py_DECREF(result);
+
+  // Iterate the sequence and call Add (stored in 'add') for each item
+  PyObject* seq = PySequence_Fast(value, "expected a sequence");
+  if (seq == nullptr)
+  {
+    return -1;
+  }
+
+  Py_ssize_t n = PySequence_Fast_GET_SIZE(seq);
+  for (Py_ssize_t i = 0; i < n; i++)
+  {
+    PyObject* item = PySequence_Fast_GET_ITEM(seq, i);
+    PyObject* args = PyTuple_Pack(1, item);
+    result = getset->add(op, args);
+    Py_DECREF(args);
+    if (result == nullptr)
+    {
+      Py_DECREF(seq);
+      return -1;
+    }
+    Py_DECREF(result);
+  }
+
+  Py_DECREF(seq);
+  return 0;
+}
+
+//------------------------------------------------------------------------------
 // This defines any special attributes of wrapped VTK objects.
 
 static PyObject* PyVTKObject_GetDict(PyObject* op, void*)
@@ -481,7 +705,7 @@ PyGetSetDef PyVTKObject_GetSet[] = { { pystr("__dict__"), PyVTKObject_GetDict, n
 
 //------------------------------------------------------------------------------
 // The following methods and struct define the "buffer" protocol
-// for PyVTKObject, so that python can read from a vtkDataArray.
+// for PyVTKObject, so that python can read from a vtkDataArray or vtkBuffer.
 // This is particularly useful for NumPy.
 
 //------------------------------------------------------------------------------
@@ -550,9 +774,9 @@ static int PyVTKObject_AsBuffer_GetBuffer(PyObject* obj, Py_buffer* view, int fl
 {
   PyVTKObject* self = (PyVTKObject*)obj;
   vtkDataArray* da = vtkDataArray::SafeDownCast(self->vtk_ptr);
-  if (da)
+  if (da && da->HasStandardMemoryLayout())
   {
-    void* ptr = da->GetVoidPointer(0);
+    void* ptr = da->GetVoidPointer(0); // NOLINT(bugprone-unsafe-functions)
     Py_ssize_t ntuples = da->GetNumberOfTuples();
     int ncomp = da->GetNumberOfComponents();
     int dsize = da->GetDataTypeSize();
@@ -621,6 +845,50 @@ static int PyVTKObject_AsBuffer_GetBuffer(PyObject* obj, Py_buffer* view, int fl
     return 0;
   }
 
+  // Check for vtkAbstractBuffer (vtkBuffer<T> template instantiations)
+  vtkAbstractBuffer* ab = vtkAbstractBuffer::SafeDownCast(self->vtk_ptr);
+  if (ab)
+  {
+    void* ptr = ab->GetVoidBuffer();
+    Py_ssize_t nelements = ab->GetNumberOfElements();
+    int dsize = ab->GetDataTypeSize();
+    const char* format = pythonTypeFormat(ab->GetDataType());
+    Py_ssize_t size = nelements * dsize;
+
+    // start by building a basic "unsigned char" buffer
+    if (PyBuffer_FillInfo(view, obj, ptr, size, 0, flags) == -1)
+    {
+      return -1;
+    }
+    // check if a dimensioned array was requested
+    if (format != nullptr && (flags & PyBUF_ND) != 0)
+    {
+      // vtkBuffer is always 1D
+      view->itemsize = dsize;
+      view->ndim = 1;
+      view->format = const_cast<char*>(format);
+
+      {
+        if (self->vtk_buffer && self->vtk_buffer[0] != view->ndim)
+        {
+          delete[] self->vtk_buffer;
+          self->vtk_buffer = nullptr;
+        }
+        if (self->vtk_buffer == nullptr)
+        {
+          self->vtk_buffer = new Py_ssize_t[2 * view->ndim + 1];
+          self->vtk_buffer[0] = view->ndim;
+        }
+        view->shape = &self->vtk_buffer[1];
+        view->strides = &self->vtk_buffer[view->ndim + 1];
+      }
+
+      view->shape[0] = nelements;
+      view->strides[0] = view->itemsize;
+    }
+    return 0;
+  }
+
   PyErr_Format(
     PyExc_ValueError, "Cannot get a buffer from %s.", vtkPythonUtil::GetTypeNameForObject(obj));
   return -1;
@@ -638,6 +906,83 @@ static void PyVTKObject_AsBuffer_ReleaseBuffer(PyObject* obj, Py_buffer* view)
 PyBufferProcs PyVTKObject_AsBuffer = {
   PyVTKObject_AsBuffer_GetBuffer,    // bf_getbuffer
   PyVTKObject_AsBuffer_ReleaseBuffer // bf_releasebuffer
+};
+
+//------------------------------------------------------------------------------
+// Sequence protocol for vtkCollection (inherited by all subclasses)
+//------------------------------------------------------------------------------
+
+static Py_ssize_t PyVTKObject_AsSequence_Length(PyObject* self)
+{
+  vtkObjectBase* ob = ((PyVTKObject*)self)->vtk_ptr;
+  vtkCollection* coll = vtkCollection::SafeDownCast(ob);
+  if (coll)
+  {
+    return static_cast<Py_ssize_t>(coll->GetNumberOfItems());
+  }
+  PyErr_SetString(PyExc_TypeError, "object is not a vtkCollection");
+  return -1;
+}
+
+static PyObject* PyVTKObject_AsSequence_GetItem(PyObject* self, Py_ssize_t index)
+{
+  vtkObjectBase* ob = ((PyVTKObject*)self)->vtk_ptr;
+  vtkCollection* coll = vtkCollection::SafeDownCast(ob);
+  if (!coll)
+  {
+    PyErr_SetString(PyExc_TypeError, "object is not a vtkCollection");
+    return nullptr;
+  }
+
+  // Python normalizes negative indices before calling sq_item,
+  // so any remaining negative index is truly out of range.
+  Py_ssize_t n = static_cast<Py_ssize_t>(coll->GetNumberOfItems());
+  if (index < 0 || index >= n)
+  {
+    PyErr_SetString(PyExc_IndexError, "index out of range");
+    return nullptr;
+  }
+
+  vtkObject* item = coll->GetItemAsObject(static_cast<int>(index));
+  return vtkPythonUtil::GetObjectFromPointer(item);
+}
+
+static int PyVTKObject_AsSequence_Contains(PyObject* self, PyObject* value)
+{
+  vtkObjectBase* ob = ((PyVTKObject*)self)->vtk_ptr;
+  vtkCollection* coll = vtkCollection::SafeDownCast(ob);
+  if (!coll)
+  {
+    PyErr_SetString(PyExc_TypeError, "object is not a vtkCollection");
+    return -1;
+  }
+
+  if (!PyVTKObject_Check(value))
+  {
+    return 0;
+  }
+
+  vtkObjectBase* valObj = ((PyVTKObject*)value)->vtk_ptr;
+  vtkObject* vtkObj = vtkObject::SafeDownCast(valObj);
+  if (!vtkObj)
+  {
+    return 0;
+  }
+
+  return coll->IsItemPresent(vtkObj) ? 1 : 0;
+}
+
+PySequenceMethods PyVTKObject_AsSequence = {
+  PyVTKObject_AsSequence_Length,   // sq_length
+  nullptr,                         // sq_concat
+  nullptr,                         // sq_repeat
+  PyVTKObject_AsSequence_GetItem,  // sq_item
+  nullptr,                         // sq_slice (deprecated)
+  nullptr,                         // sq_ass_item
+  nullptr,                         // sq_ass_slice (deprecated)
+  PyVTKObject_AsSequence_Contains, // sq_contains
+  nullptr,                         // sq_inplace_concat
+  nullptr,                         // sq_inplace_repeat
 };
 
 //------------------------------------------------------------------------------

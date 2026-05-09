@@ -9,8 +9,11 @@
 #ifndef vtkHDFReaderImplementation_h
 #define vtkHDFReaderImplementation_h
 
+#include "vtkAMRBox.h"
+#include "vtkDataSetAttributes.h"
 #include "vtkHDFReader.h"
 #include "vtk_hdf5.h"
+
 #include <array>
 #include <map>
 #include <string>
@@ -38,12 +41,12 @@ public:
   /**
    * Opens this VTK HDF file and checks if it is valid.
    */
-  bool Open(VTK_FILEPATH const char* fileName);
+  bool Open(VTK_FILEPATH const char* fileName, bool quiet = false);
 
   /**
    * Opens this VTK HDF stream and checks if it is valid.
    */
-  bool Open(vtkResourceStream* stream);
+  bool Open(vtkResourceStream* stream, bool quiet = false);
 
   /**
    * Closes the VTK HDF file and releases any allocated resources.
@@ -115,6 +118,14 @@ public:
     const char* name, vtkIdType offset = -1, vtkIdType size = -1, vtkIdType dimMaxSize = -1);
   ///@}
 
+  /**
+   * Given a named data array and an attribute type,
+   * read from the file the special array attribute (scalars, global ids, etc.) if any,
+   * and set in in the provided vtkDataSetAttributes object.
+   */
+  void AttachDatasetAttributeToArray(
+    int attributeType, vtkDataArray* array, vtkDataSetAttributes* attributes);
+
   ///@{
   /**
    * Reads a 1D metadata array in a DataArray or a vector of vtkIdType.
@@ -177,7 +188,7 @@ public:
   /**
    * Initialize meta information of the implementation based on root name specified.
    */
-  bool RetrieveHDFInformation(const std::string& rootName);
+  bool RetrieveHDFInformation(const std::string& rootName, const std::string& groupPrefix = "");
 
   /**
    * Retrieve ImageData attributes and store them.
@@ -190,27 +201,37 @@ public:
    * Specific public API for AMR support.
    */
   /**
-   * Retrieve for each required level AMRBlocks size and position.
+   * Return the number of level in an AMR file
    */
-  bool ComputeAMRBlocksPerLevels(unsigned int maxLevel);
+  unsigned int GetAMRNumberOfLevels();
+
+  /**
+   * Retrieve for each required level AMRBlocks size and position.
+   * Set maxLevel to the number of level in the file
+   * Return true in case of success, false otherwise.
+   */
+  bool ComputeAMRBlocksPerLevels(unsigned int nLevels);
 
   /**
    * Retrieve offset for AMRBox, point/cell/field arrays for each level.
+   * Set maxLevel to the number of level in the file
+   * Return true in case of success, false otherwise.
    */
   bool ComputeAMROffsetsPerLevels(
-    vtkDataArraySelection* dataArraySelection[3], vtkIdType step, unsigned int maxLevel);
+    vtkDataArraySelection* dataArraySelection[3], vtkIdType step, unsigned int nLevels);
 
   /**
    * Read the AMR topology based on offset data on AMRBlocks.
    */
-  bool ReadAMRTopology(vtkOverlappingAMR* data, unsigned int level, unsigned int maxLevel,
-    double origin[3], bool isTemporalData);
+  bool ReadAMRTopology(
+    vtkOverlappingAMR* data, unsigned int maxLevel, double origin[3], bool isTemporalData);
 
   /**
-   * Read the AMR data based on offset on point/cell/field datas.
+   * Get the temporal offset for a specific attribute
+   * Return true if the offset arg was set, false is it was not for any reason
    */
-  bool ReadAMRData(vtkOverlappingAMR* data, unsigned int level, unsigned int maxLevel,
-    vtkDataArraySelection* dataArraySelection[3], bool isTemporalData);
+  bool GetAMRTemporalOffsetForAttributeType(
+    unsigned int level, int attributeType, const std::string& name, hsize_t& offset);
   ///@}
 
   /**
@@ -281,8 +302,6 @@ private:
     std::vector<vtkIdType> BlockOffsetsPerLevel;
     std::map<std::string, std::vector<vtkIdType>> CellOffsetsPerLevel;
     std::map<std::string, std::vector<vtkIdType>> PointOffsetsPerLevel;
-    std::map<std::string, std::vector<vtkIdType>> FieldOffsetsPerLevel;
-    std::map<std::string, std::vector<vtkIdType>> FieldSizesPerLevel;
 
     void Clear()
     {
@@ -290,8 +309,6 @@ private:
       this->BlockOffsetsPerLevel.clear();
       this->PointOffsetsPerLevel.clear();
       this->CellOffsetsPerLevel.clear();
-      this->FieldOffsetsPerLevel.clear();
-      this->FieldSizesPerLevel.clear();
     }
   };
 
@@ -302,8 +319,6 @@ private:
     hid_t levelGroupID, std::vector<int>& amrBoxRawData, int level, bool isTemporalData);
   bool ReadLevelTopology(unsigned int level, const std::string& levelGroupName,
     vtkOverlappingAMR* data, double origin[3], bool isTemporalData);
-  bool ReadLevelData(unsigned int level, const std::string& levelGroupName, vtkOverlappingAMR* data,
-    vtkDataArraySelection* dataArraySelection[3], bool isTemporalData);
   ///@}
 };
 

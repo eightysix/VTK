@@ -1,8 +1,11 @@
 # Enable SPDX generation
 set(VTK_GENERATE_SPDX ON CACHE BOOL "")
 
-# Enable IOUSD module
+# Disable IOUSD module
 set(VTK_MODULE_ENABLE_VTK_IOUSD NO CACHE STRING "") # usd
+
+# Disable wayland testing as CI machines do not have a wayland compositor.
+set(VTK_USE_Wayland OFF CACHE BOOL "")
 
 # Add rpath entries for dependencies.
 set(CMAKE_INSTALL_RPATH "/usr/local/lib64:$ENV{CI_PROJECT_DIR}/.gitlab/qt6/lib" CACHE STRING "")

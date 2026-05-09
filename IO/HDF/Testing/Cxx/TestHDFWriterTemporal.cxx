@@ -7,8 +7,9 @@
 #include "vtkDataAssemblyUtilities.h"
 #include "vtkDataObjectTree.h"
 #include "vtkDataSet.h"
-#include "vtkExtractSurface.h"
 #include "vtkForceStaticMesh.h"
+#include "vtkGenerateTimeSteps.h"
+#include "vtkGeometryFilter.h"
 #include "vtkGroupDataSetsFilter.h"
 #include "vtkHDFReader.h"
 #include "vtkHDFWriter.h"
@@ -19,18 +20,19 @@
 #include "vtkNew.h"
 #include "vtkPartitionedDataSet.h"
 #include "vtkPartitionedDataSetCollection.h"
-#include "vtkPartitionedDataSetCollectionAlgorithm.h"
 #include "vtkPointData.h"
 #include "vtkPointDataToCellData.h"
 #include "vtkPolyData.h"
+#include "vtkSpatioTemporalHarmonicsAttribute.h"
 #include "vtkSpatioTemporalHarmonicsSource.h"
+#include "vtkSphereSource.h"
 #include "vtkStreamingDemandDrivenPipeline.h"
 #include "vtkStringFormatter.h"
 #include "vtkTestUtilities.h"
 #include "vtkTesting.h"
-#include "vtkTransformFilter.h"
+#include "vtkType.h"
 #include "vtkUnstructuredGrid.h"
-#include "vtkXMLUnstructuredGridWriter.h"
+#include "vtkWarpScalar.h"
 
 namespace HDFTestUtilities
 {
@@ -38,13 +40,6 @@ vtkStandardNewMacro(vtkAddAssembly);
 }
 namespace
 {
-
-enum supportedDataSetTypes
-{
-  vtkUnstructuredGridType,
-  vtkPolyDataType
-};
-
 struct WriterConfigOptions
 {
   bool UseExternalTimeSteps;
@@ -58,7 +53,7 @@ bool TestTemporalData(const std::string& tempDir, const std::string& dataRoot,
   const std::string& baseName, const WriterConfigOptions& config, int datatype)
 {
   // Open original temporal HDF data
-  const std::string basePath = dataRoot + "/Data/" + baseName;
+  const std::string basePath = dataRoot + "/Data/vtkHDF/" + baseName;
   vtkNew<vtkHDFReader> baseHDFReader;
   baseHDFReader->SetFileName(basePath.c_str());
   baseHDFReader->Update();
@@ -74,7 +69,7 @@ bool TestTemporalData(const std::string& tempDir, const std::string& dataRoot,
   HDFWriter->SetInputConnection(
     datatype > 0 ? mergeBlocks->GetOutputPort() : baseHDFReader->GetOutputPort());
   std::string tempPath = tempDir + "/HDFWriter_";
-  tempPath += baseName + ".vtkhdf" + config.FileNameSuffix;
+  tempPath += baseName + config.FileNameSuffix + ".vtkhdf";
   HDFWriter->SetFileName(tempPath.c_str());
   HDFWriter->SetUseExternalTimeSteps(config.UseExternalTimeSteps);
   HDFWriter->SetUseExternalPartitions(config.UseExternalPartitions);
@@ -164,54 +159,102 @@ bool TestTemporalData(const std::string& tempDir, const std::string& dataRoot,
 bool TestTemporalStaticMesh(
   const std::string& tempDir, const std::string& baseName, int dataSetType)
 {
-  /*
-   * At the time this test has been written, the reader only support static mesh for partitioned
-   * data set. We can't use use both the merge parts & the cache at the same time, which cause every
-   * static to be read as a partitioned dataset with at least one partition. The writer doesn't
-   * support writing partitioned dataset yet so we can't test static mesh writing properly since we
-   * can't read non partitioned static data.
-   */
   // Custom static mesh source
   vtkNew<vtkSpatioTemporalHarmonicsSource> harmonics;
   harmonics->ClearHarmonics();
-  harmonics->AddHarmonic(1, 0, 0.6283, 0.6283, 0.6283, 0);
-  harmonics->AddHarmonic(3, 0, 0.6283, 0, 0, 1.5708);
-  harmonics->AddHarmonic(2, 0, 0, 0.6283, 0, 3.1416);
-  harmonics->AddHarmonic(1, 0, 0, 0, 0.6283, 4.1724);
+  harmonics->AddHarmonic(1, 1, 0.6283, 0.6283, 0.6283, 0);
+  harmonics->AddHarmonic(3, 1, 0.6283, 0, 0, 1.5708);
+  harmonics->AddHarmonic(2, 1, 0, 0.6283, 0, 3.1416);
+  harmonics->AddHarmonic(1, 2, 0, 0, 0.6283, 4.1724);
 
-  vtkSmartPointer<vtkAlgorithm> datasetTypeSpecificFilter;
-
-  if (dataSetType == ::supportedDataSetTypes::vtkUnstructuredGridType)
-  {
-    datasetTypeSpecificFilter =
-      vtkSmartPointer<vtkCleanUnstructuredGrid>::Take(vtkCleanUnstructuredGrid::New());
-  }
-  else if (dataSetType == ::supportedDataSetTypes::vtkPolyDataType)
-  {
-    datasetTypeSpecificFilter = vtkSmartPointer<vtkExtractSurface>::Take(vtkExtractSurface::New());
-  }
-  datasetTypeSpecificFilter->SetInputConnection(0, harmonics->GetOutputPort(0));
-
+  vtkNew<vtkCleanUnstructuredGrid> cleanUG;
+  vtkNew<vtkGeometryFilter> geom;
   vtkNew<vtkPointDataToCellData> pointDataToCellData;
   pointDataToCellData->SetPassPointData(true);
-  pointDataToCellData->SetInputConnection(0, datasetTypeSpecificFilter->GetOutputPort(0));
-
   vtkNew<vtkForceStaticMesh> staticMesh;
-  staticMesh->SetInputConnection(0, pointDataToCellData->GetOutputPort(0));
+
+  if (dataSetType == VTK_UNSTRUCTURED_GRID)
+  {
+    cleanUG->SetInputConnection(harmonics->GetOutputPort());
+    pointDataToCellData->SetInputConnection(0, cleanUG->GetOutputPort(0));
+    staticMesh->SetInputConnection(0, pointDataToCellData->GetOutputPort(0));
+  }
+  else
+  {
+    geom->SetInputConnection(harmonics->GetOutputPort(0));
+    staticMesh->SetInputConnection(0, geom->GetOutputPort(0));
+  }
 
   // Write the data to a file using the vtkHDFWriter
   vtkNew<vtkHDFWriter> HDFWriter;
   HDFWriter->SetInputConnection(staticMesh->GetOutputPort());
-  std::string tempPath = tempDir + "/HDFWriter_";
-  tempPath += baseName + ".vtkhdf";
-  HDFWriter->SetFileName(tempPath.c_str());
+  HDFWriter->SetInputConnection(staticMesh->GetOutputPort());
+  std::string staticPath = tempDir + "/HDFWriter_" + baseName + "_static.vtkhdf";
+  std::string nonStaticPath = tempDir + "/HDFWriter_" + baseName + "_nostatic.vtkhdf";
+  HDFWriter->SetFileName(staticPath.c_str());
   HDFWriter->SetWriteAllTimeSteps(true);
   HDFWriter->SetCompressionLevel(1);
+
   if (!HDFWriter->Write())
   {
     vtkLog(ERROR, "An error occurred while writing the static mesh HDF file");
     return false;
   }
+
+  if (dataSetType == VTK_UNSTRUCTURED_GRID)
+  {
+    HDFWriter->SetInputConnection(pointDataToCellData->GetOutputPort());
+  }
+  else
+  {
+    HDFWriter->SetInputConnection(geom->GetOutputPort());
+  }
+  HDFWriter->SetFileName(nonStaticPath.c_str());
+  if (!HDFWriter->Write())
+  {
+    vtkLog(ERROR, "An error occurred while writing the non static mesh HDF file");
+    return false;
+  }
+
+  vtkNew<vtkHDFReader> readerStatic;
+  readerStatic->SetFileName(staticPath.c_str());
+  vtkNew<vtkHDFReader> readerNonStatic;
+  readerNonStatic->SetFileName(nonStaticPath.c_str());
+
+  for (int step = 0; step < 20; step++)
+  {
+    readerStatic->SetStep(step);
+    readerStatic->Update();
+    readerNonStatic->SetStep(step);
+    readerNonStatic->Update();
+
+    if (dataSetType == VTK_UNSTRUCTURED_GRID)
+    {
+      vtkUnstructuredGrid* staticUG =
+        vtkUnstructuredGrid::SafeDownCast(readerStatic->GetOutputAsDataSet());
+      vtkUnstructuredGrid* nonStaticUG =
+        vtkUnstructuredGrid::SafeDownCast(readerNonStatic->GetOutputAsDataSet());
+
+      if (!vtkTestUtilities::CompareDataObjects(staticUG, nonStaticUG))
+      {
+        vtkLog(ERROR, "Static and non static files do not have the same data");
+        return false;
+      }
+    }
+    else
+    {
+      vtkPolyData* staticPD = vtkPolyData::SafeDownCast(readerStatic->GetOutputAsDataSet());
+      vtkPolyData* nonStaticPD = vtkPolyData::SafeDownCast(readerNonStatic->GetOutputAsDataSet());
+
+      if (!vtkTestUtilities::CompareDataObjects(staticPD, nonStaticPD))
+      {
+        vtkLog(
+          ERROR, "Static and non static files do not have the same data for time step " << step);
+        return false;
+      }
+    }
+  }
+
   return true;
 }
 
@@ -223,7 +266,7 @@ bool TestTemporalComposite(const std::string& tempDir, const std::string& dataRo
   std::vector<vtkSmartPointer<vtkMergeBlocks>> baselineReadersMerged;
   for (const auto& baseName : baseNames)
   {
-    const std::string filePath = dataRoot + "/Data/" + baseName + ".hdf";
+    const std::string filePath = dataRoot + "/Data/vtkHDF/" + baseName + ".vtkhdf";
     vtkNew<vtkHDFReader> baseHDFReader;
     baseHDFReader->SetFileName(filePath.c_str());
 
@@ -242,7 +285,7 @@ bool TestTemporalComposite(const std::string& tempDir, const std::string& dataRo
   groupDataSets->SetOutputType(compositeType);
   for (int i = 0; i < static_cast<int>(baseNames.size()); i++)
   {
-    if (baseNames[i] == "transient_sphere")
+    if (baseNames[i] == "temporal_sphere")
     {
       groupDataSets->AddInputConnection(baselineReadersMerged[i]->GetOutputPort());
     }
@@ -321,7 +364,7 @@ bool TestTemporalComposite(const std::string& tempDir, const std::string& dataRo
 
       auto currentGroupedDO = vtkDataSet::SafeDownCast(iter->GetCurrentDataObject());
       vtkDataSet* baselineDO = nullptr;
-      if (baseNames[compositeID] == "transient_sphere")
+      if (baseNames[compositeID] == "temporal_sphere")
       {
         baselineDO =
           vtkDataSet::SafeDownCast(baselineReadersMerged[compositeID]->GetOutputDataObject(0));
@@ -352,6 +395,78 @@ bool TestTemporalComposite(const std::string& tempDir, const std::string& dataRo
 }
 
 //----------------------------------------------------------------------------
+bool TestTemporalPartitioned(const std::string& tempDir)
+{
+  vtkNew<vtkSphereSource> sph1;
+  sph1->SetRadius(2.5);
+
+  vtkNew<vtkSphereSource> sph2;
+  sph2->SetCenter(10.0, 10.0, 10.0);
+  sph2->SetRadius(2.5);
+
+  vtkNew<vtkGroupDataSetsFilter> group;
+  group->AddInputConnection(sph1->GetOutputPort());
+  group->AddInputConnection(sph2->GetOutputPort());
+  group->SetOutputTypeToPartitionedDataSet();
+
+  // Generate several time steps
+  vtkNew<vtkGenerateTimeSteps> generateTimeSteps;
+  const std::array timeValues{ 1.0, 3.0, 5.0 };
+  for (const double& value : timeValues)
+  {
+    generateTimeSteps->AddTimeStepValue(value);
+  }
+  generateTimeSteps->SetInputConnection(group->GetOutputPort());
+
+  // Generate a time-varying point field: use default ParaView weights
+  vtkNew<vtkSpatioTemporalHarmonicsAttribute> harmonics;
+  harmonics->AddHarmonic(1.0, 1.0, 0.6283, 0.6283, 0.6283, 0.0);
+  harmonics->AddHarmonic(3.0, 1.0, 0.6283, 0.0, 0.0, 1.5708);
+  harmonics->AddHarmonic(2.0, 2.0, 0.0, 0.6283, 0.0, 3.1416);
+  harmonics->AddHarmonic(1.0, 3.0, 0.0, 0.0, 0.6283, 4.7124);
+  harmonics->SetInputConnection(generateTimeSteps->GetOutputPort());
+
+  // Warp by scalar
+  vtkNew<vtkWarpScalar> warp;
+  warp->SetInputConnection(harmonics->GetOutputPort());
+  warp->SetScaleFactor(0.1);
+
+  std::string writtenFile = tempDir + "/temporal_partitions.vtkhdf";
+  vtkNew<vtkHDFWriter> writer;
+  writer->SetFileName(writtenFile.c_str());
+  writer->SetInputConnection(warp->GetOutputPort());
+  writer->Write();
+
+  vtkNew<vtkHDFReader> readerHDF;
+  readerHDF->SetPieceDistribution(vtkHDFReader::Block);
+  readerHDF->SetFileName(writtenFile.c_str());
+
+  for (size_t step = 0; step < timeValues.size(); step++)
+  {
+    warp->GetOutputInformation(0)->Set(
+      vtkStreamingDemandDrivenPipeline::UPDATE_TIME_STEP(), timeValues[step]);
+    warp->Modified();
+    warp->Update();
+
+    readerHDF->SetStep(step);
+    readerHDF->Update();
+
+    vtkPartitionedDataSet* pds =
+      vtkPartitionedDataSet::SafeDownCast(readerHDF->GetOutputDataObject(0));
+    vtkPartitionedDataSet* pdsBaseline =
+      vtkPartitionedDataSet::SafeDownCast(warp->GetOutputDataObject(0));
+
+    if (!vtkTestUtilities::CompareDataObjects(pds, pdsBaseline))
+    {
+      vtkErrorWithObjectMacro(
+        nullptr, "Expected partitionedDataSets to match for time step " << step);
+      return false;
+    }
+  }
+
+  return true;
+}
+//----------------------------------------------------------------------------
 int TestHDFWriterTemporal(int argc, char* argv[])
 {
   // Get temporary testing directory
@@ -372,11 +487,12 @@ int TestHDFWriterTemporal(int argc, char* argv[])
   bool result = true;
 
   // Run tests : read data, write it, read the written data and compare to the original
-  std::vector<std::string> baseNames = { "transient_sphere.hdf",
-    "temporal_unstructured_grid.vtkhdf", "transient_harmonics.hdf" };
+  std::vector<std::string> baseNames = { "temporal_sphere.vtkhdf",
+    "temporal_unstructured_grid.vtkhdf", "temporal_harmonics.vtkhdf",
+    "temporal_partitioned_polydata_cache.vtkhdf" };
   std::vector<int> parallel_types{ VTK_UNSTRUCTURED_GRID,
     -1, // Not parallel
-    -1 };
+    -1, -1 };
   std::vector<WriterConfigOptions> configs{ { false, false, "_NoExtTimeNoExtPart" },
     { false, true, "_NoExtTimeExtPart" }, { true, false, "_ExtTimeNoExtPart" },
     { true, true, "_ExtTimeExtPart" } };
@@ -390,17 +506,16 @@ int TestHDFWriterTemporal(int argc, char* argv[])
     }
   }
 
-  // Use a modified version of transient_harmonics to make sure that the time values match
-  // between
-  // both datasets
-  std::vector<std::string> baseNamesComposite = { "transient_sphere", "transient_harmonics" };
+  // Use a modified version of temporal_harmonics to make sure that the time values match
+  // between both datasets
+  std::vector<std::string> baseNamesComposite = { "temporal_sphere", "temporal_harmonics" };
   result &= TestTemporalComposite(tempDir, dataRoot, baseNamesComposite, VTK_MULTIBLOCK_DATA_SET);
   result &= TestTemporalComposite(
     tempDir, dataRoot, baseNamesComposite, VTK_PARTITIONED_DATA_SET_COLLECTION);
+  result &= TestTemporalPartitioned(tempDir);
 
-  result &= TestTemporalStaticMesh(
-    tempDir, "transient_static_sphere_ug_source", ::supportedDataSetTypes::vtkUnstructuredGridType);
-  result &= TestTemporalStaticMesh(
-    tempDir, "transient_static_sphere_polydata_source", ::supportedDataSetTypes::vtkPolyDataType);
+  result &= TestTemporalStaticMesh(tempDir, "transient_static_sphere_ug_source", VTK_POLY_DATA);
+  result &=
+    TestTemporalStaticMesh(tempDir, "transient_static_sphere_polydata_source", VTK_POLY_DATA);
   return result ? EXIT_SUCCESS : EXIT_FAILURE;
 }

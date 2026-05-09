@@ -2033,7 +2033,8 @@ vtkSmartPointer<vtkAbstractArray> vtkIOSSReaderInternal::GetField(const std::str
     // subset the field.
     vtkNew<vtkIdList> list;
     // this is a shallow copy.
-    list->SetArray(ids_to_extract->GetPointer(0), ids_to_extract->GetNumberOfTuples());
+    list->SetList(
+      ids_to_extract->GetPointer(0), ids_to_extract->GetNumberOfTuples(), /*save*/ true);
 
     vtkSmartPointer<vtkAbstractArray> clone;
     clone.TakeReference(full_field->NewInstance());
@@ -2041,9 +2042,6 @@ vtkSmartPointer<vtkAbstractArray> vtkIOSSReaderInternal::GetField(const std::str
     clone->SetNumberOfComponents(full_field->GetNumberOfComponents());
     clone->SetNumberOfTuples(list->GetNumberOfIds());
     full_field->GetTuples(list, clone);
-
-    // get back the data pointer from the idlist
-    list->Release();
 
     // convert field if needed for VTK e.g. ids have to be `vtkIdTypeArray`.
     clone = this->ConvertFieldForVTK(clone);
@@ -2277,7 +2275,7 @@ bool vtkIOSSReaderInternal::GetFields(vtkDataSetAttributes* dsa, vtkDataArraySel
             vtkNew<vtkIdTypeArray> communicatingSides;
             communicatingSides->SetName(vtkFieldData::CommunicatingSidesArrayName());
             communicatingSides->SetNumberOfComponents(3);
-            communicatingSides->Allocate(static_cast<vtkIdType>(entityProcessor.size() / 3));
+            communicatingSides->ReserveTuples(static_cast<vtkIdType>(entityProcessor.size()));
             for (std::size_t ii = 0; ii < entityProcessor.size() / 3; ++ii)
             {
               auto it = globalsToLocalsThisBlock.find(entityProcessor[3 * ii]);
@@ -2510,7 +2508,7 @@ bool vtkIOSSReaderInternal::GetQAAndInformationRecords(
   vtkNew<vtkStringArray> qa_records;
   qa_records->SetName("QA Records");
   qa_records->SetNumberOfComponents(4);
-  qa_records->Allocate(static_cast<vtkIdType>(qa.size()));
+  qa_records->ReserveValues(static_cast<vtkIdType>(qa.size()));
   qa_records->SetComponentName(0, "Code Name");
   qa_records->SetComponentName(1, "QA Descriptor");
   qa_records->SetComponentName(2, "Date");
@@ -2524,7 +2522,7 @@ bool vtkIOSSReaderInternal::GetQAAndInformationRecords(
   vtkNew<vtkStringArray> info_records;
   info_records->SetName("Information Records");
   info_records->SetNumberOfComponents(1);
-  info_records->Allocate(static_cast<vtkIdType>(info.size()));
+  info_records->ReserveValues(static_cast<vtkIdType>(info.size()));
   for (auto& n : info)
   {
     info_records->InsertNextValue(n);

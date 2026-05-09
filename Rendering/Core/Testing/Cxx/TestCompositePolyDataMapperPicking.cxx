@@ -258,7 +258,7 @@ int TestCompositePolyDataMapperPicking(int argc, char* argv[])
   ren->ResetCamera();
   win->Render(); // get the window up
 
-  // modify the data to force a rebuild of OpenGL structs
+  // modify the data to force a rebuild of internal state
   // after rendering set one cylinder to white
   mapper->SetBlockColor(80, 1.0, 1.0, 1.0);
   mapper->SetBlockOpacity(80, 1.0);
@@ -303,7 +303,7 @@ int TestCompositePolyDataMapperPicking(int argc, char* argv[])
   // Verify pick
   std::map<int, std::vector<int>>& bPrims = com->GetBlockPrims();
   if (bPrims.find(48) == bPrims.end() ||
-    std::find(bPrims[48].begin(), bPrims[48].end(), 14) == bPrims[48].end() ||
+    std::find(bPrims[48].begin(), bPrims[48].end(), 11) == bPrims[48].end() ||
     bPrims.find(82) == bPrims.end() ||
     std::find(bPrims[82].begin(), bPrims[82].end(), 114) == bPrims[82].end())
   {

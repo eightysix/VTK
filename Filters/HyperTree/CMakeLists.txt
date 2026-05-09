@@ -9,6 +9,7 @@ set(classes
   vtkHyperTreeGridDepthLimiter
   vtkHyperTreeGridEvaluateCoarse
   vtkHyperTreeGridExtractGhostCells
+  vtkFeatureEdgesDispatcher
   vtkHyperTreeGridFeatureEdges
   vtkHyperTreeGridGenerateFields
   vtkHyperTreeGridGeometry
@@ -19,7 +20,6 @@ set(classes
   vtkHyperTreeGridToDualGrid
   vtkHyperTreeGridToUnstructuredGrid
   vtkHyperTreeGridValidCellStrategy
-  vtkHyperTreeGridVisibleLeavesSize
   vtkHyperTreeGridTotalVisibleVolumeStrategy
   vtkImageDataToHyperTreeGrid
 )

@@ -72,6 +72,11 @@ set(VTK_MODULE_ENABLE_VTK_InfovisBoostGraphAlgorithms NO CACHE STRING "") # Boos
 set(VTK_MODULE_ENABLE_VTK_RenderingFreeTypeFontConfig NO CACHE STRING "") # fontconfig
 set(VTK_MODULE_ENABLE_VTK_RenderingOpenVR NO CACHE STRING "") # OpenVR
 
+# PCH causes issues on macOS CI due to issues from sccache.
+# sccache issue: https://github.com/mozilla/sccache/issues/2558
+# vtk issue: https://gitlab.kitware.com/vtk/vtk/-/issues/19903
+set(VTK_USE_PCH OFF CACHE BOOL "")
+
 if(NOT WIN32)
   set(VTK_MODULE_ENABLE_VTK_RenderingOpenXR NO CACHE STRING "") # OpenXR disable on every system except Windows
 endif()
@@ -81,6 +86,7 @@ set(VTK_MODULE_ENABLE_VTK_RenderingZSpace NO CACHE STRING "") # zSpace
 set(VTK_MODULE_ENABLE_VTK_fides NO CACHE STRING "") # ADIOS2
 set(VTK_MODULE_ENABLE_VTK_xdmf3 NO CACHE STRING "") # Boost
 set(VTK_MODULE_ENABLE_VTK_IOOCCT NO CACHE STRING "") # occt
+set(VTK_MODULE_ENABLE_VTK_IOIFC NO CACHE STRING "") # IFC based on IfcOpenShell
 set(VTK_MODULE_ENABLE_VTK_IOUSD NO CACHE STRING "") # usd
 set(VTK_ENABLE_CATALYST OFF CACHE BOOL "") # catalyst
 

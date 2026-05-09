@@ -303,7 +303,7 @@ void vtkAdaptiveDataSetSurfaceFilter::ProcessTrees(vtkHyperTreeGrid* input, vtkP
 
   for (int i = 0; i < this->OutData->GetNumberOfArrays(); i++)
   {
-    this->OutData->GetAbstractArray(i)->Resize(output->GetNumberOfCells());
+    this->OutData->GetAbstractArray(i)->ReserveTuples(output->GetNumberOfCells());
   }
 
   this->Points->Delete();
@@ -691,66 +691,6 @@ vtkMTimeType vtkAdaptiveDataSetSurfaceFilter::GetMTime()
     } // if ( cam )
   }   // if ( this->Renderer )
   return this->Superclass::GetMTime();
-}
-
-//------------------------------------------------------------------------------
-// VTK_DEPRECATED_IN_9_5_0
-void vtkAdaptiveDataSetSurfaceFilter::SetCircleSelection(bool vtkNotUsed(_arg))
-{
-  vtkWarningMacro("CircleSelection has been removed. Do not use.");
-}
-
-//------------------------------------------------------------------------------
-// VTK_DEPRECATED_IN_9_5_0
-bool vtkAdaptiveDataSetSurfaceFilter::GetCircleSelection()
-{
-  vtkWarningMacro("CircleSelection has been removed. Do not use.");
-  return true;
-}
-
-//------------------------------------------------------------------------------
-// VTK_DEPRECATED_IN_9_5_0
-void vtkAdaptiveDataSetSurfaceFilter::SetBBSelection(bool vtkNotUsed(_arg))
-{
-  vtkWarningMacro("BBSelection has been removed. Do not use.");
-}
-
-//------------------------------------------------------------------------------
-// VTK_DEPRECATED_IN_9_5_0
-bool vtkAdaptiveDataSetSurfaceFilter::GetBBSelection()
-{
-  vtkWarningMacro("BBSelection has been removed. Do not use.");
-  return true;
-}
-
-//------------------------------------------------------------------------------
-// VTK_DEPRECATED_IN_9_5_0
-void vtkAdaptiveDataSetSurfaceFilter::SetDynamicDecimateLevelMax(int vtkNotUsed(_arg))
-{
-  vtkWarningMacro("DynamicDecimateLevelMax has been removed. Do not use.");
-}
-
-//------------------------------------------------------------------------------
-// VTK_DEPRECATED_IN_9_5_0
-int vtkAdaptiveDataSetSurfaceFilter::GetDynamicDecimateLevelMax()
-{
-  vtkWarningMacro("DynamicDecimateLevelMax has been removed. Do not use.");
-  return 0;
-}
-
-//------------------------------------------------------------------------------
-// VTK_DEPRECATED_IN_9_5_0
-void vtkAdaptiveDataSetSurfaceFilter::SetScale(double vtkNotUsed(_arg))
-{
-  vtkWarningMacro("Scale has been removed. Do not use.");
-}
-
-//------------------------------------------------------------------------------
-// VTK_DEPRECATED_IN_9_5_0
-int vtkAdaptiveDataSetSurfaceFilter::GetScale()
-{
-  vtkWarningMacro("Scale has been removed. Do not use.");
-  return 0;
 }
 
 VTK_ABI_NAMESPACE_END

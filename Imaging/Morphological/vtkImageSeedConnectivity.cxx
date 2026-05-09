@@ -45,21 +45,14 @@ void vtkImageSeedConnectivity::RemoveAllSeeds()
 }
 
 //------------------------------------------------------------------------------
-void vtkImageSeedConnectivity::AddSeed(int num, int* index)
+void vtkImageSeedConnectivity::AddSeed(int num, VTK_FUTURE_CONST int* index)
 {
-  int idx, newIndex[3];
-  vtkImageConnectorSeed* seed;
-
-  num = std::max(num, 3);
-  for (idx = 0; idx < num; ++idx)
+  int newIndex[3];
+  for (int idx = 0; idx < 3; ++idx)
   {
-    newIndex[idx] = index[idx];
+    newIndex[idx] = (idx < num) ? index[idx] : 0;
   }
-  for (idx = num; idx < 3; ++idx)
-  {
-    newIndex[idx] = 0;
-  }
-  seed = this->Connector->NewSeed(newIndex, nullptr);
+  vtkImageConnectorSeed* seed = this->Connector->NewSeed(newIndex, nullptr);
   seed->Next = this->Seeds;
   this->Seeds = seed;
   this->Modified();

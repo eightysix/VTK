@@ -8,10 +8,8 @@
 #include "vtkCellData.h"
 #include "vtkCellLinks.h"
 #include "vtkDataSetAttributes.h"
-#include "vtkEmptyCell.h"
 #include "vtkGarbageCollector.h"
 #include "vtkGenericCell.h"
-#include "vtkHexahedron.h"
 #include "vtkInformation.h"
 #include "vtkInformationVector.h"
 #include "vtkNew.h"
@@ -791,7 +789,7 @@ void vtkExplicitStructuredGrid::Crop(
       originalCellIds->SetNumberOfComponents(1);
       this->GetCellData()->AddArray(originalCellIds.GetPointer());
       vtkIdType inSize = this->GetNumberOfCells();
-      originalCellIds->Allocate(inSize);
+      originalCellIds->ReserveValues(inSize);
       for (vtkIdType i = 0; i < inSize; i++)
       {
         originalCellIds->InsertValue(i, i);
@@ -835,8 +833,7 @@ void vtkExplicitStructuredGrid::Crop(
     if (generateOriginalCellIds)
     {
       originalCellIds->SetName("vtkOriginalCellIds");
-      originalCellIds->SetNumberOfComponents(1);
-      originalCellIds->Allocate(outSize);
+      originalCellIds->ReserveValues(outSize);
     }
 
     // Browse input data and copy cell attributes to output

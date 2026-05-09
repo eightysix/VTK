@@ -407,6 +407,10 @@ vtkExprTkFunctionParser::SizeModes vtkExprTkFunctionParser::DetermineSizeMode(
 {
   // if first charachter is { and last is }, then VectorDefined
   const std::string funcNoSpaces = RemoveSpacesFrom(function);
+  if (funcNoSpaces.empty())
+  {
+    return SizeModes::AutoDetected;
+  }
   return funcNoSpaces.front() == '{' && funcNoSpaces.back() == '}' ? SizeModes::VectorDefined
                                                                    : SizeModes::AutoDetected;
 }

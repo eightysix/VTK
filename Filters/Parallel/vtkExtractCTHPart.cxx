@@ -814,7 +814,7 @@ void vtkExtractCTHPart::ExtractExteriorSurface(
     outPolys->Delete();
 
     vtkPoints* outPoints = vtkPoints::New();
-    outPoints->Allocate(numPoints);
+    outPoints->Reserve(numPoints);
     output->SetPoints(outPoints);
     outPoints->Delete();
 
@@ -1171,7 +1171,6 @@ void vtkExtractCTHPart::ExecuteCellDataToPointData(
   kInc = (dims[1]) * jInc;
 
   pPoint = pointVolumeFraction->GetPointer(0);
-  //  pCell = static_cast<double*>(cellVolumeFraction->GetVoidPointer(0));
 
   // Initialize the point data to 0.
   memset(pPoint, 0, dims[0] * dims[1] * dims[2] * sizeof(double));

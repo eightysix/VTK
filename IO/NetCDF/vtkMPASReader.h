@@ -109,6 +109,11 @@ public:
    * The following methods allow selective reading of solutions fields.
    * By default, ALL data fields on the nodes are read, but this can
    * be modified.
+   *
+   * The point and cell arrays are defined in terms of the dual grid. When the
+   * `UsePrimaryGrid` option gets turned on, the semantics of points and cells
+   * get reversed. In that case the selection of points affects cells and vice
+   * versa.
    */
   int GetNumberOfPointArrays();
   const char* GetPointArrayName(int index);
@@ -172,6 +177,24 @@ public:
   vtkSetMacro(ProjectLatLon, bool);
   vtkGetMacro(ProjectLatLon, bool);
 
+  /// @{
+  /**
+   * The primary MPAS grid is defined as a Voronoi diagram of points on a
+   * sphere, and the simulation data are defined in those cell regions of that
+   * Voronoi diagram. MPAS also defines the dual grid, which is naturally a
+   * Delaunay tesselation of the points. When this option is true, the primary
+   * Voronoi diagram is loaded, and the field data are the cells of these
+   * regions. When this option is false (the default), the dual Delaunay
+   * tesselation is loaded and the field data is on the points.
+   *
+   * Note that switching between the dual and primary grid switches the
+   * point/cell semantics. Thus, when `UsePrimaryGrid` is turned on, the
+   * selection of point arrays actually affects cell arrays and vice versa.
+   */
+  vtkSetMacro(UsePrimaryGrid, bool);
+  vtkGetMacro(UsePrimaryGrid, bool);
+  /// @}
+
   vtkSetMacro(IsAtmosphere, bool);
   vtkGetMacro(IsAtmosphere, bool);
 
@@ -227,17 +250,9 @@ protected:
   int CenterLon;
   int CenterLonRange[2];
 
-  enum GeometryType
-  {
-    Spherical,
-    Projected,
-    Planar
-  };
-
-  GeometryType Geometry;
-
-  bool ProjectLatLon; // User option
-  bool OnASphere;     // Data file attribute
+  bool ProjectLatLon;  // User option
+  bool UsePrimaryGrid; // User option
+  bool OnASphere;      // Data file attribute
   bool IsAtmosphere;
   bool IsZeroCentered;
   bool ShowMultilayerView;
@@ -248,6 +263,18 @@ protected:
 
   bool UseDimensionedArrayNames;
 
+private:
+  enum GeometryType
+  {
+    SphericalDual,
+    SphericalPrimary,
+    ProjectedDual,
+    ProjectedPrimary,
+    Planar
+  };
+
+  GeometryType Geometry;
+
   // geometry
   size_t MaximumNVertLevels;
   size_t NumberOfCells;
@@ -255,41 +282,33 @@ protected:
   int CellOffset;
   size_t PointOffset;
   size_t PointsPerCell;
-  size_t CurrentExtraPoint; // current extra point
-  size_t CurrentExtraCell;  // current extra cell
-  double* PointX;           // x coord of point
-  double* PointY;           // y coord of point
-  double* PointZ;           // z coord of point
-  size_t ModNumPoints;
-  size_t ModNumCells;
-  int* OrigConnections;   // original connections
-  int* ModConnections;    // modified connections
-  size_t* CellMap;        // maps from added cell to original cell #
-  size_t* PointMap;       // maps from added point to original point #
-  int* MaximumLevelPoint; //
-  int MaximumCells;       // max cells
-  int MaximumPoints;      // max points
+  int MaximumCells;
+  int MaximumPoints;
+
+  struct LoadState;
 
   void SetDefaults();
   int GetNcDims();
   int GetNcAtts();
   int CheckParams();
   int GetNcVars(const char* cellDimName, const char* pointDimName);
-  int ReadAndOutputGrid();
+  int ReadAndOutputGrid(LoadState& state);
   int BuildVarArrays();
-  int AllocSphericalGeometry();
-  int AllocProjectedGeometry();
-  int AllocPlanarGeometry();
-  void ShiftLonData();
-  int AddMirrorPoint(int index, double dividerX, double offset);
-  void FixPoints();
-  int EliminateXWrap();
-  void OutputPoints();
-  void OutputCells();
-  unsigned char GetCellType();
+  int AllocSphericalDualGeometry(LoadState& state);
+  int AllocSphericalPrimaryGeometry(LoadState& state);
+  int AllocProjectedDualGeometry(LoadState& state);
+  int AllocProjectedPrimaryGeometry(LoadState& state);
+  int AllocPlanarGeometry(LoadState& state);
+  void ShiftLonData(LoadState& state);
+  int AddMirrorPoint(LoadState& state, int index, double dividerX, double offset);
+  void FixPoints(LoadState& state);
+  int EliminateXWrap(LoadState& state);
+  void OutputPoints(LoadState& state);
+  void OutputCells(LoadState& state);
+  unsigned char GetCellType(int numPoints);
 
-  vtkDataArray* LoadPointVarData(int variable);
-  vtkDataArray* LoadCellVarData(int variable);
+  vtkDataArray* LoadPointVarData(LoadState& state, int variable);
+  vtkDataArray* LoadCellVarData(LoadState& state, int variable);
   vtkDataArray* LookupPointDataArray(int varIdx);
   vtkDataArray* LookupCellDataArray(int varIdx);
 
@@ -303,7 +322,6 @@ protected:
    */
   void LoadTimeFieldData(vtkUnstructuredGrid* dataset);
 
-private:
   vtkMPASReader(const vtkMPASReader&) = delete;
   void operator=(const vtkMPASReader&) = delete;
 

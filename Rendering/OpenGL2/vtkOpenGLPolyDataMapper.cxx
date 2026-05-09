@@ -3,6 +3,8 @@
 
 #include "vtkOpenGLPolyDataMapper.h"
 
+#include "vtk_glad.h"
+
 #include "vtkArrayDispatch.h"
 #include "vtkCamera.h"
 #include "vtkCellArray.h"
@@ -42,6 +44,7 @@
 #include "vtkOpenGLVertexBufferObject.h"
 #include "vtkOpenGLVertexBufferObjectCache.h"
 #include "vtkOpenGLVertexBufferObjectGroup.h"
+#include "vtkOverrideAttribute.h"
 #include "vtkPBRIrradianceTexture.h"
 #include "vtkPBRLUTTexture.h"
 #include "vtkPBRPrefilterTexture.h"
@@ -184,6 +187,14 @@ vtkOpenGLPolyDataMapper::~vtkOpenGLPolyDataMapper()
 }
 
 //------------------------------------------------------------------------------
+vtkOverrideAttribute* vtkOpenGLPolyDataMapper::CreateOverrideAttributes()
+{
+  auto* renderingBackendAttribute =
+    vtkOverrideAttribute::CreateAttributeChain("RenderingBackend", "OpenGL", nullptr);
+  return renderingBackendAttribute;
+}
+
+//------------------------------------------------------------------------------
 void vtkOpenGLPolyDataMapper::ReleaseGraphicsResources(vtkWindow* win)
 {
   if (!this->ResourceCallback->IsReleasing())
@@ -278,6 +289,26 @@ vtkPolyDataMapper::MapperHashType vtkOpenGLPolyDataMapper::GenerateHash(vtkPolyD
   hash += (usesCellColorTexture << 5);
   hash += (usesCellNormalTexture << 6);
   return hash;
+}
+
+//------------------------------------------------------------------------------
+vtkIdType vtkOpenGLPolyDataMapper::GetMaximumNumberOfTriangles([[maybe_unused]] vtkRenderer* ren)
+{
+#ifndef GL_ES_VERSION_3_0
+  vtkOpenGLRenderer* renderer = vtkOpenGLRenderer::SafeDownCast(ren);
+  if (renderer)
+  {
+    int maxSize = -1;
+    vtkOpenGLState* state = renderer->GetState();
+    if (state)
+    {
+      state->vtkglGetIntegerv(GL_MAX_TEXTURE_BUFFER_SIZE, &maxSize);
+      return static_cast<vtkIdType>(maxSize);
+    }
+  }
+#endif
+
+  return std::numeric_limits<vtkIdType>::max();
 }
 
 //------------------------------------------------------------------------------

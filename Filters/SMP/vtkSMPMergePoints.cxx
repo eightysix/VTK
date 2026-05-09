@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) Ken Martin, Will Schroeder, Bill Lorensen
 // SPDX-License-Identifier: BSD-3-Clause
+#define VTK_DEPRECATION_LEVEL 0
 
 #include "vtkSMPMergePoints.h"
 #include "vtkFloatArray.h"
@@ -45,7 +46,7 @@ void vtkSMPMergePoints::Merge(vtkSMPMergePoints* locator, vtkIdType idx, vtkPoin
   if (!(bucket = this->HashTable[idx]))
   {
     this->HashTable[idx] = bucket = vtkIdList::New();
-    bucket->Allocate(this->NumberOfPointsPerBucket / 2, this->NumberOfPointsPerBucket / 3);
+    bucket->Reserve(this->NumberOfPointsPerBucket / 2);
     oldIdToMerge = locator->HashTable[idx];
     oldIdToMerge->Register(this);
     if (this->Points->GetData()->GetDataType() == VTK_FLOAT)
@@ -59,7 +60,7 @@ void vtkSMPMergePoints::Merge(vtkSMPMergePoints* locator, vtkIdType idx, vtkPoin
 
     vtkIdType nbOfIds = bucket->GetNumberOfIds();
     vtkIdType nbOfOldIds = locator->HashTable[idx]->GetNumberOfIds();
-    oldIdToMerge->Allocate(nbOfOldIds);
+    oldIdToMerge->Reserve(nbOfOldIds);
 
     vtkDataArray* dataArray = this->Points->GetData();
     vtkDataArray* oldDataArray = locator->Points->GetData();
@@ -128,7 +129,7 @@ void vtkSMPMergePoints::Merge(vtkSMPMergePoints* locator, vtkIdType idx, vtkPoin
   // points have to be added
   vtkIdType numberOfInsertions = oldIdToMerge->GetNumberOfIds();
   vtkIdType firstId = this->AtomicInsertionId.fetch_add(numberOfInsertions);
-  bucket->Resize(bucket->GetNumberOfIds() + numberOfInsertions);
+  bucket->Reserve(bucket->GetNumberOfIds() + numberOfInsertions);
   for (vtkIdType i = 0; i < numberOfInsertions; ++i)
   {
     vtkIdType newId = firstId + i, oldId = oldIdToMerge->GetId(i);

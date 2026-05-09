@@ -14,7 +14,6 @@
 #include "vtkImageData.h"
 #include "vtkInformation.h"
 #include "vtkInformationVector.h"
-#include "vtkLegacy.h"
 #include "vtkMultiBlockDataSet.h"
 #include "vtkPointData.h"
 #include "vtkResourceStream.h"
@@ -244,7 +243,7 @@ void AddTransformToFieldData(const vtkSmartPointer<vtkMatrix4x4> transform,
   if (fieldData->HasArray(name.c_str()))
   {
     matrixArray = vtkDoubleArray::SafeDownCast(fieldData->GetArray(name.c_str()));
-    matrixArray->Resize(0);
+    matrixArray->Initialize();
   }
   else
   {

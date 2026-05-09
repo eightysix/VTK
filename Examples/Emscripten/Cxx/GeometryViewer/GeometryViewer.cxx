@@ -51,9 +51,10 @@
 #include <vtkTubeFilter.h>
 #include <vtkType.h>
 #include <vtkUnsignedCharArray.h>
+#include <vtkWebAssemblyHardwareWindow.h>
 #include <vtkWebAssemblyOpenGLRenderWindow.h>
 #include <vtkWebAssemblyRenderWindowInteractor.h>
-#include <vtkWebAssemblyWebGPURenderWindow.h>
+#include <vtkWebGPURenderWindow.h>
 #include <vtkWindowToImageFilter.h>
 #include <vtkXMLMultiBlockDataReader.h>
 #include <vtkXMLPartitionedDataSetCollectionReader.h>
@@ -457,14 +458,31 @@ void GeometryViewer::Initialize()
   this->P->Window->SetInteractor(this->P->Interactor);
   auto iren = vtkWebAssemblyRenderWindowInteractor::SafeDownCast(this->P->Interactor);
   iren->SetCanvasSelector("#vtk-3d-canvas");
-  if (auto wasmWebGPURenderWindow = vtkWebAssemblyWebGPURenderWindow::SafeDownCast(this->P->Window))
+  if (auto wasmWebGPURenderWindow = vtkWebGPURenderWindow::SafeDownCast(this->P->Window))
   {
-    wasmWebGPURenderWindow->SetCanvasSelector("#vtk-3d-canvas");
+    vtkNew<vtkHardwareWindow> hwWindow;
+    wasmWebGPURenderWindow->SetHardwareWindow(hwWindow);
+    if (auto wasmHardwareWindow = vtkWebAssemblyHardwareWindow::SafeDownCast(hwWindow))
+    {
+      wasmHardwareWindow->SetCanvasSelector("#vtk-3d-canvas");
+    }
+    else
+    {
+      std::cerr
+        << "Failed to retreive the WebAssembly hardware window associated with the render window\n";
+    }
   }
-  if (auto wasmOpenGLRenderWindow = vtkWebAssemblyOpenGLRenderWindow::SafeDownCast(this->P->Window))
+  else if (auto wasmOpenGLRenderWindow =
+             vtkWebAssemblyOpenGLRenderWindow::SafeDownCast(this->P->Window))
   {
     wasmOpenGLRenderWindow->SetCanvasSelector("#vtk-3d-canvas");
   }
+  else
+  {
+    std::cerr << "Failed to cast the render window to vtkWebGPURenderWindow or a "
+                 "vtkWebAssemblyOpenGLRenderWindow\n";
+  }
+
   // turn on camera manipulator
   // this->P->CameraManipulator->SetParentRenderer(this->P->Renderer);
   // this->P->CameraManipulator->SetAnimate(false);

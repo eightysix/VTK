@@ -51,6 +51,18 @@ public:
 
   ///@{
   /**
+   * Set/Get if we want to use implicit array when appending the datasets. Using implicit array
+   * improve the execution time of the filter and reduce the memory consumption of the output.
+   * However, accessing arrays can be slower.
+   * Default to false
+   */
+  vtkGetMacro(UseImplicitArray, bool);
+  vtkSetMacro(UseImplicitArray, bool);
+  vtkBooleanMacro(UseImplicitArray, bool);
+  ///@}
+
+  ///@{
+  /**
    * Get/Set if the filter should merge coincidental points
    * Note: The filter will only merge points if the ghost cell array doesn't exist
    * Defaults to Off
@@ -138,6 +150,8 @@ private:
 
   void AppendArrays(int attributesType, vtkInformationVector** inputVector,
     vtkUnstructuredGrid* output, vtkIdType totalNumberOfElements);
+
+  bool UseImplicitArray = false;
 };
 
 VTK_ABI_NAMESPACE_END

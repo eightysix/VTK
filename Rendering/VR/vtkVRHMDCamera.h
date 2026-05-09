@@ -12,12 +12,13 @@
 #include "vtkNew.h"               // ivars
 #include "vtkRenderingVRModule.h" // For export macro
 #include "vtkVRCamera.h"
+#include "vtkWrappingHints.h" // For VTK_MARSHALAUTO
 
 VTK_ABI_NAMESPACE_BEGIN
 class vtkRenderer;
 class vtkMatrix4x4;
 
-class VTKRENDERINGVR_EXPORT vtkVRHMDCamera : public vtkVRCamera
+class VTKRENDERINGVR_EXPORT VTK_MARSHALAUTO vtkVRHMDCamera : public vtkVRCamera
 {
 public:
   vtkTypeMacro(vtkVRHMDCamera, vtkVRCamera);

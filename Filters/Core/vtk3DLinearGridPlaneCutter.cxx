@@ -3,7 +3,6 @@
 
 #include "vtk3DLinearGridPlaneCutter.h"
 
-#include "vtk3DLinearGridInternal.h"
 #include "vtkArrayDispatch.h"
 #include "vtkArrayDispatchDataSetArrayList.h"
 #include "vtkArrayListTemplate.h" // For processing attribute data
@@ -17,12 +16,12 @@
 #include "vtkInformation.h"
 #include "vtkInformationVector.h"
 #include "vtkLogger.h"
+#include "vtkMarchingCellsContourCases.h"
 #include "vtkMultiBlockDataSet.h"
 #include "vtkObjectFactory.h"
 #include "vtkPlane.h"
 #include "vtkPointData.h"
 #include "vtkPolyData.h"
-#include "vtkSMPThreadLocalObject.h"
 #include "vtkSMPTools.h"
 #include "vtkStaticEdgeLocatorTemplate.h"
 #include "vtkUnsignedCharArray.h"
@@ -97,12 +96,12 @@ struct ExtractEdges
   {
     std::vector<EdgeTupleType> LocalEdges;
     std::vector<IDType> LocalCells; // size is LocalEdges.size / 3
-    CellIter LocalCellIter;
+    vtkSmartPointer<vtkIdList> LocalPointIds;
 
     LocalDataType() { this->LocalEdges.reserve(2048); }
   };
 
-  CellIter* Iter;
+  vtkUnstructuredGrid* Input;
   EdgeTuple<IDType, EdgeDataType<IDType>>* Edges;
   IDType* Cells;
   const unsigned char* InOut;
@@ -118,9 +117,9 @@ struct ExtractEdges
   // Keep track of generated points and triangles on a per thread basis
   vtkSMPThreadLocal<LocalDataType> LocalData;
 
-  ExtractEdges(CellIter* c, vtkPlane* plane, unsigned char* inout, double* distance,
+  ExtractEdges(vtkUnstructuredGrid* input, vtkPlane* plane, unsigned char* inout, double* distance,
     vtkCellArray* tris, bool computeCells, vtk3DLinearGridPlaneCutter* filter)
-    : Iter(c)
+    : Input(input)
     , Edges(nullptr)
     , Cells(nullptr)
     , InOut(inout)
@@ -139,7 +138,7 @@ struct ExtractEdges
   void Initialize()
   {
     auto& localData = this->LocalData.Local();
-    localData.LocalCellIter = *(this->Iter);
+    localData.LocalPointIds = vtkSmartPointer<vtkIdList>::New();
   }
 
   // Composite local thread data
@@ -208,10 +207,10 @@ struct ExtractEdges
     auto& localData = this->LocalData.Local();
     auto& lEdges = localData.LocalEdges;
     auto& lCells = localData.LocalCells;
-    CellIter* cellIter = &localData.LocalCellIter;
-    const vtkIdType* c = cellIter->Initialize(cellId); // connectivity array
-    const unsigned short* edges;
-    double s[MAX_CELL_VERTS];
+    auto& lPointIds = localData.LocalPointIds;
+    vtkIdType npts, i;
+    const vtkIdType* pts = nullptr;
+    double s[8];
     bool isFirst = vtkSMPTools::GetSingleThread();
     vtkIdType checkAbortInterval = std::min((endCellId - cellId) / 10 + 1, (vtkIdType)1000);
 
@@ -228,30 +227,32 @@ struct ExtractEdges
           break;
         }
       }
-      // Does the plane cut this cell?
-      if (ExtractEdges::PlaneIntersects(this->InOut, cellIter->NumVerts, c))
+      int cellType = this->Input->GetCellType(cellId);
+      if (cellType < VTK_TETRA || cellType > VTK_PYRAMID)
       {
-        unsigned short isoCase;
-        vtkIdType i;
+        continue;
+      }
+      // Does the plane cut this cell?
+      this->Input->GetCellPoints(cellId, npts, pts, lPointIds);
+      if (ExtractEdges::PlaneIntersects(this->InOut, npts, pts))
+      {
+        uint8_t isoCase;
         // Compute case by repeated masking with function value
-        for (isoCase = 0, i = 0; i < cellIter->NumVerts; ++i)
+        for (isoCase = 0, i = 0; i < npts; ++i)
         {
-          s[i] = this->Distance[c[i]];
-          isoCase |= (s[i] >= 0.0 ? BaseCell::Mask[i] : 0);
+          s[i] = this->Distance[pts[i]];
+          isoCase |= (s[i] >= 0.0) << i;
         }
 
-        edges = cellIter->GetCase(isoCase);
-        if (*edges > 0)
+        auto cellEdges = vtkMarchingCellsContourCases::GetCellEdges(cellType);
+        auto edges = vtkMarchingCellsContourCases::GetCellCase(cellType, isoCase);
+        for (; edges[0] > -1; edges += 3)
         {
-          const unsigned short numEdges = *(edges++);
-          // three-edges form a triangles corresponding to a cell
-          assert(numEdges % 3 == 0);
-
-          // edge info
-          for (i = 0; i < numEdges; ++i, edges += 2)
+          for (int edgeId = 0; edgeId < 3; edgeId++)
           {
-            unsigned char v0 = edges[0];
-            unsigned char v1 = edges[1];
+            const auto& vert = cellEdges[edges[edgeId]];
+            const auto& v0 = vert[0];
+            const auto& v1 = vert[1];
             double deltaScalar = s[v1] - s[v0];
             // the t here is computed for each edges of each cell
             // so it is computed twice for most edges.
@@ -259,22 +260,17 @@ struct ExtractEdges
             // of t to the last moment (when we are producing points / attributes)
             // This way, we should be able to compute t only once per output edge.
             double t = (deltaScalar == 0.0 ? 0.0 : (-s[v0] / deltaScalar));
-            t = (c[v0] < c[v1] ? t : (1.0 - t));  // edges (v0,v1) must have v0<v1
-            lEdges.emplace_back(c[v0], c[v1], t); // edge constructor may swap v0<->v1
-          }                                       // for all edges in this case
-
+            t = (pts[v0] < pts[v1] ? t : (1.0 - t));  // edges (v0,v1) must have v0<v1
+            lEdges.emplace_back(pts[v0], pts[v1], t); // edge constructor may swap v0<->v1
+          }                                           // for all edges in this triangle
           // cell info
           if (this->ComputeCells)
           {
-            for (i = 0; i < numEdges; i += 3)
-            {
-              lCells.emplace_back(cellId);
-            }
+            lCells.emplace_back(cellId);
           }
-        }                   // if contour passes through this cell
-      }                     // if plane intersects
-      c = cellIter->Next(); // move to the next cell
-    }                       // for all cells in this batch
+        } // for all triangles in this case
+      }   // if plane intersects
+    }     // for all cells in this batch
   }
 }; // ExtractEdges
 
@@ -683,7 +679,7 @@ struct ProduceMergedAttributes
 
 // Wrapper to handle multiple template types for generating intersected edges
 template <typename TIds>
-void ProcessEdges(vtkIdType numCells, vtkPoints* inPts, CellIter* cellIter, vtkPlane* plane,
+void ProcessEdges(vtkIdType numCells, vtkPoints* inPts, vtkUnstructuredGrid* input, vtkPlane* plane,
   unsigned char* inout, double* distance, vtkPoints* outPts, vtkCellArray* newPolys, bool mergePts,
   bool intAttr, bool seqProcessing, int& numThreads, vtkPointData* inPD = nullptr,
   vtkPointData* outPD = nullptr, vtkCellData* inCD = nullptr, vtkCellData* outCD = nullptr,
@@ -697,7 +693,7 @@ void ProcessEdges(vtkIdType numCells, vtkPoints* inPts, CellIter* cellIter, vtkP
   const bool computeCells = (inCD != nullptr && inCD->GetNumberOfArrays() > 0);
 
   // Extract edges
-  ExtractEdges<TIds> extractEdges(cellIter, plane, inout, distance, newPolys, computeCells, filter);
+  ExtractEdges<TIds> extractEdges(input, plane, inout, distance, newPolys, computeCells, filter);
   EXECUTE_REDUCED_SMPFOR(seqProcessing, numCells, extractEdges, numThreads);
   numTris = extractEdges.NumTris;
   mergeEdges = extractEdges.Edges;
@@ -707,7 +703,7 @@ void ProcessEdges(vtkIdType numCells, vtkPoints* inPts, CellIter* cellIter, vtkP
   // Make sure data was produced
   if (numTris <= 0)
   {
-    outPts->SetNumberOfPoints(0);
+    outPts->Initialize();
     delete[] mergeEdges;
     delete[] originalCells;
     return;
@@ -977,9 +973,6 @@ int vtk3DLinearGridPlaneCutter::ProcessPiece(
   auto newPolys = vtkSmartPointer<vtkCellArray>::New();
   newPolys->UseFixedSizeDefaultStorage(3);
 
-  // Set up the cells for processing. A specialized iterator is used to traverse the cells.
-  CellIter* cellIter = new CellIter(numCells, input->GetCellTypes(), cells);
-
   // Compute plane-cut scalars
   vtkNew<vtkAOSDataArrayTemplate<double>> distanceArray;
   distanceArray->SetNumberOfValues(numPts);
@@ -1016,13 +1009,13 @@ int vtk3DLinearGridPlaneCutter::ProcessPiece(
   // Generate all of the merged points and triangles
   if (!this->LargeIds)
   {
-    ProcessEdges<int>(numCells, inPts, cellIter, plane, inout, distance, outPts, newPolys,
+    ProcessEdges<int>(numCells, inPts, input, plane, inout, distance, outPts, newPolys,
       this->MergePoints, this->InterpolateAttributes, this->SequentialProcessing,
       this->NumberOfThreadsUsed, inPD, outPD, inCD, outCD, this);
   }
   else
   {
-    ProcessEdges<vtkIdType>(numCells, inPts, cellIter, plane, inout, distance, outPts, newPolys,
+    ProcessEdges<vtkIdType>(numCells, inPts, input, plane, inout, distance, outPts, newPolys,
       this->MergePoints, this->InterpolateAttributes, this->SequentialProcessing,
       this->NumberOfThreadsUsed, inPD, outPD, inCD, outCD, this);
   }
@@ -1040,7 +1033,6 @@ int vtk3DLinearGridPlaneCutter::ProcessPiece(
                 << " triangles");
 
   // Clean up
-  delete cellIter;
   output->SetPoints(outPts);
   output->SetPolys(newPolys);
 

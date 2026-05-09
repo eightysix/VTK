@@ -2,11 +2,16 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "vtkCellData.h"
+#include "vtkConeSource.h"
+#include "vtkDataArray.h"
 #include "vtkDataArraySelection.h"
 #include "vtkFieldData.h"
+#include "vtkFloatArray.h"
+#include "vtkGroupDataSetsFilter.h"
 #include "vtkHDF5ScopedHandle.h"
 #include "vtkHDFReader.h"
 #include "vtkHDFWriter.h"
+#include "vtkIdTypeArray.h"
 #include "vtkImageData.h"
 #include "vtkInformation.h"
 #include "vtkIntArray.h"
@@ -15,6 +20,7 @@
 #include "vtkNew.h"
 #include "vtkPartitionedDataSet.h"
 #include "vtkPartitionedDataSetCollection.h"
+#include "vtkPointData.h"
 #include "vtkPolyData.h"
 #include "vtkSphereSource.h"
 #include "vtkTestUtilities.h"
@@ -228,6 +234,47 @@ bool TestUnstructuredGrid(const std::string& tempDir, const std::string& dataRoo
 }
 
 //----------------------------------------------------------------------------
+bool TestDataSetAttributes(const std::string& tempDir)
+{
+  vtkNew<vtkUnstructuredGrid> ug;
+  vtkNew<vtkFloatArray> floats;
+  floats->SetName("scals");
+  ug->GetPointData()->SetScalars(floats);
+
+  vtkNew<vtkIdTypeArray> ids;
+  ids->SetName("GlobIds");
+  ug->GetCellData()->SetGlobalIds(ids);
+
+  vtkNew<vtkHDFWriter> writer;
+  writer->SetInputData(ug);
+  const std::string filename = tempDir + "/HDFWriter_attrs.vtkhdf";
+  writer->SetFileName(filename.c_str());
+  writer->Write();
+
+  vtkNew<vtkHDFReader> reader;
+  reader->SetFileName(filename.c_str());
+  reader->Update();
+
+  vtkUnstructuredGrid* readUg = vtkUnstructuredGrid::SafeDownCast(reader->GetOutputAsDataSet());
+  vtkDataArray* readScalars = readUg->GetPointData()->GetScalars();
+  vtkDataArray* readGlobIds = readUg->GetCellData()->GetGlobalIds();
+
+  if (readScalars->GetName() != std::string("scals"))
+  {
+    std::cerr << "Expected scalars array 'scals'" << std::endl;
+    return false;
+  }
+
+  if (readGlobIds->GetName() != std::string("GlobIds"))
+  {
+    std::cerr << "Expected Global Ids array 'scals'" << std::endl;
+    return false;
+  }
+
+  return true;
+}
+
+//----------------------------------------------------------------------------
 bool TestSanitizeName(const std::string& tempDir, const std::string& dataRoot)
 {
   // Write data with a field name using slashes, that must be replaced to comply with the VTKHDF
@@ -269,10 +316,10 @@ bool TestSanitizeName(const std::string& tempDir, const std::string& dataRoot)
 //----------------------------------------------------------------------------
 bool TestPartitionedUnstructuredGrid(const std::string& tempDir, const std::string& dataRoot)
 {
-  std::string baseName = "can-pvtu.hdf";
+  std::string baseName = "can-pvtu.vtkhdf";
 
   // Get an Partitioned Unstructured grid from a VTKHDF file
-  const std::string basePath = dataRoot + "/Data/" + baseName;
+  const std::string basePath = dataRoot + "/Data/vtkHDF/" + baseName;
   vtkNew<vtkHDFReader> baseReader;
   baseReader->SetFileName(basePath.c_str());
   baseReader->Update();
@@ -296,10 +343,10 @@ bool TestPartitionedUnstructuredGrid(const std::string& tempDir, const std::stri
 //----------------------------------------------------------------------------
 bool TestPartitionedPolyData(const std::string& tempDir, const std::string& dataRoot)
 {
-  std::string baseName = "test_poly_data.hdf";
+  std::string baseName = "test_poly_data.vtkhdf";
 
   // Get an Partitioned PolyData from a VTKHDF file
-  const std::string basePath = dataRoot + "/Data/" + baseName;
+  const std::string basePath = dataRoot + "/Data/vtkHDF/" + baseName;
   vtkNew<vtkHDFReader> baseReader;
   baseReader->SetFileName(basePath.c_str());
   baseReader->Update();
@@ -350,8 +397,8 @@ bool TestMultiBlock(const std::string& tempDir, const std::string& dataRoot)
 //----------------------------------------------------------------------------
 bool TestMultiBlockIdenticalBlockNames(const std::string& tempDir, const std::string& dataRoot)
 {
-  std::string baseName = "test_poly_data.hdf";
-  const std::string basePath = dataRoot + "/Data/" + baseName;
+  std::string baseName = "test_poly_data.vtkhdf";
+  const std::string basePath = dataRoot + "/Data/vtkHDF/" + baseName;
   vtkNew<vtkHDFReader> baseReader;
   baseReader->SetFileName(basePath.c_str());
   baseReader->Update();
@@ -473,6 +520,36 @@ bool TestFieldDataReadWrite(const std::string& tempDir)
 }
 
 //----------------------------------------------------------------------------
+bool TestWriteAfterReadComposite(const std::string& tempDir)
+{
+  // Test that HDF Reader and writer properly release the file lock after they are done
+  std::string writtenName = tempDir + "/pdc_read_write.hdf";
+
+  vtkNew<vtkSphereSource> sphere;
+  vtkNew<vtkConeSource> cone;
+  vtkNew<vtkGroupDataSetsFilter> group;
+  group->AddInputConnection(sphere->GetOutputPort());
+  group->AddInputConnection(cone->GetOutputPort());
+  group->SetOutputTypeToMultiBlockDataSet();
+
+  vtkNew<vtkHDFWriter> writer;
+  writer->SetFileName(writtenName.c_str());
+  writer->SetInputConnection(group->GetOutputPort());
+  writer->Write();
+
+  // Read the file we just wrote
+  vtkNew<vtkHDFReader> reader;
+  reader->SetFileName(writtenName.c_str());
+  reader->Update();
+
+  // Overwrite the file, check that reader correctly released resources
+  // Test errors if write operation did not finish because file lock was not released;
+  writer->Write();
+
+  return true;
+}
+
+//----------------------------------------------------------------------------
 int TestHDFWriter(int argc, char* argv[])
 {
   // Get temporary testing directory
@@ -497,6 +574,7 @@ int TestHDFWriter(int argc, char* argv[])
   testPasses &= TestSpherePolyData(tempDir);
   testPasses &= TestComplexPolyData(tempDir, dataRoot);
   testPasses &= TestUnstructuredGrid(tempDir, dataRoot);
+  testPasses &= TestDataSetAttributes(tempDir);
   testPasses &= TestSanitizeName(tempDir, dataRoot);
   testPasses &= TestPartitionedUnstructuredGrid(tempDir, dataRoot);
   testPasses &= TestPartitionedPolyData(tempDir, dataRoot);
@@ -504,6 +582,7 @@ int TestHDFWriter(int argc, char* argv[])
   testPasses &= TestMultiBlock(tempDir, dataRoot);
   testPasses &= TestMultiBlockIdenticalBlockNames(tempDir, dataRoot);
   testPasses &= TestFieldDataReadWrite(tempDir);
+  testPasses &= TestWriteAfterReadComposite(tempDir);
 
   return testPasses ? EXIT_SUCCESS : EXIT_FAILURE;
 }

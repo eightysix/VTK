@@ -120,13 +120,13 @@ vtk_add_test_cxx(vtkCommonCoreCxxTests tests
   # TestCxxFeatures.cxx # This is in its own exe too.
   TestDataArray.cxx
   TestDataArrayComponentNames.cxx
-  TestDataArrayIterators.cxx
   TestDataArraySelection.cxx
   TestDataArrayTupleRange.cxx
   TestDataArrayValueRange.cxx
   TestFMT.cxx
   TestGarbageCollector.cxx
   TestGenericDataArrayAPI.cxx
+  TestGlobalStaticvtkObject.cxx
   TestInformationKeyLookup.cxx
   TestInherits.cxx
   TestLogger.cxx
@@ -140,6 +140,8 @@ vtk_add_test_cxx(vtkCommonCoreCxxTests tests
   TestNumberOfGenerationsFromBase.cxx
   TestNumberToString.cxx
   TestObjectFactory.cxx
+  TestObjectFactoryOverrideAttribute.cxx
+  TestObjectFactoryPreferencesFromCommandLine.cxx
   TestObservers.cxx
   TestObserversPerformance.cxx
   TestOStreamWrapper.cxx
@@ -148,7 +150,7 @@ vtk_add_test_cxx(vtkCommonCoreCxxTests tests
   TestSCN.cxx
   TestSMP.cxx
   TestSmartPointer.cxx
-  TestScaledSOADataArrayTemplate.cxx
+  TestSetBuffer.cxx
   TestSOADataArray.cxx
   TestSortDataArray.cxx
   TestSparseArrayValidation.cxx
@@ -158,9 +160,11 @@ vtk_add_test_cxx(vtkCommonCoreCxxTests tests
   TestTimePointUtility.cxx
   TestValueFromString.cxx
   TestVariant.cxx
+  TestVariantArray.cxx
   TestVariantComparison.cxx
   TestVariantConversionFromString.cxx
   TestWeakPointer.cxx
+  TestWeakPtr.cxx
   TestXMLFileOutputWindow.cxx
   UnitTestInformationKeys.cxx
   otherArrays.cxx
@@ -184,7 +188,6 @@ vtk_add_test_cxx(vtkCommonCoreCxxTests tests
   TestIndexedArray.cxx
   TestIndexedImplicitBackend.cxx
   TestStridedArray.cxx
-  TestStdFunctionArray.cxx
   TestStructuredPointArray.cxx)
 
 if (NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")

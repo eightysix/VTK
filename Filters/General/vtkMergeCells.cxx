@@ -245,7 +245,7 @@ vtkIdType vtkMergeCells::AddNewCellsDataSet(vtkDataSet* set, vtkIdType* idMap)
   vtkCellData* setCD = set->GetCellData();
 
   vtkNew<vtkIdList> cellPoints;
-  cellPoints->Allocate(VTK_CELL_SIZE);
+  cellPoints->Reserve(VTK_CELL_SIZE);
 
   for (vtkIdType oldCellId = 0; oldCellId < numCells; oldCellId++)
   {
@@ -627,7 +627,7 @@ void vtkMergeCells::Finish()
   if (this->NumberOfPoints < this->TotalNumberOfPoints)
   {
     // if we don't do this, grid->GetNumberOfPoints() gives the wrong value
-    grid->GetPoints()->GetData()->Resize(this->NumberOfPoints);
+    grid->GetPoints()->SetNumberOfPoints(this->NumberOfPoints);
   }
 
   grid->Squeeze();

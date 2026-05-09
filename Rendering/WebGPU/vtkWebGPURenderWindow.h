@@ -26,6 +26,7 @@
 
 VTK_ABI_NAMESPACE_BEGIN
 
+class vtkOverrideAttribute;
 class vtkWebGPUComputeOcclusionCuller;
 class vtkWebGPUConfiguration;
 class vtkWebGPUTextureCache;
@@ -34,24 +35,24 @@ class vtkTypeUInt32Array;
 class VTKRENDERINGWEBGPU_EXPORT VTK_MARSHALAUTO vtkWebGPURenderWindow : public vtkRenderWindow
 {
 public:
+  /**
+   * Instantiate the class.
+   */
+  static vtkWebGPURenderWindow* New();
+  VTK_NEWINSTANCE
+  static vtkOverrideAttribute* CreateOverrideAttributes();
   vtkTypeMacro(vtkWebGPURenderWindow, vtkRenderWindow);
   void PrintSelf(ostream& os, vtkIndent indent) override;
 
   /**
-   * Concrete render windows must create a platform window and initialize this->WindowId.
-   * Upon success, please call WGPUInit().
-   */
-  virtual bool WindowSetup() = 0;
-
-  /**
    * Create a not-off-screen window.
    */
-  virtual void CreateAWindow() = 0;
+  virtual void CreateAWindow();
 
   /**
    * Destroy a not-off-screen window.
    */
-  virtual void DestroyWindow() = 0;
+  virtual void DestroyWindow();
 
   /**
    * Creates the WebGPU context, swapchain, depth buffer, color attachment, ...
@@ -139,6 +140,14 @@ public:
   int GetZbufferData(int x1, int y1, int x2, int y2, vtkFloatArray* buffer) override;
   int SetZbufferData(int x1, int y1, int x2, int y2, float* buffer) override;
   int SetZbufferData(int x1, int y1, int x2, int y2, vtkFloatArray* buffer) override;
+  ///@}
+
+  ///@{
+  /**
+   * Get the Ids data from the last render.
+   */
+  vtkTypeUInt32* GetIdsData(int x1, int y1, int x2, int y2);
+  void GetIdsData(int x1, int y1, int x2, int y2, vtkTypeUInt32Array* data);
   ///@}
 
   /**
@@ -296,6 +305,16 @@ public:
   };
   vtkSmartPointer<vtkImageData> SaveAttachmentToVTI(AttachmentTypeForVTISnapshot type);
 
+  /**
+   * Ensure RenderWindow's display is opened
+   */
+  bool EnsureDisplay() override;
+
+  /**
+   * Get the generic display id for the window.
+   */
+  void* GetGenericDisplayId() override;
+
 protected:
   vtkWebGPURenderWindow();
   ~vtkWebGPURenderWindow() override;
@@ -308,11 +327,12 @@ protected:
    *     "Visualization Toolkit - Cocoa OpenGL"
    *     "Visualization Toolkit - Win32 D3D12"
    */
-  virtual std::string MakeDefaultWindowNameWithBackend() = 0;
+  virtual std::string MakeDefaultWindowNameWithBackend();
 
   bool WGPUInit();
   void WGPUFinalize();
 
+  void CreateSurface();
   void ConfigureSurface();
   void UnconfigureSurface();
 
@@ -331,6 +351,8 @@ protected:
   void RecreateComputeRenderTextures();
 
   void RenderOffscreenTexture();
+
+  virtual void SyncWithHardware();
 
   bool RenderTexturesSetup = false;
 
@@ -388,8 +410,6 @@ protected:
 private:
   // For accessing SubmitCommandBuffer to submit custom prop render work
   friend class vtkWebGPUComputeOcclusionCuller;
-  // For accessing HardwareSelectorAttachment
-  friend class vtkWebGPUHardwareSelector;
 
   vtkWebGPURenderWindow(const vtkWebGPURenderWindow&) = delete;
   void operator=(const vtkWebGPURenderWindow&) = delete;
@@ -417,6 +437,32 @@ private:
    */
   void PostRasterizationRender();
 
+  struct ComponentMapping
+  {
+    int Map[4];
+    int InComponents;
+    int OutComponents;
+    bool Valid;
+  };
+
+  ComponentMapping GetComponentMapping(wgpu::TextureFormat format, int desiredOutComponents);
+
+  template <typename TOutput, typename TInput>
+  struct PixelReadbackCallbackData
+  {
+    TOutput* OutputValues;
+    uint32_t Width, Height;
+    ComponentMapping Mapping;
+    std::function<TOutput(TInput)> Converter;
+  };
+
+  template <typename TOutput, typename TInput>
+  TOutput* GetTextureDataInternal(wgpu::Texture texture, wgpu::TextureFormat format, int x1, int y1,
+    int x2, int y2, const ComponentMapping& componentMapping,
+    std::function<TOutput(TInput)> converter = nullptr);
+
+  std::uint32_t FlipY(std::uint32_t y);
+
   void ReadTextureFromGPU(wgpu::Texture& wgpuTexture, wgpu::TextureFormat format,
     std::size_t mipLevel, wgpu::TextureAspect aspect, wgpu::Origin3D offsets,
     wgpu::Extent3D extents, TextureMapCallback callback, void* userData);
@@ -424,14 +470,12 @@ private:
   void ReadTextureFromGPU(wgpu::Texture& wgpuTexture, wgpu::TextureFormat format,
     std::size_t mipLevel, wgpu::TextureAspect aspect, TextureMapCallback callback, void* userData);
 
-  void GetIdsData(int x1, int y1, int x2, int y2, vtkTypeUInt32* values);
-  void GetIdsData(int x1, int y1, int x2, int y2, vtkTypeUInt32Array* data);
-
   // Render textures acquired by the user on this render window. They are kept here in case the
   // render window is resized, in which case, we'll need to resize the render textures --> We need
   // access to the textures
   std::vector<vtkSmartPointer<vtkWebGPUComputeRenderTexture>> ComputeRenderTextures;
 };
 
+#define vtkWebGPURenderWindow_OVERRIDE_ATTRIBUTES vtkWebGPURenderWindow::CreateOverrideAttributes()
 VTK_ABI_NAMESPACE_END
 #endif

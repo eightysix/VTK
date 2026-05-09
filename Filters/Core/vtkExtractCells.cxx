@@ -443,7 +443,7 @@ vtkSmartPointer<vtkIdList> ConvertToPointIdsToExtract(vtkIdList* pointMap)
 {
   const auto numberOfInputPoints = pointMap->GetNumberOfIds();
   vtkNew<vtkIdList> srcIds;
-  srcIds->Allocate(numberOfInputPoints);
+  srcIds->Reserve(numberOfInputPoints);
   auto pointMapPtr = pointMap->GetPointer(0);
   for (vtkIdType cc = 0; cc < numberOfInputPoints; ++cc)
   {
@@ -491,7 +491,8 @@ public:
       {
         auto smallest = this->begin();
         auto largest = std::upper_bound(this->begin(), this->end(), numInputCells - 1);
-        this->Resize(static_cast<vtkIdType>(std::distance(smallest, largest)));
+        this->SetNumberOfIds(std::distance(smallest, largest));
+        this->Squeeze();
       }
       else
       {
@@ -501,7 +502,8 @@ public:
           ? std::upper_bound(this->begin(), this->end(), numInputCells - 1)
           : this->end();
         std::copy(smallest, largest, this->begin());
-        this->Resize(static_cast<vtkIdType>(std::distance(this->begin(), largest)));
+        this->SetNumberOfIds(std::distance(this->begin(), largest));
+        this->Squeeze();
       }
     }
     return this->GetNumberOfIds();
@@ -568,10 +570,6 @@ void vtkExtractCells::AddCellIds(const vtkIdType* ptr, vtkIdType numValues)
   auto& cellIds = this->CellList;
   const vtkIdType oldSize = cellIds->GetNumberOfIds();
   const vtkIdType newSize = oldSize + numValues;
-  if (oldSize != 0)
-  {
-    cellIds->Resize(newSize);
-  }
   cellIds->SetNumberOfIds(newSize);
   vtkSMPTools::For(0, numValues,
     [&](vtkIdType begin, vtkIdType end)
@@ -596,10 +594,6 @@ void vtkExtractCells::AddCellRange(vtkIdType from, vtkIdType to)
   const vtkIdType oldSize = cellIds->GetNumberOfIds();
   const vtkIdType numValues = to - from;
   const vtkIdType newSize = oldSize + numValues;
-  if (oldSize != 0)
-  {
-    cellIds->Resize(newSize);
-  }
   cellIds->SetNumberOfIds(newSize);
   vtkSMPTools::For(0, numValues,
     [&](vtkIdType begin, vtkIdType end)
@@ -641,7 +635,6 @@ int vtkExtractCells::RequestData(vtkInformation* vtkNotUsed(request),
     outPD->CopyAllocate(inPD, 1);
     outCD->CopyAllocate(inCD, 1);
     vtkNew<vtkPoints> pts;
-    pts->SetNumberOfPoints(0);
     output->SetPoints(pts);
     return 1;
   }

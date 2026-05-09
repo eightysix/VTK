@@ -61,6 +61,28 @@ digraph G {
 
 ```
 
+## Attribute Data
+
+Attribute data (point, cell, field) is stored in HDF5 datasets located in
+the `VTKHDF/[Point/Cell/Field]Data` groups.
+
+Each point and cell array can define the "Attribute" HDF5 attribute to mark the array as carrying a special meaning,
+corresponding to types defined in `vtkDataSetAttributes`.
+
+Possible values for "Attribute" are (case-insensitive):
+ - Scalars
+ - Vectors
+ - Normals
+ - TCoords
+ - Tensors
+ - GlobalIds
+ - PedigreeIds
+ - EdgeFlag
+ - Tangents
+ - RationalWeights
+ - HigherOrderDegrees
+ - ProcessIds
+
 ## Image data
 
 The format for image data is detailed in the Figure 1 where the `Type`
@@ -531,31 +553,40 @@ The format currently supports vtkPartitionedDataSetCollection (PDC) and vtkMulti
 The `Type` attribute of the `VTKHDF` group for them should be either `PartitionedDataSetCollection` or `MultiBlockDataSet`.
 
 All simple (non composite) datasets are located in the root `VTKHDF` group, with a unique block name.
-These blocks can have any `Type` specified above, or be empty blocks when no `Type` is specified.
+These blocks can have any simple `Type` specified above, or be empty blocks when no `Type` is specified.
 These top-level data blocks should not be composite themselves : they can only be simple or partitioned (multi-piece) types.
 For temporal datasets, all blocks should have the same number of time steps and time values.
 
 Then, dataset tree hierarchy is defined in the `Assembly` group, which is also a direct child of the `VTKHDF` group.
 Sub-groups in the `Assembly` group define the dataset(s) they contain using a [HDF5 symbolic link](https://davis.lbl.gov/Manuals/HDF5-1.8.7/UG/09_Groups.html#HardAndSymbolicLinks)
-to the top-level datasets. The name of the link in the assembly will be the actual name of the block when read.
+to the top-level datasets. The name of the link target in the assembly will be the actual name of the block when read.
 Any group can have multiple children that are either links to datasets, or nodes that define datasets deeper in the hierarchy.
 
 ```{admonition} **Track Creation Order**
 :class: warning
 
-VTKHDF group, the Assembly group and its children need to track creation order to be able to keep subtrees ordered.
+VTKHDF group, the Assembly group and its children need to track creation order so we always read them ordered properly.
 For this, you need to set H5G properties `H5P_CRT_ORDER_TRACKED` and `H5P_CRT_ORDER_INDEXED` on each group when writing the Assembly.
 
 ```
 
 While both MB and PDC share a common structure, there is still a slight distinction in the format between them.
-For PDC, a group in the assembly that is not a softlink represents a node in the vtkDataAssembly associated to it, and
-a softlink represents a dataset index associated to its parent node (similar to what the function `AddDataSetIndex` does in `vtkDataAssembly`).
-This way, a single dataset can be used multiple times in the assembly without any additional storage cost.
-Top-level datasets need to set an `Index` attribute to specify their index in the PDC flat structure.
+This is caused by an internal storage different between MB and PDC; both data classes are not 100% compatible with each other.
 
-On the other hand, MB structures work a little differently. First, they don't need no index for their datasets, and
-secondly, an assembly node that is not a softlink represents a nested `vtkMultiBlockDataSet`.
+Multiblock define their structure recursively, nesting multiblocks inside of other multiblocks to achieve multi-level nesting.
+PDC store their leaf datasets in an indexed list, and their structure in a separate object.
+ - The dataset list associates an integer index to a dataset object.
+ - The `vtkDataAssembly`object defines structure using a tree of nodes. Each node of the tree can be associated to one or more datasets from the indexed dataset list.
+
+In practice, for PDC in VTKHDF, a group in the `Assembly` group is either:
+ - Not a softlink, and represents a node in the vtkDataAssembly tree.
+ - A softlink that points to a non-composite block group in the `VTKHDF` group. It represents the association of its parent node in the tree structure with an indexed dataset in the flat list, similar to what the function `AddDataSetIndex` does in `vtkDataAssembly`.
+
+This way, a single dataset can be used multiple times in the assembly without any additional storage cost.
+Top-level datasets need to set an `Index` attribute to specify their index in the PDC flat dataset array. This index needs to be globally unique.
+
+On the other hand, MB structures don't need an index for their leaf datasets,
+and an assembly node that is not a softlink represents a nested `vtkMultiBlockDataSet`.
 A softlink in the assembly represents a dataset nested in its parent `vtkMultiBlockDataSet`.
 Again, this MB format can save space when a block is referenced multiple times.
 
@@ -597,9 +628,6 @@ digraph G {
 Figure 6. - PartitionedDataSetCollection/MultiBlockDataset VTKHDF File Format
 </div>
 
-:::{hint}
-Each block should describe a valid VTKHDF root node for a supported data types. Composite data types are not, and will not, be supported.
-:::
 
 ## Temporal Data
 

@@ -15,6 +15,7 @@ detailed instructions.
 - [Cone](./Cone/README.md) Shows how to write an extremely simple 3D object viewer that runs in the browser using VTK that targets WebAssembly architecture.
 - [ConeMultiBackend](./ConeMultiBackend/README.md) Shows how to write a 3D object viewer for
 WebAssembly . Notably, it offers the flexibility to select the rendering backend, either OpenGL or WebGPU, during runtime.
+- [ConeWebXR](./ConeWebXR/README.md) Shows how to write a simple 3D object viewer for XR devices that runs in the browser using WebXR.
 - [GeometryViewer](./GeometryViewer/README.md) Load files from popular formats and adjust rendering options.
 - [ModuleTesting](./ModuleTesting/README.md) Illustrates necessary CMake code and directory structure to enable and run WASM tests for custom modules.
 - [MultiCone](./MultiCone/README.md) Shows to render multiple viewports in a HTML canvas using a VTK wasm module per viewport.

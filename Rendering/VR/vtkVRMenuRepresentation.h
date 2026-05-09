@@ -18,10 +18,11 @@
 
 #include "vtkRenderingVRModule.h" // For export macro
 #include "vtkWidgetRepresentation.h"
-#include <deque> // for ivar
+#include "vtkWrappingHints.h" // For VTK_MARSHALAUTO
+#include <deque>              // for ivar
 
 VTK_ABI_NAMESPACE_BEGIN
-class VTKRENDERINGVR_EXPORT vtkVRMenuRepresentation : public vtkWidgetRepresentation
+class VTKRENDERINGVR_EXPORT VTK_MARSHALAUTO vtkVRMenuRepresentation : public vtkWidgetRepresentation
 {
 public:
   /**

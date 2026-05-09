@@ -13,6 +13,7 @@ DEPENDS
   VTK::CommonDataModel
 OPTIONAL_DEPENDS
   VTK::RenderingCore
+  VTK::RenderingWebXR
 TEST_DEPENDS
   VTK::FiltersCore
   VTK::ImagingCore

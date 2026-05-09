@@ -185,7 +185,7 @@ int PrintAndCheck(const std::vector<vtkDataSet*>& inputs, vtkDataSet* output, in
 
   for (int arrayIndex = 0; arrayIndex < dataArrays->GetNumberOfArrays(); ++arrayIndex)
   {
-    vtkIntArray* outputArray = vtkArrayDownCast<vtkIntArray>(dataArrays->GetArray(arrayIndex));
+    vtkDataArray* outputArray = vtkArrayDownCast<vtkDataArray>(dataArrays->GetArray(arrayIndex));
     const char* outputArrayName = outputArray->GetName();
     std::cout << "Array " << arrayIndex << " - ";
     std::cout << (outputArrayName ? outputArrayName : "(null)") << ": [ ";
@@ -212,7 +212,7 @@ int PrintAndCheck(const std::vector<vtkDataSet*>& inputs, vtkDataSet* output, in
   // Test the output
   for (int arrayIndex = 0; arrayIndex < dataArrays->GetNumberOfArrays(); ++arrayIndex)
   {
-    vtkIntArray* outputArray = vtkArrayDownCast<vtkIntArray>(dataArrays->GetArray(arrayIndex));
+    vtkDataArray* outputArray = vtkArrayDownCast<vtkDataArray>(dataArrays->GetArray(arrayIndex));
     const char* arrayName = outputArray->GetName();
     if (arrayName == nullptr)
     {
@@ -423,11 +423,13 @@ int AppendDatasetsAndCheckMergedArrayLengths(vtkAppendDataSets* append)
 }
 
 //////////////////////////////////////////////////////////////////////////////
-// Returns 1 on success, 0 otherwise
+// Returns true on success, false otherwise
 //////////////////////////////////////////////////////////////////////////////
-int AppendDatasetsAndPrint(const std::vector<vtkDataSet*>& inputs, const char* expectedDataSetType)
+bool AppendDatasetsAndPrint(
+  const std::vector<vtkDataSet*>& inputs, const char* expectedDataSetType, bool useImplicitArray)
 {
   vtkNew<vtkAppendDataSets> append;
+  append->SetUseImplicitArray(useImplicitArray);
   for (size_t inputIndex = 0; inputIndex < inputs.size(); ++inputIndex)
   {
     append->AddInputData(inputs[inputIndex]);
@@ -439,31 +441,40 @@ int AppendDatasetsAndPrint(const std::vector<vtkDataSet*>& inputs, const char* e
   {
     std::cerr << "Output dataset type is " << output->GetClassName() << " but is expected to be "
               << expectedDataSetType << std::endl;
-    return 0;
+    return false;
   }
 
   if (!PrintAndCheck(inputs, output, vtkDataObject::POINT))
   {
-    return 0;
+    return false;
   }
   if (!PrintAndCheck(inputs, output, vtkDataObject::CELL))
   {
-    return 0;
+    return false;
   }
 
   if (output->GetPointData()->GetGlobalIds() == nullptr)
   {
     std::cerr << "Point global ids should have been preserved!\n";
-    return 0;
+    return false;
   }
 
   if (output->GetCellData()->GetGlobalIds() == nullptr)
   {
     std::cerr << "Cell global ids should have been preserved!\n";
-    return 0;
+    return false;
   }
 
   return AppendDatasetsAndCheckMergedArrayLengths(append);
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Returns true on success, false otherwise
+//////////////////////////////////////////////////////////////////////////////
+bool AppendDatasetsAndPrint(const std::vector<vtkDataSet*>& inputs, const char* expectedDataSetType)
+{
+  return AppendDatasetsAndPrint(inputs, expectedDataSetType, false) &&
+    AppendDatasetsAndPrint(inputs, expectedDataSetType, true);
 }
 
 bool TestToleranceModes(vtkDataSet* dataset1, vtkDataSet* dataset2)

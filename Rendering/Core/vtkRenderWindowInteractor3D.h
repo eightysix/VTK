@@ -19,6 +19,7 @@
 
 #include "vtkRenderWindowInteractor.h"
 #include "vtkRenderingCoreModule.h" // For export macro
+#include "vtkWrappingHints.h"       // For VTK_MARSHALAUTO, VTK_MARSHALEXCLUDE
 
 #include "vtkNew.h" // ivars
 
@@ -28,7 +29,8 @@ class vtkMatrix4x4;
 enum class vtkEventDataDevice;
 enum class vtkEventDataDeviceInput;
 
-class VTKRENDERINGCORE_EXPORT vtkRenderWindowInteractor3D : public vtkRenderWindowInteractor
+class VTKRENDERINGCORE_EXPORT VTK_MARSHALAUTO vtkRenderWindowInteractor3D
+  : public vtkRenderWindowInteractor
 {
 public:
   /**
@@ -145,6 +147,7 @@ public:
   /**
    * Return starting physical to world matrix.
    */
+  VTK_MARSHALEXCLUDE(VTK_MARSHAL_EXCLUDE_REASON_IS_INTERNAL)
   virtual void GetStartingPhysicalToWorldMatrix(vtkMatrix4x4* startingPhysicalToWorldMatrix);
 
   /**
@@ -158,6 +161,7 @@ public:
    * \sa vtkVRRenderWindowInteractor::HandleComplexGestureEvents()
    * \sa vtkVRRenderWindowInteractor::RecognizeComplexGesture()
    */
+  VTK_MARSHALEXCLUDE(VTK_MARSHAL_EXCLUDE_REASON_IS_INTERNAL)
   virtual void SetStartingPhysicalToWorldMatrix(vtkMatrix4x4* startingPhysicalToWorldMatrix);
 
   /**

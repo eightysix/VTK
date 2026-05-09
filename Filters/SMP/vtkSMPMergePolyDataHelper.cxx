@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) Ken Martin, Will Schroeder, Bill Lorensen
 // SPDX-License-Identifier: BSD-3-Clause
+#define VTK_DEPRECATION_LEVEL 0
+
 #include "vtkSMPMergePolyDataHelper.h"
 
 #include "vtkCellArray.h"
@@ -82,8 +84,6 @@ void MergePoints(
     numPts += (*itr).Output->GetNumberOfPoints();
     ++itr;
   }
-  // Resize preserves existing data on reallocation
-  outPts->Resize(numPts);
   outPts->SetNumberOfPoints(numPts);
 
   // Find non-empty buckets for best load balancing. We don't
@@ -113,7 +113,7 @@ void MergePoints(
   {
     pds.push_back((*itr).Output->GetPointData());
     vtkIdList* idMap = vtkIdList::New();
-    idMap->Allocate((*itr).Output->GetNumberOfPoints());
+    idMap->Reserve((*itr).Output->GetNumberOfPoints());
     idMaps.push_back(idMap);
     ++itr;
   }
@@ -130,8 +130,6 @@ void MergePoints(
     int numArrays = mergePoints.OutputPointData->GetNumberOfArrays();
     for (int i = 0; i < numArrays; i++)
     {
-      // Resize preserves existing data on reallocation
-      mergePoints.OutputPointData->GetArray(i)->Resize(numPts);
       mergePoints.OutputPointData->GetArray(i)->SetNumberOfTuples(numPts);
     }
     mergePoints.InputPointDatas = pds.data();
@@ -427,8 +425,6 @@ vtkPolyData* vtkSMPMergePolyDataHelper::MergePolyData(std::vector<InputData>& in
   int numCellArrays = outCellData->GetNumberOfArrays();
   for (int i = 0; i < numCellArrays; i++)
   {
-    // Resize preserves existing data on reallocation
-    outCellData->GetArray(i)->Resize(numOutCells);
     outCellData->GetArray(i)->SetNumberOfTuples(numOutCells);
   }
 

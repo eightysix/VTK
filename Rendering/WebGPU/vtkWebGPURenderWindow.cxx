@@ -9,22 +9,39 @@
 #include "Private/vtkWebGPURenderPipelineDescriptorInternals.h"
 #include "vtkCollectionRange.h"
 #include "vtkFloatArray.h"
+#include "vtkHardwareWindow.h"
 #include "vtkImageData.h"
 #include "vtkObjectFactory.h"
+#include "vtkOverrideAttribute.h"
 #include "vtkPointData.h"
 #include "vtkRendererCollection.h"
+#include "vtkSmartPointer.h"
 #include "vtkTypeUInt32Array.h"
 #include "vtkUnsignedCharArray.h"
 #include "vtkWebGPUCommandEncoderDebugGroup.h"
 #include "vtkWebGPUConfiguration.h"
 #include "vtkWebGPUHelpers.h"
 #include "vtkWebGPURenderer.h"
+#if !defined(__EMSCRIPTEN__)
+#ifdef _WIN32
+#include "vtkWin32HardwareWindow.h"
+#elif __APPLE__
+#include "vtkCocoaHardwareWindow.h"
+#elif VTK_USE_Wayland
+#include "vtkWaylandHardwareWindow.h"
+#elif VTK_USE_X
+#include "vtkXlibHardwareWindow.h"
+#endif // _WIN32, __APPLE__, VTK_USE_Wayland, Xlib
+#else  // __EMSCRIPTEN__
+#include "vtkWebAssemblyHardwareWindow.h"
+#endif // !__EMSCRIPTEN__
 
 #include "vtksys/SystemTools.hxx"
 
 #include "CopyDepthTextureToBuffer.h"
 
 #include <sstream>
+#include <webgpu/webgpu_cpp.h>
 
 #if defined(__EMSCRIPTEN__)
 #include "emscripten/version.h"
@@ -78,16 +95,45 @@ struct InternalMapTextureAsyncData
 };
 }
 
+vtkStandardNewMacro(vtkWebGPURenderWindow);
 //------------------------------------------------------------------------------
 vtkWebGPURenderWindow::vtkWebGPURenderWindow()
 {
   this->ScreenSize[0] = 0;
   this->ScreenSize[1] = 0;
+  this->Size[0] = 300;
+  this->Size[1] = 300;
   this->WGPUConfiguration = vtk::TakeSmartPointer(vtkWebGPUConfiguration::New());
 }
 
 //------------------------------------------------------------------------------
-vtkWebGPURenderWindow::~vtkWebGPURenderWindow() = default;
+vtkWebGPURenderWindow::~vtkWebGPURenderWindow()
+{
+  this->Finalize();
+  if (this->Initialized)
+  {
+    this->WGPUFinalize();
+  }
+  this->ReleaseGraphicsResources(this);
+
+  vtkRenderer* renderer;
+  vtkCollectionSimpleIterator rit;
+  this->Renderers->InitTraversal(rit);
+  while ((renderer = this->Renderers->GetNextRenderer(rit)))
+  {
+    renderer->SetRenderWindow(nullptr);
+  }
+  this->SetHardwareWindow(nullptr);
+  this->WGPUConfiguration = nullptr;
+}
+
+//------------------------------------------------------------------------------
+vtkOverrideAttribute* vtkWebGPURenderWindow::CreateOverrideAttributes()
+{
+  auto* renderingBackendAttribute =
+    vtkOverrideAttribute::CreateAttributeChain("RenderingBackend", "WebGPU", nullptr);
+  return renderingBackendAttribute;
+}
 
 //------------------------------------------------------------------------------
 void vtkWebGPURenderWindow::PrintSelf(ostream& os, vtkIndent indent)
@@ -113,14 +159,79 @@ bool vtkWebGPURenderWindow::WGPUInit()
 }
 
 //------------------------------------------------------------------------------
-void vtkWebGPURenderWindow::Initialize()
+void vtkWebGPURenderWindow::CreateSurface()
 {
-  if (!this->WindowSetup()) // calls WGPUInit after surface is created.
+  if (!this->HardwareWindow)
   {
-    vtkLog(ERROR, "Unable to setup WebGPU.");
+    // vtkErrorMacro(<< "Cannot create surface without a hardware window.");
     return;
   }
 
+#ifdef __EMSCRIPTEN__
+  if (auto* wasmhw = vtkWebAssemblyHardwareWindow::SafeDownCast(this->HardwareWindow))
+  {
+    wgpu::EmscriptenSurfaceSourceCanvasHTMLSelector htmlSurfDesc;
+    htmlSurfDesc.selector = wasmhw->GetCanvasSelector();
+    wgpu::SurfaceDescriptor surfDesc = {};
+    surfDesc.label = "VTK HTML5 surface";
+    surfDesc.nextInChain = &htmlSurfDesc;
+    this->Surface = this->WGPUConfiguration->GetInstance().CreateSurface(&surfDesc);
+  }
+#elif _WIN32
+  if (auto* win32hw = vtkWin32HardwareWindow::SafeDownCast(this->HardwareWindow))
+  {
+    wgpu::SurfaceDescriptorFromWindowsHWND winSurfDesc;
+    winSurfDesc.hwnd = win32hw->GetWindowId();
+    winSurfDesc.hinstance = win32hw->GetApplicationInstance();
+    wgpu::SurfaceDescriptor surfDesc = {};
+    surfDesc.label = "VTK Win32 surface";
+    surfDesc.nextInChain = &winSurfDesc;
+    this->Surface = this->WGPUConfiguration->GetInstance().CreateSurface(&surfDesc);
+  }
+#elif defined VTK_USE_Wayland
+  if (auto* waylandhw = vtkWaylandHardwareWindow::SafeDownCast(this->HardwareWindow))
+  {
+    wgpu::SurfaceDescriptorFromWaylandSurface waylandSurfDesc;
+    waylandSurfDesc.surface = waylandhw->GetWindowId();
+    waylandSurfDesc.display = waylandhw->GetDisplayId();
+    wgpu::SurfaceDescriptor surfDesc = {};
+    surfDesc.label = "VTK Wayland surface";
+    surfDesc.nextInChain = &waylandSurfDesc;
+    this->Surface = this->WGPUConfiguration->GetInstance().CreateSurface(&surfDesc);
+  }
+#elif defined __APPLE__
+  if (auto* cocoahw = vtkCocoaHardwareWindow::SafeDownCast(this->HardwareWindow))
+  {
+    wgpu::SurfaceDescriptorFromMetalLayer metalSurfDesc;
+    metalSurfDesc.layer = cocoahw->GetMetalLayer();
+    wgpu::SurfaceDescriptor surfDesc = {};
+    surfDesc.label = "VTK Cocoa surface";
+    surfDesc.nextInChain = &metalSurfDesc;
+    this->Surface = this->WGPUConfiguration->GetInstance().CreateSurface(&surfDesc);
+  }
+#else // Xlib
+  if (auto* xlibhw = vtkXlibHardwareWindow::SafeDownCast(this->HardwareWindow))
+  {
+    xlibhw->SetWindowName("VTK Xlib window");
+    wgpu::SurfaceDescriptorFromXlibWindow xlibSurfDesc;
+    xlibSurfDesc.display = xlibhw->GetDisplayId();
+    xlibSurfDesc.window = xlibhw->GetWindowId();
+    wgpu::SurfaceDescriptor surfDesc = {};
+    surfDesc.label = "VTK Xlib surface";
+    surfDesc.nextInChain = &xlibSurfDesc;
+    this->Surface = this->WGPUConfiguration->GetInstance().CreateSurface(&surfDesc);
+  }
+#endif
+}
+
+//------------------------------------------------------------------------------
+void vtkWebGPURenderWindow::Initialize()
+{
+  this->CreateAWindow();
+  if (this->WGPUInit())
+  {
+    this->CreateSurface();
+  }
   this->ConfigureSurface();
   this->CreateOffscreenColorAttachment();
   this->CreateIdsAttachment();
@@ -142,6 +253,7 @@ void vtkWebGPURenderWindow::WGPUFinalize()
   }
   this->ReleaseGraphicsResources(this);
   this->WGPUConfiguration->Finalize();
+  this->DestroyWindow();
   this->Initialized = false;
 }
 
@@ -149,7 +261,11 @@ void vtkWebGPURenderWindow::WGPUFinalize()
 void vtkWebGPURenderWindow::Render()
 {
   vtkDebugMacro(<< __func__);
-
+  if (this->HardwareWindow != nullptr)
+  {
+    this->SyncWithHardware();
+    this->HardwareWindow->Render();
+  }
   this->Superclass::Render();
 }
 
@@ -304,7 +420,6 @@ void vtkWebGPURenderWindow::CreateCommandEncoder()
 {
   vtkWebGPUCheckUnconfigured(this);
   wgpu::CommandEncoderDescriptor encDesc = {};
-  std::stringstream label;
   encDesc.label = "vtkWebGPURenderWindow::CommandEncoder";
   if (auto device = this->WGPUConfiguration->GetDevice())
   {
@@ -329,7 +444,8 @@ void vtkWebGPURenderWindow::InitializeRendererComputePipelines()
     else
     {
       vtkWarningMacro(<< "Renderer is not a vtkWebGPURenderer. Cannot initialize compute "
-                         "pipelines. Please ensure VTK_GRAPHICS_BACKEND is set to 'WEBGPU' ");
+                         "pipelines. Please ensure object factory preferences include "
+                         "'RenderingBackend=WebGPU'.");
     }
   }
 }
@@ -649,7 +765,7 @@ void vtkWebGPURenderWindow::CreateColorCopyPipeline()
     @fragment
     fn fragmentMain(fragment: FragmentInput) -> @location(0) vec4<f32> {
       let dims = textureDimensions(fsqTexture);
-      let texCoord = vec2(u32(fragment.position.x), dims.y - 1u - u32(fragment.position.y));
+      let texCoord = vec2(u32(fragment.position.x), u32(fragment.position.y));
       let color = textureLoad(fsqTexture, texCoord, 0);
       return vec4<f32>(color);
     }
@@ -765,6 +881,88 @@ void vtkWebGPURenderWindow::PostRasterizationRender()
 }
 
 //------------------------------------------------------------------------------
+vtkWebGPURenderWindow::ComponentMapping vtkWebGPURenderWindow::GetComponentMapping(
+  wgpu::TextureFormat format, int desiredOutComponents)
+{
+  switch (format)
+  {
+    case wgpu::TextureFormat::RGBA8Unorm:
+      return { { 0, 1, 2, 3 }, 4, desiredOutComponents, true };
+    case wgpu::TextureFormat::RGBA32Uint:
+      return { { 0, 1, 2, 3 }, 4, desiredOutComponents, true };
+    case wgpu::TextureFormat::BGRA8Unorm:
+      return { { 2, 1, 0, 3 }, 4, desiredOutComponents, true };
+    default:
+      vtkGenericWarningMacro(
+        "GetComponentMapping: Unsupported texture format " << static_cast<int>(format) << ".");
+      return { { -1, -1, -1, -1 }, 4, desiredOutComponents, false };
+  }
+}
+
+//------------------------------------------------------------------------------
+template <typename TOutput, typename TInput>
+TOutput* vtkWebGPURenderWindow::GetTextureDataInternal(wgpu::Texture texture,
+  wgpu::TextureFormat format, int x1, int y1, int x2, int y2,
+  const ComponentMapping& componentMapping, std::function<TOutput(TInput)> converter /*=nullptr*/)
+{
+  int xMin = std::min(x1, x2);
+  int xMax = std::max(x1, x2);
+  int yMin = std::min(y1, y2);
+  int yMax = std::max(y1, y2);
+  uint32_t width = static_cast<uint32_t>(xMax - xMin + 1);
+  uint32_t height = static_cast<uint32_t>(yMax - yMin + 1);
+
+  wgpu::Origin3D origin;
+  origin.x = static_cast<std::uint32_t>(xMin);
+  origin.y = this->FlipY(static_cast<std::uint32_t>(yMax));
+
+  wgpu::Extent3D extent = { width, height, 1 };
+
+  auto* result = new TOutput[width * height * componentMapping.OutComponents];
+
+  auto* callbackData = new PixelReadbackCallbackData<TOutput, TInput>();
+  callbackData->Width = width;
+  callbackData->Height = height;
+  callbackData->Mapping = componentMapping;
+  callbackData->Converter = converter;
+  callbackData->OutputValues = result;
+
+  auto onTextureMapped = [](const void* mappedValues, int bytesPerRow, void* userData)
+  {
+    auto* callbackDataPtr = reinterpret_cast<PixelReadbackCallbackData<TOutput, TInput>*>(userData);
+    const auto& formatMapping = callbackDataPtr->Mapping;
+    TOutput* dst = callbackDataPtr->OutputValues;
+    const TInput* src = reinterpret_cast<const TInput*>(mappedValues);
+    const vtkIdType stridePixels = bytesPerRow / (formatMapping.InComponents * sizeof(TInput));
+    for (std::uint32_t y = 0; y < callbackDataPtr->Height; ++y)
+    {
+      const auto yFlipped = callbackDataPtr->Height - y - 1;
+      for (std::uint32_t x = 0; x < callbackDataPtr->Width; ++x)
+      {
+        const vtkIdType pixelId = x + yFlipped * stridePixels;
+        for (int c = 0; c < formatMapping.OutComponents; ++c)
+        {
+          const auto value = src[pixelId * formatMapping.InComponents + formatMapping.Map[c]];
+          (*dst++) = callbackDataPtr->Converter(value);
+        }
+      }
+    }
+    delete callbackDataPtr;
+  };
+
+  this->ReadTextureFromGPU(texture, format, 0, wgpu::TextureAspect::All, origin, extent,
+    onTextureMapped, reinterpret_cast<void*>(callbackData));
+  this->WaitForCompletion();
+  return result;
+}
+
+//------------------------------------------------------------------------------
+std::uint32_t vtkWebGPURenderWindow::FlipY(std::uint32_t y)
+{
+  return this->Size[1] - 1 - y;
+}
+
+//------------------------------------------------------------------------------
 void vtkWebGPURenderWindow::ReadTextureFromGPU(wgpu::Texture& wgpuTexture,
   wgpu::TextureFormat format, std::size_t mipLevel, wgpu::TextureAspect aspect,
   wgpu::Origin3D offsets, wgpu::Extent3D extents, TextureMapCallback callback, void* userData)
@@ -792,6 +990,7 @@ void vtkWebGPURenderWindow::ReadTextureFromGPU(wgpu::Texture& wgpuTexture,
       vtkErrorMacro(
         << "Unhandled texture format in vtkWebGPUTextureDeviceResource::GetBytesPerPixel: "
         << int(format));
+      return;
   }
 
   // Bytes needs to be a multiple of 256
@@ -835,6 +1034,15 @@ void vtkWebGPURenderWindow::ReadTextureFromGPU(wgpu::Texture& wgpuTexture,
   auto bufferMapCallback =
     [](wgpu::MapAsyncStatus status, wgpu::StringView message, InternalMapTextureAsyncData* mapData)
   {
+#ifdef Success
+    // Avoiding macro collision on Xlib systems where Success is defined as 0 with the definition
+    // wgpu::MapAsyncStatus::Success in dawn's webgpu_cpp.h.
+    // See X11/Xlib.h: #define Success 0
+    // We undefine preprocessor macro Success here and redefine it as a `constexpr auto` variable.
+    constexpr auto Success_ = Success;
+#undef Success
+    [[maybe_unused]] constexpr auto Success = Success_;
+#endif
     if (status == wgpu::MapAsyncStatus::Success)
     {
       const void* mappedRange = mapData->buffer.GetConstMappedRange(0, mapData->byteSize);
@@ -880,77 +1088,10 @@ void vtkWebGPURenderWindow::ReadTextureFromGPU(wgpu::Texture& wgpuTexture,
   wgpu::TextureFormat format, std::size_t mipLevel, wgpu::TextureAspect aspect,
   vtkWebGPURenderWindow::TextureMapCallback callback, void* userData)
 {
-  return this->ReadTextureFromGPU(wgpuTexture, format, mipLevel, aspect, wgpu::Origin3D{ 0, 0, 0 },
+  this->ReadTextureFromGPU(wgpuTexture, format, mipLevel, aspect, wgpu::Origin3D{ 0, 0, 0 },
     wgpu::Extent3D{
       wgpuTexture.GetWidth(), wgpuTexture.GetHeight(), wgpuTexture.GetDepthOrArrayLayers() },
     callback, userData);
-}
-
-//------------------------------------------------------------------------------
-void vtkWebGPURenderWindow::GetIdsData(int x1, int y1, int x2, int y2, vtkTypeUInt32* values)
-{
-  int inNumberOfComponents = 4;
-
-  struct CallbackData
-  {
-    vtkTypeUInt32* outputValues;
-    int xMin;
-    int xMax;
-    int yMin;
-    int yMax;
-  };
-
-  auto* callbackData = new CallbackData();
-  callbackData->outputValues = values;
-  callbackData->xMin = x1;
-  callbackData->xMax = x2;
-  callbackData->yMin = y1;
-  callbackData->yMax = y2;
-
-  auto onTextureMapped = [inNumberOfComponents](
-                           const void* mappedData, int bytesPerRow, void* userData)
-  {
-    CallbackData* callbackDataPtr = reinterpret_cast<CallbackData*>(userData);
-    auto* outputValues = callbackDataPtr->outputValues;
-    const vtkTypeUInt32* mappedDataAsUInt32 = reinterpret_cast<const vtkTypeUInt32*>(mappedData);
-
-    // Copying the RGBA channels of each pixel
-    vtkIdType dstIdx = 0;
-    for (int y = callbackDataPtr->yMin; y <= callbackDataPtr->yMax; y++)
-    {
-      for (int x = callbackDataPtr->xMin; x <= callbackDataPtr->xMax; x++)
-      {
-        // Dividing by inNumberOfComponents * sizeof(SampleType) here because we want to multiply Y
-        // by the 'width' which is in number of pixels (ex: for RGBA=4, for RGB=3)
-        const int mappedIndex =
-          x + y * (bytesPerRow / (inNumberOfComponents * sizeof(vtkTypeUInt32)));
-        outputValues[dstIdx++] = mappedDataAsUInt32[mappedIndex * inNumberOfComponents + 0];
-        outputValues[dstIdx++] = mappedDataAsUInt32[mappedIndex * inNumberOfComponents + 1];
-        outputValues[dstIdx++] = mappedDataAsUInt32[mappedIndex * inNumberOfComponents + 2];
-        outputValues[dstIdx++] = mappedDataAsUInt32[mappedIndex * inNumberOfComponents + 3];
-      }
-    }
-    delete callbackDataPtr;
-  };
-
-  this->ReadTextureFromGPU(this->IdsAttachment.Texture, this->IdsAttachment.Format, 0,
-    wgpu::TextureAspect::All, onTextureMapped, reinterpret_cast<void*>(callbackData));
-  this->WaitForCompletion();
-}
-
-//------------------------------------------------------------------------------
-void vtkWebGPURenderWindow::GetIdsData(int x1, int y1, int x2, int y2, vtkTypeUInt32Array* data)
-{
-  int width = x2 - x1 + 1;
-  int height = y2 - y1 + 1;
-  const int outNumberOfComponents = 4;
-  data->SetNumberOfComponents(outNumberOfComponents);
-  data->SetNumberOfTuples(width * height);
-  data->SetComponentName(0, "CellId");
-  data->SetComponentName(1, "PropId");
-  data->SetComponentName(2, "CompositeId");
-  data->SetComponentName(3, "ProcessId");
-  this->GetIdsData(x1, y1, x2, y2, data->GetPointer(0));
 }
 
 //------------------------------------------------------------------------------
@@ -1091,11 +1232,10 @@ void vtkWebGPURenderWindow::FlushCommandBuffers(vtkTypeUInt32 count, wgpu::Comma
 //------------------------------------------------------------------------------
 void vtkWebGPURenderWindow::Start()
 {
-  int* size = this->GetSize();
-  vtkDebugMacro(<< __func__ << '(' << size[0] << ',' << size[1] << ')');
+  vtkDebugMacro(<< __func__ << '(' << this->Size[0] << ',' << this->Size[1] << ')');
 
-  this->Size[0] = (size[0] > 0 ? size[0] : 300);
-  this->Size[1] = (size[1] > 0 ? size[1] : 300);
+  this->Size[0] = (this->Size[0] > 0 ? this->Size[0] : 300);
+  this->Size[1] = (this->Size[1] > 0 ? this->Size[1] : 300);
 
   vtkDebugMacro(<< __func__ << " Initialized=" << this->Initialized);
 
@@ -1234,95 +1374,29 @@ unsigned char* vtkWebGPURenderWindow::GetPixelData(
 {
   (void)front;
   (void)right;
-
-  int width = x2 - x1 + 1;
-  int height = y2 - y1 + 1;
-  const int outNumberOfComponents = 3;
-  int inNumberOfComponents = 0;
-
-  struct CallbackData
-  {
-    unsigned char* outputValues;
-    int xMin;
-    int xMax;
-    int yMin;
-    int yMax;
-    int componentMap[3] = {};
-  };
-  auto* pixels = new unsigned char[width * height * outNumberOfComponents];
-  // Dynamically allocating here because we callbackData to stay alive even after exiting this
-  // function.
-  auto* callbackData = new CallbackData();
-  callbackData->outputValues = pixels;
-  callbackData->xMin = x1;
-  callbackData->xMax = x2;
-  callbackData->yMin = y1;
-  callbackData->yMax = y2;
-  if (this->ColorAttachment.Format == wgpu::TextureFormat::BGRA8Unorm)
-  {
-    callbackData->componentMap[0] = 2;
-    callbackData->componentMap[1] = 1;
-    callbackData->componentMap[2] = 0;
-    inNumberOfComponents = 4;
-  }
-  else if (this->ColorAttachment.Format == wgpu::TextureFormat::RGBA8Unorm)
-  {
-    callbackData->componentMap[0] = 0;
-    callbackData->componentMap[1] = 1;
-    callbackData->componentMap[2] = 2;
-    inNumberOfComponents = 4;
-  }
-  else
-  {
-    // TODO: Handle other formats.
-    vtkErrorMacro(<< "Unsupported offscreen texture format!");
-    delete callbackData;
-    return pixels;
-  }
-
-  auto onTextureMapped = [inNumberOfComponents](
-                           const void* mappedData, int bytesPerRow, void* userData)
-  {
-    CallbackData* callbackDataPtr = reinterpret_cast<CallbackData*>(userData);
-    unsigned char* outputValues = callbackDataPtr->outputValues;
-    const unsigned char* mappedDataChar = reinterpret_cast<const unsigned char*>(mappedData);
-
-    // Copying the RGB channels of each pixel
-    vtkIdType dstIdx = 0;
-    for (int y = callbackDataPtr->yMin; y <= callbackDataPtr->yMax; y++)
-    {
-      for (int x = callbackDataPtr->xMin; x <= callbackDataPtr->xMax; x++)
-      {
-        // Dividing by inNumberOfComponents * sizeof(SampleType) here because we want to multiply Y
-        // by the 'width' which is in number of pixels (ex: for RGBA=4, for RGB=3)
-        const int mappedIndex =
-          x + y * (bytesPerRow / (inNumberOfComponents * sizeof(unsigned char)));
-        // Copying the RGB channels of each pixel
-        for (auto& comp : callbackDataPtr->componentMap)
-        {
-          outputValues[dstIdx++] = mappedDataChar[mappedIndex * inNumberOfComponents + comp];
-        }
-      }
-    }
-    delete callbackDataPtr;
-  };
-
-  this->ReadTextureFromGPU(this->ColorAttachment.Texture, this->ColorAttachment.Format, 0,
-    wgpu::TextureAspect::All, onTextureMapped, reinterpret_cast<void*>(callbackData));
-  this->WaitForCompletion();
-  return pixels;
+  const auto componentMapping = this->GetComponentMapping(this->ColorAttachment.Format, 3);
+  using TInput = unsigned char;
+  using TOutput = unsigned char;
+  auto converter = [](TInput val) -> TOutput { return val; };
+  return this->GetTextureDataInternal<TOutput, TInput>(this->ColorAttachment.Texture,
+    this->ColorAttachment.Format, x1, y1, x2, y2, componentMapping, converter);
 }
 
 //------------------------------------------------------------------------------
 int vtkWebGPURenderWindow::GetPixelData(
   int x1, int y1, int x2, int y2, int front, vtkUnsignedCharArray* data, int right)
 {
-  int width = x2 - x1 + 1;
-  int height = y2 - y1 + 1;
+  int xMin = std::min(x1, x2);
+  int xMax = std::max(x1, x2);
+  int yMin = std::min(y1, y2);
+  int yMax = std::max(y1, y2);
+  int width = xMax - xMin + 1;
+  int height = yMax - yMin + 1;
+
   const int numberOfComponents = 3;
   data->SetNumberOfComponents(numberOfComponents);
   data->SetNumberOfTuples(width * height);
-  unsigned char* pixels = this->GetPixelData(x1, y1, x2, y2, front, right);
+  unsigned char* pixels = this->GetPixelData(xMin, yMin, xMax, yMax, front, right);
   // take ownership of pixels
   data->SetArray(pixels, width * height * numberOfComponents, 0);
   return data->GetNumberOfValues();
@@ -1342,6 +1416,7 @@ int vtkWebGPURenderWindow::SetPixelData(
   (void)front;
   (void)right;
   const int nComp = 3;
+  int yOffset = this->Size[1] - y2 - 1;
   int width = (x2 - x) + 1;
   int height = (y2 - y) + 1;
   int bytesPerRow = vtkWebGPUConfiguration::Align(width * nComp, 256);
@@ -1369,7 +1444,6 @@ int vtkWebGPURenderWindow::SetPixelData(
     return 0;
   }
   unsigned long dstIdx = 0;
-  unsigned long srcIdx = 0;
   const unsigned long nPad = bytesPerRow - width * nComp;
   int componentMap[3] = {};
   if (this->ColorAttachment.Format == wgpu::TextureFormat::BGRA8Unorm)
@@ -1384,10 +1458,11 @@ int vtkWebGPURenderWindow::SetPixelData(
     componentMap[1] = 1;
     componentMap[2] = 2;
   }
-  for (int j = 0; j < height; ++j)
+  for (int j = height - 1; j > -1; --j)
   {
     for (int i = 0; i < width; ++i)
     {
+      int srcIdx = i + j * bytesPerRow;
       for (const auto& comp : componentMap)
       {
         mapped[dstIdx + comp] = data[srcIdx++];
@@ -1407,7 +1482,7 @@ int vtkWebGPURenderWindow::SetPixelData(
   this->StagingPixelData.Extent.depthOrArrayLayers = 1;
 
   this->StagingPixelData.Origin.x = x;
-  this->StagingPixelData.Origin.y = y;
+  this->StagingPixelData.Origin.y = yOffset;
   this->StagingPixelData.Origin.z = 0;
 
   return size;
@@ -1426,95 +1501,28 @@ float* vtkWebGPURenderWindow::GetRGBAPixelData(
 {
   (void)front;
   (void)right;
-
-  int width = x2 - x1 + 1;
-  int height = y2 - y1 + 1;
-  const int outNumberOfComponents = 4;
-  int inNumberOfComponents = 0;
-
-  struct CallbackData
-  {
-    float* outputValues;
-    int xMin;
-    int xMax;
-    int yMin;
-    int yMax;
-    int componentMap[4] = {};
-  };
-  auto* pixels = new float[width * height * outNumberOfComponents];
-  auto* callbackData = new CallbackData();
-  callbackData->outputValues = pixels;
-  callbackData->xMin = x1;
-  callbackData->xMax = x2;
-  callbackData->yMin = y1;
-  callbackData->yMax = y2;
-  if (this->ColorAttachment.Format == wgpu::TextureFormat::BGRA8Unorm)
-  {
-    callbackData->componentMap[0] = 2;
-    callbackData->componentMap[1] = 1;
-    callbackData->componentMap[2] = 0;
-    callbackData->componentMap[3] = 3;
-    inNumberOfComponents = 4;
-  }
-  else if (this->ColorAttachment.Format == wgpu::TextureFormat::RGBA8Unorm)
-  {
-    callbackData->componentMap[0] = 0;
-    callbackData->componentMap[1] = 1;
-    callbackData->componentMap[2] = 2;
-    callbackData->componentMap[3] = 3;
-    inNumberOfComponents = 4;
-  }
-  else
-  {
-    // TODO: Handle other formats.
-    vtkErrorMacro(<< "Unsupported offscreen texture format!");
-    delete callbackData;
-    return pixels;
-  }
-
-  auto onTextureMapped = [inNumberOfComponents](
-                           const void* mappedData, int bytesPerRow, void* userData)
-  {
-    CallbackData* callbackDataPtr = reinterpret_cast<CallbackData*>(userData);
-    float* outputValues = callbackDataPtr->outputValues;
-    const unsigned char* mappedDataChar = reinterpret_cast<const unsigned char*>(mappedData);
-
-    vtkIdType dstIdx = 0;
-    for (int y = callbackDataPtr->yMin; y <= callbackDataPtr->yMax; y++)
-    {
-      for (int x = callbackDataPtr->xMin; x <= callbackDataPtr->xMax; x++)
-      {
-        // Dividing by inNumberOfComponents * sizeof(SampleType) here because we want to multiply Y
-        // by the 'width' which is in number of pixels (ex: for RGBA=4, for RGB=3)
-        const int mappedIndex =
-          x + y * (bytesPerRow / (inNumberOfComponents * sizeof(unsigned char)));
-        // Copying the RGBA channels of each pixel
-        for (auto& comp : callbackDataPtr->componentMap)
-        {
-          outputValues[dstIdx++] =
-            mappedDataChar[mappedIndex * inNumberOfComponents + comp] / 255.0f;
-        }
-      }
-    }
-    delete callbackDataPtr;
-  };
-
-  this->ReadTextureFromGPU(this->ColorAttachment.Texture, this->ColorAttachment.Format, 0,
-    wgpu::TextureAspect::All, onTextureMapped, reinterpret_cast<void*>(callbackData));
-  this->WaitForCompletion();
-  return pixels;
+  const auto componentMapping = this->GetComponentMapping(this->ColorAttachment.Format, 4);
+  using TInput = unsigned char;
+  using TOutput = float;
+  auto converter = [](TInput val) -> TOutput { return val / 255.0f; };
+  return this->GetTextureDataInternal<TOutput, TInput>(this->ColorAttachment.Texture,
+    this->ColorAttachment.Format, x1, y1, x2, y2, componentMapping, converter);
 }
 
 //------------------------------------------------------------------------------
 int vtkWebGPURenderWindow::GetRGBAPixelData(
   int x1, int y1, int x2, int y2, int front, vtkFloatArray* data, int right /*=0*/)
 {
-  int width = x2 - x1 + 1;
-  int height = y2 - y1 + 1;
+  int xMin = std::min(x1, x2);
+  int xMax = std::max(x1, x2);
+  int yMin = std::min(y1, y2);
+  int yMax = std::max(y1, y2);
+  int width = xMax - xMin + 1;
+  int height = yMax - yMin + 1;
   const int numberOfComponents = 4;
   data->SetNumberOfComponents(numberOfComponents);
   data->SetNumberOfTuples(width * height);
-  float* pixels = this->GetRGBAPixelData(x1, y1, x2, y2, front, right);
+  float* pixels = this->GetRGBAPixelData(xMin, yMin, xMax, yMax, front, right);
   // take ownership of pixels
   data->SetArray(pixels, width * height * numberOfComponents, 0);
   return data->GetNumberOfValues();
@@ -1535,6 +1543,7 @@ int vtkWebGPURenderWindow::SetRGBAPixelData(
   (void)blend;
   (void)right;
   const int nComp = 4;
+  int yOffset = this->Size[1] - y2 - 1;
   int width = (x2 - x) + 1;
   int height = (y2 - y) + 1;
   int bytesPerRow = vtkWebGPUConfiguration::Align(width * nComp, 256);
@@ -1562,7 +1571,6 @@ int vtkWebGPURenderWindow::SetRGBAPixelData(
     return 0;
   }
   unsigned long dstIdx = 0;
-  unsigned long srcIdx = 0;
   const unsigned long nPad = bytesPerRow - width * nComp;
   int componentMap[4] = {};
   if (this->ColorAttachment.Format == wgpu::TextureFormat::BGRA8Unorm)
@@ -1579,10 +1587,11 @@ int vtkWebGPURenderWindow::SetRGBAPixelData(
     componentMap[2] = 2;
     componentMap[3] = 3;
   }
-  for (int j = 0; j < height; ++j)
+  for (int j = height - 1; j > -1; --j)
   {
     for (int i = 0; i < width; ++i)
     {
+      int srcIdx = i + j * bytesPerRow;
       for (const auto& comp : componentMap)
       {
         mapped[dstIdx + comp] = static_cast<unsigned char>(data[srcIdx++] * 255.0);
@@ -1602,7 +1611,7 @@ int vtkWebGPURenderWindow::SetRGBAPixelData(
   this->StagingPixelData.Extent.depthOrArrayLayers = 1;
 
   this->StagingPixelData.Origin.x = x;
-  this->StagingPixelData.Origin.y = y;
+  this->StagingPixelData.Origin.y = yOffset;
   this->StagingPixelData.Origin.z = 0;
 
   this->Start();
@@ -1629,95 +1638,28 @@ unsigned char* vtkWebGPURenderWindow::GetRGBACharPixelData(
 {
   (void)front;
   (void)right;
-
-  int width = x2 - x1 + 1;
-  int height = y2 - y1 + 1;
-  const int outNumberOfComponents = 4;
-  int inNumberOfComponents = 0;
-
-  struct CallbackData
-  {
-    unsigned char* outputValues;
-    int xMin;
-    int xMax;
-    int yMin;
-    int yMax;
-    int componentMap[4] = {};
-  };
-  auto* pixels = new unsigned char[width * height * outNumberOfComponents];
-  auto* callbackData = new CallbackData();
-  callbackData->outputValues = pixels;
-  callbackData->xMin = x1;
-  callbackData->xMax = x2;
-  callbackData->yMin = y1;
-  callbackData->yMax = y2;
-  if (this->ColorAttachment.Format == wgpu::TextureFormat::BGRA8Unorm)
-  {
-    callbackData->componentMap[0] = 2;
-    callbackData->componentMap[1] = 1;
-    callbackData->componentMap[2] = 0;
-    callbackData->componentMap[3] = 3;
-    inNumberOfComponents = 4;
-  }
-  else if (this->ColorAttachment.Format == wgpu::TextureFormat::RGBA8Unorm)
-  {
-    callbackData->componentMap[0] = 0;
-    callbackData->componentMap[1] = 1;
-    callbackData->componentMap[2] = 2;
-    callbackData->componentMap[3] = 3;
-    inNumberOfComponents = 4;
-  }
-  else
-  {
-    // TODO: Handle other formats.
-    vtkErrorMacro(<< "Unsupported offscreen texture format!");
-    delete callbackData;
-    return pixels;
-  }
-
-  auto onTextureMapped = [inNumberOfComponents](
-                           const void* mappedData, int bytesPerRow, void* userData)
-  {
-    CallbackData* callbackDataPtr = reinterpret_cast<CallbackData*>(userData);
-    unsigned char* outputValues = callbackDataPtr->outputValues;
-    const unsigned char* mappedDataChar = reinterpret_cast<const unsigned char*>(mappedData);
-
-    // Copying the RGB channels of each pixel
-    vtkIdType dstIdx = 0;
-    for (int y = callbackDataPtr->yMin; y <= callbackDataPtr->yMax; y++)
-    {
-      for (int x = callbackDataPtr->xMin; x <= callbackDataPtr->xMax; x++)
-      {
-        // Dividing by inNumberOfComponents * sizeof(SampleType) here because we want to multiply Y
-        // by the 'width' which is in number of pixels (ex: for RGBA=4, for RGB=3)
-        const int mappedIndex =
-          x + y * (bytesPerRow / (inNumberOfComponents * sizeof(unsigned char)));
-        // Copying the RGBA channels of each pixel
-        for (auto& comp : callbackDataPtr->componentMap)
-        {
-          outputValues[dstIdx++] = mappedDataChar[mappedIndex * inNumberOfComponents + comp];
-        }
-      }
-    }
-    delete callbackDataPtr;
-  };
-
-  this->ReadTextureFromGPU(this->ColorAttachment.Texture, this->ColorAttachment.Format, 0,
-    wgpu::TextureAspect::All, onTextureMapped, reinterpret_cast<void*>(callbackData));
-  this->WaitForCompletion();
-  return pixels;
+  const auto componentMapping = this->GetComponentMapping(this->ColorAttachment.Format, 4);
+  using TInput = unsigned char;
+  using TOutput = unsigned char;
+  auto converter = [](TInput val) -> TOutput { return val; };
+  return this->GetTextureDataInternal<TOutput, TInput>(this->ColorAttachment.Texture,
+    this->ColorAttachment.Format, x1, y1, x2, y2, componentMapping, converter);
 }
 
 //------------------------------------------------------------------------------
 int vtkWebGPURenderWindow::GetRGBACharPixelData(
   int x1, int y1, int x2, int y2, int front, vtkUnsignedCharArray* data, int right /*=0*/)
 {
-  int width = x2 - x1 + 1;
-  int height = y2 - y1 + 1;
+  int xMin = std::min(x1, x2);
+  int xMax = std::max(x1, x2);
+  int yMin = std::min(y1, y2);
+  int yMax = std::max(y1, y2);
+  int width = xMax - xMin + 1;
+  int height = yMax - yMin + 1;
   const int numberOfComponents = 4;
   data->SetNumberOfComponents(numberOfComponents);
   data->SetNumberOfTuples(width * height);
-  unsigned char* pixels = this->GetRGBACharPixelData(x1, y1, x2, y2, front, right);
+  unsigned char* pixels = this->GetRGBACharPixelData(xMin, yMin, xMax, yMax, front, right);
   // take ownership of pixels
   data->SetArray(pixels, width * height * numberOfComponents, 0);
   return data->GetNumberOfValues();
@@ -1738,6 +1680,7 @@ int vtkWebGPURenderWindow::SetRGBACharPixelData(
   (void)blend;
   (void)right;
   const int nComp = 4;
+  int yOffset = this->Size[1] - y2 - 1;
   int width = (x2 - x) + 1;
   int height = (y2 - y) + 1;
   int bytesPerRow = vtkWebGPUConfiguration::Align(width * nComp, 256);
@@ -1765,7 +1708,6 @@ int vtkWebGPURenderWindow::SetRGBACharPixelData(
     return 0;
   }
   unsigned long dstIdx = 0;
-  unsigned long srcIdx = 0;
   const unsigned long nPad = bytesPerRow - width * nComp;
   int componentMap[4] = {};
   if (this->ColorAttachment.Format == wgpu::TextureFormat::BGRA8Unorm)
@@ -1787,10 +1729,11 @@ int vtkWebGPURenderWindow::SetRGBACharPixelData(
     // TODO: Handle other formats.
     vtkErrorMacro(<< "Unsupported offscreen texture format!");
   }
-  for (int j = 0; j < height; ++j)
+  for (int j = height - 1; j > -1; --j)
   {
     for (int i = 0; i < width; ++i)
     {
+      int srcIdx = (i + j * width) * nComp;
       for (const auto& comp : componentMap)
       {
         mapped[dstIdx + comp] = data[srcIdx++];
@@ -1810,7 +1753,7 @@ int vtkWebGPURenderWindow::SetRGBACharPixelData(
   this->StagingPixelData.Extent.depthOrArrayLayers = 1;
 
   this->StagingPixelData.Origin.x = x;
-  this->StagingPixelData.Origin.y = y;
+  this->StagingPixelData.Origin.y = yOffset;
   this->StagingPixelData.Origin.z = 0;
 
   this->Start();
@@ -1829,10 +1772,14 @@ int vtkWebGPURenderWindow::SetRGBACharPixelData(int x, int y, int x2, int y2,
 //------------------------------------------------------------------------------
 float* vtkWebGPURenderWindow::GetZbufferData(int x1, int y1, int x2, int y2)
 {
-  int width = x2 - x1 + 1;
-  int height = y2 - y1 + 1;
+  int xMin = std::min(x1, x2);
+  int xMax = std::max(x1, x2);
+  int yMin = std::min(y1, y2);
+  int yMax = std::max(y1, y2);
+  int width = xMax - xMin + 1;
+  int height = yMax - yMin + 1;
   float* zValues = new float[width * height];
-  this->GetZbufferData(x1, y1, x2, y2, zValues);
+  this->GetZbufferData(xMin, yMin, xMax, yMax, zValues);
   return zValues;
 }
 
@@ -1916,7 +1863,7 @@ int vtkWebGPURenderWindow::GetZbufferData(int x1, int y1, int x2, int y2, float*
     float* outputValues = callbackDataPtr->outputValues;
     const float* mappedDataAsF32 = reinterpret_cast<const float*>(mappedData);
     vtkIdType dstIdx = 0;
-    for (int y = callbackDataPtr->yMin; y <= callbackDataPtr->yMax; y++)
+    for (int y = callbackDataPtr->yMax; y >= callbackDataPtr->yMin; y--)
     {
       for (int x = callbackDataPtr->xMin; x <= callbackDataPtr->xMax; x++)
       {
@@ -1925,11 +1872,15 @@ int vtkWebGPURenderWindow::GetZbufferData(int x1, int y1, int x2, int y2, float*
       }
     }
   };
+  int xMin = std::min(x1, x2);
+  int xMax = std::max(x1, x2);
+  int yMin = std::min(y1, y2);
+  int yMax = std::max(y1, y2);
   CallbackData callbackData;
-  callbackData.xMin = x1;
-  callbackData.xMax = x2;
-  callbackData.yMin = y1;
-  callbackData.yMax = y2;
+  callbackData.xMin = xMin;
+  callbackData.xMax = xMax;
+  callbackData.yMin = this->FlipY(yMax);
+  callbackData.yMax = this->FlipY(yMin);
   callbackData.outputValues = zValues;
   callbackData.width = textureWidth;
   this->DepthCopyPass->ReadBufferFromGPU(this->DepthCopyBufferIndex, onBufferMapped, &callbackData);
@@ -1940,11 +1891,15 @@ int vtkWebGPURenderWindow::GetZbufferData(int x1, int y1, int x2, int y2, float*
 //------------------------------------------------------------------------------
 int vtkWebGPURenderWindow::GetZbufferData(int x1, int y1, int x2, int y2, vtkFloatArray* buffer)
 {
-  int width = x2 - x1 + 1;
-  int height = y2 - y1 + 1;
+  int xMin = std::min(x1, x2);
+  int xMax = std::max(x1, x2);
+  int yMin = std::min(y1, y2);
+  int yMax = std::max(y1, y2);
+  int width = xMax - xMin + 1;
+  int height = yMax - yMin + 1;
   buffer->SetNumberOfComponents(1);
   buffer->SetNumberOfTuples(width * height);
-  return this->GetZbufferData(x1, y1, x2, y2, buffer->GetPointer(0));
+  return this->GetZbufferData(xMin, yMin, xMax, yMax, buffer->GetPointer(0));
 }
 
 //------------------------------------------------------------------------------
@@ -1957,6 +1912,41 @@ int vtkWebGPURenderWindow::SetZbufferData(int, int, int, int, float*)
 int vtkWebGPURenderWindow::SetZbufferData(int, int, int, int, vtkFloatArray*)
 {
   return 0;
+}
+
+//------------------------------------------------------------------------------
+vtkTypeUInt32* vtkWebGPURenderWindow::GetIdsData(int x1, int y1, int x2, int y2)
+{
+  int xMin = std::min(x1, x2);
+  int xMax = std::max(x1, x2);
+  int yMin = std::min(y1, y2);
+  int yMax = std::max(y1, y2);
+  const auto componentMapping = this->GetComponentMapping(this->IdsAttachment.Format, 4);
+  using TInput = uint32_t;
+  using TOutput = vtkTypeUInt32;
+  auto converter = [](TInput val) -> TOutput { return static_cast<TOutput>(val); };
+  return this->GetTextureDataInternal<TOutput, TInput>(this->IdsAttachment.Texture,
+    this->IdsAttachment.Format, xMin, yMin, xMax, yMax, componentMapping, converter);
+}
+
+//------------------------------------------------------------------------------
+void vtkWebGPURenderWindow::GetIdsData(int x1, int y1, int x2, int y2, vtkTypeUInt32Array* data)
+{
+  int xMin = std::min(x1, x2);
+  int xMax = std::max(x1, x2);
+  int yMin = std::min(y1, y2);
+  int yMax = std::max(y1, y2);
+  int width = xMax - xMin + 1;
+  int height = yMax - yMin + 1;
+  const int outNumberOfComponents = 4;
+  data->SetNumberOfComponents(outNumberOfComponents);
+  data->SetComponentName(0, "CellId");
+  data->SetComponentName(1, "PropId");
+  data->SetComponentName(2, "CompositeId");
+  data->SetComponentName(3, "ProcessId");
+  auto* ids = this->GetIdsData(xMin, yMin, xMax, yMax);
+  // take ownership of ids
+  data->SetArray(ids, width * height * outNumberOfComponents, /*save=*/0);
 }
 
 //------------------------------------------------------------------------------
@@ -2148,6 +2138,86 @@ vtkSmartPointer<vtkImageData> vtkWebGPURenderWindow::SaveAttachmentToVTI(
       break;
   }
   return image;
+}
+
+//-------------------------------------------------------------------------------------------------
+void vtkWebGPURenderWindow::CreateAWindow()
+{
+  if (!this->HardwareWindow)
+  {
+    this->SetHardwareWindow(vtk::TakeSmartPointer(vtkHardwareWindow::New()));
+    if (this->Interactor)
+    {
+      this->HardwareWindow->SetInteractor(this->Interactor);
+    }
+  }
+  this->SyncWithHardware();
+  this->HardwareWindow->Create();
+}
+
+//-------------------------------------------------------------------------------------------------
+void vtkWebGPURenderWindow::DestroyWindow()
+{
+  if (this->HardwareWindow)
+  {
+    this->HardwareWindow->Destroy();
+  }
+}
+
+//-------------------------------------------------------------------------------------------------
+bool vtkWebGPURenderWindow::EnsureDisplay()
+{
+  if (!this->HardwareWindow)
+  {
+    this->HardwareWindow = vtk::TakeSmartPointer(vtkHardwareWindow::New());
+  }
+  if (this->Interactor && this->Interactor->GetHardwareWindow() != this->HardwareWindow)
+  {
+    this->HardwareWindow->SetInteractor(this->Interactor);
+  }
+  return this->HardwareWindow->EnsureDisplay();
+}
+
+//-------------------------------------------------------------------------------------------------
+void vtkWebGPURenderWindow::SyncWithHardware()
+{
+  if (!this->HardwareWindow)
+  {
+    return;
+  }
+  this->HardwareWindow->SetWindowName(this->GetWindowName());
+  this->HardwareWindow->SetSize(this->GetSize());
+  this->HardwareWindow->SetCoverable(this->GetCoverable());
+}
+
+//-------------------------------------------------------------------------------------------------
+void* vtkWebGPURenderWindow::GetGenericDisplayId()
+{
+  if (this->HardwareWindow)
+  {
+    return this->HardwareWindow->GetGenericDisplayId();
+  }
+  return this->Superclass::GetGenericDisplayId();
+}
+
+//-------------------------------------------------------------------------------------------------
+std::string vtkWebGPURenderWindow::MakeDefaultWindowNameWithBackend()
+{
+  std::string result = "Visualization Toolkit - ";
+  if (this->HardwareWindow)
+  {
+    result += this->HardwareWindow->GetPlatform();
+  }
+  result += " ";
+  if (this->WGPUConfiguration)
+  {
+    result += this->WGPUConfiguration->GetBackendInUseAsString();
+  }
+  else
+  {
+    result += "undefined backend";
+  }
+  return result;
 }
 
 VTK_ABI_NAMESPACE_END

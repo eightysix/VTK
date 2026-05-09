@@ -109,6 +109,7 @@ int vtkAppendDataSets::RequestData(vtkInformation* vtkNotUsed(request),
   if (outputUG)
   {
     vtkNew<vtkAppendFilter> appender;
+    appender->SetUseImplicitArray(this->UseImplicitArray);
     appender->SetContainerAlgorithm(this);
     appender->SetOutputPointsPrecision(this->GetOutputPointsPrecision());
     appender->SetMergePoints(this->GetMergePoints());
@@ -129,6 +130,7 @@ int vtkAppendDataSets::RequestData(vtkInformation* vtkNotUsed(request),
   else if (outputPD)
   {
     vtkNew<vtkAppendPolyData> appender;
+    appender->SetUseImplicitArray(this->UseImplicitArray);
     appender->SetContainerAlgorithm(this);
     appender->SetOutputPointsPrecision(this->GetOutputPointsPrecision());
     for (int cc = 0; cc < inputVector[0]->GetNumberOfInformationObjects(); cc++)

@@ -13,9 +13,9 @@
 #include "vtkAbstractArray.h"
 #include "vtkCellArray.h"
 #include "vtkHDF5ScopedHandle.h"
-#include "vtkHDFUtilities.h"
 #include "vtkHDFWriter.h"
 #include "vtkType.h"
+#include "vtk_hdf5.h"
 
 #include <array>
 #include <string>
@@ -121,6 +121,13 @@ public:
   vtkHDF::ScopedH5AHandle CreateScalarAttribute(hid_t group, const char* name, int value);
 
   /**
+   * Create a string attribute in the given group.
+   * Noop if the attribute already exists.
+   */
+  vtkHDF::ScopedH5AHandle CreateStringAttribute(
+    hid_t group, const char* name, const std::string& value);
+
+  /**
    * Create an unlimited HDF dataspace with a dimension of `0 * numCols`.
    * This dataspace can be attached to a chunked dataset and extended afterwards.
    * Returned scoped handle may be invalid
@@ -128,20 +135,20 @@ public:
   vtkHDF::ScopedH5SHandle CreateUnlimitedSimpleDataspace(hsize_t numCols);
 
   /**
-   * Create a group in the given group from a dataspace.
-   * Returned scoped handle may be invalid.
+   * Retrieve group if it exists, create it if needed.
+   * Returned scoped handle may be invalid when group could not be created
    */
   vtkHDF::ScopedH5GHandle CreateHdfGroup(hid_t group, const char* name);
 
   /**
-   * Create a group that keeps track of link creation order
-   * Returned scoped handle may be invalid.
+   * Retrieve or create a group that keeps track of link creation order
+   * Returned scoped handle may be invalid when group could not be created
    */
   vtkHDF::ScopedH5GHandle CreateHdfGroupWithLinkOrder(hid_t group, const char* name);
 
   /**
    * Create a soft link to the real group containing the block dataset.
-   * Return true if the operation succeeded.
+   * Return true if the operation succeeded or if it already exists.
    */
   bool CreateSoftLink(hid_t group, const char* groupName, const char* targetLink);
 
@@ -226,10 +233,11 @@ public:
 
   ///@{
   /**
-   * Creates a dataset and write a value to it.
+   * Creates a dataset and write a row of values to it.
    * Returned scoped handle may be invalid
    */
-  vtkHDF::ScopedH5DHandle CreateSingleValueDataset(hid_t group, const char* name, vtkIdType value);
+  vtkHDF::ScopedH5DHandle CreateSingleRowDataset(
+    hid_t group, const char* name, const std::vector<vtkIdType>& values);
   ///@}
 
   /**
@@ -241,12 +249,13 @@ public:
     hsize_t chunkSize[], int compressionLevel = 0);
 
   /**
-   * Add a single value of integer type to an existing dataspace.
+   * Add a single row of integer type to an existing dataspace.
    * The trim parameter allows to overwrite the last data instead
    * of appending it to the dataset.
    * Return true if the write operation was successful.
    */
-  bool AddSingleValueToDataset(hid_t dataset, vtkIdType value, bool offset, bool trim = false);
+  bool AddSingleRowToDataset(
+    hid_t dataset, const std::vector<vtkIdType>& value, bool offset, bool trim = false);
 
   /**
    * Add a 2D value of integer type to an existing dataspace which represents the FieldDataSize.
@@ -272,14 +281,14 @@ public:
   bool AddOrCreateDataset(hid_t group, const char* name, hid_t type, vtkAbstractArray* dataArray);
 
   /**
-   * Append a single integer value to the dataset with name `name` in `group` group.
+   * Append a single row of integer values to the dataset with name `name` in `group` group.
    * Create the dataset and dataspace if it does not exist yet.
    * When offset is true, the value written to the dataset is offset by the previous value of the
    * dataspace.
    * Return true if the operation is successful.
    */
-  bool AddOrCreateSingleValueDataset(
-    hid_t group, const char* name, vtkIdType value, bool offset = false, bool trim = false);
+  bool AddOrCreateSingleRowDataset(hid_t group, const char* name,
+    const std::vector<vtkIdType>& value, bool offset = false, bool trim = false);
 
   /**
    * Append a 2D integer value to the dataset with name `FieldDataSize`.

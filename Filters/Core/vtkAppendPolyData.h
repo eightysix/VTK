@@ -24,7 +24,6 @@
 #ifndef vtkAppendPolyData_h
 #define vtkAppendPolyData_h
 
-#include "vtkDeprecation.h"       // For VTK_DEPRECATED_IN_9_5_0
 #include "vtkFiltersCoreModule.h" // For export macro
 #include "vtkPolyDataAlgorithm.h"
 #include "vtkWrappingHints.h" // For VTK_MARSHALAUTO
@@ -53,6 +52,18 @@ public:
   vtkSetMacro(UserManagedInputs, vtkTypeBool);
   vtkGetMacro(UserManagedInputs, vtkTypeBool);
   vtkBooleanMacro(UserManagedInputs, vtkTypeBool);
+  ///@}
+
+  ///@{
+  /**
+   * Set/Get if we want to use implicit array when appending the polydata. Using implicit array
+   * improve the execution time of the filter and reduce the memory consumption of the output.
+   * However, accessing arrays can be slower.
+   * Default to false
+   */
+  vtkGetMacro(UseImplicitArray, bool);
+  vtkSetMacro(UseImplicitArray, bool);
+  vtkBooleanMacro(UseImplicitArray, bool);
   ///@}
 
   /**
@@ -127,14 +138,6 @@ protected:
   int RequestUpdateExtent(vtkInformation*, vtkInformationVector**, vtkInformationVector*) override;
   int FillInputPortInformation(int, vtkInformation*) override;
 
-  // An efficient templated way to append data.
-  VTK_DEPRECATED_IN_9_5_0("This function has been deprecated")
-  void AppendData(vtkDataArray* dest, vtkDataArray* src, vtkIdType offset);
-
-  // An efficient way to append cells.
-  VTK_DEPRECATED_IN_9_5_0("This function has been deprecated")
-  void AppendCells(vtkCellArray* dst, vtkCellArray* src, vtkIdType offset);
-
 private:
   // hide the superclass' AddInput() from the user and the compiler
   void AddInputData(vtkDataObject*)
@@ -143,6 +146,8 @@ private:
   }
 
   vtkTypeBool UserManagedInputs;
+
+  bool UseImplicitArray = false;
 
   vtkAppendPolyData(const vtkAppendPolyData&) = delete;
   void operator=(const vtkAppendPolyData&) = delete;

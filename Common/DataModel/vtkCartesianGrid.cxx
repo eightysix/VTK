@@ -102,6 +102,11 @@ vtkPoints* vtkCartesianGrid::GetPoints()
 {
   if (this->StructuredPoints == nullptr)
   {
+    auto pts = vtkSmartPointer<vtkPoints>::New();
+    auto spa = vtkSmartPointer<vtkStructuredPointArray<double>>::New();
+    spa->SetNumberOfComponents(3);
+    pts->SetData(spa);
+    this->SetStructuredPoints(pts);
     this->BuildPoints();
   }
   return this->StructuredPoints.Get();
@@ -242,7 +247,8 @@ void vtkCartesianGrid::GetCellNeighbors(
     vtkIdType* pCellIds = cellIds->GetPointer(0);
     vtkIdType* end =
       std::remove_if(pCellIds, pCellIds + cellIds->GetNumberOfIds(), CellVisibility(this));
-    cellIds->Resize(std::distance(pCellIds, end));
+    cellIds->SetNumberOfIds(std::distance(pCellIds, end));
+    cellIds->Squeeze();
   }
 }
 

@@ -17,6 +17,7 @@
 #include "vtkObject.h"
 #include "vtkOpenGLHelper.h"      // ivar
 #include "vtkRenderingVRModule.h" // For export macro
+#include "vtkWrappingHints.h"     // For VTK_MARSHALAUTO
 
 VTK_ABI_NAMESPACE_BEGIN
 class vtkMatrix4x4;
@@ -25,7 +26,7 @@ class vtkOpenGLVertexBufferObject;
 class vtkTextureObject;
 class vtkVRRay;
 
-class VTKRENDERINGVR_EXPORT vtkVRModel : public vtkObject
+class VTKRENDERINGVR_EXPORT VTK_MARSHALAUTO vtkVRModel : public vtkObject
 {
 public:
   vtkTypeMacro(vtkVRModel, vtkObject);

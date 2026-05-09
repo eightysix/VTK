@@ -7,7 +7,6 @@
 #include "vtkCamera.h"
 #include "vtkCellArray.h"
 #include "vtkCellData.h"
-#include "vtkCollectionIterator.h"
 #include "vtkConstantArray.h"
 #include "vtkFloatArray.h"
 #include "vtkGLSLModCamera.h"
@@ -35,6 +34,7 @@
 #include "vtkOpenGLState.h"
 #include "vtkOpenGLUniforms.h"
 #include "vtkOpenGLVertexBufferObject.h"
+#include "vtkOverrideAttribute.h"
 #include "vtkPlaneCollection.h"
 #include "vtkPointData.h"
 #include "vtkPolyDataFS.h"
@@ -244,6 +244,16 @@ vtkOpenGLLowMemoryPolyDataMapper::~vtkOpenGLLowMemoryPolyDataMapper()
   {
     this->InternalColorTexture->Delete();
   }
+}
+
+//------------------------------------------------------------------------------
+vtkOverrideAttribute* vtkOpenGLLowMemoryPolyDataMapper::CreateOverrideAttributes()
+{
+  auto* platformAttribute =
+    vtkOverrideAttribute::CreateAttributeChain("Platform", "Embedded", nullptr);
+  auto* renderingBackendAttribute =
+    vtkOverrideAttribute::CreateAttributeChain("RenderingBackend", "OpenGL", platformAttribute);
+  return renderingBackendAttribute;
 }
 
 //------------------------------------------------------------------------------
@@ -566,6 +576,27 @@ vtkPolyDataMapper::MapperHashType vtkOpenGLLowMemoryPolyDataMapper::GenerateHash
 }
 
 //------------------------------------------------------------------------------
+vtkIdType vtkOpenGLLowMemoryPolyDataMapper::GetMaximumNumberOfTriangles(
+  [[maybe_unused]] vtkRenderer* ren)
+{
+#ifndef GL_ES_VERSION_3_0
+  vtkOpenGLRenderer* renderer = vtkOpenGLRenderer::SafeDownCast(ren);
+  if (renderer)
+  {
+    int maxSize = -1;
+    vtkOpenGLState* state = renderer->GetState();
+    if (state)
+    {
+      state->vtkglGetIntegerv(GL_MAX_TEXTURE_BUFFER_SIZE, &maxSize);
+      return static_cast<vtkIdType>(maxSize);
+    }
+  }
+#endif
+
+  return std::numeric_limits<vtkIdType>::max();
+}
+
+//------------------------------------------------------------------------------
 bool vtkOpenGLLowMemoryPolyDataMapper::BindArraysToTextureBuffers(
   vtkRenderer*, vtkActor*, vtkCellGraphicsPrimitiveMap::CellTypeMapperOffsets& offsets)
 {
@@ -841,11 +872,10 @@ bool vtkOpenGLLowMemoryPolyDataMapper::IsShaderUpToDate(vtkRenderer* renderer, v
     return false;
   }
   // Have the mods changed?
-  auto modsIter = vtk::TakeSmartPointer(this->GetGLSLModCollection()->NewIterator());
   auto oglRen = static_cast<vtkOpenGLRenderer*>(renderer);
-  for (modsIter->InitTraversal(); !modsIter->IsDoneWithTraversal(); modsIter->GoToNextItem())
+  for (vtkObject* obj : *(this->GetGLSLModCollection()))
   {
-    auto mod = static_cast<vtkGLSLModifierBase*>(modsIter->GetCurrentObject());
+    auto mod = static_cast<vtkGLSLModifierBase*>(obj);
     if (!mod->IsUpToDate(oglRen, this, actor))
     {
       vtkDebugMacro(<< mod->GetClassName() << " is outdated");
@@ -3075,10 +3105,9 @@ void vtkOpenGLLowMemoryPolyDataMapper::UpdatePBRStateCache(vtkRenderer*, vtkActo
 //------------------------------------------------------------------------------
 void vtkOpenGLLowMemoryPolyDataMapper::UpdateGLSLMods(vtkRenderer*, vtkActor*)
 {
-  auto modsIter = vtk::TakeSmartPointer(this->GLSLMods->NewIterator());
-  for (modsIter->InitTraversal(); !modsIter->IsDoneWithTraversal(); modsIter->GoToNextItem())
+  for (vtkObject* obj : *(this->GLSLMods))
   {
-    if (auto cameraMod = vtkGLSLModCamera::SafeDownCast(modsIter->GetCurrentObject()))
+    if (auto cameraMod = vtkGLSLModCamera::SafeDownCast(obj))
     {
       // camera mod needs additional information before they can set shader parameters.
       if (this->CoordinateShiftAndScaleInUse)

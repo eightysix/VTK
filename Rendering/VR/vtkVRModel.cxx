@@ -82,7 +82,6 @@ bool vtkVRModel::Build(vtkOpenGLRenderWindow* win)
     "//VTK::Output::Dec\n"
     "uniform sampler2D diffuse;\n"
     "in vec2 v2TexCoord;\n"
-    "out vec4 outputColor;\n"
     "void main()\n"
     "{\n"
     "  gl_FragData[0] = texture(diffuse, v2TexCoord);\n"

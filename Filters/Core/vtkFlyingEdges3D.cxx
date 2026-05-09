@@ -14,7 +14,7 @@
 #include "vtkInformation.h"
 #include "vtkInformationIntegerVectorKey.h"
 #include "vtkInformationVector.h"
-#include "vtkMarchingCubesTriangleCases.h"
+#include "vtkMarchingCellsContourCases.h"
 #include "vtkMath.h"
 #include "vtkObjectFactory.h"
 #include "vtkPointData.h"
@@ -510,10 +510,7 @@ vtkFlyingEdges3DAlgorithm<TArray>::vtkFlyingEdges3DAlgorithm()
   , NewNormals(nullptr)
 {
   int i, j, k, l, ii, eCase, index, numTris;
-  static const int vertMap[8] = { 0, 1, 3, 2, 4, 5, 7, 6 };
   static const int CASE_MASK[8] = { 1, 2, 4, 8, 16, 32, 64, 128 };
-  int* edge;
-  vtkMarchingCubesTriangleCases* triCase;
   unsigned char* edgeCase;
 
   // Initialize cases, increments, and edge intersection flags
@@ -548,15 +545,15 @@ vtkFlyingEdges3DAlgorithm<TArray>::vtkFlyingEdges3DAlgorithm()
           eCase = i | (j << 2) | (k << 4) | (l << 6);
           for (ii = 0, index = 0; ii < 8; ++ii)
           {
-            if (eCase & (1 << vertMap[ii])) // map into ancient MC table
+            if (eCase & (1 << ii)) // map into ancient MC table
             {
               index |= CASE_MASK[ii];
             }
           }
           // Now build case table
-          triCase = vtkMarchingCubesTriangleCases::GetCases() + index;
-          edge = triCase->edges;
-          for (numTris = 0, edge = triCase->edges; edge[0] > -1; edge += 3)
+          const int* edges = vtkMarchingCellsContourCases::GetVoxelCase(index);
+          numTris = 0;
+          for (const int* edge = edges; edge[0] > -1; edge += 3)
           { // count the number of triangles
             numTris++;
           }
@@ -564,7 +561,7 @@ vtkFlyingEdges3DAlgorithm<TArray>::vtkFlyingEdges3DAlgorithm()
           {
             edgeCase = this->EdgeCases[eCase];
             *edgeCase++ = numTris;
-            for (edge = triCase->edges; edge[0] > -1; edge += 3, edgeCase += 3)
+            for (const int* edge = edges; edge[0] > -1; edge += 3, edgeCase += 3)
             {
               // Build new case table.
               edgeCase[0] = this->EdgeMap[edge[0]];
@@ -1434,7 +1431,7 @@ void vtkFlyingEdges3DAlgorithm<TArray>::Contour(vtkFlyingEdges3D* self, vtkImage
     vtkIdType totalPts = numOutXPts + numOutYPts + numOutZPts;
     if (totalPts > 0)
     {
-      newPts->GetData()->WriteVoidPointer(0, 3 * totalPts);
+      newPts->GetData()->SetNumberOfTuples(totalPts);
       algo.NewPoints =
         vtkAOSDataArrayTemplate<float>::FastDownCast(newPts->GetData())->GetPointer(0);
       newTris->ResizeExact(numOutTris, 3 * numOutTris);
@@ -1443,19 +1440,19 @@ void vtkFlyingEdges3DAlgorithm<TArray>::Contour(vtkFlyingEdges3D* self, vtkImage
       {
         vtkIdType numPrevPts = newScalars->GetNumberOfTuples();
         vtkIdType numNewPts = totalPts - numPrevPts;
-        newScalars->WriteVoidPointer(0, totalPts);
+        newScalars->SetNumberOfValues(totalPts);
         algo.NewScalars = vtk::DataArrayValueRange<1>(TArray::FastDownCast(newScalars)).begin();
         T TValue = static_cast<T>(value);
         std::fill_n(algo.NewScalars + numPrevPts, numNewPts, TValue);
       }
       if (newGradients)
       {
-        newGradients->WriteVoidPointer(0, 3 * totalPts);
+        newGradients->SetNumberOfTuples(totalPts);
         algo.NewGradients = newGradients->GetPointer(0);
       }
       if (newNormals)
       {
-        newNormals->WriteVoidPointer(0, 3 * totalPts);
+        newNormals->SetNumberOfTuples(totalPts);
         algo.NewNormals = newNormals->GetPointer(0);
       }
       if (algo.InterpolateAttributes)

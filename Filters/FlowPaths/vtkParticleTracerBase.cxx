@@ -678,7 +678,7 @@ struct ParticleTracerFunctor
     if (this->PT->ComputeVorticity)
     {
       cellVectors->SetNumberOfComponents(3);
-      cellVectors->Allocate(3 * VTK_CELL_SIZE);
+      cellVectors->ReserveTuples(VTK_CELL_SIZE);
     }
   }
 
@@ -718,14 +718,7 @@ VTK_ABI_NAMESPACE_END
 VTK_ABI_NAMESPACE_BEGIN
 void vtkParticleTracerBase::ResizeArrays(vtkIdType numTuples)
 {
-  // resize first so that if you already have data, you don't lose them
-  this->OutputCoordinates->Resize(numTuples);
-  this->ParticleCellsConnectivity->Resize(numTuples);
-  for (int i = 0; i < this->OutputPointData->GetNumberOfArrays(); ++i)
-  {
-    this->OutputPointData->GetArray(i)->Resize(numTuples);
-  }
-  // set number number of tuples because resize does not do that
+  // set number number of tuples and keep the existing data
   this->OutputCoordinates->SetNumberOfPoints(numTuples);
   this->ParticleCellsConnectivity->SetNumberOfValues(numTuples);
   this->OutputPointData->SetNumberOfTuples(numTuples);
@@ -769,7 +762,7 @@ int vtkParticleTracerBase::Initialize(
 
     this->CellVectors->SetName("CellVectors");
     this->CellVectors->SetNumberOfComponents(3);
-    this->CellVectors->Allocate(3 * VTK_CELL_SIZE);
+    this->CellVectors->ReserveTuples(VTK_CELL_SIZE);
     this->ParticleVorticity->SetName("Vorticity");
     this->ParticleRotation->SetName("Rotation");
     this->ParticleAngularVel->SetName("AngularVelocity");

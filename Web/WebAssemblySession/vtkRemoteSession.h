@@ -33,8 +33,6 @@
 #include "vtkType.h"                     // for vtkTypeUInt32
 #include "vtkWebAssemblySessionModule.h" // for no export macro
 
-#include "vtkDeprecation.h" // for VTK_DEPRECATED_IN_9_5_0
-
 #include <emscripten/val.h> // for emscripten::val
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -68,20 +66,17 @@ public:
   bool UnRegisterState(vtkTypeUInt32 object);
 
   /**
-   * @brief Retrieves the state associated with a VTK object handle.
-   * @param object The handle of the VTK object.
-   * @return A JavaScript object representing the state.
-   */
-  VTK_DEPRECATED_IN_9_5_0("Use vtkRemoteSession::Get(vtkTypeUInt32 object) instead.")
-  emscripten::val GetState(vtkTypeUInt32 object);
-
-  /**
    * Set properties of a VTKObject
+   * @param object The handle of the VTK object.
+   * @param properties A JavaScript object representing the properties to set.
+   * @return True if the properties were successfully set, false otherwise.
    */
-  void Set(vtkTypeUInt32 object, emscripten::val properties);
+  bool Set(vtkTypeUInt32 object, emscripten::val properties);
 
   /**
    * Get all properties of a VTKObject
+   * @param object The handle of the VTK object.
+   * @return A JavaScript object representing the properties.
    */
   emscripten::val Get(vtkTypeUInt32 object);
 
@@ -140,8 +135,9 @@ public:
   /**
    * @brief Updates a VTK object from a given state.
    * @param state A JavaScript object representing the state.
+   * @return True if the object was successfully updated, false otherwise.
    */
-  void UpdateObjectFromState(emscripten::val state);
+  bool UpdateObjectFromState(emscripten::val state);
 
   /**
    * @brief Updates the state from a given VTK object.
@@ -171,6 +167,20 @@ public:
    * @return True if the camera was successfully reset, false otherwise.
    */
   bool ResetCamera(vtkTypeUInt32 object);
+
+  /**
+   * @brief Start WebXR Session
+   * @param mode 0: inline, 1: VR or 2: AR
+   * @param requiredFeatures Required session features (bitmask of WEBXR_SESSION_FEATURE_*)
+   * @param optionalFeatures Optional session features (bitmask of WEBXR_SESSION_FEATURE_*)
+   */
+  bool StartWebXR(
+    vtkTypeUInt8 mode, vtkTypeUInt32 requiredFeatures, vtkTypeUInt32 optionalFeatures);
+
+  /**
+   * @brief Stop the current WebXR Session
+   */
+  bool StopWebXR();
 
   /**
    * @brief Starts an event loop for a VTK object.
@@ -211,6 +221,18 @@ public:
    * @return True if the observer was successfully removed, false otherwise.
    */
   bool UnObserve(vtkTypeUInt32 object, unsigned long tag);
+
+  /**
+   * @brief Remove all observers from a specific object.
+   * @param object The handle of the VTK object.
+   * @return True if all observers were successfully removed, false otherwise.
+   */
+  bool UnObserveAll(vtkTypeUInt32 object);
+
+  /**
+   * @brief Remove all observers from all objects in the session.
+   */
+  void UnObserveAllObjects();
 
   /**
    * @brief Exports states into `fileName.states.json` and blobs into

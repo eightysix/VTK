@@ -47,7 +47,7 @@ The `vtkWrapSerDes` executable makes use of the `WrappingTools` package to autom
     ```
 
     ```c++
-    static void Deserialize_vtkClassName(const nlohmann::json&, vtkObjectBase*, vtkDeserializer*)
+    static bool Deserialize_vtkClassName(const nlohmann::json&, vtkObjectBase*, vtkDeserializer*)
     ```
 
 3. A invoker function with signature:
@@ -144,3 +144,9 @@ your custom `RegisterHandlers_vtkClassNameSerDesHelper`.
 - When the `-u, --update` argument is used, headers are in-place edited to use the `VTK_MARSHAL(AUTO|MANUAL)` wrapping hint. Files that already have this hint are untouched.
 
 - When the `-t, --test` argument is used, the source tree is checked for inconsistent use of marshal macros.
+
+## Testing serialization code
+
+Serialization testing can be run on top of regular VTK C++ regression tests by performing an image comparison test after serializing and deserializing the test's render window.
+When VTK is configured with `VTK_WRAP_SERIALIZAITON=ON`, serialization tests will be generated with the suffix `SerDes`. Specific tests can be excluded from serialization testing
+by adding the `NO_SERDES` argument to the test in `Some/Module/Testing/Cxx/CMakeLists.txt`.

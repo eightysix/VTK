@@ -2,6 +2,7 @@ include(vtkOpenGLOptions)
 if (vtk_can_do_onscreen AND NOT VTK_DEFAULT_RENDER_WINDOW_OFFSCREEN)
   vtk_add_test_python(
     TestFlyTo.py
+    TestStyleManipulator.py,NO_RT
     TestStyleRubberBandZoom.py
     TestStyleRubberBandZoomPerspective.py,NO_RT
     TestInteractorStyleTerrain.py

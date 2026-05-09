@@ -692,8 +692,9 @@ void vtkHyperTreeGridRedistribute::ExchangeHyperTreeMetaData(vtkBitArray* descri
 
     // Make sure that we're starting the partition on a full byte
     int byteAlignedSize = ::GetNumberOfBytes(descriptorSizeCum) * 8;
-    descriptorSendBuffer->Resize(
+    descriptorSendBuffer->SetNumberOfTuples(
       descriptorSendBuffer->GetNumberOfTuples() + (byteAlignedSize - descriptorSizeCum));
+    descriptorSendBuffer->Squeeze();
 
     this->NbDescriptorsBytesPerPart[part] = byteAlignedSize / 8;
     if (part > 0)
@@ -962,8 +963,10 @@ void vtkHyperTreeGridRedistribute::ExchangeCellArray(int arrayId,
   }
   int numComp = outputArray->GetNumberOfComponents();
 
-  vtkSmartPointer<vtkAbstractArray> cellDataSendArrayBuffer =
-    vtk::TakeSmartPointer(outputArray->NewInstance());
+  auto cellDataSendArrayBuffer =
+    vtk::TakeSmartPointer(vtkDataArray::CreateDataArray(outputArray->GetDataType()));
+  assert(
+    cellDataSendArrayBuffer->HasStandardMemoryLayout() && "Array must have standard memory layout");
   cellDataSendArrayBuffer->SetNumberOfComponents(numComp);
   int totalNbCellsSent =
     std::accumulate(nbCellDataSentPerPart.begin(), nbCellDataSentPerPart.end(), 0);
@@ -988,8 +991,10 @@ void vtkHyperTreeGridRedistribute::ExchangeCellArray(int arrayId,
     std::accumulate(nbCellDataReceivedPerPart.begin(), nbCellDataReceivedPerPart.end(), 0);
 
   // Prepare input send/recv structures
-  vtkSmartPointer<vtkAbstractArray> cellDataReceivedBuffer =
-    vtk::TakeSmartPointer(outputArray->NewInstance());
+  auto cellDataReceivedBuffer =
+    vtk::TakeSmartPointer(vtkDataArray::CreateDataArray(outputArray->GetDataType()));
+  assert(
+    cellDataReceivedBuffer->HasStandardMemoryLayout() && "Array must have standard memory layout");
   cellDataReceivedBuffer->SetNumberOfComponents(numComp);
   cellDataReceivedBuffer->SetNumberOfTuples(totalNbCellsReceived);
 
@@ -1007,8 +1012,10 @@ void vtkHyperTreeGridRedistribute::ExchangeCellArray(int arrayId,
     cellDataReceivedOffsets.begin(), [numComp](int elem) { return elem * numComp; });
 
   // Exchange cell data information
-  this->MPIComm->AllToAllVVoidArray(cellDataSendArrayBuffer->GetVoidPointer(0),
-    cellDataSentSizes.data(), cellDataSentOffsets.data(), cellDataReceivedBuffer->GetVoidPointer(0),
+  this->MPIComm->AllToAllVVoidArray(
+    cellDataSendArrayBuffer->GetVoidPointer(0), // NOLINT(bugprone-unsafe-functions)
+    cellDataSentSizes.data(), cellDataSentOffsets.data(),
+    cellDataReceivedBuffer->GetVoidPointer(0), // NOLINT(bugprone-unsafe-functions)
     cellDataReceivedSizes.data(), cellDataReceivedOffsets.data(), outputArray->GetDataType());
 
   // Iterate over trees received

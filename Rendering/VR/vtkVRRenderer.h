@@ -18,11 +18,12 @@
 #include "vtkNew.h" // for ivar
 #include "vtkOpenGLRenderer.h"
 #include "vtkRenderingVRModule.h" // For export macro
+#include "vtkWrappingHints.h"     // For VTK_MARSHALAUTO
 
 VTK_ABI_NAMESPACE_BEGIN
 class vtkActor;
 
-class VTKRENDERINGVR_EXPORT vtkVRRenderer : public vtkOpenGLRenderer
+class VTKRENDERINGVR_EXPORT VTK_MARSHALAUTO vtkVRRenderer : public vtkOpenGLRenderer
 {
 public:
   vtkTypeMacro(vtkVRRenderer, vtkOpenGLRenderer);
@@ -71,7 +72,9 @@ public:
    * Set/get whether to show a white floor corresponding to the physical floor.
    * Default is false.
    */
+  VTK_MARSHALEXCLUDE(VTK_MARSHAL_EXCLUDE_REASON_NOT_SUPPORTED)
   virtual void SetShowFloor(bool value);
+  VTK_MARSHALEXCLUDE(VTK_MARSHAL_EXCLUDE_REASON_NOT_SUPPORTED)
   vtkGetMacro(ShowFloor, bool);
   ///@}
 

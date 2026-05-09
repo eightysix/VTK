@@ -421,6 +421,16 @@ public:
    */
   void DelegateTDxEvent(unsigned long event, void* calldata);
 
+  /**
+   * Dolly the renderer's camera to a specific point
+   */
+  static void DollyToPosition(double fact, int* position, vtkRenderer* renderer);
+
+  /**
+   * Translate the renderer's camera
+   */
+  static void TranslateCamera(vtkRenderer* renderer, int toX, int toY, int fromX, int fromY);
+
 protected:
   vtkInteractorStyle();
   ~vtkInteractorStyle() override;

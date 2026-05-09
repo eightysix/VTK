@@ -268,18 +268,18 @@ int Test_fft_direct()
   }
   else
   {
-    auto resRange = vtk::DataArrayTupleRange(resultVtkOnes);
+    auto resRange = vtk::DataArrayTupleRange<2>(resultVtkOnes);
     auto iter = resRange.cbegin();
-    if (!vtkMathUtilities::FuzzyCompare((*iter)[0], 16.0) ||
-      !vtkMathUtilities::FuzzyCompare((*iter)[1], 0.0))
+    if (!vtkMathUtilities::FuzzyCompare(static_cast<double>((*iter)[0]), 16.0) ||
+      !vtkMathUtilities::FuzzyCompare(static_cast<double>((*iter)[1]), 0.0))
     {
       std::cerr << ".vtkFFT::RFft(vtkOnes) wrong first value." << std::endl;
       status++;
     }
     for (iter++; iter != resRange.cend(); ++iter)
     {
-      if (!vtkMathUtilities::FuzzyCompare((*iter)[0], 0.0) ||
-        !vtkMathUtilities::FuzzyCompare((*iter)[1], 0.0))
+      if (!vtkMathUtilities::FuzzyCompare(static_cast<double>((*iter)[0]), 0.0) ||
+        !vtkMathUtilities::FuzzyCompare(static_cast<double>((*iter)[1]), 0.0))
       {
         std::cerr << ".vtkFFT::RFft(vtkOnes) wrong values." << std::endl;
         status++;

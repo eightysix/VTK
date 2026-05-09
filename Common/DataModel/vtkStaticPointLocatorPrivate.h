@@ -494,7 +494,7 @@ struct BucketList : public vtkBucketList
     void Initialize()
     {
       vtkIdList*& pIds = this->PIds.Local();
-      pIds->Allocate(128); // allocate some memory
+      pIds->Reserve(128); // allocate some memory
     }
 
     void Reduce() {}
@@ -764,6 +764,12 @@ struct BucketList : public vtkBucketList
           points, worker, this))
     {
       worker(points, this);
+    }
+
+    // Provide accelerated access to points. Needed for Voronoi bin iterators.
+    if (vtkDoubleArray::SafeDownCast(points))
+    {
+      this->FastPoints = static_cast<double*>(vtkDoubleArray::SafeDownCast(points)->GetPointer(0));
     }
 
     // Now group the points into contiguous runs within buckets (recall that

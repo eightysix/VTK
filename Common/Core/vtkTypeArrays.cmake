@@ -7,15 +7,11 @@ include(vtkTypeLists)
 
 # Configure `.in` class files depending on the requested backend
 # and the concrete c++ type.
-macro(_generate_array_specialization array_prefix vtk_type concrete_type deprecated)
+macro(_generate_array_specialization array_prefix vtk_type concrete_type deprecation)
   # used inside .in files
   set(VTK_TYPE_NAME "${vtk_type}")
   set(CONCRETE_TYPE "${concrete_type}")
-  if ("${deprecated}")
-    set(VTK_DEPRECATION "VTK_DEPRECATED_IN_9_6_0(\"Use vtk${array_prefix}Type*Array instead\")")
-  else ()
-    set(VTK_DEPRECATION "")
-  endif ()
+  set(VTK_DEPRECATION "${deprecation}")
 
   set(_className "vtk${array_prefix}${VTK_TYPE_NAME}Array")
 
@@ -25,8 +21,8 @@ macro(_generate_array_specialization array_prefix vtk_type concrete_type depreca
     @ONLY)
 
   configure_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/vtk${array_prefix}TypedArray.cxx.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/${_className}.cxx"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vtk${array_prefix}TypedArray.cxx.inc.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/${_className}.cxx.inc"
     @ONLY)
 
   # append generated header to current module headers
@@ -42,7 +38,7 @@ macro(_generate_array_specialization array_prefix vtk_type concrete_type depreca
     string(REPLACE " " "_" _suffix "${concrete_type}")
   endif ()
   list(APPEND "bulk_instantiation_sources_${_suffix}"
-    "#include \"${_className}.cxx\"")
+    "#include \"${_className}.cxx.inc\"")
 
   unset(VTK_DEPRECATION)
   unset(VTK_TYPE_NAME)
@@ -54,14 +50,24 @@ endmacro()
 foreach (array_prefix IN ITEMS Affine Composite Constant Indexed)
   foreach (type IN LISTS vtk_numeric_types)
     vtk_type_to_camel_case("${type}" cased_type)
-    _generate_array_specialization("${array_prefix}" "${cased_type}" "${type}" 1)
+    set(deprecation "VTK_DEPRECATED_IN_9_6_0(\"Use vtk${array_prefix}Type${cased_type}Array instead\")")
+    _generate_array_specialization("${array_prefix}" "${cased_type}" "${type}" "${deprecation}")
   endforeach ()
 endforeach ()
 
-foreach (array_prefix IN ITEMS Affine Composite Constant Indexed ScaledSOA SOA StdFunction Strided)
+# VTK_DEPRECATED_IN_9_7_0 to be removed later
+foreach (array_prefix IN ITEMS ScaledSOA StdFunction)
   foreach (type IN LISTS vtk_fixed_size_numeric_types)
     vtk_fixed_size_type_to_without_prefix("${type}" "vtk" without_vtk_prefix)
-    _generate_array_specialization("${array_prefix}" "${without_vtk_prefix}" "${type}" 0)
+    set(deprecation "VTK_DEPRECATED_IN_9_7_0(\"Use vtk${array_prefix}Type${without_vtk_prefix}Array instead\")")
+    _generate_array_specialization("${array_prefix}" "${without_vtk_prefix}" "${type}" "${deprecation}")
+  endforeach ()
+endforeach ()
+
+foreach (array_prefix IN ITEMS Affine Composite Constant Indexed SOA Strided StructuredPoint)
+  foreach (type IN LISTS vtk_fixed_size_numeric_types)
+    vtk_fixed_size_type_to_without_prefix("${type}" "vtk" without_vtk_prefix)
+    _generate_array_specialization("${array_prefix}" "${without_vtk_prefix}" "${type}" "")
   endforeach ()
 endforeach ()
 
@@ -113,8 +119,8 @@ foreach (type IN LISTS vtk_fixed_size_numeric_types)
       "${CMAKE_CURRENT_BINARY_DIR}/${type}Array.h"
       @ONLY)
     configure_file(
-      "${CMAKE_CURRENT_SOURCE_DIR}/vtkAOSTypedArray.cxx.in"
-      "${CMAKE_CURRENT_BINARY_DIR}/${type}Array.cxx"
+      "${CMAKE_CURRENT_SOURCE_DIR}/vtkAOSTypedArray.cxx.inc.in"
+      "${CMAKE_CURRENT_BINARY_DIR}/${type}Array.cxx.inc"
       @ONLY)
     # append generated header to current module headers
     list(APPEND headers
@@ -123,6 +129,6 @@ foreach (type IN LISTS vtk_fixed_size_numeric_types)
     vtk_get_fixed_size_type_mapping("${type}" numeric_type)
     string(REPLACE " " "_" _suffix "${numeric_type}")
     list(APPEND "bulk_instantiation_sources_${_suffix}"
-      "#include \"${type}Array.cxx\"")
+      "#include \"${type}Array.cxx.inc\"")
   endif ()
 endforeach ()

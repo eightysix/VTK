@@ -70,7 +70,7 @@ typedef struct
   unsigned char alpha;
 } plyFace;
 
-void vtkPLYWriter::WriteData()
+bool vtkPLYWriter::WriteDataAndReturn()
 {
   vtkIdType i, j, idx;
   vtkPoints* inPts;
@@ -80,6 +80,19 @@ void vtkPLYWriter::WriteData()
   vtkSmartPointer<vtkUnsignedCharArray> cellColors, pointColors;
   PlyFile* ply;
   static const char* elemNames[] = { "vertex", "face" };
+  const char* firstTextureCoordsName = "u";
+  const char* secondTextureCoordsName = "v";
+  if (TextureCoordinatesName == VTK_TEXTURECOORDS_TEXTUREUV)
+  {
+    firstTextureCoordsName = "texture_u";
+    secondTextureCoordsName = "texture_v";
+  }
+  else if (TextureCoordinatesName == VTK_TEXTURECOORDS_ST)
+  {
+    firstTextureCoordsName = "s";
+    secondTextureCoordsName = "t";
+  }
+
   PlyProperty vertProps[] = {
     // property information for a vertex
     { "x", PLY_FLOAT, PLY_FLOAT, static_cast<int>(offsetof(plyVertex, x)), 0, 0, 0, 0 },
@@ -96,9 +109,9 @@ void vtkPLYWriter::WriteData()
     { "green", PLY_UCHAR, PLY_UCHAR, static_cast<int>(offsetof(plyVertex, green)), 0, 0, 0, 0 },
     { "blue", PLY_UCHAR, PLY_UCHAR, static_cast<int>(offsetof(plyVertex, blue)), 0, 0, 0, 0 },
     { "alpha", PLY_UCHAR, PLY_UCHAR, static_cast<int>(offsetof(plyVertex, alpha)), 0, 0, 0, 0 },
-    { (TextureCoordinatesName == 1) ? "texture_u" : "u", PLY_FLOAT, PLY_FLOAT,
-      static_cast<int>(offsetof(plyVertex, tex)), 0, 0, 0, 0 },
-    { (TextureCoordinatesName == 1) ? "texture_v" : "v", PLY_FLOAT, PLY_FLOAT,
+    { firstTextureCoordsName, PLY_FLOAT, PLY_FLOAT, static_cast<int>(offsetof(plyVertex, tex)), 0,
+      0, 0, 0 },
+    { secondTextureCoordsName, PLY_FLOAT, PLY_FLOAT,
       static_cast<int>(offsetof(plyVertex, tex) + sizeof(float)), 0, 0, 0, 0 },
   };
   static PlyProperty faceProps[] = {
@@ -117,7 +130,7 @@ void vtkPLYWriter::WriteData()
   if (inPts == nullptr || polys == nullptr)
   {
     vtkErrorMacro(<< "No data to write!");
-    return;
+    return false;
   }
 
   // Open the file in appropriate way
@@ -142,7 +155,7 @@ void vtkPLYWriter::WriteData()
   {
     vtkErrorMacro(<< "Error opening PLY file");
     this->SetErrorCode(vtkErrorCode::CannotOpenFileError);
-    return;
+    return false;
   }
 
   // compute colors, if any
@@ -262,7 +275,7 @@ void vtkPLYWriter::WriteData()
     polys->GetNextCell(npts, pts);
     if (npts > 256)
     {
-      vtkErrorMacro(<< "Ply file only supports polygons with <256 points");
+      vtkWarningMacro(<< "Ply file only supports polygons with <256 points");
     }
     else
     {
@@ -288,6 +301,7 @@ void vtkPLYWriter::WriteData()
 
   // close the PLY file
   vtkPLY::ply_close(ply);
+  return true;
 }
 
 vtkSmartPointer<vtkUnsignedCharArray> vtkPLYWriter::GetColors(

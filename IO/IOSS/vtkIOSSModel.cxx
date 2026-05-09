@@ -936,7 +936,6 @@ protected:
     const size_t totalSize = std::accumulate(lIds.begin(), lIds.end(), static_cast<size_t>(0),
       [](size_t sum, const std::vector<vtkIdType>& ids) { return sum + ids.size(); });
 
-    using Dispatcher = vtkArrayDispatch::DispatchByValueType<vtkArrayDispatch::AllTypes>;
     const bool createAOS = numComponents <= 3 || numComponents == 6;
     PutFieldWorker<T> worker(numComponents, totalSize, createAOS);
     for (size_t dsIndex = 0; dsIndex < datasets.size(); ++dsIndex)
@@ -946,7 +945,7 @@ protected:
       worker.SetSourceIds(&lids);
       if (auto array = ds->GetAttributes(association)->GetArray(name.c_str()))
       {
-        if (!Dispatcher::Execute(array, worker))
+        if (!vtkArrayDispatch::Dispatch::Execute(array, worker))
         {
           vtkLogF(ERROR, "Failed to dispatch array %s", name.c_str());
         }
@@ -1316,25 +1315,22 @@ struct vtkEntityBlock : public vtkGroupingEntity
   // transformation T = { t_i | i in [1, n] }. So now the IOSS has been converted to VTK ordering.
   // To convert VTK ordering to IOSS ordering, we find the transformation that converts T to O.
   // The below function returns that transformation.
-  // ref: https://sandialabs.github.io/seacas-docs/html/md_include_exodus_element_types.html
+  // ref: https://sandialabs.github.io/seacas-docs/html/element_types.html
   static bool NeedsIdsTransformation(
     const unsigned char vtkCellType, std::vector<int>& orderingTransformation)
   {
     switch (vtkCellType)
     {
-      case VTK_WEDGE:
-      {
-        orderingTransformation = std::vector<int>{ 4, 5, 6, 1, 2, 3 };
-        break;
-      }
       case VTK_QUADRATIC_WEDGE:
       {
         // clang-format off
         orderingTransformation = std::vector<int>{
-          4, 5, 6, 1, 2, 3,
-          10, 11, 12,
-          13, 14, 15,
+          /* 2 triangles */
+          1, 2, 3, 4, 5, 6,
+          /* edge centers */
           7, 8, 9,
+          13, 14, 15,
+          10, 11, 12
         };
         // clang-format on
         break;
@@ -1343,15 +1339,55 @@ struct vtkEntityBlock : public vtkGroupingEntity
       {
         // clang-format off
         orderingTransformation = std::vector<int>{
-          4, 5, 6, 1, 2, 3,
-          10, 11, 12,
-          13, 14, 15,
+          /* 2 triangles */
+          1, 2, 3, 4, 5, 6,
+          /* edge centers */
           7, 8, 9,
+          13, 14, 15,
+          10, 11, 12,
+          /* quad-centers */
           16, 17, 18
         };
         // clang-format on
         break;
       }
+      case VTK_LAGRANGE_WEDGE:
+      {
+        // We only handle 21-node wedges for now.
+        // The caller checks whether our returned size matches.
+        // clang-format off
+        orderingTransformation = std::vector<int>{
+          /* 2 triangles */
+          1, 2, 3, 4, 5, 6,
+          /* edge centers */
+          7, 8, 9,
+          13, 14, 15,
+          10, 11, 12,
+          /* triangle centers */
+          21, 17,
+          /* quad-centers */
+          16, 19, 20,
+          /* body center */
+          18
+        };
+        // clang-format on
+        break;
+      }
+      case VTK_LAGRANGE_TETRAHEDRON: // tet-15, VTK -> Exodus
+        // clang-format off
+        orderingTransformation = std::vector<int>{
+          /* corner points */
+          1, 2, 3, 4,
+          /* edge centers */
+          5, 6, 7,
+          8, 9, 10,
+          /* triangle centers */
+          15, 11, 13, 14,
+          /* body center */
+          12
+        };
+        // clang-format on
+        break;
       case VTK_QUADRATIC_HEXAHEDRON:
       {
         // clang-format off
@@ -1359,7 +1395,6 @@ struct vtkEntityBlock : public vtkGroupingEntity
           /* 8 corners */
           1, 2, 3, 4,
           5, 6, 7, 8,
-
           /* 12 mid-edge nodes */
           9, 10, 11, 12,
           17, 18, 19, 20,
@@ -1372,35 +1407,17 @@ struct vtkEntityBlock : public vtkGroupingEntity
       {
         // clang-format off
         orderingTransformation = std::vector<int>{
+          /* 8 corners */
           1, 2, 3, 4,
           5, 6, 7, 8,
+          /* 12 mid-edge nodes */
           9, 10, 11, 12,
           17, 18, 19, 20,
           13, 14, 15, 16,
-          27, 25, 26, 21,
-          22, 23, 24
-        };
-        // clang-format on
-        break;
-      }
-      case VTK_LAGRANGE_WEDGE:
-      {
-        // We only handle 21-node wedges for now.
-        // The caller checks whether our returned size matches.
-        // clang-format off
-        orderingTransformation = std::vector<int>{
-            // nodes
-          4, 5, 6, 1, 2, 3,
-            // edge mid-points
-         10, 11, 12,
-         13, 14, 15,
-         7, 8, 9,
-           // body center
-         21,
-           // triangle faces
-         17, 16,
-           // quad faces
-         19, 20, 18
+          /* 6 mid-face nodes */
+          27, 25, 26, 21, 22, 23,
+          /* mid-volume node */
+          24
         };
         // clang-format on
         break;

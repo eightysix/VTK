@@ -1,9 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) Ken Martin, Will Schroeder, Bill Lorensen
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Hide VTK_DEPRECATED_IN_9_5_0() warnings for this class.
-#define VTK_DEPRECATION_LEVEL 0
-
 #include "vtkRemoteSession.h"
 
 #include "vtkLogger.h"
@@ -39,24 +36,12 @@ bool vtkRemoteSession::UnRegisterState(vtkTypeUInt32 object)
 }
 
 //-------------------------------------------------------------------------------
-emscripten::val vtkRemoteSession::GetState(vtkTypeUInt32 object)
-{
-  vtkGenericWarningMacro(<< "Please use vtkRemoteSession::Get(vtkTypeUInt32 object) instead. "
-                            "vtkRemoteSession::GetState(vtkTypeUInt32 object) "
-                            "will be removed in a future release.");
-  auto resultImpl = vtkSessionGetState(this->Session, object);
-  auto result = std::move(resultImpl->JsonValue);
-  delete resultImpl;
-  return result;
-}
-
-//-------------------------------------------------------------------------------
-void vtkRemoteSession::Set(vtkTypeUInt32 object, emscripten::val properties)
+bool vtkRemoteSession::Set(vtkTypeUInt32 object, emscripten::val properties)
 {
   // Ensure the ID is set in the JSON state before updating the object
   properties.set("Id", object);
   vtkSessionJsonImpl propertiesImpl{ properties };
-  return vtkSessionUpdateObjectFromState(this->Session, &propertiesImpl);
+  return vtkSessionUpdateObjectFromState(this->Session, &propertiesImpl) == vtkSessionResultSuccess;
 }
 
 //-------------------------------------------------------------------------------
@@ -143,11 +128,10 @@ emscripten::val vtkRemoteSession::Invoke(
               const auto length = jsArray["length"].as<std::size_t>();
               dataArray->SetNumberOfValues(length);
               // Copy the data from the JS array to the VTK data array
-              using DispatchT = vtkArrayDispatch::DispatchByValueType<vtkArrayDispatch::AllTypes>;
-              if (!DispatchT::Execute(dataArray, CopyJSArrayToVTKDataArray{}, jsArray))
+              CopyJSArrayToVTKDataArray worker;
+              if (!vtkArrayDispatch::DispatchByArray<Arrays>::Execute(dataArray, worker, jsArray))
               {
-                // Fallback to the default implementation if the DispatchT fails
-                CopyJSArrayToVTKDataArray{}(dataArray, jsArray);
+                vtkLog(ERROR, << dataArray->GetClassName() << " does not support SetArray");
               }
               return emscripten::val::undefined();
             }
@@ -190,10 +174,10 @@ emscripten::val vtkRemoteSession::GetAllDependencies(vtkTypeUInt32 object)
 }
 
 //-------------------------------------------------------------------------------
-void vtkRemoteSession::UpdateObjectFromState(emscripten::val state)
+bool vtkRemoteSession::UpdateObjectFromState(emscripten::val state)
 {
   vtkSessionJsonImpl stateImpl{ state };
-  return vtkSessionUpdateObjectFromState(this->Session, &stateImpl);
+  return vtkSessionUpdateObjectFromState(this->Session, &stateImpl) == vtkSessionResultSuccess;
 }
 
 //-------------------------------------------------------------------------------
@@ -218,6 +202,19 @@ bool vtkRemoteSession::Render(vtkTypeUInt32 object)
 bool vtkRemoteSession::ResetCamera(vtkTypeUInt32 object)
 {
   return vtkSessionResetCamera(this->Session, object) == vtkSessionResultSuccess;
+}
+
+//------------------------------------------------------------------------------
+bool vtkRemoteSession::StartWebXR(
+  vtkTypeUInt8 mode, vtkTypeUInt32 requiredFeatures, vtkTypeUInt32 optionalFeatures)
+{
+  return vtkSessionStartWebXR(mode, requiredFeatures, optionalFeatures) == vtkSessionResultSuccess;
+}
+
+//------------------------------------------------------------------------------
+bool vtkRemoteSession::StopWebXR()
+{
+  return vtkSessionStopWebXR() == vtkSessionResultSuccess;
 }
 
 //-------------------------------------------------------------------------------
@@ -284,6 +281,18 @@ unsigned long vtkRemoteSession::Observe(
 bool vtkRemoteSession::UnObserve(vtkTypeUInt32 object, unsigned long tag)
 {
   return vtkSessionRemoveObserver(this->Session, object, tag) == vtkSessionResultSuccess;
+}
+
+//-------------------------------------------------------------------------------
+bool vtkRemoteSession::UnObserveAll(vtkObjectHandle object)
+{
+  return vtkSessionRemoveAllObservers(this->Session, object) == vtkSessionResultSuccess;
+}
+
+//-------------------------------------------------------------------------------
+void vtkRemoteSession::UnObserveAllObjects()
+{
+  vtkSessionRemoveAllObserversFromAllObjects(this->Session);
 }
 
 //-------------------------------------------------------------------------------

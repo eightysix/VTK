@@ -26,6 +26,12 @@ vtk_add_test_cxx(vtkIOImportCxxTests tests
 )
 
 vtk_add_test_cxx(vtkIOImportCxxTests tests
+  3DSImport-Stream,Test3DSImporterStream.cxx
+    DATA{../../../../Testing/Data/iflamigm.3ds}
+    33
+)
+
+vtk_add_test_cxx(vtkIOImportCxxTests tests
   OBJImport-mtllib-texturepath,TestOBJImporter.cxx
     DATA{../Data/Input/cube-scene.obj}
 )
@@ -119,6 +125,10 @@ vtk_add_test_cxx(vtkIOImportCxxTests tests
 )
 
 vtk_add_test_cxx(vtkIOImportCxxTests tests
+  TestGLTFImporterTexCoord,TestGLTFImporter.cxx DATA{../Data/glTF/TexturedMonkey.glb} 0 -1 1 0 0 0
+)
+
+vtk_add_test_cxx(vtkIOImportCxxTests tests
   LOOSE_VALID
   TestGLTFImporterPBR,TestGLTFImporter.cxx DATA{../Data/glTF/WaterBottle/WaterBottle.glb} 0 -1 1 0 0 0
 )
@@ -126,6 +136,11 @@ vtk_add_test_cxx(vtkIOImportCxxTests tests
 vtk_add_test_cxx(vtkIOImportCxxTests tests
   LOOSE_VALID
   TestGLTFImporterPBRStream,TestGLTFImporter.cxx DATA{../Data/glTF/WaterBottle/WaterBottle.glb} 1 -1 1 0 0 0
+)
+
+vtk_add_test_cxx(vtkIOImportCxxTests tests
+  LOOSE_VALID
+  TestGLTFImporterNonBinaryStream,TestGLTFImporter.cxx DATA{../Data/glTF/Cameras/Cameras.gltf} 1 1 1 0 2 0
 )
 
 vtk_add_test_cxx(vtkIOImportCxxTests tests
@@ -200,6 +215,7 @@ vtk_add_test_cxx(vtkIOImportCxxTests tests
 )
 
 vtk_add_test_cxx(vtkIOImportCxxTests tests
+  NO_SERDES
   TestImport3DS,TestImportOBJ.cxx
   ${TEMP}/iflamigm.obj
   ${TEMP}/iflamigm.mtl
@@ -213,6 +229,7 @@ set_tests_properties(VTK::IOImportCxx-TestImport3DS
 )
 
 vtk_add_test_cxx(vtkIOImportCxxTests tests
+  NO_SERDES
   TestImportGLFT,TestImportOBJ.cxx
   ${TEMP}/Avocado.obj
   ${TEMP}/Avocado.mtl

@@ -6,7 +6,6 @@
 #include "vtkAnariSceneGraph.h"
 
 #include "vtkCamera.h"
-#include "vtkCollectionIterator.h"
 #include "vtkImageData.h"
 #include "vtkInformation.h"
 #include "vtkInformationDoubleKey.h"
@@ -388,8 +387,7 @@ void vtkAnariLightNode::Synchronize(bool prepass)
       // the amount of light arriving at a surface point, assuming the light is
       // oriented towards to the surface, in W/m^2^
       float irradiance =
-        static_cast<float>((vtkAnariLightNode::GetLightScale(light) * light->GetIntensity()) /
-          vtkMath::Distance2BetweenPoints(position, focalPoint));
+        static_cast<float>(vtkAnariLightNode::GetLightScale(light) * light->GetIntensity());
       anari::setParameter(anariDevice, anariLight, "irradiance", irradiance);
 
       if (anariExtensions.ANARI_KHR_AREA_LIGHTS)

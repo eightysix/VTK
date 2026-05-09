@@ -461,6 +461,11 @@ std::string vtkJSONSceneExporter::WriteDataSet(
     return "";
   }
 
+  if (dataset->GetNumberOfCells() == 0)
+  {
+    return "";
+  }
+
   std::string dsPath = this->CurrentDataSetPath();
   ++this->DatasetCount;
 

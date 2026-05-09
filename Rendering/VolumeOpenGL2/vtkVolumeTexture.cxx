@@ -336,7 +336,8 @@ bool vtkVolumeTexture::LoadTexture(int interpolation, VolumeBlock* volBlock)
     // Account for component offset
     // index = ( z0 * Dx * Dy + y0 * Dx + x0 ) * numComp
     vtkIdType const dataIdx = tupleIdx * noOfComponents;
-    void* dataPtr = this->Scalars->GetVoidPointer(dataIdx);
+    auto scalarsAOS = this->Scalars->ToAOSDataArray();
+    void* dataPtr = scalarsAOS->GetVoidPointer(dataIdx); // NOLINT(bugprone-unsafe-functions)
 
     if (this->StreamBlocks)
     {
@@ -565,7 +566,7 @@ bool vtkVolumeTexture::LoadTexture(int interpolation, VolumeBlock* volBlock)
     // Since this is a pseudo-bit array i.e. values either 0 or 255, skip scale and bias
     // computation
     this->BlankingTex->Create3DFromRaw(blockSize[0], blockSize[1], blockSize[2], numComps,
-      VTK_UNSIGNED_CHAR, &blankingArrayRange[0][0]);
+      VTK_UNSIGNED_CHAR, blankingArray->GetPointer(0));
     this->BlankingTex->SetWrapR(vtkTextureObject::ClampToEdge);
     this->BlankingTex->SetWrapS(vtkTextureObject::ClampToEdge);
     this->BlankingTex->SetWrapT(vtkTextureObject::ClampToEdge);

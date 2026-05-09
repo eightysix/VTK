@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) Ken Martin, Will Schroeder, Bill Lorensen
 // SPDX-License-Identifier: BSD-3-Clause
+#define VTK_DEPRECATION_LEVEL 0
 
 #include "vtkGLTFImporter.h"
 
@@ -10,6 +11,7 @@
 #include "vtkDataAssembly.h"
 #include "vtkDoubleArray.h"
 #include "vtkEventForwarderCommand.h"
+#include "vtkFileResourceStream.h"
 #include "vtkFloatArray.h"
 #include "vtkGLTFDocumentLoader.h"
 #include "vtkImageAppendComponents.h"
@@ -525,20 +527,20 @@ int vtkGLTFImporter::ImportBegin()
   std::vector<char> glbBuffer;
   if (stream != nullptr)
   {
+    if (!this->Loader->LoadModelMetaDataFromStream(stream, this->StreamURILoader))
+    {
+      vtkErrorMacro("Error loading model metadata");
+      return 0;
+    }
+
     // stream is defined.
-    if (this->StreamIsBinary)
+    if (this->Loader->GetIsBinary() || this->StreamIsBinary)
     {
       if (!this->Loader->LoadStreamBuffer(stream, glbBuffer))
       {
         vtkErrorMacro("Error loading binary data");
         return 0;
       }
-    }
-
-    if (!this->Loader->LoadModelMetaDataFromStream(stream, this->StreamURILoader))
-    {
-      vtkErrorMacro("Error loading model metadata");
-      return 0;
     }
   }
   else
@@ -638,7 +640,6 @@ void vtkGLTFImporter::ImportActors(vtkRenderer* renderer)
   // List of nodes to import
   std::stack<int> nodeIdStack;
   std::stack<int> dasmParents;
-  int flatActorId = 0;
 
   // Add root nodes to the stack
   for (int nodeId : model->Scenes[scene].Nodes)
@@ -674,6 +675,11 @@ void vtkGLTFImporter::ImportActors(vtkRenderer* renderer)
       dasmNodeName = "node" + vtk::to_string(nodeId);
     }
     const int dasmNode = this->SceneHierarchy->AddNode(dasmNodeName.c_str(), dasmParent);
+
+    if (!node.Name.empty())
+    {
+      this->SceneHierarchy->SetAttribute(dasmNode, "label", node.Name.c_str());
+    }
 
     // Import node's geometry
     if (node.Mesh >= 0)
@@ -747,12 +753,19 @@ void vtkGLTFImporter::ImportActors(vtkRenderer* renderer)
         }
         renderer->AddActor(actor);
 
-        this->Actors[nodeId].emplace_back(actor);
-        this->ActorCollection->AddItem(actor);
         const int actorNode =
           this->SceneHierarchy->AddNode(meshNodeName.c_str(), /*parent=*/dasmNode);
         this->SceneHierarchy->SetAttribute(actorNode, "parent_node_name", dasmNodeName.c_str());
-        this->SceneHierarchy->SetAttribute(actorNode, "flat_actor_id", flatActorId++);
+        this->SceneHierarchy->SetAttribute(
+          actorNode, "flat_actor_id", this->ActorCollection->GetNumberOfItems());
+
+        this->Actors[nodeId].emplace_back(actor);
+        this->ActorCollection->AddItem(actor);
+
+        if (!mesh.Name.empty())
+        {
+          this->SceneHierarchy->SetAttribute(actorNode, "label", mesh.Name.c_str());
+        }
 
         this->InvokeEvent(vtkCommand::UpdateDataEvent);
       }
@@ -796,6 +809,66 @@ void vtkGLTFImporter::ApplyArmatureProperties(vtkActor* actor)
 {
   actor->GetProperty()->RenderPointsAsSpheresOn();
   actor->GetProperty()->RenderLinesAsTubesOn();
+}
+
+//------------------------------------------------------------------------------
+// VTK_DEPRECATED_IN_9_7_0
+void vtkGLTFImporter::SetStreamIsBinary(bool val)
+{
+  if (this->StreamIsBinary != val)
+  {
+    this->StreamIsBinary = val;
+    this->Modified();
+  }
+}
+
+//------------------------------------------------------------------------------
+// VTK_DEPRECATED_IN_9_7_0
+bool vtkGLTFImporter::GetStreamIsBinary()
+{
+  return this->StreamIsBinary;
+}
+
+//------------------------------------------------------------------------------
+// VTK_DEPRECATED_IN_9_7_0
+void vtkGLTFImporter::StreamIsBinaryOn()
+{
+  this->SetStreamIsBinary(true);
+}
+
+//------------------------------------------------------------------------------
+// VTK_DEPRECATED_IN_9_7_0
+void vtkGLTFImporter::StreamIsBinaryOff()
+{
+  this->SetStreamIsBinary(false);
+}
+
+//------------------------------------------------------------------------------
+bool vtkGLTFImporter::CanReadFile(const std::string& filename)
+{
+  vtkNew<vtkFileResourceStream> stream;
+  if (!stream->Open(filename.c_str()))
+  {
+    return false;
+  }
+  return vtkGLTFImporter::CanReadFile(stream);
+}
+
+//------------------------------------------------------------------------------
+bool vtkGLTFImporter::CanReadFile(vtkResourceStream* stream)
+{
+  if (!stream)
+  {
+    return false;
+  }
+
+  stream->Seek(0, vtkResourceStream::SeekDirection::Begin);
+  vtkNew<vtkGLTFDocumentLoader> loader;
+  if (!loader->LoadModelMetaDataFromStream(stream, nullptr, true))
+  {
+    return false;
+  }
+  return true;
 }
 
 //------------------------------------------------------------------------------
@@ -1187,8 +1260,7 @@ bool vtkGLTFImporter::GetTemporalInformation(vtkIdType animationIndex, double fr
     if (frameRate > 0)
     {
       nbTimeSteps = 0;
-      timeSteps->SetNumberOfComponents(1);
-      timeSteps->SetNumberOfTuples(0);
+      timeSteps->Initialize();
 
       std::vector<double> ts;
       double period = (1.0 / frameRate);
@@ -1217,7 +1289,7 @@ bool vtkGLTFImporter::GetTemporalInformation(
 
     nbTimeStep = static_cast<int>(model->Animations[animationIndex].AllTimestamps.size());
     timeSteps->Initialize();
-    timeSteps->Allocate(nbTimeStep);
+    timeSteps->ReserveValues(nbTimeStep);
     for (const float& Timestamp : model->Animations[animationIndex].AllTimestamps)
     {
       timeSteps->InsertNextValue(Timestamp);

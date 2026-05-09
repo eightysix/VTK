@@ -33,9 +33,17 @@ static int vtkWrapSerDes_CanMarshalValue(
   const int isStdVector = vtkWrap_IsStdVector(valInfo);
 
   int isAllowed = -1;
-  // vtkAOSDataArrayTemplate does not get recognized as a template class through valInfo->Template.
+  // Array classes do not get recognized as a template class through valInfo->Template.
   if (strstr(valInfo->Class, "vtkAOSDataArrayTemplate") != NULL ||
-    strstr(valInfo->Class, "vtkSOADataArrayTemplate") != NULL)
+    strstr(valInfo->Class, "vtkScaledSOADataArrayTemplate") != NULL || // VTK_DEPRECATED_IN_9_7_0
+    strstr(valInfo->Class, "vtkSOADataArrayTemplate") != NULL ||
+    strstr(valInfo->Class, "vtkAffineArray") != NULL ||
+    strstr(valInfo->Class, "vtkCompositeArray") != NULL ||
+    strstr(valInfo->Class, "vtkConstantArray") != NULL ||
+    strstr(valInfo->Class, "vtkIndexedArray") != NULL ||
+    strstr(valInfo->Class, "vtkStdFunctionArray") != NULL || // VTK_DEPRECATED_IN_9_7_0
+    strstr(valInfo->Class, "vtkStridedArray") != NULL ||
+    strstr(valInfo->Class, "vtkStructuredPointArray") != NULL)
   {
     isAllowed = 0;
   }
@@ -261,9 +269,9 @@ static void vtkWrapSerDes_WriteArgumentDeserializer(
   if (isVTKSmartPointer || (isVTKObject && isPointer))
   {
     fprintf(fp,
-      "    auto arg_%d = "
-      "reinterpret_cast<%s*>(objectFromContext%d.GetPointer());\n",
-      paramId, className, paramId);
+      "    auto* arg_%d = "
+      "reinterpret_cast<%s*>(args[%d].is_null() ? nullptr : objectFromContext%d.GetPointer());\n",
+      paramId, className, paramId, paramId);
     free(className);
     return;
   }
@@ -401,7 +409,7 @@ static void vtkWrapSerDes_WriteReturnValueSerializer(
       "    vtkTypeUInt32 identifier = "
       "context->GetId(reinterpret_cast<vtkObjectBase*>(methodReturnValue));\n");
     fprintf(fp,
-      "    if (identifier == 0)\n"
+      "    if (identifier == 0 && methodReturnValue != nullptr)\n"
       "    {\n"
       "      // NOLINTNEXTLINE(readability-redundant-casting)\n"
       "      context->RegisterObject(reinterpret_cast<vtkObjectBase*>(methodReturnValue), "

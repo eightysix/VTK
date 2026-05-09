@@ -11,6 +11,7 @@
 #include "vtkMapper.h"
 #include "vtkMatrix3x3.h"
 #include "vtkObjectFactory.h"
+#include "vtkOverrideAttribute.h"
 #include "vtkProperty.h"
 #include "vtkRenderWindow.h"
 #include "vtkRenderer.h"
@@ -37,6 +38,14 @@ vtkWebGPUActor::vtkWebGPUActor()
 
 //------------------------------------------------------------------------------
 vtkWebGPUActor::~vtkWebGPUActor() = default;
+
+//------------------------------------------------------------------------------
+vtkOverrideAttribute* vtkWebGPUActor::CreateOverrideAttributes()
+{
+  auto* renderingBackendAttribute =
+    vtkOverrideAttribute::CreateAttributeChain("RenderingBackend", "WebGPU", nullptr);
+  return renderingBackendAttribute;
+}
 
 //------------------------------------------------------------------------------
 void vtkWebGPUActor::PrintSelf(ostream& os, vtkIndent indent)
@@ -329,6 +338,7 @@ bool vtkWebGPUActor::CacheActorRenderOptions()
       (displayProperty->GetRenderPointsAsSpheres() << 5) |
       (displayProperty->GetRenderLinesAsTubes() << 6) |
       (static_cast<int>(displayProperty->GetPoint2DShape()) << 7);
+    ro.Flags2 = displayProperty->GetLighting();
     internals.RenderOptionsLastUpdated.Modified();
     return true;
   }

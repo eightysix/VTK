@@ -3,7 +3,6 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "")
 set(VTK_ENABLE_WEBGPU ON CACHE BOOL "")
 set(VTK_BUILD_EXAMPLES OFF CACHE BOOL "")
 set(VTK_ENABLE_CATALYST OFF CACHE BOOL "")
-set(VTK_LEGACY_REMOVE ON CACHE BOOL "") # Hides many `-Wreserved-identifier` from legacy code.
 # Modules which do not build successfully or do not have required software in the docker image.
 set(VTK_GROUP_ENABLE_Qt NO CACHE STRING "") # no qt
 # ├── Common
@@ -29,6 +28,7 @@ set(VTK_MODULE_ENABLE_VTK_IOGDAL NO CACHE STRING "") # no gdal
 set(VTK_MODULE_ENABLE_VTK_IOLAS NO CACHE STRING "") # no liblas
 set(VTK_MODULE_ENABLE_VTK_IOMySQL NO CACHE STRING "") # no mysql
 set(VTK_MODULE_ENABLE_VTK_IOOCCT NO CACHE STRING "") # no open cascade
+set(VTK_MODULE_ENABLE_VTK_IOIFC NO CACHE STRING "") # no IFC based on IfcOpenShell
 set(VTK_MODULE_ENABLE_VTK_IOUSD NO CACHE STRING "") # no usd
 set(VTK_MODULE_ENABLE_VTK_IOODBC NO CACHE STRING "") # no iodbc
 set(VTK_MODULE_ENABLE_VTK_IOOpenVDB NO CACHE STRING "") # no openvdb
@@ -44,7 +44,6 @@ set(VTK_MODULE_ENABLE_VTK_RenderingOpenXR NO CACHE STRING "") # no openxr
 set(VTK_MODULE_ENABLE_VTK_RenderingQt NO CACHE STRING "") # no qt
 set(VTK_MODULE_ENABLE_VTK_RenderingRayTracing NO CACHE STRING "") # no ospray or visrtx
 set(VTK_MODULE_ENABLE_VTK_RenderingTk NO CACHE STRING "") # no tk
-set(VTK_MODULE_ENABLE_VTK_RenderingVR NO CACHE STRING "") # gl code incompatible with gles 3.0
 set(VTK_MODULE_ENABLE_VTK_RenderingZSpace NO CACHE STRING "") # no zspace
 # ├── ThirdParty
 set(VTK_MODULE_ENABLE_VTK_fides NO CACHE STRING "") # no adios2

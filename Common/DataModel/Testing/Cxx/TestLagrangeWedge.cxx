@@ -436,7 +436,7 @@ int TestLagrangeWedge(int argc, char* argv[])
 
   // empirically determined values, verified visually
   static const vtkIdType nIntersections = 107;
-  static const vtkIdType nClippedElems[8] = { 0, 8, 30, 61, 110, 168, 242, 39 };
+  static const vtkIdType nClippedElems[8] = { 0, 8, 25, 50, 82, 125, 178, 30 };
 
   vtkIdType nPointsForOrder[8];
   nPointsForOrder[0] = -1;

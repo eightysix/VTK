@@ -53,7 +53,7 @@ vtkSTLWriter::~vtkSTLWriter()
   this->SetBinaryHeader(nullptr);
 }
 
-void vtkSTLWriter::WriteData()
+bool vtkSTLWriter::WriteDataAndReturn()
 {
   vtkPoints* pts;
   vtkCellArray* polys;
@@ -67,14 +67,14 @@ void vtkSTLWriter::WriteData()
   {
     vtkErrorMacro(<< "No data to write!");
     this->SetErrorCode(vtkErrorCode::UnknownError);
-    return;
+    return false;
   }
 
   if (this->FileName == nullptr)
   {
     vtkErrorMacro(<< "Please specify FileName to write");
     this->SetErrorCode(vtkErrorCode::NoFileNameError);
-    return;
+    return false;
   }
 
   if (this->FileType == VTK_BINARY)
@@ -84,6 +84,7 @@ void vtkSTLWriter::WriteData()
     {
       vtkErrorMacro("Ran out of disk space; deleting file: " << this->FileName);
       unlink(this->FileName);
+      return false;
     }
   }
   else
@@ -93,8 +94,10 @@ void vtkSTLWriter::WriteData()
     {
       vtkErrorMacro("Ran out of disk space; deleting file: " << this->FileName);
       unlink(this->FileName);
+      return false;
     }
   }
+  return true;
 }
 
 void vtkSTLWriter::WriteAsciiSTL(vtkPoints* pts, vtkCellArray* polys, vtkCellArray* strips)
@@ -193,7 +196,7 @@ void vtkSTLWriter::WriteAsciiSTL(vtkPoints* pts, vtkCellArray* polys, vtkCellArr
 
       // Do the triangulation
       vtkNew<vtkIdList> ptIds;
-      ptIds->Allocate(VTK_CELL_SIZE);
+      ptIds->Reserve(VTK_CELL_SIZE);
       poly->TriangulateLocalIds(0, ptIds);
 
       vtkIdType numPts = ptIds->GetNumberOfIds();
@@ -418,7 +421,7 @@ void vtkSTLWriter::WriteBinarySTL(vtkPoints* pts, vtkCellArray* polys, vtkCellAr
 
       // Do the triangulation
       vtkNew<vtkIdList> ptIds;
-      ptIds->Allocate(VTK_CELL_SIZE);
+      ptIds->Reserve(VTK_CELL_SIZE);
       poly->TriangulateLocalIds(0, ptIds);
 
       vtkIdType numPts = ptIds->GetNumberOfIds();

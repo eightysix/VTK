@@ -856,7 +856,7 @@ void vtkFlyingEdges2DAlgorithm<TArray>::ContourImage(vtkFlyingEdges2D* self, TAr
     vtkIdType totalPts = numOutXPts + numOutYPts;
     if (totalPts > 0)
     {
-      newPts->GetData()->WriteVoidPointer(0, 3 * totalPts);
+      newPts->GetData()->SetNumberOfTuples(totalPts);
       algo.NewPoints =
         vtkAOSDataArrayTemplate<float>::FastDownCast(newPts->GetData())->GetPointer(0);
       newLines->ResizeExact(numOutLines, 2 * numOutLines);
@@ -865,7 +865,7 @@ void vtkFlyingEdges2DAlgorithm<TArray>::ContourImage(vtkFlyingEdges2D* self, TAr
       {
         vtkIdType numPrevPts = newScalars->GetNumberOfTuples();
         vtkIdType numNewPts = totalPts - numPrevPts;
-        newScalars->WriteVoidPointer(0, totalPts);
+        newScalars->SetNumberOfValues(totalPts);
         algo.NewScalars = vtk::DataArrayValueRange<1>(TArray::FastDownCast(newScalars)).begin();
         T TValue = static_cast<T>(value);
         std::fill_n(algo.NewScalars + numPrevPts, numNewPts, TValue);

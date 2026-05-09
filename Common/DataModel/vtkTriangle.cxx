@@ -7,18 +7,42 @@
 #include "vtkDoubleArray.h"
 #include "vtkIncrementalPointLocator.h"
 #include "vtkLine.h"
+#include "vtkMarchingCellsClipCases.h"
+#include "vtkMarchingCellsContourCases.h"
 #include "vtkMath.h"
 #include "vtkObjectFactory.h"
 #include "vtkPlane.h"
 #include "vtkPointData.h"
 #include "vtkPoints.h"
-#include "vtkPolygon.h"
 #include "vtkQuadric.h"
 
 #include <cassert>
 #include <limits>
 #include <numeric> //std::iota
-#include <utility>
+
+namespace
+{
+//------------------------------------------------------------------------------
+[[maybe_unused]] constexpr const char* Topology = R"(
+   Triangle topology:
+
+          2
+         / \
+        /   \
+       /     \
+      0-------1
+)";
+
+//------------------------------------------------------------------------------
+double ParametricCoords[9] = {
+  0.0, 0.0, 0.0, //
+  1.0, 0.0, 0.0, //
+  0.0, 1.0, 0.0  //
+};
+
+//------------------------------------------------------------------------------
+constexpr vtkIdType Edges[3][2] = { { 0, 1 }, { 1, 2 }, { 2, 0 } };
+}
 
 VTK_ABI_NAMESPACE_BEGIN
 vtkStandardNewMacro(vtkTriangle);
@@ -34,13 +58,7 @@ vtkTriangle::vtkTriangle()
     this->Points->SetPoint(i, 0.0, 0.0, 0.0);
     this->PointIds->SetId(i, 0);
   }
-  this->Line = vtkLine::New();
-}
-
-//------------------------------------------------------------------------------
-vtkTriangle::~vtkTriangle()
-{
-  this->Line->Delete();
+  this->Line = vtkSmartPointer<vtkLine>::New();
 }
 
 //------------------------------------------------------------------------------
@@ -90,9 +108,7 @@ bool vtkTriangle::ComputeCentroid(vtkPoints* points, const vtkIdType* pointIds, 
 // with the appropriate parameters from the instantiated vtkTriangle.
 double vtkTriangle::ComputeArea()
 {
-  double p0[3];
-  double p1[3];
-  double p2[3];
+  double p0[3], p1[3], p2[3];
   this->GetPoints()->GetPoint(0, p0);
   this->GetPoints()->GetPoint(1, p1);
   this->GetPoints()->GetPoint(2, p2);
@@ -105,9 +121,8 @@ double vtkTriangle::ComputeArea()
 int vtkTriangle::EvaluatePosition(const double x[3], double closestPoint[3], int& subId,
   double pcoords[3], double& dist2, double weights[])
 {
-  int i, j;
   const double *pt1, *pt2, *pt3, *closest;
-  double n[3], fabsn;
+  double n[3];
   double rhs[2], c1[2], c2[2];
   double det;
   int idx = 0, indices[2];
@@ -144,24 +159,17 @@ int vtkTriangle::EvaluatePosition(const double x[3], double closestPoint[3], int
   // work since we've projected point to plane.)
   //
   double maxComponent = 0.0;
-  for (i = 0; i < 3; i++)
+  for (int i = 0; i < 3; i++)
   {
-    // trying to avoid an expensive call to fabs()
-    if (n[i] < 0)
+    // trying to avoid an expensive call to std::abs()
+    n[i] = std::abs(n[i]);
+    if (n[i] > maxComponent)
     {
-      fabsn = -n[i];
-    }
-    else
-    {
-      fabsn = n[i];
-    }
-    if (fabsn > maxComponent)
-    {
-      maxComponent = fabsn;
+      maxComponent = n[i];
       idx = i;
     }
   }
-  for (j = 0, i = 0; i < 3; i++)
+  for (int j = 0, i = 0; i < 3; i++)
   {
     if (i != idx)
     {
@@ -169,7 +177,7 @@ int vtkTriangle::EvaluatePosition(const double x[3], double closestPoint[3], int
     }
   }
 
-  for (i = 0; i < 2; i++)
+  for (int i = 0; i < 2; i++)
   {
     rhs[i] = cp[indices[i]] - pt3[indices[i]];
     c1[i] = pt1[indices[i]] - pt3[indices[i]];
@@ -229,7 +237,7 @@ int vtkTriangle::EvaluatePosition(const double x[3], double closestPoint[3], int
           dist2 = dist2Line2;
           closest = closestPoint2;
         }
-        for (i = 0; i < 3; i++)
+        for (int i = 0; i < 3; i++)
         {
           closestPoint[i] = closest[i];
         }
@@ -254,7 +262,7 @@ int vtkTriangle::EvaluatePosition(const double x[3], double closestPoint[3], int
           dist2 = dist2Line2;
           closest = closestPoint2;
         }
-        for (i = 0; i < 3; i++)
+        for (int i = 0; i < 3; i++)
         {
           closestPoint[i] = closest[i];
         }
@@ -279,7 +287,7 @@ int vtkTriangle::EvaluatePosition(const double x[3], double closestPoint[3], int
           dist2 = dist2Line2;
           closest = closestPoint2;
         }
-        for (i = 0; i < 3; i++)
+        for (int i = 0; i < 3; i++)
         {
           closestPoint[i] = closest[i];
         }
@@ -314,9 +322,6 @@ int vtkTriangle::EvaluatePosition(const double x[3], double closestPoint[3], int
 void vtkTriangle::EvaluateLocation(
   int& vtkNotUsed(subId), const double pcoords[3], double x[3], double* weights)
 {
-  double u3;
-  const double *pt0, *pt1, *pt2;
-
   // Efficient point access
   const auto pointsArray = vtkDoubleArray::FastDownCast(this->Points->GetData());
   if (!pointsArray)
@@ -325,11 +330,11 @@ void vtkTriangle::EvaluateLocation(
     return;
   }
   const double* pts = pointsArray->GetPointer(0);
-  pt0 = pts;
-  pt1 = pts + 3;
-  pt2 = pts + 6;
+  const double* pt0 = pts;
+  const double* pt1 = pts + 3;
+  const double* pt2 = pts + 6;
 
-  u3 = 1.0 - pcoords[0] - pcoords[1];
+  const double u3 = 1.0 - pcoords[0] - pcoords[1];
 
   for (int i = 0; i < 3; i++)
   {
@@ -404,37 +409,10 @@ int vtkTriangle::CellBoundary(int vtkNotUsed(subId), const double pcoords[3], vt
     return 1;
   }
 }
-
-//------------------------------------------------------------------------------
-//
-// Marching triangles
-//
-namespace
-{ // required so we don't violate ODR
-struct LINE_CASES_t
-{
-  int edges[3];
-};
-using LINE_CASES = struct LINE_CASES_t;
-
-constexpr LINE_CASES lineCases[] = {
-  { { -1, -1, -1 } },
-  { { 0, 2, -1 } },
-  { { 1, 0, -1 } },
-  { { 1, 2, -1 } },
-  { { 2, 1, -1 } },
-  { { 0, 1, -1 } },
-  { { 2, 0, -1 } },
-  { { -1, -1, -1 } },
-};
-}
-
-static constexpr vtkIdType edges[3][2] = { { 0, 1 }, { 1, 2 }, { 2, 0 } };
-
 //------------------------------------------------------------------------------
 const vtkIdType* vtkTriangle::GetEdgeArray(vtkIdType edgeId)
 {
-  return edges[edgeId];
+  return Edges[edgeId];
 }
 
 //------------------------------------------------------------------------------
@@ -443,12 +421,9 @@ void vtkTriangle::Contour(double value, vtkDataArray* cellScalars,
   vtkCellArray* vtkNotUsed(polys), vtkPointData* inPd, vtkPointData* outPd, vtkCellData* inCd,
   vtkIdType cellId, vtkCellData* outCd)
 {
-  constexpr int CASE_MASK[3] = { 1, 2, 4 };
-  const LINE_CASES* lineCase;
-  const int* edge;
-  const vtkIdType* vert;
+  static constexpr int CASE_MASK[3] = { 1, 2, 4 };
   vtkIdType pts[2];
-  int e1, e2, newCellId;
+  int e1, e2;
   double t, x1[3], x2[3], x[3], deltaScalar;
   vtkIdType offset = verts->GetNumberOfCells();
 
@@ -462,14 +437,12 @@ void vtkTriangle::Contour(double value, vtkDataArray* cellScalars,
     }
   }
 
-  lineCase = lineCases + index;
-  edge = lineCase->edges;
-
+  const int* edge = vtkMarchingCellsContourCases::GetTriangleCase(index);
   for (; edge[0] > -1; edge += 2)
   {
     for (int i = 0; i < 2; i++) // insert line
     {
-      vert = edges[edge[i]];
+      const vtkIdType* vert = Edges[edge[i]];
       // calculate a preferred interpolation direction
       deltaScalar = (cellScalars->GetComponent(vert[1], 0) - cellScalars->GetComponent(vert[0], 0));
       if (deltaScalar > 0)
@@ -514,7 +487,7 @@ void vtkTriangle::Contour(double value, vtkDataArray* cellScalars,
     // check for degenerate line
     if (pts[0] != pts[1])
     {
-      newCellId = offset + lines->InsertNextCell(2, pts);
+      const vtkIdType newCellId = offset + lines->InsertNextCell(2, pts);
       if (outCd)
       {
         outCd->CopyData(inCd, cellId, newCellId);
@@ -528,15 +501,15 @@ void vtkTriangle::Contour(double value, vtkDataArray* cellScalars,
 // coordinates.
 vtkCell* vtkTriangle::GetEdge(int edgeId)
 {
-  int edgeIdPlus1 = (edgeId > 1 ? 0 : (edgeId + 1));
+  edgeId = std::clamp(edgeId, 0, 2);
 
   // load point id's
-  this->Line->PointIds->SetId(0, this->PointIds->GetId(edgeId));
-  this->Line->PointIds->SetId(1, this->PointIds->GetId(edgeIdPlus1));
+  this->Line->PointIds->SetId(0, this->PointIds->GetId(Edges[edgeId][0]));
+  this->Line->PointIds->SetId(1, this->PointIds->GetId(Edges[edgeId][1]));
 
   // load coordinates
-  this->Line->Points->SetPoint(0, this->Points->GetPoint(edgeId));
-  this->Line->Points->SetPoint(1, this->Points->GetPoint(edgeIdPlus1));
+  this->Line->Points->SetPoint(0, this->Points->GetPoint(Edges[edgeId][0]));
+  this->Line->Points->SetPoint(1, this->Points->GetPoint(Edges[edgeId][1]));
 
   return this->Line;
 }
@@ -954,143 +927,101 @@ int vtkTriangle::ProjectTo2D(const double x1[3], const double x2[3], const doubl
 }
 
 //------------------------------------------------------------------------------
-// Support triangle clipping. Note that the table defines triangles (three ids
-// at a time define a triangle, -1 ends the list). Numbers in the list >= 100
-// correspond to already existing vertices; otherwise the numbers refer to edge
-// ids.
-namespace
-{ // required so we don't violate ODR
-typedef int TRIANGLE_EDGE_LIST;
-struct TRIANGLE_CASES_t
-{
-  TRIANGLE_EDGE_LIST edges[7];
-};
-using TRIANGLE_CASES = struct TRIANGLE_CASES_t;
-
-constexpr TRIANGLE_CASES triangleCases[] = {
-  { { -1, -1, -1, -1, -1, -1, -1 } },   // 0
-  { { 0, 2, 100, -1, -1, -1, -1 } },    // 1
-  { { 1, 0, 101, -1, -1, -1, -1 } },    // 2
-  { { 1, 2, 100, 1, 100, 101, -1 } },   // 3
-  { { 2, 1, 102, -1, -1, -1, -1 } },    // 4
-  { { 0, 1, 102, 102, 100, 0, -1 } },   // 5
-  { { 0, 101, 2, 2, 101, 102, -1 } },   // 6
-  { { 100, 101, 102, -1, -1, -1, -1 } } // 7
-};
-}
-
-//------------------------------------------------------------------------------
 // Clip this triangle using scalar value provided. Like contouring, except
-// that it cuts the triangle to produce other triangles.
+// that it cuts the triangle to produce triangle/quad.
 void vtkTriangle::Clip(double value, vtkDataArray* cellScalars, vtkIncrementalPointLocator* locator,
-  vtkCellArray* tris, vtkPointData* inPd, vtkPointData* outPd, vtkCellData* inCd, vtkIdType cellId,
+  vtkCellArray* polys, vtkPointData* inPd, vtkPointData* outPd, vtkCellData* inCd, vtkIdType cellId,
   vtkCellData* outCd, int insideOut)
 {
-  constexpr int CASE_MASK[3] = { 1, 2, 4 };
-  const TRIANGLE_CASES* triangleCase;
-  const TRIANGLE_EDGE_LIST* edge;
-  int i, index;
-  const vtkIdType* vert;
-  int e1, e2, newCellId;
-  vtkIdType pts[3];
-  int vertexId;
-  double t, x1[3], x2[3], x[3], deltaScalar;
+  vtkIdType pts[4];
+  double grdDiffs[3];
+  double x[3], x1[3], x2[3];
 
   // Build the case table
-  if (insideOut)
+  uint8_t caseIndex = 0;
+  for (int pointId = 0; pointId < 3; ++pointId)
   {
-    for (i = 0, index = 0; i < 3; i++)
+    grdDiffs[pointId] = cellScalars->GetComponent(pointId, 0) - value;
+    caseIndex |= (grdDiffs[pointId] >= 0.0) << pointId;
+  }
+  const uint8_t* thisCase = insideOut
+    ? vtkMarchingCellsClipCases<true>::GetCellCase(VTK_TRIANGLE, caseIndex)
+    : vtkMarchingCellsClipCases<false>::GetCellCase(VTK_TRIANGLE, caseIndex);
+  using MCCases = vtkMarchingCellsClipCasesBase;
+  const MCCases::EDGEIDXS* edgeVertices = MCCases::GetCellEdges(VTK_TRIANGLE);
+  const uint8_t numberOfOutputCells = *thisCase++;
+  assert(numberOfOutputCells <= 1);
+  if (numberOfOutputCells == 0)
+  {
+    return;
+  }
+
+  // generate clipped triangle/quad
+  /*shape = */ thisCase++; // VTK_TRIANGLE/VTK_QUAD
+  const uint8_t numberOfCellPoints = *thisCase++;
+  for (uint8_t i = 0; i < numberOfCellPoints; i++) // insert triangle/quad
+  {
+    const uint8_t pointIndex = *thisCase++;
+    if (pointIndex <= MCCases::P7) // Input Point
     {
-      if (cellScalars->GetComponent(i, 0) <= value)
+      this->Points->GetPoint(pointIndex, x);
+      if (locator->InsertUniquePoint(x, pts[i]))
       {
-        index |= CASE_MASK[i];
+        if (outPd)
+        {
+          outPd->CopyData(inPd, this->PointIds->GetId(pointIndex), pts[i]);
+        }
+      }
+    }
+    else // Mid-Edge Point
+    {
+      const auto& edgePoints = edgeVertices[pointIndex - MCCases::EA];
+      uint8_t point1Index = edgePoints[0];
+      uint8_t point2Index = edgePoints[1];
+      double point1ToPoint2 = grdDiffs[point2Index] - grdDiffs[point1Index];
+      if (point1ToPoint2 < 0)
+      {
+        std::swap(point1Index, point2Index);
+        point1ToPoint2 = -point1ToPoint2;
+      }
+      const double point1ToIso = 0.0 - grdDiffs[point1Index];
+      const double t = point1ToPoint2 != 0 ? point1ToIso / point1ToPoint2 : 0;
+      this->Points->GetPoint(point1Index, x1);
+      this->Points->GetPoint(point2Index, x2);
+
+      for (int j = 0; j < 3; j++)
+      {
+        x[j] = x1[j] + t * (x2[j] - x1[j]);
+      }
+
+      if (locator->InsertUniquePoint(x, pts[i]))
+      {
+        if (outPd)
+        {
+          vtkIdType pointIndex1 = this->PointIds->GetId(point1Index);
+          vtkIdType pointIndex2 = this->PointIds->GetId(point2Index);
+          outPd->InterpolateEdge(inPd, pts[i], pointIndex1, pointIndex2, t);
+        }
       }
     }
   }
-  else
+  // check for degenerate output
+  if (numberOfCellPoints == 3) // i.e., a triangle
   {
-    for (i = 0, index = 0; i < 3; i++)
-    {
-      if (cellScalars->GetComponent(i, 0) > value)
-      {
-        index |= CASE_MASK[i];
-      }
-    }
-  }
-
-  // Select the case based on the index and get the list of edges for this case
-  triangleCase = triangleCases + index;
-  edge = triangleCase->edges;
-
-  // generate each triangle
-  for (; edge[0] > -1; edge += 3)
-  {
-    for (i = 0; i < 3; i++) // insert triangle
-    {
-      // vertex exists, and need not be interpolated
-      if (edge[i] >= 100)
-      {
-        vertexId = edge[i] - 100;
-        this->Points->GetPoint(vertexId, x);
-        if (locator->InsertUniquePoint(x, pts[i]))
-        {
-          outPd->CopyData(inPd, this->PointIds->GetId(vertexId), pts[i]);
-        }
-      }
-
-      else // new vertex, interpolate
-      {
-        vert = edges[edge[i]];
-
-        // calculate a preferred interpolation direction
-        deltaScalar =
-          (cellScalars->GetComponent(vert[1], 0) - cellScalars->GetComponent(vert[0], 0));
-        if (deltaScalar > 0)
-        {
-          e1 = vert[0];
-          e2 = vert[1];
-        }
-        else
-        {
-          e1 = vert[1];
-          e2 = vert[0];
-          deltaScalar = -deltaScalar;
-        }
-
-        // linear interpolation
-        if (deltaScalar == 0.0)
-        {
-          t = 0.0;
-        }
-        else
-        {
-          t = (value - cellScalars->GetComponent(e1, 0)) / deltaScalar;
-        }
-
-        this->Points->GetPoint(e1, x1);
-        this->Points->GetPoint(e2, x2);
-
-        for (int j = 0; j < 3; j++)
-        {
-          x[j] = x1[j] + t * (x2[j] - x1[j]);
-        }
-        if (locator->InsertUniquePoint(x, pts[i]))
-        {
-          vtkIdType p1 = this->PointIds->GetId(e1);
-          vtkIdType p2 = this->PointIds->GetId(e2);
-          outPd->InterpolateEdge(inPd, pts[i], p1, p2, t);
-        }
-      }
-    }
-    // check for degenerate tri's
     if (pts[0] == pts[1] || pts[0] == pts[2] || pts[1] == pts[2])
     {
-      continue;
+      return;
     }
-
-    newCellId = tris->InsertNextCell(3, pts);
-    outCd->CopyData(inCd, cellId, newCellId);
   }
+  else // a quad
+  {
+    if ((pts[0] == pts[3] && pts[1] == pts[2]) || (pts[0] == pts[1] && pts[3] == pts[2]))
+    {
+      return;
+    }
+  }
+  const vtkIdType newCellId = polys->InsertNextCell(numberOfCellPoints, pts);
+  outCd->CopyData(inCd, cellId, newCellId);
 }
 
 //------------------------------------------------------------------------------
@@ -1150,7 +1081,7 @@ int CoplanarTrianglesIntersect(const double p1[2], const double q1[2], const dou
     std::swap(q2, r2);
   }
 
-  // Next, we compute the orientation of p1 w.r.t. the edges that comprise T2
+  // Next, we compute the orientation of p1 w.r.t. the Edges that comprise T2
   int p1Orientation[3] = { Orientation(p2, q2, p1), Orientation(q2, r2, p1),
     Orientation(r2, p2, p1) };
 
@@ -1691,14 +1622,9 @@ void vtkTriangle::ComputeQuadric(
 }
 
 //------------------------------------------------------------------------------
-static double vtkTriangleCellPCoords[9] = {
-  0.0, 0.0, 0.0, //
-  1.0, 0.0, 0.0, //
-  0.0, 1.0, 0.0  //
-};
 double* vtkTriangle::GetParametricCoords()
 {
-  return vtkTriangleCellPCoords;
+  return ParametricCoords;
 }
 
 //------------------------------------------------------------------------------

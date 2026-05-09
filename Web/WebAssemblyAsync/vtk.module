@@ -35,7 +35,9 @@ OPTIONAL_DEPENDS
   VTK::RenderingUI
   VTK::RenderingVolume
   VTK::RenderingVolumeOpenGL2
+  VTK::RenderingVR
   VTK::RenderingWebGPU
+  VTK::RenderingWebXR
   VTK::ViewsCore
   VTK::ViewsContext2D
   VTK::ViewsInfovis

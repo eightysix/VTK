@@ -107,8 +107,7 @@ constexpr vtkIdType checkedValueIdx = checkedTupleIdx * strided::nbOfComponents 
  */
 bool TestGenericDataArrayAPI()
 {
-  std::vector<float> localBuffer = buffer::arrayBuffer();
-  const std::vector<float> initialValues = localBuffer;
+  const std::vector<float> localBuffer = buffer::arrayBuffer();
 
   vtkNew<vtkStridedArray<float>> stridedArray;
   stridedArray->SetNumberOfComponents(strided::nbOfComponents);
@@ -124,17 +123,17 @@ bool TestGenericDataArrayAPI()
   if (setVal == localBuffer[buffer::checkedBufferIdx])
   {
     std::cerr << "SetValue should not write in read-only array. Has " << setVal << " instead of "
-              << initialValues[buffer::checkedBufferIdx] << "\n";
+              << localBuffer[buffer::checkedBufferIdx] << "\n";
     buffer::printArray(localBuffer);
     return false;
   }
 
   // Test GetValue
   const float getVal = stridedArray->GetValue(strided::checkedValueIdx);
-  if (getVal != initialValues[buffer::checkedBufferIdx])
+  if (getVal != localBuffer[buffer::checkedBufferIdx])
   {
-    std::cerr << "Wrong GetValue result " << getVal << " "
-              << initialValues[buffer::checkedBufferIdx] << "\n";
+    std::cerr << "Wrong GetValue result " << getVal << " " << localBuffer[buffer::checkedBufferIdx]
+              << "\n";
     return false;
   }
 
@@ -190,7 +189,7 @@ bool TestGenericDataArrayAPI()
 bool TestMemoryAllocations()
 {
   {
-    std::vector<float> localBuffer = buffer::arrayBuffer();
+    const std::vector<float> localBuffer = buffer::arrayBuffer();
     vtkNew<vtkStridedArray<float>> stridedArray;
     stridedArray->SetNumberOfComponents(strided::nbOfComponents);
     stridedArray->SetNumberOfTuples(strided::nbOfTuples);
@@ -200,18 +199,19 @@ bool TestMemoryAllocations()
     // Check no-op methods
     // ---------
     // MaxId should be -1, GetNumberOfValues == 0
-    stridedArray->Allocate(0);
+    stridedArray->Reset();
+    stridedArray->Squeeze();
     vtkIdType nextNbOfTuples = stridedArray->GetNumberOfTuples();
-    if (nextNbOfTuples != 0) // is 0 after any allocate
+    if (nextNbOfTuples != 0) // is 0 after squeezing empty array
     {
-      std::cerr << "Allocate should reset number of tuples, but still has " << nextNbOfTuples
+      std::cerr << "Reset() should reset number of tuples, but still has " << nextNbOfTuples
                 << "\n";
       return false;
     }
   }
 
   {
-    std::vector<float> localBuffer = buffer::arrayBuffer();
+    const std::vector<float> localBuffer = buffer::arrayBuffer();
     vtkNew<vtkStridedArray<float>> stridedArray;
     stridedArray->SetNumberOfComponents(strided::nbOfComponents);
     stridedArray->SetNumberOfTuples(strided::nbOfTuples);
@@ -219,20 +219,23 @@ bool TestMemoryAllocations()
       localBuffer.data(), strided::stride, strided::nbOfComponents, strided::offset);
 
     // increasing size is no-op
-    stridedArray->Resize(buffer::totalSize * 2);
+    stridedArray->ReserveTuples(buffer::totalSize * 2);
     vtkIdType nextNbOfValues = stridedArray->GetNumberOfValues();
     if (nextNbOfValues != strided::nbOfComponents * strided::nbOfTuples)
     {
-      std::cerr << "Resize should reset number of tuples, but still has " << nextNbOfValues << "\n";
+      std::cerr << "ReserveTuples should reset number of tuples, but still has " << nextNbOfValues
+                << "\n";
       return false;
     }
 
     // shrinking array. Memory is untouched but MaxId / Size are updated.
-    stridedArray->Resize(2);
+    stridedArray->SetNumberOfTuples(2);
+    stridedArray->Squeeze();
     nextNbOfValues = stridedArray->GetNumberOfValues();
     if (nextNbOfValues != 4)
     {
-      std::cerr << "Resize should reset number of tuples, but still has " << nextNbOfValues << "\n";
+      std::cerr << "ReserveTuples should reset number of tuples, but still has " << nextNbOfValues
+                << "\n";
       return false;
     }
   }
@@ -244,7 +247,7 @@ bool TestMemoryAllocations()
  */
 bool TestCopies()
 {
-  std::vector<float> localBuffer = buffer::arrayBuffer();
+  const std::vector<float> localBuffer = buffer::arrayBuffer();
   vtkNew<vtkStridedArray<float>> stridedArray;
   stridedArray->SetNumberOfComponents(strided::nbOfComponents);
   stridedArray->SetNumberOfTuples(strided::nbOfTuples);

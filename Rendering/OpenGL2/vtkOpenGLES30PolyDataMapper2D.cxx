@@ -19,6 +19,7 @@
 #include "vtkOpenGLState.h"
 #include "vtkOpenGLVertexArrayObject.h"
 #include "vtkOpenGLVertexBufferObjectGroup.h"
+#include "vtkOverrideAttribute.h"
 #include "vtkPointData.h"
 #include "vtkPolyData.h"
 #include "vtkPolyData2DFS.h"
@@ -128,6 +129,16 @@ vtkOpenGLES30PolyDataMapper2D::vtkOpenGLES30PolyDataMapper2D() = default;
 
 //------------------------------------------------------------------------------
 vtkOpenGLES30PolyDataMapper2D::~vtkOpenGLES30PolyDataMapper2D() = default;
+
+//------------------------------------------------------------------------------
+vtkOverrideAttribute* vtkOpenGLES30PolyDataMapper2D::CreateOverrideAttributes()
+{
+  auto* platformAttribute =
+    vtkOverrideAttribute::CreateAttributeChain("Platform", "Embedded", nullptr);
+  auto* renderingBackendAttribute =
+    vtkOverrideAttribute::CreateAttributeChain("RenderingBackend", "OpenGL", platformAttribute);
+  return renderingBackendAttribute;
+}
 
 //------------------------------------------------------------------------------
 void vtkOpenGLES30PolyDataMapper2D::PrintSelf(ostream& os, vtkIndent indent)
@@ -427,8 +438,8 @@ void vtkOpenGLES30PolyDataMapper2D::UpdateVBO(vtkActor2D* act, vtkViewport* view
       return;
     }
     vtkExpandVertexAttributes worker;
-    using DispatchT = vtkArrayDispatch::Dispatch2BySameValueType<vtkArrayDispatch::AllTypes>;
-    if (!DispatchT::Execute(src.Get(), dst.Get(), worker, indices, numIndices))
+    if (!vtkArrayDispatch::Dispatch2SameValueType::Execute(
+          src.Get(), dst.Get(), worker, indices, numIndices))
     {
       worker(src.Get(), dst.Get(), indices, numIndices);
     }

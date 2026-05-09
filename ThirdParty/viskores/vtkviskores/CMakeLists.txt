@@ -16,7 +16,7 @@ endif ()
 # Make sure Viskores is compiled for VTK types.
 set(Viskores_USE_DEFAULT_TYPES_FOR_VTK ON)
 set(Viskores_USE_DEFAULT_SYMBOL_VISIBILITY OFF)
-set(Viskores_USE_DOUBLE_PRECISION OFF)
+set(Viskores_USE_DOUBLE_PRECISION ON)
 set(Viskores_USE_64BIT_IDS "${VTK_USE_64BIT_IDS}")
 set(Viskores_ADD_XGC_TO_DEFAULT_TYPES_VTK OFF)
 set(Viskores_USE_DEFAULT_TYPES_FOR_ASCENT OFF)
@@ -91,7 +91,15 @@ if (UNIX)
   endif ()
 endif ()
 
+# Suppress vendored diy cache entries.
+set(enable_sanitizers 0)
+set(python 0)
+set(wrapped_mpi 0)
+
 add_subdirectory(viskores)
+
+unset(enable_sanitizers CACHE)
+
 viskores_setup_job_pool()
 
 vtk_module_add_module(VTK::vtkviskores

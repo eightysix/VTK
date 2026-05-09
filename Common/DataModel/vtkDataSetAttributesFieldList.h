@@ -92,6 +92,12 @@ public:
    */
   void UnionFieldList(vtkDataSetAttributes* dsa);
 
+  /**
+   * Generate a composite array from the provided fields that are registered
+   * so far and add them in the outputData
+   */
+  void GenerateCompositeArray(std::vector<vtkFieldData*> fields, vtkDataSetAttributes* outputData);
+
   ///@{
   /**
    * These methods can called to generate and update the output

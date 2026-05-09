@@ -1,9 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) Ken Martin, Will Schroeder, Bill Lorensen
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Hide VTK_DEPRECATED_IN_9_5_0() warnings.
-#define VTK_DEPRECATION_LEVEL 0
-
 // clang-format off
 // Includes vtkModuleNameSerDes.h.
 @_vtk_serdes_include_libraries_registrar_headers@
@@ -157,14 +154,24 @@ EMSCRIPTEN_BINDINGS(bindings)
     .function("invoke", &vtkStandaloneSession::Invoke)
 #endif
     .function("observe", &vtkStandaloneSession::Observe)
-    .function("unObserve", &vtkStandaloneSession::UnObserve);
+    .function("unObserve", &vtkStandaloneSession::UnObserve)
+    .function("unObserveAll", &vtkStandaloneSession::UnObserveAll)
+    .function("unObserveAllObjects", &vtkStandaloneSession::UnObserveAllObjects)
+    .function("getTotalBlobMemoryUsage", &vtkStandaloneSession::GetTotalBlobMemoryUsage)
+    .function(
+      "getTotalVTKDataObjectMemoryUsage", &vtkStandaloneSession::GetTotalVTKDataObjectMemoryUsage)
+    .function("printObjectToString", &vtkStandaloneSession::PrintObjectToString)
+    .function("printSceneManagerInformation", &vtkStandaloneSession::PrintSceneManagerInformation)
+    .function("setDeserializerLogVerbosity", &vtkStandaloneSession::SetDeserializerLogVerbosity)
+    .function("setInvokerLogVerbosity", &vtkStandaloneSession::SetInvokerLogVerbosity)
+    .function("setObjectManagerLogVerbosity", &vtkStandaloneSession::SetObjectManagerLogVerbosity)
+    .function("setSerializerLogVerbosity", &vtkStandaloneSession::SetSerializerLogVerbosity);
 
   /// Wrappings for the WebAssembly remoting session.
   class_<vtkRemoteSession>("vtkRemoteSession")
     .constructor(&makeRemoteSession, allow_raw_pointers())
     .function("registerState", &vtkRemoteSession::RegisterState)
     .function("unRegisterState", &vtkRemoteSession::UnRegisterState)
-    .function("getState", &vtkRemoteSession::GetState)
     .function("set", &vtkRemoteSession::Set)
     .function("get", &vtkRemoteSession::Get)
     .function("skipProperty", &vtkRemoteSession::SkipProperty)
@@ -192,6 +199,8 @@ EMSCRIPTEN_BINDINGS(bindings)
     .function("bindRenderWindow", &vtkRemoteSession::BindRenderWindow)
     .function("observe", &vtkRemoteSession::Observe)
     .function("unObserve", &vtkRemoteSession::UnObserve)
+    .function("unObserveAll", &vtkRemoteSession::UnObserveAll)
+    .function("unObserveAllObjects", &vtkRemoteSession::UnObserveAllObjects)
     .function("export", &vtkRemoteSession::Export)
     .function("import", &vtkRemoteSession::Import)
     .function("updateObjectsFromStates", &vtkRemoteSession::UpdateObjectsFromStates)
@@ -205,7 +214,9 @@ EMSCRIPTEN_BINDINGS(bindings)
     .function("setDeserializerLogVerbosity", &vtkRemoteSession::SetDeserializerLogVerbosity)
     .function("setInvokerLogVerbosity", &vtkRemoteSession::SetInvokerLogVerbosity)
     .function("setObjectManagerLogVerbosity", &vtkRemoteSession::SetObjectManagerLogVerbosity)
-    .function("setSerializerLogVerbosity", &vtkRemoteSession::SetSerializerLogVerbosity);
+    .function("setSerializerLogVerbosity", &vtkRemoteSession::SetSerializerLogVerbosity)
+    .function("startWebXR", &vtkRemoteSession::StartWebXR)
+    .function("stopWebXR", &vtkRemoteSession::StopWebXR);
 }
 
 VTK_ABI_NAMESPACE_END

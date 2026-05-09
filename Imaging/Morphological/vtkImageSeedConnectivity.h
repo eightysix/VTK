@@ -38,7 +38,7 @@ public:
    * Methods for manipulating the seed pixels.
    */
   void RemoveAllSeeds();
-  void AddSeed(int num, int* index);
+  void AddSeed(int num, VTK_FUTURE_CONST int* index);
   void AddSeed(int i0, int i1, int i2);
   void AddSeed(int i0, int i1);
   ///@}

@@ -236,7 +236,7 @@ void vtkLinearTransform::TransformPoints(vtkPoints* inPts, vtkPoints* outPts)
   // operate directly on the memory to avoid GetPoint()/SetPoint() calls.
   vtkDataArray* inArray = inPts->GetData();
   vtkDataArray* outArray = outPts->GetData();
-  outArray->WriteVoidPointer(3 * m, 3 * n);
+  outArray->SetNumberOfTuples(m + n);
 
   vtkLinearTransformPointsWorker worker;
   if (!vtkArrayDispatch::Dispatch2ByArray<vtkArrayDispatch::AOSPointArrays,
@@ -272,7 +272,7 @@ void vtkLinearTransform::TransformNormals(vtkDataArray* inNms, vtkDataArray* out
   vtkMatrix4x4::Transpose(*matrix, *matrix);
 
   // operate directly on the memory to avoid GetTuple()/SetPoint() calls.
-  outNms->WriteVoidPointer(3 * m, 3 * n);
+  outNms->SetNumberOfTuples(m + n);
 
   vtkLinearTransformNormalsWorker worker;
   if (!vtkArrayDispatch::Dispatch2ByArray<vtkArrayDispatch::AOSPointArrays,
@@ -306,7 +306,7 @@ void vtkLinearTransform::TransformVectors(vtkDataArray* inVrs, vtkDataArray* out
   this->Update();
 
   // operate directly on the memory to avoid GetTuple()/SetTuple() calls.
-  outVrs->WriteVoidPointer(3 * m, 3 * n);
+  outVrs->SetNumberOfTuples(m + n);
 
   vtkLinearTransformVectorsWorker worker;
   if (!vtkArrayDispatch::Dispatch2ByArray<vtkArrayDispatch::AOSPointArrays,

@@ -1,9 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) Ken Martin, Will Schroeder, Bill Lorensen
 // SPDX-License-Identifier: BSD-3-Clause
 
-// VTK_DEPRECATED_IN_9_5_0()
-#define VTK_DEPRECATION_LEVEL 0
-
 #include "vtkCommunicator.h"
 
 #include "vtkBoundingBox.h"
@@ -173,11 +170,7 @@ int vtkCommunicator::Send(vtkDataObject* data, int remoteHandle, int tag)
     case VTK_POINT_SET:
     case VTK_UNIFORM_GRID:
     case VTK_GENERIC_DATA_SET:
-    case VTK_HYPER_OCTREE:
     case VTK_COMPOSITE_DATA_SET:
-    case VTK_HIERARCHICAL_BOX_DATA_SET: // obsolete
-    case VTK_MULTIGROUP_DATA_SET:       // obsolete
-    case VTK_HIERARCHICAL_DATA_SET:     // obsolete
     default:
       vtkWarningMacro(<< "Cannot send " << data->GetClassName());
       return 0;
@@ -276,7 +269,8 @@ int vtkCommunicator::Send(vtkDataArray* data, int remoteHandle, int tag)
   }
 
   // now send the raw array
-  this->SendVoidArray(data->GetVoidPointer(0), size, type, remoteHandle, tag);
+  auto aos = data->ToAOSDataArray(); // NOLINTNEXTLINE(bugprone-unsafe-functions)
+  this->SendVoidArray(aos->GetVoidPointer(0), size, type, remoteHandle, tag);
   return 1;
 }
 
@@ -367,11 +361,7 @@ int vtkCommunicator::ReceiveDataObject(vtkDataObject* data, int remoteHandle, in
     case VTK_POINT_SET:
     case VTK_UNIFORM_GRID:
     case VTK_GENERIC_DATA_SET:
-    case VTK_HYPER_OCTREE:
     case VTK_COMPOSITE_DATA_SET:
-    case VTK_HIERARCHICAL_BOX_DATA_SET: // obsolete.
-    case VTK_MULTIGROUP_DATA_SET:       // obsolete.
-    case VTK_HIERARCHICAL_DATA_SET:     // obsolete.
     default:
       vtkWarningMacro(<< "Cannot receive "
                       << vtkDataObjectTypes::GetClassNameFromTypeId(data_type));
@@ -492,8 +482,12 @@ int vtkCommunicator::Receive(vtkDataArray* data, int remoteHandle, int tag)
   }
 
   // now receive the raw array.
+  if (!data->HasStandardMemoryLayout())
+  {
+    vtkErrorMacro("Receive only works with data arrays with standard memory layout.");
+    return 0;
+  } // NOLINTNEXTLINE(bugprone-unsafe-functions)
   this->ReceiveVoidArray(data->GetVoidPointer(0), size, type, remoteHandle, tag);
-
   return 1;
 }
 
@@ -501,11 +495,9 @@ int vtkCommunicator::Receive(vtkDataArray* data, int remoteHandle, int tag)
 int vtkCommunicator::MarshalDataObject(vtkDataObject* object, vtkCharArray* buffer)
 {
   buffer->Initialize();
-  buffer->SetNumberOfComponents(1);
 
   if (object == nullptr)
   {
-    buffer->SetNumberOfTuples(0);
     return 1;
   }
 
@@ -801,6 +793,63 @@ void vtkCommunicator::Barrier()
 }
 
 //------------------------------------------------------------------------------
+int vtkCommunicator::AllToAllVVoidArray(const void* sendBuffer, const int* sendCounts,
+  const int* sendOffsets, void* recvBuffer, const int* recvCounts, const int* recvOffsets, int type)
+{
+  int result = 1;
+
+  int typeSize = 1;
+  switch (type)
+  {
+    vtkTemplateMacro(typeSize = sizeof(VTK_TT));
+  }
+
+  for (int pid = 0; pid < this->NumberOfProcesses; ++pid)
+  {
+    if (pid != this->LocalProcessId)
+    {
+      // Sending to other processes
+      if (sendCounts[pid] > 0)
+      {
+        result &=
+          this->SendVoidArray((void*)((const char*)(sendBuffer) + typeSize * sendOffsets[pid]),
+            sendCounts[pid], type, pid, ALL_TO_ALLV_TAG);
+      }
+    }
+    else
+    {
+      // Receiving from other processes
+      for (int spid = 0; spid < this->NumberOfProcesses; ++spid)
+      {
+        if (recvCounts[spid] > 0)
+        {
+          if (spid != this->LocalProcessId)
+          {
+            result &= this->ReceiveVoidArray(
+              (void*)((const char*)(recvBuffer) + typeSize * recvOffsets[spid]), recvCounts[spid],
+              type, spid, ALL_TO_ALLV_TAG);
+          }
+          else
+          {
+            // To receive the data from our process ID, we just have to copy what we sent
+            if (recvCounts[spid] != sendCounts[spid])
+            {
+              return false;
+            }
+
+            memcpy((void*)((const char*)(recvBuffer) + typeSize * recvOffsets[spid]),
+              (void*)((const char*)(sendBuffer) + typeSize * sendOffsets[spid]),
+              typeSize * sendCounts[spid]);
+          }
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+//------------------------------------------------------------------------------
 int vtkCommunicator::BroadcastVoidArray(void* data, vtkIdType length, int type, int srcProcessId)
 {
   if (srcProcessId == this->LocalProcessId)
@@ -901,8 +950,9 @@ int vtkCommunicator::Broadcast(vtkDataArray* data, int srcProcessId)
     if (!this->Broadcast(name, nameLength, srcProcessId))
       return 0;
   }
-  if (!this->BroadcastVoidArray(
-        data->GetVoidPointer(0), numTuples * numComponents, data->GetDataType(), srcProcessId))
+  auto aos = data->ToAOSDataArray();
+  if (!this->BroadcastVoidArray( // NOLINTNEXTLINE(bugprone-unsafe-functions)
+        aos->GetVoidPointer(0), numTuples * numComponents, data->GetDataType(), srcProcessId))
     return 0;
 
   // Cleanup
@@ -953,7 +1003,8 @@ int vtkCommunicator::GatherVoidArray(
 int vtkCommunicator::Gather(vtkDataArray* sendBuffer, vtkDataArray* recvBuffer, int destProcessId)
 {
   int type = sendBuffer->GetDataType();
-  const void* sb = sendBuffer->GetVoidPointer(0);
+  auto sbAOS = sendBuffer->ToAOSDataArray();
+  const void* sb = sbAOS->GetVoidPointer(0); // NOLINT(bugprone-unsafe-functions)
   void* rb = nullptr;
   int numComponents = sendBuffer->GetNumberOfComponents();
   vtkIdType numTuples = sendBuffer->GetNumberOfTuples();
@@ -966,7 +1017,12 @@ int vtkCommunicator::Gather(vtkDataArray* sendBuffer, vtkDataArray* recvBuffer, 
     }
     recvBuffer->SetNumberOfComponents(numComponents);
     recvBuffer->SetNumberOfTuples(numTuples * this->NumberOfProcesses);
-    rb = recvBuffer->GetVoidPointer(0);
+    if (!recvBuffer->HasStandardMemoryLayout())
+    {
+      vtkErrorMacro("Gather only works with data arrays with standard memory layout.");
+      return 0;
+    }
+    rb = recvBuffer->GetVoidPointer(0); // NOLINT(bugprone-unsafe-functions)
   }
   return this->GatherVoidArray(sb, rb, numComponents * numTuples, type, destProcessId);
 }
@@ -1113,6 +1169,11 @@ int vtkCommunicator::AllGather(
 int vtkCommunicator::GatherV(vtkDataArray* sendBuffer, vtkDataArray* recvBuffer,
   vtkSmartPointer<vtkDataArray>* recvBuffers, int destProcessId)
 {
+  if (!recvBuffer->HasStandardMemoryLayout())
+  {
+    vtkErrorMacro("GatherV only works with data arrays with standard memory layout.");
+    return 0;
+  }
   vtkNew<vtkIdTypeArray> recvLengths;
   vtkNew<vtkIdTypeArray> offsets;
   int retValue = this->GatherV(sendBuffer, recvBuffer, recvLengths, offsets, destProcessId);
@@ -1122,7 +1183,8 @@ int vtkCommunicator::GatherV(vtkDataArray* sendBuffer, vtkDataArray* recvBuffer,
     for (int i = 0; i < this->NumberOfProcesses; ++i)
     {
       recvBuffers[i]->SetNumberOfComponents(numComponents);
-      recvBuffers[i]->SetVoidArray(static_cast<unsigned char*>(recvBuffer->GetVoidPointer(0)) +
+      recvBuffers[i]->SetVoidArray( // NOLINTNEXTLINE(bugprone-unsafe-functions)
+        static_cast<unsigned char*>(recvBuffer->GetVoidPointer(0)) +
           offsets->GetValue(i) * recvBuffer->GetElementComponentSize(),
         recvLengths->GetValue(i) * recvBuffer->GetElementComponentSize(), 1);
     }
@@ -1134,6 +1196,11 @@ int vtkCommunicator::GatherV(vtkDataArray* sendBuffer, vtkDataArray* recvBuffer,
 int vtkCommunicator::AllGatherV(
   vtkDataArray* sendBuffer, vtkDataArray* recvBuffer, vtkSmartPointer<vtkDataArray>* recvBuffers)
 {
+  if (!recvBuffer->HasStandardMemoryLayout())
+  {
+    vtkErrorMacro("AllGatherV only works with data arrays with standard memory layout.");
+    return 0;
+  }
   vtkNew<vtkIdTypeArray> recvLengths;
   vtkNew<vtkIdTypeArray> offsets;
   int retValue = this->AllGatherV(sendBuffer, recvBuffer, recvLengths, offsets);
@@ -1141,7 +1208,8 @@ int vtkCommunicator::AllGatherV(
   for (int i = 0; i < this->NumberOfProcesses; ++i)
   {
     recvBuffers[i]->SetNumberOfComponents(numComponents);
-    recvBuffers[i]->SetVoidArray(static_cast<unsigned char*>(recvBuffer->GetVoidPointer(0)) +
+    recvBuffers[i]->SetVoidArray( // NOLINTNEXTLINE(bugprone-unsafe-functions)
+      static_cast<unsigned char*>(recvBuffer->GetVoidPointer(0)) +
         offsets->GetValue(i) * recvBuffer->GetElementComponentSize(),
       recvLengths->GetValue(i) * recvBuffer->GetElementComponentSize(), 1);
   }
@@ -1199,11 +1267,7 @@ int vtkCommunicator::GatherV(
     case VTK_POINT_SET:
     case VTK_UNIFORM_GRID:
     case VTK_GENERIC_DATA_SET:
-    case VTK_HYPER_OCTREE:
     case VTK_COMPOSITE_DATA_SET:
-    case VTK_HIERARCHICAL_BOX_DATA_SET: // obsolete
-    case VTK_MULTIGROUP_DATA_SET:       // obsolete
-    case VTK_HIERARCHICAL_DATA_SET:     // obsolete
     default:
       vtkErrorMacro(<< "Cannot gather " << sendData->GetClassName());
       return 0;
@@ -1278,8 +1342,14 @@ int vtkCommunicator::GatherV(vtkDataArray* sendBuffer, vtkDataArray* recvBuffer,
     vtkErrorMacro("Send/receive buffers do not match!");
     return 0;
   }
-  return this->GatherVVoidArray(sendBuffer->GetVoidPointer(0),
-    (recvBuffer ? recvBuffer->GetVoidPointer(0) : nullptr),
+  if (recvBuffer && !recvBuffer->HasStandardMemoryLayout())
+  {
+    vtkErrorMacro("GatherV only works with data arrays with standard memory layout.");
+    return 0;
+  }
+  auto sbAOS = sendBuffer->ToAOSDataArray();
+  return this->GatherVVoidArray(sbAOS->GetVoidPointer(0),   // NOLINT(bugprone-unsafe-functions)
+    (recvBuffer ? recvBuffer->GetVoidPointer(0) : nullptr), // NOLINT(bugprone-unsafe-functions)
     (sendBuffer->GetNumberOfComponents() * sendBuffer->GetNumberOfTuples()), recvLengths, offsets,
     type, destProcessId);
 }
@@ -1381,9 +1451,15 @@ int vtkCommunicator::Scatter(vtkDataArray* sendBuffer, vtkDataArray* recvBuffer,
 {
   int type = recvBuffer->GetDataType();
   const void* sb = nullptr;
-  void* rb = recvBuffer->GetVoidPointer(0);
+  if (!recvBuffer->HasStandardMemoryLayout())
+  {
+    vtkErrorMacro("Scatter only works with data arrays with standard memory layout.");
+    return 0;
+  }
+  void* rb = recvBuffer->GetVoidPointer(0); // NOLINT(bugprone-unsafe-functions)
   int numComponents = recvBuffer->GetNumberOfComponents();
   vtkIdType numTuples = recvBuffer->GetNumberOfTuples();
+  vtkSmartPointer<vtkDataArray> sbAOS;
   if (this->LocalProcessId == srcProcessId)
   {
     if (type != sendBuffer->GetDataType())
@@ -1397,7 +1473,8 @@ int vtkCommunicator::Scatter(vtkDataArray* sendBuffer, vtkDataArray* recvBuffer,
       vtkErrorMacro(<< "Send buffer not large enough for requested data.");
       return 0;
     }
-    sb = sendBuffer->GetVoidPointer(0);
+    sbAOS = sendBuffer->ToAOSDataArray();
+    sb = sbAOS->GetVoidPointer(0); // NOLINT(bugprone-unsafe-functions)
   }
   return this->ScatterVoidArray(sb, rb, numComponents * numTuples, type, srcProcessId);
 }
@@ -1453,12 +1530,18 @@ int vtkCommunicator::AllGather(vtkDataArray* sendBuffer, vtkDataArray* recvBuffe
     vtkErrorMacro(<< "Send and receive types do not match.");
     return 0;
   }
+  if (!recvBuffer->HasStandardMemoryLayout())
+  {
+    vtkErrorMacro("AllGather only works with data arrays with standard memory layout.");
+    return 0;
+  }
   int numComponents = sendBuffer->GetNumberOfComponents();
   vtkIdType numTuples = sendBuffer->GetNumberOfTuples();
   recvBuffer->SetNumberOfComponents(numComponents);
   recvBuffer->SetNumberOfTuples(numTuples * this->NumberOfProcesses);
-  return this->AllGatherVoidArray(
-    sendBuffer->GetVoidPointer(0), recvBuffer->GetVoidPointer(0), numComponents * numTuples, type);
+  auto sbAOS = sendBuffer->ToAOSDataArray();
+  return this->AllGatherVoidArray( // NOLINTNEXTLINE(bugprone-unsafe-functions)
+    sbAOS->GetVoidPointer(0), recvBuffer->GetVoidPointer(0), numComponents * numTuples, type);
 }
 
 //------------------------------------------------------------------------------
@@ -1489,7 +1572,14 @@ int vtkCommunicator::AllGatherV(
     vtkErrorMacro("Send/receive buffers do not match!");
     return 0;
   }
-  return this->AllGatherVVoidArray(sendBuffer->GetVoidPointer(0), recvBuffer->GetVoidPointer(0),
+  if (!recvBuffer->HasStandardMemoryLayout())
+  {
+    vtkErrorMacro("AllGatherV only works with data arrays with standard memory layout.");
+    return 0;
+  }
+  auto sbAOS = sendBuffer->ToAOSDataArray();
+  // NOLINTNEXTLINE(bugprone-unsafe-functions)
+  return this->AllGatherVVoidArray(sbAOS->GetVoidPointer(0), recvBuffer->GetVoidPointer(0),
     (sendBuffer->GetNumberOfComponents() * sendBuffer->GetNumberOfTuples()), recvLengths, offsets,
     type);
 }
@@ -1610,8 +1700,14 @@ int vtkCommunicator::Reduce(
   }
   recvBuffer->SetNumberOfComponents(components);
   recvBuffer->SetNumberOfTuples(tuples);
-
-  return this->ReduceVoidArray(sendBuffer->GetVoidPointer(0), recvBuffer->GetVoidPointer(0),
+  if (!recvBuffer->HasStandardMemoryLayout())
+  {
+    vtkErrorMacro("Reduce only works with data arrays with standard memory layout.");
+    return 0;
+  }
+  auto sbAOS = sendBuffer->ToAOSDataArray();
+  // NOLINTNEXTLINE(bugprone-unsafe-functions)
+  return this->ReduceVoidArray(sbAOS->GetVoidPointer(0), recvBuffer->GetVoidPointer(0),
     components * tuples, type, operation, destProcessId);
 }
 
@@ -1630,8 +1726,14 @@ int vtkCommunicator::Reduce(
   }
   recvBuffer->SetNumberOfComponents(components);
   recvBuffer->SetNumberOfTuples(tuples);
-
-  return this->ReduceVoidArray(sendBuffer->GetVoidPointer(0), recvBuffer->GetVoidPointer(0),
+  if (!recvBuffer->HasStandardMemoryLayout())
+  {
+    vtkErrorMacro("Reduce only works with data arrays with standard memory layout.");
+    return 0;
+  }
+  auto sbAOS = sendBuffer->ToAOSDataArray();
+  // NOLINTNEXTLINE(bugprone-unsafe-functions)
+  return this->ReduceVoidArray(sbAOS->GetVoidPointer(0), recvBuffer->GetVoidPointer(0),
     components * tuples, type, operation, destProcessId);
 }
 
@@ -1672,8 +1774,14 @@ int vtkCommunicator::AllReduce(vtkDataArray* sendBuffer, vtkDataArray* recvBuffe
   recvBuffer->SetNumberOfComponents(components);
   recvBuffer->SetNumberOfTuples(tuples);
 
-  return this->AllReduceVoidArray(sendBuffer->GetVoidPointer(0), recvBuffer->GetVoidPointer(0),
-    components * tuples, type, operation);
+  if (!recvBuffer->HasStandardMemoryLayout())
+  {
+    vtkErrorMacro("AllReduce only works with data arrays with standard memory layout.");
+    return 0;
+  }
+  auto sbAOS = sendBuffer->ToAOSDataArray();
+  return this->AllReduceVoidArray( // NOLINTNEXTLINE(bugprone-unsafe-functions)
+    sbAOS->GetVoidPointer(0), recvBuffer->GetVoidPointer(0), components * tuples, type, operation);
 }
 
 //------------------------------------------------------------------------------
@@ -1691,9 +1799,14 @@ int vtkCommunicator::AllReduce(
   }
   recvBuffer->SetNumberOfComponents(components);
   recvBuffer->SetNumberOfTuples(tuples);
-
-  return this->AllReduceVoidArray(sendBuffer->GetVoidPointer(0), recvBuffer->GetVoidPointer(0),
-    components * tuples, type, operation);
+  if (!recvBuffer->HasStandardMemoryLayout())
+  {
+    vtkErrorMacro("AllReduce only works with data arrays with standard memory layout.");
+    return 0;
+  }
+  auto sbAOS = sendBuffer->ToAOSDataArray();
+  return this->AllReduceVoidArray( // NOLINTNEXTLINE(bugprone-unsafe-functions)
+    sbAOS->GetVoidPointer(0), recvBuffer->GetVoidPointer(0), components * tuples, type, operation);
 }
 
 //------------------------------------------------------------------------------

@@ -15,6 +15,7 @@
 #include "vtkNew.h"               // for vtkNew
 #include "vtkRenderingVRModule.h" // For export macro
 #include "vtkSmartPointer.h"      // for vtkSmartPointer
+#include "vtkWrappingHints.h"     // For VTK_MARSHALAUTO
 
 #include <map>    // for std::map
 #include <vector> // for std::vector
@@ -32,7 +33,7 @@ class vtkVRHardwarePicker;
 class vtkVRMenuRepresentation;
 class vtkVRMenuWidget;
 
-class VTKRENDERINGVR_EXPORT vtkVRInteractorStyle : public vtkInteractorStyle3D
+class VTKRENDERINGVR_EXPORT VTK_MARSHALAUTO vtkVRInteractorStyle : public vtkInteractorStyle3D
 {
 public:
   vtkTypeMacro(vtkVRInteractorStyle, vtkInteractorStyle3D);

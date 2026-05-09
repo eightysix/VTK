@@ -1327,7 +1327,7 @@ int vtkEnSightGoldBinaryReader::ReadMeasuredGeometryFile(
   xCoords = new float[this->NumberOfMeasuredPoints];
   yCoords = new float[this->NumberOfMeasuredPoints];
   zCoords = new float[this->NumberOfMeasuredPoints];
-  points->Allocate(this->NumberOfMeasuredPoints);
+  points->Reserve(this->NumberOfMeasuredPoints);
   pd->AllocateEstimate(this->NumberOfMeasuredPoints, 1);
 
   // Extract the array of point indices. Note EnSight Manual v8.2 (pp. 559,
@@ -1931,7 +1931,7 @@ int vtkEnSightGoldBinaryReader::CreateUnstructuredGridOutput(
       vtkPoints* points = vtkPoints::New();
       vtkDebugMacro("num. points: " << numPts);
 
-      points->Allocate(numPts);
+      points->Reserve(numPts);
 
       if (this->NodeIdsListed)
       {
@@ -2825,9 +2825,6 @@ int vtkEnSightGoldBinaryReader::CreateUnstructuredGridOutput(
         this->ReadIntArray(nodeIdList.data(), numElements * 6);
       }
 
-      constexpr unsigned char penta6Map[6] = { 0, 2, 1, 3, 5, 4 };
-      constexpr unsigned char penta15Map[15] = { 0, 2, 1, 3, 5, 4, 8, 7, 6, 11, 10, 9, 12, 14, 13 };
-
       vtkIdType nodeIds[15];
       for (i = 0; i < numElements; i++)
       {
@@ -2835,7 +2832,7 @@ int vtkEnSightGoldBinaryReader::CreateUnstructuredGridOutput(
         {
           for (j = 0; j < 15; j++)
           {
-            nodeIds[penta15Map[j]] = nodeIdList[15 * i + j] - 1;
+            nodeIds[j] = nodeIdList[15 * i + j] - 1;
           }
           cellId = output->InsertNextCell(VTK_QUADRATIC_WEDGE, 15, nodeIds);
         }
@@ -2843,7 +2840,7 @@ int vtkEnSightGoldBinaryReader::CreateUnstructuredGridOutput(
         {
           for (j = 0; j < 6; j++)
           {
-            nodeIds[penta6Map[j]] = nodeIdList[6 * i + j] - 1;
+            nodeIds[j] = nodeIdList[6 * i + j] - 1;
           }
           cellId = output->InsertNextCell(VTK_WEDGE, 6, nodeIds);
         }
@@ -2968,7 +2965,7 @@ int vtkEnSightGoldBinaryReader::CreateStructuredGridOutput(
     return -1;
   }
   output->SetDimensions(dimensions);
-  points->Allocate(numPts);
+  points->Reserve(numPts);
 
   xCoords = new float[numPts];
   yCoords = new float[numPts];
@@ -3090,9 +3087,9 @@ int vtkEnSightGoldBinaryReader::CreateRectilinearGridOutput(
   }
 
   output->SetDimensions(dimensions);
-  xCoords->Allocate(dimensions[0]);
-  yCoords->Allocate(dimensions[1]);
-  zCoords->Allocate(dimensions[2]);
+  xCoords->ReserveValues(dimensions[0]);
+  yCoords->ReserveValues(dimensions[1]);
+  zCoords->ReserveValues(dimensions[2]);
 
   tempCoords = new float[dimensions[0]];
   this->ReadFloatArray(tempCoords, dimensions[0]);

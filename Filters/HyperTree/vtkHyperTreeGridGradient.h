@@ -76,7 +76,7 @@ public:
    * Set/Get the gradient computation method to use:
    * * Unlimited: virtually reffine neighbors
    * * Unstructured: compute gradient like in UG
-   * Dfault is UNLIMITED
+   * Default is UNLIMITED
    */
   vtkSetClampMacro(Mode, int, UNLIMITED, UNSTRUCTURED);
   vtkGetMacro(Mode, int);

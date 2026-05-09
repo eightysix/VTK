@@ -182,18 +182,20 @@ public:
    * Write the result to a provided ostream
    */
   void WriteToStream(ostream& out, vtkDataObject* in);
+
   /**
    * This is used to read texture_uri fields that contain
    * a list of texture paths
    * @see vtkCityGMLReader
    */
+  VTK_DEPRECATED_IN_9_6_0("Use vtkPolyDataMaterial::GetField() instead.")
   static std::vector<std::string> GetFieldAsStringVector(vtkDataObject* obj, const char* name);
 
 protected:
   vtkGLTFWriter();
   ~vtkGLTFWriter() override;
 
-  void WriteData() override;
+  bool WriteDataAndReturn() override;
   int FillInputPortInformation(int port, vtkInformation* info) override;
   void WriteToStreamMultiBlock(ostream& out, vtkMultiBlockDataSet* in);
 

@@ -6,8 +6,8 @@
 #include "vtkAOSDataArrayTemplate.h"
 #include "vtkDataArray.h"
 #include "vtkFloatArray.h"
+#include "vtkNew.h"
 #include "vtkSOADataArrayTemplate.h"
-#include "vtkScaledSOADataArrayTemplate.h"
 #include "vtkSmartPointer.h"
 
 #include <algorithm>
@@ -1351,24 +1351,6 @@ struct UnitTestEdgeCases
 
     std::cerr << "AOS<float> <--> SOA<int>\n";
     DispatchValueCompat<vtkAOSDataArrayTemplate<float>, vtkSOADataArrayTemplate<int>>();
-
-    std::cerr << "ScaleSOA<float> <--> AOS<float>\n";
-    DispatchValueCompat<vtkScaledSOADataArrayTemplate<float>, vtkAOSDataArrayTemplate<float>>();
-
-    std::cerr << "AOS<float> <--> ScaleSOA<float>\n";
-    DispatchValueCompat<vtkAOSDataArrayTemplate<float>, vtkScaledSOADataArrayTemplate<float>>();
-
-    std::cerr << "ScaleSOA<double> <--> AOS<float>\n";
-    DispatchValueCompat<vtkScaledSOADataArrayTemplate<double>, vtkAOSDataArrayTemplate<float>>();
-
-    std::cerr << "AOS<float> <--> ScaleSOA<double>\n";
-    DispatchValueCompat<vtkAOSDataArrayTemplate<float>, vtkScaledSOADataArrayTemplate<double>>();
-
-    std::cerr << "ScaleSOA<int> <--> AOS<float>\n";
-    DispatchValueCompat<vtkScaledSOADataArrayTemplate<int>, vtkAOSDataArrayTemplate<float>>();
-
-    std::cerr << "AOS<float> <--> ScaleSOA<int>\n";
-    DispatchValueCompat<vtkAOSDataArrayTemplate<float>, vtkScaledSOADataArrayTemplate<int>>();
   }
 
   static void TestSpecializations()
@@ -1776,21 +1758,11 @@ public:
 
 protected:
   vtkNew<vtkBuffer<ValueT>> Buffer;
-  bool AllocateTuples(vtkIdType numTuples)
-  {
-    vtkIdType numValues = numTuples * this->GetNumberOfComponents();
-    if (this->Buffer->Allocate(numValues))
-    {
-      this->Size = this->Buffer->GetSize();
-      return true;
-    }
-    return false;
-  }
   bool ReallocateTuples(vtkIdType numTuples)
   {
     if (this->Buffer->Reallocate(numTuples * this->GetNumberOfComponents()))
     {
-      this->Size = this->Buffer->GetSize();
+      this->Capacity = this->Buffer->GetSize();
       return true;
     }
     return false;
@@ -1805,8 +1777,6 @@ int TestDataArrayValueRange(int, char*[])
   RunTestsForArray<vtkAOSDataArrayTemplate<float>>();
   std::cerr << "SOA:\n";
   RunTestsForArray<vtkSOADataArrayTemplate<float>>();
-  std::cerr << "ScaleSOA:\n";
-  RunTestsForArray<vtkScaledSOADataArrayTemplate<float>>();
   std::cerr << "vtkFloatArray:\n";
   RunTestsForArray<vtkFloatArray>();
   std::cerr << "MockDataArray<vtkTypeInt32>:\n";

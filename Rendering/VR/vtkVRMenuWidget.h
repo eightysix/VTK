@@ -13,13 +13,14 @@
 
 #include "vtkAbstractWidget.h"
 #include "vtkRenderingVRModule.h" // For export macro
+#include "vtkWrappingHints.h"     // For VTK_MARSHALAUTO
 #include <deque>                  // for ivar
 
 VTK_ABI_NAMESPACE_BEGIN
 class vtkEventData;
 class vtkVRMenuRepresentation;
 
-class VTKRENDERINGVR_EXPORT vtkVRMenuWidget : public vtkAbstractWidget
+class VTKRENDERINGVR_EXPORT VTK_MARSHALAUTO vtkVRMenuWidget : public vtkAbstractWidget
 {
 public:
   /**
