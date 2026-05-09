@@ -45,4 +45,7 @@ cmake --build build -j8
 echo "Step 5b: Copying ObjectFactory header into framework..."
 cp build/CMakeExternals/Build/vtk-ios-device-arm64/Rendering/OpenGL2/vtkRenderingOpenGL2ObjectFactory.h build/frameworks/vtk.framework/Headers/
 
+echo "Step 5c: Copying Info.plist into framework..."
+cp Info.plist build/frameworks/vtk.framework/Info.plist
+
 echo "Done!"
