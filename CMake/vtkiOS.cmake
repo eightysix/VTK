@@ -98,7 +98,6 @@ endif()
 
 # expose some module options
 set(module_options
-  #DICOM
   FiltersModeling
   FiltersSources
   ImagingGeneral
@@ -143,11 +142,6 @@ foreach (module IN LISTS module_options)
   endif ()
 endforeach ()
 
-# XXX(FIXME): DICOM has not been added back into the main build yet.
-if (FALSE AND Module_vtkDICOM)
-  set(DICOM_OPTION -DModule_vtkDICOM:BOOL=ON)
-endif()
-
 # Now cross-compile VTK with custom toolchains
 set(ios_cmake_flags
   -DBUILD_SHARED_LIBS:BOOL=OFF
@@ -177,15 +171,15 @@ set(ios_cmake_flags
   -DVTK_MODULE_ENABLE_VTK_RenderingImage:STRING=${enable_option_RenderingImage}
   -DVTK_MODULE_ENABLE_VTK_RenderingVolumeOpenGL2:STRING=${enable_option_RenderingVolumeOpenGL2}
   -DVTK_MODULE_ENABLE_VTK_RenderingLOD:STRING=${enable_option_RenderingLOD}
-  ${DICOM_OPTION}
+  -DVTK_MODULE_ENABLE_VTK_IOCore:STRING=YES
+  -DModule_vtkDICOM:BOOL=ON
+  -DVTK_MODULE_ENABLE_VTK_vtkDICOM:STRING=YES
+  -DVTK_MODULE_ENABLE_VTK_DICOM:STRING=YES
+  -DVTK_MODULE_ENABLE_VTK_vtkIOSQL:STRING=YES
+  -DBUILD_DICOM_PROGRAMS:BOOL=OFF
+  -DUSE_GDCM:BOOL=ON
+  -DUSE_ITK_GDCM:BOOL=OFF
 )
-
-if (Module_vtkDICOM AND IOS_EMBED_BITCODE)
-  # libvtkzlib does not contain bitcode
-  list (APPEND ios_cmake_flags
-    -DBUILD_DICOM_PROGRAMS:BOOL=OFF
-    )
-endif()
 
 macro(crosscompile target toolchain_file)
   ExternalProject_Add(
