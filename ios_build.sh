@@ -36,6 +36,9 @@ cmake -B build -DVTK_IOS_BUILD:BOOL=ON \
     -DCMAKE_BUILD_TYPE=Release \
     -DVTK_MODULE_ENABLE_VTK_RenderingImage:BOOL=ON
 
+echo "Step 4b: Creating frameworks directory..."
+mkdir -p build/frameworks
+
 echo "Step 5: Building..."
 cmake --build build -j8
 
