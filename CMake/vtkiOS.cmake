@@ -113,7 +113,8 @@ set(module_options
   RenderingImage
   RenderingLOD
   RenderingOpenGL2
-  RenderingVolumeOpenGL2)
+  RenderingVolumeOpenGL2
+  vtkDICOM)
 
 set(IOXML_desc "Include IO/XML Module")
 set(InteractionStyle_desc "Include InteractionStyle module")
@@ -121,6 +122,7 @@ set(InteractionWidgets_desc "Include InteractionWidgets module")
 set(RenderingLOD_desc "Include LOD Rendering Support")
 set(RenderingOpenGL2_desc "Include Polygonal Rendering Support")
 set(RenderingVolumeOpenGL2_desc "Include Volume Rendering Support")
+set(vtkDICOM_desc "Include remote vtkDICOM module")
 
 set(InteractionStyle_default ON)
 set(RenderingOpenGL2_default ON)
@@ -142,16 +144,12 @@ foreach (module IN LISTS module_options)
   endif ()
 endforeach ()
 
-# XXX(FIXME): DICOM has not been added back into the main build yet.
-if (FALSE AND Module_vtkDICOM)
-  set(DICOM_OPTION -DModule_vtkDICOM:BOOL=ON)
-endif()
-
 # Now cross-compile VTK with custom toolchains
 set(ios_cmake_flags
   -DBUILD_SHARED_LIBS:BOOL=OFF
   -DVTK_BUILD_TESTING:BOOL=OFF
   -DVTK_BUILD_EXAMPLES:BOOL=${VTK_BUILD_EXAMPLES}
+  -DVTK_ENABLE_REMOTE_MODULES:BOOL=ON
   -DVTK_USE_64BIT_IDS:BOOL=OFF
   -DVTK_GROUP_ENABLE_Rendering:STRING=DONT_WANT
   -DVTK_GROUP_ENABLE_StandAlone:STRING=DONT_WANT
@@ -176,6 +174,7 @@ set(ios_cmake_flags
   -DVTK_MODULE_ENABLE_VTK_RenderingImage:STRING=${enable_option_RenderingImage}
   -DVTK_MODULE_ENABLE_VTK_RenderingVolumeOpenGL2:STRING=${enable_option_RenderingVolumeOpenGL2}
   -DVTK_MODULE_ENABLE_VTK_RenderingLOD:STRING=${enable_option_RenderingLOD}
+  -DVTK_MODULE_ENABLE_VTK_vtkDICOM:STRING=${enable_option_vtkDICOM}
 )
 
 macro(crosscompile target toolchain_file)
