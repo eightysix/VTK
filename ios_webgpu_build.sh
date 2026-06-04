@@ -6,15 +6,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build_ios"
 DAWN_INSTALL_DIR="/Users/macair/Public/VTK-Source/ci-utilities/install/dawn-v20251002.162335-ios-arm64"
 
-echo "Step 1: Removing build folder..."
-rm -rf "${BUILD_DIR}"
+if [ "$1" != "--resume" ]; then
+  echo "Step 1: Removing build folder..."
+  rm -rf "${BUILD_DIR}"
+else
+  echo "Step 1: Skipping clean (--resume), reusing existing build folder..."
+fi
 
 echo "Step 2: Running CMake..."
 cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}" -GNinja \
     -DCMAKE_SYSTEM_NAME:STRING=iOS \
     -DCMAKE_SYSTEM_PROCESSOR:STRING=arm64 \
     -DCMAKE_OSX_ARCHITECTURES:STRING=arm64 \
-    -DCMAKE_OSX_DEPLOYMENT_TARGET:STRING=15.0 \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET:STRING=16.0 \
     -DCMAKE_BUILD_TYPE:STRING=Release \
     -DAPPLE_IOS:BOOL=ON \
     -DVTK_ENABLE_WEBGPU:BOOL=ON \
