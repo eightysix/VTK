@@ -1,5 +1,8 @@
 #import "AppDelegate.h"
 
+#include <vtkAutoInit.h>
+VTK_MODULE_INIT(vtkRenderingWebGPU);
+
 #include "vtkCocoaHardwareWindow.h"
 #include "vtkNew.h"
 #include "vtkProperty.h"
