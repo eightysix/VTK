@@ -29,7 +29,7 @@ set(GRIDSHIFT_FILES ${GSB_FILES} ${GTX_FILES})
 
 file(GLOB SCHEMA_FILES *.json)
 # XXX(kitware): disable proj.db generation on emscripten platform because sqlite3 cannot create output file outside the webassembly sandbox.
-if (NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+if (NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten" AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
 set(ALL_SQL_IN "${CMAKE_CURRENT_BINARY_DIR}/all.sql.in")
 if (FALSE) # XXX(kitware): install proj.db in share/proj so that test work.
   set(PROJ_DB "${CMAKE_CURRENT_BINARY_DIR}/proj.db")
