@@ -3,12 +3,13 @@
 #include <vtkAutoInit.h>
 VTK_MODULE_INIT(vtkRenderingWebGPU);
 
+#include "vtkCallbackCommand.h"
 #include "vtkCocoaHardwareWindow.h"
 #include "vtkNew.h"
 #include "vtkProperty.h"
 #include "vtkInteractorStyleMultiTouchCamera.h"
 #include "vtkRenderWindowInteractor.h"
-#include "vtkSphereSource.h"
+#include "vtkConeSource.h"
 #include "vtkWebGPUActor.h"
 #include "vtkWebGPUCamera.h"
 #include "vtkWebGPUPolyDataMapper.h"
@@ -37,11 +38,10 @@ VTK_MODULE_INIT(vtkRenderingWebGPU);
     [appMenuItem setSubmenu:appMenu];
 
     // Setup VTK scene
-    vtkNew<vtkSphereSource> sphere;
-    sphere->SetThetaResolution(32);
-    sphere->SetPhiResolution(32);
+    vtkNew<vtkConeSource> cone;
+    cone->SetResolution(128);
     vtkNew<vtkWebGPUPolyDataMapper> mapper;
-    mapper->SetInputConnection(sphere->GetOutputPort());
+    mapper->SetInputConnection(cone->GetOutputPort());
 
     vtkNew<vtkWebGPUActor> actor;
     actor->SetMapper(mapper);
