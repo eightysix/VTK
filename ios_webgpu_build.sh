@@ -99,29 +99,27 @@ cmake --build "${BUILD_DIR}" -j"$(sysctl -n hw.ncpu)"
 echo "Step 4: Installing..."
 cmake --install "${BUILD_DIR}"
 
-echo "Step 5: Creating framework (versioned bundle)..."
+echo "Step 5: Creating framework (shallow bundle for iOS/Catalyst)..."
 FRAMEWORK_DIR="${BUILD_DIR}/frameworks/vtk.framework"
-VERSION_DIR="${FRAMEWORK_DIR}/Versions/A"
-mkdir -p "${VERSION_DIR}/Resources"
-mkdir -p "${VERSION_DIR}/Headers"
+mkdir -p "${FRAMEWORK_DIR}/Headers"
 
 VTK_INCLUDE_DIR=$(find "${BUILD_DIR}/install/include" -maxdepth 1 -type d -name "vtk-*" | head -1)
 if [ -z "${VTK_INCLUDE_DIR}" ]; then
   echo "Error: Could not find VTK include directory in ${BUILD_DIR}/install/include/"
   exit 1
 fi
-cp -r "${VTK_INCLUDE_DIR}/" "${VERSION_DIR}/Headers/"
+cp -r "${VTK_INCLUDE_DIR}/" "${FRAMEWORK_DIR}/Headers/"
 
 echo "Step 5a: Copying Dawn headers..."
-cp -r "${DAWN_INSTALL_DIR}/include/webgpu" "${VERSION_DIR}/Headers/"
-cp -r "${DAWN_INSTALL_DIR}/include/dawn" "${VERSION_DIR}/Headers/"
+cp -r "${DAWN_INSTALL_DIR}/include/webgpu" "${FRAMEWORK_DIR}/Headers/"
+cp -r "${DAWN_INSTALL_DIR}/include/dawn" "${FRAMEWORK_DIR}/Headers/"
 
 echo "Step 5b: Merging static libraries..."
 LIBTOOL_INPUT=$(find "${BUILD_DIR}/install/lib" -name "*.a" | tr '\n' ' ')
-libtool -static -o "${VERSION_DIR}/vtk" ${LIBTOOL_INPUT} "${DAWN_INSTALL_DIR}/lib/libwebgpu_dawn.a"
+libtool -static -o "${FRAMEWORK_DIR}/vtk" ${LIBTOOL_INPUT} "${DAWN_INSTALL_DIR}/lib/libwebgpu_dawn.a"
 
-echo "Step 5c: Creating Info.plist..."
-cat > "${VERSION_DIR}/Resources/Info.plist" <<PLIST
+echo "Step 5c: Creating Info.plist (at root, required for shallow bundles)..."
+cat > "${FRAMEWORK_DIR}/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -151,11 +149,5 @@ cat > "${VERSION_DIR}/Resources/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
-
-echo "Step 5d: Creating symlinks..."
-ln -sfn A "${FRAMEWORK_DIR}/Versions/Current"
-ln -sfn Versions/Current/vtk "${FRAMEWORK_DIR}/vtk"
-ln -sfn Versions/Current/Resources "${FRAMEWORK_DIR}/Resources"
-ln -sfn Versions/Current/Headers "${FRAMEWORK_DIR}/Headers"
 
 echo "Done! Framework created at ${FRAMEWORK_DIR}"
