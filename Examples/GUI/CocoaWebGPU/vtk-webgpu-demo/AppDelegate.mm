@@ -4,10 +4,13 @@
 VTK_MODULE_INIT(vtkRenderingWebGPU);
 
 #include "vtkCocoaHardwareWindow.h"
+#include "vtkCocoaHardwareView.h"
+#include "vtkCocoaRenderWindowInteractor.h"
 #include "vtkNew.h"
 #include "vtkProperty.h"
 #include "vtkRenderWindowInteractor.h"
 #include "vtkSphereSource.h"
+#include "vtkInteractorStyleMultiTouchCamera.h"
 #include "vtkWebGPUActor.h"
 #include "vtkWebGPUCamera.h"
 #include "vtkWebGPUPolyDataMapper.h"
@@ -17,12 +20,36 @@ VTK_MODULE_INIT(vtkRenderingWebGPU);
 @interface AppDelegate ()
 @end
 
+@implementation vtkCocoaHardwareView (GestureForwarding)
+
+- (void)magnifyWithEvent:(NSEvent*)event {
+    vtkCocoaRenderWindowInteractor* interactor = [self getInteractor];
+    if (interactor) {
+        // vtkInteractorStyleMultiTouchCamera expects scale/pinch events.
+        // We simulate this by invoking vtkCommand::PinchEvent.
+        // This is a simplified bridge.
+        interactor->SetScale(1.0 + [event magnification]);
+        interactor->InvokeEvent(vtkCommand::PinchEvent, nullptr);
+    }
+}
+
+- (void)rotateWithEvent:(NSEvent*)event {
+    vtkCocoaRenderWindowInteractor* interactor = [self getInteractor];
+    if (interactor) {
+        interactor->SetRotation([event rotation]);
+        interactor->InvokeEvent(vtkCommand::RotateEvent, nullptr);
+    }
+}
+
+@end
+
 @implementation AppDelegate
 {
   vtkNew<vtkCocoaHardwareWindow> _hw;
   vtkNew<vtkWebGPURenderWindow> _renWin;
   vtkNew<vtkWebGPURenderer> _renderer;
   vtkNew<vtkRenderWindowInteractor> _iren;
+  vtkNew<vtkInteractorStyleMultiTouchCamera> _style;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
@@ -55,6 +82,8 @@ VTK_MODULE_INIT(vtkRenderingWebGPU);
     _renWin->SetSize(800, 600);
     _renWin->SetWindowName("vtk-webgpu-demo");
     _iren->SetRenderWindow(_renWin);
+    _iren->SetInteractorStyle(_style);
+    _iren->SetRecognizeGestures(YES);
 
     // Wire up the hardware window before Render()
     _renWin->SetHardwareWindow(_hw);
