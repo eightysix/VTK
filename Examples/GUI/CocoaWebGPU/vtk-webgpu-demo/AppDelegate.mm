@@ -6,6 +6,7 @@ VTK_MODULE_INIT(vtkRenderingWebGPU);
 #include "vtkCocoaHardwareWindow.h"
 #include "vtkNew.h"
 #include "vtkProperty.h"
+#include "vtkInteractorStyleMultiTouchCamera.h"
 #include "vtkRenderWindowInteractor.h"
 #include "vtkSphereSource.h"
 #include "vtkWebGPUActor.h"
@@ -59,6 +60,10 @@ VTK_MODULE_INIT(vtkRenderingWebGPU);
     // Wire up the hardware window before Render()
     _renWin->SetHardwareWindow(_hw);
     _hw->SetInteractor(_iren);
+
+    // Set multitouch interactor style
+    vtkNew<vtkInteractorStyleMultiTouchCamera> style;
+    _iren->SetInteractorStyle(style);
 
     // Initialize the interactor
     _iren->Initialize();
