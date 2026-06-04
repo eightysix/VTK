@@ -1,9 +1,25 @@
 #import "AppDelegate.h"
 
+#include "vtkActor.h"
+#include "vtkCocoaHardwareWindow.h"
+#include "vtkNew.h"
+#include "vtkProperty.h"
+#include "vtkRenderWindowInteractor.h"
+#include "vtkSphereSource.h"
+#include "vtkWebGPUPolyDataMapper.h"
+#include "vtkWebGPURenderer.h"
+#include "vtkWebGPURenderWindow.h"
+
 @interface AppDelegate ()
 @end
 
 @implementation AppDelegate
+{
+  vtkNew<vtkCocoaHardwareWindow> _hw;
+  vtkNew<vtkWebGPURenderWindow> _renWin;
+  vtkNew<vtkWebGPURenderer> _renderer;
+  vtkNew<vtkRenderWindowInteractor> _iren;
+}
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
     NSMenu *menubar = [NSMenu new];
@@ -15,25 +31,31 @@
     [appMenu addItemWithTitle:@"Quit vtk-webgpu-demo" action:@selector(terminate:) keyEquivalent:@"q"];
     [appMenuItem setSubmenu:appMenu];
 
-    NSRect frame = NSMakeRect(0, 0, 800, 600);
-    self.window = [[NSWindow alloc] initWithContentRect:frame
-                                              styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
-                                                backing:NSBackingStoreBuffered
-                                                  defer:NO];
-    [self.window setTitle:@"vtk-webgpu-demo"];
-    [self.window center];
+    // Setup VTK scene
+    vtkNew<vtkSphereSource> sphere;
+    vtkNew<vtkWebGPUPolyDataMapper> mapper;
+    mapper->SetInputConnection(sphere->GetOutputPort());
+    vtkNew<vtkActor> actor;
+    actor->SetMapper(mapper);
+    actor->GetProperty()->SetColor(0.2, 0.6, 1.0);
+    _renderer->AddActor(actor);
+    _renderer->SetBackground(0.1, 0.1, 0.2);
+    _renWin->AddRenderer(_renderer);
+    _renWin->SetSize(800, 600);
+    _renWin->SetWindowName("vtk-webgpu-demo");
+    _iren->SetRenderWindow(_renWin);
 
-    NSTextField *label = [[NSTextField alloc] initWithFrame:NSMakeRect(50, 280, 700, 40)];
-    [label setStringValue:@"VTK WebGPU Demo — Cocoa Test"];
-    [label setFont:[NSFont systemFontOfSize:24]];
-    [label setBezeled:NO];
-    [label setDrawsBackground:NO];
-    [label setEditable:NO];
-    [label setSelectable:NO];
-    [label setAlignment:NSTextAlignmentCenter];
-    [[self.window contentView] addSubview:label];
+    // Wire up the hardware window before Render()
+    _renWin->SetHardwareWindow(_hw);
+    _hw->SetInteractor(_iren);
 
-    [self.window makeKeyAndOrderFront:nil];
+    // Render triggers hardware window Create() -> NSWindow + vtkCocoaHardwareView
+    _renderer->ResetCamera();
+    _renWin->Render();
+
+    // Adopt the NSWindow created by vtkCocoaHardwareWindow
+    self.window = _hw->GetWindowId();
+
     [NSApp activateIgnoringOtherApps:YES];
 }
 
