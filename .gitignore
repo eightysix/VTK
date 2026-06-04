@@ -1,5 +1,6 @@
 dawn
 build
+build_ios
 buildServer.json
 
 # Do not add ExternalData module staging files
