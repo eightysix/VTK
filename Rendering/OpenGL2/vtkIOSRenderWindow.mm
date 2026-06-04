@@ -496,7 +496,7 @@ void vtkIOSRenderWindow::SetWindowInfo(const char* info)
 {
   // The parameter is an ASCII string of a decimal number representing
   // a pointer to the window. Convert it back to a pointer.
-  uptrdiff_t tmp = 0;
+  ptrdiff_t tmp = 0;
   if (info)
   {
     vtk::from_chars(info, tmp);
@@ -510,7 +510,7 @@ void vtkIOSRenderWindow::SetParentInfo(const char* info)
 {
   // The parameter is an ASCII string of a decimal number representing
   // a pointer to the window. Convert it back to a pointer.
-  uptrdiff_t tmp = 0;
+  ptrdiff_t tmp = 0;
   if (info)
   {
     vtk::from_chars(info, tmp);
