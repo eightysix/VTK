@@ -34,11 +34,6 @@ public:
   void PrintSelf(ostream& os, vtkIndent indent) override;
 
   /**
-   * Get the native iOS window object.
-   */
-  UIWindow* GetWindowId();
-
-  /**
    * Get the native iOS view object.
    */
   UIView* GetViewId();
@@ -80,10 +75,7 @@ protected:
   vtkIOSHardwareWindow();
   ~vtkIOSHardwareWindow() override;
 
-  UIWindow* WindowId = nullptr;
   UIView* ViewId = nullptr;
-
-  bool OwnsWindow = false;
 
 private:
   vtkIOSHardwareWindow(const vtkIOSHardwareWindow&) = delete;
