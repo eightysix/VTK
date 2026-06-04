@@ -60,14 +60,42 @@ VTK_MODULE_INIT(vtkRenderingWebGPU);
     _renWin->SetHardwareWindow(_hw);
     _hw->SetInteractor(_iren);
 
+    // Initialize the interactor
+    _iren->Initialize();
+
     // Render triggers hardware window Create() -> NSWindow + vtkCocoaHardwareView
     _renderer->ResetCamera();
     _renWin->Render();
 
     // Adopt the NSWindow created by vtkCocoaHardwareWindow
     self.window = _hw->GetWindowId();
+    [self.window setDelegate:self];
+
+    // Fix initial window size on Retina displays (bug in vtkCocoaHardwareWindow::Create)
+    NSRect viewRect = [self.window.contentView frame];
+    NSRect backingRect = [self.window.contentView convertRectToBacking:viewRect];
+    if (backingRect.size.width > viewRect.size.width) {
+        // We are on a Retina display, the window was created too large.
+        // Adjust the window size so the content area matches the requested pixel size.
+        CGFloat scale = backingRect.size.width / viewRect.size.width;
+        NSSize newSize = NSMakeSize(viewRect.size.width / scale, viewRect.size.height / scale);
+        [self.window setContentSize:newSize];
+    }
 
     [NSApp activateIgnoringOtherApps:YES];
+}
+
+- (void)windowDidResize:(NSNotification *)notification {
+    NSWindow *window = (NSWindow *)notification.object;
+    NSView *contentView = [window contentView];
+    // Convert points to pixels for VTK
+    NSRect backingFrame = [contentView convertRectToBacking:[contentView frame]];
+    _iren->UpdateSize(backingFrame.size.width, backingFrame.size.height);
+}
+
+- (BOOL)windowShouldClose:(NSWindow *)sender {
+    _iren->TerminateApp();
+    return YES;
 }
 
 - (void)applicationWillTerminate:(NSNotification *)aNotification {
