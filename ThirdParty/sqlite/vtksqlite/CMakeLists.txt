@@ -18,7 +18,7 @@ vtk_module_include(VTK::sqlite
   PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>")
 
-if (vtk_sqlite_build_binary AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+if (vtk_sqlite_build_binary AND NOT APPLE_IOS)
   vtk_module_add_executable(sqlitebin
     NO_INSTALL
     shell.c)
