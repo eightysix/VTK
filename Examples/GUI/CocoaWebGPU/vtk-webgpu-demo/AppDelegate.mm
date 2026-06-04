@@ -91,6 +91,7 @@ VTK_MODULE_INIT(vtkRenderingWebGPU);
     // Convert points to pixels for VTK
     NSRect backingFrame = [contentView convertRectToBacking:[contentView frame]];
     _iren->UpdateSize(backingFrame.size.width, backingFrame.size.height);
+    _renWin->Render();
 }
 
 - (BOOL)windowShouldClose:(NSWindow *)sender {
