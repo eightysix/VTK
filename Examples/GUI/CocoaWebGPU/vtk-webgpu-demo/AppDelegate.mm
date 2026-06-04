@@ -1,11 +1,12 @@
 #import "AppDelegate.h"
 
-#include "vtkActor.h"
 #include "vtkCocoaHardwareWindow.h"
 #include "vtkNew.h"
 #include "vtkProperty.h"
 #include "vtkRenderWindowInteractor.h"
 #include "vtkSphereSource.h"
+#include "vtkWebGPUActor.h"
+#include "vtkWebGPUCamera.h"
 #include "vtkWebGPUPolyDataMapper.h"
 #include "vtkWebGPURenderer.h"
 #include "vtkWebGPURenderWindow.h"
@@ -35,10 +36,15 @@
     vtkNew<vtkSphereSource> sphere;
     vtkNew<vtkWebGPUPolyDataMapper> mapper;
     mapper->SetInputConnection(sphere->GetOutputPort());
-    vtkNew<vtkActor> actor;
+
+    vtkNew<vtkWebGPUActor> actor;
     actor->SetMapper(mapper);
     actor->GetProperty()->SetColor(0.2, 0.6, 1.0);
     _renderer->AddActor(actor);
+
+    vtkNew<vtkWebGPUCamera> camera;
+    _renderer->SetActiveCamera(camera);
+
     _renderer->SetBackground(0.1, 0.1, 0.2);
     _renWin->AddRenderer(_renderer);
     _renWin->SetSize(800, 600);
