@@ -26,7 +26,12 @@
 #ifdef _WIN32
 #include "vtkWin32HardwareWindow.h"
 #elif __APPLE__
+#include <TargetConditionals.h>
+#if TARGET_OS_IOS
+#include "vtkIOSHardwareWindow.h"
+#else
 #include "vtkCocoaHardwareWindow.h"
+#endif
 #elif VTK_USE_Wayland
 #include "vtkWaylandHardwareWindow.h"
 #elif VTK_USE_X
@@ -200,6 +205,17 @@ void vtkWebGPURenderWindow::CreateSurface()
     this->Surface = this->WGPUConfiguration->GetInstance().CreateSurface(&surfDesc);
   }
 #elif defined __APPLE__
+#if TARGET_OS_IOS
+  if (auto* ioshw = vtkIOSHardwareWindow::SafeDownCast(this->HardwareWindow))
+  {
+    wgpu::SurfaceSourceMetalLayer metalSurfDesc;
+    metalSurfDesc.layer = ioshw->GetMetalLayer();
+    wgpu::SurfaceDescriptor surfDesc = {};
+    surfDesc.label = "VTK iOS surface";
+    surfDesc.nextInChain = &metalSurfDesc;
+    this->Surface = this->WGPUConfiguration->GetInstance().CreateSurface(&surfDesc);
+  }
+#else
   if (auto* cocoahw = vtkCocoaHardwareWindow::SafeDownCast(this->HardwareWindow))
   {
     wgpu::SurfaceSourceMetalLayer metalSurfDesc;
@@ -209,6 +225,7 @@ void vtkWebGPURenderWindow::CreateSurface()
     surfDesc.nextInChain = &metalSurfDesc;
     this->Surface = this->WGPUConfiguration->GetInstance().CreateSurface(&surfDesc);
   }
+#endif
 #else // Xlib
   if (auto* xlibhw = vtkXlibHardwareWindow::SafeDownCast(this->HardwareWindow))
   {

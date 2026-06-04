@@ -90,13 +90,20 @@ elseif(APPLE_IOS)
   # Add some custom overrides
   vtk_object_factory_declare(BASE vtkRenderWindowInteractor OVERRIDE
                              vtkIOSRenderWindowInteractor)
-  list(APPEND sources vtkIOSRenderWindowInteractor.mm)
-  list(APPEND headers vtkIOSRenderWindowInteractor.h)
+  vtk_object_factory_declare(BASE vtkHardwareWindow OVERRIDE
+                             vtkIOSHardwareWindow)
+  list(APPEND sources vtkIOSRenderWindowInteractor.mm
+       vtkIOSHardwareWindow.mm)
+  list(APPEND headers vtkIOSRenderWindowInteractor.h
+       vtkIOSHardwareWindow.h)
   # Set specified Objective-C++ flags, if any.
   if(VTK_REQUIRED_OBJCXX_FLAGS)
     set_source_files_properties(
       vtkIOSRenderWindowInteractor.mm PROPERTIES COMPILE_FLAGS
                                                  "${VTK_REQUIRED_OBJCXX_FLAGS}")
+    set_source_files_properties(
+      vtkIOSHardwareWindow.mm PROPERTIES COMPILE_FLAGS
+                                         "${VTK_REQUIRED_OBJCXX_FLAGS}")
   endif()
 else() # use generic
   vtk_object_factory_declare(BASE vtkRenderWindowInteractor OVERRIDE
