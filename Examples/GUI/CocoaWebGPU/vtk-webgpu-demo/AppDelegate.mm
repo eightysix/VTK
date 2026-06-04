@@ -37,6 +37,8 @@ VTK_MODULE_INIT(vtkRenderingWebGPU);
 
     // Setup VTK scene
     vtkNew<vtkSphereSource> sphere;
+    sphere->SetThetaResolution(32);
+    sphere->SetPhiResolution(32);
     vtkNew<vtkWebGPUPolyDataMapper> mapper;
     mapper->SetInputConnection(sphere->GetOutputPort());
 
