@@ -49,6 +49,7 @@
   _renWin->SetSize(self.view.bounds.size.width, self.view.bounds.size.height);
   _renWin->SetWindowName("test-vtk-webgpu");
   _iren->SetRenderWindow(_renWin);
+  _iren->SetEnableRender(false);
 
   _renWin->SetHardwareWindow(_hw);
   _hw->SetInteractor(_iren);
