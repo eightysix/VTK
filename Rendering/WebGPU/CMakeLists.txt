@@ -22,6 +22,7 @@ set(classes
   vtkWebGPUComputeTexture
   vtkWebGPUComputeTextureView
   vtkWebGPUConfiguration
+  vtkWebGPUGPUVolumeRayCastMapper
   vtkWebGPUGlyph3DMapper
   vtkWebGPUHardwareSelector
   vtkWebGPUHelpers
@@ -89,6 +90,7 @@ set(webgpu_overrides
   ImageMapper
   # NI: ImageSliceMapper
   Glyph3DMapper
+  GPUVolumeRayCastMapper
   # NI: HyperTreeGridMapper
   Light
   # NI: PointGaussianMapper
@@ -127,7 +129,8 @@ set(private_shader_files
   wgsl/vtkPolyData2DVSWGSL.wgsl
   wgsl/vtkPolyData2DFSWGSL.wgsl
   wgsl/vtkPolyDataVSWGSL.wgsl
-  wgsl/vtkPolyDataFSWGSL.wgsl)
+  wgsl/vtkPolyDataFSWGSL.wgsl
+  wgsl/vtkVolumeRayCastMapperShader.wgsl)
 
 set(public_shader_files
   Testing/Cxx/TestShaders/TestComputePassShader.wgsl

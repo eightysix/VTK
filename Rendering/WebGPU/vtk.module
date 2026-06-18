@@ -6,6 +6,7 @@ GROUPS
   Rendering
 IMPLEMENTS
   VTK::RenderingCore
+  VTK::RenderingVolume
 SPDX_LICENSE_IDENTIFIER
   BSD-3-Clause
 SPDX_COPYRIGHT_TEXT
@@ -15,6 +16,7 @@ DEPENDS
   VTK::RenderingCore
   VTK::RenderingUI
   VTK::IOImage
+  VTK::RenderingVolume
 PRIVATE_DEPENDS
   VTK::CommonDataModel
   VTK::CommonSystem
