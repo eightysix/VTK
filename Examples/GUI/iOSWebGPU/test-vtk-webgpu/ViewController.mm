@@ -13,6 +13,7 @@
 #include "vtkWebGPUPolyDataMapper.h"
 #include "vtkWebGPURenderer.h"
 #include "vtkWebGPURenderWindow.h"
+#include <string>
 
 @interface ViewController () <UIGestureRecognizerDelegate>
 {
@@ -20,13 +21,32 @@
   vtkNew<vtkWebGPURenderWindow> _renWin;
   vtkNew<vtkWebGPURenderer> _renderer;
   vtkNew<vtkRenderWindowInteractor> _iren;
+  BOOL _autoRotate;
+  NSTimer *_rotationTimer;
+  vtkNew<vtkCallbackCommand> _keyPressCallback;
+  vtkNew<vtkWebGPUActor> _coneActor;
 }
 @property (nonatomic, strong) UIPinchGestureRecognizer *pinchRecognizer;
 @property (nonatomic, strong) UIPanGestureRecognizer *panRecognizer;
 @property (nonatomic, strong) UIRotationGestureRecognizer *rotationRecognizer;
+@property (nonatomic, strong) UIButton *toggleButton;
 @end
 
 @implementation ViewController
+
+static void OnKeyPress(vtkObject *object, unsigned long, void *clientdata, void *) {
+  vtkRenderWindowInteractor *iren = vtkRenderWindowInteractor::SafeDownCast(object);
+  if (!iren) return;
+  ViewController *vc = (__bridge ViewController *)clientdata;
+  if (!vc) return;
+
+  std::string key = iren->GetKeySym();
+  if (key == "space") {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [vc toggleAutoRotation];
+    });
+  }
+}
 
 - (void)viewDidLoad {
   [super viewDidLoad];
@@ -36,10 +56,9 @@
   vtkNew<vtkWebGPUPolyDataMapper> mapper;
   mapper->SetInputConnection(cone->GetOutputPort());
 
-  vtkNew<vtkWebGPUActor> actor;
-  actor->SetMapper(mapper);
-  actor->GetProperty()->SetColor(0.2, 0.6, 1.0);
-  _renderer->AddActor(actor);
+  _coneActor->SetMapper(mapper);
+  _coneActor->GetProperty()->SetColor(0.2, 0.6, 1.0);
+  _renderer->AddActor(_coneActor);
 
   vtkNew<vtkWebGPUCamera> camera;
   _renderer->SetActiveCamera(camera);
@@ -56,6 +75,10 @@
   vtkNew<vtkInteractorStyleMultiTouchCamera> style;
   _iren->SetInteractorStyle(style);
 
+  _keyPressCallback->SetCallback(OnKeyPress);
+  _keyPressCallback->SetClientData((__bridge void *)self);
+  _iren->AddObserver(vtkCommand::KeyPressEvent, _keyPressCallback);
+
   _iren->Initialize();
 
   _renderer->ResetCamera();
@@ -68,22 +91,39 @@
     [self.view addSubview:vtkView];
     [self setupGestureRecognizersOnView:vtkView];
   }
+
+  _toggleButton = [UIButton buttonWithType:UIButtonTypeSystem];
+  [_toggleButton setTitle:@"Play" forState:UIControlStateNormal];
+  _toggleButton.titleLabel.font = [UIFont boldSystemFontOfSize:17];
+  _toggleButton.backgroundColor = [UIColor whiteColor];
+  _toggleButton.layer.cornerRadius = 22;
+  [_toggleButton setTitleColor:[UIColor blackColor] forState:UIControlStateNormal];
+  [_toggleButton addTarget:self action:@selector(toggleAutoRotation) forControlEvents:UIControlEventTouchUpInside];
+  _toggleButton.translatesAutoresizingMaskIntoConstraints = NO;
+  [self.view addSubview:_toggleButton];
+
+  [NSLayoutConstraint activateConstraints:@[
+    [_toggleButton.trailingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.trailingAnchor constant:-20],
+    [_toggleButton.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-20],
+    [_toggleButton.widthAnchor constraintEqualToConstant:80],
+    [_toggleButton.heightAnchor constraintEqualToConstant:44]
+  ]];
 }
 
 - (void)setupGestureRecognizersOnView:(UIView *)view {
   self.pinchRecognizer = [[UIPinchGestureRecognizer alloc] initWithTarget:self
-                                                                    action:@selector(handlePinch:)];
+                                                                     action:@selector(handlePinch:)];
   self.pinchRecognizer.delegate = self;
   [view addGestureRecognizer:self.pinchRecognizer];
 
   self.panRecognizer = [[UIPanGestureRecognizer alloc] initWithTarget:self
-                                                                action:@selector(handlePan:)];
+                                                                 action:@selector(handlePan:)];
   self.panRecognizer.delegate = self;
   self.panRecognizer.maximumNumberOfTouches = 1;
   [view addGestureRecognizer:self.panRecognizer];
 
   self.rotationRecognizer = [[UIRotationGestureRecognizer alloc] initWithTarget:self
-                                                                          action:@selector(handleRotation:)];
+                                                                           action:@selector(handleRotation:)];
   self.rotationRecognizer.delegate = self;
   [view addGestureRecognizer:self.rotationRecognizer];
 }
@@ -186,6 +226,29 @@
   }
 
   _renWin->Render();
+}
+
+- (void)toggleAutoRotation {
+  _autoRotate = !_autoRotate;
+  [_toggleButton setTitle:(_autoRotate ? @"Pause" : @"Play") forState:UIControlStateNormal];
+
+  if (_autoRotate) {
+    _rotationTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / 60.0
+                                                     target:self
+                                                   selector:@selector(rotateStep)
+                                                   userInfo:nil
+                                                    repeats:YES];
+  } else {
+    [_rotationTimer invalidate];
+    _rotationTimer = nil;
+  }
+}
+
+- (void)rotateStep {
+  if (_autoRotate) {
+    _coneActor->RotateY(1.0);
+    _renWin->Render();
+  }
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)a
