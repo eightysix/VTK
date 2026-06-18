@@ -14,20 +14,16 @@
 #include "vtkWebGPURenderer.h"
 #include "vtkWebGPURenderWindow.h"
 
-#import <QuartzCore/CAMetalLayer.h>
-
 @interface ViewController () <UIGestureRecognizerDelegate>
 {
   vtkNew<vtkIOSHardwareWindow> _hw;
   vtkNew<vtkWebGPURenderWindow> _renWin;
   vtkNew<vtkWebGPURenderer> _renderer;
   vtkNew<vtkRenderWindowInteractor> _iren;
-  BOOL _renderDirty;
 }
 @property (nonatomic, strong) UIPinchGestureRecognizer *pinchRecognizer;
 @property (nonatomic, strong) UIPanGestureRecognizer *panRecognizer;
 @property (nonatomic, strong) UIRotationGestureRecognizer *rotationRecognizer;
-@property (nonatomic, strong) CADisplayLink *displayLink;
 @end
 
 @implementation ViewController
@@ -59,7 +55,6 @@
 
   vtkNew<vtkInteractorStyleMultiTouchCamera> style;
   _iren->SetInteractorStyle(style);
-  _iren->SetEnableRender(false);
 
   _iren->Initialize();
 
@@ -73,25 +68,6 @@
     [self.view addSubview:vtkView];
     [self setupGestureRecognizersOnView:vtkView];
   }
-
-  _renderDirty = NO;
-  _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(displayLinkFired:)];
-  [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-}
-
-- (void)dealloc {
-  [_displayLink invalidate];
-}
-
-- (void)displayLinkFired:(CADisplayLink *)link {
-  if (_renderDirty) {
-    _renderDirty = NO;
-    _renWin->Render();
-  }
-}
-
-- (void)setRenderDirty {
-  _renderDirty = YES;
 }
 
 - (void)setupGestureRecognizersOnView:(UIView *)view {
@@ -140,7 +116,7 @@
       break;
   }
 
-  [self setRenderDirty];
+  _renWin->Render();
 }
 
 - (void)handlePan:(UIPanGestureRecognizer *)recognizer {
@@ -185,7 +161,7 @@
     }
   }
 
-  [self setRenderDirty];
+  _renWin->Render();
 }
 
 - (void)handleRotation:(UIRotationGestureRecognizer *)recognizer {
@@ -209,7 +185,7 @@
       break;
   }
 
-  [self setRenderDirty];
+  _renWin->Render();
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)a
