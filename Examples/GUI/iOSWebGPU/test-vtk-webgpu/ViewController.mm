@@ -6,6 +6,7 @@
 #include "vtkProperty.h"
 #include "vtkInteractorStyleMultiTouchCamera.h"
 #include "vtkRenderWindowInteractor.h"
+#include "vtkCommand.h"
 #include "vtkConeSource.h"
 #include "vtkWebGPUActor.h"
 #include "vtkWebGPUCamera.h"
@@ -119,26 +120,45 @@
 }
 
 - (void)handlePan:(UIPanGestureRecognizer *)recognizer {
+  BOOL trackball = recognizer.modifierFlags & UIKeyModifierShift;
+
   [self forwardTouchPosition:recognizer];
 
-  CGPoint translation = [recognizer translationInView:recognizer.view];
-  CGFloat scale = self.view.contentScaleFactor;
-  double t[2] = {scale * translation.x, -scale * translation.y};
-  _iren->SetTranslation(t);
+  if (trackball) {
+    switch (recognizer.state) {
+      case UIGestureRecognizerStateBegan:
+        _iren->InvokeEvent(vtkCommand::LeftButtonPressEvent, nullptr);
+        break;
+      case UIGestureRecognizerStateChanged:
+        _iren->InvokeEvent(vtkCommand::MouseMoveEvent, nullptr);
+        break;
+      case UIGestureRecognizerStateEnded:
+      case UIGestureRecognizerStateCancelled:
+        _iren->InvokeEvent(vtkCommand::LeftButtonReleaseEvent, nullptr);
+        break;
+      default:
+        break;
+    }
+  } else {
+    CGPoint translation = [recognizer translationInView:recognizer.view];
+    CGFloat scale = self.view.contentScaleFactor;
+    double t[2] = {scale * translation.x, -scale * translation.y};
+    _iren->SetTranslation(t);
 
-  switch (recognizer.state) {
-    case UIGestureRecognizerStateBegan:
-      _iren->StartPanEvent();
-      break;
-    case UIGestureRecognizerStateChanged:
-      _iren->PanEvent();
-      break;
-    case UIGestureRecognizerStateEnded:
-    case UIGestureRecognizerStateCancelled:
-      _iren->EndPanEvent();
-      break;
-    default:
-      break;
+    switch (recognizer.state) {
+      case UIGestureRecognizerStateBegan:
+        _iren->StartPanEvent();
+        break;
+      case UIGestureRecognizerStateChanged:
+        _iren->PanEvent();
+        break;
+      case UIGestureRecognizerStateEnded:
+      case UIGestureRecognizerStateCancelled:
+        _iren->EndPanEvent();
+        break;
+      default:
+        break;
+    }
   }
 
   _renWin->Render();
