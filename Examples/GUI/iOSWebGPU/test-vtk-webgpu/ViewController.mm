@@ -20,6 +20,7 @@
   vtkNew<vtkWebGPURenderWindow> _renWin;
   vtkNew<vtkWebGPURenderer> _renderer;
   vtkNew<vtkRenderWindowInteractor> _iren;
+  BOOL _trackballMode;
 }
 @property (nonatomic, strong) UIPinchGestureRecognizer *pinchRecognizer;
 @property (nonatomic, strong) UIPanGestureRecognizer *panRecognizer;
@@ -121,45 +122,61 @@
 }
 
 - (void)handlePan:(UIPanGestureRecognizer *)recognizer {
-  BOOL trackball = recognizer.modifierFlags & UIKeyModifierShift;
+  BOOL trackball = (recognizer.modifierFlags & UIKeyModifierShift) != 0;
 
   [self forwardTouchPosition:recognizer];
 
-  if (trackball) {
-    switch (recognizer.state) {
-      case UIGestureRecognizerStateBegan:
+  switch (recognizer.state) {
+    case UIGestureRecognizerStateBegan:
+      _trackballMode = trackball;
+      if (trackball) {
         _iren->InvokeEvent(vtkCommand::LeftButtonPressEvent, nullptr);
-        break;
-      case UIGestureRecognizerStateChanged:
-        _iren->InvokeEvent(vtkCommand::MouseMoveEvent, nullptr);
-        break;
-      case UIGestureRecognizerStateEnded:
-      case UIGestureRecognizerStateCancelled:
-        _iren->InvokeEvent(vtkCommand::LeftButtonReleaseEvent, nullptr);
-        break;
-      default:
-        break;
-    }
-  } else {
-    CGPoint translation = [recognizer translationInView:recognizer.view];
-    CGFloat scale = self.view.contentScaleFactor;
-    double t[2] = {scale * translation.x, -scale * translation.y};
-    _iren->SetTranslation(t);
-
-    switch (recognizer.state) {
-      case UIGestureRecognizerStateBegan:
+      } else {
+        CGPoint translation = [recognizer translationInView:recognizer.view];
+        CGFloat scale = self.view.contentScaleFactor;
+        double t[2] = {scale * translation.x, -scale * translation.y};
+        _iren->SetTranslation(t);
         _iren->StartPanEvent();
-        break;
-      case UIGestureRecognizerStateChanged:
+      }
+      break;
+
+    case UIGestureRecognizerStateChanged:
+      if (trackball != _trackballMode) {
+        if (_trackballMode) {
+          _iren->InvokeEvent(vtkCommand::LeftButtonReleaseEvent, nullptr);
+          CGPoint translation = [recognizer translationInView:recognizer.view];
+          CGFloat scale = self.view.contentScaleFactor;
+          double t[2] = {scale * translation.x, -scale * translation.y};
+          _iren->SetTranslation(t);
+          _iren->StartPanEvent();
+        } else {
+          _iren->EndPanEvent();
+          _iren->InvokeEvent(vtkCommand::LeftButtonPressEvent, nullptr);
+        }
+        _trackballMode = trackball;
+      } else if (trackball) {
+        _iren->InvokeEvent(vtkCommand::MouseMoveEvent, nullptr);
+      } else {
+        CGPoint translation = [recognizer translationInView:recognizer.view];
+        CGFloat scale = self.view.contentScaleFactor;
+        double t[2] = {scale * translation.x, -scale * translation.y};
+        _iren->SetTranslation(t);
         _iren->PanEvent();
-        break;
-      case UIGestureRecognizerStateEnded:
-      case UIGestureRecognizerStateCancelled:
+      }
+      break;
+
+    case UIGestureRecognizerStateEnded:
+    case UIGestureRecognizerStateCancelled:
+      if (_trackballMode) {
+        _iren->InvokeEvent(vtkCommand::LeftButtonReleaseEvent, nullptr);
+      } else {
         _iren->EndPanEvent();
-        break;
-      default:
-        break;
-    }
+      }
+      _trackballMode = NO;
+      break;
+
+    default:
+      break;
   }
 
   _renWin->Render();
