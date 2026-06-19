@@ -60,6 +60,7 @@ void vtkIOSHardwareWindow::Create()
     [view setOpaque:YES];
     CAMetalLayer* metalLayer = (CAMetalLayer*)[view layer];
     metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    metalLayer.contentsScale = [UIScreen mainScreen].nativeScale;
 
     if (this->WindowName)
     {
