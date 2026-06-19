@@ -126,7 +126,7 @@
 }
 
 - (void)handlePan:(UIPanGestureRecognizer *)recognizer {
-  BOOL trackball = (recognizer.modifierFlags & UIKeyModifierShift) != 0;
+  BOOL trackball = (recognizer.modifierFlags & UIKeyModifierShift) == 0;
 
   [self forwardTouchPosition:recognizer];
 
