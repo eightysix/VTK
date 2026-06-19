@@ -58,6 +58,9 @@
   reader->Update();
 
   vtkNew<vtkWebGPUGPUVolumeRayCastMapper> mapper;
+  mapper->SetSampleDistance(0.5);
+  mapper->AutoAdjustSampleDistancesOff();
+  mapper->UseJitteringOn();
   mapper->SetInputConnection(reader->GetOutputPort());
 
   // Bone + Skin II preset (16-bit CLUT)
