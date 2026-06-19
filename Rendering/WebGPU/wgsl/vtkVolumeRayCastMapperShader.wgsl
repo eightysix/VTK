@@ -29,6 +29,7 @@ struct VolumeMapperUniforms {
 @group(1) @binding(1) var volumeTexture: texture_3d<f32>;
 @group(1) @binding(2) var transferFunctionTexture: texture_2d<f32>;
 @group(1) @binding(3) var transferFunctionSampler: sampler;
+@group(1) @binding(4) var volumeSampler: sampler;
 
 struct VertexInput {
   @location(0) position: vec3<f32>,
@@ -59,8 +60,10 @@ struct FragmentOutput {
   @location(1) selectorId: vec4<u32>,
 }
 
+const MAX_RAY_STEPS: i32 = 2000;
+
 fn intersectBox(orig: vec3<f32>, dir: vec3<f32>, boxMin: vec3<f32>, boxMax: vec3<f32>) -> vec2<f32> {
-  let invDir = 1.0 / dir;
+  let invDir = 1.0 / (dir + vec3<f32>(1e-8));
   let tbot = invDir * (boxMin - orig);
   let ttop = invDir * (boxMax - orig);
   let tmin = min(ttop, tbot);
@@ -75,36 +78,41 @@ fn fragmentMain(input: FragmentInput) -> FragmentOutput {
   var output: FragmentOutput;
   output.selectorId = vec4<u32>(0u, 0u, 0u, 0u);
 
-  let dims = vec3<i32>(textureDimensions(volumeTexture, 0));
   let cameraPos = volumeUniforms.cameraVolumePos.xyz;
   let stepSize = volumeUniforms.sampleDistance;
 
-  // Compute analytical ray-box intersection to determine exact entry/exit points
   let startPoint = input.localPos;
-  let rayDir = normalize(startPoint - cameraPos);
+  var rayDir = startPoint - cameraPos;
+  let dirLength = length(rayDir);
+  if (dirLength < 0.0001) {
+    discard;
+  }
+  rayDir = rayDir / dirLength;
+
   let t = intersectBox(cameraPos, rayDir, vec3<f32>(0.0), vec3<f32>(1.0));
 
-  if (t.x >= t.y) {
+  let tStart = max(t.x, 0.0);
+  if (tStart >= t.y) {
     output.color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     return output;
   }
 
-  let entryPoint = cameraPos + rayDir * t.x;
+  let entryPoint = cameraPos + rayDir * tStart;
   let exitPoint = cameraPos + rayDir * t.y;
   let totalDist = length(exitPoint - entryPoint);
-  let maxSteps = max(1, i32(ceil(totalDist / stepSize)));
+  let maxSteps = min(max(1, i32(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
 
   var currentPoint = entryPoint;
   var accumulatedColor = vec3<f32>(0.0);
   var accumulatedOpacity = 0.0;
 
   for (var i = 0; i < maxSteps; i = i + 1) {
-    let texCoord = vec3<i32>(clamp(
-      vec3<f32>(currentPoint) * vec3<f32>(dims),
+    let texCoord = clamp(
+      currentPoint,
       vec3<f32>(0.0),
-      vec3<f32>(dims - vec3<i32>(1))
-    ));
-    let rawScalar = textureLoad(volumeTexture, texCoord, 0).r;
+      vec3<f32>(1.0)
+    );
+    let rawScalar = textureSampleLevel(volumeTexture, volumeSampler, texCoord, 0.0).r;
 
     let scalarNorm = clamp(
       (rawScalar - volumeUniforms.scalarMin) /
@@ -114,10 +122,11 @@ fn fragmentMain(input: FragmentInput) -> FragmentOutput {
     let colorOpacity = textureSampleLevel(transferFunctionTexture, transferFunctionSampler, vec2<f32>(scalarNorm, 0.5), 0.0);
 
     let sampleOpacity = colorOpacity.a;
-    let sampleColor = colorOpacity.rgb;
-
-    accumulatedColor = accumulatedColor + (1.0 - accumulatedOpacity) * sampleColor * sampleOpacity;
-    accumulatedOpacity = accumulatedOpacity + (1.0 - accumulatedOpacity) * sampleOpacity;
+    if (sampleOpacity > 0.001) {
+      let sampleColor = colorOpacity.rgb;
+      accumulatedColor = accumulatedColor + (1.0 - accumulatedOpacity) * sampleColor * sampleOpacity;
+      accumulatedOpacity = accumulatedOpacity + (1.0 - accumulatedOpacity) * sampleOpacity;
+    }
 
     if (accumulatedOpacity >= 0.95) {
       accumulatedOpacity = 1.0;

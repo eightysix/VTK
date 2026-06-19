@@ -77,8 +77,7 @@ private:
   // Textures and samplers
   wgpu::Texture VolumeTexture = nullptr;
   wgpu::TextureView VolumeTextureView = nullptr;
-  // Note: no VolumeSampler — the volume texture uses textureLoad() in the shader
-  // (R32Float is UnfilterableFloat; a filtering sampler would require float32-filterable).
+  wgpu::Sampler VolumeSampler = nullptr;
 
   wgpu::Texture ColorOpacityTexture = nullptr;
   wgpu::TextureView ColorOpacityTextureView = nullptr;
