@@ -631,9 +631,6 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, wgpu::R
   // Draw back faces so fragments are generated even when camera is inside the volume
   pipelineDesc.primitive.cullMode = wgpu::CullMode::Front;
 
-  pipelineDesc.multisample.count = wgpuRenderWindow->GetMultiSampleCount();
-  pipelineDesc.multisample.mask = 0xFFFFFFFF;
-
   wgpu::DepthStencilState depthStencil = {};
   depthStencil.format = wgpuRenderWindow->GetDepthStencilFormat();
   depthStencil.depthWriteEnabled = false;

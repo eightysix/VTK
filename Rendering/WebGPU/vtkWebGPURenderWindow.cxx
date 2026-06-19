@@ -379,24 +379,6 @@ wgpu::TextureFormat vtkWebGPURenderWindow::GetPreferredSelectorIdsTextureFormat(
 }
 
 //------------------------------------------------------------------------------
-int vtkWebGPURenderWindow::GetMultiSampleCount()
-{
-  return this->MultiSamples > 0 ? this->MultiSamples : 1;
-}
-
-//------------------------------------------------------------------------------
-wgpu::TextureView vtkWebGPURenderWindow::GetMSAAColorAttachmentView()
-{
-  return this->MSAAColorAttachment.View;
-}
-
-//------------------------------------------------------------------------------
-wgpu::TextureView vtkWebGPURenderWindow::GetMSAADepthStencilView()
-{
-  return this->MSAADepthStencilAttachment.View;
-}
-
-//------------------------------------------------------------------------------
 vtkSmartPointer<vtkWebGPUComputeRenderTexture>
 vtkWebGPURenderWindow::AcquireDepthBufferRenderTexture()
 {
@@ -604,42 +586,6 @@ void vtkWebGPURenderWindow::CreateDepthStencilAttachment()
     vtkErrorMacro(<< "Failed to create a texture for depth stencil attachment using device "
                   << device.Get());
   }
-
-  // Create MSAA depth-stencil attachment if multisampling is enabled
-  const int sampleCount = this->GetMultiSampleCount();
-  if (sampleCount > 1)
-  {
-    const std::string msaaLabel = "MSAADepthStencil-" + this->GetObjectDescription();
-    wgpu::TextureDescriptor msaaDesc;
-    msaaDesc.label = msaaLabel.c_str();
-    msaaDesc.dimension = wgpu::TextureDimension::e2D;
-    msaaDesc.size.width = this->SurfaceConfiguredSize[0];
-    msaaDesc.size.height = this->SurfaceConfiguredSize[1];
-    msaaDesc.size.depthOrArrayLayers = 1;
-    msaaDesc.sampleCount = sampleCount;
-    msaaDesc.format = wgpu::TextureFormat::Depth24PlusStencil8;
-    msaaDesc.mipLevelCount = 1;
-    msaaDesc.usage = wgpu::TextureUsage::RenderAttachment;
-
-    wgpu::TextureViewDescriptor msaaViewDesc;
-    msaaViewDesc.dimension = wgpu::TextureViewDimension::e2D;
-    msaaViewDesc.format = msaaDesc.format;
-    msaaViewDesc.baseMipLevel = 0;
-    msaaViewDesc.mipLevelCount = 1;
-    msaaViewDesc.baseArrayLayer = 0;
-    msaaViewDesc.arrayLayerCount = 1;
-    msaaViewDesc.aspect = wgpu::TextureAspect::All;
-
-    if (auto texture = this->WGPUConfiguration->CreateTexture(msaaDesc))
-    {
-      this->MSAADepthStencilAttachment.Texture = texture;
-      if (auto view = this->WGPUConfiguration->CreateView(texture, msaaViewDesc))
-      {
-        this->MSAADepthStencilAttachment.View = view;
-        this->MSAADepthStencilAttachment.Format = msaaDesc.format;
-      }
-    }
-  }
 }
 
 //------------------------------------------------------------------------------
@@ -648,8 +594,6 @@ void vtkWebGPURenderWindow::DestroyDepthStencilAttachment()
   vtkDebugMacro(<< __func__);
   this->DepthStencilAttachment.View = nullptr;
   this->DepthStencilAttachment.Texture = nullptr;
-  this->MSAADepthStencilAttachment.View = nullptr;
-  this->MSAADepthStencilAttachment.Texture = nullptr;
 }
 
 //------------------------------------------------------------------------------
@@ -712,41 +656,6 @@ void vtkWebGPURenderWindow::CreateOffscreenColorAttachment()
                   << device.Get());
     return;
   }
-
-  // Create MSAA resolve target if multisampling is enabled
-  const int sampleCount = this->GetMultiSampleCount();
-  if (sampleCount > 1)
-  {
-    const std::string msaaLabel = "MSAAColor-" + this->GetObjectDescription();
-    wgpu::TextureDescriptor msaaDesc;
-    msaaDesc.label = msaaLabel.c_str();
-    msaaDesc.size = textureExtent;
-    msaaDesc.mipLevelCount = 1;
-    msaaDesc.sampleCount = sampleCount;
-    msaaDesc.dimension = wgpu::TextureDimension::e2D;
-    msaaDesc.format = this->GetPreferredSurfaceTextureFormat();
-    msaaDesc.usage = wgpu::TextureUsage::RenderAttachment;
-    msaaDesc.viewFormatCount = 0;
-    msaaDesc.viewFormats = nullptr;
-
-    wgpu::TextureViewDescriptor msaaViewDesc;
-    msaaViewDesc.dimension = wgpu::TextureViewDimension::e2D;
-    msaaViewDesc.format = msaaDesc.format;
-    msaaViewDesc.baseMipLevel = 0;
-    msaaViewDesc.mipLevelCount = 1;
-    msaaViewDesc.baseArrayLayer = 0;
-    msaaViewDesc.arrayLayerCount = 1;
-
-    if (auto texture = this->WGPUConfiguration->CreateTexture(msaaDesc))
-    {
-      this->MSAAColorAttachment.Texture = texture;
-      if (auto view = this->WGPUConfiguration->CreateView(texture, msaaViewDesc))
-      {
-        this->MSAAColorAttachment.View = view;
-        this->MSAAColorAttachment.Format = msaaDesc.format;
-      }
-    }
-  }
 }
 
 //------------------------------------------------------------------------------
@@ -754,8 +663,6 @@ void vtkWebGPURenderWindow::DestroyOffscreenColorAttachment()
 {
   this->ColorAttachment.View = nullptr;
   this->ColorAttachment.Texture = nullptr;
-  this->MSAAColorAttachment.View = nullptr;
-  this->MSAAColorAttachment.Texture = nullptr;
 }
 
 //------------------------------------------------------------------------------
