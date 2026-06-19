@@ -62,19 +62,17 @@
 
   vtkNew<vtkColorTransferFunction> colorFunc;
   colorFunc->AddRGBPoint(-1024.0, 0.0, 0.0, 0.0);
-  colorFunc->AddRGBPoint(-300.0, 0.0, 0.0, 0.0);
-  colorFunc->AddRGBPoint(-100.0, 0.4, 0.4, 0.4);
-  colorFunc->AddRGBPoint(100.0, 0.7, 0.7, 0.7);
-  colorFunc->AddRGBPoint(400.0, 0.85, 0.85, 0.85);
+  colorFunc->AddRGBPoint(150.0, 0.0, 0.0, 0.0);
+  colorFunc->AddRGBPoint(200.0, 0.8, 0.6, 0.5);
+  colorFunc->AddRGBPoint(600.0, 0.95, 0.85, 0.75);
   colorFunc->AddRGBPoint(3000.0, 1.0, 1.0, 1.0);
 
   vtkNew<vtkPiecewiseFunction> opacityFunc;
   opacityFunc->AddPoint(-1024.0, 0.0);
-  opacityFunc->AddPoint(-300.0, 0.0);
-  opacityFunc->AddPoint(-100.0, 0.0);
-  opacityFunc->AddPoint(100.0, 0.2);
+  opacityFunc->AddPoint(150.0, 0.0);
+  opacityFunc->AddPoint(200.0, 0.15);
   opacityFunc->AddPoint(400.0, 0.5);
-  opacityFunc->AddPoint(3000.0, 1.0);
+  opacityFunc->AddPoint(3000.0, 0.85);
 
   vtkNew<vtkVolumeProperty> property;
   property->SetColor(colorFunc);

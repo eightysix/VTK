@@ -44,7 +44,6 @@
   vtkNew<vtkWebGPUCamera> camera;
   _renderer->SetActiveCamera(camera);
 
-  _renderer->SetBackground(0.1, 0.1, 0.2);
   _renWin->AddRenderer(_renderer);
   CGFloat scale = self.view.contentScaleFactor;
   _renWin->SetSize((int)lround(scale * self.view.bounds.size.width),
