@@ -128,14 +128,76 @@ bool vtkWebGPUGPUVolumeRayCastMapper::UpdateVolumeTexture(wgpu::Device device, w
       static_cast<uint32_t>(dims[2])
     };
 
+    int dataType = scalars->GetDataType();
+    int numComponents = scalars->GetNumberOfComponents();
+    vtkIdType numTuples = scalars->GetNumberOfTuples();
+    vtkIdType numValues = numTuples * numComponents;
+
+    std::vector<float> floatData;
+    const void* uploadPointer = scalars->GetVoidPointer(0);
     wgpu::TextureFormat format = wgpu::TextureFormat::R8Unorm;
-    if (scalars->GetDataType() == VTK_FLOAT)
+
+    if (dataType == VTK_FLOAT)
     {
       format = wgpu::TextureFormat::R32Float;
     }
-    else if (scalars->GetDataType() != VTK_UNSIGNED_CHAR)
+    else if (dataType == VTK_UNSIGNED_CHAR)
     {
-      vtkWarningMacro("Only unsigned char and float volumes are fully supported in WebGPU mapper currently.");
+      format = wgpu::TextureFormat::R8Unorm;
+    }
+    else
+    {
+      // Convert other types (e.g. short, unsigned short, int, double) to float
+      format = wgpu::TextureFormat::R32Float;
+      floatData.resize(numValues);
+      switch (dataType)
+      {
+        case VTK_SHORT:
+        {
+          const short* ptr = static_cast<const short*>(scalars->GetVoidPointer(0));
+          for (vtkIdType i = 0; i < numValues; ++i)
+          {
+            floatData[i] = static_cast<float>(ptr[i]);
+          }
+          break;
+        }
+        case VTK_UNSIGNED_SHORT:
+        {
+          const unsigned short* ptr = static_cast<const unsigned short*>(scalars->GetVoidPointer(0));
+          for (vtkIdType i = 0; i < numValues; ++i)
+          {
+            floatData[i] = static_cast<float>(ptr[i]);
+          }
+          break;
+        }
+        case VTK_INT:
+        {
+          const int* ptr = static_cast<const int*>(scalars->GetVoidPointer(0));
+          for (vtkIdType i = 0; i < numValues; ++i)
+          {
+            floatData[i] = static_cast<float>(ptr[i]);
+          }
+          break;
+        }
+        case VTK_UNSIGNED_INT:
+        {
+          const unsigned int* ptr = static_cast<const unsigned int*>(scalars->GetVoidPointer(0));
+          for (vtkIdType i = 0; i < numValues; ++i)
+          {
+            floatData[i] = static_cast<float>(ptr[i]);
+          }
+          break;
+        }
+        default:
+        {
+          for (vtkIdType i = 0; i < numValues; ++i)
+          {
+            floatData[i] = static_cast<float>(scalars->GetComponent(i / numComponents, i % numComponents));
+          }
+          break;
+        }
+      }
+      uploadPointer = floatData.data();
     }
 
     wgpu::TextureDescriptor texDesc = {};
@@ -154,14 +216,17 @@ bool vtkWebGPUGPUVolumeRayCastMapper::UpdateVolumeTexture(wgpu::Device device, w
     destination.origin = {0, 0, 0};
     destination.aspect = wgpu::TextureAspect::All;
 
+    int dataTypeSize = (format == wgpu::TextureFormat::R32Float) ? 4 : 1;
+
     wgpu::TexelCopyBufferLayout dataLayout = {};
     dataLayout.offset = 0;
-    dataLayout.bytesPerRow = dims[0] * scalars->GetDataTypeSize() * scalars->GetNumberOfComponents();
+    dataLayout.bytesPerRow = dims[0] * dataTypeSize * numComponents;
     dataLayout.rowsPerImage = dims[1];
 
     wgpu::Extent3D writeSize = extent;
 
-    queue.WriteTexture(&destination, scalars->GetVoidPointer(0), scalars->GetDataSize() * scalars->GetDataTypeSize(), &dataLayout, &writeSize);
+    size_t totalBytes = static_cast<size_t>(dims[0]) * dims[1] * dims[2] * dataTypeSize * numComponents;
+    queue.WriteTexture(&destination, uploadPointer, totalBytes, &dataLayout, &writeSize);
 
     this->VolumeUploadTime.Modified();
     this->BindGroup = nullptr;

@@ -2,6 +2,7 @@
 #import "ConeViewController.h"
 #import "CubeViewController.h"
 #import "VolumeViewController.h"
+#import "DICOMVolumeViewController.h"
 
 @implementation ViewController
 
@@ -23,8 +24,13 @@
                                                      image:nil
                                                        tag:2];
 
+  DICOMVolumeViewController *dicomVC = [[DICOMVolumeViewController alloc] init];
+  dicomVC.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"DICOM"
+                                                    image:nil
+                                                      tag:3];
+
   UITabBarController *tabBar = [[UITabBarController alloc] init];
-  tabBar.viewControllers = @[ coneVC, cubeVC, volumeVC ];
+  tabBar.viewControllers = @[ coneVC, cubeVC, volumeVC, dicomVC ];
   tabBar.view.frame = self.view.bounds;
   tabBar.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
   [self.view addSubview:tabBar.view];
