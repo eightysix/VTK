@@ -84,10 +84,6 @@ private:
   wgpu::TextureView ColorOpacityTextureView = nullptr;
   wgpu::Sampler ColorOpacitySampler = nullptr;
 
-  wgpu::Texture NoiseTexture = nullptr;
-  wgpu::TextureView NoiseTextureView = nullptr;
-  wgpu::Sampler NoiseSampler = nullptr;
-
   // Cache/timestamps
   vtkTimeStamp VolumeUploadTime;
   vtkTimeStamp TransferFunctionUploadTime;
@@ -95,7 +91,6 @@ private:
   // Helper methods
   bool UpdateVolumeTexture(wgpu::Device device, wgpu::Queue queue, vtkVolume* vol);
   bool UpdateTransferFunctionTexture(wgpu::Device device, wgpu::Queue queue, vtkVolume* vol);
-  bool UpdateNoiseTexture(wgpu::Device device, wgpu::Queue queue);
   bool SetupBuffers(wgpu::Device device, vtkVolume* vol);
   bool SetupPipeline(wgpu::Device device, wgpu::RenderPassEncoder renderPass, vtkRenderer* ren);
 };

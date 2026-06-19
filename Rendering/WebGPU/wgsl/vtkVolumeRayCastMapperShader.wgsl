@@ -19,7 +19,7 @@ struct VolumeMapperUniforms {
   sampleDistance: f32,
   scalarMin: f32,
   scalarMax: f32,
-  useJittering: f32, // 1.0 to enable blue-noise jitter on ray start offset
+  padding: f32,
 }
 
 
@@ -29,8 +29,6 @@ struct VolumeMapperUniforms {
 @group(1) @binding(1) var volumeTexture: texture_3d<f32>;
 @group(1) @binding(2) var transferFunctionTexture: texture_2d<f32>;
 @group(1) @binding(3) var transferFunctionSampler: sampler;
-@group(1) @binding(4) var noiseTexture: texture_2d<f32>;
-@group(1) @binding(5) var noiseSampler: sampler;
 
 struct VertexInput {
   @location(0) position: vec3<f32>,
@@ -53,7 +51,6 @@ fn vertexMain(input: VertexInput) -> VertexOutput {
 }
 
 struct FragmentInput {
-  @builtin(position) fragCoord: vec4<f32>,
   @location(0) localPos: vec3<f32>,
 }
 
@@ -98,36 +95,16 @@ fn fragmentMain(input: FragmentInput) -> FragmentOutput {
   let maxSteps = max(1, i32(ceil(totalDist / stepSize)));
 
   var currentPoint = entryPoint;
-  if (volumeUniforms.useJittering != 0.0) {
-    let noiseDims = vec2<f32>(textureDimensions(noiseTexture));
-    let noiseCoord = input.fragCoord.xy / noiseDims;
-    let jitterValue = textureSampleLevel(noiseTexture, noiseSampler, noiseCoord, 0.0).r;
-    currentPoint = entryPoint + rayDir * stepSize * jitterValue;
-  }
   var accumulatedColor = vec3<f32>(0.0);
   var accumulatedOpacity = 0.0;
 
   for (var i = 0; i < maxSteps; i = i + 1) {
-    // Manual trilinear interpolation (the volume texture uses
-    // UnfilterableFloat because of R32Float support, so we cannot
-    // rely on hardware filtering).
-    let fcoord = clamp(currentPoint * vec3<f32>(dims), vec3<f32>(0.0), vec3<f32>(dims - vec3<i32>(1)));
-    let ic0 = vec3<i32>(floor(fcoord));
-    let frac = fcoord - vec3<f32>(ic0);
-    let ic1 = min(ic0 + vec3<i32>(1, 1, 1), dims - vec3<i32>(1));
-
-    let v000 = textureLoad(volumeTexture, vec3<i32>(ic0.x, ic0.y, ic0.z), 0).r;
-    let v100 = textureLoad(volumeTexture, vec3<i32>(ic1.x, ic0.y, ic0.z), 0).r;
-    let v010 = textureLoad(volumeTexture, vec3<i32>(ic0.x, ic1.y, ic0.z), 0).r;
-    let v110 = textureLoad(volumeTexture, vec3<i32>(ic1.x, ic1.y, ic0.z), 0).r;
-    let v001 = textureLoad(volumeTexture, vec3<i32>(ic0.x, ic0.y, ic1.z), 0).r;
-    let v101 = textureLoad(volumeTexture, vec3<i32>(ic1.x, ic0.y, ic1.z), 0).r;
-    let v011 = textureLoad(volumeTexture, vec3<i32>(ic0.x, ic1.y, ic1.z), 0).r;
-    let v111 = textureLoad(volumeTexture, vec3<i32>(ic1.x, ic1.y, ic1.z), 0).r;
-
-    let rawScalar = mix(mix(mix(v000, v100, frac.x), mix(v010, v110, frac.x), frac.y),
-                        mix(mix(v001, v101, frac.x), mix(v011, v111, frac.x), frac.y),
-                        frac.z);
+    let texCoord = vec3<i32>(clamp(
+      vec3<f32>(currentPoint) * vec3<f32>(dims),
+      vec3<f32>(0.0),
+      vec3<f32>(dims - vec3<i32>(1))
+    ));
+    let rawScalar = textureLoad(volumeTexture, texCoord, 0).r;
 
     let scalarNorm = clamp(
       (rawScalar - volumeUniforms.scalarMin) /
