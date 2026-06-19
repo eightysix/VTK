@@ -17,18 +17,21 @@ struct VolumeMapperUniforms {
   volumeBoundsMax: vec4<f32>,
   cameraVolumePos: vec4<f32>,
   sampleDistance: f32,
-  padding1: f32,
-  padding2: f32,
-  padding3: f32,
+  scalarMin: f32,      // raw scalar data minimum (e.g. ~37 for RTAnalytic)
+  scalarMax: f32,      // raw scalar data maximum (e.g. ~276 for RTAnalytic)
+  padding: f32,
 }
+
 
 @group(0) @binding(0) var<uniform> sceneTransform: SceneTransform;
 
 @group(1) @binding(0) var<uniform> volumeUniforms: VolumeMapperUniforms;
+// R32Float is 'UnfilterableFloat' in WebGPU — use texture_3d<f32> with textureLoad(),
+// not textureSample(), to avoid requiring the float32-filterable feature.
 @group(1) @binding(1) var volumeTexture: texture_3d<f32>;
-@group(1) @binding(2) var volumeSampler: sampler;
-@group(1) @binding(3) var transferFunctionTexture: texture_2d<f32>;
-@group(1) @binding(4) var transferFunctionSampler: sampler;
+// Non-filtering sampler used for the transfer-function lookup (RGBA8Unorm, filterable).
+@group(1) @binding(2) var transferFunctionTexture: texture_2d<f32>;
+@group(1) @binding(3) var transferFunctionSampler: sampler;
 
 struct VertexInput {
   @location(0) position: vec3<f32>,
@@ -57,21 +60,30 @@ struct FragmentInput {
 }
 
 struct FragmentOutput {
+  // Color attachment 0: main rendered color
   @location(0) color: vec4<f32>,
+  // Color attachment 1: hardware selector IDs (RGBA32Uint).
+  // Volume rendering does not participate in picking; write zero to suppress
+  // the "attachment state mismatch" WebGPU validation error.
+  @location(1) selectorId: vec4<u32>,
 }
 
 @fragment
 fn fragmentMain(input: FragmentInput) -> FragmentOutput {
   var output: FragmentOutput;
-  
-  // Ray casting starting point (in volume/local texture coordinates)
+  output.selectorId = vec4<u32>(0u, 0u, 0u, 0u);
+
+  // Dimensions of the volume texture (needed for textureLoad integer coords)
+  let dims = vec3<i32>(textureDimensions(volumeTexture, 0));
+
+  // Ray casting starting point (in volume/local texture coordinates [0,1]^3)
   let startPoint = input.localPos;
   
   // Ray direction in volume space (from camera to fragment)
   let cameraPos = volumeUniforms.cameraVolumePos.xyz;
   let rayDir = normalize(startPoint - cameraPos);
   
-  // Ray marching setup
+  // Ray marching
   var currentPoint = startPoint;
   var accumulatedColor = vec3<f32>(0.0);
   var accumulatedOpacity = 0.0;
@@ -85,11 +97,25 @@ fn fragmentMain(input: FragmentInput) -> FragmentOutput {
       break;
     }
     
-    // Sample scalar value from 3D texture
-    let scalarVal = textureSampleLevel(volumeTexture, volumeSampler, currentPoint, 0.0).r;
+    // Convert normalized [0,1] coordinate to integer texel coordinates and
+    // sample the scalar value without filtering (avoids float32-filterable requirement).
+    let texCoord = vec3<i32>(clamp(
+      vec3<f32>(currentPoint) * vec3<f32>(dims),
+      vec3<f32>(0.0),
+      vec3<f32>(dims - vec3<i32>(1))
+    ));
+    let rawScalar = textureLoad(volumeTexture, texCoord, 0).r;
+
+    // Normalise raw voxel scalar into [0,1] using the actual data range so
+    // that the transfer-function texture is indexed correctly regardless of
+    // whether the volume stores unsigned bytes (0–255) or floats (e.g. 37–276).
+    let scalarNorm = clamp(
+      (rawScalar - volumeUniforms.scalarMin) /
+      (volumeUniforms.scalarMax - volumeUniforms.scalarMin),
+      0.0, 1.0);
     
-    // Map scalar value through transfer function 1D/2D texture (using y = 0.5)
-    let colorOpacity = textureSampleLevel(transferFunctionTexture, transferFunctionSampler, vec2<f32>(scalarVal, 0.5), 0.0);
+    // Map through the pre-baked RGBA transfer function texture.
+    let colorOpacity = textureSampleLevel(transferFunctionTexture, transferFunctionSampler, vec2<f32>(scalarNorm, 0.5), 0.0);
     
     // Front-to-back compositing
     let sampleOpacity = colorOpacity.a;

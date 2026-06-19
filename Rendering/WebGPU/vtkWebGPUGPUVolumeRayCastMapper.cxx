@@ -16,6 +16,7 @@
 #include "vtkMatrix4x4.h"
 #include "vtkVolumeRayCastMapperShader.h"
 
+#include <algorithm>
 #include <vector>
 
 struct VolumeMapperUniforms
@@ -26,8 +27,11 @@ struct VolumeMapperUniforms
   float VolumeBoundsMax[4];
   float CameraVolumePos[4];
   float SampleDistance;
-  float Padding[3];
+  float ScalarMin;   // scalar data range – used by the shader to normalise
+  float ScalarMax;   // raw voxel values into [0,1] for the TF texture lookup
+  float Padding;     // keep 16-byte alignment
 };
+
 
 VTK_ABI_NAMESPACE_BEGIN
 
@@ -62,7 +66,6 @@ void vtkWebGPUGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNot
   this->IndexBuffer = nullptr;
   this->VolumeTexture = nullptr;
   this->VolumeTextureView = nullptr;
-  this->VolumeSampler = nullptr;
   this->ColorOpacityTexture = nullptr;
   this->ColorOpacityTextureView = nullptr;
   this->ColorOpacitySampler = nullptr;
@@ -330,18 +333,6 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, wgpu::R
     shaderModule = device.CreateShaderModule(&shaderDesc);
   }
 
-  if (!this->VolumeSampler)
-  {
-    wgpu::SamplerDescriptor samplerDesc = {};
-    samplerDesc.addressModeU = wgpu::AddressMode::ClampToEdge;
-    samplerDesc.addressModeV = wgpu::AddressMode::ClampToEdge;
-    samplerDesc.addressModeW = wgpu::AddressMode::ClampToEdge;
-    samplerDesc.magFilter = wgpu::FilterMode::Linear;
-    samplerDesc.minFilter = wgpu::FilterMode::Linear;
-    samplerDesc.mipmapFilter = wgpu::MipmapFilterMode::Linear;
-    this->VolumeSampler = device.CreateSampler(&samplerDesc);
-  }
-
   if (!this->ColorOpacitySampler)
   {
     wgpu::SamplerDescriptor samplerDesc = {};
@@ -353,60 +344,59 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, wgpu::R
   }
 
   {
-    wgpu::BindGroupLayoutEntry entries[5] = {};
-    
+    // Binding layout must match the shader:
+    //  0 - uniform buffer (vertex + fragment)
+    //  1 - volumeTexture: texture_3d<f32> accessed via textureLoad (UnfilterableFloat,
+    //      required for R32Float which lacks the float32-filterable feature)
+    //  2 - transferFunctionTexture: texture_2d<f32>, RGBA8Unorm -> filterable Float
+    //  3 - transferFunctionSampler: filtering sampler
+    wgpu::BindGroupLayoutEntry entries[4] = {};
+
     entries[0].binding = 0;
     entries[0].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
     entries[0].buffer.type = wgpu::BufferBindingType::Uniform;
-    
+
     entries[1].binding = 1;
     entries[1].visibility = wgpu::ShaderStage::Fragment;
-    entries[1].texture.sampleType = wgpu::TextureSampleType::Float;
+    entries[1].texture.sampleType = wgpu::TextureSampleType::UnfilterableFloat;
     entries[1].texture.viewDimension = wgpu::TextureViewDimension::e3D;
-    
+
     entries[2].binding = 2;
     entries[2].visibility = wgpu::ShaderStage::Fragment;
-    entries[2].sampler.type = wgpu::SamplerBindingType::Filtering;
-    
+    entries[2].texture.sampleType = wgpu::TextureSampleType::Float;
+    entries[2].texture.viewDimension = wgpu::TextureViewDimension::e2D;
+
     entries[3].binding = 3;
     entries[3].visibility = wgpu::ShaderStage::Fragment;
-    entries[3].texture.sampleType = wgpu::TextureSampleType::Float;
-    entries[3].texture.viewDimension = wgpu::TextureViewDimension::e2D;
-    
-    entries[4].binding = 4;
-    entries[4].visibility = wgpu::ShaderStage::Fragment;
-    entries[4].sampler.type = wgpu::SamplerBindingType::Filtering;
+    entries[3].sampler.type = wgpu::SamplerBindingType::Filtering;
 
     wgpu::BindGroupLayoutDescriptor bglDesc = {};
     bglDesc.label = "vtkWebGPUGPUVolumeRayCastMapper::BindGroupLayout";
-    bglDesc.entryCount = 5;
+    bglDesc.entryCount = 4;
     bglDesc.entries = entries;
     this->BindGroupLayout = device.CreateBindGroupLayout(&bglDesc);
   }
 
   {
-    wgpu::BindGroupEntry bgEntries[5] = {};
-    
+    wgpu::BindGroupEntry bgEntries[4] = {};
+
     bgEntries[0].binding = 0;
     bgEntries[0].buffer = this->UniformBuffer;
     bgEntries[0].size = sizeof(VolumeMapperUniforms);
-    
+
     bgEntries[1].binding = 1;
     bgEntries[1].textureView = this->VolumeTextureView;
-    
+
     bgEntries[2].binding = 2;
-    bgEntries[2].sampler = this->VolumeSampler;
-    
+    bgEntries[2].textureView = this->ColorOpacityTextureView;
+
     bgEntries[3].binding = 3;
-    bgEntries[3].textureView = this->ColorOpacityTextureView;
-    
-    bgEntries[4].binding = 4;
-    bgEntries[4].sampler = this->ColorOpacitySampler;
+    bgEntries[3].sampler = this->ColorOpacitySampler;
 
     wgpu::BindGroupDescriptor bgDesc = {};
     bgDesc.label = "vtkWebGPUGPUVolumeRayCastMapper::BindGroup";
     bgDesc.layout = this->BindGroupLayout;
-    bgDesc.entryCount = 5;
+    bgDesc.entryCount = 4;
     bgDesc.entries = bgEntries;
     this->BindGroup = device.CreateBindGroup(&bgDesc);
   }
@@ -424,9 +414,10 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, wgpu::R
   layoutDesc.bindGroupLayouts = layouts.data();
   wgpu::PipelineLayout pipelineLayout = device.CreatePipelineLayout(&layoutDesc);
 
-  wgpu::ColorTargetState colorTarget = {};
-  colorTarget.format = wgpuRenderWindow->GetPreferredSurfaceTextureFormat();
-  
+  // The renderer's render pass always has two color attachments:
+  //   [0] BGRA8Unorm  - main color output
+  //   [1] RGBA32Uint  - hardware selector IDs
+  // Both must be declared in the pipeline or WebGPU raises an attachment-state error.
   wgpu::BlendState blend = {};
   blend.color.srcFactor = wgpu::BlendFactor::SrcAlpha;
   blend.color.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
@@ -434,13 +425,20 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, wgpu::R
   blend.alpha.srcFactor = wgpu::BlendFactor::One;
   blend.alpha.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
   blend.alpha.operation = wgpu::BlendOperation::Add;
-  colorTarget.blend = &blend;
+
+  wgpu::ColorTargetState colorTargets[2] = {};
+  colorTargets[0].format = wgpuRenderWindow->GetPreferredSurfaceTextureFormat();
+  colorTargets[0].blend = &blend;
+  colorTargets[1].format = wgpuRenderWindow->GetPreferredSelectorIdsTextureFormat();
+  // Selector target: no blending; volume rendering does not participate in picking.
+  colorTargets[1].blend = nullptr;
+  colorTargets[1].writeMask = wgpu::ColorWriteMask::None;
 
   wgpu::FragmentState fragmentState = {};
   fragmentState.module = shaderModule;
   fragmentState.entryPoint = "fragmentMain";
-  fragmentState.targetCount = 1;
-  fragmentState.targets = &colorTarget;
+  fragmentState.targetCount = 2;
+  fragmentState.targets = colorTargets;
 
   wgpu::VertexAttribute vertAttr = {};
   vertAttr.format = wgpu::VertexFormat::Float32x3;
@@ -544,6 +542,8 @@ void vtkWebGPUGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol
 
       double bounds[6];
       vol->GetBounds(bounds);
+
+      // Bounds in world/model space (passed to shader for bounding-box geometry).
       uniforms.VolumeBoundsMin[0] = static_cast<float>(bounds[0]);
       uniforms.VolumeBoundsMin[1] = static_cast<float>(bounds[2]);
       uniforms.VolumeBoundsMin[2] = static_cast<float>(bounds[4]);
@@ -554,16 +554,52 @@ void vtkWebGPUGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol
       uniforms.VolumeBoundsMax[2] = static_cast<float>(bounds[5]);
       uniforms.VolumeBoundsMax[3] = 1.0f;
 
+      // The vertex shader maps vertex positions to localPos in [0,1]³ texture
+      // space.  The camera position must be expressed in the same space so that
+      // the ray direction is consistent.
+      double boundsSize[3] = {
+        bounds[1] - bounds[0],
+        bounds[3] - bounds[2],
+        bounds[5] - bounds[4]
+      };
+      // Guard against degenerate (zero-size) bounds.
+      for (int k = 0; k < 3; ++k)
+      {
+        if (boundsSize[k] < 1e-10) boundsSize[k] = 1.0;
+      }
+
       double* camPosWorld = ren->GetActiveCamera()->GetPosition();
       double camPosVolume[4] = { camPosWorld[0], camPosWorld[1], camPosWorld[2], 1.0 };
       invModelMatrix->MultiplyPoint(camPosVolume, camPosVolume);
 
-      uniforms.CameraVolumePos[0] = static_cast<float>(camPosVolume[0]);
-      uniforms.CameraVolumePos[1] = static_cast<float>(camPosVolume[1]);
-      uniforms.CameraVolumePos[2] = static_cast<float>(camPosVolume[2]);
+      // Normalise camera position into [0,1]³ texture space.
+      uniforms.CameraVolumePos[0] =
+        static_cast<float>((camPosVolume[0] - bounds[0]) / boundsSize[0]);
+      uniforms.CameraVolumePos[1] =
+        static_cast<float>((camPosVolume[1] - bounds[2]) / boundsSize[1]);
+      uniforms.CameraVolumePos[2] =
+        static_cast<float>((camPosVolume[2] - bounds[4]) / boundsSize[2]);
       uniforms.CameraVolumePos[3] = 1.0f;
 
-      uniforms.SampleDistance = this->GetSampleDistance();
+      // Normalise step size into [0,1]³ space.  Use the longest axis so the
+      // step is isotropic in normalised coordinates.
+      double maxBoundsSize = std::max({ boundsSize[0], boundsSize[1], boundsSize[2] });
+      uniforms.SampleDistance =
+        static_cast<float>(this->GetSampleDistance() / maxBoundsSize);
+
+      // Scalar data range – needed by the shader to normalise raw voxel values
+      // into [0,1] before indexing the transfer-function texture.
+      {
+        vtkImageData* inputImg = vtkImageData::SafeDownCast(this->GetInput());
+        double scalarRange[2] = { 0.0, 1.0 };
+        if (inputImg && inputImg->GetPointData()->GetScalars())
+        {
+          inputImg->GetPointData()->GetScalars()->GetRange(scalarRange);
+        }
+        uniforms.ScalarMin = static_cast<float>(scalarRange[0]);
+        uniforms.ScalarMax = static_cast<float>(
+          scalarRange[1] > scalarRange[0] ? scalarRange[1] : scalarRange[0] + 1.0);
+      }
 
       queue.WriteBuffer(this->UniformBuffer, 0, &uniforms, sizeof(uniforms));
 
@@ -571,9 +607,8 @@ void vtkWebGPUGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol
       renderPass.SetBindGroup(0, wgpuRenderer->GetSceneBindGroup());
       renderPass.SetBindGroup(1, this->BindGroup);
 
-      uint32_t vertexBufferOffset = 0;
-      renderPass.SetVertexBuffer(0, this->VertexBuffer, vertexBufferOffset, 0);
-      renderPass.SetIndexBuffer(this->IndexBuffer, wgpu::IndexFormat::Uint32, 0, 0);
+      renderPass.SetVertexBuffer(0, this->VertexBuffer);
+      renderPass.SetIndexBuffer(this->IndexBuffer, wgpu::IndexFormat::Uint32);
       renderPass.DrawIndexed(this->IndexCount, 1, 0, 0, 0);
       break;
     }
