@@ -278,6 +278,23 @@ public:
    */
   wgpu::TextureFormat GetPreferredSelectorIdsTextureFormat();
 
+  /**
+   * Get the number of MSAA samples used for rendering. Returns 1 when MSAA is disabled.
+   */
+  int GetMultiSampleCount();
+
+  /**
+   * Get a view of the MSAA color attachment used in the offscreen render target.
+   * Returns a null view when MSAA is disabled (sampleCount == 1).
+   */
+  wgpu::TextureView GetMSAAColorAttachmentView();
+
+  /**
+   * Get a view of the MSAA depth-stencil attachment used in the offscreen render target.
+   * Returns a null view when MSAA is disabled (sampleCount == 1).
+   */
+  wgpu::TextureView GetMSAADepthStencilView();
+
   ///@{
   /**
    * Returns a vtkWebGPUComputeRenderTexture ready to be added to a compute pipeline using
@@ -554,6 +571,9 @@ private:
   };
   vtkWGPUAttachment ColorAttachment;
   vtkWGPUAttachment IdsAttachment;
+
+  vtkWGPUAttachment MSAAColorAttachment;
+  vtkWGPUDepthStencil MSAADepthStencilAttachment;
 
   struct vtkWGPUUserStagingPixelData
   {

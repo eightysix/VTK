@@ -1201,15 +1201,20 @@ void vtkWebGPUPolyDataMapper2DInternals::UpdateBuffers(
     descriptor.cFragment.entryPoint = "main";
     descriptor.EnableBlending(0);
     descriptor.cTargets[0].format = wgpuRenderWindow->GetPreferredSurfaceTextureFormat();
+    descriptor.multisample.count = wgpuRenderWindow->GetMultiSampleCount();
     ///@{ TODO: Only for valid depth stencil formats
     auto depthState = descriptor.EnableDepthStencil(wgpuRenderWindow->GetDepthStencilFormat());
     depthState->depthWriteEnabled = true;
     depthState->depthCompare = wgpu::CompareFunction::Less;
     ///@}
-    // Prepare selection ids output.
-    descriptor.cTargets[1].format = wgpuRenderWindow->GetPreferredSelectorIdsTextureFormat();
-    descriptor.cFragment.targetCount++;
-    descriptor.DisableBlending(1);
+    // Prepare selection ids output. Skip when MSAA is active because the
+    // hardware selector format (RGBA32Uint) does not support multisampling.
+    if (wgpuRenderWindow->GetMultiSampleCount() <= 1)
+    {
+      descriptor.cTargets[1].format = wgpuRenderWindow->GetPreferredSelectorIdsTextureFormat();
+      descriptor.cFragment.targetCount++;
+      descriptor.DisableBlending(1);
+    }
 
     // Update local parameters that decide whether a pipeline must be rebuilt.
     this->RebuildGraphicsPipelines = false;
