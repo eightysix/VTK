@@ -46,7 +46,9 @@
 
   _renderer->SetBackground(0.1, 0.1, 0.2);
   _renWin->AddRenderer(_renderer);
-  _renWin->SetSize(self.view.bounds.size.width, self.view.bounds.size.height);
+  CGFloat scale = self.view.contentScaleFactor;
+  _renWin->SetSize((int)lround(scale * self.view.bounds.size.width),
+                   (int)lround(scale * self.view.bounds.size.height));
   _iren->SetRenderWindow(_renWin);
   _iren->SetEnableRender(false);
 
@@ -221,8 +223,12 @@
 
 - (void)viewDidLayoutSubviews {
   [super viewDidLayoutSubviews];
-  _renWin->SetSize(self.view.bounds.size.width, self.view.bounds.size.height);
-  _iren->UpdateSize(self.view.bounds.size.width, self.view.bounds.size.height);
+  CGFloat scale = self.view.contentScaleFactor;
+  int w = (int)lround(scale * self.view.bounds.size.width);
+  int h = (int)lround(scale * self.view.bounds.size.height);
+  _renWin->SetSize(w, h);
+  _iren->UpdateSize(w, h);
+  _renWin->Render();
 }
 
 @end
