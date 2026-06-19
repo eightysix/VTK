@@ -74,19 +74,15 @@ private:
   wgpu::Buffer IndexBuffer = nullptr;
   int IndexCount = 0;
 
-  // Volume texture
+  // Textures and samplers
   wgpu::Texture VolumeTexture = nullptr;
   wgpu::TextureView VolumeTextureView = nullptr;
+  // Note: no VolumeSampler — the volume texture uses textureLoad() in the shader
+  // (R32Float is UnfilterableFloat; a filtering sampler would require float32-filterable).
 
-  // Textures and samplers
   wgpu::Texture ColorOpacityTexture = nullptr;
   wgpu::TextureView ColorOpacityTextureView = nullptr;
   wgpu::Sampler ColorOpacitySampler = nullptr;
-
-  // Noise texture for stochastic jittering
-  wgpu::Texture NoiseTexture = nullptr;
-  wgpu::TextureView NoiseTextureView = nullptr;
-  wgpu::Sampler NoiseSampler = nullptr;
 
   // Cache/timestamps
   vtkTimeStamp VolumeUploadTime;

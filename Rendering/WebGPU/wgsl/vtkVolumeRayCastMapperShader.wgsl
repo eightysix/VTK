@@ -17,9 +17,9 @@ struct VolumeMapperUniforms {
   volumeBoundsMax: vec4<f32>,
   cameraVolumePos: vec4<f32>,
   sampleDistance: f32,
-  scalarMin: f32,
-  scalarMax: f32,
-  useJittering: f32,
+  scalarMin: f32,      // raw scalar data minimum (e.g. ~37 for RTAnalytic)
+  scalarMax: f32,      // raw scalar data maximum (e.g. ~276 for RTAnalytic)
+  padding: f32,
 }
 
 
@@ -32,8 +32,6 @@ struct VolumeMapperUniforms {
 // Non-filtering sampler used for the transfer-function lookup (RGBA8Unorm, filterable).
 @group(1) @binding(2) var transferFunctionTexture: texture_2d<f32>;
 @group(1) @binding(3) var transferFunctionSampler: sampler;
-@group(1) @binding(4) var noiseTexture: texture_2d<f32>;
-@group(1) @binding(5) var noiseSampler: sampler;
 
 struct VertexInput {
   @location(0) position: vec3<f32>,
@@ -71,7 +69,7 @@ struct FragmentOutput {
 }
 
 @fragment
-fn fragmentMain(input: FragmentInput, @builtin(position) fragCoord: vec4<f32>) -> FragmentOutput {
+fn fragmentMain(input: FragmentInput) -> FragmentOutput {
   var output: FragmentOutput;
   output.selectorId = vec4<u32>(0u, 0u, 0u, 0u);
 
@@ -79,29 +77,18 @@ fn fragmentMain(input: FragmentInput, @builtin(position) fragCoord: vec4<f32>) -
   let dims = vec3<i32>(textureDimensions(volumeTexture, 0));
 
   // Ray casting starting point (in volume/local texture coordinates [0,1]^3)
-  var currentPoint = input.localPos;
+  let startPoint = input.localPos;
   
   // Ray direction in volume space (from camera to fragment)
   let cameraPos = volumeUniforms.cameraVolumePos.xyz;
-  let rayDir = normalize(currentPoint - cameraPos);
-  
-  // Step along the ray (in [0,1]^3 normalised space)
-  let stepVec = rayDir * volumeUniforms.sampleDistance;
-
-  // Apply stochastic jittering to the ray entry point when enabled.
-  // A per-fragment random value from the noise texture offsets the start
-  // position along the ray, breaking up banding artifacts.
-  if (volumeUniforms.useJittering > 0.5) {
-    let noiseDims = vec2<f32>(textureDimensions(noiseTexture, 0));
-    let noiseUV = (fragCoord.xy % noiseDims) / noiseDims;
-    let jitterValue = textureSampleLevel(noiseTexture, noiseSampler, noiseUV, 0.0).r;
-    currentPoint = currentPoint + stepVec * jitterValue;
-  }
+  let rayDir = normalize(startPoint - cameraPos);
   
   // Ray marching
+  var currentPoint = startPoint;
   var accumulatedColor = vec3<f32>(0.0);
   var accumulatedOpacity = 0.0;
   
+  let stepSize = volumeUniforms.sampleDistance;
   let maxSteps = 1000;
   
   for (var i = 0; i < maxSteps; i = i + 1) {
@@ -143,7 +130,7 @@ fn fragmentMain(input: FragmentInput, @builtin(position) fragCoord: vec4<f32>) -
     }
     
     // Step along the ray
-    currentPoint = currentPoint + stepVec;
+    currentPoint = currentPoint + rayDir * stepSize;
   }
   
   output.color = vec4<f32>(accumulatedColor, accumulatedOpacity);
