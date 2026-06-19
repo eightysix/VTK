@@ -527,7 +527,7 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, wgpu::R
 
   pipelineDesc.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
   pipelineDesc.primitive.frontFace = wgpu::FrontFace::CCW;
-  pipelineDesc.primitive.cullMode = wgpu::CullMode::None;
+  pipelineDesc.primitive.cullMode = wgpu::CullMode::Back;
 
   wgpu::DepthStencilState depthStencil = {};
   depthStencil.format = wgpuRenderWindow->GetDepthStencilFormat();
