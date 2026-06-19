@@ -22,6 +22,7 @@ set(classes
   vtkWebGPUComputeTexture
   vtkWebGPUComputeTextureView
   vtkWebGPUConfiguration
+  vtkWebGPUGPUInfoList
   vtkWebGPUGPUVolumeRayCastMapper
   vtkWebGPUGlyph3DMapper
   vtkWebGPUHardwareSelector
@@ -90,6 +91,7 @@ set(webgpu_overrides
   ImageMapper
   # NI: ImageSliceMapper
   Glyph3DMapper
+  GPUInfoList
   GPUVolumeRayCastMapper
   # NI: HyperTreeGridMapper
   Light

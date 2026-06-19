@@ -1,6 +1,7 @@
 #import "ViewController.h"
 #import "ConeViewController.h"
 #import "CubeViewController.h"
+#import "VolumeViewController.h"
 
 @implementation ViewController
 
@@ -17,8 +18,13 @@
                                                     image:nil
                                                       tag:1];
 
+  VolumeViewController *volumeVC = [[VolumeViewController alloc] init];
+  volumeVC.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Volume"
+                                                     image:nil
+                                                       tag:2];
+
   UITabBarController *tabBar = [[UITabBarController alloc] init];
-  tabBar.viewControllers = @[ coneVC, cubeVC ];
+  tabBar.viewControllers = @[ coneVC, cubeVC, volumeVC ];
   tabBar.view.frame = self.view.bounds;
   tabBar.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
   [self.view addSubview:tabBar.view];
