@@ -60,21 +60,32 @@
   vtkNew<vtkWebGPUGPUVolumeRayCastMapper> mapper;
   mapper->SetInputConnection(reader->GetOutputPort());
 
+  // Bone + Skin II preset (16-bit CLUT)
   vtkNew<vtkColorTransferFunction> colorFunc;
-  colorFunc->AddRGBPoint(-1024.0, 0.0, 0.0, 0.0);
-  colorFunc->AddRGBPoint(-300.0, 0.0, 0.0, 0.0);
-  colorFunc->AddRGBPoint(-100.0, 0.4, 0.4, 0.4);
-  colorFunc->AddRGBPoint(100.0, 0.7, 0.7, 0.7);
-  colorFunc->AddRGBPoint(400.0, 0.85, 0.85, 0.85);
-  colorFunc->AddRGBPoint(3000.0, 1.0, 1.0, 1.0);
+  // Curve 1: cyan-ish tones for soft tissue
+  colorFunc->AddRGBPoint(-713.84, 0.072, 0.994, 1.0);
+  colorFunc->AddRGBPoint(-653.98, 0.072, 0.994, 1.0);
+  colorFunc->AddRGBPoint(-640.25, 0.072, 0.994, 1.0);
+  colorFunc->AddRGBPoint(-590.33, 0.072, 0.994, 1.0);
+  colorFunc->AddRGBPoint(-544.65, 0.072, 0.994, 1.0);
+  // Curve 2: red → pink → white for bone
+  colorFunc->AddRGBPoint(66.73, 0.0, 0.0, 0.0);
+  colorFunc->AddRGBPoint(84.34, 1.0, 0.0, 0.0);
+  colorFunc->AddRGBPoint(366.83, 1.0, 0.999, 1.0);
+  colorFunc->AddRGBPoint(1585.43, 1.0, 1.0, 1.0);
 
   vtkNew<vtkPiecewiseFunction> opacityFunc;
-  opacityFunc->AddPoint(-1024.0, 0.0);
-  opacityFunc->AddPoint(-300.0, 0.0);
-  opacityFunc->AddPoint(-100.0, 0.0);
-  opacityFunc->AddPoint(100.0, 0.2);
-  opacityFunc->AddPoint(400.0, 0.5);
-  opacityFunc->AddPoint(3000.0, 1.0);
+  // Curve 1
+  opacityFunc->AddPoint(-713.84, 0.0);
+  opacityFunc->AddPoint(-653.98, 0.209);
+  opacityFunc->AddPoint(-640.25, 0.29);
+  opacityFunc->AddPoint(-590.33, 0.209);
+  opacityFunc->AddPoint(-544.65, 0.209);
+  // Curve 2
+  opacityFunc->AddPoint(66.73, 0.0);
+  opacityFunc->AddPoint(84.34, 0.189);
+  opacityFunc->AddPoint(366.83, 0.645);
+  opacityFunc->AddPoint(1585.43, 0.789);
 
   vtkNew<vtkVolumeProperty> property;
   property->SetColor(colorFunc);
