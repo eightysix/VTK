@@ -19,9 +19,8 @@ struct VolumeMapperUniforms {
   sampleDistance: f32,
   scalarMin: f32,
   scalarMax: f32,
-  padding: f32,
+  useJittering: f32,
 }
-
 
 @group(0) @binding(0) var<uniform> sceneTransform: SceneTransform;
 
@@ -52,6 +51,7 @@ fn vertexMain(input: VertexInput) -> VertexOutput {
 }
 
 struct FragmentInput {
+  @builtin(position) position: vec4<f32>,
   @location(0) localPos: vec3<f32>,
 }
 
@@ -61,6 +61,10 @@ struct FragmentOutput {
 }
 
 const MAX_RAY_STEPS: i32 = 2000;
+
+fn random(st: vec2<f32>) -> f32 {
+  return fract(sin(dot(st.xy, vec2<f32>(12.9898, 78.233))) * 43758.5453123);
+}
 
 fn intersectBox(orig: vec3<f32>, dir: vec3<f32>, boxMin: vec3<f32>, boxMax: vec3<f32>) -> vec2<f32> {
   let invDir = 1.0 / (dir + vec3<f32>(1e-8));
@@ -84,6 +88,7 @@ fn fragmentMain(input: FragmentInput) -> FragmentOutput {
   let startPoint = input.localPos;
   var rayDir = startPoint - cameraPos;
   let dirLength = length(rayDir);
+
   if (dirLength < 0.0001) {
     discard;
   }
@@ -93,8 +98,7 @@ fn fragmentMain(input: FragmentInput) -> FragmentOutput {
 
   let tStart = max(t.x, 0.0);
   if (tStart >= t.y) {
-    output.color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    return output;
+    discard;
   }
 
   let entryPoint = cameraPos + rayDir * tStart;
@@ -102,16 +106,17 @@ fn fragmentMain(input: FragmentInput) -> FragmentOutput {
   let totalDist = length(exitPoint - entryPoint);
   let maxSteps = min(max(1, i32(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
 
-  var currentPoint = entryPoint;
+  var jitter = 0.0;
+  if (volumeUniforms.useJittering > 0.5) {
+      jitter = random(input.position.xy) * stepSize;
+  }
+
+  var currentPoint = entryPoint + (rayDir * jitter);
   var accumulatedColor = vec3<f32>(0.0);
   var accumulatedOpacity = 0.0;
 
   for (var i = 0; i < maxSteps; i = i + 1) {
-    let texCoord = clamp(
-      currentPoint,
-      vec3<f32>(0.0),
-      vec3<f32>(1.0)
-    );
+    let texCoord = clamp(currentPoint, vec3<f32>(0.0), vec3<f32>(1.0));
     let rawScalar = textureSampleLevel(volumeTexture, volumeSampler, texCoord, 0.0).r;
 
     let scalarNorm = clamp(

@@ -16,6 +16,8 @@
 #include "vtkMatrix4x4.h"
 #include "vtkVolumeRayCastMapperShader.h"
 
+#include "vtkSMPTools.h"
+
 #include <algorithm>
 #include <cstring>
 #include <vector>
@@ -28,11 +30,35 @@ struct VolumeMapperUniforms
   float VolumeBoundsMax[4];
   float CameraVolumePos[4];
   float SampleDistance;
-  float ScalarMin;   // scalar data range – used by the shader to normalise
-  float ScalarMax;   // raw voxel values into [0,1] for the TF texture lookup
-  float Padding;     // keep 16-byte alignment
+  float ScalarMin;
+  float ScalarMax;
+  float UseJittering;
 };
 
+namespace
+{
+inline uint16_t FloatToHalf(float f)
+{
+  uint32_t bits;
+  std::memcpy(&bits, &f, sizeof(bits));
+  uint32_t sign = (bits >> 16) & 0x8000;
+  int32_t exponent = ((bits >> 23) & 0xFF) - 127 + 15;
+  uint32_t mantissa = bits & 0x7FFFFF;
+
+  if (exponent <= 0)
+  {
+    if (exponent < -10)
+      return static_cast<uint16_t>(sign);
+    mantissa = (mantissa | 0x800000) >> (1 - exponent);
+    return static_cast<uint16_t>(sign | (mantissa >> 13));
+  }
+  if (exponent == 0xFF - 127 + 15)
+    return static_cast<uint16_t>(sign | 0x7C00 | (mantissa ? (mantissa >> 13) : 0));
+  if (exponent > 30)
+    return static_cast<uint16_t>(sign | 0x7C00);
+  return static_cast<uint16_t>(sign | (exponent << 10) | (mantissa >> 13));
+}
+}
 
 VTK_ABI_NAMESPACE_BEGIN
 
@@ -145,98 +171,78 @@ bool vtkWebGPUGPUVolumeRayCastMapper::UpdateVolumeTexture(wgpu::Device device, w
     vtkIdType numTuples = scalars->GetNumberOfTuples();
     vtkIdType numValues = numTuples * numComponents;
 
-    // Convert all data to half-float (R16Float) for trilinear filtering support.
-    // R16Float is filterable in core WebGPU, unlike R32Float.
-    std::vector<uint16_t> halfData;
-    const void* uploadPointer = scalars->GetVoidPointer(0);
+    std::vector<uint16_t> halfData(numValues);
+    const void* uploadPointer = nullptr;
     wgpu::TextureFormat format = wgpu::TextureFormat::R16Float;
-
-    auto floatToHalf = [](float f) -> uint16_t {
-      uint32_t bits;
-      std::memcpy(&bits, &f, sizeof(bits));
-      uint32_t sign = (bits >> 16) & 0x8000;
-      int32_t exponent = ((bits >> 23) & 0xFF) - 127 + 15;
-      uint32_t mantissa = bits & 0x7FFFFF;
-
-      if (exponent <= 0)
-      {
-        if (exponent < -10)
-          return static_cast<uint16_t>(sign);
-        mantissa = (mantissa | 0x800000) >> (1 - exponent);
-        return static_cast<uint16_t>(sign | (mantissa >> 13));
-      }
-      if (exponent == 0xFF - 127 + 15)
-        return static_cast<uint16_t>(sign | 0x7C00 | (mantissa ? (mantissa >> 13) : 0));
-      if (exponent > 30)
-        return static_cast<uint16_t>(sign | 0x7C00);
-      return static_cast<uint16_t>(sign | (exponent << 10) | (mantissa >> 13));
-    };
-
-    halfData.resize(numValues);
 
     switch (dataType)
     {
       case VTK_FLOAT:
       {
         const float* ptr = static_cast<const float*>(scalars->GetVoidPointer(0));
-        for (vtkIdType i = 0; i < numValues; ++i)
-        {
-          halfData[i] = floatToHalf(ptr[i]);
-        }
+        vtkSMPTools::For(0, numValues, [&](vtkIdType begin, vtkIdType end) {
+          for (vtkIdType i = begin; i < end; ++i)
+            halfData[i] = FloatToHalf(ptr[i]);
+        });
         break;
       }
       case VTK_UNSIGNED_CHAR:
       {
-        const unsigned char* ptr = static_cast<const unsigned char*>(scalars->GetVoidPointer(0));
-        for (vtkIdType i = 0; i < numValues; ++i)
-        {
-          halfData[i] = floatToHalf(ptr[i] / 255.0f);
-        }
+        const unsigned char* ptr =
+          static_cast<const unsigned char*>(scalars->GetVoidPointer(0));
+        vtkSMPTools::For(0, numValues, [&](vtkIdType begin, vtkIdType end) {
+          for (vtkIdType i = begin; i < end; ++i)
+            halfData[i] = FloatToHalf(ptr[i] / 255.0f);
+        });
         break;
       }
       case VTK_SHORT:
       {
         const short* ptr = static_cast<const short*>(scalars->GetVoidPointer(0));
-        for (vtkIdType i = 0; i < numValues; ++i)
-        {
-          halfData[i] = floatToHalf(static_cast<float>(ptr[i]));
-        }
+        vtkSMPTools::For(0, numValues, [&](vtkIdType begin, vtkIdType end) {
+          for (vtkIdType i = begin; i < end; ++i)
+            halfData[i] = FloatToHalf(static_cast<float>(ptr[i]));
+        });
         break;
       }
       case VTK_UNSIGNED_SHORT:
       {
-        const unsigned short* ptr = static_cast<const unsigned short*>(scalars->GetVoidPointer(0));
-        for (vtkIdType i = 0; i < numValues; ++i)
-        {
-          halfData[i] = floatToHalf(static_cast<float>(ptr[i]));
-        }
+        const unsigned short* ptr =
+          static_cast<const unsigned short*>(scalars->GetVoidPointer(0));
+        vtkSMPTools::For(0, numValues, [&](vtkIdType begin, vtkIdType end) {
+          for (vtkIdType i = begin; i < end; ++i)
+            halfData[i] = FloatToHalf(static_cast<float>(ptr[i]));
+        });
         break;
       }
       case VTK_INT:
       {
         const int* ptr = static_cast<const int*>(scalars->GetVoidPointer(0));
-        for (vtkIdType i = 0; i < numValues; ++i)
-        {
-          halfData[i] = floatToHalf(static_cast<float>(ptr[i]));
-        }
+        vtkSMPTools::For(0, numValues, [&](vtkIdType begin, vtkIdType end) {
+          for (vtkIdType i = begin; i < end; ++i)
+            halfData[i] = FloatToHalf(static_cast<float>(ptr[i]));
+        });
         break;
       }
       case VTK_UNSIGNED_INT:
       {
-        const unsigned int* ptr = static_cast<const unsigned int*>(scalars->GetVoidPointer(0));
-        for (vtkIdType i = 0; i < numValues; ++i)
-        {
-          halfData[i] = floatToHalf(static_cast<float>(ptr[i]));
-        }
+        const unsigned int* ptr =
+          static_cast<const unsigned int*>(scalars->GetVoidPointer(0));
+        vtkSMPTools::For(0, numValues, [&](vtkIdType begin, vtkIdType end) {
+          for (vtkIdType i = begin; i < end; ++i)
+            halfData[i] = FloatToHalf(static_cast<float>(ptr[i]));
+        });
         break;
       }
       default:
       {
-        for (vtkIdType i = 0; i < numValues; ++i)
-        {
-          halfData[i] = floatToHalf(
-            static_cast<float>(scalars->GetComponent(i / numComponents, i % numComponents)));
-        }
+        vtkSMPTools::For(0, numValues, [&](vtkIdType begin, vtkIdType end) {
+          for (vtkIdType i = begin; i < end; ++i)
+          {
+            halfData[i] = FloatToHalf(static_cast<float>(
+              scalars->GetComponent(i / numComponents, i % numComponents)));
+          }
+        });
         break;
       }
     }
@@ -279,17 +285,19 @@ bool vtkWebGPUGPUVolumeRayCastMapper::UpdateVolumeTexture(wgpu::Device device, w
         static_cast<size_t>(alignedBytesPerRow) * dims[1] * dims[2], 0);
       const uint8_t* src = static_cast<const uint8_t*>(uploadPointer);
 
-      for (int z = 0; z < dims[2]; ++z)
-      {
-        for (int y = 0; y < dims[1]; ++y)
+      vtkSMPTools::For(0, dims[2], [&](vtkIdType beginZ, vtkIdType endZ) {
+        for (vtkIdType z = beginZ; z < endZ; ++z)
         {
-          size_t dstOffset =
-            static_cast<size_t>(z) * dims[1] * alignedBytesPerRow + y * alignedBytesPerRow;
-          size_t srcOffset =
-            static_cast<size_t>(z) * dims[1] * unalignedBytesPerRow + y * unalignedBytesPerRow;
-          std::memcpy(alignedBuffer.data() + dstOffset, src + srcOffset, unalignedBytesPerRow);
+          for (int y = 0; y < dims[1]; ++y)
+          {
+            size_t dstOffset = static_cast<size_t>(z) * dims[1] * alignedBytesPerRow +
+              y * alignedBytesPerRow;
+            size_t srcOffset = static_cast<size_t>(z) * dims[1] * unalignedBytesPerRow +
+              y * unalignedBytesPerRow;
+            std::memcpy(alignedBuffer.data() + dstOffset, src + srcOffset, unalignedBytesPerRow);
+          }
         }
-      }
+      });
       queue.WriteTexture(
         &destination, alignedBuffer.data(), alignedBuffer.size(), &dataLayout, &writeSize);
     }
@@ -759,6 +767,8 @@ void vtkWebGPUGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol
         uniforms.ScalarMax = static_cast<float>(
           scalarRange[1] > scalarRange[0] ? scalarRange[1] : scalarRange[0] + 1.0);
       }
+
+      uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;
 
       queue.WriteBuffer(this->UniformBuffer, 0, &uniforms, sizeof(uniforms));
 
