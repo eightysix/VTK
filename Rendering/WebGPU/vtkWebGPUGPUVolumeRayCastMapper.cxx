@@ -27,9 +27,9 @@ struct VolumeMapperUniforms
   float VolumeBoundsMax[4];
   float CameraVolumePos[4];
   float SampleDistance;
-  float ScalarMin;   // scalar data range – used by the shader to normalise
-  float ScalarMax;   // raw voxel values into [0,1] for the TF texture lookup
-  float Padding;     // keep 16-byte alignment
+  float ScalarMin;
+  float ScalarMax;
+  float UseJittering;
 };
 
 
@@ -69,6 +69,9 @@ void vtkWebGPUGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNot
   this->ColorOpacityTexture = nullptr;
   this->ColorOpacityTextureView = nullptr;
   this->ColorOpacitySampler = nullptr;
+  this->NoiseTexture = nullptr;
+  this->NoiseTextureView = nullptr;
+  this->NoiseSampler = nullptr;
 }
 
 //------------------------------------------------------------------------------
@@ -408,6 +411,53 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, wgpu::R
     this->ColorOpacitySampler = device.CreateSampler(&samplerDesc);
   }
 
+  if (!this->NoiseTexture)
+  {
+    constexpr int noiseSize = 64;
+    std::vector<float> noiseData(noiseSize * noiseSize);
+    for (int y = 0; y < noiseSize; ++y)
+    {
+      for (int x = 0; x < noiseSize; ++x)
+      {
+        // Simple hash-based blue-noise approximation
+        unsigned int seed = static_cast<unsigned int>(x * 1973 + y * 9277 + 26699) | 1u;
+        seed = (seed * 1103515245u + 12345u) & 0x7fffffffu;
+        noiseData[y * noiseSize + x] = static_cast<float>(seed) / 2147483647.0f;
+      }
+    }
+
+    wgpu::TextureDescriptor noiseDesc = {};
+    noiseDesc.label = "vtkWebGPUGPUVolumeRayCastMapper::NoiseTexture";
+    noiseDesc.dimension = wgpu::TextureDimension::e2D;
+    noiseDesc.size = { noiseSize, noiseSize, 1 };
+    noiseDesc.format = wgpu::TextureFormat::R32Float;
+    noiseDesc.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
+    this->NoiseTexture = device.CreateTexture(&noiseDesc);
+    this->NoiseTextureView = this->NoiseTexture.CreateView();
+
+    wgpu::TexelCopyTextureInfo noiseDst = {};
+    noiseDst.texture = this->NoiseTexture;
+    noiseDst.mipLevel = 0;
+    noiseDst.origin = { 0, 0, 0 };
+    noiseDst.aspect = wgpu::TextureAspect::All;
+
+    wgpu::TexelCopyBufferLayout noiseLayout = {};
+    noiseLayout.offset = 0;
+    noiseLayout.bytesPerRow = noiseSize * sizeof(float);
+    noiseLayout.rowsPerImage = noiseSize;
+
+    wgpu::Extent3D noiseWriteSize = { noiseSize, noiseSize, 1 };
+    device.GetQueue().WriteTexture(&noiseDst, noiseData.data(), noiseData.size() * sizeof(float),
+      &noiseLayout, &noiseWriteSize);
+
+    wgpu::SamplerDescriptor noiseSamplerDesc = {};
+    noiseSamplerDesc.addressModeU = wgpu::AddressMode::Repeat;
+    noiseSamplerDesc.addressModeV = wgpu::AddressMode::Repeat;
+    noiseSamplerDesc.magFilter = wgpu::FilterMode::Nearest;
+    noiseSamplerDesc.minFilter = wgpu::FilterMode::Nearest;
+    this->NoiseSampler = device.CreateSampler(&noiseSamplerDesc);
+  }
+
   {
     // Binding layout must match the shader:
     //  0 - uniform buffer (vertex + fragment)
@@ -415,7 +465,9 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, wgpu::R
     //      required for R32Float which lacks the float32-filterable feature)
     //  2 - transferFunctionTexture: texture_2d<f32>, RGBA8Unorm -> filterable Float
     //  3 - transferFunctionSampler: filtering sampler
-    wgpu::BindGroupLayoutEntry entries[4] = {};
+    //  4 - noiseTexture: texture_2d<f32>, R32Float -> UnfilterableFloat
+    //  5 - noiseSampler: nearest-neighbor sampler for noise
+    wgpu::BindGroupLayoutEntry entries[6] = {};
 
     entries[0].binding = 0;
     entries[0].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
@@ -435,15 +487,24 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, wgpu::R
     entries[3].visibility = wgpu::ShaderStage::Fragment;
     entries[3].sampler.type = wgpu::SamplerBindingType::Filtering;
 
+    entries[4].binding = 4;
+    entries[4].visibility = wgpu::ShaderStage::Fragment;
+    entries[4].texture.sampleType = wgpu::TextureSampleType::UnfilterableFloat;
+    entries[4].texture.viewDimension = wgpu::TextureViewDimension::e2D;
+
+    entries[5].binding = 5;
+    entries[5].visibility = wgpu::ShaderStage::Fragment;
+    entries[5].sampler.type = wgpu::SamplerBindingType::NonFiltering;
+
     wgpu::BindGroupLayoutDescriptor bglDesc = {};
     bglDesc.label = "vtkWebGPUGPUVolumeRayCastMapper::BindGroupLayout";
-    bglDesc.entryCount = 4;
+    bglDesc.entryCount = 6;
     bglDesc.entries = entries;
     this->BindGroupLayout = device.CreateBindGroupLayout(&bglDesc);
   }
 
   {
-    wgpu::BindGroupEntry bgEntries[4] = {};
+    wgpu::BindGroupEntry bgEntries[6] = {};
 
     bgEntries[0].binding = 0;
     bgEntries[0].buffer = this->UniformBuffer;
@@ -458,10 +519,16 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, wgpu::R
     bgEntries[3].binding = 3;
     bgEntries[3].sampler = this->ColorOpacitySampler;
 
+    bgEntries[4].binding = 4;
+    bgEntries[4].textureView = this->NoiseTextureView;
+
+    bgEntries[5].binding = 5;
+    bgEntries[5].sampler = this->NoiseSampler;
+
     wgpu::BindGroupDescriptor bgDesc = {};
     bgDesc.label = "vtkWebGPUGPUVolumeRayCastMapper::BindGroup";
     bgDesc.layout = this->BindGroupLayout;
-    bgDesc.entryCount = 4;
+    bgDesc.entryCount = 6;
     bgDesc.entries = bgEntries;
     this->BindGroup = device.CreateBindGroup(&bgDesc);
   }
@@ -665,6 +732,8 @@ void vtkWebGPUGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol
         uniforms.ScalarMax = static_cast<float>(
           scalarRange[1] > scalarRange[0] ? scalarRange[1] : scalarRange[0] + 1.0);
       }
+
+      uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;
 
       queue.WriteBuffer(this->UniformBuffer, 0, &uniforms, sizeof(uniforms));
 
