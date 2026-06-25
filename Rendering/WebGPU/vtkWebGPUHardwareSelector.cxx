@@ -63,6 +63,12 @@ bool vtkWebGPUHardwareSelector::CaptureBuffers()
         vtkWebGPURenderWindow::SafeDownCast(this->Renderer->GetRenderWindow()))
   {
     this->BeginSelection();
+
+    // Temporarily disable MSAA because the IDs texture format (RGBA32Uint) does not
+    // support multisampling in WebGPU. Selection rendering is invisible to the user.
+    const int savedMultiSamples = wgpuRenderWindow->GetMultiSamples();
+    wgpuRenderWindow->SetMultiSamples(0);
+
     if (this->FieldAssociation == vtkDataObject::FIELD_ASSOCIATION_POINTS)
     {
       // render a second time and draw only points.
@@ -76,6 +82,10 @@ bool vtkWebGPUHardwareSelector::CaptureBuffers()
     wgpuRenderWindow->GetIdsData(
       this->Area[0], this->Area[1], this->Area[2], this->Area[3], this->IdBuffer);
     SAVE_SELECTION;
+
+    // Restore MSAA state; next Render() will recreate MSAA textures as needed.
+    wgpuRenderWindow->SetMultiSamples(savedMultiSamples);
+
     this->BuildPropHitList(this->PixBuffer[ACTOR_PASS]);
     this->EndSelection();
     return true;

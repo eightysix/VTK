@@ -120,6 +120,13 @@ public:
    */
   void DestroyRenderPipeline(const std::string& key);
 
+  /**
+   * Clear all cached render pipelines. Call this when a rendering parameter
+   * (e.g. sample count) changes such that all existing pipelines become invalid.
+   * Shader modules are retained as they remain valid across such changes.
+   */
+  void ClearPipelines();
+
 protected:
   vtkWebGPURenderPipelineCache();
   ~vtkWebGPURenderPipelineCache() override;

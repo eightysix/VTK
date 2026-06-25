@@ -841,9 +841,6 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, vtkRend
     return false;
   }
 
-  // The renderer's render pass always has two color attachments:
-  //   [0] BGRA8Unorm  - main color output
-  //   [1] RGBA32Uint  - hardware selector IDs
   wgpu::BlendState blend = {};
   blend.color.srcFactor = wgpu::BlendFactor::SrcAlpha;
   blend.color.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
@@ -852,17 +849,24 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, vtkRend
   blend.alpha.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
   blend.alpha.operation = wgpu::BlendOperation::Add;
 
+  // The renderer's render pass has 1 color attachment when MSAA is active
+  // and 2 otherwise (main color + hardware selector IDs).
+  // RGBA32Uint (IDs format) does not support multisampling.
+  const bool msaaActive = wgpuRenderWindow->GetMultiSamples() > 1;
   wgpu::ColorTargetState colorTargets[2] = {};
   colorTargets[0].format = wgpuRenderWindow->GetPreferredSurfaceTextureFormat();
   colorTargets[0].blend = &blend;
-  colorTargets[1].format = wgpuRenderWindow->GetPreferredSelectorIdsTextureFormat();
-  colorTargets[1].blend = nullptr;
-  colorTargets[1].writeMask = wgpu::ColorWriteMask::None;
+  if (!msaaActive)
+  {
+    colorTargets[1].format = wgpuRenderWindow->GetPreferredSelectorIdsTextureFormat();
+    colorTargets[1].blend = nullptr;
+    colorTargets[1].writeMask = wgpu::ColorWriteMask::None;
+  }
 
   wgpu::FragmentState fragmentState = {};
   fragmentState.module = shaderModule;
   fragmentState.entryPoint = "fragmentMain";
-  fragmentState.targetCount = 2;
+  fragmentState.targetCount = msaaActive ? 1 : 2;
   fragmentState.targets = colorTargets;
 
   wgpu::VertexAttribute vertAttr = {};
@@ -879,6 +883,7 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, vtkRend
   wgpu::RenderPipelineDescriptor pipelineDesc = {};
   pipelineDesc.label = "vtkWebGPUGPUVolumeRayCastMapper::RenderPipeline";
   pipelineDesc.layout = this->PipelineLayout;
+  pipelineDesc.multisample.count = wgpuRenderWindow->GetEffectiveSampleCount();
   pipelineDesc.vertex.module = shaderModule;
   pipelineDesc.vertex.entryPoint = "vertexMain";
   pipelineDesc.vertex.bufferCount = 1;

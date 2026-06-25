@@ -1,5 +1,20 @@
 #import "VTKBaseViewController.h"
 
+#include <execinfo.h>
+#include <signal.h>
+
+static void signalHandler(int sig) {
+    void* callstack[128];
+    int frames = backtrace(callstack, 128);
+    char** strs = backtrace_symbols(callstack, frames);
+    for (int i = 0; i < frames; i++) {
+        NSLog(@"  %s", strs[i]);
+    }
+    free(strs);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 #include "vtkCallbackCommand.h"
 #include "vtkIOSHardwareWindow.h"
 #include "vtkNew.h"
@@ -38,6 +53,7 @@
 
 - (void)viewDidLoad {
   [super viewDidLoad];
+  signal(SIGSEGV, signalHandler);
 
   [self setupVTKPipeline];
 
@@ -46,7 +62,7 @@
 
   _renderer->SetBackground(0.1, 0.1, 0.2);
   _renWin->AddRenderer(_renderer);
-  CGFloat scale = self.view.contentScaleFactor;
+  CGFloat scale = [UIScreen mainScreen].nativeScale;
   _renWin->SetSize((int)lround(scale * self.view.bounds.size.width),
                    (int)lround(scale * self.view.bounds.size.height));
   _iren->SetRenderWindow(_renWin);
@@ -223,7 +239,7 @@
 
 - (void)viewDidLayoutSubviews {
   [super viewDidLayoutSubviews];
-  CGFloat scale = self.view.contentScaleFactor;
+  CGFloat scale = [UIScreen mainScreen].nativeScale;
   int w = (int)lround(scale * self.view.bounds.size.width);
   int h = (int)lround(scale * self.view.bounds.size.height);
   _renWin->SetSize(w, h);

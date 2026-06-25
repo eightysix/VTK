@@ -177,9 +177,14 @@ std::string vtkWebGPURenderPipelineCache::GetPipelineKey(wgpu::RenderPipelineDes
   const auto topologyStr =
     vtk::to_string(static_cast<std::underlying_type<wgpu::PrimitiveTopology>::type>(
       descriptor->primitive.topology));
+  const auto sampleCountStr =
+    vtk::to_string(static_cast<std::uint32_t>(descriptor->multisample.count));
+  const auto targetCountStr =
+    vtk::to_string(static_cast<std::uint32_t>(descriptor->fragment->targetCount));
   std::string hash;
   this->Internals->ComputeMD5({ vertexShaderSource, fragmentShaderSource, cullModeStr, topologyStr,
-                                descriptor->vertex.entryPoint, descriptor->fragment->entryPoint },
+                                descriptor->vertex.entryPoint, descriptor->fragment->entryPoint,
+                                sampleCountStr, targetCountStr },
     hash);
   return hash;
 }
@@ -348,6 +353,12 @@ bool vtkWebGPURenderPipelineCache::Substitute(
 void vtkWebGPURenderPipelineCache::DestroyRenderPipeline(const std::string& key)
 {
   this->Internals->PipelineCache.erase(key);
+}
+
+//------------------------------------------------------------------------------
+void vtkWebGPURenderPipelineCache::ClearPipelines()
+{
+  this->Internals->PipelineCache.clear();
 }
 
 VTK_ABI_NAMESPACE_END

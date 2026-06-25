@@ -239,9 +239,26 @@ public:
 
   /**
    * Get a view of the color attachment used in the offscreen render target.
+   * When MSAA is active, this returns the multisampled view (for use as the
+   * render pass color attachment, with resolveTarget set to the single-sample view).
    */
   wgpu::TextureView GetOffscreenColorAttachmentView();
+
+  /**
+   * Get a view of the single-sample (resolve target) hardware selector IDs attachment.
+   * RGBA32Uint does not support multisampling in WebGPU, so the IDs attachment is only
+   * used single-sample. When MSAA is active, the render pass uses 1 color attachment
+   * (color-only) and hardware selection temporarily disables MSAA.
+   */
   wgpu::TextureView GetHardwareSelectorAttachmentView();
+
+  /**
+   * Get a view of the single-sample (resolve target) color attachment.
+   * When MSAA is active, this is the texture that the multisampled color
+   * gets resolved into. When MSAA is not active, this is the same as
+   * GetOffscreenColorAttachmentView().
+   */
+  wgpu::TextureView GetResolveColorAttachmentView();
 
   /**
    * Get a view of the depth-stencil attachment used in the offscreen render target.
@@ -257,6 +274,12 @@ public:
    * Whether the offscreen render target has stencil capabilities.
    */
   bool HasStencil();
+
+  /**
+   * Get the effective sample count for multisampling.
+   * Returns this->MultiSamples if > 1, otherwise 1.
+   */
+  uint32_t GetEffectiveSampleCount();
 
   /**
    * Get the webgpu device.
@@ -502,6 +525,16 @@ private:
 
   ///@{
   /**
+   * Create/Destroy the multisampled color, depth, and IDs attachments used for MSAA rendering.
+   * When MultiSamples > 1, these are used as the actual render targets, and the regular
+   * ColorAttachment/DepthStencilAttachment/IdsAttachment serve as resolve targets.
+   */
+  void CreateMultisampleAttachments();
+  void DestroyMultisampleAttachments();
+  ///@}
+
+  ///@{
+  /**
    * Create/Destroy the render pipeline used to copy the offscreen color attachment to the surface's
    * current texture for presentation.
    */
@@ -555,6 +588,13 @@ private:
   vtkWGPUAttachment ColorAttachment;
   vtkWGPUAttachment IdsAttachment;
 
+  // MSAA textures (only valid when MultiSamples > 1)
+  // IDs attachment is NOT multisampled because RGBA32Uint does not support multisampling.
+  wgpu::Texture MultisampleColorTexture;
+  wgpu::TextureView MultisampleColorView;
+  wgpu::Texture MultisampleDepthTexture;
+  wgpu::TextureView MultisampleDepthView;
+
   struct vtkWGPUUserStagingPixelData
   {
     wgpu::Origin3D Origin;
@@ -582,6 +622,7 @@ private:
   int DepthCopyTextureIndex = 0;
 
   int ScreenSize[2];
+  int LastConfiguredMultiSamples = -1;
 
   // Render textures acquired by the user on this render window. They are kept here in case the
   // render window is resized, in which case, we'll need to resize the render textures --> We need

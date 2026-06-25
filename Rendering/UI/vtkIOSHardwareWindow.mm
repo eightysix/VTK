@@ -88,11 +88,9 @@ void vtkIOSHardwareWindow::SetSize(int width, int height)
   if (this->Size[0] != width || this->Size[1] != height)
   {
     this->Superclass::SetSize(width, height);
-    if (this->ViewId)
-    {
-      CGRect frame = CGRectMake(0, 0, (CGFloat)width, (CGFloat)height);
-      [this->ViewId setFrame:frame];
-    }
+    // Do not set the UIView frame here; the size is in pixels (for the Metal drawable),
+    // while the view frame is in points. The view is positioned via autoresizing or by
+    // the containing view controller (e.g. vtkView.frame = self.view.bounds).
     this->Modified();
   }
 }

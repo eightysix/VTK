@@ -108,6 +108,7 @@ vtkWebGPURenderWindow::vtkWebGPURenderWindow()
   this->ScreenSize[1] = 0;
   this->Size[0] = 300;
   this->Size[1] = 300;
+  this->MultiSamples = 4;
   this->WGPUConfiguration = vtk::TakeSmartPointer(vtkWebGPUConfiguration::New());
 }
 
@@ -325,6 +326,17 @@ wgpu::CommandEncoder vtkWebGPURenderWindow::GetCommandEncoder()
 //------------------------------------------------------------------------------
 wgpu::TextureView vtkWebGPURenderWindow::GetOffscreenColorAttachmentView()
 {
+  // When MSAA is active, return the multisampled view for rendering with resolve target
+  if (this->MultisampleColorView.Get() != nullptr)
+  {
+    return this->MultisampleColorView;
+  }
+  return this->ColorAttachment.View;
+}
+
+//------------------------------------------------------------------------------
+wgpu::TextureView vtkWebGPURenderWindow::GetResolveColorAttachmentView()
+{
   return this->ColorAttachment.View;
 }
 
@@ -337,6 +349,11 @@ wgpu::TextureView vtkWebGPURenderWindow::GetHardwareSelectorAttachmentView()
 //------------------------------------------------------------------------------
 wgpu::TextureView vtkWebGPURenderWindow::GetDepthStencilView()
 {
+  // When MSAA is active, return the multisampled depth view for per-sample depth testing
+  if (this->MultisampleDepthView.Get() != nullptr)
+  {
+    return this->MultisampleDepthView;
+  }
   return this->DepthStencilAttachment.View;
 }
 
@@ -350,6 +367,12 @@ wgpu::TextureFormat vtkWebGPURenderWindow::GetDepthStencilFormat()
 bool vtkWebGPURenderWindow::HasStencil()
 {
   return this->DepthStencilAttachment.HasStencil;
+}
+
+//------------------------------------------------------------------------------
+uint32_t vtkWebGPURenderWindow::GetEffectiveSampleCount()
+{
+  return this->MultiSamples > 1 ? static_cast<uint32_t>(this->MultiSamples) : 1;
 }
 
 //------------------------------------------------------------------------------
@@ -594,6 +617,8 @@ void vtkWebGPURenderWindow::DestroyDepthStencilAttachment()
   vtkDebugMacro(<< __func__);
   this->DepthStencilAttachment.View = nullptr;
   this->DepthStencilAttachment.Texture = nullptr;
+  this->MultisampleDepthView = nullptr;
+  this->MultisampleDepthTexture = nullptr;
 }
 
 //------------------------------------------------------------------------------
@@ -663,6 +688,8 @@ void vtkWebGPURenderWindow::DestroyOffscreenColorAttachment()
 {
   this->ColorAttachment.View = nullptr;
   this->ColorAttachment.Texture = nullptr;
+  this->MultisampleColorView = nullptr;
+  this->MultisampleColorTexture = nullptr;
 }
 
 //------------------------------------------------------------------------------
@@ -731,6 +758,107 @@ void vtkWebGPURenderWindow::DestroyIdsAttachment()
 {
   this->IdsAttachment.View = nullptr;
   this->IdsAttachment.Texture = nullptr;
+}
+
+//------------------------------------------------------------------------------
+void vtkWebGPURenderWindow::CreateMultisampleAttachments()
+{
+  auto sampleCount = this->GetEffectiveSampleCount();
+  if (sampleCount <= 1)
+  {
+    return;
+  }
+
+  vtkWebGPUCheckUnconfigured(this);
+  auto device = this->WGPUConfiguration->GetDevice();
+  if (device == nullptr)
+  {
+    vtkErrorMacro(
+      << "Cannot create multisample attachments because WebGPU device is not ready!");
+    return;
+  }
+
+  wgpu::Extent3D textureExtent;
+  textureExtent.depthOrArrayLayers = 1;
+  textureExtent.width = this->SurfaceConfiguredSize[0];
+  textureExtent.height = this->SurfaceConfiguredSize[1];
+
+  // --- Multisampled color attachment ---
+  {
+    const std::string label = "MSAA-Color-" + this->GetObjectDescription();
+    wgpu::TextureDescriptor desc;
+    desc.label = label.c_str();
+    desc.size = textureExtent;
+    desc.mipLevelCount = 1;
+    desc.sampleCount = sampleCount;
+    desc.dimension = wgpu::TextureDimension::e2D;
+    desc.format = this->GetPreferredSurfaceTextureFormat();
+    desc.usage = wgpu::TextureUsage::RenderAttachment;
+    desc.viewFormatCount = 0;
+    desc.viewFormats = nullptr;
+
+    this->MultisampleColorTexture = this->WGPUConfiguration->CreateTexture(desc);
+    if (this->MultisampleColorTexture.Get() != nullptr)
+    {
+      wgpu::TextureViewDescriptor viewDesc;
+      viewDesc.dimension = wgpu::TextureViewDimension::e2D;
+      viewDesc.format = desc.format;
+      viewDesc.baseMipLevel = 0;
+      viewDesc.mipLevelCount = 1;
+      viewDesc.baseArrayLayer = 0;
+      viewDesc.arrayLayerCount = 1;
+      this->MultisampleColorView = this->WGPUConfiguration->CreateView(
+        this->MultisampleColorTexture, viewDesc);
+    }
+    if (this->MultisampleColorView.Get() == nullptr)
+    {
+      vtkErrorMacro(<< "Failed to create multisampled color attachment");
+    }
+  }
+
+  // --- Multisampled depth-stencil attachment ---
+  {
+    const std::string label = "MSAA-DepthStencil-" + this->GetObjectDescription();
+    wgpu::TextureDescriptor desc;
+    desc.label = label.c_str();
+    desc.dimension = wgpu::TextureDimension::e2D;
+    desc.size.width = this->SurfaceConfiguredSize[0];
+    desc.size.height = this->SurfaceConfiguredSize[1];
+    desc.size.depthOrArrayLayers = 1;
+    desc.sampleCount = sampleCount;
+    desc.format = wgpu::TextureFormat::Depth24PlusStencil8;
+    desc.mipLevelCount = 1;
+    desc.usage = wgpu::TextureUsage::RenderAttachment;
+
+    this->MultisampleDepthTexture = this->WGPUConfiguration->CreateTexture(desc);
+    if (this->MultisampleDepthTexture.Get() != nullptr)
+    {
+      wgpu::TextureViewDescriptor viewDesc;
+      viewDesc.dimension = wgpu::TextureViewDimension::e2D;
+      viewDesc.format = desc.format;
+      viewDesc.baseMipLevel = 0;
+      viewDesc.mipLevelCount = 1;
+      viewDesc.baseArrayLayer = 0;
+      viewDesc.arrayLayerCount = 1;
+      viewDesc.aspect = wgpu::TextureAspect::All;
+      this->MultisampleDepthView = this->WGPUConfiguration->CreateView(
+        this->MultisampleDepthTexture, viewDesc);
+    }
+    if (this->MultisampleDepthView.Get() == nullptr)
+    {
+      vtkErrorMacro(<< "Failed to create multisampled depth-stencil attachment");
+    }
+  }
+
+}
+
+//------------------------------------------------------------------------------
+void vtkWebGPURenderWindow::DestroyMultisampleAttachments()
+{
+  this->MultisampleColorView = nullptr;
+  this->MultisampleColorTexture = nullptr;
+  this->MultisampleDepthView = nullptr;
+  this->MultisampleDepthTexture = nullptr;
 }
 
 //------------------------------------------------------------------------------
@@ -1236,8 +1364,10 @@ void vtkWebGPURenderWindow::Start()
     this->Initialize();
   }
 
-  if (this->Size[0] != this->SurfaceConfiguredSize[0] ||
-    this->Size[1] != this->SurfaceConfiguredSize[1])
+  bool sizeChanged = (this->Size[0] != this->SurfaceConfiguredSize[0] ||
+    this->Size[1] != this->SurfaceConfiguredSize[1]);
+
+  if (sizeChanged)
   {
     // Window's size changed, need to recreate the swap chain, textures, ...
     this->DestroyColorCopyPipeline();
@@ -1251,6 +1381,36 @@ void vtkWebGPURenderWindow::Start()
     this->CreateIdsAttachment();
     this->CreateColorCopyPipeline();
     this->RecreateComputeRenderTextures();
+  }
+
+  if (sizeChanged || this->MultiSamples != this->LastConfiguredMultiSamples)
+  {
+    bool sampleCountChanged = (this->MultiSamples != this->LastConfiguredMultiSamples);
+
+    this->DestroyMultisampleAttachments();
+    this->CreateMultisampleAttachments();
+
+    if (sampleCountChanged)
+    {
+      // Sample count changed: invalidate all cached pipelines so they
+      // are rebuilt with the new sample count. The color copy pipeline
+      // is always single-sample so it must be invalidated and recreated.
+      this->WGPUPipelineCache->ClearPipelines();
+      this->DestroyColorCopyPipeline();
+      this->CreateColorCopyPipeline();
+    }
+
+    this->LastConfiguredMultiSamples = this->MultiSamples;
+
+    // Invalidate render bundles in all renderers so they are rebuilt
+    // with the new sample count.
+    for (auto renderer : vtk::Range(this->Renderers))
+    {
+      if (auto* wgpuRenderer = vtkWebGPURenderer::SafeDownCast(renderer))
+      {
+        wgpuRenderer->InvalidateBundle();
+      }
+    }
   }
 
   this->CreateCommandEncoder();

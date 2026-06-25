@@ -194,6 +194,7 @@ void vtkWebGPURenderer::Clear()
   bkgPipelineDescriptor.vertex.bufferCount = 0;
   bkgPipelineDescriptor.cFragment.entryPoint = "fragmentMain";
   bkgPipelineDescriptor.cTargets[0].format = wgpuRenderWindow->GetPreferredSurfaceTextureFormat();
+  bkgPipelineDescriptor.multisample.count = wgpuRenderWindow->GetEffectiveSampleCount();
 
   auto depthState =
     bkgPipelineDescriptor.EnableDepthStencil(wgpuRenderWindow->GetDepthStencilFormat());
@@ -222,11 +223,15 @@ void vtkWebGPURenderer::Clear()
       blendState->alpha.dstFactor = wgpu::BlendFactor::Zero;
     }
   }
-  // Prepare selection ids output.
-  bkgPipelineDescriptor.cTargets[1].format =
-    wgpuRenderWindow->GetPreferredSelectorIdsTextureFormat();
-  bkgPipelineDescriptor.cFragment.targetCount++;
-  bkgPipelineDescriptor.DisableBlending(1);
+  // Prepare selection ids output (skipped when MSAA active; IDs format RGBA32Uint
+  // does not support multisampling, and the render pass uses only 1 color attachment).
+  if (wgpuRenderWindow->GetMultiSamples() <= 1)
+  {
+    bkgPipelineDescriptor.cTargets[1].format =
+      wgpuRenderWindow->GetPreferredSelectorIdsTextureFormat();
+    bkgPipelineDescriptor.cFragment.targetCount++;
+    bkgPipelineDescriptor.DisableBlending(1);
+  }
   const auto pipelineKey =
     wgpuPipelineCache->GetPipelineKey(&bkgPipelineDescriptor, backgroundShaderSource);
   wgpuPipelineCache->CreateRenderPipeline(
@@ -266,12 +271,31 @@ void vtkWebGPURenderer::RecordRenderCommands()
 {
   if (auto* wgpuRenderWindow = vtkWebGPURenderWindow::SafeDownCast(this->RenderWindow))
   {
+    const bool msaa = (wgpuRenderWindow->GetMultiSamples() > 1);
+
+    // When MSAA is active, use only 1 color attachment (color). The IDs attachment format
+    // RGBA32Uint does not support multisampling, so it's excluded from the MSAA render pass.
+    // Hardware selection temporarily disables MSAA when capturing IDs.
+    std::vector<wgpu::TextureView> colorViews;
+    colorViews.push_back(wgpuRenderWindow->GetOffscreenColorAttachmentView());
+    if (!msaa)
+    {
+      colorViews.push_back(wgpuRenderWindow->GetHardwareSelectorAttachmentView());
+    }
+
     vtkWebGPURenderPassDescriptorInternals renderPassDescriptor(
-      { wgpuRenderWindow->GetOffscreenColorAttachmentView(),
-        wgpuRenderWindow->GetHardwareSelectorAttachmentView() },
-      wgpuRenderWindow->GetDepthStencilView(),
+      colorViews, wgpuRenderWindow->GetDepthStencilView(),
       /*clearColor=*/false, /*clearDepth=*/false, /*clearStencil=*/false);
     renderPassDescriptor.label = "vtkWebGPURenderer::RecordRenderCommands";
+
+    // When MSAA is active, set the resolve target so the multisampled color attachment
+    // resolves to the single-sample texture used for copy/present.
+    if (msaa)
+    {
+      renderPassDescriptor.ColorAttachments[0].resolveTarget =
+        wgpuRenderWindow->GetResolveColorAttachmentView();
+    }
+
     this->WGPURenderEncoder = wgpuRenderWindow->NewRenderPass(renderPassDescriptor);
     this->BeginRecording();
     // 1. Draw the background color/texture.
@@ -829,16 +853,20 @@ void vtkWebGPURenderer::BeginRecording()
     // create a new bundle encoder.
     const std::string label = this->GetObjectDescription();
     auto wgpuRenderWindow = vtkWebGPURenderWindow::SafeDownCast(this->GetRenderWindow());
-    const std::vector<wgpu::TextureFormat> colorFormats = {
-      wgpuRenderWindow->GetPreferredSurfaceTextureFormat(),
-      wgpuRenderWindow->GetPreferredSelectorIdsTextureFormat()
-    };
+    std::vector<wgpu::TextureFormat> colorFormats;
+    colorFormats.push_back(wgpuRenderWindow->GetPreferredSurfaceTextureFormat());
+    // IDs attachment format RGBA32Uint does not support multisampling; exclude
+    // when MSAA is active so the bundle encoder matches the render pass.
+    if (wgpuRenderWindow->GetMultiSamples() <= 1)
+    {
+      colorFormats.push_back(wgpuRenderWindow->GetPreferredSelectorIdsTextureFormat());
+    }
     wgpu::RenderBundleEncoderDescriptor bundleEncDesc;
     bundleEncDesc.colorFormatCount = colorFormats.size();
     bundleEncDesc.colorFormats = colorFormats.data();
     bundleEncDesc.depthStencilFormat = wgpuRenderWindow->GetDepthStencilFormat();
     bundleEncDesc.sampleCount =
-      1; // multi-sampling only works for 1 or 4 samples on some implementations.
+      wgpuRenderWindow->GetEffectiveSampleCount();
     bundleEncDesc.depthReadOnly = false;
     bundleEncDesc.stencilReadOnly = false;
     bundleEncDesc.label = label.c_str();

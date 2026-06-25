@@ -1196,6 +1196,7 @@ void vtkWebGPUPolyDataMapper2DInternals::UpdateBuffers(
     auto* wgpuPipelineCache = wgpuRenderWindow->GetWGPUPipelineCache();
 
     vtkWebGPURenderPipelineDescriptorInternals descriptor;
+    descriptor.multisample.count = wgpuRenderWindow->GetEffectiveSampleCount();
     descriptor.vertex.bufferCount = 0;
     descriptor.vertex.entryPoint = "main";
     descriptor.cFragment.entryPoint = "main";
@@ -1206,10 +1207,14 @@ void vtkWebGPUPolyDataMapper2DInternals::UpdateBuffers(
     depthState->depthWriteEnabled = true;
     depthState->depthCompare = wgpu::CompareFunction::Less;
     ///@}
-    // Prepare selection ids output.
-    descriptor.cTargets[1].format = wgpuRenderWindow->GetPreferredSelectorIdsTextureFormat();
-    descriptor.cFragment.targetCount++;
-    descriptor.DisableBlending(1);
+    // Prepare selection ids output (skipped when MSAA active; IDs format RGBA32Uint
+    // does not support multisampling, and the render pass uses only 1 color attachment).
+    if (wgpuRenderWindow->GetMultiSamples() <= 1)
+    {
+      descriptor.cTargets[1].format = wgpuRenderWindow->GetPreferredSelectorIdsTextureFormat();
+      descriptor.cFragment.targetCount++;
+      descriptor.DisableBlending(1);
+    }
 
     // Update local parameters that decide whether a pipeline must be rebuilt.
     this->RebuildGraphicsPipelines = false;
