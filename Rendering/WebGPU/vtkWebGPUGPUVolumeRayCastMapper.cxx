@@ -33,6 +33,7 @@ struct VolumeMapperUniforms
   float ScalarMin;
   float ScalarMax;
   float UseJittering;
+  float Padding[3]; // ensure 16-byte alignment
 };
 
 namespace
@@ -45,6 +46,14 @@ inline uint16_t FloatToHalf(float f)
   int32_t exponent = ((bits >> 23) & 0xFF) - 127 + 15;
   uint32_t mantissa = bits & 0x7FFFFF;
 
+  // Handle NaN and Inf
+  if ((bits & 0x7F800000) == 0x7F800000)
+  {
+    // Preserve sign, set exponent to half Inf/NaN (0x1F), shift mantissa
+    uint16_t halfMantissa = mantissa >> 13;
+    return static_cast<uint16_t>(sign | 0x7C00 | halfMantissa);
+  }
+
   if (exponent <= 0)
   {
     if (exponent < -10)
@@ -52,11 +61,9 @@ inline uint16_t FloatToHalf(float f)
     mantissa = (mantissa | 0x800000) >> (1 - exponent);
     return static_cast<uint16_t>(sign | (mantissa >> 13));
   }
-  if (exponent == 0xFF - 127 + 15)
-    return static_cast<uint16_t>(sign | 0x7C00 | (mantissa ? (mantissa >> 13) : 0));
   if (exponent > 30)
     return static_cast<uint16_t>(sign | 0x7C00);
-  return static_cast<uint16_t>(sign | (exponent << 10) | (mantissa >> 13));
+  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10) | (mantissa >> 13));
 }
 }
 
@@ -86,6 +93,7 @@ void vtkWebGPUGPUVolumeRayCastMapper::PrintSelf(ostream& os, vtkIndent indent)
 void vtkWebGPUGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotUsed(window))
 {
   this->Pipeline = nullptr;
+  this->PipelineLayout = nullptr;
   this->BindGroupLayout = nullptr;
   this->BindGroup = nullptr;
   this->UniformBuffer = nullptr;
@@ -169,105 +177,283 @@ bool vtkWebGPUGPUVolumeRayCastMapper::UpdateVolumeTexture(wgpu::Device device, w
     int dataType = scalars->GetDataType();
     int numComponents = scalars->GetNumberOfComponents();
     vtkIdType numTuples = scalars->GetNumberOfTuples();
-    vtkIdType numValues = numTuples * numComponents;
 
-    std::vector<uint16_t> halfData(numValues);
-    const void* uploadPointer = nullptr;
-    wgpu::TextureFormat format = wgpu::TextureFormat::R16Float;
+    this->VolumeNumComponents = numComponents;
+
+    // Store model-space bounds for use in SetupBuffers and GPURender
+    double origin[3], spacing[3];
+    input->GetOrigin(origin);
+    input->GetSpacing(spacing);
+    this->ModelBounds[0] = origin[0];
+    this->ModelBounds[1] = origin[0] + spacing[0] * (dims[0] - 1);
+    this->ModelBounds[2] = origin[1];
+    this->ModelBounds[3] = origin[1] + spacing[1] * (dims[1] - 1);
+    this->ModelBounds[4] = origin[2];
+    this->ModelBounds[5] = origin[2] + spacing[2] * (dims[2] - 1);
+
+    // Select optimal texture format for this data type
+    // WebGPU component format names:
+    //   1 comp: R, 2 comp: RG, 4 comp: RGBA (no RGB/3-component formats)
+    int componentsForFormat = (numComponents == 3) ? 4 : numComponents;
+
+    struct FormatInfo
+    {
+      wgpu::TextureFormat format;
+      int bytesPerComponent;
+      // For unorm formats the shader reads value / maxForFormat.
+      // Normalization factor converts: shader_value * factor = original_value
+      float normalizationFactor;
+      bool needsConversion; // true if CPU conversion pass is needed
+    };
+
+    FormatInfo fmtInfo = {};
+    fmtInfo.needsConversion = true;
+    fmtInfo.normalizationFactor = 1.0f;
 
     switch (dataType)
     {
       case VTK_FLOAT:
       {
-        const float* ptr = static_cast<const float*>(scalars->GetVoidPointer(0));
-        vtkSMPTools::For(0, numValues, [&](vtkIdType begin, vtkIdType end) {
-          for (vtkIdType i = begin; i < end; ++i)
-            halfData[i] = FloatToHalf(ptr[i]);
-        });
+        // R32Float only supports UnfilterableFloat sample type, but volume
+        // rendering requires trilinear filtering.  Store as float16 which
+        // supports Float (filterable) sample type.
+        fmtInfo.bytesPerComponent = 2;
+        fmtInfo.needsConversion = true;
+        fmtInfo.normalizationFactor = 1.0f;
+        switch (componentsForFormat)
+        {
+          case 1:
+            fmtInfo.format = wgpu::TextureFormat::R16Float;
+            break;
+          case 2:
+            fmtInfo.format = wgpu::TextureFormat::RG16Float;
+            break;
+          default:
+            fmtInfo.format = wgpu::TextureFormat::RGBA16Float;
+            break;
+        }
         break;
       }
       case VTK_UNSIGNED_CHAR:
       {
-        const unsigned char* ptr =
-          static_cast<const unsigned char*>(scalars->GetVoidPointer(0));
-        vtkSMPTools::For(0, numValues, [&](vtkIdType begin, vtkIdType end) {
-          for (vtkIdType i = begin; i < end; ++i)
-            halfData[i] = FloatToHalf(ptr[i] / 255.0f);
-        });
-        break;
-      }
-      case VTK_SHORT:
-      {
-        const short* ptr = static_cast<const short*>(scalars->GetVoidPointer(0));
-        vtkSMPTools::For(0, numValues, [&](vtkIdType begin, vtkIdType end) {
-          for (vtkIdType i = begin; i < end; ++i)
-            halfData[i] = FloatToHalf(static_cast<float>(ptr[i]));
-        });
+        fmtInfo.bytesPerComponent = 1;
+        fmtInfo.needsConversion = false;
+        fmtInfo.normalizationFactor = 255.0f;
+        switch (componentsForFormat)
+        {
+          case 1:
+            fmtInfo.format = wgpu::TextureFormat::R8Unorm;
+            break;
+          case 2:
+            fmtInfo.format = wgpu::TextureFormat::RG8Unorm;
+            break;
+          default:
+            fmtInfo.format = wgpu::TextureFormat::RGBA8Unorm;
+            break;
+        }
         break;
       }
       case VTK_UNSIGNED_SHORT:
       {
-        const unsigned short* ptr =
-          static_cast<const unsigned short*>(scalars->GetVoidPointer(0));
-        vtkSMPTools::For(0, numValues, [&](vtkIdType begin, vtkIdType end) {
-          for (vtkIdType i = begin; i < end; ++i)
-            halfData[i] = FloatToHalf(static_cast<float>(ptr[i]));
-        });
-        break;
-      }
-      case VTK_INT:
-      {
-        const int* ptr = static_cast<const int*>(scalars->GetVoidPointer(0));
-        vtkSMPTools::For(0, numValues, [&](vtkIdType begin, vtkIdType end) {
-          for (vtkIdType i = begin; i < end; ++i)
-            halfData[i] = FloatToHalf(static_cast<float>(ptr[i]));
-        });
-        break;
-      }
-      case VTK_UNSIGNED_INT:
-      {
-        const unsigned int* ptr =
-          static_cast<const unsigned int*>(scalars->GetVoidPointer(0));
-        vtkSMPTools::For(0, numValues, [&](vtkIdType begin, vtkIdType end) {
-          for (vtkIdType i = begin; i < end; ++i)
-            halfData[i] = FloatToHalf(static_cast<float>(ptr[i]));
-        });
+        fmtInfo.bytesPerComponent = 2;
+        fmtInfo.needsConversion = false;
+        fmtInfo.normalizationFactor = 65535.0f;
+        switch (componentsForFormat)
+        {
+          case 1:
+            fmtInfo.format = wgpu::TextureFormat::R16Unorm;
+            break;
+          case 2:
+            fmtInfo.format = wgpu::TextureFormat::RG16Unorm;
+            break;
+          default:
+            fmtInfo.format = wgpu::TextureFormat::RGBA16Unorm;
+            break;
+        }
         break;
       }
       default:
       {
-        vtkSMPTools::For(0, numValues, [&](vtkIdType begin, vtkIdType end) {
-          for (vtkIdType i = begin; i < end; ++i)
-          {
-            halfData[i] = FloatToHalf(static_cast<float>(
-              scalars->GetComponent(i / numComponents, i % numComponents)));
-          }
-        });
+        // All other types (SHORT, INT, UNSIGNED_INT, etc.) → convert to f16
+        fmtInfo.bytesPerComponent = 2;
+        fmtInfo.needsConversion = true;
+        fmtInfo.normalizationFactor = 1.0f;
+        switch (componentsForFormat)
+        {
+          case 1:
+            fmtInfo.format = wgpu::TextureFormat::R16Float;
+            break;
+          case 2:
+            fmtInfo.format = wgpu::TextureFormat::RG16Float;
+            break;
+          default:
+            fmtInfo.format = wgpu::TextureFormat::RGBA16Float;
+            break;
+        }
         break;
       }
     }
-    uploadPointer = halfData.data();
+
+    this->ScalarNormalizationFactor = fmtInfo.normalizationFactor;
+
+    const void* uploadPointer = nullptr;
+    std::vector<uint16_t> halfData;
+    std::vector<uint8_t> conversionBuffer;
+
+    if (fmtInfo.needsConversion)
+    {
+      // Convert to float16; handle 3→4 component expansion
+      int outputComponents = (numComponents == 3) ? 4 : numComponents;
+      halfData.resize(static_cast<size_t>(numTuples) * outputComponents);
+
+      switch (dataType)
+      {
+        case VTK_FLOAT:
+        {
+          const float* src = static_cast<const float*>(scalars->GetVoidPointer(0));
+          vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+            for (vtkIdType i = begin; i < end; ++i)
+            {
+              for (int c = 0; c < numComponents; ++c)
+                halfData[i * outputComponents + c] = FloatToHalf(src[i * numComponents + c]);
+              for (int c = numComponents; c < outputComponents; ++c)
+                halfData[i * outputComponents + c] = FloatToHalf(0.0f);
+            }
+          });
+          break;
+        }
+        case VTK_SHORT:
+        {
+          const short* src = static_cast<const short*>(scalars->GetVoidPointer(0));
+          vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+            for (vtkIdType i = begin; i < end; ++i)
+            {
+              for (int c = 0; c < numComponents; ++c)
+                halfData[i * outputComponents + c] = FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+              for (int c = numComponents; c < outputComponents; ++c)
+                halfData[i * outputComponents + c] = FloatToHalf(0.0f);
+            }
+          });
+          break;
+        }
+        case VTK_INT:
+        {
+          const int* src = static_cast<const int*>(scalars->GetVoidPointer(0));
+          vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+            for (vtkIdType i = begin; i < end; ++i)
+            {
+              for (int c = 0; c < numComponents; ++c)
+                halfData[i * outputComponents + c] = FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+              for (int c = numComponents; c < outputComponents; ++c)
+                halfData[i * outputComponents + c] = FloatToHalf(0.0f);
+            }
+          });
+          break;
+        }
+        case VTK_UNSIGNED_INT:
+        {
+          const unsigned int* src =
+            static_cast<const unsigned int*>(scalars->GetVoidPointer(0));
+          vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+            for (vtkIdType i = begin; i < end; ++i)
+            {
+              for (int c = 0; c < numComponents; ++c)
+                halfData[i * outputComponents + c] = FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+              for (int c = numComponents; c < outputComponents; ++c)
+                halfData[i * outputComponents + c] = FloatToHalf(0.0f);
+            }
+          });
+          break;
+        }
+        default:
+        {
+          vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+            for (vtkIdType i = begin; i < end; ++i)
+            {
+              for (int c = 0; c < numComponents; ++c)
+                halfData[i * outputComponents + c] = FloatToHalf(static_cast<float>(
+                  scalars->GetComponent(i, c)));
+              for (int c = numComponents; c < outputComponents; ++c)
+                halfData[i * outputComponents + c] = FloatToHalf(0.0f);
+            }
+          });
+          break;
+        }
+      }
+      uploadPointer = halfData.data();
+    }
+    else if (dataType == VTK_UNSIGNED_CHAR)
+    {
+      // Store directly; handle 3→4 component expansion
+      if (numComponents == 3)
+      {
+        const unsigned char* src = static_cast<const unsigned char*>(scalars->GetVoidPointer(0));
+        conversionBuffer.resize(static_cast<size_t>(numTuples) * 4);
+        vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+          for (vtkIdType i = begin; i < end; ++i)
+          {
+            conversionBuffer[i * 4 + 0] = src[i * 3 + 0];
+            conversionBuffer[i * 4 + 1] = src[i * 3 + 1];
+            conversionBuffer[i * 4 + 2] = src[i * 3 + 2];
+            conversionBuffer[i * 4 + 3] = 255;
+          }
+        });
+        uploadPointer = conversionBuffer.data();
+      }
+      else
+      {
+        uploadPointer = scalars->GetVoidPointer(0);
+      }
+    }
+    else if (dataType == VTK_UNSIGNED_SHORT)
+    {
+      // Store directly; handle 3→4 component expansion
+      if (numComponents == 3)
+      {
+        const unsigned short* src = static_cast<const unsigned short*>(scalars->GetVoidPointer(0));
+        conversionBuffer.resize(static_cast<size_t>(numTuples) * 4 * 2);
+        unsigned short* dst = reinterpret_cast<unsigned short*>(conversionBuffer.data());
+        vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+          for (vtkIdType i = begin; i < end; ++i)
+          {
+            dst[i * 4 + 0] = src[i * 3 + 0];
+            dst[i * 4 + 1] = src[i * 3 + 1];
+            dst[i * 4 + 2] = src[i * 3 + 2];
+            dst[i * 4 + 3] = 65535;
+          }
+        });
+        uploadPointer = conversionBuffer.data();
+      }
+      else
+      {
+        uploadPointer = scalars->GetVoidPointer(0);
+      }
+    }
 
     wgpu::TextureDescriptor texDesc = {};
     texDesc.label = "vtkWebGPUGPUVolumeRayCastMapper::VolumeTexture";
     texDesc.dimension = wgpu::TextureDimension::e3D;
     texDesc.size = extent;
-    texDesc.format = format;
+    texDesc.format = fmtInfo.format;
     texDesc.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
 
     this->VolumeTexture = device.CreateTexture(&texDesc);
+    if (!this->VolumeTexture)
+    {
+      vtkErrorMacro("Failed to create 3D volume texture");
+      return false;
+    }
     this->VolumeTextureView = this->VolumeTexture.CreateView();
 
     wgpu::TexelCopyTextureInfo destination = {};
     destination.texture = this->VolumeTexture;
     destination.mipLevel = 0;
-    destination.origin = {0, 0, 0};
+    destination.origin = { 0, 0, 0 };
     destination.aspect = wgpu::TextureAspect::All;
 
-    // R16Float: 2 bytes per pixel
-    uint32_t bytesPerPixel = 2 * numComponents;
+    int actualComponents = (numComponents == 3) ? 4 : numComponents;
+    uint32_t bytesPerPixel = fmtInfo.bytesPerComponent * actualComponents;
     uint32_t unalignedBytesPerRow = dims[0] * bytesPerPixel;
-    // WebGPU requires bytesPerRow to be a multiple of 256 bytes
     uint32_t alignedBytesPerRow = (unalignedBytesPerRow + 255) & ~255;
 
     wgpu::TexelCopyBufferLayout dataLayout = {};
@@ -277,8 +463,6 @@ bool vtkWebGPUGPUVolumeRayCastMapper::UpdateVolumeTexture(wgpu::Device device, w
 
     wgpu::Extent3D writeSize = extent;
 
-    // WriteTexture reads data sequentially using alignedBytesPerRow for stride,
-    // so the CPU buffer must be repacked to match the alignment.
     if (alignedBytesPerRow != unalignedBytesPerRow)
     {
       std::vector<uint8_t> alignedBuffer(
@@ -291,9 +475,9 @@ bool vtkWebGPUGPUVolumeRayCastMapper::UpdateVolumeTexture(wgpu::Device device, w
           for (int y = 0; y < dims[1]; ++y)
           {
             size_t dstOffset = static_cast<size_t>(z) * dims[1] * alignedBytesPerRow +
-              y * alignedBytesPerRow;
+              static_cast<size_t>(y) * alignedBytesPerRow;
             size_t srcOffset = static_cast<size_t>(z) * dims[1] * unalignedBytesPerRow +
-              y * unalignedBytesPerRow;
+              static_cast<size_t>(y) * unalignedBytesPerRow;
             std::memcpy(alignedBuffer.data() + dstOffset, src + srcOffset, unalignedBytesPerRow);
           }
         }
@@ -305,8 +489,6 @@ bool vtkWebGPUGPUVolumeRayCastMapper::UpdateVolumeTexture(wgpu::Device device, w
     {
       size_t totalBytes =
         static_cast<size_t>(dims[0]) * dims[1] * dims[2] * bytesPerPixel;
-      // uploadPointer (halfData) is safe to use here: WriteTexture copies to
-      // staging memory synchronously on the CPU side before returning.
       queue.WriteTexture(&destination, uploadPointer, totalBytes, &dataLayout, &writeSize);
     }
 
@@ -396,7 +578,7 @@ bool vtkWebGPUGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(wgpu::Device
 }
 
 //------------------------------------------------------------------------------
-bool vtkWebGPUGPUVolumeRayCastMapper::SetupBuffers(wgpu::Device device, vtkVolume* vol)
+bool vtkWebGPUGPUVolumeRayCastMapper::SetupBuffers(wgpu::Device device, vtkVolume* vol, vtkImageData* input)
 {
   if (!this->UniformBuffer)
   {
@@ -405,15 +587,42 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupBuffers(wgpu::Device device, vtkVolum
     bufDesc.size = sizeof(VolumeMapperUniforms);
     bufDesc.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
     this->UniformBuffer = device.CreateBuffer(&bufDesc);
+    if (!this->UniformBuffer)
+    {
+      vtkErrorMacro("Failed to create uniform buffer");
+      return false;
+    }
   }
 
-  double bounds[6];
-  vol->GetBounds(bounds);
+  // Use model-space bounds for vertex positions so the vertex shader's
+  // volumeToWorld matrix correctly positions the cube in world space.
+  if (input)
+  {
+    int dims[3];
+    double origin[3], spacing[3];
+    input->GetDimensions(dims);
+    input->GetOrigin(origin);
+    input->GetSpacing(spacing);
+    this->ModelBounds[0] = origin[0];
+    this->ModelBounds[1] = origin[0] + spacing[0] * (dims[0] - 1);
+    this->ModelBounds[2] = origin[1];
+    this->ModelBounds[3] = origin[1] + spacing[1] * (dims[1] - 1);
+    this->ModelBounds[4] = origin[2];
+    this->ModelBounds[5] = origin[2] + spacing[2] * (dims[2] - 1);
+  }
 
   if (!this->VertexBuffer || this->GetMTime() > this->VolumeUploadTime)
   {
-    float boundsMin[3] = { static_cast<float>(bounds[0]), static_cast<float>(bounds[2]), static_cast<float>(bounds[4]) };
-    float boundsMax[3] = { static_cast<float>(bounds[1]), static_cast<float>(bounds[3]), static_cast<float>(bounds[5]) };
+    float boundsMin[3] = {
+      static_cast<float>(this->ModelBounds[0]),
+      static_cast<float>(this->ModelBounds[2]),
+      static_cast<float>(this->ModelBounds[4])
+    };
+    float boundsMax[3] = {
+      static_cast<float>(this->ModelBounds[1]),
+      static_cast<float>(this->ModelBounds[3]),
+      static_cast<float>(this->ModelBounds[5])
+    };
 
     float vertices[] = {
       boundsMin[0], boundsMin[1], boundsMin[2],
@@ -443,7 +652,12 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupBuffers(wgpu::Device device, vtkVolum
       bufDesc.size = sizeof(vertices);
       bufDesc.usage = wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst;
       this->VertexBuffer = device.CreateBuffer(&bufDesc);
-      
+      if (!this->VertexBuffer)
+      {
+        vtkErrorMacro("Failed to create vertex buffer");
+        return false;
+      }
+
       device.GetQueue().WriteBuffer(this->VertexBuffer, 0, vertices, sizeof(vertices));
     }
 
@@ -453,7 +667,12 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupBuffers(wgpu::Device device, vtkVolum
       bufDesc.size = sizeof(indices);
       bufDesc.usage = wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst;
       this->IndexBuffer = device.CreateBuffer(&bufDesc);
-      
+      if (!this->IndexBuffer)
+      {
+        vtkErrorMacro("Failed to create index buffer");
+        return false;
+      }
+
       device.GetQueue().WriteBuffer(this->IndexBuffer, 0, indices, sizeof(indices));
     }
   }
@@ -462,9 +681,59 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupBuffers(wgpu::Device device, vtkVolum
 }
 
 //------------------------------------------------------------------------------
-bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, wgpu::RenderPassEncoder renderPass, vtkRenderer* ren)
+bool vtkWebGPUGPUVolumeRayCastMapper::CreateBindGroup()
 {
-  if (this->Pipeline && this->BindGroup)
+  if (this->BindGroup)
+  {
+    return true;
+  }
+  if (!this->BindGroupLayout || !this->UniformBuffer || !this->VolumeTextureView ||
+    !this->ColorOpacityTextureView || !this->ColorOpacitySampler || !this->VolumeSampler)
+  {
+    return false;
+  }
+
+  // Retrieve device from the stored render-window reference that is
+  // populated by the caller during the SyncDeviceResources stage.
+  if (!this->CachedDevice)
+  {
+    return false;
+  }
+
+  wgpu::BindGroupEntry bgEntries[5] = {};
+
+  bgEntries[0].binding = 0;
+  bgEntries[0].buffer = this->UniformBuffer;
+  bgEntries[0].size = sizeof(VolumeMapperUniforms);
+
+  bgEntries[1].binding = 1;
+  bgEntries[1].textureView = this->VolumeTextureView;
+
+  bgEntries[2].binding = 2;
+  bgEntries[2].textureView = this->ColorOpacityTextureView;
+
+  bgEntries[3].binding = 3;
+  bgEntries[3].sampler = this->ColorOpacitySampler;
+
+  bgEntries[4].binding = 4;
+  bgEntries[4].sampler = this->VolumeSampler;
+
+  wgpu::BindGroupDescriptor bgDesc = {};
+  bgDesc.label = "vtkWebGPUGPUVolumeRayCastMapper::BindGroup";
+  bgDesc.layout = this->BindGroupLayout;
+  bgDesc.entryCount = 5;
+  bgDesc.entries = bgEntries;
+
+  this->BindGroup = this->CachedDevice.CreateBindGroup(&bgDesc);
+  return this->BindGroup != nullptr;
+}
+
+//------------------------------------------------------------------------------
+bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, vtkRenderer* ren)
+{
+  // Pipeline and bind-group-layout are cached; only the bind group is recreated
+  // when textures change (see CreateBindGroup).
+  if (this->Pipeline)
   {
     return true;
   }
@@ -478,6 +747,11 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, wgpu::R
     shaderDesc.nextInChain = &wgslDesc;
     shaderDesc.label = "vtkWebGPUGPUVolumeRayCastMapper::ShaderModule";
     shaderModule = device.CreateShaderModule(&shaderDesc);
+    if (!shaderModule)
+    {
+      vtkErrorMacro("Failed to create shader module");
+      return false;
+    }
   }
 
   if (!this->ColorOpacitySampler)
@@ -505,8 +779,8 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, wgpu::R
   {
     // Binding layout must match the shader:
     //  0 - uniform buffer (vertex + fragment)
-    //  1 - volumeTexture: texture_3d<f32> – R16Float, filterable Float
-    //  2 - transferFunctionTexture: texture_2d<f32>, RGBA8Unorm -> filterable Float
+    //  1 - volumeTexture: texture_3d<f32>
+    //  2 - transferFunctionTexture: texture_2d<f32>
     //  3 - transferFunctionSampler: filtering sampler
     //  4 - volumeSampler: 3D linear sampler for trilinear filtering
     wgpu::BindGroupLayoutEntry entries[5] = {};
@@ -538,38 +812,20 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, wgpu::R
     bglDesc.entryCount = 5;
     bglDesc.entries = entries;
     this->BindGroupLayout = device.CreateBindGroupLayout(&bglDesc);
-  }
-
-  {
-    wgpu::BindGroupEntry bgEntries[5] = {};
-
-    bgEntries[0].binding = 0;
-    bgEntries[0].buffer = this->UniformBuffer;
-    bgEntries[0].size = sizeof(VolumeMapperUniforms);
-
-    bgEntries[1].binding = 1;
-    bgEntries[1].textureView = this->VolumeTextureView;
-
-    bgEntries[2].binding = 2;
-    bgEntries[2].textureView = this->ColorOpacityTextureView;
-
-    bgEntries[3].binding = 3;
-    bgEntries[3].sampler = this->ColorOpacitySampler;
-
-    bgEntries[4].binding = 4;
-    bgEntries[4].sampler = this->VolumeSampler;
-
-    wgpu::BindGroupDescriptor bgDesc = {};
-    bgDesc.label = "vtkWebGPUGPUVolumeRayCastMapper::BindGroup";
-    bgDesc.layout = this->BindGroupLayout;
-    bgDesc.entryCount = 5;
-    bgDesc.entries = bgEntries;
-    this->BindGroup = device.CreateBindGroup(&bgDesc);
+    if (!this->BindGroupLayout)
+    {
+      vtkErrorMacro("Failed to create bind group layout");
+      return false;
+    }
   }
 
   auto* wgpuRenderer = vtkWebGPURenderer::SafeDownCast(ren);
   auto* wgpuRenderWindow = vtkWebGPURenderWindow::SafeDownCast(ren->GetRenderWindow());
-  
+  if (!wgpuRenderer || !wgpuRenderWindow)
+  {
+    return false;
+  }
+
   std::vector<wgpu::BindGroupLayout> layouts;
   wgpuRenderer->PopulateBindgroupLayouts(layouts);
   layouts.push_back(this->BindGroupLayout);
@@ -578,12 +834,16 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, wgpu::R
   layoutDesc.label = "vtkWebGPUGPUVolumeRayCastMapper::PipelineLayout";
   layoutDesc.bindGroupLayoutCount = layouts.size();
   layoutDesc.bindGroupLayouts = layouts.data();
-  wgpu::PipelineLayout pipelineLayout = device.CreatePipelineLayout(&layoutDesc);
+  this->PipelineLayout = device.CreatePipelineLayout(&layoutDesc);
+  if (!this->PipelineLayout)
+  {
+    vtkErrorMacro("Failed to create pipeline layout");
+    return false;
+  }
 
   // The renderer's render pass always has two color attachments:
   //   [0] BGRA8Unorm  - main color output
   //   [1] RGBA32Uint  - hardware selector IDs
-  // Both must be declared in the pipeline or WebGPU raises an attachment-state error.
   wgpu::BlendState blend = {};
   blend.color.srcFactor = wgpu::BlendFactor::SrcAlpha;
   blend.color.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
@@ -596,7 +856,6 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, wgpu::R
   colorTargets[0].format = wgpuRenderWindow->GetPreferredSurfaceTextureFormat();
   colorTargets[0].blend = &blend;
   colorTargets[1].format = wgpuRenderWindow->GetPreferredSelectorIdsTextureFormat();
-  // Selector target: no blending; volume rendering does not participate in picking.
   colorTargets[1].blend = nullptr;
   colorTargets[1].writeMask = wgpu::ColorWriteMask::None;
 
@@ -619,7 +878,7 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, wgpu::R
 
   wgpu::RenderPipelineDescriptor pipelineDesc = {};
   pipelineDesc.label = "vtkWebGPUGPUVolumeRayCastMapper::RenderPipeline";
-  pipelineDesc.layout = pipelineLayout;
+  pipelineDesc.layout = this->PipelineLayout;
   pipelineDesc.vertex.module = shaderModule;
   pipelineDesc.vertex.entryPoint = "vertexMain";
   pipelineDesc.vertex.bufferCount = 1;
@@ -628,7 +887,6 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, wgpu::R
 
   pipelineDesc.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
   pipelineDesc.primitive.frontFace = wgpu::FrontFace::CCW;
-  // Draw back faces so fragments are generated even when camera is inside the volume
   pipelineDesc.primitive.cullMode = wgpu::CullMode::Front;
 
   wgpu::DepthStencilState depthStencil = {};
@@ -638,8 +896,13 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, wgpu::R
   pipelineDesc.depthStencil = &depthStencil;
 
   this->Pipeline = device.CreateRenderPipeline(&pipelineDesc);
+  if (!this->Pipeline)
+  {
+    vtkErrorMacro("Failed to create render pipeline");
+    return false;
+  }
 
-  return this->Pipeline != nullptr;
+  return true;
 }
 
 //------------------------------------------------------------------------------
@@ -655,10 +918,19 @@ void vtkWebGPUGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol
   wgpu::Device device = wgpuRenderWindow->GetDevice();
   wgpu::Queue queue = device.GetQueue();
 
+  // Cache device for use in CreateBindGroup
+  this->CachedDevice = device;
+
   switch (wgpuRenderer->GetRenderStage())
   {
     case vtkWebGPURenderer::RenderStageEnum::SyncDeviceResources:
     {
+      vtkImageData* input = vtkImageData::SafeDownCast(this->GetInput());
+      if (!input)
+      {
+        return;
+      }
+
       if (!this->UpdateVolumeTexture(device, queue, vol))
       {
         return;
@@ -667,11 +939,11 @@ void vtkWebGPUGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol
       {
         return;
       }
-      if (!this->SetupBuffers(device, vol))
+      if (!this->SetupBuffers(device, vol, input))
       {
         return;
       }
-      if (!this->SetupPipeline(device, nullptr, ren))
+      if (!this->SetupPipeline(device, ren))
       {
         return;
       }
@@ -685,16 +957,24 @@ void vtkWebGPUGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol
         return;
       }
 
-      if (!this->SetupPipeline(device, renderPass, ren))
+      if (!this->SetupPipeline(device, ren))
+      {
+        return;
+      }
+
+      // Recreate bind group if textures changed (invalidated by UpdateVolumeTexture
+      // or UpdateTransferFunctionTexture).
+      if (!this->BindGroup && !this->CreateBindGroup())
       {
         return;
       }
 
       VolumeMapperUniforms uniforms;
-      
+
+      // Model matrix transforms from model space (data coords) to world space.
       vtkNew<vtkMatrix4x4> modelMatrix;
       vol->GetModelToWorldMatrix(modelMatrix);
-      
+
       vtkNew<vtkMatrix4x4> invModelMatrix;
       vtkMatrix4x4::Invert(modelMatrix, invModelMatrix);
 
@@ -707,55 +987,50 @@ void vtkWebGPUGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol
         }
       }
 
-      double bounds[6];
-      vol->GetBounds(bounds);
-
-      // Bounds in world/model space (passed to shader for bounding-box geometry).
-      uniforms.VolumeBoundsMin[0] = static_cast<float>(bounds[0]);
-      uniforms.VolumeBoundsMin[1] = static_cast<float>(bounds[2]);
-      uniforms.VolumeBoundsMin[2] = static_cast<float>(bounds[4]);
+      // Bounds in model space (data coordinates).
+      double* modelBounds = this->ModelBounds;
+      uniforms.VolumeBoundsMin[0] = static_cast<float>(modelBounds[0]);
+      uniforms.VolumeBoundsMin[1] = static_cast<float>(modelBounds[2]);
+      uniforms.VolumeBoundsMin[2] = static_cast<float>(modelBounds[4]);
       uniforms.VolumeBoundsMin[3] = 1.0f;
 
-      uniforms.VolumeBoundsMax[0] = static_cast<float>(bounds[1]);
-      uniforms.VolumeBoundsMax[1] = static_cast<float>(bounds[3]);
-      uniforms.VolumeBoundsMax[2] = static_cast<float>(bounds[5]);
+      uniforms.VolumeBoundsMax[0] = static_cast<float>(modelBounds[1]);
+      uniforms.VolumeBoundsMax[1] = static_cast<float>(modelBounds[3]);
+      uniforms.VolumeBoundsMax[2] = static_cast<float>(modelBounds[5]);
       uniforms.VolumeBoundsMax[3] = 1.0f;
 
-      // The vertex shader maps vertex positions to localPos in [0,1]³ texture
-      // space.  The camera position must be expressed in the same space so that
-      // the ray direction is consistent.
+      // Camera position in model space → transform with invModelMatrix, then
+      // normalise into [0,1]³ using model-space bounds.
       double boundsSize[3] = {
-        bounds[1] - bounds[0],
-        bounds[3] - bounds[2],
-        bounds[5] - bounds[4]
+        modelBounds[1] - modelBounds[0],
+        modelBounds[3] - modelBounds[2],
+        modelBounds[5] - modelBounds[4]
       };
-      // Guard against degenerate (zero-size) bounds.
       for (int k = 0; k < 3; ++k)
       {
-        if (boundsSize[k] < 1e-10) boundsSize[k] = 1.0;
+        if (boundsSize[k] < 1e-10)
+          boundsSize[k] = 1.0;
       }
 
       double* camPosWorld = ren->GetActiveCamera()->GetPosition();
       double camPosVolume[4] = { camPosWorld[0], camPosWorld[1], camPosWorld[2], 1.0 };
       invModelMatrix->MultiplyPoint(camPosVolume, camPosVolume);
 
-      // Normalise camera position into [0,1]³ texture space.
       uniforms.CameraVolumePos[0] =
-        static_cast<float>((camPosVolume[0] - bounds[0]) / boundsSize[0]);
+        static_cast<float>((camPosVolume[0] - modelBounds[0]) / boundsSize[0]);
       uniforms.CameraVolumePos[1] =
-        static_cast<float>((camPosVolume[1] - bounds[2]) / boundsSize[1]);
+        static_cast<float>((camPosVolume[1] - modelBounds[2]) / boundsSize[1]);
       uniforms.CameraVolumePos[2] =
-        static_cast<float>((camPosVolume[2] - bounds[4]) / boundsSize[2]);
+        static_cast<float>((camPosVolume[2] - modelBounds[4]) / boundsSize[2]);
       uniforms.CameraVolumePos[3] = 1.0f;
 
-      // Normalise step size into [0,1]³ space.  Use the longest axis so the
-      // step is isotropic in normalised coordinates.
       double maxBoundsSize = std::max({ boundsSize[0], boundsSize[1], boundsSize[2] });
       uniforms.SampleDistance =
         static_cast<float>(this->GetSampleDistance() / maxBoundsSize);
 
-      // Scalar data range – needed by the shader to normalise raw voxel values
-      // into [0,1] before indexing the transfer-function texture.
+      // Scalar range: adjust for texture format normalization.
+      // For unorm formats (R8Unorm, R16Unorm) the shader reads value / maxOfFormat,
+      // so scalarMin/scalarMax must be in that same normalized space.
       {
         vtkImageData* inputImg = vtkImageData::SafeDownCast(this->GetInput());
         double scalarRange[2] = { 0.0, 1.0 };
@@ -763,9 +1038,10 @@ void vtkWebGPUGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol
         {
           inputImg->GetPointData()->GetScalars()->GetRange(scalarRange);
         }
-        uniforms.ScalarMin = static_cast<float>(scalarRange[0]);
+        float normFactor = this->ScalarNormalizationFactor;
+        uniforms.ScalarMin = static_cast<float>(scalarRange[0] / normFactor);
         uniforms.ScalarMax = static_cast<float>(
-          scalarRange[1] > scalarRange[0] ? scalarRange[1] : scalarRange[0] + 1.0);
+          (scalarRange[1] > scalarRange[0] ? scalarRange[1] : scalarRange[0] + 1.0) / normFactor);
       }
 
       uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;

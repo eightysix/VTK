@@ -14,6 +14,8 @@
 #include "vtkWrappingHints.h"         // For VTK_MARSHALAUTO
 #include "vtk_wgpu.h"                 // For WebGPU
 
+class vtkImageData;
+
 VTK_ABI_NAMESPACE_BEGIN
 
 class VTKRENDERINGWEBGPU_EXPORT VTK_MARSHALAUTO vtkWebGPUGPUVolumeRayCastMapper
@@ -67,7 +69,8 @@ private:
   wgpu::RenderPipeline Pipeline = nullptr;
   wgpu::BindGroupLayout BindGroupLayout = nullptr;
   wgpu::BindGroup BindGroup = nullptr;
-  
+  wgpu::PipelineLayout PipelineLayout = nullptr;
+
   // Buffers
   wgpu::Buffer UniformBuffer = nullptr;
   wgpu::Buffer VertexBuffer = nullptr;
@@ -83,6 +86,14 @@ private:
   wgpu::TextureView ColorOpacityTextureView = nullptr;
   wgpu::Sampler ColorOpacitySampler = nullptr;
 
+  // Volume state
+  double ModelBounds[6] = { 0.0, 1.0, 0.0, 1.0, 0.0, 1.0 };
+  float ScalarNormalizationFactor = 1.0f;
+  int VolumeNumComponents = 1;
+
+  // Cached device handle (set during SyncDeviceResources, used by CreateBindGroup)
+  wgpu::Device CachedDevice = nullptr;
+
   // Cache/timestamps
   vtkTimeStamp VolumeUploadTime;
   vtkTimeStamp TransferFunctionUploadTime;
@@ -90,8 +101,9 @@ private:
   // Helper methods
   bool UpdateVolumeTexture(wgpu::Device device, wgpu::Queue queue, vtkVolume* vol);
   bool UpdateTransferFunctionTexture(wgpu::Device device, wgpu::Queue queue, vtkVolume* vol);
-  bool SetupBuffers(wgpu::Device device, vtkVolume* vol);
-  bool SetupPipeline(wgpu::Device device, wgpu::RenderPassEncoder renderPass, vtkRenderer* ren);
+  bool SetupBuffers(wgpu::Device device, vtkVolume* vol, vtkImageData* input);
+  bool SetupPipeline(wgpu::Device device, vtkRenderer* ren);
+  bool CreateBindGroup();
 };
 
 VTK_ABI_NAMESPACE_END
