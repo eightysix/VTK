@@ -15,6 +15,7 @@
 #include "vtkCamera.h"
 #include "vtkMatrix4x4.h"
 #include "vtkVolumeRayCastMapperShader.h"
+#include "vtkWebGPUCamera.h"
 
 #include "vtkSMPTools.h"
 
@@ -842,7 +843,7 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupPipeline(wgpu::Device device, vtkRend
   }
 
   wgpu::BlendState blend = {};
-  blend.color.srcFactor = wgpu::BlendFactor::SrcAlpha;
+  blend.color.srcFactor = wgpu::BlendFactor::One;
   blend.color.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
   blend.color.operation = wgpu::BlendOperation::Add;
   blend.alpha.srcFactor = wgpu::BlendFactor::One;
@@ -952,29 +953,13 @@ void vtkWebGPUGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol
       {
         return;
       }
-      break;
-    }
-    case vtkWebGPURenderer::RenderStageEnum::RecordingCommands:
-    {
-      wgpu::RenderPassEncoder renderPass = wgpuRenderer->GetRenderPassEncoder();
-      if (!renderPass)
-      {
-        return;
-      }
 
-      if (!this->SetupPipeline(device, ren))
-      {
-        return;
-      }
-
-      // Recreate bind group if textures changed (invalidated by UpdateVolumeTexture
-      // or UpdateTransferFunctionTexture).
-      if (!this->BindGroup && !this->CreateBindGroup())
-      {
-        return;
-      }
-
-      VolumeMapperUniforms uniforms;
+      // Derive camera world position from the CACHED scene transforms --
+      // the same data that WriteSceneTransformsBuffer sends to the GPU.
+      // This guarantees bit-for-bit consistency: the camera position matches
+      // precisely the view matrix used by the vertex shader.
+      auto* wgpuCam = vtkWebGPUCamera::SafeDownCast(ren->GetActiveCamera());
+      wgpuCam->GetCachedCameraWorldPosition(this->StoredCameraPosition);
 
       // Model matrix transforms from model space (data coords) to world space.
       vtkNew<vtkMatrix4x4> modelMatrix;
@@ -982,6 +967,8 @@ void vtkWebGPUGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol
 
       vtkNew<vtkMatrix4x4> invModelMatrix;
       vtkMatrix4x4::Invert(modelMatrix, invModelMatrix);
+
+      VolumeMapperUniforms uniforms;
 
       for (int r = 0; r < 4; ++r)
       {
@@ -1004,8 +991,6 @@ void vtkWebGPUGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol
       uniforms.VolumeBoundsMax[2] = static_cast<float>(modelBounds[5]);
       uniforms.VolumeBoundsMax[3] = 1.0f;
 
-      // Camera position in model space → transform with invModelMatrix, then
-      // normalise into [0,1]³ using model-space bounds.
       double boundsSize[3] = {
         modelBounds[1] - modelBounds[0],
         modelBounds[3] - modelBounds[2],
@@ -1017,8 +1002,13 @@ void vtkWebGPUGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol
           boundsSize[k] = 1.0;
       }
 
-      double* camPosWorld = ren->GetActiveCamera()->GetPosition();
-      double camPosVolume[4] = { camPosWorld[0], camPosWorld[1], camPosWorld[2], 1.0 };
+      // Camera position in model space.
+      double camPosVolume[4] = {
+        this->StoredCameraPosition[0],
+        this->StoredCameraPosition[1],
+        this->StoredCameraPosition[2],
+        1.0
+      };
       invModelMatrix->MultiplyPoint(camPosVolume, camPosVolume);
 
       uniforms.CameraVolumePos[0] =
@@ -1034,8 +1024,6 @@ void vtkWebGPUGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol
         static_cast<float>(this->GetSampleDistance() / maxBoundsSize);
 
       // Scalar range: adjust for texture format normalization.
-      // For unorm formats (R8Unorm, R16Unorm) the shader reads value / maxOfFormat,
-      // so scalarMin/scalarMax must be in that same normalized space.
       {
         vtkImageData* inputImg = vtkImageData::SafeDownCast(this->GetInput());
         double scalarRange[2] = { 0.0, 1.0 };
@@ -1052,6 +1040,27 @@ void vtkWebGPUGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol
       uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;
 
       queue.WriteBuffer(this->UniformBuffer, 0, &uniforms, sizeof(uniforms));
+      break;
+    }
+    case vtkWebGPURenderer::RenderStageEnum::RecordingCommands:
+    {
+      wgpu::RenderPassEncoder renderPass = wgpuRenderer->GetRenderPassEncoder();
+      if (!renderPass)
+      {
+        return;
+      }
+
+      if (!this->SetupPipeline(device, ren))
+      {
+        return;
+      }
+
+      // Recreate bind group if textures changed (invalidated by UpdateVolumeTexture
+      // or UpdateTransferFunctionTexture).
+      if (!this->BindGroup && !this->CreateBindGroup())
+      {
+        return;
+      }
 
       renderPass.SetPipeline(this->Pipeline);
       renderPass.SetBindGroup(0, wgpuRenderer->GetSceneBindGroup());

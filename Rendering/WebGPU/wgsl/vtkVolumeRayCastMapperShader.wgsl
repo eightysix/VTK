@@ -62,18 +62,26 @@ struct FragmentOutput {
 
 const MAX_RAY_STEPS: i32 = 2000;
 
+fn hash3(p: vec3<f32>) -> f32 {
+  return fract(sin(dot(p, vec3<f32>(12.9898, 78.233, 45.164))) * 43758.5453123);
+}
+
 fn random(st: vec2<f32>) -> f32 {
   return fract(sin(dot(st.xy, vec2<f32>(12.9898, 78.233))) * 43758.5453123);
 }
 
 fn intersectBox(orig: vec3<f32>, dir: vec3<f32>, boxMin: vec3<f32>, boxMax: vec3<f32>) -> vec2<f32> {
   let invDir = 1.0 / (dir + vec3<f32>(1e-8));
+
   let tbot = invDir * (boxMin - orig);
   let ttop = invDir * (boxMax - orig);
+
   let tmin = min(ttop, tbot);
   let tmax = max(ttop, tbot);
+
   let t0 = max(max(tmin.x, tmin.y), tmin.z);
   let t1 = min(min(tmax.x, tmax.y), tmax.z);
+
   return vec2<f32>(t0, t1);
 }
 
@@ -108,7 +116,7 @@ fn fragmentMain(input: FragmentInput) -> FragmentOutput {
 
   var jitter = 0.0;
   if (volumeUniforms.useJittering > 0.5) {
-      jitter = random(input.position.xy) * stepSize;
+      jitter = hash3(input.localPos) * stepSize;
   }
 
   var currentPoint = entryPoint + (rayDir * jitter);

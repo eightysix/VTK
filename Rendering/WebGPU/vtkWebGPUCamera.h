@@ -27,6 +27,7 @@ public:
   void CacheSceneTransforms(vtkRenderer* renderer);
   inline void* GetCachedSceneTransforms() { return &(this->CachedSceneTransforms); }
   static std::size_t GetCacheSizeBytes() { return sizeof(SceneTransforms); }
+  void GetCachedCameraWorldPosition(double pos[3]);
 
   /**
    * Implement base class method. This function does not actually 'render' anything.

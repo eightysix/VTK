@@ -38,6 +38,27 @@ void vtkWebGPUCamera::Render(vtkRenderer* renderer)
 }
 
 //------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+void vtkWebGPUCamera::GetCachedCameraWorldPosition(double pos[3])
+{
+  // Reconstruct the view matrix from the cached (transposed) data.
+  // CachedSceneTransforms.ViewMatrix[i][j] = GetModelViewTransformMatrix()->GetElement(j, i)
+  vtkNew<vtkMatrix4x4> viewMat;
+  for (int i = 0; i < 4; ++i)
+  {
+    for (int j = 0; j < 4; ++j)
+    {
+      viewMat->SetElement(j, i, this->CachedSceneTransforms.ViewMatrix[i][j]);
+    }
+  }
+  vtkNew<vtkMatrix4x4> invViewMat;
+  vtkMatrix4x4::Invert(viewMat, invViewMat);
+  pos[0] = invViewMat->GetElement(0, 3);
+  pos[1] = invViewMat->GetElement(1, 3);
+  pos[2] = invViewMat->GetElement(2, 3);
+}
+
+//------------------------------------------------------------------------------
 void vtkWebGPUCamera::CacheSceneTransforms(vtkRenderer* renderer)
 {
   if (renderer == nullptr && this->LastRenderer == nullptr)
