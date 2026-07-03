@@ -75,6 +75,8 @@ static void signalHandler(int sig) {
   _iren->SetInteractorStyle(style);
 
   _iren->Initialize();
+  
+  static_cast<vtkWebGPURenderWindow*>([self renderWindow])->SetMultiSamples(0);
 
   _renderer->ResetCamera();
   _renWin->Render();
@@ -146,9 +148,25 @@ static void signalHandler(int sig) {
 
   [self forwardTouchPosition:recognizer];
 
+  CGPoint touch = [recognizer locationInView:recognizer.view];
+  static double s_prevX = 0, s_prevY = 0;
+  double dx = touch.x - s_prevX;
+  double dy = touch.y - s_prevY;
+  s_prevX = touch.x;
+  s_prevY = touch.y;
+
+  vtkCamera* cam = _renderer->GetActiveCamera();
+  double pos[3];
+  cam->GetPosition(pos);
+
+  NSLog(@"[Pan state=%ld trackball=%d dx=%.1f dy=%.1f pos=(%.1f,%.1f,%.1f)",
+        (long)recognizer.state, trackball, dx, dy, pos[0], pos[1], pos[2]);
+
   switch (recognizer.state) {
     case UIGestureRecognizerStateBegan:
       _trackballMode = trackball;
+      s_prevX = touch.x;
+      s_prevY = touch.y;
       if (trackball) {
         _iren->InvokeEvent(vtkCommand::LeftButtonPressEvent, nullptr);
       } else {
@@ -187,6 +205,8 @@ static void signalHandler(int sig) {
 
     case UIGestureRecognizerStateEnded:
     case UIGestureRecognizerStateCancelled:
+      s_prevX = 0;
+      s_prevY = 0;
       if (_trackballMode) {
         _iren->InvokeEvent(vtkCommand::LeftButtonReleaseEvent, nullptr);
       } else {
@@ -206,6 +226,15 @@ static void signalHandler(int sig) {
   [self forwardTouchPosition:recognizer];
 
   double angle = -[recognizer rotation] * 180.0 / M_PI;
+
+  static double s_prevAngle = 0;
+  double delta = angle - s_prevAngle;
+  s_prevAngle = angle;
+
+  vtkCamera* cam = _renderer->GetActiveCamera();
+  double posBefore[3];
+  cam->GetPosition(posBefore);
+
   _iren->SetRotation(angle);
 
   switch (recognizer.state) {
@@ -218,10 +247,20 @@ static void signalHandler(int sig) {
     case UIGestureRecognizerStateEnded:
     case UIGestureRecognizerStateCancelled:
       _iren->EndRotateEvent();
+      s_prevAngle = 0;
       break;
     default:
       break;
   }
+
+  double posAfter[3];
+  cam->GetPosition(posAfter);
+  double moved = sqrt((posAfter[0]-posBefore[0])*(posAfter[0]-posBefore[0]) +
+                      (posAfter[1]-posBefore[1])*(posAfter[1]-posBefore[1]) +
+                      (posAfter[2]-posBefore[2])*(posAfter[2]-posBefore[2]));
+  NSLog(@"[Rot state=%ld angle=%.2f delta=%.2f moved=%.2f pos=(%.1f,%.1f,%.1f)",
+        (long)recognizer.state, angle, delta, moved,
+        posAfter[0], posAfter[1], posAfter[2]);
 
   _renWin->Render();
 }

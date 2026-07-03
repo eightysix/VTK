@@ -7,6 +7,7 @@ struct SceneTransform {
   projection: mat4x4<f32>,
   normal: mat3x3<f32>,
   inverted_projection: mat4x4<f32>,
+  inverted_view: mat4x4<f32>,
   flags: u32
 }
 
@@ -82,11 +83,34 @@ fn fragmentMain(input: FragmentInput) -> FragmentOutput {
   var output: FragmentOutput;
   output.selectorId = vec4<u32>(0u, 0u, 0u, 0u);
 
-  let cameraPos = volumeUniforms.cameraVolumePos.xyz;
   let stepSize = volumeUniforms.sampleDistance;
 
-  let startPoint = input.localPos;
-  var rayDir = startPoint - cameraPos;
+  // Derive fragment's volume-space position from screen coordinates
+  // using the SAME matrices that transformed the vertices.
+  let viewport = sceneTransform.viewport;
+  let ndcX = (input.position.x - viewport.x) / viewport.z * 2.0 - 1.0;
+  let ndcY = (input.position.y - viewport.y) / viewport.w * 2.0 - 1.0;
+  let ndcZ = input.position.z;
+
+  // NDC -> clip space
+  let clipPos = vec4<f32>(ndcX, ndcY, ndcZ, 1.0);
+
+  // clip -> camera space (perspective divide after inverse projection)
+  let viewPosH = sceneTransform.inverted_projection * clipPos;
+  let viewPos = viewPosH.xyz / viewPosH.w;
+
+  // camera -> world space (inverse view stored WITHOUT transposition)
+  let worldPosH = sceneTransform.inverted_view * vec4<f32>(viewPos, 1.0);
+  let worldPos = worldPosH.xyz / worldPosH.w;
+
+  // world -> volume/model space, then normalize to [0,1]³
+  let modelPosH = volumeUniforms.worldToVolume * vec4<f32>(worldPos, 1.0);
+  let modelPos = modelPosH.xyz / modelPosH.w;
+  let boundsSize = volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz;
+  let fragVolumePos = (modelPos - volumeUniforms.volumeBoundsMin.xyz) / boundsSize;
+
+  let cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  var rayDir = fragVolumePos - cameraPos;
   let dirLength = length(rayDir);
 
   if (dirLength < 0.0001) {

@@ -100,7 +100,8 @@ std::size_t vtkWebGPURenderer::WriteSceneTransformsBuffer(std::size_t offset /*=
   const auto size = vtkWebGPUCamera::GetCacheSizeBytes();
   const auto data =
     reinterpret_cast<vtkWebGPUCamera*>(this->ActiveCamera)->GetCachedSceneTransforms();
-  wgpuConfiguration->WriteBuffer(this->SceneTransformBuffer, offset, data, size, "SceneTransforms");
+  wgpuConfiguration->WriteBuffer(
+    this->SceneTransformBuffers[this->CurrentSceneBufferIndex], offset, data, size, "SceneTransforms");
   wroteBytes += size;
   return wroteBytes;
 }
@@ -154,14 +155,17 @@ void vtkWebGPURenderer::CreateBuffers()
 
   auto* wgpuRenderWindow = vtkWebGPURenderWindow::SafeDownCast(this->GetRenderWindow());
   auto* wgpuConfiguration = wgpuRenderWindow->GetWGPUConfiguration();
-  bool createSceneBindGroup = false;
+  bool createSceneBindGroups = false;
 
-  if (this->SceneTransformBuffer == nullptr)
+  for (int i = 0; i < NUM_SCENE_BUFFERS; ++i)
   {
-    const std::string label = "SceneTransforms-" + this->GetObjectDescription();
-    this->SceneTransformBuffer = wgpuConfiguration->CreateBuffer(transformSizePadded,
-      wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst, false, label.c_str());
-    createSceneBindGroup = true;
+    if (this->SceneTransformBuffers[i] == nullptr)
+    {
+      const std::string label = "SceneTransforms-" + std::to_string(i) + "-" + this->GetObjectDescription();
+      this->SceneTransformBuffers[i] = wgpuConfiguration->CreateBuffer(transformSizePadded,
+        wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst, false, label.c_str());
+      createSceneBindGroups = true;
+    }
   }
 
   if (this->SceneLightsBuffer == nullptr)
@@ -169,12 +173,12 @@ void vtkWebGPURenderer::CreateBuffers()
     const std::string label = "LightInformation-" + this->GetObjectDescription();
     this->SceneLightsBuffer = wgpuConfiguration->CreateBuffer(lightSizePadded,
       wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, false, label.c_str());
-    createSceneBindGroup = true;
+    createSceneBindGroups = true;
   }
 
-  if (createSceneBindGroup)
+  if (createSceneBindGroups)
   {
-    this->SetupSceneBindGroup();
+    this->SetupSceneBindGroups();
   }
 }
 
@@ -262,6 +266,10 @@ void vtkWebGPURenderer::DeviceRender()
   this->PreRenderComputePipelines();
 
   this->RecordRenderCommands();
+
+  // Advance the scene buffer index AFTER recording, so the next frame
+  // writes to a different buffer while this frame's commands reference the current one.
+  this->CurrentSceneBufferIndex = (this->CurrentSceneBufferIndex + 1) % NUM_SCENE_BUFFERS;
 
   this->DrawBackgroundInClearPass = true;
 }
@@ -771,9 +779,13 @@ void vtkWebGPURenderer::ReleaseGraphicsResources(vtkWindow* w)
   this->Bundle = nullptr;
   this->WGPUBundleEncoder = nullptr;
   this->WGPURenderEncoder = nullptr;
-  this->SceneTransformBuffer = nullptr;
+  for (int i = 0; i < NUM_SCENE_BUFFERS; ++i)
+  {
+    this->SceneTransformBuffers[i] = nullptr;
+    this->SceneBindGroups[i] = nullptr;
+  }
+  this->CurrentSceneBufferIndex = 0;
   this->SceneLightsBuffer = nullptr;
-  this->SceneBindGroup = nullptr;
   this->SceneBindGroupLayout = nullptr;
 }
 
@@ -845,7 +857,7 @@ void vtkWebGPURenderer::BeginRecording()
 #if !defined(NDEBUG) && !defined(__EMSCRIPTEN__)
   this->WGPURenderEncoder.PushDebugGroup("Renderer start encoding");
 #endif
-  this->WGPURenderEncoder.SetBindGroup(0, this->SceneBindGroup);
+  this->WGPURenderEncoder.SetBindGroup(0, this->SceneBindGroups[this->CurrentSceneBufferIndex]);
   if (this->RebuildRenderBundle)
   {
     // destroy previous bundle.
@@ -872,7 +884,7 @@ void vtkWebGPURenderer::BeginRecording()
     bundleEncDesc.label = label.c_str();
     bundleEncDesc.nextInChain = nullptr;
     this->WGPUBundleEncoder = wgpuRenderWindow->NewRenderBundleEncoder(bundleEncDesc);
-    this->WGPUBundleEncoder.SetBindGroup(0, this->SceneBindGroup);
+    this->WGPUBundleEncoder.SetBindGroup(0, this->SceneBindGroups[this->CurrentSceneBufferIndex]);
   }
   else
   {
@@ -902,20 +914,23 @@ void vtkWebGPURenderer::SetupBindGroupLayouts()
 }
 
 //------------------------------------------------------------------------------
-void vtkWebGPURenderer::SetupSceneBindGroup()
+void vtkWebGPURenderer::SetupSceneBindGroups()
 {
   auto wgpuRenderWindow = vtkWebGPURenderWindow::SafeDownCast(this->GetRenderWindow());
   wgpu::Device device = wgpuRenderWindow->GetDevice();
 
-  this->SceneBindGroup =
-    vtkWebGPUBindGroupInternals::MakeBindGroup(device, this->SceneBindGroupLayout,
-      {
-        // clang-format off
-        { 0, this->SceneTransformBuffer },
-        { 1, this->SceneLightsBuffer }
-        // clang-format on
-      });
-  this->SceneBindGroup.SetLabel("SceneBindGroup");
+  for (int i = 0; i < NUM_SCENE_BUFFERS; ++i)
+  {
+    this->SceneBindGroups[i] =
+      vtkWebGPUBindGroupInternals::MakeBindGroup(device, this->SceneBindGroupLayout,
+        {
+          // clang-format off
+          { 0, this->SceneTransformBuffers[i] },
+          { 1, this->SceneLightsBuffer }
+          // clang-format on
+        });
+    this->SceneBindGroups[i].SetLabel("SceneBindGroup");
+  }
 }
 
 //------------------------------------------------------------------------------
