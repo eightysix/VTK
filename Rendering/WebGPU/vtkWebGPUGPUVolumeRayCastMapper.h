@@ -94,10 +94,6 @@ private:
   // Cached device handle (set during SyncDeviceResources, used by CreateBindGroup)
   wgpu::Device CachedDevice = nullptr;
 
-  // Camera position frozen during SyncDeviceResources to stay consistent
-  // with the SceneTransform buffer (written from the same camera snapshot).
-  double StoredCameraPosition[3] = { 0.0, 0.0, 0.0 };
-
   // Cache/timestamps
   vtkTimeStamp VolumeUploadTime;
   vtkTimeStamp TransferFunctionUploadTime;
