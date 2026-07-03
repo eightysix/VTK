@@ -110,7 +110,7 @@ public:
 
   wgpu::RenderPassEncoder GetRenderPassEncoder() { return this->WGPURenderEncoder; }
   wgpu::RenderBundleEncoder GetRenderBundleEncoder() { return this->WGPUBundleEncoder; }
-  wgpu::BindGroup GetSceneBindGroup() { return this->SceneBindGroups[this->CurrentSceneBufferIndex]; }
+  wgpu::BindGroup GetSceneBindGroup() { return this->SceneBindGroup; }
 
   void PopulateBindgroupLayouts(std::vector<wgpu::BindGroupLayout>& layouts)
   {
@@ -225,7 +225,7 @@ private:
   // Create buffers for the bind groups.
   void CreateBuffers();
   // Create scene bind group.
-  void SetupSceneBindGroups();
+  void SetupSceneBindGroup();
 
   // Start, finish recording commands.
   void BeginRecording();
@@ -304,12 +304,10 @@ private:
 
   wgpu::RenderPassEncoder WGPURenderEncoder;
   wgpu::RenderBundleEncoder WGPUBundleEncoder;
-  static constexpr int NUM_SCENE_BUFFERS = 3;
-  wgpu::Buffer SceneTransformBuffers[NUM_SCENE_BUFFERS] = {};
+  wgpu::Buffer SceneTransformBuffer;
   wgpu::Buffer SceneLightsBuffer;
-  int CurrentSceneBufferIndex = 0;
 
-  wgpu::BindGroup SceneBindGroups[NUM_SCENE_BUFFERS] = {};
+  wgpu::BindGroup SceneBindGroup;
   wgpu::BindGroupLayout SceneBindGroupLayout;
 
   // Render bundles enable faster rendering.

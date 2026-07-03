@@ -98,18 +98,6 @@ void vtkWebGPUCamera::CacheSceneTransforms(vtkRenderer* renderer)
         st.InvertedProjectionMatrix[i][j] = projection->GetElement(j, i);
       }
     }
-    // Inverted view matrix: same transposition as all other matrices.
-    // WGSL reads column-major, so storing transpose(V^{-1}) gives WGSL
-    // the correct column-vector camera→world transform.
-    vtkNew<vtkMatrix4x4> invView;
-    vtkMatrix4x4::Invert(view, invView);
-    for (int i = 0; i < 4; ++i)
-    {
-      for (int j = 0; j < 4; ++j)
-      {
-        st.InvertedViewMatrix[i][j] = invView->GetElement(j, i);
-      }
-    }
     auto [originX, originY, width, height] = this->ComputeYInvertedViewport(renderer);
     st.Viewport[0] = originX;
     st.Viewport[1] = originY;

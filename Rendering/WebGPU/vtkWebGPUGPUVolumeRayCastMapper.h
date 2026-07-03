@@ -68,13 +68,11 @@ private:
   // WebGPU pipeline objects
   wgpu::RenderPipeline Pipeline = nullptr;
   wgpu::BindGroupLayout BindGroupLayout = nullptr;
+  wgpu::BindGroup BindGroup = nullptr;
   wgpu::PipelineLayout PipelineLayout = nullptr;
 
-  // Buffers — triple-buffered uniform buffer to avoid Metal/iOS aliasing
-  static constexpr int NUM_UNIFORM_BUFFERS = 3;
-  wgpu::Buffer UniformBuffers[NUM_UNIFORM_BUFFERS] = {};
-  wgpu::BindGroup BindGroups[NUM_UNIFORM_BUFFERS] = {};
-  int CurrentBufferIndex = 0;
+  // Buffers
+  wgpu::Buffer UniformBuffer = nullptr;
   wgpu::Buffer VertexBuffer = nullptr;
   wgpu::Buffer IndexBuffer = nullptr;
   int IndexCount = 0;
@@ -105,7 +103,7 @@ private:
   bool UpdateTransferFunctionTexture(wgpu::Device device, wgpu::Queue queue, vtkVolume* vol);
   bool SetupBuffers(wgpu::Device device, vtkVolume* vol, vtkImageData* input);
   bool SetupPipeline(wgpu::Device device, vtkRenderer* ren);
-  bool CreateBindGroup(int bufferIndex);
+  bool CreateBindGroup();
 };
 
 VTK_ABI_NAMESPACE_END
