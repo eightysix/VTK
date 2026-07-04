@@ -25,6 +25,7 @@ public:
   void UpdateViewport(vtkRenderer* renderer) override;
 
   void* GetCachedSceneTransforms() { return &this->CachedSceneTransforms; }
+  static size_t GetSceneTransformsSize() { return sizeof(SceneTransforms); }
 
 protected:
   vtkMetalCamera();
@@ -45,6 +46,7 @@ private:
     float ModelMatrix[4][4] = {};
     float Viewport[4] = {};
     vtkTypeUInt32 Flags = 0;
+    float _Padding[3] = {}; // pad to 272 bytes to match Metal struct alignment
   };
   SceneTransforms CachedSceneTransforms;
 };

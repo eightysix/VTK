@@ -178,11 +178,12 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       if (!this->Internals->SceneUniformBuffer)
       {
         this->Internals->SceneUniformBuffer = [device
-          newBufferWithLength:144 // sizeof(SceneTransforms) approx
+          newBufferWithLength:vtkMetalCamera::GetSceneTransformsSize()
                      options:MTLResourceStorageModeShared];
       }
       memcpy([this->Internals->SceneUniformBuffer contents],
-             metalCamera->GetCachedSceneTransforms(), 144);
+             metalCamera->GetCachedSceneTransforms(),
+             vtkMetalCamera::GetSceneTransformsSize());
     }
 
     this->UpdateMaterialUniforms((__bridge void*)device, act);
@@ -381,6 +382,20 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   }
   if (!normals.empty())
   {
+    this->Internals->VertexNormalBuffer = [device
+      newBufferWithBytes:normals.data()
+                 length:normals.size() * sizeof(float)
+                options:MTLResourceStorageModeShared];
+  }
+  else if (!positions.empty())
+  {
+    // Vertex descriptor always requires a buffer at index 1 for normals.
+    // Fill with a default up-facing normal so the pipeline validates.
+    normals.assign(positions.size(), 0.0f);
+    for (size_t i = 1; i < normals.size(); i += 3)
+    {
+      normals[i] = 1.0f;
+    }
     this->Internals->VertexNormalBuffer = [device
       newBufferWithBytes:normals.data()
                  length:normals.size() * sizeof(float)

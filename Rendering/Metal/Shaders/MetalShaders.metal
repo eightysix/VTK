@@ -42,7 +42,7 @@ struct Light {
 struct LightUniforms {
   Light lights[MAX_LIGHTS];
   int lightCount;
-  float3 _padding;
+  float _padding[3];
 };
 
 // Vertex input attributes
@@ -62,7 +62,7 @@ struct VertexOut {
 // Vertex shader
 // ---------------------------------------------------------------------------
 vertex VertexOut vertex_main(VertexIn in [[stage_in]],
-                             constant SceneUniforms& scene [[buffer(1)]]) {
+                             constant SceneUniforms& scene [[buffer(2)]]) {
   VertexOut out;
 
   float4 worldPos = scene.modelMatrix * float4(in.position, 1.0);
@@ -122,7 +122,7 @@ fragment float4 fragment_main(VertexOut in [[stage_in]],
         float spotCos = dot(-lightDir, normalize(L.direction.xyz));
         float spotAngle = L.direction.w;
         float spotExponent = L.attenuation.w;
-        float spotCosCutoff = cos(radians(spotAngle));
+        float spotCosCutoff = cos(spotAngle * M_PI_F / 180.0);
         if (spotCos < spotCosCutoff) {
           attenuation = 0.0;
         } else {
