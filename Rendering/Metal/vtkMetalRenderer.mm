@@ -8,6 +8,7 @@
 #include "vtkObjectFactory.h"
 #include "vtkRenderer.h"
 #include "vtkRendererCollection.h"
+#include "vtkLightCollection.h"
 #include "vtkViewport.h"
 
 #import <Metal/Metal.h>
@@ -131,8 +132,11 @@ void vtkMetalRenderer::DeviceRender()
       this->ActiveCamera->UpdateViewport(this);
     }
 
-    // Create default lights if none exist (matching WebGPU renderer behavior)
-    this->UpdateLights();
+    // Create default headlight if none exist (matching WebGPU renderer behavior)
+    if (this->GetLights()->GetNumberOfItems() == 0 && this->AutomaticLightCreation)
+    {
+      this->CreateLight();
+    }
 
     // Render opaque geometry
     this->UpdateOpaquePolygonalGeometry();

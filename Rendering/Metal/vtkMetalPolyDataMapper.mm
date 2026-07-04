@@ -657,18 +657,21 @@ void vtkMetalPolyDataMapper::UpdateLightUniforms(void* mtlDevice, vtkRenderer* r
 
   if (count == 0)
   {
-    float dx = -0.3f, dy = -0.3f, dz = -1.0f;
-    float len = sqrtf(dx*dx + dy*dy + dz*dz);
+    // Headlight: at camera, type 0
     lu.lights[0].position[0] = 0.0f;
     lu.lights[0].position[1] = 0.0f;
     lu.lights[0].position[2] = 0.0f;
-    lu.lights[0].position[3] = 1.0f;
-    lu.lights[0].direction[0] = dx / len;
-    lu.lights[0].direction[1] = dy / len;
-    lu.lights[0].direction[2] = dz / len;
+    lu.lights[0].position[3] = 0.0f;
+    lu.lights[0].direction[0] = 0.0f;
+    lu.lights[0].direction[1] = 0.0f;
+    lu.lights[0].direction[2] = -1.0f;
     lu.lights[0].direction[3] = 0.0f;
     lu.lights[0].color[0] = lu.lights[0].color[1] = lu.lights[0].color[2] = 1.0f;
     lu.lights[0].color[3] = 1.0f;
+    lu.lights[0].attenuation[0] = 1.0f;
+    lu.lights[0].attenuation[1] = 0.0f;
+    lu.lights[0].attenuation[2] = 0.0f;
+    lu.lights[0].attenuation[3] = 0.0f;
     lu.lightCount = 1;
   }
 

@@ -85,11 +85,9 @@ fragment float4 fragment_main(VertexOut in [[stage_in]],
   float3 N = normalize(in.viewNormal);
 
   float3 matColor = material.color.rgb;
-  float ambientK = material.ambient.w;
-  float diffuseK = material.diffuse.w;
-  float specK = material.specular.w;
+  float3 matSpecular = material.specular.rgb * material.specular.w;
 
-  float3 totalAmbient = float3(0.0);
+  float3 totalAmbient = matColor * 0.3;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
@@ -102,19 +100,21 @@ fragment float4 fragment_main(VertexOut in [[stage_in]],
     float attenuation = 1.0;
     float df = 0.0;
     float3 reflDir = float3(0.0);
+    float3 toLight = float3(0.0);
 
     if (lightType == 0) {
-      // Headlight — N.z directly (positive = facing camera)
+      // Headlight — matches WebGPU: df = max(0.000001, normal_VC.z)
+      toLight = float3(0.0, 0.0, 1.0);
       df = max(N.z, 0.000001);
       reflDir = reflect(float3(0.0, 0.0, -1.0), N);
     } else if (lightType == 1) {
-      // Directional — stored direction is incident (light→scene), negate for surface→light
-      float3 toLight = normalize(-L.direction.xyz);
+      // Directional
+      toLight = normalize(-L.direction.xyz);
       df = max(dot(N, toLight), 0.0);
       reflDir = reflect(L.direction.xyz, N);
     } else {
       // Point or spot
-      float3 toLight = L.position.xyz - in.viewPos;
+      toLight = L.position.xyz - in.viewPos;
       float dist = length(toLight);
       toLight /= dist;
       attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
@@ -133,11 +133,13 @@ fragment float4 fragment_main(VertexOut in [[stage_in]],
       }
     }
 
-    totalAmbient += ambientK * matColor * lightColor;
-    totalDiffuse += diffuseK * matColor * df * lightColor * attenuation;
+    totalDiffuse += matColor * df * lightColor * attenuation;
 
-    float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
-    totalSpecular += specK * matColor * sf * lightColor * attenuation;
+    float NdotL = max(dot(N, toLight), 0.0);
+    if (NdotL > 0.0) {
+      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
+      totalSpecular += matSpecular * sf * lightColor * attenuation;
+    }
   }
 
   return float4(saturate(totalAmbient + totalDiffuse + totalSpecular), material.opacity);
