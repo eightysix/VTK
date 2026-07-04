@@ -95,8 +95,12 @@ void vtkWebGPUGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNot
   this->Pipeline = nullptr;
   this->PipelineLayout = nullptr;
   this->BindGroupLayout = nullptr;
-  this->BindGroup = nullptr;
-  this->UniformBuffer = nullptr;
+  for (int i = 0; i < NumUniformBuffers; ++i)
+  {
+    this->BindGroups[i] = nullptr;
+    this->UniformBuffers[i] = nullptr;
+  }
+  this->UniformBufferIndex = 0;
   this->VertexBuffer = nullptr;
   this->IndexBuffer = nullptr;
 
@@ -493,7 +497,10 @@ bool vtkWebGPUGPUVolumeRayCastMapper::UpdateVolumeTexture(wgpu::Device device, w
     }
 
     this->VolumeUploadTime.Modified();
-    this->BindGroup = nullptr;
+    for (int i = 0; i < NumUniformBuffers; ++i)
+    {
+      this->BindGroups[i] = nullptr;
+    }
   }
 
   return this->VolumeTexture != nullptr;
@@ -571,7 +578,10 @@ bool vtkWebGPUGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(wgpu::Device
     queue.WriteTexture(&destination, tfData, sizeof(tfData), &dataLayout, &writeSize);
 
     this->TransferFunctionUploadTime.Modified();
-    this->BindGroup = nullptr;
+    for (int i = 0; i < NumUniformBuffers; ++i)
+    {
+      this->BindGroups[i] = nullptr;
+    }
   }
 
   return this->ColorOpacityTexture != nullptr;
@@ -580,17 +590,20 @@ bool vtkWebGPUGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(wgpu::Device
 //------------------------------------------------------------------------------
 bool vtkWebGPUGPUVolumeRayCastMapper::SetupBuffers(wgpu::Device device, vtkVolume* vol, vtkImageData* input)
 {
-  if (!this->UniformBuffer)
+  for (int i = 0; i < NumUniformBuffers; ++i)
   {
-    wgpu::BufferDescriptor bufDesc = {};
-    bufDesc.label = "vtkWebGPUGPUVolumeRayCastMapper::UniformBuffer";
-    bufDesc.size = sizeof(VolumeMapperUniforms);
-    bufDesc.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
-    this->UniformBuffer = device.CreateBuffer(&bufDesc);
-    if (!this->UniformBuffer)
+    if (!this->UniformBuffers[i])
     {
-      vtkErrorMacro("Failed to create uniform buffer");
-      return false;
+      wgpu::BufferDescriptor bufDesc = {};
+      bufDesc.label = "vtkWebGPUGPUVolumeRayCastMapper::UniformBuffer";
+      bufDesc.size = sizeof(VolumeMapperUniforms);
+      bufDesc.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+      this->UniformBuffers[i] = device.CreateBuffer(&bufDesc);
+      if (!this->UniformBuffers[i])
+      {
+        vtkErrorMacro("Failed to create uniform buffer");
+        return false;
+      }
     }
   }
 
@@ -677,17 +690,17 @@ bool vtkWebGPUGPUVolumeRayCastMapper::SetupBuffers(wgpu::Device device, vtkVolum
     }
   }
 
-  return this->VertexBuffer && this->IndexBuffer && this->UniformBuffer;
+  return this->VertexBuffer && this->IndexBuffer && this->UniformBuffers[0];
 }
 
 //------------------------------------------------------------------------------
 bool vtkWebGPUGPUVolumeRayCastMapper::CreateBindGroup()
 {
-  if (this->BindGroup)
+  if (this->BindGroups[0])
   {
     return true;
   }
-  if (!this->BindGroupLayout || !this->UniformBuffer || !this->VolumeTextureView ||
+  if (!this->BindGroupLayout || !this->UniformBuffers[0] || !this->VolumeTextureView ||
     !this->ColorOpacityTextureView || !this->ColorOpacitySampler || !this->VolumeSampler)
   {
     return false;
@@ -700,32 +713,39 @@ bool vtkWebGPUGPUVolumeRayCastMapper::CreateBindGroup()
     return false;
   }
 
-  wgpu::BindGroupEntry bgEntries[5] = {};
+  for (int i = 0; i < NumUniformBuffers; ++i)
+  {
+    wgpu::BindGroupEntry bgEntries[5] = {};
 
-  bgEntries[0].binding = 0;
-  bgEntries[0].buffer = this->UniformBuffer;
-  bgEntries[0].size = sizeof(VolumeMapperUniforms);
+    bgEntries[0].binding = 0;
+    bgEntries[0].buffer = this->UniformBuffers[i];
+    bgEntries[0].size = sizeof(VolumeMapperUniforms);
 
-  bgEntries[1].binding = 1;
-  bgEntries[1].textureView = this->VolumeTextureView;
+    bgEntries[1].binding = 1;
+    bgEntries[1].textureView = this->VolumeTextureView;
 
-  bgEntries[2].binding = 2;
-  bgEntries[2].textureView = this->ColorOpacityTextureView;
+    bgEntries[2].binding = 2;
+    bgEntries[2].textureView = this->ColorOpacityTextureView;
 
-  bgEntries[3].binding = 3;
-  bgEntries[3].sampler = this->ColorOpacitySampler;
+    bgEntries[3].binding = 3;
+    bgEntries[3].sampler = this->ColorOpacitySampler;
 
-  bgEntries[4].binding = 4;
-  bgEntries[4].sampler = this->VolumeSampler;
+    bgEntries[4].binding = 4;
+    bgEntries[4].sampler = this->VolumeSampler;
 
-  wgpu::BindGroupDescriptor bgDesc = {};
-  bgDesc.label = "vtkWebGPUGPUVolumeRayCastMapper::BindGroup";
-  bgDesc.layout = this->BindGroupLayout;
-  bgDesc.entryCount = 5;
-  bgDesc.entries = bgEntries;
+    wgpu::BindGroupDescriptor bgDesc = {};
+    bgDesc.label = "vtkWebGPUGPUVolumeRayCastMapper::BindGroup";
+    bgDesc.layout = this->BindGroupLayout;
+    bgDesc.entryCount = 5;
+    bgDesc.entries = bgEntries;
 
-  this->BindGroup = this->CachedDevice.CreateBindGroup(&bgDesc);
-  return this->BindGroup != nullptr;
+    this->BindGroups[i] = this->CachedDevice.CreateBindGroup(&bgDesc);
+    if (!this->BindGroups[i])
+    {
+      return false;
+    }
+  }
+  return true;
 }
 
 //------------------------------------------------------------------------------
@@ -952,6 +972,93 @@ void vtkWebGPUGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol
       {
         return;
       }
+
+      // Recreate bind group if textures changed.
+      if (!this->BindGroups[0] && !this->CreateBindGroup())
+      {
+        return;
+      }
+
+      // Compute and write uniform data BEFORE the render pass encoder exists.
+      // Writing to a buffer that is currently bound in an active render pass
+      // can cause Dawn/Metal to split the pass or defer the update, leading to
+      // fragments reading stale data.
+      {
+        const int slot = this->UniformBufferIndex % NumUniformBuffers;
+
+        VolumeMapperUniforms uniforms;
+
+        vtkNew<vtkMatrix4x4> modelMatrix;
+        vol->GetModelToWorldMatrix(modelMatrix);
+
+        vtkNew<vtkMatrix4x4> invModelMatrix;
+        vtkMatrix4x4::Invert(modelMatrix, invModelMatrix);
+
+        for (int r = 0; r < 4; ++r)
+        {
+          for (int c = 0; c < 4; ++c)
+          {
+            uniforms.VolumeToWorldMatrix[c * 4 + r] = modelMatrix->GetElement(r, c);
+            uniforms.WorldToVolumeMatrix[c * 4 + r] = invModelMatrix->GetElement(r, c);
+          }
+        }
+
+        double* modelBounds = this->ModelBounds;
+        uniforms.VolumeBoundsMin[0] = static_cast<float>(modelBounds[0]);
+        uniforms.VolumeBoundsMin[1] = static_cast<float>(modelBounds[2]);
+        uniforms.VolumeBoundsMin[2] = static_cast<float>(modelBounds[4]);
+        uniforms.VolumeBoundsMin[3] = 1.0f;
+
+        uniforms.VolumeBoundsMax[0] = static_cast<float>(modelBounds[1]);
+        uniforms.VolumeBoundsMax[1] = static_cast<float>(modelBounds[3]);
+        uniforms.VolumeBoundsMax[2] = static_cast<float>(modelBounds[5]);
+        uniforms.VolumeBoundsMax[3] = 1.0f;
+
+        double boundsSize[3] = {
+          modelBounds[1] - modelBounds[0],
+          modelBounds[3] - modelBounds[2],
+          modelBounds[5] - modelBounds[4]
+        };
+        for (int k = 0; k < 3; ++k)
+        {
+          if (boundsSize[k] < 1e-10)
+            boundsSize[k] = 1.0;
+        }
+
+        double* camPosWorld = ren->GetActiveCamera()->GetPosition();
+        double camPosVolume[4] = { camPosWorld[0], camPosWorld[1], camPosWorld[2], 1.0 };
+        invModelMatrix->MultiplyPoint(camPosVolume, camPosVolume);
+
+        uniforms.CameraVolumePos[0] =
+          static_cast<float>((camPosVolume[0] - modelBounds[0]) / boundsSize[0]);
+        uniforms.CameraVolumePos[1] =
+          static_cast<float>((camPosVolume[1] - modelBounds[2]) / boundsSize[1]);
+        uniforms.CameraVolumePos[2] =
+          static_cast<float>((camPosVolume[2] - modelBounds[4]) / boundsSize[2]);
+        uniforms.CameraVolumePos[3] = 1.0f;
+
+        double maxBoundsSize = std::max({ boundsSize[0], boundsSize[1], boundsSize[2] });
+        uniforms.SampleDistance =
+          static_cast<float>(this->GetSampleDistance() / maxBoundsSize);
+
+        {
+          vtkImageData* inputImg = vtkImageData::SafeDownCast(this->GetInput());
+          double scalarRange[2] = { 0.0, 1.0 };
+          if (inputImg && inputImg->GetPointData()->GetScalars())
+          {
+            inputImg->GetPointData()->GetScalars()->GetRange(scalarRange);
+          }
+          float normFactor = this->ScalarNormalizationFactor;
+          uniforms.ScalarMin = static_cast<float>(scalarRange[0] / normFactor);
+          uniforms.ScalarMax = static_cast<float>(
+            (scalarRange[1] > scalarRange[0] ? scalarRange[1] : scalarRange[0] + 1.0) / normFactor);
+        }
+
+        uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;
+
+        queue.WriteBuffer(this->UniformBuffers[slot], 0, &uniforms, sizeof(uniforms));
+        this->ActiveUniformSlot = slot;
+      }
       break;
     }
     case vtkWebGPURenderer::RenderStageEnum::RecordingCommands:
@@ -967,99 +1074,20 @@ void vtkWebGPUGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol
         return;
       }
 
-      // Recreate bind group if textures changed (invalidated by UpdateVolumeTexture
-      // or UpdateTransferFunctionTexture).
-      if (!this->BindGroup && !this->CreateBindGroup())
+      if (!this->BindGroups[0])
       {
         return;
       }
 
-      VolumeMapperUniforms uniforms;
-
-      // Model matrix transforms from model space (data coords) to world space.
-      vtkNew<vtkMatrix4x4> modelMatrix;
-      vol->GetModelToWorldMatrix(modelMatrix);
-
-      vtkNew<vtkMatrix4x4> invModelMatrix;
-      vtkMatrix4x4::Invert(modelMatrix, invModelMatrix);
-
-      for (int r = 0; r < 4; ++r)
-      {
-        for (int c = 0; c < 4; ++c)
-        {
-          uniforms.VolumeToWorldMatrix[c * 4 + r] = modelMatrix->GetElement(r, c);
-          uniforms.WorldToVolumeMatrix[c * 4 + r] = invModelMatrix->GetElement(r, c);
-        }
-      }
-
-      // Bounds in model space (data coordinates).
-      double* modelBounds = this->ModelBounds;
-      uniforms.VolumeBoundsMin[0] = static_cast<float>(modelBounds[0]);
-      uniforms.VolumeBoundsMin[1] = static_cast<float>(modelBounds[2]);
-      uniforms.VolumeBoundsMin[2] = static_cast<float>(modelBounds[4]);
-      uniforms.VolumeBoundsMin[3] = 1.0f;
-
-      uniforms.VolumeBoundsMax[0] = static_cast<float>(modelBounds[1]);
-      uniforms.VolumeBoundsMax[1] = static_cast<float>(modelBounds[3]);
-      uniforms.VolumeBoundsMax[2] = static_cast<float>(modelBounds[5]);
-      uniforms.VolumeBoundsMax[3] = 1.0f;
-
-      // Camera position in model space → transform with invModelMatrix, then
-      // normalise into [0,1]³ using model-space bounds.
-      double boundsSize[3] = {
-        modelBounds[1] - modelBounds[0],
-        modelBounds[3] - modelBounds[2],
-        modelBounds[5] - modelBounds[4]
-      };
-      for (int k = 0; k < 3; ++k)
-      {
-        if (boundsSize[k] < 1e-10)
-          boundsSize[k] = 1.0;
-      }
-
-      double* camPosWorld = ren->GetActiveCamera()->GetPosition();
-      double camPosVolume[4] = { camPosWorld[0], camPosWorld[1], camPosWorld[2], 1.0 };
-      invModelMatrix->MultiplyPoint(camPosVolume, camPosVolume);
-
-      uniforms.CameraVolumePos[0] =
-        static_cast<float>((camPosVolume[0] - modelBounds[0]) / boundsSize[0]);
-      uniforms.CameraVolumePos[1] =
-        static_cast<float>((camPosVolume[1] - modelBounds[2]) / boundsSize[1]);
-      uniforms.CameraVolumePos[2] =
-        static_cast<float>((camPosVolume[2] - modelBounds[4]) / boundsSize[2]);
-      uniforms.CameraVolumePos[3] = 1.0f;
-
-      double maxBoundsSize = std::max({ boundsSize[0], boundsSize[1], boundsSize[2] });
-      uniforms.SampleDistance =
-        static_cast<float>(this->GetSampleDistance() / maxBoundsSize);
-
-      // Scalar range: adjust for texture format normalization.
-      // For unorm formats (R8Unorm, R16Unorm) the shader reads value / maxOfFormat,
-      // so scalarMin/scalarMax must be in that same normalized space.
-      {
-        vtkImageData* inputImg = vtkImageData::SafeDownCast(this->GetInput());
-        double scalarRange[2] = { 0.0, 1.0 };
-        if (inputImg && inputImg->GetPointData()->GetScalars())
-        {
-          inputImg->GetPointData()->GetScalars()->GetRange(scalarRange);
-        }
-        float normFactor = this->ScalarNormalizationFactor;
-        uniforms.ScalarMin = static_cast<float>(scalarRange[0] / normFactor);
-        uniforms.ScalarMax = static_cast<float>(
-          (scalarRange[1] > scalarRange[0] ? scalarRange[1] : scalarRange[0] + 1.0) / normFactor);
-      }
-
-      uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;
-
-      queue.WriteBuffer(this->UniformBuffer, 0, &uniforms, sizeof(uniforms));
-
       renderPass.SetPipeline(this->Pipeline);
       renderPass.SetBindGroup(0, wgpuRenderer->GetSceneBindGroup());
-      renderPass.SetBindGroup(1, this->BindGroup);
+      renderPass.SetBindGroup(1, this->BindGroups[this->ActiveUniformSlot]);
 
       renderPass.SetVertexBuffer(0, this->VertexBuffer);
       renderPass.SetIndexBuffer(this->IndexBuffer, wgpu::IndexFormat::Uint32);
       renderPass.DrawIndexed(this->IndexCount, 1, 0, 0, 0);
+
+      this->UniformBufferIndex++;
       break;
     }
     default:
