@@ -68,19 +68,11 @@ private:
   // WebGPU pipeline objects
   wgpu::RenderPipeline Pipeline = nullptr;
   wgpu::BindGroupLayout BindGroupLayout = nullptr;
+  wgpu::BindGroup BindGroup = nullptr;
   wgpu::PipelineLayout PipelineLayout = nullptr;
 
-  // Triple-buffered uniform buffer and bind groups to avoid GPU-CPU race
-  // condition on Mailbox present mode: while the GPU executes frame N's
-  // command buffer, the CPU can write frame N+1's uniforms into a
-  // different buffer slot, preventing data corruption.
-  static constexpr int NumUniformBuffers = 3;
-  wgpu::Buffer UniformBuffers[NumUniformBuffers] = {};
-  wgpu::BindGroup BindGroups[NumUniformBuffers] = {};
-  int UniformBufferIndex = 0;
-  int ActiveUniformSlot = 0;
-
   // Buffers
+  wgpu::Buffer UniformBuffer = nullptr;
   wgpu::Buffer VertexBuffer = nullptr;
   wgpu::Buffer IndexBuffer = nullptr;
   int IndexCount = 0;
