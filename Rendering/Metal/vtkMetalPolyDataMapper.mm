@@ -487,22 +487,45 @@ void vtkMetalPolyDataMapper::UpdateMaterialUniforms(void* mtlDevice, vtkActor* a
   vtkProperty* prop = actor->GetProperty();
 
   // Flat layout matching Metal shader's MaterialUniforms byte-for-byte.
-  // Metal float4 = 16 bytes aligned to 16.
-  float mu[20]; // 4+4+4+4 color/ambient/diffuse/specular + opacity + specPow + 2 pad
+  // ambientColor: rgb + ambient_intensity
+  // diffuseColor: rgb + diffuse_intensity
+  // specularColor: rgb + specular_intensity
+  // color: base color (unused in lighting)
+  // opacity, specularPower, 2 pad
+  float mu[20];
   memset(mu, 0, sizeof(mu));
 
+  // ambientColor.rgb = property ambient color, .w = ambient intensity
+  double ac[3];
+  prop->GetAmbientColor(ac);
+  mu[0] = static_cast<float>(ac[0]);
+  mu[1] = static_cast<float>(ac[1]);
+  mu[2] = static_cast<float>(ac[2]);
+  mu[3] = static_cast<float>(prop->GetAmbient());
+
+  // diffuseColor.rgb = property diffuse color, .w = diffuse intensity
+  double dc[3];
+  prop->GetDiffuseColor(dc);
+  mu[4] = static_cast<float>(dc[0]);
+  mu[5] = static_cast<float>(dc[1]);
+  mu[6] = static_cast<float>(dc[2]);
+  mu[7] = static_cast<float>(prop->GetDiffuse());
+
+  // specularColor.rgb = property specular color, .w = specular intensity
+  double sc[3];
+  prop->GetSpecularColor(sc);
+  mu[8] = static_cast<float>(sc[0]);
+  mu[9] = static_cast<float>(sc[1]);
+  mu[10] = static_cast<float>(sc[2]);
+  mu[11] = static_cast<float>(prop->GetSpecular());
+
+  // color = base actor color (unused in lighting shader)
   double rgb[3];
   prop->GetColor(rgb);
-  mu[0] = static_cast<float>(rgb[0]);
-  mu[1] = static_cast<float>(rgb[1]);
-  mu[2] = static_cast<float>(rgb[2]);
-  mu[3] = 1.0f;
-
-  mu[7] = static_cast<float>(prop->GetAmbient());  // ambient.w
-
-  mu[11] = static_cast<float>(prop->GetDiffuse()); // diffuse.w
-
-  mu[15] = static_cast<float>(prop->GetSpecular()); // specular.w
+  mu[12] = static_cast<float>(rgb[0]);
+  mu[13] = static_cast<float>(rgb[1]);
+  mu[14] = static_cast<float>(rgb[2]);
+  mu[15] = 1.0f;
 
   mu[16] = static_cast<float>(prop->GetOpacity());
   mu[17] = static_cast<float>(prop->GetSpecularPower());

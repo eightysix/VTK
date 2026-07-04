@@ -14,7 +14,7 @@ using namespace metal;
 struct SceneUniforms {
   float4x4 viewMatrix;
   float4x4 projectionMatrix;
-  float3x3 normalMatrix;       // inverse-transpose of view * model
+  float3x3 normalMatrix;       // inverse of view matrix 3x3 (matching WebGPU)
   float4x4 modelMatrix;
   float4 viewport;             // x, y, width, height
   uint flags;
@@ -22,10 +22,10 @@ struct SceneUniforms {
 
 // Per-material uniforms
 struct MaterialUniforms {
-  float4 color;                // rgba
-  float4 ambient;              // rgb + intensity
-  float4 diffuse;              // rgb + intensity
-  float4 specular;             // rgb + intensity
+  float4 ambientColor;         // rgb + ambient_intensity
+  float4 diffuseColor;         // rgb + diffuse_intensity
+  float4 specularColor;        // rgb + specular_intensity
+  float4 color;                // base color (unused in lighting)
   float opacity;
   float specularPower;
   float2 _padding;
@@ -77,17 +77,21 @@ vertex VertexOut vertex_main(VertexIn in [[stage_in]],
 }
 
 // ---------------------------------------------------------------------------
-// Fragment shader — Phong lighting
+// Fragment shader — Phong lighting matching WebGPU backend
 // ---------------------------------------------------------------------------
 fragment float4 fragment_main(VertexOut in [[stage_in]],
                               constant MaterialUniforms& material [[buffer(0)]],
                               constant LightUniforms& lights [[buffer(1)]]) {
   float3 N = normalize(in.viewNormal);
 
-  float3 matColor = material.color.rgb;
-  float3 matSpecular = material.specular.rgb * material.specular.w;
+  float3 ambientColor = material.ambientColor.rgb;
+  float ambientIntensity = material.ambientColor.w;
+  float3 diffuseColor = material.diffuseColor.rgb;
+  float diffuseIntensity = material.diffuseColor.w;
+  float3 specularColor = material.specularColor.rgb;
+  float specularIntensity = material.specularColor.w;
 
-  float3 totalAmbient = matColor * 0.3;
+  float3 totalAmbient = ambientIntensity * ambientColor;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
@@ -133,14 +137,14 @@ fragment float4 fragment_main(VertexOut in [[stage_in]],
       }
     }
 
-    totalDiffuse += matColor * df * lightColor * attenuation;
+    totalDiffuse += df * diffuseColor * lightColor * attenuation;
 
     float NdotL = max(dot(N, toLight), 0.0);
     if (NdotL > 0.0) {
       float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
-      totalSpecular += matSpecular * sf * lightColor * attenuation;
+      totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
     }
   }
 
-  return float4(saturate(totalAmbient + totalDiffuse + totalSpecular), material.opacity);
+  return float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, material.opacity);
 }

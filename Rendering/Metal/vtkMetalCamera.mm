@@ -51,14 +51,13 @@ void vtkMetalCamera::Render(vtkRenderer* ren)
     }
   }
 
-  // Compute normal matrix (inverse-transpose of view * model)
-  vtkNew<vtkMatrix4x4> vm;
-  vtkMatrix4x4::Multiply4x4(viewMatrix, modelMatrix, vm);
-
+  // Compute normal matrix matching WebGPU: inverse(view[3x3]) only.
+  // WebGPU computes inverse(view) at camera level and inverse(model) at actor level,
+  // then multiplies them in the shader. Here we store the view part only.
   double m[3][3];
   for (int i = 0; i < 3; ++i)
     for (int j = 0; j < 3; ++j)
-      m[i][j] = vm->GetElement(i, j);
+      m[i][j] = viewMatrix->GetElement(i, j);
 
   double det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
                m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
@@ -80,7 +79,7 @@ void vtkMetalCamera::Render(vtkRenderer* ren)
 
     for (int i = 0; i < 3; ++i)
       for (int j = 0; j < 3; ++j)
-        this->CachedSceneTransforms.NormalMatrix[i][j] = static_cast<float>(inv[j][i]);
+        this->CachedSceneTransforms.NormalMatrix[i][j] = static_cast<float>(inv[i][j]);
   }
 
   int* sz = ren->GetSize();
