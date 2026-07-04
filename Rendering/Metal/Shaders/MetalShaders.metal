@@ -54,7 +54,7 @@ struct VertexIn {
 // Vertex output / fragment input
 struct VertexOut {
   float4 position [[position]];
-  float3 worldPos;
+  float3 viewPos;
   float3 viewNormal;
 };
 
@@ -66,9 +66,9 @@ vertex VertexOut vertex_main(VertexIn in [[stage_in]],
   VertexOut out;
 
   float4 worldPos = scene.modelMatrix * float4(in.position, 1.0);
-  out.worldPos = worldPos.xyz;
-
   float4 viewPos = scene.viewMatrix * worldPos;
+  out.viewPos = viewPos.xyz;
+
   out.position = scene.projectionMatrix * viewPos;
 
   out.viewNormal = scene.normalMatrix * in.normal;
@@ -93,6 +93,9 @@ fragment float4 fragment_main(VertexOut in [[stage_in]],
   float3 matDiffuse = material.diffuse.rgb * material.diffuse.w;
   float3 matSpecular = material.specular.rgb * material.specular.w;
 
+  // In view space, camera is at origin
+  float3 viewDir = normalize(-in.viewPos);
+
   for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
     Light L = lights.lights[i];
     int lightType = int(L.position.w);
@@ -101,14 +104,14 @@ fragment float4 fragment_main(VertexOut in [[stage_in]],
     float attenuation = 1.0;
 
     if (lightType == 0) {
-      // Headlight: always coming from the camera
+      // Headlight: always coming from the camera along -Z in view space
       lightDir = float3(0.0, 0.0, -1.0);
     } else if (lightType == 1) {
-      // Directional
+      // Directional — direction already in view space
       lightDir = normalize(L.direction.xyz);
     } else {
-      // Point or spot
-      float3 toLight = L.position.xyz - in.worldPos;
+      // Point or spot — positions already in view space
+      float3 toLight = L.position.xyz - in.viewPos;
       float dist = length(toLight);
       lightDir = toLight / dist;
 
@@ -138,15 +141,14 @@ fragment float4 fragment_main(VertexOut in [[stage_in]],
 
     // Specular (Blinn-Phong)
     if (NdotL > 0.0) {
-      float3 viewDir = normalize(-in.worldPos);
       float3 halfDir = normalize(lightDir + viewDir);
       float NdotH = max(dot(N, halfDir), 0.0);
       specularAccum += matSpecular * L.color.rgb * L.color.w *
                        pow(NdotH, material.specularPower) * attenuation;
     }
 
-    // Ambient
-    ambientAccum += matAmbient * L.color.rgb * L.color.w * attenuation;
+    // Ambient — no attenuation
+    ambientAccum += matAmbient * L.color.rgb * L.color.w;
   }
 
   float3 color = ambientAccum + diffuseAccum + specularAccum;

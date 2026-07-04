@@ -1,6 +1,9 @@
 #import "AppDelegate.h"
 #import "ViewController.h"
 
+#include <vtkAutoInit.h>
+VTK_MODULE_INIT(vtkRenderingMetal);
+
 @implementation AppDelegate
 
 - (BOOL)application:(UIApplication*)application

@@ -24,6 +24,10 @@
 #include "vtkUnsignedCharArray.h"
 #include "vtkLight.h"
 #include "vtkLightCollection.h"
+#include "vtkCamera.h"
+#include "vtkMatrix4x4.h"
+#include "vtkTransform.h"
+#include "vtkMath.h"
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -442,6 +446,12 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   pipelineDesc.vertexDescriptor = vertexDesc;
   pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
 
+  // Enable depth testing (matching WebGPU's depthCompare = Less, depthWriteEnabled = true)
+  pipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+
+  // Enable backface culling (matching WebGPU's default behavior)
+  pipelineDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+
   if (!this->Internals->TrianglePipeline)
   {
     error = nil;
@@ -549,6 +559,10 @@ void vtkMetalPolyDataMapper::UpdateLightUniforms(void* mtlDevice, vtkRenderer* r
   LightUniforms lu;
   memset(&lu, 0, sizeof(lu));
 
+  // Get the camera's model-view transform for view-space conversion
+  vtkCamera* cam = ren->GetActiveCamera();
+  vtkTransform* viewTF = cam ? cam->GetModelViewTransformObject() : nullptr;
+
   vtkLightCollection* lc = ren->GetLights();
   vtkLight* light;
   int count = 0;
@@ -556,25 +570,84 @@ void vtkMetalPolyDataMapper::UpdateLightUniforms(void* mtlDevice, vtkRenderer* r
   lc->InitTraversal();
   while ((light = lc->GetNextItem()) && count < 8)
   {
+    if (!light->GetSwitch())
+    {
+      continue;
+    }
+
     LightData& ld = lu.lights[count];
 
-    if (light->GetPositional())
+    int lightType = light->GetLightType();
+    if (lightType == VTK_LIGHT_TYPE_HEADLIGHT)
+    {
+      // Headlight: shader uses hardcoded (0,0,-1) direction in view space
+      ld.position[3] = 0.0f;
+      ld.position[0] = ld.position[1] = ld.position[2] = 0.0f;
+    }
+    else if (light->GetPositional())
     {
       ld.position[3] = (light->GetConeAngle() < 90.0) ? 3.0f : 2.0f;
-      double pos[3];
-      light->GetPosition(pos);
-      ld.position[0] = static_cast<float>(pos[0]);
-      ld.position[1] = static_cast<float>(pos[1]);
-      ld.position[2] = static_cast<float>(pos[2]);
+
+      if (viewTF)
+      {
+        // Transform light position into view space
+        double pos[3];
+        light->GetPosition(pos);
+        double tPos[3];
+        viewTF->TransformPoint(pos, tPos);
+        ld.position[0] = static_cast<float>(tPos[0]);
+        ld.position[1] = static_cast<float>(tPos[1]);
+        ld.position[2] = static_cast<float>(tPos[2]);
+
+        // Transform direction into view space
+        double* lfp = light->GetTransformedFocalPoint();
+        double* lp = light->GetTransformedPosition();
+        double lightDir[3];
+        vtkMath::Subtract(lfp, lp, lightDir);
+        vtkMath::Normalize(lightDir);
+        double tDir[3];
+        viewTF->TransformNormal(lightDir, tDir);
+        ld.direction[0] = static_cast<float>(tDir[0]);
+        ld.direction[1] = static_cast<float>(tDir[1]);
+        ld.direction[2] = static_cast<float>(tDir[2]);
+      }
+      else
+      {
+        double pos[3];
+        light->GetPosition(pos);
+        ld.position[0] = static_cast<float>(pos[0]);
+        ld.position[1] = static_cast<float>(pos[1]);
+        ld.position[2] = static_cast<float>(pos[2]);
+        ld.direction[0] = ld.direction[1] = 0.0f;
+        ld.direction[2] = -1.0f;
+      }
     }
     else
     {
-      ld.position[3] = (light->GetLightType() == VTK_LIGHT_TYPE_HEADLIGHT) ? 0.0f : 1.0f;
+      // Directional or camera light — transform direction to view space
+      ld.position[3] = 1.0f;
       ld.position[0] = ld.position[1] = ld.position[2] = 0.0f;
+
+      if (viewTF)
+      {
+        double* lfp = light->GetTransformedFocalPoint();
+        double* lp = light->GetTransformedPosition();
+        double lightDir[3];
+        vtkMath::Subtract(lfp, lp, lightDir);
+        vtkMath::Normalize(lightDir);
+        double tDir[3];
+        viewTF->TransformNormal(lightDir, tDir);
+        ld.direction[0] = static_cast<float>(tDir[0]);
+        ld.direction[1] = static_cast<float>(tDir[1]);
+        ld.direction[2] = static_cast<float>(tDir[2]);
+      }
+      else
+      {
+        ld.direction[0] = ld.direction[1] = 0.0f;
+        ld.direction[2] = -1.0f;
+      }
     }
 
-    ld.direction[0] = ld.direction[1] = 0.0f;
-    ld.direction[2] = -1.0f;
     ld.direction[3] = static_cast<float>(light->GetConeAngle());
 
     double diffColor[3];

@@ -82,11 +82,29 @@ void vtkMetalRenderer::DeviceRender()
     rpd.colorAttachments[0].clearColor = MTLClearColorMake(bgColor[0], bgColor[1], bgColor[2], 1.0);
     rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
 
-    id<MTLTexture> depthTex = nil;
+    // Attach depth texture for depth testing
+    id<MTLTexture> depthTex = (__bridge id<MTLTexture>)renWin->DepthTexture;
+    if (depthTex)
+    {
+      rpd.depthAttachment.texture = depthTex;
+      rpd.depthAttachment.loadAction = MTLLoadActionClear;
+      rpd.depthAttachment.clearDepth = 1.0;
+      rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+    }
 
     id<MTLRenderCommandEncoder> encoder =
       [commandBuffer renderCommandEncoderWithDescriptor:rpd];
     encoder.label = @"VTK Render Encoder";
+
+    // Set depth stencil state for depth testing (Less comparison, write enabled)
+    if (depthTex)
+    {
+      MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
+      dsDesc.depthCompareFunction = MTLCompareFunctionLess;
+      dsDesc.depthWriteEnabled = YES;
+      id<MTLDepthStencilState> depthState = [device newDepthStencilStateWithDescriptor:dsDesc];
+      [encoder setDepthStencilState:depthState];
+    }
 
     // Store encoder and command buffer for mappers to use.
     // No CFRetain needed: the local ARC strong references keep these alive
