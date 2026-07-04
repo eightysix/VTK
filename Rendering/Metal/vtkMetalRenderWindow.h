@@ -120,6 +120,7 @@ protected:
   void* MetalLayer = nullptr;     // CAMetalLayer*
   void* CurrentDrawable = nullptr; // CAMetalDrawable*
   void* CommandBuffer = nullptr;   // id<MTLCommandBuffer>
+  void* Encoder = nullptr;         // id<MTLRenderCommandEncoder>
   void* DepthTexture = nullptr;    // id<MTLTexture>
   void* ColorCopyPipeline = nullptr; // id<MTLRenderPipelineState>
 

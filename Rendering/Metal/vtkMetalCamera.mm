@@ -29,8 +29,13 @@ void vtkMetalCamera::Render(vtkRenderer* ren)
   double aspect = (size[1] > 0) ? static_cast<double>(size[0]) / size[1] : 1.0;
 
   vtkMatrix4x4* viewMatrix = this->GetViewTransformMatrix();
-  vtkMatrix4x4* projMatrix = this->GetCompositeProjectionTransformMatrix(
-    aspect, this->GetClippingRange()[0], this->GetClippingRange()[1]);
+  // Metal maps clip-space Z to [0, 1] (not [-1, 1] like OpenGL).
+  // GetProjectionTransformMatrix with nearz=0, farz=1 produces a projection
+  // that outputs Z in [0, 1], matching Metal's depth convention.
+  // GetCompositeProjectionTransformMatrix would produce Z in [-1, 1], causing
+  // Metal to cull all visible geometry (Z < 0 is clipped).
+  vtkMatrix4x4* projMatrix =
+    this->GetProjectionTransformMatrix(aspect, /*nearz=*/0, /*farz=*/1);
   vtkMatrix4x4* modelMatrix = this->GetModelTransformMatrix();
 
   for (int col = 0; col < 4; ++col)

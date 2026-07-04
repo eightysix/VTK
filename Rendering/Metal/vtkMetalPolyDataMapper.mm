@@ -139,36 +139,16 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
 
     this->EnsurePipelineStates((__bridge void*)device);
 
-    id<MTLCommandQueue> queue = [device newCommandQueue];
-    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
-
-    CAMetalLayer* layer = (__bridge CAMetalLayer*)renWin->GetMetalLayer();
-    id<CAMetalDrawable> drawable = [layer nextDrawable];
-    if (!drawable)
+    // Use the encoder already created by vtkMetalRenderer::DeviceRender().
+    // Do NOT create a new render pass, command buffer, or drawable here.
+    id<MTLRenderCommandEncoder> encoder =
+      (__bridge id<MTLRenderCommandEncoder>)renWin->GetCurrentRenderCommandEncoder();
+    if (!encoder)
     {
+      vtkErrorMacro(<< "No active render command encoder. "
+                    << "RenderPiece must be called within DeviceRender.");
       return;
     }
-
-    MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-    rpd.colorAttachments[0].texture = drawable.texture;
-    rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
-    double bgColor[3];
-    ren->GetBackground(bgColor);
-    rpd.colorAttachments[0].clearColor = MTLClearColorMake(bgColor[0], bgColor[1], bgColor[2], 1.0);
-    rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
-
-    id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:rpd];
-
-    int* size = ren->GetSize();
-    double* viewport = ren->GetViewport();
-    MTLViewport metalViewport;
-    metalViewport.originX = viewport[0] * size[0];
-    metalViewport.originY = viewport[1] * size[1];
-    metalViewport.width = viewport[2] * size[0];
-    metalViewport.height = viewport[3] * size[1];
-    metalViewport.znear = 0.0;
-    metalViewport.zfar = 1.0;
-    [encoder setViewport:metalViewport];
 
     vtkMetalCamera* metalCamera = vtkMetalCamera::SafeDownCast(ren->GetActiveCamera());
     if (metalCamera)
@@ -256,10 +236,6 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
                          indexBuffer:this->Internals->LineIndexBuffer
                    indexBufferOffset:0];
     }
-
-    [encoder endEncoding];
-    [commandBuffer presentDrawable:drawable];
-    [commandBuffer commit];
   }
 }
 

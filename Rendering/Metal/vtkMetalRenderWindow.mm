@@ -108,6 +108,18 @@ void vtkMetalRenderWindow::Finalize()
 {
   this->ReleaseDrawable();
 
+  if (this->Encoder)
+  {
+    CFRelease(this->Encoder);
+    this->Encoder = nullptr;
+  }
+
+  if (this->CommandBuffer)
+  {
+    CFRelease(this->CommandBuffer);
+    this->CommandBuffer = nullptr;
+  }
+
   if (this->DepthTexture)
   {
     CFRelease(this->DepthTexture);
@@ -276,7 +288,7 @@ void* vtkMetalRenderWindow::GetMetalDevice()
 //------------------------------------------------------------------------------
 void* vtkMetalRenderWindow::GetCurrentRenderCommandEncoder()
 {
-  return nullptr;
+  return this->Encoder;
 }
 
 //------------------------------------------------------------------------------

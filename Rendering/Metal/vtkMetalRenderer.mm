@@ -91,6 +91,20 @@ void vtkMetalRenderer::DeviceRender()
     // Store encoder and command buffer for mappers to use
     renWin->CommandBuffer = (__bridge void*)commandBuffer;
     CFRetain((__bridge CFTypeRef)commandBuffer);
+    renWin->Encoder = (__bridge void*)encoder;
+    CFRetain((__bridge CFTypeRef)encoder);
+
+    // Set viewport
+    int* size = this->GetSize();
+    double* viewport = this->GetViewport();
+    MTLViewport metalViewport;
+    metalViewport.originX = viewport[0] * size[0];
+    metalViewport.originY = viewport[1] * size[1];
+    metalViewport.width = viewport[2] * size[0];
+    metalViewport.height = viewport[3] * size[1];
+    metalViewport.znear = 0.0;
+    metalViewport.zfar = 1.0;
+    [encoder setViewport:metalViewport];
 
     // Update camera and set viewport
     if (this->ActiveCamera)
@@ -112,6 +126,11 @@ void vtkMetalRenderer::DeviceRender()
     [commandBuffer commit];
 
     // Clean up
+    if (renWin->Encoder)
+    {
+      CFRelease(renWin->Encoder);
+      renWin->Encoder = nullptr;
+    }
     if (renWin->CommandBuffer)
     {
       CFRelease(renWin->CommandBuffer);
