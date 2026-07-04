@@ -8,32 +8,33 @@ set(classes
   vtkMetalLight)
 
 set(headers)
-set(nowrap_headers)
 set(sources)
+
+# All Metal sources use .mm (Objective-C++) for Metal API access
+foreach(class IN LISTS classes)
+  list(APPEND sources ${class}.mm)
+  list(APPEND headers ${class}.h)
+endforeach()
 
 # Platform-specific classes
 if(APPLE_IOS)
   vtk_object_factory_declare(
     BASE vtkRenderWindow
     OVERRIDE vtkIOSMetalRenderWindow)
-  list(APPEND classes vtkIOSMetalRenderWindow)
   list(APPEND sources vtkIOSMetalRenderWindow.mm)
   list(APPEND headers vtkIOSMetalRenderWindow.h)
 endif()
 
-# Collect header/source pairs
-foreach(class IN LISTS classes)
-  list(APPEND sources ${class}.cxx)
-  list(APPEND headers ${class}.h)
-endforeach()
-
-# Metal shader compilation
+# Metal shader compilation - embed shader source as C++ string constant
 vtk_encode_string(
-  INPUT Shaders/MetalShaders.metal
-  HEADER vtkMetalShaders.h
-  NAME vtkMetalShaders)
-list(APPEND sources ${vtkMetalShaders_SOURCE})
-list(APPEND headers ${vtkMetalShaders_HEADER})
+  INPUT "Shaders/MetalShaders.metal"
+  NAME "vtkMetalShaders"
+  EXPORT_SYMBOL "VTKRENDERINGMETAL_EXPORT"
+  EXPORT_HEADER "vtkRenderingMetalModule.h"
+  HEADER_OUTPUT metal_shader_header
+  SOURCE_OUTPUT metal_shader_source)
+list(APPEND sources "${metal_shader_source}")
+list(APPEND headers "${metal_shader_header}")
 
 vtk_object_factory_configure(
   SOURCE_FILE vtk_object_factory_source
@@ -45,7 +46,6 @@ vtk_object_factory_configure(
 
 vtk_module_add_module(
   VTK::RenderingMetal
-  CLASSES ${classes}
   HEADERS ${headers}
   SOURCES ${sources} ${vtk_object_factory_source}
   PRIVATE_HEADERS ${vtk_object_factory_header})

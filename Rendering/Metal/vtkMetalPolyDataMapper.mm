@@ -4,6 +4,7 @@
 #include "vtkMetalPolyDataMapper.h"
 
 #include "vtkMetalRenderWindow.h"
+#include "vtkMetalShaders.h" // Generated from MetalShaders.metal
 #include "vtkMetalRenderer.h"
 #include "vtkMetalCamera.h"
 #include "vtkObjectFactory.h"
@@ -546,11 +547,14 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(id<MTLDevice> device)
     return;
   }
 
-  // Load the default Metal library
-  id<MTLLibrary> library = [device newDefaultLibrary];
+  // Compile shader from embedded source string
+  NSError* error = nil;
+  NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
+  id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
   if (!library)
   {
-    vtkErrorMacro(<< "Failed to create Metal shader library");
+    vtkErrorMacro(<< "Failed to compile Metal shader: "
+                  << [[error localizedDescription] UTF8String]);
     return;
   }
 
