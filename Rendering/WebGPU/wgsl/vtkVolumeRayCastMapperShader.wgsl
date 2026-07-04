@@ -82,62 +82,40 @@ fn fragmentMain(input: FragmentInput) -> FragmentOutput {
   var output: FragmentOutput;
   output.selectorId = vec4<u32>(0u, 0u, 0u, 0u);
 
-  let boundsSize = volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz;
-  let maxBoundsSize = max(max(boundsSize.x, boundsSize.y), boundsSize.z);
+  let cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  let stepSize = volumeUniforms.sampleDistance;
 
-  // Reconstruct the physical sample distance:
-  let physicalStepSize = volumeUniforms.sampleDistance * maxBoundsSize;
+  let startPoint = input.localPos;
+  var rayDir = startPoint - cameraPos;
+  let dirLength = length(rayDir);
 
-  // Un-normalize camera and start points to physical model space
-  let modelCameraPos = volumeUniforms.cameraVolumePos.xyz * boundsSize + volumeUniforms.volumeBoundsMin.xyz;
-  let modelStartPoint = input.localPos * boundsSize + volumeUniforms.volumeBoundsMin.xyz;
-
-  // Compute normalized ray direction in PHYSICAL model space
-  var modelRayDir = modelStartPoint - modelCameraPos;
-  let modelDirLength = length(modelRayDir);
-
-  if (modelDirLength < 0.0001) {
+  if (dirLength < 0.0001) {
     discard;
   }
-  modelRayDir = modelRayDir / modelDirLength;
+  rayDir = rayDir / dirLength;
 
-  // Compute the step vector in texture space [0,1]³
-  let texStep = (modelRayDir * physicalStepSize) / boundsSize;
+  let t = intersectBox(cameraPos, rayDir, vec3<f32>(0.0), vec3<f32>(1.0));
 
-  let t_cam = intersectBox(volumeUniforms.cameraVolumePos.xyz, texStep, vec3<f32>(0.0), vec3<f32>(1.0));
-  
-  if (t_cam.y <= 0.0) {
+  let tStart = max(t.x, 0.0);
+  if (tStart >= t.y) {
     discard;
   }
 
-  let t_back = intersectBox(input.localPos, texStep, vec3<f32>(0.0), vec3<f32>(1.0));
-  
-  var entryPoint: vec3<f32>;
-  var maxSteps: i32;
-
-  if (t_cam.x < 0.0) {
-    // Camera is inside the volume. Start directly at the camera position.
-    entryPoint = volumeUniforms.cameraVolumePos.xyz;
-    maxSteps = min(max(1, i32(ceil(t_cam.y))), 10000);
-  } else {
-    // Camera is outside. Start exactly at the front face.
-    // Compute front face relative to back face (input.localPos) to avoid catastrophic cancellation!
-    entryPoint = input.localPos + texStep * t_back.x;
-    maxSteps = min(max(1, i32(ceil(t_back.y - t_back.x))), 10000);
-  }
+  let entryPoint = cameraPos + rayDir * tStart;
+  let exitPoint = cameraPos + rayDir * t.y;
+  let totalDist = length(exitPoint - entryPoint);
+  let maxSteps = min(max(1, i32(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
 
   var jitter = 0.0;
   if (volumeUniforms.useJittering > 0.5) {
-      jitter = random(input.position.xy);
+      jitter = random(input.position.xy) * stepSize;
   }
 
+  var currentPoint = entryPoint + (rayDir * jitter);
   var accumulatedColor = vec3<f32>(0.0);
   var accumulatedOpacity = 0.0;
 
   for (var i = 0; i < maxSteps; i = i + 1) {
-    // Recompute currentPoint from scratch to completely eliminate floating-point accumulation error!
-    let currentPoint = entryPoint + texStep * (f32(i) + jitter);
-
     let texCoord = clamp(currentPoint, vec3<f32>(0.0), vec3<f32>(1.0));
     let rawScalar = textureSampleLevel(volumeTexture, volumeSampler, texCoord, 0.0).r;
 
@@ -159,6 +137,8 @@ fn fragmentMain(input: FragmentInput) -> FragmentOutput {
       accumulatedOpacity = 1.0;
       break;
     }
+
+    currentPoint = currentPoint + rayDir * stepSize;
   }
 
   output.color = vec4<f32>(accumulatedColor, accumulatedOpacity);
