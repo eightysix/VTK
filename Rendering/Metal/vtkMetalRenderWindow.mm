@@ -46,7 +46,8 @@ bool vtkMetalRenderWindow::InitializeMetal()
       vtkErrorMacro(<< "Failed to create Metal device");
       return false;
     }
-    this->MetalDevice = (__bridge_retained void*)device;
+    this->MetalDevice = (__bridge void*)device;
+    CFRetain((__bridge CFTypeRef)device);
 
     id<MTLCommandQueue> queue = [device newCommandQueue];
     if (!queue)
@@ -54,7 +55,8 @@ bool vtkMetalRenderWindow::InitializeMetal()
       vtkErrorMacro(<< "Failed to create Metal command queue");
       return false;
     }
-    this->MetalQueue = (__bridge_retained void*)queue;
+    this->MetalQueue = (__bridge void*)queue;
+    CFRetain((__bridge CFTypeRef)queue);
   }
 
   this->Initialized = true;
@@ -76,15 +78,14 @@ void vtkMetalRenderWindow::CreateMetalLayer()
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     layer.framebufferOnly = YES;
     layer.opaque = NO;
-
-    CGFloat scale = [UIScreen mainScreen].nativeScale;
-    layer.contentsScale = scale;
+    layer.contentsScale = 1.0;
 
     CGFloat w = (this->Size[0] > 0) ? this->Size[0] : 300;
     CGFloat h = (this->Size[1] > 0) ? this->Size[1] : 300;
     layer.drawableSize = CGSizeMake(w, h);
 
-    this->MetalLayer = (__bridge_retained void*)layer;
+    this->MetalLayer = (__bridge void*)layer;
+    CFRetain((__bridge CFTypeRef)layer);
   }
 }
 
@@ -96,7 +97,6 @@ void vtkMetalRenderWindow::Initialize()
     return;
   }
 
-  this->CreateAWindow();
   this->InitializeMetal();
   this->CreateMetalLayer();
 
@@ -136,12 +136,6 @@ void vtkMetalRenderWindow::Finalize()
 }
 
 //------------------------------------------------------------------------------
-void vtkMetalRenderWindow::CreateAWindow()
-{
-  // Subclasses (vtkIOSMetalRenderWindow) create the platform-specific view
-}
-
-//------------------------------------------------------------------------------
 void vtkMetalRenderWindow::Start()
 {
   if (!this->Initialized)
@@ -171,7 +165,8 @@ bool vtkMetalRenderWindow::AcquireDrawable()
     {
       return false;
     }
-    this->CurrentDrawable = (__bridge_retained void*)drawable;
+    this->CurrentDrawable = (__bridge void*)drawable;
+    CFRetain((__bridge CFTypeRef)drawable);
   }
   return true;
 }
@@ -206,7 +201,8 @@ void vtkMetalRenderWindow::RecreateDepthTexture()
     desc.storageMode = MTLStorageModePrivate;
 
     id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
-    this->DepthTexture = (__bridge_retained void*)tex;
+    this->DepthTexture = (__bridge void*)tex;
+    CFRetain((__bridge CFTypeRef)tex);
   }
 }
 
@@ -218,13 +214,13 @@ void vtkMetalRenderWindow::Render()
     this->Initialize();
   }
 
-  // Ensure depth texture matches window size
   if (this->Size[0] > 0 && this->Size[1] > 0)
   {
     @autoreleasepool
     {
       id<MTLTexture> depthTex = (__bridge id<MTLTexture>)this->DepthTexture;
-      if (!depthTex || depthTex.width != this->Size[0] || depthTex.height != this->Size[1])
+      if (!depthTex || depthTex.width != (NSUInteger)this->Size[0] ||
+          depthTex.height != (NSUInteger)this->Size[1])
       {
         this->RecreateDepthTexture();
       }
@@ -280,7 +276,7 @@ void* vtkMetalRenderWindow::GetMetalDevice()
 //------------------------------------------------------------------------------
 void* vtkMetalRenderWindow::GetCurrentRenderCommandEncoder()
 {
-  return nullptr; // Set during render pass by the renderer
+  return nullptr;
 }
 
 //------------------------------------------------------------------------------

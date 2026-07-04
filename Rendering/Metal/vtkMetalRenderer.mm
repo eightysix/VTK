@@ -82,17 +82,15 @@ void vtkMetalRenderer::DeviceRender()
     rpd.colorAttachments[0].clearColor = MTLClearColorMake(bgColor[0], bgColor[1], bgColor[2], 1.0);
     rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
 
-    // Depth attachment
-    id<MTLTexture> depthTex = (__bridge id<MTLTexture>)[renWin GetGenericContext];
-    // Get depth texture from render window
-    // For now, skip depth if not available
+    id<MTLTexture> depthTex = nil;
 
     id<MTLRenderCommandEncoder> encoder =
       [commandBuffer renderCommandEncoderWithDescriptor:rpd];
     encoder.label = @"VTK Render Encoder";
 
     // Store encoder and command buffer for mappers to use
-    renWin->CommandBuffer = (__bridge_retained void*)commandBuffer;
+    renWin->CommandBuffer = (__bridge void*)commandBuffer;
+    CFRetain((__bridge CFTypeRef)commandBuffer);
 
     // Update camera and set viewport
     if (this->ActiveCamera)
