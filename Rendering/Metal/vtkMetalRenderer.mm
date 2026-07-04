@@ -131,6 +131,9 @@ void vtkMetalRenderer::DeviceRender()
       this->ActiveCamera->UpdateViewport(this);
     }
 
+    // Create default lights if none exist (matching WebGPU renderer behavior)
+    this->UpdateLights();
+
     // Render opaque geometry
     this->UpdateOpaquePolygonalGeometry();
 

@@ -508,16 +508,16 @@ void vtkMetalPolyDataMapper::UpdateMaterialUniforms(void* mtlDevice, vtkActor* a
   mu.color[3] = 1.0f;
 
   double ambient = prop->GetAmbient();
-  mu.ambient[0] = mu.ambient[1] = mu.ambient[2] = static_cast<float>(ambient);
-  mu.ambient[3] = 1.0f;
+  mu.ambient[0] = mu.ambient[1] = mu.ambient[2] = 0.0f;
+  mu.ambient[3] = static_cast<float>(ambient);
 
   double diff = prop->GetDiffuse();
-  mu.diffuse[0] = mu.diffuse[1] = mu.diffuse[2] = static_cast<float>(diff);
-  mu.diffuse[3] = 1.0f;
+  mu.diffuse[0] = mu.diffuse[1] = mu.diffuse[2] = 0.0f;
+  mu.diffuse[3] = static_cast<float>(diff);
 
   double spec = prop->GetSpecular();
-  mu.specular[0] = mu.specular[1] = mu.specular[2] = static_cast<float>(spec);
-  mu.specular[3] = 1.0f;
+  mu.specular[0] = mu.specular[1] = mu.specular[2] = 0.0f;
+  mu.specular[3] = static_cast<float>(spec);
 
   mu.opacity = static_cast<float>(prop->GetOpacity());
   mu.specularPower = static_cast<float>(prop->GetSpecularPower());

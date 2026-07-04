@@ -100,20 +100,32 @@ fragment float4 fragment_main(VertexOut in [[stage_in]],
     Light L = lights.lights[i];
     int lightType = int(L.position.w);
 
-    float3 lightDir;
     float attenuation = 1.0;
 
     if (lightType == 0) {
-      // Headlight: always coming from the camera along -Z in view space
-      lightDir = float3(0.0, 0.0, -1.0);
-    } else if (lightType == 1) {
-      // Directional — direction already in view space
-      lightDir = normalize(L.direction.xyz);
+      // Headlight: use the normal's z component directly (positive = facing camera = lit)
+      diffuseAccum += matDiffuse * L.color.rgb * L.color.w * max(N.z, 0.000001) * attenuation;
+
+      if (N.z > 0.0) {
+        float3 halfDir = normalize(float3(0.0, 0.0, -1.0) + viewDir);
+        float NdotH = max(dot(N, halfDir), 0.0);
+        specularAccum += matSpecular * L.color.rgb * L.color.w *
+                         pow(NdotH, material.specularPower) * attenuation;
+      }
+
+      ambientAccum += matAmbient * L.color.rgb * L.color.w;
+      continue;
+    }
+
+    float3 toLight;
+    if (lightType == 1) {
+      // Directional — direction points FROM light TO scene, negate for surface-to-light
+      toLight = normalize(-L.direction.xyz);
     } else {
       // Point or spot — positions already in view space
-      float3 toLight = L.position.xyz - in.viewPos;
+      toLight = L.position.xyz - in.viewPos;
       float dist = length(toLight);
-      lightDir = toLight / dist;
+      toLight = toLight / dist;
 
       float attenConst = L.attenuation.x;
       float attenLinear = L.attenuation.y;
@@ -122,7 +134,8 @@ fragment float4 fragment_main(VertexOut in [[stage_in]],
 
       // Spot light
       if (lightType == 3) {
-        float spotCos = dot(-lightDir, normalize(L.direction.xyz));
+        float3 spotDir = normalize(L.direction.xyz);
+        float spotCos = dot(-toLight, spotDir);
         float spotAngle = L.direction.w;
         float spotExponent = L.attenuation.w;
         float spotCosCutoff = cos(spotAngle * M_PI_F / 180.0);
@@ -134,14 +147,14 @@ fragment float4 fragment_main(VertexOut in [[stage_in]],
       }
     }
 
-    float NdotL = max(dot(N, lightDir), 0.0);
+    float NdotL = max(dot(N, toLight), 0.0);
 
     // Diffuse
     diffuseAccum += matDiffuse * L.color.rgb * L.color.w * NdotL * attenuation;
 
     // Specular (Blinn-Phong)
     if (NdotL > 0.0) {
-      float3 halfDir = normalize(lightDir + viewDir);
+      float3 halfDir = normalize(toLight + viewDir);
       float NdotH = max(dot(N, halfDir), 0.0);
       specularAccum += matSpecular * L.color.rgb * L.color.w *
                        pow(NdotH, material.specularPower) * attenuation;
