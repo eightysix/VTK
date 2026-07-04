@@ -255,7 +255,6 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
   std::vector<float> positions;
   std::vector<float> normals;
-  std::vector<uint32_t> triangleIndices;
   std::vector<uint32_t> lineIndices;
 
   vtkPointData* pd = polydata->GetPointData();
@@ -269,9 +268,6 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   vtkCellArray* polys = polydata->GetPolys();
   if (polys && polys->GetNumberOfCells() > 0)
   {
-    std::unordered_map<vtkIdType, uint32_t> pointMap;
-    uint32_t nextPointId = 0;
-
     vtkIdType npts;
     const vtkIdType* pts;
     polys->InitTraversal();
@@ -281,74 +277,58 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       {
         continue;
       }
+      // Fan-triangulate polygon
       for (vtkIdType i = 1; i < npts - 1; ++i)
       {
+        vtkIdType tri[3] = { pts[0], pts[i], pts[i + 1] };
+        double p[3][3];
         for (int j = 0; j < 3; ++j)
         {
-          vtkIdType corner = (j == 0) ? pts[0] : (j == 1) ? pts[i] : pts[i + 1];
-          if (pointMap.find(corner) == pointMap.end())
-          {
-            pointMap[corner] = nextPointId++;
-            double pt[3];
-            polydata->GetPoint(corner, pt);
-            positions.push_back(static_cast<float>(pt[0]));
-            positions.push_back(static_cast<float>(pt[1]));
-            positions.push_back(static_cast<float>(pt[2]));
-            if (normalArray)
-            {
-              double n[3];
-              normalArray->GetTuple(corner, n);
-              normals.push_back(static_cast<float>(n[0]));
-              normals.push_back(static_cast<float>(n[1]));
-              normals.push_back(static_cast<float>(n[2]));
-            }
-          }
-          triangleIndices.push_back(pointMap[corner]);
+          polydata->GetPoint(tri[j], p[j]);
         }
-      }
-    }
-    this->Internals->TriangleVertexCount = nextPointId;
-    this->Internals->TriangleIndexCount = triangleIndices.size();
-    this->Internals->HasTriangles = !triangleIndices.empty();
 
-    // When source provides no normals, compute flat face normals per-triangle,
-    // matching the WebGPU backend's vertex shader fallback.
-    if (!normalArray)
-    {
-      normals.assign(positions.size(), 0.0f);
-      for (size_t t = 0; t + 2 < triangleIndices.size(); t += 3)
-      {
-        uint32_t i0 = triangleIndices[t];
-        uint32_t i1 = triangleIndices[t + 1];
-        uint32_t i2 = triangleIndices[t + 2];
-        float e1[3] = { positions[i1 * 3] - positions[i0 * 3],
-                         positions[i1 * 3 + 1] - positions[i0 * 3 + 1],
-                         positions[i1 * 3 + 2] - positions[i0 * 3 + 2] };
-        float e2[3] = { positions[i2 * 3] - positions[i0 * 3],
-                         positions[i2 * 3 + 1] - positions[i0 * 3 + 1],
-                         positions[i2 * 3 + 2] - positions[i0 * 3 + 2] };
-        // normalize(cross(normalize(e1), normalize(e2))) matching WebGPU's computeFaceNormal
-        float ne1 = std::sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
-        float ne2 = std::sqrt(e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]);
-        if (ne1 > 1e-8f && ne2 > 1e-8f)
+        // Compute face normal
+        float e1[3] = { (float)(p[1][0] - p[0][0]), (float)(p[1][1] - p[0][1]), (float)(p[1][2] - p[0][2]) };
+        float e2[3] = { (float)(p[2][0] - p[0][0]), (float)(p[2][1] - p[0][1]), (float)(p[2][2] - p[0][2]) };
+        float fn[3] = { 0.0f, 1.0f, 0.0f };
+
+        if (normalArray)
         {
-          e1[0] /= ne1; e1[1] /= ne1; e1[2] /= ne1;
-          e2[0] /= ne2; e2[1] /= ne2; e2[2] /= ne2;
+          double nn[3];
+          normalArray->GetTuple(tri[0], nn);
+          fn[0] = (float)nn[0]; fn[1] = (float)nn[1]; fn[2] = (float)nn[2];
         }
-        float n[3] = { e1[1] * e2[2] - e1[2] * e2[1],
-                        e1[2] * e2[0] - e1[0] * e2[2],
-                        e1[0] * e2[1] - e1[1] * e2[0] };
-        float nn = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-        if (nn > 1e-8f) { n[0] /= nn; n[1] /= nn; n[2] /= nn; }
-        // Assign flat face normal to all three vertices of this triangle
-        for (uint32_t vi : { i0, i1, i2 })
+        else
         {
-          normals[vi * 3] = n[0];
-          normals[vi * 3 + 1] = n[1];
-          normals[vi * 3 + 2] = n[2];
+          float ne1 = std::sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
+          float ne2 = std::sqrt(e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]);
+          if (ne1 > 1e-8f && ne2 > 1e-8f)
+          {
+            e1[0] /= ne1; e1[1] /= ne1; e1[2] /= ne1;
+            e2[0] /= ne2; e2[1] /= ne2; e2[2] /= ne2;
+          }
+          fn[0] = e1[1] * e2[2] - e1[2] * e2[1];
+          fn[1] = e1[2] * e2[0] - e1[0] * e2[2];
+          fn[2] = e1[0] * e2[1] - e1[1] * e2[0];
+          float nn = std::sqrt(fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2]);
+          if (nn > 1e-8f) { fn[0] /= nn; fn[1] /= nn; fn[2] /= nn; }
+        }
+
+        // Emit 3 vertices per triangle (no index buffer needed when computing normals)
+        for (int j = 0; j < 3; ++j)
+        {
+          positions.push_back(static_cast<float>(p[j][0]));
+          positions.push_back(static_cast<float>(p[j][1]));
+          positions.push_back(static_cast<float>(p[j][2]));
+          normals.push_back(fn[0]);
+          normals.push_back(fn[1]);
+          normals.push_back(fn[2]);
         }
       }
     }
+    this->Internals->TriangleVertexCount = static_cast<uint32_t>(positions.size() / 3);
+    this->Internals->TriangleIndexCount = 0;
+    this->Internals->HasTriangles = !positions.empty();
   }
 
   // Process lines
@@ -419,13 +399,6 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     this->Internals->VertexNormalBuffer = [device
       newBufferWithBytes:normals.data()
                  length:normals.size() * sizeof(float)
-                options:MTLResourceStorageModeShared];
-  }
-  if (!triangleIndices.empty())
-  {
-    this->Internals->IndexBuffer = [device
-      newBufferWithBytes:triangleIndices.data()
-                 length:triangleIndices.size() * sizeof(uint32_t)
                 options:MTLResourceStorageModeShared];
   }
   if (!lineIndices.empty())
