@@ -1,0 +1,11 @@
+/* SPDX-FileCopyrightText: Copyright (c) Ken Martin, Will Schroeder, Bill Lorensen
+   SPDX-License-Identifier: BSD-3-Clause */
+
+#ifndef vtkMetal_h
+#define vtkMetal_h
+
+/* configured from vtkMetal.h.in */
+
+#cmakedefine VTK_RENDERING_METAL
+
+#endif

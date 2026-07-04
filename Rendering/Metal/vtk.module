@@ -1,0 +1,21 @@
+NAME
+  VTK::RenderingMetal
+LIBRARY_NAME
+  vtkRenderingMetal
+GROUPS
+  Rendering
+SPDX_LICENSE_IDENTIFIER
+  BSD-3-Clause
+SPDX_COPYRIGHT_TEXT
+  Copyright (c) Ken Martin, Will Schroeder, Bill Lorensen
+IMPLEMENTS
+  VTK::RenderingCore
+DEPENDS
+  VTK::CommonCore
+  VTK::RenderingCore
+  VTK::RenderingUI
+PRIVATE_DEPENDS
+  VTK::CommonDataModel
+  VTK::CommonMath
+  VTK::CommonSystem
+INCLUDE_MARSHAL
