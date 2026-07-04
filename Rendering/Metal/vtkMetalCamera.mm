@@ -31,7 +31,7 @@ void vtkMetalCamera::Render(vtkRenderer* ren)
   vtkMatrix4x4* viewMatrix = this->GetViewTransformMatrix();
   // Metal maps clip-space Z to [0, 1] (not [-1, 1] like OpenGL).
   // GetProjectionTransformMatrix with nearz=0, farz=1 produces a projection
-  // that outputs Z in [0, 1], matching Metal's depth convention.
+  // compatible with Metal's depth convention, matching the WebGPU camera.
   // GetCompositeProjectionTransformMatrix would produce Z in [-1, 1], causing
   // Metal to cull all visible geometry (Z < 0 is clipped).
   vtkMatrix4x4* projMatrix =

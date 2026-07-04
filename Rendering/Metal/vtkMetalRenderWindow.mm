@@ -10,6 +10,9 @@
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#if TARGET_OS_IOS
+#import <UIKit/UIKit.h>
+#endif
 
 VTK_ABI_NAMESPACE_BEGIN
 
@@ -78,7 +81,11 @@ void vtkMetalRenderWindow::CreateMetalLayer()
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     layer.framebufferOnly = YES;
     layer.opaque = NO;
+#if TARGET_OS_IOS
+    layer.contentsScale = [UIScreen mainScreen].nativeScale;
+#else
     layer.contentsScale = 1.0;
+#endif
 
     CGFloat w = (this->Size[0] > 0) ? this->Size[0] : 300;
     CGFloat h = (this->Size[1] > 0) ? this->Size[1] : 300;
@@ -108,17 +115,9 @@ void vtkMetalRenderWindow::Finalize()
 {
   this->ReleaseDrawable();
 
-  if (this->Encoder)
-  {
-    CFRelease(this->Encoder);
-    this->Encoder = nullptr;
-  }
-
-  if (this->CommandBuffer)
-  {
-    CFRelease(this->CommandBuffer);
-    this->CommandBuffer = nullptr;
-  }
+  // Encoder and CommandBuffer are transient; managed by ARC in vtkMetalRenderer.
+  this->Encoder = nullptr;
+  this->CommandBuffer = nullptr;
 
   if (this->DepthTexture)
   {
@@ -283,6 +282,12 @@ void* vtkMetalRenderWindow::GetMetalLayer()
 void* vtkMetalRenderWindow::GetMetalDevice()
 {
   return this->MetalDevice;
+}
+
+//------------------------------------------------------------------------------
+void* vtkMetalRenderWindow::GetMetalQueue()
+{
+  return this->MetalQueue;
 }
 
 //------------------------------------------------------------------------------

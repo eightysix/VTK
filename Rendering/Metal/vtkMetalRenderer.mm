@@ -49,7 +49,7 @@ void vtkMetalRenderer::DeviceRender()
   @autoreleasepool
   {
     id<MTLDevice> device = (__bridge id<MTLDevice>)renWin->GetMetalDevice();
-    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)[device newCommandQueue];
+    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)renWin->GetMetalQueue();
     if (!queue)
     {
       return;
@@ -88,11 +88,11 @@ void vtkMetalRenderer::DeviceRender()
       [commandBuffer renderCommandEncoderWithDescriptor:rpd];
     encoder.label = @"VTK Render Encoder";
 
-    // Store encoder and command buffer for mappers to use
+    // Store encoder and command buffer for mappers to use.
+    // No CFRetain needed: the local ARC strong references keep these alive
+    // for the duration of this @autoreleasepool block.
     renWin->CommandBuffer = (__bridge void*)commandBuffer;
-    CFRetain((__bridge CFTypeRef)commandBuffer);
     renWin->Encoder = (__bridge void*)encoder;
-    CFRetain((__bridge CFTypeRef)encoder);
 
     // Set viewport
     int* size = this->GetSize();
@@ -125,17 +125,9 @@ void vtkMetalRenderer::DeviceRender()
     [commandBuffer presentDrawable:drawable];
     [commandBuffer commit];
 
-    // Clean up
-    if (renWin->Encoder)
-    {
-      CFRelease(renWin->Encoder);
-      renWin->Encoder = nullptr;
-    }
-    if (renWin->CommandBuffer)
-    {
-      CFRelease(renWin->CommandBuffer);
-      renWin->CommandBuffer = nullptr;
-    }
+    // Clear pointers (objects are released by ARC when block exits)
+    renWin->Encoder = nullptr;
+    renWin->CommandBuffer = nullptr;
   }
 }
 

@@ -50,8 +50,9 @@ UIView* vtkIOSMetalRenderWindow::GetViewId()
   {
     @autoreleasepool
     {
-      CGFloat w = (this->Size[0] > 0) ? this->Size[0] : 300;
-      CGFloat h = (this->Size[1] > 0) ? this->Size[1] : 300;
+      CGFloat scale = [UIScreen mainScreen].nativeScale;
+      CGFloat w = (this->Size[0] > 0) ? this->Size[0] / scale : 300;
+      CGFloat h = (this->Size[1] > 0) ? this->Size[1] / scale : 300;
       CGRect frame = CGRectMake(0, 0, w, h);
       vtkIOSMetalView* view = [[vtkIOSMetalView alloc] initWithFrame:frame];
       [view setOpaque:YES];
@@ -59,7 +60,7 @@ UIView* vtkIOSMetalRenderWindow::GetViewId()
 
       CAMetalLayer* metalLayer = (CAMetalLayer*)[view layer];
       metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-      metalLayer.contentsScale = 1.0;
+      metalLayer.contentsScale = scale;
       metalLayer.framebufferOnly = YES;
       this->MetalLayer = (__bridge void*)metalLayer;
       CFRetain((__bridge CFTypeRef)metalLayer);
@@ -77,7 +78,7 @@ void vtkIOSMetalRenderWindow::SetSize(int width, int height)
   {
     @autoreleasepool
     {
-      CGFloat scale = 1.0;
+      CGFloat scale = [UIScreen mainScreen].nativeScale;
       CGRect frame = CGRectMake(0, 0, width / scale, height / scale);
       [this->ViewId setFrame:frame];
 

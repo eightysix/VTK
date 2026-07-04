@@ -74,6 +74,11 @@ public:
   void* GetMetalDevice();
 
   /**
+   * Get the Metal command queue.
+   */
+  void* GetMetalQueue();
+
+  /**
    * Get the current render command encoder.
    * Only valid during a render pass.
    */
