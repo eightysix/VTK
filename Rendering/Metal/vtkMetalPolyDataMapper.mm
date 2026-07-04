@@ -34,6 +34,7 @@
 
 #include <vector>
 #include <unordered_map>
+#include <cmath>
 
 VTK_ABI_NAMESPACE_BEGIN
 
@@ -362,6 +363,48 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   }
   if (!normals.empty())
   {
+    this->Internals->VertexNormalBuffer = [device
+      newBufferWithBytes:normals.data()
+                 length:normals.size() * sizeof(float)
+                options:MTLResourceStorageModeShared];
+  }
+  else if (!positions.empty() && !triangleIndices.empty())
+  {
+    // Compute per-vertex normals from triangle geometry when source provides none.
+    size_t numVerts = positions.size() / 3;
+    normals.assign(positions.size(), 0.0f);
+    for (size_t t = 0; t + 2 < triangleIndices.size(); t += 3)
+    {
+      uint32_t i0 = triangleIndices[t];
+      uint32_t i1 = triangleIndices[t + 1];
+      uint32_t i2 = triangleIndices[t + 2];
+      float e1[3] = { positions[i1 * 3] - positions[i0 * 3],
+                       positions[i1 * 3 + 1] - positions[i0 * 3 + 1],
+                       positions[i1 * 3 + 2] - positions[i0 * 3 + 2] };
+      float e2[3] = { positions[i2 * 3] - positions[i0 * 3],
+                       positions[i2 * 3 + 1] - positions[i0 * 3 + 1],
+                       positions[i2 * 3 + 2] - positions[i0 * 3 + 2] };
+      float n[3] = { e1[1] * e2[2] - e1[2] * e2[1],
+                      e1[2] * e2[0] - e1[0] * e2[2],
+                      e1[0] * e2[1] - e1[1] * e2[0] };
+      for (uint32_t idx : { i0, i1, i2 })
+      {
+        normals[idx * 3] += n[0];
+        normals[idx * 3 + 1] += n[1];
+        normals[idx * 3 + 2] += n[2];
+      }
+    }
+    for (size_t v = 0; v < numVerts; ++v)
+    {
+      float nx = normals[v * 3], ny = normals[v * 3 + 1], nz = normals[v * 3 + 2];
+      float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+      if (len > 1e-8f)
+      {
+        normals[v * 3] = nx / len;
+        normals[v * 3 + 1] = ny / len;
+        normals[v * 3 + 2] = nz / len;
+      }
+    }
     this->Internals->VertexNormalBuffer = [device
       newBufferWithBytes:normals.data()
                  length:normals.size() * sizeof(float)
