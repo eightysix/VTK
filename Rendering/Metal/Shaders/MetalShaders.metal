@@ -84,87 +84,61 @@ fragment float4 fragment_main(VertexOut in [[stage_in]],
                               constant LightUniforms& lights [[buffer(1)]]) {
   float3 N = normalize(in.viewNormal);
 
-  // Accumulate lighting
-  float3 ambientAccum = float3(0.0);
-  float3 diffuseAccum = float3(0.0);
-  float3 specularAccum = float3(0.0);
+  float3 matColor = material.color.rgb;
+  float ambientK = material.ambient.w;
+  float diffuseK = material.diffuse.w;
+  float specK = material.specular.w;
 
-  float3 matAmbient = material.color.rgb * material.ambient.w;
-  float3 matDiffuse = material.color.rgb * material.diffuse.w;
-  float3 matSpecular = material.specular.rgb * material.specular.w;
+  float3 totalAmbient = float3(0.0);
+  float3 totalDiffuse = float3(0.0);
+  float3 totalSpecular = float3(0.0);
 
-  // In view space, camera is at origin
   float3 viewDir = normalize(-in.viewPos);
 
   for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
     Light L = lights.lights[i];
     int lightType = int(L.position.w);
-
+    float3 lightColor = L.color.rgb * L.color.w;
     float attenuation = 1.0;
+    float df = 0.0;
+    float3 reflDir = float3(0.0);
 
     if (lightType == 0) {
-      // Headlight: use the normal's z component directly (positive = facing camera = lit)
-      diffuseAccum += matDiffuse * L.color.rgb * L.color.w * max(N.z, 0.000001) * attenuation;
-
-      if (N.z > 0.0) {
-        float3 halfDir = normalize(float3(0.0, 0.0, -1.0) + viewDir);
-        float NdotH = max(dot(N, halfDir), 0.0);
-        specularAccum += matSpecular * L.color.rgb * L.color.w *
-                         pow(NdotH, material.specularPower) * attenuation;
-      }
-
-      ambientAccum += matAmbient * L.color.rgb * L.color.w;
-      continue;
-    }
-
-    float3 toLight;
-    if (lightType == 1) {
-      // Directional — direction points FROM light TO scene, negate for surface-to-light
-      toLight = normalize(-L.direction.xyz);
+      // Headlight — N.z directly (positive = facing camera)
+      df = max(N.z, 0.000001);
+      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
+    } else if (lightType == 1) {
+      // Directional — stored direction is incident (light→scene), negate for surface→light
+      float3 toLight = normalize(-L.direction.xyz);
+      df = max(dot(N, toLight), 0.0);
+      reflDir = reflect(L.direction.xyz, N);
     } else {
-      // Point or spot — positions already in view space
-      toLight = L.position.xyz - in.viewPos;
+      // Point or spot
+      float3 toLight = L.position.xyz - in.viewPos;
       float dist = length(toLight);
-      toLight = toLight / dist;
+      toLight /= dist;
+      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
+      df = max(dot(N, toLight), 0.0);
+      reflDir = reflect(-toLight, N);
 
-      float attenConst = L.attenuation.x;
-      float attenLinear = L.attenuation.y;
-      float attenQuad = L.attenuation.z;
-      attenuation = 1.0 / (attenConst + attenLinear * dist + attenQuad * dist * dist);
-
-      // Spot light
       if (lightType == 3) {
         float3 spotDir = normalize(L.direction.xyz);
         float spotCos = dot(-toLight, spotDir);
-        float spotAngle = L.direction.w;
-        float spotExponent = L.attenuation.w;
-        float spotCosCutoff = cos(spotAngle * M_PI_F / 180.0);
-        if (spotCos < spotCosCutoff) {
-          attenuation = 0.0;
+        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
+        if (spotCos > spotCutoff) {
+          attenuation *= pow(spotCos, L.attenuation.w);
         } else {
-          attenuation *= pow(spotCos, spotExponent);
+          attenuation = 0.0;
         }
       }
     }
 
-    float NdotL = max(dot(N, toLight), 0.0);
+    totalAmbient += ambientK * matColor * lightColor;
+    totalDiffuse += diffuseK * matColor * df * lightColor * attenuation;
 
-    // Diffuse
-    diffuseAccum += matDiffuse * L.color.rgb * L.color.w * NdotL * attenuation;
-
-    // Specular (Blinn-Phong)
-    if (NdotL > 0.0) {
-      float3 halfDir = normalize(toLight + viewDir);
-      float NdotH = max(dot(N, halfDir), 0.0);
-      specularAccum += matSpecular * L.color.rgb * L.color.w *
-                       pow(NdotH, material.specularPower) * attenuation;
-    }
-
-    // Ambient — no attenuation
-    ambientAccum += matAmbient * L.color.rgb * L.color.w;
+    float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
+    totalSpecular += specK * matColor * sf * lightColor * attenuation;
   }
 
-  float3 color = ambientAccum + diffuseAccum + specularAccum;
-
-  return float4(saturate(color), material.opacity);
+  return float4(saturate(totalAmbient + totalDiffuse + totalSpecular), material.opacity);
 }

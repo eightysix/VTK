@@ -486,49 +486,34 @@ void vtkMetalPolyDataMapper::UpdateMaterialUniforms(void* mtlDevice, vtkActor* a
   id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
   vtkProperty* prop = actor->GetProperty();
 
-  struct MaterialUniforms
-  {
-    float color[4];
-    float ambient[4];
-    float diffuse[4];
-    float specular[4];
-    float opacity;
-    float specularPower;
-    float padding[2];
-  };
-
-  MaterialUniforms mu;
-  memset(&mu, 0, sizeof(mu));
+  // Flat layout matching Metal shader's MaterialUniforms byte-for-byte.
+  // Metal float4 = 16 bytes aligned to 16.
+  float mu[20]; // 4+4+4+4 color/ambient/diffuse/specular + opacity + specPow + 2 pad
+  memset(mu, 0, sizeof(mu));
 
   double rgb[3];
   prop->GetColor(rgb);
-  mu.color[0] = static_cast<float>(rgb[0]);
-  mu.color[1] = static_cast<float>(rgb[1]);
-  mu.color[2] = static_cast<float>(rgb[2]);
-  mu.color[3] = 1.0f;
+  mu[0] = static_cast<float>(rgb[0]);
+  mu[1] = static_cast<float>(rgb[1]);
+  mu[2] = static_cast<float>(rgb[2]);
+  mu[3] = 1.0f;
 
-  double ambient = prop->GetAmbient();
-  mu.ambient[0] = mu.ambient[1] = mu.ambient[2] = 0.0f;
-  mu.ambient[3] = static_cast<float>(ambient);
+  mu[7] = static_cast<float>(prop->GetAmbient());  // ambient.w
 
-  double diff = prop->GetDiffuse();
-  mu.diffuse[0] = mu.diffuse[1] = mu.diffuse[2] = 0.0f;
-  mu.diffuse[3] = static_cast<float>(diff);
+  mu[11] = static_cast<float>(prop->GetDiffuse()); // diffuse.w
 
-  double spec = prop->GetSpecular();
-  mu.specular[0] = mu.specular[1] = mu.specular[2] = 0.0f;
-  mu.specular[3] = static_cast<float>(spec);
+  mu[15] = static_cast<float>(prop->GetSpecular()); // specular.w
 
-  mu.opacity = static_cast<float>(prop->GetOpacity());
-  mu.specularPower = static_cast<float>(prop->GetSpecularPower());
+  mu[16] = static_cast<float>(prop->GetOpacity());
+  mu[17] = static_cast<float>(prop->GetSpecularPower());
 
   if (!this->Internals->MaterialUniformBuffer)
   {
     this->Internals->MaterialUniformBuffer = [device
-      newBufferWithLength:sizeof(MaterialUniforms)
+      newBufferWithLength:sizeof(mu)
                  options:MTLResourceStorageModeShared];
   }
-  memcpy([this->Internals->MaterialUniformBuffer contents], &mu, sizeof(MaterialUniforms));
+  memcpy([this->Internals->MaterialUniformBuffer contents], mu, sizeof(mu));
 }
 
 //------------------------------------------------------------------------------
@@ -672,7 +657,16 @@ void vtkMetalPolyDataMapper::UpdateLightUniforms(void* mtlDevice, vtkRenderer* r
 
   if (count == 0)
   {
-    lu.lights[0].position[3] = 0.0f;
+    float dx = -0.3f, dy = -0.3f, dz = -1.0f;
+    float len = sqrtf(dx*dx + dy*dy + dz*dz);
+    lu.lights[0].position[0] = 0.0f;
+    lu.lights[0].position[1] = 0.0f;
+    lu.lights[0].position[2] = 0.0f;
+    lu.lights[0].position[3] = 1.0f;
+    lu.lights[0].direction[0] = dx / len;
+    lu.lights[0].direction[1] = dy / len;
+    lu.lights[0].direction[2] = dz / len;
+    lu.lights[0].direction[3] = 0.0f;
     lu.lights[0].color[0] = lu.lights[0].color[1] = lu.lights[0].color[2] = 1.0f;
     lu.lights[0].color[3] = 1.0f;
     lu.lightCount = 1;
