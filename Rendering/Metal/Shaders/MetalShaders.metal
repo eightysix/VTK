@@ -89,8 +89,8 @@ fragment float4 fragment_main(VertexOut in [[stage_in]],
   float3 diffuseAccum = float3(0.0);
   float3 specularAccum = float3(0.0);
 
-  float3 matAmbient = material.ambient.rgb * material.ambient.w;
-  float3 matDiffuse = material.diffuse.rgb * material.diffuse.w;
+  float3 matAmbient = material.color.rgb * material.ambient.w;
+  float3 matDiffuse = material.color.rgb * material.diffuse.w;
   float3 matSpecular = material.specular.rgb * material.specular.w;
 
   // In view space, camera is at origin
@@ -152,11 +152,6 @@ fragment float4 fragment_main(VertexOut in [[stage_in]],
   }
 
   float3 color = ambientAccum + diffuseAccum + specularAccum;
-
-  // Apply base color tint if diffuse is black (no material set)
-  if (length(matDiffuse) < 0.001) {
-    color = material.color.rgb;
-  }
 
   return float4(saturate(color), material.opacity);
 }
