@@ -112,8 +112,8 @@ static void signalHandler(int sig) {
 
 - (void)forwardTouchPosition:(UIGestureRecognizer *)recognizer {
   CGPoint p = [recognizer locationInView:recognizer.view];
-  CGFloat height = recognizer.view.bounds.size.height;
-  _iren->SetEventInformation((int)p.x, (int)(height - p.y), 0, 0, 0, 0, 0);
+  CGFloat scale = recognizer.view.contentScaleFactor;
+  _iren->SetEventInformationFlipY((int)(p.x * scale), (int)(p.y * scale), 0, 0, 0, 0, 0);
 }
 
 - (void)handlePinch:(UIPinchGestureRecognizer *)recognizer {
