@@ -35,6 +35,9 @@ protected:
   void EnsurePointPipelineStates(void* mtlDevice);
   void UpdateMaterialUniforms(void* mtlDevice, vtkActor* actor);
   void UpdateLightUniforms(void* mtlDevice, vtkRenderer* ren);
+  void UpdateCoincidentOffsetUniforms(void* mtlDevice, vtkActor* actor);
+  void UpdateVertexColorUniforms(void* mtlDevice, vtkActor* actor);
+  void UpdateClipPlaneUniforms(void* mtlDevice, vtkRenderer* ren);
 
 private:
   vtkMetalPolyDataMapper(const vtkMetalPolyDataMapper&) = delete;

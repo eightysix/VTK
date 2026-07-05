@@ -21,6 +21,26 @@ struct SceneUniforms {
   float pointSize;
 };
 
+// Coincident topology offset (P1-5) — separate uniform buffer
+struct CoincidentOffsetUniforms {
+  float polygonFactor;         // slope-scale factor for polygons
+  float polygonOffset;         // constant offset for polygons
+  float lineFactor;            // slope-scale factor for lines
+  float lineOffset;            // constant offset for lines
+  float pointOffset;           // constant offset for points
+};
+
+// Vertex color override (P1-4) — used when vertex visibility is on
+struct VertexColorUniforms {
+  float4 color;                // vertex color (rgb + alpha)
+};
+
+// Clipping planes (P1-6)
+struct ClipPlaneUniforms {
+  float4 planes[6];            // up to 6 clip planes (ax+by+cz+d)
+  int numClipPlanes;
+};
+
 // Per-material uniforms
 struct MaterialUniforms {
   float4 ambientColor;         // rgb + ambient_intensity
@@ -57,13 +77,21 @@ struct VertexOut {
   float4 position [[position]];
   float3 viewPos;
   float3 viewNormal;
+  float4 clipDistances;  // P1-6: clip plane distances (x,y,z,w for planes 0-3)
+};
+
+// Fragment output with explicit depth — needed for coincident topology offset
+struct FragmentOutput {
+  float4 color [[color(0)]];
+  float depth [[depth(any)]];
 };
 
 // ---------------------------------------------------------------------------
 // Vertex shader
 // ---------------------------------------------------------------------------
 vertex VertexOut vertex_main(VertexIn in [[stage_in]],
-                             constant SceneUniforms& scene [[buffer(2)]]) {
+                             constant SceneUniforms& scene [[buffer(2)]],
+                             constant ClipPlaneUniforms& clipPlanes [[buffer(5)]]) {
   VertexOut out;
 
   float4 worldPos = scene.modelMatrix * float4(in.position, 1.0);
@@ -74,15 +102,31 @@ vertex VertexOut vertex_main(VertexIn in [[stage_in]],
 
   out.viewNormal = scene.normalMatrix * in.normal;
 
+  // P1-6: compute clip distances for up to 4 planes
+  out.clipDistances = float4(
+    dot(float4(in.position, 1.0), clipPlanes.planes[0]),
+    dot(float4(in.position, 1.0), clipPlanes.planes[1]),
+    dot(float4(in.position, 1.0), clipPlanes.planes[2]),
+    dot(float4(in.position, 1.0), clipPlanes.planes[3]));
+
   return out;
 }
 
 // ---------------------------------------------------------------------------
 // Fragment shader — Phong lighting matching WebGPU backend
+// Includes coincident topology offset (P1-5).
 // ---------------------------------------------------------------------------
-fragment float4 fragment_main(VertexOut in [[stage_in]],
+fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
                               constant MaterialUniforms& material [[buffer(0)]],
-                              constant LightUniforms& lights [[buffer(1)]]) {
+                              constant LightUniforms& lights [[buffer(1)]],
+                              constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+                              constant ClipPlaneUniforms& clipPlanes [[buffer(5)]]) {
+  // P1-6: discard fragments outside clip planes
+  if (clipPlanes.numClipPlanes > 0 && in.clipDistances.x < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 1 && in.clipDistances.y < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 2 && in.clipDistances.z < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 3 && in.clipDistances.w < 0.0) discard_fragment();
+
   float3 N = normalize(in.viewNormal);
 
   float3 ambientColor = material.ambientColor.rgb;
@@ -147,7 +191,14 @@ fragment float4 fragment_main(VertexOut in [[stage_in]],
     }
   }
 
-  return float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, material.opacity);
+  FragmentOutput out;
+  out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, material.opacity);
+  // Coincident topology offset for polygons — matches WebGPU
+  float c_factor = coinOffset.polygonFactor;
+  float c_offset = coinOffset.polygonOffset;
+  float cscale = length(float2(dFdx(out.depth), dFdy(out.depth)));
+  out.depth = in.position.z + c_factor * cscale + c_offset / 65000.0;
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -184,15 +235,24 @@ vertex PointVertexOut vertex_point_main(
   return out;
 }
 
-// Fragment shader for 1px points — identical lighting to triangle/line fragment.
-fragment float4 fragment_point_main(PointVertexOut in [[stage_in]],
+// Fragment shader for 1px points — coincident offset + vertex visibility.
+// Flags: bit 3 = vertex visibility
+fragment FragmentOutput fragment_point_main(PointVertexOut in [[stage_in]],
                                     constant MaterialUniforms& material [[buffer(0)]],
-                                    constant LightUniforms& lights [[buffer(1)]]) {
+                                    constant LightUniforms& lights [[buffer(1)]],
+                                    constant SceneUniforms& scene [[buffer(2)]],
+                                    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+                                    constant VertexColorUniforms& vertexColorUniform [[buffer(4)]]) {
   float3 N = normalize(in.viewNormal);
-  // Use per-point color for ambient/diffuse when available (matches WebGPU)
-  float3 ambientColor = in.pointColor.rgb;
+
+  // Determine color: vertex visibility overrides per-point color (matches WebGPU)
+  bool showVertices = (scene.flags & (1u << 3)) != 0u;
+  float3 baseColor = showVertices ? vertexColorUniform.color.rgb : in.pointColor.rgb;
+  float baseAlpha = showVertices ? vertexColorUniform.color.a : in.pointColor.a;
+
+  float3 ambientColor = baseColor;
   float ambientIntensity = material.ambientColor.w;
-  float3 diffuseColor = in.pointColor.rgb;
+  float3 diffuseColor = baseColor;
   float diffuseIntensity = material.diffuseColor.w;
   float3 specularColor = material.specularColor.rgb;
   float specularIntensity = material.specularColor.w;
@@ -224,7 +284,7 @@ fragment float4 fragment_point_main(PointVertexOut in [[stage_in]],
       df = max(dot(N, toLight), 0.0);
       reflDir = reflect(-toLight, N);
       if (lightType == 3) {
-        float3 spotDir = normalize(L.direction.xyz);
+        float spotDir = normalize(L.direction.xyz);
         float spotCos = dot(-toLight, spotDir);
         float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
         if (spotCos > spotCutoff) {
@@ -232,6 +292,21 @@ fragment float4 fragment_point_main(PointVertexOut in [[stage_in]],
         } else {
           attenuation = 0.0;
         }
+      }
+    }
+    totalDiffuse += df * diffuseColor * lightColor * attenuation;
+    float NdotL = max(dot(N, toLight), 0.0);
+    if (NdotL > 0.0) {
+      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
+      totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
+    }
+  }
+  FragmentOutput out;
+  out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, baseAlpha * material.opacity);
+  // Coincident topology offset for points
+  out.depth = in.position.z + coinOffset.pointOffset / 65000.0;
+  return out;
+}
       }
     }
     totalDiffuse += df * diffuseColor * lightColor * attenuation;
@@ -303,14 +378,17 @@ struct PointFragmentOutput {
   float depth [[depth(any)]];
 };
 
-// Fragment for shaped points — sphere shading with depth correction.
+// Fragment for shaped points — sphere shading, depth correction, vertex visibility.
 // Matches WebGPU's ReplaceFragmentShaderNormals for POINTS_SHAPED.
-// Flags: bit 0 = parallel projection, bit 5 = render as spheres, bit 7 = point 2D shape (0=round,1=square)
+// Flags: bit 0 = parallel projection, bit 3 = vertex visibility,
+//        bit 5 = render as spheres, bit 7 = point 2D shape (0=round,1=square)
 fragment PointFragmentOutput fragment_point_shaped_main(
     PointShapedVertexOut in [[stage_in]],
     constant MaterialUniforms& material [[buffer(0)]],
     constant LightUniforms& lights [[buffer(1)]],
-    constant SceneUniforms& scene [[buffer(2)]]) {
+    constant SceneUniforms& scene [[buffer(2)]],
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+    constant VertexColorUniforms& vertexColorUniform [[buffer(4)]]) {
   PointFragmentOutput out;
 
   float d = length(in.p_coord);
@@ -348,10 +426,14 @@ fragment PointFragmentOutput fragment_point_shaped_main(
     out.depth = in.position.z;
   }
 
-  // Use per-point color for ambient/diffuse when available (matches WebGPU)
-  float3 ambientColor = in.pointColor.rgb;
+  // Determine color: vertex visibility overrides per-point color (matches WebGPU)
+  bool showVertices = (scene.flags & (1u << 3)) != 0u;
+  float3 baseColor = showVertices ? vertexColorUniform.color.rgb : in.pointColor.rgb;
+  float baseAlpha = showVertices ? vertexColorUniform.color.a : in.pointColor.a;
+
+  float3 ambientColor = baseColor;
   float ambientIntensity = material.ambientColor.w;
-  float3 diffuseColor = in.pointColor.rgb;
+  float3 diffuseColor = baseColor;
   float diffuseIntensity = material.diffuseColor.w;
   float3 specularColor = material.specularColor.rgb;
   float specularIntensity = material.specularColor.w;
@@ -400,6 +482,8 @@ fragment PointFragmentOutput fragment_point_shaped_main(
       totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
     }
   }
-  out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, in.pointColor.a * material.opacity);
+  out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, baseAlpha * material.opacity);
+  // Apply point coincident offset to depth (additive, after sphere depth correction)
+  out.depth += coinOffset.pointOffset / 65000.0;
   return out;
 }

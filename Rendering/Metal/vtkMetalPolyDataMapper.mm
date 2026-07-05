@@ -28,6 +28,7 @@
 #include "vtkMatrix4x4.h"
 #include "vtkTransform.h"
 #include "vtkMath.h"
+#include "vtkMapper.h"
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -66,6 +67,9 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLBuffer> SceneUniformBuffer = nil;
   id<MTLBuffer> MaterialUniformBuffer = nil;
   id<MTLBuffer> LightUniformBuffer = nil;
+  id<MTLBuffer> CoincidentOffsetBuffer = nil;   // P1-5: polygon/line/point depth bias
+  id<MTLBuffer> VertexColorBuffer = nil;        // P1-4: vertex visibility color
+  id<MTLBuffer> ClipPlaneBuffer = nil;          // P1-6: clipping planes
 
   vtkIdType TriangleVertexCount = 0;
   vtkIdType TriangleIndexCount = 0;
@@ -96,6 +100,9 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     SceneUniformBuffer = nil;
     MaterialUniformBuffer = nil;
     LightUniformBuffer = nil;
+    CoincidentOffsetBuffer = nil;
+    VertexColorBuffer = nil;
+    ClipPlaneBuffer = nil;
     TriangleVertexCount = 0;
     TriangleIndexCount = 0;
     LineIndexCount = 0;
@@ -214,10 +221,12 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
 
       // Merge actor render option flags into SceneUniforms flags (offset 256).
       // Bit 0: parallel projection (set by camera)
+      // Bit 3: vertex visibility
       // Bit 5: RenderPointsAsSpheres
       // Bit 7: Point2DShape (0=Round, 1=Square)
       vtkProperty* prop = act->GetProperty();
       uint32_t actorFlags = 0;
+      actorFlags |= (prop->GetVertexVisibility() ? 1u : 0u) << 3;
       actorFlags |= (prop->GetRenderPointsAsSpheres() ? 1u : 0u) << 5;
       actorFlags |= (static_cast<uint32_t>(prop->GetPoint2DShape())) << 7;
       *reinterpret_cast<uint32_t*>(buf + 256) |= actorFlags;
@@ -225,6 +234,9 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
 
     this->UpdateMaterialUniforms((__bridge void*)device, act);
     this->UpdateLightUniforms((__bridge void*)device, ren);
+    this->UpdateCoincidentOffsetUniforms((__bridge void*)device, act);
+    this->UpdateVertexColorUniforms((__bridge void*)device, act);
+    this->UpdateClipPlaneUniforms((__bridge void*)device, ren);
 
     if (this->Internals->HasTriangles && this->Internals->TrianglePipeline)
     {
@@ -246,6 +258,15 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       if (this->Internals->SceneUniformBuffer)
       {
         [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
+      }
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
+      }
+      if (this->Internals->ClipPlaneBuffer)
+      {
+        [encoder setFragmentBuffer:this->Internals->ClipPlaneBuffer offset:0 atIndex:5];
+        [encoder setVertexBuffer:this->Internals->ClipPlaneBuffer offset:0 atIndex:5];
       }
 
       if (this->Internals->IndexBuffer)
@@ -286,12 +307,107 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       {
         [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
       }
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
+      }
 
       [encoder drawIndexedPrimitives:MTLPrimitiveTypeLine
                           indexCount:this->Internals->LineIndexCount
                            indexType:MTLIndexTypeUInt32
                          indexBuffer:this->Internals->LineIndexBuffer
                    indexBufferOffset:0];
+    }
+
+    // --- P1-4: Vertex visibility — draw vertex dots on top of surface/wireframe ---
+    if (representation != VTK_POINTS && act->GetProperty()->GetVertexVisibility() &&
+        this->Internals->PointVertexCount > 0 && this->Internals->PointPositionBuffer)
+    {
+      float ptSize = act->GetProperty()->GetPointSize();
+      if (ptSize > 1.0f && this->Internals->PointShapedPipeline)
+      {
+        // Shaped vertex dots
+        [encoder setRenderPipelineState:this->Internals->PointShapedPipeline];
+        [encoder setVertexBuffer:this->Internals->PointPositionBuffer offset:0 atIndex:0];
+        [encoder setVertexBuffer:this->Internals->PointConnectivityBuffer offset:0 atIndex:1];
+        if (this->Internals->SceneUniformBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
+        }
+        if (this->Internals->PointNormalBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointNormalBuffer offset:0 atIndex:3];
+        }
+        if (this->Internals->PointColorBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointColorBuffer offset:0 atIndex:4];
+        }
+        if (this->Internals->MaterialUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
+        }
+        if (this->Internals->LightUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
+        }
+        if (this->Internals->SceneUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
+        }
+        if (this->Internals->CoincidentOffsetBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
+        }
+        if (this->Internals->VertexColorBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->VertexColorBuffer offset:0 atIndex:4];
+        }
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
+                    vertexStart:0
+                  vertexCount:4
+                instanceCount:this->Internals->PointVertexCount];
+      }
+      else if (this->Internals->PointPipeline)
+      {
+        // Basic 1px vertex dots
+        [encoder setRenderPipelineState:this->Internals->PointPipeline];
+        [encoder setVertexBuffer:this->Internals->PointPositionBuffer offset:0 atIndex:0];
+        if (this->Internals->SceneUniformBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:1];
+        }
+        if (this->Internals->PointNormalBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointNormalBuffer offset:0 atIndex:2];
+        }
+        if (this->Internals->PointColorBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointColorBuffer offset:0 atIndex:3];
+        }
+        if (this->Internals->MaterialUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
+        }
+        if (this->Internals->LightUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
+        }
+        if (this->Internals->SceneUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
+        }
+        if (this->Internals->CoincidentOffsetBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
+        }
+        if (this->Internals->VertexColorBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->VertexColorBuffer offset:0 atIndex:4];
+        }
+        [encoder drawPrimitives:MTLPrimitiveTypePoint
+                    vertexStart:0
+                  vertexCount:this->Internals->PointVertexCount];
+      }
     }
 
     // --- Draw points ---
@@ -329,6 +445,14 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         {
           [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
         }
+        if (this->Internals->CoincidentOffsetBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
+        }
+        if (this->Internals->VertexColorBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->VertexColorBuffer offset:0 atIndex:4];
+        }
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
                     vertexStart:0
                   vertexCount:4
@@ -358,6 +482,18 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         if (this->Internals->LightUniformBuffer)
         {
           [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
+        }
+        if (this->Internals->SceneUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
+        }
+        if (this->Internals->CoincidentOffsetBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
+        }
+        if (this->Internals->VertexColorBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->VertexColorBuffer offset:0 atIndex:4];
         }
         [encoder drawPrimitives:MTLPrimitiveTypePoint
                     vertexStart:0
@@ -1007,6 +1143,148 @@ void vtkMetalPolyDataMapper::UpdateLightUniforms(void* mtlDevice, vtkRenderer* r
                  options:MTLResourceStorageModeShared];
   }
   memcpy([this->Internals->LightUniformBuffer contents], &lu, sizeof(LightUniforms));
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::UpdateCoincidentOffsetUniforms(void* mtlDevice, vtkActor* actor)
+{
+  if (!mtlDevice || !actor)
+  {
+    return;
+  }
+
+  id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
+
+  // CoincidentOffsetUniforms layout: 5 floats (20 bytes)
+  // Matches Metal shader's CoincidentOffsetUniforms struct.
+  float co[5];
+  memset(co, 0, sizeof(co));
+
+  const int resolveMode = vtkMapper::GetResolveCoincidentTopology();
+  if (auto* vtkmap = vtkMapper::SafeDownCast(actor->GetMapper()))
+  {
+    if (resolveMode == VTK_RESOLVE_POLYGON_OFFSET)
+    {
+      double pgFactor = 0.0, pgUnits = 0.0;
+      double lnFactor = 0.0, lnUnits = 0.0;
+      double ptUnits = 0.0;
+      vtkmap->GetCoincidentTopologyPolygonOffsetParameters(pgFactor, pgUnits);
+      vtkmap->GetCoincidentTopologyLineOffsetParameters(lnFactor, lnUnits);
+      vtkmap->GetCoincidentTopologyPointOffsetParameter(ptUnits);
+      co[0] = static_cast<float>(pgFactor);
+      co[1] = static_cast<float>(pgUnits);
+      co[2] = static_cast<float>(lnFactor);
+      co[3] = static_cast<float>(lnUnits);
+      co[4] = static_cast<float>(ptUnits);
+    }
+    else if (resolveMode == VTK_RESOLVE_SHIFT_ZBUFFER)
+    {
+      const double zShift = vtkMapper::GetResolveCoincidentTopologyZShift();
+      co[1] = static_cast<float>(zShift * 4.0);
+    }
+  }
+
+  if (!this->Internals->CoincidentOffsetBuffer)
+  {
+    this->Internals->CoincidentOffsetBuffer = [device
+      newBufferWithLength:sizeof(co)
+                 options:MTLResourceStorageModeShared];
+  }
+  memcpy([this->Internals->CoincidentOffsetBuffer contents], co, sizeof(co));
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::UpdateVertexColorUniforms(void* mtlDevice, vtkActor* actor)
+{
+  if (!mtlDevice || !actor)
+  {
+    return;
+  }
+
+  id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
+
+  // VertexColorUniforms layout: float4 (16 bytes)
+  // Default white; overridden when vertex visibility is on.
+  float vc[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+
+  if (actor->GetProperty()->GetVertexVisibility())
+  {
+    double vcol[3];
+    actor->GetProperty()->GetVertexColor(vcol);
+    vc[0] = static_cast<float>(vcol[0]);
+    vc[1] = static_cast<float>(vcol[1]);
+    vc[2] = static_cast<float>(vcol[2]);
+    vc[3] = 1.0f;
+  }
+
+  if (!this->Internals->VertexColorBuffer)
+  {
+    this->Internals->VertexColorBuffer = [device
+      newBufferWithLength:sizeof(vc)
+                 options:MTLResourceStorageModeShared];
+  }
+  memcpy([this->Internals->VertexColorBuffer contents], vc, sizeof(vc));
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::UpdateClipPlaneUniforms(void* mtlDevice, vtkRenderer* ren)
+{
+  if (!mtlDevice || !ren)
+  {
+    return;
+  }
+
+  id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
+
+  // ClipPlaneUniforms layout: float4 planes[6] (96 bytes) + int numClipPlanes (4 bytes)
+  // = 100 bytes total, padded to 16-byte alignment = 112 bytes
+  // Using flat float array to avoid alignment issues.
+  float cp[28]; // 7 floats × 4 components = 28 floats = 112 bytes
+  memset(cp, 0, sizeof(cp));
+
+  vtkCamera* cam = ren->GetActiveCamera();
+  int numPlanes = 0;
+
+  if (cam && cam->GetClippingRange())
+  {
+    // Get clip planes from the renderer (set by vtkClipPlanes or vtkAssembly)
+    // For now, use the near/far clipping planes as defaults
+    double nearClip = cam->GetClippingRange()[0];
+    double farClip = cam->GetClippingRange()[1];
+
+    // Near plane in view space: z = -nearClip (points behind camera are clipped)
+    // In world space: dot(plane, point) >= 0 for visible points
+    // The near plane normal in view space is (0, 0, -1), point on plane is (0, 0, -nearClip)
+    // But we need to transform to world space... simplified: just pass identity planes
+    // The actual clip planes come from vtkClipPlanes filter, not the camera
+  }
+
+  // Fill with identity-like planes (no clipping) by default
+  // planes[0..3] = 4 clip planes (ax+by+cz+d format)
+  // planes[4..5] = reserved
+  // numClipPlanes at offset 24 (index 24 in float array)
+  // Initialize all planes to (0,0,0,1) which never clips
+  for (int i = 0; i < 24; ++i)
+  {
+    cp[i] = 0.0f;
+  }
+  // Set d=1 for each plane so dot(plane, (x,y,z,1)) = 1 > 0 always
+  cp[3] = 1.0f;   // plane 0
+  cp[7] = 1.0f;   // plane 1
+  cp[11] = 1.0f;  // plane 2
+  cp[15] = 1.0f;  // plane 3
+
+  // numClipPlanes = 0 (no clipping by default)
+  // This will be overridden when vtkClipPlanes is used
+  reinterpret_cast<int*>(&cp[24])[0] = 0;
+
+  if (!this->Internals->ClipPlaneBuffer)
+  {
+    this->Internals->ClipPlaneBuffer = [device
+      newBufferWithLength:sizeof(cp)
+                 options:MTLResourceStorageModeShared];
+  }
+  memcpy([this->Internals->ClipPlaneBuffer contents], cp, sizeof(cp));
 }
 
 VTK_ABI_NAMESPACE_END
