@@ -54,6 +54,8 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
 
   // Point geometry — separate buffers so points can draw independently
   id<MTLBuffer> PointPositionBuffer = nil;   // float3 per point
+  id<MTLBuffer> PointNormalBuffer = nil;     // float3 per point (from data or default)
+  id<MTLBuffer> PointColorBuffer = nil;      // float4 per point (RGBA, from MapScalars)
   id<MTLBuffer> PointConnectivityBuffer = nil; // uint32 per entry (identity map)
   vtkIdType PointVertexCount = 0;             // number of points to draw
 
@@ -84,6 +86,8 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     LinePipeline = nil;
 
     PointPositionBuffer = nil;
+    PointNormalBuffer = nil;
+    PointColorBuffer = nil;
     PointConnectivityBuffer = nil;
     PointVertexCount = 0;
     PointPipeline = nil;
@@ -156,7 +160,7 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       this->Internals->ReleaseBuffers();
       this->Internals->CachedInputMTime = currentMTime;
       this->Internals->CachedRepresentation = representation;
-      this->BuildGeometryBuffers((__bridge void*)device, input);
+      this->BuildGeometryBuffers((__bridge void*)device, input, act);
     }
 
     bool hasGeometry = this->Internals->HasTriangles || this->Internals->HasLines ||
@@ -201,12 +205,22 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
              metalCamera->GetCachedSceneTransforms(),
              vtkMetalCamera::GetSceneTransformsSize());
 
-      // Write point size into the SceneUniforms at its known offset
+      // Write point size and actor render options into SceneUniforms at known offsets.
       // Layout: ViewMatrix(64) + ProjectionMatrix(64) + NormalMatrix(48) +
-      //         ModelMatrix(64) + Viewport(16) + Flags(4) = offset 260
-      float ptSize = static_cast<float>(act->GetProperty()->GetPointSize());
+      //         ModelMatrix(64) + Viewport(16) + Flags(256) + PointSize(260)
       char* buf = static_cast<char*>([this->Internals->SceneUniformBuffer contents]);
+      float ptSize = static_cast<float>(act->GetProperty()->GetPointSize());
       *reinterpret_cast<float*>(buf + 260) = ptSize;
+
+      // Merge actor render option flags into SceneUniforms flags (offset 256).
+      // Bit 0: parallel projection (set by camera)
+      // Bit 5: RenderPointsAsSpheres
+      // Bit 7: Point2DShape (0=Round, 1=Square)
+      vtkProperty* prop = act->GetProperty();
+      uint32_t actorFlags = 0;
+      actorFlags |= (prop->GetRenderPointsAsSpheres() ? 1u : 0u) << 5;
+      actorFlags |= (static_cast<uint32_t>(prop->GetPoint2DShape())) << 7;
+      *reinterpret_cast<uint32_t*>(buf + 256) |= actorFlags;
     }
 
     this->UpdateMaterialUniforms((__bridge void*)device, act);
@@ -295,6 +309,14 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         {
           [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
         }
+        if (this->Internals->PointNormalBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointNormalBuffer offset:0 atIndex:3];
+        }
+        if (this->Internals->PointColorBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointColorBuffer offset:0 atIndex:4];
+        }
         if (this->Internals->MaterialUniformBuffer)
         {
           [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
@@ -302,6 +324,10 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         if (this->Internals->LightUniformBuffer)
         {
           [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
+        }
+        if (this->Internals->SceneUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
         }
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
                     vertexStart:0
@@ -316,6 +342,14 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         if (this->Internals->SceneUniformBuffer)
         {
           [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:1];
+        }
+        if (this->Internals->PointNormalBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointNormalBuffer offset:0 atIndex:2];
+        }
+        if (this->Internals->PointColorBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointColorBuffer offset:0 atIndex:3];
         }
         if (this->Internals->MaterialUniformBuffer)
         {
@@ -334,7 +368,7 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
 }
 
 //------------------------------------------------------------------------------
-void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* polydata)
+void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* polydata, vtkActor* actor)
 {
   if (!polydata || !mtlDevice)
   {
@@ -514,6 +548,67 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     this->Internals->PointPositionBuffer = [device
       newBufferWithBytes:pointPositions.data()
                  length:pointPositions.size() * sizeof(float)
+                options:MTLResourceStorageModeShared];
+
+    // Point normals — from polydata if available, otherwise default (0,0,1).
+    // Matches WebGPU: reads point_normals SSBO indexed by point_id.
+    std::vector<float> pointNormals(numPts * 3);
+    vtkFloatArray* ptNormalArray = nullptr;
+    if (pd->GetNormals())
+    {
+      ptNormalArray = vtkFloatArray::SafeDownCast(pd->GetNormals());
+    }
+    if (ptNormalArray && ptNormalArray->GetNumberOfTuples() >= numPts)
+    {
+      for (vtkIdType i = 0; i < numPts; ++i)
+      {
+        double n[3];
+        ptNormalArray->GetTuple(i, n);
+        pointNormals[i * 3] = static_cast<float>(n[0]);
+        pointNormals[i * 3 + 1] = static_cast<float>(n[1]);
+        pointNormals[i * 3 + 2] = static_cast<float>(n[2]);
+      }
+    }
+    else
+    {
+      // Default normal facing camera (0,0,1) — matches WebGPU fallback
+      for (vtkIdType i = 0; i < numPts; ++i)
+      {
+        pointNormals[i * 3] = 0.0f;
+        pointNormals[i * 3 + 1] = 0.0f;
+        pointNormals[i * 3 + 2] = 1.0f;
+      }
+    }
+    this->Internals->PointNormalBuffer = [device
+      newBufferWithBytes:pointNormals.data()
+                 length:pointNormals.size() * sizeof(float)
+                options:MTLResourceStorageModeShared];
+
+    // Point colors — from MapScalars (per-point RGBA) or default white.
+    // Matches WebGPU: reads point_colors SSBO indexed by point_id.
+    std::vector<float> pointColors(numPts * 4, 1.0f); // default white
+    int cellFlag = 0;
+    vtkUnsignedCharArray* mappedColors = nullptr;
+    if (actor)
+    {
+      mappedColors = this->MapScalars(actor->GetProperty()->GetOpacity(), cellFlag);
+    }
+    if (mappedColors && cellFlag == 0 &&
+        mappedColors->GetNumberOfTuples() >= numPts)
+    {
+      // Per-point colors — normalize unsigned char RGBA to float [0,1]
+      const unsigned char* rgba = mappedColors->GetPointer(0);
+      for (vtkIdType i = 0; i < numPts; ++i)
+      {
+        pointColors[i * 4] = rgba[i * 4] / 255.0f;
+        pointColors[i * 4 + 1] = rgba[i * 4 + 1] / 255.0f;
+        pointColors[i * 4 + 2] = rgba[i * 4 + 2] / 255.0f;
+        pointColors[i * 4 + 3] = rgba[i * 4 + 3] / 255.0f;
+      }
+    }
+    this->Internals->PointColorBuffer = [device
+      newBufferWithBytes:pointColors.data()
+                 length:pointColors.size() * sizeof(float)
                 options:MTLResourceStorageModeShared];
 
     // Connectivity: identity map — vertex_index i maps to point i.

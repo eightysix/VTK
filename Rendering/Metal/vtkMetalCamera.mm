@@ -88,6 +88,9 @@ void vtkMetalCamera::Render(vtkRenderer* ren)
   this->CachedSceneTransforms.Viewport[2] = static_cast<float>(sz[0]);
   this->CachedSceneTransforms.Viewport[3] = static_cast<float>(sz[1]);
 
+  // Encode parallel projection into flags (bit 0), matching WebGPU's SceneTransforms
+  this->CachedSceneTransforms.Flags = this->ParallelProjection ? 1u : 0u;
+
   this->KeyMatrixTime.Modified();
 }
 
