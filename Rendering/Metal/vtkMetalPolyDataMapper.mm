@@ -57,6 +57,9 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLBuffer> PointPositionBuffer = nil;   // float3 per point
   id<MTLBuffer> PointNormalBuffer = nil;     // float3 per point (from data or default)
   id<MTLBuffer> PointColorBuffer = nil;      // float4 per point (RGBA, from MapScalars)
+  id<MTLBuffer> PointTangentBuffer = nil;    // float3 per point (from data or default)
+  id<MTLBuffer> PointUVBuffer = nil;         // float2 per point (from data or default)
+  id<MTLBuffer> PointColorUVBuffer = nil;    // float2 per point (from data or default)
   id<MTLBuffer> PointConnectivityBuffer = nil; // uint32 per entry (identity map)
   vtkIdType PointVertexCount = 0;             // number of points to draw
 
@@ -70,6 +73,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLBuffer> CoincidentOffsetBuffer = nil;   // P1-5: polygon/line/point depth bias
   id<MTLBuffer> VertexColorBuffer = nil;        // P1-4: vertex visibility color
   id<MTLBuffer> ClipPlaneBuffer = nil;          // P1-6: clipping planes
+  id<MTLBuffer> CellIdOffsetBuffer = nil;       // P2-7: homogeneous cell ID offset
 
   vtkIdType TriangleVertexCount = 0;
   vtkIdType TriangleIndexCount = 0;
@@ -92,6 +96,9 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     PointPositionBuffer = nil;
     PointNormalBuffer = nil;
     PointColorBuffer = nil;
+    PointTangentBuffer = nil;
+    PointUVBuffer = nil;
+    PointColorUVBuffer = nil;
     PointConnectivityBuffer = nil;
     PointVertexCount = 0;
     PointPipeline = nil;
@@ -103,6 +110,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     CoincidentOffsetBuffer = nil;
     VertexColorBuffer = nil;
     ClipPlaneBuffer = nil;
+    CellIdOffsetBuffer = nil;
     TriangleVertexCount = 0;
     TriangleIndexCount = 0;
     LineIndexCount = 0;
@@ -342,6 +350,22 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         {
           [encoder setVertexBuffer:this->Internals->PointColorBuffer offset:0 atIndex:4];
         }
+        if (this->Internals->PointTangentBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointTangentBuffer offset:0 atIndex:6];
+        }
+        if (this->Internals->PointUVBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointUVBuffer offset:0 atIndex:7];
+        }
+        if (this->Internals->PointColorUVBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointColorUVBuffer offset:0 atIndex:8];
+        }
+        if (this->Internals->CellIdOffsetBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->CellIdOffsetBuffer offset:0 atIndex:9];
+        }
         if (this->Internals->MaterialUniformBuffer)
         {
           [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
@@ -383,6 +407,22 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         if (this->Internals->PointColorBuffer)
         {
           [encoder setVertexBuffer:this->Internals->PointColorBuffer offset:0 atIndex:3];
+        }
+        if (this->Internals->PointTangentBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointTangentBuffer offset:0 atIndex:6];
+        }
+        if (this->Internals->PointUVBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointUVBuffer offset:0 atIndex:7];
+        }
+        if (this->Internals->PointColorUVBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointColorUVBuffer offset:0 atIndex:8];
+        }
+        if (this->Internals->CellIdOffsetBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->CellIdOffsetBuffer offset:0 atIndex:9];
         }
         if (this->Internals->MaterialUniformBuffer)
         {
@@ -433,6 +473,22 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         {
           [encoder setVertexBuffer:this->Internals->PointColorBuffer offset:0 atIndex:4];
         }
+        if (this->Internals->PointTangentBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointTangentBuffer offset:0 atIndex:6];
+        }
+        if (this->Internals->PointUVBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointUVBuffer offset:0 atIndex:7];
+        }
+        if (this->Internals->PointColorUVBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointColorUVBuffer offset:0 atIndex:8];
+        }
+        if (this->Internals->CellIdOffsetBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->CellIdOffsetBuffer offset:0 atIndex:9];
+        }
         if (this->Internals->MaterialUniformBuffer)
         {
           [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
@@ -474,6 +530,22 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         if (this->Internals->PointColorBuffer)
         {
           [encoder setVertexBuffer:this->Internals->PointColorBuffer offset:0 atIndex:3];
+        }
+        if (this->Internals->PointTangentBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointTangentBuffer offset:0 atIndex:6];
+        }
+        if (this->Internals->PointUVBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointUVBuffer offset:0 atIndex:7];
+        }
+        if (this->Internals->PointColorUVBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointColorUVBuffer offset:0 atIndex:8];
+        }
+        if (this->Internals->CellIdOffsetBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->CellIdOffsetBuffer offset:0 atIndex:9];
         }
         if (this->Internals->MaterialUniformBuffer)
         {
@@ -747,6 +819,83 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                  length:pointColors.size() * sizeof(float)
                 options:MTLResourceStorageModeShared];
 
+    // Point tangents — from polydata if available, otherwise default (1,0,0).
+    // Matches WebGPU: reads point_tangents SSBO indexed by point_id.
+    std::vector<float> pointTangents(numPts * 3, 0.0f);
+    vtkFloatArray* tangentArray = nullptr;
+    if (pd->GetTangents())
+    {
+      tangentArray = vtkFloatArray::SafeDownCast(pd->GetTangents());
+    }
+    if (tangentArray && tangentArray->GetNumberOfTuples() >= numPts)
+    {
+      for (vtkIdType i = 0; i < numPts; ++i)
+      {
+        double t[3];
+        tangentArray->GetTuple(i, t);
+        pointTangents[i * 3] = static_cast<float>(t[0]);
+        pointTangents[i * 3 + 1] = static_cast<float>(t[1]);
+        pointTangents[i * 3 + 2] = static_cast<float>(t[2]);
+      }
+    }
+    else
+    {
+      // Default tangent (1,0,0)
+      for (vtkIdType i = 0; i < numPts; ++i)
+      {
+        pointTangents[i * 3] = 1.0f;
+        pointTangents[i * 3 + 1] = 0.0f;
+        pointTangents[i * 3 + 2] = 0.0f;
+      }
+    }
+    this->Internals->PointTangentBuffer = [device
+      newBufferWithBytes:pointTangents.data()
+                 length:pointTangents.size() * sizeof(float)
+                options:MTLResourceStorageModeShared];
+
+    // Point UVs — from polydata if available, otherwise default (0,0).
+    // Matches WebGPU: reads point_uvs SSBO indexed by point_id.
+    std::vector<float> pointUVs(numPts * 2, 0.0f);
+    vtkFloatArray* uvArray = nullptr;
+    if (pd->GetTCoords())
+    {
+      uvArray = vtkFloatArray::SafeDownCast(pd->GetTCoords());
+    }
+    if (uvArray && uvArray->GetNumberOfTuples() >= numPts)
+    {
+      for (vtkIdType i = 0; i < numPts; ++i)
+      {
+        double uv[3];
+        uvArray->GetTuple(i, uv);
+        pointUVs[i * 2] = static_cast<float>(uv[0]);
+        pointUVs[i * 2 + 1] = static_cast<float>(uv[1]);
+      }
+    }
+    this->Internals->PointUVBuffer = [device
+      newBufferWithBytes:pointUVs.data()
+                 length:pointUVs.size() * sizeof(float)
+                options:MTLResourceStorageModeShared];
+
+    // Point color UVs — from polydata if available, otherwise default (0,0).
+    // Matches WebGPU: reads point_color_uvs SSBO indexed by point_id.
+    std::vector<float> pointColorUVs(numPts * 2, 0.0f);
+    // Color UVs are typically the same as regular UVs unless a separate texture channel is used.
+    // For now, use the same UV data.
+    if (uvArray && uvArray->GetNumberOfTuples() >= numPts)
+    {
+      for (vtkIdType i = 0; i < numPts; ++i)
+      {
+        double uv[3];
+        uvArray->GetTuple(i, uv);
+        pointColorUVs[i * 2] = static_cast<float>(uv[0]);
+        pointColorUVs[i * 2 + 1] = static_cast<float>(uv[1]);
+      }
+    }
+    this->Internals->PointColorUVBuffer = [device
+      newBufferWithBytes:pointColorUVs.data()
+                 length:pointColorUVs.size() * sizeof(float)
+                options:MTLResourceStorageModeShared];
+
     // Connectivity: identity map — vertex_index i maps to point i.
     std::vector<uint32_t> connectivity(numPts);
     for (vtkIdType i = 0; i < numPts; ++i)
@@ -756,6 +905,14 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     this->Internals->PointConnectivityBuffer = [device
       newBufferWithBytes:connectivity.data()
                  length:connectivity.size() * sizeof(uint32_t)
+                options:MTLResourceStorageModeShared];
+
+    // P2-7: Cell ID offset uniform — defaults to 0 for single-actor rendering.
+    // For batched rendering, this would be set to the starting point index.
+    uint32_t cellIdOffset = 0;
+    this->Internals->CellIdOffsetBuffer = [device
+      newBufferWithBytes:&cellIdOffset
+                 length:sizeof(uint32_t)
                 options:MTLResourceStorageModeShared];
 
     this->Internals->PointVertexCount = numPts;
@@ -810,6 +967,8 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   pipelineDesc.fragmentFunction = fragmentFunc;
   pipelineDesc.vertexDescriptor = vertexDesc;
   pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+  // P2-8: Second color attachment for picking IDs
+  pipelineDesc.colorAttachments[1].pixelFormat = MTLPixelFormatR32Uint;
 
   // Enable depth testing (matching WebGPU's depthCompare = Less, depthWriteEnabled = true)
   pipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
@@ -873,6 +1032,7 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
       desc.vertexFunction = vFunc;
       desc.fragmentFunction = fFunc;
       desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      desc.colorAttachments[1].pixelFormat = MTLPixelFormatR32Uint;  // P2-8: picking IDs
       desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 
       error = nil;
@@ -898,6 +1058,7 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
       desc.vertexFunction = vFunc;
       desc.fragmentFunction = fFunc;
       desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      desc.colorAttachments[1].pixelFormat = MTLPixelFormatR32Uint;  // P2-8: picking IDs
       desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
       // No backface culling for point quads
       desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;

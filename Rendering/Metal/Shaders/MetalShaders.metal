@@ -41,6 +41,11 @@ struct ClipPlaneUniforms {
   int numClipPlanes;
 };
 
+// Cell ID offset (P2-7) — for homogeneous cell size variants
+struct CellIdOffsetUniform {
+  uint offset;                 // added to instance_id to get global cell ID
+};
+
 // Per-material uniforms
 struct MaterialUniforms {
   float4 ambientColor;         // rgb + ambient_intensity
@@ -83,6 +88,7 @@ struct VertexOut {
 // Fragment output with explicit depth — needed for coincident topology offset
 struct FragmentOutput {
   float4 color [[color(0)]];
+  uint4 ids [[color(1)]];     // P2-8: cell_id, prop_id, composite_id, process_id
   float depth [[depth(any)]];
 };
 
@@ -193,6 +199,7 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
 
   FragmentOutput out;
   out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, material.opacity);
+  out.ids = uint4(0, 0, 0, 0);  // P2-8: default picking IDs
   // Coincident topology offset for polygons — matches WebGPU
   float c_factor = coinOffset.polygonFactor;
   float c_offset = coinOffset.polygonOffset;
@@ -211,17 +218,23 @@ struct PointVertexOut {
   float3 viewPos;
   float3 viewNormal;
   float4 pointColor;
+  float3 tangent;    // P2-9: tangent in view space
+  float2 uv;         // P2-10: texture coordinates
+  float2 lut_uv;     // P2-10: color texture coordinates
 };
 
 // Basic 1px point vertex shader — positions stored as packed float3 array.
-// Buffer(0) = positions (3 floats per point), buffer(1) = SceneUniforms,
-// buffer(2) = point_normals (3 floats per point), buffer(3) = point_colors (4 floats per point).
+// Buffer(0) = positions, buffer(1) = SceneUniforms, buffer(2) = normals,
+// buffer(3) = colors, buffer(6) = tangents, buffer(7) = uvs, buffer(8) = color_uvs.
 vertex PointVertexOut vertex_point_main(
     uint vertex_id [[vertex_id]],
     constant float3* point_positions [[buffer(0)]],
     constant SceneUniforms& scene [[buffer(1)]],
     constant float3* point_normals [[buffer(2)]],
-    constant float4* point_colors [[buffer(3)]]) {
+    constant float4* point_colors [[buffer(3)]],
+    constant float3* point_tangents [[buffer(6)]],
+    constant float2* point_uvs [[buffer(7)]],
+    constant float2* point_color_uvs [[buffer(8)]]) {
   PointVertexOut out;
   float3 pos = point_positions[vertex_id];
 
@@ -232,6 +245,9 @@ vertex PointVertexOut vertex_point_main(
   out.viewNormal = scene.normalMatrix * point_normals[vertex_id];
   out.point_size = 1.0;
   out.pointColor = point_colors[vertex_id];
+  out.tangent = scene.normalMatrix * point_tangents[vertex_id];
+  out.uv = point_uvs[vertex_id];
+  out.lut_uv = point_color_uvs[vertex_id];
   return out;
 }
 
@@ -303,14 +319,11 @@ fragment FragmentOutput fragment_point_main(PointVertexOut in [[stage_in]],
   }
   FragmentOutput out;
   out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, baseAlpha * material.opacity);
+  out.ids = uint4(0, 0, 0, 0);  // P2-8: default picking IDs
   // Coincident topology offset for points
   out.depth = in.position.z + coinOffset.pointOffset / 65000.0;
   return out;
 }
-      }
-    }
-    totalDiffuse += df * diffuseColor * lightColor * attenuation;
-    float NdotL = max(dot(N, toLight), 0.0);
     if (NdotL > 0.0) {
       float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
       totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
@@ -333,6 +346,9 @@ struct PointShapedVertexOut {
   float3 viewNormal;
   float2 p_coord;
   float4 pointColor;
+  float3 tangent;    // P2-9: tangent in view space
+  float2 uv;         // P2-10: texture coordinates
+  float2 lut_uv;     // P2-10: color texture coordinates
 };
 
 vertex PointShapedVertexOut vertex_point_shaped_main(
@@ -342,7 +358,10 @@ vertex PointShapedVertexOut vertex_point_shaped_main(
     constant uint* connectivity [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant float3* point_normals [[buffer(3)]],
-    constant float4* point_colors [[buffer(4)]]) {
+    constant float4* point_colors [[buffer(4)]],
+    constant float3* point_tangents [[buffer(6)]],
+    constant float2* point_uvs [[buffer(7)]],
+    constant float2* point_color_uvs [[buffer(8)]]) {
   // Quad corners matching WebGPU TRIANGLE_VERTS
   const float2 tri_verts[4] = {
     float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1)
@@ -369,6 +388,9 @@ vertex PointShapedVertexOut vertex_point_shaped_main(
   out.viewNormal = scene.normalMatrix * point_normals[point_id];
   out.p_coord = corner;
   out.pointColor = point_colors[point_id];
+  out.tangent = scene.normalMatrix * point_tangents[point_id];
+  out.uv = point_uvs[point_id];
+  out.lut_uv = point_color_uvs[point_id];
   return out;
 }
 
@@ -483,6 +505,7 @@ fragment PointFragmentOutput fragment_point_shaped_main(
     }
   }
   out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, baseAlpha * material.opacity);
+  out.ids = uint4(0, 0, 0, 0);  // P2-8: default picking IDs
   // Apply point coincident offset to depth (additive, after sphere depth correction)
   out.depth += coinOffset.pointOffset / 65000.0;
   return out;
