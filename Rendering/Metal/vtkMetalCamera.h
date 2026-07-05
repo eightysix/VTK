@@ -46,7 +46,8 @@ private:
     float ModelMatrix[4][4] = {};
     float Viewport[4] = {};
     vtkTypeUInt32 Flags = 0;
-    float _Padding[3] = {}; // pad to 272 bytes to match Metal struct alignment
+    float PointSize = 1.0f;
+    float _Padding[2] = {};
   };
   SceneTransforms CachedSceneTransforms;
 };

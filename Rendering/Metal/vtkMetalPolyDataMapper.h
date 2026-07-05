@@ -32,6 +32,7 @@ protected:
 
   void BuildGeometryBuffers(void* mtlDevice, vtkPolyData* polydata);
   void EnsurePipelineStates(void* mtlDevice);
+  void EnsurePointPipelineStates(void* mtlDevice);
   void UpdateMaterialUniforms(void* mtlDevice, vtkActor* actor);
   void UpdateLightUniforms(void* mtlDevice, vtkRenderer* ren);
 

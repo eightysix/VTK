@@ -43,6 +43,7 @@ vtkStandardNewMacro(vtkMetalPolyDataMapper);
 //------------------------------------------------------------------------------
 struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
 {
+  // Triangle / line geometry
   id<MTLBuffer> VertexPositionBuffer = nil;
   id<MTLBuffer> VertexNormalBuffer = nil;
   id<MTLBuffer> IndexBuffer = nil;
@@ -51,6 +52,15 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLRenderPipelineState> TrianglePipeline = nil;
   id<MTLRenderPipelineState> LinePipeline = nil;
 
+  // Point geometry — separate buffers so points can draw independently
+  id<MTLBuffer> PointPositionBuffer = nil;   // float3 per point
+  id<MTLBuffer> PointConnectivityBuffer = nil; // uint32 per entry (identity map)
+  vtkIdType PointVertexCount = 0;             // number of points to draw
+
+  id<MTLRenderPipelineState> PointPipeline = nil;       // basic 1px
+  id<MTLRenderPipelineState> PointShapedPipeline = nil; // instanced quads
+
+  // Uniforms
   id<MTLBuffer> SceneUniformBuffer = nil;
   id<MTLBuffer> MaterialUniformBuffer = nil;
   id<MTLBuffer> LightUniformBuffer = nil;
@@ -62,6 +72,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   bool HasLines = false;
 
   vtkIdType CachedInputMTime = 0;
+  int CachedRepresentation = -1;
 
   void ReleaseBuffers()
   {
@@ -71,6 +82,13 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     LineIndexBuffer = nil;
     TrianglePipeline = nil;
     LinePipeline = nil;
+
+    PointPositionBuffer = nil;
+    PointConnectivityBuffer = nil;
+    PointVertexCount = 0;
+    PointPipeline = nil;
+    PointShapedPipeline = nil;
+
     SceneUniformBuffer = nil;
     MaterialUniformBuffer = nil;
     LightUniformBuffer = nil;
@@ -80,6 +98,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     HasTriangles = false;
     HasLines = false;
     CachedInputMTime = 0;
+    CachedRepresentation = -1;
   }
 };
 
@@ -130,19 +149,31 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     id<MTLDevice> device = (__bridge id<MTLDevice>)renWin->GetMetalDevice();
 
     vtkIdType currentMTime = input->GetMTime();
-    if (currentMTime != this->Internals->CachedInputMTime)
+    int representation = act->GetProperty()->GetRepresentation();
+    if (currentMTime != this->Internals->CachedInputMTime ||
+        representation != this->Internals->CachedRepresentation)
     {
       this->Internals->ReleaseBuffers();
       this->Internals->CachedInputMTime = currentMTime;
+      this->Internals->CachedRepresentation = representation;
       this->BuildGeometryBuffers((__bridge void*)device, input);
     }
 
-    if (this->Internals->TriangleVertexCount == 0 && this->Internals->LineIndexCount == 0)
+    bool hasGeometry = this->Internals->HasTriangles || this->Internals->HasLines ||
+                       this->Internals->PointVertexCount > 0;
+    if (!hasGeometry)
     {
       return;
     }
 
-    this->EnsurePipelineStates((__bridge void*)device);
+    if (representation == VTK_POINTS)
+    {
+      this->EnsurePointPipelineStates((__bridge void*)device);
+    }
+    else
+    {
+      this->EnsurePipelineStates((__bridge void*)device);
+    }
 
     // Use the encoder already created by vtkMetalRenderer::DeviceRender().
     // Do NOT create a new render pass, command buffer, or drawable here.
@@ -169,6 +200,13 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       memcpy([this->Internals->SceneUniformBuffer contents],
              metalCamera->GetCachedSceneTransforms(),
              vtkMetalCamera::GetSceneTransformsSize());
+
+      // Write point size into the SceneUniforms at its known offset
+      // Layout: ViewMatrix(64) + ProjectionMatrix(64) + NormalMatrix(48) +
+      //         ModelMatrix(64) + Viewport(16) + Flags(4) = offset 260
+      float ptSize = static_cast<float>(act->GetProperty()->GetPointSize());
+      char* buf = static_cast<char*>([this->Internals->SceneUniformBuffer contents]);
+      *reinterpret_cast<float*>(buf + 260) = ptSize;
     }
 
     this->UpdateMaterialUniforms((__bridge void*)device, act);
@@ -240,6 +278,57 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
                            indexType:MTLIndexTypeUInt32
                          indexBuffer:this->Internals->LineIndexBuffer
                    indexBufferOffset:0];
+    }
+
+    // --- Draw points ---
+    if (representation == VTK_POINTS && this->Internals->PointVertexCount > 0 &&
+        this->Internals->PointPositionBuffer)
+    {
+      float ptSize = act->GetProperty()->GetPointSize();
+      if (ptSize > 1.0f && this->Internals->PointShapedPipeline)
+      {
+        // Shaped points: instanced triangle-strip quads (4 verts × N instances)
+        [encoder setRenderPipelineState:this->Internals->PointShapedPipeline];
+        [encoder setVertexBuffer:this->Internals->PointPositionBuffer offset:0 atIndex:0];
+        [encoder setVertexBuffer:this->Internals->PointConnectivityBuffer offset:0 atIndex:1];
+        if (this->Internals->SceneUniformBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
+        }
+        if (this->Internals->MaterialUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
+        }
+        if (this->Internals->LightUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
+        }
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
+                    vertexStart:0
+                  vertexCount:4
+                instanceCount:this->Internals->PointVertexCount];
+      }
+      else if (this->Internals->PointPipeline)
+      {
+        // Basic 1px points
+        [encoder setRenderPipelineState:this->Internals->PointPipeline];
+        [encoder setVertexBuffer:this->Internals->PointPositionBuffer offset:0 atIndex:0];
+        if (this->Internals->SceneUniformBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:1];
+        }
+        if (this->Internals->MaterialUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
+        }
+        if (this->Internals->LightUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
+        }
+        [encoder drawPrimitives:MTLPrimitiveTypePoint
+                    vertexStart:0
+                  vertexCount:this->Internals->PointVertexCount];
+      }
     }
   }
 }
@@ -408,6 +497,38 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                  length:lineIndices.size() * sizeof(uint32_t)
                 options:MTLResourceStorageModeShared];
   }
+
+  // Build point buffers — all unique point positions with an identity connectivity map.
+  vtkIdType numPts = polydata->GetNumberOfPoints();
+  if (numPts > 0)
+  {
+    std::vector<float> pointPositions(numPts * 3);
+    for (vtkIdType i = 0; i < numPts; ++i)
+    {
+      double pt[3];
+      polydata->GetPoint(i, pt);
+      pointPositions[i * 3] = static_cast<float>(pt[0]);
+      pointPositions[i * 3 + 1] = static_cast<float>(pt[1]);
+      pointPositions[i * 3 + 2] = static_cast<float>(pt[2]);
+    }
+    this->Internals->PointPositionBuffer = [device
+      newBufferWithBytes:pointPositions.data()
+                 length:pointPositions.size() * sizeof(float)
+                options:MTLResourceStorageModeShared];
+
+    // Connectivity: identity map — vertex_index i maps to point i.
+    std::vector<uint32_t> connectivity(numPts);
+    for (vtkIdType i = 0; i < numPts; ++i)
+    {
+      connectivity[i] = static_cast<uint32_t>(i);
+    }
+    this->Internals->PointConnectivityBuffer = [device
+      newBufferWithBytes:connectivity.data()
+                 length:connectivity.size() * sizeof(uint32_t)
+                options:MTLResourceStorageModeShared];
+
+    this->Internals->PointVertexCount = numPts;
+  }
 }
 
 //------------------------------------------------------------------------------
@@ -484,6 +605,79 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
     if (!this->Internals->LinePipeline)
     {
       vtkErrorMacro(<< "Line pipeline: " << [[error localizedDescription] UTF8String]);
+    }
+  }
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
+{
+  if (this->Internals->PointPipeline && this->Internals->PointShapedPipeline)
+  {
+    return;
+  }
+
+  id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
+
+  NSError* error = nil;
+  NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
+  id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+  if (!library)
+  {
+    vtkErrorMacro(<< "Failed to compile Metal shader for points: "
+                  << [[error localizedDescription] UTF8String]);
+    return;
+  }
+
+  // --- Basic 1px point pipeline ---
+  // vertex_point_main takes position buffer at [[buffer(0)]], scene at [[buffer(1)]]
+  // No vertex descriptor needed — the shader reads from raw buffers.
+  if (!this->Internals->PointPipeline)
+  {
+    id<MTLFunction> vFunc = [library newFunctionWithName:@"vertex_point_main"];
+    id<MTLFunction> fFunc = [library newFunctionWithName:@"fragment_point_main"];
+    if (vFunc && fFunc)
+    {
+      MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+      desc.vertexFunction = vFunc;
+      desc.fragmentFunction = fFunc;
+      desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+
+      error = nil;
+      this->Internals->PointPipeline =
+        [device newRenderPipelineStateWithDescriptor:desc error:&error];
+      if (!this->Internals->PointPipeline)
+      {
+        vtkErrorMacro(<< "Point pipeline: " << [[error localizedDescription] UTF8String]);
+      }
+    }
+  }
+
+  // --- Shaped point pipeline (instanced triangle-strip quads) ---
+  // vertex_point_shaped_main takes position buffer at [[buffer(0)]],
+  // connectivity at [[buffer(1)]], scene at [[buffer(2)]].
+  if (!this->Internals->PointShapedPipeline)
+  {
+    id<MTLFunction> vFunc = [library newFunctionWithName:@"vertex_point_shaped_main"];
+    id<MTLFunction> fFunc = [library newFunctionWithName:@"fragment_point_shaped_main"];
+    if (vFunc && fFunc)
+    {
+      MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+      desc.vertexFunction = vFunc;
+      desc.fragmentFunction = fFunc;
+      desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+      // No backface culling for point quads
+      desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+
+      error = nil;
+      this->Internals->PointShapedPipeline =
+        [device newRenderPipelineStateWithDescriptor:desc error:&error];
+      if (!this->Internals->PointShapedPipeline)
+      {
+        vtkErrorMacro(<< "Point shaped pipeline: " << [[error localizedDescription] UTF8String]);
+      }
     }
   }
 }
