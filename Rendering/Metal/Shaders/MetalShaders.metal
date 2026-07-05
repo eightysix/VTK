@@ -88,7 +88,6 @@ struct VertexOut {
 // Fragment output with explicit depth — needed for coincident topology offset
 struct FragmentOutput {
   float4 color [[color(0)]];
-  uint4 ids [[color(1)]];     // P2-8: cell_id, prop_id, composite_id, process_id
   float depth [[depth(any)]];
 };
 
@@ -199,11 +198,10 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
 
   FragmentOutput out;
   out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, material.opacity);
-  out.ids = uint4(0, 0, 0, 0);  // P2-8: default picking IDs
   // Coincident topology offset for polygons — matches WebGPU
   float c_factor = coinOffset.polygonFactor;
   float c_offset = coinOffset.polygonOffset;
-  float cscale = length(float2(dFdx(out.depth), dFdy(out.depth)));
+  float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
   out.depth = in.position.z + c_factor * cscale + c_offset / 65000.0;
   return out;
 }
@@ -300,7 +298,7 @@ fragment FragmentOutput fragment_point_main(PointVertexOut in [[stage_in]],
       df = max(dot(N, toLight), 0.0);
       reflDir = reflect(-toLight, N);
       if (lightType == 3) {
-        float spotDir = normalize(L.direction.xyz);
+        float3 spotDir = normalize(L.direction.xyz);
         float spotCos = dot(-toLight, spotDir);
         float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
         if (spotCos > spotCutoff) {
@@ -319,17 +317,9 @@ fragment FragmentOutput fragment_point_main(PointVertexOut in [[stage_in]],
   }
   FragmentOutput out;
   out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, baseAlpha * material.opacity);
-  out.ids = uint4(0, 0, 0, 0);  // P2-8: default picking IDs
   // Coincident topology offset for points
   out.depth = in.position.z + coinOffset.pointOffset / 65000.0;
   return out;
-}
-    if (NdotL > 0.0) {
-      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
-      totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
-    }
-  }
-  return float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, in.pointColor.a * material.opacity);
 }
 
 // -----------------------------------------------------------------------
@@ -487,7 +477,7 @@ fragment PointFragmentOutput fragment_point_shaped_main(
       df = max(dot(N, toLight), 0.0);
       reflDir = reflect(-toLight, N);
       if (lightType == 3) {
-        float spotDir = normalize(L.direction.xyz);
+        float3 spotDir = normalize(L.direction.xyz);
         float spotCos = dot(-toLight, spotDir);
         float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
         if (spotCos > spotCutoff) {
@@ -505,7 +495,6 @@ fragment PointFragmentOutput fragment_point_shaped_main(
     }
   }
   out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, baseAlpha * material.opacity);
-  out.ids = uint4(0, 0, 0, 0);  // P2-8: default picking IDs
   // Apply point coincident offset to depth (additive, after sphere depth correction)
   out.depth += coinOffset.pointOffset / 65000.0;
   return out;

@@ -967,8 +967,6 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   pipelineDesc.fragmentFunction = fragmentFunc;
   pipelineDesc.vertexDescriptor = vertexDesc;
   pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-  // P2-8: Second color attachment for picking IDs
-  pipelineDesc.colorAttachments[1].pixelFormat = MTLPixelFormatR32Uint;
 
   // Enable depth testing (matching WebGPU's depthCompare = Less, depthWriteEnabled = true)
   pipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
@@ -1032,7 +1030,6 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
       desc.vertexFunction = vFunc;
       desc.fragmentFunction = fFunc;
       desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-      desc.colorAttachments[1].pixelFormat = MTLPixelFormatR32Uint;  // P2-8: picking IDs
       desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 
       error = nil;
@@ -1058,7 +1055,6 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
       desc.vertexFunction = vFunc;
       desc.fragmentFunction = fFunc;
       desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-      desc.colorAttachments[1].pixelFormat = MTLPixelFormatR32Uint;  // P2-8: picking IDs
       desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
       // No backface culling for point quads
       desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
