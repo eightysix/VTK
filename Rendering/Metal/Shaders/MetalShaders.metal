@@ -83,20 +83,26 @@ struct VertexOut {
   float3 viewPos;
   float3 viewNormal;
   float4 clipDistances;  // P1-6: clip plane distances (x,y,z,w for planes 0-3)
+  uint cellId;           // P2-8: flat-interpolated cell ID (1-based, 0=background)
+  uint propId;           // P2-8: flat-interpolated prop ID (1-based, 0=background)
 };
 
 // Fragment output with explicit depth — needed for coincident topology offset
 struct FragmentOutput {
   float4 color [[color(0)]];
+  uint4 ids [[color(1)]];   // P2-8: {cell, prop, composite, process} IDs
   float depth [[depth(any)]];
 };
 
 // ---------------------------------------------------------------------------
 // Vertex shader
 // ---------------------------------------------------------------------------
-vertex VertexOut vertex_main(VertexIn in [[stage_in]],
+vertex VertexOut vertex_main(uint vertex_id [[vertex_id]],
+                             VertexIn in [[stage_in]],
                              constant SceneUniforms& scene [[buffer(2)]],
-                             constant ClipPlaneUniforms& clipPlanes [[buffer(5)]]) {
+                             constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
+                             constant uint* cellIds [[buffer(6)]],
+                             constant uint& propId [[buffer(7)]]) {
   VertexOut out;
 
   float4 worldPos = scene.modelMatrix * float4(in.position, 1.0);
@@ -113,6 +119,10 @@ vertex VertexOut vertex_main(VertexIn in [[stage_in]],
     dot(float4(in.position, 1.0), clipPlanes.planes[1]),
     dot(float4(in.position, 1.0), clipPlanes.planes[2]),
     dot(float4(in.position, 1.0), clipPlanes.planes[3]));
+
+  // P2-8: picking IDs (already 1-based from compute kernel)
+  out.cellId = cellIds[vertex_id];
+  out.propId = propId + 1u;
 
   return out;
 }
@@ -198,6 +208,7 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
 
   FragmentOutput out;
   out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, material.opacity);
+  out.ids = uint4(in.cellId, in.propId, 1u, 0u);  // P2-8: {cell, prop, composite=1, process=0}
   // Coincident topology offset for polygons — matches WebGPU
   float c_factor = coinOffset.polygonFactor;
   float c_offset = coinOffset.polygonOffset;
@@ -219,6 +230,8 @@ struct PointVertexOut {
   float3 tangent;    // P2-9: tangent in view space
   float2 uv;         // P2-10: texture coordinates
   float2 lut_uv;     // P2-10: color texture coordinates
+  uint cellId;       // P2-8: flat-interpolated cell ID
+  uint propId;       // P2-8: flat-interpolated prop ID
 };
 
 // Basic 1px point vertex shader — positions stored as packed float3 array.
@@ -232,7 +245,9 @@ vertex PointVertexOut vertex_point_main(
     constant float4* point_colors [[buffer(3)]],
     constant float3* point_tangents [[buffer(6)]],
     constant float2* point_uvs [[buffer(7)]],
-    constant float2* point_color_uvs [[buffer(8)]]) {
+    constant float2* point_color_uvs [[buffer(8)]],
+    constant uint* pointCellIds [[buffer(11)]],
+    constant uint& pointPropId [[buffer(12)]]) {
   PointVertexOut out;
   float3 pos = point_positions[vertex_id];
 
@@ -246,6 +261,8 @@ vertex PointVertexOut vertex_point_main(
   out.tangent = scene.normalMatrix * point_tangents[vertex_id];
   out.uv = point_uvs[vertex_id];
   out.lut_uv = point_color_uvs[vertex_id];
+  out.cellId = pointCellIds[vertex_id];
+  out.propId = pointPropId + 1u;
   return out;
 }
 
@@ -317,6 +334,7 @@ fragment FragmentOutput fragment_point_main(PointVertexOut in [[stage_in]],
   }
   FragmentOutput out;
   out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, baseAlpha * material.opacity);
+  out.ids = uint4(in.cellId, in.propId, 1u, 0u);  // P2-8
   // Coincident topology offset for points
   out.depth = in.position.z + coinOffset.pointOffset / 65000.0;
   return out;
@@ -339,6 +357,8 @@ struct PointShapedVertexOut {
   float3 tangent;    // P2-9: tangent in view space
   float2 uv;         // P2-10: texture coordinates
   float2 lut_uv;     // P2-10: color texture coordinates
+  uint cellId;       // P2-8: flat-interpolated cell ID
+  uint propId;       // P2-8: flat-interpolated prop ID
 };
 
 vertex PointShapedVertexOut vertex_point_shaped_main(
@@ -351,7 +371,9 @@ vertex PointShapedVertexOut vertex_point_shaped_main(
     constant float4* point_colors [[buffer(4)]],
     constant float3* point_tangents [[buffer(6)]],
     constant float2* point_uvs [[buffer(7)]],
-    constant float2* point_color_uvs [[buffer(8)]]) {
+    constant float2* point_color_uvs [[buffer(8)]],
+    constant uint* shapedCellIds [[buffer(11)]],
+    constant uint& shapedPropId [[buffer(12)]]) {
   // Quad corners matching WebGPU TRIANGLE_VERTS
   const float2 tri_verts[4] = {
     float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1)
@@ -381,12 +403,15 @@ vertex PointShapedVertexOut vertex_point_shaped_main(
   out.tangent = scene.normalMatrix * point_tangents[point_id];
   out.uv = point_uvs[point_id];
   out.lut_uv = point_color_uvs[point_id];
+  out.cellId = shapedCellIds[point_id];
+  out.propId = shapedPropId + 1u;
   return out;
 }
 
 // Fragment output struct with explicit depth — needed for sphere depth correction.
 struct PointFragmentOutput {
   float4 color [[color(0)]];
+  uint4 ids [[color(1)]];   // P2-8: {cell, prop, composite, process} IDs
   float depth [[depth(any)]];
 };
 
@@ -495,7 +520,22 @@ fragment PointFragmentOutput fragment_point_shaped_main(
     }
   }
   out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, baseAlpha * material.opacity);
+  out.ids = uint4(in.cellId, in.propId, 1u, 0u);  // P2-8
   // Apply point coincident offset to depth (additive, after sphere depth correction)
   out.depth += coinOffset.pointOffset / 65000.0;
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// P2-8: Compute kernel for cell-to-primitive mapping
+// Maps each primitive (triangle/line segment) to its owning cell ID.
+// Mirrors WebGPU's VTKCellToGraphicsPrimitive.wgsl.
+// ---------------------------------------------------------------------------
+kernel void cellToPrimitive(
+    device uint* cellIds [[buffer(0)]],
+    constant uint* primitiveToCell [[buffer(1)]],
+    constant uint& cellIdOffset [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+  cellIds[gid] = primitiveToCell[gid] + cellIdOffset + 1u;  // 1-based
 }

@@ -83,6 +83,16 @@ void vtkMetalRenderer::DeviceRender()
     rpd.colorAttachments[0].clearColor = MTLClearColorMake(bgColor[0], bgColor[1], bgColor[2], 1.0);
     rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
 
+    // Attach IDs texture for GPU-based picking (color attachment 1)
+    id<MTLTexture> idsTex = (__bridge id<MTLTexture>)renWin->IdsTexture;
+    if (idsTex)
+    {
+      rpd.colorAttachments[1].texture = idsTex;
+      rpd.colorAttachments[1].loadAction = MTLLoadActionClear;
+      rpd.colorAttachments[1].clearColor = MTLClearColorMake(0, 0, 0, 0);
+      rpd.colorAttachments[1].storeAction = MTLStoreActionStore;
+    }
+
     // Attach depth texture for depth testing
     id<MTLTexture> depthTex = (__bridge id<MTLTexture>)renWin->DepthTexture;
     if (depthTex)

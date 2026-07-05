@@ -7,6 +7,10 @@
 #include "vtkRenderer.h"
 #include "vtkRendererCollection.h"
 #include "vtkCommand.h"
+#include "vtkUnsignedIntArray.h"
+
+#include <algorithm>
+#include <vector>
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -125,6 +129,12 @@ void vtkMetalRenderWindow::Finalize()
     this->DepthTexture = nullptr;
   }
 
+  if (this->IdsTexture)
+  {
+    CFRelease(this->IdsTexture);
+    this->IdsTexture = nullptr;
+  }
+
   if (this->MetalLayer)
   {
     CFRelease(this->MetalLayer);
@@ -218,6 +228,31 @@ void vtkMetalRenderWindow::RecreateDepthTexture()
 }
 
 //------------------------------------------------------------------------------
+void vtkMetalRenderWindow::RecreateIdsTexture()
+{
+  if (this->IdsTexture)
+  {
+    CFRelease(this->IdsTexture);
+    this->IdsTexture = nullptr;
+  }
+
+  @autoreleasepool
+  {
+    id<MTLDevice> device = (__bridge id<MTLDevice>)this->MetalDevice;
+    MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Uint
+                                                                                    width:this->Size[0]
+                                                                                   height:this->Size[1]
+                                                                                mipmapped:NO];
+    desc.usage = MTLTextureUsageRenderTarget;
+    desc.storageMode = MTLStorageModeShared;
+
+    id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+    this->IdsTexture = (__bridge void*)tex;
+    CFRetain((__bridge CFTypeRef)tex);
+  }
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalRenderWindow::Render()
 {
   if (!this->Initialized)
@@ -234,6 +269,13 @@ void vtkMetalRenderWindow::Render()
           depthTex.height != (NSUInteger)this->Size[1])
       {
         this->RecreateDepthTexture();
+      }
+
+      id<MTLTexture> idsTex = (__bridge id<MTLTexture>)this->IdsTexture;
+      if (!idsTex || idsTex.width != (NSUInteger)this->Size[0] ||
+          idsTex.height != (NSUInteger)this->Size[1])
+      {
+        this->RecreateIdsTexture();
       }
     }
   }
@@ -337,6 +379,65 @@ void vtkMetalRenderWindow::WaitForCompletion()
     if (buf)
     {
       [buf waitUntilCompleted];
+    }
+  }
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalRenderWindow::GetIdsData(int x1, int y1, int x2, int y2,
+                                       vtkUnsignedIntArray* data)
+{
+  if (!this->IdsTexture || !data)
+  {
+    return;
+  }
+
+  @autoreleasepool
+  {
+    id<MTLTexture> idsTex = (__bridge id<MTLTexture>)this->IdsTexture;
+
+    // Clamp to texture bounds
+    int texW = static_cast<int>(idsTex.width);
+    int texH = static_cast<int>(idsTex.height);
+    int xMin = std::max(0, std::min(x1, x2));
+    int yMin = std::max(0, std::min(y1, y2));
+    int xMax = std::min(texW - 1, std::max(x1, x2));
+    int yMax = std::min(texH - 1, std::max(y1, y2));
+
+    int width = xMax - xMin + 1;
+    int height = yMax - yMin + 1;
+    if (width <= 0 || height <= 0)
+    {
+      return;
+    }
+
+    // Read the texture region. MTLStorageModeShared allows direct CPU access.
+    // Region in texture coordinates: origin is top-left for Metal.
+    MTLRegion region = MTLRegionMake2D(xMin, yMin, width, height);
+    std::vector<uint32_t> texData(width * height * 4);
+    [idsTex getBytes:texData.data()
+         fromBytesPerRow:width * 4 * sizeof(uint32_t)
+        fromRegion:region
+       mipmapLevel:0];
+
+    // Copy into the output array with Y-flip (Metal top-left → VTK bottom-left).
+    // Output format: 4 components per pixel: {CellId, PropId, CompositeId, ProcessId}.
+    data->SetNumberOfComponents(4);
+    data->SetNumberOfTuples(width * height);
+    uint32_t* dst = data->GetPointer(0);
+
+    for (int y = 0; y < height; ++y)
+    {
+      int srcY = height - 1 - y; // flip Y
+      for (int x = 0; x < width; ++x)
+      {
+        int srcIdx = (srcY * width + x) * 4;
+        int dstIdx = (y * width + x) * 4;
+        dst[dstIdx + 0] = texData[srcIdx + 0]; // cell_id
+        dst[dstIdx + 1] = texData[srcIdx + 1]; // prop_id
+        dst[dstIdx + 2] = texData[srcIdx + 2]; // composite_id
+        dst[dstIdx + 3] = texData[srcIdx + 3]; // process_id
+      }
     }
   }
 }

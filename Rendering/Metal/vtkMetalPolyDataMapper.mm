@@ -75,6 +75,16 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLBuffer> ClipPlaneBuffer = nil;          // P1-6: clipping planes
   id<MTLBuffer> CellIdOffsetBuffer = nil;       // P2-7: homogeneous cell ID offset
 
+  // P2-8: Picking IDs
+  id<MTLBuffer> TriangleCellIdBuffer = nil;    // GPU output: per-triangle-vertex cell IDs
+  id<MTLBuffer> LineCellIdBuffer = nil;        // GPU output: per-line-vertex cell IDs
+  id<MTLBuffer> PointCellIdBuffer = nil;       // GPU output: per-point cell IDs
+  id<MTLBuffer> PropIdBuffer = nil;            // single uint32: actor prop ID
+  id<MTLBuffer> PrimitiveToCellBuffer = nil;   // CPU→GPU: maps primitive index → cell index
+  id<MTLComputePipelineState> CellToPrimitivePipeline = nil;
+  vtkIdType TrianglePrimitiveCount = 0;        // number of triangles for compute dispatch
+  vtkIdType LinePrimitiveCount = 0;            // number of line segments for compute dispatch
+
   vtkIdType TriangleVertexCount = 0;
   vtkIdType TriangleIndexCount = 0;
   vtkIdType LineIndexCount = 0;
@@ -111,6 +121,14 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     VertexColorBuffer = nil;
     ClipPlaneBuffer = nil;
     CellIdOffsetBuffer = nil;
+    TriangleCellIdBuffer = nil;
+    LineCellIdBuffer = nil;
+    PointCellIdBuffer = nil;
+    PropIdBuffer = nil;
+    PrimitiveToCellBuffer = nil;
+    CellToPrimitivePipeline = nil;
+    TrianglePrimitiveCount = 0;
+    LinePrimitiveCount = 0;
     TriangleVertexCount = 0;
     TriangleIndexCount = 0;
     LineIndexCount = 0;
@@ -277,6 +295,16 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         [encoder setVertexBuffer:this->Internals->ClipPlaneBuffer offset:0 atIndex:5];
       }
 
+      // P2-8: Bind picking ID buffers for triangle rendering
+      if (this->Internals->TriangleCellIdBuffer)
+      {
+        [encoder setVertexBuffer:this->Internals->TriangleCellIdBuffer offset:0 atIndex:6];
+      }
+      if (this->Internals->PropIdBuffer)
+      {
+        [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:7];
+      }
+
       if (this->Internals->IndexBuffer)
       {
         [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
@@ -318,6 +346,16 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       if (this->Internals->CoincidentOffsetBuffer)
       {
         [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
+      }
+
+      // P2-8: Bind picking ID buffers for line rendering
+      if (this->Internals->LineCellIdBuffer)
+      {
+        [encoder setVertexBuffer:this->Internals->LineCellIdBuffer offset:0 atIndex:6];
+      }
+      if (this->Internals->PropIdBuffer)
+      {
+        [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:7];
       }
 
       [encoder drawIndexedPrimitives:MTLPrimitiveTypeLine
@@ -365,6 +403,14 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         if (this->Internals->CellIdOffsetBuffer)
         {
           [encoder setVertexBuffer:this->Internals->CellIdOffsetBuffer offset:0 atIndex:9];
+        }
+        if (this->Internals->PointCellIdBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointCellIdBuffer offset:0 atIndex:11];
+        }
+        if (this->Internals->PropIdBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:12];
         }
         if (this->Internals->MaterialUniformBuffer)
         {
@@ -423,6 +469,14 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         if (this->Internals->CellIdOffsetBuffer)
         {
           [encoder setVertexBuffer:this->Internals->CellIdOffsetBuffer offset:0 atIndex:9];
+        }
+        if (this->Internals->PointCellIdBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointCellIdBuffer offset:0 atIndex:11];
+        }
+        if (this->Internals->PropIdBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:12];
         }
         if (this->Internals->MaterialUniformBuffer)
         {
@@ -489,6 +543,14 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         {
           [encoder setVertexBuffer:this->Internals->CellIdOffsetBuffer offset:0 atIndex:9];
         }
+        if (this->Internals->PointCellIdBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointCellIdBuffer offset:0 atIndex:11];
+        }
+        if (this->Internals->PropIdBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:12];
+        }
         if (this->Internals->MaterialUniformBuffer)
         {
           [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
@@ -547,6 +609,14 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         {
           [encoder setVertexBuffer:this->Internals->CellIdOffsetBuffer offset:0 atIndex:9];
         }
+        if (this->Internals->PointCellIdBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PointCellIdBuffer offset:0 atIndex:11];
+        }
+        if (this->Internals->PropIdBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:12];
+        }
         if (this->Internals->MaterialUniformBuffer)
         {
           [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
@@ -588,6 +658,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   std::vector<float> normals;
   std::vector<uint32_t> lineIndices;
 
+  // P2-8: per-primitive cell ID mapping (primitive index → cell index)
+  std::vector<uint32_t> trianglePrimToCell;
+  std::vector<uint32_t> linePrimToCell;
+
   vtkPointData* pd = polydata->GetPointData();
   vtkFloatArray* normalArray = nullptr;
   if (pd->GetNormals())
@@ -597,6 +671,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
 
   // Process triangles
   vtkCellArray* polys = polydata->GetPolys();
+  vtkIdType polyCellIdx = 0;
   if (polys && polys->GetNumberOfCells() > 0)
   {
     vtkIdType npts;
@@ -655,7 +730,9 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
           normals.push_back(fn[1]);
           normals.push_back(fn[2]);
         }
+        trianglePrimToCell.push_back(static_cast<uint32_t>(polyCellIdx));
       }
+      polyCellIdx++;
     }
     this->Internals->TriangleVertexCount = static_cast<uint32_t>(positions.size() / 3);
     this->Internals->TriangleIndexCount = 0;
@@ -664,6 +741,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
 
   // Process lines
   vtkCellArray* lines = polydata->GetLines();
+  vtkIdType lineCellIdx = 0;
   if (lines && lines->GetNumberOfCells() > 0)
   {
     std::unordered_map<vtkIdType, uint32_t> pointMap;
@@ -698,7 +776,9 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       {
         lineIndices.push_back(pointMap[pts[i]]);
         lineIndices.push_back(pointMap[pts[i + 1]]);
+        linePrimToCell.push_back(static_cast<uint32_t>(lineCellIdx));
       }
+      lineCellIdx++;
     }
     this->Internals->LineIndexCount = lineIndices.size();
     this->Internals->HasLines = !lineIndices.empty();
@@ -737,6 +817,44 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     this->Internals->LineIndexBuffer = [device
       newBufferWithBytes:lineIndices.data()
                  length:lineIndices.size() * sizeof(uint32_t)
+                options:MTLResourceStorageModeShared];
+  }
+
+  // P2-8: Create primitive-to-cell mapping buffers and cell ID output buffers
+  if (!trianglePrimToCell.empty())
+  {
+    this->Internals->PrimitiveToCellBuffer = [device
+      newBufferWithBytes:trianglePrimToCell.data()
+                 length:trianglePrimToCell.size() * sizeof(uint32_t)
+                options:MTLResourceStorageModeShared];
+    this->Internals->TrianglePrimitiveCount = trianglePrimToCell.size();
+    // Cell ID output buffer — same size as primitive-to-cell (one uint per primitive)
+    this->Internals->TriangleCellIdBuffer = [device
+      newBufferWithLength:trianglePrimToCell.size() * sizeof(uint32_t)
+                 options:MTLResourceStorageModeShared];
+  }
+  if (!linePrimToCell.empty())
+  {
+    this->Internals->LineCellIdBuffer = [device
+      newBufferWithLength:linePrimToCell.size() * sizeof(uint32_t)
+                 options:MTLResourceStorageModeShared];
+    this->Internals->LinePrimitiveCount = linePrimToCell.size();
+    // Reuse PrimitiveToCellBuffer if only lines exist, otherwise we need a separate one
+    if (trianglePrimToCell.empty())
+    {
+      this->Internals->PrimitiveToCellBuffer = [device
+        newBufferWithBytes:linePrimToCell.data()
+                   length:linePrimToCell.size() * sizeof(uint32_t)
+                  options:MTLStorageModeShared];
+    }
+  }
+
+  // Prop ID buffer — single uint32
+  {
+    uint32_t propId = 0;
+    this->Internals->PropIdBuffer = [device
+      newBufferWithBytes:&propId
+                 length:sizeof(uint32_t)
                 options:MTLResourceStorageModeShared];
   }
 
@@ -916,6 +1034,89 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                 options:MTLResourceStorageModeShared];
 
     this->Internals->PointVertexCount = numPts;
+
+    // P2-8: Point cell IDs — identity mapping (point i → cell i)
+    std::vector<uint32_t> pointCellIds(numPts);
+    for (vtkIdType i = 0; i < numPts; ++i)
+    {
+      pointCellIds[i] = static_cast<uint32_t>(i);
+    }
+    this->Internals->PointCellIdBuffer = [device
+      newBufferWithBytes:pointCellIds.data()
+                 length:pointCellIds.size() * sizeof(uint32_t)
+                options:MTLResourceStorageModeShared];
+  }
+
+  // P2-8: Create compute pipeline and dispatch cell-to-primitive mapping
+  if (!this->Internals->CellToPrimitivePipeline)
+  {
+    NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
+    NSError* error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+    if (library)
+    {
+      id<MTLFunction> kernelFunc = [library newFunctionWithName:@"cellToPrimitive"];
+      if (kernelFunc)
+      {
+        this->Internals->CellToPrimitivePipeline =
+          [device newComputePipelineStateWithFunction:kernelFunc error:&error];
+      }
+    }
+  }
+
+  // Dispatch compute kernel for triangle cell IDs
+  if (this->Internals->CellToPrimitivePipeline &&
+      this->Internals->TrianglePrimitiveCount > 0 &&
+      this->Internals->TriangleCellIdBuffer &&
+      this->Internals->PrimitiveToCellBuffer)
+  {
+    id<MTLCommandBuffer> cmdBuf = [(__bridge id<MTLCommandQueue>)
+      [device newCommandQueue] commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+    [encoder setComputePipelineState:this->Internals->CellToPrimitivePipeline];
+    [encoder setBuffer:this->Internals->TriangleCellIdBuffer offset:0 atIndex:0];
+    [encoder setBuffer:this->Internals->PrimitiveToCellBuffer offset:0 atIndex:1];
+    [encoder setBuffer:this->Internals->CellIdOffsetBuffer offset:0 atIndex:2];
+    NSUInteger threadgroupSize = this->Internals->CellToPrimitivePipeline.maxTotalThreadsPerThreadgroup;
+    if (threadgroupSize > static_cast<NSUInteger>(this->Internals->TrianglePrimitiveCount))
+    {
+      threadgroupSize = this->Internals->TrianglePrimitiveCount;
+    }
+    MTLSize gridSize = MTLSizeMake(static_cast<NSUInteger>(this->Internals->TrianglePrimitiveCount), 1, 1);
+    MTLSize tgSize = MTLSizeMake(threadgroupSize, 1, 1);
+    [encoder dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
+    [encoder endEncoding];
+    [cmdBuf commit];
+    [cmdBuf waitUntilCompleted];
+  }
+
+  // Dispatch compute kernel for line cell IDs
+  if (this->Internals->CellToPrimitivePipeline &&
+      this->Internals->LinePrimitiveCount > 0 &&
+      this->Internals->LineCellIdBuffer &&
+      this->Internals->PrimitiveToCellBuffer &&
+      this->Internals->TrianglePrimitiveCount == 0)
+  {
+    // Only dispatch lines if we didn't already dispatch triangles
+    // (they share PrimitiveToCellBuffer)
+    id<MTLCommandBuffer> cmdBuf = [(__bridge id<MTLCommandQueue>)
+      [device newCommandQueue] commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+    [encoder setComputePipelineState:this->Internals->CellToPrimitivePipeline];
+    [encoder setBuffer:this->Internals->LineCellIdBuffer offset:0 atIndex:0];
+    [encoder setBuffer:this->Internals->PrimitiveToCellBuffer offset:0 atIndex:1];
+    [encoder setBuffer:this->Internals->CellIdOffsetBuffer offset:0 atIndex:2];
+    NSUInteger threadgroupSize = this->Internals->CellToPrimitivePipeline.maxTotalThreadsPerThreadgroup;
+    if (threadgroupSize > static_cast<NSUInteger>(this->Internals->LinePrimitiveCount))
+    {
+      threadgroupSize = this->Internals->LinePrimitiveCount;
+    }
+    MTLSize gridSize = MTLSizeMake(static_cast<NSUInteger>(this->Internals->LinePrimitiveCount), 1, 1);
+    MTLSize tgSize = MTLSizeMake(threadgroupSize, 1, 1);
+    [encoder dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
+    [encoder endEncoding];
+    [cmdBuf commit];
+    [cmdBuf waitUntilCompleted];
   }
 }
 
@@ -967,6 +1168,7 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   pipelineDesc.fragmentFunction = fragmentFunc;
   pipelineDesc.vertexDescriptor = vertexDesc;
   pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+  pipelineDesc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
 
   // Enable depth testing (matching WebGPU's depthCompare = Less, depthWriteEnabled = true)
   pipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
@@ -1030,6 +1232,7 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
       desc.vertexFunction = vFunc;
       desc.fragmentFunction = fFunc;
       desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
       desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 
       error = nil;
@@ -1055,6 +1258,7 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
       desc.vertexFunction = vFunc;
       desc.fragmentFunction = fFunc;
       desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
       desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
       // No backface culling for point quads
       desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;

@@ -21,11 +21,14 @@
 @protocol MTLCommandQueue;
 @protocol MTLCommandBuffer;
 @protocol MTLRenderPipelineState;
+@protocol MTLTexture;
 @class CAMetalLayer;
 @class CAMetalDrawable;
 #else
 class id;
 #endif
+
+class vtkUnsignedIntArray;
 
 VTK_ABI_NAMESPACE_BEGIN
 
@@ -90,6 +93,13 @@ public:
    */
   void* GetCurrentCommandBuffer();
 
+  /**
+   * Read back the IDs texture (RGBA32Uint) into a vtkTypeUInt32Array.
+   * The array is populated with 4 components per pixel: {CellId, PropId, CompositeId, ProcessId}.
+   * Y-axis is flipped to match VTK's bottom-left origin.
+   */
+  void GetIdsData(int x1, int y1, int x2, int y2, vtkUnsignedIntArray* data);
+
 protected:
   vtkMetalRenderWindow();
   ~vtkMetalRenderWindow() override;
@@ -110,6 +120,11 @@ protected:
   void RecreateDepthTexture();
 
   /**
+   * Recreate the IDs texture for GPU-based picking.
+   */
+  void RecreateIdsTexture();
+
+  /**
    * Acquire the next drawable from the CAMetalLayer.
    */
   bool AcquireDrawable();
@@ -127,6 +142,7 @@ protected:
   void* CommandBuffer = nullptr;   // id<MTLCommandBuffer>
   void* Encoder = nullptr;         // id<MTLRenderCommandEncoder>
   void* DepthTexture = nullptr;    // id<MTLTexture>
+  void* IdsTexture = nullptr;      // id<MTLTexture> — RGBA32Uint for picking IDs
   void* ColorCopyPipeline = nullptr; // id<MTLRenderPipelineState>
 
   bool Initialized = false;

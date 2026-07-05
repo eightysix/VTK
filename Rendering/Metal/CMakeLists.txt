@@ -5,7 +5,8 @@ set(classes
   vtkMetalPolyDataMapper
   vtkMetalCamera
   vtkMetalProperty
-  vtkMetalLight)
+  vtkMetalLight
+  vtkMetalHardwareSelector)
 
 set(headers)
 set(sources)
