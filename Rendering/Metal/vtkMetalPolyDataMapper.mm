@@ -50,6 +50,10 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLBuffer> IndexBuffer = nil;
   id<MTLBuffer> LineIndexBuffer = nil;
 
+  // P1-1A/1B: per-vertex color for triangle/line surfaces (float4 RGBA per vertex)
+  id<MTLBuffer> SurfaceColorBuffer = nil;
+  bool HasSurfaceColors = false;
+
   id<MTLRenderPipelineState> TrianglePipeline = nil;
   id<MTLRenderPipelineState> LinePipeline = nil;
 
@@ -100,6 +104,8 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     VertexNormalBuffer = nil;
     IndexBuffer = nil;
     LineIndexBuffer = nil;
+    SurfaceColorBuffer = nil;
+    HasSurfaceColors = false;
     TrianglePipeline = nil;
     LinePipeline = nil;
 
@@ -250,11 +256,13 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       // Bit 3: vertex visibility
       // Bit 5: RenderPointsAsSpheres
       // Bit 7: Point2DShape (0=Round, 1=Square)
+      // Bit 8: has surface vertex colors (P1-1A/1B)
       vtkProperty* prop = act->GetProperty();
       uint32_t actorFlags = 0;
       actorFlags |= (prop->GetVertexVisibility() ? 1u : 0u) << 3;
       actorFlags |= (prop->GetRenderPointsAsSpheres() ? 1u : 0u) << 5;
       actorFlags |= (static_cast<uint32_t>(prop->GetPoint2DShape())) << 7;
+      actorFlags |= (this->Internals->HasSurfaceColors ? 1u : 0u) << 8;
       *reinterpret_cast<uint32_t*>(buf + 256) |= actorFlags;
     }
 
@@ -272,6 +280,11 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       {
         [encoder setVertexBuffer:this->Internals->VertexNormalBuffer offset:0 atIndex:1];
       }
+      // P1-1A/1B: bind per-vertex color buffer at vertex buffer index 3
+      if (this->Internals->SurfaceColorBuffer)
+      {
+        [encoder setVertexBuffer:this->Internals->SurfaceColorBuffer offset:0 atIndex:3];
+      }
 
       if (this->Internals->MaterialUniformBuffer)
       {
@@ -284,6 +297,8 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       if (this->Internals->SceneUniformBuffer)
       {
         [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
+        // P1-1A: bind scene uniforms to fragment buffer(2) so fragment shader can read flags
+        [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
       }
       if (this->Internals->CoincidentOffsetBuffer)
       {
@@ -303,6 +318,20 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       if (this->Internals->PropIdBuffer)
       {
         [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:7];
+      }
+
+      // P1-1C: set backface/frontface cull mode
+      if (act->GetProperty()->GetBackfaceCulling())
+      {
+        [encoder setCullMode:MTLCullModeBack];
+      }
+      else if (act->GetProperty()->GetFrontfaceCulling())
+      {
+        [encoder setCullMode:MTLCullModeFront];
+      }
+      else
+      {
+        [encoder setCullMode:MTLCullModeNone];
       }
 
       if (this->Internals->IndexBuffer)
@@ -330,6 +359,11 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       {
         [encoder setVertexBuffer:this->Internals->VertexNormalBuffer offset:0 atIndex:1];
       }
+      // P1-1A/1B: bind per-vertex color buffer at vertex buffer index 3
+      if (this->Internals->SurfaceColorBuffer)
+      {
+        [encoder setVertexBuffer:this->Internals->SurfaceColorBuffer offset:0 atIndex:3];
+      }
 
       if (this->Internals->MaterialUniformBuffer)
       {
@@ -342,6 +376,8 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       if (this->Internals->SceneUniformBuffer)
       {
         [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
+        // P1-1A: bind scene uniforms to fragment buffer(2) so fragment shader can read flags
+        [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
       }
       if (this->Internals->CoincidentOffsetBuffer)
       {
@@ -357,6 +393,9 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       {
         [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:7];
       }
+
+      // P1-1C: set cull mode for lines
+      [encoder setCullMode:MTLCullModeNone];
 
       [encoder drawIndexedPrimitives:MTLPrimitiveTypeLine
                           indexCount:this->Internals->LineIndexCount
@@ -656,6 +695,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
   std::vector<float> positions;
   std::vector<float> normals;
+  std::vector<float> surfaceColors;  // P1-1A/1B: float4 per vertex
   std::vector<uint32_t> lineIndices;
 
   // P2-8: per-primitive cell ID mapping (primitive index → cell index)
@@ -667,6 +707,14 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   if (pd->GetNormals())
   {
     normalArray = vtkFloatArray::SafeDownCast(pd->GetNormals());
+  }
+
+  // P1-1A/1B: MapScalars early so both triangle and line paths can use the result.
+  int cellFlag = 0;
+  vtkUnsignedCharArray* mappedColors = nullptr;
+  if (actor)
+  {
+    mappedColors = this->MapScalars(actor->GetProperty()->GetOpacity(), cellFlag);
   }
 
   // Process triangles
@@ -729,6 +777,24 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
           normals.push_back(fn[0]);
           normals.push_back(fn[1]);
           normals.push_back(fn[2]);
+
+          // P1-1A/1B: per-vertex color from scalar mapping
+          if (mappedColors)
+          {
+            const unsigned char* rgba = mappedColors->GetPointer(0);
+            vtkIdType idx = (cellFlag == 0) ? tri[j] : polyCellIdx;
+            surfaceColors.push_back(rgba[idx * 4] / 255.0f);
+            surfaceColors.push_back(rgba[idx * 4 + 1] / 255.0f);
+            surfaceColors.push_back(rgba[idx * 4 + 2] / 255.0f);
+            surfaceColors.push_back(rgba[idx * 4 + 3] / 255.0f);
+          }
+          else
+          {
+            surfaceColors.push_back(1.0f);
+            surfaceColors.push_back(1.0f);
+            surfaceColors.push_back(1.0f);
+            surfaceColors.push_back(1.0f);
+          }
         }
         trianglePrimToCell.push_back(static_cast<uint32_t>(polyCellIdx));
       }
@@ -744,19 +810,25 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   vtkIdType lineCellIdx = 0;
   if (lines && lines->GetNumberOfCells() > 0)
   {
-    std::unordered_map<vtkIdType, uint32_t> pointMap;
-    uint32_t nextPointId = static_cast<uint32_t>(positions.size() / 3);
-
-    vtkIdType npts;
-    const vtkIdType* pts;
-    lines->InitTraversal();
-    while (lines->GetNextCell(npts, pts) && npts > 0)
+    if (cellFlag != 0 && mappedColors)
     {
-      for (vtkIdType i = 0; i < npts; ++i)
+      // P1-1B: Cell coloring for lines — no deduplication, each segment endpoint
+      // gets the cell's color (flat shading via duplicated per-vertex colors).
+      uint32_t nextPointId = static_cast<uint32_t>(positions.size() / 3);
+
+      vtkIdType npts;
+      const vtkIdType* pts;
+      lines->InitTraversal();
+      while (lines->GetNextCell(npts, pts) && npts > 0)
       {
-        if (pointMap.find(pts[i]) == pointMap.end())
+        const unsigned char* rgba = mappedColors->GetPointer(0);
+        float cr = rgba[lineCellIdx * 4] / 255.0f;
+        float cg = rgba[lineCellIdx * 4 + 1] / 255.0f;
+        float cb = rgba[lineCellIdx * 4 + 2] / 255.0f;
+        float ca = rgba[lineCellIdx * 4 + 3] / 255.0f;
+
+        for (vtkIdType i = 0; i < npts; ++i)
         {
-          pointMap[pts[i]] = nextPointId++;
           double pt[3];
           polydata->GetPoint(pts[i], pt);
           positions.push_back(static_cast<float>(pt[0]));
@@ -770,15 +842,77 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
             normals.push_back(static_cast<float>(n[1]));
             normals.push_back(static_cast<float>(n[2]));
           }
+          surfaceColors.push_back(cr);
+          surfaceColors.push_back(cg);
+          surfaceColors.push_back(cb);
+          surfaceColors.push_back(ca);
         }
+        uint32_t base = nextPointId;
+        nextPointId += npts;
+        for (vtkIdType i = 0; i < npts - 1; ++i)
+        {
+          lineIndices.push_back(base + i);
+          lineIndices.push_back(base + i + 1);
+          linePrimToCell.push_back(static_cast<uint32_t>(lineCellIdx));
+        }
+        lineCellIdx++;
       }
-      for (vtkIdType i = 0; i < npts - 1; ++i)
+    }
+    else
+    {
+      // P1-1A: Point coloring (or no coloring) — deduplicate by point ID
+      std::unordered_map<vtkIdType, uint32_t> pointMap;
+      uint32_t nextPointId = static_cast<uint32_t>(positions.size() / 3);
+
+      vtkIdType npts;
+      const vtkIdType* pts;
+      lines->InitTraversal();
+      while (lines->GetNextCell(npts, pts) && npts > 0)
       {
-        lineIndices.push_back(pointMap[pts[i]]);
-        lineIndices.push_back(pointMap[pts[i + 1]]);
-        linePrimToCell.push_back(static_cast<uint32_t>(lineCellIdx));
+        for (vtkIdType i = 0; i < npts; ++i)
+        {
+          if (pointMap.find(pts[i]) == pointMap.end())
+          {
+            pointMap[pts[i]] = nextPointId++;
+            double pt[3];
+            polydata->GetPoint(pts[i], pt);
+            positions.push_back(static_cast<float>(pt[0]));
+            positions.push_back(static_cast<float>(pt[1]));
+            positions.push_back(static_cast<float>(pt[2]));
+            if (normalArray)
+            {
+              double n[3];
+              normalArray->GetTuple(pts[i], n);
+              normals.push_back(static_cast<float>(n[0]));
+              normals.push_back(static_cast<float>(n[1]));
+              normals.push_back(static_cast<float>(n[2]));
+            }
+            // P1-1A: point color
+            if (mappedColors && cellFlag == 0)
+            {
+              const unsigned char* rgba = mappedColors->GetPointer(0);
+              surfaceColors.push_back(rgba[pts[i] * 4] / 255.0f);
+              surfaceColors.push_back(rgba[pts[i] * 4 + 1] / 255.0f);
+              surfaceColors.push_back(rgba[pts[i] * 4 + 2] / 255.0f);
+              surfaceColors.push_back(rgba[pts[i] * 4 + 3] / 255.0f);
+            }
+            else
+            {
+              surfaceColors.push_back(1.0f);
+              surfaceColors.push_back(1.0f);
+              surfaceColors.push_back(1.0f);
+              surfaceColors.push_back(1.0f);
+            }
+          }
+        }
+        for (vtkIdType i = 0; i < npts - 1; ++i)
+        {
+          lineIndices.push_back(pointMap[pts[i]]);
+          lineIndices.push_back(pointMap[pts[i + 1]]);
+          linePrimToCell.push_back(static_cast<uint32_t>(lineCellIdx));
+        }
+        lineCellIdx++;
       }
-      lineCellIdx++;
     }
     this->Internals->LineIndexCount = lineIndices.size();
     this->Internals->HasLines = !lineIndices.empty();
@@ -817,6 +951,25 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     this->Internals->LineIndexBuffer = [device
       newBufferWithBytes:lineIndices.data()
                  length:lineIndices.size() * sizeof(uint32_t)
+                options:MTLResourceStorageModeShared];
+  }
+
+  // P1-1A/1B: Create surface color buffer (float4 per triangle/line vertex)
+  if (!surfaceColors.empty())
+  {
+    this->Internals->SurfaceColorBuffer = [device
+      newBufferWithBytes:surfaceColors.data()
+                 length:surfaceColors.size() * sizeof(float)
+                options:MTLResourceStorageModeShared];
+    this->Internals->HasSurfaceColors = (mappedColors != nullptr);
+  }
+  else if (!positions.empty())
+  {
+    // Always provide a white color buffer so the vertex shader can always read from buffer(3)
+    std::vector<float> whiteColors(positions.size() / 3 * 4, 1.0f);
+    this->Internals->SurfaceColorBuffer = [device
+      newBufferWithBytes:whiteColors.data()
+                 length:whiteColors.size() * sizeof(float)
                 options:MTLResourceStorageModeShared];
   }
 
@@ -912,13 +1065,8 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
 
     // Point colors — from MapScalars (per-point RGBA) or default white.
     // Matches WebGPU: reads point_colors SSBO indexed by point_id.
+    // Note: mappedColors and cellFlag are already set from the early MapScalars call above.
     std::vector<float> pointColors(numPts * 4, 1.0f); // default white
-    int cellFlag = 0;
-    vtkUnsignedCharArray* mappedColors = nullptr;
-    if (actor)
-    {
-      mappedColors = this->MapScalars(actor->GetProperty()->GetOpacity(), cellFlag);
-    }
     if (mappedColors && cellFlag == 0 &&
         mappedColors->GetNumberOfTuples() >= numPts)
     {

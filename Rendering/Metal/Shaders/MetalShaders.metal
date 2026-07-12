@@ -82,6 +82,7 @@ struct VertexOut {
   float4 position [[position]];
   float3 viewPos;
   float3 viewNormal;
+  float4 vertexColor;    // P1-1A: per-vertex color from scalar mapping
   float4 clipDistances;  // P1-6: clip plane distances (x,y,z,w for planes 0-3)
   uint cellId;           // P2-8: flat-interpolated cell ID (1-based, 0=background)
   uint propId;           // P2-8: flat-interpolated prop ID (1-based, 0=background)
@@ -100,6 +101,7 @@ struct FragmentOutput {
 vertex VertexOut vertex_main(uint vertex_id [[vertex_id]],
                              VertexIn in [[stage_in]],
                              constant SceneUniforms& scene [[buffer(2)]],
+                             constant float4* vertexColors [[buffer(3)]],
                              constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
                              constant uint* cellIds [[buffer(6)]],
                              constant uint& propId [[buffer(7)]]) {
@@ -112,6 +114,9 @@ vertex VertexOut vertex_main(uint vertex_id [[vertex_id]],
   out.position = scene.projectionMatrix * viewPos;
 
   out.viewNormal = scene.normalMatrix * in.normal;
+
+  // P1-1A: per-vertex color from scalar mapping
+  out.vertexColor = vertexColors[vertex_id];
 
   // P1-6: compute clip distances for up to 4 planes
   out.clipDistances = float4(
@@ -134,6 +139,7 @@ vertex VertexOut vertex_main(uint vertex_id [[vertex_id]],
 fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
                               constant MaterialUniforms& material [[buffer(0)]],
                               constant LightUniforms& lights [[buffer(1)]],
+                              constant SceneUniforms& scene [[buffer(2)]],
                               constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
                               constant ClipPlaneUniforms& clipPlanes [[buffer(5)]]) {
   // P1-6: discard fragments outside clip planes
@@ -144,9 +150,11 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
 
   float3 N = normalize(in.viewNormal);
 
-  float3 ambientColor = material.ambientColor.rgb;
+  // P1-1A: per-vertex color overrides material colors when active (bit 8)
+  bool hasVertexColors = (scene.flags & (1u << 8)) != 0u;
+  float3 ambientColor = hasVertexColors ? in.vertexColor.rgb : material.ambientColor.rgb;
   float ambientIntensity = material.ambientColor.w;
-  float3 diffuseColor = material.diffuseColor.rgb;
+  float3 diffuseColor = hasVertexColors ? in.vertexColor.rgb : material.diffuseColor.rgb;
   float diffuseIntensity = material.diffuseColor.w;
   float3 specularColor = material.specularColor.rgb;
   float specularIntensity = material.specularColor.w;
@@ -207,7 +215,8 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
   }
 
   FragmentOutput out;
-  out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, material.opacity);
+  float baseOpacity = hasVertexColors ? in.vertexColor.a : material.opacity;
+  out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, baseOpacity);
   out.ids = uint4(in.cellId, in.propId, 1u, 0u);  // P2-8: {cell, prop, composite=1, process=0}
   // Coincident topology offset for polygons — matches WebGPU
   float c_factor = coinOffset.polygonFactor;

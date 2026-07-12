@@ -2,7 +2,7 @@
 
 Track the implementation status of the VTK Metal rendering backend compared to the WebGPU reference implementation.
 
-Last updated: 2026-07-11
+Last updated: 2026-07-12
 
 ---
 
@@ -18,6 +18,9 @@ Last updated: 2026-07-11
 - **Light uniforms** — up to 8 lights with position, direction, color, attenuation
 
 ### P1 Features (Priority 1)
+- **P1-1A Per-vertex color for surfaces** — `MapScalars()` called early in `BuildGeometryBuffers()`; `SurfaceColorBuffer` (float4 per vertex) built for triangles and lines. Vertex shader reads from `[[buffer(3)]]`, fragment shader uses `vertexColor` when flags bit 8 is set, replacing `material.ambientColor.rgb` and `material.diffuseColor.rgb`.
+- **P1-1B Cell data coloring** — when `cellFlag != 0`, triangle vertices get cell color via `polyCellIdx`; line vertices get cell color with no point deduplication (flat shading via duplicated per-vertex colors).
+- **P1-1C Backface/frontface cull mode** — `[encoder setCullMode:]` set from `GetBackfaceCulling()`/`GetFrontfaceCulling()` before triangle draw calls. Lines always use `MTLCullModeNone`.
 - **P1-4 Vertex visibility** — draws vertex dots on top of surface/wireframe when `GetVertexVisibility()` is true. Supports both 1px (`PointPipeline`) and shaped (`PointShapedPipeline`) based on point size.
 - **P1-5 Coincident topology offset** — `CoincidentOffsetUniforms` buffer with polygon/line/point factors. Polygon offset uses `dfdx`/`dfdy` depth derivatives for slope-scale bias. Matches WebGPU behavior.
 - **P1-6 Clipping planes** — up to 6 clip planes via `ClipPlaneUniforms`. Clip distances computed in vertex shader, fragments discarded in fragment shader.
@@ -53,17 +56,6 @@ Last updated: 2026-07-11
 ---
 
 ## Not Implemented
-
-### Per-Vertex Color for Surfaces
-- `MapScalars()` is called but colors are only used for the point rendering path
-- Triangle/line vertex descriptor only has position + normal (no color attribute)
-- Fragment shader always uses `material.diffuseColor.rgb` — no per-vertex color input
-- **Impact**: Surfaces cannot be colored by scalar arrays
-
-### Cell Data Coloring
-- `cellFlag != 0` from `MapScalars()` causes colors to be discarded
-- No `CellColorBuffer` exists in the mapper internals
-- **Impact**: Cell-based scalar arrays produce no visible coloring
 
 ### Wireframe / Edge Rendering
 - No `VTK_WIREFRAME` representation code path
@@ -128,8 +120,8 @@ Last updated: 2026-07-11
 |------|-------|------|
 | `vtkMetalRenderWindow.h/.mm` | 143/445 | Device, layer, depth/IDs textures, readback |
 | `vtkMetalRenderer.mm` | 182 | Render pass setup, encoder, camera |
-| `vtkMetalPolyDataMapper.mm` | 1651 | Geometry build, pipeline states, draw calls |
-| `Shaders/MetalShaders.metal` | 540 | Vertex/fragment/compute shaders |
+| `vtkMetalPolyDataMapper.mm` | 1808 | Geometry build, pipeline states, draw calls |
+| `Shaders/MetalShaders.metal` | 550 | Vertex/fragment/compute shaders |
 | `vtkMetalActor.mm` | 43 | Thin passthrough to mapper |
 | `vtkMetalCamera.mm` | — | Scene transforms, view/projection matrices |
 | `vtkMetalProperty.mm` | — | Property state (color, opacity, representation) |
@@ -144,13 +136,11 @@ Last updated: 2026-07-11
 
 See `IMPLEMENTATION_PLAN.md` for the full feature-by-feature implementation plan with file locations, code changes, and WebGPU references.
 
-1. **Per-vertex color for surfaces** — most visible gap; surfaces can't be colored by scalar arrays
-2. **Cell data coloring** — needed for cell-based scalar visualization
-3. **Wireframe rendering** — needed for `VTK_WIREFRAME` representation
-4. **Triangle index buffers** — reduces memory and improves cache efficiency
-5. **MSAA** — straightforward Metal feature, high visual impact
-6. **Depth peeling** — needed for correct translucent rendering
-7. **GPU tessellation** — moves polygon→triangle conversion off CPU
-8. **Thick lines** — needed for line width settings
-9. **Batched rendering** — reduces CPU overhead for many-actor scenes
-10. **Texture mapping** — complete the P2-10 UV plumbing with actual sampling
+1. **Wireframe rendering** — needed for `VTK_WIREFRAME` representation
+2. **Triangle index buffers** — reduces memory and improves cache efficiency
+3. **MSAA** — straightforward Metal feature, high visual impact
+4. **Depth peeling** — needed for correct translucent rendering
+5. **GPU tessellation** — moves polygon→triangle conversion off CPU
+6. **Thick lines** — needed for line width settings
+7. **Batched rendering** — reduces CPU overhead for many-actor scenes
+8. **Texture mapping** — complete the P2-10 UV plumbing with actual sampling

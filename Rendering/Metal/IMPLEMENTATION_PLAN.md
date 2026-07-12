@@ -7,59 +7,19 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 
 ---
 
-## Phase 1: Foundation — Per-Vertex Color & Cull Mode
+## Phase 1: Foundation — Per-Vertex Color & Cull Mode ✅ COMPLETED
 
-### 1A. Per-Vertex Color for Surfaces
+### 1A. Per-Vertex Color for Surfaces ✅
 
-**Gap**: Triangle/line vertex descriptor only has position + normal. `MapScalars()` is called but colors are only used in the point path. Surfaces cannot be colored by scalar arrays.
+**Status**: Implemented. `MapScalars()` called early in `BuildGeometryBuffers()`. `SurfaceColorBuffer` (float4 per vertex) created for triangles and lines. Vertex shader reads from `[[buffer(3)]]`. Fragment shader uses `vertexColor` when flags bit 8 is set, replacing `material.ambientColor.rgb` and `material.diffuseColor.rgb`.
 
-**Files**:
-- `vtkMetalPolyDataMapper.mm` — `BuildGeometryBuffers()`, `EnsurePipelineStates()`
-- `MetalShaders.metal` — `vertex_main`, `fragment_main`
+### 1B. Cell Data Coloring ✅
 
-**Implementation**:
-1. In `BuildGeometryBuffers()`, after building `VertexPositionBuffer`/`VertexNormalBuffer`, call `this->MapScalars(actor->GetProperty()->GetOpacity(), cellFlag)`.
-2. If `cellFlag == 0` (point-associated scalars), normalize the `unsigned char` RGBA colors to `float [0,1]` and create `VertexColorBuffer` (float4 per vertex, duplicated per triangle vertex just like normals).
-3. Update `EnsurePipelineStates()` vertex descriptor: add `MTLVertexFormatFloat4` at `bufferIndex = 2` (color attribute).
-4. Update `MetalShaders.metal` `VertexIn` struct: add `float4 color [[attribute(2)]]`.
-5. Update `VertexOut` struct: add `float4 vertexColor`.
-6. In `vertex_main`: pass `in.color` through to `out.vertexColor`.
-7. In `fragment_main`: when per-vertex color is available, use `in.vertexColor` instead of `material.diffuseColor.rgb` for the base color.
-8. Add a uniform flag (or use a bit in `SceneUniforms.flags`) to tell the fragment shader whether per-vertex color is active.
+**Status**: Implemented. When `cellFlag != 0`: triangle vertices get cell color via `polyCellIdx`; line vertices get cell color with no point deduplication (flat shading via duplicated per-vertex colors).
 
-**WebGPU reference**: `DeducePointCellAttributeAvailability()` (line ~1469), `ReplaceVertexShaderColors()` (line ~3444), `ReplaceFragmentShaderColors()` (line ~3818).
+### 1C. Backface/Frontface Culling ✅
 
-### 1B. Cell Data Coloring
-
-**Gap**: When `cellFlag != 0` from `MapScalars()`, colors are discarded. No `CellColorBuffer` exists.
-
-**Files**:
-- `vtkMetalPolyDataMapper.mm` — internals struct, `BuildGeometryBuffers()`
-- `MetalShaders.metal` — fragment shader
-
-**Implementation**:
-1. Add `id<MTLBuffer> CellColorBuffer` to `vtkMetalPolyDataMapperInternals`.
-2. In `BuildGeometryBuffers()`, when `cellFlag != 0`, iterate cells, look up each cell's mapped color, and duplicate the color for each vertex of that cell (fan-triangulated triangles get the cell color for all 3 vertices).
-3. Create a separate vertex buffer for cell colors or pack into the existing color buffer with a flag.
-4. Fragment shader reads cell color when cell coloring is active.
-
-**WebGPU reference**: `DeducePointCellAttributeAvailability()` lines 1500-1530, `UploadAttributeToGPUBuffer()` for `CELL_COLORS`.
-
-### 1C. Backface/Frontface Culling
-
-**Gap**: Metal only sets `inputPrimitiveTopology` but no explicit cull mode.
-
-**Files**:
-- `vtkMetalPolyDataMapper.mm` — `EnsurePipelineStates()`
-- `MetalShaders.metal` — no change needed
-
-**Implementation**:
-1. In `EnsurePipelineStates()`, after creating the pipeline descriptor, check `actor->GetProperty()->GetBackfaceCulling()` and `GetFrontfaceCulling()`.
-2. Set `descriptor.inputPrimitiveTopology` and enable backface culling via the pipeline's `MTLRenderPipelineDescriptor` — specifically, the rasterizer state doesn't have cull mode directly; it's set on `MTLDepthStencilState` or implicit. Actually in Metal, cull mode is set on the render command encoder: `[encoder setCullMode:]`.
-3. In `RenderPiece()`, before issuing draw calls, set `[encoder setCullMode:MTLCullModeBack]` or `MTLCullModeFront` based on actor property.
-4. Add `CachedActorBackfaceCulling`/`CachedActorFrontfaceCulling` to detect changes.
-
-**WebGPU reference**: `SetupGraphicsPipelines()` lines 2093-2100, `CacheActorRendererProperties()` lines 416-417.
+**Status**: Implemented. `[encoder setCullMode:]` set from `GetBackfaceCulling()`/`GetFrontfaceCulling()` before triangle draw calls. Lines always use `MTLCullModeNone`.
 
 ---
 
@@ -326,27 +286,27 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 
 ## Priority Order
 
-| Priority | Phase | Effort | Impact |
-|----------|-------|--------|--------|
-| 1 | 1A — Per-vertex color | Small | Critical — surfaces can't be colored |
-| 2 | 1B — Cell data coloring | Small | High — cell-based scalars broken |
-| 3 | 1C — Cull mode | Trivial | Medium — incorrect face culling |
-| 4 | 4A — Clipping planes | Small | Medium — planes exist but do nothing |
-| 5 | 2C — Triangle index buffers | Small | Medium — memory/perf improvement |
-| 6 | 2A — Wireframe representation | Medium | High — SetRepresentationToWireframe() broken |
-| 7 | 2B — Edge visibility | Medium | High — edge overlay missing |
-| 8 | 3A — Thick lines | Medium | Medium — line width ignored |
-| 9 | 5A — Texture mapping | Medium | Medium — UVs buffered but unused |
-| 10 | 3B/3C — Round/miter joins | Large | Low — niche line styles |
-| 11 | 6A — GPU tessellation | Large | Medium — moves work off CPU |
-| 12 | 8A — MSAA | Medium | Medium — anti-aliasing |
-| 13 | 7A — 2D mapper | Medium | Low — 2D overlay support |
-| 14 | 7B — Batched mapper | Large | Low — performance optimization |
-| 15 | 8B — Depth peeling | Large | Low — correct translucency |
-| 16 | 7C — Composite delegator | Large | Low — LOD support |
-| 17 | 7D — Glyph3D mapper | Large | Low — glyph instancing |
-| 18 | 8C — Render bundles | Large | Low — perf optimization |
-| 19 | 8D — Vertex attribute mapping | Medium | Low — custom attributes |
+| Priority | Phase | Effort | Impact | Status |
+|----------|-------|--------|--------|--------|
+| 1 | 1A — Per-vertex color | Small | Critical | ✅ Done |
+| 2 | 1B — Cell data coloring | Small | High | ✅ Done |
+| 3 | 1C — Cull mode | Trivial | Medium | ✅ Done |
+| 4 | 4A — Clipping planes | Small | Medium | — planes exist but do nothing |
+| 5 | 2C — Triangle index buffers | Small | Medium | — memory/perf improvement |
+| 6 | 2A — Wireframe representation | Medium | High | — SetRepresentationToWireframe() broken |
+| 7 | 2B — Edge visibility | Medium | High | — edge overlay missing |
+| 8 | 3A — Thick lines | Medium | Medium | — line width ignored |
+| 9 | 5A — Texture mapping | Medium | Medium | — UVs buffered but unused |
+| 10 | 3B/3C — Round/miter joins | Large | Low | — niche line styles |
+| 11 | 6A — GPU tessellation | Large | Medium | — moves work off CPU |
+| 12 | 8A — MSAA | Medium | Medium | — anti-aliasing |
+| 13 | 7A — 2D mapper | Medium | Low | — 2D overlay support |
+| 14 | 7B — Batched mapper | Large | Low | — performance optimization |
+| 15 | 8B — Depth peeling | Large | Low | — correct translucency |
+| 16 | 7C — Composite delegator | Large | Low | — LOD support |
+| 17 | 7D — Glyph3D mapper | Large | Low | — glyph instancing |
+| 18 | 8C — Render bundles | Large | Low | — perf optimization |
+| 19 | 8D — Vertex attribute mapping | Medium | Low | — custom attributes |
 
 ---
 
