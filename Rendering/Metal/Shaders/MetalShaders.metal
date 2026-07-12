@@ -2226,13 +2226,9 @@ struct VolumeFragmentOut {
 
 constant int MAX_RAY_STEPS = 2000;
 
-// Pseudo-random for jittering — uses a 2D screen-space seed combined with
-// a per-ray depth index so that successive samples along a ray receive
-// different offsets. This breaks up the correlated noise patterns that
-// screen-space-only jitter produces.
-inline float volume_random(float2 st, float depth) {
-  float2 combined = st.xy + float2(depth * 17.31, depth * 43.73);
-  return fract(sin(dot(combined, float2(12.9898, 78.233))) * 43758.5453123);
+// Pseudo-random for jittering
+inline float volume_random(float2 st) {
+  return fract(sin(dot(st.xy, float2(12.9898, 78.233))) * 43758.5453123);
 }
 
 // Ray-box intersection
@@ -2282,9 +2278,7 @@ fragment VolumeFragmentOut fragment_volume_main(
 
   float jitter = 0.0;
   if (volumeUniforms.useJittering > 0.5) {
-    // Use a single random offset per ray (based on screen position),
-    // but the function now mixes in depth to decorrelate adjacent rays.
-    jitter = volume_random(in.position.xy, 0.0) * stepSize;
+    jitter = volume_random(in.position.xy) * stepSize;
   }
 
   float3 currentPoint = entryPoint + (rayDir * jitter);

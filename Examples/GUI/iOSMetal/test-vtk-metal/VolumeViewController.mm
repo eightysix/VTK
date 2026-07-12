@@ -25,9 +25,6 @@
 
   vtkNew<vtkMetalGPUVolumeRayCastMapper> mapper;
   mapper->SetInputConnection(source->GetOutputPort());
-  mapper->AutoAdjustSampleDistancesOn();
-  mapper->UseJitteringOn();
-  mapper->SetSampleDistance(0.5);
 
   vtkNew<vtkColorTransferFunction> colorFunc;
   colorFunc->AddRGBPoint(0.0, 0.0, 0.0, 0.0);

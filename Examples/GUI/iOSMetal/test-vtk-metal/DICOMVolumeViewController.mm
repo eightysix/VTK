@@ -59,7 +59,6 @@
 
   vtkNew<vtkMetalGPUVolumeRayCastMapper> mapper;
   mapper->SetInputConnection(reader->GetOutputPort());
-  mapper->AutoAdjustSampleDistancesOn();
   mapper->UseJitteringOn();
   mapper->SetSampleDistance(0.5);
 
