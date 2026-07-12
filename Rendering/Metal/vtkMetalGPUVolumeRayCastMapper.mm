@@ -37,7 +37,7 @@ struct VolumeMapperUniforms
   float ScalarMin;
   float ScalarMax;
   float UseJittering;
-  float Padding[3]; // ensure 16-byte alignment
+  float Padding[4]; // ensure 16-byte alignment (Metal rounds struct to 208)
 };
 
 namespace
@@ -463,6 +463,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       int actualComponents = (numComponents == 3) ? 4 : numComponents;
       NSUInteger bytesPerRow = static_cast<NSUInteger>(dims[0]) * fmtInfo.bytesPerComponent *
         actualComponents;
+      NSUInteger bytesPerImage = bytesPerRow * dims[1];
 
       MTLTextureDescriptor* texDesc = [[MTLTextureDescriptor alloc] init];
       texDesc.textureType = MTLTextureType3D;
@@ -472,7 +473,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       texDesc.depth = dims[2];
       texDesc.mipmapLevelCount = 1;
       texDesc.usage = MTLTextureUsageShaderRead;
-      texDesc.storageMode = MTLStorageModeShared;
+      texDesc.storageMode = MTLStorageModePrivate;
 
       id<MTLTexture> tex = [device newTextureWithDescriptor:texDesc];
       if (!tex)
@@ -484,12 +485,31 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       CFRetain((__bridge CFTypeRef)tex);
       this->VolumeTextureView = this->VolumeTexture;
 
-      MTLRegion region = MTLRegionMake3D(0, 0, 0, dims[0], dims[1], dims[2]);
-      [tex replaceRegion:region
-            mipmapLevel:0
-              withBytes:uploadPointer
-            bytesPerRow:bytesPerRow
-          bytesPerImage:bytesPerRow * dims[1]];
+      // Upload via staging buffer + blit encoder (works on all platforms)
+      NSUInteger totalBytes = bytesPerImage * dims[2];
+      id<MTLBuffer> stagingBuf = [device newBufferWithBytes:uploadPointer
+                                                     length:totalBytes
+                                                    options:MTLResourceStorageModeShared];
+      if (!stagingBuf)
+      {
+        vtkErrorMacro("Failed to create volume staging buffer");
+        return false;
+      }
+
+      id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
+      id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
+      [blit copyFromBuffer:stagingBuf
+              sourceOffset:0
+       sourceBytesPerRow:bytesPerRow
+     sourceBytesPerImage:bytesPerImage
+              sourceSize:MTLSizeMake(dims[0], dims[1], dims[2])
+               toTexture:tex
+        destinationSlice:0
+        destinationLevel:0
+       destinationOrigin:MTLOriginMake(0, 0, 0)];
+      [blit endEncoding];
+      [uploadCmdBuf commit];
+      [uploadCmdBuf waitUntilCompleted];
 
       this->VolumeUploadTime.Modified();
     }
@@ -786,13 +806,6 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor =
       MTLBlendFactorOneMinusSourceAlpha;
     pipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
-
-    // IDs attachment when no MSAA
-    if (sampleCount <= 1)
-    {
-      pipelineDesc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;
-      pipelineDesc.colorAttachments[1].blendingEnabled = NO;
-    }
 
     pipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     pipelineDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;

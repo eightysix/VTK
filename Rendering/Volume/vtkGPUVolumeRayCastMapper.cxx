@@ -76,18 +76,21 @@ vtkGPUVolumeRayCastMapper::vtkGPUVolumeRayCastMapper()
 
   this->MaxMemoryInBytes = 0;
   vtkGPUInfoList* l = vtkGPUInfoList::New();
-  l->Probe();
-  if (l->GetNumberOfGPUs() > 0)
+  if (l)
   {
-    vtkGPUInfo* info = l->GetGPUInfo(0);
-    this->MaxMemoryInBytes = info->GetDedicatedVideoMemory();
-    if (this->MaxMemoryInBytes == 0)
+    l->Probe();
+    if (l->GetNumberOfGPUs() > 0)
     {
-      this->MaxMemoryInBytes = info->GetDedicatedSystemMemory();
+      vtkGPUInfo* info = l->GetGPUInfo(0);
+      this->MaxMemoryInBytes = info->GetDedicatedVideoMemory();
+      if (this->MaxMemoryInBytes == 0)
+      {
+        this->MaxMemoryInBytes = info->GetDedicatedSystemMemory();
+      }
+      // we ignore info->GetSharedSystemMemory(); as this is very slow.
     }
-    // we ignore info->GetSharedSystemMemory(); as this is very slow.
+    l->Delete();
   }
-  l->Delete();
 
   if (this->MaxMemoryInBytes == 0) // use some default value: 128MB.
   {

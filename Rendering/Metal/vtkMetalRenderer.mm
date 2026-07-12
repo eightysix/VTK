@@ -291,6 +291,84 @@ void vtkMetalRenderer::DeviceRender()
       renWin->Encoder = nullptr;
     }
 
+    // === Phase 3: Render volumetric geometry ===
+    if (!this->UseDepthPeelingForVolumes)
+    {
+      MTLRenderPassDescriptor* rpd =
+        [MTLRenderPassDescriptor renderPassDescriptor];
+
+      if (msaa && msaaColorTex)
+      {
+        rpd.colorAttachments[0].texture = msaaColorTex;
+        rpd.colorAttachments[0].resolveTexture = drawable.texture;
+        rpd.colorAttachments[0].storeAction =
+          MTLStoreActionMultisampleResolve;
+      }
+      else
+      {
+        rpd.colorAttachments[0].texture = drawable.texture;
+        rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+      }
+      rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
+
+      if (msaa && msaaDepthTex)
+      {
+        rpd.depthAttachment.texture = msaaDepthTex;
+        rpd.depthAttachment.loadAction = MTLLoadActionLoad;
+        rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+      }
+      else
+      {
+        id<MTLTexture> depthTex =
+          (__bridge id<MTLTexture>)renWin->DepthTexture;
+        if (depthTex)
+        {
+          rpd.depthAttachment.texture = depthTex;
+          rpd.depthAttachment.loadAction = MTLLoadActionLoad;
+          rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+        }
+      }
+
+      id<MTLRenderCommandEncoder> encoder =
+        [commandBuffer renderCommandEncoderWithDescriptor:rpd];
+      encoder.label = @"VTK Volume Encoder";
+
+      // Depth test: Less, depth write: Off (volumes are translucent)
+      id<MTLTexture> activeDepthTex = msaa ? msaaDepthTex
+        : (__bridge id<MTLTexture>)renWin->DepthTexture;
+      if (activeDepthTex)
+      {
+        MTLDepthStencilDescriptor* dsDesc =
+          [[MTLDepthStencilDescriptor alloc] init];
+        dsDesc.depthCompareFunction = MTLCompareFunctionLess;
+        dsDesc.depthWriteEnabled = NO;
+        id<MTLDepthStencilState> depthState =
+          [device newDepthStencilStateWithDescriptor:dsDesc];
+        [encoder setDepthStencilState:depthState];
+      }
+
+      renWin->CommandBuffer = (__bridge void*)commandBuffer;
+      renWin->Encoder = (__bridge void*)encoder;
+
+      MTLViewport metalViewport;
+      metalViewport.originX = viewport[0] * size[0];
+      metalViewport.originY = viewport[1] * size[1];
+      metalViewport.width = viewport[2] * size[0];
+      metalViewport.height = viewport[3] * size[1];
+      metalViewport.znear = 0.0;
+      metalViewport.zfar = 1.0;
+      [encoder setViewport:metalViewport];
+
+      for (int i = 0; i < this->PropArrayCount; i++)
+      {
+        this->NumberOfPropsRendered +=
+          this->PropArray[i]->RenderVolumetricGeometry(this);
+      }
+
+      [encoder endEncoding];
+      renWin->Encoder = nullptr;
+    }
+
     // Commit and present
     [commandBuffer presentDrawable:drawable];
     [commandBuffer commit];
