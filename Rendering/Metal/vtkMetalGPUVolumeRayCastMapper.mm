@@ -18,6 +18,7 @@
 #include "vtkCamera.h"
 #include "vtkMatrix4x4.h"
 #include "vtkSMPTools.h"
+#include "vtkTimerLog.h"
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -164,9 +165,72 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
 //------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::GetReductionRatio(double ratio[3])
 {
-  ratio[0] = 1.0;
-  ratio[1] = 1.0;
-  ratio[2] = 1.0;
+  ratio[0] = this->ReductionFactor;
+  ratio[1] = this->ReductionFactor;
+  ratio[2] = this->ReductionFactor;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::ComputeReductionFactor(double allocatedTime)
+{
+  if (!this->AutoAdjustSampleDistances)
+  {
+    this->ReductionFactor = 1.0 / this->ImageSampleDistance;
+    return;
+  }
+
+  if (this->TimeToDraw)
+  {
+    double oldFactor = this->ReductionFactor;
+
+    double timeToDraw;
+    if (allocatedTime < 1.0)
+    {
+      timeToDraw = this->SmallTimeToDraw;
+      if (timeToDraw == 0.0)
+      {
+        timeToDraw = this->BigTimeToDraw / 3.0;
+      }
+    }
+    else
+    {
+      timeToDraw = this->BigTimeToDraw;
+    }
+
+    if (timeToDraw == 0.0)
+    {
+      timeToDraw = 10.0;
+    }
+
+    double fullTime = timeToDraw / this->ReductionFactor;
+    double newFactor = allocatedTime / fullTime;
+
+    this->ReductionFactor = (newFactor + oldFactor) / 2.0;
+    this->ReductionFactor = (this->ReductionFactor > 1.0) ? 1.0 : (this->ReductionFactor);
+
+    // Discretize to avoid visual artifacts from continuous quality changes
+    if (this->ReductionFactor < 0.20)
+    {
+      this->ReductionFactor = 0.10;
+    }
+    else if (this->ReductionFactor < 0.50)
+    {
+      this->ReductionFactor = 0.20;
+    }
+    else if (this->ReductionFactor < 1.0)
+    {
+      this->ReductionFactor = 0.50;
+    }
+
+    if (1.0 / this->ReductionFactor > this->MaximumImageSampleDistance)
+    {
+      this->ReductionFactor = 1.0 / this->MaximumImageSampleDistance;
+    }
+    if (1.0 / this->ReductionFactor < this->MinimumImageSampleDistance)
+    {
+      this->ReductionFactor = 1.0 / this->MinimumImageSampleDistance;
+    }
+  }
 }
 
 //------------------------------------------------------------------------------
@@ -625,23 +689,27 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
     {
       id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
 
-      unsigned char tfData[256 * 4];
-      for (int i = 0; i < 256; ++i)
+      // Use 512 entries with 16-bit float precision per channel to avoid
+      // color banding artifacts from 8-bit quantization in sharp TFs.
+      const int tfSize = 512;
+      std::vector<float> tfData(tfSize * 4);
+      for (int i = 0; i < tfSize; ++i)
       {
-        double val = this->ScalarRange[0] + (this->ScalarRange[1] - this->ScalarRange[0]) * (i / 255.0);
+        double val =
+          this->ScalarRange[0] + (this->ScalarRange[1] - this->ScalarRange[0]) * (i / (tfSize - 1.0));
         double rgb[3];
         colorFunc->GetColor(val, rgb);
         double opacity = opacityFunc->GetValue(val);
-        tfData[i * 4 + 0] = static_cast<unsigned char>(rgb[0] * 255.0);
-        tfData[i * 4 + 1] = static_cast<unsigned char>(rgb[1] * 255.0);
-        tfData[i * 4 + 2] = static_cast<unsigned char>(rgb[2] * 255.0);
-        tfData[i * 4 + 3] = static_cast<unsigned char>(opacity * 255.0);
+        tfData[i * 4 + 0] = static_cast<float>(rgb[0]);
+        tfData[i * 4 + 1] = static_cast<float>(rgb[1]);
+        tfData[i * 4 + 2] = static_cast<float>(rgb[2]);
+        tfData[i * 4 + 3] = static_cast<float>(opacity);
       }
 
       id<MTLTexture> oldTfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
       id<MTLTexture> tex = nil;
 
-      if (oldTfTex)
+      if (oldTfTex && oldTfTex.width == tfSize && oldTfTex.pixelFormat == MTLPixelFormatRGBA16Float)
       {
         tex = oldTfTex;
       }
@@ -656,8 +724,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
 
         MTLTextureDescriptor* tfDesc = [[MTLTextureDescriptor alloc] init];
         tfDesc.textureType = MTLTextureType2D;
-        tfDesc.pixelFormat = MTLPixelFormatRGBA8Unorm;
-        tfDesc.width = 256;
+        tfDesc.pixelFormat = MTLPixelFormatRGBA16Float;
+        tfDesc.width = tfSize;
         tfDesc.height = 1;
         tfDesc.mipmapLevelCount = 1;
         tfDesc.usage = MTLTextureUsageShaderRead;
@@ -674,11 +742,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
         this->ColorOpacityTextureView = this->ColorOpacityTexture;
       }
 
-      MTLRegion region = MTLRegionMake2D(0, 0, 256, 1);
+      MTLRegion region = MTLRegionMake2D(0, 0, tfSize, 1);
       [tex replaceRegion:region
             mipmapLevel:0
-              withBytes:tfData
-            bytesPerRow:256 * 4];
+              withBytes:tfData.data()
+            bytesPerRow:tfSize * 4 * sizeof(float)];
 
       this->TransferFunctionUploadTime.Modified();
     }
@@ -935,6 +1003,9 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
 //------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 {
+  vtkNew<vtkTimerLog> timer;
+  timer->StartTimer();
+
   auto* metalRenderer = vtkMetalRenderer::SafeDownCast(ren);
   auto* metalRenderWindow = vtkMetalRenderWindow::SafeDownCast(ren->GetRenderWindow());
   if (!metalRenderer || !metalRenderWindow)
@@ -989,6 +1060,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   {
     return;
   }
+
+  // Adaptive quality: adjust sample distance based on frame timing
+  this->ComputeReductionFactor(vol->GetAllocatedRenderTime());
 
   // Update uniforms
   VolumeMapperUniforms uniforms;
@@ -1045,6 +1119,14 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   double maxBoundsSize = std::max({ boundsSize[0], boundsSize[1], boundsSize[2] });
   uniforms.SampleDistance =
     static_cast<float>(this->GetSampleDistance() / maxBoundsSize);
+
+  // Apply adaptive quality: increase step size when under frame pressure.
+  // ReductionFactor < 1 means we need to render faster, so we increase the
+  // step size proportionally (fewer samples per ray = faster rendering).
+  if (this->ReductionFactor < 1.0)
+  {
+    uniforms.SampleDistance /= static_cast<float>(this->ReductionFactor);
+  }
 
   {
     float normFactor = this->ScalarNormalizationFactor;
@@ -1151,6 +1233,17 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
                        indexType:MTLIndexTypeUInt32
                      indexBuffer:indexBuf
                indexBufferOffset:0];
+
+  timer->StopTimer();
+  this->TimeToDraw = timer->GetElapsedTime();
+  if (this->TimeToDraw < 1.0)
+  {
+    this->SmallTimeToDraw = this->TimeToDraw;
+  }
+  else
+  {
+    this->BigTimeToDraw = this->TimeToDraw;
+  }
 }
 
 VTK_ABI_NAMESPACE_END

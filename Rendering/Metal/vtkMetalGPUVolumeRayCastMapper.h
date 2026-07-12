@@ -38,6 +38,13 @@ public:
 
   void PostRender(vtkRenderer* ren, int numberOfScalarComponents) override;
 
+  /**
+   * Compute a reduction factor based on how long the last render took vs.
+   * the allocated time. Discretized to 0.10, 0.20, 0.50, 1.0 to avoid
+   * visual artifacts from continuous quality changes.
+   */
+  void ComputeReductionFactor(double allocatedTime);
+
 protected:
   vtkMetalGPUVolumeRayCastMapper();
   ~vtkMetalGPUVolumeRayCastMapper() override;
@@ -75,6 +82,13 @@ private:
   vtkTimeStamp VolumeUploadTime;
   vtkTimeStamp TransferFunctionUploadTime;
   vtkTimeStamp VertexBufferUploadTime;
+
+  // Adaptive quality (mirrors vtkOpenGLGPUVolumeRayCastMapper)
+  double ReductionFactor = 1.0;
+  double TimeToDraw = 0.0;
+  double SmallTimeToDraw = 0.0;
+  double BigTimeToDraw = 0.0;
+  double LastRenderTime = 0.0;
 
   // Helper methods
   bool UpdateVolumeTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
