@@ -71,6 +71,20 @@ inline uint16_t FloatToHalf(float f)
     return static_cast<uint16_t>(sign | 0x7C00);
   return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10) | (mantissa >> 13));
 }
+
+// Thread-safe atomic max for unsigned char via compare-and-swap.
+// Used during coarse opacity map construction when vtkSMPTools::For
+// partitions work across threads.
+inline void atomicMaxU8(unsigned char* ptr, unsigned char val)
+{
+  unsigned char old = __atomic_load_n(ptr, __ATOMIC_RELAXED);
+  while (val > old)
+  {
+    if (__atomic_compare_exchange_n(
+          ptr, &old, val, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+      break;
+  }
+}
 }
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -799,16 +813,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateCoarseOpacityTexture(
         tfIdx = std::max(0, std::min(255, tfIdx));
         unsigned char opacity = opacityLUT[tfIdx];
 
-        // Update max for this coarse cell (atomic-free: use a CAS-free max
-        // by accepting potential benign races — the max is monotonically
-        // increasing so worst case we do one extra write)
+        // Update max for this coarse cell (thread-safe via atomic CAS)
         size_t coarseIdx = static_cast<size_t>(cx) +
           static_cast<size_t>(cy) * COARSE_DIM +
           static_cast<size_t>(cz) * COARSE_DIM * COARSE_DIM;
-        if (opacity > coarseData[coarseIdx])
-        {
-          coarseData[coarseIdx] = opacity;
-        }
+        atomicMaxU8(&coarseData[coarseIdx], opacity);
       }
     });
 
@@ -1275,12 +1284,23 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;
 
-  // Coarse opacity map dimensions (32x32x32) — 1/dim for each axis
+  // Coarse opacity map dimensions (32x32x32) — 1/dim for each axis.
+  // Only set non-zero when the coarse texture is actually bound; otherwise
+  // the shader would sample a nil texture (undefined behavior in Metal).
   static constexpr int COARSE_DIM = 32;
   float coarseInvDim = 1.0f / static_cast<float>(COARSE_DIM);
-  uniforms.CoarseMapInvDims[0] = coarseInvDim;
-  uniforms.CoarseMapInvDims[1] = coarseInvDim;
-  uniforms.CoarseMapInvDims[2] = coarseInvDim;
+  if (this->CoarseOpacityTexture && this->CoarseOpacitySampler)
+  {
+    uniforms.CoarseMapInvDims[0] = coarseInvDim;
+    uniforms.CoarseMapInvDims[1] = coarseInvDim;
+    uniforms.CoarseMapInvDims[2] = coarseInvDim;
+  }
+  else
+  {
+    uniforms.CoarseMapInvDims[0] = 0.0f;
+    uniforms.CoarseMapInvDims[1] = 0.0f;
+    uniforms.CoarseMapInvDims[2] = 0.0f;
+  }
   uniforms.CoarseMapInvDims[3] = 0.0f;
 
   // Compute view-projection matrix via generic vtkCamera API.

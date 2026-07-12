@@ -2293,66 +2293,115 @@ fragment VolumeFragmentOut fragment_volume_main(
   half scalarRangeRcp = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
 
   // Empty-space skipping via coarse 3D opacity map (32x32x32).
-  // When a coarse cell has max opacity ≈ 0, the ray jumps to the next cell
+  // When a coarse cell has max opacity ~0, the ray jumps to the next cell
   // boundary, avoiding all expensive volume texture fetches in that region.
-  float3 coarseCellSize = volumeUniforms.coarseMapInvDims.xyz; // e.g. 1/32
+  // Cell tracking (prevCell) avoids redundant coarse map fetches within the
+  // same cell — the map is only re-sampled when the ray crosses into a new cell.
+  float3 coarseCellSize = volumeUniforms.coarseMapInvDims.xyz;
   bool hasCoarseMap = volumeUniforms.coarseMapInvDims.x > 0.0;
+  int3 prevCell = int3(-1, -1, -1);
+  half coarseMaxOp = 1.0h;
 
+  // Process 2 samples per iteration to halve loop overhead and improve
+  // instruction-level parallelism.  Coarse map checks are inserted before
+  // each sample so we can skip immediately when entering an empty cell.
   int i = 0;
-  int maxIter = maxSteps * 3; // safety: allow extra iterations for skips
+  int maxIter = maxSteps * 4; // safety: skips don't count toward i
   int iter = 0;
+
   while (i < maxSteps && iter < maxIter) {
     iter++;
 
-    // Bounds check — ensure we're still inside [0,1]^3
     if (any(currentPoint < 0.0) || any(currentPoint > 1.0)) {
       break;
     }
 
-    // --- Coarse map empty-space skip ---
+    // --- Coarse map: only re-sample at cell boundaries ---
     if (hasCoarseMap) {
-      float coarseMaxOp = coarseOpacityTexture.sample(
-        coarseSampler, currentPoint, level(0)).r;
-      if (coarseMaxOp < 0.002) {
-        // Compute which coarse cell we're in
-        float3 cellf = currentPoint / coarseCellSize;
-        int3 cell = clamp(int3(cellf), 0, 31);
-        float3 cellMin = float3(cell) * coarseCellSize;
+      int3 curCell = clamp(int3(currentPoint / coarseCellSize), 0, 31);
+      if (curCell.x != prevCell.x || curCell.y != prevCell.y || curCell.z != prevCell.z) {
+        prevCell = curCell;
+        coarseMaxOp = half(coarseOpacityTexture.sample(
+          coarseSampler, currentPoint, level(0)).r);
+      }
+      if (coarseMaxOp < 0.002h) {
+        // Ray-box exit to find distance to next coarse cell boundary
+        float3 cellMin = float3(prevCell) * coarseCellSize;
         float3 cellMax = cellMin + coarseCellSize;
-
-        // Distance to exit this coarse cell along the ray
         float3 invDir = 1.0 / (rayDir + float3(1e-8));
-        float3 t1 = invDir * (cellMin - currentPoint);
-        float3 t2 = invDir * (cellMax - currentPoint);
-        float3 tmax = max(t1, t2);
-        float tSkip = min(min(tmax.x, tmax.y), tmax.z);
-        tSkip = max(tSkip, stepSize);
-
+        float3 tA = invDir * (cellMin - currentPoint);
+        float3 tB = invDir * (cellMax - currentPoint);
+        float3 tmaxV = max(tA, tB);
+        float tSkip = max(min(min(tmaxV.x, tmaxV.y), tmaxV.z), stepSize);
         currentPoint += rayDir * tSkip;
-        continue; // don't increment i — skips are free
+        prevCell = int3(-1, -1, -1);
+        continue;
       }
     }
 
-    // --- Normal sample ---
-    float rawScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
-    half scalarNorm = clamp(
-      half(rawScalar - volumeUniforms.scalarMin) * scalarRangeRcp,
+    // --- Sample 1 ---
+    float rawScalar1 = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
+    half scalarNorm1 = clamp(
+      half(rawScalar1 - volumeUniforms.scalarMin) * scalarRangeRcp,
       0.0h, 1.0h);
-    half4 colorOpacity = half4(transferFunctionTexture.sample(
-      transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
-    half sampleOpacity = colorOpacity.a;
-    if (sampleOpacity > 0.001h) {
-      half3 sampleColor = colorOpacity.rgb;
-      half w = 1.0h - accumulatedOpacity;
-      accumulatedColor += w * sampleColor * sampleOpacity;
-      accumulatedOpacity += w * sampleOpacity;
+    half4 colorOpacity1 = half4(transferFunctionTexture.sample(
+      transferFunctionSampler, float2(float(scalarNorm1), 0.5), level(0)));
+    half sampleOpacity1 = colorOpacity1.a;
+    if (sampleOpacity1 > 0.001h) {
+      half3 sampleColor1 = colorOpacity1.rgb;
+      half w1 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w1 * sampleColor1 * sampleOpacity1;
+      accumulatedOpacity += w1 * sampleOpacity1;
     }
-
     if (accumulatedOpacity >= 0.95h) {
       accumulatedOpacity = 1.0h;
       break;
     }
+    currentPoint += stepVec;
+    i++;
 
+    if (i >= maxSteps) break;
+
+    // Re-check coarse map before second sample (may have crossed cell boundary)
+    if (hasCoarseMap) {
+      int3 curCell2 = clamp(int3(currentPoint / coarseCellSize), 0, 31);
+      if (curCell2.x != prevCell.x || curCell2.y != prevCell.y || curCell2.z != prevCell.z) {
+        prevCell = curCell2;
+        coarseMaxOp = half(coarseOpacityTexture.sample(
+          coarseSampler, currentPoint, level(0)).r);
+      }
+      if (coarseMaxOp < 0.002h) {
+        float3 cellMin = float3(prevCell) * coarseCellSize;
+        float3 cellMax = cellMin + coarseCellSize;
+        float3 invDir = 1.0 / (rayDir + float3(1e-8));
+        float3 tA = invDir * (cellMin - currentPoint);
+        float3 tB = invDir * (cellMax - currentPoint);
+        float3 tmaxV = max(tA, tB);
+        float tSkip = max(min(min(tmaxV.x, tmaxV.y), tmaxV.z), stepSize);
+        currentPoint += rayDir * tSkip;
+        prevCell = int3(-1, -1, -1);
+        continue;
+      }
+    }
+
+    // --- Sample 2 ---
+    float rawScalar2 = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
+    half scalarNorm2 = clamp(
+      half(rawScalar2 - volumeUniforms.scalarMin) * scalarRangeRcp,
+      0.0h, 1.0h);
+    half4 colorOpacity2 = half4(transferFunctionTexture.sample(
+      transferFunctionSampler, float2(float(scalarNorm2), 0.5), level(0)));
+    half sampleOpacity2 = colorOpacity2.a;
+    if (sampleOpacity2 > 0.001h) {
+      half3 sampleColor2 = colorOpacity2.rgb;
+      half w2 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w2 * sampleColor2 * sampleOpacity2;
+      accumulatedOpacity += w2 * sampleOpacity2;
+    }
+    if (accumulatedOpacity >= 0.95h) {
+      accumulatedOpacity = 1.0h;
+      break;
+    }
     currentPoint += stepVec;
     i++;
   }
