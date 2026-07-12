@@ -34,6 +34,11 @@ Last updated: 2026-07-12
   - `vtkMetalHardwareSelector` for single-pass capture + readback
   - `GetIdsData()` reads back texture with Y-flip
 
+### P3 Features (Priority 3) — Line Rendering Variants
+- **P3-3A Thick lines (NoJoin)** — when `lineWidth > 1` and `lineJoin == NoJoin`, line segments rendered as screen-space quads via `vertex_thick_line_main`/`fragment_thick_line_main`. 4-vertex triangle strip template, instanced per segment. Tube-like shading via normal modification based on centerline distance. `ThickLinePipeline` with `MTLPrimitiveTypeTriangleStrip`.
+- **P3-3B Round Cap + Round Join lines** — when `lineJoin == RoundCapRoundJoin`, 36-vertex triangle strip template: 6 body + 15 left semicircle + 15 right semicircle. Semicircles approximated with 5-segment triangle fans. `p_coord.z` maps to interpolation along line. `RoundCapLinePipeline` with `MTLPrimitiveTypeTriangleStrip`.
+- **P3-3C Miter Join lines** — when `lineJoin == MiterJoin`, 4-vertex quad with miter offset computation in vertex shader. Adjacent segment normals used to compute miter direction; offset applied at shared endpoints. Miter limit (2× lineWidth) falls back to bevel. `MiterJoinLinePipeline` with `MTLPrimitiveTypeTriangleStrip`. `segmentCount` uniform buffer for bounds checking.
+
 ---
 
 ## Partially Implemented
@@ -86,11 +91,6 @@ Last updated: 2026-07-12
 - No alpha blending configured on pipeline descriptors
 - **Impact**: Translucent geometry rendering is incorrect (painter's algorithm only)
 
-### Thick Lines
-- WebGPU has 4 line pipeline variants: 1px, thick no-join, round-cap round-join, miter-join
-- Metal has single `MTLPrimitiveTypeLine` pipeline
-- **Impact**: Lines are always 1px regardless of line width setting
-
 ### Batched Rendering
 - No `vtkMetalBatchedPolyDataMapper` equivalent
 - Each actor renders independently with its own buffers and draw calls
@@ -124,8 +124,8 @@ Last updated: 2026-07-12
 |------|-------|------|
 | `vtkMetalRenderWindow.h/.mm` | 143/445 | Device, layer, depth/IDs textures, readback |
 | `vtkMetalRenderer.mm` | 182 | Render pass setup, encoder, camera |
-| `vtkMetalPolyDataMapper.mm` | 1808 | Geometry build, pipeline states, draw calls |
-| `Shaders/MetalShaders.metal` | 550 | Vertex/fragment/compute shaders |
+| `vtkMetalPolyDataMapper.mm` | 3044 | Geometry build, pipeline states, draw calls |
+| `Shaders/MetalShaders.metal` | 1194 | Vertex/fragment/compute shaders |
 | `vtkMetalActor.mm` | 43 | Thin passthrough to mapper |
 | `vtkMetalCamera.mm` | — | Scene transforms, view/projection matrices |
 | `vtkMetalProperty.mm` | — | Property state (color, opacity, representation) |
@@ -140,10 +140,7 @@ Last updated: 2026-07-12
 
 See `IMPLEMENTATION_PLAN.md` for the full feature-by-feature implementation plan with file locations, code changes, and WebGPU references.
 
-1. **Wireframe rendering** — needed for `VTK_WIREFRAME` representation
-2. **Triangle index buffers** — reduces memory and improves cache efficiency
-3. **MSAA** — straightforward Metal feature, high visual impact
-4. **Depth peeling** — needed for correct translucent rendering
-5. **GPU tessellation** — moves polygon→triangle conversion off CPU
-6. **Thick lines** — needed for line width settings
-7. **Batched rendering** — reduces CPU overhead for many-actor scenes
+1. **MSAA** — straightforward Metal feature, high visual impact
+2. **Depth peeling** — needed for correct translucent rendering
+3. **GPU tessellation** — moves polygon→triangle conversion off CPU
+4. **Batched rendering** — reduces CPU overhead for many-actor scenes

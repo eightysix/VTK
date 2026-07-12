@@ -54,27 +54,25 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 - `vtkMetalPolyDataMapper.mm` — new `ThickLinePipeline`, `ThickLineLineWidthBuffer`, `EnsureThickLinePipelineState()`
 - `vtkMetalPolyDataMapper.h` — `EnsureThickLinePipelineState()` declaration
 
-### 3B. Round Cap + Round Join Lines
+### 3B. Round Cap + Round Join Lines ✅
+
+**Status**: Implemented. When `lineWidth > 1` and `lineJoin == RoundCapRoundJoin`, line segments are rendered as a 36-vertex triangle strip template: 6 body quad vertices + 15 left semicircle (5 triangle fan segments × 3 verts) + 15 right semicircle (5 triangle fan segments × 3 verts). The third coordinate (`p_coord.z`) maps to interpolation along the line: `z=0` → p0 (left cap), `z=1` → p1 (right cap). Fragment shader applies tube-like shading based on distance from centerline. `RoundCapLinePipeline` uses `MTLPrimitiveTypeTriangleStrip` with instanced drawing (36 verts × N segments).
 
 **Files**:
-- `MetalShaders.metal` — new shaders
-- `vtkMetalPolyDataMapper.mm` — new pipeline
-
-**Implementation**:
-1. For each line segment, emit a quad body (4 verts) + caps (semicircles at each end, approximated with triangle fans, ~14 verts per cap). Total: ~32 verts per segment, instanced.
-2. At joints between consecutive segments, emit additional geometry to fill the gap (round join).
-3. Fragment shader computes distance from line center for anti-aliasing.
-4. Pipeline uses `MTLPrimitiveTypeTriangle`.
+- `MetalShaders.metal` — `vertex_round_cap_line_main` / `fragment_round_cap_line_main`, `RoundCapLineVertexOut`
+- `vtkMetalPolyDataMapper.mm` — `RoundCapLinePipeline`, `EnsureRoundCapLinePipelineState()`
+- `vtkMetalPolyDataMapper.h` — `EnsureRoundCapLinePipelineState()` declaration
 
 **WebGPU reference**: `GFX_PIPELINE_LINES_ROUND_CAP_ROUND_JOIN` — 36 verts per segment instance.
 
-### 3C. Miter Join Lines
+### 3C. Miter Join Lines ✅
 
-**Files**: Same as 3B.
+**Status**: Implemented. When `lineWidth > 1` and `lineJoin == MiterJoin`, line segments use the same 4-vertex triangle strip quad as thick lines, but the vertex shader examines adjacent segments to compute miter offsets at shared endpoints. At each shared vertex, the miter direction is computed as the normalized sum of edge normals from adjacent segments. The quad corner is offset along the miter direction. Miter limit check: if the miter offset exceeds 2× line width, falls back to bevel (no extension). `MiterJoinLinePipeline` uses `MTLPrimitiveTypeTriangleStrip` with instanced drawing (4 verts × N segments). A `segmentCount` uniform buffer provides bounds for the next-segment adjacency check.
 
-**Implementation**:
-1. Similar to thick lines but at joints, extend the quads along the miter direction.
-2. Miter limit check: if miter angle is too acute, fall back to bevel.
+**Files**:
+- `MetalShaders.metal` — `vertex_miter_join_line_main` / `fragment_miter_join_line_main`, `MiterJoinLineVertexOut`
+- `vtkMetalPolyDataMapper.mm` — `MiterJoinLinePipeline`, `MiterJoinSegmentCountBuffer`, `EnsureMiterJoinLinePipelineState()`
+- `vtkMetalPolyDataMapper.h` — `EnsureMiterJoinLinePipelineState()` declaration
 
 **WebGPU reference**: `GFX_PIPELINE_LINES_MITER_JOIN` — 4 verts per segment, instanced.
 
@@ -260,7 +258,7 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 | 7 | 2B — Edge visibility | Medium | High | ✅ Done |
 | 8 | 3A — Thick lines | Medium | Medium | ✅ Done |
 | 9 | 5A — Texture mapping | Medium | Medium | ✅ Done |
-| 10 | 3B/3C — Round/miter joins | Large | Low | — niche line styles |
+| 10 | 3B/3C — Round/miter joins | Large | Low | ✅ Done |
 | 11 | 6A — GPU tessellation | Large | Medium | — moves work off CPU |
 | 12 | 8A — MSAA | Medium | Medium | — anti-aliasing |
 | 13 | 7A — 2D mapper | Medium | Low | — 2D overlay support |
