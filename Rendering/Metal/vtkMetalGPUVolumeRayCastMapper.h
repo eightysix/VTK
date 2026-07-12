@@ -65,6 +65,7 @@ private:
 
   // Volume state
   double ModelBounds[6] = { 0.0, 1.0, 0.0, 1.0, 0.0, 1.0 };
+  double ScalarRange[2] = { 0.0, 1.0 };
   float ScalarNormalizationFactor = 1.0f;
   int VolumeNumComponents = 1;
 

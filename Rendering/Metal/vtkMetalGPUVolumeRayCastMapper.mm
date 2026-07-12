@@ -568,22 +568,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
     {
       id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
 
-      double range[2];
-      vtkImageData* input = vtkImageData::SafeDownCast(this->GetInput());
-      if (input && input->GetPointData()->GetScalars())
-      {
-        input->GetPointData()->GetScalars()->GetRange(range);
-      }
-      else
-      {
-        range[0] = 0.0;
-        range[1] = 255.0;
-      }
-
       unsigned char tfData[256 * 4];
       for (int i = 0; i < 256; ++i)
       {
-        double val = range[0] + (range[1] - range[0]) * (i / 255.0);
+        double val = this->ScalarRange[0] + (this->ScalarRange[1] - this->ScalarRange[0]) * (i / 255.0);
         double rgb[3];
         colorFunc->GetColor(val, rgb);
         double opacity = opacityFunc->GetValue(val);
@@ -877,6 +865,18 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     return;
   }
 
+  // Cache scalar range once (used by both TF texture and uniforms)
+  vtkDataArray* scalars = input->GetPointData()->GetScalars();
+  if (scalars)
+  {
+    scalars->GetRange(this->ScalarRange);
+  }
+  else
+  {
+    this->ScalarRange[0] = 0.0;
+    this->ScalarRange[1] = 1.0;
+  }
+
   if (!this->UpdateVolumeTexture(mtlDevice, mtlQueue, vol))
   {
     return;
@@ -951,16 +951,13 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     static_cast<float>(this->GetSampleDistance() / maxBoundsSize);
 
   {
-    vtkImageData* inputImg = vtkImageData::SafeDownCast(this->GetInput());
-    double scalarRange[2] = { 0.0, 1.0 };
-    if (inputImg && inputImg->GetPointData()->GetScalars())
-    {
-      inputImg->GetPointData()->GetScalars()->GetRange(scalarRange);
-    }
     float normFactor = this->ScalarNormalizationFactor;
-    uniforms.ScalarMin = static_cast<float>(scalarRange[0] / normFactor);
+    uniforms.ScalarMin = static_cast<float>(this->ScalarRange[0] / normFactor);
     uniforms.ScalarMax = static_cast<float>(
-      (scalarRange[1] > scalarRange[0] ? scalarRange[1] : scalarRange[0] + 1.0) / normFactor);
+      (this->ScalarRange[1] > this->ScalarRange[0]
+         ? this->ScalarRange[1]
+         : this->ScalarRange[0] + 1.0) /
+      normFactor);
   }
 
   uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;
