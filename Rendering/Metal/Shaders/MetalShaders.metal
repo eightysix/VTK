@@ -2282,36 +2282,83 @@ fragment VolumeFragmentOut fragment_volume_main(
   }
 
   float3 currentPoint = entryPoint + (rayDir * jitter);
-  float3 accumulatedColor = float3(0.0);
-  float accumulatedOpacity = 0.0;
+  float3 stepVec = rayDir * stepSize;
 
-  for (int i = 0; i < maxSteps; i++) {
-    // The volumeSampler uses ClampToEdge on all axes; no explicit clamp needed.
-    float rawScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
+  // Use half precision for accumulators — Apple GPUs run half ALU at 2x throughput.
+  // Texture coordinates stay float for addressing accuracy.
+  half3 accumulatedColor = half3(0.0);
+  half accumulatedOpacity = 0.0;
+  half scalarRangeRcp = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
 
-    float scalarNorm = clamp(
-      (rawScalar - volumeUniforms.scalarMin) /
-      (volumeUniforms.scalarMax - volumeUniforms.scalarMin),
-      0.0, 1.0);
-
-    float4 colorOpacity = transferFunctionTexture.sample(
-      transferFunctionSampler, float2(scalarNorm, 0.5), level(0));
-
-    float sampleOpacity = colorOpacity.a;
-    if (sampleOpacity > 0.001) {
-      float3 sampleColor = colorOpacity.rgb;
-      accumulatedColor = accumulatedColor + (1.0 - accumulatedOpacity) * sampleColor * sampleOpacity;
-      accumulatedOpacity = accumulatedOpacity + (1.0 - accumulatedOpacity) * sampleOpacity;
+  // Process 2 samples per iteration to halve loop overhead and improve
+  // instruction-level parallelism.
+  int i = 0;
+  int maxStepsEven = maxSteps & ~1;
+  for (; i < maxStepsEven; i += 2) {
+    // --- Sample 1 ---
+    float rawScalar1 = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
+    half scalarNorm1 = clamp(
+      half(rawScalar1 - volumeUniforms.scalarMin) * scalarRangeRcp,
+      0.0h, 1.0h);
+    half4 colorOpacity1 = half4(transferFunctionTexture.sample(
+      transferFunctionSampler, float2(float(scalarNorm1), 0.5), level(0)));
+    half sampleOpacity1 = colorOpacity1.a;
+    if (sampleOpacity1 > 0.001h) {
+      half3 sampleColor1 = colorOpacity1.rgb;
+      half w1 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w1 * sampleColor1 * sampleOpacity1;
+      accumulatedOpacity += w1 * sampleOpacity1;
     }
 
-    if (accumulatedOpacity >= 0.95) {
-      accumulatedOpacity = 1.0;
+    currentPoint += stepVec;
+
+    // --- Sample 2 ---
+    float rawScalar2 = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
+    half scalarNorm2 = clamp(
+      half(rawScalar2 - volumeUniforms.scalarMin) * scalarRangeRcp,
+      0.0h, 1.0h);
+    half4 colorOpacity2 = half4(transferFunctionTexture.sample(
+      transferFunctionSampler, float2(float(scalarNorm2), 0.5), level(0)));
+    half sampleOpacity2 = colorOpacity2.a;
+    if (sampleOpacity2 > 0.001h) {
+      half3 sampleColor2 = colorOpacity2.rgb;
+      half w2 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w2 * sampleColor2 * sampleOpacity2;
+      accumulatedOpacity += w2 * sampleOpacity2;
+    }
+
+    currentPoint += stepVec;
+
+    if (accumulatedOpacity >= 0.95h) {
+      accumulatedOpacity = 1.0h;
+      break;
+    }
+  }
+
+  // Handle odd remaining step
+  for (; i < maxSteps; i++) {
+    float rawScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
+    half scalarNorm = clamp(
+      half(rawScalar - volumeUniforms.scalarMin) * scalarRangeRcp,
+      0.0h, 1.0h);
+    half4 colorOpacity = half4(transferFunctionTexture.sample(
+      transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+    half sampleOpacity = colorOpacity.a;
+    if (sampleOpacity > 0.001h) {
+      half3 sampleColor = colorOpacity.rgb;
+      half w = 1.0h - accumulatedOpacity;
+      accumulatedColor += w * sampleColor * sampleOpacity;
+      accumulatedOpacity += w * sampleOpacity;
+    }
+
+    if (accumulatedOpacity >= 0.95h) {
+      accumulatedOpacity = 1.0h;
       break;
     }
 
-    currentPoint = currentPoint + rayDir * stepSize;
+    currentPoint += stepVec;
   }
 
-  output.color = float4(accumulatedColor, accumulatedOpacity);
+  output.color = float4(float3(accumulatedColor), float(accumulatedOpacity));
   return output;
 }
