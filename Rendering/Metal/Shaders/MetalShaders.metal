@@ -1193,3 +1193,151 @@ kernel void cellToPrimitive(
 {
   cellIds[gid] = primitiveToCell[gid] + cellIdOffset + 1u;  // 1-based
 }
+
+// ---------------------------------------------------------------------------
+// P6-6A: GPU Tessellation Compute Kernels
+// Replace CPU fan-triangulation with compute-based polygon → triangle conversion.
+// Mirrors WebGPU's polygon_to_triangle, poly_line_to_line, polygon_edges_to_lines.
+// ---------------------------------------------------------------------------
+
+struct TessParams {
+  uint numCells;
+  uint cellIdOffset;
+};
+
+// Polygon → Triangle fan tessellation.
+// Each thread processes one polygon cell and emits (npts-2) triangles via fan from vertex 0.
+// Also produces edge array for hiding internal fan edges when edge visibility is on.
+//
+// Bindings:
+//   0: outConnectivity (output) — tessellated triangle indices, 3 per triangle
+//   1: edgeArray (output) — per-triangle edge visibility flag (-1, 0, 1, or 2)
+//   2: cellIds (output) — per-triangle cell ID
+//   3: connectivity (input) — flat array of point IDs for all polygon cells
+//   4: offsets (input) — per-cell start offset into connectivity (length = numCells+1)
+//   5: primitiveCounts (input) — prefix-sum of triangle counts (length = numCells+1)
+//   6: params (input) — numCells and cellIdOffset
+kernel void polygonToTriangle(
+    device uint* outConnectivity [[buffer(0)]],
+    device float* edgeArray [[buffer(1)]],
+    device uint* cellIds [[buffer(2)]],
+    constant uint* connectivity [[buffer(3)]],
+    constant uint* offsets [[buffer(4)]],
+    constant uint* primitiveCounts [[buffer(5)]],
+    constant TessParams& params [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= params.numCells) return;
+
+  uint numTriangles = primitiveCounts[gid + 1u] - primitiveCounts[gid];
+  uint outputOffset = primitiveCounts[gid] * 3u;
+  uint inputOffset = offsets[gid];
+
+  for (uint i = 0u; i < numTriangles; i++)
+  {
+    uint p0 = connectivity[inputOffset];
+    uint p1 = connectivity[inputOffset + i + 1u];
+    uint p2 = connectivity[inputOffset + i + 2u];
+
+    uint triangleId = primitiveCounts[gid] + i;
+
+    // Edge array: hides internal fan edges of a polygon when edge visibility is on.
+    // -1 = single triangle (all edges are boundary), 2 = first triangle,
+    // 0 = last triangle, 1 = interior triangle.
+    // Matches WebGPU VTKCellToGraphicsPrimitive.wgsl line 49.
+    if (numTriangles == 1u)
+      edgeArray[triangleId] = -1.0;
+    else if (i == 0u)
+      edgeArray[triangleId] = 2.0;
+    else if (i == numTriangles - 1u)
+      edgeArray[triangleId] = 0.0;
+    else
+      edgeArray[triangleId] = 1.0;
+
+    cellIds[triangleId] = gid + params.cellIdOffset;
+
+    outConnectivity[outputOffset] = p0;
+    outConnectivity[outputOffset + 1u] = p1;
+    outConnectivity[outputOffset + 2u] = p2;
+    outputOffset += 3u;
+  }
+}
+
+// Polyline → Line segment tessellation.
+// Each thread processes one polyline cell and emits (npts-1) line segments.
+//
+// Bindings:
+//   0: outConnectivity (output) — line segment index pairs, 2 per segment
+//   1: cellIds (output) — per-segment cell ID
+//   2: connectivity (input) — flat point IDs for all line cells
+//   3: offsets (input) — per-cell start offset into connectivity
+//   4: primitiveCounts (input) — prefix-sum of segment counts
+//   5: params (input) — numCells and cellIdOffset
+kernel void polyLineToLine(
+    device uint* outConnectivity [[buffer(0)]],
+    device uint* cellIds [[buffer(1)]],
+    constant uint* connectivity [[buffer(2)]],
+    constant uint* offsets [[buffer(3)]],
+    constant uint* primitiveCounts [[buffer(4)]],
+    constant TessParams& params [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= params.numCells) return;
+
+  uint numLines = primitiveCounts[gid + 1u] - primitiveCounts[gid];
+  uint outputOffset = primitiveCounts[gid] * 2u;
+  uint inputOffset = offsets[gid];
+
+  for (uint i = 0u; i < numLines; i++)
+  {
+    uint p0 = connectivity[inputOffset + i];
+    uint p1 = connectivity[inputOffset + i + 1u];
+
+    uint lineId = primitiveCounts[gid] + i;
+    cellIds[lineId] = gid + params.cellIdOffset;
+
+    outConnectivity[outputOffset] = p0;
+    outConnectivity[outputOffset + 1u] = p1;
+    outputOffset += 2u;
+  }
+}
+
+// Polygon boundary edges → Line segments (wireframe / edge visibility).
+// Each thread processes one polygon cell and emits npts line segments
+// (including the closing edge from last vertex back to first).
+//
+// Bindings:
+//   0: outConnectivity (output) — edge index pairs, 2 per edge
+//   1: cellIds (output) — per-edge cell ID
+//   2: connectivity (input) — flat point IDs for all polygon cells
+//   3: offsets (input) — per-cell start offset into connectivity
+//   4: primitiveCounts (input) — prefix-sum of edge counts
+//   5: params (input) — numCells and cellIdOffset
+kernel void polygonEdgesToLines(
+    device uint* outConnectivity [[buffer(0)]],
+    device uint* cellIds [[buffer(1)]],
+    constant uint* connectivity [[buffer(2)]],
+    constant uint* offsets [[buffer(3)]],
+    constant uint* primitiveCounts [[buffer(4)]],
+    constant TessParams& params [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= params.numCells) return;
+
+  uint numEdges = primitiveCounts[gid + 1u] - primitiveCounts[gid];
+  uint outputOffset = primitiveCounts[gid] * 2u;
+  uint inputOffset = offsets[gid];
+
+  for (uint i = 0u; i < numEdges; i++)
+  {
+    uint p0 = connectivity[inputOffset + i];
+    uint p1 = connectivity[inputOffset + (i + 1u) % numEdges];
+
+    uint edgeId = primitiveCounts[gid] + i;
+    cellIds[edgeId] = gid + params.cellIdOffset;
+
+    outConnectivity[outputOffset] = p0;
+    outConnectivity[outputOffset + 1u] = p1;
+    outputOffset += 2u;
+  }
+}

@@ -122,24 +122,15 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 
 ## Phase 6: GPU Tessellation (Compute Shader)
 
-### 6A. Cell-to-Primitive Compute Pipeline
+### 6A. Cell-to-Primitive Compute Pipeline ✅
 
-**Gap**: CPU fan-triangulation in `BuildGeometryBuffers()`. WebGPU uses a compute shader for polygon → triangle conversion and edge array generation.
+**Status**: Implemented. Three new Metal compute kernels (`polygonToTriangle`, `polyLineToLine`, `polygonEdgesToLines`) replace CPU fan-triangulation for large meshes (>1000 points). When per-point coloring (`cellFlag == 0`) with data normals, `BuildGeometryBuffers()` builds per-point vertex arrays from all polydata points, constructs connectivity/offsets/primitiveCounts arrays, and dispatches compute kernels that produce triangle index buffers, line segment index buffers, and edge visibility arrays on the GPU. The GPU-produced edge array encodes which internal fan edges to hide (-1=all visible, 0/1/2=specific edge hidden), matching WebGPU's `polygon_to_triangle` shader. Wireframe mode uses `polygonEdgesToLines` to extract polygon boundary edges. CPU fallback retained for per-cell coloring, computed normals, and small meshes.
 
 **Files**:
-- `MetalShaders.metal` — expand `cellToPrimitive` kernel or add new kernel
-- `vtkMetalPolyDataMapper.mm` — new compute dispatch code
+- `MetalShaders.metal` — new `polygonToTriangle`, `polyLineToLine`, `polygonEdgesToLines` kernels with `TessParams` uniform struct
+- `vtkMetalPolyDataMapper.mm` — GPU tessellation path in `BuildGeometryBuffers()`, new pipeline states (`PolygonToTrianglePipeline`, `PolyLineToLinePipeline`, `PolygonEdgesToLinesPipeline`), output buffers (`TessOutputConnectivityBuffer`, `TessEdgeArrayBuffer`, `TessParamsBuffer`)
 
-**Implementation**:
-1. Extend the existing `cellToPrimitive` compute kernel to also:
-   - Perform polygon → triangle tessellation (fan triangulation)
-   - Generate line indices for edges (for wireframe/edge visibility)
-   - Generate edge arrays (per-triangle edge visibility flags)
-2. Use Metal compute buffers to store tessellated output.
-3. Replace CPU-side `BuildGeometryBuffers()` polygon processing with compute dispatch.
-4. Keep CPU fallback for simple cases (< threshold vertices).
-
-**WebGPU reference**: `vtkWebGPUCellToPrimitiveConverter` — full compute-based tessellation with edge array output.
+**WebGPU reference**: `vtkWebGPUCellToPrimitiveConverter` — full compute-based tessellation with edge array output. Metal kernels mirror the WGSL `polygon_to_triangle`, `poly_line_to_line`, and `polygon_edges_to_lines` shaders.
 
 ---
 
@@ -259,7 +250,7 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 | 8 | 3A — Thick lines | Medium | Medium | ✅ Done |
 | 9 | 5A — Texture mapping | Medium | Medium | ✅ Done |
 | 10 | 3B/3C — Round/miter joins | Large | Low | ✅ Done |
-| 11 | 6A — GPU tessellation | Large | Medium | — moves work off CPU |
+| 11 | 6A — GPU tessellation | Large | Medium | ✅ Done |
 | 12 | 8A — MSAA | Medium | Medium | — anti-aliasing |
 | 13 | 7A — 2D mapper | Medium | Low | — 2D overlay support |
 | 14 | 7B — Batched mapper | Large | Low | — performance optimization |
