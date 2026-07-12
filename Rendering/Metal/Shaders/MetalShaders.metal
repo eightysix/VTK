@@ -2286,8 +2286,8 @@ fragment VolumeFragmentOut fragment_volume_main(
   float accumulatedOpacity = 0.0;
 
   for (int i = 0; i < maxSteps; i++) {
-    float3 texCoord = clamp(currentPoint, float3(0.0), float3(1.0));
-    float rawScalar = volumeTexture.sample(volumeSampler, texCoord, level(0)).r;
+    // The volumeSampler uses ClampToEdge on all axes; no explicit clamp needed.
+    float rawScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
 
     float scalarNorm = clamp(
       (rawScalar - volumeUniforms.scalarMin) /

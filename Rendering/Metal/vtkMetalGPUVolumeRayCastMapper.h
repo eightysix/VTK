@@ -55,6 +55,7 @@ private:
   void* ColorOpacityTexture = nullptr;   // id<MTLTexture>  (2D)
   void* ColorOpacityTextureView = nullptr; // id<MTLTexture>  (alias)
   void* ColorOpacitySampler = nullptr;   // id<MTLSamplerState>
+  void* DepthStencilState = nullptr;     // id<MTLDepthStencilState>
 
   // Buffers
   void* UniformBuffer = nullptr;         // id<MTLBuffer>
@@ -68,10 +69,12 @@ private:
   double ScalarRange[2] = { 0.0, 1.0 };
   float ScalarNormalizationFactor = 1.0f;
   int VolumeNumComponents = 1;
+  int CurrentSampleCount = 0;
 
   // Cache/timestamps
   vtkTimeStamp VolumeUploadTime;
   vtkTimeStamp TransferFunctionUploadTime;
+  vtkTimeStamp VertexBufferUploadTime;
 
   // Helper methods
   bool UpdateVolumeTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);

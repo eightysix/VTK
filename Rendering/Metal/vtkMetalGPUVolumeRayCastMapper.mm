@@ -136,6 +136,12 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
     this->ColorOpacitySampler = nullptr;
   }
 
+  if (this->DepthStencilState)
+  {
+    CFRelease(this->DepthStencilState);
+    this->DepthStencilState = nullptr;
+  }
+
   if (this->UniformBuffer)
   {
     CFRelease(this->UniformBuffer);
@@ -397,6 +403,21 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
             });
             break;
           }
+          case VTK_DOUBLE:
+          {
+            const double* src = static_cast<const double*>(scalars->GetVoidPointer(0));
+            vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+              for (vtkIdType i = begin; i < end; ++i)
+              {
+                for (int c = 0; c < numComponents; ++c)
+                  halfData[i * outputComponents + c] =
+                    FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                for (int c = numComponents; c < outputComponents; ++c)
+                  halfData[i * outputComponents + c] = FloatToHalf(0.0f);
+              }
+            });
+            break;
+          }
           default:
           {
             vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
@@ -485,38 +506,51 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
         }
       }
 
-      // Release old texture
-      if (this->VolumeTexture)
+      id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->VolumeTexture;
+      id<MTLTexture> tex = nil;
+
+      if (oldTex &&
+          oldTex.width == dims[0] &&
+          oldTex.height == dims[1] &&
+          oldTex.depth == dims[2] &&
+          oldTex.pixelFormat == fmtInfo.format)
       {
-        CFRelease(this->VolumeTexture);
-        this->VolumeTexture = nullptr;
-        this->VolumeTextureView = nullptr;
+        tex = oldTex;
+      }
+      else
+      {
+        if (this->VolumeTexture)
+        {
+          CFRelease(this->VolumeTexture);
+          this->VolumeTexture = nullptr;
+          this->VolumeTextureView = nullptr;
+        }
+
+        MTLTextureDescriptor* texDesc = [[MTLTextureDescriptor alloc] init];
+        texDesc.textureType = MTLTextureType3D;
+        texDesc.pixelFormat = fmtInfo.format;
+        texDesc.width = dims[0];
+        texDesc.height = dims[1];
+        texDesc.depth = dims[2];
+        texDesc.mipmapLevelCount = 1;
+        texDesc.usage = MTLTextureUsageShaderRead;
+        texDesc.storageMode = MTLStorageModePrivate;
+
+        tex = [device newTextureWithDescriptor:texDesc];
+        if (!tex)
+        {
+          vtkErrorMacro("Failed to create 3D volume texture");
+          return false;
+        }
+        this->VolumeTexture = (__bridge void*)tex;
+        CFRetain((__bridge CFTypeRef)tex);
+        this->VolumeTextureView = this->VolumeTexture;
       }
 
       int actualComponents = (numComponents == 3) ? 4 : numComponents;
       NSUInteger bytesPerRow = static_cast<NSUInteger>(dims[0]) * fmtInfo.bytesPerComponent *
         actualComponents;
       NSUInteger bytesPerImage = bytesPerRow * dims[1];
-
-      MTLTextureDescriptor* texDesc = [[MTLTextureDescriptor alloc] init];
-      texDesc.textureType = MTLTextureType3D;
-      texDesc.pixelFormat = fmtInfo.format;
-      texDesc.width = dims[0];
-      texDesc.height = dims[1];
-      texDesc.depth = dims[2];
-      texDesc.mipmapLevelCount = 1;
-      texDesc.usage = MTLTextureUsageShaderRead;
-      texDesc.storageMode = MTLStorageModePrivate;
-
-      id<MTLTexture> tex = [device newTextureWithDescriptor:texDesc];
-      if (!tex)
-      {
-        vtkErrorMacro("Failed to create 3D volume texture");
-        return false;
-      }
-      this->VolumeTexture = (__bridge void*)tex;
-      CFRetain((__bridge CFTypeRef)tex);
-      this->VolumeTextureView = this->VolumeTexture;
 
       // Upload via staging buffer + blit encoder (works on all platforms)
       NSUInteger totalBytes = bytesPerImage * dims[2];
@@ -604,32 +638,41 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
         tfData[i * 4 + 3] = static_cast<unsigned char>(opacity * 255.0);
       }
 
-      // Release old texture
-      if (this->ColorOpacityTexture)
-      {
-        CFRelease(this->ColorOpacityTexture);
-        this->ColorOpacityTexture = nullptr;
-        this->ColorOpacityTextureView = nullptr;
-      }
+      id<MTLTexture> oldTfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
+      id<MTLTexture> tex = nil;
 
-      MTLTextureDescriptor* tfDesc = [[MTLTextureDescriptor alloc] init];
-      tfDesc.textureType = MTLTextureType2D;
-      tfDesc.pixelFormat = MTLPixelFormatRGBA8Unorm;
-      tfDesc.width = 256;
-      tfDesc.height = 1;
-      tfDesc.mipmapLevelCount = 1;
-      tfDesc.usage = MTLTextureUsageShaderRead;
-      tfDesc.storageMode = MTLStorageModeShared;
-
-      id<MTLTexture> tex = [device newTextureWithDescriptor:tfDesc];
-      if (!tex)
+      if (oldTfTex)
       {
-        vtkErrorMacro("Failed to create transfer function texture");
-        return false;
+        tex = oldTfTex;
       }
-      this->ColorOpacityTexture = (__bridge void*)tex;
-      CFRetain((__bridge CFTypeRef)tex);
-      this->ColorOpacityTextureView = this->ColorOpacityTexture;
+      else
+      {
+        if (this->ColorOpacityTexture)
+        {
+          CFRelease(this->ColorOpacityTexture);
+          this->ColorOpacityTexture = nullptr;
+          this->ColorOpacityTextureView = nullptr;
+        }
+
+        MTLTextureDescriptor* tfDesc = [[MTLTextureDescriptor alloc] init];
+        tfDesc.textureType = MTLTextureType2D;
+        tfDesc.pixelFormat = MTLPixelFormatRGBA8Unorm;
+        tfDesc.width = 256;
+        tfDesc.height = 1;
+        tfDesc.mipmapLevelCount = 1;
+        tfDesc.usage = MTLTextureUsageShaderRead;
+        tfDesc.storageMode = MTLStorageModeShared;
+
+        tex = [device newTextureWithDescriptor:tfDesc];
+        if (!tex)
+        {
+          vtkErrorMacro("Failed to create transfer function texture");
+          return false;
+        }
+        this->ColorOpacityTexture = (__bridge void*)tex;
+        CFRetain((__bridge CFTypeRef)tex);
+        this->ColorOpacityTextureView = this->ColorOpacityTexture;
+      }
 
       MTLRegion region = MTLRegionMake2D(0, 0, 256, 1);
       [tex replaceRegion:region
@@ -681,7 +724,11 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
       this->ModelBounds[5] = origin[2] + spacing[2] * (dims[2] - 1);
     }
 
-    if (!this->VertexBuffer || this->GetMTime() > this->VolumeUploadTime)
+    bool needsVertexRebuild = !this->VertexBuffer;
+    needsVertexRebuild |= (this->VolumeUploadTime.GetMTime() > this->VertexBufferUploadTime.GetMTime());
+    needsVertexRebuild |= (this->GetMTime() > this->VertexBufferUploadTime.GetMTime());
+
+    if (needsVertexRebuild)
     {
       float boundsMin[3] = {
         static_cast<float>(this->ModelBounds[0]),
@@ -749,6 +796,8 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         this->IndexBuffer = (__bridge void*)ibuf;
         CFRetain((__bridge CFTypeRef)ibuf);
       }
+
+      this->VertexBufferUploadTime.Modified();
     }
   }
 
@@ -758,6 +807,16 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
 //------------------------------------------------------------------------------
 bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRenderer* ren)
 {
+  // Get sample count and invalidate PSO if it changed (e.g., MSAA toggled)
+  auto* metalRenderWindow = vtkMetalRenderWindow::SafeDownCast(ren->GetRenderWindow());
+  int sampleCount = metalRenderWindow ? metalRenderWindow->GetEffectiveSampleCount() : 1;
+
+  if (this->PipelineState && sampleCount != this->CurrentSampleCount)
+  {
+    CFRelease(this->PipelineState);
+    this->PipelineState = nullptr;
+  }
+
   if (this->PipelineState)
   {
     return true;
@@ -812,6 +871,20 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       CFRetain((__bridge CFTypeRef)sampler);
     }
 
+    // Create and cache a depth stencil state.
+    // Volume rendering reads but does not write depth — this prevents the
+    // bounding box from z-fighting with itself and allows correct occlusion
+    // by opaque geometry that wrote depth earlier in the render pass.
+    if (!this->DepthStencilState)
+    {
+      MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
+      dsDesc.depthCompareFunction = MTLCompareFunctionLessEqual;
+      dsDesc.depthWriteEnabled = NO;
+      id<MTLDepthStencilState> ds = [device newDepthStencilStateWithDescriptor:dsDesc];
+      this->DepthStencilState = (__bridge void*)ds;
+      CFRetain((__bridge CFTypeRef)ds);
+    }
+
     // Pipeline: vertex buffer layout — float3 position at buffer index 0
     MTLVertexDescriptor* vertexDesc = [[MTLVertexDescriptor alloc] init];
     vertexDesc.attributes[0].format = MTLVertexFormatFloat3;
@@ -821,19 +894,18 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     vertexDesc.layouts[0].stepRate = 1;
     vertexDesc.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
 
-    // Get sample count from renderer
-    auto* metalRenderWindow = vtkMetalRenderWindow::SafeDownCast(ren->GetRenderWindow());
-    int sampleCount = metalRenderWindow ? metalRenderWindow->GetEffectiveSampleCount() : 1;
-
     MTLRenderPipelineDescriptor* pipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
     pipelineDesc.vertexFunction = vertexFunc;
     pipelineDesc.fragmentFunction = fragmentFunc;
     pipelineDesc.vertexDescriptor = vertexDesc;
     pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
 
-    // Blending: SrcAlpha, OneMinusSrcAlpha (matching WebGPU)
+    // The raymarching shader accumulates premultiplied color (color * alpha)
+    // into accumulatedColor. Using MTLBlendFactorOne as source avoids
+    // double-multiplying by alpha again at the blend stage. This matches
+    // the WebGPU volume mapper blend mode.
     pipelineDesc.colorAttachments[0].blendingEnabled = YES;
-    pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+    pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
     pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
     pipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
     pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
@@ -854,6 +926,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     }
     this->PipelineState = (__bridge void*)pso;
     CFRetain((__bridge CFTypeRef)pso);
+    this->CurrentSampleCount = sampleCount;
   }
 
   return true;
@@ -985,10 +1058,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;
 
-  // Compute viewProjection matrix = projection * view and pack into uniforms
-  // SceneTransforms layout (from vtkMetalCamera.h):
-  //   offset 0:   float ViewMatrix[4][4]     (64 bytes)
-  //   offset 64:  float ProjectionMatrix[4][4] (64 bytes)
+  // Compute view-projection matrix via generic vtkCamera API.
+  // Try the Metal camera first (has a precomputed cached layout), fall back to
+  // computing it from vtkCamera::GetViewTransformMatrix /
+  // GetProjectionTransformMatrix so the mapper stays functional even if the
+  // camera override is not in place.
   vtkMetalCamera* metalCamera = vtkMetalCamera::SafeDownCast(ren->GetActiveCamera());
   if (metalCamera)
   {
@@ -1007,9 +1081,25 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   }
   else
   {
-    memset(uniforms.ViewProjectionMatrix, 0, sizeof(uniforms.ViewProjectionMatrix));
-    uniforms.ViewProjectionMatrix[0] = uniforms.ViewProjectionMatrix[5] =
-      uniforms.ViewProjectionMatrix[10] = uniforms.ViewProjectionMatrix[15] = 1.0f;
+    // Generic fallback: compute VP from vtkCamera matrices.
+    // Metal clip-space uses Z in [0,1], so nearz=0, farz=1.
+    vtkCamera* cam = ren->GetActiveCamera();
+    int* size = ren->GetSize();
+    double aspect = (size[1] > 0) ? static_cast<double>(size[0]) / size[1] : 1.0;
+    vtkMatrix4x4* V4 = cam->GetViewTransformMatrix();
+    vtkMatrix4x4* P4 = cam->GetProjectionTransformMatrix(aspect, 0.0, 1.0);
+    // Compute P*V column-major (Metal convention: column vectors)
+    for (int c = 0; c < 4; ++c)
+    {
+      for (int r = 0; r < 4; ++r)
+      {
+        float sum = 0.0f;
+        for (int k = 0; k < 4; ++k)
+          sum += static_cast<float>(P4->GetElement(r, k)) *
+                 static_cast<float>(V4->GetElement(k, c));
+        uniforms.ViewProjectionMatrix[c * 4 + r] = sum;
+      }
+    }
   }
 
   // Update uniform buffer (now includes viewProjection)
@@ -1019,6 +1109,20 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // Set pipeline and arguments
   id<MTLRenderPipelineState> pipeline = (__bridge id<MTLRenderPipelineState>)this->PipelineState;
   [encoder setRenderPipelineState:pipeline];
+
+  // Disable face culling: volume bounding box is viewed from both inside and
+  // outside depending on camera position, so both front and back faces must be
+  // rendered as ray entry/exit points.
+  [encoder setCullMode:MTLCullModeNone];
+
+  // Apply cached depth-stencil state: read depth (LessEqual) but do not write
+  // it. This lets opaque geometry occlude the volume correctly while preventing
+  // the bounding-box triangles from z-fighting with each other.
+  if (this->DepthStencilState)
+  {
+    id<MTLDepthStencilState> ds = (__bridge id<MTLDepthStencilState>)this->DepthStencilState;
+    [encoder setDepthStencilState:ds];
+  }
 
   // Bind vertex buffer (positions)
   id<MTLBuffer> vertexBuf = (__bridge id<MTLBuffer>)this->VertexBuffer;
