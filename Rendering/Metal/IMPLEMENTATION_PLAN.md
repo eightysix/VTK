@@ -90,9 +90,9 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 
 ## Phase 4: Clipping Planes (Full Implementation)
 
-### 4A. Activate Clipping Plane Support
+### 4A. Activate Clipping Plane Support ✅
 
-**Gap**: `ClipPlaneUniforms` buffer is allocated but `numClipPlanes` is always 0.
+**Status**: Implemented. `UpdateClipPlaneUniforms()` reads clip planes via `GetNumberOfClippingPlanes()` and `GetClippingPlaneInDataCoords()`, transforms them by the actor's model-to-world matrix, and packs up to 6 planes into `ClipPlaneUniforms` with `numClipPlanes` set to the actual count.
 
 **Files**:
 - `vtkMetalPolyDataMapper.mm` — `UpdateClipPlaneUniforms()`
@@ -261,7 +261,7 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 | 1 | 1A — Per-vertex color | Small | Critical | ✅ Done |
 | 2 | 1B — Cell data coloring | Small | High | ✅ Done |
 | 3 | 1C — Cull mode | Trivial | Medium | ✅ Done |
-| 4 | 4A — Clipping planes | Small | Medium | — planes exist but do nothing |
+| 4 | 4A — Clipping planes | Small | Medium | ✅ Done |
 | 5 | 2C — Triangle index buffers | Small | Medium | ✅ Done |
 | 6 | 2A — Wireframe representation | Medium | High | ✅ Done |
 | 7 | 2B — Edge visibility | Medium | High | ✅ Done |

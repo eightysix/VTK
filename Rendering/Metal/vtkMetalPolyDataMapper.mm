@@ -29,6 +29,9 @@
 #include "vtkTransform.h"
 #include "vtkMath.h"
 #include "vtkMapper.h"
+#include "vtkNew.h"
+#include "vtkPlaneCollection.h"
+#include "vtkPlane.h"
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -305,7 +308,7 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     this->UpdateLightUniforms((__bridge void*)device, ren);
     this->UpdateCoincidentOffsetUniforms((__bridge void*)device, act);
     this->UpdateVertexColorUniforms((__bridge void*)device, act);
-    this->UpdateClipPlaneUniforms((__bridge void*)device, ren);
+    this->UpdateClipPlaneUniforms((__bridge void*)device, act);
 
     // P2-2A: Skip triangle drawing when in wireframe mode
     bool skipTriangles = (representation == VTK_WIREFRAME);
@@ -2247,9 +2250,9 @@ void vtkMetalPolyDataMapper::UpdateEdgeColorUniform(void* mtlDevice, vtkActor* a
 }
 
 //------------------------------------------------------------------------------
-void vtkMetalPolyDataMapper::UpdateClipPlaneUniforms(void* mtlDevice, vtkRenderer* ren)
+void vtkMetalPolyDataMapper::UpdateClipPlaneUniforms(void* mtlDevice, vtkActor* actor)
 {
-  if (!mtlDevice || !ren)
+  if (!mtlDevice || !actor)
   {
     return;
   }
@@ -2262,41 +2265,38 @@ void vtkMetalPolyDataMapper::UpdateClipPlaneUniforms(void* mtlDevice, vtkRendere
   float cp[28]; // 7 floats × 4 components = 28 floats = 112 bytes
   memset(cp, 0, sizeof(cp));
 
-  vtkCamera* cam = ren->GetActiveCamera();
-  int numPlanes = 0;
+  int numPlanes = this->GetNumberOfClippingPlanes();
 
-  if (cam && cam->GetClippingRange())
+  if (numPlanes > 6)
   {
-    // Get clip planes from the renderer (set by vtkClipPlanes or vtkAssembly)
-    // For now, use the near/far clipping planes as defaults
-    double nearClip = cam->GetClippingRange()[0];
-    double farClip = cam->GetClippingRange()[1];
-
-    // Near plane in view space: z = -nearClip (points behind camera are clipped)
-    // In world space: dot(plane, point) >= 0 for visible points
-    // The near plane normal in view space is (0, 0, -1), point on plane is (0, 0, -nearClip)
-    // But we need to transform to world space... simplified: just pass identity planes
-    // The actual clip planes come from vtkClipPlanes filter, not the camera
+    vtkWarningMacro(<< "Too many clipping planes: " << numPlanes
+                    << ", maximum supported is 6.");
+    numPlanes = 6;
   }
 
-  // Fill with identity-like planes (no clipping) by default
-  // planes[0..3] = 4 clip planes (ax+by+cz+d format)
-  // planes[4..5] = reserved
-  // numClipPlanes at offset 24 (index 24 in float array)
-  // Initialize all planes to (0,0,0,1) which never clips
-  for (int i = 0; i < 24; ++i)
+  if (numPlanes > 0)
   {
-    cp[i] = 0.0f;
-  }
-  // Set d=1 for each plane so dot(plane, (x,y,z,1)) = 1 > 0 always
-  cp[3] = 1.0f;   // plane 0
-  cp[7] = 1.0f;   // plane 1
-  cp[11] = 1.0f;  // plane 2
-  cp[15] = 1.0f;  // plane 3
+    // Get the model-to-world matrix from the actor
+    vtkNew<vtkMatrix4x4> modelToWorldMatrix;
+    actor->GetModelToWorldMatrix(modelToWorldMatrix);
 
-  // numClipPlanes = 0 (no clipping by default)
-  // This will be overridden when vtkClipPlanes is used
-  reinterpret_cast<int*>(&cp[24])[0] = 0;
+    for (int i = 0; i < numPlanes; ++i)
+    {
+      double planeEquation[4];
+      this->GetClippingPlaneInDataCoords(modelToWorldMatrix, i, planeEquation);
+
+      // Pack plane equation (ax+by+cz+d) into the flat float array.
+      // Each plane occupies 4 floats; planes are stored at cp[0..23].
+      int base = i * 4;
+      cp[base + 0] = static_cast<float>(planeEquation[0]);
+      cp[base + 1] = static_cast<float>(planeEquation[1]);
+      cp[base + 2] = static_cast<float>(planeEquation[2]);
+      cp[base + 3] = static_cast<float>(planeEquation[3]);
+    }
+  }
+
+  // Set numClipPlanes at offset 24 (index 24 in float array)
+  reinterpret_cast<int*>(&cp[24])[0] = numPlanes;
 
   if (!this->Internals->ClipPlaneBuffer)
   {

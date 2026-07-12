@@ -39,7 +39,7 @@ protected:
   void UpdateCoincidentOffsetUniforms(void* mtlDevice, vtkActor* actor);
   void UpdateVertexColorUniforms(void* mtlDevice, vtkActor* actor);
   void UpdateEdgeColorUniform(void* mtlDevice, vtkActor* actor);
-  void UpdateClipPlaneUniforms(void* mtlDevice, vtkRenderer* ren);
+  void UpdateClipPlaneUniforms(void* mtlDevice, vtkActor* actor);
 
 private:
   vtkMetalPolyDataMapper(const vtkMetalPolyDataMapper&) = delete;
