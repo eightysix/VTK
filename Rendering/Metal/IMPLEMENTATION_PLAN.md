@@ -37,19 +37,9 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 
 **WebGPU reference**: `ReplaceVertexShaderEdges()` (line 3226), `ReplaceFragmentShaderEdges()` (line 3666) — computes per-vertex edge distances and blends edge color in fragment shader.
 
-### 2C. Triangle Index Buffers — NOT YET IMPLEMENTED
+### 2C. Triangle Index Buffers ✅
 
-**Gap**: `IndexBuffer` field exists but is never populated. Triangles are non-indexed (3 unique verts per tri).
-
-**Files**:
-- `vtkMetalPolyDataMapper.mm` — `BuildGeometryBuffers()`
-
-**Implementation**:
-1. Build a shared vertex array (deduplicate positions+normals) and an index buffer referencing shared vertices.
-2. Use `[encoder drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:]`.
-3. This reduces memory by ~50% for typical meshes and improves vertex cache hit rate.
-
-**WebGPU reference**: WebGPU uses `CellToPrimitiveConverter` which produces indexed geometry via compute shaders.
+**Status**: Implemented. When `cellFlag == 0` (per-point coloring) and normals come from the data, vertices are deduplicated by point ID into a shared vertex array. An index buffer references shared vertices, reducing memory by ~50% for typical meshes and improving vertex cache hit rate. Falls back to non-indexed rendering when per-cell coloring is active (different colors per cell prevent deduplication) or when normals are computed per-face (different face normals per shared vertex).
 
 ---
 
@@ -272,7 +262,7 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 | 2 | 1B — Cell data coloring | Small | High | ✅ Done |
 | 3 | 1C — Cull mode | Trivial | Medium | ✅ Done |
 | 4 | 4A — Clipping planes | Small | Medium | — planes exist but do nothing |
-| 5 | 2C — Triangle index buffers | Small | Medium | — memory/perf improvement |
+| 5 | 2C — Triangle index buffers | Small | Medium | ✅ Done |
 | 6 | 2A — Wireframe representation | Medium | High | ✅ Done |
 | 7 | 2B — Edge visibility | Medium | High | ✅ Done |
 | 8 | 3A — Thick lines | Medium | Medium | — line width ignored |

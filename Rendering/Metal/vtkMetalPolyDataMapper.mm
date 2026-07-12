@@ -805,6 +805,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   std::vector<float> surfaceColors;  // P1-1A/1B: float4 per vertex
   std::vector<uint32_t> lineIndices;
 
+  // P2-2C: Triangle index buffers — deduplicated vertices + index buffer
+  std::vector<uint32_t> triangleIndices;
+  std::unordered_map<vtkIdType, uint32_t> triVertexMap;
+
   // P2-2B: Edge geometry for wireframe overlay on surfaces (separate vertex + index buffers)
   std::vector<float> edgePositions;
   std::vector<float> edgeNormals;
@@ -960,70 +964,132 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       else
       {
         // VTK_SURFACE: Fan-triangulate polygon for filled rendering
+        // P2-2C: When cellFlag == 0 (per-point coloring) AND normals come from
+        // the data (normalArray), deduplicate vertices by point ID and build an
+        // index buffer. Each unique point has identical position, normal, and color.
+        // When normals are computed per-face, each vertex gets the face normal of
+        // whichever triangle first emits it, so deduplication would produce incorrect
+        // normals for vertices shared between faces with different orientations.
+        // When cellFlag != 0 (per-cell coloring), vertices at the same point may
+        // have different colors from different cells, so no deduplication is possible.
+        bool useIndexBuffer = (cellFlag == 0) && normalArray;
+
         for (vtkIdType i = 1; i < npts - 1; ++i)
         {
           vtkIdType tri[3] = { pts[0], pts[i], pts[i + 1] };
-          double p[3][3];
-          for (int j = 0; j < 3; ++j)
-          {
-            polydata->GetPoint(tri[j], p[j]);
-          }
 
-          // Compute face normal
-          float e1[3] = { (float)(p[1][0] - p[0][0]), (float)(p[1][1] - p[0][1]), (float)(p[1][2] - p[0][2]) };
-          float e2[3] = { (float)(p[2][0] - p[0][0]), (float)(p[2][1] - p[0][1]), (float)(p[2][2] - p[0][2]) };
-          float fn[3] = { 0.0f, 1.0f, 0.0f };
-
-          if (normalArray)
+          if (useIndexBuffer)
           {
-            double nn[3];
-            normalArray->GetTuple(tri[0], nn);
-            fn[0] = (float)nn[0]; fn[1] = (float)nn[1]; fn[2] = (float)nn[2];
+            // Indexed path: deduplicate vertices by point ID
+            for (int j = 0; j < 3; ++j)
+            {
+              auto it = triVertexMap.find(tri[j]);
+              if (it != triVertexMap.end())
+              {
+                triangleIndices.push_back(it->second);
+              }
+              else
+              {
+                uint32_t vidx = static_cast<uint32_t>(positions.size() / 3);
+                triVertexMap[tri[j]] = vidx;
+                triangleIndices.push_back(vidx);
+
+                double pt[3];
+                polydata->GetPoint(tri[j], pt);
+                positions.push_back(static_cast<float>(pt[0]));
+                positions.push_back(static_cast<float>(pt[1]));
+                positions.push_back(static_cast<float>(pt[2]));
+
+                // useIndexBuffer requires normalArray, so it's always non-null here
+                double nn[3];
+                normalArray->GetTuple(tri[j], nn);
+                normals.push_back(static_cast<float>(nn[0]));
+                normals.push_back(static_cast<float>(nn[1]));
+                normals.push_back(static_cast<float>(nn[2]));
+
+                // P1-1A: per-vertex color from point scalar mapping
+                if (mappedColors)
+                {
+                  const unsigned char* rgba = mappedColors->GetPointer(0);
+                  surfaceColors.push_back(rgba[tri[j] * 4] / 255.0f);
+                  surfaceColors.push_back(rgba[tri[j] * 4 + 1] / 255.0f);
+                  surfaceColors.push_back(rgba[tri[j] * 4 + 2] / 255.0f);
+                  surfaceColors.push_back(rgba[tri[j] * 4 + 3] / 255.0f);
+                }
+                else
+                {
+                  surfaceColors.push_back(1.0f);
+                  surfaceColors.push_back(1.0f);
+                  surfaceColors.push_back(1.0f);
+                  surfaceColors.push_back(1.0f);
+                }
+              }
+            }
           }
           else
           {
-            float ne1 = std::sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
-            float ne2 = std::sqrt(e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]);
-            if (ne1 > 1e-8f && ne2 > 1e-8f)
+            // Non-indexed path: emit 3 unique vertices per triangle (cell coloring)
+            double p[3][3];
+            for (int j = 0; j < 3; ++j)
             {
-              e1[0] /= ne1; e1[1] /= ne1; e1[2] /= ne1;
-              e2[0] /= ne2; e2[1] /= ne2; e2[2] /= ne2;
+              polydata->GetPoint(tri[j], p[j]);
             }
-            fn[0] = e1[1] * e2[2] - e1[2] * e2[1];
-            fn[1] = e1[2] * e2[0] - e1[0] * e2[2];
-            fn[2] = e1[0] * e2[1] - e1[1] * e2[0];
-            float nn = std::sqrt(fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2]);
-            if (nn > 1e-8f) { fn[0] /= nn; fn[1] /= nn; fn[2] /= nn; }
-          }
 
-          // Emit 3 vertices per triangle
-          for (int j = 0; j < 3; ++j)
-          {
-            positions.push_back(static_cast<float>(p[j][0]));
-            positions.push_back(static_cast<float>(p[j][1]));
-            positions.push_back(static_cast<float>(p[j][2]));
-            normals.push_back(fn[0]);
-            normals.push_back(fn[1]);
-            normals.push_back(fn[2]);
+            // Compute face normal
+            float e1[3] = { (float)(p[1][0] - p[0][0]), (float)(p[1][1] - p[0][1]), (float)(p[1][2] - p[0][2]) };
+            float e2[3] = { (float)(p[2][0] - p[0][0]), (float)(p[2][1] - p[0][1]), (float)(p[2][2] - p[0][2]) };
+            float fn[3] = { 0.0f, 1.0f, 0.0f };
 
-            // P1-1A/1B: per-vertex color from scalar mapping
-            if (mappedColors)
+            if (normalArray)
             {
-              const unsigned char* rgba = mappedColors->GetPointer(0);
-              vtkIdType idx = (cellFlag == 0) ? tri[j] : polyCellIdx;
-              surfaceColors.push_back(rgba[idx * 4] / 255.0f);
-              surfaceColors.push_back(rgba[idx * 4 + 1] / 255.0f);
-              surfaceColors.push_back(rgba[idx * 4 + 2] / 255.0f);
-              surfaceColors.push_back(rgba[idx * 4 + 3] / 255.0f);
+              double nn[3];
+              normalArray->GetTuple(tri[0], nn);
+              fn[0] = (float)nn[0]; fn[1] = (float)nn[1]; fn[2] = (float)nn[2];
             }
             else
             {
-              surfaceColors.push_back(1.0f);
-              surfaceColors.push_back(1.0f);
-              surfaceColors.push_back(1.0f);
-              surfaceColors.push_back(1.0f);
+              float ne1 = std::sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
+              float ne2 = std::sqrt(e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]);
+              if (ne1 > 1e-8f && ne2 > 1e-8f)
+              {
+                e1[0] /= ne1; e1[1] /= ne1; e1[2] /= ne1;
+                e2[0] /= ne2; e2[1] /= ne2; e2[2] /= ne2;
+              }
+              fn[0] = e1[1] * e2[2] - e1[2] * e2[1];
+              fn[1] = e1[2] * e2[0] - e1[0] * e2[2];
+              fn[2] = e1[0] * e2[1] - e1[1] * e2[0];
+              float nn = std::sqrt(fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2]);
+              if (nn > 1e-8f) { fn[0] /= nn; fn[1] /= nn; fn[2] /= nn; }
+            }
+
+            for (int j = 0; j < 3; ++j)
+            {
+              positions.push_back(static_cast<float>(p[j][0]));
+              positions.push_back(static_cast<float>(p[j][1]));
+              positions.push_back(static_cast<float>(p[j][2]));
+              normals.push_back(fn[0]);
+              normals.push_back(fn[1]);
+              normals.push_back(fn[2]);
+
+              // P1-1B: per-vertex color from cell scalar mapping
+              if (mappedColors)
+              {
+                const unsigned char* rgba = mappedColors->GetPointer(0);
+                surfaceColors.push_back(rgba[polyCellIdx * 4] / 255.0f);
+                surfaceColors.push_back(rgba[polyCellIdx * 4 + 1] / 255.0f);
+                surfaceColors.push_back(rgba[polyCellIdx * 4 + 2] / 255.0f);
+                surfaceColors.push_back(rgba[polyCellIdx * 4 + 3] / 255.0f);
+              }
+              else
+              {
+                surfaceColors.push_back(1.0f);
+                surfaceColors.push_back(1.0f);
+                surfaceColors.push_back(1.0f);
+                surfaceColors.push_back(1.0f);
+              }
             }
           }
+
           trianglePrimToCell.push_back(static_cast<uint32_t>(polyCellIdx));
 
           // P2-2B: When edge visibility is on, also build edge index buffer from polygon edges
@@ -1115,7 +1181,8 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     else
     {
       this->Internals->TriangleVertexCount = static_cast<uint32_t>(positions.size() / 3);
-      this->Internals->TriangleIndexCount = 0;
+      // P2-2C: When indexed, TriangleIndexCount is the number of indices (3 per triangle).
+      this->Internals->TriangleIndexCount = static_cast<uint32_t>(triangleIndices.size());
       this->Internals->HasTriangles = !positions.empty();
     }
   }
@@ -1266,6 +1333,15 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     this->Internals->LineIndexBuffer = [device
       newBufferWithBytes:lineIndices.data()
                  length:lineIndices.size() * sizeof(uint32_t)
+                options:MTLResourceStorageModeShared];
+  }
+
+  // P2-2C: Create triangle index buffer for deduplicated geometry
+  if (!triangleIndices.empty())
+  {
+    this->Internals->IndexBuffer = [device
+      newBufferWithBytes:triangleIndices.data()
+                 length:triangleIndices.size() * sizeof(uint32_t)
                 options:MTLResourceStorageModeShared];
   }
 
