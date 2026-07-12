@@ -45,22 +45,14 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 
 ## Phase 3: Line Rendering Variants
 
-### 3A. Thick Lines (No Join)
+### 3A. Thick Lines (No Join) ✅
 
-**Gap**: Lines are always 1px regardless of `GetLineWidth()`.
+**Status**: Implemented. When `lineWidth > 1` and `lineJoin == NoJoin`, line segments are rendered as screen-space quads using `vertex_thick_line_main` / `fragment_thick_line_main`. The vertex shader reads both endpoints from the line index buffer, transforms to screen space, and expands perpendicular to the line direction by `lineWidth`. The fragment shader applies tube-like shading by modifying the normal based on distance from the centerline. `ThickLinePipeline` uses `MTLPrimitiveTypeTriangle` topology with instanced drawing (4 verts × N segments).
 
 **Files**:
 - `MetalShaders.metal` — new `vertex_thick_line_main` / `fragment_thick_line_main`
-- `vtkMetalPolyDataMapper.mm` — new pipeline state, new `id<MTLBuffer> ThickLineVertex/FragmentBuffer`
-
-**Implementation**:
-1. For each line segment, emit a screen-space quad (4 vertices per segment). The quad is oriented along the line direction and expanded perpendicular by `lineWidth / 2`.
-2. Vertex shader: transform both endpoints to clip space, compute line direction, expand perpendicular in screen space, emit 4 vertices per instance.
-3. Fragment shader: simple color output (same as line color).
-4. Create `ThickLinePipeline` with `MTLPrimitiveTypeTriangle` topology, no backface culling.
-5. In `RenderPiece()`, when `lineWidth > 1` and `lineJoin == NoJoin`, use thick line pipeline instead of basic line pipeline.
-
-**WebGPU reference**: `GFX_PIPELINE_LINES_THICK` — uses instanced quads (4 verts × N instances), `GetDrawCallArgs()` returns `vertexCount=4, instanceCount=vertexCount/2`.
+- `vtkMetalPolyDataMapper.mm` — new `ThickLinePipeline`, `ThickLineLineWidthBuffer`, `EnsureThickLinePipelineState()`
+- `vtkMetalPolyDataMapper.h` — `EnsureThickLinePipelineState()` declaration
 
 ### 3B. Round Cap + Round Join Lines
 
@@ -265,7 +257,7 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 | 5 | 2C — Triangle index buffers | Small | Medium | ✅ Done |
 | 6 | 2A — Wireframe representation | Medium | High | ✅ Done |
 | 7 | 2B — Edge visibility | Medium | High | ✅ Done |
-| 8 | 3A — Thick lines | Medium | Medium | — line width ignored |
+| 8 | 3A — Thick lines | Medium | Medium | ✅ Done |
 | 9 | 5A — Texture mapping | Medium | Medium | — UVs buffered but unused |
 | 10 | 3B/3C — Round/miter joins | Large | Low | — niche line styles |
 | 11 | 6A — GPU tessellation | Large | Medium | — moves work off CPU |

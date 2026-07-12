@@ -113,12 +113,18 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLBuffer> EdgeColorUniformBuffer = nil;   // edge color (float4 RGBA)
   id<MTLRenderPipelineState> EdgePipeline = nil; // pipeline for edge rendering
 
+  // P3-3A: Thick line pipeline — screen-space quad expansion for lineWidth > 1
+  id<MTLRenderPipelineState> ThickLinePipeline = nil;
+  id<MTLBuffer> ThickLineLineWidthBuffer = nil;  // float: line width in pixels
+  vtkIdType ThickLineSegmentCount = 0;           // number of line segments for instanced draw
+
   // P2-2C: Triangle index buffers — deduplicated vertices + index buffer
   // IndexBuffer is populated when vertices can be deduplicated.
 
   vtkIdType CachedInputMTime = 0;
   int CachedRepresentation = -1;
   bool CachedEdgeVisibility = false;  // P2-2B: track edge visibility changes
+  float CachedLineWidth = -1.0f;     // P3-3A: track line width changes
 
   void ReleaseBuffers()
   {
@@ -141,6 +147,11 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     HasEdgeOverlay = false;
     EdgeColorUniformBuffer = nil;
     EdgePipeline = nil;
+
+    // P3-3A: Thick line pipeline
+    ThickLinePipeline = nil;
+    ThickLineLineWidthBuffer = nil;
+    ThickLineSegmentCount = 0;
 
     PointPositionBuffer = nil;
     PointNormalBuffer = nil;
@@ -176,6 +187,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     CachedInputMTime = 0;
     CachedRepresentation = -1;
     CachedEdgeVisibility = false;
+    CachedLineWidth = -1.0f;
   }
 };
 
@@ -228,6 +240,7 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     vtkIdType currentMTime = input->GetMTime();
     int representation = act->GetProperty()->GetRepresentation();
     bool edgeVisibility = act->GetProperty()->GetEdgeVisibility();
+    float lineWidth = static_cast<float>(act->GetProperty()->GetLineWidth());
     if (currentMTime != this->Internals->CachedInputMTime ||
         representation != this->Internals->CachedRepresentation ||
         edgeVisibility != this->Internals->CachedEdgeVisibility)
@@ -238,6 +251,9 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       this->Internals->CachedEdgeVisibility = edgeVisibility;
       this->BuildGeometryBuffers((__bridge void*)device, input, act);
     }
+
+    // P3-3A: Track line width changes (buffer updated at draw time)
+    this->Internals->CachedLineWidth = lineWidth;
 
     bool hasGeometry = this->Internals->HasTriangles || this->Internals->HasLines ||
                        this->Internals->HasEdgeOverlay ||
@@ -391,58 +407,125 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       }
     }
 
-    if (this->Internals->HasLines && this->Internals->LinePipeline &&
-        this->Internals->LineIndexBuffer)
+    if (this->Internals->HasLines && this->Internals->LineIndexBuffer)
     {
-      [encoder setRenderPipelineState:this->Internals->LinePipeline];
-      [encoder setVertexBuffer:this->Internals->VertexPositionBuffer offset:0 atIndex:0];
-      if (this->Internals->VertexNormalBuffer)
+      // P3-3A: Use thick line pipeline when lineWidth > 1 and lineJoin == NoJoin
+      bool useThickLines = (lineWidth > 1.0f &&
+        act->GetProperty()->GetLineJoin() == vtkProperty::LineJoinType::NoJoin &&
+        this->Internals->ThickLineSegmentCount > 0);
+
+      if (useThickLines)
       {
-        [encoder setVertexBuffer:this->Internals->VertexNormalBuffer offset:0 atIndex:1];
-      }
-      // P1-1A/1B: bind per-vertex color buffer at vertex buffer index 3
-      if (this->Internals->SurfaceColorBuffer)
-      {
-        [encoder setVertexBuffer:this->Internals->SurfaceColorBuffer offset:0 atIndex:3];
+        this->EnsureThickLinePipelineState((__bridge void*)device);
+        if (!this->Internals->ThickLinePipeline)
+        {
+          useThickLines = false;
+        }
       }
 
-      if (this->Internals->MaterialUniformBuffer)
+      if (useThickLines && this->Internals->ThickLinePipeline)
       {
-        [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
-      }
-      if (this->Internals->LightUniformBuffer)
-      {
-        [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
-      }
-      if (this->Internals->SceneUniformBuffer)
-      {
-        [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-        // P1-1A: bind scene uniforms to fragment buffer(2) so fragment shader can read flags
-        [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-      }
-      if (this->Internals->CoincidentOffsetBuffer)
-      {
-        [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
-      }
+        // P3-3A: Thick line rendering — instanced quad expansion
+        [encoder setRenderPipelineState:this->Internals->ThickLinePipeline];
+        [encoder setVertexBuffer:this->Internals->VertexPositionBuffer offset:0 atIndex:0];
+        [encoder setVertexBuffer:this->Internals->LineIndexBuffer offset:0 atIndex:1];
+        if (this->Internals->SceneUniformBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
+        }
+        if (this->Internals->SurfaceColorBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->SurfaceColorBuffer offset:0 atIndex:3];
+        }
+        // P3-3A: line width uniform
+        if (!this->Internals->ThickLineLineWidthBuffer)
+        {
+          this->Internals->ThickLineLineWidthBuffer = [device
+            newBufferWithLength:sizeof(float)
+                       options:MTLResourceStorageModeShared];
+        }
+        *static_cast<float*>([this->Internals->ThickLineLineWidthBuffer contents]) = lineWidth;
+        [encoder setVertexBuffer:this->Internals->ThickLineLineWidthBuffer offset:0 atIndex:4];
+        if (this->Internals->LineCellIdBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->LineCellIdBuffer offset:0 atIndex:5];
+        }
+        if (this->Internals->PropIdBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:6];
+        }
+        if (this->Internals->MaterialUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
+        }
+        if (this->Internals->LightUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
+        }
+        if (this->Internals->SceneUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
+        }
+        if (this->Internals->CoincidentOffsetBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
+        }
 
-      // P2-8: Bind picking ID buffers for line rendering
-      if (this->Internals->LineCellIdBuffer)
-      {
-        [encoder setVertexBuffer:this->Internals->LineCellIdBuffer offset:0 atIndex:6];
-      }
-      if (this->Internals->PropIdBuffer)
-      {
-        [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:7];
-      }
+        [encoder setCullMode:MTLCullModeNone];
 
-      // P1-1C: set cull mode for lines
-      [encoder setCullMode:MTLCullModeNone];
+        // Instanced draw: 4 vertices per quad, one instance per line segment
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
+                    vertexStart:0
+                  vertexCount:4
+                instanceCount:this->Internals->ThickLineSegmentCount];
+      }
+      else
+      {
+        // Standard 1px line rendering
+        [encoder setRenderPipelineState:this->Internals->LinePipeline];
+        [encoder setVertexBuffer:this->Internals->VertexPositionBuffer offset:0 atIndex:0];
+        if (this->Internals->VertexNormalBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->VertexNormalBuffer offset:0 atIndex:1];
+        }
+        if (this->Internals->SurfaceColorBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->SurfaceColorBuffer offset:0 atIndex:3];
+        }
+        if (this->Internals->MaterialUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
+        }
+        if (this->Internals->LightUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
+        }
+        if (this->Internals->SceneUniformBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
+          [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
+        }
+        if (this->Internals->CoincidentOffsetBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
+        }
+        if (this->Internals->LineCellIdBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->LineCellIdBuffer offset:0 atIndex:6];
+        }
+        if (this->Internals->PropIdBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:7];
+        }
 
-      [encoder drawIndexedPrimitives:MTLPrimitiveTypeLine
-                          indexCount:this->Internals->LineIndexCount
-                           indexType:MTLIndexTypeUInt32
-                         indexBuffer:this->Internals->LineIndexBuffer
-                   indexBufferOffset:0];
+        [encoder setCullMode:MTLCullModeNone];
+
+        [encoder drawIndexedPrimitives:MTLPrimitiveTypeLine
+                            indexCount:this->Internals->LineIndexCount
+                             indexType:MTLIndexTypeUInt32
+                           indexBuffer:this->Internals->LineIndexBuffer
+                     indexBufferOffset:0];
+      }
     }
 
     // P2-2B: Edge visibility — draw wireframe edges on top of surfaces
@@ -1301,6 +1384,8 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     }
     this->Internals->LineIndexCount = lineIndices.size();
     this->Internals->HasLines = !lineIndices.empty();
+    // P3-3A: number of line segments for instanced thick line drawing
+    this->Internals->ThickLineSegmentCount = lineIndices.size() / 2;
   }
 
   if (!positions.empty())
@@ -1902,6 +1987,49 @@ void vtkMetalPolyDataMapper::EnsureEdgePipelineState(void* mtlDevice)
     if (!this->Internals->EdgePipeline)
     {
       vtkErrorMacro(<< "Edge pipeline: " << [[error localizedDescription] UTF8String]);
+    }
+  }
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::EnsureThickLinePipelineState(void* mtlDevice)
+{
+  if (this->Internals->ThickLinePipeline)
+  {
+    return;
+  }
+
+  id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
+
+  NSError* error = nil;
+  NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
+  id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+  if (!library)
+  {
+    vtkErrorMacro(<< "Failed to compile Metal shader for thick lines: "
+                  << [[error localizedDescription] UTF8String]);
+    return;
+  }
+
+  id<MTLFunction> vFunc = [library newFunctionWithName:@"vertex_thick_line_main"];
+  id<MTLFunction> fFunc = [library newFunctionWithName:@"fragment_thick_line_main"];
+  if (vFunc && fFunc)
+  {
+    MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+    desc.vertexFunction = vFunc;
+    desc.fragmentFunction = fFunc;
+    desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+    desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    // Thick lines are rendered as triangle strips (quads)
+    desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+
+    error = nil;
+    this->Internals->ThickLinePipeline =
+      [device newRenderPipelineStateWithDescriptor:desc error:&error];
+    if (!this->Internals->ThickLinePipeline)
+    {
+      vtkErrorMacro(<< "Thick line pipeline: " << [[error localizedDescription] UTF8String]);
     }
   }
 }

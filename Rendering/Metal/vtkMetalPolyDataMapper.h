@@ -34,6 +34,7 @@ protected:
   void EnsurePipelineStates(void* mtlDevice);
   void EnsurePointPipelineStates(void* mtlDevice);
   void EnsureEdgePipelineState(void* mtlDevice);
+  void EnsureThickLinePipelineState(void* mtlDevice);
   void UpdateMaterialUniforms(void* mtlDevice, vtkActor* actor);
   void UpdateLightUniforms(void* mtlDevice, vtkRenderer* ren);
   void UpdateCoincidentOffsetUniforms(void* mtlDevice, vtkActor* actor);

@@ -560,6 +560,165 @@ fragment PointFragmentOutput fragment_point_shaped_main(
 }
 
 // ---------------------------------------------------------------------------
+// P3-3A: Thick line shaders — screen-space quad expansion (NoJoin)
+// Each line segment is expanded into a screen-space quad (4 vertices per instance).
+// Vertex shader reads both endpoints from the index buffer, transforms to screen
+// space, and expands perpendicular to the line direction by lineWidth/2.
+// ---------------------------------------------------------------------------
+
+struct ThickLineVertexOut {
+  float4 position [[position]];
+  float3 viewPos;
+  float3 viewNormal;
+  float4 vertexColor;
+  float dist_to_centerline;  // perpendicular distance from center (-0.5..0.5)
+  uint cellId;
+  uint propId;
+};
+
+vertex ThickLineVertexOut vertex_thick_line_main(
+    uint vertex_id [[vertex_id]],
+    uint instance_id [[instance_id]],
+    constant float3* positions [[buffer(0)]],
+    constant uint* lineIndices [[buffer(1)]],
+    constant SceneUniforms& scene [[buffer(2)]],
+    constant float4* vertexColors [[buffer(3)]],
+    constant float& lineWidth [[buffer(4)]],
+    constant uint* cellIds [[buffer(5)]],
+    constant uint& propId [[buffer(6)]]) {
+  // Quad corners: (-1,-1), (1,-1), (-1,1), (1,1)
+  const float2 tri_verts[4] = {
+    float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1)
+  };
+
+  float2 p_coord = tri_verts[vertex_id];
+
+  // Read the two endpoint indices for this line segment
+  uint p0_idx = lineIndices[instance_id * 2];
+  uint p1_idx = lineIndices[instance_id * 2 + 1];
+
+  float3 p0_MC = positions[p0_idx];
+  float3 p1_MC = positions[p1_idx];
+
+  // Transform both endpoints to clip space
+  float4 p0_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(p0_MC, 1.0);
+  float4 p1_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(p1_MC, 1.0);
+
+  // Transform to screen space
+  float2 resolution = scene.viewport.zw;
+  float2 p0_screen = resolution * (0.5 * p0_DC.xy / p0_DC.w + 0.5);
+  float2 p1_screen = resolution * (0.5 * p1_DC.xy / p1_DC.w + 0.5);
+
+  // Compute line direction and perpendicular in screen space
+  float2 x_basis = normalize(p1_screen - p0_screen);
+  // Handle degenerate case (zero-length segment)
+  float segLen = length(p1_screen - p0_screen);
+  x_basis = select(x_basis, float2(1.0, 0.0), segLen < 0.001);
+  float2 y_basis = float2(-x_basis.y, x_basis.x);
+
+  // Expand into a quad by lineWidth
+  float w = max(lineWidth, 1.0);
+  float2 adjusted_p0 = p0_screen + p_coord.x * x_basis + p_coord.y * y_basis * w;
+  float2 adjusted_p1 = p1_screen + p_coord.x * x_basis + p_coord.y * y_basis * w;
+  float2 p = mix(adjusted_p0, adjusted_p1, p_coord.x);
+
+  // Select z/w from the appropriate endpoint
+  float4 p_DC = mix(p0_DC, p1_DC, p_coord.x);
+
+  ThickLineVertexOut out;
+  out.position = float4(p_DC.w * ((2.0 * p) / resolution - 1.0), p_DC.z, p_DC.w);
+
+  // Interpolate view-space position for lighting
+  float3 mid_MC = mix(p0_MC, p1_MC, p_coord.x);
+  out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(mid_MC, 1.0)).xyz;
+  out.viewNormal = scene.normalMatrix * float3(0.0, 0.0, 1.0);
+
+  // Use the color from the starting endpoint of the segment
+  out.vertexColor = vertexColors[p0_idx];
+  out.dist_to_centerline = p_coord.y;
+  out.cellId = cellIds[instance_id];
+  out.propId = propId + 1u;
+  return out;
+}
+
+fragment FragmentOutput fragment_thick_line_main(
+    ThickLineVertexOut in [[stage_in]],
+    constant MaterialUniforms& material [[buffer(0)]],
+    constant LightUniforms& lights [[buffer(1)]],
+    constant SceneUniforms& scene [[buffer(2)]],
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
+  FragmentOutput out;
+
+  float3 baseColor = in.vertexColor.rgb;
+  float baseAlpha = in.vertexColor.a * material.opacity;
+
+  // Tube-like shading: modify normal based on distance from centerline
+  float3 N = normalize(in.viewNormal);
+  float d = abs(in.dist_to_centerline);
+  N.z = 1.0 - 2.0 * d;
+  N = normalize(N);
+
+  float3 totalAmbient = material.ambientColor.w * baseColor;
+  float3 totalDiffuse = float3(0.0);
+  float3 totalSpecular = float3(0.0);
+  float3 viewDir = normalize(-in.viewPos);
+
+  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
+    Light L = lights.lights[i];
+    int lightType = int(L.position.w);
+    float3 lightColor = L.color.rgb * L.color.w;
+    float attenuation = 1.0;
+    float df = 0.0;
+    float3 reflDir = float3(0.0);
+    float3 toLight = float3(0.0);
+
+    if (lightType == 0) {
+      toLight = float3(0.0, 0.0, 1.0);
+      df = max(N.z, 0.000001);
+      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
+    } else if (lightType == 1) {
+      toLight = normalize(-L.direction.xyz);
+      df = max(dot(N, toLight), 0.0);
+      reflDir = reflect(L.direction.xyz, N);
+    } else {
+      toLight = L.position.xyz - in.viewPos;
+      float dist = length(toLight);
+      toLight /= dist;
+      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
+      df = max(dot(N, toLight), 0.0);
+      reflDir = reflect(-toLight, N);
+      if (lightType == 3) {
+        float3 spotDir = normalize(L.direction.xyz);
+        float spotCos = dot(-toLight, spotDir);
+        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
+        if (spotCos > spotCutoff) {
+          attenuation *= pow(spotCos, L.attenuation.w);
+        } else {
+          attenuation = 0.0;
+        }
+      }
+    }
+
+    totalDiffuse += df * baseColor * lightColor * attenuation;
+    float NdotL = max(dot(N, toLight), 0.0);
+    if (NdotL > 0.0) {
+      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
+      totalSpecular += sf * material.specularColor.w * material.specularColor.rgb * lightColor * attenuation;
+    }
+  }
+
+  out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha);
+  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
+
+  // Coincident topology offset for lines
+  float c_factor = coinOffset.lineFactor;
+  float c_offset = coinOffset.lineOffset;
+  float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
+  out.depth = in.position.z + c_factor * cscale + c_offset / 65000.0;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // P2-8: Compute kernel for cell-to-primitive mapping
 // Maps each primitive (triangle/line segment) to its owning cell ID.
 // Mirrors WebGPU's VTKCellToGraphicsPrimitive.wgsl.
