@@ -2767,7 +2767,11 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   pipelineDesc.fragmentFunction = fragmentFunc;
   pipelineDesc.vertexDescriptor = vertexDesc;
   pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-  pipelineDesc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+  // 8A: Skip IDs attachment when MSAA is active — render pass only has 1 color attachment
+  if (sampleCount <= 1)
+  {
+    pipelineDesc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+  }
 
   // Enable depth testing (matching WebGPU's depthCompare = Less, depthWriteEnabled = true)
   pipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
@@ -2776,7 +2780,7 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   pipelineDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
 
   // 8A: Set sample count for MSAA
-  pipelineDesc.sampleCount = sampleCount;
+  pipelineDesc.rasterSampleCount = sampleCount;
 
   if (!this->Internals->TrianglePipeline)
   {
@@ -2837,7 +2841,10 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
       desc.vertexFunction = vFunc;
       desc.fragmentFunction = fFunc;
       desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-      desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+      if (sampleCount <= 1)
+      {
+        desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+      }
       desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
       desc.rasterSampleCount = sampleCount;
 
@@ -2864,7 +2871,10 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
       desc.vertexFunction = vFunc;
       desc.fragmentFunction = fFunc;
       desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-      desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+      if (sampleCount <= 1)
+      {
+        desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+      }
       desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
       // No backface culling for point quads
       desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
@@ -2930,7 +2940,10 @@ void vtkMetalPolyDataMapper::EnsureEdgePipelineState(void* mtlDevice)
     desc.fragmentFunction = fFunc;
     desc.vertexDescriptor = vertexDesc;
     desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+    if (sampleCount <= 1)
+    {
+      desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+    }
     desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassLine;
     desc.rasterSampleCount = sampleCount;
@@ -2976,7 +2989,10 @@ void vtkMetalPolyDataMapper::EnsureThickLinePipelineState(void* mtlDevice)
     desc.vertexFunction = vFunc;
     desc.fragmentFunction = fFunc;
     desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+    if (sampleCount <= 1)
+    {
+      desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+    }
     desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     // Thick lines are rendered as triangle strips (quads)
     desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
@@ -3023,7 +3039,10 @@ void vtkMetalPolyDataMapper::EnsureRoundCapLinePipelineState(void* mtlDevice)
     desc.vertexFunction = vFunc;
     desc.fragmentFunction = fFunc;
     desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+    if (sampleCount <= 1)
+    {
+      desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+    }
     desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     // Round cap lines are rendered as triangle lists
     desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
@@ -3070,7 +3089,10 @@ void vtkMetalPolyDataMapper::EnsureMiterJoinLinePipelineState(void* mtlDevice)
     desc.vertexFunction = vFunc;
     desc.fragmentFunction = fFunc;
     desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+    if (sampleCount <= 1)
+    {
+      desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+    }
     desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     // Miter join lines are rendered as triangle strips (quads)
     desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
