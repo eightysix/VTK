@@ -16,9 +16,12 @@
 #include "vtkRenderingMetalModule.h" // for export macro
 #include "vtkWrappingHints.h"        // for VTK_MARSHALAUTO
 
+#include <memory>
+
 VTK_ABI_NAMESPACE_BEGIN
 
 class vtkOverrideAttribute;
+class vtkMetalDepthPeeler;
 
 class VTKRENDERINGMETAL_EXPORT VTK_MARSHALAUTO vtkMetalRenderer : public vtkRenderer
 {
@@ -49,11 +52,22 @@ public:
    */
   void ReleaseGraphicsResources(vtkWindow* w) override;
 
+  /**
+   * Render translucent polygonal geometry (public wrapper for depth peeler).
+   */
+  void RenderTranslucentGeometry();
+
 protected:
   vtkMetalRenderer();
   ~vtkMetalRenderer() override;
 
+  /**
+   * Check if any visible props have translucent geometry.
+   */
+  bool HasTranslucentPolygonalGeometry();
+
 private:
+  std::unique_ptr<vtkMetalDepthPeeler> DepthPeeler;
   vtkMetalRenderer(const vtkMetalRenderer&) = delete;
   void operator=(const vtkMetalRenderer&) = delete;
 };

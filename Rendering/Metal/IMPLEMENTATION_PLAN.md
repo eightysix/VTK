@@ -195,18 +195,33 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 - `vtkMetalRenderer.mm` — render pass uses MSAA textures with resolve, skips IDs when MSAA active
 - `vtkMetalPolyDataMapper.mm` — `sampleCount` on all pipeline descriptors, `CachedSampleCount` invalidation in `RenderPiece()`
 
-### 8B. Depth Peeling / Correct Translucency
+### 8B. Depth Peeling / Correct Translucency ✅
+
+**Status**: Implemented. Dual depth peeling for order-independent transparency. `vtkMetalDepthPeeler` manages the multi-pass algorithm with 6 ping-pong textures (FrontPeelA/B, BackPeelTemp, BackAccum, DepthPeelA/B). Algorithm:
+1. Opaque pass renders with depth write=Yes.
+2. Init peel pass renders translucent with MAX blending on RG32Float depth range, depth test=Less against opaque depth.
+3. Peel loop (up to 8 iterations): each pass renders translucent with 3 color outputs (backTemp, frontDest, depthDest). Four-zone depth comparison: outside (pass through), inside (mark for future peel), on front (under-blend into front accumulation), on back (premultiply alpha into backTemp). BackTemp blended into BackAccum via premultiplied over-blend. Ping-pong front/depth buffers swapped each iteration.
+4. Final composite: fullscreen pass blends front accumulation (alpha stored as 1-alpha) and back accumulation onto drawable with premultiplied over-blend.
 
 **Files**:
-- `vtkMetalRenderer.mm` — multi-pass rendering
-- `MetalShaders.metal` — peeling shaders
-- New `vtkMetalDepthPeeler` or equivalent
+- `vtkMetalDepthPeeler.h` — class declaration with texture/pipeline management
+- `vtkMetalDepthPeeler.mm` — multi-pass orchestration, texture creation, fullscreen pipelines
+- `MetalShaders.metal` — `fragment_peel_init`, `fragment_peel`, `fragment_peel_alpha_blend`, `fragment_peel_composite`, `fragment_peel_back_blend`, `vertex_fullscreen_main`
+- `vtkMetalRenderer.mm` — split DeviceRender into opaque pass + depth peeling or fallback alpha blending
+- `vtkMetalRenderer.h` — `DepthPeeler` member, `HasTranslucentPolygonalGeometry()`
+- `vtkMetalRenderWindow.h` — peeling state fields (`DepthPeelingMode`, `PeelFrontTexture`, `PeelDepthTexture`, `PeelIndex`)
+- `vtkMetalPolyDataMapper.mm` — `EnsurePeelPipelineStates()`, peeling pipeline selection in `RenderPiece()`, peeling texture/uniform binding
+- `vtkMetalPolyDataMapper.h` — `EnsurePeelPipelineStates()` declaration
+- `CMakeLists.txt` — added `vtkMetalDepthPeeler`
 
-**Implementation**:
-1. Implement OIT (Order-Independent Transparency) via depth peeling.
-2. Multiple render passes, each peeling the closest translucent layer.
-3. Stencil buffer to track peeled fragments.
-4. Final composite pass blends all layers back-to-front.
+**Key design decisions**:
+- No stencil buffer needed — min-max depth buffer (RG32Float) with MAX blending handles all tracking.
+- Front accumulation alpha stored as (1-alpha) so MAX blending correctly picks nearest fragment.
+- No occlusion queries — fixed maximum peel count (default 8).
+- Mapper creates separate peeling pipeline states (fragment_peel_init for init pass, fragment_peel for peel passes) with 3 color attachments and appropriate MAX blend modes.
+- Depth peeling enabled via `vtkRenderer::SetUseDepthPeeling(1)` (base class API).
+
+**WebGPU reference**: Not yet implemented in WebGPU backend. Algorithm based on `vtkDualDepthPeelingPass` (OpenGL2).
 
 ### 8C. Render Bundles
 
@@ -252,7 +267,7 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 | 13 | 7A — 2D mapper | Medium | Low | ✅ Done |
 | 14 | 7B — Batched mapper | Large | Low | ✅ Done |
 | 15 | 7C — Composite delegator | Large | Low | ✅ Done |
-| 16 | 8B — Depth peeling | Large | Low | — correct translucency |
+| 16 | 8B — Depth peeling | Large | Low | ✅ Done |
 | 17 | 7D — Glyph3D mapper | Large | Low | — glyph instancing |
 | 18 | 8C — Render bundles | Large | Low | — perf optimization |
 | 19 | 8D — Vertex attribute mapping | Medium | Low | — custom attributes |

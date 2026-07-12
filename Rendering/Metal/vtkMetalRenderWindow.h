@@ -159,10 +159,18 @@ protected:
   void* MultisampleDepthTexture = nullptr; // id<MTLTexture> — MSAA depth (MTLTextureType2DMultisample)
   void* ColorCopyPipeline = nullptr; // id<MTLRenderPipelineState>
 
+  // 8B: Depth peeling state — set by vtkMetalDepthPeeler before each pass,
+  // read by vtkMetalPolyDataMapper during RenderPiece().
+  int DepthPeelingMode = 0;       // 0=normal, 1=init, 2=peel
+  void* PeelFrontTexture = nullptr; // id<MTLTexture> — previous front accumulation
+  void* PeelDepthTexture = nullptr; // id<MTLTexture> — previous depth (RG32Float)
+  int PeelIndex = 0;              // current peel iteration
+
   bool Initialized = false;
 
 private:
   friend class vtkMetalRenderer;
+  friend class vtkMetalDepthPeeler;
   friend class vtkMetalPolyDataMapper;
   friend class vtkMetalPolyDataMapper2D;
 

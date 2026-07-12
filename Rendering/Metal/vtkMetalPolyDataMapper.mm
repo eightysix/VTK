@@ -150,6 +150,11 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   // P2-2C: Triangle index buffers — deduplicated vertices + index buffer
   // IndexBuffer is populated when vertices can be deduplicated.
 
+  // 8B: Depth peeling pipeline states (same vertex shader, peeling fragment shaders)
+  id<MTLRenderPipelineState> TriangleInitPeelPipeline = nil;  // init depth range
+  id<MTLRenderPipelineState> TrianglePeelPipeline = nil;      // main peel pass
+  id<MTLBuffer> PeelUniformBuffer = nil;                       // peel mode + pass index
+
   vtkIdType CachedInputMTime = 0;
   int CachedRepresentation = -1;
   bool CachedEdgeVisibility = false;  // P2-2B: track edge visibility changes
@@ -240,6 +245,11 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     CachedRepresentation = -1;
     CachedEdgeVisibility = false;
     CachedLineWidth = -1.0f;
+
+    // 8B: Depth peeling pipelines
+    TriangleInitPeelPipeline = nil;
+    TrianglePeelPipeline = nil;
+    PeelUniformBuffer = nil;
   }
 };
 
@@ -297,6 +307,8 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     this->Internals->ThickLinePipeline = nil;
     this->Internals->RoundCapLinePipeline = nil;
     this->Internals->MiterJoinLinePipeline = nil;
+    this->Internals->TriangleInitPeelPipeline = nil;
+    this->Internals->TrianglePeelPipeline = nil;
     this->Internals->CachedSampleCount = currentSampleCount;
   }
 
@@ -406,7 +418,24 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
 
     if (!skipTriangles && this->Internals->HasTriangles && this->Internals->TrianglePipeline)
     {
-      [encoder setRenderPipelineState:this->Internals->TrianglePipeline];
+      // 8B: Select pipeline based on depth peeling mode
+      int peelMode = renWin->DepthPeelingMode;
+      if (peelMode != 0)
+      {
+        this->EnsurePeelPipelineStates((__bridge void*)device);
+      }
+      if (peelMode == 1 && this->Internals->TriangleInitPeelPipeline)
+      {
+        [encoder setRenderPipelineState:this->Internals->TriangleInitPeelPipeline];
+      }
+      else if (peelMode == 2 && this->Internals->TrianglePeelPipeline)
+      {
+        [encoder setRenderPipelineState:this->Internals->TrianglePeelPipeline];
+      }
+      else
+      {
+        [encoder setRenderPipelineState:this->Internals->TrianglePipeline];
+      }
       [encoder setVertexBuffer:this->Internals->VertexPositionBuffer offset:0 atIndex:0];
       if (this->Internals->VertexNormalBuffer)
       {
@@ -501,6 +530,40 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         if (samplerToBind)
         {
           [encoder setFragmentSamplerState:samplerToBind atIndex:0];
+        }
+      }
+
+      // 8B: Bind peeling textures when in depth peeling mode
+      if (peelMode == 1 || peelMode == 2)
+      {
+        // Create/update peel uniform buffer
+        if (!this->Internals->PeelUniformBuffer)
+        {
+          this->Internals->PeelUniformBuffer = [device
+            newBufferWithLength:16 options:MTLResourceStorageModeShared];
+        }
+        struct { uint32_t mode; uint32_t peelPass; float vpW; float vpH; } peelUni;
+        peelUni.mode = static_cast<uint32_t>(peelMode);
+        peelUni.peelPass = static_cast<uint32_t>(renWin->PeelIndex);
+        int* renSize = ren->GetSize();
+        peelUni.vpW = static_cast<float>(renSize[0]);
+        peelUni.vpH = static_cast<float>(renSize[1]);
+        memcpy([this->Internals->PeelUniformBuffer contents], &peelUni, sizeof(peelUni));
+
+        [encoder setFragmentBuffer:this->Internals->PeelUniformBuffer offset:0 atIndex:6];
+
+        // Bind previous front texture (peel mode 2 only)
+        if (peelMode == 2 && renWin->PeelFrontTexture)
+        {
+          id<MTLTexture> prevFront = (__bridge id<MTLTexture>)renWin->PeelFrontTexture;
+          [encoder setFragmentTexture:prevFront atIndex:1];
+        }
+
+        // Bind previous depth texture (both modes)
+        if (renWin->PeelDepthTexture)
+        {
+          id<MTLTexture> prevDepth = (__bridge id<MTLTexture>)renWin->PeelDepthTexture;
+          [encoder setFragmentTexture:prevDepth atIndex:2];
         }
       }
 
@@ -3104,6 +3167,132 @@ void vtkMetalPolyDataMapper::EnsureMiterJoinLinePipelineState(void* mtlDevice)
     if (!this->Internals->MiterJoinLinePipeline)
     {
       vtkErrorMacro(<< "Miter join line pipeline: " << [[error localizedDescription] UTF8String]);
+    }
+  }
+}
+
+//------------------------------------------------------------------------------
+// 8B: Create depth peeling pipeline states for triangle rendering.
+// These use the same vertex shader (vertex_main) but peeling fragment shaders
+// that output to 3 color attachments (backTemp, frontDest, depthDest).
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
+{
+  if (this->Internals->TriangleInitPeelPipeline && this->Internals->TrianglePeelPipeline)
+  {
+    return;
+  }
+
+  id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
+
+  NSError* error = nil;
+  NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
+  id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+  if (!library)
+  {
+    vtkErrorMacro(<< "Failed to compile Metal shader for depth peeling: "
+                  << [[error localizedDescription] UTF8String]);
+    return;
+  }
+
+  id<MTLFunction> vertexFunc = [library newFunctionWithName:@"vertex_main"];
+  if (!vertexFunc)
+  {
+    return;
+  }
+
+  MTLVertexDescriptor* vertexDesc = [[MTLVertexDescriptor alloc] init];
+  vertexDesc.attributes[0].format = MTLVertexFormatFloat3;
+  vertexDesc.attributes[0].offset = 0;
+  vertexDesc.attributes[0].bufferIndex = 0;
+  vertexDesc.attributes[1].format = MTLVertexFormatFloat3;
+  vertexDesc.attributes[1].offset = 0;
+  vertexDesc.attributes[1].bufferIndex = 1;
+  vertexDesc.layouts[0].stride = sizeof(float) * 3;
+  vertexDesc.layouts[0].stepRate = 1;
+  vertexDesc.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
+  vertexDesc.layouts[1].stride = sizeof(float) * 3;
+  vertexDesc.layouts[1].stepRate = 1;
+  vertexDesc.layouts[1].stepFunction = MTLVertexStepFunctionPerVertex;
+
+  // --- Init peel pipeline ---
+  // Outputs RG32Float (depth range) with MAX blend, depth test=Less
+  if (!this->Internals->TriangleInitPeelPipeline)
+  {
+    id<MTLFunction> fragFunc = [library newFunctionWithName:@"fragment_peel_init"];
+    if (fragFunc)
+    {
+      MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+      desc.vertexFunction = vertexFunc;
+      desc.fragmentFunction = fragFunc;
+      desc.vertexDescriptor = vertexDesc;
+      // color(0): RG32Float (depth range) with MAX blend
+      desc.colorAttachments[0].pixelFormat = MTLPixelFormatRG32Float;
+      desc.colorAttachments[0].blendingEnabled = YES;
+      desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationMax;
+      desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationMax;
+      desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+      desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOne;
+      desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+      desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
+      // No IDs attachment during peeling
+      desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+      desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+
+      error = nil;
+      this->Internals->TriangleInitPeelPipeline =
+        [device newRenderPipelineStateWithDescriptor:desc error:&error];
+      if (!this->Internals->TriangleInitPeelPipeline)
+      {
+        vtkErrorMacro(<< "Init peel pipeline: " << [[error localizedDescription] UTF8String]);
+      }
+    }
+  }
+
+  // --- Main peel pipeline ---
+  // Outputs to 3 color attachments: RGBA8 (backTemp), RGBA8 (frontDest), RG32Float (depthDest)
+  // frontDest and depthDest use MAX blend
+  if (!this->Internals->TrianglePeelPipeline)
+  {
+    id<MTLFunction> fragFunc = [library newFunctionWithName:@"fragment_peel"];
+    if (fragFunc)
+    {
+      MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+      desc.vertexFunction = vertexFunc;
+      desc.fragmentFunction = fragFunc;
+      desc.vertexDescriptor = vertexDesc;
+      // color(0): RGBA8 (backTemp) — no blend, direct write
+      desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+      desc.colorAttachments[0].blendingEnabled = NO;
+      // color(1): RGBA8 (frontDest) — MAX blend
+      desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA8Unorm;
+      desc.colorAttachments[1].blendingEnabled = YES;
+      desc.colorAttachments[1].rgbBlendOperation = MTLBlendOperationMax;
+      desc.colorAttachments[1].alphaBlendOperation = MTLBlendOperationMax;
+      desc.colorAttachments[1].sourceRGBBlendFactor = MTLBlendFactorOne;
+      desc.colorAttachments[1].destinationRGBBlendFactor = MTLBlendFactorOne;
+      desc.colorAttachments[1].sourceAlphaBlendFactor = MTLBlendFactorOne;
+      desc.colorAttachments[1].destinationAlphaBlendFactor = MTLBlendFactorOne;
+      // color(2): RG32Float (depthDest) — MAX blend
+      desc.colorAttachments[2].pixelFormat = MTLPixelFormatRG32Float;
+      desc.colorAttachments[2].blendingEnabled = YES;
+      desc.colorAttachments[2].rgbBlendOperation = MTLBlendOperationMax;
+      desc.colorAttachments[2].alphaBlendOperation = MTLBlendOperationMax;
+      desc.colorAttachments[2].sourceRGBBlendFactor = MTLBlendFactorOne;
+      desc.colorAttachments[2].destinationRGBBlendFactor = MTLBlendFactorOne;
+      desc.colorAttachments[2].sourceAlphaBlendFactor = MTLBlendFactorOne;
+      desc.colorAttachments[2].destinationAlphaBlendFactor = MTLBlendFactorOne;
+      // No depth attachment during peel passes
+      desc.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
+      desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+
+      error = nil;
+      this->Internals->TrianglePeelPipeline =
+        [device newRenderPipelineStateWithDescriptor:desc error:&error];
+      if (!this->Internals->TrianglePeelPipeline)
+      {
+        vtkErrorMacro(<< "Peel pipeline: " << [[error localizedDescription] UTF8String]);
+      }
     }
   }
 }

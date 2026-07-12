@@ -1383,3 +1383,375 @@ fragment float4 fragment_2d_main(
 {
   return in.color;
 }
+
+// ============================================================================
+// 8B: Depth Peeling / Correct Translucency (OIT)
+// ============================================================================
+
+// Peeling uniforms — passed per render pass
+struct PeelUniforms {
+  uint mode;          // 0=init, 1=peel, 2=alphaBlend
+  uint peelPass;      // current peel iteration
+  float2 viewportSize;
+};
+
+// Fullscreen vertex output (for composite/init passes)
+struct FullscreenVertexOut {
+  float4 position [[position]];
+  float2 texCoord;
+};
+
+// Fullscreen vertex shader — generates a single triangle covering the viewport
+vertex FullscreenVertexOut vertex_fullscreen_main(uint vertex_id [[vertex_id]]) {
+  // Oversized triangle: covers entire viewport with 1 triangle (2 fewer verts than a quad)
+  float2 positions[3] = {
+    float2(-1, -1),
+    float2( 3, -1),
+    float2(-1,  3)
+  };
+  float2 texCoords[3] = {
+    float2(0, 1),
+    float2(2, 1),
+    float2(0, -1)
+  };
+  FullscreenVertexOut out;
+  out.position = float4(positions[vertex_id], 0, 1);
+  out.texCoord = texCoords[vertex_id];
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Depth peeling — fragment output structs
+// ---------------------------------------------------------------------------
+
+// Init pass output: just min/max depth (RG32Float)
+struct PeelInitOutput {
+  float2 depthRange [[color(0)]];
+};
+
+// Peel pass output: back temp, front accumulation, depth range
+struct PeelPassOutput {
+  float4 backTemp  [[color(0)]];   // premultiplied back fragment
+  float4 frontDest [[color(1)]];   // front accumulation (alpha stored as 1-alpha)
+  float2 depthDest [[color(2)]];   // min/max depth for next iteration
+};
+
+// ---------------------------------------------------------------------------
+// Init pass fragment shader — establishes initial min/max depth range
+// Renders translucent geometry with MAX blending to find visible depth bounds.
+// Depth test=Less ensures fragments behind opaque are discarded by hardware.
+// MAX blending on RG32Float target picks the nearest min and farthest max.
+// Depth is negated for min so that MAX(blue) picks the smallest depth.
+// ---------------------------------------------------------------------------
+fragment PeelInitOutput fragment_peel_init(
+    VertexOut in [[stage_in]],
+    constant MaterialUniforms& material [[buffer(0)]],
+    constant LightUniforms& lights [[buffer(1)]],
+    constant SceneUniforms& scene [[buffer(2)]],
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+    constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
+    texture2d<float> actorTexture [[texture(0)]],
+    sampler actorSampler [[sampler(0)]]) {
+  // P1-6: discard fragments outside clip planes
+  if (clipPlanes.numClipPlanes > 0 && in.clipDistances.x < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 1 && in.clipDistances.y < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 2 && in.clipDistances.z < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 3 && in.clipDistances.w < 0.0) discard_fragment();
+
+  PeelInitOutput out;
+  float depth = in.position.z;
+  // Negate min depth so that MAX blending picks the nearest (smallest) depth
+  out.depthRange = float2(-depth, depth);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Peel pass fragment shader — main depth peeling logic
+// Reads previous depth range and front accumulation, outputs to three targets.
+// Uses the four-zone algorithm from vtkDualDepthPeelingPass:
+//   Zone 1 (outside):   fragment is irrelevant, pass through previous data
+//   Zone 2 (inside):    fragment will be peeled later, mark its depth
+//   Zone 3 (on front):  nearest unpeeled fragment, under-blend into front
+//   Zone 4 (on back):   farthest unpeeled fragment, premultiply and output
+// ---------------------------------------------------------------------------
+fragment PeelPassOutput fragment_peel(
+    VertexOut in [[stage_in]],
+    constant MaterialUniforms& material [[buffer(0)]],
+    constant LightUniforms& lights [[buffer(1)]],
+    constant SceneUniforms& scene [[buffer(2)]],
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+    constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
+    texture2d<float> actorTexture [[texture(0)]],
+    sampler actorSampler [[sampler(0)]],
+    texture2d<float, access::read> prevFrontTex [[texture(1)]],
+    texture2d<float, access::read> prevDepthTex [[texture(2)]]) {
+  // P1-6: discard fragments outside clip planes
+  if (clipPlanes.numClipPlanes > 0 && in.clipDistances.x < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 1 && in.clipDistances.y < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 2 && in.clipDistances.z < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 3 && in.clipDistances.w < 0.0) discard_fragment();
+
+  // Compute pixel coordinates for texture reads
+  uint2 pixel = uint2(in.position.xy) - uint2(scene.viewport.xy);
+
+  // Read previous peel state
+  float4 prevFront = prevFrontTex.read(pixel);
+  float2 prevDepth = prevDepthTex.read(pixel).rg;
+  float minDepth = -prevDepth.x;  // negate back to positive
+  float maxDepth = prevDepth.y;
+  float fragDepth = in.position.z;
+  float epsilon = 0.0000001;
+
+  // Default outputs: pass through previous state, no depth change
+  PeelPassOutput out;
+  out.backTemp = float4(0.0);
+  out.frontDest = prevFront;
+  out.depthDest = float2(-1.0, -1.0);
+
+  // Compute fragment color via Phong lighting (same as fragment_main)
+  float3 N = normalize(in.viewNormal);
+  bool hasVertexColors = (scene.flags & (1u << 8)) != 0u;
+  float3 ambientColor = hasVertexColors ? in.vertexColor.rgb : material.ambientColor.rgb;
+  float ambientIntensity = material.ambientColor.w;
+  float3 diffuseColor = hasVertexColors ? in.vertexColor.rgb : material.diffuseColor.rgb;
+  float diffuseIntensity = material.diffuseColor.w;
+  float3 specularColor = material.specularColor.rgb;
+  float specularIntensity = material.specularColor.w;
+  float baseOpacity = hasVertexColors ? in.vertexColor.a : material.opacity;
+
+  // P5-5A: texture sampling
+  bool hasTexture = (scene.flags & (1u << 9)) != 0u;
+  if (hasTexture) {
+    float4 texColor = actorTexture.sample(actorSampler, in.uv);
+    ambientColor *= texColor.rgb;
+    diffuseColor *= texColor.rgb;
+    baseOpacity *= texColor.a;
+  }
+
+  float3 totalAmbient = ambientIntensity * ambientColor;
+  float3 totalDiffuse = float3(0.0);
+  float3 totalSpecular = float3(0.0);
+  float3 viewDir = normalize(-in.viewPos);
+
+  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
+    Light L = lights.lights[i];
+    int lightType = int(L.position.w);
+    float3 lightColor = L.color.rgb * L.color.w;
+    float attenuation = 1.0;
+    float df = 0.0;
+    float3 reflDir = float3(0.0);
+    float3 toLight = float3(0.0);
+
+    if (lightType == 0) {
+      toLight = float3(0.0, 0.0, 1.0);
+      df = max(N.z, 0.000001);
+      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
+    } else if (lightType == 1) {
+      toLight = normalize(-L.direction.xyz);
+      df = max(dot(N, toLight), 0.0);
+      reflDir = reflect(L.direction.xyz, N);
+    } else {
+      toLight = L.position.xyz - in.viewPos;
+      float dist = length(toLight);
+      toLight /= dist;
+      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
+      df = max(dot(N, toLight), 0.0);
+      reflDir = reflect(-toLight, N);
+      if (lightType == 3) {
+        float3 spotDir = normalize(L.direction.xyz);
+        float spotCos = dot(-toLight, spotDir);
+        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
+        if (spotCos > spotCutoff) {
+          attenuation *= pow(spotCos, L.attenuation.w);
+        } else {
+          attenuation = 0.0;
+        }
+      }
+    }
+    totalDiffuse += df * diffuseColor * lightColor * attenuation;
+    float NdotL = max(dot(N, toLight), 0.0);
+    if (NdotL > 0.0) {
+      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
+      totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
+    }
+  }
+
+  float3 fragRGB = totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular;
+  float fragAlpha = baseOpacity;
+
+  // Four-zone depth comparison
+  // Zone 1: Outside current peels — fragment is irrelevant
+  if (fragDepth < minDepth - epsilon || fragDepth > maxDepth + epsilon) {
+    return out;
+  }
+
+  // Zone 2: Strictly inside current peels — will be peeled in a future pass
+  if (fragDepth > minDepth + epsilon && fragDepth < maxDepth - epsilon) {
+    out.depthDest = float2(-fragDepth, fragDepth);
+    return out;
+  }
+
+  // Zone 3: On the front peel (nearest unpeeled)
+  if (fragDepth >= minDepth - epsilon && fragDepth <= minDepth + epsilon) {
+    float prevAlpha = 1.0 - prevFront.a;  // stored as (1-alpha), convert back
+    // Under-blend: accumulate front-to-back
+    out.frontDest.rgb = prevAlpha * fragAlpha * fragRGB + prevFront.rgb;
+    out.frontDest.a = 1.0 - (prevAlpha * (1.0 - fragAlpha));  // store as (1-newAlpha)
+    return out;
+  }
+
+  // Zone 4: On the back peel (farthest unpeeled)
+  if (fragDepth >= maxDepth - epsilon && fragDepth <= maxDepth + epsilon) {
+    out.backTemp = float4(fragRGB * fragAlpha, fragAlpha);  // premultiplied alpha
+    return out;
+  }
+
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Alpha blend pass fragment shader — blends remaining unpeeled fragments
+// Used when the peel loop terminates early (occlusion threshold exceeded).
+// Discards fragments outside the last peel depth range.
+// Outputs premultiplied fragment color for over-blending into back accumulation.
+// ---------------------------------------------------------------------------
+fragment float4 fragment_peel_alpha_blend(
+    VertexOut in [[stage_in]],
+    constant MaterialUniforms& material [[buffer(0)]],
+    constant LightUniforms& lights [[buffer(1)]],
+    constant SceneUniforms& scene [[buffer(2)]],
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+    constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
+    texture2d<float> actorTexture [[texture(0)]],
+    sampler actorSampler [[sampler(0)]],
+    texture2d<float, access::read> prevDepthTex [[texture(2)]]) {
+  // P1-6: discard fragments outside clip planes
+  if (clipPlanes.numClipPlanes > 0 && in.clipDistances.x < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 1 && in.clipDistances.y < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 2 && in.clipDistances.z < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 3 && in.clipDistances.w < 0.0) discard_fragment();
+
+  uint2 pixel = uint2(in.position.xy) - uint2(scene.viewport.xy);
+  float2 prevDepth = prevDepthTex.read(pixel).rg;
+  float minDepth = -prevDepth.x;
+  float maxDepth = prevDepth.y;
+  float fragDepth = in.position.z;
+  float epsilon = 0.0000001;
+
+  // Discard fragments outside the last peel range
+  if (fragDepth < minDepth - epsilon || fragDepth > maxDepth + epsilon) {
+    discard_fragment();
+  }
+
+  // Compute fragment color (same Phong lighting)
+  float3 N = normalize(in.viewNormal);
+  bool hasVertexColors = (scene.flags & (1u << 8)) != 0u;
+  float3 ambientColor = hasVertexColors ? in.vertexColor.rgb : material.ambientColor.rgb;
+  float ambientIntensity = material.ambientColor.w;
+  float3 diffuseColor = hasVertexColors ? in.vertexColor.rgb : material.diffuseColor.rgb;
+  float diffuseIntensity = material.diffuseColor.w;
+  float3 specularColor = material.specularColor.rgb;
+  float specularIntensity = material.specularColor.w;
+  float baseOpacity = hasVertexColors ? in.vertexColor.a : material.opacity;
+
+  bool hasTexture = (scene.flags & (1u << 9)) != 0u;
+  if (hasTexture) {
+    float4 texColor = actorTexture.sample(actorSampler, in.uv);
+    ambientColor *= texColor.rgb;
+    diffuseColor *= texColor.rgb;
+    baseOpacity *= texColor.a;
+  }
+
+  float3 totalAmbient = ambientIntensity * ambientColor;
+  float3 totalDiffuse = float3(0.0);
+  float3 totalSpecular = float3(0.0);
+  float3 viewDir = normalize(-in.viewPos);
+
+  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
+    Light L = lights.lights[i];
+    int lightType = int(L.position.w);
+    float3 lightColor = L.color.rgb * L.color.w;
+    float attenuation = 1.0;
+    float df = 0.0;
+    float3 reflDir = float3(0.0);
+    float3 toLight = float3(0.0);
+
+    if (lightType == 0) {
+      toLight = float3(0.0, 0.0, 1.0);
+      df = max(N.z, 0.000001);
+      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
+    } else if (lightType == 1) {
+      toLight = normalize(-L.direction.xyz);
+      df = max(dot(N, toLight), 0.0);
+      reflDir = reflect(L.direction.xyz, N);
+    } else {
+      toLight = L.position.xyz - in.viewPos;
+      float dist = length(toLight);
+      toLight /= dist;
+      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
+      df = max(dot(N, toLight), 0.0);
+      reflDir = reflect(-toLight, N);
+      if (lightType == 3) {
+        float3 spotDir = normalize(L.direction.xyz);
+        float spotCos = dot(-toLight, spotDir);
+        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
+        if (spotCos > spotCutoff) {
+          attenuation *= pow(spotCos, L.attenuation.w);
+        } else {
+          attenuation = 0.0;
+        }
+      }
+    }
+    totalDiffuse += df * diffuseColor * lightColor * attenuation;
+    float NdotL = max(dot(N, toLight), 0.0);
+    if (NdotL > 0.0) {
+      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
+      totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
+    }
+  }
+
+  float3 fragRGB = totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular;
+  float fragAlpha = baseOpacity;
+  return float4(fragRGB * fragAlpha, fragAlpha);  // premultiplied alpha
+}
+
+// ---------------------------------------------------------------------------
+// Composite pass fragment shader — composites front and back accumulation
+// onto the framebuffer. Front accumulation has alpha stored as (1-alpha).
+// Uses premultiplied-alpha over-blending: src=One, dst=OneMinusSrcAlpha.
+// ---------------------------------------------------------------------------
+fragment float4 fragment_peel_composite(
+    FullscreenVertexOut in [[stage_in]],
+    texture2d<float, access::read> frontTex [[texture(0)]],
+    texture2d<float, access::read> backTex [[texture(1)]]) {
+  uint2 pixel = uint2(in.position.xy);
+  float4 front = frontTex.read(pixel);
+  float4 back = backTex.read(pixel);
+
+  float frontAlpha = 1.0 - front.a;  // stored as (1-alpha), convert back
+  // Under-blend: back underneath front
+  float3 color = front.rgb + back.rgb * frontAlpha;
+  // Convert under-blend alpha to over-blend alpha for final compositing
+  float alpha = 1.0 - frontAlpha * (1.0 - back.a);
+
+  return float4(color, alpha);
+}
+
+// ---------------------------------------------------------------------------
+// Back blend pass fragment shader — blends BackTemp into Back accumulation
+// Fullscreen quad that reads BackTemp and over-blends into the back buffer.
+// Discards fragments with zero alpha (no back fragment this peel).
+// Uses premultiplied-alpha over-blending.
+// ---------------------------------------------------------------------------
+fragment float4 fragment_peel_back_blend(
+    FullscreenVertexOut in [[stage_in]],
+    texture2d<float, access::read> backTempTex [[texture(0)]]) {
+  uint2 pixel = uint2(in.position.xy);
+  float4 backTemp = backTempTex.read(pixel);
+
+  // Discard if no back fragment was written
+  if (backTemp.a < 0.001) discard_fragment();
+
+  // BackTemp is already premultiplied, pass through for over-blending
+  return backTemp;
+}
