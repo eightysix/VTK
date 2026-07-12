@@ -48,10 +48,14 @@ Last updated: 2026-07-12
 - Passed through point vertex shaders (`PointVertexOut.tangent`)
 - Not consumed by fragment shaders for lighting calculations
 
-### P2-10 Texture Coordinates
-- UV buffers created from `pd->GetTCoords()`
-- Passed through point vertex shaders (`PointVertexOut.uv`, `PointVertexOut.lut_uv`)
-- Never sampled in fragment shaders — no `texture2d` or sampler declarations exist
+### P2-10 Texture Coordinates ✅
+- UV buffers created from `pd->GetTCoords()` for triangles, lines, and points
+- TriangleUVBuffer (float2 per vertex) passed through vertex shaders at `[[buffer(8)]]`
+- Fragment shader samples `texture2d<float>` at `[[texture(0)]]` with `sampler` at `[[sampler(0)]]`
+- When actor has texture (`vtkActor::GetTexture()`), creates `MTLTexture` and `MTLSamplerState`
+- Default 1x1 white texture used as fallback when no actor texture is present
+- Texture color multiplied with ambient/diffuse colors and opacity (modulate blending)
+- Scene flags bit 9 indicates texture presence
 
 ---
 
@@ -143,4 +147,3 @@ See `IMPLEMENTATION_PLAN.md` for the full feature-by-feature implementation plan
 5. **GPU tessellation** — moves polygon→triangle conversion off CPU
 6. **Thick lines** — needed for line width settings
 7. **Batched rendering** — reduces CPU overhead for many-actor scenes
-8. **Texture mapping** — complete the P2-10 UV plumbing with actual sampling

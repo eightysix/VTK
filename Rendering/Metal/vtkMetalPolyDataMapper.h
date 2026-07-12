@@ -41,6 +41,7 @@ protected:
   void UpdateVertexColorUniforms(void* mtlDevice, vtkActor* actor);
   void UpdateEdgeColorUniform(void* mtlDevice, vtkActor* actor);
   void UpdateClipPlaneUniforms(void* mtlDevice, vtkActor* actor);
+  void UpdateActorTexture(void* mtlDevice, vtkActor* actor);
 
 private:
   vtkMetalPolyDataMapper(const vtkMetalPolyDataMapper&) = delete;

@@ -102,20 +102,21 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 
 ## Phase 5: Texture Mapping
 
-### 5A. Complete UV Pipeline with Sampling
+### 5A. Complete UV Pipeline with Sampling ✅
 
-**Gap**: UV buffers exist and are passed through vertex shaders but never sampled.
+**Status**: Implemented. TriangleUVBuffer (float2 per vertex) created from `pd->GetTCoords()` for all geometry types. Vertex shader reads UVs from `[[buffer(8)]]` and passes through `VertexOut.uv`. Fragment shader accepts `texture2d<float>` at `[[texture(0)]]` and `sampler` at `[[sampler(0)]]`. When actor has texture (`vtkActor::GetTexture()`), `MTLTexture` and `MTLSamplerState` are created from `vtkImageData`. Default 1x1 white texture used as fallback. Texture color multiplied with ambient/diffuse colors and opacity (modulate blending). Scene flags bit 9 indicates texture presence.
 
 **Files**:
-- `vtkMetalPolyDataMapper.mm` — new texture binding code, `BuildGeometryBuffers()`
-- `MetalShaders.metal` — new texture sampling in fragment shaders
+- `MetalShaders.metal` — `VertexOut.uv`, `vertex_main` UV buffer, `fragment_main` texture/sampler arguments and sampling
+- `vtkMetalPolyDataMapper.mm` — `TriangleUVBuffer`, `ActorTexture`, `ActorSampler`, `UpdateActorTexture()`, texture binding in `RenderPiece()`
+- `vtkMetalPolyDataMapper.h` — `UpdateActorTexture()` declaration
 
 **Implementation**:
-1. In `BuildGeometryBuffers()`, when `pd->GetTCoords()` exists, the UV buffers are already created.
-2. Add texture creation/binding: when the actor has a texture (`vtkActor::GetTexture()`), create an `MTLTexture` and `MTLSamplerState`.
-3. Add a new buffer binding (or repurpose an existing one) for the texture + sampler.
-4. In the fragment shader, add `texture2d<float>` and `sampler` arguments.
-5. When texture is present, multiply the fragment color by the sampled texture color.
+1. In `BuildGeometryBuffers()`, when `pd->GetTCoords()` exists, UV data is collected alongside positions at all vertex addition points (wireframe, indexed, non-indexed, line paths).
+2. `TriangleUVBuffer` created from collected UV data, with zero-UV fallback when no UVs exist.
+3. `UpdateActorTexture()` reads `vtkActor::GetTexture()`, converts `vtkImageData` to RGBA8 `MTLTexture`, creates `MTLSamplerState` with linear filtering and repeat addressing.
+4. Fragment shader samples texture when scene flags bit 9 is set, multiplying sampled color with base ambient/diffuse colors and opacity.
+5. Default 1x1 white texture and sampler created lazily as fallback when no actor texture is present.
 
 **WebGPU reference**: `ReplaceFragmentShaderColors()` handles texture coordinate lookup and sampling, `ColorTextureHostResource` manages the GPU texture.
 
@@ -258,7 +259,7 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 | 6 | 2A — Wireframe representation | Medium | High | ✅ Done |
 | 7 | 2B — Edge visibility | Medium | High | ✅ Done |
 | 8 | 3A — Thick lines | Medium | Medium | ✅ Done |
-| 9 | 5A — Texture mapping | Medium | Medium | — UVs buffered but unused |
+| 9 | 5A — Texture mapping | Medium | Medium | ✅ Done |
 | 10 | 3B/3C — Round/miter joins | Large | Low | — niche line styles |
 | 11 | 6A — GPU tessellation | Large | Medium | — moves work off CPU |
 | 12 | 8A — MSAA | Medium | Medium | — anti-aliasing |

@@ -83,6 +83,7 @@ struct VertexOut {
   float3 viewPos;
   float3 viewNormal;
   float4 vertexColor;    // P1-1A: per-vertex color from scalar mapping
+  float2 uv;             // P5-5A: texture coordinates
   float4 clipDistances;  // P1-6: clip plane distances (x,y,z,w for planes 0-3)
   uint cellId;           // P2-8: flat-interpolated cell ID (1-based, 0=background)
   uint propId;           // P2-8: flat-interpolated prop ID (1-based, 0=background)
@@ -104,7 +105,8 @@ vertex VertexOut vertex_main(uint vertex_id [[vertex_id]],
                              constant float4* vertexColors [[buffer(3)]],
                              constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
                              constant uint* cellIds [[buffer(6)]],
-                             constant uint& propId [[buffer(7)]]) {
+                             constant uint& propId [[buffer(7)]],
+                             constant float2* triangleUVs [[buffer(8)]]) {
   VertexOut out;
 
   float4 worldPos = scene.modelMatrix * float4(in.position, 1.0);
@@ -117,6 +119,9 @@ vertex VertexOut vertex_main(uint vertex_id [[vertex_id]],
 
   // P1-1A: per-vertex color from scalar mapping
   out.vertexColor = vertexColors[vertex_id];
+
+  // P5-5A: texture coordinates
+  out.uv = triangleUVs[vertex_id];
 
   // P1-6: compute clip distances for up to 4 planes
   out.clipDistances = float4(
@@ -141,7 +146,9 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
                               constant LightUniforms& lights [[buffer(1)]],
                               constant SceneUniforms& scene [[buffer(2)]],
                               constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
-                              constant ClipPlaneUniforms& clipPlanes [[buffer(5)]]) {
+                              constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
+                              texture2d<float> actorTexture [[texture(0)]],
+                              sampler actorSampler [[sampler(0)]]) {
   // P1-6: discard fragments outside clip planes
   if (clipPlanes.numClipPlanes > 0 && in.clipDistances.x < 0.0) discard_fragment();
   if (clipPlanes.numClipPlanes > 1 && in.clipDistances.y < 0.0) discard_fragment();
@@ -158,6 +165,16 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
   float diffuseIntensity = material.diffuseColor.w;
   float3 specularColor = material.specularColor.rgb;
   float specularIntensity = material.specularColor.w;
+  float baseOpacity = hasVertexColors ? in.vertexColor.a : material.opacity;
+
+  // P5-5A: texture sampling — when bit 9 is set, multiply colors by texture sample
+  bool hasTexture = (scene.flags & (1u << 9)) != 0u;
+  if (hasTexture) {
+    float4 texColor = actorTexture.sample(actorSampler, in.uv);
+    ambientColor *= texColor.rgb;
+    diffuseColor *= texColor.rgb;
+    baseOpacity *= texColor.a;
+  }
 
   float3 totalAmbient = ambientIntensity * ambientColor;
   float3 totalDiffuse = float3(0.0);
@@ -215,7 +232,6 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
   }
 
   FragmentOutput out;
-  float baseOpacity = hasVertexColors ? in.vertexColor.a : material.opacity;
   out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, baseOpacity);
   out.ids = uint4(in.cellId, in.propId, 1u, 0u);  // P2-8: {cell, prop, composite=1, process=0}
   // Coincident topology offset for polygons — matches WebGPU

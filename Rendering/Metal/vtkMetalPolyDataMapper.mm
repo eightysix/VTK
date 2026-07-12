@@ -32,6 +32,7 @@
 #include "vtkNew.h"
 #include "vtkPlaneCollection.h"
 #include "vtkPlane.h"
+#include "vtkTexture.h"
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -57,8 +58,18 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLBuffer> SurfaceColorBuffer = nil;
   bool HasSurfaceColors = false;
 
+  // P5-5A: texture coordinates for triangles (float2 per vertex)
+  id<MTLBuffer> TriangleUVBuffer = nil;
+
   id<MTLRenderPipelineState> TrianglePipeline = nil;
   id<MTLRenderPipelineState> LinePipeline = nil;
+
+  // P5-5A: Actor texture and sampler for texture mapping
+  id<MTLTexture> ActorTexture = nil;
+  id<MTLSamplerState> ActorSampler = nil;
+  id<MTLTexture> DefaultTexture = nil;   // 1x1 white fallback
+  id<MTLSamplerState> DefaultSampler = nil;
+  vtkIdType CachedTextureMTime = 0;
 
   // Point geometry — separate buffers so points can draw independently
   id<MTLBuffer> PointPositionBuffer = nil;   // float3 per point
@@ -134,6 +145,12 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     LineIndexBuffer = nil;
     SurfaceColorBuffer = nil;
     HasSurfaceColors = false;
+    TriangleUVBuffer = nil;
+    ActorTexture = nil;
+    ActorSampler = nil;
+    DefaultTexture = nil;
+    DefaultSampler = nil;
+    CachedTextureMTime = 0;
     TrianglePipeline = nil;
     LinePipeline = nil;
 
@@ -325,6 +342,14 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     this->UpdateCoincidentOffsetUniforms((__bridge void*)device, act);
     this->UpdateVertexColorUniforms((__bridge void*)device, act);
     this->UpdateClipPlaneUniforms((__bridge void*)device, act);
+    this->UpdateActorTexture((__bridge void*)device, act);
+
+    // P5-5A: Set texture flag (bit 9) in scene uniforms when actor has a texture
+    if (this->Internals->ActorTexture)
+    {
+      char* buf = static_cast<char*>([this->Internals->SceneUniformBuffer contents]);
+      *reinterpret_cast<uint32_t*>(buf + 256) |= (1u << 9);
+    }
 
     // P2-2A: Skip triangle drawing when in wireframe mode
     bool skipTriangles = (representation == VTK_WIREFRAME);
@@ -375,6 +400,58 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       if (this->Internals->PropIdBuffer)
       {
         [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:7];
+      }
+
+      // P5-5A: Bind UV buffer and texture/sampler for texture mapping
+      if (this->Internals->TriangleUVBuffer)
+      {
+        [encoder setVertexBuffer:this->Internals->TriangleUVBuffer offset:0 atIndex:8];
+      }
+
+      // P5-5A: Bind texture and sampler — use actor texture or default 1x1 white
+      {
+        id<MTLTexture> texToBind = this->Internals->ActorTexture;
+        id<MTLSamplerState> samplerToBind = this->Internals->ActorSampler;
+
+        if (!texToBind)
+        {
+          // Create default 1x1 white texture and sampler lazily
+          if (!this->Internals->DefaultTexture)
+          {
+            MTLTextureDescriptor* desc = [MTLTextureDescriptor
+              texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                         width:1
+                                        height:1
+                                     mipmapped:NO];
+            desc.usage = MTLTextureUsageShaderRead;
+            desc.storageMode = MTLStorageModeShared;
+            this->Internals->DefaultTexture = [device newTextureWithDescriptor:desc];
+            unsigned char white[4] = { 255, 255, 255, 255 };
+            MTLRegion region = MTLRegionMake2D(0, 0, 1, 1);
+            [this->Internals->DefaultTexture replaceRegion:region
+                                              mipmapLevel:0
+                                                withBytes:white
+                                              bytesPerRow:4];
+          }
+          if (!this->Internals->DefaultSampler)
+          {
+            MTLSamplerDescriptor* sDesc = [[MTLSamplerDescriptor alloc] init];
+            sDesc.minFilter = MTLSamplerMinMagFilterLinear;
+            sDesc.magFilter = MTLSamplerMinMagFilterLinear;
+            this->Internals->DefaultSampler = [device newSamplerStateWithDescriptor:sDesc];
+          }
+          texToBind = this->Internals->DefaultTexture;
+          samplerToBind = this->Internals->DefaultSampler;
+        }
+
+        if (texToBind)
+        {
+          [encoder setFragmentTexture:texToBind atIndex:0];
+        }
+        if (samplerToBind)
+        {
+          [encoder setFragmentSamplerState:samplerToBind atIndex:0];
+        }
       }
 
       // P1-1C: set backface/frontface cull mode
@@ -516,6 +593,57 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         if (this->Internals->PropIdBuffer)
         {
           [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:7];
+        }
+
+        // P5-5A: Bind UV buffer and texture/sampler for line texture mapping
+        if (this->Internals->TriangleUVBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->TriangleUVBuffer offset:0 atIndex:8];
+        }
+
+        // P5-5A: Bind texture and sampler for lines — use actor texture or default 1x1 white
+        {
+          id<MTLTexture> texToBind = this->Internals->ActorTexture;
+          id<MTLSamplerState> samplerToBind = this->Internals->ActorSampler;
+
+          if (!texToBind)
+          {
+            if (!this->Internals->DefaultTexture)
+            {
+              MTLTextureDescriptor* desc = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                           width:1
+                                          height:1
+                                       mipmapped:NO];
+              desc.usage = MTLTextureUsageShaderRead;
+              desc.storageMode = MTLStorageModeShared;
+              this->Internals->DefaultTexture = [device newTextureWithDescriptor:desc];
+              unsigned char white[4] = { 255, 255, 255, 255 };
+              MTLRegion region = MTLRegionMake2D(0, 0, 1, 1);
+              [this->Internals->DefaultTexture replaceRegion:region
+                                                mipmapLevel:0
+                                                  withBytes:white
+                                                bytesPerRow:4];
+            }
+            if (!this->Internals->DefaultSampler)
+            {
+              MTLSamplerDescriptor* sDesc = [[MTLSamplerDescriptor alloc] init];
+              sDesc.minFilter = MTLSamplerMinMagFilterLinear;
+              sDesc.magFilter = MTLSamplerMinMagFilterLinear;
+              this->Internals->DefaultSampler = [device newSamplerStateWithDescriptor:sDesc];
+            }
+            texToBind = this->Internals->DefaultTexture;
+            samplerToBind = this->Internals->DefaultSampler;
+          }
+
+          if (texToBind)
+          {
+            [encoder setFragmentTexture:texToBind atIndex:0];
+          }
+          if (samplerToBind)
+          {
+            [encoder setFragmentSamplerState:samplerToBind atIndex:0];
+          }
         }
 
         [encoder setCullMode:MTLCullModeNone];
@@ -889,6 +1017,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   std::vector<float> positions;
   std::vector<float> normals;
   std::vector<float> surfaceColors;  // P1-1A/1B: float4 per vertex
+  std::vector<float> triangleUVs;    // P5-5A: float2 per vertex
   std::vector<uint32_t> lineIndices;
 
   // P2-2C: Triangle index buffers — deduplicated vertices + index buffer
@@ -915,6 +1044,13 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   if (pd->GetNormals())
   {
     normalArray = vtkFloatArray::SafeDownCast(pd->GetNormals());
+  }
+
+  // P5-5A: texture coordinate array
+  vtkFloatArray* tcoordArray = nullptr;
+  if (pd->GetTCoords())
+  {
+    tcoordArray = vtkFloatArray::SafeDownCast(pd->GetTCoords());
   }
 
   // P1-1A/1B: MapScalars early so both triangle and line paths can use the result.
@@ -975,6 +1111,19 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
               normals.push_back(static_cast<float>(n[1]));
               normals.push_back(static_cast<float>(n[2]));
             }
+            // P5-5A: UV for wireframe vertex
+            if (tcoordArray && tcoordArray->GetNumberOfTuples() > v0)
+            {
+              double uv[3];
+              tcoordArray->GetTuple(v0, uv);
+              triangleUVs.push_back(static_cast<float>(uv[0]));
+              triangleUVs.push_back(static_cast<float>(uv[1]));
+            }
+            else
+            {
+              triangleUVs.push_back(0.0f);
+              triangleUVs.push_back(0.0f);
+            }
             // Color for wireframe vertex
             if (mappedColors)
             {
@@ -1018,6 +1167,19 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
               normals.push_back(static_cast<float>(n[0]));
               normals.push_back(static_cast<float>(n[1]));
               normals.push_back(static_cast<float>(n[2]));
+            }
+            // P5-5A: UV for wireframe vertex
+            if (tcoordArray && tcoordArray->GetNumberOfTuples() > v1)
+            {
+              double uv[3];
+              tcoordArray->GetTuple(v1, uv);
+              triangleUVs.push_back(static_cast<float>(uv[0]));
+              triangleUVs.push_back(static_cast<float>(uv[1]));
+            }
+            else
+            {
+              triangleUVs.push_back(0.0f);
+              triangleUVs.push_back(0.0f);
             }
             // Color for wireframe vertex
             if (mappedColors)
@@ -1109,6 +1271,20 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                   surfaceColors.push_back(1.0f);
                   surfaceColors.push_back(1.0f);
                 }
+
+                // P5-5A: texture coordinates for indexed triangle vertex
+                if (tcoordArray && tcoordArray->GetNumberOfTuples() > tri[j])
+                {
+                  double uv[3];
+                  tcoordArray->GetTuple(tri[j], uv);
+                  triangleUVs.push_back(static_cast<float>(uv[0]));
+                  triangleUVs.push_back(static_cast<float>(uv[1]));
+                }
+                else
+                {
+                  triangleUVs.push_back(0.0f);
+                  triangleUVs.push_back(0.0f);
+                }
               }
             }
           }
@@ -1172,6 +1348,20 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                 surfaceColors.push_back(1.0f);
                 surfaceColors.push_back(1.0f);
                 surfaceColors.push_back(1.0f);
+              }
+
+              // P5-5A: texture coordinates for non-indexed triangle vertex
+              if (tcoordArray && tcoordArray->GetNumberOfTuples() > tri[j])
+              {
+                double uv[3];
+                tcoordArray->GetTuple(tri[j], uv);
+                triangleUVs.push_back(static_cast<float>(uv[0]));
+                triangleUVs.push_back(static_cast<float>(uv[1]));
+              }
+              else
+              {
+                triangleUVs.push_back(0.0f);
+                triangleUVs.push_back(0.0f);
               }
             }
           }
@@ -1314,6 +1504,19 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
           surfaceColors.push_back(cg);
           surfaceColors.push_back(cb);
           surfaceColors.push_back(ca);
+          // P5-5A: UV for line vertex (cell coloring path)
+          if (tcoordArray && tcoordArray->GetNumberOfTuples() > pts[i])
+          {
+            double uv[3];
+            tcoordArray->GetTuple(pts[i], uv);
+            triangleUVs.push_back(static_cast<float>(uv[0]));
+            triangleUVs.push_back(static_cast<float>(uv[1]));
+          }
+          else
+          {
+            triangleUVs.push_back(0.0f);
+            triangleUVs.push_back(0.0f);
+          }
         }
         uint32_t base = nextPointId;
         nextPointId += npts;
@@ -1370,6 +1573,19 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
               surfaceColors.push_back(1.0f);
               surfaceColors.push_back(1.0f);
               surfaceColors.push_back(1.0f);
+            }
+            // P5-5A: UV for line vertex (point coloring path)
+            if (tcoordArray && tcoordArray->GetNumberOfTuples() > pts[i])
+            {
+              double uv[3];
+              tcoordArray->GetTuple(pts[i], uv);
+              triangleUVs.push_back(static_cast<float>(uv[0]));
+              triangleUVs.push_back(static_cast<float>(uv[1]));
+            }
+            else
+            {
+              triangleUVs.push_back(0.0f);
+              triangleUVs.push_back(0.0f);
             }
           }
         }
@@ -1479,6 +1695,24 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     this->Internals->SurfaceColorBuffer = [device
       newBufferWithBytes:whiteColors.data()
                  length:whiteColors.size() * sizeof(float)
+                options:MTLResourceStorageModeShared];
+  }
+
+  // P5-5A: Create triangle UV buffer (float2 per triangle/line vertex)
+  if (!triangleUVs.empty())
+  {
+    this->Internals->TriangleUVBuffer = [device
+      newBufferWithBytes:triangleUVs.data()
+                 length:triangleUVs.size() * sizeof(float)
+                options:MTLResourceStorageModeShared];
+  }
+  else if (!positions.empty())
+  {
+    // Always provide a zero UV buffer so the vertex shader can always read from buffer(8)
+    std::vector<float> zeroUVs(positions.size() / 3 * 2, 0.0f);
+    this->Internals->TriangleUVBuffer = [device
+      newBufferWithBytes:zeroUVs.data()
+                 length:zeroUVs.size() * sizeof(float)
                 options:MTLResourceStorageModeShared];
   }
 
@@ -2433,6 +2667,139 @@ void vtkMetalPolyDataMapper::UpdateClipPlaneUniforms(void* mtlDevice, vtkActor* 
                  options:MTLResourceStorageModeShared];
   }
   memcpy([this->Internals->ClipPlaneBuffer contents], cp, sizeof(cp));
+}
+
+//------------------------------------------------------------------------------
+// P5-5A: Create Metal texture from actor's vtkTexture
+void vtkMetalPolyDataMapper::UpdateActorTexture(void* mtlDevice, vtkActor* actor)
+{
+  if (!mtlDevice || !actor)
+  {
+    return;
+  }
+
+  id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
+
+  vtkTexture* texture = actor->GetTexture();
+  if (!texture || !texture->GetInput())
+  {
+    this->Internals->ActorTexture = nil;
+    this->Internals->ActorSampler = nil;
+    return;
+  }
+
+  // Check if texture has changed
+  vtkIdType texMTime = texture->GetMTime();
+  if (this->Internals->ActorTexture && texMTime == this->Internals->CachedTextureMTime)
+  {
+    return; // texture hasn't changed
+  }
+  this->Internals->CachedTextureMTime = texMTime;
+
+  vtkImageData* image = texture->GetInput();
+  int extent[6];
+  image->GetExtent(extent);
+  int width = extent[1] - extent[0] + 1;
+  int height = extent[3] - extent[2] + 1;
+  int numComponents = image->GetNumberOfScalarComponents();
+
+  if (width <= 0 || height <= 0)
+  {
+    this->Internals->ActorTexture = nil;
+    this->Internals->ActorSampler = nil;
+    return;
+  }
+
+  // Determine pixel format — convert to RGBA8Unorm for simplicity
+  MTLPixelFormat pixelFormat = MTLPixelFormatRGBA8Unorm;
+
+  // Create texture descriptor
+  MTLTextureDescriptor* texDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
+                                                                                     width:width
+                                                                                    height:height
+                                                                                 mipmapped:NO];
+  texDesc.usage = MTLTextureUsageShaderRead;
+  texDesc.storageMode = MTLStorageModeShared;
+
+  this->Internals->ActorTexture = [device newTextureWithDescriptor:texDesc];
+  if (!this->Internals->ActorTexture)
+  {
+    vtkErrorMacro(<< "Failed to create Metal texture");
+    return;
+  }
+
+  // Convert image data to RGBA8 and upload
+  unsigned char* rgbaData = new unsigned char[width * height * 4];
+  vtkDataArray* scalars = image->GetPointData()->GetScalars();
+  if (!scalars)
+  {
+    delete[] rgbaData;
+    this->Internals->ActorTexture = nil;
+    return;
+  }
+
+  for (int y = 0; y < height; ++y)
+  {
+    for (int x = 0; x < width; ++x)
+    {
+      int srcIdx = (y * width + x) * numComponents;
+      int dstIdx = (y * width + x) * 4;
+      unsigned char* dst = rgbaData + dstIdx;
+
+      switch (numComponents)
+      {
+        case 1:
+          dst[0] = dst[1] = dst[2] = static_cast<unsigned char*>(scalars->GetVoidPointer(0))[srcIdx];
+          dst[3] = 255;
+          break;
+        case 2:
+        {
+          unsigned char* src = static_cast<unsigned char*>(scalars->GetVoidPointer(0)) + srcIdx;
+          dst[0] = dst[1] = dst[2] = src[0];
+          dst[3] = src[1];
+          break;
+        }
+        case 3:
+        {
+          unsigned char* src = static_cast<unsigned char*>(scalars->GetVoidPointer(0)) + srcIdx;
+          dst[0] = src[0];
+          dst[1] = src[1];
+          dst[2] = src[2];
+          dst[3] = 255;
+          break;
+        }
+        case 4:
+        {
+          unsigned char* src = static_cast<unsigned char*>(scalars->GetVoidPointer(0)) + srcIdx;
+          dst[0] = src[0];
+          dst[1] = src[1];
+          dst[2] = src[2];
+          dst[3] = src[3];
+          break;
+        }
+        default:
+          dst[0] = dst[1] = dst[2] = dst[3] = 255;
+          break;
+      }
+    }
+  }
+
+  // Upload texture data
+  MTLRegion region = MTLRegionMake2D(0, 0, width, height);
+  [this->Internals->ActorTexture replaceRegion:region
+                                mipmapLevel:0
+                                  withBytes:rgbaData
+                                bytesPerRow:width * 4];
+
+  delete[] rgbaData;
+
+  // Create sampler state
+  MTLSamplerDescriptor* samplerDesc = [[MTLSamplerDescriptor alloc] init];
+  samplerDesc.sAddressMode = MTLSamplerAddressModeRepeat;
+  samplerDesc.tAddressMode = MTLSamplerAddressModeRepeat;
+  samplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
+  samplerDesc.magFilter = MTLSamplerMinMagFilterLinear;
+  this->Internals->ActorSampler = [device newSamplerStateWithDescriptor:samplerDesc];
 }
 
 VTK_ABI_NAMESPACE_END
