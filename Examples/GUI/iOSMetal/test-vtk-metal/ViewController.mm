@@ -3,6 +3,8 @@
 #import "CubeViewController.h"
 #import "ConeViewController.h"
 #import "VolumeViewController.h"
+#import "DICOMVolumeViewController.h"
+#import "NIFTIVolumeViewController.h"
 
 @implementation ViewController
 
@@ -25,8 +27,18 @@
                                                        image:nil
                                                          tag:2];
 
+  DICOMVolumeViewController* dicomVC = [[DICOMVolumeViewController alloc] init];
+  dicomVC.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"DICOM"
+                                                      image:nil
+                                                        tag:3];
+
+  NIFTIVolumeViewController* niftiVC = [[NIFTIVolumeViewController alloc] init];
+  niftiVC.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"NIfTI"
+                                                      image:nil
+                                                        tag:4];
+
   UITabBarController* tabBar = [[UITabBarController alloc] init];
-  tabBar.viewControllers = @[ cubeVC, coneVC, volumeVC ];
+  tabBar.viewControllers = @[ cubeVC, coneVC, volumeVC, dicomVC, niftiVC ];
   tabBar.view.frame = self.view.bounds;
   tabBar.view.autoresizingMask =
     UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
