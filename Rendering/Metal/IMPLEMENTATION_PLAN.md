@@ -240,18 +240,15 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 **Files**:
 - `vtkMetalPolyDataMapper.mm` — `RenderBundleDrawCommand`, `RenderBundle` structs, `ReplayRenderBundle()`, `RebuildRenderBundle()`, bundle validity tracking fields, modified `RenderPiece()` to use bundle
 
-### 8D. Vertex Attribute Mapping
+### 8D. Vertex Attribute Mapping ✅
+
+**Status**: Implemented. `MapDataArrayToVertexAttribute()` stores mappings in an `ExtraAttributes` map (attribute name → data array name, field association, component number). `RemoveVertexAttributeMapping()` and `RemoveAllVertexAttributeMappings()` clear entries and invalidate the render bundle. In `BuildGeometryBuffers()`, each mapped data array is looked up from point/cell data, converted to float, and uploaded as a per-point `MTLBuffer`. Extra attribute buffers are bound at buffer indices 16+ in `RebuildRenderBundle()`, making them accessible to custom Metal shaders via `[[buffer(N)]]`.
 
 **Files**:
-- `vtkMetalPolyDataMapper.h/.mm` — `MapDataArrayToVertexAttribute()`, `RemoveVertexAttributeMapping()`
+- `vtkMetalPolyDataMapper.h` — `ExtraAttributeValue` struct, `ExtraAttributes` map, `MapDataArrayToVertexAttribute()`, `RemoveVertexAttributeMapping()`, `RemoveAllVertexAttributeMappings()` declarations
+- `vtkMetalPolyDataMapper.mm` — method implementations, extra attribute buffer creation in `BuildGeometryBuffers()`, buffer binding in `RebuildRenderBundle()` at indices 16+, cleanup in `ReleaseBuffers()`
 
-**Implementation**:
-1. Maintain a map of custom vertex attribute names → data arrays.
-2. In `BuildGeometryBuffers()`, create additional vertex buffers for custom attributes.
-3. Extend vertex descriptor with additional buffer slots.
-4. Pass custom attributes through to shaders via a generic mechanism.
-
-**WebGPU reference**: `MapDataArrayToVertexAttribute()` stores mappings, `UploadAttributeToGPUBuffer()` handles upload.
+**WebGPU reference**: `MapDataArrayToVertexAttribute()` stores mappings, `UploadAttributeToGPUBuffer()` handles upload. WebGPU implementation is currently a stub.
 
 ---
 
@@ -277,7 +274,7 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 | 16 | 8B — Depth peeling | Large | Low | ✅ Done |
 | 17 | 7D — Glyph3D mapper | Large | Low | ✅ Done |
 | 18 | 8C — Render bundles | Large | Low | ✅ Done |
-| 19 | 8D — Vertex attribute mapping | Medium | Low | — custom attributes |
+| 19 | 8D — Vertex attribute mapping | Medium | Low | ✅ Done |
 
 ---
 

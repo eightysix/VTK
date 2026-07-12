@@ -7,7 +7,9 @@
 #include "vtkRenderingMetalModule.h"
 #include "vtkWrappingHints.h"
 
+#include <map>
 #include <memory>
+#include <string>
 
 VTK_ABI_NAMESPACE_BEGIN
 class vtkOverrideAttribute;
@@ -25,6 +27,21 @@ public:
   void RenderPiece(vtkRenderer* renderer, vtkActor* actor) override;
   void ReleaseGraphicsResources(vtkWindow*) override;
   MapperHashType GenerateHash(vtkPolyData* polydata) override;
+
+  // 8D: Vertex attribute mapping — map VTK data arrays to generic vertex attributes
+  void MapDataArrayToVertexAttribute(const char* vertexAttributeName,
+    const char* dataArrayName,
+    int fieldAssociation,
+    int componentno = -1) override;
+  void RemoveVertexAttributeMapping(const char* vertexAttributeName) override;
+  void RemoveAllVertexAttributeMappings() override;
+
+  struct ExtraAttributeValue
+  {
+    std::string DataArrayName;
+    int FieldAssociation; // vtkDataObject::FIELD_ASSOCIATION_POINTS or _CELLS
+    int ComponentNumber;  // -1 = all components
+  };
 
 protected:
   vtkMetalPolyDataMapper();
@@ -45,6 +62,9 @@ protected:
   void UpdateClipPlaneUniforms(void* mtlDevice, vtkActor* actor);
   void UpdateActorTexture(void* mtlDevice, vtkActor* actor);
   void EnsurePeelPipelineStates(void* mtlDevice);
+
+  // 8D: Vertex attribute mappings (attribute name → data source)
+  std::map<std::string, ExtraAttributeValue> ExtraAttributes;
 
   // 8C: Render bundle caching — pre-recorded encoder commands for static geometry
   void ReplayRenderBundle(void* mtlRenderCommandEncoder);

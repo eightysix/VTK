@@ -33,6 +33,7 @@
 #include "vtkPlaneCollection.h"
 #include "vtkPlane.h"
 #include "vtkTexture.h"
+#include "vtkDataObject.h"
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -155,6 +156,10 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLRenderPipelineState> TriangleInitPeelPipeline = nil;  // init depth range
   id<MTLRenderPipelineState> TrianglePeelPipeline = nil;      // main peel pass
   id<MTLBuffer> PeelUniformBuffer = nil;                       // peel mode + pass index
+
+  // 8D: Vertex attribute mapping — custom per-vertex buffers from user-mapped data arrays
+  std::unordered_map<std::string, id<MTLBuffer>> ExtraAttributeBuffers;
+  std::unordered_map<std::string, int> ExtraAttributeComponentCounts;
 
   vtkIdType CachedInputMTime = 0;
   int CachedRepresentation = -1;
@@ -345,6 +350,10 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     TrianglePeelPipeline = nil;
     PeelUniformBuffer = nil;
 
+    // 8D: Extra attribute buffers
+    ExtraAttributeBuffers.clear();
+    ExtraAttributeComponentCounts.clear();
+
     // 8C: Render bundle invalidation — geometry changed, cached commands are stale
     InvalidateRenderBundle();
     BundleGeometryMTime = 0;
@@ -381,6 +390,68 @@ vtkMetalPolyDataMapper::MapperHashType vtkMetalPolyDataMapper::GenerateHash(vtkP
 void vtkMetalPolyDataMapper::ReleaseGraphicsResources(vtkWindow*)
 {
   this->Internals->ReleaseBuffers();
+}
+
+//------------------------------------------------------------------------------
+// 8D: Vertex attribute mapping — map VTK data arrays to generic vertex attributes.
+// Follows the same pattern as vtkOpenGLPolyDataMapper: stores mappings and creates
+// per-point GPU buffers that are bound at buffer indices 16+ for custom shaders.
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::MapDataArrayToVertexAttribute(
+  const char* vertexAttributeName,
+  const char* dataArrayName,
+  int fieldAssociation,
+  int componentno)
+{
+  if (!vertexAttributeName)
+  {
+    return;
+  }
+
+  // Remove existing mapping for this attribute name
+  this->RemoveVertexAttributeMapping(vertexAttributeName);
+  if (!dataArrayName)
+  {
+    return;
+  }
+
+  ExtraAttributeValue aval;
+  aval.DataArrayName = dataArrayName;
+  aval.FieldAssociation = fieldAssociation;
+  aval.ComponentNumber = componentno;
+
+  this->ExtraAttributes.insert(std::make_pair(vertexAttributeName, aval));
+
+  this->Internals->InvalidateRenderBundle();
+  this->Modified();
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::RemoveVertexAttributeMapping(const char* vertexAttributeName)
+{
+  if (!vertexAttributeName)
+  {
+    return;
+  }
+  auto itr = this->ExtraAttributes.find(vertexAttributeName);
+  if (itr != this->ExtraAttributes.end())
+  {
+    this->ExtraAttributes.erase(itr);
+    this->Internals->InvalidateRenderBundle();
+    this->Modified();
+  }
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::RemoveAllVertexAttributeMappings()
+{
+  if (this->ExtraAttributes.empty())
+  {
+    return;
+  }
+  this->ExtraAttributes.clear();
+  this->Internals->InvalidateRenderBundle();
+  this->Modified();
 }
 
 //------------------------------------------------------------------------------
@@ -591,6 +662,18 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
     if (this->Internals->TriangleUVBuffer)
     {
       recordVBuf(this->Internals->TriangleUVBuffer, 0, 8);
+    }
+    // 8D: Bind extra attribute buffers at buffer indices 16+
+    {
+      NSUInteger extraIdx = 16;
+      for (auto& eab : this->Internals->ExtraAttributeBuffers)
+      {
+        if (eab.second)
+        {
+          recordVBuf(eab.second, 0, extraIdx);
+        }
+        extraIdx++;
+      }
     }
     {
       id<MTLTexture> texToBind = this->Internals->ActorTexture;
@@ -2618,6 +2701,55 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       newBufferWithBytes:zeroUVs.data()
                  length:zeroUVs.size() * sizeof(float)
                 options:MTLResourceStorageModeShared];
+  }
+
+  // 8D: Create extra attribute buffers from user-mapped data arrays.
+  // Each attribute gets a per-point buffer (works correctly for indexed/deduplicated
+  // rendering where vertex count == point count). Buffers are bound at indices 16+
+  // in the render bundle for access by custom shaders.
+  for (auto& itr : this->ExtraAttributes)
+  {
+    vtkDataArray* da = nullptr;
+    if (itr.second.FieldAssociation == vtkDataObject::FIELD_ASSOCIATION_POINTS)
+    {
+      da = polydata->GetPointData()->GetArray(itr.second.DataArrayName.c_str());
+    }
+    else if (itr.second.FieldAssociation == vtkDataObject::FIELD_ASSOCIATION_CELLS)
+    {
+      da = polydata->GetCellData()->GetArray(itr.second.DataArrayName.c_str());
+    }
+    if (!da)
+    {
+      continue;
+    }
+
+    int numComps = da->GetNumberOfComponents();
+    int comp = itr.second.ComponentNumber;
+    int effectiveComps = (comp < 0) ? numComps : 1;
+    vtkIdType numTuples = da->GetNumberOfTuples();
+
+    std::vector<float> attrData(numTuples * effectiveComps);
+    for (vtkIdType i = 0; i < numTuples; ++i)
+    {
+      if (comp < 0)
+      {
+        double* tuple = da->GetTuple(i);
+        for (int c = 0; c < numComps; ++c)
+        {
+          attrData[i * numComps + c] = static_cast<float>(tuple[c]);
+        }
+      }
+      else
+      {
+        attrData[i] = static_cast<float>(da->GetComponent(i, comp));
+      }
+    }
+
+    this->Internals->ExtraAttributeBuffers[itr.first] = [device
+      newBufferWithBytes:attrData.data()
+                 length:attrData.size() * sizeof(float)
+                options:MTLResourceStorageModeShared];
+    this->Internals->ExtraAttributeComponentCounts[itr.first] = effectiveComps;
   }
 
   // P6-6A: When GPU tessellation produced edge overlay, assign edge vertex buffers
