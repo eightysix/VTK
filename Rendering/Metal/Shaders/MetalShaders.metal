@@ -1755,3 +1755,423 @@ fragment float4 fragment_peel_back_blend(
   // BackTemp is already premultiplied, pass through for over-blending
   return backTemp;
 }
+
+// ---------------------------------------------------------------------------
+// P7-7D: Glyph3D instanced rendering
+//
+// Vertex function that renders source geometry (triangles) with per-instance
+// glyph transforms, colors, and pick IDs. Each instance is a glyph placed at
+// an input point with optional scaling, rotation, and color.
+//
+// Source geometry (per-vertex):
+//   buffer(0) = positions (float3)
+//   buffer(1) = normals (float3)
+//
+// Instance data (per-instance, stepFunctionPerInstance):
+//   buffer(2)  = glyph transforms (float4x4 per instance, column-major)
+//   buffer(3)  = glyph normal transforms (float3x3 per instance, column-major)
+//   buffer(4)  = glyph colors (float4 per instance, RGBA)
+//   buffer(5)  = glyph pick IDs (uint per instance)
+//
+// Uniforms:
+//   buffer(8)  = SceneUniforms (vertex + fragment)
+//   buffer(9)  = ClipPlaneUniforms (vertex + fragment)
+//
+// Fragment uniforms:
+//   buffer(0)  = MaterialUniforms
+//   buffer(1)  = LightUniforms
+//   buffer(2)  = SceneUniforms (shared with vertex)
+//   buffer(3)  = CoincidentOffsetUniforms
+//   buffer(9)  = ClipPlaneUniforms (shared with vertex)
+// ---------------------------------------------------------------------------
+
+struct GlyphVertexOut {
+  float4 position [[position]];
+  float3 viewPos;
+  float3 viewNormal;
+  float4 glyphColor;
+  float4 clipDistances;
+  uint cellId;
+  uint propId;
+};
+
+vertex GlyphVertexOut vertex_glyph_main(
+    uint vertex_id [[vertex_id]],
+    uint instance_id [[instance_id]],
+    constant float3* positions [[buffer(0)]],
+    constant float3* normals [[buffer(1)]],
+    constant float4x4* glyphTransforms [[buffer(2)]],
+    constant float3x3* glyphNormalTransforms [[buffer(3)]],
+    constant float4* glyphColors [[buffer(4)]],
+    constant uint* glyphPickIds [[buffer(5)]],
+    constant SceneUniforms& scene [[buffer(8)]],
+    constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
+    constant uint& propId [[buffer(10)]]) {
+  GlyphVertexOut out;
+
+  float3 pos = positions[vertex_id];
+  float3 norm = normals[vertex_id];
+
+  float4x4 glyphTransform = glyphTransforms[instance_id];
+  float3x3 normalTransform = glyphNormalTransforms[instance_id];
+
+  float4 worldPos = scene.modelMatrix * glyphTransform * float4(pos, 1.0);
+  float4 viewPos = scene.viewMatrix * worldPos;
+  out.viewPos = viewPos.xyz;
+  out.position = scene.projectionMatrix * viewPos;
+  out.viewNormal = scene.normalMatrix * normalTransform * norm;
+  out.glyphColor = glyphColors[instance_id];
+  out.cellId = glyphPickIds[instance_id] + 1u;
+  out.propId = propId + 1u;
+
+  out.clipDistances = float4(
+    dot(float4(pos, 1.0), clipPlanes.planes[0]),
+    dot(float4(pos, 1.0), clipPlanes.planes[1]),
+    dot(float4(pos, 1.0), clipPlanes.planes[2]),
+    dot(float4(pos, 1.0), clipPlanes.planes[3]));
+
+  return out;
+}
+
+fragment FragmentOutput fragment_glyph_main(
+    GlyphVertexOut in [[stage_in]],
+    constant MaterialUniforms& material [[buffer(0)]],
+    constant LightUniforms& lights [[buffer(1)]],
+    constant SceneUniforms& scene [[buffer(2)]],
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+    constant ClipPlaneUniforms& clipPlanes [[buffer(9)]]) {
+  if (clipPlanes.numClipPlanes > 0 && in.clipDistances.x < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 1 && in.clipDistances.y < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 2 && in.clipDistances.z < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 3 && in.clipDistances.w < 0.0) discard_fragment();
+
+  float3 N = normalize(in.viewNormal);
+  float3 ambientColor = in.glyphColor.rgb;
+  float ambientIntensity = material.ambientColor.w;
+  float3 diffuseColor = in.glyphColor.rgb;
+  float diffuseIntensity = material.diffuseColor.w;
+  float3 specularColor = material.specularColor.rgb;
+  float specularIntensity = material.specularColor.w;
+  float baseOpacity = in.glyphColor.a;
+
+  float3 totalAmbient = ambientIntensity * ambientColor;
+  float3 totalDiffuse = float3(0.0);
+  float3 totalSpecular = float3(0.0);
+  float3 viewDir = normalize(-in.viewPos);
+
+  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
+    Light L = lights.lights[i];
+    int lightType = int(L.position.w);
+    float3 lightColor = L.color.rgb * L.color.w;
+    float attenuation = 1.0;
+    float df = 0.0;
+    float3 reflDir = float3(0.0);
+    float3 toLight = float3(0.0);
+
+    if (lightType == 0) {
+      toLight = float3(0.0, 0.0, 1.0);
+      df = max(N.z, 0.000001);
+      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
+    } else if (lightType == 1) {
+      toLight = normalize(-L.direction.xyz);
+      df = max(dot(N, toLight), 0.0);
+      reflDir = reflect(L.direction.xyz, N);
+    } else {
+      toLight = L.position.xyz - in.viewPos;
+      float dist = length(toLight);
+      toLight /= dist;
+      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
+      df = max(dot(N, toLight), 0.0);
+      reflDir = reflect(-toLight, N);
+      if (lightType == 3) {
+        float3 spotDir = normalize(L.direction.xyz);
+        float spotCos = dot(-toLight, spotDir);
+        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
+        if (spotCos > spotCutoff) {
+          attenuation *= pow(spotCos, L.attenuation.w);
+        } else {
+          attenuation = 0.0;
+        }
+      }
+    }
+    totalDiffuse += df * diffuseColor * lightColor * attenuation;
+    float NdotL = max(dot(N, toLight), 0.0);
+    if (NdotL > 0.0) {
+      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
+      totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
+    }
+  }
+
+  FragmentOutput out;
+  out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular,
+                     baseOpacity * material.opacity);
+  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
+  out.depth = in.position.z;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// P7-7D: Glyph3D line source geometry vertex shader
+//
+// Same as glyph triangle shader but draws as line segments (MTLPrimitiveTypeLine).
+// Buffer layout identical to vertex_glyph_main.
+// ---------------------------------------------------------------------------
+
+struct GlyphLineVertexOut {
+  float4 position [[position]];
+  float3 viewPos;
+  float3 viewNormal;
+  float4 glyphColor;
+  float4 clipDistances;
+  uint cellId;
+  uint propId;
+};
+
+vertex GlyphLineVertexOut vertex_glyph_line_main(
+    uint vertex_id [[vertex_id]],
+    uint instance_id [[instance_id]],
+    constant float3* positions [[buffer(0)]],
+    constant float3* normals [[buffer(1)]],
+    constant float4x4* glyphTransforms [[buffer(2)]],
+    constant float3x3* glyphNormalTransforms [[buffer(3)]],
+    constant float4* glyphColors [[buffer(4)]],
+    constant uint* glyphPickIds [[buffer(5)]],
+    constant SceneUniforms& scene [[buffer(8)]],
+    constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
+    constant uint& propId [[buffer(10)]]) {
+  GlyphLineVertexOut out;
+
+  float3 pos = positions[vertex_id];
+  float3 norm = normals[vertex_id];
+
+  float4x4 glyphTransform = glyphTransforms[instance_id];
+  float3x3 normalTransform = glyphNormalTransforms[instance_id];
+
+  float4 worldPos = scene.modelMatrix * glyphTransform * float4(pos, 1.0);
+  float4 viewPos = scene.viewMatrix * worldPos;
+  out.viewPos = viewPos.xyz;
+  out.position = scene.projectionMatrix * viewPos;
+  out.viewNormal = scene.normalMatrix * normalTransform * norm;
+  out.glyphColor = glyphColors[instance_id];
+  out.cellId = glyphPickIds[instance_id] + 1u;
+  out.propId = propId + 1u;
+
+  out.clipDistances = float4(
+    dot(float4(pos, 1.0), clipPlanes.planes[0]),
+    dot(float4(pos, 1.0), clipPlanes.planes[1]),
+    dot(float4(pos, 1.0), clipPlanes.planes[2]),
+    dot(float4(pos, 1.0), clipPlanes.planes[3]));
+
+  return out;
+}
+
+fragment FragmentOutput fragment_glyph_line_main(
+    GlyphLineVertexOut in [[stage_in]],
+    constant MaterialUniforms& material [[buffer(0)]],
+    constant LightUniforms& lights [[buffer(1)]],
+    constant SceneUniforms& scene [[buffer(2)]],
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+    constant ClipPlaneUniforms& clipPlanes [[buffer(9)]]) {
+  if (clipPlanes.numClipPlanes > 0 && in.clipDistances.x < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 1 && in.clipDistances.y < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 2 && in.clipDistances.z < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 3 && in.clipDistances.w < 0.0) discard_fragment();
+
+  float3 N = normalize(in.viewNormal);
+  float3 ambientColor = in.glyphColor.rgb;
+  float ambientIntensity = material.ambientColor.w;
+  float3 diffuseColor = in.glyphColor.rgb;
+  float diffuseIntensity = material.diffuseColor.w;
+  float3 specularColor = material.specularColor.rgb;
+  float specularIntensity = material.specularColor.w;
+  float baseOpacity = in.glyphColor.a;
+
+  float3 totalAmbient = ambientIntensity * ambientColor;
+  float3 totalDiffuse = float3(0.0);
+  float3 totalSpecular = float3(0.0);
+  float3 viewDir = normalize(-in.viewPos);
+
+  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
+    Light L = lights.lights[i];
+    int lightType = int(L.position.w);
+    float3 lightColor = L.color.rgb * L.color.w;
+    float attenuation = 1.0;
+    float df = 0.0;
+    float3 reflDir = float3(0.0);
+    float3 toLight = float3(0.0);
+
+    if (lightType == 0) {
+      toLight = float3(0.0, 0.0, 1.0);
+      df = max(N.z, 0.000001);
+      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
+    } else if (lightType == 1) {
+      toLight = normalize(-L.direction.xyz);
+      df = max(dot(N, toLight), 0.0);
+      reflDir = reflect(L.direction.xyz, N);
+    } else {
+      toLight = L.position.xyz - in.viewPos;
+      float dist = length(toLight);
+      toLight /= dist;
+      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
+      df = max(dot(N, toLight), 0.0);
+      reflDir = reflect(-toLight, N);
+      if (lightType == 3) {
+        float3 spotDir = normalize(L.direction.xyz);
+        float spotCos = dot(-toLight, spotDir);
+        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
+        if (spotCos > spotCutoff) {
+          attenuation *= pow(spotCos, L.attenuation.w);
+        } else {
+          attenuation = 0.0;
+        }
+      }
+    }
+    totalDiffuse += df * diffuseColor * lightColor * attenuation;
+    float NdotL = max(dot(N, toLight), 0.0);
+    if (NdotL > 0.0) {
+      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
+      totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
+    }
+  }
+
+  FragmentOutput out;
+  out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular,
+                     baseOpacity * material.opacity);
+  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
+  out.depth = in.position.z;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// P7-7D: Glyph3D point source geometry vertex shader
+//
+// Renders glyph source points. Same instance data as triangle/line glyphs.
+// Uses MTLPrimitiveTypePoint with point size from SceneUniforms.
+// ---------------------------------------------------------------------------
+
+struct GlyphPointVertexOut {
+  float4 position [[position]];
+  float3 viewPos;
+  float3 viewNormal;
+  float4 glyphColor;
+  float4 clipDistances;
+  uint cellId;
+  uint propId;
+  float point_size;
+};
+
+vertex GlyphPointVertexOut vertex_glyph_point_main(
+    uint vertex_id [[vertex_id]],
+    uint instance_id [[instance_id]],
+    constant float3* positions [[buffer(0)]],
+    constant float3* normals [[buffer(1)]],
+    constant float4x4* glyphTransforms [[buffer(2)]],
+    constant float3x3* glyphNormalTransforms [[buffer(3)]],
+    constant float4* glyphColors [[buffer(4)]],
+    constant uint* glyphPickIds [[buffer(5)]],
+    constant SceneUniforms& scene [[buffer(8)]],
+    constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
+    constant uint& propId [[buffer(10)]]) {
+  GlyphPointVertexOut out;
+
+  float3 pos = positions[vertex_id];
+  float3 norm = normals[vertex_id];
+
+  float4x4 glyphTransform = glyphTransforms[instance_id];
+  float3x3 normalTransform = glyphNormalTransforms[instance_id];
+
+  float4 worldPos = scene.modelMatrix * glyphTransform * float4(pos, 1.0);
+  float4 viewPos = scene.viewMatrix * worldPos;
+  out.viewPos = viewPos.xyz;
+  out.position = scene.projectionMatrix * viewPos;
+  out.viewNormal = scene.normalMatrix * normalTransform * norm;
+  out.glyphColor = glyphColors[instance_id];
+  out.cellId = glyphPickIds[instance_id] + 1u;
+  out.propId = propId + 1u;
+  out.point_size = scene.pointSize;
+
+  out.clipDistances = float4(
+    dot(float4(pos, 1.0), clipPlanes.planes[0]),
+    dot(float4(pos, 1.0), clipPlanes.planes[1]),
+    dot(float4(pos, 1.0), clipPlanes.planes[2]),
+    dot(float4(pos, 1.0), clipPlanes.planes[3]));
+
+  return out;
+}
+
+fragment FragmentOutput fragment_glyph_point_main(
+    GlyphPointVertexOut in [[stage_in]],
+    constant MaterialUniforms& material [[buffer(0)]],
+    constant LightUniforms& lights [[buffer(1)]],
+    constant SceneUniforms& scene [[buffer(2)]],
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+    constant ClipPlaneUniforms& clipPlanes [[buffer(9)]]) {
+  if (clipPlanes.numClipPlanes > 0 && in.clipDistances.x < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 1 && in.clipDistances.y < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 2 && in.clipDistances.z < 0.0) discard_fragment();
+  if (clipPlanes.numClipPlanes > 3 && in.clipDistances.w < 0.0) discard_fragment();
+
+  float3 N = normalize(in.viewNormal);
+  float3 ambientColor = in.glyphColor.rgb;
+  float ambientIntensity = material.ambientColor.w;
+  float3 diffuseColor = in.glyphColor.rgb;
+  float diffuseIntensity = material.diffuseColor.w;
+  float3 specularColor = material.specularColor.rgb;
+  float specularIntensity = material.specularColor.w;
+  float baseOpacity = in.glyphColor.a;
+
+  float3 totalAmbient = ambientIntensity * ambientColor;
+  float3 totalDiffuse = float3(0.0);
+  float3 totalSpecular = float3(0.0);
+  float3 viewDir = normalize(-in.viewPos);
+
+  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
+    Light L = lights.lights[i];
+    int lightType = int(L.position.w);
+    float3 lightColor = L.color.rgb * L.color.w;
+    float attenuation = 1.0;
+    float df = 0.0;
+    float3 reflDir = float3(0.0);
+    float3 toLight = float3(0.0);
+
+    if (lightType == 0) {
+      toLight = float3(0.0, 0.0, 1.0);
+      df = max(N.z, 0.000001);
+      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
+    } else if (lightType == 1) {
+      toLight = normalize(-L.direction.xyz);
+      df = max(dot(N, toLight), 0.0);
+      reflDir = reflect(L.direction.xyz, N);
+    } else {
+      toLight = L.position.xyz - in.viewPos;
+      float dist = length(toLight);
+      toLight /= dist;
+      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
+      df = max(dot(N, toLight), 0.0);
+      reflDir = reflect(-toLight, N);
+      if (lightType == 3) {
+        float3 spotDir = normalize(L.direction.xyz);
+        float spotCos = dot(-toLight, spotDir);
+        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
+        if (spotCos > spotCutoff) {
+          attenuation *= pow(spotCos, L.attenuation.w);
+        } else {
+          attenuation = 0.0;
+        }
+      }
+    }
+    totalDiffuse += df * diffuseColor * lightColor * attenuation;
+    float NdotL = max(dot(N, toLight), 0.0);
+    if (NdotL > 0.0) {
+      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
+      totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
+    }
+  }
+
+  FragmentOutput out;
+  out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular,
+                     baseOpacity * material.opacity);
+  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
+  out.depth = in.position.z + coinOffset.pointOffset / 65000.0;
+  return out;
+}

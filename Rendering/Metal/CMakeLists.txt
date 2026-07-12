@@ -10,7 +10,8 @@ set(classes
   vtkMetalCamera
   vtkMetalProperty
   vtkMetalLight
-  vtkMetalHardwareSelector)
+  vtkMetalHardwareSelector
+  vtkMetalGlyph3DMapper)
 
 set(headers)
 set(sources)

@@ -170,16 +170,17 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 
 **WebGPU reference**: `vtkWebGPUCompositePolyDataMapperDelegator` — same pattern.
 
-### 7D. Glyph3D Mapper
+### 7D. Glyph3D Mapper ✅
 
-**Files**: New `vtkMetalGlyph3DMapper.{h,mm}`
+**Status**: Implemented. `vtkMetalGlyph3DMapper` inherits from `vtkGlyph3DMapper` and overrides `Render()` to perform Metal instanced rendering. Source geometry (triangles, lines, points) is extracted from the glyph source polydata into per-vertex position/normal buffers. Per-instance glyph attributes (4×4 transform, 3×3 normal transform, RGBA color, pick ID) are computed on the CPU from input point data, orientation arrays, scale arrays, and selection arrays, then uploaded to per-instance Metal buffers with `stepFunctionPerInstance`. Three dedicated pipeline states (triangle, line, point) use `vertex_glyph_main`/`fragment_glyph_main` shaders that read source geometry from buffer slots 0–1 and instance data from slots 2–5. The glyph transform is composed in the vertex shader: `modelMatrix * glyphTransform * position`. Source geometry is cached and only rebuilt when the source polydata MTime changes; instance data is cached and only rebuilt when the input dataset MTime changes. Supports all orientation modes (DIRECTION, ROTATION, QUATERNION), scale modes (BY_MAGNITUDE, BY_COMPONENTS, NO_DATA_SCALING), clamping, masking, and selection IDs. MSAA sample count changes invalidate pipeline states.
 
-**Implementation**:
-1. Instanced rendering of glyph geometry.
-2. Per-instance transform buffer.
-3. Point/glyph attribute passing.
+**Files**:
+- `vtkMetalGlyph3DMapper.h` — class declaration
+- `vtkMetalGlyph3DMapper.mm` — `Render()`, source geometry extraction, instance buffer management, pipeline creation
+- `MetalShaders.metal` — `vertex_glyph_main`/`fragment_glyph_main`, `vertex_glyph_line_main`/`fragment_glyph_line_main`, `vertex_glyph_point_main`/`fragment_glyph_point_main`, `GlyphVertexOut`, `GlyphLineVertexOut`, `GlyphPointVertexOut` structs
+- `CMakeLists.txt` — added to classes list
 
-**WebGPU reference**: `vtkWebGPUGlyph3DMapper`.
+**WebGPU reference**: `vtkWebGPUGlyph3DMapper` — same architecture with shader substitution; Metal uses dedicated shader functions instead.
 
 ---
 
@@ -268,7 +269,7 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 | 14 | 7B — Batched mapper | Large | Low | ✅ Done |
 | 15 | 7C — Composite delegator | Large | Low | ✅ Done |
 | 16 | 8B — Depth peeling | Large | Low | ✅ Done |
-| 17 | 7D — Glyph3D mapper | Large | Low | — glyph instancing |
+| 17 | 7D — Glyph3D mapper | Large | Low | ✅ Done |
 | 18 | 8C — Render bundles | Large | Low | — perf optimization |
 | 19 | 8D — Vertex attribute mapping | Medium | Low | — custom attributes |
 
