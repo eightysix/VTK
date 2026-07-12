@@ -64,6 +64,10 @@ private:
   void* StagingBuffer = nullptr;         // id<MTLBuffer> (volume upload, kept alive for async blit)
   int IndexCount = 0;
 
+  // Coarse opacity map for empty-space skipping (32x32x32 R8Unorm 3D texture)
+  void* CoarseOpacityTexture = nullptr;  // id<MTLTexture> (3D)
+  void* CoarseOpacitySampler = nullptr;  // id<MTLSamplerState> (nearest)
+
   // Volume state
   double ModelBounds[6] = { 0.0, 1.0, 0.0, 1.0, 0.0, 1.0 };
   double ScalarRange[2] = { 0.0, 1.0 };
@@ -75,10 +79,12 @@ private:
   vtkTimeStamp VolumeUploadTime;
   vtkTimeStamp TransferFunctionUploadTime;
   vtkTimeStamp VertexBufferUploadTime;
+  vtkTimeStamp CoarseOpacityUploadTime;
 
   // Helper methods
   bool UpdateVolumeTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
   bool UpdateTransferFunctionTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
+  bool UpdateCoarseOpacityTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
   bool SetupBuffers(void* mtlDevice, vtkVolume* vol, vtkImageData* input);
   bool SetupPipeline(void* mtlDevice, vtkRenderer* ren);
 };

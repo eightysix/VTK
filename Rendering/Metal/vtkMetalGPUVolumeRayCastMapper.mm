@@ -38,7 +38,7 @@ struct VolumeMapperUniforms
   float ScalarMin;
   float ScalarMax;
   float UseJittering;
-  float Padding[4]; // 272 bytes total, 16-byte aligned (Metal enforces this)
+  float CoarseMapInvDims[4]; // 1/coarseDims.x, 1/coarseDims.y, 1/coarseDims.z, unused
 };
 
 static_assert(sizeof(VolumeMapperUniforms) == 272,
@@ -134,6 +134,18 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   {
     CFRelease(this->ColorOpacitySampler);
     this->ColorOpacitySampler = nullptr;
+  }
+
+  if (this->CoarseOpacityTexture)
+  {
+    CFRelease(this->CoarseOpacityTexture);
+    this->CoarseOpacityTexture = nullptr;
+  }
+
+  if (this->CoarseOpacitySampler)
+  {
+    CFRelease(this->CoarseOpacitySampler);
+    this->CoarseOpacitySampler = nullptr;
   }
 
   if (this->DepthStencilState)
@@ -688,6 +700,210 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
 }
 
 //------------------------------------------------------------------------------
+bool vtkMetalGPUVolumeRayCastMapper::UpdateCoarseOpacityTexture(
+  void* mtlDeviceVoid, void* mtlQueueVoid, vtkVolume* vol)
+{
+  vtkImageData* input = vtkImageData::SafeDownCast(this->GetInput());
+  if (!input)
+  {
+    return false;
+  }
+
+  vtkDataArray* scalars = input->GetPointData()->GetScalars();
+  if (!scalars)
+  {
+    return false;
+  }
+
+  // Rebuild when volume data or transfer function changes
+  bool doReload = (this->CoarseOpacityTexture == nullptr);
+  doReload |= (input->GetMTime() > this->CoarseOpacityUploadTime.GetMTime());
+  doReload |= (this->TransferFunctionUploadTime.GetMTime() >
+    this->CoarseOpacityUploadTime.GetMTime());
+
+  if (!doReload)
+  {
+    return this->CoarseOpacityTexture != nullptr;
+  }
+
+  @autoreleasepool
+  {
+    id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
+
+    const int COARSE_DIM = 32;
+
+    int dims[3];
+    input->GetDimensions(dims);
+
+    // Build opacity LUT on the CPU from the volume property's transfer function.
+    // This avoids GPU texture readback (which fails on private-storage debug textures).
+    unsigned char opacityLUT[256];
+    vtkVolumeProperty* property = vol ? vol->GetProperty() : nullptr;
+    vtkPiecewiseFunction* opacityFunc = property ? property->GetScalarOpacity() : nullptr;
+    if (opacityFunc)
+    {
+      for (int i = 0; i < 256; ++i)
+      {
+        double val = this->ScalarRange[0] +
+          (this->ScalarRange[1] - this->ScalarRange[0]) * (i / 255.0);
+        double opacity = opacityFunc->GetValue(val);
+        int opInt = static_cast<int>(opacity * 255.0 + 0.5);
+        opacityLUT[i] = static_cast<unsigned char>(
+          opInt < 0 ? 0 : (opInt > 255 ? 255 : opInt));
+      }
+    }
+    else
+    {
+      for (int i = 0; i < 256; ++i)
+        opacityLUT[i] = 255;
+    }
+
+    // Build coarse opacity map: max opacity per 32x32x32 cell.
+    std::vector<unsigned char> coarseData(
+      static_cast<size_t>(COARSE_DIM) * COARSE_DIM * COARSE_DIM, 0);
+
+    double scalarRangeSize = this->ScalarRange[1] - this->ScalarRange[0];
+    if (scalarRangeSize < 1e-10)
+      scalarRangeSize = 1.0;
+
+    vtkIdType numTuples = scalars->GetNumberOfTuples();
+
+    // Parallel iteration over all voxels
+    vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+      for (vtkIdType i = begin; i < end; ++i)
+      {
+        // Compute 3D index from flat index
+        vtkIdType idx = i;
+        int iz = static_cast<int>(idx / (dims[0] * dims[1]));
+        idx %= (dims[0] * dims[1]);
+        int iy = static_cast<int>(idx / dims[0]);
+        int ix = static_cast<int>(idx % dims[0]);
+
+        // Map to coarse cell
+        int cx = ix * COARSE_DIM / dims[0];
+        int cy = iy * COARSE_DIM / dims[1];
+        int cz = iz * COARSE_DIM / dims[2];
+        cx = std::min(cx, COARSE_DIM - 1);
+        cy = std::min(cy, COARSE_DIM - 1);
+        cz = std::min(cz, COARSE_DIM - 1);
+
+        // Get scalar value (first component only)
+        double rawScalar = scalars->GetTuple1(i);
+
+        // Normalize to [0, 1] using the same formula as the shader
+        double scalarNorm = (rawScalar - this->ScalarRange[0]) / scalarRangeSize;
+        scalarNorm = std::max(0.0, std::min(1.0, scalarNorm));
+
+        // Look up opacity from the TF LUT
+        int tfIdx = static_cast<int>(scalarNorm * 255.0);
+        tfIdx = std::max(0, std::min(255, tfIdx));
+        unsigned char opacity = opacityLUT[tfIdx];
+
+        // Update max for this coarse cell (atomic-free: use a CAS-free max
+        // by accepting potential benign races — the max is monotonically
+        // increasing so worst case we do one extra write)
+        size_t coarseIdx = static_cast<size_t>(cx) +
+          static_cast<size_t>(cy) * COARSE_DIM +
+          static_cast<size_t>(cz) * COARSE_DIM * COARSE_DIM;
+        if (opacity > coarseData[coarseIdx])
+        {
+          coarseData[coarseIdx] = opacity;
+        }
+      }
+    });
+
+    // Upload the coarse map as a 3D texture
+    id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->CoarseOpacityTexture;
+    id<MTLTexture> tex = nil;
+
+    if (oldTex &&
+        oldTex.width == COARSE_DIM &&
+        oldTex.height == COARSE_DIM &&
+        oldTex.depth == COARSE_DIM &&
+        oldTex.pixelFormat == MTLPixelFormatR8Unorm)
+    {
+      tex = oldTex;
+    }
+    else
+    {
+      if (this->CoarseOpacityTexture)
+      {
+        CFRelease(this->CoarseOpacityTexture);
+        this->CoarseOpacityTexture = nullptr;
+      }
+
+      MTLTextureDescriptor* texDesc = [[MTLTextureDescriptor alloc] init];
+      texDesc.textureType = MTLTextureType3D;
+      texDesc.pixelFormat = MTLPixelFormatR8Unorm;
+      texDesc.width = COARSE_DIM;
+      texDesc.height = COARSE_DIM;
+      texDesc.depth = COARSE_DIM;
+      texDesc.mipmapLevelCount = 1;
+      texDesc.usage = MTLTextureUsageShaderRead;
+      texDesc.storageMode = MTLStorageModePrivate;
+
+      tex = [device newTextureWithDescriptor:texDesc];
+      if (!tex)
+      {
+        vtkErrorMacro("Failed to create coarse opacity 3D texture");
+        return false;
+      }
+      this->CoarseOpacityTexture = (__bridge void*)tex;
+      CFRetain((__bridge CFTypeRef)tex);
+    }
+
+    // Upload via staging buffer + blit encoder (avoids replaceRegion on debug textures)
+    {
+      id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)mtlQueueVoid;
+      NSUInteger bytesPerRow = COARSE_DIM * sizeof(unsigned char);
+      NSUInteger bytesPerImage = bytesPerRow * COARSE_DIM;
+      NSUInteger totalBytes = bytesPerImage * COARSE_DIM;
+
+      id<MTLBuffer> stagingBuf = [device newBufferWithBytes:coarseData.data()
+                                                     length:totalBytes
+                                                    options:MTLResourceStorageModeShared];
+      if (!stagingBuf)
+      {
+        vtkErrorMacro("Failed to create coarse opacity staging buffer");
+        return false;
+      }
+
+      id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+      id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
+      [blit copyFromBuffer:stagingBuf
+              sourceOffset:0
+       sourceBytesPerRow:bytesPerRow
+     sourceBytesPerImage:bytesPerImage
+              sourceSize:MTLSizeMake(COARSE_DIM, COARSE_DIM, COARSE_DIM)
+               toTexture:tex
+        destinationSlice:0
+        destinationLevel:0
+       destinationOrigin:MTLOriginMake(0, 0, 0)];
+      [blit endEncoding];
+      [cmdBuf commit];
+    }
+
+    // Create nearest-filter sampler (shared, created once)
+    if (!this->CoarseOpacitySampler)
+    {
+      MTLSamplerDescriptor* samplerDesc = [[MTLSamplerDescriptor alloc] init];
+      samplerDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+      samplerDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+      samplerDesc.rAddressMode = MTLSamplerAddressModeClampToEdge;
+      samplerDesc.magFilter = MTLSamplerMinMagFilterNearest;
+      samplerDesc.minFilter = MTLSamplerMinMagFilterNearest;
+      id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:samplerDesc];
+      this->CoarseOpacitySampler = (__bridge void*)sampler;
+      CFRetain((__bridge CFTypeRef)sampler);
+    }
+
+    this->CoarseOpacityUploadTime.Modified();
+  }
+
+  return this->CoarseOpacityTexture != nullptr;
+}
+
+//------------------------------------------------------------------------------
 bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
   void* mtlDeviceVoid, vtkVolume* vol, vtkImageData* input)
 {
@@ -981,6 +1197,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   {
     return;
   }
+  this->UpdateCoarseOpacityTexture(mtlDevice, mtlQueue, vol);
   if (!this->SetupBuffers(mtlDevice, vol, input))
   {
     return;
@@ -1057,6 +1274,14 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   }
 
   uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;
+
+  // Coarse opacity map dimensions (32x32x32) — 1/dim for each axis
+  static constexpr int COARSE_DIM = 32;
+  float coarseInvDim = 1.0f / static_cast<float>(COARSE_DIM);
+  uniforms.CoarseMapInvDims[0] = coarseInvDim;
+  uniforms.CoarseMapInvDims[1] = coarseInvDim;
+  uniforms.CoarseMapInvDims[2] = coarseInvDim;
+  uniforms.CoarseMapInvDims[3] = 0.0f;
 
   // Compute view-projection matrix via generic vtkCamera API.
   // Try the Metal camera first (has a precomputed cached layout), fall back to
@@ -1143,6 +1368,15 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   id<MTLSamplerState> tfSamp = (__bridge id<MTLSamplerState>)this->ColorOpacitySampler;
   [encoder setFragmentTexture:tfTex atIndex:1];
   [encoder setFragmentSamplerState:tfSamp atIndex:1];
+
+  // Bind coarse opacity map for empty-space skipping (fragment)
+  id<MTLTexture> coarseTex = (__bridge id<MTLTexture>)this->CoarseOpacityTexture;
+  id<MTLSamplerState> coarseSamp = (__bridge id<MTLSamplerState>)this->CoarseOpacitySampler;
+  if (coarseTex && coarseSamp)
+  {
+    [encoder setFragmentTexture:coarseTex atIndex:2];
+    [encoder setFragmentSamplerState:coarseSamp atIndex:2];
+  }
 
   // Draw
   id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;
