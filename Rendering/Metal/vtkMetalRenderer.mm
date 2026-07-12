@@ -74,33 +74,63 @@ void vtkMetalRenderer::DeviceRender()
 
     // Create render pass descriptor
     MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-    rpd.colorAttachments[0].texture = drawable.texture;
-    rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
 
-    // Set background color
+    // Determine if MSAA is active
+    const bool msaa = (renWin->GetEffectiveSampleCount() > 1);
+    id<MTLTexture> msaaColorTex = (__bridge id<MTLTexture>)renWin->MultisampleColorTexture;
+    id<MTLTexture> msaaDepthTex = (__bridge id<MTLTexture>)renWin->MultisampleDepthTexture;
+
+    // Color attachment 0: use MSAA texture when active, otherwise the drawable directly
     double bgColor[3];
     this->GetBackground(bgColor);
-    rpd.colorAttachments[0].clearColor = MTLClearColorMake(bgColor[0], bgColor[1], bgColor[2], 1.0);
-    rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
 
-    // Attach IDs texture for GPU-based picking (color attachment 1)
-    id<MTLTexture> idsTex = (__bridge id<MTLTexture>)renWin->IdsTexture;
-    if (idsTex)
+    if (msaa && msaaColorTex)
     {
-      rpd.colorAttachments[1].texture = idsTex;
-      rpd.colorAttachments[1].loadAction = MTLLoadActionClear;
-      rpd.colorAttachments[1].clearColor = MTLClearColorMake(0, 0, 0, 0);
-      rpd.colorAttachments[1].storeAction = MTLStoreActionStore;
+      rpd.colorAttachments[0].texture = msaaColorTex;
+      rpd.colorAttachments[0].resolveTexture = drawable.texture;
+      rpd.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+    }
+    else
+    {
+      rpd.colorAttachments[0].texture = drawable.texture;
+      rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+    }
+    rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rpd.colorAttachments[0].clearColor = MTLClearColorMake(bgColor[0], bgColor[1], bgColor[2], 1.0);
+
+    // Attach IDs texture for GPU-based picking (color attachment 1).
+    // RGBA32Uint does not support multisampling, so skip the IDs attachment when MSAA is active.
+    // Hardware selection temporarily disables MSAA when capturing IDs.
+    if (!msaa)
+    {
+      id<MTLTexture> idsTex = (__bridge id<MTLTexture>)renWin->IdsTexture;
+      if (idsTex)
+      {
+        rpd.colorAttachments[1].texture = idsTex;
+        rpd.colorAttachments[1].loadAction = MTLLoadActionClear;
+        rpd.colorAttachments[1].clearColor = MTLClearColorMake(0, 0, 0, 0);
+        rpd.colorAttachments[1].storeAction = MTLStoreActionStore;
+      }
     }
 
-    // Attach depth texture for depth testing
-    id<MTLTexture> depthTex = (__bridge id<MTLTexture>)renWin->DepthTexture;
-    if (depthTex)
+    // Attach depth texture for depth testing (use MSAA depth when active)
+    if (msaa && msaaDepthTex)
     {
-      rpd.depthAttachment.texture = depthTex;
+      rpd.depthAttachment.texture = msaaDepthTex;
       rpd.depthAttachment.loadAction = MTLLoadActionClear;
       rpd.depthAttachment.clearDepth = 1.0;
       rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+    }
+    else
+    {
+      id<MTLTexture> depthTex = (__bridge id<MTLTexture>)renWin->DepthTexture;
+      if (depthTex)
+      {
+        rpd.depthAttachment.texture = depthTex;
+        rpd.depthAttachment.loadAction = MTLLoadActionClear;
+        rpd.depthAttachment.clearDepth = 1.0;
+        rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+      }
     }
 
     id<MTLRenderCommandEncoder> encoder =

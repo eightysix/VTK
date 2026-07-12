@@ -94,6 +94,12 @@ public:
   void* GetCurrentCommandBuffer();
 
   /**
+   * Get the effective sample count for multisampling.
+   * Returns MultiSamples if > 1, otherwise 1.
+   */
+  int GetEffectiveSampleCount();
+
+  /**
    * Read back the IDs texture (RGBA32Uint) into a vtkTypeUInt32Array.
    * The array is populated with 4 components per pixel: {CellId, PropId, CompositeId, ProcessId}.
    * Y-axis is flipped to match VTK's bottom-left origin.
@@ -125,6 +131,12 @@ protected:
   void RecreateIdsTexture();
 
   /**
+   * Create/destroy multisampled color and depth textures for MSAA rendering.
+   */
+  void CreateMultisampleAttachments();
+  void DestroyMultisampleAttachments();
+
+  /**
    * Acquire the next drawable from the CAMetalLayer.
    */
   bool AcquireDrawable();
@@ -143,6 +155,8 @@ protected:
   void* Encoder = nullptr;         // id<MTLRenderCommandEncoder>
   void* DepthTexture = nullptr;    // id<MTLTexture>
   void* IdsTexture = nullptr;      // id<MTLTexture> — RGBA32Uint for picking IDs
+  void* MultisampleColorTexture = nullptr; // id<MTLTexture> — MSAA color (MTLTextureType2DMultisample)
+  void* MultisampleDepthTexture = nullptr; // id<MTLTexture> — MSAA depth (MTLTextureType2DMultisample)
   void* ColorCopyPipeline = nullptr; // id<MTLRenderPipelineState>
 
   bool Initialized = false;
@@ -150,6 +164,7 @@ protected:
 private:
   friend class vtkMetalRenderer;
   friend class vtkMetalPolyDataMapper;
+  friend class vtkMetalPolyDataMapper2D;
 
   vtkMetalRenderWindow(const vtkMetalRenderWindow&) = delete;
   void operator=(const vtkMetalRenderWindow&) = delete;

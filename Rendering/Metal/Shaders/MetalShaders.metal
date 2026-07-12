@@ -1341,3 +1341,45 @@ kernel void polygonEdgesToLines(
     outputOffset += 2u;
   }
 }
+
+// ============================================================================
+// 2D Mapper shaders (P7-7A)
+// ============================================================================
+
+// 2D mapper uniforms — orthographic projection + per-draw state
+struct Mapper2DState {
+  float4x4 wcvcMatrix;       // world-to-viewport-clip matrix (orthographic)
+  float4 color;              // base color (RGBA)
+  float pointSize;           // point size in pixels
+  float lineWidth;           // line width in pixels
+  uint flags;                // bit 0: use point color, bit 1: use cell color
+};
+
+// 2D vertex input — position (float2 or float3) + optional color
+struct Vertex2DIn {
+  float2 position [[attribute(0)]];
+};
+
+// 2D vertex output
+struct Vertex2DOut {
+  float4 position [[position]];
+  float4 color;
+};
+
+// 2D vertex shader — transforms 2D positions to clip space using WCVC matrix
+vertex Vertex2DOut vertex_2d_main(
+    Vertex2DIn in [[stage_in]],
+    constant Mapper2DState& state [[buffer(1)]])
+{
+  Vertex2DOut out;
+  out.position = state.wcvcMatrix * float4(in.position, 0.0, 1.0);
+  out.color = state.color;
+  return out;
+}
+
+// 2D fragment shader — outputs flat color
+fragment float4 fragment_2d_main(
+    Vertex2DOut in [[stage_in]])
+{
+  return in.color;
+}

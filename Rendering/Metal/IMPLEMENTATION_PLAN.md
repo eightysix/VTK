@@ -136,15 +136,15 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 
 ## Phase 7: Additional Mappers & Infrastructure
 
-### 7A. 2D Mapper
+### 7A. 2D Mapper ✅
 
-**Files**: New `vtkMetalPolyDataMapper2D.{h,mm}`
+**Status**: Implemented. `vtkMetalPolyDataMapper2D` inherits from `vtkPolyDataMapper2D` and overrides `RenderOverlay()`. Uses orthographic projection to transform polydata points from viewport pixel coordinates to Metal NDC. Three pipeline states (triangle, line, point) with `vertex_2d_main` / `fragment_2d_main` shaders. Supports `TransformCoordinate` for coordinate system conversion. Geometry is rebuilt when input MTime changes. Pipeline states support MSAA sample count.
 
-**Implementation**:
-1. Create `vtkMetalPolyDataMapper2D` inheriting from `vtkPolyDataMapper2D`.
-2. Implement `RenderOverlay()` and `RenderOpaqueOverlay()` / `RenderTranslucentOverlay()`.
-3. Use 2D viewport coordinates (no perspective projection).
-4. Simple shader: position → screen space transform via 2D actor transform.
+**Files**:
+- `vtkMetalPolyDataMapper2D.h` — class declaration
+- `vtkMetalPolyDataMapper2D.mm` — `RenderOverlay()`, orthographic WCVC matrix, fan triangulation
+- `MetalShaders.metal` — `vertex_2d_main`, `fragment_2d_main`, `Mapper2DState` struct
+- `CMakeLists.txt` — added to classes list
 
 **WebGPU reference**: `vtkWebGPUPolyDataMapper2D` + `Private/vtkWebGPUPolyDataMapper2DInternals`.
 
@@ -185,18 +185,15 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 
 ## Phase 8: Advanced Features
 
-### 8A. MSAA
+### 8A. MSAA ✅
+
+**Status**: Implemented. `vtkMetalRenderWindow` creates `MTLTextureType2DMultisample` color and depth textures via `CreateMultisampleAttachments()` when `MultiSamples > 1`. `GetEffectiveSampleCount()` returns the active sample count. `vtkMetalRenderer::DeviceRender()` uses multisample textures as render targets with `MTLStoreActionMultisampleResolve` to resolve to the drawable. IDs attachment (RGBA32Uint) is skipped when MSAA is active since RGBA32Uint doesn't support multisampling. All 8 pipeline types in `vtkMetalPolyDataMapper` set `sampleCount` on their `MTLRenderPipelineDescriptor`. Pipeline states are invalidated in `RenderPiece()` when sample count changes.
 
 **Files**:
-- `vtkMetalRenderWindow.mm` — create multisample textures
-- `vtkMetalRenderer.mm` — configure multisample render pass
-- `vtkMetalPolyDataMapper.mm` — set `sampleCount` on pipeline descriptors
-
-**Implementation**:
-1. Query `MTLDevice` for `maxSampleCount`.
-2. Create `MTLTexture` with `textureType = MTLTextureType2DMultisample`.
-3. Set `descriptor.sampleCount` on all pipeline descriptors.
-4. Configure resolve texture in render pass descriptor.
+- `vtkMetalRenderWindow.h` — `MultisampleColorTexture`, `MultisampleDepthTexture`, `GetEffectiveSampleCount()`, `CreateMultisampleAttachments()`, `DestroyMultisampleAttachments()`
+- `vtkMetalRenderWindow.mm` — MSAA texture creation/destruction, `Render()` recreates MSAA textures on size change
+- `vtkMetalRenderer.mm` — render pass uses MSAA textures with resolve, skips IDs when MSAA active
+- `vtkMetalPolyDataMapper.mm` — `sampleCount` on all pipeline descriptors, `CachedSampleCount` invalidation in `RenderPiece()`
 
 ### 8B. Depth Peeling / Correct Translucency
 
@@ -251,8 +248,8 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 | 9 | 5A — Texture mapping | Medium | Medium | ✅ Done |
 | 10 | 3B/3C — Round/miter joins | Large | Low | ✅ Done |
 | 11 | 6A — GPU tessellation | Large | Medium | ✅ Done |
-| 12 | 8A — MSAA | Medium | Medium | — anti-aliasing |
-| 13 | 7A — 2D mapper | Medium | Low | — 2D overlay support |
+| 12 | 8A — MSAA | Medium | Medium | ✅ Done |
+| 13 | 7A — 2D mapper | Medium | Low | ✅ Done |
 | 14 | 7B — Batched mapper | Large | Low | — performance optimization |
 | 15 | 8B — Depth peeling | Large | Low | — correct translucency |
 | 16 | 7C — Composite delegator | Large | Low | — LOD support |

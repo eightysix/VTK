@@ -3,6 +3,7 @@ set(classes
   vtkMetalRenderer
   vtkMetalActor
   vtkMetalPolyDataMapper
+  vtkMetalPolyDataMapper2D
   vtkMetalCamera
   vtkMetalProperty
   vtkMetalLight

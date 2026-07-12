@@ -135,6 +135,8 @@ void vtkMetalRenderWindow::Finalize()
     this->IdsTexture = nullptr;
   }
 
+  this->DestroyMultisampleAttachments();
+
   if (this->MetalLayer)
   {
     CFRelease(this->MetalLayer);
@@ -253,6 +255,86 @@ void vtkMetalRenderWindow::RecreateIdsTexture()
 }
 
 //------------------------------------------------------------------------------
+int vtkMetalRenderWindow::GetEffectiveSampleCount()
+{
+  return (this->MultiSamples > 1) ? this->MultiSamples : 1;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalRenderWindow::CreateMultisampleAttachments()
+{
+  int sampleCount = this->GetEffectiveSampleCount();
+  if (sampleCount <= 1)
+  {
+    return;
+  }
+
+  @autoreleasepool
+  {
+    id<MTLDevice> device = (__bridge id<MTLDevice>)this->MetalDevice;
+    if (!device)
+    {
+      return;
+    }
+
+    // --- Multisampled color attachment (BGRA8Unorm, matching the drawable) ---
+    {
+      MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
+      desc.textureType = MTLTextureType2DMultisample;
+      desc.pixelFormat = MTLPixelFormatBGRA8Unorm;
+      desc.width = this->Size[0];
+      desc.height = this->Size[1];
+      desc.mipmapLevelCount = 1;
+      desc.sampleCount = sampleCount;
+      desc.usage = MTLTextureUsageRenderTarget;
+      desc.storageMode = MTLStorageModePrivate;
+
+      id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+      if (tex)
+      {
+        this->MultisampleColorTexture = (__bridge void*)tex;
+        CFRetain((__bridge CFTypeRef)tex);
+      }
+    }
+
+    // --- Multisampled depth attachment (Depth32Float) ---
+    {
+      MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
+      desc.textureType = MTLTextureType2DMultisample;
+      desc.pixelFormat = MTLPixelFormatDepth32Float;
+      desc.width = this->Size[0];
+      desc.height = this->Size[1];
+      desc.mipmapLevelCount = 1;
+      desc.sampleCount = sampleCount;
+      desc.usage = MTLTextureUsageRenderTarget;
+      desc.storageMode = MTLStorageModePrivate;
+
+      id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+      if (tex)
+      {
+        this->MultisampleDepthTexture = (__bridge void*)tex;
+        CFRetain((__bridge CFTypeRef)tex);
+      }
+    }
+  }
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalRenderWindow::DestroyMultisampleAttachments()
+{
+  if (this->MultisampleColorTexture)
+  {
+    CFRelease(this->MultisampleColorTexture);
+    this->MultisampleColorTexture = nullptr;
+  }
+  if (this->MultisampleDepthTexture)
+  {
+    CFRelease(this->MultisampleDepthTexture);
+    this->MultisampleDepthTexture = nullptr;
+  }
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalRenderWindow::Render()
 {
   if (!this->Initialized)
@@ -276,6 +358,19 @@ void vtkMetalRenderWindow::Render()
           idsTex.height != (NSUInteger)this->Size[1])
       {
         this->RecreateIdsTexture();
+      }
+
+      // Recreate multisample attachments when size or sample count changes
+      int effectiveSamples = this->GetEffectiveSampleCount();
+      id<MTLTexture> msaaColorTex = (__bridge id<MTLTexture>)this->MultisampleColorTexture;
+      bool needsMSAACreation = (effectiveSamples > 1) &&
+        (!msaaColorTex || msaaColorTex.width != (NSUInteger)this->Size[0] ||
+         msaaColorTex.height != (NSUInteger)this->Size[1] ||
+         (int)msaaColorTex.sampleCount != effectiveSamples);
+      if (needsMSAACreation)
+      {
+        this->DestroyMultisampleAttachments();
+        this->CreateMultisampleAttachments();
       }
     }
   }
