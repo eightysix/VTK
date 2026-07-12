@@ -136,7 +136,6 @@ void vtkMetalRenderWindow::Finalize()
   }
 
   this->DestroyMultisampleAttachments();
-  this->DestroyTemporalUpscaleTextures();
 
   if (this->MetalLayer)
   {
@@ -336,159 +335,6 @@ void vtkMetalRenderWindow::DestroyMultisampleAttachments()
 }
 
 //------------------------------------------------------------------------------
-void vtkMetalRenderWindow::SetTemporalUpscaleScaleFactor(float factor)
-{
-  if (this->TemporalUpscaleScaleFactor != factor)
-  {
-    this->TemporalUpscaleScaleFactor = factor;
-    this->TemporalUpscaleTexturesCreated = false;
-    this->Modified();
-  }
-}
-
-//------------------------------------------------------------------------------
-float vtkMetalRenderWindow::GetTemporalUpscaleScaleFactor() const
-{
-  return this->TemporalUpscaleScaleFactor;
-}
-
-//------------------------------------------------------------------------------
-bool vtkMetalRenderWindow::IsTemporalUpscalingEnabled() const
-{
-  return this->TemporalUpscaleScaleFactor < 1.0f;
-}
-
-//------------------------------------------------------------------------------
-int vtkMetalRenderWindow::GetRenderResolutionWidth() const
-{
-  if (this->IsTemporalUpscalingEnabled() && this->RenderResolutionWidth > 0)
-  {
-    return this->RenderResolutionWidth;
-  }
-  return this->Size[0];
-}
-
-//------------------------------------------------------------------------------
-int vtkMetalRenderWindow::GetRenderResolutionHeight() const
-{
-  if (this->IsTemporalUpscalingEnabled() && this->RenderResolutionHeight > 0)
-  {
-    return this->RenderResolutionHeight;
-  }
-  return this->Size[1];
-}
-
-//------------------------------------------------------------------------------
-void vtkMetalRenderWindow::CreateTemporalUpscaleTextures()
-{
-  if (this->TemporalUpscaleTexturesCreated)
-  {
-    return;
-  }
-
-  this->DestroyTemporalUpscaleTextures();
-
-  @autoreleasepool
-  {
-    id<MTLDevice> device = (__bridge id<MTLDevice>)this->MetalDevice;
-    if (!device)
-    {
-      return;
-    }
-
-    int renderW = static_cast<int>(this->Size[0] * this->TemporalUpscaleScaleFactor);
-    int renderH = static_cast<int>(this->Size[1] * this->TemporalUpscaleScaleFactor);
-    int outputW = this->Size[0];
-    int outputH = this->Size[1];
-
-    this->RenderResolutionWidth = renderW;
-    this->RenderResolutionHeight = renderH;
-
-    // Internal color texture — RGBA16Float at render resolution
-    {
-      MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
-                                                                                      width:renderW
-                                                                                     height:renderH
-                                                                                  mipmapped:NO];
-      desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-      desc.storageMode = MTLStorageModePrivate;
-      id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
-      this->InternalColorTexture = (__bridge void*)tex;
-      CFRetain((__bridge CFTypeRef)tex);
-    }
-
-    // Internal depth texture — Depth32Float at render resolution
-    {
-      MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-                                                                                      width:renderW
-                                                                                     height:renderH
-                                                                                  mipmapped:NO];
-      desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-      desc.storageMode = MTLStorageModePrivate;
-      id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
-      this->InternalDepthTexture = (__bridge void*)tex;
-      CFRetain((__bridge CFTypeRef)tex);
-    }
-
-    // Motion vector texture — RG16Float at render resolution
-    {
-      MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG16Float
-                                                                                      width:renderW
-                                                                                     height:renderH
-                                                                                  mipmapped:NO];
-      desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-      desc.storageMode = MTLStorageModePrivate;
-      id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
-      this->MotionVectorTexture = (__bridge void*)tex;
-      CFRetain((__bridge CFTypeRef)tex);
-    }
-
-    // Upscale output texture — RGBA16Float at output resolution
-    {
-      MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
-                                                                                      width:outputW
-                                                                                     height:outputH
-                                                                                  mipmapped:NO];
-      desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-      desc.storageMode = MTLStorageModePrivate;
-      id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
-      this->UpscaleOutputTexture = (__bridge void*)tex;
-      CFRetain((__bridge CFTypeRef)tex);
-    }
-
-    this->TemporalUpscaleTexturesCreated = true;
-  }
-}
-
-//------------------------------------------------------------------------------
-void vtkMetalRenderWindow::DestroyTemporalUpscaleTextures()
-{
-  if (this->InternalColorTexture)
-  {
-    CFRelease(this->InternalColorTexture);
-    this->InternalColorTexture = nullptr;
-  }
-  if (this->InternalDepthTexture)
-  {
-    CFRelease(this->InternalDepthTexture);
-    this->InternalDepthTexture = nullptr;
-  }
-  if (this->MotionVectorTexture)
-  {
-    CFRelease(this->MotionVectorTexture);
-    this->MotionVectorTexture = nullptr;
-  }
-  if (this->UpscaleOutputTexture)
-  {
-    CFRelease(this->UpscaleOutputTexture);
-    this->UpscaleOutputTexture = nullptr;
-  }
-  this->TemporalUpscaleTexturesCreated = false;
-  this->RenderResolutionWidth = 0;
-  this->RenderResolutionHeight = 0;
-}
-
-//------------------------------------------------------------------------------
 void vtkMetalRenderWindow::Render()
 {
   if (!this->Initialized)
@@ -525,12 +371,6 @@ void vtkMetalRenderWindow::Render()
       {
         this->DestroyMultisampleAttachments();
         this->CreateMultisampleAttachments();
-      }
-
-      // Recreate temporal upscale textures when upscaling is enabled
-      if (this->IsTemporalUpscalingEnabled())
-      {
-        this->CreateTemporalUpscaleTextures();
       }
     }
   }

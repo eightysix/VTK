@@ -166,8 +166,6 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   bool CachedEdgeVisibility = false;  // P2-2B: track edge visibility changes
   float CachedLineWidth = -1.0f;     // P3-3A: track line width changes
   int CachedSampleCount = 0;        // 8A: track MSAA sample count changes
-  int CachedColorFormat = 0;        // track color format changes (0=BGRA8, 1=RGBA16Float)
-  bool TemporalUpscalingActive = false; // whether temporal upscaling is currently active
 
   // 8C: Render bundle caching — pre-recorded encoder commands for static geometry
   // When geometry hasn't changed between frames, replay cached commands instead of
@@ -1295,26 +1293,6 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     this->Internals->TrianglePeelPipeline = nil;
     this->Internals->CachedSampleCount = currentSampleCount;
   }
-
-  // Invalidate pipelines when color format changes (temporal upscaling uses RGBA16Float)
-  int currentColorFormat = renWin->IsTemporalUpscalingEnabled() ? 1 : 0;
-  if (currentColorFormat != this->Internals->CachedColorFormat)
-  {
-    this->Internals->TrianglePipeline = nil;
-    this->Internals->LinePipeline = nil;
-    this->Internals->PointPipeline = nil;
-    this->Internals->PointShapedPipeline = nil;
-    this->Internals->EdgePipeline = nil;
-    this->Internals->ThickLinePipeline = nil;
-    this->Internals->RoundCapLinePipeline = nil;
-    this->Internals->MiterJoinLinePipeline = nil;
-    this->Internals->TriangleInitPeelPipeline = nil;
-    this->Internals->TrianglePeelPipeline = nil;
-    this->Internals->CachedColorFormat = currentColorFormat;
-  }
-
-  // Track temporal upscaling state for pipeline creation
-  this->Internals->TemporalUpscalingActive = renWin->IsTemporalUpscalingEnabled();
 
   @autoreleasepool
   {
@@ -3089,12 +3067,6 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   // 8A: Use cached sample count (set by RenderPiece before this call)
   int sampleCount = this->Internals->CachedSampleCount > 0 ? this->Internals->CachedSampleCount : 1;
 
-  // Determine color format based on temporal upscaling state
-  MTLPixelFormat colorFormat = this->Internals->TemporalUpscalingActive
-    ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
-  // Skip IDs attachment when MSAA or temporal upscaling is active
-  bool skipIdsAttachment = (sampleCount > 1) || this->Internals->TemporalUpscalingActive;
-
   id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
 
   NSError* error = nil;
@@ -3134,9 +3106,9 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   pipelineDesc.vertexFunction = vertexFunc;
   pipelineDesc.fragmentFunction = fragmentFunc;
   pipelineDesc.vertexDescriptor = vertexDesc;
-  pipelineDesc.colorAttachments[0].pixelFormat = colorFormat;
-  // Skip IDs attachment when MSAA or temporal upscaling is active
-  if (!skipIdsAttachment)
+  pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+  // 8A: Skip IDs attachment when MSAA is active — render pass only has 1 color attachment
+  if (sampleCount <= 1)
   {
     pipelineDesc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
   }
@@ -3184,12 +3156,6 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
   // 8A: Use cached sample count (set by RenderPiece before this call)
   int sampleCount = this->Internals->CachedSampleCount > 0 ? this->Internals->CachedSampleCount : 1;
 
-  // Determine color format based on temporal upscaling state
-  MTLPixelFormat colorFormat = this->Internals->TemporalUpscalingActive
-    ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
-  // Skip IDs attachment when MSAA or temporal upscaling is active
-  bool skipIdsAttachment = (sampleCount > 1) || this->Internals->TemporalUpscalingActive;
-
   id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
 
   NSError* error = nil;
@@ -3214,8 +3180,8 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
       MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
       desc.vertexFunction = vFunc;
       desc.fragmentFunction = fFunc;
-      desc.colorAttachments[0].pixelFormat = colorFormat;
-      if (!skipIdsAttachment)
+      desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      if (sampleCount <= 1)
       {
         desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
       }
@@ -3244,8 +3210,8 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
       MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
       desc.vertexFunction = vFunc;
       desc.fragmentFunction = fFunc;
-      desc.colorAttachments[0].pixelFormat = colorFormat;
-      if (!skipIdsAttachment)
+      desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      if (sampleCount <= 1)
       {
         desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
       }
@@ -3275,12 +3241,6 @@ void vtkMetalPolyDataMapper::EnsureEdgePipelineState(void* mtlDevice)
 
   // 8A: Use cached sample count (set by RenderPiece before this call)
   int sampleCount = this->Internals->CachedSampleCount > 0 ? this->Internals->CachedSampleCount : 1;
-
-  // Determine color format based on temporal upscaling state
-  MTLPixelFormat colorFormat = this->Internals->TemporalUpscalingActive
-    ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
-  // Skip IDs attachment when MSAA or temporal upscaling is active
-  bool skipIdsAttachment = (sampleCount > 1) || this->Internals->TemporalUpscalingActive;
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
 
@@ -3319,8 +3279,8 @@ void vtkMetalPolyDataMapper::EnsureEdgePipelineState(void* mtlDevice)
     desc.vertexFunction = vFunc;
     desc.fragmentFunction = fFunc;
     desc.vertexDescriptor = vertexDesc;
-    desc.colorAttachments[0].pixelFormat = colorFormat;
-    if (!skipIdsAttachment)
+    desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    if (sampleCount <= 1)
     {
       desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
     }
@@ -3349,12 +3309,6 @@ void vtkMetalPolyDataMapper::EnsureThickLinePipelineState(void* mtlDevice)
   // 8A: Use cached sample count (set by RenderPiece before this call)
   int sampleCount = this->Internals->CachedSampleCount > 0 ? this->Internals->CachedSampleCount : 1;
 
-  // Determine color format based on temporal upscaling state
-  MTLPixelFormat colorFormat = this->Internals->TemporalUpscalingActive
-    ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
-  // Skip IDs attachment when MSAA or temporal upscaling is active
-  bool skipIdsAttachment = (sampleCount > 1) || this->Internals->TemporalUpscalingActive;
-
   id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
 
   NSError* error = nil;
@@ -3374,8 +3328,8 @@ void vtkMetalPolyDataMapper::EnsureThickLinePipelineState(void* mtlDevice)
     MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
     desc.vertexFunction = vFunc;
     desc.fragmentFunction = fFunc;
-    desc.colorAttachments[0].pixelFormat = colorFormat;
-    if (!skipIdsAttachment)
+    desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    if (sampleCount <= 1)
     {
       desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
     }
@@ -3405,12 +3359,6 @@ void vtkMetalPolyDataMapper::EnsureRoundCapLinePipelineState(void* mtlDevice)
   // 8A: Use cached sample count (set by RenderPiece before this call)
   int sampleCount = this->Internals->CachedSampleCount > 0 ? this->Internals->CachedSampleCount : 1;
 
-  // Determine color format based on temporal upscaling state
-  MTLPixelFormat colorFormat = this->Internals->TemporalUpscalingActive
-    ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
-  // Skip IDs attachment when MSAA or temporal upscaling is active
-  bool skipIdsAttachment = (sampleCount > 1) || this->Internals->TemporalUpscalingActive;
-
   id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
 
   NSError* error = nil;
@@ -3430,8 +3378,8 @@ void vtkMetalPolyDataMapper::EnsureRoundCapLinePipelineState(void* mtlDevice)
     MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
     desc.vertexFunction = vFunc;
     desc.fragmentFunction = fFunc;
-    desc.colorAttachments[0].pixelFormat = colorFormat;
-    if (!skipIdsAttachment)
+    desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    if (sampleCount <= 1)
     {
       desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
     }
@@ -3461,12 +3409,6 @@ void vtkMetalPolyDataMapper::EnsureMiterJoinLinePipelineState(void* mtlDevice)
   // 8A: Use cached sample count (set by RenderPiece before this call)
   int sampleCount = this->Internals->CachedSampleCount > 0 ? this->Internals->CachedSampleCount : 1;
 
-  // Determine color format based on temporal upscaling state
-  MTLPixelFormat colorFormat = this->Internals->TemporalUpscalingActive
-    ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
-  // Skip IDs attachment when MSAA or temporal upscaling is active
-  bool skipIdsAttachment = (sampleCount > 1) || this->Internals->TemporalUpscalingActive;
-
   id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
 
   NSError* error = nil;
@@ -3486,8 +3428,8 @@ void vtkMetalPolyDataMapper::EnsureMiterJoinLinePipelineState(void* mtlDevice)
     MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
     desc.vertexFunction = vFunc;
     desc.fragmentFunction = fFunc;
-    desc.colorAttachments[0].pixelFormat = colorFormat;
-    if (!skipIdsAttachment)
+    desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    if (sampleCount <= 1)
     {
       desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
     }

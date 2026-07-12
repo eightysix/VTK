@@ -342,7 +342,7 @@ static void BuildSourceGeometry(id<MTLDevice> device, vtkPolyData* src,
 // Ensure pipeline states for glyph rendering (lazy creation).
 // ---------------------------------------------------------------------------
 static void EnsureGlyphPipelines(
-  vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals* I, id<MTLDevice> device, int sampleCount, bool upscalingActive)
+  vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals* I, id<MTLDevice> device, int sampleCount)
 {
   if (I->TriPipeline && I->LinePipeline && I->PtPipeline)
   {
@@ -430,11 +430,8 @@ static void EnsureGlyphPipelines(
     d.vertexFunction = vf;
     d.fragmentFunction = ff;
     d.vertexDescriptor = makeVertDesc();
-    // Determine color format based on temporal upscaling state
-    MTLPixelFormat colorFormat = upscalingActive
-      ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
-    d.colorAttachments[0].pixelFormat = colorFormat;
-    if (sampleCount <= 1 && !upscalingActive)
+    d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    if (sampleCount <= 1)
     {
       d.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;
     }
@@ -794,8 +791,7 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
   }
 
   // Ensure pipelines
-  bool upscalingActive = renWin->IsTemporalUpscalingEnabled();
-  EnsureGlyphPipelines(I, device, sampleCount, upscalingActive);
+  EnsureGlyphPipelines(I, device, sampleCount);
 
   id<MTLRenderCommandEncoder> enc =
     (__bridge id<MTLRenderCommandEncoder>)renWin->GetCurrentRenderCommandEncoder();
