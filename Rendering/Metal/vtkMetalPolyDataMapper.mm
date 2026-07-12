@@ -129,6 +129,15 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLBuffer> ThickLineLineWidthBuffer = nil;  // float: line width in pixels
   vtkIdType ThickLineSegmentCount = 0;           // number of line segments for instanced draw
 
+  // P3-3B: Round Cap + Round Join line pipeline — 36 verts per instance
+  id<MTLRenderPipelineState> RoundCapLinePipeline = nil;
+  vtkIdType RoundCapLineSegmentCount = 0;
+
+  // P3-3C: Miter Join line pipeline — 4 verts per instance, miter offsets in shader
+  id<MTLRenderPipelineState> MiterJoinLinePipeline = nil;
+  vtkIdType MiterJoinLineSegmentCount = 0;
+  id<MTLBuffer> MiterJoinSegmentCountBuffer = nil;  // uint32: total segment count for bounds check
+
   // P2-2C: Triangle index buffers — deduplicated vertices + index buffer
   // IndexBuffer is populated when vertices can be deduplicated.
 
@@ -169,6 +178,13 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     ThickLinePipeline = nil;
     ThickLineLineWidthBuffer = nil;
     ThickLineSegmentCount = 0;
+
+    // P3-3B/3C: Round cap and miter join pipelines
+    RoundCapLinePipeline = nil;
+    RoundCapLineSegmentCount = 0;
+    MiterJoinLinePipeline = nil;
+    MiterJoinLineSegmentCount = 0;
+    MiterJoinSegmentCountBuffer = nil;
 
     PointPositionBuffer = nil;
     PointNormalBuffer = nil;
@@ -486,21 +502,167 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
 
     if (this->Internals->HasLines && this->Internals->LineIndexBuffer)
     {
-      // P3-3A: Use thick line pipeline when lineWidth > 1 and lineJoin == NoJoin
-      bool useThickLines = (lineWidth > 1.0f &&
-        act->GetProperty()->GetLineJoin() == vtkProperty::LineJoinType::NoJoin &&
-        this->Internals->ThickLineSegmentCount > 0);
+      // P3-3A/3B/3C: Select line pipeline based on lineWidth and lineJoin type
+      auto lineJoinType = act->GetProperty()->GetLineJoin();
+      bool useThickLines = false;
+      bool useRoundCapLines = false;
+      bool useMiterJoinLines = false;
 
-      if (useThickLines)
+      if (lineWidth > 1.0f)
       {
-        this->EnsureThickLinePipelineState((__bridge void*)device);
-        if (!this->Internals->ThickLinePipeline)
+        if (lineJoinType == vtkProperty::LineJoinType::RoundCapRoundJoin &&
+            this->Internals->RoundCapLineSegmentCount > 0)
         {
-          useThickLines = false;
+          useRoundCapLines = true;
+          this->EnsureRoundCapLinePipelineState((__bridge void*)device);
+          if (!this->Internals->RoundCapLinePipeline)
+          {
+            useRoundCapLines = false;
+          }
+        }
+        else if (lineJoinType == vtkProperty::LineJoinType::MiterJoin &&
+                 this->Internals->MiterJoinLineSegmentCount > 0)
+        {
+          useMiterJoinLines = true;
+          this->EnsureMiterJoinLinePipelineState((__bridge void*)device);
+          if (!this->Internals->MiterJoinLinePipeline)
+          {
+            useMiterJoinLines = false;
+          }
+        }
+        else if (lineJoinType == vtkProperty::LineJoinType::NoJoin &&
+                 this->Internals->ThickLineSegmentCount > 0)
+        {
+          useThickLines = true;
+          this->EnsureThickLinePipelineState((__bridge void*)device);
+          if (!this->Internals->ThickLinePipeline)
+          {
+            useThickLines = false;
+          }
         }
       }
 
-      if (useThickLines && this->Internals->ThickLinePipeline)
+      if (useRoundCapLines && this->Internals->RoundCapLinePipeline)
+      {
+        // P3-3B: Round Cap + Round Join line rendering — 36 verts per instance
+        [encoder setRenderPipelineState:this->Internals->RoundCapLinePipeline];
+        [encoder setVertexBuffer:this->Internals->VertexPositionBuffer offset:0 atIndex:0];
+        [encoder setVertexBuffer:this->Internals->LineIndexBuffer offset:0 atIndex:1];
+        if (this->Internals->SceneUniformBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
+        }
+        if (this->Internals->SurfaceColorBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->SurfaceColorBuffer offset:0 atIndex:3];
+        }
+        if (!this->Internals->ThickLineLineWidthBuffer)
+        {
+          this->Internals->ThickLineLineWidthBuffer = [device
+            newBufferWithLength:sizeof(float)
+                       options:MTLResourceStorageModeShared];
+        }
+        *static_cast<float*>([this->Internals->ThickLineLineWidthBuffer contents]) = lineWidth;
+        [encoder setVertexBuffer:this->Internals->ThickLineLineWidthBuffer offset:0 atIndex:4];
+        if (this->Internals->LineCellIdBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->LineCellIdBuffer offset:0 atIndex:5];
+        }
+        if (this->Internals->PropIdBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:6];
+        }
+        if (this->Internals->MaterialUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
+        }
+        if (this->Internals->LightUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
+        }
+        if (this->Internals->SceneUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
+        }
+        if (this->Internals->CoincidentOffsetBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
+        }
+
+        [encoder setCullMode:MTLCullModeNone];
+
+        // Instanced draw: 36 vertices per instance (triangle strip), one instance per line segment
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
+                    vertexStart:0
+                  vertexCount:36
+                instanceCount:this->Internals->RoundCapLineSegmentCount];
+      }
+      else if (useMiterJoinLines && this->Internals->MiterJoinLinePipeline)
+      {
+        // P3-3C: Miter Join line rendering — 4 verts per instance
+        [encoder setRenderPipelineState:this->Internals->MiterJoinLinePipeline];
+        [encoder setVertexBuffer:this->Internals->VertexPositionBuffer offset:0 atIndex:0];
+        [encoder setVertexBuffer:this->Internals->LineIndexBuffer offset:0 atIndex:1];
+        if (this->Internals->SceneUniformBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
+        }
+        if (this->Internals->SurfaceColorBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->SurfaceColorBuffer offset:0 atIndex:3];
+        }
+        if (!this->Internals->ThickLineLineWidthBuffer)
+        {
+          this->Internals->ThickLineLineWidthBuffer = [device
+            newBufferWithLength:sizeof(float)
+                       options:MTLResourceStorageModeShared];
+        }
+        *static_cast<float*>([this->Internals->ThickLineLineWidthBuffer contents]) = lineWidth;
+        [encoder setVertexBuffer:this->Internals->ThickLineLineWidthBuffer offset:0 atIndex:4];
+        if (this->Internals->LineCellIdBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->LineCellIdBuffer offset:0 atIndex:5];
+        }
+        if (this->Internals->PropIdBuffer)
+        {
+          [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:6];
+        }
+        // P3-3C: segment count uniform for bounds checking in shader
+        if (!this->Internals->MiterJoinSegmentCountBuffer)
+        {
+          this->Internals->MiterJoinSegmentCountBuffer = [device
+            newBufferWithLength:sizeof(uint32_t)
+                       options:MTLResourceStorageModeShared];
+        }
+        *static_cast<uint32_t*>([this->Internals->MiterJoinSegmentCountBuffer contents]) =
+          static_cast<uint32_t>(this->Internals->MiterJoinLineSegmentCount);
+        [encoder setVertexBuffer:this->Internals->MiterJoinSegmentCountBuffer offset:0 atIndex:7];
+        if (this->Internals->MaterialUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
+        }
+        if (this->Internals->LightUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
+        }
+        if (this->Internals->SceneUniformBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
+        }
+        if (this->Internals->CoincidentOffsetBuffer)
+        {
+          [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
+        }
+
+        [encoder setCullMode:MTLCullModeNone];
+
+        // Instanced draw: 4 vertices per quad (triangle strip), one instance per line segment
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
+                    vertexStart:0
+                  vertexCount:4
+                instanceCount:this->Internals->MiterJoinLineSegmentCount];
+      }
+      else if (useThickLines && this->Internals->ThickLinePipeline)
       {
         // P3-3A: Thick line rendering — instanced quad expansion
         [encoder setRenderPipelineState:this->Internals->ThickLinePipeline];
@@ -1602,6 +1764,9 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     this->Internals->HasLines = !lineIndices.empty();
     // P3-3A: number of line segments for instanced thick line drawing
     this->Internals->ThickLineSegmentCount = lineIndices.size() / 2;
+    // P3-3B/3C: same segment count for round cap and miter join pipelines
+    this->Internals->RoundCapLineSegmentCount = this->Internals->ThickLineSegmentCount;
+    this->Internals->MiterJoinLineSegmentCount = this->Internals->ThickLineSegmentCount;
   }
 
   if (!positions.empty())
@@ -2264,6 +2429,92 @@ void vtkMetalPolyDataMapper::EnsureThickLinePipelineState(void* mtlDevice)
     if (!this->Internals->ThickLinePipeline)
     {
       vtkErrorMacro(<< "Thick line pipeline: " << [[error localizedDescription] UTF8String]);
+    }
+  }
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::EnsureRoundCapLinePipelineState(void* mtlDevice)
+{
+  if (this->Internals->RoundCapLinePipeline)
+  {
+    return;
+  }
+
+  id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
+
+  NSError* error = nil;
+  NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
+  id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+  if (!library)
+  {
+    vtkErrorMacro(<< "Failed to compile Metal shader for round cap lines: "
+                  << [[error localizedDescription] UTF8String]);
+    return;
+  }
+
+  id<MTLFunction> vFunc = [library newFunctionWithName:@"vertex_round_cap_line_main"];
+  id<MTLFunction> fFunc = [library newFunctionWithName:@"fragment_round_cap_line_main"];
+  if (vFunc && fFunc)
+  {
+    MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+    desc.vertexFunction = vFunc;
+    desc.fragmentFunction = fFunc;
+    desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+    desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    // Round cap lines are rendered as triangle lists
+    desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+
+    error = nil;
+    this->Internals->RoundCapLinePipeline =
+      [device newRenderPipelineStateWithDescriptor:desc error:&error];
+    if (!this->Internals->RoundCapLinePipeline)
+    {
+      vtkErrorMacro(<< "Round cap line pipeline: " << [[error localizedDescription] UTF8String]);
+    }
+  }
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::EnsureMiterJoinLinePipelineState(void* mtlDevice)
+{
+  if (this->Internals->MiterJoinLinePipeline)
+  {
+    return;
+  }
+
+  id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
+
+  NSError* error = nil;
+  NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
+  id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+  if (!library)
+  {
+    vtkErrorMacro(<< "Failed to compile Metal shader for miter join lines: "
+                  << [[error localizedDescription] UTF8String]);
+    return;
+  }
+
+  id<MTLFunction> vFunc = [library newFunctionWithName:@"vertex_miter_join_line_main"];
+  id<MTLFunction> fFunc = [library newFunctionWithName:@"fragment_miter_join_line_main"];
+  if (vFunc && fFunc)
+  {
+    MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+    desc.vertexFunction = vFunc;
+    desc.fragmentFunction = fFunc;
+    desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+    desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    // Miter join lines are rendered as triangle strips (quads)
+    desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+
+    error = nil;
+    this->Internals->MiterJoinLinePipeline =
+      [device newRenderPipelineStateWithDescriptor:desc error:&error];
+    if (!this->Internals->MiterJoinLinePipeline)
+    {
+      vtkErrorMacro(<< "Miter join line pipeline: " << [[error localizedDescription] UTF8String]);
     }
   }
 }

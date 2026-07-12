@@ -735,6 +735,452 @@ fragment FragmentOutput fragment_thick_line_main(
 }
 
 // ---------------------------------------------------------------------------
+// P3-3B: Round Cap + Round Join line shaders — screen-space quad expansion with semicircle caps
+// Each line segment is expanded into a screen-space shape (36 vertices per instance):
+//   - 6 vertices for the body quad (2 triangles)
+//   - 15 vertices for the left semicircle cap (triangle fan, 5 segments × 3 verts)
+//   - 15 vertices for the right semicircle cap (triangle fan, 5 segments × 3 verts)
+// The third coordinate (p_coord.z) is used for interpolation along the line:
+//   z=0 → p0 endpoint (left cap), z=1 → p1 endpoint (right cap)
+// Fragment shader computes distance from line center for anti-aliasing.
+// ---------------------------------------------------------------------------
+
+struct RoundCapLineVertexOut {
+  float4 position [[position]];
+  float3 viewPos;
+  float3 viewNormal;
+  float4 vertexColor;
+  float dist_to_centerline;  // perpendicular distance from center (-0.5..0.5)
+  uint cellId;
+  uint propId;
+};
+
+vertex RoundCapLineVertexOut vertex_round_cap_line_main(
+    uint vertex_id [[vertex_id]],
+    uint instance_id [[instance_id]],
+    constant float3* positions [[buffer(0)]],
+    constant uint* lineIndices [[buffer(1)]],
+    constant SceneUniforms& scene [[buffer(2)]],
+    constant float4* vertexColors [[buffer(3)]],
+    constant float& lineWidth [[buffer(4)]],
+    constant uint* cellIds [[buffer(5)]],
+    constant uint& propId [[buffer(6)]]) {
+  // 36-vertex template: 6 body + 15 left cap + 15 right cap (triangle strip)
+  // Body quad: (-0.5,0,0), (-0.5,0,1), (0.5,0,0), (0.5,0,1), (-0.5,1,0), (-0.5,1,1)
+  // The x coordinate maps to the semicircle offset (0=center, ±0.5=edges)
+  // The y coordinate maps to the parametric position along the line (0=start, 1=end)
+  // The z coordinate maps to interpolation factor (0=p0, 1=p1)
+
+  // Generate template vertex for this vertex_id
+  float3 p_coord;
+  const int CAP_SEGMENTS = 5;
+  const float PI = 3.14159265358979;
+
+  if (vertex_id < 6) {
+    // Body quad (triangle strip): alternating bottom/top vertices
+    // v0=(-0.5,0,0), v1=(-0.5,0,1), v2=(0.5,0,0), v3=(0.5,0,1), v4=(-0.5,1,0), v5=(-0.5,1,1)
+    const float3 body_verts[6] = {
+      float3(-0.5, 0.0, 0.0),
+      float3(-0.5, 0.0, 1.0),
+      float3( 0.5, 0.0, 0.0),
+      float3( 0.5, 0.0, 1.0),
+      float3(-0.5, 1.0, 0.0),
+      float3(-0.5, 1.0, 1.0)
+    };
+    p_coord = body_verts[vertex_id];
+  } else if (vertex_id < 21) {
+    // Left semicircle cap (triangle fan, 5 segments × 3 verts)
+    // Fan center at (0, 0, 0), arcs from angle PI/2 to 3PI/2
+    int local = vertex_id - 6;
+    int seg = local / 3;
+    int triVert = local % 3;
+    float theta0 = PI * 0.5 + (float(seg) * PI) / float(CAP_SEGMENTS);
+    float theta1 = PI * 0.5 + (float(seg + 1) * PI) / float(CAP_SEGMENTS);
+    if (triVert == 0) {
+      p_coord = float3(0.0, 0.0, 0.0);
+    } else if (triVert == 1) {
+      p_coord = float3(0.5 * cos(theta0), 0.5 * sin(theta0), 0.0);
+    } else {
+      p_coord = float3(0.5 * cos(theta1), 0.5 * sin(theta1), 0.0);
+    }
+  } else {
+    // Right semicircle cap (triangle fan, 5 segments × 3 verts)
+    // Fan center at (0, 1, 1), arcs from angle 3PI/2 to 5PI/2
+    int local = vertex_id - 21;
+    int seg = local / 3;
+    int triVert = local % 3;
+    float theta0 = 1.5 * PI + (float(seg) * PI) / float(CAP_SEGMENTS);
+    float theta1 = 1.5 * PI + (float(seg + 1) * PI) / float(CAP_SEGMENTS);
+    if (triVert == 0) {
+      p_coord = float3(0.0, 1.0, 1.0);
+    } else if (triVert == 1) {
+      p_coord = float3(0.5 * cos(theta0), 0.5 * sin(theta0) + 1.0, 1.0);
+    } else {
+      p_coord = float3(0.5 * cos(theta1), 0.5 * sin(theta1) + 1.0, 1.0);
+    }
+  }
+
+  // Read the two endpoint indices for this line segment
+  uint p0_idx = lineIndices[instance_id * 2];
+  uint p1_idx = lineIndices[instance_id * 2 + 1];
+
+  float3 p0_MC = positions[p0_idx];
+  float3 p1_MC = positions[p1_idx];
+
+  // Transform both endpoints to clip space
+  float4 p0_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(p0_MC, 1.0);
+  float4 p1_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(p1_MC, 1.0);
+
+  // Transform to screen space
+  float2 resolution = scene.viewport.zw;
+  float2 p0_screen = resolution * (0.5 * p0_DC.xy / p0_DC.w + 0.5);
+  float2 p1_screen = resolution * (0.5 * p1_DC.xy / p1_DC.w + 0.5);
+
+  // Compute line direction and perpendicular in screen space
+  float2 x_basis = normalize(p1_screen - p0_screen);
+  float segLen = length(p1_screen - p0_screen);
+  x_basis = select(x_basis, float2(1.0, 0.0), segLen < 0.001);
+  float2 y_basis = float2(-x_basis.y, x_basis.x);
+
+  // Expand into shape by lineWidth
+  float w = max(lineWidth, 1.0);
+  float2 adjusted_p0 = p0_screen + (p_coord.x * x_basis + p_coord.y * y_basis) * w;
+  float2 adjusted_p1 = p1_screen + (p_coord.x * x_basis + p_coord.y * y_basis) * w;
+  float2 p = mix(adjusted_p0, adjusted_p1, p_coord.z);
+
+  // Select z/w from the appropriate endpoint based on p_coord.z
+  float4 p_DC = mix(p0_DC, p1_DC, p_coord.z);
+
+  RoundCapLineVertexOut out;
+  out.position = float4(p_DC.w * ((2.0 * p) / resolution - 1.0), p_DC.z, p_DC.w);
+
+  // Interpolate view-space position for lighting
+  float3 mid_MC = mix(p0_MC, p1_MC, p_coord.z);
+  out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(mid_MC, 1.0)).xyz;
+  out.viewNormal = scene.normalMatrix * float3(0.0, 0.0, 1.0);
+
+  // Use the color from the appropriate endpoint
+  out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], p_coord.z);
+  out.dist_to_centerline = p_coord.y;
+  out.cellId = cellIds[instance_id];
+  out.propId = propId + 1u;
+  return out;
+}
+
+fragment FragmentOutput fragment_round_cap_line_main(
+    RoundCapLineVertexOut in [[stage_in]],
+    constant MaterialUniforms& material [[buffer(0)]],
+    constant LightUniforms& lights [[buffer(1)]],
+    constant SceneUniforms& scene [[buffer(2)]],
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
+  FragmentOutput out;
+
+  float3 baseColor = in.vertexColor.rgb;
+  float baseAlpha = in.vertexColor.a * material.opacity;
+
+  // Tube-like shading: modify normal based on distance from centerline
+  float3 N = normalize(in.viewNormal);
+  float d = abs(in.dist_to_centerline);
+  N.z = 1.0 - 2.0 * d;
+  N = normalize(N);
+
+  float3 totalAmbient = material.ambientColor.w * baseColor;
+  float3 totalDiffuse = float3(0.0);
+  float3 totalSpecular = float3(0.0);
+  float3 viewDir = normalize(-in.viewPos);
+
+  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
+    Light L = lights.lights[i];
+    int lightType = int(L.position.w);
+    float3 lightColor = L.color.rgb * L.color.w;
+    float attenuation = 1.0;
+    float df = 0.0;
+    float3 reflDir = float3(0.0);
+    float3 toLight = float3(0.0);
+
+    if (lightType == 0) {
+      toLight = float3(0.0, 0.0, 1.0);
+      df = max(N.z, 0.000001);
+      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
+    } else if (lightType == 1) {
+      toLight = normalize(-L.direction.xyz);
+      df = max(dot(N, toLight), 0.0);
+      reflDir = reflect(L.direction.xyz, N);
+    } else {
+      toLight = L.position.xyz - in.viewPos;
+      float dist = length(toLight);
+      toLight /= dist;
+      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
+      df = max(dot(N, toLight), 0.0);
+      reflDir = reflect(-toLight, N);
+      if (lightType == 3) {
+        float3 spotDir = normalize(L.direction.xyz);
+        float spotCos = dot(-toLight, spotDir);
+        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
+        if (spotCos > spotCutoff) {
+          attenuation *= pow(spotCos, L.attenuation.w);
+        } else {
+          attenuation = 0.0;
+        }
+      }
+    }
+
+    totalDiffuse += df * baseColor * lightColor * attenuation;
+    float NdotL = max(dot(N, toLight), 0.0);
+    if (NdotL > 0.0) {
+      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
+      totalSpecular += sf * material.specularColor.w * material.specularColor.rgb * lightColor * attenuation;
+    }
+  }
+
+  out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha);
+  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
+
+  // Coincident topology offset for lines
+  float c_factor = coinOffset.lineFactor;
+  float c_offset = coinOffset.lineOffset;
+  float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
+  out.depth = in.position.z + c_factor * cscale + c_offset / 65000.0;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// P3-3C: Miter Join line shaders — screen-space quad expansion with miter offsets
+// Same 4-vertex triangle strip as thick lines, but the vertex shader looks at
+// adjacent segments to compute miter join offsets at shared endpoints.
+// Falls back to bevel when the miter angle is too acute.
+// ---------------------------------------------------------------------------
+
+struct MiterJoinLineVertexOut {
+  float4 position [[position]];
+  float3 viewPos;
+  float3 viewNormal;
+  float4 vertexColor;
+  float dist_to_centerline;  // perpendicular distance from center (-0.5..0.5)
+  uint cellId;
+  uint propId;
+};
+
+vertex MiterJoinLineVertexOut vertex_miter_join_line_main(
+    uint vertex_id [[vertex_id]],
+    uint instance_id [[instance_id]],
+    constant float3* positions [[buffer(0)]],
+    constant uint* lineIndices [[buffer(1)]],
+    constant SceneUniforms& scene [[buffer(2)]],
+    constant float4* vertexColors [[buffer(3)]],
+    constant float& lineWidth [[buffer(4)]],
+    constant uint* cellIds [[buffer(5)]],
+    constant uint& propId [[buffer(6)]],
+    constant uint& segmentCount [[buffer(7)]]) {
+  // Quad corners: (-1,-1), (1,-1), (-1,1), (1,1)
+  const float2 tri_verts[4] = {
+    float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1)
+  };
+
+  float2 p_coord = tri_verts[vertex_id];
+
+  // Read the two endpoint indices for this line segment
+  uint p0_idx = lineIndices[instance_id * 2];
+  uint p1_idx = lineIndices[instance_id * 2 + 1];
+
+  float3 p0_MC = positions[p0_idx];
+  float3 p1_MC = positions[p1_idx];
+
+  // Transform both endpoints to clip space
+  float4 p0_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(p0_MC, 1.0);
+  float4 p1_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(p1_MC, 1.0);
+
+  // Transform to screen space
+  float2 resolution = scene.viewport.zw;
+  float2 p0_screen = resolution * (0.5 * p0_DC.xy / p0_DC.w + 0.5);
+  float2 p1_screen = resolution * (0.5 * p1_DC.xy / p1_DC.w + 0.5);
+
+  // Compute line direction and perpendicular in screen space
+  float2 x_basis = normalize(p1_screen - p0_screen);
+  float segLen = length(p1_screen - p0_screen);
+  x_basis = select(x_basis, float2(1.0, 0.0), segLen < 0.001);
+  float2 y_basis = float2(-x_basis.y, x_basis.x);
+
+  // Miter join: look at adjacent segments to compute miter offset at shared endpoints
+  float w = max(lineWidth, 1.0);
+  float2 offset = p_coord.x * x_basis + p_coord.y * y_basis * w;
+
+  // Check for miter at p0 (start of segment, p_coord.x == -1)
+  if (p_coord.x == -1.0 && instance_id > 0) {
+    // Check if previous segment shares the same cell (i.e., same polyline)
+    if (cellIds[instance_id - 1] == cellIds[instance_id]) {
+      uint prev_p0_idx = lineIndices[(instance_id - 1) * 2];
+      uint prev_p1_idx = lineIndices[(instance_id - 1) * 2 + 1];
+      float3 prev_p0_MC = positions[prev_p0_idx];
+      float3 prev_p1_MC = positions[prev_p1_idx];
+
+      float4 prev_p0_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(prev_p0_MC, 1.0);
+      float4 prev_p1_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(prev_p1_MC, 1.0);
+
+      float2 prev_p0_screen = resolution * (0.5 * prev_p0_DC.xy / prev_p0_DC.w + 0.5);
+      float2 prev_p1_screen = resolution * (0.5 * prev_p1_DC.xy / prev_p1_DC.w + 0.5);
+
+      // Direction of previous segment in screen space
+      float2 prev_dir = normalize(prev_p1_screen - prev_p0_screen);
+      // Current segment direction
+      float2 curr_dir = x_basis;
+
+      // Miter direction = normalized sum of the two edge normals
+      float2 prev_normal = float2(-prev_dir.y, prev_dir.x);
+      float2 curr_normal = float2(-curr_dir.y, curr_dir.x);
+      float2 miter = prev_normal + curr_normal;
+      float miter_len = length(miter);
+
+      // Miter limit: if miter is too long (angle too acute), fall back to bevel
+      float MITER_LIMIT = 2.0;
+      if (miter_len > 0.001 && miter_len < MITER_LIMIT * 2.0) {
+        miter = miter / miter_len;
+        // Offset along miter direction
+        float miterOffset = w * 0.5 / dot(miter, curr_normal);
+        if (sign(dot(p_coord.y * y_basis, miter)) == sign(dot(float2(0.0, 1.0), miter))) {
+          offset = p_coord.x * x_basis + miter * miterOffset;
+        }
+      }
+    }
+  }
+
+  // Check for miter at p1 (end of segment, p_coord.x == 1)
+  if (p_coord.x == 1.0 && instance_id < segmentCount - 1) {
+    // Check if next segment shares the same cell
+    if (cellIds[instance_id + 1] == cellIds[instance_id]) {
+      uint next_p0_idx = lineIndices[(instance_id + 1) * 2];
+      uint next_p1_idx = lineIndices[(instance_id + 1) * 2 + 1];
+      float3 next_p0_MC = positions[next_p0_idx];
+      float3 next_p1_MC = positions[next_p1_idx];
+
+      float4 next_p0_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(next_p0_MC, 1.0);
+      float4 next_p1_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(next_p1_MC, 1.0);
+
+      float2 next_p0_screen = resolution * (0.5 * next_p0_DC.xy / next_p0_DC.w + 0.5);
+      float2 next_p1_screen = resolution * (0.5 * next_p1_DC.xy / next_p1_DC.w + 0.5);
+
+      // Direction of next segment in screen space
+      float2 next_dir = normalize(next_p1_screen - next_p0_screen);
+      // Current segment direction
+      float2 curr_dir = x_basis;
+
+      // Miter direction = normalized sum of the two edge normals
+      float2 curr_normal = float2(-curr_dir.y, curr_dir.x);
+      float2 next_normal = float2(-next_dir.y, next_dir.x);
+      float2 miter = curr_normal + next_normal;
+      float miter_len = length(miter);
+
+      // Miter limit: if miter is too long (angle too acute), fall back to bevel
+      float MITER_LIMIT = 2.0;
+      if (miter_len > 0.001 && miter_len < MITER_LIMIT * 2.0) {
+        miter = miter / miter_len;
+        float miterOffset = w * 0.5 / dot(miter, curr_normal);
+        if (sign(dot(p_coord.y * y_basis, miter)) == sign(dot(float2(0.0, 1.0), miter))) {
+          offset = p_coord.x * x_basis + miter * miterOffset;
+        }
+      }
+    }
+  }
+
+  float2 p = p0_screen + offset + (p1_screen - p0_screen) * 0.5 * (p_coord.x + 1.0);
+
+  // Select z/w from the appropriate endpoint
+  float4 p_DC = mix(p0_DC, p1_DC, p_coord.x);
+
+  MiterJoinLineVertexOut out;
+  out.position = float4(p_DC.w * ((2.0 * p) / resolution - 1.0), p_DC.z, p_DC.w);
+
+  // Interpolate view-space position for lighting
+  float3 mid_MC = mix(p0_MC, p1_MC, p_coord.x);
+  out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(mid_MC, 1.0)).xyz;
+  out.viewNormal = scene.normalMatrix * float3(0.0, 0.0, 1.0);
+
+  // Use the color from the appropriate endpoint
+  out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], p_coord.x);
+  out.dist_to_centerline = p_coord.y;
+  out.cellId = cellIds[instance_id];
+  out.propId = propId + 1u;
+  return out;
+}
+
+fragment FragmentOutput fragment_miter_join_line_main(
+    MiterJoinLineVertexOut in [[stage_in]],
+    constant MaterialUniforms& material [[buffer(0)]],
+    constant LightUniforms& lights [[buffer(1)]],
+    constant SceneUniforms& scene [[buffer(2)]],
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
+  FragmentOutput out;
+
+  float3 baseColor = in.vertexColor.rgb;
+  float baseAlpha = in.vertexColor.a * material.opacity;
+
+  // Tube-like shading: modify normal based on distance from centerline
+  float3 N = normalize(in.viewNormal);
+  float d = abs(in.dist_to_centerline);
+  N.z = 1.0 - 2.0 * d;
+  N = normalize(N);
+
+  float3 totalAmbient = material.ambientColor.w * baseColor;
+  float3 totalDiffuse = float3(0.0);
+  float3 totalSpecular = float3(0.0);
+  float3 viewDir = normalize(-in.viewPos);
+
+  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
+    Light L = lights.lights[i];
+    int lightType = int(L.position.w);
+    float3 lightColor = L.color.rgb * L.color.w;
+    float attenuation = 1.0;
+    float df = 0.0;
+    float3 reflDir = float3(0.0);
+    float3 toLight = float3(0.0);
+
+    if (lightType == 0) {
+      toLight = float3(0.0, 0.0, 1.0);
+      df = max(N.z, 0.000001);
+      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
+    } else if (lightType == 1) {
+      toLight = normalize(-L.direction.xyz);
+      df = max(dot(N, toLight), 0.0);
+      reflDir = reflect(L.direction.xyz, N);
+    } else {
+      toLight = L.position.xyz - in.viewPos;
+      float dist = length(toLight);
+      toLight /= dist;
+      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
+      df = max(dot(N, toLight), 0.0);
+      reflDir = reflect(-toLight, N);
+      if (lightType == 3) {
+        float3 spotDir = normalize(L.direction.xyz);
+        float spotCos = dot(-toLight, spotDir);
+        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
+        if (spotCos > spotCutoff) {
+          attenuation *= pow(spotCos, L.attenuation.w);
+        } else {
+          attenuation = 0.0;
+        }
+      }
+    }
+
+    totalDiffuse += df * baseColor * lightColor * attenuation;
+    float NdotL = max(dot(N, toLight), 0.0);
+    if (NdotL > 0.0) {
+      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
+      totalSpecular += sf * material.specularColor.w * material.specularColor.rgb * lightColor * attenuation;
+    }
+  }
+
+  out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha);
+  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
+
+  // Coincident topology offset for lines
+  float c_factor = coinOffset.lineFactor;
+  float c_offset = coinOffset.lineOffset;
+  float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
+  out.depth = in.position.z + c_factor * cscale + c_offset / 65000.0;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // P2-8: Compute kernel for cell-to-primitive mapping
 // Maps each primitive (triangle/line segment) to its owning cell ID.
 // Mirrors WebGPU's VTKCellToGraphicsPrimitive.wgsl.
