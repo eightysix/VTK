@@ -2213,7 +2213,7 @@ vertex VolumeVertexOut vertex_volume_main(
   out.position = viewProjection * worldPos;
 
   float3 boundsSize = volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz;
-  out.localPos = (in.position - volumeUniforms.volumeBoundsMin.xyz) / boundsSize;
+  out.localPos = (worldPos.xyz - volumeUniforms.volumeBoundsMin.xyz) / boundsSize;
 
   return out;
 }
