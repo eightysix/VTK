@@ -248,19 +248,19 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       {
         case VTK_FLOAT:
         {
-          fmtInfo.bytesPerComponent = 2;
-          fmtInfo.needsConversion = true;
+          fmtInfo.bytesPerComponent = 4;
+          fmtInfo.needsConversion = false;
           fmtInfo.normalizationFactor = 1.0f;
           switch (componentsForFormat)
           {
             case 1:
-              fmtInfo.format = MTLPixelFormatR16Float;
+              fmtInfo.format = MTLPixelFormatR32Float;
               break;
             case 2:
-              fmtInfo.format = MTLPixelFormatRG16Float;
+              fmtInfo.format = MTLPixelFormatRG32Float;
               break;
             default:
-              fmtInfo.format = MTLPixelFormatRGBA16Float;
+              fmtInfo.format = MTLPixelFormatRGBA32Float;
               break;
           }
           break;
@@ -413,6 +413,29 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           }
         }
         uploadPointer = halfData.data();
+      }
+      else if (dataType == VTK_FLOAT)
+      {
+        if (numComponents == 3)
+        {
+          const float* src = static_cast<const float*>(scalars->GetVoidPointer(0));
+          conversionBuffer.resize(static_cast<size_t>(numTuples) * 4 * sizeof(float));
+          float* dst = reinterpret_cast<float*>(conversionBuffer.data());
+          vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+            for (vtkIdType i = begin; i < end; ++i)
+            {
+              dst[i * 4 + 0] = src[i * 3 + 0];
+              dst[i * 4 + 1] = src[i * 3 + 1];
+              dst[i * 4 + 2] = src[i * 3 + 2];
+              dst[i * 4 + 3] = 0.0f;
+            }
+          });
+          uploadPointer = conversionBuffer.data();
+        }
+        else
+        {
+          uploadPointer = scalars->GetVoidPointer(0);
+        }
       }
       else if (dataType == VTK_UNSIGNED_CHAR)
       {
