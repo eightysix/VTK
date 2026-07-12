@@ -2,7 +2,7 @@
 
 Track the implementation status of the VTK Metal rendering backend compared to the WebGPU reference implementation.
 
-Last updated: 2026-07-05
+Last updated: 2026-07-11
 
 ---
 
@@ -141,6 +141,8 @@ Last updated: 2026-07-05
 ---
 
 ## Recommended Priority Order for Closing Gaps
+
+See `IMPLEMENTATION_PLAN.md` for the full feature-by-feature implementation plan with file locations, code changes, and WebGPU references.
 
 1. **Per-vertex color for surfaces** — most visible gap; surfaces can't be colored by scalar arrays
 2. **Cell data coloring** — needed for cell-based scalar visualization
