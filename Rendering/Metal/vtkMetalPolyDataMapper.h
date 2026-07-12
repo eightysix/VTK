@@ -33,10 +33,12 @@ protected:
   void BuildGeometryBuffers(void* mtlDevice, vtkPolyData* polydata, vtkActor* actor);
   void EnsurePipelineStates(void* mtlDevice);
   void EnsurePointPipelineStates(void* mtlDevice);
+  void EnsureEdgePipelineState(void* mtlDevice);
   void UpdateMaterialUniforms(void* mtlDevice, vtkActor* actor);
   void UpdateLightUniforms(void* mtlDevice, vtkRenderer* ren);
   void UpdateCoincidentOffsetUniforms(void* mtlDevice, vtkActor* actor);
   void UpdateVertexColorUniforms(void* mtlDevice, vtkActor* actor);
+  void UpdateEdgeColorUniform(void* mtlDevice, vtkActor* actor);
   void UpdateClipPlaneUniforms(void* mtlDevice, vtkRenderer* ren);
 
 private:

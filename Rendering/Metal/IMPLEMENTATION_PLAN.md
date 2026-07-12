@@ -23,41 +23,21 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 
 ---
 
-## Phase 2: Edge & Wireframe Rendering
+## Phase 2: Edge & Wireframe Rendering ✅ COMPLETED
 
-### 2A. Wireframe Representation
+### 2A. Wireframe Representation ✅
 
-**Gap**: No `VTK_WIREFRAME` code path. Lines only come from explicit `GetLines()` cells.
-
-**Files**:
-- `vtkMetalPolyDataMapper.mm` — `BuildGeometryBuffers()`, `RenderPiece()`
-- `MetalShaders.metal` — no new shaders needed
-
-**Implementation**:
-1. In `BuildGeometryBuffers()`, when `representation == VTK_WIREFRAME`, extract edges from polygon cells: for each polygon with vertices `[v0, v1, ..., vn]`, emit line segments `(v0,v1), (v1,v2), ..., (vn-1,vn)`. This is the same line deduplication already done for `GetLines()`.
-2. In `RenderPiece()`, when representation is `VTK_WIREFRAME`, skip triangle drawing entirely and only draw lines.
-3. Store a `CachedRepresentation` and rebuild geometry buffers when representation changes (already partially done).
+**Status**: Implemented. When `representation == VTK_WIREFRAME`, polygon edges are extracted as line segments with vertex deduplication. `RenderPiece()` skips triangle drawing and only draws lines. Cache invalidation tracks representation changes.
 
 **WebGPU reference**: WebGPU handles this via `TopologyBindGroupInfos[TOPOLOGY_SOURCE_POLYGON_EDGES]` — the `CellToPrimitiveConverter` extracts polygon edges for wireframe mode.
 
-### 2B. Edge Visibility on Surfaces
+### 2B. Edge Visibility on Surfaces ✅
 
-**Gap**: No edge overlay rendering when `GetEdgeVisibility()` is true in `VTK_SURFACE` mode.
-
-**Files**:
-- `vtkMetalPolyDataMapper.mm` — `BuildGeometryBuffers()`, `RenderPiece()`
-- `MetalShaders.metal` — new shaders or modifications
-
-**Implementation**:
-1. When `representation == VTK_SURFACE && GetEdgeVisibility()`, after drawing filled triangles, draw wireframe edges on top with a slight depth bias.
-2. In `BuildGeometryBuffers()`, when edge visibility is on, also build an edge index buffer from polygon edges (same as wireframe path).
-3. Add a dedicated edge pipeline that renders lines with the edge color from `vtkProperty::GetEdgeColor()`.
-4. Apply coincident topology offset to push edges slightly forward (already have `CoincidentOffsetUniforms` with `lineFactor`/`lineOffset`).
-5. In fragment shader, use anti-aliased line rendering (alpha from distance to edge).
+**Status**: Implemented. When `representation == VTK_SURFACE && GetEdgeVisibility()`, separate edge geometry is built from polygon edges (with interior edge hiding for fan triangulation). Edge overlay is drawn after triangles with edge color from `vtkProperty::GetEdgeColor()` and coincident topology offset. Dedicated `EdgePipeline` with `fragment_edge_main` shader outputs flat edge color.
 
 **WebGPU reference**: `ReplaceVertexShaderEdges()` (line 3226), `ReplaceFragmentShaderEdges()` (line 3666) — computes per-vertex edge distances and blends edge color in fragment shader.
 
-### 2C. Triangle Index Buffers
+### 2C. Triangle Index Buffers — NOT YET IMPLEMENTED
 
 **Gap**: `IndexBuffer` field exists but is never populated. Triangles are non-indexed (3 unique verts per tri).
 
@@ -293,8 +273,8 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 | 3 | 1C — Cull mode | Trivial | Medium | ✅ Done |
 | 4 | 4A — Clipping planes | Small | Medium | — planes exist but do nothing |
 | 5 | 2C — Triangle index buffers | Small | Medium | — memory/perf improvement |
-| 6 | 2A — Wireframe representation | Medium | High | — SetRepresentationToWireframe() broken |
-| 7 | 2B — Edge visibility | Medium | High | — edge overlay missing |
+| 6 | 2A — Wireframe representation | Medium | High | ✅ Done |
+| 7 | 2B — Edge visibility | Medium | High | ✅ Done |
 | 8 | 3A — Thick lines | Medium | Medium | — line width ignored |
 | 9 | 5A — Texture mapping | Medium | Medium | — UVs buffered but unused |
 | 10 | 3B/3C — Round/miter joins | Large | Low | — niche line styles |

@@ -227,6 +227,30 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
 }
 
 // ---------------------------------------------------------------------------
+// P2-2B: Edge fragment shader — outputs flat edge color from uniform buffer
+// Used for wireframe overlay when edge visibility is on.
+// ---------------------------------------------------------------------------
+fragment FragmentOutput fragment_edge_main(VertexOut in [[stage_in]],
+                                   constant MaterialUniforms& material [[buffer(0)]],
+                                   constant LightUniforms& lights [[buffer(1)]],
+                                   constant SceneUniforms& scene [[buffer(2)]],
+                                   constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+                                   constant float4& edgeColor [[buffer(4)]]) {
+  FragmentOutput out;
+
+  // Output flat edge color with full opacity
+  out.color = float4(edgeColor.rgb, edgeColor.a * material.opacity);
+  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
+
+  // Coincident topology offset for lines — push edges forward to avoid z-fighting
+  float c_factor = coinOffset.lineFactor;
+  float c_offset = coinOffset.lineOffset;
+  float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
+  out.depth = in.position.z + c_factor * cscale + c_offset / 65000.0;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Point rendering shaders (basic 1px and shaped)
 // ---------------------------------------------------------------------------
 

@@ -95,8 +95,27 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   bool HasTriangles = false;
   bool HasLines = false;
 
+  // P2-2A: Wireframe representation — polygon edges extracted as line segments
+  // When representation == VTK_WIREFRAME, polygon edges are added to LineIndexBuffer
+  // and HasTriangles is set to false so only line drawing occurs.
+
+  // P2-2B: Edge visibility on surfaces — wireframe overlay on VTK_SURFACE
+  id<MTLBuffer> EdgeVertexPositionBuffer = nil; // edge vertex positions (separate from triangle positions)
+  id<MTLBuffer> EdgeVertexNormalBuffer = nil;   // edge vertex normals
+  id<MTLBuffer> EdgeSurfaceColorBuffer = nil;   // edge vertex colors (float4 per vertex)
+  id<MTLBuffer> EdgeIndexBuffer = nil;          // polygon edge indices for wireframe overlay
+  vtkIdType EdgeIndexCount = 0;
+  vtkIdType EdgeVertexCount = 0;
+  bool HasEdgeOverlay = false;
+  id<MTLBuffer> EdgeColorUniformBuffer = nil;   // edge color (float4 RGBA)
+  id<MTLRenderPipelineState> EdgePipeline = nil; // pipeline for edge rendering
+
+  // P2-2C: Triangle index buffers — deduplicated vertices + index buffer
+  // IndexBuffer is populated when vertices can be deduplicated.
+
   vtkIdType CachedInputMTime = 0;
   int CachedRepresentation = -1;
+  bool CachedEdgeVisibility = false;  // P2-2B: track edge visibility changes
 
   void ReleaseBuffers()
   {
@@ -108,6 +127,17 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     HasSurfaceColors = false;
     TrianglePipeline = nil;
     LinePipeline = nil;
+
+    // P2-2A/2B: Wireframe and edge overlay buffers
+    EdgeVertexPositionBuffer = nil;
+    EdgeVertexNormalBuffer = nil;
+    EdgeSurfaceColorBuffer = nil;
+    EdgeIndexBuffer = nil;
+    EdgeIndexCount = 0;
+    EdgeVertexCount = 0;
+    HasEdgeOverlay = false;
+    EdgeColorUniformBuffer = nil;
+    EdgePipeline = nil;
 
     PointPositionBuffer = nil;
     PointNormalBuffer = nil;
@@ -142,6 +172,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     HasLines = false;
     CachedInputMTime = 0;
     CachedRepresentation = -1;
+    CachedEdgeVisibility = false;
   }
 };
 
@@ -193,16 +224,20 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
 
     vtkIdType currentMTime = input->GetMTime();
     int representation = act->GetProperty()->GetRepresentation();
+    bool edgeVisibility = act->GetProperty()->GetEdgeVisibility();
     if (currentMTime != this->Internals->CachedInputMTime ||
-        representation != this->Internals->CachedRepresentation)
+        representation != this->Internals->CachedRepresentation ||
+        edgeVisibility != this->Internals->CachedEdgeVisibility)
     {
       this->Internals->ReleaseBuffers();
       this->Internals->CachedInputMTime = currentMTime;
       this->Internals->CachedRepresentation = representation;
+      this->Internals->CachedEdgeVisibility = edgeVisibility;
       this->BuildGeometryBuffers((__bridge void*)device, input, act);
     }
 
     bool hasGeometry = this->Internals->HasTriangles || this->Internals->HasLines ||
+                       this->Internals->HasEdgeOverlay ||
                        this->Internals->PointVertexCount > 0;
     if (!hasGeometry)
     {
@@ -272,7 +307,10 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     this->UpdateVertexColorUniforms((__bridge void*)device, act);
     this->UpdateClipPlaneUniforms((__bridge void*)device, ren);
 
-    if (this->Internals->HasTriangles && this->Internals->TrianglePipeline)
+    // P2-2A: Skip triangle drawing when in wireframe mode
+    bool skipTriangles = (representation == VTK_WIREFRAME);
+
+    if (!skipTriangles && this->Internals->HasTriangles && this->Internals->TrianglePipeline)
     {
       [encoder setRenderPipelineState:this->Internals->TrianglePipeline];
       [encoder setVertexBuffer:this->Internals->VertexPositionBuffer offset:0 atIndex:0];
@@ -401,6 +439,75 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
                           indexCount:this->Internals->LineIndexCount
                            indexType:MTLIndexTypeUInt32
                          indexBuffer:this->Internals->LineIndexBuffer
+                   indexBufferOffset:0];
+    }
+
+    // P2-2B: Edge visibility — draw wireframe edges on top of surfaces
+    if (representation == VTK_SURFACE && act->GetProperty()->GetEdgeVisibility() &&
+        this->Internals->HasEdgeOverlay && this->Internals->EdgePipeline &&
+        this->Internals->EdgeIndexBuffer)
+    {
+      // Ensure edge pipeline is created
+      this->EnsureEdgePipelineState((__bridge void*)device);
+      if (!this->Internals->EdgePipeline)
+      {
+        return;
+      }
+
+      // Update edge color uniform
+      this->UpdateEdgeColorUniform((__bridge void*)device, act);
+
+      [encoder setRenderPipelineState:this->Internals->EdgePipeline];
+      // P2-2B: Use separate edge vertex buffers (not the main triangle position buffer)
+      [encoder setVertexBuffer:this->Internals->EdgeVertexPositionBuffer offset:0 atIndex:0];
+      if (this->Internals->EdgeVertexNormalBuffer)
+      {
+        [encoder setVertexBuffer:this->Internals->EdgeVertexNormalBuffer offset:0 atIndex:1];
+      }
+      // P1-1A/1B: bind per-vertex color buffer at vertex buffer index 3
+      if (this->Internals->EdgeSurfaceColorBuffer)
+      {
+        [encoder setVertexBuffer:this->Internals->EdgeSurfaceColorBuffer offset:0 atIndex:3];
+      }
+
+      // Bind scene uniforms to vertex buffer(2) and fragment buffer(2)
+      if (this->Internals->SceneUniformBuffer)
+      {
+        [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
+        [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
+      }
+      // Bind coincident offset to fragment buffer(3) for line offset
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
+      }
+      // Bind edge color to fragment buffer(4)
+      if (this->Internals->EdgeColorUniformBuffer)
+      {
+        [encoder setFragmentBuffer:this->Internals->EdgeColorUniformBuffer offset:0 atIndex:4];
+      }
+      // Bind material to fragment buffer(0) for opacity
+      if (this->Internals->MaterialUniformBuffer)
+      {
+        [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
+      }
+      // Bind picking IDs for edge rendering (use line cell ID buffer)
+      if (this->Internals->LineCellIdBuffer)
+      {
+        [encoder setVertexBuffer:this->Internals->LineCellIdBuffer offset:0 atIndex:6];
+      }
+      if (this->Internals->PropIdBuffer)
+      {
+        [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:7];
+      }
+
+      // No backface culling for edges
+      [encoder setCullMode:MTLCullModeNone];
+
+      [encoder drawIndexedPrimitives:MTLPrimitiveTypeLine
+                          indexCount:this->Internals->EdgeIndexCount
+                           indexType:MTLIndexTypeUInt32
+                         indexBuffer:this->Internals->EdgeIndexBuffer
                    indexBufferOffset:0];
     }
 
@@ -698,9 +805,20 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   std::vector<float> surfaceColors;  // P1-1A/1B: float4 per vertex
   std::vector<uint32_t> lineIndices;
 
+  // P2-2B: Edge geometry for wireframe overlay on surfaces (separate vertex + index buffers)
+  std::vector<float> edgePositions;
+  std::vector<float> edgeNormals;
+  std::vector<float> edgeColors;
+  std::vector<uint32_t> edgeIndices;
+  std::unordered_map<vtkIdType, uint32_t> edgeVertexMap;
+
   // P2-8: per-primitive cell ID mapping (primitive index → cell index)
   std::vector<uint32_t> trianglePrimToCell;
   std::vector<uint32_t> linePrimToCell;
+
+  // Get representation for wireframe/edge handling
+  int representation = actor ? actor->GetProperty()->GetRepresentation() : VTK_SURFACE;
+  bool edgeVisibility = actor ? actor->GetProperty()->GetEdgeVisibility() : false;
 
   vtkPointData* pd = polydata->GetPointData();
   vtkFloatArray* normalArray = nullptr;
@@ -717,9 +835,11 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     mappedColors = this->MapScalars(actor->GetProperty()->GetOpacity(), cellFlag);
   }
 
-  // Process triangles
+  // Process polygons — handles VTK_WIREFRAME, VTK_SURFACE, and edge visibility
   vtkCellArray* polys = polydata->GetPolys();
   vtkIdType polyCellIdx = 0;
+  // P2-2A: Vertex deduplication map for wireframe polygon edges
+  std::unordered_map<vtkIdType, uint32_t> wireVertexMap;
   if (polys && polys->GetNumberOfCells() > 0)
   {
     vtkIdType npts;
@@ -731,78 +851,273 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       {
         continue;
       }
-      // Fan-triangulate polygon
-      for (vtkIdType i = 1; i < npts - 1; ++i)
+
+      if (representation == VTK_WIREFRAME)
       {
-        vtkIdType tri[3] = { pts[0], pts[i], pts[i + 1] };
-        double p[3][3];
-        for (int j = 0; j < 3; ++j)
+        // P2-2A: Wireframe — extract edges from polygon as line segments.
+        // For each polygon with vertices [v0, v1, ..., vn-1], emit line segments
+        // (v0,v1), (v1,v2), ..., (vn-2,vn-1), (vn-1,v0) — closing the polygon.
+        // This matches WebGPU's polygon_edges_to_lines compute shader.
+        // Deduplicate vertices by point ID to avoid duplicates for shared edges.
+        for (vtkIdType i = 0; i < npts; ++i)
         {
-          polydata->GetPoint(tri[j], p[j]);
-        }
+          vtkIdType v0 = pts[i];
+          vtkIdType v1 = pts[(i + 1) % npts];  // wraps to close polygon
 
-        // Compute face normal
-        float e1[3] = { (float)(p[1][0] - p[0][0]), (float)(p[1][1] - p[0][1]), (float)(p[1][2] - p[0][2]) };
-        float e2[3] = { (float)(p[2][0] - p[0][0]), (float)(p[2][1] - p[0][1]), (float)(p[2][2] - p[0][2]) };
-        float fn[3] = { 0.0f, 1.0f, 0.0f };
-
-        if (normalArray)
-        {
-          double nn[3];
-          normalArray->GetTuple(tri[0], nn);
-          fn[0] = (float)nn[0]; fn[1] = (float)nn[1]; fn[2] = (float)nn[2];
-        }
-        else
-        {
-          float ne1 = std::sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
-          float ne2 = std::sqrt(e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]);
-          if (ne1 > 1e-8f && ne2 > 1e-8f)
+          // Add vertex v0 if not already added
+          auto it0 = wireVertexMap.find(v0);
+          uint32_t idx0;
+          if (it0 == wireVertexMap.end())
           {
-            e1[0] /= ne1; e1[1] /= ne1; e1[2] /= ne1;
-            e2[0] /= ne2; e2[1] /= ne2; e2[2] /= ne2;
-          }
-          fn[0] = e1[1] * e2[2] - e1[2] * e2[1];
-          fn[1] = e1[2] * e2[0] - e1[0] * e2[2];
-          fn[2] = e1[0] * e2[1] - e1[1] * e2[0];
-          float nn = std::sqrt(fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2]);
-          if (nn > 1e-8f) { fn[0] /= nn; fn[1] /= nn; fn[2] /= nn; }
-        }
+            idx0 = static_cast<uint32_t>(positions.size() / 3);
+            wireVertexMap[v0] = idx0;
 
-        // Emit 3 vertices per triangle (no index buffer needed when computing normals)
-        for (int j = 0; j < 3; ++j)
-        {
-          positions.push_back(static_cast<float>(p[j][0]));
-          positions.push_back(static_cast<float>(p[j][1]));
-          positions.push_back(static_cast<float>(p[j][2]));
-          normals.push_back(fn[0]);
-          normals.push_back(fn[1]);
-          normals.push_back(fn[2]);
-
-          // P1-1A/1B: per-vertex color from scalar mapping
-          if (mappedColors)
-          {
-            const unsigned char* rgba = mappedColors->GetPointer(0);
-            vtkIdType idx = (cellFlag == 0) ? tri[j] : polyCellIdx;
-            surfaceColors.push_back(rgba[idx * 4] / 255.0f);
-            surfaceColors.push_back(rgba[idx * 4 + 1] / 255.0f);
-            surfaceColors.push_back(rgba[idx * 4 + 2] / 255.0f);
-            surfaceColors.push_back(rgba[idx * 4 + 3] / 255.0f);
+            double p[3];
+            polydata->GetPoint(v0, p);
+            positions.push_back(static_cast<float>(p[0]));
+            positions.push_back(static_cast<float>(p[1]));
+            positions.push_back(static_cast<float>(p[2]));
+            if (normalArray)
+            {
+              double n[3];
+              normalArray->GetTuple(v0, n);
+              normals.push_back(static_cast<float>(n[0]));
+              normals.push_back(static_cast<float>(n[1]));
+              normals.push_back(static_cast<float>(n[2]));
+            }
+            // Color for wireframe vertex
+            if (mappedColors)
+            {
+              const unsigned char* rgba = mappedColors->GetPointer(0);
+              vtkIdType idx = (cellFlag == 0) ? v0 : polyCellIdx;
+              surfaceColors.push_back(rgba[idx * 4] / 255.0f);
+              surfaceColors.push_back(rgba[idx * 4 + 1] / 255.0f);
+              surfaceColors.push_back(rgba[idx * 4 + 2] / 255.0f);
+              surfaceColors.push_back(rgba[idx * 4 + 3] / 255.0f);
+            }
+            else
+            {
+              surfaceColors.push_back(1.0f);
+              surfaceColors.push_back(1.0f);
+              surfaceColors.push_back(1.0f);
+              surfaceColors.push_back(1.0f);
+            }
           }
           else
           {
-            surfaceColors.push_back(1.0f);
-            surfaceColors.push_back(1.0f);
-            surfaceColors.push_back(1.0f);
-            surfaceColors.push_back(1.0f);
+            idx0 = it0->second;
+          }
+
+          // Add vertex v1 if not already added
+          auto it1 = wireVertexMap.find(v1);
+          uint32_t idx1;
+          if (it1 == wireVertexMap.end())
+          {
+            idx1 = static_cast<uint32_t>(positions.size() / 3);
+            wireVertexMap[v1] = idx1;
+
+            double p[3];
+            polydata->GetPoint(v1, p);
+            positions.push_back(static_cast<float>(p[0]));
+            positions.push_back(static_cast<float>(p[1]));
+            positions.push_back(static_cast<float>(p[2]));
+            if (normalArray)
+            {
+              double n[3];
+              normalArray->GetTuple(v1, n);
+              normals.push_back(static_cast<float>(n[0]));
+              normals.push_back(static_cast<float>(n[1]));
+              normals.push_back(static_cast<float>(n[2]));
+            }
+            // Color for wireframe vertex
+            if (mappedColors)
+            {
+              const unsigned char* rgba = mappedColors->GetPointer(0);
+              vtkIdType idx = (cellFlag == 0) ? v1 : polyCellIdx;
+              surfaceColors.push_back(rgba[idx * 4] / 255.0f);
+              surfaceColors.push_back(rgba[idx * 4 + 1] / 255.0f);
+              surfaceColors.push_back(rgba[idx * 4 + 2] / 255.0f);
+              surfaceColors.push_back(rgba[idx * 4 + 3] / 255.0f);
+            }
+            else
+            {
+              surfaceColors.push_back(1.0f);
+              surfaceColors.push_back(1.0f);
+              surfaceColors.push_back(1.0f);
+              surfaceColors.push_back(1.0f);
+            }
+          }
+          else
+          {
+            idx1 = it1->second;
+          }
+
+          lineIndices.push_back(idx0);
+          lineIndices.push_back(idx1);
+          linePrimToCell.push_back(static_cast<uint32_t>(polyCellIdx));
+        }
+      }
+      else
+      {
+        // VTK_SURFACE: Fan-triangulate polygon for filled rendering
+        for (vtkIdType i = 1; i < npts - 1; ++i)
+        {
+          vtkIdType tri[3] = { pts[0], pts[i], pts[i + 1] };
+          double p[3][3];
+          for (int j = 0; j < 3; ++j)
+          {
+            polydata->GetPoint(tri[j], p[j]);
+          }
+
+          // Compute face normal
+          float e1[3] = { (float)(p[1][0] - p[0][0]), (float)(p[1][1] - p[0][1]), (float)(p[1][2] - p[0][2]) };
+          float e2[3] = { (float)(p[2][0] - p[0][0]), (float)(p[2][1] - p[0][1]), (float)(p[2][2] - p[0][2]) };
+          float fn[3] = { 0.0f, 1.0f, 0.0f };
+
+          if (normalArray)
+          {
+            double nn[3];
+            normalArray->GetTuple(tri[0], nn);
+            fn[0] = (float)nn[0]; fn[1] = (float)nn[1]; fn[2] = (float)nn[2];
+          }
+          else
+          {
+            float ne1 = std::sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
+            float ne2 = std::sqrt(e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]);
+            if (ne1 > 1e-8f && ne2 > 1e-8f)
+            {
+              e1[0] /= ne1; e1[1] /= ne1; e1[2] /= ne1;
+              e2[0] /= ne2; e2[1] /= ne2; e2[2] /= ne2;
+            }
+            fn[0] = e1[1] * e2[2] - e1[2] * e2[1];
+            fn[1] = e1[2] * e2[0] - e1[0] * e2[2];
+            fn[2] = e1[0] * e2[1] - e1[1] * e2[0];
+            float nn = std::sqrt(fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2]);
+            if (nn > 1e-8f) { fn[0] /= nn; fn[1] /= nn; fn[2] /= nn; }
+          }
+
+          // Emit 3 vertices per triangle
+          for (int j = 0; j < 3; ++j)
+          {
+            positions.push_back(static_cast<float>(p[j][0]));
+            positions.push_back(static_cast<float>(p[j][1]));
+            positions.push_back(static_cast<float>(p[j][2]));
+            normals.push_back(fn[0]);
+            normals.push_back(fn[1]);
+            normals.push_back(fn[2]);
+
+            // P1-1A/1B: per-vertex color from scalar mapping
+            if (mappedColors)
+            {
+              const unsigned char* rgba = mappedColors->GetPointer(0);
+              vtkIdType idx = (cellFlag == 0) ? tri[j] : polyCellIdx;
+              surfaceColors.push_back(rgba[idx * 4] / 255.0f);
+              surfaceColors.push_back(rgba[idx * 4 + 1] / 255.0f);
+              surfaceColors.push_back(rgba[idx * 4 + 2] / 255.0f);
+              surfaceColors.push_back(rgba[idx * 4 + 3] / 255.0f);
+            }
+            else
+            {
+              surfaceColors.push_back(1.0f);
+              surfaceColors.push_back(1.0f);
+              surfaceColors.push_back(1.0f);
+              surfaceColors.push_back(1.0f);
+            }
+          }
+          trianglePrimToCell.push_back(static_cast<uint32_t>(polyCellIdx));
+
+          // P2-2B: When edge visibility is on, also build edge index buffer from polygon edges
+          if (edgeVisibility)
+          {
+            // Extract polygon edges for wireframe overlay.
+            // For the first triangle in the fan, emit edges (v0,v1) and (v0,v2)
+            // For middle triangles, emit edge (v0,v1) only (the diagonal)
+            // For the last triangle, emit edges (v0,v1) and (v1,v2)
+            // This hides interior edges shared between triangles in the fan.
+            // Use edgeVertexMap to deduplicate vertices by original point ID.
+            auto addEdgeVertex = [&](vtkIdType pointId) -> uint32_t {
+              auto it = edgeVertexMap.find(pointId);
+              if (it != edgeVertexMap.end())
+              {
+                return it->second;
+              }
+              // Add new vertex to separate edge buffers
+              uint32_t idx = static_cast<uint32_t>(edgePositions.size() / 3);
+              edgeVertexMap[pointId] = idx;
+
+              double pt[3];
+              polydata->GetPoint(pointId, pt);
+              edgePositions.push_back(static_cast<float>(pt[0]));
+              edgePositions.push_back(static_cast<float>(pt[1]));
+              edgePositions.push_back(static_cast<float>(pt[2]));
+              if (normalArray)
+              {
+                double n[3];
+                normalArray->GetTuple(pointId, n);
+                edgeNormals.push_back(static_cast<float>(n[0]));
+                edgeNormals.push_back(static_cast<float>(n[1]));
+                edgeNormals.push_back(static_cast<float>(n[2]));
+              }
+              if (mappedColors)
+              {
+                const unsigned char* rgba = mappedColors->GetPointer(0);
+                vtkIdType idx2 = (cellFlag == 0) ? pointId : polyCellIdx;
+                edgeColors.push_back(rgba[idx2 * 4] / 255.0f);
+                edgeColors.push_back(rgba[idx2 * 4 + 1] / 255.0f);
+                edgeColors.push_back(rgba[idx2 * 4 + 2] / 255.0f);
+                edgeColors.push_back(rgba[idx2 * 4 + 3] / 255.0f);
+              }
+              else
+              {
+                edgeColors.push_back(1.0f);
+                edgeColors.push_back(1.0f);
+                edgeColors.push_back(1.0f);
+                edgeColors.push_back(1.0f);
+              }
+              return idx;
+            };
+
+            if (i == 1)
+            {
+              // First triangle: emit edges (v0,v1) and (v0,v2) — two boundary edges
+              edgeIndices.push_back(addEdgeVertex(tri[0]));
+              edgeIndices.push_back(addEdgeVertex(tri[1]));
+              edgeIndices.push_back(addEdgeVertex(tri[0]));
+              edgeIndices.push_back(addEdgeVertex(tri[2]));
+            }
+            else if (i == npts - 2)
+            {
+              // Last triangle: emit edges (v0,v1) and (v1,v2) — two boundary edges
+              edgeIndices.push_back(addEdgeVertex(tri[0]));
+              edgeIndices.push_back(addEdgeVertex(tri[1]));
+              edgeIndices.push_back(addEdgeVertex(tri[1]));
+              edgeIndices.push_back(addEdgeVertex(tri[2]));
+            }
+            else
+            {
+              // Middle triangle: emit only edge (v0,v1) — the polygon boundary edge
+              edgeIndices.push_back(addEdgeVertex(tri[0]));
+              edgeIndices.push_back(addEdgeVertex(tri[1]));
+            }
           }
         }
-        trianglePrimToCell.push_back(static_cast<uint32_t>(polyCellIdx));
       }
       polyCellIdx++;
     }
-    this->Internals->TriangleVertexCount = static_cast<uint32_t>(positions.size() / 3);
-    this->Internals->TriangleIndexCount = 0;
-    this->Internals->HasTriangles = !positions.empty();
+
+    if (representation == VTK_WIREFRAME)
+    {
+      // Wireframe: no triangles, only lines
+      this->Internals->TriangleVertexCount = 0;
+      this->Internals->TriangleIndexCount = 0;
+      this->Internals->HasTriangles = false;
+    }
+    else
+    {
+      this->Internals->TriangleVertexCount = static_cast<uint32_t>(positions.size() / 3);
+      this->Internals->TriangleIndexCount = 0;
+      this->Internals->HasTriangles = !positions.empty();
+    }
   }
 
   // Process lines
@@ -952,6 +1267,36 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       newBufferWithBytes:lineIndices.data()
                  length:lineIndices.size() * sizeof(uint32_t)
                 options:MTLResourceStorageModeShared];
+  }
+
+  // P2-2B: Create edge geometry buffers for wireframe overlay on surfaces
+  if (!edgeIndices.empty() && !edgePositions.empty())
+  {
+    this->Internals->EdgeVertexPositionBuffer = [device
+      newBufferWithBytes:edgePositions.data()
+                 length:edgePositions.size() * sizeof(float)
+                options:MTLResourceStorageModeShared];
+    if (!edgeNormals.empty())
+    {
+      this->Internals->EdgeVertexNormalBuffer = [device
+        newBufferWithBytes:edgeNormals.data()
+                   length:edgeNormals.size() * sizeof(float)
+                  options:MTLResourceStorageModeShared];
+    }
+    if (!edgeColors.empty())
+    {
+      this->Internals->EdgeSurfaceColorBuffer = [device
+        newBufferWithBytes:edgeColors.data()
+                   length:edgeColors.size() * sizeof(float)
+                  options:MTLResourceStorageModeShared];
+    }
+    this->Internals->EdgeIndexBuffer = [device
+      newBufferWithBytes:edgeIndices.data()
+                 length:edgeIndices.size() * sizeof(uint32_t)
+                options:MTLResourceStorageModeShared];
+    this->Internals->EdgeIndexCount = edgeIndices.size();
+    this->Internals->EdgeVertexCount = edgePositions.size() / 3;
+    this->Internals->HasEdgeOverlay = true;
   }
 
   // P1-1A/1B: Create surface color buffer (float4 per triangle/line vertex)
@@ -1423,6 +1768,66 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
 }
 
 //------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::EnsureEdgePipelineState(void* mtlDevice)
+{
+  if (this->Internals->EdgePipeline)
+  {
+    return;
+  }
+
+  id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
+
+  NSError* error = nil;
+  NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
+  id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+  if (!library)
+  {
+    vtkErrorMacro(<< "Failed to compile Metal shader for edges: "
+                  << [[error localizedDescription] UTF8String]);
+    return;
+  }
+
+  // Edge pipeline uses vertex_main + fragment_edge_main
+  // vertex_main: transforms position, outputs vertex color
+  // fragment_edge_main: outputs flat edge color from uniform
+  id<MTLFunction> vFunc = [library newFunctionWithName:@"vertex_main"];
+  id<MTLFunction> fFunc = [library newFunctionWithName:@"fragment_edge_main"];
+  if (vFunc && fFunc)
+  {
+    MTLVertexDescriptor* vertexDesc = [[MTLVertexDescriptor alloc] init];
+    vertexDesc.attributes[0].format = MTLVertexFormatFloat3;
+    vertexDesc.attributes[0].offset = 0;
+    vertexDesc.attributes[0].bufferIndex = 0;
+    vertexDesc.attributes[1].format = MTLVertexFormatFloat3;
+    vertexDesc.attributes[1].offset = 0;
+    vertexDesc.attributes[1].bufferIndex = 1;
+    vertexDesc.layouts[0].stride = sizeof(float) * 3;
+    vertexDesc.layouts[0].stepRate = 1;
+    vertexDesc.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
+    vertexDesc.layouts[1].stride = sizeof(float) * 3;
+    vertexDesc.layouts[1].stepRate = 1;
+    vertexDesc.layouts[1].stepFunction = MTLVertexStepFunctionPerVertex;
+
+    MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+    desc.vertexFunction = vFunc;
+    desc.fragmentFunction = fFunc;
+    desc.vertexDescriptor = vertexDesc;
+    desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+    desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassLine;
+
+    error = nil;
+    this->Internals->EdgePipeline =
+      [device newRenderPipelineStateWithDescriptor:desc error:&error];
+    if (!this->Internals->EdgePipeline)
+    {
+      vtkErrorMacro(<< "Edge pipeline: " << [[error localizedDescription] UTF8String]);
+    }
+  }
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalPolyDataMapper::UpdateMaterialUniforms(void* mtlDevice, vtkActor* actor)
 {
   if (!actor || !mtlDevice)
@@ -1733,6 +2138,36 @@ void vtkMetalPolyDataMapper::UpdateVertexColorUniforms(void* mtlDevice, vtkActor
                  options:MTLResourceStorageModeShared];
   }
   memcpy([this->Internals->VertexColorBuffer contents], vc, sizeof(vc));
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::UpdateEdgeColorUniform(void* mtlDevice, vtkActor* actor)
+{
+  if (!mtlDevice || !actor)
+  {
+    return;
+  }
+
+  id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
+
+  // EdgeColorUniforms layout: float4 (16 bytes)
+  // RGB from vtkProperty::GetEdgeColor(), alpha = 1.0
+  float ec[4] = { 0.0f, 0.0f, 0.0f, 1.0f };  // default black
+
+  double edgeCol[3];
+  actor->GetProperty()->GetEdgeColor(edgeCol);
+  ec[0] = static_cast<float>(edgeCol[0]);
+  ec[1] = static_cast<float>(edgeCol[1]);
+  ec[2] = static_cast<float>(edgeCol[2]);
+  ec[3] = 1.0f;
+
+  if (!this->Internals->EdgeColorUniformBuffer)
+  {
+    this->Internals->EdgeColorUniformBuffer = [device
+      newBufferWithLength:sizeof(ec)
+                 options:MTLResourceStorageModeShared];
+  }
+  memcpy([this->Internals->EdgeColorUniformBuffer contents], ec, sizeof(ec));
 }
 
 //------------------------------------------------------------------------------
