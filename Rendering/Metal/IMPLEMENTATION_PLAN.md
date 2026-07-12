@@ -224,15 +224,21 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 
 **WebGPU reference**: Not yet implemented in WebGPU backend. Algorithm based on `vtkDualDepthPeelingPass` (OpenGL2).
 
-### 8C. Render Bundles
+### 8C. Render Bundles ✅
+
+**Status**: Implemented. Render bundle caching pre-records encoder commands (pipeline states, buffer bindings, draw calls) into a `RenderBundle` on first frame, then replays them directly on subsequent frames when geometry hasn't changed. This eliminates CPU encoding overhead for static scenes.
+
+**Mechanism**:
+1. `RenderBundleDrawCommand` stores individual encoder operations (set pipeline, bind buffer, draw, etc.) via a `std::variant`-based tagged union.
+2. `RenderBundle` holds a `std::vector<RenderBundleDrawCommand>` of the full command sequence for a mapper's draw calls.
+3. `RebuildRenderBundle()` records all geometry-related encoder commands (triangles, lines, edge overlay, vertex visibility, points) into the bundle. It mirrors the exact encoder command sequence that was previously inline in `RenderPiece()`.
+4. `ReplayRenderBundle()` iterates through cached commands and issues them on the current `MTLRenderCommandEncoder`. Since Metal buffer objects persist across frames and uniform buffers are updated in-place, replaying the same buffer bindings reads the latest content automatically.
+5. `RenderPiece()` checks bundle validity by comparing current geometry state (MTime, representation, edge visibility, line width, MSAA sample count, peel mode) against values at bundle creation. If valid, only `ReplayRenderBundle()` is called. If invalid, `RebuildRenderBundle()` + `ReplayRenderBundle()` are called.
+
+**Invalidation triggers**: Geometry MTime change, representation change, edge visibility toggle, line width change, MSAA sample count change, depth peeling mode change, or `ReleaseGraphicsResources()`.
 
 **Files**:
-- `vtkMetalPolyDataMapper.mm` — command buffer caching
-
-**Implementation**:
-1. Metal doesn't have an exact equivalent of WebGPU render bundles, but command buffers can be pre-recorded and replayed.
-2. Use `MTLCommandBuffer` caching for static geometry.
-3. Detect when geometry hasn't changed and replay cached command buffer.
+- `vtkMetalPolyDataMapper.mm` — `RenderBundleDrawCommand`, `RenderBundle` structs, `ReplayRenderBundle()`, `RebuildRenderBundle()`, bundle validity tracking fields, modified `RenderPiece()` to use bundle
 
 ### 8D. Vertex Attribute Mapping
 
@@ -270,7 +276,7 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 | 15 | 7C — Composite delegator | Large | Low | ✅ Done |
 | 16 | 8B — Depth peeling | Large | Low | ✅ Done |
 | 17 | 7D — Glyph3D mapper | Large | Low | ✅ Done |
-| 18 | 8C — Render bundles | Large | Low | — perf optimization |
+| 18 | 8C — Render bundles | Large | Low | ✅ Done |
 | 19 | 8D — Vertex attribute mapping | Medium | Low | — custom attributes |
 
 ---

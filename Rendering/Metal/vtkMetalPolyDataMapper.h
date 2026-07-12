@@ -46,6 +46,10 @@ protected:
   void UpdateActorTexture(void* mtlDevice, vtkActor* actor);
   void EnsurePeelPipelineStates(void* mtlDevice);
 
+  // 8C: Render bundle caching — pre-recorded encoder commands for static geometry
+  void ReplayRenderBundle(void* mtlRenderCommandEncoder);
+  void RebuildRenderBundle(void* mtlRenderCommandEncoder, vtkRenderer* ren, vtkActor* act);
+
 private:
   vtkMetalPolyDataMapper(const vtkMetalPolyDataMapper&) = delete;
   void operator=(const vtkMetalPolyDataMapper&) = delete;

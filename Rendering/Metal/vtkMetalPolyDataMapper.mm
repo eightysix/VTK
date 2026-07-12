@@ -40,6 +40,7 @@
 #include <vector>
 #include <unordered_map>
 #include <cmath>
+#include <variant>
 
 VTK_ABI_NAMESPACE_BEGIN
 
@@ -161,6 +162,99 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   float CachedLineWidth = -1.0f;     // P3-3A: track line width changes
   int CachedSampleCount = 0;        // 8A: track MSAA sample count changes
 
+  // 8C: Render bundle caching — pre-recorded encoder commands for static geometry
+  // When geometry hasn't changed between frames, replay cached commands instead of
+  // re-encoding all setVertexBuffer/setFragmentBuffer/drawPrimitives calls.
+  // This eliminates CPU encoding overhead for static scenes.
+  struct RenderBundleDrawCommand
+  {
+    enum Type
+    {
+      SetPipelineState,
+      SetVertexBuffer,
+      SetFragmentBuffer,
+      SetFragmentTexture,
+      SetFragmentSamplerState,
+      SetCullMode,
+      DrawPrimitives,
+      DrawIndexedPrimitives
+    };
+    Type type;
+
+    // Polymorphic params via variant
+    struct SetPipelineStateParams
+    {
+      id<MTLRenderPipelineState> pipeline;
+    };
+    struct SetBufferParams
+    {
+      id<MTLBuffer> buffer;
+      NSUInteger offset;
+      NSUInteger index;
+    };
+    struct SetTextureParams
+    {
+      id<MTLTexture> texture;
+      NSUInteger index;
+    };
+    struct SetSamplerParams
+    {
+      id<MTLSamplerState> sampler;
+      NSUInteger index;
+    };
+    struct SetCullModeParams
+    {
+      MTLCullMode mode;
+    };
+    struct DrawPrimitivesParams
+    {
+      MTLPrimitiveType primitiveType;
+      NSUInteger vertexStart;
+      NSUInteger vertexCount;
+      NSUInteger instanceCount; // 0 for non-instanced
+    };
+    struct DrawIndexedPrimitivesParams
+    {
+      MTLPrimitiveType primitiveType;
+      NSUInteger indexCount;
+      MTLIndexType indexType;
+      id<MTLBuffer> indexBuffer;
+      NSUInteger indexBufferOffset;
+    };
+
+    using Params = std::variant<SetPipelineStateParams, SetBufferParams, SetTextureParams,
+      SetSamplerParams, SetCullModeParams, DrawPrimitivesParams, DrawIndexedPrimitivesParams>;
+    Params params;
+  };
+
+  struct RenderBundle
+  {
+    std::vector<RenderBundleDrawCommand> Commands;
+    bool Valid = false;
+
+    void Invalidate()
+    {
+      Commands.clear();
+      Valid = false;
+    }
+  };
+
+  RenderBundle Bundle;
+
+  // Bundle validity tracking — detects when the bundle needs rebuilding.
+  // Bundle is valid only when ALL of these match the values at bundle creation time.
+  vtkIdType BundleGeometryMTime = 0;
+  int BundleRepresentation = -1;
+  bool BundleEdgeVisibility = false;
+  float BundleLineWidth = -1.0f;
+  int BundleSampleCount = 0;
+  int BundlePeelMode = 0;
+
+  void InvalidateRenderBundle()
+  {
+    Bundle.Invalidate();
+  }
+
   void ReleaseBuffers()
   {
     VertexPositionBuffer = nil;
@@ -250,6 +344,15 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     TriangleInitPeelPipeline = nil;
     TrianglePeelPipeline = nil;
     PeelUniformBuffer = nil;
+
+    // 8C: Render bundle invalidation — geometry changed, cached commands are stale
+    InvalidateRenderBundle();
+    BundleGeometryMTime = 0;
+    BundleRepresentation = -1;
+    BundleEdgeVisibility = false;
+    BundleLineWidth = -1.0f;
+    BundleSampleCount = 0;
+    BundlePeelMode = 0;
   }
 };
 
@@ -278,6 +381,802 @@ vtkMetalPolyDataMapper::MapperHashType vtkMetalPolyDataMapper::GenerateHash(vtkP
 void vtkMetalPolyDataMapper::ReleaseGraphicsResources(vtkWindow*)
 {
   this->Internals->ReleaseBuffers();
+}
+
+//------------------------------------------------------------------------------
+// 8C: Render bundle — replay cached encoder commands on the current render encoder.
+// Uniform buffers (scene, material, light, etc.) are updated in-place each frame,
+// so replaying the same buffer bindings reads the latest content automatically.
+void vtkMetalPolyDataMapper::ReplayRenderBundle(void* mtlEncoder)
+{
+  id<MTLRenderCommandEncoder> encoder = (__bridge id<MTLRenderCommandEncoder>)mtlEncoder;
+  using Cmd = vtkMetalPolyDataMapperInternals::RenderBundleDrawCommand;
+  for (const auto& cmd : this->Internals->Bundle.Commands)
+  {
+    switch (cmd.type)
+    {
+      case Cmd::SetPipelineState:
+        [encoder setRenderPipelineState:std::get<Cmd::SetPipelineStateParams>(cmd.params).pipeline];
+        break;
+      case Cmd::SetVertexBuffer:
+      {
+        const auto& p = std::get<Cmd::SetBufferParams>(cmd.params);
+        [encoder setVertexBuffer:p.buffer offset:p.offset atIndex:p.index];
+        break;
+      }
+      case Cmd::SetFragmentBuffer:
+      {
+        const auto& p = std::get<Cmd::SetBufferParams>(cmd.params);
+        [encoder setFragmentBuffer:p.buffer offset:p.offset atIndex:p.index];
+        break;
+      }
+      case Cmd::SetFragmentTexture:
+      {
+        const auto& p = std::get<Cmd::SetTextureParams>(cmd.params);
+        [encoder setFragmentTexture:p.texture atIndex:p.index];
+        break;
+      }
+      case Cmd::SetFragmentSamplerState:
+      {
+        const auto& p = std::get<Cmd::SetSamplerParams>(cmd.params);
+        [encoder setFragmentSamplerState:p.sampler atIndex:p.index];
+        break;
+      }
+      case Cmd::SetCullMode:
+        [encoder setCullMode:std::get<Cmd::SetCullModeParams>(cmd.params).mode];
+        break;
+      case Cmd::DrawPrimitives:
+      {
+        const auto& p = std::get<Cmd::DrawPrimitivesParams>(cmd.params);
+        if (p.instanceCount > 0)
+        {
+          [encoder drawPrimitives:p.primitiveType
+                      vertexStart:p.vertexStart
+                    vertexCount:p.vertexCount
+                  instanceCount:p.instanceCount];
+        }
+        else
+        {
+          [encoder drawPrimitives:p.primitiveType
+                      vertexStart:p.vertexStart
+                    vertexCount:p.vertexCount];
+        }
+        break;
+      }
+      case Cmd::DrawIndexedPrimitives:
+      {
+        const auto& p = std::get<Cmd::DrawIndexedPrimitivesParams>(cmd.params);
+        [encoder drawIndexedPrimitives:p.primitiveType
+                            indexCount:p.indexCount
+                             indexType:p.indexType
+                           indexBuffer:p.indexBuffer
+                     indexBufferOffset:p.indexBufferOffset];
+        break;
+      }
+    }
+  }
+}
+
+//------------------------------------------------------------------------------
+// 8C: Render bundle — rebuild by recording all geometry-related encoder commands.
+// This captures pipeline states, buffer bindings, and draw calls into a cache
+// that can be replayed on subsequent frames when geometry hasn't changed.
+void vtkMetalPolyDataMapper::RebuildRenderBundle(
+  void* mtlEncoder, vtkRenderer* ren, vtkActor* act)
+{
+  id<MTLRenderCommandEncoder> encoder = (__bridge id<MTLRenderCommandEncoder>)mtlEncoder;
+  using Cmd = vtkMetalPolyDataMapperInternals::RenderBundleDrawCommand;
+  using PSParams = Cmd::SetPipelineStateParams;
+  using BufParams = Cmd::SetBufferParams;
+  using TexParams = Cmd::SetTextureParams;
+  using SampParams = Cmd::SetSamplerParams;
+  using CullParams = Cmd::SetCullModeParams;
+  using DrawParams = Cmd::DrawPrimitivesParams;
+  using IdxParams = Cmd::DrawIndexedPrimitivesParams;
+
+  auto& commands = this->Internals->Bundle.Commands;
+  commands.clear();
+
+  // Helper lambdas to record encoder commands into the bundle
+  auto recordPipeline = [&commands](id<MTLRenderPipelineState> pipeline) {
+    Cmd cmd;
+    cmd.type = Cmd::SetPipelineState;
+    cmd.params = PSParams{ pipeline };
+    commands.push_back(cmd);
+  };
+  auto recordVBuf = [&commands](id<MTLBuffer> buffer, NSUInteger offset, NSUInteger index) {
+    Cmd cmd;
+    cmd.type = Cmd::SetVertexBuffer;
+    cmd.params = BufParams{ buffer, offset, index };
+    commands.push_back(cmd);
+  };
+  auto recordFBuf = [&commands](id<MTLBuffer> buffer, NSUInteger offset, NSUInteger index) {
+    Cmd cmd;
+    cmd.type = Cmd::SetFragmentBuffer;
+    cmd.params = BufParams{ buffer, offset, index };
+    commands.push_back(cmd);
+  };
+  auto recordFTex = [&commands](id<MTLTexture> texture, NSUInteger index) {
+    Cmd cmd;
+    cmd.type = Cmd::SetFragmentTexture;
+    cmd.params = TexParams{ texture, index };
+    commands.push_back(cmd);
+  };
+  auto recordFSamp = [&commands](id<MTLSamplerState> sampler, NSUInteger index) {
+    Cmd cmd;
+    cmd.type = Cmd::SetFragmentSamplerState;
+    cmd.params = SampParams{ sampler, index };
+    commands.push_back(cmd);
+  };
+  auto recordCull = [&commands](MTLCullMode mode) {
+    Cmd cmd;
+    cmd.type = Cmd::SetCullMode;
+    cmd.params = CullParams{ mode };
+    commands.push_back(cmd);
+  };
+  auto recordDraw = [&commands](MTLPrimitiveType ptype, NSUInteger vstart, NSUInteger vcount,
+                        NSUInteger icount = 0) {
+    Cmd cmd;
+    cmd.type = Cmd::DrawPrimitives;
+    cmd.params = DrawParams{ ptype, vstart, vcount, icount };
+    commands.push_back(cmd);
+  };
+  auto recordIdxDraw = [&commands](MTLPrimitiveType ptype, NSUInteger indexCount, MTLIndexType itype,
+                           id<MTLBuffer> ibuf, NSUInteger offset) {
+    Cmd cmd;
+    cmd.type = Cmd::DrawIndexedPrimitives;
+    cmd.params = IdxParams{ ptype, indexCount, itype, ibuf, offset };
+    commands.push_back(cmd);
+  };
+
+  int representation = act->GetProperty()->GetRepresentation();
+  float lineWidth = static_cast<float>(act->GetProperty()->GetLineWidth());
+  bool skipTriangles = (representation == VTK_WIREFRAME);
+  int peelMode = vtkMetalRenderWindow::SafeDownCast(ren->GetRenderWindow())->DepthPeelingMode;
+
+  // --- Triangle drawing ---
+  if (!skipTriangles && this->Internals->HasTriangles && this->Internals->TrianglePipeline)
+  {
+    if (peelMode == 1 && this->Internals->TriangleInitPeelPipeline)
+    {
+      recordPipeline(this->Internals->TriangleInitPeelPipeline);
+    }
+    else if (peelMode == 2 && this->Internals->TrianglePeelPipeline)
+    {
+      recordPipeline(this->Internals->TrianglePeelPipeline);
+    }
+    else
+    {
+      recordPipeline(this->Internals->TrianglePipeline);
+    }
+    recordVBuf(this->Internals->VertexPositionBuffer, 0, 0);
+    if (this->Internals->VertexNormalBuffer)
+    {
+      recordVBuf(this->Internals->VertexNormalBuffer, 0, 1);
+    }
+    if (this->Internals->SurfaceColorBuffer)
+    {
+      recordVBuf(this->Internals->SurfaceColorBuffer, 0, 3);
+    }
+    if (this->Internals->MaterialUniformBuffer)
+    {
+      recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
+    }
+    if (this->Internals->LightUniformBuffer)
+    {
+      recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
+    }
+    if (this->Internals->SceneUniformBuffer)
+    {
+      recordVBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
+    }
+    if (this->Internals->CoincidentOffsetBuffer)
+    {
+      recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+    }
+    if (this->Internals->ClipPlaneBuffer)
+    {
+      recordFBuf(this->Internals->ClipPlaneBuffer, 0, 5);
+      recordVBuf(this->Internals->ClipPlaneBuffer, 0, 5);
+    }
+    if (this->Internals->TriangleCellIdBuffer)
+    {
+      recordVBuf(this->Internals->TriangleCellIdBuffer, 0, 6);
+    }
+    if (this->Internals->PropIdBuffer)
+    {
+      recordVBuf(this->Internals->PropIdBuffer, 0, 7);
+    }
+    if (this->Internals->TriangleUVBuffer)
+    {
+      recordVBuf(this->Internals->TriangleUVBuffer, 0, 8);
+    }
+    {
+      id<MTLTexture> texToBind = this->Internals->ActorTexture;
+      id<MTLSamplerState> samplerToBind = this->Internals->ActorSampler;
+      if (!texToBind)
+      {
+        texToBind = this->Internals->DefaultTexture;
+        samplerToBind = this->Internals->DefaultSampler;
+      }
+      if (texToBind)
+      {
+        recordFTex(texToBind, 0);
+      }
+      if (samplerToBind)
+      {
+        recordFSamp(samplerToBind, 0);
+      }
+    }
+    if (act->GetProperty()->GetBackfaceCulling())
+    {
+      recordCull(MTLCullModeBack);
+    }
+    else if (act->GetProperty()->GetFrontfaceCulling())
+    {
+      recordCull(MTLCullModeFront);
+    }
+    else
+    {
+      recordCull(MTLCullModeNone);
+    }
+    if (this->Internals->IndexBuffer)
+    {
+      recordIdxDraw(MTLPrimitiveTypeTriangle, this->Internals->TriangleIndexCount, MTLIndexTypeUInt32,
+        this->Internals->IndexBuffer, 0);
+    }
+    else
+    {
+      recordDraw(MTLPrimitiveTypeTriangle, 0, this->Internals->TriangleVertexCount);
+    }
+  }
+
+  // --- Line drawing ---
+  if (this->Internals->HasLines && this->Internals->LineIndexBuffer)
+  {
+    auto lineJoinType = act->GetProperty()->GetLineJoin();
+    bool useRoundCapLines = false;
+    bool useMiterJoinLines = false;
+    bool useThickLines = false;
+
+    if (lineWidth > 1.0f)
+    {
+      if (lineJoinType == vtkProperty::LineJoinType::RoundCapRoundJoin &&
+          this->Internals->RoundCapLineSegmentCount > 0 && this->Internals->RoundCapLinePipeline)
+      {
+        useRoundCapLines = true;
+      }
+      else if (lineJoinType == vtkProperty::LineJoinType::MiterJoin &&
+               this->Internals->MiterJoinLineSegmentCount > 0 && this->Internals->MiterJoinLinePipeline)
+      {
+        useMiterJoinLines = true;
+      }
+      else if (lineJoinType == vtkProperty::LineJoinType::NoJoin &&
+               this->Internals->ThickLineSegmentCount > 0 && this->Internals->ThickLinePipeline)
+      {
+        useThickLines = true;
+      }
+    }
+
+    if (useRoundCapLines)
+    {
+      recordPipeline(this->Internals->RoundCapLinePipeline);
+      recordVBuf(this->Internals->VertexPositionBuffer, 0, 0);
+      recordVBuf(this->Internals->LineIndexBuffer, 0, 1);
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordVBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->SurfaceColorBuffer)
+      {
+        recordVBuf(this->Internals->SurfaceColorBuffer, 0, 3);
+      }
+      if (this->Internals->ThickLineLineWidthBuffer)
+      {
+        recordVBuf(this->Internals->ThickLineLineWidthBuffer, 0, 4);
+      }
+      if (this->Internals->LineCellIdBuffer)
+      {
+        recordVBuf(this->Internals->LineCellIdBuffer, 0, 5);
+      }
+      if (this->Internals->PropIdBuffer)
+      {
+        recordVBuf(this->Internals->PropIdBuffer, 0, 6);
+      }
+      if (this->Internals->MaterialUniformBuffer)
+      {
+        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
+      }
+      if (this->Internals->LightUniformBuffer)
+      {
+        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
+      }
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+      }
+      recordCull(MTLCullModeNone);
+      recordDraw(MTLPrimitiveTypeTriangleStrip, 0, 36, this->Internals->RoundCapLineSegmentCount);
+    }
+    else if (useMiterJoinLines)
+    {
+      recordPipeline(this->Internals->MiterJoinLinePipeline);
+      recordVBuf(this->Internals->VertexPositionBuffer, 0, 0);
+      recordVBuf(this->Internals->LineIndexBuffer, 0, 1);
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordVBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->SurfaceColorBuffer)
+      {
+        recordVBuf(this->Internals->SurfaceColorBuffer, 0, 3);
+      }
+      if (this->Internals->ThickLineLineWidthBuffer)
+      {
+        recordVBuf(this->Internals->ThickLineLineWidthBuffer, 0, 4);
+      }
+      if (this->Internals->LineCellIdBuffer)
+      {
+        recordVBuf(this->Internals->LineCellIdBuffer, 0, 5);
+      }
+      if (this->Internals->PropIdBuffer)
+      {
+        recordVBuf(this->Internals->PropIdBuffer, 0, 6);
+      }
+      if (this->Internals->MiterJoinSegmentCountBuffer)
+      {
+        recordVBuf(this->Internals->MiterJoinSegmentCountBuffer, 0, 7);
+      }
+      if (this->Internals->MaterialUniformBuffer)
+      {
+        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
+      }
+      if (this->Internals->LightUniformBuffer)
+      {
+        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
+      }
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+      }
+      recordCull(MTLCullModeNone);
+      recordDraw(MTLPrimitiveTypeTriangleStrip, 0, 4, this->Internals->MiterJoinLineSegmentCount);
+    }
+    else if (useThickLines)
+    {
+      recordPipeline(this->Internals->ThickLinePipeline);
+      recordVBuf(this->Internals->VertexPositionBuffer, 0, 0);
+      recordVBuf(this->Internals->LineIndexBuffer, 0, 1);
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordVBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->SurfaceColorBuffer)
+      {
+        recordVBuf(this->Internals->SurfaceColorBuffer, 0, 3);
+      }
+      if (this->Internals->ThickLineLineWidthBuffer)
+      {
+        recordVBuf(this->Internals->ThickLineLineWidthBuffer, 0, 4);
+      }
+      if (this->Internals->LineCellIdBuffer)
+      {
+        recordVBuf(this->Internals->LineCellIdBuffer, 0, 5);
+      }
+      if (this->Internals->PropIdBuffer)
+      {
+        recordVBuf(this->Internals->PropIdBuffer, 0, 6);
+      }
+      if (this->Internals->MaterialUniformBuffer)
+      {
+        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
+      }
+      if (this->Internals->LightUniformBuffer)
+      {
+        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
+      }
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+      }
+      recordCull(MTLCullModeNone);
+      recordDraw(MTLPrimitiveTypeTriangleStrip, 0, 4, this->Internals->ThickLineSegmentCount);
+    }
+    else
+    {
+      // Standard 1px lines
+      recordPipeline(this->Internals->LinePipeline);
+      recordVBuf(this->Internals->VertexPositionBuffer, 0, 0);
+      if (this->Internals->VertexNormalBuffer)
+      {
+        recordVBuf(this->Internals->VertexNormalBuffer, 0, 1);
+      }
+      if (this->Internals->SurfaceColorBuffer)
+      {
+        recordVBuf(this->Internals->SurfaceColorBuffer, 0, 3);
+      }
+      if (this->Internals->MaterialUniformBuffer)
+      {
+        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
+      }
+      if (this->Internals->LightUniformBuffer)
+      {
+        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
+      }
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordVBuf(this->Internals->SceneUniformBuffer, 0, 2);
+        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+      }
+      if (this->Internals->LineCellIdBuffer)
+      {
+        recordVBuf(this->Internals->LineCellIdBuffer, 0, 6);
+      }
+      if (this->Internals->PropIdBuffer)
+      {
+        recordVBuf(this->Internals->PropIdBuffer, 0, 7);
+      }
+      if (this->Internals->TriangleUVBuffer)
+      {
+        recordVBuf(this->Internals->TriangleUVBuffer, 0, 8);
+      }
+      {
+        id<MTLTexture> texToBind = this->Internals->ActorTexture;
+        id<MTLSamplerState> samplerToBind = this->Internals->ActorSampler;
+        if (!texToBind)
+        {
+          texToBind = this->Internals->DefaultTexture;
+          samplerToBind = this->Internals->DefaultSampler;
+        }
+        if (texToBind)
+        {
+          recordFTex(texToBind, 0);
+        }
+        if (samplerToBind)
+        {
+          recordFSamp(samplerToBind, 0);
+        }
+      }
+      recordCull(MTLCullModeNone);
+      recordIdxDraw(MTLPrimitiveTypeLine, this->Internals->LineIndexCount, MTLIndexTypeUInt32,
+        this->Internals->LineIndexBuffer, 0);
+    }
+  }
+
+  // --- Edge overlay (wireframe on surface) ---
+  if (representation == VTK_SURFACE && act->GetProperty()->GetEdgeVisibility() &&
+      this->Internals->HasEdgeOverlay && this->Internals->EdgePipeline &&
+      this->Internals->EdgeIndexBuffer)
+  {
+    recordPipeline(this->Internals->EdgePipeline);
+    recordVBuf(this->Internals->EdgeVertexPositionBuffer, 0, 0);
+    if (this->Internals->EdgeVertexNormalBuffer)
+    {
+      recordVBuf(this->Internals->EdgeVertexNormalBuffer, 0, 1);
+    }
+    if (this->Internals->EdgeSurfaceColorBuffer)
+    {
+      recordVBuf(this->Internals->EdgeSurfaceColorBuffer, 0, 3);
+    }
+    if (this->Internals->SceneUniformBuffer)
+    {
+      recordVBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
+    }
+    if (this->Internals->CoincidentOffsetBuffer)
+    {
+      recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+    }
+    if (this->Internals->EdgeColorUniformBuffer)
+    {
+      recordFBuf(this->Internals->EdgeColorUniformBuffer, 0, 4);
+    }
+    if (this->Internals->MaterialUniformBuffer)
+    {
+      recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
+    }
+    if (this->Internals->LineCellIdBuffer)
+    {
+      recordVBuf(this->Internals->LineCellIdBuffer, 0, 6);
+    }
+    if (this->Internals->PropIdBuffer)
+    {
+      recordVBuf(this->Internals->PropIdBuffer, 0, 7);
+    }
+    recordCull(MTLCullModeNone);
+    recordIdxDraw(MTLPrimitiveTypeLine, this->Internals->EdgeIndexCount, MTLIndexTypeUInt32,
+      this->Internals->EdgeIndexBuffer, 0);
+  }
+
+  // --- Vertex visibility (dots on surface) ---
+  if (representation != VTK_POINTS && act->GetProperty()->GetVertexVisibility() &&
+      this->Internals->PointVertexCount > 0 && this->Internals->PointPositionBuffer)
+  {
+    float ptSize = act->GetProperty()->GetPointSize();
+    if (ptSize > 1.0f && this->Internals->PointShapedPipeline)
+    {
+      recordPipeline(this->Internals->PointShapedPipeline);
+      recordVBuf(this->Internals->PointPositionBuffer, 0, 0);
+      recordVBuf(this->Internals->PointConnectivityBuffer, 0, 1);
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordVBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->PointNormalBuffer)
+      {
+        recordVBuf(this->Internals->PointNormalBuffer, 0, 3);
+      }
+      if (this->Internals->PointColorBuffer)
+      {
+        recordVBuf(this->Internals->PointColorBuffer, 0, 4);
+      }
+      if (this->Internals->PointTangentBuffer)
+      {
+        recordVBuf(this->Internals->PointTangentBuffer, 0, 6);
+      }
+      if (this->Internals->PointUVBuffer)
+      {
+        recordVBuf(this->Internals->PointUVBuffer, 0, 7);
+      }
+      if (this->Internals->PointColorUVBuffer)
+      {
+        recordVBuf(this->Internals->PointColorUVBuffer, 0, 8);
+      }
+      if (this->Internals->CellIdOffsetBuffer)
+      {
+        recordVBuf(this->Internals->CellIdOffsetBuffer, 0, 9);
+      }
+      if (this->Internals->PointCellIdBuffer)
+      {
+        recordVBuf(this->Internals->PointCellIdBuffer, 0, 11);
+      }
+      if (this->Internals->PropIdBuffer)
+      {
+        recordVBuf(this->Internals->PropIdBuffer, 0, 12);
+      }
+      if (this->Internals->MaterialUniformBuffer)
+      {
+        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
+      }
+      if (this->Internals->LightUniformBuffer)
+      {
+        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
+      }
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+      }
+      if (this->Internals->VertexColorBuffer)
+      {
+        recordFBuf(this->Internals->VertexColorBuffer, 0, 4);
+      }
+      recordDraw(MTLPrimitiveTypeTriangleStrip, 0, 4, this->Internals->PointVertexCount);
+    }
+    else if (this->Internals->PointPipeline)
+    {
+      recordPipeline(this->Internals->PointPipeline);
+      recordVBuf(this->Internals->PointPositionBuffer, 0, 0);
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordVBuf(this->Internals->SceneUniformBuffer, 0, 1);
+      }
+      if (this->Internals->PointNormalBuffer)
+      {
+        recordVBuf(this->Internals->PointNormalBuffer, 0, 2);
+      }
+      if (this->Internals->PointColorBuffer)
+      {
+        recordVBuf(this->Internals->PointColorBuffer, 0, 3);
+      }
+      if (this->Internals->PointTangentBuffer)
+      {
+        recordVBuf(this->Internals->PointTangentBuffer, 0, 6);
+      }
+      if (this->Internals->PointUVBuffer)
+      {
+        recordVBuf(this->Internals->PointUVBuffer, 0, 7);
+      }
+      if (this->Internals->PointColorUVBuffer)
+      {
+        recordVBuf(this->Internals->PointColorUVBuffer, 0, 8);
+      }
+      if (this->Internals->CellIdOffsetBuffer)
+      {
+        recordVBuf(this->Internals->CellIdOffsetBuffer, 0, 9);
+      }
+      if (this->Internals->PointCellIdBuffer)
+      {
+        recordVBuf(this->Internals->PointCellIdBuffer, 0, 11);
+      }
+      if (this->Internals->PropIdBuffer)
+      {
+        recordVBuf(this->Internals->PropIdBuffer, 0, 12);
+      }
+      if (this->Internals->MaterialUniformBuffer)
+      {
+        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
+      }
+      if (this->Internals->LightUniformBuffer)
+      {
+        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
+      }
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+      }
+      if (this->Internals->VertexColorBuffer)
+      {
+        recordFBuf(this->Internals->VertexColorBuffer, 0, 4);
+      }
+      recordDraw(MTLPrimitiveTypePoint, 0, this->Internals->PointVertexCount);
+    }
+  }
+
+  // --- Points (VTK_POINTS representation) ---
+  if (representation == VTK_POINTS && this->Internals->PointVertexCount > 0 &&
+      this->Internals->PointPositionBuffer)
+  {
+    float ptSize = act->GetProperty()->GetPointSize();
+    if (ptSize > 1.0f && this->Internals->PointShapedPipeline)
+    {
+      recordPipeline(this->Internals->PointShapedPipeline);
+      recordVBuf(this->Internals->PointPositionBuffer, 0, 0);
+      recordVBuf(this->Internals->PointConnectivityBuffer, 0, 1);
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordVBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->PointNormalBuffer)
+      {
+        recordVBuf(this->Internals->PointNormalBuffer, 0, 3);
+      }
+      if (this->Internals->PointColorBuffer)
+      {
+        recordVBuf(this->Internals->PointColorBuffer, 0, 4);
+      }
+      if (this->Internals->PointTangentBuffer)
+      {
+        recordVBuf(this->Internals->PointTangentBuffer, 0, 6);
+      }
+      if (this->Internals->PointUVBuffer)
+      {
+        recordVBuf(this->Internals->PointUVBuffer, 0, 7);
+      }
+      if (this->Internals->PointColorUVBuffer)
+      {
+        recordVBuf(this->Internals->PointColorUVBuffer, 0, 8);
+      }
+      if (this->Internals->CellIdOffsetBuffer)
+      {
+        recordVBuf(this->Internals->CellIdOffsetBuffer, 0, 9);
+      }
+      if (this->Internals->PointCellIdBuffer)
+      {
+        recordVBuf(this->Internals->PointCellIdBuffer, 0, 11);
+      }
+      if (this->Internals->PropIdBuffer)
+      {
+        recordVBuf(this->Internals->PropIdBuffer, 0, 12);
+      }
+      if (this->Internals->MaterialUniformBuffer)
+      {
+        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
+      }
+      if (this->Internals->LightUniformBuffer)
+      {
+        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
+      }
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+      }
+      if (this->Internals->VertexColorBuffer)
+      {
+        recordFBuf(this->Internals->VertexColorBuffer, 0, 4);
+      }
+      recordDraw(MTLPrimitiveTypeTriangleStrip, 0, 4, this->Internals->PointVertexCount);
+    }
+    else if (this->Internals->PointPipeline)
+    {
+      recordPipeline(this->Internals->PointPipeline);
+      recordVBuf(this->Internals->PointPositionBuffer, 0, 0);
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordVBuf(this->Internals->SceneUniformBuffer, 0, 1);
+      }
+      if (this->Internals->PointNormalBuffer)
+      {
+        recordVBuf(this->Internals->PointNormalBuffer, 0, 2);
+      }
+      if (this->Internals->PointColorBuffer)
+      {
+        recordVBuf(this->Internals->PointColorBuffer, 0, 3);
+      }
+      if (this->Internals->PointTangentBuffer)
+      {
+        recordVBuf(this->Internals->PointTangentBuffer, 0, 6);
+      }
+      if (this->Internals->PointUVBuffer)
+      {
+        recordVBuf(this->Internals->PointUVBuffer, 0, 7);
+      }
+      if (this->Internals->PointColorUVBuffer)
+      {
+        recordVBuf(this->Internals->PointColorUVBuffer, 0, 8);
+      }
+      if (this->Internals->CellIdOffsetBuffer)
+      {
+        recordVBuf(this->Internals->CellIdOffsetBuffer, 0, 9);
+      }
+      if (this->Internals->PointCellIdBuffer)
+      {
+        recordVBuf(this->Internals->PointCellIdBuffer, 0, 11);
+      }
+      if (this->Internals->PropIdBuffer)
+      {
+        recordVBuf(this->Internals->PropIdBuffer, 0, 12);
+      }
+      if (this->Internals->MaterialUniformBuffer)
+      {
+        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
+      }
+      if (this->Internals->LightUniformBuffer)
+      {
+        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
+      }
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+      }
+      if (this->Internals->VertexColorBuffer)
+      {
+        recordFBuf(this->Internals->VertexColorBuffer, 0, 4);
+      }
+      recordDraw(MTLPrimitiveTypePoint, 0, this->Internals->PointVertexCount);
+    }
+  }
+
+  // Mark bundle as valid and record the state that was used to create it
+  this->Internals->Bundle.Valid = true;
+  this->Internals->BundleGeometryMTime = this->Internals->CachedInputMTime;
+  this->Internals->BundleRepresentation = representation;
+  this->Internals->BundleEdgeVisibility = this->Internals->CachedEdgeVisibility;
+  this->Internals->BundleLineWidth = lineWidth;
+  this->Internals->BundleSampleCount = this->Internals->CachedSampleCount;
+  this->Internals->BundlePeelMode = peelMode;
 }
 
 //------------------------------------------------------------------------------
@@ -351,6 +1250,41 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       this->EnsurePipelineStates((__bridge void*)device);
     }
 
+    // 8C: Ensure all pipeline states are created before render bundle recording.
+    // These were previously created lazily inside inline draw code.
+    if (representation != VTK_POINTS && representation != VTK_WIREFRAME &&
+        this->Internals->HasEdgeOverlay)
+    {
+      this->EnsureEdgePipelineState((__bridge void*)device);
+    }
+    if (this->Internals->HasLines && this->Internals->LineIndexBuffer)
+    {
+      float lw = static_cast<float>(act->GetProperty()->GetLineWidth());
+      if (lw > 1.0f)
+      {
+        auto lj = act->GetProperty()->GetLineJoin();
+        if (lj == vtkProperty::LineJoinType::RoundCapRoundJoin &&
+            this->Internals->RoundCapLineSegmentCount > 0)
+        {
+          this->EnsureRoundCapLinePipelineState((__bridge void*)device);
+        }
+        else if (lj == vtkProperty::LineJoinType::MiterJoin &&
+                 this->Internals->MiterJoinLineSegmentCount > 0)
+        {
+          this->EnsureMiterJoinLinePipelineState((__bridge void*)device);
+        }
+        else if (lj == vtkProperty::LineJoinType::NoJoin &&
+                 this->Internals->ThickLineSegmentCount > 0)
+        {
+          this->EnsureThickLinePipelineState((__bridge void*)device);
+        }
+      }
+    }
+    if (renWin->DepthPeelingMode != 0)
+    {
+      this->EnsurePeelPipelineStates((__bridge void*)device);
+    }
+
     // Use the encoder already created by vtkMetalRenderer::DeviceRender().
     // Do NOT create a new render pass, command buffer, or drawable here.
     id<MTLRenderCommandEncoder> encoder =
@@ -413,853 +1347,64 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       *reinterpret_cast<uint32_t*>(buf + 256) |= (1u << 9);
     }
 
-    // P2-2A: Skip triangle drawing when in wireframe mode
-    bool skipTriangles = (representation == VTK_WIREFRAME);
-
-    if (!skipTriangles && this->Internals->HasTriangles && this->Internals->TrianglePipeline)
+    // 8C: Update edge color uniform before bundle recording (per-frame update)
+    if (representation == VTK_SURFACE && edgeVisibility && this->Internals->HasEdgeOverlay &&
+        this->Internals->EdgeColorUniformBuffer)
     {
-      // 8B: Select pipeline based on depth peeling mode
-      int peelMode = renWin->DepthPeelingMode;
-      if (peelMode != 0)
-      {
-        this->EnsurePeelPipelineStates((__bridge void*)device);
-      }
-      if (peelMode == 1 && this->Internals->TriangleInitPeelPipeline)
-      {
-        [encoder setRenderPipelineState:this->Internals->TriangleInitPeelPipeline];
-      }
-      else if (peelMode == 2 && this->Internals->TrianglePeelPipeline)
-      {
-        [encoder setRenderPipelineState:this->Internals->TrianglePeelPipeline];
-      }
-      else
-      {
-        [encoder setRenderPipelineState:this->Internals->TrianglePipeline];
-      }
-      [encoder setVertexBuffer:this->Internals->VertexPositionBuffer offset:0 atIndex:0];
-      if (this->Internals->VertexNormalBuffer)
-      {
-        [encoder setVertexBuffer:this->Internals->VertexNormalBuffer offset:0 atIndex:1];
-      }
-      // P1-1A/1B: bind per-vertex color buffer at vertex buffer index 3
-      if (this->Internals->SurfaceColorBuffer)
-      {
-        [encoder setVertexBuffer:this->Internals->SurfaceColorBuffer offset:0 atIndex:3];
-      }
-
-      if (this->Internals->MaterialUniformBuffer)
-      {
-        [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
-      }
-      if (this->Internals->LightUniformBuffer)
-      {
-        [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
-      }
-      if (this->Internals->SceneUniformBuffer)
-      {
-        [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-        // P1-1A: bind scene uniforms to fragment buffer(2) so fragment shader can read flags
-        [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-      }
-      if (this->Internals->CoincidentOffsetBuffer)
-      {
-        [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
-      }
-      if (this->Internals->ClipPlaneBuffer)
-      {
-        [encoder setFragmentBuffer:this->Internals->ClipPlaneBuffer offset:0 atIndex:5];
-        [encoder setVertexBuffer:this->Internals->ClipPlaneBuffer offset:0 atIndex:5];
-      }
-
-      // P2-8: Bind picking ID buffers for triangle rendering
-      if (this->Internals->TriangleCellIdBuffer)
-      {
-        [encoder setVertexBuffer:this->Internals->TriangleCellIdBuffer offset:0 atIndex:6];
-      }
-      if (this->Internals->PropIdBuffer)
-      {
-        [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:7];
-      }
-
-      // P5-5A: Bind UV buffer and texture/sampler for texture mapping
-      if (this->Internals->TriangleUVBuffer)
-      {
-        [encoder setVertexBuffer:this->Internals->TriangleUVBuffer offset:0 atIndex:8];
-      }
-
-      // P5-5A: Bind texture and sampler — use actor texture or default 1x1 white
-      {
-        id<MTLTexture> texToBind = this->Internals->ActorTexture;
-        id<MTLSamplerState> samplerToBind = this->Internals->ActorSampler;
-
-        if (!texToBind)
-        {
-          // Create default 1x1 white texture and sampler lazily
-          if (!this->Internals->DefaultTexture)
-          {
-            MTLTextureDescriptor* desc = [MTLTextureDescriptor
-              texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                         width:1
-                                        height:1
-                                     mipmapped:NO];
-            desc.usage = MTLTextureUsageShaderRead;
-            desc.storageMode = MTLStorageModeShared;
-            this->Internals->DefaultTexture = [device newTextureWithDescriptor:desc];
-            unsigned char white[4] = { 255, 255, 255, 255 };
-            MTLRegion region = MTLRegionMake2D(0, 0, 1, 1);
-            [this->Internals->DefaultTexture replaceRegion:region
-                                              mipmapLevel:0
-                                                withBytes:white
-                                              bytesPerRow:4];
-          }
-          if (!this->Internals->DefaultSampler)
-          {
-            MTLSamplerDescriptor* sDesc = [[MTLSamplerDescriptor alloc] init];
-            sDesc.minFilter = MTLSamplerMinMagFilterLinear;
-            sDesc.magFilter = MTLSamplerMinMagFilterLinear;
-            this->Internals->DefaultSampler = [device newSamplerStateWithDescriptor:sDesc];
-          }
-          texToBind = this->Internals->DefaultTexture;
-          samplerToBind = this->Internals->DefaultSampler;
-        }
-
-        if (texToBind)
-        {
-          [encoder setFragmentTexture:texToBind atIndex:0];
-        }
-        if (samplerToBind)
-        {
-          [encoder setFragmentSamplerState:samplerToBind atIndex:0];
-        }
-      }
-
-      // 8B: Bind peeling textures when in depth peeling mode
-      if (peelMode == 1 || peelMode == 2)
-      {
-        // Create/update peel uniform buffer
-        if (!this->Internals->PeelUniformBuffer)
-        {
-          this->Internals->PeelUniformBuffer = [device
-            newBufferWithLength:16 options:MTLResourceStorageModeShared];
-        }
-        struct { uint32_t mode; uint32_t peelPass; float vpW; float vpH; } peelUni;
-        peelUni.mode = static_cast<uint32_t>(peelMode);
-        peelUni.peelPass = static_cast<uint32_t>(renWin->PeelIndex);
-        int* renSize = ren->GetSize();
-        peelUni.vpW = static_cast<float>(renSize[0]);
-        peelUni.vpH = static_cast<float>(renSize[1]);
-        memcpy([this->Internals->PeelUniformBuffer contents], &peelUni, sizeof(peelUni));
-
-        [encoder setFragmentBuffer:this->Internals->PeelUniformBuffer offset:0 atIndex:6];
-
-        // Bind previous front texture (peel mode 2 only)
-        if (peelMode == 2 && renWin->PeelFrontTexture)
-        {
-          id<MTLTexture> prevFront = (__bridge id<MTLTexture>)renWin->PeelFrontTexture;
-          [encoder setFragmentTexture:prevFront atIndex:1];
-        }
-
-        // Bind previous depth texture (both modes)
-        if (renWin->PeelDepthTexture)
-        {
-          id<MTLTexture> prevDepth = (__bridge id<MTLTexture>)renWin->PeelDepthTexture;
-          [encoder setFragmentTexture:prevDepth atIndex:2];
-        }
-      }
-
-      // P1-1C: set backface/frontface cull mode
-      if (act->GetProperty()->GetBackfaceCulling())
-      {
-        [encoder setCullMode:MTLCullModeBack];
-      }
-      else if (act->GetProperty()->GetFrontfaceCulling())
-      {
-        [encoder setCullMode:MTLCullModeFront];
-      }
-      else
-      {
-        [encoder setCullMode:MTLCullModeNone];
-      }
-
-      if (this->Internals->IndexBuffer)
-      {
-        [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                            indexCount:this->Internals->TriangleIndexCount
-                             indexType:MTLIndexTypeUInt32
-                           indexBuffer:this->Internals->IndexBuffer
-                     indexBufferOffset:0];
-      }
-      else
-      {
-        [encoder drawPrimitives:MTLPrimitiveTypeTriangle
-                    vertexStart:0
-                  vertexCount:this->Internals->TriangleVertexCount];
-      }
-    }
-
-    if (this->Internals->HasLines && this->Internals->LineIndexBuffer)
-    {
-      // P3-3A/3B/3C: Select line pipeline based on lineWidth and lineJoin type
-      auto lineJoinType = act->GetProperty()->GetLineJoin();
-      bool useThickLines = false;
-      bool useRoundCapLines = false;
-      bool useMiterJoinLines = false;
-
-      if (lineWidth > 1.0f)
-      {
-        if (lineJoinType == vtkProperty::LineJoinType::RoundCapRoundJoin &&
-            this->Internals->RoundCapLineSegmentCount > 0)
-        {
-          useRoundCapLines = true;
-          this->EnsureRoundCapLinePipelineState((__bridge void*)device);
-          if (!this->Internals->RoundCapLinePipeline)
-          {
-            useRoundCapLines = false;
-          }
-        }
-        else if (lineJoinType == vtkProperty::LineJoinType::MiterJoin &&
-                 this->Internals->MiterJoinLineSegmentCount > 0)
-        {
-          useMiterJoinLines = true;
-          this->EnsureMiterJoinLinePipelineState((__bridge void*)device);
-          if (!this->Internals->MiterJoinLinePipeline)
-          {
-            useMiterJoinLines = false;
-          }
-        }
-        else if (lineJoinType == vtkProperty::LineJoinType::NoJoin &&
-                 this->Internals->ThickLineSegmentCount > 0)
-        {
-          useThickLines = true;
-          this->EnsureThickLinePipelineState((__bridge void*)device);
-          if (!this->Internals->ThickLinePipeline)
-          {
-            useThickLines = false;
-          }
-        }
-      }
-
-      if (useRoundCapLines && this->Internals->RoundCapLinePipeline)
-      {
-        // P3-3B: Round Cap + Round Join line rendering — 36 verts per instance
-        [encoder setRenderPipelineState:this->Internals->RoundCapLinePipeline];
-        [encoder setVertexBuffer:this->Internals->VertexPositionBuffer offset:0 atIndex:0];
-        [encoder setVertexBuffer:this->Internals->LineIndexBuffer offset:0 atIndex:1];
-        if (this->Internals->SceneUniformBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-        }
-        if (this->Internals->SurfaceColorBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->SurfaceColorBuffer offset:0 atIndex:3];
-        }
-        if (!this->Internals->ThickLineLineWidthBuffer)
-        {
-          this->Internals->ThickLineLineWidthBuffer = [device
-            newBufferWithLength:sizeof(float)
-                       options:MTLResourceStorageModeShared];
-        }
-        *static_cast<float*>([this->Internals->ThickLineLineWidthBuffer contents]) = lineWidth;
-        [encoder setVertexBuffer:this->Internals->ThickLineLineWidthBuffer offset:0 atIndex:4];
-        if (this->Internals->LineCellIdBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->LineCellIdBuffer offset:0 atIndex:5];
-        }
-        if (this->Internals->PropIdBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:6];
-        }
-        if (this->Internals->MaterialUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
-        }
-        if (this->Internals->LightUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
-        }
-        if (this->Internals->SceneUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-        }
-        if (this->Internals->CoincidentOffsetBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
-        }
-
-        [encoder setCullMode:MTLCullModeNone];
-
-        // Instanced draw: 36 vertices per instance (triangle strip), one instance per line segment
-        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
-                    vertexStart:0
-                  vertexCount:36
-                instanceCount:this->Internals->RoundCapLineSegmentCount];
-      }
-      else if (useMiterJoinLines && this->Internals->MiterJoinLinePipeline)
-      {
-        // P3-3C: Miter Join line rendering — 4 verts per instance
-        [encoder setRenderPipelineState:this->Internals->MiterJoinLinePipeline];
-        [encoder setVertexBuffer:this->Internals->VertexPositionBuffer offset:0 atIndex:0];
-        [encoder setVertexBuffer:this->Internals->LineIndexBuffer offset:0 atIndex:1];
-        if (this->Internals->SceneUniformBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-        }
-        if (this->Internals->SurfaceColorBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->SurfaceColorBuffer offset:0 atIndex:3];
-        }
-        if (!this->Internals->ThickLineLineWidthBuffer)
-        {
-          this->Internals->ThickLineLineWidthBuffer = [device
-            newBufferWithLength:sizeof(float)
-                       options:MTLResourceStorageModeShared];
-        }
-        *static_cast<float*>([this->Internals->ThickLineLineWidthBuffer contents]) = lineWidth;
-        [encoder setVertexBuffer:this->Internals->ThickLineLineWidthBuffer offset:0 atIndex:4];
-        if (this->Internals->LineCellIdBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->LineCellIdBuffer offset:0 atIndex:5];
-        }
-        if (this->Internals->PropIdBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:6];
-        }
-        // P3-3C: segment count uniform for bounds checking in shader
-        if (!this->Internals->MiterJoinSegmentCountBuffer)
-        {
-          this->Internals->MiterJoinSegmentCountBuffer = [device
-            newBufferWithLength:sizeof(uint32_t)
-                       options:MTLResourceStorageModeShared];
-        }
-        *static_cast<uint32_t*>([this->Internals->MiterJoinSegmentCountBuffer contents]) =
-          static_cast<uint32_t>(this->Internals->MiterJoinLineSegmentCount);
-        [encoder setVertexBuffer:this->Internals->MiterJoinSegmentCountBuffer offset:0 atIndex:7];
-        if (this->Internals->MaterialUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
-        }
-        if (this->Internals->LightUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
-        }
-        if (this->Internals->SceneUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-        }
-        if (this->Internals->CoincidentOffsetBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
-        }
-
-        [encoder setCullMode:MTLCullModeNone];
-
-        // Instanced draw: 4 vertices per quad (triangle strip), one instance per line segment
-        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
-                    vertexStart:0
-                  vertexCount:4
-                instanceCount:this->Internals->MiterJoinLineSegmentCount];
-      }
-      else if (useThickLines && this->Internals->ThickLinePipeline)
-      {
-        // P3-3A: Thick line rendering — instanced quad expansion
-        [encoder setRenderPipelineState:this->Internals->ThickLinePipeline];
-        [encoder setVertexBuffer:this->Internals->VertexPositionBuffer offset:0 atIndex:0];
-        [encoder setVertexBuffer:this->Internals->LineIndexBuffer offset:0 atIndex:1];
-        if (this->Internals->SceneUniformBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-        }
-        if (this->Internals->SurfaceColorBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->SurfaceColorBuffer offset:0 atIndex:3];
-        }
-        // P3-3A: line width uniform
-        if (!this->Internals->ThickLineLineWidthBuffer)
-        {
-          this->Internals->ThickLineLineWidthBuffer = [device
-            newBufferWithLength:sizeof(float)
-                       options:MTLResourceStorageModeShared];
-        }
-        *static_cast<float*>([this->Internals->ThickLineLineWidthBuffer contents]) = lineWidth;
-        [encoder setVertexBuffer:this->Internals->ThickLineLineWidthBuffer offset:0 atIndex:4];
-        if (this->Internals->LineCellIdBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->LineCellIdBuffer offset:0 atIndex:5];
-        }
-        if (this->Internals->PropIdBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:6];
-        }
-        if (this->Internals->MaterialUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
-        }
-        if (this->Internals->LightUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
-        }
-        if (this->Internals->SceneUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-        }
-        if (this->Internals->CoincidentOffsetBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
-        }
-
-        [encoder setCullMode:MTLCullModeNone];
-
-        // Instanced draw: 4 vertices per quad, one instance per line segment
-        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
-                    vertexStart:0
-                  vertexCount:4
-                instanceCount:this->Internals->ThickLineSegmentCount];
-      }
-      else
-      {
-        // Standard 1px line rendering
-        [encoder setRenderPipelineState:this->Internals->LinePipeline];
-        [encoder setVertexBuffer:this->Internals->VertexPositionBuffer offset:0 atIndex:0];
-        if (this->Internals->VertexNormalBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->VertexNormalBuffer offset:0 atIndex:1];
-        }
-        if (this->Internals->SurfaceColorBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->SurfaceColorBuffer offset:0 atIndex:3];
-        }
-        if (this->Internals->MaterialUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
-        }
-        if (this->Internals->LightUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
-        }
-        if (this->Internals->SceneUniformBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-          [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-        }
-        if (this->Internals->CoincidentOffsetBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
-        }
-        if (this->Internals->LineCellIdBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->LineCellIdBuffer offset:0 atIndex:6];
-        }
-        if (this->Internals->PropIdBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:7];
-        }
-
-        // P5-5A: Bind UV buffer and texture/sampler for line texture mapping
-        if (this->Internals->TriangleUVBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->TriangleUVBuffer offset:0 atIndex:8];
-        }
-
-        // P5-5A: Bind texture and sampler for lines — use actor texture or default 1x1 white
-        {
-          id<MTLTexture> texToBind = this->Internals->ActorTexture;
-          id<MTLSamplerState> samplerToBind = this->Internals->ActorSampler;
-
-          if (!texToBind)
-          {
-            if (!this->Internals->DefaultTexture)
-            {
-              MTLTextureDescriptor* desc = [MTLTextureDescriptor
-                texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                           width:1
-                                          height:1
-                                       mipmapped:NO];
-              desc.usage = MTLTextureUsageShaderRead;
-              desc.storageMode = MTLStorageModeShared;
-              this->Internals->DefaultTexture = [device newTextureWithDescriptor:desc];
-              unsigned char white[4] = { 255, 255, 255, 255 };
-              MTLRegion region = MTLRegionMake2D(0, 0, 1, 1);
-              [this->Internals->DefaultTexture replaceRegion:region
-                                                mipmapLevel:0
-                                                  withBytes:white
-                                                bytesPerRow:4];
-            }
-            if (!this->Internals->DefaultSampler)
-            {
-              MTLSamplerDescriptor* sDesc = [[MTLSamplerDescriptor alloc] init];
-              sDesc.minFilter = MTLSamplerMinMagFilterLinear;
-              sDesc.magFilter = MTLSamplerMinMagFilterLinear;
-              this->Internals->DefaultSampler = [device newSamplerStateWithDescriptor:sDesc];
-            }
-            texToBind = this->Internals->DefaultTexture;
-            samplerToBind = this->Internals->DefaultSampler;
-          }
-
-          if (texToBind)
-          {
-            [encoder setFragmentTexture:texToBind atIndex:0];
-          }
-          if (samplerToBind)
-          {
-            [encoder setFragmentSamplerState:samplerToBind atIndex:0];
-          }
-        }
-
-        [encoder setCullMode:MTLCullModeNone];
-
-        [encoder drawIndexedPrimitives:MTLPrimitiveTypeLine
-                            indexCount:this->Internals->LineIndexCount
-                             indexType:MTLIndexTypeUInt32
-                           indexBuffer:this->Internals->LineIndexBuffer
-                     indexBufferOffset:0];
-      }
-    }
-
-    // P2-2B: Edge visibility — draw wireframe edges on top of surfaces
-    if (representation == VTK_SURFACE && act->GetProperty()->GetEdgeVisibility() &&
-        this->Internals->HasEdgeOverlay && this->Internals->EdgePipeline &&
-        this->Internals->EdgeIndexBuffer)
-    {
-      // Ensure edge pipeline is created
-      this->EnsureEdgePipelineState((__bridge void*)device);
-      if (!this->Internals->EdgePipeline)
-      {
-        return;
-      }
-
-      // Update edge color uniform
       this->UpdateEdgeColorUniform((__bridge void*)device, act);
-
-      [encoder setRenderPipelineState:this->Internals->EdgePipeline];
-      // P2-2B: Use separate edge vertex buffers (not the main triangle position buffer)
-      [encoder setVertexBuffer:this->Internals->EdgeVertexPositionBuffer offset:0 atIndex:0];
-      if (this->Internals->EdgeVertexNormalBuffer)
-      {
-        [encoder setVertexBuffer:this->Internals->EdgeVertexNormalBuffer offset:0 atIndex:1];
-      }
-      // P1-1A/1B: bind per-vertex color buffer at vertex buffer index 3
-      if (this->Internals->EdgeSurfaceColorBuffer)
-      {
-        [encoder setVertexBuffer:this->Internals->EdgeSurfaceColorBuffer offset:0 atIndex:3];
-      }
-
-      // Bind scene uniforms to vertex buffer(2) and fragment buffer(2)
-      if (this->Internals->SceneUniformBuffer)
-      {
-        [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-        [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-      }
-      // Bind coincident offset to fragment buffer(3) for line offset
-      if (this->Internals->CoincidentOffsetBuffer)
-      {
-        [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
-      }
-      // Bind edge color to fragment buffer(4)
-      if (this->Internals->EdgeColorUniformBuffer)
-      {
-        [encoder setFragmentBuffer:this->Internals->EdgeColorUniformBuffer offset:0 atIndex:4];
-      }
-      // Bind material to fragment buffer(0) for opacity
-      if (this->Internals->MaterialUniformBuffer)
-      {
-        [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
-      }
-      // Bind picking IDs for edge rendering (use line cell ID buffer)
-      if (this->Internals->LineCellIdBuffer)
-      {
-        [encoder setVertexBuffer:this->Internals->LineCellIdBuffer offset:0 atIndex:6];
-      }
-      if (this->Internals->PropIdBuffer)
-      {
-        [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:7];
-      }
-
-      // No backface culling for edges
-      [encoder setCullMode:MTLCullModeNone];
-
-      [encoder drawIndexedPrimitives:MTLPrimitiveTypeLine
-                          indexCount:this->Internals->EdgeIndexCount
-                           indexType:MTLIndexTypeUInt32
-                         indexBuffer:this->Internals->EdgeIndexBuffer
-                   indexBufferOffset:0];
     }
 
-    // --- P1-4: Vertex visibility — draw vertex dots on top of surface/wireframe ---
-    if (representation != VTK_POINTS && act->GetProperty()->GetVertexVisibility() &&
-        this->Internals->PointVertexCount > 0 && this->Internals->PointPositionBuffer)
+    // 8C: Ensure default texture and sampler exist before bundle recording.
+    // These are used as fallbacks when the actor has no texture, and the bundle
+    // needs valid objects at recording time.
+    if (!this->Internals->DefaultTexture)
     {
-      float ptSize = act->GetProperty()->GetPointSize();
-      if (ptSize > 1.0f && this->Internals->PointShapedPipeline)
-      {
-        // Shaped vertex dots
-        [encoder setRenderPipelineState:this->Internals->PointShapedPipeline];
-        [encoder setVertexBuffer:this->Internals->PointPositionBuffer offset:0 atIndex:0];
-        [encoder setVertexBuffer:this->Internals->PointConnectivityBuffer offset:0 atIndex:1];
-        if (this->Internals->SceneUniformBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-        }
-        if (this->Internals->PointNormalBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointNormalBuffer offset:0 atIndex:3];
-        }
-        if (this->Internals->PointColorBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointColorBuffer offset:0 atIndex:4];
-        }
-        if (this->Internals->PointTangentBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointTangentBuffer offset:0 atIndex:6];
-        }
-        if (this->Internals->PointUVBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointUVBuffer offset:0 atIndex:7];
-        }
-        if (this->Internals->PointColorUVBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointColorUVBuffer offset:0 atIndex:8];
-        }
-        if (this->Internals->CellIdOffsetBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->CellIdOffsetBuffer offset:0 atIndex:9];
-        }
-        if (this->Internals->PointCellIdBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointCellIdBuffer offset:0 atIndex:11];
-        }
-        if (this->Internals->PropIdBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:12];
-        }
-        if (this->Internals->MaterialUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
-        }
-        if (this->Internals->LightUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
-        }
-        if (this->Internals->SceneUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-        }
-        if (this->Internals->CoincidentOffsetBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
-        }
-        if (this->Internals->VertexColorBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->VertexColorBuffer offset:0 atIndex:4];
-        }
-        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
-                    vertexStart:0
-                  vertexCount:4
-                instanceCount:this->Internals->PointVertexCount];
-      }
-      else if (this->Internals->PointPipeline)
-      {
-        // Basic 1px vertex dots
-        [encoder setRenderPipelineState:this->Internals->PointPipeline];
-        [encoder setVertexBuffer:this->Internals->PointPositionBuffer offset:0 atIndex:0];
-        if (this->Internals->SceneUniformBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:1];
-        }
-        if (this->Internals->PointNormalBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointNormalBuffer offset:0 atIndex:2];
-        }
-        if (this->Internals->PointColorBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointColorBuffer offset:0 atIndex:3];
-        }
-        if (this->Internals->PointTangentBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointTangentBuffer offset:0 atIndex:6];
-        }
-        if (this->Internals->PointUVBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointUVBuffer offset:0 atIndex:7];
-        }
-        if (this->Internals->PointColorUVBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointColorUVBuffer offset:0 atIndex:8];
-        }
-        if (this->Internals->CellIdOffsetBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->CellIdOffsetBuffer offset:0 atIndex:9];
-        }
-        if (this->Internals->PointCellIdBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointCellIdBuffer offset:0 atIndex:11];
-        }
-        if (this->Internals->PropIdBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:12];
-        }
-        if (this->Internals->MaterialUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
-        }
-        if (this->Internals->LightUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
-        }
-        if (this->Internals->SceneUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-        }
-        if (this->Internals->CoincidentOffsetBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
-        }
-        if (this->Internals->VertexColorBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->VertexColorBuffer offset:0 atIndex:4];
-        }
-        [encoder drawPrimitives:MTLPrimitiveTypePoint
-                    vertexStart:0
-                  vertexCount:this->Internals->PointVertexCount];
-      }
+      MTLTextureDescriptor* desc = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                   width:1
+                                  height:1
+                               mipmapped:NO];
+      desc.usage = MTLTextureUsageShaderRead;
+      desc.storageMode = MTLStorageModeShared;
+      this->Internals->DefaultTexture = [device newTextureWithDescriptor:desc];
+      unsigned char white[4] = { 255, 255, 255, 255 };
+      MTLRegion region = MTLRegionMake2D(0, 0, 1, 1);
+      [this->Internals->DefaultTexture replaceRegion:region
+                                         mipmapLevel:0
+                                           withBytes:white
+                                         bytesPerRow:4];
+    }
+    if (!this->Internals->DefaultSampler)
+    {
+      MTLSamplerDescriptor* sDesc = [[MTLSamplerDescriptor alloc] init];
+      sDesc.minFilter = MTLSamplerMinMagFilterLinear;
+      sDesc.magFilter = MTLSamplerMinMagFilterLinear;
+      this->Internals->DefaultSampler = [device newSamplerStateWithDescriptor:sDesc];
     }
 
-    // --- Draw points ---
-    if (representation == VTK_POINTS && this->Internals->PointVertexCount > 0 &&
-        this->Internals->PointPositionBuffer)
+    // 8C: Render bundle — check if cached encoder commands can be replayed.
+    // Bundle is valid when geometry, representation, edge visibility, line width,
+    // MSAA sample count, and depth peeling mode all match the values at bundle creation.
+    // When valid, replay cached commands instead of re-encoding all draw calls.
+    // Uniform buffers (scene, material, light, etc.) are updated in-place each frame,
+    // so replaying the same buffer bindings reads the latest content automatically.
+    int currentPeelMode = renWin->DepthPeelingMode;
+    bool bundleValid = this->Internals->Bundle.Valid &&
+                       this->Internals->BundleGeometryMTime == this->Internals->CachedInputMTime &&
+                       this->Internals->BundleRepresentation == representation &&
+                       this->Internals->BundleEdgeVisibility == edgeVisibility &&
+                       this->Internals->BundleLineWidth == lineWidth &&
+                       this->Internals->BundleSampleCount == currentSampleCount &&
+                       this->Internals->BundlePeelMode == currentPeelMode;
+
+    if (bundleValid)
     {
-      float ptSize = act->GetProperty()->GetPointSize();
-      if (ptSize > 1.0f && this->Internals->PointShapedPipeline)
-      {
-        // Shaped points: instanced triangle-strip quads (4 verts × N instances)
-        [encoder setRenderPipelineState:this->Internals->PointShapedPipeline];
-        [encoder setVertexBuffer:this->Internals->PointPositionBuffer offset:0 atIndex:0];
-        [encoder setVertexBuffer:this->Internals->PointConnectivityBuffer offset:0 atIndex:1];
-        if (this->Internals->SceneUniformBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-        }
-        if (this->Internals->PointNormalBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointNormalBuffer offset:0 atIndex:3];
-        }
-        if (this->Internals->PointColorBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointColorBuffer offset:0 atIndex:4];
-        }
-        if (this->Internals->PointTangentBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointTangentBuffer offset:0 atIndex:6];
-        }
-        if (this->Internals->PointUVBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointUVBuffer offset:0 atIndex:7];
-        }
-        if (this->Internals->PointColorUVBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointColorUVBuffer offset:0 atIndex:8];
-        }
-        if (this->Internals->CellIdOffsetBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->CellIdOffsetBuffer offset:0 atIndex:9];
-        }
-        if (this->Internals->PointCellIdBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointCellIdBuffer offset:0 atIndex:11];
-        }
-        if (this->Internals->PropIdBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:12];
-        }
-        if (this->Internals->MaterialUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
-        }
-        if (this->Internals->LightUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
-        }
-        if (this->Internals->SceneUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-        }
-        if (this->Internals->CoincidentOffsetBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
-        }
-        if (this->Internals->VertexColorBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->VertexColorBuffer offset:0 atIndex:4];
-        }
-        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
-                    vertexStart:0
-                  vertexCount:4
-                instanceCount:this->Internals->PointVertexCount];
-      }
-      else if (this->Internals->PointPipeline)
-      {
-        // Basic 1px points
-        [encoder setRenderPipelineState:this->Internals->PointPipeline];
-        [encoder setVertexBuffer:this->Internals->PointPositionBuffer offset:0 atIndex:0];
-        if (this->Internals->SceneUniformBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:1];
-        }
-        if (this->Internals->PointNormalBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointNormalBuffer offset:0 atIndex:2];
-        }
-        if (this->Internals->PointColorBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointColorBuffer offset:0 atIndex:3];
-        }
-        if (this->Internals->PointTangentBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointTangentBuffer offset:0 atIndex:6];
-        }
-        if (this->Internals->PointUVBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointUVBuffer offset:0 atIndex:7];
-        }
-        if (this->Internals->PointColorUVBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointColorUVBuffer offset:0 atIndex:8];
-        }
-        if (this->Internals->CellIdOffsetBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->CellIdOffsetBuffer offset:0 atIndex:9];
-        }
-        if (this->Internals->PointCellIdBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PointCellIdBuffer offset:0 atIndex:11];
-        }
-        if (this->Internals->PropIdBuffer)
-        {
-          [encoder setVertexBuffer:this->Internals->PropIdBuffer offset:0 atIndex:12];
-        }
-        if (this->Internals->MaterialUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->MaterialUniformBuffer offset:0 atIndex:0];
-        }
-        if (this->Internals->LightUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->LightUniformBuffer offset:0 atIndex:1];
-        }
-        if (this->Internals->SceneUniformBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->SceneUniformBuffer offset:0 atIndex:2];
-        }
-        if (this->Internals->CoincidentOffsetBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->CoincidentOffsetBuffer offset:0 atIndex:3];
-        }
-        if (this->Internals->VertexColorBuffer)
-        {
-          [encoder setFragmentBuffer:this->Internals->VertexColorBuffer offset:0 atIndex:4];
-        }
-        [encoder drawPrimitives:MTLPrimitiveTypePoint
-                    vertexStart:0
-                  vertexCount:this->Internals->PointVertexCount];
-      }
+      this->ReplayRenderBundle((__bridge void*)encoder);
+    }
+    else
+    {
+      this->RebuildRenderBundle((__bridge void*)encoder, ren, act);
+      this->ReplayRenderBundle((__bridge void*)encoder);
     }
   }
 }
