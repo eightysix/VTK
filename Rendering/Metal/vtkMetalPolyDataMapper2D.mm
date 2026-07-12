@@ -164,27 +164,27 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
           newBufferWithBytes:positions.data()
                      length:positions.size() * sizeof(float)
                     options:MTLResourceStorageModeShared];
+
+        // Create color buffer from actor property
+        double r, g, b;
+        actor->GetProperty()->GetColor(r, g, b);
+        double opacity = actor->GetProperty()->GetOpacity();
+
+        // Upload color data (float4 per vertex)
+        std::vector<float> colors(numPts * 4);
+        for (vtkIdType i = 0; i < numPts; i++)
+        {
+          colors[i * 4] = static_cast<float>(r);
+          colors[i * 4 + 1] = static_cast<float>(g);
+          colors[i * 4 + 2] = static_cast<float>(b);
+          colors[i * 4 + 3] = static_cast<float>(opacity);
+        }
+
+        this->Internals->ColorBuffer = [device
+          newBufferWithBytes:colors.data()
+                     length:colors.size() * sizeof(float)
+                    options:MTLResourceStorageModeShared];
       }
-
-      // Create color buffer from actor property
-      double r, g, b;
-      actor->GetProperty()->GetColor(r, g, b);
-      double opacity = actor->GetProperty()->GetOpacity();
-
-      // Upload color data (float4 per vertex)
-      std::vector<float> colors(numPts * 4);
-      for (vtkIdType i = 0; i < numPts; i++)
-      {
-        colors[i * 4] = static_cast<float>(r);
-        colors[i * 4 + 1] = static_cast<float>(g);
-        colors[i * 4 + 2] = static_cast<float>(b);
-        colors[i * 4 + 3] = static_cast<float>(opacity);
-      }
-
-      this->Internals->ColorBuffer = [device
-        newBufferWithBytes:colors.data()
-                   length:colors.size() * sizeof(float)
-                  options:MTLResourceStorageModeShared];
 
       // Determine primitive types
       vtkCellArray* polys = input->GetPolys();
@@ -195,9 +195,6 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
       this->Internals->HasLines = (lines && lines->GetNumberOfCells() > 0);
       this->Internals->HasPoints = (verts && verts->GetNumberOfCells() > 0);
     }
-
-    // Get sample count for MSAA
-    int sampleCount = this->Internals->CachedSampleCount;
 
     // Compute WCVC (world-to-viewport-clip) matrix
     // For 2D overlay: orthographic projection from viewport pixel coordinates
@@ -317,7 +314,7 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         desc.vertexDescriptor = vertexDesc;
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-        desc.sampleCount = sampleCount;
+        desc.rasterSampleCount = sampleCount;
 
         this->Internals->TrianglePipeline =
           [device newRenderPipelineStateWithDescriptor:desc error:&error];
@@ -336,7 +333,7 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         desc.vertexDescriptor = vertexDesc;
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassLine;
-        desc.sampleCount = sampleCount;
+        desc.rasterSampleCount = sampleCount;
 
         this->Internals->LinePipeline =
           [device newRenderPipelineStateWithDescriptor:desc error:&error];
@@ -354,7 +351,7 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         desc.fragmentFunction = fFunc;
         desc.vertexDescriptor = vertexDesc;
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-        desc.sampleCount = sampleCount;
+        desc.rasterSampleCount = sampleCount;
 
         this->Internals->PointPipeline =
           [device newRenderPipelineStateWithDescriptor:desc error:&error];

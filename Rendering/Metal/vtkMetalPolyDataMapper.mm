@@ -2724,16 +2724,8 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
     return;
   }
 
-  // 8A: Get sample count for MSAA
-  int sampleCount = 1;
-  if (vtkMetalRenderWindow* renWin = vtkMetalRenderWindow::SafeDownCast(
-        vtkRenderer::SafeDownCast(this->GetFirstRenderer()) ?
-          vtkMetalRenderWindow::SafeDownCast(
-            vtkRenderer::SafeDownCast(this->GetFirstRenderer())->GetRenderWindow()) :
-          nullptr))
-  {
-    sampleCount = renWin->GetEffectiveSampleCount();
-  }
+  // 8A: Use cached sample count (set by RenderPiece before this call)
+  int sampleCount = this->Internals->CachedSampleCount > 0 ? this->Internals->CachedSampleCount : 1;
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
 
@@ -2817,16 +2809,8 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
     return;
   }
 
-  // 8A: Get sample count for MSAA
-  int sampleCount = 1;
-  if (vtkMetalRenderWindow* renWin = vtkMetalRenderWindow::SafeDownCast(
-        vtkRenderer::SafeDownCast(this->GetFirstRenderer()) ?
-          vtkMetalRenderWindow::SafeDownCast(
-            vtkRenderer::SafeDownCast(this->GetFirstRenderer())->GetRenderWindow()) :
-          nullptr))
-  {
-    sampleCount = renWin->GetEffectiveSampleCount();
-  }
+  // 8A: Use cached sample count (set by RenderPiece before this call)
+  int sampleCount = this->Internals->CachedSampleCount > 0 ? this->Internals->CachedSampleCount : 1;
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
 
@@ -2855,7 +2839,7 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
       desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
       desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
       desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
-      desc.sampleCount = sampleCount;
+      desc.rasterSampleCount = sampleCount;
 
       error = nil;
       this->Internals->PointPipeline =
@@ -2884,7 +2868,7 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
       desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
       // No backface culling for point quads
       desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-      desc.sampleCount = sampleCount;
+      desc.rasterSampleCount = sampleCount;
 
       error = nil;
       this->Internals->PointShapedPipeline =
@@ -2905,16 +2889,8 @@ void vtkMetalPolyDataMapper::EnsureEdgePipelineState(void* mtlDevice)
     return;
   }
 
-  // 8A: Get sample count for MSAA
-  int sampleCount = 1;
-  if (vtkMetalRenderWindow* renWin = vtkMetalRenderWindow::SafeDownCast(
-        vtkRenderer::SafeDownCast(this->GetFirstRenderer()) ?
-          vtkMetalRenderWindow::SafeDownCast(
-            vtkRenderer::SafeDownCast(this->GetFirstRenderer())->GetRenderWindow()) :
-          nullptr))
-  {
-    sampleCount = renWin->GetEffectiveSampleCount();
-  }
+  // 8A: Use cached sample count (set by RenderPiece before this call)
+  int sampleCount = this->Internals->CachedSampleCount > 0 ? this->Internals->CachedSampleCount : 1;
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
 
@@ -2957,7 +2933,7 @@ void vtkMetalPolyDataMapper::EnsureEdgePipelineState(void* mtlDevice)
     desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
     desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassLine;
-    desc.sampleCount = sampleCount;
+    desc.rasterSampleCount = sampleCount;
 
     error = nil;
     this->Internals->EdgePipeline =
@@ -2977,16 +2953,8 @@ void vtkMetalPolyDataMapper::EnsureThickLinePipelineState(void* mtlDevice)
     return;
   }
 
-  // 8A: Get sample count for MSAA
-  int sampleCount = 1;
-  if (vtkMetalRenderWindow* renWin = vtkMetalRenderWindow::SafeDownCast(
-        vtkRenderer::SafeDownCast(this->GetFirstRenderer()) ?
-          vtkMetalRenderWindow::SafeDownCast(
-            vtkRenderer::SafeDownCast(this->GetFirstRenderer())->GetRenderWindow()) :
-          nullptr))
-  {
-    sampleCount = renWin->GetEffectiveSampleCount();
-  }
+  // 8A: Use cached sample count (set by RenderPiece before this call)
+  int sampleCount = this->Internals->CachedSampleCount > 0 ? this->Internals->CachedSampleCount : 1;
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
 
@@ -3012,7 +2980,7 @@ void vtkMetalPolyDataMapper::EnsureThickLinePipelineState(void* mtlDevice)
     desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     // Thick lines are rendered as triangle strips (quads)
     desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-    desc.sampleCount = sampleCount;
+    desc.rasterSampleCount = sampleCount;
 
     error = nil;
     this->Internals->ThickLinePipeline =
@@ -3032,16 +3000,8 @@ void vtkMetalPolyDataMapper::EnsureRoundCapLinePipelineState(void* mtlDevice)
     return;
   }
 
-  // 8A: Get sample count for MSAA
-  int sampleCount = 1;
-  if (vtkMetalRenderWindow* renWin = vtkMetalRenderWindow::SafeDownCast(
-        vtkRenderer::SafeDownCast(this->GetFirstRenderer()) ?
-          vtkMetalRenderWindow::SafeDownCast(
-            vtkRenderer::SafeDownCast(this->GetFirstRenderer())->GetRenderWindow()) :
-          nullptr))
-  {
-    sampleCount = renWin->GetEffectiveSampleCount();
-  }
+  // 8A: Use cached sample count (set by RenderPiece before this call)
+  int sampleCount = this->Internals->CachedSampleCount > 0 ? this->Internals->CachedSampleCount : 1;
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
 
@@ -3067,7 +3027,7 @@ void vtkMetalPolyDataMapper::EnsureRoundCapLinePipelineState(void* mtlDevice)
     desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     // Round cap lines are rendered as triangle lists
     desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-    desc.sampleCount = sampleCount;
+    desc.rasterSampleCount = sampleCount;
 
     error = nil;
     this->Internals->RoundCapLinePipeline =
@@ -3087,16 +3047,8 @@ void vtkMetalPolyDataMapper::EnsureMiterJoinLinePipelineState(void* mtlDevice)
     return;
   }
 
-  // 8A: Get sample count for MSAA
-  int sampleCount = 1;
-  if (vtkMetalRenderWindow* renWin = vtkMetalRenderWindow::SafeDownCast(
-        vtkRenderer::SafeDownCast(this->GetFirstRenderer()) ?
-          vtkMetalRenderWindow::SafeDownCast(
-            vtkRenderer::SafeDownCast(this->GetFirstRenderer())->GetRenderWindow()) :
-          nullptr))
-  {
-    sampleCount = renWin->GetEffectiveSampleCount();
-  }
+  // 8A: Use cached sample count (set by RenderPiece before this call)
+  int sampleCount = this->Internals->CachedSampleCount > 0 ? this->Internals->CachedSampleCount : 1;
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
 
@@ -3122,7 +3074,7 @@ void vtkMetalPolyDataMapper::EnsureMiterJoinLinePipelineState(void* mtlDevice)
     desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     // Miter join lines are rendered as triangle strips (quads)
     desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-    desc.sampleCount = sampleCount;
+    desc.rasterSampleCount = sampleCount;
 
     error = nil;
     this->Internals->MiterJoinLinePipeline =

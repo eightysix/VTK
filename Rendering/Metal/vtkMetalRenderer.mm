@@ -138,7 +138,9 @@ void vtkMetalRenderer::DeviceRender()
     encoder.label = @"VTK Render Encoder";
 
     // Set depth stencil state for depth testing (Less comparison, write enabled)
-    if (depthTex)
+    id<MTLTexture> activeDepthTex = msaa ? msaaDepthTex :
+      (__bridge id<MTLTexture>)renWin->DepthTexture;
+    if (activeDepthTex)
     {
       MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
       dsDesc.depthCompareFunction = MTLCompareFunctionLess;
