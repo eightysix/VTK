@@ -898,7 +898,10 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     pipelineDesc.vertexFunction = vertexFunc;
     pipelineDesc.fragmentFunction = fragmentFunc;
     pipelineDesc.vertexDescriptor = vertexDesc;
-    pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    // Determine color format based on temporal upscaling state
+    MTLPixelFormat colorFormat = metalRenderWindow && metalRenderWindow->IsTemporalUpscalingEnabled()
+      ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
+    pipelineDesc.colorAttachments[0].pixelFormat = colorFormat;
 
     // The raymarching shader accumulates premultiplied color (color * alpha)
     // into accumulatedColor. Using MTLBlendFactorOne as source avoids

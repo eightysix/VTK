@@ -305,6 +305,10 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
       vertexDesc.layouts[0].stepRate = 1;
       vertexDesc.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
 
+      // Determine color format based on temporal upscaling state
+      MTLPixelFormat colorFormat = renWin->IsTemporalUpscalingEnabled()
+        ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
+
       // Triangle pipeline
       if (!this->Internals->TrianglePipeline)
       {
@@ -312,7 +316,7 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         desc.vertexFunction = vFunc;
         desc.fragmentFunction = fFunc;
         desc.vertexDescriptor = vertexDesc;
-        desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        desc.colorAttachments[0].pixelFormat = colorFormat;
         desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
         desc.rasterSampleCount = sampleCount;
 
@@ -331,7 +335,7 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         desc.vertexFunction = vFunc;
         desc.fragmentFunction = fFunc;
         desc.vertexDescriptor = vertexDesc;
-        desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        desc.colorAttachments[0].pixelFormat = colorFormat;
         desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassLine;
         desc.rasterSampleCount = sampleCount;
 
@@ -350,7 +354,7 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         desc.vertexFunction = vFunc;
         desc.fragmentFunction = fFunc;
         desc.vertexDescriptor = vertexDesc;
-        desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        desc.colorAttachments[0].pixelFormat = colorFormat;
         desc.rasterSampleCount = sampleCount;
 
         this->Internals->PointPipeline =

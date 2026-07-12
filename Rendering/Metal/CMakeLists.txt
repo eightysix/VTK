@@ -2,6 +2,7 @@ set(classes
   vtkMetalRenderWindow
   vtkMetalRenderer
   vtkMetalDepthPeeler
+  vtkMetalTemporalUpscaler
   vtkMetalActor
   vtkMetalPolyDataMapper
   vtkMetalBatchedPolyDataMapper
@@ -57,16 +58,16 @@ vtk_module_add_module(
   SOURCES ${sources} ${vtk_object_factory_source}
   PRIVATE_HEADERS ${vtk_object_factory_header})
 
-# Link Metal framework
+# Link Metal and MetalFX frameworks
 if(APPLE_IOS)
-  vtk_module_link(VTK::RenderingMetal PUBLIC "-framework Metal" "-framework QuartzCore" "-framework UIKit")
+  vtk_module_link(VTK::RenderingMetal PUBLIC "-framework Metal" "-framework MetalFX" "-framework QuartzCore" "-framework UIKit")
   if(VTK_REQUIRED_OBJCXX_FLAGS)
     set_source_files_properties(
       ${sources}
       PROPERTIES COMPILE_FLAGS "${VTK_REQUIRED_OBJCXX_FLAGS}")
   endif()
 else()
-  vtk_module_link(VTK::RenderingMetal PUBLIC "-framework Metal" "-framework QuartzCore")
+  vtk_module_link(VTK::RenderingMetal PUBLIC "-framework Metal" "-framework MetalFX" "-framework QuartzCore")
 endif()
 
 vtk_add_test_mangling(VTK::RenderingMetal)

@@ -106,6 +106,26 @@ public:
    */
   void GetIdsData(int x1, int y1, int x2, int y2, vtkUnsignedIntArray* data);
 
+  /**
+   * Set the temporal upscaling scale factor.
+   * 1.0 = disabled (native resolution), 0.5 = half resolution, etc.
+   * Must be in the range supported by MetalFX (typically 0.25–1.0).
+   */
+  void SetTemporalUpscaleScaleFactor(float factor);
+  float GetTemporalUpscaleScaleFactor() const;
+
+  /**
+   * Whether temporal upscaling is currently active (scale factor < 1.0).
+   */
+  bool IsTemporalUpscalingEnabled() const;
+
+  /**
+   * Get the render resolution (lower resolution used when upscaling is active).
+   * Returns the window size when upscaling is disabled.
+   */
+  int GetRenderResolutionWidth() const;
+  int GetRenderResolutionHeight() const;
+
 protected:
   vtkMetalRenderWindow();
   ~vtkMetalRenderWindow() override;
@@ -137,6 +157,13 @@ protected:
   void DestroyMultisampleAttachments();
 
   /**
+   * Create/destroy internal textures for MetalFX temporal upscaling.
+   * These are at render resolution (lower than window size when upscaling is active).
+   */
+  void CreateTemporalUpscaleTextures();
+  void DestroyTemporalUpscaleTextures();
+
+  /**
    * Acquire the next drawable from the CAMetalLayer.
    */
   bool AcquireDrawable();
@@ -165,6 +192,20 @@ protected:
   void* PeelFrontTexture = nullptr; // id<MTLTexture> — previous front accumulation
   void* PeelDepthTexture = nullptr; // id<MTLTexture> — previous depth (RG32Float)
   int PeelIndex = 0;              // current peel iteration
+
+  // MetalFX temporal upscaling state
+  float TemporalUpscaleScaleFactor = 1.0f; // 1.0=disabled, 0.5=half resolution
+  int RenderResolutionWidth = 0;  // actual render width (window size × scale factor)
+  int RenderResolutionHeight = 0; // actual render height
+  void* InternalColorTexture = nullptr;  // id<MTLTexture> — RGBA16Float at render resolution
+  void* InternalDepthTexture = nullptr;  // id<MTLTexture> — Depth32Float at render resolution
+  void* MotionVectorTexture = nullptr;   // id<MTLTexture> — RG16Float at render resolution
+  void* UpscaleOutputTexture = nullptr;  // id<MTLTexture> — RGBA16Float at output resolution
+  bool TemporalUpscaleTexturesCreated = false;
+
+  // Previous frame's MVP matrix for motion vector generation (column-major float[16])
+  float PreviousMVP[16] = {};
+  bool PreviousMVPValid = false;
 
   bool Initialized = false;
 

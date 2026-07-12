@@ -22,6 +22,7 @@ VTK_ABI_NAMESPACE_BEGIN
 
 class vtkOverrideAttribute;
 class vtkMetalDepthPeeler;
+class vtkMetalTemporalUpscaler;
 
 class VTKRENDERINGMETAL_EXPORT VTK_MARSHALAUTO vtkMetalRenderer : public vtkRenderer
 {
@@ -68,6 +69,17 @@ protected:
 
 private:
   std::unique_ptr<vtkMetalDepthPeeler> DepthPeeler;
+  std::unique_ptr<vtkMetalTemporalUpscaler> TemporalUpscaler;
+
+  // Temporal upscaling state
+  int TemporalFrameIndex = 0;
+  bool PreviousMVPIsValid = false;
+
+  // Pipeline states for motion vector generation and blit
+  void* MotionVectorPipeline = nullptr;   // id<MTLRenderPipelineState>
+  void* BlitPipeline = nullptr;           // id<MTLRenderPipelineState>
+  void* MotionVectorUniformBuffer = nullptr; // id<MTLBuffer>
+
   vtkMetalRenderer(const vtkMetalRenderer&) = delete;
   void operator=(const vtkMetalRenderer&) = delete;
 };

@@ -52,6 +52,7 @@
 
   _renderer->SetBackground(0.1, 0.1, 0.2);
   _renWin->AddRenderer(_renderer);
+  _renWin->SetTemporalUpscaleScaleFactor(0.5f);
 
   // Set size (Retina-aware)
   CGFloat scale = [UIScreen mainScreen].nativeScale;
