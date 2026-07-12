@@ -148,27 +148,27 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 
 **WebGPU reference**: `vtkWebGPUPolyDataMapper2D` + `Private/vtkWebGPUPolyDataMapper2DInternals`.
 
-### 7B. Batched Mapper
+### 7B. Batched Mapper ✅
 
-**Files**: New `vtkMetalBatchedPolyDataMapper.{h,mm}`
+**Status**: Implemented. `vtkMetalBatchedPolyDataMapper` accumulates multiple actors' geometry into shared vertex/index buffers. Uses `CompositeDataProperties` uniform buffer with 256-byte alignment per entry to store per-actor properties (opacity, ambient/diffuse colors, cell ID offsets, pickability, composite ID). `BatchPropertiesBuffer` stores all mesh properties in a single GPU buffer. `AddBatchElement()`/`GetBatchElement()`/`ClearBatchElements()` manage the batch. `RenderPiece()` iterates over batch elements and calls the parent class for each visible mesh. `GetMTime()` returns max of parent and batch MTime.
 
-**Implementation**:
-1. Accumulate multiple actors' geometry into shared vertex/index buffers.
-2. Use `CellIdOffsetBuffer` (already exists, hardcoded to 0) to offset cell IDs per actor.
-3. Single draw call per batch instead of one per actor.
-4. Requires uniform buffer array for per-actor transforms/materials.
+**Files**:
+- `vtkMetalBatchedPolyDataMapper.h` — class declaration with `CompositeDataProperties` struct, `BatchElement` typedef
+- `vtkMetalBatchedPolyDataMapper.mm` — `AddBatchElement()`, `BuildBatchedGeometryBuffers()`, `UpdateBatchPropertiesBuffer()`, `RenderPiece()`
+- `CMakeLists.txt` — added to classes list
 
-**WebGPU reference**: `vtkWebGPUBatchedPolyDataMapper`.
+**WebGPU reference**: `vtkWebGPUBatchedPolyDataMapper` — same architecture with storage buffer instead of uniform buffer.
 
-### 7C. Composite Mapper Delegator
+### 7C. Composite Mapper Delegator ✅
 
-**Files**: New `vtkMetalCompositePolyDataMapperDelegator.{h,mm}`
+**Status**: Implemented. `vtkMetalCompositePolyDataMapperDelegator` inherits from `vtkCompositePolyDataMapperDelegator` and delegates to `vtkMetalBatchedPolyDataMapper`. Trampolines all virtual methods (`Insert()`, `Get()`, `Clear()`, `SetParent()`, `GetRenderedList()`, etc.) to the Metal batched mapper. `CreateOverrideAttributes()` sets `RenderingBackend` to `"Metal"`.
 
-**Implementation**:
-1. Delegate geometry processing to the batched mapper.
-2. Handle composite/LOD rendering.
+**Files**:
+- `vtkMetalCompositePolyDataMapperDelegator.h` — class declaration
+- `vtkMetalCompositePolyDataMapperDelegator.mm` — trampoline implementations
+- `CMakeLists.txt` — added to classes list
 
-**WebGPU reference**: `vtkWebGPUCompositePolyDataMapperDelegator`.
+**WebGPU reference**: `vtkWebGPUCompositePolyDataMapperDelegator` — same pattern.
 
 ### 7D. Glyph3D Mapper
 
@@ -250,9 +250,9 @@ Feature-by-feature plan for bringing `vtkMetalPolyDataMapper` to full parity wit
 | 11 | 6A — GPU tessellation | Large | Medium | ✅ Done |
 | 12 | 8A — MSAA | Medium | Medium | ✅ Done |
 | 13 | 7A — 2D mapper | Medium | Low | ✅ Done |
-| 14 | 7B — Batched mapper | Large | Low | — performance optimization |
-| 15 | 8B — Depth peeling | Large | Low | — correct translucency |
-| 16 | 7C — Composite delegator | Large | Low | — LOD support |
+| 14 | 7B — Batched mapper | Large | Low | ✅ Done |
+| 15 | 7C — Composite delegator | Large | Low | ✅ Done |
+| 16 | 8B — Depth peeling | Large | Low | — correct translucency |
 | 17 | 7D — Glyph3D mapper | Large | Low | — glyph instancing |
 | 18 | 8C — Render bundles | Large | Low | — perf optimization |
 | 19 | 8D — Vertex attribute mapping | Medium | Low | — custom attributes |
