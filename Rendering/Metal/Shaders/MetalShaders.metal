@@ -2202,18 +2202,22 @@ struct VolumeVertexOut {
 // local-space position for ray entry in the fragment shader.
 // Uses a packed ViewProjection matrix passed via buffer(2) since the
 // volume mapper has its own bind group layout independent of SceneUniforms.
+struct VolumeVertexIn {
+  float3 position [[attribute(0)]];
+};
+
 vertex VolumeVertexOut vertex_volume_main(
-    uint vertex_id [[vertex_id]],
-    constant float3* positions [[buffer(0)]],
+    VolumeVertexIn in [[stage_in]],
     constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
     constant float4x4& viewProjection [[buffer(2)]]) {
   VolumeVertexOut out;
 
-  float4 worldPos = volumeUniforms.volumeToWorld * float4(positions[vertex_id], 1.0);
+  float3 modelPos = in.position;
+  float4 worldPos = volumeUniforms.volumeToWorld * float4(modelPos, 1.0);
   out.position = viewProjection * worldPos;
 
   float3 boundsSize = volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz;
-  out.localPos = (worldPos.xyz - volumeUniforms.volumeBoundsMin.xyz) / boundsSize;
+  out.localPos = (modelPos - volumeUniforms.volumeBoundsMin.xyz) / boundsSize;
 
   return out;
 }
