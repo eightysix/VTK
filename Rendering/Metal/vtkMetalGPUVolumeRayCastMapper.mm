@@ -33,12 +33,16 @@ struct VolumeMapperUniforms
   float VolumeBoundsMin[4];
   float VolumeBoundsMax[4];
   float CameraVolumePos[4];
+  float ViewProjectionMatrix[16];
   float SampleDistance;
   float ScalarMin;
   float ScalarMax;
   float UseJittering;
-  float Padding[4]; // ensure 16-byte alignment (Metal rounds struct to 208)
+  float Padding[4]; // 272 bytes total, 16-byte aligned (Metal enforces this)
 };
+
+static_assert(sizeof(VolumeMapperUniforms) == 272,
+  "VolumeMapperUniforms must be 272 bytes to match Metal shader struct");
 
 namespace
 {
@@ -98,6 +102,12 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   {
     CFRelease(this->PipelineState);
     this->PipelineState = nullptr;
+  }
+
+  if (this->StagingBuffer)
+  {
+    CFRelease(this->StagingBuffer);
+    this->StagingBuffer = nullptr;
   }
 
   if (this->VolumeTexture)
@@ -487,6 +497,14 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
 
       // Upload via staging buffer + blit encoder (works on all platforms)
       NSUInteger totalBytes = bytesPerImage * dims[2];
+
+      // Release old staging buffer before creating a new one
+      if (this->StagingBuffer)
+      {
+        CFRelease(this->StagingBuffer);
+        this->StagingBuffer = nullptr;
+      }
+
       id<MTLBuffer> stagingBuf = [device newBufferWithBytes:uploadPointer
                                                      length:totalBytes
                                                     options:MTLResourceStorageModeShared];
@@ -495,6 +513,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
         vtkErrorMacro("Failed to create volume staging buffer");
         return false;
       }
+      this->StagingBuffer = (__bridge void*)stagingBuf;
+      CFRetain((__bridge CFTypeRef)stagingBuf);
 
       id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
       id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
@@ -509,7 +529,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
        destinationOrigin:MTLOriginMake(0, 0, 0)];
       [blit endEncoding];
       [uploadCmdBuf commit];
-      [uploadCmdBuf waitUntilCompleted];
+      // No waitUntilCompleted — the staging buffer is retained as a member
+      // so it stays alive until the blit finishes on the GPU. Command buffers
+      // on the same queue execute in order, so the render pass will not read
+      // the texture until after this blit completes.
 
       this->VolumeUploadTime.Modified();
     }
@@ -942,16 +965,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;
 
-  // Update uniform buffer
-  id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)this->UniformBuffer;
-  memcpy([uniformBuf contents], &uniforms, sizeof(uniforms));
-
-  // Compute viewProjection matrix = projection * view
+  // Compute viewProjection matrix = projection * view and pack into uniforms
   // SceneTransforms layout (from vtkMetalCamera.h):
   //   offset 0:   float ViewMatrix[4][4]     (64 bytes)
   //   offset 64:  float ProjectionMatrix[4][4] (64 bytes)
   vtkMetalCamera* metalCamera = vtkMetalCamera::SafeDownCast(ren->GetActiveCamera());
-  float viewProjection[16];
   if (metalCamera)
   {
     const float* sceneData = static_cast<const float*>(metalCamera->GetCachedSceneTransforms());
@@ -961,7 +979,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     {
       for (int r = 0; r < 4; ++r)
       {
-        viewProjection[c * 4 + r] = P[0 * 4 + r] * V[c * 4 + 0] +
+        uniforms.ViewProjectionMatrix[c * 4 + r] = P[0 * 4 + r] * V[c * 4 + 0] +
           P[1 * 4 + r] * V[c * 4 + 1] + P[2 * 4 + r] * V[c * 4 + 2] +
           P[3 * 4 + r] * V[c * 4 + 3];
       }
@@ -969,14 +987,14 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   }
   else
   {
-    memset(viewProjection, 0, sizeof(viewProjection));
-    viewProjection[0] = viewProjection[5] = viewProjection[10] = viewProjection[15] = 1.0f;
+    memset(uniforms.ViewProjectionMatrix, 0, sizeof(uniforms.ViewProjectionMatrix));
+    uniforms.ViewProjectionMatrix[0] = uniforms.ViewProjectionMatrix[5] =
+      uniforms.ViewProjectionMatrix[10] = uniforms.ViewProjectionMatrix[15] = 1.0f;
   }
 
-  // Create or reuse viewProjection buffer
-  id<MTLBuffer> vpBuf = [device newBufferWithBytes:viewProjection
-                                            length:sizeof(viewProjection)
-                                           options:MTLResourceStorageModeShared];
+  // Update uniform buffer (now includes viewProjection)
+  id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)this->UniformBuffer;
+  memcpy([uniformBuf contents], &uniforms, sizeof(uniforms));
 
   // Set pipeline and arguments
   id<MTLRenderPipelineState> pipeline = (__bridge id<MTLRenderPipelineState>)this->PipelineState;
@@ -986,12 +1004,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   id<MTLBuffer> vertexBuf = (__bridge id<MTLBuffer>)this->VertexBuffer;
   [encoder setVertexBuffer:vertexBuf offset:0 atIndex:0];
 
-  // Bind uniform buffer (vertex + fragment)
+  // Bind uniform buffer (vertex + fragment) — now contains viewProjection
   [encoder setVertexBuffer:uniformBuf offset:0 atIndex:1];
   [encoder setFragmentBuffer:uniformBuf offset:0 atIndex:1];
-
-  // Bind viewProjection matrix (vertex only)
-  [encoder setVertexBuffer:vpBuf offset:0 atIndex:2];
 
   // Bind volume texture and sampler (fragment)
   id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;

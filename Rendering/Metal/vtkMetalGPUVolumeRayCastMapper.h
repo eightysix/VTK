@@ -60,6 +60,7 @@ private:
   void* UniformBuffer = nullptr;         // id<MTLBuffer>
   void* VertexBuffer = nullptr;          // id<MTLBuffer>
   void* IndexBuffer = nullptr;           // id<MTLBuffer>
+  void* StagingBuffer = nullptr;         // id<MTLBuffer> (volume upload, kept alive for async blit)
   int IndexCount = 0;
 
   // Volume state

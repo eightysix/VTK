@@ -2186,11 +2186,12 @@ struct VolumeMapperUniforms {
   float4 volumeBoundsMin;
   float4 volumeBoundsMax;
   float4 cameraVolumePos;
+  float4x4 viewProjection;
   float sampleDistance;
   float scalarMin;
   float scalarMax;
   float useJittering;
-  float _padding[3];
+  float _padding[4];
 };
 
 struct VolumeVertexOut {
@@ -2200,21 +2201,18 @@ struct VolumeVertexOut {
 
 // Volume vertex shader — transforms bounding box vertices and computes
 // local-space position for ray entry in the fragment shader.
-// Uses a packed ViewProjection matrix passed via buffer(2) since the
-// volume mapper has its own bind group layout independent of SceneUniforms.
 struct VolumeVertexIn {
   float3 position [[attribute(0)]];
 };
 
 vertex VolumeVertexOut vertex_volume_main(
     VolumeVertexIn in [[stage_in]],
-    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
-    constant float4x4& viewProjection [[buffer(2)]]) {
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]]) {
   VolumeVertexOut out;
 
   float3 modelPos = in.position;
   float4 worldPos = volumeUniforms.volumeToWorld * float4(modelPos, 1.0);
-  out.position = viewProjection * worldPos;
+  out.position = volumeUniforms.viewProjection * worldPos;
 
   float3 boundsSize = volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz;
   out.localPos = (modelPos - volumeUniforms.volumeBoundsMin.xyz) / boundsSize;
