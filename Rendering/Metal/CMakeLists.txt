@@ -11,7 +11,8 @@ set(classes
   vtkMetalProperty
   vtkMetalLight
   vtkMetalHardwareSelector
-  vtkMetalGlyph3DMapper)
+  vtkMetalGlyph3DMapper
+  vtkMetalGPUVolumeRayCastMapper)
 
 set(headers)
 set(sources)

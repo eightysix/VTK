@@ -10,10 +10,12 @@ SPDX_COPYRIGHT_TEXT
   Copyright (c) Ken Martin, Will Schroeder, Bill Lorensen
 IMPLEMENTS
   VTK::RenderingCore
+  VTK::RenderingVolume
 DEPENDS
   VTK::CommonCore
   VTK::RenderingCore
   VTK::RenderingUI
+  VTK::RenderingVolume
 PRIVATE_DEPENDS
   VTK::CommonDataModel
   VTK::CommonMath

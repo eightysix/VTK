@@ -2175,3 +2175,141 @@ fragment FragmentOutput fragment_glyph_point_main(
   out.depth = in.position.z + coinOffset.pointOffset / 65000.0;
   return out;
 }
+
+// ============================================================================
+// Volume Ray Casting Mapper
+// ============================================================================
+
+struct VolumeMapperUniforms {
+  float4x4 worldToVolume;
+  float4x4 volumeToWorld;
+  float4 volumeBoundsMin;
+  float4 volumeBoundsMax;
+  float4 cameraVolumePos;
+  float sampleDistance;
+  float scalarMin;
+  float scalarMax;
+  float useJittering;
+  float _padding[3];
+};
+
+struct VolumeVertexOut {
+  float4 position [[position]];
+  float3 localPos;
+};
+
+// Volume vertex shader — transforms bounding box vertices and computes
+// local-space position for ray entry in the fragment shader.
+// Uses a packed ViewProjection matrix passed via buffer(2) since the
+// volume mapper has its own bind group layout independent of SceneUniforms.
+vertex VolumeVertexOut vertex_volume_main(
+    uint vertex_id [[vertex_id]],
+    constant float3* positions [[buffer(0)]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant float4x4& viewProjection [[buffer(2)]]) {
+  VolumeVertexOut out;
+
+  float4 worldPos = volumeUniforms.volumeToWorld * float4(positions[vertex_id], 1.0);
+  out.position = viewProjection * worldPos;
+
+  float3 boundsSize = volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz;
+  out.localPos = (in.position - volumeUniforms.volumeBoundsMin.xyz) / boundsSize;
+
+  return out;
+}
+
+struct VolumeFragmentOut {
+  float4 color [[color(0)]];
+};
+
+constant int MAX_RAY_STEPS = 2000;
+
+// Pseudo-random for jittering
+inline float volume_random(float2 st) {
+  return fract(sin(dot(st.xy, float2(12.9898, 78.233))) * 43758.5453123);
+}
+
+// Ray-box intersection
+inline float2 intersectBox(float3 orig, float3 dir, float3 boxMin, float3 boxMax) {
+  float3 invDir = 1.0 / (dir + float3(1e-8));
+  float3 tbot = invDir * (boxMin - orig);
+  float3 ttop = invDir * (boxMax - orig);
+  float3 tmin = min(ttop, tbot);
+  float3 tmax = max(ttop, tbot);
+  float t0 = max(max(tmin.x, tmin.y), tmin.z);
+  float t1 = min(min(tmax.x, tmax.y), tmax.z);
+  return float2(t0, t1);
+}
+
+fragment VolumeFragmentOut fragment_volume_main(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    sampler transferFunctionSampler [[sampler(0)]],
+    sampler volumeSampler [[sampler(1)]]) {
+  VolumeFragmentOut output;
+
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float stepSize = volumeUniforms.sampleDistance;
+
+  float3 startPoint = in.localPos;
+  float3 rayDir = startPoint - cameraPos;
+  float dirLength = length(rayDir);
+
+  if (dirLength < 0.0001) {
+    discard_fragment();
+  }
+  rayDir = rayDir / dirLength;
+
+  float2 t = intersectBox(cameraPos, rayDir, float3(0.0), float3(1.0));
+
+  float tStart = max(t.x, 0.0);
+  if (tStart >= t.y) {
+    discard_fragment();
+  }
+
+  float3 entryPoint = cameraPos + rayDir * tStart;
+  float3 exitPoint = cameraPos + rayDir * t.y;
+  float totalDist = length(exitPoint - entryPoint);
+  int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
+
+  float jitter = 0.0;
+  if (volumeUniforms.useJittering > 0.5) {
+    jitter = volume_random(in.position.xy) * stepSize;
+  }
+
+  float3 currentPoint = entryPoint + (rayDir * jitter);
+  float3 accumulatedColor = float3(0.0);
+  float accumulatedOpacity = 0.0;
+
+  for (int i = 0; i < maxSteps; i++) {
+    float3 texCoord = clamp(currentPoint, float3(0.0), float3(1.0));
+    float rawScalar = volumeTexture.sample(volumeSampler, texCoord, level(0)).r;
+
+    float scalarNorm = clamp(
+      (rawScalar - volumeUniforms.scalarMin) /
+      (volumeUniforms.scalarMax - volumeUniforms.scalarMin),
+      0.0, 1.0);
+
+    float4 colorOpacity = transferFunctionTexture.sample(
+      transferFunctionSampler, float2(scalarNorm, 0.5), level(0));
+
+    float sampleOpacity = colorOpacity.a;
+    if (sampleOpacity > 0.001) {
+      float3 sampleColor = colorOpacity.rgb;
+      accumulatedColor = accumulatedColor + (1.0 - accumulatedOpacity) * sampleColor * sampleOpacity;
+      accumulatedOpacity = accumulatedOpacity + (1.0 - accumulatedOpacity) * sampleOpacity;
+    }
+
+    if (accumulatedOpacity >= 0.95) {
+      accumulatedOpacity = 1.0;
+      break;
+    }
+
+    currentPoint = currentPoint + rayDir * stepSize;
+  }
+
+  output.color = float4(accumulatedColor, accumulatedOpacity);
+  return output;
+}
