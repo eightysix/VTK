@@ -220,7 +220,9 @@ void vtkMetalRenderWindow::RecreateDepthTexture()
                                                                                    width:this->Size[0]
                                                                                   height:this->Size[1]
                                                                                mipmapped:NO];
-    desc.usage = MTLTextureUsageRenderTarget;
+    // ShaderRead allows the volume mapper to sample scene depth for early
+    // ray termination (depth buffer occlusion).
+    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     desc.storageMode = MTLStorageModePrivate;
 
     id<MTLTexture> tex = [device newTextureWithDescriptor:desc];

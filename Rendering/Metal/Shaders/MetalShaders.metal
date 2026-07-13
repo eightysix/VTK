@@ -2191,7 +2191,9 @@ struct VolumeMapperUniforms {
   float scalarMin;
   float scalarMax;
   float useJittering;
-  float _padding[4];
+  float4x4 inverseViewProjection;
+  float2 viewportSize;
+  float2 _pad;
 };
 
 struct VolumeVertexOut {
@@ -2248,8 +2250,10 @@ fragment VolumeFragmentOut fragment_volume_main(
     constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
     texture3d<float> volumeTexture [[texture(0)]],
     texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
     sampler transferFunctionSampler [[sampler(0)]],
-    sampler volumeSampler [[sampler(1)]]) {
+    sampler volumeSampler [[sampler(1)]],
+    sampler depthSampler [[sampler(2)]]) {
   VolumeFragmentOut output;
 
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
@@ -2274,6 +2278,34 @@ fragment VolumeFragmentOut fragment_volume_main(
   float3 entryPoint = cameraPos + rayDir * tStart;
   float3 exitPoint = cameraPos + rayDir * t.y;
   float totalDist = length(exitPoint - entryPoint);
+
+  // --- Depth buffer occlusion ---
+  // Sample the scene depth at this fragment's screen position. If an opaque
+  // surface is closer than the volume, terminate the ray early.
+  float tTerminateMax = 1e30; // default: no depth termination
+  float2 screenUV = in.position.xy / volumeUniforms.viewportSize;
+  float depthSample = depthTexture.sample(depthSampler, screenUV).r;
+
+  if (depthSample < 1.0) {
+    // Reconstruct clip-space position from window coordinates.
+    // in.position.xy is in pixels; convert to NDC [-1,1].
+    float2 ndcXY = (in.position.xy / volumeUniforms.viewportSize) * 2.0 - 1.0;
+    // Metal clip-space Z is in [0,1], Y is flipped (top-left origin).
+    float4 clipPos = float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
+    float4 worldTermination = volumeUniforms.inverseViewProjection * clipPos;
+    float3 terminationWorld = worldTermination.xyz / worldTermination.w;
+
+    // Convert to volume-local space [0,1]
+    float3 boundsMin = volumeUniforms.volumeBoundsMin.xyz;
+    float3 boundsMax = volumeUniforms.volumeBoundsMax.xyz;
+    float3 boundsSize = boundsMax - boundsMin;
+    float3 terminationLocal = (terminationWorld - boundsMin) / boundsSize;
+
+    // Compute maximum ray distance before hitting the opaque surface
+    float3 terminationVec = terminationLocal - entryPoint;
+    tTerminateMax = length(terminationVec);
+  }
+
   int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
 
   float jitter = 0.0;
@@ -2289,6 +2321,9 @@ fragment VolumeFragmentOut fragment_volume_main(
   half3 accumulatedColor = half3(0.0);
   half accumulatedOpacity = 0.0;
   half scalarRangeRcp = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
+
+  // Track ray distance for depth buffer occlusion early termination
+  float currentT = jitter;
 
   // Process 2 samples per iteration to halve loop overhead and improve
   // instruction-level parallelism.
@@ -2311,6 +2346,7 @@ fragment VolumeFragmentOut fragment_volume_main(
       }
 
       currentPoint += stepVec;
+      currentT += stepSize;
 
       // --- Sample 2 ---
       float rawScalar2 = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
@@ -2328,8 +2364,9 @@ fragment VolumeFragmentOut fragment_volume_main(
       }
 
       currentPoint += stepVec;
+      currentT += stepSize;
 
-      if (accumulatedOpacity >= 0.95h) {
+      if (accumulatedOpacity >= 0.95h || currentT >= tTerminateMax) {
         accumulatedOpacity = 1.0h;
         break;
       }
@@ -2351,7 +2388,9 @@ fragment VolumeFragmentOut fragment_volume_main(
         accumulatedOpacity += w * sampleOpacity;
       }
 
-      if (accumulatedOpacity >= 0.95h) {
+      currentT += stepSize;
+
+      if (accumulatedOpacity >= 0.95h || currentT >= tTerminateMax) {
         accumulatedOpacity = 1.0h;
         break;
       }

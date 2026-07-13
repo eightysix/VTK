@@ -43,6 +43,9 @@ public:
   int GetImageSampleWidth() const { return this->ImageSampleFBOWidth; }
   int GetImageSampleHeight() const { return this->ImageSampleFBOHeight; }
 
+  // Depth buffer occlusion — set by vtkMetalRenderer before volume rendering
+  void SetDepthTexture(void* depthTex) { this->DepthTextureOcclusion = depthTex; }
+
 protected:
   vtkMetalGPUVolumeRayCastMapper();
   ~vtkMetalGPUVolumeRayCastMapper() override;
@@ -61,6 +64,8 @@ private:
   void* ColorOpacityTextureView = nullptr; // id<MTLTexture>  (alias)
   void* ColorOpacitySampler = nullptr;   // id<MTLSamplerState>
   void* DepthStencilState = nullptr;     // id<MTLDepthStencilState>
+  void* DepthTextureOcclusion = nullptr; // id<MTLTexture> — scene depth for early ray termination
+  void* DepthSampler = nullptr;          // id<MTLSamplerState> — nearest sampler for depth texture
 
   // Buffers
   void* UniformBuffer = nullptr;         // id<MTLBuffer>

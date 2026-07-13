@@ -140,15 +140,14 @@ void vtkMetalRenderer::DeviceRender()
         }
       }
 
-      // Depth attachment — store for potential depth peeling
+      // Depth attachment — always store for depth peeling and volume rendering
+      // (volume mapper samples depth for early ray termination / depth occlusion)
       if (msaa && msaaDepthTex)
       {
         rpd.depthAttachment.texture = msaaDepthTex;
         rpd.depthAttachment.loadAction = MTLLoadActionClear;
         rpd.depthAttachment.clearDepth = 1.0;
-        // Store depth if depth peeling might need it
-        bool needDepth = this->HasTranslucentPolygonalGeometry();
-        rpd.depthAttachment.storeAction = needDepth ? MTLStoreActionStore : MTLStoreActionDontCare;
+        rpd.depthAttachment.storeAction = MTLStoreActionStore;
       }
       else
       {
@@ -158,8 +157,7 @@ void vtkMetalRenderer::DeviceRender()
           rpd.depthAttachment.texture = depthTex;
           rpd.depthAttachment.loadAction = MTLLoadActionClear;
           rpd.depthAttachment.clearDepth = 1.0;
-          bool needDepth = this->HasTranslucentPolygonalGeometry();
-          rpd.depthAttachment.storeAction = needDepth ? MTLStoreActionStore : MTLStoreActionDontCare;
+          rpd.depthAttachment.storeAction = MTLStoreActionStore;
         }
       }
 
@@ -293,6 +291,22 @@ void vtkMetalRenderer::DeviceRender()
 
       [encoder endEncoding];
       renWin->Encoder = nullptr;
+    }
+
+    // Resolve MSAA depth to regular depth texture for volume mapper sampling.
+    // The volume shader samples the depth buffer for early ray termination,
+    // but multisampled textures cannot be sampled in fragment shaders.
+    if (msaa && msaaDepthTex)
+    {
+      id<MTLTexture> depthTex = (__bridge id<MTLTexture>)renWin->DepthTexture;
+      if (depthTex)
+      {
+        id<MTLBlitCommandEncoder> depthResolve = [commandBuffer blitCommandEncoder];
+        depthResolve.label = @"VTK MSAA Depth Resolve for Volume";
+        [depthResolve resolveMultisampleTexture:msaaDepthTex
+                                destinationTexture:depthTex];
+        [depthResolve endEncoding];
+      }
     }
 
     // === Phase 3: Render volumetric geometry ===

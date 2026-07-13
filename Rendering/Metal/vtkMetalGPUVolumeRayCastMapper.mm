@@ -38,11 +38,13 @@ struct VolumeMapperUniforms
   float ScalarMin;
   float ScalarMax;
   float UseJittering;
-  float Padding[4]; // 272 bytes total, 16-byte aligned (Metal enforces this)
+  float InverseViewProjection[16];
+  float ViewportSize[2]; // width, height in pixels for depth texture UV
+  float _pad[2];
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 272,
-  "VolumeMapperUniforms must be 272 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 336,
+  "VolumeMapperUniforms must be 336 bytes to match Metal shader struct");
 
 namespace
 {
@@ -339,6 +341,12 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   {
     CFRelease(this->ColorOpacitySampler);
     this->ColorOpacitySampler = nullptr;
+  }
+
+  if (this->DepthSampler)
+  {
+    CFRelease(this->DepthSampler);
+    this->DepthSampler = nullptr;
   }
 
   if (this->DepthStencilState)
@@ -1078,6 +1086,19 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       CFRetain((__bridge CFTypeRef)sampler);
     }
 
+    // Nearest sampler for depth texture (depth buffer occlusion)
+    if (!this->DepthSampler)
+    {
+      MTLSamplerDescriptor* depthSampDesc = [[MTLSamplerDescriptor alloc] init];
+      depthSampDesc.minFilter = MTLSamplerMinMagFilterNearest;
+      depthSampDesc.magFilter = MTLSamplerMinMagFilterNearest;
+      depthSampDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+      depthSampDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+      id<MTLSamplerState> depthSamp = [device newSamplerStateWithDescriptor:depthSampDesc];
+      this->DepthSampler = (__bridge void*)depthSamp;
+      CFRetain((__bridge CFTypeRef)depthSamp);
+    }
+
     // Create and cache a depth stencil state.
     // Volume rendering reads but does not write depth — this prevents the
     // bounding box from z-fighting with itself and allows correct occlusion
@@ -1334,6 +1355,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;
 
+  // Viewport size for depth texture UV computation in the shader
+  int* winSize = ren->GetSize();
+  uniforms.ViewportSize[0] = static_cast<float>(winSize[0]);
+  uniforms.ViewportSize[1] = static_cast<float>(winSize[1]);
+
   // Compute view-projection matrix via generic vtkCamera API.
   // Try the Metal camera first (has a precomputed cached layout), fall back to
   // computing it from vtkCamera::GetViewTransformMatrix /
@@ -1378,7 +1404,82 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     }
   }
 
-  // Update uniform buffer (now includes viewProjection)
+  // Compute inverse view-projection matrix for depth buffer occlusion.
+  // Used in the fragment shader to unproject depth values to world space.
+  {
+    float VP[16];
+    memcpy(VP, uniforms.ViewProjectionMatrix, sizeof(VP));
+    float invDet = 0.0f;
+    float invVP[16];
+
+    // 4x4 inverse via cofactors (inline to avoid vtkMatrix4x4 dependency in hot path)
+    invVP[0] = VP[5] * (VP[10] * VP[15] - VP[11] * VP[14]) -
+               VP[9] * (VP[6] * VP[15] - VP[7] * VP[14]) +
+               VP[13] * (VP[6] * VP[11] - VP[7] * VP[10]);
+    invVP[4] = -VP[4] * (VP[10] * VP[15] - VP[11] * VP[14]) +
+               VP[8] * (VP[6] * VP[15] - VP[7] * VP[14]) -
+               VP[12] * (VP[6] * VP[11] - VP[7] * VP[10]);
+    invVP[8] = VP[4] * (VP[9] * VP[15] - VP[11] * VP[13]) -
+               VP[8] * (VP[5] * VP[15] - VP[7] * VP[13]) +
+               VP[12] * (VP[5] * VP[11] - VP[7] * VP[9]);
+    invVP[12] = -VP[4] * (VP[9] * VP[14] - VP[10] * VP[13]) +
+                VP[8] * (VP[5] * VP[14] - VP[6] * VP[13]) -
+                VP[12] * (VP[5] * VP[10] - VP[6] * VP[9]);
+    invVP[1] = -VP[1] * (VP[10] * VP[15] - VP[11] * VP[14]) +
+               VP[9] * (VP[2] * VP[15] - VP[3] * VP[14]) -
+               VP[13] * (VP[2] * VP[11] - VP[3] * VP[10]);
+    invVP[5] = VP[0] * (VP[10] * VP[15] - VP[11] * VP[14]) -
+               VP[8] * (VP[2] * VP[15] - VP[3] * VP[14]) +
+               VP[12] * (VP[2] * VP[11] - VP[3] * VP[10]);
+    invVP[9] = -VP[0] * (VP[9] * VP[15] - VP[11] * VP[13]) +
+               VP[8] * (VP[1] * VP[15] - VP[3] * VP[13]) -
+               VP[12] * (VP[1] * VP[11] - VP[3] * VP[9]);
+    invVP[13] = VP[0] * (VP[9] * VP[14] - VP[10] * VP[13]) -
+                VP[8] * (VP[1] * VP[14] - VP[2] * VP[13]) +
+                VP[12] * (VP[1] * VP[10] - VP[2] * VP[9]);
+    invVP[2] = VP[1] * (VP[6] * VP[15] - VP[7] * VP[14]) -
+               VP[5] * (VP[2] * VP[15] - VP[3] * VP[14]) +
+               VP[13] * (VP[2] * VP[7] - VP[3] * VP[6]);
+    invVP[6] = -VP[0] * (VP[6] * VP[15] - VP[7] * VP[14]) +
+               VP[4] * (VP[2] * VP[15] - VP[3] * VP[14]) -
+               VP[12] * (VP[2] * VP[7] - VP[3] * VP[6]);
+    invVP[10] = VP[0] * (VP[5] * VP[15] - VP[7] * VP[13]) -
+                VP[4] * (VP[1] * VP[15] - VP[3] * VP[13]) +
+                VP[12] * (VP[1] * VP[7] - VP[3] * VP[5]);
+    invVP[14] = -VP[0] * (VP[5] * VP[14] - VP[6] * VP[13]) +
+                VP[4] * (VP[1] * VP[14] - VP[2] * VP[13]) -
+                VP[12] * (VP[1] * VP[6] - VP[2] * VP[5]);
+    invVP[3] = -VP[1] * (VP[6] * VP[11] - VP[7] * VP[10]) +
+               VP[5] * (VP[2] * VP[11] - VP[3] * VP[10]) -
+               VP[9] * (VP[2] * VP[7] - VP[3] * VP[6]);
+    invVP[7] = VP[0] * (VP[6] * VP[11] - VP[7] * VP[10]) -
+               VP[4] * (VP[2] * VP[11] - VP[3] * VP[10]) +
+               VP[8] * (VP[2] * VP[7] - VP[3] * VP[6]);
+    invVP[11] = -VP[0] * (VP[5] * VP[11] - VP[7] * VP[9]) +
+                VP[4] * (VP[1] * VP[11] - VP[3] * VP[9]) -
+                VP[8] * (VP[1] * VP[7] - VP[3] * VP[5]);
+    invVP[15] = VP[0] * (VP[5] * VP[10] - VP[6] * VP[9]) -
+                VP[4] * (VP[1] * VP[10] - VP[2] * VP[9]) +
+                VP[8] * (VP[1] * VP[6] - VP[2] * VP[5]);
+
+    invDet = VP[0] * invVP[0] + VP[1] * invVP[4] + VP[2] * invVP[8] + VP[3] * invVP[12];
+    if (fabs(invDet) > 1e-10f)
+    {
+      float invDetRcp = 1.0f / invDet;
+      for (int i = 0; i < 16; ++i)
+        uniforms.InverseViewProjection[i] = invVP[i] * invDetRcp;
+    }
+    else
+    {
+      memset(uniforms.InverseViewProjection, 0, sizeof(uniforms.InverseViewProjection));
+    }
+  }
+
+  // Capture the scene depth texture for early ray termination.
+  // The depth buffer is written by opaque geometry in the earlier render pass.
+  this->DepthTextureOcclusion = metalRenderWindow->GetDepthTexture();
+
+  // Update uniform buffer (now includes viewProjection + inverseViewProjection)
   id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)this->UniformBuffer;
   memcpy([uniformBuf contents], &uniforms, sizeof(uniforms));
 
@@ -1467,6 +1568,15 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     [offscreenEncoder setFragmentTexture:tfTex atIndex:1];
     [offscreenEncoder setFragmentSamplerState:tfSamp atIndex:1];
 
+    // Bind scene depth texture for early ray termination (depth buffer occlusion)
+    if (this->DepthTextureOcclusion)
+    {
+      id<MTLTexture> depthTex = (__bridge id<MTLTexture>)this->DepthTextureOcclusion;
+      id<MTLSamplerState> depthSamp = (__bridge id<MTLSamplerState>)this->DepthSampler;
+      [offscreenEncoder setFragmentTexture:depthTex atIndex:2];
+      [offscreenEncoder setFragmentSamplerState:depthSamp atIndex:2];
+    }
+
     // Draw volume
     id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;
     [offscreenEncoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
@@ -1529,6 +1639,15 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     id<MTLSamplerState> tfSamp = (__bridge id<MTLSamplerState>)this->ColorOpacitySampler;
     [encoder setFragmentTexture:tfTex atIndex:1];
     [encoder setFragmentSamplerState:tfSamp atIndex:1];
+
+    // Bind scene depth texture for early ray termination (depth buffer occlusion)
+    if (this->DepthTextureOcclusion)
+    {
+      id<MTLTexture> depthTex = (__bridge id<MTLTexture>)this->DepthTextureOcclusion;
+      id<MTLSamplerState> depthSamp = (__bridge id<MTLSamplerState>)this->DepthSampler;
+      [encoder setFragmentTexture:depthTex atIndex:2];
+      [encoder setFragmentSamplerState:depthSamp atIndex:2];
+    }
 
     // Draw
     id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;
