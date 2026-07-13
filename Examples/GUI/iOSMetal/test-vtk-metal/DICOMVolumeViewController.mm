@@ -60,6 +60,7 @@
   vtkNew<vtkMetalGPUVolumeRayCastMapper> mapper;
   mapper->SetInputConnection(reader->GetOutputPort());
   mapper->UseJitteringOn();
+  mapper->AutoAdjustSampleDistancesOff();
   mapper->SetSampleDistance(0.5);
 
   // Bone + Skin II preset (16-bit CLUT)

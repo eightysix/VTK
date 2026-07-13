@@ -60,6 +60,7 @@
   vtkNew<vtkMetalGPUVolumeRayCastMapper> mapper;
   mapper->SetInputConnection(reader->GetOutputPort());
   mapper->UseJitteringOn();
+  mapper->AutoAdjustSampleDistancesOff();
   mapper->SetSampleDistance(0.5);
 
   // Simple linear preset to verify volume renders at all
