@@ -13,6 +13,9 @@
 #include "vtkTimeStamp.h"            // For time stamp
 #include "vtkWrappingHints.h"        // For VTK_MARSHALAUTO
 
+#include <vector> // For std::vector
+
+class vtkDataArray;
 class vtkImageData;
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -45,6 +48,14 @@ public:
 
   // Depth buffer occlusion — set by vtkMetalRenderer before volume rendering
   void SetDepthTexture(void* depthTex) { this->DepthTextureOcclusion = depthTex; }
+
+  /**
+   * Set a fixed number of partitions in which to split the volume
+   * during rendering. This will force by-block rendering without
+   * trying to compute an optimum number of partitions.
+   * Useful for volumes exceeding hardware 3D texture size limits.
+   */
+  void SetPartitions(unsigned short x, unsigned short y, unsigned short z);
 
 protected:
   vtkMetalGPUVolumeRayCastMapper();
@@ -105,6 +116,26 @@ private:
   bool UpdateTransferFunctionTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
   bool SetupBuffers(void* mtlDevice, vtkVolume* vol, vtkImageData* input);
   bool SetupPipeline(void* mtlDevice, vtkRenderer* ren);
+
+  // Volume partitioning — splits large volumes into blocks for 3D texture size limits
+  struct VolumeBlock
+  {
+    void* Texture = nullptr; // id<MTLTexture> — 3D sub-texture for this block
+    double BoundsMin[3] = {};
+    double BoundsMax[3] = {};
+    int Dims[3] = {};
+    int Extents[6] = {};
+    double Center[3] = {}; // world-space center for sorting
+  };
+
+  unsigned short Partitions[3] = { 1, 1, 1 };
+  std::vector<VolumeBlock> Blocks;
+  int SortedBlockOrder[64] = {}; // indices into Blocks, sorted back-to-front (max 64 blocks)
+
+  void ClearBlocks();
+  void SortBlocksBackToFront(vtkRenderer* ren, vtkVolume* vol);
+  bool UpdateBlockTextures(void* mtlDevice, void* mtlQueue, vtkImageData* input,
+    vtkDataArray* scalars, int numComponents);
 };
 
 VTK_ABI_NAMESPACE_END

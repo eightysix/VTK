@@ -13,7 +13,7 @@ Status as of 2026-07-13. Compares `vtkMetalGPUVolumeRayCastMapper` against
 | **Lock sample distance to input spacing** | Yes | **Yes** | Adapts step size to voxel density for optimal quality/perf |
 | **Depth buffer occlusion** (opaque geometry early-terminates rays) | Yes | **Yes** | Captures Z-buffer; ray stops at nearest opaque surface |
 | **Two-pass contour + volume** (`UseDepthPass`) | Yes | No | Renders isosurface contours to depth FBO, then ray-marches behind them |
-| **Volume partitioning** (`SetPartitions`) | Yes | No | Splits large volumes into blocks for 3D texture size limits |
+| **Volume partitioning** (`SetPartitions`) | Yes | **Yes** | Splits large volumes into blocks for 3D texture size limits |
 | **Near-plane bounding box clipping** | Yes | No | Clips box geometry when camera is inside volume; fewer wasted fragments |
 | **Gradient-based Phong shading** | Yes | No | Central-difference normals for lighting; visual quality, not perf |
 | **2D transfer functions** (gradient opacity) | Yes | No | Uses gradient magnitude for edge/feature highlighting |
@@ -25,12 +25,13 @@ Status as of 2026-07-13. Compares `vtkMetalGPUVolumeRayCastMapper` against
 
 ## Summary
 
-The Metal mapper now has five performance features matching or exceeding the OpenGL path:
+The Metal mapper now has six performance features matching or exceeding the OpenGL path:
 1. **Double-stepped sampling** exploiting Apple Silicon's half-precision ALU
 2. **Adaptive sample distance** — dynamically adjusts step count frame-to-frame
 3. **Image-space downsampling** — renders at reduced resolution during interaction
 4. **Lock sample distance to input spacing** — adapts step size to voxel density for optimal quality/perf
 5. **Depth buffer occlusion** — samples scene depth to terminate rays at opaque surfaces
+6. **Volume partitioning** — splits large volumes into blocks for 3D texture size limits
 
 However, the OpenGL mapper retains several high-impact adaptive features that
 the Metal path is missing entirely:
@@ -56,7 +57,7 @@ None remaining.
 4. Multi-volume compositing
 5. Mask / label map support
 6. Clipping planes
-7. Volume partitioning (only needed for textures exceeding hardware 3D limit)
+7. ~~Volume partitioning (only needed for textures exceeding hardware 3D limit)~~ **IMPLEMENTED**
 
 ## Recommended Implementation Order
 
