@@ -20,4 +20,5 @@ PRIVATE_DEPENDS
   VTK::CommonDataModel
   VTK::CommonMath
   VTK::CommonSystem
+  VTK::FiltersGeneral
 INCLUDE_MARSHAL

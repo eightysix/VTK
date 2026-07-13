@@ -18,6 +18,16 @@
 #include "vtkCamera.h"
 #include "vtkMatrix4x4.h"
 #include "vtkSMPTools.h"
+#include "vtkMath.h"
+#include "vtkClipConvexPolyData.h"
+#include "vtkDensifyPolyData.h"
+#include "vtkTriangleFilter.h"
+#include "vtkPlaneCollection.h"
+#include "vtkPlane.h"
+#include "vtkPolyData.h"
+#include "vtkPoints.h"
+#include "vtkCellArray.h"
+#include <limits>
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -1381,8 +1391,78 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
 }
 
 //------------------------------------------------------------------------------
+bool vtkMetalGPUVolumeRayCastMapper::IsCameraInside(
+  vtkRenderer* ren, vtkVolume* vol)
+{
+  vtkNew<vtkMatrix4x4> dataToWorld;
+  vol->GetModelToWorldMatrix(dataToWorld);
+
+  vtkCamera* cam = ren->GetActiveCamera();
+
+  double planes[24];
+  cam->GetFrustumPlanes(ren->GetTiledAspectRatio(), planes);
+
+  // Transform 8 bounding-box corners from data-space to world-space
+  double geometry[24] = {
+    this->ModelBounds[0], this->ModelBounds[2], this->ModelBounds[4],
+    this->ModelBounds[1], this->ModelBounds[2], this->ModelBounds[4],
+    this->ModelBounds[1], this->ModelBounds[3], this->ModelBounds[4],
+    this->ModelBounds[0], this->ModelBounds[3], this->ModelBounds[4],
+    this->ModelBounds[0], this->ModelBounds[2], this->ModelBounds[5],
+    this->ModelBounds[1], this->ModelBounds[2], this->ModelBounds[5],
+    this->ModelBounds[1], this->ModelBounds[3], this->ModelBounds[5],
+    this->ModelBounds[0], this->ModelBounds[3], this->ModelBounds[5],
+  };
+
+  double in[4];
+  in[3] = 1.0;
+  double out[4];
+  double worldGeometry[24];
+
+  for (int i = 0; i < 8; ++i)
+  {
+    in[0] = geometry[i * 3];
+    in[1] = geometry[i * 3 + 1];
+    in[2] = geometry[i * 3 + 2];
+    dataToWorld->MultiplyPoint(in, out);
+    worldGeometry[i * 3] = out[0] / out[3];
+    worldGeometry[i * 3 + 1] = out[1] / out[3];
+    worldGeometry[i * 3 + 2] = out[2] / out[3];
+  }
+
+  // Test if near frustum plane (index 4*4=16) intersects the bounding box
+  // Returns true if some corners are on positive side and some on negative side
+  bool hasPositive = false;
+  bool hasNegative = false;
+  bool hasZero = false;
+
+  for (int i = 0; i < 8; ++i)
+  {
+    double val = planes[4 * 4] * worldGeometry[i * 3] +
+      planes[4 * 4 + 1] * worldGeometry[i * 3 + 1] +
+      planes[4 * 4 + 2] * worldGeometry[i * 3 + 2] +
+      planes[4 * 4 + 3];
+
+    if (val < 0)
+    {
+      hasNegative = true;
+    }
+    else if (val > 0)
+    {
+      hasPositive = true;
+    }
+    else
+    {
+      hasZero = true;
+    }
+  }
+
+  return hasZero || (hasNegative && hasPositive);
+}
+
+//------------------------------------------------------------------------------
 bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
-  void* mtlDeviceVoid, vtkVolume* vol, vtkImageData* input)
+  void* mtlDeviceVoid, vtkRenderer* ren, vtkVolume* vol, vtkImageData* input)
 {
   @autoreleasepool
   {
@@ -1417,77 +1497,283 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
       this->ModelBounds[5] = origin[2] + spacing[2] * (dims[2] - 1);
     }
 
+    // Check if camera is inside the volume
+    bool cameraInside = this->IsCameraInside(ren, vol);
+
+    // Check if geometry needs rebuild
     bool needsVertexRebuild = !this->VertexBuffer;
     needsVertexRebuild |= (this->VolumeUploadTime.GetMTime() > this->VertexBufferUploadTime.GetMTime());
     needsVertexRebuild |= (this->GetMTime() > this->VertexBufferUploadTime.GetMTime());
+    needsVertexRebuild |= (cameraInside != this->CameraWasInsideInLastUpdate);
 
     if (needsVertexRebuild)
     {
-      float boundsMin[3] = {
-        static_cast<float>(this->ModelBounds[0]),
-        static_cast<float>(this->ModelBounds[2]),
-        static_cast<float>(this->ModelBounds[4])
-      };
-      float boundsMax[3] = {
-        static_cast<float>(this->ModelBounds[1]),
-        static_cast<float>(this->ModelBounds[3]),
-        static_cast<float>(this->ModelBounds[5])
-      };
-
-      float vertices[] = {
-        boundsMin[0], boundsMin[1], boundsMin[2],
-        boundsMax[0], boundsMin[1], boundsMin[2],
-        boundsMax[0], boundsMax[1], boundsMin[2],
-        boundsMin[0], boundsMax[1], boundsMin[2],
-        boundsMin[0], boundsMin[1], boundsMax[2],
-        boundsMax[0], boundsMin[1], boundsMax[2],
-        boundsMax[0], boundsMax[1], boundsMax[2],
-        boundsMin[0], boundsMax[1], boundsMax[2],
-      };
-
-      unsigned int indices[] = {
-        0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 7, 3, 0, 4, 7, 1, 2, 6, 1, 6, 5,
-        3, 6, 2, 3, 7, 6, 0, 1, 5, 0, 5, 4,
-      };
-
-      this->IndexCount = sizeof(indices) / sizeof(unsigned int);
-
-      // Release old buffers
-      if (this->VertexBuffer)
+      // Camera outside: simple 8-vertex box (original fast path)
+      // Camera inside: clip against near plane, densify, triangulate
+      if (!cameraInside)
       {
-        CFRelease(this->VertexBuffer);
-        this->VertexBuffer = nullptr;
-      }
-      if (this->IndexBuffer)
-      {
-        CFRelease(this->IndexBuffer);
-        this->IndexBuffer = nullptr;
-      }
+        float boundsMin[3] = {
+          static_cast<float>(this->ModelBounds[0]),
+          static_cast<float>(this->ModelBounds[2]),
+          static_cast<float>(this->ModelBounds[4])
+        };
+        float boundsMax[3] = {
+          static_cast<float>(this->ModelBounds[1]),
+          static_cast<float>(this->ModelBounds[3]),
+          static_cast<float>(this->ModelBounds[5])
+        };
 
-      {
-        id<MTLBuffer> vbuf = [device newBufferWithBytes:vertices
-                                                length:sizeof(vertices)
-                                               options:MTLResourceStorageModeShared];
-        if (!vbuf)
+        float vertices[] = {
+          boundsMin[0], boundsMin[1], boundsMin[2],
+          boundsMax[0], boundsMin[1], boundsMin[2],
+          boundsMax[0], boundsMax[1], boundsMin[2],
+          boundsMin[0], boundsMax[1], boundsMin[2],
+          boundsMin[0], boundsMin[1], boundsMax[2],
+          boundsMax[0], boundsMin[1], boundsMax[2],
+          boundsMax[0], boundsMax[1], boundsMax[2],
+          boundsMin[0], boundsMax[1], boundsMax[2],
+        };
+
+        unsigned int indices[] = {
+          0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 7, 3, 0, 4, 7, 1, 2, 6, 1, 6, 5,
+          3, 6, 2, 3, 7, 6, 0, 1, 5, 0, 5, 4,
+        };
+
+        this->IndexCount = sizeof(indices) / sizeof(unsigned int);
+
+        // Release old buffers
+        if (this->VertexBuffer)
         {
-          vtkErrorMacro("Failed to create vertex buffer");
-          return false;
+          CFRelease(this->VertexBuffer);
+          this->VertexBuffer = nullptr;
         }
-        this->VertexBuffer = (__bridge void*)vbuf;
-        CFRetain((__bridge CFTypeRef)vbuf);
-      }
-
-      {
-        id<MTLBuffer> ibuf = [device newBufferWithBytes:indices
-                                                length:sizeof(indices)
-                                               options:MTLResourceStorageModeShared];
-        if (!ibuf)
+        if (this->IndexBuffer)
         {
-          vtkErrorMacro("Failed to create index buffer");
-          return false;
+          CFRelease(this->IndexBuffer);
+          this->IndexBuffer = nullptr;
         }
-        this->IndexBuffer = (__bridge void*)ibuf;
-        CFRetain((__bridge CFTypeRef)ibuf);
+
+        {
+          id<MTLBuffer> vbuf = [device newBufferWithBytes:vertices
+                                                  length:sizeof(vertices)
+                                                 options:MTLResourceStorageModeShared];
+          if (!vbuf)
+          {
+            vtkErrorMacro("Failed to create vertex buffer");
+            return false;
+          }
+          this->VertexBuffer = (__bridge void*)vbuf;
+          CFRetain((__bridge CFTypeRef)vbuf);
+        }
+
+        {
+          id<MTLBuffer> ibuf = [device newBufferWithBytes:indices
+                                                  length:sizeof(indices)
+                                                 options:MTLResourceStorageModeShared];
+          if (!ibuf)
+          {
+            vtkErrorMacro("Failed to create index buffer");
+            return false;
+          }
+          this->IndexBuffer = (__bridge void*)ibuf;
+          CFRetain((__bridge CFTypeRef)ibuf);
+        }
+
+        this->CameraWasInsideInLastUpdate = false;
+      }
+      else
+      {
+        // Camera inside: clip bounding box against near plane
+        vtkNew<vtkPolyData> boxSource;
+
+        {
+          vtkNew<vtkCellArray> cells;
+          vtkNew<vtkPoints> points;
+          points->SetDataTypeToDouble();
+
+          double geometry[24] = {
+            this->ModelBounds[0], this->ModelBounds[2], this->ModelBounds[4],
+            this->ModelBounds[1], this->ModelBounds[2], this->ModelBounds[4],
+            this->ModelBounds[1], this->ModelBounds[3], this->ModelBounds[4],
+            this->ModelBounds[0], this->ModelBounds[3], this->ModelBounds[4],
+            this->ModelBounds[0], this->ModelBounds[2], this->ModelBounds[5],
+            this->ModelBounds[1], this->ModelBounds[2], this->ModelBounds[5],
+            this->ModelBounds[1], this->ModelBounds[3], this->ModelBounds[5],
+            this->ModelBounds[0], this->ModelBounds[3], this->ModelBounds[5],
+          };
+
+          for (int i = 0; i < 8; ++i)
+          {
+            points->InsertNextPoint(geometry + i * 3);
+          }
+
+          // 6 faces 12 triangles (clockwise winding for vtkClipConvexPolyData)
+          int tris[36] = {
+            0, 1, 2,
+            1, 3, 2,
+            1, 5, 3,
+            5, 7, 3,
+            5, 4, 7,
+            4, 6, 7,
+            4, 0, 6,
+            0, 2, 6,
+            2, 3, 6,
+            3, 7, 6,
+            0, 4, 1,
+            1, 4, 5
+          };
+
+          for (int i = 0; i < 12; ++i)
+          {
+            cells->InsertNextCell(3);
+            // Clockwise convention for vtkClipConvexPolyData
+            cells->InsertCellPoint(tris[i * 3]);
+            cells->InsertCellPoint(tris[i * 3 + 2]);
+            cells->InsertCellPoint(tris[i * 3 + 1]);
+          }
+
+          boxSource->SetPoints(points);
+          boxSource->SetPolys(cells);
+        }
+
+        // Clip bounding box against near plane
+        vtkNew<vtkMatrix4x4> dataToWorld;
+        vol->GetModelToWorldMatrix(dataToWorld);
+
+        vtkCamera* cam = ren->GetActiveCamera();
+
+        double fplanes[24];
+        cam->GetFrustumPlanes(ren->GetTiledAspectRatio(), fplanes);
+
+        // Extract near frustum plane (index 4*4=16)
+        double pOrigin[4];
+        pOrigin[3] = 1.0;
+        double pNormal[3];
+
+        for (int i = 0; i < 3; ++i)
+        {
+          pNormal[i] = fplanes[16 + i];
+          pOrigin[i] = -fplanes[16 + 3] * fplanes[16 + i];
+        }
+
+        // Transform normal to volume coordinates (transpose-inverse)
+        double* dmat = dataToWorld->GetData();
+        dataToWorld->Transpose();
+        double pNormalV[3];
+        pNormalV[0] = pNormal[0] * dmat[0] + pNormal[1] * dmat[1] + pNormal[2] * dmat[2];
+        pNormalV[1] = pNormal[0] * dmat[4] + pNormal[1] * dmat[5] + pNormal[2] * dmat[6];
+        pNormalV[2] = pNormal[0] * dmat[8] + pNormal[1] * dmat[9] + pNormal[2] * dmat[10];
+        vtkMath::Normalize(pNormalV);
+
+        // Transform origin point to volume coordinates
+        dataToWorld->Transpose();
+        dataToWorld->Invert();
+        dataToWorld->MultiplyPoint(pOrigin, pOrigin);
+
+        // Apply offset to prevent hardware near-plane clipping
+        double offset = (cam->GetClippingRange()[1] - cam->GetClippingRange()[0]) * 0.001;
+        double minOffset = static_cast<double>(std::numeric_limits<float>::epsilon()) * 1000.0;
+        offset = offset < minOffset ? minOffset : offset;
+
+        for (int i = 0; i < 3; ++i)
+        {
+          pOrigin[i] += (pNormalV[i] * offset);
+        }
+
+        vtkNew<vtkPlane> nearPlane;
+        nearPlane->SetOrigin(pOrigin);
+        nearPlane->SetNormal(pNormalV);
+
+        vtkNew<vtkPlaneCollection> planes;
+        planes->RemoveAllItems();
+        planes->AddItem(nearPlane);
+
+        vtkNew<vtkClipConvexPolyData> clip;
+        clip->SetInputData(boxSource);
+        clip->SetPlanes(planes);
+
+        // Clip, densify, then triangulate to guarantee triangle output
+        vtkNew<vtkDensifyPolyData> densifyPolyData;
+        densifyPolyData->SetInputConnection(clip->GetOutputPort());
+        densifyPolyData->SetNumberOfSubdivisions(2);
+
+        vtkNew<vtkTriangleFilter> triFilter;
+        triFilter->SetInputConnection(densifyPolyData->GetOutputPort());
+        triFilter->Update();
+
+        vtkPolyData* finalPolyData = triFilter->GetOutput();
+        vtkPoints* points = finalPolyData->GetPoints();
+        vtkCellArray* polys = finalPolyData->GetPolys();
+
+        // Convert to float array for Metal buffer
+        std::vector<float> vertices;
+        vertices.reserve(points->GetNumberOfPoints() * 3);
+
+        for (vtkIdType i = 0; i < points->GetNumberOfPoints(); ++i)
+        {
+          double pt[3];
+          points->GetPoint(i, pt);
+          vertices.push_back(static_cast<float>(pt[0]));
+          vertices.push_back(static_cast<float>(pt[1]));
+          vertices.push_back(static_cast<float>(pt[2]));
+        }
+
+        std::vector<unsigned int> indices;
+        vtkIdType npts;
+        const vtkIdType* pts;
+
+        polys->InitTraversal();
+        while (polys->GetNextCell(npts, pts))
+        {
+          for (vtkIdType i = 0; i < npts; ++i)
+          {
+            indices.push_back(static_cast<unsigned int>(pts[i]));
+          }
+        }
+
+        this->IndexCount = static_cast<int>(indices.size());
+
+        // Release old buffers
+        if (this->VertexBuffer)
+        {
+          CFRelease(this->VertexBuffer);
+          this->VertexBuffer = nullptr;
+        }
+        if (this->IndexBuffer)
+        {
+          CFRelease(this->IndexBuffer);
+          this->IndexBuffer = nullptr;
+        }
+
+        // Create new vertex buffer
+        {
+          id<MTLBuffer> vbuf = [device newBufferWithBytes:vertices.data()
+                                                  length:vertices.size() * sizeof(float)
+                                                 options:MTLResourceStorageModeShared];
+          if (!vbuf)
+          {
+            vtkErrorMacro("Failed to create vertex buffer");
+            return false;
+          }
+          this->VertexBuffer = (__bridge void*)vbuf;
+          CFRetain((__bridge CFTypeRef)vbuf);
+        }
+
+        // Create new index buffer
+        {
+          id<MTLBuffer> ibuf = [device newBufferWithBytes:indices.data()
+                                                  length:indices.size() * sizeof(unsigned int)
+                                                 options:MTLResourceStorageModeShared];
+          if (!ibuf)
+          {
+            vtkErrorMacro("Failed to create index buffer");
+            return false;
+          }
+          this->IndexBuffer = (__bridge void*)ibuf;
+          CFRetain((__bridge CFTypeRef)ibuf);
+        }
+
+        this->CameraWasInsideInLastUpdate = true;
       }
 
       this->VertexBufferUploadTime.Modified();
@@ -1687,7 +1973,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   {
     return;
   }
-  if (!this->SetupBuffers(mtlDevice, vol, input))
+  if (!this->SetupBuffers(mtlDevice, ren, vol, input))
   {
     return;
   }

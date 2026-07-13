@@ -14,7 +14,7 @@ Status as of 2026-07-13. Compares `vtkMetalGPUVolumeRayCastMapper` against
 | **Depth buffer occlusion** (opaque geometry early-terminates rays) | Yes | **Yes** | Captures Z-buffer; ray stops at nearest opaque surface |
 | **Two-pass contour + volume** (`UseDepthPass`) | Yes | No | Renders isosurface contours to depth FBO, then ray-marches behind them |
 | **Volume partitioning** (`SetPartitions`) | Yes | **Yes** | Splits large volumes into blocks for 3D texture size limits |
-| **Near-plane bounding box clipping** | Yes | No | Clips box geometry when camera is inside volume; fewer wasted fragments |
+| **Near-plane bounding box clipping** | Yes | **Yes** | Clips box geometry when camera is inside volume; fewer wasted fragments |
 | **Gradient-based Phong shading** | Yes | No | Central-difference normals for lighting; visual quality, not perf |
 | **2D transfer functions** (gradient opacity) | Yes | No | Uses gradient magnitude for edge/feature highlighting |
 | **Cropping regions** (32-region mask) | Yes | No | Interactive ROI without data copy |
@@ -25,13 +25,14 @@ Status as of 2026-07-13. Compares `vtkMetalGPUVolumeRayCastMapper` against
 
 ## Summary
 
-The Metal mapper now has six performance features matching or exceeding the OpenGL path:
+The Metal mapper now has seven performance features matching or exceeding the OpenGL path:
 1. **Double-stepped sampling** exploiting Apple Silicon's half-precision ALU
 2. **Adaptive sample distance** — dynamically adjusts step count frame-to-frame
 3. **Image-space downsampling** — renders at reduced resolution during interaction
 4. **Lock sample distance to input spacing** — adapts step size to voxel density for optimal quality/perf
 5. **Depth buffer occlusion** — samples scene depth to terminate rays at opaque surfaces
 6. **Volume partitioning** — splits large volumes into blocks for 3D texture size limits
+7. **Near-plane clipping** — clips bounding box geometry against near plane when camera is inside
 
 However, the OpenGL mapper retains several high-impact adaptive features that
 the Metal path is missing entirely:
@@ -42,15 +43,11 @@ None remaining.
 
 ### Medium gaps (quality of life)
 
-1. **Near-plane clipping** — When the camera is inside the bounding box, the
-   OpenGL path clips the box against the near plane. The Metal path renders
-   the full box, wasting fragments behind the camera.
-
-2. **Gradient-based shading** — Central-difference normals computed in the
+1. **Gradient-based shading** — Central-difference normals computed in the
    shader enable Phong lighting and gradient-opacity transfer functions. The
    Metal path has flat color-only compositing.
 
-3. **Cropping regions** — Interactive 32-region crop without re-uploading data.
+2. **Cropping regions** — Interactive 32-region crop without re-uploading data.
 
 ### Low priority gaps (specialized use cases)
 
@@ -72,7 +69,7 @@ For maximum performance improvement with minimum effort:
    - Unproject to volume-local space; terminate ray early at opaque surfaces
    - Handles MSAA via blit resolve before volume pass
 
-3. **Near-plane clipping** (Medium effort, Medium impact)
+3. ~~**Near-plane clipping** (Medium effort, Medium impact)~~ **IMPLEMENTED**
    - Clip bounding box geometry against near plane when camera is inside
    - Reference: `vtkOpenGLGPUVolumeRayCastMapper::RenderVolumeGeometry()`
 

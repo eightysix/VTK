@@ -114,8 +114,12 @@ private:
   // Helper methods
   bool UpdateVolumeTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
   bool UpdateTransferFunctionTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
-  bool SetupBuffers(void* mtlDevice, vtkVolume* vol, vtkImageData* input);
+  bool SetupBuffers(void* mtlDevice, vtkRenderer* ren, vtkVolume* vol, vtkImageData* input);
   bool SetupPipeline(void* mtlDevice, vtkRenderer* ren);
+
+  // Near-plane clipping
+  bool IsCameraInside(vtkRenderer* ren, vtkVolume* vol);
+  bool CameraWasInsideInLastUpdate = false;
 
   // Volume partitioning — splits large volumes into blocks for 3D texture size limits
   struct VolumeBlock
