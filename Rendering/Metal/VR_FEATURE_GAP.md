@@ -10,7 +10,7 @@ Status as of 2026-07-13. Compares `vtkMetalGPUVolumeRayCastMapper` against
 | **Early ray termination** (opacity threshold break) | Yes | Yes | Both terminate at ~95% accumulated opacity |
 | **Adaptive sample distance** (`AutoAdjustSampleDistances`) | Yes | **Yes** | Dynamically reduces step count to meet frame-time target |
 | **Image-space downsampling** (`ImageSampleDistance`) | Yes | **Yes** | Renders to lower-res FBO then upscales; cuts fragment count by up to 4x |
-| **Lock sample distance to input spacing** | Yes | No | Adapts step size to voxel density for optimal quality/perf |
+| **Lock sample distance to input spacing** | Yes | **Yes** | Adapts step size to voxel density for optimal quality/perf |
 | **Depth buffer occlusion** (opaque geometry early-terminates rays) | Yes | No | Captures Z-buffer; ray stops at nearest opaque surface |
 | **Two-pass contour + volume** (`UseDepthPass`) | Yes | No | Renders isosurface contours to depth FBO, then ray-marches behind them |
 | **Volume partitioning** (`SetPartitions`) | Yes | No | Splits large volumes into blocks for 3D texture size limits |
@@ -25,10 +25,11 @@ Status as of 2026-07-13. Compares `vtkMetalGPUVolumeRayCastMapper` against
 
 ## Summary
 
-The Metal mapper now has three performance features matching or exceeding the OpenGL path:
+The Metal mapper now has four performance features matching or exceeding the OpenGL path:
 1. **Double-stepped sampling** exploiting Apple Silicon's half-precision ALU
 2. **Adaptive sample distance** — dynamically adjusts step count frame-to-frame
 3. **Image-space downsampling** — renders at reduced resolution during interaction
+4. **Lock sample distance to input spacing** — adapts step size to voxel density for optimal quality/perf
 
 However, the OpenGL mapper retains several high-impact adaptive features that
 the Metal path is missing entirely:

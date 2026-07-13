@@ -1284,6 +1284,36 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       actualSampleDistance /= this->ReductionFactor;
     }
   }
+  else if (this->LockSampleDistanceToInputSpacing)
+  {
+    // Lock sample distance to input spacing: adapts step size to voxel density
+    // for optimal quality/performance balance. Computes 1/2 average spacing
+    // and scales down for small volumes (< 100 voxels).
+    double cellSpacing[3];
+    input->GetSpacing(cellSpacing);
+
+    int extents[6];
+    input->GetExtent(extents);
+
+    double spacingDist = (cellSpacing[0] + cellSpacing[1] + cellSpacing[2]) / 6.0;
+    double avgNumVoxels = pow(
+      static_cast<double>((extents[1] - extents[0]) * (extents[3] - extents[2]) *
+        (extents[5] - extents[4])),
+      0.333);
+
+    if (avgNumVoxels < 100)
+    {
+      spacingDist *= 0.01 + (1 - 0.01) * avgNumVoxels / 100;
+    }
+
+    float d = static_cast<float>(spacingDist);
+    float sample = static_cast<float>(this->SampleDistance);
+
+    // Use spacing-adjusted distance unless user explicitly set a custom value
+    // (within 0.1% tolerance). This matches the OpenGL mapper logic.
+    actualSampleDistance =
+      (sample / d < 0.999f || sample / d > 1.001f) ? d : this->SampleDistance;
+  }
   else
   {
     actualSampleDistance = this->GetSampleDistance();
