@@ -227,6 +227,18 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
     this->CoarseOpacitySampler = nullptr;
   }
 
+  if (this->FallbackCoarseTexture)
+  {
+    CFRelease(this->FallbackCoarseTexture);
+    this->FallbackCoarseTexture = nullptr;
+  }
+
+  if (this->FallbackCoarseSampler)
+  {
+    CFRelease(this->FallbackCoarseSampler);
+    this->FallbackCoarseSampler = nullptr;
+  }
+
   if (this->DepthStencilState)
   {
     CFRelease(this->DepthStencilState);
@@ -790,6 +802,20 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateCoarseOpacityTexture(
 
   vtkDataArray* scalars = input->GetPointData()->GetScalars();
   if (!scalars)
+  {
+    return false;
+  }
+
+  // Skip coarse map for small volumes where each coarse cell would cover only
+  // 1-2 voxels.  At that resolution the skip disrupts the regular sampling
+  // grid without providing meaningful empty-space skipping, causing grainy
+  // rendering and artifacts.  Each coarse cell should span at least 4 voxels
+  // for the optimisation to be effective.
+  static constexpr int COARSE_DIM = 32;
+  int dims[3];
+  input->GetDimensions(dims);
+  if (dims[0] < COARSE_DIM * 4 || dims[1] < COARSE_DIM * 4 ||
+    dims[2] < COARSE_DIM * 4)
   {
     return false;
   }
@@ -1493,14 +1519,60 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   [encoder setFragmentTexture:tfTex atIndex:1];
   [encoder setFragmentSamplerState:tfSamp atIndex:1];
 
-  // Bind coarse opacity map for empty-space skipping (fragment)
+  // Bind coarse opacity map for empty-space skipping (fragment).
+  // The shader declares coarseSampler as a required resource at index 2, so we
+  // must always bind something.  When the coarse map is not created (small
+  // volumes), use a 1x1x1 fallback — the shader's hasCoarseMap guard prevents
+  // it from being sampled.
   id<MTLTexture> coarseTex = (__bridge id<MTLTexture>)this->CoarseOpacityTexture;
   id<MTLSamplerState> coarseSamp = (__bridge id<MTLSamplerState>)this->CoarseOpacitySampler;
-  if (coarseTex && coarseSamp)
+  if (!coarseTex || !coarseSamp)
   {
-    [encoder setFragmentTexture:coarseTex atIndex:2];
-    [encoder setFragmentSamplerState:coarseSamp atIndex:2];
+    // Lazily create a minimal 1x1x1 R8Unorm texture and nearest sampler.
+    // Metal zero-initializes textures, so no data upload is needed — the
+    // shader's hasCoarseMap guard prevents this fallback from being sampled.
+    if (!this->FallbackCoarseTexture)
+    {
+      MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
+      desc.textureType = MTLTextureType3D;
+      desc.pixelFormat = MTLPixelFormatR8Unorm;
+      desc.width = 1;
+      desc.height = 1;
+      desc.depth = 1;
+      desc.mipmapLevelCount = 1;
+      desc.usage = MTLTextureUsageShaderRead;
+      desc.storageMode = MTLStorageModePrivate;
+
+      id<MTLDevice> dev = (__bridge id<MTLDevice>)mtlDevice;
+      id<MTLTexture> fbTex = [dev newTextureWithDescriptor:desc];
+      if (fbTex)
+      {
+        this->FallbackCoarseTexture = (__bridge void*)fbTex;
+        CFRetain((__bridge CFTypeRef)fbTex);
+      }
+    }
+    if (!this->FallbackCoarseSampler)
+    {
+      MTLSamplerDescriptor* sDesc = [[MTLSamplerDescriptor alloc] init];
+      sDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+      sDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+      sDesc.rAddressMode = MTLSamplerAddressModeClampToEdge;
+      sDesc.magFilter = MTLSamplerMinMagFilterNearest;
+      sDesc.minFilter = MTLSamplerMinMagFilterNearest;
+
+      id<MTLDevice> dev = (__bridge id<MTLDevice>)mtlDevice;
+      id<MTLSamplerState> fbSamp = [dev newSamplerStateWithDescriptor:sDesc];
+      if (fbSamp)
+      {
+        this->FallbackCoarseSampler = (__bridge void*)fbSamp;
+        CFRetain((__bridge CFTypeRef)fbSamp);
+      }
+    }
+    coarseTex = (__bridge id<MTLTexture>)this->FallbackCoarseTexture;
+    coarseSamp = (__bridge id<MTLSamplerState>)this->FallbackCoarseSampler;
   }
+  [encoder setFragmentTexture:coarseTex atIndex:2];
+  [encoder setFragmentSamplerState:coarseSamp atIndex:2];
 
   // Draw
   id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;

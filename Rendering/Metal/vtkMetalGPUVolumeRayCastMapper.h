@@ -68,6 +68,12 @@ private:
   void* CoarseOpacityTexture = nullptr;  // id<MTLTexture> (3D)
   void* CoarseOpacitySampler = nullptr;  // id<MTLSamplerState> (nearest)
 
+  // Fallback 1x1x1 texture/sampler bound at index 2 when the coarse map is
+  // not created (small volumes).  The shader declares coarseSampler as a
+  // required resource, so Metal validation rejects draws without a binding.
+  void* FallbackCoarseTexture = nullptr;  // id<MTLTexture> (1x1x1 R8Unorm)
+  void* FallbackCoarseSampler = nullptr;  // id<MTLSamplerState> (nearest)
+
   // Volume state
   double ModelBounds[6] = { 0.0, 1.0, 0.0, 1.0, 0.0, 1.0 };
   double ScalarRange[2] = { 0.0, 1.0 };
