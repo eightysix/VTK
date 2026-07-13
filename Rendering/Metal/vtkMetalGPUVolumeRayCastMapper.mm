@@ -110,6 +110,71 @@ void vtkMetalGPUVolumeRayCastMapper::PrintSelf(ostream& os, vtkIndent indent)
 }
 
 //------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::ComputeReductionFactor(double allocatedTime)
+{
+  if (!this->AutoAdjustSampleDistances)
+  {
+    this->ReductionFactor = 1.0 / this->ImageSampleDistance;
+    return;
+  }
+
+  if (this->TimeToDraw)
+  {
+    double oldFactor = this->ReductionFactor;
+
+    double timeToDraw;
+    if (allocatedTime < 1.0)
+    {
+      timeToDraw = this->SmallTimeToDraw;
+      if (timeToDraw == 0.0)
+      {
+        timeToDraw = this->BigTimeToDraw / 3.0;
+      }
+    }
+    else
+    {
+      timeToDraw = this->BigTimeToDraw;
+    }
+
+    if (timeToDraw == 0.0)
+    {
+      timeToDraw = 10.0;
+    }
+
+    double fullTime = timeToDraw / this->ReductionFactor;
+    double newFactor = allocatedTime / fullTime;
+
+    this->ReductionFactor = (newFactor + oldFactor) / 2.0;
+
+    // Discretize to avoid visual oscillation
+    this->ReductionFactor = (this->ReductionFactor > 1.0) ? 1.0 : (this->ReductionFactor);
+
+    if (this->ReductionFactor < 0.20)
+    {
+      this->ReductionFactor = 0.10;
+    }
+    else if (this->ReductionFactor < 0.50)
+    {
+      this->ReductionFactor = 0.20;
+    }
+    else if (this->ReductionFactor < 1.0)
+    {
+      this->ReductionFactor = 0.50;
+    }
+
+    // Clamp to user-specified bounds
+    if (1.0 / this->ReductionFactor > this->MaximumImageSampleDistance)
+    {
+      this->ReductionFactor = 1.0 / this->MaximumImageSampleDistance;
+    }
+    if (1.0 / this->ReductionFactor < this->MinimumImageSampleDistance)
+    {
+      this->ReductionFactor = 1.0 / this->MinimumImageSampleDistance;
+    }
+  }
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotUsed(window))
 {
   if (this->PipelineState)
@@ -1269,8 +1334,47 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   uniforms.CameraVolumePos[3] = 1.0f;
 
   double maxBoundsSize = std::max({ boundsSize[0], boundsSize[1], boundsSize[2] });
+
+  // Compute adaptive sample distance (matches OpenGL mapper logic)
+  this->ComputeReductionFactor(vol->GetAllocatedRenderTime());
+
+  double actualSampleDistance;
+  if (this->AutoAdjustSampleDistances)
+  {
+    // Compute minimum world-space voxel spacing across all 3 axes
+    vtkNew<vtkMatrix4x4> modelToWorld;
+    vol->GetModelToWorldMatrix(modelToWorld);
+
+    double cellSpacing[3];
+    input->GetSpacing(cellSpacing);
+
+    double minWorldSpacing = VTK_DOUBLE_MAX;
+    for (int i = 0; i < 3; ++i)
+    {
+      double tmp = modelToWorld->GetElement(0, i);
+      double tmp2 = tmp * tmp;
+      tmp = modelToWorld->GetElement(1, i);
+      tmp2 += tmp * tmp;
+      tmp = modelToWorld->GetElement(2, i);
+      tmp2 += tmp * tmp;
+
+      double worldSpacing = fabs(cellSpacing[i] * sqrt(tmp2));
+      minWorldSpacing = std::min(worldSpacing, minWorldSpacing);
+    }
+
+    actualSampleDistance = minWorldSpacing;
+    if (this->ReductionFactor < 1.0 && this->ReductionFactor != 0.0)
+    {
+      actualSampleDistance /= this->ReductionFactor;
+    }
+  }
+  else
+  {
+    actualSampleDistance = this->GetSampleDistance();
+  }
+
   uniforms.SampleDistance =
-    static_cast<float>(this->GetSampleDistance() / maxBoundsSize);
+    static_cast<float>(actualSampleDistance / maxBoundsSize);
 
   {
     float normFactor = this->ScalarNormalizationFactor;

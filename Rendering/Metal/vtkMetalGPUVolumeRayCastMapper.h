@@ -75,6 +75,10 @@ private:
   int VolumeNumComponents = 1;
   int CurrentSampleCount = 0;
 
+  // Adaptive sample distance
+  double ReductionFactor = 1.0;
+  void ComputeReductionFactor(double allocatedTime);
+
   // Cache/timestamps
   vtkTimeStamp VolumeUploadTime;
   vtkTimeStamp TransferFunctionUploadTime;

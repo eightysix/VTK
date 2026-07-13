@@ -1,6 +1,6 @@
 # Volume Rendering Feature Gap: Metal vs OpenGL
 
-Status as of 2026-07-12. Compares `vtkMetalGPUVolumeRayCastMapper` against
+Status as of 2026-07-13. Compares `vtkMetalGPUVolumeRayCastMapper` against
 `vtkOpenGLGPUVolumeRayCastMapper` (the reference OpenGL implementation).
 
 ## Performance Optimizations
@@ -9,7 +9,7 @@ Status as of 2026-07-12. Compares `vtkMetalGPUVolumeRayCastMapper` against
 |---|:---:|:---:|---|
 | **Empty-space skipping** (coarse 32^3 opacity map) | No | **Yes** | Skips air/transparent regions; biggest win for CT with large lung fields |
 | **Early ray termination** (opacity threshold break) | Yes | Yes | Both terminate at ~95% accumulated opacity |
-| **Adaptive sample distance** (`AutoAdjustSampleDistances`) | Yes | No | Dynamically reduces step count to meet frame-time target |
+| **Adaptive sample distance** (`AutoAdjustSampleDistances`) | Yes | **Yes** | Dynamically reduces step count to meet frame-time target |
 | **Image-space downsampling** (`ImageSampleDistance`) | Yes | No | Renders to lower-res FBO then upscales; cuts fragment count by up to 4x |
 | **Lock sample distance to input spacing** | Yes | No | Adapts step size to voxel density for optimal quality/perf |
 | **Depth buffer occlusion** (opaque geometry early-terminates rays) | Yes | No | Captures Z-buffer; ray stops at nearest opaque surface |
@@ -27,25 +27,21 @@ Status as of 2026-07-12. Compares `vtkMetalGPUVolumeRayCastMapper` against
 
 ## Summary
 
-The Metal mapper now has two unique performance features the OpenGL path lacks:
+The Metal mapper now has three unique performance features the OpenGL path lacks:
 1. **Empty-space skipping** via a 32x32x32 coarse opacity map with cell tracking
 2. **Double-stepped sampling** exploiting Apple Silicon's half-precision ALU
+3. **Adaptive sample distance** — dynamically adjusts step count frame-to-frame
 
 However, the OpenGL mapper retains several high-impact adaptive features that
 the Metal path is missing entirely:
 
 ### Critical gaps (largest performance impact)
 
-1. **Adaptive sample distance** — The OpenGL path dynamically adjusts step
-   count frame-to-frame based on render time vs. target. Without this, the Metal
-   path always renders at full quality regardless of frame rate. This is the
-   single most important interactive performance feature.
-
-2. **Image-space downsampling** — Renders at reduced resolution (e.g. 0.5x)
+1. **Image-space downsampling** — Renders at reduced resolution (e.g. 0.5x)
    during interaction, then full resolution when idle. Cuts fragment count by
    4x at 0.5x scale.
 
-3. **Depth buffer occlusion** — When opaque geometry (e.g.骨骼 surface mesh)
+2. **Depth buffer occlusion** — When opaque geometry (e.g.骨骼 surface mesh)
    is rendered before the volume, the OpenGL path captures the depth texture
    and uses it to terminate rays early. Essential for mixed rendering scenes.
 
@@ -76,18 +72,14 @@ For maximum performance improvement with minimum effort:
    - Render to half-res offscreen texture, blit to screen
    - Triggered during interaction, full-res on idle
 
-2. **Adaptive sample distance** (Medium effort, High impact)
-   - Track GPU frame time; adjust `SampleDistance` to hit target FPS
-   - Discretize to {0.25, 0.5, 1.0} to avoid visual oscillation
-
-3. **Near-plane clipping** (Medium effort, Medium impact)
+2. **Near-plane clipping** (Medium effort, Medium impact)
    - Clip bounding box geometry against near plane when camera is inside
    - Reference: `vtkOpenGLGPUVolumeRayCastMapper::RenderVolumeGeometry()`
 
-4. **Depth buffer occlusion** (Medium effort, Medium impact)
+3. **Depth buffer occlusion** (Medium effort, Medium impact)
    - Capture depth texture from earlier in render pass
    - Pass to volume shader; terminate ray when `tCurrent >= depthSample`
 
-5. **Gradient-based shading** (High effort, Medium impact)
+4. **Gradient-based shading** (High effort, Medium impact)
    - Compute central-difference gradients in fragment shader
    - Add Phong lighting model; enable gradient-opacity TFs
