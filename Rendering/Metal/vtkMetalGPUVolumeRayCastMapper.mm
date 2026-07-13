@@ -36,25 +36,49 @@
 #include <cstring>
 #include <vector>
 
+// Metal constant-address-space structs align float3 to 16 bytes (size 16),
+// float4/float4x4 to 16 bytes, and float2 to 8 bytes.  This creates
+// padding that plain C++ float[] arrays do not.  The layout below exactly
+// mirrors the Metal compiler's computation (480 bytes total).
 struct VolumeMapperUniforms
 {
-  float WorldToVolumeMatrix[16];
-  float VolumeToWorldMatrix[16];
-  float VolumeBoundsMin[4];
-  float VolumeBoundsMax[4];
-  float CameraVolumePos[4];
-  float ViewProjectionMatrix[16];
-  float SampleDistance;
-  float ScalarMin;
-  float ScalarMax;
-  float UseJittering;
-  float InverseViewProjection[16];
-  float ViewportSize[2]; // width, height in pixels for depth texture UV
-  float _pad[2];
+  // --- fields matching Metal layout 1:1, offsets verified ---
+  float WorldToVolumeMatrix[16];     // 0..63
+  float VolumeToWorldMatrix[16];     // 64..127
+  float VolumeBoundsMin[4];          // 128..143
+  float VolumeBoundsMax[4];          // 144..159
+  float CameraVolumePos[4];          // 160..175
+  float ViewProjectionMatrix[16];    // 176..239
+  float SampleDistance;              // 240
+  float ScalarMin;                   // 244
+  float ScalarMax;                   // 248
+  float UseJittering;                // 252
+  float InverseViewProjection[16];   // 256..319
+  float ViewportSize[2];            // 320..327
+  float _padViewport[2];            // 328..335  (pad to 16-byte for float3)
+  float GradientStep[3];            // 336..347
+  float _padGradStep;               // 348..351  (Metal: float3 = 16 bytes)
+  float UseGradientShading;         // 352
+  float _padGradOpRange;            // 356..359  (pad to 8-byte for float2)
+  float GradientOpacityMin;         // 360
+  float GradientOpacityMax;         // 364
+  float UseGradientOpacity;         // 368
+  float _padAmbient[3];             // 372..383  (pad to 16-byte for float4)
+  float AmbientColor[3];            // 384..395
+  float _padAmb;                    // 396..399  (Metal: float4 = 16 bytes)
+  float DiffuseColor[3];            // 400..411
+  float _padDiff;                   // 412..415
+  float SpecularColor[3];           // 416..427
+  float _padSpec;                   // 428..431
+  float Shininess;                  // 432
+  float _padLightDir[3];            // 436..447  (pad to 16-byte for float3)
+  float LightDirection[3];          // 448..459
+  float _padLight;                  // 460..463  (Metal: float3 = 16 bytes)
+  float _padEnd[4];                 // 464..479  (trailing pad to 480)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 336,
-  "VolumeMapperUniforms must be 336 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 480,
+  "VolumeMapperUniforms must be 480 bytes to match Metal shader struct");
 
 namespace
 {
@@ -369,6 +393,18 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   {
     CFRelease(this->ColorOpacitySampler);
     this->ColorOpacitySampler = nullptr;
+  }
+
+  if (this->GradientOpacityTexture)
+  {
+    CFRelease(this->GradientOpacityTexture);
+    this->GradientOpacityTexture = nullptr;
+  }
+
+  if (this->GradientOpacitySampler)
+  {
+    CFRelease(this->GradientOpacitySampler);
+    this->GradientOpacitySampler = nullptr;
   }
 
   if (this->DepthSampler)
@@ -993,6 +1029,102 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
   }
 
   return this->ColorOpacityTexture != nullptr;
+}
+
+//------------------------------------------------------------------------------
+bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
+  void* mtlDeviceVoid, void* mtlQueueVoid, vtkVolume* vol)
+{
+  vtkVolumeProperty* property = vol->GetProperty();
+  if (!property || !property->HasGradientOpacity())
+  {
+    return false;
+  }
+
+  vtkPiecewiseFunction* gradOpacityFunc = property->GetGradientOpacity();
+  if (!gradOpacityFunc)
+  {
+    return false;
+  }
+
+  bool doReload = (this->GradientOpacityTexture == nullptr);
+  doReload |= (gradOpacityFunc->GetMTime() > this->GradientOpacityUploadTime.GetMTime());
+
+  if (doReload)
+  {
+    @autoreleasepool
+    {
+      id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
+
+      // Build 256-entry gradient opacity lookup table.
+      // Range: [0, 0.25 * scalarRange] — matches the normalization in the shader
+      // where gradient magnitude is normalized to [0, 0.25 * dataRange].
+      double scalarRange = this->ScalarRange[1] - this->ScalarRange[0];
+      if (scalarRange <= 0.0)
+      {
+        scalarRange = 1.0;
+      }
+      double gradMax = scalarRange * 0.25;
+
+      unsigned char gradData[256 * 4]; // RGBA8Unorm (R channel used)
+      double table[256];
+      gradOpacityFunc->GetTable(0.0, gradMax, 256, table);
+
+      for (int i = 0; i < 256; ++i)
+      {
+        unsigned char val =
+          static_cast<unsigned char>(std::max(0.0, std::min(1.0, table[i])) * 255.0);
+        gradData[i * 4 + 0] = val;
+        gradData[i * 4 + 1] = val;
+        gradData[i * 4 + 2] = val;
+        gradData[i * 4 + 3] = 255;
+      }
+
+      id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->GradientOpacityTexture;
+      id<MTLTexture> tex = nil;
+
+      if (oldTex)
+      {
+        tex = oldTex;
+      }
+      else
+      {
+        if (this->GradientOpacityTexture)
+        {
+          CFRelease(this->GradientOpacityTexture);
+          this->GradientOpacityTexture = nullptr;
+        }
+
+        MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
+        desc.textureType = MTLTextureType2D;
+        desc.pixelFormat = MTLPixelFormatRGBA8Unorm;
+        desc.width = 256;
+        desc.height = 1;
+        desc.mipmapLevelCount = 1;
+        desc.usage = MTLTextureUsageShaderRead;
+        desc.storageMode = MTLStorageModeShared;
+
+        tex = [device newTextureWithDescriptor:desc];
+        if (!tex)
+        {
+          vtkErrorMacro("Failed to create gradient opacity texture");
+          return false;
+        }
+        this->GradientOpacityTexture = (__bridge void*)tex;
+        CFRetain((__bridge CFTypeRef)tex);
+      }
+
+      MTLRegion region = MTLRegionMake2D(0, 0, 256, 1);
+      [tex replaceRegion:region
+            mipmapLevel:0
+              withBytes:gradData
+            bytesPerRow:256 * 4];
+
+      this->GradientOpacityUploadTime.Modified();
+    }
+  }
+
+  return this->GradientOpacityTexture != nullptr;
 }
 
 //------------------------------------------------------------------------------
@@ -1863,6 +1995,19 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       CFRetain((__bridge CFTypeRef)depthSamp);
     }
 
+    // Linear sampler for gradient opacity texture (1D lookup)
+    if (!this->GradientOpacitySampler)
+    {
+      MTLSamplerDescriptor* goDesc = [[MTLSamplerDescriptor alloc] init];
+      goDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+      goDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+      goDesc.magFilter = MTLSamplerMinMagFilterLinear;
+      goDesc.minFilter = MTLSamplerMinMagFilterLinear;
+      id<MTLSamplerState> goSamp = [device newSamplerStateWithDescriptor:goDesc];
+      this->GradientOpacitySampler = (__bridge void*)goSamp;
+      CFRetain((__bridge CFTypeRef)goSamp);
+    }
+
     // Create and cache a depth stencil state.
     // Volume rendering reads but does not write depth — this prevents the
     // bounding box from z-fighting with itself and allows correct occlusion
@@ -1973,6 +2118,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   {
     return;
   }
+  this->UpdateGradientOpacityTexture(mtlDevice, mtlQueue, vol);
   if (!this->SetupBuffers(mtlDevice, ren, vol, input))
   {
     return;
@@ -2118,6 +2264,68 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   }
 
   uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;
+
+  // Gradient-based shading uniforms
+  {
+    vtkVolumeProperty* property = vol->GetProperty();
+    bool shadeOn = property && property->GetShade();
+    bool hasGradOp = property && property->HasGradientOpacity();
+
+    uniforms.UseGradientShading = shadeOn ? 1.0f : 0.0f;
+    uniforms.UseGradientOpacity = (shadeOn && hasGradOp) ? 1.0f : 0.0f;
+
+    // Gradient step: 1/(dims-1) per axis for central differences in [0,1] space
+    int dims[3];
+    input->GetDimensions(dims);
+    for (int k = 0; k < 3; ++k)
+    {
+      uniforms.GradientStep[k] = (dims[k] > 1) ? 1.0f / (dims[k] - 1) : 1.0f;
+    }
+
+    // Gradient opacity normalization range
+    double scalarRange = this->ScalarRange[1] - this->ScalarRange[0];
+    if (scalarRange <= 0.0)
+      scalarRange = 1.0;
+    uniforms.GradientOpacityMin = 0.0f;
+    uniforms.GradientOpacityMax = static_cast<float>(scalarRange * 0.25);
+
+    // Material properties from volume property
+    if (property)
+    {
+      double amb = property->GetAmbient();
+      double dif = property->GetDiffuse();
+      double spec = property->GetSpecular();
+      double power = property->GetSpecularPower();
+      uniforms.AmbientColor[0] = uniforms.AmbientColor[1] = uniforms.AmbientColor[2] =
+        static_cast<float>(amb);
+      uniforms.DiffuseColor[0] = uniforms.DiffuseColor[1] = uniforms.DiffuseColor[2] =
+        static_cast<float>(dif);
+      uniforms.SpecularColor[0] = uniforms.SpecularColor[1] = uniforms.SpecularColor[2] =
+        static_cast<float>(spec);
+      uniforms.Shininess = static_cast<float>(power);
+    }
+
+    // Light direction: headlight (camera-to-volume direction in volume [0,1] space)
+    // The gradient normal points inward (toward increasing scalar), matching the
+    // OpenGL convention where normals are negated in the lighting calculation.
+    double camDirWorld[3];
+    ren->GetActiveCamera()->GetDirectionOfProjection(camDirWorld);
+    // Transform to volume-local [0,1] space using inverse model matrix
+    double camDirLocal[4] = { camDirWorld[0], camDirWorld[1], camDirWorld[2], 0.0 };
+    invModelMatrix->MultiplyPoint(camDirLocal, camDirLocal);
+    // Normalize in volume [0,1] space
+    double dirLen = sqrt(camDirLocal[0] * camDirLocal[0] + camDirLocal[1] * camDirLocal[1] +
+      camDirLocal[2] * camDirLocal[2]);
+    if (dirLen > 1e-10)
+    {
+      camDirLocal[0] /= dirLen;
+      camDirLocal[1] /= dirLen;
+      camDirLocal[2] /= dirLen;
+    }
+    uniforms.LightDirection[0] = static_cast<float>(camDirLocal[0]);
+    uniforms.LightDirection[1] = static_cast<float>(camDirLocal[1]);
+    uniforms.LightDirection[2] = static_cast<float>(camDirLocal[2]);
+  }
 
   // Viewport size for depth texture UV computation in the shader
   int* winSize = ren->GetSize();
@@ -2341,6 +2549,15 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       [offscreenEncoder setFragmentSamplerState:depthSamp atIndex:2];
     }
 
+    // Bind gradient opacity texture for gradient-based shading
+    if (this->GradientOpacityTexture)
+    {
+      id<MTLTexture> goTex = (__bridge id<MTLTexture>)this->GradientOpacityTexture;
+      id<MTLSamplerState> goSamp = (__bridge id<MTLSamplerState>)this->GradientOpacitySampler;
+      [offscreenEncoder setFragmentTexture:goTex atIndex:3];
+      [offscreenEncoder setFragmentSamplerState:goSamp atIndex:3];
+    }
+
     // Draw volume — handle partitioned (multi-block) and single-block cases
     id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;
     if (!this->Blocks.empty())
@@ -2393,6 +2610,13 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         blockUniforms.CameraVolumePos[2] =
           static_cast<float>((camPosVolume[2] - block.BoundsMin[2]) / blockBoundsSize[2]);
         blockUniforms.CameraVolumePos[3] = 1.0f;
+
+        // Update gradient step for this block's dimensions
+        for (int k = 0; k < 3; ++k)
+        {
+          blockUniforms.GradientStep[k] =
+            (block.Dims[k] > 1) ? 1.0f / (block.Dims[k] - 1) : 1.0f;
+        }
 
         // Update uniform buffer with block-specific bounds
         memcpy([uniformBuf contents], &blockUniforms, sizeof(blockUniforms));
@@ -2486,6 +2710,22 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       [encoder setFragmentSamplerState:depthSamp atIndex:2];
     }
 
+    // Bind gradient opacity texture for gradient-based shading.
+    // Metal requires all declared fragment texture/sampler arguments to be bound,
+    // so bind the transfer function texture as fallback when gradient opacity is disabled.
+    if (this->GradientOpacityTexture)
+    {
+      id<MTLTexture> goTex = (__bridge id<MTLTexture>)this->GradientOpacityTexture;
+      id<MTLSamplerState> goSamp = (__bridge id<MTLSamplerState>)this->GradientOpacitySampler;
+      [encoder setFragmentTexture:goTex atIndex:3];
+      [encoder setFragmentSamplerState:goSamp atIndex:3];
+    }
+    else
+    {
+      [encoder setFragmentTexture:tfTex atIndex:3];
+      [encoder setFragmentSamplerState:tfSamp atIndex:3];
+    }
+
     // Draw — handle partitioned (multi-block) and single-block cases
     id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;
     if (!this->Blocks.empty())
@@ -2538,6 +2778,13 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         blockUniforms.CameraVolumePos[2] =
           static_cast<float>((camPosVolume[2] - block.BoundsMin[2]) / blockBoundsSize[2]);
         blockUniforms.CameraVolumePos[3] = 1.0f;
+
+        // Update gradient step for this block's dimensions
+        for (int k = 0; k < 3; ++k)
+        {
+          blockUniforms.GradientStep[k] =
+            (block.Dims[k] > 1) ? 1.0f / (block.Dims[k] - 1) : 1.0f;
+        }
 
         // Update uniform buffer with block-specific bounds
         memcpy([uniformBuf contents], &blockUniforms, sizeof(blockUniforms));

@@ -15,8 +15,8 @@ Status as of 2026-07-13. Compares `vtkMetalGPUVolumeRayCastMapper` against
 | **Two-pass contour + volume** (`UseDepthPass`) | Yes | No | Renders isosurface contours to depth FBO, then ray-marches behind them |
 | **Volume partitioning** (`SetPartitions`) | Yes | **Yes** | Splits large volumes into blocks for 3D texture size limits |
 | **Near-plane bounding box clipping** | Yes | **Yes** | Clips box geometry when camera is inside volume; fewer wasted fragments |
-| **Gradient-based Phong shading** | Yes | No | Central-difference normals for lighting; visual quality, not perf |
-| **2D transfer functions** (gradient opacity) | Yes | No | Uses gradient magnitude for edge/feature highlighting |
+| **Gradient-based Phong shading** | Yes | **Yes** | Central-difference normals for lighting; visual quality, not perf |
+| **Gradient opacity** (1D gradient opacity) | Yes | **Yes** | Uses gradient magnitude for edge/feature highlighting |
 | **Cropping regions** (32-region mask) | Yes | No | Interactive ROI without data copy |
 | **Clipping planes** (up to 8 arbitrary) | Yes | No | Cuts volume with arbitrary planes |
 | **Multi-volume compositing** | Yes | No | Simultaneous rendering of multiple volumes |
@@ -25,7 +25,7 @@ Status as of 2026-07-13. Compares `vtkMetalGPUVolumeRayCastMapper` against
 
 ## Summary
 
-The Metal mapper now has seven performance features matching or exceeding the OpenGL path:
+The Metal mapper now has nine features matching or exceeding the OpenGL path:
 1. **Double-stepped sampling** exploiting Apple Silicon's half-precision ALU
 2. **Adaptive sample distance** — dynamically adjusts step count frame-to-frame
 3. **Image-space downsampling** — renders at reduced resolution during interaction
@@ -33,6 +33,8 @@ The Metal mapper now has seven performance features matching or exceeding the Op
 5. **Depth buffer occlusion** — samples scene depth to terminate rays at opaque surfaces
 6. **Volume partitioning** — splits large volumes into blocks for 3D texture size limits
 7. **Near-plane clipping** — clips bounding box geometry against near plane when camera is inside
+8. **Gradient-based Phong shading** — central-difference normals for headlight Phong lighting
+9. **Gradient opacity** — 1D gradient opacity transfer function for edge/feature highlighting
 
 However, the OpenGL mapper retains several high-impact adaptive features that
 the Metal path is missing entirely:
@@ -43,9 +45,11 @@ None remaining.
 
 ### Medium gaps (quality of life)
 
-1. **Gradient-based shading** — Central-difference normals computed in the
-   shader enable Phong lighting and gradient-opacity transfer functions. The
-   Metal path has flat color-only compositing.
+1. ~~**Gradient-based shading**~~ **IMPLEMENTED**
+   - Central-difference normals computed in the fragment shader
+   - Headlight Phong lighting model (ambient + diffuse + specular)
+   - 1D gradient opacity transfer function support
+   - Enabled via `vtkVolumeProperty::SetShade(1)` and `SetGradientOpacity()`
 
 2. **Cropping regions** — Interactive 32-region crop without re-uploading data.
 
@@ -73,6 +77,8 @@ For maximum performance improvement with minimum effort:
    - Clip bounding box geometry against near plane when camera is inside
    - Reference: `vtkOpenGLGPUVolumeRayCastMapper::RenderVolumeGeometry()`
 
-4. **Gradient-based shading** (High effort, Medium impact)
-   - Compute central-difference gradients in fragment shader
-   - Add Phong lighting model; enable gradient-opacity TFs
+4. ~~**Gradient-based shading** (High effort, Medium impact)~~ **IMPLEMENTED**
+   - Central-difference gradient computation in fragment shader (7 texture samples per sample)
+   - Headlight Phong lighting model (ambient + diffuse + specular)
+   - 1D gradient opacity transfer function via 256x1 lookup texture
+   - Per-block gradient step computation for partitioned volumes

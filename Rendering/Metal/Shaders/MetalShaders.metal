@@ -2193,7 +2193,17 @@ struct VolumeMapperUniforms {
   float useJittering;
   float4x4 inverseViewProjection;
   float2 viewportSize;
-  float2 _pad;
+  // Gradient-based shading
+  float3 gradientStep;        // 1/(dims-1) per axis in [0,1] volume space
+  float useGradientShading;   // 1.0 = compute gradients and apply Phong lighting
+  float2 gradientOpacityRange; // (0, 0.25 * scalarRange) for normalizing gradient magnitude
+  float useGradientOpacity;   // 1.0 = modulate opacity by gradient magnitude
+  float4 ambientColor;        // material ambient (RGB, unused A)
+  float4 diffuseColor;        // material diffuse (RGB, unused A)
+  float4 specularColor;       // material specular (RGB, unused A)
+  float shininess;            // specular power
+  float3 lightDirection;      // unit vector toward light in volume-local [0,1] space
+  float _pad2;
 };
 
 struct VolumeVertexOut {
@@ -2245,15 +2255,67 @@ inline float2 intersectBox(float3 orig, float3 dir, float3 boxMin, float3 boxMax
   return float2(t0, t1);
 }
 
+// ---------------------------------------------------------------------------
+// Gradient-based shading helpers
+// ---------------------------------------------------------------------------
+
+// Compute gradient via central differences on the scalar field.
+// Returns (normalized_direction.xyz, gradient_magnitude) where magnitude
+// is in [0, 1] normalized to gradNormFactor (0.25 * scalarRange).
+inline float4 computeGradient(
+    texture3d<float> volTex, sampler volSamp,
+    float3 pos, float3 gradStep, float gradNormFactor) {
+  float sPX = volTex.sample(volSamp, pos + float3(gradStep.x, 0, 0), level(0)).r;
+  float sNX = volTex.sample(volSamp, pos - float3(gradStep.x, 0, 0), level(0)).r;
+  float sPY = volTex.sample(volSamp, pos + float3(0, gradStep.y, 0), level(0)).r;
+  float sNY = volTex.sample(volSamp, pos - float3(0, gradStep.y, 0), level(0)).r;
+  float sPZ = volTex.sample(volSamp, pos + float3(0, 0, gradStep.z), level(0)).r;
+  float sNZ = volTex.sample(volSamp, pos - float3(0, 0, gradStep.z), level(0)).r;
+
+  float3 grad = float3(sPX - sNX, sPY - sNY, sPZ - sNZ);
+  float mag = length(grad);
+  float3 dir = mag > 0.0 ? grad / mag : float3(0.0);
+
+  // Normalize magnitude to [0,1] over the expected range
+  float normMag = clamp(mag / max(1e-8, gradNormFactor), 0.0, 1.0);
+  return float4(dir, normMag);
+}
+
+// Simplified Phong lighting (headlight at camera).
+// Normal is oriented inward (toward increasing scalar values), so we negate
+// the light/view directions to match the OpenGL convention.
+inline half3 computePhongLighting(
+    half3 sampleColor, float3 gradDir,
+    float3 lightDir, float3 viewDir,
+    half3 ambientMat, half3 diffuseMat, half3 specularMat, float shininess) {
+  float3 normal = gradDir;
+  float nDotL = dot(normal, -lightDir);
+  float3 r = normalize(2.0 * nDotL * normal + lightDir);
+  float vDotR = dot(r, -viewDir);
+
+  half3 diffuse = half3(0.0);
+  half3 specular = half3(0.0);
+
+  if (nDotL > 0.0) {
+    diffuse = half3(nDotL) * diffuseMat * sampleColor;
+    vDotR = max(vDotR, 0.0);
+    specular = half3(pow(vDotR, shininess)) * specularMat;
+  }
+
+  return ambientMat * sampleColor + diffuse + specular;
+}
+
 fragment VolumeFragmentOut fragment_volume_main(
     VolumeVertexOut in [[stage_in]],
     constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
     texture3d<float> volumeTexture [[texture(0)]],
     texture2d<float> transferFunctionTexture [[texture(1)]],
     texture2d<float> depthTexture [[texture(2)]],
+    texture2d<float> gradientOpacityTexture [[texture(3)]],
     sampler transferFunctionSampler [[sampler(0)]],
     sampler volumeSampler [[sampler(1)]],
-    sampler depthSampler [[sampler(2)]]) {
+    sampler depthSampler [[sampler(2)]],
+    sampler gradientOpacitySampler [[sampler(3)]]) {
   VolumeFragmentOut output;
 
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
@@ -2322,6 +2384,19 @@ fragment VolumeFragmentOut fragment_volume_main(
   half accumulatedOpacity = 0.0;
   half scalarRangeRcp = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
 
+  // Gradient shading precomputations (done once, outside the loop)
+  const bool doShading = volumeUniforms.useGradientShading > 0.5;
+  const bool doGradOp = volumeUniforms.useGradientOpacity > 0.5;
+  float3 gradStep = volumeUniforms.gradientStep;
+  float3 lightDir = normalize(volumeUniforms.lightDirection);
+  // View direction: camera-to-sample in volume [0,1] space (normalized earlier)
+  float3 viewDir = normalize(entryPoint - cameraPos);
+  half3 ambientMat = half3(volumeUniforms.ambientColor.rgb);
+  half3 diffuseMat = half3(volumeUniforms.diffuseColor.rgb);
+  half3 specularMat = half3(volumeUniforms.specularColor.rgb);
+  float shininessVal = volumeUniforms.shininess;
+  float gradNormFactor = volumeUniforms.gradientOpacityRange.y;
+
   // Track ray distance for depth buffer occlusion early termination
   float currentT = jitter;
 
@@ -2340,6 +2415,22 @@ fragment VolumeFragmentOut fragment_volume_main(
       half sampleOpacity1 = colorOpacity1.a;
       if (sampleOpacity1 > 0.001h) {
         half3 sampleColor1 = colorOpacity1.rgb;
+
+        if (doShading) {
+          float4 grad1 = computeGradient(volumeTexture, volumeSampler,
+                                          currentPoint, gradStep, gradNormFactor);
+          sampleColor1 = computePhongLighting(
+            sampleColor1, grad1.xyz, lightDir, viewDir,
+            ambientMat, diffuseMat, specularMat, shininessVal);
+
+          if (doGradOp) {
+            half gradOp1 = half(gradientOpacityTexture.sample(
+              gradientOpacitySampler,
+              float2(float(grad1.w), 0.5), level(0)).r);
+            sampleOpacity1 *= gradOp1;
+          }
+        }
+
         half w1 = 1.0h - accumulatedOpacity;
         accumulatedColor += w1 * sampleColor1 * sampleOpacity1;
         accumulatedOpacity += w1 * sampleOpacity1;
@@ -2358,6 +2449,22 @@ fragment VolumeFragmentOut fragment_volume_main(
       half sampleOpacity2 = colorOpacity2.a;
       if (sampleOpacity2 > 0.001h) {
         half3 sampleColor2 = colorOpacity2.rgb;
+
+        if (doShading) {
+          float4 grad2 = computeGradient(volumeTexture, volumeSampler,
+                                          currentPoint, gradStep, gradNormFactor);
+          sampleColor2 = computePhongLighting(
+            sampleColor2, grad2.xyz, lightDir, viewDir,
+            ambientMat, diffuseMat, specularMat, shininessVal);
+
+          if (doGradOp) {
+            half gradOp2 = half(gradientOpacityTexture.sample(
+              gradientOpacitySampler,
+              float2(float(grad2.w), 0.5), level(0)).r);
+            sampleOpacity2 *= gradOp2;
+          }
+        }
+
         half w2 = 1.0h - accumulatedOpacity;
         accumulatedColor += w2 * sampleColor2 * sampleOpacity2;
         accumulatedOpacity += w2 * sampleOpacity2;
@@ -2383,6 +2490,22 @@ fragment VolumeFragmentOut fragment_volume_main(
       half sampleOpacity = colorOpacity.a;
       if (sampleOpacity > 0.001h) {
         half3 sampleColor = colorOpacity.rgb;
+
+        if (doShading) {
+          float4 grad = computeGradient(volumeTexture, volumeSampler,
+                                         currentPoint, gradStep, gradNormFactor);
+          sampleColor = computePhongLighting(
+            sampleColor, grad.xyz, lightDir, viewDir,
+            ambientMat, diffuseMat, specularMat, shininessVal);
+
+          if (doGradOp) {
+            half gradOp = half(gradientOpacityTexture.sample(
+              gradientOpacitySampler,
+              float2(float(grad.w), 0.5), level(0)).r);
+            sampleOpacity *= gradOp;
+          }
+        }
+
         half w = 1.0h - accumulatedOpacity;
         accumulatedColor += w * sampleColor * sampleOpacity;
         accumulatedOpacity += w * sampleOpacity;

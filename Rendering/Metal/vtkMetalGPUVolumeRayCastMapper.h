@@ -74,6 +74,8 @@ private:
   void* ColorOpacityTexture = nullptr;   // id<MTLTexture>  (2D)
   void* ColorOpacityTextureView = nullptr; // id<MTLTexture>  (alias)
   void* ColorOpacitySampler = nullptr;   // id<MTLSamplerState>
+  void* GradientOpacityTexture = nullptr; // id<MTLTexture> (256x1 RGBA8Unorm)
+  void* GradientOpacitySampler = nullptr; // id<MTLSamplerState>
   void* DepthStencilState = nullptr;     // id<MTLDepthStencilState>
   void* DepthTextureOcclusion = nullptr; // id<MTLTexture> — scene depth for early ray termination
   void* DepthSampler = nullptr;          // id<MTLSamplerState> — nearest sampler for depth texture
@@ -109,11 +111,13 @@ private:
   // Cache/timestamps
   vtkTimeStamp VolumeUploadTime;
   vtkTimeStamp TransferFunctionUploadTime;
+  vtkTimeStamp GradientOpacityUploadTime;
   vtkTimeStamp VertexBufferUploadTime;
 
   // Helper methods
   bool UpdateVolumeTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
   bool UpdateTransferFunctionTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
+  bool UpdateGradientOpacityTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
   bool SetupBuffers(void* mtlDevice, vtkRenderer* ren, vtkVolume* vol, vtkImageData* input);
   bool SetupPipeline(void* mtlDevice, vtkRenderer* ren);
 
