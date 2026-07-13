@@ -7,7 +7,6 @@ Status as of 2026-07-13. Compares `vtkMetalGPUVolumeRayCastMapper` against
 
 | Optimization | OpenGL | Metal | Impact |
 |---|:---:|:---:|---|
-| **Empty-space skipping** (coarse 32^3 opacity map) | No | **Yes** | Skips air/transparent regions; biggest win for CT with large lung fields |
 | **Early ray termination** (opacity threshold break) | Yes | Yes | Both terminate at ~95% accumulated opacity |
 | **Adaptive sample distance** (`AutoAdjustSampleDistances`) | Yes | **Yes** | Dynamically reduces step count to meet frame-time target |
 | **Image-space downsampling** (`ImageSampleDistance`) | Yes | No | Renders to lower-res FBO then upscales; cuts fragment count by up to 4x |
@@ -23,14 +22,12 @@ Status as of 2026-07-13. Compares `vtkMetalGPUVolumeRayCastMapper` against
 | **Multi-volume compositing** | Yes | No | Simultaneous rendering of multiple volumes |
 | **Mask / label map** | Yes | No | Binary mask and label map with 2D TFs |
 | **Double-stepped ILP loop** (2 samples/iter) | No | **Yes** | Exploits Apple GPU half-precision ALU at 2x throughput |
-| **Coarse map cell tracking** | No | **Yes** | Re-samples coarse map only at cell boundaries (avoids redundant fetches) |
 
 ## Summary
 
-The Metal mapper now has three unique performance features the OpenGL path lacks:
-1. **Empty-space skipping** via a 32x32x32 coarse opacity map with cell tracking
-2. **Double-stepped sampling** exploiting Apple Silicon's half-precision ALU
-3. **Adaptive sample distance** — dynamically adjusts step count frame-to-frame
+The Metal mapper now has two unique performance features the OpenGL path lacks:
+1. **Double-stepped sampling** exploiting Apple Silicon's half-precision ALU
+2. **Adaptive sample distance** — dynamically adjusts step count frame-to-frame
 
 However, the OpenGL mapper retains several high-impact adaptive features that
 the Metal path is missing entirely:

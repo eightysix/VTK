@@ -2191,7 +2191,7 @@ struct VolumeMapperUniforms {
   float scalarMin;
   float scalarMax;
   float useJittering;
-  float4 coarseMapInvDims; // 1/coarseDims.x, y, z; unused .w
+  float _padding[4];
 };
 
 struct VolumeVertexOut {
@@ -2248,10 +2248,8 @@ fragment VolumeFragmentOut fragment_volume_main(
     constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
     texture3d<float> volumeTexture [[texture(0)]],
     texture2d<float> transferFunctionTexture [[texture(1)]],
-    texture3d<float> coarseOpacityTexture [[texture(2)]],
     sampler transferFunctionSampler [[sampler(0)]],
-    sampler volumeSampler [[sampler(1)]],
-    sampler coarseSampler [[sampler(2)]]) {
+    sampler volumeSampler [[sampler(1)]]) {
   VolumeFragmentOut output;
 
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
@@ -2292,79 +2290,11 @@ fragment VolumeFragmentOut fragment_volume_main(
   half accumulatedOpacity = 0.0;
   half scalarRangeRcp = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
 
-  // Empty-space skipping via coarse 3D opacity map (32x32x32).
-  // Only used when the volume is large enough for the coarse map to be
-  // effective (each coarse cell covers ≥ 4 voxels).  For small volumes the
-  // coarse map is disabled and the original 2-sample for-loop is used.
-  float3 coarseCellSize = volumeUniforms.coarseMapInvDims.xyz;
-  bool hasCoarseMap = volumeUniforms.coarseMapInvDims.x > 0.0;
-
-  if (hasCoarseMap) {
-    // --- Coarse-map accelerated path (large volumes) ---
-    int3 prevCell = int3(-1, -1, -1);
-    half coarseMaxOp = 1.0h;
-
-    int i = 0;
-    int maxIter = maxSteps * 4;
-    int iter = 0;
-
-    while (i < maxSteps && iter < maxIter) {
-      iter++;
-
-      if (any(currentPoint < 0.0) || any(currentPoint > 1.0)) {
-        break;
-      }
-
-      // Re-sample coarse map only at cell boundaries
-      int3 curCell = clamp(int3(currentPoint / coarseCellSize), 0, 31);
-      if (curCell.x != prevCell.x || curCell.y != prevCell.y || curCell.z != prevCell.z) {
-        prevCell = curCell;
-        coarseMaxOp = half(coarseOpacityTexture.sample(
-          coarseSampler, currentPoint, level(0)).r);
-      }
-      if (coarseMaxOp < 0.002h) {
-        // Skip to exit of this coarse cell
-        float3 cellMin = float3(prevCell) * coarseCellSize;
-        float3 cellMax = cellMin + coarseCellSize;
-        float3 invDir = 1.0 / (rayDir + float3(1e-8));
-        float3 tA = invDir * (cellMin - currentPoint);
-        float3 tB = invDir * (cellMax - currentPoint);
-        float3 tmaxV = max(tA, tB);
-        float tSkip = max(min(min(tmaxV.x, tmaxV.y), tmaxV.z), stepSize);
-        currentPoint += rayDir * tSkip;
-        prevCell = int3(-1, -1, -1);
-        continue;
-      }
-
-      float rawScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
-      half scalarNorm = clamp(
-        half(rawScalar - volumeUniforms.scalarMin) * scalarRangeRcp,
-        0.0h, 1.0h);
-      half4 colorOpacity = half4(transferFunctionTexture.sample(
-        transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
-      half sampleOpacity = colorOpacity.a;
-      if (sampleOpacity > 0.001h) {
-        half3 sampleColor = colorOpacity.rgb;
-        half w = 1.0h - accumulatedOpacity;
-        accumulatedColor += w * sampleColor * sampleOpacity;
-        accumulatedOpacity += w * sampleOpacity;
-      }
-      if (accumulatedOpacity >= 0.95h) {
-        accumulatedOpacity = 1.0h;
-        break;
-      }
-
-      currentPoint += stepVec;
-      i++;
-    }
-  }
-  else {
-    // --- Standard path (small volumes) ---
-    // Process 2 samples per iteration to halve loop overhead and improve
-    // instruction-level parallelism.
-    int i = 0;
-    int maxStepsEven = maxSteps & ~1;
-    for (; i < maxStepsEven; i += 2) {
+  // Process 2 samples per iteration to halve loop overhead and improve
+  // instruction-level parallelism.
+  int i = 0;
+  int maxStepsEven = maxSteps & ~1;
+  for (; i < maxStepsEven; i += 2) {
       // --- Sample 1 ---
       float rawScalar1 = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
       half scalarNorm1 = clamp(
@@ -2428,7 +2358,6 @@ fragment VolumeFragmentOut fragment_volume_main(
 
       currentPoint += stepVec;
     }
-  }
 
   output.color = float4(float3(accumulatedColor), float(accumulatedOpacity));
   return output;
