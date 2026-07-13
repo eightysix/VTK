@@ -88,10 +88,27 @@ public:
   void* GetCurrentRenderCommandEncoder();
 
   /**
+   * Set the current render command encoder.
+   * Used by mappers that need to replace the encoder (e.g. offscreen rendering).
+   */
+  void SetCurrentRenderCommandEncoder(void* encoder);
+
+  /**
    * Get the current command buffer.
    * Only valid between Start() and Frame().
    */
   void* GetCurrentCommandBuffer();
+
+  /**
+   * Get the current drawable texture.
+   * Only valid during a render pass when a drawable is acquired.
+   */
+  void* GetCurrentDrawableTexture();
+
+  /**
+   * Get the depth texture used for the current render pass.
+   */
+  void* GetDepthTexture();
 
   /**
    * Get the effective sample count for multisampling.

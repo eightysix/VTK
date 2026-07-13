@@ -6,6 +6,8 @@
 #include "vtkMetalRenderWindow.h"
 #include "vtkMetalDepthPeeler.h"
 #include "vtkMetalCamera.h"
+#include "vtkMetalGPUVolumeRayCastMapper.h"
+#include "vtkMetalShaders.h"
 #include "vtkObjectFactory.h"
 #include "vtkRenderer.h"
 #include "vtkRendererCollection.h"
@@ -13,6 +15,8 @@
 #include "vtkViewport.h"
 #include "vtkActor.h"
 #include "vtkActorCollection.h"
+#include "vtkVolume.h"
+#include "vtkVolumeCollection.h"
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -365,8 +369,151 @@ void vtkMetalRenderer::DeviceRender()
           this->PropArray[i]->RenderVolumetricGeometry(this);
       }
 
-      [encoder endEncoding];
-      renWin->Encoder = nullptr;
+      // A volume mapper (image-sample path) may have ended this encoder
+      // and replaced it. Only end if it's still the same encoder.
+      if (renWin->GetCurrentRenderCommandEncoder() == (__bridge void*)encoder)
+      {
+        [encoder endEncoding];
+      }
+      renWin->SetCurrentRenderCommandEncoder(nullptr);
+    }
+
+    // === Phase 3b: Blit image-sampled volumes to screen ===
+    // After all volumes are rendered, check if any volume mapper used
+    // image-space downsampling (ImageSampleDistance != 1.0). If so, blit
+    // the offscreen textures to the drawable.
+    {
+      vtkVolumeCollection* coll = this->GetVolumes();
+      coll->InitTraversal();
+      bool needsBlit = false;
+
+      while (vtkVolume* vol = coll->GetNextVolume())
+      {
+        vtkGPUVolumeRayCastMapper* volMapper =
+          vtkGPUVolumeRayCastMapper::SafeDownCast(vol->GetMapper());
+        vtkMetalGPUVolumeRayCastMapper* metalMapper =
+          vtkMetalGPUVolumeRayCastMapper::SafeDownCast(volMapper);
+        if (metalMapper && metalMapper->GetImageSampleColorTexture() &&
+            metalMapper->GetImageSampleWidth() > 0)
+        {
+          needsBlit = true;
+          break;
+        }
+      }
+
+      if (needsBlit)
+      {
+        // Create blit pipeline if needed
+        static id<MTLRenderPipelineState> blitPipeline = nil;
+        if (!blitPipeline)
+        {
+          @autoreleasepool
+          {
+            NSError* error = nil;
+            NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
+            id<MTLLibrary> library = [device newLibraryWithSource:shaderSource
+                                                         options:nil
+                                                           error:&error];
+            if (library)
+            {
+              id<MTLFunction> vFunc = [library newFunctionWithName:@"vertex_fullscreen_main"];
+              id<MTLFunction> fFunc = [library newFunctionWithName:@"fragment_image_sample_blit"];
+              if (vFunc && fFunc)
+              {
+                MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+                desc.vertexFunction = vFunc;
+                desc.fragmentFunction = fFunc;
+                desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+                desc.colorAttachments[0].blendingEnabled = YES;
+                desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+                desc.colorAttachments[0].destinationRGBBlendFactor =
+                  MTLBlendFactorOneMinusSourceAlpha;
+                desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+                desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+                desc.colorAttachments[0].destinationAlphaBlendFactor =
+                  MTLBlendFactorOneMinusSourceAlpha;
+                desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+                desc.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
+
+                blitPipeline = [device newRenderPipelineStateWithDescriptor:desc
+                                                                     error:&error];
+              }
+            }
+          }
+        }
+
+        if (blitPipeline)
+        {
+          // Create sampler for blit
+          static id<MTLSamplerState> blitSampler = nil;
+          if (!blitSampler)
+          {
+            MTLSamplerDescriptor* sDesc = [[MTLSamplerDescriptor alloc] init];
+            sDesc.minFilter = MTLSamplerMinMagFilterLinear;
+            sDesc.magFilter = MTLSamplerMinMagFilterLinear;
+            sDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+            sDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+            blitSampler = [device newSamplerStateWithDescriptor:sDesc];
+          }
+
+          // Create blit encoder
+          MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+          if (msaa && msaaColorTex)
+          {
+            rpd.colorAttachments[0].texture = msaaColorTex;
+            rpd.colorAttachments[0].resolveTexture = drawable.texture;
+            rpd.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+          }
+          else
+          {
+            rpd.colorAttachments[0].texture = drawable.texture;
+            rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+          }
+          rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
+
+          id<MTLRenderCommandEncoder> blitEncoder =
+            [commandBuffer renderCommandEncoderWithDescriptor:rpd];
+          blitEncoder.label = @"VTK Volume ImageSample Blit";
+
+          [blitEncoder setRenderPipelineState:blitPipeline];
+          [blitEncoder setCullMode:MTLCullModeNone];
+
+          // Blit each volume's offscreen texture
+          coll->InitTraversal();
+          while (vtkVolume* vol = coll->GetNextVolume())
+          {
+            vtkGPUVolumeRayCastMapper* volMapper =
+              vtkGPUVolumeRayCastMapper::SafeDownCast(vol->GetMapper());
+            vtkMetalGPUVolumeRayCastMapper* metalMapper =
+              vtkMetalGPUVolumeRayCastMapper::SafeDownCast(volMapper);
+            if (metalMapper && metalMapper->GetImageSampleColorTexture() &&
+                metalMapper->GetImageSampleWidth() > 0)
+            {
+              id<MTLTexture> offscreenTex =
+                (__bridge id<MTLTexture>)metalMapper->GetImageSampleColorTexture();
+
+              // Set viewport to full window
+              MTLViewport metalViewport;
+              metalViewport.originX = viewport[0] * size[0];
+              metalViewport.originY = viewport[1] * size[1];
+              metalViewport.width = viewport[2] * size[0];
+              metalViewport.height = viewport[3] * size[1];
+              metalViewport.znear = 0.0;
+              metalViewport.zfar = 1.0;
+              [blitEncoder setViewport:metalViewport];
+
+              [blitEncoder setFragmentTexture:offscreenTex atIndex:0];
+              [blitEncoder setFragmentSamplerState:blitSampler atIndex:0];
+
+              [blitEncoder drawPrimitives:MTLPrimitiveTypeTriangle
+                             vertexStart:0
+                             vertexCount:3];
+            }
+          }
+
+          [blitEncoder endEncoding];
+        }
+      }
     }
 
     // Commit and present

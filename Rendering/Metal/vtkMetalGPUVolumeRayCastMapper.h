@@ -38,6 +38,11 @@ public:
 
   void PostRender(vtkRenderer* ren, int numberOfScalarComponents) override;
 
+  // Image-space downsampling accessors (used by vtkMetalRenderer for blit)
+  void* GetImageSampleColorTexture() const { return this->ImageSampleColorTexture; }
+  int GetImageSampleWidth() const { return this->ImageSampleFBOWidth; }
+  int GetImageSampleHeight() const { return this->ImageSampleFBOHeight; }
+
 protected:
   vtkMetalGPUVolumeRayCastMapper();
   ~vtkMetalGPUVolumeRayCastMapper() override;
@@ -74,6 +79,16 @@ private:
   // Adaptive sample distance
   double ReductionFactor = 1.0;
   void ComputeReductionFactor(double allocatedTime);
+
+  // Image-space downsampling (ImageSampleDistance)
+  void* ImageSampleColorTexture = nullptr;    // id<MTLTexture> — offscreen color at reduced res
+  void* ImageSampleDepthTexture = nullptr;    // id<MTLTexture> — offscreen depth at reduced res
+  void* ImageSamplePipeline = nullptr;        // id<MTLRenderPipelineState> — for blit pass
+  void* ImageSampleSampler = nullptr;         // id<MTLSamplerState> — linear sampler for blit
+  int ImageSampleFBOWidth = 0;
+  int ImageSampleFBOHeight = 0;
+  bool EnsureImageSampleResources(void* device, int width, int height);
+  void ReleaseImageSampleResources();
 
   // Cache/timestamps
   vtkTimeStamp VolumeUploadTime;

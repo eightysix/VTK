@@ -434,9 +434,32 @@ void* vtkMetalRenderWindow::GetCurrentRenderCommandEncoder()
 }
 
 //------------------------------------------------------------------------------
+void vtkMetalRenderWindow::SetCurrentRenderCommandEncoder(void* encoder)
+{
+  this->Encoder = encoder;
+}
+
+//------------------------------------------------------------------------------
 void* vtkMetalRenderWindow::GetCurrentCommandBuffer()
 {
   return this->CommandBuffer;
+}
+
+//------------------------------------------------------------------------------
+void* vtkMetalRenderWindow::GetCurrentDrawableTexture()
+{
+  if (this->CurrentDrawable)
+  {
+    id<CAMetalDrawable> drawable = (__bridge id<CAMetalDrawable>)this->CurrentDrawable;
+    return (__bridge void*)drawable.texture;
+  }
+  return nullptr;
+}
+
+//------------------------------------------------------------------------------
+void* vtkMetalRenderWindow::GetDepthTexture()
+{
+  return this->DepthTexture;
 }
 
 //------------------------------------------------------------------------------

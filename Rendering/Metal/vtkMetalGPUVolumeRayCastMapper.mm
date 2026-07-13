@@ -161,8 +161,148 @@ void vtkMetalGPUVolumeRayCastMapper::ComputeReductionFactor(double allocatedTime
 }
 
 //------------------------------------------------------------------------------
+bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
+  void* deviceVoid, int width, int height)
+{
+  if (this->ImageSampleColorTexture && this->ImageSampleFBOWidth == width &&
+    this->ImageSampleFBOHeight == height)
+  {
+    return true;
+  }
+
+  this->ReleaseImageSampleResources();
+
+  @autoreleasepool
+  {
+    id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
+
+    // Create offscreen color texture (BGRA8Unorm, matches layer pixel format)
+    MTLTextureDescriptor* colorDesc = [[MTLTextureDescriptor alloc] init];
+    colorDesc.textureType = MTLTextureType2D;
+    colorDesc.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    colorDesc.width = width;
+    colorDesc.height = height;
+    colorDesc.mipmapLevelCount = 1;
+    colorDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    colorDesc.storageMode = MTLStorageModePrivate;
+
+    id<MTLTexture> colorTex = [device newTextureWithDescriptor:colorDesc];
+    if (!colorTex)
+    {
+      vtkErrorMacro("Failed to create image-sample color texture");
+      return false;
+    }
+    this->ImageSampleColorTexture = (__bridge void*)colorTex;
+    CFRetain((__bridge CFTypeRef)colorTex);
+
+    // Create offscreen depth texture
+    MTLTextureDescriptor* depthDesc = [[MTLTextureDescriptor alloc] init];
+    depthDesc.textureType = MTLTextureType2D;
+    depthDesc.pixelFormat = MTLPixelFormatDepth32Float;
+    depthDesc.width = width;
+    depthDesc.height = height;
+    depthDesc.mipmapLevelCount = 1;
+    depthDesc.usage = MTLTextureUsageRenderTarget;
+    depthDesc.storageMode = MTLStorageModePrivate;
+
+    id<MTLTexture> depthTex = [device newTextureWithDescriptor:depthDesc];
+    if (!depthTex)
+    {
+      vtkErrorMacro("Failed to create image-sample depth texture");
+      this->ReleaseImageSampleResources();
+      return false;
+    }
+    this->ImageSampleDepthTexture = (__bridge void*)depthTex;
+    CFRetain((__bridge CFTypeRef)depthTex);
+
+    // Create blit pipeline (fullscreen quad that samples the offscreen texture)
+    NSError* error = nil;
+    NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
+    id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+    if (!library)
+    {
+      vtkErrorMacro(<< "Failed to compile Metal shader for image-sample blit: "
+                    << [[error localizedDescription] UTF8String]);
+      this->ReleaseImageSampleResources();
+      return false;
+    }
+
+    id<MTLFunction> vertexFunc = [library newFunctionWithName:@"vertex_fullscreen_main"];
+    id<MTLFunction> fragmentFunc = [library newFunctionWithName:@"fragment_image_sample_blit"];
+    if (!vertexFunc || !fragmentFunc)
+    {
+      vtkErrorMacro("Failed to find image-sample blit shader functions");
+      this->ReleaseImageSampleResources();
+      return false;
+    }
+
+    MTLRenderPipelineDescriptor* pipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
+    pipelineDesc.vertexFunction = vertexFunc;
+    pipelineDesc.fragmentFunction = fragmentFunc;
+    pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    pipelineDesc.colorAttachments[0].blendingEnabled = NO;
+    pipelineDesc.rasterSampleCount = 1; // Always 1 for blit; MSAA is on the main pass
+
+    id<MTLRenderPipelineState> pso =
+      [device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
+    if (!pso)
+    {
+      vtkErrorMacro(<< "Image-sample blit pipeline: " << [[error localizedDescription] UTF8String]);
+      this->ReleaseImageSampleResources();
+      return false;
+    }
+    this->ImageSamplePipeline = (__bridge void*)pso;
+    CFRetain((__bridge CFTypeRef)pso);
+
+    // Create linear sampler for blit
+    MTLSamplerDescriptor* sDesc = [[MTLSamplerDescriptor alloc] init];
+    sDesc.minFilter = MTLSamplerMinMagFilterLinear;
+    sDesc.magFilter = MTLSamplerMinMagFilterLinear;
+    sDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+    sDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:sDesc];
+    this->ImageSampleSampler = (__bridge void*)sampler;
+    CFRetain((__bridge CFTypeRef)sampler);
+
+    this->ImageSampleFBOWidth = width;
+    this->ImageSampleFBOHeight = height;
+  }
+
+  return true;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::ReleaseImageSampleResources()
+{
+  if (this->ImageSampleColorTexture)
+  {
+    CFRelease(this->ImageSampleColorTexture);
+    this->ImageSampleColorTexture = nullptr;
+  }
+  if (this->ImageSampleDepthTexture)
+  {
+    CFRelease(this->ImageSampleDepthTexture);
+    this->ImageSampleDepthTexture = nullptr;
+  }
+  if (this->ImageSamplePipeline)
+  {
+    CFRelease(this->ImageSamplePipeline);
+    this->ImageSamplePipeline = nullptr;
+  }
+  if (this->ImageSampleSampler)
+  {
+    CFRelease(this->ImageSampleSampler);
+    this->ImageSampleSampler = nullptr;
+  }
+  this->ImageSampleFBOWidth = 0;
+  this->ImageSampleFBOHeight = 0;
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotUsed(window))
 {
+  this->ReleaseImageSampleResources();
+
   if (this->PipelineState)
   {
     CFRelease(this->PipelineState);
@@ -229,8 +369,10 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
 //------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::GetReductionRatio(double ratio[3])
 {
-  ratio[0] = 1.0;
-  ratio[1] = 1.0;
+  // Image-space downsampling reduces the rendering resolution
+  double imageRatio = 1.0 / this->ImageSampleDistance;
+  ratio[0] = imageRatio;
+  ratio[1] = imageRatio;
   ratio[2] = 1.0;
 }
 
@@ -1009,10 +1151,10 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)metalRenderWindow->GetMetalDevice();
   id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)metalRenderWindow->GetMetalQueue();
-  id<MTLRenderCommandEncoder> encoder =
-    (__bridge id<MTLRenderCommandEncoder>)metalRenderWindow->GetCurrentRenderCommandEncoder();
+  id<MTLCommandBuffer> commandBuffer =
+    (__bridge id<MTLCommandBuffer>)metalRenderWindow->GetCurrentCommandBuffer();
 
-  if (!device || !encoder)
+  if (!device || !commandBuffer)
   {
     return;
   }
@@ -1210,51 +1352,162 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)this->UniformBuffer;
   memcpy([uniformBuf contents], &uniforms, sizeof(uniforms));
 
-  // Set pipeline and arguments
-  id<MTLRenderPipelineState> pipeline = (__bridge id<MTLRenderPipelineState>)this->PipelineState;
-  [encoder setRenderPipelineState:pipeline];
+  // Determine if image-space downsampling is active
+  const float imageSampleDist = this->ImageSampleDistance;
+  const bool useImageSampling = (imageSampleDist != 1.0f);
 
-  // Disable face culling: volume bounding box is viewed from both inside and
-  // outside depending on camera position, so both front and back faces must be
-  // rendered as ray entry/exit points.
-  [encoder setCullMode:MTLCullModeNone];
-
-  // Apply cached depth-stencil state: read depth (LessEqual) but do not write
-  // it. This lets opaque geometry occlude the volume correctly while preventing
-  // the bounding-box triangles from z-fighting with each other.
-  if (this->DepthStencilState)
+  if (useImageSampling)
   {
-    id<MTLDepthStencilState> ds = (__bridge id<MTLDepthStencilState>)this->DepthStencilState;
-    [encoder setDepthStencilState:ds];
+    // Image-space downsampling: render to offscreen texture at reduced resolution,
+    // then blit to screen. This cuts fragment count by up to 4x at 0.5x scale.
+    int* winSize = ren->GetSize();
+    int fboWidth = std::max(1, static_cast<int>(winSize[0] / imageSampleDist));
+    int fboHeight = std::max(1, static_cast<int>(winSize[1] / imageSampleDist));
+
+    if (!this->EnsureImageSampleResources(mtlDevice, fboWidth, fboHeight))
+    {
+      return;
+    }
+
+    // Must end the renderer's active encoder before creating a new one
+    id<MTLRenderCommandEncoder> currentEncoder =
+      (__bridge id<MTLRenderCommandEncoder>)metalRenderWindow->GetCurrentRenderCommandEncoder();
+    if (currentEncoder)
+    {
+      [currentEncoder endEncoding];
+      metalRenderWindow->SetCurrentRenderCommandEncoder(nullptr);
+    }
+
+    // Render volume to offscreen texture
+    id<MTLTexture> offscreenColor =
+      (__bridge id<MTLTexture>)this->ImageSampleColorTexture;
+    id<MTLTexture> offscreenDepth =
+      (__bridge id<MTLTexture>)this->ImageSampleDepthTexture;
+
+    MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+    rpd.colorAttachments[0].texture = offscreenColor;
+    rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+    rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rpd.depthAttachment.texture = offscreenDepth;
+    rpd.depthAttachment.loadAction = MTLLoadActionClear;
+    rpd.depthAttachment.clearDepth = 1.0;
+    rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+
+    id<MTLRenderCommandEncoder> offscreenEncoder =
+      [commandBuffer renderCommandEncoderWithDescriptor:rpd];
+    offscreenEncoder.label = @"VTK Volume ImageSample Offscreen";
+
+    // Set viewport to offscreen dimensions
+    MTLViewport metalViewport;
+    metalViewport.originX = 0;
+    metalViewport.originY = 0;
+    metalViewport.width = fboWidth;
+    metalViewport.height = fboHeight;
+    metalViewport.znear = 0.0;
+    metalViewport.zfar = 1.0;
+    [offscreenEncoder setViewport:metalViewport];
+
+    // Set pipeline and render state
+    id<MTLRenderPipelineState> pipeline =
+      (__bridge id<MTLRenderPipelineState>)this->PipelineState;
+    [offscreenEncoder setRenderPipelineState:pipeline];
+    [offscreenEncoder setCullMode:MTLCullModeNone];
+
+    if (this->DepthStencilState)
+    {
+      id<MTLDepthStencilState> ds =
+        (__bridge id<MTLDepthStencilState>)this->DepthStencilState;
+      [offscreenEncoder setDepthStencilState:ds];
+    }
+
+    // Bind buffers and textures
+    id<MTLBuffer> vertexBuf = (__bridge id<MTLBuffer>)this->VertexBuffer;
+    [offscreenEncoder setVertexBuffer:vertexBuf offset:0 atIndex:0];
+    [offscreenEncoder setVertexBuffer:uniformBuf offset:0 atIndex:1];
+    [offscreenEncoder setFragmentBuffer:uniformBuf offset:0 atIndex:1];
+
+    id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;
+    id<MTLSamplerState> volSamp = (__bridge id<MTLSamplerState>)this->VolumeSampler;
+    [offscreenEncoder setFragmentTexture:volTex atIndex:0];
+    [offscreenEncoder setFragmentSamplerState:volSamp atIndex:0];
+
+    id<MTLTexture> tfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
+    id<MTLSamplerState> tfSamp = (__bridge id<MTLSamplerState>)this->ColorOpacitySampler;
+    [offscreenEncoder setFragmentTexture:tfTex atIndex:1];
+    [offscreenEncoder setFragmentSamplerState:tfSamp atIndex:1];
+
+    // Draw volume
+    id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;
+    [offscreenEncoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                indexCount:this->IndexCount
+                                 indexType:MTLIndexTypeUInt32
+                               indexBuffer:indexBuf
+                         indexBufferOffset:0];
+
+    [offscreenEncoder endEncoding];
+    // Note: The renderer's blit phase (Phase 3b) will blit the offscreen
+    // texture to the screen after all volumes are rendered.
   }
+  else
+  {
+    // Standard path: render directly to the current encoder
+    id<MTLRenderCommandEncoder> encoder =
+      (__bridge id<MTLRenderCommandEncoder>)metalRenderWindow->GetCurrentRenderCommandEncoder();
 
-  // Bind vertex buffer (positions)
-  id<MTLBuffer> vertexBuf = (__bridge id<MTLBuffer>)this->VertexBuffer;
-  [encoder setVertexBuffer:vertexBuf offset:0 atIndex:0];
+    if (!encoder)
+    {
+      return;
+    }
 
-  // Bind uniform buffer (vertex + fragment) — now contains viewProjection
-  [encoder setVertexBuffer:uniformBuf offset:0 atIndex:1];
-  [encoder setFragmentBuffer:uniformBuf offset:0 atIndex:1];
+    // Set pipeline and arguments
+    id<MTLRenderPipelineState> pipeline =
+      (__bridge id<MTLRenderPipelineState>)this->PipelineState;
+    [encoder setRenderPipelineState:pipeline];
 
-  // Bind volume texture and sampler (fragment)
-  id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;
-  id<MTLSamplerState> volSamp = (__bridge id<MTLSamplerState>)this->VolumeSampler;
-  [encoder setFragmentTexture:volTex atIndex:0];
-  [encoder setFragmentSamplerState:volSamp atIndex:0];
+    // Disable face culling: volume bounding box is viewed from both inside and
+    // outside depending on camera position, so both front and back faces must be
+    // rendered as ray entry/exit points.
+    [encoder setCullMode:MTLCullModeNone];
 
-  // Bind transfer function texture and sampler (fragment)
-  id<MTLTexture> tfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
-  id<MTLSamplerState> tfSamp = (__bridge id<MTLSamplerState>)this->ColorOpacitySampler;
-  [encoder setFragmentTexture:tfTex atIndex:1];
-  [encoder setFragmentSamplerState:tfSamp atIndex:1];
+    // Apply cached depth-stencil state: read depth (LessEqual) but do not write
+    // it. This lets opaque geometry occlude the volume correctly while preventing
+    // the bounding-box triangles from z-fighting with each other.
+    if (this->DepthStencilState)
+    {
+      id<MTLDepthStencilState> ds =
+        (__bridge id<MTLDepthStencilState>)this->DepthStencilState;
+      [encoder setDepthStencilState:ds];
+    }
 
-  // Draw
-  id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;
-  [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                      indexCount:this->IndexCount
-                       indexType:MTLIndexTypeUInt32
-                     indexBuffer:indexBuf
-               indexBufferOffset:0];
+    // Bind vertex buffer (positions)
+    id<MTLBuffer> vertexBuf = (__bridge id<MTLBuffer>)this->VertexBuffer;
+    [encoder setVertexBuffer:vertexBuf offset:0 atIndex:0];
+
+    // Bind uniform buffer (vertex + fragment) — now contains viewProjection
+    [encoder setVertexBuffer:uniformBuf offset:0 atIndex:1];
+    [encoder setFragmentBuffer:uniformBuf offset:0 atIndex:1];
+
+    // Bind volume texture and sampler (fragment)
+    id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;
+    id<MTLSamplerState> volSamp = (__bridge id<MTLSamplerState>)this->VolumeSampler;
+    [encoder setFragmentTexture:volTex atIndex:0];
+    [encoder setFragmentSamplerState:volSamp atIndex:0];
+
+    // Bind transfer function texture and sampler (fragment)
+    id<MTLTexture> tfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
+    id<MTLSamplerState> tfSamp = (__bridge id<MTLSamplerState>)this->ColorOpacitySampler;
+    [encoder setFragmentTexture:tfTex atIndex:1];
+    [encoder setFragmentSamplerState:tfSamp atIndex:1];
+
+    // Draw
+    id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;
+    [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                        indexCount:this->IndexCount
+                         indexType:MTLIndexTypeUInt32
+                       indexBuffer:indexBuf
+                 indexBufferOffset:0];
+  }
 }
 
 VTK_ABI_NAMESPACE_END

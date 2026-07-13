@@ -2362,3 +2362,16 @@ fragment VolumeFragmentOut fragment_volume_main(
   output.color = float4(float3(accumulatedColor), float(accumulatedOpacity));
   return output;
 }
+
+// ---------------------------------------------------------------------------
+// Image-space downsampling blit pass
+// Samples the offscreen low-res texture and outputs to the screen.
+// Used when ImageSampleDistance != 1.0 for performance.
+// ---------------------------------------------------------------------------
+
+fragment float4 fragment_image_sample_blit(
+    FullscreenVertexOut in [[stage_in]],
+    texture2d<float> offscreenColor [[texture(0)]],
+    sampler offscreenSampler [[sampler(0)]]) {
+  return offscreenColor.sample(offscreenSampler, in.texCoord);
+}
