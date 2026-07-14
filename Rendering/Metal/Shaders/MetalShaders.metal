@@ -1514,20 +1514,26 @@ fragment VolumeFragmentOut fragment_volume_main(
 
     if (sampleOpacity > 0.001h) {
       half3 sampleColor = colorOpacity.rgb;
+      half weight = 1.0h - accumulatedOpacity;
 
-      if (doShading && maskLabel == 0.0h) {
+      // Visual Significance Threshold:
+      // If the voxel's actual contribution to the screen is less than 0.002
+      // it is invisible on an 8-bit monitor. Do not waste memory bandwidth shading it.
+      if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
+
         half4 grad = computeGradientFast(volumeTexture, volumeSampler, evalPoint, gradStep, gradNormFactor);
-
         sampleColor = computePhongLightingVolumeFast(sampleColor, grad.xyz, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
 
         if (doGradOp) {
           sampleOpacity *= half(gradientOpacityTexture.sample(gradientOpacitySampler, float2(float(grad.w), 0.5), level(0)).r);
         }
+      } else if (doShading) {
+        // Fallback for "invisible" fuzz/noise to maintain baseline brightness
+        sampleColor = ambientMat * sampleColor;
       }
 
-      half w = 1.0h - accumulatedOpacity;
-      accumulatedColor += w * sampleColor * sampleOpacity;
-      accumulatedOpacity += w * sampleOpacity;
+      accumulatedColor += weight * sampleColor * sampleOpacity;
+      accumulatedOpacity += weight * sampleOpacity;
     }
 
     if (accumulatedOpacity >= 0.95h || currentT >= tTerminateMax) {
