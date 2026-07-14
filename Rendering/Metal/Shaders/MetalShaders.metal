@@ -1313,21 +1313,19 @@ inline float2 intersectBox(float3 orig, float3 dir, float3 boxMin, float3 boxMax
   return float2(max(max(tmin.x, tmin.y), tmin.z), min(min(tmax.x, tmax.y), tmax.z));
 }
 
-// Optimized: Uses `half` precision extensively and takes pre-computed offset vectors
+// Optimized: Zero-overhead gradient fetch
 inline half4 computeGradientFast(texture3d<float> volTex, sampler volSamp, float3 pos,
-                                 float3 offX, float3 offY, float3 offZ, half gradNormFactor) {
-  // Fetching 6 samples is the memory bottleneck. Keep the math overhead zero.
-  half sPX = half(volTex.sample(volSamp, pos + offX, level(0)).r);
-  half sNX = half(volTex.sample(volSamp, pos - offX, level(0)).r);
-  half sPY = half(volTex.sample(volSamp, pos + offY, level(0)).r);
-  half sNY = half(volTex.sample(volSamp, pos - offY, level(0)).r);
-  half sPZ = half(volTex.sample(volSamp, pos + offZ, level(0)).r);
-  half sNZ = half(volTex.sample(volSamp, pos - offZ, level(0)).r);
+                                 float3 gradStep, half gradNormFactor) {
+  // 6 fetches are unavoidable for quality, but we minimize ALU overhead
+  half sPX = half(volTex.sample(volSamp, pos + float3(gradStep.x, 0, 0), level(0)).r);
+  half sNX = half(volTex.sample(volSamp, pos - float3(gradStep.x, 0, 0), level(0)).r);
+  half sPY = half(volTex.sample(volSamp, pos + float3(0, gradStep.y, 0), level(0)).r);
+  half sNY = half(volTex.sample(volSamp, pos - float3(0, gradStep.y, 0), level(0)).r);
+  half sPZ = half(volTex.sample(volSamp, pos + float3(0, 0, gradStep.z), level(0)).r);
+  half sNZ = half(volTex.sample(volSamp, pos - float3(0, 0, gradStep.z), level(0)).r);
 
   half3 grad = half3(sPX - sNX, sPY - sNY, sPZ - sNZ);
   half mag = length(grad);
-
-  // saturate() is a free hardware instruction on Apple Silicon, faster than clamp()
   return half4(mag > 0.0h ? grad / mag : half3(0.0h), saturate(mag / gradNormFactor));
 }
 
@@ -1418,36 +1416,28 @@ fragment VolumeFragmentOut fragment_volume_main(
     if (totalDist < 1e-6) discard_fragment();
   }
 
-  float jitter = volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) * stepSize : 0.0;
-  float3 currentPoint = entryPoint + (rayDir * jitter);
-  float3 stepVec = rayDir * stepSize;
-
-  half3 accumulatedColor = half3(0.0);
-  half accumulatedOpacity = 0.0;
-
-  // --- PRE-COMPUTE EVERYTHING POSSIBLE OUTSIDE THE LOOP ---
+  // --- LOCAL CACHE WARM-UP (Prevents Uniform Cache Thrashing) ---
   const bool doShading = volumeUniforms.useGradientShading > 0.5;
   const bool doGradOp = volumeUniforms.useGradientOpacity > 0.5;
   const bool doCropping = volumeUniforms.useCropping > 0.5;
   const bool doMask = volumeUniforms.useMask > 0.5;
 
-  // Optimize scale and bias to a single MAD (Multiply-Add) instruction later
   half scalarScale = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
   half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
 
-  // Move invariant normalizations and vectors OUTSIDE the loop (Massive FPS gain)
-  half3 viewDirHalf  = half3(normalize(entryPoint - cameraPos));
-  half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection));
-
-  float3 gradOffsetX = float3(volumeUniforms.gradientStep.x, 0.0, 0.0);
-  float3 gradOffsetY = float3(0.0, volumeUniforms.gradientStep.y, 0.0);
-  float3 gradOffsetZ = float3(0.0, 0.0, volumeUniforms.gradientStep.z);
+  float3 gradStep = volumeUniforms.gradientStep;
   half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
 
-  half3 ambientMat  = half3(volumeUniforms.ambientColor.rgb);
-  half3 diffuseMat  = half3(volumeUniforms.diffuseColor.rgb);
-  half3 specularMat = half3(volumeUniforms.specularColor.rgb);
-  half shininessMat = half(volumeUniforms.shininess);
+  half3 viewDirHalf  = half3(normalize(entryPoint - cameraPos));
+  half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection));
+  half3 ambientMat   = half3(volumeUniforms.ambientColor.rgb);
+  half3 diffuseMat   = half3(volumeUniforms.diffuseColor.rgb);
+  half3 specularMat  = half3(volumeUniforms.specularColor.rgb);
+  half shininessMat  = half(volumeUniforms.shininess);
+
+  float maskScale = volumeUniforms.maskScale;
+  float maskBias  = volumeUniforms.maskBias;
+  float numLabels = volumeUniforms.labelMapNumLabels;
 
   float3 cropMin = volumeUniforms.croppingPlanes.xyz;
   float3 cropMax = float3(volumeUniforms.croppingPlanes.w, volumeUniforms.croppingPlanes2.xy);
@@ -1460,30 +1450,56 @@ fragment VolumeFragmentOut fragment_volume_main(
     }
   }
 
-  int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
+  // --- SOFTWARE PIPELINING INITIALIZATION ---
+  float jitter = volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) * stepSize : 0.0;
+  float3 stepVec = rayDir * stepSize;
+  float3 currentPoint = entryPoint + (rayDir * jitter);
   float currentT = jitter;
 
-  // --- CLEAN, SINGLE-STEP LOOP (Allows AGX compiler to optimize registers) ---
+  int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
+
+  half3 accumulatedColor = half3(0.0);
+  half accumulatedOpacity = 0.0;
+
+  // PREFETCH the very first samples before the loop starts
+  float prefetchScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
+  float prefetchMask = doMask ? maskTexture.sample(maskSampler, currentPoint, level(0)).r : 0.0;
+
+  // --- THE RAYMARCHING LOOP ---
   for (int i = 0; i < maxSteps; i++) {
 
-    // Quick Crop Bailout
-    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, currentPoint))) == 0u)) {
-      currentPoint += stepVec;
-      currentT += stepSize;
+    // 1. Claim prefetched data and lock current spatial coordinate
+    float rawScalar = prefetchScalar;
+    float rawMask = prefetchMask;
+    float3 evalPoint = currentPoint;
+
+    // 2. Advance ray trackers
+    currentPoint += stepVec;
+    currentT += stepSize;
+
+    // 3. LAUNCH PREFETCH FOR NEXT ITERATION
+    // The GPU memory controller fulfills these while the ALU does the math below!
+    if (i + 1 < maxSteps) {
+      prefetchScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
+      if (doMask) {
+        prefetchMask = maskTexture.sample(maskSampler, currentPoint, level(0)).r;
+      }
+    }
+
+    // 4. MATH & EVALUATION (Hides the memory latency of step 3)
+    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, evalPoint))) == 0u)) {
       continue;
     }
 
-    float rawScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
-
-    // saturate() compiles to free hardware instruction
     half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
 
     half4 colorOpacity;
     half maskLabel = 0.0h;
+
     if (doMask) {
-      float maskVal = maskTexture.sample(maskSampler, currentPoint, level(0)).r * volumeUniforms.maskScale + volumeUniforms.maskBias;
-      if (volumeUniforms.labelMapNumLabels > 0.0) {
-        maskLabel = half(floor(maskVal * volumeUniforms.labelMapNumLabels) / volumeUniforms.labelMapNumLabels);
+      float maskVal = rawMask * maskScale + maskBias;
+      if (numLabels > 0.0) {
+        maskLabel = half(floor(maskVal * numLabels) / numLabels);
       }
       if (maskLabel > 0.0h) {
         colorOpacity = half4(labelMapTransferTexture.sample(labelMapSampler, float2(float(scalarNorm), float(maskLabel)), level(0)));
@@ -1500,10 +1516,8 @@ fragment VolumeFragmentOut fragment_volume_main(
       half3 sampleColor = colorOpacity.rgb;
 
       if (doShading && maskLabel == 0.0h) {
-        // Fast FP16 gradient fetch
-        half4 grad = computeGradientFast(volumeTexture, volumeSampler, currentPoint, gradOffsetX, gradOffsetY, gradOffsetZ, gradNormFactor);
+        half4 grad = computeGradientFast(volumeTexture, volumeSampler, evalPoint, gradStep, gradNormFactor);
 
-        // Fast FP16 lighting calculation
         sampleColor = computePhongLightingVolumeFast(sampleColor, grad.xyz, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
 
         if (doGradOp) {
@@ -1515,9 +1529,6 @@ fragment VolumeFragmentOut fragment_volume_main(
       accumulatedColor += w * sampleColor * sampleOpacity;
       accumulatedOpacity += w * sampleOpacity;
     }
-
-    currentPoint += stepVec;
-    currentT += stepSize;
 
     if (accumulatedOpacity >= 0.95h || currentT >= tTerminateMax) {
       accumulatedOpacity = 1.0h;
