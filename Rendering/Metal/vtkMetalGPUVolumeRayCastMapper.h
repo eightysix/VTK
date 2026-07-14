@@ -139,7 +139,13 @@ private:
   bool CameraWasInsideInLastUpdate = false;
 
   // Clipping planes — up to 8 arbitrary clipping planes
-  void SetClippingPlaneUniforms(void* uniforms, vtkRenderer* ren, vtkVolume* vol);
+  void SetClippingPlaneUniforms(void* uniforms, vtkRenderer* ren, vtkVolume* vol,
+    vtkMatrix4x4* invModelMatrix);
+
+  // Rendering helpers — shared between image-sampling and standard paths
+  void BindEncoderResources(void* encoder, void* uniformBuf);
+  void DrawBlocks(void* encoder, void* uniformBuf, vtkRenderer* ren, vtkVolume* vol,
+    void* uniforms, vtkMatrix4x4* invModelMatrix);
 
   // Volume partitioning — splits large volumes into blocks for 3D texture size limits
   struct VolumeBlock

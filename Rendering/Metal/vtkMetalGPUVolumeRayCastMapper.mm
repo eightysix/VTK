@@ -2032,7 +2032,8 @@ bool vtkMetalGPUVolumeRayCastMapper::IsCameraInside(
 
 //------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::SetClippingPlaneUniforms(
-  void* uniformsVoid, vtkRenderer* ren, vtkVolume* vol)
+  void* uniformsVoid, vtkRenderer* ren, vtkVolume* vol,
+  vtkMatrix4x4* invModelMatrix)
 {
   VolumeMapperUniforms* uniforms = static_cast<VolumeMapperUniforms*>(uniformsVoid);
 
@@ -2044,13 +2045,6 @@ void vtkMetalGPUVolumeRayCastMapper::SetClippingPlaneUniforms(
   }
 
   uniforms->UseClipping = 1.0f;
-
-  // Get volume model matrix for transforming planes to volume-local space
-  vtkNew<vtkMatrix4x4> modelMatrix;
-  vol->GetModelToWorldMatrix(modelMatrix);
-
-  vtkNew<vtkMatrix4x4> invModelMatrix;
-  vtkMatrix4x4::Invert(modelMatrix, invModelMatrix);
 
   double* modelBounds = this->ModelBounds;
   double boundsSize[3] = {
@@ -2333,19 +2327,22 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
           pOrigin[i] = -fplanes[16 + 3] * fplanes[16 + i];
         }
 
-        // Transform normal to volume coordinates (transpose-inverse)
-        double* dmat = dataToWorld->GetData();
-        dataToWorld->Transpose();
-        double pNormalV[3];
-        pNormalV[0] = pNormal[0] * dmat[0] + pNormal[1] * dmat[1] + pNormal[2] * dmat[2];
-        pNormalV[1] = pNormal[0] * dmat[4] + pNormal[1] * dmat[5] + pNormal[2] * dmat[6];
-        pNormalV[2] = pNormal[0] * dmat[8] + pNormal[1] * dmat[9] + pNormal[2] * dmat[10];
-        vtkMath::Normalize(pNormalV);
+        // Transform normal to volume coordinates using inverse transpose
+        // For transforming normals from world space to object space, we need
+        // the inverse transpose of the model matrix
+        vtkNew<vtkMatrix4x4> worldToData;
+        vtkMatrix4x4::Invert(dataToWorld, worldToData);
 
-        // Transform origin point to volume coordinates
-        dataToWorld->Transpose();
-        dataToWorld->Invert();
-        dataToWorld->MultiplyPoint(pOrigin, pOrigin);
+        // Transform origin point to volume coordinates using inverse matrix
+        worldToData->MultiplyPoint(pOrigin, pOrigin);
+
+        // Transform normal using transpose of inverse (i.e., inverse transpose)
+        double* invMat = worldToData->GetData();
+        double pNormalV[3];
+        pNormalV[0] = pNormal[0] * invMat[0] + pNormal[1] * invMat[1] + pNormal[2] * invMat[2];
+        pNormalV[1] = pNormal[0] * invMat[4] + pNormal[1] * invMat[5] + pNormal[2] * invMat[6];
+        pNormalV[2] = pNormal[0] * invMat[8] + pNormal[1] * invMat[9] + pNormal[2] * invMat[10];
+        vtkMath::Normalize(pNormalV);
 
         // Apply offset to prevent hardware near-plane clipping
         double offset = (cam->GetClippingRange()[1] - cam->GetClippingRange()[0]) * 0.001;
@@ -2651,6 +2648,209 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
   }
 
   return true;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
+  void* encoderVoid, void* uniformBufVoid)
+{
+  id<MTLRenderCommandEncoder> encoder =
+    (__bridge id<MTLRenderCommandEncoder>)encoderVoid;
+  id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)uniformBufVoid;
+
+  // Set pipeline and render state
+  id<MTLRenderPipelineState> pipeline =
+    (__bridge id<MTLRenderPipelineState>)this->PipelineState;
+  [encoder setRenderPipelineState:pipeline];
+  [encoder setCullMode:MTLCullModeNone];
+
+  if (this->DepthStencilState)
+  {
+    id<MTLDepthStencilState> ds =
+      (__bridge id<MTLDepthStencilState>)this->DepthStencilState;
+    [encoder setDepthStencilState:ds];
+  }
+
+  // Bind buffers
+  id<MTLBuffer> vertexBuf = (__bridge id<MTLBuffer>)this->VertexBuffer;
+  [encoder setVertexBuffer:vertexBuf offset:0 atIndex:0];
+  [encoder setVertexBuffer:uniformBuf offset:0 atIndex:1];
+  [encoder setFragmentBuffer:uniformBuf offset:0 atIndex:1];
+
+  // Bind volume texture and sampler (fragment index 0)
+  id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;
+  id<MTLSamplerState> volSamp = (__bridge id<MTLSamplerState>)this->VolumeSampler;
+  [encoder setFragmentTexture:volTex atIndex:0];
+  [encoder setFragmentSamplerState:volSamp atIndex:0];
+
+  // Bind transfer function texture and sampler (fragment index 1)
+  id<MTLTexture> tfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
+  id<MTLSamplerState> tfSamp = (__bridge id<MTLSamplerState>)this->ColorOpacitySampler;
+  [encoder setFragmentTexture:tfTex atIndex:1];
+  [encoder setFragmentSamplerState:tfSamp atIndex:1];
+
+  // Bind scene depth texture for early ray termination (fragment index 2)
+  if (this->DepthTextureOcclusion)
+  {
+    id<MTLTexture> depthTex = (__bridge id<MTLTexture>)this->DepthTextureOcclusion;
+    id<MTLSamplerState> depthSamp = (__bridge id<MTLSamplerState>)this->DepthSampler;
+    [encoder setFragmentTexture:depthTex atIndex:2];
+    [encoder setFragmentSamplerState:depthSamp atIndex:2];
+  }
+
+  // Bind gradient opacity texture for gradient-based shading (fragment index 3).
+  // Metal requires all declared fragment texture/sampler arguments to be bound,
+  // so bind the transfer function texture as fallback when gradient opacity is disabled.
+  if (this->GradientOpacityTexture)
+  {
+    id<MTLTexture> goTex = (__bridge id<MTLTexture>)this->GradientOpacityTexture;
+    id<MTLSamplerState> goSamp = (__bridge id<MTLSamplerState>)this->GradientOpacitySampler;
+    [encoder setFragmentTexture:goTex atIndex:3];
+    [encoder setFragmentSamplerState:goSamp atIndex:3];
+  }
+  else
+  {
+    [encoder setFragmentTexture:tfTex atIndex:3];
+    [encoder setFragmentSamplerState:tfSamp atIndex:3];
+  }
+
+  // Bind mask / label map textures (fragment index 4).
+  // Metal requires all declared fragment texture/sampler arguments to be bound,
+  // so bind the volume texture as fallback when mask is not used.
+  if (this->MaskTexture)
+  {
+    id<MTLTexture> maskTex = (__bridge id<MTLTexture>)this->MaskTexture;
+    id<MTLSamplerState> maskSamp = (__bridge id<MTLSamplerState>)this->MaskSampler;
+    [encoder setFragmentTexture:maskTex atIndex:4];
+    [encoder setFragmentSamplerState:maskSamp atIndex:4];
+  }
+  else
+  {
+    [encoder setFragmentTexture:volTex atIndex:4];
+    [encoder setFragmentSamplerState:volSamp atIndex:4];
+  }
+
+  // Bind label map transfer texture (fragment index 5)
+  if (this->LabelMapTransferTexture)
+  {
+    id<MTLTexture> lmTex = (__bridge id<MTLTexture>)this->LabelMapTransferTexture;
+    id<MTLSamplerState> lmSamp = (__bridge id<MTLSamplerState>)this->LabelMapTransferSampler;
+    [encoder setFragmentTexture:lmTex atIndex:5];
+    [encoder setFragmentSamplerState:lmSamp atIndex:5];
+  }
+  else
+  {
+    [encoder setFragmentTexture:tfTex atIndex:5];
+    [encoder setFragmentSamplerState:tfSamp atIndex:5];
+  }
+
+  // Bind label map gradient opacity texture (fragment index 6)
+  if (this->LabelMapGradientOpacityTexture)
+  {
+    id<MTLTexture> lgoTex = (__bridge id<MTLTexture>)this->LabelMapGradientOpacityTexture;
+    id<MTLSamplerState> lgoSamp = (__bridge id<MTLSamplerState>)this->LabelMapGradientOpacitySampler;
+    [encoder setFragmentTexture:lgoTex atIndex:6];
+    [encoder setFragmentSamplerState:lgoSamp atIndex:6];
+  }
+  else
+  {
+    [encoder setFragmentTexture:tfTex atIndex:6];
+    [encoder setFragmentSamplerState:tfSamp atIndex:6];
+  }
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
+  void* encoderVoid, void* uniformBufVoid, vtkRenderer* ren, vtkVolume* vol,
+  void* uniformsVoid, vtkMatrix4x4* invModelMatrix)
+{
+  id<MTLRenderCommandEncoder> encoder =
+    (__bridge id<MTLRenderCommandEncoder>)encoderVoid;
+  id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)uniformBufVoid;
+  VolumeMapperUniforms* uniforms = static_cast<VolumeMapperUniforms*>(uniformsVoid);
+  id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;
+
+  if (!this->Blocks.empty())
+  {
+    this->SortBlocksBackToFront(ren, vol);
+
+    // Per-block rendering: update uniform bounds and bind block's texture
+    VolumeMapperUniforms blockUniforms;
+    memcpy(&blockUniforms, uniforms, sizeof(blockUniforms));
+
+    double* camPosWorld = ren->GetActiveCamera()->GetPosition();
+
+    for (size_t bi = 0; bi < this->Blocks.size(); ++bi)
+    {
+      int si = this->SortedBlockOrder[bi];
+      auto& block = this->Blocks[si];
+
+      // Update bounds for this block
+      blockUniforms.VolumeBoundsMin[0] = static_cast<float>(block.BoundsMin[0]);
+      blockUniforms.VolumeBoundsMin[1] = static_cast<float>(block.BoundsMin[1]);
+      blockUniforms.VolumeBoundsMin[2] = static_cast<float>(block.BoundsMin[2]);
+      blockUniforms.VolumeBoundsMin[3] = 1.0f;
+
+      blockUniforms.VolumeBoundsMax[0] = static_cast<float>(block.BoundsMax[0]);
+      blockUniforms.VolumeBoundsMax[1] = static_cast<float>(block.BoundsMax[1]);
+      blockUniforms.VolumeBoundsMax[2] = static_cast<float>(block.BoundsMax[2]);
+      blockUniforms.VolumeBoundsMax[3] = 1.0f;
+
+      // Recompute camera position in block-local [0,1] space
+      double camPosVolume[4] = { camPosWorld[0], camPosWorld[1], camPosWorld[2], 1.0 };
+      invModelMatrix->MultiplyPoint(camPosVolume, camPosVolume);
+      double blockBoundsSize[3] = {
+        block.BoundsMax[0] - block.BoundsMin[0],
+        block.BoundsMax[1] - block.BoundsMin[1],
+        block.BoundsMax[2] - block.BoundsMin[2]
+      };
+      for (int k = 0; k < 3; ++k)
+      {
+        if (blockBoundsSize[k] < 1e-10)
+          blockBoundsSize[k] = 1.0;
+      }
+      blockUniforms.CameraVolumePos[0] =
+        static_cast<float>((camPosVolume[0] - block.BoundsMin[0]) / blockBoundsSize[0]);
+      blockUniforms.CameraVolumePos[1] =
+        static_cast<float>((camPosVolume[1] - block.BoundsMin[1]) / blockBoundsSize[1]);
+      blockUniforms.CameraVolumePos[2] =
+        static_cast<float>((camPosVolume[2] - block.BoundsMin[2]) / blockBoundsSize[2]);
+      blockUniforms.CameraVolumePos[3] = 1.0f;
+
+      // Update gradient step for this block's dimensions
+      for (int k = 0; k < 3; ++k)
+      {
+        blockUniforms.GradientStep[k] =
+          (block.Dims[k] > 1) ? 1.0f / (block.Dims[k] - 1) : 1.0f;
+      }
+
+      // Update uniform buffer with block-specific bounds
+      memcpy([uniformBuf contents], &blockUniforms, sizeof(blockUniforms));
+
+      // Bind this block's 3D texture
+      id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture;
+      [encoder setFragmentTexture:blockTex atIndex:0];
+
+      // Draw
+      [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                          indexCount:this->IndexCount
+                           indexType:MTLIndexTypeUInt32
+                         indexBuffer:indexBuf
+                   indexBufferOffset:0];
+    }
+
+    // Restore original uniforms
+    memcpy([uniformBuf contents], uniforms, sizeof(*uniforms));
+  }
+  else
+  {
+    // Single-block path (no partitioning)
+    [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                        indexCount:this->IndexCount
+                         indexType:MTLIndexTypeUInt32
+                       indexBuffer:indexBuf
+                 indexBufferOffset:0];
+  }
 }
 
 //------------------------------------------------------------------------------
@@ -2983,7 +3183,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   }
 
   // Clipping planes
-  this->SetClippingPlaneUniforms(&uniforms, ren, vol);
+  this->SetClippingPlaneUniforms(&uniforms, ren, vol, invModelMatrix);
 
   // Mask / label map
   this->SetMaskUniforms(&uniforms, vol);
@@ -3172,182 +3372,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     metalViewport.zfar = 1.0;
     [offscreenEncoder setViewport:metalViewport];
 
-    // Set pipeline and render state
-    id<MTLRenderPipelineState> pipeline =
-      (__bridge id<MTLRenderPipelineState>)this->PipelineState;
-    [offscreenEncoder setRenderPipelineState:pipeline];
-    [offscreenEncoder setCullMode:MTLCullModeNone];
-
-    if (this->DepthStencilState)
-    {
-      id<MTLDepthStencilState> ds =
-        (__bridge id<MTLDepthStencilState>)this->DepthStencilState;
-      [offscreenEncoder setDepthStencilState:ds];
-    }
-
-    // Bind buffers and textures
-    id<MTLBuffer> vertexBuf = (__bridge id<MTLBuffer>)this->VertexBuffer;
-    [offscreenEncoder setVertexBuffer:vertexBuf offset:0 atIndex:0];
-    [offscreenEncoder setVertexBuffer:uniformBuf offset:0 atIndex:1];
-    [offscreenEncoder setFragmentBuffer:uniformBuf offset:0 atIndex:1];
-
-    id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;
-    id<MTLSamplerState> volSamp = (__bridge id<MTLSamplerState>)this->VolumeSampler;
-    [offscreenEncoder setFragmentTexture:volTex atIndex:0];
-    [offscreenEncoder setFragmentSamplerState:volSamp atIndex:0];
-
-    id<MTLTexture> tfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
-    id<MTLSamplerState> tfSamp = (__bridge id<MTLSamplerState>)this->ColorOpacitySampler;
-    [offscreenEncoder setFragmentTexture:tfTex atIndex:1];
-    [offscreenEncoder setFragmentSamplerState:tfSamp atIndex:1];
-
-    // Bind scene depth texture for early ray termination (depth buffer occlusion)
-    if (this->DepthTextureOcclusion)
-    {
-      id<MTLTexture> depthTex = (__bridge id<MTLTexture>)this->DepthTextureOcclusion;
-      id<MTLSamplerState> depthSamp = (__bridge id<MTLSamplerState>)this->DepthSampler;
-      [offscreenEncoder setFragmentTexture:depthTex atIndex:2];
-      [offscreenEncoder setFragmentSamplerState:depthSamp atIndex:2];
-    }
-
-    // Bind gradient opacity texture for gradient-based shading
-    if (this->GradientOpacityTexture)
-    {
-      id<MTLTexture> goTex = (__bridge id<MTLTexture>)this->GradientOpacityTexture;
-      id<MTLSamplerState> goSamp = (__bridge id<MTLSamplerState>)this->GradientOpacitySampler;
-      [offscreenEncoder setFragmentTexture:goTex atIndex:3];
-      [offscreenEncoder setFragmentSamplerState:goSamp atIndex:3];
-    }
-
-    // Bind mask / label map textures.
-    // Metal requires all declared fragment texture/sampler arguments to be bound,
-    // so bind the volume texture as fallback when mask is not used.
-    if (this->MaskTexture)
-    {
-      id<MTLTexture> maskTex = (__bridge id<MTLTexture>)this->MaskTexture;
-      id<MTLSamplerState> maskSamp = (__bridge id<MTLSamplerState>)this->MaskSampler;
-      [offscreenEncoder setFragmentTexture:maskTex atIndex:4];
-      [offscreenEncoder setFragmentSamplerState:maskSamp atIndex:4];
-    }
-    else
-    {
-      [offscreenEncoder setFragmentTexture:volTex atIndex:4];
-      [offscreenEncoder setFragmentSamplerState:volSamp atIndex:4];
-    }
-
-    if (this->LabelMapTransferTexture)
-    {
-      id<MTLTexture> lmTex = (__bridge id<MTLTexture>)this->LabelMapTransferTexture;
-      id<MTLSamplerState> lmSamp = (__bridge id<MTLSamplerState>)this->LabelMapTransferSampler;
-      [offscreenEncoder setFragmentTexture:lmTex atIndex:5];
-      [offscreenEncoder setFragmentSamplerState:lmSamp atIndex:5];
-    }
-    else
-    {
-      [offscreenEncoder setFragmentTexture:tfTex atIndex:5];
-      [offscreenEncoder setFragmentSamplerState:tfSamp atIndex:5];
-    }
-
-    if (this->LabelMapGradientOpacityTexture)
-    {
-      id<MTLTexture> lgoTex = (__bridge id<MTLTexture>)this->LabelMapGradientOpacityTexture;
-      id<MTLSamplerState> lgoSamp = (__bridge id<MTLSamplerState>)this->LabelMapGradientOpacitySampler;
-      [offscreenEncoder setFragmentTexture:lgoTex atIndex:6];
-      [offscreenEncoder setFragmentSamplerState:lgoSamp atIndex:6];
-    }
-    else
-    {
-      [offscreenEncoder setFragmentTexture:tfTex atIndex:6];
-      [offscreenEncoder setFragmentSamplerState:tfSamp atIndex:6];
-    }
+    // Bind all encoder resources (pipeline, textures, samplers, buffers)
+    this->BindEncoderResources(offscreenEncoder, uniformBuf);
 
     // Draw volume — handle partitioned (multi-block) and single-block cases
-    id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;
-    if (!this->Blocks.empty())
-    {
-      this->SortBlocksBackToFront(ren, vol);
-
-      // Per-block rendering: update uniform bounds and bind block's texture
-      VolumeMapperUniforms blockUniforms;
-      memcpy(&blockUniforms, &uniforms, sizeof(blockUniforms));
-
-      double* camPosWorld = ren->GetActiveCamera()->GetPosition();
-      vtkNew<vtkMatrix4x4> invModelMatrix;
-      vtkNew<vtkMatrix4x4> modelMatrix;
-      vol->GetModelToWorldMatrix(modelMatrix);
-      vtkMatrix4x4::Invert(modelMatrix, invModelMatrix);
-
-      for (size_t bi = 0; bi < this->Blocks.size(); ++bi)
-      {
-        int si = this->SortedBlockOrder[bi];
-        auto& block = this->Blocks[si];
-
-        // Update bounds for this block
-        blockUniforms.VolumeBoundsMin[0] = static_cast<float>(block.BoundsMin[0]);
-        blockUniforms.VolumeBoundsMin[1] = static_cast<float>(block.BoundsMin[1]);
-        blockUniforms.VolumeBoundsMin[2] = static_cast<float>(block.BoundsMin[2]);
-        blockUniforms.VolumeBoundsMin[3] = 1.0f;
-
-        blockUniforms.VolumeBoundsMax[0] = static_cast<float>(block.BoundsMax[0]);
-        blockUniforms.VolumeBoundsMax[1] = static_cast<float>(block.BoundsMax[1]);
-        blockUniforms.VolumeBoundsMax[2] = static_cast<float>(block.BoundsMax[2]);
-        blockUniforms.VolumeBoundsMax[3] = 1.0f;
-
-        // Recompute camera position in block-local [0,1] space
-        double camPosVolume[4] = { camPosWorld[0], camPosWorld[1], camPosWorld[2], 1.0 };
-        invModelMatrix->MultiplyPoint(camPosVolume, camPosVolume);
-        double blockBoundsSize[3] = {
-          block.BoundsMax[0] - block.BoundsMin[0],
-          block.BoundsMax[1] - block.BoundsMin[1],
-          block.BoundsMax[2] - block.BoundsMin[2]
-        };
-        for (int k = 0; k < 3; ++k)
-        {
-          if (blockBoundsSize[k] < 1e-10)
-            blockBoundsSize[k] = 1.0;
-        }
-        blockUniforms.CameraVolumePos[0] =
-          static_cast<float>((camPosVolume[0] - block.BoundsMin[0]) / blockBoundsSize[0]);
-        blockUniforms.CameraVolumePos[1] =
-          static_cast<float>((camPosVolume[1] - block.BoundsMin[1]) / blockBoundsSize[1]);
-        blockUniforms.CameraVolumePos[2] =
-          static_cast<float>((camPosVolume[2] - block.BoundsMin[2]) / blockBoundsSize[2]);
-        blockUniforms.CameraVolumePos[3] = 1.0f;
-
-        // Update gradient step for this block's dimensions
-        for (int k = 0; k < 3; ++k)
-        {
-          blockUniforms.GradientStep[k] =
-            (block.Dims[k] > 1) ? 1.0f / (block.Dims[k] - 1) : 1.0f;
-        }
-
-        // Update uniform buffer with block-specific bounds
-        memcpy([uniformBuf contents], &blockUniforms, sizeof(blockUniforms));
-
-        // Bind this block's 3D texture
-        id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture;
-        [offscreenEncoder setFragmentTexture:blockTex atIndex:0];
-
-        // Draw
-        [offscreenEncoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                                    indexCount:this->IndexCount
-                                     indexType:MTLIndexTypeUInt32
-                                   indexBuffer:indexBuf
-                             indexBufferOffset:0];
-      }
-
-      // Restore original uniforms
-      memcpy([uniformBuf contents], &uniforms, sizeof(uniforms));
-    }
-    else
-    {
-      // Single-block path (no partitioning)
-      [offscreenEncoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                                  indexCount:this->IndexCount
-                                   indexType:MTLIndexTypeUInt32
-                                 indexBuffer:indexBuf
-                           indexBufferOffset:0];
-    }
+    this->DrawBlocks(offscreenEncoder, uniformBuf, ren, vol, &uniforms, invModelMatrix);
 
     [offscreenEncoder endEncoding];
     // Note: The renderer's blit phase (Phase 3b) will blit the offscreen
@@ -3364,200 +3393,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       return;
     }
 
-    // Set pipeline and arguments
-    id<MTLRenderPipelineState> pipeline =
-      (__bridge id<MTLRenderPipelineState>)this->PipelineState;
-    [encoder setRenderPipelineState:pipeline];
+    // Bind all encoder resources (pipeline, textures, samplers, buffers)
+    this->BindEncoderResources(encoder, uniformBuf);
 
-    // Disable face culling: volume bounding box is viewed from both inside and
-    // outside depending on camera position, so both front and back faces must be
-    // rendered as ray entry/exit points.
-    [encoder setCullMode:MTLCullModeNone];
-
-    // Apply cached depth-stencil state: read depth (LessEqual) but do not write
-    // it. This lets opaque geometry occlude the volume correctly while preventing
-    // the bounding-box triangles from z-fighting with each other.
-    if (this->DepthStencilState)
-    {
-      id<MTLDepthStencilState> ds =
-        (__bridge id<MTLDepthStencilState>)this->DepthStencilState;
-      [encoder setDepthStencilState:ds];
-    }
-
-    // Bind vertex buffer (positions)
-    id<MTLBuffer> vertexBuf = (__bridge id<MTLBuffer>)this->VertexBuffer;
-    [encoder setVertexBuffer:vertexBuf offset:0 atIndex:0];
-
-    // Bind uniform buffer (vertex + fragment) — now contains viewProjection
-    [encoder setVertexBuffer:uniformBuf offset:0 atIndex:1];
-    [encoder setFragmentBuffer:uniformBuf offset:0 atIndex:1];
-
-    // Bind volume texture and sampler (fragment)
-    id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;
-    id<MTLSamplerState> volSamp = (__bridge id<MTLSamplerState>)this->VolumeSampler;
-    [encoder setFragmentTexture:volTex atIndex:0];
-    [encoder setFragmentSamplerState:volSamp atIndex:0];
-
-    // Bind transfer function texture and sampler (fragment)
-    id<MTLTexture> tfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
-    id<MTLSamplerState> tfSamp = (__bridge id<MTLSamplerState>)this->ColorOpacitySampler;
-    [encoder setFragmentTexture:tfTex atIndex:1];
-    [encoder setFragmentSamplerState:tfSamp atIndex:1];
-
-    // Bind scene depth texture for early ray termination (depth buffer occlusion)
-    if (this->DepthTextureOcclusion)
-    {
-      id<MTLTexture> depthTex = (__bridge id<MTLTexture>)this->DepthTextureOcclusion;
-      id<MTLSamplerState> depthSamp = (__bridge id<MTLSamplerState>)this->DepthSampler;
-      [encoder setFragmentTexture:depthTex atIndex:2];
-      [encoder setFragmentSamplerState:depthSamp atIndex:2];
-    }
-
-    // Bind gradient opacity texture for gradient-based shading.
-    // Metal requires all declared fragment texture/sampler arguments to be bound,
-    // so bind the transfer function texture as fallback when gradient opacity is disabled.
-    if (this->GradientOpacityTexture)
-    {
-      id<MTLTexture> goTex = (__bridge id<MTLTexture>)this->GradientOpacityTexture;
-      id<MTLSamplerState> goSamp = (__bridge id<MTLSamplerState>)this->GradientOpacitySampler;
-      [encoder setFragmentTexture:goTex atIndex:3];
-      [encoder setFragmentSamplerState:goSamp atIndex:3];
-    }
-    else
-    {
-      [encoder setFragmentTexture:tfTex atIndex:3];
-      [encoder setFragmentSamplerState:tfSamp atIndex:3];
-    }
-
-    // Bind mask / label map textures.
-    // Metal requires all declared fragment texture/sampler arguments to be bound,
-    // so bind the volume/TF textures as fallback when mask is not used.
-    if (this->MaskTexture)
-    {
-      id<MTLTexture> maskTex = (__bridge id<MTLTexture>)this->MaskTexture;
-      id<MTLSamplerState> maskSamp = (__bridge id<MTLSamplerState>)this->MaskSampler;
-      [encoder setFragmentTexture:maskTex atIndex:4];
-      [encoder setFragmentSamplerState:maskSamp atIndex:4];
-    }
-    else
-    {
-      [encoder setFragmentTexture:volTex atIndex:4];
-      [encoder setFragmentSamplerState:volSamp atIndex:4];
-    }
-
-    if (this->LabelMapTransferTexture)
-    {
-      id<MTLTexture> lmTex = (__bridge id<MTLTexture>)this->LabelMapTransferTexture;
-      id<MTLSamplerState> lmSamp = (__bridge id<MTLSamplerState>)this->LabelMapTransferSampler;
-      [encoder setFragmentTexture:lmTex atIndex:5];
-      [encoder setFragmentSamplerState:lmSamp atIndex:5];
-    }
-    else
-    {
-      [encoder setFragmentTexture:tfTex atIndex:5];
-      [encoder setFragmentSamplerState:tfSamp atIndex:5];
-    }
-
-    if (this->LabelMapGradientOpacityTexture)
-    {
-      id<MTLTexture> lgoTex = (__bridge id<MTLTexture>)this->LabelMapGradientOpacityTexture;
-      id<MTLSamplerState> lgoSamp = (__bridge id<MTLSamplerState>)this->LabelMapGradientOpacitySampler;
-      [encoder setFragmentTexture:lgoTex atIndex:6];
-      [encoder setFragmentSamplerState:lgoSamp atIndex:6];
-    }
-    else
-    {
-      [encoder setFragmentTexture:tfTex atIndex:6];
-      [encoder setFragmentSamplerState:tfSamp atIndex:6];
-    }
-
-    // Draw — handle partitioned (multi-block) and single-block cases
-    id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;
-    if (!this->Blocks.empty())
-    {
-      this->SortBlocksBackToFront(ren, vol);
-
-      // Per-block rendering: update uniform bounds and bind block's texture
-      VolumeMapperUniforms blockUniforms;
-      memcpy(&blockUniforms, &uniforms, sizeof(blockUniforms));
-
-      double* camPosWorld = ren->GetActiveCamera()->GetPosition();
-      vtkNew<vtkMatrix4x4> invModelMatrix;
-      vtkNew<vtkMatrix4x4> modelMatrix;
-      vol->GetModelToWorldMatrix(modelMatrix);
-      vtkMatrix4x4::Invert(modelMatrix, invModelMatrix);
-
-      for (size_t bi = 0; bi < this->Blocks.size(); ++bi)
-      {
-        int si = this->SortedBlockOrder[bi];
-        auto& block = this->Blocks[si];
-
-        // Update bounds for this block
-        blockUniforms.VolumeBoundsMin[0] = static_cast<float>(block.BoundsMin[0]);
-        blockUniforms.VolumeBoundsMin[1] = static_cast<float>(block.BoundsMin[1]);
-        blockUniforms.VolumeBoundsMin[2] = static_cast<float>(block.BoundsMin[2]);
-        blockUniforms.VolumeBoundsMin[3] = 1.0f;
-
-        blockUniforms.VolumeBoundsMax[0] = static_cast<float>(block.BoundsMax[0]);
-        blockUniforms.VolumeBoundsMax[1] = static_cast<float>(block.BoundsMax[1]);
-        blockUniforms.VolumeBoundsMax[2] = static_cast<float>(block.BoundsMax[2]);
-        blockUniforms.VolumeBoundsMax[3] = 1.0f;
-
-        // Recompute camera position in block-local [0,1] space
-        double camPosVolume[4] = { camPosWorld[0], camPosWorld[1], camPosWorld[2], 1.0 };
-        invModelMatrix->MultiplyPoint(camPosVolume, camPosVolume);
-        double blockBoundsSize[3] = {
-          block.BoundsMax[0] - block.BoundsMin[0],
-          block.BoundsMax[1] - block.BoundsMin[1],
-          block.BoundsMax[2] - block.BoundsMin[2]
-        };
-        for (int k = 0; k < 3; ++k)
-        {
-          if (blockBoundsSize[k] < 1e-10)
-            blockBoundsSize[k] = 1.0;
-        }
-        blockUniforms.CameraVolumePos[0] =
-          static_cast<float>((camPosVolume[0] - block.BoundsMin[0]) / blockBoundsSize[0]);
-        blockUniforms.CameraVolumePos[1] =
-          static_cast<float>((camPosVolume[1] - block.BoundsMin[1]) / blockBoundsSize[1]);
-        blockUniforms.CameraVolumePos[2] =
-          static_cast<float>((camPosVolume[2] - block.BoundsMin[2]) / blockBoundsSize[2]);
-        blockUniforms.CameraVolumePos[3] = 1.0f;
-
-        // Update gradient step for this block's dimensions
-        for (int k = 0; k < 3; ++k)
-        {
-          blockUniforms.GradientStep[k] =
-            (block.Dims[k] > 1) ? 1.0f / (block.Dims[k] - 1) : 1.0f;
-        }
-
-        // Update uniform buffer with block-specific bounds
-        memcpy([uniformBuf contents], &blockUniforms, sizeof(blockUniforms));
-
-        // Bind this block's 3D texture
-        id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture;
-        [encoder setFragmentTexture:blockTex atIndex:0];
-
-        // Draw
-        [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                            indexCount:this->IndexCount
-                             indexType:MTLIndexTypeUInt32
-                           indexBuffer:indexBuf
-                     indexBufferOffset:0];
-      }
-
-      // Restore original uniforms
-      memcpy([uniformBuf contents], &uniforms, sizeof(uniforms));
-    }
-    else
-    {
-      // Single-block path (no partitioning)
-      [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                          indexCount:this->IndexCount
-                           indexType:MTLIndexTypeUInt32
-                         indexBuffer:indexBuf
-                   indexBufferOffset:0];
-    }
+    // Draw volume — handle partitioned (multi-block) and single-block cases
+    this->DrawBlocks(encoder, uniformBuf, ren, vol, &uniforms, invModelMatrix);
   }
 }
 

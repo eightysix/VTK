@@ -1,7 +1,5 @@
 # Review: vtkMetalGPUVolumeRayCastMapper.mm
 
-Date: 2025-07-14
-
 ## Critical Bugs
 
 ### 1. `UpdateBlockTextures` destroys blocks created by caller (line 1838)
@@ -29,7 +27,7 @@ Date: 2025-07-14
 
 ### 6. Confusing matrix transposition pattern (lines 2312-2322)
 - In-place transpose/read/retranspose/invert pattern
-- **Status**: DEFERRED (style, not bug)
+- **Status**: FIXED - Replaced with clear inverse-transpose pattern using vtkMatrix4x4::Invert
 
 ### 7. Per-block staging buffer allocation (line 1909)
 - N separate command buffers for N blocks
@@ -50,10 +48,12 @@ Date: 2025-07-14
 - **Status**: FIXED - Removed mipFilter setting
 
 ### 12. Duplicated rendering code paths
-- **Status**: DEFERRED (refactor)
+- ~175 lines duplicated between image-sampling and standard paths
+- **Status**: FIXED - Extracted `BindEncoderResources` and `DrawBlocks` helper methods
 
 ### 13. Full 4x4 matrix inverse on CPU every frame
-- **Status**: DEFERRED
+- 3 redundant model-matrix inverses per frame
+- **Status**: FIXED - Hoisted `invModelMatrix` to GPURender scope, passed to `SetClippingPlaneUniforms` (3→1 per frame)
 
 ### 14. `UpdateMaskTexture` uses `GetComponent` in serial loop
 - **Status**: FIXED - Added optimized paths for common types with vtkSMPTools::For
@@ -67,10 +67,10 @@ Date: 2025-07-14
 - **Status**: FIXED - Removed unused aliases
 
 ### 17. Empty `PreRender`, `RenderBlock`, `PostRender` overrides
-- **Status**: DEFERRED
+- **Status**: DEFERRED (required by pure virtual interface — cannot remove)
 
 ### 18. Inconsistent CFRelease pattern
-- **Status**: DEFERRED (refactor)
+- **Status**: DEFERRED (pattern is actually consistent: check null → CFRelease → set nullptr)
 
 ## Summary of Applied Fixes
 
@@ -78,6 +78,9 @@ Date: 2025-07-14
 2. **Critical Bug #2**: Changed `SortedBlockOrder` from fixed `int[64]` to `std::vector<int>` to prevent buffer overflow
 3. **Critical Bug #3**: Added dimension validation for `LabelMapTransferTexture` before reuse
 4. **Correctness #4**: Cast `fullDims` to `vtkIdType` before multiplication to prevent integer overflow
-5. **Performance #11**: Removed unused `mipFilter` from `VolumeSampler`
-6. **Performance #14**: Optimized `UpdateMaskTexture` with direct pointer access and parallelization
-7. **Minor #16**: Removed unused `VolumeTextureView` and `ColorOpacityTextureView` aliases
+5. **Correctness #6**: Replaced confusing in-place transpose/read/retranspose/invert with clear inverse-transpose pattern
+6. **Performance #11**: Removed unused `mipFilter` from `VolumeSampler`
+7. **Performance #12**: Extracted `BindEncoderResources` and `DrawBlocks` helpers to eliminate ~175 lines of duplicated rendering code
+8. **Performance #13**: Eliminated 2 redundant 4x4 matrix inverses per frame (3→1) by hoisting `invModelMatrix`
+9. **Performance #14**: Optimized `UpdateMaskTexture` with direct pointer access and parallelization
+10. **Minor #16**: Removed unused `VolumeTextureView` and `ColorOpacityTextureView` aliases
