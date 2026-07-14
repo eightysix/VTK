@@ -301,10 +301,17 @@ void vtkMetalRenderer::DeviceRender()
       id<MTLTexture> depthTex = (__bridge id<MTLTexture>)renWin->DepthTexture;
       if (depthTex)
       {
-        id<MTLBlitCommandEncoder> depthResolve = [commandBuffer blitCommandEncoder];
+        MTLRenderPassDescriptor* resolveRpd =
+          [MTLRenderPassDescriptor renderPassDescriptor];
+        resolveRpd.depthAttachment.texture = msaaDepthTex;
+        resolveRpd.depthAttachment.resolveTexture = depthTex;
+        resolveRpd.depthAttachment.loadAction = MTLLoadActionLoad;
+        resolveRpd.depthAttachment.storeAction = MTLStoreActionMultisampleResolve;
+        resolveRpd.depthAttachment.clearDepth = 1.0;
+
+        id<MTLRenderCommandEncoder> depthResolve =
+          [commandBuffer renderCommandEncoderWithDescriptor:resolveRpd];
         depthResolve.label = @"VTK MSAA Depth Resolve for Volume";
-        [depthResolve resolveMultisampleTexture:msaaDepthTex
-                                destinationTexture:depthTex];
         [depthResolve endEncoding];
       }
     }

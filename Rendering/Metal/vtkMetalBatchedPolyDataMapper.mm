@@ -153,8 +153,7 @@ void vtkMetalBatchedPolyDataMapper::ReleaseGraphicsResources(vtkWindow* w)
   // Release our batch-specific buffer (cast from void* to id<MTLBuffer>)
   if (this->BatchPropertiesBuffer)
   {
-    id<MTLBuffer> buf = (__bridge_transfer id<MTLBuffer>)this->BatchPropertiesBuffer;
-    buf = nil;
+    CFRelease(this->BatchPropertiesBuffer);
     this->BatchPropertiesBuffer = nullptr;
   }
   this->BatchPropertiesBufferSize = 0;
@@ -180,13 +179,13 @@ void vtkMetalBatchedPolyDataMapper::UpdateBatchPropertiesBuffer(void* mtlDevice)
     // Release old buffer
     if (this->BatchPropertiesBuffer)
     {
-      id<MTLBuffer> oldBuf = (__bridge_transfer id<MTLBuffer>)this->BatchPropertiesBuffer;
-      oldBuf = nil;
+      CFRelease(this->BatchPropertiesBuffer);
     }
     id<MTLBuffer> newBuf = [device
       newBufferWithLength:bufferSize
                  options:MTLResourceStorageModeShared];
-    this->BatchPropertiesBuffer = (__bridge_retained void*)newBuf;
+    this->BatchPropertiesBuffer = (__bridge void*)newBuf;
+    CFRetain(this->BatchPropertiesBuffer);
     this->BatchPropertiesBufferSize = bufferSize;
   }
 
@@ -378,7 +377,7 @@ void vtkMetalBatchedPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
   vtkMTimeType currentMTime = this->GetMTime();
   if (currentMTime != this->ResourcesSyncTimeStamp)
   {
-    this->UpdateBatchPropertiesBuffer((__bridge void*)renWin->GetMetalDevice());
+    this->UpdateBatchPropertiesBuffer(renWin->GetMetalDevice());
   }
 
   // Render each mesh in the batch individually via the parent class.

@@ -536,7 +536,7 @@ void vtkMetalRenderWindow::GetIdsData(int x1, int y1, int x2, int y2,
     MTLRegion region = MTLRegionMake2D(xMin, yMin, width, height);
     std::vector<uint32_t> texData(width * height * 4);
     [idsTex getBytes:texData.data()
-         fromBytesPerRow:width * 4 * sizeof(uint32_t)
+         bytesPerRow:width * 4 * sizeof(uint32_t)
         fromRegion:region
        mipmapLevel:0];
 
