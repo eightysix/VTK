@@ -1265,11 +1265,14 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMaskTexture(
 
       // Upload mask data to texture
       MTLRegion region = MTLRegionMake3D(0, 0, 0, dims[0], dims[1], dims[2]);
+      NSUInteger maskBytesPerRow = static_cast<NSUInteger>(dims[0]) * numComponents * sizeof(float);
+      NSUInteger maskBytesPerImage = maskBytesPerRow * dims[1];
       [tex replaceRegion:region
             mipmapLevel:0
+                  slice:0
               withBytes:maskData.data()
-            bytesPerRow:dims[0] * numComponents * sizeof(float)
-          bytesPerImage:dims[0] * dims[1] * numComponents * sizeof(float)];
+            bytesPerRow:maskBytesPerRow
+          bytesPerImage:maskBytesPerImage];
 
       this->MaskUpdateTime.Modified();
     }
