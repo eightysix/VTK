@@ -36,6 +36,7 @@
 #include <cstring>
 #include <set>
 #include <vector>
+#include <dispatch/dispatch.h>
 
 // Metal constant-address-space structs align float3 to 16 bytes (size 16),
 // float4/float4x4 to 16 bytes, and float2 to 8 bytes.  This creates
@@ -158,12 +159,20 @@ vtkStandardNewMacro(vtkMetalGPUVolumeRayCastMapper);
 vtkMetalGPUVolumeRayCastMapper::vtkMetalGPUVolumeRayCastMapper()
 {
   this->SampleDistance = 1.0f;
+  this->FrameSemaphore = dispatch_semaphore_create(3);
 }
 
 //------------------------------------------------------------------------------
 vtkMetalGPUVolumeRayCastMapper::~vtkMetalGPUVolumeRayCastMapper()
 {
   this->ReleaseGraphicsResources(nullptr);
+#if !__has_feature(objc_arc)
+  if (this->FrameSemaphore)
+  {
+    dispatch_release((dispatch_semaphore_t)this->FrameSemaphore);
+    this->FrameSemaphore = nullptr;
+  }
+#endif
 }
 
 //------------------------------------------------------------------------------
@@ -460,10 +469,13 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
     this->DepthStencilState = nullptr;
   }
 
-  if (this->UniformBuffer)
+  for (int i = 0; i < 3; ++i)
   {
-    CFRelease(this->UniformBuffer);
-    this->UniformBuffer = nullptr;
+    if (this->UniformBuffers[i])
+    {
+      CFRelease(this->UniformBuffers[i]);
+      this->UniformBuffers[i] = nullptr;
+    }
   }
 
   if (this->VertexBuffer)
@@ -2139,17 +2151,20 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
   {
     id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
 
-    if (!this->UniformBuffer)
+    if (!this->UniformBuffers[0])
     {
-      id<MTLBuffer> buf = [device newBufferWithLength:sizeof(VolumeMapperUniforms)
-                                              options:MTLResourceStorageModeShared];
-      if (!buf)
+      for (int i = 0; i < 3; ++i)
       {
-        vtkErrorMacro("Failed to create uniform buffer");
-        return false;
+        id<MTLBuffer> buf = [device newBufferWithLength:sizeof(VolumeMapperUniforms)
+                                                options:MTLResourceStorageModeShared];
+        if (!buf)
+        {
+          vtkErrorMacro("Failed to create uniform buffer");
+          return false;
+        }
+        this->UniformBuffers[i] = (__bridge void*)buf;
+        CFRetain((__bridge CFTypeRef)buf);
       }
-      this->UniformBuffer = (__bridge void*)buf;
-      CFRetain((__bridge CFTypeRef)buf);
     }
 
     // Use model-space bounds for vertex positions
@@ -2454,7 +2469,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
     }
   }
 
-  return this->VertexBuffer && this->IndexBuffer && this->UniformBuffer;
+  return this->VertexBuffer && this->IndexBuffer && this->UniformBuffers[0];
 }
 
 //------------------------------------------------------------------------------
@@ -2824,8 +2839,9 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
           (block.Dims[k] > 1) ? 1.0f / (block.Dims[k] - 1) : 1.0f;
       }
 
-      // Update uniform buffer with block-specific bounds
-      memcpy([uniformBuf contents], &blockUniforms, sizeof(blockUniforms));
+      // Copy block-specific uniforms into command buffer (avoids shared-buffer race)
+      [encoder setVertexBytes:&blockUniforms length:sizeof(blockUniforms) atIndex:1];
+      [encoder setFragmentBytes:&blockUniforms length:sizeof(blockUniforms) atIndex:1];
 
       // Bind this block's 3D texture
       id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture;
@@ -2838,9 +2854,6 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
                          indexBuffer:indexBuf
                    indexBufferOffset:0];
     }
-
-    // Restore original uniforms
-    memcpy([uniformBuf contents], uniforms, sizeof(*uniforms));
   }
   else
   {
@@ -3312,8 +3325,14 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // The depth buffer is written by opaque geometry in the earlier render pass.
   this->DepthTextureOcclusion = metalRenderWindow->GetDepthTexture();
 
+  // Wait for the uniform buffer slot for this frame to be free
+  dispatch_semaphore_wait((dispatch_semaphore_t)this->FrameSemaphore, DISPATCH_TIME_FOREVER);
+
+  int bufIdx = this->UniformFrameIndex % 3;
+  this->UniformFrameIndex++;
+
   // Update uniform buffer (now includes viewProjection + inverseViewProjection)
-  id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)this->UniformBuffer;
+  id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)this->UniformBuffers[bufIdx];
   memcpy([uniformBuf contents], &uniforms, sizeof(uniforms));
 
   // Determine if image-space downsampling is active
@@ -3330,6 +3349,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
     if (!this->EnsureImageSampleResources(mtlDevice, fboWidth, fboHeight))
     {
+      dispatch_semaphore_signal((dispatch_semaphore_t)this->FrameSemaphore);
       return;
     }
 
@@ -3390,6 +3410,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
     if (!encoder)
     {
+      dispatch_semaphore_signal((dispatch_semaphore_t)this->FrameSemaphore);
       return;
     }
 
@@ -3399,6 +3420,12 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     // Draw volume — handle partitioned (multi-block) and single-block cases
     this->DrawBlocks(encoder, uniformBuf, ren, vol, &uniforms, invModelMatrix);
   }
+
+  // Signal the semaphore when the GPU finishes this frame's command buffer
+  void* sem = this->FrameSemaphore;
+  [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
+    dispatch_semaphore_signal((dispatch_semaphore_t)sem);
+  }];
 }
 
 VTK_ABI_NAMESPACE_END

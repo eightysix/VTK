@@ -88,10 +88,12 @@ private:
   vtkTimeStamp MaskUpdateTime;
 
   // Buffers
-  void* UniformBuffer = nullptr;         // id<MTLBuffer>
-  void* VertexBuffer = nullptr;          // id<MTLBuffer>
-  void* IndexBuffer = nullptr;           // id<MTLBuffer>
-  void* StagingBuffer = nullptr;         // id<MTLBuffer> (volume upload, kept alive for async blit)
+  void* UniformBuffers[3] = { nullptr, nullptr, nullptr }; // id<MTLBuffer>[3] — triple-buffered
+  int UniformFrameIndex = 0;            // rotation index for triple-buffered uniforms
+  void* FrameSemaphore = nullptr;       // dispatch_semaphore_t — gates in-flight frames
+  void* VertexBuffer = nullptr;         // id<MTLBuffer>
+  void* IndexBuffer = nullptr;          // id<MTLBuffer>
+  void* StagingBuffer = nullptr;        // id<MTLBuffer> (volume upload, kept alive for async blit)
   int IndexCount = 0;
 
   // Volume state
