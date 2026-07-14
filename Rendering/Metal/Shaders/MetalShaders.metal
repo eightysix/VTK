@@ -2216,6 +2216,26 @@ struct VolumeMapperUniforms {
   float4 croppingFlagsRow6;    // flags[24..27]
   float4 croppingFlagsRow7;    // flags[28..31]
   float useCropping;           // 1.0 = enable cropping, 0.0 = disable
+  // Clipping planes (up to 8 arbitrary planes)
+  float useClipping;           // 1.0 = enable clipping, 0.0 = disable
+  float numClippingPlanes;     // number of clipping planes (0-8)
+  float _padClipping[2];      // pad to 16-byte for float4 arrays
+  float4 clippingPlane0Origin; // origin.xyz, 1.0
+  float4 clippingPlane0Normal; // normal.xyz, 0.0
+  float4 clippingPlane1Origin;
+  float4 clippingPlane1Normal;
+  float4 clippingPlane2Origin;
+  float4 clippingPlane2Normal;
+  float4 clippingPlane3Origin;
+  float4 clippingPlane3Normal;
+  float4 clippingPlane4Origin;
+  float4 clippingPlane4Normal;
+  float4 clippingPlane5Origin;
+  float4 clippingPlane5Normal;
+  float4 clippingPlane6Origin;
+  float4 clippingPlane6Normal;
+  float4 clippingPlane7Origin;
+  float4 clippingPlane7Normal;
 };
 
 struct VolumeVertexOut {
@@ -2400,6 +2420,66 @@ fragment VolumeFragmentOut fragment_volume_main(
     // Compute maximum ray distance before hitting the opaque surface
     float3 terminationVec = terminationLocal - entryPoint;
     tTerminateMax = length(terminationVec);
+  }
+
+  // --- Clipping planes ---
+  // Adjust ray entry/exit points based on arbitrary clipping planes.
+  // For each plane, compute signed distance from the plane. If both entry
+  // and exit are on the clipped side (negative), discard the fragment.
+  // Otherwise, adjust entry/exit to lie on the visible side.
+  if (volumeUniforms.useClipping > 0.5) {
+    int numClipPlanes = int(volumeUniforms.numClippingPlanes);
+
+    // Store plane data in arrays for loop access
+    float4 planeOrigins[8] = {
+      volumeUniforms.clippingPlane0Origin, volumeUniforms.clippingPlane1Origin,
+      volumeUniforms.clippingPlane2Origin, volumeUniforms.clippingPlane3Origin,
+      volumeUniforms.clippingPlane4Origin, volumeUniforms.clippingPlane5Origin,
+      volumeUniforms.clippingPlane6Origin, volumeUniforms.clippingPlane7Origin
+    };
+    float4 planeNormals[8] = {
+      volumeUniforms.clippingPlane0Normal, volumeUniforms.clippingPlane1Normal,
+      volumeUniforms.clippingPlane2Normal, volumeUniforms.clippingPlane3Normal,
+      volumeUniforms.clippingPlane4Normal, volumeUniforms.clippingPlane5Normal,
+      volumeUniforms.clippingPlane6Normal, volumeUniforms.clippingPlane7Normal
+    };
+
+    for (int cp = 0; cp < numClipPlanes; cp++) {
+      float3 planeOrigin = planeOrigins[cp].xyz;
+      float3 planeNormal = normalize(planeNormals[cp].xyz);
+
+      // Compute signed distance from plane for entry and exit points
+      float startDistance = dot(planeNormal, planeOrigin - entryPoint);
+      float stopDistance = dot(planeNormal, planeOrigin - exitPoint);
+      bool startClipped = startDistance > 0.0;
+      bool stopClipped = stopDistance > 0.0;
+
+      // If both points are on the clipped side, the entire ray is clipped
+      if (startClipped && stopClipped) {
+        discard_fragment();
+      }
+
+      float rayDotNormal = dot(rayDir, planeNormal);
+      bool frontFace = rayDotNormal > 0.0;
+
+      // Move entry point further from camera if needed
+      if (frontFace && startDistance > 0.0) {
+        float rayScaledDist = startDistance / rayDotNormal;
+        entryPoint = entryPoint + rayScaledDist * rayDir;
+      }
+
+      // Move exit point closer to camera if needed
+      if (!frontFace && stopDistance > 0.0) {
+        float rayScaledDist = stopDistance / rayDotNormal;
+        exitPoint = exitPoint + rayScaledDist * rayDir;
+      }
+    }
+
+    // Recompute total distance after clipping adjustment
+    totalDist = length(exitPoint - entryPoint);
+    if (totalDist < 1e-6) {
+      discard_fragment();
+    }
   }
 
   int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);

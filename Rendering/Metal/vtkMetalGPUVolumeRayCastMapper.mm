@@ -88,10 +88,30 @@ struct VolumeMapperUniforms
   float CroppingFlagsRow7[4];       // 624..639
   float UseCropping;                // 640
   float _padCropping[3];            // 644..655
+  // Clipping planes (up to 8 arbitrary planes)
+  float UseClipping;                // 656
+  float NumClippingPlanes;          // 660
+  float _padClipping[2];            // 664..671 (pad to 16-byte for float4)
+  float ClippingPlane0Origin[4];    // 672..687 (origin.xyz, 1.0)
+  float ClippingPlane0Normal[4];    // 688..703 (normal.xyz, 0.0)
+  float ClippingPlane1Origin[4];    // 704..719
+  float ClippingPlane1Normal[4];    // 720..735
+  float ClippingPlane2Origin[4];    // 736..751
+  float ClippingPlane2Normal[4];    // 752..767
+  float ClippingPlane3Origin[4];    // 768..783
+  float ClippingPlane3Normal[4];    // 784..799
+  float ClippingPlane4Origin[4];    // 800..815
+  float ClippingPlane4Normal[4];    // 816..831
+  float ClippingPlane5Origin[4];    // 832..847
+  float ClippingPlane5Normal[4];    // 848..863
+  float ClippingPlane6Origin[4];    // 864..879
+  float ClippingPlane6Normal[4];    // 880..895
+  float ClippingPlane7Origin[4];    // 896..911
+  float ClippingPlane7Normal[4];    // 912..927
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 656,
-  "VolumeMapperUniforms must be 656 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 928,
+  "VolumeMapperUniforms must be 928 bytes to match Metal shader struct");
 
 namespace
 {
@@ -1606,6 +1626,113 @@ bool vtkMetalGPUVolumeRayCastMapper::IsCameraInside(
 }
 
 //------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::SetClippingPlaneUniforms(
+  void* uniformsVoid, vtkRenderer* ren, vtkVolume* vol)
+{
+  VolumeMapperUniforms* uniforms = static_cast<VolumeMapperUniforms*>(uniformsVoid);
+
+  if (!this->GetClippingPlanes())
+  {
+    uniforms->UseClipping = 0.0f;
+    uniforms->NumClippingPlanes = 0.0f;
+    return;
+  }
+
+  uniforms->UseClipping = 1.0f;
+
+  // Get volume model matrix for transforming planes to volume-local space
+  vtkNew<vtkMatrix4x4> modelMatrix;
+  vol->GetModelToWorldMatrix(modelMatrix);
+
+  vtkNew<vtkMatrix4x4> invModelMatrix;
+  vtkMatrix4x4::Invert(modelMatrix, invModelMatrix);
+
+  double* modelBounds = this->ModelBounds;
+  double boundsSize[3] = {
+    modelBounds[1] - modelBounds[0],
+    modelBounds[3] - modelBounds[2],
+    modelBounds[5] - modelBounds[4]
+  };
+  for (int k = 0; k < 3; ++k)
+  {
+    if (boundsSize[k] < 1e-10)
+      boundsSize[k] = 1.0;
+  }
+
+  // Store plane pointers for indexed access
+  float* planeOrigins[8] = {
+    uniforms->ClippingPlane0Origin, uniforms->ClippingPlane1Origin,
+    uniforms->ClippingPlane2Origin, uniforms->ClippingPlane3Origin,
+    uniforms->ClippingPlane4Origin, uniforms->ClippingPlane5Origin,
+    uniforms->ClippingPlane6Origin, uniforms->ClippingPlane7Origin
+  };
+  float* planeNormals[8] = {
+    uniforms->ClippingPlane0Normal, uniforms->ClippingPlane1Normal,
+    uniforms->ClippingPlane2Normal, uniforms->ClippingPlane3Normal,
+    uniforms->ClippingPlane4Normal, uniforms->ClippingPlane5Normal,
+    uniforms->ClippingPlane6Normal, uniforms->ClippingPlane7Normal
+  };
+
+  int numPlanes = 0;
+  this->ClippingPlanes->InitTraversal();
+  vtkPlane* plane;
+  while ((plane = this->ClippingPlanes->GetNextItem()) && numPlanes < 8)
+  {
+    // Get plane origin and normal in world coordinates
+    double planeOrigin[3], planeNormal[3];
+    plane->GetOrigin(planeOrigin);
+    plane->GetNormal(planeNormal);
+
+    // Transform origin to volume-local [0,1] space
+    double originLocal[4] = { planeOrigin[0], planeOrigin[1], planeOrigin[2], 1.0 };
+    invModelMatrix->MultiplyPoint(originLocal, originLocal);
+
+    double originVol[3] = {
+      (originLocal[0] - modelBounds[0]) / boundsSize[0],
+      (originLocal[1] - modelBounds[2]) / boundsSize[1],
+      (originLocal[2] - modelBounds[4]) / boundsSize[2]
+    };
+
+    // Transform normal to volume-local [0,1] space
+    // Use the inverse transpose of the model matrix for normal transformation
+    double normalLocal[4] = { planeNormal[0], planeNormal[1], planeNormal[2], 0.0 };
+    invModelMatrix->MultiplyPoint(normalLocal, normalLocal);
+
+    // Scale normal by bounds to account for non-uniform scaling in [0,1] space
+    double normalVol[3] = {
+      normalLocal[0] / boundsSize[0],
+      normalLocal[1] / boundsSize[1],
+      normalLocal[2] / boundsSize[2]
+    };
+
+    // Normalize
+    double normalLen = sqrt(normalVol[0] * normalVol[0] + normalVol[1] * normalVol[1] +
+      normalVol[2] * normalVol[2]);
+    if (normalLen > 1e-10)
+    {
+      normalVol[0] /= normalLen;
+      normalVol[1] /= normalLen;
+      normalVol[2] /= normalLen;
+    }
+
+    // Store as float4 (origin.xyz, 1.0) and (normal.xyz, 0.0)
+    planeOrigins[numPlanes][0] = static_cast<float>(originVol[0]);
+    planeOrigins[numPlanes][1] = static_cast<float>(originVol[1]);
+    planeOrigins[numPlanes][2] = static_cast<float>(originVol[2]);
+    planeOrigins[numPlanes][3] = 1.0f;
+
+    planeNormals[numPlanes][0] = static_cast<float>(normalVol[0]);
+    planeNormals[numPlanes][1] = static_cast<float>(normalVol[1]);
+    planeNormals[numPlanes][2] = static_cast<float>(normalVol[2]);
+    planeNormals[numPlanes][3] = 0.0f;
+
+    numPlanes++;
+  }
+
+  uniforms->NumClippingPlanes = static_cast<float>(numPlanes);
+}
+
+//------------------------------------------------------------------------------
 bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
   void* mtlDeviceVoid, vtkRenderer* ren, vtkVolume* vol, vtkImageData* input)
 {
@@ -2402,6 +2529,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   {
     uniforms.UseCropping = 0.0f;
   }
+
+  // Clipping planes
+  this->SetClippingPlaneUniforms(&uniforms, ren, vol);
 
   // Viewport size for depth texture UV computation in the shader
   int* winSize = ren->GetSize();

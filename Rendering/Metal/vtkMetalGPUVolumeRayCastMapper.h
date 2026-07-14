@@ -125,6 +125,9 @@ private:
   bool IsCameraInside(vtkRenderer* ren, vtkVolume* vol);
   bool CameraWasInsideInLastUpdate = false;
 
+  // Clipping planes — up to 8 arbitrary clipping planes
+  void SetClippingPlaneUniforms(void* uniforms, vtkRenderer* ren, vtkVolume* vol);
+
   // Volume partitioning — splits large volumes into blocks for 3D texture size limits
   struct VolumeBlock
   {

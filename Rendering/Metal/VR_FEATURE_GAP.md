@@ -18,14 +18,14 @@ Status as of 2026-07-13. Compares `vtkMetalGPUVolumeRayCastMapper` against
 | **Gradient-based Phong shading** | Yes | **Yes** | Central-difference normals for lighting; visual quality, not perf |
 | **Gradient opacity** (1D gradient opacity) | Yes | **Yes** | Uses gradient magnitude for edge/feature highlighting |
 | **Cropping regions** (32-region mask) | Yes | **Yes** | Interactive ROI without data copy |
-| **Clipping planes** (up to 8 arbitrary) | Yes | No | Cuts volume with arbitrary planes |
+| **Clipping planes** (up to 8 arbitrary) | Yes | **Yes** | Cuts volume with arbitrary planes |
 | **Multi-volume compositing** | Yes | No | Simultaneous rendering of multiple volumes |
 | **Mask / label map** | Yes | No | Binary mask and label map with 2D TFs |
 | **Double-stepped ILP loop** (2 samples/iter) | No | **Yes** | Exploits Apple GPU half-precision ALU at 2x throughput |
 
 ## Summary
 
-The Metal mapper now has ten features matching or exceeding the OpenGL path:
+The Metal mapper now has eleven features matching or exceeding the OpenGL path:
 1. **Double-stepped sampling** exploiting Apple Silicon's half-precision ALU
 2. **Adaptive sample distance** — dynamically adjusts step count frame-to-frame
 3. **Image-space downsampling** — renders at reduced resolution during interaction
@@ -36,6 +36,7 @@ The Metal mapper now has ten features matching or exceeding the OpenGL path:
 8. **Gradient-based Phong shading** — central-difference normals for headlight Phong lighting
 9. **Gradient opacity** — 1D gradient opacity transfer function for edge/feature highlighting
 10. **Cropping regions** — 32-region orthogonal crop mask for interactive ROI
+11. **Clipping planes** — up to 8 arbitrary clipping planes for volume slicing
 
 However, the OpenGL mapper retains several high-impact adaptive features that
 the Metal path is missing entirely:
@@ -62,7 +63,11 @@ None remaining.
 
 4. Multi-volume compositing
 5. Mask / label map support
-6. Clipping planes
+6. ~~**Clipping planes**~~ **IMPLEMENTED**
+   - Up to 8 arbitrary clipping planes in volume-local [0,1] space
+   - Planes transformed from world coordinates using inverse model matrix
+   - Fragment shader adjusts ray entry/exit points per-plane
+   - Enabled via `vtkVolumeMapper::AddClippingPlane()` or `SetClippingPlanes()`
 7. ~~Volume partitioning (only needed for textures exceeding hardware 3D limit)~~ **IMPLEMENTED**
 
 ## Recommended Implementation Order
@@ -92,3 +97,9 @@ For maximum performance improvement with minimum effort:
    - 32-region crop mask decoded from CroppingRegionFlags bitmask
    - Planes converted from world to [0,1] volume-local space
    - Fragment shader skips texture fetch for disabled regions
+
+6. ~~**Clipping planes** (Medium effort, Low impact)~~ **IMPLEMENTED**
+   - Up to 8 arbitrary planes passed as float4 origin/normal pairs
+   - Planes transformed from world to [0,1] volume-local space on CPU
+   - Fragment shader adjusts ray entry/exit points per-plane before ray march
+   - Enabled via `vtkVolumeMapper::AddClippingPlane()` or `SetClippingPlanes()`
