@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <set>
 #include <vector>
 
 // Metal constant-address-space structs align float3 to 16 bytes (size 16),
@@ -108,10 +109,17 @@ struct VolumeMapperUniforms
   float ClippingPlane6Normal[4];    // 880..895
   float ClippingPlane7Origin[4];    // 896..911
   float ClippingPlane7Normal[4];    // 912..927
+  // Mask / label map support
+  float UseMask;                  // 928
+  float MaskBlendFactor;          // 932
+  float MaskScale;                // 936
+  float MaskBias;                 // 940
+  float LabelMapNumLabels;        // 944
+  float _padMask[3];              // 948..959 (pad to 16-byte alignment)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 928,
-  "VolumeMapperUniforms must be 928 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 960,
+  "VolumeMapperUniforms must be 960 bytes to match Metal shader struct");
 
 namespace
 {
@@ -439,6 +447,8 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
     CFRelease(this->GradientOpacitySampler);
     this->GradientOpacitySampler = nullptr;
   }
+
+  this->ReleaseMaskResources();
 
   if (this->DepthSampler)
   {
@@ -1158,6 +1168,373 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
   }
 
   return this->GradientOpacityTexture != nullptr;
+}
+
+//------------------------------------------------------------------------------
+bool vtkMetalGPUVolumeRayCastMapper::UpdateMaskTexture(
+  void* mtlDeviceVoid, void* mtlQueueVoid, vtkVolume* vol)
+{
+  vtkImageData* maskInput = this->MaskInput;
+  if (!maskInput)
+  {
+    return false;
+  }
+
+  vtkVolumeProperty* property = vol->GetProperty();
+  if (!property)
+  {
+    return false;
+  }
+
+  // Get the scalar array from the mask input
+  int isCellData = 0;
+  vtkDataArray* arr = this->GetScalars(
+    maskInput, this->ScalarMode, this->ArrayAccessMode,
+    this->ArrayId, this->ArrayName, isCellData);
+  if (!arr)
+  {
+    return false;
+  }
+
+  bool doReload = (this->MaskTexture == nullptr);
+  doReload |= (maskInput->GetMTime() > this->MaskUpdateTime.GetMTime());
+  doReload |= (arr->GetMTime() > this->MaskUpdateTime.GetMTime());
+
+  if (doReload)
+  {
+    @autoreleasepool
+    {
+      id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
+
+      // Get mask dimensions
+      int dims[3];
+      maskInput->GetDimensions(dims);
+
+      // Get the data pointer
+      int numComponents = arr->GetNumberOfComponents();
+
+      // Convert mask data to float for the 3D texture
+      // Mask is typically unsigned char (0-255) for label maps
+      vtkIdType numTuples = arr->GetNumberOfTuples();
+      std::vector<float> maskData(numTuples * numComponents);
+
+      for (vtkIdType i = 0; i < numTuples; ++i)
+      {
+        for (int c = 0; c < numComponents; ++c)
+        {
+          double val = arr->GetComponent(i, c);
+          maskData[i * numComponents + c] = static_cast<float>(val);
+        }
+      }
+
+      // Create or update the 3D mask texture
+      id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->MaskTexture;
+      id<MTLTexture> tex = nil;
+
+      if (oldTex)
+      {
+        tex = oldTex;
+      }
+      else
+      {
+        if (this->MaskTexture)
+        {
+          CFRelease(this->MaskTexture);
+          this->MaskTexture = nullptr;
+        }
+
+        MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
+        desc.textureType = MTLTextureType3D;
+        desc.pixelFormat = MTLPixelFormatR32Float;
+        desc.width = dims[0];
+        desc.height = dims[1];
+        desc.depth = dims[2];
+        desc.mipmapLevelCount = 1;
+        desc.usage = MTLTextureUsageShaderRead;
+        desc.storageMode = MTLStorageModeShared;
+
+        tex = [device newTextureWithDescriptor:desc];
+        if (!tex)
+        {
+          vtkErrorMacro("Failed to create mask texture");
+          return false;
+        }
+        this->MaskTexture = (__bridge void*)tex;
+        CFRetain((__bridge CFTypeRef)tex);
+      }
+
+      // Upload mask data to texture
+      MTLRegion region = MTLRegionMake3D(0, 0, 0, dims[0], dims[1], dims[2]);
+      [tex replaceRegion:region
+            mipmapLevel:0
+              withBytes:maskData.data()
+            bytesPerRow:dims[0] * numComponents * sizeof(float)
+          bytesPerImage:dims[0] * dims[1] * numComponents * sizeof(float)];
+
+      this->MaskUpdateTime.Modified();
+    }
+  }
+
+  return this->MaskTexture != nullptr;
+}
+
+//------------------------------------------------------------------------------
+bool vtkMetalGPUVolumeRayCastMapper::UpdateLabelMapTransferTexture(
+  void* mtlDeviceVoid, void* mtlQueueVoid, vtkVolume* vol)
+{
+  vtkVolumeProperty* property = vol->GetProperty();
+  if (!property)
+  {
+    return false;
+  }
+
+  // Get label map labels
+  std::set<int> labels = property->GetLabelMapLabels();
+  if (labels.empty())
+  {
+    return false;
+  }
+
+  // Get the maximum label value
+  int maxLabel = *(labels.rbegin());
+  int numLabels = maxLabel + 1; // +1 because label 0 is included
+
+  // Check if we need to reload
+  vtkMTimeType latestMTime = 0;
+  for (int label : labels)
+  {
+    vtkColorTransferFunction* colorFunc = property->GetLabelColor(label);
+    vtkPiecewiseFunction* opacityFunc = property->GetLabelScalarOpacity(label);
+    if (colorFunc && colorFunc->GetMTime() > latestMTime)
+    {
+      latestMTime = colorFunc->GetMTime();
+    }
+    if (opacityFunc && opacityFunc->GetMTime() > latestMTime)
+    {
+      latestMTime = opacityFunc->GetMTime();
+    }
+  }
+
+  bool doReload = (this->LabelMapTransferTexture == nullptr);
+  doReload |= (latestMTime > this->MaskUpdateTime.GetMTime());
+
+  if (doReload)
+  {
+    @autoreleasepool
+    {
+      id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
+
+      // Create 2D label map transfer function texture
+      // Width = 1024 (scalar range samples), Height = numLabels (one row per label)
+      const int tfWidth = 1024;
+      const int tfHeight = numLabels;
+
+      // Get the scalar range from the volume texture
+      double scalarRange[2] = { this->ScalarRange[0], this->ScalarRange[1] };
+
+      // Build the 2D transfer function texture data (RGBA float)
+      std::vector<float> tfData(tfWidth * tfHeight * 4);
+
+      // Row 0: label 0 (default) - zeros (will be filled by default TF)
+      std::fill(tfData.begin(), tfData.begin() + tfWidth * 4, 0.0f);
+
+      // Rows 1..maxLabel: per-label transfer functions
+      for (int label = 1; label < numLabels; ++label)
+      {
+        float* rowPtr = tfData.data() + label * tfWidth * 4;
+
+        // Get color transfer function for this label
+        vtkColorTransferFunction* colorFunc = property->GetLabelColor(label);
+        if (!colorFunc)
+        {
+          colorFunc = property->GetRGBTransferFunction(); // fallback to default
+        }
+
+        // Get opacity function for this label
+        vtkPiecewiseFunction* opacityFunc = property->GetLabelScalarOpacity(label);
+        if (!opacityFunc)
+        {
+          opacityFunc = property->GetScalarOpacity(); // fallback to default
+        }
+
+        if (colorFunc)
+        {
+          std::vector<double> colorTable(tfWidth * 3);
+          colorFunc->GetTable(scalarRange[0], scalarRange[1], tfWidth, colorTable.data());
+          for (int i = 0; i < tfWidth; ++i)
+          {
+            rowPtr[i * 4 + 0] = static_cast<float>(colorTable[i * 3 + 0]);
+            rowPtr[i * 4 + 1] = static_cast<float>(colorTable[i * 3 + 1]);
+            rowPtr[i * 4 + 2] = static_cast<float>(colorTable[i * 3 + 2]);
+          }
+        }
+
+        if (opacityFunc)
+        {
+          std::vector<double> opacityTable(tfWidth);
+          opacityFunc->GetTable(scalarRange[0], scalarRange[1], tfWidth, opacityTable.data());
+          for (int i = 0; i < tfWidth; ++i)
+          {
+            rowPtr[i * 4 + 3] = static_cast<float>(opacityTable[i]);
+          }
+        }
+      }
+
+      // Create or update the 2D texture
+      id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->LabelMapTransferTexture;
+      id<MTLTexture> tex = nil;
+
+      if (oldTex)
+      {
+        tex = oldTex;
+      }
+      else
+      {
+        if (this->LabelMapTransferTexture)
+        {
+          CFRelease(this->LabelMapTransferTexture);
+          this->LabelMapTransferTexture = nullptr;
+        }
+
+        MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
+        desc.textureType = MTLTextureType2D;
+        desc.pixelFormat = MTLPixelFormatRGBA32Float;
+        desc.width = tfWidth;
+        desc.height = tfHeight;
+        desc.mipmapLevelCount = 1;
+        desc.usage = MTLTextureUsageShaderRead;
+        desc.storageMode = MTLStorageModeShared;
+
+        tex = [device newTextureWithDescriptor:desc];
+        if (!tex)
+        {
+          vtkErrorMacro("Failed to create label map transfer texture");
+          return false;
+        }
+        this->LabelMapTransferTexture = (__bridge void*)tex;
+        CFRetain((__bridge CFTypeRef)tex);
+      }
+
+      // Upload data to texture
+      MTLRegion region = MTLRegionMake2D(0, 0, tfWidth, tfHeight);
+      [tex replaceRegion:region
+            mipmapLevel:0
+              withBytes:tfData.data()
+            bytesPerRow:tfWidth * 4 * sizeof(float)];
+
+      this->MaskUpdateTime.Modified();
+    }
+  }
+
+  return this->LabelMapTransferTexture != nullptr;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::SetMaskUniforms(void* uniforms, vtkVolume* vol)
+{
+  VolumeMapperUniforms* u = static_cast<VolumeMapperUniforms*>(uniforms);
+
+  vtkImageData* maskInput = this->MaskInput;
+  vtkVolumeProperty* property = vol->GetProperty();
+
+  if (maskInput && property &&
+      this->MaskType == vtkGPUVolumeRayCastMapper::LabelMapMaskType)
+  {
+    u->UseMask = 1.0f;
+    u->MaskBlendFactor = this->MaskBlendFactor;
+    u->MaskScale = 1.0f;  // Default scale for unsigned char mask
+    u->MaskBias = 0.0f;   // Default bias for unsigned char mask
+
+    // Compute mask scale/bias based on the mask data type
+    int cellFlag = 0;
+    vtkDataArray* arr = this->GetScalars(
+      maskInput, this->ScalarMode, this->ArrayAccessMode,
+      this->ArrayId, this->ArrayName, cellFlag);
+    if (arr)
+    {
+      int dataType = arr->GetDataType();
+      if (dataType == VTK_UNSIGNED_CHAR)
+      {
+        u->MaskScale = 1.0f / 255.0f;
+        u->MaskBias = 0.0f;
+      }
+      else if (dataType == VTK_CHAR)
+      {
+        u->MaskScale = 2.0f / 255.0f;
+        u->MaskBias = -1.0f;
+      }
+      else if (dataType == VTK_UNSIGNED_SHORT)
+      {
+        u->MaskScale = 1.0f / 65535.0f;
+        u->MaskBias = 0.0f;
+      }
+      else if (dataType == VTK_SHORT)
+      {
+        u->MaskScale = 2.0f / 65535.0f;
+        u->MaskBias = -1.0f;
+      }
+      else
+      {
+        // For float or other types, compute from range
+        double range[2];
+        arr->GetRange(range);
+        double dataRange = range[1] - range[0];
+        if (dataRange > 0.0)
+        {
+          u->MaskScale = static_cast<float>(1.0 / dataRange);
+          u->MaskBias = static_cast<float>(-range[0] / dataRange);
+        }
+      }
+    }
+
+    // Get the number of labels for quantization
+    std::set<int> labels = property->GetLabelMapLabels();
+    int maxLabel = labels.empty() ? 0 : *(labels.rbegin());
+    u->LabelMapNumLabels = static_cast<float>(maxLabel);
+  }
+  else
+  {
+    u->UseMask = 0.0f;
+    u->MaskBlendFactor = 0.0f;
+    u->MaskScale = 1.0f;
+    u->MaskBias = 0.0f;
+    u->LabelMapNumLabels = 0.0f;
+  }
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::ReleaseMaskResources()
+{
+  if (this->MaskTexture)
+  {
+    CFRelease(this->MaskTexture);
+    this->MaskTexture = nullptr;
+  }
+  if (this->MaskSampler)
+  {
+    CFRelease(this->MaskSampler);
+    this->MaskSampler = nullptr;
+  }
+  if (this->LabelMapTransferTexture)
+  {
+    CFRelease(this->LabelMapTransferTexture);
+    this->LabelMapTransferTexture = nullptr;
+  }
+  if (this->LabelMapTransferSampler)
+  {
+    CFRelease(this->LabelMapTransferSampler);
+    this->LabelMapTransferSampler = nullptr;
+  }
+  if (this->LabelMapGradientOpacityTexture)
+  {
+    CFRelease(this->LabelMapGradientOpacityTexture);
+    this->LabelMapGradientOpacityTexture = nullptr;
+  }
+  if (this->LabelMapGradientOpacitySampler)
+  {
+    CFRelease(this->LabelMapGradientOpacitySampler);
+    this->LabelMapGradientOpacitySampler = nullptr;
+  }
 }
 
 //------------------------------------------------------------------------------
@@ -2148,6 +2525,46 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       CFRetain((__bridge CFTypeRef)goSamp);
     }
 
+    // Nearest sampler for mask texture (3D, nearest interpolation for label maps)
+    if (!this->MaskSampler)
+    {
+      MTLSamplerDescriptor* maskDesc = [[MTLSamplerDescriptor alloc] init];
+      maskDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+      maskDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+      maskDesc.rAddressMode = MTLSamplerAddressModeClampToEdge;
+      maskDesc.magFilter = MTLSamplerMinMagFilterNearest;
+      maskDesc.minFilter = MTLSamplerMinMagFilterNearest;
+      id<MTLSamplerState> maskSamp = [device newSamplerStateWithDescriptor:maskDesc];
+      this->MaskSampler = (__bridge void*)maskSamp;
+      CFRetain((__bridge CFTypeRef)maskSamp);
+    }
+
+    // Nearest sampler for label map transfer function texture (2D, nearest for label lookup)
+    if (!this->LabelMapTransferSampler)
+    {
+      MTLSamplerDescriptor* lmDesc = [[MTLSamplerDescriptor alloc] init];
+      lmDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+      lmDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+      lmDesc.magFilter = MTLSamplerMinMagFilterNearest;
+      lmDesc.minFilter = MTLSamplerMinMagFilterNearest;
+      id<MTLSamplerState> lmSamp = [device newSamplerStateWithDescriptor:lmDesc];
+      this->LabelMapTransferSampler = (__bridge void*)lmSamp;
+      CFRetain((__bridge CFTypeRef)lmSamp);
+    }
+
+    // Nearest sampler for label map gradient opacity texture
+    if (!this->LabelMapGradientOpacitySampler)
+    {
+      MTLSamplerDescriptor* lgoDesc = [[MTLSamplerDescriptor alloc] init];
+      lgoDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+      lgoDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+      lgoDesc.magFilter = MTLSamplerMinMagFilterNearest;
+      lgoDesc.minFilter = MTLSamplerMinMagFilterNearest;
+      id<MTLSamplerState> lgoSamp = [device newSamplerStateWithDescriptor:lgoDesc];
+      this->LabelMapGradientOpacitySampler = (__bridge void*)lgoSamp;
+      CFRetain((__bridge CFTypeRef)lgoSamp);
+    }
+
     // Create and cache a depth stencil state.
     // Volume rendering reads but does not write depth — this prevents the
     // bounding box from z-fighting with itself and allows correct occlusion
@@ -2259,6 +2676,14 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     return;
   }
   this->UpdateGradientOpacityTexture(mtlDevice, mtlQueue, vol);
+
+  // Update mask / label map textures
+  if (this->MaskInput && this->MaskType == vtkGPUVolumeRayCastMapper::LabelMapMaskType)
+  {
+    this->UpdateMaskTexture(mtlDevice, mtlQueue, vol);
+    this->UpdateLabelMapTransferTexture(mtlDevice, mtlQueue, vol);
+  }
+
   if (!this->SetupBuffers(mtlDevice, ren, vol, input))
   {
     return;
@@ -2533,6 +2958,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // Clipping planes
   this->SetClippingPlaneUniforms(&uniforms, ren, vol);
 
+  // Mask / label map
+  this->SetMaskUniforms(&uniforms, vol);
+
   // Viewport size for depth texture UV computation in the shader
   int* winSize = ren->GetSize();
   uniforms.ViewportSize[0] = static_cast<float>(winSize[0]);
@@ -2764,6 +3192,48 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       [offscreenEncoder setFragmentSamplerState:goSamp atIndex:3];
     }
 
+    // Bind mask / label map textures.
+    // Metal requires all declared fragment texture/sampler arguments to be bound,
+    // so bind the volume texture as fallback when mask is not used.
+    if (this->MaskTexture)
+    {
+      id<MTLTexture> maskTex = (__bridge id<MTLTexture>)this->MaskTexture;
+      id<MTLSamplerState> maskSamp = (__bridge id<MTLSamplerState>)this->MaskSampler;
+      [offscreenEncoder setFragmentTexture:maskTex atIndex:4];
+      [offscreenEncoder setFragmentSamplerState:maskSamp atIndex:4];
+    }
+    else
+    {
+      [offscreenEncoder setFragmentTexture:volTex atIndex:4];
+      [offscreenEncoder setFragmentSamplerState:volSamp atIndex:4];
+    }
+
+    if (this->LabelMapTransferTexture)
+    {
+      id<MTLTexture> lmTex = (__bridge id<MTLTexture>)this->LabelMapTransferTexture;
+      id<MTLSamplerState> lmSamp = (__bridge id<MTLSamplerState>)this->LabelMapTransferSampler;
+      [offscreenEncoder setFragmentTexture:lmTex atIndex:5];
+      [offscreenEncoder setFragmentSamplerState:lmSamp atIndex:5];
+    }
+    else
+    {
+      [offscreenEncoder setFragmentTexture:tfTex atIndex:5];
+      [offscreenEncoder setFragmentSamplerState:tfSamp atIndex:5];
+    }
+
+    if (this->LabelMapGradientOpacityTexture)
+    {
+      id<MTLTexture> lgoTex = (__bridge id<MTLTexture>)this->LabelMapGradientOpacityTexture;
+      id<MTLSamplerState> lgoSamp = (__bridge id<MTLSamplerState>)this->LabelMapGradientOpacitySampler;
+      [offscreenEncoder setFragmentTexture:lgoTex atIndex:6];
+      [offscreenEncoder setFragmentSamplerState:lgoSamp atIndex:6];
+    }
+    else
+    {
+      [offscreenEncoder setFragmentTexture:tfTex atIndex:6];
+      [offscreenEncoder setFragmentSamplerState:tfSamp atIndex:6];
+    }
+
     // Draw volume — handle partitioned (multi-block) and single-block cases
     id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;
     if (!this->Blocks.empty())
@@ -2930,6 +3400,48 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     {
       [encoder setFragmentTexture:tfTex atIndex:3];
       [encoder setFragmentSamplerState:tfSamp atIndex:3];
+    }
+
+    // Bind mask / label map textures.
+    // Metal requires all declared fragment texture/sampler arguments to be bound,
+    // so bind the volume/TF textures as fallback when mask is not used.
+    if (this->MaskTexture)
+    {
+      id<MTLTexture> maskTex = (__bridge id<MTLTexture>)this->MaskTexture;
+      id<MTLSamplerState> maskSamp = (__bridge id<MTLSamplerState>)this->MaskSampler;
+      [encoder setFragmentTexture:maskTex atIndex:4];
+      [encoder setFragmentSamplerState:maskSamp atIndex:4];
+    }
+    else
+    {
+      [encoder setFragmentTexture:volTex atIndex:4];
+      [encoder setFragmentSamplerState:volSamp atIndex:4];
+    }
+
+    if (this->LabelMapTransferTexture)
+    {
+      id<MTLTexture> lmTex = (__bridge id<MTLTexture>)this->LabelMapTransferTexture;
+      id<MTLSamplerState> lmSamp = (__bridge id<MTLSamplerState>)this->LabelMapTransferSampler;
+      [encoder setFragmentTexture:lmTex atIndex:5];
+      [encoder setFragmentSamplerState:lmSamp atIndex:5];
+    }
+    else
+    {
+      [encoder setFragmentTexture:tfTex atIndex:5];
+      [encoder setFragmentSamplerState:tfSamp atIndex:5];
+    }
+
+    if (this->LabelMapGradientOpacityTexture)
+    {
+      id<MTLTexture> lgoTex = (__bridge id<MTLTexture>)this->LabelMapGradientOpacityTexture;
+      id<MTLSamplerState> lgoSamp = (__bridge id<MTLSamplerState>)this->LabelMapGradientOpacitySampler;
+      [encoder setFragmentTexture:lgoTex atIndex:6];
+      [encoder setFragmentSamplerState:lgoSamp atIndex:6];
+    }
+    else
+    {
+      [encoder setFragmentTexture:tfTex atIndex:6];
+      [encoder setFragmentSamplerState:tfSamp atIndex:6];
     }
 
     // Draw — handle partitioned (multi-block) and single-block cases

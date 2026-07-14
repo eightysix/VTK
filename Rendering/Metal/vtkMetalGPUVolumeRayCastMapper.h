@@ -80,6 +80,15 @@ private:
   void* DepthTextureOcclusion = nullptr; // id<MTLTexture> — scene depth for early ray termination
   void* DepthSampler = nullptr;          // id<MTLSamplerState> — nearest sampler for depth texture
 
+  // Mask / label map support
+  void* MaskTexture = nullptr;            // id<MTLTexture> (3D) — binary mask or label map
+  void* MaskSampler = nullptr;            // id<MTLSamplerState> — nearest sampler for mask
+  void* LabelMapTransferTexture = nullptr; // id<MTLTexture> (2D) — label map transfer function
+  void* LabelMapTransferSampler = nullptr; // id<MTLSamplerState> — nearest sampler for label map TF
+  void* LabelMapGradientOpacityTexture = nullptr; // id<MTLTexture> (2D) — label map gradient opacity
+  void* LabelMapGradientOpacitySampler = nullptr; // id<MTLSamplerState> — nearest sampler for label map grad op
+  vtkTimeStamp MaskUpdateTime;
+
   // Buffers
   void* UniformBuffer = nullptr;         // id<MTLBuffer>
   void* VertexBuffer = nullptr;          // id<MTLBuffer>
@@ -120,6 +129,12 @@ private:
   bool UpdateGradientOpacityTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
   bool SetupBuffers(void* mtlDevice, vtkRenderer* ren, vtkVolume* vol, vtkImageData* input);
   bool SetupPipeline(void* mtlDevice, vtkRenderer* ren);
+
+  // Mask / label map helpers
+  bool UpdateMaskTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
+  bool UpdateLabelMapTransferTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
+  void ReleaseMaskResources();
+  void SetMaskUniforms(void* uniforms, vtkVolume* vol);
 
   // Near-plane clipping
   bool IsCameraInside(vtkRenderer* ren, vtkVolume* vol);

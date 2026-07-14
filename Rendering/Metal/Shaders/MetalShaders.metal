@@ -2236,6 +2236,13 @@ struct VolumeMapperUniforms {
   float4 clippingPlane6Normal;
   float4 clippingPlane7Origin;
   float4 clippingPlane7Normal;
+  // Mask / label map support
+  float useMask;             // 1.0 = enable mask/label map, 0.0 = disable
+  float maskBlendFactor;     // 0.0 = use default TF, 1.0 = use label map TF
+  float maskScale;           // scale for normalizing mask values
+  float maskBias;            // bias for normalizing mask values
+  float labelMapNumLabels;   // number of labels (max label value)
+  float _padMask[3];         // pad to 16-byte alignment
 };
 
 struct VolumeVertexOut {
@@ -2366,10 +2373,16 @@ fragment VolumeFragmentOut fragment_volume_main(
     texture2d<float> transferFunctionTexture [[texture(1)]],
     texture2d<float> depthTexture [[texture(2)]],
     texture2d<float> gradientOpacityTexture [[texture(3)]],
+    texture3d<float> maskTexture [[texture(4)]],
+    texture2d<float> labelMapTransferTexture [[texture(5)]],
+    texture2d<float> labelMapGradientOpacityTexture [[texture(6)]],
     sampler transferFunctionSampler [[sampler(0)]],
     sampler volumeSampler [[sampler(1)]],
     sampler depthSampler [[sampler(2)]],
-    sampler gradientOpacitySampler [[sampler(3)]]) {
+    sampler gradientOpacitySampler [[sampler(3)]],
+    sampler maskSampler [[sampler(4)]],
+    sampler labelMapSampler [[sampler(5)]],
+    sampler labelMapGradOpSampler [[sampler(6)]]) {
   VolumeFragmentOut output;
 
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
@@ -2520,6 +2533,12 @@ fragment VolumeFragmentOut fragment_volume_main(
   float3 cropMax = float3(volumeUniforms.croppingPlanes.w,
                            volumeUniforms.croppingPlanes2.xy);
 
+  // Mask / label map precomputation (done once, outside the loop)
+  const bool doMask = volumeUniforms.useMask > 0.5;
+  const float maskScaleVal = volumeUniforms.maskScale;
+  const float maskBiasVal = volumeUniforms.maskBias;
+  const float numLabels = volumeUniforms.labelMapNumLabels;
+
   // Process 2 samples per iteration to halve loop overhead and improve
   // instruction-level parallelism.
   int i = 0;
@@ -2550,13 +2569,36 @@ fragment VolumeFragmentOut fragment_volume_main(
       half scalarNorm1 = clamp(
         half(rawScalar1 - volumeUniforms.scalarMin) * scalarRangeRcp,
         0.0h, 1.0h);
-      half4 colorOpacity1 = half4(transferFunctionTexture.sample(
-        transferFunctionSampler, float2(float(scalarNorm1), 0.5), level(0)));
+
+      // Mask / label map lookup
+      half4 colorOpacity1;
+      half maskLabel1 = 0.0h;
+      if (doMask) {
+        float maskVal1 = maskTexture.sample(maskSampler, currentPoint, level(0)).r;
+        maskVal1 = maskVal1 * maskScaleVal + maskBiasVal;
+        if (numLabels > 0.0) {
+          maskLabel1 = half(floor(maskVal1 * numLabels) / numLabels);
+        }
+        if (maskLabel1 > 0.0h) {
+          // Use 2D label map transfer function
+          colorOpacity1 = half4(labelMapTransferTexture.sample(
+            labelMapSampler, float2(float(scalarNorm1), float(maskLabel1)), level(0)));
+        } else {
+          // Use default transfer function
+          colorOpacity1 = half4(transferFunctionTexture.sample(
+            transferFunctionSampler, float2(float(scalarNorm1), 0.5), level(0)));
+        }
+      } else {
+        colorOpacity1 = half4(transferFunctionTexture.sample(
+          transferFunctionSampler, float2(float(scalarNorm1), 0.5), level(0)));
+      }
+
       half sampleOpacity1 = colorOpacity1.a;
       if (sampleOpacity1 > 0.001h) {
         half3 sampleColor1 = colorOpacity1.rgb;
 
-        if (doShading) {
+        // Apply gradient-based Phong shading only for default TF path (label == 0)
+        if (doShading && maskLabel1 == 0.0h) {
           float4 grad1 = computeGradient(volumeTexture, volumeSampler,
                                           currentPoint, gradStep, gradNormFactor);
           sampleColor1 = computePhongLighting(
@@ -2605,13 +2647,34 @@ fragment VolumeFragmentOut fragment_volume_main(
       half scalarNorm2 = clamp(
         half(rawScalar2 - volumeUniforms.scalarMin) * scalarRangeRcp,
         0.0h, 1.0h);
-      half4 colorOpacity2 = half4(transferFunctionTexture.sample(
-        transferFunctionSampler, float2(float(scalarNorm2), 0.5), level(0)));
+
+      // Mask / label map lookup
+      half4 colorOpacity2;
+      half maskLabel2 = 0.0h;
+      if (doMask) {
+        float maskVal2 = maskTexture.sample(maskSampler, currentPoint, level(0)).r;
+        maskVal2 = maskVal2 * maskScaleVal + maskBiasVal;
+        if (numLabels > 0.0) {
+          maskLabel2 = half(floor(maskVal2 * numLabels) / numLabels);
+        }
+        if (maskLabel2 > 0.0h) {
+          colorOpacity2 = half4(labelMapTransferTexture.sample(
+            labelMapSampler, float2(float(scalarNorm2), float(maskLabel2)), level(0)));
+        } else {
+          colorOpacity2 = half4(transferFunctionTexture.sample(
+            transferFunctionSampler, float2(float(scalarNorm2), 0.5), level(0)));
+        }
+      } else {
+        colorOpacity2 = half4(transferFunctionTexture.sample(
+          transferFunctionSampler, float2(float(scalarNorm2), 0.5), level(0)));
+      }
+
       half sampleOpacity2 = colorOpacity2.a;
       if (sampleOpacity2 > 0.001h) {
         half3 sampleColor2 = colorOpacity2.rgb;
 
-        if (doShading) {
+        // Apply gradient-based Phong shading only for default TF path (label == 0)
+        if (doShading && maskLabel2 == 0.0h) {
           float4 grad2 = computeGradient(volumeTexture, volumeSampler,
                                           currentPoint, gradStep, gradNormFactor);
           sampleColor2 = computePhongLighting(
@@ -2667,13 +2730,34 @@ fragment VolumeFragmentOut fragment_volume_main(
       half scalarNorm = clamp(
         half(rawScalar - volumeUniforms.scalarMin) * scalarRangeRcp,
         0.0h, 1.0h);
-      half4 colorOpacity = half4(transferFunctionTexture.sample(
-        transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+
+      // Mask / label map lookup
+      half4 colorOpacity;
+      half maskLabel = 0.0h;
+      if (doMask) {
+        float maskVal = maskTexture.sample(maskSampler, currentPoint, level(0)).r;
+        maskVal = maskVal * maskScaleVal + maskBiasVal;
+        if (numLabels > 0.0) {
+          maskLabel = half(floor(maskVal * numLabels) / numLabels);
+        }
+        if (maskLabel > 0.0h) {
+          colorOpacity = half4(labelMapTransferTexture.sample(
+            labelMapSampler, float2(float(scalarNorm), float(maskLabel)), level(0)));
+        } else {
+          colorOpacity = half4(transferFunctionTexture.sample(
+            transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+        }
+      } else {
+        colorOpacity = half4(transferFunctionTexture.sample(
+          transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+      }
+
       half sampleOpacity = colorOpacity.a;
       if (sampleOpacity > 0.001h) {
         half3 sampleColor = colorOpacity.rgb;
 
-        if (doShading) {
+        // Apply gradient-based Phong shading only for default TF path (label == 0)
+        if (doShading && maskLabel == 0.0h) {
           float4 grad = computeGradient(volumeTexture, volumeSampler,
                                          currentPoint, gradStep, gradNormFactor);
           sampleColor = computePhongLighting(

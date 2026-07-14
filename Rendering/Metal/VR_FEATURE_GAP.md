@@ -20,12 +20,12 @@ Status as of 2026-07-13. Compares `vtkMetalGPUVolumeRayCastMapper` against
 | **Cropping regions** (32-region mask) | Yes | **Yes** | Interactive ROI without data copy |
 | **Clipping planes** (up to 8 arbitrary) | Yes | **Yes** | Cuts volume with arbitrary planes |
 | **Multi-volume compositing** | Yes | No | Simultaneous rendering of multiple volumes |
-| **Mask / label map** | Yes | No | Binary mask and label map with 2D TFs |
+| **Mask / label map** | Yes | **Yes** | Binary mask and label map with 2D TFs |
 | **Double-stepped ILP loop** (2 samples/iter) | No | **Yes** | Exploits Apple GPU half-precision ALU at 2x throughput |
 
 ## Summary
 
-The Metal mapper now has eleven features matching or exceeding the OpenGL path:
+The Metal mapper now has twelve features matching or exceeding the OpenGL path:
 1. **Double-stepped sampling** exploiting Apple Silicon's half-precision ALU
 2. **Adaptive sample distance** — dynamically adjusts step count frame-to-frame
 3. **Image-space downsampling** — renders at reduced resolution during interaction
@@ -37,6 +37,7 @@ The Metal mapper now has eleven features matching or exceeding the OpenGL path:
 9. **Gradient opacity** — 1D gradient opacity transfer function for edge/feature highlighting
 10. **Cropping regions** — 32-region orthogonal crop mask for interactive ROI
 11. **Clipping planes** — up to 8 arbitrary clipping planes for volume slicing
+12. **Mask / label map** — binary mask and label map with 2D transfer functions
 
 However, the OpenGL mapper retains several high-impact adaptive features that
 the Metal path is missing entirely:
@@ -62,7 +63,12 @@ None remaining.
 ### Low priority gaps (specialized use cases)
 
 4. Multi-volume compositing
-5. Mask / label map support
+5. ~~**Mask / label map**~~ **IMPLEMENTED**
+   - 3D mask texture loaded with nearest interpolation for label maps
+   - 2D label map transfer function texture (1024 × numLabels, RGBA float)
+   - Per-label color and opacity from vtkVolumeProperty label API
+   - Mask blend factor for blending label-specific and default transfer functions
+   - Enabled via `vtkGPUVolumeRayCastMapper::SetMaskInput()` and `SetMaskTypeToLabelMap()`
 6. ~~**Clipping planes**~~ **IMPLEMENTED**
    - Up to 8 arbitrary clipping planes in volume-local [0,1] space
    - Planes transformed from world coordinates using inverse model matrix
