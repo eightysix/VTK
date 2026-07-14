@@ -1313,31 +1313,37 @@ inline float2 intersectBox(float3 orig, float3 dir, float3 boxMin, float3 boxMax
   return float2(max(max(tmin.x, tmin.y), tmin.z), min(min(tmax.x, tmax.y), tmax.z));
 }
 
-inline float4 computeGradient(texture3d<float> volTex, sampler volSamp, float3 pos, float3 gradStep, float gradNormFactor) {
-  float sPX = volTex.sample(volSamp, pos + float3(gradStep.x, 0, 0), level(0)).r;
-  float sNX = volTex.sample(volSamp, pos - float3(gradStep.x, 0, 0), level(0)).r;
-  float sPY = volTex.sample(volSamp, pos + float3(0, gradStep.y, 0), level(0)).r;
-  float sNY = volTex.sample(volSamp, pos - float3(0, gradStep.y, 0), level(0)).r;
-  float sPZ = volTex.sample(volSamp, pos + float3(0, 0, gradStep.z), level(0)).r;
-  float sNZ = volTex.sample(volSamp, pos - float3(0, 0, gradStep.z), level(0)).r;
+// Optimized: Uses `half` precision extensively and takes pre-computed offset vectors
+inline half4 computeGradientFast(texture3d<float> volTex, sampler volSamp, float3 pos,
+                                 float3 offX, float3 offY, float3 offZ, half gradNormFactor) {
+  // Fetching 6 samples is the memory bottleneck. Keep the math overhead zero.
+  half sPX = half(volTex.sample(volSamp, pos + offX, level(0)).r);
+  half sNX = half(volTex.sample(volSamp, pos - offX, level(0)).r);
+  half sPY = half(volTex.sample(volSamp, pos + offY, level(0)).r);
+  half sNY = half(volTex.sample(volSamp, pos - offY, level(0)).r);
+  half sPZ = half(volTex.sample(volSamp, pos + offZ, level(0)).r);
+  half sNZ = half(volTex.sample(volSamp, pos - offZ, level(0)).r);
 
-  float3 grad = float3(sPX - sNX, sPY - sNY, sPZ - sNZ);
-  float mag = length(grad);
-  return float4(mag > 0.0 ? grad / mag : float3(0.0), clamp(mag / max(1e-8, gradNormFactor), 0.0, 1.0));
+  half3 grad = half3(sPX - sNX, sPY - sNY, sPZ - sNZ);
+  half mag = length(grad);
+
+  // saturate() is a free hardware instruction on Apple Silicon, faster than clamp()
+  return half4(mag > 0.0h ? grad / mag : half3(0.0h), saturate(mag / gradNormFactor));
 }
 
-inline half3 computePhongLightingVolume(half3 sampleColor, float3 gradDir, float3 lightDir, float3 viewDir, half3 ambientMat, half3 diffuseMat, half3 specularMat, float shininess) {
-  float nDotL = dot(gradDir, -lightDir);
-  half3 diffuse = half3(0.0);
-  half3 specular = half3(0.0);
-
-  if (nDotL > 0.0) {
-    diffuse = half3(nDotL) * diffuseMat * sampleColor;
-    float3 r = normalize(2.0 * nDotL * gradDir + lightDir);
-    float vDotR = max(dot(r, -viewDir), 0.0);
-    specular = half3(pow(vDotR, shininess)) * specularMat;
+// Optimized: Pure FP16 math and fast::pow
+inline half3 computePhongLightingVolumeFast(half3 sampleColor, half3 normal, half3 lightDir, half3 viewDir,
+                                            half3 ambientMat, half3 diffuseMat, half3 specularMat, half shininess) {
+  half nDotL = dot(normal, -lightDir);
+  if (nDotL > 0.0h) {
+    half3 diffuse = nDotL * diffuseMat * sampleColor;
+    half3 r = normal * (2.0h * nDotL) + lightDir;
+    half vDotR = max(dot(r, -viewDir), 0.0h);
+    // fast::pow utilizes M2 hardware approximations, significantly faster than pow()
+    half3 specular = fast::pow(vDotR, shininess) * specularMat;
+    return ambientMat * sampleColor + diffuse + specular;
   }
-  return ambientMat * sampleColor + diffuse + specular;
+  return ambientMat * sampleColor;
 }
 
 // Branchless, fast crop region evaluator
@@ -1363,7 +1369,7 @@ fragment VolumeFragmentOut fragment_volume_main(
     sampler maskSampler [[sampler(4)]],
     sampler labelMapSampler [[sampler(5)]],
     sampler labelMapGradOpSampler [[sampler(6)]]) {
-  
+
   VolumeFragmentOut output;
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
   float stepSize = volumeUniforms.sampleDistance;
@@ -1371,7 +1377,7 @@ fragment VolumeFragmentOut fragment_volume_main(
   float3 rayDir = in.localPos - cameraPos;
   float dirLength = length(rayDir);
   if (dirLength < 0.0001) discard_fragment();
-  
+
   rayDir /= dirLength;
   float2 t = intersectBox(cameraPos, rayDir, float3(0.0), float3(1.0));
   float tStart = max(t.x, 0.0);
@@ -1418,188 +1424,105 @@ fragment VolumeFragmentOut fragment_volume_main(
 
   half3 accumulatedColor = half3(0.0);
   half accumulatedOpacity = 0.0;
-  half scalarRangeRcp = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
 
+  // --- PRE-COMPUTE EVERYTHING POSSIBLE OUTSIDE THE LOOP ---
   const bool doShading = volumeUniforms.useGradientShading > 0.5;
   const bool doGradOp = volumeUniforms.useGradientOpacity > 0.5;
   const bool doCropping = volumeUniforms.useCropping > 0.5;
   const bool doMask = volumeUniforms.useMask > 0.5;
 
+  // Optimize scale and bias to a single MAD (Multiply-Add) instruction later
+  half scalarScale = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
+  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+
+  // Move invariant normalizations and vectors OUTSIDE the loop (Massive FPS gain)
+  half3 viewDirHalf  = half3(normalize(entryPoint - cameraPos));
+  half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection));
+
+  float3 gradOffsetX = float3(volumeUniforms.gradientStep.x, 0.0, 0.0);
+  float3 gradOffsetY = float3(0.0, volumeUniforms.gradientStep.y, 0.0);
+  float3 gradOffsetZ = float3(0.0, 0.0, volumeUniforms.gradientStep.z);
+  half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
+
+  half3 ambientMat  = half3(volumeUniforms.ambientColor.rgb);
+  half3 diffuseMat  = half3(volumeUniforms.diffuseColor.rgb);
+  half3 specularMat = half3(volumeUniforms.specularColor.rgb);
+  half shininessMat = half(volumeUniforms.shininess);
+
   float3 cropMin = volumeUniforms.croppingPlanes.xyz;
   float3 cropMax = float3(volumeUniforms.croppingPlanes.w, volumeUniforms.croppingPlanes2.xy);
-  
-  // Collapse clipping map array lookups to a dynamic branching-free bitmask (huge performance boost on fast inner loops)
+
   uint cropBitmask = 0;
   if (doCropping) {
     float4 cropF[8] = { volumeUniforms.croppingFlagsRow0, volumeUniforms.croppingFlagsRow1, volumeUniforms.croppingFlagsRow2, volumeUniforms.croppingFlagsRow3, volumeUniforms.croppingFlagsRow4, volumeUniforms.croppingFlagsRow5, volumeUniforms.croppingFlagsRow6, volumeUniforms.croppingFlagsRow7 };
     for (int j = 0; j < 32; j++) {
-      if (cropF[j / 4][j % 4] > 0.0) {
-        cropBitmask |= (1u << j);
-      }
+      if (cropF[j / 4][j % 4] > 0.0) cropBitmask |= (1u << j);
     }
   }
 
   int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
   float currentT = jitter;
 
-  int i = 0;
-  int maxStepsEven = maxSteps & ~1;
-  
-  for (; i < maxStepsEven; i += 2) {
-    // --- Sample 1 ---
-    bool cropped1 = false;
-    if (doCropping) {
-      if ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, currentPoint))) == 0u) cropped1 = true;
+  // --- CLEAN, SINGLE-STEP LOOP (Allows AGX compiler to optimize registers) ---
+  for (int i = 0; i < maxSteps; i++) {
+
+    // Quick Crop Bailout
+    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, currentPoint))) == 0u)) {
+      currentPoint += stepVec;
+      currentT += stepSize;
+      continue;
     }
 
-    if (!cropped1) {
-      float rawScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
-      half scalarNorm = clamp(half(rawScalar - volumeUniforms.scalarMin) * scalarRangeRcp, 0.0h, 1.0h);
+    float rawScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
 
-      half4 colorOpacity;
-      half maskLabel = 0.0h;
-      if (doMask) {
-        float maskVal = maskTexture.sample(maskSampler, currentPoint, level(0)).r * volumeUniforms.maskScale + volumeUniforms.maskBias;
-        if (volumeUniforms.labelMapNumLabels > 0.0) {
-          maskLabel = half(floor(maskVal * volumeUniforms.labelMapNumLabels) / volumeUniforms.labelMapNumLabels);
-        }
-        if (maskLabel > 0.0h) {
-          colorOpacity = half4(labelMapTransferTexture.sample(labelMapSampler, float2(float(scalarNorm), float(maskLabel)), level(0)));
-        } else {
-          colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
-        }
+    // saturate() compiles to free hardware instruction
+    half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
+
+    half4 colorOpacity;
+    half maskLabel = 0.0h;
+    if (doMask) {
+      float maskVal = maskTexture.sample(maskSampler, currentPoint, level(0)).r * volumeUniforms.maskScale + volumeUniforms.maskBias;
+      if (volumeUniforms.labelMapNumLabels > 0.0) {
+        maskLabel = half(floor(maskVal * volumeUniforms.labelMapNumLabels) / volumeUniforms.labelMapNumLabels);
+      }
+      if (maskLabel > 0.0h) {
+        colorOpacity = half4(labelMapTransferTexture.sample(labelMapSampler, float2(float(scalarNorm), float(maskLabel)), level(0)));
       } else {
         colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
       }
+    } else {
+      colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+    }
 
-      half sampleOpacity = colorOpacity.a;
-      if (sampleOpacity > 0.001h) {
-        half3 sampleColor = colorOpacity.rgb;
+    half sampleOpacity = colorOpacity.a;
 
-        if (doShading && maskLabel == 0.0h) {
-          float4 grad = computeGradient(volumeTexture, volumeSampler, currentPoint, volumeUniforms.gradientStep, volumeUniforms.gradientOpacityRange.y);
-          sampleColor = computePhongLightingVolume(sampleColor, grad.xyz, normalize(volumeUniforms.lightDirection), normalize(entryPoint - cameraPos), half3(volumeUniforms.ambientColor.rgb), half3(volumeUniforms.diffuseColor.rgb), half3(volumeUniforms.specularColor.rgb), volumeUniforms.shininess);
+    if (sampleOpacity > 0.001h) {
+      half3 sampleColor = colorOpacity.rgb;
 
-          if (doGradOp) sampleOpacity *= half(gradientOpacityTexture.sample(gradientOpacitySampler, float2(float(grad.w), 0.5), level(0)).r);
+      if (doShading && maskLabel == 0.0h) {
+        // Fast FP16 gradient fetch
+        half4 grad = computeGradientFast(volumeTexture, volumeSampler, currentPoint, gradOffsetX, gradOffsetY, gradOffsetZ, gradNormFactor);
+
+        // Fast FP16 lighting calculation
+        sampleColor = computePhongLightingVolumeFast(sampleColor, grad.xyz, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
+
+        if (doGradOp) {
+          sampleOpacity *= half(gradientOpacityTexture.sample(gradientOpacitySampler, float2(float(grad.w), 0.5), level(0)).r);
         }
-
-        half w = 1.0h - accumulatedOpacity;
-        accumulatedColor += w * sampleColor * sampleOpacity;
-        accumulatedOpacity += w * sampleOpacity;
       }
+
+      half w = 1.0h - accumulatedOpacity;
+      accumulatedColor += w * sampleColor * sampleOpacity;
+      accumulatedOpacity += w * sampleOpacity;
     }
 
     currentPoint += stepVec;
     currentT += stepSize;
+
     if (accumulatedOpacity >= 0.95h || currentT >= tTerminateMax) {
       accumulatedOpacity = 1.0h;
       break;
     }
-
-    // --- Sample 2 ---
-    bool cropped2 = false;
-    if (doCropping) {
-      if ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, currentPoint))) == 0u) cropped2 = true;
-    }
-
-    if (!cropped2) {
-      float rawScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
-      half scalarNorm = clamp(half(rawScalar - volumeUniforms.scalarMin) * scalarRangeRcp, 0.0h, 1.0h);
-
-      half4 colorOpacity;
-      half maskLabel = 0.0h;
-      if (doMask) {
-        float maskVal = maskTexture.sample(maskSampler, currentPoint, level(0)).r * volumeUniforms.maskScale + volumeUniforms.maskBias;
-        if (volumeUniforms.labelMapNumLabels > 0.0) {
-          maskLabel = half(floor(maskVal * volumeUniforms.labelMapNumLabels) / volumeUniforms.labelMapNumLabels);
-        }
-        if (maskLabel > 0.0h) {
-          colorOpacity = half4(labelMapTransferTexture.sample(labelMapSampler, float2(float(scalarNorm), float(maskLabel)), level(0)));
-        } else {
-          colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
-        }
-      } else {
-        colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
-      }
-
-      half sampleOpacity = colorOpacity.a;
-      if (sampleOpacity > 0.001h) {
-        half3 sampleColor = colorOpacity.rgb;
-
-        if (doShading && maskLabel == 0.0h) {
-          float4 grad = computeGradient(volumeTexture, volumeSampler, currentPoint, volumeUniforms.gradientStep, volumeUniforms.gradientOpacityRange.y);
-          sampleColor = computePhongLightingVolume(sampleColor, grad.xyz, normalize(volumeUniforms.lightDirection), normalize(entryPoint - cameraPos), half3(volumeUniforms.ambientColor.rgb), half3(volumeUniforms.diffuseColor.rgb), half3(volumeUniforms.specularColor.rgb), volumeUniforms.shininess);
-
-          if (doGradOp) sampleOpacity *= half(gradientOpacityTexture.sample(gradientOpacitySampler, float2(float(grad.w), 0.5), level(0)).r);
-        }
-
-        half w = 1.0h - accumulatedOpacity;
-        accumulatedColor += w * sampleColor * sampleOpacity;
-        accumulatedOpacity += w * sampleOpacity;
-      }
-    }
-
-    currentPoint += stepVec;
-    currentT += stepSize;
-    if (accumulatedOpacity >= 0.95h || currentT >= tTerminateMax) {
-      accumulatedOpacity = 1.0h;
-      break;
-    }
-  }
-
-  // Handle remaining odd iterations if bound requires
-  for (; i < maxSteps; i++) {
-    bool croppedOdd = false;
-    if (doCropping) {
-      int regionNo = computeCropRegion(cropMin, cropMax, currentPoint);
-      if ((cropBitmask & (1u << regionNo)) == 0u) croppedOdd = true;
-    }
-
-    if (!croppedOdd) {
-      float rawScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
-      half scalarNorm = clamp(half(rawScalar - volumeUniforms.scalarMin) * scalarRangeRcp, 0.0h, 1.0h);
-
-      half4 colorOpacity;
-      half maskLabel = 0.0h;
-      if (doMask) {
-        float maskVal = maskTexture.sample(maskSampler, currentPoint, level(0)).r * volumeUniforms.maskScale + volumeUniforms.maskBias;
-        if (volumeUniforms.labelMapNumLabels > 0.0) {
-          maskLabel = half(floor(maskVal * volumeUniforms.labelMapNumLabels) / volumeUniforms.labelMapNumLabels);
-        }
-        if (maskLabel > 0.0h) {
-          colorOpacity = half4(labelMapTransferTexture.sample(labelMapSampler, float2(float(scalarNorm), float(maskLabel)), level(0)));
-        } else {
-          colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
-        }
-      } else {
-        colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
-      }
-
-      half sampleOpacity = colorOpacity.a;
-      if (sampleOpacity > 0.001h) {
-        half3 sampleColor = colorOpacity.rgb;
-
-        if (doShading && maskLabel == 0.0h) {
-          float4 grad = computeGradient(volumeTexture, volumeSampler, currentPoint, volumeUniforms.gradientStep, volumeUniforms.gradientOpacityRange.y);
-          sampleColor = computePhongLightingVolume(sampleColor, grad.xyz, normalize(volumeUniforms.lightDirection), normalize(entryPoint - cameraPos), half3(volumeUniforms.ambientColor.rgb), half3(volumeUniforms.diffuseColor.rgb), half3(volumeUniforms.specularColor.rgb), volumeUniforms.shininess);
-
-          if (doGradOp) {
-            sampleOpacity *= half(gradientOpacityTexture.sample(gradientOpacitySampler, float2(float(grad.w), 0.5), level(0)).r);
-          }
-        }
-
-        half w = 1.0h - accumulatedOpacity;
-        accumulatedColor += w * sampleColor * sampleOpacity;
-        accumulatedOpacity += w * sampleOpacity;
-      }
-    }
-    
-    currentT += stepSize;
-    if (accumulatedOpacity >= 0.95h || currentT >= tTerminateMax) {
-      accumulatedOpacity = 1.0h;
-      break;
-    }
-    currentPoint += stepVec;
   }
 
   output.color = float4(float3(accumulatedColor), float(accumulatedOpacity));
