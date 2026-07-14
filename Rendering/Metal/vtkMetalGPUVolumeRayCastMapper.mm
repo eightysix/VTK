@@ -415,7 +415,6 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
     CFRelease(this->VolumeTexture);
     this->VolumeTexture = nullptr;
   }
-  this->VolumeTextureView = nullptr;
 
   if (this->VolumeSampler)
   {
@@ -428,7 +427,6 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
     CFRelease(this->ColorOpacityTexture);
     this->ColorOpacityTexture = nullptr;
   }
-  this->ColorOpacityTextureView = nullptr;
 
   if (this->ColorOpacitySampler)
   {
@@ -910,7 +908,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
         {
           CFRelease(this->VolumeTexture);
           this->VolumeTexture = nullptr;
-          this->VolumeTextureView = nullptr;
         }
 
         MTLTextureDescriptor* texDesc = [[MTLTextureDescriptor alloc] init];
@@ -931,7 +928,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
         }
         this->VolumeTexture = (__bridge void*)tex;
         CFRetain((__bridge CFTypeRef)tex);
-        this->VolumeTextureView = this->VolumeTexture;
       }
 
       int actualComponents = (numComponents == 3) ? 4 : numComponents;
@@ -1038,7 +1034,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
         {
           CFRelease(this->ColorOpacityTexture);
           this->ColorOpacityTexture = nullptr;
-          this->ColorOpacityTextureView = nullptr;
         }
 
         MTLTextureDescriptor* tfDesc = [[MTLTextureDescriptor alloc] init];
@@ -1058,7 +1053,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
         }
         this->ColorOpacityTexture = (__bridge void*)tex;
         CFRetain((__bridge CFTypeRef)tex);
-        this->ColorOpacityTextureView = this->ColorOpacityTexture;
       }
 
       MTLRegion region = MTLRegionMake2D(0, 0, 256, 1);
@@ -1218,12 +1212,39 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMaskTexture(
       vtkIdType numTuples = arr->GetNumberOfTuples();
       std::vector<float> maskData(numTuples * numComponents);
 
-      for (vtkIdType i = 0; i < numTuples; ++i)
+      // Use direct pointer access for common types to avoid virtual dispatch overhead
+      int dataType = arr->GetDataType();
+      if (dataType == VTK_UNSIGNED_CHAR && numComponents == 1)
       {
-        for (int c = 0; c < numComponents; ++c)
+        const unsigned char* src = static_cast<const unsigned char*>(arr->GetVoidPointer(0));
+        vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+          for (vtkIdType i = begin; i < end; ++i)
+            maskData[i] = static_cast<float>(src[i]);
+        });
+      }
+      else if (dataType == VTK_UNSIGNED_SHORT && numComponents == 1)
+      {
+        const unsigned short* src = static_cast<const unsigned short*>(arr->GetVoidPointer(0));
+        vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+          for (vtkIdType i = begin; i < end; ++i)
+            maskData[i] = static_cast<float>(src[i]);
+        });
+      }
+      else if (dataType == VTK_FLOAT && numComponents == 1)
+      {
+        const float* src = static_cast<const float*>(arr->GetVoidPointer(0));
+        std::memcpy(maskData.data(), src, numTuples * sizeof(float));
+      }
+      else
+      {
+        // Generic fallback using GetComponent
+        for (vtkIdType i = 0; i < numTuples; ++i)
         {
-          double val = arr->GetComponent(i, c);
-          maskData[i * numComponents + c] = static_cast<float>(val);
+          for (int c = 0; c < numComponents; ++c)
+          {
+            double val = arr->GetComponent(i, c);
+            maskData[i * numComponents + c] = static_cast<float>(val);
+          }
         }
       }
 
@@ -1387,7 +1408,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateLabelMapTransferTexture(
       id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->LabelMapTransferTexture;
       id<MTLTexture> tex = nil;
 
-      if (oldTex)
+      // Check if existing texture has the right dimensions (numLabels may have changed)
+      if (oldTex && static_cast<int>(oldTex.width) == tfWidth &&
+          static_cast<int>(oldTex.height) == tfHeight)
       {
         tex = oldTex;
       }
@@ -1587,13 +1610,14 @@ void vtkMetalGPUVolumeRayCastMapper::SortBlocksBackToFront(
   }
 
   // Initialize sorted order
+  this->SortedBlockOrder.resize(this->Blocks.size());
   for (size_t i = 0; i < this->Blocks.size(); ++i)
   {
     this->SortedBlockOrder[i] = static_cast<int>(i);
   }
 
   // Sort by distance to camera (farthest first = back-to-front)
-  std::sort(this->SortedBlockOrder, this->SortedBlockOrder + this->Blocks.size(),
+  std::sort(this->SortedBlockOrder.begin(), this->SortedBlockOrder.end(),
     [&](int a, int b) {
       double da = (this->Blocks[a].Center[0] - camPos[0]) * camDir[0] +
         (this->Blocks[a].Center[1] - camPos[1]) * camDir[1] +
@@ -1834,9 +1858,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
     int actualComponents = (numComponents == 3) ? 4 : numComponents;
     size_t bytesPerVoxel = static_cast<size_t>(bytesPerComponent) * actualComponents;
 
-    // Release old per-block textures
-    this->ClearBlocks();
-
     // Create a 3D texture for each block
     for (size_t idx = 0; idx < this->Blocks.size(); ++idx)
     {
@@ -1888,14 +1909,18 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       // We need to extract the sub-volume from the full array with strided access
       std::vector<uint8_t> blockData(static_cast<size_t>(blockTotalBytes));
 
+      // Cast dimensions to vtkIdType to prevent integer overflow for large volumes
+      vtkIdType fd0 = fullDims[0];
+      vtkIdType fd1 = fullDims[1];
+
       for (int k = 0; k < bDims[2]; ++k)
       {
         for (int j = 0; j < bDims[1]; ++j)
         {
           // Source index in the full volume: (ext0+k) * fullDims[1] * fullDims[0] + (ext2+j) * fullDims[0] + ext0
           vtkIdType srcTuple =
-            static_cast<vtkIdType>(block.Extents[4] + k) * fullDims[1] * fullDims[0] +
-            static_cast<vtkIdType>(block.Extents[2] + j) * fullDims[0] +
+            static_cast<vtkIdType>(block.Extents[4] + k) * fd1 * fd0 +
+            static_cast<vtkIdType>(block.Extents[2] + j) * fd0 +
             block.Extents[0];
           size_t dstOffset =
             static_cast<size_t>(k) * blockBytesPerImage + static_cast<size_t>(j) * blockBytesPerRow;
@@ -2496,7 +2521,6 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       samplerDesc.rAddressMode = MTLSamplerAddressModeClampToEdge;
       samplerDesc.magFilter = MTLSamplerMinMagFilterLinear;
       samplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
-      samplerDesc.mipFilter = MTLSamplerMipFilterLinear;
       id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:samplerDesc];
       this->VolumeSampler = (__bridge void*)sampler;
       CFRetain((__bridge CFTypeRef)sampler);

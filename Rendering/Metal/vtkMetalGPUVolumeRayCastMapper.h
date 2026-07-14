@@ -68,11 +68,9 @@ private:
   // Metal pipeline objects (stored as void* to avoid Obj-C in header)
   void* PipelineState = nullptr;         // id<MTLRenderPipelineState>
   void* VolumeTexture = nullptr;         // id<MTLTexture>  (3D)
-  void* VolumeTextureView = nullptr;     // id<MTLTexture>  (alias, same object)
   void* VolumeSampler = nullptr;         // id<MTLSamplerState>
 
   void* ColorOpacityTexture = nullptr;   // id<MTLTexture>  (2D)
-  void* ColorOpacityTextureView = nullptr; // id<MTLTexture>  (alias)
   void* ColorOpacitySampler = nullptr;   // id<MTLSamplerState>
   void* GradientOpacityTexture = nullptr; // id<MTLTexture> (256x1 RGBA8Unorm)
   void* GradientOpacitySampler = nullptr; // id<MTLSamplerState>
@@ -156,7 +154,7 @@ private:
 
   unsigned short Partitions[3] = { 1, 1, 1 };
   std::vector<VolumeBlock> Blocks;
-  int SortedBlockOrder[64] = {}; // indices into Blocks, sorted back-to-front (max 64 blocks)
+  std::vector<int> SortedBlockOrder; // indices into Blocks, sorted back-to-front
 
   void ClearBlocks();
   void SortBlocksBackToFront(vtkRenderer* ren, vtkVolume* vol);
