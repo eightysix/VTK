@@ -1,0 +1,86 @@
+CompileFlags:
+  Add:
+    # iOS SDK
+    - -isysroot
+    - /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk
+    # Target arm64 iOS (matches ios_metal_build.sh)
+    - -target
+    - arm64-apple-ios16.0
+    # C++17 (matches VTK's cmake CMAKE_CXX_STANDARD=17)
+    - -std=gnu++17
+    # Force-include preamble so standalone headers have Foundation/UIKit/Metal types
+    - -include
+    - .clangd_preamble.h
+    # VTK installed headers
+    - -Ibuild_ios_metal/install/include/vtk-9.6
+    # VTK source module headers
+    - -ICommon/Core
+    - -ICommon/DataModel
+    - -ICommon/ExecutionModel
+    - -ICommon/Math
+    - -ICommon/Misc
+    - -ICommon/System
+    - -ICommon/Transforms
+    - -ICommon/Color
+    - -ICommon/ComputationalGeometry
+    - -ICommon/Archive
+    - -ICommon/Cache
+    - -IFilters/Core
+    - -IFilters/Sources
+    - -IFilters/General
+    - -IFilters/Geometry
+    - -IFilters/Points
+    - -IRendering/Core
+    - -IRendering/Metal
+    - -IRendering/OpenGL2
+    - -IRendering/SceneGraph
+    - -IRendering/UI
+    - -IRendering/Volume
+    - -IRendering/Annotation
+    - -IRendering/FreeType
+    - -IRendering/Label
+    - -IRendering/Image
+    - -IGUISupport
+    - -IDomains/General
+    - -IDomains/Imaging
+    - -IIO/Core
+    - -IIO/Image
+    - -IIO/Geometry
+    - -IIO/Import
+    - -IIO/Misc
+    - -IIO/XML
+    - -IInteraction/Style
+    - -IInteraction/Widgets
+    - -ICharts/Core
+    - -ITk
+
+---
+# .mm: Objective-C++ (VTK Metal, iOS examples, Cocoa)
+If:
+  PathMatch: .*\.mm$
+CompileFlags:
+  Add:
+    - -x
+    - objective-c++
+    - -std=gnu++17
+    - -fobjc-arc
+
+---
+# .m: Objective-C
+If:
+  PathMatch: .*\.m$
+CompileFlags:
+  Add:
+    - -x
+    - objective-c
+    - -fobjc-arc
+
+---
+# pure C++ files
+If:
+  PathMatch: .*\.(cpp|hpp|cxx|cc|c)$
+CompileFlags:
+  Add:
+    - -x
+    - c++
+    - -std=gnu++17
