@@ -2204,6 +2204,18 @@ struct VolumeMapperUniforms {
   float shininess;            // specular power
   float3 lightDirection;      // unit vector toward light in volume-local [0,1] space
   float _pad2;
+  // Cropping regions
+  float4 croppingPlanes;       // (minX, maxX, minY, maxY) in [0,1] volume space
+  float4 croppingPlanes2;      // (minZ, maxZ, 0, 0)
+  float4 croppingFlagsRow0;    // flags[0..3] as float
+  float4 croppingFlagsRow1;    // flags[4..7]
+  float4 croppingFlagsRow2;    // flags[8..11]
+  float4 croppingFlagsRow3;    // flags[12..15]
+  float4 croppingFlagsRow4;    // flags[16..19]
+  float4 croppingFlagsRow5;    // flags[20..23]
+  float4 croppingFlagsRow6;    // flags[24..27]
+  float4 croppingFlagsRow7;    // flags[28..31]
+  float useCropping;           // 1.0 = enable cropping, 0.0 = disable
 };
 
 struct VolumeVertexOut {
@@ -2305,6 +2317,28 @@ inline half3 computePhongLighting(
   return ambientMat * sampleColor + diffuse + specular;
 }
 
+// ---------------------------------------------------------------------------
+// Cropping region helpers
+// ---------------------------------------------------------------------------
+
+// Determine which of 3 regions (1=below, 2=between, 3=above) a position
+// falls in along a single axis.
+inline int computeRegionCoord(float cpMin, float cpMax, float pos) {
+  if (pos < cpMin) return 1;
+  else if (pos < cpMax) return 2;
+  else return 3;
+}
+
+// Compute the 32-region index from a position and 6 cropping planes
+// (3 pairs of min/max for X, Y, Z axes). The formula matches the OpenGL
+// reference: index = rx + (ry-1)*3 + (rz-1)*9.
+inline int computeCropRegion(float3 cropMin, float3 cropMax, float3 pos) {
+  int rx = computeRegionCoord(cropMin.x, cropMax.x, pos.x);
+  int ry = computeRegionCoord(cropMin.y, cropMax.y, pos.y);
+  int rz = computeRegionCoord(cropMin.z, cropMax.z, pos.z);
+  return (rx) + (ry - 1) * 3 + (rz - 1) * 9;
+}
+
 fragment VolumeFragmentOut fragment_volume_main(
     VolumeVertexOut in [[stage_in]],
     constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
@@ -2400,12 +2434,38 @@ fragment VolumeFragmentOut fragment_volume_main(
   // Track ray distance for depth buffer occlusion early termination
   float currentT = jitter;
 
+  // Cropping precomputation (done once, outside the loop)
+  const bool doCropping = volumeUniforms.useCropping > 0.5;
+  float3 cropMin = volumeUniforms.croppingPlanes.xyz;
+  float3 cropMax = float3(volumeUniforms.croppingPlanes.w,
+                           volumeUniforms.croppingPlanes2.xy);
+
   // Process 2 samples per iteration to halve loop overhead and improve
   // instruction-level parallelism.
   int i = 0;
   int maxStepsEven = maxSteps & ~1;
   for (; i < maxStepsEven; i += 2) {
       // --- Sample 1 ---
+      // Cropping: skip samples in disabled regions
+      bool cropped1 = false;
+      if (doCropping) {
+        int regionNo = computeCropRegion(cropMin, cropMax, currentPoint);
+        int rowIdx = regionNo / 4;
+        int colIdx = regionNo % 4;
+        float4 flagRow;
+        if (rowIdx == 0) flagRow = volumeUniforms.croppingFlagsRow0;
+        else if (rowIdx == 1) flagRow = volumeUniforms.croppingFlagsRow1;
+        else if (rowIdx == 2) flagRow = volumeUniforms.croppingFlagsRow2;
+        else if (rowIdx == 3) flagRow = volumeUniforms.croppingFlagsRow3;
+        else if (rowIdx == 4) flagRow = volumeUniforms.croppingFlagsRow4;
+        else if (rowIdx == 5) flagRow = volumeUniforms.croppingFlagsRow5;
+        else if (rowIdx == 6) flagRow = volumeUniforms.croppingFlagsRow6;
+        else flagRow = volumeUniforms.croppingFlagsRow7;
+        if (int(flagRow[colIdx]) == 0) {
+          cropped1 = true;
+        }
+      }
+      if (!cropped1) {
       float rawScalar1 = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
       half scalarNorm1 = clamp(
         half(rawScalar1 - volumeUniforms.scalarMin) * scalarRangeRcp,
@@ -2435,11 +2495,32 @@ fragment VolumeFragmentOut fragment_volume_main(
         accumulatedColor += w1 * sampleColor1 * sampleOpacity1;
         accumulatedOpacity += w1 * sampleOpacity1;
       }
+      } // !cropped1
 
       currentPoint += stepVec;
       currentT += stepSize;
 
       // --- Sample 2 ---
+      // Cropping: skip samples in disabled regions
+      bool cropped2 = false;
+      if (doCropping) {
+        int regionNo2 = computeCropRegion(cropMin, cropMax, currentPoint);
+        int rowIdx2 = regionNo2 / 4;
+        int colIdx2 = regionNo2 % 4;
+        float4 flagRow2;
+        if (rowIdx2 == 0) flagRow2 = volumeUniforms.croppingFlagsRow0;
+        else if (rowIdx2 == 1) flagRow2 = volumeUniforms.croppingFlagsRow1;
+        else if (rowIdx2 == 2) flagRow2 = volumeUniforms.croppingFlagsRow2;
+        else if (rowIdx2 == 3) flagRow2 = volumeUniforms.croppingFlagsRow3;
+        else if (rowIdx2 == 4) flagRow2 = volumeUniforms.croppingFlagsRow4;
+        else if (rowIdx2 == 5) flagRow2 = volumeUniforms.croppingFlagsRow5;
+        else if (rowIdx2 == 6) flagRow2 = volumeUniforms.croppingFlagsRow6;
+        else flagRow2 = volumeUniforms.croppingFlagsRow7;
+        if (int(flagRow2[colIdx2]) == 0) {
+          cropped2 = true;
+        }
+      }
+      if (!cropped2) {
       float rawScalar2 = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
       half scalarNorm2 = clamp(
         half(rawScalar2 - volumeUniforms.scalarMin) * scalarRangeRcp,
@@ -2469,6 +2550,7 @@ fragment VolumeFragmentOut fragment_volume_main(
         accumulatedColor += w2 * sampleColor2 * sampleOpacity2;
         accumulatedOpacity += w2 * sampleOpacity2;
       }
+      } // !cropped2
 
       currentPoint += stepVec;
       currentT += stepSize;
@@ -2481,6 +2563,26 @@ fragment VolumeFragmentOut fragment_volume_main(
 
     // Handle odd remaining step
     for (; i < maxSteps; i++) {
+      // Cropping: skip samples in disabled regions
+      bool croppedOdd = false;
+      if (doCropping) {
+        int regionNoO = computeCropRegion(cropMin, cropMax, currentPoint);
+        int rowIdxO = regionNoO / 4;
+        int colIdxO = regionNoO % 4;
+        float4 flagRowO;
+        if (rowIdxO == 0) flagRowO = volumeUniforms.croppingFlagsRow0;
+        else if (rowIdxO == 1) flagRowO = volumeUniforms.croppingFlagsRow1;
+        else if (rowIdxO == 2) flagRowO = volumeUniforms.croppingFlagsRow2;
+        else if (rowIdxO == 3) flagRowO = volumeUniforms.croppingFlagsRow3;
+        else if (rowIdxO == 4) flagRowO = volumeUniforms.croppingFlagsRow4;
+        else if (rowIdxO == 5) flagRowO = volumeUniforms.croppingFlagsRow5;
+        else if (rowIdxO == 6) flagRowO = volumeUniforms.croppingFlagsRow6;
+        else flagRowO = volumeUniforms.croppingFlagsRow7;
+        if (int(flagRowO[colIdxO]) == 0) {
+          croppedOdd = true;
+        }
+      }
+      if (!croppedOdd) {
       float rawScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
       half scalarNorm = clamp(
         half(rawScalar - volumeUniforms.scalarMin) * scalarRangeRcp,
@@ -2510,6 +2612,7 @@ fragment VolumeFragmentOut fragment_volume_main(
         accumulatedColor += w * sampleColor * sampleOpacity;
         accumulatedOpacity += w * sampleOpacity;
       }
+      } // !croppedOdd
 
       currentT += stepSize;
 

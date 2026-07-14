@@ -17,7 +17,7 @@ Status as of 2026-07-13. Compares `vtkMetalGPUVolumeRayCastMapper` against
 | **Near-plane bounding box clipping** | Yes | **Yes** | Clips box geometry when camera is inside volume; fewer wasted fragments |
 | **Gradient-based Phong shading** | Yes | **Yes** | Central-difference normals for lighting; visual quality, not perf |
 | **Gradient opacity** (1D gradient opacity) | Yes | **Yes** | Uses gradient magnitude for edge/feature highlighting |
-| **Cropping regions** (32-region mask) | Yes | No | Interactive ROI without data copy |
+| **Cropping regions** (32-region mask) | Yes | **Yes** | Interactive ROI without data copy |
 | **Clipping planes** (up to 8 arbitrary) | Yes | No | Cuts volume with arbitrary planes |
 | **Multi-volume compositing** | Yes | No | Simultaneous rendering of multiple volumes |
 | **Mask / label map** | Yes | No | Binary mask and label map with 2D TFs |
@@ -25,7 +25,7 @@ Status as of 2026-07-13. Compares `vtkMetalGPUVolumeRayCastMapper` against
 
 ## Summary
 
-The Metal mapper now has nine features matching or exceeding the OpenGL path:
+The Metal mapper now has ten features matching or exceeding the OpenGL path:
 1. **Double-stepped sampling** exploiting Apple Silicon's half-precision ALU
 2. **Adaptive sample distance** — dynamically adjusts step count frame-to-frame
 3. **Image-space downsampling** — renders at reduced resolution during interaction
@@ -35,6 +35,7 @@ The Metal mapper now has nine features matching or exceeding the OpenGL path:
 7. **Near-plane clipping** — clips bounding box geometry against near plane when camera is inside
 8. **Gradient-based Phong shading** — central-difference normals for headlight Phong lighting
 9. **Gradient opacity** — 1D gradient opacity transfer function for edge/feature highlighting
+10. **Cropping regions** — 32-region orthogonal crop mask for interactive ROI
 
 However, the OpenGL mapper retains several high-impact adaptive features that
 the Metal path is missing entirely:
@@ -51,7 +52,11 @@ None remaining.
    - 1D gradient opacity transfer function support
    - Enabled via `vtkVolumeProperty::SetShade(1)` and `SetGradientOpacity()`
 
-2. **Cropping regions** — Interactive 32-region crop without re-uploading data.
+2. ~~**Cropping regions**~~ **IMPLEMENTED**
+   - 32-region orthogonal crop mask passed as float4-packed uniforms
+   - Fragment shader skips samples in disabled regions before texture fetch
+   - Planes clamped to volume bounds and converted to [0,1] volume-local space
+   - Enabled via `vtkVolumeMapper::SetCropping(1)` and `SetCroppingRegionPlanes()`
 
 ### Low priority gaps (specialized use cases)
 
@@ -82,3 +87,8 @@ For maximum performance improvement with minimum effort:
    - Headlight Phong lighting model (ambient + diffuse + specular)
    - 1D gradient opacity transfer function via 256x1 lookup texture
    - Per-block gradient step computation for partitioned volumes
+
+5. ~~**Cropping regions** (Low effort, Medium impact)~~ **IMPLEMENTED**
+   - 32-region crop mask decoded from CroppingRegionFlags bitmask
+   - Planes converted from world to [0,1] volume-local space
+   - Fragment shader skips texture fetch for disabled regions

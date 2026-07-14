@@ -75,10 +75,23 @@ struct VolumeMapperUniforms
   float LightDirection[3];          // 448..459
   float _padLight;                  // 460..463  (Metal: float3 = 16 bytes)
   float _padEnd[4];                 // 464..479  (trailing pad to 480)
+  // Cropping regions (new)
+  float CroppingPlanes[4];          // 480..495  (minX, maxX, minY, maxY)
+  float CroppingPlanes2[4];         // 496..511  (minZ, maxZ, 0, 0)
+  float CroppingFlagsRow0[4];       // 512..527
+  float CroppingFlagsRow1[4];       // 528..543
+  float CroppingFlagsRow2[4];       // 544..559
+  float CroppingFlagsRow3[4];       // 560..575
+  float CroppingFlagsRow4[4];       // 576..591
+  float CroppingFlagsRow5[4];       // 592..607
+  float CroppingFlagsRow6[4];       // 608..623
+  float CroppingFlagsRow7[4];       // 624..639
+  float UseCropping;                // 640
+  float _padCropping[3];            // 644..655
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 480,
-  "VolumeMapperUniforms must be 480 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 656,
+  "VolumeMapperUniforms must be 656 bytes to match Metal shader struct");
 
 namespace
 {
@@ -2325,6 +2338,69 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     uniforms.LightDirection[0] = static_cast<float>(camDirLocal[0]);
     uniforms.LightDirection[1] = static_cast<float>(camDirLocal[1]);
     uniforms.LightDirection[2] = static_cast<float>(camDirLocal[2]);
+  }
+
+  // Cropping regions
+  if (this->GetCropping())
+  {
+    uniforms.UseCropping = 1.0f;
+
+    double croppingRegionPlanes[6];
+    this->GetCroppingRegionPlanes(croppingRegionPlanes);
+
+    // Clamp to loaded bounds (same as OpenGL mapper)
+    for (int i = 0; i < 3; ++i)
+    {
+      int minIdx = i * 2;
+      int maxIdx = i * 2 + 1;
+      croppingRegionPlanes[minIdx] =
+        std::max(croppingRegionPlanes[minIdx], modelBounds[minIdx]);
+      croppingRegionPlanes[minIdx] =
+        std::min(croppingRegionPlanes[minIdx], modelBounds[maxIdx]);
+      croppingRegionPlanes[maxIdx] =
+        std::max(croppingRegionPlanes[maxIdx], modelBounds[minIdx]);
+      croppingRegionPlanes[maxIdx] =
+        std::min(croppingRegionPlanes[maxIdx], modelBounds[maxIdx]);
+    }
+
+    // Convert from world coordinates to volume-local [0,1] space
+    // using the same normalization as CameraVolumePos
+    uniforms.CroppingPlanes[0] =
+      static_cast<float>((croppingRegionPlanes[0] - modelBounds[0]) / boundsSize[0]);
+    uniforms.CroppingPlanes[1] =
+      static_cast<float>((croppingRegionPlanes[1] - modelBounds[0]) / boundsSize[0]);
+    uniforms.CroppingPlanes[2] =
+      static_cast<float>((croppingRegionPlanes[2] - modelBounds[2]) / boundsSize[1]);
+    uniforms.CroppingPlanes[3] =
+      static_cast<float>((croppingRegionPlanes[3] - modelBounds[2]) / boundsSize[1]);
+    uniforms.CroppingPlanes2[0] =
+      static_cast<float>((croppingRegionPlanes[4] - modelBounds[4]) / boundsSize[2]);
+    uniforms.CroppingPlanes2[1] =
+      static_cast<float>((croppingRegionPlanes[5] - modelBounds[4]) / boundsSize[2]);
+    uniforms.CroppingPlanes2[2] = 0.0f;
+    uniforms.CroppingPlanes2[3] = 0.0f;
+
+    // Decode CroppingRegionFlags bitmask into 32-element array
+    int cropFlags = this->GetCroppingRegionFlags();
+    float flagsArray[32] = {};
+    flagsArray[0] = 0; // region 0 is always 0
+    for (int fi = 1; fi < 32; ++fi)
+    {
+      flagsArray[fi] = static_cast<float>(cropFlags & 1);
+      cropFlags >>= 1;
+    }
+
+    // Pack into float4 rows
+    for (int r = 0; r < 8; ++r)
+    {
+      float row[4] = { flagsArray[r * 4], flagsArray[r * 4 + 1], flagsArray[r * 4 + 2],
+        flagsArray[r * 4 + 3] };
+      memcpy(&uniforms.CroppingFlagsRow0 + r, row, sizeof(row));
+    }
+  }
+  else
+  {
+    uniforms.UseCropping = 0.0f;
   }
 
   // Viewport size for depth texture UV computation in the shader
