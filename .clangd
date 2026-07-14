@@ -19,7 +19,6 @@ CompileFlags:
     - -x
     - objective-c++
     - -std=gnu++17
-    - -fobjc-arc
 
 ---
 # .m: Objective-C
@@ -29,7 +28,6 @@ CompileFlags:
   Add:
     - -x
     - objective-c
-    - -fobjc-arc
 
 ---
 # pure C++ files
