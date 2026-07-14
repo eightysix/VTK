@@ -21,18 +21,18 @@ struct SceneUniforms {
   float pointSize;
 };
 
-// Coincident topology offset (P1-5) — separate uniform buffer
+// Coincident topology offset (P1-5)
 struct CoincidentOffsetUniforms {
-  float polygonFactor;         // slope-scale factor for polygons
-  float polygonOffset;         // constant offset for polygons
-  float lineFactor;            // slope-scale factor for lines
-  float lineOffset;            // constant offset for lines
-  float pointOffset;           // constant offset for points
+  float polygonFactor;
+  float polygonOffset;
+  float lineFactor;
+  float lineOffset;
+  float pointOffset;
 };
 
-// Vertex color override (P1-4) — used when vertex visibility is on
+// Vertex color override (P1-4)
 struct VertexColorUniforms {
-  float4 color;                // vertex color (rgb + alpha)
+  float4 color;
 };
 
 // Clipping planes (P1-6)
@@ -41,7 +41,7 @@ struct ClipPlaneUniforms {
   int numClipPlanes;
 };
 
-// Cell ID offset (P2-7) — for homogeneous cell size variants
+// Cell ID offset (P2-7)
 struct CellIdOffsetUniform {
   uint offset;                 // added to instance_id to get global cell ID
 };
@@ -84,17 +84,81 @@ struct VertexOut {
   float3 viewNormal;
   float4 vertexColor;    // P1-1A: per-vertex color from scalar mapping
   float2 uv;             // P5-5A: texture coordinates
-  float4 clipDistances;  // P1-6: clip plane distances (x,y,z,w for planes 0-3)
+  float3 modelPos;       // Optimized 6-plane clip validation
   uint cellId;           // P2-8: flat-interpolated cell ID (1-based, 0=background)
   uint propId;           // P2-8: flat-interpolated prop ID (1-based, 0=background)
 };
 
-// Fragment output with explicit depth — needed for coincident topology offset
+// Fragment output with explicit depth
 struct FragmentOutput {
   float4 color [[color(0)]];
-  uint4 ids [[color(1)]];   // P2-8: {cell, prop, composite, process} IDs
+  uint4 ids [[color(1)]];
   float depth [[depth(any)]];
 };
+
+
+// ---------------------------------------------------------------------------
+// Shared Shader Helper Functions
+// ---------------------------------------------------------------------------
+
+// Check clipping dynamically to support full 6 planes without bloating Varyings
+inline bool isClipped(float3 modelPos, constant ClipPlaneUniforms& clipPlanes) {
+  if (clipPlanes.numClipPlanes > 0) {
+    for (int i = 0; i < clipPlanes.numClipPlanes && i < 6; ++i) {
+      if (dot(float4(modelPos, 1.0), clipPlanes.planes[i]) < 0.0) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Unified fast lighting calculation preventing duplicated loops / logic across fragments
+inline void computePhongLighting(
+    float3 N, float3 viewPos, float3 diffuseColor, float3 specularColor, 
+    float specularIntensity, float specularPower,
+    constant LightUniforms& lights,
+    thread float3& totalDiffuse, thread float3& totalSpecular) {
+  
+  float3 viewDir = normalize(-viewPos);
+  
+  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
+    Light L = lights.lights[i];
+    int lightType = int(L.position.w);
+    float3 lightColor = L.color.rgb * L.color.w;
+    float attenuation = 1.0;
+    float3 toLight;
+    
+    if (lightType == 0) { // Headlight
+      toLight = float3(0.0, 0.0, 1.0);
+    } else if (lightType == 1) { // Directional
+      toLight = normalize(-L.direction.xyz);
+    } else { // Point / Spot
+      toLight = L.position.xyz - viewPos;
+      float dist = length(toLight);
+      toLight = dist > 0.00001 ? toLight / dist : float3(0,0,1);
+      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
+      
+      if (lightType == 3) { // Spot specifics
+        float spotCos = dot(-toLight, normalize(L.direction.xyz));
+        float spotCutoff = cos(L.direction.w * (M_PI_F / 180.0));
+        attenuation *= select(0.0f, pow(max(spotCos, 0.0f), L.attenuation.w), spotCos > spotCutoff);
+      }
+    }
+
+    float NdotL = max(dot(N, toLight), 0.0);
+    float df = (lightType == 0) ? max(N.z, 0.000001f) : NdotL;
+    
+    totalDiffuse += df * diffuseColor * lightColor * attenuation;
+    
+    // Only calculate reflect direction / specular if illuminated and valid specular intensity
+    if (NdotL > 0.0 && specularIntensity > 0.0) {
+      float3 reflDir = reflect(-toLight, N);
+      float sf = pow(max(dot(viewDir, reflDir), 0.0), specularPower);
+      totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Vertex shader
@@ -112,25 +176,11 @@ vertex VertexOut vertex_main(uint vertex_id [[vertex_id]],
   float4 worldPos = scene.modelMatrix * float4(in.position, 1.0);
   float4 viewPos = scene.viewMatrix * worldPos;
   out.viewPos = viewPos.xyz;
-
   out.position = scene.projectionMatrix * viewPos;
-
   out.viewNormal = scene.normalMatrix * in.normal;
-
-  // P1-1A: per-vertex color from scalar mapping
   out.vertexColor = vertexColors[vertex_id];
-
-  // P5-5A: texture coordinates
   out.uv = triangleUVs[vertex_id];
-
-  // P1-6: compute clip distances for up to 4 planes
-  out.clipDistances = float4(
-    dot(float4(in.position, 1.0), clipPlanes.planes[0]),
-    dot(float4(in.position, 1.0), clipPlanes.planes[1]),
-    dot(float4(in.position, 1.0), clipPlanes.planes[2]),
-    dot(float4(in.position, 1.0), clipPlanes.planes[3]));
-
-  // P2-8: picking IDs (already 1-based from compute kernel)
+  out.modelPos = in.position; // Direct pass for unbounded planes evaluation
   out.cellId = cellIds[vertex_id];
   out.propId = propId + 1u;
 
@@ -138,8 +188,7 @@ vertex VertexOut vertex_main(uint vertex_id [[vertex_id]],
 }
 
 // ---------------------------------------------------------------------------
-// Fragment shader — Phong lighting matching WebGPU backend
-// Includes coincident topology offset (P1-5).
+// Fragment shader
 // ---------------------------------------------------------------------------
 fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
                               constant MaterialUniforms& material [[buffer(0)]],
@@ -149,15 +198,10 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
                               constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
                               texture2d<float> actorTexture [[texture(0)]],
                               sampler actorSampler [[sampler(0)]]) {
-  // P1-6: discard fragments outside clip planes
-  if (clipPlanes.numClipPlanes > 0 && in.clipDistances.x < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 1 && in.clipDistances.y < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 2 && in.clipDistances.z < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 3 && in.clipDistances.w < 0.0) discard_fragment();
+  if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
 
   float3 N = normalize(in.viewNormal);
 
-  // P1-1A: per-vertex color overrides material colors when active (bit 8)
   bool hasVertexColors = (scene.flags & (1u << 8)) != 0u;
   float3 ambientColor = hasVertexColors ? in.vertexColor.rgb : material.ambientColor.rgb;
   float ambientIntensity = material.ambientColor.w;
@@ -167,7 +211,6 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
   float specularIntensity = material.specularColor.w;
   float baseOpacity = hasVertexColors ? in.vertexColor.a : material.opacity;
 
-  // P5-5A: texture sampling — when bit 9 is set, multiply colors by texture sample
   bool hasTexture = (scene.flags & (1u << 9)) != 0u;
   if (hasTexture) {
     float4 texColor = actorTexture.sample(actorSampler, in.uv);
@@ -180,72 +223,17 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
-  float3 viewDir = normalize(-in.viewPos);
-
-  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
-    Light L = lights.lights[i];
-    int lightType = int(L.position.w);
-    float3 lightColor = L.color.rgb * L.color.w;
-    float attenuation = 1.0;
-    float df = 0.0;
-    float3 reflDir = float3(0.0);
-    float3 toLight = float3(0.0);
-
-    if (lightType == 0) {
-      // Headlight — matches WebGPU: df = max(0.000001, normal_VC.z)
-      toLight = float3(0.0, 0.0, 1.0);
-      df = max(N.z, 0.000001);
-      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
-    } else if (lightType == 1) {
-      // Directional
-      toLight = normalize(-L.direction.xyz);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(L.direction.xyz, N);
-    } else {
-      // Point or spot
-      toLight = L.position.xyz - in.viewPos;
-      float dist = length(toLight);
-      toLight /= dist;
-      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(-toLight, N);
-
-      if (lightType == 3) {
-        float3 spotDir = normalize(L.direction.xyz);
-        float spotCos = dot(-toLight, spotDir);
-        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
-        if (spotCos > spotCutoff) {
-          attenuation *= pow(spotCos, L.attenuation.w);
-        } else {
-          attenuation = 0.0;
-        }
-      }
-    }
-
-    totalDiffuse += df * diffuseColor * lightColor * attenuation;
-
-    float NdotL = max(dot(N, toLight), 0.0);
-    if (NdotL > 0.0) {
-      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
-      totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
-    }
-  }
+  computePhongLighting(N, in.viewPos, diffuseColor, specularColor, specularIntensity, material.specularPower, lights, totalDiffuse, totalSpecular);
 
   FragmentOutput out;
   out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, baseOpacity);
-  out.ids = uint4(in.cellId, in.propId, 1u, 0u);  // P2-8: {cell, prop, composite=1, process=0}
-  // Coincident topology offset for polygons — matches WebGPU
-  float c_factor = coinOffset.polygonFactor;
-  float c_offset = coinOffset.polygonOffset;
+  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
+  
   float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
-  out.depth = in.position.z + c_factor * cscale + c_offset / 65000.0;
+  out.depth = in.position.z + coinOffset.polygonFactor * cscale + coinOffset.polygonOffset / 65000.0;
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// P2-2B: Edge fragment shader — outputs flat edge color from uniform buffer
-// Used for wireframe overlay when edge visibility is on.
-// ---------------------------------------------------------------------------
 fragment FragmentOutput fragment_edge_main(VertexOut in [[stage_in]],
                                    constant MaterialUniforms& material [[buffer(0)]],
                                    constant LightUniforms& lights [[buffer(1)]],
@@ -253,39 +241,30 @@ fragment FragmentOutput fragment_edge_main(VertexOut in [[stage_in]],
                                    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
                                    constant float4& edgeColor [[buffer(4)]]) {
   FragmentOutput out;
-
-  // Output flat edge color with full opacity
   out.color = float4(edgeColor.rgb, edgeColor.a * material.opacity);
   out.ids = uint4(in.cellId, in.propId, 1u, 0u);
 
-  // Coincident topology offset for lines — push edges forward to avoid z-fighting
-  float c_factor = coinOffset.lineFactor;
-  float c_offset = coinOffset.lineOffset;
   float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
-  out.depth = in.position.z + c_factor * cscale + c_offset / 65000.0;
+  out.depth = in.position.z + coinOffset.lineFactor * cscale + coinOffset.lineOffset / 65000.0;
   return out;
 }
 
 // ---------------------------------------------------------------------------
-// Point rendering shaders (basic 1px and shaped)
+// Point shaders
 // ---------------------------------------------------------------------------
-
 struct PointVertexOut {
   float4 position [[position]];
   float point_size [[point_size]];
   float3 viewPos;
   float3 viewNormal;
   float4 pointColor;
-  float3 tangent;    // P2-9: tangent in view space
-  float2 uv;         // P2-10: texture coordinates
-  float2 lut_uv;     // P2-10: color texture coordinates
-  uint cellId;       // P2-8: flat-interpolated cell ID
-  uint propId;       // P2-8: flat-interpolated prop ID
+  float3 tangent;
+  float2 uv;
+  float2 lut_uv;
+  uint cellId;
+  uint propId;
 };
 
-// Basic 1px point vertex shader — positions stored as packed float3 array.
-// Buffer(0) = positions, buffer(1) = SceneUniforms, buffer(2) = normals,
-// buffer(3) = colors, buffer(6) = tangents, buffer(7) = uvs, buffer(8) = color_uvs.
 vertex PointVertexOut vertex_point_main(
     uint vertex_id [[vertex_id]],
     constant float3* point_positions [[buffer(0)]],
@@ -299,9 +278,9 @@ vertex PointVertexOut vertex_point_main(
     constant uint& pointPropId [[buffer(12)]]) {
   PointVertexOut out;
   float3 pos = point_positions[vertex_id];
-
   float4 worldPos = scene.modelMatrix * float4(pos, 1.0);
   float4 viewPos = scene.viewMatrix * worldPos;
+  
   out.viewPos = viewPos.xyz;
   out.position = scene.projectionMatrix * viewPos;
   out.viewNormal = scene.normalMatrix * point_normals[vertex_id];
@@ -315,8 +294,6 @@ vertex PointVertexOut vertex_point_main(
   return out;
 }
 
-// Fragment shader for 1px points — coincident offset + vertex visibility.
-// Flags: bit 3 = vertex visibility
 fragment FragmentOutput fragment_point_main(PointVertexOut in [[stage_in]],
                                     constant MaterialUniforms& material [[buffer(0)]],
                                     constant LightUniforms& lights [[buffer(1)]],
@@ -325,89 +302,37 @@ fragment FragmentOutput fragment_point_main(PointVertexOut in [[stage_in]],
                                     constant VertexColorUniforms& vertexColorUniform [[buffer(4)]]) {
   float3 N = normalize(in.viewNormal);
 
-  // Determine color: vertex visibility overrides per-point color (matches WebGPU)
   bool showVertices = (scene.flags & (1u << 3)) != 0u;
   float3 baseColor = showVertices ? vertexColorUniform.color.rgb : in.pointColor.rgb;
   float baseAlpha = showVertices ? vertexColorUniform.color.a : in.pointColor.a;
 
-  float3 ambientColor = baseColor;
-  float ambientIntensity = material.ambientColor.w;
-  float3 diffuseColor = baseColor;
-  float diffuseIntensity = material.diffuseColor.w;
-  float3 specularColor = material.specularColor.rgb;
-  float specularIntensity = material.specularColor.w;
-  float3 totalAmbient = ambientIntensity * ambientColor;
+  float3 totalAmbient = material.ambientColor.w * baseColor;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
-  float3 viewDir = normalize(-in.viewPos);
-  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
-    Light L = lights.lights[i];
-    int lightType = int(L.position.w);
-    float3 lightColor = L.color.rgb * L.color.w;
-    float attenuation = 1.0;
-    float df = 0.0;
-    float3 reflDir = float3(0.0);
-    float3 toLight = float3(0.0);
-    if (lightType == 0) {
-      toLight = float3(0.0, 0.0, 1.0);
-      df = max(N.z, 0.000001);
-      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
-    } else if (lightType == 1) {
-      toLight = normalize(-L.direction.xyz);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(L.direction.xyz, N);
-    } else {
-      toLight = L.position.xyz - in.viewPos;
-      float dist = length(toLight);
-      toLight /= dist;
-      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(-toLight, N);
-      if (lightType == 3) {
-        float3 spotDir = normalize(L.direction.xyz);
-        float spotCos = dot(-toLight, spotDir);
-        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
-        if (spotCos > spotCutoff) {
-          attenuation *= pow(spotCos, L.attenuation.w);
-        } else {
-          attenuation = 0.0;
-        }
-      }
-    }
-    totalDiffuse += df * diffuseColor * lightColor * attenuation;
-    float NdotL = max(dot(N, toLight), 0.0);
-    if (NdotL > 0.0) {
-      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
-      totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
-    }
-  }
+  
+  computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
+
   FragmentOutput out;
-  out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, baseAlpha * material.opacity);
-  out.ids = uint4(in.cellId, in.propId, 1u, 0u);  // P2-8
-  // Coincident topology offset for points
+  out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha * material.opacity);
+  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
   out.depth = in.position.z + coinOffset.pointOffset / 65000.0;
   return out;
 }
 
 // -----------------------------------------------------------------------
-// Shaped point vertex shader — quad-per-point instancing
-// Buffer(0) = point positions (float3[]), buffer(1) = connectivity (uint[]),
-// buffer(2) = SceneUniforms, buffer(3) = point normals (float3[]),
-// buffer(4) = point colors (float4[]).
-// Drawn as MTLPrimitiveTypeTriangleStrip, 4 vertices, N instances.
+// Shaped point shaders
 // -----------------------------------------------------------------------
-
 struct PointShapedVertexOut {
   float4 position [[position]];
   float3 viewPos;
   float3 viewNormal;
   float2 p_coord;
   float4 pointColor;
-  float3 tangent;    // P2-9: tangent in view space
-  float2 uv;         // P2-10: texture coordinates
-  float2 lut_uv;     // P2-10: color texture coordinates
-  uint cellId;       // P2-8: flat-interpolated cell ID
-  uint propId;       // P2-8: flat-interpolated prop ID
+  float3 tangent;
+  float2 uv;
+  float2 lut_uv;
+  uint cellId;
+  uint propId;
 };
 
 vertex PointShapedVertexOut vertex_point_shaped_main(
@@ -423,11 +348,8 @@ vertex PointShapedVertexOut vertex_point_shaped_main(
     constant float2* point_color_uvs [[buffer(8)]],
     constant uint* shapedCellIds [[buffer(11)]],
     constant uint& shapedPropId [[buffer(12)]]) {
-  // Quad corners matching WebGPU TRIANGLE_VERTS
-  const float2 tri_verts[4] = {
-    float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1)
-  };
-
+  
+  const float2 tri_verts[4] = { float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1) };
   uint point_id = connectivity[instance_id];
   float3 pos = point_positions[point_id];
 
@@ -435,16 +357,13 @@ vertex PointShapedVertexOut vertex_point_shaped_main(
   float4 viewPos = scene.viewMatrix * worldPos;
   float4 clipPos = scene.projectionMatrix * viewPos;
 
-  // Convert to screen space, expand quad by point_size
   float2 resolution = scene.viewport.zw;
   float2 screenPos = resolution * (0.5 * clipPos.xy / clipPos.w + 0.5);
-  float ptSize = scene.pointSize;
   float2 corner = tri_verts[vertex_id];
-  float2 expanded = screenPos + 0.5 * ptSize * corner;
+  float2 expanded = screenPos + 0.5 * scene.pointSize * corner;
 
   PointShapedVertexOut out;
-  out.position = float4(clipPos.w * ((2.0 * expanded) / resolution - 1.0),
-                        clipPos.z, clipPos.w);
+  out.position = float4(clipPos.w * ((2.0 * expanded) / resolution - 1.0), clipPos.z, clipPos.w);
   out.viewPos = viewPos.xyz;
   out.viewNormal = scene.normalMatrix * point_normals[point_id];
   out.p_coord = corner;
@@ -457,17 +376,12 @@ vertex PointShapedVertexOut vertex_point_shaped_main(
   return out;
 }
 
-// Fragment output struct with explicit depth — needed for sphere depth correction.
 struct PointFragmentOutput {
   float4 color [[color(0)]];
-  uint4 ids [[color(1)]];   // P2-8: {cell, prop, composite, process} IDs
+  uint4 ids [[color(1)]];
   float depth [[depth(any)]];
 };
 
-// Fragment for shaped points — sphere shading, depth correction, vertex visibility.
-// Matches WebGPU's ReplaceFragmentShaderNormals for POINTS_SHAPED.
-// Flags: bit 0 = parallel projection, bit 3 = vertex visibility,
-//        bit 5 = render as spheres, bit 7 = point 2D shape (0=round,1=square)
 fragment PointFragmentOutput fragment_point_shaped_main(
     PointShapedVertexOut in [[stage_in]],
     constant MaterialUniforms& material [[buffer(0)]],
@@ -478,31 +392,21 @@ fragment PointFragmentOutput fragment_point_shaped_main(
   PointFragmentOutput out;
 
   float d = length(in.p_coord);
-
-  // Bit 5: render points as spheres, bit 7: point 2D shape (0=round, 1=square)
   bool drawSpheres = (scene.flags & (1u << 5)) != 0u;
-  bool isRound = ((scene.flags >> 7) & 1u) == 0u; // 0=Round, 1=Square
+  bool isRound = ((scene.flags >> 7) & 1u) == 0u;
 
-  // Discard fragments outside the point shape
-  if ((isRound || drawSpheres) && d > 1.0) {
-    discard_fragment();
-  }
+  if ((isRound || drawSpheres) && d > 1.0) discard_fragment();
 
   float3 N;
   if (drawSpheres && d <= 1.0) {
-    // Compute fake sphere normal from p_coord — matches WebGPU
     N = normalize(float3(in.p_coord, 1.0));
     N.z = sqrt(1.0 - d * d);
 
-    // Fake sphere depth correction.
-    // See Rendering/OpenGL2/PixelsToZBufferConversion.txt for the math.
-    // WebGPU depth is [0,1].
     float pointSize = clamp(scene.pointSize, 1.0, 100000.0);
     float r = pointSize / (scene.viewport.z * scene.projectionMatrix[0][0]);
     bool parallel = (scene.flags & 1u) != 0u;
     if (parallel) {
-      float s = scene.projectionMatrix[2][2];
-      out.depth = in.position.z + N.z * r * s;
+      out.depth = in.position.z + N.z * r * scene.projectionMatrix[2][2];
     } else {
       float s = -scene.projectionMatrix[2][2];
       out.depth = (s - in.position.z) / (N.z * r - 1.0) + s;
@@ -512,82 +416,31 @@ fragment PointFragmentOutput fragment_point_shaped_main(
     out.depth = in.position.z;
   }
 
-  // Determine color: vertex visibility overrides per-point color (matches WebGPU)
   bool showVertices = (scene.flags & (1u << 3)) != 0u;
   float3 baseColor = showVertices ? vertexColorUniform.color.rgb : in.pointColor.rgb;
   float baseAlpha = showVertices ? vertexColorUniform.color.a : in.pointColor.a;
 
-  float3 ambientColor = baseColor;
-  float ambientIntensity = material.ambientColor.w;
-  float3 diffuseColor = baseColor;
-  float diffuseIntensity = material.diffuseColor.w;
-  float3 specularColor = material.specularColor.rgb;
-  float specularIntensity = material.specularColor.w;
-  float3 totalAmbient = ambientIntensity * ambientColor;
+  float3 totalAmbient = material.ambientColor.w * baseColor;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
-  float3 viewDir = normalize(-in.viewPos);
-  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
-    Light L = lights.lights[i];
-    int lightType = int(L.position.w);
-    float3 lightColor = L.color.rgb * L.color.w;
-    float attenuation = 1.0;
-    float df = 0.0;
-    float3 reflDir = float3(0.0);
-    float3 toLight = float3(0.0);
-    if (lightType == 0) {
-      toLight = float3(0.0, 0.0, 1.0);
-      df = max(N.z, 0.000001);
-      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
-    } else if (lightType == 1) {
-      toLight = normalize(-L.direction.xyz);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(L.direction.xyz, N);
-    } else {
-      toLight = L.position.xyz - in.viewPos;
-      float dist = length(toLight);
-      toLight /= dist;
-      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(-toLight, N);
-      if (lightType == 3) {
-        float3 spotDir = normalize(L.direction.xyz);
-        float spotCos = dot(-toLight, spotDir);
-        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
-        if (spotCos > spotCutoff) {
-          attenuation *= pow(spotCos, L.attenuation.w);
-        } else {
-          attenuation = 0.0;
-        }
-      }
-    }
-    totalDiffuse += df * diffuseColor * lightColor * attenuation;
-    float NdotL = max(dot(N, toLight), 0.0);
-    if (NdotL > 0.0) {
-      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
-      totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
-    }
-  }
-  out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, baseAlpha * material.opacity);
-  out.ids = uint4(in.cellId, in.propId, 1u, 0u);  // P2-8
-  // Apply point coincident offset to depth (additive, after sphere depth correction)
+  
+  computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
+
+  out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha * material.opacity);
+  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
   out.depth += coinOffset.pointOffset / 65000.0;
   return out;
 }
 
 // ---------------------------------------------------------------------------
-// P3-3A: Thick line shaders — screen-space quad expansion (NoJoin)
-// Each line segment is expanded into a screen-space quad (4 vertices per instance).
-// Vertex shader reads both endpoints from the index buffer, transforms to screen
-// space, and expands perpendicular to the line direction by lineWidth/2.
+// Thick line shaders
 // ---------------------------------------------------------------------------
-
 struct ThickLineVertexOut {
   float4 position [[position]];
   float3 viewPos;
   float3 viewNormal;
   float4 vertexColor;
-  float dist_to_centerline;  // perpendicular distance from center (-0.5..0.5)
+  float dist_to_centerline;
   uint cellId;
   uint propId;
 };
@@ -602,54 +455,39 @@ vertex ThickLineVertexOut vertex_thick_line_main(
     constant float& lineWidth [[buffer(4)]],
     constant uint* cellIds [[buffer(5)]],
     constant uint& propId [[buffer(6)]]) {
-  // Quad corners: (-1,-1), (1,-1), (-1,1), (1,1)
-  const float2 tri_verts[4] = {
-    float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1)
-  };
-
+  
+  const float2 tri_verts[4] = { float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1) };
   float2 p_coord = tri_verts[vertex_id];
 
-  // Read the two endpoint indices for this line segment
   uint p0_idx = lineIndices[instance_id * 2];
   uint p1_idx = lineIndices[instance_id * 2 + 1];
 
   float3 p0_MC = positions[p0_idx];
   float3 p1_MC = positions[p1_idx];
 
-  // Transform both endpoints to clip space
   float4 p0_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(p0_MC, 1.0);
   float4 p1_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(p1_MC, 1.0);
 
-  // Transform to screen space
   float2 resolution = scene.viewport.zw;
   float2 p0_screen = resolution * (0.5 * p0_DC.xy / p0_DC.w + 0.5);
   float2 p1_screen = resolution * (0.5 * p1_DC.xy / p1_DC.w + 0.5);
 
-  // Compute line direction and perpendicular in screen space
-  float2 x_basis = normalize(p1_screen - p0_screen);
-  // Handle degenerate case (zero-length segment)
-  float segLen = length(p1_screen - p0_screen);
-  x_basis = select(x_basis, float2(1.0, 0.0), segLen < 0.001);
+  float2 delta = p1_screen - p0_screen;
+  float segLen = length(delta);
+  float2 x_basis = segLen < 0.001 ? float2(1.0, 0.0) : (delta / segLen);
   float2 y_basis = float2(-x_basis.y, x_basis.x);
 
-  // Expand into a quad by lineWidth
   float w = max(lineWidth, 1.0);
   float2 adjusted_p0 = p0_screen + p_coord.x * x_basis + p_coord.y * y_basis * w;
   float2 adjusted_p1 = p1_screen + p_coord.x * x_basis + p_coord.y * y_basis * w;
   float2 p = mix(adjusted_p0, adjusted_p1, p_coord.x);
 
-  // Select z/w from the appropriate endpoint
   float4 p_DC = mix(p0_DC, p1_DC, p_coord.x);
 
   ThickLineVertexOut out;
   out.position = float4(p_DC.w * ((2.0 * p) / resolution - 1.0), p_DC.z, p_DC.w);
-
-  // Interpolate view-space position for lighting
-  float3 mid_MC = mix(p0_MC, p1_MC, p_coord.x);
-  out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(mid_MC, 1.0)).xyz;
+  out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(mix(p0_MC, p1_MC, p_coord.x), 1.0)).xyz;
   out.viewNormal = scene.normalMatrix * float3(0.0, 0.0, 1.0);
-
-  // Use the color from the starting endpoint of the segment
   out.vertexColor = vertexColors[p0_idx];
   out.dist_to_centerline = p_coord.y;
   out.cellId = cellIds[instance_id];
@@ -668,89 +506,33 @@ fragment FragmentOutput fragment_thick_line_main(
   float3 baseColor = in.vertexColor.rgb;
   float baseAlpha = in.vertexColor.a * material.opacity;
 
-  // Tube-like shading: modify normal based on distance from centerline
   float3 N = normalize(in.viewNormal);
-  float d = abs(in.dist_to_centerline);
-  N.z = 1.0 - 2.0 * d;
+  N.z = 1.0 - 2.0 * abs(in.dist_to_centerline);
   N = normalize(N);
 
   float3 totalAmbient = material.ambientColor.w * baseColor;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
-  float3 viewDir = normalize(-in.viewPos);
 
-  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
-    Light L = lights.lights[i];
-    int lightType = int(L.position.w);
-    float3 lightColor = L.color.rgb * L.color.w;
-    float attenuation = 1.0;
-    float df = 0.0;
-    float3 reflDir = float3(0.0);
-    float3 toLight = float3(0.0);
-
-    if (lightType == 0) {
-      toLight = float3(0.0, 0.0, 1.0);
-      df = max(N.z, 0.000001);
-      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
-    } else if (lightType == 1) {
-      toLight = normalize(-L.direction.xyz);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(L.direction.xyz, N);
-    } else {
-      toLight = L.position.xyz - in.viewPos;
-      float dist = length(toLight);
-      toLight /= dist;
-      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(-toLight, N);
-      if (lightType == 3) {
-        float3 spotDir = normalize(L.direction.xyz);
-        float spotCos = dot(-toLight, spotDir);
-        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
-        if (spotCos > spotCutoff) {
-          attenuation *= pow(spotCos, L.attenuation.w);
-        } else {
-          attenuation = 0.0;
-        }
-      }
-    }
-
-    totalDiffuse += df * baseColor * lightColor * attenuation;
-    float NdotL = max(dot(N, toLight), 0.0);
-    if (NdotL > 0.0) {
-      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
-      totalSpecular += sf * material.specularColor.w * material.specularColor.rgb * lightColor * attenuation;
-    }
-  }
+  computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
 
   out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha);
   out.ids = uint4(in.cellId, in.propId, 1u, 0u);
 
-  // Coincident topology offset for lines
-  float c_factor = coinOffset.lineFactor;
-  float c_offset = coinOffset.lineOffset;
   float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
-  out.depth = in.position.z + c_factor * cscale + c_offset / 65000.0;
+  out.depth = in.position.z + coinOffset.lineFactor * cscale + coinOffset.lineOffset / 65000.0;
   return out;
 }
 
 // ---------------------------------------------------------------------------
-// P3-3B: Round Cap + Round Join line shaders — screen-space quad expansion with semicircle caps
-// Each line segment is expanded into a screen-space shape (36 vertices per instance):
-//   - 6 vertices for the body quad (2 triangles)
-//   - 15 vertices for the left semicircle cap (triangle fan, 5 segments × 3 verts)
-//   - 15 vertices for the right semicircle cap (triangle fan, 5 segments × 3 verts)
-// The third coordinate (p_coord.z) is used for interpolation along the line:
-//   z=0 → p0 endpoint (left cap), z=1 → p1 endpoint (right cap)
-// Fragment shader computes distance from line center for anti-aliasing.
+// Round Cap Line Shaders 
 // ---------------------------------------------------------------------------
-
 struct RoundCapLineVertexOut {
   float4 position [[position]];
   float3 viewPos;
   float3 viewNormal;
   float4 vertexColor;
-  float dist_to_centerline;  // perpendicular distance from center (-0.5..0.5)
+  float dist_to_centerline;
   uint cellId;
   uint propId;
 };
@@ -765,101 +547,62 @@ vertex RoundCapLineVertexOut vertex_round_cap_line_main(
     constant float& lineWidth [[buffer(4)]],
     constant uint* cellIds [[buffer(5)]],
     constant uint& propId [[buffer(6)]]) {
-  // 36-vertex template: 6 body + 15 left cap + 15 right cap (triangle strip)
-  // Body quad: (-0.5,0,0), (-0.5,0,1), (0.5,0,0), (0.5,0,1), (-0.5,1,0), (-0.5,1,1)
-  // The x coordinate maps to the semicircle offset (0=center, ±0.5=edges)
-  // The y coordinate maps to the parametric position along the line (0=start, 1=end)
-  // The z coordinate maps to interpolation factor (0=p0, 1=p1)
 
-  // Generate template vertex for this vertex_id
   float3 p_coord;
   const int CAP_SEGMENTS = 5;
   const float PI = 3.14159265358979;
 
   if (vertex_id < 6) {
-    // Body quad (triangle strip): alternating bottom/top vertices
-    // v0=(-0.5,0,0), v1=(-0.5,0,1), v2=(0.5,0,0), v3=(0.5,0,1), v4=(-0.5,1,0), v5=(-0.5,1,1)
     const float3 body_verts[6] = {
-      float3(-0.5, 0.0, 0.0),
-      float3(-0.5, 0.0, 1.0),
-      float3( 0.5, 0.0, 0.0),
-      float3( 0.5, 0.0, 1.0),
-      float3(-0.5, 1.0, 0.0),
-      float3(-0.5, 1.0, 1.0)
+      float3(-0.5, 0.0, 0.0), float3(-0.5, 0.0, 1.0), float3( 0.5, 0.0, 0.0),
+      float3( 0.5, 0.0, 1.0), float3(-0.5, 1.0, 0.0), float3(-0.5, 1.0, 1.0)
     };
     p_coord = body_verts[vertex_id];
   } else if (vertex_id < 21) {
-    // Left semicircle cap (triangle fan, 5 segments × 3 verts)
-    // Fan center at (0, 0, 0), arcs from angle PI/2 to 3PI/2
     int local = vertex_id - 6;
-    int seg = local / 3;
-    int triVert = local % 3;
-    float theta0 = PI * 0.5 + (float(seg) * PI) / float(CAP_SEGMENTS);
-    float theta1 = PI * 0.5 + (float(seg + 1) * PI) / float(CAP_SEGMENTS);
-    if (triVert == 0) {
-      p_coord = float3(0.0, 0.0, 0.0);
-    } else if (triVert == 1) {
-      p_coord = float3(0.5 * cos(theta0), 0.5 * sin(theta0), 0.0);
-    } else {
-      p_coord = float3(0.5 * cos(theta1), 0.5 * sin(theta1), 0.0);
-    }
+    float theta0 = PI * 0.5 + (float(local / 3) * PI) / float(CAP_SEGMENTS);
+    float theta1 = PI * 0.5 + (float(local / 3 + 1) * PI) / float(CAP_SEGMENTS);
+    p_coord = (local % 3 == 0) ? float3(0.0) : 
+              ((local % 3 == 1) ? float3(0.5 * cos(theta0), 0.5 * sin(theta0), 0.0) :
+                                  float3(0.5 * cos(theta1), 0.5 * sin(theta1), 0.0));
   } else {
-    // Right semicircle cap (triangle fan, 5 segments × 3 verts)
-    // Fan center at (0, 1, 1), arcs from angle 3PI/2 to 5PI/2
     int local = vertex_id - 21;
-    int seg = local / 3;
-    int triVert = local % 3;
-    float theta0 = 1.5 * PI + (float(seg) * PI) / float(CAP_SEGMENTS);
-    float theta1 = 1.5 * PI + (float(seg + 1) * PI) / float(CAP_SEGMENTS);
-    if (triVert == 0) {
-      p_coord = float3(0.0, 1.0, 1.0);
-    } else if (triVert == 1) {
-      p_coord = float3(0.5 * cos(theta0), 0.5 * sin(theta0) + 1.0, 1.0);
-    } else {
-      p_coord = float3(0.5 * cos(theta1), 0.5 * sin(theta1) + 1.0, 1.0);
-    }
+    float theta0 = 1.5 * PI + (float(local / 3) * PI) / float(CAP_SEGMENTS);
+    float theta1 = 1.5 * PI + (float(local / 3 + 1) * PI) / float(CAP_SEGMENTS);
+    p_coord = (local % 3 == 0) ? float3(0.0, 1.0, 1.0) : 
+              ((local % 3 == 1) ? float3(0.5 * cos(theta0), 0.5 * sin(theta0) + 1.0, 1.0) :
+                                  float3(0.5 * cos(theta1), 0.5 * sin(theta1) + 1.0, 1.0));
   }
 
-  // Read the two endpoint indices for this line segment
   uint p0_idx = lineIndices[instance_id * 2];
   uint p1_idx = lineIndices[instance_id * 2 + 1];
 
   float3 p0_MC = positions[p0_idx];
   float3 p1_MC = positions[p1_idx];
 
-  // Transform both endpoints to clip space
   float4 p0_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(p0_MC, 1.0);
   float4 p1_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(p1_MC, 1.0);
 
-  // Transform to screen space
   float2 resolution = scene.viewport.zw;
   float2 p0_screen = resolution * (0.5 * p0_DC.xy / p0_DC.w + 0.5);
   float2 p1_screen = resolution * (0.5 * p1_DC.xy / p1_DC.w + 0.5);
 
-  // Compute line direction and perpendicular in screen space
-  float2 x_basis = normalize(p1_screen - p0_screen);
-  float segLen = length(p1_screen - p0_screen);
-  x_basis = select(x_basis, float2(1.0, 0.0), segLen < 0.001);
+  float2 delta = p1_screen - p0_screen;
+  float segLen = length(delta);
+  float2 x_basis = segLen < 0.001 ? float2(1.0, 0.0) : (delta / segLen);
   float2 y_basis = float2(-x_basis.y, x_basis.x);
 
-  // Expand into shape by lineWidth
   float w = max(lineWidth, 1.0);
   float2 adjusted_p0 = p0_screen + (p_coord.x * x_basis + p_coord.y * y_basis) * w;
   float2 adjusted_p1 = p1_screen + (p_coord.x * x_basis + p_coord.y * y_basis) * w;
   float2 p = mix(adjusted_p0, adjusted_p1, p_coord.z);
 
-  // Select z/w from the appropriate endpoint based on p_coord.z
   float4 p_DC = mix(p0_DC, p1_DC, p_coord.z);
 
   RoundCapLineVertexOut out;
   out.position = float4(p_DC.w * ((2.0 * p) / resolution - 1.0), p_DC.z, p_DC.w);
-
-  // Interpolate view-space position for lighting
-  float3 mid_MC = mix(p0_MC, p1_MC, p_coord.z);
-  out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(mid_MC, 1.0)).xyz;
+  out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(mix(p0_MC, p1_MC, p_coord.z), 1.0)).xyz;
   out.viewNormal = scene.normalMatrix * float3(0.0, 0.0, 1.0);
-
-  // Use the color from the appropriate endpoint
   out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], p_coord.z);
   out.dist_to_centerline = p_coord.y;
   out.cellId = cellIds[instance_id];
@@ -878,85 +621,33 @@ fragment FragmentOutput fragment_round_cap_line_main(
   float3 baseColor = in.vertexColor.rgb;
   float baseAlpha = in.vertexColor.a * material.opacity;
 
-  // Tube-like shading: modify normal based on distance from centerline
   float3 N = normalize(in.viewNormal);
-  float d = abs(in.dist_to_centerline);
-  N.z = 1.0 - 2.0 * d;
+  N.z = 1.0 - 2.0 * abs(in.dist_to_centerline);
   N = normalize(N);
 
   float3 totalAmbient = material.ambientColor.w * baseColor;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
-  float3 viewDir = normalize(-in.viewPos);
-
-  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
-    Light L = lights.lights[i];
-    int lightType = int(L.position.w);
-    float3 lightColor = L.color.rgb * L.color.w;
-    float attenuation = 1.0;
-    float df = 0.0;
-    float3 reflDir = float3(0.0);
-    float3 toLight = float3(0.0);
-
-    if (lightType == 0) {
-      toLight = float3(0.0, 0.0, 1.0);
-      df = max(N.z, 0.000001);
-      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
-    } else if (lightType == 1) {
-      toLight = normalize(-L.direction.xyz);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(L.direction.xyz, N);
-    } else {
-      toLight = L.position.xyz - in.viewPos;
-      float dist = length(toLight);
-      toLight /= dist;
-      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(-toLight, N);
-      if (lightType == 3) {
-        float3 spotDir = normalize(L.direction.xyz);
-        float spotCos = dot(-toLight, spotDir);
-        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
-        if (spotCos > spotCutoff) {
-          attenuation *= pow(spotCos, L.attenuation.w);
-        } else {
-          attenuation = 0.0;
-        }
-      }
-    }
-
-    totalDiffuse += df * baseColor * lightColor * attenuation;
-    float NdotL = max(dot(N, toLight), 0.0);
-    if (NdotL > 0.0) {
-      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
-      totalSpecular += sf * material.specularColor.w * material.specularColor.rgb * lightColor * attenuation;
-    }
-  }
+  
+  computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
 
   out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha);
   out.ids = uint4(in.cellId, in.propId, 1u, 0u);
 
-  // Coincident topology offset for lines
-  float c_factor = coinOffset.lineFactor;
-  float c_offset = coinOffset.lineOffset;
   float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
-  out.depth = in.position.z + c_factor * cscale + c_offset / 65000.0;
+  out.depth = in.position.z + coinOffset.lineFactor * cscale + coinOffset.lineOffset / 65000.0;
   return out;
 }
 
 // ---------------------------------------------------------------------------
-// P3-3C: Miter Join line shaders — screen-space quad expansion with miter offsets
-// Same 4-vertex triangle strip as thick lines, but the vertex shader looks at
-// adjacent segments to compute miter join offsets at shared endpoints.
-// Falls back to bevel when the miter angle is too acute.
+// Miter Join Line Shaders
 // ---------------------------------------------------------------------------
-
 struct MiterJoinLineVertexOut {
   float4 position [[position]];
   float3 viewPos;
   float3 viewNormal;
   float4 vertexColor;
-  float dist_to_centerline;  // perpendicular distance from center (-0.5..0.5)
+  float dist_to_centerline;
   uint cellId;
   uint propId;
 };
@@ -972,130 +663,75 @@ vertex MiterJoinLineVertexOut vertex_miter_join_line_main(
     constant uint* cellIds [[buffer(5)]],
     constant uint& propId [[buffer(6)]],
     constant uint& segmentCount [[buffer(7)]]) {
-  // Quad corners: (-1,-1), (1,-1), (-1,1), (1,1)
-  const float2 tri_verts[4] = {
-    float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1)
-  };
-
+  
+  const float2 tri_verts[4] = { float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1) };
   float2 p_coord = tri_verts[vertex_id];
 
-  // Read the two endpoint indices for this line segment
   uint p0_idx = lineIndices[instance_id * 2];
   uint p1_idx = lineIndices[instance_id * 2 + 1];
 
-  float3 p0_MC = positions[p0_idx];
-  float3 p1_MC = positions[p1_idx];
+  float4 p0_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(positions[p0_idx], 1.0);
+  float4 p1_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(positions[p1_idx], 1.0);
 
-  // Transform both endpoints to clip space
-  float4 p0_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(p0_MC, 1.0);
-  float4 p1_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(p1_MC, 1.0);
-
-  // Transform to screen space
   float2 resolution = scene.viewport.zw;
   float2 p0_screen = resolution * (0.5 * p0_DC.xy / p0_DC.w + 0.5);
   float2 p1_screen = resolution * (0.5 * p1_DC.xy / p1_DC.w + 0.5);
 
-  // Compute line direction and perpendicular in screen space
-  float2 x_basis = normalize(p1_screen - p0_screen);
-  float segLen = length(p1_screen - p0_screen);
-  x_basis = select(x_basis, float2(1.0, 0.0), segLen < 0.001);
+  float2 delta = p1_screen - p0_screen;
+  float segLen = length(delta);
+  float2 x_basis = segLen < 0.001 ? float2(1.0, 0.0) : (delta / segLen);
   float2 y_basis = float2(-x_basis.y, x_basis.x);
 
-  // Miter join: look at adjacent segments to compute miter offset at shared endpoints
   float w = max(lineWidth, 1.0);
   float2 offset = p_coord.x * x_basis + p_coord.y * y_basis * w;
 
-  // Check for miter at p0 (start of segment, p_coord.x == -1)
-  if (p_coord.x == -1.0 && instance_id > 0) {
-    // Check if previous segment shares the same cell (i.e., same polyline)
-    if (cellIds[instance_id - 1] == cellIds[instance_id]) {
-      uint prev_p0_idx = lineIndices[(instance_id - 1) * 2];
-      uint prev_p1_idx = lineIndices[(instance_id - 1) * 2 + 1];
-      float3 prev_p0_MC = positions[prev_p0_idx];
-      float3 prev_p1_MC = positions[prev_p1_idx];
+  if (p_coord.x == -1.0 && instance_id > 0 && cellIds[instance_id - 1] == cellIds[instance_id]) {
+    float4 prev_p0_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(positions[lineIndices[(instance_id - 1) * 2]], 1.0);
+    float2 prev_p0_screen = resolution * (0.5 * prev_p0_DC.xy / prev_p0_DC.w + 0.5);
+    
+    float2 prev_delta = p0_screen - prev_p0_screen;
+    float prev_len = length(prev_delta);
+    float2 prev_dir = prev_len < 0.001 ? float2(1.0, 0.0) : (prev_delta / prev_len);
+    
+    float2 miter = float2(-prev_dir.y, prev_dir.x) + float2(-x_basis.y, x_basis.x);
+    float miter_len = length(miter);
 
-      float4 prev_p0_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(prev_p0_MC, 1.0);
-      float4 prev_p1_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(prev_p1_MC, 1.0);
-
-      float2 prev_p0_screen = resolution * (0.5 * prev_p0_DC.xy / prev_p0_DC.w + 0.5);
-      float2 prev_p1_screen = resolution * (0.5 * prev_p1_DC.xy / prev_p1_DC.w + 0.5);
-
-      // Direction of previous segment in screen space
-      float2 prev_dir = normalize(prev_p1_screen - prev_p0_screen);
-      // Current segment direction
-      float2 curr_dir = x_basis;
-
-      // Miter direction = normalized sum of the two edge normals
-      float2 prev_normal = float2(-prev_dir.y, prev_dir.x);
-      float2 curr_normal = float2(-curr_dir.y, curr_dir.x);
-      float2 miter = prev_normal + curr_normal;
-      float miter_len = length(miter);
-
-      // Miter limit: if miter is too long (angle too acute), fall back to bevel
-      float MITER_LIMIT = 2.0;
-      if (miter_len > 0.001 && miter_len < MITER_LIMIT * 2.0) {
-        miter = miter / miter_len;
-        // Offset along miter direction
-        float miterOffset = w * 0.5 / dot(miter, curr_normal);
-        if (sign(dot(p_coord.y * y_basis, miter)) == sign(dot(float2(0.0, 1.0), miter))) {
-          offset = p_coord.x * x_basis + miter * miterOffset;
-        }
+    if (miter_len > 0.001 && miter_len < 4.0) {
+      miter = miter / miter_len;
+      float miterOffset = w * 0.5 / dot(miter, float2(-x_basis.y, x_basis.x));
+      if (sign(dot(p_coord.y * y_basis, miter)) == sign(dot(float2(0.0, 1.0), miter))) {
+        offset = p_coord.x * x_basis + miter * miterOffset;
       }
     }
   }
 
-  // Check for miter at p1 (end of segment, p_coord.x == 1)
-  if (p_coord.x == 1.0 && instance_id < segmentCount - 1) {
-    // Check if next segment shares the same cell
-    if (cellIds[instance_id + 1] == cellIds[instance_id]) {
-      uint next_p0_idx = lineIndices[(instance_id + 1) * 2];
-      uint next_p1_idx = lineIndices[(instance_id + 1) * 2 + 1];
-      float3 next_p0_MC = positions[next_p0_idx];
-      float3 next_p1_MC = positions[next_p1_idx];
+  if (p_coord.x == 1.0 && instance_id < segmentCount - 1 && cellIds[instance_id + 1] == cellIds[instance_id]) {
+    float4 next_p1_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(positions[lineIndices[(instance_id + 1) * 2 + 1]], 1.0);
+    float2 next_p1_screen = resolution * (0.5 * next_p1_DC.xy / next_p1_DC.w + 0.5);
+    
+    float2 next_delta = next_p1_screen - p1_screen;
+    float next_len = length(next_delta);
+    float2 next_dir = next_len < 0.001 ? float2(1.0, 0.0) : (next_delta / next_len);
+    
+    float2 miter = float2(-x_basis.y, x_basis.x) + float2(-next_dir.y, next_dir.x);
+    float miter_len = length(miter);
 
-      float4 next_p0_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(next_p0_MC, 1.0);
-      float4 next_p1_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(next_p1_MC, 1.0);
-
-      float2 next_p0_screen = resolution * (0.5 * next_p0_DC.xy / next_p0_DC.w + 0.5);
-      float2 next_p1_screen = resolution * (0.5 * next_p1_DC.xy / next_p1_DC.w + 0.5);
-
-      // Direction of next segment in screen space
-      float2 next_dir = normalize(next_p1_screen - next_p0_screen);
-      // Current segment direction
-      float2 curr_dir = x_basis;
-
-      // Miter direction = normalized sum of the two edge normals
-      float2 curr_normal = float2(-curr_dir.y, curr_dir.x);
-      float2 next_normal = float2(-next_dir.y, next_dir.x);
-      float2 miter = curr_normal + next_normal;
-      float miter_len = length(miter);
-
-      // Miter limit: if miter is too long (angle too acute), fall back to bevel
-      float MITER_LIMIT = 2.0;
-      if (miter_len > 0.001 && miter_len < MITER_LIMIT * 2.0) {
-        miter = miter / miter_len;
-        float miterOffset = w * 0.5 / dot(miter, curr_normal);
-        if (sign(dot(p_coord.y * y_basis, miter)) == sign(dot(float2(0.0, 1.0), miter))) {
-          offset = p_coord.x * x_basis + miter * miterOffset;
-        }
+    if (miter_len > 0.001 && miter_len < 4.0) {
+      miter = miter / miter_len;
+      float miterOffset = w * 0.5 / dot(miter, float2(-x_basis.y, x_basis.x));
+      if (sign(dot(p_coord.y * y_basis, miter)) == sign(dot(float2(0.0, 1.0), miter))) {
+        offset = p_coord.x * x_basis + miter * miterOffset;
       }
     }
   }
 
   float2 p = p0_screen + offset + (p1_screen - p0_screen) * 0.5 * (p_coord.x + 1.0);
-
-  // Select z/w from the appropriate endpoint
   float4 p_DC = mix(p0_DC, p1_DC, p_coord.x);
 
   MiterJoinLineVertexOut out;
   out.position = float4(p_DC.w * ((2.0 * p) / resolution - 1.0), p_DC.z, p_DC.w);
-
-  // Interpolate view-space position for lighting
-  float3 mid_MC = mix(p0_MC, p1_MC, p_coord.x);
-  out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(mid_MC, 1.0)).xyz;
+  out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(mix(positions[p0_idx], positions[p1_idx], p_coord.x), 1.0)).xyz;
   out.viewNormal = scene.normalMatrix * float3(0.0, 0.0, 1.0);
-
-  // Use the color from the appropriate endpoint
   out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], p_coord.x);
   out.dist_to_centerline = p_coord.y;
   out.cellId = cellIds[instance_id];
@@ -1114,109 +750,37 @@ fragment FragmentOutput fragment_miter_join_line_main(
   float3 baseColor = in.vertexColor.rgb;
   float baseAlpha = in.vertexColor.a * material.opacity;
 
-  // Tube-like shading: modify normal based on distance from centerline
   float3 N = normalize(in.viewNormal);
-  float d = abs(in.dist_to_centerline);
-  N.z = 1.0 - 2.0 * d;
+  N.z = 1.0 - 2.0 * abs(in.dist_to_centerline);
   N = normalize(N);
 
   float3 totalAmbient = material.ambientColor.w * baseColor;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
-  float3 viewDir = normalize(-in.viewPos);
-
-  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
-    Light L = lights.lights[i];
-    int lightType = int(L.position.w);
-    float3 lightColor = L.color.rgb * L.color.w;
-    float attenuation = 1.0;
-    float df = 0.0;
-    float3 reflDir = float3(0.0);
-    float3 toLight = float3(0.0);
-
-    if (lightType == 0) {
-      toLight = float3(0.0, 0.0, 1.0);
-      df = max(N.z, 0.000001);
-      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
-    } else if (lightType == 1) {
-      toLight = normalize(-L.direction.xyz);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(L.direction.xyz, N);
-    } else {
-      toLight = L.position.xyz - in.viewPos;
-      float dist = length(toLight);
-      toLight /= dist;
-      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(-toLight, N);
-      if (lightType == 3) {
-        float3 spotDir = normalize(L.direction.xyz);
-        float spotCos = dot(-toLight, spotDir);
-        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
-        if (spotCos > spotCutoff) {
-          attenuation *= pow(spotCos, L.attenuation.w);
-        } else {
-          attenuation = 0.0;
-        }
-      }
-    }
-
-    totalDiffuse += df * baseColor * lightColor * attenuation;
-    float NdotL = max(dot(N, toLight), 0.0);
-    if (NdotL > 0.0) {
-      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
-      totalSpecular += sf * material.specularColor.w * material.specularColor.rgb * lightColor * attenuation;
-    }
-  }
+  
+  computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
 
   out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha);
   out.ids = uint4(in.cellId, in.propId, 1u, 0u);
 
-  // Coincident topology offset for lines
-  float c_factor = coinOffset.lineFactor;
-  float c_offset = coinOffset.lineOffset;
   float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
-  out.depth = in.position.z + c_factor * cscale + c_offset / 65000.0;
+  out.depth = in.position.z + coinOffset.lineFactor * cscale + coinOffset.lineOffset / 65000.0;
   return out;
 }
 
 // ---------------------------------------------------------------------------
-// P2-8: Compute kernel for cell-to-primitive mapping
-// Maps each primitive (triangle/line segment) to its owning cell ID.
-// Mirrors WebGPU's VTKCellToGraphicsPrimitive.wgsl.
+// Compute Kernels (Tessellation mapping)
 // ---------------------------------------------------------------------------
 kernel void cellToPrimitive(
     device uint* cellIds [[buffer(0)]],
     constant uint* primitiveToCell [[buffer(1)]],
     constant uint& cellIdOffset [[buffer(2)]],
-    uint gid [[thread_position_in_grid]])
-{
-  cellIds[gid] = primitiveToCell[gid] + cellIdOffset + 1u;  // 1-based
+    uint gid [[thread_position_in_grid]]) {
+  cellIds[gid] = primitiveToCell[gid] + cellIdOffset + 1u;
 }
 
-// ---------------------------------------------------------------------------
-// P6-6A: GPU Tessellation Compute Kernels
-// Replace CPU fan-triangulation with compute-based polygon → triangle conversion.
-// Mirrors WebGPU's polygon_to_triangle, poly_line_to_line, polygon_edges_to_lines.
-// ---------------------------------------------------------------------------
+struct TessParams { uint numCells; uint cellIdOffset; };
 
-struct TessParams {
-  uint numCells;
-  uint cellIdOffset;
-};
-
-// Polygon → Triangle fan tessellation.
-// Each thread processes one polygon cell and emits (npts-2) triangles via fan from vertex 0.
-// Also produces edge array for hiding internal fan edges when edge visibility is on.
-//
-// Bindings:
-//   0: outConnectivity (output) — tessellated triangle indices, 3 per triangle
-//   1: edgeArray (output) — per-triangle edge visibility flag (-1, 0, 1, or 2)
-//   2: cellIds (output) — per-triangle cell ID
-//   3: connectivity (input) — flat array of point IDs for all polygon cells
-//   4: offsets (input) — per-cell start offset into connectivity (length = numCells+1)
-//   5: primitiveCounts (input) — prefix-sum of triangle counts (length = numCells+1)
-//   6: params (input) — numCells and cellIdOffset
 kernel void polygonToTriangle(
     device uint* outConnectivity [[buffer(0)]],
     device float* edgeArray [[buffer(1)]],
@@ -1225,54 +789,25 @@ kernel void polygonToTriangle(
     constant uint* offsets [[buffer(4)]],
     constant uint* primitiveCounts [[buffer(5)]],
     constant TessParams& params [[buffer(6)]],
-    uint gid [[thread_position_in_grid]])
-{
+    uint gid [[thread_position_in_grid]]) {
   if (gid >= params.numCells) return;
 
   uint numTriangles = primitiveCounts[gid + 1u] - primitiveCounts[gid];
   uint outputOffset = primitiveCounts[gid] * 3u;
   uint inputOffset = offsets[gid];
 
-  for (uint i = 0u; i < numTriangles; i++)
-  {
-    uint p0 = connectivity[inputOffset];
-    uint p1 = connectivity[inputOffset + i + 1u];
-    uint p2 = connectivity[inputOffset + i + 2u];
-
+  for (uint i = 0u; i < numTriangles; i++) {
     uint triangleId = primitiveCounts[gid] + i;
-
-    // Edge array: hides internal fan edges of a polygon when edge visibility is on.
-    // -1 = single triangle (all edges are boundary), 2 = first triangle,
-    // 0 = last triangle, 1 = interior triangle.
-    // Matches WebGPU VTKCellToGraphicsPrimitive.wgsl line 49.
-    if (numTriangles == 1u)
-      edgeArray[triangleId] = -1.0;
-    else if (i == 0u)
-      edgeArray[triangleId] = 2.0;
-    else if (i == numTriangles - 1u)
-      edgeArray[triangleId] = 0.0;
-    else
-      edgeArray[triangleId] = 1.0;
-
+    edgeArray[triangleId] = (numTriangles == 1u) ? -1.0 : (i == 0u ? 2.0 : (i == numTriangles - 1u ? 0.0 : 1.0));
     cellIds[triangleId] = gid + params.cellIdOffset;
 
-    outConnectivity[outputOffset] = p0;
-    outConnectivity[outputOffset + 1u] = p1;
-    outConnectivity[outputOffset + 2u] = p2;
+    outConnectivity[outputOffset] = connectivity[inputOffset];
+    outConnectivity[outputOffset + 1u] = connectivity[inputOffset + i + 1u];
+    outConnectivity[outputOffset + 2u] = connectivity[inputOffset + i + 2u];
     outputOffset += 3u;
   }
 }
 
-// Polyline → Line segment tessellation.
-// Each thread processes one polyline cell and emits (npts-1) line segments.
-//
-// Bindings:
-//   0: outConnectivity (output) — line segment index pairs, 2 per segment
-//   1: cellIds (output) — per-segment cell ID
-//   2: connectivity (input) — flat point IDs for all line cells
-//   3: offsets (input) — per-cell start offset into connectivity
-//   4: primitiveCounts (input) — prefix-sum of segment counts
-//   5: params (input) — numCells and cellIdOffset
 kernel void polyLineToLine(
     device uint* outConnectivity [[buffer(0)]],
     device uint* cellIds [[buffer(1)]],
@@ -1280,39 +815,21 @@ kernel void polyLineToLine(
     constant uint* offsets [[buffer(3)]],
     constant uint* primitiveCounts [[buffer(4)]],
     constant TessParams& params [[buffer(5)]],
-    uint gid [[thread_position_in_grid]])
-{
+    uint gid [[thread_position_in_grid]]) {
   if (gid >= params.numCells) return;
 
   uint numLines = primitiveCounts[gid + 1u] - primitiveCounts[gid];
   uint outputOffset = primitiveCounts[gid] * 2u;
   uint inputOffset = offsets[gid];
 
-  for (uint i = 0u; i < numLines; i++)
-  {
-    uint p0 = connectivity[inputOffset + i];
-    uint p1 = connectivity[inputOffset + i + 1u];
-
-    uint lineId = primitiveCounts[gid] + i;
-    cellIds[lineId] = gid + params.cellIdOffset;
-
-    outConnectivity[outputOffset] = p0;
-    outConnectivity[outputOffset + 1u] = p1;
+  for (uint i = 0u; i < numLines; i++) {
+    cellIds[primitiveCounts[gid] + i] = gid + params.cellIdOffset;
+    outConnectivity[outputOffset] = connectivity[inputOffset + i];
+    outConnectivity[outputOffset + 1u] = connectivity[inputOffset + i + 1u];
     outputOffset += 2u;
   }
 }
 
-// Polygon boundary edges → Line segments (wireframe / edge visibility).
-// Each thread processes one polygon cell and emits npts line segments
-// (including the closing edge from last vertex back to first).
-//
-// Bindings:
-//   0: outConnectivity (output) — edge index pairs, 2 per edge
-//   1: cellIds (output) — per-edge cell ID
-//   2: connectivity (input) — flat point IDs for all polygon cells
-//   3: offsets (input) — per-cell start offset into connectivity
-//   4: primitiveCounts (input) — prefix-sum of edge counts
-//   5: params (input) — numCells and cellIdOffset
 kernel void polygonEdgesToLines(
     device uint* outConnectivity [[buffer(0)]],
     device uint* cellIds [[buffer(1)]],
@@ -1320,129 +837,57 @@ kernel void polygonEdgesToLines(
     constant uint* offsets [[buffer(3)]],
     constant uint* primitiveCounts [[buffer(4)]],
     constant TessParams& params [[buffer(5)]],
-    uint gid [[thread_position_in_grid]])
-{
+    uint gid [[thread_position_in_grid]]) {
   if (gid >= params.numCells) return;
 
   uint numEdges = primitiveCounts[gid + 1u] - primitiveCounts[gid];
   uint outputOffset = primitiveCounts[gid] * 2u;
   uint inputOffset = offsets[gid];
 
-  for (uint i = 0u; i < numEdges; i++)
-  {
-    uint p0 = connectivity[inputOffset + i];
-    uint p1 = connectivity[inputOffset + (i + 1u) % numEdges];
-
-    uint edgeId = primitiveCounts[gid] + i;
-    cellIds[edgeId] = gid + params.cellIdOffset;
-
-    outConnectivity[outputOffset] = p0;
-    outConnectivity[outputOffset + 1u] = p1;
+  for (uint i = 0u; i < numEdges; i++) {
+    cellIds[primitiveCounts[gid] + i] = gid + params.cellIdOffset;
+    outConnectivity[outputOffset] = connectivity[inputOffset + i];
+    outConnectivity[outputOffset + 1u] = connectivity[inputOffset + (i + 1u) % numEdges];
     outputOffset += 2u;
   }
 }
 
-// ============================================================================
-// 2D Mapper shaders (P7-7A)
-// ============================================================================
+// ---------------------------------------------------------------------------
+// 2D Mapper shaders
+// ---------------------------------------------------------------------------
+struct Mapper2DState { float4x4 wcvcMatrix; float4 color; float pointSize; float lineWidth; uint flags; };
+struct Vertex2DIn { float2 position [[attribute(0)]]; };
+struct Vertex2DOut { float4 position [[position]]; float4 color; };
 
-// 2D mapper uniforms — orthographic projection + per-draw state
-struct Mapper2DState {
-  float4x4 wcvcMatrix;       // world-to-viewport-clip matrix (orthographic)
-  float4 color;              // base color (RGBA)
-  float pointSize;           // point size in pixels
-  float lineWidth;           // line width in pixels
-  uint flags;                // bit 0: use point color, bit 1: use cell color
-};
-
-// 2D vertex input — position (float2 or float3) + optional color
-struct Vertex2DIn {
-  float2 position [[attribute(0)]];
-};
-
-// 2D vertex output
-struct Vertex2DOut {
-  float4 position [[position]];
-  float4 color;
-};
-
-// 2D vertex shader — transforms 2D positions to clip space using WCVC matrix
-vertex Vertex2DOut vertex_2d_main(
-    Vertex2DIn in [[stage_in]],
-    constant Mapper2DState& state [[buffer(1)]])
-{
+vertex Vertex2DOut vertex_2d_main(Vertex2DIn in [[stage_in]], constant Mapper2DState& state [[buffer(1)]]) {
   Vertex2DOut out;
   out.position = state.wcvcMatrix * float4(in.position, 0.0, 1.0);
   out.color = state.color;
   return out;
 }
 
-// 2D fragment shader — outputs flat color
-fragment float4 fragment_2d_main(
-    Vertex2DOut in [[stage_in]])
-{
+fragment float4 fragment_2d_main(Vertex2DOut in [[stage_in]]) {
   return in.color;
 }
 
-// ============================================================================
-// 8B: Depth Peeling / Correct Translucency (OIT)
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Depth Peeling Shaders
+// ---------------------------------------------------------------------------
+struct PeelUniforms { uint mode; uint peelPass; float2 viewportSize; };
+struct FullscreenVertexOut { float4 position [[position]]; float2 texCoord; };
 
-// Peeling uniforms — passed per render pass
-struct PeelUniforms {
-  uint mode;          // 0=init, 1=peel, 2=alphaBlend
-  uint peelPass;      // current peel iteration
-  float2 viewportSize;
-};
-
-// Fullscreen vertex output (for composite/init passes)
-struct FullscreenVertexOut {
-  float4 position [[position]];
-  float2 texCoord;
-};
-
-// Fullscreen vertex shader — generates a single triangle covering the viewport
 vertex FullscreenVertexOut vertex_fullscreen_main(uint vertex_id [[vertex_id]]) {
-  // Oversized triangle: covers entire viewport with 1 triangle (2 fewer verts than a quad)
-  float2 positions[3] = {
-    float2(-1, -1),
-    float2( 3, -1),
-    float2(-1,  3)
-  };
-  float2 texCoords[3] = {
-    float2(0, 1),
-    float2(2, 1),
-    float2(0, -1)
-  };
+  const float2 positions[3] = { float2(-1, -1), float2( 3, -1), float2(-1,  3) };
+  const float2 texCoords[3] = { float2(0, 1), float2(2, 1), float2(0, -1) };
   FullscreenVertexOut out;
   out.position = float4(positions[vertex_id], 0, 1);
   out.texCoord = texCoords[vertex_id];
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// Depth peeling — fragment output structs
-// ---------------------------------------------------------------------------
+struct PeelInitOutput { float2 depthRange [[color(0)]]; };
+struct PeelPassOutput { float4 backTemp  [[color(0)]]; float4 frontDest [[color(1)]]; float2 depthDest [[color(2)]]; };
 
-// Init pass output: just min/max depth (RG32Float)
-struct PeelInitOutput {
-  float2 depthRange [[color(0)]];
-};
-
-// Peel pass output: back temp, front accumulation, depth range
-struct PeelPassOutput {
-  float4 backTemp  [[color(0)]];   // premultiplied back fragment
-  float4 frontDest [[color(1)]];   // front accumulation (alpha stored as 1-alpha)
-  float2 depthDest [[color(2)]];   // min/max depth for next iteration
-};
-
-// ---------------------------------------------------------------------------
-// Init pass fragment shader — establishes initial min/max depth range
-// Renders translucent geometry with MAX blending to find visible depth bounds.
-// Depth test=Less ensures fragments behind opaque are discarded by hardware.
-// MAX blending on RG32Float target picks the nearest min and farthest max.
-// Depth is negated for min so that MAX(blue) picks the smallest depth.
-// ---------------------------------------------------------------------------
 fragment PeelInitOutput fragment_peel_init(
     VertexOut in [[stage_in]],
     constant MaterialUniforms& material [[buffer(0)]],
@@ -1452,28 +897,14 @@ fragment PeelInitOutput fragment_peel_init(
     constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
     texture2d<float> actorTexture [[texture(0)]],
     sampler actorSampler [[sampler(0)]]) {
-  // P1-6: discard fragments outside clip planes
-  if (clipPlanes.numClipPlanes > 0 && in.clipDistances.x < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 1 && in.clipDistances.y < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 2 && in.clipDistances.z < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 3 && in.clipDistances.w < 0.0) discard_fragment();
+  
+  if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
 
   PeelInitOutput out;
-  float depth = in.position.z;
-  // Negate min depth so that MAX blending picks the nearest (smallest) depth
-  out.depthRange = float2(-depth, depth);
+  out.depthRange = float2(-in.position.z, in.position.z);
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// Peel pass fragment shader — main depth peeling logic
-// Reads previous depth range and front accumulation, outputs to three targets.
-// Uses the four-zone algorithm from vtkDualDepthPeelingPass:
-//   Zone 1 (outside):   fragment is irrelevant, pass through previous data
-//   Zone 2 (inside):    fragment will be peeled later, mark its depth
-//   Zone 3 (on front):  nearest unpeeled fragment, under-blend into front
-//   Zone 4 (on back):   farthest unpeeled fragment, premultiply and output
-// ---------------------------------------------------------------------------
 fragment PeelPassOutput fragment_peel(
     VertexOut in [[stage_in]],
     constant MaterialUniforms& material [[buffer(0)]],
@@ -1485,136 +916,62 @@ fragment PeelPassOutput fragment_peel(
     sampler actorSampler [[sampler(0)]],
     texture2d<float, access::read> prevFrontTex [[texture(1)]],
     texture2d<float, access::read> prevDepthTex [[texture(2)]]) {
-  // P1-6: discard fragments outside clip planes
-  if (clipPlanes.numClipPlanes > 0 && in.clipDistances.x < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 1 && in.clipDistances.y < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 2 && in.clipDistances.z < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 3 && in.clipDistances.w < 0.0) discard_fragment();
+  
+  if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
 
-  // Compute pixel coordinates for texture reads
   uint2 pixel = uint2(in.position.xy) - uint2(scene.viewport.xy);
-
-  // Read previous peel state
   float4 prevFront = prevFrontTex.read(pixel);
   float2 prevDepth = prevDepthTex.read(pixel).rg;
-  float minDepth = -prevDepth.x;  // negate back to positive
+  
+  float minDepth = -prevDepth.x;
   float maxDepth = prevDepth.y;
   float fragDepth = in.position.z;
   float epsilon = 0.0000001;
 
-  // Default outputs: pass through previous state, no depth change
   PeelPassOutput out;
   out.backTemp = float4(0.0);
   out.frontDest = prevFront;
   out.depthDest = float2(-1.0, -1.0);
 
-  // Compute fragment color via Phong lighting (same as fragment_main)
+  // Early depth out to prevent highly expensive texture / lighting recalculations for overlapping zones
+  if (fragDepth < minDepth - epsilon || fragDepth > maxDepth + epsilon) return out;
+  if (fragDepth > minDepth + epsilon && fragDepth < maxDepth - epsilon) {
+    out.depthDest = float2(-fragDepth, fragDepth);
+    return out;
+  }
+
   float3 N = normalize(in.viewNormal);
   bool hasVertexColors = (scene.flags & (1u << 8)) != 0u;
   float3 ambientColor = hasVertexColors ? in.vertexColor.rgb : material.ambientColor.rgb;
-  float ambientIntensity = material.ambientColor.w;
   float3 diffuseColor = hasVertexColors ? in.vertexColor.rgb : material.diffuseColor.rgb;
-  float diffuseIntensity = material.diffuseColor.w;
-  float3 specularColor = material.specularColor.rgb;
-  float specularIntensity = material.specularColor.w;
   float baseOpacity = hasVertexColors ? in.vertexColor.a : material.opacity;
 
-  // P5-5A: texture sampling
-  bool hasTexture = (scene.flags & (1u << 9)) != 0u;
-  if (hasTexture) {
+  if ((scene.flags & (1u << 9)) != 0u) {
     float4 texColor = actorTexture.sample(actorSampler, in.uv);
     ambientColor *= texColor.rgb;
     diffuseColor *= texColor.rgb;
     baseOpacity *= texColor.a;
   }
 
-  float3 totalAmbient = ambientIntensity * ambientColor;
+  float3 totalAmbient = material.ambientColor.w * ambientColor;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
-  float3 viewDir = normalize(-in.viewPos);
 
-  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
-    Light L = lights.lights[i];
-    int lightType = int(L.position.w);
-    float3 lightColor = L.color.rgb * L.color.w;
-    float attenuation = 1.0;
-    float df = 0.0;
-    float3 reflDir = float3(0.0);
-    float3 toLight = float3(0.0);
+  computePhongLighting(N, in.viewPos, diffuseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
 
-    if (lightType == 0) {
-      toLight = float3(0.0, 0.0, 1.0);
-      df = max(N.z, 0.000001);
-      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
-    } else if (lightType == 1) {
-      toLight = normalize(-L.direction.xyz);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(L.direction.xyz, N);
-    } else {
-      toLight = L.position.xyz - in.viewPos;
-      float dist = length(toLight);
-      toLight /= dist;
-      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(-toLight, N);
-      if (lightType == 3) {
-        float3 spotDir = normalize(L.direction.xyz);
-        float spotCos = dot(-toLight, spotDir);
-        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
-        if (spotCos > spotCutoff) {
-          attenuation *= pow(spotCos, L.attenuation.w);
-        } else {
-          attenuation = 0.0;
-        }
-      }
-    }
-    totalDiffuse += df * diffuseColor * lightColor * attenuation;
-    float NdotL = max(dot(N, toLight), 0.0);
-    if (NdotL > 0.0) {
-      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
-      totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
-    }
-  }
+  float3 fragRGB = totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular;
 
-  float3 fragRGB = totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular;
-  float fragAlpha = baseOpacity;
-
-  // Four-zone depth comparison
-  // Zone 1: Outside current peels — fragment is irrelevant
-  if (fragDepth < minDepth - epsilon || fragDepth > maxDepth + epsilon) {
-    return out;
-  }
-
-  // Zone 2: Strictly inside current peels — will be peeled in a future pass
-  if (fragDepth > minDepth + epsilon && fragDepth < maxDepth - epsilon) {
-    out.depthDest = float2(-fragDepth, fragDepth);
-    return out;
-  }
-
-  // Zone 3: On the front peel (nearest unpeeled)
   if (fragDepth >= minDepth - epsilon && fragDepth <= minDepth + epsilon) {
-    float prevAlpha = 1.0 - prevFront.a;  // stored as (1-alpha), convert back
-    // Under-blend: accumulate front-to-back
-    out.frontDest.rgb = prevAlpha * fragAlpha * fragRGB + prevFront.rgb;
-    out.frontDest.a = 1.0 - (prevAlpha * (1.0 - fragAlpha));  // store as (1-newAlpha)
-    return out;
-  }
-
-  // Zone 4: On the back peel (farthest unpeeled)
-  if (fragDepth >= maxDepth - epsilon && fragDepth <= maxDepth + epsilon) {
-    out.backTemp = float4(fragRGB * fragAlpha, fragAlpha);  // premultiplied alpha
-    return out;
+    float prevAlpha = 1.0 - prevFront.a;
+    out.frontDest.rgb = prevAlpha * baseOpacity * fragRGB + prevFront.rgb;
+    out.frontDest.a = 1.0 - (prevAlpha * (1.0 - baseOpacity));
+  } else if (fragDepth >= maxDepth - epsilon && fragDepth <= maxDepth + epsilon) {
+    out.backTemp = float4(fragRGB * baseOpacity, baseOpacity);
   }
 
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// Alpha blend pass fragment shader — blends remaining unpeeled fragments
-// Used when the peel loop terminates early (occlusion threshold exceeded).
-// Discards fragments outside the last peel depth range.
-// Outputs premultiplied fragment color for over-blending into back accumulation.
-// ---------------------------------------------------------------------------
 fragment float4 fragment_peel_alpha_blend(
     VertexOut in [[stage_in]],
     constant MaterialUniforms& material [[buffer(0)]],
@@ -1625,211 +982,93 @@ fragment float4 fragment_peel_alpha_blend(
     texture2d<float> actorTexture [[texture(0)]],
     sampler actorSampler [[sampler(0)]],
     texture2d<float, access::read> prevDepthTex [[texture(2)]]) {
-  // P1-6: discard fragments outside clip planes
-  if (clipPlanes.numClipPlanes > 0 && in.clipDistances.x < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 1 && in.clipDistances.y < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 2 && in.clipDistances.z < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 3 && in.clipDistances.w < 0.0) discard_fragment();
+  
+  if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
 
   uint2 pixel = uint2(in.position.xy) - uint2(scene.viewport.xy);
   float2 prevDepth = prevDepthTex.read(pixel).rg;
-  float minDepth = -prevDepth.x;
-  float maxDepth = prevDepth.y;
   float fragDepth = in.position.z;
   float epsilon = 0.0000001;
 
-  // Discard fragments outside the last peel range
-  if (fragDepth < minDepth - epsilon || fragDepth > maxDepth + epsilon) {
-    discard_fragment();
-  }
+  if (fragDepth < -prevDepth.x - epsilon || fragDepth > prevDepth.y + epsilon) discard_fragment();
 
-  // Compute fragment color (same Phong lighting)
   float3 N = normalize(in.viewNormal);
   bool hasVertexColors = (scene.flags & (1u << 8)) != 0u;
   float3 ambientColor = hasVertexColors ? in.vertexColor.rgb : material.ambientColor.rgb;
-  float ambientIntensity = material.ambientColor.w;
   float3 diffuseColor = hasVertexColors ? in.vertexColor.rgb : material.diffuseColor.rgb;
-  float diffuseIntensity = material.diffuseColor.w;
-  float3 specularColor = material.specularColor.rgb;
-  float specularIntensity = material.specularColor.w;
   float baseOpacity = hasVertexColors ? in.vertexColor.a : material.opacity;
 
-  bool hasTexture = (scene.flags & (1u << 9)) != 0u;
-  if (hasTexture) {
+  if ((scene.flags & (1u << 9)) != 0u) {
     float4 texColor = actorTexture.sample(actorSampler, in.uv);
     ambientColor *= texColor.rgb;
     diffuseColor *= texColor.rgb;
     baseOpacity *= texColor.a;
   }
 
-  float3 totalAmbient = ambientIntensity * ambientColor;
+  float3 totalAmbient = material.ambientColor.w * ambientColor;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
-  float3 viewDir = normalize(-in.viewPos);
 
-  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
-    Light L = lights.lights[i];
-    int lightType = int(L.position.w);
-    float3 lightColor = L.color.rgb * L.color.w;
-    float attenuation = 1.0;
-    float df = 0.0;
-    float3 reflDir = float3(0.0);
-    float3 toLight = float3(0.0);
+  computePhongLighting(N, in.viewPos, diffuseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
 
-    if (lightType == 0) {
-      toLight = float3(0.0, 0.0, 1.0);
-      df = max(N.z, 0.000001);
-      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
-    } else if (lightType == 1) {
-      toLight = normalize(-L.direction.xyz);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(L.direction.xyz, N);
-    } else {
-      toLight = L.position.xyz - in.viewPos;
-      float dist = length(toLight);
-      toLight /= dist;
-      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(-toLight, N);
-      if (lightType == 3) {
-        float3 spotDir = normalize(L.direction.xyz);
-        float spotCos = dot(-toLight, spotDir);
-        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
-        if (spotCos > spotCutoff) {
-          attenuation *= pow(spotCos, L.attenuation.w);
-        } else {
-          attenuation = 0.0;
-        }
-      }
-    }
-    totalDiffuse += df * diffuseColor * lightColor * attenuation;
-    float NdotL = max(dot(N, toLight), 0.0);
-    if (NdotL > 0.0) {
-      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
-      totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
-    }
-  }
-
-  float3 fragRGB = totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular;
-  float fragAlpha = baseOpacity;
-  return float4(fragRGB * fragAlpha, fragAlpha);  // premultiplied alpha
+  float3 fragRGB = totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular;
+  return float4(fragRGB * baseOpacity, baseOpacity);
 }
 
-// ---------------------------------------------------------------------------
-// Composite pass fragment shader — composites front and back accumulation
-// onto the framebuffer. Front accumulation has alpha stored as (1-alpha).
-// Uses premultiplied-alpha over-blending: src=One, dst=OneMinusSrcAlpha.
-// ---------------------------------------------------------------------------
 fragment float4 fragment_peel_composite(
     FullscreenVertexOut in [[stage_in]],
     texture2d<float, access::read> frontTex [[texture(0)]],
     texture2d<float, access::read> backTex [[texture(1)]]) {
+  
   uint2 pixel = uint2(in.position.xy);
   float4 front = frontTex.read(pixel);
   float4 back = backTex.read(pixel);
 
-  float frontAlpha = 1.0 - front.a;  // stored as (1-alpha), convert back
-  // Under-blend: back underneath front
-  float3 color = front.rgb + back.rgb * frontAlpha;
-  // Convert under-blend alpha to over-blend alpha for final compositing
-  float alpha = 1.0 - frontAlpha * (1.0 - back.a);
-
-  return float4(color, alpha);
+  float frontAlpha = 1.0 - front.a;
+  return float4(front.rgb + back.rgb * frontAlpha, 1.0 - frontAlpha * (1.0 - back.a));
 }
 
-// ---------------------------------------------------------------------------
-// Back blend pass fragment shader — blends BackTemp into Back accumulation
-// Fullscreen quad that reads BackTemp and over-blends into the back buffer.
-// Discards fragments with zero alpha (no back fragment this peel).
-// Uses premultiplied-alpha over-blending.
-// ---------------------------------------------------------------------------
 fragment float4 fragment_peel_back_blend(
     FullscreenVertexOut in [[stage_in]],
     texture2d<float, access::read> backTempTex [[texture(0)]]) {
-  uint2 pixel = uint2(in.position.xy);
-  float4 backTemp = backTempTex.read(pixel);
-
-  // Discard if no back fragment was written
+  
+  float4 backTemp = backTempTex.read(uint2(in.position.xy));
   if (backTemp.a < 0.001) discard_fragment();
-
-  // BackTemp is already premultiplied, pass through for over-blending
   return backTemp;
 }
 
 // ---------------------------------------------------------------------------
-// P7-7D: Glyph3D instanced rendering
-//
-// Vertex function that renders source geometry (triangles) with per-instance
-// glyph transforms, colors, and pick IDs. Each instance is a glyph placed at
-// an input point with optional scaling, rotation, and color.
-//
-// Source geometry (per-vertex):
-//   buffer(0) = positions (float3)
-//   buffer(1) = normals (float3)
-//
-// Instance data (per-instance, stepFunctionPerInstance):
-//   buffer(2)  = glyph transforms (float4x4 per instance, column-major)
-//   buffer(3)  = glyph normal transforms (float3x3 per instance, column-major)
-//   buffer(4)  = glyph colors (float4 per instance, RGBA)
-//   buffer(5)  = glyph pick IDs (uint per instance)
-//
-// Uniforms:
-//   buffer(8)  = SceneUniforms (vertex + fragment)
-//   buffer(9)  = ClipPlaneUniforms (vertex + fragment)
-//
-// Fragment uniforms:
-//   buffer(0)  = MaterialUniforms
-//   buffer(1)  = LightUniforms
-//   buffer(2)  = SceneUniforms (shared with vertex)
-//   buffer(3)  = CoincidentOffsetUniforms
-//   buffer(9)  = ClipPlaneUniforms (shared with vertex)
+// Glyph3D Shaders
 // ---------------------------------------------------------------------------
-
 struct GlyphVertexOut {
   float4 position [[position]];
   float3 viewPos;
   float3 viewNormal;
   float4 glyphColor;
-  float4 clipDistances;
+  float3 modelPos;
   uint cellId;
   uint propId;
 };
 
 vertex GlyphVertexOut vertex_glyph_main(
-    uint vertex_id [[vertex_id]],
-    uint instance_id [[instance_id]],
-    constant float3* positions [[buffer(0)]],
-    constant float3* normals [[buffer(1)]],
-    constant float4x4* glyphTransforms [[buffer(2)]],
-    constant float3x3* glyphNormalTransforms [[buffer(3)]],
-    constant float4* glyphColors [[buffer(4)]],
-    constant uint* glyphPickIds [[buffer(5)]],
-    constant SceneUniforms& scene [[buffer(8)]],
-    constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
+    uint vertex_id [[vertex_id]], uint instance_id [[instance_id]],
+    constant float3* positions [[buffer(0)]], constant float3* normals [[buffer(1)]],
+    constant float4x4* glyphTransforms [[buffer(2)]], constant float3x3* glyphNormalTransforms [[buffer(3)]],
+    constant float4* glyphColors [[buffer(4)]], constant uint* glyphPickIds [[buffer(5)]],
+    constant SceneUniforms& scene [[buffer(8)]], constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
     constant uint& propId [[buffer(10)]]) {
+  
   GlyphVertexOut out;
-
   float3 pos = positions[vertex_id];
-  float3 norm = normals[vertex_id];
-
-  float4x4 glyphTransform = glyphTransforms[instance_id];
-  float3x3 normalTransform = glyphNormalTransforms[instance_id];
-
-  float4 worldPos = scene.modelMatrix * glyphTransform * float4(pos, 1.0);
-  float4 viewPos = scene.viewMatrix * worldPos;
-  out.viewPos = viewPos.xyz;
-  out.position = scene.projectionMatrix * viewPos;
-  out.viewNormal = scene.normalMatrix * normalTransform * norm;
+  float4 worldPos = scene.modelMatrix * glyphTransforms[instance_id] * float4(pos, 1.0);
+  
+  out.viewPos = (scene.viewMatrix * worldPos).xyz;
+  out.position = scene.projectionMatrix * float4(out.viewPos, 1.0);
+  out.viewNormal = scene.normalMatrix * glyphNormalTransforms[instance_id] * normals[vertex_id];
   out.glyphColor = glyphColors[instance_id];
   out.cellId = glyphPickIds[instance_id] + 1u;
   out.propId = propId + 1u;
-
-  out.clipDistances = float4(
-    dot(float4(pos, 1.0), clipPlanes.planes[0]),
-    dot(float4(pos, 1.0), clipPlanes.planes[1]),
-    dot(float4(pos, 1.0), clipPlanes.planes[2]),
-    dot(float4(pos, 1.0), clipPlanes.planes[3]));
-
+  out.modelPos = pos;
   return out;
 }
 
@@ -1840,128 +1079,52 @@ fragment FragmentOutput fragment_glyph_main(
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
     constant ClipPlaneUniforms& clipPlanes [[buffer(9)]]) {
-  if (clipPlanes.numClipPlanes > 0 && in.clipDistances.x < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 1 && in.clipDistances.y < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 2 && in.clipDistances.z < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 3 && in.clipDistances.w < 0.0) discard_fragment();
+  
+  if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
 
   float3 N = normalize(in.viewNormal);
-  float3 ambientColor = in.glyphColor.rgb;
-  float ambientIntensity = material.ambientColor.w;
-  float3 diffuseColor = in.glyphColor.rgb;
-  float diffuseIntensity = material.diffuseColor.w;
-  float3 specularColor = material.specularColor.rgb;
-  float specularIntensity = material.specularColor.w;
-  float baseOpacity = in.glyphColor.a;
-
-  float3 totalAmbient = ambientIntensity * ambientColor;
+  float3 totalAmbient = material.ambientColor.w * in.glyphColor.rgb;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
-  float3 viewDir = normalize(-in.viewPos);
 
-  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
-    Light L = lights.lights[i];
-    int lightType = int(L.position.w);
-    float3 lightColor = L.color.rgb * L.color.w;
-    float attenuation = 1.0;
-    float df = 0.0;
-    float3 reflDir = float3(0.0);
-    float3 toLight = float3(0.0);
-
-    if (lightType == 0) {
-      toLight = float3(0.0, 0.0, 1.0);
-      df = max(N.z, 0.000001);
-      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
-    } else if (lightType == 1) {
-      toLight = normalize(-L.direction.xyz);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(L.direction.xyz, N);
-    } else {
-      toLight = L.position.xyz - in.viewPos;
-      float dist = length(toLight);
-      toLight /= dist;
-      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(-toLight, N);
-      if (lightType == 3) {
-        float3 spotDir = normalize(L.direction.xyz);
-        float spotCos = dot(-toLight, spotDir);
-        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
-        if (spotCos > spotCutoff) {
-          attenuation *= pow(spotCos, L.attenuation.w);
-        } else {
-          attenuation = 0.0;
-        }
-      }
-    }
-    totalDiffuse += df * diffuseColor * lightColor * attenuation;
-    float NdotL = max(dot(N, toLight), 0.0);
-    if (NdotL > 0.0) {
-      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
-      totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
-    }
-  }
+  computePhongLighting(N, in.viewPos, in.glyphColor.rgb, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
 
   FragmentOutput out;
-  out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular,
-                     baseOpacity * material.opacity);
+  out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, in.glyphColor.a * material.opacity);
   out.ids = uint4(in.cellId, in.propId, 1u, 0u);
   out.depth = in.position.z;
   return out;
 }
-
-// ---------------------------------------------------------------------------
-// P7-7D: Glyph3D line source geometry vertex shader
-//
-// Same as glyph triangle shader but draws as line segments (MTLPrimitiveTypeLine).
-// Buffer layout identical to vertex_glyph_main.
-// ---------------------------------------------------------------------------
 
 struct GlyphLineVertexOut {
   float4 position [[position]];
   float3 viewPos;
   float3 viewNormal;
   float4 glyphColor;
-  float4 clipDistances;
+  float3 modelPos;
   uint cellId;
   uint propId;
 };
 
 vertex GlyphLineVertexOut vertex_glyph_line_main(
-    uint vertex_id [[vertex_id]],
-    uint instance_id [[instance_id]],
-    constant float3* positions [[buffer(0)]],
-    constant float3* normals [[buffer(1)]],
-    constant float4x4* glyphTransforms [[buffer(2)]],
-    constant float3x3* glyphNormalTransforms [[buffer(3)]],
-    constant float4* glyphColors [[buffer(4)]],
-    constant uint* glyphPickIds [[buffer(5)]],
-    constant SceneUniforms& scene [[buffer(8)]],
-    constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
+    uint vertex_id [[vertex_id]], uint instance_id [[instance_id]],
+    constant float3* positions [[buffer(0)]], constant float3* normals [[buffer(1)]],
+    constant float4x4* glyphTransforms [[buffer(2)]], constant float3x3* glyphNormalTransforms [[buffer(3)]],
+    constant float4* glyphColors [[buffer(4)]], constant uint* glyphPickIds [[buffer(5)]],
+    constant SceneUniforms& scene [[buffer(8)]], constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
     constant uint& propId [[buffer(10)]]) {
+  
   GlyphLineVertexOut out;
-
   float3 pos = positions[vertex_id];
-  float3 norm = normals[vertex_id];
-
-  float4x4 glyphTransform = glyphTransforms[instance_id];
-  float3x3 normalTransform = glyphNormalTransforms[instance_id];
-
-  float4 worldPos = scene.modelMatrix * glyphTransform * float4(pos, 1.0);
-  float4 viewPos = scene.viewMatrix * worldPos;
-  out.viewPos = viewPos.xyz;
-  out.position = scene.projectionMatrix * viewPos;
-  out.viewNormal = scene.normalMatrix * normalTransform * norm;
+  float4 worldPos = scene.modelMatrix * glyphTransforms[instance_id] * float4(pos, 1.0);
+  
+  out.viewPos = (scene.viewMatrix * worldPos).xyz;
+  out.position = scene.projectionMatrix * float4(out.viewPos, 1.0);
+  out.viewNormal = scene.normalMatrix * glyphNormalTransforms[instance_id] * normals[vertex_id];
   out.glyphColor = glyphColors[instance_id];
   out.cellId = glyphPickIds[instance_id] + 1u;
   out.propId = propId + 1u;
-
-  out.clipDistances = float4(
-    dot(float4(pos, 1.0), clipPlanes.planes[0]),
-    dot(float4(pos, 1.0), clipPlanes.planes[1]),
-    dot(float4(pos, 1.0), clipPlanes.planes[2]),
-    dot(float4(pos, 1.0), clipPlanes.planes[3]));
-
+  out.modelPos = pos;
   return out;
 }
 
@@ -1972,130 +1135,54 @@ fragment FragmentOutput fragment_glyph_line_main(
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
     constant ClipPlaneUniforms& clipPlanes [[buffer(9)]]) {
-  if (clipPlanes.numClipPlanes > 0 && in.clipDistances.x < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 1 && in.clipDistances.y < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 2 && in.clipDistances.z < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 3 && in.clipDistances.w < 0.0) discard_fragment();
+  
+  if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
 
   float3 N = normalize(in.viewNormal);
-  float3 ambientColor = in.glyphColor.rgb;
-  float ambientIntensity = material.ambientColor.w;
-  float3 diffuseColor = in.glyphColor.rgb;
-  float diffuseIntensity = material.diffuseColor.w;
-  float3 specularColor = material.specularColor.rgb;
-  float specularIntensity = material.specularColor.w;
-  float baseOpacity = in.glyphColor.a;
-
-  float3 totalAmbient = ambientIntensity * ambientColor;
+  float3 totalAmbient = material.ambientColor.w * in.glyphColor.rgb;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
-  float3 viewDir = normalize(-in.viewPos);
 
-  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
-    Light L = lights.lights[i];
-    int lightType = int(L.position.w);
-    float3 lightColor = L.color.rgb * L.color.w;
-    float attenuation = 1.0;
-    float df = 0.0;
-    float3 reflDir = float3(0.0);
-    float3 toLight = float3(0.0);
-
-    if (lightType == 0) {
-      toLight = float3(0.0, 0.0, 1.0);
-      df = max(N.z, 0.000001);
-      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
-    } else if (lightType == 1) {
-      toLight = normalize(-L.direction.xyz);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(L.direction.xyz, N);
-    } else {
-      toLight = L.position.xyz - in.viewPos;
-      float dist = length(toLight);
-      toLight /= dist;
-      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(-toLight, N);
-      if (lightType == 3) {
-        float3 spotDir = normalize(L.direction.xyz);
-        float spotCos = dot(-toLight, spotDir);
-        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
-        if (spotCos > spotCutoff) {
-          attenuation *= pow(spotCos, L.attenuation.w);
-        } else {
-          attenuation = 0.0;
-        }
-      }
-    }
-    totalDiffuse += df * diffuseColor * lightColor * attenuation;
-    float NdotL = max(dot(N, toLight), 0.0);
-    if (NdotL > 0.0) {
-      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
-      totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
-    }
-  }
+  computePhongLighting(N, in.viewPos, in.glyphColor.rgb, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
 
   FragmentOutput out;
-  out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular,
-                     baseOpacity * material.opacity);
+  out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, in.glyphColor.a * material.opacity);
   out.ids = uint4(in.cellId, in.propId, 1u, 0u);
   out.depth = in.position.z;
   return out;
 }
-
-// ---------------------------------------------------------------------------
-// P7-7D: Glyph3D point source geometry vertex shader
-//
-// Renders glyph source points. Same instance data as triangle/line glyphs.
-// Uses MTLPrimitiveTypePoint with point size from SceneUniforms.
-// ---------------------------------------------------------------------------
 
 struct GlyphPointVertexOut {
   float4 position [[position]];
   float3 viewPos;
   float3 viewNormal;
   float4 glyphColor;
-  float4 clipDistances;
+  float3 modelPos;
   uint cellId;
   uint propId;
-  float point_size;
+  float point_size [[point_size]];
 };
 
 vertex GlyphPointVertexOut vertex_glyph_point_main(
-    uint vertex_id [[vertex_id]],
-    uint instance_id [[instance_id]],
-    constant float3* positions [[buffer(0)]],
-    constant float3* normals [[buffer(1)]],
-    constant float4x4* glyphTransforms [[buffer(2)]],
-    constant float3x3* glyphNormalTransforms [[buffer(3)]],
-    constant float4* glyphColors [[buffer(4)]],
-    constant uint* glyphPickIds [[buffer(5)]],
-    constant SceneUniforms& scene [[buffer(8)]],
-    constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
+    uint vertex_id [[vertex_id]], uint instance_id [[instance_id]],
+    constant float3* positions [[buffer(0)]], constant float3* normals [[buffer(1)]],
+    constant float4x4* glyphTransforms [[buffer(2)]], constant float3x3* glyphNormalTransforms [[buffer(3)]],
+    constant float4* glyphColors [[buffer(4)]], constant uint* glyphPickIds [[buffer(5)]],
+    constant SceneUniforms& scene [[buffer(8)]], constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
     constant uint& propId [[buffer(10)]]) {
+  
   GlyphPointVertexOut out;
-
   float3 pos = positions[vertex_id];
-  float3 norm = normals[vertex_id];
-
-  float4x4 glyphTransform = glyphTransforms[instance_id];
-  float3x3 normalTransform = glyphNormalTransforms[instance_id];
-
-  float4 worldPos = scene.modelMatrix * glyphTransform * float4(pos, 1.0);
-  float4 viewPos = scene.viewMatrix * worldPos;
-  out.viewPos = viewPos.xyz;
-  out.position = scene.projectionMatrix * viewPos;
-  out.viewNormal = scene.normalMatrix * normalTransform * norm;
+  float4 worldPos = scene.modelMatrix * glyphTransforms[instance_id] * float4(pos, 1.0);
+  
+  out.viewPos = (scene.viewMatrix * worldPos).xyz;
+  out.position = scene.projectionMatrix * float4(out.viewPos, 1.0);
+  out.viewNormal = scene.normalMatrix * glyphNormalTransforms[instance_id] * normals[vertex_id];
   out.glyphColor = glyphColors[instance_id];
   out.cellId = glyphPickIds[instance_id] + 1u;
   out.propId = propId + 1u;
   out.point_size = scene.pointSize;
-
-  out.clipDistances = float4(
-    dot(float4(pos, 1.0), clipPlanes.planes[0]),
-    dot(float4(pos, 1.0), clipPlanes.planes[1]),
-    dot(float4(pos, 1.0), clipPlanes.planes[2]),
-    dot(float4(pos, 1.0), clipPlanes.planes[3]));
-
+  out.modelPos = pos;
   return out;
 }
 
@@ -2106,75 +1193,23 @@ fragment FragmentOutput fragment_glyph_point_main(
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
     constant ClipPlaneUniforms& clipPlanes [[buffer(9)]]) {
-  if (clipPlanes.numClipPlanes > 0 && in.clipDistances.x < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 1 && in.clipDistances.y < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 2 && in.clipDistances.z < 0.0) discard_fragment();
-  if (clipPlanes.numClipPlanes > 3 && in.clipDistances.w < 0.0) discard_fragment();
+  
+  if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
 
   float3 N = normalize(in.viewNormal);
-  float3 ambientColor = in.glyphColor.rgb;
-  float ambientIntensity = material.ambientColor.w;
-  float3 diffuseColor = in.glyphColor.rgb;
-  float diffuseIntensity = material.diffuseColor.w;
-  float3 specularColor = material.specularColor.rgb;
-  float specularIntensity = material.specularColor.w;
-  float baseOpacity = in.glyphColor.a;
-
-  float3 totalAmbient = ambientIntensity * ambientColor;
+  float3 totalAmbient = material.ambientColor.w * in.glyphColor.rgb;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
-  float3 viewDir = normalize(-in.viewPos);
 
-  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
-    Light L = lights.lights[i];
-    int lightType = int(L.position.w);
-    float3 lightColor = L.color.rgb * L.color.w;
-    float attenuation = 1.0;
-    float df = 0.0;
-    float3 reflDir = float3(0.0);
-    float3 toLight = float3(0.0);
-
-    if (lightType == 0) {
-      toLight = float3(0.0, 0.0, 1.0);
-      df = max(N.z, 0.000001);
-      reflDir = reflect(float3(0.0, 0.0, -1.0), N);
-    } else if (lightType == 1) {
-      toLight = normalize(-L.direction.xyz);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(L.direction.xyz, N);
-    } else {
-      toLight = L.position.xyz - in.viewPos;
-      float dist = length(toLight);
-      toLight /= dist;
-      attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
-      df = max(dot(N, toLight), 0.0);
-      reflDir = reflect(-toLight, N);
-      if (lightType == 3) {
-        float3 spotDir = normalize(L.direction.xyz);
-        float spotCos = dot(-toLight, spotDir);
-        float spotCutoff = cos(L.direction.w * M_PI_F / 180.0);
-        if (spotCos > spotCutoff) {
-          attenuation *= pow(spotCos, L.attenuation.w);
-        } else {
-          attenuation = 0.0;
-        }
-      }
-    }
-    totalDiffuse += df * diffuseColor * lightColor * attenuation;
-    float NdotL = max(dot(N, toLight), 0.0);
-    if (NdotL > 0.0) {
-      float sf = pow(max(dot(viewDir, reflDir), 0.0), material.specularPower);
-      totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
-    }
-  }
+  computePhongLighting(N, in.viewPos, in.glyphColor.rgb, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
 
   FragmentOutput out;
-  out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular,
-                     baseOpacity * material.opacity);
+  out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, in.glyphColor.a * material.opacity);
   out.ids = uint4(in.cellId, in.propId, 1u, 0u);
   out.depth = in.position.z + coinOffset.pointOffset / 65000.0;
   return out;
 }
+
 
 // ============================================================================
 // Volume Ray Casting Mapper
@@ -2193,35 +1228,32 @@ struct VolumeMapperUniforms {
   float useJittering;
   float4x4 inverseViewProjection;
   float2 viewportSize;
-  // Gradient-based shading
-  float3 gradientStep;        // 1/(dims-1) per axis in [0,1] volume space
-  float useGradientShading;   // 1.0 = compute gradients and apply Phong lighting
-  float2 gradientOpacityRange; // (0, 0.25 * scalarRange) for normalizing gradient magnitude
-  float useGradientOpacity;   // 1.0 = modulate opacity by gradient magnitude
-  float4 ambientColor;        // material ambient (RGB, unused A)
-  float4 diffuseColor;        // material diffuse (RGB, unused A)
-  float4 specularColor;       // material specular (RGB, unused A)
-  float shininess;            // specular power
-  float3 lightDirection;      // unit vector toward light in volume-local [0,1] space
+  float3 gradientStep;
+  float useGradientShading;
+  float2 gradientOpacityRange;
+  float useGradientOpacity;
+  float4 ambientColor;
+  float4 diffuseColor;
+  float4 specularColor;
+  float shininess;
+  float3 lightDirection;
   float _pad2;
-  // Cropping regions
-  float4 croppingPlanes;       // (minX, maxX, minY, maxY) in [0,1] volume space
-  float4 croppingPlanes2;      // (minZ, maxZ, 0, 0)
-  float4 croppingFlagsRow0;    // flags[0..3] as float
-  float4 croppingFlagsRow1;    // flags[4..7]
-  float4 croppingFlagsRow2;    // flags[8..11]
-  float4 croppingFlagsRow3;    // flags[12..15]
-  float4 croppingFlagsRow4;    // flags[16..19]
-  float4 croppingFlagsRow5;    // flags[20..23]
-  float4 croppingFlagsRow6;    // flags[24..27]
-  float4 croppingFlagsRow7;    // flags[28..31]
-  float useCropping;           // 1.0 = enable cropping, 0.0 = disable
-  // Clipping planes (up to 8 arbitrary planes)
-  float useClipping;           // 1.0 = enable clipping, 0.0 = disable
-  float numClippingPlanes;     // number of clipping planes (0-8)
-  float _padClipping[2];      // pad to 16-byte for float4 arrays
-  float4 clippingPlane0Origin; // origin.xyz, 1.0
-  float4 clippingPlane0Normal; // normal.xyz, 0.0
+  float4 croppingPlanes;
+  float4 croppingPlanes2;
+  float4 croppingFlagsRow0;
+  float4 croppingFlagsRow1;
+  float4 croppingFlagsRow2;
+  float4 croppingFlagsRow3;
+  float4 croppingFlagsRow4;
+  float4 croppingFlagsRow5;
+  float4 croppingFlagsRow6;
+  float4 croppingFlagsRow7;
+  float useCropping;
+  float useClipping;
+  float numClippingPlanes;
+  float _padClipping[2];
+  float4 clippingPlane0Origin;
+  float4 clippingPlane0Normal;
   float4 clippingPlane1Origin;
   float4 clippingPlane1Normal;
   float4 clippingPlane2Origin;
@@ -2236,13 +1268,12 @@ struct VolumeMapperUniforms {
   float4 clippingPlane6Normal;
   float4 clippingPlane7Origin;
   float4 clippingPlane7Normal;
-  // Mask / label map support
-  float useMask;             // 1.0 = enable mask/label map, 0.0 = disable
-  float maskBlendFactor;     // 0.0 = use default TF, 1.0 = use label map TF
-  float maskScale;           // scale for normalizing mask values
-  float maskBias;            // bias for normalizing mask values
-  float labelMapNumLabels;   // number of labels (max label value)
-  float _padMask[3];         // pad to 16-byte alignment
+  float useMask;
+  float maskBlendFactor;
+  float maskScale;
+  float maskBias;
+  float labelMapNumLabels;
+  float _padMask[3];
 };
 
 struct VolumeVertexOut {
@@ -2250,8 +1281,6 @@ struct VolumeVertexOut {
   float3 localPos;
 };
 
-// Volume vertex shader — transforms bounding box vertices and computes
-// local-space position for ray entry in the fragment shader.
 struct VolumeVertexIn {
   float3 position [[attribute(0)]];
 };
@@ -2262,48 +1291,29 @@ vertex VolumeVertexOut vertex_volume_main(
   VolumeVertexOut out;
 
   float3 modelPos = in.position;
-  float4 worldPos = volumeUniforms.volumeToWorld * float4(modelPos, 1.0);
-  out.position = volumeUniforms.viewProjection * worldPos;
-
-  float3 boundsSize = volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz;
-  out.localPos = (modelPos - volumeUniforms.volumeBoundsMin.xyz) / boundsSize;
-
+  out.position = volumeUniforms.viewProjection * volumeUniforms.volumeToWorld * float4(modelPos, 1.0);
+  out.localPos = (modelPos - volumeUniforms.volumeBoundsMin.xyz) / (volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz);
   return out;
 }
 
-struct VolumeFragmentOut {
-  float4 color [[color(0)]];
-};
+struct VolumeFragmentOut { float4 color [[color(0)]]; };
 
 constant int MAX_RAY_STEPS = 2000;
 
-// Pseudo-random for jittering
 inline float volume_random(float2 st) {
   return fract(sin(dot(st.xy, float2(12.9898, 78.233))) * 43758.5453123);
 }
 
-// Ray-box intersection
 inline float2 intersectBox(float3 orig, float3 dir, float3 boxMin, float3 boxMax) {
   float3 invDir = 1.0 / (dir + float3(1e-8));
   float3 tbot = invDir * (boxMin - orig);
   float3 ttop = invDir * (boxMax - orig);
   float3 tmin = min(ttop, tbot);
   float3 tmax = max(ttop, tbot);
-  float t0 = max(max(tmin.x, tmin.y), tmin.z);
-  float t1 = min(min(tmax.x, tmax.y), tmax.z);
-  return float2(t0, t1);
+  return float2(max(max(tmin.x, tmin.y), tmin.z), min(min(tmax.x, tmax.y), tmax.z));
 }
 
-// ---------------------------------------------------------------------------
-// Gradient-based shading helpers
-// ---------------------------------------------------------------------------
-
-// Compute gradient via central differences on the scalar field.
-// Returns (normalized_direction.xyz, gradient_magnitude) where magnitude
-// is in [0, 1] normalized to gradNormFactor (0.25 * scalarRange).
-inline float4 computeGradient(
-    texture3d<float> volTex, sampler volSamp,
-    float3 pos, float3 gradStep, float gradNormFactor) {
+inline float4 computeGradient(texture3d<float> volTex, sampler volSamp, float3 pos, float3 gradStep, float gradNormFactor) {
   float sPX = volTex.sample(volSamp, pos + float3(gradStep.x, 0, 0), level(0)).r;
   float sNX = volTex.sample(volSamp, pos - float3(gradStep.x, 0, 0), level(0)).r;
   float sPY = volTex.sample(volSamp, pos + float3(0, gradStep.y, 0), level(0)).r;
@@ -2313,57 +1323,27 @@ inline float4 computeGradient(
 
   float3 grad = float3(sPX - sNX, sPY - sNY, sPZ - sNZ);
   float mag = length(grad);
-  float3 dir = mag > 0.0 ? grad / mag : float3(0.0);
-
-  // Normalize magnitude to [0,1] over the expected range
-  float normMag = clamp(mag / max(1e-8, gradNormFactor), 0.0, 1.0);
-  return float4(dir, normMag);
+  return float4(mag > 0.0 ? grad / mag : float3(0.0), clamp(mag / max(1e-8, gradNormFactor), 0.0, 1.0));
 }
 
-// Simplified Phong lighting (headlight at camera).
-// Normal is oriented inward (toward increasing scalar values), so we negate
-// the light/view directions to match the OpenGL convention.
-inline half3 computePhongLighting(
-    half3 sampleColor, float3 gradDir,
-    float3 lightDir, float3 viewDir,
-    half3 ambientMat, half3 diffuseMat, half3 specularMat, float shininess) {
-  float3 normal = gradDir;
-  float nDotL = dot(normal, -lightDir);
-  float3 r = normalize(2.0 * nDotL * normal + lightDir);
-  float vDotR = dot(r, -viewDir);
-
+inline half3 computePhongLightingVolume(half3 sampleColor, float3 gradDir, float3 lightDir, float3 viewDir, half3 ambientMat, half3 diffuseMat, half3 specularMat, float shininess) {
+  float nDotL = dot(gradDir, -lightDir);
   half3 diffuse = half3(0.0);
   half3 specular = half3(0.0);
 
   if (nDotL > 0.0) {
     diffuse = half3(nDotL) * diffuseMat * sampleColor;
-    vDotR = max(vDotR, 0.0);
+    float3 r = normalize(2.0 * nDotL * gradDir + lightDir);
+    float vDotR = max(dot(r, -viewDir), 0.0);
     specular = half3(pow(vDotR, shininess)) * specularMat;
   }
-
   return ambientMat * sampleColor + diffuse + specular;
 }
 
-// ---------------------------------------------------------------------------
-// Cropping region helpers
-// ---------------------------------------------------------------------------
-
-// Determine which of 3 regions (1=below, 2=between, 3=above) a position
-// falls in along a single axis.
-inline int computeRegionCoord(float cpMin, float cpMax, float pos) {
-  if (pos < cpMin) return 1;
-  else if (pos < cpMax) return 2;
-  else return 3;
-}
-
-// Compute the 32-region index from a position and 6 cropping planes
-// (3 pairs of min/max for X, Y, Z axes). The formula matches the OpenGL
-// reference: index = rx + (ry-1)*3 + (rz-1)*9.
+// Branchless, fast crop region evaluator
 inline int computeCropRegion(float3 cropMin, float3 cropMax, float3 pos) {
-  int rx = computeRegionCoord(cropMin.x, cropMax.x, pos.x);
-  int ry = computeRegionCoord(cropMin.y, cropMax.y, pos.y);
-  int rz = computeRegionCoord(cropMin.z, cropMax.z, pos.z);
-  return (rx) + (ry - 1) * 3 + (rz - 1) * 9;
+  int3 r = 1 + int3(step(cropMin, pos)) + int3(step(cropMax, pos));
+  return r.x + (r.y - 1) * 3 + (r.z - 1) * 9;
 }
 
 fragment VolumeFragmentOut fragment_volume_main(
@@ -2383,392 +1363,228 @@ fragment VolumeFragmentOut fragment_volume_main(
     sampler maskSampler [[sampler(4)]],
     sampler labelMapSampler [[sampler(5)]],
     sampler labelMapGradOpSampler [[sampler(6)]]) {
+  
   VolumeFragmentOut output;
-
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
   float stepSize = volumeUniforms.sampleDistance;
 
-  float3 startPoint = in.localPos;
-  float3 rayDir = startPoint - cameraPos;
+  float3 rayDir = in.localPos - cameraPos;
   float dirLength = length(rayDir);
-
-  if (dirLength < 0.0001) {
-    discard_fragment();
-  }
-  rayDir = rayDir / dirLength;
-
+  if (dirLength < 0.0001) discard_fragment();
+  
+  rayDir /= dirLength;
   float2 t = intersectBox(cameraPos, rayDir, float3(0.0), float3(1.0));
-
   float tStart = max(t.x, 0.0);
-  if (tStart >= t.y) {
-    discard_fragment();
-  }
+  if (tStart >= t.y) discard_fragment();
 
   float3 entryPoint = cameraPos + rayDir * tStart;
   float3 exitPoint = cameraPos + rayDir * t.y;
   float totalDist = length(exitPoint - entryPoint);
 
-  // --- Depth buffer occlusion ---
-  // Sample the scene depth at this fragment's screen position. If an opaque
-  // surface is closer than the volume, terminate the ray early.
-  float tTerminateMax = 1e30; // default: no depth termination
-  float2 screenUV = in.position.xy / volumeUniforms.viewportSize;
-  float depthSample = depthTexture.sample(depthSampler, screenUV).r;
+  float tTerminateMax = 1e30;
+  float depthSample = depthTexture.sample(depthSampler, in.position.xy / volumeUniforms.viewportSize).r;
 
   if (depthSample < 1.0) {
-    // Reconstruct clip-space position from window coordinates.
-    // in.position.xy is in pixels; convert to NDC [-1,1].
     float2 ndcXY = (in.position.xy / volumeUniforms.viewportSize) * 2.0 - 1.0;
-    // Metal clip-space Z is in [0,1], Y is flipped (top-left origin).
-    float4 clipPos = float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
-    float4 worldTermination = volumeUniforms.inverseViewProjection * clipPos;
-    float3 terminationWorld = worldTermination.xyz / worldTermination.w;
-
-    // Convert to volume-local space [0,1]
-    float3 boundsMin = volumeUniforms.volumeBoundsMin.xyz;
-    float3 boundsMax = volumeUniforms.volumeBoundsMax.xyz;
-    float3 boundsSize = boundsMax - boundsMin;
-    float3 terminationLocal = (terminationWorld - boundsMin) / boundsSize;
-
-    // Compute maximum ray distance before hitting the opaque surface
-    float3 terminationVec = terminationLocal - entryPoint;
-    tTerminateMax = length(terminationVec);
+    float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
+    float3 terminationLocal = ((worldTermination.xyz / worldTermination.w) - volumeUniforms.volumeBoundsMin.xyz) / (volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz);
+    tTerminateMax = length(terminationLocal - entryPoint);
   }
 
-  // --- Clipping planes ---
-  // Adjust ray entry/exit points based on arbitrary clipping planes.
-  // For each plane, compute signed distance from the plane. If both entry
-  // and exit are on the clipped side (negative), discard the fragment.
-  // Otherwise, adjust entry/exit to lie on the visible side.
   if (volumeUniforms.useClipping > 0.5) {
     int numClipPlanes = int(volumeUniforms.numClippingPlanes);
-
-    // Store plane data in arrays for loop access
-    float4 planeOrigins[8] = {
-      volumeUniforms.clippingPlane0Origin, volumeUniforms.clippingPlane1Origin,
-      volumeUniforms.clippingPlane2Origin, volumeUniforms.clippingPlane3Origin,
-      volumeUniforms.clippingPlane4Origin, volumeUniforms.clippingPlane5Origin,
-      volumeUniforms.clippingPlane6Origin, volumeUniforms.clippingPlane7Origin
-    };
-    float4 planeNormals[8] = {
-      volumeUniforms.clippingPlane0Normal, volumeUniforms.clippingPlane1Normal,
-      volumeUniforms.clippingPlane2Normal, volumeUniforms.clippingPlane3Normal,
-      volumeUniforms.clippingPlane4Normal, volumeUniforms.clippingPlane5Normal,
-      volumeUniforms.clippingPlane6Normal, volumeUniforms.clippingPlane7Normal
-    };
+    float4 planeOrigins[8] = { volumeUniforms.clippingPlane0Origin, volumeUniforms.clippingPlane1Origin, volumeUniforms.clippingPlane2Origin, volumeUniforms.clippingPlane3Origin, volumeUniforms.clippingPlane4Origin, volumeUniforms.clippingPlane5Origin, volumeUniforms.clippingPlane6Origin, volumeUniforms.clippingPlane7Origin };
+    float4 planeNormals[8] = { volumeUniforms.clippingPlane0Normal, volumeUniforms.clippingPlane1Normal, volumeUniforms.clippingPlane2Normal, volumeUniforms.clippingPlane3Normal, volumeUniforms.clippingPlane4Normal, volumeUniforms.clippingPlane5Normal, volumeUniforms.clippingPlane6Normal, volumeUniforms.clippingPlane7Normal };
 
     for (int cp = 0; cp < numClipPlanes; cp++) {
       float3 planeOrigin = planeOrigins[cp].xyz;
       float3 planeNormal = normalize(planeNormals[cp].xyz);
-
-      // Compute signed distance from plane for entry and exit points
       float startDistance = dot(planeNormal, planeOrigin - entryPoint);
       float stopDistance = dot(planeNormal, planeOrigin - exitPoint);
-      bool startClipped = startDistance > 0.0;
-      bool stopClipped = stopDistance > 0.0;
 
-      // If both points are on the clipped side, the entire ray is clipped
-      if (startClipped && stopClipped) {
-        discard_fragment();
-      }
-
+      if (startDistance > 0.0 && stopDistance > 0.0) discard_fragment();
       float rayDotNormal = dot(rayDir, planeNormal);
-      bool frontFace = rayDotNormal > 0.0;
 
-      // Move entry point further from camera if needed
-      if (frontFace && startDistance > 0.0) {
-        float rayScaledDist = startDistance / rayDotNormal;
-        entryPoint = entryPoint + rayScaledDist * rayDir;
-      }
-
-      // Move exit point closer to camera if needed
-      if (!frontFace && stopDistance > 0.0) {
-        float rayScaledDist = stopDistance / rayDotNormal;
-        exitPoint = exitPoint + rayScaledDist * rayDir;
-      }
+      if (rayDotNormal > 0.0 && startDistance > 0.0) entryPoint += (startDistance / rayDotNormal) * rayDir;
+      if (rayDotNormal <= 0.0 && stopDistance > 0.0) exitPoint += (stopDistance / rayDotNormal) * rayDir;
     }
-
-    // Recompute total distance after clipping adjustment
     totalDist = length(exitPoint - entryPoint);
-    if (totalDist < 1e-6) {
-      discard_fragment();
-    }
+    if (totalDist < 1e-6) discard_fragment();
   }
 
-  int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
-
-  float jitter = 0.0;
-  if (volumeUniforms.useJittering > 0.5) {
-    jitter = volume_random(in.position.xy) * stepSize;
-  }
-
+  float jitter = volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) * stepSize : 0.0;
   float3 currentPoint = entryPoint + (rayDir * jitter);
   float3 stepVec = rayDir * stepSize;
 
-  // Use half precision for accumulators — Apple GPUs run half ALU at 2x throughput.
-  // Texture coordinates stay float for addressing accuracy.
   half3 accumulatedColor = half3(0.0);
   half accumulatedOpacity = 0.0;
   half scalarRangeRcp = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
 
-  // Gradient shading precomputations (done once, outside the loop)
   const bool doShading = volumeUniforms.useGradientShading > 0.5;
   const bool doGradOp = volumeUniforms.useGradientOpacity > 0.5;
-  float3 gradStep = volumeUniforms.gradientStep;
-  float3 lightDir = normalize(volumeUniforms.lightDirection);
-  // View direction: camera-to-sample in volume [0,1] space (normalized earlier)
-  float3 viewDir = normalize(entryPoint - cameraPos);
-  half3 ambientMat = half3(volumeUniforms.ambientColor.rgb);
-  half3 diffuseMat = half3(volumeUniforms.diffuseColor.rgb);
-  half3 specularMat = half3(volumeUniforms.specularColor.rgb);
-  float shininessVal = volumeUniforms.shininess;
-  float gradNormFactor = volumeUniforms.gradientOpacityRange.y;
-
-  // Track ray distance for depth buffer occlusion early termination
-  float currentT = jitter;
-
-  // Cropping precomputation (done once, outside the loop)
   const bool doCropping = volumeUniforms.useCropping > 0.5;
-  float3 cropMin = volumeUniforms.croppingPlanes.xyz;
-  float3 cropMax = float3(volumeUniforms.croppingPlanes.w,
-                           volumeUniforms.croppingPlanes2.xy);
-
-  // Mask / label map precomputation (done once, outside the loop)
   const bool doMask = volumeUniforms.useMask > 0.5;
-  const float maskScaleVal = volumeUniforms.maskScale;
-  const float maskBiasVal = volumeUniforms.maskBias;
-  const float numLabels = volumeUniforms.labelMapNumLabels;
 
-  // Process 2 samples per iteration to halve loop overhead and improve
-  // instruction-level parallelism.
-  int i = 0;
-  int maxStepsEven = maxSteps & ~1;
-  for (; i < maxStepsEven; i += 2) {
-      // --- Sample 1 ---
-      // Cropping: skip samples in disabled regions
-      bool cropped1 = false;
-      if (doCropping) {
-        int regionNo = computeCropRegion(cropMin, cropMax, currentPoint);
-        int rowIdx = regionNo / 4;
-        int colIdx = regionNo % 4;
-        float4 flagRow;
-        if (rowIdx == 0) flagRow = volumeUniforms.croppingFlagsRow0;
-        else if (rowIdx == 1) flagRow = volumeUniforms.croppingFlagsRow1;
-        else if (rowIdx == 2) flagRow = volumeUniforms.croppingFlagsRow2;
-        else if (rowIdx == 3) flagRow = volumeUniforms.croppingFlagsRow3;
-        else if (rowIdx == 4) flagRow = volumeUniforms.croppingFlagsRow4;
-        else if (rowIdx == 5) flagRow = volumeUniforms.croppingFlagsRow5;
-        else if (rowIdx == 6) flagRow = volumeUniforms.croppingFlagsRow6;
-        else flagRow = volumeUniforms.croppingFlagsRow7;
-        if (int(flagRow[colIdx]) == 0) {
-          cropped1 = true;
-        }
-      }
-      if (!cropped1) {
-      float rawScalar1 = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
-      half scalarNorm1 = clamp(
-        half(rawScalar1 - volumeUniforms.scalarMin) * scalarRangeRcp,
-        0.0h, 1.0h);
-
-      // Mask / label map lookup
-      half4 colorOpacity1;
-      half maskLabel1 = 0.0h;
-      if (doMask) {
-        float maskVal1 = maskTexture.sample(maskSampler, currentPoint, level(0)).r;
-        maskVal1 = maskVal1 * maskScaleVal + maskBiasVal;
-        if (numLabels > 0.0) {
-          maskLabel1 = half(floor(maskVal1 * numLabels) / numLabels);
-        }
-        if (maskLabel1 > 0.0h) {
-          // Use 2D label map transfer function
-          colorOpacity1 = half4(labelMapTransferTexture.sample(
-            labelMapSampler, float2(float(scalarNorm1), float(maskLabel1)), level(0)));
-        } else {
-          // Use default transfer function
-          colorOpacity1 = half4(transferFunctionTexture.sample(
-            transferFunctionSampler, float2(float(scalarNorm1), 0.5), level(0)));
-        }
-      } else {
-        colorOpacity1 = half4(transferFunctionTexture.sample(
-          transferFunctionSampler, float2(float(scalarNorm1), 0.5), level(0)));
-      }
-
-      half sampleOpacity1 = colorOpacity1.a;
-      if (sampleOpacity1 > 0.001h) {
-        half3 sampleColor1 = colorOpacity1.rgb;
-
-        // Apply gradient-based Phong shading only for default TF path (label == 0)
-        if (doShading && maskLabel1 == 0.0h) {
-          float4 grad1 = computeGradient(volumeTexture, volumeSampler,
-                                          currentPoint, gradStep, gradNormFactor);
-          sampleColor1 = computePhongLighting(
-            sampleColor1, grad1.xyz, lightDir, viewDir,
-            ambientMat, diffuseMat, specularMat, shininessVal);
-
-          if (doGradOp) {
-            half gradOp1 = half(gradientOpacityTexture.sample(
-              gradientOpacitySampler,
-              float2(float(grad1.w), 0.5), level(0)).r);
-            sampleOpacity1 *= gradOp1;
-          }
-        }
-
-        half w1 = 1.0h - accumulatedOpacity;
-        accumulatedColor += w1 * sampleColor1 * sampleOpacity1;
-        accumulatedOpacity += w1 * sampleOpacity1;
-      }
-      } // !cropped1
-
-      currentPoint += stepVec;
-      currentT += stepSize;
-
-      // --- Sample 2 ---
-      // Cropping: skip samples in disabled regions
-      bool cropped2 = false;
-      if (doCropping) {
-        int regionNo2 = computeCropRegion(cropMin, cropMax, currentPoint);
-        int rowIdx2 = regionNo2 / 4;
-        int colIdx2 = regionNo2 % 4;
-        float4 flagRow2;
-        if (rowIdx2 == 0) flagRow2 = volumeUniforms.croppingFlagsRow0;
-        else if (rowIdx2 == 1) flagRow2 = volumeUniforms.croppingFlagsRow1;
-        else if (rowIdx2 == 2) flagRow2 = volumeUniforms.croppingFlagsRow2;
-        else if (rowIdx2 == 3) flagRow2 = volumeUniforms.croppingFlagsRow3;
-        else if (rowIdx2 == 4) flagRow2 = volumeUniforms.croppingFlagsRow4;
-        else if (rowIdx2 == 5) flagRow2 = volumeUniforms.croppingFlagsRow5;
-        else if (rowIdx2 == 6) flagRow2 = volumeUniforms.croppingFlagsRow6;
-        else flagRow2 = volumeUniforms.croppingFlagsRow7;
-        if (int(flagRow2[colIdx2]) == 0) {
-          cropped2 = true;
-        }
-      }
-      if (!cropped2) {
-      float rawScalar2 = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
-      half scalarNorm2 = clamp(
-        half(rawScalar2 - volumeUniforms.scalarMin) * scalarRangeRcp,
-        0.0h, 1.0h);
-
-      // Mask / label map lookup
-      half4 colorOpacity2;
-      half maskLabel2 = 0.0h;
-      if (doMask) {
-        float maskVal2 = maskTexture.sample(maskSampler, currentPoint, level(0)).r;
-        maskVal2 = maskVal2 * maskScaleVal + maskBiasVal;
-        if (numLabels > 0.0) {
-          maskLabel2 = half(floor(maskVal2 * numLabels) / numLabels);
-        }
-        if (maskLabel2 > 0.0h) {
-          colorOpacity2 = half4(labelMapTransferTexture.sample(
-            labelMapSampler, float2(float(scalarNorm2), float(maskLabel2)), level(0)));
-        } else {
-          colorOpacity2 = half4(transferFunctionTexture.sample(
-            transferFunctionSampler, float2(float(scalarNorm2), 0.5), level(0)));
-        }
-      } else {
-        colorOpacity2 = half4(transferFunctionTexture.sample(
-          transferFunctionSampler, float2(float(scalarNorm2), 0.5), level(0)));
-      }
-
-      half sampleOpacity2 = colorOpacity2.a;
-      if (sampleOpacity2 > 0.001h) {
-        half3 sampleColor2 = colorOpacity2.rgb;
-
-        // Apply gradient-based Phong shading only for default TF path (label == 0)
-        if (doShading && maskLabel2 == 0.0h) {
-          float4 grad2 = computeGradient(volumeTexture, volumeSampler,
-                                          currentPoint, gradStep, gradNormFactor);
-          sampleColor2 = computePhongLighting(
-            sampleColor2, grad2.xyz, lightDir, viewDir,
-            ambientMat, diffuseMat, specularMat, shininessVal);
-
-          if (doGradOp) {
-            half gradOp2 = half(gradientOpacityTexture.sample(
-              gradientOpacitySampler,
-              float2(float(grad2.w), 0.5), level(0)).r);
-            sampleOpacity2 *= gradOp2;
-          }
-        }
-
-        half w2 = 1.0h - accumulatedOpacity;
-        accumulatedColor += w2 * sampleColor2 * sampleOpacity2;
-        accumulatedOpacity += w2 * sampleOpacity2;
-      }
-      } // !cropped2
-
-      currentPoint += stepVec;
-      currentT += stepSize;
-
-      if (accumulatedOpacity >= 0.95h || currentT >= tTerminateMax) {
-        accumulatedOpacity = 1.0h;
-        break;
+  float3 cropMin = volumeUniforms.croppingPlanes.xyz;
+  float3 cropMax = float3(volumeUniforms.croppingPlanes.w, volumeUniforms.croppingPlanes2.xy);
+  
+  // Collapse clipping map array lookups to a dynamic branching-free bitmask (huge performance boost on fast inner loops)
+  uint cropBitmask = 0;
+  if (doCropping) {
+    float4 cropF[8] = { volumeUniforms.croppingFlagsRow0, volumeUniforms.croppingFlagsRow1, volumeUniforms.croppingFlagsRow2, volumeUniforms.croppingFlagsRow3, volumeUniforms.croppingFlagsRow4, volumeUniforms.croppingFlagsRow5, volumeUniforms.croppingFlagsRow6, volumeUniforms.croppingFlagsRow7 };
+    for (int j = 0; j < 32; j++) {
+      if (cropF[j / 4][j % 4] > 0.0) {
+        cropBitmask |= (1u << j);
       }
     }
+  }
 
-    // Handle odd remaining step
-    for (; i < maxSteps; i++) {
-      // Cropping: skip samples in disabled regions
-      bool croppedOdd = false;
-      if (doCropping) {
-        int regionNoO = computeCropRegion(cropMin, cropMax, currentPoint);
-        int rowIdxO = regionNoO / 4;
-        int colIdxO = regionNoO % 4;
-        float4 flagRowO;
-        if (rowIdxO == 0) flagRowO = volumeUniforms.croppingFlagsRow0;
-        else if (rowIdxO == 1) flagRowO = volumeUniforms.croppingFlagsRow1;
-        else if (rowIdxO == 2) flagRowO = volumeUniforms.croppingFlagsRow2;
-        else if (rowIdxO == 3) flagRowO = volumeUniforms.croppingFlagsRow3;
-        else if (rowIdxO == 4) flagRowO = volumeUniforms.croppingFlagsRow4;
-        else if (rowIdxO == 5) flagRowO = volumeUniforms.croppingFlagsRow5;
-        else if (rowIdxO == 6) flagRowO = volumeUniforms.croppingFlagsRow6;
-        else flagRowO = volumeUniforms.croppingFlagsRow7;
-        if (int(flagRowO[colIdxO]) == 0) {
-          croppedOdd = true;
-        }
-      }
-      if (!croppedOdd) {
+  int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
+  float currentT = jitter;
+
+  int i = 0;
+  int maxStepsEven = maxSteps & ~1;
+  
+  for (; i < maxStepsEven; i += 2) {
+    // --- Sample 1 ---
+    bool cropped1 = false;
+    if (doCropping) {
+      if ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, currentPoint))) == 0u) cropped1 = true;
+    }
+
+    if (!cropped1) {
       float rawScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
-      half scalarNorm = clamp(
-        half(rawScalar - volumeUniforms.scalarMin) * scalarRangeRcp,
-        0.0h, 1.0h);
+      half scalarNorm = clamp(half(rawScalar - volumeUniforms.scalarMin) * scalarRangeRcp, 0.0h, 1.0h);
 
-      // Mask / label map lookup
       half4 colorOpacity;
       half maskLabel = 0.0h;
       if (doMask) {
-        float maskVal = maskTexture.sample(maskSampler, currentPoint, level(0)).r;
-        maskVal = maskVal * maskScaleVal + maskBiasVal;
-        if (numLabels > 0.0) {
-          maskLabel = half(floor(maskVal * numLabels) / numLabels);
+        float maskVal = maskTexture.sample(maskSampler, currentPoint, level(0)).r * volumeUniforms.maskScale + volumeUniforms.maskBias;
+        if (volumeUniforms.labelMapNumLabels > 0.0) {
+          maskLabel = half(floor(maskVal * volumeUniforms.labelMapNumLabels) / volumeUniforms.labelMapNumLabels);
         }
         if (maskLabel > 0.0h) {
-          colorOpacity = half4(labelMapTransferTexture.sample(
-            labelMapSampler, float2(float(scalarNorm), float(maskLabel)), level(0)));
+          colorOpacity = half4(labelMapTransferTexture.sample(labelMapSampler, float2(float(scalarNorm), float(maskLabel)), level(0)));
         } else {
-          colorOpacity = half4(transferFunctionTexture.sample(
-            transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+          colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
         }
       } else {
-        colorOpacity = half4(transferFunctionTexture.sample(
-          transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+        colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
       }
 
       half sampleOpacity = colorOpacity.a;
       if (sampleOpacity > 0.001h) {
         half3 sampleColor = colorOpacity.rgb;
 
-        // Apply gradient-based Phong shading only for default TF path (label == 0)
         if (doShading && maskLabel == 0.0h) {
-          float4 grad = computeGradient(volumeTexture, volumeSampler,
-                                         currentPoint, gradStep, gradNormFactor);
-          sampleColor = computePhongLighting(
-            sampleColor, grad.xyz, lightDir, viewDir,
-            ambientMat, diffuseMat, specularMat, shininessVal);
+          float4 grad = computeGradient(volumeTexture, volumeSampler, currentPoint, volumeUniforms.gradientStep, volumeUniforms.gradientOpacityRange.y);
+          sampleColor = computePhongLightingVolume(sampleColor, grad.xyz, normalize(volumeUniforms.lightDirection), normalize(entryPoint - cameraPos), half3(volumeUniforms.ambientColor.rgb), half3(volumeUniforms.diffuseColor.rgb), half3(volumeUniforms.specularColor.rgb), volumeUniforms.shininess);
+
+          if (doGradOp) sampleOpacity *= half(gradientOpacityTexture.sample(gradientOpacitySampler, float2(float(grad.w), 0.5), level(0)).r);
+        }
+
+        half w = 1.0h - accumulatedOpacity;
+        accumulatedColor += w * sampleColor * sampleOpacity;
+        accumulatedOpacity += w * sampleOpacity;
+      }
+    }
+
+    currentPoint += stepVec;
+    currentT += stepSize;
+    if (accumulatedOpacity >= 0.95h || currentT >= tTerminateMax) {
+      accumulatedOpacity = 1.0h;
+      break;
+    }
+
+    // --- Sample 2 ---
+    bool cropped2 = false;
+    if (doCropping) {
+      if ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, currentPoint))) == 0u) cropped2 = true;
+    }
+
+    if (!cropped2) {
+      float rawScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
+      half scalarNorm = clamp(half(rawScalar - volumeUniforms.scalarMin) * scalarRangeRcp, 0.0h, 1.0h);
+
+      half4 colorOpacity;
+      half maskLabel = 0.0h;
+      if (doMask) {
+        float maskVal = maskTexture.sample(maskSampler, currentPoint, level(0)).r * volumeUniforms.maskScale + volumeUniforms.maskBias;
+        if (volumeUniforms.labelMapNumLabels > 0.0) {
+          maskLabel = half(floor(maskVal * volumeUniforms.labelMapNumLabels) / volumeUniforms.labelMapNumLabels);
+        }
+        if (maskLabel > 0.0h) {
+          colorOpacity = half4(labelMapTransferTexture.sample(labelMapSampler, float2(float(scalarNorm), float(maskLabel)), level(0)));
+        } else {
+          colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+        }
+      } else {
+        colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+      }
+
+      half sampleOpacity = colorOpacity.a;
+      if (sampleOpacity > 0.001h) {
+        half3 sampleColor = colorOpacity.rgb;
+
+        if (doShading && maskLabel == 0.0h) {
+          float4 grad = computeGradient(volumeTexture, volumeSampler, currentPoint, volumeUniforms.gradientStep, volumeUniforms.gradientOpacityRange.y);
+          sampleColor = computePhongLightingVolume(sampleColor, grad.xyz, normalize(volumeUniforms.lightDirection), normalize(entryPoint - cameraPos), half3(volumeUniforms.ambientColor.rgb), half3(volumeUniforms.diffuseColor.rgb), half3(volumeUniforms.specularColor.rgb), volumeUniforms.shininess);
+
+          if (doGradOp) sampleOpacity *= half(gradientOpacityTexture.sample(gradientOpacitySampler, float2(float(grad.w), 0.5), level(0)).r);
+        }
+
+        half w = 1.0h - accumulatedOpacity;
+        accumulatedColor += w * sampleColor * sampleOpacity;
+        accumulatedOpacity += w * sampleOpacity;
+      }
+    }
+
+    currentPoint += stepVec;
+    currentT += stepSize;
+    if (accumulatedOpacity >= 0.95h || currentT >= tTerminateMax) {
+      accumulatedOpacity = 1.0h;
+      break;
+    }
+  }
+
+  // Handle remaining odd iterations if bound requires
+  for (; i < maxSteps; i++) {
+    bool croppedOdd = false;
+    if (doCropping) {
+      int regionNo = computeCropRegion(cropMin, cropMax, currentPoint);
+      if ((cropBitmask & (1u << regionNo)) == 0u) croppedOdd = true;
+    }
+
+    if (!croppedOdd) {
+      float rawScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
+      half scalarNorm = clamp(half(rawScalar - volumeUniforms.scalarMin) * scalarRangeRcp, 0.0h, 1.0h);
+
+      half4 colorOpacity;
+      half maskLabel = 0.0h;
+      if (doMask) {
+        float maskVal = maskTexture.sample(maskSampler, currentPoint, level(0)).r * volumeUniforms.maskScale + volumeUniforms.maskBias;
+        if (volumeUniforms.labelMapNumLabels > 0.0) {
+          maskLabel = half(floor(maskVal * volumeUniforms.labelMapNumLabels) / volumeUniforms.labelMapNumLabels);
+        }
+        if (maskLabel > 0.0h) {
+          colorOpacity = half4(labelMapTransferTexture.sample(labelMapSampler, float2(float(scalarNorm), float(maskLabel)), level(0)));
+        } else {
+          colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+        }
+      } else {
+        colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+      }
+
+      half sampleOpacity = colorOpacity.a;
+      if (sampleOpacity > 0.001h) {
+        half3 sampleColor = colorOpacity.rgb;
+
+        if (doShading && maskLabel == 0.0h) {
+          float4 grad = computeGradient(volumeTexture, volumeSampler, currentPoint, volumeUniforms.gradientStep, volumeUniforms.gradientOpacityRange.y);
+          sampleColor = computePhongLightingVolume(sampleColor, grad.xyz, normalize(volumeUniforms.lightDirection), normalize(entryPoint - cameraPos), half3(volumeUniforms.ambientColor.rgb), half3(volumeUniforms.diffuseColor.rgb), half3(volumeUniforms.specularColor.rgb), volumeUniforms.shininess);
 
           if (doGradOp) {
-            half gradOp = half(gradientOpacityTexture.sample(
-              gradientOpacitySampler,
-              float2(float(grad.w), 0.5), level(0)).r);
-            sampleOpacity *= gradOp;
+            sampleOpacity *= half(gradientOpacityTexture.sample(gradientOpacitySampler, float2(float(grad.w), 0.5), level(0)).r);
           }
         }
 
@@ -2776,27 +1592,19 @@ fragment VolumeFragmentOut fragment_volume_main(
         accumulatedColor += w * sampleColor * sampleOpacity;
         accumulatedOpacity += w * sampleOpacity;
       }
-      } // !croppedOdd
-
-      currentT += stepSize;
-
-      if (accumulatedOpacity >= 0.95h || currentT >= tTerminateMax) {
-        accumulatedOpacity = 1.0h;
-        break;
-      }
-
-      currentPoint += stepVec;
     }
+    
+    currentT += stepSize;
+    if (accumulatedOpacity >= 0.95h || currentT >= tTerminateMax) {
+      accumulatedOpacity = 1.0h;
+      break;
+    }
+    currentPoint += stepVec;
+  }
 
   output.color = float4(float3(accumulatedColor), float(accumulatedOpacity));
   return output;
 }
-
-// ---------------------------------------------------------------------------
-// Image-space downsampling blit pass
-// Samples the offscreen low-res texture and outputs to the screen.
-// Used when ImageSampleDistance != 1.0 for performance.
-// ---------------------------------------------------------------------------
 
 fragment float4 fragment_image_sample_blit(
     FullscreenVertexOut in [[stage_in]],
