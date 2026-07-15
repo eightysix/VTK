@@ -1480,30 +1480,30 @@ fragment VolumeFragmentOut fragment_volume_main(
     // Uses DDA to jump exactly to the boundary of the current empty macrocell.
     if (volumeUniforms.useMinMaxAccel > 0.5) {
       float3 mmPos = clamp(currentPoint, float3(0.0), float3(1.0));
-
-      // FIX 1: .sample() expects normalized [0,1] coordinates, so just use mmPos directly.
       float isEmpty = minMaxTexture.sample(minMaxSampler, mmPos, level(0)).r;
 
       if (isEmpty > 0.5) {
-        // FIX 3: DDA — calculate the exact distance to the boundary of this empty macrocell
         float3 mmDim = float3(volumeUniforms.minMaxDimX, volumeUniforms.minMaxDimY, volumeUniforms.minMaxDimZ);
         float3 cellCoord = mmPos * mmDim;
 
-        // Distance to the next integer boundary along the ray direction
         float3 distToEdge;
         distToEdge.x = rayDir.x > 0.0 ? (floor(cellCoord.x + 1.0) - cellCoord.x) : (cellCoord.x - floor(cellCoord.x));
         distToEdge.y = rayDir.y > 0.0 ? (floor(cellCoord.y + 1.0) - cellCoord.y) : (cellCoord.y - floor(cellCoord.y));
         distToEdge.z = rayDir.z > 0.0 ? (floor(cellCoord.z + 1.0) - cellCoord.z) : (cellCoord.z - floor(cellCoord.z));
 
-        // Convert cell-space distances to ray parameter 't'
         float3 absDir = max(abs(rayDir * mmDim), 1e-6);
         float3 tToEdge = distToEdge / absDir;
 
-        // The shortest distance hitting a cell boundary
-        float skipDist = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
+        // Exact distance to the boundary
+        float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
 
-        // Add epsilon to push across the boundary into the next cell
-        skipDist = max(stepSize, skipDist + 0.001);
+        // FIX: Add a tiny epsilon to cross the boundary, then QUANTIZE to stepSize.
+        // This ensures the ray maintains its exact sampling rhythm and jitter alignment.
+        exactSkip += 1e-4;
+        float skipDist = ceil(exactSkip / stepSize) * stepSize;
+
+        // Ensure we always move forward at least one step
+        skipDist = max(stepSize, skipDist);
 
         currentPoint += rayDir * skipDist;
         currentT += skipDist;
