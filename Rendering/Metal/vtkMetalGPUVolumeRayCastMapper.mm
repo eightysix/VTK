@@ -31,6 +31,7 @@
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <Accelerate/Accelerate.h>
 
 #include <algorithm>
 #include <cstring>
@@ -148,6 +149,16 @@ inline uint16_t FloatToHalf(float f)
   if (exponent > 30)
     return static_cast<uint16_t>(sign | 0x7C00);
   return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10) | (mantissa >> 13));
+}
+
+// Returns true when the data is a single-component float array that can be
+// converted to half-precision in-place using Accelerate (vImage).
+inline bool IsContiguousScalarFloat(int dataType, int numComponents, vtkIdType numTuples,
+  const void* ptr, size_t bytesPerVoxel)
+{
+  return dataType == VTK_FLOAT && numComponents == 1 &&
+    bytesPerVoxel == sizeof(float) &&
+    ptr == static_cast<const float*>(ptr); // alignment check
 }
 }
 
@@ -1762,77 +1773,94 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
     }
     void* uploadPointer = [stagingBuf contents];
 
-    // Convert data types that don't match the chosen pixel format
+    // Convert data types that don't match the chosen pixel format.
+    // For single-component float data, use Accelerate (NEON-vectorized) for
+    // the float-to-half conversion instead of the scalar FloatToHalf loop.
     bool needsConversion = (dataType != VTK_FLOAT && dataType != VTK_UNSIGNED_CHAR &&
       dataType != VTK_UNSIGNED_SHORT);
 
     if (needsConversion)
     {
       int outputComponents = (numComponents == 3) ? 4 : numComponents;
-      switch (dataType)
+
+      // Fast path: single-component float → half via Accelerate (NEON/SED)
+      if (IsContiguousScalarFloat(dataType, numComponents, totalTuples, fullDataPtr, bytesPerVoxel))
       {
-        case VTK_SHORT:
+        // In-place conversion: copy float data to staging buffer, then convert
+        std::memcpy(uploadPointer, fullDataPtr, static_cast<size_t>(totalVolumeBytes));
+        vImage_Buffer srcBuf = { uploadPointer, 1, static_cast<vImagePixelCount>(totalTuples),
+          static_cast<vImagePixelCount>(totalTuples * sizeof(float)) };
+        vImage_Buffer dstBuf = { uploadPointer, 1, static_cast<vImagePixelCount>(totalTuples),
+          static_cast<vImagePixelCount>(totalTuples * sizeof(uint16_t)) };
+        vImageConvert_PlanarFtoPlanar16F(&srcBuf, &dstBuf, 0);
+      }
+      else
+      {
+        switch (dataType)
         {
-          const short* src = static_cast<const short*>(fullDataPtr);
-          vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
-            for (vtkIdType i = begin; i < end; ++i)
-            {
-              for (int c = 0; c < numComponents; ++c)
-                static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                  FloatToHalf(static_cast<float>(src[i * numComponents + c]));
-              for (int c = numComponents; c < outputComponents; ++c)
-                static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                  FloatToHalf(0.0f);
-            }
-          });
-          break;
-        }
-        case VTK_INT:
-        {
-          const int* src = static_cast<const int*>(fullDataPtr);
-          vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
-            for (vtkIdType i = begin; i < end; ++i)
-            {
-              for (int c = 0; c < numComponents; ++c)
-                static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                  FloatToHalf(static_cast<float>(src[i * numComponents + c]));
-              for (int c = numComponents; c < outputComponents; ++c)
-                static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                  FloatToHalf(0.0f);
-            }
-          });
-          break;
-        }
-        case VTK_DOUBLE:
-        {
-          const double* src = static_cast<const double*>(fullDataPtr);
-          vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
-            for (vtkIdType i = begin; i < end; ++i)
-            {
-              for (int c = 0; c < numComponents; ++c)
-                static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                  FloatToHalf(static_cast<float>(src[i * numComponents + c]));
-              for (int c = numComponents; c < outputComponents; ++c)
-                static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                  FloatToHalf(0.0f);
-            }
-          });
-          break;
-        }
-        default:
-        {
-          vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
-            for (vtkIdType i = begin; i < end; ++i)
-            {
-              for (int c = 0; c < numComponents; ++c)
-                static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                  FloatToHalf(static_cast<float>(scalars->GetComponent(i, c)));
-              for (int c = numComponents; c < outputComponents; ++c)
-                static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                  FloatToHalf(0.0f);
-            }
-          });
-          break;
+          case VTK_SHORT:
+          {
+            const short* src = static_cast<const short*>(fullDataPtr);
+            vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
+              for (vtkIdType i = begin; i < end; ++i)
+              {
+                for (int c = 0; c < numComponents; ++c)
+                  static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                    FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                for (int c = numComponents; c < outputComponents; ++c)
+                  static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                    FloatToHalf(0.0f);
+              }
+            });
+            break;
+          }
+          case VTK_INT:
+          {
+            const int* src = static_cast<const int*>(fullDataPtr);
+            vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
+              for (vtkIdType i = begin; i < end; ++i)
+              {
+                for (int c = 0; c < numComponents; ++c)
+                  static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                    FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                for (int c = numComponents; c < outputComponents; ++c)
+                  static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                    FloatToHalf(0.0f);
+              }
+            });
+            break;
+          }
+          case VTK_DOUBLE:
+          {
+            const double* src = static_cast<const double*>(fullDataPtr);
+            vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
+              for (vtkIdType i = begin; i < end; ++i)
+              {
+                for (int c = 0; c < numComponents; ++c)
+                  static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                    FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                for (int c = numComponents; c < outputComponents; ++c)
+                  static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                    FloatToHalf(0.0f);
+              }
+            });
+            break;
+          }
+          default:
+          {
+            vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
+              for (vtkIdType i = begin; i < end; ++i)
+              {
+                for (int c = 0; c < numComponents; ++c)
+                  static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                    FloatToHalf(static_cast<float>(scalars->GetComponent(i, c)));
+                for (int c = numComponents; c < outputComponents; ++c)
+                  static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                    FloatToHalf(0.0f);
+              }
+            });
+            break;
+          }
         }
       }
     }
