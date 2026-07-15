@@ -1743,18 +1743,32 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
     vtkIdType totalTuples = scalars->GetNumberOfTuples();
     const void* fullDataPtr = scalars->GetVoidPointer(0);
 
-    // For non-native types, we need to convert first. Build a conversion buffer.
-    std::vector<uint16_t> halfData;
-    std::vector<uint8_t> conversionBuffer;
-    const void* nativeDataPtr = fullDataPtr;
+    int actualComponents = (numComponents == 3) ? 4 : numComponents;
+    size_t bytesPerVoxel = static_cast<size_t>(bytesPerComponent) * actualComponents;
 
+    // Compute full-volume strides for strided blit
+    NSUInteger srcBytesPerRow = static_cast<NSUInteger>(fullDims[0]) * bytesPerVoxel;
+    NSUInteger srcBytesPerImage = srcBytesPerRow * fullDims[1];
+    NSUInteger totalVolumeBytes = srcBytesPerImage * fullDims[2];
+
+    // Create a single staging buffer for the full volume. Conversion writes
+    // directly into it, eliminating intermediate std::vector copies.
+    id<MTLBuffer> stagingBuf = [device newBufferWithLength:totalVolumeBytes
+                                                  options:MTLResourceStorageModeShared];
+    if (!stagingBuf)
+    {
+      vtkErrorMacro("Failed to create full-volume staging buffer");
+      return false;
+    }
+    void* uploadPointer = [stagingBuf contents];
+
+    // Convert data types that don't match the chosen pixel format
     bool needsConversion = (dataType != VTK_FLOAT && dataType != VTK_UNSIGNED_CHAR &&
       dataType != VTK_UNSIGNED_SHORT);
 
     if (needsConversion)
     {
       int outputComponents = (numComponents == 3) ? 4 : numComponents;
-      halfData.resize(static_cast<size_t>(totalTuples) * outputComponents);
       switch (dataType)
       {
         case VTK_SHORT:
@@ -1764,10 +1778,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
             for (vtkIdType i = begin; i < end; ++i)
             {
               for (int c = 0; c < numComponents; ++c)
-                halfData[i * outputComponents + c] =
+                static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
                   FloatToHalf(static_cast<float>(src[i * numComponents + c]));
               for (int c = numComponents; c < outputComponents; ++c)
-                halfData[i * outputComponents + c] = FloatToHalf(0.0f);
+                static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                  FloatToHalf(0.0f);
             }
           });
           break;
@@ -1779,10 +1794,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
             for (vtkIdType i = begin; i < end; ++i)
             {
               for (int c = 0; c < numComponents; ++c)
-                halfData[i * outputComponents + c] =
+                static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
                   FloatToHalf(static_cast<float>(src[i * numComponents + c]));
               for (int c = numComponents; c < outputComponents; ++c)
-                halfData[i * outputComponents + c] = FloatToHalf(0.0f);
+                static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                  FloatToHalf(0.0f);
             }
           });
           break;
@@ -1794,10 +1810,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
             for (vtkIdType i = begin; i < end; ++i)
             {
               for (int c = 0; c < numComponents; ++c)
-                halfData[i * outputComponents + c] =
+                static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
                   FloatToHalf(static_cast<float>(src[i * numComponents + c]));
               for (int c = numComponents; c < outputComponents; ++c)
-                halfData[i * outputComponents + c] = FloatToHalf(0.0f);
+                static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                  FloatToHalf(0.0f);
             }
           });
           break;
@@ -1808,22 +1825,22 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
             for (vtkIdType i = begin; i < end; ++i)
             {
               for (int c = 0; c < numComponents; ++c)
-                halfData[i * outputComponents + c] =
+                static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
                   FloatToHalf(static_cast<float>(scalars->GetComponent(i, c)));
               for (int c = numComponents; c < outputComponents; ++c)
-                halfData[i * outputComponents + c] = FloatToHalf(0.0f);
+                static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                  FloatToHalf(0.0f);
             }
           });
           break;
         }
       }
-      nativeDataPtr = halfData.data();
     }
     else if (dataType == VTK_FLOAT && numComponents == 3)
     {
+      // Expand 3-component float to RGBA (pad alpha with 0)
       const float* src = static_cast<const float*>(fullDataPtr);
-      conversionBuffer.resize(static_cast<size_t>(totalTuples) * 4 * sizeof(float));
-      float* dst = reinterpret_cast<float*>(conversionBuffer.data());
+      float* dst = static_cast<float*>(uploadPointer);
       vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
         for (vtkIdType i = begin; i < end; ++i)
         {
@@ -1833,28 +1850,27 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
           dst[i * 4 + 3] = 0.0f;
         }
       });
-      nativeDataPtr = conversionBuffer.data();
     }
     else if (dataType == VTK_UNSIGNED_CHAR && numComponents == 3)
     {
+      // Expand 3-component uchar to RGBA (pad alpha with 255)
       const unsigned char* src = static_cast<const unsigned char*>(fullDataPtr);
-      conversionBuffer.resize(static_cast<size_t>(totalTuples) * 4);
+      unsigned char* dst = static_cast<unsigned char*>(uploadPointer);
       vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
         for (vtkIdType i = begin; i < end; ++i)
         {
-          conversionBuffer[i * 4 + 0] = src[i * 3 + 0];
-          conversionBuffer[i * 4 + 1] = src[i * 3 + 1];
-          conversionBuffer[i * 4 + 2] = src[i * 3 + 2];
-          conversionBuffer[i * 4 + 3] = 255;
+          dst[i * 4 + 0] = src[i * 3 + 0];
+          dst[i * 4 + 1] = src[i * 3 + 1];
+          dst[i * 4 + 2] = src[i * 3 + 2];
+          dst[i * 4 + 3] = 255;
         }
       });
-      nativeDataPtr = conversionBuffer.data();
     }
     else if (dataType == VTK_UNSIGNED_SHORT && numComponents == 3)
     {
+      // Expand 3-component ushort to RGBA (pad alpha with 65535)
       const unsigned short* src = static_cast<const unsigned short*>(fullDataPtr);
-      conversionBuffer.resize(static_cast<size_t>(totalTuples) * 4 * 2);
-      unsigned short* dst = reinterpret_cast<unsigned short*>(conversionBuffer.data());
+      unsigned short* dst = static_cast<unsigned short*>(uploadPointer);
       vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
         for (vtkIdType i = begin; i < end; ++i)
         {
@@ -1864,13 +1880,19 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
           dst[i * 4 + 3] = 65535;
         }
       });
-      nativeDataPtr = conversionBuffer.data();
+    }
+    else
+    {
+      // Native type, no conversion needed — copy directly into staging buffer
+      std::memcpy(uploadPointer, fullDataPtr, static_cast<size_t>(totalVolumeBytes));
     }
 
-    int actualComponents = (numComponents == 3) ? 4 : numComponents;
-    size_t bytesPerVoxel = static_cast<size_t>(bytesPerComponent) * actualComponents;
+    // Use one command buffer for all block uploads
+    id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
 
-    // Create a 3D texture for each block
+    // Create a 3D texture for each block, using strided blit from the
+    // single staging buffer. This eliminates per-block memcpy and allocation.
     for (size_t idx = 0; idx < this->Blocks.size(); ++idx)
     {
       auto& block = this->Blocks[idx];
@@ -1912,61 +1934,27 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       block.Texture = (__bridge void*)tex;
       CFRetain((__bridge CFTypeRef)tex);
 
-      // Copy block data from the full volume array
-      NSUInteger blockBytesPerRow = static_cast<NSUInteger>(bDims[0]) * bytesPerVoxel;
-      NSUInteger blockBytesPerImage = blockBytesPerRow * bDims[1];
-      NSUInteger blockTotalBytes = blockBytesPerImage * bDims[2];
+      // Compute byte offset for this block's corner in the full volume buffer.
+      // The GPU DMA controller extracts the 3D sub-region using source strides.
+      NSUInteger sourceOffset =
+        static_cast<NSUInteger>(block.Extents[4]) * srcBytesPerImage +
+        static_cast<NSUInteger>(block.Extents[2]) * srcBytesPerRow +
+        static_cast<NSUInteger>(block.Extents[0]) * bytesPerVoxel;
 
-      // Build a staging buffer with the block's sub-region data
-      // We need to extract the sub-volume from the full array with strided access
-      std::vector<uint8_t> blockData(static_cast<size_t>(blockTotalBytes));
-
-      // Cast dimensions to vtkIdType to prevent integer overflow for large volumes
-      vtkIdType fd0 = fullDims[0];
-      vtkIdType fd1 = fullDims[1];
-
-      for (int k = 0; k < bDims[2]; ++k)
-      {
-        for (int j = 0; j < bDims[1]; ++j)
-        {
-          // Source index in the full volume: (ext0+k) * fullDims[1] * fullDims[0] + (ext2+j) * fullDims[0] + ext0
-          vtkIdType srcTuple =
-            static_cast<vtkIdType>(block.Extents[4] + k) * fd1 * fd0 +
-            static_cast<vtkIdType>(block.Extents[2] + j) * fd0 +
-            block.Extents[0];
-          size_t dstOffset =
-            static_cast<size_t>(k) * blockBytesPerImage + static_cast<size_t>(j) * blockBytesPerRow;
-
-          const uint8_t* srcPtr =
-            static_cast<const uint8_t*>(nativeDataPtr) + srcTuple * bytesPerVoxel;
-          std::memcpy(blockData.data() + dstOffset, srcPtr, bDims[0] * bytesPerVoxel);
-        }
-      }
-
-      id<MTLBuffer> blockStaging = [device newBufferWithBytes:blockData.data()
-                                                       length:blockTotalBytes
-                                                      options:MTLResourceStorageModeShared];
-      if (!blockStaging)
-      {
-        vtkErrorMacro(<< "Failed to create staging buffer for block " << idx);
-        return false;
-      }
-
-      id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
-      id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
-      [blit copyFromBuffer:blockStaging
-              sourceOffset:0
-       sourceBytesPerRow:blockBytesPerRow
-     sourceBytesPerImage:blockBytesPerImage
+      [blit copyFromBuffer:stagingBuf
+              sourceOffset:sourceOffset
+       sourceBytesPerRow:srcBytesPerRow
+     sourceBytesPerImage:srcBytesPerImage
               sourceSize:MTLSizeMake(bDims[0], bDims[1], bDims[2])
                toTexture:tex
         destinationSlice:0
         destinationLevel:0
        destinationOrigin:MTLOriginMake(0, 0, 0)];
-      [blit endEncoding];
-      [uploadCmdBuf commit];
-      // Staging buffer is stack-local; block.Texture is retained so the GPU can read it
     }
+
+    [blit endEncoding];
+    [uploadCmdBuf commit];
+    // Staging buffer is stack-local; block textures are retained so the GPU can read them
   }
 
   return true;
