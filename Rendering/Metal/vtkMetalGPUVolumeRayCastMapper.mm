@@ -117,7 +117,7 @@ struct VolumeMapperUniforms
   float MaskScale;                // 936
   float MaskBias;                 // 940
   float LabelMapNumLabels;        // 944
-  float _padMask[3];              // 948..959 (pad to 16-byte alignment)
+  float VolumeExtentsPhysical[3]; // 948..959 (physical mm extents for angle-adaptive stepping)
   // Min-max acceleration texture
   float UseMinMaxAccel;           // 960
   float MinMaxDimX;               // 964
@@ -3253,6 +3253,12 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
         if (blockBoundsSize[k] < 1e-10)
           blockBoundsSize[k] = 1.0;
       }
+
+      // Pass block physical extents for angle-adaptive stepping
+      blockUniforms.VolumeExtentsPhysical[0] = static_cast<float>(blockBoundsSize[0]);
+      blockUniforms.VolumeExtentsPhysical[1] = static_cast<float>(blockBoundsSize[1]);
+      blockUniforms.VolumeExtentsPhysical[2] = static_cast<float>(blockBoundsSize[2]);
+
       blockUniforms.CameraVolumePos[0] =
         static_cast<float>((camPosVolume[0] - block.BoundsMin[0]) / blockBoundsSize[0]);
       blockUniforms.CameraVolumePos[1] =
@@ -3404,6 +3410,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     if (boundsSize[k] < 1e-10)
       boundsSize[k] = 1.0;
   }
+
+  // Pass physical extents for angle-adaptive step sizing in the shader
+  uniforms.VolumeExtentsPhysical[0] = static_cast<float>(boundsSize[0]);
+  uniforms.VolumeExtentsPhysical[1] = static_cast<float>(boundsSize[1]);
+  uniforms.VolumeExtentsPhysical[2] = static_cast<float>(boundsSize[2]);
 
   double* camPosWorld = ren->GetActiveCamera()->GetPosition();
   double camPosVolume[4] = { camPosWorld[0], camPosWorld[1], camPosWorld[2], 1.0 };

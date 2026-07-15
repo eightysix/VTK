@@ -1273,7 +1273,7 @@ struct VolumeMapperUniforms {
   float maskScale;
   float maskBias;
   float labelMapNumLabels;
-  float _padMask[3];
+  float volumeExtentsPhysical[3];
   // Min-max acceleration texture
   float useMinMaxAccel;
   float minMaxDimX;
@@ -1457,13 +1457,25 @@ fragment VolumeFragmentOut fragment_volume_main(
     }
   }
 
+  // --- ANGLE-ADAPTIVE STEP SIZING ---
+  // When the ray aligns with the longest physical axis (Z for axial CT views),
+  // take larger steps to compensate for the longer physical path, then apply
+  // opacity correction to maintain identical visual appearance.
+  float3 volExt = float3(volumeUniforms.volumeExtentsPhysical[0],
+                         volumeUniforms.volumeExtentsPhysical[1],
+                         volumeUniforms.volumeExtentsPhysical[2]);
+  float3 rayDirPhysical = normalize(rayDir * volExt);
+  float zAlign = abs(rayDirPhysical.z);
+  float stepMultiplier = mix(1.0, 3.5, zAlign);
+  float currentStepSize = stepSize * stepMultiplier;
+
   // --- SOFTWARE PIPELINING INITIALIZATION ---
-  float jitter = volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) * stepSize : 0.0;
-  float3 stepVec = rayDir * stepSize;
+  float jitter = volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) * currentStepSize : 0.0;
+  float3 stepVec = rayDir * currentStepSize;
   float3 currentPoint = entryPoint + (rayDir * jitter);
   float currentT = jitter;
 
-  int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
+  int maxSteps = min(max(1, int(ceil(totalDist / currentStepSize))), MAX_RAY_STEPS);
 
   half3 accumulatedColor = half3(0.0);
   half accumulatedOpacity = 0.0;
@@ -1505,13 +1517,13 @@ fragment VolumeFragmentOut fragment_volume_main(
         // Exact distance to the boundary
         float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
 
-        // FIX: Add a tiny epsilon to cross the boundary, then QUANTIZE to stepSize.
+        // FIX: Add a tiny epsilon to cross the boundary, then QUANTIZE to currentStepSize.
         // This ensures the ray maintains its exact sampling rhythm and jitter alignment.
         exactSkip += 1e-4;
-        float skipDist = ceil(exactSkip / stepSize) * stepSize;
+        float skipDist = ceil(exactSkip / currentStepSize) * currentStepSize;
 
         // Ensure we always move forward at least one step
-        skipDist = max(stepSize, skipDist);
+        skipDist = max(currentStepSize, skipDist);
 
         currentPoint += rayDir * skipDist;
         currentT += skipDist;
@@ -1537,7 +1549,7 @@ fragment VolumeFragmentOut fragment_volume_main(
 
     // 2. Advance ray trackers
     currentPoint += stepVec;
-    currentT += stepSize;
+    currentT += currentStepSize;
 
     // 3. LAUNCH PREFETCH FOR NEXT ITERATION
     // The GPU memory controller fulfills these while the ALU does the math below!
@@ -1573,6 +1585,12 @@ fragment VolumeFragmentOut fragment_volume_main(
     }
 
     half sampleOpacity = colorOpacity.a;
+
+    // Opacity correction: when taking larger adaptive steps, boost opacity
+    // so the integrated density along the ray remains visually identical.
+    if (stepMultiplier > 1.01 && sampleOpacity > 0.0h) {
+      sampleOpacity = 1.0h - fast::pow(1.0h - sampleOpacity, half(stepMultiplier));
+    }
 
     if (sampleOpacity > 0.001h) {
       half3 sampleColor = colorOpacity.rgb;
