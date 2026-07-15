@@ -1486,13 +1486,21 @@ fragment VolumeFragmentOut fragment_volume_main(
         float3 mmDim = float3(volumeUniforms.minMaxDimX, volumeUniforms.minMaxDimY, volumeUniforms.minMaxDimZ);
         float3 cellCoord = mmPos * mmDim;
 
-        float3 distToEdge;
-        distToEdge.x = rayDir.x > 0.0 ? (floor(cellCoord.x + 1.0) - cellCoord.x) : (cellCoord.x - floor(cellCoord.x));
-        distToEdge.y = rayDir.y > 0.0 ? (floor(cellCoord.y + 1.0) - cellCoord.y) : (cellCoord.y - floor(cellCoord.y));
-        distToEdge.z = rayDir.z > 0.0 ? (floor(cellCoord.z + 1.0) - cellCoord.z) : (cellCoord.z - floor(cellCoord.z));
+        float3 fractCoord = fract(cellCoord);
 
-        float3 absDir = max(abs(rayDir * mmDim), 1e-6);
-        float3 tToEdge = distToEdge / absDir;
+        float3 distToEdge;
+        distToEdge.x = rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x;
+        distToEdge.y = rayDir.y > 0.0 ? (1.0 - fractCoord.y) : fractCoord.y;
+        distToEdge.z = rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
+
+        // If exactly on a boundary (dist ~0), distance to NEXT boundary is 1.0 cell
+        distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
+
+        // Axial fix: only divide if ray actually moves along this axis
+        float3 tToEdge;
+        tToEdge.x = abs(rayDir.x) > 1e-5 ? distToEdge.x / abs(rayDir.x * mmDim.x) : 1e30;
+        tToEdge.y = abs(rayDir.y) > 1e-5 ? distToEdge.y / abs(rayDir.y * mmDim.y) : 1e30;
+        tToEdge.z = abs(rayDir.z) > 1e-5 ? distToEdge.z / abs(rayDir.z * mmDim.z) : 1e30;
 
         // Exact distance to the boundary
         float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
@@ -1570,6 +1578,12 @@ fragment VolumeFragmentOut fragment_volume_main(
       half3 sampleColor = colorOpacity.rgb;
       half weight = 1.0h - accumulatedOpacity;
 
+      // Ghost lighting bypass: skip expensive gradient/lighting for near-transparent voxels
+      if (sampleOpacity < 0.01h) {
+        accumulatedColor += weight * sampleColor * sampleOpacity;
+        accumulatedOpacity += weight * sampleOpacity;
+      } else {
+
       // Visual Significance Threshold:
       // If the voxel's actual contribution to the screen is less than 0.002
       // it is invisible on an 8-bit monitor. Do not waste memory bandwidth shading it.
@@ -1588,9 +1602,11 @@ fragment VolumeFragmentOut fragment_volume_main(
 
       accumulatedColor += weight * sampleColor * sampleOpacity;
       accumulatedOpacity += weight * sampleOpacity;
+      } // end ghost lighting bypass
     }
 
-    if (accumulatedOpacity >= 0.95h || currentT >= tTerminateMax) {
+    // Early Ray Termination (ERT)
+    if (accumulatedOpacity >= 0.99h || currentT >= tTerminateMax) {
       accumulatedOpacity = 1.0h;
       break;
     }
