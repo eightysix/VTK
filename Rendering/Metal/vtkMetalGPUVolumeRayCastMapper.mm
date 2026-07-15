@@ -424,12 +424,6 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
     this->PipelineState = nullptr;
   }
 
-  if (this->StagingBuffer)
-  {
-    CFRelease(this->StagingBuffer);
-    this->StagingBuffer = nullptr;
-  }
-
   if (this->VolumeTexture)
   {
     CFRelease(this->VolumeTexture);
@@ -961,13 +955,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       // Upload via staging buffer + blit encoder (works on all platforms)
       NSUInteger totalBytes = bytesPerImage * dims[2];
 
-      // Release old staging buffer before creating a new one
-      if (this->StagingBuffer)
-      {
-        CFRelease(this->StagingBuffer);
-        this->StagingBuffer = nullptr;
-      }
-
       id<MTLBuffer> stagingBuf = [device newBufferWithBytes:uploadPointer
                                                      length:totalBytes
                                                     options:MTLResourceStorageModeShared];
@@ -976,8 +963,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
         vtkErrorMacro("Failed to create volume staging buffer");
         return false;
       }
-      this->StagingBuffer = (__bridge void*)stagingBuf;
-      CFRetain((__bridge CFTypeRef)stagingBuf);
 
       id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
       id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
@@ -992,10 +977,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
        destinationOrigin:MTLOriginMake(0, 0, 0)];
       [blit endEncoding];
       [uploadCmdBuf commit];
-      // No waitUntilCompleted — the staging buffer is retained as a member
-      // so it stays alive until the blit finishes on the GPU. Command buffers
-      // on the same queue execute in order, so the render pass will not read
-      // the texture until after this blit completes.
+      // No waitUntilCompleted — Metal retains the staging buffer for the
+      // lifetime of the committed command buffer. Command buffers on the same
+      // queue execute in order, so the render pass will not read the texture
+      // until after this blit completes.
 
       this->VolumeUploadTime.Modified();
     }

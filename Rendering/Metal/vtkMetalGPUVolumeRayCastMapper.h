@@ -93,7 +93,6 @@ private:
   void* FrameSemaphore = nullptr;       // dispatch_semaphore_t — gates in-flight frames
   void* VertexBuffer = nullptr;         // id<MTLBuffer>
   void* IndexBuffer = nullptr;          // id<MTLBuffer>
-  void* StagingBuffer = nullptr;        // id<MTLBuffer> (volume upload, kept alive for async blit)
   int IndexCount = 0;
 
   // Volume state
