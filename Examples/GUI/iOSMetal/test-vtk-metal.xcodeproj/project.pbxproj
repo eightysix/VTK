@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A6AF980A30080A240096E743 /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A6AF980930080A240096E743 /* Accelerate.framework */; };
 		B63C7BEF2FD342A000F76715 /* vtk.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B63C7BEE2FD342A000F76715 /* vtk.framework */; };
 		B63C7BF02FD342A000F76715 /* vtk.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = B63C7BEE2FD342A000F76715 /* vtk.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
@@ -26,6 +27,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		A6AF980930080A240096E743 /* Accelerate.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Accelerate.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.2.sdk/System/Library/Frameworks/Accelerate.framework; sourceTree = DEVELOPER_DIR; };
 		B60563132FD22A870098CA33 /* test-vtk-metal.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "test-vtk-metal.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		B63C7BEE2FD342A000F76715 /* vtk.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = vtk.framework; path = ../../../build_ios_metal/frameworks/vtk.framework; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -57,6 +59,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				B63C7BEF2FD342A000F76715 /* vtk.framework in Frameworks */,
+				A6AF980A30080A240096E743 /* Accelerate.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -83,6 +86,7 @@
 		B60563302FD22AAF0098CA33 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				A6AF980930080A240096E743 /* Accelerate.framework */,
 				B63C7BEE2FD342A000F76715 /* vtk.framework */,
 			);
 			name = Frameworks;
