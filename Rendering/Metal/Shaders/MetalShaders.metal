@@ -1274,6 +1274,11 @@ struct VolumeMapperUniforms {
   float maskBias;
   float labelMapNumLabels;
   float _padMask[3];
+  // Min-max acceleration texture
+  float useMinMaxAccel;
+  float minMaxDimX;
+  float minMaxDimY;
+  float minMaxDimZ;
 };
 
 struct VolumeVertexOut {
@@ -1360,13 +1365,15 @@ fragment VolumeFragmentOut fragment_volume_main(
     texture3d<float> maskTexture [[texture(4)]],
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture2d<float> labelMapGradientOpacityTexture [[texture(6)]],
+    texture3d<float> minMaxTexture [[texture(7)]],
     sampler transferFunctionSampler [[sampler(0)]],
     sampler volumeSampler [[sampler(1)]],
     sampler depthSampler [[sampler(2)]],
     sampler gradientOpacitySampler [[sampler(3)]],
     sampler maskSampler [[sampler(4)]],
     sampler labelMapSampler [[sampler(5)]],
-    sampler labelMapGradOpSampler [[sampler(6)]]) {
+    sampler labelMapGradOpSampler [[sampler(6)]],
+    sampler minMaxSampler [[sampler(7)]]) {
 
   VolumeFragmentOut output;
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
@@ -1467,6 +1474,53 @@ fragment VolumeFragmentOut fragment_volume_main(
 
   // --- THE RAYMARCHING LOOP ---
   for (int i = 0; i < maxSteps; i++) {
+
+    // 0. MIN-MAX ACCELERATION: Empty space skipping via occupancy map.
+    // The texture is R8Unorm: 255 = empty, 0 = solid (baked on CPU via opacity TF).
+    // Uses DDA to jump exactly to the boundary of the current empty macrocell.
+    if (volumeUniforms.useMinMaxAccel > 0.5) {
+      float3 mmPos = clamp(currentPoint, float3(0.0), float3(1.0));
+
+      // FIX 1: .sample() expects normalized [0,1] coordinates, so just use mmPos directly.
+      float isEmpty = minMaxTexture.sample(minMaxSampler, mmPos, level(0)).r;
+
+      if (isEmpty > 0.5) {
+        // FIX 3: DDA — calculate the exact distance to the boundary of this empty macrocell
+        float3 mmDim = float3(volumeUniforms.minMaxDimX, volumeUniforms.minMaxDimY, volumeUniforms.minMaxDimZ);
+        float3 cellCoord = mmPos * mmDim;
+
+        // Distance to the next integer boundary along the ray direction
+        float3 distToEdge;
+        distToEdge.x = rayDir.x > 0.0 ? (floor(cellCoord.x + 1.0) - cellCoord.x) : (cellCoord.x - floor(cellCoord.x));
+        distToEdge.y = rayDir.y > 0.0 ? (floor(cellCoord.y + 1.0) - cellCoord.y) : (cellCoord.y - floor(cellCoord.y));
+        distToEdge.z = rayDir.z > 0.0 ? (floor(cellCoord.z + 1.0) - cellCoord.z) : (cellCoord.z - floor(cellCoord.z));
+
+        // Convert cell-space distances to ray parameter 't'
+        float3 absDir = max(abs(rayDir * mmDim), 1e-6);
+        float3 tToEdge = distToEdge / absDir;
+
+        // The shortest distance hitting a cell boundary
+        float skipDist = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
+
+        // Add epsilon to push across the boundary into the next cell
+        skipDist = max(stepSize, skipDist + 0.001);
+
+        currentPoint += rayDir * skipDist;
+        currentT += skipDist;
+
+        if (any(currentPoint < float3(0.0)) || any(currentPoint > float3(1.0)) || currentT >= t.y) {
+          break;
+        }
+
+        if (i + 1 < maxSteps) {
+          prefetchScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
+          if (doMask) {
+            prefetchMask = maskTexture.sample(maskSampler, currentPoint, level(0)).r;
+          }
+        }
+        continue;
+      }
+    }
 
     // 1. Claim prefetched data and lock current spatial coordinate
     float rawScalar = prefetchScalar;

@@ -13,10 +13,13 @@
 #include "vtkTimeStamp.h"            // For time stamp
 #include "vtkWrappingHints.h"        // For VTK_MARSHALAUTO
 
+#include <array>  // For std::array
 #include <vector> // For std::vector
 
 class vtkDataArray;
 class vtkImageData;
+class vtkPiecewiseFunction;
+class vtkVolume;
 
 VTK_ABI_NAMESPACE_BEGIN
 
@@ -74,6 +77,10 @@ private:
   void* ColorOpacitySampler = nullptr;   // id<MTLSamplerState>
   void* GradientOpacityTexture = nullptr; // id<MTLTexture> (256x1 RGBA8Unorm)
   void* GradientOpacitySampler = nullptr; // id<MTLSamplerState>
+  void* MinMaxTexture = nullptr;         // id<MTLTexture> (3D) — 4x downsampled min-max accel
+  void* MinMaxSampler = nullptr;         // id<MTLSamplerState> — nearest sampler for min-max
+  int MinMaxDims[3] = {};               // dimensions of the min-max texture
+  vtkTimeStamp MinMaxUploadTime;
   void* DepthStencilState = nullptr;     // id<MTLDepthStencilState>
   void* DepthTextureOcclusion = nullptr; // id<MTLTexture> — scene depth for early ray termination
   void* DepthSampler = nullptr;          // id<MTLSamplerState> — nearest sampler for depth texture
@@ -126,6 +133,7 @@ private:
   bool UpdateVolumeTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
   bool UpdateTransferFunctionTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
   bool UpdateGradientOpacityTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
+  bool UpdateMinMaxTexture(void* mtlDevice, vtkVolume* vol, vtkImageData* input, vtkDataArray* scalars);
   bool SetupBuffers(void* mtlDevice, vtkRenderer* ren, vtkVolume* vol, vtkImageData* input);
   bool SetupPipeline(void* mtlDevice, vtkRenderer* ren);
 
@@ -165,8 +173,12 @@ private:
 
   void ClearBlocks();
   void SortBlocksBackToFront(vtkRenderer* ren, vtkVolume* vol);
-  bool UpdateBlockTextures(void* mtlDevice, void* mtlQueue, vtkImageData* input,
-    vtkDataArray* scalars, int numComponents);
+  bool UpdateBlockTextures(void* mtlDevice, void* mtlQueue, vtkVolume* vol,
+    vtkImageData* input, vtkDataArray* scalars, int numComponents);
+
+  // Per-block scalar min/max for empty-space skipping
+  std::vector<std::array<double, 2>> BlockScalarRanges;
+  bool IsBlockEmpty(double blockMin, double blockMax, vtkPiecewiseFunction* opacityFunc);
 };
 
 VTK_ABI_NAMESPACE_END
