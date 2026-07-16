@@ -1303,7 +1303,7 @@ vertex VolumeVertexOut vertex_volume_main(
 
 struct VolumeFragmentOut { float4 color [[color(0)]]; };
 
-constant int MAX_RAY_STEPS = 2000;
+constant int MAX_RAY_STEPS = 8192;
 
 inline float volume_random(float2 st) {
   return fract(sin(dot(st.xy, float2(12.9898, 78.233))) * 43758.5453123);
@@ -1520,20 +1520,23 @@ fragment VolumeFragmentOut fragment_volume_main(
           break;
         }
 
-        if (i + 1 < maxSteps) {
-          prefetchScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
-          if (doMask) {
-            prefetchMask = maskTexture.sample(maskSampler, currentPoint, level(0)).r;
-          }
-        }
+        // Do NOT prefetch here — if the next cell is also empty, the fetch is wasted bandwidth.
+        // Invalidate the prefetch so the normal branch knows to fetch fresh data.
+        prefetchScalar = as_type<float>(0x7fc00000u); // NaN sentinel
         continue;
       }
     }
 
-    // 1. Claim prefetched data and lock current spatial coordinate
-    float rawScalar = prefetchScalar;
-    float rawMask = prefetchMask;
+    // 1. Claim prefetched data and lock current spatial coordinate.
+    //    If prefetchScalar is NaN (sentinel from skip branch), fetch fresh data.
     float3 evalPoint = currentPoint;
+    bool needsFetch = (as_type<uint>(prefetchScalar) == 0x7fc00000u);
+    float rawScalar = needsFetch
+      ? volumeTexture.sample(volumeSampler, evalPoint, level(0)).r
+      : prefetchScalar;
+    float rawMask = (doMask && needsFetch)
+      ? maskTexture.sample(maskSampler, evalPoint, level(0)).r
+      : prefetchMask;
 
     // 2. Advance ray trackers
     currentPoint += stepVec;

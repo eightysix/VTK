@@ -4,25 +4,9 @@ I went through both files carefully. For a 1 GB thin-slice CT, the axial-view dr
 
 ---
 
-## 1. Critical correctness + perf bug — `MAX_RAY_STEPS = 2000`
+## 1. Critical correctness + perf bug — `MAX_RAY_STEPS = 2000` ✅ DONE
 
-In `vtkMetalShaders`:
-```cpp
-constant int MAX_RAY_STEPS = 2000;
-```
-And in the fragment:
-```cpp
-int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
-```
-
-For a thin-slice CT (e.g. 512×512×2000+), when `SampleDistance ≈ minSpacing` and the ray traverses the long axis, `totalDist/stepSize` can exceed 2000. The cap silently truncates the ray, which both *hurts quality* (back of volume missing) and *wastes work* (no ERT can compensate). Make it adaptive, e.g.:
-
-```cpp
-// In the shader, replace the constant:
-int maxRaySteps = int(ceil(totalDist / stepSize)) + 8;
-```
-
-Or, if you want a hard cap to prevent pathological cases, set it to 8192. The `ceil(totalDist/stepSize)` already bounds it for normal cases.
+Raised `MAX_RAY_STEPS` from 2000 to 8192 in `MetalShaders.metal:1306`. The existing adaptive computation `int(ceil(totalDist/stepSize))` already governs for normal cases; the constant only acts as a safety cap. For thin-slice CT (512×512×2000+), the old cap silently truncated the ray, cutting off the back of the volume. The new cap of 8192 is high enough that only pathological cases hit it.
 
 ---
 
@@ -135,7 +119,7 @@ Hoist the block-range computation into the min-max pass: while scanning macrocel
 
 ---
 
-## 7. Shader: stop unconditionally prefetching `volumeTexture` in skip iterations
+## 7. Shader: stop unconditionally prefetching `volumeTexture` in skip iterations — ✅ DONE
 
 In the skip branch:
 ```cpp
@@ -150,14 +134,17 @@ When the ray is skipping through many empty macrocells in a row (typical for the
 
 ```cpp
 // In the skip branch: do NOT prefetch. Just invalidate:
-prefetchScalar = NAN; // sentinel
+prefetchScalar = as_type<float>(0x7fc00000u); // NaN sentinel
 continue;
 
 // In the regular branch, before using prefetchScalar:
-if (isnan(prefetchScalar)) {
-  prefetchScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
-  if (doMask) prefetchMask = maskTexture.sample(maskSampler, currentPoint, level(0)).r;
-}
+bool needsFetch = (as_type<uint>(prefetchScalar) == 0x7fc00000u);
+float rawScalar = needsFetch
+  ? volumeTexture.sample(volumeSampler, evalPoint, level(0)).r
+  : prefetchScalar;
+float rawMask = (doMask && needsFetch)
+  ? maskTexture.sample(maskSampler, evalPoint, level(0)).r
+  : prefetchMask;
 ```
 
 Alternatively, do a single min-max fetch in the skip branch for the next cell, and only prefetch volume if that cell is non-empty. Either way, this is a meaningful bandwidth saving for the axial case.
@@ -233,7 +220,7 @@ A cheaper variant: store gradients at half resolution (DS=2) and bilinearly upsa
 
 ## Suggested implementation order
 
-1. Items **#1** (MAX_RAY_STEPS) and **#7** (skip-branch prefetch) — 30 minutes, immediate visual + perf win.
+1. ~~Item **#1** (MAX_RAY_STEPS)~~ ✅ — done. ~~Item **#7** (skip-branch prefetch)~~ ✅ — done.
 2. Item **#2** (cell-boundary min-max) — 1–2 hours, biggest GPU-side win in dense regions.
 3. Item **#3** (auto-partition) — 1 hour, biggest axial-view structural win.
 4. Item **#5** (parallel dilation) and **#6** (dedup voxel scans) — 1 hour, cuts first-frame and re-upload times.
