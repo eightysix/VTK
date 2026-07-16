@@ -1702,12 +1702,27 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
     return false;
   }
 
-  bool doReload = (this->MinMaxTexture == nullptr);
+  // When skipGlobalTexture is true (partitioned mode), MinMaxTexture is
+  // intentionally never created. Use MacrocellScalarMin as the validity
+  // sentinel instead, so we don't re-run the full voxel scan every frame.
+  bool doReload;
+  if (skipGlobalTexture)
+  {
+    doReload = this->MacrocellScalarMin.empty();
+  }
+  else
+  {
+    doReload = (this->MinMaxTexture == nullptr);
+  }
   doReload |= (input->GetMTime() > this->MinMaxUploadTime.GetMTime());
   doReload |= (opFunc->GetMTime() > this->MinMaxUploadTime.GetMTime());
 
   if (!doReload)
   {
+    if (skipGlobalTexture)
+    {
+      return this->MacrocellScalarMin.empty() == false;
+    }
     return this->MinMaxTexture != nullptr;
   }
 
