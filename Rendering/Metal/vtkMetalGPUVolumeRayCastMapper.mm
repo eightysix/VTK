@@ -580,9 +580,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       int nx = this->Partitions[0];
       int ny = this->Partitions[1];
       int nz = this->Partitions[2];
-      int deltaX = (fullExt[1] - fullExt[0]) / nx;
-      int deltaY = (fullExt[3] - fullExt[2]) / ny;
-      int deltaZ = (fullExt[5] - fullExt[4]) / nz;
+      int deltaX = (fullExt[1] - fullExt[0] + 1) / nx;
+      int deltaY = (fullExt[3] - fullExt[2] + 1) / ny;
+      int deltaZ = (fullExt[5] - fullExt[4] + 1) / nz;
 
       for (int k = 0; k < nz; ++k)
       {
@@ -592,11 +592,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           {
             VolumeBlock block;
             block.Extents[0] = fullExt[0] + i * deltaX;
-            block.Extents[1] = fullExt[0] + (i + 1) * deltaX;
+            block.Extents[1] = std::min(fullExt[0] + (i + 1) * deltaX - 1, fullExt[1]);
             block.Extents[2] = fullExt[2] + j * deltaY;
-            block.Extents[3] = fullExt[2] + (j + 1) * deltaY;
+            block.Extents[3] = std::min(fullExt[2] + (j + 1) * deltaY - 1, fullExt[3]);
             block.Extents[4] = fullExt[4] + k * deltaZ;
-            block.Extents[5] = fullExt[4] + (k + 1) * deltaZ;
+            block.Extents[5] = std::min(fullExt[4] + (k + 1) * deltaZ - 1, fullExt[5]);
             this->Blocks.push_back(block);
           }
         }
@@ -2200,6 +2200,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
     // Use one command buffer for all block uploads
     id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
+
+    // Resize BlockScalarRanges to match the number of blocks.
+    // ClearBlocks() empties this vector, so we must re-allocate before the loop.
+    this->BlockScalarRanges.resize(this->Blocks.size());
 
     // Create a 3D texture for each block, using strided blit from the
     // single staging buffer. This eliminates per-block memcpy and allocation.
