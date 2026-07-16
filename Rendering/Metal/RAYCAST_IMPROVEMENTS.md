@@ -43,7 +43,9 @@ In the dense patient interior this typically cuts the min-max fetch count by ~4�
 
 ---
 
-## 3. Auto-partition large volumes along the long axis
+## 3. Auto-partition large volumes along the long axis — SKIP FOR NOW
+
+> **Note**: Auto-partitioning for a single volume creates visual artifacts and degrades performance significantly. Skipping this optimization for now.
 
 `Partitions` defaults to `{1,1,1}`, so the user is hitting the single-texture path for a 1 GB volume. The block pipeline already exists and already does:
 - Empty-block skipping via `IsBlockEmpty`
@@ -221,7 +223,7 @@ A cheaper variant: store gradients at half resolution (DS=2) and bilinearly upsa
 ## Suggested implementation order
 
 1. ~~Item **#1** (MAX_RAY_STEPS)~~ ✅ — done. ~~Item **#7** (skip-branch prefetch)~~ ✅ — done. ~~Item **#2** (cell-boundary min-max)~~ ✅ — done.
-2. Item **#3** (auto-partition) — 1 hour, biggest axial-view structural win.
+2. ~~Item **#3** (auto-partition)~~ — **SKIPPED**: artifacts + perf regression on single volumes.
 3. Item **#5** (parallel dilation) and **#6** (dedup voxel scans) — 1 hour, cuts first-frame and re-upload times.
 4. Item **#11** (inter-block opacity) — half day, the remaining axial-view gap.
 5. Item **#4** (per-block min-max) — half day, on top of #3.
