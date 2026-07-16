@@ -1718,6 +1718,13 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
     // 1. Create a RAW buffer for the initial pass
     std::vector<uint8_t> rawMinMax(numCells, 255);
 
+    // Per-macrocell scalar min/max — consumed later by UpdateBlockTextures
+    // to compute per-block ranges without re-walking every voxel.
+    this->MacrocellScalarMin.resize(numCells, 1e30f);
+    this->MacrocellScalarMax.resize(numCells, -1e30f);
+    float* mcMin = this->MacrocellScalarMin.data();
+    float* mcMax = this->MacrocellScalarMax.data();
+
     // Parallel scan: each macrocell is independent — perfect for vtkSMPTools
     vtkSMPTools::For(0, numCells, [&](vtkIdType begin, vtkIdType end) {
       for (vtkIdType cellIdx = begin; cellIdx < end; ++cellIdx)
@@ -1774,6 +1781,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
           }
         }
 
+        // Store macrocell scalar range for later block-range reduction
+        mcMin[cellIdx] = cellMin;
+        mcMax[cellIdx] = cellMax;
+
         // Inline empty check using the precomputed opacity table
         bool empty = true;
         if (cellMin <= cellMax)
@@ -1799,27 +1810,38 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
     // 2. DILATION PASS: Pad solid blocks by 1 macrocell in all directions.
     // This guarantees the ray resumes normal stepping *before* hitting the surface,
     // preserving perfect trilinear interpolation and lighting gradients.
+    // Gather-style stencil: read from rawMinMax, write to minMaxData —
+    // embarrassingly parallel since each output cell is independent.
     std::vector<uint8_t> minMaxData(numCells, 255);
-    for (int gz = 0; gz < mmDims[2]; ++gz) {
-      for (int gy = 0; gy < mmDims[1]; ++gy) {
-        for (int gx = 0; gx < mmDims[0]; ++gx) {
-          if (rawMinMax[(gz * mmDims[1] + gy) * mmDims[0] + gx] == 0) {
-            // Mark the 3x3x3 neighborhood as solid
-            int z0 = std::max(0, gz - 1), z1 = std::min(mmDims[2] - 1, gz + 1);
-            int y0 = std::max(0, gy - 1), y1 = std::min(mmDims[1] - 1, gy + 1);
-            int x0 = std::max(0, gx - 1), x1 = std::min(mmDims[0] - 1, gx + 1);
+    vtkSMPTools::For(0, numCells, [&](vtkIdType begin, vtkIdType end) {
+      for (vtkIdType cellIdx = begin; cellIdx < end; ++cellIdx)
+      {
+        const int gx = static_cast<int>(cellIdx % mmDims0);
+        const int gy = static_cast<int>((cellIdx / mmDims0) % mmDims1);
+        const int gz = static_cast<int>(cellIdx / (mmDims0 * mmDims1));
 
-            for (int nz = z0; nz <= z1; ++nz) {
-              for (int ny = y0; ny <= y1; ++ny) {
-                for (int nx = x0; nx <= x1; ++nx) {
-                  minMaxData[(nz * mmDims[1] + ny) * mmDims[0] + nx] = 0;
-                }
+        const int x0 = std::max(0, gx - 1), x1 = std::min(mmDims0 - 1, gx + 1);
+        const int y0 = std::max(0, gy - 1), y1 = std::min(mmDims1 - 1, gy + 1);
+        const int z0 = std::max(0, gz - 1), z1 = std::min(mmDims2 - 1, gz + 1);
+
+        bool solid = false;
+        for (int nz = z0; nz <= z1 && !solid; ++nz)
+        {
+          for (int ny = y0; ny <= y1 && !solid; ++ny)
+          {
+            for (int nx = x0; nx <= x1 && !solid; ++nx)
+            {
+              if (rawMinMax[(nz * mmDims1 + ny) * mmDims0 + nx] == 0)
+              {
+                solid = true;
               }
             }
           }
         }
+
+        minMaxData[cellIdx] = solid ? 0 : 255;
       }
-    }
+    });
 
     // Create or reuse the 3D occupancy texture (R8Unorm)
     id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->MinMaxTexture;
@@ -2227,10 +2249,49 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       block.BoundsMin[2] = origin[2] + block.Extents[4] * spacing[2];
       block.BoundsMax[2] = origin[2] + block.Extents[5] * spacing[2];
 
-      // Compute scalar min/max for this block (used for empty-space skipping)
+      // Compute scalar min/max for this block (used for empty-space skipping).
+      // Prefer reducing over pre-computed macrocell min/max from UpdateMinMaxTexture
+      // (typically ~16³ = 4096 reductions vs. 250³ voxel reads for a 1 GB CT).
       double blockMin = VTK_DOUBLE_MAX;
       double blockMax = -VTK_DOUBLE_MAX;
+      if (!this->MacrocellScalarMin.empty() && !this->MacrocellScalarMax.empty())
       {
+        // Reduce over macrocells that overlap this block
+        const int mcDims0 = this->MinMaxDims[0];
+        const int mcDims1 = this->MinMaxDims[1];
+        const int dims0 = input->GetDimensions()[0];
+        const int dims1 = input->GetDimensions()[1];
+        const int dims2 = input->GetDimensions()[2];
+        const int DS0 = mcDims0 > 0 ? dims0 / mcDims0 : 4;
+        const int DS1 = mcDims1 > 0 ? dims1 / mcDims1 : 4;
+        const int DS2 = (this->MinMaxDims[2] > 0) ? dims2 / this->MinMaxDims[2] : 4;
+
+        const int mcX0 = block.Extents[0] / DS0;
+        const int mcX1 = std::min(block.Extents[1] / DS0, mcDims0 - 1);
+        const int mcY0 = block.Extents[2] / DS1;
+        const int mcY1 = std::min(block.Extents[3] / DS1, mcDims1 - 1);
+        const int mcZ0 = block.Extents[4] / DS2;
+        const int mcZ1 = std::min(block.Extents[5] / DS2, this->MinMaxDims[2] - 1);
+
+        const float* mcMin = this->MacrocellScalarMin.data();
+        const float* mcMax = this->MacrocellScalarMax.data();
+
+        for (int mz = mcZ0; mz <= mcZ1; ++mz)
+        {
+          for (int my = mcY0; my <= mcY1; ++my)
+          {
+            for (int mx = mcX0; mx <= mcX1; ++mx)
+            {
+              vtkIdType ci = (static_cast<vtkIdType>(mz) * mcDims1 + my) * mcDims0 + mx;
+              if (mcMin[ci] < blockMin) blockMin = mcMin[ci];
+              if (mcMax[ci] > blockMax) blockMax = mcMax[ci];
+            }
+          }
+        }
+      }
+      else
+      {
+        // Fallback: walk every voxel in this block (original path)
         int ext[6] = {
           block.Extents[0], block.Extents[1],
           block.Extents[2], block.Extents[3],
@@ -2297,7 +2358,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
           }
           default:
           {
-            // Generic fallback for half-float and other types
             for (int z = ext[4]; z <= ext[5]; ++z)
             {
               for (int y = ext[2]; y <= ext[3]; ++y)
@@ -3340,6 +3400,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     this->ScalarRange[1] = 1.0;
   }
 
+  // Update min-max acceleration texture BEFORE volume texture.
+  // UpdateBlockTextures (inside UpdateVolumeTexture) uses the per-macrocell
+  // scalar ranges computed here to avoid re-walking every voxel.
+  this->UpdateMinMaxTexture(mtlDevice, vol, input, scalars);
+
   if (!this->UpdateVolumeTexture(mtlDevice, mtlQueue, vol))
   {
     return;
@@ -3349,9 +3414,6 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     return;
   }
   this->UpdateGradientOpacityTexture(mtlDevice, mtlQueue, vol);
-
-  // Update min-max acceleration texture (enables empty-space skipping in shader)
-  this->UpdateMinMaxTexture(mtlDevice, vol, input, scalars);
 
   // Update mask / label map textures
   if (this->MaskInput && this->MaskType == vtkGPUVolumeRayCastMapper::LabelMapMaskType)

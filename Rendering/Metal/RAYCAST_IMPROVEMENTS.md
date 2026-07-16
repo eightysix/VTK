@@ -82,7 +82,7 @@ This is the single biggest "architectural" win for the axial case after auto-par
 
 ---
 
-## 5. CPU-side: parallelize the dilation pass in `UpdateMinMaxTexture`
+## 5. CPU-side: parallelize the dilation pass in `UpdateMinMaxTexture` ✅ DONE
 
 The dilation is currently a serial triple-nested loop over every macrocell — for a 512×512×2000 CT at DS=4 that's 128×128×500 ≈ 8 M cells. On one thread this is ~50–150 ms. Replace it with a gather-style stencil (read-only on `rawMinMax`, write-only on `minMaxData`), which is embarrassingly parallel:
 
@@ -113,7 +113,7 @@ Same memory access pattern, but now uses all cores. This typically drops the dil
 
 ---
 
-## 6. CPU-side: stop iterating voxels twice
+## 6. CPU-side: stop iterating voxels twice ✅ DONE
 
 `UpdateMinMaxTexture` walks every voxel to compute per-cell min/max. Then `UpdateBlockTextures` walks every voxel *again* per block to compute `BlockScalarRanges`. For a 1 GB volume, that's ~500 M voxels walked twice on the CPU.
 
@@ -224,7 +224,7 @@ A cheaper variant: store gradients at half resolution (DS=2) and bilinearly upsa
 
 1. ~~Item **#1** (MAX_RAY_STEPS)~~ ✅ — done. ~~Item **#7** (skip-branch prefetch)~~ ✅ — done. ~~Item **#2** (cell-boundary min-max)~~ ✅ — done.
 2. ~~Item **#3** (auto-partition)~~ — **SKIPPED**: artifacts + perf regression on single volumes.
-3. Item **#5** (parallel dilation) and **#6** (dedup voxel scans) — 1 hour, cuts first-frame and re-upload times.
+3. ~~Item **#5** (parallel dilation)~~ ✅ — done. ~~Item **#6** (dedup voxel scans)~~ ✅ — done.
 4. Item **#11** (inter-block opacity) — half day, the remaining axial-view gap.
 5. Item **#4** (per-block min-max) — half day, on top of #3.
 6. Items **#9, #10, #12** — polish / optional.

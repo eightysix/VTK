@@ -179,6 +179,12 @@ private:
   // Per-block scalar min/max for empty-space skipping
   std::vector<std::array<double, 2>> BlockScalarRanges;
   bool IsBlockEmpty(double blockMin, double blockMax, vtkPiecewiseFunction* opacityFunc);
+
+  // Per-macrocell scalar min/max — computed alongside the occupancy scan
+  // in UpdateMinMaxTexture, consumed by UpdateBlockTextures to avoid a
+  // redundant full-voxel walk for BlockScalarRanges.
+  std::vector<float> MacrocellScalarMin;
+  std::vector<float> MacrocellScalarMax;
 };
 
 VTK_ABI_NAMESPACE_END
