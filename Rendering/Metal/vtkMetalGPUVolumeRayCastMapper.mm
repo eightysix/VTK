@@ -332,26 +332,6 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
     this->ImageSampleColorTexture = (__bridge void*)colorTex;
     CFRetain((__bridge CFTypeRef)colorTex);
 
-    // Create offscreen depth texture
-    MTLTextureDescriptor* depthDesc = [[MTLTextureDescriptor alloc] init];
-    depthDesc.textureType = MTLTextureType2D;
-    depthDesc.pixelFormat = MTLPixelFormatDepth32Float;
-    depthDesc.width = width;
-    depthDesc.height = height;
-    depthDesc.mipmapLevelCount = 1;
-    depthDesc.usage = MTLTextureUsageRenderTarget;
-    depthDesc.storageMode = MTLStorageModePrivate;
-
-    id<MTLTexture> depthTex = [device newTextureWithDescriptor:depthDesc];
-    if (!depthTex)
-    {
-      vtkErrorMacro("Failed to create image-sample depth texture");
-      this->ReleaseImageSampleResources();
-      return false;
-    }
-    this->ImageSampleDepthTexture = (__bridge void*)depthTex;
-    CFRetain((__bridge CFTypeRef)depthTex);
-
     // Create blit pipeline (fullscreen quad that samples the offscreen texture)
     NSError* error = nil;
     NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
@@ -3421,7 +3401,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     accumDesc.vertexDescriptor = vertexDesc;
     accumDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
     accumDesc.colorAttachments[0].blendingEnabled = NO; // Shader handles compositing manually
-    accumDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    accumDesc.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
     accumDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
     accumDesc.rasterSampleCount = sampleCount;
 
@@ -3451,7 +3431,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       instDesc.vertexDescriptor = vertexDesc;
       instDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
       instDesc.colorAttachments[0].blendingEnabled = NO; // Shader handles compositing via framebuffer fetch
-      instDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+      instDesc.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
       instDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
       instDesc.rasterSampleCount = sampleCount;
 
@@ -3493,7 +3473,11 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
   [encoder setRenderPipelineState:pipeline];
   [encoder setCullMode:MTLCullModeNone];
 
-  if (this->DepthStencilState)
+  // Only bind depth state if the pipeline uses depth testing.
+  // Standard pipeline renders directly to screen with depth; the accumulation
+  // and instanced offscreen pipelines have no depth attachment (MTLPixelFormatInvalid).
+  bool hasDepthAttachment = (pipelineStateVoid == nullptr || pipelineStateVoid == this->PipelineState);
+  if (this->DepthStencilState && hasDepthAttachment)
   {
     id<MTLDepthStencilState> ds =
       (__bridge id<MTLDepthStencilState>)this->DepthStencilState;
@@ -4254,10 +4238,23 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   uniforms.MinMaxDimY = static_cast<float>(this->MinMaxDims[1]);
   uniforms.MinMaxDimZ = static_cast<float>(this->MinMaxDims[2]);
 
+  // Determine if image-space downsampling is active.
+  // Force offscreen rendering when blocks are present to enable inter-block
+  // opacity propagation via Metal framebuffer fetch ([[color(0)]]).
+  const float imageSampleDist = this->ImageSampleDistance;
+  const bool useImageSampling = (imageSampleDist != 1.0f) || !this->Blocks.empty();
+
   // Viewport size for depth texture UV computation in the shader
   int* winSize = ren->GetSize();
-  uniforms.ViewportSize[0] = static_cast<float>(winSize[0]);
-  uniforms.ViewportSize[1] = static_cast<float>(winSize[1]);
+  int renderWidth = winSize[0];
+  int renderHeight = winSize[1];
+  if (useImageSampling)
+  {
+    renderWidth = std::max(1, static_cast<int>(winSize[0] / imageSampleDist));
+    renderHeight = std::max(1, static_cast<int>(winSize[1] / imageSampleDist));
+  }
+  uniforms.ViewportSize[0] = static_cast<float>(renderWidth);
+  uniforms.ViewportSize[1] = static_cast<float>(renderHeight);
 
   // Compute view-projection matrix via generic vtkCamera API.
   // Try the Metal camera first (has a precomputed cached layout), fall back to
@@ -4388,12 +4385,6 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)this->UniformBuffers[bufIdx];
   memcpy([uniformBuf contents], &uniforms, sizeof(uniforms));
 
-  // Determine if image-space downsampling is active.
-  // Force offscreen rendering when blocks are present to enable inter-block
-  // opacity propagation via Metal framebuffer fetch ([[color(0)]]).
-  const float imageSampleDist = this->ImageSampleDistance;
-  const bool useImageSampling = (imageSampleDist != 1.0f) || !this->Blocks.empty();
-
   if (useImageSampling)
   {
     // Image-space downsampling: render to offscreen texture at reduced resolution,
@@ -4420,18 +4411,12 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     // Render volume to offscreen texture
     id<MTLTexture> offscreenColor =
       (__bridge id<MTLTexture>)this->ImageSampleColorTexture;
-    id<MTLTexture> offscreenDepth =
-      (__bridge id<MTLTexture>)this->ImageSampleDepthTexture;
 
     MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
     rpd.colorAttachments[0].texture = offscreenColor;
     rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
     rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
     rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
-    rpd.depthAttachment.texture = offscreenDepth;
-    rpd.depthAttachment.loadAction = MTLLoadActionClear;
-    rpd.depthAttachment.clearDepth = 1.0;
-    rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
 
     id<MTLRenderCommandEncoder> offscreenEncoder =
       [commandBuffer renderCommandEncoderWithDescriptor:rpd];
