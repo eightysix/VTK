@@ -164,12 +164,18 @@ is fetched three times per iteration from the constant buffer. Hoist it above th
 
 ---
 
-## 9. Per-block uniform upload overhead
+## 9. Per-block uniform upload overhead ✅ DONE
 
-`DrawBlocks` calls `setVertexBytes` + `setFragmentBytes` with the full 976-byte `VolumeMapperUniforms` struct per block. For an 8-block partition that's 8 × 976 = ~7.8 KB of memcpy + 16 API calls per frame, plus the cost of re-binding the block texture. Two options:
+Implemented the "better win" option: single-draw instanced rendering. When block count ≤ 8, all blocks are rendered in a single `drawIndexedPrimitives:instanceCount:` call.
 
-- **Quick win**: use `setVertexBuffer:offset:atIndex:` with a single shared `MTLBuffer` containing an array of `VolumeBlockUniforms` (just the per-block bits: `volumeBoundsMin/Max`, `cameraVolumePos`, `gradientStep`, block texture index). The fragment shader indexes by `gl_InstanceID`/`[[instance_id]]`. Drops 976 → ~64 bytes per block.
-- **Better win**: render all blocks in one `drawIndexedPrimitives:instanceCount:` call with instancing. The vertex shader picks the block by instance ID. This collapses 8 draw calls into 1.
+- **`PerBlockData` struct** (80 bytes): tight array of per-block data (`volumeBoundsMin/Max`, `cameraVolumePos`, `gradientStep`, `minMaxInfo`) uploaded to buffer index 2, indexed by `[[instance_id]]`.
+- **`vertex_volume_instanced_main`**: scales a unit cube `[0,1]` to each block's model-space bounds via `PerBlockData[instance_id]`.
+- **`fragment_volume_instanced_main`**: indexes into texture arrays for per-block volume and min-max textures, includes framebuffer fetch for inter-block ERT, DDA skip, and prefetch pipeline.
+- **Capped at 8 blocks** to stay within Metal's 32-texture limit on older Intel Macs. Falls back to the existing per-block loop for >8 blocks.
+- **Unit cube vertex buffer** used when blocks are present — the vertex shader scales per instance.
+- **InstancedPipelineState** (RGBA16Float, no blending) created alongside the existing accumulation pipeline.
+
+This eliminates 7 × `setVertexBytes` + 7 × `setFragmentBytes` + 14 × `setFragmentTexture` + 7 × `drawIndexedPrimitives` calls, replacing them with 2 buffer binds, 16 texture binds, and 1 draw call.
 
 ---
 
@@ -224,6 +230,6 @@ A cheaper variant: store gradients at half resolution (DS=2) and bilinearly upsa
 3. ~~Item **#5** (parallel dilation)~~ ✅ — done. ~~Item **#6** (dedup voxel scans)~~ ✅ — done.
 4. ~~Item **#11** (inter-block opacity)~~ ✅ — done via Metal Framebuffer Fetch.
 5. ~~Item **#4** (per-block min-max)~~ ✅ — done.
-6. Items **#9, #10, #12** — polish / optional.
+6. Items **#10, #12** — polish / optional.
 
 Expect #1–#3 alone to push axial view from 10–15 fps into the 20–25 fps range; #5, #6, #11 should get you to parity with the coronal/sagittal numbers.
