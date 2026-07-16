@@ -74,11 +74,13 @@ For your 1 GB CT this typically yields `1×1×4` or `1×1×8`, which:
 
 ---
 
-## 4. Per-block min-max texture
+## 4. Per-block min-max texture ✅ DONE
 
-When partitioning is on, `UpdateMinMaxTexture` still builds *one* global occupancy volume at DS=4. For a 1 GB CT partitioned 1×1×8, each block's slice range is ~250 slices; a per-block min-max at DS=2 would have the same memory footprint as the current global DS=4 but ~4× finer granularity. Inside `UpdateBlockTextures`, after computing each block's scalar range, also build a small `R8Unorm` 3D texture for that block and store it on `VolumeBlock`. Bind it at fragment texture index 8 (you'll need to add it to the shader signature and to the fallback bind in `BindEncoderResources`).
+When partitioning is on, the global min-max texture is skipped entirely (saves CPU upload time). Instead, `UpdateBlockTextures` generates a per-block `R8Unorm` 3D min-max texture at DS=4 for each non-empty block, with a parallel dilation pass. The per-block dimensions (`MinMaxDims`) and texture (`MinMaxTexture`) are stored on `VolumeBlock` and bound in `DrawBlocks` at fragment index 7 with updated `MinMaxDimX/Y/Z` uniforms. The opacity table is hoisted to the top of `UpdateBlockTextures` to avoid redundant computation.
 
-This is the single biggest "architectural" win for the axial case after auto-partitioning.
+No shader changes required — the existing `minMaxTexture` sampling and DDA skip logic automatically adapt to each block's local occupancy grid via the per-block uniforms.
+
+For a 1 GB CT partitioned 1×1×8, each block's min-max grid covers ~250 slices at DS=4 instead of the global grid covering 2000 slices, yielding ~4× finer granularity and much more aggressive empty-space skipping inside dense blocks.
 
 ---
 
@@ -221,7 +223,7 @@ A cheaper variant: store gradients at half resolution (DS=2) and bilinearly upsa
 2. ~~Item **#3** (auto-partition)~~ — **SKIPPED**: artifacts + perf regression on single volumes.
 3. ~~Item **#5** (parallel dilation)~~ ✅ — done. ~~Item **#6** (dedup voxel scans)~~ ✅ — done.
 4. ~~Item **#11** (inter-block opacity)~~ ✅ — done via Metal Framebuffer Fetch.
-5. Item **#4** (per-block min-max) — half day, on top of #3.
+5. ~~Item **#4** (per-block min-max)~~ ✅ — done.
 6. Items **#9, #10, #12** — polish / optional.
 
 Expect #1–#3 alone to push axial view from 10–15 fps into the 20–25 fps range; #5, #6, #11 should get you to parity with the coronal/sagittal numbers.
