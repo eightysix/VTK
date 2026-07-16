@@ -135,7 +135,7 @@ private:
   bool UpdateVolumeTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
   bool UpdateTransferFunctionTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
   bool UpdateGradientOpacityTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
-  bool UpdateMinMaxTexture(void* mtlDevice, vtkVolume* vol, vtkImageData* input, vtkDataArray* scalars);
+  bool UpdateMinMaxTexture(void* mtlDevice, vtkVolume* vol, vtkImageData* input, vtkDataArray* scalars, bool skipGlobalTexture = false);
   bool SetupBuffers(void* mtlDevice, vtkRenderer* ren, vtkVolume* vol, vtkImageData* input);
   bool SetupPipeline(void* mtlDevice, vtkRenderer* ren);
 
@@ -162,9 +162,11 @@ private:
   struct VolumeBlock
   {
     void* Texture = nullptr; // id<MTLTexture> — 3D sub-texture for this block
+    void* MinMaxTexture = nullptr; // id<MTLTexture> — per-block min-max accel (R8Unorm)
     double BoundsMin[3] = {};
     double BoundsMax[3] = {};
     int Dims[3] = {};
+    int MinMaxDims[3] = {}; // dimensions of the per-block min-max texture
     int Extents[6] = {};
     double Center[3] = {}; // world-space center for sorting
   };
