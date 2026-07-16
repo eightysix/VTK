@@ -43,7 +43,7 @@ In the dense patient interior this typically cuts the min-max fetch count by ~4�
 
 ---
 
-## 3. Auto-partition large volumes along the long axis ✅ DONE
+## 3. Auto-partition large volumes along the long axis
 
 `Partitions` defaults to `{1,1,1}`, so the user is hitting the single-texture path for a 1 GB volume. The block pipeline already exists and already does:
 - Empty-block skipping via `IsBlockEmpty`
@@ -220,10 +220,11 @@ A cheaper variant: store gradients at half resolution (DS=2) and bilinearly upsa
 
 ## Suggested implementation order
 
-1. ~~Item **#1** (MAX_RAY_STEPS)~~ ✅ — done. ~~Item **#7** (skip-branch prefetch)~~ ✅ — done. ~~Item **#2** (cell-boundary min-max)~~ ✅ — done. ~~Item **#3** (auto-partition)~~ ✅ — done.
-2. Item **#5** (parallel dilation) and **#6** (dedup voxel scans) — 1 hour, cuts first-frame and re-upload times.
-3. Item **#11** (inter-block opacity) — half day, the remaining axial-view gap.
-4. Item **#4** (per-block min-max) — half day, on top of #3.
-5. Items **#9, #10, #12** — polish / optional.
+1. ~~Item **#1** (MAX_RAY_STEPS)~~ ✅ — done. ~~Item **#7** (skip-branch prefetch)~~ ✅ — done. ~~Item **#2** (cell-boundary min-max)~~ ✅ — done.
+2. Item **#3** (auto-partition) — 1 hour, biggest axial-view structural win.
+3. Item **#5** (parallel dilation) and **#6** (dedup voxel scans) — 1 hour, cuts first-frame and re-upload times.
+4. Item **#11** (inter-block opacity) — half day, the remaining axial-view gap.
+5. Item **#4** (per-block min-max) — half day, on top of #3.
+6. Items **#9, #10, #12** — polish / optional.
 
 Expect #1–#3 alone to push axial view from 10–15 fps into the 20–25 fps range; #5, #6, #11 should get you to parity with the coronal/sagittal numbers.

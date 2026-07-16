@@ -211,7 +211,6 @@ void vtkMetalGPUVolumeRayCastMapper::SetPartitions(
   {
     this->Partitions[0] = this->Partitions[1] = this->Partitions[2] = 1;
   }
-  this->AutoPartition = false;
   this->Modified();
 }
 
@@ -561,16 +560,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
 
   bool doReload = (this->VolumeTexture == nullptr);
   doReload |= (input->GetMTime() > this->VolumeUploadTime.GetMTime());
-
-  // Auto-partition large volumes along any axis > 384 voxels
-  if (this->AutoPartition)
-  {
-    int dims[3];
-    input->GetDimensions(dims);
-    this->Partitions[0] = std::max(1, (dims[0] + 383) / 384);
-    this->Partitions[1] = std::max(1, (dims[1] + 383) / 384);
-    this->Partitions[2] = std::max(1, (dims[2] + 383) / 384);
-  }
 
   // Check if partitioning is active — route to block-based texture creation
   bool usePartitions = (this->Partitions[0] > 1 || this->Partitions[1] > 1 || this->Partitions[2] > 1);
