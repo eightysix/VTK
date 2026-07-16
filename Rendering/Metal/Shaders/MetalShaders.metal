@@ -1472,19 +1472,31 @@ fragment VolumeFragmentOut fragment_volume_main(
   float prefetchScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
   float prefetchMask = doMask ? maskTexture.sample(maskSampler, currentPoint, level(0)).r : 0.0;
 
+  // MIN-MAX CELL CACHE: only re-sample when the ray crosses into a new macrocell.
+  // This cuts texture fetches by ~4× in dense tissue (DS=4 means each cell covers 4 samples).
+  int3  curCell     = int3(-1);
+  bool  curCellEmpty = false;
+  float3 mmDimF     = float3(volumeUniforms.minMaxDimX,
+                              volumeUniforms.minMaxDimY,
+                              volumeUniforms.minMaxDimZ);
+
   // --- THE RAYMARCHING LOOP ---
   for (int i = 0; i < maxSteps; i++) {
 
     // 0. MIN-MAX ACCELERATION: Empty space skipping via occupancy map.
     // The texture is R8Unorm: 255 = empty, 0 = solid (baked on CPU via opacity TF).
     // Uses DDA to jump exactly to the boundary of the current empty macrocell.
+    // Cell boundary tracking: only re-sample when entering a new cell.
     if (volumeUniforms.useMinMaxAccel > 0.5) {
       float3 mmPos = clamp(currentPoint, float3(0.0), float3(1.0));
-      float isEmpty = minMaxTexture.sample(minMaxSampler, mmPos, level(0)).r;
+      int3 newCell = int3(mmPos * mmDimF);
+      if (any(newCell != curCell)) {
+        curCell      = newCell;
+        curCellEmpty = minMaxTexture.sample(minMaxSampler, mmPos, level(0)).r > 0.5;
+      }
 
-      if (isEmpty > 0.5) {
-        float3 mmDim = float3(volumeUniforms.minMaxDimX, volumeUniforms.minMaxDimY, volumeUniforms.minMaxDimZ);
-        float3 cellCoord = mmPos * mmDim;
+      if (curCellEmpty) {
+        float3 cellCoord = mmPos * mmDimF;
 
         float3 fractCoord = fract(cellCoord);
 
@@ -1498,9 +1510,9 @@ fragment VolumeFragmentOut fragment_volume_main(
 
         // Axial fix: only divide if ray actually moves along this axis
         float3 tToEdge;
-        tToEdge.x = abs(rayDir.x) > 1e-5 ? distToEdge.x / abs(rayDir.x * mmDim.x) : 1e30;
-        tToEdge.y = abs(rayDir.y) > 1e-5 ? distToEdge.y / abs(rayDir.y * mmDim.y) : 1e30;
-        tToEdge.z = abs(rayDir.z) > 1e-5 ? distToEdge.z / abs(rayDir.z * mmDim.z) : 1e30;
+        tToEdge.x = abs(rayDir.x) > 1e-5 ? distToEdge.x / abs(rayDir.x * mmDimF.x) : 1e30;
+        tToEdge.y = abs(rayDir.y) > 1e-5 ? distToEdge.y / abs(rayDir.y * mmDimF.y) : 1e30;
+        tToEdge.z = abs(rayDir.z) > 1e-5 ? distToEdge.z / abs(rayDir.z * mmDimF.z) : 1e30;
 
         // Exact distance to the boundary
         float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
@@ -1520,9 +1532,9 @@ fragment VolumeFragmentOut fragment_volume_main(
           break;
         }
 
-        // Do NOT prefetch here — if the next cell is also empty, the fetch is wasted bandwidth.
-        // Invalidate the prefetch so the normal branch knows to fetch fresh data.
+        // Invalidate prefetch and cell cache so next iteration re-evaluates from scratch.
         prefetchScalar = as_type<float>(0x7fc00000u); // NaN sentinel
+        curCell = int3(-1); // force min-max re-sample for the new cell
         continue;
       }
     }

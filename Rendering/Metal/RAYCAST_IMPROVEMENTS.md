@@ -10,7 +10,7 @@ Raised `MAX_RAY_STEPS` from 2000 to 8192 in `MetalShaders.metal:1306`. The exist
 
 ---
 
-## 2. Biggest GPU win — make min-max sampling cell-boundary–triggered
+## 2. Biggest GPU win — make min-max sampling cell-boundary–triggered ✅ DONE
 
 Right now every loop iteration issues a `minMaxTexture.sample(...)` regardless of whether we've moved to a new macrocell. In dense tissue (the slow axial case), that's a wasted texture fetch + filter on every step. Track the current cell and only re-sample when the ray crosses into a new one:
 
@@ -220,12 +220,11 @@ A cheaper variant: store gradients at half resolution (DS=2) and bilinearly upsa
 
 ## Suggested implementation order
 
-1. ~~Item **#1** (MAX_RAY_STEPS)~~ ✅ — done. ~~Item **#7** (skip-branch prefetch)~~ ✅ — done.
-2. Item **#2** (cell-boundary min-max) — 1–2 hours, biggest GPU-side win in dense regions.
-3. Item **#3** (auto-partition) — 1 hour, biggest axial-view structural win.
-4. Item **#5** (parallel dilation) and **#6** (dedup voxel scans) — 1 hour, cuts first-frame and re-upload times.
-5. Item **#11** (inter-block opacity) — half day, the remaining axial-view gap.
-6. Item **#4** (per-block min-max) — half day, on top of #3.
-7. Items **#9, #10, #12** — polish / optional.
+1. ~~Item **#1** (MAX_RAY_STEPS)~~ ✅ — done. ~~Item **#7** (skip-branch prefetch)~~ ✅ — done. ~~Item **#2** (cell-boundary min-max)~~ ✅ — done.
+2. Item **#3** (auto-partition) — 1 hour, biggest axial-view structural win.
+3. Item **#5** (parallel dilation) and **#6** (dedup voxel scans) — 1 hour, cuts first-frame and re-upload times.
+4. Item **#11** (inter-block opacity) — half day, the remaining axial-view gap.
+5. Item **#4** (per-block min-max) — half day, on top of #3.
+6. Items **#9, #10, #12** — polish / optional.
 
 Expect #1–#3 alone to push axial view from 10–15 fps into the 20–25 fps range; #5, #6, #11 should get you to parity with the coronal/sagittal numbers.
