@@ -191,14 +191,9 @@ Not a perf win directly, but it makes the skip loop's correctness obvious and le
 
 ---
 
-## 11. Inter-block opacity propagation (medium-effort, big axial-view win)
+## 11. Inter-block opacity propagation (medium-effort, big axial-view win) ✅ DONE
 
-Currently, even with back-to-front block sorting, each block's fragment shader starts `accumulatedOpacity = 0`. So if block N (farthest) deposits 0.7 opacity, block N-1 still ray-marches all ~250 of its slices even though only 0.3 weight remains. Solutions:
-
-- **Front-to-back with screen-space opacity buffer**: maintain an R8/R16 opacity texture. Before block K, bind it as a readable texture; the fragment shader reads `prevOpacity` and uses `1 - prevOpacity` as the initial `weight`. After block K, blend-write the new opacity. This is the standard "multi-pass volume" trick.
-- **Or**: render all blocks in a single fragment-shader pass by using a texture array (`MTLTextureType3DArray`) for the block volumes and a per-block bounds buffer; the shader marches each ray through all blocks in order. This is the cleanest solution and gives you global ERT for free. Requires shader rewrite but is conceptually simple.
-
-Either of these typically gives 1.5–2× on the axial view alone, because most of the patient's interior is dense enough to ERT well before the ray exits the last block.
+Implemented via Metal Framebuffer Fetch (`[[color(0)]]`). Blocks are now sorted front-to-back, and the accumulation shader (`fragment_volume_accum_main`) reads previous blocks' accumulated opacity from the offscreen texture. This enables global early ray termination: if a pixel is already opaque from closer blocks, later blocks skip entirely via `discard_fragment()`. Falls back to the standard shader when MSAA > 1 (framebuffer fetch not supported with MSAA).
 
 ---
 
@@ -225,7 +220,7 @@ A cheaper variant: store gradients at half resolution (DS=2) and bilinearly upsa
 1. ~~Item **#1** (MAX_RAY_STEPS)~~ ✅ — done. ~~Item **#7** (skip-branch prefetch)~~ ✅ — done. ~~Item **#2** (cell-boundary min-max)~~ ✅ — done.
 2. ~~Item **#3** (auto-partition)~~ — **SKIPPED**: artifacts + perf regression on single volumes.
 3. ~~Item **#5** (parallel dilation)~~ ✅ — done. ~~Item **#6** (dedup voxel scans)~~ ✅ — done.
-4. Item **#11** (inter-block opacity) — half day, the remaining axial-view gap.
+4. ~~Item **#11** (inter-block opacity)~~ ✅ — done via Metal Framebuffer Fetch.
 5. Item **#4** (per-block min-max) — half day, on top of #3.
 6. Items **#9, #10, #12** — polish / optional.
 

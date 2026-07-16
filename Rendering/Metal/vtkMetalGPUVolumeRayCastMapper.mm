@@ -283,8 +283,10 @@ void vtkMetalGPUVolumeRayCastMapper::ComputeReductionFactor(double allocatedTime
 bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
   void* deviceVoid, int width, int height)
 {
+  // Force recreation if pixel format changed (e.g., BGRA8Unorm -> RGBA16Float)
+  const int desiredFormat = MTLPixelFormatRGBA16Float;
   if (this->ImageSampleColorTexture && this->ImageSampleFBOWidth == width &&
-    this->ImageSampleFBOHeight == height)
+    this->ImageSampleFBOHeight == height && this->ImageSamplePixelFormat == desiredFormat)
   {
     return true;
   }
@@ -295,10 +297,10 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
   {
     id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
 
-    // Create offscreen color texture (BGRA8Unorm, matches layer pixel format)
+    // Create offscreen color texture (RGBA16Float for inter-block accumulation)
     MTLTextureDescriptor* colorDesc = [[MTLTextureDescriptor alloc] init];
     colorDesc.textureType = MTLTextureType2D;
-    colorDesc.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    colorDesc.pixelFormat = MTLPixelFormatRGBA16Float;
     colorDesc.width = width;
     colorDesc.height = height;
     colorDesc.mipmapLevelCount = 1;
@@ -358,8 +360,15 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
     MTLRenderPipelineDescriptor* pipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
     pipelineDesc.vertexFunction = vertexFunc;
     pipelineDesc.fragmentFunction = fragmentFunc;
-    pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    pipelineDesc.colorAttachments[0].blendingEnabled = NO;
+    pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+    // Enable blending so the blit composites the accumulated volume over the background
+    pipelineDesc.colorAttachments[0].blendingEnabled = YES;
+    pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+    pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    pipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    pipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
     pipelineDesc.rasterSampleCount = 1; // Always 1 for blit; MSAA is on the main pass
 
     id<MTLRenderPipelineState> pso =
@@ -385,6 +394,7 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
 
     this->ImageSampleFBOWidth = width;
     this->ImageSampleFBOHeight = height;
+    this->ImageSamplePixelFormat = desiredFormat;
   }
 
   return true;
@@ -415,6 +425,7 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseImageSampleResources()
   }
   this->ImageSampleFBOWidth = 0;
   this->ImageSampleFBOHeight = 0;
+  this->ImageSamplePixelFormat = 0;
 }
 
 //------------------------------------------------------------------------------
@@ -427,6 +438,12 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   {
     CFRelease(this->PipelineState);
     this->PipelineState = nullptr;
+  }
+
+  if (this->AccumulationPipelineState)
+  {
+    CFRelease(this->AccumulationPipelineState);
+    this->AccumulationPipelineState = nullptr;
   }
 
   if (this->VolumeTexture)
@@ -1942,7 +1959,10 @@ void vtkMetalGPUVolumeRayCastMapper::SortBlocksBackToFront(
     }
   }
 
-  // Sort by distance to camera (farthest first = back-to-front)
+  // Sort by distance to camera (closest first = front-to-back)
+  // Front-to-back ordering enables inter-block opacity propagation:
+  // the accumulation shader reads previous blocks' opacity via framebuffer fetch
+  // and can discard early if the pixel is already opaque.
   std::sort(this->SortedBlockOrder.begin(), this->SortedBlockOrder.end(),
     [&](int a, int b) {
       double da = (this->Blocks[a].Center[0] - camPos[0]) * camDir[0] +
@@ -1951,7 +1971,7 @@ void vtkMetalGPUVolumeRayCastMapper::SortBlocksBackToFront(
       double db = (this->Blocks[b].Center[0] - camPos[0]) * camDir[0] +
         (this->Blocks[b].Center[1] - camPos[1]) * camDir[1] +
         (this->Blocks[b].Center[2] - camPos[2]) * camDir[2];
-      return da > db; // farthest first
+      return da < db; // closest first (front-to-back)
     });
 }
 
@@ -2948,6 +2968,13 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     this->PipelineState = nullptr;
   }
 
+  // Also invalidate accumulation pipeline when sample count changes
+  if (this->AccumulationPipelineState && sampleCount != this->CurrentSampleCount)
+  {
+    CFRelease(this->AccumulationPipelineState);
+    this->AccumulationPipelineState = nullptr;
+  }
+
   if (this->PipelineState)
   {
     return true;
@@ -3137,6 +3164,35 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     this->PipelineState = (__bridge void*)pso;
     CFRetain((__bridge CFTypeRef)pso);
     this->CurrentSampleCount = sampleCount;
+
+    // Create accumulation pipeline for inter-block opacity propagation.
+    // This pipeline uses fragment_volume_accum_main which reads the previous
+    // block's accumulated color/opacity via Metal framebuffer fetch ([[color(0)]],
+    // enabling global early ray termination across block boundaries.
+    MTLRenderPipelineDescriptor* accumDesc = [[MTLRenderPipelineDescriptor alloc] init];
+    accumDesc.vertexFunction = vertexFunc;
+    accumDesc.fragmentFunction = [library newFunctionWithName:@"fragment_volume_accum_main"];
+    accumDesc.vertexDescriptor = vertexDesc;
+    accumDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+    accumDesc.colorAttachments[0].blendingEnabled = NO; // Shader handles compositing manually
+    accumDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    accumDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+    accumDesc.rasterSampleCount = sampleCount;
+
+    id<MTLRenderPipelineState> accumPso =
+      [device newRenderPipelineStateWithDescriptor:accumDesc error:&error];
+    if (!accumPso)
+    {
+      vtkErrorMacro(<< "Volume accumulation pipeline: "
+                    << [[error localizedDescription] UTF8String]);
+      return false;
+    }
+    if (this->AccumulationPipelineState)
+    {
+      CFRelease(this->AccumulationPipelineState);
+    }
+    this->AccumulationPipelineState = (__bridge void*)accumPso;
+    CFRetain((__bridge CFTypeRef)accumPso);
   }
 
   return true;
@@ -3144,15 +3200,22 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
 
 //------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
-  void* encoderVoid, void* uniformBufVoid)
+  void* encoderVoid, void* uniformBufVoid, void* pipelineStateVoid)
 {
   id<MTLRenderCommandEncoder> encoder =
     (__bridge id<MTLRenderCommandEncoder>)encoderVoid;
   id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)uniformBufVoid;
 
-  // Set pipeline and render state
-  id<MTLRenderPipelineState> pipeline =
-    (__bridge id<MTLRenderPipelineState>)this->PipelineState;
+  // Set pipeline and render state (use provided pipeline, or fall back to default)
+  id<MTLRenderPipelineState> pipeline;
+  if (pipelineStateVoid)
+  {
+    pipeline = (__bridge id<MTLRenderPipelineState>)pipelineStateVoid;
+  }
+  else
+  {
+    pipeline = (__bridge id<MTLRenderPipelineState>)this->PipelineState;
+  }
   [encoder setRenderPipelineState:pipeline];
   [encoder setCullMode:MTLCullModeNone];
 
@@ -3839,9 +3902,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)this->UniformBuffers[bufIdx];
   memcpy([uniformBuf contents], &uniforms, sizeof(uniforms));
 
-  // Determine if image-space downsampling is active
+  // Determine if image-space downsampling is active.
+  // Force offscreen rendering when blocks are present to enable inter-block
+  // opacity propagation via Metal framebuffer fetch ([[color(0)]]).
   const float imageSampleDist = this->ImageSampleDistance;
-  const bool useImageSampling = (imageSampleDist != 1.0f);
+  const bool useImageSampling = (imageSampleDist != 1.0f) || !this->Blocks.empty();
 
   if (useImageSampling)
   {
@@ -3897,7 +3962,12 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     [offscreenEncoder setViewport:metalViewport];
 
     // Bind all encoder resources (pipeline, textures, samplers, buffers)
-    this->BindEncoderResources(offscreenEncoder, uniformBuf);
+    // Use accumulation pipeline for multi-block rendering (enables inter-block
+    // opacity propagation via framebuffer fetch when sampleCount == 1).
+    int currentSampleCount = metalRenderWindow->GetEffectiveSampleCount();
+    bool useAccumulation = !this->Blocks.empty() && (currentSampleCount == 1);
+    void* activePipeline = useAccumulation ? this->AccumulationPipelineState : this->PipelineState;
+    this->BindEncoderResources(offscreenEncoder, uniformBuf, activePipeline);
 
     // Draw volume — handle partitioned (multi-block) and single-block cases
     this->DrawBlocks(offscreenEncoder, uniformBuf, ren, vol, &uniforms, invModelMatrix);

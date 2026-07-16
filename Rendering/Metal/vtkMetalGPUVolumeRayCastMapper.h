@@ -70,6 +70,7 @@ private:
 
   // Metal pipeline objects (stored as void* to avoid Obj-C in header)
   void* PipelineState = nullptr;         // id<MTLRenderPipelineState>
+  void* AccumulationPipelineState = nullptr; // id<MTLRenderPipelineState> — for inter-block opacity propagation
   void* VolumeTexture = nullptr;         // id<MTLTexture>  (3D)
   void* VolumeSampler = nullptr;         // id<MTLSamplerState>
 
@@ -120,6 +121,7 @@ private:
   void* ImageSampleSampler = nullptr;         // id<MTLSamplerState> — linear sampler for blit
   int ImageSampleFBOWidth = 0;
   int ImageSampleFBOHeight = 0;
+  int ImageSamplePixelFormat = 0;             // cached pixel format to detect changes
   bool EnsureImageSampleResources(void* device, int width, int height);
   void ReleaseImageSampleResources();
 
@@ -152,7 +154,7 @@ private:
     vtkMatrix4x4* invModelMatrix);
 
   // Rendering helpers — shared between image-sampling and standard paths
-  void BindEncoderResources(void* encoder, void* uniformBuf);
+  void BindEncoderResources(void* encoder, void* uniformBuf, void* pipelineState = nullptr);
   void DrawBlocks(void* encoder, void* uniformBuf, vtkRenderer* ren, vtkVolume* vol,
     void* uniforms, vtkMatrix4x4* invModelMatrix);
 
