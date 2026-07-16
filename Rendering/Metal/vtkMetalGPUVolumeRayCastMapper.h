@@ -168,6 +168,7 @@ private:
   };
 
   unsigned short Partitions[3] = { 1, 1, 1 };
+  bool AutoPartition = true; // auto-compute partitions for large volumes
   std::vector<VolumeBlock> Blocks;
   std::vector<int> SortedBlockOrder; // indices into Blocks, sorted back-to-front
 
