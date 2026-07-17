@@ -132,13 +132,14 @@ static_assert(sizeof(VolumeMapperUniforms) == 976,
 struct PerBlockData {
   float VolumeBoundsMin[4]; // 0..15
   float VolumeBoundsMax[4]; // 16..31
-  float CameraVolumePos[4]; // 32..47
-  float GradientStep[4];    // 48..63  (xyz + pad)
-  float MinMaxInfo[4];      // 64..79  (useMinMax, dimX, dimY, dimZ)
+  float TextureBoundsMin[4]; // 32..47
+  float TextureBoundsMax[4]; // 48..63
+  float GradientStep[4];    // 64..79  (xyz + pad)
+  float MinMaxInfo[4];      // 80..95  (useMinMax, dimX, dimY, dimZ)
 };
 
-static_assert(sizeof(PerBlockData) == 80,
-  "PerBlockData must be 80 bytes to match Metal shader struct");
+static_assert(sizeof(PerBlockData) == 96,
+  "PerBlockData must be 96 bytes to match Metal shader struct");
 
 // Maximum number of blocks that can be rendered in a single instanced draw call.
 // Capped at 8 to stay within Metal's 32-texture limit on older Intel Macs.
@@ -2020,6 +2021,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
     int fullDims[3];
     input->GetDimensions(fullDims);
 
+    int fullExt[6];
+    input->GetExtent(fullExt);
+
     int dataType = scalars->GetDataType();
     int componentsForFormat = (numComponents == 3) ? 4 : numComponents;
 
@@ -2292,10 +2296,21 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
     for (size_t idx = 0; idx < this->Blocks.size(); ++idx)
     {
       auto& block = this->Blocks[idx];
+
+      // Ghost Voxels: Pad texture bounds by 1 voxel for correct boundary gradients
+      int texExt[6] = {
+        std::max(fullExt[0], block.Extents[0] - 1),
+        std::min(fullExt[1], block.Extents[1] + 1),
+        std::max(fullExt[2], block.Extents[2] - 1),
+        std::min(fullExt[3], block.Extents[3] + 1),
+        std::max(fullExt[4], block.Extents[4] - 1),
+        std::min(fullExt[5], block.Extents[5] + 1)
+      };
+
       int bDims[3] = {
-        block.Extents[1] - block.Extents[0] + 1,
-        block.Extents[3] - block.Extents[2] + 1,
-        block.Extents[5] - block.Extents[4] + 1
+        texExt[1] - texExt[0] + 1,
+        texExt[3] - texExt[2] + 1,
+        texExt[5] - texExt[4] + 1
       };
       block.Dims[0] = bDims[0];
       block.Dims[1] = bDims[1];
@@ -2500,44 +2515,47 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
             const int gy = static_cast<int>((cellIdx / mmDims0) % mmDims1);
             const int gz = static_cast<int>(cellIdx / (mmDims0 * mmDims1));
 
-            const int zStart = block.Extents[4] + gz * DS;
-            const int zEnd = std::min(zStart + DS, block.Extents[5] + 1);
-            const int yStart = block.Extents[2] + gy * DS;
-            const int yEnd = std::min(yStart + DS, block.Extents[3] + 1);
-            const int xStart = block.Extents[0] + gx * DS;
-            const int xEnd = std::min(xStart + DS, block.Extents[1] + 1);
+            const int zStart = texExt[4] + gz * DS;
+            const int zEnd = std::min(zStart + DS, texExt[5] + 1);
+            const int yStart = texExt[2] + gy * DS;
+            const int yEnd = std::min(yStart + DS, texExt[3] + 1);
+            const int xStart = texExt[0] + gx * DS;
+            const int xEnd = std::min(xStart + DS, texExt[1] + 1);
 
             float cellMin = 1e30f;
             float cellMax = -1e30f;
 
             for (int z = zStart; z < zEnd; ++z)
             {
+              int zOffset = z - fullExt[4];
               for (int y = yStart; y < yEnd; ++y)
               {
+                int yOffset = y - fullExt[2];
                 for (int x = xStart; x < xEnd; ++x)
                 {
+                  int xOffset = x - fullExt[0];
                   float v = 0.0f;
                   switch (dataType)
                   {
                     case VTK_FLOAT:
                       v = static_cast<float>(
-                        static_cast<const float*>(fullDataPtr)[z * inc[2] + y * inc[1] + x * inc[0]]);
+                        static_cast<const float*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
                       break;
                     case VTK_UNSIGNED_CHAR:
                       v = static_cast<float>(
-                        static_cast<const unsigned char*>(fullDataPtr)[z * inc[2] + y * inc[1] + x * inc[0]]);
+                        static_cast<const unsigned char*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
                       break;
                     case VTK_UNSIGNED_SHORT:
                       v = static_cast<float>(
-                        static_cast<const unsigned short*>(fullDataPtr)[z * inc[2] + y * inc[1] + x * inc[0]]);
+                        static_cast<const unsigned short*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
                       break;
                     case VTK_SHORT:
                       v = static_cast<float>(
-                        static_cast<const short*>(fullDataPtr)[z * inc[2] + y * inc[1] + x * inc[0]]);
+                        static_cast<const short*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
                       break;
                     default:
                     {
-                      vtkIdType tupleIdx = z * (inc[2] / inc[0]) + y * (inc[1] / inc[0]) + x;
+                      vtkIdType tupleIdx = zOffset * (inc[2] / inc[0]) + yOffset * (inc[1] / inc[0]) + xOffset;
                       v = static_cast<float>(scalars->GetComponent(tupleIdx, 0));
                       break;
                     }
@@ -2632,9 +2650,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       // Compute byte offset for this block's corner in the full volume buffer.
       // The GPU DMA controller extracts the 3D sub-region using source strides.
       NSUInteger sourceOffset =
-        static_cast<NSUInteger>(block.Extents[4]) * srcBytesPerImage +
-        static_cast<NSUInteger>(block.Extents[2]) * srcBytesPerRow +
-        static_cast<NSUInteger>(block.Extents[0]) * bytesPerVoxel;
+        static_cast<NSUInteger>(texExt[4] - fullExt[4]) * srcBytesPerImage +
+        static_cast<NSUInteger>(texExt[2] - fullExt[2]) * srcBytesPerRow +
+        static_cast<NSUInteger>(texExt[0] - fullExt[0]) * bytesPerVoxel;
 
       [blit copyFromBuffer:stagingBuf
               sourceOffset:sourceOffset
@@ -3599,6 +3617,13 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
   VolumeMapperUniforms* uniforms = static_cast<VolumeMapperUniforms*>(uniformsVoid);
   id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;
 
+  vtkImageData* input = vtkImageData::SafeDownCast(this->GetInput());
+  int fullExt[6];
+  input->GetExtent(fullExt);
+  double origin[3], spacing[3];
+  input->GetOrigin(origin);
+  input->GetSpacing(spacing);
+
   if (!this->Blocks.empty())
   {
     this->SortBlocksBackToFront(ren, vol);
@@ -3635,26 +3660,24 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
         perBlockData[i].VolumeBoundsMax[2] = static_cast<float>(block.BoundsMax[2]);
         perBlockData[i].VolumeBoundsMax[3] = 1.0f;
 
-        // Recompute camera position in block-local [0,1] space
-        double camPosVolume[4] = { camPosWorld[0], camPosWorld[1], camPosWorld[2], 1.0 };
-        invModelMatrix->MultiplyPoint(camPosVolume, camPosVolume);
-        double blockBoundsSize[3] = {
-          block.BoundsMax[0] - block.BoundsMin[0],
-          block.BoundsMax[1] - block.BoundsMin[1],
-          block.BoundsMax[2] - block.BoundsMin[2]
+        int texExt[6] = {
+          std::max(fullExt[0], block.Extents[0] - 1),
+          std::min(fullExt[1], block.Extents[1] + 1),
+          std::max(fullExt[2], block.Extents[2] - 1),
+          std::min(fullExt[3], block.Extents[3] + 1),
+          std::max(fullExt[4], block.Extents[4] - 1),
+          std::min(fullExt[5], block.Extents[5] + 1)
         };
-        for (int k = 0; k < 3; ++k)
-        {
-          if (blockBoundsSize[k] < 1e-10)
-            blockBoundsSize[k] = 1.0;
-        }
-        perBlockData[i].CameraVolumePos[0] =
-          static_cast<float>((camPosVolume[0] - block.BoundsMin[0]) / blockBoundsSize[0]);
-        perBlockData[i].CameraVolumePos[1] =
-          static_cast<float>((camPosVolume[1] - block.BoundsMin[1]) / blockBoundsSize[1]);
-        perBlockData[i].CameraVolumePos[2] =
-          static_cast<float>((camPosVolume[2] - block.BoundsMin[2]) / blockBoundsSize[2]);
-        perBlockData[i].CameraVolumePos[3] = 1.0f;
+
+        perBlockData[i].TextureBoundsMin[0] = static_cast<float>(origin[0] + texExt[0] * spacing[0]);
+        perBlockData[i].TextureBoundsMin[1] = static_cast<float>(origin[1] + texExt[2] * spacing[1]);
+        perBlockData[i].TextureBoundsMin[2] = static_cast<float>(origin[2] + texExt[4] * spacing[2]);
+        perBlockData[i].TextureBoundsMin[3] = 1.0f;
+
+        perBlockData[i].TextureBoundsMax[0] = static_cast<float>(origin[0] + texExt[1] * spacing[0]);
+        perBlockData[i].TextureBoundsMax[1] = static_cast<float>(origin[1] + texExt[3] * spacing[1]);
+        perBlockData[i].TextureBoundsMax[2] = static_cast<float>(origin[2] + texExt[5] * spacing[2]);
+        perBlockData[i].TextureBoundsMax[3] = 1.0f;
 
         // Gradient step for this block's dimensions
         for (int k = 0; k < 3; ++k)
@@ -3795,62 +3818,53 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
     }
 
     // --- FALLBACK PATH (> 8 blocks): per-block loop ---
-    VolumeMapperUniforms blockUniforms;
-    memcpy(&blockUniforms, uniforms, sizeof(blockUniforms));
-
-    double* camPosWorld = ren->GetActiveCamera()->GetPosition();
-
     for (size_t bi = 0; bi < this->SortedBlockOrder.size(); ++bi)
     {
       int si = this->SortedBlockOrder[bi];
       auto& block = this->Blocks[si];
 
-      // Update bounds for this block
-      blockUniforms.VolumeBoundsMin[0] = static_cast<float>(block.BoundsMin[0]);
-      blockUniforms.VolumeBoundsMin[1] = static_cast<float>(block.BoundsMin[1]);
-      blockUniforms.VolumeBoundsMin[2] = static_cast<float>(block.BoundsMin[2]);
-      blockUniforms.VolumeBoundsMin[3] = 1.0f;
+      PerBlockData pbd;
+      pbd.VolumeBoundsMin[0] = static_cast<float>(block.BoundsMin[0]);
+      pbd.VolumeBoundsMin[1] = static_cast<float>(block.BoundsMin[1]);
+      pbd.VolumeBoundsMin[2] = static_cast<float>(block.BoundsMin[2]);
+      pbd.VolumeBoundsMin[3] = 1.0f;
 
-      blockUniforms.VolumeBoundsMax[0] = static_cast<float>(block.BoundsMax[0]);
-      blockUniforms.VolumeBoundsMax[1] = static_cast<float>(block.BoundsMax[1]);
-      blockUniforms.VolumeBoundsMax[2] = static_cast<float>(block.BoundsMax[2]);
-      blockUniforms.VolumeBoundsMax[3] = 1.0f;
+      pbd.VolumeBoundsMax[0] = static_cast<float>(block.BoundsMax[0]);
+      pbd.VolumeBoundsMax[1] = static_cast<float>(block.BoundsMax[1]);
+      pbd.VolumeBoundsMax[2] = static_cast<float>(block.BoundsMax[2]);
+      pbd.VolumeBoundsMax[3] = 1.0f;
 
-      // Recompute camera position in block-local [0,1] space
-      double camPosVolume[4] = { camPosWorld[0], camPosWorld[1], camPosWorld[2], 1.0 };
-      invModelMatrix->MultiplyPoint(camPosVolume, camPosVolume);
-      double blockBoundsSize[3] = {
-        block.BoundsMax[0] - block.BoundsMin[0],
-        block.BoundsMax[1] - block.BoundsMin[1],
-        block.BoundsMax[2] - block.BoundsMin[2]
+      int texExt[6] = {
+        std::max(fullExt[0], block.Extents[0] - 1),
+        std::min(fullExt[1], block.Extents[1] + 1),
+        std::max(fullExt[2], block.Extents[2] - 1),
+        std::min(fullExt[3], block.Extents[3] + 1),
+        std::max(fullExt[4], block.Extents[4] - 1),
+        std::min(fullExt[5], block.Extents[5] + 1)
       };
+
+      pbd.TextureBoundsMin[0] = static_cast<float>(origin[0] + texExt[0] * spacing[0]);
+      pbd.TextureBoundsMin[1] = static_cast<float>(origin[1] + texExt[2] * spacing[1]);
+      pbd.TextureBoundsMin[2] = static_cast<float>(origin[2] + texExt[4] * spacing[2]);
+      pbd.TextureBoundsMin[3] = 1.0f;
+
+      pbd.TextureBoundsMax[0] = static_cast<float>(origin[0] + texExt[1] * spacing[0]);
+      pbd.TextureBoundsMax[1] = static_cast<float>(origin[1] + texExt[3] * spacing[1]);
+      pbd.TextureBoundsMax[2] = static_cast<float>(origin[2] + texExt[5] * spacing[2]);
+      pbd.TextureBoundsMax[3] = 1.0f;
+
       for (int k = 0; k < 3; ++k)
       {
-        if (blockBoundsSize[k] < 1e-10)
-          blockBoundsSize[k] = 1.0;
+        pbd.GradientStep[k] = (block.Dims[k] > 0) ? 1.0f / block.Dims[k] : 1.0f;
       }
-      blockUniforms.CameraVolumePos[0] =
-        static_cast<float>((camPosVolume[0] - block.BoundsMin[0]) / blockBoundsSize[0]);
-      blockUniforms.CameraVolumePos[1] =
-        static_cast<float>((camPosVolume[1] - block.BoundsMin[1]) / blockBoundsSize[1]);
-      blockUniforms.CameraVolumePos[2] =
-        static_cast<float>((camPosVolume[2] - block.BoundsMin[2]) / blockBoundsSize[2]);
-      blockUniforms.CameraVolumePos[3] = 1.0f;
+      pbd.GradientStep[3] = 0.0f;
 
-      // Update gradient step for this block's dimensions
-      for (int k = 0; k < 3; ++k)
-      {
-        blockUniforms.GradientStep[k] =
-          (block.Dims[k] > 0) ? 1.0f / block.Dims[k] : 1.0f;
-      }
-
-      // Update min-max uniforms and bind per-block min-max texture
       if (block.MinMaxTexture)
       {
-        blockUniforms.UseMinMaxAccel = 1.0f;
-        blockUniforms.MinMaxDimX = static_cast<float>(block.MinMaxDims[0]);
-        blockUniforms.MinMaxDimY = static_cast<float>(block.MinMaxDims[1]);
-        blockUniforms.MinMaxDimZ = static_cast<float>(block.MinMaxDims[2]);
+        pbd.MinMaxInfo[0] = 1.0f;
+        pbd.MinMaxInfo[1] = static_cast<float>(block.MinMaxDims[0]);
+        pbd.MinMaxInfo[2] = static_cast<float>(block.MinMaxDims[1]);
+        pbd.MinMaxInfo[3] = static_cast<float>(block.MinMaxDims[2]);
 
         id<MTLTexture> blockMmTex = (__bridge id<MTLTexture>)block.MinMaxTexture;
         [encoder setFragmentTexture:blockMmTex atIndex:7];
@@ -3859,12 +3873,14 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
       }
       else
       {
-        blockUniforms.UseMinMaxAccel = 0.0f;
+        pbd.MinMaxInfo[0] = 0.0f;
+        pbd.MinMaxInfo[1] = 0.0f;
+        pbd.MinMaxInfo[2] = 0.0f;
+        pbd.MinMaxInfo[3] = 0.0f;
       }
 
-      // Copy block-specific uniforms into command buffer
-      [encoder setVertexBytes:&blockUniforms length:sizeof(blockUniforms) atIndex:1];
-      [encoder setFragmentBytes:&blockUniforms length:sizeof(blockUniforms) atIndex:1];
+      [encoder setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
+      [encoder setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
 
       // Bind this block's 3D texture (scalar data)
       id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture;
@@ -3881,6 +3897,40 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
   else
   {
     // Single-block path (no partitioning)
+    PerBlockData pbd = {};
+    pbd.VolumeBoundsMin[0] = uniforms->VolumeBoundsMin[0];
+    pbd.VolumeBoundsMin[1] = uniforms->VolumeBoundsMin[1];
+    pbd.VolumeBoundsMin[2] = uniforms->VolumeBoundsMin[2];
+    pbd.VolumeBoundsMin[3] = 1.0f;
+
+    pbd.VolumeBoundsMax[0] = uniforms->VolumeBoundsMax[0];
+    pbd.VolumeBoundsMax[1] = uniforms->VolumeBoundsMax[1];
+    pbd.VolumeBoundsMax[2] = uniforms->VolumeBoundsMax[2];
+    pbd.VolumeBoundsMax[3] = 1.0f;
+
+    pbd.TextureBoundsMin[0] = uniforms->VolumeBoundsMin[0];
+    pbd.TextureBoundsMin[1] = uniforms->VolumeBoundsMin[1];
+    pbd.TextureBoundsMin[2] = uniforms->VolumeBoundsMin[2];
+    pbd.TextureBoundsMin[3] = 1.0f;
+
+    pbd.TextureBoundsMax[0] = uniforms->VolumeBoundsMax[0];
+    pbd.TextureBoundsMax[1] = uniforms->VolumeBoundsMax[1];
+    pbd.TextureBoundsMax[2] = uniforms->VolumeBoundsMax[2];
+    pbd.TextureBoundsMax[3] = 1.0f;
+
+    pbd.GradientStep[0] = uniforms->GradientStep[0];
+    pbd.GradientStep[1] = uniforms->GradientStep[1];
+    pbd.GradientStep[2] = uniforms->GradientStep[2];
+    pbd.GradientStep[3] = 0.0f;
+
+    pbd.MinMaxInfo[0] = uniforms->UseMinMaxAccel;
+    pbd.MinMaxInfo[1] = uniforms->MinMaxDimX;
+    pbd.MinMaxInfo[2] = uniforms->MinMaxDimY;
+    pbd.MinMaxInfo[3] = uniforms->MinMaxDimZ;
+
+    [encoder setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
+    [encoder setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
+
     [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                         indexCount:this->IndexCount
                          indexType:MTLIndexTypeUInt32

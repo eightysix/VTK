@@ -1297,14 +1297,16 @@ constant int MAX_INSTANCED_BLOCKS = 8;
 struct PerBlockData {
   float4 volumeBoundsMin;
   float4 volumeBoundsMax;
-  float4 cameraVolumePos;
+  float4 textureBoundsMin;
+  float4 textureBoundsMax;
   float4 gradientStep;  // xyz + pad
   float4 minMaxInfo;    // useMinMax, dimX, dimY, dimZ
 };
 
 vertex VolumeVertexOut vertex_volume_main(
     VolumeVertexIn in [[stage_in]],
-    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]]) {
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]]) {
   VolumeVertexOut out;
 
   float3 modelPos = in.position;
@@ -1328,7 +1330,7 @@ vertex VolumeVertexOut vertex_volume_instanced_main(
   float3 modelPos = b.volumeBoundsMin.xyz + in.position * (b.volumeBoundsMax.xyz - b.volumeBoundsMin.xyz);
 
   out.position = u.viewProjection * u.volumeToWorld * float4(modelPos, 1.0);
-  out.localPos = in.position; // Already in [0,1] space for this block
+  out.localPos = (modelPos - u.volumeBoundsMin.xyz) / (u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz);
   out.instanceID = iid;
   return out;
 }
@@ -1342,7 +1344,7 @@ inline float volume_random(float2 st) {
 }
 
 inline float2 intersectBox(float3 orig, float3 dir, float3 boxMin, float3 boxMax) {
-  float3 invDir = 1.0 / (dir + float3(1e-8));
+  float3 invDir = 1.0 / select(dir, float3(1e-8), abs(dir) < 1e-8);
   float3 tbot = invDir * (boxMin - orig);
   float3 ttop = invDir * (boxMax - orig);
   float3 tmin = min(ttop, tbot);
@@ -1389,7 +1391,9 @@ inline int computeCropRegion(float3 cropMin, float3 cropMax, float3 pos) {
 
 fragment VolumeFragmentOut fragment_volume_main(
     VolumeVertexOut in [[stage_in]],
+    bool isFrontFace [[front_facing]],
     constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
     texture3d<float> volumeTexture [[texture(0)]],
     texture2d<float> transferFunctionTexture [[texture(1)]],
     texture2d<float> depthTexture [[texture(2)]],
@@ -1407,7 +1411,15 @@ fragment VolumeFragmentOut fragment_volume_main(
     sampler labelMapGradOpSampler [[sampler(6)]],
     sampler minMaxSampler [[sampler(7)]]) {
 
+  if (!isFrontFace) discard_fragment();
+
   VolumeFragmentOut output;
+  float3 blockMinGlobal = (b.volumeBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+
+  float3 texMinGlobal = (b.textureBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 texMaxGlobal = (b.textureBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
   float stepSize = volumeUniforms.sampleDistance;
 
@@ -1416,7 +1428,7 @@ fragment VolumeFragmentOut fragment_volume_main(
   if (dirLength < 0.0001) discard_fragment();
 
   rayDir /= dirLength;
-  float2 t = intersectBox(cameraPos, rayDir, float3(0.0), float3(1.0));
+  float2 t = intersectBox(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal);
   float tStart = max(t.x, 0.0);
   if (tStart >= t.y) discard_fragment();
 
@@ -1431,7 +1443,7 @@ fragment VolumeFragmentOut fragment_volume_main(
     float2 ndcXY = (in.position.xy / volumeUniforms.viewportSize) * 2.0 - 1.0;
     float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
     float3 terminationLocal = ((worldTermination.xyz / worldTermination.w) - volumeUniforms.volumeBoundsMin.xyz) / (volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz);
-    tTerminateMax = length(terminationLocal - entryPoint);
+    tTerminateMax = dot(terminationLocal - cameraPos, rayDir);
   }
 
   if (volumeUniforms.useClipping > 0.5) {
@@ -1451,8 +1463,10 @@ fragment VolumeFragmentOut fragment_volume_main(
       if (rayDotNormal > 0.0 && startDistance > 0.0) entryPoint += (startDistance / rayDotNormal) * rayDir;
       if (rayDotNormal <= 0.0 && stopDistance > 0.0) exitPoint += (stopDistance / rayDotNormal) * rayDir;
     }
-    totalDist = length(exitPoint - entryPoint);
-    if (totalDist < 1e-6) discard_fragment();
+    
+    if (dot(exitPoint - entryPoint, rayDir) < 1e-6) discard_fragment();
+    tStart = dot(entryPoint - cameraPos, rayDir);
+    t.y = dot(exitPoint - cameraPos, rayDir);
   }
 
   // --- LOCAL CACHE WARM-UP (Prevents Uniform Cache Thrashing) ---
@@ -1464,7 +1478,6 @@ fragment VolumeFragmentOut fragment_volume_main(
   half scalarScale = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
   half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
 
-  float3 gradStep = volumeUniforms.gradientStep;
   half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
 
   half3 viewDirHalf  = half3(normalize(entryPoint - cameraPos));
@@ -1491,34 +1504,35 @@ fragment VolumeFragmentOut fragment_volume_main(
 
   // --- SOFTWARE PIPELINING INITIALIZATION ---
   float jitter = volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) * stepSize : 0.0;
-  float3 stepVec = rayDir * stepSize;
-  float3 currentPoint = entryPoint + (rayDir * jitter);
-  float currentT = jitter;
+  float currentT = jitter + ceil((tStart - jitter) / stepSize - 1e-4) * stepSize;
+  if (currentT >= t.y) discard_fragment();
 
-  int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
+  float3 stepVec = rayDir * stepSize;
+  float3 currentPoint = cameraPos + rayDir * currentT;
+  float totalDistActual = t.y - currentT;
+  int maxSteps = min(max(1, int(ceil(totalDistActual / stepSize))), MAX_RAY_STEPS);
 
   half3 accumulatedColor = half3(0.0);
   half accumulatedOpacity = 0.0;
 
   // PREFETCH the very first samples before the loop starts
-  float3 evalPoint0 = currentPoint * (1.0 - gradStep) + 0.5 * gradStep;
+  float3 texLocalPos0 = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
+  float3 evalPoint0 = texLocalPos0 * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
   float prefetchScalar = volumeTexture.sample(volumeSampler, evalPoint0, level(0)).r;
   float prefetchMask = doMask ? maskTexture.sample(maskSampler, evalPoint0, level(0)).r : 0.0;
   int3  curCell     = int3(-1);
   bool  curCellEmpty = false;
-  float3 mmDimF     = float3(volumeUniforms.minMaxDimX,
-                              volumeUniforms.minMaxDimY,
-                              volumeUniforms.minMaxDimZ);
+  float3 mmDimF     = b.minMaxInfo.yzw;
 
   // --- THE RAYMARCHING LOOP ---
   for (int i = 0; i < maxSteps; i++) {
+    // Strict check to completely suppress smearing outside partitioned edges
+    if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
 
-    // 0. MIN-MAX ACCELERATION: Empty space skipping via occupancy map.
-    // The texture is R8Unorm: 255 = empty, 0 = solid (baked on CPU via opacity TF).
-    // Uses DDA to jump exactly to the boundary of the current empty macrocell.
-    // Cell boundary tracking: only re-sample when entering a new cell.
-    if (volumeUniforms.useMinMaxAccel > 0.5) {
-      float3 mmPos = clamp(currentPoint, float3(0.0), float3(1.0));
+    // 0. MIN-MAX ACCELERATION
+    if (b.minMaxInfo.x > 0.5) {
+      float3 blockLocalPos = (currentPoint - blockMinGlobal) / max(blockMaxGlobal - blockMinGlobal, 1e-6);
+      float3 mmPos = clamp(blockLocalPos, float3(0.0), float3(1.0));
       int3 newCell = int3(mmPos * mmDimF);
       if (any(newCell != curCell)) {
         curCell      = newCell;
@@ -1527,51 +1541,39 @@ fragment VolumeFragmentOut fragment_volume_main(
 
       if (curCellEmpty) {
         float3 cellCoord = mmPos * mmDimF;
-
         float3 fractCoord = fract(cellCoord);
 
         float3 distToEdge;
         distToEdge.x = rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x;
         distToEdge.y = rayDir.y > 0.0 ? (1.0 - fractCoord.y) : fractCoord.y;
         distToEdge.z = rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
-
-        // If exactly on a boundary (dist ~0), distance to NEXT boundary is 1.0 cell
         distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
 
-        // Axial fix: only divide if ray actually moves along this axis
+        float3 rayDirBlockLocal = rayDir / max(blockMaxGlobal - blockMinGlobal, 1e-6);
         float3 tToEdge;
-        tToEdge.x = abs(rayDir.x) > 1e-5 ? distToEdge.x / abs(rayDir.x * mmDimF.x) : 1e30;
-        tToEdge.y = abs(rayDir.y) > 1e-5 ? distToEdge.y / abs(rayDir.y * mmDimF.y) : 1e30;
-        tToEdge.z = abs(rayDir.z) > 1e-5 ? distToEdge.z / abs(rayDir.z * mmDimF.z) : 1e30;
+        tToEdge.x = abs(rayDirBlockLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirBlockLocal.x * mmDimF.x) : 1e30;
+        tToEdge.y = abs(rayDirBlockLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirBlockLocal.y * mmDimF.y) : 1e30;
+        tToEdge.z = abs(rayDirBlockLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirBlockLocal.z * mmDimF.z) : 1e30;
 
-        // Exact distance to the boundary
         float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
+        float skipDist = (floor(exactSkip / stepSize + 1e-4) + 1.0) * stepSize;
 
-        // FIX: Add a tiny epsilon to cross the boundary, then QUANTIZE to stepSize.
-        // This ensures the ray maintains its exact sampling rhythm and jitter alignment.
-        exactSkip += 1e-4;
-        float skipDist = ceil(exactSkip / stepSize) * stepSize;
-
-        // Ensure we always move forward at least one step
-        skipDist = max(stepSize, skipDist);
-
-        currentPoint += rayDir * skipDist;
         currentT += skipDist;
+        currentPoint = cameraPos + rayDir * currentT;
 
-        if (any(currentPoint < float3(0.0)) || any(currentPoint > float3(1.0)) || currentT >= t.y) {
+        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y) {
           break;
         }
 
-        // Invalidate prefetch and cell cache so next iteration re-evaluates from scratch.
         prefetchScalar = as_type<float>(0x7fc00000u); // NaN sentinel
-        curCell = int3(-1); // force min-max re-sample for the new cell
+        curCell = int3(-1);
         continue;
       }
     }
 
-    // 1. Claim prefetched data and lock current spatial coordinate.
-    //    If prefetchScalar is NaN (sentinel from skip branch), fetch fresh data.
-    float3 evalPoint = currentPoint * (1.0 - gradStep) + 0.5 * gradStep;
+    // 1. Claim prefetched data
+    float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
+    float3 evalPoint = texLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
     bool needsFetch = (as_type<uint>(prefetchScalar) == 0x7fc00000u);
     float rawScalar = needsFetch
       ? volumeTexture.sample(volumeSampler, evalPoint, level(0)).r
@@ -1586,16 +1588,16 @@ fragment VolumeFragmentOut fragment_volume_main(
     currentT += stepSize;
 
     // 3. LAUNCH PREFETCH FOR NEXT ITERATION
-    // The GPU memory controller fulfills these while the ALU does the math below!
     if (i + 1 < maxSteps) {
-      float3 nextEvalPoint = currentPoint * (1.0 - gradStep) + 0.5 * gradStep;
+      float3 nextTexLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
+      float3 nextEvalPoint = nextTexLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
       prefetchScalar = volumeTexture.sample(volumeSampler, nextEvalPoint, level(0)).r;
       if (doMask) {
         prefetchMask = maskTexture.sample(maskSampler, nextEvalPoint, level(0)).r;
       }
     }
 
-    // 4. MATH & EVALUATION (Hides the memory latency of step 3)
+    // 4. MATH & EVALUATION
     if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, lastPoint))) == 0u)) {
       continue;
     }
@@ -1636,7 +1638,7 @@ fragment VolumeFragmentOut fragment_volume_main(
       // it is invisible on an 8-bit monitor. Do not waste memory bandwidth shading it.
       if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
 
-        half4 grad = computeGradientFast(volumeTexture, volumeSampler, evalPoint, gradStep, gradNormFactor);
+        half4 grad = computeGradientFast(volumeTexture, volumeSampler, evalPoint, b.gradientStep.xyz, gradNormFactor);
         sampleColor = computePhongLightingVolumeFast(sampleColor, grad.xyz, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
 
         if (doGradOp) {
@@ -1668,8 +1670,10 @@ fragment VolumeFragmentOut fragment_volume_main(
 // across block boundaries. Used when rendering partitioned volumes front-to-back.
 fragment VolumeFragmentOut fragment_volume_accum_main(
     VolumeVertexOut in [[stage_in]],
+    bool isFrontFace [[front_facing]],
     float4 prevAccum [[color(0)]], // Metal Framebuffer Fetch
     constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
     texture3d<float> volumeTexture [[texture(0)]],
     texture2d<float> transferFunctionTexture [[texture(1)]],
     texture2d<float> depthTexture [[texture(2)]],
@@ -1687,6 +1691,8 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     sampler labelMapGradOpSampler [[sampler(6)]],
     sampler minMaxSampler [[sampler(7)]]) {
 
+  if (!isFrontFace) discard_fragment();
+
   VolumeFragmentOut output;
 
   // Global ERT: Skip if previous blocks already made this pixel opaque
@@ -1698,6 +1704,12 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
   half3 accumulatedColor = half3(prevAccum.rgb);
   half accumulatedOpacity = half(prevAccum.a);
 
+  float3 blockMinGlobal = (b.volumeBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+
+  float3 texMinGlobal = (b.textureBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 texMaxGlobal = (b.textureBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
   float stepSize = volumeUniforms.sampleDistance;
 
@@ -1706,7 +1718,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
   if (dirLength < 0.0001) discard_fragment();
 
   rayDir /= dirLength;
-  float2 t = intersectBox(cameraPos, rayDir, float3(0.0), float3(1.0));
+  float2 t = intersectBox(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal);
   float tStart = max(t.x, 0.0);
   if (tStart >= t.y) discard_fragment();
 
@@ -1721,7 +1733,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     float2 ndcXY = (in.position.xy / volumeUniforms.viewportSize) * 2.0 - 1.0;
     float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
     float3 terminationLocal = ((worldTermination.xyz / worldTermination.w) - volumeUniforms.volumeBoundsMin.xyz) / (volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz);
-    tTerminateMax = length(terminationLocal - entryPoint);
+    tTerminateMax = dot(terminationLocal - cameraPos, rayDir);
   }
 
   if (volumeUniforms.useClipping > 0.5) {
@@ -1741,8 +1753,10 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
       if (rayDotNormal > 0.0 && startDistance > 0.0) entryPoint += (startDistance / rayDotNormal) * rayDir;
       if (rayDotNormal <= 0.0 && stopDistance > 0.0) exitPoint += (stopDistance / rayDotNormal) * rayDir;
     }
-    totalDist = length(exitPoint - entryPoint);
-    if (totalDist < 1e-6) discard_fragment();
+    
+    if (dot(exitPoint - entryPoint, rayDir) < 1e-6) discard_fragment();
+    tStart = dot(entryPoint - cameraPos, rayDir);
+    t.y = dot(exitPoint - cameraPos, rayDir);
   }
 
   // --- LOCAL CACHE WARM-UP (Prevents Uniform Cache Thrashing) ---
@@ -1754,7 +1768,6 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
   half scalarScale = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
   half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
 
-  float3 gradStep = volumeUniforms.gradientStep;
   half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
 
   half3 viewDirHalf  = half3(normalize(entryPoint - cameraPos));
@@ -1781,30 +1794,32 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
 
   // --- SOFTWARE PIPELINING INITIALIZATION ---
   float jitter = volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) * stepSize : 0.0;
-  float3 stepVec = rayDir * stepSize;
-  float3 currentPoint = entryPoint + (rayDir * jitter);
-  float currentT = jitter;
+  float currentT = jitter + ceil((tStart - jitter) / stepSize - 1e-4) * stepSize;
+  if (currentT >= t.y) discard_fragment();
 
-  int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
+  float3 stepVec = rayDir * stepSize;
+  float3 currentPoint = cameraPos + rayDir * currentT;
+  float totalDistActual = t.y - currentT;
+  int maxSteps = min(max(1, int(ceil(totalDistActual / stepSize))), MAX_RAY_STEPS);
 
   // PREFETCH the very first samples before the loop starts
-  float3 evalPoint0 = currentPoint * (1.0 - gradStep) + 0.5 * gradStep;
+  float3 texLocalPos0 = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
+  float3 evalPoint0 = texLocalPos0 * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
   float prefetchScalar = volumeTexture.sample(volumeSampler, evalPoint0, level(0)).r;
   float prefetchMask = doMask ? maskTexture.sample(maskSampler, evalPoint0, level(0)).r : 0.0;
 
-  // MIN-MAX CELL CACHE: only re-sample when the ray crosses into a new macrocell.
+  // MIN-MAX CELL CACHE
   int3  curCell     = int3(-1);
   bool  curCellEmpty = false;
-  float3 mmDimF     = float3(volumeUniforms.minMaxDimX,
-                              volumeUniforms.minMaxDimY,
-                              volumeUniforms.minMaxDimZ);
+  float3 mmDimF     = b.minMaxInfo.yzw;
 
   // --- THE RAYMARCHING LOOP ---
   for (int i = 0; i < maxSteps; i++) {
+    if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
 
-    // 0. MIN-MAX ACCELERATION: Empty space skipping via occupancy map.
-    if (volumeUniforms.useMinMaxAccel > 0.5) {
-      float3 mmPos = clamp(currentPoint, float3(0.0), float3(1.0));
+    if (b.minMaxInfo.x > 0.5) {
+      float3 blockLocalPos = (currentPoint - blockMinGlobal) / max(blockMaxGlobal - blockMinGlobal, 1e-6);
+      float3 mmPos = clamp(blockLocalPos, float3(0.0), float3(1.0));
       int3 newCell = int3(mmPos * mmDimF);
       if (any(newCell != curCell)) {
         curCell      = newCell;
@@ -1813,49 +1828,39 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
 
       if (curCellEmpty) {
         float3 cellCoord = mmPos * mmDimF;
-
         float3 fractCoord = fract(cellCoord);
 
         float3 distToEdge;
         distToEdge.x = rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x;
         distToEdge.y = rayDir.y > 0.0 ? (1.0 - fractCoord.y) : fractCoord.y;
         distToEdge.z = rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
-
-        // If exactly on a boundary (dist ~0), distance to NEXT boundary is 1.0 cell
         distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
 
-        // Axial fix: only divide if ray actually moves along this axis
+        float3 rayDirBlockLocal = rayDir / max(blockMaxGlobal - blockMinGlobal, 1e-6);
         float3 tToEdge;
-        tToEdge.x = abs(rayDir.x) > 1e-5 ? distToEdge.x / abs(rayDir.x * mmDimF.x) : 1e30;
-        tToEdge.y = abs(rayDir.y) > 1e-5 ? distToEdge.y / abs(rayDir.y * mmDimF.y) : 1e30;
-        tToEdge.z = abs(rayDir.z) > 1e-5 ? distToEdge.z / abs(rayDir.z * mmDimF.z) : 1e30;
+        tToEdge.x = abs(rayDirBlockLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirBlockLocal.x * mmDimF.x) : 1e30;
+        tToEdge.y = abs(rayDirBlockLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirBlockLocal.y * mmDimF.y) : 1e30;
+        tToEdge.z = abs(rayDirBlockLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirBlockLocal.z * mmDimF.z) : 1e30;
 
-        // Exact distance to the boundary
         float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
+        float skipDist = (floor(exactSkip / stepSize + 1e-4) + 1.0) * stepSize;
 
-        // FIX: Add a tiny epsilon to cross the boundary, then QUANTIZE to stepSize.
-        exactSkip += 1e-4;
-        float skipDist = ceil(exactSkip / stepSize) * stepSize;
-
-        // Ensure we always move forward at least one step
-        skipDist = max(stepSize, skipDist);
-
-        currentPoint += rayDir * skipDist;
         currentT += skipDist;
+        currentPoint = cameraPos + rayDir * currentT;
 
-        if (any(currentPoint < float3(0.0)) || any(currentPoint > float3(1.0)) || currentT >= t.y) {
+        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y) {
           break;
         }
 
-        // Invalidate prefetch and cell cache so next iteration re-evaluates from scratch.
         prefetchScalar = as_type<float>(0x7fc00000u); // NaN sentinel
-        curCell = int3(-1); // force min-max re-sample for the new cell
+        curCell = int3(-1);
         continue;
       }
     }
 
     // 1. Claim prefetched data
-    float3 evalPoint = currentPoint * (1.0 - gradStep) + 0.5 * gradStep;
+    float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
+    float3 evalPoint = texLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
     bool needsFetch = (as_type<uint>(prefetchScalar) == 0x7fc00000u);
     float rawScalar = needsFetch
       ? volumeTexture.sample(volumeSampler, evalPoint, level(0)).r
@@ -1871,7 +1876,8 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
 
     // 3. LAUNCH PREFETCH FOR NEXT ITERATION
     if (i + 1 < maxSteps) {
-      float3 nextEvalPoint = currentPoint * (1.0 - gradStep) + 0.5 * gradStep;
+      float3 nextTexLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
+      float3 nextEvalPoint = nextTexLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
       prefetchScalar = volumeTexture.sample(volumeSampler, nextEvalPoint, level(0)).r;
       if (doMask) {
         prefetchMask = maskTexture.sample(maskSampler, nextEvalPoint, level(0)).r;
@@ -1917,7 +1923,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
       // Visual Significance Threshold
       if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
 
-        half4 grad = computeGradientFast(volumeTexture, volumeSampler, evalPoint, gradStep, gradNormFactor);
+        half4 grad = computeGradientFast(volumeTexture, volumeSampler, evalPoint, b.gradientStep.xyz, gradNormFactor);
         sampleColor = computePhongLightingVolumeFast(sampleColor, grad.xyz, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
 
         if (doGradOp) {
@@ -1951,6 +1957,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
 
 fragment VolumeFragmentOut fragment_volume_instanced_main(
     VolumeVertexOut in [[stage_in]],
+    bool isFrontFace [[front_facing]],
     float4 prevAccum [[color(0)]], // Metal Framebuffer Fetch for inter-block opacity propagation
     constant VolumeMapperUniforms& u [[buffer(1)]],
     constant PerBlockData* blockData [[buffer(2)]],
@@ -1971,6 +1978,8 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
     sampler labelMapGradOpSampler [[sampler(6)]],
     sampler minMaxSampler [[sampler(7)]])
 {
+  if (!isFrontFace) discard_fragment();
+
   VolumeFragmentOut output;
   uint iid = in.instanceID;
   PerBlockData b = blockData[iid];
@@ -1983,14 +1992,20 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
   half3 accumulatedColor = half3(prevAccum.rgb);
   half accumulatedOpacity = half(prevAccum.a);
 
+  float3 blockMinGlobal = (b.volumeBoundsMin.xyz - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
+  float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
+
+  float3 texMinGlobal = (b.textureBoundsMin.xyz - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
+  float3 texMaxGlobal = (b.textureBoundsMax.xyz - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
+
   // --- RAY SETUP ---
-  float3 cameraPos = b.cameraVolumePos.xyz;
+  float3 cameraPos = u.cameraVolumePos.xyz;
   float3 rayDir = in.localPos - cameraPos;
   float dirLength = length(rayDir);
   if (dirLength < 0.0001) discard_fragment();
   rayDir /= dirLength;
 
-  float2 t = intersectBox(cameraPos, rayDir, float3(0.0), float3(1.0));
+  float2 t = intersectBox(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal);
   float tStart = max(t.x, 0.0);
   if (tStart >= t.y) discard_fragment();
 
@@ -2005,8 +2020,8 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
   if (depthSample < 1.0) {
     float2 ndcXY = (in.position.xy / u.viewportSize) * 2.0 - 1.0;
     float4 worldTermination = u.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
-    float3 terminationLocal = ((worldTermination.xyz / worldTermination.w) - b.volumeBoundsMin.xyz) / (b.volumeBoundsMax.xyz - b.volumeBoundsMin.xyz);
-    tTerminateMax = length(terminationLocal - entryPoint);
+    float3 terminationLocal = ((worldTermination.xyz / worldTermination.w) - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
+    tTerminateMax = dot(terminationLocal - cameraPos, rayDir);
   }
 
   // Clipping planes
@@ -2027,8 +2042,10 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
       if (rayDotNormal > 0.0 && startDistance > 0.0) entryPoint += (startDistance / rayDotNormal) * rayDir;
       if (rayDotNormal <= 0.0 && stopDistance > 0.0) exitPoint += (stopDistance / rayDotNormal) * rayDir;
     }
-    totalDist = length(exitPoint - entryPoint);
-    if (totalDist < 1e-6) discard_fragment();
+    
+    if (dot(exitPoint - entryPoint, rayDir) < 1e-6) discard_fragment();
+    tStart = dot(entryPoint - cameraPos, rayDir);
+    t.y = dot(exitPoint - cameraPos, rayDir);
   }
 
   // --- LOCAL CACHE WARM-UP ---
@@ -2039,7 +2056,6 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
 
   half scalarScale = half(1.0 / (u.scalarMax - u.scalarMin));
   half scalarBias  = half(-u.scalarMin) * scalarScale;
-  float3 gradStep = b.gradientStep.xyz;
   half gradNormFactor = half(max(1e-8f, u.gradientOpacityRange.y));
 
   half3 viewDirHalf  = half3(normalize(entryPoint - cameraPos));
@@ -2066,28 +2082,32 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
 
   // --- SOFTWARE PIPELINING INITIALIZATION ---
   float jitter = u.useJittering > 0.5 ? volume_random(in.position.xy) * stepSize : 0.0;
-  float3 stepVec = rayDir * stepSize;
-  float3 currentPoint = entryPoint + (rayDir * jitter);
-  float currentT = jitter;
+  float currentT = jitter + ceil((tStart - jitter) / stepSize - 1e-4) * stepSize;
+  if (currentT >= t.y) discard_fragment();
 
-  int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
+  float3 stepVec = rayDir * stepSize;
+  float3 currentPoint = cameraPos + rayDir * currentT;
+  float totalDistActual = t.y - currentT;
+  int maxSteps = min(max(1, int(ceil(totalDistActual / stepSize))), MAX_RAY_STEPS);
 
   // PREFETCH
-  float3 evalPoint0 = currentPoint * (1.0 - gradStep) + 0.5 * gradStep;
+  float3 texLocalPos0 = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
+  float3 evalPoint0 = texLocalPos0 * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
   float prefetchScalar = blockVolumes[iid].sample(volumeSampler, evalPoint0, level(0)).r;
   float prefetchMask = doMask ? maskTexture.sample(maskSampler, evalPoint0, level(0)).r : 0.0;
 
   // MIN-MAX CELL CACHE
   int3  curCell     = int3(-1);
   bool  curCellEmpty = false;
-  float3 mmDimF     = float3(b.minMaxInfo.y, b.minMaxInfo.z, b.minMaxInfo.w);
+  float3 mmDimF     = b.minMaxInfo.yzw;
 
   // --- THE RAYMARCHING LOOP ---
   for (int i = 0; i < maxSteps; i++) {
+    if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
 
-    // 0. MIN-MAX ACCELERATION
     if (b.minMaxInfo.x > 0.5) {
-      float3 mmPos = clamp(currentPoint, float3(0.0), float3(1.0));
+      float3 blockLocalPos = (currentPoint - blockMinGlobal) / max(blockMaxGlobal - blockMinGlobal, 1e-6);
+      float3 mmPos = clamp(blockLocalPos, float3(0.0), float3(1.0));
       int3 newCell = int3(mmPos * mmDimF);
       if (any(newCell != curCell)) {
         curCell      = newCell;
@@ -2105,20 +2125,19 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
 
         distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
 
+        float3 rayDirBlockLocal = rayDir / max(blockMaxGlobal - blockMinGlobal, 1e-6);
         float3 tToEdge;
-        tToEdge.x = abs(rayDir.x) > 1e-5 ? distToEdge.x / abs(rayDir.x * mmDimF.x) : 1e30;
-        tToEdge.y = abs(rayDir.y) > 1e-5 ? distToEdge.y / abs(rayDir.y * mmDimF.y) : 1e30;
-        tToEdge.z = abs(rayDir.z) > 1e-5 ? distToEdge.z / abs(rayDir.z * mmDimF.z) : 1e30;
+        tToEdge.x = abs(rayDirBlockLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirBlockLocal.x * mmDimF.x) : 1e30;
+        tToEdge.y = abs(rayDirBlockLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirBlockLocal.y * mmDimF.y) : 1e30;
+        tToEdge.z = abs(rayDirBlockLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirBlockLocal.z * mmDimF.z) : 1e30;
 
         float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
-        exactSkip += 1e-4;
-        float skipDist = ceil(exactSkip / stepSize) * stepSize;
-        skipDist = max(stepSize, skipDist);
+        float skipDist = (floor(exactSkip / stepSize + 1e-4) + 1.0) * stepSize;
 
-        currentPoint += rayDir * skipDist;
         currentT += skipDist;
+        currentPoint = cameraPos + rayDir * currentT;
 
-        if (any(currentPoint < float3(0.0)) || any(currentPoint > float3(1.0)) || currentT >= t.y) {
+        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y) {
           break;
         }
 
@@ -2129,7 +2148,8 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
     }
 
     // 1. Claim prefetched data
-    float3 evalPoint = currentPoint * (1.0 - gradStep) + 0.5 * gradStep;
+    float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
+    float3 evalPoint = texLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
     bool needsFetch = (as_type<uint>(prefetchScalar) == 0x7fc00000u);
     float rawScalar = needsFetch
       ? blockVolumes[iid].sample(volumeSampler, evalPoint, level(0)).r
@@ -2145,7 +2165,8 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
 
     // 3. LAUNCH PREFETCH FOR NEXT ITERATION
     if (i + 1 < maxSteps) {
-      float3 nextEvalPoint = currentPoint * (1.0 - gradStep) + 0.5 * gradStep;
+      float3 nextTexLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
+      float3 nextEvalPoint = nextTexLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
       prefetchScalar = blockVolumes[iid].sample(volumeSampler, nextEvalPoint, level(0)).r;
       if (doMask) {
         prefetchMask = maskTexture.sample(maskSampler, nextEvalPoint, level(0)).r;
@@ -2188,7 +2209,7 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
       } else {
 
       if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
-        half4 grad = computeGradientFast(blockVolumes[iid], volumeSampler, evalPoint, gradStep, gradNormFactor);
+        half4 grad = computeGradientFast(blockVolumes[iid], volumeSampler, evalPoint, b.gradientStep.xyz, gradNormFactor);
         sampleColor = computePhongLightingVolumeFast(sampleColor, grad.xyz, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
 
         if (doGradOp) {
