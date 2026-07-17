@@ -611,11 +611,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           {
             VolumeBlock block;
             block.Extents[0] = fullExt[0] + i * deltaX;
-            block.Extents[1] = std::min(fullExt[0] + (i + 1) * deltaX - 1, fullExt[1]);
+            block.Extents[1] = (i == nx - 1) ? fullExt[1] : std::min(fullExt[0] + (i + 1) * deltaX, fullExt[1]);
             block.Extents[2] = fullExt[2] + j * deltaY;
-            block.Extents[3] = std::min(fullExt[2] + (j + 1) * deltaY - 1, fullExt[3]);
+            block.Extents[3] = (j == ny - 1) ? fullExt[3] : std::min(fullExt[2] + (j + 1) * deltaY, fullExt[3]);
             block.Extents[4] = fullExt[4] + k * deltaZ;
-            block.Extents[5] = std::min(fullExt[4] + (k + 1) * deltaZ - 1, fullExt[5]);
+            block.Extents[5] = (k == nz - 1) ? fullExt[5] : std::min(fullExt[4] + (k + 1) * deltaZ, fullExt[5]);
             this->Blocks.push_back(block);
           }
         }
@@ -3660,7 +3660,7 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
         for (int k = 0; k < 3; ++k)
         {
           perBlockData[i].GradientStep[k] =
-            (block.Dims[k] > 1) ? 1.0f / (block.Dims[k] - 1) : 1.0f;
+            (block.Dims[k] > 0) ? 1.0f / block.Dims[k] : 1.0f;
         }
         perBlockData[i].GradientStep[3] = 0.0f;
 
@@ -3841,7 +3841,7 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
       for (int k = 0; k < 3; ++k)
       {
         blockUniforms.GradientStep[k] =
-          (block.Dims[k] > 1) ? 1.0f / (block.Dims[k] - 1) : 1.0f;
+          (block.Dims[k] > 0) ? 1.0f / block.Dims[k] : 1.0f;
       }
 
       // Update min-max uniforms and bind per-block min-max texture
@@ -4110,12 +4110,12 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     uniforms.UseGradientShading = shadeOn ? 1.0f : 0.0f;
     uniforms.UseGradientOpacity = (shadeOn && hasGradOp) ? 1.0f : 0.0f;
 
-    // Gradient step: 1/(dims-1) per axis for central differences in [0,1] space
+    // Gradient step: 1/dims per axis for central differences in [0,1] space
     int dims[3];
     input->GetDimensions(dims);
     for (int k = 0; k < 3; ++k)
     {
-      uniforms.GradientStep[k] = (dims[k] > 1) ? 1.0f / (dims[k] - 1) : 1.0f;
+      uniforms.GradientStep[k] = (dims[k] > 0) ? 1.0f / dims[k] : 1.0f;
     }
 
     // Gradient opacity normalization range

@@ -1501,11 +1501,9 @@ fragment VolumeFragmentOut fragment_volume_main(
   half accumulatedOpacity = 0.0;
 
   // PREFETCH the very first samples before the loop starts
-  float prefetchScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
-  float prefetchMask = doMask ? maskTexture.sample(maskSampler, currentPoint, level(0)).r : 0.0;
-
-  // MIN-MAX CELL CACHE: only re-sample when the ray crosses into a new macrocell.
-  // This cuts texture fetches by ~4× in dense tissue (DS=4 means each cell covers 4 samples).
+  float3 evalPoint0 = currentPoint * (1.0 - gradStep) + 0.5 * gradStep;
+  float prefetchScalar = volumeTexture.sample(volumeSampler, evalPoint0, level(0)).r;
+  float prefetchMask = doMask ? maskTexture.sample(maskSampler, evalPoint0, level(0)).r : 0.0;
   int3  curCell     = int3(-1);
   bool  curCellEmpty = false;
   float3 mmDimF     = float3(volumeUniforms.minMaxDimX,
@@ -1573,7 +1571,7 @@ fragment VolumeFragmentOut fragment_volume_main(
 
     // 1. Claim prefetched data and lock current spatial coordinate.
     //    If prefetchScalar is NaN (sentinel from skip branch), fetch fresh data.
-    float3 evalPoint = currentPoint;
+    float3 evalPoint = currentPoint * (1.0 - gradStep) + 0.5 * gradStep;
     bool needsFetch = (as_type<uint>(prefetchScalar) == 0x7fc00000u);
     float rawScalar = needsFetch
       ? volumeTexture.sample(volumeSampler, evalPoint, level(0)).r
@@ -1583,20 +1581,22 @@ fragment VolumeFragmentOut fragment_volume_main(
       : prefetchMask;
 
     // 2. Advance ray trackers
+    float3 lastPoint = currentPoint;
     currentPoint += stepVec;
     currentT += stepSize;
 
     // 3. LAUNCH PREFETCH FOR NEXT ITERATION
     // The GPU memory controller fulfills these while the ALU does the math below!
     if (i + 1 < maxSteps) {
-      prefetchScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
+      float3 nextEvalPoint = currentPoint * (1.0 - gradStep) + 0.5 * gradStep;
+      prefetchScalar = volumeTexture.sample(volumeSampler, nextEvalPoint, level(0)).r;
       if (doMask) {
-        prefetchMask = maskTexture.sample(maskSampler, currentPoint, level(0)).r;
+        prefetchMask = maskTexture.sample(maskSampler, nextEvalPoint, level(0)).r;
       }
     }
 
     // 4. MATH & EVALUATION (Hides the memory latency of step 3)
-    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, evalPoint))) == 0u)) {
+    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, lastPoint))) == 0u)) {
       continue;
     }
 
@@ -1788,8 +1788,9 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
   int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
 
   // PREFETCH the very first samples before the loop starts
-  float prefetchScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
-  float prefetchMask = doMask ? maskTexture.sample(maskSampler, currentPoint, level(0)).r : 0.0;
+  float3 evalPoint0 = currentPoint * (1.0 - gradStep) + 0.5 * gradStep;
+  float prefetchScalar = volumeTexture.sample(volumeSampler, evalPoint0, level(0)).r;
+  float prefetchMask = doMask ? maskTexture.sample(maskSampler, evalPoint0, level(0)).r : 0.0;
 
   // MIN-MAX CELL CACHE: only re-sample when the ray crosses into a new macrocell.
   int3  curCell     = int3(-1);
@@ -1853,8 +1854,8 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
       }
     }
 
-    // 1. Claim prefetched data and lock current spatial coordinate.
-    float3 evalPoint = currentPoint;
+    // 1. Claim prefetched data
+    float3 evalPoint = currentPoint * (1.0 - gradStep) + 0.5 * gradStep;
     bool needsFetch = (as_type<uint>(prefetchScalar) == 0x7fc00000u);
     float rawScalar = needsFetch
       ? volumeTexture.sample(volumeSampler, evalPoint, level(0)).r
@@ -1864,19 +1865,21 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
       : prefetchMask;
 
     // 2. Advance ray trackers
+    float3 lastPoint = currentPoint;
     currentPoint += stepVec;
     currentT += stepSize;
 
     // 3. LAUNCH PREFETCH FOR NEXT ITERATION
     if (i + 1 < maxSteps) {
-      prefetchScalar = volumeTexture.sample(volumeSampler, currentPoint, level(0)).r;
+      float3 nextEvalPoint = currentPoint * (1.0 - gradStep) + 0.5 * gradStep;
+      prefetchScalar = volumeTexture.sample(volumeSampler, nextEvalPoint, level(0)).r;
       if (doMask) {
-        prefetchMask = maskTexture.sample(maskSampler, currentPoint, level(0)).r;
+        prefetchMask = maskTexture.sample(maskSampler, nextEvalPoint, level(0)).r;
       }
     }
 
-    // 4. MATH & EVALUATION (Hides the memory latency of step 3)
-    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, evalPoint))) == 0u)) {
+    // 4. MATH & EVALUATION
+    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, lastPoint))) == 0u)) {
       continue;
     }
 
@@ -2070,8 +2073,9 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
   int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
 
   // PREFETCH
-  float prefetchScalar = blockVolumes[iid].sample(volumeSampler, currentPoint, level(0)).r;
-  float prefetchMask = doMask ? maskTexture.sample(maskSampler, currentPoint, level(0)).r : 0.0;
+  float3 evalPoint0 = currentPoint * (1.0 - gradStep) + 0.5 * gradStep;
+  float prefetchScalar = blockVolumes[iid].sample(volumeSampler, evalPoint0, level(0)).r;
+  float prefetchMask = doMask ? maskTexture.sample(maskSampler, evalPoint0, level(0)).r : 0.0;
 
   // MIN-MAX CELL CACHE
   int3  curCell     = int3(-1);
@@ -2125,7 +2129,7 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
     }
 
     // 1. Claim prefetched data
-    float3 evalPoint = currentPoint;
+    float3 evalPoint = currentPoint * (1.0 - gradStep) + 0.5 * gradStep;
     bool needsFetch = (as_type<uint>(prefetchScalar) == 0x7fc00000u);
     float rawScalar = needsFetch
       ? blockVolumes[iid].sample(volumeSampler, evalPoint, level(0)).r
@@ -2135,19 +2139,21 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
       : prefetchMask;
 
     // 2. Advance ray trackers
+    float3 lastPoint = currentPoint;
     currentPoint += stepVec;
     currentT += stepSize;
 
     // 3. LAUNCH PREFETCH FOR NEXT ITERATION
     if (i + 1 < maxSteps) {
-      prefetchScalar = blockVolumes[iid].sample(volumeSampler, currentPoint, level(0)).r;
+      float3 nextEvalPoint = currentPoint * (1.0 - gradStep) + 0.5 * gradStep;
+      prefetchScalar = blockVolumes[iid].sample(volumeSampler, nextEvalPoint, level(0)).r;
       if (doMask) {
-        prefetchMask = maskTexture.sample(maskSampler, currentPoint, level(0)).r;
+        prefetchMask = maskTexture.sample(maskSampler, nextEvalPoint, level(0)).r;
       }
     }
 
     // 4. MATH & EVALUATION
-    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, evalPoint))) == 0u)) {
+    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, lastPoint))) == 0u)) {
       continue;
     }
 
