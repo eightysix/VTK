@@ -1531,8 +1531,8 @@ fragment VolumeFragmentOut fragment_volume_main(
 
     // 0. MIN-MAX ACCELERATION
     if (b.minMaxInfo.x > 0.5) {
-      float3 blockLocalPos = (currentPoint - blockMinGlobal) / max(blockMaxGlobal - blockMinGlobal, 1e-6);
-      float3 mmPos = clamp(blockLocalPos, float3(0.0), float3(1.0));
+      float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
+      float3 mmPos = clamp(texLocalPos, float3(0.0), float3(1.0));
       int3 newCell = int3(mmPos * mmDimF);
       if (any(newCell != curCell)) {
         curCell      = newCell;
@@ -1549,11 +1549,11 @@ fragment VolumeFragmentOut fragment_volume_main(
         distToEdge.z = rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
         distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
 
-        float3 rayDirBlockLocal = rayDir / max(blockMaxGlobal - blockMinGlobal, 1e-6);
+        float3 rayDirTexLocal = rayDir / max(texMaxGlobal - texMinGlobal, 1e-6);
         float3 tToEdge;
-        tToEdge.x = abs(rayDirBlockLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirBlockLocal.x * mmDimF.x) : 1e30;
-        tToEdge.y = abs(rayDirBlockLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirBlockLocal.y * mmDimF.y) : 1e30;
-        tToEdge.z = abs(rayDirBlockLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirBlockLocal.z * mmDimF.z) : 1e30;
+        tToEdge.x = abs(rayDirTexLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirTexLocal.x * mmDimF.x) : 1e30;
+        tToEdge.y = abs(rayDirTexLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirTexLocal.y * mmDimF.y) : 1e30;
+        tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
 
         float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
         float skipDist = (floor(exactSkip / stepSize + 1e-4) + 1.0) * stepSize;
@@ -1818,8 +1818,8 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
 
     if (b.minMaxInfo.x > 0.5) {
-      float3 blockLocalPos = (currentPoint - blockMinGlobal) / max(blockMaxGlobal - blockMinGlobal, 1e-6);
-      float3 mmPos = clamp(blockLocalPos, float3(0.0), float3(1.0));
+      float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
+      float3 mmPos = clamp(texLocalPos, float3(0.0), float3(1.0));
       int3 newCell = int3(mmPos * mmDimF);
       if (any(newCell != curCell)) {
         curCell      = newCell;
@@ -1836,11 +1836,11 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
         distToEdge.z = rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
         distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
 
-        float3 rayDirBlockLocal = rayDir / max(blockMaxGlobal - blockMinGlobal, 1e-6);
+        float3 rayDirTexLocal = rayDir / max(texMaxGlobal - texMinGlobal, 1e-6);
         float3 tToEdge;
-        tToEdge.x = abs(rayDirBlockLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirBlockLocal.x * mmDimF.x) : 1e30;
-        tToEdge.y = abs(rayDirBlockLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirBlockLocal.y * mmDimF.y) : 1e30;
-        tToEdge.z = abs(rayDirBlockLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirBlockLocal.z * mmDimF.z) : 1e30;
+        tToEdge.x = abs(rayDirTexLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirTexLocal.x * mmDimF.x) : 1e30;
+        tToEdge.y = abs(rayDirTexLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirTexLocal.y * mmDimF.y) : 1e30;
+        tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
 
         float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
         float skipDist = (floor(exactSkip / stepSize + 1e-4) + 1.0) * stepSize;
@@ -2106,8 +2106,8 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
     if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
 
     if (b.minMaxInfo.x > 0.5) {
-      float3 blockLocalPos = (currentPoint - blockMinGlobal) / max(blockMaxGlobal - blockMinGlobal, 1e-6);
-      float3 mmPos = clamp(blockLocalPos, float3(0.0), float3(1.0));
+      float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
+      float3 mmPos = clamp(texLocalPos, float3(0.0), float3(1.0));
       int3 newCell = int3(mmPos * mmDimF);
       if (any(newCell != curCell)) {
         curCell      = newCell;
@@ -2125,11 +2125,11 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
 
         distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
 
-        float3 rayDirBlockLocal = rayDir / max(blockMaxGlobal - blockMinGlobal, 1e-6);
+        float3 rayDirTexLocal = rayDir / max(texMaxGlobal - texMinGlobal, 1e-6);
         float3 tToEdge;
-        tToEdge.x = abs(rayDirBlockLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirBlockLocal.x * mmDimF.x) : 1e30;
-        tToEdge.y = abs(rayDirBlockLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirBlockLocal.y * mmDimF.y) : 1e30;
-        tToEdge.z = abs(rayDirBlockLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirBlockLocal.z * mmDimF.z) : 1e30;
+        tToEdge.x = abs(rayDirTexLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirTexLocal.x * mmDimF.x) : 1e30;
+        tToEdge.y = abs(rayDirTexLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirTexLocal.y * mmDimF.y) : 1e30;
+        tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
 
         float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
         float skipDist = (floor(exactSkip / stepSize + 1e-4) + 1.0) * stepSize;
