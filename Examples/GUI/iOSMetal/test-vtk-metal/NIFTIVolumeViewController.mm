@@ -15,6 +15,10 @@
 - (void)viewDidLoad {
   [super viewDidLoad];
 
+  // Enable Metal volume partition debugging (block tinting + sort-order log).
+  // The mapper reads VTK_METAL_VOLUME_DEBUG via std::getenv, so set it in-process.
+  setenv("VTK_METAL_VOLUME_DEBUG", "1", 1);
+
   UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
   [button setTitle:@"Load NIfTI" forState:UIControlStateNormal];
   button.titleLabel.font = [UIFont boldSystemFontOfSize:18];

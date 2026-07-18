@@ -1279,6 +1279,9 @@ struct VolumeMapperUniforms {
   float minMaxDimX;
   float minMaxDimY;
   float minMaxDimZ;
+  // Debug: when > 0.5, fragment tints by block index to visualize seams
+  float debugBlockMode;
+  float _padDebug[3];
 };
 
 struct VolumeVertexOut {
@@ -1301,6 +1304,7 @@ struct PerBlockData {
   float4 textureBoundsMax;
   float4 gradientStep;  // xyz + pad
   float4 minMaxInfo;    // useMinMax, dimX, dimY, dimZ
+  float4 blockIndex;    // xyz: sort index for debug tinting; w: 1.0 = unit-cube vertex buffer
 };
 
 vertex VolumeVertexOut vertex_volume_main(
@@ -1309,9 +1313,10 @@ vertex VolumeVertexOut vertex_volume_main(
     constant PerBlockData& b [[buffer(2)]]) {
   VolumeVertexOut out;
 
-  float3 modelPos = in.position;
+  // in.position is a unit cube [0,1]. Scale it to the block's model-space bounds.
+  float3 modelPos = b.volumeBoundsMin.xyz + in.position * (b.volumeBoundsMax.xyz - b.volumeBoundsMin.xyz);
   out.position = volumeUniforms.viewProjection * volumeUniforms.volumeToWorld * float4(modelPos, 1.0);
-  out.localPos = (modelPos - volumeUniforms.volumeBoundsMin.xyz) / (volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz);
+  out.localPos = (modelPos - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
   out.instanceID = 0;
   return out;
 }
@@ -1328,9 +1333,8 @@ vertex VolumeVertexOut vertex_volume_instanced_main(
 
   // in.position is a unit cube [0,1]. Scale it to the block's model-space bounds.
   float3 modelPos = b.volumeBoundsMin.xyz + in.position * (b.volumeBoundsMax.xyz - b.volumeBoundsMin.xyz);
-
   out.position = u.viewProjection * u.volumeToWorld * float4(modelPos, 1.0);
-  out.localPos = (modelPos - u.volumeBoundsMin.xyz) / (u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz);
+  out.localPos = (modelPos - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
   out.instanceID = iid;
   return out;
 }
@@ -1389,6 +1393,23 @@ inline int computeCropRegion(float3 cropMin, float3 cropMax, float3 pos) {
   return r.x + (r.y - 1) * 3 + (r.z - 1) * 9;
 }
 
+// Debug: tint the accumulated color by block index so partition seams/boundaries
+// are visible. blockId indexes the sorted draw order (0 = closest).
+inline float3 debugBlockTint(int blockId, float3 color) {
+  float3 palette[8] = {
+    float3(1.0, 0.0, 0.0),
+    float3(0.0, 1.0, 0.0),
+    float3(0.0, 0.0, 1.0),
+    float3(1.0, 1.0, 0.0),
+    float3(1.0, 0.0, 1.0),
+    float3(0.0, 1.0, 1.0),
+    float3(1.0, 0.5, 0.0),
+    float3(0.5, 0.0, 1.0),
+  };
+  int id = blockId % 8;
+  return color * 0.5 + palette[id] * 0.5;
+}
+
 fragment VolumeFragmentOut fragment_volume_main(
     VolumeVertexOut in [[stage_in]],
     bool isFrontFace [[front_facing]],
@@ -1414,6 +1435,10 @@ fragment VolumeFragmentOut fragment_volume_main(
   if (!isFrontFace) discard_fragment();
 
   VolumeFragmentOut output;
+  // Intersect the ray against THIS block's box only. Each partition block is
+  // composited as an independent slab; with correct back-to-front draw order
+  // the slabs tile seamlessly. (The whole-volume-ray variant caused a block to
+  // paint over blocks it only partially overlaps in screen space.)
   float3 blockMinGlobal = (b.volumeBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
   float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
 
@@ -1517,7 +1542,7 @@ fragment VolumeFragmentOut fragment_volume_main(
 
   // PREFETCH the very first samples before the loop starts
   float3 texLocalPos0 = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
-  float3 evalPoint0 = texLocalPos0 * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
+  float3 evalPoint0 = texLocalPos0;
   float prefetchScalar = volumeTexture.sample(volumeSampler, evalPoint0, level(0)).r;
   float prefetchMask = doMask ? maskTexture.sample(maskSampler, evalPoint0, level(0)).r : 0.0;
   int3  curCell     = int3(-1);
@@ -1562,7 +1587,12 @@ fragment VolumeFragmentOut fragment_volume_main(
         currentPoint = cameraPos + rayDir * currentT;
 
         if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y) {
-          break;
+          break;                          // left the block: done
+          currentT += stepSize;           // still before block: keep skipping
+          currentPoint = cameraPos + rayDir * currentT;
+          prefetchScalar = as_type<float>(0x7fc00000u); // NaN sentinel
+          curCell = int3(-1);
+          continue;
         }
 
         prefetchScalar = as_type<float>(0x7fc00000u); // NaN sentinel
@@ -1573,7 +1603,7 @@ fragment VolumeFragmentOut fragment_volume_main(
 
     // 1. Claim prefetched data
     float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
-    float3 evalPoint = texLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
+    float3 evalPoint = texLocalPos;
     bool needsFetch = (as_type<uint>(prefetchScalar) == 0x7fc00000u);
     float rawScalar = needsFetch
       ? volumeTexture.sample(volumeSampler, evalPoint, level(0)).r
@@ -1590,7 +1620,7 @@ fragment VolumeFragmentOut fragment_volume_main(
     // 3. LAUNCH PREFETCH FOR NEXT ITERATION
     if (i + 1 < maxSteps) {
       float3 nextTexLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
-      float3 nextEvalPoint = nextTexLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
+      float3 nextEvalPoint = nextTexLocalPos;
       prefetchScalar = volumeTexture.sample(volumeSampler, nextEvalPoint, level(0)).r;
       if (doMask) {
         prefetchMask = maskTexture.sample(maskSampler, nextEvalPoint, level(0)).r;
@@ -1661,10 +1691,19 @@ fragment VolumeFragmentOut fragment_volume_main(
     }
   }
 
-  output.color = float4(float3(accumulatedColor), float(accumulatedOpacity));
+  float3 finalColor = float3(accumulatedColor);
+  if (volumeUniforms.debugBlockMode > 0.5) {
+    // Discard fragments with negligible opacity — the tint's non-zero RGB with
+    // zero alpha would additive-blend into the framebuffer under One/OneMinusSrcAlpha,
+    // causing one partition's debug color to bleed into another's region.
+    if (accumulatedOpacity < 1e-3h) discard_fragment();
+    finalColor = debugBlockTint(int(b.blockIndex.x + 0.5), finalColor);
+  }
+  output.color = float4(finalColor, float(accumulatedOpacity));
   return output;
 }
 
+//------------------------------------------------------------------------------
 // Inter-block accumulation shader: reads previous blocks' accumulated color/opacity
 // via Metal framebuffer fetch ([[color(0)]]), enabling global early ray termination
 // across block boundaries. Used when rendering partitioned volumes front-to-back.
@@ -1704,6 +1743,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
   half3 accumulatedColor = half3(prevAccum.rgb);
   half accumulatedOpacity = half(prevAccum.a);
 
+  // Intersect the ray against THIS block's box only (per-partition slab).
   float3 blockMinGlobal = (b.volumeBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
   float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
 
@@ -1804,7 +1844,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
 
   // PREFETCH the very first samples before the loop starts
   float3 texLocalPos0 = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
-  float3 evalPoint0 = texLocalPos0 * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
+  float3 evalPoint0 = texLocalPos0;
   float prefetchScalar = volumeTexture.sample(volumeSampler, evalPoint0, level(0)).r;
   float prefetchMask = doMask ? maskTexture.sample(maskSampler, evalPoint0, level(0)).r : 0.0;
 
@@ -1815,6 +1855,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
 
   // --- THE RAYMARCHING LOOP ---
   for (int i = 0; i < maxSteps; i++) {
+    // Strict check to completely suppress smearing outside partitioned edges
     if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
 
     if (b.minMaxInfo.x > 0.5) {
@@ -1849,7 +1890,12 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
         currentPoint = cameraPos + rayDir * currentT;
 
         if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y) {
-          break;
+          break;                          // left the block: done
+          currentT += stepSize;           // still before block: keep skipping
+          currentPoint = cameraPos + rayDir * currentT;
+          prefetchScalar = as_type<float>(0x7fc00000u); // NaN sentinel
+          curCell = int3(-1);
+          continue;
         }
 
         prefetchScalar = as_type<float>(0x7fc00000u); // NaN sentinel
@@ -1860,7 +1906,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
 
     // 1. Claim prefetched data
     float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
-    float3 evalPoint = texLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
+    float3 evalPoint = texLocalPos;
     bool needsFetch = (as_type<uint>(prefetchScalar) == 0x7fc00000u);
     float rawScalar = needsFetch
       ? volumeTexture.sample(volumeSampler, evalPoint, level(0)).r
@@ -1877,7 +1923,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     // 3. LAUNCH PREFETCH FOR NEXT ITERATION
     if (i + 1 < maxSteps) {
       float3 nextTexLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
-      float3 nextEvalPoint = nextTexLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
+      float3 nextEvalPoint = nextTexLocalPos;
       prefetchScalar = volumeTexture.sample(volumeSampler, nextEvalPoint, level(0)).r;
       if (doMask) {
         prefetchMask = maskTexture.sample(maskSampler, nextEvalPoint, level(0)).r;
@@ -1946,7 +1992,12 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     }
   }
 
-  output.color = float4(float3(accumulatedColor), float(accumulatedOpacity));
+  float3 finalColor = float3(accumulatedColor);
+  if (volumeUniforms.debugBlockMode > 0.5) {
+    if (accumulatedOpacity < 1e-3h) discard_fragment();
+    finalColor = debugBlockTint(int(b.blockIndex.x + 0.5), finalColor);
+  }
+  output.color = float4(finalColor, float(accumulatedOpacity));
   return output;
 }
 
@@ -1992,6 +2043,7 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
   half3 accumulatedColor = half3(prevAccum.rgb);
   half accumulatedOpacity = half(prevAccum.a);
 
+  // Intersect the ray against THIS block's box only (per-partition slab).
   float3 blockMinGlobal = (b.volumeBoundsMin.xyz - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
   float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
 
@@ -2092,7 +2144,7 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
 
   // PREFETCH
   float3 texLocalPos0 = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
-  float3 evalPoint0 = texLocalPos0 * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
+  float3 evalPoint0 = texLocalPos0;
   float prefetchScalar = blockVolumes[iid].sample(volumeSampler, evalPoint0, level(0)).r;
   float prefetchMask = doMask ? maskTexture.sample(maskSampler, evalPoint0, level(0)).r : 0.0;
 
@@ -2103,6 +2155,7 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
 
   // --- THE RAYMARCHING LOOP ---
   for (int i = 0; i < maxSteps; i++) {
+    // Strict check to completely suppress smearing outside partitioned edges
     if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
 
     if (b.minMaxInfo.x > 0.5) {
@@ -2138,10 +2191,15 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
         currentPoint = cameraPos + rayDir * currentT;
 
         if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y) {
-          break;
+          break;                          // left the block: done
+          currentT += stepSize;           // still before block: keep skipping
+          currentPoint = cameraPos + rayDir * currentT;
+          prefetchScalar = as_type<float>(0x7fc00000u); // NaN sentinel
+          curCell = int3(-1);
+          continue;
         }
 
-        prefetchScalar = as_type<float>(0x7fc00000u);
+        prefetchScalar = as_type<float>(0x7fc00000u); // NaN sentinel
         curCell = int3(-1);
         continue;
       }
@@ -2149,7 +2207,7 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
 
     // 1. Claim prefetched data
     float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
-    float3 evalPoint = texLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
+    float3 evalPoint = texLocalPos;
     bool needsFetch = (as_type<uint>(prefetchScalar) == 0x7fc00000u);
     float rawScalar = needsFetch
       ? blockVolumes[iid].sample(volumeSampler, evalPoint, level(0)).r
@@ -2166,7 +2224,7 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
     // 3. LAUNCH PREFETCH FOR NEXT ITERATION
     if (i + 1 < maxSteps) {
       float3 nextTexLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
-      float3 nextEvalPoint = nextTexLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
+      float3 nextEvalPoint = nextTexLocalPos;
       prefetchScalar = blockVolumes[iid].sample(volumeSampler, nextEvalPoint, level(0)).r;
       if (doMask) {
         prefetchMask = maskTexture.sample(maskSampler, nextEvalPoint, level(0)).r;
@@ -2231,7 +2289,12 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
     }
   }
 
-  output.color = float4(float3(accumulatedColor), float(accumulatedOpacity));
+  float3 finalColor = float3(accumulatedColor);
+  if (u.debugBlockMode > 0.5) {
+    if (accumulatedOpacity < 1e-3h) discard_fragment();
+    finalColor = debugBlockTint(int(b.blockIndex.x + 0.5), finalColor);
+  }
+  output.color = float4(finalColor, float(accumulatedOpacity));
   return output;
 }
 

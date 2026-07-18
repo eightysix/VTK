@@ -71,6 +71,7 @@ private:
   // Metal pipeline objects (stored as void* to avoid Obj-C in header)
   void* PipelineState = nullptr;         // id<MTLRenderPipelineState>
   void* AccumulationPipelineState = nullptr; // id<MTLRenderPipelineState> — for inter-block opacity propagation
+  void* OffscreenPipelineState = nullptr; // id<MTLRenderPipelineState> — RGBA16Float + HW blend, offscreen partitioned
   void* InstancedPipelineState = nullptr; // id<MTLRenderPipelineState> — for single-draw instanced block rendering
   void* VolumeTexture = nullptr;         // id<MTLTexture>  (3D)
   void* VolumeSampler = nullptr;         // id<MTLSamplerState>

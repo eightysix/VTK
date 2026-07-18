@@ -122,11 +122,14 @@ struct VolumeMapperUniforms
   float UseMinMaxAccel;           // 960
   float MinMaxDimX;               // 964
   float MinMaxDimY;               // 968
-  float MinMaxDimZ;               // 972
+  float MinMaxDimZ;              // 972
+  // Debug: when > 0.5, fragment tints by block sort index to visualize seams
+  float DebugBlockMode;           // 976
+  float _padDebug[3];             // 980..991 (pad to 16-byte alignment)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 976,
-  "VolumeMapperUniforms must be 976 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 992,
+  "VolumeMapperUniforms must be 992 bytes to match Metal shader struct");
 
 // Per-block data for instanced rendering — must match Metal PerBlockData struct
 struct PerBlockData {
@@ -136,10 +139,11 @@ struct PerBlockData {
   float TextureBoundsMax[4]; // 48..63
   float GradientStep[4];    // 64..79  (xyz + pad)
   float MinMaxInfo[4];      // 80..95  (useMinMax, dimX, dimY, dimZ)
+  float BlockIndex[4];      // 96..111 (xyz: sort index for debug tinting; w: 1.0 = unit-cube vertex buffer)
 };
 
-static_assert(sizeof(PerBlockData) == 96,
-  "PerBlockData must be 96 bytes to match Metal shader struct");
+static_assert(sizeof(PerBlockData) == 112,
+  "PerBlockData must be 112 bytes to match Metal shader struct");
 
 // Maximum number of blocks that can be rendered in a single instanced draw call.
 // Capped at 8 to stay within Metal's 32-texture limit on older Intel Macs.
@@ -443,6 +447,12 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
     this->AccumulationPipelineState = nullptr;
   }
 
+  if (this->OffscreenPipelineState)
+  {
+    CFRelease(this->OffscreenPipelineState);
+    this->OffscreenPipelineState = nullptr;
+  }
+
   if (this->InstancedPipelineState)
   {
     CFRelease(this->InstancedPipelineState);
@@ -612,11 +622,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           {
             VolumeBlock block;
             block.Extents[0] = fullExt[0] + i * deltaX;
-            block.Extents[1] = (i == nx - 1) ? fullExt[1] : std::min(fullExt[0] + (i + 1) * deltaX, fullExt[1]);
+            block.Extents[1] = (i == nx - 1) ? fullExt[1] : fullExt[0] + (i + 1) * deltaX - 1;
             block.Extents[2] = fullExt[2] + j * deltaY;
-            block.Extents[3] = (j == ny - 1) ? fullExt[3] : std::min(fullExt[2] + (j + 1) * deltaY, fullExt[3]);
+            block.Extents[3] = (j == ny - 1) ? fullExt[3] : fullExt[2] + (j + 1) * deltaY - 1;
             block.Extents[4] = fullExt[4] + k * deltaZ;
-            block.Extents[5] = (k == nz - 1) ? fullExt[5] : std::min(fullExt[4] + (k + 1) * deltaZ, fullExt[5]);
+            block.Extents[5] = (k == nz - 1) ? fullExt[5] : fullExt[4] + (k + 1) * deltaZ - 1;
             this->Blocks.push_back(block);
           }
         }
@@ -1987,10 +1997,10 @@ void vtkMetalGPUVolumeRayCastMapper::SortBlocksBackToFront(
     }
   }
 
-  // Sort by distance to camera (closest first = front-to-back)
-  // Front-to-back ordering enables inter-block opacity propagation:
-  // the accumulation shader reads previous blocks' opacity via framebuffer fetch
-  // and can discard early if the pixel is already opaque.
+  // Sort by distance to camera NEAREST-FIRST (front-to-back) into SortedBlockOrder.
+  // Blocks are then DRAWN in REVERSE (farthest first = back-to-front), which is
+  // required by the src=ONE, dst=ONE_MINUS_SRC_ALPHA ("over") blend. The draw
+  // loops iterate SortedBlockOrder from the end to the beginning for this reason.
   std::sort(this->SortedBlockOrder.begin(), this->SortedBlockOrder.end(),
     [&](int a, int b) {
       double da = (this->Blocks[a].Center[0] - camPos[0]) * camDir[0] +
@@ -1999,8 +2009,28 @@ void vtkMetalGPUVolumeRayCastMapper::SortBlocksBackToFront(
       double db = (this->Blocks[b].Center[0] - camPos[0]) * camDir[0] +
         (this->Blocks[b].Center[1] - camPos[1]) * camDir[1] +
         (this->Blocks[b].Center[2] - camPos[2]) * camDir[2];
-      return da < db; // closest first (front-to-back)
+      return da < db; // nearest first; draw loops traverse this array backwards
     });
+
+  // Debug logging of partition layout + sort order (VTK_METAL_VOLUME_DEBUG=1)
+  if (std::getenv("VTK_METAL_VOLUME_DEBUG"))
+  {
+    vtkWarningWithObjectMacro(this, "Partition sort: " << this->SortedBlockOrder.size()
+      << " drawn blocks (of " << this->Blocks.size() << " total). DRAW order (farthest->nearest):");
+    for (size_t s = 0; s < this->SortedBlockOrder.size(); ++s)
+    {
+      int bi = this->SortedBlockOrder[s];
+      auto& blk = this->Blocks[bi];
+      double dist = (blk.Center[0] - camPos[0]) * camDir[0] +
+        (blk.Center[1] - camPos[1]) * camDir[1] +
+        (blk.Center[2] - camPos[2]) * camDir[2];
+      vtkWarningWithObjectMacro(this, "  draw#" << (this->SortedBlockOrder.size() - 1 - s)
+        << " block#" << bi << " dist=" << dist
+        << " bounds=(" << blk.BoundsMin[0] << "," << blk.BoundsMin[1] << "," << blk.BoundsMin[2]
+        << ")-(" << blk.BoundsMax[0] << "," << blk.BoundsMax[1] << "," << blk.BoundsMax[2]
+        << ") center=(" << blk.Center[0] << "," << blk.Center[1] << "," << blk.Center[2] << ")");
+    }
+  }
 }
 
 //------------------------------------------------------------------------------
@@ -2297,14 +2327,15 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
     {
       auto& block = this->Blocks[idx];
 
-      // Ghost Voxels: Pad texture bounds by 1 voxel for correct boundary gradients
+      // Texture extent: exactly the block's own voxels. The block.Extents tile
+      // the volume contiguously (no gaps, no overlaps), so no ±1 padding is
+      // needed. The shader marches the whole volume and only samples inside this
+      // exact box, so padding would only make adjacent blocks overlap a voxel
+      // and double-composite the seam.
       int texExt[6] = {
-        std::max(fullExt[0], block.Extents[0] - 1),
-        std::min(fullExt[1], block.Extents[1] + 1),
-        std::max(fullExt[2], block.Extents[2] - 1),
-        std::min(fullExt[3], block.Extents[3] + 1),
-        std::max(fullExt[4], block.Extents[4] - 1),
-        std::min(fullExt[5], block.Extents[5] + 1)
+        block.Extents[0], block.Extents[1],
+        block.Extents[2], block.Extents[3],
+        block.Extents[4], block.Extents[5]
       };
 
       int bDims[3] = {
@@ -2317,12 +2348,12 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       block.Dims[2] = bDims[2];
 
       // Compute model-space bounds for this block
-      block.BoundsMin[0] = origin[0] + block.Extents[0] * spacing[0];
-      block.BoundsMax[0] = origin[0] + block.Extents[1] * spacing[0];
-      block.BoundsMin[1] = origin[1] + block.Extents[2] * spacing[1];
-      block.BoundsMax[1] = origin[1] + block.Extents[3] * spacing[1];
-      block.BoundsMin[2] = origin[2] + block.Extents[4] * spacing[2];
-      block.BoundsMax[2] = origin[2] + block.Extents[5] * spacing[2];
+      block.BoundsMin[0] = origin[0] + (block.Extents[0] - 0.5) * spacing[0];
+      block.BoundsMax[0] = origin[0] + (block.Extents[1] + 0.5) * spacing[0];
+      block.BoundsMin[1] = origin[1] + (block.Extents[2] - 0.5) * spacing[1];
+      block.BoundsMax[1] = origin[1] + (block.Extents[3] + 0.5) * spacing[1];
+      block.BoundsMin[2] = origin[2] + (block.Extents[4] - 0.5) * spacing[2];
+      block.BoundsMax[2] = origin[2] + (block.Extents[5] + 0.5) * spacing[2];
 
       // Compute scalar min/max for this block (used for empty-space skipping).
       // Prefer reducing over pre-computed macrocell min/max from UpdateMinMaxTexture
@@ -2902,40 +2933,14 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         float vertices[24];
         unsigned int indices[36];
 
-        if (!this->Blocks.empty())
         {
-          // Unit cube [0,1] for instanced rendering — the vertex shader
-          // scales each instance to its block's model-space bounds.
+          // Unit cube [0,1] for all volume rendering. The vertex shader
+          // scales this to the block's model-space bounds.
           float unitVerts[] = {
             0,0,0, 1,0,0, 1,1,0, 0,1,0,
             0,0,1, 1,0,1, 1,1,1, 0,1,1
           };
           memcpy(vertices, unitVerts, sizeof(unitVerts));
-        }
-        else
-        {
-          float boundsMin[3] = {
-            static_cast<float>(this->ModelBounds[0]),
-            static_cast<float>(this->ModelBounds[2]),
-            static_cast<float>(this->ModelBounds[4])
-          };
-          float boundsMax[3] = {
-            static_cast<float>(this->ModelBounds[1]),
-            static_cast<float>(this->ModelBounds[3]),
-            static_cast<float>(this->ModelBounds[5])
-          };
-
-          float modelVerts[] = {
-            boundsMin[0], boundsMin[1], boundsMin[2],
-            boundsMax[0], boundsMin[1], boundsMin[2],
-            boundsMax[0], boundsMax[1], boundsMin[2],
-            boundsMin[0], boundsMax[1], boundsMin[2],
-            boundsMin[0], boundsMin[1], boundsMax[2],
-            boundsMax[0], boundsMin[1], boundsMax[2],
-            boundsMax[0], boundsMax[1], boundsMax[2],
-            boundsMin[0], boundsMax[1], boundsMax[2],
-          };
-          memcpy(vertices, modelVerts, sizeof(modelVerts));
         }
 
         indices[0] = 0;  indices[1] = 2;  indices[2] = 1;  indices[3] = 0;  indices[4] = 3;  indices[5] = 2;
@@ -3421,7 +3426,10 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     accumDesc.colorAttachments[0].blendingEnabled = NO; // Shader handles compositing manually
     accumDesc.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
     accumDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-    accumDesc.rasterSampleCount = sampleCount;
+    // The accumulation pipeline always renders into the offscreen single-sample
+    // ImageSampleColorTexture (RGBA16Float, no MSAA), so it must be single-sampled
+    // regardless of the main window's MSAA setting.
+    accumDesc.rasterSampleCount = 1;
 
     id<MTLRenderPipelineState> accumPso =
       [device newRenderPipelineStateWithDescriptor:accumDesc error:&error];
@@ -3438,6 +3446,41 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     this->AccumulationPipelineState = (__bridge void*)accumPso;
     CFRetain((__bridge CFTypeRef)accumPso);
 
+    // Offscreen partitioned pipeline: renders per-block cubes into the RGBA16Float
+    // offscreen target using the SAME fragment shader as the proven single-block
+    // path (fragment_volume_main) with hardware back-to-front blending
+    // (One / OneMinusSrcAlpha). This avoids framebuffer-fetch accumulation and
+    // composites partition slabs exactly like the single-block renderer.
+    MTLRenderPipelineDescriptor* offDesc = [[MTLRenderPipelineDescriptor alloc] init];
+    offDesc.vertexFunction = vertexFunc;
+    offDesc.fragmentFunction = fragmentFunc;
+    offDesc.vertexDescriptor = vertexDesc;
+    offDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+    offDesc.colorAttachments[0].blendingEnabled = YES;
+    offDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+    offDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    offDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    offDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    offDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    offDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+    offDesc.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
+    offDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+    offDesc.rasterSampleCount = 1;
+    id<MTLRenderPipelineState> offPso =
+      [device newRenderPipelineStateWithDescriptor:offDesc error:&error];
+    if (!offPso)
+    {
+      vtkErrorMacro(<< "Volume offscreen pipeline: "
+                    << [[error localizedDescription] UTF8String]);
+      return false;
+    }
+    if (this->OffscreenPipelineState)
+    {
+      CFRelease(this->OffscreenPipelineState);
+    }
+    this->OffscreenPipelineState = (__bridge void*)offPso;
+    CFRetain((__bridge CFTypeRef)offPso);
+
     // Create instanced pipeline for single-ddraw block rendering (<= 8 blocks).
     // Uses vertex_volume_instanced_main + fragment_volume_instanced_main which
     // index into PerBlockData and texture arrays by [[instance_id]].
@@ -3451,7 +3494,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       instDesc.colorAttachments[0].blendingEnabled = NO; // Shader handles compositing via framebuffer fetch
       instDesc.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
       instDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-      instDesc.rasterSampleCount = sampleCount;
+      instDesc.rasterSampleCount = 1; // offscreen single-sample target
 
       NSError* instError = nil;
       id<MTLRenderPipelineState> instPso =
@@ -3629,7 +3672,14 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
     this->SortBlocksBackToFront(ren, vol);
 
     // --- INSTANCED PATH (<= 8 blocks): single draw call for all blocks ---
-    if (this->SortedBlockOrder.size() <= MAX_INSTANCED_BLOCKS && this->InstancedPipelineState)
+    // DISABLED by default: a single instanced draw with framebuffer-fetch
+    // accumulation does NOT guarantee back-to-front ordering across instances,
+    // which produces see-through cross-sections at partition boundaries. The
+    // fallback per-block loop (separate ordered draw calls with One/OneMinusSrcAlpha
+    // blending) composites correctly. Re-enable via VTK_METAL_INSTANCED=1.
+    bool useInstanced =
+      (std::getenv("VTK_METAL_INSTANCED") != nullptr) && this->InstancedPipelineState;
+    if (useInstanced && this->SortedBlockOrder.size() <= MAX_INSTANCED_BLOCKS && this->InstancedPipelineState)
     {
       // Switch to instanced pipeline
       id<MTLRenderPipelineState> instPso =
@@ -3661,22 +3711,19 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
         perBlockData[i].VolumeBoundsMax[3] = 1.0f;
 
         int texExt[6] = {
-          std::max(fullExt[0], block.Extents[0] - 1),
-          std::min(fullExt[1], block.Extents[1] + 1),
-          std::max(fullExt[2], block.Extents[2] - 1),
-          std::min(fullExt[3], block.Extents[3] + 1),
-          std::max(fullExt[4], block.Extents[4] - 1),
-          std::min(fullExt[5], block.Extents[5] + 1)
+          block.Extents[0], block.Extents[1],
+          block.Extents[2], block.Extents[3],
+          block.Extents[4], block.Extents[5]
         };
 
-        perBlockData[i].TextureBoundsMin[0] = static_cast<float>(origin[0] + texExt[0] * spacing[0]);
-        perBlockData[i].TextureBoundsMin[1] = static_cast<float>(origin[1] + texExt[2] * spacing[1]);
-        perBlockData[i].TextureBoundsMin[2] = static_cast<float>(origin[2] + texExt[4] * spacing[2]);
+        perBlockData[i].TextureBoundsMin[0] = static_cast<float>(origin[0] + (texExt[0] - 0.5) * spacing[0]);
+        perBlockData[i].TextureBoundsMin[1] = static_cast<float>(origin[1] + (texExt[2] - 0.5) * spacing[1]);
+        perBlockData[i].TextureBoundsMin[2] = static_cast<float>(origin[2] + (texExt[4] - 0.5) * spacing[2]);
         perBlockData[i].TextureBoundsMin[3] = 1.0f;
 
-        perBlockData[i].TextureBoundsMax[0] = static_cast<float>(origin[0] + texExt[1] * spacing[0]);
-        perBlockData[i].TextureBoundsMax[1] = static_cast<float>(origin[1] + texExt[3] * spacing[1]);
-        perBlockData[i].TextureBoundsMax[2] = static_cast<float>(origin[2] + texExt[5] * spacing[2]);
+        perBlockData[i].TextureBoundsMax[0] = static_cast<float>(origin[0] + (texExt[1] + 0.5) * spacing[0]);
+        perBlockData[i].TextureBoundsMax[1] = static_cast<float>(origin[1] + (texExt[3] + 0.5) * spacing[1]);
+        perBlockData[i].TextureBoundsMax[2] = static_cast<float>(origin[2] + (texExt[5] + 0.5) * spacing[2]);
         perBlockData[i].TextureBoundsMax[3] = 1.0f;
 
         // Gradient step for this block's dimensions
@@ -3702,6 +3749,11 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
           perBlockData[i].MinMaxInfo[2] = 0.0f;
           perBlockData[i].MinMaxInfo[3] = 0.0f;
         }
+
+        perBlockData[i].BlockIndex[0] = static_cast<float>(i);
+        perBlockData[i].BlockIndex[1] = static_cast<float>(si);
+        perBlockData[i].BlockIndex[2] = 0.0f;
+        perBlockData[i].BlockIndex[3] = 1.0f; // unit-cube vertex buffer flag
 
         volTexArray[i] = (__bridge id<MTLTexture>)block.Texture;
         mmTexArray[i] = block.MinMaxTexture
@@ -3817,8 +3869,10 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
       return;
     }
 
-    // --- FALLBACK PATH (> 8 blocks): per-block loop ---
-    for (size_t bi = 0; bi < this->SortedBlockOrder.size(); ++bi)
+    // --- FALLBACK PATH: per-block loop ---
+    // SortedBlockOrder is nearest-first; draw farthest-first (back-to-front) by
+    // iterating in reverse so nearer blocks composite "over" farther ones.
+    for (size_t bi = this->SortedBlockOrder.size(); bi-- > 0;)
     {
       int si = this->SortedBlockOrder[bi];
       auto& block = this->Blocks[si];
@@ -3835,22 +3889,19 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
       pbd.VolumeBoundsMax[3] = 1.0f;
 
       int texExt[6] = {
-        std::max(fullExt[0], block.Extents[0] - 1),
-        std::min(fullExt[1], block.Extents[1] + 1),
-        std::max(fullExt[2], block.Extents[2] - 1),
-        std::min(fullExt[3], block.Extents[3] + 1),
-        std::max(fullExt[4], block.Extents[4] - 1),
-        std::min(fullExt[5], block.Extents[5] + 1)
+        block.Extents[0], block.Extents[1],
+        block.Extents[2], block.Extents[3],
+        block.Extents[4], block.Extents[5]
       };
 
-      pbd.TextureBoundsMin[0] = static_cast<float>(origin[0] + texExt[0] * spacing[0]);
-      pbd.TextureBoundsMin[1] = static_cast<float>(origin[1] + texExt[2] * spacing[1]);
-      pbd.TextureBoundsMin[2] = static_cast<float>(origin[2] + texExt[4] * spacing[2]);
+      pbd.TextureBoundsMin[0] = static_cast<float>(origin[0] + (texExt[0] - 0.5) * spacing[0]);
+      pbd.TextureBoundsMin[1] = static_cast<float>(origin[1] + (texExt[2] - 0.5) * spacing[1]);
+      pbd.TextureBoundsMin[2] = static_cast<float>(origin[2] + (texExt[4] - 0.5) * spacing[2]);
       pbd.TextureBoundsMin[3] = 1.0f;
 
-      pbd.TextureBoundsMax[0] = static_cast<float>(origin[0] + texExt[1] * spacing[0]);
-      pbd.TextureBoundsMax[1] = static_cast<float>(origin[1] + texExt[3] * spacing[1]);
-      pbd.TextureBoundsMax[2] = static_cast<float>(origin[2] + texExt[5] * spacing[2]);
+      pbd.TextureBoundsMax[0] = static_cast<float>(origin[0] + (texExt[1] + 0.5) * spacing[0]);
+      pbd.TextureBoundsMax[1] = static_cast<float>(origin[1] + (texExt[3] + 0.5) * spacing[1]);
+      pbd.TextureBoundsMax[2] = static_cast<float>(origin[2] + (texExt[5] + 0.5) * spacing[2]);
       pbd.TextureBoundsMax[3] = 1.0f;
 
       for (int k = 0; k < 3; ++k)
@@ -3879,6 +3930,11 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
         pbd.MinMaxInfo[3] = 0.0f;
       }
 
+      pbd.BlockIndex[0] = static_cast<float>(bi);
+      pbd.BlockIndex[1] = static_cast<float>(si);
+      pbd.BlockIndex[2] = 0.0f;
+      pbd.BlockIndex[3] = 1.0f; // unit-cube vertex buffer flag
+
       [encoder setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
       [encoder setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
 
@@ -3887,11 +3943,17 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
       [encoder setFragmentTexture:blockTex atIndex:0];
 
       // Draw
+      if (std::getenv("VTK_METAL_VOLUME_DEBUG"))
+      {
+        static long drawCounter = 0;
+        vtkWarningWithObjectMacro(this, "ACTUAL DRAW seq=" << (drawCounter++)
+          << " block#" << si << " (reverse-loop index bi=" << bi << ")");
+      }
       [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                          indexCount:this->IndexCount
-                           indexType:MTLIndexTypeUInt32
-                         indexBuffer:indexBuf
-                   indexBufferOffset:0];
+                           indexCount:this->IndexCount
+                            indexType:MTLIndexTypeUInt32
+                          indexBuffer:indexBuf
+                    indexBufferOffset:0];
     }
   }
   else
@@ -4288,6 +4350,12 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   uniforms.MinMaxDimY = static_cast<float>(this->MinMaxDims[1]);
   uniforms.MinMaxDimZ = static_cast<float>(this->MinMaxDims[2]);
 
+  // Debug: tint fragments by block index when VTK_METAL_VOLUME_DEBUG env var set.
+  {
+    const char* dbg = std::getenv("VTK_METAL_VOLUME_DEBUG");
+    uniforms.DebugBlockMode = (dbg && std::strcmp(dbg, "1") == 0) ? 1.0f : 0.0f;
+  }
+
   // Determine if image-space downsampling is active.
   // Force offscreen rendering when blocks are present to enable inter-block
   // opacity propagation via Metal framebuffer fetch ([[color(0)]]).
@@ -4489,13 +4557,27 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     // pipeline for single-block rendering.
     // Note: use Blocks.size() here because SortedBlockOrder isn't populated
     // until SortBlocksBackToFront is called inside DrawBlocks.
+    // The offscreen target (ImageSampleColorTexture) is RGBA16Float, so a
+    // partitioned volume MUST use the RGBA16Float accumulation pipeline. Using
+    // the BGRA8 PipelineState here would mismatch the render target's pixel
+    // format (especially when MSAA is active on the main window) and corrupt
+    // the composited result. The instanced pipeline is also RGBA16Float and is
+    // only used when explicitly forced via VTK_METAL_INSTANCED.
     int currentSampleCount = metalRenderWindow->GetEffectiveSampleCount();
     bool useInstanced = !this->Blocks.empty() &&
       this->Blocks.size() <= MAX_INSTANCED_BLOCKS &&
-      this->InstancedPipelineState && (currentSampleCount == 1);
-    bool useAccumulation = !useInstanced && !this->Blocks.empty() && (currentSampleCount == 1);
+      this->InstancedPipelineState && (std::getenv("VTK_METAL_INSTANCED") != nullptr);
+    // For partitioned volumes rendered offscreen, use the RGBA16Float pipeline
+    // that reuses fragment_volume_main with hardware back-to-front blending.
+    // This composites partition slabs exactly like the proven single-block path.
+    bool useOffscreen = !useInstanced && !this->Blocks.empty() && this->OffscreenPipelineState;
     void* activePipeline = useInstanced ? this->InstancedPipelineState
-      : (useAccumulation ? this->AccumulationPipelineState : this->PipelineState);
+      : (useOffscreen ? this->OffscreenPipelineState : this->PipelineState);
+    if (std::getenv("VTK_METAL_VOLUME_DEBUG"))
+    {
+      vtkWarningWithObjectMacro(this, "ACTIVE PIPELINE: "
+        << (useInstanced ? "instanced" : (useOffscreen ? "offscreen(RGBA16Float+blend)" : "BGRA8-PipelineState(FALLBACK!)")));
+    }
     this->BindEncoderResources(offscreenEncoder, uniformBuf, activePipeline);
 
     // Draw volume — handle partitioned (multi-block) and single-block cases
