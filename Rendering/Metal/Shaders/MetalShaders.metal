@@ -1305,13 +1305,13 @@ struct PerBlockData {
 
 vertex VolumeVertexOut vertex_volume_main(
     VolumeVertexIn in [[stage_in]],
-    constant VolumeMapperUniforms& u [[buffer(1)]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
     constant PerBlockData& b [[buffer(2)]]) {
   VolumeVertexOut out;
 
   float3 modelPos = in.position;
-  out.position = u.viewProjection * u.volumeToWorld * float4(modelPos, 1.0);
-  out.localPos = (modelPos - u.volumeBoundsMin.xyz) / (u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz);
+  out.position = volumeUniforms.viewProjection * volumeUniforms.volumeToWorld * float4(modelPos, 1.0);
+  out.localPos = (modelPos - volumeUniforms.volumeBoundsMin.xyz) / (volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz);
   out.instanceID = 0;
   return out;
 }
@@ -1392,7 +1392,7 @@ inline int computeCropRegion(float3 cropMin, float3 cropMax, float3 pos) {
 fragment VolumeFragmentOut fragment_volume_main(
     VolumeVertexOut in [[stage_in]],
     bool isFrontFace [[front_facing]],
-    constant VolumeMapperUniforms& u [[buffer(1)]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
     constant PerBlockData& b [[buffer(2)]],
     texture3d<float> volumeTexture [[texture(0)]],
     texture2d<float> transferFunctionTexture [[texture(1)]],
@@ -1414,45 +1414,42 @@ fragment VolumeFragmentOut fragment_volume_main(
   if (!isFrontFace) discard_fragment();
 
   VolumeFragmentOut output;
-  float3 blockMinGlobal = (b.volumeBoundsMin.xyz - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
-  float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
+  float3 blockMinGlobal = (b.volumeBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
 
-  float3 texMinGlobal = (b.textureBoundsMin.xyz - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
-  float3 texMaxGlobal = (b.textureBoundsMax.xyz - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
+  float3 texMinGlobal = (b.textureBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 texMaxGlobal = (b.textureBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
 
-  // Bit-perfect identical ray direction derived purely from un-projecting the screen pixel coordinate
-  float2 ndcXY = (in.position.xy / u.viewportSize) * 2.0 - 1.0;
-  float4 farWorld = u.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, 1.0, 1.0);
-  float fw = abs(farWorld.w) < 1e-6f ? 1e-6f : farWorld.w;
-  float3 farLocal = ((farWorld.xyz / fw) - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
-  
-  float3 cameraPos = u.cameraVolumePos.xyz;
-  float3 rayDir = farLocal - cameraPos;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float stepSize = volumeUniforms.sampleDistance;
+
+  float3 rayDir = in.localPos - cameraPos;
   float dirLength = length(rayDir);
   if (dirLength < 0.0001) discard_fragment();
-  rayDir /= dirLength;
 
+  rayDir /= dirLength;
   float2 t = intersectBox(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal);
   float tStart = max(t.x, 0.0);
   if (tStart >= t.y) discard_fragment();
 
   float3 entryPoint = cameraPos + rayDir * tStart;
   float3 exitPoint = cameraPos + rayDir * t.y;
+  float totalDist = length(exitPoint - entryPoint);
 
   float tTerminateMax = 1e30;
-  float depthSample = depthTexture.sample(depthSampler, in.position.xy / u.viewportSize).r;
+  float depthSample = depthTexture.sample(depthSampler, in.position.xy / volumeUniforms.viewportSize).r;
 
   if (depthSample < 1.0) {
-    float4 worldTermination = u.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
-    float tw = abs(worldTermination.w) < 1e-6f ? 1e-6f : worldTermination.w;
-    float3 terminationLocal = ((worldTermination.xyz / tw) - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
+    float2 ndcXY = (in.position.xy / volumeUniforms.viewportSize) * 2.0 - 1.0;
+    float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
+    float3 terminationLocal = ((worldTermination.xyz / worldTermination.w) - volumeUniforms.volumeBoundsMin.xyz) / (volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz);
     tTerminateMax = dot(terminationLocal - cameraPos, rayDir);
   }
 
-  if (u.useClipping > 0.5) {
-    int numClipPlanes = int(u.numClippingPlanes);
-    float4 planeOrigins[8] = { u.clippingPlane0Origin, u.clippingPlane1Origin, u.clippingPlane2Origin, u.clippingPlane3Origin, u.clippingPlane4Origin, u.clippingPlane5Origin, u.clippingPlane6Origin, u.clippingPlane7Origin };
-    float4 planeNormals[8] = { u.clippingPlane0Normal, u.clippingPlane1Normal, u.clippingPlane2Normal, u.clippingPlane3Normal, u.clippingPlane4Normal, u.clippingPlane5Normal, u.clippingPlane6Normal, u.clippingPlane7Normal };
+  if (volumeUniforms.useClipping > 0.5) {
+    int numClipPlanes = int(volumeUniforms.numClippingPlanes);
+    float4 planeOrigins[8] = { volumeUniforms.clippingPlane0Origin, volumeUniforms.clippingPlane1Origin, volumeUniforms.clippingPlane2Origin, volumeUniforms.clippingPlane3Origin, volumeUniforms.clippingPlane4Origin, volumeUniforms.clippingPlane5Origin, volumeUniforms.clippingPlane6Origin, volumeUniforms.clippingPlane7Origin };
+    float4 planeNormals[8] = { volumeUniforms.clippingPlane0Normal, volumeUniforms.clippingPlane1Normal, volumeUniforms.clippingPlane2Normal, volumeUniforms.clippingPlane3Normal, volumeUniforms.clippingPlane4Normal, volumeUniforms.clippingPlane5Normal, volumeUniforms.clippingPlane6Normal, volumeUniforms.clippingPlane7Normal };
 
     for (int cp = 0; cp < numClipPlanes; cp++) {
       float3 planeOrigin = planeOrigins[cp].xyz;
@@ -1473,52 +1470,47 @@ fragment VolumeFragmentOut fragment_volume_main(
   }
 
   // --- LOCAL CACHE WARM-UP (Prevents Uniform Cache Thrashing) ---
-  const bool doShading = u.useGradientShading > 0.5;
-  const bool doGradOp = u.useGradientOpacity > 0.5;
-  const bool doCropping = u.useCropping > 0.5;
-  const bool doMask = u.useMask > 0.5;
+  const bool doShading = volumeUniforms.useGradientShading > 0.5;
+  const bool doGradOp = volumeUniforms.useGradientOpacity > 0.5;
+  const bool doCropping = volumeUniforms.useCropping > 0.5;
+  const bool doMask = volumeUniforms.useMask > 0.5;
 
-  half scalarScale = half(1.0 / (u.scalarMax - u.scalarMin));
-  half scalarBias  = half(-u.scalarMin) * scalarScale;
+  half scalarScale = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
+  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
 
-  half gradNormFactor = half(max(1e-8f, u.gradientOpacityRange.y));
+  half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
 
   half3 viewDirHalf  = half3(normalize(entryPoint - cameraPos));
-  half3 lightDirHalf = half3(normalize(u.lightDirection));
-  half3 ambientMat   = half3(u.ambientColor.rgb);
-  half3 diffuseMat   = half3(u.diffuseColor.rgb);
-  half3 specularMat  = half3(u.specularColor.rgb);
-  half shininessMat  = half(u.shininess);
+  half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection));
+  half3 ambientMat   = half3(volumeUniforms.ambientColor.rgb);
+  half3 diffuseMat   = half3(volumeUniforms.diffuseColor.rgb);
+  half3 specularMat  = half3(volumeUniforms.specularColor.rgb);
+  half shininessMat  = half(volumeUniforms.shininess);
 
-  float maskScale = u.maskScale;
-  float maskBias  = u.maskBias;
-  float numLabels = u.labelMapNumLabels;
+  float maskScale = volumeUniforms.maskScale;
+  float maskBias  = volumeUniforms.maskBias;
+  float numLabels = volumeUniforms.labelMapNumLabels;
 
-  float3 cropMin = u.croppingPlanes.xyz;
-  float3 cropMax = float3(u.croppingPlanes.w, u.croppingPlanes2.xy);
+  float3 cropMin = volumeUniforms.croppingPlanes.xyz;
+  float3 cropMax = float3(volumeUniforms.croppingPlanes.w, volumeUniforms.croppingPlanes2.xy);
 
   uint cropBitmask = 0;
   if (doCropping) {
-    float4 cropF[8] = { u.croppingFlagsRow0, u.croppingFlagsRow1, u.croppingFlagsRow2, u.croppingFlagsRow3, u.croppingFlagsRow4, u.croppingFlagsRow5, u.croppingFlagsRow6, u.croppingFlagsRow7 };
+    float4 cropF[8] = { volumeUniforms.croppingFlagsRow0, volumeUniforms.croppingFlagsRow1, volumeUniforms.croppingFlagsRow2, volumeUniforms.croppingFlagsRow3, volumeUniforms.croppingFlagsRow4, volumeUniforms.croppingFlagsRow5, volumeUniforms.croppingFlagsRow6, volumeUniforms.croppingFlagsRow7 };
     for (int j = 0; j < 32; j++) {
       if (cropF[j / 4][j % 4] > 0.0) cropBitmask |= (1u << j);
     }
   }
 
   // --- SOFTWARE PIPELINING INITIALIZATION ---
-  float stepSize = u.sampleDistance;
-  float jitter = u.useJittering > 0.5 ? volume_random(in.position.xy) * stepSize : 0.0;
-  
-  // Create an aligned integer ray-step coordinate grid shared across all block bounds flawlessly
-  int k = int(floor((tStart - jitter) / stepSize));
-  float currentT = jitter + float(k) * stepSize;
-  while (currentT < tStart) {
-      k++;
-      currentT = jitter + float(k) * stepSize;
-  }
+  float jitter = volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) * stepSize : 0.0;
+  float currentT = jitter + ceil((tStart - jitter) / stepSize - 1e-4) * stepSize;
   if (currentT >= t.y) discard_fragment();
 
+  float3 stepVec = rayDir * stepSize;
   float3 currentPoint = cameraPos + rayDir * currentT;
+  float totalDistActual = t.y - currentT;
+  int maxSteps = min(max(1, int(ceil(totalDistActual / stepSize))), MAX_RAY_STEPS);
 
   half3 accumulatedColor = half3(0.0);
   half accumulatedOpacity = 0.0;
@@ -1533,8 +1525,9 @@ fragment VolumeFragmentOut fragment_volume_main(
   float3 mmDimF     = b.minMaxInfo.yzw;
 
   // --- THE RAYMARCHING LOOP ---
-  for (int stepCount = 0; stepCount < MAX_RAY_STEPS; stepCount++) {
-    if (currentT >= t.y) break;
+  for (int i = 0; i < maxSteps; i++) {
+    // Strict check to completely suppress smearing outside partitioned edges
+    if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
 
     // 0. MIN-MAX ACCELERATION
     if (b.minMaxInfo.x > 0.5) {
@@ -1563,12 +1556,14 @@ fragment VolumeFragmentOut fragment_volume_main(
         tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
 
         float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
-        int skipSteps = int(floor(exactSkip / stepSize + 1e-4)) + 1;
+        float skipDist = (floor(exactSkip / stepSize + 1e-4) + 1.0) * stepSize;
 
-        // Directly jump indices retaining strict global alignment
-        k += skipSteps;
-        currentT = jitter + float(k) * stepSize;
+        currentT += skipDist;
         currentPoint = cameraPos + rayDir * currentT;
+
+        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y) {
+          break;
+        }
 
         prefetchScalar = as_type<float>(0x7fc00000u); // NaN sentinel
         curCell = int3(-1);
@@ -1587,16 +1582,13 @@ fragment VolumeFragmentOut fragment_volume_main(
       ? maskTexture.sample(maskSampler, evalPoint, level(0)).r
       : prefetchMask;
 
-    // Save the evaluated point to check strict bounds ownership exactly
-    float3 evalWorldPos = currentPoint;
-
-    // 2. Advance ray trackers (Grid strict index tracker instead of continuous float additions)
-    k++;
-    currentT = jitter + float(k) * stepSize;
-    currentPoint = cameraPos + rayDir * currentT;
+    // 2. Advance ray trackers
+    float3 lastPoint = currentPoint;
+    currentPoint += stepVec;
+    currentT += stepSize;
 
     // 3. LAUNCH PREFETCH FOR NEXT ITERATION
-    if (currentT < t.y) {
+    if (i + 1 < maxSteps) {
       float3 nextTexLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
       float3 nextEvalPoint = nextTexLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
       prefetchScalar = volumeTexture.sample(volumeSampler, nextEvalPoint, level(0)).r;
@@ -1606,72 +1598,66 @@ fragment VolumeFragmentOut fragment_volume_main(
     }
 
     // 4. MATH & EVALUATION
-    bool validSample = true;
-    
-    // Strict Half-Open Interval Ownership [min, max) -> Eliminates boundary duplication
-    if (evalWorldPos.x < blockMinGlobal.x && (blockMinGlobal.x > 0.0001f || evalWorldPos.x < -0.0001f)) validSample = false;
-    if (evalWorldPos.x >= blockMaxGlobal.x && (blockMaxGlobal.x < 0.9999f || evalWorldPos.x > 1.0001f)) validSample = false;
-    if (evalWorldPos.y < blockMinGlobal.y && (blockMinGlobal.y > 0.0001f || evalWorldPos.y < -0.0001f)) validSample = false;
-    if (evalWorldPos.y >= blockMaxGlobal.y && (blockMaxGlobal.y < 0.9999f || evalWorldPos.y > 1.0001f)) validSample = false;
-    if (evalWorldPos.z < blockMinGlobal.z && (blockMinGlobal.z > 0.0001f || evalWorldPos.z < -0.0001f)) validSample = false;
-    if (evalWorldPos.z >= blockMaxGlobal.z && (blockMaxGlobal.z < 0.9999f || evalWorldPos.z > 1.0001f)) validSample = false;
-
-    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, evalWorldPos))) == 0u)) {
-      validSample = false;
+    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, lastPoint))) == 0u)) {
+      continue;
     }
 
-    if (validSample) {
-        half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
-        half4 colorOpacity;
-        half maskLabel = 0.0h;
+    half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
 
-        if (doMask) {
-          float maskVal = rawMask * maskScale + maskBias;
-          if (numLabels > 0.0) {
-            maskLabel = half(floor(maskVal * numLabels) / numLabels);
-          }
-          if (maskLabel > 0.0h) {
-            colorOpacity = half4(labelMapTransferTexture.sample(labelMapSampler, float2(float(scalarNorm), float(maskLabel)), level(0)));
-          } else {
-            colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
-          }
-        } else {
-          colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+    half4 colorOpacity;
+    half maskLabel = 0.0h;
+
+    if (doMask) {
+      float maskVal = rawMask * maskScale + maskBias;
+      if (numLabels > 0.0) {
+        maskLabel = half(floor(maskVal * numLabels) / numLabels);
+      }
+      if (maskLabel > 0.0h) {
+        colorOpacity = half4(labelMapTransferTexture.sample(labelMapSampler, float2(float(scalarNorm), float(maskLabel)), level(0)));
+      } else {
+        colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+      }
+    } else {
+      colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+    }
+
+    half sampleOpacity = colorOpacity.a;
+
+    if (sampleOpacity > 0.001h) {
+      half3 sampleColor = colorOpacity.rgb;
+      half weight = 1.0h - accumulatedOpacity;
+
+      // Ghost lighting bypass: skip expensive gradient/lighting for near-transparent voxels
+      if (sampleOpacity < 0.01h) {
+        accumulatedColor += weight * sampleColor * sampleOpacity;
+        accumulatedOpacity += weight * sampleOpacity;
+      } else {
+
+      // Visual Significance Threshold:
+      // If the voxel's actual contribution to the screen is less than 0.002
+      // it is invisible on an 8-bit monitor. Do not waste memory bandwidth shading it.
+      if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
+
+        half4 grad = computeGradientFast(volumeTexture, volumeSampler, evalPoint, b.gradientStep.xyz, gradNormFactor);
+        sampleColor = computePhongLightingVolumeFast(sampleColor, grad.xyz, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
+
+        if (doGradOp) {
+          sampleOpacity *= half(gradientOpacityTexture.sample(gradientOpacitySampler, float2(float(grad.w), 0.5), level(0)).r);
         }
+      } else if (doShading) {
+        // Fallback for "invisible" fuzz/noise to maintain baseline brightness
+        sampleColor = ambientMat * sampleColor;
+      }
 
-        half sampleOpacity = colorOpacity.a;
+      accumulatedColor += weight * sampleColor * sampleOpacity;
+      accumulatedOpacity += weight * sampleOpacity;
+      } // end ghost lighting bypass
+    }
 
-        if (sampleOpacity > 0.001h) {
-          half3 sampleColor = colorOpacity.rgb;
-          half weight = 1.0h - accumulatedOpacity;
-
-          if (sampleOpacity < 0.01h) {
-            accumulatedColor += weight * sampleColor * sampleOpacity;
-            accumulatedOpacity += weight * sampleOpacity;
-          } else {
-
-          // Visual Significance Threshold
-          if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
-            half4 grad = computeGradientFast(volumeTexture, volumeSampler, evalPoint, b.gradientStep.xyz, gradNormFactor);
-            sampleColor = computePhongLightingVolumeFast(sampleColor, grad.xyz, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
-
-            if (doGradOp) {
-              sampleOpacity *= half(gradientOpacityTexture.sample(gradientOpacitySampler, float2(float(grad.w), 0.5), level(0)).r);
-            }
-          } else if (doShading) {
-            sampleColor = ambientMat * sampleColor;
-          }
-
-          accumulatedColor += weight * sampleColor * sampleOpacity;
-          accumulatedOpacity += weight * sampleOpacity;
-          }
-        }
-
-        // Early Ray Termination
-        if (accumulatedOpacity >= 0.99h || currentT >= tTerminateMax) {
-          accumulatedOpacity = 1.0h;
-          break;
-        }
+    // Early Ray Termination (ERT)
+    if (accumulatedOpacity >= 0.99h || currentT >= tTerminateMax) {
+      accumulatedOpacity = 1.0h;
+      break;
     }
   }
 
@@ -1685,8 +1671,8 @@ fragment VolumeFragmentOut fragment_volume_main(
 fragment VolumeFragmentOut fragment_volume_accum_main(
     VolumeVertexOut in [[stage_in]],
     bool isFrontFace [[front_facing]],
-    float4 prevAccum [[color(0), raster_order_group(0)]], // Thread sync ensures F2B execution
-    constant VolumeMapperUniforms& u [[buffer(1)]],
+    float4 prevAccum [[color(0)]], // Metal Framebuffer Fetch
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
     constant PerBlockData& b [[buffer(2)]],
     texture3d<float> volumeTexture [[texture(0)]],
     texture2d<float> transferFunctionTexture [[texture(1)]],
@@ -1718,45 +1704,42 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
   half3 accumulatedColor = half3(prevAccum.rgb);
   half accumulatedOpacity = half(prevAccum.a);
 
-  float3 blockMinGlobal = (b.volumeBoundsMin.xyz - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
-  float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
+  float3 blockMinGlobal = (b.volumeBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
 
-  float3 texMinGlobal = (b.textureBoundsMin.xyz - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
-  float3 texMaxGlobal = (b.textureBoundsMax.xyz - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
+  float3 texMinGlobal = (b.textureBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 texMaxGlobal = (b.textureBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
 
-  // Bit-perfect identical ray direction derived purely from un-projecting the screen pixel coordinate
-  float2 ndcXY = (in.position.xy / u.viewportSize) * 2.0 - 1.0;
-  float4 farWorld = u.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, 1.0, 1.0);
-  float fw = abs(farWorld.w) < 1e-6f ? 1e-6f : farWorld.w;
-  float3 farLocal = ((farWorld.xyz / fw) - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
-  
-  float3 cameraPos = u.cameraVolumePos.xyz;
-  float3 rayDir = farLocal - cameraPos;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float stepSize = volumeUniforms.sampleDistance;
+
+  float3 rayDir = in.localPos - cameraPos;
   float dirLength = length(rayDir);
   if (dirLength < 0.0001) discard_fragment();
-  rayDir /= dirLength;
 
+  rayDir /= dirLength;
   float2 t = intersectBox(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal);
   float tStart = max(t.x, 0.0);
   if (tStart >= t.y) discard_fragment();
 
   float3 entryPoint = cameraPos + rayDir * tStart;
   float3 exitPoint = cameraPos + rayDir * t.y;
+  float totalDist = length(exitPoint - entryPoint);
 
   float tTerminateMax = 1e30;
-  float depthSample = depthTexture.sample(depthSampler, in.position.xy / u.viewportSize).r;
+  float depthSample = depthTexture.sample(depthSampler, in.position.xy / volumeUniforms.viewportSize).r;
 
   if (depthSample < 1.0) {
-    float4 worldTermination = u.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
-    float tw = abs(worldTermination.w) < 1e-6f ? 1e-6f : worldTermination.w;
-    float3 terminationLocal = ((worldTermination.xyz / tw) - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
+    float2 ndcXY = (in.position.xy / volumeUniforms.viewportSize) * 2.0 - 1.0;
+    float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
+    float3 terminationLocal = ((worldTermination.xyz / worldTermination.w) - volumeUniforms.volumeBoundsMin.xyz) / (volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz);
     tTerminateMax = dot(terminationLocal - cameraPos, rayDir);
   }
 
-  if (u.useClipping > 0.5) {
-    int numClipPlanes = int(u.numClippingPlanes);
-    float4 planeOrigins[8] = { u.clippingPlane0Origin, u.clippingPlane1Origin, u.clippingPlane2Origin, u.clippingPlane3Origin, u.clippingPlane4Origin, u.clippingPlane5Origin, u.clippingPlane6Origin, u.clippingPlane7Origin };
-    float4 planeNormals[8] = { u.clippingPlane0Normal, u.clippingPlane1Normal, u.clippingPlane2Normal, u.clippingPlane3Normal, u.clippingPlane4Normal, u.clippingPlane5Normal, u.clippingPlane6Normal, u.clippingPlane7Normal };
+  if (volumeUniforms.useClipping > 0.5) {
+    int numClipPlanes = int(volumeUniforms.numClippingPlanes);
+    float4 planeOrigins[8] = { volumeUniforms.clippingPlane0Origin, volumeUniforms.clippingPlane1Origin, volumeUniforms.clippingPlane2Origin, volumeUniforms.clippingPlane3Origin, volumeUniforms.clippingPlane4Origin, volumeUniforms.clippingPlane5Origin, volumeUniforms.clippingPlane6Origin, volumeUniforms.clippingPlane7Origin };
+    float4 planeNormals[8] = { volumeUniforms.clippingPlane0Normal, volumeUniforms.clippingPlane1Normal, volumeUniforms.clippingPlane2Normal, volumeUniforms.clippingPlane3Normal, volumeUniforms.clippingPlane4Normal, volumeUniforms.clippingPlane5Normal, volumeUniforms.clippingPlane6Normal, volumeUniforms.clippingPlane7Normal };
 
     for (int cp = 0; cp < numClipPlanes; cp++) {
       float3 planeOrigin = planeOrigins[cp].xyz;
@@ -1777,52 +1760,47 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
   }
 
   // --- LOCAL CACHE WARM-UP (Prevents Uniform Cache Thrashing) ---
-  const bool doShading = u.useGradientShading > 0.5;
-  const bool doGradOp = u.useGradientOpacity > 0.5;
-  const bool doCropping = u.useCropping > 0.5;
-  const bool doMask = u.useMask > 0.5;
+  const bool doShading = volumeUniforms.useGradientShading > 0.5;
+  const bool doGradOp = volumeUniforms.useGradientOpacity > 0.5;
+  const bool doCropping = volumeUniforms.useCropping > 0.5;
+  const bool doMask = volumeUniforms.useMask > 0.5;
 
-  half scalarScale = half(1.0 / (u.scalarMax - u.scalarMin));
-  half scalarBias  = half(-u.scalarMin) * scalarScale;
+  half scalarScale = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
+  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
 
-  half gradNormFactor = half(max(1e-8f, u.gradientOpacityRange.y));
+  half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
 
   half3 viewDirHalf  = half3(normalize(entryPoint - cameraPos));
-  half3 lightDirHalf = half3(normalize(u.lightDirection));
-  half3 ambientMat   = half3(u.ambientColor.rgb);
-  half3 diffuseMat   = half3(u.diffuseColor.rgb);
-  half3 specularMat  = half3(u.specularColor.rgb);
-  half shininessMat  = half(u.shininess);
+  half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection));
+  half3 ambientMat   = half3(volumeUniforms.ambientColor.rgb);
+  half3 diffuseMat   = half3(volumeUniforms.diffuseColor.rgb);
+  half3 specularMat  = half3(volumeUniforms.specularColor.rgb);
+  half shininessMat  = half(volumeUniforms.shininess);
 
-  float maskScale = u.maskScale;
-  float maskBias  = u.maskBias;
-  float numLabels = u.labelMapNumLabels;
+  float maskScale = volumeUniforms.maskScale;
+  float maskBias  = volumeUniforms.maskBias;
+  float numLabels = volumeUniforms.labelMapNumLabels;
 
-  float3 cropMin = u.croppingPlanes.xyz;
-  float3 cropMax = float3(u.croppingPlanes.w, u.croppingPlanes2.xy);
+  float3 cropMin = volumeUniforms.croppingPlanes.xyz;
+  float3 cropMax = float3(volumeUniforms.croppingPlanes.w, volumeUniforms.croppingPlanes2.xy);
 
   uint cropBitmask = 0;
   if (doCropping) {
-    float4 cropF[8] = { u.croppingFlagsRow0, u.croppingFlagsRow1, u.croppingFlagsRow2, u.croppingFlagsRow3, u.croppingFlagsRow4, u.croppingFlagsRow5, u.croppingFlagsRow6, u.croppingFlagsRow7 };
+    float4 cropF[8] = { volumeUniforms.croppingFlagsRow0, volumeUniforms.croppingFlagsRow1, volumeUniforms.croppingFlagsRow2, volumeUniforms.croppingFlagsRow3, volumeUniforms.croppingFlagsRow4, volumeUniforms.croppingFlagsRow5, volumeUniforms.croppingFlagsRow6, volumeUniforms.croppingFlagsRow7 };
     for (int j = 0; j < 32; j++) {
       if (cropF[j / 4][j % 4] > 0.0) cropBitmask |= (1u << j);
     }
   }
 
   // --- SOFTWARE PIPELINING INITIALIZATION ---
-  float stepSize = u.sampleDistance;
-  float jitter = u.useJittering > 0.5 ? volume_random(in.position.xy) * stepSize : 0.0;
-  
-  // Create an aligned integer ray-step coordinate grid shared across all block bounds flawlessly
-  int k = int(floor((tStart - jitter) / stepSize));
-  float currentT = jitter + float(k) * stepSize;
-  while (currentT < tStart) {
-      k++;
-      currentT = jitter + float(k) * stepSize;
-  }
+  float jitter = volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) * stepSize : 0.0;
+  float currentT = jitter + ceil((tStart - jitter) / stepSize - 1e-4) * stepSize;
   if (currentT >= t.y) discard_fragment();
 
+  float3 stepVec = rayDir * stepSize;
   float3 currentPoint = cameraPos + rayDir * currentT;
+  float totalDistActual = t.y - currentT;
+  int maxSteps = min(max(1, int(ceil(totalDistActual / stepSize))), MAX_RAY_STEPS);
 
   // PREFETCH the very first samples before the loop starts
   float3 texLocalPos0 = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
@@ -1836,8 +1814,8 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
   float3 mmDimF     = b.minMaxInfo.yzw;
 
   // --- THE RAYMARCHING LOOP ---
-  for (int stepCount = 0; stepCount < MAX_RAY_STEPS; stepCount++) {
-    if (currentT >= t.y) break;
+  for (int i = 0; i < maxSteps; i++) {
+    if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
 
     if (b.minMaxInfo.x > 0.5) {
       float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
@@ -1865,12 +1843,14 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
         tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
 
         float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
-        int skipSteps = int(floor(exactSkip / stepSize + 1e-4)) + 1;
+        float skipDist = (floor(exactSkip / stepSize + 1e-4) + 1.0) * stepSize;
 
-        // Directly jump indices retaining strict global alignment
-        k += skipSteps;
-        currentT = jitter + float(k) * stepSize;
+        currentT += skipDist;
         currentPoint = cameraPos + rayDir * currentT;
+
+        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y) {
+          break;
+        }
 
         prefetchScalar = as_type<float>(0x7fc00000u); // NaN sentinel
         curCell = int3(-1);
@@ -1889,13 +1869,13 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
       ? maskTexture.sample(maskSampler, evalPoint, level(0)).r
       : prefetchMask;
 
-    float3 evalWorldPos = currentPoint;
+    // 2. Advance ray trackers
+    float3 lastPoint = currentPoint;
+    currentPoint += stepVec;
+    currentT += stepSize;
 
-    k++;
-    currentT = jitter + float(k) * stepSize;
-    currentPoint = cameraPos + rayDir * currentT;
-
-    if (currentT < t.y) {
+    // 3. LAUNCH PREFETCH FOR NEXT ITERATION
+    if (i + 1 < maxSteps) {
       float3 nextTexLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
       float3 nextEvalPoint = nextTexLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
       prefetchScalar = volumeTexture.sample(volumeSampler, nextEvalPoint, level(0)).r;
@@ -1905,70 +1885,64 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     }
 
     // 4. MATH & EVALUATION
-    bool validSample = true;
-    
-    // Strict Half-Open Interval Ownership [min, max) -> Eliminates boundary duplication
-    if (evalWorldPos.x < blockMinGlobal.x && (blockMinGlobal.x > 0.0001f || evalWorldPos.x < -0.0001f)) validSample = false;
-    if (evalWorldPos.x >= blockMaxGlobal.x && (blockMaxGlobal.x < 0.9999f || evalWorldPos.x > 1.0001f)) validSample = false;
-    if (evalWorldPos.y < blockMinGlobal.y && (blockMinGlobal.y > 0.0001f || evalWorldPos.y < -0.0001f)) validSample = false;
-    if (evalWorldPos.y >= blockMaxGlobal.y && (blockMaxGlobal.y < 0.9999f || evalWorldPos.y > 1.0001f)) validSample = false;
-    if (evalWorldPos.z < blockMinGlobal.z && (blockMinGlobal.z > 0.0001f || evalWorldPos.z < -0.0001f)) validSample = false;
-    if (evalWorldPos.z >= blockMaxGlobal.z && (blockMaxGlobal.z < 0.9999f || evalWorldPos.z > 1.0001f)) validSample = false;
-
-    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, evalWorldPos))) == 0u)) {
-      validSample = false;
+    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, lastPoint))) == 0u)) {
+      continue;
     }
 
-    if (validSample) {
-        half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
-        half4 colorOpacity;
-        half maskLabel = 0.0h;
+    half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
 
-        if (doMask) {
-          float maskVal = rawMask * maskScale + maskBias;
-          if (numLabels > 0.0) {
-            maskLabel = half(floor(maskVal * numLabels) / numLabels);
-          }
-          if (maskLabel > 0.0h) {
-            colorOpacity = half4(labelMapTransferTexture.sample(labelMapSampler, float2(float(scalarNorm), float(maskLabel)), level(0)));
-          } else {
-            colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
-          }
-        } else {
-          colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+    half4 colorOpacity;
+    half maskLabel = 0.0h;
+
+    if (doMask) {
+      float maskVal = rawMask * maskScale + maskBias;
+      if (numLabels > 0.0) {
+        maskLabel = half(floor(maskVal * numLabels) / numLabels);
+      }
+      if (maskLabel > 0.0h) {
+        colorOpacity = half4(labelMapTransferTexture.sample(labelMapSampler, float2(float(scalarNorm), float(maskLabel)), level(0)));
+      } else {
+        colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+      }
+    } else {
+      colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+    }
+
+    half sampleOpacity = colorOpacity.a;
+
+    if (sampleOpacity > 0.001h) {
+      half3 sampleColor = colorOpacity.rgb;
+      half weight = 1.0h - accumulatedOpacity;
+
+      // Ghost lighting bypass: skip expensive gradient/lighting for near-transparent voxels
+      if (sampleOpacity < 0.01h) {
+        accumulatedColor += weight * sampleColor * sampleOpacity;
+        accumulatedOpacity += weight * sampleOpacity;
+      } else {
+
+      // Visual Significance Threshold
+      if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
+
+        half4 grad = computeGradientFast(volumeTexture, volumeSampler, evalPoint, b.gradientStep.xyz, gradNormFactor);
+        sampleColor = computePhongLightingVolumeFast(sampleColor, grad.xyz, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
+
+        if (doGradOp) {
+          sampleOpacity *= half(gradientOpacityTexture.sample(gradientOpacitySampler, float2(float(grad.w), 0.5), level(0)).r);
         }
+      } else if (doShading) {
+        // Fallback for "invisible" fuzz/noise to maintain baseline brightness
+        sampleColor = ambientMat * sampleColor;
+      }
 
-        half sampleOpacity = colorOpacity.a;
+      accumulatedColor += weight * sampleColor * sampleOpacity;
+      accumulatedOpacity += weight * sampleOpacity;
+      } // end ghost lighting bypass
+    }
 
-        if (sampleOpacity > 0.001h) {
-          half3 sampleColor = colorOpacity.rgb;
-          half weight = 1.0h - accumulatedOpacity;
-
-          if (sampleOpacity < 0.01h) {
-            accumulatedColor += weight * sampleColor * sampleOpacity;
-            accumulatedOpacity += weight * sampleOpacity;
-          } else {
-
-          if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
-            half4 grad = computeGradientFast(volumeTexture, volumeSampler, evalPoint, b.gradientStep.xyz, gradNormFactor);
-            sampleColor = computePhongLightingVolumeFast(sampleColor, grad.xyz, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
-
-            if (doGradOp) {
-              sampleOpacity *= half(gradientOpacityTexture.sample(gradientOpacitySampler, float2(float(grad.w), 0.5), level(0)).r);
-            }
-          } else if (doShading) {
-            sampleColor = ambientMat * sampleColor;
-          }
-
-          accumulatedColor += weight * sampleColor * sampleOpacity;
-          accumulatedOpacity += weight * sampleOpacity;
-          }
-        }
-
-        if (accumulatedOpacity >= 0.99h || currentT >= tTerminateMax) {
-          accumulatedOpacity = 1.0h;
-          break;
-        }
+    // Early Ray Termination (ERT)
+    if (accumulatedOpacity >= 0.99h || currentT >= tTerminateMax) {
+      accumulatedOpacity = 1.0h;
+      break;
     }
   }
 
@@ -1984,7 +1958,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
 fragment VolumeFragmentOut fragment_volume_instanced_main(
     VolumeVertexOut in [[stage_in]],
     bool isFrontFace [[front_facing]],
-    float4 prevAccum [[color(0), raster_order_group(0)]], // Thread sync ensures F2B execution
+    float4 prevAccum [[color(0)]], // Metal Framebuffer Fetch for inter-block opacity propagation
     constant VolumeMapperUniforms& u [[buffer(1)]],
     constant PerBlockData* blockData [[buffer(2)]],
     array<texture3d<float>, MAX_INSTANCED_BLOCKS> blockVolumes [[texture(0)]],
@@ -2025,13 +1999,8 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
   float3 texMaxGlobal = (b.textureBoundsMax.xyz - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
 
   // --- RAY SETUP ---
-  float2 ndcXY = (in.position.xy / u.viewportSize) * 2.0 - 1.0;
-  float4 farWorld = u.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, 1.0, 1.0);
-  float fw = abs(farWorld.w) < 1e-6f ? 1e-6f : farWorld.w;
-  float3 farLocal = ((farWorld.xyz / fw) - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
-  
   float3 cameraPos = u.cameraVolumePos.xyz;
-  float3 rayDir = farLocal - cameraPos;
+  float3 rayDir = in.localPos - cameraPos;
   float dirLength = length(rayDir);
   if (dirLength < 0.0001) discard_fragment();
   rayDir /= dirLength;
@@ -2042,13 +2011,16 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
 
   float3 entryPoint = cameraPos + rayDir * tStart;
   float3 exitPoint = cameraPos + rayDir * t.y;
+  float totalDist = length(exitPoint - entryPoint);
+  float stepSize = u.sampleDistance;
 
+  // Depth buffer occlusion
   float tTerminateMax = 1e30;
   float depthSample = depthTexture.sample(depthSampler, in.position.xy / u.viewportSize).r;
   if (depthSample < 1.0) {
+    float2 ndcXY = (in.position.xy / u.viewportSize) * 2.0 - 1.0;
     float4 worldTermination = u.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
-    float tw = abs(worldTermination.w) < 1e-6f ? 1e-6f : worldTermination.w;
-    float3 terminationLocal = ((worldTermination.xyz / tw) - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
+    float3 terminationLocal = ((worldTermination.xyz / worldTermination.w) - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
     tTerminateMax = dot(terminationLocal - cameraPos, rayDir);
   }
 
@@ -2109,19 +2081,14 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
   }
 
   // --- SOFTWARE PIPELINING INITIALIZATION ---
-  float stepSize = u.sampleDistance;
   float jitter = u.useJittering > 0.5 ? volume_random(in.position.xy) * stepSize : 0.0;
-  
-  // Create an aligned integer ray-step coordinate grid shared across all block bounds flawlessly
-  int k = int(floor((tStart - jitter) / stepSize));
-  float currentT = jitter + float(k) * stepSize;
-  while (currentT < tStart) {
-      k++;
-      currentT = jitter + float(k) * stepSize;
-  }
+  float currentT = jitter + ceil((tStart - jitter) / stepSize - 1e-4) * stepSize;
   if (currentT >= t.y) discard_fragment();
 
+  float3 stepVec = rayDir * stepSize;
   float3 currentPoint = cameraPos + rayDir * currentT;
+  float totalDistActual = t.y - currentT;
+  int maxSteps = min(max(1, int(ceil(totalDistActual / stepSize))), MAX_RAY_STEPS);
 
   // PREFETCH
   float3 texLocalPos0 = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
@@ -2135,8 +2102,8 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
   float3 mmDimF     = b.minMaxInfo.yzw;
 
   // --- THE RAYMARCHING LOOP ---
-  for (int stepCount = 0; stepCount < MAX_RAY_STEPS; stepCount++) {
-    if (currentT >= t.y) break;
+  for (int i = 0; i < maxSteps; i++) {
+    if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
 
     if (b.minMaxInfo.x > 0.5) {
       float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
@@ -2165,12 +2132,14 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
         tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
 
         float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
-        int skipSteps = int(floor(exactSkip / stepSize + 1e-4)) + 1;
+        float skipDist = (floor(exactSkip / stepSize + 1e-4) + 1.0) * stepSize;
 
-        // Directly jump indices retaining strict global alignment
-        k += skipSteps;
-        currentT = jitter + float(k) * stepSize;
+        currentT += skipDist;
         currentPoint = cameraPos + rayDir * currentT;
+
+        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y) {
+          break;
+        }
 
         prefetchScalar = as_type<float>(0x7fc00000u);
         curCell = int3(-1);
@@ -2189,13 +2158,13 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
       ? maskTexture.sample(maskSampler, evalPoint, level(0)).r
       : prefetchMask;
 
-    float3 evalWorldPos = currentPoint;
+    // 2. Advance ray trackers
+    float3 lastPoint = currentPoint;
+    currentPoint += stepVec;
+    currentT += stepSize;
 
-    k++;
-    currentT = jitter + float(k) * stepSize;
-    currentPoint = cameraPos + rayDir * currentT;
-
-    if (currentT < t.y) {
+    // 3. LAUNCH PREFETCH FOR NEXT ITERATION
+    if (i + 1 < maxSteps) {
       float3 nextTexLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
       float3 nextEvalPoint = nextTexLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
       prefetchScalar = blockVolumes[iid].sample(volumeSampler, nextEvalPoint, level(0)).r;
@@ -2205,70 +2174,60 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
     }
 
     // 4. MATH & EVALUATION
-    bool validSample = true;
-    
-    // Strict Half-Open Interval Ownership [min, max) -> Eliminates boundary duplication
-    if (evalWorldPos.x < blockMinGlobal.x && (blockMinGlobal.x > 0.0001f || evalWorldPos.x < -0.0001f)) validSample = false;
-    if (evalWorldPos.x >= blockMaxGlobal.x && (blockMaxGlobal.x < 0.9999f || evalWorldPos.x > 1.0001f)) validSample = false;
-    if (evalWorldPos.y < blockMinGlobal.y && (blockMinGlobal.y > 0.0001f || evalWorldPos.y < -0.0001f)) validSample = false;
-    if (evalWorldPos.y >= blockMaxGlobal.y && (blockMaxGlobal.y < 0.9999f || evalWorldPos.y > 1.0001f)) validSample = false;
-    if (evalWorldPos.z < blockMinGlobal.z && (blockMinGlobal.z > 0.0001f || evalWorldPos.z < -0.0001f)) validSample = false;
-    if (evalWorldPos.z >= blockMaxGlobal.z && (blockMaxGlobal.z < 0.9999f || evalWorldPos.z > 1.0001f)) validSample = false;
-
-    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, evalWorldPos))) == 0u)) {
-      validSample = false;
+    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, lastPoint))) == 0u)) {
+      continue;
     }
 
-    if (validSample) {
-        half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
-        half4 colorOpacity;
-        half maskLabel = 0.0h;
+    half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
 
-        if (doMask) {
-          float maskVal = rawMask * maskScale + maskBias;
-          if (numLabels > 0.0) {
-            maskLabel = half(floor(maskVal * numLabels) / numLabels);
-          }
-          if (maskLabel > 0.0h) {
-            colorOpacity = half4(labelMapTransferTexture.sample(labelMapSampler, float2(float(scalarNorm), float(maskLabel)), level(0)));
-          } else {
-            colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
-          }
-        } else {
-          colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+    half4 colorOpacity;
+    half maskLabel = 0.0h;
+
+    if (doMask) {
+      float maskVal = rawMask * maskScale + maskBias;
+      if (numLabels > 0.0) {
+        maskLabel = half(floor(maskVal * numLabels) / numLabels);
+      }
+      if (maskLabel > 0.0h) {
+        colorOpacity = half4(labelMapTransferTexture.sample(labelMapSampler, float2(float(scalarNorm), float(maskLabel)), level(0)));
+      } else {
+        colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+      }
+    } else {
+      colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+    }
+
+    half sampleOpacity = colorOpacity.a;
+
+    if (sampleOpacity > 0.001h) {
+      half3 sampleColor = colorOpacity.rgb;
+      half weight = 1.0h - accumulatedOpacity;
+
+      if (sampleOpacity < 0.01h) {
+        accumulatedColor += weight * sampleColor * sampleOpacity;
+        accumulatedOpacity += weight * sampleOpacity;
+      } else {
+
+      if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
+        half4 grad = computeGradientFast(blockVolumes[iid], volumeSampler, evalPoint, b.gradientStep.xyz, gradNormFactor);
+        sampleColor = computePhongLightingVolumeFast(sampleColor, grad.xyz, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
+
+        if (doGradOp) {
+          sampleOpacity *= half(gradientOpacityTexture.sample(gradientOpacitySampler, float2(float(grad.w), 0.5), level(0)).r);
         }
+      } else if (doShading) {
+        sampleColor = ambientMat * sampleColor;
+      }
 
-        half sampleOpacity = colorOpacity.a;
+      accumulatedColor += weight * sampleColor * sampleOpacity;
+      accumulatedOpacity += weight * sampleOpacity;
+      }
+    }
 
-        if (sampleOpacity > 0.001h) {
-          half3 sampleColor = colorOpacity.rgb;
-          half weight = 1.0h - accumulatedOpacity;
-
-          if (sampleOpacity < 0.01h) {
-            accumulatedColor += weight * sampleColor * sampleOpacity;
-            accumulatedOpacity += weight * sampleOpacity;
-          } else {
-
-          if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
-            half4 grad = computeGradientFast(blockVolumes[iid], volumeSampler, evalPoint, b.gradientStep.xyz, gradNormFactor);
-            sampleColor = computePhongLightingVolumeFast(sampleColor, grad.xyz, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
-
-            if (doGradOp) {
-              sampleOpacity *= half(gradientOpacityTexture.sample(gradientOpacitySampler, float2(float(grad.w), 0.5), level(0)).r);
-            }
-          } else if (doShading) {
-            sampleColor = ambientMat * sampleColor;
-          }
-
-          accumulatedColor += weight * sampleColor * sampleOpacity;
-          accumulatedOpacity += weight * sampleOpacity;
-          }
-        }
-
-        if (accumulatedOpacity >= 0.99h || currentT >= tTerminateMax) {
-          accumulatedOpacity = 1.0h;
-          break;
-        }
+    // Early Ray Termination
+    if (accumulatedOpacity >= 0.99h || currentT >= tTerminateMax) {
+      accumulatedOpacity = 1.0h;
+      break;
     }
   }
 
