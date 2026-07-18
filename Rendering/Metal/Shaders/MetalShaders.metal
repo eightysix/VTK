@@ -1434,6 +1434,7 @@ fragment VolumeFragmentOut fragment_volume_main(
 
   float3 entryPoint = cameraPos + rayDir * tStart;
   float3 exitPoint = cameraPos + rayDir * t.y;
+  float totalDist = length(exitPoint - entryPoint);
 
   float tTerminateMax = 1e30;
   float depthSample = depthTexture.sample(depthSampler, in.position.xy / volumeUniforms.viewportSize).r;
@@ -1525,9 +1526,8 @@ fragment VolumeFragmentOut fragment_volume_main(
 
   // --- THE RAYMARCHING LOOP ---
   for (int i = 0; i < maxSteps; i++) {
-    if (currentT >= t.y) {
-      break;
-    }
+    // Strict check to completely suppress smearing outside partitioned edges
+    if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
 
     // 0. MIN-MAX ACCELERATION
     if (b.minMaxInfo.x > 0.5) {
@@ -1561,7 +1561,7 @@ fragment VolumeFragmentOut fragment_volume_main(
         currentT += skipDist;
         currentPoint = cameraPos + rayDir * currentT;
 
-        if (currentT >= t.y) {
+        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y) {
           break;
         }
 
@@ -1570,8 +1570,6 @@ fragment VolumeFragmentOut fragment_volume_main(
         continue;
       }
     }
-
-    float evalT = currentT;
 
     // 1. Claim prefetched data
     float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
@@ -1600,10 +1598,6 @@ fragment VolumeFragmentOut fragment_volume_main(
     }
 
     // 4. MATH & EVALUATION
-    if (evalT < tStart) {
-      continue;
-    }
-
     if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, lastPoint))) == 0u)) {
       continue;
     }
@@ -1730,6 +1724,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
 
   float3 entryPoint = cameraPos + rayDir * tStart;
   float3 exitPoint = cameraPos + rayDir * t.y;
+  float totalDist = length(exitPoint - entryPoint);
 
   float tTerminateMax = 1e30;
   float depthSample = depthTexture.sample(depthSampler, in.position.xy / volumeUniforms.viewportSize).r;
@@ -1820,11 +1815,8 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
 
   // --- THE RAYMARCHING LOOP ---
   for (int i = 0; i < maxSteps; i++) {
-    if (currentT >= t.y) {
-      break;
-    }
+    if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
 
-    // 0. MIN-MAX CELL CACHE
     if (b.minMaxInfo.x > 0.5) {
       float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
       float3 mmPos = clamp(texLocalPos, float3(0.0), float3(1.0));
@@ -1856,7 +1848,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
         currentT += skipDist;
         currentPoint = cameraPos + rayDir * currentT;
 
-        if (currentT >= t.y) {
+        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y) {
           break;
         }
 
@@ -1865,8 +1857,6 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
         continue;
       }
     }
-
-    float evalT = currentT;
 
     // 1. Claim prefetched data
     float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
@@ -1895,10 +1885,6 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     }
 
     // 4. MATH & EVALUATION
-    if (evalT < tStart) {
-      continue;
-    }
-
     if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, lastPoint))) == 0u)) {
       continue;
     }
@@ -2117,11 +2103,8 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
 
   // --- THE RAYMARCHING LOOP ---
   for (int i = 0; i < maxSteps; i++) {
-    if (currentT >= t.y) {
-      break;
-    }
+    if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
 
-    // MIN-MAX CELL CACHE
     if (b.minMaxInfo.x > 0.5) {
       float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
       float3 mmPos = clamp(texLocalPos, float3(0.0), float3(1.0));
@@ -2154,7 +2137,7 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
         currentT += skipDist;
         currentPoint = cameraPos + rayDir * currentT;
 
-        if (currentT >= t.y) {
+        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y) {
           break;
         }
 
@@ -2163,8 +2146,6 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
         continue;
       }
     }
-
-    float evalT = currentT;
 
     // 1. Claim prefetched data
     float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
@@ -2193,10 +2174,6 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
     }
 
     // 4. MATH & EVALUATION
-    if (evalT < tStart) {
-      continue;
-    }
-
     if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, lastPoint))) == 0u)) {
       continue;
     }
