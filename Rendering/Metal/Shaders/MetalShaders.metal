@@ -1316,6 +1316,24 @@ vertex VolumeVertexOut vertex_volume_main(
   return out;
 }
 
+// Accumulation vertex shader: scales unit cube [0,1] to this block's model-space
+// bounds via PerBlockData. Used by the accumulation pipeline (>8 blocks path)
+// where vertex_buffer_main's unit-cube vertices need per-block scaling.
+vertex VolumeVertexOut vertex_volume_accum_main(
+    VolumeVertexIn in [[stage_in]],
+    constant VolumeMapperUniforms& u [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]])
+{
+  VolumeVertexOut out;
+  float3 modelPos = b.volumeBoundsMin.xyz
+                  + in.position * (b.volumeBoundsMax.xyz - b.volumeBoundsMin.xyz);
+  out.position = u.viewProjection * u.volumeToWorld * float4(modelPos, 1.0);
+  out.localPos = (modelPos - u.volumeBoundsMin.xyz)
+               / (u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz);
+  out.instanceID = 0;
+  return out;
+}
+
 vertex VolumeVertexOut vertex_volume_instanced_main(
     uint vid [[vertex_id]],
     uint iid [[instance_id]],
@@ -1411,16 +1429,20 @@ fragment VolumeFragmentOut fragment_volume_main(
     sampler labelMapGradOpSampler [[sampler(6)]],
     sampler minMaxSampler [[sampler(7)]]) {
 
-  if (!isFrontFace) discard_fragment();
-
-  VolumeFragmentOut output;
+  // FIX: Compute bounds early to check if camera is inside this block
   float3 blockMinGlobal = (b.volumeBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
   float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  bool cameraInsideBlock = all(cameraPos >= blockMinGlobal - 1e-4) && all(cameraPos <= blockMaxGlobal + 1e-4);
+
+  // FIX: Only discard backfaces if the camera is strictly outside the block
+  if (!isFrontFace && !cameraInsideBlock) discard_fragment();
+
+  VolumeFragmentOut output;
 
   float3 texMinGlobal = (b.textureBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
   float3 texMaxGlobal = (b.textureBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
 
-  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
   float stepSize = volumeUniforms.sampleDistance;
 
   float3 rayDir = in.localPos - cameraPos;
@@ -1691,7 +1713,14 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     sampler labelMapGradOpSampler [[sampler(6)]],
     sampler minMaxSampler [[sampler(7)]]) {
 
-  if (!isFrontFace) discard_fragment();
+  // FIX: Compute bounds early to check if camera is inside this block
+  float3 blockMinGlobal = (b.volumeBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  bool cameraInsideBlock = all(cameraPos >= blockMinGlobal - 1e-4) && all(cameraPos <= blockMaxGlobal + 1e-4);
+
+  // FIX: Only discard backfaces if the camera is strictly outside the block
+  if (!isFrontFace && !cameraInsideBlock) discard_fragment();
 
   VolumeFragmentOut output;
 
@@ -1704,13 +1733,9 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
   half3 accumulatedColor = half3(prevAccum.rgb);
   half accumulatedOpacity = half(prevAccum.a);
 
-  float3 blockMinGlobal = (b.volumeBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-  float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-
   float3 texMinGlobal = (b.textureBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
   float3 texMaxGlobal = (b.textureBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
 
-  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
   float stepSize = volumeUniforms.sampleDistance;
 
   float3 rayDir = in.localPos - cameraPos;
@@ -1958,7 +1983,6 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
 fragment VolumeFragmentOut fragment_volume_instanced_main(
     VolumeVertexOut in [[stage_in]],
     bool isFrontFace [[front_facing]],
-    float4 prevAccum [[color(0)]], // Metal Framebuffer Fetch for inter-block opacity propagation
     constant VolumeMapperUniforms& u [[buffer(1)]],
     constant PerBlockData* blockData [[buffer(2)]],
     array<texture3d<float>, MAX_INSTANCED_BLOCKS> blockVolumes [[texture(0)]],
@@ -1978,28 +2002,26 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
     sampler labelMapGradOpSampler [[sampler(6)]],
     sampler minMaxSampler [[sampler(7)]])
 {
-  if (!isFrontFace) discard_fragment();
-
-  VolumeFragmentOut output;
+  // FIX: Compute bounds early to check if camera is inside this block
   uint iid = in.instanceID;
   PerBlockData b = blockData[iid];
-
-  // Global ERT: skip if previous blocks already made this pixel opaque
-  if (prevAccum.a >= 0.99h) {
-    discard_fragment();
-  }
-
-  half3 accumulatedColor = half3(prevAccum.rgb);
-  half accumulatedOpacity = half(prevAccum.a);
-
   float3 blockMinGlobal = (b.volumeBoundsMin.xyz - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
   float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
+  float3 cameraPos = u.cameraVolumePos.xyz;
+  bool cameraInsideBlock = all(cameraPos >= blockMinGlobal - 1e-4) && all(cameraPos <= blockMaxGlobal + 1e-4);
+
+  // FIX: Only discard backfaces if the camera is strictly outside the block
+  if (!isFrontFace && !cameraInsideBlock) discard_fragment();
+
+  VolumeFragmentOut output;
+
+  half3 accumulatedColor = half3(0.0);
+  half accumulatedOpacity = half(0.0);
 
   float3 texMinGlobal = (b.textureBoundsMin.xyz - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
   float3 texMaxGlobal = (b.textureBoundsMax.xyz - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
 
   // --- RAY SETUP ---
-  float3 cameraPos = u.cameraVolumePos.xyz;
   float3 rayDir = in.localPos - cameraPos;
   float dirLength = length(rayDir);
   if (dirLength < 0.0001) discard_fragment();

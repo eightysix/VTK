@@ -612,11 +612,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           {
             VolumeBlock block;
             block.Extents[0] = fullExt[0] + i * deltaX;
-            block.Extents[1] = (i == nx - 1) ? fullExt[1] : std::min(fullExt[0] + (i + 1) * deltaX, fullExt[1]);
+            block.Extents[1] = (i == nx - 1) ? fullExt[1] : (fullExt[0] + (i + 1) * deltaX - 1);
             block.Extents[2] = fullExt[2] + j * deltaY;
-            block.Extents[3] = (j == ny - 1) ? fullExt[3] : std::min(fullExt[2] + (j + 1) * deltaY, fullExt[3]);
+            block.Extents[3] = (j == ny - 1) ? fullExt[3] : (fullExt[2] + (j + 1) * deltaY - 1);
             block.Extents[4] = fullExt[4] + k * deltaZ;
-            block.Extents[5] = (k == nz - 1) ? fullExt[5] : std::min(fullExt[4] + (k + 1) * deltaZ, fullExt[5]);
+            block.Extents[5] = (k == nz - 1) ? fullExt[5] : (fullExt[4] + (k + 1) * deltaZ - 1);
             this->Blocks.push_back(block);
           }
         }
@@ -1987,10 +1987,10 @@ void vtkMetalGPUVolumeRayCastMapper::SortBlocksBackToFront(
     }
   }
 
-  // Sort by distance to camera (closest first = front-to-back)
-  // Front-to-back ordering enables inter-block opacity propagation:
-  // the accumulation shader reads previous blocks' opacity via framebuffer fetch
-  // and can discard early if the pixel is already opaque.
+  // Sort by distance to camera (farthest first = back-to-front)
+  // Back-to-front ordering with hardware alpha blending ensures correct
+  // compositing without framebuffer fetch race conditions. An opaque front
+  // block will correctly occlude back blocks even with minor sort errors.
   std::sort(this->SortedBlockOrder.begin(), this->SortedBlockOrder.end(),
     [&](int a, int b) {
       double da = (this->Blocks[a].Center[0] - camPos[0]) * camDir[0] +
@@ -1999,7 +1999,7 @@ void vtkMetalGPUVolumeRayCastMapper::SortBlocksBackToFront(
       double db = (this->Blocks[b].Center[0] - camPos[0]) * camDir[0] +
         (this->Blocks[b].Center[1] - camPos[1]) * camDir[1] +
         (this->Blocks[b].Center[2] - camPos[2]) * camDir[2];
-      return da < db; // closest first (front-to-back)
+      return da > db; // farthest first (back-to-front)
     });
 }
 
@@ -2887,6 +2887,13 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
     // Check if camera is inside the volume
     bool cameraInside = this->IsCameraInside(ren, vol);
 
+    // FIX: Force the unit cube vertex buffer when blocks are present.
+    // The hardware will clip the unit cube against the near plane.
+    if (!this->Blocks.empty())
+    {
+      cameraInside = false;
+    }
+
     // Check if geometry needs rebuild
     bool needsVertexRebuild = !this->VertexBuffer;
     needsVertexRebuild |= (this->VolumeUploadTime.GetMTime() > this->VertexBufferUploadTime.GetMTime());
@@ -3414,8 +3421,15 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     // block's accumulated color/opacity via Metal framebuffer fetch ([[color(0)]],
     // enabling global early ray termination across block boundaries.
     MTLRenderPipelineDescriptor* accumDesc = [[MTLRenderPipelineDescriptor alloc] init];
-    accumDesc.vertexFunction = vertexFunc;
-    accumDesc.fragmentFunction = [library newFunctionWithName:@"fragment_volume_accum_main"];
+    id<MTLFunction> accumVertexFunc = [library newFunctionWithName:@"vertex_volume_accum_main"];
+    id<MTLFunction> accumFragFunc = [library newFunctionWithName:@"fragment_volume_accum_main"];
+    if (!accumVertexFunc || !accumFragFunc)
+    {
+      vtkErrorMacro("Failed to find volume accumulation shader functions");
+      return false;
+    }
+    accumDesc.vertexFunction = accumVertexFunc;
+    accumDesc.fragmentFunction = accumFragFunc;
     accumDesc.vertexDescriptor = vertexDesc;
     accumDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
     accumDesc.colorAttachments[0].blendingEnabled = NO; // Shader handles compositing manually
@@ -3438,9 +3452,10 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     this->AccumulationPipelineState = (__bridge void*)accumPso;
     CFRetain((__bridge CFTypeRef)accumPso);
 
-    // Create instanced pipeline for single-ddraw block rendering (<= 8 blocks).
+    // Create instanced pipeline for block rendering.
     // Uses vertex_volume_instanced_main + fragment_volume_instanced_main which
     // index into PerBlockData and texture arrays by [[instance_id]].
+    // Hardware blending (back-to-front) eliminates framebuffer fetch race conditions.
     if (!this->InstancedPipelineState)
     {
       MTLRenderPipelineDescriptor* instDesc = [[MTLRenderPipelineDescriptor alloc] init];
@@ -3448,7 +3463,13 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       instDesc.fragmentFunction = [library newFunctionWithName:@"fragment_volume_instanced_main"];
       instDesc.vertexDescriptor = vertexDesc;
       instDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
-      instDesc.colorAttachments[0].blendingEnabled = NO; // Shader handles compositing via framebuffer fetch
+      instDesc.colorAttachments[0].blendingEnabled = YES;
+      instDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+      instDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+      instDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+      instDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+      instDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+      instDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
       instDesc.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
       instDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
       instDesc.rasterSampleCount = sampleCount;
@@ -3628,101 +3649,20 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
   {
     this->SortBlocksBackToFront(ren, vol);
 
-    // --- INSTANCED PATH (<= 8 blocks): single draw call for all blocks ---
-    if (this->SortedBlockOrder.size() <= MAX_INSTANCED_BLOCKS && this->InstancedPipelineState)
+    // Use instanced pipeline for ALL partitioned volumes.
+    // Renders in chunks of MAX_INSTANCED_BLOCKS with hardware alpha blending
+    // (back-to-front). This eliminates framebuffer fetch race conditions and
+    // is robust to minor sorting errors.
+    if (this->InstancedPipelineState)
     {
-      // Switch to instanced pipeline
       id<MTLRenderPipelineState> instPso =
         (__bridge id<MTLRenderPipelineState>)this->InstancedPipelineState;
       [encoder setRenderPipelineState:instPso];
 
-      PerBlockData perBlockData[MAX_INSTANCED_BLOCKS] = {};
-      id<MTLTexture> volTexArray[MAX_INSTANCED_BLOCKS] = {nil};
-      id<MTLTexture> mmTexArray[MAX_INSTANCED_BLOCKS] = {nil};
-
-      // Fallback textures to avoid nil binds
       id<MTLTexture> fallbackTex = (__bridge id<MTLTexture>)this->VolumeTexture;
+      size_t numBlocks = this->SortedBlockOrder.size();
 
-      double* camPosWorld = ren->GetActiveCamera()->GetPosition();
-
-      for (size_t i = 0; i < this->SortedBlockOrder.size(); ++i)
-      {
-        int si = this->SortedBlockOrder[i];
-        auto& block = this->Blocks[si];
-
-        perBlockData[i].VolumeBoundsMin[0] = static_cast<float>(block.BoundsMin[0]);
-        perBlockData[i].VolumeBoundsMin[1] = static_cast<float>(block.BoundsMin[1]);
-        perBlockData[i].VolumeBoundsMin[2] = static_cast<float>(block.BoundsMin[2]);
-        perBlockData[i].VolumeBoundsMin[3] = 1.0f;
-
-        perBlockData[i].VolumeBoundsMax[0] = static_cast<float>(block.BoundsMax[0]);
-        perBlockData[i].VolumeBoundsMax[1] = static_cast<float>(block.BoundsMax[1]);
-        perBlockData[i].VolumeBoundsMax[2] = static_cast<float>(block.BoundsMax[2]);
-        perBlockData[i].VolumeBoundsMax[3] = 1.0f;
-
-        int texExt[6] = {
-          std::max(fullExt[0], block.Extents[0] - 1),
-          std::min(fullExt[1], block.Extents[1] + 1),
-          std::max(fullExt[2], block.Extents[2] - 1),
-          std::min(fullExt[3], block.Extents[3] + 1),
-          std::max(fullExt[4], block.Extents[4] - 1),
-          std::min(fullExt[5], block.Extents[5] + 1)
-        };
-
-        perBlockData[i].TextureBoundsMin[0] = static_cast<float>(origin[0] + texExt[0] * spacing[0]);
-        perBlockData[i].TextureBoundsMin[1] = static_cast<float>(origin[1] + texExt[2] * spacing[1]);
-        perBlockData[i].TextureBoundsMin[2] = static_cast<float>(origin[2] + texExt[4] * spacing[2]);
-        perBlockData[i].TextureBoundsMin[3] = 1.0f;
-
-        perBlockData[i].TextureBoundsMax[0] = static_cast<float>(origin[0] + texExt[1] * spacing[0]);
-        perBlockData[i].TextureBoundsMax[1] = static_cast<float>(origin[1] + texExt[3] * spacing[1]);
-        perBlockData[i].TextureBoundsMax[2] = static_cast<float>(origin[2] + texExt[5] * spacing[2]);
-        perBlockData[i].TextureBoundsMax[3] = 1.0f;
-
-        // Gradient step for this block's dimensions
-        for (int k = 0; k < 3; ++k)
-        {
-          perBlockData[i].GradientStep[k] =
-            (block.Dims[k] > 0) ? 1.0f / block.Dims[k] : 1.0f;
-        }
-        perBlockData[i].GradientStep[3] = 0.0f;
-
-        // Min-max info
-        if (block.MinMaxTexture)
-        {
-          perBlockData[i].MinMaxInfo[0] = 1.0f;
-          perBlockData[i].MinMaxInfo[1] = static_cast<float>(block.MinMaxDims[0]);
-          perBlockData[i].MinMaxInfo[2] = static_cast<float>(block.MinMaxDims[1]);
-          perBlockData[i].MinMaxInfo[3] = static_cast<float>(block.MinMaxDims[2]);
-        }
-        else
-        {
-          perBlockData[i].MinMaxInfo[0] = 0.0f;
-          perBlockData[i].MinMaxInfo[1] = 0.0f;
-          perBlockData[i].MinMaxInfo[2] = 0.0f;
-          perBlockData[i].MinMaxInfo[3] = 0.0f;
-        }
-
-        volTexArray[i] = (__bridge id<MTLTexture>)block.Texture;
-        mmTexArray[i] = block.MinMaxTexture
-          ? (__bridge id<MTLTexture>)block.MinMaxTexture
-          : fallbackTex;
-      }
-
-      // Bind per-block data buffer at index 2 (vertex + fragment)
-      [encoder setVertexBytes:perBlockData
-                       length:sizeof(PerBlockData) * MAX_INSTANCED_BLOCKS
-                      atIndex:2];
-      [encoder setFragmentBytes:perBlockData
-                         length:sizeof(PerBlockData) * MAX_INSTANCED_BLOCKS
-                        atIndex:2];
-
-      // Bind block volume textures as array at fragment texture indices 0..7
-      [encoder setFragmentTextures:volTexArray withRange:NSMakeRange(0, MAX_INSTANCED_BLOCKS)];
-      // Bind block min-max textures as array at fragment texture indices 8..15
-      [encoder setFragmentTextures:mmTexArray withRange:NSMakeRange(8, MAX_INSTANCED_BLOCKS)];
-
-      // Bind shared textures at offset indices (16+) for the instanced shader
+      // Bind shared textures (once, before chunk loop)
       id<MTLTexture> tfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
       id<MTLSamplerState> tfSamp = (__bridge id<MTLSamplerState>)this->ColorOpacitySampler;
       [encoder setFragmentTexture:tfTex atIndex:16];
@@ -3742,7 +3682,6 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
         [encoder setFragmentSamplerState:tfSamp atIndex:2];
       }
 
-      // Gradient opacity
       if (this->GradientOpacityTexture)
       {
         id<MTLTexture> goTex = (__bridge id<MTLTexture>)this->GradientOpacityTexture;
@@ -3756,7 +3695,6 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
         [encoder setFragmentSamplerState:tfSamp atIndex:3];
       }
 
-      // Mask
       if (this->MaskTexture)
       {
         id<MTLTexture> maskTex = (__bridge id<MTLTexture>)this->MaskTexture;
@@ -3771,7 +3709,6 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
         [encoder setFragmentSamplerState:volSamp atIndex:4];
       }
 
-      // Label map transfer
       if (this->LabelMapTransferTexture)
       {
         id<MTLTexture> lmTex = (__bridge id<MTLTexture>)this->LabelMapTransferTexture;
@@ -3785,7 +3722,6 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
         [encoder setFragmentSamplerState:tfSamp atIndex:5];
       }
 
-      // Label map gradient opacity
       if (this->LabelMapGradientOpacityTexture)
       {
         id<MTLTexture> lgoTex = (__bridge id<MTLTexture>)this->LabelMapGradientOpacityTexture;
@@ -3799,99 +3735,109 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
         [encoder setFragmentSamplerState:tfSamp atIndex:6];
       }
 
-      // Min-max sampler
       id<MTLSamplerState> mmSamp = (__bridge id<MTLSamplerState>)this->MinMaxSampler;
       [encoder setFragmentSamplerState:mmSamp atIndex:7];
 
-      // Volume sampler (shared across all blocks)
       id<MTLSamplerState> volSamp = (__bridge id<MTLSamplerState>)this->VolumeSampler;
       [encoder setFragmentSamplerState:volSamp atIndex:1];
 
-      // SINGLE INSTANCED DRAW CALL
-      [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                          indexCount:this->IndexCount
-                           indexType:MTLIndexTypeUInt32
-                         indexBuffer:indexBuf
-                   indexBufferOffset:0
-                       instanceCount:this->SortedBlockOrder.size()];
+      // Render in chunks of MAX_INSTANCED_BLOCKS
+      for (size_t chunkStart = 0; chunkStart < numBlocks; chunkStart += MAX_INSTANCED_BLOCKS)
+      {
+        size_t chunkSize = std::min(MAX_INSTANCED_BLOCKS, numBlocks - chunkStart);
+
+        PerBlockData perBlockData[MAX_INSTANCED_BLOCKS] = {};
+        id<MTLTexture> volTexArray[MAX_INSTANCED_BLOCKS] = {nil};
+        id<MTLTexture> mmTexArray[MAX_INSTANCED_BLOCKS] = {nil};
+
+        for (size_t i = 0; i < chunkSize; ++i)
+        {
+          int si = this->SortedBlockOrder[chunkStart + i];
+          auto& block = this->Blocks[si];
+
+          perBlockData[i].VolumeBoundsMin[0] = static_cast<float>(block.BoundsMin[0]);
+          perBlockData[i].VolumeBoundsMin[1] = static_cast<float>(block.BoundsMin[1]);
+          perBlockData[i].VolumeBoundsMin[2] = static_cast<float>(block.BoundsMin[2]);
+          perBlockData[i].VolumeBoundsMin[3] = 1.0f;
+
+          perBlockData[i].VolumeBoundsMax[0] = static_cast<float>(block.BoundsMax[0]);
+          perBlockData[i].VolumeBoundsMax[1] = static_cast<float>(block.BoundsMax[1]);
+          perBlockData[i].VolumeBoundsMax[2] = static_cast<float>(block.BoundsMax[2]);
+          perBlockData[i].VolumeBoundsMax[3] = 1.0f;
+
+          int texExt[6] = {
+            std::max(fullExt[0], block.Extents[0] - 1),
+            std::min(fullExt[1], block.Extents[1] + 1),
+            std::max(fullExt[2], block.Extents[2] - 1),
+            std::min(fullExt[3], block.Extents[3] + 1),
+            std::max(fullExt[4], block.Extents[4] - 1),
+            std::min(fullExt[5], block.Extents[5] + 1)
+          };
+
+          perBlockData[i].TextureBoundsMin[0] = static_cast<float>(origin[0] + texExt[0] * spacing[0]);
+          perBlockData[i].TextureBoundsMin[1] = static_cast<float>(origin[1] + texExt[2] * spacing[1]);
+          perBlockData[i].TextureBoundsMin[2] = static_cast<float>(origin[2] + texExt[4] * spacing[2]);
+          perBlockData[i].TextureBoundsMin[3] = 1.0f;
+
+          perBlockData[i].TextureBoundsMax[0] = static_cast<float>(origin[0] + texExt[1] * spacing[0]);
+          perBlockData[i].TextureBoundsMax[1] = static_cast<float>(origin[1] + texExt[3] * spacing[1]);
+          perBlockData[i].TextureBoundsMax[2] = static_cast<float>(origin[2] + texExt[5] * spacing[2]);
+          perBlockData[i].TextureBoundsMax[3] = 1.0f;
+
+          for (int k = 0; k < 3; ++k)
+          {
+            perBlockData[i].GradientStep[k] =
+              (block.Dims[k] > 0) ? 1.0f / block.Dims[k] : 1.0f;
+          }
+          perBlockData[i].GradientStep[3] = 0.0f;
+
+          if (block.MinMaxTexture)
+          {
+            perBlockData[i].MinMaxInfo[0] = 1.0f;
+            perBlockData[i].MinMaxInfo[1] = static_cast<float>(block.MinMaxDims[0]);
+            perBlockData[i].MinMaxInfo[2] = static_cast<float>(block.MinMaxDims[1]);
+            perBlockData[i].MinMaxInfo[3] = static_cast<float>(block.MinMaxDims[2]);
+          }
+          else
+          {
+            perBlockData[i].MinMaxInfo[0] = 0.0f;
+            perBlockData[i].MinMaxInfo[1] = 0.0f;
+            perBlockData[i].MinMaxInfo[2] = 0.0f;
+            perBlockData[i].MinMaxInfo[3] = 0.0f;
+          }
+
+          volTexArray[i] = (__bridge id<MTLTexture>)block.Texture;
+          mmTexArray[i] = block.MinMaxTexture
+            ? (__bridge id<MTLTexture>)block.MinMaxTexture
+            : fallbackTex;
+        }
+
+        // Fill remaining slots to avoid nil binds
+        for (size_t i = chunkSize; i < MAX_INSTANCED_BLOCKS; ++i)
+        {
+          volTexArray[i] = fallbackTex;
+          mmTexArray[i] = fallbackTex;
+          perBlockData[i] = perBlockData[chunkSize > 0 ? chunkSize - 1 : 0];
+        }
+
+        [encoder setVertexBytes:perBlockData
+                         length:sizeof(PerBlockData) * MAX_INSTANCED_BLOCKS
+                        atIndex:2];
+        [encoder setFragmentBytes:perBlockData
+                           length:sizeof(PerBlockData) * MAX_INSTANCED_BLOCKS
+                          atIndex:2];
+
+        [encoder setFragmentTextures:volTexArray withRange:NSMakeRange(0, MAX_INSTANCED_BLOCKS)];
+        [encoder setFragmentTextures:mmTexArray withRange:NSMakeRange(8, MAX_INSTANCED_BLOCKS)];
+
+        [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                            indexCount:this->IndexCount
+                             indexType:MTLIndexTypeUInt32
+                           indexBuffer:indexBuf
+                     indexBufferOffset:0
+                         instanceCount:chunkSize];
+      }
       return;
-    }
-
-    // --- FALLBACK PATH (> 8 blocks): per-block loop ---
-    for (size_t bi = 0; bi < this->SortedBlockOrder.size(); ++bi)
-    {
-      int si = this->SortedBlockOrder[bi];
-      auto& block = this->Blocks[si];
-
-      PerBlockData pbd;
-      pbd.VolumeBoundsMin[0] = static_cast<float>(block.BoundsMin[0]);
-      pbd.VolumeBoundsMin[1] = static_cast<float>(block.BoundsMin[1]);
-      pbd.VolumeBoundsMin[2] = static_cast<float>(block.BoundsMin[2]);
-      pbd.VolumeBoundsMin[3] = 1.0f;
-
-      pbd.VolumeBoundsMax[0] = static_cast<float>(block.BoundsMax[0]);
-      pbd.VolumeBoundsMax[1] = static_cast<float>(block.BoundsMax[1]);
-      pbd.VolumeBoundsMax[2] = static_cast<float>(block.BoundsMax[2]);
-      pbd.VolumeBoundsMax[3] = 1.0f;
-
-      int texExt[6] = {
-        std::max(fullExt[0], block.Extents[0] - 1),
-        std::min(fullExt[1], block.Extents[1] + 1),
-        std::max(fullExt[2], block.Extents[2] - 1),
-        std::min(fullExt[3], block.Extents[3] + 1),
-        std::max(fullExt[4], block.Extents[4] - 1),
-        std::min(fullExt[5], block.Extents[5] + 1)
-      };
-
-      pbd.TextureBoundsMin[0] = static_cast<float>(origin[0] + texExt[0] * spacing[0]);
-      pbd.TextureBoundsMin[1] = static_cast<float>(origin[1] + texExt[2] * spacing[1]);
-      pbd.TextureBoundsMin[2] = static_cast<float>(origin[2] + texExt[4] * spacing[2]);
-      pbd.TextureBoundsMin[3] = 1.0f;
-
-      pbd.TextureBoundsMax[0] = static_cast<float>(origin[0] + texExt[1] * spacing[0]);
-      pbd.TextureBoundsMax[1] = static_cast<float>(origin[1] + texExt[3] * spacing[1]);
-      pbd.TextureBoundsMax[2] = static_cast<float>(origin[2] + texExt[5] * spacing[2]);
-      pbd.TextureBoundsMax[3] = 1.0f;
-
-      for (int k = 0; k < 3; ++k)
-      {
-        pbd.GradientStep[k] = (block.Dims[k] > 0) ? 1.0f / block.Dims[k] : 1.0f;
-      }
-      pbd.GradientStep[3] = 0.0f;
-
-      if (block.MinMaxTexture)
-      {
-        pbd.MinMaxInfo[0] = 1.0f;
-        pbd.MinMaxInfo[1] = static_cast<float>(block.MinMaxDims[0]);
-        pbd.MinMaxInfo[2] = static_cast<float>(block.MinMaxDims[1]);
-        pbd.MinMaxInfo[3] = static_cast<float>(block.MinMaxDims[2]);
-
-        id<MTLTexture> blockMmTex = (__bridge id<MTLTexture>)block.MinMaxTexture;
-        [encoder setFragmentTexture:blockMmTex atIndex:7];
-        id<MTLSamplerState> mmSamp = (__bridge id<MTLSamplerState>)this->MinMaxSampler;
-        [encoder setFragmentSamplerState:mmSamp atIndex:7];
-      }
-      else
-      {
-        pbd.MinMaxInfo[0] = 0.0f;
-        pbd.MinMaxInfo[1] = 0.0f;
-        pbd.MinMaxInfo[2] = 0.0f;
-        pbd.MinMaxInfo[3] = 0.0f;
-      }
-
-      [encoder setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
-      [encoder setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
-
-      // Bind this block's 3D texture (scalar data)
-      id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture;
-      [encoder setFragmentTexture:blockTex atIndex:0];
-
-      // Draw
-      [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                          indexCount:this->IndexCount
-                           indexType:MTLIndexTypeUInt32
-                         indexBuffer:indexBuf
-                   indexBufferOffset:0];
     }
   }
   else
