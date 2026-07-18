@@ -3209,19 +3209,9 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     this->PipelineState = nullptr;
   }
 
-  // Also invalidate accumulation pipeline when sample count changes
-  if (this->AccumulationPipelineState && sampleCount != this->CurrentSampleCount)
-  {
-    CFRelease(this->AccumulationPipelineState);
-    this->AccumulationPipelineState = nullptr;
-  }
-
-  // Also invalidate instanced pipeline when sample count changes
-  if (this->InstancedPipelineState && sampleCount != this->CurrentSampleCount)
-  {
-    CFRelease(this->InstancedPipelineState);
-    this->InstancedPipelineState = nullptr;
-  }
+  // Accumulation and instanced pipelines are always rasterSampleCount=1
+  // (used only for offscreen rendering), so they don't need invalidation
+  // when the window's MSAA sample count changes.
 
   if (this->PipelineState)
   {
@@ -3417,6 +3407,8 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     // This pipeline uses fragment_volume_accum_main which reads the previous
     // block's accumulated color/opacity via Metal framebuffer fetch ([[color(0)]],
     // enabling global early ray termination across block boundaries.
+    // Always use rasterSampleCount = 1 because this pipeline is only used for
+    // offscreen rendering (image-sample path), where the render pass is always 1x.
     MTLRenderPipelineDescriptor* accumDesc = [[MTLRenderPipelineDescriptor alloc] init];
     accumDesc.vertexFunction = vertexFunc;
     accumDesc.fragmentFunction = [library newFunctionWithName:@"fragment_volume_accum_main"];
@@ -3425,7 +3417,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     accumDesc.colorAttachments[0].blendingEnabled = NO; // Shader handles compositing manually
     accumDesc.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
     accumDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-    accumDesc.rasterSampleCount = sampleCount;
+    accumDesc.rasterSampleCount = 1;
 
     id<MTLRenderPipelineState> accumPso =
       [device newRenderPipelineStateWithDescriptor:accumDesc error:&error];
@@ -3445,6 +3437,8 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     // Create instanced pipeline for single-ddraw block rendering (<= 8 blocks).
     // Uses vertex_volume_instanced_main + fragment_volume_instanced_main which
     // index into PerBlockData and texture arrays by [[instance_id]].
+    // Always use rasterSampleCount = 1 because this pipeline is only used for
+    // offscreen rendering (image-sample path), where the render pass is always 1x.
     if (!this->InstancedPipelineState)
     {
       MTLRenderPipelineDescriptor* instDesc = [[MTLRenderPipelineDescriptor alloc] init];
@@ -3455,7 +3449,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       instDesc.colorAttachments[0].blendingEnabled = NO; // Shader handles compositing via framebuffer fetch
       instDesc.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
       instDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-      instDesc.rasterSampleCount = sampleCount;
+      instDesc.rasterSampleCount = 1;
 
       NSError* instError = nil;
       id<MTLRenderPipelineState> instPso =
@@ -4494,11 +4488,15 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     // pipeline for single-block rendering.
     // Note: use Blocks.size() here because SortedBlockOrder isn't populated
     // until SortBlocksBackToFront is called inside DrawBlocks.
-    int currentSampleCount = metalRenderWindow->GetEffectiveSampleCount();
+    // The offscreen pass is always rasterSampleCount=1, so the accumulation
+    // and instanced pipelines (also rasterSampleCount=1) are always valid.
+    // DisableInstanceRendering must be checked here so the fallback path in
+    // DrawBlocks gets the correct pipeline (accumulation, not instanced).
     bool useInstanced = !this->Blocks.empty() &&
+      !this->DisableInstanceRendering &&
       this->Blocks.size() <= MAX_INSTANCED_BLOCKS &&
-      this->InstancedPipelineState && (currentSampleCount == 1);
-    bool useAccumulation = !useInstanced && !this->Blocks.empty() && (currentSampleCount == 1);
+      this->InstancedPipelineState;
+    bool useAccumulation = !useInstanced && !this->Blocks.empty();
     void* activePipeline = useInstanced ? this->InstancedPipelineState
       : (useAccumulation ? this->AccumulationPipelineState : this->PipelineState);
     this->BindEncoderResources(offscreenEncoder, uniformBuf, activePipeline);
