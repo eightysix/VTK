@@ -3633,7 +3633,8 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
     this->SortBlocksBackToFront(ren, vol);
 
     // --- INSTANCED PATH (<= 8 blocks): single draw call for all blocks ---
-    if (this->SortedBlockOrder.size() <= MAX_INSTANCED_BLOCKS && this->InstancedPipelineState)
+    if (!this->DisableInstanceRendering &&
+        this->SortedBlockOrder.size() <= MAX_INSTANCED_BLOCKS && this->InstancedPipelineState)
     {
       // Switch to instanced pipeline
       id<MTLRenderPipelineState> instPso =

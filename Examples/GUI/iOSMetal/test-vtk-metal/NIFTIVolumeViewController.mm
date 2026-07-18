@@ -63,6 +63,7 @@
   mapper->AutoAdjustSampleDistancesOff();
   mapper->SetSampleDistance(0.5);
   mapper->SetPartitions(1, 1, 4);
+  mapper->SetDisableInstanceRendering(true);
 
   // Simple linear preset to verify volume renders at all
   vtkNew<vtkColorTransferFunction> colorFunc;

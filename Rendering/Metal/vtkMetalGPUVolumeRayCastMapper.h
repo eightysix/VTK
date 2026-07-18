@@ -60,6 +60,14 @@ public:
    */
   void SetPartitions(unsigned short x, unsigned short y, unsigned short z);
 
+  /**
+   * When set to true, instance rendering is disabled and blocks are drawn
+   * individually even when there are fewer than 8 blocks.  This is useful
+   * for debugging or for hardware that has issues with instanced draws.
+   */
+  vtkSetMacro(DisableInstanceRendering, bool);
+  vtkGetMacro(DisableInstanceRendering, bool);
+
 protected:
   vtkMetalGPUVolumeRayCastMapper();
   ~vtkMetalGPUVolumeRayCastMapper() override;
@@ -173,6 +181,7 @@ private:
   };
 
   unsigned short Partitions[3] = { 1, 1, 1 };
+  bool DisableInstanceRendering = false;
   std::vector<VolumeBlock> Blocks;
   std::vector<int> SortedBlockOrder; // indices into Blocks, sorted back-to-front
 
