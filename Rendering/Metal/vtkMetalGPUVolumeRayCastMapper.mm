@@ -3410,18 +3410,29 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     this->CurrentSampleCount = sampleCount;
 
     // Create accumulation pipeline for inter-block opacity propagation.
-    // This pipeline uses fragment_volume_accum_main which reads the previous
-    // block's accumulated color/opacity via Metal framebuffer fetch ([[color(0)]],
-    // enabling global early ray termination across block boundaries.
+    // Uses standard hardware front-to-back blending (MSAA-compatible) with
+    // fragment_volume_main. Each block is drawn sequentially, and the GPU's
+    // fixed-function ROP blends them correctly regardless of sample count.
     MTLRenderPipelineDescriptor* accumDesc = [[MTLRenderPipelineDescriptor alloc] init];
-    accumDesc.vertexFunction = vertexFunc;
-    accumDesc.fragmentFunction = [library newFunctionWithName:@"fragment_volume_accum_main"];
+    id<MTLFunction> vertexInstancedFunc = [library newFunctionWithName:@"vertex_volume_instanced_main"];
+    id<MTLFunction> standardFragmentFunc = [library newFunctionWithName:@"fragment_volume_main"];
+    accumDesc.vertexFunction = vertexInstancedFunc; // Scales block geometry correctly
+    accumDesc.fragmentFunction = standardFragmentFunc; // Standard shader (platform independent)
     accumDesc.vertexDescriptor = vertexDesc;
     accumDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
-    accumDesc.colorAttachments[0].blendingEnabled = NO; // Shader handles compositing manually
+
+    // Configure standard hardware front-to-back blending (MSAA-compatible)
+    accumDesc.colorAttachments[0].blendingEnabled = YES;
+    accumDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOneMinusDestinationAlpha;
+    accumDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOne;
+    accumDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    accumDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOneMinusDestinationAlpha;
+    accumDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
+    accumDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+
     accumDesc.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
     accumDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-    accumDesc.rasterSampleCount = sampleCount;
+    accumDesc.rasterSampleCount = sampleCount; // Matches the MSAA count of the render window
 
     id<MTLRenderPipelineState> accumPso =
       [device newRenderPipelineStateWithDescriptor:accumDesc error:&error];
@@ -4489,11 +4500,10 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     // pipeline for single-block rendering.
     // Note: use Blocks.size() here because SortedBlockOrder isn't populated
     // until SortBlocksBackToFront is called inside DrawBlocks.
-    int currentSampleCount = metalRenderWindow->GetEffectiveSampleCount();
-    bool useInstanced = !this->Blocks.empty() &&
-      this->Blocks.size() <= MAX_INSTANCED_BLOCKS &&
-      this->InstancedPipelineState && (currentSampleCount == 1);
-    bool useAccumulation = !useInstanced && !this->Blocks.empty() && (currentSampleCount == 1);
+    // Bypass the instanced path and force the sequential hardware-blended accumulation path
+    // to run when partitions are active, fully preserving MSAA compatibility.
+    bool useInstanced = false;
+    bool useAccumulation = !this->Blocks.empty();
     void* activePipeline = useInstanced ? this->InstancedPipelineState
       : (useAccumulation ? this->AccumulationPipelineState : this->PipelineState);
     this->BindEncoderResources(offscreenEncoder, uniformBuf, activePipeline);
