@@ -1717,14 +1717,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
     // Downsample factor: 4x in each dimension
     const int DS = 4;
     int mmDims[3] = {
-      (dims[0] + DS - 1) / DS,
-      (dims[1] + DS - 1) / DS,
-      (dims[2] + DS - 1) / DS
+      std::max(1, dims[0] / DS),
+      std::max(1, dims[1] / DS),
+      std::max(1, dims[2] / DS)
     };
-    for (int k = 0; k < 3; ++k)
-    {
-      if (mmDims[k] < 1) mmDims[k] = 1;
-    }
     this->MinMaxDims[0] = mmDims[0];
     this->MinMaxDims[1] = mmDims[1];
     this->MinMaxDims[2] = mmDims[2];
@@ -2493,14 +2489,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       {
         const int DS = 4; // Downsample factor
         int mmDims[3] = {
-          (bDims[0] + DS - 1) / DS,
-          (bDims[1] + DS - 1) / DS,
-          (bDims[2] + DS - 1) / DS
+          std::max(1, bDims[0] / DS),
+          std::max(1, bDims[1] / DS),
+          std::max(1, bDims[2] / DS)
         };
-        for (int k = 0; k < 3; ++k)
-        {
-          if (mmDims[k] < 1) mmDims[k] = 1;
-        }
         block.MinMaxDims[0] = mmDims[0];
         block.MinMaxDims[1] = mmDims[1];
         block.MinMaxDims[2] = mmDims[2];
