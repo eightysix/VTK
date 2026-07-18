@@ -1309,9 +1309,10 @@ vertex VolumeVertexOut vertex_volume_main(
     constant PerBlockData& b [[buffer(2)]]) {
   VolumeVertexOut out;
 
-  float3 modelPos = in.position;
+  // in.position is a unit cube [0,1]. Scale it to the block's model-space bounds.
+  float3 modelPos = b.volumeBoundsMin.xyz + in.position * (b.volumeBoundsMax.xyz - b.volumeBoundsMin.xyz);
   out.position = volumeUniforms.viewProjection * volumeUniforms.volumeToWorld * float4(modelPos, 1.0);
-  out.localPos = (modelPos - volumeUniforms.volumeBoundsMin.xyz) / (volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz);
+  out.localPos = (modelPos - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
   out.instanceID = 0;
   return out;
 }
@@ -1330,7 +1331,7 @@ vertex VolumeVertexOut vertex_volume_instanced_main(
   float3 modelPos = b.volumeBoundsMin.xyz + in.position * (b.volumeBoundsMax.xyz - b.volumeBoundsMin.xyz);
 
   out.position = u.viewProjection * u.volumeToWorld * float4(modelPos, 1.0);
-  out.localPos = (modelPos - u.volumeBoundsMin.xyz) / (u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz);
+  out.localPos = (modelPos - u.volumeBoundsMin.xyz) / max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
   out.instanceID = iid;
   return out;
 }
@@ -1517,7 +1518,7 @@ fragment VolumeFragmentOut fragment_volume_main(
 
   // PREFETCH the very first samples before the loop starts
   float3 texLocalPos0 = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
-  float3 evalPoint0 = texLocalPos0 * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
+  float3 evalPoint0 = texLocalPos0;
   float prefetchScalar = volumeTexture.sample(volumeSampler, evalPoint0, level(0)).r;
   float prefetchMask = doMask ? maskTexture.sample(maskSampler, evalPoint0, level(0)).r : 0.0;
   int3  curCell     = int3(-1);
@@ -1573,7 +1574,7 @@ fragment VolumeFragmentOut fragment_volume_main(
 
     // 1. Claim prefetched data
     float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
-    float3 evalPoint = texLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
+    float3 evalPoint = texLocalPos;
     bool needsFetch = (as_type<uint>(prefetchScalar) == 0x7fc00000u);
     float rawScalar = needsFetch
       ? volumeTexture.sample(volumeSampler, evalPoint, level(0)).r
@@ -1590,7 +1591,7 @@ fragment VolumeFragmentOut fragment_volume_main(
     // 3. LAUNCH PREFETCH FOR NEXT ITERATION
     if (i + 1 < maxSteps) {
       float3 nextTexLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
-      float3 nextEvalPoint = nextTexLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
+      float3 nextEvalPoint = nextTexLocalPos;
       prefetchScalar = volumeTexture.sample(volumeSampler, nextEvalPoint, level(0)).r;
       if (doMask) {
         prefetchMask = maskTexture.sample(maskSampler, nextEvalPoint, level(0)).r;
@@ -1804,7 +1805,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
 
   // PREFETCH the very first samples before the loop starts
   float3 texLocalPos0 = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
-  float3 evalPoint0 = texLocalPos0 * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
+  float3 evalPoint0 = texLocalPos0;
   float prefetchScalar = volumeTexture.sample(volumeSampler, evalPoint0, level(0)).r;
   float prefetchMask = doMask ? maskTexture.sample(maskSampler, evalPoint0, level(0)).r : 0.0;
 
@@ -1860,7 +1861,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
 
     // 1. Claim prefetched data
     float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
-    float3 evalPoint = texLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
+    float3 evalPoint = texLocalPos;
     bool needsFetch = (as_type<uint>(prefetchScalar) == 0x7fc00000u);
     float rawScalar = needsFetch
       ? volumeTexture.sample(volumeSampler, evalPoint, level(0)).r
@@ -1877,7 +1878,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     // 3. LAUNCH PREFETCH FOR NEXT ITERATION
     if (i + 1 < maxSteps) {
       float3 nextTexLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
-      float3 nextEvalPoint = nextTexLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
+      float3 nextEvalPoint = nextTexLocalPos;
       prefetchScalar = volumeTexture.sample(volumeSampler, nextEvalPoint, level(0)).r;
       if (doMask) {
         prefetchMask = maskTexture.sample(maskSampler, nextEvalPoint, level(0)).r;
@@ -2092,7 +2093,7 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
 
   // PREFETCH
   float3 texLocalPos0 = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
-  float3 evalPoint0 = texLocalPos0 * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
+  float3 evalPoint0 = texLocalPos0;
   float prefetchScalar = blockVolumes[iid].sample(volumeSampler, evalPoint0, level(0)).r;
   float prefetchMask = doMask ? maskTexture.sample(maskSampler, evalPoint0, level(0)).r : 0.0;
 
@@ -2149,7 +2150,7 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
 
     // 1. Claim prefetched data
     float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
-    float3 evalPoint = texLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
+    float3 evalPoint = texLocalPos;
     bool needsFetch = (as_type<uint>(prefetchScalar) == 0x7fc00000u);
     float rawScalar = needsFetch
       ? blockVolumes[iid].sample(volumeSampler, evalPoint, level(0)).r
@@ -2166,7 +2167,7 @@ fragment VolumeFragmentOut fragment_volume_instanced_main(
     // 3. LAUNCH PREFETCH FOR NEXT ITERATION
     if (i + 1 < maxSteps) {
       float3 nextTexLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
-      float3 nextEvalPoint = nextTexLocalPos * (1.0 - b.gradientStep.xyz) + 0.5 * b.gradientStep.xyz;
+      float3 nextEvalPoint = nextTexLocalPos;
       prefetchScalar = blockVolumes[iid].sample(volumeSampler, nextEvalPoint, level(0)).r;
       if (doMask) {
         prefetchMask = maskTexture.sample(maskSampler, nextEvalPoint, level(0)).r;

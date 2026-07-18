@@ -612,11 +612,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           {
             VolumeBlock block;
             block.Extents[0] = fullExt[0] + i * deltaX;
-            block.Extents[1] = (i == nx - 1) ? fullExt[1] : std::min(fullExt[0] + (i + 1) * deltaX, fullExt[1]);
+            block.Extents[1] = (i == nx - 1) ? fullExt[1] : fullExt[0] + (i + 1) * deltaX - 1;
             block.Extents[2] = fullExt[2] + j * deltaY;
-            block.Extents[3] = (j == ny - 1) ? fullExt[3] : std::min(fullExt[2] + (j + 1) * deltaY, fullExt[3]);
+            block.Extents[3] = (j == ny - 1) ? fullExt[3] : fullExt[2] + (j + 1) * deltaY - 1;
             block.Extents[4] = fullExt[4] + k * deltaZ;
-            block.Extents[5] = (k == nz - 1) ? fullExt[5] : std::min(fullExt[4] + (k + 1) * deltaZ, fullExt[5]);
+            block.Extents[5] = (k == nz - 1) ? fullExt[5] : fullExt[4] + (k + 1) * deltaZ - 1;
             this->Blocks.push_back(block);
           }
         }
@@ -1953,53 +1953,72 @@ void vtkMetalGPUVolumeRayCastMapper::SortBlocksBackToFront(
     return;
   }
 
+  // Transform camera position into volume-local (grid) space.
   vtkNew<vtkMatrix4x4> modelToWorld;
   vol->GetModelToWorldMatrix(modelToWorld);
+  vtkNew<vtkMatrix4x4> worldToModel;
+  vtkMatrix4x4::Invert(modelToWorld, worldToModel);
 
-  double* camPos = ren->GetActiveCamera()->GetPosition();
-  double* camDir = ren->GetActiveCamera()->GetDirectionOfProjection();
+  double* camPosWorld = ren->GetActiveCamera()->GetPosition();
+  double camLocal[4] = { camPosWorld[0], camPosWorld[1], camPosWorld[2], 1.0 };
+  worldToModel->MultiplyPoint(camLocal, camLocal);
 
-  // Compute world-space center and distance for each block
-  for (size_t i = 0; i < this->Blocks.size(); ++i)
-  {
-    auto& block = this->Blocks[i];
-    double centerModel[4] = {
-      (block.BoundsMin[0] + block.BoundsMax[0]) * 0.5,
-      (block.BoundsMin[1] + block.BoundsMax[1]) * 0.5,
-      (block.BoundsMin[2] + block.BoundsMax[2]) * 0.5,
-      1.0
-    };
-    double centerWorld[4];
-    modelToWorld->MultiplyPoint(centerModel, centerWorld);
-    block.Center[0] = centerWorld[0];
-    block.Center[1] = centerWorld[1];
-    block.Center[2] = centerWorld[2];
-  }
+  // For each grid axis, determine whether an INCREASING block index moves
+  // toward or away from the camera. This uses camera POSITION relative to
+  // the volume's split planes -- which is what actually determines ray
+  // entry order for axis-aligned, non-overlapping blocks -- rather than
+  // projecting onto the view direction (which is only valid for
+  // orthographic projection and fails at grazing angles near a shared
+  // partition boundary under perspective).
+  double gridCenter[3] = {
+    (this->ModelBounds[0] + this->ModelBounds[1]) * 0.5,
+    (this->ModelBounds[2] + this->ModelBounds[3]) * 0.5,
+    (this->ModelBounds[4] + this->ModelBounds[5]) * 0.5
+  };
+  bool ascendingIsCloser[3] = {
+    camLocal[0] < gridCenter[0],
+    camLocal[1] < gridCenter[1],
+    camLocal[2] < gridCenter[2]
+  };
 
-  // Initialize sorted order — skip blocks with no texture (empty-space skipped)
+  const int nx = this->Partitions[0];
+  const int ny = this->Partitions[1];
+  const int NZ = this->Partitions[2];
+
+  // Initialize sorted order -- skip blocks with no texture (empty-space skipped)
   this->SortedBlockOrder.clear();
   this->SortedBlockOrder.reserve(this->Blocks.size());
-  for (size_t i = 0; i < this->Blocks.size(); ++i)
+  for (size_t idx = 0; idx < this->Blocks.size(); ++idx)
   {
-    if (this->Blocks[i].Texture)
+    if (this->Blocks[idx].Texture)
     {
-      this->SortedBlockOrder.push_back(static_cast<int>(i));
+      this->SortedBlockOrder.push_back(static_cast<int>(idx));
     }
   }
 
-  // Sort by distance to camera (closest first = front-to-back)
-  // Front-to-back ordering enables inter-block opacity propagation:
-  // the accumulation shader reads previous blocks' opacity via framebuffer fetch
-  // and can discard early if the pixel is already opaque.
+  // Blocks were built as: for(k) for(j) for(i) push_back(...)
+  // so idx = (k*ny + j)*nx + i. Recover (i,j,k) from the flat index.
   std::sort(this->SortedBlockOrder.begin(), this->SortedBlockOrder.end(),
     [&](int a, int b) {
-      double da = (this->Blocks[a].Center[0] - camPos[0]) * camDir[0] +
-        (this->Blocks[a].Center[1] - camPos[1]) * camDir[1] +
-        (this->Blocks[a].Center[2] - camPos[2]) * camDir[2];
-      double db = (this->Blocks[b].Center[0] - camPos[0]) * camDir[0] +
-        (this->Blocks[b].Center[1] - camPos[1]) * camDir[1] +
-        (this->Blocks[b].Center[2] - camPos[2]) * camDir[2];
-      return da < db; // closest first (front-to-back)
+      int ai = a % nx;
+      int aj = (a / nx) % ny;
+      int ak = a / (nx * ny);
+      int bi = b % nx;
+      int bj = (b / nx) % ny;
+      int bk = b / (nx * ny);
+
+      // Remap each axis so "closer to camera" is always the smaller index,
+      // then combine as a single nested key. Any fixed, consistent priority
+      // is valid here because the blocks are a non-overlapping axis-aligned
+      // grid and the camera sits outside the grid's bounding box in normal use.
+      auto key = [&](int i, int j, int k) -> long long {
+        int ii = ascendingIsCloser[0] ? i : (nx - 1 - i);
+        int jj = ascendingIsCloser[1] ? j : (ny - 1 - j);
+        int kk = ascendingIsCloser[2] ? k : (NZ - 1 - k);
+        return (static_cast<long long>(kk) * ny + jj) * nx + ii;
+      };
+
+      return key(ai, aj, ak) < key(bi, bj, bk); // ascending = closest first
     });
 }
 
@@ -2317,12 +2336,12 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       block.Dims[2] = bDims[2];
 
       // Compute model-space bounds for this block
-      block.BoundsMin[0] = origin[0] + block.Extents[0] * spacing[0];
-      block.BoundsMax[0] = origin[0] + block.Extents[1] * spacing[0];
-      block.BoundsMin[1] = origin[1] + block.Extents[2] * spacing[1];
-      block.BoundsMax[1] = origin[1] + block.Extents[3] * spacing[1];
-      block.BoundsMin[2] = origin[2] + block.Extents[4] * spacing[2];
-      block.BoundsMax[2] = origin[2] + block.Extents[5] * spacing[2];
+      block.BoundsMin[0] = origin[0] + (block.Extents[0] - 0.5) * spacing[0];
+      block.BoundsMax[0] = origin[0] + (block.Extents[1] + 0.5) * spacing[0];
+      block.BoundsMin[1] = origin[1] + (block.Extents[2] - 0.5) * spacing[1];
+      block.BoundsMax[1] = origin[1] + (block.Extents[3] + 0.5) * spacing[1];
+      block.BoundsMin[2] = origin[2] + (block.Extents[4] - 0.5) * spacing[2];
+      block.BoundsMax[2] = origin[2] + (block.Extents[5] + 0.5) * spacing[2];
 
       // Compute scalar min/max for this block (used for empty-space skipping).
       // Prefer reducing over pre-computed macrocell min/max from UpdateMinMaxTexture
@@ -2914,28 +2933,13 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         }
         else
         {
-          float boundsMin[3] = {
-            static_cast<float>(this->ModelBounds[0]),
-            static_cast<float>(this->ModelBounds[2]),
-            static_cast<float>(this->ModelBounds[4])
+          // Unit cube [0,1] for all volume rendering. The vertex shader
+          // scales this to the block's model-space bounds.
+          float unitVerts[] = {
+            0,0,0, 1,0,0, 1,1,0, 0,1,0,
+            0,0,1, 1,0,1, 1,1,1, 0,1,1
           };
-          float boundsMax[3] = {
-            static_cast<float>(this->ModelBounds[1]),
-            static_cast<float>(this->ModelBounds[3]),
-            static_cast<float>(this->ModelBounds[5])
-          };
-
-          float modelVerts[] = {
-            boundsMin[0], boundsMin[1], boundsMin[2],
-            boundsMax[0], boundsMin[1], boundsMin[2],
-            boundsMax[0], boundsMax[1], boundsMin[2],
-            boundsMin[0], boundsMax[1], boundsMin[2],
-            boundsMin[0], boundsMin[1], boundsMax[2],
-            boundsMax[0], boundsMin[1], boundsMax[2],
-            boundsMax[0], boundsMax[1], boundsMax[2],
-            boundsMin[0], boundsMax[1], boundsMax[2],
-          };
-          memcpy(vertices, modelVerts, sizeof(modelVerts));
+          memcpy(vertices, unitVerts, sizeof(unitVerts));
         }
 
         indices[0] = 0;  indices[1] = 2;  indices[2] = 1;  indices[3] = 0;  indices[4] = 3;  indices[5] = 2;
@@ -3669,14 +3673,14 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
           std::min(fullExt[5], block.Extents[5] + 1)
         };
 
-        perBlockData[i].TextureBoundsMin[0] = static_cast<float>(origin[0] + texExt[0] * spacing[0]);
-        perBlockData[i].TextureBoundsMin[1] = static_cast<float>(origin[1] + texExt[2] * spacing[1]);
-        perBlockData[i].TextureBoundsMin[2] = static_cast<float>(origin[2] + texExt[4] * spacing[2]);
+        perBlockData[i].TextureBoundsMin[0] = static_cast<float>(origin[0] + (texExt[0] - 0.5) * spacing[0]);
+        perBlockData[i].TextureBoundsMin[1] = static_cast<float>(origin[1] + (texExt[2] - 0.5) * spacing[1]);
+        perBlockData[i].TextureBoundsMin[2] = static_cast<float>(origin[2] + (texExt[4] - 0.5) * spacing[2]);
         perBlockData[i].TextureBoundsMin[3] = 1.0f;
 
-        perBlockData[i].TextureBoundsMax[0] = static_cast<float>(origin[0] + texExt[1] * spacing[0]);
-        perBlockData[i].TextureBoundsMax[1] = static_cast<float>(origin[1] + texExt[3] * spacing[1]);
-        perBlockData[i].TextureBoundsMax[2] = static_cast<float>(origin[2] + texExt[5] * spacing[2]);
+        perBlockData[i].TextureBoundsMax[0] = static_cast<float>(origin[0] + (texExt[1] + 0.5) * spacing[0]);
+        perBlockData[i].TextureBoundsMax[1] = static_cast<float>(origin[1] + (texExt[3] + 0.5) * spacing[1]);
+        perBlockData[i].TextureBoundsMax[2] = static_cast<float>(origin[2] + (texExt[5] + 0.5) * spacing[2]);
         perBlockData[i].TextureBoundsMax[3] = 1.0f;
 
         // Gradient step for this block's dimensions
@@ -3843,14 +3847,14 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
         std::min(fullExt[5], block.Extents[5] + 1)
       };
 
-      pbd.TextureBoundsMin[0] = static_cast<float>(origin[0] + texExt[0] * spacing[0]);
-      pbd.TextureBoundsMin[1] = static_cast<float>(origin[1] + texExt[2] * spacing[1]);
-      pbd.TextureBoundsMin[2] = static_cast<float>(origin[2] + texExt[4] * spacing[2]);
+      pbd.TextureBoundsMin[0] = static_cast<float>(origin[0] + (texExt[0] - 0.5) * spacing[0]);
+      pbd.TextureBoundsMin[1] = static_cast<float>(origin[1] + (texExt[2] - 0.5) * spacing[1]);
+      pbd.TextureBoundsMin[2] = static_cast<float>(origin[2] + (texExt[4] - 0.5) * spacing[2]);
       pbd.TextureBoundsMin[3] = 1.0f;
 
-      pbd.TextureBoundsMax[0] = static_cast<float>(origin[0] + texExt[1] * spacing[0]);
-      pbd.TextureBoundsMax[1] = static_cast<float>(origin[1] + texExt[3] * spacing[1]);
-      pbd.TextureBoundsMax[2] = static_cast<float>(origin[2] + texExt[5] * spacing[2]);
+      pbd.TextureBoundsMax[0] = static_cast<float>(origin[0] + (texExt[1] + 0.5) * spacing[0]);
+      pbd.TextureBoundsMax[1] = static_cast<float>(origin[1] + (texExt[3] + 0.5) * spacing[1]);
+      pbd.TextureBoundsMax[2] = static_cast<float>(origin[2] + (texExt[5] + 0.5) * spacing[2]);
       pbd.TextureBoundsMax[3] = 1.0f;
 
       for (int k = 0; k < 3; ++k)
