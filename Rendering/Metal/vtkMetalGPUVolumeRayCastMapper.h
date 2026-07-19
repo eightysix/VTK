@@ -199,6 +199,18 @@ private:
   // redundant full-voxel walk for BlockScalarRanges.
   std::vector<float> MacrocellScalarMin;
   std::vector<float> MacrocellScalarMax;
+
+  // --- Order-independent compositing: per-brick layer textures ---
+  // Each brick renders into its own RGBA16Float layer; a final composite pass
+  // sorts the layers per-pixel by ray-entry depth and folds front-to-back.
+  // This eliminates the bright ring caused by framebuffer-fetch ordering.
+  void* LayerColorTexture[8] = { nullptr };  // id<MTLTexture> — one per brick slot
+  void* LayerPipelineState = nullptr;        // vertex_volume_main + fragment_volume_main, RGBA16Float
+  void* CompositePipelineState = nullptr;    // vertex_fullscreen_main + fragment_layer_composite_main
+  int LayerFBOWidth = 0;
+  int LayerFBOHeight = 0;
+  bool UsePerPixelBrickOrder = true;         // the fix; set false for A/B against old global order
+  bool EnsureLayerResources(void* device, int w, int h);
 };
 
 VTK_ABI_NAMESPACE_END

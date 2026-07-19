@@ -145,6 +145,13 @@ static_assert(sizeof(PerBlockData) == 96,
 // Capped at 8 to stay within Metal's 32-texture limit on older Intel Macs.
 static const size_t MAX_INSTANCED_BLOCKS = 8;
 
+// Must match Metal LayerCompositeUniforms struct
+struct LayerCompositeUniforms {
+  float BlockMin[8][4];
+  float BlockMax[8][4];
+  float Params[4]; // x = brickCount, y = usePerPixelOrder (1=fix, 0=cpu order), zw unused
+};
+
 namespace
 {
 inline uint16_t FloatToHalf(float f)
@@ -423,6 +430,56 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseImageSampleResources()
   this->ImageSampleFBOWidth = 0;
   this->ImageSampleFBOHeight = 0;
   this->ImageSamplePixelFormat = 0;
+
+  // Release order-independent compositing layer textures
+  for (int i = 0; i < 8; ++i)
+  {
+    if (this->LayerColorTexture[i])
+    {
+      CFRelease(this->LayerColorTexture[i]);
+      this->LayerColorTexture[i] = nullptr;
+    }
+  }
+  this->LayerFBOWidth = 0;
+  this->LayerFBOHeight = 0;
+}
+
+//------------------------------------------------------------------------------
+bool vtkMetalGPUVolumeRayCastMapper::EnsureLayerResources(void* deviceVoid, int w, int h)
+{
+  if (this->LayerColorTexture[0] && this->LayerFBOWidth == w && this->LayerFBOHeight == h)
+    return true;
+
+  // Release old textures if size changed
+  for (int i = 0; i < 8; ++i)
+  {
+    if (this->LayerColorTexture[i])
+    {
+      CFRelease(this->LayerColorTexture[i]);
+      this->LayerColorTexture[i] = nullptr;
+    }
+  }
+
+  id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
+  MTLTextureDescriptor* d = [[MTLTextureDescriptor alloc] init];
+  d.textureType = MTLTextureType2D;
+  d.pixelFormat = MTLPixelFormatRGBA16Float;
+  d.width = w;
+  d.height = h;
+  d.mipmapLevelCount = 1;
+  d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+  d.storageMode = MTLStorageModePrivate;
+
+  for (int i = 0; i < 8; ++i)
+  {
+    id<MTLTexture> t = [device newTextureWithDescriptor:d];
+    if (!t) return false;
+    this->LayerColorTexture[i] = (__bridge void*)t;
+    CFRetain((__bridge CFTypeRef)t);
+  }
+  this->LayerFBOWidth = w;
+  this->LayerFBOHeight = h;
+  return true;
 }
 
 //------------------------------------------------------------------------------
@@ -447,6 +504,18 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   {
     CFRelease(this->InstancedPipelineState);
     this->InstancedPipelineState = nullptr;
+  }
+
+  if (this->LayerPipelineState)
+  {
+    CFRelease(this->LayerPipelineState);
+    this->LayerPipelineState = nullptr;
+  }
+
+  if (this->CompositePipelineState)
+  {
+    CFRelease(this->CompositePipelineState);
+    this->CompositePipelineState = nullptr;
   }
 
   if (this->VolumeTexture)
@@ -3463,6 +3532,53 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       this->InstancedPipelineState = (__bridge void*)instPso;
       CFRetain((__bridge CFTypeRef)instPso);
     }
+
+    // Layer pipeline: same fragment as screen path (fragment_volume_main), but offscreen format, no blend, no depth.
+    if (!this->LayerPipelineState)
+    {
+      MTLRenderPipelineDescriptor* ld = [[MTLRenderPipelineDescriptor alloc] init];
+      ld.vertexFunction = vertexFunc;
+      ld.fragmentFunction = [library newFunctionWithName:@"fragment_volume_main"];
+      ld.vertexDescriptor = vertexDesc;
+      ld.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+      ld.colorAttachments[0].blendingEnabled = NO;
+      ld.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
+      ld.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+      ld.rasterSampleCount = 1;
+
+      NSError* layerError = nil;
+      id<MTLRenderPipelineState> p = [device newRenderPipelineStateWithDescriptor:ld error:&layerError];
+      if (!p)
+      {
+        vtkErrorMacro(<< "Layer pipeline: " << [[layerError localizedDescription] UTF8String]);
+        return false;
+      }
+      this->LayerPipelineState = (__bridge void*)p;
+      CFRetain((__bridge CFTypeRef)p);
+    }
+
+    // Composite pipeline: fullscreen resolve of the 8 layers.
+    if (!this->CompositePipelineState)
+    {
+      MTLRenderPipelineDescriptor* cd = [[MTLRenderPipelineDescriptor alloc] init];
+      cd.vertexFunction = [library newFunctionWithName:@"vertex_fullscreen_main"];
+      cd.fragmentFunction = [library newFunctionWithName:@"fragment_layer_composite_main"];
+      cd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+      cd.colorAttachments[0].blendingEnabled = NO;
+      cd.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
+      cd.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+      cd.rasterSampleCount = 1;
+
+      NSError* compError = nil;
+      id<MTLRenderPipelineState> p = [device newRenderPipelineStateWithDescriptor:cd error:&compError];
+      if (!p)
+      {
+        vtkErrorMacro(<< "Composite pipeline: " << [[compError localizedDescription] UTF8String]);
+        return false;
+      }
+      this->CompositePipelineState = (__bridge void*)p;
+      CFRetain((__bridge CFTypeRef)p);
+    }
   }
 
   return true;
@@ -4457,54 +4573,188 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       metalRenderWindow->SetCurrentRenderCommandEncoder(nullptr);
     }
 
-    // Render volume to offscreen texture
+    // Render volume to offscreen texture — order-independent layer path
+    // for partitioned volumes (<=8 blocks). Single-block uses the old path.
     id<MTLTexture> offscreenColor =
       (__bridge id<MTLTexture>)this->ImageSampleColorTexture;
 
-    MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-    rpd.colorAttachments[0].texture = offscreenColor;
-    rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
-    rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
-    rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+    if (!this->Blocks.empty() && this->Blocks.size() <= MAX_INSTANCED_BLOCKS &&
+        this->LayerPipelineState && this->CompositePipelineState)
+    {
+      if (!this->EnsureLayerResources(mtlDevice, fboWidth, fboHeight))
+      {
+        dispatch_semaphore_signal((dispatch_semaphore_t)this->FrameSemaphore);
+        return;
+      }
+      this->SortBlocksBackToFront(ren, vol);
 
-    id<MTLRenderCommandEncoder> offscreenEncoder =
-      [commandBuffer renderCommandEncoderWithDescriptor:rpd];
-    offscreenEncoder.label = @"VTK Volume ImageSample Offscreen";
+      id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;
 
-    // Set viewport to offscreen dimensions
-    MTLViewport metalViewport;
-    metalViewport.originX = 0;
-    metalViewport.originY = 0;
-    metalViewport.width = fboWidth;
-    metalViewport.height = fboHeight;
-    metalViewport.znear = 0.0;
-    metalViewport.zfar = 1.0;
-    [offscreenEncoder setViewport:metalViewport];
+      // Get origin and spacing for PerBlockData texture bounds
+      vtkImageData* input = vtkImageData::SafeDownCast(this->GetInput());
+      int fullExt[6];
+      input->GetExtent(fullExt);
+      double origin[3], spacing[3];
+      input->GetOrigin(origin);
+      input->GetSpacing(spacing);
 
-    // Bind all encoder resources (pipeline, textures, samplers, buffers)
-    // Use instanced pipeline for multi-block rendering when block count <= 8
-    // (single-draw instanced rendering). Otherwise use accumulation pipeline
-    // for inter-block opacity propagation via framebuffer fetch, or standard
-    // pipeline for single-block rendering.
-    // Note: use Blocks.size() here because SortedBlockOrder isn't populated
-    // until SortBlocksBackToFront is called inside DrawBlocks.
-    // The offscreen pass is always rasterSampleCount=1, so the accumulation
-    // and instanced pipelines (also rasterSampleCount=1) are always valid.
-    // DisableInstanceRendering must be checked here so the fallback path in
-    // DrawBlocks gets the correct pipeline (accumulation, not instanced).
-    bool useInstanced = !this->Blocks.empty() &&
-      !this->DisableInstanceRendering &&
-      this->Blocks.size() <= MAX_INSTANCED_BLOCKS &&
-      this->InstancedPipelineState;
-    bool useAccumulation = !useInstanced && !this->Blocks.empty();
-    void* activePipeline = useInstanced ? this->InstancedPipelineState
-      : (useAccumulation ? this->AccumulationPipelineState : this->PipelineState);
-    this->BindEncoderResources(offscreenEncoder, uniformBuf, activePipeline);
+      double* modelBounds = this->ModelBounds;
+      double bsz[3] = {
+        modelBounds[1] - modelBounds[0],
+        modelBounds[3] - modelBounds[2],
+        modelBounds[5] - modelBounds[4]
+      };
+      for (int k = 0; k < 3; ++k)
+        if (bsz[k] < 1e-10) bsz[k] = 1.0;
 
-    // Draw volume — handle partitioned (multi-block) and single-block cases
-    this->DrawBlocks(offscreenEncoder, uniformBuf, ren, vol, &uniforms, invModelMatrix);
+      // --- One render pass per brick → its own layer texture (order irrelevant) ---
+      for (size_t bi = 0; bi < this->SortedBlockOrder.size(); ++bi)
+      {
+        int si = this->SortedBlockOrder[bi];
+        auto& block = this->Blocks[si];
 
-    [offscreenEncoder endEncoding];
+        MTLRenderPassDescriptor* lrpd = [MTLRenderPassDescriptor renderPassDescriptor];
+        lrpd.colorAttachments[0].texture = (__bridge id<MTLTexture>)this->LayerColorTexture[bi];
+        lrpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+        lrpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+        lrpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> layerEnc = [commandBuffer renderCommandEncoderWithDescriptor:lrpd];
+        MTLViewport vp = {0, 0, (double)fboWidth, (double)fboHeight, 0.0, 1.0};
+        [layerEnc setViewport:vp];
+
+        // Shared bindings (layer pipeline, vertex buf, uniforms, TF/depth/grad/mask/minmax samplers)
+        this->BindEncoderResources(layerEnc, uniformBuf, this->LayerPipelineState);
+
+        // Per-brick PerBlockData — identical construction to the fallback loop in DrawBlocks
+        PerBlockData pbd = {};
+        pbd.VolumeBoundsMin[0] = static_cast<float>(block.BoundsMin[0]);
+        pbd.VolumeBoundsMin[1] = static_cast<float>(block.BoundsMin[1]);
+        pbd.VolumeBoundsMin[2] = static_cast<float>(block.BoundsMin[2]);
+        pbd.VolumeBoundsMin[3] = 1.0f;
+        pbd.VolumeBoundsMax[0] = static_cast<float>(block.BoundsMax[0]);
+        pbd.VolumeBoundsMax[1] = static_cast<float>(block.BoundsMax[1]);
+        pbd.VolumeBoundsMax[2] = static_cast<float>(block.BoundsMax[2]);
+        pbd.VolumeBoundsMax[3] = 1.0f;
+
+        int texExt[6] = {
+          std::max(fullExt[0], block.Extents[0] - 1),
+          std::min(fullExt[1], block.Extents[1] + 1),
+          std::max(fullExt[2], block.Extents[2] - 1),
+          std::min(fullExt[3], block.Extents[3] + 1),
+          std::max(fullExt[4], block.Extents[4] - 1),
+          std::min(fullExt[5], block.Extents[5] + 1)
+        };
+        pbd.TextureBoundsMin[0] = static_cast<float>(origin[0] + (texExt[0] - 0.5) * spacing[0]);
+        pbd.TextureBoundsMin[1] = static_cast<float>(origin[1] + (texExt[2] - 0.5) * spacing[1]);
+        pbd.TextureBoundsMin[2] = static_cast<float>(origin[2] + (texExt[4] - 0.5) * spacing[2]);
+        pbd.TextureBoundsMin[3] = 1.0f;
+        pbd.TextureBoundsMax[0] = static_cast<float>(origin[0] + (texExt[1] + 0.5) * spacing[0]);
+        pbd.TextureBoundsMax[1] = static_cast<float>(origin[1] + (texExt[3] + 0.5) * spacing[1]);
+        pbd.TextureBoundsMax[2] = static_cast<float>(origin[2] + (texExt[5] + 0.5) * spacing[2]);
+        pbd.TextureBoundsMax[3] = 1.0f;
+
+        for (int k = 0; k < 3; ++k)
+          pbd.GradientStep[k] = (block.Dims[k] > 0) ? 1.0f / block.Dims[k] : 1.0f;
+        pbd.GradientStep[3] = 0.0f;
+
+        if (block.MinMaxTexture)
+        {
+          pbd.MinMaxInfo[0] = 1.0f;
+          pbd.MinMaxInfo[1] = static_cast<float>(block.MinMaxDims[0]);
+          pbd.MinMaxInfo[2] = static_cast<float>(block.MinMaxDims[1]);
+          pbd.MinMaxInfo[3] = static_cast<float>(block.MinMaxDims[2]);
+          [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.MinMaxTexture atIndex:7];
+          [layerEnc setFragmentSamplerState:(__bridge id<MTLSamplerState>)this->MinMaxSampler atIndex:7];
+        }
+        else
+        {
+          pbd.MinMaxInfo[0] = pbd.MinMaxInfo[1] = pbd.MinMaxInfo[2] = pbd.MinMaxInfo[3] = 0.0f;
+        }
+
+        [layerEnc setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
+        [layerEnc setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
+        // Override the nil global texture BindEncoderResources set at index 0
+        [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.Texture atIndex:0];
+
+        [layerEnc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                             indexCount:this->IndexCount
+                              indexType:MTLIndexTypeUInt32
+                            indexBuffer:indexBuf
+                      indexBufferOffset:0];
+        [layerEnc endEncoding];
+      }
+
+      // --- Composite pass: per-pixel-sorted fold of the layers ---
+      LayerCompositeUniforms lc = {};
+      for (size_t bi = 0; bi < this->SortedBlockOrder.size(); ++bi)
+      {
+        auto& block = this->Blocks[this->SortedBlockOrder[bi]];
+        for (int k = 0; k < 3; ++k)
+        {
+          lc.BlockMin[bi][k] = static_cast<float>((block.BoundsMin[k] - modelBounds[2 * k]) / bsz[k]);
+          lc.BlockMax[bi][k] = static_cast<float>((block.BoundsMax[k] - modelBounds[2 * k]) / bsz[k]);
+        }
+        lc.BlockMin[bi][3] = 0.0f;
+        lc.BlockMax[bi][3] = 0.0f;
+      }
+      lc.Params[0] = static_cast<float>(this->SortedBlockOrder.size());
+      lc.Params[1] = this->UsePerPixelBrickOrder ? 1.0f : 0.0f;
+
+      MTLRenderPassDescriptor* crpd = [MTLRenderPassDescriptor renderPassDescriptor];
+      crpd.colorAttachments[0].texture = offscreenColor;
+      crpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+      crpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+      crpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+      id<MTLRenderCommandEncoder> compEnc = [commandBuffer renderCommandEncoderWithDescriptor:crpd];
+      [compEnc setViewport:(MTLViewport){0, 0, (double)fboWidth, (double)fboHeight, 0.0, 1.0}];
+      [compEnc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)this->CompositePipelineState];
+      [compEnc setCullMode:MTLCullModeNone];
+      [compEnc setFragmentBuffer:uniformBuf offset:0 atIndex:1];
+      [compEnc setFragmentBytes:&lc length:sizeof(lc) atIndex:2];
+
+      id<MTLTexture> layerArr[8];
+      for (int i = 0; i < 8; ++i)
+        layerArr[i] = (__bridge id<MTLTexture>)this->LayerColorTexture[i];
+      [compEnc setFragmentTextures:layerArr withRange:NSMakeRange(0, 8)];
+
+      [compEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [compEnc endEncoding];
+    }
+    else
+    {
+      // Single-block or > 8 blocks: use existing single-encoder path
+      MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+      rpd.colorAttachments[0].texture = offscreenColor;
+      rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+      rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+      rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+      id<MTLRenderCommandEncoder> offscreenEncoder =
+        [commandBuffer renderCommandEncoderWithDescriptor:rpd];
+      offscreenEncoder.label = @"VTK Volume ImageSample Offscreen";
+
+      MTLViewport metalViewport;
+      metalViewport.originX = 0;
+      metalViewport.originY = 0;
+      metalViewport.width = fboWidth;
+      metalViewport.height = fboHeight;
+      metalViewport.znear = 0.0;
+      metalViewport.zfar = 1.0;
+      [offscreenEncoder setViewport:metalViewport];
+
+      bool useInstanced = !this->Blocks.empty() &&
+        !this->DisableInstanceRendering &&
+        this->Blocks.size() <= MAX_INSTANCED_BLOCKS &&
+        this->InstancedPipelineState;
+      bool useAccumulation = !useInstanced && !this->Blocks.empty();
+      void* activePipeline = useInstanced ? this->InstancedPipelineState
+        : (useAccumulation ? this->AccumulationPipelineState : this->PipelineState);
+      this->BindEncoderResources(offscreenEncoder, uniformBuf, activePipeline);
+
+      this->DrawBlocks(offscreenEncoder, uniformBuf, ren, vol, &uniforms, invModelMatrix);
+
+      [offscreenEncoder endEncoding];
+    }
     // Note: The renderer's blit phase (Phase 3b) will blit the offscreen
     // texture to the screen after all volumes are rendered.
   }

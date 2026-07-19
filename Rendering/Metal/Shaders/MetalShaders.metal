@@ -2242,3 +2242,68 @@ fragment float4 fragment_image_sample_blit(
     sampler offscreenSampler [[sampler(0)]]) {
   return offscreenColor.sample(offscreenSampler, in.texCoord);
 }
+
+// --- ORDER-INDEPENDENT COMPOSITING: per-brick layer composite ---
+// Reads up to 8 layer textures (one per brick), reconstructs the pixel ray,
+// intersects each brick box to get true ray-entry depth, sorts per-pixel,
+// and folds the premultiplied layers front-to-back. Exact == unpartitioned march.
+struct LayerCompositeUniforms {
+    float4 blockMin[8];  // brick bounding boxes in global [0,1] space
+    float4 blockMax[8];
+    float4 params;       // x = brickCount, y = usePerPixelOrder (1 = fix, 0 = slot order)
+};
+
+fragment float4 fragment_layer_composite_main(
+    FullscreenVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& u  [[buffer(1)]],
+    constant LayerCompositeUniforms& lc [[buffer(2)]],
+    texture2d<float, access::read> layer0 [[texture(0)]],
+    texture2d<float, access::read> layer1 [[texture(1)]],
+    texture2d<float, access::read> layer2 [[texture(2)]],
+    texture2d<float, access::read> layer3 [[texture(3)]],
+    texture2d<float, access::read> layer4 [[texture(4)]],
+    texture2d<float, access::read> layer5 [[texture(5)]],
+    texture2d<float, access::read> layer6 [[texture(6)]],
+    texture2d<float, access::read> layer7 [[texture(7)]])
+{
+    uint2 pixel = uint2(in.position.xy);
+    float4 L[8] = { layer0.read(pixel), layer1.read(pixel), layer2.read(pixel), layer3.read(pixel),
+                    layer4.read(pixel), layer5.read(pixel), layer6.read(pixel), layer7.read(pixel) };
+    int count = int(lc.params.x);
+
+    // Reconstruct the pixel ray in global [0,1] space, identical convention to brick shaders.
+    float3 cameraPos = u.cameraVolumePos.xyz;
+    float2 uv  = in.position.xy / u.viewportSize;
+    float2 ndc = uv * 2.0 - 1.0;
+    float4 wn = u.inverseViewProjection * float4(ndc.x, -ndc.y, 0.0, 1.0); wn.xyz /= wn.w;
+    float4 wf = u.inverseViewProjection * float4(ndc.x, -ndc.y, 1.0, 1.0); wf.xyz /= wf.w;
+    float3 bsz = max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
+    float3 localN = ((u.worldToVolume * float4(wn.xyz, 1.0)).xyz - u.volumeBoundsMin.xyz) / bsz;
+    float3 localF = ((u.worldToVolume * float4(wf.xyz, 1.0)).xyz - u.volumeBoundsMin.xyz) / bsz;
+    float3 dir = normalize(localF - localN);
+
+    // Gather active layers (alpha>0) with their true ray-entry param.
+    int   idx[8]; float tE[8]; int m = 0;
+    for (int i = 0; i < count; ++i) {
+        if (L[i].a < 1e-4) continue;
+        float2 tt = intersectBox(cameraPos, dir, lc.blockMin[i].xyz, lc.blockMax[i].xyz);
+        idx[m] = i; tE[m] = tt.x; ++m;
+    }
+    // Per-pixel depth sort (the fix) vs. slot order (= old global sorted order, for A/B).
+    if (lc.params.y > 0.5) {
+        for (int i = 1; i < m; ++i) {
+            float kt = tE[i]; int ki = idx[i]; int j = i - 1;
+            while (j >= 0 && tE[j] > kt) { tE[j+1] = tE[j]; idx[j+1] = idx[j]; --j; }
+            tE[j+1] = kt; idx[j+1] = ki;
+        }
+    }
+    // Front-to-back fold of premultiplied layers: R = R + L*(1 - R.a). Exact == unpartitioned march.
+    float3 R = 0.0; float Ra = 0.0;
+    for (int p = 0; p < m; ++p) {
+        float4 c = L[idx[p]];
+        float  w = 1.0 - Ra;
+        R  += c.rgb * w;
+        Ra += c.a   * w;
+    }
+    return float4(R, Ra);
+}
