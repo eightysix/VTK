@@ -60,13 +60,10 @@ public:
    */
   void SetPartitions(unsigned short x, unsigned short y, unsigned short z);
 
-  /**
-   * When set to true, instance rendering is disabled and blocks are drawn
-   * individually even when there are fewer than 8 blocks.  This is useful
-   * for debugging or for hardware that has issues with instanced draws.
-   */
-  vtkSetMacro(DisableInstanceRendering, bool);
-  vtkGetMacro(DisableInstanceRendering, bool);
+  // No-op stubs: the instanced path was removed.  Kept so that any
+  // external caller (test / UI) that references the setter still compiles.
+  void SetDisableInstanceRendering(bool) {}
+  bool GetDisableInstanceRendering() const { return false; }
 
 protected:
   vtkMetalGPUVolumeRayCastMapper();
@@ -78,8 +75,7 @@ private:
 
   // Metal pipeline objects (stored as void* to avoid Obj-C in header)
   void* PipelineState = nullptr;         // id<MTLRenderPipelineState>
-  void* AccumulationPipelineState = nullptr; // id<MTLRenderPipelineState> — for inter-block opacity propagation
-  void* InstancedPipelineState = nullptr; // id<MTLRenderPipelineState> — for single-draw instanced block rendering
+  void* AccumulationPipelineState = nullptr; // id<MTLRenderPipelineState> — for > MAX_LAYER_BRICKS fallback
   void* VolumeTexture = nullptr;         // id<MTLTexture>  (3D)
   void* VolumeSampler = nullptr;         // id<MTLSamplerState>
 
@@ -181,7 +177,6 @@ private:
   };
 
   unsigned short Partitions[3] = { 1, 1, 1 };
-  bool DisableInstanceRendering = false;
   std::vector<VolumeBlock> Blocks;
   std::vector<int> SortedBlockOrder; // indices into Blocks, sorted back-to-front
 
@@ -204,12 +199,13 @@ private:
   // Each brick renders into its own RGBA16Float layer; a final composite pass
   // sorts the layers per-pixel by ray-entry depth and folds front-to-back.
   // This eliminates the bright ring caused by framebuffer-fetch ordering.
+  // Covered bricks: <= MAX_LAYER_BRICKS (8).  Volumes with more partitions
+  // fall through to AccumulationPipelineState (>8 fallback, order-dependent).
   void* LayerColorTexture[8] = { nullptr };  // id<MTLTexture> — one per brick slot
   void* LayerPipelineState = nullptr;        // vertex_volume_main + fragment_volume_main, RGBA16Float
   void* CompositePipelineState = nullptr;    // vertex_fullscreen_main + fragment_layer_composite_main
   int LayerFBOWidth = 0;
   int LayerFBOHeight = 0;
-  bool UsePerPixelBrickOrder = true;         // the fix; set false for A/B against old global order
   bool EnsureLayerResources(void* device, int w, int h);
 };
 

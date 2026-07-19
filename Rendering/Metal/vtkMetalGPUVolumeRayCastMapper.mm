@@ -128,7 +128,7 @@ struct VolumeMapperUniforms
 static_assert(sizeof(VolumeMapperUniforms) == 976,
   "VolumeMapperUniforms must be 976 bytes to match Metal shader struct");
 
-// Per-block data for instanced rendering — must match Metal PerBlockData struct
+// Per-block data for volume rendering — must match Metal PerBlockData struct
 struct PerBlockData {
   float VolumeBoundsMin[4]; // 0..15
   float VolumeBoundsMax[4]; // 16..31
@@ -141,9 +141,9 @@ struct PerBlockData {
 static_assert(sizeof(PerBlockData) == 96,
   "PerBlockData must be 96 bytes to match Metal shader struct");
 
-// Maximum number of blocks that can be rendered in a single instanced draw call.
-// Capped at 8 to stay within Metal's 32-texture limit on older Intel Macs.
-static const size_t MAX_INSTANCED_BLOCKS = 8;
+// Maximum number of bricks covered by the order-independent layer composite.
+// Capped at 8 to stay within Metal's texture bind limit on older hardware.
+static const size_t MAX_LAYER_BRICKS = 8;
 
 // Must match Metal LayerCompositeUniforms struct
 struct LayerCompositeUniforms {
@@ -498,12 +498,6 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   {
     CFRelease(this->AccumulationPipelineState);
     this->AccumulationPipelineState = nullptr;
-  }
-
-  if (this->InstancedPipelineState)
-  {
-    CFRelease(this->InstancedPipelineState);
-    this->InstancedPipelineState = nullptr;
   }
 
   if (this->LayerPipelineState)
@@ -2992,8 +2986,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
 
         if (!this->Blocks.empty())
         {
-          // Unit cube [0,1] for instanced rendering — the vertex shader
-          // scales each instance to its block's model-space bounds.
+          // Unit cube [0,1] — the vertex shader scales to each block's model-space bounds.
           float unitVerts[] = {
             0,0,0, 1,0,0, 1,1,0, 0,1,0,
             0,0,1, 1,0,1, 1,1,1, 0,1,1
@@ -3278,8 +3271,8 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     this->PipelineState = nullptr;
   }
 
-  // Accumulation and instanced pipelines are always rasterSampleCount=1
-  // (used only for offscreen rendering), so they don't need invalidation
+  // Accumulation pipeline is always rasterSampleCount=1
+  // (used only for offscreen rendering), so it doesn't need invalidation
   // when the window's MSAA sample count changes.
 
   if (this->PipelineState)
@@ -3503,36 +3496,6 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     this->AccumulationPipelineState = (__bridge void*)accumPso;
     CFRetain((__bridge CFTypeRef)accumPso);
 
-    // Create instanced pipeline for single-ddraw block rendering (<= 8 blocks).
-    // Uses vertex_volume_instanced_main + fragment_volume_instanced_main which
-    // index into PerBlockData and texture arrays by [[instance_id]].
-    // Always use rasterSampleCount = 1 because this pipeline is only used for
-    // offscreen rendering (image-sample path), where the render pass is always 1x.
-    if (!this->InstancedPipelineState)
-    {
-      MTLRenderPipelineDescriptor* instDesc = [[MTLRenderPipelineDescriptor alloc] init];
-      instDesc.vertexFunction = [library newFunctionWithName:@"vertex_volume_instanced_main"];
-      instDesc.fragmentFunction = [library newFunctionWithName:@"fragment_volume_instanced_main"];
-      instDesc.vertexDescriptor = vertexDesc;
-      instDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
-      instDesc.colorAttachments[0].blendingEnabled = NO; // Shader handles compositing via framebuffer fetch
-      instDesc.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
-      instDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-      instDesc.rasterSampleCount = 1;
-
-      NSError* instError = nil;
-      id<MTLRenderPipelineState> instPso =
-        [device newRenderPipelineStateWithDescriptor:instDesc error:&instError];
-      if (!instPso)
-      {
-        vtkErrorMacro(<< "Instanced volume pipeline: "
-                      << [[instError localizedDescription] UTF8String]);
-        return false;
-      }
-      this->InstancedPipelineState = (__bridge void*)instPso;
-      CFRetain((__bridge CFTypeRef)instPso);
-    }
-
     // Layer pipeline: same fragment as screen path (fragment_volume_main), but offscreen format, no blend, no depth.
     if (!this->LayerPipelineState)
     {
@@ -3607,7 +3570,7 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
 
   // Only bind depth state if the pipeline uses depth testing.
   // Standard pipeline renders directly to screen with depth; the accumulation
-  // and instanced offscreen pipelines have no depth attachment (MTLPixelFormatInvalid).
+  // and accumulation offscreen pipelines have no depth attachment (MTLPixelFormatInvalid).
   bool hasDepthAttachment = (pipelineStateVoid == nullptr || pipelineStateVoid == this->PipelineState);
   if (this->DepthStencilState && hasDepthAttachment)
   {
@@ -3742,197 +3705,15 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
   {
     this->SortBlocksBackToFront(ren, vol);
 
-    // --- INSTANCED PATH (<= 8 blocks): single draw call for all blocks ---
-    if (!this->DisableInstanceRendering &&
-        this->SortedBlockOrder.size() <= MAX_INSTANCED_BLOCKS && this->InstancedPipelineState)
-    {
-      // Switch to instanced pipeline
-      id<MTLRenderPipelineState> instPso =
-        (__bridge id<MTLRenderPipelineState>)this->InstancedPipelineState;
-      [encoder setRenderPipelineState:instPso];
+    // NOTE: the old single-draw INSTANCED path was removed. Partitioned volumes
+    // with <= MAX_LAYER_BRICKS bricks are now composited order-independently in
+    // GPURender (per-brick layer textures + per-pixel-sorted composite), which
+    // makes draw order irrelevant. This function is therefore only reached for
+    // the > MAX_LAYER_BRICKS fallback (order-dependent; see "Known limitations"
+    // in GPURender) and never instances.
 
-      PerBlockData perBlockData[MAX_INSTANCED_BLOCKS] = {};
-      id<MTLTexture> volTexArray[MAX_INSTANCED_BLOCKS] = {nil};
-      id<MTLTexture> mmTexArray[MAX_INSTANCED_BLOCKS] = {nil};
-
-      // Fallback textures to avoid nil binds
-      id<MTLTexture> fallbackTex = (__bridge id<MTLTexture>)this->VolumeTexture;
-
-      double* camPosWorld = ren->GetActiveCamera()->GetPosition();
-
-      for (size_t i = 0; i < this->SortedBlockOrder.size(); ++i)
-      {
-        int si = this->SortedBlockOrder[i];
-        auto& block = this->Blocks[si];
-
-        perBlockData[i].VolumeBoundsMin[0] = static_cast<float>(block.BoundsMin[0]);
-        perBlockData[i].VolumeBoundsMin[1] = static_cast<float>(block.BoundsMin[1]);
-        perBlockData[i].VolumeBoundsMin[2] = static_cast<float>(block.BoundsMin[2]);
-        perBlockData[i].VolumeBoundsMin[3] = 1.0f;
-
-        perBlockData[i].VolumeBoundsMax[0] = static_cast<float>(block.BoundsMax[0]);
-        perBlockData[i].VolumeBoundsMax[1] = static_cast<float>(block.BoundsMax[1]);
-        perBlockData[i].VolumeBoundsMax[2] = static_cast<float>(block.BoundsMax[2]);
-        perBlockData[i].VolumeBoundsMax[3] = 1.0f;
-
-        int texExt[6] = {
-          std::max(fullExt[0], block.Extents[0] - 1),
-          std::min(fullExt[1], block.Extents[1] + 1),
-          std::max(fullExt[2], block.Extents[2] - 1),
-          std::min(fullExt[3], block.Extents[3] + 1),
-          std::max(fullExt[4], block.Extents[4] - 1),
-          std::min(fullExt[5], block.Extents[5] + 1)
-        };
-
-        perBlockData[i].TextureBoundsMin[0] = static_cast<float>(origin[0] + (texExt[0] - 0.5) * spacing[0]);
-        perBlockData[i].TextureBoundsMin[1] = static_cast<float>(origin[1] + (texExt[2] - 0.5) * spacing[1]);
-        perBlockData[i].TextureBoundsMin[2] = static_cast<float>(origin[2] + (texExt[4] - 0.5) * spacing[2]);
-        perBlockData[i].TextureBoundsMin[3] = 1.0f;
-
-        perBlockData[i].TextureBoundsMax[0] = static_cast<float>(origin[0] + (texExt[1] + 0.5) * spacing[0]);
-        perBlockData[i].TextureBoundsMax[1] = static_cast<float>(origin[1] + (texExt[3] + 0.5) * spacing[1]);
-        perBlockData[i].TextureBoundsMax[2] = static_cast<float>(origin[2] + (texExt[5] + 0.5) * spacing[2]);
-        perBlockData[i].TextureBoundsMax[3] = 1.0f;
-
-        // Gradient step for this block's dimensions
-        for (int k = 0; k < 3; ++k)
-        {
-          perBlockData[i].GradientStep[k] =
-            (block.Dims[k] > 0) ? 1.0f / block.Dims[k] : 1.0f;
-        }
-        perBlockData[i].GradientStep[3] = 0.0f;
-
-        // Min-max info
-        if (block.MinMaxTexture)
-        {
-          perBlockData[i].MinMaxInfo[0] = 1.0f;
-          perBlockData[i].MinMaxInfo[1] = static_cast<float>(block.MinMaxDims[0]);
-          perBlockData[i].MinMaxInfo[2] = static_cast<float>(block.MinMaxDims[1]);
-          perBlockData[i].MinMaxInfo[3] = static_cast<float>(block.MinMaxDims[2]);
-        }
-        else
-        {
-          perBlockData[i].MinMaxInfo[0] = 0.0f;
-          perBlockData[i].MinMaxInfo[1] = 0.0f;
-          perBlockData[i].MinMaxInfo[2] = 0.0f;
-          perBlockData[i].MinMaxInfo[3] = 0.0f;
-        }
-
-        volTexArray[i] = (__bridge id<MTLTexture>)block.Texture;
-        mmTexArray[i] = block.MinMaxTexture
-          ? (__bridge id<MTLTexture>)block.MinMaxTexture
-          : fallbackTex;
-      }
-
-      // Bind per-block data buffer at index 2 (vertex + fragment)
-      [encoder setVertexBytes:perBlockData
-                       length:sizeof(PerBlockData) * MAX_INSTANCED_BLOCKS
-                      atIndex:2];
-      [encoder setFragmentBytes:perBlockData
-                         length:sizeof(PerBlockData) * MAX_INSTANCED_BLOCKS
-                        atIndex:2];
-
-      // Bind block volume textures as array at fragment texture indices 0..7
-      [encoder setFragmentTextures:volTexArray withRange:NSMakeRange(0, MAX_INSTANCED_BLOCKS)];
-      // Bind block min-max textures as array at fragment texture indices 8..15
-      [encoder setFragmentTextures:mmTexArray withRange:NSMakeRange(8, MAX_INSTANCED_BLOCKS)];
-
-      // Bind shared textures at offset indices (16+) for the instanced shader
-      id<MTLTexture> tfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
-      id<MTLSamplerState> tfSamp = (__bridge id<MTLSamplerState>)this->ColorOpacitySampler;
-      [encoder setFragmentTexture:tfTex atIndex:16];
-      [encoder setFragmentSamplerState:tfSamp atIndex:0];
-
-      if (this->DepthTextureOcclusion)
-      {
-        id<MTLTexture> depthTex = (__bridge id<MTLTexture>)this->DepthTextureOcclusion;
-        id<MTLSamplerState> depthSamp = this->DepthSampler
-          ? (__bridge id<MTLSamplerState>)this->DepthSampler : tfSamp;
-        [encoder setFragmentTexture:depthTex atIndex:17];
-        [encoder setFragmentSamplerState:depthSamp atIndex:2];
-      }
-      else
-      {
-        [encoder setFragmentTexture:tfTex atIndex:17];
-        [encoder setFragmentSamplerState:tfSamp atIndex:2];
-      }
-
-      // Gradient opacity
-      if (this->GradientOpacityTexture)
-      {
-        id<MTLTexture> goTex = (__bridge id<MTLTexture>)this->GradientOpacityTexture;
-        id<MTLSamplerState> goSamp = (__bridge id<MTLSamplerState>)this->GradientOpacitySampler;
-        [encoder setFragmentTexture:goTex atIndex:18];
-        [encoder setFragmentSamplerState:goSamp atIndex:3];
-      }
-      else
-      {
-        [encoder setFragmentTexture:tfTex atIndex:18];
-        [encoder setFragmentSamplerState:tfSamp atIndex:3];
-      }
-
-      // Mask
-      if (this->MaskTexture)
-      {
-        id<MTLTexture> maskTex = (__bridge id<MTLTexture>)this->MaskTexture;
-        id<MTLSamplerState> maskSamp = (__bridge id<MTLSamplerState>)this->MaskSampler;
-        [encoder setFragmentTexture:maskTex atIndex:19];
-        [encoder setFragmentSamplerState:maskSamp atIndex:4];
-      }
-      else
-      {
-        [encoder setFragmentTexture:fallbackTex atIndex:19];
-        id<MTLSamplerState> volSamp = (__bridge id<MTLSamplerState>)this->VolumeSampler;
-        [encoder setFragmentSamplerState:volSamp atIndex:4];
-      }
-
-      // Label map transfer
-      if (this->LabelMapTransferTexture)
-      {
-        id<MTLTexture> lmTex = (__bridge id<MTLTexture>)this->LabelMapTransferTexture;
-        id<MTLSamplerState> lmSamp = (__bridge id<MTLSamplerState>)this->LabelMapTransferSampler;
-        [encoder setFragmentTexture:lmTex atIndex:20];
-        [encoder setFragmentSamplerState:lmSamp atIndex:5];
-      }
-      else
-      {
-        [encoder setFragmentTexture:tfTex atIndex:20];
-        [encoder setFragmentSamplerState:tfSamp atIndex:5];
-      }
-
-      // Label map gradient opacity
-      if (this->LabelMapGradientOpacityTexture)
-      {
-        id<MTLTexture> lgoTex = (__bridge id<MTLTexture>)this->LabelMapGradientOpacityTexture;
-        id<MTLSamplerState> lgoSamp = (__bridge id<MTLSamplerState>)this->LabelMapGradientOpacitySampler;
-        [encoder setFragmentTexture:lgoTex atIndex:21];
-        [encoder setFragmentSamplerState:lgoSamp atIndex:6];
-      }
-      else
-      {
-        [encoder setFragmentTexture:tfTex atIndex:21];
-        [encoder setFragmentSamplerState:tfSamp atIndex:6];
-      }
-
-      // Min-max sampler
-      id<MTLSamplerState> mmSamp = (__bridge id<MTLSamplerState>)this->MinMaxSampler;
-      [encoder setFragmentSamplerState:mmSamp atIndex:7];
-
-      // Volume sampler (shared across all blocks)
-      id<MTLSamplerState> volSamp = (__bridge id<MTLSamplerState>)this->VolumeSampler;
-      [encoder setFragmentSamplerState:volSamp atIndex:1];
-
-      // SINGLE INSTANCED DRAW CALL
-      [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                          indexCount:this->IndexCount
-                           indexType:MTLIndexTypeUInt32
-                         indexBuffer:indexBuf
-                   indexBufferOffset:0
-                       instanceCount:this->SortedBlockOrder.size()];
-      return;
-    }
-
-    // --- FALLBACK PATH (> 8 blocks): per-block loop ---
+    // --- FALLBACK PATH (> MAX_LAYER_BRICKS bricks): one draw per brick,
+    //     composited front-to-back via framebuffer fetch. Order-dependent. ---
     for (size_t bi = 0; bi < this->SortedBlockOrder.size(); ++bi)
     {
       int si = this->SortedBlockOrder[bi];
@@ -4573,12 +4354,48 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       metalRenderWindow->SetCurrentRenderCommandEncoder(nullptr);
     }
 
-    // Render volume to offscreen texture — order-independent layer path
-    // for partitioned volumes (<=8 blocks). Single-block uses the old path.
+    // Render volume to offscreen texture
     id<MTLTexture> offscreenColor =
       (__bridge id<MTLTexture>)this->ImageSampleColorTexture;
 
-    if (!this->Blocks.empty() && this->Blocks.size() <= MAX_INSTANCED_BLOCKS &&
+    // ============================================================================
+    // ORDER-INDEPENDENT BRICK COMPOSITING (partitioned volumes, <= MAX_LAYER_BRICKS)
+    // ----------------------------------------------------------------------------
+    // Why this exists: the previous compositor (fragment_volume_accum_main / the
+    // old instanced path) folded bricks through a Metal framebuffer fetch in a
+    // single global draw order produced by SortBlocksBackToFront(). That is correct
+    // ONLY when one total front-to-back order is valid for every pixel at once. For
+    // an axis-aligned brick grid that holds while the camera is outside the brick
+    // span on every split axis, but the moment the camera sits between two split
+    // planes on a split axis (typical side/orbit views), pixels in the top and
+    // bottom of the frame traverse the same two bricks in OPPOSITE orders, and no
+    // global sort can satisfy both. The mis-ordered brick then composites a
+    // high-opacity voxel at the cut (the body surface crossing the partition plane)
+    // at full weight instead of attenuated by the true front brick -> a bright ring
+    // that "peeks through", visible only in translucent renders (opaque renders hide
+    // it via early ray termination) and only at the affected angles. No sampling,
+    // slack, or sort-comparator change can fix it, because the requirement is
+    // per-pixel order, which a single draw sequence cannot provide.
+    //
+    // The fix makes compositing order-independent:
+    //   1. Each brick is ray-marched INDEPENDENTLY (fragment_volume_main, no fetch,
+    //      accumulators start at 0) into its own RGBA16Float layer texture
+    //      (LayerColorTexture[i]). Because each pass writes a different texture,
+    //      draw order is irrelevant.
+    //   2. A final fullscreen pass (fragment_layer_composite_main) reconstructs the
+    //      pixel ray, intersects the <= MAX_LAYER_BRICKS brick boxes to get the TRUE
+    //      per-pixel entry order, and folds the non-empty layers front-to-back with
+    //      premultiplied Porter-Duff over (R += L*(1-R.a)). Because over is
+    //      associative, grouping each brick's samples into one layer and compositing
+    //      the layers in true order is bit-equivalent to a single unpartitioned
+    //      march -- which is why toggling SetPartitions(1,1,1) now matches.
+    // Cost: N+1 passes instead of 1, but the bricks' projected boxes overlap across
+    // the whole silhouette, so the bricks had to serialize at every covered pixel
+    // anyway; the layer path also drops the framebuffer fetch. Net GPU cost is
+    // comparable for <= MAX_LAYER_BRICKS, and we trade a few CPU draw calls for
+    // correctness at all camera angles.
+    // ============================================================================
+    if (!this->Blocks.empty() && this->Blocks.size() <= MAX_LAYER_BRICKS &&
         this->LayerPipelineState && this->CompositePipelineState)
     {
       if (!this->EnsureLayerResources(mtlDevice, fboWidth, fboHeight))
@@ -4607,7 +4424,13 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       for (int k = 0; k < 3; ++k)
         if (bsz[k] < 1e-10) bsz[k] = 1.0;
 
-      // --- One render pass per brick → its own layer texture (order irrelevant) ---
+      // One render pass per brick -> its own layer texture. The brick is marched with
+      // the SAME shader as the on-screen single-block path (fragment_volume_main), so
+      // the per-brick result is exactly that brick's ray segment as one premultiplied
+      // layer (C, a). Bindings mirror BindEncoderResources but slot 0 = this brick's
+      // volume texture and slot 7 = this brick's min-max texture + the NEAREST
+      // min-max sampler (the global min-max is nil in partitioned mode, so do not rely
+      // on BindEncoderResources' slot-7 sampler here).
       for (size_t bi = 0; bi < this->SortedBlockOrder.size(); ++bi)
       {
         int si = this->SortedBlockOrder[bi];
@@ -4684,7 +4507,19 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         [layerEnc endEncoding];
       }
 
-      // --- Composite pass: per-pixel-sorted fold of the layers ---
+      // Composite pass: read the <= MAX_LAYER_BRICKS layers and fold them in TRUE
+      // per-pixel depth order (reconstructed ray vs. each brick box). The insertion
+      // sort is over <= MAX_LAYER_BRICKS items, so it is free. lc.BlockMin/Max are the
+      // bricks' bounds in global [0,1] space -- the SAME convention the brick shaders
+      // use for blockMinGlobal/blockMaxGlobal, so the entry params line up.
+      //
+      // LANDMINE: the ray reconstructed below (the inverseViewProjection unproject at
+      // z=0 and z=1, the -ndc.y flip, and the (worldToVolume - boundsMin)/boundsSize
+      // affine) MUST stay in lockstep with the brick shaders' ray setup
+      // (rayDir = normalize(localPos - cameraVolumePos), localPos in [0,1]). If anyone
+      // changes the brick vertex/fragment ray convention, update this reconstruction
+      // too, or the per-pixel order will silently disagree with the march and the
+      // seam will return.
       LayerCompositeUniforms lc = {};
       for (size_t bi = 0; bi < this->SortedBlockOrder.size(); ++bi)
       {
@@ -4698,7 +4533,6 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         lc.BlockMax[bi][3] = 0.0f;
       }
       lc.Params[0] = static_cast<float>(this->SortedBlockOrder.size());
-      lc.Params[1] = this->UsePerPixelBrickOrder ? 1.0f : 0.0f;
 
       MTLRenderPassDescriptor* crpd = [MTLRenderPassDescriptor renderPassDescriptor];
       crpd.colorAttachments[0].texture = offscreenColor;
@@ -4722,7 +4556,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     }
     else
     {
-      // Single-block or > 8 blocks: use existing single-encoder path
+      // --- ORDER-DEPENDENT PATH: single-block volumes, or partitioned volumes
+      //     with > MAX_LAYER_BRICKS bricks (the layer composite is capped at
+      //     MAX_LAYER_BRICKS; see "Known limitations"). ---
       MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
       rpd.colorAttachments[0].texture = offscreenColor;
       rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -4742,13 +4578,12 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       metalViewport.zfar = 1.0;
       [offscreenEncoder setViewport:metalViewport];
 
-      bool useInstanced = !this->Blocks.empty() &&
-        !this->DisableInstanceRendering &&
-        this->Blocks.size() <= MAX_INSTANCED_BLOCKS &&
-        this->InstancedPipelineState;
-      bool useAccumulation = !useInstanced && !this->Blocks.empty();
-      void* activePipeline = useInstanced ? this->InstancedPipelineState
-        : (useAccumulation ? this->AccumulationPipelineState : this->PipelineState);
+      // --- ORDER-DEPENDENT PATH: single-block volumes, or partitioned volumes
+      //     with > MAX_LAYER_BRICKS bricks (the layer composite is capped at
+      //     MAX_LAYER_BRICKS; see "Known limitations"). ---
+      bool useAccumulation = !this->Blocks.empty(); // true only for the >8-brick case here
+      void* activePipeline = useAccumulation ? this->AccumulationPipelineState
+                                             : this->PipelineState;
       this->BindEncoderResources(offscreenEncoder, uniformBuf, activePipeline);
 
       this->DrawBlocks(offscreenEncoder, uniformBuf, ren, vol, &uniforms, invModelMatrix);
@@ -4783,5 +4618,53 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     dispatch_semaphore_signal((dispatch_semaphore_t)sem);
   }];
 }
+
+// ============================================================================
+// KNOWN LIMITATIONS & FUTURE WORK (partitioned volume rendering)
+// ----------------------------------------------------------------------------
+// 1. BRICK CAP. The order-independent composite reads a fixed 8 layer textures
+//    (layer0..layer7) and LayerCompositeUniforms holds [8] bounds, so the fix
+//    covers <= MAX_LAYER_BRICKS bricks only. Volumes with more partitions fall
+//    through to the order-DEPENDENT accumulation path (fragment_volume_accum_main)
+//    and WILL show the boundary seam at some camera angles. To lift the cap,
+//    either (a) bind the layers as a texture array and loop the composite over a
+//    uniform count (Metal needs the array size at compile time, so pick a new
+//    higher cap), or (b) composite in log2(N) pairwise fullscreen passes, or
+//    (c) switch to a k-buffer / weighted-blended OIT (see #4). Do NOT delete
+//    fragment_volume_accum_main / AccumulationPipelineState until this is done --
+//    they are the only correct-ish path for > MAX_LAYER_BRICKS today.
+//
+// 2. SILHOUETTE "TABS" (cosmetic, flat/label-map views only). Each brick's proxy
+//    box is its own AABB, so a curved body outline jaggles at brick boundaries in
+//    opaque renders. It is invisible in translucent renders and unrelated to the
+//    seam. Cheap fix: drive every brick's VERTEX box from the FULL volume bounds
+//    (one smooth silhouette) and let the fragment window the ray to its brick via
+//    tStart/t.y (the march already does this). Requires the vertex stage to read
+//    full bounds while the fragment reads per-brick bounds, so do not reuse the
+//    same PerBlockData field for both.
+//
+// 3. FAINT 1-VOXEL LINE AT INTERNAL CUTS (optional polish). fragment_volume_main
+//    still carries the +/-1e-4 boundary slacks. In the old fetch chain these were
+//    largely masked; with separate layers they can double-deposit the plane voxel
+//    once (front brick's +1e-4 and back brick's -1e-4 entry both touch it),
+//    showing as a thin, angle-INDEPENDENT line -- much fainter than the old ring.
+//    Only fix if you actually see it: make the boundary half-open in the layer
+//    path (break on currentT >= t.y at the brick exit, drop the -1e-4 entry bias),
+//    applied to INTERNAL faces only (pass a per-brick "which faces are internal"
+//    flag so the outer silhouette keeps its slack). Leave the on-screen single-
+//    block path's slacks untouched.
+//
+// 4. MEMORY ALTERNATIVE. 8x RGBA16Float fullscreen layers at high resolution is
+//    the main cost of this fix. If that matters, weighted-blended OIT (two
+//    additive accumulators + a final normalize) is order-independent with O(1)
+//    storage and no sort, at the price of the usual WBOIT banding on thin/over-
+//    lapping high-alpha features. The current per-layer approach is exact, which
+//    is why it was chosen; WBOIT is the fallback if memory wins.
+//
+// 5. SORT IS NOW DECORATIVE. SortBlocksBackToFront no longer affects correctness
+//    on this path (the composite re-sorts per pixel); it only fixes which brick
+//    lands in which layer slot. Safe to replace with a plain collect-non-empty
+//    loop if you want one less camera-dependent branch.
+// ============================================================================
 
 VTK_ABI_NAMESPACE_END
