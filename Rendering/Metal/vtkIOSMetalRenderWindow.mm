@@ -63,7 +63,6 @@ UIView* vtkIOSMetalRenderWindow::GetViewId()
       metalLayer.contentsScale = scale;
       metalLayer.framebufferOnly = YES;
       this->MetalLayer = (__bridge void*)metalLayer;
-      CFRetain((__bridge CFTypeRef)metalLayer);
     }
   }
   return this->ViewId;
