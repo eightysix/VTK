@@ -47,7 +47,7 @@ protected:
   vtkMetalPolyDataMapper();
   ~vtkMetalPolyDataMapper() override;
 
-  void BuildGeometryBuffers(void* mtlDevice, void* mtlQueue, vtkPolyData* polydata, vtkActor* actor);
+  void BuildGeometryBuffers(void* mtlDevice, vtkPolyData* polydata, vtkActor* actor);
   void EnsurePipelineStates(void* mtlDevice);
   void EnsurePointPipelineStates(void* mtlDevice);
   void EnsureEdgePipelineState(void* mtlDevice);

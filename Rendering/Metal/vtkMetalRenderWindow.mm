@@ -143,22 +143,6 @@ void vtkMetalRenderWindow::Finalize()
     this->MetalLayer = nullptr;
   }
 
-  if (this->DepthStateWriteOn)
-  {
-    CFRelease(this->DepthStateWriteOn);
-    this->DepthStateWriteOn = nullptr;
-  }
-  if (this->DepthStateWriteOff)
-  {
-    CFRelease(this->DepthStateWriteOff);
-    this->DepthStateWriteOff = nullptr;
-  }
-  if (this->DepthStateAlways)
-  {
-    CFRelease(this->DepthStateAlways);
-    this->DepthStateAlways = nullptr;
-  }
-
   if (this->MetalQueue)
   {
     CFRelease(this->MetalQueue);
@@ -362,19 +346,6 @@ void vtkMetalRenderWindow::Render()
 
   if (this->Size[0] > 0 && this->Size[1] > 0)
   {
-    // Before recreating textures, ensure any previous frame's command buffer
-    // is done so the old textures are not in-flight when we CFRelease them.
-    @autoreleasepool
-    {
-      id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)this->MetalQueue;
-      if (queue)
-      {
-        id<MTLCommandBuffer> syncBuf = [queue commandBuffer];
-        [syncBuf commit];
-        [syncBuf waitUntilCompleted];
-      }
-    }
-
     @autoreleasepool
     {
       id<MTLTexture> depthTex = (__bridge id<MTLTexture>)this->DepthTexture;
@@ -394,22 +365,14 @@ void vtkMetalRenderWindow::Render()
       // Recreate multisample attachments when size or sample count changes
       int effectiveSamples = this->GetEffectiveSampleCount();
       id<MTLTexture> msaaColorTex = (__bridge id<MTLTexture>)this->MultisampleColorTexture;
-      if (effectiveSamples > 1)
+      bool needsMSAACreation = (effectiveSamples > 1) &&
+        (!msaaColorTex || msaaColorTex.width != (NSUInteger)this->Size[0] ||
+         msaaColorTex.height != (NSUInteger)this->Size[1] ||
+         (int)msaaColorTex.sampleCount != effectiveSamples);
+      if (needsMSAACreation)
       {
-        bool needsMSAACreation =
-          !msaaColorTex || msaaColorTex.width != (NSUInteger)this->Size[0] ||
-          msaaColorTex.height != (NSUInteger)this->Size[1] ||
-          (int)msaaColorTex.sampleCount != effectiveSamples;
-        if (needsMSAACreation)
-        {
-          this->DestroyMultisampleAttachments();
-          this->CreateMultisampleAttachments();
-        }
-      }
-      else if (msaaColorTex)
-      {
-        // Sample count dropped to 1 — destroy stale MSAA textures
         this->DestroyMultisampleAttachments();
+        this->CreateMultisampleAttachments();
       }
     }
   }
@@ -506,21 +469,6 @@ void vtkMetalRenderWindow::SetSize(int width, int height)
 {
   if (this->Size[0] != width || this->Size[1] != height)
   {
-    // Wait for GPU to finish before changing drawableSize, otherwise the
-    // old drawable pool is orphaned and its IOGPU memory is never reclaimed.
-    @autoreleasepool
-    {
-      id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)this->MetalQueue;
-      if (queue)
-      {
-        // Create and commit an empty buffer that will complete only after
-        // all previously committed buffers from this queue have finished.
-        id<MTLCommandBuffer> syncBuf = [queue commandBuffer];
-        [syncBuf commit];
-        [syncBuf waitUntilCompleted];
-      }
-    }
-
     this->Superclass::SetSize(width, height);
 
     @autoreleasepool
@@ -553,46 +501,6 @@ void vtkMetalRenderWindow::WaitForCompletion()
       [buf waitUntilCompleted];
     }
   }
-}
-
-//------------------------------------------------------------------------------
-void* vtkMetalRenderWindow::GetOrCreateDepthStencilState(int kind)
-{
-  // kind: 0=Less+Write, 1=Less+NoWrite, 2=Always+NoWrite
-  void** target = nullptr;
-  switch (kind)
-  {
-    case 0: target = &this->DepthStateWriteOn; break;
-    case 1: target = &this->DepthStateWriteOff; break;
-    case 2: target = &this->DepthStateAlways; break;
-    default: return nullptr;
-  }
-
-  if (*target)
-  {
-    return *target;
-  }
-
-  @autoreleasepool
-  {
-    id<MTLDevice> device = (__bridge id<MTLDevice>)this->MetalDevice;
-    if (!device)
-    {
-      return nullptr;
-    }
-
-    MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-    dsDesc.depthWriteEnabled = (kind == 0) ? YES : NO;
-    dsDesc.depthCompareFunction = (kind == 2) ? MTLCompareFunctionAlways : MTLCompareFunctionLess;
-
-    id<MTLDepthStencilState> state = [device newDepthStencilStateWithDescriptor:dsDesc];
-    if (state)
-    {
-      *target = (__bridge void*)state;
-      CFRetain((__bridge CFTypeRef)state);
-    }
-  }
-  return *target;
 }
 
 //------------------------------------------------------------------------------
