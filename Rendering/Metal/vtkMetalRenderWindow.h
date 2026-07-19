@@ -183,6 +183,17 @@ protected:
   void* PeelDepthTexture = nullptr; // id<MTLTexture> — previous depth (RG32Float)
   int PeelIndex = 0;              // current peel iteration
 
+  // Cached depth stencil states — created once, reused per-frame
+  void* DepthStateWriteOn = nullptr;  // id<MTLDepthStencilState> — Less + depthWrite=YES
+  void* DepthStateWriteOff = nullptr; // id<MTLDepthStencilState> — Less + depthWrite=NO
+  void* DepthStateAlways = nullptr;   // id<MTLDepthStencilState> — Always + depthWrite=NO
+
+  /**
+   * Get or create a cached depth stencil state.
+   * Kind: 0=Less+Write, 1=Less+NoWrite, 2=Always+NoWrite
+   */
+  void* GetOrCreateDepthStencilState(int kind);
+
   bool Initialized = false;
 
 private:

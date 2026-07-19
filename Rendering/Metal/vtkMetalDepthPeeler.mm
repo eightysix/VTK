@@ -300,10 +300,8 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
     metalViewport.zfar = 1.0;
     [encoder setViewport:metalViewport];
 
-    MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-    dsDesc.depthCompareFunction = MTLCompareFunctionLess;
-    dsDesc.depthWriteEnabled = NO;
-    id<MTLDepthStencilState> depthState = [device newDepthStencilStateWithDescriptor:dsDesc];
+    id<MTLDepthStencilState> depthState =
+      (__bridge id<MTLDepthStencilState>)renWin->GetOrCreateDepthStencilState(1);
     [encoder setDepthStencilState:depthState];
 
     renWin->DepthPeelingMode = 1;
@@ -362,10 +360,8 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
       metalViewport.zfar = 1.0;
       [encoder setViewport:metalViewport];
 
-      MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-      dsDesc.depthCompareFunction = MTLCompareFunctionAlways;
-      dsDesc.depthWriteEnabled = NO;
-      id<MTLDepthStencilState> depthState = [device newDepthStencilStateWithDescriptor:dsDesc];
+      id<MTLDepthStencilState> depthState =
+        (__bridge id<MTLDepthStencilState>)renWin->GetOrCreateDepthStencilState(2);
       [encoder setDepthStencilState:depthState];
 
       renWin->DepthPeelingMode = 2;

@@ -170,10 +170,8 @@ void vtkMetalRenderer::DeviceRender()
         (__bridge id<MTLTexture>)renWin->DepthTexture;
       if (activeDepthTex)
       {
-        MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-        dsDesc.depthCompareFunction = MTLCompareFunctionLess;
-        dsDesc.depthWriteEnabled = YES;
-        id<MTLDepthStencilState> depthState = [device newDepthStencilStateWithDescriptor:dsDesc];
+        id<MTLDepthStencilState> depthState =
+          (__bridge id<MTLDepthStencilState>)renWin->GetOrCreateDepthStencilState(0);
         [encoder setDepthStencilState:depthState];
       }
 
@@ -268,10 +266,8 @@ void vtkMetalRenderer::DeviceRender()
         (__bridge id<MTLTexture>)renWin->DepthTexture;
       if (activeDepthTex)
       {
-        MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-        dsDesc.depthCompareFunction = MTLCompareFunctionLess;
-        dsDesc.depthWriteEnabled = NO;
-        id<MTLDepthStencilState> depthState = [device newDepthStencilStateWithDescriptor:dsDesc];
+        id<MTLDepthStencilState> depthState =
+          (__bridge id<MTLDepthStencilState>)renWin->GetOrCreateDepthStencilState(1);
         [encoder setDepthStencilState:depthState];
       }
 
@@ -363,12 +359,8 @@ void vtkMetalRenderer::DeviceRender()
         : (__bridge id<MTLTexture>)renWin->DepthTexture;
       if (activeDepthTex)
       {
-        MTLDepthStencilDescriptor* dsDesc =
-          [[MTLDepthStencilDescriptor alloc] init];
-        dsDesc.depthCompareFunction = MTLCompareFunctionLess;
-        dsDesc.depthWriteEnabled = NO;
         id<MTLDepthStencilState> depthState =
-          [device newDepthStencilStateWithDescriptor:dsDesc];
+          (__bridge id<MTLDepthStencilState>)renWin->GetOrCreateDepthStencilState(1);
         [encoder setDepthStencilState:depthState];
       }
 
@@ -540,6 +532,10 @@ void vtkMetalRenderer::DeviceRender()
     // Commit and present
     [commandBuffer presentDrawable:drawable];
     [commandBuffer commit];
+
+    // Clear the transient command buffer pointer — it is ARC-managed
+    // and would dangle after this function returns.
+    renWin->CommandBuffer = nullptr;
   }
 }
 

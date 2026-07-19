@@ -62,6 +62,12 @@ UIView* vtkIOSMetalRenderWindow::GetViewId()
       metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
       metalLayer.contentsScale = scale;
       metalLayer.framebufferOnly = YES;
+      // Release the standalone layer created by CreateMetalLayer() before
+      // overwriting with the view's backing layer to avoid a CFRetain leak.
+      if (this->MetalLayer && this->MetalLayer != (__bridge void*)metalLayer)
+      {
+        CFRelease(this->MetalLayer);
+      }
       this->MetalLayer = (__bridge void*)metalLayer;
       CFRetain((__bridge CFTypeRef)metalLayer);
     }
@@ -81,9 +87,6 @@ void vtkIOSMetalRenderWindow::SetSize(int width, int height)
       CGFloat scale = [UIScreen mainScreen].nativeScale;
       CGRect frame = CGRectMake(0, 0, width / scale, height / scale);
       [this->ViewId setFrame:frame];
-
-      CAMetalLayer* layer = (CAMetalLayer*)[this->ViewId layer];
-      layer.drawableSize = CGSizeMake(width, height);
     }
   }
 }

@@ -1310,7 +1310,8 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       this->Internals->CachedInputMTime = currentMTime;
       this->Internals->CachedRepresentation = representation;
       this->Internals->CachedEdgeVisibility = edgeVisibility;
-      this->BuildGeometryBuffers((__bridge void*)device, input, act);
+      this->BuildGeometryBuffers(
+        (__bridge void*)device, renWin->GetMetalQueue(), input, act);
     }
 
     // P3-3A: Track line width changes (buffer updated at draw time)
@@ -1493,7 +1494,7 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
 }
 
 //------------------------------------------------------------------------------
-void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* polydata, vtkActor* actor)
+void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, void* mtlQueue, vtkPolyData* polydata, vtkActor* actor)
 {
   if (!polydata || !mtlDevice)
   {
@@ -1692,7 +1693,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
 
           // Dispatch polygonToTriangle compute kernel
           id<MTLCommandBuffer> cmdBuf = [(__bridge id<MTLCommandQueue>)
-            [device newCommandQueue] commandBuffer];
+            mtlQueue commandBuffer];
           id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
           [enc setComputePipelineState:this->Internals->PolygonToTrianglePipeline];
           [enc setBuffer:this->Internals->TessOutputConnectivityBuffer offset:0 atIndex:0];
@@ -1795,7 +1796,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                         options:MTLResourceStorageModeShared];
 
             id<MTLCommandBuffer> cmdBuf = [(__bridge id<MTLCommandQueue>)
-              [device newCommandQueue] commandBuffer];
+              mtlQueue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
             [enc setComputePipelineState:this->Internals->PolygonEdgesToLinesPipeline];
             [enc setBuffer:edgeOutBuf offset:0 atIndex:0];
@@ -1897,7 +1898,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                       options:MTLResourceStorageModeShared];
 
           id<MTLCommandBuffer> cmdBuf = [(__bridge id<MTLCommandQueue>)
-            [device newCommandQueue] commandBuffer];
+            mtlQueue commandBuffer];
           id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
           [enc setComputePipelineState:this->Internals->PolygonEdgesToLinesPipeline];
           [enc setBuffer:wireOutBuf offset:0 atIndex:0];
@@ -2007,7 +2008,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                         options:MTLResourceStorageModeShared];
 
             id<MTLCommandBuffer> cmdBuf = [(__bridge id<MTLCommandQueue>)
-              [device newCommandQueue] commandBuffer];
+              mtlQueue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
             [enc setComputePipelineState:this->Internals->PolyLineToLinePipeline];
             [enc setBuffer:lineOutBuf offset:0 atIndex:0];
@@ -3007,7 +3008,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       this->Internals->PrimitiveToCellBuffer)
   {
     id<MTLCommandBuffer> cmdBuf = [(__bridge id<MTLCommandQueue>)
-      [device newCommandQueue] commandBuffer];
+      mtlQueue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
     [encoder setComputePipelineState:this->Internals->CellToPrimitivePipeline];
     [encoder setBuffer:this->Internals->TriangleCellIdBuffer offset:0 atIndex:0];
@@ -3036,7 +3037,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     // Only dispatch lines if we didn't already dispatch triangles
     // (they share PrimitiveToCellBuffer)
     id<MTLCommandBuffer> cmdBuf = [(__bridge id<MTLCommandQueue>)
-      [device newCommandQueue] commandBuffer];
+      mtlQueue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
     [encoder setComputePipelineState:this->Internals->CellToPrimitivePipeline];
     [encoder setBuffer:this->Internals->LineCellIdBuffer offset:0 atIndex:0];
