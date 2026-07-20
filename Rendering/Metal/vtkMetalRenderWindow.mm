@@ -53,9 +53,8 @@ bool vtkMetalRenderWindow::InitializeMetal()
       vtkErrorMacro(<< "Failed to create Metal device");
       return false;
     }
-    // MTLCreateSystemDefaultDevice follows the Create rule (+1).
-    // Under MRC the local is not autoreleased, so the member owns the +1.
     this->MetalDevice = (__bridge void*)device;
+    CFRetain((__bridge CFTypeRef)device);
 
     id<MTLCommandQueue> queue = [device newCommandQueue];
     if (!queue)
@@ -63,8 +62,8 @@ bool vtkMetalRenderWindow::InitializeMetal()
       vtkErrorMacro(<< "Failed to create Metal command queue");
       return false;
     }
-    // newCommandQueue follows the New rule (+1).
     this->MetalQueue = (__bridge void*)queue;
+    CFRetain((__bridge CFTypeRef)queue);
   }
 
   this->Initialized = true;
@@ -226,9 +225,9 @@ void vtkMetalRenderWindow::RecreateDepthTexture()
     desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     desc.storageMode = MTLStorageModePrivate;
 
-    // newTextureWithDescriptor: follows the New rule (+1).
     id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
     this->DepthTexture = (__bridge void*)tex;
+    CFRetain((__bridge CFTypeRef)tex);
   }
 }
 
@@ -251,9 +250,9 @@ void vtkMetalRenderWindow::RecreateIdsTexture()
     desc.usage = MTLTextureUsageRenderTarget;
     desc.storageMode = MTLStorageModeShared;
 
-    // newTextureWithDescriptor: follows the New rule (+1).
     id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
     this->IdsTexture = (__bridge void*)tex;
+    CFRetain((__bridge CFTypeRef)tex);
   }
 }
 
@@ -292,11 +291,11 @@ void vtkMetalRenderWindow::CreateMultisampleAttachments()
       desc.usage = MTLTextureUsageRenderTarget;
       desc.storageMode = MTLStorageModePrivate;
 
-      // newTextureWithDescriptor: follows the New rule (+1).
       id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
       if (tex)
       {
         this->MultisampleColorTexture = (__bridge void*)tex;
+        CFRetain((__bridge CFTypeRef)tex);
       }
     }
 
@@ -312,11 +311,11 @@ void vtkMetalRenderWindow::CreateMultisampleAttachments()
       desc.usage = MTLTextureUsageRenderTarget;
       desc.storageMode = MTLStorageModePrivate;
 
-      // newTextureWithDescriptor: follows the New rule (+1).
       id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
       if (tex)
       {
         this->MultisampleDepthTexture = (__bridge void*)tex;
+        CFRetain((__bridge CFTypeRef)tex);
       }
     }
   }

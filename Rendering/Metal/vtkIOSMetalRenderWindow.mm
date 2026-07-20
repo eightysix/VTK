@@ -62,13 +62,6 @@ UIView* vtkIOSMetalRenderWindow::GetViewId()
       metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
       metalLayer.contentsScale = scale;
       metalLayer.framebufferOnly = YES;
-
-      // Release the standalone layer created by CreateMetalLayer() (base class)
-      // before adopting the view's backing layer.
-      if (this->MetalLayer)
-      {
-        CFRelease(this->MetalLayer);
-      }
       this->MetalLayer = (__bridge void*)metalLayer;
     }
   }

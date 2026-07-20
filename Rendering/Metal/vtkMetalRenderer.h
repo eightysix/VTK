@@ -68,12 +68,6 @@ protected:
 
 private:
   std::unique_ptr<vtkMetalDepthPeeler> DepthPeeler;
-
-  // Cached depth/stencil states to avoid per-frame allocation.
-  // void* to avoid Obj-C types in the header.
-  void* DepthWriteOnState = nullptr;  // id<MTLDepthStencilState> — Less + write ON
-  void* DepthWriteOffState = nullptr; // id<MTLDepthStencilState> — Less + write OFF
-
   vtkMetalRenderer(const vtkMetalRenderer&) = delete;
   void operator=(const vtkMetalRenderer&) = delete;
 };

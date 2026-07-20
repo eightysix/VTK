@@ -261,13 +261,9 @@
   CGFloat scale = [UIScreen mainScreen].nativeScale;
   int w = (int)lround(scale * self.view.bounds.size.width);
   int h = (int)lround(scale * self.view.bounds.size.height);
-  int* sz = _renWin->GetSize();
-  if (sz[0] != w || sz[1] != h)
-  {
-    _renWin->SetSize(w, h);
-    _iren->UpdateSize(w, h);
-    _renWin->Render();
-  }
+  _renWin->SetSize(w, h);
+  _iren->UpdateSize(w, h);
+  _renWin->Render();
 }
 
 @end
