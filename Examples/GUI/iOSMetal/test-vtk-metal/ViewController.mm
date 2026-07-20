@@ -37,8 +37,13 @@
                                                       image:nil
                                                         tag:4];
 
+  VTKMetalBaseViewController* baseVC = [[VTKMetalBaseViewController alloc] init];
+  baseVC.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Base"
+                                                     image:nil
+                                                       tag:5];
+
   UITabBarController* tabBar = [[UITabBarController alloc] init];
-  tabBar.viewControllers = @[ cubeVC, coneVC, volumeVC, dicomVC, niftiVC ];
+  tabBar.viewControllers = @[ cubeVC, coneVC, volumeVC, dicomVC, niftiVC, baseVC ];
   tabBar.view.frame = self.view.bounds;
   tabBar.view.autoresizingMask =
     UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
