@@ -101,6 +101,10 @@ private:
   // Sampler for peeling textures
   id<MTLSamplerState> PeelSampler = nil;
 
+  // Cached depth-stencil states (immutable, created once)
+  id<MTLDepthStencilState> ReadOnlyDepthState = nil;   // Less, write=NO
+  id<MTLDepthStencilState> AlwaysDepthState = nil;     // Always, write=NO
+
   // State
   int CurrentWidth = 0;
   int CurrentHeight = 0;

@@ -23,6 +23,38 @@
 
 VTK_ABI_NAMESPACE_BEGIN
 
+// Cached depth-stencil states (immutable, size-independent).
+// Created lazily on first use; live for the process lifetime.
+static id<MTLDepthStencilState> sOpaqueDepthState = nil;      // Less, write=YES
+static id<MTLDepthStencilState> sReadOnlyDepthState = nil;    // Less, write=NO
+
+static void EnsureDepthStencilStates(id<MTLDevice> device)
+{
+  if (sOpaqueDepthState && sReadOnlyDepthState)
+  {
+    return;
+  }
+
+  @autoreleasepool
+  {
+    if (!sOpaqueDepthState)
+    {
+      MTLDepthStencilDescriptor* desc = [[MTLDepthStencilDescriptor alloc] init];
+      desc.depthCompareFunction = MTLCompareFunctionLess;
+      desc.depthWriteEnabled = YES;
+      sOpaqueDepthState = [device newDepthStencilStateWithDescriptor:desc];
+    }
+
+    if (!sReadOnlyDepthState)
+    {
+      MTLDepthStencilDescriptor* desc = [[MTLDepthStencilDescriptor alloc] init];
+      desc.depthCompareFunction = MTLCompareFunctionLess;
+      desc.depthWriteEnabled = NO;
+      sReadOnlyDepthState = [device newDepthStencilStateWithDescriptor:desc];
+    }
+  }
+}
+
 vtkStandardNewMacro(vtkMetalRenderer);
 
 //------------------------------------------------------------------------------
@@ -80,6 +112,8 @@ void vtkMetalRenderer::DeviceRender()
     {
       return;
     }
+
+    EnsureDepthStencilStates(device);
 
     // Acquire drawable
     CAMetalLayer* layer = (__bridge CAMetalLayer*)renWin->GetMetalLayer();
@@ -170,11 +204,7 @@ void vtkMetalRenderer::DeviceRender()
         (__bridge id<MTLTexture>)renWin->DepthTexture;
       if (activeDepthTex)
       {
-        MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-        dsDesc.depthCompareFunction = MTLCompareFunctionLess;
-        dsDesc.depthWriteEnabled = YES;
-        id<MTLDepthStencilState> depthState = [device newDepthStencilStateWithDescriptor:dsDesc];
-        [encoder setDepthStencilState:depthState];
+        [encoder setDepthStencilState:sOpaqueDepthState];
       }
 
       renWin->CommandBuffer = (__bridge void*)commandBuffer;
@@ -268,11 +298,7 @@ void vtkMetalRenderer::DeviceRender()
         (__bridge id<MTLTexture>)renWin->DepthTexture;
       if (activeDepthTex)
       {
-        MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-        dsDesc.depthCompareFunction = MTLCompareFunctionLess;
-        dsDesc.depthWriteEnabled = NO;
-        id<MTLDepthStencilState> depthState = [device newDepthStencilStateWithDescriptor:dsDesc];
-        [encoder setDepthStencilState:depthState];
+        [encoder setDepthStencilState:sReadOnlyDepthState];
       }
 
       renWin->CommandBuffer = (__bridge void*)commandBuffer;
@@ -363,13 +389,7 @@ void vtkMetalRenderer::DeviceRender()
         : (__bridge id<MTLTexture>)renWin->DepthTexture;
       if (activeDepthTex)
       {
-        MTLDepthStencilDescriptor* dsDesc =
-          [[MTLDepthStencilDescriptor alloc] init];
-        dsDesc.depthCompareFunction = MTLCompareFunctionLess;
-        dsDesc.depthWriteEnabled = NO;
-        id<MTLDepthStencilState> depthState =
-          [device newDepthStencilStateWithDescriptor:dsDesc];
-        [encoder setDepthStencilState:depthState];
+        [encoder setDepthStencilState:sReadOnlyDepthState];
       }
 
       renWin->CommandBuffer = (__bridge void*)commandBuffer;

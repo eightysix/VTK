@@ -47,6 +47,8 @@ void vtkMetalDepthPeeler::Release()
   this->CompositePipeline = nil;
   this->BackBlendPipeline = nil;
   this->AlphaBlendPipeline = nil;
+  this->ReadOnlyDepthState = nil;
+  this->AlwaysDepthState = nil;
   this->PipelinesCreated = false;
   this->CurrentWidth = 0;
   this->CurrentHeight = 0;
@@ -208,6 +210,23 @@ void vtkMetalDepthPeeler::CreatePipelines(id<MTLDevice> device)
     }
   }
 
+  // --- Cached depth-stencil states (immutable, created once) ---
+  if (!this->ReadOnlyDepthState)
+  {
+    MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
+    dsDesc.depthCompareFunction = MTLCompareFunctionLess;
+    dsDesc.depthWriteEnabled = NO;
+    this->ReadOnlyDepthState = [device newDepthStencilStateWithDescriptor:dsDesc];
+  }
+
+  if (!this->AlwaysDepthState)
+  {
+    MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
+    dsDesc.depthCompareFunction = MTLCompareFunctionAlways;
+    dsDesc.depthWriteEnabled = NO;
+    this->AlwaysDepthState = [device newDepthStencilStateWithDescriptor:dsDesc];
+  }
+
   this->PipelinesCreated = (this->InitDepthPipeline && this->CompositePipeline &&
                             this->BackBlendPipeline);
 }
@@ -300,11 +319,7 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
     metalViewport.zfar = 1.0;
     [encoder setViewport:metalViewport];
 
-    MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-    dsDesc.depthCompareFunction = MTLCompareFunctionLess;
-    dsDesc.depthWriteEnabled = NO;
-    id<MTLDepthStencilState> depthState = [device newDepthStencilStateWithDescriptor:dsDesc];
-    [encoder setDepthStencilState:depthState];
+    [encoder setDepthStencilState:this->ReadOnlyDepthState];
 
     renWin->DepthPeelingMode = 1;
     renWin->PeelFrontTexture = nullptr;
@@ -362,11 +377,7 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
       metalViewport.zfar = 1.0;
       [encoder setViewport:metalViewport];
 
-      MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-      dsDesc.depthCompareFunction = MTLCompareFunctionAlways;
-      dsDesc.depthWriteEnabled = NO;
-      id<MTLDepthStencilState> depthState = [device newDepthStencilStateWithDescriptor:dsDesc];
-      [encoder setDepthStencilState:depthState];
+      [encoder setDepthStencilState:this->AlwaysDepthState];
 
       renWin->DepthPeelingMode = 2;
       renWin->PeelFrontTexture = (__bridge void*)frontSrc;
