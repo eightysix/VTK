@@ -1291,9 +1291,6 @@ struct VolumeVertexIn {
   float3 position [[attribute(0)]];
 };
 
-// Per-block data for layer compositing — uploaded as an array indexed by [[instance_id]]
-constant int MAX_LAYER_BRICKS = 8;
-
 struct PerBlockData {
   float4 volumeBoundsMin;
   float4 volumeBoundsMax;
@@ -1425,7 +1422,7 @@ fragment VolumeFragmentOut fragment_volume_main(
     float2 ndcXY = (in.position.xy / volumeUniforms.viewportSize) * 2.0 - 1.0;
     float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
     float3 terminationLocal = ((worldTermination.xyz / worldTermination.w) - volumeUniforms.volumeBoundsMin.xyz) / (volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz);
-    tTerminateMax = dot(terminationLocal - cameraPos, rayDir);
+    tTerminateMax = length(terminationLocal - entryPoint);
   }
 
   if (volumeUniforms.useClipping > 0.5) {
@@ -1445,10 +1442,8 @@ fragment VolumeFragmentOut fragment_volume_main(
       if (rayDotNormal > 0.0 && startDistance > 0.0) entryPoint += (startDistance / rayDotNormal) * rayDir;
       if (rayDotNormal <= 0.0 && stopDistance > 0.0) exitPoint += (stopDistance / rayDotNormal) * rayDir;
     }
-    
-    if (dot(exitPoint - entryPoint, rayDir) < 1e-6) discard_fragment();
-    tStart = dot(entryPoint - cameraPos, rayDir);
-    t.y = dot(exitPoint - cameraPos, rayDir);
+    totalDist = length(exitPoint - entryPoint);
+    if (totalDist < 1e-6) discard_fragment();
   }
 
   // --- LOCAL CACHE WARM-UP (Prevents Uniform Cache Thrashing) ---
@@ -1486,13 +1481,11 @@ fragment VolumeFragmentOut fragment_volume_main(
 
   // --- SOFTWARE PIPELINING INITIALIZATION ---
   float jitter = volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) * stepSize : 0.0;
-  float currentT = jitter + ceil((tStart - jitter) / stepSize - 1e-4) * stepSize;
-  if (currentT >= t.y) discard_fragment();
-
   float3 stepVec = rayDir * stepSize;
-  float3 currentPoint = cameraPos + rayDir * currentT;
-  float totalDistActual = t.y - currentT;
-  int maxSteps = min(max(1, int(ceil(totalDistActual / stepSize))), MAX_RAY_STEPS);
+  float3 currentPoint = entryPoint + (rayDir * jitter);
+  float currentT = jitter;
+
+  int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
 
   half3 accumulatedColor = half3(0.0);
   half accumulatedOpacity = 0.0;
@@ -1538,12 +1531,18 @@ fragment VolumeFragmentOut fragment_volume_main(
         tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
 
         float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
-        float skipDist = (floor(exactSkip / stepSize + 1e-4) + 1.0) * stepSize;
 
+        // Add a tiny epsilon to cross the boundary, then quantize to stepSize.
+        exactSkip += 1e-4;
+        float skipDist = ceil(exactSkip / stepSize) * stepSize;
+
+        // Ensure we always move forward at least one step
+        skipDist = max(stepSize, skipDist);
+
+        currentPoint += rayDir * skipDist;
         currentT += skipDist;
-        currentPoint = cameraPos + rayDir * currentT;
 
-        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y) {
+        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y - tStart) {
           break;
         }
 
@@ -1715,7 +1714,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     float2 ndcXY = (in.position.xy / volumeUniforms.viewportSize) * 2.0 - 1.0;
     float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
     float3 terminationLocal = ((worldTermination.xyz / worldTermination.w) - volumeUniforms.volumeBoundsMin.xyz) / (volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz);
-    tTerminateMax = dot(terminationLocal - cameraPos, rayDir);
+    tTerminateMax = length(terminationLocal - entryPoint);
   }
 
   if (volumeUniforms.useClipping > 0.5) {
@@ -1735,10 +1734,8 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
       if (rayDotNormal > 0.0 && startDistance > 0.0) entryPoint += (startDistance / rayDotNormal) * rayDir;
       if (rayDotNormal <= 0.0 && stopDistance > 0.0) exitPoint += (stopDistance / rayDotNormal) * rayDir;
     }
-    
-    if (dot(exitPoint - entryPoint, rayDir) < 1e-6) discard_fragment();
-    tStart = dot(entryPoint - cameraPos, rayDir);
-    t.y = dot(exitPoint - cameraPos, rayDir);
+    totalDist = length(exitPoint - entryPoint);
+    if (totalDist < 1e-6) discard_fragment();
   }
 
   // --- LOCAL CACHE WARM-UP (Prevents Uniform Cache Thrashing) ---
@@ -1776,13 +1773,11 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
 
   // --- SOFTWARE PIPELINING INITIALIZATION ---
   float jitter = volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) * stepSize : 0.0;
-  float currentT = jitter + ceil((tStart - jitter) / stepSize - 1e-4) * stepSize;
-  if (currentT >= t.y) discard_fragment();
-
   float3 stepVec = rayDir * stepSize;
-  float3 currentPoint = cameraPos + rayDir * currentT;
-  float totalDistActual = t.y - currentT;
-  int maxSteps = min(max(1, int(ceil(totalDistActual / stepSize))), MAX_RAY_STEPS);
+  float3 currentPoint = entryPoint + (rayDir * jitter);
+  float currentT = jitter;
+
+  int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
 
   // PREFETCH the very first samples before the loop starts
   float3 texLocalPos0 = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
@@ -1825,12 +1820,18 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
         tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
 
         float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
-        float skipDist = (floor(exactSkip / stepSize + 1e-4) + 1.0) * stepSize;
 
+        // Add a tiny epsilon to cross the boundary, then quantize to stepSize.
+        exactSkip += 1e-4;
+        float skipDist = ceil(exactSkip / stepSize) * stepSize;
+
+        // Ensure we always move forward at least one step
+        skipDist = max(stepSize, skipDist);
+
+        currentPoint += rayDir * skipDist;
         currentT += skipDist;
-        currentPoint = cameraPos + rayDir * currentT;
 
-        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y) {
+        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y - tStart) {
           break;
         }
 
