@@ -165,16 +165,23 @@ void vtkMetalRenderer::DeviceRender()
         [commandBuffer renderCommandEncoderWithDescriptor:rpd];
       encoder.label = @"VTK Opaque Encoder";
 
-      // Set depth stencil state
+      // Set depth stencil state (cached — Less + depth write ON)
       id<MTLTexture> activeDepthTex = msaa ? msaaDepthTex :
         (__bridge id<MTLTexture>)renWin->DepthTexture;
       if (activeDepthTex)
       {
-        MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-        dsDesc.depthCompareFunction = MTLCompareFunctionLess;
-        dsDesc.depthWriteEnabled = YES;
-        id<MTLDepthStencilState> depthState = [device newDepthStencilStateWithDescriptor:dsDesc];
-        [encoder setDepthStencilState:depthState];
+        if (!this->DepthWriteOnState)
+        {
+          MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
+          dsDesc.depthCompareFunction = MTLCompareFunctionLess;
+          dsDesc.depthWriteEnabled = YES;
+          id<MTLDepthStencilState> ds =
+            [device newDepthStencilStateWithDescriptor:dsDesc];
+          // newDepthStencilStateWithDescriptor: follows the New rule (+1).
+          this->DepthWriteOnState = (__bridge void*)ds;
+        }
+        [encoder setDepthStencilState:
+          (__bridge id<MTLDepthStencilState>)this->DepthWriteOnState];
       }
 
       renWin->CommandBuffer = (__bridge void*)commandBuffer;
@@ -263,16 +270,23 @@ void vtkMetalRenderer::DeviceRender()
         [commandBuffer renderCommandEncoderWithDescriptor:rpd];
       encoder.label = @"VTK Translucent Encoder";
 
-      // Depth test: Less (match opaque), depth write: No
+      // Depth test: Less (match opaque), depth write: No (cached)
       id<MTLTexture> activeDepthTex = msaa ? msaaDepthTex :
         (__bridge id<MTLTexture>)renWin->DepthTexture;
       if (activeDepthTex)
       {
-        MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-        dsDesc.depthCompareFunction = MTLCompareFunctionLess;
-        dsDesc.depthWriteEnabled = NO;
-        id<MTLDepthStencilState> depthState = [device newDepthStencilStateWithDescriptor:dsDesc];
-        [encoder setDepthStencilState:depthState];
+        if (!this->DepthWriteOffState)
+        {
+          MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
+          dsDesc.depthCompareFunction = MTLCompareFunctionLess;
+          dsDesc.depthWriteEnabled = NO;
+          id<MTLDepthStencilState> ds =
+            [device newDepthStencilStateWithDescriptor:dsDesc];
+          // newDepthStencilStateWithDescriptor: follows the New rule (+1).
+          this->DepthWriteOffState = (__bridge void*)ds;
+        }
+        [encoder setDepthStencilState:
+          (__bridge id<MTLDepthStencilState>)this->DepthWriteOffState];
       }
 
       renWin->CommandBuffer = (__bridge void*)commandBuffer;
@@ -358,18 +372,24 @@ void vtkMetalRenderer::DeviceRender()
         [commandBuffer renderCommandEncoderWithDescriptor:rpd];
       encoder.label = @"VTK Volume Encoder";
 
-      // Depth test: Less, depth write: Off (volumes are translucent)
+      // Depth test: Less, depth write: Off (cached — same as translucent)
       id<MTLTexture> activeDepthTex = msaa ? msaaDepthTex
         : (__bridge id<MTLTexture>)renWin->DepthTexture;
       if (activeDepthTex)
       {
-        MTLDepthStencilDescriptor* dsDesc =
-          [[MTLDepthStencilDescriptor alloc] init];
-        dsDesc.depthCompareFunction = MTLCompareFunctionLess;
-        dsDesc.depthWriteEnabled = NO;
-        id<MTLDepthStencilState> depthState =
-          [device newDepthStencilStateWithDescriptor:dsDesc];
-        [encoder setDepthStencilState:depthState];
+        if (!this->DepthWriteOffState)
+        {
+          MTLDepthStencilDescriptor* dsDesc =
+            [[MTLDepthStencilDescriptor alloc] init];
+          dsDesc.depthCompareFunction = MTLCompareFunctionLess;
+          dsDesc.depthWriteEnabled = NO;
+          id<MTLDepthStencilState> ds =
+            [device newDepthStencilStateWithDescriptor:dsDesc];
+          // newDepthStencilStateWithDescriptor: follows the New rule (+1).
+          this->DepthWriteOffState = (__bridge void*)ds;
+        }
+        [encoder setDepthStencilState:
+          (__bridge id<MTLDepthStencilState>)this->DepthWriteOffState];
       }
 
       renWin->CommandBuffer = (__bridge void*)commandBuffer;
@@ -557,6 +577,18 @@ void vtkMetalRenderer::ReleaseGraphicsResources(vtkWindow* w)
   {
     this->DepthPeeler->Release();
   }
+
+  if (this->DepthWriteOnState)
+  {
+    CFRelease(this->DepthWriteOnState);
+    this->DepthWriteOnState = nullptr;
+  }
+  if (this->DepthWriteOffState)
+  {
+    CFRelease(this->DepthWriteOffState);
+    this->DepthWriteOffState = nullptr;
+  }
+
   this->Superclass::ReleaseGraphicsResources(w);
 }
 
