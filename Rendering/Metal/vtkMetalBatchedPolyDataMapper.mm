@@ -153,7 +153,7 @@ void vtkMetalBatchedPolyDataMapper::ReleaseGraphicsResources(vtkWindow* w)
   // Release our batch-specific buffer (cast from void* to id<MTLBuffer>)
   if (this->BatchPropertiesBuffer)
   {
-    CFRelease(this->BatchPropertiesBuffer);
+    [(__bridge id)this->BatchPropertiesBuffer release];
     this->BatchPropertiesBuffer = nullptr;
   }
   this->BatchPropertiesBufferSize = 0;
@@ -179,7 +179,7 @@ void vtkMetalBatchedPolyDataMapper::UpdateBatchPropertiesBuffer(void* mtlDevice)
     // Release old buffer
     if (this->BatchPropertiesBuffer)
     {
-      CFRelease(this->BatchPropertiesBuffer);
+      [(__bridge id)this->BatchPropertiesBuffer release];
     }
     id<MTLBuffer> newBuf = [device
       newBufferWithLength:bufferSize

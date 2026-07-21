@@ -43,6 +43,7 @@ static void EnsureDepthStencilStates(id<MTLDevice> device)
       desc.depthCompareFunction = MTLCompareFunctionLess;
       desc.depthWriteEnabled = YES;
       sOpaqueDepthState = [device newDepthStencilStateWithDescriptor:desc];
+      [desc release];
     }
 
     if (!sReadOnlyDepthState)
@@ -51,6 +52,7 @@ static void EnsureDepthStencilStates(id<MTLDevice> device)
       desc.depthCompareFunction = MTLCompareFunctionLess;
       desc.depthWriteEnabled = NO;
       sReadOnlyDepthState = [device newDepthStencilStateWithDescriptor:desc];
+      [desc release];
     }
   }
 }
@@ -478,8 +480,12 @@ void vtkMetalRenderer::DeviceRender()
 
                 blitPipeline = [device newRenderPipelineStateWithDescriptor:desc
                                                                      error:&error];
+                [desc release];
               }
+              [vFunc release];
+              [fFunc release];
             }
+            [library release];
           }
         }
 
@@ -495,6 +501,7 @@ void vtkMetalRenderer::DeviceRender()
             sDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
             sDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
             blitSampler = [device newSamplerStateWithDescriptor:sDesc];
+            [sDesc release];
           }
 
           // Create blit encoder

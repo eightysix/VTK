@@ -125,13 +125,13 @@ void vtkMetalRenderWindow::Finalize()
 
   if (this->DepthTexture)
   {
-    CFRelease(this->DepthTexture);
+    [(__bridge id)this->DepthTexture release];
     this->DepthTexture = nullptr;
   }
 
   if (this->IdsTexture)
   {
-    CFRelease(this->IdsTexture);
+    [(__bridge id)this->IdsTexture release];
     this->IdsTexture = nullptr;
   }
 
@@ -139,19 +139,19 @@ void vtkMetalRenderWindow::Finalize()
 
   if (this->MetalLayer)
   {
-    CFRelease(this->MetalLayer);
+    [(__bridge id)this->MetalLayer release];
     this->MetalLayer = nullptr;
   }
 
   if (this->MetalQueue)
   {
-    CFRelease(this->MetalQueue);
+    [(__bridge id)this->MetalQueue release];
     this->MetalQueue = nullptr;
   }
 
   if (this->MetalDevice)
   {
-    CFRelease(this->MetalDevice);
+    [(__bridge id)this->MetalDevice release];
     this->MetalDevice = nullptr;
   }
 
@@ -199,7 +199,7 @@ void vtkMetalRenderWindow::ReleaseDrawable()
 {
   if (this->CurrentDrawable)
   {
-    CFRelease(this->CurrentDrawable);
+    [(__bridge id)this->CurrentDrawable release];
     this->CurrentDrawable = nullptr;
   }
 }
@@ -209,7 +209,7 @@ void vtkMetalRenderWindow::RecreateDepthTexture()
 {
   if (this->DepthTexture)
   {
-    CFRelease(this->DepthTexture);
+    [(__bridge id)this->DepthTexture release];
     this->DepthTexture = nullptr;
   }
 
@@ -236,7 +236,7 @@ void vtkMetalRenderWindow::RecreateIdsTexture()
 {
   if (this->IdsTexture)
   {
-    CFRelease(this->IdsTexture);
+    [(__bridge id)this->IdsTexture release];
     this->IdsTexture = nullptr;
   }
 
@@ -291,8 +291,8 @@ void vtkMetalRenderWindow::CreateMultisampleAttachments()
       desc.usage = MTLTextureUsageRenderTarget;
       desc.storageMode = MTLStorageModePrivate;
 
-      // newTextureWithDescriptor returns +1 (new rule); member owns it directly.
       id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+      [desc release];
       if (tex)
       {
         this->MultisampleColorTexture = (__bridge void*)tex;
@@ -311,8 +311,8 @@ void vtkMetalRenderWindow::CreateMultisampleAttachments()
       desc.usage = MTLTextureUsageRenderTarget;
       desc.storageMode = MTLStorageModePrivate;
 
-      // newTextureWithDescriptor returns +1 (new rule); member owns it directly.
       id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+      [desc release];
       if (tex)
       {
         this->MultisampleDepthTexture = (__bridge void*)tex;
@@ -326,12 +326,12 @@ void vtkMetalRenderWindow::DestroyMultisampleAttachments()
 {
   if (this->MultisampleColorTexture)
   {
-    CFRelease(this->MultisampleColorTexture);
+    [(__bridge id)this->MultisampleColorTexture release];
     this->MultisampleColorTexture = nullptr;
   }
   if (this->MultisampleDepthTexture)
   {
-    CFRelease(this->MultisampleDepthTexture);
+    [(__bridge id)this->MultisampleDepthTexture release];
     this->MultisampleDepthTexture = nullptr;
   }
 }

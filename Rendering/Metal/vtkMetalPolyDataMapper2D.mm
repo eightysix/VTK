@@ -52,8 +52,11 @@ struct vtkMetalPolyDataMapper2D::vtkMetalPolyDataMapper2DInternals
 
   void ReleaseBuffers()
   {
+    [PositionBuffer release];
     PositionBuffer = nil;
+    [ColorBuffer release];
     ColorBuffer = nil;
+    [StateBuffer release];
     StateBuffer = nil;
     VertexCount = 0;
     HasTriangles = false;
@@ -294,6 +297,9 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
       if (!vFunc || !fFunc)
       {
         vtkErrorMacro(<< "Failed to find 2D shader functions");
+        [vFunc release];
+        [fFunc release];
+        [library release];
         return;
       }
 
@@ -322,6 +328,7 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         {
           vtkErrorMacro(<< "2D triangle pipeline: " << [[error localizedDescription] UTF8String]);
         }
+        [desc release];
       }
 
       // Line pipeline
@@ -341,6 +348,7 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         {
           vtkErrorMacro(<< "2D line pipeline: " << [[error localizedDescription] UTF8String]);
         }
+        [desc release];
       }
 
       // Point pipeline
@@ -359,7 +367,13 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         {
           vtkErrorMacro(<< "2D point pipeline: " << [[error localizedDescription] UTF8String]);
         }
+        [desc release];
       }
+
+      [vertexDesc release];
+      [vFunc release];
+      [fFunc release];
+      [library release];
     }
 
     // Set state buffer at buffer index 1

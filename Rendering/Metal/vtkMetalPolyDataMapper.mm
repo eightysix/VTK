@@ -1463,6 +1463,7 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       sDesc.minFilter = MTLSamplerMinMagFilterLinear;
       sDesc.magFilter = MTLSamplerMinMagFilterLinear;
       this->Internals->DefaultSampler = [device newSamplerStateWithDescriptor:sDesc];
+      [sDesc release];
     }
 
     // 8C: Render bundle — check if cached encoder commands can be replayed.
@@ -1650,7 +1651,9 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
             {
               this->Internals->PolygonToTrianglePipeline =
                 [device newComputePipelineStateWithFunction:func error:&error];
+              [func release];
             }
+            [library release];
           }
         }
 
@@ -1760,7 +1763,9 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
               {
                 this->Internals->PolygonEdgesToLinesPipeline =
                   [device newComputePipelineStateWithFunction:func error:&error];
+                [func release];
               }
+              [library release];
             }
           }
 
@@ -1862,7 +1867,9 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
             {
               this->Internals->PolygonEdgesToLinesPipeline =
                 [device newComputePipelineStateWithFunction:func error:&error];
+              [func release];
             }
+            [library release];
           }
         }
 
@@ -1972,7 +1979,9 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
               {
                 this->Internals->PolyLineToLinePipeline =
                   [device newComputePipelineStateWithFunction:func error:&error];
+                [func release];
               }
+              [library release];
             }
           }
 
@@ -2996,7 +3005,9 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       {
         this->Internals->CellToPrimitivePipeline =
           [device newComputePipelineStateWithFunction:kernelFunc error:&error];
+        [kernelFunc release];
       }
+      [library release];
     }
   }
 
@@ -3085,6 +3096,9 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   if (!vertexFunc || !fragmentFunc)
   {
     vtkErrorMacro(<< "Failed to find shader functions");
+    [vertexFunc release];
+    [fragmentFunc release];
+    [library release];
     return;
   }
 
@@ -3143,6 +3157,12 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
       vtkErrorMacro(<< "Line pipeline: " << [[error localizedDescription] UTF8String]);
     }
   }
+
+  [vertexFunc release];
+  [fragmentFunc release];
+  [vertexDesc release];
+  [pipelineDesc release];
+  [library release];
 }
 
 //------------------------------------------------------------------------------
@@ -3195,7 +3215,10 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
       {
         vtkErrorMacro(<< "Point pipeline: " << [[error localizedDescription] UTF8String]);
       }
+      [desc release];
     }
+    [vFunc release];
+    [fFunc release];
   }
 
   // --- Shaped point pipeline (instanced triangle-strip quads) ---
@@ -3227,8 +3250,13 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
       {
         vtkErrorMacro(<< "Point shaped pipeline: " << [[error localizedDescription] UTF8String]);
       }
+      [desc release];
     }
+    [vFunc release];
+    [fFunc release];
   }
+
+  [library release];
 }
 
 //------------------------------------------------------------------------------
@@ -3295,7 +3323,12 @@ void vtkMetalPolyDataMapper::EnsureEdgePipelineState(void* mtlDevice)
     {
       vtkErrorMacro(<< "Edge pipeline: " << [[error localizedDescription] UTF8String]);
     }
+    [desc release];
+    [vertexDesc release];
   }
+  [vFunc release];
+  [fFunc release];
+  [library release];
 }
 
 //------------------------------------------------------------------------------
@@ -3345,7 +3378,11 @@ void vtkMetalPolyDataMapper::EnsureThickLinePipelineState(void* mtlDevice)
     {
       vtkErrorMacro(<< "Thick line pipeline: " << [[error localizedDescription] UTF8String]);
     }
+    [desc release];
   }
+  [vFunc release];
+  [fFunc release];
+  [library release];
 }
 
 //------------------------------------------------------------------------------
@@ -3395,7 +3432,11 @@ void vtkMetalPolyDataMapper::EnsureRoundCapLinePipelineState(void* mtlDevice)
     {
       vtkErrorMacro(<< "Round cap line pipeline: " << [[error localizedDescription] UTF8String]);
     }
+    [desc release];
   }
+  [vFunc release];
+  [fFunc release];
+  [library release];
 }
 
 //------------------------------------------------------------------------------
@@ -3445,7 +3486,11 @@ void vtkMetalPolyDataMapper::EnsureMiterJoinLinePipelineState(void* mtlDevice)
     {
       vtkErrorMacro(<< "Miter join line pipeline: " << [[error localizedDescription] UTF8String]);
     }
+    [desc release];
   }
+  [vFunc release];
+  [fFunc release];
+  [library release];
 }
 
 //------------------------------------------------------------------------------
@@ -3475,6 +3520,7 @@ void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
   id<MTLFunction> vertexFunc = [library newFunctionWithName:@"vertex_main"];
   if (!vertexFunc)
   {
+    [library release];
     return;
   }
 
@@ -3523,7 +3569,9 @@ void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
       {
         vtkErrorMacro(<< "Init peel pipeline: " << [[error localizedDescription] UTF8String]);
       }
+      [desc release];
     }
+    [fragFunc release];
   }
 
   // --- Main peel pipeline ---
@@ -3570,8 +3618,14 @@ void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
       {
         vtkErrorMacro(<< "Peel pipeline: " << [[error localizedDescription] UTF8String]);
       }
+      [desc release];
     }
+    [fragFunc release];
   }
+
+  [vertexFunc release];
+  [vertexDesc release];
+  [library release];
 }
 
 //------------------------------------------------------------------------------
@@ -4028,6 +4082,7 @@ void vtkMetalPolyDataMapper::UpdateActorTexture(void* mtlDevice, vtkActor* actor
   texDesc.storageMode = MTLStorageModeShared;
 
   this->Internals->ActorTexture = [device newTextureWithDescriptor:texDesc];
+  [texDesc release];
   if (!this->Internals->ActorTexture)
   {
     vtkErrorMacro(<< "Failed to create Metal texture");
@@ -4106,6 +4161,7 @@ void vtkMetalPolyDataMapper::UpdateActorTexture(void* mtlDevice, vtkActor* actor
   samplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
   samplerDesc.magFilter = MTLSamplerMinMagFilterLinear;
   this->Internals->ActorSampler = [device newSamplerStateWithDescriptor:samplerDesc];
+  [samplerDesc release];
 }
 
 VTK_ABI_NAMESPACE_END

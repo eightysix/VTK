@@ -101,7 +101,9 @@ struct vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals
 
   void ReleaseSourceBuffers()
   {
+    [SrcPositionBuffer release];
     SrcPositionBuffer = nil;
+    [SrcNormalBuffer release];
     SrcNormalBuffer = nil;
     SrcVertexCount = 0;
     TriVertexCount = LineVertexCount = PtVertexCount = 0;
@@ -111,9 +113,13 @@ struct vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals
 
   void ReleaseInstanceBuffers()
   {
+    [InstTransformBuffer release];
     InstTransformBuffer = nil;
+    [InstNormalTransformBuffer release];
     InstNormalTransformBuffer = nil;
+    [InstColorBuffer release];
     InstColorBuffer = nil;
+    [InstPickIdBuffer release];
     InstPickIdBuffer = nil;
     NumInstances = 0;
   }
@@ -122,14 +128,23 @@ struct vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals
   {
     ReleaseSourceBuffers();
     ReleaseInstanceBuffers();
+    [TriPipeline release];
     TriPipeline = nil;
+    [LinePipeline release];
     LinePipeline = nil;
+    [PtPipeline release];
     PtPipeline = nil;
+    [SceneBuffer release];
     SceneBuffer = nil;
+    [MaterialBuffer release];
     MaterialBuffer = nil;
+    [LightBuffer release];
     LightBuffer = nil;
+    [CoincidentBuffer release];
     CoincidentBuffer = nil;
+    [ClipPlaneBuffer release];
     ClipPlaneBuffer = nil;
+    [PropIdBuffer release];
     PropIdBuffer = nil;
     CachedSampleCount = 0;
   }
@@ -424,7 +439,11 @@ static void EnsureGlyphPipelines(
     id<MTLFunction> vf = [lib newFunctionWithName:vName];
     id<MTLFunction> ff = [lib newFunctionWithName:fName];
     if (!vf || !ff)
+    {
+      [vf release];
+      [ff release];
       return nil;
+    }
 
     MTLRenderPipelineDescriptor* d = [[MTLRenderPipelineDescriptor alloc] init];
     d.vertexFunction = vf;
@@ -446,6 +465,9 @@ static void EnsureGlyphPipelines(
       vtkGenericWarningMacro(<< "Glyph pipeline error: "
                              << [[error localizedDescription] UTF8String]);
     }
+    [d release];
+    [vf release];
+    [ff release];
     return ps;
   };
 
@@ -464,6 +486,8 @@ static void EnsureGlyphPipelines(
     I->PtPipeline = makePipeline(@"vertex_glyph_point_main", @"fragment_glyph_point_main",
                                  MTLPrimitiveTopologyClassPoint);
   }
+
+  [lib release];
 }
 
 // ---------------------------------------------------------------------------

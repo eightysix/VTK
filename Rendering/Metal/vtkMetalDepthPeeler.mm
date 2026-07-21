@@ -35,19 +35,33 @@ bool vtkMetalDepthPeeler::NeedsInitialization(int width, int height) const
 //------------------------------------------------------------------------------
 void vtkMetalDepthPeeler::Release()
 {
+  [this->FrontPeelA release];
   this->FrontPeelA = nil;
+  [this->FrontPeelB release];
   this->FrontPeelB = nil;
+  [this->BackPeelTemp release];
   this->BackPeelTemp = nil;
+  [this->BackAccum release];
   this->BackAccum = nil;
+  [this->DepthPeelA release];
   this->DepthPeelA = nil;
+  [this->DepthPeelB release];
   this->DepthPeelB = nil;
+  [this->PeelUniformBuffer release];
   this->PeelUniformBuffer = nil;
+  [this->PeelSampler release];
   this->PeelSampler = nil;
+  [this->InitDepthPipeline release];
   this->InitDepthPipeline = nil;
+  [this->CompositePipeline release];
   this->CompositePipeline = nil;
+  [this->BackBlendPipeline release];
   this->BackBlendPipeline = nil;
+  [this->AlphaBlendPipeline release];
   this->AlphaBlendPipeline = nil;
+  [this->ReadOnlyDepthState release];
   this->ReadOnlyDepthState = nil;
+  [this->AlwaysDepthState release];
   this->AlwaysDepthState = nil;
   this->PipelinesCreated = false;
   this->CurrentWidth = 0;
@@ -151,7 +165,10 @@ void vtkMetalDepthPeeler::CreatePipelines(id<MTLDevice> device)
       {
         vtkGenericWarningMacro(<< "Init depth pipeline: " << [[error localizedDescription] UTF8String]);
       }
+      [desc release];
     }
+    [vFunc release];
+    [fFunc release];
   }
 
   // --- Composite pipeline ---
@@ -179,7 +196,10 @@ void vtkMetalDepthPeeler::CreatePipelines(id<MTLDevice> device)
       {
         vtkGenericWarningMacro(<< "Composite pipeline: " << [[error localizedDescription] UTF8String]);
       }
+      [desc release];
     }
+    [vFunc release];
+    [fFunc release];
   }
 
   // --- Back blend pipeline ---
@@ -207,7 +227,10 @@ void vtkMetalDepthPeeler::CreatePipelines(id<MTLDevice> device)
       {
         vtkGenericWarningMacro(<< "Back blend pipeline: " << [[error localizedDescription] UTF8String]);
       }
+      [desc release];
     }
+    [vFunc release];
+    [fFunc release];
   }
 
   // --- Cached depth-stencil states (immutable, created once) ---
@@ -217,6 +240,7 @@ void vtkMetalDepthPeeler::CreatePipelines(id<MTLDevice> device)
     dsDesc.depthCompareFunction = MTLCompareFunctionLess;
     dsDesc.depthWriteEnabled = NO;
     this->ReadOnlyDepthState = [device newDepthStencilStateWithDescriptor:dsDesc];
+    [dsDesc release];
   }
 
   if (!this->AlwaysDepthState)
@@ -225,7 +249,10 @@ void vtkMetalDepthPeeler::CreatePipelines(id<MTLDevice> device)
     dsDesc.depthCompareFunction = MTLCompareFunctionAlways;
     dsDesc.depthWriteEnabled = NO;
     this->AlwaysDepthState = [device newDepthStencilStateWithDescriptor:dsDesc];
+    [dsDesc release];
   }
+
+  [library release];
 
   this->PipelinesCreated = (this->InitDepthPipeline && this->CompositePipeline &&
                             this->BackBlendPipeline);
