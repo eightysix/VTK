@@ -16,9 +16,16 @@
 
 #include <vtkSmartPointer.h>
 
+// Fixed CT HU→u8 mapping matching Eyesight-iOS VTK_HU2U8.
+// Maps the standard CT range [-1024, 3071] to [0, 255].
+static const double kHUshift = 1024.0;
+static const double kHUscale = 255.0 / 4095.0;
+
+static inline double HU2U8(double hu) {
+  return (hu + kHUshift) * kHUscale;
+}
+
 @interface DICOMVolumeViewController ()
-@property (nonatomic, assign) double dataMin;
-@property (nonatomic, assign) double dataRange;
 @property (nonatomic, assign) BOOL dataLoaded;
 @end
 
@@ -43,21 +50,12 @@
   reader->SetDirectoryName([path UTF8String]);
   reader->Update();
 
-  // Cast to unsigned char for better performance on iOS.
-  // Rescale data to [0, 255] using the scalar range from the reader.
-  double scalarRange[2];
-  reader->GetOutput()->GetScalarRange(scalarRange);
-  self.dataMin = scalarRange[0];
-  double dataMax = scalarRange[1];
-  self.dataRange = dataMax - self.dataMin;
-  if (self.dataRange == 0.0) {
-    self.dataRange = 1.0;
-  }
-
+  // Cast to unsigned char using fixed CT HU range mapping.
+  // This matches Eyesight-iOS: u8 = (hu + 1024) * (255 / 4095).
   vtkNew<vtkImageShiftScale> castToU8;
   castToU8->SetInputConnection(reader->GetOutputPort());
-  castToU8->SetShift(-self.dataMin);
-  castToU8->SetScale(255.0 / self.dataRange);
+  castToU8->SetShift(kHUshift);
+  castToU8->SetScale(kHUscale);
   castToU8->SetOutputScalarTypeToUnsignedChar();
   castToU8->ClampOverflowOn();
   castToU8->Update();
@@ -96,10 +94,6 @@
 
   vtkVolumeProperty *property = volume->GetProperty();
 
-  auto rescale = [&](double hu) -> double {
-    return (hu - self.dataMin) / self.dataRange * 255.0;
-  };
-
   vtkNew<vtkColorTransferFunction> colorFunc;
   vtkNew<vtkPiecewiseFunction> opacityFunc;
 
@@ -111,8 +105,8 @@
       NSArray<ColorTransferFunctionMember *> *ctf = preset.colorTransferFunctions[i];
       if (otf.count == ctf.count) {
         for (NSUInteger j = 0; j < otf.count; j++) {
-          opacityFunc->AddPoint(rescale(otf[j].x), otf[j].y);
-          colorFunc->AddRGBPoint(rescale(otf[j].x), ctf[j].red, ctf[j].green, ctf[j].blue);
+          opacityFunc->AddPoint(HU2U8(otf[j].x), otf[j].y);
+          colorFunc->AddRGBPoint(HU2U8(otf[j].x), ctf[j].red, ctf[j].green, ctf[j].blue);
         }
       }
     }
