@@ -189,6 +189,32 @@ inline bool IsContiguousScalarFloat(int dataType, int numComponents, vtkIdType n
     bytesPerVoxel == sizeof(float) &&
     ptr == static_cast<const float*>(ptr); // alignment check
 }
+
+// Release a Metal object held as a void* member (MRC helper).
+// Uses -release rather than CFRelease for proper Objective-C semantics.
+inline void ReleaseMetalObject(void*& obj)
+{
+  if (obj)
+  {
+    [(__bridge id)obj release];
+    obj = nullptr;
+  }
+}
+
+// Takes ownership of a +1 Metal object into a void* member slot.
+// Releases the previous occupant if any.
+inline void AssignMetalObject(void*& slot, id obj)
+{
+  if (slot == (__bridge void*)obj)
+  {
+    return;
+  }
+  if (slot)
+  {
+    [(__bridge id)slot release];
+  }
+  slot = (__bridge void*)obj;
+}
 }
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -331,14 +357,14 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
     colorDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     colorDesc.storageMode = MTLStorageModePrivate;
 
-    // newTextureWithDescriptor returns +1 (new rule); member owns it directly.
     id<MTLTexture> colorTex = [device newTextureWithDescriptor:colorDesc];
+    [colorDesc release];
     if (!colorTex)
     {
       vtkErrorMacro("Failed to create image-sample color texture");
       return false;
     }
-    this->ImageSampleColorTexture = (__bridge void*)colorTex;
+    AssignMetalObject(this->ImageSampleColorTexture, colorTex);
 
     // Create blit pipeline (fullscreen quad that samples the offscreen texture)
     NSError* error = nil;
@@ -357,6 +383,9 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
     if (!vertexFunc || !fragmentFunc)
     {
       vtkErrorMacro("Failed to find image-sample blit shader functions");
+      [vertexFunc release];
+      [fragmentFunc release];
+      [library release];
       this->ReleaseImageSampleResources();
       return false;
     }
@@ -377,13 +406,17 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
 
     id<MTLRenderPipelineState> pso =
       [device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
+    [pipelineDesc release];
     if (!pso)
     {
       vtkErrorMacro(<< "Image-sample blit pipeline: " << [[error localizedDescription] UTF8String]);
+      [vertexFunc release];
+      [fragmentFunc release];
+      [library release];
       this->ReleaseImageSampleResources();
       return false;
     }
-    this->ImageSamplePipeline = (__bridge void*)pso;
+    AssignMetalObject(this->ImageSamplePipeline, pso);
 
     // Create linear sampler for blit
     MTLSamplerDescriptor* sDesc = [[MTLSamplerDescriptor alloc] init];
@@ -391,9 +424,13 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
     sDesc.magFilter = MTLSamplerMinMagFilterLinear;
     sDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
     sDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
-    // newSamplerStateWithDescriptor returns +1 (new rule); member owns it directly.
     id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:sDesc];
-    this->ImageSampleSampler = (__bridge void*)sampler;
+    [sDesc release];
+    AssignMetalObject(this->ImageSampleSampler, sampler);
+
+    [vertexFunc release];
+    [fragmentFunc release];
+    [library release];
 
     this->ImageSampleFBOWidth = width;
     this->ImageSampleFBOHeight = height;
@@ -406,26 +443,10 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
 //------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::ReleaseImageSampleResources()
 {
-  if (this->ImageSampleColorTexture)
-  {
-    CFRelease(this->ImageSampleColorTexture);
-    this->ImageSampleColorTexture = nullptr;
-  }
-  if (this->ImageSampleDepthTexture)
-  {
-    CFRelease(this->ImageSampleDepthTexture);
-    this->ImageSampleDepthTexture = nullptr;
-  }
-  if (this->ImageSamplePipeline)
-  {
-    CFRelease(this->ImageSamplePipeline);
-    this->ImageSamplePipeline = nullptr;
-  }
-  if (this->ImageSampleSampler)
-  {
-    CFRelease(this->ImageSampleSampler);
-    this->ImageSampleSampler = nullptr;
-  }
+  ReleaseMetalObject(this->ImageSampleColorTexture);
+  ReleaseMetalObject(this->ImageSampleDepthTexture);
+  ReleaseMetalObject(this->ImageSamplePipeline);
+  ReleaseMetalObject(this->ImageSampleSampler);
   this->ImageSampleFBOWidth = 0;
   this->ImageSampleFBOHeight = 0;
   this->ImageSamplePixelFormat = 0;
@@ -433,11 +454,7 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseImageSampleResources()
   // Release order-independent compositing layer textures
   for (int i = 0; i < 8; ++i)
   {
-    if (this->LayerColorTexture[i])
-    {
-      CFRelease(this->LayerColorTexture[i]);
-      this->LayerColorTexture[i] = nullptr;
-    }
+    ReleaseMetalObject(this->LayerColorTexture[i]);
   }
   this->LayerFBOWidth = 0;
   this->LayerFBOHeight = 0;
@@ -452,11 +469,7 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureLayerResources(void* deviceVoid, int 
   // Release old textures if size changed
   for (int i = 0; i < 8; ++i)
   {
-    if (this->LayerColorTexture[i])
-    {
-      CFRelease(this->LayerColorTexture[i]);
-      this->LayerColorTexture[i] = nullptr;
-    }
+    ReleaseMetalObject(this->LayerColorTexture[i]);
   }
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
@@ -471,11 +484,15 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureLayerResources(void* deviceVoid, int 
 
   for (int i = 0; i < 8; ++i)
   {
-    // newTextureWithDescriptor returns +1 (new rule); member owns it directly.
     id<MTLTexture> t = [device newTextureWithDescriptor:d];
-    if (!t) return false;
+    if (!t)
+    {
+      [d release];
+      return false;
+    }
     this->LayerColorTexture[i] = (__bridge void*)t;
   }
+  [d release];
   this->LayerFBOWidth = w;
   this->LayerFBOHeight = h;
   return true;
@@ -487,111 +504,31 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   this->ReleaseImageSampleResources();
   this->ClearBlocks();
 
-  if (this->PipelineState)
-  {
-    CFRelease(this->PipelineState);
-    this->PipelineState = nullptr;
-  }
-
-  if (this->AccumulationPipelineState)
-  {
-    CFRelease(this->AccumulationPipelineState);
-    this->AccumulationPipelineState = nullptr;
-  }
-
-  if (this->LayerPipelineState)
-  {
-    CFRelease(this->LayerPipelineState);
-    this->LayerPipelineState = nullptr;
-  }
-
-  if (this->CompositePipelineState)
-  {
-    CFRelease(this->CompositePipelineState);
-    this->CompositePipelineState = nullptr;
-  }
-
-  if (this->VolumeTexture)
-  {
-    CFRelease(this->VolumeTexture);
-    this->VolumeTexture = nullptr;
-  }
-
-  if (this->VolumeSampler)
-  {
-    CFRelease(this->VolumeSampler);
-    this->VolumeSampler = nullptr;
-  }
-
-  if (this->ColorOpacityTexture)
-  {
-    CFRelease(this->ColorOpacityTexture);
-    this->ColorOpacityTexture = nullptr;
-  }
-
-  if (this->ColorOpacitySampler)
-  {
-    CFRelease(this->ColorOpacitySampler);
-    this->ColorOpacitySampler = nullptr;
-  }
-
-  if (this->GradientOpacityTexture)
-  {
-    CFRelease(this->GradientOpacityTexture);
-    this->GradientOpacityTexture = nullptr;
-  }
-
-  if (this->GradientOpacitySampler)
-  {
-    CFRelease(this->GradientOpacitySampler);
-    this->GradientOpacitySampler = nullptr;
-  }
-
-  if (this->MinMaxTexture)
-  {
-    CFRelease(this->MinMaxTexture);
-    this->MinMaxTexture = nullptr;
-  }
-  if (this->MinMaxSampler)
-  {
-    CFRelease(this->MinMaxSampler);
-    this->MinMaxSampler = nullptr;
-  }
+  ReleaseMetalObject(this->PipelineState);
+  ReleaseMetalObject(this->AccumulationPipelineState);
+  ReleaseMetalObject(this->LayerPipelineState);
+  ReleaseMetalObject(this->CompositePipelineState);
+  ReleaseMetalObject(this->VolumeTexture);
+  ReleaseMetalObject(this->VolumeSampler);
+  ReleaseMetalObject(this->ColorOpacityTexture);
+  ReleaseMetalObject(this->ColorOpacitySampler);
+  ReleaseMetalObject(this->GradientOpacityTexture);
+  ReleaseMetalObject(this->GradientOpacitySampler);
+  ReleaseMetalObject(this->MinMaxTexture);
+  ReleaseMetalObject(this->MinMaxSampler);
 
   this->ReleaseMaskResources();
 
-  if (this->DepthSampler)
-  {
-    CFRelease(this->DepthSampler);
-    this->DepthSampler = nullptr;
-  }
-
-  if (this->DepthStencilState)
-  {
-    CFRelease(this->DepthStencilState);
-    this->DepthStencilState = nullptr;
-  }
+  ReleaseMetalObject(this->DepthSampler);
+  ReleaseMetalObject(this->DepthStencilState);
 
   for (int i = 0; i < 3; ++i)
   {
-    if (this->UniformBuffers[i])
-    {
-      CFRelease(this->UniformBuffers[i]);
-      this->UniformBuffers[i] = nullptr;
-    }
+    ReleaseMetalObject(this->UniformBuffers[i]);
   }
 
-  if (this->VertexBuffer)
-  {
-    CFRelease(this->VertexBuffer);
-    this->VertexBuffer = nullptr;
-  }
-
-  if (this->IndexBuffer)
-  {
-    CFRelease(this->IndexBuffer);
-    this->IndexBuffer = nullptr;
-  }
+  ReleaseMetalObject(this->VertexBuffer);
+  ReleaseMetalObject(this->IndexBuffer);
 }
 
 //------------------------------------------------------------------------------
@@ -1019,11 +956,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       }
       else
       {
-        if (this->VolumeTexture)
-        {
-          CFRelease(this->VolumeTexture);
-          this->VolumeTexture = nullptr;
-        }
+        ReleaseMetalObject(this->VolumeTexture);
 
         MTLTextureDescriptor* texDesc = [[MTLTextureDescriptor alloc] init];
         texDesc.textureType = MTLTextureType3D;
@@ -1036,6 +969,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
         texDesc.storageMode = MTLStorageModePrivate;
 
         tex = [device newTextureWithDescriptor:texDesc];
+        [texDesc release];
         if (!tex)
         {
           vtkErrorMacro("Failed to create 3D volume texture");
@@ -1136,11 +1070,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
       }
       else
       {
-        if (this->ColorOpacityTexture)
-        {
-          CFRelease(this->ColorOpacityTexture);
-          this->ColorOpacityTexture = nullptr;
-        }
+        ReleaseMetalObject(this->ColorOpacityTexture);
 
         MTLTextureDescriptor* tfDesc = [[MTLTextureDescriptor alloc] init];
         tfDesc.textureType = MTLTextureType2D;
@@ -1152,6 +1082,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
         tfDesc.storageMode = MTLStorageModeShared;
 
         tex = [device newTextureWithDescriptor:tfDesc];
+        [tfDesc release];
         if (!tex)
         {
           vtkErrorMacro("Failed to create transfer function texture");
@@ -1232,11 +1163,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
       }
       else
       {
-        if (this->GradientOpacityTexture)
-        {
-          CFRelease(this->GradientOpacityTexture);
-          this->GradientOpacityTexture = nullptr;
-        }
+        ReleaseMetalObject(this->GradientOpacityTexture);
 
         MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
         desc.textureType = MTLTextureType2D;
@@ -1248,6 +1175,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
         desc.storageMode = MTLStorageModeShared;
 
         tex = [device newTextureWithDescriptor:desc];
+        [desc release];
         if (!tex)
         {
           vtkErrorMacro("Failed to create gradient opacity texture");
@@ -1364,11 +1292,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMaskTexture(
       }
       else
       {
-        if (this->MaskTexture)
-        {
-          CFRelease(this->MaskTexture);
-          this->MaskTexture = nullptr;
-        }
+        ReleaseMetalObject(this->MaskTexture);
 
         MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
         desc.textureType = MTLTextureType3D;
@@ -1381,6 +1305,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMaskTexture(
         desc.storageMode = MTLStorageModeShared;
 
         tex = [device newTextureWithDescriptor:desc];
+        [desc release];
         if (!tex)
         {
           vtkErrorMacro("Failed to create mask texture");
@@ -1524,8 +1449,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateLabelMapTransferTexture(
       {
         if (this->LabelMapTransferTexture)
         {
-          CFRelease(this->LabelMapTransferTexture);
-          this->LabelMapTransferTexture = nullptr;
+          ReleaseMetalObject(this->LabelMapTransferTexture);
         }
 
         MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
@@ -1538,6 +1462,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateLabelMapTransferTexture(
         desc.storageMode = MTLStorageModeShared;
 
         tex = [device newTextureWithDescriptor:desc];
+        [desc release];
         if (!tex)
         {
           vtkErrorMacro("Failed to create label map transfer texture");
@@ -1637,36 +1562,12 @@ void vtkMetalGPUVolumeRayCastMapper::SetMaskUniforms(void* uniforms, vtkVolume* 
 //------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::ReleaseMaskResources()
 {
-  if (this->MaskTexture)
-  {
-    CFRelease(this->MaskTexture);
-    this->MaskTexture = nullptr;
-  }
-  if (this->MaskSampler)
-  {
-    CFRelease(this->MaskSampler);
-    this->MaskSampler = nullptr;
-  }
-  if (this->LabelMapTransferTexture)
-  {
-    CFRelease(this->LabelMapTransferTexture);
-    this->LabelMapTransferTexture = nullptr;
-  }
-  if (this->LabelMapTransferSampler)
-  {
-    CFRelease(this->LabelMapTransferSampler);
-    this->LabelMapTransferSampler = nullptr;
-  }
-  if (this->LabelMapGradientOpacityTexture)
-  {
-    CFRelease(this->LabelMapGradientOpacityTexture);
-    this->LabelMapGradientOpacityTexture = nullptr;
-  }
-  if (this->LabelMapGradientOpacitySampler)
-  {
-    CFRelease(this->LabelMapGradientOpacitySampler);
-    this->LabelMapGradientOpacitySampler = nullptr;
-  }
+  ReleaseMetalObject(this->MaskTexture);
+  ReleaseMetalObject(this->MaskSampler);
+  ReleaseMetalObject(this->LabelMapTransferTexture);
+  ReleaseMetalObject(this->LabelMapTransferSampler);
+  ReleaseMetalObject(this->LabelMapGradientOpacityTexture);
+  ReleaseMetalObject(this->LabelMapGradientOpacitySampler);
 }
 
 //------------------------------------------------------------------------------
@@ -1674,16 +1575,8 @@ void vtkMetalGPUVolumeRayCastMapper::ClearBlocks()
 {
   for (auto& block : this->Blocks)
   {
-    if (block.Texture)
-    {
-      CFRelease(block.Texture);
-      block.Texture = nullptr;
-    }
-    if (block.MinMaxTexture)
-    {
-      CFRelease(block.MinMaxTexture);
-      block.MinMaxTexture = nullptr;
-    }
+    ReleaseMetalObject(block.Texture);
+    ReleaseMetalObject(block.MinMaxTexture);
   }
   this->Blocks.clear();
   this->BlockScalarRanges.clear();
@@ -1962,11 +1855,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
       }
       else
       {
-        if (this->MinMaxTexture)
-        {
-          CFRelease(this->MinMaxTexture);
-          this->MinMaxTexture = nullptr;
-        }
+        ReleaseMetalObject(this->MinMaxTexture);
 
         MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
         desc.textureType = MTLTextureType3D;
@@ -1979,6 +1868,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
         desc.storageMode = MTLStorageModeShared;
 
         tex = [device newTextureWithDescriptor:desc];
+        [desc release];
         if (!tex)
         {
           vtkErrorMacro("Failed to create min-max acceleration texture");
@@ -2556,6 +2446,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       texDesc.storageMode = MTLStorageModePrivate;
 
       id<MTLTexture> tex = [device newTextureWithDescriptor:texDesc];
+      [texDesc release];
       if (!tex)
       {
         vtkErrorMacro(<< "Failed to create block " << idx << " 3D texture ("
@@ -2702,6 +2593,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
         mmDesc.storageMode = MTLStorageModeShared;
 
         id<MTLTexture> mmTex = [device newTextureWithDescriptor:mmDesc];
+        [mmDesc release];
         if (mmTex)
         {
           MTLRegion region = MTLRegionMake3D(0, 0, 0, mmDims0, mmDims1, mmDims2);
@@ -3015,13 +2907,11 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         // Release old buffers
         if (this->VertexBuffer)
         {
-          CFRelease(this->VertexBuffer);
-          this->VertexBuffer = nullptr;
+          ReleaseMetalObject(this->VertexBuffer);
         }
         if (this->IndexBuffer)
         {
-          CFRelease(this->IndexBuffer);
-          this->IndexBuffer = nullptr;
+          ReleaseMetalObject(this->IndexBuffer);
         }
 
         {
@@ -3208,13 +3098,11 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         // Release old buffers
         if (this->VertexBuffer)
         {
-          CFRelease(this->VertexBuffer);
-          this->VertexBuffer = nullptr;
+          ReleaseMetalObject(this->VertexBuffer);
         }
         if (this->IndexBuffer)
         {
-          CFRelease(this->IndexBuffer);
-          this->IndexBuffer = nullptr;
+          ReleaseMetalObject(this->IndexBuffer);
         }
 
         // Create new vertex buffer
@@ -3262,8 +3150,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
 
   if (this->PipelineState && sampleCount != this->CurrentSampleCount)
   {
-    CFRelease(this->PipelineState);
-    this->PipelineState = nullptr;
+    ReleaseMetalObject(this->PipelineState);
   }
 
   // Accumulation pipeline is always rasterSampleCount=1
@@ -3305,8 +3192,8 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       samplerDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
       samplerDesc.magFilter = MTLSamplerMinMagFilterLinear;
       samplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
-      // newSamplerStateWithDescriptor returns +1 (new rule); member owns it directly.
       id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:samplerDesc];
+      [samplerDesc release];
       this->ColorOpacitySampler = (__bridge void*)sampler;
     }
 
@@ -3318,8 +3205,8 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       samplerDesc.rAddressMode = MTLSamplerAddressModeClampToEdge;
       samplerDesc.magFilter = MTLSamplerMinMagFilterLinear;
       samplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
-      // newSamplerStateWithDescriptor returns +1 (new rule); member owns it directly.
       id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:samplerDesc];
+      [samplerDesc release];
       this->VolumeSampler = (__bridge void*)sampler;
     }
 
@@ -3331,8 +3218,8 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       depthSampDesc.magFilter = MTLSamplerMinMagFilterNearest;
       depthSampDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
       depthSampDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
-      // newSamplerStateWithDescriptor returns +1 (new rule); member owns it directly.
       id<MTLSamplerState> depthSamp = [device newSamplerStateWithDescriptor:depthSampDesc];
+      [depthSampDesc release];
       this->DepthSampler = (__bridge void*)depthSamp;
     }
 
@@ -3344,8 +3231,8 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       goDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
       goDesc.magFilter = MTLSamplerMinMagFilterLinear;
       goDesc.minFilter = MTLSamplerMinMagFilterLinear;
-      // newSamplerStateWithDescriptor returns +1 (new rule); member owns it directly.
       id<MTLSamplerState> goSamp = [device newSamplerStateWithDescriptor:goDesc];
+      [goDesc release];
       this->GradientOpacitySampler = (__bridge void*)goSamp;
     }
 
@@ -3358,8 +3245,8 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       maskDesc.rAddressMode = MTLSamplerAddressModeClampToEdge;
       maskDesc.magFilter = MTLSamplerMinMagFilterNearest;
       maskDesc.minFilter = MTLSamplerMinMagFilterNearest;
-      // newSamplerStateWithDescriptor returns +1 (new rule); member owns it directly.
       id<MTLSamplerState> maskSamp = [device newSamplerStateWithDescriptor:maskDesc];
+      [maskDesc release];
       this->MaskSampler = (__bridge void*)maskSamp;
     }
 
@@ -3371,8 +3258,8 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       lmDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
       lmDesc.magFilter = MTLSamplerMinMagFilterNearest;
       lmDesc.minFilter = MTLSamplerMinMagFilterNearest;
-      // newSamplerStateWithDescriptor returns +1 (new rule); member owns it directly.
       id<MTLSamplerState> lmSamp = [device newSamplerStateWithDescriptor:lmDesc];
+      [lmDesc release];
       this->LabelMapTransferSampler = (__bridge void*)lmSamp;
     }
 
@@ -3384,8 +3271,8 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       lgoDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
       lgoDesc.magFilter = MTLSamplerMinMagFilterNearest;
       lgoDesc.minFilter = MTLSamplerMinMagFilterNearest;
-      // newSamplerStateWithDescriptor returns +1 (new rule); member owns it directly.
       id<MTLSamplerState> lgoSamp = [device newSamplerStateWithDescriptor:lgoDesc];
+      [lgoDesc release];
       this->LabelMapGradientOpacitySampler = (__bridge void*)lgoSamp;
     }
 
@@ -3398,22 +3285,19 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       mmDesc.rAddressMode = MTLSamplerAddressModeClampToEdge;
       mmDesc.magFilter = MTLSamplerMinMagFilterNearest;
       mmDesc.minFilter = MTLSamplerMinMagFilterNearest;
-      // newSamplerStateWithDescriptor returns +1 (new rule); member owns it directly.
       id<MTLSamplerState> mmSamp = [device newSamplerStateWithDescriptor:mmDesc];
+      [mmDesc release];
       this->MinMaxSampler = (__bridge void*)mmSamp;
     }
 
     // Create and cache a depth stencil state.
-    // Volume rendering reads but does not write depth — this prevents the
-    // bounding box from z-fighting with itself and allows correct occlusion
-    // by opaque geometry that wrote depth earlier in the render pass.
     if (!this->DepthStencilState)
     {
       MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
       dsDesc.depthCompareFunction = MTLCompareFunctionLessEqual;
       dsDesc.depthWriteEnabled = NO;
-      // newDepthStencilStateWithDescriptor returns +1 (new rule); member owns it directly.
       id<MTLDepthStencilState> ds = [device newDepthStencilStateWithDescriptor:dsDesc];
+      [dsDesc release];
       this->DepthStencilState = (__bridge void*)ds;
     }
 
@@ -3432,10 +3316,6 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     pipelineDesc.vertexDescriptor = vertexDesc;
     pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
 
-    // The raymarching shader accumulates premultiplied color (color * alpha)
-    // into accumulatedColor. Using MTLBlendFactorOne as source avoids
-    // double-multiplying by alpha again at the blend stage. This matches
-    // the WebGPU volume mapper blend mode.
     pipelineDesc.colorAttachments[0].blendingEnabled = YES;
     pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
     pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
@@ -3451,47 +3331,52 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
 
     id<MTLRenderPipelineState> pso =
       [device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
+    [pipelineDesc release];
     if (!pso)
     {
       vtkErrorMacro(<< "Volume pipeline: " << [[error localizedDescription] UTF8String]);
+      [vertexFunc release];
+      [fragmentFunc release];
+      [library release];
+      [vertexDesc release];
       return false;
     }
-    // newRenderPipelineStateWithDescriptor returns +1 (new rule); member owns it directly.
     this->PipelineState = (__bridge void*)pso;
     this->CurrentSampleCount = sampleCount;
 
     // Create accumulation pipeline for inter-block opacity propagation.
-    // This pipeline uses fragment_volume_accum_main which reads the previous
-    // block's accumulated color/opacity via Metal framebuffer fetch ([[color(0)]],
-    // enabling global early ray termination across block boundaries.
-    // Always use rasterSampleCount = 1 because this pipeline is only used for
-    // offscreen rendering (image-sample path), where the render pass is always 1x.
     MTLRenderPipelineDescriptor* accumDesc = [[MTLRenderPipelineDescriptor alloc] init];
     accumDesc.vertexFunction = vertexFunc;
-    accumDesc.fragmentFunction = [library newFunctionWithName:@"fragment_volume_accum_main"];
+    id<MTLFunction> accumFrag = [library newFunctionWithName:@"fragment_volume_accum_main"];
+    accumDesc.fragmentFunction = accumFrag;
     accumDesc.vertexDescriptor = vertexDesc;
     accumDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
-    accumDesc.colorAttachments[0].blendingEnabled = NO; // Shader handles compositing manually
+    accumDesc.colorAttachments[0].blendingEnabled = NO;
     accumDesc.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
     accumDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
     accumDesc.rasterSampleCount = 1;
 
     id<MTLRenderPipelineState> accumPso =
       [device newRenderPipelineStateWithDescriptor:accumDesc error:&error];
+    [accumDesc release];
+    [accumFrag release];
     if (!accumPso)
     {
       vtkErrorMacro(<< "Volume accumulation pipeline: "
                     << [[error localizedDescription] UTF8String]);
+      [vertexFunc release];
+      [fragmentFunc release];
+      [library release];
+      [vertexDesc release];
       return false;
     }
     if (this->AccumulationPipelineState)
     {
-      CFRelease(this->AccumulationPipelineState);
+      ReleaseMetalObject(this->AccumulationPipelineState);
     }
-    // newRenderPipelineStateWithDescriptor returns +1 (new rule); member owns it directly.
     this->AccumulationPipelineState = (__bridge void*)accumPso;
 
-    // Layer pipeline: same fragment as screen path (fragment_volume_main), but offscreen format, no blend, no depth.
+    // Layer pipeline: same fragment as screen path, but offscreen format, no blend, no depth.
     if (!this->LayerPipelineState)
     {
       MTLRenderPipelineDescriptor* ld = [[MTLRenderPipelineDescriptor alloc] init];
@@ -3506,12 +3391,16 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
 
       NSError* layerError = nil;
       id<MTLRenderPipelineState> p = [device newRenderPipelineStateWithDescriptor:ld error:&layerError];
+      [ld release];
       if (!p)
       {
         vtkErrorMacro(<< "Layer pipeline: " << [[layerError localizedDescription] UTF8String]);
+        [vertexFunc release];
+        [fragmentFunc release];
+        [library release];
+        [vertexDesc release];
         return false;
       }
-      // newRenderPipelineStateWithDescriptor returns +1 (new rule); member owns it directly.
       this->LayerPipelineState = (__bridge void*)p;
     }
 
@@ -3519,8 +3408,10 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     if (!this->CompositePipelineState)
     {
       MTLRenderPipelineDescriptor* cd = [[MTLRenderPipelineDescriptor alloc] init];
-      cd.vertexFunction = [library newFunctionWithName:@"vertex_fullscreen_main"];
-      cd.fragmentFunction = [library newFunctionWithName:@"fragment_layer_composite_main"];
+      id<MTLFunction> cdVert = [library newFunctionWithName:@"vertex_fullscreen_main"];
+      id<MTLFunction> cdFrag = [library newFunctionWithName:@"fragment_layer_composite_main"];
+      cd.vertexFunction = cdVert;
+      cd.fragmentFunction = cdFrag;
       cd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
       cd.colorAttachments[0].blendingEnabled = NO;
       cd.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
@@ -3529,14 +3420,26 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
 
       NSError* compError = nil;
       id<MTLRenderPipelineState> p = [device newRenderPipelineStateWithDescriptor:cd error:&compError];
+      [cd release];
+      [cdVert release];
+      [cdFrag release];
       if (!p)
       {
         vtkErrorMacro(<< "Composite pipeline: " << [[compError localizedDescription] UTF8String]);
+        [vertexFunc release];
+        [fragmentFunc release];
+        [library release];
+        [vertexDesc release];
         return false;
       }
-      // newRenderPipelineStateWithDescriptor returns +1 (new rule); member owns it directly.
       this->CompositePipelineState = (__bridge void*)p;
     }
+
+    // Release temporary objects
+    [vertexFunc release];
+    [fragmentFunc release];
+    [library release];
+    [vertexDesc release];
   }
 
   return true;
@@ -3833,6 +3736,8 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
 //------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 {
+  @autoreleasepool
+  {
   auto* metalRenderer = vtkMetalRenderer::SafeDownCast(ren);
   auto* metalRenderWindow = vtkMetalRenderWindow::SafeDownCast(ren->GetRenderWindow());
   if (!metalRenderer || !metalRenderWindow)
@@ -4612,6 +4517,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
     dispatch_semaphore_signal((dispatch_semaphore_t)sem);
   }];
+
+  } // @autoreleasepool
 }
 
 // ============================================================================
