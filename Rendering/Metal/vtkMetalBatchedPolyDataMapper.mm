@@ -184,8 +184,8 @@ void vtkMetalBatchedPolyDataMapper::UpdateBatchPropertiesBuffer(void* mtlDevice)
     id<MTLBuffer> newBuf = [device
       newBufferWithLength:bufferSize
                  options:MTLResourceStorageModeShared];
+    // newBufferWithLength returns +1 (new rule); member owns it directly.
     this->BatchPropertiesBuffer = (__bridge void*)newBuf;
-    CFRetain(this->BatchPropertiesBuffer);
     this->BatchPropertiesBufferSize = bufferSize;
   }
 
