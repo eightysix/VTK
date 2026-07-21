@@ -1,6 +1,5 @@
-#import "VTKMetalBaseViewController.h"
+#import "FileVolumeViewController.h"
 
-@interface DICOMVolumeViewController : VTKMetalBaseViewController <UIDocumentPickerDelegate>
-@property (nonatomic, copy) NSString *dicomDirectoryPath;
-- (void)loadDICOMFolder;
+@interface DICOMVolumeViewController : FileVolumeViewController
+
 @end
