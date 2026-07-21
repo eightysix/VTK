@@ -1,8 +1,15 @@
 #import "FileVolumeViewController.h"
+#import "VolumeRenderingPreset.h"
+#import "VolumeRenderingPresetsManager.h"
 
 #include "vtkVolume.h"
 #include "vtkMetalRenderer.h"
 #include "vtkIOSMetalRenderWindow.h"
+
+@interface FileVolumeViewController ()
+@property (nonatomic, strong, readwrite) VolumeRenderingPreset *currentPreset;
+@property (nonatomic, assign, readwrite) NSInteger currentPresetIndex;
+@end
 
 @implementation FileVolumeViewController
 
@@ -40,6 +47,13 @@
     [button.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
     [button.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-20]
   ]];
+
+  // Start with the first preset
+  self.currentPresetIndex = 0;
+  NSArray<VolumeRenderingPreset *> *presets = VolumeRenderingPresetsManager.presets;
+  if (presets.count > 0) {
+    self.currentPreset = presets[0];
+  }
 }
 
 - (void)loadFile
@@ -75,6 +89,31 @@
 
 - (void)setupVTKPipeline
 {
+}
+
+#pragma mark - Preset Cycling
+
+- (IBAction)nextPreset:(id)sender
+{
+  NSArray<VolumeRenderingPreset *> *presets = VolumeRenderingPresetsManager.presets;
+  if (presets.count == 0) return;
+
+  self.currentPresetIndex = (self.currentPresetIndex + 1) % presets.count;
+  self.currentPreset = presets[self.currentPresetIndex];
+
+  NSLog(@"Preset: %@", self.currentPreset.name);
+}
+
+- (IBAction)previousPreset:(id)sender
+{
+  NSArray<VolumeRenderingPreset *> *presets = VolumeRenderingPresetsManager.presets;
+  if (presets.count == 0) return;
+
+  self.currentPresetIndex =
+      (self.currentPresetIndex - 1 + presets.count) % presets.count;
+  self.currentPreset = presets[self.currentPresetIndex];
+
+  NSLog(@"Preset: %@", self.currentPreset.name);
 }
 
 @end

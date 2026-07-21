@@ -1,4 +1,6 @@
 #import "DICOMVolumeViewController.h"
+#import "VolumeRenderingPreset.h"
+#import "VolumeRenderingPresetsManager.h"
 
 #include "vtkNew.h"
 #include "vtkColorTransferFunction.h"
@@ -11,6 +13,14 @@
 #include "vtkMetalGPUVolumeRayCastMapper.h"
 #include "vtkMetalRenderer.h"
 #include "vtkIOSMetalRenderWindow.h"
+
+#include <vtkSmartPointer.h>
+
+@interface DICOMVolumeViewController ()
+@property (nonatomic, assign) double dataMin;
+@property (nonatomic, assign) double dataRange;
+@property (nonatomic, assign) BOOL dataLoaded;
+@end
 
 @implementation DICOMVolumeViewController
 
@@ -37,17 +47,17 @@
   // Rescale data to [0, 255] using the scalar range from the reader.
   double scalarRange[2];
   reader->GetOutput()->GetScalarRange(scalarRange);
-  double dataMin = scalarRange[0];
+  self.dataMin = scalarRange[0];
   double dataMax = scalarRange[1];
-  double dataRange = dataMax - dataMin;
-  if (dataRange == 0.0) {
-    dataRange = 1.0;
+  self.dataRange = dataMax - self.dataMin;
+  if (self.dataRange == 0.0) {
+    self.dataRange = 1.0;
   }
 
   vtkNew<vtkImageShiftScale> castToU8;
   castToU8->SetInputConnection(reader->GetOutputPort());
-  castToU8->SetShift(-dataMin);
-  castToU8->SetScale(255.0 / dataRange);
+  castToU8->SetShift(-self.dataMin);
+  castToU8->SetScale(255.0 / self.dataRange);
   castToU8->SetOutputScalarTypeToUnsignedChar();
   castToU8->ClampOverflowOn();
   castToU8->Update();
@@ -60,51 +70,77 @@
   mapper->AutoAdjustSampleDistancesOff();
   mapper->SetSampleDistance(0.5);
 
-  // Bone + Skin II preset — remapped to u8 [0, 255] range.
-  // Original CLUT was authored against HU range; scale x-values by
-  //   u8 = (hu - dataMin) / dataRange * 255
-  auto rescale = [&](double hu) -> double {
-    return (hu - dataMin) / dataRange * 255.0;
-  };
-
-  vtkNew<vtkColorTransferFunction> colorFunc;
-  // Curve 1: cyan-ish tones for soft tissue
-  colorFunc->AddRGBPoint(rescale(-713.84), 0.072, 0.994, 1.0);
-  colorFunc->AddRGBPoint(rescale(-653.98), 0.072, 0.994, 1.0);
-  colorFunc->AddRGBPoint(rescale(-640.25), 0.072, 0.994, 1.0);
-  colorFunc->AddRGBPoint(rescale(-590.33), 0.072, 0.994, 1.0);
-  colorFunc->AddRGBPoint(rescale(-544.65), 0.072, 0.994, 1.0);
-  // Curve 2: red -> pink -> white for bone
-  colorFunc->AddRGBPoint(rescale(66.73), 0.0, 0.0, 0.0);
-  colorFunc->AddRGBPoint(rescale(84.34), 1.0, 0.0, 0.0);
-  colorFunc->AddRGBPoint(rescale(366.83), 1.0, 0.999, 1.0);
-  colorFunc->AddRGBPoint(rescale(1585.43), 1.0, 1.0, 1.0);
-
-  vtkNew<vtkPiecewiseFunction> opacityFunc;
-  // Curve 1
-  opacityFunc->AddPoint(rescale(-713.84), 0.0);
-  opacityFunc->AddPoint(rescale(-653.98), 0.209);
-  opacityFunc->AddPoint(rescale(-640.25), 0.29);
-  opacityFunc->AddPoint(rescale(-590.33), 0.209);
-  opacityFunc->AddPoint(rescale(-544.65), 0.209);
-  // Curve 2
-  opacityFunc->AddPoint(rescale(66.73), 0.0);
-  opacityFunc->AddPoint(rescale(84.34), 0.189);
-  opacityFunc->AddPoint(rescale(366.83), 0.645);
-  opacityFunc->AddPoint(rescale(1585.43), 0.789);
-
   vtkNew<vtkVolumeProperty> property;
-  property->SetColor(colorFunc);
-  property->SetScalarOpacity(opacityFunc);
-  property->SetInterpolationTypeToLinear();
 
   vtkNew<vtkVolume> volume;
   volume->SetMapper(mapper);
   volume->SetProperty(property);
 
   renderer->AddVolume(volume);
+
+  self.dataLoaded = YES;
+
+  [self applyCurrentPreset];
+
   renderer->ResetCamera();
   static_cast<vtkIOSMetalRenderWindow *>([self renderWindow])->Render();
+}
+
+- (void)applyCurrentPreset
+{
+  if (!self.dataLoaded) return;
+
+  vtkMetalRenderer *renderer = static_cast<vtkMetalRenderer *>([self renderer]);
+  vtkVolume *volume = renderer->GetVolumes()->GetNextVolume();
+  if (!volume) return;
+
+  vtkVolumeProperty *property = volume->GetProperty();
+
+  auto rescale = [&](double hu) -> double {
+    return (hu - self.dataMin) / self.dataRange * 255.0;
+  };
+
+  vtkNew<vtkColorTransferFunction> colorFunc;
+  vtkNew<vtkPiecewiseFunction> opacityFunc;
+
+  VolumeRenderingPreset *preset = self.currentPreset;
+  if (preset &&
+      preset.colorTransferFunctions.count == preset.opacityTransferFunctions.count) {
+    for (NSUInteger i = 0; i < preset.opacityTransferFunctions.count; i++) {
+      NSArray<OpacityTransferFunctionMember *> *otf = preset.opacityTransferFunctions[i];
+      NSArray<ColorTransferFunctionMember *> *ctf = preset.colorTransferFunctions[i];
+      if (otf.count == ctf.count) {
+        for (NSUInteger j = 0; j < otf.count; j++) {
+          opacityFunc->AddPoint(rescale(otf[j].x), otf[j].y);
+          colorFunc->AddRGBPoint(rescale(otf[j].x), ctf[j].red, ctf[j].green, ctf[j].blue);
+        }
+      }
+    }
+  } else {
+    // Fallback: simple linear preset
+    colorFunc->AddRGBPoint(0.0, 0.0, 0.0, 0.0);
+    colorFunc->AddRGBPoint(255.0, 1.0, 1.0, 1.0);
+    opacityFunc->AddPoint(0.0, 0.0);
+    opacityFunc->AddPoint(255.0, 1.0);
+  }
+
+  property->SetColor(colorFunc);
+  property->SetScalarOpacity(opacityFunc);
+  property->SetInterpolationTypeToLinear();
+
+  static_cast<vtkIOSMetalRenderWindow *>([self renderWindow])->Render();
+}
+
+- (IBAction)nextPreset:(id)sender
+{
+  [super nextPreset:sender];
+  [self applyCurrentPreset];
+}
+
+- (IBAction)previousPreset:(id)sender
+{
+  [super previousPreset:sender];
+  [self applyCurrentPreset];
 }
 
 @end
