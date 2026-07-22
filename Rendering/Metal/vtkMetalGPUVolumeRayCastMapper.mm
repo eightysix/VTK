@@ -1023,7 +1023,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
 
 //------------------------------------------------------------------------------
 bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
-  void* mtlDeviceVoid, void* mtlQueueVoid, vtkVolume* vol)
+  void* mtlDeviceVoid, void* mtlQueueVoid, vtkVolume* vol, double actualSampleDistance)
 {
   vtkVolumeProperty* property = vol->GetProperty();
   if (!property)
@@ -1041,12 +1041,21 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
   bool doReload = (this->ColorOpacityTexture == nullptr);
   doReload |= (colorFunc->GetMTime() > this->TransferFunctionUploadTime.GetMTime());
   doReload |= (opacityFunc->GetMTime() > this->TransferFunctionUploadTime.GetMTime());
+  // Re-upload when sample distance changes (affects opacity pre-integration)
+  doReload |= (actualSampleDistance != this->LastTransferFunctionSampleDistance);
 
   if (doReload)
   {
     @autoreleasepool
     {
       id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
+
+      // Pre-integration factor: matches OpenGL mapper's opacity table correction.
+      // The OpenGL mapper applies: adjusted = 1 - pow(1 - raw, sampleDistance / unitDistance)
+      // This bakes the step distance into the opacity texture so the shader
+      // can use simple front-to-back compositing without multiplying by step distance.
+      const double unitDistance = property->GetScalarOpacityUnitDistance(0);
+      const double factor = actualSampleDistance / unitDistance;
 
       unsigned char tfData[256 * 4];
       for (int i = 0; i < 256; ++i)
@@ -1055,6 +1064,13 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
         double rgb[3];
         colorFunc->GetColor(val, rgb);
         double opacity = opacityFunc->GetValue(val);
+
+        // Pre-integrate opacity (matches vtkOpenGLVolumeOpacityTable::InternalUpdate)
+        if (opacity > 0.0001)
+        {
+          opacity = 1.0 - pow(1.0 - opacity, factor);
+        }
+
         tfData[i * 4 + 0] = static_cast<unsigned char>(rgb[0] * 255.0);
         tfData[i * 4 + 1] = static_cast<unsigned char>(rgb[1] * 255.0);
         tfData[i * 4 + 2] = static_cast<unsigned char>(rgb[2] * 255.0);
@@ -1099,6 +1115,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
             bytesPerRow:256 * 4];
 
       this->TransferFunctionUploadTime.Modified();
+      this->LastTransferFunctionSampleDistance = actualSampleDistance;
     }
   }
 
@@ -3788,7 +3805,62 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   {
     return;
   }
-  if (!this->UpdateTransferFunctionTexture(mtlDevice, mtlQueue, vol))
+
+  // Compute actual sample distance early so it can be used for opacity pre-integration
+  // (matches the OpenGL mapper's vtkInternal::ComputeSampleDistance).
+  this->ComputeReductionFactor(vol->GetAllocatedRenderTime());
+
+  double actualSampleDistance;
+  if (this->AutoAdjustSampleDistances)
+  {
+    vtkNew<vtkMatrix4x4> modelToWorld;
+    vol->GetModelToWorldMatrix(modelToWorld);
+    double cellSpacing[3];
+    input->GetSpacing(cellSpacing);
+    double minWorldSpacing = VTK_DOUBLE_MAX;
+    for (int i = 0; i < 3; ++i)
+    {
+      double tmp = modelToWorld->GetElement(0, i);
+      double tmp2 = tmp * tmp;
+      tmp = modelToWorld->GetElement(1, i);
+      tmp2 += tmp * tmp;
+      tmp = modelToWorld->GetElement(2, i);
+      tmp2 += tmp * tmp;
+      double worldSpacing = fabs(cellSpacing[i] * sqrt(tmp2));
+      minWorldSpacing = std::min(worldSpacing, minWorldSpacing);
+    }
+    actualSampleDistance = minWorldSpacing;
+    if (this->ReductionFactor < 1.0 && this->ReductionFactor != 0.0)
+    {
+      actualSampleDistance /= this->ReductionFactor;
+    }
+  }
+  else if (this->LockSampleDistanceToInputSpacing)
+  {
+    double cellSpacing[3];
+    input->GetSpacing(cellSpacing);
+    int extents[6];
+    input->GetExtent(extents);
+    double spacingDist = (cellSpacing[0] + cellSpacing[1] + cellSpacing[2]) / 6.0;
+    double avgNumVoxels = pow(
+      static_cast<double>((extents[1] - extents[0]) * (extents[3] - extents[2]) *
+        (extents[5] - extents[4])),
+      0.333);
+    if (avgNumVoxels < 100)
+    {
+      spacingDist *= 0.01 + (1 - 0.01) * avgNumVoxels / 100;
+    }
+    float d = static_cast<float>(spacingDist);
+    float sample = static_cast<float>(this->SampleDistance);
+    actualSampleDistance =
+      (sample / d < 0.999f || sample / d > 1.001f) ? d : this->SampleDistance;
+  }
+  else
+  {
+    actualSampleDistance = this->GetSampleDistance();
+  }
+
+  if (!this->UpdateTransferFunctionTexture(mtlDevice, mtlQueue, vol, actualSampleDistance))
   {
     return;
   }
@@ -3863,74 +3935,6 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   uniforms.CameraVolumePos[3] = 1.0f;
 
   double maxBoundsSize = std::max({ boundsSize[0], boundsSize[1], boundsSize[2] });
-
-  // Compute adaptive sample distance (matches OpenGL mapper logic)
-  this->ComputeReductionFactor(vol->GetAllocatedRenderTime());
-
-  double actualSampleDistance;
-  if (this->AutoAdjustSampleDistances)
-  {
-    // Compute minimum world-space voxel spacing across all 3 axes
-    vtkNew<vtkMatrix4x4> modelToWorld;
-    vol->GetModelToWorldMatrix(modelToWorld);
-
-    double cellSpacing[3];
-    input->GetSpacing(cellSpacing);
-
-    double minWorldSpacing = VTK_DOUBLE_MAX;
-    for (int i = 0; i < 3; ++i)
-    {
-      double tmp = modelToWorld->GetElement(0, i);
-      double tmp2 = tmp * tmp;
-      tmp = modelToWorld->GetElement(1, i);
-      tmp2 += tmp * tmp;
-      tmp = modelToWorld->GetElement(2, i);
-      tmp2 += tmp * tmp;
-
-      double worldSpacing = fabs(cellSpacing[i] * sqrt(tmp2));
-      minWorldSpacing = std::min(worldSpacing, minWorldSpacing);
-    }
-
-    actualSampleDistance = minWorldSpacing;
-    if (this->ReductionFactor < 1.0 && this->ReductionFactor != 0.0)
-    {
-      actualSampleDistance /= this->ReductionFactor;
-    }
-  }
-  else if (this->LockSampleDistanceToInputSpacing)
-  {
-    // Lock sample distance to input spacing: adapts step size to voxel density
-    // for optimal quality/performance balance. Computes 1/2 average spacing
-    // and scales down for small volumes (< 100 voxels).
-    double cellSpacing[3];
-    input->GetSpacing(cellSpacing);
-
-    int extents[6];
-    input->GetExtent(extents);
-
-    double spacingDist = (cellSpacing[0] + cellSpacing[1] + cellSpacing[2]) / 6.0;
-    double avgNumVoxels = pow(
-      static_cast<double>((extents[1] - extents[0]) * (extents[3] - extents[2]) *
-        (extents[5] - extents[4])),
-      0.333);
-
-    if (avgNumVoxels < 100)
-    {
-      spacingDist *= 0.01 + (1 - 0.01) * avgNumVoxels / 100;
-    }
-
-    float d = static_cast<float>(spacingDist);
-    float sample = static_cast<float>(this->SampleDistance);
-
-    // Use spacing-adjusted distance unless user explicitly set a custom value
-    // (within 0.1% tolerance). This matches the OpenGL mapper logic.
-    actualSampleDistance =
-      (sample / d < 0.999f || sample / d > 1.001f) ? d : this->SampleDistance;
-  }
-  else
-  {
-    actualSampleDistance = this->GetSampleDistance();
-  }
 
   uniforms.SampleDistance =
     static_cast<float>(actualSampleDistance / maxBoundsSize);
