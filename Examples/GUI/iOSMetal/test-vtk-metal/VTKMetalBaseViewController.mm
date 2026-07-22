@@ -50,7 +50,6 @@
   vtkNew<vtkMetalCamera> camera;
   _renderer->SetActiveCamera(camera);
 
-  _renderer->SetBackground(0.1, 0.1, 0.2);
   _renWin->AddRenderer(_renderer);
 
   // Set size (Retina-aware)
