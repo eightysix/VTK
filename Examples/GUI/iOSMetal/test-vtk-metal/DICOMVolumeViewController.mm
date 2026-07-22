@@ -5,7 +5,9 @@
 #include "vtkNew.h"
 #include "vtkColorTransferFunction.h"
 #include "vtkPiecewiseFunction.h"
-#include "vtkDICOMImageReader.h"
+#include "vtkDICOMDirectory.h"
+#include "vtkDICOMReader.h"
+#include "vtkStringArray.h"
 #include "vtkImageData.h"
 #include "vtkImageShiftScale.h"
 #include "vtkVolume.h"
@@ -46,8 +48,20 @@ static inline double HU2U8(double hu) {
   NSString *path = url.path;
   vtkMetalRenderer *renderer = static_cast<vtkMetalRenderer *>([self renderer]);
 
-  vtkNew<vtkDICOMImageReader> reader;
-  reader->SetDirectoryName([path UTF8String]);
+  // Scan the directory for DICOM series.
+  vtkNew<vtkDICOMDirectory> dicomDir;
+  dicomDir->SetDirectoryName([path UTF8String]);
+  dicomDir->Update();
+
+  int numSeries = dicomDir->GetNumberOfSeries();
+  if (numSeries == 0) {
+    NSLog(@"No DICOM series found in %s", [path UTF8String]);
+    return;
+  }
+
+  // Read the first series.
+  vtkNew<vtkDICOMReader> reader;
+  reader->SetFileNames(dicomDir->GetFileNamesForSeries(0));
   reader->Update();
 
   // Cast to unsigned char using fixed CT HU range mapping.
