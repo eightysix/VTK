@@ -190,6 +190,14 @@ inline uint16_t FloatToHalf(float f)
   return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10) | (mantissa >> 13));
 }
 
+// Returns true when half-float can safely represent the full scalar range.
+inline bool HalfRangeIsSafe(double r0, double r1)
+{
+  const double halfMax = 65504.0;
+  return std::isfinite(r0) && std::isfinite(r1) &&
+    r0 >= -halfMax && r1 <= halfMax;
+}
+
 // Returns true when the data is a single-component float array that can be
 // converted to half-precision in-place using Accelerate (vImage).
 inline bool IsContiguousScalarFloat(int dataType, int numComponents, vtkIdType numTuples,
@@ -241,6 +249,7 @@ vtkMetalGPUVolumeRayCastMapper::vtkMetalGPUVolumeRayCastMapper()
 //------------------------------------------------------------------------------
 vtkMetalGPUVolumeRayCastMapper::~vtkMetalGPUVolumeRayCastMapper()
 {
+  this->WaitForInFlightFrames();
   this->ReleaseGraphicsResources(nullptr);
 #if !__has_feature(objc_arc)
   if (this->FrameSemaphore)
@@ -249,6 +258,26 @@ vtkMetalGPUVolumeRayCastMapper::~vtkMetalGPUVolumeRayCastMapper()
     this->FrameSemaphore = nullptr;
   }
 #endif
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::WaitForInFlightFrames()
+{
+  if (!this->FrameSemaphore)
+  {
+    return;
+  }
+  dispatch_semaphore_t sem = (__bridge dispatch_semaphore_t)this->FrameSemaphore;
+  for (int i = 0; i < 3; ++i)
+  {
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+  }
+  // Restore the semaphore to valid state so a future GPURender (e.g. after
+  // ReleaseGraphicsResources for a window resize) does not deadlock.
+  for (int i = 0; i < 3; ++i)
+  {
+    dispatch_semaphore_signal(sem);
+  }
 }
 
 //------------------------------------------------------------------------------
@@ -492,16 +521,16 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureLayerResources(void* deviceVoid, int 
   d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
   d.storageMode = MTLStorageModePrivate;
 
-  for (int i = 0; i < 8; ++i)
-  {
-    id<MTLTexture> t = [device newTextureWithDescriptor:d];
-    if (!t)
+    for (int i = 0; i < 8; ++i)
     {
-      [d release];
-      return false;
+      id<MTLTexture> t = [device newTextureWithDescriptor:d];
+      if (!t)
+      {
+        [d release];
+        return false;
+      }
+      AssignMetalObject(this->LayerColorTexture[i], t);
     }
-    this->LayerColorTexture[i] = (__bridge void*)t;
-  }
   [d release];
   this->LayerFBOWidth = w;
   this->LayerFBOHeight = h;
@@ -531,6 +560,9 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
 
   ReleaseMetalObject(this->DepthSampler);
   ReleaseMetalObject(this->DummyDepthTexture);
+  ReleaseMetalObject(this->DummyVolumeTexture);
+  ReleaseMetalObject(this->DummyMaskTexture);
+  ReleaseMetalObject(this->DummyMinMaxTexture);
   ReleaseMetalObject(this->DepthStencilState);
 
   for (int i = 0; i < 3; ++i)
@@ -734,6 +766,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       fmtInfo.needsConversion = true;
       fmtInfo.normalizationFactor = 1.0f;
 
+      bool useHalf = this->PreferHalfPrecision &&
+        HalfRangeIsSafe(this->ScalarRange[0], this->ScalarRange[1]);
+
       switch (dataType)
       {
         case VTK_FLOAT:
@@ -795,20 +830,42 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
         }
         default:
         {
-          fmtInfo.bytesPerComponent = 2;
-          fmtInfo.needsConversion = true;
-          fmtInfo.normalizationFactor = 1.0f;
-          switch (componentsForFormat)
+
+          if (useHalf)
           {
-            case 1:
-              fmtInfo.format = MTLPixelFormatR16Float;
-              break;
-            case 2:
-              fmtInfo.format = MTLPixelFormatRG16Float;
-              break;
-            default:
-              fmtInfo.format = MTLPixelFormatRGBA16Float;
-              break;
+            fmtInfo.bytesPerComponent = 2;
+            fmtInfo.needsConversion = true;
+            fmtInfo.normalizationFactor = 1.0f;
+            switch (componentsForFormat)
+            {
+              case 1:
+                fmtInfo.format = MTLPixelFormatR16Float;
+                break;
+              case 2:
+                fmtInfo.format = MTLPixelFormatRG16Float;
+                break;
+              default:
+                fmtInfo.format = MTLPixelFormatRGBA16Float;
+                break;
+            }
+          }
+          else
+          {
+            fmtInfo.bytesPerComponent = 4;
+            fmtInfo.needsConversion = true;
+            fmtInfo.normalizationFactor = 1.0f;
+            switch (componentsForFormat)
+            {
+              case 1:
+                fmtInfo.format = MTLPixelFormatR32Float;
+                break;
+              case 2:
+                fmtInfo.format = MTLPixelFormatRG32Float;
+                break;
+              default:
+                fmtInfo.format = MTLPixelFormatRGBA32Float;
+                break;
+            }
           }
           break;
         }
@@ -818,106 +875,181 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
 
       const void* uploadPointer = nullptr;
       std::vector<uint16_t> halfData;
+      std::vector<float> floatData;
       std::vector<uint8_t> conversionBuffer;
 
       if (fmtInfo.needsConversion)
       {
         int outputComponents = (numComponents == 3) ? 4 : numComponents;
-        halfData.resize(static_cast<size_t>(numTuples) * outputComponents);
 
-        switch (dataType)
+        if (useHalf)
         {
-          case VTK_FLOAT:
+          halfData.resize(static_cast<size_t>(numTuples) * outputComponents);
+
+          switch (dataType)
           {
-            const float* src = static_cast<const float*>(scalars->GetVoidPointer(0));
-            vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
-              for (vtkIdType i = begin; i < end; ++i)
-              {
-                for (int c = 0; c < numComponents; ++c)
-                  halfData[i * outputComponents + c] = FloatToHalf(src[i * numComponents + c]);
-                for (int c = numComponents; c < outputComponents; ++c)
-                  halfData[i * outputComponents + c] = FloatToHalf(0.0f);
-              }
-            });
-            break;
+            case VTK_SHORT:
+            {
+              const short* src = static_cast<const short*>(scalars->GetVoidPointer(0));
+              vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+                for (vtkIdType i = begin; i < end; ++i)
+                {
+                  for (int c = 0; c < numComponents; ++c)
+                    halfData[i * outputComponents + c] =
+                      FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                  for (int c = numComponents; c < outputComponents; ++c)
+                    halfData[i * outputComponents + c] = FloatToHalf(0.0f);
+                }
+              });
+              break;
+            }
+            case VTK_INT:
+            {
+              const int* src = static_cast<const int*>(scalars->GetVoidPointer(0));
+              vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+                for (vtkIdType i = begin; i < end; ++i)
+                {
+                  for (int c = 0; c < numComponents; ++c)
+                    halfData[i * outputComponents + c] =
+                      FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                  for (int c = numComponents; c < outputComponents; ++c)
+                    halfData[i * outputComponents + c] = FloatToHalf(0.0f);
+                }
+              });
+              break;
+            }
+            case VTK_UNSIGNED_INT:
+            {
+              const unsigned int* src =
+                static_cast<const unsigned int*>(scalars->GetVoidPointer(0));
+              vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+                for (vtkIdType i = begin; i < end; ++i)
+                {
+                  for (int c = 0; c < numComponents; ++c)
+                    halfData[i * outputComponents + c] =
+                      FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                  for (int c = numComponents; c < outputComponents; ++c)
+                    halfData[i * outputComponents + c] = FloatToHalf(0.0f);
+                }
+              });
+              break;
+            }
+            case VTK_DOUBLE:
+            {
+              const double* src = static_cast<const double*>(scalars->GetVoidPointer(0));
+              vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+                for (vtkIdType i = begin; i < end; ++i)
+                {
+                  for (int c = 0; c < numComponents; ++c)
+                    halfData[i * outputComponents + c] =
+                      FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                  for (int c = numComponents; c < outputComponents; ++c)
+                    halfData[i * outputComponents + c] = FloatToHalf(0.0f);
+                }
+              });
+              break;
+            }
+            default:
+            {
+              vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+                for (vtkIdType i = begin; i < end; ++i)
+                {
+                  for (int c = 0; c < numComponents; ++c)
+                    halfData[i * outputComponents + c] =
+                      FloatToHalf(static_cast<float>(scalars->GetComponent(i, c)));
+                  for (int c = numComponents; c < outputComponents; ++c)
+                    halfData[i * outputComponents + c] = FloatToHalf(0.0f);
+                }
+              });
+              break;
+            }
           }
-          case VTK_SHORT:
-          {
-            const short* src = static_cast<const short*>(scalars->GetVoidPointer(0));
-            vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
-              for (vtkIdType i = begin; i < end; ++i)
-              {
-                for (int c = 0; c < numComponents; ++c)
-                  halfData[i * outputComponents + c] =
-                    FloatToHalf(static_cast<float>(src[i * numComponents + c]));
-                for (int c = numComponents; c < outputComponents; ++c)
-                  halfData[i * outputComponents + c] = FloatToHalf(0.0f);
-              }
-            });
-            break;
-          }
-          case VTK_INT:
-          {
-            const int* src = static_cast<const int*>(scalars->GetVoidPointer(0));
-            vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
-              for (vtkIdType i = begin; i < end; ++i)
-              {
-                for (int c = 0; c < numComponents; ++c)
-                  halfData[i * outputComponents + c] =
-                    FloatToHalf(static_cast<float>(src[i * numComponents + c]));
-                for (int c = numComponents; c < outputComponents; ++c)
-                  halfData[i * outputComponents + c] = FloatToHalf(0.0f);
-              }
-            });
-            break;
-          }
-          case VTK_UNSIGNED_INT:
-          {
-            const unsigned int* src =
-              static_cast<const unsigned int*>(scalars->GetVoidPointer(0));
-            vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
-              for (vtkIdType i = begin; i < end; ++i)
-              {
-                for (int c = 0; c < numComponents; ++c)
-                  halfData[i * outputComponents + c] =
-                    FloatToHalf(static_cast<float>(src[i * numComponents + c]));
-                for (int c = numComponents; c < outputComponents; ++c)
-                  halfData[i * outputComponents + c] = FloatToHalf(0.0f);
-              }
-            });
-            break;
-          }
-          case VTK_DOUBLE:
-          {
-            const double* src = static_cast<const double*>(scalars->GetVoidPointer(0));
-            vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
-              for (vtkIdType i = begin; i < end; ++i)
-              {
-                for (int c = 0; c < numComponents; ++c)
-                  halfData[i * outputComponents + c] =
-                    FloatToHalf(static_cast<float>(src[i * numComponents + c]));
-                for (int c = numComponents; c < outputComponents; ++c)
-                  halfData[i * outputComponents + c] = FloatToHalf(0.0f);
-              }
-            });
-            break;
-          }
-          default:
-          {
-            vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
-              for (vtkIdType i = begin; i < end; ++i)
-              {
-                for (int c = 0; c < numComponents; ++c)
-                  halfData[i * outputComponents + c] =
-                    FloatToHalf(static_cast<float>(scalars->GetComponent(i, c)));
-                for (int c = numComponents; c < outputComponents; ++c)
-                  halfData[i * outputComponents + c] = FloatToHalf(0.0f);
-              }
-            });
-            break;
-          }
+          uploadPointer = halfData.data();
         }
-        uploadPointer = halfData.data();
+        else
+        {
+          floatData.resize(static_cast<size_t>(numTuples) * outputComponents);
+
+          switch (dataType)
+          {
+            case VTK_SHORT:
+            {
+              const short* src = static_cast<const short*>(scalars->GetVoidPointer(0));
+              vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+                for (vtkIdType i = begin; i < end; ++i)
+                {
+                  for (int c = 0; c < numComponents; ++c)
+                    floatData[i * outputComponents + c] =
+                      static_cast<float>(src[i * numComponents + c]);
+                  for (int c = numComponents; c < outputComponents; ++c)
+                    floatData[i * outputComponents + c] = 0.0f;
+                }
+              });
+              break;
+            }
+            case VTK_INT:
+            {
+              const int* src = static_cast<const int*>(scalars->GetVoidPointer(0));
+              vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+                for (vtkIdType i = begin; i < end; ++i)
+                {
+                  for (int c = 0; c < numComponents; ++c)
+                    floatData[i * outputComponents + c] =
+                      static_cast<float>(src[i * numComponents + c]);
+                  for (int c = numComponents; c < outputComponents; ++c)
+                    floatData[i * outputComponents + c] = 0.0f;
+                }
+              });
+              break;
+            }
+            case VTK_UNSIGNED_INT:
+            {
+              const unsigned int* src =
+                static_cast<const unsigned int*>(scalars->GetVoidPointer(0));
+              vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+                for (vtkIdType i = begin; i < end; ++i)
+                {
+                  for (int c = 0; c < numComponents; ++c)
+                    floatData[i * outputComponents + c] =
+                      static_cast<float>(src[i * numComponents + c]);
+                  for (int c = numComponents; c < outputComponents; ++c)
+                    floatData[i * outputComponents + c] = 0.0f;
+                }
+              });
+              break;
+            }
+            case VTK_DOUBLE:
+            {
+              const double* src = static_cast<const double*>(scalars->GetVoidPointer(0));
+              vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+                for (vtkIdType i = begin; i < end; ++i)
+                {
+                  for (int c = 0; c < numComponents; ++c)
+                    floatData[i * outputComponents + c] =
+                      static_cast<float>(src[i * numComponents + c]);
+                  for (int c = numComponents; c < outputComponents; ++c)
+                    floatData[i * outputComponents + c] = 0.0f;
+                }
+              });
+              break;
+            }
+            default:
+            {
+              vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+                for (vtkIdType i = begin; i < end; ++i)
+                {
+                  for (int c = 0; c < numComponents; ++c)
+                    floatData[i * outputComponents + c] =
+                      static_cast<float>(scalars->GetComponent(i, c));
+                  for (int c = numComponents; c < outputComponents; ++c)
+                    floatData[i * outputComponents + c] = 0.0f;
+                }
+              });
+              break;
+            }
+          }
+          uploadPointer = floatData.data();
+        }
       }
       else if (dataType == VTK_FLOAT)
       {
@@ -1022,8 +1154,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           vtkErrorMacro("Failed to create 3D volume texture");
           return false;
         }
-        // newTextureWithDescriptor returns +1 (new rule); member owns it directly.
-        this->VolumeTexture = (__bridge void*)tex;
+        AssignMetalObject(this->VolumeTexture, tex);
       }
 
       int actualComponents = (numComponents == 3) ? 4 : numComponents;
@@ -1161,8 +1292,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
           vtkErrorMacro("Failed to create transfer function texture");
           return false;
         }
-        // newTextureWithDescriptor returns +1 (new rule); member owns it directly.
-        this->ColorOpacityTexture = (__bridge void*)tex;
+        AssignMetalObject(this->ColorOpacityTexture, tex);
       }
 
       MTLRegion region = MTLRegionMake2D(0, 0, 256, 1);
@@ -1257,8 +1387,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
           vtkErrorMacro("Failed to create gradient opacity texture");
           return false;
         }
-        // newTextureWithDescriptor returns +1 (new rule); member owns it directly.
-        this->GradientOpacityTexture = (__bridge void*)tex;
+        AssignMetalObject(this->GradientOpacityTexture, tex);
       }
 
       MTLRegion region = MTLRegionMake2D(0, 0, 256, 1);
@@ -1397,8 +1526,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMaskTexture(
           vtkErrorMacro("Failed to create mask texture");
           return false;
         }
-        // newTextureWithDescriptor returns +1 (new rule); member owns it directly.
-        this->MaskTexture = (__bridge void*)tex;
+        AssignMetalObject(this->MaskTexture, tex);
       }
 
       // Upload mask data to texture (R32Float format uses 1 component)
@@ -1564,8 +1692,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateLabelMapTransferTexture(
           vtkErrorMacro("Failed to create label map transfer texture");
           return false;
         }
-        // newTextureWithDescriptor returns +1 (new rule); member owns it directly.
-        this->LabelMapTransferTexture = (__bridge void*)tex;
+        AssignMetalObject(this->LabelMapTransferTexture, tex);
       }
 
       // Upload data to texture
@@ -1672,7 +1799,7 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseMaskResources()
   ReleaseMetalObject(this->LabelMapTransferTexture);
   ReleaseMetalObject(this->LabelMapTransferSampler);
   ReleaseMetalObject(this->LabelMapGradientOpacityTexture);
-  ReleaseMetalObject(this->LabelMapGradientOpacitySampler);
+  ReleaseMetalObject(this->LabelMapGradientOpacitySampler); // Kept for binary compatibility; unused in shader
 }
 
 //------------------------------------------------------------------------------
@@ -1983,8 +2110,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
           vtkErrorMacro("Failed to create min-max acceleration texture");
           return false;
         }
-        // newTextureWithDescriptor returns +1 (new rule); member owns it directly.
-        this->MinMaxTexture = (__bridge void*)tex;
+        AssignMetalObject(this->MinMaxTexture, tex);
       }
 
       // Upload data
@@ -2111,6 +2237,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
     MTLPixelFormat pixelFormat;
     int bytesPerComponent = 2;
     float normalizationFactor = 1.0f;
+    bool blockUseHalf = this->PreferHalfPrecision &&
+      HalfRangeIsSafe(this->ScalarRange[0], this->ScalarRange[1]);
 
     switch (dataType)
     {
@@ -2163,21 +2291,43 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
         }
         break;
       default:
-        bytesPerComponent = 2;
-        normalizationFactor = 1.0f;
-        switch (componentsForFormat)
+      {
+        if (blockUseHalf)
         {
-          case 1:
-            pixelFormat = MTLPixelFormatR16Float;
-            break;
-          case 2:
-            pixelFormat = MTLPixelFormatRG16Float;
-            break;
-          default:
-            pixelFormat = MTLPixelFormatRGBA16Float;
-            break;
+          bytesPerComponent = 2;
+          normalizationFactor = 1.0f;
+          switch (componentsForFormat)
+          {
+            case 1:
+              pixelFormat = MTLPixelFormatR16Float;
+              break;
+            case 2:
+              pixelFormat = MTLPixelFormatRG16Float;
+              break;
+            default:
+              pixelFormat = MTLPixelFormatRGBA16Float;
+              break;
+          }
+        }
+        else
+        {
+          bytesPerComponent = 4;
+          normalizationFactor = 1.0f;
+          switch (componentsForFormat)
+          {
+            case 1:
+              pixelFormat = MTLPixelFormatR32Float;
+              break;
+            case 2:
+              pixelFormat = MTLPixelFormatRG32Float;
+              break;
+            default:
+              pixelFormat = MTLPixelFormatRGBA32Float;
+              break;
+          }
         }
         break;
+      }
     }
 
     this->ScalarNormalizationFactor = normalizationFactor;
@@ -2231,16 +2381,87 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
     {
       int outputComponents = (numComponents == 3) ? 4 : numComponents;
 
-      // Fast path: single-component float → half via Accelerate (NEON/SED)
-      if (IsContiguousScalarFloat(dataType, numComponents, totalTuples, fullDataPtr, bytesPerVoxel))
+      if (blockUseHalf)
       {
-        // In-place conversion: copy float data to staging buffer, then convert
-        std::memcpy(uploadPointer, fullDataPtr, static_cast<size_t>(totalVolumeBytes));
-        vImage_Buffer srcBuf = { uploadPointer, 1, static_cast<vImagePixelCount>(totalTuples),
-          static_cast<vImagePixelCount>(totalTuples * sizeof(float)) };
-        vImage_Buffer dstBuf = { uploadPointer, 1, static_cast<vImagePixelCount>(totalTuples),
-          static_cast<vImagePixelCount>(totalTuples * sizeof(uint16_t)) };
-        vImageConvert_PlanarFtoPlanar16F(&srcBuf, &dstBuf, 0);
+        // Fast path: single-component float → half via Accelerate (NEON/SED)
+        if (IsContiguousScalarFloat(dataType, numComponents, totalTuples, fullDataPtr, bytesPerVoxel))
+        {
+          std::memcpy(uploadPointer, fullDataPtr, static_cast<size_t>(totalVolumeBytes));
+          vImage_Buffer srcBuf = { uploadPointer, 1, static_cast<vImagePixelCount>(totalTuples),
+            static_cast<vImagePixelCount>(totalTuples * sizeof(float)) };
+          vImage_Buffer dstBuf = { uploadPointer, 1, static_cast<vImagePixelCount>(totalTuples),
+            static_cast<vImagePixelCount>(totalTuples * sizeof(uint16_t)) };
+          vImageConvert_PlanarFtoPlanar16F(&srcBuf, &dstBuf, 0);
+        }
+        else
+        {
+          switch (dataType)
+          {
+            case VTK_SHORT:
+            {
+              const short* src = static_cast<const short*>(fullDataPtr);
+              vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
+                for (vtkIdType i = begin; i < end; ++i)
+                {
+                  for (int c = 0; c < numComponents; ++c)
+                    static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                      FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                  for (int c = numComponents; c < outputComponents; ++c)
+                    static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                      FloatToHalf(0.0f);
+                }
+              });
+              break;
+            }
+            case VTK_INT:
+            {
+              const int* src = static_cast<const int*>(fullDataPtr);
+              vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
+                for (vtkIdType i = begin; i < end; ++i)
+                {
+                  for (int c = 0; c < numComponents; ++c)
+                    static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                      FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                  for (int c = numComponents; c < outputComponents; ++c)
+                    static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                      FloatToHalf(0.0f);
+                }
+              });
+              break;
+            }
+            case VTK_DOUBLE:
+            {
+              const double* src = static_cast<const double*>(fullDataPtr);
+              vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
+                for (vtkIdType i = begin; i < end; ++i)
+                {
+                  for (int c = 0; c < numComponents; ++c)
+                    static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                      FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                  for (int c = numComponents; c < outputComponents; ++c)
+                    static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                      FloatToHalf(0.0f);
+                }
+              });
+              break;
+            }
+            default:
+            {
+              vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
+                for (vtkIdType i = begin; i < end; ++i)
+                {
+                  for (int c = 0; c < numComponents; ++c)
+                    static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                      FloatToHalf(static_cast<float>(scalars->GetComponent(i, c)));
+                  for (int c = numComponents; c < outputComponents; ++c)
+                    static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                      FloatToHalf(0.0f);
+                }
+              });
+              break;
+            }
+          }
+        }
       }
       else
       {
@@ -2253,11 +2474,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
               for (vtkIdType i = begin; i < end; ++i)
               {
                 for (int c = 0; c < numComponents; ++c)
-                  static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                    FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                  static_cast<float*>(uploadPointer)[i * outputComponents + c] =
+                    static_cast<float>(src[i * numComponents + c]);
                 for (int c = numComponents; c < outputComponents; ++c)
-                  static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                    FloatToHalf(0.0f);
+                  static_cast<float*>(uploadPointer)[i * outputComponents + c] = 0.0f;
               }
             });
             break;
@@ -2269,11 +2489,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
               for (vtkIdType i = begin; i < end; ++i)
               {
                 for (int c = 0; c < numComponents; ++c)
-                  static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                    FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                  static_cast<float*>(uploadPointer)[i * outputComponents + c] =
+                    static_cast<float>(src[i * numComponents + c]);
                 for (int c = numComponents; c < outputComponents; ++c)
-                  static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                    FloatToHalf(0.0f);
+                  static_cast<float*>(uploadPointer)[i * outputComponents + c] = 0.0f;
               }
             });
             break;
@@ -2285,11 +2504,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
               for (vtkIdType i = begin; i < end; ++i)
               {
                 for (int c = 0; c < numComponents; ++c)
-                  static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                    FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                  static_cast<float*>(uploadPointer)[i * outputComponents + c] =
+                    static_cast<float>(src[i * numComponents + c]);
                 for (int c = numComponents; c < outputComponents; ++c)
-                  static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                    FloatToHalf(0.0f);
+                  static_cast<float*>(uploadPointer)[i * outputComponents + c] = 0.0f;
               }
             });
             break;
@@ -2300,11 +2518,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
               for (vtkIdType i = begin; i < end; ++i)
               {
                 for (int c = 0; c < numComponents; ++c)
-                  static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                    FloatToHalf(static_cast<float>(scalars->GetComponent(i, c)));
+                  static_cast<float*>(uploadPointer)[i * outputComponents + c] =
+                    static_cast<float>(scalars->GetComponent(i, c));
                 for (int c = numComponents; c < outputComponents; ++c)
-                  static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                    FloatToHalf(0.0f);
+                  static_cast<float*>(uploadPointer)[i * outputComponents + c] = 0.0f;
               }
             });
             break;
@@ -2566,8 +2783,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
                       << bDims[0] << "x" << bDims[1] << "x" << bDims[2] << ")");
         return false;
       }
-      // newTextureWithDescriptor returns +1 (new rule); member owns it directly.
-      block.Texture = (__bridge void*)tex;
+      AssignMetalObject(block.Texture, tex);
 
       // --- Per-block min-max texture generation ---
       if (hasOpacityFunc)
@@ -2719,8 +2935,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
                   bytesPerRow:mmBytesPerRow
                 bytesPerImage:mmBytesPerImage];
 
-          // newTextureWithDescriptor returns +1 (new rule); member owns it directly.
-          block.MinMaxTexture = (__bridge void*)mmTex;
+          AssignMetalObject(block.MinMaxTexture, mmTex);
         }
         else
         {
@@ -2832,7 +3047,7 @@ bool vtkMetalGPUVolumeRayCastMapper::IsCameraInside(
 //------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::SetClippingPlaneUniforms(
   void* uniformsVoid, vtkRenderer* ren, vtkVolume* vol,
-  vtkMatrix4x4* invModelMatrix)
+  vtkMatrix4x4* modelMatrix, vtkMatrix4x4* invModelMatrix)
 {
   VolumeMapperUniforms* uniforms = static_cast<VolumeMapperUniforms*>(uniformsVoid);
 
@@ -2872,18 +3087,25 @@ void vtkMetalGPUVolumeRayCastMapper::SetClippingPlaneUniforms(
   };
 
   int numPlanes = 0;
+
   this->ClippingPlanes->InitTraversal();
   vtkPlane* plane;
   while ((plane = this->ClippingPlanes->GetNextItem()) && numPlanes < 8)
   {
-    // Get plane origin and normal in world coordinates
     double planeOrigin[3], planeNormal[3];
     plane->GetOrigin(planeOrigin);
     plane->GetNormal(planeNormal);
 
-    // Transform origin to volume-local [0,1] space
+    // Origin: transform as a point from world to model/data space.
     double originLocal[4] = { planeOrigin[0], planeOrigin[1], planeOrigin[2], 1.0 };
     invModelMatrix->MultiplyPoint(originLocal, originLocal);
+
+    if (fabs(originLocal[3]) > 1e-12)
+    {
+      originLocal[0] /= originLocal[3];
+      originLocal[1] /= originLocal[3];
+      originLocal[2] /= originLocal[3];
+    }
 
     double originVol[3] = {
       (originLocal[0] - modelBounds[0]) / boundsSize[0],
@@ -2891,22 +3113,39 @@ void vtkMetalGPUVolumeRayCastMapper::SetClippingPlaneUniforms(
       (originLocal[2] - modelBounds[4]) / boundsSize[2]
     };
 
-    // Transform normal to volume-local [0,1] space
-    // Use the inverse transpose of the model matrix for normal transformation
-    double normalLocal[4] = { planeNormal[0], planeNormal[1], planeNormal[2], 0.0 };
-    invModelMatrix->MultiplyPoint(normalLocal, normalLocal);
+    // Normal: transform as a normal/covector.
+    // We want transpose(modelMatrix) * normalWorld.
+    // VTK matrices are accessed as GetElement(row, col).
+    // For column c of transpose(M):
+    //   (M^T n)[c] = sum_r M[r][c] * n[r]
+    double normalModel[3];
+    normalModel[0] =
+      modelMatrix->GetElement(0, 0) * planeNormal[0] +
+      modelMatrix->GetElement(1, 0) * planeNormal[1] +
+      modelMatrix->GetElement(2, 0) * planeNormal[2];
 
-    // Scale normal by bounds to account for non-uniform scaling in [0,1] space
-    // In texture space q = (x_local - min) / size, so gradient scales multiplicatively
+    normalModel[1] =
+      modelMatrix->GetElement(0, 1) * planeNormal[0] +
+      modelMatrix->GetElement(1, 1) * planeNormal[1] +
+      modelMatrix->GetElement(2, 1) * planeNormal[2];
+
+    normalModel[2] =
+      modelMatrix->GetElement(0, 2) * planeNormal[0] +
+      modelMatrix->GetElement(1, 2) * planeNormal[1] +
+      modelMatrix->GetElement(2, 2) * planeNormal[2];
+
+    // Scale into normalized volume space.
     double normalVol[3] = {
-      normalLocal[0] * boundsSize[0],
-      normalLocal[1] * boundsSize[1],
-      normalLocal[2] * boundsSize[2]
+      normalModel[0] * boundsSize[0],
+      normalModel[1] * boundsSize[1],
+      normalModel[2] * boundsSize[2]
     };
 
-    // Normalize
-    double normalLen = sqrt(normalVol[0] * normalVol[0] + normalVol[1] * normalVol[1] +
+    double normalLen = sqrt(
+      normalVol[0] * normalVol[0] +
+      normalVol[1] * normalVol[1] +
       normalVol[2] * normalVol[2]);
+
     if (normalLen > 1e-10)
     {
       normalVol[0] /= normalLen;
@@ -2930,7 +3169,6 @@ void vtkMetalGPUVolumeRayCastMapper::SetClippingPlaneUniforms(
 
   uniforms->NumClippingPlanes = static_cast<float>(numPlanes);
 }
-
 //------------------------------------------------------------------------------
 bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
   void* mtlDeviceVoid, vtkRenderer* ren, vtkVolume* vol, vtkImageData* input)
@@ -2950,8 +3188,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
           vtkErrorMacro("Failed to create uniform buffer");
           return false;
         }
-        // newBufferWithLength returns +1 (new rule); member owns it directly.
-        this->UniformBuffers[i] = (__bridge void*)buf;
+        AssignMetalObject(this->UniformBuffers[i], buf);
       }
     }
 
@@ -3053,7 +3290,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
             vtkErrorMacro("Failed to create vertex buffer");
             return false;
           }
-          this->VertexBuffer = (__bridge void*)vbuf;
+          AssignMetalObject(this->VertexBuffer, vbuf);
         }
 
         {
@@ -3065,7 +3302,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
             vtkErrorMacro("Failed to create index buffer");
             return false;
           }
-          this->IndexBuffer = (__bridge void*)ibuf;
+          AssignMetalObject(this->IndexBuffer, ibuf);
         }
 
         this->CameraWasInsideInLastUpdate = false;
@@ -3262,7 +3499,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
             vtkErrorMacro("Failed to create vertex buffer");
             return false;
           }
-          this->VertexBuffer = (__bridge void*)vbuf;
+          AssignMetalObject(this->VertexBuffer, vbuf);
         }
 
         // Create new index buffer
@@ -3275,7 +3512,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
             vtkErrorMacro("Failed to create index buffer");
             return false;
           }
-          this->IndexBuffer = (__bridge void*)ibuf;
+          AssignMetalObject(this->IndexBuffer, ibuf);
         }
 
         this->CameraWasInsideInLastUpdate = true;
@@ -3328,6 +3565,9 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     if (!vertexFunc || !fragmentFunc)
     {
       vtkErrorMacro("Failed to find volume shader functions");
+      [vertexFunc release];
+      [fragmentFunc release];
+      [library release];
       return false;
     }
 
@@ -3341,7 +3581,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       samplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
       id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:samplerDesc];
       [samplerDesc release];
-      this->ColorOpacitySampler = (__bridge void*)sampler;
+      AssignMetalObject(this->ColorOpacitySampler, sampler);
     }
 
     if (!this->VolumeSampler)
@@ -3354,7 +3594,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       samplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
       id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:samplerDesc];
       [samplerDesc release];
-      this->VolumeSampler = (__bridge void*)sampler;
+      AssignMetalObject(this->VolumeSampler, sampler);
     }
 
     // Create dummy depth texture (1x1 R32Float with value 1.0) for when no real depth texture is bound
@@ -3376,7 +3616,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
         float one = 1.0f;
         MTLRegion region = MTLRegionMake2D(0, 0, 1, 1);
         [dummyTex replaceRegion:region mipmapLevel:0 withBytes:&one bytesPerRow:sizeof(float)];
-        this->DummyDepthTexture = (__bridge void*)dummyTex;
+        AssignMetalObject(this->DummyDepthTexture, dummyTex);
       }
     }
 
@@ -3390,7 +3630,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       depthSampDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
       id<MTLSamplerState> depthSamp = [device newSamplerStateWithDescriptor:depthSampDesc];
       [depthSampDesc release];
-      this->DepthSampler = (__bridge void*)depthSamp;
+      AssignMetalObject(this->DepthSampler, depthSamp);
     }
 
     // Linear sampler for gradient opacity texture (1D lookup)
@@ -3403,7 +3643,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       goDesc.minFilter = MTLSamplerMinMagFilterLinear;
       id<MTLSamplerState> goSamp = [device newSamplerStateWithDescriptor:goDesc];
       [goDesc release];
-      this->GradientOpacitySampler = (__bridge void*)goSamp;
+      AssignMetalObject(this->GradientOpacitySampler, goSamp);
     }
 
     // Nearest sampler for mask texture (3D, nearest interpolation for label maps)
@@ -3417,7 +3657,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       maskDesc.minFilter = MTLSamplerMinMagFilterNearest;
       id<MTLSamplerState> maskSamp = [device newSamplerStateWithDescriptor:maskDesc];
       [maskDesc release];
-      this->MaskSampler = (__bridge void*)maskSamp;
+      AssignMetalObject(this->MaskSampler, maskSamp);
     }
 
     // Nearest sampler for label map transfer function texture (2D, nearest for label lookup)
@@ -3430,20 +3670,77 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       lmDesc.minFilter = MTLSamplerMinMagFilterNearest;
       id<MTLSamplerState> lmSamp = [device newSamplerStateWithDescriptor:lmDesc];
       [lmDesc release];
-      this->LabelMapTransferSampler = (__bridge void*)lmSamp;
+      AssignMetalObject(this->LabelMapTransferSampler, lmSamp);
     }
 
-    // Nearest sampler for label map gradient opacity texture
-    if (!this->LabelMapGradientOpacitySampler)
+    // Create dummy 3D textures for fallback bindings (prevent nil texture binds).
+    if (!this->DummyVolumeTexture)
     {
-      MTLSamplerDescriptor* lgoDesc = [[MTLSamplerDescriptor alloc] init];
-      lgoDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
-      lgoDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
-      lgoDesc.magFilter = MTLSamplerMinMagFilterNearest;
-      lgoDesc.minFilter = MTLSamplerMinMagFilterNearest;
-      id<MTLSamplerState> lgoSamp = [device newSamplerStateWithDescriptor:lgoDesc];
-      [lgoDesc release];
-      this->LabelMapGradientOpacitySampler = (__bridge void*)lgoSamp;
+      MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
+      desc.textureType = MTLTextureType3D;
+      desc.pixelFormat = MTLPixelFormatR32Float;
+      desc.width = 1;
+      desc.height = 1;
+      desc.depth = 1;
+      desc.mipmapLevelCount = 1;
+      desc.usage = MTLTextureUsageShaderRead;
+      desc.storageMode = MTLStorageModeShared;
+      id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+      if (tex)
+      {
+        float zero = 0.0f;
+        MTLRegion region = MTLRegionMake3D(0, 0, 0, 1, 1, 1);
+        [tex replaceRegion:region mipmapLevel:0 slice:0 withBytes:&zero
+               bytesPerRow:sizeof(float) bytesPerImage:sizeof(float)];
+      }
+      AssignMetalObject(this->DummyVolumeTexture, tex);
+      [desc release];
+    }
+
+    if (!this->DummyMaskTexture)
+    {
+      MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
+      desc.textureType = MTLTextureType3D;
+      desc.pixelFormat = MTLPixelFormatR32Float;
+      desc.width = 1;
+      desc.height = 1;
+      desc.depth = 1;
+      desc.mipmapLevelCount = 1;
+      desc.usage = MTLTextureUsageShaderRead;
+      desc.storageMode = MTLStorageModeShared;
+      id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+      if (tex)
+      {
+        float zero = 0.0f;
+        MTLRegion region = MTLRegionMake3D(0, 0, 0, 1, 1, 1);
+        [tex replaceRegion:region mipmapLevel:0 slice:0 withBytes:&zero
+               bytesPerRow:sizeof(float) bytesPerImage:sizeof(float)];
+      }
+      AssignMetalObject(this->DummyMaskTexture, tex);
+      [desc release];
+    }
+
+    if (!this->DummyMinMaxTexture)
+    {
+      MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
+      desc.textureType = MTLTextureType3D;
+      desc.pixelFormat = MTLPixelFormatR8Unorm;
+      desc.width = 1;
+      desc.height = 1;
+      desc.depth = 1;
+      desc.mipmapLevelCount = 1;
+      desc.usage = MTLTextureUsageShaderRead;
+      desc.storageMode = MTLStorageModeShared;
+      id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+      if (tex)
+      {
+        uint8_t zero = 0;
+        MTLRegion region = MTLRegionMake3D(0, 0, 0, 1, 1, 1);
+        [tex replaceRegion:region mipmapLevel:0 slice:0 withBytes:&zero
+               bytesPerRow:sizeof(uint8_t) bytesPerImage:sizeof(uint8_t)];
+      }
+      AssignMetalObject(this->DummyMinMaxTexture, tex);
+      [desc release];
     }
 
     // Nearest sampler for min-max acceleration texture (3D, nearest for block lookup)
@@ -3457,7 +3754,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       mmDesc.minFilter = MTLSamplerMinMagFilterNearest;
       id<MTLSamplerState> mmSamp = [device newSamplerStateWithDescriptor:mmDesc];
       [mmDesc release];
-      this->MinMaxSampler = (__bridge void*)mmSamp;
+      AssignMetalObject(this->MinMaxSampler, mmSamp);
     }
 
     // Create and cache a depth stencil state.
@@ -3468,7 +3765,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       dsDesc.depthWriteEnabled = NO;
       id<MTLDepthStencilState> ds = [device newDepthStencilStateWithDescriptor:dsDesc];
       [dsDesc release];
-      this->DepthStencilState = (__bridge void*)ds;
+      AssignMetalObject(this->DepthStencilState, ds);
     }
 
     // Pipeline: vertex buffer layout — float3 position at buffer index 0
@@ -3511,7 +3808,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       [vertexDesc release];
       return false;
     }
-    this->PipelineState = (__bridge void*)pso;
+    AssignMetalObject(this->PipelineState, pso);
     this->CurrentSampleCount = sampleCount;
 
     // Create accumulation pipeline for inter-block opacity propagation.
@@ -3540,18 +3837,25 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       [vertexDesc release];
       return false;
     }
-    if (this->AccumulationPipelineState)
-    {
-      ReleaseMetalObject(this->AccumulationPipelineState);
-    }
-    this->AccumulationPipelineState = (__bridge void*)accumPso;
+    AssignMetalObject(this->AccumulationPipelineState, accumPso);
 
     // Layer pipeline: same fragment as screen path, but offscreen format, no blend, no depth.
     if (!this->LayerPipelineState)
     {
+      id<MTLFunction> layerFrag = [library newFunctionWithName:@"fragment_volume_main"];
+      if (!layerFrag)
+      {
+        vtkErrorMacro("Failed to find layer fragment function");
+        [vertexFunc release];
+        [fragmentFunc release];
+        [library release];
+        [vertexDesc release];
+        return false;
+      }
+
       MTLRenderPipelineDescriptor* ld = [[MTLRenderPipelineDescriptor alloc] init];
       ld.vertexFunction = vertexFunc;
-      ld.fragmentFunction = [library newFunctionWithName:@"fragment_volume_main"];
+      ld.fragmentFunction = layerFrag;
       ld.vertexDescriptor = vertexDesc;
       ld.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
       ld.colorAttachments[0].blendingEnabled = NO;
@@ -3562,6 +3866,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       NSError* layerError = nil;
       id<MTLRenderPipelineState> p = [device newRenderPipelineStateWithDescriptor:ld error:&layerError];
       [ld release];
+      [layerFrag release];
       if (!p)
       {
         vtkErrorMacro(<< "Layer pipeline: " << [[layerError localizedDescription] UTF8String]);
@@ -3571,7 +3876,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
         [vertexDesc release];
         return false;
       }
-      this->LayerPipelineState = (__bridge void*)p;
+      AssignMetalObject(this->LayerPipelineState, p);
     }
 
     // Composite pipeline: fullscreen resolve of the 8 layers.
@@ -3602,7 +3907,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
         [vertexDesc release];
         return false;
       }
-      this->CompositePipelineState = (__bridge void*)p;
+      AssignMetalObject(this->CompositePipelineState, p);
     }
 
     // Release temporary objects
@@ -3653,7 +3958,9 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
   [encoder setVertexBuffer:uniformBuf offset:0 atIndex:1];
   [encoder setFragmentBuffer:uniformBuf offset:0 atIndex:1];
 
-  id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;
+  id<MTLTexture> volTex = this->VolumeTexture
+    ? (__bridge id<MTLTexture>)this->VolumeTexture
+    : (__bridge id<MTLTexture>)this->DummyVolumeTexture;
   id<MTLSamplerState> volSamp = (__bridge id<MTLSamplerState>)this->VolumeSampler;
   id<MTLTexture> tfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
   id<MTLSamplerState> tfSamp = (__bridge id<MTLSamplerState>)this->ColorOpacitySampler;
@@ -3689,7 +3996,9 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
 
   // Bind mask / label map textures (fragment index 4).
   // Metal requires all declared fragment texture/sampler arguments to be bound,
-  // so bind the volume texture as fallback when mask is not used.
+  // so bind the dummy mask texture as fallback when mask is not used.
+  id<MTLTexture> maskFallbackTex =
+    (__bridge id<MTLTexture>)this->DummyMaskTexture;
   if (this->MaskTexture)
   {
     id<MTLTexture> maskTex = (__bridge id<MTLTexture>)this->MaskTexture;
@@ -3699,7 +4008,7 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
   }
   else
   {
-    [encoder setFragmentTexture:volTex atIndex:4];
+    [encoder setFragmentTexture:maskFallbackTex atIndex:4];
     [encoder setFragmentSamplerState:volSamp atIndex:4];
   }
 
@@ -3717,34 +4026,22 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
     [encoder setFragmentSamplerState:tfSamp atIndex:5];
   }
 
-  // Bind label map gradient opacity texture (fragment index 6)
-  if (this->LabelMapGradientOpacityTexture)
-  {
-    id<MTLTexture> lgoTex = (__bridge id<MTLTexture>)this->LabelMapGradientOpacityTexture;
-    id<MTLSamplerState> lgoSamp = (__bridge id<MTLSamplerState>)this->LabelMapGradientOpacitySampler;
-    [encoder setFragmentTexture:lgoTex atIndex:6];
-    [encoder setFragmentSamplerState:lgoSamp atIndex:6];
-  }
-  else
-  {
-    [encoder setFragmentTexture:tfTex atIndex:6];
-    [encoder setFragmentSamplerState:tfSamp atIndex:6];
-  }
-
-  // Bind min-max acceleration texture (fragment index 7)
+  // Bind min-max acceleration texture (fragment index 6).
   // Metal requires all declared fragment texture/sampler arguments to be bound,
-  // so bind the volume texture as fallback when min-max is not available.
+  // so bind the dummy minmax texture as fallback when min-max is not available.
+  id<MTLTexture> minMaxFallbackTex =
+    (__bridge id<MTLTexture>)this->DummyMinMaxTexture;
   if (this->MinMaxTexture)
   {
     id<MTLTexture> mmTex = (__bridge id<MTLTexture>)this->MinMaxTexture;
     id<MTLSamplerState> mmSamp = (__bridge id<MTLSamplerState>)this->MinMaxSampler;
-    [encoder setFragmentTexture:mmTex atIndex:7];
-    [encoder setFragmentSamplerState:mmSamp atIndex:7];
+    [encoder setFragmentTexture:mmTex atIndex:6];
+    [encoder setFragmentSamplerState:mmSamp atIndex:6];
   }
   else
   {
-    [encoder setFragmentTexture:volTex atIndex:7];
-    [encoder setFragmentSamplerState:volSamp atIndex:7];
+    [encoder setFragmentTexture:minMaxFallbackTex atIndex:6];
+    [encoder setFragmentSamplerState:volSamp atIndex:6];
   }
 }
 
@@ -3828,9 +4125,9 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
         pbd.MinMaxInfo[3] = static_cast<float>(block.MinMaxDims[2]);
 
         id<MTLTexture> blockMmTex = (__bridge id<MTLTexture>)block.MinMaxTexture;
-        [encoder setFragmentTexture:blockMmTex atIndex:7];
+        [encoder setFragmentTexture:blockMmTex atIndex:6];
         id<MTLSamplerState> mmSamp = (__bridge id<MTLSamplerState>)this->MinMaxSampler;
-        [encoder setFragmentSamplerState:mmSamp atIndex:7];
+        [encoder setFragmentSamplerState:mmSamp atIndex:6];
       }
       else
       {
@@ -3935,7 +4232,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   vtkDataArray* scalars = input->GetPointData()->GetScalars();
   if (scalars)
   {
-    scalars->GetRange(this->ScalarRange);
+    scalars->GetRange(this->ScalarRange, 0);
   }
   else
   {
@@ -4192,8 +4489,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         std::min(croppingRegionPlanes[maxIdx], modelBounds[maxIdx]);
     }
 
-    // Convert from world coordinates to volume-local [0,1] space
-    // using the same normalization as CameraVolumePos
+    // Convert from model/data coordinates to volume-local [0,1] space.
+    // VTK's GetCroppingRegionPlanes() returns planes in model/data coordinates,
+    // so the direct normalization against modelBounds is correct.
     uniforms.CroppingPlanes[0] =
       static_cast<float>((croppingRegionPlanes[0] - modelBounds[0]) / boundsSize[0]);
     uniforms.CroppingPlanes[1] =
@@ -4231,7 +4529,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   }
 
   // Clipping planes
-  this->SetClippingPlaneUniforms(&uniforms, ren, vol, invModelMatrix);
+  this->SetClippingPlaneUniforms(&uniforms, ren, vol, modelMatrix, invModelMatrix);
 
   // Mask / label map
   this->SetMaskUniforms(&uniforms, vol);
@@ -4550,8 +4848,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
           pbd.MinMaxInfo[1] = static_cast<float>(block.MinMaxDims[0]);
           pbd.MinMaxInfo[2] = static_cast<float>(block.MinMaxDims[1]);
           pbd.MinMaxInfo[3] = static_cast<float>(block.MinMaxDims[2]);
-          [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.MinMaxTexture atIndex:7];
-          [layerEnc setFragmentSamplerState:(__bridge id<MTLSamplerState>)this->MinMaxSampler atIndex:7];
+          [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.MinMaxTexture atIndex:6];
+          [layerEnc setFragmentSamplerState:(__bridge id<MTLSamplerState>)this->MinMaxSampler atIndex:6];
         }
         else
         {
@@ -4677,10 +4975,18 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     this->DrawBlocks(encoder, uniformBuf, ren, vol, &uniforms, invModelMatrix);
   }
 
-  // Signal the semaphore when the GPU finishes this frame's command buffer
-  void* sem = this->FrameSemaphore;
+  // Signal the semaphore when the GPU finishes this frame's command buffer.
+  // Retain the semaphore under MRC to prevent use-after-free if the mapper
+  // is destroyed before the handler fires.
+  dispatch_semaphore_t sem = (__bridge dispatch_semaphore_t)this->FrameSemaphore;
+#if !__has_feature(objc_arc)
+  dispatch_retain(sem);
+#endif
   [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
-    dispatch_semaphore_signal((dispatch_semaphore_t)sem);
+    dispatch_semaphore_signal(sem);
+#if !__has_feature(objc_arc)
+    dispatch_release(sem);
+#endif
   }];
 
   } // @autoreleasepool

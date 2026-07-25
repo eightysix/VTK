@@ -1332,10 +1332,11 @@ inline float2 intersectBox(float3 orig, float3 dir, float3 boxMin, float3 boxMax
   return float2(max(max(tmin.x, tmin.y), tmin.z), min(min(tmax.x, tmax.y), tmax.z));
 }
 
-// Optimized: Zero-overhead gradient fetch
+// Optimized: Gradient fetch with direction correction for anisotropic spacing.
+// gradScale = 1 / (gradientStep * texSizeGlobal) converts raw central-difference
+// components from texture-local to normalized-volume space.
 inline half4 computeGradientFast(texture3d<float> volTex, sampler volSamp, float3 pos,
-                                 float3 gradStep, half gradNormFactor) {
-  // 6 fetches are unavoidable for quality, but we minimize ALU overhead
+                                 float3 gradStep, half3 gradScale, half gradNormFactor) {
   half sPX = half(volTex.sample(volSamp, pos + float3(gradStep.x, 0, 0), level(0)).r);
   half sNX = half(volTex.sample(volSamp, pos - float3(gradStep.x, 0, 0), level(0)).r);
   half sPY = half(volTex.sample(volSamp, pos + float3(0, gradStep.y, 0), level(0)).r);
@@ -1343,9 +1344,13 @@ inline half4 computeGradientFast(texture3d<float> volTex, sampler volSamp, float
   half sPZ = half(volTex.sample(volSamp, pos + float3(0, 0, gradStep.z), level(0)).r);
   half sNZ = half(volTex.sample(volSamp, pos - float3(0, 0, gradStep.z), level(0)).r);
 
-  half3 grad = half3(sPX - sNX, sPY - sNY, sPZ - sNZ);
-  half mag = length(grad);
-  return half4(mag > 0.0h ? grad / mag : half3(0.0h), saturate(mag / gradNormFactor));
+  half3 rawGrad = half3(sPX - sNX, sPY - sNY, sPZ - sNZ);
+  half rawMag = length(rawGrad);
+
+  half3 correctedGrad = rawGrad * gradScale;
+  half3 normal = length(correctedGrad) > 0.0h ? normalize(correctedGrad) : half3(0.0h);
+
+  return half4(normal, saturate(rawMag / gradNormFactor));
 }
 
 // Optimized: Pure FP16 math and fast::pow
@@ -1380,16 +1385,14 @@ fragment VolumeFragmentOut fragment_volume_main(
     texture2d<float> gradientOpacityTexture [[texture(3)]],
     texture3d<float> maskTexture [[texture(4)]],
     texture2d<float> labelMapTransferTexture [[texture(5)]],
-    texture2d<float> labelMapGradientOpacityTexture [[texture(6)]],
-    texture3d<float> minMaxTexture [[texture(7)]],
+    texture3d<float> minMaxTexture [[texture(6)]],
     sampler transferFunctionSampler [[sampler(0)]],
     sampler volumeSampler [[sampler(1)]],
     sampler depthSampler [[sampler(2)]],
     sampler gradientOpacitySampler [[sampler(3)]],
     sampler maskSampler [[sampler(4)]],
     sampler labelMapSampler [[sampler(5)]],
-    sampler labelMapGradOpSampler [[sampler(6)]],
-    sampler minMaxSampler [[sampler(7)]]) {
+    sampler minMaxSampler [[sampler(6)]]) {
 
   if (!isFrontFace) discard_fragment();
 
@@ -1460,6 +1463,10 @@ fragment VolumeFragmentOut fragment_volume_main(
   half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
 
   half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
+
+  float3 texSizeGlobal = max(texMaxGlobal - texMinGlobal, 1e-6);
+  float3 dt = max(volumeUniforms.gradientStep, 1e-8);
+  half3 gradScale = half3(1.0 / (dt * texSizeGlobal));
 
   half3 viewDirHalf  = half3(normalize(entryPoint - cameraPos));
   half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection));
@@ -1632,7 +1639,7 @@ fragment VolumeFragmentOut fragment_volume_main(
       // it is invisible on an 8-bit monitor. Do not waste memory bandwidth shading it.
       if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
 
-        half4 grad = computeGradientFast(volumeTexture, volumeSampler, evalPoint, b.gradientStep.xyz, gradNormFactor);
+        half4 grad = computeGradientFast(volumeTexture, volumeSampler, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
         sampleColor = computePhongLightingVolumeFast(sampleColor, grad.xyz, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
 
         if (doGradOp) {
@@ -1678,16 +1685,14 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     texture2d<float> gradientOpacityTexture [[texture(3)]],
     texture3d<float> maskTexture [[texture(4)]],
     texture2d<float> labelMapTransferTexture [[texture(5)]],
-    texture2d<float> labelMapGradientOpacityTexture [[texture(6)]],
-    texture3d<float> minMaxTexture [[texture(7)]],
+    texture3d<float> minMaxTexture [[texture(6)]],
     sampler transferFunctionSampler [[sampler(0)]],
     sampler volumeSampler [[sampler(1)]],
     sampler depthSampler [[sampler(2)]],
     sampler gradientOpacitySampler [[sampler(3)]],
     sampler maskSampler [[sampler(4)]],
     sampler labelMapSampler [[sampler(5)]],
-    sampler labelMapGradOpSampler [[sampler(6)]],
-    sampler minMaxSampler [[sampler(7)]]) {
+    sampler minMaxSampler [[sampler(6)]]) {
 
   if (!isFrontFace) discard_fragment();
 
@@ -1768,6 +1773,10 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
   half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
 
   half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
+
+  float3 texSizeGlobalFrag2 = max(texMaxGlobal - texMinGlobal, 1e-6);
+  float3 dtFrag2 = max(volumeUniforms.gradientStep, 1e-8);
+  half3 gradScaleFrag2 = half3(1.0 / (dtFrag2 * texSizeGlobalFrag2));
 
   half3 viewDirHalf  = half3(normalize(entryPoint - cameraPos));
   half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection));
@@ -1935,7 +1944,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
       // Visual Significance Threshold
       if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
 
-        half4 grad = computeGradientFast(volumeTexture, volumeSampler, evalPoint, b.gradientStep.xyz, gradNormFactor);
+        half4 grad = computeGradientFast(volumeTexture, volumeSampler, evalPoint, b.gradientStep.xyz, gradScaleFrag2, gradNormFactor);
         sampleColor = computePhongLightingVolumeFast(sampleColor, grad.xyz, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
 
         if (doGradOp) {

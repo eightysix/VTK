@@ -90,6 +90,9 @@ private:
   void* DepthStencilState = nullptr;     // id<MTLDepthStencilState>
   void* DepthTextureOcclusion = nullptr; // id<MTLTexture> — scene depth for early ray termination
   void* DummyDepthTexture = nullptr;     // id<MTLTexture> — 1x1 R32Float(1.0) fallback when no depth available
+  void* DummyVolumeTexture = nullptr;    // id<MTLTexture> — 1x1x1 R32Float fallback for nil volume tex
+  void* DummyMaskTexture = nullptr;      // id<MTLTexture> — 1x1x1 R32Float fallback for nil mask tex
+  void* DummyMinMaxTexture = nullptr;    // id<MTLTexture> — 1x1x1 R8Unorm fallback for nil minmax tex
   void* DepthSampler = nullptr;          // id<MTLSamplerState> — nearest sampler for depth texture
 
   // Mask / label map support
@@ -117,6 +120,8 @@ private:
   float ScalarNormalizationFactor = 1.0f;
   int VolumeNumComponents = 1;
   int CurrentSampleCount = 0;
+
+  bool PreferHalfPrecision = true;  // when true, prefer half-float for non-native data types
 
   // Adaptive sample distance
   double ReductionFactor = 1.0;
@@ -164,7 +169,10 @@ private:
 
   // Clipping planes — up to 8 arbitrary clipping planes
   void SetClippingPlaneUniforms(void* uniforms, vtkRenderer* ren, vtkVolume* vol,
-    vtkMatrix4x4* invModelMatrix);
+    vtkMatrix4x4* modelMatrix, vtkMatrix4x4* invModelMatrix);
+
+  // Wait for all in-flight GPU frames to complete (safe teardown)
+  void WaitForInFlightFrames();
 
   // Rendering helpers — shared between image-sampling and standard paths
   void BindEncoderResources(void* encoder, void* uniformBuf, void* pipelineState = nullptr);
