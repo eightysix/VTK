@@ -89,6 +89,7 @@ private:
   vtkTimeStamp MinMaxUploadTime;
   void* DepthStencilState = nullptr;     // id<MTLDepthStencilState>
   void* DepthTextureOcclusion = nullptr; // id<MTLTexture> — scene depth for early ray termination
+  void* DummyDepthTexture = nullptr;     // id<MTLTexture> — 1x1 R32Float(1.0) fallback when no depth available
   void* DepthSampler = nullptr;          // id<MTLSamplerState> — nearest sampler for depth texture
 
   // Mask / label map support
@@ -99,6 +100,8 @@ private:
   void* LabelMapGradientOpacityTexture = nullptr; // id<MTLTexture> (2D) — label map gradient opacity
   void* LabelMapGradientOpacitySampler = nullptr; // id<MTLSamplerState> — nearest sampler for label map grad op
   vtkTimeStamp MaskUpdateTime;
+  int LastLabelMapMaxLabel = -1;
+  size_t LastLabelMapLabelCount = 0;
 
   // Buffers
   void* UniformBuffers[3] = { nullptr, nullptr, nullptr }; // id<MTLBuffer>[3] — triple-buffered
@@ -118,6 +121,9 @@ private:
   // Adaptive sample distance
   double ReductionFactor = 1.0;
   double LastTransferFunctionSampleDistance = -1.0;
+  double LastTransferFunctionScalarRange[2] = { 0.0, 0.0 };
+  double LastGradientOpacityScalarRange[2] = { 0.0, 0.0 };
+  double LastLabelMapScalarRange[2] = { 0.0, 0.0 };
   void ComputeReductionFactor(double allocatedTime);
 
   // Image-space downsampling (ImageSampleDistance)

@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstddef>
 #include <set>
 #include <vector>
 #include <dispatch/dispatch.h>
@@ -90,11 +91,11 @@ struct VolumeMapperUniforms
   float CroppingFlagsRow6[4];       // 608..623
   float CroppingFlagsRow7[4];       // 624..639
   float UseCropping;                // 640
-  float _padCropping[3];            // 644..655
+  float UseClipping;                // 644
+  float NumClippingPlanes;          // 648
+  float _padClipping[2];            // 652..659
+  float _padClipAlign[3];           // 660..671
   // Clipping planes (up to 8 arbitrary planes)
-  float UseClipping;                // 656
-  float NumClippingPlanes;          // 660
-  float _padClipping[2];            // 664..671 (pad to 16-byte for float4)
   float ClippingPlane0Origin[4];    // 672..687 (origin.xyz, 1.0)
   float ClippingPlane0Normal[4];    // 688..703 (normal.xyz, 0.0)
   float ClippingPlane1Origin[4];    // 704..719
@@ -117,7 +118,8 @@ struct VolumeMapperUniforms
   float MaskScale;                // 936
   float MaskBias;                 // 940
   float LabelMapNumLabels;        // 944
-  float _padMask[3];              // 948..959 (pad to 16-byte alignment)
+  float UseDepthTexture;          // 948
+  float _padMask[2];              // 952..959 (pad to 16-byte alignment)
   // Min-max acceleration texture
   float UseMinMaxAccel;           // 960
   float MinMaxDimX;               // 964
@@ -127,6 +129,14 @@ struct VolumeMapperUniforms
 
 static_assert(sizeof(VolumeMapperUniforms) == 976,
   "VolumeMapperUniforms must be 976 bytes to match Metal shader struct");
+
+static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
+static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
+static_assert(offsetof(VolumeMapperUniforms, NumClippingPlanes) == 648, "");
+static_assert(offsetof(VolumeMapperUniforms, ClippingPlane0Origin) == 672, "");
+static_assert(offsetof(VolumeMapperUniforms, UseMask) == 928, "");
+static_assert(offsetof(VolumeMapperUniforms, UseDepthTexture) == 948, "");
+static_assert(offsetof(VolumeMapperUniforms, UseMinMaxAccel) == 960, "");
 
 // Per-block data for volume rendering — must match Metal PerBlockData struct
 struct PerBlockData {
@@ -520,6 +530,7 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   this->ReleaseMaskResources();
 
   ReleaseMetalObject(this->DepthSampler);
+  ReleaseMetalObject(this->DummyDepthTexture);
   ReleaseMetalObject(this->DepthStencilState);
 
   for (int i = 0; i < 3; ++i)
@@ -582,11 +593,27 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
 
   // Check if partitioning is active — route to block-based texture creation
   bool usePartitions = (this->Partitions[0] > 1 || this->Partitions[1] > 1 || this->Partitions[2] > 1);
+
+  // Clear stale blocks when partitions are disabled
+  if (!usePartitions && !this->Blocks.empty())
+  {
+    this->ClearBlocks();
+  }
+
   if (usePartitions)
   {
     // Only reload if blocks don't exist yet or data has changed
     bool blockNeedsReload = this->Blocks.empty();
     blockNeedsReload |= (input->GetMTime() > this->VolumeUploadTime.GetMTime());
+    blockNeedsReload |= (this->GetMTime() > this->VolumeUploadTime.GetMTime());
+
+    vtkVolumeProperty* property = vol ? vol->GetProperty() : nullptr;
+    vtkPiecewiseFunction* opacityFunc =
+      property ? property->GetScalarOpacity() : nullptr;
+    if (opacityFunc)
+    {
+      blockNeedsReload |= (opacityFunc->GetMTime() > this->VolumeUploadTime.GetMTime());
+    }
     if (blockNeedsReload)
     {
       // Split the volume into blocks and create per-block textures
@@ -621,16 +648,22 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
         }
       }
 
-      // Store full volume bounds for vertex buffer (covers entire volume)
+      // Store full volume bounds for vertex buffer (covers entire volume) using extent
       double origin[3], spacing[3];
       input->GetOrigin(origin);
       input->GetSpacing(spacing);
-      this->ModelBounds[0] = origin[0];
-      this->ModelBounds[1] = origin[0] + spacing[0] * (input->GetDimensions()[0] - 1);
-      this->ModelBounds[2] = origin[1];
-      this->ModelBounds[3] = origin[1] + spacing[1] * (input->GetDimensions()[1] - 1);
-      this->ModelBounds[4] = origin[2];
-      this->ModelBounds[5] = origin[2] + spacing[2] * (input->GetDimensions()[2] - 1);
+      double x0 = origin[0] + spacing[0] * fullExt[0];
+      double x1 = origin[0] + spacing[0] * fullExt[1];
+      double y0 = origin[1] + spacing[1] * fullExt[2];
+      double y1 = origin[1] + spacing[1] * fullExt[3];
+      double z0 = origin[2] + spacing[2] * fullExt[4];
+      double z1 = origin[2] + spacing[2] * fullExt[5];
+      this->ModelBounds[0] = std::min(x0, x1);
+      this->ModelBounds[1] = std::max(x0, x1);
+      this->ModelBounds[2] = std::min(y0, y1);
+      this->ModelBounds[3] = std::max(y0, y1);
+      this->ModelBounds[4] = std::min(z0, z1);
+      this->ModelBounds[5] = std::max(z0, z1);
 
       this->VolumeNumComponents = scalars->GetNumberOfComponents();
 
@@ -659,18 +692,32 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       int numComponents = scalars->GetNumberOfComponents();
       vtkIdType numTuples = scalars->GetNumberOfTuples();
 
+      if (numComponents < 1 || numComponents > 4)
+      {
+        vtkErrorMacro("Unsupported number of scalar components: " << numComponents);
+        return false;
+      }
+
       this->VolumeNumComponents = numComponents;
 
-      // Store model-space bounds
+      // Store model-space bounds using image extent (handles non-zero extents and negative spacing)
+      int ext[6];
+      input->GetExtent(ext);
       double origin[3], spacing[3];
       input->GetOrigin(origin);
       input->GetSpacing(spacing);
-      this->ModelBounds[0] = origin[0];
-      this->ModelBounds[1] = origin[0] + spacing[0] * (dims[0] - 1);
-      this->ModelBounds[2] = origin[1];
-      this->ModelBounds[3] = origin[1] + spacing[1] * (dims[1] - 1);
-      this->ModelBounds[4] = origin[2];
-      this->ModelBounds[5] = origin[2] + spacing[2] * (dims[2] - 1);
+      double x0 = origin[0] + spacing[0] * ext[0];
+      double x1 = origin[0] + spacing[0] * ext[1];
+      double y0 = origin[1] + spacing[1] * ext[2];
+      double y1 = origin[1] + spacing[1] * ext[3];
+      double z0 = origin[2] + spacing[2] * ext[4];
+      double z1 = origin[2] + spacing[2] * ext[5];
+      this->ModelBounds[0] = std::min(x0, x1);
+      this->ModelBounds[1] = std::max(x0, x1);
+      this->ModelBounds[2] = std::min(y0, y1);
+      this->ModelBounds[3] = std::max(y0, y1);
+      this->ModelBounds[4] = std::min(z0, z1);
+      this->ModelBounds[5] = std::max(z0, z1);
 
       // Select optimal texture format for this data type
       int componentsForFormat = (numComponents == 3) ? 4 : numComponents;
@@ -1038,9 +1085,14 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
     return false;
   }
 
+  bool scalarRangeChanged =
+    (this->ScalarRange[0] != this->LastTransferFunctionScalarRange[0]) ||
+    (this->ScalarRange[1] != this->LastTransferFunctionScalarRange[1]);
+
   bool doReload = (this->ColorOpacityTexture == nullptr);
   doReload |= (colorFunc->GetMTime() > this->TransferFunctionUploadTime.GetMTime());
   doReload |= (opacityFunc->GetMTime() > this->TransferFunctionUploadTime.GetMTime());
+  doReload |= scalarRangeChanged;
   // Re-upload when sample distance changes (affects opacity pre-integration)
   doReload |= (actualSampleDistance != this->LastTransferFunctionSampleDistance);
 
@@ -1070,6 +1122,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
         {
           opacity = 1.0 - pow(1.0 - opacity, factor);
         }
+
+        rgb[0] = std::clamp(rgb[0], 0.0, 1.0);
+        rgb[1] = std::clamp(rgb[1], 0.0, 1.0);
+        rgb[2] = std::clamp(rgb[2], 0.0, 1.0);
+        opacity = std::clamp(opacity, 0.0, 1.0);
 
         tfData[i * 4 + 0] = static_cast<unsigned char>(rgb[0] * 255.0);
         tfData[i * 4 + 1] = static_cast<unsigned char>(rgb[1] * 255.0);
@@ -1114,6 +1171,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
               withBytes:tfData
             bytesPerRow:256 * 4];
 
+      this->LastTransferFunctionScalarRange[0] = this->ScalarRange[0];
+      this->LastTransferFunctionScalarRange[1] = this->ScalarRange[1];
       this->TransferFunctionUploadTime.Modified();
       this->LastTransferFunctionSampleDistance = actualSampleDistance;
     }
@@ -1258,44 +1317,50 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMaskTexture(
       // Get the data pointer
       int numComponents = arr->GetNumberOfComponents();
 
-      // Convert mask data to float for the 3D texture
+      // Convert mask data to float for the 3D texture (R32Float — component 0 only)
       // Mask is typically unsigned char (0-255) for label maps
       vtkIdType numTuples = arr->GetNumberOfTuples();
-      std::vector<float> maskData(numTuples * numComponents);
+      std::vector<float> maskData(numTuples);
 
       // Use direct pointer access for common types to avoid virtual dispatch overhead
       int dataType = arr->GetDataType();
-      if (dataType == VTK_UNSIGNED_CHAR && numComponents == 1)
+      if (dataType == VTK_UNSIGNED_CHAR)
       {
         const unsigned char* src = static_cast<const unsigned char*>(arr->GetVoidPointer(0));
         vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
           for (vtkIdType i = begin; i < end; ++i)
-            maskData[i] = static_cast<float>(src[i]);
+            maskData[i] = static_cast<float>(src[i * numComponents]);
         });
       }
-      else if (dataType == VTK_UNSIGNED_SHORT && numComponents == 1)
+      else if (dataType == VTK_UNSIGNED_SHORT)
       {
         const unsigned short* src = static_cast<const unsigned short*>(arr->GetVoidPointer(0));
         vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
           for (vtkIdType i = begin; i < end; ++i)
-            maskData[i] = static_cast<float>(src[i]);
+            maskData[i] = static_cast<float>(src[i * numComponents]);
         });
       }
-      else if (dataType == VTK_FLOAT && numComponents == 1)
+      else if (dataType == VTK_FLOAT)
       {
         const float* src = static_cast<const float*>(arr->GetVoidPointer(0));
-        std::memcpy(maskData.data(), src, numTuples * sizeof(float));
+        if (numComponents == 1)
+        {
+          std::memcpy(maskData.data(), src, numTuples * sizeof(float));
+        }
+        else
+        {
+          vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+            for (vtkIdType i = begin; i < end; ++i)
+              maskData[i] = src[i * numComponents];
+          });
+        }
       }
       else
       {
         // Generic fallback using GetComponent
         for (vtkIdType i = 0; i < numTuples; ++i)
         {
-          for (int c = 0; c < numComponents; ++c)
-          {
-            double val = arr->GetComponent(i, c);
-            maskData[i * numComponents + c] = static_cast<float>(val);
-          }
+          maskData[i] = static_cast<float>(arr->GetComponent(i, 0));
         }
       }
 
@@ -1303,7 +1368,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMaskTexture(
       id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->MaskTexture;
       id<MTLTexture> tex = nil;
 
-      if (oldTex)
+      if (oldTex &&
+          oldTex.width == static_cast<NSUInteger>(dims[0]) &&
+          oldTex.height == static_cast<NSUInteger>(dims[1]) &&
+          oldTex.depth == static_cast<NSUInteger>(dims[2]) &&
+          oldTex.pixelFormat == MTLPixelFormatR32Float)
       {
         tex = oldTex;
       }
@@ -1332,9 +1401,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMaskTexture(
         this->MaskTexture = (__bridge void*)tex;
       }
 
-      // Upload mask data to texture
+      // Upload mask data to texture (R32Float format uses 1 component)
       MTLRegion region = MTLRegionMake3D(0, 0, 0, dims[0], dims[1], dims[2]);
-      NSUInteger maskBytesPerRow = static_cast<NSUInteger>(dims[0]) * numComponents * sizeof(float);
+      NSUInteger maskBytesPerRow = static_cast<NSUInteger>(dims[0]) * sizeof(float);
       NSUInteger maskBytesPerImage = maskBytesPerRow * dims[1];
       [tex replaceRegion:region
             mipmapLevel:0
@@ -1387,8 +1456,18 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateLabelMapTransferTexture(
     }
   }
 
+  bool scalarRangeChanged =
+    (this->ScalarRange[0] != this->LastLabelMapScalarRange[0]) ||
+    (this->ScalarRange[1] != this->LastLabelMapScalarRange[1]);
+
+  bool labelSetChanged =
+    (maxLabel != this->LastLabelMapMaxLabel) ||
+    (labels.size() != this->LastLabelMapLabelCount);
+
   bool doReload = (this->LabelMapTransferTexture == nullptr);
   doReload |= (latestMTime > this->MaskUpdateTime.GetMTime());
+  doReload |= scalarRangeChanged;
+  doReload |= labelSetChanged;
 
   if (doReload)
   {
@@ -1496,6 +1575,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateLabelMapTransferTexture(
               withBytes:tfData.data()
             bytesPerRow:tfWidth * 4 * sizeof(float)];
 
+      this->LastLabelMapScalarRange[0] = this->ScalarRange[0];
+      this->LastLabelMapScalarRange[1] = this->ScalarRange[1];
+      this->LastLabelMapMaxLabel = maxLabel;
+      this->LastLabelMapLabelCount = labels.size();
       this->MaskUpdateTime.Modified();
     }
   }
@@ -1562,9 +1645,14 @@ void vtkMetalGPUVolumeRayCastMapper::SetMaskUniforms(void* uniforms, vtkVolume* 
     }
 
     // Get the number of labels for quantization
+    // numLabels = maxLabel + 1, so the shader can use label indices directly.
     std::set<int> labels = property->GetLabelMapLabels();
     int maxLabel = labels.empty() ? 0 : *(labels.rbegin());
-    u->LabelMapNumLabels = static_cast<float>(maxLabel);
+    int numLabels = labels.empty() ? 0 : maxLabel + 1;
+    u->LabelMapNumLabels = static_cast<float>(numLabels);
+    // For label maps, use raw label indices not normalized values
+    u->MaskScale = 1.0f;
+    u->MaskBias = 0.0f;
   }
   else
   {
@@ -1603,9 +1691,13 @@ void vtkMetalGPUVolumeRayCastMapper::ClearBlocks()
 bool vtkMetalGPUVolumeRayCastMapper::IsBlockEmpty(
   double blockMin, double blockMax, vtkPiecewiseFunction* opacityFunc)
 {
-  if (!opacityFunc || blockMin > blockMax)
+  if (blockMin > blockMax)
   {
     return true;
+  }
+  if (!opacityFunc)
+  {
+    return false;
   }
 
   double range = this->ScalarRange[1] - this->ScalarRange[0];
@@ -1689,9 +1781,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
     // Downsample factor: 4x in each dimension
     const int DS = 4;
     int mmDims[3] = {
-      std::max(1, dims[0] / DS),
-      std::max(1, dims[1] / DS),
-      std::max(1, dims[2] / DS)
+      std::max(1, (dims[0] + DS - 1) / DS),
+      std::max(1, (dims[1] + DS - 1) / DS),
+      std::max(1, (dims[2] + DS - 1) / DS)
     };
     this->MinMaxDims[0] = mmDims[0];
     this->MinMaxDims[1] = mmDims[1];
@@ -2319,22 +2411,26 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       double blockMax = -VTK_DOUBLE_MAX;
       if (!this->MacrocellScalarMin.empty() && !this->MacrocellScalarMax.empty())
       {
-        // Reduce over macrocells that overlap this block
+        // Reduce over macrocells that overlap this block using constant DS = 4
+        // and block extents relative to the full volume extent.
+        const int DS = 4;
         const int mcDims0 = this->MinMaxDims[0];
         const int mcDims1 = this->MinMaxDims[1];
-        const int dims0 = input->GetDimensions()[0];
-        const int dims1 = input->GetDimensions()[1];
-        const int dims2 = input->GetDimensions()[2];
-        const int DS0 = mcDims0 > 0 ? dims0 / mcDims0 : 4;
-        const int DS1 = mcDims1 > 0 ? dims1 / mcDims1 : 4;
-        const int DS2 = (this->MinMaxDims[2] > 0) ? dims2 / this->MinMaxDims[2] : 4;
+        const int mcDims2 = this->MinMaxDims[2];
 
-        const int mcX0 = block.Extents[0] / DS0;
-        const int mcX1 = std::min(block.Extents[1] / DS0, mcDims0 - 1);
-        const int mcY0 = block.Extents[2] / DS1;
-        const int mcY1 = std::min(block.Extents[3] / DS1, mcDims1 - 1);
-        const int mcZ0 = block.Extents[4] / DS2;
-        const int mcZ1 = std::min(block.Extents[5] / DS2, this->MinMaxDims[2] - 1);
+        int relX0 = block.Extents[0] - fullExt[0];
+        int relX1 = block.Extents[1] - fullExt[0];
+        int relY0 = block.Extents[2] - fullExt[2];
+        int relY1 = block.Extents[3] - fullExt[2];
+        int relZ0 = block.Extents[4] - fullExt[4];
+        int relZ1 = block.Extents[5] - fullExt[4];
+
+        int mcX0 = relX0 / DS;
+        int mcX1 = std::min(relX1 / DS, mcDims0 - 1);
+        int mcY0 = relY0 / DS;
+        int mcY1 = std::min(relY1 / DS, mcDims1 - 1);
+        int mcZ0 = relZ0 / DS;
+        int mcZ1 = std::min(relZ1 / DS, mcDims2 - 1);
 
         const float* mcMin = this->MacrocellScalarMin.data();
         const float* mcMax = this->MacrocellScalarMax.data();
@@ -2478,9 +2574,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       {
         const int DS = 4; // Downsample factor
         int mmDims[3] = {
-          std::max(1, bDims[0] / DS),
-          std::max(1, bDims[1] / DS),
-          std::max(1, bDims[2] / DS)
+          std::max(1, (bDims[0] + DS - 1) / DS),
+          std::max(1, (bDims[1] + DS - 1) / DS),
+          std::max(1, (bDims[2] + DS - 1) / DS)
         };
         block.MinMaxDims[0] = mmDims[0];
         block.MinMaxDims[1] = mmDims[1];
@@ -2801,10 +2897,11 @@ void vtkMetalGPUVolumeRayCastMapper::SetClippingPlaneUniforms(
     invModelMatrix->MultiplyPoint(normalLocal, normalLocal);
 
     // Scale normal by bounds to account for non-uniform scaling in [0,1] space
+    // In texture space q = (x_local - min) / size, so gradient scales multiplicatively
     double normalVol[3] = {
-      normalLocal[0] / boundsSize[0],
-      normalLocal[1] / boundsSize[1],
-      normalLocal[2] / boundsSize[2]
+      normalLocal[0] * boundsSize[0],
+      normalLocal[1] * boundsSize[1],
+      normalLocal[2] * boundsSize[2]
     };
 
     // Normalize
@@ -2858,20 +2955,26 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
       }
     }
 
-    // Use model-space bounds for vertex positions
+    // Use model-space bounds for vertex positions (using extent for correctness)
     if (input)
     {
-      int dims[3];
+      int ext[6];
       double origin[3], spacing[3];
-      input->GetDimensions(dims);
+      input->GetExtent(ext);
       input->GetOrigin(origin);
       input->GetSpacing(spacing);
-      this->ModelBounds[0] = origin[0];
-      this->ModelBounds[1] = origin[0] + spacing[0] * (dims[0] - 1);
-      this->ModelBounds[2] = origin[1];
-      this->ModelBounds[3] = origin[1] + spacing[1] * (dims[1] - 1);
-      this->ModelBounds[4] = origin[2];
-      this->ModelBounds[5] = origin[2] + spacing[2] * (dims[2] - 1);
+      double x0 = origin[0] + spacing[0] * ext[0];
+      double x1 = origin[0] + spacing[0] * ext[1];
+      double y0 = origin[1] + spacing[1] * ext[2];
+      double y1 = origin[1] + spacing[1] * ext[3];
+      double z0 = origin[2] + spacing[2] * ext[4];
+      double z1 = origin[2] + spacing[2] * ext[5];
+      this->ModelBounds[0] = std::min(x0, x1);
+      this->ModelBounds[1] = std::max(x0, x1);
+      this->ModelBounds[2] = std::min(y0, y1);
+      this->ModelBounds[3] = std::max(y0, y1);
+      this->ModelBounds[4] = std::min(z0, z1);
+      this->ModelBounds[5] = std::max(z0, z1);
     }
 
     // Check if camera is inside the volume
@@ -2882,6 +2985,16 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
     needsVertexRebuild |= (this->VolumeUploadTime.GetMTime() > this->VertexBufferUploadTime.GetMTime());
     needsVertexRebuild |= (this->GetMTime() > this->VertexBufferUploadTime.GetMTime());
     needsVertexRebuild |= (cameraInside != this->CameraWasInsideInLastUpdate);
+
+    if (cameraInside)
+    {
+      vtkCamera* cam = ren->GetActiveCamera();
+      if (cam)
+      {
+        needsVertexRebuild |= (cam->GetMTime() > this->VertexBufferUploadTime.GetMTime());
+      }
+      needsVertexRebuild |= (ren->GetMTime() > this->VertexBufferUploadTime.GetMTime());
+    }
 
     if (needsVertexRebuild)
     {
@@ -3084,7 +3197,18 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         vtkPoints* points = finalPolyData->GetPoints();
         vtkCellArray* polys = finalPolyData->GetPolys();
 
-        // Convert to float array for Metal buffer
+        // Normalize clipped points from model-space to [0,1] for the vertex shader
+        double bmin[3] = { this->ModelBounds[0], this->ModelBounds[2], this->ModelBounds[4] };
+        double bsize[3] = {
+          this->ModelBounds[1] - this->ModelBounds[0],
+          this->ModelBounds[3] - this->ModelBounds[2],
+          this->ModelBounds[5] - this->ModelBounds[4]
+        };
+        for (int k = 0; k < 3; ++k)
+        {
+          if (std::fabs(bsize[k]) < 1e-10) bsize[k] = 1.0;
+        }
+
         std::vector<float> vertices;
         vertices.reserve(points->GetNumberOfPoints() * 3);
 
@@ -3092,9 +3216,9 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         {
           double pt[3];
           points->GetPoint(i, pt);
-          vertices.push_back(static_cast<float>(pt[0]));
-          vertices.push_back(static_cast<float>(pt[1]));
-          vertices.push_back(static_cast<float>(pt[2]));
+          vertices.push_back(static_cast<float>((pt[0] - bmin[0]) / bsize[0]));
+          vertices.push_back(static_cast<float>((pt[1] - bmin[1]) / bsize[1]));
+          vertices.push_back(static_cast<float>((pt[2] - bmin[2]) / bsize[2]));
         }
 
         std::vector<unsigned int> indices;
@@ -3104,10 +3228,16 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         polys->InitTraversal();
         while (polys->GetNextCell(npts, pts))
         {
-          for (vtkIdType i = 0; i < npts; ++i)
-          {
-            indices.push_back(static_cast<unsigned int>(pts[i]));
-          }
+          if (npts != 3) continue;
+          indices.push_back(static_cast<unsigned int>(pts[0]));
+          indices.push_back(static_cast<unsigned int>(pts[1]));
+          indices.push_back(static_cast<unsigned int>(pts[2]));
+        }
+
+        if (indices.empty())
+        {
+          vtkErrorMacro("Camera-inside clipped proxy produced no triangles");
+          return false;
         }
 
         this->IndexCount = static_cast<int>(indices.size());
@@ -3225,6 +3355,29 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:samplerDesc];
       [samplerDesc release];
       this->VolumeSampler = (__bridge void*)sampler;
+    }
+
+    // Create dummy depth texture (1x1 R32Float with value 1.0) for when no real depth texture is bound
+    if (!this->DummyDepthTexture)
+    {
+      MTLTextureDescriptor* dummyDesc = [[MTLTextureDescriptor alloc] init];
+      dummyDesc.textureType = MTLTextureType2D;
+      dummyDesc.pixelFormat = MTLPixelFormatR32Float;
+      dummyDesc.width = 1;
+      dummyDesc.height = 1;
+      dummyDesc.mipmapLevelCount = 1;
+      dummyDesc.usage = MTLTextureUsageShaderRead;
+      dummyDesc.storageMode = MTLStorageModeShared;
+
+      id<MTLTexture> dummyTex = [device newTextureWithDescriptor:dummyDesc];
+      [dummyDesc release];
+      if (dummyTex)
+      {
+        float one = 1.0f;
+        MTLRegion region = MTLRegionMake2D(0, 0, 1, 1);
+        [dummyTex replaceRegion:region mipmapLevel:0 withBytes:&one bytesPerRow:sizeof(float)];
+        this->DummyDepthTexture = (__bridge void*)dummyTex;
+      }
     }
 
     // Nearest sampler for depth texture (depth buffer occlusion)
@@ -3500,26 +3653,23 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
   [encoder setVertexBuffer:uniformBuf offset:0 atIndex:1];
   [encoder setFragmentBuffer:uniformBuf offset:0 atIndex:1];
 
-  // Bind volume texture and sampler (fragment index 0)
   id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;
   id<MTLSamplerState> volSamp = (__bridge id<MTLSamplerState>)this->VolumeSampler;
-  [encoder setFragmentTexture:volTex atIndex:0];
-  [encoder setFragmentSamplerState:volSamp atIndex:0];
-
-  // Bind transfer function texture and sampler (fragment index 1)
   id<MTLTexture> tfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
   id<MTLSamplerState> tfSamp = (__bridge id<MTLSamplerState>)this->ColorOpacitySampler;
+  [encoder setFragmentTexture:volTex atIndex:0];
   [encoder setFragmentTexture:tfTex atIndex:1];
-  [encoder setFragmentSamplerState:tfSamp atIndex:1];
+  [encoder setFragmentSamplerState:tfSamp atIndex:0];
+  [encoder setFragmentSamplerState:volSamp atIndex:1];
 
-  // Bind scene depth texture for early ray termination (fragment index 2)
-  if (this->DepthTextureOcclusion)
-  {
-    id<MTLTexture> depthTex = (__bridge id<MTLTexture>)this->DepthTextureOcclusion;
-    id<MTLSamplerState> depthSamp = (__bridge id<MTLSamplerState>)this->DepthSampler;
-    [encoder setFragmentTexture:depthTex atIndex:2];
-    [encoder setFragmentSamplerState:depthSamp atIndex:2];
-  }
+  // Bind scene depth texture for early ray termination (fragment index 2).
+  // Use the dummy depth texture (value 1.0) when no real depth texture is available.
+  id<MTLTexture> depthTex = this->DepthTextureOcclusion
+    ? (__bridge id<MTLTexture>)this->DepthTextureOcclusion
+    : (__bridge id<MTLTexture>)this->DummyDepthTexture;
+  id<MTLSamplerState> depthSamp = (__bridge id<MTLSamplerState>)this->DepthSampler;
+  [encoder setFragmentTexture:depthTex atIndex:2];
+  [encoder setFragmentSamplerState:depthSamp atIndex:2];
 
   // Bind gradient opacity texture for gradient-based shading (fragment index 3).
   // Metal requires all declared fragment texture/sampler arguments to be bound,
@@ -3883,7 +4033,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   }
 
   // Update uniforms
-  VolumeMapperUniforms uniforms;
+  VolumeMapperUniforms uniforms = {};
 
   vtkNew<vtkMatrix4x4> modelMatrix;
   vol->GetModelToWorldMatrix(modelMatrix);
@@ -3973,7 +4123,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     if (scalarRange <= 0.0)
       scalarRange = 1.0;
     uniforms.GradientOpacityMin = 0.0f;
-    uniforms.GradientOpacityMax = static_cast<float>(scalarRange * 0.25);
+    uniforms.GradientOpacityMax = static_cast<float>(
+      (scalarRange * 0.25) / this->ScalarNormalizationFactor);
 
     // Material properties from volume property
     if (property)
@@ -3999,6 +4150,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     // Transform to volume-local [0,1] space using inverse model matrix
     double camDirLocal[4] = { camDirWorld[0], camDirWorld[1], camDirWorld[2], 0.0 };
     invModelMatrix->MultiplyPoint(camDirLocal, camDirLocal);
+    // Account for anisotropic bounds scaling in texture space:
+    // direction in [0,1] space must be divided by bounds size to preserve anisotropy
+    camDirLocal[0] /= boundsSize[0];
+    camDirLocal[1] /= boundsSize[1];
+    camDirLocal[2] /= boundsSize[2];
     // Normalize in volume [0,1] space
     double dirLen = sqrt(camDirLocal[0] * camDirLocal[0] + camDirLocal[1] * camDirLocal[1] +
       camDirLocal[2] * camDirLocal[2]);
@@ -4056,11 +4212,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     // Decode CroppingRegionFlags bitmask into 32-element array
     int cropFlags = this->GetCroppingRegionFlags();
     float flagsArray[32] = {};
-    flagsArray[0] = 0; // region 0 is always 0
-    for (int fi = 1; fi < 32; ++fi)
+    for (int fi = 0; fi < 32; ++fi)
     {
-      flagsArray[fi] = static_cast<float>(cropFlags & 1);
-      cropFlags >>= 1;
+      flagsArray[fi] = static_cast<float>((cropFlags >> fi) & 1);
     }
 
     // Pack into float4 rows
@@ -4081,6 +4235,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   // Mask / label map
   this->SetMaskUniforms(&uniforms, vol);
+
+  // Depth texture flag — set to 1 when we have a real scene depth texture
+  uniforms.UseDepthTexture = this->DepthTextureOcclusion ? 1.0f : 0.0f;
 
   // Min-max acceleration texture
   uniforms.UseMinMaxAccel = this->MinMaxTexture ? 1.0f : 0.0f;
@@ -4223,7 +4380,10 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   // Capture the scene depth texture for early ray termination.
   // The depth buffer is written by opaque geometry in the earlier render pass.
-  this->DepthTextureOcclusion = metalRenderWindow->GetDepthTexture();
+  // When MSAA is active, the depth texture is multisampled and cannot be sampled
+  // directly by a shader — disable depth occlusion in that case.
+  int sampleCount = metalRenderWindow ? metalRenderWindow->GetEffectiveSampleCount() : 1;
+  this->DepthTextureOcclusion = (sampleCount > 1) ? nullptr : metalRenderWindow->GetDepthTexture();
 
   // Wait for the uniform buffer slot for this frame to be free
   dispatch_semaphore_wait((dispatch_semaphore_t)this->FrameSemaphore, DISPATCH_TIME_FOREVER);
@@ -4486,8 +4646,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       //     with > MAX_LAYER_BRICKS bricks (the layer composite is capped at
       //     MAX_LAYER_BRICKS; see "Known limitations"). ---
       bool useAccumulation = !this->Blocks.empty(); // true only for the >8-brick case here
-      void* activePipeline = useAccumulation ? this->AccumulationPipelineState
-                                             : this->PipelineState;
+      void* activePipeline = useAccumulation
+        ? this->AccumulationPipelineState
+        : this->LayerPipelineState;
       this->BindEncoderResources(offscreenEncoder, uniformBuf, activePipeline);
 
       this->DrawBlocks(offscreenEncoder, uniformBuf, ren, vol, &uniforms, invModelMatrix);
