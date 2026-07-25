@@ -90,8 +90,6 @@ private:
   void* DepthStencilState = nullptr;     // id<MTLDepthStencilState>
   void* DepthTextureOcclusion = nullptr; // id<MTLTexture> — scene depth for early ray termination
   void* DummyDepthTexture = nullptr;     // id<MTLTexture> — 1x1 R32Float(1.0) fallback when no depth available
-  void* DummyVolumeTexture = nullptr;    // id<MTLTexture> — 1x1x1 R8Unorm fallback when no volume texture
-  void* DummyTransferFunctionTexture = nullptr; // id<MTLTexture> — 1x1 RGBA8Unorm fallback when no TF texture
   void* DepthSampler = nullptr;          // id<MTLSamplerState> — nearest sampler for depth texture
 
   // Mask / label map support
@@ -120,16 +118,6 @@ private:
   int VolumeNumComponents = 1;
   int CurrentSampleCount = 0;
 
-  // Feature-valid flags — set each frame to prevent shaders from sampling partially updated resources
-  bool GradientOpacityValid = false;
-  bool MaskValid = false;
-  bool LabelMapValid = false;
-  bool MinMaxValid = false;
-  bool BlocksValid = false;
-
-  // Cached Metal queue for use during destruction
-  void* CachedMetalQueue = nullptr;
-
   // Adaptive sample distance
   double ReductionFactor = 1.0;
   double LastTransferFunctionSampleDistance = -1.0;
@@ -156,9 +144,6 @@ private:
   vtkTimeStamp VertexBufferUploadTime;
 
   // Helper methods
-  bool EnsureDummyResources(void* mtlDevice);
-  void WaitForGPUIdle(void* queueVoid);
-
   bool UpdateVolumeTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
   bool UpdateTransferFunctionTexture(
     void* mtlDevice, void* mtlQueue, vtkVolume* vol, double actualSampleDistance);
