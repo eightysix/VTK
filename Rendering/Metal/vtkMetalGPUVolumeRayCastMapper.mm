@@ -1845,51 +1845,83 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMaskTexture(
       // Get the data pointer
       int numComponents = arr->GetNumberOfComponents();
 
-      // Convert mask data to float for the 3D texture (R32Float — component 0 only)
-      // Mask is typically unsigned char (0-255) for label maps
+      // Choose mask texture format based on data type to minimize memory
       vtkIdType numTuples = arr->GetNumberOfTuples();
-      std::vector<float> maskData(numTuples);
-
-      // Use direct pointer access for common types to avoid virtual dispatch overhead
       int dataType = arr->GetDataType();
+      MTLPixelFormat chosenFormat;
+      NSUInteger bytesPerPixel = 0;
+      const void* uploadSrc = nullptr;
+      std::vector<uint8_t> byteData;
+      std::vector<uint16_t> shortData;
+      std::vector<float> floatData;
+
       if (dataType == VTK_UNSIGNED_CHAR)
       {
+        chosenFormat = MTLPixelFormatR8Unorm;
+        bytesPerPixel = 1;
+        byteData.resize(numTuples);
         const unsigned char* src = static_cast<const unsigned char*>(arr->GetVoidPointer(0));
-        vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
-          for (vtkIdType i = begin; i < end; ++i)
-            maskData[i] = static_cast<float>(src[i * numComponents]);
-        });
-      }
-      else if (dataType == VTK_UNSIGNED_SHORT)
-      {
-        const unsigned short* src = static_cast<const unsigned short*>(arr->GetVoidPointer(0));
-        vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
-          for (vtkIdType i = begin; i < end; ++i)
-            maskData[i] = static_cast<float>(src[i * numComponents]);
-        });
-      }
-      else if (dataType == VTK_FLOAT)
-      {
-        const float* src = static_cast<const float*>(arr->GetVoidPointer(0));
         if (numComponents == 1)
         {
-          std::memcpy(maskData.data(), src, numTuples * sizeof(float));
+          std::memcpy(byteData.data(), src, numTuples);
         }
         else
         {
           vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
             for (vtkIdType i = begin; i < end; ++i)
-              maskData[i] = src[i * numComponents];
+              byteData[i] = src[i * numComponents];
           });
         }
+        uploadSrc = byteData.data();
+      }
+      else if (dataType == VTK_UNSIGNED_SHORT)
+      {
+        chosenFormat = MTLPixelFormatR16Unorm;
+        bytesPerPixel = 2;
+        shortData.resize(numTuples);
+        const unsigned short* src = static_cast<const unsigned short*>(arr->GetVoidPointer(0));
+        if (numComponents == 1)
+        {
+          std::memcpy(shortData.data(), src, numTuples * sizeof(uint16_t));
+        }
+        else
+        {
+          vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+            for (vtkIdType i = begin; i < end; ++i)
+              shortData[i] = src[i * numComponents];
+          });
+        }
+        uploadSrc = shortData.data();
       }
       else
       {
-        // Generic fallback using GetComponent
-        for (vtkIdType i = 0; i < numTuples; ++i)
+        chosenFormat = MTLPixelFormatR32Float;
+        bytesPerPixel = 4;
+        floatData.resize(numTuples);
+
+        if (dataType == VTK_FLOAT)
         {
-          maskData[i] = static_cast<float>(arr->GetComponent(i, 0));
+          const float* src = static_cast<const float*>(arr->GetVoidPointer(0));
+          if (numComponents == 1)
+          {
+            std::memcpy(floatData.data(), src, numTuples * sizeof(float));
+          }
+          else
+          {
+            vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+              for (vtkIdType i = begin; i < end; ++i)
+                floatData[i] = src[i * numComponents];
+            });
+          }
         }
+        else
+        {
+          for (vtkIdType i = 0; i < numTuples; ++i)
+          {
+            floatData[i] = static_cast<float>(arr->GetComponent(i, 0));
+          }
+        }
+        uploadSrc = floatData.data();
       }
 
       // Create or update the 3D mask texture
@@ -1900,7 +1932,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMaskTexture(
           oldTex.width == static_cast<NSUInteger>(dims[0]) &&
           oldTex.height == static_cast<NSUInteger>(dims[1]) &&
           oldTex.depth == static_cast<NSUInteger>(dims[2]) &&
-          oldTex.pixelFormat == MTLPixelFormatR32Float)
+          oldTex.pixelFormat == chosenFormat)
       {
         tex = oldTex;
       }
@@ -1910,7 +1942,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMaskTexture(
 
         MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
         desc.textureType = MTLTextureType3D;
-        desc.pixelFormat = MTLPixelFormatR32Float;
+        desc.pixelFormat = chosenFormat;
         desc.width = dims[0];
         desc.height = dims[1];
         desc.depth = dims[2];
@@ -1928,14 +1960,14 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMaskTexture(
         AssignMetalObject(this->MaskTexture, tex);
       }
 
-      // Upload mask data to texture (R32Float format uses 1 component)
+      // Upload mask data to texture
       MTLRegion region = MTLRegionMake3D(0, 0, 0, dims[0], dims[1], dims[2]);
-      NSUInteger maskBytesPerRow = static_cast<NSUInteger>(dims[0]) * sizeof(float);
+      NSUInteger maskBytesPerRow = static_cast<NSUInteger>(dims[0]) * bytesPerPixel;
       NSUInteger maskBytesPerImage = maskBytesPerRow * dims[1];
       [tex replaceRegion:region
             mipmapLevel:0
                   slice:0
-              withBytes:maskData.data()
+              withBytes:uploadSrc
             bytesPerRow:maskBytesPerRow
           bytesPerImage:maskBytesPerImage];
 
@@ -2010,16 +2042,16 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateLabelMapTransferTexture(
       // Get the scalar range from the volume texture
       double scalarRange[2] = { this->ScalarRange[0], this->ScalarRange[1] };
 
-      // Build the 2D transfer function texture data (RGBA float)
-      std::vector<float> tfData(tfWidth * tfHeight * 4);
+      // Build the 2D transfer function texture data (RGBA8Unorm)
+      std::vector<uint8_t> tfData(tfWidth * tfHeight * 4);
 
       // Row 0: label 0 (default) - zeros (will be filled by default TF)
-      std::fill(tfData.begin(), tfData.begin() + tfWidth * 4, 0.0f);
+      std::fill(tfData.begin(), tfData.begin() + tfWidth * 4, static_cast<uint8_t>(0));
 
       // Rows 1..maxLabel: per-label transfer functions
       for (int label = 1; label < numLabels; ++label)
       {
-        float* rowPtr = tfData.data() + label * tfWidth * 4;
+        uint8_t* rowPtr = tfData.data() + label * tfWidth * 4;
 
         // Get color transfer function for this label
         vtkColorTransferFunction* colorFunc = property->GetLabelColor(label);
@@ -2041,9 +2073,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateLabelMapTransferTexture(
           colorFunc->GetTable(scalarRange[0], scalarRange[1], tfWidth, colorTable.data());
           for (int i = 0; i < tfWidth; ++i)
           {
-            rowPtr[i * 4 + 0] = static_cast<float>(colorTable[i * 3 + 0]);
-            rowPtr[i * 4 + 1] = static_cast<float>(colorTable[i * 3 + 1]);
-            rowPtr[i * 4 + 2] = static_cast<float>(colorTable[i * 3 + 2]);
+            rowPtr[i * 4 + 0] = static_cast<uint8_t>(std::clamp(colorTable[i * 3 + 0], 0.0, 1.0) * 255.0);
+            rowPtr[i * 4 + 1] = static_cast<uint8_t>(std::clamp(colorTable[i * 3 + 1], 0.0, 1.0) * 255.0);
+            rowPtr[i * 4 + 2] = static_cast<uint8_t>(std::clamp(colorTable[i * 3 + 2], 0.0, 1.0) * 255.0);
           }
         }
 
@@ -2053,7 +2085,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateLabelMapTransferTexture(
           opacityFunc->GetTable(scalarRange[0], scalarRange[1], tfWidth, opacityTable.data());
           for (int i = 0; i < tfWidth; ++i)
           {
-            rowPtr[i * 4 + 3] = static_cast<float>(opacityTable[i]);
+            rowPtr[i * 4 + 3] = static_cast<uint8_t>(std::clamp(opacityTable[i], 0.0, 1.0) * 255.0);
           }
         }
       }
@@ -2064,7 +2096,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateLabelMapTransferTexture(
 
       // Check if existing texture has the right dimensions (numLabels may have changed)
       if (oldTex && static_cast<int>(oldTex.width) == tfWidth &&
-          static_cast<int>(oldTex.height) == tfHeight)
+          static_cast<int>(oldTex.height) == tfHeight &&
+          oldTex.pixelFormat == MTLPixelFormatRGBA8Unorm)
       {
         tex = oldTex;
       }
@@ -2077,7 +2110,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateLabelMapTransferTexture(
 
         MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
         desc.textureType = MTLTextureType2D;
-        desc.pixelFormat = MTLPixelFormatRGBA32Float;
+        desc.pixelFormat = MTLPixelFormatRGBA8Unorm;
         desc.width = tfWidth;
         desc.height = tfHeight;
         desc.mipmapLevelCount = 1;
@@ -2099,7 +2132,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateLabelMapTransferTexture(
       [tex replaceRegion:region
             mipmapLevel:0
               withBytes:tfData.data()
-            bytesPerRow:tfWidth * 4 * sizeof(float)];
+            bytesPerRow:tfWidth * 4];
 
       this->LastLabelMapScalarRange[0] = this->ScalarRange[0];
       this->LastLabelMapScalarRange[1] = this->ScalarRange[1];
@@ -2176,8 +2209,28 @@ void vtkMetalGPUVolumeRayCastMapper::SetMaskUniforms(void* uniforms, vtkVolume* 
     int maxLabel = labels.empty() ? 0 : *(labels.rbegin());
     int numLabels = labels.empty() ? 0 : maxLabel + 1;
     u->LabelMapNumLabels = static_cast<float>(numLabels);
-    // For label maps, use raw label indices not normalized values
-    u->MaskScale = 1.0f;
+    // Determine scale to convert sampled mask value back to label index.
+    // Unorm formats normalize to [0,1] at sample time, so we scale back.
+    id<MTLTexture> maskTex = (__bridge id<MTLTexture>)this->MaskTexture;
+    if (maskTex)
+    {
+      switch (maskTex.pixelFormat)
+      {
+        case MTLPixelFormatR8Unorm:
+          u->MaskScale = 255.0f;
+          break;
+        case MTLPixelFormatR16Unorm:
+          u->MaskScale = 65535.0f;
+          break;
+        default:
+          u->MaskScale = 1.0f;
+          break;
+      }
+    }
+    else
+    {
+      u->MaskScale = 1.0f;
+    }
     u->MaskBias = 0.0f;
   }
   else
