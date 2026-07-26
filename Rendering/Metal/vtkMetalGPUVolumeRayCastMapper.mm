@@ -6050,13 +6050,13 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     if (!this->Blocks.empty() && this->Blocks.size() <= MAX_LAYER_BRICKS &&
         this->LayerPipelineState && this->CompositePipelineState)
     {
+      this->SortBlocksBackToFront(ren, vol);
       int neededSlices = static_cast<int>(this->SortedBlockOrder.size());
       if (!this->EnsureLayerResources(mtlDevice, fboWidth, fboHeight, neededSlices))
       {
         dispatch_semaphore_signal((dispatch_semaphore_t)this->FrameSemaphore);
         return;
       }
-      this->SortBlocksBackToFront(ren, vol);
 
       id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;
 
