@@ -23,6 +23,10 @@ class vtkImageData;
 class vtkPiecewiseFunction;
 class vtkVolume;
 
+// Forward declarations for types defined in the .mm file.
+struct PerBlockData;
+struct VolumeMapperUniforms;
+
 // Pipeline cache types for Phase 1B
 enum class VolumePipelineType : uint32_t
 {
@@ -302,6 +306,14 @@ private:
   void SetClippingPlaneUniforms(void* uniforms, vtkRenderer* ren, vtkVolume* vol,
     vtkMatrix4x4* modelMatrix, vtkMatrix4x4* invModelMatrix);
 
+  // Bind all volume fragment textures at fixed indices for the fullscreen paths.
+  // volTex/minMaxTex/normalTex are per-block (or global for single-block).
+  // The PerBlockData is bound at index 2 (vertex + fragment).
+  // cullMode: MTL_CullModeBack or MTL_CullModeNone (layer composite uses none).
+  void BindFullscreenTextures(void* encoder, void* uniformBuf,
+    void* volTex, void* minMaxTex, void* normalTex,
+    bool useDepth, const void* pbd, uint32_t cullMode);
+
   // Wait for all in-flight GPU frames to complete (safe teardown)
   void WaitForInFlightFrames();
 
@@ -330,6 +342,13 @@ private:
     int Extents[6] = {};
     double Center[3] = {}; // world-space center for sorting
   };
+
+  // Build PerBlockData from a partitioned-volume block.
+  static void BuildPerBlockData(PerBlockData& pbd,
+    const VolumeBlock& block,
+    const int fullExt[6], const double origin[3], const double spacing[3]);
+  // Build PerBlockData from global uniforms for single-block volumes.
+  static void BuildPerBlockData(PerBlockData& pbd, const VolumeMapperUniforms* uniforms);
 
   unsigned short Partitions[3] = { 1, 1, 1 };
   std::vector<VolumeBlock> Blocks;

@@ -528,6 +528,7 @@ inline void AssignRetainedMetalObject(void*& slot, id obj)
   }
   slot = (__bridge void*)[obj retain];
 }
+
 }
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -5727,6 +5728,173 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
 }
 
 //------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::BindFullscreenTextures(
+  void* encoderVoid, void* uniformBufVoid,
+  void* volTexVoid, void* minMaxTexVoid, void* normalTexVoid,
+  bool useDepth, const void* pbd, uint32_t cullMode)
+{
+  id<MTLRenderCommandEncoder> encoder =
+    (__bridge id<MTLRenderCommandEncoder>)encoderVoid;
+  id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)uniformBufVoid;
+
+  [encoder setCullMode:(MTLCullMode)cullMode];
+  if (this->DepthStencilState && useDepth)
+  {
+    [encoder setDepthStencilState:(__bridge id<MTLDepthStencilState>)this->DepthStencilState];
+  }
+
+  [encoder setVertexBytes:pbd length:sizeof(PerBlockData) atIndex:2];
+  [encoder setFragmentBytes:pbd length:sizeof(PerBlockData) atIndex:2];
+  [encoder setFragmentBuffer:uniformBuf offset:0 atIndex:1];
+
+  id<MTLTexture> volTex = volTexVoid
+    ? (__bridge id<MTLTexture>)volTexVoid
+    : (__bridge id<MTLTexture>)this->DummyVolumeTexture;
+  id<MTLTexture> tfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
+  [encoder setFragmentTexture:volTex atIndex:0];
+  [encoder setFragmentTexture:tfTex atIndex:1];
+
+  id<MTLTexture> depthTex = this->DepthTextureOcclusion
+    ? (__bridge id<MTLTexture>)this->DepthTextureOcclusion
+    : (__bridge id<MTLTexture>)this->DummyDepthTexture;
+  [encoder setFragmentTexture:depthTex atIndex:2];
+
+  if (this->GradientOpacityTexture)
+  {
+    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->GradientOpacityTexture atIndex:3];
+  }
+  else
+  {
+    [encoder setFragmentTexture:tfTex atIndex:3];
+  }
+
+  if (this->MaskTexture)
+  {
+    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->MaskTexture atIndex:4];
+  }
+  else
+  {
+    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMaskTexture atIndex:4];
+  }
+
+  if (this->LabelMapTransferTexture)
+  {
+    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->LabelMapTransferTexture atIndex:5];
+  }
+  else
+  {
+    [encoder setFragmentTexture:tfTex atIndex:5];
+  }
+
+  if (minMaxTexVoid)
+  {
+    [encoder setFragmentTexture:(__bridge id<MTLTexture>)minMaxTexVoid atIndex:6];
+  }
+  else
+  {
+    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMinMaxTexture atIndex:6];
+  }
+
+  if (normalTexVoid)
+  {
+    [encoder setFragmentTexture:(__bridge id<MTLTexture>)normalTexVoid atIndex:7];
+  }
+  else
+  {
+    [encoder setFragmentTexture:volTex atIndex:7];
+  }
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::BuildPerBlockData(PerBlockData& pbd,
+  const VolumeBlock& block,
+  const int fullExt[6], const double origin[3], const double spacing[3])
+{
+  pbd.VolumeBoundsMin[0] = static_cast<float>(block.BoundsMin[0]);
+  pbd.VolumeBoundsMin[1] = static_cast<float>(block.BoundsMin[1]);
+  pbd.VolumeBoundsMin[2] = static_cast<float>(block.BoundsMin[2]);
+  pbd.VolumeBoundsMin[3] = 1.0f;
+
+  pbd.VolumeBoundsMax[0] = static_cast<float>(block.BoundsMax[0]);
+  pbd.VolumeBoundsMax[1] = static_cast<float>(block.BoundsMax[1]);
+  pbd.VolumeBoundsMax[2] = static_cast<float>(block.BoundsMax[2]);
+  pbd.VolumeBoundsMax[3] = 1.0f;
+
+  int texExt[6] = {
+    std::max(fullExt[0], static_cast<int>(block.Extents[0] - 1)),
+    std::min(fullExt[1], static_cast<int>(block.Extents[1] + 1)),
+    std::max(fullExt[2], static_cast<int>(block.Extents[2] - 1)),
+    std::min(fullExt[3], static_cast<int>(block.Extents[3] + 1)),
+    std::max(fullExt[4], static_cast<int>(block.Extents[4] - 1)),
+    std::min(fullExt[5], static_cast<int>(block.Extents[5] + 1))
+  };
+
+  pbd.TextureBoundsMin[0] = static_cast<float>(origin[0] + (texExt[0] - 0.5) * spacing[0]);
+  pbd.TextureBoundsMin[1] = static_cast<float>(origin[1] + (texExt[2] - 0.5) * spacing[1]);
+  pbd.TextureBoundsMin[2] = static_cast<float>(origin[2] + (texExt[4] - 0.5) * spacing[2]);
+  pbd.TextureBoundsMin[3] = 1.0f;
+
+  pbd.TextureBoundsMax[0] = static_cast<float>(origin[0] + (texExt[1] + 0.5) * spacing[0]);
+  pbd.TextureBoundsMax[1] = static_cast<float>(origin[1] + (texExt[3] + 0.5) * spacing[1]);
+  pbd.TextureBoundsMax[2] = static_cast<float>(origin[2] + (texExt[5] + 0.5) * spacing[2]);
+  pbd.TextureBoundsMax[3] = 1.0f;
+
+  for (int k = 0; k < 3; ++k)
+    pbd.GradientStep[k] = (block.Dims[k] > 0) ? 1.0f / block.Dims[k] : 1.0f;
+  pbd.GradientStep[3] = 0.0f;
+
+  if (block.MinMaxTexture)
+  {
+    pbd.MinMaxInfo[0] = 1.0f;
+    pbd.MinMaxInfo[1] = static_cast<float>(block.MinMaxDims[0]);
+    pbd.MinMaxInfo[2] = static_cast<float>(block.MinMaxDims[1]);
+    pbd.MinMaxInfo[3] = static_cast<float>(block.MinMaxDims[2]);
+  }
+  else
+  {
+    pbd.MinMaxInfo[0] = 0.0f;
+    pbd.MinMaxInfo[1] = 0.0f;
+    pbd.MinMaxInfo[2] = 0.0f;
+    pbd.MinMaxInfo[3] = 0.0f;
+  }
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::BuildPerBlockData(PerBlockData& pbd,
+  const VolumeMapperUniforms* uniforms)
+{
+  pbd.VolumeBoundsMin[0] = uniforms->VolumeBoundsMin[0];
+  pbd.VolumeBoundsMin[1] = uniforms->VolumeBoundsMin[1];
+  pbd.VolumeBoundsMin[2] = uniforms->VolumeBoundsMin[2];
+  pbd.VolumeBoundsMin[3] = 1.0f;
+
+  pbd.VolumeBoundsMax[0] = uniforms->VolumeBoundsMax[0];
+  pbd.VolumeBoundsMax[1] = uniforms->VolumeBoundsMax[1];
+  pbd.VolumeBoundsMax[2] = uniforms->VolumeBoundsMax[2];
+  pbd.VolumeBoundsMax[3] = 1.0f;
+
+  pbd.TextureBoundsMin[0] = uniforms->VolumeBoundsMin[0];
+  pbd.TextureBoundsMin[1] = uniforms->VolumeBoundsMin[1];
+  pbd.TextureBoundsMin[2] = uniforms->VolumeBoundsMin[2];
+  pbd.TextureBoundsMin[3] = 1.0f;
+
+  pbd.TextureBoundsMax[0] = uniforms->VolumeBoundsMax[0];
+  pbd.TextureBoundsMax[1] = uniforms->VolumeBoundsMax[1];
+  pbd.TextureBoundsMax[2] = uniforms->VolumeBoundsMax[2];
+  pbd.TextureBoundsMax[3] = 1.0f;
+
+  pbd.GradientStep[0] = uniforms->GradientStep[0];
+  pbd.GradientStep[1] = uniforms->GradientStep[1];
+  pbd.GradientStep[2] = uniforms->GradientStep[2];
+  pbd.GradientStep[3] = 0.0f;
+
+  pbd.MinMaxInfo[0] = uniforms->UseMinMaxAccel;
+  pbd.MinMaxInfo[1] = uniforms->MinMaxDimX;
+  pbd.MinMaxInfo[2] = uniforms->MinMaxDimY;
+  pbd.MinMaxInfo[3] = uniforms->MinMaxDimZ;
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
   void* encoderVoid, void* uniformBufVoid, vtkRenderer* ren, vtkVolume* vol,
   void* uniformsVoid, vtkMatrix4x4* invModelMatrix)
@@ -5763,74 +5931,22 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
       auto& block = this->Blocks[si];
 
       PerBlockData pbd;
-      pbd.VolumeBoundsMin[0] = static_cast<float>(block.BoundsMin[0]);
-      pbd.VolumeBoundsMin[1] = static_cast<float>(block.BoundsMin[1]);
-      pbd.VolumeBoundsMin[2] = static_cast<float>(block.BoundsMin[2]);
-      pbd.VolumeBoundsMin[3] = 1.0f;
+      BuildPerBlockData(pbd, block, fullExt, origin, spacing);
 
-      pbd.VolumeBoundsMax[0] = static_cast<float>(block.BoundsMax[0]);
-      pbd.VolumeBoundsMax[1] = static_cast<float>(block.BoundsMax[1]);
-      pbd.VolumeBoundsMax[2] = static_cast<float>(block.BoundsMax[2]);
-      pbd.VolumeBoundsMax[3] = 1.0f;
-
-      int texExt[6] = {
-        std::max(fullExt[0], block.Extents[0] - 1),
-        std::min(fullExt[1], block.Extents[1] + 1),
-        std::max(fullExt[2], block.Extents[2] - 1),
-        std::min(fullExt[3], block.Extents[3] + 1),
-        std::max(fullExt[4], block.Extents[4] - 1),
-        std::min(fullExt[5], block.Extents[5] + 1)
-      };
-
-      pbd.TextureBoundsMin[0] = static_cast<float>(origin[0] + (texExt[0] - 0.5) * spacing[0]);
-      pbd.TextureBoundsMin[1] = static_cast<float>(origin[1] + (texExt[2] - 0.5) * spacing[1]);
-      pbd.TextureBoundsMin[2] = static_cast<float>(origin[2] + (texExt[4] - 0.5) * spacing[2]);
-      pbd.TextureBoundsMin[3] = 1.0f;
-
-      pbd.TextureBoundsMax[0] = static_cast<float>(origin[0] + (texExt[1] + 0.5) * spacing[0]);
-      pbd.TextureBoundsMax[1] = static_cast<float>(origin[1] + (texExt[3] + 0.5) * spacing[1]);
-      pbd.TextureBoundsMax[2] = static_cast<float>(origin[2] + (texExt[5] + 0.5) * spacing[2]);
-      pbd.TextureBoundsMax[3] = 1.0f;
-
-      for (int k = 0; k < 3; ++k)
-      {
-        pbd.GradientStep[k] = (block.Dims[k] > 0) ? 1.0f / block.Dims[k] : 1.0f;
-      }
-      pbd.GradientStep[3] = 0.0f;
-
+      // Override per-block textures on top of the common textures set by BindEncoderResources
+      id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture;
+      [encoder setFragmentTexture:blockTex atIndex:0];
       if (block.MinMaxTexture)
-      {
-        pbd.MinMaxInfo[0] = 1.0f;
-        pbd.MinMaxInfo[1] = static_cast<float>(block.MinMaxDims[0]);
-        pbd.MinMaxInfo[2] = static_cast<float>(block.MinMaxDims[1]);
-        pbd.MinMaxInfo[3] = static_cast<float>(block.MinMaxDims[2]);
-
-        id<MTLTexture> blockMmTex = (__bridge id<MTLTexture>)block.MinMaxTexture;
-        [encoder setFragmentTexture:blockMmTex atIndex:6];
-      }
+        [encoder setFragmentTexture:(__bridge id<MTLTexture>)block.MinMaxTexture atIndex:6];
       else
-      {
-        pbd.MinMaxInfo[0] = 0.0f;
-        pbd.MinMaxInfo[1] = 0.0f;
-        pbd.MinMaxInfo[2] = 0.0f;
-        pbd.MinMaxInfo[3] = 0.0f;
-      }
+        [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMinMaxTexture atIndex:6];
+      if (block.NormalTexture)
+        [encoder setFragmentTexture:(__bridge id<MTLTexture>)block.NormalTexture atIndex:7];
+      else
+        [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyVolumeTexture atIndex:7];
 
       [encoder setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
       [encoder setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
-
-      // Bind this block's 3D texture (scalar data)
-      id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture;
-      [encoder setFragmentTexture:blockTex atIndex:0];
-      // Bind per-block normal texture at index 7 if available
-      if (block.NormalTexture)
-      {
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)block.NormalTexture atIndex:7];
-      }
-      else
-      {
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyVolumeTexture atIndex:7];
-      }
 
       // Draw
       [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
@@ -5842,37 +5958,8 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
   }
   else
   {
-    // Single-block path (no partitioning)
     PerBlockData pbd = {};
-    pbd.VolumeBoundsMin[0] = uniforms->VolumeBoundsMin[0];
-    pbd.VolumeBoundsMin[1] = uniforms->VolumeBoundsMin[1];
-    pbd.VolumeBoundsMin[2] = uniforms->VolumeBoundsMin[2];
-    pbd.VolumeBoundsMin[3] = 1.0f;
-
-    pbd.VolumeBoundsMax[0] = uniforms->VolumeBoundsMax[0];
-    pbd.VolumeBoundsMax[1] = uniforms->VolumeBoundsMax[1];
-    pbd.VolumeBoundsMax[2] = uniforms->VolumeBoundsMax[2];
-    pbd.VolumeBoundsMax[3] = 1.0f;
-
-    pbd.TextureBoundsMin[0] = uniforms->VolumeBoundsMin[0];
-    pbd.TextureBoundsMin[1] = uniforms->VolumeBoundsMin[1];
-    pbd.TextureBoundsMin[2] = uniforms->VolumeBoundsMin[2];
-    pbd.TextureBoundsMin[3] = 1.0f;
-
-    pbd.TextureBoundsMax[0] = uniforms->VolumeBoundsMax[0];
-    pbd.TextureBoundsMax[1] = uniforms->VolumeBoundsMax[1];
-    pbd.TextureBoundsMax[2] = uniforms->VolumeBoundsMax[2];
-    pbd.TextureBoundsMax[3] = 1.0f;
-
-    pbd.GradientStep[0] = uniforms->GradientStep[0];
-    pbd.GradientStep[1] = uniforms->GradientStep[1];
-    pbd.GradientStep[2] = uniforms->GradientStep[2];
-    pbd.GradientStep[3] = 0.0f;
-
-    pbd.MinMaxInfo[0] = uniforms->UseMinMaxAccel;
-    pbd.MinMaxInfo[1] = uniforms->MinMaxDimX;
-    pbd.MinMaxInfo[2] = uniforms->MinMaxDimY;
-    pbd.MinMaxInfo[3] = uniforms->MinMaxDimZ;
+    BuildPerBlockData(pbd, uniforms);
 
     [encoder setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
     [encoder setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
@@ -5949,162 +6036,31 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
       if (!pso) continue;
       [encoder setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)pso];
 
-      // Build PerBlockData for this brick.
       PerBlockData pbd;
-      pbd.VolumeBoundsMin[0] = static_cast<float>(block.BoundsMin[0]);
-      pbd.VolumeBoundsMin[1] = static_cast<float>(block.BoundsMin[1]);
-      pbd.VolumeBoundsMin[2] = static_cast<float>(block.BoundsMin[2]);
-      pbd.VolumeBoundsMin[3] = 1.0f;
-      pbd.VolumeBoundsMax[0] = static_cast<float>(block.BoundsMax[0]);
-      pbd.VolumeBoundsMax[1] = static_cast<float>(block.BoundsMax[1]);
-      pbd.VolumeBoundsMax[2] = static_cast<float>(block.BoundsMax[2]);
-      pbd.VolumeBoundsMax[3] = 1.0f;
+      BuildPerBlockData(pbd, block, fullExt, origin, spacing);
 
-      int texExt[6] = {
-        std::max(fullExt[0], block.Extents[0] - 1),
-        std::min(fullExt[1], block.Extents[1] + 1),
-        std::max(fullExt[2], block.Extents[2] - 1),
-        std::min(fullExt[3], block.Extents[3] + 1),
-        std::max(fullExt[4], block.Extents[4] - 1),
-        std::min(fullExt[5], block.Extents[5] + 1)
-      };
-      pbd.TextureBoundsMin[0] = static_cast<float>(origin[0] + (texExt[0] - 0.5) * spacing[0]);
-      pbd.TextureBoundsMin[1] = static_cast<float>(origin[1] + (texExt[2] - 0.5) * spacing[1]);
-      pbd.TextureBoundsMin[2] = static_cast<float>(origin[2] + (texExt[4] - 0.5) * spacing[2]);
-      pbd.TextureBoundsMin[3] = 1.0f;
-      pbd.TextureBoundsMax[0] = static_cast<float>(origin[0] + (texExt[1] + 0.5) * spacing[0]);
-      pbd.TextureBoundsMax[1] = static_cast<float>(origin[1] + (texExt[3] + 0.5) * spacing[1]);
-      pbd.TextureBoundsMax[2] = static_cast<float>(origin[2] + (texExt[5] + 0.5) * spacing[2]);
-      pbd.TextureBoundsMax[3] = 1.0f;
+      this->BindFullscreenTextures(encoder, uniformBuf,
+        block.Texture, block.MinMaxTexture, block.NormalTexture,
+        useDirectPipeline, &pbd, MTLCullModeBack);
 
-      for (int k = 0; k < 3; ++k)
-        pbd.GradientStep[k] = (block.Dims[k] > 0) ? 1.0f / block.Dims[k] : 1.0f;
-      pbd.GradientStep[3] = 0.0f;
-
-      if (block.MinMaxTexture)
-      {
-        pbd.MinMaxInfo[0] = 1.0f;
-        pbd.MinMaxInfo[1] = static_cast<float>(block.MinMaxDims[0]);
-        pbd.MinMaxInfo[2] = static_cast<float>(block.MinMaxDims[1]);
-        pbd.MinMaxInfo[3] = static_cast<float>(block.MinMaxDims[2]);
-      }
-      else
-      {
-        pbd.MinMaxInfo[0] = pbd.MinMaxInfo[1] = pbd.MinMaxInfo[2] = pbd.MinMaxInfo[3] = 0.0f;
-      }
-
-      // Bind resources manually (avoid BindEncoderResources which sets a potentially
-      // nil VertexBuffer — the fullscreen path skips vertex buffer creation).
-      [encoder setCullMode:MTLCullModeBack];
-      if (this->DepthStencilState && useDirectPipeline)
-      {
-        [encoder setDepthStencilState:(__bridge id<MTLDepthStencilState>)this->DepthStencilState];
-      }
-      [encoder setFragmentBuffer:uniformBuf offset:0 atIndex:1];
-      [encoder setFragmentTexture:(__bridge id<MTLTexture>)block.Texture atIndex:0];
-      [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->ColorOpacityTexture atIndex:1];
-      id<MTLTexture> depthTex = this->DepthTextureOcclusion
-        ? (__bridge id<MTLTexture>)this->DepthTextureOcclusion
-        : (__bridge id<MTLTexture>)this->DummyDepthTexture;
-      [encoder setFragmentTexture:depthTex atIndex:2];
-      if (this->GradientOpacityTexture)
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->GradientOpacityTexture atIndex:3];
-      else
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->ColorOpacityTexture atIndex:3];
-      if (this->MaskTexture)
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->MaskTexture atIndex:4];
-      else
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMaskTexture atIndex:4];
-      if (this->LabelMapTransferTexture)
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->LabelMapTransferTexture atIndex:5];
-      else
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->ColorOpacityTexture atIndex:5];
-      if (block.MinMaxTexture)
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)block.MinMaxTexture atIndex:6];
-      else
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMinMaxTexture atIndex:6];
-      if (block.NormalTexture)
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)block.NormalTexture atIndex:7];
-      else
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyVolumeTexture atIndex:7];
-
-      // Bind PerBlockData as bytes.
-      [encoder setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
-      [encoder setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
-
-      // Draw fullscreen triangle (no vertex/index buffers needed).
       [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     }
   }
   else
   {
-    // Single-block volume: render fullscreen with global volume bounds.
     void* pso = this->GetOrCreateVolumePipeline(
       (__bridge void*)device, pipelineType, colorFormat, depthFormat, sampleCount, featureMask);
     if (!pso) return;
     [encoder setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)pso];
 
     PerBlockData pbd = {};
-    pbd.VolumeBoundsMin[0] = uniforms->VolumeBoundsMin[0];
-    pbd.VolumeBoundsMin[1] = uniforms->VolumeBoundsMin[1];
-    pbd.VolumeBoundsMin[2] = uniforms->VolumeBoundsMin[2];
-    pbd.VolumeBoundsMin[3] = 1.0f;
-    pbd.VolumeBoundsMax[0] = uniforms->VolumeBoundsMax[0];
-    pbd.VolumeBoundsMax[1] = uniforms->VolumeBoundsMax[1];
-    pbd.VolumeBoundsMax[2] = uniforms->VolumeBoundsMax[2];
-    pbd.VolumeBoundsMax[3] = 1.0f;
-    pbd.TextureBoundsMin[0] = uniforms->VolumeBoundsMin[0];
-    pbd.TextureBoundsMin[1] = uniforms->VolumeBoundsMin[1];
-    pbd.TextureBoundsMin[2] = uniforms->VolumeBoundsMin[2];
-    pbd.TextureBoundsMin[3] = 1.0f;
-    pbd.TextureBoundsMax[0] = uniforms->VolumeBoundsMax[0];
-    pbd.TextureBoundsMax[1] = uniforms->VolumeBoundsMax[1];
-    pbd.TextureBoundsMax[2] = uniforms->VolumeBoundsMax[2];
-    pbd.TextureBoundsMax[3] = 1.0f;
-    pbd.GradientStep[0] = uniforms->GradientStep[0];
-    pbd.GradientStep[1] = uniforms->GradientStep[1];
-    pbd.GradientStep[2] = uniforms->GradientStep[2];
-    pbd.GradientStep[3] = 0.0f;
-    pbd.MinMaxInfo[0] = uniforms->UseMinMaxAccel;
-    pbd.MinMaxInfo[1] = uniforms->MinMaxDimX;
-    pbd.MinMaxInfo[2] = uniforms->MinMaxDimY;
-    pbd.MinMaxInfo[3] = uniforms->MinMaxDimZ;
+    BuildPerBlockData(pbd, uniforms);
 
-    // Bind resources manually (avoid BindEncoderResources which sets VertexBuffer).
-    [encoder setCullMode:MTLCullModeBack];
-    if (this->DepthStencilState && useDirectPipeline)
-    {
-      [encoder setDepthStencilState:(__bridge id<MTLDepthStencilState>)this->DepthStencilState];
-    }
-    [encoder setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
-    [encoder setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
-    [encoder setFragmentBuffer:uniformBuf offset:0 atIndex:1];
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->VolumeTexture atIndex:0];
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->ColorOpacityTexture atIndex:1];
-    id<MTLTexture> depthTex = this->DepthTextureOcclusion
-      ? (__bridge id<MTLTexture>)this->DepthTextureOcclusion
-      : (__bridge id<MTLTexture>)this->DummyDepthTexture;
-    [encoder setFragmentTexture:depthTex atIndex:2];
-    if (this->GradientOpacityTexture)
-      [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->GradientOpacityTexture atIndex:3];
-    else
-      [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->ColorOpacityTexture atIndex:3];
-    if (this->MaskTexture)
-      [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->MaskTexture atIndex:4];
-    else
-      [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMaskTexture atIndex:4];
-    if (this->LabelMapTransferTexture)
-      [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->LabelMapTransferTexture atIndex:5];
-    else
-      [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->ColorOpacityTexture atIndex:5];
-    if (this->MinMaxTexture)
-      [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->MinMaxTexture atIndex:6];
-    else
-      [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMinMaxTexture atIndex:6];
-    if (this->GradientNormalTexture)
-      [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->GradientNormalTexture atIndex:7];
-    else
-      [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyVolumeTexture atIndex:7];
+    this->BindFullscreenTextures(encoder, uniformBuf,
+      this->VolumeTexture,
+      this->MinMaxTexture,
+      this->GradientNormalTexture,
+      useDirectPipeline, &pbd, MTLCullModeBack);
 
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
   }
@@ -6770,90 +6726,18 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         MTLViewport vp = {0, 0, (double)fboWidth, (double)fboHeight, 0.0, 1.0};
         [layerEnc setViewport:vp];
 
-        PerBlockData pbd = {};
-        pbd.VolumeBoundsMin[0] = static_cast<float>(block.BoundsMin[0]);
-        pbd.VolumeBoundsMin[1] = static_cast<float>(block.BoundsMin[1]);
-        pbd.VolumeBoundsMin[2] = static_cast<float>(block.BoundsMin[2]);
-        pbd.VolumeBoundsMin[3] = 1.0f;
-        pbd.VolumeBoundsMax[0] = static_cast<float>(block.BoundsMax[0]);
-        pbd.VolumeBoundsMax[1] = static_cast<float>(block.BoundsMax[1]);
-        pbd.VolumeBoundsMax[2] = static_cast<float>(block.BoundsMax[2]);
-        pbd.VolumeBoundsMax[3] = 1.0f;
-
-        int texExt[6] = {
-          std::max(fullExt[0], block.Extents[0] - 1),
-          std::min(fullExt[1], block.Extents[1] + 1),
-          std::max(fullExt[2], block.Extents[2] - 1),
-          std::min(fullExt[3], block.Extents[3] + 1),
-          std::max(fullExt[4], block.Extents[4] - 1),
-          std::min(fullExt[5], block.Extents[5] + 1)
-        };
-        pbd.TextureBoundsMin[0] = static_cast<float>(origin[0] + (texExt[0] - 0.5) * spacing[0]);
-        pbd.TextureBoundsMin[1] = static_cast<float>(origin[1] + (texExt[2] - 0.5) * spacing[1]);
-        pbd.TextureBoundsMin[2] = static_cast<float>(origin[2] + (texExt[4] - 0.5) * spacing[2]);
-        pbd.TextureBoundsMin[3] = 1.0f;
-        pbd.TextureBoundsMax[0] = static_cast<float>(origin[0] + (texExt[1] + 0.5) * spacing[0]);
-        pbd.TextureBoundsMax[1] = static_cast<float>(origin[1] + (texExt[3] + 0.5) * spacing[1]);
-        pbd.TextureBoundsMax[2] = static_cast<float>(origin[2] + (texExt[5] + 0.5) * spacing[2]);
-        pbd.TextureBoundsMax[3] = 1.0f;
-
-        for (int k = 0; k < 3; ++k)
-          pbd.GradientStep[k] = (block.Dims[k] > 0) ? 1.0f / block.Dims[k] : 1.0f;
-        pbd.GradientStep[3] = 0.0f;
-
-        if (block.MinMaxTexture)
-        {
-          pbd.MinMaxInfo[0] = 1.0f;
-          pbd.MinMaxInfo[1] = static_cast<float>(block.MinMaxDims[0]);
-          pbd.MinMaxInfo[2] = static_cast<float>(block.MinMaxDims[1]);
-          pbd.MinMaxInfo[3] = static_cast<float>(block.MinMaxDims[2]);
-        }
-        else
-        {
-          pbd.MinMaxInfo[0] = pbd.MinMaxInfo[1] = pbd.MinMaxInfo[2] = pbd.MinMaxInfo[3] = 0.0f;
-        }
-
-        [layerEnc setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
-        [layerEnc setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
+        PerBlockData pbd;
+        BuildPerBlockData(pbd, block, fullExt, origin, spacing);
 
         if (cameraInside)
         {
-          // Fullscreen camera-inside path: use vertex_fullscreen_main +
-          // fragment_volume_fullscreen_main. No vertex/index buffers needed.
           void* fsLayerPso = this->GetOrCreateVolumePipeline(mtlDevice,
             static_cast<uint32_t>(VolumePipelineType::FullscreenOffscreen),
             MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, featureMask);
           [layerEnc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)fsLayerPso];
-          [layerEnc setCullMode:MTLCullModeNone];
-          // Bind uniform buffer and textures manually (avoid BindEncoderResources
-          // which sets VertexBuffer — null in fullscreen path).
-          [layerEnc setFragmentBuffer:uniformBuf offset:0 atIndex:1];
-          [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.Texture atIndex:0];
-          [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)this->ColorOpacityTexture atIndex:1];
-          id<MTLTexture> depthTex = this->DepthTextureOcclusion
-            ? (__bridge id<MTLTexture>)this->DepthTextureOcclusion
-            : (__bridge id<MTLTexture>)this->DummyDepthTexture;
-          [layerEnc setFragmentTexture:depthTex atIndex:2];
-          if (this->GradientOpacityTexture)
-            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)this->GradientOpacityTexture atIndex:3];
-          else
-            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)this->ColorOpacityTexture atIndex:3];
-          if (this->MaskTexture)
-            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)this->MaskTexture atIndex:4];
-          else
-            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMaskTexture atIndex:4];
-          if (this->LabelMapTransferTexture)
-            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)this->LabelMapTransferTexture atIndex:5];
-          else
-            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)this->ColorOpacityTexture atIndex:5];
-          if (block.MinMaxTexture)
-            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.MinMaxTexture atIndex:6];
-          else
-            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMinMaxTexture atIndex:6];
-          if (block.NormalTexture)
-            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.NormalTexture atIndex:7];
-          else
-            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)this->DummyVolumeTexture atIndex:7];
+          this->BindFullscreenTextures(layerEnc, uniformBuf,
+            block.Texture, block.MinMaxTexture, block.NormalTexture,
+            false, &pbd, MTLCullModeNone);
           [layerEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         }
         else
@@ -6874,6 +6758,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
           {
             [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.NormalTexture atIndex:7];
           }
+
+          [layerEnc setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
+          [layerEnc setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
 
           [layerEnc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                                indexCount:this->IndexCount
