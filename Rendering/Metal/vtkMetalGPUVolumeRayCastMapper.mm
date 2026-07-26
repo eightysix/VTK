@@ -6807,7 +6807,6 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
           pbd.MinMaxInfo[1] = static_cast<float>(block.MinMaxDims[0]);
           pbd.MinMaxInfo[2] = static_cast<float>(block.MinMaxDims[1]);
           pbd.MinMaxInfo[3] = static_cast<float>(block.MinMaxDims[2]);
-          [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.MinMaxTexture atIndex:6];
         }
         else
         {
@@ -6864,8 +6863,12 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
             static_cast<uint32_t>(VolumePipelineType::OffscreenLayer),
             MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, featureMask);
           this->BindEncoderResources(layerEnc, uniformBuf, layerPso, false);
-          // Override the nil global texture BindEncoderResources set at index 0
+          // Override the global textures BindEncoderResources set with per-block textures
           [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.Texture atIndex:0];
+          if (block.MinMaxTexture)
+            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.MinMaxTexture atIndex:6];
+          else
+            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMinMaxTexture atIndex:6];
           // Override index 7 with per-block normal texture if available
           if (block.NormalTexture)
           {
