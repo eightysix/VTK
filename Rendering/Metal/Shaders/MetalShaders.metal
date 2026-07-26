@@ -1465,7 +1465,7 @@ inline half4 marchVolume(
   const bool doCropping = volumeUniforms.useCropping > 0.5;
   const bool doMask = fc_mask && (volumeUniforms.useMask > 0.5);
 
-  half scalarScale = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
+  half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
   half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
 
   half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
@@ -1473,7 +1473,7 @@ inline half4 marchVolume(
   float3 texSizeGlobal = max(texMaxGlobal - texMinGlobal, 1e-6);
   float3 invTexSizeGlobal = 1.0 / texSizeGlobal;
   float3 rayDirTexLocal = rayDir * invTexSizeGlobal;
-  float3 dt = max(volumeUniforms.gradientStep, 1e-8);
+  float3 dt = max(b.gradientStep.xyz, 1e-8);
   half3 gradScale = half3(1.0 / (dt * texSizeGlobal));
 
   half3 viewDirHalf  = half3(normalize(entryPoint - cameraPos));
@@ -1631,6 +1631,7 @@ inline half4 marchVolume(
         float label = floor(maskVal + 0.5);
         if (label > 0.0) {
           label = clamp(label, 1.0, numLabels - 1.0);
+          maskLabel = half(label);
           float labelY = (label + 0.5) / numLabels;
           colorOpacity = half4(labelMapTransferTexture.sample(sNearest, float2(float(scalarNorm), labelY), level(0)));
         } else {
@@ -1775,7 +1776,11 @@ fragment VolumeFragmentOut fragment_volume_main(
       worldTermination.xyz /= worldTermination.w;
       float3 terminationLocal = (worldTermination.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
       tTerminateMax = dot(terminationLocal - entryPoint, rayDir);
-      if (tTerminateMax < 0.0) tTerminateMax = 1e30;
+      if (tTerminateMax <= 0.0)
+      {
+        output.color = float4(0.0);
+        return output;
+      }
     }
   }
 
@@ -1873,11 +1878,122 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
       worldTermination.xyz /= worldTermination.w;
       float3 terminationLocal = (worldTermination.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
       tTerminateMax = dot(terminationLocal - entryPoint, rayDir);
-      if (tTerminateMax < 0.0) tTerminateMax = 1e30;
+      if (tTerminateMax <= 0.0)
+      {
+        output.color = float4(0.0);
+        return output;
+      }
     }
   }
 
   half4 _marchResult = marchVolume(entryPoint, exitPoint, totalDist, tTerminateMax, rayDir, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos, stepSize, t.y - tStart, in.position.xy, half3(0.0), 0.0h, volumeUniforms, b, volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture, maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
+  output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
+  return output;
+}
+
+// Fullscreen accumulation shader: same as fragment_volume_fullscreen_main but
+// reads the previous pixel result via framebuffer fetch and accumulates blocks
+// front-to-back.  Required for camera-inside + multi-block rendering (when the
+// layer-composite path is unavailable, e.g. > MAX_LAYER_BRICKS).
+fragment VolumeFragmentOut fragment_volume_fullscreen_accum_main(
+    FullscreenVertexOut in [[stage_in]],
+    float4 prevAccum [[color(0)]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    texture2d<float> gradientOpacityTexture [[texture(3)]],
+    texture3d<float> maskTexture [[texture(4)]],
+    texture2d<float> labelMapTransferTexture [[texture(5)]],
+    texture3d<float> minMaxTexture [[texture(6)]],
+    texture3d<float> normalTexture [[texture(7)]]) {
+
+  VolumeFragmentOut output;
+
+  // Global ERT: skip if previous blocks already made this pixel opaque
+  if (prevAccum.a >= 0.99h) {
+    discard_fragment();
+  }
+
+  half3 accumulatedColor = half3(prevAccum.rgb);
+  half accumulatedOpacity = half(prevAccum.a);
+
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float2 uv  = in.position.xy / volumeUniforms.viewportSize;
+  float2 ndc = uv * 2.0 - 1.0;
+  float4 wn = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, 0.0, 1.0); wn.xyz /= wn.w;
+  float4 wf = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, 1.0, 1.0); wf.xyz /= wf.w;
+  float3 bszF = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 localN = ((volumeUniforms.worldToVolume * float4(wn.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bszF;
+  float3 localF = ((volumeUniforms.worldToVolume * float4(wf.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bszF;
+  float3 rayDir = normalize(localF - localN);
+
+  float3 blockMinGlobal = (b.volumeBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+
+  float3 texMinGlobal = (b.textureBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 texMaxGlobal = (b.textureBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+
+  float stepSize = volumeUniforms.sampleDistance;
+
+  float2 t = intersectBox(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal);
+  float tStart = max(t.x, 0.0);
+  if (tStart >= t.y) {
+    output.color = float4(0.0);
+    return output;
+  }
+
+  float3 entryPoint = cameraPos + rayDir * tStart;
+  float3 exitPoint = cameraPos + rayDir * t.y;
+  float totalDist = length(exitPoint - entryPoint);
+
+  if (volumeUniforms.useClipping > 0.5) {
+    int numClipPlanes = int(volumeUniforms.numClippingPlanes);
+    float4 planeOrigins[8] = { volumeUniforms.clippingPlane0Origin, volumeUniforms.clippingPlane1Origin, volumeUniforms.clippingPlane2Origin, volumeUniforms.clippingPlane3Origin, volumeUniforms.clippingPlane4Origin, volumeUniforms.clippingPlane5Origin, volumeUniforms.clippingPlane6Origin, volumeUniforms.clippingPlane7Origin };
+    float4 planeNormals[8] = { volumeUniforms.clippingPlane0Normal, volumeUniforms.clippingPlane1Normal, volumeUniforms.clippingPlane2Normal, volumeUniforms.clippingPlane3Normal, volumeUniforms.clippingPlane4Normal, volumeUniforms.clippingPlane5Normal, volumeUniforms.clippingPlane6Normal, volumeUniforms.clippingPlane7Normal };
+
+    #pragma unroll
+    for (int cp = 0; cp < numClipPlanes; cp++) {
+      float3 planeOrigin = planeOrigins[cp].xyz;
+      float3 planeNormal = normalize(planeNormals[cp].xyz);
+      float startDistance = dot(planeNormal, planeOrigin - entryPoint);
+      float stopDistance = dot(planeNormal, planeOrigin - exitPoint);
+
+      if (startDistance > 0.0 && stopDistance > 0.0) {
+        output.color = float4(0.0);
+        return output;
+      }
+      float rayDotNormal = dot(rayDir, planeNormal);
+
+      if (rayDotNormal > 0.0 && startDistance > 0.0) entryPoint += (startDistance / rayDotNormal) * rayDir;
+      if (rayDotNormal <= 0.0 && stopDistance > 0.0) exitPoint += (stopDistance / rayDotNormal) * rayDir;
+    }
+    totalDist = length(exitPoint - entryPoint);
+    if (totalDist < 1e-6) {
+      output.color = float4(0.0);
+      return output;
+    }
+  }
+
+  float tTerminateMax = 1e30;
+  if (volumeUniforms.useDepthTexture > 0.5) {
+    float depthSample = depthTexture.sample(sNearest, in.position.xy / volumeUniforms.viewportSize).r;
+    if (depthSample < 1.0) {
+      float2 ndcXY = (in.position.xy / volumeUniforms.viewportSize) * 2.0 - 1.0;
+      float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
+      worldTermination.xyz /= worldTermination.w;
+      float3 terminationLocal = (worldTermination.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+      tTerminateMax = dot(terminationLocal - entryPoint, rayDir);
+      if (tTerminateMax <= 0.0)
+      {
+        output.color = float4(0.0);
+        return output;
+      }
+    }
+  }
+
+  half4 _marchResult = marchVolume(entryPoint, exitPoint, totalDist, tTerminateMax, rayDir, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos, stepSize, t.y - tStart, in.position.xy, accumulatedColor, accumulatedOpacity, volumeUniforms, b, volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture, maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
@@ -1972,7 +2088,11 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
       worldTermination.xyz /= worldTermination.w;
       float3 terminationLocal = (worldTermination.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
       tTerminateMax = dot(terminationLocal - entryPoint, rayDir);
-      if (tTerminateMax < 0.0) tTerminateMax = 1e30;
+      if (tTerminateMax <= 0.0)
+      {
+        output.color = float4(0.0);
+        return output;
+      }
     }
   }
 
@@ -2027,10 +2147,10 @@ kernel void volume_compute_minmax(
 
   // Check emptiness via opacity prefix table
   if (cellMin <= cellMax) {
-    float tf = (cellMin - u.scalarMin) * u.scalarScale;
-    uint idxMin = clamp(uint(tf), 0u, 255u);
-    tf = (cellMax - u.scalarMin) * u.scalarScale;
-    uint idxMax = clamp(uint(tf), 0u, 255u);
+    int iMin = int(floor((cellMin - u.scalarMin) * u.scalarScale));
+    int iMax = int(floor((cellMax - u.scalarMin) * u.scalarScale));
+    uint idxMin = uint(clamp(iMin, 0, 255));
+    uint idxMax = uint(clamp(iMax, 0, 255));
     bool empty = (u.opacityPrefix[idxMax + 1] == u.opacityPrefix[idxMin]);
     occupancy.write(empty ? 1.0 : 0.0, gid);
   } else {

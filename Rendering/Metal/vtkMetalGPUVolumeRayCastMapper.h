@@ -32,7 +32,8 @@ enum class VolumePipelineType : uint32_t
   LayerComposite = 3,
   ImageSampleBlit = 4,
   FullscreenDirect = 5,      // Fullscreen ray-cast for camera-inside (BGRA8Unorm + depth)
-  FullscreenOffscreen = 6    // Fullscreen ray-cast for camera-inside (RGBA16Float, no depth)
+  FullscreenOffscreen = 6,   // Fullscreen ray-cast for camera-inside (RGBA16Float, no depth)
+  FullscreenAccumulation = 7 // Fullscreen ray-cast with framebuffer fetch for multi-block accumulation
 };
 
 struct VolumePipelineKey

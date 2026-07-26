@@ -270,17 +270,20 @@ void ConvertVolumeData(const void* src, int dataType, int numComponents,
 {
   if (useHalf)
   {
-    // Accelerate fast path for single-component float -> half
-    if (dataType == VTK_FLOAT && numComponents == 1)
-    {
-      std::memcpy(dst, src, static_cast<size_t>(numTuples) * sizeof(float));
-      vImage_Buffer vSrc = { dst, 1, static_cast<vImagePixelCount>(numTuples),
-        static_cast<vImagePixelCount>(numTuples * sizeof(float)) };
-      vImage_Buffer vDst = { dst, 1, static_cast<vImagePixelCount>(numTuples),
-        static_cast<vImagePixelCount>(numTuples * sizeof(uint16_t)) };
-      vImageConvert_PlanarFtoPlanar16F(&vSrc, &vDst, 0);
-      return;
-    }
+      // Accelerate fast path for single-component float -> half.
+      // Use the original src as the read-only source buffer to avoid
+      // overlapping source/destination in vImageConvert_PlanarFtoPlanar16F.
+      if (dataType == VTK_FLOAT && numComponents == 1)
+      {
+        vImage_Buffer vSrc = { const_cast<void*>(src), 1,
+          static_cast<vImagePixelCount>(numTuples),
+          static_cast<vImagePixelCount>(numTuples * sizeof(float)) };
+        vImage_Buffer vDst = { dst, 1,
+          static_cast<vImagePixelCount>(numTuples),
+          static_cast<vImagePixelCount>(numTuples * sizeof(uint16_t)) };
+        vImageConvert_PlanarFtoPlanar16F(&vSrc, &vDst, 0);
+        return;
+      }
     uint16_t* h = static_cast<uint16_t*>(dst);
     switch (dataType)
     {
@@ -449,6 +452,21 @@ inline void AssignMetalObject(void*& slot, id obj)
     [(__bridge id)slot release];
   }
   slot = (__bridge void*)obj;
+}
+
+// Retaining assignment: releases the previous occupant, then retains and
+// stores the new object. Used when the +1 is owned elsewhere (e.g. cache).
+inline void AssignRetainedMetalObject(void*& slot, id obj)
+{
+  if (slot == (__bridge void*)obj)
+  {
+    return;
+  }
+  if (slot)
+  {
+    [(__bridge id)slot release];
+  }
+  slot = (__bridge void*)[obj retain];
 }
 }
 
@@ -698,13 +716,14 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
       this->ReleaseImageSampleResources();
       return false;
     }
-    AssignMetalObject(this->ImageSamplePipeline, pso);
+    // The +1 from new() goes to the cache.  AssignRetainedMetalObject
+    // adds a separate +1 for the member slot.
     {
       VolumePipelineKey k = { static_cast<uint32_t>(VolumePipelineType::ImageSampleBlit),
         MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, 0 };
-      [(__bridge id)pso retain];
       this->PipelineCache[k] = (__bridge void*)pso;
     }
+    AssignRetainedMetalObject(this->ImageSamplePipeline, pso);
 
     [vertexFunc release];
     [fragmentFunc release];
@@ -1607,10 +1626,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
        destinationOrigin:MTLOriginMake(0, 0, 0)];
       [blit endEncoding];
       [uploadCmdBuf commit];
-      // No waitUntilCompleted — Metal retains the staging buffer for the
-      // lifetime of the committed command buffer. Command buffers on the same
-      // queue execute in order, so the render pass will not read the texture
-      // until after this blit completes.
+      // Release our reference to the staging buffer. Metal keeps the buffer
+      // alive internally until the command buffer completes.
+      [stagingBuf release];
 
       } // end if (!gpuConversionUsed)
 
@@ -1654,6 +1672,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       { static_cast<uint32_t>(VolumePipelineType::FullscreenDirect),
         MTLPixelFormatBGRA8Unorm, MTLPixelFormatDepth32Float, sc },
       { static_cast<uint32_t>(VolumePipelineType::FullscreenOffscreen),
+        MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1 },
+      { static_cast<uint32_t>(VolumePipelineType::FullscreenAccumulation),
         MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1 },
     };
 
@@ -2544,7 +2564,9 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     if (!rawOcc ||
         rawOcc.width != static_cast<NSUInteger>(mmDims[0]) ||
         rawOcc.height != static_cast<NSUInteger>(mmDims[1]) ||
-        rawOcc.depth != static_cast<NSUInteger>(mmDims[2]))
+        rawOcc.depth != static_cast<NSUInteger>(mmDims[2]) ||
+        rawOcc.storageMode != MTLStorageModePrivate ||
+        rawOcc.pixelFormat != MTLPixelFormatR8Unorm)
     {
       MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
       desc.textureType = MTLTextureType3D;
@@ -2630,7 +2652,9 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     if (!permTex ||
         permTex.width != static_cast<NSUInteger>(mmDims[0]) ||
         permTex.height != static_cast<NSUInteger>(mmDims[1]) ||
-        permTex.depth != static_cast<NSUInteger>(mmDims[2]))
+        permTex.depth != static_cast<NSUInteger>(mmDims[2]) ||
+        permTex.storageMode != MTLStorageModePrivate ||
+        permTex.pixelFormat != MTLPixelFormatR8Unorm)
     {
       MTLTextureDescriptor* permDesc = [[MTLTextureDescriptor alloc] init];
       permDesc.textureType = MTLTextureType3D;
@@ -2899,7 +2923,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
       if (oldTex &&
           oldTex.width == mmDims0 &&
           oldTex.height == mmDims1 &&
-          oldTex.depth == mmDims2)
+          oldTex.depth == mmDims2 &&
+          oldTex.storageMode == MTLStorageModeShared &&
+          oldTex.pixelFormat == MTLPixelFormatR8Unorm)
       {
         tex = oldTex;
       }
@@ -4690,6 +4716,8 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     // Base pipelines (featureMask=0) are created here for backward compat;
     // specialized pipelines with non-zero feature masks are created on demand
     // in GPURender() via GetOrCreateVolumePipeline.
+    // GetOrCreateVolumePipeline returns a non-owning pointer (cache owns +1);
+    // use AssignRetainedMetalObject to give each member its own +1.
     void* pso = this->GetOrCreateVolumePipeline(mtlDeviceVoid,
       static_cast<uint32_t>(VolumePipelineType::DirectScreen),
       MTLPixelFormatBGRA8Unorm, MTLPixelFormatDepth32Float,
@@ -4698,7 +4726,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     {
       return false;
     }
-    AssignMetalObject(this->PipelineState, (__bridge id)pso);
+    AssignRetainedMetalObject(this->PipelineState, (__bridge id)pso);
     this->CurrentSampleCount = sampleCount;
 
     void* accumPso = this->GetOrCreateVolumePipeline(mtlDeviceVoid,
@@ -4708,7 +4736,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     {
       return false;
     }
-    AssignMetalObject(this->AccumulationPipelineState, (__bridge id)accumPso);
+    AssignRetainedMetalObject(this->AccumulationPipelineState, (__bridge id)accumPso);
 
     void* layerPso = this->GetOrCreateVolumePipeline(mtlDeviceVoid,
       static_cast<uint32_t>(VolumePipelineType::OffscreenLayer),
@@ -4717,7 +4745,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     {
       return false;
     }
-    AssignMetalObject(this->LayerPipelineState, (__bridge id)layerPso);
+    AssignRetainedMetalObject(this->LayerPipelineState, (__bridge id)layerPso);
 
     // Pre-create fullscreen camera-inside pipelines (cached in PipelineCache).
     // FullscreenDirect: BGRA + depth + blending, matching DirectScreen.
@@ -4762,13 +4790,14 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
         vtkErrorMacro(<< "Composite pipeline: " << [[compError localizedDescription] UTF8String]);
         return false;
       }
-      AssignMetalObject(this->CompositePipelineState, p);
+      // The +1 from new() goes to the cache.  AssignRetainedMetalObject
+      // adds a separate +1 for the member slot.
       {
         VolumePipelineKey k = { static_cast<uint32_t>(VolumePipelineType::LayerComposite),
           MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, 0 };
-        [(__bridge id)p retain];
         this->PipelineCache[k] = (__bridge void*)p;
       }
+      AssignRetainedMetalObject(this->CompositePipelineState, p);
     }
   }
 
@@ -4817,6 +4846,10 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
       fragName = @"fragment_volume_fullscreen_main";
       useVolumeVertex = false;
       break;
+    case VolumePipelineType::FullscreenAccumulation:
+      fragName = @"fragment_volume_fullscreen_accum_main";
+      useVolumeVertex = false;
+      break;
     case VolumePipelineType::LayerComposite:
       fragName = @"fragment_layer_composite_main";
       useVolumeVertex = false;
@@ -4836,7 +4869,8 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     pt == VolumePipelineType::OffscreenLayer ||
     pt == VolumePipelineType::OffscreenAccumulation ||
     pt == VolumePipelineType::FullscreenDirect ||
-    pt == VolumePipelineType::FullscreenOffscreen);
+    pt == VolumePipelineType::FullscreenOffscreen ||
+    pt == VolumePipelineType::FullscreenAccumulation);
 
   if (hasFeatureConstants)
   {
@@ -4944,7 +4978,10 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     return nullptr;
   }
 
-  // Cache and return
+  // Cache and return.
+  // The +1 from new() is owned by the cache.
+  // The caller receives a non-owning handle; use AssignRetainedMetalObject
+  // when storing into a member slot.
   this->PipelineCache[key] = (__bridge void*)pso;
   return (__bridge void*)pso;
 }
@@ -5273,7 +5310,7 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
       auto& block = this->Blocks[si];
 
       VolumePipelineType pt = useDirectPipeline ? VolumePipelineType::FullscreenDirect
-                                                : VolumePipelineType::FullscreenOffscreen;
+                                                : VolumePipelineType::FullscreenAccumulation;
       uint32_t fsType = static_cast<uint32_t>(pt);
 
       void* pso = this->GetOrCreateVolumePipeline(
