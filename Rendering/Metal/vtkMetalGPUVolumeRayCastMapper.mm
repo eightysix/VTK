@@ -6026,6 +6026,15 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // Wait for the uniform buffer slot for this frame to be free
   dispatch_semaphore_wait((dispatch_semaphore_t)this->FrameSemaphore, DISPATCH_TIME_FOREVER);
 
+  // RAII guard: signals the semaphore on scope exit (early return, exception, etc.).
+  // Dismiss after the completion handler is installed below.
+  struct SemaphoreSignalGuard {
+    dispatch_semaphore_t sem;
+    bool active = true;
+    ~SemaphoreSignalGuard() { if (active && sem) dispatch_semaphore_signal(sem); }
+    void dismiss() { active = false; }
+  } semGuard{ (__bridge dispatch_semaphore_t)this->FrameSemaphore };
+
   int bufIdx = this->UniformFrameIndex % 3;
   this->UniformFrameIndex++;
 
@@ -6046,7 +6055,6 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
     if (!this->EnsureImageSampleResources(mtlDevice, fboWidth, fboHeight))
     {
-      dispatch_semaphore_signal((dispatch_semaphore_t)this->FrameSemaphore);
       return;
     }
 
@@ -6107,7 +6115,6 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       int neededSlices = static_cast<int>(this->SortedBlockOrder.size());
       if (!this->EnsureLayerResources(mtlDevice, fboWidth, fboHeight, neededSlices))
       {
-        dispatch_semaphore_signal((dispatch_semaphore_t)this->FrameSemaphore);
         return;
       }
 
@@ -6365,7 +6372,6 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
     if (!encoder)
     {
-      dispatch_semaphore_signal((dispatch_semaphore_t)this->FrameSemaphore);
       return;
     }
 
@@ -6402,6 +6408,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     dispatch_release(sem);
 #endif
   }];
+
+  // Completion handler is installed — the guard is no longer needed.
+  semGuard.dismiss();
 
   } // @autoreleasepool
 }
