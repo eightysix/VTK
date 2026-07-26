@@ -859,6 +859,51 @@ kernel void polygonEdgesToLines(
 }
 
 // ---------------------------------------------------------------------------
+// Volume gradient/normal precomputation kernel (Phase 4)
+// ---------------------------------------------------------------------------
+struct NormalComputeUniforms {
+    uint dimX, dimY, dimZ;
+    float gsX, gsY, gsZ;
+    float scalarScale;
+    float scalarBias;
+    float gradNormFactor;
+};
+
+// Each thread computes one voxel's gradient from 6 neighbors in the volume
+// texture (linear clamp, safe at borders) and stores encoded normal + magnitude.
+// Output format: RGBA8Unorm. RGB = normal * 0.5 + 0.5, A = normalized gradMag.
+kernel void volume_compute_normals(
+    texture3d<float, access::sample> volume [[texture(0)]],
+    texture3d<float, access::write> normalTex [[texture(1)]],
+    constant NormalComputeUniforms& u [[buffer(0)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint3 dims = uint3(u.dimX, u.dimY, u.dimZ);
+    if (any(gid >= dims)) return;
+
+    float3 pos = (float3(gid) + 0.5) / float3(dims);
+    float3 gs = float3(u.gsX, u.gsY, u.gsZ);
+
+    // Central differences (6 texel fetches — same as computeGradientFast)
+    float sPX = volume.sample(sVolume, pos + float3(gs.x, 0, 0), level(0)).r;
+    float sNX = volume.sample(sVolume, pos - float3(gs.x, 0, 0), level(0)).r;
+    float sPY = volume.sample(sVolume, pos + float3(0, gs.y, 0), level(0)).r;
+    float sNY = volume.sample(sVolume, pos - float3(0, gs.y, 0), level(0)).r;
+    float sPZ = volume.sample(sVolume, pos + float3(0, 0, gs.z), level(0)).r;
+    float sNZ = volume.sample(sVolume, pos - float3(0, 0, gs.z), level(0)).r;
+
+    float3 rawGrad = float3(sPX - sNX, sPY - sNY, sPZ - sNZ);
+    float rawMag = length(rawGrad);
+
+    // Normalize and encode to [0, 1]
+    float3 normal = rawMag > 1e-6 ? rawGrad / rawMag : float3(0.0, 0.0, 1.0);
+    float3 encoded = normal * 0.5 + 0.5;
+    float gradMagNorm = saturate(rawMag / max(u.gradNormFactor, 1e-6));
+
+    normalTex.write(float4(encoded, gradMagNorm), gid);
+}
+
+// ---------------------------------------------------------------------------
 // 2D Mapper shaders
 // ---------------------------------------------------------------------------
 struct Mapper2DState { float4x4 wcvcMatrix; float4 color; float pointSize; float lineWidth; uint flags; };
@@ -1226,6 +1271,7 @@ constant bool fc_shading [[function_constant(0)]];
 constant bool fc_gradientOpacity [[function_constant(1)]];
 constant bool fc_mask [[function_constant(2)]];
 constant bool fc_minmax [[function_constant(3)]];
+constant bool fc_normalTexture [[function_constant(4)]];
 
 // ============================================================================
 // Volume Ray Casting Mapper
@@ -1290,7 +1336,8 @@ struct VolumeMapperUniforms {
   float maskBias;
   float labelMapNumLabels;
   float useDepthTexture;
-  float _padMask[2];
+  float useNormalTexture;
+  float _padMask;
   // Min-max acceleration texture
   float useMinMaxAccel;
   float minMaxDimX;
@@ -1401,7 +1448,8 @@ fragment VolumeFragmentOut fragment_volume_main(
     texture2d<float> gradientOpacityTexture [[texture(3)]],
     texture3d<float> maskTexture [[texture(4)]],
     texture2d<float> labelMapTransferTexture [[texture(5)]],
-    texture3d<float> minMaxTexture [[texture(6)]]) {
+    texture3d<float> minMaxTexture [[texture(6)]],
+    texture3d<float> normalTexture [[texture(7)]]) {
 
   if (!isFrontFace) discard_fragment();
 
@@ -1651,11 +1699,23 @@ fragment VolumeFragmentOut fragment_volume_main(
       // it is invisible on an 8-bit monitor. Do not waste memory bandwidth shading it.
       if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
 
-        half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
-        sampleColor = computePhongLightingVolumeFast(sampleColor, grad.xyz, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
+        half3 normal;
+        half gradMag;
+
+        if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
+          half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
+          normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
+          gradMag = nrmSample.w;
+        } else {
+          half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
+          normal = grad.xyz;
+          gradMag = grad.w;
+        }
+
+        sampleColor = computePhongLightingVolumeFast(sampleColor, normal, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
 
         if (doGradOp) {
-          sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(grad.w), 0.5), level(0)).r);
+          sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(gradMag), 0.5), level(0)).r);
         }
       } else if (doShading) {
         // Fallback for "invisible" fuzz/noise to maintain baseline brightness
@@ -1697,7 +1757,8 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     texture2d<float> gradientOpacityTexture [[texture(3)]],
     texture3d<float> maskTexture [[texture(4)]],
     texture2d<float> labelMapTransferTexture [[texture(5)]],
-    texture3d<float> minMaxTexture [[texture(6)]]) {
+    texture3d<float> minMaxTexture [[texture(6)]],
+    texture3d<float> normalTexture [[texture(7)]]) {
 
   if (!isFrontFace) discard_fragment();
 
@@ -1950,11 +2011,23 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
       // Visual Significance Threshold
       if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
 
-        half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScaleFrag2, gradNormFactor);
-        sampleColor = computePhongLightingVolumeFast(sampleColor, grad.xyz, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
+        half3 normal;
+        half gradMag;
+
+        if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
+          half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
+          normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
+          gradMag = nrmSample.w;
+        } else {
+          half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScaleFrag2, gradNormFactor);
+          normal = grad.xyz;
+          gradMag = grad.w;
+        }
+
+        sampleColor = computePhongLightingVolumeFast(sampleColor, normal, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
 
         if (doGradOp) {
-          sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(grad.w), 0.5), level(0)).r);
+          sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(gradMag), 0.5), level(0)).r);
         }
       } else if (doShading) {
         // Fallback for "invisible" fuzz/noise to maintain baseline brightness

@@ -119,7 +119,8 @@ struct VolumeMapperUniforms
   float MaskBias;                 // 940
   float LabelMapNumLabels;        // 944
   float UseDepthTexture;          // 948
-  float _padMask[2];              // 952..959 (pad to 16-byte alignment)
+  float UseNormalTexture;         // 952
+  float _padMask;                 // 956
   // Min-max acceleration texture
   float UseMinMaxAccel;           // 960
   float MinMaxDimX;               // 964
@@ -136,6 +137,7 @@ static_assert(offsetof(VolumeMapperUniforms, NumClippingPlanes) == 648, "");
 static_assert(offsetof(VolumeMapperUniforms, ClippingPlane0Origin) == 672, "");
 static_assert(offsetof(VolumeMapperUniforms, UseMask) == 928, "");
 static_assert(offsetof(VolumeMapperUniforms, UseDepthTexture) == 948, "");
+static_assert(offsetof(VolumeMapperUniforms, UseNormalTexture) == 952, "");
 static_assert(offsetof(VolumeMapperUniforms, UseMinMaxAccel) == 960, "");
 
 // Per-block data for volume rendering — must match Metal PerBlockData struct
@@ -515,6 +517,153 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseImageSampleResources()
 }
 
 //------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::ReleaseGradientNormalTexture()
+{
+  ReleaseMetalObject(this->GradientNormalTexture);
+  ReleaseMetalObject(this->NormalComputePipeline);
+  this->NormalTextureDims[0] = 0;
+  this->NormalTextureDims[1] = 0;
+  this->NormalTextureDims[2] = 0;
+}
+
+//------------------------------------------------------------------------------
+bool vtkMetalGPUVolumeRayCastMapper::EnsureGradientNormalTexture(
+  void* mtlDeviceVoid, void* mtlQueueVoid, vtkVolume* vol)
+{
+  if (!this->VolumeTexture)
+  {
+    return false;
+  }
+
+  if (!this->UsePrecomputedNormals)
+  {
+    this->ReleaseGradientNormalTexture();
+    return false;
+  }
+
+  id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
+  id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)mtlQueueVoid;
+
+  id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;
+  int dims[3] = { static_cast<int>(volTex.width), static_cast<int>(volTex.height), static_cast<int>(volTex.depth) };
+
+  // Reuse if dimensions match
+  id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->GradientNormalTexture;
+  if (oldTex &&
+      static_cast<int>(oldTex.width) == dims[0] &&
+      static_cast<int>(oldTex.height) == dims[1] &&
+      static_cast<int>(oldTex.depth) == dims[2])
+  {
+    return true;
+  }
+
+  this->ReleaseGradientNormalTexture();
+
+  if (!this->EnsureShaderLibrary(mtlDeviceVoid))
+  {
+    return false;
+  }
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
+
+  @autoreleasepool
+  {
+    // Create 3D normal texture (RGBA8Unorm: normal.xyz*0.5+0.5 in RGB, gradMag in A)
+    MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
+    desc.textureType = MTLTextureType3D;
+    desc.pixelFormat = MTLPixelFormatRGBA8Unorm;
+    desc.width = dims[0];
+    desc.height = dims[1];
+    desc.depth = dims[2];
+    desc.mipmapLevelCount = 1;
+    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    desc.storageMode = MTLStorageModePrivate;
+
+    id<MTLTexture> normalTex = [device newTextureWithDescriptor:desc];
+    [desc release];
+    if (!normalTex)
+    {
+      vtkErrorMacro("Failed to create gradient normal texture");
+      return false;
+    }
+    AssignMetalObject(this->GradientNormalTexture, normalTex);
+    this->NormalTextureDims[0] = dims[0];
+    this->NormalTextureDims[1] = dims[1];
+    this->NormalTextureDims[2] = dims[2];
+
+    // Create compute pipeline state (cache it)
+    if (!this->NormalComputePipeline)
+    {
+      id<MTLFunction> kernelFunc = [library newFunctionWithName:@"volume_compute_normals"];
+      if (!kernelFunc)
+      {
+        vtkErrorMacro("Failed to find volume_compute_normals kernel");
+        this->ReleaseGradientNormalTexture();
+        return false;
+      }
+
+      NSError* error = nil;
+      id<MTLComputePipelineState> cps =
+        [device newComputePipelineStateWithFunction:kernelFunc error:&error];
+      [kernelFunc release];
+      if (!cps)
+      {
+        vtkErrorMacro(<< "Failed to create normal compute pipeline: "
+                      << [[error localizedDescription] UTF8String]);
+        this->ReleaseGradientNormalTexture();
+        return false;
+      }
+      AssignMetalObject(this->NormalComputePipeline, cps);
+    }
+
+    // Build NormalComputeUniforms
+    double scalarRange = this->ScalarRange[1] - this->ScalarRange[0];
+    if (scalarRange <= 0.0) scalarRange = 1.0;
+
+    struct NormalComputeUniforms {
+      uint32_t dimX, dimY, dimZ;
+      float gsX, gsY, gsZ;
+      float scalarScale;
+      float scalarBias;
+      float gradNormFactor;
+    };
+
+    NormalComputeUniforms u;
+    u.dimX = static_cast<uint32_t>(dims[0]);
+    u.dimY = static_cast<uint32_t>(dims[1]);
+    u.dimZ = static_cast<uint32_t>(dims[2]);
+    u.gsX = 1.0f / std::max(dims[0], 1);
+    u.gsY = 1.0f / std::max(dims[1], 1);
+    u.gsZ = 1.0f / std::max(dims[2], 1);
+    float normFactor = this->ScalarNormalizationFactor;
+    u.scalarScale = 1.0f / std::max(static_cast<float>((this->ScalarRange[1] - this->ScalarRange[0]) / normFactor), 1e-6f);
+    u.scalarBias = -(static_cast<float>(this->ScalarRange[0] / normFactor)) * u.scalarScale;
+    u.gradNormFactor = static_cast<float>(scalarRange * 0.25 / normFactor);
+
+    // Dispatch compute
+    id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+    cmdBuf.label = @"VTK Volume Normal Compute";
+
+    id<MTLComputeCommandEncoder> compEnc = [cmdBuf computeCommandEncoder];
+    [compEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->NormalComputePipeline];
+    [compEnc setTexture:volTex atIndex:0];
+    [compEnc setTexture:normalTex atIndex:1];
+    [compEnc setBytes:&u length:sizeof(u) atIndex:0];
+
+    MTLSize gridSize = MTLSizeMake(dims[0], dims[1], dims[2]);
+    NSUInteger tgw_max = 16;
+    NSUInteger tgw_x = std::min(tgw_max, static_cast<NSUInteger>(dims[0]));
+    NSUInteger tgw_y = std::min(tgw_max, static_cast<NSUInteger>(dims[1]));
+    NSUInteger tgw_z = std::min(static_cast<NSUInteger>(1024) / (tgw_x * tgw_y), static_cast<NSUInteger>(dims[2]));
+    MTLSize threadGroupSize = MTLSizeMake(tgw_x, tgw_y, tgw_z);
+    [compEnc dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
+    [compEnc endEncoding];
+    [cmdBuf commit];
+  }
+
+  return this->GradientNormalTexture != nullptr;
+}
+
+//------------------------------------------------------------------------------
 bool vtkMetalGPUVolumeRayCastMapper::EnsureLayerResources(void* deviceVoid, int w, int h, int neededSlices)
 {
   int capacity = std::max(neededSlices, 1);
@@ -566,6 +715,7 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   ReleaseMetalObject(this->ColorOpacityTexture);
   ReleaseMetalObject(this->GradientOpacityTexture);
   ReleaseMetalObject(this->MinMaxTexture);
+  this->ReleaseGradientNormalTexture();
 
   this->ReleaseMaskResources();
   ReleaseMetalObject(this->DummyDepthTexture);
@@ -1825,6 +1975,7 @@ void vtkMetalGPUVolumeRayCastMapper::ClearBlocks()
   {
     ReleaseMetalObject(block.Texture);
     ReleaseMetalObject(block.MinMaxTexture);
+    ReleaseMetalObject(block.NormalTexture);
   }
   this->Blocks.clear();
   this->BlockScalarRanges.clear();
@@ -2983,6 +3134,104 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
     }
 
     [blit endEncoding];
+
+    // Phase 4: Precompute per-block gradient/normal textures for partitioned volumes.
+    if (this->UsePrecomputedNormals && !this->Blocks.empty())
+    {
+      if (!this->EnsureShaderLibrary(mtlDeviceVoid))
+      {
+        return false;
+      }
+      id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
+
+      if (!this->NormalComputePipeline)
+      {
+        id<MTLFunction> kernelFunc = [library newFunctionWithName:@"volume_compute_normals"];
+        if (kernelFunc)
+        {
+          NSError* err = nil;
+          id<MTLComputePipelineState> cps =
+            [device newComputePipelineStateWithFunction:kernelFunc error:&err];
+          [kernelFunc release];
+          if (cps)
+          {
+            AssignMetalObject(this->NormalComputePipeline, cps);
+          }
+        }
+      }
+
+      if (this->NormalComputePipeline)
+      {
+        double scalarRange = this->ScalarRange[1] - this->ScalarRange[0];
+        if (scalarRange <= 0.0) scalarRange = 1.0;
+        float normFactorLocal = this->ScalarNormalizationFactor;
+        float localGradNormFactor = static_cast<float>(scalarRange * 0.25 / normFactorLocal);
+
+        struct NormalComputeUniforms {
+          uint32_t dimX, dimY, dimZ;
+          float gsX, gsY, gsZ;
+          float scalarScale;
+          float scalarBias;
+          float gradNormFactor;
+        };
+
+        id<MTLComputeCommandEncoder> compEnc = [uploadCmdBuf computeCommandEncoder];
+        compEnc.label = @"VTK Block Normal Compute";
+
+        for (auto& block : this->Blocks)
+        {
+          if (!block.Texture) continue;
+
+          id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture;
+          int bdims[3] = { static_cast<int>(blockTex.width),
+                           static_cast<int>(blockTex.height),
+                           static_cast<int>(blockTex.depth) };
+
+          // Create per-block normal texture
+          MTLTextureDescriptor* nd = [[MTLTextureDescriptor alloc] init];
+          nd.textureType = MTLTextureType3D;
+          nd.pixelFormat = MTLPixelFormatRGBA8Unorm;
+          nd.width = bdims[0];
+          nd.height = bdims[1];
+          nd.depth = bdims[2];
+          nd.mipmapLevelCount = 1;
+          nd.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+          nd.storageMode = MTLStorageModePrivate;
+
+          id<MTLTexture> blockNrm = [device newTextureWithDescriptor:nd];
+          [nd release];
+          if (!blockNrm) continue;
+          AssignMetalObject(block.NormalTexture, blockNrm);
+
+          NormalComputeUniforms u;
+          u.dimX = static_cast<uint32_t>(bdims[0]);
+          u.dimY = static_cast<uint32_t>(bdims[1]);
+          u.dimZ = static_cast<uint32_t>(bdims[2]);
+          u.gsX = 1.0f / std::max(bdims[0], 1);
+          u.gsY = 1.0f / std::max(bdims[1], 1);
+          u.gsZ = 1.0f / std::max(bdims[2], 1);
+          u.scalarScale = 1.0f / std::max(static_cast<float>((this->ScalarRange[1] - this->ScalarRange[0]) / normFactorLocal), 1e-6f);
+          u.scalarBias = -(static_cast<float>(this->ScalarRange[0] / normFactorLocal)) * u.scalarScale;
+          u.gradNormFactor = localGradNormFactor;
+
+          [compEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->NormalComputePipeline];
+          [compEnc setTexture:blockTex atIndex:0];
+          [compEnc setTexture:blockNrm atIndex:1];
+          [compEnc setBytes:&u length:sizeof(u) atIndex:0];
+
+          MTLSize gridSize = MTLSizeMake(bdims[0], bdims[1], bdims[2]);
+          NSUInteger tgw_max = 16;
+          NSUInteger tgw_x = std::min(tgw_max, static_cast<NSUInteger>(bdims[0]));
+          NSUInteger tgw_y = std::min(tgw_max, static_cast<NSUInteger>(bdims[1]));
+          NSUInteger tgw_z = std::min(static_cast<NSUInteger>(1024) / (tgw_x * tgw_y), static_cast<NSUInteger>(bdims[2]));
+          MTLSize threadGroupSize = MTLSizeMake(tgw_x, tgw_y, tgw_z);
+          [compEnc dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
+        }
+
+        [compEnc endEncoding];
+      }
+    }
+
     [uploadCmdBuf commit];
     // Staging buffer is stack-local; block textures are retained so the GPU can read them
   }
@@ -3813,11 +4062,13 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     BOOL gradOp  = (featureMask & VolumeFeature_GradientOpacity) ? YES : NO;
     BOOL mask    = (featureMask & VolumeFeature_Mask) ? YES : NO;
     BOOL minmax  = (featureMask & VolumeFeature_MinMax) ? YES : NO;
+    BOOL normalTex = (featureMask & VolumeFeature_NormalTexture) ? YES : NO;
 
     [constants setConstantValue:&shading type:MTLDataTypeBool withName:@"fc_shading"];
     [constants setConstantValue:&gradOp  type:MTLDataTypeBool withName:@"fc_gradientOpacity"];
     [constants setConstantValue:&mask    type:MTLDataTypeBool withName:@"fc_mask"];
     [constants setConstantValue:&minmax  type:MTLDataTypeBool withName:@"fc_minmax"];
+    [constants setConstantValue:&normalTex type:MTLDataTypeBool withName:@"fc_normalTexture"];
 
     fragFunc = [library newFunctionWithName:fragName
                              constantValues:constants
@@ -4011,6 +4262,16 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
   {
     [encoder setFragmentTexture:minMaxFallbackTex atIndex:6];
   }
+
+  // Bind precomputed gradient normal texture (fragment index 7).
+  if (this->GradientNormalTexture)
+  {
+    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->GradientNormalTexture atIndex:7];
+  }
+  else
+  {
+    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyVolumeTexture atIndex:7];
+  }
 }
 
 //------------------------------------------------------------------------------
@@ -4109,6 +4370,15 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
       // Bind this block's 3D texture (scalar data)
       id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture;
       [encoder setFragmentTexture:blockTex atIndex:0];
+      // Bind per-block normal texture at index 7 if available
+      if (block.NormalTexture)
+      {
+        [encoder setFragmentTexture:(__bridge id<MTLTexture>)block.NormalTexture atIndex:7];
+      }
+      else
+      {
+        [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyVolumeTexture atIndex:7];
+      }
 
       // Draw
       [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
@@ -4217,6 +4487,13 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   if (!this->UpdateVolumeTexture(mtlDevice, mtlQueue, vol))
   {
     return;
+  }
+
+  // Precompute gradient/normal texture for non-partitioned volumes (Phase 4).
+  // Partitioned volumes generate per-block normals in UpdateBlockTextures.
+  if (!usePartitions)
+  {
+    this->EnsureGradientNormalTexture(mtlDevice, mtlQueue, vol);
   }
 
   // Compute actual sample distance early so it can be used for opacity pre-integration
@@ -4509,6 +4786,21 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   uniforms.MinMaxDimY = static_cast<float>(this->MinMaxDims[1]);
   uniforms.MinMaxDimZ = static_cast<float>(this->MinMaxDims[2]);
 
+  // Precomputed gradient normal texture (Phase 4)
+  bool hasNormalTexture = (this->GradientNormalTexture != nullptr);
+  if (!hasNormalTexture && !this->Blocks.empty())
+  {
+    for (auto& block : this->Blocks)
+    {
+      if (block.NormalTexture)
+      {
+        hasNormalTexture = true;
+        break;
+      }
+    }
+  }
+  uniforms.UseNormalTexture = hasNormalTexture ? 1.0f : 0.0f;
+
   // Build feature mask for shader function constant specialization.
   // When any feature is actively used at runtime, the corresponding bit is set
   // so GetOrCreateVolumePipeline selects a PSO compiled with that constant = 1.
@@ -4521,6 +4813,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     featureMask |= VolumeFeature_Mask;
   if (uniforms.UseMinMaxAccel > 0.5f || !this->Blocks.empty())
     featureMask |= VolumeFeature_MinMax;
+  if (hasNormalTexture)
+    featureMask |= VolumeFeature_NormalTexture;
 
   // Determine if image-space downsampling is active.
   // Force offscreen rendering when blocks are present to enable inter-block
@@ -4843,6 +5137,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         [layerEnc setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
         // Override the nil global texture BindEncoderResources set at index 0
         [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.Texture atIndex:0];
+        // Override index 7 with per-block normal texture if available
+        if (block.NormalTexture)
+        {
+          [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.NormalTexture atIndex:7];
+        }
 
         [layerEnc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                              indexCount:this->IndexCount

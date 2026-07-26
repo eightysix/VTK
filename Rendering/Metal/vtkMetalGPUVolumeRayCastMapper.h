@@ -71,6 +71,7 @@ enum VolumeShaderFeatureFlags : uint32_t
   VolumeFeature_GradientOpacity = 1u << 1,
   VolumeFeature_Mask            = 1u << 2,
   VolumeFeature_MinMax          = 1u << 3,
+  VolumeFeature_NormalTexture    = 1u << 4,
 };
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -111,6 +112,9 @@ public:
    * Useful for volumes exceeding hardware 3D texture size limits.
    */
   void SetPartitions(unsigned short x, unsigned short y, unsigned short z);
+
+  void SetUsePrecomputedNormals(bool val) { this->UsePrecomputedNormals = val; }
+  bool GetUsePrecomputedNormals() const { return this->UsePrecomputedNormals; }
 
   // No-op stubs: the instanced path was removed.  Kept so that any
   // external caller (test / UI) that references the setter still compiles.
@@ -166,6 +170,20 @@ private:
   int CurrentSampleCount = 0;
 
   bool PreferHalfPrecision = true;  // when true, prefer half-float for non-native data types
+  // Enables a precomputed RGBA8Unorm normal texture to replace 6 gradient
+  // fetches per sample with 1 normal texture fetch.  Adds ~4 bytes/voxel of
+  // GPU memory and a one-time compute dispatch.  Provides a net benefit only
+  // when shading is on (the gradient is unused otherwise).  Disabled by default;
+  // set to true when shading is enabled for a ~5x reduction in texture-fetch
+  // bandwidth per shaded sample.
+  bool UsePrecomputedNormals = false;
+
+  // Phase 4: Precomputed gradient/normal texture (replaces 6 gradient fetches with 1 normal fetch)
+  void* GradientNormalTexture = nullptr; // id<MTLTexture> — RGBA8Unorm 3D (normal.xyz*0.5+0.5, gradMag)
+  int NormalTextureDims[3] = {};        // dimensions of the normal texture
+  void* NormalComputePipeline = nullptr; // id<MTLComputePipelineState>
+  bool EnsureGradientNormalTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
+  void ReleaseGradientNormalTexture();
 
   // Phase 1A: Cached shader library (avoid recompiling vtkMetalShaders)
   void* CachedShaderLibrary = nullptr; // id<MTLLibrary>
@@ -238,6 +256,7 @@ private:
   {
     void* Texture = nullptr; // id<MTLTexture> — 3D sub-texture for this block
     void* MinMaxTexture = nullptr; // id<MTLTexture> — per-block min-max accel (R8Unorm)
+    void* NormalTexture = nullptr; // id<MTLTexture> — per-block precomputed normals (RGBA8Unorm)
     double BoundsMin[3] = {};
     double BoundsMax[3] = {};
     int Dims[3] = {};
