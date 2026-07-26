@@ -3572,18 +3572,6 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
     id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
 
-    NSError* error = nil;
-
-    id<MTLFunction> vertexFunc = [library newFunctionWithName:@"vertex_volume_main"];
-    id<MTLFunction> fragmentFunc = [library newFunctionWithName:@"fragment_volume_main"];
-    if (!vertexFunc || !fragmentFunc)
-    {
-      vtkErrorMacro("Failed to find volume shader functions");
-      [vertexFunc release];
-      [fragmentFunc release];
-      return false;
-    }
-
     // Create dummy depth texture (1x1 R32Float with value 1.0) for when no real depth texture is bound
     if (!this->DummyDepthTexture)
     {
@@ -3691,131 +3679,38 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       AssignMetalObject(this->DepthStencilState, ds);
     }
 
-    // Pipeline: vertex buffer layout — float3 position at buffer index 0
-    MTLVertexDescriptor* vertexDesc = [[MTLVertexDescriptor alloc] init];
-    vertexDesc.attributes[0].format = MTLVertexFormatFloat3;
-    vertexDesc.attributes[0].offset = 0;
-    vertexDesc.attributes[0].bufferIndex = 0;
-    vertexDesc.layouts[0].stride = sizeof(float) * 3;
-    vertexDesc.layouts[0].stepRate = 1;
-    vertexDesc.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
-
-    MTLRenderPipelineDescriptor* pipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
-    pipelineDesc.vertexFunction = vertexFunc;
-    pipelineDesc.fragmentFunction = fragmentFunc;
-    pipelineDesc.vertexDescriptor = vertexDesc;
-    pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-
-    pipelineDesc.colorAttachments[0].blendingEnabled = YES;
-    pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
-    pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    pipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
-    pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-    pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor =
-      MTLBlendFactorOneMinusSourceAlpha;
-    pipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
-
-    pipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
-    pipelineDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-    pipelineDesc.rasterSampleCount = sampleCount;
-
-    id<MTLRenderPipelineState> pso =
-      [device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
-    [pipelineDesc release];
+    // Create volume rendering pipelines via the caching helper.
+    // Base pipelines (featureMask=0) are created here for backward compat;
+    // specialized pipelines with non-zero feature masks are created on demand
+    // in GPURender() via GetOrCreateVolumePipeline.
+    void* pso = this->GetOrCreateVolumePipeline(mtlDeviceVoid,
+      static_cast<uint32_t>(VolumePipelineType::DirectScreen),
+      MTLPixelFormatBGRA8Unorm, MTLPixelFormatDepth32Float,
+      static_cast<uint32_t>(sampleCount), 0);
     if (!pso)
     {
-      vtkErrorMacro(<< "Volume pipeline: " << [[error localizedDescription] UTF8String]);
-      [vertexFunc release];
-      [fragmentFunc release];
-      [vertexDesc release];
       return false;
     }
-    AssignMetalObject(this->PipelineState, pso);
+    AssignMetalObject(this->PipelineState, (__bridge id)pso);
     this->CurrentSampleCount = sampleCount;
-    {
-      VolumePipelineKey k = { static_cast<uint32_t>(VolumePipelineType::DirectScreen),
-        MTLPixelFormatBGRA8Unorm, MTLPixelFormatDepth32Float,
-        static_cast<uint32_t>(sampleCount), 0 };
-      [(__bridge id)pso retain];
-      this->PipelineCache[k] = (__bridge void*)pso;
-    }
 
-    // Create accumulation pipeline for inter-block opacity propagation.
-    MTLRenderPipelineDescriptor* accumDesc = [[MTLRenderPipelineDescriptor alloc] init];
-    accumDesc.vertexFunction = vertexFunc;
-    id<MTLFunction> accumFrag = [library newFunctionWithName:@"fragment_volume_accum_main"];
-    accumDesc.fragmentFunction = accumFrag;
-    accumDesc.vertexDescriptor = vertexDesc;
-    accumDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
-    accumDesc.colorAttachments[0].blendingEnabled = NO;
-    accumDesc.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
-    accumDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-    accumDesc.rasterSampleCount = 1;
-
-    id<MTLRenderPipelineState> accumPso =
-      [device newRenderPipelineStateWithDescriptor:accumDesc error:&error];
-    [accumDesc release];
-    [accumFrag release];
+    void* accumPso = this->GetOrCreateVolumePipeline(mtlDeviceVoid,
+      static_cast<uint32_t>(VolumePipelineType::OffscreenAccumulation),
+      MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, 0);
     if (!accumPso)
     {
-      vtkErrorMacro(<< "Volume accumulation pipeline: "
-                    << [[error localizedDescription] UTF8String]);
-      [vertexFunc release];
-      [fragmentFunc release];
-      [vertexDesc release];
       return false;
     }
-    AssignMetalObject(this->AccumulationPipelineState, accumPso);
+    AssignMetalObject(this->AccumulationPipelineState, (__bridge id)accumPso);
+
+    void* layerPso = this->GetOrCreateVolumePipeline(mtlDeviceVoid,
+      static_cast<uint32_t>(VolumePipelineType::OffscreenLayer),
+      MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, 0);
+    if (!layerPso)
     {
-      VolumePipelineKey k = { static_cast<uint32_t>(VolumePipelineType::OffscreenAccumulation),
-        MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, 0 };
-      [(__bridge id)accumPso retain];
-      this->PipelineCache[k] = (__bridge void*)accumPso;
+      return false;
     }
-
-    // Layer pipeline: same fragment as screen path, but offscreen format, no blend, no depth.
-    if (!this->LayerPipelineState)
-    {
-      id<MTLFunction> layerFrag = [library newFunctionWithName:@"fragment_volume_main"];
-      if (!layerFrag)
-      {
-        vtkErrorMacro("Failed to find layer fragment function");
-        [vertexFunc release];
-        [fragmentFunc release];
-        [vertexDesc release];
-        return false;
-      }
-
-      MTLRenderPipelineDescriptor* ld = [[MTLRenderPipelineDescriptor alloc] init];
-      ld.vertexFunction = vertexFunc;
-      ld.fragmentFunction = layerFrag;
-      ld.vertexDescriptor = vertexDesc;
-      ld.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
-      ld.colorAttachments[0].blendingEnabled = NO;
-      ld.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
-      ld.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-      ld.rasterSampleCount = 1;
-
-      NSError* layerError = nil;
-      id<MTLRenderPipelineState> p = [device newRenderPipelineStateWithDescriptor:ld error:&layerError];
-      [ld release];
-      [layerFrag release];
-      if (!p)
-      {
-        vtkErrorMacro(<< "Layer pipeline: " << [[layerError localizedDescription] UTF8String]);
-        [vertexFunc release];
-        [fragmentFunc release];
-        [vertexDesc release];
-        return false;
-      }
-      AssignMetalObject(this->LayerPipelineState, p);
-      {
-        VolumePipelineKey k = { static_cast<uint32_t>(VolumePipelineType::OffscreenLayer),
-          MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, 0 };
-        [(__bridge id)p retain];
-        this->PipelineCache[k] = (__bridge void*)p;
-      }
-    }
+    AssignMetalObject(this->LayerPipelineState, (__bridge id)layerPso);
 
     // Composite pipeline: fullscreen resolve of the 8 layers.
     if (!this->CompositePipelineState)
@@ -3839,9 +3734,6 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       if (!p)
       {
         vtkErrorMacro(<< "Composite pipeline: " << [[compError localizedDescription] UTF8String]);
-        [vertexFunc release];
-        [fragmentFunc release];
-        [vertexDesc release];
         return false;
       }
       AssignMetalObject(this->CompositePipelineState, p);
@@ -3852,19 +3744,179 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
         this->PipelineCache[k] = (__bridge void*)p;
       }
     }
-
-    // Release temporary objects
-    [vertexFunc release];
-    [fragmentFunc release];
-    [vertexDesc release];
   }
 
   return true;
 }
 
 //------------------------------------------------------------------------------
+void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
+  void* mtlDeviceVoid, uint32_t type, uint32_t colorFormat,
+  uint32_t depthFormat, uint32_t sampleCount, uint32_t featureMask)
+{
+  VolumePipelineKey key = { type, colorFormat, depthFormat, sampleCount, featureMask };
+  auto it = this->PipelineCache.find(key);
+  if (it != this->PipelineCache.end())
+  {
+    return it->second;
+  }
+
+  id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
+  if (!library)
+  {
+    return nullptr;
+  }
+
+  NSError* error = nil;
+
+  // Determine the fragment function name and whether to use vertex_volume_main
+  // or vertex_fullscreen_main based on pipeline type.
+  NSString* fragName = @"fragment_volume_main";
+  bool useVolumeVertex = true;
+
+  switch (static_cast<VolumePipelineType>(type))
+  {
+    case VolumePipelineType::OffscreenAccumulation:
+      fragName = @"fragment_volume_accum_main";
+      useVolumeVertex = true;
+      break;
+    case VolumePipelineType::DirectScreen:
+    case VolumePipelineType::OffscreenLayer:
+      fragName = @"fragment_volume_main";
+      useVolumeVertex = true;
+      break;
+    case VolumePipelineType::LayerComposite:
+      fragName = @"fragment_layer_composite_main";
+      useVolumeVertex = false;
+      break;
+    case VolumePipelineType::ImageSampleBlit:
+      fragName = @"fragment_image_sample_blit";
+      useVolumeVertex = false;
+      break;
+  }
+
+  // Create function constants for shader specialization.
+  // Only volume fragment shaders (volume_main/volume_accum_main) use
+  // function constants; composite and blit passes do not.
+  id<MTLFunction> fragFunc = nil;
+  VolumePipelineType pt = static_cast<VolumePipelineType>(type);
+  BOOL hasFeatureConstants = (pt == VolumePipelineType::DirectScreen ||
+    pt == VolumePipelineType::OffscreenLayer ||
+    pt == VolumePipelineType::OffscreenAccumulation);
+
+  if (hasFeatureConstants)
+  {
+    MTLFunctionConstantValues* constants = [[MTLFunctionConstantValues alloc] init];
+
+    BOOL shading = (featureMask & VolumeFeature_Shading) ? YES : NO;
+    BOOL gradOp  = (featureMask & VolumeFeature_GradientOpacity) ? YES : NO;
+    BOOL mask    = (featureMask & VolumeFeature_Mask) ? YES : NO;
+    BOOL minmax  = (featureMask & VolumeFeature_MinMax) ? YES : NO;
+
+    [constants setConstantValue:&shading type:MTLDataTypeBool withName:@"fc_shading"];
+    [constants setConstantValue:&gradOp  type:MTLDataTypeBool withName:@"fc_gradientOpacity"];
+    [constants setConstantValue:&mask    type:MTLDataTypeBool withName:@"fc_mask"];
+    [constants setConstantValue:&minmax  type:MTLDataTypeBool withName:@"fc_minmax"];
+
+    fragFunc = [library newFunctionWithName:fragName
+                             constantValues:constants
+                                      error:&error];
+    [constants release];
+  }
+  else
+  {
+    // Non-volume pipelines (composite, blit) have no function constants.
+    fragFunc = [library newFunctionWithName:fragName];
+  }
+
+  if (!fragFunc)
+  {
+    vtkErrorMacro(<< "Failed to find fragment function " << [fragName UTF8String]);
+    return nullptr;
+  }
+
+  id<MTLFunction> vertexFunc = nil;
+  if (useVolumeVertex)
+  {
+    vertexFunc = [library newFunctionWithName:@"vertex_volume_main"];
+  }
+  else
+  {
+    vertexFunc = [library newFunctionWithName:@"vertex_fullscreen_main"];
+  }
+
+  if (!vertexFunc)
+  {
+    vtkErrorMacro("Failed to find vertex function for pipeline");
+    [fragFunc release];
+    return nullptr;
+  }
+
+  MTLRenderPipelineDescriptor* pipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
+  pipelineDesc.vertexFunction = vertexFunc;
+  pipelineDesc.fragmentFunction = fragFunc;
+
+  if (useVolumeVertex)
+  {
+    MTLVertexDescriptor* vertexDesc = [[MTLVertexDescriptor alloc] init];
+    vertexDesc.attributes[0].format = MTLVertexFormatFloat3;
+    vertexDesc.attributes[0].offset = 0;
+    vertexDesc.attributes[0].bufferIndex = 0;
+    vertexDesc.layouts[0].stride = sizeof(float) * 3;
+    vertexDesc.layouts[0].stepRate = 1;
+    vertexDesc.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
+    pipelineDesc.vertexDescriptor = vertexDesc;
+    [vertexDesc release];
+  }
+
+  pipelineDesc.colorAttachments[0].pixelFormat = (MTLPixelFormat)colorFormat;
+
+  // DirectScreen uses blending; offscreen pipelines do not.
+  if (pt == VolumePipelineType::DirectScreen)
+  {
+    pipelineDesc.colorAttachments[0].blendingEnabled = YES;
+    pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+    pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    pipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    pipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+  }
+  else
+  {
+    pipelineDesc.colorAttachments[0].blendingEnabled = NO;
+  }
+
+  if (depthFormat != MTLPixelFormatInvalid)
+  {
+    pipelineDesc.depthAttachmentPixelFormat = (MTLPixelFormat)depthFormat;
+  }
+
+  pipelineDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+  pipelineDesc.rasterSampleCount = sampleCount;
+
+  id<MTLRenderPipelineState> pso =
+    [device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
+  [pipelineDesc release];
+  [vertexFunc release];
+  [fragFunc release];
+
+  if (!pso)
+  {
+    vtkErrorMacro(<< "Pipeline creation failed for type " << type << ": "
+                  << [[error localizedDescription] UTF8String]);
+    return nullptr;
+  }
+
+  // Cache and return
+  this->PipelineCache[key] = (__bridge void*)pso;
+  return (__bridge void*)pso;
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
-  void* encoderVoid, void* uniformBufVoid, void* pipelineStateVoid)
+  void* encoderVoid, void* uniformBufVoid, void* pipelineStateVoid, bool hasDepth)
 {
   id<MTLRenderCommandEncoder> encoder =
     (__bridge id<MTLRenderCommandEncoder>)encoderVoid;
@@ -3884,10 +3936,7 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
   [encoder setCullMode:MTLCullModeNone];
 
   // Only bind depth state if the pipeline uses depth testing.
-  // Standard pipeline renders directly to screen with depth; the accumulation
-  // and accumulation offscreen pipelines have no depth attachment (MTLPixelFormatInvalid).
-  bool hasDepthAttachment = (pipelineStateVoid == nullptr || pipelineStateVoid == this->PipelineState);
-  if (this->DepthStencilState && hasDepthAttachment)
+  if (this->DepthStencilState && hasDepth)
   {
     id<MTLDepthStencilState> ds =
       (__bridge id<MTLDepthStencilState>)this->DepthStencilState;
@@ -4460,6 +4509,19 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   uniforms.MinMaxDimY = static_cast<float>(this->MinMaxDims[1]);
   uniforms.MinMaxDimZ = static_cast<float>(this->MinMaxDims[2]);
 
+  // Build feature mask for shader function constant specialization.
+  // When any feature is actively used at runtime, the corresponding bit is set
+  // so GetOrCreateVolumePipeline selects a PSO compiled with that constant = 1.
+  int featureMask = 0;
+  if (uniforms.UseGradientShading > 0.5f)
+    featureMask |= VolumeFeature_Shading;
+  if (uniforms.UseGradientOpacity > 0.5f)
+    featureMask |= VolumeFeature_GradientOpacity;
+  if (uniforms.UseMask > 0.5f)
+    featureMask |= VolumeFeature_Mask;
+  if (uniforms.UseMinMaxAccel > 0.5f || !this->Blocks.empty())
+    featureMask |= VolumeFeature_MinMax;
+
   // Determine if image-space downsampling is active.
   // Force offscreen rendering when blocks are present to enable inter-block
   // opacity propagation via Metal framebuffer fetch ([[color(0)]]).
@@ -4727,7 +4789,10 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         [layerEnc setViewport:vp];
 
         // Shared bindings (layer pipeline, vertex buf, uniforms, TF/depth/grad/mask/minmax samplers)
-        this->BindEncoderResources(layerEnc, uniformBuf, this->LayerPipelineState);
+        void* layerPso = this->GetOrCreateVolumePipeline(mtlDevice,
+          static_cast<uint32_t>(VolumePipelineType::OffscreenLayer),
+          MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, featureMask);
+        this->BindEncoderResources(layerEnc, uniformBuf, layerPso, false);
 
         // Per-brick PerBlockData — identical construction to the fallback loop in DrawBlocks
         PerBlockData pbd = {};
@@ -4859,10 +4924,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       //     with > MAX_LAYER_BRICKS bricks (the layer composite is capped at
       //     MAX_LAYER_BRICKS; see "Known limitations"). ---
       bool useAccumulation = !this->Blocks.empty(); // true only for the >8-brick case here
-      void* activePipeline = useAccumulation
-        ? this->AccumulationPipelineState
-        : this->LayerPipelineState;
-      this->BindEncoderResources(offscreenEncoder, uniformBuf, activePipeline);
+      void* activePipeline = this->GetOrCreateVolumePipeline(mtlDevice,
+        static_cast<uint32_t>(useAccumulation ? VolumePipelineType::OffscreenAccumulation
+                                              : VolumePipelineType::OffscreenLayer),
+        MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, featureMask);
+      this->BindEncoderResources(offscreenEncoder, uniformBuf, activePipeline, false);
 
       this->DrawBlocks(offscreenEncoder, uniformBuf, ren, vol, &uniforms, invModelMatrix);
 
@@ -4884,7 +4950,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     }
 
     // Bind all encoder resources (pipeline, textures, samplers, buffers)
-    this->BindEncoderResources(encoder, uniformBuf);
+    void* directPso = this->GetOrCreateVolumePipeline(mtlDevice,
+      static_cast<uint32_t>(VolumePipelineType::DirectScreen),
+      MTLPixelFormatBGRA8Unorm, MTLPixelFormatDepth32Float,
+      static_cast<uint32_t>(sampleCount), featureMask);
+    this->BindEncoderResources(encoder, uniformBuf, directPso, true);
 
     // Draw volume — handle partitioned (multi-block) and single-block cases
     this->DrawBlocks(encoder, uniformBuf, ren, vol, &uniforms, invModelMatrix);

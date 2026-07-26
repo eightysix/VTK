@@ -1217,6 +1217,16 @@ fragment FragmentOutput fragment_glyph_point_main(
 }
 
 
+// Function constants for volume shader specialization.
+// These are set via MTLFunctionConstantValues at pipeline creation time,
+// allowing the Metal compiler to eliminate dead code for unused features.
+// Each constant controls whether a specific expensive feature path is
+// compiled into the fragment shader at all.
+constant bool fc_shading [[function_constant(0)]];
+constant bool fc_gradientOpacity [[function_constant(1)]];
+constant bool fc_mask [[function_constant(2)]];
+constant bool fc_minmax [[function_constant(3)]];
+
 // ============================================================================
 // Volume Ray Casting Mapper
 // ============================================================================
@@ -1452,11 +1462,11 @@ fragment VolumeFragmentOut fragment_volume_main(
     }
   }
 
-  // --- LOCAL CACHE WARM-UP (Prevents Uniform Cache Thrashing) ---
-  const bool doShading = volumeUniforms.useGradientShading > 0.5;
-  const bool doGradOp = volumeUniforms.useGradientOpacity > 0.5;
+  // --- LOCAL CACHE WARM-UP ---
+  const bool doShading = fc_shading && (volumeUniforms.useGradientShading > 0.5);
+  const bool doGradOp = fc_gradientOpacity && (volumeUniforms.useGradientOpacity > 0.5);
   const bool doCropping = volumeUniforms.useCropping > 0.5;
-  const bool doMask = volumeUniforms.useMask > 0.5;
+  const bool doMask = fc_mask && (volumeUniforms.useMask > 0.5);
 
   half scalarScale = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
   half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
@@ -1516,7 +1526,10 @@ fragment VolumeFragmentOut fragment_volume_main(
     if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
 
     // 0. MIN-MAX ACCELERATION
-    if (b.minMaxInfo.x > 0.5 &&
+    // fc_minmax gates the entire empty-space skipping code at compile time.
+    // If min-max is not in use, this entire block is eliminated by the compiler.
+    if (fc_minmax &&
+        b.minMaxInfo.x > 0.5 &&
         b.minMaxInfo.y > 0.5 &&
         b.minMaxInfo.z > 0.5 &&
         b.minMaxInfo.w > 0.5) {
@@ -1755,11 +1768,11 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     }
   }
 
-  // --- LOCAL CACHE WARM-UP (Prevents Uniform Cache Thrashing) ---
-  const bool doShading = volumeUniforms.useGradientShading > 0.5;
-  const bool doGradOp = volumeUniforms.useGradientOpacity > 0.5;
+  // --- LOCAL CACHE WARM-UP ---
+  const bool doShading = fc_shading && (volumeUniforms.useGradientShading > 0.5);
+  const bool doGradOp = fc_gradientOpacity && (volumeUniforms.useGradientOpacity > 0.5);
   const bool doCropping = volumeUniforms.useCropping > 0.5;
-  const bool doMask = volumeUniforms.useMask > 0.5;
+  const bool doMask = fc_mask && (volumeUniforms.useMask > 0.5);
 
   half scalarScale = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
   half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
@@ -1816,7 +1829,8 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
   for (int i = 0; i < maxSteps; i++) {
     if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
 
-    if (b.minMaxInfo.x > 0.5 &&
+    if (fc_minmax &&
+        b.minMaxInfo.x > 0.5 &&
         b.minMaxInfo.y > 0.5 &&
         b.minMaxInfo.z > 0.5 &&
         b.minMaxInfo.w > 0.5) {

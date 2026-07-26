@@ -62,6 +62,17 @@ struct VolumePipelineKeyHash
   }
 };
 
+// Feature flags for volume shader specialization via function constants.
+// Each flag enables a corresponding [[function_constant(n)]] in the Metal
+// shader, allowing the compiler to eliminate dead code paths.
+enum VolumeShaderFeatureFlags : uint32_t
+{
+  VolumeFeature_Shading        = 1u << 0,
+  VolumeFeature_GradientOpacity = 1u << 1,
+  VolumeFeature_Mask            = 1u << 2,
+  VolumeFeature_MinMax          = 1u << 3,
+};
+
 VTK_ABI_NAMESPACE_BEGIN
 
 class VTKRENDERINGMETAL_EXPORT VTK_MARSHALAUTO vtkMetalGPUVolumeRayCastMapper
@@ -195,6 +206,9 @@ private:
   bool UpdateMinMaxTexture(void* mtlDevice, vtkVolume* vol, vtkImageData* input, vtkDataArray* scalars, bool skipGlobalTexture = false);
   bool SetupBuffers(void* mtlDevice, vtkRenderer* ren, vtkVolume* vol, vtkImageData* input);
   bool SetupPipeline(void* mtlDevice, vtkRenderer* ren);
+  void* GetOrCreateVolumePipeline(void* mtlDevice, uint32_t type,
+    uint32_t colorFormat, uint32_t depthFormat, uint32_t sampleCount,
+    uint32_t featureMask);
 
   // Mask / label map helpers
   bool UpdateMaskTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
@@ -214,7 +228,8 @@ private:
   void WaitForInFlightFrames();
 
   // Rendering helpers — shared between image-sampling and standard paths
-  void BindEncoderResources(void* encoder, void* uniformBuf, void* pipelineState = nullptr);
+  void BindEncoderResources(void* encoder, void* uniformBuf, void* pipelineState = nullptr,
+    bool hasDepth = false);
   void DrawBlocks(void* encoder, void* uniformBuf, vtkRenderer* ren, vtkVolume* vol,
     void* uniforms, vtkMatrix4x4* invModelMatrix);
 
