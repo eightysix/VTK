@@ -3294,6 +3294,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       needsConversion = false;
     }
 
+    // Use one command buffer for all work (conversion, upload, minmax, normals)
+    id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
+
     // --- Phase 7: GPU compute conversion for non-native data types ---
     bool gpuConversionUsed = false;
     id<MTLTexture> gpuFullTex = nullptr;
@@ -3342,9 +3345,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
 
             if (gpuFullTex)
             {
-              id<MTLCommandBuffer> convCmdBuf = [queue commandBuffer];
-              convCmdBuf.label = @"VTK Block Volume Convert";
-              id<MTLComputeCommandEncoder> enc = [convCmdBuf computeCommandEncoder];
+              id<MTLComputeCommandEncoder> enc = [uploadCmdBuf computeCommandEncoder];
+              enc.label = @"VTK Block Volume Convert";
               [enc setComputePipelineState:pipeline];
               [enc setBuffer:srcBuf offset:0 atIndex:0];
               [enc setTexture:gpuFullTex atIndex:0];
@@ -3364,8 +3366,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
                 (static_cast<NSUInteger>(fullDims[2]) + 7) / 8);
               [enc dispatchThreadgroups:tgCount threadsPerThreadgroup:tgSize];
               [enc endEncoding];
-
-              [convCmdBuf commit];
               [srcBuf release];
 
               gpuConversionUsed = true;
@@ -3462,8 +3462,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       }
     }
 
-    // Use one command buffer for all block uploads
-    id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
 
     // Resize BlockScalarRanges to match the number of blocks.
