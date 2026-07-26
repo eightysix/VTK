@@ -186,28 +186,67 @@ namespace
 {
 inline uint16_t FloatToHalf(float f)
 {
+#if defined(__aarch64__) || defined(__ARM_ARCH_7A__)
+  // Hardware conversion via __fp16 — handles all IEEE 754 cases correctly
+  // (round-to-nearest-even, NaN payload, signed zero, denormals).
+  __fp16 h = static_cast<__fp16>(f);
+  uint16_t bits;
+  std::memcpy(&bits, &h, sizeof(bits));
+  return bits;
+#else
+  // Software fallback with proper IEEE 754 round-to-nearest-even
   uint32_t bits;
   std::memcpy(&bits, &f, sizeof(bits));
   uint32_t sign = (bits >> 16) & 0x8000;
   int32_t exponent = ((bits >> 23) & 0xFF) - 127 + 15;
   uint32_t mantissa = bits & 0x7FFFFF;
 
+  // NaN / Infinity
   if ((bits & 0x7F800000) == 0x7F800000)
   {
-    uint16_t halfMantissa = mantissa >> 13;
-    return static_cast<uint16_t>(sign | 0x7C00 | halfMantissa);
+    if ((bits & 0x7FFFFF) == 0)
+      return static_cast<uint16_t>(sign | 0x7C00);
+    // NaN — preserve payload; ensure at least one mantissa bit is set
+    uint16_t halfMantissa = (mantissa >> 13) & 0x03FF;
+    return static_cast<uint16_t>(sign | 0x7C00 | halfMantissa | (halfMantissa == 0 ? 1 : 0));
   }
 
+  // Denormals / underflow
   if (exponent <= 0)
   {
     if (exponent < -10)
       return static_cast<uint16_t>(sign);
     mantissa = (mantissa | 0x800000) >> (1 - exponent);
-    return static_cast<uint16_t>(sign | (mantissa >> 13));
+    uint32_t roundBit = (mantissa >> 12) & 1;
+    uint32_t sticky = mantissa & 0xFFF;
+    mantissa >>= 13;
+    if (roundBit && (sticky > 0 || (mantissa & 1)))
+      ++mantissa;
+    return static_cast<uint16_t>(sign | (mantissa > 0x3FF ? 0x7C00 : mantissa));
   }
+
+  // Overflow to infinity
   if (exponent > 30)
     return static_cast<uint16_t>(sign | 0x7C00);
-  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10) | (mantissa >> 13));
+
+  // Normal number with round-to-nearest-even
+  uint32_t halfMantissa = mantissa >> 13;
+  uint32_t roundBit = (mantissa >> 12) & 1;
+  uint32_t sticky = mantissa & 0xFFF;
+
+  if (roundBit && (sticky > 0 || (halfMantissa & 1)))
+  {
+    ++halfMantissa;
+    if (halfMantissa > 0x3FF)
+    {
+      halfMantissa = 0;
+      ++exponent;
+      if (exponent > 30)
+        return static_cast<uint16_t>(sign | 0x7C00);
+    }
+  }
+  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10) | halfMantissa);
+#endif
 }
 
 // Returns true when half-float can safely represent the full scalar range.
