@@ -1663,7 +1663,6 @@ inline half4 marchVolume(
 
 fragment VolumeFragmentOut fragment_volume_main(
     VolumeVertexOut in [[stage_in]],
-    bool isFrontFace [[front_facing]],
     constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
     constant PerBlockData& b [[buffer(2)]],
     texture3d<float> volumeTexture [[texture(0)]],
@@ -1674,8 +1673,6 @@ fragment VolumeFragmentOut fragment_volume_main(
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
     texture3d<float> normalTexture [[texture(7)]]) {
-
-  if (!isFrontFace) discard_fragment();
 
   VolumeFragmentOut output;
   float3 blockMinGlobal = (b.volumeBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
@@ -1832,7 +1829,6 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
 // across block boundaries. Used when rendering partitioned volumes front-to-back.
 fragment VolumeFragmentOut fragment_volume_accum_main(
     VolumeVertexOut in [[stage_in]],
-    bool isFrontFace [[front_facing]],
     float4 prevAccum [[color(0)]], // Metal Framebuffer Fetch
     constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
     constant PerBlockData& b [[buffer(2)]],
@@ -1844,8 +1840,6 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
     texture3d<float> normalTexture [[texture(7)]]) {
-
-  if (!isFrontFace) discard_fragment();
 
   VolumeFragmentOut output;
 

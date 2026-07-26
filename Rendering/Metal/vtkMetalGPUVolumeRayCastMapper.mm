@@ -5018,7 +5018,7 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
     pipeline = (__bridge id<MTLRenderPipelineState>)this->PipelineState;
   }
   [encoder setRenderPipelineState:pipeline];
-  [encoder setCullMode:MTLCullModeNone];
+  [encoder setCullMode:MTLCullModeBack];
 
   // Only bind depth state if the pipeline uses depth testing.
   if (this->DepthStencilState && hasDepth)
@@ -5377,7 +5377,7 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
 
       // Bind resources manually (avoid BindEncoderResources which sets a potentially
       // nil VertexBuffer — the fullscreen path skips vertex buffer creation).
-      [encoder setCullMode:MTLCullModeNone];
+      [encoder setCullMode:MTLCullModeBack];
       if (this->DepthStencilState && useDirectPipeline)
       {
         [encoder setDepthStencilState:(__bridge id<MTLDepthStencilState>)this->DepthStencilState];
@@ -5453,7 +5453,7 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
     pbd.MinMaxInfo[3] = uniforms->MinMaxDimZ;
 
     // Bind resources manually (avoid BindEncoderResources which sets VertexBuffer).
-    [encoder setCullMode:MTLCullModeNone];
+    [encoder setCullMode:MTLCullModeBack];
     if (this->DepthStencilState && useDirectPipeline)
     {
       [encoder setDepthStencilState:(__bridge id<MTLDepthStencilState>)this->DepthStencilState];
