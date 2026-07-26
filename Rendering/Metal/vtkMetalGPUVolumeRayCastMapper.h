@@ -30,7 +30,9 @@ enum class VolumePipelineType : uint32_t
   OffscreenAccumulation = 1,
   OffscreenLayer = 2,
   LayerComposite = 3,
-  ImageSampleBlit = 4
+  ImageSampleBlit = 4,
+  FullscreenDirect = 5,      // Fullscreen ray-cast for camera-inside (BGRA8Unorm + depth)
+  FullscreenOffscreen = 6    // Fullscreen ray-cast for camera-inside (RGBA16Float, no depth)
 };
 
 struct VolumePipelineKey
@@ -119,6 +121,14 @@ public:
   void SetUseGPUMinMax(bool val) { this->UseGPUMinMax = val; }
   bool GetUseGPUMinMax() const { return this->UseGPUMinMax; }
 
+  // Phase 6: Fullscreen camera-inside path.
+  // When true (default), camera-inside rendering uses a fullscreen ray-cast
+  // fragment shader instead of CPU proxy geometry (ClipConvexPolyData +
+  // DensifyPolyData + TriangleFilter). Eliminates CPU hitching when the
+  // camera enters the volume.
+  void SetUseFullscreenCameraInside(bool val) { this->UseFullscreenCameraInside = val; }
+  bool GetUseFullscreenCameraInside() const { return this->UseFullscreenCameraInside; }
+
   // No-op stubs: the instanced path was removed.  Kept so that any
   // external caller (test / UI) that references the setter still compiles.
   void SetDisableInstanceRendering(bool) {}
@@ -187,6 +197,10 @@ private:
   void* NormalComputePipeline = nullptr; // id<MTLComputePipelineState>
   bool EnsureGradientNormalTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
   void ReleaseGradientNormalTexture();
+
+  // Phase 6: Enables fullscreen ray-cast path when camera is inside the volume.
+  // Defaults to true (recommended). Set to false to force the old CPU proxy geometry path.
+  bool UseFullscreenCameraInside = true;
 
   // Phase 5: GPU-based min/max acceleration generation.
   // When true, UpdateMinMaxTexture uses GPU compute kernels instead of CPU
@@ -270,6 +284,12 @@ private:
     bool hasDepth = false);
   void DrawBlocks(void* encoder, void* uniformBuf, vtkRenderer* ren, vtkVolume* vol,
     void* uniforms, vtkMatrix4x4* invModelMatrix);
+  // Fullscreen camera-inside draw path.
+  // Renders each non-empty brick using a fullscreen triangle (vertex_fullscreen_main +
+  // fragment_volume_fullscreen_main) instead of proxy geometry. No vertex/index buffers
+  // needed — the fullscreen vertex shader generates positions internally.
+  void DrawBlocksFullscreen(void* encoder, void* uniformBuf, vtkRenderer* ren, vtkVolume* vol,
+    void* uniforms, vtkMatrix4x4* invModelMatrix, bool useDirectPipeline);
 
   // Volume partitioning — splits large volumes into blocks for 3D texture size limits
   struct VolumeBlock

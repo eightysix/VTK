@@ -1742,6 +1742,308 @@ fragment VolumeFragmentOut fragment_volume_main(
   return output;
 }
 
+// Fullscreen volume ray-cast shader: used when the camera is inside the volume.
+// Reconstructs the ray from screen UV using inverseViewProjection (same approach
+// as the composite shader) instead of relying on proxy-geometry vertices.
+// This eliminates the CPU-heavy ClipConvexPolyData + DensifyPolyData + TriangleFilter
+// pipeline that the proxy-based path requires for camera-inside rendering.
+// The march loop is identical to fragment_volume_main.
+fragment VolumeFragmentOut fragment_volume_fullscreen_main(
+    FullscreenVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    texture2d<float> gradientOpacityTexture [[texture(3)]],
+    texture3d<float> maskTexture [[texture(4)]],
+    texture2d<float> labelMapTransferTexture [[texture(5)]],
+    texture3d<float> minMaxTexture [[texture(6)]],
+    texture3d<float> normalTexture [[texture(7)]]) {
+
+  VolumeFragmentOut output;
+
+  // Reconstruct the pixel ray in global [0,1] space — same convention as the
+  // composite shader (fragment_layer_composite_main).
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float2 uv  = in.position.xy / volumeUniforms.viewportSize;
+  float2 ndc = uv * 2.0 - 1.0;
+  float4 wn = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, 0.0, 1.0); wn.xyz /= wn.w;
+  float4 wf = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, 1.0, 1.0); wf.xyz /= wf.w;
+  float3 bszF = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 localN = ((volumeUniforms.worldToVolume * float4(wn.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bszF;
+  float3 localF = ((volumeUniforms.worldToVolume * float4(wf.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bszF;
+  float3 rayDir = normalize(localF - localN);
+
+  float3 blockMinGlobal = (b.volumeBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+
+  float3 texMinGlobal = (b.textureBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 texMaxGlobal = (b.textureBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+
+  float stepSize = volumeUniforms.sampleDistance;
+
+  float2 t = intersectBox(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal);
+  float tStart = max(t.x, 0.0);
+  if (tStart >= t.y) discard_fragment();
+
+  float3 entryPoint = cameraPos + rayDir * tStart;
+  float3 exitPoint = cameraPos + rayDir * t.y;
+  float totalDist = length(exitPoint - entryPoint);
+
+  if (volumeUniforms.useClipping > 0.5) {
+    int numClipPlanes = int(volumeUniforms.numClippingPlanes);
+    float4 planeOrigins[8] = { volumeUniforms.clippingPlane0Origin, volumeUniforms.clippingPlane1Origin, volumeUniforms.clippingPlane2Origin, volumeUniforms.clippingPlane3Origin, volumeUniforms.clippingPlane4Origin, volumeUniforms.clippingPlane5Origin, volumeUniforms.clippingPlane6Origin, volumeUniforms.clippingPlane7Origin };
+    float4 planeNormals[8] = { volumeUniforms.clippingPlane0Normal, volumeUniforms.clippingPlane1Normal, volumeUniforms.clippingPlane2Normal, volumeUniforms.clippingPlane3Normal, volumeUniforms.clippingPlane4Normal, volumeUniforms.clippingPlane5Normal, volumeUniforms.clippingPlane6Normal, volumeUniforms.clippingPlane7Normal };
+
+    for (int cp = 0; cp < numClipPlanes; cp++) {
+      float3 planeOrigin = planeOrigins[cp].xyz;
+      float3 planeNormal = normalize(planeNormals[cp].xyz);
+      float startDistance = dot(planeNormal, planeOrigin - entryPoint);
+      float stopDistance = dot(planeNormal, planeOrigin - exitPoint);
+
+      if (startDistance > 0.0 && stopDistance > 0.0) discard_fragment();
+      float rayDotNormal = dot(rayDir, planeNormal);
+
+      if (rayDotNormal > 0.0 && startDistance > 0.0) entryPoint += (startDistance / rayDotNormal) * rayDir;
+      if (rayDotNormal <= 0.0 && stopDistance > 0.0) exitPoint += (stopDistance / rayDotNormal) * rayDir;
+    }
+    totalDist = length(exitPoint - entryPoint);
+    if (totalDist < 1e-6) discard_fragment();
+  }
+
+  float tTerminateMax = 1e30;
+  if (volumeUniforms.useDepthTexture > 0.5) {
+    float depthSample = depthTexture.sample(sNearest, in.position.xy / volumeUniforms.viewportSize).r;
+    if (depthSample < 1.0) {
+      float2 ndcXY = (in.position.xy / volumeUniforms.viewportSize) * 2.0 - 1.0;
+      float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
+      worldTermination.xyz /= worldTermination.w;
+      float3 terminationLocal = (worldTermination.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+      tTerminateMax = dot(terminationLocal - entryPoint, rayDir);
+      if (tTerminateMax < 0.0) tTerminateMax = 1e30;
+    }
+  }
+
+  // --- LOCAL CACHE WARM-UP ---
+  const bool doShading = fc_shading && (volumeUniforms.useGradientShading > 0.5);
+  const bool doGradOp = fc_gradientOpacity && (volumeUniforms.useGradientOpacity > 0.5);
+  const bool doCropping = volumeUniforms.useCropping > 0.5;
+  const bool doMask = fc_mask && (volumeUniforms.useMask > 0.5);
+
+  half scalarScale = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
+  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+
+  half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
+
+  float3 texSizeGlobal = max(texMaxGlobal - texMinGlobal, 1e-6);
+  float3 dt = max(volumeUniforms.gradientStep, 1e-8);
+  half3 gradScale = half3(1.0 / (dt * texSizeGlobal));
+
+  half3 viewDirHalf  = half3(normalize(entryPoint - cameraPos));
+  half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection));
+  half3 ambientMat   = half3(volumeUniforms.ambientColor.rgb);
+  half3 diffuseMat   = half3(volumeUniforms.diffuseColor.rgb);
+  half3 specularMat  = half3(volumeUniforms.specularColor.rgb);
+  half shininessMat  = half(volumeUniforms.shininess);
+
+  float maskScale = volumeUniforms.maskScale;
+  float maskBias  = volumeUniforms.maskBias;
+  float numLabels = volumeUniforms.labelMapNumLabels;
+
+  float3 cropMin = float3(volumeUniforms.croppingPlanes.x, volumeUniforms.croppingPlanes.z, volumeUniforms.croppingPlanes2.x);
+  float3 cropMax = float3(volumeUniforms.croppingPlanes.y, volumeUniforms.croppingPlanes.w, volumeUniforms.croppingPlanes2.y);
+
+  uint cropBitmask = 0;
+  if (doCropping) {
+    float4 cropF[8] = { volumeUniforms.croppingFlagsRow0, volumeUniforms.croppingFlagsRow1, volumeUniforms.croppingFlagsRow2, volumeUniforms.croppingFlagsRow3, volumeUniforms.croppingFlagsRow4, volumeUniforms.croppingFlagsRow5, volumeUniforms.croppingFlagsRow6, volumeUniforms.croppingFlagsRow7 };
+    for (int j = 0; j < 32; j++) {
+      if (cropF[j / 4][j % 4] > 0.0) cropBitmask |= (1u << j);
+    }
+  }
+
+  // --- SOFTWARE PIPELINING INITIALIZATION ---
+  float jitter = volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) * stepSize : 0.0;
+  float3 stepVec = rayDir * stepSize;
+  float3 currentPoint = entryPoint + (rayDir * jitter);
+  float currentT = jitter;
+
+  int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
+
+  half3 accumulatedColor = half3(0.0);
+  half accumulatedOpacity = 0.0;
+
+  // PREFETCH the very first samples before the loop starts
+  float3 texLocalPos0 = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
+  float3 evalPoint0 = texLocalPos0;
+  float prefetchScalar = volumeTexture.sample(sVolume, evalPoint0, level(0)).r;
+  float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint0, level(0)).r : 0.0;
+  bool prefetchValid = true;
+  int3  curCell     = int3(-1);
+  bool  curCellEmpty = false;
+  float3 mmDimF     = b.minMaxInfo.yzw;
+
+  // --- THE RAYMARCHING LOOP ---
+  for (int i = 0; i < maxSteps; i++) {
+    if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
+
+    // 0. MIN-MAX ACCELERATION
+    if (fc_minmax &&
+        b.minMaxInfo.x > 0.5 &&
+        b.minMaxInfo.y > 0.5 &&
+        b.minMaxInfo.z > 0.5 &&
+        b.minMaxInfo.w > 0.5) {
+      float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
+      float3 mmPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+      int3 newCell = min(int3(mmPos * mmDimF), int3(mmDimF) - 1);
+      if (any(newCell != curCell)) {
+        curCell      = newCell;
+        curCellEmpty = minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5;
+      }
+
+      if (curCellEmpty) {
+        float3 cellCoord = mmPos * mmDimF;
+        float3 fractCoord = fract(cellCoord);
+
+        float3 distToEdge;
+        distToEdge.x = rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x;
+        distToEdge.y = rayDir.y > 0.0 ? (1.0 - fractCoord.y) : fractCoord.y;
+        distToEdge.z = rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
+        distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
+
+        float3 rayDirTexLocal = rayDir / max(texMaxGlobal - texMinGlobal, 1e-6);
+        float3 tToEdge;
+        tToEdge.x = abs(rayDirTexLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirTexLocal.x * mmDimF.x) : 1e30;
+        tToEdge.y = abs(rayDirTexLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirTexLocal.y * mmDimF.y) : 1e30;
+        tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
+
+        float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
+        exactSkip += 1e-4;
+        float skipDist = ceil(exactSkip / stepSize) * stepSize;
+        skipDist = max(stepSize, skipDist);
+
+        currentPoint += rayDir * skipDist;
+        currentT += skipDist;
+
+        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y - tStart) {
+          break;
+        }
+
+        prefetchValid = false;
+        curCell = int3(-1);
+        continue;
+      }
+    }
+
+    // 1. Claim prefetched data
+    float3 texLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
+    float3 evalPoint = texLocalPos;
+    bool needsFetch = !prefetchValid;
+    float rawScalar = needsFetch
+      ? volumeTexture.sample(sVolume, evalPoint, level(0)).r
+      : prefetchScalar;
+    float rawMask = (doMask && needsFetch)
+      ? maskTexture.sample(sNearest, evalPoint, level(0)).r
+      : prefetchMask;
+
+    // 2. Advance ray trackers
+    float3 lastPoint = currentPoint;
+    currentPoint += stepVec;
+    currentT += stepSize;
+
+    // 3. LAUNCH PREFETCH FOR NEXT ITERATION
+    if (i + 1 < maxSteps) {
+      float3 nextTexLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
+      float3 nextEvalPoint = nextTexLocalPos;
+      prefetchScalar = volumeTexture.sample(sVolume, nextEvalPoint, level(0)).r;
+      if (doMask) {
+        prefetchMask = maskTexture.sample(sNearest, nextEvalPoint, level(0)).r;
+      }
+      prefetchValid = true;
+    }
+
+    // 4. MATH & EVALUATION
+    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, lastPoint))) == 0u)) {
+      continue;
+    }
+
+    half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
+
+    half4 colorOpacity;
+    half maskLabel = 0.0h;
+
+    if (doMask) {
+      float maskVal = rawMask * maskScale + maskBias;
+      if (numLabels > 0.0) {
+        float label = floor(maskVal + 0.5);
+        if (label > 0.0) {
+          label = clamp(label, 1.0, numLabels - 1.0);
+          float labelY = (label + 0.5) / numLabels;
+          colorOpacity = half4(labelMapTransferTexture.sample(sNearest, float2(float(scalarNorm), labelY), level(0)));
+        } else {
+          colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
+        }
+      } else {
+        colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
+      }
+    } else {
+      colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
+    }
+
+    half sampleOpacity = colorOpacity.a;
+
+    if (sampleOpacity > 0.001h) {
+      half3 sampleColor = colorOpacity.rgb;
+      half weight = 1.0h - accumulatedOpacity;
+
+      if (sampleOpacity < 0.01h) {
+        accumulatedColor += weight * sampleColor * sampleOpacity;
+        accumulatedOpacity += weight * sampleOpacity;
+      } else {
+      if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
+
+        half3 normal;
+        half gradMag;
+
+        if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
+          half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
+          normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
+          gradMag = nrmSample.w;
+        } else {
+          half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
+          normal = grad.xyz;
+          gradMag = grad.w;
+        }
+
+        sampleColor = computePhongLightingVolumeFast(sampleColor, normal, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
+
+        if (doGradOp) {
+          sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(gradMag), 0.5), level(0)).r);
+        }
+      } else if (doShading) {
+        sampleColor = ambientMat * sampleColor;
+      }
+
+      accumulatedColor += weight * sampleColor * sampleOpacity;
+      accumulatedOpacity += weight * sampleOpacity;
+      }
+    }
+
+    // Early Ray Termination (ERT)
+    if (accumulatedOpacity >= 0.99h) {
+      accumulatedColor /= max(accumulatedOpacity, 1e-4h);
+      accumulatedOpacity = 1.0h;
+      break;
+    }
+    if (currentT >= tTerminateMax) {
+      break;
+    }
+  }
+
+  output.color = float4(float3(accumulatedColor), float(accumulatedOpacity));
+  return output;
+}
+
 // Inter-block accumulation shader: reads previous blocks' accumulated color/opacity
 // via Metal framebuffer fetch ([[color(0)]]), enabling global early ray termination
 // across block boundaries. Used when rendering partitioned volumes front-to-back.
