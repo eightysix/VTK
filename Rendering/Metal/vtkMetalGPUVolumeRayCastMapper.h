@@ -206,12 +206,14 @@ private:
   // When true, UpdateMinMaxTexture uses GPU compute kernels instead of CPU
   // vtkSMPTools to build the R8Unorm occupancy texture.
   bool UseGPUMinMax = true;
+  bool HasMinMaxMip = false;
 
   // Compute pipelines for GPU min-max generation.
   void* MinMaxComputePipeline = nullptr;  // id<MTLComputePipelineState> — volume_compute_minmax
   void* DilateComputePipeline = nullptr;  // id<MTLComputePipelineState> — volume_dilate_minmax
+  void* MipComputePipeline = nullptr;     // id<MTLComputePipelineState> — volume_minmax_mip
 
-  // Ensure the two compute pipelines exist.
+  // Ensure the minmax compute pipelines exist.
   bool EnsureMinMaxComputePipelines(void* mtlDevice);
 
   // Run GPU min/max generation after volume texture is uploaded.
@@ -225,6 +227,9 @@ private:
 
   // Phase 1B: Pipeline state cache (keyed by format, sample count, feature mask)
   std::unordered_map<VolumePipelineKey, void*, VolumePipelineKeyHash> PipelineCache;
+
+  // Frame counter for jitter temporal offset (interleaved gradient noise)
+  uint64_t FrameCounter = 0;
 
   // Adaptive sample distance
   double ReductionFactor = 1.0;
