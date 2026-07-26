@@ -6491,6 +6491,13 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // Mask / label map
   this->SetMaskUniforms(&uniforms, vol);
 
+  // Capture the scene depth texture for early ray termination.
+  // The depth buffer is written by opaque geometry in the earlier render pass.
+  // When MSAA is active, the depth texture is multisampled and cannot be sampled
+  // directly by a shader — disable depth occlusion in that case.
+  int sampleCount = metalRenderWindow ? metalRenderWindow->GetEffectiveSampleCount() : 1;
+  this->DepthTextureOcclusion = (sampleCount > 1) ? nullptr : metalRenderWindow->GetDepthTexture();
+
   // Depth texture flag — set to 1 when we have a real scene depth texture
   uniforms.UseDepthTexture = this->DepthTextureOcclusion ? 1.0f : 0.0f;
 
@@ -6608,13 +6615,6 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       memset(uniforms.InverseViewProjection, 0, sizeof(uniforms.InverseViewProjection));
     }
   }
-
-  // Capture the scene depth texture for early ray termination.
-  // The depth buffer is written by opaque geometry in the earlier render pass.
-  // When MSAA is active, the depth texture is multisampled and cannot be sampled
-  // directly by a shader — disable depth occlusion in that case.
-  int sampleCount = metalRenderWindow ? metalRenderWindow->GetEffectiveSampleCount() : 1;
-  this->DepthTextureOcclusion = (sampleCount > 1) ? nullptr : metalRenderWindow->GetDepthTexture();
 
   // Wait for the uniform buffer slot for this frame to be free
   dispatch_semaphore_wait((dispatch_semaphore_t)this->FrameSemaphore, DISPATCH_TIME_FOREVER);
