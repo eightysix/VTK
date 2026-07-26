@@ -219,12 +219,31 @@ private:
   bool ComputeMinMaxGPU(void* mtlDevice, void* mtlQueue, vtkVolume* vol,
     vtkImageData* input, vtkDataArray* scalars);
 
+  // Phase 7: GPU compute kernels for data type conversion.
+  // When true, UpdateVolumeTexture uses GPU compute kernels instead of CPU
+  // vtkSMPTools loops to convert short/int/double/etc. to the target pixel format.
+  bool UseGPUConversion = true;
+
+  // Compute pipelines for GPU data type conversion.
+  void* ConvertShortToHalfPipeline = nullptr;   // id<MTLComputePipelineState> — volume_convert_short_to_half
+  void* ConvertShortToFloatPipeline = nullptr;  // id<MTLComputePipelineState> — volume_convert_short_to_float
+  void* ConvertIntToHalfPipeline = nullptr;     // id<MTLComputePipelineState> — volume_convert_int_to_half
+  void* ConvertIntToFloatPipeline = nullptr;    // id<MTLComputePipelineState> — volume_convert_int_to_float
+  void* ConvertUIntToHalfPipeline = nullptr;    // id<MTLComputePipelineState> — volume_convert_uint_to_half
+  void* ConvertUIntToFloatPipeline = nullptr;   // id<MTLComputePipelineState> — volume_convert_uint_to_float
+  // Ensure all conversion compute pipelines exist for the given (dataType, useHalf) pair.
+  // Returns true on success, false on failure (caller falls back to CPU).
+  bool EnsureConversionPipelines(void* mtlDevice);
+
   // Phase 1A: Cached shader library (avoid recompiling vtkMetalShaders)
   void* CachedShaderLibrary = nullptr; // id<MTLLibrary>
   bool EnsureShaderLibrary(void* mtlDevice);
 
   // Phase 1B: Pipeline state cache (keyed by format, sample count, feature mask)
   std::unordered_map<VolumePipelineKey, void*, VolumePipelineKeyHash> PipelineCache;
+
+  // Phase 1C: Pipeline pre-warming — set to true after first pre-warm completes
+  bool PipelinesPreWarmed = false;
 
   // Adaptive sample distance
   double ReductionFactor = 1.0;

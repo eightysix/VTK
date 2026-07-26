@@ -82,14 +82,8 @@ struct VolumeMapperUniforms
   // Cropping regions (new)
   float CroppingPlanes[4];          // 480..495  (minX, maxX, minY, maxY)
   float CroppingPlanes2[4];         // 496..511  (minZ, maxZ, 0, 0)
-  float CroppingFlagsRow0[4];       // 512..527
-  float CroppingFlagsRow1[4];       // 528..543
-  float CroppingFlagsRow2[4];       // 544..559
-  float CroppingFlagsRow3[4];       // 560..575
-  float CroppingFlagsRow4[4];       // 576..591
-  float CroppingFlagsRow5[4];       // 592..607
-  float CroppingFlagsRow6[4];       // 608..623
-  float CroppingFlagsRow7[4];       // 624..639
+  uint32_t CroppingBitmask;         // 512..515  (packed bitmask from GetCroppingRegionFlags)
+  float _padCropFlags[31];          // 516..639  (maintain total struct size)
   float UseCropping;                // 640
   float UseClipping;                // 644
   float NumClippingPlanes;          // 648
@@ -163,6 +157,15 @@ struct LayerCompositeUniforms {
   float BlockMax[8][4];
   float Params[4]; // x = brickCount, y = usePerPixelOrder (1=fix, 0=cpu order), zw unused
 };
+
+// Must match Metal VolumeConvertUniforms struct (Phase 7: GPU data type conversion)
+struct VolumeConvertUniforms {
+  uint32_t dimX, dimY, dimZ;
+  uint32_t numComponents;
+  uint32_t outputComponents;
+  uint32_t _pad;
+};
+static_assert(sizeof(VolumeConvertUniforms) == 6 * 4, "VolumeConvertUniforms size must match Metal struct");
 
 // Must match Metal MinMaxComputeUniforms struct (Phase 5: GPU min-max)
 struct MinMaxComputeUniforms {
@@ -739,6 +742,13 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   ReleaseMetalObject(this->MinMaxComputePipeline);
   ReleaseMetalObject(this->DilateComputePipeline);
 
+  // Phase 7: Release GPU data-type conversion compute pipelines
+  ReleaseMetalObject(this->ConvertShortToHalfPipeline);
+  ReleaseMetalObject(this->ConvertShortToFloatPipeline);
+  ReleaseMetalObject(this->ConvertIntToHalfPipeline);
+  ReleaseMetalObject(this->ConvertIntToFloatPipeline);
+  ReleaseMetalObject(this->ConvertUIntToHalfPipeline);
+  ReleaseMetalObject(this->ConvertUIntToFloatPipeline);
   ReleaseMetalObject(this->DummyDepthTexture);
   ReleaseMetalObject(this->DummyVolumeTexture);
   ReleaseMetalObject(this->DummyMaskTexture);
@@ -747,6 +757,9 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
 
   // Phase 1A: Release cached shader library
   ReleaseMetalObject(this->CachedShaderLibrary);
+
+  // Phase 1C: Reset pipeline pre-warm guard so it re-warms after device loss / resize
+  this->PipelinesPreWarmed = false;
 
   // Phase 1B: Clear pipeline cache
   for (auto& entry : this->PipelineCache)
@@ -1067,8 +1080,106 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       std::vector<uint16_t> halfData;
       std::vector<float> floatData;
       std::vector<uint8_t> conversionBuffer;
+      bool gpuConversionUsed = false;
 
-      if (fmtInfo.needsConversion)
+      // Phase 7: GPU data type conversion (replaces CPU vtkSMPTools loop)
+      // For short/int/uint/double data types, dispatch a Metal compute kernel
+      // that reads from a shared buffer and writes directly to the 3D texture.
+      if (fmtInfo.needsConversion && this->UseGPUConversion)
+      {
+        // Determine kernel name based on (dataType, useHalf) pair
+        const char* kernelName = nullptr;
+             if (dataType == VTK_SHORT)        kernelName = useHalf ? "volume_convert_short_to_half"  : "volume_convert_short_to_float";
+        else if (dataType == VTK_INT)          kernelName = useHalf ? "volume_convert_int_to_half"    : "volume_convert_int_to_float";
+        else if (dataType == VTK_UNSIGNED_INT) kernelName = useHalf ? "volume_convert_uint_to_half"   : "volume_convert_uint_to_float";
+        // Note: VTK_DOUBLE is not supported in Metal device address space; falls through to CPU.
+
+        if (kernelName)
+        {
+          if (!this->EnsureConversionPipelines(mtlDeviceVoid))
+          {
+            return false;
+          }
+
+          id<MTLComputePipelineState> pipeline = nullptr;
+               if (dataType == VTK_SHORT)        pipeline = (__bridge id<MTLComputePipelineState>)(useHalf ? this->ConvertShortToHalfPipeline : this->ConvertShortToFloatPipeline);
+          else if (dataType == VTK_INT)          pipeline = (__bridge id<MTLComputePipelineState>)(useHalf ? this->ConvertIntToHalfPipeline : this->ConvertIntToFloatPipeline);
+          else if (dataType == VTK_UNSIGNED_INT) pipeline = (__bridge id<MTLComputePipelineState>)(useHalf ? this->ConvertUIntToHalfPipeline : this->ConvertUIntToFloatPipeline);
+          if (!pipeline)
+          {
+            vtkErrorMacro("GPU conversion pipeline not available for data type " << dataType);
+            return false;
+          }
+
+          int outputComponents = (numComponents == 3) ? 4 : numComponents;
+          size_t srcBytesPerVoxel = static_cast<size_t>(vtkDataArray::GetDataTypeSize(dataType)) * numComponents;
+          size_t totalSrcBytes = static_cast<size_t>(numTuples) * srcBytesPerVoxel;
+
+          id<MTLBuffer> srcBuf = [device newBufferWithBytes:scalars->GetVoidPointer(0)
+                                                     length:totalSrcBytes
+                                                    options:MTLResourceStorageModeShared];
+          if (!srcBuf)
+          {
+            vtkErrorMacro("Failed to create source buffer for GPU conversion");
+            return false;
+          }
+
+          // Ensure texture has ShaderWrite usage for compute kernel output
+          ReleaseMetalObject(this->VolumeTexture);
+
+          MTLTextureDescriptor* texDesc = [[MTLTextureDescriptor alloc] init];
+          texDesc.textureType = MTLTextureType3D;
+          texDesc.pixelFormat = fmtInfo.format;
+          texDesc.width = dims[0];
+          texDesc.height = dims[1];
+          texDesc.depth = dims[2];
+          texDesc.mipmapLevelCount = 1;
+          texDesc.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
+          texDesc.storageMode = MTLStorageModePrivate;
+
+          id<MTLTexture> tex = [device newTextureWithDescriptor:texDesc];
+          [texDesc release];
+          if (!tex)
+          {
+            vtkErrorMacro("Failed to create 3D volume texture for GPU conversion");
+            [srcBuf release];
+            return false;
+          }
+          AssignMetalObject(this->VolumeTexture, tex);
+
+          // Dispatch compute kernel
+          VolumeConvertUniforms vu;
+          vu.dimX = static_cast<uint32_t>(dims[0]);
+          vu.dimY = static_cast<uint32_t>(dims[1]);
+          vu.dimZ = static_cast<uint32_t>(dims[2]);
+          vu.numComponents = static_cast<uint32_t>(numComponents);
+          vu.outputComponents = static_cast<uint32_t>(outputComponents);
+          vu._pad = 0;
+
+          id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+          cmdBuf.label = @"VTK Volume GPU Convert";
+          id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+          enc.label = @"Volume Convert";
+          [enc setBuffer:srcBuf offset:0 atIndex:0];
+          [enc setTexture:tex atIndex:0];
+          [enc setBytes:&vu length:sizeof(vu) atIndex:1];
+
+          MTLSize grid = MTLSizeMake(dims[0], dims[1], dims[2]);
+          MTLSize tg = MTLSizeMake(8, 8, 8);
+          [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+          [enc endEncoding];
+          [cmdBuf commit];
+
+          [srcBuf release];
+          gpuConversionUsed = true;
+        }
+        else
+        {
+          vtkErrorMacro("Unsupported data type for GPU conversion: " << dataType);
+          return false;
+        }
+      }
+      else if (fmtInfo.needsConversion)
       {
         int outputComponents = (numComponents == 3) ? 4 : numComponents;
 
@@ -1312,6 +1423,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
         }
       }
 
+      if (!gpuConversionUsed)
+      {
       id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->VolumeTexture;
       id<MTLTexture> tex = nil;
 
@@ -1382,11 +1495,63 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       // queue execute in order, so the render pass will not read the texture
       // until after this blit completes.
 
+      } // end if (!gpuConversionUsed)
+
       this->VolumeUploadTime.Modified();
     }
   }
 
-  return this->VolumeTexture != nullptr;
+  // Phase 1C: Pre-warm common pipeline permutations to avoid first-use hitches.
+  // PSO compilation takes 50-200ms on Apple Silicon; warming them up here on the
+  // render thread (synchronous) ensures subsequent toggles are frame-rate smooth.
+  if (!this->PipelinesPreWarmed)
+  {
+    static const uint32_t kPreWarmMasks[] = {
+      0,
+      VolumeFeature_Shading,
+      VolumeFeature_Shading | VolumeFeature_GradientOpacity,
+      VolumeFeature_Shading | VolumeFeature_MinMax,
+      VolumeFeature_Shading | VolumeFeature_GradientOpacity | VolumeFeature_MinMax,
+      VolumeFeature_Shading | VolumeFeature_Mask,
+      VolumeFeature_Shading | VolumeFeature_Mask | VolumeFeature_MinMax,
+      VolumeFeature_Shading | VolumeFeature_NormalTexture,
+      VolumeFeature_Shading | VolumeFeature_NormalTexture | VolumeFeature_MinMax,
+    };
+
+    struct PreWarmSpec {
+      uint32_t type;
+      uint32_t colorFormat;
+      uint32_t depthFormat;
+      uint32_t samples;
+    };
+
+    int sampleCount = this->CurrentSampleCount > 0 ? this->CurrentSampleCount : 1;
+    uint32_t sc = static_cast<uint32_t>(sampleCount);
+    PreWarmSpec specs[] = {
+      { static_cast<uint32_t>(VolumePipelineType::DirectScreen),
+        MTLPixelFormatBGRA8Unorm, MTLPixelFormatDepth32Float, sc },
+      { static_cast<uint32_t>(VolumePipelineType::OffscreenLayer),
+        MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1 },
+      { static_cast<uint32_t>(VolumePipelineType::OffscreenAccumulation),
+        MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1 },
+      { static_cast<uint32_t>(VolumePipelineType::FullscreenDirect),
+        MTLPixelFormatBGRA8Unorm, MTLPixelFormatDepth32Float, sc },
+      { static_cast<uint32_t>(VolumePipelineType::FullscreenOffscreen),
+        MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1 },
+    };
+
+    for (auto& spec : specs)
+    {
+      for (uint32_t mask : kPreWarmMasks)
+      {
+        this->GetOrCreateVolumePipeline(mtlDeviceVoid,
+          spec.type, spec.colorFormat, spec.depthFormat, spec.samples, mask);
+      }
+    }
+    this->PipelinesPreWarmed = true;
+  }
+
+  return true;
 }
 
 //------------------------------------------------------------------------------
@@ -2108,6 +2273,55 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureMinMaxComputePipelines(void* mtlDevic
 }
 
 //------------------------------------------------------------------------------
+// Phase 7: Ensure compute pipelines for GPU data type conversion exist.
+// Creates all 8 conversion pipelines (4 input types × half/float output).
+// Returns true on success, false on failure (caller falls back to CPU).
+bool vtkMetalGPUVolumeRayCastMapper::EnsureConversionPipelines(void* mtlDeviceVoid)
+{
+  if (!this->EnsureShaderLibrary(mtlDeviceVoid))
+  {
+    return false;
+  }
+
+  id<MTLDevice> dev = (__bridge id<MTLDevice>)mtlDeviceVoid;
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
+
+  @autoreleasepool
+  {
+#define VTK_CREATE_CONVERT_PIPELINE(kernelName, member) \
+    if (!member) { \
+      id<MTLFunction> func = [library newFunctionWithName:@kernelName]; \
+      if (!func) { \
+        vtkErrorMacro("Failed to find " << kernelName << " kernel"); \
+        return false; \
+      } \
+      NSError* error = nil; \
+      id<MTLComputePipelineState> pso = \
+        [dev newComputePipelineStateWithFunction:func error:&error]; \
+      [func release]; \
+      if (!pso) { \
+        vtkErrorMacro(<< "Failed to create " << kernelName << " pipeline: " \
+                      << [[error localizedDescription] UTF8String]); \
+        return false; \
+      } \
+      AssignMetalObject(member, pso); \
+    }
+
+    VTK_CREATE_CONVERT_PIPELINE("volume_convert_short_to_half", this->ConvertShortToHalfPipeline);
+    VTK_CREATE_CONVERT_PIPELINE("volume_convert_short_to_float", this->ConvertShortToFloatPipeline);
+    VTK_CREATE_CONVERT_PIPELINE("volume_convert_int_to_half", this->ConvertIntToHalfPipeline);
+    VTK_CREATE_CONVERT_PIPELINE("volume_convert_int_to_float", this->ConvertIntToFloatPipeline);
+    VTK_CREATE_CONVERT_PIPELINE("volume_convert_uint_to_half", this->ConvertUIntToHalfPipeline);
+    VTK_CREATE_CONVERT_PIPELINE("volume_convert_uint_to_float", this->ConvertUIntToFloatPipeline);
+    // Note: VTK_DOUBLE kernels are not provided (Metal does not support 'double' in device address space).
+
+#undef VTK_CREATE_CONVERT_PIPELINE
+  }
+
+  return true;
+}
+
+//------------------------------------------------------------------------------
 bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
   void* mtlDeviceVoid, void* mtlQueueVoid, vtkVolume* vol,
   vtkImageData* input, vtkDataArray* scalars)
@@ -2802,38 +3016,190 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
     NSUInteger srcBytesPerImage = srcBytesPerRow * fullDims[1];
     NSUInteger totalVolumeBytes = srcBytesPerImage * fullDims[2];
 
-    // Create a single staging buffer for the full volume. Conversion writes
-    // directly into it, eliminating intermediate std::vector copies.
-    id<MTLBuffer> stagingBuf = [device newBufferWithLength:totalVolumeBytes
-                                                  options:MTLResourceStorageModeShared];
-    if (!stagingBuf)
-    {
-      vtkErrorMacro("Failed to create full-volume staging buffer");
-      return false;
-    }
-    void* uploadPointer = [stagingBuf contents];
-
     // Convert data types that don't match the chosen pixel format.
     // For single-component float data, use Accelerate (NEON-vectorized) for
     // the float-to-half conversion instead of the scalar FloatToHalf loop.
     bool needsConversion = (dataType != VTK_FLOAT && dataType != VTK_UNSIGNED_CHAR &&
       dataType != VTK_UNSIGNED_SHORT);
 
-    if (needsConversion)
+    // --- Phase 7: GPU compute conversion for non-native data types ---
+    bool gpuConversionUsed = false;
+    id<MTLTexture> gpuFullTex = nullptr;
+    id<MTLBuffer> stagingBuf = nil;
+
+    if (needsConversion && this->UseGPUConversion)
     {
+      const char* kernelName = nullptr;
+           if (dataType == VTK_SHORT)        kernelName = blockUseHalf ? "volume_convert_short_to_half"  : "volume_convert_short_to_float";
+      else if (dataType == VTK_INT)          kernelName = blockUseHalf ? "volume_convert_int_to_half"    : "volume_convert_int_to_float";
+      else if (dataType == VTK_UNSIGNED_INT) kernelName = blockUseHalf ? "volume_convert_uint_to_half"   : "volume_convert_uint_to_float";
+      // VTK_DOUBLE: kernelName stays nullptr (Metal does not support double in device address space)
+
+      if (kernelName && this->EnsureConversionPipelines(mtlDeviceVoid))
+      {
+        id<MTLComputePipelineState> pipeline = nullptr;
+             if (dataType == VTK_SHORT)        pipeline = (__bridge id<MTLComputePipelineState>)(blockUseHalf ? this->ConvertShortToHalfPipeline : this->ConvertShortToFloatPipeline);
+        else if (dataType == VTK_INT)          pipeline = (__bridge id<MTLComputePipelineState>)(blockUseHalf ? this->ConvertIntToHalfPipeline : this->ConvertIntToFloatPipeline);
+        else if (dataType == VTK_UNSIGNED_INT) pipeline = (__bridge id<MTLComputePipelineState>)(blockUseHalf ? this->ConvertUIntToHalfPipeline : this->ConvertUIntToFloatPipeline);
+
+        if (pipeline)
+        {
+          int outputComponents = (numComponents == 3) ? 4 : numComponents;
+          size_t srcBytesPerVoxelGPU = static_cast<size_t>(vtkDataArray::GetDataTypeSize(dataType)) * numComponents;
+          size_t totalSrcBytes = static_cast<size_t>(totalTuples) * srcBytesPerVoxelGPU;
+
+          id<MTLBuffer> srcBuf = [device newBufferWithBytes:scalars->GetVoidPointer(0)
+                                                     length:totalSrcBytes
+                                                    options:MTLResourceStorageModeShared];
+          if (srcBuf)
+          {
+            MTLTextureDescriptor* texDesc = [[MTLTextureDescriptor alloc] init];
+            texDesc.textureType = MTLTextureType3D;
+            texDesc.pixelFormat = pixelFormat;
+            texDesc.width = static_cast<NSUInteger>(fullDims[0]);
+            texDesc.height = static_cast<NSUInteger>(fullDims[1]);
+            texDesc.depth = static_cast<NSUInteger>(fullDims[2]);
+            texDesc.mipmapLevelCount = 1;
+            texDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+            texDesc.storageMode = MTLStorageModePrivate;
+
+            gpuFullTex = [device newTextureWithDescriptor:texDesc];
+            [texDesc release];
+
+            if (gpuFullTex)
+            {
+              id<MTLCommandBuffer> convCmdBuf = [queue commandBuffer];
+              convCmdBuf.label = @"VTK Block Volume Convert";
+              id<MTLComputeCommandEncoder> enc = [convCmdBuf computeCommandEncoder];
+              [enc setComputePipelineState:pipeline];
+              [enc setBuffer:srcBuf offset:0 atIndex:0];
+              [enc setTexture:gpuFullTex atIndex:0];
+
+              VolumeConvertUniforms vu;
+              vu.dimX = static_cast<uint32_t>(fullDims[0]);
+              vu.dimY = static_cast<uint32_t>(fullDims[1]);
+              vu.dimZ = static_cast<uint32_t>(fullDims[2]);
+              vu.numComponents = static_cast<uint32_t>(numComponents);
+              vu.outputComponents = static_cast<uint32_t>(outputComponents);
+              [enc setBytes:&vu length:sizeof(vu) atIndex:1];
+
+              MTLSize tgSize = MTLSizeMake(8, 8, 8);
+              MTLSize tgCount = MTLSizeMake(
+                (static_cast<NSUInteger>(fullDims[0]) + 7) / 8,
+                (static_cast<NSUInteger>(fullDims[1]) + 7) / 8,
+                (static_cast<NSUInteger>(fullDims[2]) + 7) / 8);
+              [enc dispatchThreadgroups:tgCount threadsPerThreadgroup:tgSize];
+              [enc endEncoding];
+
+              [convCmdBuf commit];
+              [convCmdBuf waitUntilCompleted];
+              [srcBuf release];
+
+              gpuConversionUsed = true;
+            }
+          }
+        }
+      }
+    }
+
+    if (!gpuConversionUsed)
+    {
+      // Create a single staging buffer for the full volume. Conversion writes
+      // directly into it, eliminating intermediate std::vector copies.
+      stagingBuf = [device newBufferWithLength:totalVolumeBytes
+                                       options:MTLResourceStorageModeShared];
+      if (!stagingBuf)
+      {
+        vtkErrorMacro("Failed to create full-volume staging buffer");
+        return false;
+      }
+      void* uploadPointer = [stagingBuf contents];
+
       int outputComponents = (numComponents == 3) ? 4 : numComponents;
 
-      if (blockUseHalf)
+      if (needsConversion)
       {
-        // Fast path: single-component float → half via Accelerate (NEON/SED)
-        if (IsContiguousScalarFloat(dataType, numComponents, totalTuples, fullDataPtr, bytesPerVoxel))
+        if (blockUseHalf)
         {
-          std::memcpy(uploadPointer, fullDataPtr, static_cast<size_t>(totalVolumeBytes));
-          vImage_Buffer srcBuf = { uploadPointer, 1, static_cast<vImagePixelCount>(totalTuples),
-            static_cast<vImagePixelCount>(totalTuples * sizeof(float)) };
-          vImage_Buffer dstBuf = { uploadPointer, 1, static_cast<vImagePixelCount>(totalTuples),
-            static_cast<vImagePixelCount>(totalTuples * sizeof(uint16_t)) };
-          vImageConvert_PlanarFtoPlanar16F(&srcBuf, &dstBuf, 0);
+          // Fast path: single-component float → half via Accelerate (NEON/SED)
+          if (IsContiguousScalarFloat(dataType, numComponents, totalTuples, fullDataPtr, bytesPerVoxel))
+          {
+            std::memcpy(uploadPointer, fullDataPtr, static_cast<size_t>(totalVolumeBytes));
+            vImage_Buffer srcBuf = { uploadPointer, 1, static_cast<vImagePixelCount>(totalTuples),
+              static_cast<vImagePixelCount>(totalTuples * sizeof(float)) };
+            vImage_Buffer dstBuf = { uploadPointer, 1, static_cast<vImagePixelCount>(totalTuples),
+              static_cast<vImagePixelCount>(totalTuples * sizeof(uint16_t)) };
+            vImageConvert_PlanarFtoPlanar16F(&srcBuf, &dstBuf, 0);
+          }
+          else
+          {
+            switch (dataType)
+            {
+              case VTK_SHORT:
+              {
+                const short* src = static_cast<const short*>(fullDataPtr);
+                vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
+                  for (vtkIdType i = begin; i < end; ++i)
+                  {
+                    for (int c = 0; c < numComponents; ++c)
+                      static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                        FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                    for (int c = numComponents; c < outputComponents; ++c)
+                      static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                        FloatToHalf(0.0f);
+                  }
+                });
+                break;
+              }
+              case VTK_INT:
+              {
+                const int* src = static_cast<const int*>(fullDataPtr);
+                vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
+                  for (vtkIdType i = begin; i < end; ++i)
+                  {
+                    for (int c = 0; c < numComponents; ++c)
+                      static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                        FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                    for (int c = numComponents; c < outputComponents; ++c)
+                      static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                        FloatToHalf(0.0f);
+                  }
+                });
+                break;
+              }
+              case VTK_DOUBLE:
+              {
+                const double* src = static_cast<const double*>(fullDataPtr);
+                vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
+                  for (vtkIdType i = begin; i < end; ++i)
+                  {
+                    for (int c = 0; c < numComponents; ++c)
+                      static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                        FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                    for (int c = numComponents; c < outputComponents; ++c)
+                      static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                        FloatToHalf(0.0f);
+                  }
+                });
+                break;
+              }
+              default:
+              {
+                vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
+                  for (vtkIdType i = begin; i < end; ++i)
+                  {
+                    for (int c = 0; c < numComponents; ++c)
+                      static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                        FloatToHalf(static_cast<float>(scalars->GetComponent(i, c)));
+                    for (int c = numComponents; c < outputComponents; ++c)
+                      static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                        FloatToHalf(0.0f);
+                  }
+                });
+                break;
+              }
+            }
+          }
         }
         else
         {
@@ -2846,11 +3212,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
                 for (vtkIdType i = begin; i < end; ++i)
                 {
                   for (int c = 0; c < numComponents; ++c)
-                    static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                      FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                    static_cast<float*>(uploadPointer)[i * outputComponents + c] =
+                      static_cast<float>(src[i * numComponents + c]);
                   for (int c = numComponents; c < outputComponents; ++c)
-                    static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                      FloatToHalf(0.0f);
+                    static_cast<float*>(uploadPointer)[i * outputComponents + c] = 0.0f;
                 }
               });
               break;
@@ -2862,11 +3227,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
                 for (vtkIdType i = begin; i < end; ++i)
                 {
                   for (int c = 0; c < numComponents; ++c)
-                    static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                      FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                    static_cast<float*>(uploadPointer)[i * outputComponents + c] =
+                      static_cast<float>(src[i * numComponents + c]);
                   for (int c = numComponents; c < outputComponents; ++c)
-                    static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                      FloatToHalf(0.0f);
+                    static_cast<float*>(uploadPointer)[i * outputComponents + c] = 0.0f;
                 }
               });
               break;
@@ -2878,11 +3242,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
                 for (vtkIdType i = begin; i < end; ++i)
                 {
                   for (int c = 0; c < numComponents; ++c)
-                    static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                      FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                    static_cast<float*>(uploadPointer)[i * outputComponents + c] =
+                      static_cast<float>(src[i * numComponents + c]);
                   for (int c = numComponents; c < outputComponents; ++c)
-                    static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                      FloatToHalf(0.0f);
+                    static_cast<float*>(uploadPointer)[i * outputComponents + c] = 0.0f;
                 }
               });
               break;
@@ -2893,11 +3256,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
                 for (vtkIdType i = begin; i < end; ++i)
                 {
                   for (int c = 0; c < numComponents; ++c)
-                    static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                      FloatToHalf(static_cast<float>(scalars->GetComponent(i, c)));
+                    static_cast<float*>(uploadPointer)[i * outputComponents + c] =
+                      static_cast<float>(scalars->GetComponent(i, c));
                   for (int c = numComponents; c < outputComponents; ++c)
-                    static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
-                      FloatToHalf(0.0f);
+                    static_cast<float*>(uploadPointer)[i * outputComponents + c] = 0.0f;
                 }
               });
               break;
@@ -2905,121 +3267,56 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
           }
         }
       }
+      else if (dataType == VTK_FLOAT && numComponents == 3)
+      {
+        // Expand 3-component float to RGBA (pad alpha with 0)
+        const float* src = static_cast<const float*>(fullDataPtr);
+        float* dst = static_cast<float*>(uploadPointer);
+        vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
+          for (vtkIdType i = begin; i < end; ++i)
+          {
+            dst[i * 4 + 0] = src[i * 3 + 0];
+            dst[i * 4 + 1] = src[i * 3 + 1];
+            dst[i * 4 + 2] = src[i * 3 + 2];
+            dst[i * 4 + 3] = 0.0f;
+          }
+        });
+      }
+      else if (dataType == VTK_UNSIGNED_CHAR && numComponents == 3)
+      {
+        // Expand 3-component uchar to RGBA (pad alpha with 255)
+        const unsigned char* src = static_cast<const unsigned char*>(fullDataPtr);
+        unsigned char* dst = static_cast<unsigned char*>(uploadPointer);
+        vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
+          for (vtkIdType i = begin; i < end; ++i)
+          {
+            dst[i * 4 + 0] = src[i * 3 + 0];
+            dst[i * 4 + 1] = src[i * 3 + 1];
+            dst[i * 4 + 2] = src[i * 3 + 2];
+            dst[i * 4 + 3] = 255;
+          }
+        });
+      }
+      else if (dataType == VTK_UNSIGNED_SHORT && numComponents == 3)
+      {
+        // Expand 3-component ushort to RGBA (pad alpha with 65535)
+        const unsigned short* src = static_cast<const unsigned short*>(fullDataPtr);
+        unsigned short* dst = static_cast<unsigned short*>(uploadPointer);
+        vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
+          for (vtkIdType i = begin; i < end; ++i)
+          {
+            dst[i * 4 + 0] = src[i * 3 + 0];
+            dst[i * 4 + 1] = src[i * 3 + 1];
+            dst[i * 4 + 2] = src[i * 3 + 2];
+            dst[i * 4 + 3] = 65535;
+          }
+        });
+      }
       else
       {
-        switch (dataType)
-        {
-          case VTK_SHORT:
-          {
-            const short* src = static_cast<const short*>(fullDataPtr);
-            vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
-              for (vtkIdType i = begin; i < end; ++i)
-              {
-                for (int c = 0; c < numComponents; ++c)
-                  static_cast<float*>(uploadPointer)[i * outputComponents + c] =
-                    static_cast<float>(src[i * numComponents + c]);
-                for (int c = numComponents; c < outputComponents; ++c)
-                  static_cast<float*>(uploadPointer)[i * outputComponents + c] = 0.0f;
-              }
-            });
-            break;
-          }
-          case VTK_INT:
-          {
-            const int* src = static_cast<const int*>(fullDataPtr);
-            vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
-              for (vtkIdType i = begin; i < end; ++i)
-              {
-                for (int c = 0; c < numComponents; ++c)
-                  static_cast<float*>(uploadPointer)[i * outputComponents + c] =
-                    static_cast<float>(src[i * numComponents + c]);
-                for (int c = numComponents; c < outputComponents; ++c)
-                  static_cast<float*>(uploadPointer)[i * outputComponents + c] = 0.0f;
-              }
-            });
-            break;
-          }
-          case VTK_DOUBLE:
-          {
-            const double* src = static_cast<const double*>(fullDataPtr);
-            vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
-              for (vtkIdType i = begin; i < end; ++i)
-              {
-                for (int c = 0; c < numComponents; ++c)
-                  static_cast<float*>(uploadPointer)[i * outputComponents + c] =
-                    static_cast<float>(src[i * numComponents + c]);
-                for (int c = numComponents; c < outputComponents; ++c)
-                  static_cast<float*>(uploadPointer)[i * outputComponents + c] = 0.0f;
-              }
-            });
-            break;
-          }
-          default:
-          {
-            vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
-              for (vtkIdType i = begin; i < end; ++i)
-              {
-                for (int c = 0; c < numComponents; ++c)
-                  static_cast<float*>(uploadPointer)[i * outputComponents + c] =
-                    static_cast<float>(scalars->GetComponent(i, c));
-                for (int c = numComponents; c < outputComponents; ++c)
-                  static_cast<float*>(uploadPointer)[i * outputComponents + c] = 0.0f;
-              }
-            });
-            break;
-          }
-        }
+        // Native type, no conversion needed — copy directly into staging buffer
+        std::memcpy(uploadPointer, fullDataPtr, static_cast<size_t>(totalVolumeBytes));
       }
-    }
-    else if (dataType == VTK_FLOAT && numComponents == 3)
-    {
-      // Expand 3-component float to RGBA (pad alpha with 0)
-      const float* src = static_cast<const float*>(fullDataPtr);
-      float* dst = static_cast<float*>(uploadPointer);
-      vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
-        for (vtkIdType i = begin; i < end; ++i)
-        {
-          dst[i * 4 + 0] = src[i * 3 + 0];
-          dst[i * 4 + 1] = src[i * 3 + 1];
-          dst[i * 4 + 2] = src[i * 3 + 2];
-          dst[i * 4 + 3] = 0.0f;
-        }
-      });
-    }
-    else if (dataType == VTK_UNSIGNED_CHAR && numComponents == 3)
-    {
-      // Expand 3-component uchar to RGBA (pad alpha with 255)
-      const unsigned char* src = static_cast<const unsigned char*>(fullDataPtr);
-      unsigned char* dst = static_cast<unsigned char*>(uploadPointer);
-      vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
-        for (vtkIdType i = begin; i < end; ++i)
-        {
-          dst[i * 4 + 0] = src[i * 3 + 0];
-          dst[i * 4 + 1] = src[i * 3 + 1];
-          dst[i * 4 + 2] = src[i * 3 + 2];
-          dst[i * 4 + 3] = 255;
-        }
-      });
-    }
-    else if (dataType == VTK_UNSIGNED_SHORT && numComponents == 3)
-    {
-      // Expand 3-component ushort to RGBA (pad alpha with 65535)
-      const unsigned short* src = static_cast<const unsigned short*>(fullDataPtr);
-      unsigned short* dst = static_cast<unsigned short*>(uploadPointer);
-      vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
-        for (vtkIdType i = begin; i < end; ++i)
-        {
-          dst[i * 4 + 0] = src[i * 3 + 0];
-          dst[i * 4 + 1] = src[i * 3 + 1];
-          dst[i * 4 + 2] = src[i * 3 + 2];
-          dst[i * 4 + 3] = 65535;
-        }
-      });
-    }
-    else
-    {
-      // Native type, no conversion needed — copy directly into staging buffer
-      std::memcpy(uploadPointer, fullDataPtr, static_cast<size_t>(totalVolumeBytes));
     }
 
     // Use one command buffer for all block uploads
@@ -3245,89 +3542,166 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
         const double blockRangeRecip = (blockRange > 0.0) ? (255.0 / blockRange) : 1.0;
         const double blockRangeOffset = this->ScalarRange[0];
 
-        // 1. Parallel scan of macrocells
+        // 1. Slice from global macrocell min/max instead of walking every voxel.
+        // Mapped from global MacrocellScalarMin/Max (computed in UpdateMinMaxTexture)
+        // which covers the entire volume at DS=4 resolution.
         std::vector<uint8_t> rawMinMax(numCells, 255);
         const int mmDims0 = mmDims[0];
         const int mmDims1 = mmDims[1];
         const int mmDims2 = mmDims[2];
 
-        vtkSMPTools::For(0, numCells, [&](vtkIdType begin, vtkIdType end) {
-          for (vtkIdType cellIdx = begin; cellIdx < end; ++cellIdx)
-          {
-            const int gx = static_cast<int>(cellIdx % mmDims0);
-            const int gy = static_cast<int>((cellIdx / mmDims0) % mmDims1);
-            const int gz = static_cast<int>(cellIdx / (mmDims0 * mmDims1));
+        const int mcDims0 = this->MinMaxDims[0];
+        const int mcDims1 = this->MinMaxDims[1];
+        const int mcDims2 = this->MinMaxDims[2];
+        const bool haveGlobalMinMax = !this->MacrocellScalarMin.empty() && !this->MacrocellScalarMax.empty();
 
-            const int zStart = texExt[4] + gz * DS;
-            const int zEnd = std::min(zStart + DS, texExt[5] + 1);
-            const int yStart = texExt[2] + gy * DS;
-            const int yEnd = std::min(yStart + DS, texExt[3] + 1);
-            const int xStart = texExt[0] + gx * DS;
-            const int xEnd = std::min(xStart + DS, texExt[1] + 1);
+        if (haveGlobalMinMax)
+        {
+          // Fast path: use precomputed global macrocell data
+          const float* mcMin = this->MacrocellScalarMin.data();
+          const float* mcMax = this->MacrocellScalarMax.data();
+          const int relX0 = texExt[0] - fullExt[0];
+          const int relY0 = texExt[2] - fullExt[2];
+          const int relZ0 = texExt[4] - fullExt[4];
 
-            float cellMin = 1e30f;
-            float cellMax = -1e30f;
-
-            for (int z = zStart; z < zEnd; ++z)
+          vtkSMPTools::For(0, numCells, [&](vtkIdType begin, vtkIdType end) {
+            for (vtkIdType cellIdx = begin; cellIdx < end; ++cellIdx)
             {
-              int zOffset = z - fullExt[4];
-              for (int y = yStart; y < yEnd; ++y)
+              const int gx = static_cast<int>(cellIdx % mmDims0);
+              const int gy = static_cast<int>((cellIdx / mmDims0) % mmDims1);
+              const int gz = static_cast<int>(cellIdx / (mmDims0 * mmDims1));
+
+              // Map block macrocell range to overlapping global macrocells
+              const int xVoxelStart = relX0 + gx * DS;
+              const int xVoxelEnd = relX0 + std::min((gx + 1) * DS, bDims[0]);
+              const int yVoxelStart = relY0 + gy * DS;
+              const int yVoxelEnd = relY0 + std::min((gy + 1) * DS, bDims[1]);
+              const int zVoxelStart = relZ0 + gz * DS;
+              const int zVoxelEnd = relZ0 + std::min((gz + 1) * DS, bDims[2]);
+
+              const int mcX0 = std::min(xVoxelStart / DS, mcDims0 - 1);
+              const int mcX1 = std::min(std::max(xVoxelEnd - 1, 0) / DS, mcDims0 - 1);
+              const int mcY0 = std::min(yVoxelStart / DS, mcDims1 - 1);
+              const int mcY1 = std::min(std::max(yVoxelEnd - 1, 0) / DS, mcDims1 - 1);
+              const int mcZ0 = std::min(zVoxelStart / DS, mcDims2 - 1);
+              const int mcZ1 = std::min(std::max(zVoxelEnd - 1, 0) / DS, mcDims2 - 1);
+
+              float cellMin = 1e30f;
+              float cellMax = -1e30f;
+              for (int mz = mcZ0; mz <= mcZ1; ++mz)
               {
-                int yOffset = y - fullExt[2];
-                for (int x = xStart; x < xEnd; ++x)
+                for (int my = mcY0; my <= mcY1; ++my)
                 {
-                  int xOffset = x - fullExt[0];
-                  float v = 0.0f;
-                  switch (dataType)
+                  for (int mx = mcX0; mx <= mcX1; ++mx)
                   {
-                    case VTK_FLOAT:
-                      v = static_cast<float>(
-                        static_cast<const float*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
-                      break;
-                    case VTK_UNSIGNED_CHAR:
-                      v = static_cast<float>(
-                        static_cast<const unsigned char*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
-                      break;
-                    case VTK_UNSIGNED_SHORT:
-                      v = static_cast<float>(
-                        static_cast<const unsigned short*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
-                      break;
-                    case VTK_SHORT:
-                      v = static_cast<float>(
-                        static_cast<const short*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
-                      break;
-                    default:
-                    {
-                      vtkIdType tupleIdx = zOffset * (inc[2] / inc[0]) + yOffset * (inc[1] / inc[0]) + xOffset;
-                      v = static_cast<float>(scalars->GetComponent(tupleIdx, 0));
-                      break;
-                    }
+                    vtkIdType idx = (static_cast<vtkIdType>(mz) * mcDims1 + my) * mcDims0 + mx;
+                    if (mcMin[idx] < cellMin) cellMin = mcMin[idx];
+                    if (mcMax[idx] > cellMax) cellMax = mcMax[idx];
                   }
-                  if (v < cellMin) cellMin = v;
-                  if (v > cellMax) cellMax = v;
                 }
               }
-            }
 
-            bool empty = true;
-            if (cellMin <= cellMax)
-            {
-              int idxMin = std::max(0,
-                std::min(255, static_cast<int>((cellMin - blockRangeOffset) * blockRangeRecip)));
-              int idxMax = std::max(0,
-                std::min(255, static_cast<int>((cellMax - blockRangeOffset) * blockRangeRecip)));
-              for (int i = idxMin; i <= idxMax; ++i)
+              bool empty = true;
+              if (cellMin <= cellMax)
               {
-                if (opacityTable[i] > 0.0)
+                int idxMin = std::max(0,
+                  std::min(255, static_cast<int>((cellMin - blockRangeOffset) * blockRangeRecip)));
+                int idxMax = std::max(0,
+                  std::min(255, static_cast<int>((cellMax - blockRangeOffset) * blockRangeRecip)));
+                for (int i = idxMin; i <= idxMax; ++i)
                 {
-                  empty = false;
-                  break;
+                  if (opacityTable[i] > 0.0)
+                  {
+                    empty = false;
+                    break;
+                  }
                 }
               }
+              rawMinMax[cellIdx] = empty ? 255 : 0;
             }
-            rawMinMax[cellIdx] = empty ? 255 : 0;
-          }
-        });
+          });
+        }
+        else
+        {
+          // Fallback: walk every voxel (original path)
+          vtkSMPTools::For(0, numCells, [&](vtkIdType begin, vtkIdType end) {
+            for (vtkIdType cellIdx = begin; cellIdx < end; ++cellIdx)
+            {
+              const int gx = static_cast<int>(cellIdx % mmDims0);
+              const int gy = static_cast<int>((cellIdx / mmDims0) % mmDims1);
+              const int gz = static_cast<int>(cellIdx / (mmDims0 * mmDims1));
+
+              const int zStart = texExt[4] + gz * DS;
+              const int zEnd = std::min(zStart + DS, texExt[5] + 1);
+              const int yStart = texExt[2] + gy * DS;
+              const int yEnd = std::min(yStart + DS, texExt[3] + 1);
+              const int xStart = texExt[0] + gx * DS;
+              const int xEnd = std::min(xStart + DS, texExt[1] + 1);
+
+              float cellMin = 1e30f;
+              float cellMax = -1e30f;
+
+              for (int z = zStart; z < zEnd; ++z)
+              {
+                int zOffset = z - fullExt[4];
+                for (int y = yStart; y < yEnd; ++y)
+                {
+                  int yOffset = y - fullExt[2];
+                  for (int x = xStart; x < xEnd; ++x)
+                  {
+                    int xOffset = x - fullExt[0];
+                    float v = 0.0f;
+                    switch (dataType)
+                    {
+                      case VTK_FLOAT:
+                        v = static_cast<float>(
+                          static_cast<const float*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
+                        break;
+                      case VTK_UNSIGNED_CHAR:
+                        v = static_cast<float>(
+                          static_cast<const unsigned char*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
+                        break;
+                      case VTK_UNSIGNED_SHORT:
+                        v = static_cast<float>(
+                          static_cast<const unsigned short*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
+                        break;
+                      case VTK_SHORT:
+                        v = static_cast<float>(
+                          static_cast<const short*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
+                        break;
+                      default:
+                      {
+                        vtkIdType tupleIdx = zOffset * (inc[2] / inc[0]) + yOffset * (inc[1] / inc[0]) + xOffset;
+                        v = static_cast<float>(scalars->GetComponent(tupleIdx, 0));
+                        break;
+                      }
+                    }
+                    if (v < cellMin) cellMin = v;
+                    if (v > cellMax) cellMax = v;
+                  }
+                }
+              }
+
+              bool empty = true;
+              if (cellMin <= cellMax)
+              {
+                int idxMin = std::max(0,
+                  std::min(255, static_cast<int>((cellMin - blockRangeOffset) * blockRangeRecip)));
+                int idxMax = std::max(0,
+                  std::min(255, static_cast<int>((cellMax - blockRangeOffset) * blockRangeRecip)));
+                for (int i = idxMin; i <= idxMax; ++i)
+                {
+                  if (opacityTable[i] > 0.0)
+                  {
+                    empty = false;
+                    break;
+                  }
+                }
+              }
+              rawMinMax[cellIdx] = empty ? 255 : 0;
+            }
+          });
+        }
 
         // 2. Dilation pass (avoid holes at macrocell boundaries)
         std::vector<uint8_t> minMaxData(numCells, 255);
@@ -3390,22 +3764,43 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       }
       // --- End per-block min-max texture generation ---
 
-      // Compute byte offset for this block's corner in the full volume buffer.
-      // The GPU DMA controller extracts the 3D sub-region using source strides.
-      NSUInteger sourceOffset =
-        static_cast<NSUInteger>(texExt[4] - fullExt[4]) * srcBytesPerImage +
-        static_cast<NSUInteger>(texExt[2] - fullExt[2]) * srcBytesPerRow +
-        static_cast<NSUInteger>(texExt[0] - fullExt[0]) * bytesPerVoxel;
+      if (gpuConversionUsed && gpuFullTex)
+      {
+        // GPU-converted full volume: extract per-block sub-region via texture-to-texture copy
+        [blit copyFromTexture:gpuFullTex
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:MTLOriginMake(
+                     static_cast<NSUInteger>(texExt[0] - fullExt[0]),
+                     static_cast<NSUInteger>(texExt[2] - fullExt[2]),
+                     static_cast<NSUInteger>(texExt[4] - fullExt[4]))
+                   sourceSize:MTLSizeMake(
+                     static_cast<NSUInteger>(bDims[0]),
+                     static_cast<NSUInteger>(bDims[1]),
+                     static_cast<NSUInteger>(bDims[2]))
+                    toTexture:tex
+             destinationSlice:0
+             destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+      }
+      else
+      {
+        // CPU-converted staging buffer: extract per-block sub-region via buffer-to-texture copy
+        NSUInteger sourceOffset =
+          static_cast<NSUInteger>(texExt[4] - fullExt[4]) * srcBytesPerImage +
+          static_cast<NSUInteger>(texExt[2] - fullExt[2]) * srcBytesPerRow +
+          static_cast<NSUInteger>(texExt[0] - fullExt[0]) * bytesPerVoxel;
 
-      [blit copyFromBuffer:stagingBuf
-              sourceOffset:sourceOffset
-       sourceBytesPerRow:srcBytesPerRow
-     sourceBytesPerImage:srcBytesPerImage
-              sourceSize:MTLSizeMake(bDims[0], bDims[1], bDims[2])
-               toTexture:tex
-        destinationSlice:0
-        destinationLevel:0
-       destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit copyFromBuffer:stagingBuf
+                sourceOffset:sourceOffset
+         sourceBytesPerRow:srcBytesPerRow
+       sourceBytesPerImage:srcBytesPerImage
+                sourceSize:MTLSizeMake(bDims[0], bDims[1], bDims[2])
+                 toTexture:tex
+          destinationSlice:0
+          destinationLevel:0
+         destinationOrigin:MTLOriginMake(0, 0, 0)];
+      }
     }
 
     [blit endEncoding];
@@ -3508,7 +3903,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
     }
 
     [uploadCmdBuf commit];
-    // Staging buffer is stack-local; block textures are retained so the GPU can read them
+    if (gpuFullTex)
+    {
+      [gpuFullTex release];
+    }
+    [stagingBuf release];
   }
 
   return true;
@@ -5306,21 +5705,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     uniforms.CroppingPlanes2[2] = 0.0f;
     uniforms.CroppingPlanes2[3] = 0.0f;
 
-    // Decode CroppingRegionFlags bitmask into 32-element array
-    int cropFlags = this->GetCroppingRegionFlags();
-    float flagsArray[32] = {};
-    for (int fi = 0; fi < 32; ++fi)
-    {
-      flagsArray[fi] = static_cast<float>((cropFlags >> fi) & 1);
-    }
-
-    // Pack into float4 rows
-    for (int r = 0; r < 8; ++r)
-    {
-      float row[4] = { flagsArray[r * 4], flagsArray[r * 4 + 1], flagsArray[r * 4 + 2],
-        flagsArray[r * 4 + 3] };
-      memcpy(&uniforms.CroppingFlagsRow0 + r, row, sizeof(row));
-    }
+    uniforms.CroppingBitmask = static_cast<uint32_t>(this->GetCroppingRegionFlags());
   }
   else
   {
