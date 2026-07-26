@@ -6058,7 +6058,17 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     if (!this->Blocks.empty() && this->Blocks.size() <= MAX_LAYER_BRICKS &&
         this->LayerPipelineState && this->CompositePipelineState)
     {
-      this->SortBlocksBackToFront(ren, vol);
+      // Sort is decorative for the order-independent path (composite re-sorts per
+      // pixel in the shader). Only collect non-empty blocks without sorting.
+      this->SortedBlockOrder.clear();
+      this->SortedBlockOrder.reserve(this->Blocks.size());
+      for (size_t idx = 0; idx < this->Blocks.size(); ++idx)
+      {
+        if (this->Blocks[idx].Texture)
+        {
+          this->SortedBlockOrder.push_back(static_cast<int>(idx));
+        }
+      }
       int neededSlices = static_cast<int>(this->SortedBlockOrder.size());
       if (!this->EnsureLayerResources(mtlDevice, fboWidth, fboHeight, neededSlices))
       {
