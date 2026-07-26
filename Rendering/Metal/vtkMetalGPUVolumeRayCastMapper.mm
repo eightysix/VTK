@@ -1100,7 +1100,12 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
         else if (dataType == VTK_UNSIGNED_INT) kernelName = useHalf ? "volume_convert_uint_to_half"   : "volume_convert_uint_to_float";
         // Note: VTK_DOUBLE is not supported in Metal device address space; falls through to CPU.
 
-        if (kernelName)
+        if (!kernelName)
+        {
+          // Metal cannot read double in device address space.
+          // Fall through to CPU conversion.
+        }
+        else
         {
           if (!this->EnsureConversionPipelines(mtlDeviceVoid))
           {
@@ -1179,13 +1184,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           [srcBuf release];
           gpuConversionUsed = true;
         }
-        else
-        {
-          vtkErrorMacro("Unsupported data type for GPU conversion: " << dataType);
-          return false;
-        }
       }
-      else if (fmtInfo.needsConversion)
+      if (fmtInfo.needsConversion && !gpuConversionUsed)
       {
         int outputComponents = (numComponents == 3) ? 4 : numComponents;
 
