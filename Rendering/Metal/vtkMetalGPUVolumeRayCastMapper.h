@@ -275,7 +275,7 @@ private:
   bool UpdateTransferFunctionTexture(
     void* mtlDevice, void* mtlQueue, vtkVolume* vol, double actualSampleDistance);
   bool UpdateGradientOpacityTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
-  bool UpdateMinMaxTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol, vtkImageData* input, vtkDataArray* scalars, bool skipGlobalTexture = false);
+  bool UpdateMinMaxTexture(void* mtlDevice, vtkVolume* vol, vtkImageData* input, vtkDataArray* scalars, bool skipGlobalTexture = false);
   bool SetupBuffers(void* mtlDevice, vtkRenderer* ren, vtkVolume* vol, vtkImageData* input);
   bool SetupPipeline(void* mtlDevice, vtkRenderer* ren);
   void* GetOrCreateVolumePipeline(void* mtlDevice, uint32_t type,

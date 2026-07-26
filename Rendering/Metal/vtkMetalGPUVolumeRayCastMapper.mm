@@ -1644,7 +1644,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
         tfDesc.height = 1;
         tfDesc.mipmapLevelCount = 1;
         tfDesc.usage = MTLTextureUsageShaderRead;
-        tfDesc.storageMode = MTLStorageModePrivate;
+        tfDesc.storageMode = MTLStorageModeShared;
 
         tex = [device newTextureWithDescriptor:tfDesc];
         [tfDesc release];
@@ -1656,26 +1656,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
         AssignMetalObject(this->ColorOpacityTexture, tex);
       }
 
-      {
-        id<MTLBuffer> staging =
-          [device newBufferWithBytes:tfData
-                              length:256 * 4
-                             options:MTLResourceStorageModeShared];
-        id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)mtlQueueVoid;
-        id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
-        id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
-        [blit copyFromBuffer:staging
-                sourceOffset:0
-           sourceBytesPerRow:256 * 4
-         sourceBytesPerImage:0
-                  sourceSize:MTLSizeMake(256, 1, 1)
-                   toTexture:tex
-            destinationSlice:0
-            destinationLevel:0
-           destinationOrigin:MTLOriginMake(0, 0, 0)];
-        [blit endEncoding];
-        [uploadCmdBuf commit];
-      }
+      MTLRegion region = MTLRegionMake2D(0, 0, 256, 1);
+      [tex replaceRegion:region
+            mipmapLevel:0
+              withBytes:tfData
+            bytesPerRow:256 * 4];
 
       this->LastTransferFunctionScalarRange[0] = this->ScalarRange[0];
       this->LastTransferFunctionScalarRange[1] = this->ScalarRange[1];
@@ -1754,7 +1739,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
         desc.height = 1;
         desc.mipmapLevelCount = 1;
         desc.usage = MTLTextureUsageShaderRead;
-        desc.storageMode = MTLStorageModePrivate;
+        desc.storageMode = MTLStorageModeShared;
 
         tex = [device newTextureWithDescriptor:desc];
         [desc release];
@@ -1766,26 +1751,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
         AssignMetalObject(this->GradientOpacityTexture, tex);
       }
 
-      {
-        id<MTLBuffer> staging =
-          [device newBufferWithBytes:gradData
-                              length:256 * 4
-                             options:MTLResourceStorageModeShared];
-        id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)mtlQueueVoid;
-        id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
-        id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
-        [blit copyFromBuffer:staging
-                sourceOffset:0
-           sourceBytesPerRow:256 * 4
-         sourceBytesPerImage:0
-                  sourceSize:MTLSizeMake(256, 1, 1)
-                   toTexture:tex
-            destinationSlice:0
-            destinationLevel:0
-           destinationOrigin:MTLOriginMake(0, 0, 0)];
-        [blit endEncoding];
-        [uploadCmdBuf commit];
-      }
+      MTLRegion region = MTLRegionMake2D(0, 0, 256, 1);
+      [tex replaceRegion:region
+            mipmapLevel:0
+              withBytes:gradData
+            bytesPerRow:256 * 4];
 
       this->GradientOpacityUploadTime.Modified();
     }
@@ -1908,7 +1878,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMaskTexture(
         desc.depth = dims[2];
         desc.mipmapLevelCount = 1;
         desc.usage = MTLTextureUsageShaderRead;
-        desc.storageMode = MTLStorageModePrivate;
+        desc.storageMode = MTLStorageModeShared;
 
         tex = [device newTextureWithDescriptor:desc];
         [desc release];
@@ -1921,28 +1891,15 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMaskTexture(
       }
 
       // Upload mask data to texture (R32Float format uses 1 component)
+      MTLRegion region = MTLRegionMake3D(0, 0, 0, dims[0], dims[1], dims[2]);
       NSUInteger maskBytesPerRow = static_cast<NSUInteger>(dims[0]) * sizeof(float);
       NSUInteger maskBytesPerImage = maskBytesPerRow * dims[1];
-      {
-        id<MTLBuffer> staging =
-          [device newBufferWithBytes:maskData.data()
-                              length:maskData.size() * sizeof(float)
-                             options:MTLResourceStorageModeShared];
-        id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)mtlQueueVoid;
-        id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
-        id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
-        [blit copyFromBuffer:staging
-                sourceOffset:0
-           sourceBytesPerRow:maskBytesPerRow
-         sourceBytesPerImage:maskBytesPerImage
-                  sourceSize:MTLSizeMake(dims[0], dims[1], dims[2])
-                   toTexture:tex
-            destinationSlice:0
-            destinationLevel:0
-           destinationOrigin:MTLOriginMake(0, 0, 0)];
-        [blit endEncoding];
-        [uploadCmdBuf commit];
-      }
+      [tex replaceRegion:region
+            mipmapLevel:0
+                  slice:0
+              withBytes:maskData.data()
+            bytesPerRow:maskBytesPerRow
+          bytesPerImage:maskBytesPerImage];
 
       this->MaskUpdateTime.Modified();
     }
@@ -2087,7 +2044,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateLabelMapTransferTexture(
         desc.height = tfHeight;
         desc.mipmapLevelCount = 1;
         desc.usage = MTLTextureUsageShaderRead;
-        desc.storageMode = MTLStorageModePrivate;
+        desc.storageMode = MTLStorageModeShared;
 
         tex = [device newTextureWithDescriptor:desc];
         [desc release];
@@ -2100,27 +2057,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateLabelMapTransferTexture(
       }
 
       // Upload data to texture
-      {
-        NSUInteger bytesPerRow = tfWidth * 4 * sizeof(float);
-        id<MTLBuffer> staging =
-          [device newBufferWithBytes:tfData.data()
-                              length:tfHeight * bytesPerRow
-                             options:MTLResourceStorageModeShared];
-        id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)mtlQueueVoid;
-        id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
-        id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
-        [blit copyFromBuffer:staging
-                sourceOffset:0
-           sourceBytesPerRow:bytesPerRow
-         sourceBytesPerImage:0
-                  sourceSize:MTLSizeMake(tfWidth, tfHeight, 1)
-                   toTexture:tex
-            destinationSlice:0
-            destinationLevel:0
-           destinationOrigin:MTLOriginMake(0, 0, 0)];
-        [blit endEncoding];
-        [uploadCmdBuf commit];
-      }
+      MTLRegion region = MTLRegionMake2D(0, 0, tfWidth, tfHeight);
+      [tex replaceRegion:region
+            mipmapLevel:0
+              withBytes:tfData.data()
+            bytesPerRow:tfWidth * 4 * sizeof(float)];
 
       this->LastLabelMapScalarRange[0] = this->ScalarRange[0];
       this->LastLabelMapScalarRange[1] = this->ScalarRange[1];
@@ -2556,7 +2497,7 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
 
 //------------------------------------------------------------------------------
 bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
-  void* mtlDeviceVoid, void* mtlQueueVoid, vtkVolume* vol, vtkImageData* input, vtkDataArray* scalars,
+  void* mtlDeviceVoid, vtkVolume* vol, vtkImageData* input, vtkDataArray* scalars,
   bool skipGlobalTexture)
 {
   if (!input || !scalars || !vol)
@@ -2800,7 +2741,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
         desc.depth = mmDims2;
         desc.mipmapLevelCount = 1;
         desc.usage = MTLTextureUsageShaderRead;
-        desc.storageMode = MTLStorageModePrivate;
+        desc.storageMode = MTLStorageModeShared;
 
         tex = [device newTextureWithDescriptor:desc];
         [desc release];
@@ -2813,28 +2754,15 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
       }
 
       // Upload data
-      {
-        NSUInteger bytesPerRow = static_cast<NSUInteger>(mmDims0) * sizeof(uint8_t);
-        NSUInteger bytesPerImage = bytesPerRow * mmDims1;
-        id<MTLBuffer> staging =
-          [device newBufferWithBytes:minMaxData.data()
-                              length:static_cast<NSUInteger>(mmDims2) * bytesPerImage
-                             options:MTLResourceStorageModeShared];
-        id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)mtlQueueVoid;
-        id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
-        id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
-        [blit copyFromBuffer:staging
-                sourceOffset:0
-           sourceBytesPerRow:bytesPerRow
-         sourceBytesPerImage:bytesPerImage
-                  sourceSize:MTLSizeMake(mmDims0, mmDims1, mmDims2)
-                   toTexture:tex
-            destinationSlice:0
-            destinationLevel:0
-           destinationOrigin:MTLOriginMake(0, 0, 0)];
-        [blit endEncoding];
-        [uploadCmdBuf commit];
-      }
+      MTLRegion region = MTLRegionMake3D(0, 0, 0, mmDims0, mmDims1, mmDims2);
+      NSUInteger bytesPerRow = mmDims0 * sizeof(uint8_t);
+      NSUInteger bytesPerImage = bytesPerRow * mmDims1;
+      [tex replaceRegion:region
+             mipmapLevel:0
+                   slice:0
+               withBytes:minMaxData.data()
+             bytesPerRow:bytesPerRow
+           bytesPerImage:bytesPerImage];
     }
 
     this->MinMaxUploadTime.Modified();
@@ -3796,27 +3724,21 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
         mmDesc.depth = mmDims2;
         mmDesc.mipmapLevelCount = 1;
         mmDesc.usage = MTLTextureUsageShaderRead;
-        mmDesc.storageMode = MTLStorageModePrivate;
+        mmDesc.storageMode = MTLStorageModeShared;
 
         id<MTLTexture> mmTex = [device newTextureWithDescriptor:mmDesc];
         [mmDesc release];
         if (mmTex)
         {
-          NSUInteger mmBytesPerRow = static_cast<NSUInteger>(mmDims0) * sizeof(uint8_t);
+          MTLRegion region = MTLRegionMake3D(0, 0, 0, mmDims0, mmDims1, mmDims2);
+          NSUInteger mmBytesPerRow = mmDims0 * sizeof(uint8_t);
           NSUInteger mmBytesPerImage = mmBytesPerRow * mmDims1;
-          id<MTLBuffer> staging =
-            [device newBufferWithBytes:minMaxData.data()
-                                length:static_cast<NSUInteger>(mmDims2) * mmBytesPerImage
-                               options:MTLResourceStorageModeShared];
-          [blit copyFromBuffer:staging
-                  sourceOffset:0
-             sourceBytesPerRow:mmBytesPerRow
-           sourceBytesPerImage:mmBytesPerImage
-                    sourceSize:MTLSizeMake(mmDims0, mmDims1, mmDims2)
-                     toTexture:mmTex
-              destinationSlice:0
-              destinationLevel:0
-             destinationOrigin:MTLOriginMake(0, 0, 0)];
+          [mmTex replaceRegion:region
+                  mipmapLevel:0
+                        slice:0
+                    withBytes:minMaxData.data()
+                  bytesPerRow:mmBytesPerRow
+                bytesPerImage:mmBytesPerImage];
 
           AssignMetalObject(block.MinMaxTexture, mmTex);
         }
@@ -5493,16 +5415,17 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
     if (!this->ComputeMinMaxGPU(mtlDevice, mtlQueue, vol, input, scalars))
     {
-      // GPU path failed — release and fall back to CPU path (private texture + staging blit)
+      // GPU path failed — release any private texture so the CPU
+      // fallback's replaceRegion (which needs StorageModeShared) works.
       ReleaseMetalObject(this->MinMaxTexture);
-      this->UpdateMinMaxTexture(mtlDevice, mtlQueue, vol, input, scalars, false);
+      this->UpdateMinMaxTexture(mtlDevice, vol, input, scalars, false);
     }
   }
   else
   {
     // CPU min-max path: compute from raw scalar data before volume upload.
     // Partitioned volumes still need CPU macrocell data for per-block ranges.
-    this->UpdateMinMaxTexture(mtlDevice, mtlQueue, vol, input, scalars, usePartitions);
+    this->UpdateMinMaxTexture(mtlDevice, vol, input, scalars, usePartitions);
 
     if (!this->UpdateVolumeTexture(mtlDevice, mtlQueue, vol))
     {
