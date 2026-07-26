@@ -13,13 +13,54 @@
 #include "vtkTimeStamp.h"            // For time stamp
 #include "vtkWrappingHints.h"        // For VTK_MARSHALAUTO
 
-#include <array>  // For std::array
-#include <vector> // For std::vector
+#include <array>        // For std::array
+#include <vector>       // For std::vector
+#include <unordered_map> // For pipeline cache
+#include <functional>    // For std::hash
 
 class vtkDataArray;
 class vtkImageData;
 class vtkPiecewiseFunction;
 class vtkVolume;
+
+// Pipeline cache types for Phase 1B
+enum class VolumePipelineType : uint32_t
+{
+  DirectScreen = 0,
+  OffscreenAccumulation = 1,
+  OffscreenLayer = 2,
+  LayerComposite = 3,
+  ImageSampleBlit = 4
+};
+
+struct VolumePipelineKey
+{
+  uint32_t type;
+  uint32_t colorFormat;
+  uint32_t depthFormat;
+  uint32_t sampleCount;
+  uint32_t featureMask;
+
+  bool operator==(const VolumePipelineKey& other) const
+  {
+    return type == other.type && colorFormat == other.colorFormat &&
+      depthFormat == other.depthFormat && sampleCount == other.sampleCount &&
+      featureMask == other.featureMask;
+  }
+};
+
+struct VolumePipelineKeyHash
+{
+  size_t operator()(const VolumePipelineKey& k) const
+  {
+    size_t h = std::hash<uint32_t>()(k.type);
+    h ^= std::hash<uint32_t>()(k.colorFormat) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<uint32_t>()(k.depthFormat) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<uint32_t>()(k.sampleCount) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<uint32_t>()(k.featureMask) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    return h;
+  }
+};
 
 VTK_ABI_NAMESPACE_BEGIN
 
@@ -122,6 +163,13 @@ private:
   int CurrentSampleCount = 0;
 
   bool PreferHalfPrecision = true;  // when true, prefer half-float for non-native data types
+
+  // Phase 1A: Cached shader library (avoid recompiling vtkMetalShaders)
+  void* CachedShaderLibrary = nullptr; // id<MTLLibrary>
+  bool EnsureShaderLibrary(void* mtlDevice);
+
+  // Phase 1B: Pipeline state cache (keyed by format, sample count, feature mask)
+  std::unordered_map<VolumePipelineKey, void*, VolumePipelineKeyHash> PipelineCache;
 
   // Adaptive sample distance
   double ReductionFactor = 1.0;

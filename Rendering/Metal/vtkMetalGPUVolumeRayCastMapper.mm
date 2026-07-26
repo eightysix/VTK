@@ -287,6 +287,34 @@ void vtkMetalGPUVolumeRayCastMapper::PrintSelf(ostream& os, vtkIndent indent)
 }
 
 //------------------------------------------------------------------------------
+bool vtkMetalGPUVolumeRayCastMapper::EnsureShaderLibrary(void* mtlDeviceVoid)
+{
+  if (this->CachedShaderLibrary)
+  {
+    return true;
+  }
+
+  @autoreleasepool
+  {
+    id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
+    NSError* error = nil;
+    NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
+    id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+
+    if (!library)
+    {
+      vtkErrorMacro(<< "Failed to compile Metal shader library: "
+                    << [[error localizedDescription] UTF8String]);
+      return false;
+    }
+
+    AssignMetalObject(this->CachedShaderLibrary, library);
+  }
+
+  return true;
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::SetPartitions(
   unsigned short x, unsigned short y, unsigned short z)
 {
@@ -406,17 +434,14 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
     AssignMetalObject(this->ImageSampleColorTexture, colorTex);
 
     // Create blit pipeline (fullscreen quad that samples the offscreen texture)
-    NSError* error = nil;
-    NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
-    id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
-    if (!library)
+    if (!this->EnsureShaderLibrary(deviceVoid))
     {
-      vtkErrorMacro(<< "Failed to compile Metal shader for image-sample blit: "
-                    << [[error localizedDescription] UTF8String]);
       this->ReleaseImageSampleResources();
       return false;
     }
+    id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
 
+    NSError* error = nil;
     id<MTLFunction> vertexFunc = [library newFunctionWithName:@"vertex_fullscreen_main"];
     id<MTLFunction> fragmentFunc = [library newFunctionWithName:@"fragment_image_sample_blit"];
     if (!vertexFunc || !fragmentFunc)
@@ -424,7 +449,6 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
       vtkErrorMacro("Failed to find image-sample blit shader functions");
       [vertexFunc release];
       [fragmentFunc release];
-      [library release];
       this->ReleaseImageSampleResources();
       return false;
     }
@@ -451,11 +475,16 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
       vtkErrorMacro(<< "Image-sample blit pipeline: " << [[error localizedDescription] UTF8String]);
       [vertexFunc release];
       [fragmentFunc release];
-      [library release];
       this->ReleaseImageSampleResources();
       return false;
     }
     AssignMetalObject(this->ImageSamplePipeline, pso);
+    {
+      VolumePipelineKey k = { static_cast<uint32_t>(VolumePipelineType::ImageSampleBlit),
+        MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, 0 };
+      [(__bridge id)pso retain];
+      this->PipelineCache[k] = (__bridge void*)pso;
+    }
 
     // Create linear sampler for blit
     MTLSamplerDescriptor* sDesc = [[MTLSamplerDescriptor alloc] init];
@@ -469,7 +498,6 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
 
     [vertexFunc release];
     [fragmentFunc release];
-    [library release];
 
     this->ImageSampleFBOWidth = width;
     this->ImageSampleFBOHeight = height;
@@ -564,6 +592,16 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   ReleaseMetalObject(this->DummyMaskTexture);
   ReleaseMetalObject(this->DummyMinMaxTexture);
   ReleaseMetalObject(this->DepthStencilState);
+
+  // Phase 1A: Release cached shader library
+  ReleaseMetalObject(this->CachedShaderLibrary);
+
+  // Phase 1B: Clear pipeline cache
+  for (auto& entry : this->PipelineCache)
+  {
+    [(__bridge id)entry.second release];
+  }
+  this->PipelineCache.clear();
 
   for (int i = 0; i < 3; ++i)
   {
@@ -3546,19 +3584,17 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     return true;
   }
 
+  if (!this->EnsureShaderLibrary(mtlDeviceVoid))
+  {
+    return false;
+  }
+
   @autoreleasepool
   {
     id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
+    id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
 
     NSError* error = nil;
-    NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
-    id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
-    if (!library)
-    {
-      vtkErrorMacro(<< "Failed to compile Metal volume shader: "
-                    << [[error localizedDescription] UTF8String]);
-      return false;
-    }
 
     id<MTLFunction> vertexFunc = [library newFunctionWithName:@"vertex_volume_main"];
     id<MTLFunction> fragmentFunc = [library newFunctionWithName:@"fragment_volume_main"];
@@ -3567,7 +3603,6 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       vtkErrorMacro("Failed to find volume shader functions");
       [vertexFunc release];
       [fragmentFunc release];
-      [library release];
       return false;
     }
 
@@ -3804,12 +3839,18 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       vtkErrorMacro(<< "Volume pipeline: " << [[error localizedDescription] UTF8String]);
       [vertexFunc release];
       [fragmentFunc release];
-      [library release];
       [vertexDesc release];
       return false;
     }
     AssignMetalObject(this->PipelineState, pso);
     this->CurrentSampleCount = sampleCount;
+    {
+      VolumePipelineKey k = { static_cast<uint32_t>(VolumePipelineType::DirectScreen),
+        MTLPixelFormatBGRA8Unorm, MTLPixelFormatDepth32Float,
+        static_cast<uint32_t>(sampleCount), 0 };
+      [(__bridge id)pso retain];
+      this->PipelineCache[k] = (__bridge void*)pso;
+    }
 
     // Create accumulation pipeline for inter-block opacity propagation.
     MTLRenderPipelineDescriptor* accumDesc = [[MTLRenderPipelineDescriptor alloc] init];
@@ -3833,11 +3874,16 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
                     << [[error localizedDescription] UTF8String]);
       [vertexFunc release];
       [fragmentFunc release];
-      [library release];
       [vertexDesc release];
       return false;
     }
     AssignMetalObject(this->AccumulationPipelineState, accumPso);
+    {
+      VolumePipelineKey k = { static_cast<uint32_t>(VolumePipelineType::OffscreenAccumulation),
+        MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, 0 };
+      [(__bridge id)accumPso retain];
+      this->PipelineCache[k] = (__bridge void*)accumPso;
+    }
 
     // Layer pipeline: same fragment as screen path, but offscreen format, no blend, no depth.
     if (!this->LayerPipelineState)
@@ -3848,7 +3894,6 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
         vtkErrorMacro("Failed to find layer fragment function");
         [vertexFunc release];
         [fragmentFunc release];
-        [library release];
         [vertexDesc release];
         return false;
       }
@@ -3872,11 +3917,16 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
         vtkErrorMacro(<< "Layer pipeline: " << [[layerError localizedDescription] UTF8String]);
         [vertexFunc release];
         [fragmentFunc release];
-        [library release];
         [vertexDesc release];
         return false;
       }
       AssignMetalObject(this->LayerPipelineState, p);
+      {
+        VolumePipelineKey k = { static_cast<uint32_t>(VolumePipelineType::OffscreenLayer),
+          MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, 0 };
+        [(__bridge id)p retain];
+        this->PipelineCache[k] = (__bridge void*)p;
+      }
     }
 
     // Composite pipeline: fullscreen resolve of the 8 layers.
@@ -3903,17 +3953,21 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
         vtkErrorMacro(<< "Composite pipeline: " << [[compError localizedDescription] UTF8String]);
         [vertexFunc release];
         [fragmentFunc release];
-        [library release];
         [vertexDesc release];
         return false;
       }
       AssignMetalObject(this->CompositePipelineState, p);
+      {
+        VolumePipelineKey k = { static_cast<uint32_t>(VolumePipelineType::LayerComposite),
+          MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, 0 };
+        [(__bridge id)p retain];
+        this->PipelineCache[k] = (__bridge void*)p;
+      }
     }
 
     // Release temporary objects
     [vertexFunc release];
     [fragmentFunc release];
-    [library release];
     [vertexDesc release];
   }
 
