@@ -116,6 +116,9 @@ public:
   void SetUsePrecomputedNormals(bool val) { this->UsePrecomputedNormals = val; }
   bool GetUsePrecomputedNormals() const { return this->UsePrecomputedNormals; }
 
+  void SetUseGPUMinMax(bool val) { this->UseGPUMinMax = val; }
+  bool GetUseGPUMinMax() const { return this->UseGPUMinMax; }
+
   // No-op stubs: the instanced path was removed.  Kept so that any
   // external caller (test / UI) that references the setter still compiles.
   void SetDisableInstanceRendering(bool) {}
@@ -184,6 +187,23 @@ private:
   void* NormalComputePipeline = nullptr; // id<MTLComputePipelineState>
   bool EnsureGradientNormalTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
   void ReleaseGradientNormalTexture();
+
+  // Phase 5: GPU-based min/max acceleration generation.
+  // When true, UpdateMinMaxTexture uses GPU compute kernels instead of CPU
+  // vtkSMPTools to build the R8Unorm occupancy texture.
+  bool UseGPUMinMax = true;
+
+  // Compute pipelines for GPU min-max generation.
+  void* MinMaxComputePipeline = nullptr;  // id<MTLComputePipelineState> — volume_compute_minmax
+  void* DilateComputePipeline = nullptr;  // id<MTLComputePipelineState> — volume_dilate_minmax
+
+  // Ensure the two compute pipelines exist.
+  bool EnsureMinMaxComputePipelines(void* mtlDevice);
+
+  // Run GPU min/max generation after volume texture is uploaded.
+  // Returns true on success, false on failure (caller falls back to CPU).
+  bool ComputeMinMaxGPU(void* mtlDevice, void* mtlQueue, vtkVolume* vol,
+    vtkImageData* input, vtkDataArray* scalars);
 
   // Phase 1A: Cached shader library (avoid recompiling vtkMetalShaders)
   void* CachedShaderLibrary = nullptr; // id<MTLLibrary>

@@ -164,6 +164,20 @@ struct LayerCompositeUniforms {
   float Params[4]; // x = brickCount, y = usePerPixelOrder (1=fix, 0=cpu order), zw unused
 };
 
+// Must match Metal MinMaxComputeUniforms struct (Phase 5: GPU min-max)
+struct MinMaxComputeUniforms {
+  uint32_t mmDimX, mmDimY, mmDimZ;
+  uint32_t volDimX, volDimY, volDimZ;
+  float ds;
+  float scalarMin;
+  float scalarScale;
+  float _pad;
+  uint32_t opacityPrefix[257];
+};
+
+static_assert(sizeof(MinMaxComputeUniforms) == 4*6 + 4 + 4 + 4 + 4 + 257*4,
+  "MinMaxComputeUniforms size must match Metal struct");
+
 namespace
 {
 inline uint16_t FloatToHalf(float f)
@@ -286,6 +300,7 @@ void vtkMetalGPUVolumeRayCastMapper::WaitForInFlightFrames()
 void vtkMetalGPUVolumeRayCastMapper::PrintSelf(ostream& os, vtkIndent indent)
 {
   this->Superclass::PrintSelf(os, indent);
+  os << indent << "UseGPUMinMax: " << this->UseGPUMinMax << "\n";
 }
 
 //------------------------------------------------------------------------------
@@ -718,6 +733,11 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   this->ReleaseGradientNormalTexture();
 
   this->ReleaseMaskResources();
+
+  // Phase 5: Release GPU min-max compute pipelines
+  ReleaseMetalObject(this->MinMaxComputePipeline);
+  ReleaseMetalObject(this->DilateComputePipeline);
+
   ReleaseMetalObject(this->DummyDepthTexture);
   ReleaseMetalObject(this->DummyVolumeTexture);
   ReleaseMetalObject(this->DummyMaskTexture);
@@ -2020,6 +2040,260 @@ bool vtkMetalGPUVolumeRayCastMapper::IsBlockEmpty(
   }
 
   return true;
+}
+
+//------------------------------------------------------------------------------
+bool vtkMetalGPUVolumeRayCastMapper::EnsureMinMaxComputePipelines(void* mtlDeviceVoid)
+{
+  if (this->MinMaxComputePipeline && this->DilateComputePipeline)
+  {
+    return true;
+  }
+
+  if (!this->EnsureShaderLibrary(mtlDeviceVoid))
+  {
+    return false;
+  }
+
+  id<MTLDevice> dev = (__bridge id<MTLDevice>)mtlDeviceVoid;
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
+
+  @autoreleasepool
+  {
+    if (!this->MinMaxComputePipeline)
+    {
+      id<MTLFunction> func = [library newFunctionWithName:@"volume_compute_minmax"];
+      if (!func)
+      {
+        vtkErrorMacro("Failed to find volume_compute_minmax kernel");
+        return false;
+      }
+      NSError* error = nil;
+      id<MTLComputePipelineState> pso =
+        [dev newComputePipelineStateWithFunction:func error:&error];
+      [func release];
+      if (!pso)
+      {
+        vtkErrorMacro(<< "Failed to create minmax compute pipeline: "
+                      << [[error localizedDescription] UTF8String]);
+        return false;
+      }
+      AssignMetalObject(this->MinMaxComputePipeline, pso);
+    }
+
+    if (!this->DilateComputePipeline)
+    {
+      id<MTLFunction> func = [library newFunctionWithName:@"volume_dilate_minmax"];
+      if (!func)
+      {
+        vtkErrorMacro("Failed to find volume_dilate_minmax kernel");
+        return false;
+      }
+      NSError* error = nil;
+      id<MTLComputePipelineState> pso =
+        [dev newComputePipelineStateWithFunction:func error:&error];
+      [func release];
+      if (!pso)
+      {
+        vtkErrorMacro(<< "Failed to create dilate compute pipeline: "
+                      << [[error localizedDescription] UTF8String]);
+        return false;
+      }
+      AssignMetalObject(this->DilateComputePipeline, pso);
+    }
+  }
+
+  return true;
+}
+
+//------------------------------------------------------------------------------
+bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
+  void* mtlDeviceVoid, void* mtlQueueVoid, vtkVolume* vol,
+  vtkImageData* input, vtkDataArray* scalars)
+{
+  id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
+  id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)mtlQueueVoid;
+
+  if (!this->VolumeTexture)
+  {
+    return false;
+  }
+
+  // Timestamp-based caching: skip recompute when nothing changed.
+  if (input && this->MinMaxTexture)
+  {
+    vtkVolumeProperty* property = vol ? vol->GetProperty() : nullptr;
+    vtkPiecewiseFunction* opFunc = property ? property->GetScalarOpacity() : nullptr;
+    if (opFunc &&
+        input->GetMTime() <= this->MinMaxUploadTime.GetMTime() &&
+        opFunc->GetMTime() <= this->MinMaxUploadTime.GetMTime())
+    {
+      return true;
+    }
+  }
+
+  id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;
+  int dims[3] = { static_cast<int>(volTex.width),
+                  static_cast<int>(volTex.height),
+                  static_cast<int>(volTex.depth) };
+
+  const int DS = 4;
+  int mmDims[3] = {
+    std::max(1, (dims[0] + DS - 1) / DS),
+    std::max(1, (dims[1] + DS - 1) / DS),
+    std::max(1, (dims[2] + DS - 1) / DS)
+  };
+  this->MinMaxDims[0] = mmDims[0];
+  this->MinMaxDims[1] = mmDims[1];
+  this->MinMaxDims[2] = mmDims[2];
+
+  if (!this->EnsureMinMaxComputePipelines(mtlDeviceVoid))
+  {
+    return false;
+  }
+
+  @autoreleasepool
+  {
+    // --- Create temporary occupancy textures (R8Unorm, read/write) ---
+    MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
+    desc.textureType = MTLTextureType3D;
+    desc.pixelFormat = MTLPixelFormatR8Unorm;
+    desc.width = mmDims[0];
+    desc.height = mmDims[1];
+    desc.depth = mmDims[2];
+    desc.mipmapLevelCount = 1;
+    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    desc.storageMode = MTLStorageModePrivate;
+
+    id<MTLTexture> rawOcc = [device newTextureWithDescriptor:desc];
+    id<MTLTexture> dilatedOcc = [device newTextureWithDescriptor:desc];
+    [desc release];
+
+    if (!rawOcc || !dilatedOcc)
+    {
+      [rawOcc release];
+      [dilatedOcc release];
+      return false;
+    }
+
+    // --- Build opacity prefix table from transfer function ---
+    vtkVolumeProperty* property = vol ? vol->GetProperty() : nullptr;
+    vtkPiecewiseFunction* opFunc = property ? property->GetScalarOpacity() : nullptr;
+    if (!opFunc)
+    {
+      [rawOcc release];
+      [dilatedOcc release];
+      return false;
+    }
+
+    double opacityTable[256];
+    opFunc->GetTable(this->ScalarRange[0], this->ScalarRange[1], 256, opacityTable);
+
+    uint32_t opacityPrefix[257];
+    opacityPrefix[0] = 0;
+    for (int i = 0; i < 256; ++i)
+    {
+      opacityPrefix[i + 1] = opacityPrefix[i] + (opacityTable[i] > 0.0 ? 1u : 0u);
+    }
+
+    double scalarRange = this->ScalarRange[1] - this->ScalarRange[0];
+    if (scalarRange <= 0.0) scalarRange = 1.0;
+
+    // --- Build uniforms ---
+    // IMPORTANT: texture sampler returns normalized values for R8Unorm/R16Unorm
+    // formats but raw values for R32Float.  We must adjust scalarMin/scalarScale
+    // to work in the sampler's output space (raw/normalized) so the TF index
+    // computation matches the CPU path.
+    float normFactor = this->ScalarNormalizationFactor;
+
+    MinMaxComputeUniforms u;
+    u.mmDimX = static_cast<uint32_t>(mmDims[0]);
+    u.mmDimY = static_cast<uint32_t>(mmDims[1]);
+    u.mmDimZ = static_cast<uint32_t>(mmDims[2]);
+    u.volDimX = static_cast<uint32_t>(dims[0]);
+    u.volDimY = static_cast<uint32_t>(dims[1]);
+    u.volDimZ = static_cast<uint32_t>(dims[2]);
+    u.ds = static_cast<float>(DS);
+    u.scalarMin = static_cast<float>(this->ScalarRange[0] / normFactor);
+    u.scalarScale = static_cast<float>(255.0 * normFactor / scalarRange);
+    u._pad = 0.0f;
+    memcpy(u.opacityPrefix, opacityPrefix, sizeof(opacityPrefix));
+
+    // --- Command buffer ---
+    id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+    cmdBuf.label = @"VTK Volume MinMax Compute";
+
+    // --- Dispatch kernel 1: macrocell occupancy ---
+    id<MTLComputeCommandEncoder> enc1 = [cmdBuf computeCommandEncoder];
+    enc1.label = @"Volume Compute MinMax";
+    [enc1 setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->MinMaxComputePipeline];
+    [enc1 setTexture:volTex atIndex:0];
+    [enc1 setTexture:rawOcc atIndex:1];
+    [enc1 setBytes:&u length:sizeof(u) atIndex:0];
+
+    MTLSize gridSize = MTLSizeMake(mmDims[0], mmDims[1], mmDims[2]);
+    NSUInteger tgw = 8;
+    MTLSize tgSize = MTLSizeMake(tgw, tgw, tgw);
+    [enc1 dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
+    [enc1 endEncoding];
+
+    // --- Dispatch kernel 2: dilation ---
+    id<MTLComputeCommandEncoder> enc2 = [cmdBuf computeCommandEncoder];
+    enc2.label = @"Volume Dilate MinMax";
+    [enc2 setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->DilateComputePipeline];
+    [enc2 setTexture:rawOcc atIndex:0];
+    [enc2 setTexture:dilatedOcc atIndex:1];
+    [enc2 dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
+    [enc2 endEncoding];
+
+    [cmdBuf commit];
+
+    // --- Store the dilated result as the persistent MinMaxTexture ---
+    // First, create the persistent texture (ShaderRead only)
+    MTLTextureDescriptor* permDesc = [[MTLTextureDescriptor alloc] init];
+    permDesc.textureType = MTLTextureType3D;
+    permDesc.pixelFormat = MTLPixelFormatR8Unorm;
+    permDesc.width = mmDims[0];
+    permDesc.height = mmDims[1];
+    permDesc.depth = mmDims[2];
+    permDesc.mipmapLevelCount = 1;
+    permDesc.usage = MTLTextureUsageShaderRead;
+    permDesc.storageMode = MTLStorageModePrivate;
+
+    id<MTLTexture> permTex = [device newTextureWithDescriptor:permDesc];
+    [permDesc release];
+    if (!permTex)
+    {
+      [rawOcc release];
+      [dilatedOcc release];
+      vtkErrorMacro("Failed to create persistent min-max texture");
+      return false;
+    }
+    AssignMetalObject(this->MinMaxTexture, permTex);
+
+    // Blit the dilated result into the persistent texture
+    id<MTLCommandBuffer> copyCmdBuf = [queue commandBuffer];
+    copyCmdBuf.label = @"VTK MinMax Copy";
+    id<MTLBlitCommandEncoder> blit = [copyCmdBuf blitCommandEncoder];
+    [blit copyFromTexture:dilatedOcc
+              sourceSlice:0
+              sourceLevel:0
+             sourceOrigin:MTLOriginMake(0, 0, 0)
+               sourceSize:MTLSizeMake(mmDims[0], mmDims[1], mmDims[2])
+                toTexture:permTex
+         destinationSlice:0
+         destinationLevel:0
+        destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+    [copyCmdBuf commit];
+
+    [rawOcc release];
+    [dilatedOcc release];
+
+    this->MinMaxUploadTime.Modified();
+  }
+
+  return this->MinMaxTexture != nullptr;
 }
 
 //------------------------------------------------------------------------------
@@ -4476,17 +4750,39 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     this->ScalarRange[1] = 1.0;
   }
 
-  // Update min-max acceleration texture BEFORE volume texture.
-  // UpdateBlockTextures (inside UpdateVolumeTexture) uses the per-macrocell
-  // scalar ranges computed here to avoid re-walking every voxel.
-  // For partitioned volumes, we still need the macrocell data but skip
-  // creating the global texture — blocks build their own min-max textures.
+  // Phase 5: GPU-accelerated min-max generation.
+  // For single-block volumes with UseGPUMinMax, we must upload the volume
+  // texture first, then dispatch compute kernels. For partitioned volumes
+  // (or when GPU min-max is disabled), the CPU path runs before volume
+  // upload so that UpdateBlockTextures can reuse the per-macrocell data.
   bool usePartitions = (this->Partitions[0] > 1 || this->Partitions[1] > 1 || this->Partitions[2] > 1);
-  this->UpdateMinMaxTexture(mtlDevice, vol, input, scalars, usePartitions);
 
-  if (!this->UpdateVolumeTexture(mtlDevice, mtlQueue, vol))
+  if (this->UseGPUMinMax && !usePartitions)
   {
-    return;
+    // GPU min-max path: upload volume texture first, then dispatch compute.
+    if (!this->UpdateVolumeTexture(mtlDevice, mtlQueue, vol))
+    {
+      return;
+    }
+
+    if (!this->ComputeMinMaxGPU(mtlDevice, mtlQueue, vol, input, scalars))
+    {
+      // GPU path failed — release any private texture so the CPU
+      // fallback's replaceRegion (which needs StorageModeShared) works.
+      ReleaseMetalObject(this->MinMaxTexture);
+      this->UpdateMinMaxTexture(mtlDevice, vol, input, scalars, false);
+    }
+  }
+  else
+  {
+    // CPU min-max path: compute from raw scalar data before volume upload.
+    // Partitioned volumes still need CPU macrocell data for per-block ranges.
+    this->UpdateMinMaxTexture(mtlDevice, vol, input, scalars, usePartitions);
+
+    if (!this->UpdateVolumeTexture(mtlDevice, mtlQueue, vol))
+    {
+      return;
+    }
   }
 
   // Precompute gradient/normal texture for non-partitioned volumes (Phase 4).

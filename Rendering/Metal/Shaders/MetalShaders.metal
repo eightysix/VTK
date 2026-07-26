@@ -2054,6 +2054,90 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
   return output;
 }
 
+// ============================================================================
+// GPU Min-Max Acceleration: compute kernels
+// Phase 5: GPU-based empty-space skipping generation.
+// Generates an R8Unorm occupancy texture where >0.5 means empty,
+// 0.0 means solid. The fragment shader uses this to skip empty space.
+// ============================================================================
+
+struct MinMaxComputeUniforms {
+  uint  mmDimX, mmDimY, mmDimZ;   // macrocell grid dimensions
+  uint  volDimX, volDimY, volDimZ; // full volume voxel dimensions
+  float ds;                       // downsampling factor (typically 4.0)
+  float scalarMin;                // ScalarRange[0]
+  float scalarScale;              // 255.0 / (ScalarRange[1] - ScalarRange[0])
+  float _pad;
+  uint  opacityPrefix[257];       // prefix sum: opacityPrefix[i] = count of non-zero opacity entries for indices < i
+};
+
+kernel void volume_compute_minmax(
+    texture3d<float, access::sample> volume [[texture(0)]],
+    texture3d<float, access::write>  occupancy [[texture(1)]],
+    constant MinMaxComputeUniforms& u [[buffer(0)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  if (any(gid >= uint3(u.mmDimX, u.mmDimY, u.mmDimZ))) return;
+
+  uint ds = uint(u.ds);
+  uint3 start = gid * ds;
+  uint3 end = min(start + ds, uint3(u.volDimX, u.volDimY, u.volDimZ));
+
+  float cellMin = INFINITY;
+  float cellMax = -INFINITY;
+  float3 volDims = float3(u.volDimX, u.volDimY, u.volDimZ);
+
+  for (uint z = start.z; z < end.z; z++) {
+    for (uint y = start.y; y < end.y; y++) {
+      for (uint x = start.x; x < end.x; x++) {
+        float3 pos = (float3(x, y, z) + 0.5) / volDims;
+        float v = volume.sample(sNearest, pos, level(0)).r;
+        cellMin = min(cellMin, v);
+        cellMax = max(cellMax, v);
+      }
+    }
+  }
+
+  // Check emptiness via opacity prefix table
+  if (cellMin <= cellMax) {
+    float tf = (cellMin - u.scalarMin) * u.scalarScale;
+    uint idxMin = clamp(uint(tf), 0u, 255u);
+    tf = (cellMax - u.scalarMin) * u.scalarScale;
+    uint idxMax = clamp(uint(tf), 0u, 255u);
+    bool empty = (u.opacityPrefix[idxMax + 1] == u.opacityPrefix[idxMin]);
+    occupancy.write(empty ? 1.0 : 0.0, gid);
+  } else {
+    occupancy.write(1.0, gid);
+  }
+}
+
+kernel void volume_dilate_minmax(
+    texture3d<float, access::read> src [[texture(0)]],
+    texture3d<float, access::write> dst [[texture(1)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  uint3 dims = uint3(dst.get_width(), dst.get_height(), dst.get_depth());
+  if (any(gid >= dims)) return;
+
+  bool solid = false;
+  int3 g = int3(gid);
+
+  for (int dz = -1; dz <= 1 && !solid; dz++) {
+    for (int dy = -1; dy <= 1 && !solid; dy++) {
+      for (int dx = -1; dx <= 1 && !solid; dx++) {
+        int3 n = g + int3(dx, dy, dz);
+        if (all(n >= 0) && all(n < int3(dims))) {
+          if (src.read(uint3(n)).r < 0.5) {
+            solid = true;
+          }
+        }
+      }
+    }
+  }
+
+  dst.write(solid ? 0.0 : 1.0, gid);
+}
+
 fragment float4 fragment_image_sample_blit(
     FullscreenVertexOut in [[stage_in]],
     texture2d<float> offscreenColor [[texture(0)]]) {
