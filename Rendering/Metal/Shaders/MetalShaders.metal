@@ -1527,6 +1527,38 @@ inline half4 marchVolume(
         curCellEmpty = minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5;
       }
 
+      bool allEmpty = simd_all(curCellEmpty);
+      if (allEmpty) {
+        float3 cellCoord = mmPos * mmDimF;
+        float3 fractCoord = fract(cellCoord);
+
+        float3 distToEdge;
+        distToEdge.x = rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x;
+        distToEdge.y = rayDir.y > 0.0 ? (1.0 - fractCoord.y) : fractCoord.y;
+        distToEdge.z = rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
+        distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
+
+        float3 tToEdge;
+        tToEdge.x = abs(rayDirTexLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirTexLocal.x * mmDimF.x) : 1e30;
+        tToEdge.y = abs(rayDirTexLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirTexLocal.y * mmDimF.y) : 1e30;
+        tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
+
+        float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
+        exactSkip += 1e-4;
+        float skipDist = ceil(exactSkip / stepSize) * stepSize;
+        skipDist = max(stepSize, skipDist);
+
+        currentPoint += rayDir * skipDist;
+        currentT += skipDist;
+
+        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= totalBoxT) {
+          break;
+        }
+
+        prefetchValid = false;
+        curCell = int3(-1);
+        continue;
+      }
       if (curCellEmpty) {
         float3 cellCoord = mmPos * mmDimF;
         float3 fractCoord = fract(cellCoord);
@@ -1689,12 +1721,18 @@ fragment VolumeFragmentOut fragment_volume_main(
 
   float3 rayDir = in.localPos - cameraPos;
   float dirLength = length(rayDir);
-  if (dirLength < 0.0001) discard_fragment();
+  if (dirLength < 0.0001) {
+    output.color = float4(0.0);
+    return output;
+  }
 
   rayDir /= dirLength;
   float2 t = intersectBox(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal);
   float tStart = max(t.x, 0.0);
-  if (tStart >= t.y) discard_fragment();
+  if (tStart >= t.y) {
+    output.color = float4(0.0);
+    return output;
+  }
 
   float3 entryPoint = cameraPos + rayDir * tStart;
   float3 exitPoint = cameraPos + rayDir * t.y;
@@ -1705,20 +1743,27 @@ fragment VolumeFragmentOut fragment_volume_main(
     float4 planeOrigins[8] = { volumeUniforms.clippingPlane0Origin, volumeUniforms.clippingPlane1Origin, volumeUniforms.clippingPlane2Origin, volumeUniforms.clippingPlane3Origin, volumeUniforms.clippingPlane4Origin, volumeUniforms.clippingPlane5Origin, volumeUniforms.clippingPlane6Origin, volumeUniforms.clippingPlane7Origin };
     float4 planeNormals[8] = { volumeUniforms.clippingPlane0Normal, volumeUniforms.clippingPlane1Normal, volumeUniforms.clippingPlane2Normal, volumeUniforms.clippingPlane3Normal, volumeUniforms.clippingPlane4Normal, volumeUniforms.clippingPlane5Normal, volumeUniforms.clippingPlane6Normal, volumeUniforms.clippingPlane7Normal };
 
+    #pragma unroll
     for (int cp = 0; cp < numClipPlanes; cp++) {
       float3 planeOrigin = planeOrigins[cp].xyz;
       float3 planeNormal = normalize(planeNormals[cp].xyz);
       float startDistance = dot(planeNormal, planeOrigin - entryPoint);
       float stopDistance = dot(planeNormal, planeOrigin - exitPoint);
 
-      if (startDistance > 0.0 && stopDistance > 0.0) discard_fragment();
+      if (startDistance > 0.0 && stopDistance > 0.0) {
+        output.color = float4(0.0);
+        return output;
+      }
       float rayDotNormal = dot(rayDir, planeNormal);
 
       if (rayDotNormal > 0.0 && startDistance > 0.0) entryPoint += (startDistance / rayDotNormal) * rayDir;
       if (rayDotNormal <= 0.0 && stopDistance > 0.0) exitPoint += (stopDistance / rayDotNormal) * rayDir;
     }
     totalDist = length(exitPoint - entryPoint);
-    if (totalDist < 1e-6) discard_fragment();
+    if (totalDist < 1e-6) {
+      output.color = float4(0.0);
+      return output;
+    }
   }
 
   float tTerminateMax = 1e30;
@@ -1782,7 +1827,10 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
 
   float2 t = intersectBox(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal);
   float tStart = max(t.x, 0.0);
-  if (tStart >= t.y) discard_fragment();
+  if (tStart >= t.y) {
+    output.color = float4(0.0);
+    return output;
+  }
 
   float3 entryPoint = cameraPos + rayDir * tStart;
   float3 exitPoint = cameraPos + rayDir * t.y;
@@ -1793,20 +1841,27 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
     float4 planeOrigins[8] = { volumeUniforms.clippingPlane0Origin, volumeUniforms.clippingPlane1Origin, volumeUniforms.clippingPlane2Origin, volumeUniforms.clippingPlane3Origin, volumeUniforms.clippingPlane4Origin, volumeUniforms.clippingPlane5Origin, volumeUniforms.clippingPlane6Origin, volumeUniforms.clippingPlane7Origin };
     float4 planeNormals[8] = { volumeUniforms.clippingPlane0Normal, volumeUniforms.clippingPlane1Normal, volumeUniforms.clippingPlane2Normal, volumeUniforms.clippingPlane3Normal, volumeUniforms.clippingPlane4Normal, volumeUniforms.clippingPlane5Normal, volumeUniforms.clippingPlane6Normal, volumeUniforms.clippingPlane7Normal };
 
+    #pragma unroll
     for (int cp = 0; cp < numClipPlanes; cp++) {
       float3 planeOrigin = planeOrigins[cp].xyz;
       float3 planeNormal = normalize(planeNormals[cp].xyz);
       float startDistance = dot(planeNormal, planeOrigin - entryPoint);
       float stopDistance = dot(planeNormal, planeOrigin - exitPoint);
 
-      if (startDistance > 0.0 && stopDistance > 0.0) discard_fragment();
+      if (startDistance > 0.0 && stopDistance > 0.0) {
+        output.color = float4(0.0);
+        return output;
+      }
       float rayDotNormal = dot(rayDir, planeNormal);
 
       if (rayDotNormal > 0.0 && startDistance > 0.0) entryPoint += (startDistance / rayDotNormal) * rayDir;
       if (rayDotNormal <= 0.0 && stopDistance > 0.0) exitPoint += (stopDistance / rayDotNormal) * rayDir;
     }
     totalDist = length(exitPoint - entryPoint);
-    if (totalDist < 1e-6) discard_fragment();
+    if (totalDist < 1e-6) {
+      output.color = float4(0.0);
+      return output;
+    }
   }
 
   float tTerminateMax = 1e30;
@@ -1871,7 +1926,10 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
   rayDir /= dirLength;
   float2 t = intersectBox(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal);
   float tStart = max(t.x, 0.0);
-  if (tStart >= t.y) discard_fragment();
+  if (tStart >= t.y) {
+    output.color = float4(0.0);
+    return output;
+  }
 
   float3 entryPoint = cameraPos + rayDir * tStart;
   float3 exitPoint = cameraPos + rayDir * t.y;
@@ -1882,20 +1940,27 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     float4 planeOrigins[8] = { volumeUniforms.clippingPlane0Origin, volumeUniforms.clippingPlane1Origin, volumeUniforms.clippingPlane2Origin, volumeUniforms.clippingPlane3Origin, volumeUniforms.clippingPlane4Origin, volumeUniforms.clippingPlane5Origin, volumeUniforms.clippingPlane6Origin, volumeUniforms.clippingPlane7Origin };
     float4 planeNormals[8] = { volumeUniforms.clippingPlane0Normal, volumeUniforms.clippingPlane1Normal, volumeUniforms.clippingPlane2Normal, volumeUniforms.clippingPlane3Normal, volumeUniforms.clippingPlane4Normal, volumeUniforms.clippingPlane5Normal, volumeUniforms.clippingPlane6Normal, volumeUniforms.clippingPlane7Normal };
 
+    #pragma unroll
     for (int cp = 0; cp < numClipPlanes; cp++) {
       float3 planeOrigin = planeOrigins[cp].xyz;
       float3 planeNormal = normalize(planeNormals[cp].xyz);
       float startDistance = dot(planeNormal, planeOrigin - entryPoint);
       float stopDistance = dot(planeNormal, planeOrigin - exitPoint);
 
-      if (startDistance > 0.0 && stopDistance > 0.0) discard_fragment();
+      if (startDistance > 0.0 && stopDistance > 0.0) {
+        output.color = float4(0.0);
+        return output;
+      }
       float rayDotNormal = dot(rayDir, planeNormal);
 
       if (rayDotNormal > 0.0 && startDistance > 0.0) entryPoint += (startDistance / rayDotNormal) * rayDir;
       if (rayDotNormal <= 0.0 && stopDistance > 0.0) exitPoint += (stopDistance / rayDotNormal) * rayDir;
     }
     totalDist = length(exitPoint - entryPoint);
-    if (totalDist < 1e-6) discard_fragment();
+    if (totalDist < 1e-6) {
+      output.color = float4(0.0);
+      return output;
+    }
   }
 
   float tTerminateMax = 1e30;
