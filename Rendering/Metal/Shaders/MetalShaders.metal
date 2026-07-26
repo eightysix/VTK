@@ -1285,7 +1285,7 @@ struct VolumeMapperUniforms {
   float4 cameraVolumePos;
   float4x4 viewProjection;
   half sampleDistance;
-  half _pdSD;             // padding — was upper half of float sampleDistance
+  half opacityPreIntegrationFactor; // stepDistance/unitDistance for shader-side opacity pre-integration
   half scalarMin;
   half _pdSM;             // padding — was upper half of float scalarMin
   half scalarMax;
@@ -1618,6 +1618,12 @@ inline half4 marchVolume(
     }
 
     half sampleOpacity = colorOpacity.a;
+    // Shader-side opacity pre-integration: adjust raw opacity by step distance.
+    // Avoids CPU rebuild of the TF texture when sample distance changes.
+    half stepFactor = volumeUniforms.opacityPreIntegrationFactor;
+    if (sampleOpacity > 0.0001h && stepFactor > 0.0h) {
+        sampleOpacity = 1.0h - pow(1.0h - sampleOpacity, stepFactor);
+    }
 
     if (sampleOpacity > 0.001h) {
       half3 sampleColor = colorOpacity.rgb;

@@ -55,7 +55,7 @@ struct VolumeMapperUniforms
   float CameraVolumePos[4];          // 160..175
   float ViewProjectionMatrix[16];    // 176..239
   uint16_t SampleDistanceHalf;      // 240  (half precision: sufficient for [0,1] space)
-  uint16_t _padSD;                  // 242  (padding — was upper half of float SampleDistance)
+  uint16_t OpacityPreIntegrationFactorHalf; // 242  (half: sampleDistance/unitDistance for shader-side pre-integration)
   uint16_t ScalarMinHalf;           // 244
   uint16_t _padSM;                  // 246
   uint16_t ScalarMaxHalf;           // 248
@@ -1693,7 +1693,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
 
 //------------------------------------------------------------------------------
 bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
-  void* mtlDeviceVoid, void* mtlQueueVoid, vtkVolume* vol, double actualSampleDistance)
+  void* mtlDeviceVoid, void* mtlQueueVoid, vtkVolume* vol)
 {
   vtkVolumeProperty* property = vol->GetProperty();
   if (!property)
@@ -1716,21 +1716,12 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
   doReload |= (colorFunc->GetMTime() > this->TransferFunctionUploadTime.GetMTime());
   doReload |= (opacityFunc->GetMTime() > this->TransferFunctionUploadTime.GetMTime());
   doReload |= scalarRangeChanged;
-  // Re-upload when sample distance changes (affects opacity pre-integration)
-  doReload |= (actualSampleDistance != this->LastTransferFunctionSampleDistance);
 
   if (doReload)
   {
     @autoreleasepool
     {
       id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
-
-      // Pre-integration factor: matches OpenGL mapper's opacity table correction.
-      // The OpenGL mapper applies: adjusted = 1 - pow(1 - raw, sampleDistance / unitDistance)
-      // This bakes the step distance into the opacity texture so the shader
-      // can use simple front-to-back compositing without multiplying by step distance.
-      const double unitDistance = property->GetScalarOpacityUnitDistance(0);
-      const double factor = actualSampleDistance / unitDistance;
 
       unsigned char tfData[256 * 4];
       for (int i = 0; i < 256; ++i)
@@ -1739,12 +1730,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
         double rgb[3];
         colorFunc->GetColor(val, rgb);
         double opacity = opacityFunc->GetValue(val);
-
-        // Pre-integrate opacity (matches vtkOpenGLVolumeOpacityTable::InternalUpdate)
-        if (opacity > 0.0001)
-        {
-          opacity = 1.0 - pow(1.0 - opacity, factor);
-        }
 
         rgb[0] = std::clamp(rgb[0], 0.0, 1.0);
         rgb[1] = std::clamp(rgb[1], 0.0, 1.0);
@@ -1796,7 +1781,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
       this->LastTransferFunctionScalarRange[0] = this->ScalarRange[0];
       this->LastTransferFunctionScalarRange[1] = this->ScalarRange[1];
       this->TransferFunctionUploadTime.Modified();
-      this->LastTransferFunctionSampleDistance = actualSampleDistance;
     }
   }
 
@@ -5756,7 +5740,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     actualSampleDistance = this->GetSampleDistance();
   }
 
-  if (!this->UpdateTransferFunctionTexture(mtlDevice, mtlQueue, vol, actualSampleDistance))
+  if (!this->UpdateTransferFunctionTexture(mtlDevice, mtlQueue, vol))
   {
     return;
   }
@@ -5834,6 +5818,16 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   uniforms.SampleDistanceHalf =
     FloatToHalf(static_cast<float>(actualSampleDistance / maxBoundsSize));
+
+  // Opacity pre-integration factor: stepDistance / unitDistance.
+  // Applied in the shader: alpha = 1.0 - pow(1.0 - alpha, factor).
+  {
+    vtkVolumeProperty* volProp = vol->GetProperty();
+    double unitDist = volProp ? volProp->GetScalarOpacityUnitDistance(0) : 1.0;
+    if (unitDist <= 0.0) unitDist = 1.0;
+    uniforms.OpacityPreIntegrationFactorHalf =
+      FloatToHalf(static_cast<float>(actualSampleDistance / unitDist));
+  }
 
   {
     float normFactor = this->ScalarNormalizationFactor;
