@@ -428,6 +428,91 @@ void ConvertVolumeData(const void* src, int dataType, int numComponents,
   }
 }
 
+//------------------------------------------------------------------------------
+// Compute a conservative screen-space rectangle for a model-space AABB.
+// Useful for setting MTLScissorRect to restrict rasterization to the brick's
+// projected footprint.  Returns {0,0,0,0} when the AABB projects to zero area
+// (fully off-screen or degenerate).
+MTLScissorRect ComputeModelAABBScreenRect(
+  const double boundsMin[3],
+  const double boundsMax[3],
+  const float viewProjMatrix[16],
+  const float volumeToWorldMatrix[16],
+  int viewWidth,
+  int viewHeight)
+{
+  double minX = std::numeric_limits<double>::max();
+  double maxX = -std::numeric_limits<double>::max();
+  double minY = std::numeric_limits<double>::max();
+  double maxY = -std::numeric_limits<double>::max();
+
+  double corners[8][3] = {
+    {boundsMin[0], boundsMin[1], boundsMin[2]},
+    {boundsMax[0], boundsMin[1], boundsMin[2]},
+    {boundsMax[0], boundsMax[1], boundsMin[2]},
+    {boundsMin[0], boundsMax[1], boundsMin[2]},
+    {boundsMin[0], boundsMin[1], boundsMax[2]},
+    {boundsMax[0], boundsMin[1], boundsMax[2]},
+    {boundsMax[0], boundsMax[1], boundsMax[2]},
+    {boundsMin[0], boundsMax[1], boundsMax[2]},
+  };
+
+  bool anyBehind = false;
+
+  for (int i = 0; i < 8; ++i)
+  {
+    double mx = corners[i][0];
+    double my = corners[i][1];
+    double mz = corners[i][2];
+
+    // Model-space -> world-space via volumeToWorldMatrix (column-major)
+    double wx = volumeToWorldMatrix[0] * mx + volumeToWorldMatrix[1] * my + volumeToWorldMatrix[2] * mz + volumeToWorldMatrix[3];
+    double wy = volumeToWorldMatrix[4] * mx + volumeToWorldMatrix[5] * my + volumeToWorldMatrix[6] * mz + volumeToWorldMatrix[7];
+    double wz = volumeToWorldMatrix[8] * mx + volumeToWorldMatrix[9] * my + volumeToWorldMatrix[10] * mz + volumeToWorldMatrix[11];
+    double ww = volumeToWorldMatrix[12] * mx + volumeToWorldMatrix[13] * my + volumeToWorldMatrix[14] * mz + volumeToWorldMatrix[15];
+
+    // World-space -> clip-space via viewProjectionMatrix (column-major)
+    double cx = viewProjMatrix[0] * wx + viewProjMatrix[1] * wy + viewProjMatrix[2] * wz + viewProjMatrix[3] * ww;
+    double cy = viewProjMatrix[4] * wx + viewProjMatrix[5] * wy + viewProjMatrix[6] * wz + viewProjMatrix[7] * ww;
+    double cz = viewProjMatrix[8] * wx + viewProjMatrix[9] * wy + viewProjMatrix[10] * wz + viewProjMatrix[11] * ww;
+    double cw = viewProjMatrix[12] * wx + viewProjMatrix[13] * wy + viewProjMatrix[14] * wz + viewProjMatrix[15] * ww;
+
+    // Corner is behind the camera — projection may extend across full viewport.
+    if (cw < 0.0) { anyBehind = true; continue; }
+    if (fabs(cw) < 1e-12) continue;
+
+    double ndcX = cx / cw;
+    double ndcY = cy / cw;
+
+    // Screen space: Metal NDC is [-1,1] with y-up; screen y is top-down.
+    double screenX = (ndcX + 1.0) * 0.5 * viewWidth;
+    double screenY = (1.0 - ndcY) * 0.5 * viewHeight;
+
+    if (screenX < minX) minX = screenX;
+    if (screenX > maxX) maxX = screenX;
+    if (screenY < minY) minY = screenY;
+    if (screenY > maxY) maxY = screenY;
+  }
+
+  // AABB crosses the near plane — conservative: cover the whole viewport.
+  if (anyBehind)
+    return {0, 0, static_cast<NSUInteger>(viewWidth), static_cast<NSUInteger>(viewHeight)};
+
+  if (maxX <= minX || maxY <= minY)
+    return {0, 0, 0, 0};
+
+  int ix = std::max(0, static_cast<int>(std::floor(minX)));
+  int iy = std::max(0, static_cast<int>(std::floor(minY)));
+  int iw = std::min(static_cast<int>(std::ceil(maxX)), viewWidth) - ix;
+  int ih = std::min(static_cast<int>(std::ceil(maxY)), viewHeight) - iy;
+
+  if (iw <= 0 || ih <= 0)
+    return {0, 0, 0, 0};
+
+  return {static_cast<NSUInteger>(ix), static_cast<NSUInteger>(iy),
+          static_cast<NSUInteger>(iw), static_cast<NSUInteger>(ih)};
+}
+
 // Release a Metal object held as a void* member (MRC helper).
 // Uses -release rather than CFRelease for proper Objective-C semantics.
 inline void ReleaseMetalObject(void*& obj)
@@ -6685,6 +6770,15 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         MTLViewport vp = {0, 0, (double)fboWidth, (double)fboHeight, 0.0, 1.0};
         [layerEnc setViewport:vp];
 
+        // Restrict rasterization to the brick's projected screen-space footprint.
+        // Reduces overdraw from fullscreen passes, especially for small bricks.
+        MTLScissorRect sr = ComputeModelAABBScreenRect(
+          block.BoundsMin, block.BoundsMax,
+          uniforms.ViewProjectionMatrix, uniforms.VolumeToWorldMatrix,
+          fboWidth, fboHeight);
+        if (sr.width > 0 && sr.height > 0)
+          [layerEnc setScissorRect:sr];
+
         PerBlockData pbd = {};
         pbd.VolumeBoundsMin[0] = static_cast<float>(block.BoundsMin[0]);
         pbd.VolumeBoundsMin[1] = static_cast<float>(block.BoundsMin[1]);
@@ -6830,6 +6924,44 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       crpd.colorAttachments[0].storeAction = MTLStoreActionStore;
       id<MTLRenderCommandEncoder> compEnc = [commandBuffer renderCommandEncoderWithDescriptor:crpd];
       [compEnc setViewport:(MTLViewport){0, 0, (double)fboWidth, (double)fboHeight, 0.0, 1.0}];
+
+      // Restrict composite rasterization to the union of all brick screen-space
+      // projections so the layer-composite shader runs only where bricks exist.
+      {
+        int unionMinX = std::numeric_limits<int>::max();
+        int unionMinY = std::numeric_limits<int>::max();
+        int unionMaxX = 0, unionMaxY = 0;
+        bool anyValid = false;
+        for (size_t bi = 0; bi < this->SortedBlockOrder.size(); ++bi)
+        {
+          auto& block = this->Blocks[this->SortedBlockOrder[bi]];
+          MTLScissorRect sr = ComputeModelAABBScreenRect(
+            block.BoundsMin, block.BoundsMax,
+            uniforms.ViewProjectionMatrix, uniforms.VolumeToWorldMatrix,
+            fboWidth, fboHeight);
+          if (sr.width > 0 && sr.height > 0)
+          {
+            int sx = static_cast<int>(sr.x);
+            int sy = static_cast<int>(sr.y);
+            unionMinX = std::min(unionMinX, sx);
+            unionMinY = std::min(unionMinY, sy);
+            unionMaxX = std::max(unionMaxX, sx + static_cast<int>(sr.width));
+            unionMaxY = std::max(unionMaxY, sy + static_cast<int>(sr.height));
+            anyValid = true;
+          }
+        }
+        if (anyValid)
+        {
+          MTLScissorRect unionRect = {
+            static_cast<NSUInteger>(unionMinX),
+            static_cast<NSUInteger>(unionMinY),
+            static_cast<NSUInteger>(unionMaxX - unionMinX),
+            static_cast<NSUInteger>(unionMaxY - unionMinY)
+          };
+          [compEnc setScissorRect:unionRect];
+        }
+      }
+
       [compEnc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)this->CompositePipelineState];
       [compEnc setCullMode:MTLCullModeNone];
       [compEnc setFragmentBuffer:uniformBuf offset:0 atIndex:1];
