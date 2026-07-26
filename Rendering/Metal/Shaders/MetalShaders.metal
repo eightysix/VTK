@@ -1431,6 +1431,236 @@ inline int computeCropRegion(float3 cropMin, float3 cropMax, float3 pos) {
   return r.x + r.y * 3 + r.z * 9;
 }
 
+inline half4 marchVolume(
+    float3 entryPoint,
+    float3 exitPoint,
+    float totalDist,
+    float tTerminateMax,
+    float3 rayDir,
+    float3 blockMinGlobal,
+    float3 blockMaxGlobal,
+    float3 texMinGlobal,
+    float3 texMaxGlobal,
+    float3 cameraPos,
+    float stepSize,
+    float totalBoxT,
+    float2 screenPos,
+    half3 initialColor,
+    half initialOpacity,
+    constant VolumeMapperUniforms& volumeUniforms,
+    constant PerBlockData& b,
+    texture3d<float> volumeTexture,
+    texture2d<float> transferFunctionTexture,
+    texture2d<float> depthTexture,
+    texture2d<float> gradientOpacityTexture,
+    texture3d<float> maskTexture,
+    texture2d<float> labelMapTransferTexture,
+    texture3d<float> minMaxTexture,
+    texture3d<float> normalTexture) {
+  const bool doShading = fc_shading && (volumeUniforms.useGradientShading > 0.5);
+  const bool doGradOp = fc_gradientOpacity && (volumeUniforms.useGradientOpacity > 0.5);
+  const bool doCropping = volumeUniforms.useCropping > 0.5;
+  const bool doMask = fc_mask && (volumeUniforms.useMask > 0.5);
+
+  half scalarScale = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
+  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+
+  half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
+
+  float3 texSizeGlobal = max(texMaxGlobal - texMinGlobal, 1e-6);
+  float3 invTexSizeGlobal = 1.0 / texSizeGlobal;
+  float3 rayDirTexLocal = rayDir * invTexSizeGlobal;
+  float3 dt = max(volumeUniforms.gradientStep, 1e-8);
+  half3 gradScale = half3(1.0 / (dt * texSizeGlobal));
+
+  half3 viewDirHalf  = half3(normalize(entryPoint - cameraPos));
+  half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection));
+  half3 ambientMat   = half3(volumeUniforms.ambientColor.rgb);
+  half3 diffuseMat   = half3(volumeUniforms.diffuseColor.rgb);
+  half3 specularMat  = half3(volumeUniforms.specularColor.rgb);
+  half shininessMat  = half(volumeUniforms.shininess);
+
+  float maskScale = volumeUniforms.maskScale;
+  float maskBias  = volumeUniforms.maskBias;
+  float numLabels = volumeUniforms.labelMapNumLabels;
+
+  float3 cropMin = float3(volumeUniforms.croppingPlanes.x, volumeUniforms.croppingPlanes.z, volumeUniforms.croppingPlanes2.x);
+  float3 cropMax = float3(volumeUniforms.croppingPlanes.y, volumeUniforms.croppingPlanes.w, volumeUniforms.croppingPlanes2.y);
+
+  uint cropBitmask = volumeUniforms.croppingBitmask;
+
+  float jitter = volumeUniforms.useJittering > 0.5 ? volume_random(screenPos) * stepSize : 0.0;
+  float3 stepVec = rayDir * stepSize;
+  float3 currentPoint = entryPoint + (rayDir * jitter);
+  float currentT = jitter;
+
+  int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
+
+  half3 accumulatedColor = initialColor;
+  half accumulatedOpacity = initialOpacity;
+
+  float3 texLocalPos0 = (currentPoint - texMinGlobal) * invTexSizeGlobal;
+  float3 evalPoint0 = texLocalPos0;
+  float prefetchScalar = volumeTexture.sample(sVolume, evalPoint0, level(0)).r;
+  float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint0, level(0)).r : 0.0;
+  bool prefetchValid = true;
+  int3  curCell     = int3(-1);
+  bool  curCellEmpty = false;
+  float3 mmDimF     = b.minMaxInfo.yzw;
+
+  for (int i = 0; i < maxSteps; i++) {
+    if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
+
+    if (fc_minmax &&
+        b.minMaxInfo.x > 0.5 &&
+        b.minMaxInfo.y > 0.5 &&
+        b.minMaxInfo.z > 0.5 &&
+        b.minMaxInfo.w > 0.5) {
+      float3 texLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
+      float3 mmPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+      int3 newCell = min(int3(mmPos * mmDimF), int3(mmDimF) - 1);
+      if (any(newCell != curCell)) {
+        curCell      = newCell;
+        curCellEmpty = minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5;
+      }
+
+      if (curCellEmpty) {
+        float3 cellCoord = mmPos * mmDimF;
+        float3 fractCoord = fract(cellCoord);
+
+        float3 distToEdge;
+        distToEdge.x = rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x;
+        distToEdge.y = rayDir.y > 0.0 ? (1.0 - fractCoord.y) : fractCoord.y;
+        distToEdge.z = rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
+        distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
+
+        float3 tToEdge;
+        tToEdge.x = abs(rayDirTexLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirTexLocal.x * mmDimF.x) : 1e30;
+        tToEdge.y = abs(rayDirTexLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirTexLocal.y * mmDimF.y) : 1e30;
+        tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
+
+        float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
+        exactSkip += 1e-4;
+        float skipDist = ceil(exactSkip / stepSize) * stepSize;
+        skipDist = max(stepSize, skipDist);
+
+        currentPoint += rayDir * skipDist;
+        currentT += skipDist;
+
+        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= totalBoxT) {
+          break;
+        }
+
+        prefetchValid = false;
+        curCell = int3(-1);
+        continue;
+      }
+    }
+
+    float3 texLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
+    float3 evalPoint = texLocalPos;
+    bool needsFetch = !prefetchValid;
+    float rawScalar = needsFetch
+      ? volumeTexture.sample(sVolume, evalPoint, level(0)).r
+      : prefetchScalar;
+    float rawMask = (doMask && needsFetch)
+      ? maskTexture.sample(sNearest, evalPoint, level(0)).r
+      : prefetchMask;
+
+    float3 lastPoint = currentPoint;
+    currentPoint += stepVec;
+    currentT += stepSize;
+
+    if (i + 1 < maxSteps) {
+      float3 nextTexLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
+      float3 nextEvalPoint = nextTexLocalPos;
+      prefetchScalar = volumeTexture.sample(sVolume, nextEvalPoint, level(0)).r;
+      if (doMask) {
+        prefetchMask = maskTexture.sample(sNearest, nextEvalPoint, level(0)).r;
+      }
+      prefetchValid = true;
+    }
+
+    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, lastPoint))) == 0u)) {
+      continue;
+    }
+
+    half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
+
+    half4 colorOpacity;
+    half maskLabel = 0.0h;
+
+    if (doMask) {
+      float maskVal = rawMask * maskScale + maskBias;
+      if (numLabels > 0.0) {
+        float label = floor(maskVal + 0.5);
+        if (label > 0.0) {
+          label = clamp(label, 1.0, numLabels - 1.0);
+          float labelY = (label + 0.5) / numLabels;
+          colorOpacity = half4(labelMapTransferTexture.sample(sNearest, float2(float(scalarNorm), labelY), level(0)));
+        } else {
+          colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
+        }
+      } else {
+        colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
+      }
+    } else {
+      colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
+    }
+
+    half sampleOpacity = colorOpacity.a;
+
+    if (sampleOpacity > 0.001h) {
+      half3 sampleColor = colorOpacity.rgb;
+      half weight = 1.0h - accumulatedOpacity;
+
+      if (sampleOpacity < 0.01h) {
+        accumulatedColor += weight * sampleColor * sampleOpacity;
+        accumulatedOpacity += weight * sampleOpacity;
+      } else {
+
+      if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
+
+        half3 normal;
+        half gradMag;
+
+        if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
+          half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
+          normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
+          gradMag = nrmSample.w;
+        } else {
+          half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
+          normal = grad.xyz;
+          gradMag = grad.w;
+        }
+
+        sampleColor = computePhongLightingVolumeFast(sampleColor, normal, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
+
+        if (doGradOp) {
+          sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(gradMag), 0.5), level(0)).r);
+        }
+      } else if (doShading) {
+        sampleColor = ambientMat * sampleColor;
+      }
+
+      accumulatedColor += weight * sampleColor * sampleOpacity;
+      accumulatedOpacity += weight * sampleOpacity;
+      }
+    }
+
+    if (accumulatedOpacity >= 0.99h) {
+      accumulatedColor /= max(accumulatedOpacity, 1e-4h);
+      accumulatedOpacity = 1.0h;
+      break;
+    }
+    if (currentT >= tTerminateMax) {
+      break;
+    }
+  }
+
+  return half4(accumulatedColor, accumulatedOpacity);
+}
+
 fragment VolumeFragmentOut fragment_volume_main(
     VolumeVertexOut in [[stage_in]],
     bool isFrontFace [[front_facing]],
@@ -1504,231 +1734,8 @@ fragment VolumeFragmentOut fragment_volume_main(
     }
   }
 
-  // --- LOCAL CACHE WARM-UP ---
-  const bool doShading = fc_shading && (volumeUniforms.useGradientShading > 0.5);
-  const bool doGradOp = fc_gradientOpacity && (volumeUniforms.useGradientOpacity > 0.5);
-  const bool doCropping = volumeUniforms.useCropping > 0.5;
-  const bool doMask = fc_mask && (volumeUniforms.useMask > 0.5);
-
-  half scalarScale = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
-  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
-
-  half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
-
-  float3 texSizeGlobal = max(texMaxGlobal - texMinGlobal, 1e-6);
-  float3 invTexSizeGlobal = 1.0 / texSizeGlobal;
-  float3 rayDirTexLocal = rayDir * invTexSizeGlobal;
-  float3 dt = max(volumeUniforms.gradientStep, 1e-8);
-  half3 gradScale = half3(1.0 / (dt * texSizeGlobal));
-
-  half3 viewDirHalf  = half3(normalize(entryPoint - cameraPos));
-  half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection));
-  half3 ambientMat   = half3(volumeUniforms.ambientColor.rgb);
-  half3 diffuseMat   = half3(volumeUniforms.diffuseColor.rgb);
-  half3 specularMat  = half3(volumeUniforms.specularColor.rgb);
-  half shininessMat  = half(volumeUniforms.shininess);
-
-  float maskScale = volumeUniforms.maskScale;
-  float maskBias  = volumeUniforms.maskBias;
-  float numLabels = volumeUniforms.labelMapNumLabels;
-
-  float3 cropMin = float3(volumeUniforms.croppingPlanes.x, volumeUniforms.croppingPlanes.z, volumeUniforms.croppingPlanes2.x);
-  float3 cropMax = float3(volumeUniforms.croppingPlanes.y, volumeUniforms.croppingPlanes.w, volumeUniforms.croppingPlanes2.y);
-
-  uint cropBitmask = volumeUniforms.croppingBitmask;
-
-  // --- SOFTWARE PIPELINING INITIALIZATION ---
-  float jitter = volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) * stepSize : 0.0;
-  float3 stepVec = rayDir * stepSize;
-  float3 currentPoint = entryPoint + (rayDir * jitter);
-  float currentT = jitter;
-
-  int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
-
-  half3 accumulatedColor = half3(0.0);
-  half accumulatedOpacity = 0.0;
-
-  // PREFETCH the very first samples before the loop starts
-  float3 texLocalPos0 = (currentPoint - texMinGlobal) * invTexSizeGlobal;
-  float3 evalPoint0 = texLocalPos0;
-  float prefetchScalar = volumeTexture.sample(sVolume, evalPoint0, level(0)).r;
-  float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint0, level(0)).r : 0.0;
-  bool prefetchValid = true;
-  int3  curCell     = int3(-1);
-  bool  curCellEmpty = false;
-  float3 mmDimF     = b.minMaxInfo.yzw;
-
-  // --- THE RAYMARCHING LOOP ---
-  for (int i = 0; i < maxSteps; i++) {
-    // Strict check to completely suppress smearing outside partitioned edges
-    if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
-
-    // 0. MIN-MAX ACCELERATION
-    // fc_minmax gates the entire empty-space skipping code at compile time.
-    // If min-max is not in use, this entire block is eliminated by the compiler.
-    if (fc_minmax &&
-        b.minMaxInfo.x > 0.5 &&
-        b.minMaxInfo.y > 0.5 &&
-        b.minMaxInfo.z > 0.5 &&
-        b.minMaxInfo.w > 0.5) {
-      float3 texLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
-      float3 mmPos = clamp(texLocalPos, float3(0.0), float3(1.0));
-      int3 newCell = min(int3(mmPos * mmDimF), int3(mmDimF) - 1);
-      if (any(newCell != curCell)) {
-        curCell      = newCell;
-        curCellEmpty = minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5;
-      }
-
-      if (curCellEmpty) {
-        float3 cellCoord = mmPos * mmDimF;
-        float3 fractCoord = fract(cellCoord);
-
-        float3 distToEdge;
-        distToEdge.x = rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x;
-        distToEdge.y = rayDir.y > 0.0 ? (1.0 - fractCoord.y) : fractCoord.y;
-        distToEdge.z = rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
-        distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
-
-        // rayDirTexLocal precomputed above
-        float3 tToEdge;
-        tToEdge.x = abs(rayDirTexLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirTexLocal.x * mmDimF.x) : 1e30;
-        tToEdge.y = abs(rayDirTexLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirTexLocal.y * mmDimF.y) : 1e30;
-        tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
-
-        float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
-
-        // Add a tiny epsilon to cross the boundary, then quantize to stepSize.
-        exactSkip += 1e-4;
-        float skipDist = ceil(exactSkip / stepSize) * stepSize;
-
-        // Ensure we always move forward at least one step
-        skipDist = max(stepSize, skipDist);
-
-        currentPoint += rayDir * skipDist;
-        currentT += skipDist;
-
-        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y - tStart) {
-          break;
-        }
-
-        prefetchValid = false;
-        curCell = int3(-1);
-        continue;
-      }
-    }
-
-    // 1. Claim prefetched data
-    float3 texLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
-    float3 evalPoint = texLocalPos;
-    bool needsFetch = !prefetchValid;
-    float rawScalar = needsFetch
-      ? volumeTexture.sample(sVolume, evalPoint, level(0)).r
-      : prefetchScalar;
-    float rawMask = (doMask && needsFetch)
-      ? maskTexture.sample(sNearest, evalPoint, level(0)).r
-      : prefetchMask;
-
-    // 2. Advance ray trackers
-    float3 lastPoint = currentPoint;
-    currentPoint += stepVec;
-    currentT += stepSize;
-
-    // 3. LAUNCH PREFETCH FOR NEXT ITERATION
-    if (i + 1 < maxSteps) {
-      float3 nextTexLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
-      float3 nextEvalPoint = nextTexLocalPos;
-      prefetchScalar = volumeTexture.sample(sVolume, nextEvalPoint, level(0)).r;
-      if (doMask) {
-        prefetchMask = maskTexture.sample(sNearest, nextEvalPoint, level(0)).r;
-      }
-      prefetchValid = true;
-    }
-
-    // 4. MATH & EVALUATION
-    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, lastPoint))) == 0u)) {
-      continue;
-    }
-
-    half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
-
-    half4 colorOpacity;
-    half maskLabel = 0.0h;
-
-    if (doMask) {
-      float maskVal = rawMask * maskScale + maskBias;
-      if (numLabels > 0.0) {
-        float label = floor(maskVal + 0.5);
-        if (label > 0.0) {
-          label = clamp(label, 1.0, numLabels - 1.0);
-          float labelY = (label + 0.5) / numLabels;
-          colorOpacity = half4(labelMapTransferTexture.sample(sNearest, float2(float(scalarNorm), labelY), level(0)));
-        } else {
-          colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
-        }
-      } else {
-        colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
-      }
-    } else {
-      colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
-    }
-
-    half sampleOpacity = colorOpacity.a;
-
-    if (sampleOpacity > 0.001h) {
-      half3 sampleColor = colorOpacity.rgb;
-      half weight = 1.0h - accumulatedOpacity;
-
-      // Ghost lighting bypass: skip expensive gradient/lighting for near-transparent voxels
-      if (sampleOpacity < 0.01h) {
-        accumulatedColor += weight * sampleColor * sampleOpacity;
-        accumulatedOpacity += weight * sampleOpacity;
-      } else {
-
-      // Visual Significance Threshold:
-      // If the voxel's actual contribution to the screen is less than 0.002
-      // it is invisible on an 8-bit monitor. Do not waste memory bandwidth shading it.
-      if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
-
-        half3 normal;
-        half gradMag;
-
-        if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
-          half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
-          normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
-          gradMag = nrmSample.w;
-        } else {
-          half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
-          normal = grad.xyz;
-          gradMag = grad.w;
-        }
-
-        sampleColor = computePhongLightingVolumeFast(sampleColor, normal, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
-
-        if (doGradOp) {
-          sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(gradMag), 0.5), level(0)).r);
-        }
-      } else if (doShading) {
-        // Fallback for "invisible" fuzz/noise to maintain baseline brightness
-        sampleColor = ambientMat * sampleColor;
-      }
-
-      accumulatedColor += weight * sampleColor * sampleOpacity;
-      accumulatedOpacity += weight * sampleOpacity;
-      } // end ghost lighting bypass
-    }
-
-    // Early Ray Termination (ERT)
-    if (accumulatedOpacity >= 0.99h) {
-      accumulatedColor /= max(accumulatedOpacity, 1e-4h);
-      accumulatedOpacity = 1.0h;
-      break;
-    }
-    if (currentT >= tTerminateMax) {
-      break;
-    }
-  }
-
-  output.color = float4(float3(accumulatedColor), float(accumulatedOpacity));
+  half4 _marchResult = marchVolume(entryPoint, exitPoint, totalDist, tTerminateMax, rayDir, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos, stepSize, t.y - tStart, in.position.xy, half3(0.0), 0.0h, volumeUniforms, b, volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture, maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
+  output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
 
@@ -1815,218 +1822,8 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
     }
   }
 
-  // --- LOCAL CACHE WARM-UP ---
-  const bool doShading = fc_shading && (volumeUniforms.useGradientShading > 0.5);
-  const bool doGradOp = fc_gradientOpacity && (volumeUniforms.useGradientOpacity > 0.5);
-  const bool doCropping = volumeUniforms.useCropping > 0.5;
-  const bool doMask = fc_mask && (volumeUniforms.useMask > 0.5);
-
-  half scalarScale = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
-  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
-
-  half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
-
-  float3 texSizeGlobal = max(texMaxGlobal - texMinGlobal, 1e-6);
-  float3 invTexSizeGlobal = 1.0 / texSizeGlobal;
-  float3 rayDirTexLocal = rayDir * invTexSizeGlobal;
-  float3 dt = max(volumeUniforms.gradientStep, 1e-8);
-  half3 gradScale = half3(1.0 / (dt * texSizeGlobal));
-
-  half3 viewDirHalf  = half3(normalize(entryPoint - cameraPos));
-  half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection));
-  half3 ambientMat   = half3(volumeUniforms.ambientColor.rgb);
-  half3 diffuseMat   = half3(volumeUniforms.diffuseColor.rgb);
-  half3 specularMat  = half3(volumeUniforms.specularColor.rgb);
-  half shininessMat  = half(volumeUniforms.shininess);
-
-  float maskScale = volumeUniforms.maskScale;
-  float maskBias  = volumeUniforms.maskBias;
-  float numLabels = volumeUniforms.labelMapNumLabels;
-
-  float3 cropMin = float3(volumeUniforms.croppingPlanes.x, volumeUniforms.croppingPlanes.z, volumeUniforms.croppingPlanes2.x);
-  float3 cropMax = float3(volumeUniforms.croppingPlanes.y, volumeUniforms.croppingPlanes.w, volumeUniforms.croppingPlanes2.y);
-
-  uint cropBitmask = volumeUniforms.croppingBitmask;
-
-  // --- SOFTWARE PIPELINING INITIALIZATION ---
-  float jitter = volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) * stepSize : 0.0;
-  float3 stepVec = rayDir * stepSize;
-  float3 currentPoint = entryPoint + (rayDir * jitter);
-  float currentT = jitter;
-
-  int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
-
-  half3 accumulatedColor = half3(0.0);
-  half accumulatedOpacity = 0.0;
-
-  // PREFETCH the very first samples before the loop starts
-  float3 texLocalPos0 = (currentPoint - texMinGlobal) * invTexSizeGlobal;
-  float3 evalPoint0 = texLocalPos0;
-  float prefetchScalar = volumeTexture.sample(sVolume, evalPoint0, level(0)).r;
-  float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint0, level(0)).r : 0.0;
-  bool prefetchValid = true;
-  int3  curCell     = int3(-1);
-  bool  curCellEmpty = false;
-  float3 mmDimF     = b.minMaxInfo.yzw;
-
-  // --- THE RAYMARCHING LOOP ---
-  for (int i = 0; i < maxSteps; i++) {
-    if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
-
-    // 0. MIN-MAX ACCELERATION
-    if (fc_minmax &&
-        b.minMaxInfo.x > 0.5 &&
-        b.minMaxInfo.y > 0.5 &&
-        b.minMaxInfo.z > 0.5 &&
-        b.minMaxInfo.w > 0.5) {
-      float3 texLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
-      float3 mmPos = clamp(texLocalPos, float3(0.0), float3(1.0));
-      int3 newCell = min(int3(mmPos * mmDimF), int3(mmDimF) - 1);
-      if (any(newCell != curCell)) {
-        curCell      = newCell;
-        curCellEmpty = minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5;
-      }
-
-      if (curCellEmpty) {
-        float3 cellCoord = mmPos * mmDimF;
-        float3 fractCoord = fract(cellCoord);
-
-        float3 distToEdge;
-        distToEdge.x = rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x;
-        distToEdge.y = rayDir.y > 0.0 ? (1.0 - fractCoord.y) : fractCoord.y;
-        distToEdge.z = rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
-        distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
-
-        // rayDirTexLocal precomputed above
-        float3 tToEdge;
-        tToEdge.x = abs(rayDirTexLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirTexLocal.x * mmDimF.x) : 1e30;
-        tToEdge.y = abs(rayDirTexLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirTexLocal.y * mmDimF.y) : 1e30;
-        tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
-
-        float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
-        exactSkip += 1e-4;
-        float skipDist = ceil(exactSkip / stepSize) * stepSize;
-        skipDist = max(stepSize, skipDist);
-
-        currentPoint += rayDir * skipDist;
-        currentT += skipDist;
-
-        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y - tStart) {
-          break;
-        }
-
-        prefetchValid = false;
-        curCell = int3(-1);
-        continue;
-      }
-    }
-
-    // 1. Claim prefetched data
-    float3 texLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
-    float3 evalPoint = texLocalPos;
-    bool needsFetch = !prefetchValid;
-    float rawScalar = needsFetch
-      ? volumeTexture.sample(sVolume, evalPoint, level(0)).r
-      : prefetchScalar;
-    float rawMask = (doMask && needsFetch)
-      ? maskTexture.sample(sNearest, evalPoint, level(0)).r
-      : prefetchMask;
-
-    // 2. Advance ray trackers
-    float3 lastPoint = currentPoint;
-    currentPoint += stepVec;
-    currentT += stepSize;
-
-    // 3. LAUNCH PREFETCH FOR NEXT ITERATION
-    if (i + 1 < maxSteps) {
-      float3 nextTexLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
-      float3 nextEvalPoint = nextTexLocalPos;
-      prefetchScalar = volumeTexture.sample(sVolume, nextEvalPoint, level(0)).r;
-      if (doMask) {
-        prefetchMask = maskTexture.sample(sNearest, nextEvalPoint, level(0)).r;
-      }
-      prefetchValid = true;
-    }
-
-    // 4. MATH & EVALUATION
-    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, lastPoint))) == 0u)) {
-      continue;
-    }
-
-    half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
-
-    half4 colorOpacity;
-    half maskLabel = 0.0h;
-
-    if (doMask) {
-      float maskVal = rawMask * maskScale + maskBias;
-      if (numLabels > 0.0) {
-        float label = floor(maskVal + 0.5);
-        if (label > 0.0) {
-          label = clamp(label, 1.0, numLabels - 1.0);
-          float labelY = (label + 0.5) / numLabels;
-          colorOpacity = half4(labelMapTransferTexture.sample(sNearest, float2(float(scalarNorm), labelY), level(0)));
-        } else {
-          colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
-        }
-      } else {
-        colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
-      }
-    } else {
-      colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
-    }
-
-    half sampleOpacity = colorOpacity.a;
-
-    if (sampleOpacity > 0.001h) {
-      half3 sampleColor = colorOpacity.rgb;
-      half weight = 1.0h - accumulatedOpacity;
-
-      if (sampleOpacity < 0.01h) {
-        accumulatedColor += weight * sampleColor * sampleOpacity;
-        accumulatedOpacity += weight * sampleOpacity;
-      } else {
-      if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
-
-        half3 normal;
-        half gradMag;
-
-        if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
-          half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
-          normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
-          gradMag = nrmSample.w;
-        } else {
-          half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
-          normal = grad.xyz;
-          gradMag = grad.w;
-        }
-
-        sampleColor = computePhongLightingVolumeFast(sampleColor, normal, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
-
-        if (doGradOp) {
-          sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(gradMag), 0.5), level(0)).r);
-        }
-      } else if (doShading) {
-        sampleColor = ambientMat * sampleColor;
-      }
-
-      accumulatedColor += weight * sampleColor * sampleOpacity;
-      accumulatedOpacity += weight * sampleOpacity;
-      }
-    }
-
-    // Early Ray Termination (ERT)
-    if (accumulatedOpacity >= 0.99h) {
-      accumulatedColor /= max(accumulatedOpacity, 1e-4h);
-      accumulatedOpacity = 1.0h;
-      break;
-    }
-    if (currentT >= tTerminateMax) {
-      break;
-    }
-  }
-
-  output.color = float4(float3(accumulatedColor), float(accumulatedOpacity));
+  half4 _marchResult = marchVolume(entryPoint, exitPoint, totalDist, tTerminateMax, rayDir, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos, stepSize, t.y - tStart, in.position.xy, half3(0.0), 0.0h, volumeUniforms, b, volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture, maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
+  output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
 
@@ -2117,224 +1914,8 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     }
   }
 
-  // --- LOCAL CACHE WARM-UP ---
-  const bool doShading = fc_shading && (volumeUniforms.useGradientShading > 0.5);
-  const bool doGradOp = fc_gradientOpacity && (volumeUniforms.useGradientOpacity > 0.5);
-  const bool doCropping = volumeUniforms.useCropping > 0.5;
-  const bool doMask = fc_mask && (volumeUniforms.useMask > 0.5);
-
-  half scalarScale = half(1.0 / (volumeUniforms.scalarMax - volumeUniforms.scalarMin));
-  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
-
-  half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
-
-  float3 texSizeGlobalFrag2 = max(texMaxGlobal - texMinGlobal, 1e-6);
-  float3 invTexSizeGlobal = 1.0 / texSizeGlobalFrag2;
-  float3 rayDirTexLocal = rayDir * invTexSizeGlobal;
-  float3 dtFrag2 = max(volumeUniforms.gradientStep, 1e-8);
-  half3 gradScaleFrag2 = half3(1.0 / (dtFrag2 * texSizeGlobalFrag2));
-
-  half3 viewDirHalf  = half3(normalize(entryPoint - cameraPos));
-  half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection));
-  half3 ambientMat   = half3(volumeUniforms.ambientColor.rgb);
-  half3 diffuseMat   = half3(volumeUniforms.diffuseColor.rgb);
-  half3 specularMat  = half3(volumeUniforms.specularColor.rgb);
-  half shininessMat  = half(volumeUniforms.shininess);
-
-  float maskScale = volumeUniforms.maskScale;
-  float maskBias  = volumeUniforms.maskBias;
-  float numLabels = volumeUniforms.labelMapNumLabels;
-
-  float3 cropMin = float3(volumeUniforms.croppingPlanes.x, volumeUniforms.croppingPlanes.z, volumeUniforms.croppingPlanes2.x);
-  float3 cropMax = float3(volumeUniforms.croppingPlanes.y, volumeUniforms.croppingPlanes.w, volumeUniforms.croppingPlanes2.y);
-
-  uint cropBitmask = volumeUniforms.croppingBitmask;
-
-  // --- SOFTWARE PIPELINING INITIALIZATION ---
-  float jitter = volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) * stepSize : 0.0;
-  float3 stepVec = rayDir * stepSize;
-  float3 currentPoint = entryPoint + (rayDir * jitter);
-  float currentT = jitter;
-
-  int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
-
-  // PREFETCH the very first samples before the loop starts
-  float3 texLocalPos0 = (currentPoint - texMinGlobal) * invTexSizeGlobal;
-  float3 evalPoint0 = texLocalPos0;
-  float prefetchScalar =   volumeTexture.sample(sVolume, evalPoint0, level(0)).r;
-  float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint0, level(0)).r : 0.0;
-  bool prefetchValid = true;
-
-  // MIN-MAX CELL CACHE
-  int3  curCell     = int3(-1);
-  bool  curCellEmpty = false;
-  float3 mmDimF     = b.minMaxInfo.yzw;
-
-  // --- THE RAYMARCHING LOOP ---
-  for (int i = 0; i < maxSteps; i++) {
-    if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
-
-    if (fc_minmax &&
-        b.minMaxInfo.x > 0.5 &&
-        b.minMaxInfo.y > 0.5 &&
-        b.minMaxInfo.z > 0.5 &&
-        b.minMaxInfo.w > 0.5) {
-      float3 texLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
-      float3 mmPos = clamp(texLocalPos, float3(0.0), float3(1.0));
-      int3 newCell = min(int3(mmPos * mmDimF), int3(mmDimF) - 1);
-      if (any(newCell != curCell)) {
-        curCell      = newCell;
-        curCellEmpty = minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5;
-      }
-
-      if (curCellEmpty) {
-        float3 cellCoord = mmPos * mmDimF;
-        float3 fractCoord = fract(cellCoord);
-
-        float3 distToEdge;
-        distToEdge.x = rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x;
-        distToEdge.y = rayDir.y > 0.0 ? (1.0 - fractCoord.y) : fractCoord.y;
-        distToEdge.z = rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
-        distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
-
-        // rayDirTexLocal precomputed above
-        float3 tToEdge;
-        tToEdge.x = abs(rayDirTexLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirTexLocal.x * mmDimF.x) : 1e30;
-        tToEdge.y = abs(rayDirTexLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirTexLocal.y * mmDimF.y) : 1e30;
-        tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
-
-        float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
-
-        // Add a tiny epsilon to cross the boundary, then quantize to stepSize.
-        exactSkip += 1e-4;
-        float skipDist = ceil(exactSkip / stepSize) * stepSize;
-
-        // Ensure we always move forward at least one step
-        skipDist = max(stepSize, skipDist);
-
-        currentPoint += rayDir * skipDist;
-        currentT += skipDist;
-
-        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= t.y - tStart) {
-          break;
-        }
-
-        prefetchValid = false;
-        curCell = int3(-1);
-        continue;
-      }
-    }
-
-    // 1. Claim prefetched data
-    float3 texLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
-    float3 evalPoint = texLocalPos;
-    bool needsFetch = !prefetchValid;
-    float rawScalar = needsFetch
-      ? volumeTexture.sample(sVolume, evalPoint, level(0)).r
-      : prefetchScalar;
-    float rawMask = (doMask && needsFetch)
-      ? maskTexture.sample(sNearest, evalPoint, level(0)).r
-      : prefetchMask;
-
-    // 2. Advance ray trackers
-    float3 lastPoint = currentPoint;
-    currentPoint += stepVec;
-    currentT += stepSize;
-
-    // 3. LAUNCH PREFETCH FOR NEXT ITERATION
-    if (i + 1 < maxSteps) {
-      float3 nextTexLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
-      float3 nextEvalPoint = nextTexLocalPos;
-      prefetchScalar = volumeTexture.sample(sVolume, nextEvalPoint, level(0)).r;
-      if (doMask) {
-        prefetchMask = maskTexture.sample(sNearest, nextEvalPoint, level(0)).r;
-      }
-      prefetchValid = true;
-    }
-
-    // 4. MATH & EVALUATION
-    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, lastPoint))) == 0u)) {
-      continue;
-    }
-
-    half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
-
-    half4 colorOpacity;
-    half maskLabel = 0.0h;
-
-    if (doMask) {
-      float maskVal = rawMask * maskScale + maskBias;
-      if (numLabels > 0.0) {
-        float label = floor(maskVal + 0.5);
-        if (label > 0.0) {
-          label = clamp(label, 1.0, numLabels - 1.0);
-          float labelY = (label + 0.5) / numLabels;
-          colorOpacity = half4(labelMapTransferTexture.sample(sNearest, float2(float(scalarNorm), labelY), level(0)));
-        } else {
-          colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
-        }
-      } else {
-        colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
-      }
-    } else {
-      colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
-    }
-
-    half sampleOpacity = colorOpacity.a;
-
-    if (sampleOpacity > 0.001h) {
-      half3 sampleColor = colorOpacity.rgb;
-      half weight = 1.0h - accumulatedOpacity;
-
-      // Ghost lighting bypass: skip expensive gradient/lighting for near-transparent voxels
-      if (sampleOpacity < 0.01h) {
-        accumulatedColor += weight * sampleColor * sampleOpacity;
-        accumulatedOpacity += weight * sampleOpacity;
-      } else {
-
-      // Visual Significance Threshold
-      if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
-
-        half3 normal;
-        half gradMag;
-
-        if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
-          half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
-          normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
-          gradMag = nrmSample.w;
-        } else {
-          half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScaleFrag2, gradNormFactor);
-          normal = grad.xyz;
-          gradMag = grad.w;
-        }
-
-        sampleColor = computePhongLightingVolumeFast(sampleColor, normal, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
-
-        if (doGradOp) {
-          sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(gradMag), 0.5), level(0)).r);
-        }
-      } else if (doShading) {
-        // Fallback for "invisible" fuzz/noise to maintain baseline brightness
-        sampleColor = ambientMat * sampleColor;
-      }
-
-      accumulatedColor += weight * sampleColor * sampleOpacity;
-      accumulatedOpacity += weight * sampleOpacity;
-      } // end ghost lighting bypass
-    }
-
-    // Early Ray Termination (ERT)
-    if (accumulatedOpacity >= 0.99h) {
-      accumulatedColor /= max(accumulatedOpacity, 1e-4h);
-      accumulatedOpacity = 1.0h;
-      break;
-    }
-    if (currentT >= tTerminateMax) {
-      break;
-    }
-  }
-
-  output.color = float4(float3(accumulatedColor), float(accumulatedOpacity));
+  half4 _marchResult = marchVolume(entryPoint, exitPoint, totalDist, tTerminateMax, rayDir, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos, stepSize, t.y - tStart, in.position.xy, accumulatedColor, accumulatedOpacity, volumeUniforms, b, volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture, maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
+  output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
 
