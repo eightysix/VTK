@@ -2733,8 +2733,12 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
     {
       return this->MacrocellScalarMin.empty() == false;
     }
-    return this->MinMaxTexture != nullptr;
+  if (skipGlobalTexture)
+  {
+    return !this->MacrocellScalarMin.empty();
   }
+  return this->MinMaxTexture != nullptr;
+}
 
   @autoreleasepool
   {
@@ -2782,11 +2786,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
     const vtkIdType inc1 = inc[1];
     const vtkIdType inc2 = inc[2];
 
-    // Store 1 byte per macrocell: 255 = empty, 0 = solid
     vtkIdType numCells = static_cast<vtkIdType>(mmDims0) * mmDims1 * mmDims2;
-
-    // 1. Create a RAW buffer for the initial pass
-    std::vector<uint8_t> rawMinMax(numCells, 255);
 
     // Per-macrocell scalar min/max — consumed later by UpdateBlockTextures
     // to compute per-block ranges without re-walking every voxel.
@@ -2794,6 +2794,13 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
     this->MacrocellScalarMax.resize(numCells, -1e30f);
     float* mcMin = this->MacrocellScalarMin.data();
     float* mcMax = this->MacrocellScalarMax.data();
+
+    // RAW buffer for occupancy (only needed for global texture)
+    std::vector<uint8_t> rawMinMax;
+    if (!skipGlobalTexture)
+    {
+      rawMinMax.resize(numCells, 255);
+    }
 
     // Parallel scan: each macrocell is independent — perfect for vtkSMPTools
     vtkSMPTools::For(0, numCells, [&](vtkIdType begin, vtkIdType end) {
@@ -2855,68 +2862,71 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
         mcMin[cellIdx] = cellMin;
         mcMax[cellIdx] = cellMax;
 
-        // Inline empty check using the precomputed opacity table
-        bool empty = true;
-        if (cellMin <= cellMax)
+        if (!skipGlobalTexture)
         {
-          int idxMin = std::max(0,
-            std::min(255, static_cast<int>((cellMin - rangeOffset) * rangeRecip)));
-          int idxMax = std::max(0,
-            std::min(255, static_cast<int>((cellMax - rangeOffset) * rangeRecip)));
-          for (int i = idxMin; i <= idxMax; ++i)
+          // Inline empty check using the precomputed opacity table
+          bool empty = true;
+          if (cellMin <= cellMax)
           {
-            if (opacityTable[i] > 0.0)
+            int idxMin = std::max(0,
+              std::min(255, static_cast<int>((cellMin - rangeOffset) * rangeRecip)));
+            int idxMax = std::max(0,
+              std::min(255, static_cast<int>((cellMax - rangeOffset) * rangeRecip)));
+            for (int i = idxMin; i <= idxMax; ++i)
             {
-              empty = false;
-              break;
-            }
-          }
-        }
-
-        rawMinMax[cellIdx] = empty ? 255 : 0;
-      }
-    });
-
-    // 2. DILATION PASS: Pad solid blocks by 1 macrocell in all directions.
-    // This guarantees the ray resumes normal stepping *before* hitting the surface,
-    // preserving perfect trilinear interpolation and lighting gradients.
-    // Gather-style stencil: read from rawMinMax, write to minMaxData —
-    // embarrassingly parallel since each output cell is independent.
-    std::vector<uint8_t> minMaxData(numCells, 255);
-    vtkSMPTools::For(0, numCells, [&](vtkIdType begin, vtkIdType end) {
-      for (vtkIdType cellIdx = begin; cellIdx < end; ++cellIdx)
-      {
-        const int gx = static_cast<int>(cellIdx % mmDims0);
-        const int gy = static_cast<int>((cellIdx / mmDims0) % mmDims1);
-        const int gz = static_cast<int>(cellIdx / (mmDims0 * mmDims1));
-
-        const int x0 = std::max(0, gx - 1), x1 = std::min(mmDims0 - 1, gx + 1);
-        const int y0 = std::max(0, gy - 1), y1 = std::min(mmDims1 - 1, gy + 1);
-        const int z0 = std::max(0, gz - 1), z1 = std::min(mmDims2 - 1, gz + 1);
-
-        bool solid = false;
-        for (int nz = z0; nz <= z1 && !solid; ++nz)
-        {
-          for (int ny = y0; ny <= y1 && !solid; ++ny)
-          {
-            for (int nx = x0; nx <= x1 && !solid; ++nx)
-            {
-              if (rawMinMax[(nz * mmDims1 + ny) * mmDims0 + nx] == 0)
+              if (opacityTable[i] > 0.0)
               {
-                solid = true;
+                empty = false;
+                break;
               }
             }
           }
-        }
 
-        minMaxData[cellIdx] = solid ? 0 : 255;
+          rawMinMax[cellIdx] = empty ? 255 : 0;
+        }
       }
     });
 
-    // 3. Create or reuse the 3D occupancy texture (R8Unorm).
-    // For partitioned volumes, skip this — blocks build their own min-max textures.
     if (!skipGlobalTexture)
     {
+      // 2. DILATION PASS: Pad solid blocks by 1 macrocell in all directions.
+      // This guarantees the ray resumes normal stepping *before* hitting the surface,
+      // preserving perfect trilinear interpolation and lighting gradients.
+      // Gather-style stencil: read from rawMinMax, write to minMaxData —
+      // embarrassingly parallel since each output cell is independent.
+      std::vector<uint8_t> minMaxData(numCells, 255);
+      vtkSMPTools::For(0, numCells, [&](vtkIdType begin, vtkIdType end) {
+        for (vtkIdType cellIdx = begin; cellIdx < end; ++cellIdx)
+        {
+          const int gx = static_cast<int>(cellIdx % mmDims0);
+          const int gy = static_cast<int>((cellIdx / mmDims0) % mmDims1);
+          const int gz = static_cast<int>(cellIdx / (mmDims0 * mmDims1));
+
+          const int x0 = std::max(0, gx - 1), x1 = std::min(mmDims0 - 1, gx + 1);
+          const int y0 = std::max(0, gy - 1), y1 = std::min(mmDims1 - 1, gy + 1);
+          const int z0 = std::max(0, gz - 1), z1 = std::min(mmDims2 - 1, gz + 1);
+
+          bool solid = false;
+          for (int nz = z0; nz <= z1 && !solid; ++nz)
+          {
+            for (int ny = y0; ny <= y1 && !solid; ++ny)
+            {
+              for (int nx = x0; nx <= x1 && !solid; ++nx)
+              {
+                if (rawMinMax[(nz * mmDims1 + ny) * mmDims0 + nx] == 0)
+                {
+                  solid = true;
+                }
+              }
+            }
+          }
+
+          minMaxData[cellIdx] = solid ? 0 : 255;
+        }
+      });
+
+      // 3. Create or reuse the 3D occupancy texture (R8Unorm).
+      // For partitioned volumes, skip this — blocks build their own min-max textures.
       id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->MinMaxTexture;
       id<MTLTexture> tex = nil;
 
@@ -2968,6 +2978,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
     this->MinMaxUploadTime.Modified();
   }
 
+  if (skipGlobalTexture)
+  {
+    return !this->MacrocellScalarMin.empty();
+  }
   return this->MinMaxTexture != nullptr;
 }
 
