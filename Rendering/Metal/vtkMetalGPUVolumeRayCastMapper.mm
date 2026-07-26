@@ -1199,20 +1199,41 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
         }
         case VTK_UNSIGNED_SHORT:
         {
-          fmtInfo.bytesPerComponent = 2;
-          fmtInfo.needsConversion = false;
-          fmtInfo.normalizationFactor = 65535.0f;
-          switch (componentsForFormat)
+          if (this->ScalarRange[0] >= 0.0 && this->ScalarRange[1] <= 255.0)
           {
-            case 1:
-              fmtInfo.format = MTLPixelFormatR16Unorm;
-              break;
-            case 2:
-              fmtInfo.format = MTLPixelFormatRG16Unorm;
-              break;
-            default:
-              fmtInfo.format = MTLPixelFormatRGBA16Unorm;
-              break;
+            fmtInfo.bytesPerComponent = 1;
+            fmtInfo.needsConversion = false;
+            fmtInfo.normalizationFactor = 255.0f;
+            switch (componentsForFormat)
+            {
+              case 1:
+                fmtInfo.format = MTLPixelFormatR8Unorm;
+                break;
+              case 2:
+                fmtInfo.format = MTLPixelFormatRG8Unorm;
+                break;
+              default:
+                fmtInfo.format = MTLPixelFormatRGBA8Unorm;
+                break;
+            }
+          }
+          else
+          {
+            fmtInfo.bytesPerComponent = 2;
+            fmtInfo.needsConversion = false;
+            fmtInfo.normalizationFactor = 65535.0f;
+            switch (componentsForFormat)
+            {
+              case 1:
+                fmtInfo.format = MTLPixelFormatR16Unorm;
+                break;
+              case 2:
+                fmtInfo.format = MTLPixelFormatRG16Unorm;
+                break;
+              default:
+                fmtInfo.format = MTLPixelFormatRGBA16Unorm;
+                break;
+            }
           }
           break;
         }
@@ -1427,6 +1448,24 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
         {
           uploadPointer = scalars->GetVoidPointer(0);
         }
+      }
+      else if (dataType == VTK_UNSIGNED_SHORT && this->ScalarNormalizationFactor == 255.0f)
+      {
+        int outComp = (numComponents == 3) ? 4 : numComponents;
+        const unsigned short* src =
+          static_cast<const unsigned short*>(scalars->GetVoidPointer(0));
+        conversionBuffer.resize(static_cast<size_t>(numTuples) * outComp);
+        unsigned char* dst = conversionBuffer.data();
+        vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+          for (vtkIdType i = begin; i < end; ++i)
+          {
+            for (int c = 0; c < numComponents; ++c)
+              dst[i * outComp + c] = static_cast<unsigned char>(std::min<unsigned short>(src[i * numComponents + c], 255));
+            if (numComponents == 3)
+              dst[i * 4 + 3] = 255;
+          }
+        });
+        uploadPointer = conversionBuffer.data();
       }
       else if (dataType == VTK_UNSIGNED_SHORT)
       {
@@ -3022,19 +3061,39 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
         }
         break;
       case VTK_UNSIGNED_SHORT:
-        bytesPerComponent = 2;
-        normalizationFactor = 65535.0f;
-        switch (componentsForFormat)
+        if (this->ScalarRange[0] >= 0.0 && this->ScalarRange[1] <= 255.0)
         {
-          case 1:
-            pixelFormat = MTLPixelFormatR16Unorm;
-            break;
-          case 2:
-            pixelFormat = MTLPixelFormatRG16Unorm;
-            break;
-          default:
-            pixelFormat = MTLPixelFormatRGBA16Unorm;
-            break;
+          bytesPerComponent = 1;
+          normalizationFactor = 255.0f;
+          switch (componentsForFormat)
+          {
+            case 1:
+              pixelFormat = MTLPixelFormatR8Unorm;
+              break;
+            case 2:
+              pixelFormat = MTLPixelFormatRG8Unorm;
+              break;
+            default:
+              pixelFormat = MTLPixelFormatRGBA8Unorm;
+              break;
+          }
+        }
+        else
+        {
+          bytesPerComponent = 2;
+          normalizationFactor = 65535.0f;
+          switch (componentsForFormat)
+          {
+            case 1:
+              pixelFormat = MTLPixelFormatR16Unorm;
+              break;
+            case 2:
+              pixelFormat = MTLPixelFormatRG16Unorm;
+              break;
+            default:
+              pixelFormat = MTLPixelFormatRGBA16Unorm;
+              break;
+          }
         }
         break;
       default:
@@ -3215,6 +3274,21 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       {
         ConvertVolumeData(fullDataPtr, dataType, numComponents,
           totalTuples, uploadPointer, blockUseHalf, outputComponents, scalars);
+      }
+      else if (dataType == VTK_UNSIGNED_SHORT && bytesPerComponent == 1)
+      {
+        int outComp = (numComponents == 3) ? 4 : numComponents;
+        const unsigned short* src = static_cast<const unsigned short*>(fullDataPtr);
+        unsigned char* dst = static_cast<unsigned char*>(uploadPointer);
+        vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
+          for (vtkIdType i = begin; i < end; ++i)
+          {
+            for (int c = 0; c < numComponents; ++c)
+              dst[i * outComp + c] = static_cast<unsigned char>(std::min<unsigned short>(src[i * numComponents + c], 255));
+            if (numComponents == 3)
+              dst[i * 4 + 3] = 255;
+          }
+        });
       }
       else if (dataType == VTK_FLOAT && numComponents == 3)
       {
