@@ -2381,13 +2381,11 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     desc.storageMode = MTLStorageModePrivate;
 
     id<MTLTexture> rawOcc = [device newTextureWithDescriptor:desc];
-    id<MTLTexture> dilatedOcc = [device newTextureWithDescriptor:desc];
     [desc release];
 
-    if (!rawOcc || !dilatedOcc)
+    if (!rawOcc)
     {
       [rawOcc release];
-      [dilatedOcc release];
       return false;
     }
 
@@ -2397,7 +2395,6 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     if (!opFunc)
     {
       [rawOcc release];
-      [dilatedOcc release];
       return false;
     }
 
@@ -2452,19 +2449,7 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     [enc1 dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
     [enc1 endEncoding];
 
-    // --- Dispatch kernel 2: dilation ---
-    id<MTLComputeCommandEncoder> enc2 = [cmdBuf computeCommandEncoder];
-    enc2.label = @"Volume Dilate MinMax";
-    [enc2 setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->DilateComputePipeline];
-    [enc2 setTexture:rawOcc atIndex:0];
-    [enc2 setTexture:dilatedOcc atIndex:1];
-    [enc2 dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
-    [enc2 endEncoding];
-
-    [cmdBuf commit];
-
-    // --- Store the dilated result as the persistent MinMaxTexture ---
-    // First, create the persistent texture (ShaderRead only)
+    // --- Create the persistent MinMax texture (dilation writes here directly) ---
     MTLTextureDescriptor* permDesc = [[MTLTextureDescriptor alloc] init];
     permDesc.textureType = MTLTextureType3D;
     permDesc.pixelFormat = MTLPixelFormatR8Unorm;
@@ -2472,7 +2457,7 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     permDesc.height = mmDims[1];
     permDesc.depth = mmDims[2];
     permDesc.mipmapLevelCount = 1;
-    permDesc.usage = MTLTextureUsageShaderRead;
+    permDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     permDesc.storageMode = MTLStorageModePrivate;
 
     id<MTLTexture> permTex = [device newTextureWithDescriptor:permDesc];
@@ -2480,30 +2465,23 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     if (!permTex)
     {
       [rawOcc release];
-      [dilatedOcc release];
       vtkErrorMacro("Failed to create persistent min-max texture");
       return false;
     }
     AssignMetalObject(this->MinMaxTexture, permTex);
 
-    // Blit the dilated result into the persistent texture
-    id<MTLCommandBuffer> copyCmdBuf = [queue commandBuffer];
-    copyCmdBuf.label = @"VTK MinMax Copy";
-    id<MTLBlitCommandEncoder> blit = [copyCmdBuf blitCommandEncoder];
-    [blit copyFromTexture:dilatedOcc
-              sourceSlice:0
-              sourceLevel:0
-             sourceOrigin:MTLOriginMake(0, 0, 0)
-               sourceSize:MTLSizeMake(mmDims[0], mmDims[1], mmDims[2])
-                toTexture:permTex
-         destinationSlice:0
-         destinationLevel:0
-        destinationOrigin:MTLOriginMake(0, 0, 0)];
-    [blit endEncoding];
-    [copyCmdBuf commit];
+    // --- Dispatch kernel 2: dilation (writes directly to permTex) ---
+    id<MTLComputeCommandEncoder> enc2 = [cmdBuf computeCommandEncoder];
+    enc2.label = @"Volume Dilate MinMax";
+    [enc2 setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->DilateComputePipeline];
+    [enc2 setTexture:rawOcc atIndex:0];
+    [enc2 setTexture:permTex atIndex:1];
+    [enc2 dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
+    [enc2 endEncoding];
+
+    [cmdBuf commit];
 
     [rawOcc release];
-    [dilatedOcc release];
 
     this->MinMaxUploadTime.Modified();
   }
