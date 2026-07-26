@@ -153,6 +153,7 @@ private:
   void* ColorOpacityTexture = nullptr;   // id<MTLTexture>  (2D)
   void* GradientOpacityTexture = nullptr; // id<MTLTexture> (256x1 RGBA8Unorm)
   void* MinMaxTexture = nullptr;         // id<MTLTexture> (3D) — 4x downsampled min-max accel
+  void* MinMaxScratchTexture = nullptr;  // id<MTLTexture> — reusable scratch occupancy (R8Unorm 3D)
   int MinMaxDims[3] = {};               // dimensions of the min-max texture
   vtkTimeStamp MinMaxUploadTime;
   void* DepthStencilState = nullptr;     // id<MTLDepthStencilState>

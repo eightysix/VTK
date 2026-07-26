@@ -741,6 +741,7 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   ReleaseMetalObject(this->ColorOpacityTexture);
   ReleaseMetalObject(this->GradientOpacityTexture);
   ReleaseMetalObject(this->MinMaxTexture);
+  ReleaseMetalObject(this->MinMaxScratchTexture);
   this->ReleaseGradientNormalTexture();
 
   this->ReleaseMaskResources();
@@ -2412,24 +2413,31 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
 
   @autoreleasepool
   {
-    // --- Create temporary occupancy textures (R8Unorm, read/write) ---
-    MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-    desc.textureType = MTLTextureType3D;
-    desc.pixelFormat = MTLPixelFormatR8Unorm;
-    desc.width = mmDims[0];
-    desc.height = mmDims[1];
-    desc.depth = mmDims[2];
-    desc.mipmapLevelCount = 1;
-    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-    desc.storageMode = MTLStorageModePrivate;
-
-    id<MTLTexture> rawOcc = [device newTextureWithDescriptor:desc];
-    [desc release];
-
-    if (!rawOcc)
+    // --- Reuse or create temporary occupancy texture ---
+    id<MTLTexture> rawOcc = (__bridge id<MTLTexture>)this->MinMaxScratchTexture;
+    if (!rawOcc ||
+        rawOcc.width != static_cast<NSUInteger>(mmDims[0]) ||
+        rawOcc.height != static_cast<NSUInteger>(mmDims[1]) ||
+        rawOcc.depth != static_cast<NSUInteger>(mmDims[2]))
     {
-      [rawOcc release];
-      return false;
+      MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
+      desc.textureType = MTLTextureType3D;
+      desc.pixelFormat = MTLPixelFormatR8Unorm;
+      desc.width = mmDims[0];
+      desc.height = mmDims[1];
+      desc.depth = mmDims[2];
+      desc.mipmapLevelCount = 1;
+      desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+      desc.storageMode = MTLStorageModePrivate;
+
+      rawOcc = [device newTextureWithDescriptor:desc];
+      [desc release];
+
+      if (!rawOcc)
+      {
+        return false;
+      }
+      AssignMetalObject(this->MinMaxScratchTexture, rawOcc);
     }
 
     // --- Build opacity prefix table from transfer function ---
@@ -2437,7 +2445,6 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     vtkPiecewiseFunction* opFunc = property ? property->GetScalarOpacity() : nullptr;
     if (!opFunc)
     {
-      [rawOcc release];
       return false;
     }
 
@@ -2492,26 +2499,32 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     [enc1 dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
     [enc1 endEncoding];
 
-    // --- Create the persistent MinMax texture (dilation writes here directly) ---
-    MTLTextureDescriptor* permDesc = [[MTLTextureDescriptor alloc] init];
-    permDesc.textureType = MTLTextureType3D;
-    permDesc.pixelFormat = MTLPixelFormatR8Unorm;
-    permDesc.width = mmDims[0];
-    permDesc.height = mmDims[1];
-    permDesc.depth = mmDims[2];
-    permDesc.mipmapLevelCount = 1;
-    permDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-    permDesc.storageMode = MTLStorageModePrivate;
-
-    id<MTLTexture> permTex = [device newTextureWithDescriptor:permDesc];
-    [permDesc release];
-    if (!permTex)
+    // --- Reuse or create persistent MinMax texture (dilation writes here directly) ---
+    id<MTLTexture> permTex = (__bridge id<MTLTexture>)this->MinMaxTexture;
+    if (!permTex ||
+        permTex.width != static_cast<NSUInteger>(mmDims[0]) ||
+        permTex.height != static_cast<NSUInteger>(mmDims[1]) ||
+        permTex.depth != static_cast<NSUInteger>(mmDims[2]))
     {
-      [rawOcc release];
-      vtkErrorMacro("Failed to create persistent min-max texture");
-      return false;
+      MTLTextureDescriptor* permDesc = [[MTLTextureDescriptor alloc] init];
+      permDesc.textureType = MTLTextureType3D;
+      permDesc.pixelFormat = MTLPixelFormatR8Unorm;
+      permDesc.width = mmDims[0];
+      permDesc.height = mmDims[1];
+      permDesc.depth = mmDims[2];
+      permDesc.mipmapLevelCount = 1;
+      permDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+      permDesc.storageMode = MTLStorageModePrivate;
+
+      permTex = [device newTextureWithDescriptor:permDesc];
+      [permDesc release];
+      if (!permTex)
+      {
+        vtkErrorMacro("Failed to create persistent min-max texture");
+        return false;
+      }
+      AssignMetalObject(this->MinMaxTexture, permTex);
     }
-    AssignMetalObject(this->MinMaxTexture, permTex);
 
     // --- Dispatch kernel 2: dilation (writes directly to permTex) ---
     id<MTLComputeCommandEncoder> enc2 = [cmdBuf computeCommandEncoder];
@@ -2523,8 +2536,6 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     [enc2 endEncoding];
 
     [cmdBuf commit];
-
-    [rawOcc release];
 
     this->MinMaxUploadTime.Modified();
   }
