@@ -3092,7 +3092,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
               [enc endEncoding];
 
               [convCmdBuf commit];
-              [convCmdBuf waitUntilCompleted];
               [srcBuf release];
 
               gpuConversionUsed = true;
