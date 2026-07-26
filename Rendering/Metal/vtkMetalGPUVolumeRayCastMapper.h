@@ -118,14 +118,10 @@ private:
   void* PipelineState = nullptr;         // id<MTLRenderPipelineState>
   void* AccumulationPipelineState = nullptr; // id<MTLRenderPipelineState> — for > MAX_LAYER_BRICKS fallback
   void* VolumeTexture = nullptr;         // id<MTLTexture>  (3D)
-  void* VolumeSampler = nullptr;         // id<MTLSamplerState>
 
   void* ColorOpacityTexture = nullptr;   // id<MTLTexture>  (2D)
-  void* ColorOpacitySampler = nullptr;   // id<MTLSamplerState>
   void* GradientOpacityTexture = nullptr; // id<MTLTexture> (256x1 RGBA8Unorm)
-  void* GradientOpacitySampler = nullptr; // id<MTLSamplerState>
   void* MinMaxTexture = nullptr;         // id<MTLTexture> (3D) — 4x downsampled min-max accel
-  void* MinMaxSampler = nullptr;         // id<MTLSamplerState> — nearest sampler for min-max
   int MinMaxDims[3] = {};               // dimensions of the min-max texture
   vtkTimeStamp MinMaxUploadTime;
   void* DepthStencilState = nullptr;     // id<MTLDepthStencilState>
@@ -134,15 +130,11 @@ private:
   void* DummyVolumeTexture = nullptr;    // id<MTLTexture> — 1x1x1 R32Float fallback for nil volume tex
   void* DummyMaskTexture = nullptr;      // id<MTLTexture> — 1x1x1 R32Float fallback for nil mask tex
   void* DummyMinMaxTexture = nullptr;    // id<MTLTexture> — 1x1x1 R8Unorm fallback for nil minmax tex
-  void* DepthSampler = nullptr;          // id<MTLSamplerState> — nearest sampler for depth texture
 
   // Mask / label map support
   void* MaskTexture = nullptr;            // id<MTLTexture> (3D) — binary mask or label map
-  void* MaskSampler = nullptr;            // id<MTLSamplerState> — nearest sampler for mask
   void* LabelMapTransferTexture = nullptr; // id<MTLTexture> (2D) — label map transfer function
-  void* LabelMapTransferSampler = nullptr; // id<MTLSamplerState> — nearest sampler for label map TF
   void* LabelMapGradientOpacityTexture = nullptr; // id<MTLTexture> (2D) — label map gradient opacity
-  void* LabelMapGradientOpacitySampler = nullptr; // id<MTLSamplerState> — nearest sampler for label map grad op
   vtkTimeStamp MaskUpdateTime;
   int LastLabelMapMaxLabel = -1;
   size_t LastLabelMapLabelCount = 0;
@@ -183,7 +175,6 @@ private:
   void* ImageSampleColorTexture = nullptr;    // id<MTLTexture> — offscreen color at reduced res
   void* ImageSampleDepthTexture = nullptr;    // id<MTLTexture> — offscreen depth at reduced res
   void* ImageSamplePipeline = nullptr;        // id<MTLRenderPipelineState> — for blit pass
-  void* ImageSampleSampler = nullptr;         // id<MTLSamplerState> — linear sampler for blit
   int ImageSampleFBOWidth = 0;
   int ImageSampleFBOHeight = 0;
   int ImageSamplePixelFormat = 0;             // cached pixel format to detect changes
@@ -260,17 +251,19 @@ private:
   std::vector<float> MacrocellScalarMax;
 
   // --- Order-independent compositing: per-brick layer textures ---
-  // Each brick renders into its own RGBA16Float layer; a final composite pass
-  // sorts the layers per-pixel by ray-entry depth and folds front-to-back.
+  // Each brick renders into its own RGBA16Float slice of a 2D texture array;
+  // a final composite pass reads the array, sorts the layers per-pixel by
+  // ray-entry depth and folds front-to-back.
   // This eliminates the bright ring caused by framebuffer-fetch ordering.
   // Covered bricks: <= MAX_LAYER_BRICKS (8).  Volumes with more partitions
   // fall through to AccumulationPipelineState (>8 fallback, order-dependent).
-  void* LayerColorTexture[8] = { nullptr };  // id<MTLTexture> — one per brick slot
+  void* LayerTextureArray = nullptr;         // id<MTLTexture> — 2D array, RGBA16Float, <= MAX_LAYER_BRICKS slices
+  int LayerTextureCapacity = 0;              // current number of slices in the array
   void* LayerPipelineState = nullptr;        // vertex_volume_main + fragment_volume_main, RGBA16Float
   void* CompositePipelineState = nullptr;    // vertex_fullscreen_main + fragment_layer_composite_main
   int LayerFBOWidth = 0;
   int LayerFBOHeight = 0;
-  bool EnsureLayerResources(void* device, int w, int h);
+  bool EnsureLayerResources(void* device, int w, int h, int neededSlices);
 };
 
 VTK_ABI_NAMESPACE_END

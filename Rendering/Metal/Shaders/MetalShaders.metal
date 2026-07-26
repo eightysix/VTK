@@ -7,6 +7,12 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// Constexpr samplers: avoids per-draw sampler binding overhead.
+// sVolume — linear min/mag, clamp-to-edge (volume data, transfer function, gradient opacity)
+// sNearest — nearest min/mag, clamp-to-edge (depth, mask, label map, min-max occupancy)
+constexpr sampler sVolume(filter::linear, address::clamp_to_edge);
+constexpr sampler sNearest(filter::nearest, address::clamp_to_edge);
+
 // Maximum number of lights
 #define MAX_LIGHTS 8
 
@@ -1335,14 +1341,14 @@ inline float2 intersectBox(float3 orig, float3 dir, float3 boxMin, float3 boxMax
 // Optimized: Gradient fetch with direction correction for anisotropic spacing.
 // gradScale = 1 / (gradientStep * texSizeGlobal) converts raw central-difference
 // components from texture-local to normalized-volume space.
-inline half4 computeGradientFast(texture3d<float> volTex, sampler volSamp, float3 pos,
+inline half4 computeGradientFast(texture3d<float> volTex, float3 pos,
                                  float3 gradStep, half3 gradScale, half gradNormFactor) {
-  half sPX = half(volTex.sample(volSamp, pos + float3(gradStep.x, 0, 0), level(0)).r);
-  half sNX = half(volTex.sample(volSamp, pos - float3(gradStep.x, 0, 0), level(0)).r);
-  half sPY = half(volTex.sample(volSamp, pos + float3(0, gradStep.y, 0), level(0)).r);
-  half sNY = half(volTex.sample(volSamp, pos - float3(0, gradStep.y, 0), level(0)).r);
-  half sPZ = half(volTex.sample(volSamp, pos + float3(0, 0, gradStep.z), level(0)).r);
-  half sNZ = half(volTex.sample(volSamp, pos - float3(0, 0, gradStep.z), level(0)).r);
+  half sPX = half(volTex.sample(sVolume, pos + float3(gradStep.x, 0, 0), level(0)).r);
+  half sNX = half(volTex.sample(sVolume, pos - float3(gradStep.x, 0, 0), level(0)).r);
+  half sPY = half(volTex.sample(sVolume, pos + float3(0, gradStep.y, 0), level(0)).r);
+  half sNY = half(volTex.sample(sVolume, pos - float3(0, gradStep.y, 0), level(0)).r);
+  half sPZ = half(volTex.sample(sVolume, pos + float3(0, 0, gradStep.z), level(0)).r);
+  half sNZ = half(volTex.sample(sVolume, pos - float3(0, 0, gradStep.z), level(0)).r);
 
   half3 rawGrad = half3(sPX - sNX, sPY - sNY, sPZ - sNZ);
   half rawMag = length(rawGrad);
@@ -1385,14 +1391,7 @@ fragment VolumeFragmentOut fragment_volume_main(
     texture2d<float> gradientOpacityTexture [[texture(3)]],
     texture3d<float> maskTexture [[texture(4)]],
     texture2d<float> labelMapTransferTexture [[texture(5)]],
-    texture3d<float> minMaxTexture [[texture(6)]],
-    sampler transferFunctionSampler [[sampler(0)]],
-    sampler volumeSampler [[sampler(1)]],
-    sampler depthSampler [[sampler(2)]],
-    sampler gradientOpacitySampler [[sampler(3)]],
-    sampler maskSampler [[sampler(4)]],
-    sampler labelMapSampler [[sampler(5)]],
-    sampler minMaxSampler [[sampler(6)]]) {
+    texture3d<float> minMaxTexture [[texture(6)]]) {
 
   if (!isFrontFace) discard_fragment();
 
@@ -1442,7 +1441,7 @@ fragment VolumeFragmentOut fragment_volume_main(
 
   float tTerminateMax = 1e30;
   if (volumeUniforms.useDepthTexture > 0.5) {
-    float depthSample = depthTexture.sample(depthSampler, in.position.xy / volumeUniforms.viewportSize).r;
+    float depthSample = depthTexture.sample(sNearest, in.position.xy / volumeUniforms.viewportSize).r;
     if (depthSample < 1.0) {
       float2 ndcXY = (in.position.xy / volumeUniforms.viewportSize) * 2.0 - 1.0;
       float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
@@ -1504,8 +1503,8 @@ fragment VolumeFragmentOut fragment_volume_main(
   // PREFETCH the very first samples before the loop starts
   float3 texLocalPos0 = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
   float3 evalPoint0 = texLocalPos0;
-  float prefetchScalar = volumeTexture.sample(volumeSampler, evalPoint0, level(0)).r;
-  float prefetchMask = doMask ? maskTexture.sample(maskSampler, evalPoint0, level(0)).r : 0.0;
+  float prefetchScalar = volumeTexture.sample(sVolume, evalPoint0, level(0)).r;
+  float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint0, level(0)).r : 0.0;
   bool prefetchValid = true;
   int3  curCell     = int3(-1);
   bool  curCellEmpty = false;
@@ -1526,7 +1525,7 @@ fragment VolumeFragmentOut fragment_volume_main(
       int3 newCell = min(int3(mmPos * mmDimF), int3(mmDimF) - 1);
       if (any(newCell != curCell)) {
         curCell      = newCell;
-        curCellEmpty = minMaxTexture.sample(minMaxSampler, mmPos, level(0)).r > 0.5;
+        curCellEmpty = minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5;
       }
 
       if (curCellEmpty) {
@@ -1572,10 +1571,10 @@ fragment VolumeFragmentOut fragment_volume_main(
     float3 evalPoint = texLocalPos;
     bool needsFetch = !prefetchValid;
     float rawScalar = needsFetch
-      ? volumeTexture.sample(volumeSampler, evalPoint, level(0)).r
+      ? volumeTexture.sample(sVolume, evalPoint, level(0)).r
       : prefetchScalar;
     float rawMask = (doMask && needsFetch)
-      ? maskTexture.sample(maskSampler, evalPoint, level(0)).r
+      ? maskTexture.sample(sNearest, evalPoint, level(0)).r
       : prefetchMask;
 
     // 2. Advance ray trackers
@@ -1587,9 +1586,9 @@ fragment VolumeFragmentOut fragment_volume_main(
     if (i + 1 < maxSteps) {
       float3 nextTexLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
       float3 nextEvalPoint = nextTexLocalPos;
-      prefetchScalar = volumeTexture.sample(volumeSampler, nextEvalPoint, level(0)).r;
+      prefetchScalar = volumeTexture.sample(sVolume, nextEvalPoint, level(0)).r;
       if (doMask) {
-        prefetchMask = maskTexture.sample(maskSampler, nextEvalPoint, level(0)).r;
+        prefetchMask = maskTexture.sample(sNearest, nextEvalPoint, level(0)).r;
       }
       prefetchValid = true;
     }
@@ -1611,15 +1610,15 @@ fragment VolumeFragmentOut fragment_volume_main(
         if (label > 0.0) {
           label = clamp(label, 1.0, numLabels - 1.0);
           float labelY = (label + 0.5) / numLabels;
-          colorOpacity = half4(labelMapTransferTexture.sample(labelMapSampler, float2(float(scalarNorm), labelY), level(0)));
+          colorOpacity = half4(labelMapTransferTexture.sample(sNearest, float2(float(scalarNorm), labelY), level(0)));
         } else {
-          colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+          colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
         }
       } else {
-        colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+        colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
       }
     } else {
-      colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+      colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
     }
 
     half sampleOpacity = colorOpacity.a;
@@ -1639,11 +1638,11 @@ fragment VolumeFragmentOut fragment_volume_main(
       // it is invisible on an 8-bit monitor. Do not waste memory bandwidth shading it.
       if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
 
-        half4 grad = computeGradientFast(volumeTexture, volumeSampler, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
+        half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
         sampleColor = computePhongLightingVolumeFast(sampleColor, grad.xyz, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
 
         if (doGradOp) {
-          sampleOpacity *= half(gradientOpacityTexture.sample(gradientOpacitySampler, float2(float(grad.w), 0.5), level(0)).r);
+          sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(grad.w), 0.5), level(0)).r);
         }
       } else if (doShading) {
         // Fallback for "invisible" fuzz/noise to maintain baseline brightness
@@ -1685,14 +1684,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     texture2d<float> gradientOpacityTexture [[texture(3)]],
     texture3d<float> maskTexture [[texture(4)]],
     texture2d<float> labelMapTransferTexture [[texture(5)]],
-    texture3d<float> minMaxTexture [[texture(6)]],
-    sampler transferFunctionSampler [[sampler(0)]],
-    sampler volumeSampler [[sampler(1)]],
-    sampler depthSampler [[sampler(2)]],
-    sampler gradientOpacitySampler [[sampler(3)]],
-    sampler maskSampler [[sampler(4)]],
-    sampler labelMapSampler [[sampler(5)]],
-    sampler minMaxSampler [[sampler(6)]]) {
+    texture3d<float> minMaxTexture [[texture(6)]]) {
 
   if (!isFrontFace) discard_fragment();
 
@@ -1752,7 +1744,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
 
   float tTerminateMax = 1e30;
   if (volumeUniforms.useDepthTexture > 0.5) {
-    float depthSample = depthTexture.sample(depthSampler, in.position.xy / volumeUniforms.viewportSize).r;
+    float depthSample = depthTexture.sample(sNearest, in.position.xy / volumeUniforms.viewportSize).r;
     if (depthSample < 1.0) {
       float2 ndcXY = (in.position.xy / volumeUniforms.viewportSize) * 2.0 - 1.0;
       float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
@@ -1811,8 +1803,8 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
   // PREFETCH the very first samples before the loop starts
   float3 texLocalPos0 = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
   float3 evalPoint0 = texLocalPos0;
-  float prefetchScalar =   volumeTexture.sample(volumeSampler, evalPoint0, level(0)).r;
-  float prefetchMask = doMask ? maskTexture.sample(maskSampler, evalPoint0, level(0)).r : 0.0;
+  float prefetchScalar =   volumeTexture.sample(sVolume, evalPoint0, level(0)).r;
+  float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint0, level(0)).r : 0.0;
   bool prefetchValid = true;
 
   // MIN-MAX CELL CACHE
@@ -1833,7 +1825,7 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
       int3 newCell = min(int3(mmPos * mmDimF), int3(mmDimF) - 1);
       if (any(newCell != curCell)) {
         curCell      = newCell;
-        curCellEmpty = minMaxTexture.sample(minMaxSampler, mmPos, level(0)).r > 0.5;
+        curCellEmpty = minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5;
       }
 
       if (curCellEmpty) {
@@ -1879,10 +1871,10 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     float3 evalPoint = texLocalPos;
     bool needsFetch = !prefetchValid;
     float rawScalar = needsFetch
-      ? volumeTexture.sample(volumeSampler, evalPoint, level(0)).r
+      ? volumeTexture.sample(sVolume, evalPoint, level(0)).r
       : prefetchScalar;
     float rawMask = (doMask && needsFetch)
-      ? maskTexture.sample(maskSampler, evalPoint, level(0)).r
+      ? maskTexture.sample(sNearest, evalPoint, level(0)).r
       : prefetchMask;
 
     // 2. Advance ray trackers
@@ -1894,9 +1886,9 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     if (i + 1 < maxSteps) {
       float3 nextTexLocalPos = (currentPoint - texMinGlobal) / max(texMaxGlobal - texMinGlobal, 1e-6);
       float3 nextEvalPoint = nextTexLocalPos;
-      prefetchScalar = volumeTexture.sample(volumeSampler, nextEvalPoint, level(0)).r;
+      prefetchScalar = volumeTexture.sample(sVolume, nextEvalPoint, level(0)).r;
       if (doMask) {
-        prefetchMask = maskTexture.sample(maskSampler, nextEvalPoint, level(0)).r;
+        prefetchMask = maskTexture.sample(sNearest, nextEvalPoint, level(0)).r;
       }
       prefetchValid = true;
     }
@@ -1918,15 +1910,15 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
         if (label > 0.0) {
           label = clamp(label, 1.0, numLabels - 1.0);
           float labelY = (label + 0.5) / numLabels;
-          colorOpacity = half4(labelMapTransferTexture.sample(labelMapSampler, float2(float(scalarNorm), labelY), level(0)));
+          colorOpacity = half4(labelMapTransferTexture.sample(sNearest, float2(float(scalarNorm), labelY), level(0)));
         } else {
-          colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+          colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
         }
       } else {
-        colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+        colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
       }
     } else {
-      colorOpacity = half4(transferFunctionTexture.sample(transferFunctionSampler, float2(float(scalarNorm), 0.5), level(0)));
+      colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
     }
 
     half sampleOpacity = colorOpacity.a;
@@ -1944,11 +1936,11 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
       // Visual Significance Threshold
       if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
 
-        half4 grad = computeGradientFast(volumeTexture, volumeSampler, evalPoint, b.gradientStep.xyz, gradScaleFrag2, gradNormFactor);
+        half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScaleFrag2, gradNormFactor);
         sampleColor = computePhongLightingVolumeFast(sampleColor, grad.xyz, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
 
         if (doGradOp) {
-          sampleOpacity *= half(gradientOpacityTexture.sample(gradientOpacitySampler, float2(float(grad.w), 0.5), level(0)).r);
+          sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(grad.w), 0.5), level(0)).r);
         }
       } else if (doShading) {
         // Fallback for "invisible" fuzz/noise to maintain baseline brightness
@@ -1977,9 +1969,8 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
 
 fragment float4 fragment_image_sample_blit(
     FullscreenVertexOut in [[stage_in]],
-    texture2d<float> offscreenColor [[texture(0)]],
-    sampler offscreenSampler [[sampler(0)]]) {
-  return offscreenColor.sample(offscreenSampler, in.texCoord);
+    texture2d<float> offscreenColor [[texture(0)]]) {
+  return offscreenColor.sample(sVolume, in.texCoord);
 }
 
 // --- ORDER-INDEPENDENT COMPOSITING: per-brick layer composite ---
@@ -1996,21 +1987,17 @@ fragment float4 fragment_layer_composite_main(
     FullscreenVertexOut in [[stage_in]],
     constant VolumeMapperUniforms& u  [[buffer(1)]],
     constant LayerCompositeUniforms& lc [[buffer(2)]],
-    texture2d<float, access::read> layer0 [[texture(0)]],
-    texture2d<float, access::read> layer1 [[texture(1)]],
-    texture2d<float, access::read> layer2 [[texture(2)]],
-    texture2d<float, access::read> layer3 [[texture(3)]],
-    texture2d<float, access::read> layer4 [[texture(4)]],
-    texture2d<float, access::read> layer5 [[texture(5)]],
-    texture2d<float, access::read> layer6 [[texture(6)]],
-    texture2d<float, access::read> layer7 [[texture(7)]])
+    texture2d_array<float, access::read> layers [[texture(0)]])
 {
     uint2 pixel = uint2(in.position.xy);
     int count = int(lc.params.x);
     if (count <= 0) { return float4(0.0, 0.0, 0.0, 0.0); }
 
-    float4 L[8] = { layer0.read(pixel), layer1.read(pixel), layer2.read(pixel), layer3.read(pixel),
-                    layer4.read(pixel), layer5.read(pixel), layer6.read(pixel), layer7.read(pixel) };
+    // Read only up to `count` active slices from the texture array.
+    float4 L[8];
+    for (int i = 0; i < min(count, 8); ++i) {
+        L[i] = layers.read(pixel, i);
+    }
 
     // Reconstruct the pixel ray in global [0,1] space, identical convention to brick shaders.
     float3 cameraPos = u.cameraVolumePos.xyz;

@@ -486,16 +486,6 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
       this->PipelineCache[k] = (__bridge void*)pso;
     }
 
-    // Create linear sampler for blit
-    MTLSamplerDescriptor* sDesc = [[MTLSamplerDescriptor alloc] init];
-    sDesc.minFilter = MTLSamplerMinMagFilterLinear;
-    sDesc.magFilter = MTLSamplerMinMagFilterLinear;
-    sDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
-    sDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
-    id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:sDesc];
-    [sDesc release];
-    AssignMetalObject(this->ImageSampleSampler, sampler);
-
     [vertexFunc release];
     [fragmentFunc release];
 
@@ -513,53 +503,50 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseImageSampleResources()
   ReleaseMetalObject(this->ImageSampleColorTexture);
   ReleaseMetalObject(this->ImageSampleDepthTexture);
   ReleaseMetalObject(this->ImageSamplePipeline);
-  ReleaseMetalObject(this->ImageSampleSampler);
   this->ImageSampleFBOWidth = 0;
   this->ImageSampleFBOHeight = 0;
   this->ImageSamplePixelFormat = 0;
 
-  // Release order-independent compositing layer textures
-  for (int i = 0; i < 8; ++i)
-  {
-    ReleaseMetalObject(this->LayerColorTexture[i]);
-  }
+  // Release order-independent compositing layer texture array
+  ReleaseMetalObject(this->LayerTextureArray);
+  this->LayerTextureCapacity = 0;
   this->LayerFBOWidth = 0;
   this->LayerFBOHeight = 0;
 }
 
 //------------------------------------------------------------------------------
-bool vtkMetalGPUVolumeRayCastMapper::EnsureLayerResources(void* deviceVoid, int w, int h)
+bool vtkMetalGPUVolumeRayCastMapper::EnsureLayerResources(void* deviceVoid, int w, int h, int neededSlices)
 {
-  if (this->LayerColorTexture[0] && this->LayerFBOWidth == w && this->LayerFBOHeight == h)
+  int capacity = std::max(neededSlices, 1);
+  if (this->LayerTextureArray && this->LayerFBOWidth == w && this->LayerFBOHeight == h &&
+        this->LayerTextureCapacity >= capacity)
     return true;
 
-  // Release old textures if size changed
-  for (int i = 0; i < 8; ++i)
-  {
-    ReleaseMetalObject(this->LayerColorTexture[i]);
-  }
+  // Release old texture array if size or capacity changed
+  ReleaseMetalObject(this->LayerTextureArray);
+  this->LayerTextureCapacity = 0;
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
   MTLTextureDescriptor* d = [[MTLTextureDescriptor alloc] init];
-  d.textureType = MTLTextureType2D;
+  d.textureType = MTLTextureType2DArray;
   d.pixelFormat = MTLPixelFormatRGBA16Float;
   d.width = w;
   d.height = h;
+  d.depth = 1;
+  d.arrayLength = capacity;
   d.mipmapLevelCount = 1;
   d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
   d.storageMode = MTLStorageModePrivate;
 
-    for (int i = 0; i < 8; ++i)
-    {
-      id<MTLTexture> t = [device newTextureWithDescriptor:d];
-      if (!t)
-      {
-        [d release];
-        return false;
-      }
-      AssignMetalObject(this->LayerColorTexture[i], t);
-    }
+  id<MTLTexture> texArray = [device newTextureWithDescriptor:d];
   [d release];
+  if (!texArray)
+  {
+    vtkErrorMacro("Failed to create layer texture array");
+    return false;
+  }
+  AssignMetalObject(this->LayerTextureArray, texArray);
+  this->LayerTextureCapacity = capacity;
   this->LayerFBOWidth = w;
   this->LayerFBOHeight = h;
   return true;
@@ -576,17 +563,11 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   ReleaseMetalObject(this->LayerPipelineState);
   ReleaseMetalObject(this->CompositePipelineState);
   ReleaseMetalObject(this->VolumeTexture);
-  ReleaseMetalObject(this->VolumeSampler);
   ReleaseMetalObject(this->ColorOpacityTexture);
-  ReleaseMetalObject(this->ColorOpacitySampler);
   ReleaseMetalObject(this->GradientOpacityTexture);
-  ReleaseMetalObject(this->GradientOpacitySampler);
   ReleaseMetalObject(this->MinMaxTexture);
-  ReleaseMetalObject(this->MinMaxSampler);
 
   this->ReleaseMaskResources();
-
-  ReleaseMetalObject(this->DepthSampler);
   ReleaseMetalObject(this->DummyDepthTexture);
   ReleaseMetalObject(this->DummyVolumeTexture);
   ReleaseMetalObject(this->DummyMaskTexture);
@@ -1833,11 +1814,8 @@ void vtkMetalGPUVolumeRayCastMapper::SetMaskUniforms(void* uniforms, vtkVolume* 
 void vtkMetalGPUVolumeRayCastMapper::ReleaseMaskResources()
 {
   ReleaseMetalObject(this->MaskTexture);
-  ReleaseMetalObject(this->MaskSampler);
   ReleaseMetalObject(this->LabelMapTransferTexture);
-  ReleaseMetalObject(this->LabelMapTransferSampler);
   ReleaseMetalObject(this->LabelMapGradientOpacityTexture);
-  ReleaseMetalObject(this->LabelMapGradientOpacitySampler); // Kept for binary compatibility; unused in shader
 }
 
 //------------------------------------------------------------------------------
@@ -3606,32 +3584,6 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       return false;
     }
 
-    // Create samplers
-    if (!this->ColorOpacitySampler)
-    {
-      MTLSamplerDescriptor* samplerDesc = [[MTLSamplerDescriptor alloc] init];
-      samplerDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
-      samplerDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
-      samplerDesc.magFilter = MTLSamplerMinMagFilterLinear;
-      samplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
-      id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:samplerDesc];
-      [samplerDesc release];
-      AssignMetalObject(this->ColorOpacitySampler, sampler);
-    }
-
-    if (!this->VolumeSampler)
-    {
-      MTLSamplerDescriptor* samplerDesc = [[MTLSamplerDescriptor alloc] init];
-      samplerDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
-      samplerDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
-      samplerDesc.rAddressMode = MTLSamplerAddressModeClampToEdge;
-      samplerDesc.magFilter = MTLSamplerMinMagFilterLinear;
-      samplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
-      id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:samplerDesc];
-      [samplerDesc release];
-      AssignMetalObject(this->VolumeSampler, sampler);
-    }
-
     // Create dummy depth texture (1x1 R32Float with value 1.0) for when no real depth texture is bound
     if (!this->DummyDepthTexture)
     {
@@ -3655,58 +3607,8 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       }
     }
 
-    // Nearest sampler for depth texture (depth buffer occlusion)
-    if (!this->DepthSampler)
-    {
-      MTLSamplerDescriptor* depthSampDesc = [[MTLSamplerDescriptor alloc] init];
-      depthSampDesc.minFilter = MTLSamplerMinMagFilterNearest;
-      depthSampDesc.magFilter = MTLSamplerMinMagFilterNearest;
-      depthSampDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
-      depthSampDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
-      id<MTLSamplerState> depthSamp = [device newSamplerStateWithDescriptor:depthSampDesc];
-      [depthSampDesc release];
-      AssignMetalObject(this->DepthSampler, depthSamp);
-    }
-
-    // Linear sampler for gradient opacity texture (1D lookup)
-    if (!this->GradientOpacitySampler)
-    {
-      MTLSamplerDescriptor* goDesc = [[MTLSamplerDescriptor alloc] init];
-      goDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
-      goDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
-      goDesc.magFilter = MTLSamplerMinMagFilterLinear;
-      goDesc.minFilter = MTLSamplerMinMagFilterLinear;
-      id<MTLSamplerState> goSamp = [device newSamplerStateWithDescriptor:goDesc];
-      [goDesc release];
-      AssignMetalObject(this->GradientOpacitySampler, goSamp);
-    }
-
-    // Nearest sampler for mask texture (3D, nearest interpolation for label maps)
-    if (!this->MaskSampler)
-    {
-      MTLSamplerDescriptor* maskDesc = [[MTLSamplerDescriptor alloc] init];
-      maskDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
-      maskDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
-      maskDesc.rAddressMode = MTLSamplerAddressModeClampToEdge;
-      maskDesc.magFilter = MTLSamplerMinMagFilterNearest;
-      maskDesc.minFilter = MTLSamplerMinMagFilterNearest;
-      id<MTLSamplerState> maskSamp = [device newSamplerStateWithDescriptor:maskDesc];
-      [maskDesc release];
-      AssignMetalObject(this->MaskSampler, maskSamp);
-    }
-
-    // Nearest sampler for label map transfer function texture (2D, nearest for label lookup)
-    if (!this->LabelMapTransferSampler)
-    {
-      MTLSamplerDescriptor* lmDesc = [[MTLSamplerDescriptor alloc] init];
-      lmDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
-      lmDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
-      lmDesc.magFilter = MTLSamplerMinMagFilterNearest;
-      lmDesc.minFilter = MTLSamplerMinMagFilterNearest;
-      id<MTLSamplerState> lmSamp = [device newSamplerStateWithDescriptor:lmDesc];
-      [lmDesc release];
-      AssignMetalObject(this->LabelMapTransferSampler, lmSamp);
-    }
+    // Note: constexpr samplers in MetalShaders.metal replace all runtime
+    // sampler state objects. No sampler creation needed here.
 
     // Create dummy 3D textures for fallback bindings (prevent nil texture binds).
     if (!this->DummyVolumeTexture)
@@ -3776,20 +3678,6 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       }
       AssignMetalObject(this->DummyMinMaxTexture, tex);
       [desc release];
-    }
-
-    // Nearest sampler for min-max acceleration texture (3D, nearest for block lookup)
-    if (!this->MinMaxSampler)
-    {
-      MTLSamplerDescriptor* mmDesc = [[MTLSamplerDescriptor alloc] init];
-      mmDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
-      mmDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
-      mmDesc.rAddressMode = MTLSamplerAddressModeClampToEdge;
-      mmDesc.magFilter = MTLSamplerMinMagFilterNearest;
-      mmDesc.minFilter = MTLSamplerMinMagFilterNearest;
-      id<MTLSamplerState> mmSamp = [device newSamplerStateWithDescriptor:mmDesc];
-      [mmDesc release];
-      AssignMetalObject(this->MinMaxSampler, mmSamp);
     }
 
     // Create and cache a depth stencil state.
@@ -4015,87 +3903,64 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
   id<MTLTexture> volTex = this->VolumeTexture
     ? (__bridge id<MTLTexture>)this->VolumeTexture
     : (__bridge id<MTLTexture>)this->DummyVolumeTexture;
-  id<MTLSamplerState> volSamp = (__bridge id<MTLSamplerState>)this->VolumeSampler;
   id<MTLTexture> tfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
-  id<MTLSamplerState> tfSamp = (__bridge id<MTLSamplerState>)this->ColorOpacitySampler;
   [encoder setFragmentTexture:volTex atIndex:0];
   [encoder setFragmentTexture:tfTex atIndex:1];
-  [encoder setFragmentSamplerState:tfSamp atIndex:0];
-  [encoder setFragmentSamplerState:volSamp atIndex:1];
 
   // Bind scene depth texture for early ray termination (fragment index 2).
   // Use the dummy depth texture (value 1.0) when no real depth texture is available.
   id<MTLTexture> depthTex = this->DepthTextureOcclusion
     ? (__bridge id<MTLTexture>)this->DepthTextureOcclusion
     : (__bridge id<MTLTexture>)this->DummyDepthTexture;
-  id<MTLSamplerState> depthSamp = (__bridge id<MTLSamplerState>)this->DepthSampler;
   [encoder setFragmentTexture:depthTex atIndex:2];
-  [encoder setFragmentSamplerState:depthSamp atIndex:2];
 
   // Bind gradient opacity texture for gradient-based shading (fragment index 3).
-  // Metal requires all declared fragment texture/sampler arguments to be bound,
-  // so bind the transfer function texture as fallback when gradient opacity is disabled.
+  // The shader uses constexpr samplers, so no sampler bindings are needed.
   if (this->GradientOpacityTexture)
   {
     id<MTLTexture> goTex = (__bridge id<MTLTexture>)this->GradientOpacityTexture;
-    id<MTLSamplerState> goSamp = (__bridge id<MTLSamplerState>)this->GradientOpacitySampler;
     [encoder setFragmentTexture:goTex atIndex:3];
-    [encoder setFragmentSamplerState:goSamp atIndex:3];
   }
   else
   {
     [encoder setFragmentTexture:tfTex atIndex:3];
-    [encoder setFragmentSamplerState:tfSamp atIndex:3];
   }
 
   // Bind mask / label map textures (fragment index 4).
-  // Metal requires all declared fragment texture/sampler arguments to be bound,
-  // so bind the dummy mask texture as fallback when mask is not used.
   id<MTLTexture> maskFallbackTex =
     (__bridge id<MTLTexture>)this->DummyMaskTexture;
   if (this->MaskTexture)
   {
     id<MTLTexture> maskTex = (__bridge id<MTLTexture>)this->MaskTexture;
-    id<MTLSamplerState> maskSamp = (__bridge id<MTLSamplerState>)this->MaskSampler;
     [encoder setFragmentTexture:maskTex atIndex:4];
-    [encoder setFragmentSamplerState:maskSamp atIndex:4];
   }
   else
   {
     [encoder setFragmentTexture:maskFallbackTex atIndex:4];
-    [encoder setFragmentSamplerState:volSamp atIndex:4];
   }
 
   // Bind label map transfer texture (fragment index 5)
   if (this->LabelMapTransferTexture)
   {
     id<MTLTexture> lmTex = (__bridge id<MTLTexture>)this->LabelMapTransferTexture;
-    id<MTLSamplerState> lmSamp = (__bridge id<MTLSamplerState>)this->LabelMapTransferSampler;
     [encoder setFragmentTexture:lmTex atIndex:5];
-    [encoder setFragmentSamplerState:lmSamp atIndex:5];
   }
   else
   {
     [encoder setFragmentTexture:tfTex atIndex:5];
-    [encoder setFragmentSamplerState:tfSamp atIndex:5];
   }
 
   // Bind min-max acceleration texture (fragment index 6).
-  // Metal requires all declared fragment texture/sampler arguments to be bound,
-  // so bind the dummy minmax texture as fallback when min-max is not available.
   id<MTLTexture> minMaxFallbackTex =
     (__bridge id<MTLTexture>)this->DummyMinMaxTexture;
   if (this->MinMaxTexture)
   {
     id<MTLTexture> mmTex = (__bridge id<MTLTexture>)this->MinMaxTexture;
-    id<MTLSamplerState> mmSamp = (__bridge id<MTLSamplerState>)this->MinMaxSampler;
     [encoder setFragmentTexture:mmTex atIndex:6];
-    [encoder setFragmentSamplerState:mmSamp atIndex:6];
   }
   else
   {
     [encoder setFragmentTexture:minMaxFallbackTex atIndex:6];
-    [encoder setFragmentSamplerState:volSamp atIndex:6];
   }
 }
 
@@ -4180,8 +4045,6 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
 
         id<MTLTexture> blockMmTex = (__bridge id<MTLTexture>)block.MinMaxTexture;
         [encoder setFragmentTexture:blockMmTex atIndex:6];
-        id<MTLSamplerState> mmSamp = (__bridge id<MTLSamplerState>)this->MinMaxSampler;
-        [encoder setFragmentSamplerState:mmSamp atIndex:6];
       }
       else
       {
@@ -4796,7 +4659,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     // The fix makes compositing order-independent:
     //   1. Each brick is ray-marched INDEPENDENTLY (fragment_volume_main, no fetch,
     //      accumulators start at 0) into its own RGBA16Float layer texture
-    //      (LayerColorTexture[i]). Because each pass writes a different texture,
+    //      (texture array slice i). Because each pass writes a different slice,
     //      draw order is irrelevant.
     //   2. A final fullscreen pass (fragment_layer_composite_main) reconstructs the
     //      pixel ray, intersects the <= MAX_LAYER_BRICKS brick boxes to get the TRUE
@@ -4814,7 +4677,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     if (!this->Blocks.empty() && this->Blocks.size() <= MAX_LAYER_BRICKS &&
         this->LayerPipelineState && this->CompositePipelineState)
     {
-      if (!this->EnsureLayerResources(mtlDevice, fboWidth, fboHeight))
+      int neededSlices = static_cast<int>(this->SortedBlockOrder.size());
+      if (!this->EnsureLayerResources(mtlDevice, fboWidth, fboHeight, neededSlices))
       {
         dispatch_semaphore_signal((dispatch_semaphore_t)this->FrameSemaphore);
         return;
@@ -4853,7 +4717,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         auto& block = this->Blocks[si];
 
         MTLRenderPassDescriptor* lrpd = [MTLRenderPassDescriptor renderPassDescriptor];
-        lrpd.colorAttachments[0].texture = (__bridge id<MTLTexture>)this->LayerColorTexture[bi];
+        lrpd.colorAttachments[0].texture = (__bridge id<MTLTexture>)this->LayerTextureArray;
+        lrpd.colorAttachments[0].slice = static_cast<NSUInteger>(bi);
         lrpd.colorAttachments[0].loadAction = MTLLoadActionClear;
         lrpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
         lrpd.colorAttachments[0].storeAction = MTLStoreActionStore;
@@ -4903,7 +4768,6 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
           pbd.MinMaxInfo[2] = static_cast<float>(block.MinMaxDims[1]);
           pbd.MinMaxInfo[3] = static_cast<float>(block.MinMaxDims[2]);
           [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.MinMaxTexture atIndex:6];
-          [layerEnc setFragmentSamplerState:(__bridge id<MTLSamplerState>)this->MinMaxSampler atIndex:6];
         }
         else
         {
@@ -4962,10 +4826,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       [compEnc setFragmentBuffer:uniformBuf offset:0 atIndex:1];
       [compEnc setFragmentBytes:&lc length:sizeof(lc) atIndex:2];
 
-      id<MTLTexture> layerArr[8];
-      for (int i = 0; i < 8; ++i)
-        layerArr[i] = (__bridge id<MTLTexture>)this->LayerColorTexture[i];
-      [compEnc setFragmentTextures:layerArr withRange:NSMakeRange(0, 8)];
+      [compEnc setFragmentTexture:(__bridge id<MTLTexture>)this->LayerTextureArray atIndex:0];
 
       [compEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
       [compEnc endEncoding];
@@ -5049,8 +4910,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 // ============================================================================
 // KNOWN LIMITATIONS & FUTURE WORK (partitioned volume rendering)
 // ----------------------------------------------------------------------------
-// 1. BRICK CAP. The order-independent composite reads a fixed 8 layer textures
-//    (layer0..layer7) and LayerCompositeUniforms holds [8] bounds, so the fix
+// 1. BRICK CAP. The order-independent composite reads from a texture array
+//    (layers[0..7]) and LayerCompositeUniforms holds [8] bounds, so the fix
 //    covers <= MAX_LAYER_BRICKS bricks only. Volumes with more partitions fall
 //    through to the order-DEPENDENT accumulation path (fragment_volume_accum_main)
 //    and WILL show the boundary seam at some camera angles. To lift the cap,
