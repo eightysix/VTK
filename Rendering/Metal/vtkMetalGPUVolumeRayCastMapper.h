@@ -118,6 +118,9 @@ public:
   void SetUsePrecomputedNormals(bool val) { this->UsePrecomputedNormals = val; }
   bool GetUsePrecomputedNormals() const { return this->UsePrecomputedNormals; }
 
+  void SetPreferHalfPrecision(bool val) { this->PreferHalfPrecision = val; }
+  bool GetPreferHalfPrecision() const { return this->PreferHalfPrecision; }
+
   void SetUseGPUMinMax(bool val) { this->UseGPUMinMax = val; }
   bool GetUseGPUMinMax() const { return this->UseGPUMinMax; }
 
@@ -182,7 +185,7 @@ private:
   int VolumeNumComponents = 1;
   int CurrentSampleCount = 0;
 
-  bool PreferHalfPrecision = true;  // when true, prefer half-float for non-native data types
+  bool PreferHalfPrecision = true;  // when true, prefer half-float (16-bit) for volume textures when the scalar range fits within [−65504, 65504]; covers native float and integer types
   // Enables a precomputed RGBA8Unorm normal texture to replace 6 gradient
   // fetches per sample with 1 normal texture fetch.  Adds ~4 bytes/voxel of
   // GPU memory and a one-time compute dispatch.  Provides a net benefit only

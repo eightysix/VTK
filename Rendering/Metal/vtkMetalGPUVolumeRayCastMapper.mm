@@ -303,6 +303,7 @@ void vtkMetalGPUVolumeRayCastMapper::WaitForInFlightFrames()
 void vtkMetalGPUVolumeRayCastMapper::PrintSelf(ostream& os, vtkIndent indent)
 {
   this->Superclass::PrintSelf(os, indent);
+  os << indent << "PreferHalfPrecision: " << this->PreferHalfPrecision << "\n";
   os << indent << "UseGPUMinMax: " << this->UseGPUMinMax << "\n";
   os << indent << "UseFullscreenCameraInside: " << this->UseFullscreenCameraInside << "\n";
 }
@@ -982,20 +983,41 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       {
         case VTK_FLOAT:
         {
-          fmtInfo.bytesPerComponent = 4;
-          fmtInfo.needsConversion = false;
-          fmtInfo.normalizationFactor = 1.0f;
-          switch (componentsForFormat)
+          if (useHalf)
           {
-            case 1:
-              fmtInfo.format = MTLPixelFormatR32Float;
-              break;
-            case 2:
-              fmtInfo.format = MTLPixelFormatRG32Float;
-              break;
-            default:
-              fmtInfo.format = MTLPixelFormatRGBA32Float;
-              break;
+            fmtInfo.bytesPerComponent = 2;
+            fmtInfo.needsConversion = true;
+            fmtInfo.normalizationFactor = 1.0f;
+            switch (componentsForFormat)
+            {
+              case 1:
+                fmtInfo.format = MTLPixelFormatR16Float;
+                break;
+              case 2:
+                fmtInfo.format = MTLPixelFormatRG16Float;
+                break;
+              default:
+                fmtInfo.format = MTLPixelFormatRGBA16Float;
+                break;
+            }
+          }
+          else
+          {
+            fmtInfo.bytesPerComponent = 4;
+            fmtInfo.needsConversion = false;
+            fmtInfo.normalizationFactor = 1.0f;
+            switch (componentsForFormat)
+            {
+              case 1:
+                fmtInfo.format = MTLPixelFormatR32Float;
+                break;
+              case 2:
+                fmtInfo.format = MTLPixelFormatRG32Float;
+                break;
+              default:
+                fmtInfo.format = MTLPixelFormatRGBA32Float;
+                break;
+            }
           }
           break;
         }
@@ -1250,6 +1272,21 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
                   for (int c = 0; c < numComponents; ++c)
                     halfData[i * outputComponents + c] =
                       FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                  for (int c = numComponents; c < outputComponents; ++c)
+                    halfData[i * outputComponents + c] = FloatToHalf(0.0f);
+                }
+              });
+              break;
+            }
+            case VTK_FLOAT:
+            {
+              const float* src = static_cast<const float*>(scalars->GetVoidPointer(0));
+              vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+                for (vtkIdType i = begin; i < end; ++i)
+                {
+                  for (int c = 0; c < numComponents; ++c)
+                    halfData[i * outputComponents + c] =
+                      FloatToHalf(src[i * numComponents + c]);
                   for (int c = numComponents; c < outputComponents; ++c)
                     halfData[i * outputComponents + c] = FloatToHalf(0.0f);
                 }
@@ -2883,19 +2920,39 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
     switch (dataType)
     {
       case VTK_FLOAT:
-        bytesPerComponent = 4;
-        normalizationFactor = 1.0f;
-        switch (componentsForFormat)
+        if (blockUseHalf)
         {
-          case 1:
-            pixelFormat = MTLPixelFormatR32Float;
-            break;
-          case 2:
-            pixelFormat = MTLPixelFormatRG32Float;
-            break;
-          default:
-            pixelFormat = MTLPixelFormatRGBA32Float;
-            break;
+          bytesPerComponent = 2;
+          normalizationFactor = 1.0f;
+          switch (componentsForFormat)
+          {
+            case 1:
+              pixelFormat = MTLPixelFormatR16Float;
+              break;
+            case 2:
+              pixelFormat = MTLPixelFormatRG16Float;
+              break;
+            default:
+              pixelFormat = MTLPixelFormatRGBA16Float;
+              break;
+          }
+        }
+        else
+        {
+          bytesPerComponent = 4;
+          normalizationFactor = 1.0f;
+          switch (componentsForFormat)
+          {
+            case 1:
+              pixelFormat = MTLPixelFormatR32Float;
+              break;
+            case 2:
+              pixelFormat = MTLPixelFormatRG32Float;
+              break;
+            default:
+              pixelFormat = MTLPixelFormatRGBA32Float;
+              break;
+          }
         }
         break;
       case VTK_UNSIGNED_CHAR:
@@ -3165,6 +3222,22 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
                     for (int c = 0; c < numComponents; ++c)
                       static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
                         FloatToHalf(static_cast<float>(src[i * numComponents + c]));
+                    for (int c = numComponents; c < outputComponents; ++c)
+                      static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                        FloatToHalf(0.0f);
+                  }
+                });
+                break;
+              }
+              case VTK_FLOAT:
+              {
+                const float* src = static_cast<const float*>(fullDataPtr);
+                vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
+                  for (vtkIdType i = begin; i < end; ++i)
+                  {
+                    for (int c = 0; c < numComponents; ++c)
+                      static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
+                        FloatToHalf(src[i * numComponents + c]);
                     for (int c = numComponents; c < outputComponents; ++c)
                       static_cast<uint16_t*>(uploadPointer)[i * outputComponents + c] =
                         FloatToHalf(0.0f);
