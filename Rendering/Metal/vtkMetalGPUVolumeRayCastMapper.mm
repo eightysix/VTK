@@ -3622,7 +3622,18 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       AssignMetalObject(block.Texture, tex);
 
       // --- Per-block min-max texture generation ---
-      if (hasOpacityFunc)
+      // When UseGPUMinMax is true, skip CPU generation and let the GPU compute
+      // phase after the blit encoder handle it.  Just store the dims so the
+      // GPU phase can reuse them.
+      if (this->UseGPUMinMax)
+      {
+        const int DS = 4;
+        block.MinMaxDims[0] = std::max(1, (bDims[0] + DS - 1) / DS);
+        block.MinMaxDims[1] = std::max(1, (bDims[1] + DS - 1) / DS);
+        block.MinMaxDims[2] = std::max(1, (bDims[2] + DS - 1) / DS);
+        block.MinMaxTexture = nullptr;
+      }
+      else if (hasOpacityFunc)
       {
         const int DS = 4; // Downsample factor
         int mmDims[3] = {
@@ -3901,6 +3912,109 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
     }
 
     [blit endEncoding];
+
+    // Phase 5b: GPU per-block min-max texture generation for partitioned volumes.
+    // After all block textures are uploaded, dispatch volume_compute_minmax and
+    // volume_dilate_minmax compute kernels per block, reusing the same shaders
+    // as the single-block GPU min-max path but with per-block texture bindings.
+    if (this->UseGPUMinMax && hasOpacityFunc &&
+        this->EnsureMinMaxComputePipelines(mtlDeviceVoid))
+    {
+      // Build opacity prefix table from the transfer function
+      double scalarRange = this->ScalarRange[1] - this->ScalarRange[0];
+      if (scalarRange <= 0.0) scalarRange = 1.0;
+      float normFactor = this->ScalarNormalizationFactor;
+
+      double opacityTable[256];
+      opFunc->GetTable(this->ScalarRange[0], this->ScalarRange[1], 256, opacityTable);
+
+      MinMaxComputeUniforms mmu;
+      mmu.ds = 4.0f;
+      mmu.scalarMin = static_cast<float>(this->ScalarRange[0] / normFactor);
+      mmu.scalarScale = static_cast<float>(255.0 * normFactor / scalarRange);
+      mmu._pad = 0.0f;
+      mmu.opacityPrefix[0] = 0;
+      for (int i = 0; i < 256; ++i)
+        mmu.opacityPrefix[i + 1] = mmu.opacityPrefix[i] + (opacityTable[i] > 0.0 ? 1u : 0u);
+
+      id<MTLComputeCommandEncoder> mmEnc = [uploadCmdBuf computeCommandEncoder];
+      mmEnc.label = @"VTK Block MinMax Compute";
+
+      for (auto& block : this->Blocks)
+      {
+        if (!block.Texture) continue;
+
+        id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture;
+        int bdims[3] = { block.Dims[0], block.Dims[1], block.Dims[2] };
+        int mmDims[3] = { block.MinMaxDims[0], block.MinMaxDims[1], block.MinMaxDims[2] };
+
+        // Create scratch R8Unorm texture for raw occupancy (temporary)
+        MTLTextureDescriptor* scratchDesc = [[MTLTextureDescriptor alloc] init];
+        scratchDesc.textureType = MTLTextureType3D;
+        scratchDesc.pixelFormat = MTLPixelFormatR8Unorm;
+        scratchDesc.width = static_cast<NSUInteger>(mmDims[0]);
+        scratchDesc.height = static_cast<NSUInteger>(mmDims[1]);
+        scratchDesc.depth = static_cast<NSUInteger>(mmDims[2]);
+        scratchDesc.mipmapLevelCount = 1;
+        scratchDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        scratchDesc.storageMode = MTLStorageModePrivate;
+
+        id<MTLTexture> scratchTex = [device newTextureWithDescriptor:scratchDesc];
+        [scratchDesc release];
+        if (!scratchTex) continue;
+
+        // Create persistent per-block MinMax texture (dilated result)
+        MTLTextureDescriptor* mmDesc = [[MTLTextureDescriptor alloc] init];
+        mmDesc.textureType = MTLTextureType3D;
+        mmDesc.pixelFormat = MTLPixelFormatR8Unorm;
+        mmDesc.width = static_cast<NSUInteger>(mmDims[0]);
+        mmDesc.height = static_cast<NSUInteger>(mmDims[1]);
+        mmDesc.depth = static_cast<NSUInteger>(mmDims[2]);
+        mmDesc.mipmapLevelCount = 1;
+        mmDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        mmDesc.storageMode = MTLStorageModePrivate;
+
+        id<MTLTexture> mmTex = [device newTextureWithDescriptor:mmDesc];
+        [mmDesc release];
+        if (!mmTex) { [scratchTex release]; continue; }
+        AssignMetalObject(block.MinMaxTexture, mmTex);
+
+        // Setup uniforms for this block
+        mmu.mmDimX = static_cast<uint32_t>(mmDims[0]);
+        mmu.mmDimY = static_cast<uint32_t>(mmDims[1]);
+        mmu.mmDimZ = static_cast<uint32_t>(mmDims[2]);
+        mmu.volDimX = static_cast<uint32_t>(bdims[0]);
+        mmu.volDimY = static_cast<uint32_t>(bdims[1]);
+        mmu.volDimZ = static_cast<uint32_t>(bdims[2]);
+
+        // Dispatch volume_compute_minmax: blockTex -> scratchTex
+        [mmEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->MinMaxComputePipeline];
+        [mmEnc setTexture:blockTex atIndex:0];
+        [mmEnc setTexture:scratchTex atIndex:1];
+        [mmEnc setBytes:&mmu length:sizeof(mmu) atIndex:0];
+
+        MTLSize gridSize = MTLSizeMake(
+          static_cast<NSUInteger>(mmDims[0]),
+          static_cast<NSUInteger>(mmDims[1]),
+          static_cast<NSUInteger>(mmDims[2]));
+        NSUInteger tgw = 8;
+        MTLSize tgSize = MTLSizeMake(
+          std::min(tgw, static_cast<NSUInteger>(mmDims[0])),
+          std::min(tgw, static_cast<NSUInteger>(mmDims[1])),
+          std::min(tgw, static_cast<NSUInteger>(mmDims[2])));
+        [mmEnc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
+
+        // Dispatch volume_dilate_minmax: scratchTex -> mmTex
+        [mmEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->DilateComputePipeline];
+        [mmEnc setTexture:scratchTex atIndex:0];
+        [mmEnc setTexture:mmTex atIndex:1];
+        [mmEnc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
+
+        [scratchTex release];
+      }
+
+      [mmEnc endEncoding];
+    }
 
     // Phase 4: Precompute per-block gradient/normal textures for partitioned volumes.
     if (this->UsePrecomputedNormals && !this->Blocks.empty())
@@ -5545,10 +5659,20 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       this->UpdateMinMaxTexture(mtlDevice, vol, input, scalars, false);
     }
   }
+  else if (this->UseGPUMinMax && usePartitions)
+  {
+    // GPU min-max path for partitioned volumes: skip the expensive CPU macrocell
+    // voxel scan. UpdateBlockTextures generates per-block minmax textures on GPU
+    // directly from each block's uploaded texture, reusing volume_compute_minmax
+    // and volume_dilate_minmax compute kernels with block-specific uniforms.
+    if (!this->UpdateVolumeTexture(mtlDevice, mtlQueue, vol))
+    {
+      return;
+    }
+  }
   else
   {
     // CPU min-max path: compute from raw scalar data before volume upload.
-    // Partitioned volumes still need CPU macrocell data for per-block ranges.
     this->UpdateMinMaxTexture(mtlDevice, vol, input, scalars, usePartitions);
 
     if (!this->UpdateVolumeTexture(mtlDevice, mtlQueue, vol))
