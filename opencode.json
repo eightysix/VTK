@@ -3,6 +3,7 @@
   "lsp": {
     "clangd": {
       "command": ["clangd"],
+      "extensions": [".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".m", ".mm"],
       "initialization": {
         "fallbackFlags": ["-std=gnu++17"]
       }
