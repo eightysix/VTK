@@ -1383,8 +1383,12 @@ inline float volume_random(float2 st) {
   return fract(sin(dot(st.xy, float2(12.9898, 78.233))) * 43758.5453123);
 }
 
+inline float safeRecip(float x) {
+  return 1.0 / (abs(x) < 1e-8 ? copysign(1e-8, x) : x);
+}
+
 inline float2 intersectBox(float3 orig, float3 dir, float3 boxMin, float3 boxMax) {
-  float3 invDir = 1.0 / select(dir, float3(1e-8), abs(dir) < 1e-8);
+  float3 invDir = float3(safeRecip(dir.x), safeRecip(dir.y), safeRecip(dir.z));
   float3 tbot = invDir * (boxMin - orig);
   float3 ttop = invDir * (boxMax - orig);
   float3 tmin = min(ttop, tbot);
@@ -1510,15 +1514,16 @@ inline half4 marchVolume(
   int3  curCell     = int3(-1);
   bool  curCellEmpty = false;
   float3 mmDimF     = b.minMaxInfo.yzw;
+  const bool useMinMax = fc_minmax &&
+    b.minMaxInfo.x > 0.5 &&
+    b.minMaxInfo.y > 0.5 &&
+    b.minMaxInfo.z > 0.5 &&
+    b.minMaxInfo.w > 0.5;
 
   for (int i = 0; i < maxSteps; i++) {
     if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
 
-    if (fc_minmax &&
-        b.minMaxInfo.x > 0.5 &&
-        b.minMaxInfo.y > 0.5 &&
-        b.minMaxInfo.z > 0.5 &&
-        b.minMaxInfo.w > 0.5) {
+    if (useMinMax) {
       float3 texLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
       float3 mmPos = clamp(texLocalPos, float3(0.0), float3(1.0));
       int3 newCell = min(int3(mmPos * mmDimF), int3(mmDimF) - 1);
@@ -1527,38 +1532,6 @@ inline half4 marchVolume(
         curCellEmpty = minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5;
       }
 
-      bool allEmpty = simd_all(curCellEmpty);
-      if (allEmpty) {
-        float3 cellCoord = mmPos * mmDimF;
-        float3 fractCoord = fract(cellCoord);
-
-        float3 distToEdge;
-        distToEdge.x = rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x;
-        distToEdge.y = rayDir.y > 0.0 ? (1.0 - fractCoord.y) : fractCoord.y;
-        distToEdge.z = rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
-        distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
-
-        float3 tToEdge;
-        tToEdge.x = abs(rayDirTexLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirTexLocal.x * mmDimF.x) : 1e30;
-        tToEdge.y = abs(rayDirTexLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirTexLocal.y * mmDimF.y) : 1e30;
-        tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
-
-        float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
-        exactSkip += 1e-4;
-        float skipDist = ceil(exactSkip / stepSize) * stepSize;
-        skipDist = max(stepSize, skipDist);
-
-        currentPoint += rayDir * skipDist;
-        currentT += skipDist;
-
-        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= totalBoxT) {
-          break;
-        }
-
-        prefetchValid = false;
-        curCell = int3(-1);
-        continue;
-      }
       if (curCellEmpty) {
         float3 cellCoord = mmPos * mmDimF;
         float3 fractCoord = fract(cellCoord);
