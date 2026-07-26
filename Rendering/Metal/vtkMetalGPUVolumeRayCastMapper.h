@@ -337,6 +337,8 @@ private:
   void SortBlocksBackToFront(vtkRenderer* ren, vtkVolume* vol);
   bool UpdateBlockTextures(void* mtlDevice, void* mtlQueue, vtkVolume* vol,
     vtkImageData* input, vtkDataArray* scalars, int numComponents);
+  bool UpdateBlockMinMaxTextures(void* mtlDevice, void* mtlQueue, vtkVolume* vol,
+    vtkImageData* input, vtkDataArray* scalars, int numComponents);
 
   // Per-block scalar min/max for empty-space skipping
   std::vector<std::array<double, 2>> BlockScalarRanges;
