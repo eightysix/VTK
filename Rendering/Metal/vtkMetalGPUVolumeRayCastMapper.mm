@@ -3003,8 +3003,12 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
     // Convert data types that don't match the chosen pixel format.
     // For single-component float data, use Accelerate (NEON-vectorized) for
     // the float-to-half conversion instead of the scalar FloatToHalf loop.
-    bool needsConversion = (dataType != VTK_FLOAT && dataType != VTK_UNSIGNED_CHAR &&
+    bool needsConversion = (dataType != VTK_UNSIGNED_CHAR &&
       dataType != VTK_UNSIGNED_SHORT);
+    if (dataType == VTK_FLOAT && !blockUseHalf)
+    {
+      needsConversion = false;
+    }
 
     // --- Phase 7: GPU compute conversion for non-native data types ---
     bool gpuConversionUsed = false;
@@ -3105,7 +3109,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
         if (blockUseHalf)
         {
           // Fast path: single-component float → half via Accelerate (NEON/SED)
-          if (IsContiguousScalarFloat(dataType, numComponents, totalTuples, fullDataPtr, bytesPerVoxel))
+          size_t srcBytesPerVoxel =
+            static_cast<size_t>(vtkDataArray::GetDataTypeSize(dataType)) * numComponents;
+          if (IsContiguousScalarFloat(dataType, numComponents, totalTuples, fullDataPtr, srcBytesPerVoxel))
           {
             std::memcpy(uploadPointer, fullDataPtr, static_cast<size_t>(totalVolumeBytes));
             vImage_Buffer srcBuf = { uploadPointer, 1, static_cast<vImagePixelCount>(totalTuples),
