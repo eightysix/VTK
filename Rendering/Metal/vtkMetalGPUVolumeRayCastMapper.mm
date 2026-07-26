@@ -120,7 +120,7 @@ struct VolumeMapperUniforms
   float LabelMapNumLabels;        // 944
   float UseDepthTexture;          // 948
   float UseNormalTexture;         // 952
-  float FrameIndex;               // 956 — replaces _padMask, used for jitter temporal offset
+  float _padMask;                 // 956
   // Min-max acceleration texture
   float UseMinMaxAccel;           // 960
   float MinMaxDimX;               // 964
@@ -138,7 +138,6 @@ static_assert(offsetof(VolumeMapperUniforms, ClippingPlane0Origin) == 672, "");
 static_assert(offsetof(VolumeMapperUniforms, UseMask) == 928, "");
 static_assert(offsetof(VolumeMapperUniforms, UseDepthTexture) == 948, "");
 static_assert(offsetof(VolumeMapperUniforms, UseNormalTexture) == 952, "");
-static_assert(offsetof(VolumeMapperUniforms, FrameIndex) == 956, "");
 static_assert(offsetof(VolumeMapperUniforms, UseMinMaxAccel) == 960, "");
 
 // Per-block data for volume rendering — must match Metal PerBlockData struct
@@ -2047,7 +2046,7 @@ bool vtkMetalGPUVolumeRayCastMapper::IsBlockEmpty(
 //------------------------------------------------------------------------------
 bool vtkMetalGPUVolumeRayCastMapper::EnsureMinMaxComputePipelines(void* mtlDeviceVoid)
 {
-  if (this->MinMaxComputePipeline && this->DilateComputePipeline && this->MipComputePipeline)
+  if (this->MinMaxComputePipeline && this->DilateComputePipeline)
   {
     return true;
   }
@@ -2102,31 +2101,6 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureMinMaxComputePipelines(void* mtlDevic
         return false;
       }
       AssignMetalObject(this->DilateComputePipeline, pso);
-    }
-
-    if (!this->MipComputePipeline)
-    {
-      id<MTLFunction> func = [library newFunctionWithName:@"volume_minmax_mip"];
-      if (func)
-      {
-        NSError* error = nil;
-        id<MTLComputePipelineState> pso =
-          [dev newComputePipelineStateWithFunction:func error:&error];
-        [func release];
-        if (pso)
-        {
-          AssignMetalObject(this->MipComputePipeline, pso);
-        }
-        else
-        {
-          vtkWarningMacro(<< "Failed to create minmax mip compute pipeline: "
-                          << [[error localizedDescription] UTF8String]);
-        }
-      }
-      else
-      {
-        vtkWarningMacro("volume_minmax_mip kernel not found — hierarchical skip disabled");
-      }
     }
   }
 
@@ -2276,17 +2250,15 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     [cmdBuf commit];
 
     // --- Store the dilated result as the persistent MinMaxTexture ---
-    // Create with 2 mip levels for hierarchical (coarse-level) empty-space skipping,
-    // but only if the mip kernel is available.
-    int mipCount = (this->MipComputePipeline && (mmDims[0] > 1 || mmDims[1] > 1 || mmDims[2] > 1)) ? 2 : 1;
+    // First, create the persistent texture (ShaderRead only)
     MTLTextureDescriptor* permDesc = [[MTLTextureDescriptor alloc] init];
     permDesc.textureType = MTLTextureType3D;
     permDesc.pixelFormat = MTLPixelFormatR8Unorm;
     permDesc.width = mmDims[0];
     permDesc.height = mmDims[1];
     permDesc.depth = mmDims[2];
-    permDesc.mipmapLevelCount = mipCount;
-    permDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    permDesc.mipmapLevelCount = 1;
+    permDesc.usage = MTLTextureUsageShaderRead;
     permDesc.storageMode = MTLStorageModePrivate;
 
     id<MTLTexture> permTex = [device newTextureWithDescriptor:permDesc];
@@ -2300,7 +2272,7 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     }
     AssignMetalObject(this->MinMaxTexture, permTex);
 
-    // Blit the dilated result into level 0 of the persistent texture
+    // Blit the dilated result into the persistent texture
     id<MTLCommandBuffer> copyCmdBuf = [queue commandBuffer];
     copyCmdBuf.label = @"VTK MinMax Copy";
     id<MTLBlitCommandEncoder> blit = [copyCmdBuf blitCommandEncoder];
@@ -2314,70 +2286,6 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
          destinationLevel:0
         destinationOrigin:MTLOriginMake(0, 0, 0)];
     [blit endEncoding];
-
-    // Generate coarse level (mip 1) from level 0 via conservative mip kernel.
-    // Note: Metal's texture3d<access::write>::write() always writes to level 0,
-    // so we must use a separate 1-level temp texture and blit into the mip level.
-    if (this->MipComputePipeline && (mmDims[0] > 1 || mmDims[1] > 1 || mmDims[2] > 1))
-    {
-      // Note: Metal computes mip level 1 dimensions as max(1, floor(dim/2)), so
-      // our coarse temp texture must match that (not ceil), otherwise the blit
-      // destination would overflow the actual mip level 1 storage.
-      int coarseDims[3] = {
-        std::max(1, mmDims[0] / 2),
-        std::max(1, mmDims[1] / 2),
-        std::max(1, mmDims[2] / 2)
-      };
-      MTLTextureDescriptor* coarseDesc = [[MTLTextureDescriptor alloc] init];
-      coarseDesc.textureType = MTLTextureType3D;
-      coarseDesc.pixelFormat = MTLPixelFormatR8Unorm;
-      coarseDesc.width = coarseDims[0];
-      coarseDesc.height = coarseDims[1];
-      coarseDesc.depth = coarseDims[2];
-      coarseDesc.mipmapLevelCount = 1;
-      coarseDesc.usage = MTLTextureUsageShaderWrite;
-      coarseDesc.storageMode = MTLStorageModePrivate;
-      id<MTLTexture> coarseTex = [device newTextureWithDescriptor:coarseDesc];
-      [coarseDesc release];
-      if (coarseTex)
-      {
-        id<MTLComputeCommandEncoder> mipEnc = [copyCmdBuf computeCommandEncoder];
-        mipEnc.label = @"Volume MinMax Mip";
-        [mipEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->MipComputePipeline];
-        [mipEnc setTexture:permTex atIndex:0];
-        [mipEnc setTexture:coarseTex atIndex:1];
-        MTLSize mipGrid = MTLSizeMake(coarseDims[0], coarseDims[1], coarseDims[2]);
-        NSUInteger tgw = 8;
-        [mipEnc dispatchThreads:mipGrid threadsPerThreadgroup:MTLSizeMake(tgw, tgw, tgw)];
-        [mipEnc endEncoding];
-
-        // Blit from coarseTex into permTex mip level 1
-        id<MTLBlitCommandEncoder> mipBlit = [copyCmdBuf blitCommandEncoder];
-        [mipBlit copyFromTexture:coarseTex
-                    sourceSlice:0
-                    sourceLevel:0
-                   sourceOrigin:MTLOriginMake(0, 0, 0)
-                     sourceSize:MTLSizeMake(coarseDims[0], coarseDims[1], coarseDims[2])
-                      toTexture:permTex
-               destinationSlice:0
-               destinationLevel:1
-              destinationOrigin:MTLOriginMake(0, 0, 0)];
-        [mipBlit endEncoding];
-
-        this->HasMinMaxMip = true;
-        [coarseTex release];
-      }
-      else
-      {
-        vtkWarningMacro("Failed to create coarse minmax temp texture");
-        this->HasMinMaxMip = false;
-      }
-    }
-    else
-    {
-      this->HasMinMaxMip = false;
-    }
-
     [copyCmdBuf commit];
 
     [rawOcc release];
@@ -2645,7 +2553,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
           return false;
         }
         AssignMetalObject(this->MinMaxTexture, tex);
-        this->HasMinMaxMip = false; // CPU path always creates 1-level textures
       }
 
       // Upload data
@@ -3445,15 +3352,14 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
           }
         });
 
-        // 3. Create and upload the Metal 3D texture (with 2 mip levels for hierarchical skip)
-        int mMipCount = (mmDims0 > 1 || mmDims1 > 1 || mmDims2 > 1) ? 2 : 1;
+        // 3. Create and upload the Metal 3D texture
         MTLTextureDescriptor* mmDesc = [[MTLTextureDescriptor alloc] init];
         mmDesc.textureType = MTLTextureType3D;
         mmDesc.pixelFormat = MTLPixelFormatR8Unorm;
         mmDesc.width = mmDims0;
         mmDesc.height = mmDims1;
         mmDesc.depth = mmDims2;
-        mmDesc.mipmapLevelCount = mMipCount;
+        mmDesc.mipmapLevelCount = 1;
         mmDesc.usage = MTLTextureUsageShaderRead;
         mmDesc.storageMode = MTLStorageModeShared;
 
@@ -3470,43 +3376,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
                     withBytes:minMaxData.data()
                   bytesPerRow:mmBytesPerRow
                 bytesPerImage:mmBytesPerImage];
-
-          // Generate coarse mip level 1 via conservative OR reduction.
-          // Use floor(width/2) to match Metal's mip level 1 dimension formula.
-          if (mMipCount > 1)
-          {
-            int cw = std::max(1, mmDims0 / 2);
-            int ch = std::max(1, mmDims1 / 2);
-            int cd = std::max(1, mmDims2 / 2);
-            std::vector<uint8_t> coarseData(cw * ch * cd, 0);
-            for (int z = 0; z < cd; ++z)
-              for (int y = 0; y < ch; ++y)
-                for (int x = 0; x < cw; ++x)
-                {
-                  bool anyEmpty = false;
-                  for (int dz = 0; dz < 2 && !anyEmpty; ++dz)
-                    for (int dy = 0; dy < 2 && !anyEmpty; ++dy)
-                      for (int dx = 0; dx < 2 && !anyEmpty; ++dx)
-                      {
-                        int sx = x * 2 + dx, sy = y * 2 + dy, sz = z * 2 + dz;
-                        if (sx < mmDims0 && sy < mmDims1 && sz < mmDims2)
-                        {
-                          int srcIdx = (sz * mmDims1 + sy) * mmDims0 + sx;
-                          if (minMaxData[srcIdx] == 0) anyEmpty = true;
-                        }
-                      }
-                  coarseData[(z * ch + y) * cw + x] = anyEmpty ? 0 : 255;
-                }
-            MTLRegion coarseRegion = MTLRegionMake3D(0, 0, 0, cw, ch, cd);
-            NSUInteger cBytesPerRow = cw * sizeof(uint8_t);
-            NSUInteger cBytesPerImage = cBytesPerRow * ch;
-            [mmTex replaceRegion:coarseRegion
-                    mipmapLevel:1
-                          slice:0
-                      withBytes:coarseData.data()
-                    bytesPerRow:cBytesPerRow
-                  bytesPerImage:cBytesPerImage];
-          }
 
           AssignMetalObject(block.MinMaxTexture, mmTex);
         }
@@ -4788,12 +4657,12 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
 
       if (block.MinMaxTexture)
       {
-        id<MTLTexture> blockMmTex = (__bridge id<MTLTexture>)block.MinMaxTexture;
-        pbd.MinMaxInfo[0] = (blockMmTex.mipmapLevelCount > 1) ? 2.0f : 1.0f;
+        pbd.MinMaxInfo[0] = 1.0f;
         pbd.MinMaxInfo[1] = static_cast<float>(block.MinMaxDims[0]);
         pbd.MinMaxInfo[2] = static_cast<float>(block.MinMaxDims[1]);
         pbd.MinMaxInfo[3] = static_cast<float>(block.MinMaxDims[2]);
 
+        id<MTLTexture> blockMmTex = (__bridge id<MTLTexture>)block.MinMaxTexture;
         [encoder setFragmentTexture:blockMmTex atIndex:6];
       }
       else
@@ -4971,8 +4840,7 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
 
       if (block.MinMaxTexture)
       {
-        id<MTLTexture> blockMmTex = (__bridge id<MTLTexture>)block.MinMaxTexture;
-        pbd.MinMaxInfo[0] = (blockMmTex.mipmapLevelCount > 1) ? 2.0f : 1.0f;
+        pbd.MinMaxInfo[0] = 1.0f;
         pbd.MinMaxInfo[1] = static_cast<float>(block.MinMaxDims[0]);
         pbd.MinMaxInfo[2] = static_cast<float>(block.MinMaxDims[1]);
         pbd.MinMaxInfo[3] = static_cast<float>(block.MinMaxDims[2]);
@@ -5468,10 +5336,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // Depth texture flag — set to 1 when we have a real scene depth texture
   uniforms.UseDepthTexture = this->DepthTextureOcclusion ? 1.0f : 0.0f;
 
-  // Min-max acceleration texture (1.0 = fine-only, 2.0 = fine+coarse hierarchical)
-  uniforms.UseMinMaxAccel = this->MinMaxTexture
-    ? (this->HasMinMaxMip ? 2.0f : 1.0f)
-    : 0.0f;
+  // Min-max acceleration texture
+  uniforms.UseMinMaxAccel = this->MinMaxTexture ? 1.0f : 0.0f;
   uniforms.MinMaxDimX = static_cast<float>(this->MinMaxDims[0]);
   uniforms.MinMaxDimY = static_cast<float>(this->MinMaxDims[1]);
   uniforms.MinMaxDimZ = static_cast<float>(this->MinMaxDims[2]);
@@ -5490,7 +5356,6 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     }
   }
   uniforms.UseNormalTexture = hasNormalTexture ? 1.0f : 0.0f;
-  uniforms.FrameIndex = static_cast<float>(this->FrameCounter++);
 
   // Build feature mask for shader function constant specialization.
   // When any feature is actively used at runtime, the corresponding bit is set
@@ -5809,12 +5674,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
         if (block.MinMaxTexture)
         {
-          id<MTLTexture> blockMmTex = (__bridge id<MTLTexture>)block.MinMaxTexture;
-          pbd.MinMaxInfo[0] = (blockMmTex.mipmapLevelCount > 1) ? 2.0f : 1.0f;
+          pbd.MinMaxInfo[0] = 1.0f;
           pbd.MinMaxInfo[1] = static_cast<float>(block.MinMaxDims[0]);
           pbd.MinMaxInfo[2] = static_cast<float>(block.MinMaxDims[1]);
           pbd.MinMaxInfo[3] = static_cast<float>(block.MinMaxDims[2]);
-          [layerEnc setFragmentTexture:blockMmTex atIndex:6];
+          [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.MinMaxTexture atIndex:6];
         }
         else
         {
