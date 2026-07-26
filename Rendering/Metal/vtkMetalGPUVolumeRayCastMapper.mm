@@ -1129,6 +1129,12 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       int dims[3];
       input->GetDimensions(dims);
 
+      if (dims[0] < 1 || dims[1] < 1 || dims[2] < 1)
+      {
+        vtkErrorMacro("Volume has zero dimensions");
+        return false;
+      }
+
       int dataType = scalars->GetDataType();
       int numComponents = scalars->GetNumberOfComponents();
       vtkIdType numTuples = scalars->GetNumberOfTuples();
@@ -4169,6 +4175,11 @@ void vtkMetalGPUVolumeRayCastMapper::SetClippingPlaneUniforms(
     planeNormals[numPlanes][3] = 0.0f;
 
     numPlanes++;
+  }
+
+  if (this->ClippingPlanes->GetNumberOfItems() >= 8)
+  {
+    vtkWarningMacro("More than 8 clipping planes provided; extras ignored.");
   }
 
   uniforms->NumClippingPlanes = static_cast<float>(numPlanes);
