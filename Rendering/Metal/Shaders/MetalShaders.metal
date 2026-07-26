@@ -1284,9 +1284,12 @@ struct VolumeMapperUniforms {
   float4 volumeBoundsMax;
   float4 cameraVolumePos;
   float4x4 viewProjection;
-  float sampleDistance;
-  float scalarMin;
-  float scalarMax;
+  half sampleDistance;
+  half _pdSD;             // padding — was upper half of float sampleDistance
+  half scalarMin;
+  half _pdSM;             // padding — was upper half of float scalarMin
+  half scalarMax;
+  half _pdSMax;           // padding — was upper half of float scalarMax
   float useJittering;
   float4x4 inverseViewProjection;
   float2 viewportSize;

@@ -54,9 +54,12 @@ struct VolumeMapperUniforms
   float VolumeBoundsMax[4];          // 144..159
   float CameraVolumePos[4];          // 160..175
   float ViewProjectionMatrix[16];    // 176..239
-  float SampleDistance;              // 240
-  float ScalarMin;                   // 244
-  float ScalarMax;                   // 248
+  uint16_t SampleDistanceHalf;      // 240  (half precision: sufficient for [0,1] space)
+  uint16_t _padSD;                  // 242  (padding — was upper half of float SampleDistance)
+  uint16_t ScalarMinHalf;           // 244
+  uint16_t _padSM;                  // 246
+  uint16_t ScalarMaxHalf;           // 248
+  uint16_t _padSMax;                // 250
   float UseJittering;                // 252
   float InverseViewProjection[16];   // 256..319
   float ViewportSize[2];            // 320..327
@@ -5643,17 +5646,17 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   double maxBoundsSize = std::max({ boundsSize[0], boundsSize[1], boundsSize[2] });
 
-  uniforms.SampleDistance =
-    static_cast<float>(actualSampleDistance / maxBoundsSize);
+  uniforms.SampleDistanceHalf =
+    FloatToHalf(static_cast<float>(actualSampleDistance / maxBoundsSize));
 
   {
     float normFactor = this->ScalarNormalizationFactor;
-    uniforms.ScalarMin = static_cast<float>(this->ScalarRange[0] / normFactor);
-    uniforms.ScalarMax = static_cast<float>(
+    uniforms.ScalarMinHalf = FloatToHalf(static_cast<float>(this->ScalarRange[0] / normFactor));
+    uniforms.ScalarMaxHalf = FloatToHalf(static_cast<float>(
       (this->ScalarRange[1] > this->ScalarRange[0]
          ? this->ScalarRange[1]
          : this->ScalarRange[0] + 1.0) /
-      normFactor);
+      normFactor));
   }
 
   uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;
