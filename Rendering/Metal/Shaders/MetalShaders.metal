@@ -2345,5 +2345,41 @@ kernel void volume_convert_uint_to_float(
     dst.write(val, gid);
 }
 
+// float -> half (handles all component counts, including 3→4 expansion)
+kernel void volume_convert_float_to_half(
+    device const float* src [[buffer(0)]],
+    texture3d<half, access::write> dst [[texture(0)]],
+    constant VolumeConvertUniforms& u [[buffer(1)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    if (any(gid >= uint3(u.dimX, u.dimY, u.dimZ))) return;
+    uint srcIdx = (gid.z * u.dimY + gid.y) * u.dimX + gid.x;
+    half4 val;
+    val.x = half(src[srcIdx * u.numComponents + 0]);
+    val.y = u.numComponents > 1 ? half(src[srcIdx * u.numComponents + 1]) : (half)0;
+    val.z = u.numComponents > 2 ? half(src[srcIdx * u.numComponents + 2]) : (half)0;
+    val.w = u.numComponents > 3 ? half(src[srcIdx * u.numComponents + 3]) : (half)0;
+    dst.write(val, gid);
+}
+
+// ushort -> normalized half with clamping to [0,255] (for ushort→uchar normalization).
+// Writes normalized values to a Unorm texture; the shader samples them as [0,1] and
+// reconstructs the original by multiplying by ScalarNormalizationFactor (255.0).
+kernel void volume_convert_ushort_to_uchar(
+    device const ushort* src [[buffer(0)]],
+    texture3d<half, access::write> dst [[texture(0)]],
+    constant VolumeConvertUniforms& u [[buffer(1)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    if (any(gid >= uint3(u.dimX, u.dimY, u.dimZ))) return;
+    uint srcIdx = (gid.z * u.dimY + gid.y) * u.dimX + gid.x;
+    half4 val;
+    val.x = half(min(src[srcIdx * u.numComponents + 0], (ushort)255)) / 255.0h;
+    val.y = u.numComponents > 1 ? half(min(src[srcIdx * u.numComponents + 1], (ushort)255)) / 255.0h : 1.0h;
+    val.z = u.numComponents > 2 ? half(min(src[srcIdx * u.numComponents + 2], (ushort)255)) / 255.0h : 1.0h;
+    val.w = u.numComponents > 3 ? half(min(src[srcIdx * u.numComponents + 3], (ushort)255)) / 255.0h : 1.0h;
+    dst.write(val, gid);
+}
+
 // NOTE: double -> half/float kernels are not provided because Metal does not
 // support 'double' in device address space. VTK_DOUBLE data falls back to CPU.

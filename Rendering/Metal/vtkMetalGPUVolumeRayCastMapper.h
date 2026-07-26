@@ -236,6 +236,8 @@ private:
   void* ConvertIntToFloatPipeline = nullptr;    // id<MTLComputePipelineState> — volume_convert_int_to_float
   void* ConvertUIntToHalfPipeline = nullptr;    // id<MTLComputePipelineState> — volume_convert_uint_to_half
   void* ConvertUIntToFloatPipeline = nullptr;   // id<MTLComputePipelineState> — volume_convert_uint_to_float
+  void* ConvertFloatToHalfPipeline = nullptr;   // id<MTLComputePipelineState> — volume_convert_float_to_half
+  void* ConvertUShortToUCharPipeline = nullptr; // id<MTLComputePipelineState> — volume_convert_ushort_to_uchar
   // Ensure all conversion compute pipelines exist for the given (dataType, useHalf) pair.
   // Returns true on success, false on failure (caller falls back to CPU).
   bool EnsureConversionPipelines(void* mtlDevice);
