@@ -64,24 +64,28 @@ static inline double HU2U8(double hu) {
   reader->SetFileNames(dicomDir->GetFileNamesForSeries(0));
   reader->Update();
 
-  // Cast to unsigned char using fixed CT HU range mapping.
-  // This matches Eyesight-iOS: u8 = (hu + 1024) * (255 / 4095).
-  vtkNew<vtkImageShiftScale> castToU8;
-  castToU8->SetInputConnection(reader->GetOutputPort());
-  castToU8->SetShift(kHUshift);
-  castToU8->SetScale(kHUscale);
-  castToU8->SetOutputScalarTypeToUnsignedChar();
-  castToU8->ClampOverflowOn();
-  castToU8->Update();
+  // Cast to float using fixed CT HU range mapping, preserving full
+  // dynamic range in a 0–255 space suitable for the preset transfer
+  // functions.  The mapper will convert these floats to half-float
+  // (R16Float / RGBA16Float) when PreferHalfPrecision is on, cutting
+  // texture bandwidth by ~2× vs. R32Float.
+  vtkNew<vtkImageShiftScale> castToFloat;
+  castToFloat->SetInputConnection(reader->GetOutputPort());
+  castToFloat->SetShift(kHUshift);
+  castToFloat->SetScale(kHUscale);
+  castToFloat->SetOutputScalarTypeToFloat();
+  castToFloat->ClampOverflowOn();
+  castToFloat->Update();
   // Original 16-bit data is no longer needed — free it.
   reader->GetOutput()->ReleaseData();
 
   vtkNew<vtkMetalGPUVolumeRayCastMapper> mapper;
-  mapper->SetInputData(castToU8->GetOutput());
+  mapper->SetInputData(castToFloat->GetOutput());
   mapper->UseJitteringOn();
   mapper->AutoAdjustSampleDistancesOff();
   mapper->SetSampleDistance(0.5);
   mapper->SetUseGPUMinMax(true);
+  mapper->SetPreferHalfPrecision(true);
 
   vtkNew<vtkVolumeProperty> property;
 
