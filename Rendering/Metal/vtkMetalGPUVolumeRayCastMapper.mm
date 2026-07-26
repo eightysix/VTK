@@ -32,6 +32,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <Accelerate/Accelerate.h>
+#import <simd/simd.h>
 
 #include <algorithm>
 #include <cstring>
@@ -5948,67 +5949,13 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // Compute inverse view-projection matrix for depth buffer occlusion.
   // Used in the fragment shader to unproject depth values to world space.
   {
-    float VP[16];
-    memcpy(VP, uniforms.ViewProjectionMatrix, sizeof(VP));
-    float invDet = 0.0f;
-    float invVP[16];
-
-    // 4x4 inverse via cofactors (inline to avoid vtkMatrix4x4 dependency in hot path)
-    invVP[0] = VP[5] * (VP[10] * VP[15] - VP[11] * VP[14]) -
-               VP[9] * (VP[6] * VP[15] - VP[7] * VP[14]) +
-               VP[13] * (VP[6] * VP[11] - VP[7] * VP[10]);
-    invVP[4] = -VP[4] * (VP[10] * VP[15] - VP[11] * VP[14]) +
-               VP[8] * (VP[6] * VP[15] - VP[7] * VP[14]) -
-               VP[12] * (VP[6] * VP[11] - VP[7] * VP[10]);
-    invVP[8] = VP[4] * (VP[9] * VP[15] - VP[11] * VP[13]) -
-               VP[8] * (VP[5] * VP[15] - VP[7] * VP[13]) +
-               VP[12] * (VP[5] * VP[11] - VP[7] * VP[9]);
-    invVP[12] = -VP[4] * (VP[9] * VP[14] - VP[10] * VP[13]) +
-                VP[8] * (VP[5] * VP[14] - VP[6] * VP[13]) -
-                VP[12] * (VP[5] * VP[10] - VP[6] * VP[9]);
-    invVP[1] = -VP[1] * (VP[10] * VP[15] - VP[11] * VP[14]) +
-               VP[9] * (VP[2] * VP[15] - VP[3] * VP[14]) -
-               VP[13] * (VP[2] * VP[11] - VP[3] * VP[10]);
-    invVP[5] = VP[0] * (VP[10] * VP[15] - VP[11] * VP[14]) -
-               VP[8] * (VP[2] * VP[15] - VP[3] * VP[14]) +
-               VP[12] * (VP[2] * VP[11] - VP[3] * VP[10]);
-    invVP[9] = -VP[0] * (VP[9] * VP[15] - VP[11] * VP[13]) +
-               VP[8] * (VP[1] * VP[15] - VP[3] * VP[13]) -
-               VP[12] * (VP[1] * VP[11] - VP[3] * VP[9]);
-    invVP[13] = VP[0] * (VP[9] * VP[14] - VP[10] * VP[13]) -
-                VP[8] * (VP[1] * VP[14] - VP[2] * VP[13]) +
-                VP[12] * (VP[1] * VP[10] - VP[2] * VP[9]);
-    invVP[2] = VP[1] * (VP[6] * VP[15] - VP[7] * VP[14]) -
-               VP[5] * (VP[2] * VP[15] - VP[3] * VP[14]) +
-               VP[13] * (VP[2] * VP[7] - VP[3] * VP[6]);
-    invVP[6] = -VP[0] * (VP[6] * VP[15] - VP[7] * VP[14]) +
-               VP[4] * (VP[2] * VP[15] - VP[3] * VP[14]) -
-               VP[12] * (VP[2] * VP[7] - VP[3] * VP[6]);
-    invVP[10] = VP[0] * (VP[5] * VP[15] - VP[7] * VP[13]) -
-                VP[4] * (VP[1] * VP[15] - VP[3] * VP[13]) +
-                VP[12] * (VP[1] * VP[7] - VP[3] * VP[5]);
-    invVP[14] = -VP[0] * (VP[5] * VP[14] - VP[6] * VP[13]) +
-                VP[4] * (VP[1] * VP[14] - VP[2] * VP[13]) -
-                VP[12] * (VP[1] * VP[6] - VP[2] * VP[5]);
-    invVP[3] = -VP[1] * (VP[6] * VP[11] - VP[7] * VP[10]) +
-               VP[5] * (VP[2] * VP[11] - VP[3] * VP[10]) -
-               VP[9] * (VP[2] * VP[7] - VP[3] * VP[6]);
-    invVP[7] = VP[0] * (VP[6] * VP[11] - VP[7] * VP[10]) -
-               VP[4] * (VP[2] * VP[11] - VP[3] * VP[10]) +
-               VP[8] * (VP[2] * VP[7] - VP[3] * VP[6]);
-    invVP[11] = -VP[0] * (VP[5] * VP[11] - VP[7] * VP[9]) +
-                VP[4] * (VP[1] * VP[11] - VP[3] * VP[9]) -
-                VP[8] * (VP[1] * VP[7] - VP[3] * VP[5]);
-    invVP[15] = VP[0] * (VP[5] * VP[10] - VP[6] * VP[9]) -
-                VP[4] * (VP[1] * VP[10] - VP[2] * VP[9]) +
-                VP[8] * (VP[1] * VP[6] - VP[2] * VP[5]);
-
-    invDet = VP[0] * invVP[0] + VP[1] * invVP[4] + VP[2] * invVP[8] + VP[3] * invVP[12];
-    if (fabs(invDet) > 1e-10f)
+    simd_float4x4 vpMat;
+    memcpy(&vpMat, uniforms.ViewProjectionMatrix, sizeof(vpMat));
+    float det = simd::determinant(vpMat);
+    if (fabs(det) > 1e-10f)
     {
-      float invDetRcp = 1.0f / invDet;
-      for (int i = 0; i < 16; ++i)
-        uniforms.InverseViewProjection[i] = invVP[i] * invDetRcp;
+      simd_float4x4 invVP = simd::inverse(vpMat);
+      memcpy(uniforms.InverseViewProjection, &invVP, sizeof(invVP));
     }
     else
     {
