@@ -27,6 +27,28 @@ class vtkVolume;
 struct PerBlockData;
 struct VolumeMapperUniforms;
 
+// RAII wrapper for Metal Obj-C resources stored as void*.
+// Defined in .mm (injects release/retain via Obj-C bridging).
+class VTKRENDERINGMETAL_EXPORT vtkMetalResource
+{
+  void* Obj = nullptr;
+
+public:
+  vtkMetalResource() = default;
+  ~vtkMetalResource();
+  vtkMetalResource(vtkMetalResource&& o) noexcept;
+  vtkMetalResource& operator=(vtkMetalResource&& o) noexcept;
+  vtkMetalResource(const vtkMetalResource&) = delete;
+  vtkMetalResource& operator=(const vtkMetalResource&) = delete;
+
+  vtkMetalResource& operator=(void* o);
+  void reset();
+  void take(void* o);
+  void retain(void* o);
+  void* get() const { return this->Obj; }
+  operator void*() const { return this->Obj; }
+};
+
 // Pipeline cache types for Phase 1B
 enum class VolumePipelineType : uint32_t
 {
@@ -105,7 +127,7 @@ public:
   void PostRender(vtkRenderer* ren, int numberOfScalarComponents) override;
 
   // Image-space downsampling accessors (used by vtkMetalRenderer for blit)
-  void* GetImageSampleColorTexture() const { return this->ImageSampleColorTexture; }
+  void* GetImageSampleColorTexture() const { return this->ImageSampleColorTexture.get(); }
   int GetImageSampleWidth() const { return this->ImageSampleFBOWidth; }
   int GetImageSampleHeight() const { return this->ImageSampleFBOHeight; }
 
@@ -130,15 +152,10 @@ public:
   bool GetUseGPUMinMax() const { return this->UseGPUMinMax; }
 
   // Phase 6: Fullscreen camera-inside path.
-  // When true (default), camera-inside rendering uses a fullscreen ray-cast
-  // fragment shader instead of CPU proxy geometry (ClipConvexPolyData +
-  // DensifyPolyData + TriangleFilter). Eliminates CPU hitching when the
-  // camera enters the volume.
   void SetUseFullscreenCameraInside(bool val) { this->UseFullscreenCameraInside = val; }
   bool GetUseFullscreenCameraInside() const { return this->UseFullscreenCameraInside; }
 
-  // No-op stubs: the instanced path was removed.  Kept so that any
-  // external caller (test / UI) that references the setter still compiles.
+  // No-op stubs: the instanced path was removed.
   void SetDisableInstanceRendering(bool) {}
   bool GetDisableInstanceRendering() const { return false; }
 
@@ -150,38 +167,38 @@ private:
   vtkMetalGPUVolumeRayCastMapper(const vtkMetalGPUVolumeRayCastMapper&) = delete;
   void operator=(const vtkMetalGPUVolumeRayCastMapper&) = delete;
 
-  // Metal pipeline objects (stored as void* to avoid Obj-C in header)
-  void* PipelineState = nullptr;         // id<MTLRenderPipelineState>
-  void* AccumulationPipelineState = nullptr; // id<MTLRenderPipelineState> — for > MAX_LAYER_BRICKS fallback
-  void* VolumeTexture = nullptr;         // id<MTLTexture>  (3D)
+  // Metal pipeline objects (RAII-managed void*)
+  vtkMetalResource PipelineState;            // id<MTLRenderPipelineState>
+  vtkMetalResource AccumulationPipelineState; // id<MTLRenderPipelineState>
+  vtkMetalResource VolumeTexture;            // id<MTLTexture>  (3D)
 
-  void* ColorOpacityTexture = nullptr;   // id<MTLTexture>  (2D)
-  void* GradientOpacityTexture = nullptr; // id<MTLTexture> (256x1 RGBA8Unorm)
-  void* MinMaxTexture = nullptr;         // id<MTLTexture> (3D) — 4x downsampled min-max accel
-  void* MinMaxScratchTexture = nullptr;  // id<MTLTexture> — reusable scratch occupancy (R8Unorm 3D)
-  int MinMaxDims[3] = {};               // dimensions of the min-max texture
+  vtkMetalResource ColorOpacityTexture;     // id<MTLTexture> (2D)
+  vtkMetalResource GradientOpacityTexture;  // id<MTLTexture> (256x1 RGBA8Unorm)
+  vtkMetalResource MinMaxTexture;           // id<MTLTexture> (3D) — 4x downsampled min-max accel
+  vtkMetalResource MinMaxScratchTexture;    // id<MTLTexture> — reusable scratch occupancy (R8Unorm 3D)
+  int MinMaxDims[3] = {};                  // dimensions of the min-max texture
   vtkTimeStamp MinMaxUploadTime;
-  void* DepthStencilState = nullptr;     // id<MTLDepthStencilState>
-  void* DepthTextureOcclusion = nullptr; // id<MTLTexture> — scene depth for early ray termination
-  void* DummyDepthTexture = nullptr;     // id<MTLTexture> — 1x1 R32Float(1.0) fallback when no depth available
-  void* DummyVolumeTexture = nullptr;    // id<MTLTexture> — 1x1x1 R32Float fallback for nil volume tex
-  void* DummyMaskTexture = nullptr;      // id<MTLTexture> — 1x1x1 R32Float fallback for nil mask tex
-  void* DummyMinMaxTexture = nullptr;    // id<MTLTexture> — 1x1x1 R8Unorm fallback for nil minmax tex
+  vtkMetalResource DepthStencilState;       // id<MTLDepthStencilState>
+  vtkMetalResource DepthTextureOcclusion;   // id<MTLTexture> — scene depth for early ray termination
+  vtkMetalResource DummyDepthTexture;       // id<MTLTexture> — 1x1 R32Float(1.0) fallback
+  vtkMetalResource DummyVolumeTexture;      // id<MTLTexture> — 1x1x1 R32Float fallback
+  vtkMetalResource DummyMaskTexture;        // id<MTLTexture> — 1x1x1 R32Float fallback
+  vtkMetalResource DummyMinMaxTexture;      // id<MTLTexture> — 1x1x1 R8Unorm fallback
 
   // Mask / label map support
-  void* MaskTexture = nullptr;            // id<MTLTexture> (3D) — binary mask or label map
-  void* LabelMapTransferTexture = nullptr; // id<MTLTexture> (2D) — label map transfer function
-  void* LabelMapGradientOpacityTexture = nullptr; // id<MTLTexture> (2D) — label map gradient opacity
+  vtkMetalResource MaskTexture;             // id<MTLTexture> (3D) — binary mask or label map
+  vtkMetalResource LabelMapTransferTexture;  // id<MTLTexture> (2D) — label map transfer function
+  vtkMetalResource LabelMapGradientOpacityTexture; // id<MTLTexture> (2D) — label map gradient opacity
   vtkTimeStamp MaskUpdateTime;
   int LastLabelMapMaxLabel = -1;
   size_t LastLabelMapLabelCount = 0;
 
   // Buffers
-  void* UniformBuffers[3] = { nullptr, nullptr, nullptr }; // id<MTLBuffer>[3] — triple-buffered
-  int UniformFrameIndex = 0;            // rotation index for triple-buffered uniforms
-  void* FrameSemaphore = nullptr;       // dispatch_semaphore_t — gates in-flight frames
-  void* VertexBuffer = nullptr;         // id<MTLBuffer>
-  void* IndexBuffer = nullptr;          // id<MTLBuffer>
+  vtkMetalResource UniformBuffers[3];       // id<MTLBuffer>[3] — triple-buffered
+  int UniformFrameIndex = 0;                // rotation index for triple-buffered uniforms
+  vtkMetalResource FrameSemaphore;          // dispatch_semaphore_t — gates in-flight frames
+  vtkMetalResource VertexBuffer;            // id<MTLBuffer>
+  vtkMetalResource IndexBuffer;             // id<MTLBuffer>
   int IndexCount = 0;
 
   // Volume state
@@ -191,69 +208,94 @@ private:
   int VolumeNumComponents = 1;
   int CurrentSampleCount = 0;
 
-  bool PreferHalfPrecision = true;  // when true, prefer half-float (16-bit) for volume textures when the scalar range fits within [−65504, 65504]; covers native float and integer types
-  // Enables a precomputed RGBA8Unorm normal texture to replace 6 gradient
-  // fetches per sample with 1 normal texture fetch.  Adds ~4 bytes/voxel of
-  // GPU memory and a one-time compute dispatch.  Provides a net benefit only
-  // when shading is on (the gradient is unused otherwise).  Disabled by default;
-  // set to true when shading is enabled for a ~5x reduction in texture-fetch
-  // bandwidth per shaded sample.
+  bool PreferHalfPrecision = true;
   bool UsePrecomputedNormals = false;
 
-  // Phase 4: Precomputed gradient/normal texture (replaces 6 gradient fetches with 1 normal fetch)
-  void* GradientNormalTexture = nullptr; // id<MTLTexture> — RGBA8Unorm 3D (normal.xyz*0.5+0.5, gradMag)
-  int NormalTextureDims[3] = {};        // dimensions of the normal texture
-  void* NormalComputePipeline = nullptr; // id<MTLComputePipelineState>
+  // Phase 4: Precomputed gradient/normal texture
+  vtkMetalResource GradientNormalTexture;    // id<MTLTexture> — RGBA8Unorm 3D
+  int NormalTextureDims[3] = {};
+  vtkMetalResource NormalComputePipeline;    // id<MTLComputePipelineState>
   bool EnsureGradientNormalTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
   void ReleaseGradientNormalTexture();
 
-  // Phase 6: Enables fullscreen ray-cast path when camera is inside the volume.
-  // Defaults to true (recommended). Set to false to force the old CPU proxy geometry path.
   bool UseFullscreenCameraInside = true;
 
-  // Phase 5: GPU-based min/max acceleration generation.
-  // When true, UpdateMinMaxTexture uses GPU compute kernels instead of CPU
-  // vtkSMPTools to build the R8Unorm occupancy texture.
+  // Volume partitioning — splits large volumes into blocks for 3D texture size limits
+  struct VolumeBlock
+  {
+    vtkMetalResource Texture;        // id<MTLTexture> — 3D sub-texture for this block
+    vtkMetalResource MinMaxTexture;  // id<MTLTexture> — per-block min-max accel (R8Unorm)
+    vtkMetalResource NormalTexture;  // id<MTLTexture> — per-block precomputed normals (RGBA8Unorm)
+    double BoundsMin[3] = {};
+    double BoundsMax[3] = {};
+    int Dims[3] = {};
+    int MinMaxDims[3] = {};
+    int Extents[6] = {};
+    double Center[3] = {};
+
+    VolumeBlock() = default;
+    VolumeBlock(const VolumeBlock& o)
+      : BoundsMin{ o.BoundsMin[0], o.BoundsMin[1], o.BoundsMin[2] }
+      , BoundsMax{ o.BoundsMax[0], o.BoundsMax[1], o.BoundsMax[2] }
+      , Dims{ o.Dims[0], o.Dims[1], o.Dims[2] }
+      , MinMaxDims{ o.MinMaxDims[0], o.MinMaxDims[1], o.MinMaxDims[2] }
+      , Extents{ o.Extents[0], o.Extents[1], o.Extents[2], o.Extents[3], o.Extents[4], o.Extents[5] }
+      , Center{ o.Center[0], o.Center[1], o.Center[2] }
+    {
+      Texture.retain(o.Texture.get());
+      MinMaxTexture.retain(o.MinMaxTexture.get());
+      NormalTexture.retain(o.NormalTexture.get());
+    }
+    VolumeBlock& operator=(const VolumeBlock& o)
+    {
+      if (this != &o)
+      {
+        Texture.retain(o.Texture.get());
+        MinMaxTexture.retain(o.MinMaxTexture.get());
+        NormalTexture.retain(o.NormalTexture.get());
+        std::copy_n(o.BoundsMin, 3, BoundsMin);
+        std::copy_n(o.BoundsMax, 3, BoundsMax);
+        std::copy_n(o.Dims, 3, Dims);
+        std::copy_n(o.MinMaxDims, 3, MinMaxDims);
+        std::copy_n(o.Extents, 6, Extents);
+        std::copy_n(o.Center, 3, Center);
+      }
+      return *this;
+    }
+  };
+
+  // Phase 5: GPU min-max
   bool UseGPUMinMax = true;
-
-  // Compute pipelines for GPU min-max generation.
-  void* MinMaxComputePipeline = nullptr;  // id<MTLComputePipelineState> — volume_compute_minmax
-  void* DilateComputePipeline = nullptr;  // id<MTLComputePipelineState> — volume_dilate_minmax
-
-  // Ensure the two compute pipelines exist.
+  vtkMetalResource MinMaxComputePipeline;    // id<MTLComputePipelineState>
+  vtkMetalResource DilateComputePipeline;    // id<MTLComputePipelineState>
   bool EnsureMinMaxComputePipelines(void* mtlDevice);
-
-  // Run GPU min/max generation after volume texture is uploaded.
-  // Returns true on success, false on failure (caller falls back to CPU).
   bool ComputeMinMaxGPU(void* mtlDevice, void* mtlQueue, vtkVolume* vol,
     vtkImageData* input, vtkDataArray* scalars);
+  // GPU min-max dispatch helper for per-block generation
+  void DispatchBlockMinMaxGPU(void* device, void* mmEnc, void* blockTex, VolumeBlock& block,
+    const int bdims[3], const float normFactor, const double scalarRange,
+    const double opacityTable[256]);
 
-  // Phase 7: GPU compute kernels for data type conversion.
-  // When true, UpdateVolumeTexture uses GPU compute kernels instead of CPU
-  // vtkSMPTools loops to convert short/int/double/etc. to the target pixel format.
+  // Phase 7: GPU data type conversion
   bool UseGPUConversion = true;
-
-  // Compute pipelines for GPU data type conversion.
-  void* ConvertShortToHalfPipeline = nullptr;   // id<MTLComputePipelineState> — volume_convert_short_to_half
-  void* ConvertShortToFloatPipeline = nullptr;  // id<MTLComputePipelineState> — volume_convert_short_to_float
-  void* ConvertIntToHalfPipeline = nullptr;     // id<MTLComputePipelineState> — volume_convert_int_to_half
-  void* ConvertIntToFloatPipeline = nullptr;    // id<MTLComputePipelineState> — volume_convert_int_to_float
-  void* ConvertUIntToHalfPipeline = nullptr;    // id<MTLComputePipelineState> — volume_convert_uint_to_half
-  void* ConvertUIntToFloatPipeline = nullptr;   // id<MTLComputePipelineState> — volume_convert_uint_to_float
-  void* ConvertFloatToHalfPipeline = nullptr;   // id<MTLComputePipelineState> — volume_convert_float_to_half
-  void* ConvertUShortToUCharPipeline = nullptr; // id<MTLComputePipelineState> — volume_convert_ushort_to_uchar
-  // Ensure all conversion compute pipelines exist for the given (dataType, useHalf) pair.
-  // Returns true on success, false on failure (caller falls back to CPU).
+  vtkMetalResource ConvertShortToHalfPipeline;
+  vtkMetalResource ConvertShortToFloatPipeline;
+  vtkMetalResource ConvertIntToHalfPipeline;
+  vtkMetalResource ConvertIntToFloatPipeline;
+  vtkMetalResource ConvertUIntToHalfPipeline;
+  vtkMetalResource ConvertUIntToFloatPipeline;
+  vtkMetalResource ConvertFloatToHalfPipeline;
+  vtkMetalResource ConvertUShortToUCharPipeline;
   bool EnsureConversionPipelines(void* mtlDevice);
 
-  // Phase 1A: Cached shader library (avoid recompiling vtkMetalShaders)
-  void* CachedShaderLibrary = nullptr; // id<MTLLibrary>
+  // Phase 1A: Cached shader library
+  vtkMetalResource CachedShaderLibrary;      // id<MTLLibrary>
   bool EnsureShaderLibrary(void* mtlDevice);
 
-  // Phase 1B: Pipeline state cache (keyed by format, sample count, feature mask)
+  // Phase 1B: Pipeline state cache
   std::unordered_map<VolumePipelineKey, void*, VolumePipelineKeyHash> PipelineCache;
 
-  // Phase 1C: Pipeline pre-warming — set to true after first pre-warm completes
+  // Phase 1C: Pipeline pre-warming
   bool PipelinesPreWarmed = false;
 
   // Adaptive sample distance
@@ -263,13 +305,13 @@ private:
   double LastLabelMapScalarRange[2] = { 0.0, 0.0 };
   void ComputeReductionFactor(double allocatedTime);
 
-  // Image-space downsampling (ImageSampleDistance)
-  void* ImageSampleColorTexture = nullptr;    // id<MTLTexture> — offscreen color at reduced res
-  void* ImageSampleDepthTexture = nullptr;    // id<MTLTexture> — offscreen depth at reduced res
-  void* ImageSamplePipeline = nullptr;        // id<MTLRenderPipelineState> — for blit pass
+  // Image-space downsampling
+  vtkMetalResource ImageSampleColorTexture;  // id<MTLTexture>
+  vtkMetalResource ImageSampleDepthTexture;  // id<MTLTexture>
+  vtkMetalResource ImageSamplePipeline;      // id<MTLRenderPipelineState>
   int ImageSampleFBOWidth = 0;
   int ImageSampleFBOHeight = 0;
-  int ImageSamplePixelFormat = 0;             // cached pixel format to detect changes
+  int ImageSamplePixelFormat = 0;
   bool EnsureImageSampleResources(void* device, int width, int height);
   void ReleaseImageSampleResources();
 
@@ -282,10 +324,10 @@ private:
 
   // Helper methods
   bool UpdateVolumeTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
-  bool UpdateTransferFunctionTexture(
-    void* mtlDevice, void* mtlQueue, vtkVolume* vol);
+  bool UpdateTransferFunctionTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
   bool UpdateGradientOpacityTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
-  bool UpdateMinMaxTexture(void* mtlDevice, vtkVolume* vol, vtkImageData* input, vtkDataArray* scalars, bool skipGlobalTexture = false);
+  bool UpdateMinMaxTexture(void* mtlDevice, vtkVolume* vol, vtkImageData* input,
+    vtkDataArray* scalars, bool skipGlobalTexture = false);
   bool SetupBuffers(void* mtlDevice, vtkRenderer* ren, vtkVolume* vol, vtkImageData* input);
   bool SetupPipeline(void* mtlDevice, vtkRenderer* ren);
   void* GetOrCreateVolumePipeline(void* mtlDevice, uint32_t type,
@@ -302,57 +344,37 @@ private:
   bool IsCameraInside(vtkRenderer* ren, vtkVolume* vol);
   bool CameraWasInsideInLastUpdate = false;
 
-  // Clipping planes — up to 8 arbitrary clipping planes
+  // Clipping planes
   void SetClippingPlaneUniforms(void* uniforms, vtkRenderer* ren, vtkVolume* vol,
     vtkMatrix4x4* modelMatrix, vtkMatrix4x4* invModelMatrix);
 
-  // Bind all volume fragment textures at fixed indices for the fullscreen paths.
-  // volTex/minMaxTex/normalTex are per-block (or global for single-block).
-  // The PerBlockData is bound at index 2 (vertex + fragment).
-  // cullMode: MTL_CullModeBack or MTL_CullModeNone (layer composite uses none).
+  // Fragment texture binding (consolidated helper)
+  void BindFragmentTextures(void* encoder, void* volTex, void* minMaxTex, void* normalTex);
+
+  // Bind all volume fragment textures at fixed indices for fullscreen paths.
   void BindFullscreenTextures(void* encoder, void* uniformBuf,
     void* volTex, void* minMaxTex, void* normalTex,
     bool useDepth, const void* pbd, uint32_t cullMode);
 
-  // Wait for all in-flight GPU frames to complete (safe teardown)
+  // Wait for all in-flight GPU frames to complete
   void WaitForInFlightFrames();
 
-  // Rendering helpers — shared between image-sampling and standard paths
+  // Rendering helpers
   void BindEncoderResources(void* encoder, void* uniformBuf, void* pipelineState = nullptr,
     bool hasDepth = false);
   void DrawBlocks(void* encoder, void* uniformBuf, vtkRenderer* ren, vtkVolume* vol,
     void* uniforms, vtkMatrix4x4* invModelMatrix);
-  // Fullscreen camera-inside draw path.
-  // Renders each non-empty brick using a fullscreen triangle (vertex_fullscreen_main +
-  // fragment_volume_fullscreen_main) instead of proxy geometry. No vertex/index buffers
-  // needed — the fullscreen vertex shader generates positions internally.
   void DrawBlocksFullscreen(void* encoder, void* uniformBuf, vtkRenderer* ren, vtkVolume* vol,
     void* uniforms, vtkMatrix4x4* invModelMatrix, bool useDirectPipeline);
 
-  // Volume partitioning — splits large volumes into blocks for 3D texture size limits
-  struct VolumeBlock
-  {
-    void* Texture = nullptr; // id<MTLTexture> — 3D sub-texture for this block
-    void* MinMaxTexture = nullptr; // id<MTLTexture> — per-block min-max accel (R8Unorm)
-    void* NormalTexture = nullptr; // id<MTLTexture> — per-block precomputed normals (RGBA8Unorm)
-    double BoundsMin[3] = {};
-    double BoundsMax[3] = {};
-    int Dims[3] = {};
-    int MinMaxDims[3] = {}; // dimensions of the per-block min-max texture
-    int Extents[6] = {};
-    double Center[3] = {}; // world-space center for sorting
-  };
-
-  // Build PerBlockData from a partitioned-volume block.
   static void BuildPerBlockData(PerBlockData& pbd,
     const VolumeBlock& block,
     const int fullExt[6], const double origin[3], const double spacing[3]);
-  // Build PerBlockData from global uniforms for single-block volumes.
   static void BuildPerBlockData(PerBlockData& pbd, const VolumeMapperUniforms* uniforms);
 
   unsigned short Partitions[3] = { 1, 1, 1 };
   std::vector<VolumeBlock> Blocks;
-  std::vector<int> SortedBlockOrder; // indices into Blocks, sorted back-to-front
+  std::vector<int> SortedBlockOrder;
 
   void ClearBlocks();
   void SortBlocksBackToFront(vtkRenderer* ren, vtkVolume* vol);
@@ -365,23 +387,15 @@ private:
   std::vector<std::array<double, 2>> BlockScalarRanges;
   bool IsBlockEmpty(double blockMin, double blockMax, vtkPiecewiseFunction* opacityFunc);
 
-  // Per-macrocell scalar min/max — computed alongside the occupancy scan
-  // in UpdateMinMaxTexture, consumed by UpdateBlockTextures to avoid a
-  // redundant full-voxel walk for BlockScalarRanges.
+  // Per-macrocell scalar min/max
   std::vector<float> MacrocellScalarMin;
   std::vector<float> MacrocellScalarMax;
 
-  // --- Order-independent compositing: per-brick layer textures ---
-  // Each brick renders into its own RGBA16Float slice of a 2D texture array;
-  // a final composite pass reads the array, sorts the layers per-pixel by
-  // ray-entry depth and folds front-to-back.
-  // This eliminates the bright ring caused by framebuffer-fetch ordering.
-  // Covered bricks: <= MAX_LAYER_BRICKS (8).  Volumes with more partitions
-  // fall through to AccumulationPipelineState (>8 fallback, order-dependent).
-  void* LayerTextureArray = nullptr;         // id<MTLTexture> — 2D array, RGBA16Float, <= MAX_LAYER_BRICKS slices
-  int LayerTextureCapacity = 0;              // current number of slices in the array
-  void* LayerPipelineState = nullptr;        // vertex_volume_main + fragment_volume_main, RGBA16Float
-  void* CompositePipelineState = nullptr;    // vertex_fullscreen_main + fragment_layer_composite_main
+  // Order-independent compositing
+  vtkMetalResource LayerTextureArray;        // id<MTLTexture> — 2D array
+  int LayerTextureCapacity = 0;
+  vtkMetalResource LayerPipelineState;       // id<MTLRenderPipelineState>
+  vtkMetalResource CompositePipelineState;   // id<MTLRenderPipelineState>
   int LayerFBOWidth = 0;
   int LayerFBOHeight = 0;
   bool EnsureLayerResources(void* device, int w, int h, int neededSlices);

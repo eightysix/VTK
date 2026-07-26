@@ -185,6 +185,62 @@ struct MinMaxComputeUniforms {
 static_assert(sizeof(MinMaxComputeUniforms) == 4*6 + 4 + 4 + 4 + 4 + 257*4,
   "MinMaxComputeUniforms size must match Metal struct");
 
+// ---------------------------------------------------------------------------
+// vtkMetalResource — RAII for Metal Obj-C resources stored as void*.
+// Implementation in .mm where Obj-C runtime is available.
+// ---------------------------------------------------------------------------
+vtkMetalResource::~vtkMetalResource() { this->reset(); }
+
+vtkMetalResource::vtkMetalResource(vtkMetalResource&& o) noexcept
+  : Obj(o.Obj)
+{
+  o.Obj = nullptr;
+}
+
+vtkMetalResource& vtkMetalResource::operator=(vtkMetalResource&& o) noexcept
+{
+  if (this != &o)
+  {
+    this->reset();
+    this->Obj = o.Obj;
+    o.Obj = nullptr;
+  }
+  return *this;
+}
+
+vtkMetalResource& vtkMetalResource::operator=(void* o)
+{
+  this->take(o);
+  return *this;
+}
+
+void vtkMetalResource::reset()
+{
+  if (this->Obj)
+  {
+    [(__bridge id)this->Obj release];
+    this->Obj = nullptr;
+  }
+}
+
+void vtkMetalResource::take(void* o)
+{
+  if (this->Obj != o)
+  {
+    this->reset();
+    this->Obj = o;
+  }
+}
+
+void vtkMetalResource::retain(void* o)
+{
+  if (this->Obj != o)
+  {
+    this->reset();
+    this->Obj = o ? (__bridge_retained void*)(__bridge id)o : nullptr;
+  }
+}
+
 namespace
 {
 inline uint16_t FloatToHalf(float f)
@@ -361,45 +417,92 @@ void ConvertVolumeData(const void* src, int dataType, int numComponents,
   }
 }
 
-// Release a Metal object held as a void* member (MRC helper).
-// Uses -release rather than CFRelease for proper Objective-C semantics.
-inline void ReleaseMetalObject(void*& obj)
+// ---------------------------------------------------------------------------
+// EnsureTexture3D — create or reuse a 3D texture matching the given format/size.
+// Returns the existing texture if sizes and format match, or creates a new one.
+// ---------------------------------------------------------------------------
+static id<MTLTexture> EnsureTexture3D(id<MTLDevice> device, vtkMetalResource& slot,
+  MTLPixelFormat format, NSUInteger w, NSUInteger h, NSUInteger d,
+  MTLTextureUsage usage, MTLStorageMode storage)
 {
-  if (obj)
+  id<MTLTexture> existing = (__bridge id<MTLTexture>)slot.get();
+  if (existing && existing.width == w && existing.height == h &&
+      existing.depth == d && existing.pixelFormat == format &&
+      existing.storageMode == storage)
   {
-    [(__bridge id)obj release];
-    obj = nullptr;
+    return existing;
   }
+
+  MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+                                                                                   width:w
+                                                                                  height:h
+                                                                               mipmapped:NO];
+  desc.textureType = MTLTextureType3D;
+  desc.depth = d;
+  desc.usage = usage;
+  desc.storageMode = storage;
+
+  id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+  slot.take((__bridge void*)tex);
+  return tex;
 }
 
-// Takes ownership of a +1 Metal object into a void* member slot.
-// Releases the previous occupant if any.
-inline void AssignMetalObject(void*& slot, id obj)
+// ---------------------------------------------------------------------------
+// EnsureTexture2D — create or reuse a 2D texture matching the given format/size.
+// ---------------------------------------------------------------------------
+static id<MTLTexture> EnsureTexture2D(id<MTLDevice> device, vtkMetalResource& slot,
+  MTLPixelFormat format, NSUInteger w, NSUInteger h,
+  MTLTextureUsage usage, MTLStorageMode storage, NSUInteger slices = 1)
 {
-  if (slot == (__bridge void*)obj)
+  id<MTLTexture> existing = (__bridge id<MTLTexture>)slot.get();
+  if (existing && existing.width == w && existing.height == h &&
+      existing.pixelFormat == format && existing.storageMode == storage &&
+      existing.textureType == (slices > 1 ? MTLTextureType2DArray : MTLTextureType2D))
   {
-    return;
+    return existing;
   }
-  if (slot)
+
+  MTLTextureDescriptor* desc;
+  if (slices > 1)
   {
-    [(__bridge id)slot release];
+    desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:w height:h mipmapped:NO];
+    desc.textureType = MTLTextureType2DArray;
+    desc.arrayLength = slices;
   }
-  slot = (__bridge void*)obj;
+  else
+  {
+    desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:w height:h mipmapped:NO];
+  }
+  desc.usage = usage;
+  desc.storageMode = storage;
+
+  id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+  slot.take((__bridge void*)tex);
+  return tex;
 }
 
-// Retaining assignment: releases the previous occupant, then retains and
-// stores the new object. Used when the +1 is owned elsewhere (e.g. cache).
-inline void AssignRetainedMetalObject(void*& slot, id obj)
+// ---------------------------------------------------------------------------
+// GetVoxelScalar — read a single voxel value from any VTK data type.
+// ---------------------------------------------------------------------------
+template <typename Functor>
+static void GetVoxelScalar(int dataType, const void* dataPtr, vtkIdType idx, Functor&& func,
+  vtkDataArray* scalars = nullptr)
 {
-  if (slot == (__bridge void*)obj)
+  switch (dataType)
   {
-    return;
+    vtkTemplateMacro(
+      using T = VTK_TT;
+      func(static_cast<float>(static_cast<const T*>(dataPtr)[idx]));
+    );
+    default:
+    {
+      if (scalars)
+      {
+        func(static_cast<float>(scalars->GetComponent(idx, 0)));
+      }
+      break;
+    }
   }
-  if (slot)
-  {
-    [(__bridge id)slot release];
-  }
-  slot = (__bridge void*)[obj retain];
 }
 
 }
@@ -420,13 +523,6 @@ vtkMetalGPUVolumeRayCastMapper::~vtkMetalGPUVolumeRayCastMapper()
 {
   this->WaitForInFlightFrames();
   this->ReleaseGraphicsResources(nullptr);
-#if !__has_feature(objc_arc)
-  if (this->FrameSemaphore)
-  {
-    dispatch_release((dispatch_semaphore_t)this->FrameSemaphore);
-    this->FrameSemaphore = nullptr;
-  }
-#endif
 }
 
 //------------------------------------------------------------------------------
@@ -436,7 +532,7 @@ void vtkMetalGPUVolumeRayCastMapper::WaitForInFlightFrames()
   {
     return;
   }
-  dispatch_semaphore_t sem = (__bridge dispatch_semaphore_t)this->FrameSemaphore;
+  dispatch_semaphore_t sem = (__bridge dispatch_semaphore_t)this->FrameSemaphore.get();
   for (int i = 0; i < 3; ++i)
   {
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
@@ -480,7 +576,7 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureShaderLibrary(void* mtlDeviceVoid)
       return false;
     }
 
-    AssignMetalObject(this->CachedShaderLibrary, library);
+    CachedShaderLibrary.take((__bridge void*)library);
   }
 
   return true;
@@ -587,23 +683,14 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
     id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
 
     // Create offscreen color texture (RGBA16Float for inter-block accumulation)
-    MTLTextureDescriptor* colorDesc = [[MTLTextureDescriptor alloc] init];
-    colorDesc.textureType = MTLTextureType2D;
-    colorDesc.pixelFormat = MTLPixelFormatRGBA16Float;
-    colorDesc.width = width;
-    colorDesc.height = height;
-    colorDesc.mipmapLevelCount = 1;
-    colorDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-    colorDesc.storageMode = MTLStorageModePrivate;
-
-    id<MTLTexture> colorTex = [device newTextureWithDescriptor:colorDesc];
-    [colorDesc release];
+    id<MTLTexture> colorTex = EnsureTexture2D(device, this->ImageSampleColorTexture,
+      MTLPixelFormatRGBA16Float, width, height,
+      MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, MTLStorageModePrivate);
     if (!colorTex)
     {
       vtkErrorMacro("Failed to create image-sample color texture");
       return false;
     }
-    AssignMetalObject(this->ImageSampleColorTexture, colorTex);
 
     // Create blit pipeline (fullscreen quad that samples the offscreen texture)
     if (!this->EnsureShaderLibrary(deviceVoid))
@@ -611,7 +698,7 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
       this->ReleaseImageSampleResources();
       return false;
     }
-    id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
+    id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary.get();
 
     NSError* error = nil;
     id<MTLFunction> vertexFunc = [library newFunctionWithName:@"vertex_fullscreen_main"];
@@ -657,7 +744,7 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
         MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, 0 };
       this->PipelineCache[k] = (__bridge void*)pso;
     }
-    AssignRetainedMetalObject(this->ImageSamplePipeline, pso);
+    ImageSamplePipeline.retain((__bridge void*)pso);
 
     [vertexFunc release];
     [fragmentFunc release];
@@ -673,15 +760,15 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
 //------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::ReleaseImageSampleResources()
 {
-  ReleaseMetalObject(this->ImageSampleColorTexture);
-  ReleaseMetalObject(this->ImageSampleDepthTexture);
-  ReleaseMetalObject(this->ImageSamplePipeline);
+  ImageSampleColorTexture.reset();
+  ImageSampleDepthTexture.reset();
+  ImageSamplePipeline.reset();
   this->ImageSampleFBOWidth = 0;
   this->ImageSampleFBOHeight = 0;
   this->ImageSamplePixelFormat = 0;
 
   // Release order-independent compositing layer texture array
-  ReleaseMetalObject(this->LayerTextureArray);
+  LayerTextureArray.reset();
   this->LayerTextureCapacity = 0;
   this->LayerFBOWidth = 0;
   this->LayerFBOHeight = 0;
@@ -690,8 +777,8 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseImageSampleResources()
 //------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::ReleaseGradientNormalTexture()
 {
-  ReleaseMetalObject(this->GradientNormalTexture);
-  ReleaseMetalObject(this->NormalComputePipeline);
+  GradientNormalTexture.reset();
+  NormalComputePipeline.reset();
   this->NormalTextureDims[0] = 0;
   this->NormalTextureDims[1] = 0;
   this->NormalTextureDims[2] = 0;
@@ -715,11 +802,11 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureGradientNormalTexture(
   id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
   id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)mtlQueueVoid;
 
-  id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;
+  id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture.get();
   int dims[3] = { static_cast<int>(volTex.width), static_cast<int>(volTex.height), static_cast<int>(volTex.depth) };
 
   // Reuse if still valid — data, scalar range, and params haven't changed
-  id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->GradientNormalTexture;
+  id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->GradientNormalTexture.get();
   bool stale = !oldTex ||
     static_cast<int>(oldTex.width) != dims[0] ||
     static_cast<int>(oldTex.height) != dims[1] ||
@@ -738,29 +825,18 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureGradientNormalTexture(
   {
     return false;
   }
-  id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary.get();
 
   @autoreleasepool
   {
-    // Create 3D normal texture (RGBA8Unorm: normal.xyz*0.5+0.5 in RGB, gradMag in A)
-    MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-    desc.textureType = MTLTextureType3D;
-    desc.pixelFormat = MTLPixelFormatRGBA8Unorm;
-    desc.width = dims[0];
-    desc.height = dims[1];
-    desc.depth = dims[2];
-    desc.mipmapLevelCount = 1;
-    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-    desc.storageMode = MTLStorageModePrivate;
-
-    id<MTLTexture> normalTex = [device newTextureWithDescriptor:desc];
-    [desc release];
+    id<MTLTexture> normalTex = EnsureTexture3D(device, this->GradientNormalTexture,
+      MTLPixelFormatRGBA8Unorm, dims[0], dims[1], dims[2],
+      MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, MTLStorageModePrivate);
     if (!normalTex)
     {
       vtkErrorMacro("Failed to create gradient normal texture");
       return false;
     }
-    AssignMetalObject(this->GradientNormalTexture, normalTex);
     this->NormalTextureDims[0] = dims[0];
     this->NormalTextureDims[1] = dims[1];
     this->NormalTextureDims[2] = dims[2];
@@ -787,7 +863,7 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureGradientNormalTexture(
         this->ReleaseGradientNormalTexture();
         return false;
       }
-      AssignMetalObject(this->NormalComputePipeline, cps);
+      NormalComputePipeline.take((__bridge void*)cps);
     }
 
     // Build NormalComputeUniforms
@@ -819,7 +895,7 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureGradientNormalTexture(
     cmdBuf.label = @"VTK Volume Normal Compute";
 
     id<MTLComputeCommandEncoder> compEnc = [cmdBuf computeCommandEncoder];
-    [compEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->NormalComputePipeline];
+    [compEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->NormalComputePipeline.get()];
     [compEnc setTexture:volTex atIndex:0];
     [compEnc setTexture:normalTex atIndex:1];
     [compEnc setBytes:&u length:sizeof(u) atIndex:0];
@@ -849,29 +925,18 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureLayerResources(void* deviceVoid, int 
     return true;
 
   // Release old texture array if size or capacity changed
-  ReleaseMetalObject(this->LayerTextureArray);
+  LayerTextureArray.reset();
   this->LayerTextureCapacity = 0;
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
-  MTLTextureDescriptor* d = [[MTLTextureDescriptor alloc] init];
-  d.textureType = MTLTextureType2DArray;
-  d.pixelFormat = MTLPixelFormatRGBA16Float;
-  d.width = w;
-  d.height = h;
-  d.depth = 1;
-  d.arrayLength = capacity;
-  d.mipmapLevelCount = 1;
-  d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-  d.storageMode = MTLStorageModePrivate;
-
-  id<MTLTexture> texArray = [device newTextureWithDescriptor:d];
-  [d release];
+  id<MTLTexture> texArray = EnsureTexture2D(device, this->LayerTextureArray,
+    MTLPixelFormatRGBA16Float, w, h,
+    MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, MTLStorageModePrivate, capacity);
   if (!texArray)
   {
     vtkErrorMacro("Failed to create layer texture array");
     return false;
   }
-  AssignMetalObject(this->LayerTextureArray, texArray);
   this->LayerTextureCapacity = capacity;
   this->LayerFBOWidth = w;
   this->LayerFBOHeight = h;
@@ -879,63 +944,19 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureLayerResources(void* deviceVoid, int 
 }
 
 //------------------------------------------------------------------------------
-void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotUsed(window))
+void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow*)
 {
   this->ReleaseImageSampleResources();
   this->ClearBlocks();
-
-  ReleaseMetalObject(this->PipelineState);
-  ReleaseMetalObject(this->AccumulationPipelineState);
-  ReleaseMetalObject(this->LayerPipelineState);
-  ReleaseMetalObject(this->CompositePipelineState);
-  ReleaseMetalObject(this->VolumeTexture);
-  ReleaseMetalObject(this->ColorOpacityTexture);
-  ReleaseMetalObject(this->GradientOpacityTexture);
-  ReleaseMetalObject(this->MinMaxTexture);
-  ReleaseMetalObject(this->MinMaxScratchTexture);
   this->ReleaseGradientNormalTexture();
-
   this->ReleaseMaskResources();
 
-  // Phase 5: Release GPU min-max compute pipelines
-  ReleaseMetalObject(this->MinMaxComputePipeline);
-  ReleaseMetalObject(this->DilateComputePipeline);
-
-  // Phase 7: Release GPU data-type conversion compute pipelines
-  ReleaseMetalObject(this->ConvertShortToHalfPipeline);
-  ReleaseMetalObject(this->ConvertShortToFloatPipeline);
-  ReleaseMetalObject(this->ConvertIntToHalfPipeline);
-  ReleaseMetalObject(this->ConvertIntToFloatPipeline);
-  ReleaseMetalObject(this->ConvertUIntToHalfPipeline);
-  ReleaseMetalObject(this->ConvertUIntToFloatPipeline);
-  ReleaseMetalObject(this->ConvertFloatToHalfPipeline);
-  ReleaseMetalObject(this->ConvertUShortToUCharPipeline);
-  ReleaseMetalObject(this->DummyDepthTexture);
-  ReleaseMetalObject(this->DummyVolumeTexture);
-  ReleaseMetalObject(this->DummyMaskTexture);
-  ReleaseMetalObject(this->DummyMinMaxTexture);
-  ReleaseMetalObject(this->DepthStencilState);
-
-  // Phase 1A: Release cached shader library
-  ReleaseMetalObject(this->CachedShaderLibrary);
-
-  // Phase 1C: Reset pipeline pre-warm guard so it re-warms after device loss / resize
-  this->PipelinesPreWarmed = false;
-
-  // Phase 1B: Clear pipeline cache
   for (auto& entry : this->PipelineCache)
   {
     [(__bridge id)entry.second release];
   }
   this->PipelineCache.clear();
-
-  for (int i = 0; i < 3; ++i)
-  {
-    ReleaseMetalObject(this->UniformBuffers[i]);
-  }
-
-  ReleaseMetalObject(this->VertexBuffer);
-  ReleaseMetalObject(this->IndexBuffer);
+  this->PipelinesPreWarmed = false;
 }
 
 //------------------------------------------------------------------------------
@@ -1333,10 +1354,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           }
 
           id<MTLComputePipelineState> pipeline = nullptr;
-               if (dataType == VTK_SHORT)        pipeline = (__bridge id<MTLComputePipelineState>)(useHalf ? this->ConvertShortToHalfPipeline : this->ConvertShortToFloatPipeline);
-          else if (dataType == VTK_INT)          pipeline = (__bridge id<MTLComputePipelineState>)(useHalf ? this->ConvertIntToHalfPipeline : this->ConvertIntToFloatPipeline);
-          else if (dataType == VTK_UNSIGNED_INT) pipeline = (__bridge id<MTLComputePipelineState>)(useHalf ? this->ConvertUIntToHalfPipeline : this->ConvertUIntToFloatPipeline);
-          else if (dataType == VTK_FLOAT && useHalf) pipeline = (__bridge id<MTLComputePipelineState>)this->ConvertFloatToHalfPipeline;
+               if (dataType == VTK_SHORT)        pipeline = (__bridge id<MTLComputePipelineState>)(useHalf ? (id<MTLComputePipelineState>)(void*)this->ConvertShortToHalfPipeline.get() : (id<MTLComputePipelineState>)(void*)this->ConvertShortToFloatPipeline.get());
+          else if (dataType == VTK_INT)          pipeline = (__bridge id<MTLComputePipelineState>)(useHalf ? (id<MTLComputePipelineState>)(void*)this->ConvertIntToHalfPipeline.get() : (id<MTLComputePipelineState>)(void*)this->ConvertIntToFloatPipeline.get());
+          else if (dataType == VTK_UNSIGNED_INT) pipeline = (__bridge id<MTLComputePipelineState>)(useHalf ? (id<MTLComputePipelineState>)(void*)this->ConvertUIntToHalfPipeline.get() : (id<MTLComputePipelineState>)(void*)this->ConvertUIntToFloatPipeline.get());
+          else if (dataType == VTK_FLOAT && useHalf) pipeline = (__bridge id<MTLComputePipelineState>)this->ConvertFloatToHalfPipeline.get();
           if (!pipeline)
           {
             vtkErrorMacro("GPU conversion pipeline not available for data type " << dataType);
@@ -1357,29 +1378,16 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           }
 
           // Ensure texture has ShaderWrite usage for compute kernel output
-          ReleaseMetalObject(this->VolumeTexture);
-
-          MTLTextureDescriptor* texDesc = [[MTLTextureDescriptor alloc] init];
-          texDesc.textureType = MTLTextureType3D;
-          texDesc.pixelFormat = fmtInfo.format;
-          texDesc.width = dims[0];
-          texDesc.height = dims[1];
-          texDesc.depth = dims[2];
-          texDesc.mipmapLevelCount = 1;
-          texDesc.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
-          texDesc.storageMode = MTLStorageModePrivate;
-
-          id<MTLTexture> tex = [device newTextureWithDescriptor:texDesc];
-          [texDesc release];
+          id<MTLTexture> tex = EnsureTexture3D(device, this->VolumeTexture,
+            fmtInfo.format, dims[0], dims[1], dims[2],
+            MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead, MTLStorageModePrivate);
           if (!tex)
           {
             vtkErrorMacro("Failed to create 3D volume texture for GPU conversion");
             [srcBuf release];
             return false;
           }
-          AssignMetalObject(this->VolumeTexture, tex);
 
-          // Dispatch compute kernel
           VolumeConvertUniforms vu;
           vu.dimX = static_cast<uint32_t>(dims[0]);
           vu.dimY = static_cast<uint32_t>(dims[1]);
@@ -1487,39 +1495,13 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           std::memcpy(uploadPointer, scalars->GetVoidPointer(0), totalBytes);
         }
 
-      id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->VolumeTexture;
-      id<MTLTexture> tex = nil;
-
-      if (oldTex &&
-          oldTex.width == static_cast<NSUInteger>(dims[0]) &&
-          oldTex.height == static_cast<NSUInteger>(dims[1]) &&
-          oldTex.depth == static_cast<NSUInteger>(dims[2]) &&
-          oldTex.pixelFormat == fmtInfo.format)
+      id<MTLTexture> tex = EnsureTexture3D(device, this->VolumeTexture,
+        fmtInfo.format, dims[0], dims[1], dims[2],
+        MTLTextureUsageShaderRead, MTLStorageModePrivate);
+      if (!tex)
       {
-        tex = oldTex;
-      }
-      else
-      {
-        ReleaseMetalObject(this->VolumeTexture);
-
-        MTLTextureDescriptor* texDesc = [[MTLTextureDescriptor alloc] init];
-        texDesc.textureType = MTLTextureType3D;
-        texDesc.pixelFormat = fmtInfo.format;
-        texDesc.width = static_cast<NSUInteger>(dims[0]);
-        texDesc.height = static_cast<NSUInteger>(dims[1]);
-        texDesc.depth = static_cast<NSUInteger>(dims[2]);
-        texDesc.mipmapLevelCount = 1;
-        texDesc.usage = MTLTextureUsageShaderRead;
-        texDesc.storageMode = MTLStorageModePrivate;
-
-        tex = [device newTextureWithDescriptor:texDesc];
-        [texDesc release];
-        if (!tex)
-        {
-          vtkErrorMacro("Failed to create 3D volume texture");
-          return false;
-        }
-        AssignMetalObject(this->VolumeTexture, tex);
+        vtkErrorMacro("Failed to create 3D volume texture");
+        return false;
       }
 
       id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
@@ -1651,34 +1633,13 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
         tfData[i * 4 + 3] = static_cast<unsigned char>(opacity * 255.0);
       }
 
-      id<MTLTexture> oldTfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
-      id<MTLTexture> tex = nil;
-
-      if (oldTfTex)
+      id<MTLTexture> tex = EnsureTexture2D(device, this->ColorOpacityTexture,
+        MTLPixelFormatRGBA8Unorm, 256, 1,
+        MTLTextureUsageShaderRead, MTLStorageModeShared);
+      if (!tex)
       {
-        tex = oldTfTex;
-      }
-      else
-      {
-        ReleaseMetalObject(this->ColorOpacityTexture);
-
-        MTLTextureDescriptor* tfDesc = [[MTLTextureDescriptor alloc] init];
-        tfDesc.textureType = MTLTextureType2D;
-        tfDesc.pixelFormat = MTLPixelFormatRGBA8Unorm;
-        tfDesc.width = 256;
-        tfDesc.height = 1;
-        tfDesc.mipmapLevelCount = 1;
-        tfDesc.usage = MTLTextureUsageShaderRead;
-        tfDesc.storageMode = MTLStorageModeShared;
-
-        tex = [device newTextureWithDescriptor:tfDesc];
-        [tfDesc release];
-        if (!tex)
-        {
-          vtkErrorMacro("Failed to create transfer function texture");
-          return false;
-        }
-        AssignMetalObject(this->ColorOpacityTexture, tex);
+        vtkErrorMacro("Failed to create transfer function texture");
+        return false;
       }
 
       MTLRegion region = MTLRegionMake2D(0, 0, 256, 1);
@@ -1745,34 +1706,13 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
         gradData[i * 4 + 3] = 255;
       }
 
-      id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->GradientOpacityTexture;
-      id<MTLTexture> tex = nil;
-
-      if (oldTex)
+      id<MTLTexture> tex = EnsureTexture2D(device, this->GradientOpacityTexture,
+        MTLPixelFormatRGBA8Unorm, 256, 1,
+        MTLTextureUsageShaderRead, MTLStorageModeShared);
+      if (!tex)
       {
-        tex = oldTex;
-      }
-      else
-      {
-        ReleaseMetalObject(this->GradientOpacityTexture);
-
-        MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-        desc.textureType = MTLTextureType2D;
-        desc.pixelFormat = MTLPixelFormatRGBA8Unorm;
-        desc.width = 256;
-        desc.height = 1;
-        desc.mipmapLevelCount = 1;
-        desc.usage = MTLTextureUsageShaderRead;
-        desc.storageMode = MTLStorageModeShared;
-
-        tex = [device newTextureWithDescriptor:desc];
-        [desc release];
-        if (!tex)
-        {
-          vtkErrorMacro("Failed to create gradient opacity texture");
-          return false;
-        }
-        AssignMetalObject(this->GradientOpacityTexture, tex);
+        vtkErrorMacro("Failed to create gradient opacity texture");
+        return false;
       }
 
       MTLRegion region = MTLRegionMake2D(0, 0, 256, 1);
@@ -1911,39 +1851,13 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMaskTexture(
       }
 
       // Create or update the 3D mask texture
-      id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->MaskTexture;
-      id<MTLTexture> tex = nil;
-
-      if (oldTex &&
-          oldTex.width == static_cast<NSUInteger>(dims[0]) &&
-          oldTex.height == static_cast<NSUInteger>(dims[1]) &&
-          oldTex.depth == static_cast<NSUInteger>(dims[2]) &&
-          oldTex.pixelFormat == chosenFormat)
+      id<MTLTexture> tex = EnsureTexture3D(device, this->MaskTexture,
+        chosenFormat, dims[0], dims[1], dims[2],
+        MTLTextureUsageShaderRead, MTLStorageModeShared);
+      if (!tex)
       {
-        tex = oldTex;
-      }
-      else
-      {
-        ReleaseMetalObject(this->MaskTexture);
-
-        MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-        desc.textureType = MTLTextureType3D;
-        desc.pixelFormat = chosenFormat;
-        desc.width = dims[0];
-        desc.height = dims[1];
-        desc.depth = dims[2];
-        desc.mipmapLevelCount = 1;
-        desc.usage = MTLTextureUsageShaderRead;
-        desc.storageMode = MTLStorageModeShared;
-
-        tex = [device newTextureWithDescriptor:desc];
-        [desc release];
-        if (!tex)
-        {
-          vtkErrorMacro("Failed to create mask texture");
-          return false;
-        }
-        AssignMetalObject(this->MaskTexture, tex);
+        vtkErrorMacro("Failed to create mask texture");
+        return false;
       }
 
       // Upload mask data to texture
@@ -2077,40 +1991,13 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateLabelMapTransferTexture(
       }
 
       // Create or update the 2D texture
-      id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->LabelMapTransferTexture;
-      id<MTLTexture> tex = nil;
-
-      // Check if existing texture has the right dimensions (numLabels may have changed)
-      if (oldTex && static_cast<int>(oldTex.width) == tfWidth &&
-          static_cast<int>(oldTex.height) == tfHeight &&
-          oldTex.pixelFormat == MTLPixelFormatRGBA8Unorm)
+      id<MTLTexture> tex = EnsureTexture2D(device, this->LabelMapTransferTexture,
+        MTLPixelFormatRGBA8Unorm, tfWidth, tfHeight,
+        MTLTextureUsageShaderRead, MTLStorageModeShared);
+      if (!tex)
       {
-        tex = oldTex;
-      }
-      else
-      {
-        if (this->LabelMapTransferTexture)
-        {
-          ReleaseMetalObject(this->LabelMapTransferTexture);
-        }
-
-        MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-        desc.textureType = MTLTextureType2D;
-        desc.pixelFormat = MTLPixelFormatRGBA8Unorm;
-        desc.width = tfWidth;
-        desc.height = tfHeight;
-        desc.mipmapLevelCount = 1;
-        desc.usage = MTLTextureUsageShaderRead;
-        desc.storageMode = MTLStorageModeShared;
-
-        tex = [device newTextureWithDescriptor:desc];
-        [desc release];
-        if (!tex)
-        {
-          vtkErrorMacro("Failed to create label map transfer texture");
-          return false;
-        }
-        AssignMetalObject(this->LabelMapTransferTexture, tex);
+        vtkErrorMacro("Failed to create label map transfer texture");
+        return false;
       }
 
       // Upload data to texture
@@ -2197,7 +2084,7 @@ void vtkMetalGPUVolumeRayCastMapper::SetMaskUniforms(void* uniforms, vtkVolume* 
     u->LabelMapNumLabels = static_cast<float>(numLabels);
     // Determine scale to convert sampled mask value back to label index.
     // Unorm formats normalize to [0,1] at sample time, so we scale back.
-    id<MTLTexture> maskTex = (__bridge id<MTLTexture>)this->MaskTexture;
+    id<MTLTexture> maskTex = (__bridge id<MTLTexture>)this->MaskTexture.get();
     if (maskTex)
     {
       switch (maskTex.pixelFormat)
@@ -2232,9 +2119,9 @@ void vtkMetalGPUVolumeRayCastMapper::SetMaskUniforms(void* uniforms, vtkVolume* 
 //------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::ReleaseMaskResources()
 {
-  ReleaseMetalObject(this->MaskTexture);
-  ReleaseMetalObject(this->LabelMapTransferTexture);
-  ReleaseMetalObject(this->LabelMapGradientOpacityTexture);
+  MaskTexture.reset();
+  LabelMapTransferTexture.reset();
+  LabelMapGradientOpacityTexture.reset();
 }
 
 //------------------------------------------------------------------------------
@@ -2242,9 +2129,9 @@ void vtkMetalGPUVolumeRayCastMapper::ClearBlocks()
 {
   for (auto& block : this->Blocks)
   {
-    ReleaseMetalObject(block.Texture);
-    ReleaseMetalObject(block.MinMaxTexture);
-    ReleaseMetalObject(block.NormalTexture);
+    block.Texture.reset();
+    block.MinMaxTexture.reset();
+    block.NormalTexture.reset();
   }
   this->Blocks.clear();
   this->BlockScalarRanges.clear();
@@ -2305,7 +2192,7 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureMinMaxComputePipelines(void* mtlDevic
   }
 
   id<MTLDevice> dev = (__bridge id<MTLDevice>)mtlDeviceVoid;
-  id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary.get();
 
   @autoreleasepool
   {
@@ -2327,7 +2214,7 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureMinMaxComputePipelines(void* mtlDevic
                       << [[error localizedDescription] UTF8String]);
         return false;
       }
-      AssignMetalObject(this->MinMaxComputePipeline, pso);
+      MinMaxComputePipeline.take((__bridge void*)pso);
     }
 
     if (!this->DilateComputePipeline)
@@ -2348,7 +2235,7 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureMinMaxComputePipelines(void* mtlDevic
                       << [[error localizedDescription] UTF8String]);
         return false;
       }
-      AssignMetalObject(this->DilateComputePipeline, pso);
+      DilateComputePipeline.take((__bridge void*)pso);
     }
   }
 
@@ -2367,7 +2254,7 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureConversionPipelines(void* mtlDeviceVo
   }
 
   id<MTLDevice> dev = (__bridge id<MTLDevice>)mtlDeviceVoid;
-  id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary.get();
 
   @autoreleasepool
   {
@@ -2387,7 +2274,7 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureConversionPipelines(void* mtlDeviceVo
                       << [[error localizedDescription] UTF8String]); \
         return false; \
       } \
-      AssignMetalObject(member, pso); \
+      member.take((__bridge void*)pso); \
     }
 
     VTK_CREATE_CONVERT_PIPELINE("volume_convert_short_to_half", this->ConvertShortToHalfPipeline);
@@ -2432,7 +2319,7 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     }
   }
 
-  id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;
+  id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture.get();
   int dims[3] = { static_cast<int>(volTex.width),
                   static_cast<int>(volTex.height),
                   static_cast<int>(volTex.depth) };
@@ -2454,34 +2341,10 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
 
   @autoreleasepool
   {
-    // --- Reuse or create temporary occupancy texture ---
-    id<MTLTexture> rawOcc = (__bridge id<MTLTexture>)this->MinMaxScratchTexture;
-    if (!rawOcc ||
-        rawOcc.width != static_cast<NSUInteger>(mmDims[0]) ||
-        rawOcc.height != static_cast<NSUInteger>(mmDims[1]) ||
-        rawOcc.depth != static_cast<NSUInteger>(mmDims[2]) ||
-        rawOcc.storageMode != MTLStorageModePrivate ||
-        rawOcc.pixelFormat != MTLPixelFormatR8Unorm)
-    {
-      MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-      desc.textureType = MTLTextureType3D;
-      desc.pixelFormat = MTLPixelFormatR8Unorm;
-      desc.width = mmDims[0];
-      desc.height = mmDims[1];
-      desc.depth = mmDims[2];
-      desc.mipmapLevelCount = 1;
-      desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-      desc.storageMode = MTLStorageModePrivate;
-
-      rawOcc = [device newTextureWithDescriptor:desc];
-      [desc release];
-
-      if (!rawOcc)
-      {
-        return false;
-      }
-      AssignMetalObject(this->MinMaxScratchTexture, rawOcc);
-    }
+    id<MTLTexture> rawOcc = EnsureTexture3D(device, this->MinMaxScratchTexture,
+      MTLPixelFormatR8Unorm, mmDims[0], mmDims[1], mmDims[2],
+      MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, MTLStorageModePrivate);
+    if (!rawOcc) return false;
 
     // --- Build opacity prefix table from transfer function ---
     vtkVolumeProperty* property = vol ? vol->GetProperty() : nullptr;
@@ -2531,7 +2394,7 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     // --- Dispatch kernel 1: macrocell occupancy ---
     id<MTLComputeCommandEncoder> enc1 = [cmdBuf computeCommandEncoder];
     enc1.label = @"Volume Compute MinMax";
-    [enc1 setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->MinMaxComputePipeline];
+    [enc1 setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->MinMaxComputePipeline.get()];
     [enc1 setTexture:volTex atIndex:0];
     [enc1 setTexture:rawOcc atIndex:1];
     [enc1 setBytes:&u length:sizeof(u) atIndex:0];
@@ -2542,39 +2405,19 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     [enc1 dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
     [enc1 endEncoding];
 
-    // --- Reuse or create persistent MinMax texture (dilation writes here directly) ---
-    id<MTLTexture> permTex = (__bridge id<MTLTexture>)this->MinMaxTexture;
-    if (!permTex ||
-        permTex.width != static_cast<NSUInteger>(mmDims[0]) ||
-        permTex.height != static_cast<NSUInteger>(mmDims[1]) ||
-        permTex.depth != static_cast<NSUInteger>(mmDims[2]) ||
-        permTex.storageMode != MTLStorageModePrivate ||
-        permTex.pixelFormat != MTLPixelFormatR8Unorm)
+    id<MTLTexture> permTex = EnsureTexture3D(device, this->MinMaxTexture,
+      MTLPixelFormatR8Unorm, mmDims[0], mmDims[1], mmDims[2],
+      MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, MTLStorageModePrivate);
+    if (!permTex)
     {
-      MTLTextureDescriptor* permDesc = [[MTLTextureDescriptor alloc] init];
-      permDesc.textureType = MTLTextureType3D;
-      permDesc.pixelFormat = MTLPixelFormatR8Unorm;
-      permDesc.width = mmDims[0];
-      permDesc.height = mmDims[1];
-      permDesc.depth = mmDims[2];
-      permDesc.mipmapLevelCount = 1;
-      permDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-      permDesc.storageMode = MTLStorageModePrivate;
-
-      permTex = [device newTextureWithDescriptor:permDesc];
-      [permDesc release];
-      if (!permTex)
-      {
-        vtkErrorMacro("Failed to create persistent min-max texture");
-        return false;
-      }
-      AssignMetalObject(this->MinMaxTexture, permTex);
+      vtkErrorMacro("Failed to create persistent min-max texture");
+      return false;
     }
 
     // --- Dispatch kernel 2: dilation (writes directly to permTex) ---
     id<MTLComputeCommandEncoder> enc2 = [cmdBuf computeCommandEncoder];
     enc2.label = @"Volume Dilate MinMax";
-    [enc2 setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->DilateComputePipeline];
+    [enc2 setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->DilateComputePipeline.get()];
     [enc2 setTexture:rawOcc atIndex:0];
     [enc2 setTexture:permTex atIndex:1];
     [enc2 dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
@@ -2626,14 +2469,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
   {
     if (skipGlobalTexture)
     {
-      return this->MacrocellScalarMin.empty() == false;
+      return !this->MacrocellScalarMin.empty();
     }
-  if (skipGlobalTexture)
-  {
-    return !this->MacrocellScalarMin.empty();
+    return this->MinMaxTexture != nullptr;
   }
-  return this->MinMaxTexture != nullptr;
-}
 
   @autoreleasepool
   {
@@ -2722,39 +2561,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
             for (int x = xStart; x < xEnd; ++x)
             {
               float v = 0.0f;
-              switch (dataType)
-              {
-                case VTK_FLOAT:
-                  v = static_cast<float>(
-                    static_cast<const float*>(dataPtr)[z * inc2 + y * inc1 + x * inc0]);
-                  break;
-                case VTK_UNSIGNED_CHAR:
-                  v = static_cast<float>(
-                    static_cast<const unsigned char*>(dataPtr)[z * inc2 + y * inc1 + x * inc0]);
-                  break;
-                case VTK_UNSIGNED_SHORT:
-                  v = static_cast<float>(
-                    static_cast<const unsigned short*>(dataPtr)[z * inc2 + y * inc1 + x * inc0]);
-                  break;
-                case VTK_SHORT:
-                  v = static_cast<float>(
-                    static_cast<const short*>(dataPtr)[z * inc2 + y * inc1 + x * inc0]);
-                  break;
-                case VTK_INT:
-                  v = static_cast<float>(
-                    static_cast<const int*>(dataPtr)[z * inc2 + y * inc1 + x * inc0]);
-                  break;
-                case VTK_UNSIGNED_INT:
-                  v = static_cast<float>(
-                    static_cast<const unsigned int*>(dataPtr)[z * inc2 + y * inc1 + x * inc0]);
-                  break;
-                default:
-                {
-                  vtkIdType tupleIdx = z * (inc2 / inc0) + y * (inc1 / inc0) + x;
-                  v = static_cast<float>(scalars->GetComponent(tupleIdx, 0));
-                  break;
-                }
-              }
+              GetVoxelScalar(dataType, dataPtr, z * inc2 + y * inc1 + x * inc0, [&](float val) { v = val; }, scalars);
               if (v < cellMin) cellMin = v;
               if (v > cellMax) cellMax = v;
             }
@@ -2829,41 +2636,13 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
       });
 
       // 3. Create or reuse the 3D occupancy texture (R8Unorm).
-      // For partitioned volumes, skip this — blocks build their own min-max textures.
-      id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->MinMaxTexture;
-      id<MTLTexture> tex = nil;
-
-      if (oldTex &&
-          oldTex.width == mmDims0 &&
-          oldTex.height == mmDims1 &&
-          oldTex.depth == mmDims2 &&
-          oldTex.storageMode == MTLStorageModeShared &&
-          oldTex.pixelFormat == MTLPixelFormatR8Unorm)
+      id<MTLTexture> tex = EnsureTexture3D(device, this->MinMaxTexture,
+        MTLPixelFormatR8Unorm, mmDims0, mmDims1, mmDims2,
+        MTLTextureUsageShaderRead, MTLStorageModeShared);
+      if (!tex)
       {
-        tex = oldTex;
-      }
-      else
-      {
-        ReleaseMetalObject(this->MinMaxTexture);
-
-        MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-        desc.textureType = MTLTextureType3D;
-        desc.pixelFormat = MTLPixelFormatR8Unorm;
-        desc.width = mmDims0;
-        desc.height = mmDims1;
-        desc.depth = mmDims2;
-        desc.mipmapLevelCount = 1;
-        desc.usage = MTLTextureUsageShaderRead;
-        desc.storageMode = MTLStorageModeShared;
-
-        tex = [device newTextureWithDescriptor:desc];
-        [desc release];
-        if (!tex)
-        {
-          vtkErrorMacro("Failed to create min-max acceleration texture");
-          return false;
-        }
-        AssignMetalObject(this->MinMaxTexture, tex);
+        vtkErrorMacro("Failed to create min-max acceleration texture");
+        return false;
       }
 
       // Upload data
@@ -3187,10 +2966,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       if (kernelName && this->EnsureConversionPipelines(mtlDeviceVoid))
       {
         id<MTLComputePipelineState> pipeline = nullptr;
-             if (dataType == VTK_SHORT)        pipeline = (__bridge id<MTLComputePipelineState>)(blockUseHalf ? this->ConvertShortToHalfPipeline : this->ConvertShortToFloatPipeline);
-        else if (dataType == VTK_INT)          pipeline = (__bridge id<MTLComputePipelineState>)(blockUseHalf ? this->ConvertIntToHalfPipeline : this->ConvertIntToFloatPipeline);
-        else if (dataType == VTK_UNSIGNED_INT) pipeline = (__bridge id<MTLComputePipelineState>)(blockUseHalf ? this->ConvertUIntToHalfPipeline : this->ConvertUIntToFloatPipeline);
-        else if (dataType == VTK_FLOAT && blockUseHalf) pipeline = (__bridge id<MTLComputePipelineState>)this->ConvertFloatToHalfPipeline;
+             if (dataType == VTK_SHORT)        pipeline = (__bridge id<MTLComputePipelineState>)(blockUseHalf ? (id<MTLComputePipelineState>)(void*)this->ConvertShortToHalfPipeline.get() : (id<MTLComputePipelineState>)(void*)this->ConvertShortToFloatPipeline.get());
+        else if (dataType == VTK_INT)          pipeline = (__bridge id<MTLComputePipelineState>)(blockUseHalf ? (id<MTLComputePipelineState>)(void*)this->ConvertIntToHalfPipeline.get() : (id<MTLComputePipelineState>)(void*)this->ConvertIntToFloatPipeline.get());
+        else if (dataType == VTK_UNSIGNED_INT) pipeline = (__bridge id<MTLComputePipelineState>)(blockUseHalf ? (id<MTLComputePipelineState>)(void*)this->ConvertUIntToHalfPipeline.get() : (id<MTLComputePipelineState>)(void*)this->ConvertUIntToFloatPipeline.get());
+        else if (dataType == VTK_FLOAT && blockUseHalf) pipeline = (__bridge id<MTLComputePipelineState>)this->ConvertFloatToHalfPipeline.get();
 
         if (pipeline)
         {
@@ -3203,46 +2982,34 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
                                                     options:MTLResourceStorageModeShared];
           if (srcBuf)
           {
-            MTLTextureDescriptor* texDesc = [[MTLTextureDescriptor alloc] init];
-            texDesc.textureType = MTLTextureType3D;
-            texDesc.pixelFormat = pixelFormat;
-            texDesc.width = static_cast<NSUInteger>(fullDims[0]);
-            texDesc.height = static_cast<NSUInteger>(fullDims[1]);
-            texDesc.depth = static_cast<NSUInteger>(fullDims[2]);
-            texDesc.mipmapLevelCount = 1;
-            texDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-            texDesc.storageMode = MTLStorageModePrivate;
+            id<MTLTexture> gpuFullTex = EnsureTexture3D(device, this->DummyVolumeTexture,
+              pixelFormat, fullDims[0], fullDims[1], fullDims[2],
+              MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, MTLStorageModePrivate);
+            if (!gpuFullTex) { return false; }
+            id<MTLComputeCommandEncoder> enc = [uploadCmdBuf computeCommandEncoder];
+            enc.label = @"VTK Block Volume Convert";
+            [enc setComputePipelineState:pipeline];
+            [enc setBuffer:srcBuf offset:0 atIndex:0];
+            [enc setTexture:gpuFullTex atIndex:0];
 
-            gpuFullTex = [device newTextureWithDescriptor:texDesc];
-            [texDesc release];
+            VolumeConvertUniforms vu;
+            vu.dimX = static_cast<uint32_t>(fullDims[0]);
+            vu.dimY = static_cast<uint32_t>(fullDims[1]);
+            vu.dimZ = static_cast<uint32_t>(fullDims[2]);
+            vu.numComponents = static_cast<uint32_t>(numComponents);
+            vu.outputComponents = static_cast<uint32_t>(outputComponents);
+            [enc setBytes:&vu length:sizeof(vu) atIndex:1];
 
-            if (gpuFullTex)
-            {
-              id<MTLComputeCommandEncoder> enc = [uploadCmdBuf computeCommandEncoder];
-              enc.label = @"VTK Block Volume Convert";
-              [enc setComputePipelineState:pipeline];
-              [enc setBuffer:srcBuf offset:0 atIndex:0];
-              [enc setTexture:gpuFullTex atIndex:0];
+            MTLSize tgSize = MTLSizeMake(8, 8, 8);
+            MTLSize tgCount = MTLSizeMake(
+              (static_cast<NSUInteger>(fullDims[0]) + 7) / 8,
+              (static_cast<NSUInteger>(fullDims[1]) + 7) / 8,
+              (static_cast<NSUInteger>(fullDims[2]) + 7) / 8);
+            [enc dispatchThreadgroups:tgCount threadsPerThreadgroup:tgSize];
+            [enc endEncoding];
+            [srcBuf release];
 
-              VolumeConvertUniforms vu;
-              vu.dimX = static_cast<uint32_t>(fullDims[0]);
-              vu.dimY = static_cast<uint32_t>(fullDims[1]);
-              vu.dimZ = static_cast<uint32_t>(fullDims[2]);
-              vu.numComponents = static_cast<uint32_t>(numComponents);
-              vu.outputComponents = static_cast<uint32_t>(outputComponents);
-              [enc setBytes:&vu length:sizeof(vu) atIndex:1];
-
-              MTLSize tgSize = MTLSizeMake(8, 8, 8);
-              MTLSize tgCount = MTLSizeMake(
-                (static_cast<NSUInteger>(fullDims[0]) + 7) / 8,
-                (static_cast<NSUInteger>(fullDims[1]) + 7) / 8,
-                (static_cast<NSUInteger>(fullDims[2]) + 7) / 8);
-              [enc dispatchThreadgroups:tgCount threadsPerThreadgroup:tgSize];
-              [enc endEncoding];
-              [srcBuf release];
-
-              gpuConversionUsed = true;
-            }
+            gpuConversionUsed = true;
           }
         }
       }
@@ -3554,25 +3321,15 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       }
 
       // Create the 3D texture for this block
-      MTLTextureDescriptor* texDesc = [[MTLTextureDescriptor alloc] init];
-      texDesc.textureType = MTLTextureType3D;
-      texDesc.pixelFormat = pixelFormat;
-      texDesc.width = bDims[0];
-      texDesc.height = bDims[1];
-      texDesc.depth = bDims[2];
-      texDesc.mipmapLevelCount = 1;
-      texDesc.usage = MTLTextureUsageShaderRead;
-      texDesc.storageMode = MTLStorageModePrivate;
-
-      id<MTLTexture> tex = [device newTextureWithDescriptor:texDesc];
-      [texDesc release];
+      id<MTLTexture> tex = EnsureTexture3D(device, block.Texture,
+        pixelFormat, bDims[0], bDims[1], bDims[2],
+        MTLTextureUsageShaderRead, MTLStorageModePrivate);
       if (!tex)
       {
         vtkErrorMacro(<< "Failed to create block " << idx << " 3D texture ("
                       << bDims[0] << "x" << bDims[1] << "x" << bDims[2] << ")");
         return false;
       }
-      AssignMetalObject(block.Texture, tex);
 
       // --- Per-block min-max texture generation ---
       // When UseGPUMinMax is true, skip CPU generation and let the GPU compute
@@ -3796,18 +3553,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
         });
 
         // 3. Create and upload the Metal 3D texture
-        MTLTextureDescriptor* mmDesc = [[MTLTextureDescriptor alloc] init];
-        mmDesc.textureType = MTLTextureType3D;
-        mmDesc.pixelFormat = MTLPixelFormatR8Unorm;
-        mmDesc.width = mmDims0;
-        mmDesc.height = mmDims1;
-        mmDesc.depth = mmDims2;
-        mmDesc.mipmapLevelCount = 1;
-        mmDesc.usage = MTLTextureUsageShaderRead;
-        mmDesc.storageMode = MTLStorageModeShared;
-
-        id<MTLTexture> mmTex = [device newTextureWithDescriptor:mmDesc];
-        [mmDesc release];
+        id<MTLTexture> mmTex = EnsureTexture3D(device, block.MinMaxTexture,
+          MTLPixelFormatR8Unorm, mmDims0, mmDims1, mmDims2,
+          MTLTextureUsageShaderRead, MTLStorageModeShared);
         if (mmTex)
         {
           MTLRegion region = MTLRegionMake3D(0, 0, 0, mmDims0, mmDims1, mmDims2);
@@ -3819,8 +3567,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
                     withBytes:minMaxData.data()
                   bytesPerRow:mmBytesPerRow
                 bytesPerImage:mmBytesPerImage];
-
-          AssignMetalObject(block.MinMaxTexture, mmTex);
         }
         else
         {
@@ -3905,73 +3651,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       {
         if (!block.Texture) continue;
 
-        id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture;
+        id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture.get();
         int bdims[3] = { block.Dims[0], block.Dims[1], block.Dims[2] };
-        int mmDims[3] = { block.MinMaxDims[0], block.MinMaxDims[1], block.MinMaxDims[2] };
 
-        // Create scratch R8Unorm texture for raw occupancy (temporary)
-        MTLTextureDescriptor* scratchDesc = [[MTLTextureDescriptor alloc] init];
-        scratchDesc.textureType = MTLTextureType3D;
-        scratchDesc.pixelFormat = MTLPixelFormatR8Unorm;
-        scratchDesc.width = static_cast<NSUInteger>(mmDims[0]);
-        scratchDesc.height = static_cast<NSUInteger>(mmDims[1]);
-        scratchDesc.depth = static_cast<NSUInteger>(mmDims[2]);
-        scratchDesc.mipmapLevelCount = 1;
-        scratchDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-        scratchDesc.storageMode = MTLStorageModePrivate;
-
-        id<MTLTexture> scratchTex = [device newTextureWithDescriptor:scratchDesc];
-        [scratchDesc release];
-        if (!scratchTex) continue;
-
-        // Create persistent per-block MinMax texture (dilated result)
-        MTLTextureDescriptor* mmDesc = [[MTLTextureDescriptor alloc] init];
-        mmDesc.textureType = MTLTextureType3D;
-        mmDesc.pixelFormat = MTLPixelFormatR8Unorm;
-        mmDesc.width = static_cast<NSUInteger>(mmDims[0]);
-        mmDesc.height = static_cast<NSUInteger>(mmDims[1]);
-        mmDesc.depth = static_cast<NSUInteger>(mmDims[2]);
-        mmDesc.mipmapLevelCount = 1;
-        mmDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-        mmDesc.storageMode = MTLStorageModePrivate;
-
-        id<MTLTexture> mmTex = [device newTextureWithDescriptor:mmDesc];
-        [mmDesc release];
-        if (!mmTex) { [scratchTex release]; continue; }
-        AssignMetalObject(block.MinMaxTexture, mmTex);
-
-        // Setup uniforms for this block
-        mmu.mmDimX = static_cast<uint32_t>(mmDims[0]);
-        mmu.mmDimY = static_cast<uint32_t>(mmDims[1]);
-        mmu.mmDimZ = static_cast<uint32_t>(mmDims[2]);
-        mmu.volDimX = static_cast<uint32_t>(bdims[0]);
-        mmu.volDimY = static_cast<uint32_t>(bdims[1]);
-        mmu.volDimZ = static_cast<uint32_t>(bdims[2]);
-
-        // Dispatch volume_compute_minmax: blockTex -> scratchTex
-        [mmEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->MinMaxComputePipeline];
-        [mmEnc setTexture:blockTex atIndex:0];
-        [mmEnc setTexture:scratchTex atIndex:1];
-        [mmEnc setBytes:&mmu length:sizeof(mmu) atIndex:0];
-
-        MTLSize gridSize = MTLSizeMake(
-          static_cast<NSUInteger>(mmDims[0]),
-          static_cast<NSUInteger>(mmDims[1]),
-          static_cast<NSUInteger>(mmDims[2]));
-        NSUInteger tgw = 8;
-        MTLSize tgSize = MTLSizeMake(
-          std::min(tgw, static_cast<NSUInteger>(mmDims[0])),
-          std::min(tgw, static_cast<NSUInteger>(mmDims[1])),
-          std::min(tgw, static_cast<NSUInteger>(mmDims[2])));
-        [mmEnc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
-
-        // Dispatch volume_dilate_minmax: scratchTex -> mmTex
-        [mmEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->DilateComputePipeline];
-        [mmEnc setTexture:scratchTex atIndex:0];
-        [mmEnc setTexture:mmTex atIndex:1];
-        [mmEnc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
-
-        [scratchTex release];
+        this->DispatchBlockMinMaxGPU(mtlDeviceVoid, (__bridge void*)mmEnc, (__bridge void*)blockTex,
+          block, bdims, normFactor, scalarRange, opacityTable);
       }
 
       [mmEnc endEncoding];
@@ -3984,7 +3668,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       {
         return false;
       }
-      id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
+      id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary.get();
 
       if (!this->NormalComputePipeline)
       {
@@ -3997,7 +3681,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
           [kernelFunc release];
           if (cps)
           {
-            AssignMetalObject(this->NormalComputePipeline, cps);
+            NormalComputePipeline.take((__bridge void*)cps);
           }
         }
       }
@@ -4024,26 +3708,16 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
         {
           if (!block.Texture) continue;
 
-          id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture;
+          id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture.get();
           int bdims[3] = { static_cast<int>(blockTex.width),
                            static_cast<int>(blockTex.height),
                            static_cast<int>(blockTex.depth) };
 
           // Create per-block normal texture
-          MTLTextureDescriptor* nd = [[MTLTextureDescriptor alloc] init];
-          nd.textureType = MTLTextureType3D;
-          nd.pixelFormat = MTLPixelFormatRGBA8Unorm;
-          nd.width = bdims[0];
-          nd.height = bdims[1];
-          nd.depth = bdims[2];
-          nd.mipmapLevelCount = 1;
-          nd.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-          nd.storageMode = MTLStorageModePrivate;
-
-          id<MTLTexture> blockNrm = [device newTextureWithDescriptor:nd];
-          [nd release];
+          id<MTLTexture> blockNrm = EnsureTexture3D(device, block.NormalTexture,
+            MTLPixelFormatRGBA8Unorm, bdims[0], bdims[1], bdims[2],
+            MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, MTLStorageModePrivate);
           if (!blockNrm) continue;
-          AssignMetalObject(block.NormalTexture, blockNrm);
 
           NormalComputeUniforms u;
           u.dimX = static_cast<uint32_t>(bdims[0]);
@@ -4056,7 +3730,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
           u.scalarBias = -(static_cast<float>(this->ScalarRange[0] / normFactorLocal)) * u.scalarScale;
           u.gradNormFactor = localGradNormFactor;
 
-          [compEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->NormalComputePipeline];
+          [compEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->NormalComputePipeline.get()];
           [compEnc setTexture:blockTex atIndex:0];
           [compEnc setTexture:blockNrm atIndex:1];
           [compEnc setBytes:&u length:sizeof(u) atIndex:0];
@@ -4121,12 +3795,12 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockMinMaxTextures(
       {
         if (block.Texture)
         {
-          ReleaseMetalObject(block.Texture);
+          block.Texture.reset();
           block.Texture = nullptr;
         }
-        ReleaseMetalObject(block.MinMaxTexture);
+        block.MinMaxTexture.reset();
         block.MinMaxTexture = nullptr;
-        ReleaseMetalObject(block.NormalTexture);
+        block.NormalTexture.reset();
         block.NormalTexture = nullptr;
       }
       else if (!block.Texture)
@@ -4151,6 +3825,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockMinMaxTextures(
     id<MTLCommandBuffer> mmCmdBuf = nil;
     MinMaxComputeUniforms mmu = {};
     bool gpuMinMaxReady = false;
+    float normFactor = this->ScalarNormalizationFactor;
 
     if (this->UseGPUMinMax && hasOpacityFunc &&
         this->EnsureMinMaxComputePipelines(mtlDeviceVoid))
@@ -4160,7 +3835,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockMinMaxTextures(
       mmEnc = [mmCmdBuf computeCommandEncoder];
       mmEnc.label = @"VTK Block MinMax Compute (opacity update)";
 
-      const float normFactor = this->ScalarNormalizationFactor;
       mmu.ds = 4.0f;
       mmu.scalarMin = static_cast<float>(this->ScalarRange[0] / normFactor);
       mmu.scalarScale = static_cast<float>(255.0 * normFactor / (scalarRange > 0.0 ? scalarRange : 1.0));
@@ -4199,7 +3873,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockMinMaxTextures(
       if (this->UseGPUMinMax)
       {
         // GPU path: release old minmax texture; compute kernel will create new one
-        ReleaseMetalObject(block.MinMaxTexture);
+        block.MinMaxTexture.reset();
         block.MinMaxTexture = nullptr;
         continue; // dispatched below in the compute encoder
       }
@@ -4399,20 +4073,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockMinMaxTextures(
       });
 
       // Step 2c: Create and upload R8Unorm texture
-      ReleaseMetalObject(block.MinMaxTexture);
-
-      MTLTextureDescriptor* mmDesc = [[MTLTextureDescriptor alloc] init];
-      mmDesc.textureType = MTLTextureType3D;
-      mmDesc.pixelFormat = MTLPixelFormatR8Unorm;
-      mmDesc.width = static_cast<NSUInteger>(mmDims[0]);
-      mmDesc.height = static_cast<NSUInteger>(mmDims[1]);
-      mmDesc.depth = static_cast<NSUInteger>(mmDims[2]);
-      mmDesc.mipmapLevelCount = 1;
-      mmDesc.usage = MTLTextureUsageShaderRead;
-      mmDesc.storageMode = MTLStorageModeShared;
-
-      id<MTLTexture> mmTex = [device newTextureWithDescriptor:mmDesc];
-      [mmDesc release];
+      id<MTLTexture> mmTex = EnsureTexture3D(device, block.MinMaxTexture,
+        MTLPixelFormatR8Unorm, mmDims[0], mmDims[1], mmDims[2],
+        MTLTextureUsageShaderRead, MTLStorageModeShared);
       if (mmTex)
       {
         MTLRegion region = MTLRegionMake3D(0, 0, 0,
@@ -4427,8 +4090,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockMinMaxTextures(
                   withBytes:minMaxData.data()
                 bytesPerRow:mmBytesPerRow
               bytesPerImage:mmBytesPerImage];
-
-        AssignMetalObject(block.MinMaxTexture, mmTex);
       }
     }
 
@@ -4439,72 +4100,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockMinMaxTextures(
       {
         if (!block.Texture) continue;
 
-        id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture;
+        id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture.get();
         int bdims[3] = { block.Dims[0], block.Dims[1], block.Dims[2] };
-        int mmDimsL[3] = { block.MinMaxDims[0], block.MinMaxDims[1], block.MinMaxDims[2] };
-
-        // Scratch R8Unorm texture (temporary, released after command)
-        MTLTextureDescriptor* scratchDesc = [[MTLTextureDescriptor alloc] init];
-        scratchDesc.textureType = MTLTextureType3D;
-        scratchDesc.pixelFormat = MTLPixelFormatR8Unorm;
-        scratchDesc.width = static_cast<NSUInteger>(mmDimsL[0]);
-        scratchDesc.height = static_cast<NSUInteger>(mmDimsL[1]);
-        scratchDesc.depth = static_cast<NSUInteger>(mmDimsL[2]);
-        scratchDesc.mipmapLevelCount = 1;
-        scratchDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-        scratchDesc.storageMode = MTLStorageModePrivate;
-
-        id<MTLTexture> scratchTex = [device newTextureWithDescriptor:scratchDesc];
-        [scratchDesc release];
-        if (!scratchTex) continue;
-
-        // Persistent per-block MinMax texture (dilated result)
-        MTLTextureDescriptor* mmDescP = [[MTLTextureDescriptor alloc] init];
-        mmDescP.textureType = MTLTextureType3D;
-        mmDescP.pixelFormat = MTLPixelFormatR8Unorm;
-        mmDescP.width = static_cast<NSUInteger>(mmDimsL[0]);
-        mmDescP.height = static_cast<NSUInteger>(mmDimsL[1]);
-        mmDescP.depth = static_cast<NSUInteger>(mmDimsL[2]);
-        mmDescP.mipmapLevelCount = 1;
-        mmDescP.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-        mmDescP.storageMode = MTLStorageModePrivate;
-
-        id<MTLTexture> mmTex = [device newTextureWithDescriptor:mmDescP];
-        [mmDescP release];
-        if (!mmTex) { [scratchTex release]; continue; }
-        AssignMetalObject(block.MinMaxTexture, mmTex);
-
-        mmu.mmDimX = static_cast<uint32_t>(mmDimsL[0]);
-        mmu.mmDimY = static_cast<uint32_t>(mmDimsL[1]);
-        mmu.mmDimZ = static_cast<uint32_t>(mmDimsL[2]);
-        mmu.volDimX = static_cast<uint32_t>(bdims[0]);
-        mmu.volDimY = static_cast<uint32_t>(bdims[1]);
-        mmu.volDimZ = static_cast<uint32_t>(bdims[2]);
-
-        // volume_compute_minmax: blockTex -> scratchTex
-        [mmEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->MinMaxComputePipeline];
-        [mmEnc setTexture:blockTex atIndex:0];
-        [mmEnc setTexture:scratchTex atIndex:1];
-        [mmEnc setBytes:&mmu length:sizeof(mmu) atIndex:0];
-
-        MTLSize gridSize = MTLSizeMake(
-          static_cast<NSUInteger>(mmDimsL[0]),
-          static_cast<NSUInteger>(mmDimsL[1]),
-          static_cast<NSUInteger>(mmDimsL[2]));
-        NSUInteger tgw = 8;
-        MTLSize tgSize = MTLSizeMake(
-          std::min(tgw, static_cast<NSUInteger>(mmDimsL[0])),
-          std::min(tgw, static_cast<NSUInteger>(mmDimsL[1])),
-          std::min(tgw, static_cast<NSUInteger>(mmDimsL[2])));
-        [mmEnc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
-
-        // volume_dilate_minmax: scratchTex -> mmTex
-        [mmEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->DilateComputePipeline];
-        [mmEnc setTexture:scratchTex atIndex:0];
-        [mmEnc setTexture:mmTex atIndex:1];
-        [mmEnc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
-
-        [scratchTex release];
+        this->DispatchBlockMinMaxGPU(mtlDeviceVoid, (__bridge void*)mmEnc, (__bridge void*)blockTex,
+          block, bdims, normFactor, scalarRange, opacityTable);
       }
       [mmEnc endEncoding];
       [mmCmdBuf commit];
@@ -4732,7 +4331,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
           vtkErrorMacro("Failed to create uniform buffer");
           return false;
         }
-        AssignMetalObject(this->UniformBuffers[i], buf);
+        UniformBuffers[i].take((__bridge void*)buf);
       }
     }
 
@@ -4826,11 +4425,11 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         // Release old buffers
         if (this->VertexBuffer)
         {
-          ReleaseMetalObject(this->VertexBuffer);
+          VertexBuffer.reset();
         }
         if (this->IndexBuffer)
         {
-          ReleaseMetalObject(this->IndexBuffer);
+          IndexBuffer.reset();
         }
 
         {
@@ -4842,7 +4441,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
             vtkErrorMacro("Failed to create vertex buffer");
             return false;
           }
-          AssignMetalObject(this->VertexBuffer, vbuf);
+          VertexBuffer.take((__bridge void*)vbuf);
         }
 
         {
@@ -4854,7 +4453,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
             vtkErrorMacro("Failed to create index buffer");
             return false;
           }
-          AssignMetalObject(this->IndexBuffer, ibuf);
+          IndexBuffer.take((__bridge void*)ibuf);
         }
 
         this->CameraWasInsideInLastUpdate = false;
@@ -5034,11 +4633,11 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         // Release old buffers
         if (this->VertexBuffer)
         {
-          ReleaseMetalObject(this->VertexBuffer);
+          VertexBuffer.reset();
         }
         if (this->IndexBuffer)
         {
-          ReleaseMetalObject(this->IndexBuffer);
+          IndexBuffer.reset();
         }
 
         // Create new vertex buffer
@@ -5051,7 +4650,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
             vtkErrorMacro("Failed to create vertex buffer");
             return false;
           }
-          AssignMetalObject(this->VertexBuffer, vbuf);
+          VertexBuffer.take((__bridge void*)vbuf);
         }
 
         // Create new index buffer
@@ -5064,7 +4663,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
             vtkErrorMacro("Failed to create index buffer");
             return false;
           }
-          AssignMetalObject(this->IndexBuffer, ibuf);
+          IndexBuffer.take((__bridge void*)ibuf);
         }
 
         this->CameraWasInsideInLastUpdate = true;
@@ -5086,7 +4685,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
 
   if (this->PipelineState && sampleCount != this->CurrentSampleCount)
   {
-    ReleaseMetalObject(this->PipelineState);
+    PipelineState.reset();
   }
 
   // Accumulation pipeline is always rasterSampleCount=1
@@ -5106,28 +4705,31 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
   @autoreleasepool
   {
     id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
-    id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
+    id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary.get();
+
+    auto ensureDummy3D = [&](vtkMetalResource& slot, MTLPixelFormat fmt, const void* data) {
+      if (slot) return;
+      id<MTLTexture> tex = EnsureTexture3D(device, slot, fmt, 1, 1, 1,
+        MTLTextureUsageShaderRead, MTLStorageModeShared);
+      if (tex)
+      {
+        MTLRegion region = MTLRegionMake3D(0, 0, 0, 1, 1, 1);
+        [tex replaceRegion:region mipmapLevel:0 slice:0 withBytes:data
+               bytesPerRow:sizeof(float) bytesPerImage:sizeof(float)];
+      }
+    };
 
     // Create dummy depth texture (1x1 R32Float with value 1.0) for when no real depth texture is bound
     if (!this->DummyDepthTexture)
     {
-      MTLTextureDescriptor* dummyDesc = [[MTLTextureDescriptor alloc] init];
-      dummyDesc.textureType = MTLTextureType2D;
-      dummyDesc.pixelFormat = MTLPixelFormatR32Float;
-      dummyDesc.width = 1;
-      dummyDesc.height = 1;
-      dummyDesc.mipmapLevelCount = 1;
-      dummyDesc.usage = MTLTextureUsageShaderRead;
-      dummyDesc.storageMode = MTLStorageModeShared;
-
-      id<MTLTexture> dummyTex = [device newTextureWithDescriptor:dummyDesc];
-      [dummyDesc release];
+      id<MTLTexture> dummyTex = EnsureTexture2D(device, this->DummyDepthTexture,
+        MTLPixelFormatR32Float, 1, 1,
+        MTLTextureUsageShaderRead, MTLStorageModeShared);
       if (dummyTex)
       {
         float one = 1.0f;
         MTLRegion region = MTLRegionMake2D(0, 0, 1, 1);
         [dummyTex replaceRegion:region mipmapLevel:0 withBytes:&one bytesPerRow:sizeof(float)];
-        AssignMetalObject(this->DummyDepthTexture, dummyTex);
       }
     }
 
@@ -5135,73 +4737,14 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     // sampler state objects. No sampler creation needed here.
 
     // Create dummy 3D textures for fallback bindings (prevent nil texture binds).
-    if (!this->DummyVolumeTexture)
     {
-      MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-      desc.textureType = MTLTextureType3D;
-      desc.pixelFormat = MTLPixelFormatR32Float;
-      desc.width = 1;
-      desc.height = 1;
-      desc.depth = 1;
-      desc.mipmapLevelCount = 1;
-      desc.usage = MTLTextureUsageShaderRead;
-      desc.storageMode = MTLStorageModeShared;
-      id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
-      if (tex)
-      {
-        float zero = 0.0f;
-        MTLRegion region = MTLRegionMake3D(0, 0, 0, 1, 1, 1);
-        [tex replaceRegion:region mipmapLevel:0 slice:0 withBytes:&zero
-               bytesPerRow:sizeof(float) bytesPerImage:sizeof(float)];
-      }
-      AssignMetalObject(this->DummyVolumeTexture, tex);
-      [desc release];
+      float zero = 0.0f;
+      ensureDummy3D(this->DummyVolumeTexture, MTLPixelFormatR32Float, &zero);
+      ensureDummy3D(this->DummyMaskTexture, MTLPixelFormatR32Float, &zero);
     }
-
-    if (!this->DummyMaskTexture)
     {
-      MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-      desc.textureType = MTLTextureType3D;
-      desc.pixelFormat = MTLPixelFormatR32Float;
-      desc.width = 1;
-      desc.height = 1;
-      desc.depth = 1;
-      desc.mipmapLevelCount = 1;
-      desc.usage = MTLTextureUsageShaderRead;
-      desc.storageMode = MTLStorageModeShared;
-      id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
-      if (tex)
-      {
-        float zero = 0.0f;
-        MTLRegion region = MTLRegionMake3D(0, 0, 0, 1, 1, 1);
-        [tex replaceRegion:region mipmapLevel:0 slice:0 withBytes:&zero
-               bytesPerRow:sizeof(float) bytesPerImage:sizeof(float)];
-      }
-      AssignMetalObject(this->DummyMaskTexture, tex);
-      [desc release];
-    }
-
-    if (!this->DummyMinMaxTexture)
-    {
-      MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-      desc.textureType = MTLTextureType3D;
-      desc.pixelFormat = MTLPixelFormatR8Unorm;
-      desc.width = 1;
-      desc.height = 1;
-      desc.depth = 1;
-      desc.mipmapLevelCount = 1;
-      desc.usage = MTLTextureUsageShaderRead;
-      desc.storageMode = MTLStorageModeShared;
-      id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
-      if (tex)
-      {
-        uint8_t zero = 0;
-        MTLRegion region = MTLRegionMake3D(0, 0, 0, 1, 1, 1);
-        [tex replaceRegion:region mipmapLevel:0 slice:0 withBytes:&zero
-               bytesPerRow:sizeof(uint8_t) bytesPerImage:sizeof(uint8_t)];
-      }
-      AssignMetalObject(this->DummyMinMaxTexture, tex);
-      [desc release];
+      uint8_t zero = 0;
+      ensureDummy3D(this->DummyMinMaxTexture, MTLPixelFormatR8Unorm, &zero);
     }
 
     // Create and cache a depth stencil state.
@@ -5212,7 +4755,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
       dsDesc.depthWriteEnabled = NO;
       id<MTLDepthStencilState> ds = [device newDepthStencilStateWithDescriptor:dsDesc];
       [dsDesc release];
-      AssignMetalObject(this->DepthStencilState, ds);
+      DepthStencilState.take((__bridge void*)ds);
     }
 
     // Create volume rendering pipelines via the caching helper.
@@ -5229,7 +4772,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     {
       return false;
     }
-    AssignRetainedMetalObject(this->PipelineState, (__bridge id)pso);
+    PipelineState.retain((__bridge void*)(__bridge id)pso);
     this->CurrentSampleCount = sampleCount;
 
     void* accumPso = this->GetOrCreateVolumePipeline(mtlDeviceVoid,
@@ -5239,7 +4782,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     {
       return false;
     }
-    AssignRetainedMetalObject(this->AccumulationPipelineState, (__bridge id)accumPso);
+    AccumulationPipelineState.retain((__bridge void*)(__bridge id)accumPso);
 
     void* layerPso = this->GetOrCreateVolumePipeline(mtlDeviceVoid,
       static_cast<uint32_t>(VolumePipelineType::OffscreenLayer),
@@ -5248,7 +4791,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     {
       return false;
     }
-    AssignRetainedMetalObject(this->LayerPipelineState, (__bridge id)layerPso);
+    LayerPipelineState.retain((__bridge void*)(__bridge id)layerPso);
 
     // Pre-create fullscreen camera-inside pipelines (cached in PipelineCache).
     // FullscreenDirect: BGRA + depth + blending, matching DirectScreen.
@@ -5300,7 +4843,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
           MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, 0 };
         this->PipelineCache[k] = (__bridge void*)p;
       }
-      AssignRetainedMetalObject(this->CompositePipelineState, p);
+      CompositePipelineState.retain((__bridge void*)p);
     }
   }
 
@@ -5320,7 +4863,7 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
   }
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
-  id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary.get();
   if (!library)
   {
     return nullptr;
@@ -5490,6 +5033,123 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
 }
 
 //------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::DispatchBlockMinMaxGPU(void* deviceVoid, void* mmEncVoid,
+  void* blockTexVoid, VolumeBlock& block,
+  const int bdims[3], const float normFactor, const double scalarRange,
+  const double opacityTable[256])
+{
+  id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
+  id<MTLComputeCommandEncoder> mmEnc = (__bridge id<MTLComputeCommandEncoder>)mmEncVoid;
+  id<MTLTexture> blockTex = (__bridge id<MTLTexture>)blockTexVoid;
+
+  int mmDims[3] = { block.MinMaxDims[0], block.MinMaxDims[1], block.MinMaxDims[2] };
+  if (mmDims[0] <= 0) mmDims[0] = 1;
+  if (mmDims[1] <= 0) mmDims[1] = 1;
+  if (mmDims[2] <= 0) mmDims[2] = 1;
+  block.MinMaxDims[0] = mmDims[0]; block.MinMaxDims[1] = mmDims[1]; block.MinMaxDims[2] = mmDims[2];
+
+  // Create scratch R8Unorm texture for raw occupancy (temporary)
+  MTLTextureDescriptor* scratchDesc = [[MTLTextureDescriptor alloc] init];
+  scratchDesc.textureType = MTLTextureType3D;
+  scratchDesc.pixelFormat = MTLPixelFormatR8Unorm;
+  scratchDesc.width = static_cast<NSUInteger>(mmDims[0]);
+  scratchDesc.height = static_cast<NSUInteger>(mmDims[1]);
+  scratchDesc.depth = static_cast<NSUInteger>(mmDims[2]);
+  scratchDesc.mipmapLevelCount = 1;
+  scratchDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+  scratchDesc.storageMode = MTLStorageModePrivate;
+
+  id<MTLTexture> scratchTex = [device newTextureWithDescriptor:scratchDesc];
+  [scratchDesc release];
+  if (!scratchTex) return;
+
+  // Create persistent per-block MinMax texture (dilated result)
+  id<MTLTexture> mmTex = EnsureTexture3D(device, block.MinMaxTexture,
+    MTLPixelFormatR8Unorm, mmDims[0], mmDims[1], mmDims[2],
+    MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, MTLStorageModePrivate);
+  if (!mmTex) { [scratchTex release]; return; }
+
+  // Setup uniforms
+  MinMaxComputeUniforms mmu;
+  mmu.ds = 4.0f;
+  mmu.scalarMin = static_cast<float>(this->ScalarRange[0] / normFactor);
+  mmu.scalarScale = static_cast<float>(255.0 * normFactor / (scalarRange > 0.0 ? scalarRange : 1.0));
+  mmu._pad = 0.0f;
+  mmu.opacityPrefix[0] = 0;
+  for (int i = 0; i < 256; ++i)
+    mmu.opacityPrefix[i + 1] = mmu.opacityPrefix[i] + (opacityTable[i] > 0.0 ? 1u : 0u);
+  mmu.mmDimX = static_cast<uint32_t>(mmDims[0]);
+  mmu.mmDimY = static_cast<uint32_t>(mmDims[1]);
+  mmu.mmDimZ = static_cast<uint32_t>(mmDims[2]);
+  mmu.volDimX = static_cast<uint32_t>(bdims[0]);
+  mmu.volDimY = static_cast<uint32_t>(bdims[1]);
+  mmu.volDimZ = static_cast<uint32_t>(bdims[2]);
+
+  // Dispatch volume_compute_minmax: blockTex -> scratchTex
+  [mmEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->MinMaxComputePipeline.get()];
+  [mmEnc setTexture:blockTex atIndex:0];
+  [mmEnc setTexture:scratchTex atIndex:1];
+  [mmEnc setBytes:&mmu length:sizeof(mmu) atIndex:0];
+
+  MTLSize gridSize = MTLSizeMake(
+    static_cast<NSUInteger>(mmDims[0]),
+    static_cast<NSUInteger>(mmDims[1]),
+    static_cast<NSUInteger>(mmDims[2]));
+  NSUInteger tgw = 8;
+  MTLSize tgSize = MTLSizeMake(
+    std::min(tgw, static_cast<NSUInteger>(mmDims[0])),
+    std::min(tgw, static_cast<NSUInteger>(mmDims[1])),
+    std::min(tgw, static_cast<NSUInteger>(mmDims[2])));
+  [mmEnc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
+
+  // Dispatch volume_dilate_minmax: scratchTex -> mmTex
+  [mmEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->DilateComputePipeline.get()];
+  [mmEnc setTexture:scratchTex atIndex:0];
+  [mmEnc setTexture:mmTex atIndex:1];
+  [mmEnc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
+
+  [scratchTex release];
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::BindFragmentTextures(
+  void* encoderVoid, void* volTex, void* minMaxTex, void* normalTex)
+{
+  id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)encoderVoid;
+  id<MTLTexture> tfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture.get();
+  id<MTLTexture> depthTex = this->DepthTextureOcclusion
+    ? (__bridge id<MTLTexture>)this->DepthTextureOcclusion.get()
+    : (__bridge id<MTLTexture>)this->DummyDepthTexture.get();
+  id<MTLTexture> gradOpTex = this->GradientOpacityTexture
+    ? (__bridge id<MTLTexture>)this->GradientOpacityTexture.get() : tfTex;
+  id<MTLTexture> maskTex = this->MaskTexture
+    ? (__bridge id<MTLTexture>)this->MaskTexture.get()
+    : (__bridge id<MTLTexture>)this->DummyMaskTexture.get();
+  id<MTLTexture> labelTfTex = this->LabelMapTransferTexture
+    ? (__bridge id<MTLTexture>)this->LabelMapTransferTexture.get() : tfTex;
+  id<MTLTexture> mmTex = minMaxTex
+    ? (__bridge id<MTLTexture>)minMaxTex
+    : (this->MinMaxTexture
+      ? (__bridge id<MTLTexture>)this->MinMaxTexture.get()
+      : (__bridge id<MTLTexture>)this->DummyMinMaxTexture.get());
+  id<MTLTexture> nrmTex = normalTex
+    ? (__bridge id<MTLTexture>)normalTex
+    : (this->GradientNormalTexture
+      ? (__bridge id<MTLTexture>)this->GradientNormalTexture.get()
+      : (volTex ? (__bridge id<MTLTexture>)volTex : (__bridge id<MTLTexture>)this->DummyVolumeTexture.get()));
+
+  id<MTLTexture> vol = volTex
+    ? (__bridge id<MTLTexture>)volTex
+    : (this->VolumeTexture
+      ? (__bridge id<MTLTexture>)this->VolumeTexture.get()
+      : (__bridge id<MTLTexture>)this->DummyVolumeTexture.get());
+
+  id<MTLTexture> textures[8] = { vol, tfTex, depthTex, gradOpTex, maskTex, labelTfTex, mmTex, nrmTex };
+  for (NSUInteger i = 0; i < 8; ++i)
+    [enc setFragmentTexture:textures[i] atIndex:i];
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
   void* encoderVoid, void* uniformBufVoid, void* pipelineStateVoid, bool hasDepth)
 {
@@ -5505,7 +5165,7 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
   }
   else
   {
-    pipeline = (__bridge id<MTLRenderPipelineState>)this->PipelineState;
+    pipeline = (__bridge id<MTLRenderPipelineState>)this->PipelineState.get();
   }
   [encoder setRenderPipelineState:pipeline];
   [encoder setCullMode:MTLCullModeBack];
@@ -5514,88 +5174,17 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
   if (this->DepthStencilState && hasDepth)
   {
     id<MTLDepthStencilState> ds =
-      (__bridge id<MTLDepthStencilState>)this->DepthStencilState;
+      (__bridge id<MTLDepthStencilState>)this->DepthStencilState.get();
     [encoder setDepthStencilState:ds];
   }
 
   // Bind buffers
-  id<MTLBuffer> vertexBuf = (__bridge id<MTLBuffer>)this->VertexBuffer;
+  id<MTLBuffer> vertexBuf = (__bridge id<MTLBuffer>)this->VertexBuffer.get();
   [encoder setVertexBuffer:vertexBuf offset:0 atIndex:0];
   [encoder setVertexBuffer:uniformBuf offset:0 atIndex:1];
   [encoder setFragmentBuffer:uniformBuf offset:0 atIndex:1];
 
-  id<MTLTexture> volTex = this->VolumeTexture
-    ? (__bridge id<MTLTexture>)this->VolumeTexture
-    : (__bridge id<MTLTexture>)this->DummyVolumeTexture;
-  id<MTLTexture> tfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
-  [encoder setFragmentTexture:volTex atIndex:0];
-  [encoder setFragmentTexture:tfTex atIndex:1];
-
-  // Bind scene depth texture for early ray termination (fragment index 2).
-  // Use the dummy depth texture (value 1.0) when no real depth texture is available.
-  id<MTLTexture> depthTex = this->DepthTextureOcclusion
-    ? (__bridge id<MTLTexture>)this->DepthTextureOcclusion
-    : (__bridge id<MTLTexture>)this->DummyDepthTexture;
-  [encoder setFragmentTexture:depthTex atIndex:2];
-
-  // Bind gradient opacity texture for gradient-based shading (fragment index 3).
-  // The shader uses constexpr samplers, so no sampler bindings are needed.
-  if (this->GradientOpacityTexture)
-  {
-    id<MTLTexture> goTex = (__bridge id<MTLTexture>)this->GradientOpacityTexture;
-    [encoder setFragmentTexture:goTex atIndex:3];
-  }
-  else
-  {
-    [encoder setFragmentTexture:tfTex atIndex:3];
-  }
-
-  // Bind mask / label map textures (fragment index 4).
-  id<MTLTexture> maskFallbackTex =
-    (__bridge id<MTLTexture>)this->DummyMaskTexture;
-  if (this->MaskTexture)
-  {
-    id<MTLTexture> maskTex = (__bridge id<MTLTexture>)this->MaskTexture;
-    [encoder setFragmentTexture:maskTex atIndex:4];
-  }
-  else
-  {
-    [encoder setFragmentTexture:maskFallbackTex atIndex:4];
-  }
-
-  // Bind label map transfer texture (fragment index 5)
-  if (this->LabelMapTransferTexture)
-  {
-    id<MTLTexture> lmTex = (__bridge id<MTLTexture>)this->LabelMapTransferTexture;
-    [encoder setFragmentTexture:lmTex atIndex:5];
-  }
-  else
-  {
-    [encoder setFragmentTexture:tfTex atIndex:5];
-  }
-
-  // Bind min-max acceleration texture (fragment index 6).
-  id<MTLTexture> minMaxFallbackTex =
-    (__bridge id<MTLTexture>)this->DummyMinMaxTexture;
-  if (this->MinMaxTexture)
-  {
-    id<MTLTexture> mmTex = (__bridge id<MTLTexture>)this->MinMaxTexture;
-    [encoder setFragmentTexture:mmTex atIndex:6];
-  }
-  else
-  {
-    [encoder setFragmentTexture:minMaxFallbackTex atIndex:6];
-  }
-
-  // Bind precomputed gradient normal texture (fragment index 7).
-  if (this->GradientNormalTexture)
-  {
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->GradientNormalTexture atIndex:7];
-  }
-  else
-  {
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyVolumeTexture atIndex:7];
-  }
+  this->BindFragmentTextures(encoder, this->VolumeTexture.get(), this->MinMaxTexture.get(), this->GradientNormalTexture.get());
 }
 
 //------------------------------------------------------------------------------
@@ -5611,69 +5200,14 @@ void vtkMetalGPUVolumeRayCastMapper::BindFullscreenTextures(
   [encoder setCullMode:(MTLCullMode)cullMode];
   if (this->DepthStencilState && useDepth)
   {
-    [encoder setDepthStencilState:(__bridge id<MTLDepthStencilState>)this->DepthStencilState];
+    [encoder setDepthStencilState:(__bridge id<MTLDepthStencilState>)this->DepthStencilState.get()];
   }
 
   [encoder setVertexBytes:pbd length:sizeof(PerBlockData) atIndex:2];
   [encoder setFragmentBytes:pbd length:sizeof(PerBlockData) atIndex:2];
   [encoder setFragmentBuffer:uniformBuf offset:0 atIndex:1];
 
-  id<MTLTexture> volTex = volTexVoid
-    ? (__bridge id<MTLTexture>)volTexVoid
-    : (__bridge id<MTLTexture>)this->DummyVolumeTexture;
-  id<MTLTexture> tfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
-  [encoder setFragmentTexture:volTex atIndex:0];
-  [encoder setFragmentTexture:tfTex atIndex:1];
-
-  id<MTLTexture> depthTex = this->DepthTextureOcclusion
-    ? (__bridge id<MTLTexture>)this->DepthTextureOcclusion
-    : (__bridge id<MTLTexture>)this->DummyDepthTexture;
-  [encoder setFragmentTexture:depthTex atIndex:2];
-
-  if (this->GradientOpacityTexture)
-  {
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->GradientOpacityTexture atIndex:3];
-  }
-  else
-  {
-    [encoder setFragmentTexture:tfTex atIndex:3];
-  }
-
-  if (this->MaskTexture)
-  {
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->MaskTexture atIndex:4];
-  }
-  else
-  {
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMaskTexture atIndex:4];
-  }
-
-  if (this->LabelMapTransferTexture)
-  {
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->LabelMapTransferTexture atIndex:5];
-  }
-  else
-  {
-    [encoder setFragmentTexture:tfTex atIndex:5];
-  }
-
-  if (minMaxTexVoid)
-  {
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)minMaxTexVoid atIndex:6];
-  }
-  else
-  {
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMinMaxTexture atIndex:6];
-  }
-
-  if (normalTexVoid)
-  {
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)normalTexVoid atIndex:7];
-  }
-  else
-  {
-    [encoder setFragmentTexture:volTex atIndex:7];
-  }
+  this->BindFragmentTextures(encoder, volTexVoid, minMaxTexVoid, normalTexVoid);
 }
 
 //------------------------------------------------------------------------------
@@ -5774,7 +5308,7 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
     (__bridge id<MTLRenderCommandEncoder>)encoderVoid;
   id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)uniformBufVoid;
   VolumeMapperUniforms* uniforms = static_cast<VolumeMapperUniforms*>(uniformsVoid);
-  id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;
+  id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer.get();
 
   vtkImageData* input = vtkImageData::SafeDownCast(this->GetInput());
   int fullExt[6];
@@ -5805,16 +5339,16 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
       BuildPerBlockData(pbd, block, fullExt, origin, spacing);
 
       // Override per-block textures on top of the common textures set by BindEncoderResources
-      id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture;
+      id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture.get();
       [encoder setFragmentTexture:blockTex atIndex:0];
       if (block.MinMaxTexture)
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)block.MinMaxTexture atIndex:6];
+        [encoder setFragmentTexture:(__bridge id<MTLTexture>)block.MinMaxTexture.get() atIndex:6];
       else
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMinMaxTexture atIndex:6];
+        [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMinMaxTexture.get() atIndex:6];
       if (block.NormalTexture)
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)block.NormalTexture atIndex:7];
+        [encoder setFragmentTexture:(__bridge id<MTLTexture>)block.NormalTexture.get() atIndex:7];
       else
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyVolumeTexture atIndex:7];
+        [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyVolumeTexture.get() atIndex:7];
 
       [encoder setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
       [encoder setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
@@ -5999,7 +5533,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     {
       // GPU path failed — release any private texture so the CPU
       // fallback's replaceRegion (which needs StorageModeShared) works.
-      ReleaseMetalObject(this->MinMaxTexture);
+      MinMaxTexture.reset();
       this->UpdateMinMaxTexture(mtlDevice, vol, input, scalars, false);
     }
   }
@@ -6444,7 +5978,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   }
 
   // Wait for the uniform buffer slot for this frame to be free
-  dispatch_semaphore_wait((dispatch_semaphore_t)this->FrameSemaphore, DISPATCH_TIME_FOREVER);
+  dispatch_semaphore_wait((dispatch_semaphore_t)this->FrameSemaphore.get(), DISPATCH_TIME_FOREVER);
 
   // RAII guard: signals the semaphore on scope exit (early return, exception, etc.).
   // Dismiss after the completion handler is installed below.
@@ -6453,13 +5987,13 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     bool active = true;
     ~SemaphoreSignalGuard() { if (active && sem) dispatch_semaphore_signal(sem); }
     void dismiss() { active = false; }
-  } semGuard{ (__bridge dispatch_semaphore_t)this->FrameSemaphore };
+  } semGuard{ (__bridge dispatch_semaphore_t)this->FrameSemaphore.get() };
 
   int bufIdx = this->UniformFrameIndex % 3;
   this->UniformFrameIndex++;
 
   // Update uniform buffer (now includes viewProjection + inverseViewProjection)
-  id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)this->UniformBuffers[bufIdx];
+  id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)this->UniformBuffers[bufIdx].get();
   memcpy([uniformBuf contents], &uniforms, sizeof(uniforms));
 
   // Phase 6: Determine if camera is inside the volume for the fullscreen ray-cast path.
@@ -6489,7 +6023,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
     // Render volume to offscreen texture
     id<MTLTexture> offscreenColor =
-      (__bridge id<MTLTexture>)this->ImageSampleColorTexture;
+      (__bridge id<MTLTexture>)this->ImageSampleColorTexture.get();
 
     // ============================================================================
     // ORDER-INDEPENDENT BRICK COMPOSITING (partitioned volumes, <= MAX_LAYER_BRICKS)
@@ -6556,7 +6090,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         return;
       }
 
-      id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;
+      id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer.get();
 
       // Get origin and spacing for PerBlockData texture bounds
       vtkImageData* input = vtkImageData::SafeDownCast(this->GetInput());
@@ -6588,7 +6122,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         auto& block = this->Blocks[si];
 
         MTLRenderPassDescriptor* lrpd = [MTLRenderPassDescriptor renderPassDescriptor];
-        lrpd.colorAttachments[0].texture = (__bridge id<MTLTexture>)this->LayerTextureArray;
+        lrpd.colorAttachments[0].texture = (__bridge id<MTLTexture>)this->LayerTextureArray.get();
         lrpd.colorAttachments[0].slice = static_cast<NSUInteger>(bi);
         lrpd.colorAttachments[0].loadAction = MTLLoadActionClear;
         lrpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
@@ -6619,15 +6153,15 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
             MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, featureMask);
           this->BindEncoderResources(layerEnc, uniformBuf, layerPso, false);
           // Override the global textures BindEncoderResources set with per-block textures
-          [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.Texture atIndex:0];
+          [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.Texture.get() atIndex:0];
           if (block.MinMaxTexture)
-            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.MinMaxTexture atIndex:6];
+            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.MinMaxTexture.get() atIndex:6];
           else
-            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMinMaxTexture atIndex:6];
+            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMinMaxTexture.get() atIndex:6];
           // Override index 7 with per-block normal texture if available
           if (block.NormalTexture)
           {
-            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.NormalTexture atIndex:7];
+            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.NormalTexture.get() atIndex:7];
           }
 
           [layerEnc setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
@@ -6676,12 +6210,12 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       crpd.colorAttachments[0].storeAction = MTLStoreActionStore;
       id<MTLRenderCommandEncoder> compEnc = [commandBuffer renderCommandEncoderWithDescriptor:crpd];
       [compEnc setViewport:(MTLViewport){0, 0, (double)fboWidth, (double)fboHeight, 0.0, 1.0}];
-      [compEnc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)this->CompositePipelineState];
+      [compEnc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)this->CompositePipelineState.get()];
       [compEnc setCullMode:MTLCullModeNone];
       [compEnc setFragmentBuffer:uniformBuf offset:0 atIndex:1];
       [compEnc setFragmentBytes:&lc length:sizeof(lc) atIndex:2];
 
-      [compEnc setFragmentTexture:(__bridge id<MTLTexture>)this->LayerTextureArray atIndex:0];
+      [compEnc setFragmentTexture:(__bridge id<MTLTexture>)this->LayerTextureArray.get() atIndex:0];
 
       [compEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
       [compEnc endEncoding];
@@ -6770,7 +6304,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // Signal the semaphore when the GPU finishes this frame's command buffer.
   // Retain the semaphore under MRC to prevent use-after-free if the mapper
   // is destroyed before the handler fires.
-  dispatch_semaphore_t sem = (__bridge dispatch_semaphore_t)this->FrameSemaphore;
+  dispatch_semaphore_t sem = (__bridge dispatch_semaphore_t)this->FrameSemaphore.get();
 #if !__has_feature(objc_arc)
   dispatch_retain(sem);
 #endif
