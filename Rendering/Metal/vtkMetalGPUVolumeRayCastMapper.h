@@ -268,6 +268,7 @@ private:
   vtkTimeStamp TransferFunctionUploadTime;
   vtkTimeStamp GradientOpacityUploadTime;
   vtkTimeStamp VertexBufferUploadTime;
+  vtkTimeStamp NormalTextureTime;
 
   // Helper methods
   bool UpdateVolumeTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);

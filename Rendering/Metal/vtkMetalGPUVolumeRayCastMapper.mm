@@ -566,12 +566,16 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureGradientNormalTexture(
   id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;
   int dims[3] = { static_cast<int>(volTex.width), static_cast<int>(volTex.height), static_cast<int>(volTex.depth) };
 
-  // Reuse if dimensions match
+  // Reuse if still valid — data, scalar range, and params haven't changed
   id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->GradientNormalTexture;
-  if (oldTex &&
-      static_cast<int>(oldTex.width) == dims[0] &&
-      static_cast<int>(oldTex.height) == dims[1] &&
-      static_cast<int>(oldTex.depth) == dims[2])
+  bool stale = !oldTex ||
+    static_cast<int>(oldTex.width) != dims[0] ||
+    static_cast<int>(oldTex.height) != dims[1] ||
+    static_cast<int>(oldTex.depth) != dims[2] ||
+    this->VolumeUploadTime.GetMTime() > this->NormalTextureTime.GetMTime() ||
+    this->GetMTime() > this->NormalTextureTime.GetMTime();
+
+  if (!stale)
   {
     return true;
   }
@@ -677,6 +681,8 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureGradientNormalTexture(
     [compEnc dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
     [compEnc endEncoding];
     [cmdBuf commit];
+
+    this->NormalTextureTime.Modified();
   }
 
   return this->GradientNormalTexture != nullptr;
