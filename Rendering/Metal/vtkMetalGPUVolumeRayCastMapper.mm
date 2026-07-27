@@ -5319,14 +5319,13 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
 
   if (!this->Blocks.empty())
   {
-    this->SortBlocksBackToFront(ren, vol);
-
     // NOTE: the old single-draw INSTANCED path was removed. Partitioned volumes
     // with <= MAX_LAYER_BRICKS bricks are now composited order-independently in
     // GPURender (per-brick layer textures + per-pixel-sorted composite), which
     // makes draw order irrelevant. This function is therefore only reached for
     // the > MAX_LAYER_BRICKS fallback (order-dependent; see "Known limitations"
-    // in GPURender) and never instances.
+    // in GPURender) — SortBlocksBackToFront is called by the caller in that path.
+    // Single-block volumes (Blocks.empty()) do not enter this branch.
 
     // --- FALLBACK PATH (> MAX_LAYER_BRICKS bricks): one draw per brick,
     //     composited front-to-back via framebuffer fetch. Order-dependent. ---
@@ -5422,11 +5421,12 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
     ? static_cast<uint32_t>(metalRenderWindow ? metalRenderWindow->GetEffectiveSampleCount() : 1)
     : 1;
 
-  // Handle partitioned volumes: sort blocks, render each brick.
+  // Handle partitioned volumes: render blocks in caller-established order.
+  // SortBlocksBackToFront is called by the caller before this function when the
+  // order-dependent (> MAX_LAYER_BRICKS) fallback is needed; the order-independent
+  // layer composite path (<= MAX_LAYER_BRICKS) bypasses this function entirely.
   if (!this->Blocks.empty())
   {
-    this->SortBlocksBackToFront(ren, vol);
-
     for (size_t bi = 0; bi < this->SortedBlockOrder.size(); ++bi)
     {
       int si = this->SortedBlockOrder[bi];
@@ -6248,6 +6248,10 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       //     with > MAX_LAYER_BRICKS bricks (the layer composite is capped at
       //     MAX_LAYER_BRICKS; see "Known limitations"). ---
       bool useAccumulation = !this->Blocks.empty(); // true only for the >8-brick case here
+      if (useAccumulation)
+      {
+        this->SortBlocksBackToFront(ren, vol);
+      }
       if (cameraInside)
       {
         // Use fullscreen ray-cast path — no proxy geometry needed.
