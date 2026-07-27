@@ -915,6 +915,115 @@ static void EncodeNormalCompute(
   [enc dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
 }
 
+//------------------------------------------------------------------------------
+// Refactoring 10: VolumeBounds — factor repeated model-bounds computation
+struct VolumeBounds
+{
+  double Min[3];
+  double Max[3];
+  double Size[3];
+};
+
+static VolumeBounds ComputeVolumeBounds(vtkImageData* input)
+{
+  VolumeBounds bounds{};
+  int ext[6];
+  double origin[3], spacing[3];
+  input->GetExtent(ext);
+  input->GetOrigin(origin);
+  input->GetSpacing(spacing);
+  double x0 = origin[0] + spacing[0] * ext[0];
+  double x1 = origin[0] + spacing[0] * ext[1];
+  double y0 = origin[1] + spacing[1] * ext[2];
+  double y1 = origin[1] + spacing[1] * ext[3];
+  double z0 = origin[2] + spacing[2] * ext[4];
+  double z1 = origin[2] + spacing[2] * ext[5];
+  bounds.Min[0] = std::min(x0, x1);
+  bounds.Max[0] = std::max(x0, x1);
+  bounds.Min[1] = std::min(y0, y1);
+  bounds.Max[1] = std::max(y0, y1);
+  bounds.Min[2] = std::min(z0, z1);
+  bounds.Max[2] = std::max(z0, z1);
+  for (int i = 0; i < 3; ++i)
+  {
+    bounds.Size[i] = bounds.Max[i] - bounds.Min[i];
+    if (bounds.Size[i] < 1e-10)
+      bounds.Size[i] = 1.0;
+  }
+  return bounds;
+}
+
+inline float NormalizeToVolumeSpace(const VolumeBounds& bounds, int axis, double value)
+{
+  return static_cast<float>((value - bounds.Min[axis]) / bounds.Size[axis]);
+}
+
+//------------------------------------------------------------------------------
+// Refactoring 11: transfer-function table helpers
+static uint8_t ColorToByte(double x)
+{
+  return static_cast<uint8_t>(std::clamp(x, 0.0, 1.0) * 255.0);
+}
+
+static void FillTransferFunctionRGBA8(
+  vtkColorTransferFunction* colorFunc,
+  vtkPiecewiseFunction* opacityFunc,
+  double scalarMin,
+  double scalarMax,
+  int width,
+  uint8_t* row)
+{
+  std::vector<double> rgb(width * 3);
+  std::vector<double> alpha(width);
+  colorFunc->GetTable(scalarMin, scalarMax, width, rgb.data());
+  opacityFunc->GetTable(scalarMin, scalarMax, width, alpha.data());
+  for (int i = 0; i < width; ++i)
+  {
+    row[i * 4 + 0] = ColorToByte(rgb[i * 3 + 0]);
+    row[i * 4 + 1] = ColorToByte(rgb[i * 3 + 1]);
+    row[i * 4 + 2] = ColorToByte(rgb[i * 3 + 2]);
+    row[i * 4 + 3] = ColorToByte(alpha[i]);
+  }
+}
+
+//------------------------------------------------------------------------------
+// Refactoring 12: create a dummy 3D texture filled with a constant value
+static id<MTLTexture> CreateDummy3DTexture(
+  id<MTLDevice> device,
+  MTLPixelFormat format,
+  const void* initialValue,
+  NSUInteger initialValueSize)
+{
+  id<MTLTexture> tex = NewTexture3D(
+    device, format, 1, 1, 1,
+    MTLTextureUsageShaderRead, MTLStorageModeShared);
+  if (tex)
+  {
+    MTLRegion region = MTLRegionMake3D(0, 0, 0, 1, 1, 1);
+    [tex replaceRegion:region
+            mipmapLevel:0
+                  slice:0
+              withBytes:initialValue
+            bytesPerRow:initialValueSize
+          bytesPerImage:initialValueSize];
+  }
+  return tex;
+}
+
+//------------------------------------------------------------------------------
+// Refactoring 13: bind a texture or its fallback
+static inline void SetFragmentTextureOrFallback(
+  id<MTLRenderCommandEncoder> encoder,
+  NSUInteger index,
+  void* texture,
+  void* fallback)
+{
+  id<MTLTexture> tex = texture
+    ? (__bridge id<MTLTexture>)texture
+    : (__bridge id<MTLTexture>)fallback;
+  [encoder setFragmentTexture:tex atIndex:index];
+}
+
 }
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -1509,21 +1618,13 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
         }
       }
 
-      double origin[3], spacing[3];
-      input->GetOrigin(origin);
-      input->GetSpacing(spacing);
-      double x0 = origin[0] + spacing[0] * fullExt[0];
-      double x1 = origin[0] + spacing[0] * fullExt[1];
-      double y0 = origin[1] + spacing[1] * fullExt[2];
-      double y1 = origin[1] + spacing[1] * fullExt[3];
-      double z0 = origin[2] + spacing[2] * fullExt[4];
-      double z1 = origin[2] + spacing[2] * fullExt[5];
-      this->ModelBounds[0] = std::min(x0, x1);
-      this->ModelBounds[1] = std::max(x0, x1);
-      this->ModelBounds[2] = std::min(y0, y1);
-      this->ModelBounds[3] = std::max(y0, y1);
-      this->ModelBounds[4] = std::min(z0, z1);
-      this->ModelBounds[5] = std::max(z0, z1);
+      VolumeBounds vb = ComputeVolumeBounds(input);
+      this->ModelBounds[0] = vb.Min[0];
+      this->ModelBounds[1] = vb.Max[0];
+      this->ModelBounds[2] = vb.Min[1];
+      this->ModelBounds[3] = vb.Max[1];
+      this->ModelBounds[4] = vb.Min[2];
+      this->ModelBounds[5] = vb.Max[2];
 
       this->VolumeNumComponents = scalars->GetNumberOfComponents();
 
@@ -1585,23 +1686,15 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       this->VolumeNumComponents = numComponents;
 
       // Store model-space bounds using image extent (handles non-zero extents and negative spacing)
-      int ext[6];
-      input->GetExtent(ext);
-      double origin[3], spacing[3];
-      input->GetOrigin(origin);
-      input->GetSpacing(spacing);
-      double x0 = origin[0] + spacing[0] * ext[0];
-      double x1 = origin[0] + spacing[0] * ext[1];
-      double y0 = origin[1] + spacing[1] * ext[2];
-      double y1 = origin[1] + spacing[1] * ext[3];
-      double z0 = origin[2] + spacing[2] * ext[4];
-      double z1 = origin[2] + spacing[2] * ext[5];
-      this->ModelBounds[0] = std::min(x0, x1);
-      this->ModelBounds[1] = std::max(x0, x1);
-      this->ModelBounds[2] = std::min(y0, y1);
-      this->ModelBounds[3] = std::max(y0, y1);
-      this->ModelBounds[4] = std::min(z0, z1);
-      this->ModelBounds[5] = std::max(z0, z1);
+      {
+        VolumeBounds vb = ComputeVolumeBounds(input);
+        this->ModelBounds[0] = vb.Min[0];
+        this->ModelBounds[1] = vb.Max[0];
+        this->ModelBounds[2] = vb.Min[1];
+        this->ModelBounds[3] = vb.Max[1];
+        this->ModelBounds[4] = vb.Min[2];
+        this->ModelBounds[5] = vb.Max[2];
+      }
 
       // Select optimal texture format for this data type
       VolumeFormat fmtInfo = ChooseVolumeFormat(
@@ -1916,23 +2009,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
       id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
 
       unsigned char tfData[256 * 4];
-      for (int i = 0; i < 256; ++i)
-      {
-        double val = this->ScalarRange[0] + (this->ScalarRange[1] - this->ScalarRange[0]) * (i / 255.0);
-        double rgb[3];
-        colorFunc->GetColor(val, rgb);
-        double opacity = opacityFunc->GetValue(val);
-
-        rgb[0] = std::clamp(rgb[0], 0.0, 1.0);
-        rgb[1] = std::clamp(rgb[1], 0.0, 1.0);
-        rgb[2] = std::clamp(rgb[2], 0.0, 1.0);
-        opacity = std::clamp(opacity, 0.0, 1.0);
-
-        tfData[i * 4 + 0] = static_cast<unsigned char>(rgb[0] * 255.0);
-        tfData[i * 4 + 1] = static_cast<unsigned char>(rgb[1] * 255.0);
-        tfData[i * 4 + 2] = static_cast<unsigned char>(rgb[2] * 255.0);
-        tfData[i * 4 + 3] = static_cast<unsigned char>(opacity * 255.0);
-      }
+      FillTransferFunctionRGBA8(
+        colorFunc, opacityFunc,
+        this->ScalarRange[0], this->ScalarRange[1],
+        256, tfData);
 
       id<MTLTexture> oldTfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
       id<MTLTexture> tex = nil;
@@ -2322,25 +2402,35 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateLabelMapTransferTexture(
           opacityFunc = property->GetScalarOpacity(); // fallback to default
         }
 
-        if (colorFunc)
+        if (colorFunc && opacityFunc)
+        {
+          FillTransferFunctionRGBA8(
+            colorFunc, opacityFunc,
+            scalarRange[0], scalarRange[1],
+            tfWidth, rowPtr);
+        }
+        else if (colorFunc)
         {
           std::vector<double> colorTable(tfWidth * 3);
           colorFunc->GetTable(scalarRange[0], scalarRange[1], tfWidth, colorTable.data());
           for (int i = 0; i < tfWidth; ++i)
           {
-            rowPtr[i * 4 + 0] = static_cast<uint8_t>(std::clamp(colorTable[i * 3 + 0], 0.0, 1.0) * 255.0);
-            rowPtr[i * 4 + 1] = static_cast<uint8_t>(std::clamp(colorTable[i * 3 + 1], 0.0, 1.0) * 255.0);
-            rowPtr[i * 4 + 2] = static_cast<uint8_t>(std::clamp(colorTable[i * 3 + 2], 0.0, 1.0) * 255.0);
+            rowPtr[i * 4 + 0] = ColorToByte(colorTable[i * 3 + 0]);
+            rowPtr[i * 4 + 1] = ColorToByte(colorTable[i * 3 + 1]);
+            rowPtr[i * 4 + 2] = ColorToByte(colorTable[i * 3 + 2]);
+            rowPtr[i * 4 + 3] = 0;
           }
         }
-
-        if (opacityFunc)
+        else if (opacityFunc)
         {
           std::vector<double> opacityTable(tfWidth);
           opacityFunc->GetTable(scalarRange[0], scalarRange[1], tfWidth, opacityTable.data());
           for (int i = 0; i < tfWidth; ++i)
           {
-            rowPtr[i * 4 + 3] = static_cast<uint8_t>(std::clamp(opacityTable[i], 0.0, 1.0) * 255.0);
+            rowPtr[i * 4 + 0] = 0;
+            rowPtr[i * 4 + 1] = 0;
+            rowPtr[i * 4 + 2] = 0;
+            rowPtr[i * 4 + 3] = ColorToByte(opacityTable[i]);
           }
         }
       }
@@ -4302,31 +4392,24 @@ void vtkMetalGPUVolumeRayCastMapper::SetClippingPlaneUniforms(
 
   uniforms->UseClipping = 1.0f;
 
-  double* modelBounds = this->ModelBounds;
-  double boundsSize[3] = {
-    modelBounds[1] - modelBounds[0],
-    modelBounds[3] - modelBounds[2],
-    modelBounds[5] - modelBounds[4]
-  };
+  VolumeBounds bounds;
+  bounds.Min[0] = this->ModelBounds[0];
+  bounds.Max[0] = this->ModelBounds[1];
+  bounds.Min[1] = this->ModelBounds[2];
+  bounds.Max[1] = this->ModelBounds[3];
+  bounds.Min[2] = this->ModelBounds[4];
+  bounds.Max[2] = this->ModelBounds[5];
   for (int k = 0; k < 3; ++k)
   {
-    if (boundsSize[k] < 1e-10)
-      boundsSize[k] = 1.0;
+    bounds.Size[k] = bounds.Max[k] - bounds.Min[k];
+    if (bounds.Size[k] < 1e-10)
+      bounds.Size[k] = 1.0;
   }
 
-  // Store plane pointers for indexed access
-  float* planeOrigins[8] = {
-    uniforms->ClippingPlane0Origin, uniforms->ClippingPlane1Origin,
-    uniforms->ClippingPlane2Origin, uniforms->ClippingPlane3Origin,
-    uniforms->ClippingPlane4Origin, uniforms->ClippingPlane5Origin,
-    uniforms->ClippingPlane6Origin, uniforms->ClippingPlane7Origin
-  };
-  float* planeNormals[8] = {
-    uniforms->ClippingPlane0Normal, uniforms->ClippingPlane1Normal,
-    uniforms->ClippingPlane2Normal, uniforms->ClippingPlane3Normal,
-    uniforms->ClippingPlane4Normal, uniforms->ClippingPlane5Normal,
-    uniforms->ClippingPlane6Normal, uniforms->ClippingPlane7Normal
-  };
+  // Planes are stored as alternating origin/normal float[4] each 16 bytes.
+  // ClippingPlane0Origin is at the base of the 8-plane block; each plane
+  // occupies 8 floats (origin[4] + normal[4]).
+  float* planeData = &uniforms->ClippingPlane0Origin[0];
 
   int numPlanes = 0;
 
@@ -4350,9 +4433,9 @@ void vtkMetalGPUVolumeRayCastMapper::SetClippingPlaneUniforms(
     }
 
     double originVol[3] = {
-      (originLocal[0] - modelBounds[0]) / boundsSize[0],
-      (originLocal[1] - modelBounds[2]) / boundsSize[1],
-      (originLocal[2] - modelBounds[4]) / boundsSize[2]
+      (originLocal[0] - bounds.Min[0]) / bounds.Size[0],
+      (originLocal[1] - bounds.Min[1]) / bounds.Size[1],
+      (originLocal[2] - bounds.Min[2]) / bounds.Size[2]
     };
 
     // Normal: transform as a normal/covector.
@@ -4378,9 +4461,9 @@ void vtkMetalGPUVolumeRayCastMapper::SetClippingPlaneUniforms(
 
     // Scale into normalized volume space.
     double normalVol[3] = {
-      normalModel[0] * boundsSize[0],
-      normalModel[1] * boundsSize[1],
-      normalModel[2] * boundsSize[2]
+      normalModel[0] * bounds.Size[0],
+      normalModel[1] * bounds.Size[1],
+      normalModel[2] * bounds.Size[2]
     };
 
     double normalLen = sqrt(
@@ -4396,15 +4479,16 @@ void vtkMetalGPUVolumeRayCastMapper::SetClippingPlaneUniforms(
     }
 
     // Store as float4 (origin.xyz, 1.0) and (normal.xyz, 0.0)
-    planeOrigins[numPlanes][0] = static_cast<float>(originVol[0]);
-    planeOrigins[numPlanes][1] = static_cast<float>(originVol[1]);
-    planeOrigins[numPlanes][2] = static_cast<float>(originVol[2]);
-    planeOrigins[numPlanes][3] = 1.0f;
-
-    planeNormals[numPlanes][0] = static_cast<float>(normalVol[0]);
-    planeNormals[numPlanes][1] = static_cast<float>(normalVol[1]);
-    planeNormals[numPlanes][2] = static_cast<float>(normalVol[2]);
-    planeNormals[numPlanes][3] = 0.0f;
+    float* origin = planeData + numPlanes * 8;
+    float* normal = origin + 4;
+    origin[0] = static_cast<float>(originVol[0]);
+    origin[1] = static_cast<float>(originVol[1]);
+    origin[2] = static_cast<float>(originVol[2]);
+    origin[3] = 1.0f;
+    normal[0] = static_cast<float>(normalVol[0]);
+    normal[1] = static_cast<float>(normalVol[1]);
+    normal[2] = static_cast<float>(normalVol[2]);
+    normal[3] = 0.0f;
 
     numPlanes++;
   }
@@ -4442,23 +4526,13 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
     // Use model-space bounds for vertex positions (using extent for correctness)
     if (input)
     {
-      int ext[6];
-      double origin[3], spacing[3];
-      input->GetExtent(ext);
-      input->GetOrigin(origin);
-      input->GetSpacing(spacing);
-      double x0 = origin[0] + spacing[0] * ext[0];
-      double x1 = origin[0] + spacing[0] * ext[1];
-      double y0 = origin[1] + spacing[1] * ext[2];
-      double y1 = origin[1] + spacing[1] * ext[3];
-      double z0 = origin[2] + spacing[2] * ext[4];
-      double z1 = origin[2] + spacing[2] * ext[5];
-      this->ModelBounds[0] = std::min(x0, x1);
-      this->ModelBounds[1] = std::max(x0, x1);
-      this->ModelBounds[2] = std::min(y0, y1);
-      this->ModelBounds[3] = std::max(y0, y1);
-      this->ModelBounds[4] = std::min(z0, z1);
-      this->ModelBounds[5] = std::max(z0, z1);
+      VolumeBounds vb = ComputeVolumeBounds(input);
+      this->ModelBounds[0] = vb.Min[0];
+      this->ModelBounds[1] = vb.Max[0];
+      this->ModelBounds[2] = vb.Min[1];
+      this->ModelBounds[3] = vb.Max[1];
+      this->ModelBounds[4] = vb.Min[2];
+      this->ModelBounds[5] = vb.Max[2];
     }
 
     // Check if camera is inside the volume
@@ -4835,54 +4909,23 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     // Create dummy 3D textures for fallback bindings (prevent nil texture binds).
     if (!this->DummyVolumeTexture)
     {
-      id<MTLTexture> tex = NewTexture3D(
-        device,
-        MTLPixelFormatR32Float,
-        1, 1, 1,
-        MTLTextureUsageShaderRead,
-        MTLStorageModeShared);
-      if (tex)
-      {
-        float zero = 0.0f;
-        MTLRegion region = MTLRegionMake3D(0, 0, 0, 1, 1, 1);
-        [tex replaceRegion:region mipmapLevel:0 slice:0 withBytes:&zero
-               bytesPerRow:sizeof(float) bytesPerImage:sizeof(float)];
-      }
-      AssignMetalObject(this->DummyVolumeTexture, tex);
+      float zeroFloat = 0.0f;
+      AssignMetalObject(this->DummyVolumeTexture,
+        CreateDummy3DTexture(device, MTLPixelFormatR32Float, &zeroFloat, sizeof(float)));
     }
 
     if (!this->DummyMaskTexture)
     {
-      id<MTLTexture> tex = NewTexture3D(
-        device,
-        MTLPixelFormatR32Float,
-        1, 1, 1,
-        MTLTextureUsageShaderRead,
-        MTLStorageModeShared);
-      if (tex)
-      {
-        float zero = 0.0f;
-        MTLRegion region = MTLRegionMake3D(0, 0, 0, 1, 1, 1);
-        [tex replaceRegion:region mipmapLevel:0 slice:0 withBytes:&zero
-               bytesPerRow:sizeof(float) bytesPerImage:sizeof(float)];
-      }
-      AssignMetalObject(this->DummyMaskTexture, tex);
+      float zeroFloat = 0.0f;
+      AssignMetalObject(this->DummyMaskTexture,
+        CreateDummy3DTexture(device, MTLPixelFormatR32Float, &zeroFloat, sizeof(float)));
     }
 
     if (!this->DummyMinMaxTexture)
     {
-      id<MTLTexture> tex = NewTexture3D(
-        device,
-        MTLPixelFormatR8Unorm,
-        1, 1, 1,
-        MTLTextureUsageShaderRead,
-        MTLStorageModeShared);
-      if (tex)
-      {
-        uint8_t zero = 0;
-        UploadR8Volume3D(tex, &zero, 1, 1, 1);
-      }
-      AssignMetalObject(this->DummyMinMaxTexture, tex);
+      uint8_t zeroByte = 0;
+      AssignMetalObject(this->DummyMinMaxTexture,
+        CreateDummy3DTexture(device, MTLPixelFormatR8Unorm, &zeroByte, sizeof(uint8_t)));
     }
 
     // Create and cache a depth stencil state.
@@ -5205,78 +5248,14 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
   [encoder setVertexBuffer:uniformBuf offset:0 atIndex:1];
   [encoder setFragmentBuffer:uniformBuf offset:0 atIndex:1];
 
-  id<MTLTexture> volTex = this->VolumeTexture
-    ? (__bridge id<MTLTexture>)this->VolumeTexture
-    : (__bridge id<MTLTexture>)this->DummyVolumeTexture;
-  id<MTLTexture> tfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
-  [encoder setFragmentTexture:volTex atIndex:0];
-  [encoder setFragmentTexture:tfTex atIndex:1];
-
-  // Bind scene depth texture for early ray termination (fragment index 2).
-  // Use the dummy depth texture (value 1.0) when no real depth texture is available.
-  id<MTLTexture> depthTex = this->DepthTextureOcclusion
-    ? (__bridge id<MTLTexture>)this->DepthTextureOcclusion
-    : (__bridge id<MTLTexture>)this->DummyDepthTexture;
-  [encoder setFragmentTexture:depthTex atIndex:2];
-
-  // Bind gradient opacity texture for gradient-based shading (fragment index 3).
-  // The shader uses constexpr samplers, so no sampler bindings are needed.
-  if (this->GradientOpacityTexture)
-  {
-    id<MTLTexture> goTex = (__bridge id<MTLTexture>)this->GradientOpacityTexture;
-    [encoder setFragmentTexture:goTex atIndex:3];
-  }
-  else
-  {
-    [encoder setFragmentTexture:tfTex atIndex:3];
-  }
-
-  // Bind mask / label map textures (fragment index 4).
-  id<MTLTexture> maskFallbackTex =
-    (__bridge id<MTLTexture>)this->DummyMaskTexture;
-  if (this->MaskTexture)
-  {
-    id<MTLTexture> maskTex = (__bridge id<MTLTexture>)this->MaskTexture;
-    [encoder setFragmentTexture:maskTex atIndex:4];
-  }
-  else
-  {
-    [encoder setFragmentTexture:maskFallbackTex atIndex:4];
-  }
-
-  // Bind label map transfer texture (fragment index 5)
-  if (this->LabelMapTransferTexture)
-  {
-    id<MTLTexture> lmTex = (__bridge id<MTLTexture>)this->LabelMapTransferTexture;
-    [encoder setFragmentTexture:lmTex atIndex:5];
-  }
-  else
-  {
-    [encoder setFragmentTexture:tfTex atIndex:5];
-  }
-
-  // Bind min-max acceleration texture (fragment index 6).
-  id<MTLTexture> minMaxFallbackTex =
-    (__bridge id<MTLTexture>)this->DummyMinMaxTexture;
-  if (this->MinMaxTexture)
-  {
-    id<MTLTexture> mmTex = (__bridge id<MTLTexture>)this->MinMaxTexture;
-    [encoder setFragmentTexture:mmTex atIndex:6];
-  }
-  else
-  {
-    [encoder setFragmentTexture:minMaxFallbackTex atIndex:6];
-  }
-
-  // Bind precomputed gradient normal texture (fragment index 7).
-  if (this->GradientNormalTexture)
-  {
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->GradientNormalTexture atIndex:7];
-  }
-  else
-  {
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyVolumeTexture atIndex:7];
-  }
+  SetFragmentTextureOrFallback(encoder, 0, this->VolumeTexture, this->DummyVolumeTexture);
+  [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->ColorOpacityTexture atIndex:1];
+  SetFragmentTextureOrFallback(encoder, 2, this->DepthTextureOcclusion, this->DummyDepthTexture);
+  SetFragmentTextureOrFallback(encoder, 3, this->GradientOpacityTexture, this->ColorOpacityTexture);
+  SetFragmentTextureOrFallback(encoder, 4, this->MaskTexture, this->DummyMaskTexture);
+  SetFragmentTextureOrFallback(encoder, 5, this->LabelMapTransferTexture, this->ColorOpacityTexture);
+  SetFragmentTextureOrFallback(encoder, 6, this->MinMaxTexture, this->DummyMinMaxTexture);
+  SetFragmentTextureOrFallback(encoder, 7, this->GradientNormalTexture, this->DummyVolumeTexture);
 }
 
 //------------------------------------------------------------------------------
@@ -5299,62 +5278,14 @@ void vtkMetalGPUVolumeRayCastMapper::BindFullscreenTextures(
   [encoder setFragmentBytes:pbd length:sizeof(PerBlockData) atIndex:2];
   [encoder setFragmentBuffer:uniformBuf offset:0 atIndex:1];
 
-  id<MTLTexture> volTex = volTexVoid
-    ? (__bridge id<MTLTexture>)volTexVoid
-    : (__bridge id<MTLTexture>)this->DummyVolumeTexture;
-  id<MTLTexture> tfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
-  [encoder setFragmentTexture:volTex atIndex:0];
-  [encoder setFragmentTexture:tfTex atIndex:1];
-
-  id<MTLTexture> depthTex = this->DepthTextureOcclusion
-    ? (__bridge id<MTLTexture>)this->DepthTextureOcclusion
-    : (__bridge id<MTLTexture>)this->DummyDepthTexture;
-  [encoder setFragmentTexture:depthTex atIndex:2];
-
-  if (this->GradientOpacityTexture)
-  {
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->GradientOpacityTexture atIndex:3];
-  }
-  else
-  {
-    [encoder setFragmentTexture:tfTex atIndex:3];
-  }
-
-  if (this->MaskTexture)
-  {
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->MaskTexture atIndex:4];
-  }
-  else
-  {
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMaskTexture atIndex:4];
-  }
-
-  if (this->LabelMapTransferTexture)
-  {
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->LabelMapTransferTexture atIndex:5];
-  }
-  else
-  {
-    [encoder setFragmentTexture:tfTex atIndex:5];
-  }
-
-  if (minMaxTexVoid)
-  {
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)minMaxTexVoid atIndex:6];
-  }
-  else
-  {
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMinMaxTexture atIndex:6];
-  }
-
-  if (normalTexVoid)
-  {
-    [encoder setFragmentTexture:(__bridge id<MTLTexture>)normalTexVoid atIndex:7];
-  }
-  else
-  {
-    [encoder setFragmentTexture:volTex atIndex:7];
-  }
+  SetFragmentTextureOrFallback(encoder, 0, volTexVoid, this->DummyVolumeTexture);
+  [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->ColorOpacityTexture atIndex:1];
+  SetFragmentTextureOrFallback(encoder, 2, this->DepthTextureOcclusion, this->DummyDepthTexture);
+  SetFragmentTextureOrFallback(encoder, 3, this->GradientOpacityTexture, this->ColorOpacityTexture);
+  SetFragmentTextureOrFallback(encoder, 4, this->MaskTexture, this->DummyMaskTexture);
+  SetFragmentTextureOrFallback(encoder, 5, this->LabelMapTransferTexture, this->ColorOpacityTexture);
+  SetFragmentTextureOrFallback(encoder, 6, minMaxTexVoid, this->DummyMinMaxTexture);
+  SetFragmentTextureOrFallback(encoder, 7, normalTexVoid, this->DummyVolumeTexture);
 }
 
 //------------------------------------------------------------------------------
@@ -5486,16 +5417,9 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
       BuildPerBlockData(pbd, block, fullExt, origin, spacing);
 
       // Override per-block textures on top of the common textures set by BindEncoderResources
-      id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture;
-      [encoder setFragmentTexture:blockTex atIndex:0];
-      if (block.MinMaxTexture)
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)block.MinMaxTexture atIndex:6];
-      else
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMinMaxTexture atIndex:6];
-      if (block.NormalTexture)
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)block.NormalTexture atIndex:7];
-      else
-        [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->DummyVolumeTexture atIndex:7];
+      SetFragmentTextureOrFallback(encoder, 0, block.Texture, this->DummyVolumeTexture);
+      SetFragmentTextureOrFallback(encoder, 6, block.MinMaxTexture, this->DummyMinMaxTexture);
+      SetFragmentTextureOrFallback(encoder, 7, block.NormalTexture, this->DummyVolumeTexture);
 
       [encoder setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
       [encoder setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
@@ -5816,41 +5740,40 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     }
   }
 
-  double* modelBounds = this->ModelBounds;
-  uniforms.VolumeBoundsMin[0] = static_cast<float>(modelBounds[0]);
-  uniforms.VolumeBoundsMin[1] = static_cast<float>(modelBounds[2]);
-  uniforms.VolumeBoundsMin[2] = static_cast<float>(modelBounds[4]);
-  uniforms.VolumeBoundsMin[3] = 1.0f;
-
-  uniforms.VolumeBoundsMax[0] = static_cast<float>(modelBounds[1]);
-  uniforms.VolumeBoundsMax[1] = static_cast<float>(modelBounds[3]);
-  uniforms.VolumeBoundsMax[2] = static_cast<float>(modelBounds[5]);
-  uniforms.VolumeBoundsMax[3] = 1.0f;
-
-  double boundsSize[3] = {
-    modelBounds[1] - modelBounds[0],
-    modelBounds[3] - modelBounds[2],
-    modelBounds[5] - modelBounds[4]
-  };
+  VolumeBounds vb;
+  vb.Min[0] = this->ModelBounds[0];
+  vb.Max[0] = this->ModelBounds[1];
+  vb.Min[1] = this->ModelBounds[2];
+  vb.Max[1] = this->ModelBounds[3];
+  vb.Min[2] = this->ModelBounds[4];
+  vb.Max[2] = this->ModelBounds[5];
   for (int k = 0; k < 3; ++k)
   {
-    if (boundsSize[k] < 1e-10)
-      boundsSize[k] = 1.0;
+    vb.Size[k] = vb.Max[k] - vb.Min[k];
+    if (vb.Size[k] < 1e-10)
+      vb.Size[k] = 1.0;
   }
+
+  uniforms.VolumeBoundsMin[0] = static_cast<float>(vb.Min[0]);
+  uniforms.VolumeBoundsMin[1] = static_cast<float>(vb.Min[1]);
+  uniforms.VolumeBoundsMin[2] = static_cast<float>(vb.Min[2]);
+  uniforms.VolumeBoundsMin[3] = 1.0f;
+
+  uniforms.VolumeBoundsMax[0] = static_cast<float>(vb.Max[0]);
+  uniforms.VolumeBoundsMax[1] = static_cast<float>(vb.Max[1]);
+  uniforms.VolumeBoundsMax[2] = static_cast<float>(vb.Max[2]);
+  uniforms.VolumeBoundsMax[3] = 1.0f;
 
   double* camPosWorld = ren->GetActiveCamera()->GetPosition();
   double camPosVolume[4] = { camPosWorld[0], camPosWorld[1], camPosWorld[2], 1.0 };
   invModelMatrix->MultiplyPoint(camPosVolume, camPosVolume);
 
-  uniforms.CameraVolumePos[0] =
-    static_cast<float>((camPosVolume[0] - modelBounds[0]) / boundsSize[0]);
-  uniforms.CameraVolumePos[1] =
-    static_cast<float>((camPosVolume[1] - modelBounds[2]) / boundsSize[1]);
-  uniforms.CameraVolumePos[2] =
-    static_cast<float>((camPosVolume[2] - modelBounds[4]) / boundsSize[2]);
+  uniforms.CameraVolumePos[0] = NormalizeToVolumeSpace(vb, 0, camPosVolume[0]);
+  uniforms.CameraVolumePos[1] = NormalizeToVolumeSpace(vb, 1, camPosVolume[1]);
+  uniforms.CameraVolumePos[2] = NormalizeToVolumeSpace(vb, 2, camPosVolume[2]);
   uniforms.CameraVolumePos[3] = 1.0f;
 
-  double maxBoundsSize = std::max({ boundsSize[0], boundsSize[1], boundsSize[2] });
+  double maxBoundsSize = std::max({ vb.Size[0], vb.Size[1], vb.Size[2] });
 
   uniforms.SampleDistanceHalf =
     FloatToHalf(static_cast<float>(actualSampleDistance / maxBoundsSize));
@@ -5928,9 +5851,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     invModelMatrix->MultiplyPoint(camDirLocal, camDirLocal);
     // Account for anisotropic bounds scaling in texture space:
     // direction in [0,1] space must be divided by bounds size to preserve anisotropy
-    camDirLocal[0] /= boundsSize[0];
-    camDirLocal[1] /= boundsSize[1];
-    camDirLocal[2] /= boundsSize[2];
+    camDirLocal[0] /= vb.Size[0];
+    camDirLocal[1] /= vb.Size[1];
+    camDirLocal[2] /= vb.Size[2];
     // Normalize in volume [0,1] space
     double dirLen = sqrt(camDirLocal[0] * camDirLocal[0] + camDirLocal[1] * camDirLocal[1] +
       camDirLocal[2] * camDirLocal[2]);
@@ -5959,30 +5882,22 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       int minIdx = i * 2;
       int maxIdx = i * 2 + 1;
       croppingRegionPlanes[minIdx] =
-        std::max(croppingRegionPlanes[minIdx], modelBounds[minIdx]);
+        std::max(croppingRegionPlanes[minIdx], this->ModelBounds[minIdx]);
       croppingRegionPlanes[minIdx] =
-        std::min(croppingRegionPlanes[minIdx], modelBounds[maxIdx]);
+        std::min(croppingRegionPlanes[minIdx], this->ModelBounds[maxIdx]);
       croppingRegionPlanes[maxIdx] =
-        std::max(croppingRegionPlanes[maxIdx], modelBounds[minIdx]);
+        std::max(croppingRegionPlanes[maxIdx], this->ModelBounds[minIdx]);
       croppingRegionPlanes[maxIdx] =
-        std::min(croppingRegionPlanes[maxIdx], modelBounds[maxIdx]);
+        std::min(croppingRegionPlanes[maxIdx], this->ModelBounds[maxIdx]);
     }
 
     // Convert from model/data coordinates to volume-local [0,1] space.
-    // VTK's GetCroppingRegionPlanes() returns planes in model/data coordinates,
-    // so the direct normalization against modelBounds is correct.
-    uniforms.CroppingPlanes[0] =
-      static_cast<float>((croppingRegionPlanes[0] - modelBounds[0]) / boundsSize[0]);
-    uniforms.CroppingPlanes[1] =
-      static_cast<float>((croppingRegionPlanes[1] - modelBounds[0]) / boundsSize[0]);
-    uniforms.CroppingPlanes[2] =
-      static_cast<float>((croppingRegionPlanes[2] - modelBounds[2]) / boundsSize[1]);
-    uniforms.CroppingPlanes[3] =
-      static_cast<float>((croppingRegionPlanes[3] - modelBounds[2]) / boundsSize[1]);
-    uniforms.CroppingPlanes2[0] =
-      static_cast<float>((croppingRegionPlanes[4] - modelBounds[4]) / boundsSize[2]);
-    uniforms.CroppingPlanes2[1] =
-      static_cast<float>((croppingRegionPlanes[5] - modelBounds[4]) / boundsSize[2]);
+    uniforms.CroppingPlanes[0] = NormalizeToVolumeSpace(vb, 0, croppingRegionPlanes[0]);
+    uniforms.CroppingPlanes[1] = NormalizeToVolumeSpace(vb, 0, croppingRegionPlanes[1]);
+    uniforms.CroppingPlanes[2] = NormalizeToVolumeSpace(vb, 1, croppingRegionPlanes[2]);
+    uniforms.CroppingPlanes[3] = NormalizeToVolumeSpace(vb, 1, croppingRegionPlanes[3]);
+    uniforms.CroppingPlanes2[0] = NormalizeToVolumeSpace(vb, 2, croppingRegionPlanes[4]);
+    uniforms.CroppingPlanes2[1] = NormalizeToVolumeSpace(vb, 2, croppingRegionPlanes[5]);
     uniforms.CroppingPlanes2[2] = 0.0f;
     uniforms.CroppingPlanes2[3] = 0.0f;
 
@@ -6300,16 +6215,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
             MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, featureMask);
           this->BindEncoderResources(layerEnc, uniformBuf, layerPso, false);
           // Override the global textures BindEncoderResources set with per-block textures
-          [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.Texture atIndex:0];
-          if (block.MinMaxTexture)
-            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.MinMaxTexture atIndex:6];
-          else
-            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)this->DummyMinMaxTexture atIndex:6];
-          // Override index 7 with per-block normal texture if available
-          if (block.NormalTexture)
-          {
-            [layerEnc setFragmentTexture:(__bridge id<MTLTexture>)block.NormalTexture atIndex:7];
-          }
+          SetFragmentTextureOrFallback(layerEnc, 0, block.Texture, this->DummyVolumeTexture);
+          SetFragmentTextureOrFallback(layerEnc, 6, block.MinMaxTexture, this->DummyMinMaxTexture);
+          SetFragmentTextureOrFallback(layerEnc, 7, block.NormalTexture, this->DummyVolumeTexture);
 
           [layerEnc setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
           [layerEnc setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
