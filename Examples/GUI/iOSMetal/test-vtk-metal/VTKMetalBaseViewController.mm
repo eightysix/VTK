@@ -356,8 +356,8 @@
 
   [self rotateCameraForNextFrame];
 
-  // Stop after 3 full rotations, with a safety cap at 3000 frames
-  BOOL shouldStop = (_benchmarkAccumulatedAngle >= 1080.0) || (_benchmarkTotalFrames >= 3000);
+  // Stop after 1.5 full rotations, with a safety cap at 3000 frames
+  BOOL shouldStop = (_benchmarkAccumulatedAngle >= 540.0) || (_benchmarkTotalFrames >= 3000);
   if (shouldStop)
   {
     [self stopBenchmark];
