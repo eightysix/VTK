@@ -790,6 +790,56 @@ static void AssignR8MinMaxTexture(
   AssignMetalObject(slot, tex);
 }
 
+//------------------------------------------------------------------------------
+static void EncodeGPUMinMaxDilation(
+  id<MTLComputeCommandEncoder> enc,
+  id<MTLDevice> device,
+  id<MTLTexture> volumeTex,
+  id<MTLTexture> outputTex,
+  const int volumeDims[3],
+  const int minMaxDims[3],
+  const MinMaxComputeUniforms& uniforms,
+  id<MTLComputePipelineState> minMaxPipeline,
+  id<MTLComputePipelineState> dilatePipeline)
+{
+  id<MTLTexture> scratchTex = CreateR8MinMaxTexture(
+    device,
+    minMaxDims[0],
+    minMaxDims[1],
+    minMaxDims[2],
+    MTLStorageModePrivate,
+    MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+
+  if (!scratchTex)
+  {
+    return;
+  }
+
+  MTLSize gridSize = MTLSizeMake(
+    static_cast<NSUInteger>(minMaxDims[0]),
+    static_cast<NSUInteger>(minMaxDims[1]),
+    static_cast<NSUInteger>(minMaxDims[2]));
+
+  NSUInteger tgw = 8;
+  MTLSize threadgroupSize = MTLSizeMake(
+    std::min(tgw, static_cast<NSUInteger>(minMaxDims[0])),
+    std::min(tgw, static_cast<NSUInteger>(minMaxDims[1])),
+    std::min(tgw, static_cast<NSUInteger>(minMaxDims[2])));
+
+  [enc setComputePipelineState:minMaxPipeline];
+  [enc setTexture:volumeTex atIndex:0];
+  [enc setTexture:scratchTex atIndex:1];
+  [enc setBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+  [enc dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+
+  [enc setComputePipelineState:dilatePipeline];
+  [enc setTexture:scratchTex atIndex:0];
+  [enc setTexture:outputTex atIndex:1];
+  [enc dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+
+  [scratchTex release];
+}
+
 }
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -2625,29 +2675,8 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
 
   @autoreleasepool
   {
-    // --- Reuse or create temporary occupancy texture ---
-    id<MTLTexture> rawOcc = (__bridge id<MTLTexture>)this->MinMaxScratchTexture;
-    if (!rawOcc ||
-        rawOcc.width != static_cast<NSUInteger>(mmDims[0]) ||
-        rawOcc.height != static_cast<NSUInteger>(mmDims[1]) ||
-        rawOcc.depth != static_cast<NSUInteger>(mmDims[2]) ||
-        rawOcc.storageMode != MTLStorageModePrivate ||
-        rawOcc.pixelFormat != MTLPixelFormatR8Unorm)
-    {
-      rawOcc = CreateR8MinMaxTexture(
-        device,
-        mmDims[0],
-        mmDims[1],
-        mmDims[2],
-        MTLStorageModePrivate,
-        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
-
-      if (!rawOcc)
-      {
-        return false;
-      }
-      AssignMetalObject(this->MinMaxScratchTexture, rawOcc);
-    }
+    // Release old scratch texture (helper creates its own)
+    ReleaseMetalObject(this->MinMaxScratchTexture);
 
     // --- Build opacity prefix table from transfer function ---
     vtkVolumeProperty* property = vol ? vol->GetProperty() : nullptr;
@@ -2690,25 +2719,7 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     u._pad = 0.0f;
     memcpy(u.opacityPrefix, opacityPrefix, sizeof(opacityPrefix));
 
-    // --- Command buffer ---
-    id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
-    cmdBuf.label = @"VTK Volume MinMax Compute";
-
-    // --- Dispatch kernel 1: macrocell occupancy ---
-    id<MTLComputeCommandEncoder> enc1 = [cmdBuf computeCommandEncoder];
-    enc1.label = @"Volume Compute MinMax";
-    [enc1 setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->MinMaxComputePipeline];
-    [enc1 setTexture:volTex atIndex:0];
-    [enc1 setTexture:rawOcc atIndex:1];
-    [enc1 setBytes:&u length:sizeof(u) atIndex:0];
-
-    MTLSize gridSize = MTLSizeMake(mmDims[0], mmDims[1], mmDims[2]);
-    NSUInteger tgw = 8;
-    MTLSize tgSize = MTLSizeMake(tgw, tgw, tgw);
-    [enc1 dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
-    [enc1 endEncoding];
-
-    // --- Reuse or create persistent MinMax texture (dilation writes here directly) ---
+    // --- Reuse or create persistent MinMax texture ---
     id<MTLTexture> permTex = (__bridge id<MTLTexture>)this->MinMaxTexture;
     if (!permTex ||
         permTex.width != static_cast<NSUInteger>(mmDims[0]) ||
@@ -2732,15 +2743,24 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
       AssignMetalObject(this->MinMaxTexture, permTex);
     }
 
-    // --- Dispatch kernel 2: dilation (writes directly to permTex) ---
-    id<MTLComputeCommandEncoder> enc2 = [cmdBuf computeCommandEncoder];
-    enc2.label = @"Volume Dilate MinMax";
-    [enc2 setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->DilateComputePipeline];
-    [enc2 setTexture:rawOcc atIndex:0];
-    [enc2 setTexture:permTex atIndex:1];
-    [enc2 dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
-    [enc2 endEncoding];
+    // --- Command buffer ---
+    id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+    cmdBuf.label = @"VTK Volume MinMax Compute";
+    id<MTLComputeCommandEncoder> mmEnc = [cmdBuf computeCommandEncoder];
+    mmEnc.label = @"Volume Compute MinMax";
 
+    EncodeGPUMinMaxDilation(
+      mmEnc,
+      device,
+      volTex,
+      permTex,
+      dims,
+      mmDims,
+      u,
+      (__bridge id<MTLComputePipelineState>)this->MinMaxComputePipeline,
+      (__bridge id<MTLComputePipelineState>)this->DilateComputePipeline);
+
+    [mmEnc endEncoding];
     [cmdBuf commit];
 
     this->MinMaxUploadTime.Modified();
@@ -3708,14 +3728,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
 
     [blit endEncoding];
 
-    // Phase 5b: GPU per-block min-max texture generation for partitioned volumes.
-    // After all block textures are uploaded, dispatch volume_compute_minmax and
-    // volume_dilate_minmax compute kernels per block, reusing the same shaders
-    // as the single-block GPU min-max path but with per-block texture bindings.
     if (this->UseGPUMinMax && hasOpacityFunc &&
         this->EnsureMinMaxComputePipelines(mtlDeviceVoid))
     {
-      // Build opacity prefix table from the transfer function
       double scalarRange = this->ScalarRange[1] - this->ScalarRange[0];
       if (scalarRange <= 0.0) scalarRange = 1.0;
       float normFactor = this->ScalarNormalizationFactor;
@@ -3743,15 +3758,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
         int bdims[3] = { block.Dims[0], block.Dims[1], block.Dims[2] };
         int mmDims[3] = { block.MinMaxDims[0], block.MinMaxDims[1], block.MinMaxDims[2] };
 
-        id<MTLTexture> scratchTex = CreateR8MinMaxTexture(
-          device,
-          mmDims[0],
-          mmDims[1],
-          mmDims[2],
-          MTLStorageModePrivate,
-          MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
-        if (!scratchTex) continue;
-
         id<MTLTexture> mmTex = CreateR8MinMaxTexture(
           device,
           mmDims[0],
@@ -3759,10 +3765,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
           mmDims[2],
           MTLStorageModePrivate,
           MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
-        if (!mmTex) { [scratchTex release]; continue; }
+        if (!mmTex) continue;
         AssignMetalObject(block.MinMaxTexture, mmTex);
 
-        // Setup uniforms for this block
         mmu.mmDimX = static_cast<uint32_t>(mmDims[0]);
         mmu.mmDimY = static_cast<uint32_t>(mmDims[1]);
         mmu.mmDimZ = static_cast<uint32_t>(mmDims[2]);
@@ -3770,30 +3775,16 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
         mmu.volDimY = static_cast<uint32_t>(bdims[1]);
         mmu.volDimZ = static_cast<uint32_t>(bdims[2]);
 
-        // Dispatch volume_compute_minmax: blockTex -> scratchTex
-        [mmEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->MinMaxComputePipeline];
-        [mmEnc setTexture:blockTex atIndex:0];
-        [mmEnc setTexture:scratchTex atIndex:1];
-        [mmEnc setBytes:&mmu length:sizeof(mmu) atIndex:0];
-
-        MTLSize gridSize = MTLSizeMake(
-          static_cast<NSUInteger>(mmDims[0]),
-          static_cast<NSUInteger>(mmDims[1]),
-          static_cast<NSUInteger>(mmDims[2]));
-        NSUInteger tgw = 8;
-        MTLSize tgSize = MTLSizeMake(
-          std::min(tgw, static_cast<NSUInteger>(mmDims[0])),
-          std::min(tgw, static_cast<NSUInteger>(mmDims[1])),
-          std::min(tgw, static_cast<NSUInteger>(mmDims[2])));
-        [mmEnc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
-
-        // Dispatch volume_dilate_minmax: scratchTex -> mmTex
-        [mmEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->DilateComputePipeline];
-        [mmEnc setTexture:scratchTex atIndex:0];
-        [mmEnc setTexture:mmTex atIndex:1];
-        [mmEnc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
-
-        [scratchTex release];
+        EncodeGPUMinMaxDilation(
+          mmEnc,
+          device,
+          blockTex,
+          mmTex,
+          bdims,
+          mmDims,
+          mmu,
+          (__bridge id<MTLComputePipelineState>)this->MinMaxComputePipeline,
+          (__bridge id<MTLComputePipelineState>)this->DilateComputePipeline);
       }
 
       [mmEnc endEncoding];
@@ -4177,15 +4168,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockMinMaxTextures(
         int bdims[3] = { block.Dims[0], block.Dims[1], block.Dims[2] };
         int mmDimsL[3] = { block.MinMaxDims[0], block.MinMaxDims[1], block.MinMaxDims[2] };
 
-        id<MTLTexture> scratchTex = CreateR8MinMaxTexture(
-          device,
-          mmDimsL[0],
-          mmDimsL[1],
-          mmDimsL[2],
-          MTLStorageModePrivate,
-          MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
-        if (!scratchTex) continue;
-
         id<MTLTexture> mmTex = CreateR8MinMaxTexture(
           device,
           mmDimsL[0],
@@ -4193,7 +4175,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockMinMaxTextures(
           mmDimsL[2],
           MTLStorageModePrivate,
           MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
-        if (!mmTex) { [scratchTex release]; continue; }
+        if (!mmTex) continue;
         AssignMetalObject(block.MinMaxTexture, mmTex);
 
         mmu.mmDimX = static_cast<uint32_t>(mmDimsL[0]);
@@ -4203,30 +4185,16 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockMinMaxTextures(
         mmu.volDimY = static_cast<uint32_t>(bdims[1]);
         mmu.volDimZ = static_cast<uint32_t>(bdims[2]);
 
-        // volume_compute_minmax: blockTex -> scratchTex
-        [mmEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->MinMaxComputePipeline];
-        [mmEnc setTexture:blockTex atIndex:0];
-        [mmEnc setTexture:scratchTex atIndex:1];
-        [mmEnc setBytes:&mmu length:sizeof(mmu) atIndex:0];
-
-        MTLSize gridSize = MTLSizeMake(
-          static_cast<NSUInteger>(mmDimsL[0]),
-          static_cast<NSUInteger>(mmDimsL[1]),
-          static_cast<NSUInteger>(mmDimsL[2]));
-        NSUInteger tgw = 8;
-        MTLSize tgSize = MTLSizeMake(
-          std::min(tgw, static_cast<NSUInteger>(mmDimsL[0])),
-          std::min(tgw, static_cast<NSUInteger>(mmDimsL[1])),
-          std::min(tgw, static_cast<NSUInteger>(mmDimsL[2])));
-        [mmEnc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
-
-        // volume_dilate_minmax: scratchTex -> mmTex
-        [mmEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->DilateComputePipeline];
-        [mmEnc setTexture:scratchTex atIndex:0];
-        [mmEnc setTexture:mmTex atIndex:1];
-        [mmEnc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
-
-        [scratchTex release];
+        EncodeGPUMinMaxDilation(
+          mmEnc,
+          device,
+          blockTex,
+          mmTex,
+          bdims,
+          mmDimsL,
+          mmu,
+          (__bridge id<MTLComputePipelineState>)this->MinMaxComputePipeline,
+          (__bridge id<MTLComputePipelineState>)this->DilateComputePipeline);
       }
       [mmEnc endEncoding];
       [mmCmdBuf commit];
