@@ -361,6 +361,125 @@ void ConvertVolumeData(const void* src, int dataType, int numComponents,
   }
 }
 
+//------------------------------------------------------------------------------
+struct VolumeFormat
+{
+  MTLPixelFormat Format = MTLPixelFormatInvalid;
+  int BytesPerComponent = 0;
+  float NormalizationFactor = 1.0f;
+  bool NeedsConversion = false;
+};
+
+static VolumeFormat ChooseVolumeFormat(
+  int dataType,
+  int numComponents,
+  const double scalarRange[2],
+  bool preferHalf)
+{
+  VolumeFormat fmt;
+  const int componentsForFormat = (numComponents == 3) ? 4 : numComponents;
+  const bool useHalf =
+    preferHalf && HalfRangeIsSafe(scalarRange[0], scalarRange[1]);
+
+  switch (dataType)
+  {
+    case VTK_FLOAT:
+      if (useHalf)
+      {
+        fmt.BytesPerComponent = 2;
+        fmt.NeedsConversion = true;
+        fmt.NormalizationFactor = 1.0f;
+        switch (componentsForFormat)
+        {
+          case 1: fmt.Format = MTLPixelFormatR16Float; break;
+          case 2: fmt.Format = MTLPixelFormatRG16Float; break;
+          default: fmt.Format = MTLPixelFormatRGBA16Float; break;
+        }
+      }
+      else
+      {
+        fmt.BytesPerComponent = 4;
+        fmt.NeedsConversion = false;
+        fmt.NormalizationFactor = 1.0f;
+        switch (componentsForFormat)
+        {
+          case 1: fmt.Format = MTLPixelFormatR32Float; break;
+          case 2: fmt.Format = MTLPixelFormatRG32Float; break;
+          default: fmt.Format = MTLPixelFormatRGBA32Float; break;
+        }
+      }
+      break;
+
+    case VTK_UNSIGNED_CHAR:
+      fmt.BytesPerComponent = 1;
+      fmt.NeedsConversion = false;
+      fmt.NormalizationFactor = 255.0f;
+      switch (componentsForFormat)
+      {
+        case 1: fmt.Format = MTLPixelFormatR8Unorm; break;
+        case 2: fmt.Format = MTLPixelFormatRG8Unorm; break;
+        default: fmt.Format = MTLPixelFormatRGBA8Unorm; break;
+      }
+      break;
+
+    case VTK_UNSIGNED_SHORT:
+      if (scalarRange[0] >= 0.0 && scalarRange[1] <= 255.0)
+      {
+        fmt.BytesPerComponent = 1;
+        fmt.NeedsConversion = false;
+        fmt.NormalizationFactor = 255.0f;
+        switch (componentsForFormat)
+        {
+          case 1: fmt.Format = MTLPixelFormatR8Unorm; break;
+          case 2: fmt.Format = MTLPixelFormatRG8Unorm; break;
+          default: fmt.Format = MTLPixelFormatRGBA8Unorm; break;
+        }
+      }
+      else
+      {
+        fmt.BytesPerComponent = 2;
+        fmt.NeedsConversion = false;
+        fmt.NormalizationFactor = 65535.0f;
+        switch (componentsForFormat)
+        {
+          case 1: fmt.Format = MTLPixelFormatR16Unorm; break;
+          case 2: fmt.Format = MTLPixelFormatRG16Unorm; break;
+          default: fmt.Format = MTLPixelFormatRGBA16Unorm; break;
+        }
+      }
+      break;
+
+    default:
+      if (useHalf)
+      {
+        fmt.BytesPerComponent = 2;
+        fmt.NeedsConversion = true;
+        fmt.NormalizationFactor = 1.0f;
+        switch (componentsForFormat)
+        {
+          case 1: fmt.Format = MTLPixelFormatR16Float; break;
+          case 2: fmt.Format = MTLPixelFormatRG16Float; break;
+          default: fmt.Format = MTLPixelFormatRGBA16Float; break;
+        }
+      }
+      else
+      {
+        fmt.BytesPerComponent = 4;
+        fmt.NeedsConversion = true;
+        fmt.NormalizationFactor = 1.0f;
+        switch (componentsForFormat)
+        {
+          case 1: fmt.Format = MTLPixelFormatR32Float; break;
+          case 2: fmt.Format = MTLPixelFormatRG32Float; break;
+          default: fmt.Format = MTLPixelFormatRGBA32Float; break;
+        }
+      }
+      break;
+  }
+
+  return fmt;
+}
+
 // Release a Metal object held as a void* member (MRC helper).
 // Uses -release rather than CFRelease for proper Objective-C semantics.
 inline void ReleaseMetalObject(void*& obj)
@@ -1136,173 +1255,16 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       this->ModelBounds[5] = std::max(z0, z1);
 
       // Select optimal texture format for this data type
-      int componentsForFormat = (numComponents == 3) ? 4 : numComponents;
-
-      struct FormatInfo
-      {
-        MTLPixelFormat format;
-        int bytesPerComponent;
-        float normalizationFactor;
-        bool needsConversion;
-      };
-
-      FormatInfo fmtInfo = {};
-      fmtInfo.needsConversion = true;
-      fmtInfo.normalizationFactor = 1.0f;
-
+      VolumeFormat fmtInfo = ChooseVolumeFormat(
+        dataType, numComponents, this->ScalarRange, this->PreferHalfPrecision);
       bool useHalf = this->PreferHalfPrecision &&
         HalfRangeIsSafe(this->ScalarRange[0], this->ScalarRange[1]);
-
-      switch (dataType)
-      {
-        case VTK_FLOAT:
-        {
-          if (useHalf)
-          {
-            fmtInfo.bytesPerComponent = 2;
-            fmtInfo.needsConversion = true;
-            fmtInfo.normalizationFactor = 1.0f;
-            switch (componentsForFormat)
-            {
-              case 1:
-                fmtInfo.format = MTLPixelFormatR16Float;
-                break;
-              case 2:
-                fmtInfo.format = MTLPixelFormatRG16Float;
-                break;
-              default:
-                fmtInfo.format = MTLPixelFormatRGBA16Float;
-                break;
-            }
-          }
-          else
-          {
-            fmtInfo.bytesPerComponent = 4;
-            fmtInfo.needsConversion = false;
-            fmtInfo.normalizationFactor = 1.0f;
-            switch (componentsForFormat)
-            {
-              case 1:
-                fmtInfo.format = MTLPixelFormatR32Float;
-                break;
-              case 2:
-                fmtInfo.format = MTLPixelFormatRG32Float;
-                break;
-              default:
-                fmtInfo.format = MTLPixelFormatRGBA32Float;
-                break;
-            }
-          }
-          break;
-        }
-        case VTK_UNSIGNED_CHAR:
-        {
-          fmtInfo.bytesPerComponent = 1;
-          fmtInfo.needsConversion = false;
-          fmtInfo.normalizationFactor = 255.0f;
-          switch (componentsForFormat)
-          {
-            case 1:
-              fmtInfo.format = MTLPixelFormatR8Unorm;
-              break;
-            case 2:
-              fmtInfo.format = MTLPixelFormatRG8Unorm;
-              break;
-            default:
-              fmtInfo.format = MTLPixelFormatRGBA8Unorm;
-              break;
-          }
-          break;
-        }
-        case VTK_UNSIGNED_SHORT:
-        {
-          if (this->ScalarRange[0] >= 0.0 && this->ScalarRange[1] <= 255.0)
-          {
-            fmtInfo.bytesPerComponent = 1;
-            fmtInfo.needsConversion = false;
-            fmtInfo.normalizationFactor = 255.0f;
-            switch (componentsForFormat)
-            {
-              case 1:
-                fmtInfo.format = MTLPixelFormatR8Unorm;
-                break;
-              case 2:
-                fmtInfo.format = MTLPixelFormatRG8Unorm;
-                break;
-              default:
-                fmtInfo.format = MTLPixelFormatRGBA8Unorm;
-                break;
-            }
-          }
-          else
-          {
-            fmtInfo.bytesPerComponent = 2;
-            fmtInfo.needsConversion = false;
-            fmtInfo.normalizationFactor = 65535.0f;
-            switch (componentsForFormat)
-            {
-              case 1:
-                fmtInfo.format = MTLPixelFormatR16Unorm;
-                break;
-              case 2:
-                fmtInfo.format = MTLPixelFormatRG16Unorm;
-                break;
-              default:
-                fmtInfo.format = MTLPixelFormatRGBA16Unorm;
-                break;
-            }
-          }
-          break;
-        }
-        default:
-        {
-
-          if (useHalf)
-          {
-            fmtInfo.bytesPerComponent = 2;
-            fmtInfo.needsConversion = true;
-            fmtInfo.normalizationFactor = 1.0f;
-            switch (componentsForFormat)
-            {
-              case 1:
-                fmtInfo.format = MTLPixelFormatR16Float;
-                break;
-              case 2:
-                fmtInfo.format = MTLPixelFormatRG16Float;
-                break;
-              default:
-                fmtInfo.format = MTLPixelFormatRGBA16Float;
-                break;
-            }
-          }
-          else
-          {
-            fmtInfo.bytesPerComponent = 4;
-            fmtInfo.needsConversion = true;
-            fmtInfo.normalizationFactor = 1.0f;
-            switch (componentsForFormat)
-            {
-              case 1:
-                fmtInfo.format = MTLPixelFormatR32Float;
-                break;
-              case 2:
-                fmtInfo.format = MTLPixelFormatRG32Float;
-                break;
-              default:
-                fmtInfo.format = MTLPixelFormatRGBA32Float;
-                break;
-            }
-          }
-          break;
-        }
-      }
-
-      this->ScalarNormalizationFactor = fmtInfo.normalizationFactor;
+      this->ScalarNormalizationFactor = fmtInfo.NormalizationFactor;
 
       bool gpuConversionUsed = false;
 
       int actualComponents = (numComponents == 3) ? 4 : numComponents;
-      NSUInteger bytesPerRow = static_cast<NSUInteger>(dims[0]) * fmtInfo.bytesPerComponent *
+      NSUInteger bytesPerRow = static_cast<NSUInteger>(dims[0]) * fmtInfo.BytesPerComponent *
         actualComponents;
       NSUInteger bytesPerImage = bytesPerRow * dims[1];
       NSUInteger totalBytes = bytesPerImage * dims[2];
@@ -1310,7 +1272,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       // Phase 7: GPU data type conversion (replaces CPU vtkSMPTools loop)
       // For short/int/uint/double data types, dispatch a Metal compute kernel
       // that reads from a shared buffer and writes directly to the 3D texture.
-      if (fmtInfo.needsConversion && this->UseGPUConversion)
+      if (fmtInfo.NeedsConversion && this->UseGPUConversion)
       {
         // Determine kernel name based on (dataType, useHalf) pair
         const char* kernelName = nullptr;
@@ -1361,7 +1323,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
 
           MTLTextureDescriptor* texDesc = [[MTLTextureDescriptor alloc] init];
           texDesc.textureType = MTLTextureType3D;
-          texDesc.pixelFormat = fmtInfo.format;
+          texDesc.pixelFormat = fmtInfo.Format;
           texDesc.width = dims[0];
           texDesc.height = dims[1];
           texDesc.depth = dims[2];
@@ -1418,7 +1380,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
         }
         void* uploadPointer = [stagingBuf contents];
 
-        if (fmtInfo.needsConversion)
+        if (fmtInfo.NeedsConversion)
         {
           ConvertVolumeData(scalars->GetVoidPointer(0), dataType, numComponents,
             numTuples, uploadPointer, useHalf, actualComponents, scalars);
@@ -1494,7 +1456,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           oldTex.width == static_cast<NSUInteger>(dims[0]) &&
           oldTex.height == static_cast<NSUInteger>(dims[1]) &&
           oldTex.depth == static_cast<NSUInteger>(dims[2]) &&
-          oldTex.pixelFormat == fmtInfo.format)
+          oldTex.pixelFormat == fmtInfo.Format)
       {
         tex = oldTex;
       }
@@ -1504,7 +1466,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
 
         MTLTextureDescriptor* texDesc = [[MTLTextureDescriptor alloc] init];
         texDesc.textureType = MTLTextureType3D;
-        texDesc.pixelFormat = fmtInfo.format;
+        texDesc.pixelFormat = fmtInfo.Format;
         texDesc.width = static_cast<NSUInteger>(dims[0]);
         texDesc.height = static_cast<NSUInteger>(dims[1]);
         texDesc.depth = static_cast<NSUInteger>(dims[2]);
@@ -2988,144 +2950,15 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
     input->GetExtent(fullExt);
 
     int dataType = scalars->GetDataType();
-    int componentsForFormat = (numComponents == 3) ? 4 : numComponents;
 
     // Determine pixel format (same logic as single-texture path)
-    MTLPixelFormat pixelFormat;
-    int bytesPerComponent = 2;
-    float normalizationFactor = 1.0f;
     bool blockUseHalf = this->PreferHalfPrecision &&
       HalfRangeIsSafe(this->ScalarRange[0], this->ScalarRange[1]);
-
-    switch (dataType)
-    {
-      case VTK_FLOAT:
-        if (blockUseHalf)
-        {
-          bytesPerComponent = 2;
-          normalizationFactor = 1.0f;
-          switch (componentsForFormat)
-          {
-            case 1:
-              pixelFormat = MTLPixelFormatR16Float;
-              break;
-            case 2:
-              pixelFormat = MTLPixelFormatRG16Float;
-              break;
-            default:
-              pixelFormat = MTLPixelFormatRGBA16Float;
-              break;
-          }
-        }
-        else
-        {
-          bytesPerComponent = 4;
-          normalizationFactor = 1.0f;
-          switch (componentsForFormat)
-          {
-            case 1:
-              pixelFormat = MTLPixelFormatR32Float;
-              break;
-            case 2:
-              pixelFormat = MTLPixelFormatRG32Float;
-              break;
-            default:
-              pixelFormat = MTLPixelFormatRGBA32Float;
-              break;
-          }
-        }
-        break;
-      case VTK_UNSIGNED_CHAR:
-        bytesPerComponent = 1;
-        normalizationFactor = 255.0f;
-        switch (componentsForFormat)
-        {
-          case 1:
-            pixelFormat = MTLPixelFormatR8Unorm;
-            break;
-          case 2:
-            pixelFormat = MTLPixelFormatRG8Unorm;
-            break;
-          default:
-            pixelFormat = MTLPixelFormatRGBA8Unorm;
-            break;
-        }
-        break;
-      case VTK_UNSIGNED_SHORT:
-        if (this->ScalarRange[0] >= 0.0 && this->ScalarRange[1] <= 255.0)
-        {
-          bytesPerComponent = 1;
-          normalizationFactor = 255.0f;
-          switch (componentsForFormat)
-          {
-            case 1:
-              pixelFormat = MTLPixelFormatR8Unorm;
-              break;
-            case 2:
-              pixelFormat = MTLPixelFormatRG8Unorm;
-              break;
-            default:
-              pixelFormat = MTLPixelFormatRGBA8Unorm;
-              break;
-          }
-        }
-        else
-        {
-          bytesPerComponent = 2;
-          normalizationFactor = 65535.0f;
-          switch (componentsForFormat)
-          {
-            case 1:
-              pixelFormat = MTLPixelFormatR16Unorm;
-              break;
-            case 2:
-              pixelFormat = MTLPixelFormatRG16Unorm;
-              break;
-            default:
-              pixelFormat = MTLPixelFormatRGBA16Unorm;
-              break;
-          }
-        }
-        break;
-      default:
-      {
-        if (blockUseHalf)
-        {
-          bytesPerComponent = 2;
-          normalizationFactor = 1.0f;
-          switch (componentsForFormat)
-          {
-            case 1:
-              pixelFormat = MTLPixelFormatR16Float;
-              break;
-            case 2:
-              pixelFormat = MTLPixelFormatRG16Float;
-              break;
-            default:
-              pixelFormat = MTLPixelFormatRGBA16Float;
-              break;
-          }
-        }
-        else
-        {
-          bytesPerComponent = 4;
-          normalizationFactor = 1.0f;
-          switch (componentsForFormat)
-          {
-            case 1:
-              pixelFormat = MTLPixelFormatR32Float;
-              break;
-            case 2:
-              pixelFormat = MTLPixelFormatRG32Float;
-              break;
-            default:
-              pixelFormat = MTLPixelFormatRGBA32Float;
-              break;
-          }
-        }
-        break;
-      }
-    }
+    VolumeFormat fmtInfo = ChooseVolumeFormat(
+      dataType, numComponents, this->ScalarRange, this->PreferHalfPrecision);
+    MTLPixelFormat pixelFormat = fmtInfo.Format;
+    int bytesPerComponent = fmtInfo.BytesPerComponent;
+    float normalizationFactor = fmtInfo.NormalizationFactor;
 
     this->ScalarNormalizationFactor = normalizationFactor;
 
@@ -3157,15 +2990,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
     NSUInteger srcBytesPerImage = srcBytesPerRow * fullDims[1];
     NSUInteger totalVolumeBytes = srcBytesPerImage * fullDims[2];
 
-    // Convert data types that don't match the chosen pixel format.
-    // For single-component float data, use Accelerate (NEON-vectorized) for
-    // the float-to-half conversion instead of the scalar FloatToHalf loop.
-    bool needsConversion = (dataType != VTK_UNSIGNED_CHAR &&
-      dataType != VTK_UNSIGNED_SHORT);
-    if (dataType == VTK_FLOAT && !blockUseHalf)
-    {
-      needsConversion = false;
-    }
+    bool needsConversion = fmtInfo.NeedsConversion;
 
     // Use one command buffer for all work (conversion, upload, minmax, normals)
     id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
