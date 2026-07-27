@@ -1438,6 +1438,93 @@ inline int computeCropRegion(float3 cropMin, float3 cropMax, float3 pos) {
   return r.x + r.y * 3 + r.z * 9;
 }
 
+struct RaySetup {
+    float3 entryPoint;
+    float3 exitPoint;
+    float3 rayDir;
+    float totalDist;
+    float tTerminateMax;
+    float totalBoxT;
+    bool valid;
+};
+
+inline void computeVolumeBounds(
+    constant PerBlockData& b,
+    constant VolumeMapperUniforms& volumeUniforms,
+    thread float3& blockMinGlobal,
+    thread float3& blockMaxGlobal,
+    thread float3& texMinGlobal,
+    thread float3& texMaxGlobal)
+{
+    float3 bsz = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+    blockMinGlobal = (b.volumeBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / bsz;
+    blockMaxGlobal = (b.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / bsz;
+    texMinGlobal = (b.textureBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / bsz;
+    texMaxGlobal = (b.textureBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / bsz;
+}
+
+inline RaySetup setupVolumeRay(
+    float3 cameraPos,
+    float3 rayDir,
+    float3 blockMinGlobal,
+    float3 blockMaxGlobal,
+    float2 screenPos,
+    float2 viewportSize,
+    constant VolumeMapperUniforms& volumeUniforms,
+    texture2d<float> depthTexture)
+{
+    RaySetup s;
+    s.rayDir = rayDir;
+    s.valid = false;
+
+    float2 t = intersectBox(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal);
+    float tStart = max(t.x, 0.0);
+    if (tStart >= t.y) return s;
+
+    s.entryPoint = cameraPos + rayDir * tStart;
+    s.exitPoint = cameraPos + rayDir * t.y;
+    s.totalDist = length(s.exitPoint - s.entryPoint);
+    s.totalBoxT = t.y - tStart;
+
+    if (volumeUniforms.useClipping > 0.5) {
+        int numClipPlanes = int(volumeUniforms.numClippingPlanes);
+        float4 planeOrigins[8] = { volumeUniforms.clippingPlane0Origin, volumeUniforms.clippingPlane1Origin, volumeUniforms.clippingPlane2Origin, volumeUniforms.clippingPlane3Origin, volumeUniforms.clippingPlane4Origin, volumeUniforms.clippingPlane5Origin, volumeUniforms.clippingPlane6Origin, volumeUniforms.clippingPlane7Origin };
+        float4 planeNormals[8] = { volumeUniforms.clippingPlane0Normal, volumeUniforms.clippingPlane1Normal, volumeUniforms.clippingPlane2Normal, volumeUniforms.clippingPlane3Normal, volumeUniforms.clippingPlane4Normal, volumeUniforms.clippingPlane5Normal, volumeUniforms.clippingPlane6Normal, volumeUniforms.clippingPlane7Normal };
+
+        #pragma unroll
+        for (int cp = 0; cp < numClipPlanes; cp++) {
+            float3 planeOrigin = planeOrigins[cp].xyz;
+            float3 planeNormal = normalize(planeNormals[cp].xyz);
+            float startDistance = dot(planeNormal, planeOrigin - s.entryPoint);
+            float stopDistance = dot(planeNormal, planeOrigin - s.exitPoint);
+
+            if (startDistance > 0.0 && stopDistance > 0.0) return s;
+
+            float rayDotNormal = dot(rayDir, planeNormal);
+            if (rayDotNormal > 0.0 && startDistance > 0.0) s.entryPoint += (startDistance / rayDotNormal) * rayDir;
+            if (rayDotNormal <= 0.0 && stopDistance > 0.0) s.exitPoint += (stopDistance / rayDotNormal) * rayDir;
+        }
+        s.totalDist = length(s.exitPoint - s.entryPoint);
+        if (s.totalDist < 1e-6) return s;
+    }
+
+    s.tTerminateMax = 1e30;
+    if (volumeUniforms.useDepthTexture > 0.5) {
+        float depthSample = depthTexture.sample(sNearest, screenPos / viewportSize).r;
+        if (depthSample < 1.0) {
+            float2 ndcXY = (screenPos / viewportSize) * 2.0 - 1.0;
+            float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
+            worldTermination.xyz /= worldTermination.w;
+            float3 terminationLocal = (worldTermination.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+            s.tTerminateMax = dot(terminationLocal - s.entryPoint, rayDir);
+            if (s.tTerminateMax <= 0.0) return s;
+        }
+    }
+
+    s.valid = true;
+    return s;
+}
+
 inline half4 marchVolume(
     float3 entryPoint,
     float3 exitPoint,
@@ -1690,80 +1777,25 @@ fragment VolumeFragmentOut fragment_volume_main(
     texture3d<float> normalTexture [[texture(7)]]) {
 
   VolumeFragmentOut output;
-  float3 blockMinGlobal = (b.volumeBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-  float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-
-  float3 texMinGlobal = (b.textureBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-  float3 texMaxGlobal = (b.textureBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
-  float stepSize = volumeUniforms.sampleDistance;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
 
   float3 rayDir = in.localPos - cameraPos;
   float dirLength = length(rayDir);
-  if (dirLength < 0.0001) {
-    output.color = float4(0.0);
-    return output;
-  }
-
+  if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
   rayDir /= dirLength;
-  float2 t = intersectBox(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal);
-  float tStart = max(t.x, 0.0);
-  if (tStart >= t.y) {
-    output.color = float4(0.0);
-    return output;
-  }
 
-  float3 entryPoint = cameraPos + rayDir * tStart;
-  float3 exitPoint = cameraPos + rayDir * t.y;
-  float totalDist = length(exitPoint - entryPoint);
+  RaySetup s = setupVolumeRay(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { output.color = float4(0.0); return output; }
 
-  if (volumeUniforms.useClipping > 0.5) {
-    int numClipPlanes = int(volumeUniforms.numClippingPlanes);
-    float4 planeOrigins[8] = { volumeUniforms.clippingPlane0Origin, volumeUniforms.clippingPlane1Origin, volumeUniforms.clippingPlane2Origin, volumeUniforms.clippingPlane3Origin, volumeUniforms.clippingPlane4Origin, volumeUniforms.clippingPlane5Origin, volumeUniforms.clippingPlane6Origin, volumeUniforms.clippingPlane7Origin };
-    float4 planeNormals[8] = { volumeUniforms.clippingPlane0Normal, volumeUniforms.clippingPlane1Normal, volumeUniforms.clippingPlane2Normal, volumeUniforms.clippingPlane3Normal, volumeUniforms.clippingPlane4Normal, volumeUniforms.clippingPlane5Normal, volumeUniforms.clippingPlane6Normal, volumeUniforms.clippingPlane7Normal };
-
-    #pragma unroll
-    for (int cp = 0; cp < numClipPlanes; cp++) {
-      float3 planeOrigin = planeOrigins[cp].xyz;
-      float3 planeNormal = normalize(planeNormals[cp].xyz);
-      float startDistance = dot(planeNormal, planeOrigin - entryPoint);
-      float stopDistance = dot(planeNormal, planeOrigin - exitPoint);
-
-      if (startDistance > 0.0 && stopDistance > 0.0) {
-        output.color = float4(0.0);
-        return output;
-      }
-      float rayDotNormal = dot(rayDir, planeNormal);
-
-      if (rayDotNormal > 0.0 && startDistance > 0.0) entryPoint += (startDistance / rayDotNormal) * rayDir;
-      if (rayDotNormal <= 0.0 && stopDistance > 0.0) exitPoint += (stopDistance / rayDotNormal) * rayDir;
-    }
-    totalDist = length(exitPoint - entryPoint);
-    if (totalDist < 1e-6) {
-      output.color = float4(0.0);
-      return output;
-    }
-  }
-
-  float tTerminateMax = 1e30;
-  if (volumeUniforms.useDepthTexture > 0.5) {
-    float depthSample = depthTexture.sample(sNearest, in.position.xy / volumeUniforms.viewportSize).r;
-    if (depthSample < 1.0) {
-      float2 ndcXY = (in.position.xy / volumeUniforms.viewportSize) * 2.0 - 1.0;
-      float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
-      worldTermination.xyz /= worldTermination.w;
-      float3 terminationLocal = (worldTermination.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-      tTerminateMax = dot(terminationLocal - entryPoint, rayDir);
-      if (tTerminateMax <= 0.0)
-      {
-        output.color = float4(0.0);
-        return output;
-      }
-    }
-  }
-
-  half4 _marchResult = marchVolume(entryPoint, exitPoint, totalDist, tTerminateMax, rayDir, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos, stepSize, t.y - tStart, in.position.xy, half3(0.0), 0.0h, volumeUniforms, b, volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture, maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
+  half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos,
+      volumeUniforms.sampleDistance, s.totalBoxT, in.position.xy,
+      half3(0.0), 0.0h, volumeUniforms, b,
+      volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture,
+      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
@@ -1788,84 +1820,29 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
     texture3d<float> normalTexture [[texture(7)]]) {
 
   VolumeFragmentOut output;
-
-  // Reconstruct the pixel ray in global [0,1] space — same convention as the
-  // composite shader (fragment_layer_composite_main).
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
   float2 uv  = in.position.xy / volumeUniforms.viewportSize;
   float2 ndc = uv * 2.0 - 1.0;
   float4 wn = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, 0.0, 1.0); wn.xyz /= wn.w;
   float4 wf = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, 1.0, 1.0); wf.xyz /= wf.w;
-  float3 bszF = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-  float3 localN = ((volumeUniforms.worldToVolume * float4(wn.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bszF;
-  float3 localF = ((volumeUniforms.worldToVolume * float4(wf.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bszF;
+  float3 bsz = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 localN = ((volumeUniforms.worldToVolume * float4(wn.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bsz;
+  float3 localF = ((volumeUniforms.worldToVolume * float4(wf.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bsz;
   float3 rayDir = normalize(localF - localN);
 
-  float3 blockMinGlobal = (b.volumeBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-  float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  RaySetup s = setupVolumeRay(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { output.color = float4(0.0); return output; }
 
-  float3 texMinGlobal = (b.textureBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-  float3 texMaxGlobal = (b.textureBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-
-  float stepSize = volumeUniforms.sampleDistance;
-
-  float2 t = intersectBox(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal);
-  float tStart = max(t.x, 0.0);
-  if (tStart >= t.y) {
-    output.color = float4(0.0);
-    return output;
-  }
-
-  float3 entryPoint = cameraPos + rayDir * tStart;
-  float3 exitPoint = cameraPos + rayDir * t.y;
-  float totalDist = length(exitPoint - entryPoint);
-
-  if (volumeUniforms.useClipping > 0.5) {
-    int numClipPlanes = int(volumeUniforms.numClippingPlanes);
-    float4 planeOrigins[8] = { volumeUniforms.clippingPlane0Origin, volumeUniforms.clippingPlane1Origin, volumeUniforms.clippingPlane2Origin, volumeUniforms.clippingPlane3Origin, volumeUniforms.clippingPlane4Origin, volumeUniforms.clippingPlane5Origin, volumeUniforms.clippingPlane6Origin, volumeUniforms.clippingPlane7Origin };
-    float4 planeNormals[8] = { volumeUniforms.clippingPlane0Normal, volumeUniforms.clippingPlane1Normal, volumeUniforms.clippingPlane2Normal, volumeUniforms.clippingPlane3Normal, volumeUniforms.clippingPlane4Normal, volumeUniforms.clippingPlane5Normal, volumeUniforms.clippingPlane6Normal, volumeUniforms.clippingPlane7Normal };
-
-    #pragma unroll
-    for (int cp = 0; cp < numClipPlanes; cp++) {
-      float3 planeOrigin = planeOrigins[cp].xyz;
-      float3 planeNormal = normalize(planeNormals[cp].xyz);
-      float startDistance = dot(planeNormal, planeOrigin - entryPoint);
-      float stopDistance = dot(planeNormal, planeOrigin - exitPoint);
-
-      if (startDistance > 0.0 && stopDistance > 0.0) {
-        output.color = float4(0.0);
-        return output;
-      }
-      float rayDotNormal = dot(rayDir, planeNormal);
-
-      if (rayDotNormal > 0.0 && startDistance > 0.0) entryPoint += (startDistance / rayDotNormal) * rayDir;
-      if (rayDotNormal <= 0.0 && stopDistance > 0.0) exitPoint += (stopDistance / rayDotNormal) * rayDir;
-    }
-    totalDist = length(exitPoint - entryPoint);
-    if (totalDist < 1e-6) {
-      output.color = float4(0.0);
-      return output;
-    }
-  }
-
-  float tTerminateMax = 1e30;
-  if (volumeUniforms.useDepthTexture > 0.5) {
-    float depthSample = depthTexture.sample(sNearest, in.position.xy / volumeUniforms.viewportSize).r;
-    if (depthSample < 1.0) {
-      float2 ndcXY = (in.position.xy / volumeUniforms.viewportSize) * 2.0 - 1.0;
-      float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
-      worldTermination.xyz /= worldTermination.w;
-      float3 terminationLocal = (worldTermination.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-      tTerminateMax = dot(terminationLocal - entryPoint, rayDir);
-      if (tTerminateMax <= 0.0)
-      {
-        output.color = float4(0.0);
-        return output;
-      }
-    }
-  }
-
-  half4 _marchResult = marchVolume(entryPoint, exitPoint, totalDist, tTerminateMax, rayDir, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos, stepSize, t.y - tStart, in.position.xy, half3(0.0), 0.0h, volumeUniforms, b, volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture, maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
+  half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos,
+      volumeUniforms.sampleDistance, s.totalBoxT, in.position.xy,
+      half3(0.0), 0.0h, volumeUniforms, b,
+      volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture,
+      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
@@ -1889,90 +1866,33 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_accum_main(
     texture3d<float> normalTexture [[texture(7)]]) {
 
   VolumeFragmentOut output;
-
-  // Global ERT: skip if previous blocks already made this pixel opaque
-  if (prevAccum.a >= 0.99h) {
-    discard_fragment();
-  }
-
+  if (prevAccum.a >= 0.99h) discard_fragment();
   half3 accumulatedColor = half3(prevAccum.rgb);
   half accumulatedOpacity = half(prevAccum.a);
 
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
   float2 uv  = in.position.xy / volumeUniforms.viewportSize;
   float2 ndc = uv * 2.0 - 1.0;
   float4 wn = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, 0.0, 1.0); wn.xyz /= wn.w;
   float4 wf = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, 1.0, 1.0); wf.xyz /= wf.w;
-  float3 bszF = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-  float3 localN = ((volumeUniforms.worldToVolume * float4(wn.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bszF;
-  float3 localF = ((volumeUniforms.worldToVolume * float4(wf.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bszF;
+  float3 bsz = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 localN = ((volumeUniforms.worldToVolume * float4(wn.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bsz;
+  float3 localF = ((volumeUniforms.worldToVolume * float4(wf.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bsz;
   float3 rayDir = normalize(localF - localN);
 
-  float3 blockMinGlobal = (b.volumeBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-  float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  RaySetup s = setupVolumeRay(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { output.color = float4(0.0); return output; }
 
-  float3 texMinGlobal = (b.textureBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-  float3 texMaxGlobal = (b.textureBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-
-  float stepSize = volumeUniforms.sampleDistance;
-
-  float2 t = intersectBox(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal);
-  float tStart = max(t.x, 0.0);
-  if (tStart >= t.y) {
-    output.color = float4(0.0);
-    return output;
-  }
-
-  float3 entryPoint = cameraPos + rayDir * tStart;
-  float3 exitPoint = cameraPos + rayDir * t.y;
-  float totalDist = length(exitPoint - entryPoint);
-
-  if (volumeUniforms.useClipping > 0.5) {
-    int numClipPlanes = int(volumeUniforms.numClippingPlanes);
-    float4 planeOrigins[8] = { volumeUniforms.clippingPlane0Origin, volumeUniforms.clippingPlane1Origin, volumeUniforms.clippingPlane2Origin, volumeUniforms.clippingPlane3Origin, volumeUniforms.clippingPlane4Origin, volumeUniforms.clippingPlane5Origin, volumeUniforms.clippingPlane6Origin, volumeUniforms.clippingPlane7Origin };
-    float4 planeNormals[8] = { volumeUniforms.clippingPlane0Normal, volumeUniforms.clippingPlane1Normal, volumeUniforms.clippingPlane2Normal, volumeUniforms.clippingPlane3Normal, volumeUniforms.clippingPlane4Normal, volumeUniforms.clippingPlane5Normal, volumeUniforms.clippingPlane6Normal, volumeUniforms.clippingPlane7Normal };
-
-    #pragma unroll
-    for (int cp = 0; cp < numClipPlanes; cp++) {
-      float3 planeOrigin = planeOrigins[cp].xyz;
-      float3 planeNormal = normalize(planeNormals[cp].xyz);
-      float startDistance = dot(planeNormal, planeOrigin - entryPoint);
-      float stopDistance = dot(planeNormal, planeOrigin - exitPoint);
-
-      if (startDistance > 0.0 && stopDistance > 0.0) {
-        output.color = float4(0.0);
-        return output;
-      }
-      float rayDotNormal = dot(rayDir, planeNormal);
-
-      if (rayDotNormal > 0.0 && startDistance > 0.0) entryPoint += (startDistance / rayDotNormal) * rayDir;
-      if (rayDotNormal <= 0.0 && stopDistance > 0.0) exitPoint += (stopDistance / rayDotNormal) * rayDir;
-    }
-    totalDist = length(exitPoint - entryPoint);
-    if (totalDist < 1e-6) {
-      output.color = float4(0.0);
-      return output;
-    }
-  }
-
-  float tTerminateMax = 1e30;
-  if (volumeUniforms.useDepthTexture > 0.5) {
-    float depthSample = depthTexture.sample(sNearest, in.position.xy / volumeUniforms.viewportSize).r;
-    if (depthSample < 1.0) {
-      float2 ndcXY = (in.position.xy / volumeUniforms.viewportSize) * 2.0 - 1.0;
-      float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
-      worldTermination.xyz /= worldTermination.w;
-      float3 terminationLocal = (worldTermination.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-      tTerminateMax = dot(terminationLocal - entryPoint, rayDir);
-      if (tTerminateMax <= 0.0)
-      {
-        output.color = float4(0.0);
-        return output;
-      }
-    }
-  }
-
-  half4 _marchResult = marchVolume(entryPoint, exitPoint, totalDist, tTerminateMax, rayDir, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos, stepSize, t.y - tStart, in.position.xy, accumulatedColor, accumulatedOpacity, volumeUniforms, b, volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture, maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
+  half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos,
+      volumeUniforms.sampleDistance, s.totalBoxT, in.position.xy,
+      accumulatedColor, accumulatedOpacity, volumeUniforms, b,
+      volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture,
+      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
@@ -1982,7 +1902,7 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_accum_main(
 // across block boundaries. Used when rendering partitioned volumes front-to-back.
 fragment VolumeFragmentOut fragment_volume_accum_main(
     VolumeVertexOut in [[stage_in]],
-    float4 prevAccum [[color(0)]], // Metal Framebuffer Fetch
+    float4 prevAccum [[color(0)]],
     constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
     constant PerBlockData& b [[buffer(2)]],
     texture3d<float> volumeTexture [[texture(0)]],
@@ -1995,87 +1915,29 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     texture3d<float> normalTexture [[texture(7)]]) {
 
   VolumeFragmentOut output;
-
-  // Global ERT: Skip if previous blocks already made this pixel opaque
-  if (prevAccum.a >= 0.99h) {
-      discard_fragment();
-  }
-
-  // Initialize accumulators with previous block's results
+  if (prevAccum.a >= 0.99h) discard_fragment();
   half3 accumulatedColor = half3(prevAccum.rgb);
   half accumulatedOpacity = half(prevAccum.a);
 
-  float3 blockMinGlobal = (b.volumeBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-  float3 blockMaxGlobal = (b.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-
-  float3 texMinGlobal = (b.textureBoundsMin.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-  float3 texMaxGlobal = (b.textureBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
-  float stepSize = volumeUniforms.sampleDistance;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
 
   float3 rayDir = in.localPos - cameraPos;
   float dirLength = length(rayDir);
   if (dirLength < 0.0001) discard_fragment();
-
   rayDir /= dirLength;
-  float2 t = intersectBox(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal);
-  float tStart = max(t.x, 0.0);
-  if (tStart >= t.y) {
-    output.color = float4(0.0);
-    return output;
-  }
 
-  float3 entryPoint = cameraPos + rayDir * tStart;
-  float3 exitPoint = cameraPos + rayDir * t.y;
-  float totalDist = length(exitPoint - entryPoint);
+  RaySetup s = setupVolumeRay(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { output.color = float4(0.0); return output; }
 
-  if (volumeUniforms.useClipping > 0.5) {
-    int numClipPlanes = int(volumeUniforms.numClippingPlanes);
-    float4 planeOrigins[8] = { volumeUniforms.clippingPlane0Origin, volumeUniforms.clippingPlane1Origin, volumeUniforms.clippingPlane2Origin, volumeUniforms.clippingPlane3Origin, volumeUniforms.clippingPlane4Origin, volumeUniforms.clippingPlane5Origin, volumeUniforms.clippingPlane6Origin, volumeUniforms.clippingPlane7Origin };
-    float4 planeNormals[8] = { volumeUniforms.clippingPlane0Normal, volumeUniforms.clippingPlane1Normal, volumeUniforms.clippingPlane2Normal, volumeUniforms.clippingPlane3Normal, volumeUniforms.clippingPlane4Normal, volumeUniforms.clippingPlane5Normal, volumeUniforms.clippingPlane6Normal, volumeUniforms.clippingPlane7Normal };
-
-    #pragma unroll
-    for (int cp = 0; cp < numClipPlanes; cp++) {
-      float3 planeOrigin = planeOrigins[cp].xyz;
-      float3 planeNormal = normalize(planeNormals[cp].xyz);
-      float startDistance = dot(planeNormal, planeOrigin - entryPoint);
-      float stopDistance = dot(planeNormal, planeOrigin - exitPoint);
-
-      if (startDistance > 0.0 && stopDistance > 0.0) {
-        output.color = float4(0.0);
-        return output;
-      }
-      float rayDotNormal = dot(rayDir, planeNormal);
-
-      if (rayDotNormal > 0.0 && startDistance > 0.0) entryPoint += (startDistance / rayDotNormal) * rayDir;
-      if (rayDotNormal <= 0.0 && stopDistance > 0.0) exitPoint += (stopDistance / rayDotNormal) * rayDir;
-    }
-    totalDist = length(exitPoint - entryPoint);
-    if (totalDist < 1e-6) {
-      output.color = float4(0.0);
-      return output;
-    }
-  }
-
-  float tTerminateMax = 1e30;
-  if (volumeUniforms.useDepthTexture > 0.5) {
-    float depthSample = depthTexture.sample(sNearest, in.position.xy / volumeUniforms.viewportSize).r;
-    if (depthSample < 1.0) {
-      float2 ndcXY = (in.position.xy / volumeUniforms.viewportSize) * 2.0 - 1.0;
-      float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
-      worldTermination.xyz /= worldTermination.w;
-      float3 terminationLocal = (worldTermination.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-      tTerminateMax = dot(terminationLocal - entryPoint, rayDir);
-      if (tTerminateMax <= 0.0)
-      {
-        output.color = float4(0.0);
-        return output;
-      }
-    }
-  }
-
-  half4 _marchResult = marchVolume(entryPoint, exitPoint, totalDist, tTerminateMax, rayDir, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos, stepSize, t.y - tStart, in.position.xy, accumulatedColor, accumulatedOpacity, volumeUniforms, b, volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture, maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
+  half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos,
+      volumeUniforms.sampleDistance, s.totalBoxT, in.position.xy,
+      accumulatedColor, accumulatedOpacity, volumeUniforms, b,
+      volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture,
+      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
