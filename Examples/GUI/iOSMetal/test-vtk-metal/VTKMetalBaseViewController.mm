@@ -25,6 +25,7 @@
   NSInteger _benchmarkFrameCount;
   CFTimeInterval _benchmarkStartTime;
   double _benchmarkAccumulatedGPUTime;
+  double _benchmarkAccumulatedAngle;
 }
 @property (nonatomic, strong) UIPinchGestureRecognizer* pinchRecognizer;
 @property (nonatomic, strong) UIPanGestureRecognizer* panRecognizer;
@@ -287,6 +288,7 @@
   _benchmarkFrameCount = 0;
   _benchmarkStartTime = CACurrentMediaTime();
   _benchmarkAccumulatedGPUTime = 0.0;
+  _benchmarkAccumulatedAngle = 0.0;
 
   vtkMetalRenderWindow* renWin =
     static_cast<vtkMetalRenderWindow*>(_renWin.GetPointer());
@@ -344,6 +346,11 @@
   }
 
   [self rotateCameraForNextFrame];
+  if (_benchmarkAccumulatedAngle >= 1080.0)
+  {
+    [self stopBenchmark];
+    return;
+  }
   _renWin->Render();
 }
 
@@ -354,6 +361,7 @@
   camera->Azimuth(0.5);
   camera->OrthogonalizeViewUp();
   _renderer->ResetCameraClippingRange();
+  _benchmarkAccumulatedAngle += 0.5;
 }
 
 @end
