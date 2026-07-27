@@ -4,9 +4,6 @@
 #import "VTKMetalBaseViewController.h"
 #import <UIKit/UIKit.h>
 
-#include <vtkAutoInit.h>
-VTK_MODULE_INIT(vtkRenderingMetal);
-
 @interface AppDelegate ()
 @property (nonatomic, readwrite) BOOL benchmarkAutoStarted;
 @end
