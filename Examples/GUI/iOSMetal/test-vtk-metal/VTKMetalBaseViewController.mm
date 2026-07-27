@@ -1,5 +1,6 @@
 #import "VTKMetalBaseViewController.h"
 
+#include "vtkCamera.h"
 #include "vtkNew.h"
 #include "vtkProperty.h"
 #include "vtkInteractorStyleMultiTouchCamera.h"
@@ -18,6 +19,12 @@
   vtkNew<vtkMetalRenderer> _renderer;
   vtkNew<vtkRenderWindowInteractor> _iren;
   BOOL _trackballMode;
+
+  // Benchmark state
+  BOOL _benchmarkRunning;
+  NSInteger _benchmarkFrameCount;
+  CFTimeInterval _benchmarkStartTime;
+  double _benchmarkAccumulatedGPUTime;
 }
 @property (nonatomic, strong) UIPinchGestureRecognizer* pinchRecognizer;
 @property (nonatomic, strong) UIPanGestureRecognizer* panRecognizer;
@@ -263,6 +270,90 @@
   _renWin->SetSize(w, h);
   _iren->UpdateSize(w, h);
   _renWin->Render();
+}
+
+#pragma mark - Benchmark
+
+- (BOOL)isBenchmarkRunning
+{
+  return _benchmarkRunning;
+}
+
+- (void)startBenchmark
+{
+  if (_benchmarkRunning) { return; }
+
+  _benchmarkRunning = YES;
+  _benchmarkFrameCount = 0;
+  _benchmarkStartTime = CACurrentMediaTime();
+  _benchmarkAccumulatedGPUTime = 0.0;
+
+  vtkMetalRenderWindow* renWin =
+    static_cast<vtkMetalRenderWindow*>(_renWin.GetPointer());
+
+  renWin->SetRenderCompletionCallback(^(double gpuTimeMs) {
+    [self benchmarkFrameWithGPUTime:gpuTimeMs];
+  });
+
+  // Kick off the first frame
+  [self rotateCameraForNextFrame];
+  _renWin->Render();
+}
+
+- (void)stopBenchmark
+{
+  if (!_benchmarkRunning) { return; }
+
+  _benchmarkRunning = NO;
+  vtkMetalRenderWindow* renWin =
+    static_cast<vtkMetalRenderWindow*>(_renWin.GetPointer());
+
+  renWin->SetRenderCompletionCallback(nil);
+
+  // Log final summary
+  CFTimeInterval elapsed = CACurrentMediaTime() - _benchmarkStartTime;
+  if (_benchmarkFrameCount > 0 && elapsed > 0.0)
+  {
+    double avgFPS = _benchmarkFrameCount / elapsed;
+    double avgGPU = _benchmarkAccumulatedGPUTime / _benchmarkFrameCount;
+    NSLog(@"[Benchmark] Result: %.1f FPS | Avg GPU: %.2f ms | Frames: %ld | Duration: %.2fs",
+          avgFPS, avgGPU, (long)_benchmarkFrameCount, elapsed);
+  }
+}
+
+- (void)benchmarkFrameWithGPUTime:(double)gpuTimeMs
+{
+  if (!_benchmarkRunning) { return; }
+
+  _benchmarkFrameCount++;
+  _benchmarkAccumulatedGPUTime += gpuTimeMs;
+
+  CFTimeInterval now = CACurrentMediaTime();
+  CFTimeInterval elapsed = now - _benchmarkStartTime;
+
+  if (elapsed >= 1.0)
+  {
+    double avgFPS = _benchmarkFrameCount / elapsed;
+    double avgGPU = _benchmarkAccumulatedGPUTime / _benchmarkFrameCount;
+    NSLog(@"[Benchmark] FPS: %.1f | GPU: %.2f ms | Frames: %ld",
+          avgFPS, avgGPU, (long)_benchmarkFrameCount);
+
+    _benchmarkFrameCount = 0;
+    _benchmarkStartTime = now;
+    _benchmarkAccumulatedGPUTime = 0.0;
+  }
+
+  [self rotateCameraForNextFrame];
+  _renWin->Render();
+}
+
+- (void)rotateCameraForNextFrame
+{
+  // Rotate the camera ~0.5 degrees per frame around the scene
+  vtkCamera* camera = _renderer->GetActiveCamera();
+  camera->Azimuth(0.5);
+  camera->OrthogonalizeViewUp();
+  _renderer->ResetCameraClippingRange();
 }
 
 @end

@@ -24,6 +24,11 @@
 @protocol MTLTexture;
 @class CAMetalLayer;
 @class CAMetalDrawable;
+
+/** Block invoked when the GPU finishes rendering a frame.
+ *  @param gpuTimeMs GPU frame time in milliseconds.
+ *  Only valid on iOS 10.3+ / macOS 10.13+. */
+typedef void (^VTKRenderCompletionBlock)(double gpuTimeMs);
 #else
 class id;
 #endif
@@ -110,6 +115,15 @@ public:
    */
   void* GetDepthTexture();
 
+#ifdef __OBJC__
+  /**
+   * Set a block to be called when the GPU finishes rendering each frame.
+   * The block is called on an internal Metal queue. Pass nil to clear.
+   * Only meaningful when set from Objective-C context.
+   */
+  void SetRenderCompletionCallback(VTKRenderCompletionBlock block);
+#endif
+
   /**
    * Get the effective sample count for multisampling.
    * Returns MultiSamples if > 1, otherwise 1.
@@ -169,6 +183,7 @@ protected:
   void* MetalLayer = nullptr;     // CAMetalLayer*
   void* CurrentDrawable = nullptr; // CAMetalDrawable*
   void* CommandBuffer = nullptr;   // id<MTLCommandBuffer>
+  void* RenderCompletionCallback = nullptr; // VTKRenderCompletionBlock, retained
   void* Encoder = nullptr;         // id<MTLRenderCommandEncoder>
   void* DepthTexture = nullptr;    // id<MTLTexture>
   void* IdsTexture = nullptr;      // id<MTLTexture> — RGBA32Uint for picking IDs

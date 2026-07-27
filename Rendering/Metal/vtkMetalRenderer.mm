@@ -567,6 +567,22 @@ void vtkMetalRenderer::DeviceRender()
     // Commit and present
     [commandBuffer presentDrawable:drawable];
     [commandBuffer commit];
+
+    // Notify application of GPU completion (benchmarking etc.)
+    if (renWin->RenderCompletionCallback)
+    {
+      [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        double gpuMs = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+        dispatch_async(dispatch_get_main_queue(), ^{
+          VTKRenderCompletionBlock block =
+            (__bridge VTKRenderCompletionBlock)renWin->RenderCompletionCallback;
+          if (block)
+          {
+            block(gpuMs);
+          }
+        });
+      }];
+    }
   }
 }
 

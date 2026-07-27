@@ -123,6 +123,12 @@ void vtkMetalRenderWindow::Finalize()
   this->Encoder = nullptr;
   this->CommandBuffer = nullptr;
 
+  if (this->RenderCompletionCallback)
+  {
+    [(__bridge id)this->RenderCompletionCallback release];
+    this->RenderCompletionCallback = nullptr;
+  }
+
   if (this->DepthTexture)
   {
     [(__bridge id)this->DepthTexture release];
@@ -445,6 +451,20 @@ void vtkMetalRenderWindow::SetCurrentRenderCommandEncoder(void* encoder)
 void* vtkMetalRenderWindow::GetCurrentCommandBuffer()
 {
   return this->CommandBuffer;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalRenderWindow::SetRenderCompletionCallback(VTKRenderCompletionBlock block)
+{
+  if (this->RenderCompletionCallback)
+  {
+    [(__bridge id)this->RenderCompletionCallback release];
+    this->RenderCompletionCallback = nullptr;
+  }
+  if (block)
+  {
+    this->RenderCompletionCallback = (__bridge void*)[block copy];
+  }
 }
 
 //------------------------------------------------------------------------------
