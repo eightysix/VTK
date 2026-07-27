@@ -23,7 +23,9 @@
   // Benchmark state
   BOOL _benchmarkRunning;
   NSInteger _benchmarkFrameCount;
+  NSInteger _benchmarkTotalFrames;
   CFTimeInterval _benchmarkStartTime;
+  CFTimeInterval _benchmarkTotalStartTime;
   double _benchmarkAccumulatedGPUTime;
   double _benchmarkAccumulatedAngle;
 }
@@ -286,15 +288,22 @@
 
   _benchmarkRunning = YES;
   _benchmarkFrameCount = 0;
+  _benchmarkTotalFrames = 0;
   _benchmarkStartTime = CACurrentMediaTime();
+  _benchmarkTotalStartTime = _benchmarkStartTime;
   _benchmarkAccumulatedGPUTime = 0.0;
   _benchmarkAccumulatedAngle = 0.0;
 
   vtkMetalRenderWindow* renWin =
     static_cast<vtkMetalRenderWindow*>(_renWin.GetPointer());
 
+  __weak __typeof(self) weakSelf = self;
   renWin->SetRenderCompletionCallback(^(double gpuTimeMs) {
-    [self benchmarkFrameWithGPUTime:gpuTimeMs];
+    __typeof(self) strongSelf = weakSelf;
+    if (strongSelf)
+    {
+      [strongSelf benchmarkFrameWithGPUTime:gpuTimeMs];
+    }
   });
 
   // Kick off the first frame
@@ -313,13 +322,12 @@
   renWin->SetRenderCompletionCallback(nil);
 
   // Log final summary
-  CFTimeInterval elapsed = CACurrentMediaTime() - _benchmarkStartTime;
-  if (_benchmarkFrameCount > 0 && elapsed > 0.0)
+  CFTimeInterval totalTime = CACurrentMediaTime() - _benchmarkTotalStartTime;
+  if (_benchmarkTotalFrames > 0 && totalTime > 0.0)
   {
-    double avgFPS = _benchmarkFrameCount / elapsed;
-    double avgGPU = _benchmarkAccumulatedGPUTime / _benchmarkFrameCount;
-    NSLog(@"[Benchmark] Result: %.1f FPS | Avg GPU: %.2f ms | Frames: %ld | Duration: %.2fs",
-          avgFPS, avgGPU, (long)_benchmarkFrameCount, elapsed);
+    double avgFPS = _benchmarkTotalFrames / totalTime;
+    NSLog(@"[Benchmark] Result: %.1f FPS | Frames: %ld | Duration: %.2fs | Angle: %.1f deg",
+          avgFPS, (long)_benchmarkTotalFrames, totalTime, _benchmarkAccumulatedAngle);
   }
 }
 
@@ -328,6 +336,7 @@
   if (!_benchmarkRunning) { return; }
 
   _benchmarkFrameCount++;
+  _benchmarkTotalFrames++;
   _benchmarkAccumulatedGPUTime += gpuTimeMs;
 
   CFTimeInterval now = CACurrentMediaTime();
@@ -335,10 +344,10 @@
 
   if (elapsed >= 1.0)
   {
-    double avgFPS = _benchmarkFrameCount / elapsed;
-    double avgGPU = _benchmarkAccumulatedGPUTime / _benchmarkFrameCount;
-    NSLog(@"[Benchmark] FPS: %.1f | GPU: %.2f ms | Frames: %ld",
-          avgFPS, avgGPU, (long)_benchmarkFrameCount);
+    double avgFPS = (double)_benchmarkFrameCount / elapsed;
+    double avgGPU = _benchmarkAccumulatedGPUTime / (double)_benchmarkFrameCount;
+    NSLog(@"[Benchmark] FPS: %.1f | GPU: %.2f ms | Angle: %.1f deg",
+          avgFPS, avgGPU, _benchmarkAccumulatedAngle);
 
     _benchmarkFrameCount = 0;
     _benchmarkStartTime = now;
@@ -346,7 +355,10 @@
   }
 
   [self rotateCameraForNextFrame];
-  if (_benchmarkAccumulatedAngle >= 1080.0)
+
+  // Stop after 3 full rotations, with a safety cap at 3000 frames
+  BOOL shouldStop = (_benchmarkAccumulatedAngle >= 1080.0) || (_benchmarkTotalFrames >= 3000);
+  if (shouldStop)
   {
     [self stopBenchmark];
     return;
