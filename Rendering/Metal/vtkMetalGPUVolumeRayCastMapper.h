@@ -351,9 +351,12 @@ private:
   bool UseGPUMinMax = true;
   vtkMetalResource MinMaxComputePipeline;    // id<MTLComputePipelineState>
   vtkMetalResource DilateComputePipeline;    // id<MTLComputePipelineState>
+  vtkMetalResource MinMaxDownsamplePipeline; // id<MTLComputePipelineState>
   bool EnsureMinMaxComputePipelines(void* mtlDevice);
   bool ComputeMinMaxGPU(void* mtlDevice, void* mtlQueue, vtkVolume* vol,
     vtkImageData* input, vtkDataArray* scalars);
+  static int ComputeMinMaxMipLevels(int dimX, int dimY, int dimZ);
+  static int ComputeShaderSkipLevels(int numMipLevels);
   // GPU min-max dispatch helper for per-block generation
   void DispatchBlockMinMaxGPU(void* device, void* mmEnc, void* blockTex, VolumeBlock& block,
     const int bdims[3], const float normFactor, const double scalarRange,

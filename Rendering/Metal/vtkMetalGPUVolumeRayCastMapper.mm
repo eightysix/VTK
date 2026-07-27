@@ -100,6 +100,17 @@ struct MinMaxComputeUniforms {
 static_assert(sizeof(MinMaxComputeUniforms) == 4*6 + 4 + 4 + 4 + 4 + 257*4,
   "MinMaxComputeUniforms size must match Metal struct");
 
+// Must match Metal MinMaxDownsampleUniforms struct
+struct MinMaxDownsampleUniforms {
+  uint32_t srcDimX, srcDimY, srcDimZ;
+  uint32_t dstDimX, dstDimY, dstDimZ;
+  uint32_t srcLevel;
+  uint32_t dstLevel;
+};
+
+static_assert(sizeof(MinMaxDownsampleUniforms) == 8 * 4,
+  "MinMaxDownsampleUniforms size must match Metal struct");
+
 // ---------------------------------------------------------------------------
 // vtkMetalResource — RAII for Metal Obj-C resources stored as void*.
 // Implementation in .mm where Obj-C runtime is available.
@@ -338,22 +349,29 @@ void ConvertVolumeData(const void* src, int dataType, int numComponents,
 // ---------------------------------------------------------------------------
 static id<MTLTexture> EnsureTexture3D(id<MTLDevice> device, vtkMetalResource& slot,
   MTLPixelFormat format, NSUInteger w, NSUInteger h, NSUInteger d,
-  MTLTextureUsage usage, MTLStorageMode storage)
+  MTLTextureUsage usage, MTLStorageMode storage,
+  NSUInteger mipLevels = 1)
 {
   id<MTLTexture> existing = (__bridge id<MTLTexture>)slot.get();
   if (existing && existing.width == w && existing.height == h &&
       existing.depth == d && existing.pixelFormat == format &&
-      existing.storageMode == storage)
+      existing.storageMode == storage &&
+      existing.mipmapLevelCount == mipLevels)
   {
     return existing;
   }
 
+  bool mipmapped = mipLevels > 1;
   MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
                                                                                    width:w
                                                                                   height:h
-                                                                               mipmapped:NO];
+                                                                               mipmapped:mipmapped];
   desc.textureType = MTLTextureType3D;
   desc.depth = d;
+  if (mipmapped)
+  {
+    desc.mipmapLevelCount = mipLevels;
+  }
   desc.usage = usage;
   desc.storageMode = storage;
 
@@ -2226,9 +2244,89 @@ bool vtkMetalGPUVolumeRayCastMapper::IsBlockEmpty(
 }
 
 //------------------------------------------------------------------------------
+int vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxMipLevels(int dimX, int dimY, int dimZ)
+{
+  int maxDim = std::max({dimX, dimY, dimZ});
+  int levels = 1;
+  while (maxDim > 1 && levels < 5)
+  {
+    maxDim /= 2;
+    levels++;
+  }
+  return levels;
+}
+
+//------------------------------------------------------------------------------
+int vtkMetalGPUVolumeRayCastMapper::ComputeShaderSkipLevels(int numMipLevels)
+{
+  // Convert actual mip level count to shader skip levels.
+  // Shader samples only even mips (0, 2, 4), so with N mip levels
+  // the usable skip count is floor((N+1)/2), capped at 3.
+  return std::min(3, std::max(1, (numMipLevels + 1) / 2));
+}
+
+//------------------------------------------------------------------------------
+// Helper: generate and upload coarser mip levels for an R8 min-max texture.
+// Takes ownership of mip0Data (moved from), generates successive 2x min-reduction
+// levels on CPU via vtkSMPTools, and calls replaceRegion: for each.
+static void UploadMinMaxMipChain(id<MTLTexture> tex,
+    std::vector<uint8_t>&& mip0Data,
+    int dimX, int dimY, int dimZ, int numMipLevels)
+{
+  int curW = dimX, curH = dimY, curD = dimZ;
+  std::vector<uint8_t> prevMipData = std::move(mip0Data);
+  for (int mip = 1; mip < numMipLevels; ++mip)
+  {
+    int nextW = std::max(1, curW / 2);
+    int nextH = std::max(1, curH / 2);
+    int nextD = std::max(1, curD / 2);
+    vtkIdType numDst = static_cast<vtkIdType>(nextW) * nextH * nextD;
+    std::vector<uint8_t> mipData(numDst, 255);
+
+    const uint8_t* src = prevMipData.data();
+    uint8_t* dst = mipData.data();
+
+    vtkSMPTools::For(0, numDst, [&](vtkIdType begin, vtkIdType end) {
+      for (vtkIdType idx = begin; idx < end; ++idx)
+      {
+        int gx = static_cast<int>(idx % nextW);
+        int gy = static_cast<int>((idx / nextW) % nextH);
+        int gz = static_cast<int>(idx / (nextW * nextH));
+
+        uint8_t minVal = 255;
+        for (int dz = 0; dz < 2 && gz*2+dz < curD; ++dz)
+          for (int dy = 0; dy < 2 && gy*2+dy < curH; ++dy)
+            for (int dx = 0; dx < 2 && gx*2+dx < curW; ++dx)
+            {
+              int si = ((gz*2+dz)*curH + (gy*2+dy))*curW + (gx*2+dx);
+              minVal = std::min(minVal, src[si]);
+            }
+        dst[idx] = minVal;
+      }
+    });
+
+    MTLRegion mipRegion = MTLRegionMake3D(0, 0, 0,
+      static_cast<NSUInteger>(nextW),
+      static_cast<NSUInteger>(nextH),
+      static_cast<NSUInteger>(nextD));
+    NSUInteger mipBytesPerRow = static_cast<NSUInteger>(nextW) * sizeof(uint8_t);
+    NSUInteger mipBytesPerImage = mipBytesPerRow * static_cast<NSUInteger>(nextH);
+    [tex replaceRegion:mipRegion
+           mipmapLevel:mip
+                 slice:0
+             withBytes:mipData.data()
+           bytesPerRow:mipBytesPerRow
+         bytesPerImage:mipBytesPerImage];
+
+    curW = nextW; curH = nextH; curD = nextD;
+    prevMipData = std::move(mipData);
+  }
+}
+
+//------------------------------------------------------------------------------
 bool vtkMetalGPUVolumeRayCastMapper::EnsureMinMaxComputePipelines(void* mtlDeviceVoid)
 {
-  if (this->MinMaxComputePipeline && this->DilateComputePipeline)
+  if (this->MinMaxComputePipeline && this->DilateComputePipeline && this->MinMaxDownsamplePipeline)
   {
     return true;
   }
@@ -2283,6 +2381,27 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureMinMaxComputePipelines(void* mtlDevic
         return false;
       }
       DilateComputePipeline.take((__bridge void*)pso);
+    }
+
+    if (!this->MinMaxDownsamplePipeline)
+    {
+      id<MTLFunction> func = [library newFunctionWithName:@"volume_minmax_downsample"];
+      if (!func)
+      {
+        vtkErrorMacro("Failed to find volume_minmax_downsample kernel");
+        return false;
+      }
+      NSError* error = nil;
+      id<MTLComputePipelineState> pso =
+        [dev newComputePipelineStateWithFunction:func error:&error];
+      [func release];
+      if (!pso)
+      {
+        vtkErrorMacro(<< "Failed to create minmax downsample pipeline: "
+                      << [[error localizedDescription] UTF8String]);
+        return false;
+      }
+      MinMaxDownsamplePipeline.take((__bridge void*)pso);
     }
   }
 
@@ -2452,22 +2571,61 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     [enc1 dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
     [enc1 endEncoding];
 
+    int numMipLevels = ComputeMinMaxMipLevels(mmDims[0], mmDims[1], mmDims[2]);
     id<MTLTexture> permTex = EnsureTexture3D(device, this->MinMaxTexture,
       MTLPixelFormatR8Unorm, mmDims[0], mmDims[1], mmDims[2],
-      MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, MTLStorageModePrivate);
+      MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, MTLStorageModePrivate,
+      numMipLevels);
     if (!permTex)
     {
       vtkErrorMacro("Failed to create persistent min-max texture");
       return false;
     }
 
-    // --- Dispatch kernel 2: dilation (writes directly to permTex) ---
+    // --- Dispatch kernel 2: dilation (writes directly to permTex, mip 0) ---
     id<MTLComputeCommandEncoder> enc2 = [cmdBuf computeCommandEncoder];
-    enc2.label = @"Volume Dilate MinMax";
+    enc2.label = @"Volume Dilate + Downsample";
     [enc2 setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->DilateComputePipeline.get()];
     [enc2 setTexture:rawOcc atIndex:0];
     [enc2 setTexture:permTex atIndex:1];
     [enc2 dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
+
+    // --- Mip chain generation (reuses enc2) ---
+    int curW = mmDims[0], curH = mmDims[1], curD = mmDims[2];
+    for (int mip = 1; mip < numMipLevels; ++mip)
+    {
+      int nextW = std::max(1, curW / 2);
+      int nextH = std::max(1, curH / 2);
+      int nextD = std::max(1, curD / 2);
+
+      MinMaxDownsampleUniforms du;
+      du.srcDimX = static_cast<uint32_t>(curW);
+      du.srcDimY = static_cast<uint32_t>(curH);
+      du.srcDimZ = static_cast<uint32_t>(curD);
+      du.dstDimX = static_cast<uint32_t>(nextW);
+      du.dstDimY = static_cast<uint32_t>(nextH);
+      du.dstDimZ = static_cast<uint32_t>(nextD);
+      du.srcLevel = static_cast<uint32_t>(mip - 1);
+      du.dstLevel = static_cast<uint32_t>(mip);
+
+      [enc2 setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->MinMaxDownsamplePipeline.get()];
+      [enc2 setTexture:permTex atIndex:0];
+      [enc2 setTexture:permTex atIndex:1];
+      [enc2 setBytes:&du length:sizeof(du) atIndex:0];
+
+      MTLSize mipGrid = MTLSizeMake(
+        static_cast<NSUInteger>(nextW),
+        static_cast<NSUInteger>(nextH),
+        static_cast<NSUInteger>(nextD));
+      NSUInteger tgw = 8;
+      MTLSize mipTG = MTLSizeMake(
+        std::min(tgw, static_cast<NSUInteger>(nextW)),
+        std::min(tgw, static_cast<NSUInteger>(nextH)),
+        std::min(tgw, static_cast<NSUInteger>(nextD)));
+      [enc2 dispatchThreads:mipGrid threadsPerThreadgroup:mipTG];
+
+      curW = nextW; curH = nextH; curD = nextD;
+    }
     [enc2 endEncoding];
 
     [cmdBuf commit];
@@ -2682,26 +2840,32 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
         }
       });
 
-      // 3. Create or reuse the 3D occupancy texture (R8Unorm).
+      // 3. Create or reuse the 3D occupancy texture (R8Unorm) with mip chain.
+      int numMipLevels = ComputeMinMaxMipLevels(mmDims0, mmDims1, mmDims2);
       id<MTLTexture> tex = EnsureTexture3D(device, this->MinMaxTexture,
         MTLPixelFormatR8Unorm, mmDims0, mmDims1, mmDims2,
-        MTLTextureUsageShaderRead, MTLStorageModeShared);
+        MTLTextureUsageShaderRead, MTLStorageModeShared, numMipLevels);
       if (!tex)
       {
         vtkErrorMacro("Failed to create min-max acceleration texture");
         return false;
       }
 
-      // Upload data
-      MTLRegion region = MTLRegionMake3D(0, 0, 0, mmDims0, mmDims1, mmDims2);
-      NSUInteger bytesPerRow = mmDims0 * sizeof(uint8_t);
-      NSUInteger bytesPerImage = bytesPerRow * mmDims1;
-      [tex replaceRegion:region
-             mipmapLevel:0
-                   slice:0
-               withBytes:minMaxData.data()
-             bytesPerRow:bytesPerRow
-           bytesPerImage:bytesPerImage];
+      // Upload mip 0 (dilated occupancy)
+      {
+        MTLRegion region = MTLRegionMake3D(0, 0, 0, mmDims0, mmDims1, mmDims2);
+        NSUInteger bytesPerRow = mmDims0 * sizeof(uint8_t);
+        NSUInteger bytesPerImage = bytesPerRow * mmDims1;
+        [tex replaceRegion:region
+               mipmapLevel:0
+                     slice:0
+                 withBytes:minMaxData.data()
+               bytesPerRow:bytesPerRow
+             bytesPerImage:bytesPerImage];
+      }
+
+      UploadMinMaxMipChain(tex, std::move(minMaxData),
+        mmDims0, mmDims1, mmDims2, numMipLevels);
     }
 
     this->MinMaxUploadTime.Modified();
@@ -3599,21 +3763,28 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
           }
         });
 
-        // 3. Create and upload the Metal 3D texture
+        // 3. Create and upload the Metal 3D texture with mip chain
+        int numMipLevels = ComputeMinMaxMipLevels(mmDims0, mmDims1, mmDims2);
         id<MTLTexture> mmTex = EnsureTexture3D(device, block.MinMaxTexture,
           MTLPixelFormatR8Unorm, mmDims0, mmDims1, mmDims2,
-          MTLTextureUsageShaderRead, MTLStorageModeShared);
+          MTLTextureUsageShaderRead, MTLStorageModeShared, numMipLevels);
         if (mmTex)
         {
-          MTLRegion region = MTLRegionMake3D(0, 0, 0, mmDims0, mmDims1, mmDims2);
-          NSUInteger mmBytesPerRow = mmDims0 * sizeof(uint8_t);
-          NSUInteger mmBytesPerImage = mmBytesPerRow * mmDims1;
-          [mmTex replaceRegion:region
-                  mipmapLevel:0
-                        slice:0
-                    withBytes:minMaxData.data()
-                  bytesPerRow:mmBytesPerRow
-                bytesPerImage:mmBytesPerImage];
+          // Upload mip 0 (dilated occupancy)
+          {
+            MTLRegion region = MTLRegionMake3D(0, 0, 0, mmDims0, mmDims1, mmDims2);
+            NSUInteger mmBytesPerRow = mmDims0 * sizeof(uint8_t);
+            NSUInteger mmBytesPerImage = mmBytesPerRow * mmDims1;
+            [mmTex replaceRegion:region
+                    mipmapLevel:0
+                          slice:0
+                      withBytes:minMaxData.data()
+                    bytesPerRow:mmBytesPerRow
+                  bytesPerImage:mmBytesPerImage];
+          }
+
+          UploadMinMaxMipChain(mmTex, std::move(minMaxData),
+            mmDims0, mmDims1, mmDims2, numMipLevels);
         }
         else
         {
@@ -4119,24 +4290,31 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockMinMaxTextures(
         }
       });
 
-      // Step 2c: Create and upload R8Unorm texture
+      // Step 2c: Create and upload R8Unorm texture with mip chain
+      int numMipLevels = ComputeMinMaxMipLevels(mmDims[0], mmDims[1], mmDims[2]);
       id<MTLTexture> mmTex = EnsureTexture3D(device, block.MinMaxTexture,
         MTLPixelFormatR8Unorm, mmDims[0], mmDims[1], mmDims[2],
-        MTLTextureUsageShaderRead, MTLStorageModeShared);
+        MTLTextureUsageShaderRead, MTLStorageModeShared, numMipLevels);
       if (mmTex)
       {
-        MTLRegion region = MTLRegionMake3D(0, 0, 0,
-          static_cast<NSUInteger>(mmDims[0]),
-          static_cast<NSUInteger>(mmDims[1]),
-          static_cast<NSUInteger>(mmDims[2]));
-        NSUInteger mmBytesPerRow = static_cast<NSUInteger>(mmDims[0]) * sizeof(uint8_t);
-        NSUInteger mmBytesPerImage = mmBytesPerRow * static_cast<NSUInteger>(mmDims[1]);
-        [mmTex replaceRegion:region
-                mipmapLevel:0
-                      slice:0
-                  withBytes:minMaxData.data()
-                bytesPerRow:mmBytesPerRow
-              bytesPerImage:mmBytesPerImage];
+        // Upload mip 0 (dilated occupancy)
+        {
+          MTLRegion region = MTLRegionMake3D(0, 0, 0,
+            static_cast<NSUInteger>(mmDims[0]),
+            static_cast<NSUInteger>(mmDims[1]),
+            static_cast<NSUInteger>(mmDims[2]));
+          NSUInteger mmBytesPerRow = static_cast<NSUInteger>(mmDims[0]) * sizeof(uint8_t);
+          NSUInteger mmBytesPerImage = mmBytesPerRow * static_cast<NSUInteger>(mmDims[1]);
+          [mmTex replaceRegion:region
+                  mipmapLevel:0
+                        slice:0
+                    withBytes:minMaxData.data()
+                  bytesPerRow:mmBytesPerRow
+                bytesPerImage:mmBytesPerImage];
+        }
+
+        UploadMinMaxMipChain(mmTex, std::move(minMaxData),
+          mmDims[0], mmDims[1], mmDims[2], numMipLevels);
       }
     }
 
@@ -5112,10 +5290,12 @@ void vtkMetalGPUVolumeRayCastMapper::DispatchBlockMinMaxGPU(void* deviceVoid, vo
   [scratchDesc release];
   if (!scratchTex) return;
 
-  // Create persistent per-block MinMax texture (dilated result)
+  int numMipLevels = ComputeMinMaxMipLevels(mmDims[0], mmDims[1], mmDims[2]);
+  // Create persistent per-block MinMax texture (dilated result) with mip chain
   id<MTLTexture> mmTex = EnsureTexture3D(device, block.MinMaxTexture,
     MTLPixelFormatR8Unorm, mmDims[0], mmDims[1], mmDims[2],
-    MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, MTLStorageModePrivate);
+    MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, MTLStorageModePrivate,
+    numMipLevels);
   if (!mmTex) { [scratchTex release]; return; }
 
   // Setup uniforms
@@ -5151,11 +5331,48 @@ void vtkMetalGPUVolumeRayCastMapper::DispatchBlockMinMaxGPU(void* deviceVoid, vo
     std::min(tgw, static_cast<NSUInteger>(mmDims[2])));
   [mmEnc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
 
-  // Dispatch volume_dilate_minmax: scratchTex -> mmTex
+  // Dispatch volume_dilate_minmax: scratchTex -> mmTex (mip 0)
   [mmEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->DilateComputePipeline.get()];
   [mmEnc setTexture:scratchTex atIndex:0];
   [mmEnc setTexture:mmTex atIndex:1];
   [mmEnc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
+
+  // Generate mip chain: mip 1..N via successive 2x min-reduction
+  int curW = mmDims[0], curH = mmDims[1], curD = mmDims[2];
+  for (int mip = 1; mip < numMipLevels; ++mip)
+  {
+    int nextW = std::max(1, curW / 2);
+    int nextH = std::max(1, curH / 2);
+    int nextD = std::max(1, curD / 2);
+
+    MinMaxDownsampleUniforms du;
+    du.srcDimX = static_cast<uint32_t>(curW);
+    du.srcDimY = static_cast<uint32_t>(curH);
+    du.srcDimZ = static_cast<uint32_t>(curD);
+    du.dstDimX = static_cast<uint32_t>(nextW);
+    du.dstDimY = static_cast<uint32_t>(nextH);
+    du.dstDimZ = static_cast<uint32_t>(nextD);
+    du.srcLevel = static_cast<uint32_t>(mip - 1);
+    du.dstLevel = static_cast<uint32_t>(mip);
+
+    [mmEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->MinMaxDownsamplePipeline.get()];
+    [mmEnc setTexture:mmTex atIndex:0];
+    [mmEnc setTexture:mmTex atIndex:1];
+    [mmEnc setBytes:&du length:sizeof(du) atIndex:0];
+
+    MTLSize mipGrid = MTLSizeMake(
+      static_cast<NSUInteger>(nextW),
+      static_cast<NSUInteger>(nextH),
+      static_cast<NSUInteger>(nextD));
+    NSUInteger tgw = 8;
+    MTLSize mipTG = MTLSizeMake(
+      std::min(tgw, static_cast<NSUInteger>(nextW)),
+      std::min(tgw, static_cast<NSUInteger>(nextH)),
+      std::min(tgw, static_cast<NSUInteger>(nextD)));
+    [mmEnc dispatchThreads:mipGrid threadsPerThreadgroup:mipTG];
+
+    curW = nextW; curH = nextH; curD = nextD;
+  }
 
   [scratchTex release];
 }
@@ -5303,7 +5520,9 @@ void vtkMetalGPUVolumeRayCastMapper::BuildPerBlockData(PerBlockData& pbd,
 
   if (block.MinMaxTexture)
   {
-    pbd.MinMaxInfo[0] = 1.0f;
+    int numMipLevels = ComputeMinMaxMipLevels(
+      block.MinMaxDims[0], block.MinMaxDims[1], block.MinMaxDims[2]);
+    pbd.MinMaxInfo[0] = static_cast<float>(ComputeShaderSkipLevels(numMipLevels));
     pbd.MinMaxInfo[1] = static_cast<float>(block.MinMaxDims[0]);
     pbd.MinMaxInfo[2] = static_cast<float>(block.MinMaxDims[1]);
     pbd.MinMaxInfo[3] = static_cast<float>(block.MinMaxDims[2]);
@@ -5963,7 +6182,16 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   this->DepthTextureOcclusion = (sampleCount > 1) ? nullptr : metalRenderWindow->GetDepthTexture();
   uniforms.UseDepthTexture = this->DepthTextureOcclusion ? 1.0f : 0.0f;
 
-  uniforms.UseMinMaxAccel = this->MinMaxTexture ? 1.0f : 0.0f;
+  if (this->MinMaxTexture)
+  {
+    int numMipLevels = ComputeMinMaxMipLevels(
+      this->MinMaxDims[0], this->MinMaxDims[1], this->MinMaxDims[2]);
+    uniforms.UseMinMaxAccel = static_cast<float>(ComputeShaderSkipLevels(numMipLevels));
+  }
+  else
+  {
+    uniforms.UseMinMaxAccel = 0.0f;
+  }
   uniforms.MinMaxDimX = static_cast<float>(this->MinMaxDims[0]);
   uniforms.MinMaxDimY = static_cast<float>(this->MinMaxDims[1]);
   uniforms.MinMaxDimZ = static_cast<float>(this->MinMaxDims[2]);

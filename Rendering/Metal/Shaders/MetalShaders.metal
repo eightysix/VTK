@@ -1528,6 +1528,25 @@ inline RaySetup setupVolumeRay(
     return s;
 }
 
+inline float computeSkipDistance(float3 mmPos, float3 dimF,
+                                  float3 rayDir, float3 rayDirTexLocal,
+                                  float stepSize)
+{
+    float3 cellCoord = mmPos * dimF;
+    float3 fc = fract(cellCoord);
+    float3 dte;
+    dte.x = rayDir.x > 0.0 ? (1.0 - fc.x) : fc.x;
+    dte.y = rayDir.y > 0.0 ? (1.0 - fc.y) : fc.y;
+    dte.z = rayDir.z > 0.0 ? (1.0 - fc.z) : fc.z;
+    dte = mix(dte, float3(1.0), float3(dte <= 1e-5));
+    float3 tte;
+    tte.x = abs(rayDirTexLocal.x) > 1e-5 ? dte.x / abs(rayDirTexLocal.x * dimF.x) : 1e30;
+    tte.y = abs(rayDirTexLocal.y) > 1e-5 ? dte.y / abs(rayDirTexLocal.y * dimF.y) : 1e30;
+    tte.z = abs(rayDirTexLocal.z) > 1e-5 ? dte.z / abs(rayDirTexLocal.z * dimF.z) : 1e30;
+    float exactSkip = min(min(tte.x, tte.y), tte.z) + 1e-4;
+    return max(stepSize, ceil(exactSkip / stepSize) * stepSize);
+}
+
 inline half4 marchVolume(
     float3 entryPoint,
     float3 exitPoint,
@@ -1604,14 +1623,16 @@ inline half4 marchVolume(
   float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint0, level(0)).r : 0.0;
   bool prefetchValid = true;
   float prevScalar = prefetchScalar;
-  int3  curCell     = int3(-1);
-  bool  curCellEmpty = false;
-  float3 mmDimF     = b.minMaxInfo.yzw;
-  const bool useMinMax = fc_minmax &&
-    b.minMaxInfo.x > 0.5 &&
-    b.minMaxInfo.y > 0.5 &&
-    b.minMaxInfo.z > 0.5 &&
-    b.minMaxInfo.w > 0.5;
+  int3 curCellL0 = int3(-1); bool curEmptyL0 = false;
+  int3 curCellL1 = int3(-1); bool curEmptyL1 = false;
+  int3 curCellL2 = int3(-1); bool curEmptyL2 = false;
+  float3 dimL0F = b.minMaxInfo.yzw;
+  const int numLevels = int(b.minMaxInfo.x + 0.5h);
+  const bool useMinMax = fc_minmax && numLevels >= 1 &&
+    b.minMaxInfo.y > 0.5 && b.minMaxInfo.z > 0.5 && b.minMaxInfo.w > 0.5;
+  // Hierarchy levels sample every-other mip (0, 2, 4) for 4× reduction per level.
+  float3 dimL1F = max(floor(dimL0F * 0.25), float3(1)); // mip 2 dims
+  float3 dimL2F = max(floor(dimL1F * 0.25), float3(1)); // mip 4 dims
 
   for (int i = 0; i < maxSteps; i++) {
     if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
@@ -1619,41 +1640,68 @@ inline half4 marchVolume(
     if (useMinMax) {
       float3 texLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
       float3 mmPos = clamp(texLocalPos, float3(0.0), float3(1.0));
-      int3 newCell = min(int3(mmPos * mmDimF), int3(mmDimF) - 1);
-      if (any(newCell != curCell)) {
-        curCell      = newCell;
-        curCellEmpty = minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5;
+      bool definitelyEmpty = false;
+
+      // Coarse gates: coarser mips only filter whether finer mips need sampling.
+      // Only mip 0 (dilated) may drive an actual ray skip — this avoids holes
+      // at inter-mip boundaries where coarser cells straddle solid/empty regions.
+
+      if (numLevels >= 3) {
+        int3 cellL2 = min(int3(mmPos * dimL2F), int3(dimL2F) - 1);
+        if (any(cellL2 != curCellL2)) {
+          curCellL2 = cellL2;
+          curEmptyL2 = minMaxTexture.sample(sNearest, mmPos, level(4)).r > 0.5;
+        }
+        if (curEmptyL2) {
+          int3 cellL1 = min(int3(mmPos * dimL1F), int3(dimL1F) - 1);
+          if (any(cellL1 != curCellL1)) {
+            curCellL1 = cellL1;
+            curEmptyL1 = minMaxTexture.sample(sNearest, mmPos, level(2)).r > 0.5;
+          }
+          if (curEmptyL1) {
+            int3 cellL0 = min(int3(mmPos * dimL0F), int3(dimL0F) - 1);
+            if (any(cellL0 != curCellL0)) {
+              curCellL0 = cellL0;
+              curEmptyL0 = minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5;
+            }
+            definitelyEmpty = curEmptyL0;
+          }
+        }
+      } else if (numLevels >= 2) {
+        int3 cellL1 = min(int3(mmPos * dimL1F), int3(dimL1F) - 1);
+        if (any(cellL1 != curCellL1)) {
+          curCellL1 = cellL1;
+          curEmptyL1 = minMaxTexture.sample(sNearest, mmPos, level(2)).r > 0.5;
+        }
+        if (curEmptyL1) {
+          int3 cellL0 = min(int3(mmPos * dimL0F), int3(dimL0F) - 1);
+          if (any(cellL0 != curCellL0)) {
+            curCellL0 = cellL0;
+            curEmptyL0 = minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5;
+          }
+          definitelyEmpty = curEmptyL0;
+        }
+      } else {
+        int3 cellL0 = min(int3(mmPos * dimL0F), int3(dimL0F) - 1);
+        if (any(cellL0 != curCellL0)) {
+          curCellL0 = cellL0;
+          curEmptyL0 = minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5;
+        }
+        definitelyEmpty = curEmptyL0;
       }
 
-      if (curCellEmpty) {
-        float3 cellCoord = mmPos * mmDimF;
-        float3 fractCoord = fract(cellCoord);
-
-        float3 distToEdge;
-        distToEdge.x = rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x;
-        distToEdge.y = rayDir.y > 0.0 ? (1.0 - fractCoord.y) : fractCoord.y;
-        distToEdge.z = rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
-        distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
-
-        float3 tToEdge;
-        tToEdge.x = abs(rayDirTexLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirTexLocal.x * mmDimF.x) : 1e30;
-        tToEdge.y = abs(rayDirTexLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirTexLocal.y * mmDimF.y) : 1e30;
-        tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
-
-        float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
-        exactSkip += 1e-4;
-        float skipDist = ceil(exactSkip / stepSize) * stepSize;
-        skipDist = max(stepSize, skipDist);
-
+      if (definitelyEmpty) {
+        float skipDist = computeSkipDistance(mmPos, dimL0F, rayDir, rayDirTexLocal, stepSize);
         currentPoint += rayDir * skipDist;
         currentT += skipDist;
+        curCellL0 = int3(-1);
+        curCellL1 = int3(-1);
+        curCellL2 = int3(-1);
 
         if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= totalBoxT) {
           break;
         }
-
         prefetchValid = false;
-        curCell = int3(-1);
         continue;
       }
     }
@@ -2077,6 +2125,33 @@ kernel void volume_dilate_minmax(
   }
 
   dst.write(solid ? 0.0 : 1.0, gid);
+}
+
+struct MinMaxDownsampleUniforms {
+    uint srcDimX, srcDimY, srcDimZ;
+    uint dstDimX, dstDimY, dstDimZ;
+    uint srcLevel;
+    uint dstLevel;
+};
+
+kernel void volume_minmax_downsample(
+    texture3d<float, access::read>  tex [[texture(0)]],
+    texture3d<float, access::write> texOut [[texture(1)]],
+    constant MinMaxDownsampleUniforms& u [[buffer(0)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    if (any(gid >= uint3(u.dstDimX, u.dstDimY, u.dstDimZ))) return;
+
+    uint3 srcStart = gid * 2;
+    uint3 srcEnd = min(srcStart + 2, uint3(u.srcDimX, u.srcDimY, u.srcDimZ));
+
+    float minVal = 1.0;
+    for (uint z = srcStart.z; z < srcEnd.z; ++z)
+        for (uint y = srcStart.y; y < srcEnd.y; ++y)
+            for (uint x = srcStart.x; x < srcEnd.x; ++x)
+                minVal = min(minVal, tex.read(uint3(x, y, z), u.srcLevel).r);
+
+    texOut.write(minVal, gid, u.dstLevel);
 }
 
 fragment float4 fragment_image_sample_blit(
