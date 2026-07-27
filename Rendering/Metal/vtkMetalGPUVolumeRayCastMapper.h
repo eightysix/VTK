@@ -17,6 +17,7 @@
 #include <vector>       // For std::vector
 #include <unordered_map> // For pipeline cache
 #include <functional>    // For std::hash
+#include <cstdint>       // For uint16_t, uint32_t
 
 class vtkDataArray;
 class vtkImageData;
@@ -25,7 +26,86 @@ class vtkVolume;
 
 // Forward declarations for types defined in the .mm file.
 struct PerBlockData;
-struct VolumeMapperUniforms;
+
+// Metal constant-address-space structs align float3 to 16 bytes (size 16),
+// float4/float4x4 to 16 bytes, and float2 to 8 bytes.  This creates
+// padding that plain C++ float[] arrays do not.  The layout below exactly
+// mirrors the Metal compiler's computation (976 bytes total).
+struct VolumeMapperUniforms
+{
+  float WorldToVolumeMatrix[16];     // 0..63
+  float VolumeToWorldMatrix[16];     // 64..127
+  float VolumeBoundsMin[4];          // 128..143
+  float VolumeBoundsMax[4];          // 144..159
+  float CameraVolumePos[4];          // 160..175
+  float ViewProjectionMatrix[16];    // 176..239
+  uint16_t SampleDistanceHalf;      // 240
+  uint16_t OpacityPreIntegrationFactorHalf; // 242
+  uint16_t ScalarMinHalf;           // 244
+  uint16_t _padSM;                  // 246
+  uint16_t ScalarMaxHalf;           // 248
+  uint16_t _padSMax;                // 250
+  float UseJittering;                // 252
+  float InverseViewProjection[16];   // 256..319
+  float ViewportSize[2];            // 320..327
+  float _padViewport[2];            // 328..335
+  float GradientStep[3];            // 336..347
+  float _padGradStep;               // 348..351
+  float UseGradientShading;         // 352
+  float _padGradOpRange;            // 356..359
+  float GradientOpacityMin;         // 360
+  float GradientOpacityMax;         // 364
+  float UseGradientOpacity;         // 368
+  float _padAmbient[3];             // 372..383
+  float AmbientColor[3];            // 384..395
+  float _padAmb;                    // 396..399
+  float DiffuseColor[3];            // 400..411
+  float _padDiff;                   // 412..415
+  float SpecularColor[3];           // 416..427
+  float _padSpec;                   // 428..431
+  float Shininess;                  // 432
+  float _padLightDir[3];            // 436..447
+  float LightDirection[3];          // 448..459
+  float _padLight;                  // 460..463
+  float _padEnd[4];                 // 464..479
+  float CroppingPlanes[4];          // 480..495
+  float CroppingPlanes2[4];         // 496..511
+  uint32_t CroppingBitmask;         // 512..515
+  float _padCropFlags[31];          // 516..639
+  float UseCropping;                // 640
+  float UseClipping;                // 644
+  float NumClippingPlanes;          // 648
+  float _padClipping[2];            // 652..659
+  float _padClipAlign[3];           // 660..671
+  float ClippingPlane0Origin[4];    // 672..687
+  float ClippingPlane0Normal[4];    // 688..703
+  float ClippingPlane1Origin[4];    // 704..719
+  float ClippingPlane1Normal[4];    // 720..735
+  float ClippingPlane2Origin[4];    // 736..751
+  float ClippingPlane2Normal[4];    // 752..767
+  float ClippingPlane3Origin[4];    // 768..783
+  float ClippingPlane3Normal[4];    // 784..799
+  float ClippingPlane4Origin[4];    // 800..815
+  float ClippingPlane4Normal[4];    // 816..831
+  float ClippingPlane5Origin[4];    // 832..847
+  float ClippingPlane5Normal[4];    // 848..863
+  float ClippingPlane6Origin[4];    // 864..879
+  float ClippingPlane6Normal[4];    // 880..895
+  float ClippingPlane7Origin[4];    // 896..911
+  float ClippingPlane7Normal[4];    // 912..927
+  float UseMask;                  // 928
+  float MaskBlendFactor;          // 932
+  float MaskScale;                // 936
+  float MaskBias;                 // 940
+  float LabelMapNumLabels;        // 944
+  float UseDepthTexture;          // 948
+  float UseNormalTexture;         // 952
+  float _padMask;                 // 956
+  float UseMinMaxAccel;           // 960
+  float MinMaxDimX;               // 964
+  float MinMaxDimY;               // 968
+  float MinMaxDimZ;               // 972
+};
 
 // RAII wrapper for Metal Obj-C resources stored as void*.
 // Defined in .mm (injects release/retain via Obj-C bridging).
@@ -375,6 +455,15 @@ private:
   unsigned short Partitions[3] = { 1, 1, 1 };
   std::vector<VolumeBlock> Blocks;
   std::vector<int> SortedBlockOrder;
+
+  // Uniform caching to eliminate redundant per-frame work
+  VolumeMapperUniforms CachedUniforms;
+  vtkTimeStamp UniformsBuildTime;
+
+  // Cached model/inverse matrices to avoid redundant vtkMatrix4x4::Invert
+  double CachedModelMatrixData[16];
+  double CachedInvModelMatrixData[16];
+  vtkTimeStamp CachedMatrixBuildTime;
 
   void ClearBlocks();
   void SortBlocksBackToFront(vtkRenderer* ren, vtkVolume* vol);

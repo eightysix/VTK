@@ -41,91 +41,6 @@
 #include <vector>
 #include <dispatch/dispatch.h>
 
-// Metal constant-address-space structs align float3 to 16 bytes (size 16),
-// float4/float4x4 to 16 bytes, and float2 to 8 bytes.  This creates
-// padding that plain C++ float[] arrays do not.  The layout below exactly
-// mirrors the Metal compiler's computation (480 bytes total).
-struct VolumeMapperUniforms
-{
-  // --- fields matching Metal layout 1:1, offsets verified ---
-  float WorldToVolumeMatrix[16];     // 0..63
-  float VolumeToWorldMatrix[16];     // 64..127
-  float VolumeBoundsMin[4];          // 128..143
-  float VolumeBoundsMax[4];          // 144..159
-  float CameraVolumePos[4];          // 160..175
-  float ViewProjectionMatrix[16];    // 176..239
-  uint16_t SampleDistanceHalf;      // 240  (half precision: sufficient for [0,1] space)
-  uint16_t OpacityPreIntegrationFactorHalf; // 242  (half: sampleDistance/unitDistance for shader-side pre-integration)
-  uint16_t ScalarMinHalf;           // 244
-  uint16_t _padSM;                  // 246
-  uint16_t ScalarMaxHalf;           // 248
-  uint16_t _padSMax;                // 250
-  float UseJittering;                // 252
-  float InverseViewProjection[16];   // 256..319
-  float ViewportSize[2];            // 320..327
-  float _padViewport[2];            // 328..335  (pad to 16-byte for float3)
-  float GradientStep[3];            // 336..347
-  float _padGradStep;               // 348..351  (Metal: float3 = 16 bytes)
-  float UseGradientShading;         // 352
-  float _padGradOpRange;            // 356..359  (pad to 8-byte for float2)
-  float GradientOpacityMin;         // 360
-  float GradientOpacityMax;         // 364
-  float UseGradientOpacity;         // 368
-  float _padAmbient[3];             // 372..383  (pad to 16-byte for float4)
-  float AmbientColor[3];            // 384..395
-  float _padAmb;                    // 396..399  (Metal: float4 = 16 bytes)
-  float DiffuseColor[3];            // 400..411
-  float _padDiff;                   // 412..415
-  float SpecularColor[3];           // 416..427
-  float _padSpec;                   // 428..431
-  float Shininess;                  // 432
-  float _padLightDir[3];            // 436..447  (pad to 16-byte for float3)
-  float LightDirection[3];          // 448..459
-  float _padLight;                  // 460..463  (Metal: float3 = 16 bytes)
-  float _padEnd[4];                 // 464..479  (trailing pad to 480)
-  // Cropping regions (new)
-  float CroppingPlanes[4];          // 480..495  (minX, maxX, minY, maxY)
-  float CroppingPlanes2[4];         // 496..511  (minZ, maxZ, 0, 0)
-  uint32_t CroppingBitmask;         // 512..515  (packed bitmask from GetCroppingRegionFlags)
-  float _padCropFlags[31];          // 516..639  (maintain total struct size)
-  float UseCropping;                // 640
-  float UseClipping;                // 644
-  float NumClippingPlanes;          // 648
-  float _padClipping[2];            // 652..659
-  float _padClipAlign[3];           // 660..671
-  // Clipping planes (up to 8 arbitrary planes)
-  float ClippingPlane0Origin[4];    // 672..687 (origin.xyz, 1.0)
-  float ClippingPlane0Normal[4];    // 688..703 (normal.xyz, 0.0)
-  float ClippingPlane1Origin[4];    // 704..719
-  float ClippingPlane1Normal[4];    // 720..735
-  float ClippingPlane2Origin[4];    // 736..751
-  float ClippingPlane2Normal[4];    // 752..767
-  float ClippingPlane3Origin[4];    // 768..783
-  float ClippingPlane3Normal[4];    // 784..799
-  float ClippingPlane4Origin[4];    // 800..815
-  float ClippingPlane4Normal[4];    // 816..831
-  float ClippingPlane5Origin[4];    // 832..847
-  float ClippingPlane5Normal[4];    // 848..863
-  float ClippingPlane6Origin[4];    // 864..879
-  float ClippingPlane6Normal[4];    // 880..895
-  float ClippingPlane7Origin[4];    // 896..911
-  float ClippingPlane7Normal[4];    // 912..927
-  // Mask / label map support
-  float UseMask;                  // 928
-  float MaskBlendFactor;          // 932
-  float MaskScale;                // 936
-  float MaskBias;                 // 940
-  float LabelMapNumLabels;        // 944
-  float UseDepthTexture;          // 948
-  float UseNormalTexture;         // 952
-  float _padMask;                 // 956
-  // Min-max acceleration texture
-  float UseMinMaxAccel;           // 960
-  float MinMaxDimX;               // 964
-  float MinMaxDimY;               // 968
-  float MinMaxDimZ;               // 972
-};
-
 static_assert(sizeof(VolumeMapperUniforms) == 976,
   "VolumeMapperUniforms must be 976 bytes to match Metal shader struct");
 
@@ -5651,35 +5566,185 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     return;
   }
 
-  // Update uniforms
-  VolumeMapperUniforms uniforms = {};
+  // --- Uniform caching ---
+  // Start from cached values; only rebuild fields whose dependencies changed.
+  VolumeMapperUniforms uniforms = this->CachedUniforms;
 
+  vtkMTimeType volMTime = vol->GetMTime();
+
+  // Lazy model matrix + inverse (cached to avoid redundant vtkMatrix4x4::Invert)
   vtkNew<vtkMatrix4x4> modelMatrix;
   vol->GetModelToWorldMatrix(modelMatrix);
-
   vtkNew<vtkMatrix4x4> invModelMatrix;
-  vtkMatrix4x4::Invert(modelMatrix, invModelMatrix);
 
-  for (int r = 0; r < 4; ++r)
+  if (this->CachedMatrixBuildTime < volMTime)
+  {
+    vtkMatrix4x4::Invert(modelMatrix, invModelMatrix);
+    for (int c = 0; c < 4; ++c)
+      for (int r = 0; r < 4; ++r)
+      {
+        int idx = c * 4 + r;
+        this->CachedModelMatrixData[idx] = modelMatrix->GetElement(r, c);
+        this->CachedInvModelMatrixData[idx] = invModelMatrix->GetElement(r, c);
+      }
+    this->CachedMatrixBuildTime.Modified();
+  }
+  else
   {
     for (int c = 0; c < 4; ++c)
-    {
-      uniforms.VolumeToWorldMatrix[c * 4 + r] = modelMatrix->GetElement(r, c);
-      uniforms.WorldToVolumeMatrix[c * 4 + r] = invModelMatrix->GetElement(r, c);
-    }
+      for (int r = 0; r < 4; ++r)
+        invModelMatrix->SetElement(r, c, this->CachedInvModelMatrixData[c * 4 + r]);
   }
 
+  vtkMTimeType propMTime = vol->GetProperty() ? vol->GetProperty()->GetMTime() : 0;
+  vtkMTimeType inputMTime = input->GetMTime();
+  vtkMTimeType selfMTime = this->GetMTime();
+
+  bool rebuildUniforms =
+    (this->UniformsBuildTime < volMTime) ||
+    (this->UniformsBuildTime < propMTime) ||
+    (this->UniformsBuildTime < inputMTime) ||
+    (this->UniformsBuildTime < selfMTime) ||
+    (this->UniformsBuildTime < this->VolumeUploadTime) ||
+    (this->UniformsBuildTime < this->TransferFunctionUploadTime) ||
+    (this->UniformsBuildTime < this->GradientOpacityUploadTime) ||
+    (this->UniformsBuildTime < this->MaskUpdateTime);
+
+  if (rebuildUniforms)
+  {
+    // ======= Model matrix uniforms =======
+    for (int r = 0; r < 4; ++r)
+      for (int c = 0; c < 4; ++c)
+      {
+        uniforms.VolumeToWorldMatrix[c * 4 + r] = modelMatrix->GetElement(r, c);
+        uniforms.WorldToVolumeMatrix[c * 4 + r] = invModelMatrix->GetElement(r, c);
+      }
+
+    // ======= Volume bounds =======
+    {
+      double* mb = this->ModelBounds;
+      uniforms.VolumeBoundsMin[0] = static_cast<float>(mb[0]);
+      uniforms.VolumeBoundsMin[1] = static_cast<float>(mb[2]);
+      uniforms.VolumeBoundsMin[2] = static_cast<float>(mb[4]);
+      uniforms.VolumeBoundsMin[3] = 1.0f;
+      uniforms.VolumeBoundsMax[0] = static_cast<float>(mb[1]);
+      uniforms.VolumeBoundsMax[1] = static_cast<float>(mb[3]);
+      uniforms.VolumeBoundsMax[2] = static_cast<float>(mb[5]);
+      uniforms.VolumeBoundsMax[3] = 1.0f;
+    }
+
+    // ======= Scalar range (half-precision) =======
+    {
+      float normFactor = this->ScalarNormalizationFactor;
+      uniforms.ScalarMinHalf = FloatToHalf(static_cast<float>(this->ScalarRange[0] / normFactor));
+      uniforms.ScalarMaxHalf = FloatToHalf(static_cast<float>(
+        (this->ScalarRange[1] > this->ScalarRange[0]
+           ? this->ScalarRange[1]
+           : this->ScalarRange[0] + 1.0) /
+        normFactor));
+    }
+
+    // ======= Gradient-based shading (property-dependent) =======
+    {
+      vtkVolumeProperty* property = vol->GetProperty();
+      bool shadeOn = property && property->GetShade();
+      bool hasGradOp = property && property->HasGradientOpacity();
+
+      uniforms.UseGradientShading = shadeOn ? 1.0f : 0.0f;
+      uniforms.UseGradientOpacity = (shadeOn && hasGradOp) ? 1.0f : 0.0f;
+
+      int dims[3];
+      input->GetDimensions(dims);
+      for (int k = 0; k < 3; ++k)
+        uniforms.GradientStep[k] = (dims[k] > 0) ? 1.0f / dims[k] : 1.0f;
+
+      double scalarRange = this->ScalarRange[1] - this->ScalarRange[0];
+      if (scalarRange <= 0.0)
+        scalarRange = 1.0;
+      uniforms.GradientOpacityMin = 0.0f;
+      uniforms.GradientOpacityMax = static_cast<float>(
+        (scalarRange * 0.25) / this->ScalarNormalizationFactor);
+
+      if (property)
+      {
+        double amb = property->GetAmbient();
+        double dif = property->GetDiffuse();
+        double spec = property->GetSpecular();
+        double power = property->GetSpecularPower();
+        uniforms.AmbientColor[0] = uniforms.AmbientColor[1] = uniforms.AmbientColor[2] =
+          static_cast<float>(amb);
+        uniforms.DiffuseColor[0] = uniforms.DiffuseColor[1] = uniforms.DiffuseColor[2] =
+          static_cast<float>(dif);
+        uniforms.SpecularColor[0] = uniforms.SpecularColor[1] = uniforms.SpecularColor[2] =
+          static_cast<float>(spec);
+        uniforms.Shininess = static_cast<float>(power);
+      }
+    }
+
+    // ======= UseJittering =======
+    uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;
+
+    // ======= Cropping =======
+    if (this->GetCropping())
+    {
+      uniforms.UseCropping = 1.0f;
+      double* mb = this->ModelBounds;
+      double bs[3] = { mb[1] - mb[0], mb[3] - mb[2], mb[5] - mb[4] };
+      for (int k = 0; k < 3; ++k)
+        if (bs[k] < 1e-10) bs[k] = 1.0;
+
+      double croppingRegionPlanes[6];
+      this->GetCroppingRegionPlanes(croppingRegionPlanes);
+
+      for (int i = 0; i < 3; ++i)
+      {
+        int minIdx = i * 2;
+        int maxIdx = i * 2 + 1;
+        croppingRegionPlanes[minIdx] =
+          std::max(croppingRegionPlanes[minIdx], mb[minIdx]);
+        croppingRegionPlanes[minIdx] =
+          std::min(croppingRegionPlanes[minIdx], mb[maxIdx]);
+        croppingRegionPlanes[maxIdx] =
+          std::max(croppingRegionPlanes[maxIdx], mb[minIdx]);
+        croppingRegionPlanes[maxIdx] =
+          std::min(croppingRegionPlanes[maxIdx], mb[maxIdx]);
+      }
+
+      uniforms.CroppingPlanes[0] =
+        static_cast<float>((croppingRegionPlanes[0] - mb[0]) / bs[0]);
+      uniforms.CroppingPlanes[1] =
+        static_cast<float>((croppingRegionPlanes[1] - mb[0]) / bs[0]);
+      uniforms.CroppingPlanes[2] =
+        static_cast<float>((croppingRegionPlanes[2] - mb[2]) / bs[1]);
+      uniforms.CroppingPlanes[3] =
+        static_cast<float>((croppingRegionPlanes[3] - mb[2]) / bs[1]);
+      uniforms.CroppingPlanes2[0] =
+        static_cast<float>((croppingRegionPlanes[4] - mb[4]) / bs[2]);
+      uniforms.CroppingPlanes2[1] =
+        static_cast<float>((croppingRegionPlanes[5] - mb[4]) / bs[2]);
+      uniforms.CroppingPlanes2[2] = 0.0f;
+      uniforms.CroppingPlanes2[3] = 0.0f;
+
+      uniforms.CroppingBitmask = static_cast<uint32_t>(this->GetCroppingRegionFlags());
+    }
+    else
+    {
+      uniforms.UseCropping = 0.0f;
+    }
+
+    // ======= Clipping planes =======
+    this->SetClippingPlaneUniforms(&uniforms, ren, vol, modelMatrix, invModelMatrix);
+
+    // ======= Mask / label map =======
+    this->SetMaskUniforms(&uniforms, vol);
+
+    this->CachedUniforms = uniforms;
+    this->UniformsBuildTime.Modified();
+  }
+
+  // ======= Always-updated fields (camera-dependent or per-frame) =======
+
   double* modelBounds = this->ModelBounds;
-  uniforms.VolumeBoundsMin[0] = static_cast<float>(modelBounds[0]);
-  uniforms.VolumeBoundsMin[1] = static_cast<float>(modelBounds[2]);
-  uniforms.VolumeBoundsMin[2] = static_cast<float>(modelBounds[4]);
-  uniforms.VolumeBoundsMin[3] = 1.0f;
-
-  uniforms.VolumeBoundsMax[0] = static_cast<float>(modelBounds[1]);
-  uniforms.VolumeBoundsMax[1] = static_cast<float>(modelBounds[3]);
-  uniforms.VolumeBoundsMax[2] = static_cast<float>(modelBounds[5]);
-  uniforms.VolumeBoundsMax[3] = 1.0f;
-
   double boundsSize[3] = {
     modelBounds[1] - modelBounds[0],
     modelBounds[3] - modelBounds[2],
@@ -5691,25 +5756,27 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       boundsSize[k] = 1.0;
   }
 
-  double* camPosWorld = ren->GetActiveCamera()->GetPosition();
-  double camPosVolume[4] = { camPosWorld[0], camPosWorld[1], camPosWorld[2], 1.0 };
-  invModelMatrix->MultiplyPoint(camPosVolume, camPosVolume);
-
-  uniforms.CameraVolumePos[0] =
-    static_cast<float>((camPosVolume[0] - modelBounds[0]) / boundsSize[0]);
-  uniforms.CameraVolumePos[1] =
-    static_cast<float>((camPosVolume[1] - modelBounds[2]) / boundsSize[1]);
-  uniforms.CameraVolumePos[2] =
-    static_cast<float>((camPosVolume[2] - modelBounds[4]) / boundsSize[2]);
-  uniforms.CameraVolumePos[3] = 1.0f;
+  // Camera volume position (camera-dependent)
+  {
+    double* camPosWorld = ren->GetActiveCamera()->GetPosition();
+    double camPosVolume[4] = { camPosWorld[0], camPosWorld[1], camPosWorld[2], 1.0 };
+    invModelMatrix->MultiplyPoint(camPosVolume, camPosVolume);
+    uniforms.CameraVolumePos[0] =
+      static_cast<float>((camPosVolume[0] - modelBounds[0]) / boundsSize[0]);
+    uniforms.CameraVolumePos[1] =
+      static_cast<float>((camPosVolume[1] - modelBounds[2]) / boundsSize[1]);
+    uniforms.CameraVolumePos[2] =
+      static_cast<float>((camPosVolume[2] - modelBounds[4]) / boundsSize[2]);
+    uniforms.CameraVolumePos[3] = 1.0f;
+  }
 
   double maxBoundsSize = std::max({ boundsSize[0], boundsSize[1], boundsSize[2] });
 
+  // Sample distance (computed per-frame from ReductionFactor)
   uniforms.SampleDistanceHalf =
     FloatToHalf(static_cast<float>(actualSampleDistance / maxBoundsSize));
 
-  // Opacity pre-integration factor: stepDistance / unitDistance.
-  // Applied in the shader: alpha = 1.0 - pow(1.0 - alpha, factor).
+  // Opacity pre-integration factor
   {
     vtkVolumeProperty* volProp = vol->GetProperty();
     double unitDist = volProp ? volProp->GetScalarOpacityUnitDistance(0) : 1.0;
@@ -5718,73 +5785,15 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       FloatToHalf(static_cast<float>(actualSampleDistance / unitDist));
   }
 
+  // Light direction (camera-dependent)
   {
-    float normFactor = this->ScalarNormalizationFactor;
-    uniforms.ScalarMinHalf = FloatToHalf(static_cast<float>(this->ScalarRange[0] / normFactor));
-    uniforms.ScalarMaxHalf = FloatToHalf(static_cast<float>(
-      (this->ScalarRange[1] > this->ScalarRange[0]
-         ? this->ScalarRange[1]
-         : this->ScalarRange[0] + 1.0) /
-      normFactor));
-  }
-
-  uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;
-
-  // Gradient-based shading uniforms
-  {
-    vtkVolumeProperty* property = vol->GetProperty();
-    bool shadeOn = property && property->GetShade();
-    bool hasGradOp = property && property->HasGradientOpacity();
-
-    uniforms.UseGradientShading = shadeOn ? 1.0f : 0.0f;
-    uniforms.UseGradientOpacity = (shadeOn && hasGradOp) ? 1.0f : 0.0f;
-
-    // Gradient step: 1/dims per axis for central differences in [0,1] space
-    int dims[3];
-    input->GetDimensions(dims);
-    for (int k = 0; k < 3; ++k)
-    {
-      uniforms.GradientStep[k] = (dims[k] > 0) ? 1.0f / dims[k] : 1.0f;
-    }
-
-    // Gradient opacity normalization range
-    double scalarRange = this->ScalarRange[1] - this->ScalarRange[0];
-    if (scalarRange <= 0.0)
-      scalarRange = 1.0;
-    uniforms.GradientOpacityMin = 0.0f;
-    uniforms.GradientOpacityMax = static_cast<float>(
-      (scalarRange * 0.25) / this->ScalarNormalizationFactor);
-
-    // Material properties from volume property
-    if (property)
-    {
-      double amb = property->GetAmbient();
-      double dif = property->GetDiffuse();
-      double spec = property->GetSpecular();
-      double power = property->GetSpecularPower();
-      uniforms.AmbientColor[0] = uniforms.AmbientColor[1] = uniforms.AmbientColor[2] =
-        static_cast<float>(amb);
-      uniforms.DiffuseColor[0] = uniforms.DiffuseColor[1] = uniforms.DiffuseColor[2] =
-        static_cast<float>(dif);
-      uniforms.SpecularColor[0] = uniforms.SpecularColor[1] = uniforms.SpecularColor[2] =
-        static_cast<float>(spec);
-      uniforms.Shininess = static_cast<float>(power);
-    }
-
-    // Light direction: headlight (camera-to-volume direction in volume [0,1] space)
-    // The gradient normal points inward (toward increasing scalar), matching the
-    // OpenGL convention where normals are negated in the lighting calculation.
     double camDirWorld[3];
     ren->GetActiveCamera()->GetDirectionOfProjection(camDirWorld);
-    // Transform to volume-local [0,1] space using inverse model matrix
     double camDirLocal[4] = { camDirWorld[0], camDirWorld[1], camDirWorld[2], 0.0 };
     invModelMatrix->MultiplyPoint(camDirLocal, camDirLocal);
-    // Account for anisotropic bounds scaling in texture space:
-    // direction in [0,1] space must be divided by bounds size to preserve anisotropy
     camDirLocal[0] /= boundsSize[0];
     camDirLocal[1] /= boundsSize[1];
     camDirLocal[2] /= boundsSize[2];
-    // Normalize in volume [0,1] space
     double dirLen = sqrt(camDirLocal[0] * camDirLocal[0] + camDirLocal[1] * camDirLocal[1] +
       camDirLocal[2] * camDirLocal[2]);
     if (dirLen > 1e-10)
@@ -5798,71 +5807,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     uniforms.LightDirection[2] = static_cast<float>(camDirLocal[2]);
   }
 
-  // Cropping regions
-  if (this->GetCropping())
-  {
-    uniforms.UseCropping = 1.0f;
-
-    double croppingRegionPlanes[6];
-    this->GetCroppingRegionPlanes(croppingRegionPlanes);
-
-    // Clamp to loaded bounds (same as OpenGL mapper)
-    for (int i = 0; i < 3; ++i)
-    {
-      int minIdx = i * 2;
-      int maxIdx = i * 2 + 1;
-      croppingRegionPlanes[minIdx] =
-        std::max(croppingRegionPlanes[minIdx], modelBounds[minIdx]);
-      croppingRegionPlanes[minIdx] =
-        std::min(croppingRegionPlanes[minIdx], modelBounds[maxIdx]);
-      croppingRegionPlanes[maxIdx] =
-        std::max(croppingRegionPlanes[maxIdx], modelBounds[minIdx]);
-      croppingRegionPlanes[maxIdx] =
-        std::min(croppingRegionPlanes[maxIdx], modelBounds[maxIdx]);
-    }
-
-    // Convert from model/data coordinates to volume-local [0,1] space.
-    // VTK's GetCroppingRegionPlanes() returns planes in model/data coordinates,
-    // so the direct normalization against modelBounds is correct.
-    uniforms.CroppingPlanes[0] =
-      static_cast<float>((croppingRegionPlanes[0] - modelBounds[0]) / boundsSize[0]);
-    uniforms.CroppingPlanes[1] =
-      static_cast<float>((croppingRegionPlanes[1] - modelBounds[0]) / boundsSize[0]);
-    uniforms.CroppingPlanes[2] =
-      static_cast<float>((croppingRegionPlanes[2] - modelBounds[2]) / boundsSize[1]);
-    uniforms.CroppingPlanes[3] =
-      static_cast<float>((croppingRegionPlanes[3] - modelBounds[2]) / boundsSize[1]);
-    uniforms.CroppingPlanes2[0] =
-      static_cast<float>((croppingRegionPlanes[4] - modelBounds[4]) / boundsSize[2]);
-    uniforms.CroppingPlanes2[1] =
-      static_cast<float>((croppingRegionPlanes[5] - modelBounds[4]) / boundsSize[2]);
-    uniforms.CroppingPlanes2[2] = 0.0f;
-    uniforms.CroppingPlanes2[3] = 0.0f;
-
-    uniforms.CroppingBitmask = static_cast<uint32_t>(this->GetCroppingRegionFlags());
-  }
-  else
-  {
-    uniforms.UseCropping = 0.0f;
-  }
-
-  // Clipping planes
-  this->SetClippingPlaneUniforms(&uniforms, ren, vol, modelMatrix, invModelMatrix);
-
-  // Mask / label map
-  this->SetMaskUniforms(&uniforms, vol);
-
-  // Capture the scene depth texture for early ray termination.
-  // The depth buffer is written by opaque geometry in the earlier render pass.
-  // When MSAA is active, the depth texture is multisampled and cannot be sampled
-  // directly by a shader — disable depth occlusion in that case.
+  // Depth / MinMax / Normal texture flags (resource availability may change per frame)
   int sampleCount = metalRenderWindow ? metalRenderWindow->GetEffectiveSampleCount() : 1;
   this->DepthTextureOcclusion = (sampleCount > 1) ? nullptr : metalRenderWindow->GetDepthTexture();
-
-  // Depth texture flag — set to 1 when we have a real scene depth texture
   uniforms.UseDepthTexture = this->DepthTextureOcclusion ? 1.0f : 0.0f;
 
-  // Min-max acceleration texture
   uniforms.UseMinMaxAccel = this->MinMaxTexture ? 1.0f : 0.0f;
   uniforms.MinMaxDimX = static_cast<float>(this->MinMaxDims[0]);
   uniforms.MinMaxDimY = static_cast<float>(this->MinMaxDims[1]);
@@ -5884,8 +5833,6 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   uniforms.UseNormalTexture = hasNormalTexture ? 1.0f : 0.0f;
 
   // Build feature mask for shader function constant specialization.
-  // When any feature is actively used at runtime, the corresponding bit is set
-  // so GetOrCreateVolumePipeline selects a PSO compiled with that constant = 1.
   int featureMask = 0;
   if (uniforms.UseGradientShading > 0.5f)
     featureMask |= VolumeFeature_Shading;
@@ -5899,8 +5846,6 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     featureMask |= VolumeFeature_NormalTexture;
 
   // Determine if image-space downsampling is active.
-  // Force offscreen rendering when blocks are present to enable inter-block
-  // opacity propagation via Metal framebuffer fetch ([[color(0)]]).
   const float imageSampleDist = this->ImageSampleDistance;
   const bool useImageSampling = (imageSampleDist != 1.0f) || !this->Blocks.empty();
 
@@ -5917,16 +5862,12 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   uniforms.ViewportSize[1] = static_cast<float>(renderHeight);
 
   // Compute view-projection matrix via generic vtkCamera API.
-  // Try the Metal camera first (has a precomputed cached layout), fall back to
-  // computing it from vtkCamera::GetViewTransformMatrix /
-  // GetProjectionTransformMatrix so the mapper stays functional even if the
-  // camera override is not in place.
   vtkMetalCamera* metalCamera = vtkMetalCamera::SafeDownCast(ren->GetActiveCamera());
   if (metalCamera)
   {
     const float* sceneData = static_cast<const float*>(metalCamera->GetCachedSceneTransforms());
-    const float* V = sceneData;         // ViewMatrix at offset 0
-    const float* P = sceneData + 16;    // ProjectionMatrix at offset 64 (16 floats)
+    const float* V = sceneData;
+    const float* P = sceneData + 16;
     for (int c = 0; c < 4; ++c)
     {
       for (int r = 0; r < 4; ++r)
@@ -5939,14 +5880,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   }
   else
   {
-    // Generic fallback: compute VP from vtkCamera matrices.
-    // Metal clip-space uses Z in [0,1], so nearz=0, farz=1.
     vtkCamera* cam = ren->GetActiveCamera();
     int* size = ren->GetSize();
     double aspect = (size[1] > 0) ? static_cast<double>(size[0]) / size[1] : 1.0;
     vtkMatrix4x4* V4 = cam->GetViewTransformMatrix();
     vtkMatrix4x4* P4 = cam->GetProjectionTransformMatrix(aspect, 0.0, 1.0);
-    // Compute P*V column-major (Metal convention: column vectors)
     for (int c = 0; c < 4; ++c)
     {
       for (int r = 0; r < 4; ++r)
@@ -5961,7 +5899,6 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   }
 
   // Compute inverse view-projection matrix for depth buffer occlusion.
-  // Used in the fragment shader to unproject depth values to world space.
   {
     simd_float4x4 vpMat;
     memcpy(&vpMat, uniforms.ViewProjectionMatrix, sizeof(vpMat));
