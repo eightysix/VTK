@@ -55,7 +55,7 @@ VTK_MODULE_INIT(vtkRenderingMetal);
 
   UIKeyCommand* benchmarkCmd = [UIKeyCommand
       keyCommandWithInput:@"b"
-            modifierFlags:UIKeyModifierCommand
+            modifierFlags:UIKeyModifierCommand | UIKeyModifierAlternate
                    action:@selector(toggleBenchmark:)];
   benchmarkCmd.title = @"Toggle Benchmark";
   benchmarkCmd.discoverabilityTitle = @"Toggle GPU Benchmark";
@@ -129,7 +129,7 @@ VTK_MODULE_INIT(vtkRenderingMetal);
     return (UITabBarController*)root;
   }
   // If root is ViewController which has a tab bar as child
-  for (UIViewController* child in root.children)
+  for (UIViewController* child in root.childViewControllers)
   {
     if ([child isKindOfClass:[UITabBarController class]])
     {
