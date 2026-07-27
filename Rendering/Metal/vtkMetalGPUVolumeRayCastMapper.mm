@@ -1457,6 +1457,12 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       VolumeFeature_Shading | VolumeFeature_Mask | VolumeFeature_MinMax,
       VolumeFeature_Shading | VolumeFeature_NormalTexture,
       VolumeFeature_Shading | VolumeFeature_NormalTexture | VolumeFeature_MinMax,
+      // Pre-integrated TF permutations
+      VolumeFeature_PreIntegratedTF,
+      VolumeFeature_PreIntegratedTF | VolumeFeature_MinMax,
+      VolumeFeature_Shading | VolumeFeature_PreIntegratedTF,
+      VolumeFeature_Shading | VolumeFeature_PreIntegratedTF | VolumeFeature_MinMax,
+      VolumeFeature_Shading | VolumeFeature_PreIntegratedTF | VolumeFeature_GradientOpacity | VolumeFeature_MinMax,
     };
 
     struct PreWarmSpec {
@@ -1570,6 +1576,132 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
   }
 
   return this->ColorOpacityTexture != nullptr;
+}
+
+//------------------------------------------------------------------------------
+bool vtkMetalGPUVolumeRayCastMapper::UpdatePreIntegratedTFTexture(
+  void* mtlDeviceVoid, void* mtlQueueVoid, vtkVolume* vol)
+{
+  vtkVolumeProperty* property = vol->GetProperty();
+  if (!property)
+  {
+    return false;
+  }
+
+  vtkColorTransferFunction* colorFunc = property->GetRGBTransferFunction();
+  vtkPiecewiseFunction* opacityFunc = property->GetScalarOpacity();
+  if (!colorFunc || !opacityFunc)
+  {
+    return false;
+  }
+
+  double unitDist = property->GetScalarOpacityUnitDistance(0);
+  if (unitDist <= 0.0) unitDist = 1.0;
+
+  bool scalarRangeChanged =
+    (this->ScalarRange[0] != this->LastPreIntegScalarRange[0]) ||
+    (this->ScalarRange[1] != this->LastPreIntegScalarRange[1]);
+
+  bool doReload = (this->PreIntegratedTFTexture == nullptr);
+  doReload |= (colorFunc->GetMTime() > this->PreIntegratedTFUploadTime.GetMTime());
+  doReload |= (opacityFunc->GetMTime() > this->PreIntegratedTFUploadTime.GetMTime());
+  doReload |= scalarRangeChanged;
+  doReload |= (unitDist != this->LastPreIntegUnitDistance);
+
+  if (doReload)
+  {
+    @autoreleasepool
+    {
+      id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
+
+      const int TF_SIZE = 256;
+      const int N_SUBSTEPS = 32;
+      std::vector<uint16_t> texData(TF_SIZE * TF_SIZE * 4);
+
+      vtkSMPTools::For(0, TF_SIZE, [&](vtkIdType begin, vtkIdType end) {
+        for (vtkIdType sb = begin; sb < end; ++sb)
+        {
+          for (int sf = 0; sf < TF_SIZE; ++sf)
+          {
+            double sfVal = this->ScalarRange[0] +
+              (this->ScalarRange[1] - this->ScalarRange[0]) * sf / (TF_SIZE - 1.0);
+            double sbVal = this->ScalarRange[0] +
+              (this->ScalarRange[1] - this->ScalarRange[0]) * sb / (TF_SIZE - 1.0);
+
+            double integralTau = 0.0;
+            double integralColorTau[3] = { 0.0, 0.0, 0.0 };
+            double accumulatedTau = 0.0;
+
+            for (int k = 0; k < N_SUBSTEPS; ++k)
+            {
+              double t0 = static_cast<double>(k) / N_SUBSTEPS;
+              double t1 = static_cast<double>(k + 1) / N_SUBSTEPS;
+              double sMid = sfVal + (sbVal - sfVal) * (t0 + t1) / 2.0;
+
+              double rgb[3];
+              colorFunc->GetColor(sMid, rgb);
+              double tau = opacityFunc->GetValue(sMid);
+
+              double dt = 1.0 / N_SUBSTEPS;
+              integralTau += tau * dt;
+
+              double extinctionSoFar = accumulatedTau;
+              double weight = exp(-extinctionSoFar);
+              for (int c = 0; c < 3; ++c)
+              {
+                integralColorTau[c] += rgb[c] * tau * weight * dt;
+              }
+              accumulatedTau += tau * dt;
+            }
+
+            double piOpacity = 1.0 - exp(-integralTau);
+            double piColor[3];
+            if (piOpacity > 1e-6)
+            {
+              for (int c = 0; c < 3; ++c)
+                piColor[c] = integralColorTau[c] / piOpacity;
+            }
+            else
+            {
+              piColor[0] = piColor[1] = piColor[2] = 0.0;
+            }
+
+            int idx = static_cast<int>(sb) * TF_SIZE + sf;
+            texData[idx * 4 + 0] = FloatToHalf(
+              static_cast<float>(std::clamp(piColor[0], 0.0, 1.0)));
+            texData[idx * 4 + 1] = FloatToHalf(
+              static_cast<float>(std::clamp(piColor[1], 0.0, 1.0)));
+            texData[idx * 4 + 2] = FloatToHalf(
+              static_cast<float>(std::clamp(piColor[2], 0.0, 1.0)));
+            texData[idx * 4 + 3] = FloatToHalf(
+              static_cast<float>(std::clamp(integralTau, 0.0, 64.0)));
+          }
+        }
+      });
+
+      id<MTLTexture> tex = EnsureTexture2D(device, this->PreIntegratedTFTexture,
+        MTLPixelFormatRGBA16Float, TF_SIZE, TF_SIZE,
+        MTLTextureUsageShaderRead, MTLStorageModeShared);
+      if (!tex)
+      {
+        vtkErrorMacro("Failed to create pre-integrated transfer function texture");
+        return false;
+      }
+
+      MTLRegion region = MTLRegionMake2D(0, 0, TF_SIZE, TF_SIZE);
+      [tex replaceRegion:region
+            mipmapLevel:0
+              withBytes:texData.data()
+            bytesPerRow:TF_SIZE * 4 * sizeof(uint16_t)];
+
+      this->LastPreIntegScalarRange[0] = this->ScalarRange[0];
+      this->LastPreIntegScalarRange[1] = this->ScalarRange[1];
+      this->LastPreIntegUnitDistance = unitDist;
+      this->PreIntegratedTFUploadTime.Modified();
+    }
+  }
+
+  return this->PreIntegratedTFTexture != nullptr;
 }
 
 //------------------------------------------------------------------------------
@@ -4842,12 +4974,14 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     BOOL mask    = (featureMask & VolumeFeature_Mask) ? YES : NO;
     BOOL minmax  = (featureMask & VolumeFeature_MinMax) ? YES : NO;
     BOOL normalTex = (featureMask & VolumeFeature_NormalTexture) ? YES : NO;
+    BOOL preInteg = (featureMask & VolumeFeature_PreIntegratedTF) ? YES : NO;
 
     [constants setConstantValue:&shading type:MTLDataTypeBool withName:@"fc_shading"];
     [constants setConstantValue:&gradOp  type:MTLDataTypeBool withName:@"fc_gradientOpacity"];
     [constants setConstantValue:&mask    type:MTLDataTypeBool withName:@"fc_mask"];
     [constants setConstantValue:&minmax  type:MTLDataTypeBool withName:@"fc_minmax"];
     [constants setConstantValue:&normalTex type:MTLDataTypeBool withName:@"fc_normalTexture"];
+    [constants setConstantValue:&preInteg type:MTLDataTypeBool withName:@"fc_preIntegratedTF"];
 
     fragFunc = [library newFunctionWithName:fragName
                              constantValues:constants
@@ -5059,8 +5193,12 @@ void vtkMetalGPUVolumeRayCastMapper::BindFragmentTextures(
       ? (__bridge id<MTLTexture>)this->VolumeTexture.get()
       : (__bridge id<MTLTexture>)this->DummyVolumeTexture.get());
 
-  id<MTLTexture> textures[8] = { vol, tfTex, depthTex, gradOpTex, maskTex, labelTfTex, mmTex, nrmTex };
-  for (NSUInteger i = 0; i < 8; ++i)
+  id<MTLTexture> piTex = this->PreIntegratedTFTexture
+    ? (__bridge id<MTLTexture>)this->PreIntegratedTFTexture.get()
+    : tfTex; // fallback: 1D TF (will be sampled as 2D with linear, gated by usePreIntegratedTF)
+
+  id<MTLTexture> textures[9] = { vol, tfTex, depthTex, gradOpTex, maskTex, labelTfTex, mmTex, nrmTex, piTex };
+  for (NSUInteger i = 0; i < 9; ++i)
     [enc setFragmentTexture:textures[i] atIndex:i];
 }
 
@@ -5550,6 +5688,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   }
   this->UpdateGradientOpacityTexture(mtlDevice, mtlQueue, vol);
 
+  // Pre-integrated transfer function (Phase 1A)
+  this->UpdatePreIntegratedTFTexture(mtlDevice, mtlQueue, vol);
+
   // Update mask / label map textures
   if (this->MaskInput && this->MaskType == vtkGPUVolumeRayCastMapper::LabelMapMaskType)
   {
@@ -5776,13 +5917,23 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   uniforms.SampleDistanceHalf =
     FloatToHalf(static_cast<float>(actualSampleDistance / maxBoundsSize));
 
-  // Opacity pre-integration factor
+  // Opacity pre-integration factor (legacy 1D path)
   {
     vtkVolumeProperty* volProp = vol->GetProperty();
     double unitDist = volProp ? volProp->GetScalarOpacityUnitDistance(0) : 1.0;
     if (unitDist <= 0.0) unitDist = 1.0;
     uniforms.OpacityPreIntegrationFactorHalf =
       FloatToHalf(static_cast<float>(actualSampleDistance / unitDist));
+  }
+
+  // Pre-integrated TF (2D path)
+  {
+    uniforms.UsePreIntegratedTF = this->PreIntegratedTFTexture ? 1.0f : 0.0f;
+    vtkVolumeProperty* volProp = vol->GetProperty();
+    double unitDist = volProp ? volProp->GetScalarOpacityUnitDistance(0) : 1.0;
+    if (unitDist <= 0.0) unitDist = 1.0;
+    uniforms.PreIntegStepFactor =
+      static_cast<float>(actualSampleDistance / unitDist);
   }
 
   // Light direction (camera-dependent)
@@ -5844,6 +5995,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     featureMask |= VolumeFeature_MinMax;
   if (hasNormalTexture)
     featureMask |= VolumeFeature_NormalTexture;
+  if (this->PreIntegratedTFTexture && !(uniforms.UseMask > 0.5f))
+    featureMask |= VolumeFeature_PreIntegratedTF;
 
   // Determine if image-space downsampling is active.
   const float imageSampleDist = this->ImageSampleDistance;

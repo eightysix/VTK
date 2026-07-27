@@ -1272,6 +1272,7 @@ constant bool fc_gradientOpacity [[function_constant(1)]];
 constant bool fc_mask [[function_constant(2)]];
 constant bool fc_minmax [[function_constant(3)]];
 constant bool fc_normalTexture [[function_constant(4)]];
+constant bool fc_preIntegratedTF [[function_constant(5)]];
 
 // ============================================================================
 // Volume Ray Casting Mapper
@@ -1306,7 +1307,9 @@ struct VolumeMapperUniforms {
   float4 croppingPlanes;
   float4 croppingPlanes2;
   uint croppingBitmask;
-  float _padCropFlags[31];
+  float usePreIntegratedTF;
+  float preIntegStepFactor;
+  float _padCropFlags[29];
   float useCropping;
   float useClipping;
   float numClippingPlanes;
@@ -1550,11 +1553,13 @@ inline half4 marchVolume(
     texture3d<float> maskTexture,
     texture2d<float> labelMapTransferTexture,
     texture3d<float> minMaxTexture,
-    texture3d<float> normalTexture) {
+    texture3d<float> normalTexture,
+    texture2d<float> preIntegratedTF) {
   const bool doShading = fc_shading && (volumeUniforms.useGradientShading > 0.5);
   const bool doGradOp = fc_gradientOpacity && (volumeUniforms.useGradientOpacity > 0.5);
   const bool doCropping = volumeUniforms.useCropping > 0.5;
   const bool doMask = fc_mask && (volumeUniforms.useMask > 0.5);
+  const bool usePreInteg = fc_preIntegratedTF && (volumeUniforms.usePreIntegratedTF > 0.5) && !doMask;
 
   half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
   half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
@@ -1598,6 +1603,7 @@ inline half4 marchVolume(
   float prefetchScalar = volumeTexture.sample(sVolume, evalPoint0, level(0)).r;
   float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint0, level(0)).r : 0.0;
   bool prefetchValid = true;
+  float prevScalar = prefetchScalar;
   int3  curCell     = int3(-1);
   bool  curCellEmpty = false;
   float3 mmDimF     = b.minMaxInfo.yzw;
@@ -1677,78 +1683,117 @@ inline half4 marchVolume(
     }
 
     if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, lastPoint))) == 0u)) {
+      prevScalar = rawScalar;
       continue;
     }
 
     half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
 
-    half4 colorOpacity;
-    half maskLabel = 0.0h;
+    if (usePreInteg) {
+      half sf = saturate(half(prevScalar) * scalarScale + scalarBias);
+      half sb = scalarNorm;
+      half4 pi = half4(preIntegratedTF.sample(sVolume, float2(float(sf), float(sb)), level(0)));
+      half sampleOpacity = 1.0h - exp(-pi.a * half(volumeUniforms.preIntegStepFactor));
 
-    if (doMask) {
-      float maskVal = rawMask * maskScale + maskBias;
-      if (numLabels > 0.0) {
-        float label = floor(maskVal + 0.5);
-        if (label > 0.0) {
-          label = clamp(label, 1.0, numLabels - 1.0);
-          maskLabel = half(label);
-          float labelY = (label + 0.5) / numLabels;
-          colorOpacity = half4(labelMapTransferTexture.sample(sNearest, float2(float(scalarNorm), labelY), level(0)));
+      if (sampleOpacity > 0.001h) {
+        half3 sampleColor = pi.rgb;
+        half weight = 1.0h - accumulatedOpacity;
+
+        if (doShading) {
+          half4 tfSample = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
+          half3 rawColor = tfSample.rgb;
+
+          half3 normal;
+          half gradMag;
+          if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
+            half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
+            normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
+            gradMag = nrmSample.w;
+          } else {
+            half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
+            normal = grad.xyz;
+            gradMag = grad.w;
+          }
+
+          half3 litColor = computePhongLightingVolumeFast(rawColor, normal, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
+
+          if (doGradOp) {
+            sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(gradMag), 0.5), level(0)).r);
+          }
+
+          accumulatedColor += weight * litColor * sampleOpacity;
+        } else {
+          accumulatedColor += weight * sampleColor * sampleOpacity;
+        }
+        accumulatedOpacity += weight * sampleOpacity;
+      }
+    } else {
+      half4 colorOpacity;
+      half maskLabel = 0.0h;
+
+      if (doMask) {
+        float maskVal = rawMask * maskScale + maskBias;
+        if (numLabels > 0.0) {
+          float label = floor(maskVal + 0.5);
+          if (label > 0.0) {
+            label = clamp(label, 1.0, numLabels - 1.0);
+            maskLabel = half(label);
+            float labelY = (label + 0.5) / numLabels;
+            colorOpacity = half4(labelMapTransferTexture.sample(sNearest, float2(float(scalarNorm), labelY), level(0)));
+          } else {
+            colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
+          }
         } else {
           colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
         }
       } else {
         colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
       }
-    } else {
-      colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
-    }
 
-    half sampleOpacity = colorOpacity.a;
-    // Shader-side opacity pre-integration: adjust raw opacity by step distance.
-    // Avoids CPU rebuild of the TF texture when sample distance changes.
-    half stepFactor = volumeUniforms.opacityPreIntegrationFactor;
-    if (sampleOpacity > 0.0001h && stepFactor > 0.0h) {
+      half sampleOpacity = colorOpacity.a;
+      half stepFactor = volumeUniforms.opacityPreIntegrationFactor;
+      if (sampleOpacity > 0.0001h && stepFactor > 0.0h) {
         sampleOpacity = 1.0h - pow(1.0h - sampleOpacity, stepFactor);
-    }
+      }
 
-    if (sampleOpacity > 0.001h) {
-      half3 sampleColor = colorOpacity.rgb;
-      half weight = 1.0h - accumulatedOpacity;
+      if (sampleOpacity > 0.001h) {
+        half3 sampleColor = colorOpacity.rgb;
+        half weight = 1.0h - accumulatedOpacity;
 
-      if (sampleOpacity < 0.01h) {
-        accumulatedColor += weight * sampleColor * sampleOpacity;
-        accumulatedOpacity += weight * sampleOpacity;
-      } else {
-
-      if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
-
-        half3 normal;
-        half gradMag;
-
-        if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
-          half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
-          normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
-          gradMag = nrmSample.w;
+        if (sampleOpacity < 0.01h) {
+          accumulatedColor += weight * sampleColor * sampleOpacity;
+          accumulatedOpacity += weight * sampleOpacity;
         } else {
-          half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
-          normal = grad.xyz;
-          gradMag = grad.w;
+          if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
+            half3 normal;
+            half gradMag;
+
+            if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
+              half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
+              normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
+              gradMag = nrmSample.w;
+            } else {
+              half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
+              normal = grad.xyz;
+              gradMag = grad.w;
+            }
+
+            sampleColor = computePhongLightingVolumeFast(sampleColor, normal, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
+
+            if (doGradOp) {
+              sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(gradMag), 0.5), level(0)).r);
+            }
+          } else if (doShading) {
+            sampleColor = ambientMat * sampleColor;
+          }
+
+          accumulatedColor += weight * sampleColor * sampleOpacity;
+          accumulatedOpacity += weight * sampleOpacity;
         }
-
-        sampleColor = computePhongLightingVolumeFast(sampleColor, normal, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
-
-        if (doGradOp) {
-          sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(gradMag), 0.5), level(0)).r);
-        }
-      } else if (doShading) {
-        sampleColor = ambientMat * sampleColor;
-      }
-
-      accumulatedColor += weight * sampleColor * sampleOpacity;
-      accumulatedOpacity += weight * sampleOpacity;
       }
     }
+
+    prevScalar = rawScalar;
 
     if (accumulatedOpacity >= 0.99h) {
       accumulatedColor /= max(accumulatedOpacity, 1e-4h);
@@ -1774,7 +1819,8 @@ fragment VolumeFragmentOut fragment_volume_main(
     texture3d<float> maskTexture [[texture(4)]],
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
-    texture3d<float> normalTexture [[texture(7)]]) {
+    texture3d<float> normalTexture [[texture(7)]],
+    texture2d<float> preIntegratedTF [[texture(8)]]) {
 
   VolumeFragmentOut output;
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
@@ -1795,7 +1841,8 @@ fragment VolumeFragmentOut fragment_volume_main(
       volumeUniforms.sampleDistance, s.totalBoxT, in.position.xy,
       half3(0.0), 0.0h, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture,
-      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
+      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
+      preIntegratedTF);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
@@ -1817,7 +1864,8 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
     texture3d<float> maskTexture [[texture(4)]],
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
-    texture3d<float> normalTexture [[texture(7)]]) {
+    texture3d<float> normalTexture [[texture(7)]],
+    texture2d<float> preIntegratedTF [[texture(8)]]) {
 
   VolumeFragmentOut output;
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
@@ -1842,7 +1890,8 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
       volumeUniforms.sampleDistance, s.totalBoxT, in.position.xy,
       half3(0.0), 0.0h, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture,
-      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
+      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
+      preIntegratedTF);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
@@ -1863,7 +1912,8 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_accum_main(
     texture3d<float> maskTexture [[texture(4)]],
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
-    texture3d<float> normalTexture [[texture(7)]]) {
+    texture3d<float> normalTexture [[texture(7)]],
+    texture2d<float> preIntegratedTF [[texture(8)]]) {
 
   VolumeFragmentOut output;
   if (prevAccum.a >= 0.99h) discard_fragment();
@@ -1892,7 +1942,8 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_accum_main(
       volumeUniforms.sampleDistance, s.totalBoxT, in.position.xy,
       accumulatedColor, accumulatedOpacity, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture,
-      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
+      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
+      preIntegratedTF);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
@@ -1912,7 +1963,8 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
     texture3d<float> maskTexture [[texture(4)]],
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
-    texture3d<float> normalTexture [[texture(7)]]) {
+    texture3d<float> normalTexture [[texture(7)]],
+    texture2d<float> preIntegratedTF [[texture(8)]]) {
 
   VolumeFragmentOut output;
   if (prevAccum.a >= 0.99h) discard_fragment();
@@ -1937,7 +1989,8 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
       volumeUniforms.sampleDistance, s.totalBoxT, in.position.xy,
       accumulatedColor, accumulatedOpacity, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture,
-      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
+      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
+      preIntegratedTF);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }

@@ -71,7 +71,9 @@ struct VolumeMapperUniforms
   float CroppingPlanes[4];          // 480..495
   float CroppingPlanes2[4];         // 496..511
   uint32_t CroppingBitmask;         // 512..515
-  float _padCropFlags[31];          // 516..639
+  float UsePreIntegratedTF;         // 516 (was _padCropFlags[0])
+  float PreIntegStepFactor;         // 520 (was _padCropFlags[1])
+  float _padCropFlags[29];          // 524..639
   float UseCropping;                // 640
   float UseClipping;                // 644
   float NumClippingPlanes;          // 648
@@ -181,6 +183,7 @@ enum VolumeShaderFeatureFlags : uint32_t
   VolumeFeature_Mask            = 1u << 2,
   VolumeFeature_MinMax          = 1u << 3,
   VolumeFeature_NormalTexture    = 1u << 4,
+  VolumeFeature_PreIntegratedTF  = 1u << 5,
 };
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -395,6 +398,12 @@ private:
   bool EnsureImageSampleResources(void* device, int width, int height);
   void ReleaseImageSampleResources();
 
+  // Pre-integrated transfer function (Phase 1A)
+  vtkMetalResource PreIntegratedTFTexture; // id<MTLTexture> (256x256 RGBA16Float)
+  vtkTimeStamp PreIntegratedTFUploadTime;
+  double LastPreIntegScalarRange[2] = { 0.0, 0.0 };
+  double LastPreIntegUnitDistance = -1.0;
+
   // Cache/timestamps
   vtkTimeStamp VolumeUploadTime;
   vtkTimeStamp TransferFunctionUploadTime;
@@ -427,6 +436,9 @@ private:
   // Clipping planes
   void SetClippingPlaneUniforms(void* uniforms, vtkRenderer* ren, vtkVolume* vol,
     vtkMatrix4x4* modelMatrix, vtkMatrix4x4* invModelMatrix);
+
+  // Pre-integrated TF texture generation
+  bool UpdatePreIntegratedTFTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
 
   // Fragment texture binding (consolidated helper)
   void BindFragmentTextures(void* encoder, void* volTex, void* minMaxTex, void* normalTex);
