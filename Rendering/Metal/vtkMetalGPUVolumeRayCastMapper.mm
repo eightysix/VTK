@@ -261,30 +261,78 @@ inline bool HalfRangeIsSafe(double r0, double r1)
 }
 
 //------------------------------------------------------------------------------
+// Generic scalar conversion loop: source type -> writer callback
+template <typename SrcType, typename Writer>
+void ConvertScalarsGeneric(
+  const SrcType* src,
+  vtkIdType numTuples,
+  int numComp,
+  int outComp,
+  Writer&& write)
+{
+  vtkSMPTools::For(0, numTuples, [&](vtkIdType b, vtkIdType e) {
+    for (vtkIdType i = b; i < e; ++i)
+    {
+      for (int c = 0; c < outComp; ++c)
+      {
+        float value = (c < numComp)
+          ? static_cast<float>(src[i * numComp + c])
+          : 0.0f;
+
+        write(i, c, value);
+      }
+    }
+  });
+}
+
 // Templated data conversion: source type -> half
 template <typename SrcType>
-void ConvertToHalf(const SrcType* src, uint16_t* dst,
-                   vtkIdType numTuples, int numComp, int outComp) {
-    vtkSMPTools::For(0, numTuples, [&](vtkIdType b, vtkIdType e) {
-        for (vtkIdType i = b; i < e; ++i)
-            for (int c = 0; c < outComp; ++c)
-                dst[i * outComp + c] = (c < numComp)
-                    ? FloatToHalf(static_cast<float>(src[i * numComp + c]))
-                    : FloatToHalf(0.0f);
+void ConvertToHalf(
+  const SrcType* src,
+  uint16_t* dst,
+  vtkIdType numTuples,
+  int numComp,
+  int outComp)
+{
+  ConvertScalarsGeneric(src, numTuples, numComp, outComp,
+    [&](vtkIdType i, int c, float value) {
+      dst[i * outComp + c] = FloatToHalf(value);
     });
 }
 
 // Templated data conversion: source type -> float
 template <typename SrcType>
-void ConvertToFloat(const SrcType* src, float* dst,
-                    vtkIdType numTuples, int numComp, int outComp) {
-    vtkSMPTools::For(0, numTuples, [&](vtkIdType b, vtkIdType e) {
-        for (vtkIdType i = b; i < e; ++i)
-            for (int c = 0; c < outComp; ++c)
-                dst[i * outComp + c] = (c < numComp)
-                    ? static_cast<float>(src[i * numComp + c])
-                    : 0.0f;
+void ConvertToFloat(
+  const SrcType* src,
+  float* dst,
+  vtkIdType numTuples,
+  int numComp,
+  int outComp)
+{
+  ConvertScalarsGeneric(src, numTuples, numComp, outComp,
+    [&](vtkIdType i, int c, float value) {
+      dst[i * outComp + c] = value;
     });
+}
+
+//------------------------------------------------------------------------------
+// Templated 3-to-4 component expander with a constant alpha pad.
+template <typename T>
+void Expand3To4(
+  const T* src,
+  T* dst,
+  vtkIdType numTuples,
+  T alpha)
+{
+  vtkSMPTools::For(0, numTuples, [&](vtkIdType b, vtkIdType e) {
+    for (vtkIdType i = b; i < e; ++i)
+    {
+      dst[i * 4 + 0] = src[i * 3 + 0];
+      dst[i * 4 + 1] = src[i * 3 + 1];
+      dst[i * 4 + 2] = src[i * 3 + 2];
+      dst[i * 4 + 3] = alpha;
+    }
+  });
 }
 
 //------------------------------------------------------------------------------
@@ -521,6 +569,99 @@ inline void AssignRetainedMetalObject(void*& slot, id obj)
   slot = (__bridge void*)[obj retain];
 }
 
+//------------------------------------------------------------------------------
+// Helper: create a MTLTextureType3D texture with mipmapLevelCount = 1.
+// Returns nil on failure; caller owns the +1 retain count.
+static id<MTLTexture> NewTexture3D(
+  id<MTLDevice> device,
+  MTLPixelFormat format,
+  NSUInteger width,
+  NSUInteger height,
+  NSUInteger depth,
+  MTLTextureUsage usage,
+  MTLStorageMode storage)
+{
+  MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
+  desc.textureType = MTLTextureType3D;
+  desc.pixelFormat = format;
+  desc.width = width;
+  desc.height = height;
+  desc.depth = depth;
+  desc.mipmapLevelCount = 1;
+  desc.usage = usage;
+  desc.storageMode = storage;
+  id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+  [desc release];
+  return tex;
+}
+
+//------------------------------------------------------------------------------
+// Helper: create a MTLTextureType2D texture with mipmapLevelCount = 1.
+static id<MTLTexture> NewTexture2D(
+  id<MTLDevice> device,
+  MTLPixelFormat format,
+  NSUInteger width,
+  NSUInteger height,
+  MTLTextureUsage usage,
+  MTLStorageMode storage)
+{
+  MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
+  desc.textureType = MTLTextureType2D;
+  desc.pixelFormat = format;
+  desc.width = width;
+  desc.height = height;
+  desc.mipmapLevelCount = 1;
+  desc.usage = usage;
+  desc.storageMode = storage;
+  id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+  [desc release];
+  return tex;
+}
+
+//------------------------------------------------------------------------------
+// Helper: create a MTLTextureType2DArray texture with mipmapLevelCount = 1.
+static id<MTLTexture> NewTexture2DArray(
+  id<MTLDevice> device,
+  MTLPixelFormat format,
+  NSUInteger width,
+  NSUInteger height,
+  NSUInteger arrayLength,
+  MTLTextureUsage usage,
+  MTLStorageMode storage)
+{
+  MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
+  desc.textureType = MTLTextureType2DArray;
+  desc.pixelFormat = format;
+  desc.width = width;
+  desc.height = height;
+  desc.depth = 1;
+  desc.arrayLength = arrayLength;
+  desc.mipmapLevelCount = 1;
+  desc.usage = usage;
+  desc.storageMode = storage;
+  id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+  [desc release];
+  return tex;
+}
+
+//------------------------------------------------------------------------------
+// Helper: upload R8 data (one byte per voxel) to a 3D texture region [0..x) x [0..y) x [0..z).
+static void UploadR8Volume3D(
+  id<MTLTexture> tex,
+  const uint8_t* data,
+  int x, int y, int z)
+{
+  MTLRegion region = MTLRegionMake3D(0, 0, 0, x, y, z);
+  NSUInteger bytesPerRow = static_cast<NSUInteger>(x) * sizeof(uint8_t);
+  NSUInteger bytesPerImage = bytesPerRow * static_cast<NSUInteger>(y);
+  [tex replaceRegion:region
+          mipmapLevel:0
+                slice:0
+            withBytes:data
+          bytesPerRow:bytesPerRow
+        bytesPerImage:bytesPerImage];
+}
+
 }
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -706,17 +847,12 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureImageSampleResources(
     id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
 
     // Create offscreen color texture (RGBA16Float for inter-block accumulation)
-    MTLTextureDescriptor* colorDesc = [[MTLTextureDescriptor alloc] init];
-    colorDesc.textureType = MTLTextureType2D;
-    colorDesc.pixelFormat = MTLPixelFormatRGBA16Float;
-    colorDesc.width = width;
-    colorDesc.height = height;
-    colorDesc.mipmapLevelCount = 1;
-    colorDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-    colorDesc.storageMode = MTLStorageModePrivate;
-
-    id<MTLTexture> colorTex = [device newTextureWithDescriptor:colorDesc];
-    [colorDesc release];
+    id<MTLTexture> colorTex = NewTexture2D(
+      device,
+      MTLPixelFormatRGBA16Float,
+      width, height,
+      MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead,
+      MTLStorageModePrivate);
     if (!colorTex)
     {
       vtkErrorMacro("Failed to create image-sample color texture");
@@ -862,18 +998,14 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureGradientNormalTexture(
   @autoreleasepool
   {
     // Create 3D normal texture (RGBA8Unorm: normal.xyz*0.5+0.5 in RGB, gradMag in A)
-    MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-    desc.textureType = MTLTextureType3D;
-    desc.pixelFormat = MTLPixelFormatRGBA8Unorm;
-    desc.width = dims[0];
-    desc.height = dims[1];
-    desc.depth = dims[2];
-    desc.mipmapLevelCount = 1;
-    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-    desc.storageMode = MTLStorageModePrivate;
-
-    id<MTLTexture> normalTex = [device newTextureWithDescriptor:desc];
-    [desc release];
+    id<MTLTexture> normalTex = NewTexture3D(
+      device,
+      MTLPixelFormatRGBA8Unorm,
+      static_cast<NSUInteger>(dims[0]),
+      static_cast<NSUInteger>(dims[1]),
+      static_cast<NSUInteger>(dims[2]),
+      MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
+      MTLStorageModePrivate);
     if (!normalTex)
     {
       vtkErrorMacro("Failed to create gradient normal texture");
@@ -972,19 +1104,14 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureLayerResources(void* deviceVoid, int 
   this->LayerTextureCapacity = 0;
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
-  MTLTextureDescriptor* d = [[MTLTextureDescriptor alloc] init];
-  d.textureType = MTLTextureType2DArray;
-  d.pixelFormat = MTLPixelFormatRGBA16Float;
-  d.width = w;
-  d.height = h;
-  d.depth = 1;
-  d.arrayLength = capacity;
-  d.mipmapLevelCount = 1;
-  d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-  d.storageMode = MTLStorageModePrivate;
-
-  id<MTLTexture> texArray = [device newTextureWithDescriptor:d];
-  [d release];
+  id<MTLTexture> texArray = NewTexture2DArray(
+    device,
+    MTLPixelFormatRGBA16Float,
+    static_cast<NSUInteger>(w),
+    static_cast<NSUInteger>(h),
+    static_cast<NSUInteger>(capacity),
+    MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead,
+    MTLStorageModePrivate);
   if (!texArray)
   {
     vtkErrorMacro("Failed to create layer texture array");
@@ -1321,18 +1448,14 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           // Ensure texture has ShaderWrite usage for compute kernel output
           ReleaseMetalObject(this->VolumeTexture);
 
-          MTLTextureDescriptor* texDesc = [[MTLTextureDescriptor alloc] init];
-          texDesc.textureType = MTLTextureType3D;
-          texDesc.pixelFormat = fmtInfo.Format;
-          texDesc.width = dims[0];
-          texDesc.height = dims[1];
-          texDesc.depth = dims[2];
-          texDesc.mipmapLevelCount = 1;
-          texDesc.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
-          texDesc.storageMode = MTLStorageModePrivate;
-
-          id<MTLTexture> tex = [device newTextureWithDescriptor:texDesc];
-          [texDesc release];
+          id<MTLTexture> tex = NewTexture3D(
+            device,
+            fmtInfo.Format,
+            static_cast<NSUInteger>(dims[0]),
+            static_cast<NSUInteger>(dims[1]),
+            static_cast<NSUInteger>(dims[2]),
+            MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead,
+            MTLStorageModePrivate);
           if (!tex)
           {
             vtkErrorMacro("Failed to create 3D volume texture for GPU conversion");
@@ -1387,32 +1510,19 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
         }
         else if (dataType == VTK_FLOAT && numComponents == 3)
         {
-          const float* src = static_cast<const float*>(scalars->GetVoidPointer(0));
-          float* dst = static_cast<float*>(uploadPointer);
-          vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
-            for (vtkIdType i = begin; i < end; ++i)
-            {
-              dst[i * 4 + 0] = src[i * 3 + 0];
-              dst[i * 4 + 1] = src[i * 3 + 1];
-              dst[i * 4 + 2] = src[i * 3 + 2];
-              dst[i * 4 + 3] = 0.0f;
-            }
-          });
+          Expand3To4<float>(
+            static_cast<const float*>(scalars->GetVoidPointer(0)),
+            static_cast<float*>(uploadPointer),
+            numTuples,
+            0.0f);
         }
         else if (dataType == VTK_UNSIGNED_CHAR && numComponents == 3)
         {
-          const unsigned char* src =
-            static_cast<const unsigned char*>(scalars->GetVoidPointer(0));
-          unsigned char* dst = static_cast<unsigned char*>(uploadPointer);
-          vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
-            for (vtkIdType i = begin; i < end; ++i)
-            {
-              dst[i * 4 + 0] = src[i * 3 + 0];
-              dst[i * 4 + 1] = src[i * 3 + 1];
-              dst[i * 4 + 2] = src[i * 3 + 2];
-              dst[i * 4 + 3] = 255;
-            }
-          });
+          Expand3To4<unsigned char>(
+            static_cast<const unsigned char*>(scalars->GetVoidPointer(0)),
+            static_cast<unsigned char*>(uploadPointer),
+            numTuples,
+            255);
         }
         else if (dataType == VTK_UNSIGNED_SHORT && this->ScalarNormalizationFactor == 255.0f)
         {
@@ -1431,18 +1541,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
         }
         else if (dataType == VTK_UNSIGNED_SHORT && numComponents == 3)
         {
-          const unsigned short* src =
-            static_cast<const unsigned short*>(scalars->GetVoidPointer(0));
-          unsigned short* dst = static_cast<unsigned short*>(uploadPointer);
-          vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
-            for (vtkIdType i = begin; i < end; ++i)
-            {
-              dst[i * 4 + 0] = src[i * 3 + 0];
-              dst[i * 4 + 1] = src[i * 3 + 1];
-              dst[i * 4 + 2] = src[i * 3 + 2];
-              dst[i * 4 + 3] = 65535;
-            }
-          });
+          Expand3To4<unsigned short>(
+            static_cast<const unsigned short*>(scalars->GetVoidPointer(0)),
+            static_cast<unsigned short*>(uploadPointer),
+            numTuples,
+            65535);
         }
         else
         {
@@ -1464,18 +1567,14 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       {
         ReleaseMetalObject(this->VolumeTexture);
 
-        MTLTextureDescriptor* texDesc = [[MTLTextureDescriptor alloc] init];
-        texDesc.textureType = MTLTextureType3D;
-        texDesc.pixelFormat = fmtInfo.Format;
-        texDesc.width = static_cast<NSUInteger>(dims[0]);
-        texDesc.height = static_cast<NSUInteger>(dims[1]);
-        texDesc.depth = static_cast<NSUInteger>(dims[2]);
-        texDesc.mipmapLevelCount = 1;
-        texDesc.usage = MTLTextureUsageShaderRead;
-        texDesc.storageMode = MTLStorageModePrivate;
-
-        tex = [device newTextureWithDescriptor:texDesc];
-        [texDesc release];
+        tex = NewTexture3D(
+          device,
+          fmtInfo.Format,
+          static_cast<NSUInteger>(dims[0]),
+          static_cast<NSUInteger>(dims[1]),
+          static_cast<NSUInteger>(dims[2]),
+          MTLTextureUsageShaderRead,
+          MTLStorageModePrivate);
         if (!tex)
         {
           vtkErrorMacro("Failed to create 3D volume texture");
@@ -1624,17 +1723,12 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
       {
         ReleaseMetalObject(this->ColorOpacityTexture);
 
-        MTLTextureDescriptor* tfDesc = [[MTLTextureDescriptor alloc] init];
-        tfDesc.textureType = MTLTextureType2D;
-        tfDesc.pixelFormat = MTLPixelFormatRGBA8Unorm;
-        tfDesc.width = 256;
-        tfDesc.height = 1;
-        tfDesc.mipmapLevelCount = 1;
-        tfDesc.usage = MTLTextureUsageShaderRead;
-        tfDesc.storageMode = MTLStorageModeShared;
-
-        tex = [device newTextureWithDescriptor:tfDesc];
-        [tfDesc release];
+        tex = NewTexture2D(
+          device,
+          MTLPixelFormatRGBA8Unorm,
+          256, 1,
+          MTLTextureUsageShaderRead,
+          MTLStorageModeShared);
         if (!tex)
         {
           vtkErrorMacro("Failed to create transfer function texture");
@@ -1718,17 +1812,12 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
       {
         ReleaseMetalObject(this->GradientOpacityTexture);
 
-        MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-        desc.textureType = MTLTextureType2D;
-        desc.pixelFormat = MTLPixelFormatRGBA8Unorm;
-        desc.width = 256;
-        desc.height = 1;
-        desc.mipmapLevelCount = 1;
-        desc.usage = MTLTextureUsageShaderRead;
-        desc.storageMode = MTLStorageModeShared;
-
-        tex = [device newTextureWithDescriptor:desc];
-        [desc release];
+        tex = NewTexture2D(
+          device,
+          MTLPixelFormatRGBA8Unorm,
+          256, 1,
+          MTLTextureUsageShaderRead,
+          MTLStorageModeShared);
         if (!tex)
         {
           vtkErrorMacro("Failed to create gradient opacity texture");
@@ -1888,18 +1977,14 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMaskTexture(
       {
         ReleaseMetalObject(this->MaskTexture);
 
-        MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-        desc.textureType = MTLTextureType3D;
-        desc.pixelFormat = chosenFormat;
-        desc.width = dims[0];
-        desc.height = dims[1];
-        desc.depth = dims[2];
-        desc.mipmapLevelCount = 1;
-        desc.usage = MTLTextureUsageShaderRead;
-        desc.storageMode = MTLStorageModeShared;
-
-        tex = [device newTextureWithDescriptor:desc];
-        [desc release];
+        tex = NewTexture3D(
+          device,
+          chosenFormat,
+          static_cast<NSUInteger>(dims[0]),
+          static_cast<NSUInteger>(dims[1]),
+          static_cast<NSUInteger>(dims[2]),
+          MTLTextureUsageShaderRead,
+          MTLStorageModeShared);
         if (!tex)
         {
           vtkErrorMacro("Failed to create mask texture");
@@ -2056,17 +2141,13 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateLabelMapTransferTexture(
           ReleaseMetalObject(this->LabelMapTransferTexture);
         }
 
-        MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-        desc.textureType = MTLTextureType2D;
-        desc.pixelFormat = MTLPixelFormatRGBA8Unorm;
-        desc.width = tfWidth;
-        desc.height = tfHeight;
-        desc.mipmapLevelCount = 1;
-        desc.usage = MTLTextureUsageShaderRead;
-        desc.storageMode = MTLStorageModeShared;
-
-        tex = [device newTextureWithDescriptor:desc];
-        [desc release];
+        tex = NewTexture2D(
+          device,
+          MTLPixelFormatRGBA8Unorm,
+          static_cast<NSUInteger>(tfWidth),
+          static_cast<NSUInteger>(tfHeight),
+          MTLTextureUsageShaderRead,
+          MTLStorageModeShared);
         if (!tex)
         {
           vtkErrorMacro("Failed to create label map transfer texture");
@@ -2425,18 +2506,14 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
         rawOcc.storageMode != MTLStorageModePrivate ||
         rawOcc.pixelFormat != MTLPixelFormatR8Unorm)
     {
-      MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-      desc.textureType = MTLTextureType3D;
-      desc.pixelFormat = MTLPixelFormatR8Unorm;
-      desc.width = mmDims[0];
-      desc.height = mmDims[1];
-      desc.depth = mmDims[2];
-      desc.mipmapLevelCount = 1;
-      desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-      desc.storageMode = MTLStorageModePrivate;
-
-      rawOcc = [device newTextureWithDescriptor:desc];
-      [desc release];
+      rawOcc = NewTexture3D(
+        device,
+        MTLPixelFormatR8Unorm,
+        static_cast<NSUInteger>(mmDims[0]),
+        static_cast<NSUInteger>(mmDims[1]),
+        static_cast<NSUInteger>(mmDims[2]),
+        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
+        MTLStorageModePrivate);
 
       if (!rawOcc)
       {
@@ -2513,18 +2590,14 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
         permTex.storageMode != MTLStorageModePrivate ||
         permTex.pixelFormat != MTLPixelFormatR8Unorm)
     {
-      MTLTextureDescriptor* permDesc = [[MTLTextureDescriptor alloc] init];
-      permDesc.textureType = MTLTextureType3D;
-      permDesc.pixelFormat = MTLPixelFormatR8Unorm;
-      permDesc.width = mmDims[0];
-      permDesc.height = mmDims[1];
-      permDesc.depth = mmDims[2];
-      permDesc.mipmapLevelCount = 1;
-      permDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-      permDesc.storageMode = MTLStorageModePrivate;
-
-      permTex = [device newTextureWithDescriptor:permDesc];
-      [permDesc release];
+      permTex = NewTexture3D(
+        device,
+        MTLPixelFormatR8Unorm,
+        static_cast<NSUInteger>(mmDims[0]),
+        static_cast<NSUInteger>(mmDims[1]),
+        static_cast<NSUInteger>(mmDims[2]),
+        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
+        MTLStorageModePrivate);
       if (!permTex)
       {
         vtkErrorMacro("Failed to create persistent min-max texture");
@@ -2808,18 +2881,14 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
       {
         ReleaseMetalObject(this->MinMaxTexture);
 
-        MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-        desc.textureType = MTLTextureType3D;
-        desc.pixelFormat = MTLPixelFormatR8Unorm;
-        desc.width = mmDims0;
-        desc.height = mmDims1;
-        desc.depth = mmDims2;
-        desc.mipmapLevelCount = 1;
-        desc.usage = MTLTextureUsageShaderRead;
-        desc.storageMode = MTLStorageModeShared;
-
-        tex = [device newTextureWithDescriptor:desc];
-        [desc release];
+        tex = NewTexture3D(
+          device,
+          MTLPixelFormatR8Unorm,
+          static_cast<NSUInteger>(mmDims0),
+          static_cast<NSUInteger>(mmDims1),
+          static_cast<NSUInteger>(mmDims2),
+          MTLTextureUsageShaderRead,
+          MTLStorageModeShared);
         if (!tex)
         {
           vtkErrorMacro("Failed to create min-max acceleration texture");
@@ -2828,16 +2897,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
         AssignMetalObject(this->MinMaxTexture, tex);
       }
 
-      // Upload data
-      MTLRegion region = MTLRegionMake3D(0, 0, 0, mmDims0, mmDims1, mmDims2);
-      NSUInteger bytesPerRow = mmDims0 * sizeof(uint8_t);
-      NSUInteger bytesPerImage = bytesPerRow * mmDims1;
-      [tex replaceRegion:region
-             mipmapLevel:0
-                   slice:0
-               withBytes:minMaxData.data()
-             bytesPerRow:bytesPerRow
-           bytesPerImage:bytesPerImage];
+      // Upload min-max data
+      UploadR8Volume3D(tex, minMaxData.data(), mmDims0, mmDims1, mmDims2);
     }
 
     this->MinMaxUploadTime.Modified();
@@ -3028,18 +3089,14 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
                                                     options:MTLResourceStorageModeShared];
           if (srcBuf)
           {
-            MTLTextureDescriptor* texDesc = [[MTLTextureDescriptor alloc] init];
-            texDesc.textureType = MTLTextureType3D;
-            texDesc.pixelFormat = pixelFormat;
-            texDesc.width = static_cast<NSUInteger>(fullDims[0]);
-            texDesc.height = static_cast<NSUInteger>(fullDims[1]);
-            texDesc.depth = static_cast<NSUInteger>(fullDims[2]);
-            texDesc.mipmapLevelCount = 1;
-            texDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-            texDesc.storageMode = MTLStorageModePrivate;
-
-            gpuFullTex = [device newTextureWithDescriptor:texDesc];
-            [texDesc release];
+            gpuFullTex = NewTexture3D(
+              device,
+              pixelFormat,
+              static_cast<NSUInteger>(fullDims[0]),
+              static_cast<NSUInteger>(fullDims[1]),
+              static_cast<NSUInteger>(fullDims[2]),
+              MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
+              MTLStorageModePrivate);
 
             if (gpuFullTex)
             {
@@ -3379,18 +3436,14 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
       }
 
       // Create the 3D texture for this block
-      MTLTextureDescriptor* texDesc = [[MTLTextureDescriptor alloc] init];
-      texDesc.textureType = MTLTextureType3D;
-      texDesc.pixelFormat = pixelFormat;
-      texDesc.width = bDims[0];
-      texDesc.height = bDims[1];
-      texDesc.depth = bDims[2];
-      texDesc.mipmapLevelCount = 1;
-      texDesc.usage = MTLTextureUsageShaderRead;
-      texDesc.storageMode = MTLStorageModePrivate;
-
-      id<MTLTexture> tex = [device newTextureWithDescriptor:texDesc];
-      [texDesc release];
+      id<MTLTexture> tex = NewTexture3D(
+        device,
+        pixelFormat,
+        static_cast<NSUInteger>(bDims[0]),
+        static_cast<NSUInteger>(bDims[1]),
+        static_cast<NSUInteger>(bDims[2]),
+        MTLTextureUsageShaderRead,
+        MTLStorageModePrivate);
       if (!tex)
       {
         vtkErrorMacro(<< "Failed to create block " << idx << " 3D texture ("
@@ -3621,29 +3674,17 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
         });
 
         // 3. Create and upload the Metal 3D texture
-        MTLTextureDescriptor* mmDesc = [[MTLTextureDescriptor alloc] init];
-        mmDesc.textureType = MTLTextureType3D;
-        mmDesc.pixelFormat = MTLPixelFormatR8Unorm;
-        mmDesc.width = mmDims0;
-        mmDesc.height = mmDims1;
-        mmDesc.depth = mmDims2;
-        mmDesc.mipmapLevelCount = 1;
-        mmDesc.usage = MTLTextureUsageShaderRead;
-        mmDesc.storageMode = MTLStorageModeShared;
-
-        id<MTLTexture> mmTex = [device newTextureWithDescriptor:mmDesc];
-        [mmDesc release];
+        id<MTLTexture> mmTex = NewTexture3D(
+          device,
+          MTLPixelFormatR8Unorm,
+          static_cast<NSUInteger>(mmDims0),
+          static_cast<NSUInteger>(mmDims1),
+          static_cast<NSUInteger>(mmDims2),
+          MTLTextureUsageShaderRead,
+          MTLStorageModeShared);
         if (mmTex)
         {
-          MTLRegion region = MTLRegionMake3D(0, 0, 0, mmDims0, mmDims1, mmDims2);
-          NSUInteger mmBytesPerRow = mmDims0 * sizeof(uint8_t);
-          NSUInteger mmBytesPerImage = mmBytesPerRow * mmDims1;
-          [mmTex replaceRegion:region
-                  mipmapLevel:0
-                        slice:0
-                    withBytes:minMaxData.data()
-                  bytesPerRow:mmBytesPerRow
-                bytesPerImage:mmBytesPerImage];
+          UploadR8Volume3D(mmTex, minMaxData.data(), mmDims0, mmDims1, mmDims2);
 
           AssignMetalObject(block.MinMaxTexture, mmTex);
         }
@@ -3735,33 +3776,25 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
         int mmDims[3] = { block.MinMaxDims[0], block.MinMaxDims[1], block.MinMaxDims[2] };
 
         // Create scratch R8Unorm texture for raw occupancy (temporary)
-        MTLTextureDescriptor* scratchDesc = [[MTLTextureDescriptor alloc] init];
-        scratchDesc.textureType = MTLTextureType3D;
-        scratchDesc.pixelFormat = MTLPixelFormatR8Unorm;
-        scratchDesc.width = static_cast<NSUInteger>(mmDims[0]);
-        scratchDesc.height = static_cast<NSUInteger>(mmDims[1]);
-        scratchDesc.depth = static_cast<NSUInteger>(mmDims[2]);
-        scratchDesc.mipmapLevelCount = 1;
-        scratchDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-        scratchDesc.storageMode = MTLStorageModePrivate;
-
-        id<MTLTexture> scratchTex = [device newTextureWithDescriptor:scratchDesc];
-        [scratchDesc release];
+        id<MTLTexture> scratchTex = NewTexture3D(
+          device,
+          MTLPixelFormatR8Unorm,
+          static_cast<NSUInteger>(mmDims[0]),
+          static_cast<NSUInteger>(mmDims[1]),
+          static_cast<NSUInteger>(mmDims[2]),
+          MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
+          MTLStorageModePrivate);
         if (!scratchTex) continue;
 
         // Create persistent per-block MinMax texture (dilated result)
-        MTLTextureDescriptor* mmDesc = [[MTLTextureDescriptor alloc] init];
-        mmDesc.textureType = MTLTextureType3D;
-        mmDesc.pixelFormat = MTLPixelFormatR8Unorm;
-        mmDesc.width = static_cast<NSUInteger>(mmDims[0]);
-        mmDesc.height = static_cast<NSUInteger>(mmDims[1]);
-        mmDesc.depth = static_cast<NSUInteger>(mmDims[2]);
-        mmDesc.mipmapLevelCount = 1;
-        mmDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-        mmDesc.storageMode = MTLStorageModePrivate;
-
-        id<MTLTexture> mmTex = [device newTextureWithDescriptor:mmDesc];
-        [mmDesc release];
+        id<MTLTexture> mmTex = NewTexture3D(
+          device,
+          MTLPixelFormatR8Unorm,
+          static_cast<NSUInteger>(mmDims[0]),
+          static_cast<NSUInteger>(mmDims[1]),
+          static_cast<NSUInteger>(mmDims[2]),
+          MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
+          MTLStorageModePrivate);
         if (!mmTex) { [scratchTex release]; continue; }
         AssignMetalObject(block.MinMaxTexture, mmTex);
 
@@ -3855,18 +3888,14 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
                            static_cast<int>(blockTex.depth) };
 
           // Create per-block normal texture
-          MTLTextureDescriptor* nd = [[MTLTextureDescriptor alloc] init];
-          nd.textureType = MTLTextureType3D;
-          nd.pixelFormat = MTLPixelFormatRGBA8Unorm;
-          nd.width = bdims[0];
-          nd.height = bdims[1];
-          nd.depth = bdims[2];
-          nd.mipmapLevelCount = 1;
-          nd.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-          nd.storageMode = MTLStorageModePrivate;
-
-          id<MTLTexture> blockNrm = [device newTextureWithDescriptor:nd];
-          [nd release];
+          id<MTLTexture> blockNrm = NewTexture3D(
+            device,
+            MTLPixelFormatRGBA8Unorm,
+            static_cast<NSUInteger>(bdims[0]),
+            static_cast<NSUInteger>(bdims[1]),
+            static_cast<NSUInteger>(bdims[2]),
+            MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
+            MTLStorageModePrivate);
           if (!blockNrm) continue;
           AssignMetalObject(block.NormalTexture, blockNrm);
 
@@ -4226,32 +4255,17 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockMinMaxTextures(
       // Step 2c: Create and upload R8Unorm texture
       ReleaseMetalObject(block.MinMaxTexture);
 
-      MTLTextureDescriptor* mmDesc = [[MTLTextureDescriptor alloc] init];
-      mmDesc.textureType = MTLTextureType3D;
-      mmDesc.pixelFormat = MTLPixelFormatR8Unorm;
-      mmDesc.width = static_cast<NSUInteger>(mmDims[0]);
-      mmDesc.height = static_cast<NSUInteger>(mmDims[1]);
-      mmDesc.depth = static_cast<NSUInteger>(mmDims[2]);
-      mmDesc.mipmapLevelCount = 1;
-      mmDesc.usage = MTLTextureUsageShaderRead;
-      mmDesc.storageMode = MTLStorageModeShared;
-
-      id<MTLTexture> mmTex = [device newTextureWithDescriptor:mmDesc];
-      [mmDesc release];
+      id<MTLTexture> mmTex = NewTexture3D(
+        device,
+        MTLPixelFormatR8Unorm,
+        static_cast<NSUInteger>(mmDims[0]),
+        static_cast<NSUInteger>(mmDims[1]),
+        static_cast<NSUInteger>(mmDims[2]),
+        MTLTextureUsageShaderRead,
+        MTLStorageModeShared);
       if (mmTex)
       {
-        MTLRegion region = MTLRegionMake3D(0, 0, 0,
-          static_cast<NSUInteger>(mmDims[0]),
-          static_cast<NSUInteger>(mmDims[1]),
-          static_cast<NSUInteger>(mmDims[2]));
-        NSUInteger mmBytesPerRow = static_cast<NSUInteger>(mmDims[0]) * sizeof(uint8_t);
-        NSUInteger mmBytesPerImage = mmBytesPerRow * static_cast<NSUInteger>(mmDims[1]);
-        [mmTex replaceRegion:region
-                mipmapLevel:0
-                      slice:0
-                  withBytes:minMaxData.data()
-                bytesPerRow:mmBytesPerRow
-              bytesPerImage:mmBytesPerImage];
+        UploadR8Volume3D(mmTex, minMaxData.data(), mmDims[0], mmDims[1], mmDims[2]);
 
         AssignMetalObject(block.MinMaxTexture, mmTex);
       }
@@ -4269,33 +4283,25 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockMinMaxTextures(
         int mmDimsL[3] = { block.MinMaxDims[0], block.MinMaxDims[1], block.MinMaxDims[2] };
 
         // Scratch R8Unorm texture (temporary, released after command)
-        MTLTextureDescriptor* scratchDesc = [[MTLTextureDescriptor alloc] init];
-        scratchDesc.textureType = MTLTextureType3D;
-        scratchDesc.pixelFormat = MTLPixelFormatR8Unorm;
-        scratchDesc.width = static_cast<NSUInteger>(mmDimsL[0]);
-        scratchDesc.height = static_cast<NSUInteger>(mmDimsL[1]);
-        scratchDesc.depth = static_cast<NSUInteger>(mmDimsL[2]);
-        scratchDesc.mipmapLevelCount = 1;
-        scratchDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-        scratchDesc.storageMode = MTLStorageModePrivate;
-
-        id<MTLTexture> scratchTex = [device newTextureWithDescriptor:scratchDesc];
-        [scratchDesc release];
+        id<MTLTexture> scratchTex = NewTexture3D(
+          device,
+          MTLPixelFormatR8Unorm,
+          static_cast<NSUInteger>(mmDimsL[0]),
+          static_cast<NSUInteger>(mmDimsL[1]),
+          static_cast<NSUInteger>(mmDimsL[2]),
+          MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
+          MTLStorageModePrivate);
         if (!scratchTex) continue;
 
         // Persistent per-block MinMax texture (dilated result)
-        MTLTextureDescriptor* mmDescP = [[MTLTextureDescriptor alloc] init];
-        mmDescP.textureType = MTLTextureType3D;
-        mmDescP.pixelFormat = MTLPixelFormatR8Unorm;
-        mmDescP.width = static_cast<NSUInteger>(mmDimsL[0]);
-        mmDescP.height = static_cast<NSUInteger>(mmDimsL[1]);
-        mmDescP.depth = static_cast<NSUInteger>(mmDimsL[2]);
-        mmDescP.mipmapLevelCount = 1;
-        mmDescP.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-        mmDescP.storageMode = MTLStorageModePrivate;
-
-        id<MTLTexture> mmTex = [device newTextureWithDescriptor:mmDescP];
-        [mmDescP release];
+        id<MTLTexture> mmTex = NewTexture3D(
+          device,
+          MTLPixelFormatR8Unorm,
+          static_cast<NSUInteger>(mmDimsL[0]),
+          static_cast<NSUInteger>(mmDimsL[1]),
+          static_cast<NSUInteger>(mmDimsL[2]),
+          MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
+          MTLStorageModePrivate);
         if (!mmTex) { [scratchTex release]; continue; }
         AssignMetalObject(block.MinMaxTexture, mmTex);
 
@@ -4936,17 +4942,12 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     // Create dummy depth texture (1x1 R32Float with value 1.0) for when no real depth texture is bound
     if (!this->DummyDepthTexture)
     {
-      MTLTextureDescriptor* dummyDesc = [[MTLTextureDescriptor alloc] init];
-      dummyDesc.textureType = MTLTextureType2D;
-      dummyDesc.pixelFormat = MTLPixelFormatR32Float;
-      dummyDesc.width = 1;
-      dummyDesc.height = 1;
-      dummyDesc.mipmapLevelCount = 1;
-      dummyDesc.usage = MTLTextureUsageShaderRead;
-      dummyDesc.storageMode = MTLStorageModeShared;
-
-      id<MTLTexture> dummyTex = [device newTextureWithDescriptor:dummyDesc];
-      [dummyDesc release];
+      id<MTLTexture> dummyTex = NewTexture2D(
+        device,
+        MTLPixelFormatR32Float,
+        1, 1,
+        MTLTextureUsageShaderRead,
+        MTLStorageModeShared);
       if (dummyTex)
       {
         float one = 1.0f;
@@ -4962,16 +4963,12 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     // Create dummy 3D textures for fallback bindings (prevent nil texture binds).
     if (!this->DummyVolumeTexture)
     {
-      MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-      desc.textureType = MTLTextureType3D;
-      desc.pixelFormat = MTLPixelFormatR32Float;
-      desc.width = 1;
-      desc.height = 1;
-      desc.depth = 1;
-      desc.mipmapLevelCount = 1;
-      desc.usage = MTLTextureUsageShaderRead;
-      desc.storageMode = MTLStorageModeShared;
-      id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+      id<MTLTexture> tex = NewTexture3D(
+        device,
+        MTLPixelFormatR32Float,
+        1, 1, 1,
+        MTLTextureUsageShaderRead,
+        MTLStorageModeShared);
       if (tex)
       {
         float zero = 0.0f;
@@ -4980,21 +4977,16 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
                bytesPerRow:sizeof(float) bytesPerImage:sizeof(float)];
       }
       AssignMetalObject(this->DummyVolumeTexture, tex);
-      [desc release];
     }
 
     if (!this->DummyMaskTexture)
     {
-      MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-      desc.textureType = MTLTextureType3D;
-      desc.pixelFormat = MTLPixelFormatR32Float;
-      desc.width = 1;
-      desc.height = 1;
-      desc.depth = 1;
-      desc.mipmapLevelCount = 1;
-      desc.usage = MTLTextureUsageShaderRead;
-      desc.storageMode = MTLStorageModeShared;
-      id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+      id<MTLTexture> tex = NewTexture3D(
+        device,
+        MTLPixelFormatR32Float,
+        1, 1, 1,
+        MTLTextureUsageShaderRead,
+        MTLStorageModeShared);
       if (tex)
       {
         float zero = 0.0f;
@@ -5003,30 +4995,22 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
                bytesPerRow:sizeof(float) bytesPerImage:sizeof(float)];
       }
       AssignMetalObject(this->DummyMaskTexture, tex);
-      [desc release];
     }
 
     if (!this->DummyMinMaxTexture)
     {
-      MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-      desc.textureType = MTLTextureType3D;
-      desc.pixelFormat = MTLPixelFormatR8Unorm;
-      desc.width = 1;
-      desc.height = 1;
-      desc.depth = 1;
-      desc.mipmapLevelCount = 1;
-      desc.usage = MTLTextureUsageShaderRead;
-      desc.storageMode = MTLStorageModeShared;
-      id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+      id<MTLTexture> tex = NewTexture3D(
+        device,
+        MTLPixelFormatR8Unorm,
+        1, 1, 1,
+        MTLTextureUsageShaderRead,
+        MTLStorageModeShared);
       if (tex)
       {
         uint8_t zero = 0;
-        MTLRegion region = MTLRegionMake3D(0, 0, 0, 1, 1, 1);
-        [tex replaceRegion:region mipmapLevel:0 slice:0 withBytes:&zero
-               bytesPerRow:sizeof(uint8_t) bytesPerImage:sizeof(uint8_t)];
+        UploadR8Volume3D(tex, &zero, 1, 1, 1);
       }
       AssignMetalObject(this->DummyMinMaxTexture, tex);
-      [desc release];
     }
 
     // Create and cache a depth stencil state.
