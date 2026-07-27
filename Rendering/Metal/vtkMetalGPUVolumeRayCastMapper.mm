@@ -840,6 +840,81 @@ static void EncodeGPUMinMaxDilation(
   [scratchTex release];
 }
 
+//------------------------------------------------------------------------------
+struct NormalComputeUniforms
+{
+  uint32_t dimX, dimY, dimZ;
+  float gsX, gsY, gsZ;
+  float scalarScale;
+  float scalarBias;
+  float gradNormFactor;
+};
+
+static NormalComputeUniforms MakeNormalComputeUniforms(
+  const int dims[3],
+  const double scalarRange[2],
+  float normalizationFactor)
+{
+  NormalComputeUniforms u{};
+
+  double range = scalarRange[1] - scalarRange[0];
+  if (range <= 0.0)
+  {
+    range = 1.0;
+  }
+
+  u.dimX = static_cast<uint32_t>(dims[0]);
+  u.dimY = static_cast<uint32_t>(dims[1]);
+  u.dimZ = static_cast<uint32_t>(dims[2]);
+
+  u.gsX = 1.0f / std::max(dims[0], 1);
+  u.gsY = 1.0f / std::max(dims[1], 1);
+  u.gsZ = 1.0f / std::max(dims[2], 1);
+
+  u.scalarScale = 1.0f / std::max(
+    static_cast<float>((scalarRange[1] - scalarRange[0]) / normalizationFactor),
+    1e-6f);
+
+  u.scalarBias =
+    -(static_cast<float>(scalarRange[0] / normalizationFactor)) * u.scalarScale;
+
+  u.gradNormFactor = static_cast<float>(range * 0.25 / normalizationFactor);
+
+  return u;
+}
+
+static void EncodeNormalCompute(
+  id<MTLComputeCommandEncoder> enc,
+  id<MTLTexture> volumeTex,
+  id<MTLTexture> normalTex,
+  const NormalComputeUniforms& uniforms,
+  id<MTLComputePipelineState> pipeline)
+{
+  const int dims[3] = {
+    static_cast<int>(volumeTex.width),
+    static_cast<int>(volumeTex.height),
+    static_cast<int>(volumeTex.depth)
+  };
+
+  [enc setComputePipelineState:pipeline];
+  [enc setTexture:volumeTex atIndex:0];
+  [enc setTexture:normalTex atIndex:1];
+  [enc setBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+
+  MTLSize gridSize = MTLSizeMake(dims[0], dims[1], dims[2]);
+
+  NSUInteger tgwMax = 16;
+  NSUInteger tgwX = std::min(tgwMax, static_cast<NSUInteger>(dims[0]));
+  NSUInteger tgwY = std::min(tgwMax, static_cast<NSUInteger>(dims[1]));
+  NSUInteger tgwZ = std::min(
+    static_cast<NSUInteger>(1024) / (tgwX * tgwY),
+    static_cast<NSUInteger>(dims[2]));
+
+  MTLSize threadgroupSize = MTLSizeMake(tgwX, tgwY, tgwZ);
+
+  [enc dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+}
+
 }
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -1219,47 +1294,16 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureGradientNormalTexture(
       AssignMetalObject(this->NormalComputePipeline, cps);
     }
 
-    // Build NormalComputeUniforms
-    double scalarRange = this->ScalarRange[1] - this->ScalarRange[0];
-    if (scalarRange <= 0.0) scalarRange = 1.0;
+    // Build uniforms and dispatch compute using shared helpers
+    NormalComputeUniforms u = MakeNormalComputeUniforms(
+      dims, this->ScalarRange, this->ScalarNormalizationFactor);
 
-    struct NormalComputeUniforms {
-      uint32_t dimX, dimY, dimZ;
-      float gsX, gsY, gsZ;
-      float scalarScale;
-      float scalarBias;
-      float gradNormFactor;
-    };
-
-    NormalComputeUniforms u;
-    u.dimX = static_cast<uint32_t>(dims[0]);
-    u.dimY = static_cast<uint32_t>(dims[1]);
-    u.dimZ = static_cast<uint32_t>(dims[2]);
-    u.gsX = 1.0f / std::max(dims[0], 1);
-    u.gsY = 1.0f / std::max(dims[1], 1);
-    u.gsZ = 1.0f / std::max(dims[2], 1);
-    float normFactor = this->ScalarNormalizationFactor;
-    u.scalarScale = 1.0f / std::max(static_cast<float>((this->ScalarRange[1] - this->ScalarRange[0]) / normFactor), 1e-6f);
-    u.scalarBias = -(static_cast<float>(this->ScalarRange[0] / normFactor)) * u.scalarScale;
-    u.gradNormFactor = static_cast<float>(scalarRange * 0.25 / normFactor);
-
-    // Dispatch compute
     id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
     cmdBuf.label = @"VTK Volume Normal Compute";
 
     id<MTLComputeCommandEncoder> compEnc = [cmdBuf computeCommandEncoder];
-    [compEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->NormalComputePipeline];
-    [compEnc setTexture:volTex atIndex:0];
-    [compEnc setTexture:normalTex atIndex:1];
-    [compEnc setBytes:&u length:sizeof(u) atIndex:0];
-
-    MTLSize gridSize = MTLSizeMake(dims[0], dims[1], dims[2]);
-    NSUInteger tgw_max = 16;
-    NSUInteger tgw_x = std::min(tgw_max, static_cast<NSUInteger>(dims[0]));
-    NSUInteger tgw_y = std::min(tgw_max, static_cast<NSUInteger>(dims[1]));
-    NSUInteger tgw_z = std::min(static_cast<NSUInteger>(1024) / (tgw_x * tgw_y), static_cast<NSUInteger>(dims[2]));
-    MTLSize threadGroupSize = MTLSizeMake(tgw_x, tgw_y, tgw_z);
-    [compEnc dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
+    EncodeNormalCompute(compEnc, volTex, normalTex, u,
+      (__bridge id<MTLComputePipelineState>)this->NormalComputePipeline);
     [compEnc endEncoding];
     [cmdBuf commit];
 
@@ -3817,19 +3861,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
 
       if (this->NormalComputePipeline)
       {
-        double scalarRange = this->ScalarRange[1] - this->ScalarRange[0];
-        if (scalarRange <= 0.0) scalarRange = 1.0;
-        float normFactorLocal = this->ScalarNormalizationFactor;
-        float localGradNormFactor = static_cast<float>(scalarRange * 0.25 / normFactorLocal);
-
-        struct NormalComputeUniforms {
-          uint32_t dimX, dimY, dimZ;
-          float gsX, gsY, gsZ;
-          float scalarScale;
-          float scalarBias;
-          float gradNormFactor;
-        };
-
         id<MTLComputeCommandEncoder> compEnc = [uploadCmdBuf computeCommandEncoder];
         compEnc.label = @"VTK Block Normal Compute";
 
@@ -3854,29 +3885,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
           if (!blockNrm) continue;
           AssignMetalObject(block.NormalTexture, blockNrm);
 
-          NormalComputeUniforms u;
-          u.dimX = static_cast<uint32_t>(bdims[0]);
-          u.dimY = static_cast<uint32_t>(bdims[1]);
-          u.dimZ = static_cast<uint32_t>(bdims[2]);
-          u.gsX = 1.0f / std::max(bdims[0], 1);
-          u.gsY = 1.0f / std::max(bdims[1], 1);
-          u.gsZ = 1.0f / std::max(bdims[2], 1);
-          u.scalarScale = 1.0f / std::max(static_cast<float>((this->ScalarRange[1] - this->ScalarRange[0]) / normFactorLocal), 1e-6f);
-          u.scalarBias = -(static_cast<float>(this->ScalarRange[0] / normFactorLocal)) * u.scalarScale;
-          u.gradNormFactor = localGradNormFactor;
+          NormalComputeUniforms u = MakeNormalComputeUniforms(
+            bdims, this->ScalarRange, this->ScalarNormalizationFactor);
 
-          [compEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->NormalComputePipeline];
-          [compEnc setTexture:blockTex atIndex:0];
-          [compEnc setTexture:blockNrm atIndex:1];
-          [compEnc setBytes:&u length:sizeof(u) atIndex:0];
-
-          MTLSize gridSize = MTLSizeMake(bdims[0], bdims[1], bdims[2]);
-          NSUInteger tgw_max = 16;
-          NSUInteger tgw_x = std::min(tgw_max, static_cast<NSUInteger>(bdims[0]));
-          NSUInteger tgw_y = std::min(tgw_max, static_cast<NSUInteger>(bdims[1]));
-          NSUInteger tgw_z = std::min(static_cast<NSUInteger>(1024) / (tgw_x * tgw_y), static_cast<NSUInteger>(bdims[2]));
-          MTLSize threadGroupSize = MTLSizeMake(tgw_x, tgw_y, tgw_z);
-          [compEnc dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
+          EncodeNormalCompute(compEnc, blockTex, blockNrm, u,
+            (__bridge id<MTLComputePipelineState>)this->NormalComputePipeline);
         }
 
         [compEnc endEncoding];
