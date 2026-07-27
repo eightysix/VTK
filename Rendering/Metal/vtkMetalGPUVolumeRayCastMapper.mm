@@ -654,12 +654,140 @@ static void UploadR8Volume3D(
   MTLRegion region = MTLRegionMake3D(0, 0, 0, x, y, z);
   NSUInteger bytesPerRow = static_cast<NSUInteger>(x) * sizeof(uint8_t);
   NSUInteger bytesPerImage = bytesPerRow * static_cast<NSUInteger>(y);
-  [tex replaceRegion:region
-          mipmapLevel:0
-                slice:0
-            withBytes:data
-          bytesPerRow:bytesPerRow
-        bytesPerImage:bytesPerImage];
+    [tex replaceRegion:region
+            mipmapLevel:0
+                  slice:0
+              withBytes:data
+            bytesPerRow:bytesPerRow
+          bytesPerImage:bytesPerImage];
+}
+
+//------------------------------------------------------------------------------
+struct OccupancyGrid
+{
+  std::vector<uint8_t> Data;
+  int Dims[3] = { 0, 0, 0 };
+};
+
+//------------------------------------------------------------------------------
+static bool ScalarRangeTouchesOpacity(
+  float cellMin,
+  float cellMax,
+  const double opacityTable[256],
+  double scalarMin,
+  double scalarRangeRecip255)
+{
+  if (cellMin > cellMax)
+  {
+    return false;
+  }
+
+  int idxMin = std::max(0,
+    std::min(255, static_cast<int>((cellMin - scalarMin) * scalarRangeRecip255)));
+
+  int idxMax = std::max(0,
+    std::min(255, static_cast<int>((cellMax - scalarMin) * scalarRangeRecip255)));
+
+  for (int i = idxMin; i <= idxMax; ++i)
+  {
+    if (opacityTable[i] > 0.0)
+    {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+//------------------------------------------------------------------------------
+static std::vector<uint8_t> DilateOccupancy3D(
+  const std::vector<uint8_t>& raw,
+  int dimX,
+  int dimY,
+  int dimZ)
+{
+  std::vector<uint8_t> out(raw.size(), 255);
+
+  vtkSMPTools::For(0, static_cast<vtkIdType>(raw.size()),
+    [&](vtkIdType begin, vtkIdType end) {
+      for (vtkIdType cellIdx = begin; cellIdx < end; ++cellIdx)
+      {
+        const int gx = static_cast<int>(cellIdx % dimX);
+        const int gy = static_cast<int>((cellIdx / dimX) % dimY);
+        const int gz = static_cast<int>(cellIdx / (dimX * dimY));
+
+        const int x0 = std::max(0, gx - 1);
+        const int x1 = std::min(dimX - 1, gx + 1);
+        const int y0 = std::max(0, gy - 1);
+        const int y1 = std::min(dimY - 1, gy + 1);
+        const int z0 = std::max(0, gz - 1);
+        const int z1 = std::min(dimZ - 1, gz + 1);
+
+        bool solid = false;
+
+        for (int nz = z0; nz <= z1 && !solid; ++nz)
+        {
+          for (int ny = y0; ny <= y1 && !solid; ++ny)
+          {
+            for (int nx = x0; nx <= x1 && !solid; ++nx)
+            {
+              if (raw[(nz * dimY + ny) * dimX + nx] == 0)
+              {
+                solid = true;
+              }
+            }
+          }
+        }
+
+        out[cellIdx] = solid ? 0 : 255;
+      }
+    });
+
+  return out;
+}
+
+//------------------------------------------------------------------------------
+static id<MTLTexture> CreateR8MinMaxTexture(
+  id<MTLDevice> device,
+  int dimX,
+  int dimY,
+  int dimZ,
+  MTLStorageMode storage,
+  MTLTextureUsage usage)
+{
+  return NewTexture3D(
+    device,
+    MTLPixelFormatR8Unorm,
+    static_cast<NSUInteger>(dimX),
+    static_cast<NSUInteger>(dimY),
+    static_cast<NSUInteger>(dimZ),
+    usage,
+    storage);
+}
+
+//------------------------------------------------------------------------------
+static void AssignR8MinMaxTexture(
+  void*& slot,
+  id<MTLDevice> device,
+  const std::vector<uint8_t>& data,
+  int dimX,
+  int dimY,
+  int dimZ)
+{
+  id<MTLTexture> tex = CreateR8MinMaxTexture(
+    device,
+    dimX,
+    dimY,
+    dimZ,
+    MTLStorageModeShared,
+    MTLTextureUsageShaderRead);
+
+  if (tex)
+  {
+    UploadR8Volume3D(tex, data.data(), dimX, dimY, dimZ);
+  }
+
+  AssignMetalObject(slot, tex);
 }
 
 }
@@ -2506,14 +2634,13 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
         rawOcc.storageMode != MTLStorageModePrivate ||
         rawOcc.pixelFormat != MTLPixelFormatR8Unorm)
     {
-      rawOcc = NewTexture3D(
+      rawOcc = CreateR8MinMaxTexture(
         device,
-        MTLPixelFormatR8Unorm,
-        static_cast<NSUInteger>(mmDims[0]),
-        static_cast<NSUInteger>(mmDims[1]),
-        static_cast<NSUInteger>(mmDims[2]),
-        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
-        MTLStorageModePrivate);
+        mmDims[0],
+        mmDims[1],
+        mmDims[2],
+        MTLStorageModePrivate,
+        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
 
       if (!rawOcc)
       {
@@ -2590,14 +2717,13 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
         permTex.storageMode != MTLStorageModePrivate ||
         permTex.pixelFormat != MTLPixelFormatR8Unorm)
     {
-      permTex = NewTexture3D(
+      permTex = CreateR8MinMaxTexture(
         device,
-        MTLPixelFormatR8Unorm,
-        static_cast<NSUInteger>(mmDims[0]),
-        static_cast<NSUInteger>(mmDims[1]),
-        static_cast<NSUInteger>(mmDims[2]),
-        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
-        MTLStorageModePrivate);
+        mmDims[0],
+        mmDims[1],
+        mmDims[2],
+        MTLStorageModePrivate,
+        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
       if (!permTex)
       {
         vtkErrorMacro("Failed to create persistent min-max texture");
@@ -2802,103 +2928,16 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
 
         if (!skipGlobalTexture)
         {
-          // Inline empty check using the precomputed opacity table
-          bool empty = true;
-          if (cellMin <= cellMax)
-          {
-            int idxMin = std::max(0,
-              std::min(255, static_cast<int>((cellMin - rangeOffset) * rangeRecip)));
-            int idxMax = std::max(0,
-              std::min(255, static_cast<int>((cellMax - rangeOffset) * rangeRecip)));
-            for (int i = idxMin; i <= idxMax; ++i)
-            {
-              if (opacityTable[i] > 0.0)
-              {
-                empty = false;
-                break;
-              }
-            }
-          }
-
-          rawMinMax[cellIdx] = empty ? 255 : 0;
+          rawMinMax[cellIdx] = ScalarRangeTouchesOpacity(cellMin, cellMax, opacityTable, rangeOffset, rangeRecip) ? 0 : 255;
         }
       }
     });
 
     if (!skipGlobalTexture)
     {
-      // 2. DILATION PASS: Pad solid blocks by 1 macrocell in all directions.
-      // This guarantees the ray resumes normal stepping *before* hitting the surface,
-      // preserving perfect trilinear interpolation and lighting gradients.
-      // Gather-style stencil: read from rawMinMax, write to minMaxData —
-      // embarrassingly parallel since each output cell is independent.
-      std::vector<uint8_t> minMaxData(numCells, 255);
-      vtkSMPTools::For(0, numCells, [&](vtkIdType begin, vtkIdType end) {
-        for (vtkIdType cellIdx = begin; cellIdx < end; ++cellIdx)
-        {
-          const int gx = static_cast<int>(cellIdx % mmDims0);
-          const int gy = static_cast<int>((cellIdx / mmDims0) % mmDims1);
-          const int gz = static_cast<int>(cellIdx / (mmDims0 * mmDims1));
+      std::vector<uint8_t> minMaxData = DilateOccupancy3D(rawMinMax, mmDims0, mmDims1, mmDims2);
 
-          const int x0 = std::max(0, gx - 1), x1 = std::min(mmDims0 - 1, gx + 1);
-          const int y0 = std::max(0, gy - 1), y1 = std::min(mmDims1 - 1, gy + 1);
-          const int z0 = std::max(0, gz - 1), z1 = std::min(mmDims2 - 1, gz + 1);
-
-          bool solid = false;
-          for (int nz = z0; nz <= z1 && !solid; ++nz)
-          {
-            for (int ny = y0; ny <= y1 && !solid; ++ny)
-            {
-              for (int nx = x0; nx <= x1 && !solid; ++nx)
-              {
-                if (rawMinMax[(nz * mmDims1 + ny) * mmDims0 + nx] == 0)
-                {
-                  solid = true;
-                }
-              }
-            }
-          }
-
-          minMaxData[cellIdx] = solid ? 0 : 255;
-        }
-      });
-
-      // 3. Create or reuse the 3D occupancy texture (R8Unorm).
-      // For partitioned volumes, skip this — blocks build their own min-max textures.
-      id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->MinMaxTexture;
-      id<MTLTexture> tex = nil;
-
-      if (oldTex &&
-          oldTex.width == mmDims0 &&
-          oldTex.height == mmDims1 &&
-          oldTex.depth == mmDims2 &&
-          oldTex.storageMode == MTLStorageModeShared &&
-          oldTex.pixelFormat == MTLPixelFormatR8Unorm)
-      {
-        tex = oldTex;
-      }
-      else
-      {
-        ReleaseMetalObject(this->MinMaxTexture);
-
-        tex = NewTexture3D(
-          device,
-          MTLPixelFormatR8Unorm,
-          static_cast<NSUInteger>(mmDims0),
-          static_cast<NSUInteger>(mmDims1),
-          static_cast<NSUInteger>(mmDims2),
-          MTLTextureUsageShaderRead,
-          MTLStorageModeShared);
-        if (!tex)
-        {
-          vtkErrorMacro("Failed to create min-max acceleration texture");
-          return false;
-        }
-        AssignMetalObject(this->MinMaxTexture, tex);
-      }
-
-      // Upload min-max data
-      UploadR8Volume3D(tex, minMaxData.data(), mmDims0, mmDims1, mmDims2);
+      AssignR8MinMaxTexture(this->MinMaxTexture, device, minMaxData, mmDims0, mmDims1, mmDims2);
     }
 
     this->MinMaxUploadTime.Modified();
@@ -3540,23 +3579,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
                 }
               }
 
-              bool empty = true;
-              if (cellMin <= cellMax)
-              {
-                int idxMin = std::max(0,
-                  std::min(255, static_cast<int>((cellMin - blockRangeOffset) * blockRangeRecip)));
-                int idxMax = std::max(0,
-                  std::min(255, static_cast<int>((cellMax - blockRangeOffset) * blockRangeRecip)));
-                for (int i = idxMin; i <= idxMax; ++i)
-                {
-                  if (opacityTable[i] > 0.0)
-                  {
-                    empty = false;
-                    break;
-                  }
-                }
-              }
-              rawMinMax[cellIdx] = empty ? 255 : 0;
+              rawMinMax[cellIdx] = ScalarRangeTouchesOpacity(cellMin, cellMax, opacityTable, blockRangeOffset, blockRangeRecip) ? 0 : 255;
             }
           });
         }
@@ -3629,69 +3652,14 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
                 }
               }
 
-              bool empty = true;
-              if (cellMin <= cellMax)
-              {
-                int idxMin = std::max(0,
-                  std::min(255, static_cast<int>((cellMin - blockRangeOffset) * blockRangeRecip)));
-                int idxMax = std::max(0,
-                  std::min(255, static_cast<int>((cellMax - blockRangeOffset) * blockRangeRecip)));
-                for (int i = idxMin; i <= idxMax; ++i)
-                {
-                  if (opacityTable[i] > 0.0)
-                  {
-                    empty = false;
-                    break;
-                  }
-                }
-              }
-              rawMinMax[cellIdx] = empty ? 255 : 0;
+              rawMinMax[cellIdx] = ScalarRangeTouchesOpacity(cellMin, cellMax, opacityTable, blockRangeOffset, blockRangeRecip) ? 0 : 255;
             }
           });
         }
 
-        // 2. Dilation pass (avoid holes at macrocell boundaries)
-        std::vector<uint8_t> minMaxData(numCells, 255);
-        vtkSMPTools::For(0, numCells, [&](vtkIdType begin, vtkIdType end) {
-          for (vtkIdType cellIdx = begin; cellIdx < end; ++cellIdx)
-          {
-            const int gx = static_cast<int>(cellIdx % mmDims0);
-            const int gy = static_cast<int>((cellIdx / mmDims0) % mmDims1);
-            const int gz = static_cast<int>(cellIdx / (mmDims0 * mmDims1));
+        std::vector<uint8_t> minMaxData = DilateOccupancy3D(rawMinMax, mmDims0, mmDims1, mmDims2);
 
-            int z0 = std::max(0, gz - 1), z1 = std::min(mmDims2 - 1, gz + 1);
-            int y0 = std::max(0, gy - 1), y1 = std::min(mmDims1 - 1, gy + 1);
-            int x0 = std::max(0, gx - 1), x1 = std::min(mmDims0 - 1, gx + 1);
-
-            bool solid = false;
-            for (int nz = z0; nz <= z1 && !solid; ++nz)
-              for (int ny = y0; ny <= y1 && !solid; ++ny)
-                for (int nx = x0; nx <= x1 && !solid; ++nx)
-                  if (rawMinMax[(nz * mmDims1 + ny) * mmDims0 + nx] == 0) solid = true;
-
-            minMaxData[cellIdx] = solid ? 0 : 255;
-          }
-        });
-
-        // 3. Create and upload the Metal 3D texture
-        id<MTLTexture> mmTex = NewTexture3D(
-          device,
-          MTLPixelFormatR8Unorm,
-          static_cast<NSUInteger>(mmDims0),
-          static_cast<NSUInteger>(mmDims1),
-          static_cast<NSUInteger>(mmDims2),
-          MTLTextureUsageShaderRead,
-          MTLStorageModeShared);
-        if (mmTex)
-        {
-          UploadR8Volume3D(mmTex, minMaxData.data(), mmDims0, mmDims1, mmDims2);
-
-          AssignMetalObject(block.MinMaxTexture, mmTex);
-        }
-        else
-        {
-          block.MinMaxTexture = nullptr;
-        }
+        AssignR8MinMaxTexture(block.MinMaxTexture, device, minMaxData, mmDims0, mmDims1, mmDims2);
       }
       else
       {
@@ -3775,26 +3743,22 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
         int bdims[3] = { block.Dims[0], block.Dims[1], block.Dims[2] };
         int mmDims[3] = { block.MinMaxDims[0], block.MinMaxDims[1], block.MinMaxDims[2] };
 
-        // Create scratch R8Unorm texture for raw occupancy (temporary)
-        id<MTLTexture> scratchTex = NewTexture3D(
+        id<MTLTexture> scratchTex = CreateR8MinMaxTexture(
           device,
-          MTLPixelFormatR8Unorm,
-          static_cast<NSUInteger>(mmDims[0]),
-          static_cast<NSUInteger>(mmDims[1]),
-          static_cast<NSUInteger>(mmDims[2]),
-          MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
-          MTLStorageModePrivate);
+          mmDims[0],
+          mmDims[1],
+          mmDims[2],
+          MTLStorageModePrivate,
+          MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
         if (!scratchTex) continue;
 
-        // Create persistent per-block MinMax texture (dilated result)
-        id<MTLTexture> mmTex = NewTexture3D(
+        id<MTLTexture> mmTex = CreateR8MinMaxTexture(
           device,
-          MTLPixelFormatR8Unorm,
-          static_cast<NSUInteger>(mmDims[0]),
-          static_cast<NSUInteger>(mmDims[1]),
-          static_cast<NSUInteger>(mmDims[2]),
-          MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
-          MTLStorageModePrivate);
+          mmDims[0],
+          mmDims[1],
+          mmDims[2],
+          MTLStorageModePrivate,
+          MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
         if (!mmTex) { [scratchTex release]; continue; }
         AssignMetalObject(block.MinMaxTexture, mmTex);
 
@@ -4114,23 +4078,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockMinMaxTextures(
               }
             }
 
-            bool empty = true;
-            if (cellMin <= cellMax)
-            {
-              int idxMin = std::max(0,
-                std::min(255, static_cast<int>((cellMin - rangeOffset) * rangeRecip)));
-              int idxMax = std::max(0,
-                std::min(255, static_cast<int>((cellMax - rangeOffset) * rangeRecip)));
-              for (int i = idxMin; i <= idxMax; ++i)
-              {
-                if (opacityTable[i] > 0.0)
-                {
-                  empty = false;
-                  break;
-                }
-              }
-            }
-            rawMinMax[cellIdx] = empty ? 255 : 0;
+            rawMinMax[cellIdx] = ScalarRangeTouchesOpacity(cellMin, cellMax, opacityTable, rangeOffset, rangeRecip) ? 0 : 255;
           }
         });
       }
@@ -4208,67 +4156,14 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockMinMaxTextures(
               }
             }
 
-            bool empty = true;
-            if (cellMin <= cellMax)
-            {
-              int idxMin = std::max(0,
-                std::min(255, static_cast<int>((cellMin - rangeOffset) * rangeRecip)));
-              int idxMax = std::max(0,
-                std::min(255, static_cast<int>((cellMax - rangeOffset) * rangeRecip)));
-              for (int i = idxMin; i <= idxMax; ++i)
-              {
-                if (opacityTable[i] > 0.0)
-                {
-                  empty = false;
-                  break;
-                }
-              }
-            }
-            rawMinMax[cellIdx] = empty ? 255 : 0;
+            rawMinMax[cellIdx] = ScalarRangeTouchesOpacity(cellMin, cellMax, opacityTable, rangeOffset, rangeRecip) ? 0 : 255;
           }
         });
       }
 
-      // Step 2b: Dilation
-      std::vector<uint8_t> minMaxData(numCells, 255);
-      vtkSMPTools::For(0, numCells, [&](vtkIdType begin, vtkIdType end) {
-        for (vtkIdType cellIdx = begin; cellIdx < end; ++cellIdx)
-        {
-          const int gx = static_cast<int>(cellIdx % mmDims[0]);
-          const int gy = static_cast<int>((cellIdx / mmDims[0]) % mmDims[1]);
-          const int gz = static_cast<int>(cellIdx / (mmDims[0] * mmDims[1]));
+      std::vector<uint8_t> minMaxData = DilateOccupancy3D(rawMinMax, mmDims[0], mmDims[1], mmDims[2]);
 
-          int z0 = std::max(0, gz - 1), z1 = std::min(mmDims[2] - 1, gz + 1);
-          int y0 = std::max(0, gy - 1), y1 = std::min(mmDims[1] - 1, gy + 1);
-          int x0 = std::max(0, gx - 1), x1 = std::min(mmDims[0] - 1, gx + 1);
-
-          bool solid = false;
-          for (int nz = z0; nz <= z1 && !solid; ++nz)
-            for (int ny = y0; ny <= y1 && !solid; ++ny)
-              for (int nx = x0; nx <= x1 && !solid; ++nx)
-                if (rawMinMax[(nz * mmDims[1] + ny) * mmDims[0] + nx] == 0) solid = true;
-
-          minMaxData[cellIdx] = solid ? 0 : 255;
-        }
-      });
-
-      // Step 2c: Create and upload R8Unorm texture
-      ReleaseMetalObject(block.MinMaxTexture);
-
-      id<MTLTexture> mmTex = NewTexture3D(
-        device,
-        MTLPixelFormatR8Unorm,
-        static_cast<NSUInteger>(mmDims[0]),
-        static_cast<NSUInteger>(mmDims[1]),
-        static_cast<NSUInteger>(mmDims[2]),
-        MTLTextureUsageShaderRead,
-        MTLStorageModeShared);
-      if (mmTex)
-      {
-        UploadR8Volume3D(mmTex, minMaxData.data(), mmDims[0], mmDims[1], mmDims[2]);
-
-        AssignMetalObject(block.MinMaxTexture, mmTex);
-      }
+      AssignR8MinMaxTexture(block.MinMaxTexture, device, minMaxData, mmDims[0], mmDims[1], mmDims[2]);
     }
 
     // Step 3: GPU per-block minmax compute (if UseGPUMinMax)
@@ -4282,26 +4177,22 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockMinMaxTextures(
         int bdims[3] = { block.Dims[0], block.Dims[1], block.Dims[2] };
         int mmDimsL[3] = { block.MinMaxDims[0], block.MinMaxDims[1], block.MinMaxDims[2] };
 
-        // Scratch R8Unorm texture (temporary, released after command)
-        id<MTLTexture> scratchTex = NewTexture3D(
+        id<MTLTexture> scratchTex = CreateR8MinMaxTexture(
           device,
-          MTLPixelFormatR8Unorm,
-          static_cast<NSUInteger>(mmDimsL[0]),
-          static_cast<NSUInteger>(mmDimsL[1]),
-          static_cast<NSUInteger>(mmDimsL[2]),
-          MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
-          MTLStorageModePrivate);
+          mmDimsL[0],
+          mmDimsL[1],
+          mmDimsL[2],
+          MTLStorageModePrivate,
+          MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
         if (!scratchTex) continue;
 
-        // Persistent per-block MinMax texture (dilated result)
-        id<MTLTexture> mmTex = NewTexture3D(
+        id<MTLTexture> mmTex = CreateR8MinMaxTexture(
           device,
-          MTLPixelFormatR8Unorm,
-          static_cast<NSUInteger>(mmDimsL[0]),
-          static_cast<NSUInteger>(mmDimsL[1]),
-          static_cast<NSUInteger>(mmDimsL[2]),
-          MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
-          MTLStorageModePrivate);
+          mmDimsL[0],
+          mmDimsL[1],
+          mmDimsL[2],
+          MTLStorageModePrivate,
+          MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
         if (!mmTex) { [scratchTex release]; continue; }
         AssignMetalObject(block.MinMaxTexture, mmTex);
 
