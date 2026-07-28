@@ -1590,8 +1590,8 @@ inline half4 marchVolume(
 
   int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
 
-  float3 accumulatedColor = float3(initialColor);
-  float accumulatedOpacity = float(initialOpacity);
+  half3 accumulatedColor = initialColor;
+  half accumulatedOpacity = initialOpacity;
 
   float3 texLocalPos0 = (currentPoint - texMinGlobal) * invTexSizeGlobal;
   float3 evalPoint0 = texLocalPos0;
@@ -1680,9 +1680,9 @@ inline half4 marchVolume(
       continue;
     }
 
-    float scalarNorm = saturate(rawScalar * scalarScale + scalarBias);
+    half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
 
-    float4 colorOpacity;
+    half4 colorOpacity;
     half maskLabel = 0.0h;
 
     if (doMask) {
@@ -1693,29 +1693,35 @@ inline half4 marchVolume(
           label = clamp(label, 1.0, numLabels - 1.0);
           maskLabel = half(label);
           float labelY = (label + 0.5) / numLabels;
-          colorOpacity = float4(labelMapTransferTexture.sample(sNearest, float2(scalarNorm, labelY), level(0)));
+          colorOpacity = half4(labelMapTransferTexture.sample(sNearest, float2(float(scalarNorm), labelY), level(0)));
         } else {
-          colorOpacity = transferFunctionTexture.sample(sVolume, float2(scalarNorm, 0.5), level(0));
+          colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
         }
       } else {
-        colorOpacity = transferFunctionTexture.sample(sVolume, float2(scalarNorm, 0.5), level(0));
+        colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
       }
     } else {
-      colorOpacity = transferFunctionTexture.sample(sVolume, float2(scalarNorm, 0.5), level(0));
+      colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
     }
 
-    float sampleOpacity = colorOpacity.a;
+    half sampleOpacity = colorOpacity.a;
+    // Shader-side opacity pre-integration: adjust raw opacity by step distance.
+    // Avoids CPU rebuild of the TF texture when sample distance changes.
+    half stepFactor = volumeUniforms.opacityPreIntegrationFactor;
+    if (sampleOpacity > 0.0001h && stepFactor > 0.0h) {
+        sampleOpacity = 1.0h - pow(1.0h - sampleOpacity, stepFactor);
+    }
 
-    if (sampleOpacity > 0.0f) {
-      float3 sampleColor = colorOpacity.rgb;
-      float weight = 1.0f - accumulatedOpacity;
+    if (sampleOpacity > 0.001h) {
+      half3 sampleColor = colorOpacity.rgb;
+      half weight = 1.0h - accumulatedOpacity;
 
-      if (sampleOpacity < 0.01f) {
+      if (sampleOpacity < 0.01h) {
         accumulatedColor += weight * sampleColor * sampleOpacity;
         accumulatedOpacity += weight * sampleOpacity;
       } else {
 
-      if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002f)) {
+      if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
 
         half3 normal;
         half gradMag;
@@ -1730,13 +1736,13 @@ inline half4 marchVolume(
           gradMag = grad.w;
         }
 
-        sampleColor = float3(computePhongLightingVolumeFast(half3(sampleColor), normal, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat));
+        sampleColor = computePhongLightingVolumeFast(sampleColor, normal, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
 
         if (doGradOp) {
-          sampleOpacity *= gradientOpacityTexture.sample(sVolume, float2(float(gradMag), 0.5), level(0)).r;
+          sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(gradMag), 0.5), level(0)).r);
         }
       } else if (doShading) {
-        sampleColor = float3(ambientMat) * sampleColor;
+        sampleColor = ambientMat * sampleColor;
       }
 
       accumulatedColor += weight * sampleColor * sampleOpacity;
@@ -1744,9 +1750,8 @@ inline half4 marchVolume(
       }
     }
 
-    float opacityThreshold = 1.0f - 1.0f / 255.0f;
-    if (accumulatedOpacity >= opacityThreshold) {
-      accumulatedOpacity = 1.0f;
+    if (accumulatedOpacity >= 0.99h) {
+      accumulatedOpacity = 1.0h;
       break;
     }
     if (currentT >= tTerminateMax) {
@@ -1754,7 +1759,7 @@ inline half4 marchVolume(
     }
   }
 
-  return half4(half3(accumulatedColor), half(accumulatedOpacity));
+  return half4(accumulatedColor, accumulatedOpacity);
 }
 
 fragment VolumeFragmentOut fragment_volume_main(
@@ -1980,8 +1985,8 @@ inline void marchSegment(
     float stepSize,
     float jitter,
     float tTerminateMax,
-    thread float3& accumulatedColor,
-    thread float& accumulatedOpacity,
+    thread half3& accumulatedColor,
+    thread half& accumulatedOpacity,
     constant VolumeMapperUniforms& volumeUniforms,
     constant PerBlockData& b,
     texture3d<float> volumeTexture,
@@ -2113,9 +2118,9 @@ inline void marchSegment(
             continue;
         }
 
-        float scalarNorm = saturate(rawScalar * scalarScale + scalarBias);
+        half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
 
-        float4 colorOpacity;
+        half4 colorOpacity;
         half maskLabel = 0.0h;
 
         if (doMask) {
@@ -2126,28 +2131,32 @@ inline void marchSegment(
                     label = clamp(label, 1.0, numLabels - 1.0);
                     maskLabel = half(label);
                     float labelY = (label + 0.5) / numLabels;
-                    colorOpacity = float4(labelMapTransferTexture.sample(sNearest, float2(scalarNorm, labelY), level(0)));
+                    colorOpacity = half4(labelMapTransferTexture.sample(sNearest, float2(float(scalarNorm), labelY), level(0)));
                 } else {
-                    colorOpacity = transferFunctionTexture.sample(sVolume, float2(scalarNorm, 0.5), level(0));
+                    colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
                 }
             } else {
-                colorOpacity = transferFunctionTexture.sample(sVolume, float2(scalarNorm, 0.5), level(0));
+                colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
             }
         } else {
-            colorOpacity = transferFunctionTexture.sample(sVolume, float2(scalarNorm, 0.5), level(0));
+            colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
         }
 
-        float sampleOpacity = colorOpacity.a;
+        half sampleOpacity = colorOpacity.a;
+        half stepFactor = volumeUniforms.opacityPreIntegrationFactor;
+        if (sampleOpacity > 0.0001h && stepFactor > 0.0h) {
+            sampleOpacity = 1.0h - pow(1.0h - sampleOpacity, stepFactor);
+        }
 
-        if (sampleOpacity > 0.0f) {
-            float3 sampleColor = colorOpacity.rgb;
-            float weight = 1.0f - accumulatedOpacity;
+        if (sampleOpacity > 0.001h) {
+            half3 sampleColor = colorOpacity.rgb;
+            half weight = 1.0h - accumulatedOpacity;
 
-            if (sampleOpacity < 0.01f) {
+            if (sampleOpacity < 0.01h) {
                 accumulatedColor += weight * sampleColor * sampleOpacity;
                 accumulatedOpacity += weight * sampleOpacity;
             } else {
-                if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002f)) {
+                if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
                     half3 normal;
                     half gradMag;
 
@@ -2161,13 +2170,13 @@ inline void marchSegment(
                         gradMag = grad.w;
                     }
 
-                    sampleColor = float3(computePhongLightingVolumeFast(half3(sampleColor), normal, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat));
+                    sampleColor = computePhongLightingVolumeFast(sampleColor, normal, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
 
                     if (doGradOp) {
-                        sampleOpacity *= gradientOpacityTexture.sample(sVolume, float2(float(gradMag), 0.5), level(0)).r;
+                        sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(gradMag), 0.5), level(0)).r);
                     }
                 } else if (doShading) {
-                    sampleColor = float3(ambientMat) * sampleColor;
+                    sampleColor = ambientMat * sampleColor;
                 }
 
                 accumulatedColor += weight * sampleColor * sampleOpacity;
@@ -2175,9 +2184,8 @@ inline void marchSegment(
             }
         }
 
-        float opacityThreshold = 1.0f - 1.0f / 255.0f;
-        if (accumulatedOpacity >= opacityThreshold) {
-            accumulatedOpacity = 1.0f;
+        if (accumulatedOpacity >= 0.99h) {
+            accumulatedOpacity = 1.0h;
             break;
         }
         if (currentT >= tTerminateMax) {
@@ -2308,8 +2316,8 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
         : 0.0;
 
     // Grid traversal loop
-    float3 color = 0.0f;
-    float opacity = 0.0f;
+    half3 color = 0.0h;
+    half opacity = 0.0h;
 
     int3 gridDims = int3(grid.gridDimsX, grid.gridDimsY, grid.gridDimsZ);
     float tEndRel = tEnd - tStart;
@@ -2318,8 +2326,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
     int maxCells = gridDims.x + gridDims.y + gridDims.z + 3;
     int cellsVisited = 0;
 
-    float opacityThreshold = 1.0f - 1.0f / 255.0f;
-    while (walker.valid && opacity < opacityThreshold && cellsVisited < maxCells) {
+    while (walker.valid && opacity < 0.99h && cellsVisited < maxCells) {
         ++cellsVisited;
         int3 cell = walker.cell;
 
@@ -2346,7 +2353,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
         advanceGridWalker(walker, tEndRel);
     }
 
-    output.color = float4(color, opacity);
+    output.color = float4(float3(color), float(opacity));
     return output;
 }
 

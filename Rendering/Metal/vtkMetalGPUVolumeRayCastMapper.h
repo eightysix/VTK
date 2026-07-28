@@ -257,7 +257,6 @@ private:
   // Adaptive sample distance
   double ReductionFactor = 1.0;
   double LastTransferFunctionScalarRange[2] = { 0.0, 0.0 };
-  double LastTransferFunctionSampleDist = -1.0;
   double LastGradientOpacityScalarRange[2] = { 0.0, 0.0 };
   double LastLabelMapScalarRange[2] = { 0.0, 0.0 };
   void ComputeReductionFactor(double allocatedTime);
@@ -282,8 +281,7 @@ private:
   // Helper methods
   bool UpdateVolumeTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
   bool UpdateTransferFunctionTexture(
-    void* mtlDevice, void* mtlQueue, vtkVolume* vol,
-    double actualSampleDistance);
+    void* mtlDevice, void* mtlQueue, vtkVolume* vol);
   bool UpdateGradientOpacityTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
   bool UpdateMinMaxTexture(void* mtlDevice, vtkVolume* vol, vtkImageData* input, vtkDataArray* scalars, bool skipGlobalTexture = false);
   bool SetupBuffers(void* mtlDevice, vtkRenderer* ren, vtkVolume* vol, vtkImageData* input);
