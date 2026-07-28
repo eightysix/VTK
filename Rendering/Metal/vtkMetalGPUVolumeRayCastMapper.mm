@@ -155,6 +155,16 @@ static_assert(sizeof(PerBlockData) == 96,
 // Capped at 8 to stay within Metal's texture bind limit on older hardware.
 static const size_t MAX_LAYER_BRICKS = 8;
 
+// Must match Metal GridTraversalUniforms struct
+struct GridTraversalUniforms {
+  int32_t GridDimsX;
+  int32_t GridDimsY;
+  int32_t GridDimsZ;
+  int32_t _pad;
+};
+static_assert(sizeof(GridTraversalUniforms) == 16,
+  "GridTraversalUniforms must be 16 bytes to match Metal shader struct");
+
 // Must match Metal LayerCompositeUniforms struct
 struct LayerCompositeUniforms {
   float BlockMin[8][4];
@@ -1305,6 +1315,400 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseImageSampleResources()
 }
 
 //------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::ReleaseGridTraversalResources()
+{
+  ReleaseMetalObject(this->OccupancyGridTexture);
+  ReleaseMetalObject(this->SplitPlanesBuffer);
+  ReleaseMetalObject(this->GridTraversalUniformBuffer);
+  delete[] this->SplitPlanesCPU;
+  this->SplitPlanesCPU = nullptr;
+  this->SplitPlanesCount[0] = 0;
+  this->SplitPlanesCount[1] = 0;
+  this->SplitPlanesCount[2] = 0;
+  this->GridTraversalResourcesValid = false;
+}
+
+//------------------------------------------------------------------------------
+bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
+  void* mtlDeviceVoid, void* mtlQueueVoid, vtkImageData* input, vtkDataArray* scalars)
+{
+  id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
+  id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)mtlQueueVoid;
+
+  int dims[3];
+  input->GetDimensions(dims);
+  if (dims[0] < 1 || dims[1] < 1 || dims[2] < 1)
+  {
+    vtkErrorMacro("Volume has zero dimensions");
+    return false;
+  }
+
+  int dataType = scalars->GetDataType();
+  int numComponents = scalars->GetNumberOfComponents();
+  vtkIdType numTuples = scalars->GetNumberOfTuples();
+
+  VolumeFormat fmtInfo = ChooseVolumeFormat(
+    dataType, numComponents, this->ScalarRange, this->PreferHalfPrecision);
+  bool useHalf = this->PreferHalfPrecision &&
+    HalfRangeIsSafe(this->ScalarRange[0], this->ScalarRange[1]);
+  this->ScalarNormalizationFactor = fmtInfo.NormalizationFactor;
+
+  bool gpuConversionUsed = false;
+  int actualComponents = (numComponents == 3) ? 4 : numComponents;
+  NSUInteger bytesPerRow = static_cast<NSUInteger>(dims[0]) * fmtInfo.BytesPerComponent *
+    actualComponents;
+  NSUInteger bytesPerImage = bytesPerRow * dims[1];
+  NSUInteger totalBytes = bytesPerImage * dims[2];
+
+  if (fmtInfo.NeedsConversion && this->UseGPUConversion)
+  {
+    const char* kernelName = nullptr;
+         if (dataType == VTK_SHORT)        kernelName = useHalf ? "volume_convert_short_to_half"  : "volume_convert_short_to_float";
+    else if (dataType == VTK_INT)          kernelName = useHalf ? "volume_convert_int_to_half"    : "volume_convert_int_to_float";
+    else if (dataType == VTK_UNSIGNED_INT) kernelName = useHalf ? "volume_convert_uint_to_half"   : "volume_convert_uint_to_float";
+    else if (dataType == VTK_FLOAT && useHalf) kernelName = "volume_convert_float_to_half";
+
+    if (kernelName)
+    {
+      if (!this->EnsureConversionPipelines(mtlDeviceVoid))
+      {
+        return false;
+      }
+
+      id<MTLComputePipelineState> pipeline = nullptr;
+           if (dataType == VTK_SHORT)        pipeline = (__bridge id<MTLComputePipelineState>)(useHalf ? this->ConvertShortToHalfPipeline : this->ConvertShortToFloatPipeline);
+      else if (dataType == VTK_INT)          pipeline = (__bridge id<MTLComputePipelineState>)(useHalf ? this->ConvertIntToHalfPipeline : this->ConvertIntToFloatPipeline);
+      else if (dataType == VTK_UNSIGNED_INT) pipeline = (__bridge id<MTLComputePipelineState>)(useHalf ? this->ConvertUIntToHalfPipeline : this->ConvertUIntToFloatPipeline);
+      else if (dataType == VTK_FLOAT && useHalf) pipeline = (__bridge id<MTLComputePipelineState>)this->ConvertFloatToHalfPipeline;
+      if (!pipeline)
+      {
+        vtkErrorMacro("GPU conversion pipeline not available for data type " << dataType);
+        return false;
+      }
+
+      size_t srcBytesPerVoxel = static_cast<size_t>(vtkDataArray::GetDataTypeSize(dataType)) * numComponents;
+      size_t totalSrcBytes = static_cast<size_t>(numTuples) * srcBytesPerVoxel;
+
+      id<MTLBuffer> srcBuf = [device newBufferWithBytes:scalars->GetVoidPointer(0)
+                                                  length:totalSrcBytes
+                                                 options:MTLResourceStorageModeShared];
+      if (!srcBuf)
+      {
+        vtkErrorMacro("Failed to create source buffer for GPU conversion");
+        return false;
+      }
+
+      int outputComponents = actualComponents;
+      ReleaseMetalObject(this->VolumeTexture);
+
+      id<MTLTexture> tex = NewTexture3D(
+        device,
+        fmtInfo.Format,
+        static_cast<NSUInteger>(dims[0]),
+        static_cast<NSUInteger>(dims[1]),
+        static_cast<NSUInteger>(dims[2]),
+        MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead,
+        MTLStorageModePrivate);
+      if (!tex)
+      {
+        vtkErrorMacro("Failed to create 3D volume texture for GPU conversion");
+        [srcBuf release];
+        return false;
+      }
+      AssignMetalObject(this->VolumeTexture, tex);
+
+      VolumeConvertUniforms vu;
+      vu.dimX = static_cast<uint32_t>(dims[0]);
+      vu.dimY = static_cast<uint32_t>(dims[1]);
+      vu.dimZ = static_cast<uint32_t>(dims[2]);
+      vu.numComponents = static_cast<uint32_t>(numComponents);
+      vu.outputComponents = static_cast<uint32_t>(outputComponents);
+      vu._pad = 0;
+
+      id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+      cmdBuf.label = @"VTK Volume GPU Convert";
+      id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+      enc.label = @"Volume Convert";
+      [enc setComputePipelineState:pipeline];
+      [enc setBuffer:srcBuf offset:0 atIndex:0];
+      [enc setTexture:tex atIndex:0];
+      [enc setBytes:&vu length:sizeof(vu) atIndex:1];
+
+      MTLSize grid = MTLSizeMake(dims[0], dims[1], dims[2]);
+      MTLSize tg = MTLSizeMake(8, 8, 8);
+      [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+      [enc endEncoding];
+      [cmdBuf commit];
+
+      [srcBuf release];
+      gpuConversionUsed = true;
+    }
+  }
+
+  if (!gpuConversionUsed)
+  {
+    id<MTLBuffer> stagingBuf = [device newBufferWithLength:totalBytes
+                                                   options:MTLResourceStorageModeShared];
+    if (!stagingBuf)
+    {
+      vtkErrorMacro("Failed to create volume staging buffer");
+      return false;
+    }
+    void* uploadPointer = [stagingBuf contents];
+
+    if (fmtInfo.NeedsConversion)
+    {
+      ConvertVolumeData(scalars->GetVoidPointer(0), dataType, numComponents,
+        numTuples, uploadPointer, useHalf, actualComponents, scalars);
+    }
+    else if (dataType == VTK_FLOAT && numComponents == 3)
+    {
+      Expand3To4<float>(
+        static_cast<const float*>(scalars->GetVoidPointer(0)),
+        static_cast<float*>(uploadPointer),
+        numTuples,
+        0.0f);
+    }
+    else if (dataType == VTK_UNSIGNED_CHAR && numComponents == 3)
+    {
+      Expand3To4<unsigned char>(
+        static_cast<const unsigned char*>(scalars->GetVoidPointer(0)),
+        static_cast<unsigned char*>(uploadPointer),
+        numTuples,
+        255);
+    }
+    else if (dataType == VTK_UNSIGNED_SHORT && this->ScalarNormalizationFactor == 255.0f)
+    {
+      const unsigned short* src =
+        static_cast<const unsigned short*>(scalars->GetVoidPointer(0));
+      unsigned char* dst = static_cast<unsigned char*>(uploadPointer);
+      vtkSMPTools::For(0, numTuples, [&](vtkIdType begin, vtkIdType end) {
+        for (vtkIdType i = begin; i < end; ++i)
+        {
+          for (int c = 0; c < numComponents; ++c)
+            dst[i * actualComponents + c] = static_cast<unsigned char>(std::min<unsigned short>(src[i * numComponents + c], 255));
+          if (numComponents == 3)
+            dst[i * 4 + 3] = 255;
+        }
+      });
+    }
+    else if (dataType == VTK_UNSIGNED_SHORT && numComponents == 3)
+    {
+      Expand3To4<unsigned short>(
+        static_cast<const unsigned short*>(scalars->GetVoidPointer(0)),
+        static_cast<unsigned short*>(uploadPointer),
+        numTuples,
+        65535);
+    }
+    else
+    {
+      std::memcpy(uploadPointer, scalars->GetVoidPointer(0), totalBytes);
+    }
+
+    id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->VolumeTexture;
+    id<MTLTexture> tex = nil;
+
+    if (oldTex &&
+        oldTex.width == static_cast<NSUInteger>(dims[0]) &&
+        oldTex.height == static_cast<NSUInteger>(dims[1]) &&
+        oldTex.depth == static_cast<NSUInteger>(dims[2]) &&
+        oldTex.pixelFormat == fmtInfo.Format)
+    {
+      tex = oldTex;
+    }
+    else
+    {
+      ReleaseMetalObject(this->VolumeTexture);
+
+      tex = NewTexture3D(
+        device,
+        fmtInfo.Format,
+        static_cast<NSUInteger>(dims[0]),
+        static_cast<NSUInteger>(dims[1]),
+        static_cast<NSUInteger>(dims[2]),
+        MTLTextureUsageShaderRead,
+        MTLStorageModePrivate);
+      if (!tex)
+      {
+        vtkErrorMacro("Failed to create 3D volume texture");
+        [stagingBuf release];
+        return false;
+      }
+      AssignMetalObject(this->VolumeTexture, tex);
+    }
+
+    id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
+    [blit copyFromBuffer:stagingBuf
+            sourceOffset:0
+     sourceBytesPerRow:bytesPerRow
+   sourceBytesPerImage:bytesPerImage
+            sourceSize:MTLSizeMake(dims[0], dims[1], dims[2])
+             toTexture:tex
+      destinationSlice:0
+      destinationLevel:0
+     destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+    [uploadCmdBuf commit];
+    [stagingBuf release];
+  }
+
+  return true;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::EnsureGridTraversalResources(
+  void* mtlDeviceVoid, void* mtlQueueVoid, vtkImageData* input)
+{
+  if (this->GridTraversalResourcesValid)
+    return;
+
+  id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
+  id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)mtlQueueVoid;
+
+  int nx = std::max(1, static_cast<int>(this->Partitions[0]));
+  int ny = std::max(1, static_cast<int>(this->Partitions[1]));
+  int nz = std::max(1, static_cast<int>(this->Partitions[2]));
+
+  // Count non-empty blocks for diagnosis
+  int nonEmptyBlocks = 0;
+  for (auto& block : this->Blocks)
+    if (block.Texture) ++nonEmptyBlocks;
+  NSLog(@"[VTK] EnsureGridTraversalResources: grid=%dx%dx%d blocks=%zu nonEmpty=%d",
+    nx, ny, nz, this->Blocks.size(), nonEmptyBlocks);
+
+  // --- occupancy texture: reuse if dimensions match ---
+  id<MTLTexture> occTex = (__bridge id<MTLTexture>)this->OccupancyGridTexture;
+  bool needNewOccTex = !occTex ||
+      occTex.width  != static_cast<NSUInteger>(nx) ||
+      occTex.height != static_cast<NSUInteger>(ny) ||
+      occTex.depth  != static_cast<NSUInteger>(nz);
+
+  if (needNewOccTex)
+  {
+    ReleaseMetalObject(this->OccupancyGridTexture);
+    MTLTextureDescriptor* occDesc = [[MTLTextureDescriptor alloc] init];
+    occDesc.textureType = MTLTextureType3D;
+    occDesc.pixelFormat = MTLPixelFormatR8Unorm;
+    occDesc.width = static_cast<NSUInteger>(nx);
+    occDesc.height = static_cast<NSUInteger>(ny);
+    occDesc.depth = static_cast<NSUInteger>(nz);
+    occDesc.usage = MTLTextureUsageShaderRead;
+    occDesc.storageMode = MTLStorageModePrivate;
+    occTex = [device newTextureWithDescriptor:occDesc];
+    [occDesc release];
+    if (!occTex)
+    {
+      vtkErrorMacro("Failed to create grid traversal occupancy texture");
+      return;
+    }
+    AssignMetalObject(this->OccupancyGridTexture, occTex);
+  }
+
+  // Build occupancy data from current block textures
+  int gridCells = nx * ny * nz;
+  std::vector<uint8_t> occupancy(gridCells, 0);
+  for (size_t idx = 0; idx < this->Blocks.size() && idx < static_cast<size_t>(gridCells); ++idx)
+  {
+    occupancy[idx] = (this->Blocks[idx].Texture != nullptr) ? 255 : 0;
+  }
+
+  // Upload on the main queue so the blit is ordered before the render pass
+  NSUInteger occBytesPerRow = static_cast<NSUInteger>(nx);
+  NSUInteger occBytesPerImage = occBytesPerRow * ny;
+  id<MTLBuffer> occStaging = [device newBufferWithBytes:occupancy.data()
+                                                  length:occBytesPerImage * nz
+                                                 options:MTLResourceStorageModeShared];
+  id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
+  uploadCmdBuf.label = @"VTK Grid Traversal Occupancy Upload";
+  id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
+  [blit copyFromBuffer:occStaging
+          sourceOffset:0
+   sourceBytesPerRow:occBytesPerRow
+ sourceBytesPerImage:occBytesPerImage
+          sourceSize:MTLSizeMake(nx, ny, nz)
+           toTexture:occTex
+    destinationSlice:0
+    destinationLevel:0
+   destinationOrigin:MTLOriginMake(0, 0, 0)];
+  [blit endEncoding];
+  [uploadCmdBuf commit];
+  [occStaging release];
+
+  // --- split planes: rebuild only if dimensions changed ---
+  bool needNewPlanes = (this->SplitPlanesCount[0] != nx + 1 ||
+                        this->SplitPlanesCount[1] != ny + 1 ||
+                        this->SplitPlanesCount[2] != nz + 1);
+
+  if (needNewPlanes)
+  {
+    int fullExt[6];
+    input->GetExtent(fullExt);
+    int extSize[3] = {
+      fullExt[1] - fullExt[0] + 1,
+      fullExt[3] - fullExt[2] + 1,
+      fullExt[5] - fullExt[4] + 1
+    };
+
+    this->SplitPlanesCount[0] = nx + 1;
+    this->SplitPlanesCount[1] = ny + 1;
+    this->SplitPlanesCount[2] = nz + 1;
+
+    delete[] this->SplitPlanesCPU;
+    int totalPlanes = (nx + 1) + (ny + 1) + (nz + 1);
+    float* planes = new float[totalPlanes];
+    this->SplitPlanesCPU = planes;
+
+    float* px = planes;
+    float* py = planes + (nx + 1);
+    float* pz = planes + (nx + 1) + (ny + 1);
+
+    for (int i = 0; i <= nx; ++i)
+    {
+      int pixel = fullExt[0] + i * extSize[0] / nx;
+      if (i >= nx) pixel = fullExt[1] + 1;
+      px[i] = static_cast<float>(pixel - fullExt[0]) / extSize[0];
+    }
+    for (int j = 0; j <= ny; ++j)
+    {
+      int pixel = fullExt[2] + j * extSize[1] / ny;
+      if (j >= ny) pixel = fullExt[3] + 1;
+      py[j] = static_cast<float>(pixel - fullExt[2]) / extSize[1];
+    }
+    for (int k = 0; k <= nz; ++k)
+    {
+      int pixel = fullExt[4] + k * extSize[2] / nz;
+      if (k >= nz) pixel = fullExt[5] + 1;
+      pz[k] = static_cast<float>(pixel - fullExt[4]) / extSize[2];
+    }
+
+    ReleaseMetalObject(this->SplitPlanesBuffer);
+    id<MTLBuffer> splitBuf = [device newBufferWithBytes:planes
+                                                  length:totalPlanes * sizeof(float)
+                                                 options:MTLResourceStorageModeShared];
+    AssignMetalObject(this->SplitPlanesBuffer, splitBuf);
+  }
+
+  // --- grid traversal uniform buffer: rebuild only if dimensions changed ---
+  if (needNewPlanes)
+  {
+    GridTraversalUniforms gridUniforms;
+    gridUniforms.GridDimsX = static_cast<int32_t>(nx);
+    gridUniforms.GridDimsY = static_cast<int32_t>(ny);
+    gridUniforms.GridDimsZ = static_cast<int32_t>(nz);
+    gridUniforms._pad = 0;
+
+    ReleaseMetalObject(this->GridTraversalUniformBuffer);
+    id<MTLBuffer> gridBuf = [device newBufferWithBytes:&gridUniforms
+                                                 length:sizeof(GridTraversalUniforms)
+                                                options:MTLResourceStorageModeShared];
+    AssignMetalObject(this->GridTraversalUniformBuffer, gridBuf);
+  }
+
+  this->GridTraversalResourcesValid = true;
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::ReleaseGradientNormalTexture()
 {
   ReleaseMetalObject(this->GradientNormalTexture);
@@ -1511,6 +1915,8 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
     ReleaseMetalObject(this->UniformBuffers[i]);
   }
 
+  this->ReleaseGridTraversalResources();
+
   ReleaseMetalObject(this->VertexBuffer);
   ReleaseMetalObject(this->IndexBuffer);
 }
@@ -1634,6 +2040,16 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
         return false;
       }
 
+      // Create/recreate global volume texture for grid traversal
+      // Note: block textures continue using their per-block textures for the
+      // layer composite fallback; the global texture is used exclusively by
+      // the single-pass grid traversal path.
+      ReleaseMetalObject(this->VolumeTexture);
+      if (!this->CreateGlobalVolumeTexture(mtlDeviceVoid, mtlQueueVoid, input, scalars))
+      {
+        return false;
+      }
+
       this->VolumeUploadTime.Modified();
     }
     else if (needsOpacityReload && !this->Blocks.empty())
@@ -1654,6 +2070,18 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       }
       this->VolumeUploadTime.Modified();
     }
+
+    // Rebuild grid traversal resources only when the block layout or
+    // empty-space classification actually changed.
+    if (needsReblockify || needsDataReload || needsMapperReload || needsOpacityReload)
+    {
+      this->GridTraversalResourcesValid = false;
+    }
+    if (!this->GridTraversalResourcesValid && this->VolumeTexture)
+    {
+      this->EnsureGridTraversalResources(mtlDeviceVoid, mtlQueueVoid, input);
+    }
+
     return true;
   }
 
@@ -1959,6 +2387,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       { static_cast<uint32_t>(VolumePipelineType::FullscreenOffscreen),
         MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1 },
       { static_cast<uint32_t>(VolumePipelineType::FullscreenAccumulation),
+        MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1 },
+      { static_cast<uint32_t>(VolumePipelineType::GridTraversalDirect),
+        MTLPixelFormatBGRA8Unorm, MTLPixelFormatDepth32Float, sc },
+      { static_cast<uint32_t>(VolumePipelineType::GridTraversalOffscreen),
         MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1 },
     };
 
@@ -5085,6 +5517,11 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
       fragName = @"fragment_image_sample_blit";
       useVolumeVertex = false;
       break;
+    case VolumePipelineType::GridTraversalDirect:
+    case VolumePipelineType::GridTraversalOffscreen:
+      fragName = @"fragment_volume_grid_traversal_main";
+      useVolumeVertex = false;
+      break;
   }
 
   // Create function constants for shader specialization.
@@ -5097,7 +5534,9 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     pt == VolumePipelineType::OffscreenAccumulation ||
     pt == VolumePipelineType::FullscreenDirect ||
     pt == VolumePipelineType::FullscreenOffscreen ||
-    pt == VolumePipelineType::FullscreenAccumulation);
+    pt == VolumePipelineType::FullscreenAccumulation ||
+    pt == VolumePipelineType::GridTraversalDirect ||
+    pt == VolumePipelineType::GridTraversalOffscreen);
 
   if (hasFeatureConstants)
   {
@@ -5169,7 +5608,8 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
   pipelineDesc.colorAttachments[0].pixelFormat = (MTLPixelFormat)colorFormat;
 
   // DirectScreen and FullscreenDirect use blending; offscreen pipelines do not.
-  if (pt == VolumePipelineType::DirectScreen || pt == VolumePipelineType::FullscreenDirect)
+  if (pt == VolumePipelineType::DirectScreen || pt == VolumePipelineType::FullscreenDirect ||
+      pt == VolumePipelineType::GridTraversalDirect)
   {
     pipelineDesc.colorAttachments[0].blendingEnabled = YES;
     pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
@@ -5286,6 +5726,29 @@ void vtkMetalGPUVolumeRayCastMapper::BindFullscreenTextures(
   SetFragmentTextureOrFallback(encoder, 5, this->LabelMapTransferTexture, this->ColorOpacityTexture);
   SetFragmentTextureOrFallback(encoder, 6, minMaxTexVoid, this->DummyMinMaxTexture);
   SetFragmentTextureOrFallback(encoder, 7, normalTexVoid, this->DummyVolumeTexture);
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::BindGridTraversalTextures(
+  void* encoderVoid, void* uniformBufVoid,
+  void* volTexVoid, void* minMaxTexVoid, void* normalTexVoid,
+  bool useDepth, const void* pbd, uint32_t cullMode)
+{
+  id<MTLRenderCommandEncoder> encoder =
+    (__bridge id<MTLRenderCommandEncoder>)encoderVoid;
+
+  this->BindFullscreenTextures(encoderVoid, uniformBufVoid,
+    volTexVoid, minMaxTexVoid, normalTexVoid, useDepth, pbd, cullMode);
+
+  SetFragmentTextureOrFallback(encoder, 8, this->OccupancyGridTexture, this->DummyVolumeTexture);
+
+  id<MTLBuffer> gridBuf = (__bridge id<MTLBuffer>)this->GridTraversalUniformBuffer;
+  if (!gridBuf)
+  {
+    vtkErrorMacro("GridTraversalUniformBuffer is nil");
+    return;
+  }
+  [encoder setFragmentBuffer:gridBuf offset:0 atIndex:3];
 }
 
 //------------------------------------------------------------------------------
@@ -6131,7 +6594,78 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     for (auto& block : this->Blocks)
       if (block.Texture) ++nonEmptyCount;
 
-    if (!this->Blocks.empty() && nonEmptyCount > 0 &&
+    bool useGridTraversal = (usePartitions && this->VolumeTexture &&
+      this->GridTraversalResourcesValid);
+
+    NSLog(@"[VTK] grid traversal decision: usePartitions=%d volTex=%p occValid=%d useGridTraversal=%d nonEmpty=%zu/%zu",
+      (int)usePartitions, this->VolumeTexture, (int)this->GridTraversalResourcesValid,
+      (int)useGridTraversal, (size_t)nonEmptyCount, this->Blocks.size());
+
+    if (useGridTraversal)
+    {
+      // Single-pass grid traversal: march all bricks along each pixel ray using 3D DDA
+      // through the global volume texture. This is the preferred path for partitioned
+      // volumes — no per-brick layers, no sorting passes, exact front-to-back per pixel.
+      MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+      rpd.colorAttachments[0].texture = offscreenColor;
+      rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+      rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+      rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+      id<MTLRenderCommandEncoder> gridEnc =
+        [commandBuffer renderCommandEncoderWithDescriptor:rpd];
+      gridEnc.label = @"VTK Grid Traversal";
+
+      MTLViewport mvp;
+      mvp.originX = 0; mvp.originY = 0;
+      mvp.width = fboWidth; mvp.height = fboHeight;
+      mvp.znear = 0.0; mvp.zfar = 1.0;
+      [gridEnc setViewport:mvp];
+
+      void* gridPso = this->GetOrCreateVolumePipeline(mtlDevice,
+        static_cast<uint32_t>(VolumePipelineType::GridTraversalOffscreen),
+        MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, featureMask);
+      if (!gridPso) { NSLog(@"[VTK] grid traversal PSO is NULL!"); [gridEnc endEncoding]; return; }
+      [gridEnc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)gridPso];
+
+      PerBlockData pbd;
+      {
+        int dims[3];
+        input->GetDimensions(dims);
+        double* mb = this->ModelBounds;
+        double bsz[3] = { mb[1]-mb[0], mb[3]-mb[2], mb[5]-mb[4] };
+        for (int k = 0; k < 3; ++k)
+        {
+          if (bsz[k] < 1e-10) bsz[k] = 1.0;
+          pbd.VolumeBoundsMin[k] = 0.0f;
+          pbd.VolumeBoundsMax[k] = 1.0f;
+          pbd.GradientStep[k] = (dims[k] > 0) ? 1.0f / dims[k] : 1.0f;
+          pbd.TextureBoundsMin[k] = 0.0f;
+          pbd.TextureBoundsMax[k] = 1.0f;
+        }
+        pbd.VolumeBoundsMin[3] = pbd.VolumeBoundsMax[3] = 1.0f;
+        pbd.TextureBoundsMin[3] = pbd.TextureBoundsMax[3] = 1.0f;
+        pbd.GradientStep[3] = 0.0f;
+        pbd.MinMaxInfo[0] = (this->MinMaxTexture) ? 1.0f : 0.0f;
+        pbd.MinMaxInfo[1] = this->MinMaxTexture ? static_cast<float>(this->MinMaxDims[0]) : 0.0f;
+        pbd.MinMaxInfo[2] = this->MinMaxTexture ? static_cast<float>(this->MinMaxDims[1]) : 0.0f;
+        pbd.MinMaxInfo[3] = this->MinMaxTexture ? static_cast<float>(this->MinMaxDims[2]) : 0.0f;
+      }
+
+      id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;
+      id<MTLTexture> mmTex = (__bridge id<MTLTexture>)this->MinMaxTexture;
+      id<MTLTexture> normTex = (__bridge id<MTLTexture>)this->GradientNormalTexture;
+
+      this->BindGridTraversalTextures(gridEnc, uniformBuf,
+        (__bridge void*)volTex,
+        (__bridge void*)mmTex,
+        (__bridge void*)normTex,
+        false, &pbd, MTLCullModeNone);
+
+      [gridEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [gridEnc endEncoding];
+    }
+    else if (!this->Blocks.empty() && nonEmptyCount > 0 &&
         static_cast<size_t>(nonEmptyCount) <= MAX_LAYER_BRICKS &&
         this->LayerPipelineState && this->CompositePipelineState)
     {
@@ -6336,8 +6870,55 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       return;
     }
 
-    // Bind all encoder resources (pipeline, textures, samplers, buffers)
-    if (cameraInside)
+    bool useGridTraversalDirect = (usePartitions && this->VolumeTexture &&
+      this->GridTraversalResourcesValid);
+
+    if (useGridTraversalDirect)
+    {
+      void* gridPsoDirect = this->GetOrCreateVolumePipeline(mtlDevice,
+        static_cast<uint32_t>(VolumePipelineType::GridTraversalDirect),
+        MTLPixelFormatBGRA8Unorm, MTLPixelFormatDepth32Float,
+        static_cast<uint32_t>(sampleCount), featureMask);
+      if (!gridPsoDirect) { return; }
+      [encoder setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)gridPsoDirect];
+
+      PerBlockData pbd;
+      {
+        int dims[3];
+        input->GetDimensions(dims);
+        double* mb = this->ModelBounds;
+        double bsz[3] = { mb[1]-mb[0], mb[3]-mb[2], mb[5]-mb[4] };
+        for (int k = 0; k < 3; ++k)
+        {
+          if (bsz[k] < 1e-10) bsz[k] = 1.0;
+          pbd.VolumeBoundsMin[k] = 0.0f;
+          pbd.VolumeBoundsMax[k] = 1.0f;
+          pbd.GradientStep[k] = (dims[k] > 0) ? 1.0f / dims[k] : 1.0f;
+          pbd.TextureBoundsMin[k] = 0.0f;
+          pbd.TextureBoundsMax[k] = 1.0f;
+        }
+        pbd.VolumeBoundsMin[3] = pbd.VolumeBoundsMax[3] = 1.0f;
+        pbd.TextureBoundsMin[3] = pbd.TextureBoundsMax[3] = 1.0f;
+        pbd.GradientStep[3] = 0.0f;
+        pbd.MinMaxInfo[0] = (this->MinMaxTexture) ? 1.0f : 0.0f;
+        pbd.MinMaxInfo[1] = this->MinMaxTexture ? static_cast<float>(this->MinMaxDims[0]) : 0.0f;
+        pbd.MinMaxInfo[2] = this->MinMaxTexture ? static_cast<float>(this->MinMaxDims[1]) : 0.0f;
+        pbd.MinMaxInfo[3] = this->MinMaxTexture ? static_cast<float>(this->MinMaxDims[2]) : 0.0f;
+      }
+
+      id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;
+      id<MTLTexture> mmTex = (__bridge id<MTLTexture>)this->MinMaxTexture;
+      id<MTLTexture> normTex = (__bridge id<MTLTexture>)this->GradientNormalTexture;
+
+      this->BindGridTraversalTextures(encoder, uniformBuf,
+        (__bridge void*)volTex,
+        (__bridge void*)mmTex,
+        (__bridge void*)normTex,
+        true, &pbd, MTLCullModeNone);
+
+      [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    }
+    else if (cameraInside)
     {
       // Fullscreen ray-cast path — no proxy geometry, no vertex/index buffers.
       this->DrawBlocksFullscreen(encoder, uniformBuf, ren, vol,

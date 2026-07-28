@@ -1751,7 +1751,6 @@ inline half4 marchVolume(
     }
 
     if (accumulatedOpacity >= 0.99h) {
-      accumulatedColor /= max(accumulatedOpacity, 1e-4h);
       accumulatedOpacity = 1.0h;
       break;
     }
@@ -1940,6 +1939,519 @@ fragment VolumeFragmentOut fragment_volume_accum_main(
       maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
+}
+
+// ============================================================================
+// Grid traversal for partitioned volume rendering.
+// Single-pass front-to-back brick grid traversal using 3D DDA.
+// ============================================================================
+
+struct GridTraversalUniforms {
+    int gridDimsX;          // nx
+    int gridDimsY;          // ny
+    int gridDimsZ;          // nz
+    int _pad;
+};
+
+// 3D DDA grid walker for axis-aligned brick grid traversal.
+// Operates in normalized [0,1] volume space. Each grid cell
+// occupies (1/nx) x (1/ny) x (1/nz) in that space.
+struct GridWalker {
+    int3 cell;              // current brick index
+    float tEntry;           // ray t at entry into current cell
+    float tExit;            // ray t at exit from current cell
+    int3 step;              // traversal direction (+1 or -1) per axis
+    float3 tMax;            // ray t of next boundary crossing per axis
+    float3 tDelta;          // ray t delta to cross one cell per axis
+    int3 gridDims;
+    bool valid;
+};
+
+inline GridWalker initGridWalker(
+    float3 rayOrigin,
+    float3 rayDir,
+    float tStart,
+    float tEnd,
+    int3 gridDims)
+{
+    GridWalker w;
+    w.gridDims = gridDims;
+
+    float3 pos = rayOrigin + rayDir * tStart;
+    float3 cellF = clamp(pos, 0.0, 1.0) * float3(gridDims);
+
+    // Nudge into the correct cell when pos sits exactly on a boundary
+    // and the ray heads in the negative direction (floor puts us in the
+    // wrong cell otherwise).
+    float3 nudge = float3(
+        rayDir.x < 0.0 ? 1e-6 : 0.0,
+        rayDir.y < 0.0 ? 1e-6 : 0.0,
+        rayDir.z < 0.0 ? 1e-6 : 0.0);
+    w.cell = clamp(int3(floor(cellF - nudge)), int3(0), gridDims - 1);
+
+    // Work in relative coordinates: tEntry = 0 means "at pos right now".
+    // tEndRel is the distance from pos to the volume exit along the ray.
+    float tEndRel = tEnd - tStart;
+    if (tEndRel <= 1e-8) {
+        w.valid = false;
+        return w;
+    }
+
+    w.tEntry = 0.0;
+
+    float3 invGridDims = 1.0 / float3(gridDims);
+
+    for (int a = 0; a < 3; ++a)
+    {
+        float d = rayDir[a];
+        if (abs(d) < 1e-8)
+        {
+            w.step[a]   = 0;
+            w.tMax[a]   = 1e30;
+            w.tDelta[a] = 1e30;
+        }
+        else
+        {
+            w.step[a] = (d > 0.0) ? 1 : -1;
+
+            float boundary = (d > 0.0)
+                ? float(w.cell[a] + 1) * invGridDims[a]
+                : float(w.cell[a])     * invGridDims[a];
+
+            w.tMax[a]   = (boundary - pos[a]) / d;
+            w.tDelta[a] = invGridDims[a] / abs(d);
+
+            if (w.tMax[a] <= 0.0)
+                w.tMax[a] = w.tDelta[a] * 1e-6;
+        }
+    }
+
+    float minT = min(min(w.tMax.x, w.tMax.y), w.tMax.z);
+    w.tExit = min(minT, tEndRel);
+    w.valid = w.tExit > w.tEntry + 1e-8;
+
+    return w;
+}
+
+inline void advanceGridWalker(thread GridWalker& w, float tEnd)
+{
+    int axis = 0;
+    if (w.tMax.y < w.tMax.x) axis = 1;
+    if (w.tMax.z < w.tMax[axis]) axis = 2;
+
+    if (w.step[axis] == 0) { w.valid = false; return; }
+
+    w.tEntry = w.tMax[axis];
+    w.cell[axis] += w.step[axis];
+
+    if (any(w.cell < int3(0)) || any(w.cell >= w.gridDims))
+    {
+        w.valid = false;
+        return;
+    }
+
+    w.tMax[axis] += w.tDelta[axis];
+    if (w.tMax[axis] <= w.tEntry)
+        w.tMax[axis] = w.tEntry + w.tDelta[axis] * 1e-6;
+
+    float minT = min(min(w.tMax.x, w.tMax.y), w.tMax.z);
+    w.tExit = min(minT, tEnd);
+    w.valid = w.tExit > w.tEntry;
+}
+
+// March a ray segment [t0, t1] along a global sample schedule.
+// Uses the same sampling, shading, and accumulation logic as marchVolume
+// but operates on a sub-interval with a pre-determined jitter value.
+// Accumulates into color/opacity (front-to-back).
+inline void marchSegment(
+    float3 rayOrigin,
+    float3 rayDir,
+    float t0,
+    float t1,
+    float stepSize,
+    float jitter,
+    float tTerminateMax,
+    float3 texMinGlobal,
+    float3 texMaxGlobal,
+    float2 screenPos,
+    thread half3& accumulatedColor,
+    thread half& accumulatedOpacity,
+    constant VolumeMapperUniforms& volumeUniforms,
+    constant PerBlockData& b,
+    texture3d<float> volumeTexture,
+    texture2d<float> transferFunctionTexture,
+    texture2d<float> depthTexture,
+    texture2d<float> gradientOpacityTexture,
+    texture3d<float> maskTexture,
+    texture2d<float> labelMapTransferTexture,
+    texture3d<float> minMaxTexture,
+    texture3d<float> normalTexture)
+{
+    const bool doShading = fc_shading && (volumeUniforms.useGradientShading > 0.5);
+    const bool doGradOp = fc_gradientOpacity && (volumeUniforms.useGradientOpacity > 0.5);
+    const bool doCropping = volumeUniforms.useCropping > 0.5;
+    const bool doMask = fc_mask && (volumeUniforms.useMask > 0.5);
+
+    half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
+    half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+
+    half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
+
+    float3 texSizeGlobal = max(texMaxGlobal - texMinGlobal, 1e-6);
+    float3 invTexSizeGlobal = 1.0 / texSizeGlobal;
+    float3 rayDirTexLocal = rayDir * invTexSizeGlobal;
+    float3 dt = max(b.gradientStep.xyz, 1e-8);
+    half3 gradScale = half3(1.0 / (dt * texSizeGlobal));
+
+    half3 viewDirHalf  = half3(normalize((rayOrigin + rayDir * t0) - volumeUniforms.cameraVolumePos.xyz));
+    half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection));
+    half3 ambientMat   = half3(volumeUniforms.ambientColor.rgb);
+    half3 diffuseMat   = half3(volumeUniforms.diffuseColor.rgb);
+    half3 specularMat  = half3(volumeUniforms.specularColor.rgb);
+    half shininessMat  = half(volumeUniforms.shininess);
+
+    float maskScale = volumeUniforms.maskScale;
+    float maskBias  = volumeUniforms.maskBias;
+    float numLabels = volumeUniforms.labelMapNumLabels;
+
+    float3 cropMin = float3(volumeUniforms.croppingPlanes.x, volumeUniforms.croppingPlanes.z, volumeUniforms.croppingPlanes2.x);
+    float3 cropMax = float3(volumeUniforms.croppingPlanes.y, volumeUniforms.croppingPlanes.w, volumeUniforms.croppingPlanes2.y);
+    uint cropBitmask = volumeUniforms.croppingBitmask;
+
+    // Compute first sample position from the global schedule
+    float firstT = jitter + ceil((t0 - jitter) / stepSize) * stepSize;
+    float3 stepVec = rayDir * stepSize;
+    float3 currentPoint = rayOrigin + rayDir * firstT;
+    float currentT = firstT;
+
+    int maxSteps = min(max(1, int(ceil((t1 - firstT) / stepSize))), MAX_RAY_STEPS);
+
+    float3 mmDimF = b.minMaxInfo.yzw;
+    const bool useMinMax = fc_minmax &&
+        b.minMaxInfo.x > 0.5 &&
+        b.minMaxInfo.y > 0.5 &&
+        b.minMaxInfo.z > 0.5 &&
+        b.minMaxInfo.w > 0.5;
+
+    float prefetchScalar = 0.0;
+    float prefetchMask = 0.0;
+    bool prefetchValid = false;
+    int3 curCell = int3(-1);
+    bool curCellEmpty = false;
+
+    for (int i = 0; i < maxSteps; ++i) {
+        if (currentT >= t1 - 1e-6) break;
+
+        if (useMinMax) {
+            float3 texLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
+            float3 mmPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+            int3 newCell = min(int3(mmPos * mmDimF), int3(mmDimF) - 1);
+            if (any(newCell != curCell)) {
+                curCell      = newCell;
+                curCellEmpty = minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5;
+            }
+
+            if (curCellEmpty) {
+                float3 cellCoord = mmPos * mmDimF;
+                float3 fractCoord = fract(cellCoord);
+
+                float3 distToEdge;
+                distToEdge.x = rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x;
+                distToEdge.y = rayDir.y > 0.0 ? (1.0 - fractCoord.y) : fractCoord.y;
+                distToEdge.z = rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
+                distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
+
+                float3 tToEdge;
+                tToEdge.x = abs(rayDirTexLocal.x) > 1e-5
+                    ? distToEdge.x / abs(rayDirTexLocal.x * mmDimF.x) : 1e30;
+                tToEdge.y = abs(rayDirTexLocal.y) > 1e-5
+                    ? distToEdge.y / abs(rayDirTexLocal.y * mmDimF.y) : 1e30;
+                tToEdge.z = abs(rayDirTexLocal.z) > 1e-5
+                    ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
+
+                float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
+                exactSkip += 1e-4;
+                float skipDist = ceil(exactSkip / stepSize) * stepSize;
+                skipDist = max(stepSize, skipDist);
+
+                currentPoint += rayDir * skipDist;
+                currentT += skipDist;
+
+                if (currentT >= t1 - 1e-6) break;
+
+                prefetchValid = false;
+                curCell = int3(-1);
+                continue;
+            }
+        }
+
+        float3 texLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
+        float3 evalPoint = texLocalPos;
+        bool needsFetch = !prefetchValid;
+        float rawScalar = needsFetch
+            ? volumeTexture.sample(sVolume, evalPoint, level(0)).r
+            : prefetchScalar;
+        float rawMask = (doMask && needsFetch)
+            ? maskTexture.sample(sNearest, evalPoint, level(0)).r
+            : prefetchMask;
+
+        float3 lastPoint = currentPoint;
+        currentPoint += stepVec;
+        currentT += stepSize;
+
+        if (i + 1 < maxSteps) {
+            float3 nextTexLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
+            float3 nextEvalPoint = nextTexLocalPos;
+            prefetchScalar = volumeTexture.sample(sVolume, nextEvalPoint, level(0)).r;
+            if (doMask) {
+                prefetchMask = maskTexture.sample(sNearest, nextEvalPoint, level(0)).r;
+            }
+            prefetchValid = true;
+        }
+
+        if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, lastPoint))) == 0u)) {
+            continue;
+        }
+
+        half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
+
+        half4 colorOpacity;
+        half maskLabel = 0.0h;
+
+        if (doMask) {
+            float maskVal = rawMask * maskScale + maskBias;
+            if (numLabels > 0.0) {
+                float label = floor(maskVal + 0.5);
+                if (label > 0.0) {
+                    label = clamp(label, 1.0, numLabels - 1.0);
+                    maskLabel = half(label);
+                    float labelY = (label + 0.5) / numLabels;
+                    colorOpacity = half4(labelMapTransferTexture.sample(sNearest, float2(float(scalarNorm), labelY), level(0)));
+                } else {
+                    colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
+                }
+            } else {
+                colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
+            }
+        } else {
+            colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
+        }
+
+        half sampleOpacity = colorOpacity.a;
+        half stepFactor = volumeUniforms.opacityPreIntegrationFactor;
+        if (sampleOpacity > 0.0001h && stepFactor > 0.0h) {
+            sampleOpacity = 1.0h - pow(1.0h - sampleOpacity, stepFactor);
+        }
+
+        if (sampleOpacity > 0.001h) {
+            half3 sampleColor = colorOpacity.rgb;
+            half weight = 1.0h - accumulatedOpacity;
+
+            if (sampleOpacity < 0.01h) {
+                accumulatedColor += weight * sampleColor * sampleOpacity;
+                accumulatedOpacity += weight * sampleOpacity;
+            } else {
+                if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
+                    half3 normal;
+                    half gradMag;
+
+                    if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
+                        half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
+                        normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
+                        gradMag = nrmSample.w;
+                    } else {
+                        half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
+                        normal = grad.xyz;
+                        gradMag = grad.w;
+                    }
+
+                    sampleColor = computePhongLightingVolumeFast(sampleColor, normal, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
+
+                    if (doGradOp) {
+                        sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(gradMag), 0.5), level(0)).r);
+                    }
+                } else if (doShading) {
+                    sampleColor = ambientMat * sampleColor;
+                }
+
+                accumulatedColor += weight * sampleColor * sampleOpacity;
+                accumulatedOpacity += weight * sampleOpacity;
+            }
+        }
+
+        if (accumulatedOpacity >= 0.99h) {
+            accumulatedOpacity = 1.0h;
+            break;
+        }
+        if (currentT >= tTerminateMax) {
+            break;
+        }
+    }
+}
+
+// Single-pass front-to-back grid traversal shader for partitioned volumes.
+// Replaces the per-brick layer composite with a direct traversal of the
+// brick grid along each pixel ray, marching active bricks in true geometric order.
+fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
+    FullscreenVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    constant GridTraversalUniforms& grid [[buffer(3)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    texture2d<float> gradientOpacityTexture [[texture(3)]],
+    texture3d<float> maskTexture [[texture(4)]],
+    texture2d<float> labelMapTransferTexture [[texture(5)]],
+    texture3d<float> minMaxTexture [[texture(6)]],
+    texture3d<float> normalTexture [[texture(7)]],
+    texture3d<float> brickOccupancy [[texture(8)]])
+{
+    VolumeFragmentOut output;
+
+    float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+
+    // Reconstruct ray in normalized [0,1] volume space
+    float2 uv = in.position.xy / volumeUniforms.viewportSize;
+    float2 ndc = uv * 2.0 - 1.0;
+    float4 wn = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, 0.0, 1.0); wn.xyz /= wn.w;
+    float4 wf = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, 1.0, 1.0); wf.xyz /= wf.w;
+    float3 bsz = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+    float3 localN = ((volumeUniforms.worldToVolume * float4(wn.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bsz;
+    float3 localF = ((volumeUniforms.worldToVolume * float4(wf.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bsz;
+    float3 rayDir = normalize(localF - localN);
+
+    // Intersect with full volume bounds [0,1]
+    float3 volMin = float3(0.0);
+    float3 volMax = float3(1.0);
+    float2 tVol = intersectBox(cameraPos, rayDir, volMin, volMax);
+    float tStart = max(tVol.x, 0.0);
+    float tEnd = tVol.y;
+
+    if (tStart >= tEnd - 1e-8) {
+        output.color = float4(0.0);
+        return output;
+    }
+
+    // Apply clipping planes
+    if (volumeUniforms.useClipping > 0.5) {
+        int numClipPlanes = int(volumeUniforms.numClippingPlanes);
+        float4 planeOrigins[8] = {
+            volumeUniforms.clippingPlane0Origin, volumeUniforms.clippingPlane1Origin,
+            volumeUniforms.clippingPlane2Origin, volumeUniforms.clippingPlane3Origin,
+            volumeUniforms.clippingPlane4Origin, volumeUniforms.clippingPlane5Origin,
+            volumeUniforms.clippingPlane6Origin, volumeUniforms.clippingPlane7Origin
+        };
+        float4 planeNormals[8] = {
+            volumeUniforms.clippingPlane0Normal, volumeUniforms.clippingPlane1Normal,
+            volumeUniforms.clippingPlane2Normal, volumeUniforms.clippingPlane3Normal,
+            volumeUniforms.clippingPlane4Normal, volumeUniforms.clippingPlane5Normal,
+            volumeUniforms.clippingPlane6Normal, volumeUniforms.clippingPlane7Normal
+        };
+
+        float3 entryPoint = cameraPos + rayDir * tStart;
+        float3 exitPoint = cameraPos + rayDir * tEnd;
+
+        bool valid = true;
+        for (int cp = 0; cp < numClipPlanes && cp < 8; cp++) {
+            float3 planeOrigin = planeOrigins[cp].xyz;
+            float3 planeNormal = normalize(planeNormals[cp].xyz);
+            float startDistance = dot(planeNormal, planeOrigin - entryPoint);
+            float stopDistance = dot(planeNormal, planeOrigin - exitPoint);
+
+            if (startDistance > 0.0 && stopDistance > 0.0) { valid = false; break; }
+
+            float rayDotNormal = dot(rayDir, planeNormal);
+            if (rayDotNormal > 0.0 && startDistance > 0.0) {
+                entryPoint += (startDistance / rayDotNormal) * rayDir;
+            }
+            if (rayDotNormal <= 0.0 && stopDistance > 0.0) {
+                exitPoint += (stopDistance / rayDotNormal) * rayDir;
+            }
+        }
+
+        if (!valid) {
+            output.color = float4(0.0);
+            return output;
+        }
+
+        // Recompute t from clipped entry/exit
+        float3 d = exitPoint - entryPoint;
+        tStart = dot(entryPoint - cameraPos, rayDir);
+        tEnd = tStart + length(d);
+    }
+
+    // Depth occlusion termination
+    float tTerminateMax = 1e30;
+    if (volumeUniforms.useDepthTexture > 0.5) {
+        float depthSample = depthTexture.sample(sNearest, uv).r;
+        if (depthSample < 1.0) {
+            float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, depthSample, 1.0);
+            worldTermination.xyz /= worldTermination.w;
+            float3 terminationLocal = (worldTermination.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+            float tDepth = dot(terminationLocal - (cameraPos + rayDir * tStart), rayDir);
+            if (tDepth <= 0.0) {
+                output.color = float4(0.0);
+                return output;
+            }
+            tTerminateMax = tStart + tDepth;
+        }
+    }
+
+    tEnd = min(tEnd, tTerminateMax);
+    if (tStart >= tEnd - 1e-8) {
+        output.color = float4(0.0);
+        return output;
+    }
+
+    // Global sample schedule
+    float stepSize = volumeUniforms.sampleDistance;
+    float jitter = volumeUniforms.useJittering > 0.5
+        ? volume_random(in.position.xy + float2(0.5, 0.5)) * stepSize
+        : 0.0;
+
+    // Texture bounds = full volume for global texture
+    float3 texMin = float3(0.0);
+    float3 texMax = float3(1.0);
+
+    // Grid traversal loop
+    half3 color = 0.0h;
+    half opacity = 0.0h;
+
+    int3 gridDims = int3(grid.gridDimsX, grid.gridDimsY, grid.gridDimsZ);
+    float tEndRel = tEnd - tStart;
+    GridWalker walker = initGridWalker(cameraPos, rayDir, tStart, tEnd, gridDims);
+
+    while (walker.valid && opacity < 0.99h) {
+        int3 cell = walker.cell;
+
+        float3 occUV = (float3(cell) + 0.5) / float3(gridDims);
+        float occ = brickOccupancy.sample(sNearest, occUV, level(0)).r;
+
+        if (occ > 0.5) {
+            float segmentT0 = tStart + max(walker.tEntry, 0.0);
+            float segmentT1 = tStart + min(walker.tExit, tEndRel);
+
+            if (segmentT1 > segmentT0 + 1e-8) {
+                marchSegment(
+                    cameraPos, rayDir,
+                    segmentT0, segmentT1,
+                    stepSize, jitter, tTerminateMax,
+                    texMin, texMax,
+                    in.position.xy,
+                    color, opacity,
+                    volumeUniforms, b,
+                    volumeTexture, transferFunctionTexture, depthTexture,
+                    gradientOpacityTexture, maskTexture, labelMapTransferTexture,
+                    minMaxTexture, normalTexture);
+            }
+        }
+
+        advanceGridWalker(walker, tEndRel);
+    }
+
+    output.color = float4(float3(color), float(opacity));
+    return output;
 }
 
 // ============================================================================

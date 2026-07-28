@@ -37,7 +37,9 @@ enum class VolumePipelineType : uint32_t
   ImageSampleBlit = 4,
   FullscreenDirect = 5,      // Fullscreen ray-cast for camera-inside (BGRA8Unorm + depth)
   FullscreenOffscreen = 6,   // Fullscreen ray-cast for camera-inside (RGBA16Float, no depth)
-  FullscreenAccumulation = 7 // Fullscreen ray-cast with framebuffer fetch for multi-block accumulation
+  FullscreenAccumulation = 7, // Fullscreen ray-cast with framebuffer fetch for multi-block accumulation
+  GridTraversalDirect = 8,   // Single-pass grid traversal fullscreen (BGRA8Unorm + depth)
+  GridTraversalOffscreen = 9 // Single-pass grid traversal fullscreen (RGBA16Float, no depth)
 };
 
 struct VolumePipelineKey
@@ -370,6 +372,21 @@ private:
   // redundant full-voxel walk for BlockScalarRanges.
   std::vector<float> MacrocellScalarMin;
   std::vector<float> MacrocellScalarMax;
+
+  // Grid traversal data for single-pass partitioned volume rendering
+  void* OccupancyGridTexture = nullptr;     // id<MTLTexture> — R8Unorm 3D, dims = Partitions
+  void* SplitPlanesBuffer = nullptr;        // id<MTLBuffer> — packed xSplit[0..nx], ySplit[0..ny], zSplit[0..nz]
+  float* SplitPlanesCPU = nullptr;          // CPU copy for building the buffer
+  int SplitPlanesCount[3] = {};             // nx+1, ny+1, nz+1
+  void* GridTraversalUniformBuffer = nullptr; // id<MTLBuffer> — GridTraversalUniforms
+  bool GridTraversalResourcesValid = false;
+  void EnsureGridTraversalResources(void* mtlDevice, void* mtlQueue, vtkImageData* input);
+  void ReleaseGridTraversalResources();
+  bool CreateGlobalVolumeTexture(void* mtlDevice, void* mtlQueue,
+    vtkImageData* input, vtkDataArray* scalars);
+  void BindGridTraversalTextures(void* encoder, void* uniformBuf,
+    void* volTex, void* minMaxTex, void* normalTex,
+    bool useDepth, const void* pbd, uint32_t cullMode);
 
   // --- Order-independent compositing: per-brick layer textures ---
   // Each brick renders into its own RGBA16Float slice of a 2D texture array;
