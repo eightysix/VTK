@@ -2,6 +2,7 @@
 #import "ViewController.h"
 #import "FileVolumeViewController.h"
 #import "VTKMetalBaseViewController.h"
+#import "VTKInteractionMode.h"
 #import <UIKit/UIKit.h>
 
 @interface AppDelegate ()
@@ -37,7 +38,7 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
   NSUInteger index = [ViewCommandDefs() indexOfObjectPassingTest:^BOOL(NSDictionary* d, NSUInteger idx, BOOL* stop) {
     return NSSelectorFromString(d[@"action"]) == command.action;
   }];
-  
+
   if (index != NSNotFound)
   {
     ViewController* rootVC = (ViewController*)self.window.rootViewController;
@@ -45,6 +46,18 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
     {
       command.state = (rootVC.selectedIndex == (NSInteger)index) ? UIMenuElementStateOn : UIMenuElementStateOff;
     }
+    return;
+  }
+
+  // Interaction mode commands
+  SEL cmdAction = command.action;
+  VTKInteractionMode cmdMode = (VTKInteractionMode)[command.propertyList integerValue];
+  if (cmdAction == @selector(activatePanMode:) ||
+      cmdAction == @selector(activateZoomMode:) ||
+      cmdAction == @selector(activateTrackballMode:))
+  {
+    VTKMetalBaseViewController* vc = [self findMetalViewController];
+    command.state = (vc && vc.interactionMode == cmdMode) ? UIMenuElementStateOn : UIMenuElementStateOff;
   }
 }
 
@@ -87,6 +100,46 @@ didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
   
   UIMenu* viewsMenu = [UIMenu menuWithTitle:@"Views" children:viewCommands];
   [builder insertSiblingMenu:viewsMenu afterMenuForIdentifier:UIMenuApplication];
+
+  // Interaction Mode submenu
+  UIKeyCommand* panCmd = [UIKeyCommand commandWithTitle:@"Pan"
+                                                  image:[UIImage systemImageNamed:@"hand.point.up"]
+                                                 action:@selector(activatePanMode:)
+                                                  input:@"s"
+                                          modifierFlags:0
+                                           propertyList:@(VTKInteractionModePan)];
+  panCmd.discoverabilityTitle = @"Pan";
+
+  UIKeyCommand* zoomCmd = [UIKeyCommand commandWithTitle:@"Zoom"
+                                                   image:[UIImage systemImageNamed:@"magnifyingglass"]
+                                                  action:@selector(activateZoomMode:)
+                                                   input:@"a"
+                                           modifierFlags:0
+                                            propertyList:@(VTKInteractionModeZoom)];
+  zoomCmd.discoverabilityTitle = @"Zoom";
+
+  UIKeyCommand* trackballCmd = [UIKeyCommand commandWithTitle:@"Trackball"
+                                                        image:[UIImage systemImageNamed:@"cube.transparent"]
+                                                       action:@selector(activateTrackballMode:)
+                                                        input:@"x"
+                                                modifierFlags:0
+                                                 propertyList:@(VTKInteractionModeTrackball)];
+  trackballCmd.discoverabilityTitle = @"Trackball";
+
+  UIMenu* interactionMenu = [UIMenu menuWithTitle:@"Interaction Mode"
+                                         children:@[ panCmd, zoomCmd, trackballCmd ]];
+  [builder insertSiblingMenu:interactionMenu afterMenuForIdentifier:UIMenuApplication];
+
+  // Camera menu
+  UIKeyCommand* resetCameraCmd = [UIKeyCommand
+                                   keyCommandWithInput:@"r"
+                                   modifierFlags:UIKeyModifierCommand
+                                   action:@selector(resetCamera:)];
+  resetCameraCmd.title = @"Reset Camera";
+  resetCameraCmd.discoverabilityTitle = @"Reset camera to default view";
+
+  UIMenu* cameraMenu = [UIMenu menuWithTitle:@"Camera" children:@[ resetCameraCmd ]];
+  [builder insertSiblingMenu:cameraMenu afterMenuForIdentifier:UIMenuView];
   
   // VR Preset commands — actions go through the responder chain
   UIKeyCommand* nextPresetCmd = [UIKeyCommand
@@ -190,6 +243,36 @@ didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
     return (VTKMetalBaseViewController*)current;
   }
   return nil;
+}
+
+#pragma mark - Interaction Mode Actions
+
+- (void)activatePanMode:(id)sender
+{
+  [self findMetalViewController].interactionMode = VTKInteractionModePan;
+  [self updateInteractionModeMenu];
+}
+
+- (void)activateZoomMode:(id)sender
+{
+  [self findMetalViewController].interactionMode = VTKInteractionModeZoom;
+  [self updateInteractionModeMenu];
+}
+
+- (void)activateTrackballMode:(id)sender
+{
+  [self findMetalViewController].interactionMode = VTKInteractionModeTrackball;
+  [self updateInteractionModeMenu];
+}
+
+- (void)resetCamera:(id)sender
+{
+  [[self findMetalViewController] resetCamera];
+}
+
+- (void)updateInteractionModeMenu
+{
+  [UIMenuSystem.mainSystem setNeedsRebuild];
 }
 
 @end

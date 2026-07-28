@@ -50,7 +50,7 @@
 
 - (UIViewController*)currentViewController
 {
-  return [self viewControllerAtIndex:self.selectedIndex];
+  return self.childViewControllers.lastObject;
 }
 
 @end

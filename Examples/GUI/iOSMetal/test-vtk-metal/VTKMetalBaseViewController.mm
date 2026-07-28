@@ -1,10 +1,12 @@
 #import "VTKMetalBaseViewController.h"
 
 #include "vtkCamera.h"
+#include "vtkMath.h"
 #include "vtkNew.h"
 #include "vtkProperty.h"
 #include "vtkInteractorStyleMultiTouchCamera.h"
 #include "vtkRenderWindowInteractor.h"
+#include "vtkRendererCollection.h"
 #include "vtkCommand.h"
 #include "vtkMetalActor.h"
 #include "vtkMetalCamera.h"
@@ -18,7 +20,11 @@
   vtkNew<vtkIOSMetalRenderWindow> _renWin;
   vtkNew<vtkMetalRenderer> _renderer;
   vtkNew<vtkRenderWindowInteractor> _iren;
-  BOOL _trackballMode;
+
+  // Zoom anchor state
+  int _zoomAnchorDisplay[2];
+  double _zoomAnchorWorld[3];
+  BOOL _zoomAnchorValid;
 
   // Benchmark state
   BOOL _benchmarkRunning;
@@ -35,6 +41,52 @@
 @end
 
 @implementation VTKMetalBaseViewController
+
+- (instancetype)init
+{
+  self = [super init];
+  if (self)
+  {
+    _interactionMode = VTKInteractionModePan;
+  }
+  return self;
+}
+
+- (instancetype)initWithCoder:(NSCoder*)coder
+{
+  self = [super initWithCoder:coder];
+  if (self)
+  {
+    _interactionMode = VTKInteractionModePan;
+  }
+  return self;
+}
+
+- (NSString*)interactionModeTitle
+{
+  switch (self.interactionMode)
+  {
+    case VTKInteractionModePan: return @"Pan";
+    case VTKInteractionModeZoom: return @"Zoom";
+    case VTKInteractionModeTrackball: return @"Trackball";
+  }
+}
+
+- (NSString*)interactionModeImageName
+{
+  switch (self.interactionMode)
+  {
+    case VTKInteractionModePan: return @"hand.point.up";
+    case VTKInteractionModeZoom: return @"magnifyingglass";
+    case VTKInteractionModeTrackball: return @"cube.transparent";
+  }
+}
+
+- (void)setInteractionMode:(VTKInteractionMode)mode
+{
+  _interactionMode = mode;
+  _zoomAnchorValid = NO;
+}
 
 - (void*)renderer
 {
@@ -151,79 +203,159 @@
 
 - (void)handlePan:(UIPanGestureRecognizer*)recognizer
 {
-  BOOL trackball = (recognizer.modifierFlags & UIKeyModifierShift) == 0;
-
   [self forwardTouchPosition:recognizer];
 
-  switch (recognizer.state)
+  switch (self.interactionMode)
   {
-    case UIGestureRecognizerStateBegan:
-      _trackballMode = trackball;
-      if (trackball)
-      {
-        _iren->InvokeEvent(vtkCommand::LeftButtonPressEvent, nullptr);
-      }
-      else
-      {
-        CGPoint translation = [recognizer translationInView:recognizer.view];
-        CGFloat scale = self.view.contentScaleFactor;
-        double t[2] = { scale * translation.x, -scale * translation.y };
-        _iren->SetTranslation(t);
-        _iren->StartPanEvent();
-      }
+    case VTKInteractionModeZoom:
+      [self handleZoomPan:recognizer];
       break;
-
-    case UIGestureRecognizerStateChanged:
-      if (trackball != _trackballMode)
-      {
-        if (_trackballMode)
-        {
-          _iren->InvokeEvent(vtkCommand::LeftButtonReleaseEvent, nullptr);
-          CGPoint translation = [recognizer translationInView:recognizer.view];
-          CGFloat scale = self.view.contentScaleFactor;
-          double t[2] = { scale * translation.x, -scale * translation.y };
-          _iren->SetTranslation(t);
-          _iren->StartPanEvent();
-        }
-        else
-        {
-          _iren->EndPanEvent();
-          _iren->InvokeEvent(vtkCommand::LeftButtonPressEvent, nullptr);
-        }
-        _trackballMode = trackball;
-      }
-      else if (trackball)
-      {
-        _iren->InvokeEvent(vtkCommand::MouseMoveEvent, nullptr);
-      }
-      else
-      {
-        CGPoint translation = [recognizer translationInView:recognizer.view];
-        CGFloat scale = self.view.contentScaleFactor;
-        double t[2] = { scale * translation.x, -scale * translation.y };
-        _iren->SetTranslation(t);
-        _iren->PanEvent();
-      }
+    case VTKInteractionModeTrackball:
+      [self handleTrackballPan:recognizer];
       break;
-
-    case UIGestureRecognizerStateEnded:
-    case UIGestureRecognizerStateCancelled:
-      if (_trackballMode)
-      {
-        _iren->InvokeEvent(vtkCommand::LeftButtonReleaseEvent, nullptr);
-      }
-      else
-      {
-        _iren->EndPanEvent();
-      }
-      _trackballMode = NO;
-      break;
-
     default:
+      [self handlePanPan:recognizer];
       break;
   }
 
   _renWin->Render();
+}
+
+- (void)handlePanPan:(UIPanGestureRecognizer*)recognizer
+{
+  CGPoint translation = [recognizer translationInView:recognizer.view];
+  CGFloat scale = recognizer.view.contentScaleFactor;
+  double t[2] = { scale * translation.x, -scale * translation.y };
+  _iren->SetTranslation(t);
+
+  switch (recognizer.state)
+  {
+    case UIGestureRecognizerStateBegan:
+      _iren->StartPanEvent();
+      break;
+    case UIGestureRecognizerStateChanged:
+      _iren->PanEvent();
+      break;
+    case UIGestureRecognizerStateEnded:
+    case UIGestureRecognizerStateCancelled:
+      _iren->EndPanEvent();
+      break;
+    default:
+      break;
+  }
+}
+
+- (void)handleZoomPan:(UIPanGestureRecognizer*)recognizer
+{
+  vtkRenderer* ren = _renderer;
+  if (!ren) return;
+  vtkCamera* cam = ren->GetActiveCamera();
+  if (!cam) return;
+
+  if (recognizer.state == UIGestureRecognizerStateBegan || !_zoomAnchorValid)
+  {
+    CGPoint p = [recognizer locationInView:recognizer.view];
+    CGFloat scale = recognizer.view.contentScaleFactor;
+    _zoomAnchorDisplay[0] = (int)(p.x * scale);
+    _zoomAnchorDisplay[1] = (int)(p.y * scale);
+
+    ren->SetDisplayPoint(_zoomAnchorDisplay[0], _zoomAnchorDisplay[1], 0);
+    ren->DisplayToWorld();
+
+    double hom[4];
+    ren->GetWorldPoint(hom);
+    if (hom[3] == 0.0) return;
+    for (int i = 0; i < 3; ++i) _zoomAnchorWorld[i] = hom[i] / hom[3];
+
+    _zoomAnchorValid = YES;
+
+    if (recognizer.state == UIGestureRecognizerStateBegan)
+    {
+      _iren->InvokeEvent(vtkCommand::StartInteractionEvent, nullptr);
+    }
+    return;
+  }
+
+  CGPoint deltaPt = [recognizer translationInView:recognizer.view];
+  double factor = 1.0 - deltaPt.y / 200.0;
+  factor = vtkMath::ClampValue(factor, 0.01, 100.0);
+  [recognizer setTranslation:CGPointZero inView:recognizer.view];
+
+  const BOOL didZoom = (fabs(factor - 1.0) > 1e-6);
+
+  if (didZoom)
+  {
+    cam->Zoom(factor);
+
+    ren->SetDisplayPoint(_zoomAnchorDisplay[0], _zoomAnchorDisplay[1], 0);
+    ren->DisplayToWorld();
+    double newHom[4];
+    ren->GetWorldPoint(newHom);
+    if (newHom[3] == 0.0) return;
+
+    double newWorld[3] = {
+      newHom[0] / newHom[3],
+      newHom[1] / newHom[3],
+      newHom[2] / newHom[3]};
+
+    double d[3] = {
+      _zoomAnchorWorld[0] - newWorld[0],
+      _zoomAnchorWorld[1] - newWorld[1],
+      _zoomAnchorWorld[2] - newWorld[2]};
+
+    double pos[3], fp[3];
+    cam->GetPosition(pos);
+    cam->GetFocalPoint(fp);
+    for (int i = 0; i < 3; ++i)
+    {
+      pos[i] += d[i];
+      fp[i] += d[i];
+    }
+    cam->SetPosition(pos);
+    cam->SetFocalPoint(fp);
+
+    ren->ResetCameraClippingRange();
+
+    ren->SetDisplayPoint(_zoomAnchorDisplay[0], _zoomAnchorDisplay[1], 0);
+    ren->DisplayToWorld();
+    ren->GetWorldPoint(newHom);
+    if (newHom[3] != 0.0)
+      for (int i = 0; i < 3; ++i) _zoomAnchorWorld[i] = newHom[i] / newHom[3];
+  }
+
+  switch (recognizer.state)
+  {
+    case UIGestureRecognizerStateChanged:
+      if (didZoom)
+        _iren->InvokeEvent(vtkCommand::InteractionEvent, nullptr);
+      break;
+    case UIGestureRecognizerStateEnded:
+    case UIGestureRecognizerStateCancelled:
+      _iren->InvokeEvent(vtkCommand::EndInteractionEvent, nullptr);
+      _zoomAnchorValid = NO;
+      break;
+    default:
+      break;
+  }
+}
+
+- (void)handleTrackballPan:(UIPanGestureRecognizer*)recognizer
+{
+  switch (recognizer.state)
+  {
+    case UIGestureRecognizerStateBegan:
+      _iren->InvokeEvent(vtkCommand::LeftButtonPressEvent, nullptr);
+      break;
+    case UIGestureRecognizerStateChanged:
+      _iren->InvokeEvent(vtkCommand::MouseMoveEvent, nullptr);
+      break;
+    case UIGestureRecognizerStateEnded:
+    case UIGestureRecognizerStateCancelled:
+      _iren->InvokeEvent(vtkCommand::LeftButtonReleaseEvent, nullptr);
+      break;
+    default:
+      break;
+  }
 }
 
 - (void)handleRotation:(UIRotationGestureRecognizer*)recognizer
@@ -272,6 +404,18 @@
   int h = (int)lround(scale * self.view.bounds.size.height);
   _renWin->SetSize(w, h);
   _iren->UpdateSize(w, h);
+  _renWin->Render();
+}
+
+#pragma mark - Camera
+
+- (void)resetCamera
+{
+  vtkNew<vtkMetalCamera> camera;
+  _renderer->SetActiveCamera(camera);
+  _renderer->ResetCamera();
+  _renderer->ResetCameraClippingRange();
+  _zoomAnchorValid = NO;
   _renWin->Render();
 }
 
