@@ -77,7 +77,6 @@ static inline double HU2U8(double hu) {
   mapper->AutoAdjustSampleDistancesOff();
   mapper->SetSampleDistance(0.5);
   mapper->SetUseGPUMinMax(true);
-  mapper->SetPartitions(1, 1, 4);
 
   vtkNew<vtkVolumeProperty> property;
 
