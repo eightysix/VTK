@@ -1318,17 +1318,18 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseImageSampleResources()
 void vtkMetalGPUVolumeRayCastMapper::ReleaseGridTraversalResources()
 {
   ReleaseMetalObject(this->OccupancyGridTexture);
-  ReleaseMetalObject(this->SplitPlanesBuffer);
   ReleaseMetalObject(this->GridTraversalUniformBuffer);
-  delete[] this->SplitPlanesCPU;
-  this->SplitPlanesCPU = nullptr;
-  this->SplitPlanesCount[0] = 0;
-  this->SplitPlanesCount[1] = 0;
-  this->SplitPlanesCount[2] = 0;
+  this->CachedGridDims[0] = 0;
+  this->CachedGridDims[1] = 0;
+  this->CachedGridDims[2] = 0;
   this->GridTraversalResourcesValid = false;
 }
 
 //------------------------------------------------------------------------------
+// WARNING: This is intentionally duplicated from the non-partitioned path in
+// UpdateVolumeTexture. The partitioned path needs a global texture alongside
+// per-block textures. If you change the upload logic (format selection, GPU
+// conversion, staging), update BOTH paths.
 bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
   void* mtlDeviceVoid, void* mtlQueueVoid, vtkImageData* input, vtkDataArray* scalars)
 {
@@ -1570,13 +1571,6 @@ void vtkMetalGPUVolumeRayCastMapper::EnsureGridTraversalResources(
   int ny = std::max(1, static_cast<int>(this->Partitions[1]));
   int nz = std::max(1, static_cast<int>(this->Partitions[2]));
 
-  // Count non-empty blocks for diagnosis
-  int nonEmptyBlocks = 0;
-  for (auto& block : this->Blocks)
-    if (block.Texture) ++nonEmptyBlocks;
-  NSLog(@"[VTK] EnsureGridTraversalResources: grid=%dx%dx%d blocks=%zu nonEmpty=%d",
-    nx, ny, nz, this->Blocks.size(), nonEmptyBlocks);
-
   // --- occupancy texture: reuse if dimensions match ---
   id<MTLTexture> occTex = (__bridge id<MTLTexture>)this->OccupancyGridTexture;
   bool needNewOccTex = !occTex ||
@@ -1635,62 +1629,13 @@ void vtkMetalGPUVolumeRayCastMapper::EnsureGridTraversalResources(
   [uploadCmdBuf commit];
   [occStaging release];
 
-  // --- split planes: rebuild only if dimensions changed ---
-  bool needNewPlanes = (this->SplitPlanesCount[0] != nx + 1 ||
-                        this->SplitPlanesCount[1] != ny + 1 ||
-                        this->SplitPlanesCount[2] != nz + 1);
-
-  if (needNewPlanes)
-  {
-    int fullExt[6];
-    input->GetExtent(fullExt);
-    int extSize[3] = {
-      fullExt[1] - fullExt[0] + 1,
-      fullExt[3] - fullExt[2] + 1,
-      fullExt[5] - fullExt[4] + 1
-    };
-
-    this->SplitPlanesCount[0] = nx + 1;
-    this->SplitPlanesCount[1] = ny + 1;
-    this->SplitPlanesCount[2] = nz + 1;
-
-    delete[] this->SplitPlanesCPU;
-    int totalPlanes = (nx + 1) + (ny + 1) + (nz + 1);
-    float* planes = new float[totalPlanes];
-    this->SplitPlanesCPU = planes;
-
-    float* px = planes;
-    float* py = planes + (nx + 1);
-    float* pz = planes + (nx + 1) + (ny + 1);
-
-    for (int i = 0; i <= nx; ++i)
-    {
-      int pixel = fullExt[0] + i * extSize[0] / nx;
-      if (i >= nx) pixel = fullExt[1] + 1;
-      px[i] = static_cast<float>(pixel - fullExt[0]) / extSize[0];
-    }
-    for (int j = 0; j <= ny; ++j)
-    {
-      int pixel = fullExt[2] + j * extSize[1] / ny;
-      if (j >= ny) pixel = fullExt[3] + 1;
-      py[j] = static_cast<float>(pixel - fullExt[2]) / extSize[1];
-    }
-    for (int k = 0; k <= nz; ++k)
-    {
-      int pixel = fullExt[4] + k * extSize[2] / nz;
-      if (k >= nz) pixel = fullExt[5] + 1;
-      pz[k] = static_cast<float>(pixel - fullExt[4]) / extSize[2];
-    }
-
-    ReleaseMetalObject(this->SplitPlanesBuffer);
-    id<MTLBuffer> splitBuf = [device newBufferWithBytes:planes
-                                                  length:totalPlanes * sizeof(float)
-                                                 options:MTLResourceStorageModeShared];
-    AssignMetalObject(this->SplitPlanesBuffer, splitBuf);
-  }
-
   // --- grid traversal uniform buffer: rebuild only if dimensions changed ---
-  if (needNewPlanes)
+  bool needNewUniforms = !this->GridTraversalUniformBuffer ||
+    this->CachedGridDims[0] != nx ||
+    this->CachedGridDims[1] != ny ||
+    this->CachedGridDims[2] != nz;
+
+  if (needNewUniforms)
   {
     GridTraversalUniforms gridUniforms;
     gridUniforms.GridDimsX = static_cast<int32_t>(nx);
@@ -1703,6 +1648,10 @@ void vtkMetalGPUVolumeRayCastMapper::EnsureGridTraversalResources(
                                                  length:sizeof(GridTraversalUniforms)
                                                 options:MTLResourceStorageModeShared];
     AssignMetalObject(this->GridTraversalUniformBuffer, gridBuf);
+
+    this->CachedGridDims[0] = nx;
+    this->CachedGridDims[1] = ny;
+    this->CachedGridDims[2] = nz;
   }
 
   this->GridTraversalResourcesValid = true;
@@ -5841,6 +5790,33 @@ void vtkMetalGPUVolumeRayCastMapper::BuildPerBlockData(PerBlockData& pbd,
 }
 
 //------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::BuildGlobalPerBlockData(
+  PerBlockData& pbd, vtkImageData* input)
+{
+  int dims[3];
+  input->GetDimensions(dims);
+
+  for (int k = 0; k < 3; ++k)
+  {
+    pbd.VolumeBoundsMin[k]  = 0.0f;
+    pbd.VolumeBoundsMax[k]  = 1.0f;
+    pbd.TextureBoundsMin[k] = 0.0f;
+    pbd.TextureBoundsMax[k] = 1.0f;
+    pbd.GradientStep[k]     = (dims[k] > 0) ? 1.0f / dims[k] : 1.0f;
+  }
+  pbd.VolumeBoundsMin[3]  = 1.0f;
+  pbd.VolumeBoundsMax[3]  = 1.0f;
+  pbd.TextureBoundsMin[3] = 1.0f;
+  pbd.TextureBoundsMax[3] = 1.0f;
+  pbd.GradientStep[3]     = 0.0f;
+
+  pbd.MinMaxInfo[0] = this->MinMaxTexture ? 1.0f : 0.0f;
+  pbd.MinMaxInfo[1] = this->MinMaxTexture ? static_cast<float>(this->MinMaxDims[0]) : 0.0f;
+  pbd.MinMaxInfo[2] = this->MinMaxTexture ? static_cast<float>(this->MinMaxDims[1]) : 0.0f;
+  pbd.MinMaxInfo[3] = this->MinMaxTexture ? static_cast<float>(this->MinMaxDims[2]) : 0.0f;
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
   void* encoderVoid, void* uniformBufVoid, vtkRenderer* ren, vtkVolume* vol,
   void* uniformsVoid, vtkMatrix4x4* invModelMatrix)
@@ -6597,10 +6573,6 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     bool useGridTraversal = (usePartitions && this->VolumeTexture &&
       this->GridTraversalResourcesValid);
 
-    NSLog(@"[VTK] grid traversal decision: usePartitions=%d volTex=%p occValid=%d useGridTraversal=%d nonEmpty=%zu/%zu",
-      (int)usePartitions, this->VolumeTexture, (int)this->GridTraversalResourcesValid,
-      (int)useGridTraversal, (size_t)nonEmptyCount, this->Blocks.size());
-
     if (useGridTraversal)
     {
       // Single-pass grid traversal: march all bricks along each pixel ray using 3D DDA
@@ -6625,32 +6597,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       void* gridPso = this->GetOrCreateVolumePipeline(mtlDevice,
         static_cast<uint32_t>(VolumePipelineType::GridTraversalOffscreen),
         MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, featureMask);
-      if (!gridPso) { NSLog(@"[VTK] grid traversal PSO is NULL!"); [gridEnc endEncoding]; return; }
+      if (!gridPso) { [gridEnc endEncoding]; return; }
       [gridEnc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)gridPso];
 
       PerBlockData pbd;
-      {
-        int dims[3];
-        input->GetDimensions(dims);
-        double* mb = this->ModelBounds;
-        double bsz[3] = { mb[1]-mb[0], mb[3]-mb[2], mb[5]-mb[4] };
-        for (int k = 0; k < 3; ++k)
-        {
-          if (bsz[k] < 1e-10) bsz[k] = 1.0;
-          pbd.VolumeBoundsMin[k] = 0.0f;
-          pbd.VolumeBoundsMax[k] = 1.0f;
-          pbd.GradientStep[k] = (dims[k] > 0) ? 1.0f / dims[k] : 1.0f;
-          pbd.TextureBoundsMin[k] = 0.0f;
-          pbd.TextureBoundsMax[k] = 1.0f;
-        }
-        pbd.VolumeBoundsMin[3] = pbd.VolumeBoundsMax[3] = 1.0f;
-        pbd.TextureBoundsMin[3] = pbd.TextureBoundsMax[3] = 1.0f;
-        pbd.GradientStep[3] = 0.0f;
-        pbd.MinMaxInfo[0] = (this->MinMaxTexture) ? 1.0f : 0.0f;
-        pbd.MinMaxInfo[1] = this->MinMaxTexture ? static_cast<float>(this->MinMaxDims[0]) : 0.0f;
-        pbd.MinMaxInfo[2] = this->MinMaxTexture ? static_cast<float>(this->MinMaxDims[1]) : 0.0f;
-        pbd.MinMaxInfo[3] = this->MinMaxTexture ? static_cast<float>(this->MinMaxDims[2]) : 0.0f;
-      }
+      this->BuildGlobalPerBlockData(pbd, input);
 
       id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;
       id<MTLTexture> mmTex = (__bridge id<MTLTexture>)this->MinMaxTexture;
@@ -6883,28 +6834,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       [encoder setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)gridPsoDirect];
 
       PerBlockData pbd;
-      {
-        int dims[3];
-        input->GetDimensions(dims);
-        double* mb = this->ModelBounds;
-        double bsz[3] = { mb[1]-mb[0], mb[3]-mb[2], mb[5]-mb[4] };
-        for (int k = 0; k < 3; ++k)
-        {
-          if (bsz[k] < 1e-10) bsz[k] = 1.0;
-          pbd.VolumeBoundsMin[k] = 0.0f;
-          pbd.VolumeBoundsMax[k] = 1.0f;
-          pbd.GradientStep[k] = (dims[k] > 0) ? 1.0f / dims[k] : 1.0f;
-          pbd.TextureBoundsMin[k] = 0.0f;
-          pbd.TextureBoundsMax[k] = 1.0f;
-        }
-        pbd.VolumeBoundsMin[3] = pbd.VolumeBoundsMax[3] = 1.0f;
-        pbd.TextureBoundsMin[3] = pbd.TextureBoundsMax[3] = 1.0f;
-        pbd.GradientStep[3] = 0.0f;
-        pbd.MinMaxInfo[0] = (this->MinMaxTexture) ? 1.0f : 0.0f;
-        pbd.MinMaxInfo[1] = this->MinMaxTexture ? static_cast<float>(this->MinMaxDims[0]) : 0.0f;
-        pbd.MinMaxInfo[2] = this->MinMaxTexture ? static_cast<float>(this->MinMaxDims[1]) : 0.0f;
-        pbd.MinMaxInfo[3] = this->MinMaxTexture ? static_cast<float>(this->MinMaxDims[2]) : 0.0f;
-      }
+      this->BuildGlobalPerBlockData(pbd, input);
 
       id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;
       id<MTLTexture> mmTex = (__bridge id<MTLTexture>)this->MinMaxTexture;

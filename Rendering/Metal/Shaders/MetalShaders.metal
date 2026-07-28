@@ -1971,7 +1971,7 @@ inline GridWalker initGridWalker(
     float3 rayOrigin,
     float3 rayDir,
     float tStart,
-    float tEnd,
+    float tEndRel,
     int3 gridDims)
 {
     GridWalker w;
@@ -1990,8 +1990,6 @@ inline GridWalker initGridWalker(
     w.cell = clamp(int3(floor(cellF - nudge)), int3(0), gridDims - 1);
 
     // Work in relative coordinates: tEntry = 0 means "at pos right now".
-    // tEndRel is the distance from pos to the volume exit along the ray.
-    float tEndRel = tEnd - tStart;
     if (tEndRel <= 1e-8) {
         w.valid = false;
         return w;
@@ -2059,6 +2057,17 @@ inline void advanceGridWalker(thread GridWalker& w, float tEnd)
     w.valid = w.tExit > w.tEntry;
 }
 
+// NOTE: marchSegment is a modified copy of marchVolume adapted for
+// sub-interval marching with a global sample schedule. Any bug fix
+// applied to the march loop body must be applied to BOTH functions.
+//
+// Differences from marchVolume:
+//   - Computes jitter externally, receives it as parameter
+//   - Starts at ceil-aligned global schedule position
+//   - Loops until t1 (not totalBoxT)
+//   - Writes to thread half3& / thread half& refs (not returns half4)
+//   - No boundary check (segment is pre-clipped to an active brick)
+//
 // March a ray segment [t0, t1] along a global sample schedule.
 // Uses the same sampling, shading, and accumulation logic as marchVolume
 // but operates on a sub-interval with a pre-determined jitter value.
@@ -2071,16 +2080,12 @@ inline void marchSegment(
     float stepSize,
     float jitter,
     float tTerminateMax,
-    float3 texMinGlobal,
-    float3 texMaxGlobal,
-    float2 screenPos,
     thread half3& accumulatedColor,
     thread half& accumulatedOpacity,
     constant VolumeMapperUniforms& volumeUniforms,
     constant PerBlockData& b,
     texture3d<float> volumeTexture,
     texture2d<float> transferFunctionTexture,
-    texture2d<float> depthTexture,
     texture2d<float> gradientOpacityTexture,
     texture3d<float> maskTexture,
     texture2d<float> labelMapTransferTexture,
@@ -2097,11 +2102,9 @@ inline void marchSegment(
 
     half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
 
-    float3 texSizeGlobal = max(texMaxGlobal - texMinGlobal, 1e-6);
-    float3 invTexSizeGlobal = 1.0 / texSizeGlobal;
-    float3 rayDirTexLocal = rayDir * invTexSizeGlobal;
+    // Global texture bounds are always [0,1] for the global volume texture
     float3 dt = max(b.gradientStep.xyz, 1e-8);
-    half3 gradScale = half3(1.0 / (dt * texSizeGlobal));
+    half3 gradScale = half3(1.0 / dt);
 
     half3 viewDirHalf  = half3(normalize((rayOrigin + rayDir * t0) - volumeUniforms.cameraVolumePos.xyz));
     half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection));
@@ -2143,8 +2146,7 @@ inline void marchSegment(
         if (currentT >= t1 - 1e-6) break;
 
         if (useMinMax) {
-            float3 texLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
-            float3 mmPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+            float3 mmPos = clamp(currentPoint, float3(0.0), float3(1.0));
             int3 newCell = min(int3(mmPos * mmDimF), int3(mmDimF) - 1);
             if (any(newCell != curCell)) {
                 curCell      = newCell;
@@ -2162,12 +2164,12 @@ inline void marchSegment(
                 distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
 
                 float3 tToEdge;
-                tToEdge.x = abs(rayDirTexLocal.x) > 1e-5
-                    ? distToEdge.x / abs(rayDirTexLocal.x * mmDimF.x) : 1e30;
-                tToEdge.y = abs(rayDirTexLocal.y) > 1e-5
-                    ? distToEdge.y / abs(rayDirTexLocal.y * mmDimF.y) : 1e30;
-                tToEdge.z = abs(rayDirTexLocal.z) > 1e-5
-                    ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
+                tToEdge.x = abs(rayDir.x) > 1e-5
+                    ? distToEdge.x / abs(rayDir.x * mmDimF.x) : 1e30;
+                tToEdge.y = abs(rayDir.y) > 1e-5
+                    ? distToEdge.y / abs(rayDir.y * mmDimF.y) : 1e30;
+                tToEdge.z = abs(rayDir.z) > 1e-5
+                    ? distToEdge.z / abs(rayDir.z * mmDimF.z) : 1e30;
 
                 float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
                 exactSkip += 1e-4;
@@ -2185,8 +2187,7 @@ inline void marchSegment(
             }
         }
 
-        float3 texLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
-        float3 evalPoint = texLocalPos;
+        float3 evalPoint = currentPoint;
         bool needsFetch = !prefetchValid;
         float rawScalar = needsFetch
             ? volumeTexture.sample(sVolume, evalPoint, level(0)).r
@@ -2200,8 +2201,7 @@ inline void marchSegment(
         currentT += stepSize;
 
         if (i + 1 < maxSteps) {
-            float3 nextTexLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
-            float3 nextEvalPoint = nextTexLocalPos;
+            float3 nextEvalPoint = currentPoint;
             prefetchScalar = volumeTexture.sample(sVolume, nextEvalPoint, level(0)).r;
             if (doMask) {
                 prefetchMask = maskTexture.sample(sNearest, nextEvalPoint, level(0)).r;
@@ -2410,19 +2410,19 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
         ? volume_random(in.position.xy + float2(0.5, 0.5)) * stepSize
         : 0.0;
 
-    // Texture bounds = full volume for global texture
-    float3 texMin = float3(0.0);
-    float3 texMax = float3(1.0);
-
     // Grid traversal loop
     half3 color = 0.0h;
     half opacity = 0.0h;
 
     int3 gridDims = int3(grid.gridDimsX, grid.gridDimsY, grid.gridDimsZ);
     float tEndRel = tEnd - tStart;
-    GridWalker walker = initGridWalker(cameraPos, rayDir, tStart, tEnd, gridDims);
+    GridWalker walker = initGridWalker(cameraPos, rayDir, tStart, tEndRel, gridDims);
 
-    while (walker.valid && opacity < 0.99h) {
+    int maxCells = gridDims.x + gridDims.y + gridDims.z + 3;
+    int cellsVisited = 0;
+
+    while (walker.valid && opacity < 0.99h && cellsVisited < maxCells) {
+        ++cellsVisited;
         int3 cell = walker.cell;
 
         float3 occUV = (float3(cell) + 0.5) / float3(gridDims);
@@ -2437,11 +2437,9 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
                     cameraPos, rayDir,
                     segmentT0, segmentT1,
                     stepSize, jitter, tTerminateMax,
-                    texMin, texMax,
-                    in.position.xy,
                     color, opacity,
                     volumeUniforms, b,
-                    volumeTexture, transferFunctionTexture, depthTexture,
+                    volumeTexture, transferFunctionTexture,
                     gradientOpacityTexture, maskTexture, labelMapTransferTexture,
                     minMaxTexture, normalTexture);
             }

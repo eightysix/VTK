@@ -375,10 +375,8 @@ private:
 
   // Grid traversal data for single-pass partitioned volume rendering
   void* OccupancyGridTexture = nullptr;     // id<MTLTexture> — R8Unorm 3D, dims = Partitions
-  void* SplitPlanesBuffer = nullptr;        // id<MTLBuffer> — packed xSplit[0..nx], ySplit[0..ny], zSplit[0..nz]
-  float* SplitPlanesCPU = nullptr;          // CPU copy for building the buffer
-  int SplitPlanesCount[3] = {};             // nx+1, ny+1, nz+1
   void* GridTraversalUniformBuffer = nullptr; // id<MTLBuffer> — GridTraversalUniforms
+  int CachedGridDims[3] = {};
   bool GridTraversalResourcesValid = false;
   void EnsureGridTraversalResources(void* mtlDevice, void* mtlQueue, vtkImageData* input);
   void ReleaseGridTraversalResources();
@@ -387,6 +385,7 @@ private:
   void BindGridTraversalTextures(void* encoder, void* uniformBuf,
     void* volTex, void* minMaxTex, void* normalTex,
     bool useDepth, const void* pbd, uint32_t cullMode);
+  void BuildGlobalPerBlockData(PerBlockData& pbd, vtkImageData* input);
 
   // --- Order-independent compositing: per-brick layer textures ---
   // Each brick renders into its own RGBA16Float slice of a 2D texture array;
