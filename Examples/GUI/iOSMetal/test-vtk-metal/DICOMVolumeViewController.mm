@@ -33,11 +33,6 @@ static inline double HU2U8(double hu) {
 
 @implementation DICOMVolumeViewController
 
-- (NSString *)loadButtonTitle
-{
-  return @"Load DICOM";
-}
-
 - (NSArray<NSString *> *)documentTypes
 {
   return @[ @"public.folder" ];

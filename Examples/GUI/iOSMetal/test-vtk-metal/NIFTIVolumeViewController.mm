@@ -22,11 +22,6 @@
 
 @implementation NIFTIVolumeViewController
 
-- (NSString *)loadButtonTitle
-{
-  return @"Load NIfTI";
-}
-
 - (void)loadFromURL:(NSURL *)url
 {
   NSString *path = url.path;

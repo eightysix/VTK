@@ -4,7 +4,6 @@
 
 @interface FileVolumeViewController : VTKMetalBaseViewController <UIDocumentPickerDelegate>
 
-- (NSString *)loadButtonTitle;
 - (NSArray<NSString *> *)documentTypes;
 - (void)loadFromURL:(NSURL *)url;
 
@@ -13,5 +12,6 @@
 
 - (IBAction)nextPreset:(nullable id)sender;
 - (IBAction)previousPreset:(nullable id)sender;
+- (IBAction)loadFile:(nullable id)sender;
 
 @end

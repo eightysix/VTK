@@ -13,11 +13,6 @@
 
 @implementation FileVolumeViewController
 
-- (NSString *)loadButtonTitle
-{
-  return @"Load";
-}
-
 - (NSArray<NSString *> *)documentTypes
 {
   return @[ @"public.data" ];
@@ -32,22 +27,6 @@
 {
   [super viewDidLoad];
 
-  UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-  [button setTitle:[self loadButtonTitle] forState:UIControlStateNormal];
-  button.titleLabel.font = [UIFont boldSystemFontOfSize:18];
-  button.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.5];
-  button.layer.cornerRadius = 8;
-  button.contentEdgeInsets = UIEdgeInsetsMake(12, 24, 12, 24);
-  [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-  [button addTarget:self action:@selector(loadFile) forControlEvents:UIControlEventTouchUpInside];
-  button.translatesAutoresizingMaskIntoConstraints = NO;
-  [self.view addSubview:button];
-
-  [NSLayoutConstraint activateConstraints:@[
-    [button.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-    [button.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-20]
-  ]];
-
   // Start with the first preset
   self.currentPresetIndex = 0;
   NSArray<VolumeRenderingPreset *> *presets = VolumeRenderingPresetsManager.presets;
@@ -56,7 +35,7 @@
   }
 }
 
-- (void)loadFile
+- (void)loadFile:(id)sender
 {
   UIDocumentPickerViewController *picker =
       [[UIDocumentPickerViewController alloc] initWithDocumentTypes:[self documentTypes]

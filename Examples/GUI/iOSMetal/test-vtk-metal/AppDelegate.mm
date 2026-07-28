@@ -116,6 +116,17 @@ didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
   
   [builder insertSiblingMenu:renderingMenu
       afterMenuForIdentifier:UIMenuView];
+  
+  // File menu
+  UIKeyCommand* loadFileCmd = [UIKeyCommand
+                               keyCommandWithInput:@"o"
+                               modifierFlags:UIKeyModifierCommand
+                               action:@selector(loadFile:)];
+  loadFileCmd.title = @"Load File…";
+  loadFileCmd.discoverabilityTitle = @"Open a file via document picker";
+  
+  UIMenu* fileMenu = [UIMenu menuWithTitle:@"File" children:@[ loadFileCmd ]];
+  [builder insertSiblingMenu:fileMenu afterMenuForIdentifier:UIMenuApplication];
 }
 
 #pragma mark - View Switching
