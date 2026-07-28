@@ -30,6 +30,11 @@
   vtkSmartPointer<vtkImageData> _volumeData;
   int _clipAxis;
   BOOL _clipPlaneHasUserPos;
+
+  vtkSmartPointer<vtkColorTransferFunction> _savedCTF;
+  vtkSmartPointer<vtkPiecewiseFunction> _savedOTF;
+  double _windowWidth;
+  double _windowLevel;
 }
 @end
 
@@ -105,6 +110,71 @@
   return (hu + 1024.0) * (255.0 / 4095.0);
 }
 
+#pragma mark - Preset Override
+
+- (void)applyCurrentPreset
+{
+  [super applyCurrentPreset];
+  [self saveOriginalTransferFunctions];
+}
+
+#pragma mark - Window / Level
+
+- (void)saveOriginalTransferFunctions
+{
+  vtkVolumeProperty* prop = self.volume->GetProperty();
+  vtkColorTransferFunction* ctf = prop->GetRGBTransferFunction();
+  vtkPiecewiseFunction* otf = prop->GetScalarOpacity();
+  _savedCTF = vtkSmartPointer<vtkColorTransferFunction>::New();
+  _savedCTF->DeepCopy(ctf);
+  _savedOTF = vtkSmartPointer<vtkPiecewiseFunction>::New();
+  _savedOTF->DeepCopy(otf);
+  _windowWidth = 255.0;
+  _windowLevel = 127.5;
+}
+
+- (void)applyWindowLevelWithWidth:(double)width level:(double)level
+{
+  _windowWidth = width;
+  _windowLevel = level;
+  vtkVolumeProperty* prop = self.volume->GetProperty();
+
+  vtkNew<vtkColorTransferFunction> newCTF;
+  for (int i = 0; i < _savedCTF->GetSize(); i++)
+  {
+    double node[6];
+    _savedCTF->GetNodeValue(i, node);
+    double newX = _windowLevel + (node[0] - 127.5) * _windowWidth / 255.0;
+    newCTF->AddRGBPoint(newX, node[1], node[2], node[3], node[4], node[5]);
+  }
+
+  vtkNew<vtkPiecewiseFunction> newOTF;
+  for (int i = 0; i < _savedOTF->GetSize(); i++)
+  {
+    double node[4];
+    _savedOTF->GetNodeValue(i, node);
+    double newX = _windowLevel + (node[0] - 127.5) * _windowWidth / 255.0;
+    newOTF->AddPoint(newX, node[1], node[2], node[3]);
+  }
+
+  prop->SetColor(newCTF);
+  prop->SetScalarOpacity(newOTF);
+
+  static_cast<vtkIOSMetalRenderWindow*>([self renderWindow])->Render();
+}
+
+- (void)handleWindowLevelPan:(UIPanGestureRecognizer*)recognizer
+{
+  if (recognizer.state != UIGestureRecognizerStateChanged) return;
+
+  const double kScale = 0.5;
+  CGPoint t = [recognizer translationInView:recognizer.view];
+  double dW = t.x * kScale;
+  double dL = -t.y * kScale;
+  [self applyWindowLevelWithWidth:_windowWidth + dW level:_windowLevel + dL];
+  [recognizer setTranslation:CGPointZero inView:recognizer.view];
+}
+
 #pragma mark - Clipping Plane (Scroll Slices)
 
 - (void)handlePan:(UIPanGestureRecognizer*)recognizer
@@ -112,6 +182,10 @@
   if (self.interactionMode == VTKInteractionModeScrollSlices)
   {
     [self handleScrollSlicesPan:recognizer];
+  }
+  else if (self.interactionMode == VTKInteractionModeWindowLevel)
+  {
+    [self handleWindowLevelPan:recognizer];
   }
   else
   {

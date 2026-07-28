@@ -32,7 +32,9 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
 
 - (BOOL)validateMenuItem:(UIKeyCommand*)menuItem
 {
-  if (menuItem.action == @selector(activateScrollSlicesMode:))
+  SEL action = menuItem.action;
+  if (action == @selector(activateScrollSlicesMode:) ||
+      action == @selector(activateWindowLevelMode:))
   {
     VTKMetalBaseViewController* vc = [self findMetalViewController];
     return [vc isKindOfClass:[DICOMVolumeViewController class]] ||
@@ -63,12 +65,14 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
   if (cmdAction == @selector(activatePanMode:) ||
       cmdAction == @selector(activateZoomMode:) ||
       cmdAction == @selector(activateTrackballMode:) ||
-      cmdAction == @selector(activateScrollSlicesMode:))
+      cmdAction == @selector(activateScrollSlicesMode:) ||
+      cmdAction == @selector(activateWindowLevelMode:))
   {
     VTKMetalBaseViewController* vc = [self findMetalViewController];
     command.state = (vc && vc.interactionMode == cmdMode) ? UIMenuElementStateOn : UIMenuElementStateOff;
 
-    if (cmdAction == @selector(activateScrollSlicesMode:))
+    if (cmdAction == @selector(activateScrollSlicesMode:) ||
+        cmdAction == @selector(activateWindowLevelMode:))
     {
       BOOL isDICOMorNIFTI = [vc isKindOfClass:[DICOMVolumeViewController class]] ||
                              [vc isKindOfClass:[NIFTIVolumeViewController class]];
@@ -146,15 +150,23 @@ didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
   trackballCmd.discoverabilityTitle = @"Trackball";
 
   UIKeyCommand* scrollSlicesCmd = [UIKeyCommand commandWithTitle:@"Scroll Slices"
-                                                            image:[UIImage systemImageNamed:@"arrow.up.and.down"]
-                                                           action:@selector(activateScrollSlicesMode:)
-                                                            input:@"d"
-                                                    modifierFlags:0
-                                                     propertyList:@(VTKInteractionModeScrollSlices)];
+                                                             image:[UIImage systemImageNamed:@"arrow.up.and.down"]
+                                                            action:@selector(activateScrollSlicesMode:)
+                                                             input:@"d"
+                                                     modifierFlags:0
+                                                      propertyList:@(VTKInteractionModeScrollSlices)];
   scrollSlicesCmd.discoverabilityTitle = @"Clip through volume";
 
+  UIKeyCommand* windowLevelCmd = [UIKeyCommand commandWithTitle:@"Window/Level"
+                                                          image:[UIImage systemImageNamed:@"sun.max"]
+                                                         action:@selector(activateWindowLevelMode:)
+                                                          input:@"w"
+                                                  modifierFlags:0
+                                                   propertyList:@(VTKInteractionModeWindowLevel)];
+  windowLevelCmd.discoverabilityTitle = @"Adjust window/level";
+
   UIMenu* interactionMenu = [UIMenu menuWithTitle:@"Interaction Mode"
-                                         children:@[ panCmd, zoomCmd, trackballCmd, scrollSlicesCmd ]];
+                                         children:@[ panCmd, zoomCmd, trackballCmd, scrollSlicesCmd, windowLevelCmd ]];
 
   // Camera submenu
   UIKeyCommand* resetCameraCmd = [UIKeyCommand
@@ -294,6 +306,12 @@ didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
 - (void)activateScrollSlicesMode:(id)sender
 {
   [self findMetalViewController].interactionMode = VTKInteractionModeScrollSlices;
+  [self updateInteractionModeMenu];
+}
+
+- (void)activateWindowLevelMode:(id)sender
+{
+  [self findMetalViewController].interactionMode = VTKInteractionModeWindowLevel;
   [self updateInteractionModeMenu];
 }
 

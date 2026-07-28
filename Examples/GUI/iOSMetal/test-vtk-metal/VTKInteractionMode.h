@@ -5,4 +5,5 @@ typedef NS_ENUM(NSInteger, VTKInteractionMode) {
     VTKInteractionModeZoom,
     VTKInteractionModeTrackball,
     VTKInteractionModeScrollSlices,
+    VTKInteractionModeWindowLevel,
 };

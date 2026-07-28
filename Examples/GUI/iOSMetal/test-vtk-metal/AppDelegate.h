@@ -10,5 +10,6 @@
 - (void)activateZoomMode:(id)sender;
 - (void)activateTrackballMode:(id)sender;
 - (void)activateScrollSlicesMode:(id)sender;
+- (void)activateWindowLevelMode:(id)sender;
 - (void)resetCamera:(id)sender;
 @end
