@@ -17,7 +17,6 @@
 @interface NIFTIVolumeViewController ()
 @property (nonatomic, assign) double dataMin;
 @property (nonatomic, assign) double dataRange;
-@property (nonatomic, assign) BOOL dataLoaded;
 @end
 
 @implementation NIFTIVolumeViewController
@@ -31,8 +30,6 @@
   reader->SetFileName([path UTF8String]);
   reader->Update();
 
-  // Cast to unsigned char for better performance on iOS.
-  // Rescale data to [0, 255] using the scalar range from the reader.
   double scalarRange[2];
   reader->GetOutput()->GetScalarRange(scalarRange);
   self.dataMin = scalarRange[0];
@@ -65,9 +62,11 @@
   volume->SetMapper(mapper);
   volume->SetProperty(property);
 
-  renderer->AddVolume(volume);
+  self.mapper = mapper;
+  self.property = property;
+  self.volume = volume;
 
-  self.dataLoaded = YES;
+  renderer->AddVolume(volume);
 
   [self applyCurrentPreset];
 
@@ -75,61 +74,9 @@
   static_cast<vtkIOSMetalRenderWindow *>([self renderWindow])->Render();
 }
 
-- (void)applyCurrentPreset
+- (double)rescale:(double)hu
 {
-  if (!self.dataLoaded) return;
-
-  vtkMetalRenderer *renderer = static_cast<vtkMetalRenderer *>([self renderer]);
-  vtkVolume *volume = renderer->GetVolumes()->GetNextVolume();
-  if (!volume) return;
-
-  vtkVolumeProperty *property = volume->GetProperty();
-
-  auto rescale = [&](double hu) -> double {
-    return (hu - self.dataMin) / self.dataRange * 255.0;
-  };
-
-  vtkNew<vtkColorTransferFunction> colorFunc;
-  vtkNew<vtkPiecewiseFunction> opacityFunc;
-
-  VolumeRenderingPreset *preset = self.currentPreset;
-  if (preset &&
-      preset.colorTransferFunctions.count == preset.opacityTransferFunctions.count) {
-    for (NSUInteger i = 0; i < preset.opacityTransferFunctions.count; i++) {
-      NSArray<OpacityTransferFunctionMember *> *otf = preset.opacityTransferFunctions[i];
-      NSArray<ColorTransferFunctionMember *> *ctf = preset.colorTransferFunctions[i];
-      if (otf.count == ctf.count) {
-        for (NSUInteger j = 0; j < otf.count; j++) {
-          opacityFunc->AddPoint(rescale(otf[j].x), otf[j].y);
-          colorFunc->AddRGBPoint(rescale(otf[j].x), ctf[j].red, ctf[j].green, ctf[j].blue);
-        }
-      }
-    }
-  } else {
-    // Fallback: simple linear preset
-    colorFunc->AddRGBPoint(0.0, 0.0, 0.0, 0.0);
-    colorFunc->AddRGBPoint(255.0, 1.0, 1.0, 1.0);
-    opacityFunc->AddPoint(0.0, 0.0);
-    opacityFunc->AddPoint(255.0, 1.0);
-  }
-
-  property->SetColor(colorFunc);
-  property->SetScalarOpacity(opacityFunc);
-  property->SetInterpolationTypeToLinear();
-
-  static_cast<vtkIOSMetalRenderWindow *>([self renderWindow])->Render();
-}
-
-- (IBAction)nextPreset:(id)sender
-{
-  [super nextPreset:sender];
-  [self applyCurrentPreset];
-}
-
-- (IBAction)previousPreset:(id)sender
-{
-  [super previousPreset:sender];
-  [self applyCurrentPreset];
+  return (hu - self.dataMin) / self.dataRange * 255.0;
 }
 
 @end

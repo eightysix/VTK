@@ -2,7 +2,7 @@
 #import "VTKMetalBaseViewController.h"
 #import "CubeViewController.h"
 #import "ConeViewController.h"
-#import "VolumeViewController.h"
+#import "WaveletVolumeViewController.h"
 #import "DICOMVolumeViewController.h"
 #import "NIFTIVolumeViewController.h"
 
@@ -20,7 +20,7 @@
   {
     case 0: return [[CubeViewController alloc] init];
     case 1: return [[ConeViewController alloc] init];
-    case 2: return [[VolumeViewController alloc] init];
+    case 2: return [[WaveletVolumeViewController alloc] init];
     case 3: return [[DICOMVolumeViewController alloc] init];
     case 4: return [[NIFTIVolumeViewController alloc] init];
     case 5: return [[VTKMetalBaseViewController alloc] init];

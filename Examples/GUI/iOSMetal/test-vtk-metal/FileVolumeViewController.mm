@@ -2,7 +2,11 @@
 #import "VolumeRenderingPreset.h"
 #import "VolumeRenderingPresetsManager.h"
 
+#include "vtkNew.h"
 #include "vtkVolume.h"
+#include "vtkVolumeProperty.h"
+#include "vtkColorTransferFunction.h"
+#include "vtkPiecewiseFunction.h"
 #include "vtkMetalRenderer.h"
 #include "vtkIOSMetalRenderWindow.h"
 
@@ -70,6 +74,45 @@
 {
 }
 
+#pragma mark - Preset Application
+
+- (void)applyCurrentPreset
+{
+  if (!self.volume) return;
+
+  vtkVolumeProperty *property = self.volume->GetProperty();
+  if (!property) return;
+
+  vtkNew<vtkColorTransferFunction> colorFunc;
+  vtkNew<vtkPiecewiseFunction> opacityFunc;
+
+  VolumeRenderingPreset *preset = self.currentPreset;
+  if (preset &&
+      preset.colorTransferFunctions.count == preset.opacityTransferFunctions.count) {
+    for (NSUInteger i = 0; i < preset.opacityTransferFunctions.count; i++) {
+      NSArray<OpacityTransferFunctionMember *> *otf = preset.opacityTransferFunctions[i];
+      NSArray<ColorTransferFunctionMember *> *ctf = preset.colorTransferFunctions[i];
+      if (otf.count == ctf.count) {
+        for (NSUInteger j = 0; j < otf.count; j++) {
+          opacityFunc->AddPoint([self rescale:otf[j].x], otf[j].y);
+          colorFunc->AddRGBPoint([self rescale:otf[j].x], ctf[j].red, ctf[j].green, ctf[j].blue);
+        }
+      }
+    }
+  } else {
+    colorFunc->AddRGBPoint(0.0, 0.0, 0.0, 0.0);
+    colorFunc->AddRGBPoint(255.0, 1.0, 1.0, 1.0);
+    opacityFunc->AddPoint(0.0, 0.0);
+    opacityFunc->AddPoint(255.0, 1.0);
+  }
+
+  property->SetColor(colorFunc);
+  property->SetScalarOpacity(opacityFunc);
+  property->SetInterpolationTypeToLinear();
+
+  static_cast<vtkIOSMetalRenderWindow *>([self renderWindow])->Render();
+}
+
 #pragma mark - Preset Cycling
 
 - (IBAction)nextPreset:(id)sender
@@ -81,6 +124,7 @@
   self.currentPreset = presets[self.currentPresetIndex];
 
   NSLog(@"Preset: %@", self.currentPreset.name);
+  [self applyCurrentPreset];
 }
 
 - (IBAction)previousPreset:(id)sender
@@ -93,6 +137,7 @@
   self.currentPreset = presets[self.currentPresetIndex];
 
   NSLog(@"Preset: %@", self.currentPreset.name);
+  [self applyCurrentPreset];
 }
 
 @end

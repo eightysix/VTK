@@ -1,4 +1,4 @@
-#import "VolumeViewController.h"
+#import "WaveletVolumeViewController.h"
 
 #include "vtkNew.h"
 #include "vtkColorTransferFunction.h"
@@ -9,7 +9,7 @@
 #include "vtkMetalGPUVolumeRayCastMapper.h"
 #include "vtkMetalRenderer.h"
 
-@implementation VolumeViewController
+@implementation WaveletVolumeViewController
 
 - (void)setupVTKPipeline
 {
@@ -49,6 +49,10 @@
   vtkNew<vtkVolume> volume;
   volume->SetMapper(mapper);
   volume->SetProperty(property);
+
+  self.mapper = mapper;
+  self.property = property;
+  self.volume = volume;
 
   renderer->AddVolume(volume);
 }
