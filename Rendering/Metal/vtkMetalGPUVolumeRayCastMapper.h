@@ -31,15 +31,12 @@ struct VolumeMapperUniforms;
 enum class VolumePipelineType : uint32_t
 {
   DirectScreen = 0,
-  OffscreenAccumulation = 1,
-  OffscreenLayer = 2,
-  LayerComposite = 3,
-  ImageSampleBlit = 4,
-  FullscreenDirect = 5,      // Fullscreen ray-cast for camera-inside (BGRA8Unorm + depth)
-  FullscreenOffscreen = 6,   // Fullscreen ray-cast for camera-inside (RGBA16Float, no depth)
-  FullscreenAccumulation = 7, // Fullscreen ray-cast with framebuffer fetch for multi-block accumulation
-  GridTraversalDirect = 8,   // Single-pass grid traversal fullscreen (BGRA8Unorm + depth)
-  GridTraversalOffscreen = 9 // Single-pass grid traversal fullscreen (RGBA16Float, no depth)
+  OffscreenLayer = 1,
+  ImageSampleBlit = 2,
+  FullscreenDirect = 3,      // Fullscreen ray-cast for camera-inside (BGRA8Unorm + depth)
+  FullscreenOffscreen = 4,   // Fullscreen ray-cast for camera-inside (RGBA16Float, no depth)
+  GridTraversalDirect = 5,   // Single-pass grid traversal fullscreen (BGRA8Unorm + depth)
+  GridTraversalOffscreen = 6 // Single-pass grid traversal fullscreen (RGBA16Float, no depth)
 };
 
 struct VolumePipelineKey
@@ -154,7 +151,6 @@ private:
 
   // Metal pipeline objects (stored as void* to avoid Obj-C in header)
   void* PipelineState = nullptr;         // id<MTLRenderPipelineState>
-  void* AccumulationPipelineState = nullptr; // id<MTLRenderPipelineState> — for > MAX_LAYER_BRICKS fallback
   void* VolumeTexture = nullptr;         // id<MTLTexture>  (3D)
 
   void* ColorOpacityTexture = nullptr;   // id<MTLTexture>  (2D)
@@ -331,41 +327,10 @@ private:
   void DrawBlocksFullscreen(void* encoder, void* uniformBuf, vtkRenderer* ren, vtkVolume* vol,
     void* uniforms, vtkMatrix4x4* invModelMatrix, bool useDirectPipeline);
 
-  // Volume partitioning — splits large volumes into blocks for 3D texture size limits
-  struct VolumeBlock
-  {
-    void* Texture = nullptr; // id<MTLTexture> — 3D sub-texture for this block
-    void* MinMaxTexture = nullptr; // id<MTLTexture> — per-block min-max accel (R8Unorm)
-    void* NormalTexture = nullptr; // id<MTLTexture> — per-block precomputed normals (RGBA8Unorm)
-    double BoundsMin[3] = {};
-    double BoundsMax[3] = {};
-    int Dims[3] = {};
-    int MinMaxDims[3] = {}; // dimensions of the per-block min-max texture
-    int Extents[6] = {};
-    double Center[3] = {}; // world-space center for sorting
-  };
-
-  // Build PerBlockData from a partitioned-volume block.
-  static void BuildPerBlockData(PerBlockData& pbd,
-    const VolumeBlock& block,
-    const int fullExt[6], const double origin[3], const double spacing[3]);
   // Build PerBlockData from global uniforms for single-block volumes.
   static void BuildPerBlockData(PerBlockData& pbd, const VolumeMapperUniforms* uniforms);
 
   unsigned short Partitions[3] = { 1, 1, 1 };
-  std::vector<VolumeBlock> Blocks;
-  std::vector<int> SortedBlockOrder; // indices into Blocks, sorted back-to-front
-
-  void ClearBlocks();
-  void SortBlocksBackToFront(vtkRenderer* ren, vtkVolume* vol);
-  bool UpdateBlockTextures(void* mtlDevice, void* mtlQueue, vtkVolume* vol,
-    vtkImageData* input, vtkDataArray* scalars, int numComponents);
-  bool UpdateBlockMinMaxTextures(void* mtlDevice, void* mtlQueue, vtkVolume* vol,
-    vtkImageData* input, vtkDataArray* scalars, int numComponents);
-
-  // Per-block scalar min/max for empty-space skipping
-  std::vector<std::array<double, 2>> BlockScalarRanges;
-  bool IsBlockEmpty(double blockMin, double blockMax, vtkPiecewiseFunction* opacityFunc);
 
   // Per-macrocell scalar min/max — computed alongside the occupancy scan
   // in UpdateMinMaxTexture, consumed by UpdateBlockTextures to avoid a
@@ -378,6 +343,7 @@ private:
   void* GridTraversalUniformBuffer = nullptr; // id<MTLBuffer> — GridTraversalUniforms
   int CachedGridDims[3] = {};
   bool GridTraversalResourcesValid = false;
+  vtkVolume* GridTraversalCurrentVolume = nullptr; // transient cache for occupancy computation
   void EnsureGridTraversalResources(void* mtlDevice, void* mtlQueue, vtkImageData* input);
   void ReleaseGridTraversalResources();
   bool CreateGlobalVolumeTexture(void* mtlDevice, void* mtlQueue,
@@ -386,21 +352,6 @@ private:
     void* volTex, void* minMaxTex, void* normalTex,
     bool useDepth, const void* pbd, uint32_t cullMode);
   void BuildGlobalPerBlockData(PerBlockData& pbd, vtkImageData* input);
-
-  // --- Order-independent compositing: per-brick layer textures ---
-  // Each brick renders into its own RGBA16Float slice of a 2D texture array;
-  // a final composite pass reads the array, sorts the layers per-pixel by
-  // ray-entry depth and folds front-to-back.
-  // This eliminates the bright ring caused by framebuffer-fetch ordering.
-  // Covered bricks: <= MAX_LAYER_BRICKS (8).  Volumes with more partitions
-  // fall through to AccumulationPipelineState (>8 fallback, order-dependent).
-  void* LayerTextureArray = nullptr;         // id<MTLTexture> — 2D array, RGBA16Float, <= MAX_LAYER_BRICKS slices
-  int LayerTextureCapacity = 0;              // current number of slices in the array
-  void* LayerPipelineState = nullptr;        // vertex_volume_main + fragment_volume_main, RGBA16Float
-  void* CompositePipelineState = nullptr;    // vertex_fullscreen_main + fragment_layer_composite_main
-  int LayerFBOWidth = 0;
-  int LayerFBOHeight = 0;
-  bool EnsureLayerResources(void* device, int w, int h, int neededSlices);
 };
 
 VTK_ABI_NAMESPACE_END

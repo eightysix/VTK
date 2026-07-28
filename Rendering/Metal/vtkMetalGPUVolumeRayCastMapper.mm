@@ -151,10 +151,6 @@ struct PerBlockData {
 static_assert(sizeof(PerBlockData) == 96,
   "PerBlockData must be 96 bytes to match Metal shader struct");
 
-// Maximum number of bricks covered by the order-independent layer composite.
-// Capped at 8 to stay within Metal's texture bind limit on older hardware.
-static const size_t MAX_LAYER_BRICKS = 8;
-
 // Must match Metal GridTraversalUniforms struct
 struct GridTraversalUniforms {
   int32_t GridDimsX;
@@ -164,13 +160,6 @@ struct GridTraversalUniforms {
 };
 static_assert(sizeof(GridTraversalUniforms) == 16,
   "GridTraversalUniforms must be 16 bytes to match Metal shader struct");
-
-// Must match Metal LayerCompositeUniforms struct
-struct LayerCompositeUniforms {
-  float BlockMin[8][4];
-  float BlockMax[8][4];
-  float Params[4]; // x = brickCount, y = usePerPixelOrder (1=fix, 0=cpu order), zw unused
-};
 
 // Must match Metal VolumeConvertUniforms struct (Phase 7: GPU data type conversion)
 struct VolumeConvertUniforms {
@@ -620,32 +609,6 @@ static id<MTLTexture> NewTexture2D(
   desc.pixelFormat = format;
   desc.width = width;
   desc.height = height;
-  desc.mipmapLevelCount = 1;
-  desc.usage = usage;
-  desc.storageMode = storage;
-  id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
-  [desc release];
-  return tex;
-}
-
-//------------------------------------------------------------------------------
-// Helper: create a MTLTextureType2DArray texture with mipmapLevelCount = 1.
-static id<MTLTexture> NewTexture2DArray(
-  id<MTLDevice> device,
-  MTLPixelFormat format,
-  NSUInteger width,
-  NSUInteger height,
-  NSUInteger arrayLength,
-  MTLTextureUsage usage,
-  MTLStorageMode storage)
-{
-  MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-  desc.textureType = MTLTextureType2DArray;
-  desc.pixelFormat = format;
-  desc.width = width;
-  desc.height = height;
-  desc.depth = 1;
-  desc.arrayLength = arrayLength;
   desc.mipmapLevelCount = 1;
   desc.usage = usage;
   desc.storageMode = storage;
@@ -1306,12 +1269,6 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseImageSampleResources()
   this->ImageSampleFBOWidth = 0;
   this->ImageSampleFBOHeight = 0;
   this->ImageSamplePixelFormat = 0;
-
-  // Release order-independent compositing layer texture array
-  ReleaseMetalObject(this->LayerTextureArray);
-  this->LayerTextureCapacity = 0;
-  this->LayerFBOWidth = 0;
-  this->LayerFBOHeight = 0;
 }
 
 //------------------------------------------------------------------------------
@@ -1599,12 +1556,123 @@ void vtkMetalGPUVolumeRayCastMapper::EnsureGridTraversalResources(
     AssignMetalObject(this->OccupancyGridTexture, occTex);
   }
 
-  // Build occupancy data from current block textures
+  // Build occupancy data directly from partition grid and opacity function.
+  // The volume pointer is obtained from the caller context; if unavailable,
+  // all bricks are marked active (255).
   int gridCells = nx * ny * nz;
-  std::vector<uint8_t> occupancy(gridCells, 0);
-  for (size_t idx = 0; idx < this->Blocks.size() && idx < static_cast<size_t>(gridCells); ++idx)
+  std::vector<uint8_t> occupancy(gridCells, 255);
+
+  vtkPiecewiseFunction* opacityFunc = nullptr;
+  if (this->GridTraversalCurrentVolume)
   {
-    occupancy[idx] = (this->Blocks[idx].Texture != nullptr) ? 255 : 0;
+    vtkVolumeProperty* property =
+      this->GridTraversalCurrentVolume->GetProperty();
+    opacityFunc = property ? property->GetScalarOpacity() : nullptr;
+  }
+
+  if (opacityFunc &&
+      !this->MacrocellScalarMin.empty() &&
+      !this->MacrocellScalarMax.empty())
+  {
+    double opacityTable[256];
+    opacityFunc->GetTable(
+      this->ScalarRange[0],
+      this->ScalarRange[1],
+      256,
+      opacityTable);
+
+    const double scalarRange =
+      this->ScalarRange[1] - this->ScalarRange[0];
+
+    const double rangeRecip =
+      (scalarRange > 0.0) ? (255.0 / scalarRange) : 1.0;
+
+    const double rangeOffset = this->ScalarRange[0];
+
+    int fullExt[6];
+    input->GetExtent(fullExt);
+
+    const int mcDims0 = this->MinMaxDims[0];
+    const int mcDims1 = this->MinMaxDims[1];
+    const int mcDims2 = this->MinMaxDims[2];
+
+    const int DS = 4;
+
+    const int fullX = fullExt[1] - fullExt[0] + 1;
+    const int fullY = fullExt[3] - fullExt[2] + 1;
+    const int fullZ = fullExt[5] - fullExt[4] + 1;
+
+    const int deltaX = fullX / nx;
+    const int deltaY = fullY / ny;
+    const int deltaZ = fullZ / nz;
+
+    for (int k = 0; k < nz; ++k)
+    {
+      for (int j = 0; j < ny; ++j)
+      {
+        for (int i = 0; i < nx; ++i)
+        {
+          int relX0 = i * deltaX;
+          int relY0 = j * deltaY;
+          int relZ0 = k * deltaZ;
+
+          int relX1 =
+            (i == nx - 1) ? (fullX - 1) : (relX0 + deltaX - 1);
+
+          int relY1 =
+            (j == ny - 1) ? (fullY - 1) : (relY0 + deltaY - 1);
+
+          int relZ1 =
+            (k == nz - 1) ? (fullZ - 1) : (relZ0 + deltaZ - 1);
+
+          int mcX0 = relX0 / DS;
+          int mcY0 = relY0 / DS;
+          int mcZ0 = relZ0 / DS;
+
+          int mcX1 = std::min(relX1 / DS, mcDims0 - 1);
+          int mcY1 = std::min(relY1 / DS, mcDims1 - 1);
+          int mcZ1 = std::min(relZ1 / DS, mcDims2 - 1);
+
+          float brickMin = 1e30f;
+          float brickMax = -1e30f;
+
+          for (int mz = mcZ0; mz <= mcZ1; ++mz)
+          {
+            for (int my = mcY0; my <= mcY1; ++my)
+            {
+              for (int mx = mcX0; mx <= mcX1; ++mx)
+              {
+                vtkIdType ci =
+                  (static_cast<vtkIdType>(mz) * mcDims1 + my) *
+                  mcDims0 + mx;
+
+                brickMin = std::min(
+                  brickMin,
+                  this->MacrocellScalarMin[ci]);
+
+                brickMax = std::max(
+                  brickMax,
+                  this->MacrocellScalarMax[ci]);
+              }
+            }
+          }
+
+          bool active = ScalarRangeTouchesOpacity(
+            brickMin,
+            brickMax,
+            opacityTable,
+            rangeOffset,
+            rangeRecip);
+
+          size_t idx =
+            (static_cast<size_t>(k) * ny +
+             static_cast<size_t>(j)) * nx +
+            static_cast<size_t>(i);
+
+          occupancy[idx] = active ? 255 : 0;
+        }
+      }
+    }
   }
 
   // Upload on the main queue so the blit is ordered before the render pass
@@ -1645,8 +1713,8 @@ void vtkMetalGPUVolumeRayCastMapper::EnsureGridTraversalResources(
 
     ReleaseMetalObject(this->GridTraversalUniformBuffer);
     id<MTLBuffer> gridBuf = [device newBufferWithBytes:&gridUniforms
-                                                 length:sizeof(GridTraversalUniforms)
-                                                options:MTLResourceStorageModeShared];
+                                                length:sizeof(GridTraversalUniforms)
+                                               options:MTLResourceStorageModeShared];
     AssignMetalObject(this->GridTraversalUniformBuffer, gridBuf);
 
     this->CachedGridDims[0] = nx;
@@ -1776,48 +1844,11 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureGradientNormalTexture(
 }
 
 //------------------------------------------------------------------------------
-bool vtkMetalGPUVolumeRayCastMapper::EnsureLayerResources(void* deviceVoid, int w, int h, int neededSlices)
-{
-  int capacity = std::max(neededSlices, 1);
-  if (this->LayerTextureArray && this->LayerFBOWidth == w && this->LayerFBOHeight == h &&
-        this->LayerTextureCapacity >= capacity)
-    return true;
-
-  // Release old texture array if size or capacity changed
-  ReleaseMetalObject(this->LayerTextureArray);
-  this->LayerTextureCapacity = 0;
-
-  id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
-  id<MTLTexture> texArray = NewTexture2DArray(
-    device,
-    MTLPixelFormatRGBA16Float,
-    static_cast<NSUInteger>(w),
-    static_cast<NSUInteger>(h),
-    static_cast<NSUInteger>(capacity),
-    MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead,
-    MTLStorageModePrivate);
-  if (!texArray)
-  {
-    vtkErrorMacro("Failed to create layer texture array");
-    return false;
-  }
-  AssignMetalObject(this->LayerTextureArray, texArray);
-  this->LayerTextureCapacity = capacity;
-  this->LayerFBOWidth = w;
-  this->LayerFBOHeight = h;
-  return true;
-}
-
-//------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotUsed(window))
 {
   this->ReleaseImageSampleResources();
-  this->ClearBlocks();
 
   ReleaseMetalObject(this->PipelineState);
-  ReleaseMetalObject(this->AccumulationPipelineState);
-  ReleaseMetalObject(this->LayerPipelineState);
-  ReleaseMetalObject(this->CompositePipelineState);
   ReleaseMetalObject(this->VolumeTexture);
   ReleaseMetalObject(this->ColorOpacityTexture);
   ReleaseMetalObject(this->GradientOpacityTexture);
@@ -1919,60 +1950,24 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
   bool doReload = (this->VolumeTexture == nullptr);
   doReload |= (input->GetMTime() > this->VolumeUploadTime.GetMTime());
 
-  // Check if partitioning is active — route to block-based texture creation
+  // Check if partitioning is active
   bool usePartitions = (this->Partitions[0] > 1 || this->Partitions[1] > 1 || this->Partitions[2] > 1);
-
-  // Clear stale blocks when partitions are disabled
-  if (!usePartitions && !this->Blocks.empty())
-  {
-    this->ClearBlocks();
-  }
 
   if (usePartitions)
   {
-    bool needsReblockify = this->Blocks.empty();
-    bool needsDataReload = (input->GetMTime() > this->VolumeUploadTime.GetMTime());
-    bool needsMapperReload = (this->GetMTime() > this->VolumeUploadTime.GetMTime());
+    bool needsRebuild =
+      this->VolumeTexture == nullptr ||
+      input->GetMTime() > this->VolumeUploadTime.GetMTime() ||
+      this->GetMTime() > this->VolumeUploadTime.GetMTime();
 
     vtkVolumeProperty* property = vol ? vol->GetProperty() : nullptr;
     vtkPiecewiseFunction* opacityFunc =
       property ? property->GetScalarOpacity() : nullptr;
-    bool needsOpacityReload =
-      opacityFunc && (opacityFunc->GetMTime() > this->VolumeUploadTime.GetMTime());
+    bool needsOpacityRebuild =
+      opacityFunc && opacityFunc->GetMTime() > this->VolumeUploadTime.GetMTime();
 
-    if (needsReblockify || needsDataReload || needsMapperReload)
+    if (needsRebuild)
     {
-      // Full rebuild: re-blockify and re-upload everything
-      int fullExt[6];
-      input->GetExtent(fullExt);
-
-      this->ClearBlocks();
-
-      int nx = this->Partitions[0];
-      int ny = this->Partitions[1];
-      int nz = this->Partitions[2];
-      int deltaX = (fullExt[1] - fullExt[0] + 1) / nx;
-      int deltaY = (fullExt[3] - fullExt[2] + 1) / ny;
-      int deltaZ = (fullExt[5] - fullExt[4] + 1) / nz;
-
-      for (int k = 0; k < nz; ++k)
-      {
-        for (int j = 0; j < ny; ++j)
-        {
-          for (int i = 0; i < nx; ++i)
-          {
-            VolumeBlock block;
-            block.Extents[0] = fullExt[0] + i * deltaX;
-            block.Extents[1] = (i == nx - 1) ? fullExt[1] : fullExt[0] + (i + 1) * deltaX - 1;
-            block.Extents[2] = fullExt[2] + j * deltaY;
-            block.Extents[3] = (j == ny - 1) ? fullExt[3] : fullExt[2] + (j + 1) * deltaY - 1;
-            block.Extents[4] = fullExt[4] + k * deltaZ;
-            block.Extents[5] = (k == nz - 1) ? fullExt[5] : fullExt[4] + (k + 1) * deltaZ - 1;
-            this->Blocks.push_back(block);
-          }
-        }
-      }
-
       VolumeBounds vb = ComputeVolumeBounds(input);
       this->ModelBounds[0] = vb.Min[0];
       this->ModelBounds[1] = vb.Max[0];
@@ -1983,16 +1978,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
 
       this->VolumeNumComponents = scalars->GetNumberOfComponents();
 
-      if (!this->UpdateBlockTextures(
-            mtlDeviceVoid, mtlQueueVoid, vol, input, scalars, this->VolumeNumComponents))
-      {
-        return false;
-      }
-
-      // Create/recreate global volume texture for grid traversal
-      // Note: block textures continue using their per-block textures for the
-      // layer composite fallback; the global texture is used exclusively by
-      // the single-pass grid traversal path.
       ReleaseMetalObject(this->VolumeTexture);
       if (!this->CreateGlobalVolumeTexture(mtlDeviceVoid, mtlQueueVoid, input, scalars))
       {
@@ -2001,31 +1986,12 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
 
       this->VolumeUploadTime.Modified();
     }
-    else if (needsOpacityReload && !this->Blocks.empty())
-    {
-      // Only opacity/TF changed: update empty-block classification and
-      // minmax textures without re-uploading scalar voxel data.
-      if (this->MacrocellScalarMin.empty() || this->MacrocellScalarMax.empty())
-      {
-        this->UpdateMinMaxTexture(mtlDeviceVoid, vol, input, scalars, true);
-      }
-      if (!this->UpdateBlockMinMaxTextures(
-            mtlDeviceVoid, mtlQueueVoid, vol, input, scalars, this->VolumeNumComponents))
-      {
-        // Fallback: if the lightweight update cannot handle the transition
-        // (e.g. empty→non-empty block), do a full rebuild.
-        this->ClearBlocks();
-        return this->UpdateVolumeTexture(mtlDeviceVoid, mtlQueueVoid, vol);
-      }
-      this->VolumeUploadTime.Modified();
-    }
 
-    // Rebuild grid traversal resources only when the block layout or
-    // empty-space classification actually changed.
-    if (needsReblockify || needsDataReload || needsMapperReload || needsOpacityReload)
+    if (needsRebuild || needsOpacityRebuild)
     {
       this->GridTraversalResourcesValid = false;
     }
+
     if (!this->GridTraversalResourcesValid && this->VolumeTexture)
     {
       this->EnsureGridTraversalResources(mtlDeviceVoid, mtlQueueVoid, input);
@@ -2329,13 +2295,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
         MTLPixelFormatBGRA8Unorm, MTLPixelFormatDepth32Float, sc },
       { static_cast<uint32_t>(VolumePipelineType::OffscreenLayer),
         MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1 },
-      { static_cast<uint32_t>(VolumePipelineType::OffscreenAccumulation),
-        MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1 },
       { static_cast<uint32_t>(VolumePipelineType::FullscreenDirect),
         MTLPixelFormatBGRA8Unorm, MTLPixelFormatDepth32Float, sc },
       { static_cast<uint32_t>(VolumePipelineType::FullscreenOffscreen),
-        MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1 },
-      { static_cast<uint32_t>(VolumePipelineType::FullscreenAccumulation),
         MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1 },
       { static_cast<uint32_t>(VolumePipelineType::GridTraversalDirect),
         MTLPixelFormatBGRA8Unorm, MTLPixelFormatDepth32Float, sc },
@@ -2974,60 +2936,6 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseMaskResources()
 }
 
 //------------------------------------------------------------------------------
-void vtkMetalGPUVolumeRayCastMapper::ClearBlocks()
-{
-  for (auto& block : this->Blocks)
-  {
-    ReleaseMetalObject(block.Texture);
-    ReleaseMetalObject(block.MinMaxTexture);
-    ReleaseMetalObject(block.NormalTexture);
-  }
-  this->Blocks.clear();
-  this->BlockScalarRanges.clear();
-}
-
-//------------------------------------------------------------------------------
-bool vtkMetalGPUVolumeRayCastMapper::IsBlockEmpty(
-  double blockMin, double blockMax, vtkPiecewiseFunction* opacityFunc)
-{
-  if (blockMin > blockMax)
-  {
-    return true;
-  }
-  if (!opacityFunc)
-  {
-    return false;
-  }
-
-  double range = this->ScalarRange[1] - this->ScalarRange[0];
-  if (range <= 0.0)
-  {
-    range = 1.0;
-  }
-
-  // Build the 256-entry opacity lookup table matching the shader's quantization
-  double opacityTable[256];
-  opacityFunc->GetTable(this->ScalarRange[0], this->ScalarRange[1], 256, opacityTable);
-
-  // Map block scalar range to table indices
-  int idxMin = static_cast<int>((blockMin - this->ScalarRange[0]) / range * 255.0);
-  int idxMax = static_cast<int>((blockMax - this->ScalarRange[0]) / range * 255.0);
-  idxMin = std::max(0, std::min(255, idxMin));
-  idxMax = std::max(0, std::min(255, idxMax));
-
-  // Check if any opacity entry in this range is non-zero
-  for (int i = idxMin; i <= idxMax; ++i)
-  {
-    if (opacityTable[i] > 0.0)
-    {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-//------------------------------------------------------------------------------
 bool vtkMetalGPUVolumeRayCastMapper::EnsureMinMaxComputePipelines(void* mtlDeviceVoid)
 {
   if (this->MinMaxComputePipeline && this->DilateComputePipeline)
@@ -3485,1207 +3393,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
   return this->MinMaxTexture != nullptr;
 }
 
-//------------------------------------------------------------------------------
-void vtkMetalGPUVolumeRayCastMapper::SortBlocksBackToFront(
-  vtkRenderer* ren, vtkVolume* vol)
-{
-  if (this->Blocks.size() <= 1)
-  {
-    return;
-  }
-
-  // Transform camera position into volume-local (grid) space.
-  vtkNew<vtkMatrix4x4> modelToWorld;
-  vol->GetModelToWorldMatrix(modelToWorld);
-  vtkNew<vtkMatrix4x4> worldToModel;
-  vtkMatrix4x4::Invert(modelToWorld, worldToModel);
-
-  double* camPosWorld = ren->GetActiveCamera()->GetPosition();
-  double camLocal[4] = { camPosWorld[0], camPosWorld[1], camPosWorld[2], 1.0 };
-  worldToModel->MultiplyPoint(camLocal, camLocal);
-
-  // For each grid axis, determine whether an INCREASING block index moves
-  // toward or away from the camera. This uses camera POSITION relative to
-  // the volume's split planes -- which is what actually determines ray
-  // entry order for axis-aligned, non-overlapping blocks -- rather than
-  // projecting onto the view direction (which is only valid for
-  // orthographic projection and fails at grazing angles near a shared
-  // partition boundary under perspective).
-  double gridCenter[3] = {
-    (this->ModelBounds[0] + this->ModelBounds[1]) * 0.5,
-    (this->ModelBounds[2] + this->ModelBounds[3]) * 0.5,
-    (this->ModelBounds[4] + this->ModelBounds[5]) * 0.5
-  };
-  bool ascendingIsCloser[3] = {
-    camLocal[0] < gridCenter[0],
-    camLocal[1] < gridCenter[1],
-    camLocal[2] < gridCenter[2]
-  };
-
-  const int nx = this->Partitions[0];
-  const int ny = this->Partitions[1];
-  const int NZ = this->Partitions[2];
-
-  // Initialize sorted order -- skip blocks with no texture (empty-space skipped)
-  this->SortedBlockOrder.clear();
-  this->SortedBlockOrder.reserve(this->Blocks.size());
-  for (size_t idx = 0; idx < this->Blocks.size(); ++idx)
-  {
-    if (this->Blocks[idx].Texture)
-    {
-      this->SortedBlockOrder.push_back(static_cast<int>(idx));
-    }
-  }
-
-  // Blocks were built as: for(k) for(j) for(i) push_back(...)
-  // so idx = (k*ny + j)*nx + i. Recover (i,j,k) from the flat index.
-  std::sort(this->SortedBlockOrder.begin(), this->SortedBlockOrder.end(),
-    [&](int a, int b) {
-      int ai = a % nx;
-      int aj = (a / nx) % ny;
-      int ak = a / (nx * ny);
-      int bi = b % nx;
-      int bj = (b / nx) % ny;
-      int bk = b / (nx * ny);
-
-      // Remap each axis so "closer to camera" is always the smaller index,
-      // then combine as a single nested key. Any fixed, consistent priority
-      // is valid here because the blocks are a non-overlapping axis-aligned
-      // grid and the camera sits outside the grid's bounding box in normal use.
-      auto key = [&](int i, int j, int k) -> long long {
-        int ii = ascendingIsCloser[0] ? i : (nx - 1 - i);
-        int jj = ascendingIsCloser[1] ? j : (ny - 1 - j);
-        int kk = ascendingIsCloser[2] ? k : (NZ - 1 - k);
-        return (static_cast<long long>(kk) * ny + jj) * nx + ii;
-      };
-
-      return key(ai, aj, ak) < key(bi, bj, bk); // ascending = closest first
-    });
-}
-
-//------------------------------------------------------------------------------
-bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockTextures(void* mtlDeviceVoid,
-  void* mtlQueueVoid, vtkVolume* vol, vtkImageData* input, vtkDataArray* scalars,
-  int numComponents)
-{
-  if (this->Blocks.empty())
-  {
-    return false;
-  }
-
-  @autoreleasepool
-  {
-    id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
-    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)mtlQueueVoid;
-
-    int fullDims[3];
-    input->GetDimensions(fullDims);
-
-    int fullExt[6];
-    input->GetExtent(fullExt);
-
-    int dataType = scalars->GetDataType();
-
-    // Determine pixel format (same logic as single-texture path)
-    bool blockUseHalf = this->PreferHalfPrecision &&
-      HalfRangeIsSafe(this->ScalarRange[0], this->ScalarRange[1]);
-    VolumeFormat fmtInfo = ChooseVolumeFormat(
-      dataType, numComponents, this->ScalarRange, this->PreferHalfPrecision);
-    MTLPixelFormat pixelFormat = fmtInfo.Format;
-    int bytesPerComponent = fmtInfo.BytesPerComponent;
-    float normalizationFactor = fmtInfo.NormalizationFactor;
-
-    this->ScalarNormalizationFactor = normalizationFactor;
-
-    // Precompute the 256-entry opacity lookup table for per-block min-max generation.
-    vtkVolumeProperty* property = vol ? vol->GetProperty() : nullptr;
-    vtkPiecewiseFunction* opFunc = property ? property->GetScalarOpacity() : nullptr;
-    double opacityTable[256] = {0};
-    bool hasOpacityFunc = (opFunc != nullptr);
-    if (hasOpacityFunc)
-    {
-      opFunc->GetTable(this->ScalarRange[0], this->ScalarRange[1], 256, opacityTable);
-    }
-
-    double origin[3], spacing[3];
-    input->GetOrigin(origin);
-    input->GetSpacing(spacing);
-
-    vtkIdType totalTuples = scalars->GetNumberOfTuples();
-    const void* fullDataPtr = scalars->GetVoidPointer(0);
-
-    vtkIdType inc[3];
-    input->GetIncrements(inc);
-
-    int actualComponents = (numComponents == 3) ? 4 : numComponents;
-    size_t bytesPerVoxel = static_cast<size_t>(bytesPerComponent) * actualComponents;
-
-    // Compute full-volume strides for strided blit
-    NSUInteger srcBytesPerRow = static_cast<NSUInteger>(fullDims[0]) * bytesPerVoxel;
-    NSUInteger srcBytesPerImage = srcBytesPerRow * fullDims[1];
-    NSUInteger totalVolumeBytes = srcBytesPerImage * fullDims[2];
-
-    bool needsConversion = fmtInfo.NeedsConversion;
-
-    // Use one command buffer for all work (conversion, upload, minmax, normals)
-    id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
-
-    // --- Phase 7: GPU compute conversion for non-native data types ---
-    bool gpuConversionUsed = false;
-    id<MTLTexture> gpuFullTex = nullptr;
-    id<MTLBuffer> stagingBuf = nil;
-
-    if (needsConversion && this->UseGPUConversion)
-    {
-      const char* kernelName = nullptr;
-           if (dataType == VTK_SHORT)        kernelName = blockUseHalf ? "volume_convert_short_to_half"  : "volume_convert_short_to_float";
-      else if (dataType == VTK_INT)          kernelName = blockUseHalf ? "volume_convert_int_to_half"    : "volume_convert_int_to_float";
-      else if (dataType == VTK_UNSIGNED_INT) kernelName = blockUseHalf ? "volume_convert_uint_to_half"   : "volume_convert_uint_to_float";
-      else if (dataType == VTK_FLOAT && blockUseHalf) kernelName = "volume_convert_float_to_half";
-      // VTK_DOUBLE: kernelName stays nullptr (Metal does not support double in device address space)
-
-      if (kernelName && this->EnsureConversionPipelines(mtlDeviceVoid))
-      {
-        id<MTLComputePipelineState> pipeline = nullptr;
-             if (dataType == VTK_SHORT)        pipeline = (__bridge id<MTLComputePipelineState>)(blockUseHalf ? this->ConvertShortToHalfPipeline : this->ConvertShortToFloatPipeline);
-        else if (dataType == VTK_INT)          pipeline = (__bridge id<MTLComputePipelineState>)(blockUseHalf ? this->ConvertIntToHalfPipeline : this->ConvertIntToFloatPipeline);
-        else if (dataType == VTK_UNSIGNED_INT) pipeline = (__bridge id<MTLComputePipelineState>)(blockUseHalf ? this->ConvertUIntToHalfPipeline : this->ConvertUIntToFloatPipeline);
-        else if (dataType == VTK_FLOAT && blockUseHalf) pipeline = (__bridge id<MTLComputePipelineState>)this->ConvertFloatToHalfPipeline;
-
-        if (pipeline)
-        {
-          int outputComponents = (numComponents == 3) ? 4 : numComponents;
-          size_t srcBytesPerVoxelGPU = static_cast<size_t>(vtkDataArray::GetDataTypeSize(dataType)) * numComponents;
-          size_t totalSrcBytes = static_cast<size_t>(totalTuples) * srcBytesPerVoxelGPU;
-
-          id<MTLBuffer> srcBuf = [device newBufferWithBytes:scalars->GetVoidPointer(0)
-                                                     length:totalSrcBytes
-                                                    options:MTLResourceStorageModeShared];
-          if (srcBuf)
-          {
-            gpuFullTex = NewTexture3D(
-              device,
-              pixelFormat,
-              static_cast<NSUInteger>(fullDims[0]),
-              static_cast<NSUInteger>(fullDims[1]),
-              static_cast<NSUInteger>(fullDims[2]),
-              MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
-              MTLStorageModePrivate);
-
-            if (gpuFullTex)
-            {
-              id<MTLComputeCommandEncoder> enc = [uploadCmdBuf computeCommandEncoder];
-              enc.label = @"VTK Block Volume Convert";
-              [enc setComputePipelineState:pipeline];
-              [enc setBuffer:srcBuf offset:0 atIndex:0];
-              [enc setTexture:gpuFullTex atIndex:0];
-
-              VolumeConvertUniforms vu;
-              vu.dimX = static_cast<uint32_t>(fullDims[0]);
-              vu.dimY = static_cast<uint32_t>(fullDims[1]);
-              vu.dimZ = static_cast<uint32_t>(fullDims[2]);
-              vu.numComponents = static_cast<uint32_t>(numComponents);
-              vu.outputComponents = static_cast<uint32_t>(outputComponents);
-              [enc setBytes:&vu length:sizeof(vu) atIndex:1];
-
-              MTLSize tgSize = MTLSizeMake(8, 8, 8);
-              MTLSize tgCount = MTLSizeMake(
-                (static_cast<NSUInteger>(fullDims[0]) + 7) / 8,
-                (static_cast<NSUInteger>(fullDims[1]) + 7) / 8,
-                (static_cast<NSUInteger>(fullDims[2]) + 7) / 8);
-              [enc dispatchThreadgroups:tgCount threadsPerThreadgroup:tgSize];
-              [enc endEncoding];
-              [srcBuf release];
-
-              gpuConversionUsed = true;
-            }
-          }
-        }
-      }
-    }
-
-    if (!gpuConversionUsed)
-    {
-      // Create a single staging buffer for the full volume. Conversion writes
-      // directly into it, eliminating intermediate std::vector copies.
-      stagingBuf = [device newBufferWithLength:totalVolumeBytes
-                                       options:MTLResourceStorageModeShared];
-      if (!stagingBuf)
-      {
-        vtkErrorMacro("Failed to create full-volume staging buffer");
-        return false;
-      }
-      void* uploadPointer = [stagingBuf contents];
-
-      int outputComponents = (numComponents == 3) ? 4 : numComponents;
-
-      if (needsConversion)
-      {
-        ConvertVolumeData(fullDataPtr, dataType, numComponents,
-          totalTuples, uploadPointer, blockUseHalf, outputComponents, scalars);
-      }
-      else if (dataType == VTK_UNSIGNED_SHORT && bytesPerComponent == 1)
-      {
-        int outComp = (numComponents == 3) ? 4 : numComponents;
-        const unsigned short* src = static_cast<const unsigned short*>(fullDataPtr);
-        unsigned char* dst = static_cast<unsigned char*>(uploadPointer);
-        vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
-          for (vtkIdType i = begin; i < end; ++i)
-          {
-            for (int c = 0; c < numComponents; ++c)
-              dst[i * outComp + c] = static_cast<unsigned char>(std::min<unsigned short>(src[i * numComponents + c], 255));
-            if (numComponents == 3)
-              dst[i * 4 + 3] = 255;
-          }
-        });
-      }
-      else if (dataType == VTK_FLOAT && numComponents == 3)
-      {
-        // Expand 3-component float to RGBA (pad alpha with 0)
-        const float* src = static_cast<const float*>(fullDataPtr);
-        float* dst = static_cast<float*>(uploadPointer);
-        vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
-          for (vtkIdType i = begin; i < end; ++i)
-          {
-            dst[i * 4 + 0] = src[i * 3 + 0];
-            dst[i * 4 + 1] = src[i * 3 + 1];
-            dst[i * 4 + 2] = src[i * 3 + 2];
-            dst[i * 4 + 3] = 0.0f;
-          }
-        });
-      }
-      else if (dataType == VTK_UNSIGNED_CHAR && numComponents == 3)
-      {
-        // Expand 3-component uchar to RGBA (pad alpha with 255)
-        const unsigned char* src = static_cast<const unsigned char*>(fullDataPtr);
-        unsigned char* dst = static_cast<unsigned char*>(uploadPointer);
-        vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
-          for (vtkIdType i = begin; i < end; ++i)
-          {
-            dst[i * 4 + 0] = src[i * 3 + 0];
-            dst[i * 4 + 1] = src[i * 3 + 1];
-            dst[i * 4 + 2] = src[i * 3 + 2];
-            dst[i * 4 + 3] = 255;
-          }
-        });
-      }
-      else if (dataType == VTK_UNSIGNED_SHORT && numComponents == 3)
-      {
-        // Expand 3-component ushort to RGBA (pad alpha with 65535)
-        const unsigned short* src = static_cast<const unsigned short*>(fullDataPtr);
-        unsigned short* dst = static_cast<unsigned short*>(uploadPointer);
-        vtkSMPTools::For(0, totalTuples, [&](vtkIdType begin, vtkIdType end) {
-          for (vtkIdType i = begin; i < end; ++i)
-          {
-            dst[i * 4 + 0] = src[i * 3 + 0];
-            dst[i * 4 + 1] = src[i * 3 + 1];
-            dst[i * 4 + 2] = src[i * 3 + 2];
-            dst[i * 4 + 3] = 65535;
-          }
-        });
-      }
-      else
-      {
-        // Native type, no conversion needed — copy directly into staging buffer
-        std::memcpy(uploadPointer, fullDataPtr, static_cast<size_t>(totalVolumeBytes));
-      }
-    }
-
-    id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
-
-    // Resize BlockScalarRanges to match the number of blocks.
-    // ClearBlocks() empties this vector, so we must re-allocate before the loop.
-    this->BlockScalarRanges.resize(this->Blocks.size());
-
-    // Create a 3D texture for each block, using strided blit from the
-    // single staging buffer. This eliminates per-block memcpy and allocation.
-    for (size_t idx = 0; idx < this->Blocks.size(); ++idx)
-    {
-      auto& block = this->Blocks[idx];
-
-      // Ghost Voxels: Pad texture bounds by 1 voxel for correct boundary gradients
-      int texExt[6] = {
-        std::max(fullExt[0], block.Extents[0] - 1),
-        std::min(fullExt[1], block.Extents[1] + 1),
-        std::max(fullExt[2], block.Extents[2] - 1),
-        std::min(fullExt[3], block.Extents[3] + 1),
-        std::max(fullExt[4], block.Extents[4] - 1),
-        std::min(fullExt[5], block.Extents[5] + 1)
-      };
-
-      int bDims[3] = {
-        texExt[1] - texExt[0] + 1,
-        texExt[3] - texExt[2] + 1,
-        texExt[5] - texExt[4] + 1
-      };
-      block.Dims[0] = bDims[0];
-      block.Dims[1] = bDims[1];
-      block.Dims[2] = bDims[2];
-
-      // Compute model-space bounds for this block
-      block.BoundsMin[0] = origin[0] + (block.Extents[0] - 0.5) * spacing[0];
-      block.BoundsMax[0] = origin[0] + (block.Extents[1] + 0.5) * spacing[0];
-      block.BoundsMin[1] = origin[1] + (block.Extents[2] - 0.5) * spacing[1];
-      block.BoundsMax[1] = origin[1] + (block.Extents[3] + 0.5) * spacing[1];
-      block.BoundsMin[2] = origin[2] + (block.Extents[4] - 0.5) * spacing[2];
-      block.BoundsMax[2] = origin[2] + (block.Extents[5] + 0.5) * spacing[2];
-
-      // Compute scalar min/max for this block (used for empty-space skipping).
-      // Prefer reducing over pre-computed macrocell min/max from UpdateMinMaxTexture
-      // (typically ~16³ = 4096 reductions vs. 250³ voxel reads for a 1 GB CT).
-      double blockMin = VTK_DOUBLE_MAX;
-      double blockMax = -VTK_DOUBLE_MAX;
-      if (!this->MacrocellScalarMin.empty() && !this->MacrocellScalarMax.empty())
-      {
-        // Reduce over macrocells that overlap this block using constant DS = 4
-        // and block extents relative to the full volume extent.
-        const int DS = 4;
-        const int mcDims0 = this->MinMaxDims[0];
-        const int mcDims1 = this->MinMaxDims[1];
-        const int mcDims2 = this->MinMaxDims[2];
-
-        int relX0 = block.Extents[0] - fullExt[0];
-        int relX1 = block.Extents[1] - fullExt[0];
-        int relY0 = block.Extents[2] - fullExt[2];
-        int relY1 = block.Extents[3] - fullExt[2];
-        int relZ0 = block.Extents[4] - fullExt[4];
-        int relZ1 = block.Extents[5] - fullExt[4];
-
-        int mcX0 = relX0 / DS;
-        int mcX1 = std::min(relX1 / DS, mcDims0 - 1);
-        int mcY0 = relY0 / DS;
-        int mcY1 = std::min(relY1 / DS, mcDims1 - 1);
-        int mcZ0 = relZ0 / DS;
-        int mcZ1 = std::min(relZ1 / DS, mcDims2 - 1);
-
-        const float* mcMin = this->MacrocellScalarMin.data();
-        const float* mcMax = this->MacrocellScalarMax.data();
-
-        for (int mz = mcZ0; mz <= mcZ1; ++mz)
-        {
-          for (int my = mcY0; my <= mcY1; ++my)
-          {
-            for (int mx = mcX0; mx <= mcX1; ++mx)
-            {
-              vtkIdType ci = (static_cast<vtkIdType>(mz) * mcDims1 + my) * mcDims0 + mx;
-              if (mcMin[ci] < blockMin) blockMin = mcMin[ci];
-              if (mcMax[ci] > blockMax) blockMax = mcMax[ci];
-            }
-          }
-        }
-      }
-      else
-      {
-        // Fallback: walk every voxel in this block (original path)
-        int ext[6] = {
-          block.Extents[0], block.Extents[1],
-          block.Extents[2], block.Extents[3],
-          block.Extents[4], block.Extents[5]
-        };
-        vtkIdType inc[3];
-        input->GetIncrements(inc);
-
-        switch (dataType)
-        {
-          case VTK_FLOAT:
-          {
-            const float* ptr = static_cast<const float*>(fullDataPtr);
-            for (int z = ext[4]; z <= ext[5]; ++z)
-            {
-              for (int y = ext[2]; y <= ext[3]; ++y)
-              {
-                const float* row = ptr + z * inc[2] + y * inc[1] + ext[0] * inc[0];
-                for (int x = ext[0]; x <= ext[1]; ++x, row += inc[0])
-                {
-                  double v = static_cast<double>(*row);
-                  if (v < blockMin) blockMin = v;
-                  if (v > blockMax) blockMax = v;
-                }
-              }
-            }
-            break;
-          }
-          case VTK_UNSIGNED_CHAR:
-          {
-            const unsigned char* ptr = static_cast<const unsigned char*>(fullDataPtr);
-            for (int z = ext[4]; z <= ext[5]; ++z)
-            {
-              for (int y = ext[2]; y <= ext[3]; ++y)
-              {
-                const unsigned char* row = ptr + z * inc[2] + y * inc[1] + ext[0] * inc[0];
-                for (int x = ext[0]; x <= ext[1]; ++x, row += inc[0])
-                {
-                  double v = static_cast<double>(*row);
-                  if (v < blockMin) blockMin = v;
-                  if (v > blockMax) blockMax = v;
-                }
-              }
-            }
-            break;
-          }
-          case VTK_UNSIGNED_SHORT:
-          {
-            const unsigned short* ptr = static_cast<const unsigned short*>(fullDataPtr);
-            for (int z = ext[4]; z <= ext[5]; ++z)
-            {
-              for (int y = ext[2]; y <= ext[3]; ++y)
-              {
-                const unsigned short* row = ptr + z * inc[2] + y * inc[1] + ext[0] * inc[0];
-                for (int x = ext[0]; x <= ext[1]; ++x, row += inc[0])
-                {
-                  double v = static_cast<double>(*row);
-                  if (v < blockMin) blockMin = v;
-                  if (v > blockMax) blockMax = v;
-                }
-              }
-            }
-            break;
-          }
-          case VTK_INT:
-          {
-            const int* ptr = static_cast<const int*>(fullDataPtr);
-            for (int z = ext[4]; z <= ext[5]; ++z)
-            {
-              for (int y = ext[2]; y <= ext[3]; ++y)
-              {
-                const int* row = ptr + z * inc[2] + y * inc[1] + ext[0] * inc[0];
-                for (int x = ext[0]; x <= ext[1]; ++x, row += inc[0])
-                {
-                  double v = static_cast<double>(*row);
-                  if (v < blockMin) blockMin = v;
-                  if (v > blockMax) blockMax = v;
-                }
-              }
-            }
-            break;
-          }
-          case VTK_UNSIGNED_INT:
-          {
-            const unsigned int* ptr = static_cast<const unsigned int*>(fullDataPtr);
-            for (int z = ext[4]; z <= ext[5]; ++z)
-            {
-              for (int y = ext[2]; y <= ext[3]; ++y)
-              {
-                const unsigned int* row = ptr + z * inc[2] + y * inc[1] + ext[0] * inc[0];
-                for (int x = ext[0]; x <= ext[1]; ++x, row += inc[0])
-                {
-                  double v = static_cast<double>(*row);
-                  if (v < blockMin) blockMin = v;
-                  if (v > blockMax) blockMax = v;
-                }
-              }
-            }
-            break;
-          }
-          default:
-          {
-            for (int z = ext[4]; z <= ext[5]; ++z)
-            {
-              for (int y = ext[2]; y <= ext[3]; ++y)
-              {
-                for (int x = ext[0]; x <= ext[1]; ++x)
-                {
-                  vtkIdType tupleIdx = z * inc[2] / inc[0] + y * inc[1] / inc[0] + x;
-                  double v = scalars->GetComponent(tupleIdx, 0);
-                  if (v < blockMin) blockMin = v;
-                  if (v > blockMax) blockMax = v;
-                }
-              }
-            }
-            break;
-          }
-        }
-      }
-
-      this->BlockScalarRanges[idx][0] = blockMin;
-      this->BlockScalarRanges[idx][1] = blockMax;
-
-      // Check if this block is entirely transparent (empty-space skipping)
-      vtkVolumeProperty* property = vol ? vol->GetProperty() : nullptr;
-      vtkPiecewiseFunction* opacityFunc = property ? property->GetScalarOpacity() : nullptr;
-      if (this->IsBlockEmpty(blockMin, blockMax, opacityFunc))
-      {
-        block.Texture = nullptr;
-        continue;
-      }
-
-      // Create the 3D texture for this block
-      id<MTLTexture> tex = NewTexture3D(
-        device,
-        pixelFormat,
-        static_cast<NSUInteger>(bDims[0]),
-        static_cast<NSUInteger>(bDims[1]),
-        static_cast<NSUInteger>(bDims[2]),
-        MTLTextureUsageShaderRead,
-        MTLStorageModePrivate);
-      if (!tex)
-      {
-        vtkErrorMacro(<< "Failed to create block " << idx << " 3D texture ("
-                      << bDims[0] << "x" << bDims[1] << "x" << bDims[2] << ")");
-        return false;
-      }
-      AssignMetalObject(block.Texture, tex);
-
-      // --- Per-block min-max texture generation ---
-      // When UseGPUMinMax is true, skip CPU generation and let the GPU compute
-      // phase after the blit encoder handle it.  Just store the dims so the
-      // GPU phase can reuse them.
-      if (this->UseGPUMinMax)
-      {
-        const int DS = 4;
-        block.MinMaxDims[0] = std::max(1, (bDims[0] + DS - 1) / DS);
-        block.MinMaxDims[1] = std::max(1, (bDims[1] + DS - 1) / DS);
-        block.MinMaxDims[2] = std::max(1, (bDims[2] + DS - 1) / DS);
-        block.MinMaxTexture = nullptr;
-      }
-      else if (hasOpacityFunc)
-      {
-        const int DS = 4; // Downsample factor
-        int mmDims[3] = {
-          std::max(1, (bDims[0] + DS - 1) / DS),
-          std::max(1, (bDims[1] + DS - 1) / DS),
-          std::max(1, (bDims[2] + DS - 1) / DS)
-        };
-        block.MinMaxDims[0] = mmDims[0];
-        block.MinMaxDims[1] = mmDims[1];
-        block.MinMaxDims[2] = mmDims[2];
-
-        vtkIdType numCells = static_cast<vtkIdType>(mmDims[0]) * mmDims[1] * mmDims[2];
-        const double blockRange = this->ScalarRange[1] - this->ScalarRange[0];
-        const double blockRangeRecip = (blockRange > 0.0) ? (255.0 / blockRange) : 1.0;
-        const double blockRangeOffset = this->ScalarRange[0];
-
-        // 1. Slice from global macrocell min/max instead of walking every voxel.
-        // Mapped from global MacrocellScalarMin/Max (computed in UpdateMinMaxTexture)
-        // which covers the entire volume at DS=4 resolution.
-        std::vector<uint8_t> rawMinMax(numCells, 255);
-        const int mmDims0 = mmDims[0];
-        const int mmDims1 = mmDims[1];
-        const int mmDims2 = mmDims[2];
-
-        const int mcDims0 = this->MinMaxDims[0];
-        const int mcDims1 = this->MinMaxDims[1];
-        const int mcDims2 = this->MinMaxDims[2];
-        const bool haveGlobalMinMax = !this->MacrocellScalarMin.empty() && !this->MacrocellScalarMax.empty();
-
-        if (haveGlobalMinMax)
-        {
-          // Fast path: use precomputed global macrocell data
-          const float* mcMin = this->MacrocellScalarMin.data();
-          const float* mcMax = this->MacrocellScalarMax.data();
-          const int relX0 = texExt[0] - fullExt[0];
-          const int relY0 = texExt[2] - fullExt[2];
-          const int relZ0 = texExt[4] - fullExt[4];
-
-          vtkSMPTools::For(0, numCells, [&](vtkIdType begin, vtkIdType end) {
-            for (vtkIdType cellIdx = begin; cellIdx < end; ++cellIdx)
-            {
-              const int gx = static_cast<int>(cellIdx % mmDims0);
-              const int gy = static_cast<int>((cellIdx / mmDims0) % mmDims1);
-              const int gz = static_cast<int>(cellIdx / (mmDims0 * mmDims1));
-
-              // Map block macrocell range to overlapping global macrocells
-              const int xVoxelStart = relX0 + gx * DS;
-              const int xVoxelEnd = relX0 + std::min((gx + 1) * DS, bDims[0]);
-              const int yVoxelStart = relY0 + gy * DS;
-              const int yVoxelEnd = relY0 + std::min((gy + 1) * DS, bDims[1]);
-              const int zVoxelStart = relZ0 + gz * DS;
-              const int zVoxelEnd = relZ0 + std::min((gz + 1) * DS, bDims[2]);
-
-              const int mcX0 = std::min(xVoxelStart / DS, mcDims0 - 1);
-              const int mcX1 = std::min(std::max(xVoxelEnd - 1, 0) / DS, mcDims0 - 1);
-              const int mcY0 = std::min(yVoxelStart / DS, mcDims1 - 1);
-              const int mcY1 = std::min(std::max(yVoxelEnd - 1, 0) / DS, mcDims1 - 1);
-              const int mcZ0 = std::min(zVoxelStart / DS, mcDims2 - 1);
-              const int mcZ1 = std::min(std::max(zVoxelEnd - 1, 0) / DS, mcDims2 - 1);
-
-              float cellMin = 1e30f;
-              float cellMax = -1e30f;
-              for (int mz = mcZ0; mz <= mcZ1; ++mz)
-              {
-                for (int my = mcY0; my <= mcY1; ++my)
-                {
-                  for (int mx = mcX0; mx <= mcX1; ++mx)
-                  {
-                    vtkIdType idx = (static_cast<vtkIdType>(mz) * mcDims1 + my) * mcDims0 + mx;
-                    if (mcMin[idx] < cellMin) cellMin = mcMin[idx];
-                    if (mcMax[idx] > cellMax) cellMax = mcMax[idx];
-                  }
-                }
-              }
-
-              rawMinMax[cellIdx] = ScalarRangeTouchesOpacity(cellMin, cellMax, opacityTable, blockRangeOffset, blockRangeRecip) ? 0 : 255;
-            }
-          });
-        }
-        else
-        {
-          // Fallback: walk every voxel (original path)
-          vtkSMPTools::For(0, numCells, [&](vtkIdType begin, vtkIdType end) {
-            for (vtkIdType cellIdx = begin; cellIdx < end; ++cellIdx)
-            {
-              const int gx = static_cast<int>(cellIdx % mmDims0);
-              const int gy = static_cast<int>((cellIdx / mmDims0) % mmDims1);
-              const int gz = static_cast<int>(cellIdx / (mmDims0 * mmDims1));
-
-              const int zStart = texExt[4] + gz * DS;
-              const int zEnd = std::min(zStart + DS, texExt[5] + 1);
-              const int yStart = texExt[2] + gy * DS;
-              const int yEnd = std::min(yStart + DS, texExt[3] + 1);
-              const int xStart = texExt[0] + gx * DS;
-              const int xEnd = std::min(xStart + DS, texExt[1] + 1);
-
-              float cellMin = 1e30f;
-              float cellMax = -1e30f;
-
-              for (int z = zStart; z < zEnd; ++z)
-              {
-                int zOffset = z - fullExt[4];
-                for (int y = yStart; y < yEnd; ++y)
-                {
-                  int yOffset = y - fullExt[2];
-                  for (int x = xStart; x < xEnd; ++x)
-                  {
-                    int xOffset = x - fullExt[0];
-                    float v = 0.0f;
-                    switch (dataType)
-                    {
-                      case VTK_FLOAT:
-                        v = static_cast<float>(
-                          static_cast<const float*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
-                        break;
-                      case VTK_UNSIGNED_CHAR:
-                        v = static_cast<float>(
-                          static_cast<const unsigned char*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
-                        break;
-                      case VTK_UNSIGNED_SHORT:
-                        v = static_cast<float>(
-                          static_cast<const unsigned short*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
-                        break;
-                      case VTK_SHORT:
-                        v = static_cast<float>(
-                          static_cast<const short*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
-                        break;
-                      case VTK_INT:
-                        v = static_cast<float>(
-                          static_cast<const int*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
-                        break;
-                      case VTK_UNSIGNED_INT:
-                        v = static_cast<float>(
-                          static_cast<const unsigned int*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
-                        break;
-                      default:
-                      {
-                        vtkIdType tupleIdx = zOffset * (inc[2] / inc[0]) + yOffset * (inc[1] / inc[0]) + xOffset;
-                        v = static_cast<float>(scalars->GetComponent(tupleIdx, 0));
-                        break;
-                      }
-                    }
-                    if (v < cellMin) cellMin = v;
-                    if (v > cellMax) cellMax = v;
-                  }
-                }
-              }
-
-              rawMinMax[cellIdx] = ScalarRangeTouchesOpacity(cellMin, cellMax, opacityTable, blockRangeOffset, blockRangeRecip) ? 0 : 255;
-            }
-          });
-        }
-
-        std::vector<uint8_t> minMaxData = DilateOccupancy3D(rawMinMax, mmDims0, mmDims1, mmDims2);
-
-        AssignR8MinMaxTexture(block.MinMaxTexture, device, minMaxData, mmDims0, mmDims1, mmDims2);
-      }
-      else
-      {
-        block.MinMaxTexture = nullptr;
-      }
-      // --- End per-block min-max texture generation ---
-
-      if (gpuConversionUsed && gpuFullTex)
-      {
-        // GPU-converted full volume: extract per-block sub-region via texture-to-texture copy
-        [blit copyFromTexture:gpuFullTex
-                  sourceSlice:0
-                  sourceLevel:0
-                 sourceOrigin:MTLOriginMake(
-                     static_cast<NSUInteger>(texExt[0] - fullExt[0]),
-                     static_cast<NSUInteger>(texExt[2] - fullExt[2]),
-                     static_cast<NSUInteger>(texExt[4] - fullExt[4]))
-                   sourceSize:MTLSizeMake(
-                     static_cast<NSUInteger>(bDims[0]),
-                     static_cast<NSUInteger>(bDims[1]),
-                     static_cast<NSUInteger>(bDims[2]))
-                    toTexture:tex
-             destinationSlice:0
-             destinationLevel:0
-            destinationOrigin:MTLOriginMake(0, 0, 0)];
-      }
-      else
-      {
-        // CPU-converted staging buffer: extract per-block sub-region via buffer-to-texture copy
-        NSUInteger sourceOffset =
-          static_cast<NSUInteger>(texExt[4] - fullExt[4]) * srcBytesPerImage +
-          static_cast<NSUInteger>(texExt[2] - fullExt[2]) * srcBytesPerRow +
-          static_cast<NSUInteger>(texExt[0] - fullExt[0]) * bytesPerVoxel;
-
-        [blit copyFromBuffer:stagingBuf
-                sourceOffset:sourceOffset
-         sourceBytesPerRow:srcBytesPerRow
-       sourceBytesPerImage:srcBytesPerImage
-                sourceSize:MTLSizeMake(bDims[0], bDims[1], bDims[2])
-                 toTexture:tex
-          destinationSlice:0
-          destinationLevel:0
-         destinationOrigin:MTLOriginMake(0, 0, 0)];
-      }
-    }
-
-    [blit endEncoding];
-
-    if (this->UseGPUMinMax && hasOpacityFunc &&
-        this->EnsureMinMaxComputePipelines(mtlDeviceVoid))
-    {
-      double scalarRange = this->ScalarRange[1] - this->ScalarRange[0];
-      if (scalarRange <= 0.0) scalarRange = 1.0;
-      float normFactor = this->ScalarNormalizationFactor;
-
-      double opacityTable[256];
-      opFunc->GetTable(this->ScalarRange[0], this->ScalarRange[1], 256, opacityTable);
-
-      MinMaxComputeUniforms mmu;
-      mmu.ds = 4.0f;
-      mmu.scalarMin = static_cast<float>(this->ScalarRange[0] / normFactor);
-      mmu.scalarScale = static_cast<float>(255.0 * normFactor / scalarRange);
-      mmu._pad = 0.0f;
-      mmu.opacityPrefix[0] = 0;
-      for (int i = 0; i < 256; ++i)
-        mmu.opacityPrefix[i + 1] = mmu.opacityPrefix[i] + (opacityTable[i] > 0.0 ? 1u : 0u);
-
-      id<MTLComputeCommandEncoder> mmEnc = [uploadCmdBuf computeCommandEncoder];
-      mmEnc.label = @"VTK Block MinMax Compute";
-
-      for (auto& block : this->Blocks)
-      {
-        if (!block.Texture) continue;
-
-        id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture;
-        int bdims[3] = { block.Dims[0], block.Dims[1], block.Dims[2] };
-        int mmDims[3] = { block.MinMaxDims[0], block.MinMaxDims[1], block.MinMaxDims[2] };
-
-        id<MTLTexture> mmTex = CreateR8MinMaxTexture(
-          device,
-          mmDims[0],
-          mmDims[1],
-          mmDims[2],
-          MTLStorageModePrivate,
-          MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
-        if (!mmTex) continue;
-        AssignMetalObject(block.MinMaxTexture, mmTex);
-
-        mmu.mmDimX = static_cast<uint32_t>(mmDims[0]);
-        mmu.mmDimY = static_cast<uint32_t>(mmDims[1]);
-        mmu.mmDimZ = static_cast<uint32_t>(mmDims[2]);
-        mmu.volDimX = static_cast<uint32_t>(bdims[0]);
-        mmu.volDimY = static_cast<uint32_t>(bdims[1]);
-        mmu.volDimZ = static_cast<uint32_t>(bdims[2]);
-
-        EncodeGPUMinMaxDilation(
-          mmEnc,
-          device,
-          blockTex,
-          mmTex,
-          bdims,
-          mmDims,
-          mmu,
-          (__bridge id<MTLComputePipelineState>)this->MinMaxComputePipeline,
-          (__bridge id<MTLComputePipelineState>)this->DilateComputePipeline);
-      }
-
-      [mmEnc endEncoding];
-    }
-
-    // Phase 4: Precompute per-block gradient/normal textures for partitioned volumes.
-    if (this->UsePrecomputedNormals && !this->Blocks.empty())
-    {
-      if (!this->EnsureShaderLibrary(mtlDeviceVoid))
-      {
-        return false;
-      }
-      id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
-
-      if (!this->NormalComputePipeline)
-      {
-        id<MTLFunction> kernelFunc = [library newFunctionWithName:@"volume_compute_normals"];
-        if (kernelFunc)
-        {
-          NSError* err = nil;
-          id<MTLComputePipelineState> cps =
-            [device newComputePipelineStateWithFunction:kernelFunc error:&err];
-          [kernelFunc release];
-          if (cps)
-          {
-            AssignMetalObject(this->NormalComputePipeline, cps);
-          }
-        }
-      }
-
-      if (this->NormalComputePipeline)
-      {
-        id<MTLComputeCommandEncoder> compEnc = [uploadCmdBuf computeCommandEncoder];
-        compEnc.label = @"VTK Block Normal Compute";
-
-        for (auto& block : this->Blocks)
-        {
-          if (!block.Texture) continue;
-
-          id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture;
-          int bdims[3] = { static_cast<int>(blockTex.width),
-                           static_cast<int>(blockTex.height),
-                           static_cast<int>(blockTex.depth) };
-
-          // Create per-block normal texture
-          id<MTLTexture> blockNrm = NewTexture3D(
-            device,
-            MTLPixelFormatRGBA8Unorm,
-            static_cast<NSUInteger>(bdims[0]),
-            static_cast<NSUInteger>(bdims[1]),
-            static_cast<NSUInteger>(bdims[2]),
-            MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
-            MTLStorageModePrivate);
-          if (!blockNrm) continue;
-          AssignMetalObject(block.NormalTexture, blockNrm);
-
-          NormalComputeUniforms u = MakeNormalComputeUniforms(
-            bdims, this->ScalarRange, this->ScalarNormalizationFactor);
-
-          EncodeNormalCompute(compEnc, blockTex, blockNrm, u,
-            (__bridge id<MTLComputePipelineState>)this->NormalComputePipeline);
-        }
-
-        [compEnc endEncoding];
-      }
-    }
-
-    [uploadCmdBuf commit];
-    if (gpuFullTex)
-    {
-      [gpuFullTex release];
-    }
-    [stagingBuf release];
-  }
-
-  return true;
-}
-
-//------------------------------------------------------------------------------
-// Updates per-block minmax textures and empty-block classification when only
-// the opacity function changed (scalar voxel data is unchanged). Skips the
-// expensive scalar texture re-upload that a full UpdateBlockTextures would do.
-// Returns false if a full rebuild is required (e.g. a block transitioned from
-// empty to non-empty and needs a new scalar texture).
-bool vtkMetalGPUVolumeRayCastMapper::UpdateBlockMinMaxTextures(
-  void* mtlDeviceVoid, void* mtlQueueVoid, vtkVolume* vol,
-  vtkImageData* input, vtkDataArray* scalars, int numComponents)
-{
-  @autoreleasepool
-  {
-    id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
-    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)mtlQueueVoid;
-
-    int fullExt[6];
-    input->GetExtent(fullExt);
-
-    vtkVolumeProperty* property = vol ? vol->GetProperty() : nullptr;
-    vtkPiecewiseFunction* opFunc = property ? property->GetScalarOpacity() : nullptr;
-    const bool hasOpacityFunc = opFunc != nullptr;
-
-    // Step 1: Re-evaluate empty-block classification.
-    // Blocks that become empty release their textures; blocks that become
-    // non-empty require a full rebuild (uncommon).
-    for (size_t idx = 0; idx < this->Blocks.size(); ++idx)
-    {
-      auto& block = this->Blocks[idx];
-      double blockMin = this->BlockScalarRanges[idx][0];
-      double blockMax = this->BlockScalarRanges[idx][1];
-      bool isEmpty = !hasOpacityFunc || this->IsBlockEmpty(blockMin, blockMax, opFunc);
-
-      if (isEmpty)
-      {
-        if (block.Texture)
-        {
-          ReleaseMetalObject(block.Texture);
-          block.Texture = nullptr;
-        }
-        ReleaseMetalObject(block.MinMaxTexture);
-        block.MinMaxTexture = nullptr;
-        ReleaseMetalObject(block.NormalTexture);
-        block.NormalTexture = nullptr;
-      }
-      else if (!block.Texture)
-      {
-        return false; // empty→non-empty transition: needs full rebuild
-      }
-    }
-
-    // Step 2: Regenerate per-block minmax textures for non-empty blocks.
-    // Opacity table shared across all blocks.
-    const double scalarRange = this->ScalarRange[1] - this->ScalarRange[0];
-    const double rangeRecip = (scalarRange > 0.0) ? (255.0 / scalarRange) : 1.0;
-    const double rangeOffset = this->ScalarRange[0];
-    double opacityTable[256];
-    if (hasOpacityFunc)
-    {
-      opFunc->GetTable(this->ScalarRange[0], this->ScalarRange[1], 256, opacityTable);
-    }
-
-    // GPU compute encoder and opacity prefix table (used only in GPU path)
-    id<MTLComputeCommandEncoder> mmEnc = nil;
-    id<MTLCommandBuffer> mmCmdBuf = nil;
-    MinMaxComputeUniforms mmu = {};
-    bool gpuMinMaxReady = false;
-
-    if (this->UseGPUMinMax && hasOpacityFunc &&
-        this->EnsureMinMaxComputePipelines(mtlDeviceVoid))
-    {
-      mmCmdBuf = [queue commandBuffer];
-      mmCmdBuf.label = @"VTK Block Opacity MinMax Compute";
-      mmEnc = [mmCmdBuf computeCommandEncoder];
-      mmEnc.label = @"VTK Block MinMax Compute (opacity update)";
-
-      const float normFactor = this->ScalarNormalizationFactor;
-      mmu.ds = 4.0f;
-      mmu.scalarMin = static_cast<float>(this->ScalarRange[0] / normFactor);
-      mmu.scalarScale = static_cast<float>(255.0 * normFactor / (scalarRange > 0.0 ? scalarRange : 1.0));
-      mmu._pad = 0.0f;
-      mmu.opacityPrefix[0] = 0;
-      for (int i = 0; i < 256; ++i)
-        mmu.opacityPrefix[i + 1] = mmu.opacityPrefix[i] + (opacityTable[i] > 0.0 ? 1u : 0u);
-      gpuMinMaxReady = true;
-    }
-
-    const bool haveGlobalMinMax = !this->MacrocellScalarMin.empty() && !this->MacrocellScalarMax.empty();
-    const int mcDims0 = this->MinMaxDims[0];
-    const int mcDims1 = this->MinMaxDims[1];
-    const int mcDims2 = this->MinMaxDims[2];
-
-    for (auto& block : this->Blocks)
-    {
-      if (!block.Texture) continue;
-
-      const int bDims[3] = { block.Dims[0], block.Dims[1], block.Dims[2] };
-      const int texExt[6] = {
-        block.Extents[0], block.Extents[1],
-        block.Extents[2], block.Extents[3],
-        block.Extents[4], block.Extents[5]
-      };
-      const int DS = 4;
-      int mmDims[3] = {
-        std::max(1, (bDims[0] + DS - 1) / DS),
-        std::max(1, (bDims[1] + DS - 1) / DS),
-        std::max(1, (bDims[2] + DS - 1) / DS)
-      };
-      block.MinMaxDims[0] = mmDims[0];
-      block.MinMaxDims[1] = mmDims[1];
-      block.MinMaxDims[2] = mmDims[2];
-
-      if (this->UseGPUMinMax)
-      {
-        // GPU path: release old minmax texture; compute kernel will create new one
-        ReleaseMetalObject(block.MinMaxTexture);
-        block.MinMaxTexture = nullptr;
-        continue; // dispatched below in the compute encoder
-      }
-
-      if (!hasOpacityFunc)
-      {
-        block.MinMaxTexture = nullptr;
-        continue;
-      }
-
-      // --- CPU minmax regeneration ---
-      vtkIdType numCells = static_cast<vtkIdType>(mmDims[0]) * mmDims[1] * mmDims[2];
-
-      // Step 2a: Build raw occupancy from global MacrocellScalarMin/Max
-      std::vector<uint8_t> rawMinMax(numCells, 255);
-
-      if (haveGlobalMinMax)
-      {
-        const float* mcMin = this->MacrocellScalarMin.data();
-        const float* mcMax = this->MacrocellScalarMax.data();
-        const int relX0 = texExt[0] - fullExt[0];
-        const int relY0 = texExt[2] - fullExt[2];
-        const int relZ0 = texExt[4] - fullExt[4];
-
-        vtkSMPTools::For(0, numCells, [&](vtkIdType begin, vtkIdType end) {
-          for (vtkIdType cellIdx = begin; cellIdx < end; ++cellIdx)
-          {
-            const int gx = static_cast<int>(cellIdx % mmDims[0]);
-            const int gy = static_cast<int>((cellIdx / mmDims[0]) % mmDims[1]);
-            const int gz = static_cast<int>(cellIdx / (mmDims[0] * mmDims[1]));
-
-            const int xVoxelStart = relX0 + gx * DS;
-            const int xVoxelEnd = relX0 + std::min((gx + 1) * DS, bDims[0]);
-            const int yVoxelStart = relY0 + gy * DS;
-            const int yVoxelEnd = relY0 + std::min((gy + 1) * DS, bDims[1]);
-            const int zVoxelStart = relZ0 + gz * DS;
-            const int zVoxelEnd = relZ0 + std::min((gz + 1) * DS, bDims[2]);
-
-            const int mcX0 = std::min(xVoxelStart / DS, mcDims0 - 1);
-            const int mcX1 = std::min(std::max(xVoxelEnd - 1, 0) / DS, mcDims0 - 1);
-            const int mcY0 = std::min(yVoxelStart / DS, mcDims1 - 1);
-            const int mcY1 = std::min(std::max(yVoxelEnd - 1, 0) / DS, mcDims1 - 1);
-            const int mcZ0 = std::min(zVoxelStart / DS, mcDims2 - 1);
-            const int mcZ1 = std::min(std::max(zVoxelEnd - 1, 0) / DS, mcDims2 - 1);
-
-            float cellMin = 1e30f;
-            float cellMax = -1e30f;
-            for (int mz = mcZ0; mz <= mcZ1; ++mz)
-            {
-              for (int my = mcY0; my <= mcY1; ++my)
-              {
-                for (int mx = mcX0; mx <= mcX1; ++mx)
-                {
-                  vtkIdType mcIdx = (static_cast<vtkIdType>(mz) * mcDims1 + my) * mcDims0 + mx;
-                  if (mcMin[mcIdx] < cellMin) cellMin = mcMin[mcIdx];
-                  if (mcMax[mcIdx] > cellMax) cellMax = mcMax[mcIdx];
-                }
-              }
-            }
-
-            rawMinMax[cellIdx] = ScalarRangeTouchesOpacity(cellMin, cellMax, opacityTable, rangeOffset, rangeRecip) ? 0 : 255;
-          }
-        });
-      }
-      else
-      {
-        // Fallback: walk every voxel in this block
-        int dataType = scalars->GetDataType();
-        const void* fullDataPtr = scalars->GetVoidPointer(0);
-        vtkIdType inc[3];
-        input->GetIncrements(inc);
-
-        vtkSMPTools::For(0, numCells, [&](vtkIdType begin, vtkIdType end) {
-          for (vtkIdType cellIdx = begin; cellIdx < end; ++cellIdx)
-          {
-            const int gx = static_cast<int>(cellIdx % mmDims[0]);
-            const int gy = static_cast<int>((cellIdx / mmDims[0]) % mmDims[1]);
-            const int gz = static_cast<int>(cellIdx / (mmDims[0] * mmDims[1]));
-
-            const int zStart = texExt[4] + gz * DS;
-            const int zEnd = std::min(zStart + DS, texExt[5] + 1);
-            const int yStart = texExt[2] + gy * DS;
-            const int yEnd = std::min(yStart + DS, texExt[3] + 1);
-            const int xStart = texExt[0] + gx * DS;
-            const int xEnd = std::min(xStart + DS, texExt[1] + 1);
-
-            float cellMin = 1e30f;
-            float cellMax = -1e30f;
-
-            for (int z = zStart; z < zEnd; ++z)
-            {
-              int zOffset = z - fullExt[4];
-              for (int y = yStart; y < yEnd; ++y)
-              {
-                int yOffset = y - fullExt[2];
-                for (int x = xStart; x < xEnd; ++x)
-                {
-                  int xOffset = x - fullExt[0];
-                  float v = 0.0f;
-                  switch (dataType)
-                  {
-                    case VTK_FLOAT:
-                      v = static_cast<float>(
-                        static_cast<const float*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
-                      break;
-                    case VTK_UNSIGNED_CHAR:
-                      v = static_cast<float>(
-                        static_cast<const unsigned char*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
-                      break;
-                    case VTK_UNSIGNED_SHORT:
-                      v = static_cast<float>(
-                        static_cast<const unsigned short*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
-                      break;
-                    case VTK_SHORT:
-                      v = static_cast<float>(
-                        static_cast<const short*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
-                      break;
-                    case VTK_INT:
-                      v = static_cast<float>(
-                        static_cast<const int*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
-                      break;
-                    case VTK_UNSIGNED_INT:
-                      v = static_cast<float>(
-                        static_cast<const unsigned int*>(fullDataPtr)[zOffset * inc[2] + yOffset * inc[1] + xOffset * inc[0]]);
-                      break;
-                    default:
-                    {
-                      vtkIdType tupleIdx = zOffset * (inc[2] / inc[0]) + yOffset * (inc[1] / inc[0]) + xOffset;
-                      v = static_cast<float>(scalars->GetComponent(tupleIdx, 0));
-                      break;
-                    }
-                  }
-                  if (v < cellMin) cellMin = v;
-                  if (v > cellMax) cellMax = v;
-                }
-              }
-            }
-
-            rawMinMax[cellIdx] = ScalarRangeTouchesOpacity(cellMin, cellMax, opacityTable, rangeOffset, rangeRecip) ? 0 : 255;
-          }
-        });
-      }
-
-      std::vector<uint8_t> minMaxData = DilateOccupancy3D(rawMinMax, mmDims[0], mmDims[1], mmDims[2]);
-
-      AssignR8MinMaxTexture(block.MinMaxTexture, device, minMaxData, mmDims[0], mmDims[1], mmDims[2]);
-    }
-
-    // Step 3: GPU per-block minmax compute (if UseGPUMinMax)
-    if (gpuMinMaxReady && mmEnc)
-    {
-      for (auto& block : this->Blocks)
-      {
-        if (!block.Texture) continue;
-
-        id<MTLTexture> blockTex = (__bridge id<MTLTexture>)block.Texture;
-        int bdims[3] = { block.Dims[0], block.Dims[1], block.Dims[2] };
-        int mmDimsL[3] = { block.MinMaxDims[0], block.MinMaxDims[1], block.MinMaxDims[2] };
-
-        id<MTLTexture> mmTex = CreateR8MinMaxTexture(
-          device,
-          mmDimsL[0],
-          mmDimsL[1],
-          mmDimsL[2],
-          MTLStorageModePrivate,
-          MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
-        if (!mmTex) continue;
-        AssignMetalObject(block.MinMaxTexture, mmTex);
-
-        mmu.mmDimX = static_cast<uint32_t>(mmDimsL[0]);
-        mmu.mmDimY = static_cast<uint32_t>(mmDimsL[1]);
-        mmu.mmDimZ = static_cast<uint32_t>(mmDimsL[2]);
-        mmu.volDimX = static_cast<uint32_t>(bdims[0]);
-        mmu.volDimY = static_cast<uint32_t>(bdims[1]);
-        mmu.volDimZ = static_cast<uint32_t>(bdims[2]);
-
-        EncodeGPUMinMaxDilation(
-          mmEnc,
-          device,
-          blockTex,
-          mmTex,
-          bdims,
-          mmDimsL,
-          mmu,
-          (__bridge id<MTLComputePipelineState>)this->MinMaxComputePipeline,
-          (__bridge id<MTLComputePipelineState>)this->DilateComputePipeline);
-      }
-      [mmEnc endEncoding];
-      [mmCmdBuf commit];
-    }
-  }
-  return true;
-}
 
 //------------------------------------------------------------------------------
 bool vtkMetalGPUVolumeRayCastMapper::IsCameraInside(
@@ -4952,25 +3659,12 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         float vertices[24];
         unsigned int indices[36];
 
-        if (!this->Blocks.empty())
-        {
-          // Unit cube [0,1] — the vertex shader scales to each block's model-space bounds.
-          float unitVerts[] = {
-            0,0,0, 1,0,0, 1,1,0, 0,1,0,
-            0,0,1, 1,0,1, 1,1,1, 0,1,1
-          };
-          memcpy(vertices, unitVerts, sizeof(unitVerts));
-        }
-        else
-        {
-          // Unit cube [0,1] for all volume rendering. The vertex shader
-          // scales this to the block's model-space bounds.
-          float unitVerts[] = {
-            0,0,0, 1,0,0, 1,1,0, 0,1,0,
-            0,0,1, 1,0,1, 1,1,1, 0,1,1
-          };
-          memcpy(vertices, unitVerts, sizeof(unitVerts));
-        }
+        // Unit cube [0,1] — the vertex shader scales to each block's model-space bounds.
+        float unitVerts[] = {
+          0,0,0, 1,0,0, 1,1,0, 0,1,0,
+          0,0,1, 1,0,1, 1,1,1, 0,1,1
+        };
+        memcpy(vertices, unitVerts, sizeof(unitVerts));
 
         indices[0] = 0;  indices[1] = 2;  indices[2] = 1;  indices[3] = 0;  indices[4] = 3;  indices[5] = 2;
         indices[6] = 4;  indices[7] = 5;  indices[8] = 6;  indices[9] = 4;  indices[10] = 6; indices[11] = 7;
@@ -5337,24 +4031,6 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     AssignRetainedMetalObject(this->PipelineState, (__bridge id)pso);
     this->CurrentSampleCount = sampleCount;
 
-    void* accumPso = this->GetOrCreateVolumePipeline(mtlDeviceVoid,
-      static_cast<uint32_t>(VolumePipelineType::OffscreenAccumulation),
-      MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, 0);
-    if (!accumPso)
-    {
-      return false;
-    }
-    AssignRetainedMetalObject(this->AccumulationPipelineState, (__bridge id)accumPso);
-
-    void* layerPso = this->GetOrCreateVolumePipeline(mtlDeviceVoid,
-      static_cast<uint32_t>(VolumePipelineType::OffscreenLayer),
-      MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, 0);
-    if (!layerPso)
-    {
-      return false;
-    }
-    AssignRetainedMetalObject(this->LayerPipelineState, (__bridge id)layerPso);
-
     // Pre-create fullscreen camera-inside pipelines (cached in PipelineCache).
     // FullscreenDirect: BGRA + depth + blending, matching DirectScreen.
     void* fsDirectPso = this->GetOrCreateVolumePipeline(mtlDeviceVoid,
@@ -5365,47 +4041,13 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     {
       return false;
     }
-    // FullscreenOffscreen: RGBA16Float, no depth, no blending, matching OffscreenLayer.
+    // FullscreenOffscreen: RGBA16Float, no depth, no blending.
     void* fsOffscreenPso = this->GetOrCreateVolumePipeline(mtlDeviceVoid,
       static_cast<uint32_t>(VolumePipelineType::FullscreenOffscreen),
       MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, 0);
     if (!fsOffscreenPso)
     {
       return false;
-    }
-
-    // Composite pipeline: fullscreen resolve of the 8 layers.
-    if (!this->CompositePipelineState)
-    {
-      MTLRenderPipelineDescriptor* cd = [[MTLRenderPipelineDescriptor alloc] init];
-      id<MTLFunction> cdVert = [library newFunctionWithName:@"vertex_fullscreen_main"];
-      id<MTLFunction> cdFrag = [library newFunctionWithName:@"fragment_layer_composite_main"];
-      cd.vertexFunction = cdVert;
-      cd.fragmentFunction = cdFrag;
-      cd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
-      cd.colorAttachments[0].blendingEnabled = NO;
-      cd.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
-      cd.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-      cd.rasterSampleCount = 1;
-
-      NSError* compError = nil;
-      id<MTLRenderPipelineState> p = [device newRenderPipelineStateWithDescriptor:cd error:&compError];
-      [cd release];
-      [cdVert release];
-      [cdFrag release];
-      if (!p)
-      {
-        vtkErrorMacro(<< "Composite pipeline: " << [[compError localizedDescription] UTF8String]);
-        return false;
-      }
-      // The +1 from new() goes to the cache.  AssignRetainedMetalObject
-      // adds a separate +1 for the member slot.
-      {
-        VolumePipelineKey k = { static_cast<uint32_t>(VolumePipelineType::LayerComposite),
-          MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, 0 };
-        this->PipelineCache[k] = (__bridge void*)p;
-      }
-      AssignRetainedMetalObject(this->CompositePipelineState, p);
     }
   }
 
@@ -5440,10 +4082,6 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
 
   switch (static_cast<VolumePipelineType>(type))
   {
-    case VolumePipelineType::OffscreenAccumulation:
-      fragName = @"fragment_volume_accum_main";
-      useVolumeVertex = true;
-      break;
     case VolumePipelineType::DirectScreen:
     case VolumePipelineType::OffscreenLayer:
       fragName = @"fragment_volume_main";
@@ -5452,14 +4090,6 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     case VolumePipelineType::FullscreenDirect:
     case VolumePipelineType::FullscreenOffscreen:
       fragName = @"fragment_volume_fullscreen_main";
-      useVolumeVertex = false;
-      break;
-    case VolumePipelineType::FullscreenAccumulation:
-      fragName = @"fragment_volume_fullscreen_accum_main";
-      useVolumeVertex = false;
-      break;
-    case VolumePipelineType::LayerComposite:
-      fragName = @"fragment_layer_composite_main";
       useVolumeVertex = false;
       break;
     case VolumePipelineType::ImageSampleBlit:
@@ -5480,10 +4110,8 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
   VolumePipelineType pt = static_cast<VolumePipelineType>(type);
   BOOL hasFeatureConstants = (pt == VolumePipelineType::DirectScreen ||
     pt == VolumePipelineType::OffscreenLayer ||
-    pt == VolumePipelineType::OffscreenAccumulation ||
     pt == VolumePipelineType::FullscreenDirect ||
     pt == VolumePipelineType::FullscreenOffscreen ||
-    pt == VolumePipelineType::FullscreenAccumulation ||
     pt == VolumePipelineType::GridTraversalDirect ||
     pt == VolumePipelineType::GridTraversalOffscreen);
 
@@ -5701,60 +4329,7 @@ void vtkMetalGPUVolumeRayCastMapper::BindGridTraversalTextures(
 }
 
 //------------------------------------------------------------------------------
-void vtkMetalGPUVolumeRayCastMapper::BuildPerBlockData(PerBlockData& pbd,
-  const VolumeBlock& block,
-  const int fullExt[6], const double origin[3], const double spacing[3])
-{
-  pbd.VolumeBoundsMin[0] = static_cast<float>(block.BoundsMin[0]);
-  pbd.VolumeBoundsMin[1] = static_cast<float>(block.BoundsMin[1]);
-  pbd.VolumeBoundsMin[2] = static_cast<float>(block.BoundsMin[2]);
-  pbd.VolumeBoundsMin[3] = 1.0f;
 
-  pbd.VolumeBoundsMax[0] = static_cast<float>(block.BoundsMax[0]);
-  pbd.VolumeBoundsMax[1] = static_cast<float>(block.BoundsMax[1]);
-  pbd.VolumeBoundsMax[2] = static_cast<float>(block.BoundsMax[2]);
-  pbd.VolumeBoundsMax[3] = 1.0f;
-
-  int texExt[6] = {
-    std::max(fullExt[0], static_cast<int>(block.Extents[0] - 1)),
-    std::min(fullExt[1], static_cast<int>(block.Extents[1] + 1)),
-    std::max(fullExt[2], static_cast<int>(block.Extents[2] - 1)),
-    std::min(fullExt[3], static_cast<int>(block.Extents[3] + 1)),
-    std::max(fullExt[4], static_cast<int>(block.Extents[4] - 1)),
-    std::min(fullExt[5], static_cast<int>(block.Extents[5] + 1))
-  };
-
-  pbd.TextureBoundsMin[0] = static_cast<float>(origin[0] + (texExt[0] - 0.5) * spacing[0]);
-  pbd.TextureBoundsMin[1] = static_cast<float>(origin[1] + (texExt[2] - 0.5) * spacing[1]);
-  pbd.TextureBoundsMin[2] = static_cast<float>(origin[2] + (texExt[4] - 0.5) * spacing[2]);
-  pbd.TextureBoundsMin[3] = 1.0f;
-
-  pbd.TextureBoundsMax[0] = static_cast<float>(origin[0] + (texExt[1] + 0.5) * spacing[0]);
-  pbd.TextureBoundsMax[1] = static_cast<float>(origin[1] + (texExt[3] + 0.5) * spacing[1]);
-  pbd.TextureBoundsMax[2] = static_cast<float>(origin[2] + (texExt[5] + 0.5) * spacing[2]);
-  pbd.TextureBoundsMax[3] = 1.0f;
-
-  for (int k = 0; k < 3; ++k)
-    pbd.GradientStep[k] = (block.Dims[k] > 0) ? 1.0f / block.Dims[k] : 1.0f;
-  pbd.GradientStep[3] = 0.0f;
-
-  if (block.MinMaxTexture)
-  {
-    pbd.MinMaxInfo[0] = 1.0f;
-    pbd.MinMaxInfo[1] = static_cast<float>(block.MinMaxDims[0]);
-    pbd.MinMaxInfo[2] = static_cast<float>(block.MinMaxDims[1]);
-    pbd.MinMaxInfo[3] = static_cast<float>(block.MinMaxDims[2]);
-  }
-  else
-  {
-    pbd.MinMaxInfo[0] = 0.0f;
-    pbd.MinMaxInfo[1] = 0.0f;
-    pbd.MinMaxInfo[2] = 0.0f;
-    pbd.MinMaxInfo[3] = 0.0f;
-  }
-}
-
-//------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::BuildPerBlockData(PerBlockData& pbd,
   const VolumeMapperUniforms* uniforms)
 {
@@ -5827,64 +4402,17 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
   VolumeMapperUniforms* uniforms = static_cast<VolumeMapperUniforms*>(uniformsVoid);
   id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;
 
-  vtkImageData* input = vtkImageData::SafeDownCast(this->GetInput());
-  int fullExt[6];
-  input->GetExtent(fullExt);
-  double origin[3], spacing[3];
-  input->GetOrigin(origin);
-  input->GetSpacing(spacing);
+  PerBlockData pbd = {};
+  BuildPerBlockData(pbd, uniforms);
 
-  if (!this->Blocks.empty())
-  {
-    this->SortBlocksBackToFront(ren, vol);
+  [encoder setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
+  [encoder setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
 
-    // NOTE: the old single-draw INSTANCED path was removed. Partitioned volumes
-    // with <= MAX_LAYER_BRICKS bricks are now composited order-independently in
-    // GPURender (per-brick layer textures + per-pixel-sorted composite), which
-    // makes draw order irrelevant. This function is therefore only reached for
-    // the > MAX_LAYER_BRICKS fallback (order-dependent; see "Known limitations"
-    // in GPURender) and never instances.
-
-    // --- FALLBACK PATH (> MAX_LAYER_BRICKS bricks): one draw per brick,
-    //     composited front-to-back via framebuffer fetch. Order-dependent. ---
-    for (size_t bi = 0; bi < this->SortedBlockOrder.size(); ++bi)
-    {
-      int si = this->SortedBlockOrder[bi];
-      auto& block = this->Blocks[si];
-
-      PerBlockData pbd;
-      BuildPerBlockData(pbd, block, fullExt, origin, spacing);
-
-      // Override per-block textures on top of the common textures set by BindEncoderResources
-      SetFragmentTextureOrFallback(encoder, 0, block.Texture, this->DummyVolumeTexture);
-      SetFragmentTextureOrFallback(encoder, 6, block.MinMaxTexture, this->DummyMinMaxTexture);
-      SetFragmentTextureOrFallback(encoder, 7, block.NormalTexture, this->DummyVolumeTexture);
-
-      [encoder setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
-      [encoder setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
-
-      // Draw
-      [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                          indexCount:this->IndexCount
-                           indexType:MTLIndexTypeUInt32
-                         indexBuffer:indexBuf
-                   indexBufferOffset:0];
-    }
-  }
-  else
-  {
-    PerBlockData pbd = {};
-    BuildPerBlockData(pbd, uniforms);
-
-    [encoder setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
-    [encoder setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
-
-    [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                        indexCount:this->IndexCount
-                         indexType:MTLIndexTypeUInt32
-                       indexBuffer:indexBuf
-                 indexBufferOffset:0];
-  }
+  [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                      indexCount:this->IndexCount
+                       indexType:MTLIndexTypeUInt32
+                     indexBuffer:indexBuf
+               indexBufferOffset:0];
 }
 
 //------------------------------------------------------------------------------
@@ -5897,20 +4425,10 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
   id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)uniformBufVoid;
   VolumeMapperUniforms* uniforms = static_cast<VolumeMapperUniforms*>(uniformsVoid);
 
-  vtkImageData* input = vtkImageData::SafeDownCast(this->GetInput());
-  if (!input) return;
-  int fullExt[6];
-  input->GetExtent(fullExt);
-  double origin[3], spacing[3];
-  input->GetOrigin(origin);
-  input->GetSpacing(spacing);
-
-  // Determine pipeline type based on whether this is direct-screen or offscreen.
   uint32_t pipelineType = useDirectPipeline
     ? static_cast<uint32_t>(VolumePipelineType::FullscreenDirect)
     : static_cast<uint32_t>(VolumePipelineType::FullscreenOffscreen);
 
-  // Build feature mask matching the current rendering state.
   int featureMask = 0;
   if (uniforms->UseGradientShading > 0.5f)
     featureMask |= VolumeFeature_Shading;
@@ -5918,13 +4436,12 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
     featureMask |= VolumeFeature_GradientOpacity;
   if (uniforms->UseMask > 0.5f)
     featureMask |= VolumeFeature_Mask;
-  if (uniforms->UseMinMaxAccel > 0.5f || !this->Blocks.empty())
+  if (uniforms->UseMinMaxAccel > 0.5f)
     featureMask |= VolumeFeature_MinMax;
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)
     (static_cast<vtkMetalRenderWindow*>(ren->GetRenderWindow()))->GetMetalDevice();
 
-  // Determine color/depth format for pipeline key.
   uint32_t colorFormat = useDirectPipeline ? MTLPixelFormatBGRA8Unorm : MTLPixelFormatRGBA16Float;
   uint32_t depthFormat = useDirectPipeline ? MTLPixelFormatDepth32Float : MTLPixelFormatInvalid;
   auto* metalRenderWindow = vtkMetalRenderWindow::SafeDownCast(ren->GetRenderWindow());
@@ -5932,53 +4449,21 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
     ? static_cast<uint32_t>(metalRenderWindow ? metalRenderWindow->GetEffectiveSampleCount() : 1)
     : 1;
 
-  // Handle partitioned volumes: sort blocks, render each brick.
-  if (!this->Blocks.empty())
-  {
-    this->SortBlocksBackToFront(ren, vol);
+  void* pso = this->GetOrCreateVolumePipeline(
+    (__bridge void*)device, pipelineType, colorFormat, depthFormat, sampleCount, featureMask);
+  if (!pso) return;
+  [encoder setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)pso];
 
-    for (size_t bi = 0; bi < this->SortedBlockOrder.size(); ++bi)
-    {
-      int si = this->SortedBlockOrder[bi];
-      auto& block = this->Blocks[si];
+  PerBlockData pbd = {};
+  BuildPerBlockData(pbd, uniforms);
 
-      VolumePipelineType pt = useDirectPipeline ? VolumePipelineType::FullscreenDirect
-                                                : VolumePipelineType::FullscreenAccumulation;
-      uint32_t fsType = static_cast<uint32_t>(pt);
+  this->BindFullscreenTextures(encoder, uniformBuf,
+    this->VolumeTexture,
+    this->MinMaxTexture,
+    this->GradientNormalTexture,
+    useDirectPipeline, &pbd, MTLCullModeBack);
 
-      void* pso = this->GetOrCreateVolumePipeline(
-        (__bridge void*)device, fsType, colorFormat, depthFormat, sampleCount, featureMask);
-      if (!pso) continue;
-      [encoder setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)pso];
-
-      PerBlockData pbd;
-      BuildPerBlockData(pbd, block, fullExt, origin, spacing);
-
-      this->BindFullscreenTextures(encoder, uniformBuf,
-        block.Texture, block.MinMaxTexture, block.NormalTexture,
-        useDirectPipeline, &pbd, MTLCullModeBack);
-
-      [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-    }
-  }
-  else
-  {
-    void* pso = this->GetOrCreateVolumePipeline(
-      (__bridge void*)device, pipelineType, colorFormat, depthFormat, sampleCount, featureMask);
-    if (!pso) return;
-    [encoder setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)pso];
-
-    PerBlockData pbd = {};
-    BuildPerBlockData(pbd, uniforms);
-
-    this->BindFullscreenTextures(encoder, uniformBuf,
-      this->VolumeTexture,
-      this->MinMaxTexture,
-      this->GradientNormalTexture,
-      useDirectPipeline, &pbd, MTLCullModeBack);
-
-    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-  }
+  [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 }
 
 //------------------------------------------------------------------------------
@@ -6371,22 +4856,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   // Precomputed gradient normal texture (Phase 4)
   bool hasNormalTexture = (this->GradientNormalTexture != nullptr);
-  if (!hasNormalTexture && !this->Blocks.empty())
-  {
-    for (auto& block : this->Blocks)
-    {
-      if (block.NormalTexture)
-      {
-        hasNormalTexture = true;
-        break;
-      }
-    }
-  }
   uniforms.UseNormalTexture = hasNormalTexture ? 1.0f : 0.0f;
 
   // Build feature mask for shader function constant specialization.
-  // When any feature is actively used at runtime, the corresponding bit is set
-  // so GetOrCreateVolumePipeline selects a PSO compiled with that constant = 1.
   int featureMask = 0;
   if (uniforms.UseGradientShading > 0.5f)
     featureMask |= VolumeFeature_Shading;
@@ -6394,7 +4866,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     featureMask |= VolumeFeature_GradientOpacity;
   if (uniforms.UseMask > 0.5f)
     featureMask |= VolumeFeature_Mask;
-  if (uniforms.UseMinMaxAccel > 0.5f || !this->Blocks.empty())
+  if (uniforms.UseMinMaxAccel > 0.5f)
     featureMask |= VolumeFeature_MinMax;
   if (hasNormalTexture)
     featureMask |= VolumeFeature_NormalTexture;
@@ -6403,7 +4875,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // Force offscreen rendering when blocks are present to enable inter-block
   // opacity propagation via Metal framebuffer fetch ([[color(0)]]).
   const float imageSampleDist = this->ImageSampleDistance;
-  const bool useImageSampling = (imageSampleDist != 1.0f) || !this->Blocks.empty();
+  const bool useImageSampling = (imageSampleDist != 1.0f);
 
   // Viewport size for depth texture UV computation in the shader
   int* winSize = ren->GetSize();
@@ -6526,50 +4998,6 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     id<MTLTexture> offscreenColor =
       (__bridge id<MTLTexture>)this->ImageSampleColorTexture;
 
-    // ============================================================================
-    // ORDER-INDEPENDENT BRICK COMPOSITING (partitioned volumes, <= MAX_LAYER_BRICKS)
-    // ----------------------------------------------------------------------------
-    // Why this exists: the previous compositor (fragment_volume_accum_main / the
-    // old instanced path) folded bricks through a Metal framebuffer fetch in a
-    // single global draw order produced by SortBlocksBackToFront(). That is correct
-    // ONLY when one total front-to-back order is valid for every pixel at once. For
-    // an axis-aligned brick grid that holds while the camera is outside the brick
-    // span on every split axis, but the moment the camera sits between two split
-    // planes on a split axis (typical side/orbit views), pixels in the top and
-    // bottom of the frame traverse the same two bricks in OPPOSITE orders, and no
-    // global sort can satisfy both. The mis-ordered brick then composites a
-    // high-opacity voxel at the cut (the body surface crossing the partition plane)
-    // at full weight instead of attenuated by the true front brick -> a bright ring
-    // that "peeks through", visible only in translucent renders (opaque renders hide
-    // it via early ray termination) and only at the affected angles. No sampling,
-    // slack, or sort-comparator change can fix it, because the requirement is
-    // per-pixel order, which a single draw sequence cannot provide.
-    //
-    // The fix makes compositing order-independent:
-    //   1. Each brick is ray-marched INDEPENDENTLY (fragment_volume_main, no fetch,
-    //      accumulators start at 0) into its own RGBA16Float layer texture
-    //      (texture array slice i). Because each pass writes a different slice,
-    //      draw order is irrelevant.
-    //   2. A final fullscreen pass (fragment_layer_composite_main) reconstructs the
-    //      pixel ray, intersects the <= MAX_LAYER_BRICKS brick boxes to get the TRUE
-    //      per-pixel entry order, and folds the non-empty layers front-to-back with
-    //      premultiplied Porter-Duff over (R += L*(1-R.a)). Because over is
-    //      associative, grouping each brick's samples into one layer and compositing
-    //      the layers in true order is bit-equivalent to a single unpartitioned
-    //      march -- which is why toggling SetPartitions(1,1,1) now matches.
-    // Cost: N+1 passes instead of 1, but the bricks' projected boxes overlap across
-    // the whole silhouette, so the bricks had to serialize at every covered pixel
-    // anyway; the layer path also drops the framebuffer fetch. Net GPU cost is
-    // comparable for <= MAX_LAYER_BRICKS, and we trade a few CPU draw calls for
-    // correctness at all camera angles.
-    // ============================================================================
-    // Count only non-empty blocks (those with a texture) — many blocks may be
-    // skipped as empty space, so total block count is a poor gate for the
-    // order-independent path.
-    int nonEmptyCount = 0;
-    for (auto& block : this->Blocks)
-      if (block.Texture) ++nonEmptyCount;
-
     bool useGridTraversal = (usePartitions && this->VolumeTexture &&
       this->GridTraversalResourcesValid);
 
@@ -6616,155 +5044,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       [gridEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
       [gridEnc endEncoding];
     }
-    else if (!this->Blocks.empty() && nonEmptyCount > 0 &&
-        static_cast<size_t>(nonEmptyCount) <= MAX_LAYER_BRICKS &&
-        this->LayerPipelineState && this->CompositePipelineState)
-    {
-      // Sort is decorative for the order-independent path (composite re-sorts per
-      // pixel in the shader). Only collect non-empty blocks without sorting.
-      this->SortedBlockOrder.clear();
-      this->SortedBlockOrder.reserve(this->Blocks.size());
-      for (size_t idx = 0; idx < this->Blocks.size(); ++idx)
-      {
-        if (this->Blocks[idx].Texture)
-        {
-          this->SortedBlockOrder.push_back(static_cast<int>(idx));
-        }
-      }
-      int neededSlices = static_cast<int>(this->SortedBlockOrder.size());
-      if (!this->EnsureLayerResources(mtlDevice, fboWidth, fboHeight, neededSlices))
-      {
-        return;
-      }
-
-      id<MTLBuffer> indexBuf = (__bridge id<MTLBuffer>)this->IndexBuffer;
-
-      // Get origin and spacing for PerBlockData texture bounds
-      vtkImageData* input = vtkImageData::SafeDownCast(this->GetInput());
-      int fullExt[6];
-      input->GetExtent(fullExt);
-      double origin[3], spacing[3];
-      input->GetOrigin(origin);
-      input->GetSpacing(spacing);
-
-      double* modelBounds = this->ModelBounds;
-      double bsz[3] = {
-        modelBounds[1] - modelBounds[0],
-        modelBounds[3] - modelBounds[2],
-        modelBounds[5] - modelBounds[4]
-      };
-      for (int k = 0; k < 3; ++k)
-        if (bsz[k] < 1e-10) bsz[k] = 1.0;
-
-      // One render pass per brick -> its own layer texture. The brick is marched with
-      // the SAME shader as the on-screen single-block path (fragment_volume_main), so
-      // the per-brick result is exactly that brick's ray segment as one premultiplied
-      // layer (C, a). Bindings mirror BindEncoderResources but slot 0 = this brick's
-      // volume texture and slot 7 = this brick's min-max texture + the NEAREST
-      // min-max sampler (the global min-max is nil in partitioned mode, so do not rely
-      // on BindEncoderResources' slot-7 sampler here).
-      for (size_t bi = 0; bi < this->SortedBlockOrder.size(); ++bi)
-      {
-        int si = this->SortedBlockOrder[bi];
-        auto& block = this->Blocks[si];
-
-        MTLRenderPassDescriptor* lrpd = [MTLRenderPassDescriptor renderPassDescriptor];
-        lrpd.colorAttachments[0].texture = (__bridge id<MTLTexture>)this->LayerTextureArray;
-        lrpd.colorAttachments[0].slice = static_cast<NSUInteger>(bi);
-        lrpd.colorAttachments[0].loadAction = MTLLoadActionClear;
-        lrpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
-        lrpd.colorAttachments[0].storeAction = MTLStoreActionStore;
-        id<MTLRenderCommandEncoder> layerEnc = [commandBuffer renderCommandEncoderWithDescriptor:lrpd];
-        MTLViewport vp = {0, 0, (double)fboWidth, (double)fboHeight, 0.0, 1.0};
-        [layerEnc setViewport:vp];
-
-        PerBlockData pbd;
-        BuildPerBlockData(pbd, block, fullExt, origin, spacing);
-
-        if (cameraInside)
-        {
-          void* fsLayerPso = this->GetOrCreateVolumePipeline(mtlDevice,
-            static_cast<uint32_t>(VolumePipelineType::FullscreenOffscreen),
-            MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, featureMask);
-          [layerEnc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)fsLayerPso];
-          this->BindFullscreenTextures(layerEnc, uniformBuf,
-            block.Texture, block.MinMaxTexture, block.NormalTexture,
-            false, &pbd, MTLCullModeNone);
-          [layerEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-        }
-        else
-        {
-          // Shared bindings (layer pipeline, vertex buf, uniforms, TF/depth/grad/mask/minmax)
-          void* layerPso = this->GetOrCreateVolumePipeline(mtlDevice,
-            static_cast<uint32_t>(VolumePipelineType::OffscreenLayer),
-            MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, featureMask);
-          this->BindEncoderResources(layerEnc, uniformBuf, layerPso, false);
-          // Override the global textures BindEncoderResources set with per-block textures
-          SetFragmentTextureOrFallback(layerEnc, 0, block.Texture, this->DummyVolumeTexture);
-          SetFragmentTextureOrFallback(layerEnc, 6, block.MinMaxTexture, this->DummyMinMaxTexture);
-          SetFragmentTextureOrFallback(layerEnc, 7, block.NormalTexture, this->DummyVolumeTexture);
-
-          [layerEnc setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
-          [layerEnc setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
-
-          [layerEnc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                               indexCount:this->IndexCount
-                                indexType:MTLIndexTypeUInt32
-                              indexBuffer:indexBuf
-                        indexBufferOffset:0];
-        }
-        [layerEnc endEncoding];
-      }
-
-      // Composite pass: read the <= MAX_LAYER_BRICKS layers and fold them in TRUE
-      // per-pixel depth order (reconstructed ray vs. each brick box). The insertion
-      // sort is over <= MAX_LAYER_BRICKS items, so it is free. lc.BlockMin/Max are the
-      // bricks' bounds in global [0,1] space -- the SAME convention the brick shaders
-      // use for blockMinGlobal/blockMaxGlobal, so the entry params line up.
-      //
-      // LANDMINE: the ray reconstructed below (the inverseViewProjection unproject at
-      // z=0 and z=1, the -ndc.y flip, and the (worldToVolume - boundsMin)/boundsSize
-      // affine) MUST stay in lockstep with the brick shaders' ray setup
-      // (rayDir = normalize(localPos - cameraVolumePos), localPos in [0,1]). If anyone
-      // changes the brick vertex/fragment ray convention, update this reconstruction
-      // too, or the per-pixel order will silently disagree with the march and the
-      // seam will return.
-      LayerCompositeUniforms lc = {};
-      for (size_t bi = 0; bi < this->SortedBlockOrder.size(); ++bi)
-      {
-        auto& block = this->Blocks[this->SortedBlockOrder[bi]];
-        for (int k = 0; k < 3; ++k)
-        {
-          lc.BlockMin[bi][k] = static_cast<float>((block.BoundsMin[k] - modelBounds[2 * k]) / bsz[k]);
-          lc.BlockMax[bi][k] = static_cast<float>((block.BoundsMax[k] - modelBounds[2 * k]) / bsz[k]);
-        }
-        lc.BlockMin[bi][3] = 0.0f;
-        lc.BlockMax[bi][3] = 0.0f;
-      }
-      lc.Params[0] = static_cast<float>(this->SortedBlockOrder.size());
-
-      MTLRenderPassDescriptor* crpd = [MTLRenderPassDescriptor renderPassDescriptor];
-      crpd.colorAttachments[0].texture = offscreenColor;
-      crpd.colorAttachments[0].loadAction = MTLLoadActionClear;
-      crpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
-      crpd.colorAttachments[0].storeAction = MTLStoreActionStore;
-      id<MTLRenderCommandEncoder> compEnc = [commandBuffer renderCommandEncoderWithDescriptor:crpd];
-      [compEnc setViewport:(MTLViewport){0, 0, (double)fboWidth, (double)fboHeight, 0.0, 1.0}];
-      [compEnc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)this->CompositePipelineState];
-      [compEnc setCullMode:MTLCullModeNone];
-      [compEnc setFragmentBuffer:uniformBuf offset:0 atIndex:1];
-      [compEnc setFragmentBytes:&lc length:sizeof(lc) atIndex:2];
-
-      [compEnc setFragmentTexture:(__bridge id<MTLTexture>)this->LayerTextureArray atIndex:0];
-
-      [compEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-      [compEnc endEncoding];
-    }
     else
     {
-      // --- ORDER-DEPENDENT PATH: single-block volumes, or partitioned volumes
-      //     with > MAX_LAYER_BRICKS bricks (the layer composite is capped at
-      //     MAX_LAYER_BRICKS; see "Known limitations"). ---
       MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
       rpd.colorAttachments[0].texture = offscreenColor;
       rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -6784,21 +5065,15 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       metalViewport.zfar = 1.0;
       [offscreenEncoder setViewport:metalViewport];
 
-      // --- ORDER-DEPENDENT PATH: single-block volumes, or partitioned volumes
-      //     with > MAX_LAYER_BRICKS bricks (the layer composite is capped at
-      //     MAX_LAYER_BRICKS; see "Known limitations"). ---
-      bool useAccumulation = !this->Blocks.empty(); // true only for the >8-brick case here
       if (cameraInside)
       {
-        // Use fullscreen ray-cast path — no proxy geometry needed.
         this->DrawBlocksFullscreen(offscreenEncoder, uniformBuf, ren, vol,
           &uniforms, invModelMatrix, false);
       }
       else
       {
         void* activePipeline = this->GetOrCreateVolumePipeline(mtlDevice,
-          static_cast<uint32_t>(useAccumulation ? VolumePipelineType::OffscreenAccumulation
-                                                : VolumePipelineType::OffscreenLayer),
+          static_cast<uint32_t>(VolumePipelineType::OffscreenLayer),
           MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, featureMask);
         this->BindEncoderResources(offscreenEncoder, uniformBuf, activePipeline, false);
 
@@ -6888,51 +5163,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 }
 
 // ============================================================================
-// KNOWN LIMITATIONS & FUTURE WORK (partitioned volume rendering)
-// ----------------------------------------------------------------------------
-// 1. BRICK CAP. The order-independent composite reads from a texture array
-//    (layers[0..7]) and LayerCompositeUniforms holds [8] bounds, so the fix
-//    covers <= MAX_LAYER_BRICKS bricks only. Volumes with more partitions fall
-//    through to the order-DEPENDENT accumulation path (fragment_volume_accum_main)
-//    and WILL show the boundary seam at some camera angles. To lift the cap,
-//    either (a) bind the layers as a texture array and loop the composite over a
-//    uniform count (Metal needs the array size at compile time, so pick a new
-//    higher cap), or (b) composite in log2(N) pairwise fullscreen passes, or
-//    (c) switch to a k-buffer / weighted-blended OIT (see #4). Do NOT delete
-//    fragment_volume_accum_main / AccumulationPipelineState until this is done --
-//    they are the only correct-ish path for > MAX_LAYER_BRICKS today.
-//
-// 2. SILHOUETTE "TABS" (cosmetic, flat/label-map views only). Each brick's proxy
-//    box is its own AABB, so a curved body outline jaggles at brick boundaries in
-//    opaque renders. It is invisible in translucent renders and unrelated to the
-//    seam. Cheap fix: drive every brick's VERTEX box from the FULL volume bounds
-//    (one smooth silhouette) and let the fragment window the ray to its brick via
-//    tStart/t.y (the march already does this). Requires the vertex stage to read
-//    full bounds while the fragment reads per-brick bounds, so do not reuse the
-//    same PerBlockData field for both.
-//
-// 3. FAINT 1-VOXEL LINE AT INTERNAL CUTS (optional polish). fragment_volume_main
-//    still carries the +/-1e-4 boundary slacks. In the old fetch chain these were
-//    largely masked; with separate layers they can double-deposit the plane voxel
-//    once (front brick's +1e-4 and back brick's -1e-4 entry both touch it),
-//    showing as a thin, angle-INDEPENDENT line -- much fainter than the old ring.
-//    Only fix if you actually see it: make the boundary half-open in the layer
-//    path (break on currentT >= t.y at the brick exit, drop the -1e-4 entry bias),
-//    applied to INTERNAL faces only (pass a per-brick "which faces are internal"
-//    flag so the outer silhouette keeps its slack). Leave the on-screen single-
-//    block path's slacks untouched.
-//
-// 4. MEMORY ALTERNATIVE. 8x RGBA16Float fullscreen layers at high resolution is
-//    the main cost of this fix. If that matters, weighted-blended OIT (two
-//    additive accumulators + a final normalize) is order-independent with O(1)
-//    storage and no sort, at the price of the usual WBOIT banding on thin/over-
-//    lapping high-alpha features. The current per-layer approach is exact, which
-//    is why it was chosen; WBOIT is the fallback if memory wins.
-//
-// 5. SORT IS NOW DECORATIVE. SortBlocksBackToFront no longer affects correctness
-//    on this path (the composite re-sorts per pixel); it only fixes which brick
-//    lands in which layer slot. Safe to replace with a plain collect-non-empty
-//    loop if you want one less camera-dependent branch.
-// ============================================================================
+// Partitioned volumes are rendered using single-pass grid traversal.
+// The occupancy grid marks empty brick regions. Per-brick textures, sorting,
+// layer compositing, and framebuffer-fetch accumulation are no longer used.
 
 VTK_ABI_NAMESPACE_END
