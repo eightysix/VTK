@@ -32,6 +32,13 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <Accelerate/Accelerate.h>
+
+#if __has_include(<MetalFX/MetalFX.h>)
+#import <MetalFX/MetalFX.h>
+#define VTK_HAS_METALFX 1
+#else
+#define VTK_HAS_METALFX 0
+#endif
 #import <simd/simd.h>
 
 #include <algorithm>
@@ -160,6 +167,15 @@ struct GridTraversalUniforms {
 };
 static_assert(sizeof(GridTraversalUniforms) == 16,
   "GridTraversalUniforms must be 16 bytes to match Metal shader struct");
+
+// Must match Metal TemporalUniforms struct
+struct TemporalUniforms
+{
+  float PreviousViewProjection[16]; // 0..63
+  float Params[4];                  // 64..79: inputW, inputH, jitterX, jitterY
+};
+static_assert(sizeof(TemporalUniforms) == 80,
+  "TemporalUniforms must be 80 bytes to match Metal shader struct");
 
 // Must match Metal VolumeConvertUniforms struct (Phase 7: GPU data type conversion)
 struct VolumeConvertUniforms {
@@ -525,6 +541,20 @@ static VolumeFormat ChooseVolumeFormat(
   }
 
   return fmt;
+}
+
+inline float Halton(int index, int base)
+{
+  float result = 0.0f;
+  float f = 1.0f;
+  int i = index;
+  while (i > 0)
+  {
+    f /= static_cast<float>(base);
+    result += f * static_cast<float>(i % base);
+    i /= base;
+  }
+  return result;
 }
 
 // Release a Metal object held as a void* member (MRC helper).
@@ -1272,6 +1302,28 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseImageSampleResources()
 }
 
 //------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::ReleaseMetalFXResources()
+{
+  ReleaseMetalObject(this->TemporalScaler);
+  ReleaseMetalObject(this->SpatialScaler);
+  ReleaseMetalObject(this->MetalFXOutputTexture);
+  ReleaseMetalObject(this->VelocityTexture);
+  ReleaseMetalObject(this->VolumeDepthTexture);
+  ReleaseMetalObject(this->TemporalUniformBuffer);
+  ReleaseMetalObject(this->TemporalDepthStencilState);
+  this->MetalFXSupported = false;
+  this->MetalFXChecked = false;
+  this->MetalFXHistoryValid = false;
+  this->HasPreviousViewProjection = false;
+  this->MetalFXInputW = 0;
+  this->MetalFXInputH = 0;
+  this->MetalFXOutputW = 0;
+  this->MetalFXOutputH = 0;
+  this->CachedVelocityUsage = 0;
+  this->CachedDepthUsage = 0;
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::ReleaseGridTraversalResources()
 {
   ReleaseMetalObject(this->OccupancyGridTexture);
@@ -1866,6 +1918,7 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureGradientNormalTexture(
 void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotUsed(window))
 {
   this->ReleaseImageSampleResources();
+  this->ReleaseMetalFXResources();
 
   ReleaseMetalObject(this->PipelineState);
   ReleaseMetalObject(this->VolumeTexture);
@@ -4077,6 +4130,29 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     {
       return false;
     }
+
+    // Phase 8: Pre-warm temporal upscaling pipelines.
+    void* gridTemporalPso = this->GetOrCreateVolumePipeline(mtlDeviceVoid,
+      static_cast<uint32_t>(VolumePipelineType::GridTraversalOffscreenTemporal),
+      MTLPixelFormatRGBA16Float, MTLPixelFormatDepth32Float, 1, 0);
+    if (!gridTemporalPso)
+    {
+      return false;
+    }
+    void* fsTemporalPso = this->GetOrCreateVolumePipeline(mtlDeviceVoid,
+      static_cast<uint32_t>(VolumePipelineType::FullscreenOffscreenTemporal),
+      MTLPixelFormatRGBA16Float, MTLPixelFormatDepth32Float, 1, 0);
+    if (!fsTemporalPso)
+    {
+      return false;
+    }
+    void* offscreenLayerTemporalPso = this->GetOrCreateVolumePipeline(mtlDeviceVoid,
+      static_cast<uint32_t>(VolumePipelineType::OffscreenLayerTemporal),
+      MTLPixelFormatRGBA16Float, MTLPixelFormatDepth32Float, 1, 0);
+    if (!offscreenLayerTemporalPso)
+    {
+      return false;
+    }
   }
 
   return true;
@@ -4129,6 +4205,18 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
       fragName = @"fragment_volume_grid_traversal_main";
       useVolumeVertex = false;
       break;
+    case VolumePipelineType::GridTraversalOffscreenTemporal:
+      fragName = @"fragment_volume_grid_traversal_temporal_main";
+      useVolumeVertex = false;
+      break;
+    case VolumePipelineType::FullscreenOffscreenTemporal:
+      fragName = @"fragment_volume_fullscreen_temporal_main";
+      useVolumeVertex = false;
+      break;
+    case VolumePipelineType::OffscreenLayerTemporal:
+      fragName = @"fragment_volume_temporal_main";
+      useVolumeVertex = true;
+      break;
   }
 
   // Create function constants for shader specialization.
@@ -4141,7 +4229,10 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     pt == VolumePipelineType::FullscreenDirect ||
     pt == VolumePipelineType::FullscreenOffscreen ||
     pt == VolumePipelineType::GridTraversalDirect ||
-    pt == VolumePipelineType::GridTraversalOffscreen);
+    pt == VolumePipelineType::GridTraversalOffscreen ||
+    pt == VolumePipelineType::GridTraversalOffscreenTemporal ||
+    pt == VolumePipelineType::FullscreenOffscreenTemporal ||
+    pt == VolumePipelineType::OffscreenLayerTemporal);
 
   if (hasFeatureConstants)
   {
@@ -4211,6 +4302,16 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
   }
 
   pipelineDesc.colorAttachments[0].pixelFormat = (MTLPixelFormat)colorFormat;
+
+  // Temporal pipelines: color[0] = RGBA16F, color[1] = RG16F (velocity), depth = D32F
+  if (pt == VolumePipelineType::GridTraversalOffscreenTemporal ||
+      pt == VolumePipelineType::FullscreenOffscreenTemporal ||
+      pt == VolumePipelineType::OffscreenLayerTemporal)
+  {
+    pipelineDesc.colorAttachments[0].blendingEnabled = NO;
+    pipelineDesc.colorAttachments[1].pixelFormat = MTLPixelFormatRG16Float;
+    pipelineDesc.colorAttachments[1].blendingEnabled = NO;
+  }
 
   // DirectScreen and FullscreenDirect use blending; offscreen pipelines do not.
   if (pt == VolumePipelineType::DirectScreen || pt == VolumePipelineType::FullscreenDirect ||
@@ -4495,6 +4596,307 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
     useDirectPipeline, &pbd, MTLCullModeBack);
 
   [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+}
+
+// ============================================================================
+// Phase 8: MetalFX Temporal Upscaling
+// ============================================================================
+
+//------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::InvalidateMetalFXHistory()
+{
+  this->MetalFXHistoryValid = false;
+  this->MetalFXHistoryTime.Modified();
+}
+
+//------------------------------------------------------------------------------
+bool vtkMetalGPUVolumeRayCastMapper::ShouldResetMetalFXHistory()
+{
+  if (!this->MetalFXHistoryValid)
+    return true;
+
+  vtkMTimeType histTime = this->MetalFXHistoryTime.GetMTime();
+
+  if (this->VolumeUploadTime.GetMTime() > histTime) return true;
+  if (this->TransferFunctionUploadTime.GetMTime() > histTime) return true;
+  if (this->GradientOpacityUploadTime.GetMTime() > histTime) return true;
+  if (this->MaskUpdateTime.GetMTime() > histTime) return true;
+  if (this->MinMaxUploadTime.GetMTime() > histTime) return true;
+  if (this->NormalTextureTime.GetMTime() > histTime) return true;
+  if (this->GridTraversalUploadTime.GetMTime() > histTime) return true;
+
+  return false;
+}
+
+//------------------------------------------------------------------------------
+bool vtkMetalGPUVolumeRayCastMapper::EnsureMetalFXScaler(
+  void* deviceVoid, int inputW, int inputH, int outputW, int outputH)
+{
+#if VTK_HAS_METALFX
+  if (@available(macOS 13.0, iOS 16.0, *))
+  {
+    if (inputW <= 0 || inputH <= 0 || outputW <= 0 || outputH <= 0)
+    {
+      return false;
+    }
+
+    id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
+
+    if (this->TemporalScaler &&
+        this->MetalFXInputW == inputW &&
+        this->MetalFXInputH == inputH &&
+        this->MetalFXOutputW == outputW &&
+        this->MetalFXOutputH == outputH)
+    {
+      return true;
+    }
+
+    ReleaseMetalObject(this->TemporalScaler);
+    ReleaseMetalObject(this->SpatialScaler);
+    ReleaseMetalObject(this->MetalFXOutputTexture);
+
+    this->MetalFXSupported = false;
+
+    // Use BGRA8Unorm for output to reduce memory (4 bytes/pixel vs 8 for RGBA16Float).
+    // The blit pipeline targets BGRA8Unorm, so no extra conversion cost.
+    MTLPixelFormat outputFormat = MTLPixelFormatBGRA8Unorm;
+
+    bool temporalSupported =
+      !this->ForceMetalFXSpatial &&
+      [MTLFXTemporalScalerDescriptor supportsDevice:device];
+
+    if (!temporalSupported)
+    {
+      if ([MTLFXSpatialScalerDescriptor supportsDevice:device])
+      {
+        MTLFXSpatialScalerDescriptor* desc = [[MTLFXSpatialScalerDescriptor alloc] init];
+        desc.colorTextureFormat = MTLPixelFormatRGBA16Float;
+        desc.outputTextureFormat = outputFormat;
+        desc.inputWidth = inputW;
+        desc.inputHeight = inputH;
+        desc.outputWidth = outputW;
+        desc.outputHeight = outputH;
+        desc.colorProcessingMode = MTLFXSpatialScalerColorProcessingModeLinear;
+
+        id<MTLFXSpatialScaler> scaler = [desc newSpatialScalerWithDevice:device];
+        [desc release];
+        if (scaler)
+        {
+          AssignMetalObject(this->SpatialScaler, scaler);
+          this->MetalFXSupported = true;
+        }
+      }
+    }
+    else
+    {
+      MTLFXTemporalScalerDescriptor* desc = [[MTLFXTemporalScalerDescriptor alloc] init];
+      desc.colorTextureFormat = MTLPixelFormatRGBA16Float;
+      desc.depthTextureFormat = MTLPixelFormatDepth32Float;
+      desc.motionTextureFormat = MTLPixelFormatRG16Float;
+      desc.outputTextureFormat = outputFormat;
+      desc.inputWidth = inputW;
+      desc.inputHeight = inputH;
+      desc.outputWidth = outputW;
+      desc.outputHeight = outputH;
+      desc.autoExposureEnabled = NO;
+
+      id<MTLFXTemporalScaler> scaler = [desc newTemporalScalerWithDevice:device];
+      [desc release];
+
+      if (scaler)
+      {
+        scaler.preExposure = 1.0f;
+        AssignMetalObject(this->TemporalScaler, scaler);
+        this->MetalFXSupported = true;
+        this->MetalFXHistoryValid = false;
+      }
+    }
+
+    if (this->MetalFXSupported)
+    {
+      MTLTextureUsage outputUsage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
+      if (this->TemporalScaler)
+      {
+        outputUsage = ((__bridge id<MTLFXTemporalScaler>)this->TemporalScaler).outputTextureUsage;
+        outputUsage |= MTLTextureUsageShaderRead;
+      }
+      else if (this->SpatialScaler)
+      {
+        outputUsage = ((__bridge id<MTLFXSpatialScaler>)this->SpatialScaler).outputTextureUsage;
+        outputUsage |= MTLTextureUsageShaderRead;
+      }
+
+      id<MTLTexture> outTex = NewTexture2D(
+        device,
+        outputFormat,
+        outputW, outputH,
+        outputUsage,
+        MTLStorageModePrivate);
+
+      if (!outTex)
+      {
+        vtkErrorMacro("Failed to create MetalFX output texture");
+        this->MetalFXSupported = false;
+        return false;
+      }
+      AssignMetalObject(this->MetalFXOutputTexture, outTex);
+
+      this->MetalFXInputW = inputW;
+      this->MetalFXInputH = inputH;
+      this->MetalFXOutputW = outputW;
+      this->MetalFXOutputH = outputH;
+    }
+
+    return this->MetalFXSupported;
+  }
+#endif
+  return false;
+}
+
+//------------------------------------------------------------------------------
+bool vtkMetalGPUVolumeRayCastMapper::EnsureTemporalInputTextures(
+  void* deviceVoid, int width, int height)
+{
+#if VTK_HAS_METALFX
+  if (@available(macOS 13.0, iOS 16.0, *))
+  {
+    if (width <= 0 || height <= 0)
+    {
+      return false;
+    }
+
+    id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
+
+    // Compute required usage flags from the scaler (may be nil on first call)
+    MTLTextureUsage velUsage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    MTLTextureUsage depUsage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    if (this->TemporalScaler)
+    {
+      id<MTLFXTemporalScaler> scaler = (__bridge id<MTLFXTemporalScaler>)this->TemporalScaler;
+      velUsage |= scaler.motionTextureUsage;
+      depUsage |= scaler.depthTextureUsage;
+    }
+
+    id<MTLTexture> velTex = (__bridge id<MTLTexture>)this->VelocityTexture;
+    id<MTLTexture> depTex = (__bridge id<MTLTexture>)this->VolumeDepthTexture;
+    if (velTex && depTex &&
+        static_cast<int>(velTex.width) == width &&
+        static_cast<int>(velTex.height) == height &&
+        static_cast<int>(depTex.width) == width &&
+        static_cast<int>(depTex.height) == height &&
+        this->CachedVelocityUsage == static_cast<uint32_t>(velUsage) &&
+        this->CachedDepthUsage == static_cast<uint32_t>(depUsage))
+    {
+      return true;
+    }
+
+    ReleaseMetalObject(this->VelocityTexture);
+    ReleaseMetalObject(this->VolumeDepthTexture);
+
+    id<MTLTexture> newVelTex = NewTexture2D(
+      device, MTLPixelFormatRG16Float, width, height,
+      velUsage, MTLStorageModePrivate);
+    if (!newVelTex)
+    {
+      vtkErrorMacro("Failed to create velocity texture");
+      return false;
+    }
+    AssignMetalObject(this->VelocityTexture, newVelTex);
+    this->CachedVelocityUsage = static_cast<uint32_t>(velUsage);
+
+    MTLTextureDescriptor* depDesc = [[MTLTextureDescriptor alloc] init];
+    depDesc.textureType = MTLTextureType2D;
+    depDesc.pixelFormat = MTLPixelFormatDepth32Float;
+    depDesc.width = width;
+    depDesc.height = height;
+    depDesc.mipmapLevelCount = 1;
+    depDesc.usage = depUsage;
+    depDesc.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> newDepTex = [device newTextureWithDescriptor:depDesc];
+    [depDesc release];
+    if (!newDepTex)
+    {
+      vtkErrorMacro("Failed to create volume depth texture");
+      return false;
+    }
+    AssignMetalObject(this->VolumeDepthTexture, newDepTex);
+    this->CachedDepthUsage = static_cast<uint32_t>(depUsage);
+
+    return true;
+  }
+#endif
+  return false;
+}
+
+//------------------------------------------------------------------------------
+void* vtkMetalGPUVolumeRayCastMapper::EncodeMetalFXUpscale(
+  void* commandBufferVoid, int outputWidth, int outputHeight)
+{
+#if VTK_HAS_METALFX
+  if (@available(macOS 13.0, iOS 16.0, *))
+  {
+    if (!this->ImageSampleColorTexture || !this->MetalFXSupported)
+    {
+      return nullptr;
+    }
+
+    if (!this->EnsureMetalFXScaler(
+          this->CachedMetalDevice,
+          this->ImageSampleFBOWidth, this->ImageSampleFBOHeight,
+          outputWidth, outputHeight))
+    {
+      return nullptr;
+    }
+
+    id<MTLCommandBuffer> cmdBuf = (__bridge id<MTLCommandBuffer>)commandBufferVoid;
+    id<MTLTexture> colorTex = (__bridge id<MTLTexture>)this->ImageSampleColorTexture;
+    id<MTLTexture> outTex = (__bridge id<MTLTexture>)this->MetalFXOutputTexture;
+
+    if (this->TemporalScaler && this->VelocityTexture && this->VolumeDepthTexture)
+    {
+      id<MTLFXTemporalScaler> scaler = (__bridge id<MTLFXTemporalScaler>)this->TemporalScaler;
+
+      scaler.colorTexture = colorTex;
+      scaler.depthTexture = (__bridge id<MTLTexture>)this->VolumeDepthTexture;
+      scaler.motionTexture = (__bridge id<MTLTexture>)this->VelocityTexture;
+      scaler.outputTexture = outTex;
+
+      scaler.jitterOffsetX = this->JitterX;
+      scaler.jitterOffsetY = this->JitterY;
+
+      scaler.motionVectorScaleX = 1.0f;
+      scaler.motionVectorScaleY = 1.0f;
+
+      scaler.depthReversed = NO;
+
+      scaler.preExposure = 1.0f;
+
+      if (this->ShouldResetMetalFXHistory())
+      {
+        scaler.reset = YES;
+        this->MetalFXHistoryValid = false;
+      }
+      else
+      {
+        scaler.reset = NO;
+      }
+
+      [scaler encodeToCommandBuffer:cmdBuf];
+      this->MetalFXHistoryValid = true;
+      this->MetalFXHistoryTime.Modified();
+      return this->MetalFXOutputTexture;
+    }
+    else if (this->SpatialScaler)
+    {
+      id<MTLFXSpatialScaler> scaler = (__bridge id<MTLFXSpatialScaler>)this->SpatialScaler;
+      scaler.colorTexture = colorTex;
+      scaler.outputTexture = outTex;
+      [scaler encodeToCommandBuffer:cmdBuf];
+      return this->MetalFXOutputTexture;
+    }
+  }
+#endif
+  return nullptr;
 }
 
 //------------------------------------------------------------------------------
@@ -4903,6 +5305,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   const float imageSampleDist = this->ImageSampleDistance;
   const bool useImageSampling = (imageSampleDist != 1.0f);
 
+  // Phase 8: MetalFX temporal upscaling
+  bool metalFXActive = this->UseMetalFXTemporal && useImageSampling;
+
+  // Temporal variants are distinguished by pipeline type, not feature mask.
+
   // Viewport size for depth texture UV computation in the shader
   int* winSize = ren->GetSize();
   int renderWidth = winSize[0];
@@ -4920,19 +5327,28 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // computing it from vtkCamera::GetViewTransformMatrix /
   // GetProjectionTransformMatrix so the mapper stays functional even if the
   // camera override is not in place.
+  // Phase 8: Temporal jitter is applied to the projection matrix before VP multiply
+  // (not after), which produces correct reprojection for MetalFX motion vectors.
   vtkMetalCamera* metalCamera = vtkMetalCamera::SafeDownCast(ren->GetActiveCamera());
   if (metalCamera)
   {
     const float* sceneData = static_cast<const float*>(metalCamera->GetCachedSceneTransforms());
     const float* V = sceneData;         // ViewMatrix at offset 0
     const float* P = sceneData + 16;    // ProjectionMatrix at offset 64 (16 floats)
+    float Pj[16];
+    memcpy(Pj, P, sizeof(Pj));
+    if (metalFXActive)
+    {
+      Pj[8] += 2.0f * this->JitterX / static_cast<float>(renderWidth);
+      Pj[9] -= 2.0f * this->JitterY / static_cast<float>(renderHeight);
+    }
     for (int c = 0; c < 4; ++c)
     {
       for (int r = 0; r < 4; ++r)
       {
-        uniforms.ViewProjectionMatrix[c * 4 + r] = P[0 * 4 + r] * V[c * 4 + 0] +
-          P[1 * 4 + r] * V[c * 4 + 1] + P[2 * 4 + r] * V[c * 4 + 2] +
-          P[3 * 4 + r] * V[c * 4 + 3];
+        uniforms.ViewProjectionMatrix[c * 4 + r] = Pj[0 * 4 + r] * V[c * 4 + 0] +
+          Pj[1 * 4 + r] * V[c * 4 + 1] + Pj[2 * 4 + r] * V[c * 4 + 2] +
+          Pj[3 * 4 + r] * V[c * 4 + 3];
       }
     }
   }
@@ -4945,6 +5361,15 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     double aspect = (size[1] > 0) ? static_cast<double>(size[0]) / size[1] : 1.0;
     vtkMatrix4x4* V4 = cam->GetViewTransformMatrix();
     vtkMatrix4x4* P4 = cam->GetProjectionTransformMatrix(aspect, 0.0, 1.0);
+    vtkNew<vtkMatrix4x4> Pj;
+    Pj->DeepCopy(P4);
+    if (metalFXActive)
+    {
+      Pj->SetElement(0, 2, Pj->GetElement(0, 2) +
+        2.0 * this->JitterX / static_cast<float>(renderWidth));
+      Pj->SetElement(1, 2, Pj->GetElement(1, 2) -
+        2.0 * this->JitterY / static_cast<float>(renderHeight));
+    }
     // Compute P*V column-major (Metal convention: column vectors)
     for (int c = 0; c < 4; ++c)
     {
@@ -4952,7 +5377,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       {
         float sum = 0.0f;
         for (int k = 0; k < 4; ++k)
-          sum += static_cast<float>(P4->GetElement(r, k)) *
+          sum += static_cast<float>(Pj->GetElement(r, k)) *
                  static_cast<float>(V4->GetElement(k, c));
         uniforms.ViewProjectionMatrix[c * 4 + r] = sum;
       }
@@ -4973,6 +5398,38 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     else
     {
       memset(uniforms.InverseViewProjection, 0, sizeof(uniforms.InverseViewProjection));
+    }
+  }
+
+  // Phase 8: MetalFX temporal upscaling — jitter + previous VP for motion vectors
+  if (metalFXActive)
+  {
+    // Disable stochastic ray-start jitter — projection jitter is the correct
+    // source for temporal upscaling; ray jitter causes shimmering and ghosting.
+    uniforms.UseJittering = 0.0f;
+
+    const int seqLen = 8;
+    int idx = (this->TemporalFrameIndex % seqLen) + 1;
+    this->JitterX = (Halton(idx, 2) - 0.5f);
+    this->JitterY = (Halton(idx, 3) - 0.5f);
+    this->TemporalFrameIndex++;
+
+    {
+      simd_float4x4 vpMat;
+      memcpy(&vpMat, uniforms.ViewProjectionMatrix, sizeof(vpMat));
+      float det = simd::determinant(vpMat);
+      if (fabs(det) > 1e-10f)
+      {
+        simd_float4x4 invVP = simd::inverse(vpMat);
+        memcpy(uniforms.InverseViewProjection, &invVP, sizeof(invVP));
+      }
+    }
+
+    if (!this->HasPreviousViewProjection)
+    {
+      memcpy(this->PreviousViewProjection, uniforms.ViewProjectionMatrix, 64);
+      this->HasPreviousViewProjection = true;
+      this->InvalidateMetalFXHistory();
     }
   }
 
@@ -5024,6 +5481,63 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     id<MTLTexture> offscreenColor =
       (__bridge id<MTLTexture>)this->ImageSampleColorTexture;
 
+    // Phase 8: Set up MetalFX temporal resources.
+    // Order: scaler first (to get required usage flags), then temporal textures.
+    // Gate on actual scaler support — fall back to non-temporal path if unsupported.
+    if (metalFXActive)
+    {
+      int outW = winSize[0];
+      int outH = winSize[1];
+
+      if (outW <= 0 || outH <= 0 || fboWidth <= 0 || fboHeight <= 0)
+      {
+        metalFXActive = false;
+      }
+      else
+      {
+        this->CachedMetalDevice = mtlDevice;
+
+        if (!this->EnsureMetalFXScaler(mtlDevice, fboWidth, fboHeight, outW, outH))
+        {
+          metalFXActive = false;
+        }
+        else if (!this->EnsureTemporalInputTextures(mtlDevice, fboWidth, fboHeight))
+        {
+          metalFXActive = false;
+        }
+      }
+    }
+
+    if (metalFXActive)
+    {
+      // Create temporal depth-stencil state with depth write enabled
+      if (!this->TemporalDepthStencilState)
+      {
+        MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
+        dsDesc.depthCompareFunction = MTLCompareFunctionAlways;
+        dsDesc.depthWriteEnabled = YES;
+        id<MTLDepthStencilState> ds = [device newDepthStencilStateWithDescriptor:dsDesc];
+        [dsDesc release];
+        AssignMetalObject(this->TemporalDepthStencilState, ds);
+      }
+
+      if (!this->TemporalUniformBuffer)
+      {
+        id<MTLBuffer> tBuf = [device newBufferWithLength:sizeof(TemporalUniforms)
+                                                options:MTLResourceStorageModeShared];
+        AssignMetalObject(this->TemporalUniformBuffer, tBuf);
+      }
+
+      TemporalUniforms temporalU;
+      memcpy(temporalU.PreviousViewProjection, this->PreviousViewProjection, 64);
+      temporalU.Params[0] = static_cast<float>(fboWidth);
+      temporalU.Params[1] = static_cast<float>(fboHeight);
+      temporalU.Params[2] = this->JitterX;
+      temporalU.Params[3] = this->JitterY;
+      memcpy([(__bridge id<MTLBuffer>)this->TemporalUniformBuffer contents],
+             &temporalU, sizeof(temporalU));
+    }
+
     // Prefer grid traversal for partitioned volumes. If resources are
     // unavailable, fall back to rendering the global volume as a single
     // block (slower but avoids a hard failure).
@@ -5041,6 +5555,19 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
       rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
 
+      if (metalFXActive && this->VelocityTexture && this->VolumeDepthTexture)
+      {
+        rpd.colorAttachments[1].texture = (__bridge id<MTLTexture>)this->VelocityTexture;
+        rpd.colorAttachments[1].loadAction = MTLLoadActionClear;
+        rpd.colorAttachments[1].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+        rpd.colorAttachments[1].storeAction = MTLStoreActionStore;
+
+        rpd.depthAttachment.texture = (__bridge id<MTLTexture>)this->VolumeDepthTexture;
+        rpd.depthAttachment.loadAction = MTLLoadActionClear;
+        rpd.depthAttachment.clearDepth = 1.0;
+        rpd.depthAttachment.storeAction = MTLStoreActionStore;
+      }
+
       id<MTLRenderCommandEncoder> gridEnc =
         [commandBuffer renderCommandEncoderWithDescriptor:rpd];
       gridEnc.label = @"VTK Grid Traversal";
@@ -5051,11 +5578,23 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       mvp.znear = 0.0; mvp.zfar = 1.0;
       [gridEnc setViewport:mvp];
 
+      uint32_t gridPipelineType = metalFXActive
+        ? static_cast<uint32_t>(VolumePipelineType::GridTraversalOffscreenTemporal)
+        : static_cast<uint32_t>(VolumePipelineType::GridTraversalOffscreen);
+
       void* gridPso = this->GetOrCreateVolumePipeline(mtlDevice,
-        static_cast<uint32_t>(VolumePipelineType::GridTraversalOffscreen),
-        MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, featureMask);
+        gridPipelineType,
+        MTLPixelFormatRGBA16Float,
+        metalFXActive ? MTLPixelFormatDepth32Float : MTLPixelFormatInvalid,
+        1, featureMask);
       if (!gridPso) { [gridEnc endEncoding]; return; }
       [gridEnc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)gridPso];
+
+      if (metalFXActive && this->TemporalDepthStencilState)
+      {
+        [gridEnc setDepthStencilState:
+          (__bridge id<MTLDepthStencilState>)this->TemporalDepthStencilState];
+      }
 
       PerBlockData pbd;
       this->BuildGlobalPerBlockData(pbd, input);
@@ -5070,6 +5609,12 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         (__bridge void*)normTex,
         false, &pbd, MTLCullModeNone);
 
+      if (metalFXActive)
+      {
+        [gridEnc setFragmentBuffer:(__bridge id<MTLBuffer>)this->TemporalUniformBuffer
+                            offset:0 atIndex:4];
+      }
+
       [gridEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
       [gridEnc endEncoding];
     }
@@ -5080,6 +5625,19 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
       rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
       rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+      if (metalFXActive && this->VelocityTexture && this->VolumeDepthTexture)
+      {
+        rpd.colorAttachments[1].texture = (__bridge id<MTLTexture>)this->VelocityTexture;
+        rpd.colorAttachments[1].loadAction = MTLLoadActionClear;
+        rpd.colorAttachments[1].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+        rpd.colorAttachments[1].storeAction = MTLStoreActionStore;
+
+        rpd.depthAttachment.texture = (__bridge id<MTLTexture>)this->VolumeDepthTexture;
+        rpd.depthAttachment.loadAction = MTLLoadActionClear;
+        rpd.depthAttachment.clearDepth = 1.0;
+        rpd.depthAttachment.storeAction = MTLStoreActionStore;
+      }
 
       id<MTLRenderCommandEncoder> offscreenEncoder =
         [commandBuffer renderCommandEncoderWithDescriptor:rpd];
@@ -5096,15 +5654,66 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
       if (cameraInside)
       {
-        this->DrawBlocksFullscreen(offscreenEncoder, uniformBuf, ren, vol,
-          &uniforms, invModelMatrix, false);
+        uint32_t fsPipelineType = metalFXActive
+          ? static_cast<uint32_t>(VolumePipelineType::FullscreenOffscreenTemporal)
+          : static_cast<uint32_t>(VolumePipelineType::FullscreenOffscreen);
+
+        void* fsPso = this->GetOrCreateVolumePipeline(mtlDevice,
+          fsPipelineType,
+          MTLPixelFormatRGBA16Float,
+          metalFXActive ? MTLPixelFormatDepth32Float : MTLPixelFormatInvalid,
+          1, featureMask);
+        if (!fsPso) { [offscreenEncoder endEncoding]; return; }
+        [offscreenEncoder setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)fsPso];
+
+        if (metalFXActive && this->TemporalDepthStencilState)
+        {
+          [offscreenEncoder setDepthStencilState:
+            (__bridge id<MTLDepthStencilState>)this->TemporalDepthStencilState];
+        }
+
+        PerBlockData pbd;
+        this->BuildPerBlockData(pbd, &uniforms);
+
+        this->BindFullscreenTextures(offscreenEncoder, uniformBuf,
+          this->VolumeTexture,
+          this->MinMaxTexture,
+          this->GradientNormalTexture,
+          false, &pbd, MTLCullModeBack);
+
+        if (metalFXActive)
+        {
+          [offscreenEncoder setFragmentBuffer:(__bridge id<MTLBuffer>)this->TemporalUniformBuffer
+                                       offset:0 atIndex:3];
+        }
+
+        [offscreenEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
       }
       else
       {
+        uint32_t offscreenPipelineType = metalFXActive
+          ? static_cast<uint32_t>(VolumePipelineType::OffscreenLayerTemporal)
+          : static_cast<uint32_t>(VolumePipelineType::OffscreenLayer);
+
         void* activePipeline = this->GetOrCreateVolumePipeline(mtlDevice,
-          static_cast<uint32_t>(VolumePipelineType::OffscreenLayer),
-          MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, featureMask);
+          offscreenPipelineType,
+          MTLPixelFormatRGBA16Float,
+          metalFXActive ? MTLPixelFormatDepth32Float : MTLPixelFormatInvalid,
+          1, featureMask);
+        if (!activePipeline) { [offscreenEncoder endEncoding]; return; }
+
         this->BindEncoderResources(offscreenEncoder, uniformBuf, activePipeline, false);
+
+        if (metalFXActive)
+        {
+          if (this->TemporalDepthStencilState)
+          {
+            [offscreenEncoder setDepthStencilState:
+              (__bridge id<MTLDepthStencilState>)this->TemporalDepthStencilState];
+          }
+          [offscreenEncoder setFragmentBuffer:(__bridge id<MTLBuffer>)this->TemporalUniformBuffer
+                                       offset:0 atIndex:3];
+        }
 
         this->DrawBlocks(offscreenEncoder, uniformBuf, ren, vol, &uniforms, invModelMatrix);
       }
@@ -5189,6 +5798,12 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   // Completion handler is installed — the guard is no longer needed.
   semGuard.dismiss();
+
+  // Store current VP as previous for next frame's motion vectors
+  if (metalFXActive)
+  {
+    memcpy(this->PreviousViewProjection, uniforms.ViewProjectionMatrix, 64);
+  }
 
   } // @autoreleasepool
 }

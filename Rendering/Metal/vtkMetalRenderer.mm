@@ -3,6 +3,8 @@
 
 #include "vtkMetalRenderer.h"
 
+#include <unordered_map>
+
 #include "vtkMetalRenderWindow.h"
 #include "vtkMetalDepthPeeler.h"
 #include "vtkMetalCamera.h"
@@ -504,6 +506,33 @@ void vtkMetalRenderer::DeviceRender()
             [sDesc release];
           }
 
+          // Phase 8: Encode all MetalFX upscales BEFORE creating the blit encoder.
+          // MetalFX scaler encodes its own compute encoder onto the command buffer
+          // and must not have any other encoder active on the same command buffer.
+          // Collect upscaled textures keyed by mapper pointer for later compositing.
+          std::unordered_map<void*, void*> upscaledTextures;
+          coll->InitTraversal();
+          while (vtkVolume* vol = coll->GetNextVolume())
+          {
+            vtkGPUVolumeRayCastMapper* volMapper =
+              vtkGPUVolumeRayCastMapper::SafeDownCast(vol->GetMapper());
+            vtkMetalGPUVolumeRayCastMapper* metalMapper =
+              vtkMetalGPUVolumeRayCastMapper::SafeDownCast(volMapper);
+            if (metalMapper && metalMapper->GetImageSampleColorTexture() &&
+                metalMapper->GetImageSampleWidth() > 0 &&
+                metalMapper->GetUseMetalFXTemporal())
+            {
+              int outW = static_cast<int>(viewport[2] * size[0]);
+              int outH = static_cast<int>(viewport[3] * size[1]);
+              void* upscaledTex = metalMapper->EncodeMetalFXUpscale(
+                (__bridge void*)commandBuffer, outW, outH);
+              if (upscaledTex)
+              {
+                upscaledTextures[metalMapper] = upscaledTex;
+              }
+            }
+          }
+
           // Create blit encoder
           MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
           if (msaa && msaaColorTex)
@@ -526,7 +555,7 @@ void vtkMetalRenderer::DeviceRender()
           [blitEncoder setRenderPipelineState:blitPipeline];
           [blitEncoder setCullMode:MTLCullModeNone];
 
-          // Blit each volume's offscreen texture
+          // Blit each volume's offscreen texture (use MetalFX upscaled if available)
           coll->InitTraversal();
           while (vtkVolume* vol = coll->GetNextVolume())
           {
@@ -537,8 +566,10 @@ void vtkMetalRenderer::DeviceRender()
             if (metalMapper && metalMapper->GetImageSampleColorTexture() &&
                 metalMapper->GetImageSampleWidth() > 0)
             {
-              id<MTLTexture> offscreenTex =
-                (__bridge id<MTLTexture>)metalMapper->GetImageSampleColorTexture();
+              auto it = upscaledTextures.find(metalMapper);
+              id<MTLTexture> blitSource = it != upscaledTextures.end()
+                ? (__bridge id<MTLTexture>)it->second
+                : (__bridge id<MTLTexture>)metalMapper->GetImageSampleColorTexture();
 
               // Set viewport to full window
               MTLViewport metalViewport;
@@ -550,7 +581,7 @@ void vtkMetalRenderer::DeviceRender()
               metalViewport.zfar = 1.0;
               [blitEncoder setViewport:metalViewport];
 
-              [blitEncoder setFragmentTexture:offscreenTex atIndex:0];
+              [blitEncoder setFragmentTexture:blitSource atIndex:0];
               [blitEncoder setFragmentSamplerState:blitSampler atIndex:0];
 
               [blitEncoder drawPrimitives:MTLPrimitiveTypeTriangle

@@ -35,8 +35,13 @@ enum class VolumePipelineType : uint32_t
   ImageSampleBlit = 2,
   FullscreenDirect = 3,      // Fullscreen ray-cast for camera-inside (BGRA8Unorm + depth)
   FullscreenOffscreen = 4,   // Fullscreen ray-cast for camera-inside (RGBA16Float, no depth)
-  GridTraversalDirect = 5,   // Single-pass grid traversal fullscreen (BGRA8Unorm + depth)
-  GridTraversalOffscreen = 6 // Single-pass grid traversal fullscreen (RGBA16Float, no depth)
+  GridTraversalDirect = 5,     // Single-pass grid traversal fullscreen (BGRA8Unorm + depth)
+  GridTraversalOffscreen = 6,  // Single-pass grid traversal fullscreen (RGBA16Float, no depth)
+
+  // Phase 8: Temporal upscaling variants (output velocity + depth)
+  FullscreenOffscreenTemporal = 7,
+  GridTraversalOffscreenTemporal = 8,
+  OffscreenLayerTemporal = 9,
 };
 
 struct VolumePipelineKey
@@ -78,6 +83,7 @@ enum VolumeShaderFeatureFlags : uint32_t
   VolumeFeature_Mask            = 1u << 2,
   VolumeFeature_MinMax          = 1u << 3,
   VolumeFeature_NormalTexture    = 1u << 4,
+  VolumeFeature_Temporal         = 1u << 5,  // Phase 8: MetalFX temporal upscaling
 };
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -107,6 +113,19 @@ public:
   void* GetImageSampleColorTexture() const { return this->ImageSampleColorTexture; }
   int GetImageSampleWidth() const { return this->ImageSampleFBOWidth; }
   int GetImageSampleHeight() const { return this->ImageSampleFBOHeight; }
+
+  // Phase 8: MetalFX temporal upscaling
+  void SetUseMetalFXTemporal(bool val) { this->UseMetalFXTemporal = val; this->Modified(); }
+  bool GetUseMetalFXTemporal() const { return this->UseMetalFXTemporal; }
+
+  /// Called by vtkMetalRenderer during Phase 3b.
+  /// Encodes MetalFX upscale (temporal or spatial fallback) into the
+  /// command buffer. Returns the upscaled texture (owned by mapper),
+  /// or nullptr if MetalFX is unavailable/failed (caller falls back to blit).
+  void* EncodeMetalFXUpscale(void* commandBuffer, int outputWidth, int outputHeight);
+
+  /// Returns true if the last EncodeMetalFXUpscale produced a valid texture.
+  bool GetMetalFXUpscaleValid() const { return this->MetalFXOutputTexture != nullptr; }
 
   // Depth buffer occlusion — set by vtkMetalRenderer before volume rendering
   void SetDepthTexture(void* depthTex) { this->DepthTextureOcclusion = depthTex; }
@@ -214,6 +233,13 @@ private:
   // vtkSMPTools to build the R8Unorm occupancy texture.
   bool UseGPUMinMax = true;
 
+  // Phase 8: MetalFX temporal upscaling helpers
+  bool EnsureMetalFXScaler(void* device, int inputW, int inputH, int outputW, int outputH);
+  bool EnsureTemporalInputTextures(void* device, int width, int height);
+  void ReleaseMetalFXResources();
+  void InvalidateMetalFXHistory();
+  bool ShouldResetMetalFXHistory();
+
   // Compute pipelines for GPU min-max generation.
   void* MinMaxComputePipeline = nullptr;  // id<MTLComputePipelineState> — volume_compute_minmax
   void* DilateComputePipeline = nullptr;  // id<MTLComputePipelineState> — volume_dilate_minmax
@@ -270,6 +296,46 @@ private:
   int ImageSamplePixelFormat = 0;             // cached pixel format to detect changes
   bool EnsureImageSampleResources(void* device, int width, int height);
   void ReleaseImageSampleResources();
+
+  // Phase 8: MetalFX temporal upscaling state
+  bool UseMetalFXTemporal = true;
+  bool ForceMetalFXSpatial = false;
+  bool MetalFXSupported = false;
+  bool MetalFXChecked = false;
+  bool MetalFXHistoryValid = false;
+
+  void* TemporalScaler = nullptr;         // id<MTLFXTemporalScaler>
+  void* SpatialScaler = nullptr;          // id<MTLFXSpatialScaler>
+  void* MetalFXOutputTexture = nullptr;   // id<MTLTexture> — native-res private output
+  void* TemporalDepthStencilState = nullptr; // id<MTLDepthStencilState> — depth write enabled
+
+  // Temporal input attachments (low-res, created alongside ImageSampleColorTexture)
+  void* VelocityTexture = nullptr;        // id<MTLTexture> — RG16Float
+  void* VolumeDepthTexture = nullptr;     // id<MTLTexture> — Depth32Float
+
+  // Cached texture usage flags to detect changes
+  uint32_t CachedVelocityUsage = 0;
+  uint32_t CachedDepthUsage = 0;
+
+  // Temporal uniforms buffer (previous VP + jitter params)
+  void* TemporalUniformBuffer = nullptr;  // id<MTLBuffer>
+
+  // Previous frame state for motion vectors
+  float PreviousViewProjection[16] = {};
+  bool HasPreviousViewProjection = false;
+  int TemporalFrameIndex = 0;
+  float JitterX = 0.0f;
+  float JitterY = 0.0f;
+
+  // Cached dimensions for scaler recreation detection
+  int MetalFXInputW = 0;
+  int MetalFXInputH = 0;
+  int MetalFXOutputW = 0;
+  int MetalFXOutputH = 0;
+  void* CachedMetalDevice = nullptr;      // id<MTLDevice>
+
+  // Timestamp for history invalidation
+  vtkTimeStamp MetalFXHistoryTime;
 
   // Cache/timestamps
   vtkTimeStamp VolumeUploadTime;

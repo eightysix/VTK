@@ -1377,6 +1377,13 @@ vertex VolumeVertexOut vertex_volume_main(
 
 struct VolumeFragmentOut { float4 color [[color(0)]]; };
 
+// Phase 8: Fragment output with velocity and depth for temporal upscaling
+struct VolumeTemporalFragmentOut {
+    float4 color    [[color(0)]];
+    float2 velocity [[color(1)]];
+    float  depth    [[depth(any)]];
+};
+
 constant int MAX_RAY_STEPS = 8192;
 
 inline float volume_random(float2 st) {
@@ -1857,6 +1864,46 @@ struct GridTraversalUniforms {
     int gridDimsZ;          // nz
     int _pad;
 };
+
+// Phase 8: Temporal upscaling uniforms (bound at buffer index 4)
+struct TemporalUniforms {
+    float4x4 previousViewProjection;  // Previous frame's jittered VP
+    float4 params;                    // x=inputWidth, y=inputHeight, z=jitterX, w=jitterY (pixels)
+};
+
+// Phase 8: Compute motion vector and depth for temporal upscaling.
+// localPos is in normalized [0,1] volume space.
+inline void computeTemporalOutputs(
+    float3 localPos,
+    bool valid,
+    constant VolumeMapperUniforms& vu,
+    constant TemporalUniforms& tu,
+    thread float2& velocity,
+    thread float& outDepth)
+{
+    if (!valid) {
+        velocity = float2(0.0);
+        outDepth = 1.0;
+        return;
+    }
+
+    float3 bsz = max(vu.volumeBoundsMax.xyz - vu.volumeBoundsMin.xyz, 1e-6);
+    float3 modelPos = vu.volumeBoundsMin.xyz + localPos * bsz;
+    float4 worldPos = vu.volumeToWorld * float4(modelPos, 1.0);
+
+    float4 curClip = vu.viewProjection * worldPos;
+    float2 curNDC = curClip.xy / curClip.w;
+
+    float4 prevClip = tu.previousViewProjection * worldPos;
+    float2 prevNDC = prevClip.xy / prevClip.w;
+
+    float2 inputSize = tu.params.xy;
+    float2 curScreen  = (curNDC  * float2(0.5, -0.5) + 0.5) * inputSize;
+    float2 prevScreen = (prevNDC * float2(0.5, -0.5) + 0.5) * inputSize;
+    velocity = prevScreen - curScreen;
+
+    outDepth = curClip.z / curClip.w;
+}
 
 // 3D DDA grid walker for axis-aligned brick grid traversal.
 // Operates in normalized [0,1] volume space. Each grid cell
@@ -2599,3 +2646,335 @@ kernel void volume_convert_ushort_to_uchar(
 
 // NOTE: double -> half/float kernels are not provided because Metal does not
 // support 'double' in device address space. VTK_DOUBLE data falls back to CPU.
+
+// ============================================================================
+// Phase 8: MetalFX Temporal Upscaling — Fragment Shaders
+// ============================================================================
+
+// Temporal grid traversal: same as fragment_volume_grid_traversal_main but
+// outputs velocity and depth for MetalFX temporal upscaling.
+fragment VolumeTemporalFragmentOut fragment_volume_grid_traversal_temporal_main(
+    FullscreenVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    constant GridTraversalUniforms& grid [[buffer(3)]],
+    constant TemporalUniforms& temporal [[buffer(4)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    texture2d<float> gradientOpacityTexture [[texture(3)]],
+    texture3d<float> maskTexture [[texture(4)]],
+    texture2d<float> labelMapTransferTexture [[texture(5)]],
+    texture3d<float> minMaxTexture [[texture(6)]],
+    texture3d<float> normalTexture [[texture(7)]],
+    texture3d<float> brickOccupancy [[texture(8)]])
+{
+    VolumeTemporalFragmentOut output;
+
+    float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+
+    float2 uv = in.position.xy / volumeUniforms.viewportSize;
+    float2 ndc = uv * 2.0 - 1.0;
+    float4 wn = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, 0.0, 1.0); wn.xyz /= wn.w;
+    float4 wf = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, 1.0, 1.0); wf.xyz /= wf.w;
+    float3 bsz = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+    float3 localN = ((volumeUniforms.worldToVolume * float4(wn.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bsz;
+    float3 localF = ((volumeUniforms.worldToVolume * float4(wf.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bsz;
+    float3 rayDir = normalize(localF - localN);
+
+    float3 volMin = float3(0.0);
+    float3 volMax = float3(1.0);
+    float2 tVol = intersectBox(cameraPos, rayDir, volMin, volMax);
+    float tStart = max(tVol.x, 0.0);
+    float tEnd = tVol.y;
+    if (tStart >= tEnd - 1e-8) {
+        output.color = float4(0.0);
+        output.velocity = float2(0.0);
+        output.depth = 1.0;
+        return output;
+    }
+
+    // Apply clipping planes
+    if (volumeUniforms.useClipping > 0.5) {
+        int numClipPlanes = int(volumeUniforms.numClippingPlanes);
+        float4 planeOrigins[8] = {
+            volumeUniforms.clippingPlane0Origin, volumeUniforms.clippingPlane1Origin,
+            volumeUniforms.clippingPlane2Origin, volumeUniforms.clippingPlane3Origin,
+            volumeUniforms.clippingPlane4Origin, volumeUniforms.clippingPlane5Origin,
+            volumeUniforms.clippingPlane6Origin, volumeUniforms.clippingPlane7Origin
+        };
+        float4 planeNormals[8] = {
+            volumeUniforms.clippingPlane0Normal, volumeUniforms.clippingPlane1Normal,
+            volumeUniforms.clippingPlane2Normal, volumeUniforms.clippingPlane3Normal,
+            volumeUniforms.clippingPlane4Normal, volumeUniforms.clippingPlane5Normal,
+            volumeUniforms.clippingPlane6Normal, volumeUniforms.clippingPlane7Normal
+        };
+
+        float3 entryPoint = cameraPos + rayDir * tStart;
+        float3 exitPoint = cameraPos + rayDir * tEnd;
+
+        bool valid = true;
+        for (int cp = 0; cp < numClipPlanes && cp < 8; cp++) {
+            float3 planeOrigin = planeOrigins[cp].xyz;
+            float3 planeNormal = normalize(planeNormals[cp].xyz);
+            float startDistance = dot(planeNormal, planeOrigin - entryPoint);
+            float stopDistance = dot(planeNormal, planeOrigin - exitPoint);
+
+            if (startDistance > 0.0 && stopDistance > 0.0) { valid = false; break; }
+
+            float rayDotNormal = dot(rayDir, planeNormal);
+            if (rayDotNormal > 0.0 && startDistance > 0.0) {
+                entryPoint += (startDistance / rayDotNormal) * rayDir;
+            }
+            if (rayDotNormal <= 0.0 && stopDistance > 0.0) {
+                exitPoint += (stopDistance / rayDotNormal) * rayDir;
+            }
+        }
+
+        if (!valid) {
+            output.color = float4(0.0);
+            output.velocity = float2(0.0);
+            output.depth = 1.0;
+            return output;
+        }
+
+        float3 d = exitPoint - entryPoint;
+        tStart = dot(entryPoint - cameraPos, rayDir);
+        tEnd = tStart + length(d);
+    }
+
+    // Depth occlusion termination
+    float tTerminateMax = 1e30;
+    if (volumeUniforms.useDepthTexture > 0.5) {
+        float depthSample = depthTexture.sample(sNearest, uv).r;
+        if (depthSample < 1.0) {
+            float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, depthSample, 1.0);
+            worldTermination.xyz /= worldTermination.w;
+            float3 terminationLocal = (worldTermination.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+            float tDepth = dot(terminationLocal - (cameraPos + rayDir * tStart), rayDir);
+            if (tDepth <= 0.0) {
+                output.color = float4(0.0);
+                output.velocity = float2(0.0);
+                output.depth = 1.0;
+                return output;
+            }
+            tTerminateMax = tStart + tDepth;
+        }
+    }
+    tEnd = min(tEnd, tTerminateMax);
+    if (tStart >= tEnd - 1e-8) {
+        output.color = float4(0.0);
+        output.velocity = float2(0.0);
+        output.depth = 1.0;
+        return output;
+    }
+
+    float stepSize = volumeUniforms.sampleDistance;
+    float jitter = volumeUniforms.useJittering > 0.5
+        ? volume_random(in.position.xy + float2(0.5, 0.5)) * stepSize
+        : 0.0;
+
+    half3 color = 0.0h;
+    half opacity = 0.0h;
+    float3 terminationLocal = float3(0.5);
+    bool hasTermination = false;
+
+    int3 gridDims = int3(grid.gridDimsX, grid.gridDimsY, grid.gridDimsZ);
+    float tEndRel = tEnd - tStart;
+    GridWalker walker = initGridWalker(cameraPos, rayDir, tStart, tEndRel, gridDims);
+
+    int maxCells = gridDims.x + gridDims.y + gridDims.z + 3;
+    int cellsVisited = 0;
+
+    while (walker.valid && opacity < 0.99h && cellsVisited < maxCells) {
+        ++cellsVisited;
+        int3 cell = walker.cell;
+
+        float3 occUV = (float3(cell) + 0.5) / float3(gridDims);
+        float occ = brickOccupancy.sample(sNearest, occUV, level(0)).r;
+
+        if (occ > 0.5) {
+            float segmentT0 = tStart + max(walker.tEntry, 0.0);
+            float segmentT1 = tStart + min(walker.tExit, tEndRel);
+
+            if (segmentT1 > segmentT0 + 1e-8) {
+                half prevOpacity = opacity;
+                marchSegment(
+                    cameraPos, rayDir,
+                    segmentT0, segmentT1,
+                    stepSize, jitter, tTerminateMax,
+                    color, opacity,
+                    volumeUniforms, b,
+                    volumeTexture, transferFunctionTexture,
+                    gradientOpacityTexture, maskTexture, labelMapTransferTexture,
+                    minMaxTexture, normalTexture);
+
+                if (opacity > prevOpacity + 0.01h && !hasTermination) {
+                    float midT = (segmentT0 + segmentT1) * 0.5;
+                    terminationLocal = cameraPos + rayDir * midT;
+                    hasTermination = true;
+                }
+                if (opacity >= 0.99h) {
+                    terminationLocal = cameraPos + rayDir * segmentT1;
+                    hasTermination = true;
+                }
+            }
+        }
+
+        advanceGridWalker(walker, tEndRel);
+    }
+
+    output.color = float4(float3(color), float(opacity));
+
+    float2 vel;
+    float dep;
+    computeTemporalOutputs(terminationLocal, hasTermination && opacity > 0.01h,
+        volumeUniforms, temporal, vel, dep);
+    output.velocity = vel;
+    output.depth = dep;
+
+    return output;
+}
+
+// Temporal fullscreen camera-inside shader: same as fragment_volume_fullscreen_main
+// but outputs velocity and depth for MetalFX temporal upscaling.
+fragment VolumeTemporalFragmentOut fragment_volume_fullscreen_temporal_main(
+    FullscreenVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    constant TemporalUniforms& temporal [[buffer(3)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    texture2d<float> gradientOpacityTexture [[texture(3)]],
+    texture3d<float> maskTexture [[texture(4)]],
+    texture2d<float> labelMapTransferTexture [[texture(5)]],
+    texture3d<float> minMaxTexture [[texture(6)]],
+    texture3d<float> normalTexture [[texture(7)]])
+{
+    VolumeTemporalFragmentOut output;
+    float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+    float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+    computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+    float2 uv  = in.position.xy / volumeUniforms.viewportSize;
+    float2 ndc = uv * 2.0 - 1.0;
+    float4 wn = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, 0.0, 1.0); wn.xyz /= wn.w;
+    float4 wf = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, 1.0, 1.0); wf.xyz /= wf.w;
+    float3 bsz = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+    float3 localN = ((volumeUniforms.worldToVolume * float4(wn.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bsz;
+    float3 localF = ((volumeUniforms.worldToVolume * float4(wf.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bsz;
+    float3 rayDir = normalize(localF - localN);
+
+    RaySetup s = setupVolumeRay(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal,
+        in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+    if (!s.valid) {
+        output.color = float4(0.0);
+        output.velocity = float2(0.0);
+        output.depth = 1.0;
+        return output;
+    }
+
+    half4 marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
+        blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos,
+        volumeUniforms.sampleDistance, s.totalBoxT, in.position.xy,
+        half3(0.0), 0.0h, volumeUniforms, b,
+        volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture,
+        maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
+
+    output.color = float4(float3(marchResult.xyz), float(marchResult.w));
+
+    float3 termLocal = s.entryPoint + rayDir * s.totalDist * 0.5;
+
+    float2 vel;
+    float dep;
+    computeTemporalOutputs(termLocal, marchResult.w > 0.01h,
+        volumeUniforms, temporal, vel, dep);
+    output.velocity = vel;
+    output.depth = dep;
+
+    return output;
+}
+
+// Temporal proxy-geometry shader: same as fragment_volume_main but outputs
+// velocity and depth for MetalFX temporal upscaling.
+fragment VolumeTemporalFragmentOut fragment_volume_temporal_main(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    constant TemporalUniforms& temporal [[buffer(3)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    texture2d<float> gradientOpacityTexture [[texture(3)]],
+    texture3d<float> maskTexture [[texture(4)]],
+    texture2d<float> labelMapTransferTexture [[texture(5)]],
+    texture3d<float> minMaxTexture [[texture(6)]],
+    texture3d<float> normalTexture [[texture(7)]])
+{
+    VolumeTemporalFragmentOut output;
+
+    float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+
+    float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+    computeVolumeBounds(b, volumeUniforms,
+        blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+    float3 rayDir = in.localPos - cameraPos;
+    float dirLength = length(rayDir);
+
+    if (dirLength < 0.0001)
+    {
+        output.color = float4(0.0);
+        output.velocity = float2(0.0);
+        output.depth = 1.0;
+        return output;
+    }
+
+    rayDir /= dirLength;
+
+    RaySetup s = setupVolumeRay(
+        cameraPos,
+        rayDir,
+        blockMinGlobal,
+        blockMaxGlobal,
+        in.position.xy,
+        volumeUniforms.viewportSize,
+        volumeUniforms,
+        depthTexture);
+
+    if (!s.valid)
+    {
+        output.color = float4(0.0);
+        output.velocity = float2(0.0);
+        output.depth = 1.0;
+        return output;
+    }
+
+    half4 marchResult = marchVolume(
+        s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
+        blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos,
+        volumeUniforms.sampleDistance, s.totalBoxT, in.position.xy,
+        half3(0.0), 0.0h, volumeUniforms, b,
+        volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture,
+        maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
+
+    output.color = float4(float3(marchResult.xyz), float(marchResult.w));
+
+    float3 termLocal = s.entryPoint + rayDir * s.totalDist * 0.5;
+
+    float2 vel;
+    float dep;
+    computeTemporalOutputs(
+        termLocal,
+        marchResult.w > 0.01h,
+        volumeUniforms,
+        temporal,
+        vel,
+        dep);
+
+    output.velocity = vel;
+    output.depth = dep;
+
+    return output;
+}

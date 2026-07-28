@@ -79,6 +79,7 @@
   mapper->AutoAdjustSampleDistancesOff();
   mapper->SetSampleDistance(0.5);
   mapper->SetUseGPUMinMax(true);
+  mapper->SetImageSampleDistance(1.5);
 
   _volumeData = castToU8->GetOutput();
   _clipPlane = vtkSmartPointer<vtkPlane>::New();
