@@ -8,63 +8,137 @@
 @property (nonatomic, readwrite) BOOL benchmarkAutoStarted;
 @end
 
+static NSArray<NSDictionary*>* ViewCommandDefs(void)
+{
+  static NSArray* defs;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    defs = @[
+      @{ @"title": @"Cube",   @"action": @"selectCube:" },
+      @{ @"title": @"Cone",   @"action": @"selectCone:" },
+      @{ @"title": @"Volume", @"action": @"selectVolume:" },
+      @{ @"title": @"DICOM",  @"action": @"selectDICOM:" },
+      @{ @"title": @"NIfTI",  @"action": @"selectNIfTI:" },
+      @{ @"title": @"Base",   @"action": @"selectBase:" },
+    ];
+  });
+  return defs;
+}
+
 @implementation AppDelegate
 
+- (BOOL)validateMenuItem:(UIKeyCommand*)menuItem
+{
+  return YES;
+}
+
+- (void)validateCommand:(UICommand*)command
+{
+  NSUInteger index = [ViewCommandDefs() indexOfObjectPassingTest:^BOOL(NSDictionary* d, NSUInteger idx, BOOL* stop) {
+    return NSSelectorFromString(d[@"action"]) == command.action;
+  }];
+  
+  if (index != NSNotFound)
+  {
+    ViewController* rootVC = (ViewController*)self.window.rootViewController;
+    if ([rootVC isKindOfClass:[ViewController class]])
+    {
+      command.state = (rootVC.selectedIndex == (NSInteger)index) ? UIMenuElementStateOn : UIMenuElementStateOff;
+    }
+  }
+}
+
 - (BOOL)application:(UIApplication*)application
-    didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
+didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
 {
   self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
   ViewController* vc = [[ViewController alloc] init];
   self.window.rootViewController = vc;
   [self.window makeKeyAndVisible];
-
-  // Auto-start benchmark if launched with -benchmark flag
+  
   if ([[NSProcessInfo processInfo].arguments containsObject:@"-benchmark"])
   {
     dispatch_async(dispatch_get_main_queue(), ^{
       [self startBenchmarkOnVolumeTab];
     });
   }
-
+  
   return YES;
 }
 
 - (void)buildMenuWithBuilder:(id<UIMenuBuilder>)builder
 {
   [super buildMenuWithBuilder:builder];
-
+  
   if (builder.system != [UIMenuSystem mainSystem]) return;
-
+  
+  NSMutableArray* viewCommands = [NSMutableArray array];
+  [ViewCommandDefs() enumerateObjectsUsingBlock:^(NSDictionary* d, NSUInteger i, BOOL* stop) {
+    SEL action = NSSelectorFromString(d[@"action"]);
+    UIKeyCommand* cmd = [UIKeyCommand commandWithTitle:d[@"title"]
+                                                 image:nil
+                                                action:action
+                                                 input:[@(i + 1) stringValue]
+                                         modifierFlags:UIKeyModifierCommand
+                                          propertyList:@(i)];
+    cmd.discoverabilityTitle = [NSString stringWithFormat:@"Switch to %@", d[@"title"]];
+    [viewCommands addObject:cmd];
+  }];
+  
+  UIMenu* viewsMenu = [UIMenu menuWithTitle:@"Views" children:viewCommands];
+  [builder insertSiblingMenu:viewsMenu afterMenuForIdentifier:UIMenuApplication];
+  
   // VR Preset commands — actions go through the responder chain
   UIKeyCommand* nextPresetCmd = [UIKeyCommand
-      keyCommandWithInput:@"k"
-            modifierFlags:UIKeyModifierControl | UIKeyModifierAlternate
-                   action:@selector(nextPreset:)];
+                                 keyCommandWithInput:@"k"
+                                 modifierFlags:UIKeyModifierControl | UIKeyModifierAlternate
+                                 action:@selector(nextPreset:)];
   nextPresetCmd.title = @"Next VR Preset";
   nextPresetCmd.discoverabilityTitle = @"Next VR Preset";
-
+  
   UIKeyCommand* prevPresetCmd = [UIKeyCommand
-      keyCommandWithInput:@"j"
-            modifierFlags:UIKeyModifierControl | UIKeyModifierAlternate
-                   action:@selector(previousPreset:)];
+                                 keyCommandWithInput:@"j"
+                                 modifierFlags:UIKeyModifierControl | UIKeyModifierAlternate
+                                 action:@selector(previousPreset:)];
   prevPresetCmd.title = @"Previous VR Preset";
   prevPresetCmd.discoverabilityTitle = @"Previous VR Preset";
-
+  
   UIKeyCommand* benchmarkCmd = [UIKeyCommand
-      keyCommandWithInput:@"b"
-            modifierFlags:UIKeyModifierCommand | UIKeyModifierAlternate
-                   action:@selector(toggleBenchmark:)];
+                                keyCommandWithInput:@"b"
+                                modifierFlags:UIKeyModifierCommand | UIKeyModifierAlternate
+                                action:@selector(toggleBenchmark:)];
   benchmarkCmd.title = @"Toggle Benchmark";
   benchmarkCmd.discoverabilityTitle = @"Toggle GPU Benchmark";
-
-  // Rendering menu with inline preset commands
+  
   UIMenu* renderingMenu = [UIMenu
-      menuWithTitle:@"Rendering"
-          children:@[ nextPresetCmd, prevPresetCmd, benchmarkCmd ]];
-
+                           menuWithTitle:@"Rendering"
+                           children:@[ nextPresetCmd, prevPresetCmd, benchmarkCmd ]];
+  
   [builder insertSiblingMenu:renderingMenu
       afterMenuForIdentifier:UIMenuView];
 }
+
+#pragma mark - View Switching
+
+- (ViewController*)viewControllerForSwitch
+{
+  ViewController* rootVC = (ViewController*)self.window.rootViewController;
+  NSAssert([rootVC isKindOfClass:[ViewController class]],
+           @"Root view controller must be a ViewController");
+  return rootVC;
+}
+
+- (void)selectViewAtIndex:(NSInteger)index
+{
+  [self viewControllerForSwitch].selectedIndex = index;
+}
+
+- (void)selectCube:(id)sender   { [self selectViewAtIndex:0]; }
+- (void)selectCone:(id)sender   { [self selectViewAtIndex:1]; }
+- (void)selectVolume:(id)sender { [self selectViewAtIndex:2]; }
+- (void)selectDICOM:(id)sender  { [self selectViewAtIndex:3]; }
+- (void)selectNIfTI:(id)sender  { [self selectViewAtIndex:4]; }
+- (void)selectBase:(id)sender   { [self selectViewAtIndex:5]; }
 
 #pragma mark - Benchmark Actions
 
@@ -86,12 +160,8 @@
 
 - (void)startBenchmarkOnVolumeTab
 {
-  UITabBarController* tabBar = [self findTabBarController];
-  if (!tabBar) { return; }
-
-  // Volume tab is at index 2, select it
-  tabBar.selectedIndex = 2;
-
+  [self viewControllerForSwitch].selectedIndex = 2;
+  
   VTKMetalBaseViewController* vc = [self findMetalViewController];
   if (vc)
   {
@@ -102,36 +172,11 @@
 
 - (VTKMetalBaseViewController*)findMetalViewController
 {
-  UITabBarController* tabBar = [self findTabBarController];
-  if (!tabBar) { return nil; }
-
-  UIViewController* selected = tabBar.selectedViewController;
-  if ([selected isKindOfClass:[UINavigationController class]])
+  UIViewController* current = [self viewControllerForSwitch].currentViewController;
+  
+  if ([current isKindOfClass:[VTKMetalBaseViewController class]])
   {
-    selected = [(UINavigationController*)selected topViewController];
-  }
-
-  if ([selected isKindOfClass:[VTKMetalBaseViewController class]])
-  {
-    return (VTKMetalBaseViewController*)selected;
-  }
-  return nil;
-}
-
-- (UITabBarController*)findTabBarController
-{
-  UIViewController* root = self.window.rootViewController;
-  if ([root isKindOfClass:[UITabBarController class]])
-  {
-    return (UITabBarController*)root;
-  }
-  // If root is ViewController which has a tab bar as child
-  for (UIViewController* child in root.childViewControllers)
-  {
-    if ([child isKindOfClass:[UITabBarController class]])
-    {
-      return (UITabBarController*)child;
-    }
+    return (VTKMetalBaseViewController*)current;
   }
   return nil;
 }

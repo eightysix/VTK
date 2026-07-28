@@ -11,44 +11,46 @@
 - (void)viewDidLoad
 {
   [super viewDidLoad];
+  self.selectedIndex = 0;
+}
 
-  CubeViewController* cubeVC = [[CubeViewController alloc] init];
-  cubeVC.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Cube"
-                                                     image:nil
-                                                       tag:0];
+- (UIViewController*)viewControllerAtIndex:(NSInteger)index
+{
+  switch (index)
+  {
+    case 0: return [[CubeViewController alloc] init];
+    case 1: return [[ConeViewController alloc] init];
+    case 2: return [[VolumeViewController alloc] init];
+    case 3: return [[DICOMVolumeViewController alloc] init];
+    case 4: return [[NIFTIVolumeViewController alloc] init];
+    case 5: return [[VTKMetalBaseViewController alloc] init];
+  }
+  return nil;
+}
 
-  ConeViewController* coneVC = [[ConeViewController alloc] init];
-  coneVC.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Cone"
-                                                     image:nil
-                                                       tag:1];
+- (void)setSelectedIndex:(NSInteger)selectedIndex
+{
+  _selectedIndex = selectedIndex;
+  
+  for (UIViewController* child in self.childViewControllers)
+  {
+    [child willMoveToParentViewController:nil];
+    [child.view removeFromSuperview];
+    [child removeFromParentViewController];
+  }
+  
+  UIViewController* vc = [self viewControllerAtIndex:selectedIndex];
+  vc.view.frame = self.view.bounds;
+  vc.view.autoresizingMask =
+  UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+  [self.view addSubview:vc.view];
+  [self addChildViewController:vc];
+  [vc didMoveToParentViewController:self];
+}
 
-  VolumeViewController* volumeVC = [[VolumeViewController alloc] init];
-  volumeVC.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Volume"
-                                                       image:nil
-                                                         tag:2];
-
-  DICOMVolumeViewController* dicomVC = [[DICOMVolumeViewController alloc] init];
-  dicomVC.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"DICOM"
-                                                      image:nil
-                                                        tag:3];
-
-  NIFTIVolumeViewController* niftiVC = [[NIFTIVolumeViewController alloc] init];
-  niftiVC.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"NIfTI"
-                                                      image:nil
-                                                        tag:4];
-
-  VTKMetalBaseViewController* baseVC = [[VTKMetalBaseViewController alloc] init];
-  baseVC.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Base"
-                                                     image:nil
-                                                       tag:5];
-
-  UITabBarController* tabBar = [[UITabBarController alloc] init];
-  tabBar.viewControllers = @[ cubeVC, coneVC, volumeVC, dicomVC, niftiVC, baseVC ];
-  tabBar.view.frame = self.view.bounds;
-  tabBar.view.autoresizingMask =
-    UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-  [self.view addSubview:tabBar.view];
-  [self addChildViewController:tabBar];
+- (UIViewController*)currentViewController
+{
+  return [self viewControllerAtIndex:self.selectedIndex];
 }
 
 @end
