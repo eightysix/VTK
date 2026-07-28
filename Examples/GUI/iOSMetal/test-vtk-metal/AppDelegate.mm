@@ -1,6 +1,8 @@
 #import "AppDelegate.h"
 #import "ViewController.h"
+#import "DICOMVolumeViewController.h"
 #import "FileVolumeViewController.h"
+#import "NIFTIVolumeViewController.h"
 #import "VTKMetalBaseViewController.h"
 #import "VTKInteractionMode.h"
 #import <UIKit/UIKit.h>
@@ -30,6 +32,12 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
 
 - (BOOL)validateMenuItem:(UIKeyCommand*)menuItem
 {
+  if (menuItem.action == @selector(activateScrollSlicesMode:))
+  {
+    VTKMetalBaseViewController* vc = [self findMetalViewController];
+    return [vc isKindOfClass:[DICOMVolumeViewController class]] ||
+           [vc isKindOfClass:[NIFTIVolumeViewController class]];
+  }
   return YES;
 }
 
@@ -54,10 +62,19 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
   VTKInteractionMode cmdMode = (VTKInteractionMode)[command.propertyList integerValue];
   if (cmdAction == @selector(activatePanMode:) ||
       cmdAction == @selector(activateZoomMode:) ||
-      cmdAction == @selector(activateTrackballMode:))
+      cmdAction == @selector(activateTrackballMode:) ||
+      cmdAction == @selector(activateScrollSlicesMode:))
   {
     VTKMetalBaseViewController* vc = [self findMetalViewController];
     command.state = (vc && vc.interactionMode == cmdMode) ? UIMenuElementStateOn : UIMenuElementStateOff;
+
+    if (cmdAction == @selector(activateScrollSlicesMode:))
+    {
+      BOOL isDICOMorNIFTI = [vc isKindOfClass:[DICOMVolumeViewController class]] ||
+                             [vc isKindOfClass:[NIFTIVolumeViewController class]];
+      if (!isDICOMorNIFTI)
+        command.attributes = UIMenuElementAttributesDisabled;
+    }
   }
 }
 
@@ -121,15 +138,23 @@ didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
   zoomCmd.discoverabilityTitle = @"Zoom";
 
   UIKeyCommand* trackballCmd = [UIKeyCommand commandWithTitle:@"Trackball"
-                                                         image:[UIImage systemImageNamed:@"cube.transparent"]
-                                                        action:@selector(activateTrackballMode:)
-                                                         input:@"x"
-                                                 modifierFlags:0
-                                                  propertyList:@(VTKInteractionModeTrackball)];
+                                                          image:[UIImage systemImageNamed:@"cube.transparent"]
+                                                         action:@selector(activateTrackballMode:)
+                                                          input:@"x"
+                                                  modifierFlags:0
+                                                   propertyList:@(VTKInteractionModeTrackball)];
   trackballCmd.discoverabilityTitle = @"Trackball";
 
+  UIKeyCommand* scrollSlicesCmd = [UIKeyCommand commandWithTitle:@"Scroll Slices"
+                                                            image:[UIImage systemImageNamed:@"arrow.up.and.down"]
+                                                           action:@selector(activateScrollSlicesMode:)
+                                                            input:@"d"
+                                                    modifierFlags:0
+                                                     propertyList:@(VTKInteractionModeScrollSlices)];
+  scrollSlicesCmd.discoverabilityTitle = @"Clip through volume";
+
   UIMenu* interactionMenu = [UIMenu menuWithTitle:@"Interaction Mode"
-                                         children:@[ panCmd, zoomCmd, trackballCmd ]];
+                                         children:@[ panCmd, zoomCmd, trackballCmd, scrollSlicesCmd ]];
 
   // Camera submenu
   UIKeyCommand* resetCameraCmd = [UIKeyCommand
@@ -263,6 +288,12 @@ didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
 - (void)activateTrackballMode:(id)sender
 {
   [self findMetalViewController].interactionMode = VTKInteractionModeTrackball;
+  [self updateInteractionModeMenu];
+}
+
+- (void)activateScrollSlicesMode:(id)sender
+{
+  [self findMetalViewController].interactionMode = VTKInteractionModeScrollSlices;
   [self updateInteractionModeMenu];
 }
 

@@ -9,5 +9,6 @@
 - (void)activatePanMode:(id)sender;
 - (void)activateZoomMode:(id)sender;
 - (void)activateTrackballMode:(id)sender;
+- (void)activateScrollSlicesMode:(id)sender;
 - (void)resetCamera:(id)sender;
 @end

@@ -69,6 +69,7 @@
     case VTKInteractionModePan: return @"Pan";
     case VTKInteractionModeZoom: return @"Zoom";
     case VTKInteractionModeTrackball: return @"Trackball";
+    case VTKInteractionModeScrollSlices: return @"Scroll Slices";
   }
 }
 
@@ -79,6 +80,7 @@
     case VTKInteractionModePan: return @"hand.point.up";
     case VTKInteractionModeZoom: return @"magnifyingglass";
     case VTKInteractionModeTrackball: return @"cube.transparent";
+    case VTKInteractionModeScrollSlices: return @"arrow.up.and.down";
   }
 }
 
