@@ -1280,13 +1280,13 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGridTraversalResources()
   this->CachedGridDims[1] = 0;
   this->CachedGridDims[2] = 0;
   this->GridTraversalResourcesValid = false;
+  this->GridTraversalUploadTime.Modified();
 }
 
 //------------------------------------------------------------------------------
-// WARNING: This is intentionally duplicated from the non-partitioned path in
-// UpdateVolumeTexture. The partitioned path needs a global texture alongside
-// per-block textures. If you change the upload logic (format selection, GPU
-// conversion, staging), update BOTH paths.
+// WARNING: This is shared between the partitioned and non-partitioned paths.
+// The partitioned path uses the global volume texture for single-pass grid
+// traversal instead of per-block textures.
 bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
   void* mtlDeviceVoid, void* mtlQueueVoid, vtkImageData* input, vtkDataArray* scalars)
 {
@@ -1516,7 +1516,8 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
 
 //------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::EnsureGridTraversalResources(
-  void* mtlDeviceVoid, void* mtlQueueVoid, vtkImageData* input)
+  void* mtlDeviceVoid, void* mtlQueueVoid, vtkImageData* input,
+  vtkVolume* vol)
 {
   if (this->GridTraversalResourcesValid)
     return;
@@ -1556,17 +1557,15 @@ void vtkMetalGPUVolumeRayCastMapper::EnsureGridTraversalResources(
     AssignMetalObject(this->OccupancyGridTexture, occTex);
   }
 
-  // Build occupancy data directly from partition grid and opacity function.
-  // The volume pointer is obtained from the caller context; if unavailable,
-  // all bricks are marked active (255).
+  // Build occupancy data from partition grid and opacity function.
+  // All bricks are active (255) when no opacity function or macrocell data.
   int gridCells = nx * ny * nz;
   std::vector<uint8_t> occupancy(gridCells, 255);
 
   vtkPiecewiseFunction* opacityFunc = nullptr;
-  if (this->GridTraversalCurrentVolume)
+  if (vol)
   {
-    vtkVolumeProperty* property =
-      this->GridTraversalCurrentVolume->GetProperty();
+    vtkVolumeProperty* property = vol->GetProperty();
     opacityFunc = property ? property->GetScalarOpacity() : nullptr;
   }
 
@@ -1602,9 +1601,18 @@ void vtkMetalGPUVolumeRayCastMapper::EnsureGridTraversalResources(
     const int fullY = fullExt[3] - fullExt[2] + 1;
     const int fullZ = fullExt[5] - fullExt[4] + 1;
 
-    const int deltaX = fullX / nx;
-    const int deltaY = fullY / ny;
-    const int deltaZ = fullZ / nz;
+    // Convert to DilateOccupancy3D convention: 0 = active, 255 = empty.
+    // We compute raw (undilated) occupancy, then dilate for conservative
+    // empty-space skipping.
+    std::vector<uint8_t> raw(gridCells, 255);
+
+    auto brickRange = [](int i, int n, int full) -> std::pair<int, int>
+    {
+      if (n <= 0 || full <= 0) return { 0, -1 };
+      vtkIdType a = (static_cast<vtkIdType>(i) * full) / n;
+      vtkIdType b = (static_cast<vtkIdType>(i + 1) * full) / n - 1;
+      return { static_cast<int>(a), static_cast<int>(b) };
+    };
 
     for (int k = 0; k < nz; ++k)
     {
@@ -1612,26 +1620,27 @@ void vtkMetalGPUVolumeRayCastMapper::EnsureGridTraversalResources(
       {
         for (int i = 0; i < nx; ++i)
         {
-          int relX0 = i * deltaX;
-          int relY0 = j * deltaY;
-          int relZ0 = k * deltaZ;
+          auto [relX0, relX1] = brickRange(i, nx, fullX);
+          auto [relY0, relY1] = brickRange(j, ny, fullY);
+          auto [relZ0, relZ1] = brickRange(k, nz, fullZ);
 
-          int relX1 =
-            (i == nx - 1) ? (fullX - 1) : (relX0 + deltaX - 1);
+          if (relX1 < relX0 || relY1 < relY0 || relZ1 < relZ0)
+          {
+            continue; // stays 255 (empty)
+          }
 
-          int relY1 =
-            (j == ny - 1) ? (fullY - 1) : (relY0 + deltaY - 1);
-
-          int relZ1 =
-            (k == nz - 1) ? (fullZ - 1) : (relZ0 + deltaZ - 1);
-
-          int mcX0 = relX0 / DS;
-          int mcY0 = relY0 / DS;
-          int mcZ0 = relZ0 / DS;
+          int mcX0 = std::max(0, relX0 / DS);
+          int mcY0 = std::max(0, relY0 / DS);
+          int mcZ0 = std::max(0, relZ0 / DS);
 
           int mcX1 = std::min(relX1 / DS, mcDims0 - 1);
           int mcY1 = std::min(relY1 / DS, mcDims1 - 1);
           int mcZ1 = std::min(relZ1 / DS, mcDims2 - 1);
+
+          if (mcX1 < mcX0 || mcY1 < mcY0 || mcZ1 < mcZ0)
+          {
+            continue; // stays 255 (empty)
+          }
 
           float brickMin = 1e30f;
           float brickMax = -1e30f;
@@ -1669,9 +1678,19 @@ void vtkMetalGPUVolumeRayCastMapper::EnsureGridTraversalResources(
              static_cast<size_t>(j)) * nx +
             static_cast<size_t>(i);
 
-          occupancy[idx] = active ? 255 : 0;
+          // DilateOccupancy3D convention: 0 = active, 255 = empty
+          raw[idx] = active ? 0 : 255;
         }
       }
+    }
+
+    // Dilate to avoid boundary artifacts from interpolation near brick edges.
+    std::vector<uint8_t> dilated = DilateOccupancy3D(raw, nx, ny, nz);
+
+    // Convert back: 0 in dilated -> 255 in occupancy (active)
+    for (size_t i = 0; i < dilated.size(); ++i)
+    {
+      occupancy[i] = (dilated[i] == 0) ? 255 : 0;
     }
   }
 
@@ -1955,18 +1974,24 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
 
   if (usePartitions)
   {
-    bool needsRebuild =
-      this->VolumeTexture == nullptr ||
-      input->GetMTime() > this->VolumeUploadTime.GetMTime() ||
-      this->GetMTime() > this->VolumeUploadTime.GetMTime();
-
     vtkVolumeProperty* property = vol ? vol->GetProperty() : nullptr;
     vtkPiecewiseFunction* opacityFunc =
       property ? property->GetScalarOpacity() : nullptr;
-    bool needsOpacityRebuild =
-      opacityFunc && opacityFunc->GetMTime() > this->VolumeUploadTime.GetMTime();
 
-    if (needsRebuild)
+    bool needsVolumeRebuild =
+      this->VolumeTexture == nullptr ||
+      input->GetMTime() > this->VolumeUploadTime.GetMTime();
+
+    bool needsGridRebuild =
+      needsVolumeRebuild ||
+      this->GetMTime() > this->GridTraversalUploadTime.GetMTime() ||
+      (opacityFunc &&
+       opacityFunc->GetMTime() > this->GridTraversalUploadTime.GetMTime()) ||
+      this->CachedGridDims[0] != static_cast<int>(this->Partitions[0]) ||
+      this->CachedGridDims[1] != static_cast<int>(this->Partitions[1]) ||
+      this->CachedGridDims[2] != static_cast<int>(this->Partitions[2]);
+
+    if (needsVolumeRebuild)
     {
       VolumeBounds vb = ComputeVolumeBounds(input);
       this->ModelBounds[0] = vb.Min[0];
@@ -1987,14 +2012,22 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       this->VolumeUploadTime.Modified();
     }
 
-    if (needsRebuild || needsOpacityRebuild)
+    if (needsGridRebuild &&
+        opacityFunc &&
+        (this->MacrocellScalarMin.empty() || this->MacrocellScalarMax.empty()))
+    {
+      this->UpdateMinMaxTexture(mtlDeviceVoid, vol, input, scalars, true);
+    }
+
+    if (needsGridRebuild)
     {
       this->GridTraversalResourcesValid = false;
     }
 
     if (!this->GridTraversalResourcesValid && this->VolumeTexture)
     {
-      this->EnsureGridTraversalResources(mtlDeviceVoid, mtlQueueVoid, input);
+      this->EnsureGridTraversalResources(mtlDeviceVoid, mtlQueueVoid, input, vol);
+      this->GridTraversalUploadTime.Modified();
     }
 
     return true;
@@ -3941,10 +3974,6 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
     ReleaseMetalObject(this->PipelineState);
   }
 
-  // Accumulation pipeline is always rasterSampleCount=1
-  // (used only for offscreen rendering), so it doesn't need invalidation
-  // when the window's MSAA sample count changes.
-
   if (this->PipelineState)
   {
     return true;
@@ -3958,7 +3987,6 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupPipeline(void* mtlDeviceVoid, vtkRende
   @autoreleasepool
   {
     id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
-    id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
 
     // Create dummy depth texture (1x1 R32Float with value 1.0) for when no real depth texture is bound
     if (!this->DummyDepthTexture)
@@ -4393,8 +4421,9 @@ void vtkMetalGPUVolumeRayCastMapper::BuildGlobalPerBlockData(
 
 //------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
-  void* encoderVoid, void* uniformBufVoid, vtkRenderer* ren, vtkVolume* vol,
-  void* uniformsVoid, vtkMatrix4x4* invModelMatrix)
+  void* encoderVoid, void* uniformBufVoid, vtkRenderer* vtkNotUsed(ren),
+  vtkVolume* vtkNotUsed(vol),
+  void* uniformsVoid, vtkMatrix4x4* vtkNotUsed(invModelMatrix))
 {
   id<MTLRenderCommandEncoder> encoder =
     (__bridge id<MTLRenderCommandEncoder>)encoderVoid;
@@ -4417,8 +4446,10 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
 
 //------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
-  void* encoderVoid, void* uniformBufVoid, vtkRenderer* ren, vtkVolume* vol,
-  void* uniformsVoid, vtkMatrix4x4* invModelMatrix, bool useDirectPipeline)
+  void* encoderVoid, void* uniformBufVoid, vtkRenderer* ren,
+  vtkVolume* vtkNotUsed(vol),
+  void* uniformsVoid, vtkMatrix4x4* vtkNotUsed(invModelMatrix),
+  bool useDirectPipeline)
 {
   id<MTLRenderCommandEncoder> encoder =
     (__bridge id<MTLRenderCommandEncoder>)encoderVoid;
@@ -4563,12 +4594,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     }
   }
 
-  // Precompute gradient/normal texture for non-partitioned volumes (Phase 4).
-  // Partitioned volumes generate per-block normals in UpdateBlockTextures.
-  if (!usePartitions)
-  {
-    this->EnsureGradientNormalTexture(mtlDevice, mtlQueue, vol);
-  }
+  this->EnsureGradientNormalTexture(mtlDevice, mtlQueue, vol);
 
   // Compute actual sample distance early so it can be used for opacity pre-integration
   // (matches the OpenGL mapper's vtkInternal::ComputeSampleDistance).
@@ -4871,9 +4897,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   if (hasNormalTexture)
     featureMask |= VolumeFeature_NormalTexture;
 
-  // Determine if image-space downsampling is active.
-  // Force offscreen rendering when blocks are present to enable inter-block
-  // opacity propagation via Metal framebuffer fetch ([[color(0)]]).
+  // Image-space downsampling requires offscreen rendering at reduced resolution.
+  // Partitioned volumes no longer force offscreen rendering because grid traversal
+  // composites correctly in a single pass.
   const float imageSampleDist = this->ImageSampleDistance;
   const bool useImageSampling = (imageSampleDist != 1.0f);
 
@@ -4998,6 +5024,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     id<MTLTexture> offscreenColor =
       (__bridge id<MTLTexture>)this->ImageSampleColorTexture;
 
+    // Prefer grid traversal for partitioned volumes. If resources are
+    // unavailable, fall back to rendering the global volume as a single
+    // block (slower but avoids a hard failure).
     bool useGridTraversal = (usePartitions && this->VolumeTexture &&
       this->GridTraversalResourcesValid);
 
@@ -5096,6 +5125,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       return;
     }
 
+    // Prefer grid traversal for partitioned volumes. Falls back to single-block
+    // fullscreen or proxy-geometry if grid traversal resources are unavailable.
     bool useGridTraversalDirect = (usePartitions && this->VolumeTexture &&
       this->GridTraversalResourcesValid);
 

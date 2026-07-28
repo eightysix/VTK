@@ -332,9 +332,8 @@ private:
 
   unsigned short Partitions[3] = { 1, 1, 1 };
 
-  // Per-macrocell scalar min/max — computed alongside the occupancy scan
-  // in UpdateMinMaxTexture, consumed by UpdateBlockTextures to avoid a
-  // redundant full-voxel walk for BlockScalarRanges.
+  // Per-macrocell scalar min/max — computed by UpdateMinMaxTexture and consumed
+  // by EnsureGridTraversalResources to build the brick occupancy grid.
   std::vector<float> MacrocellScalarMin;
   std::vector<float> MacrocellScalarMax;
 
@@ -343,8 +342,9 @@ private:
   void* GridTraversalUniformBuffer = nullptr; // id<MTLBuffer> — GridTraversalUniforms
   int CachedGridDims[3] = {};
   bool GridTraversalResourcesValid = false;
-  vtkVolume* GridTraversalCurrentVolume = nullptr; // transient cache for occupancy computation
-  void EnsureGridTraversalResources(void* mtlDevice, void* mtlQueue, vtkImageData* input);
+  vtkTimeStamp GridTraversalUploadTime;
+  void EnsureGridTraversalResources(void* mtlDevice, void* mtlQueue,
+    vtkImageData* input, vtkVolume* vol);
   void ReleaseGridTraversalResources();
   bool CreateGlobalVolumeTexture(void* mtlDevice, void* mtlQueue,
     vtkImageData* input, vtkDataArray* scalars);
