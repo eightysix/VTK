@@ -98,8 +98,10 @@ didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
     [viewCommands addObject:cmd];
   }];
   
+  // Build submenus for the VTK top-level menu
+  
+  // Views submenu
   UIMenu* viewsMenu = [UIMenu menuWithTitle:@"Views" children:viewCommands];
-  [builder insertSiblingMenu:viewsMenu afterMenuForIdentifier:UIMenuApplication];
 
   // Interaction Mode submenu
   UIKeyCommand* panCmd = [UIKeyCommand commandWithTitle:@"Pan"
@@ -111,26 +113,25 @@ didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
   panCmd.discoverabilityTitle = @"Pan";
 
   UIKeyCommand* zoomCmd = [UIKeyCommand commandWithTitle:@"Zoom"
-                                                   image:[UIImage systemImageNamed:@"magnifyingglass"]
-                                                  action:@selector(activateZoomMode:)
-                                                   input:@"a"
-                                           modifierFlags:0
-                                            propertyList:@(VTKInteractionModeZoom)];
+                                                    image:[UIImage systemImageNamed:@"magnifyingglass"]
+                                                   action:@selector(activateZoomMode:)
+                                                    input:@"a"
+                                            modifierFlags:0
+                                             propertyList:@(VTKInteractionModeZoom)];
   zoomCmd.discoverabilityTitle = @"Zoom";
 
   UIKeyCommand* trackballCmd = [UIKeyCommand commandWithTitle:@"Trackball"
-                                                        image:[UIImage systemImageNamed:@"cube.transparent"]
-                                                       action:@selector(activateTrackballMode:)
-                                                        input:@"x"
-                                                modifierFlags:0
-                                                 propertyList:@(VTKInteractionModeTrackball)];
+                                                         image:[UIImage systemImageNamed:@"cube.transparent"]
+                                                        action:@selector(activateTrackballMode:)
+                                                         input:@"x"
+                                                 modifierFlags:0
+                                                  propertyList:@(VTKInteractionModeTrackball)];
   trackballCmd.discoverabilityTitle = @"Trackball";
 
   UIMenu* interactionMenu = [UIMenu menuWithTitle:@"Interaction Mode"
                                          children:@[ panCmd, zoomCmd, trackballCmd ]];
-  [builder insertSiblingMenu:interactionMenu afterMenuForIdentifier:UIMenuApplication];
 
-  // Camera menu
+  // Camera submenu
   UIKeyCommand* resetCameraCmd = [UIKeyCommand
                                    keyCommandWithInput:@"r"
                                    modifierFlags:UIKeyModifierCommand
@@ -139,9 +140,8 @@ didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
   resetCameraCmd.discoverabilityTitle = @"Reset camera to default view";
 
   UIMenu* cameraMenu = [UIMenu menuWithTitle:@"Camera" children:@[ resetCameraCmd ]];
-  [builder insertSiblingMenu:cameraMenu afterMenuForIdentifier:UIMenuView];
   
-  // VR Preset commands — actions go through the responder chain
+  // Rendering submenu
   UIKeyCommand* nextPresetCmd = [UIKeyCommand
                                  keyCommandWithInput:@"k"
                                  modifierFlags:UIKeyModifierControl | UIKeyModifierAlternate
@@ -166,11 +166,8 @@ didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
   UIMenu* renderingMenu = [UIMenu
                            menuWithTitle:@"Rendering"
                            children:@[ nextPresetCmd, prevPresetCmd, benchmarkCmd ]];
-  
-  [builder insertSiblingMenu:renderingMenu
-      afterMenuForIdentifier:UIMenuView];
-  
-  // File menu
+
+  // File submenu
   UIKeyCommand* loadFileCmd = [UIKeyCommand
                                keyCommandWithInput:@"o"
                                modifierFlags:UIKeyModifierCommand
@@ -179,7 +176,11 @@ didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
   loadFileCmd.discoverabilityTitle = @"Open a file via document picker";
   
   UIMenu* fileMenu = [UIMenu menuWithTitle:@"File" children:@[ loadFileCmd ]];
-  [builder insertSiblingMenu:fileMenu afterMenuForIdentifier:UIMenuApplication];
+
+  // Top-level VTK menu containing all submenus
+  UIMenu* vtkMenu = [UIMenu menuWithTitle:@"VTK"
+                                   children:@[ viewsMenu, interactionMenu, cameraMenu, renderingMenu, fileMenu ]];
+  [builder insertSiblingMenu:vtkMenu afterMenuForIdentifier:UIMenuApplication];
 }
 
 #pragma mark - View Switching
