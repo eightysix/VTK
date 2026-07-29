@@ -1396,6 +1396,20 @@ inline float2 intersectBox(float3 orig, float3 dir, float3 boxMin, float3 boxMax
   return float2(max(max(tmin.x, tmin.y), tmin.z), min(min(tmax.x, tmax.y), tmax.z));
 }
 
+// rayDirNormSpace is normalized in [0,1] volume space. Returns the normalized-space
+// step that corresponds to a constant *physical* sample distance along that ray.
+// Without this, the physical step is direction-dependent (<= sampleDistance), so the
+// pre-integration factor (which assumes a full sampleDistance per step) over-accumulates
+// opacity and the volume renders less translucent than the OpenGL backend.
+inline float physicalSampleStep(float3 rayDirNormSpace,
+                                constant VolumeMapperUniforms& u)
+{
+  float3 boundsSize = max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
+  float  maxBound   = max(boundsSize.x, max(boundsSize.y, boundsSize.z));
+  float  physPerNorm = length(rayDirNormSpace * boundsSize);
+  return u.sampleDistance * maxBound / max(physPerNorm, 1e-6);
+}
+
 // Optimized: Gradient fetch with direction correction for anisotropic spacing.
 // gradScale = 1 / (gradientStep * texSizeGlobal) converts raw central-difference
 // components from texture-local to normalized-volume space.
@@ -1789,9 +1803,10 @@ fragment VolumeFragmentOut fragment_volume_main(
       in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
   if (!s.valid) { output.color = float4(0.0); return output; }
 
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos,
-      volumeUniforms.sampleDistance, s.totalBoxT, in.position.xy,
+      stepSize, s.totalBoxT, in.position.xy,
       half3(0.0), 0.0h, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture,
       maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
@@ -1836,9 +1851,10 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
       in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
   if (!s.valid) { output.color = float4(0.0); return output; }
 
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos,
-      volumeUniforms.sampleDistance, s.totalBoxT, in.position.xy,
+      stepSize, s.totalBoxT, in.position.xy,
       half3(0.0), 0.0h, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture,
       maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
@@ -2310,7 +2326,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
     }
 
     // Global sample schedule
-    float stepSize = volumeUniforms.sampleDistance;
+    float stepSize = physicalSampleStep(rayDir, volumeUniforms);
     float jitter = volumeUniforms.useJittering > 0.5
         ? volume_random(in.position.xy + float2(0.5, 0.5)) * stepSize
         : 0.0;
