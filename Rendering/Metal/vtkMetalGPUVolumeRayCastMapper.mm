@@ -1959,6 +1959,13 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureGradientNormalTexture(
 //------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotUsed(window))
 {
+  // Drain in-flight frames before releasing any resources they may reference.
+  // Completion handlers fire on a libdispatch queue independent of the render
+  // thread, so the 3 waits won't deadlock even if the render thread is the
+  // caller. The destructor also calls WaitForInFlightFrames before calling us,
+  // which is harmless — the second pass is 3 waits + 3 signals on an already-
+  // drained semaphore, net zero.
+  this->WaitForInFlightFrames();
   this->ReleaseImageSampleResources();
 
   ReleaseMetalObject(this->PipelineState);
@@ -2498,30 +2505,30 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
         tfWidth, tfData.data(),
         preIntegrationFactor);
 
-      id<MTLTexture> oldTfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
-      id<MTLTexture> tex = nil;
+      // Swap rather than rewrite: in-flight frames on the GPU may still be
+      // sampling the old texture.  Metal command buffers retain a strong
+      // reference to every resource encoded into them until execution
+      // completes, so the old texture stays alive for those in-flight frames.
+      // We always allocate a fresh texture here — it is not yet referenced
+      // by any command buffer — then populate it via replaceRegion before
+      // the next GPURender can bind it (GPURender runs single-threaded on
+      // the render pass, so there is no race between AssignMetalObject and
+      // replaceRegion).  If allocation fails, the slot remains nullptr and
+      // doReload will re-trigger next frame.
+      ReleaseMetalObject(this->ColorOpacityTexture);
 
-      if (oldTfTex)
+      id<MTLTexture> tex = NewTexture2D(
+        device,
+        MTLPixelFormatRGBA8Unorm,
+        static_cast<NSUInteger>(tfWidth), 1,
+        MTLTextureUsageShaderRead,
+        MTLStorageModeShared);
+      if (!tex)
       {
-        tex = oldTfTex;
+        vtkErrorMacro("Failed to create transfer function texture");
+        return false;
       }
-      else
-      {
-        ReleaseMetalObject(this->ColorOpacityTexture);
-
-        tex = NewTexture2D(
-          device,
-          MTLPixelFormatRGBA8Unorm,
-          static_cast<NSUInteger>(tfWidth), 1,
-          MTLTextureUsageShaderRead,
-          MTLStorageModeShared);
-        if (!tex)
-        {
-          vtkErrorMacro("Failed to create transfer function texture");
-          return false;
-        }
-        AssignMetalObject(this->ColorOpacityTexture, tex);
-      }
+      AssignMetalObject(this->ColorOpacityTexture, tex);
 
       MTLRegion region = MTLRegionMake2D(0, 0, tfWidth, 1);
       [tex replaceRegion:region
@@ -2588,30 +2595,23 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
         gradData[i * 4 + 3] = 255;
       }
 
-      id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->GradientOpacityTexture;
-      id<MTLTexture> tex = nil;
+      // Swap (not in-place update) — see UpdateTransferFunctionTexture for
+      // the full rationale: in-flight GPU frames may still be sampling the
+      // old texture, so always allocate fresh to avoid torn reads.
+      ReleaseMetalObject(this->GradientOpacityTexture);
 
-      if (oldTex)
+      id<MTLTexture> tex = NewTexture2D(
+        device,
+        MTLPixelFormatRGBA8Unorm,
+        256, 1,
+        MTLTextureUsageShaderRead,
+        MTLStorageModeShared);
+      if (!tex)
       {
-        tex = oldTex;
+        vtkErrorMacro("Failed to create gradient opacity texture");
+        return false;
       }
-      else
-      {
-        ReleaseMetalObject(this->GradientOpacityTexture);
-
-        tex = NewTexture2D(
-          device,
-          MTLPixelFormatRGBA8Unorm,
-          256, 1,
-          MTLTextureUsageShaderRead,
-          MTLStorageModeShared);
-        if (!tex)
-        {
-          vtkErrorMacro("Failed to create gradient opacity texture");
-          return false;
-        }
-        AssignMetalObject(this->GradientOpacityTexture, tex);
-      }
+      AssignMetalObject(this->GradientOpacityTexture, tex);
 
       MTLRegion region = MTLRegionMake2D(0, 0, 256, 1);
       [tex replaceRegion:region
@@ -2748,37 +2748,30 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMaskTexture(
         uploadSrc = floatData.data();
       }
 
-      // Create or update the 3D mask texture
-      id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->MaskTexture;
-      id<MTLTexture> tex = nil;
+      // Swap (not in-place update) — in-flight GPU frames may still be
+      // sampling the old texture.  Releasing the old texture before
+      // allocating the new one marginally reduces peak memory, which
+      // matters for potentially large (e.g. 512^3 R8 = 256 MB) masks.
+      // During the brief window between NewTexture3D and the old texture's
+      // last in-flight frame completion, both old and new copies coexist
+      // transiently.  If this ever causes memory pressure, switch to a
+      // fenced ring of 3 copies indexed by UniformFrameIndex % 3.
+      ReleaseMetalObject(this->MaskTexture);
 
-      if (oldTex &&
-          oldTex.width == static_cast<NSUInteger>(dims[0]) &&
-          oldTex.height == static_cast<NSUInteger>(dims[1]) &&
-          oldTex.depth == static_cast<NSUInteger>(dims[2]) &&
-          oldTex.pixelFormat == chosenFormat)
+      id<MTLTexture> tex = NewTexture3D(
+        device,
+        chosenFormat,
+        static_cast<NSUInteger>(dims[0]),
+        static_cast<NSUInteger>(dims[1]),
+        static_cast<NSUInteger>(dims[2]),
+        MTLTextureUsageShaderRead,
+        MTLStorageModeShared);
+      if (!tex)
       {
-        tex = oldTex;
+        vtkErrorMacro("Failed to create mask texture");
+        return false;
       }
-      else
-      {
-        ReleaseMetalObject(this->MaskTexture);
-
-        tex = NewTexture3D(
-          device,
-          chosenFormat,
-          static_cast<NSUInteger>(dims[0]),
-          static_cast<NSUInteger>(dims[1]),
-          static_cast<NSUInteger>(dims[2]),
-          MTLTextureUsageShaderRead,
-          MTLStorageModeShared);
-        if (!tex)
-        {
-          vtkErrorMacro("Failed to create mask texture");
-          return false;
-        }
-        AssignMetalObject(this->MaskTexture, tex);
-      }
+      AssignMetalObject(this->MaskTexture, tex);
 
       // Upload mask data to texture
       MTLRegion region = MTLRegionMake3D(0, 0, 0, dims[0], dims[1], dims[2]);
@@ -2920,38 +2913,24 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateLabelMapTransferTexture(
         }
       }
 
-      // Create or update the 2D texture
-      id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->LabelMapTransferTexture;
-      id<MTLTexture> tex = nil;
+      // Swap (not in-place update) — see UpdateTransferFunctionTexture for
+      // the full rationale.  This 2D texture (1024 × numLabels × 4 B) is
+      // small enough that per-reload allocation is trivially cheap.
+      ReleaseMetalObject(this->LabelMapTransferTexture);
 
-      // Check if existing texture has the right dimensions (numLabels may have changed)
-      if (oldTex && static_cast<int>(oldTex.width) == tfWidth &&
-          static_cast<int>(oldTex.height) == tfHeight &&
-          oldTex.pixelFormat == MTLPixelFormatRGBA8Unorm)
+      id<MTLTexture> tex = NewTexture2D(
+        device,
+        MTLPixelFormatRGBA8Unorm,
+        static_cast<NSUInteger>(tfWidth),
+        static_cast<NSUInteger>(tfHeight),
+        MTLTextureUsageShaderRead,
+        MTLStorageModeShared);
+      if (!tex)
       {
-        tex = oldTex;
+        vtkErrorMacro("Failed to create label map transfer texture");
+        return false;
       }
-      else
-      {
-        if (this->LabelMapTransferTexture)
-        {
-          ReleaseMetalObject(this->LabelMapTransferTexture);
-        }
-
-        tex = NewTexture2D(
-          device,
-          MTLPixelFormatRGBA8Unorm,
-          static_cast<NSUInteger>(tfWidth),
-          static_cast<NSUInteger>(tfHeight),
-          MTLTextureUsageShaderRead,
-          MTLStorageModeShared);
-        if (!tex)
-        {
-          vtkErrorMacro("Failed to create label map transfer texture");
-          return false;
-        }
-        AssignMetalObject(this->LabelMapTransferTexture, tex);
-      }
+      AssignMetalObject(this->LabelMapTransferTexture, tex);
 
       // Upload data to texture
       MTLRegion region = MTLRegionMake2D(0, 0, tfWidth, tfHeight);
