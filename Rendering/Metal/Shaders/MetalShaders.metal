@@ -1719,12 +1719,8 @@ inline half4 marchVolume(
     }
 
     half sampleOpacity = colorOpacity.a;
-    // Shader-side opacity pre-integration: adjust raw opacity by step distance.
-    // Avoids CPU rebuild of the TF texture when sample distance changes.
-    half stepFactor = volumeUniforms.opacityPreIntegrationFactor;
-    if (sampleOpacity > 0.0001h && stepFactor > 0.0h) {
-        sampleOpacity = 1.0h - pow(1.0h - sampleOpacity, stepFactor);
-    }
+    // Opacity pre-integration is baked into the transfer function texture
+    // on the CPU at TF-build time (matches OpenGL backend).
 
     if (sampleOpacity > 0.001h) {
       half3 sampleColor = colorOpacity.rgb;
@@ -2159,10 +2155,8 @@ inline void marchSegment(
         }
 
         half sampleOpacity = colorOpacity.a;
-        half stepFactor = volumeUniforms.opacityPreIntegrationFactor;
-        if (sampleOpacity > 0.0001h && stepFactor > 0.0h) {
-            sampleOpacity = 1.0h - pow(1.0h - sampleOpacity, stepFactor);
-        }
+        // Opacity pre-integration is baked into the transfer function texture
+        // on the CPU at TF-build time (matches OpenGL backend).
 
         if (sampleOpacity > 0.001h) {
             half3 sampleColor = colorOpacity.rgb;

@@ -959,6 +959,36 @@ static void FillTransferFunctionRGBA8(
   }
 }
 
+// Fill a RGBA8 transfer function row with CPU-side opacity pre-integration,
+// matching the OpenGL backend's approach (vtkOpenGLVolumeOpacityTable::InternalUpdate).
+// preIntegrationFactor = sampleDistance / unitDistance.
+static void FillTransferFunctionRGBA8WithPreIntegration(
+  vtkColorTransferFunction* colorFunc,
+  vtkPiecewiseFunction* opacityFunc,
+  double scalarMin,
+  double scalarMax,
+  int width,
+  uint8_t* row,
+  double preIntegrationFactor)
+{
+  std::vector<double> rgb(width * 3);
+  std::vector<double> alpha(width);
+  colorFunc->GetTable(scalarMin, scalarMax, width, rgb.data());
+  opacityFunc->GetTable(scalarMin, scalarMax, width, alpha.data());
+  for (int i = 0; i < width; ++i)
+  {
+    double a = alpha[i];
+    if (a > 0.0001 && preIntegrationFactor > 0.0)
+    {
+      a = 1.0 - std::pow(1.0 - a, preIntegrationFactor);
+    }
+    row[i * 4 + 0] = ColorToByte(rgb[i * 3 + 0]);
+    row[i * 4 + 1] = ColorToByte(rgb[i * 3 + 1]);
+    row[i * 4 + 2] = ColorToByte(rgb[i * 3 + 2]);
+    row[i * 4 + 3] = ColorToByte(a);
+  }
+}
+
 //------------------------------------------------------------------------------
 // Refactoring 12: create a dummy 3D texture filled with a constant value
 static id<MTLTexture> CreateDummy3DTexture(
@@ -2354,7 +2384,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
 
 //------------------------------------------------------------------------------
 bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
-  void* mtlDeviceVoid, void* mtlQueueVoid, vtkVolume* vol)
+  void* mtlDeviceVoid, void* mtlQueueVoid, vtkVolume* vol,
+  double actualSampleDistance)
 {
   vtkVolumeProperty* property = vol->GetProperty();
   if (!property)
@@ -2369,6 +2400,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
     return false;
   }
 
+  bool sampleDistChanged =
+    (actualSampleDistance != this->LastTransferFunctionSampleDist);
+
   bool scalarRangeChanged =
     (this->ScalarRange[0] != this->LastTransferFunctionScalarRange[0]) ||
     (this->ScalarRange[1] != this->LastTransferFunctionScalarRange[1]);
@@ -2377,18 +2411,28 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
   doReload |= (colorFunc->GetMTime() > this->TransferFunctionUploadTime.GetMTime());
   doReload |= (opacityFunc->GetMTime() > this->TransferFunctionUploadTime.GetMTime());
   doReload |= scalarRangeChanged;
+  doReload |= sampleDistChanged;
 
   if (doReload)
   {
+    // Compute pre-integration factor (sampleDistance / unitDistance), same as
+    // vtkOpenGLVolumeOpacityTable::InternalUpdate.
+    double unitDist = property->GetScalarOpacityUnitDistance(0);
+    if (unitDist <= 0.0) unitDist = 1.0;
+    double preIntegrationFactor = actualSampleDistance / unitDist;
+
+    const int tfWidth = 256;
+
     @autoreleasepool
     {
       id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
 
       unsigned char tfData[256 * 4];
-      FillTransferFunctionRGBA8(
+      FillTransferFunctionRGBA8WithPreIntegration(
         colorFunc, opacityFunc,
         this->ScalarRange[0], this->ScalarRange[1],
-        256, tfData);
+        tfWidth, tfData,
+        preIntegrationFactor);
 
       id<MTLTexture> oldTfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
       id<MTLTexture> tex = nil;
@@ -2404,7 +2448,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
         tex = NewTexture2D(
           device,
           MTLPixelFormatRGBA8Unorm,
-          256, 1,
+          static_cast<NSUInteger>(tfWidth), 1,
           MTLTextureUsageShaderRead,
           MTLStorageModeShared);
         if (!tex)
@@ -2415,14 +2459,15 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
         AssignMetalObject(this->ColorOpacityTexture, tex);
       }
 
-      MTLRegion region = MTLRegionMake2D(0, 0, 256, 1);
+      MTLRegion region = MTLRegionMake2D(0, 0, tfWidth, 1);
       [tex replaceRegion:region
             mipmapLevel:0
               withBytes:tfData
-            bytesPerRow:256 * 4];
+            bytesPerRow:static_cast<NSUInteger>(tfWidth) * 4];
 
       this->LastTransferFunctionScalarRange[0] = this->ScalarRange[0];
       this->LastTransferFunctionScalarRange[1] = this->ScalarRange[1];
+      this->LastTransferFunctionSampleDist = actualSampleDistance;
       this->TransferFunctionUploadTime.Modified();
     }
   }
@@ -4650,7 +4695,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     actualSampleDistance = this->GetSampleDistance();
   }
 
-  if (!this->UpdateTransferFunctionTexture(mtlDevice, mtlQueue, vol))
+  if (!this->UpdateTransferFunctionTexture(mtlDevice, mtlQueue, vol, actualSampleDistance))
   {
     return;
   }
@@ -4728,15 +4773,10 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   uniforms.SampleDistanceHalf =
     FloatToHalf(static_cast<float>(actualSampleDistance / maxBoundsSize));
 
-  // Opacity pre-integration factor: stepDistance / unitDistance.
-  // Applied in the shader: alpha = 1.0 - pow(1.0 - alpha, factor).
-  {
-    vtkVolumeProperty* volProp = vol->GetProperty();
-    double unitDist = volProp ? volProp->GetScalarOpacityUnitDistance(0) : 1.0;
-    if (unitDist <= 0.0) unitDist = 1.0;
-    uniforms.OpacityPreIntegrationFactorHalf =
-      FloatToHalf(static_cast<float>(actualSampleDistance / unitDist));
-  }
+  // Opacity pre-integration is baked into the transfer function texture
+  // on the CPU at TF-build time (matches OpenGL backend).
+  // Set to 1.0 (no-op) in case any shader variant still reads this field.
+  uniforms.OpacityPreIntegrationFactorHalf = FloatToHalf(1.0f);
 
   {
     float normFactor = this->ScalarNormalizationFactor;
