@@ -332,6 +332,27 @@ private:
   // Build PerBlockData from global uniforms for single-block volumes.
   static void BuildPerBlockData(PerBlockData& pbd, const VolumeMapperUniforms* uniforms);
 
+  // Volume light uniforms for multi-light shading support.
+  struct VolumeLightData {
+    float position[4];
+    float direction[4];
+    float ambientColor[4];
+    float diffuseColor[4];
+    float specularColor[4];
+    float attenuation[4];
+  };
+  struct VolumeLightUniforms {
+    VolumeLightData lights[8];
+    int32_t lightCount;
+    int32_t numPositionalLights;
+    int32_t twoSidedLighting;
+    int32_t defaultLighting;
+    int32_t _pad[4];
+  };
+  void BuildVolumeLightUniforms(vtkRenderer* ren, vtkVolume* vol,
+    vtkMatrix4x4* invModelMatrix, const double modelBounds[6],
+    const double boundsSize[3], VolumeLightUniforms& out);
+
   unsigned short Partitions[3] = { 1, 1, 1 };
 
   // Per-macrocell scalar min/max — computed by UpdateMinMaxTexture and consumed

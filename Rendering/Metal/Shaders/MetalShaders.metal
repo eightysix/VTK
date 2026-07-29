@@ -1347,6 +1347,24 @@ struct VolumeMapperUniforms {
   float minMaxDimZ;
 };
 
+struct VolumeLight {
+    float4 position;      // xyz = position (positional lights), w = type (0=directional, 1=positional)
+    float4 direction;     // xyz = direction (directional) or focal-point direction (spot), w = cone angle (degrees)
+    float4 ambientColor;  // rgb * intensity
+    float4 diffuseColor;  // rgb * intensity
+    float4 specularColor; // rgb * intensity
+    float4 attenuation;   // x=constant, y=linear, z=quadratic, w=spot exponent
+};
+
+struct VolumeLightUniforms {
+    VolumeLight lights[MAX_LIGHTS]; // 8 * 96 = 768 bytes
+    int lightCount;                 // 4 bytes
+    int numPositionalLights;        // 4 bytes (informational, not used in shader)
+    int twoSidedLighting;           // 4 bytes
+    int defaultLighting;            // 4 bytes
+    int _pad[4];                    // 16 bytes; total = 800 (must match C++ VolumeLightUniforms)
+};
+
 struct VolumeVertexOut {
   float4 position [[position]];
   float3 localPos;
@@ -1472,8 +1490,12 @@ inline half4 computeGradientFast(texture3d<float> volTex, float3 pos,
 
 // Optimized: Pure FP16 math and fast::pow
 inline half3 computePhongLightingVolumeFast(half3 sampleColor, half3 normal, half3 lightDir, half3 viewDir,
-                                            half3 ambientMat, half3 diffuseMat, half3 specularMat, half shininess) {
+                                            half3 ambientMat, half3 diffuseMat, half3 specularMat, half shininess,
+                                            bool twoSided = false) {
   half nDotL = dot(normal, -lightDir);
+  if (nDotL < 0.0h && twoSided) {
+    nDotL = -nDotL;
+  }
   if (nDotL > 0.0h) {
     half3 diffuse = nDotL * diffuseMat * sampleColor;
     half3 r = normal * (2.0h * nDotL) + lightDir;
@@ -1483,6 +1505,94 @@ inline half3 computePhongLightingVolumeFast(half3 sampleColor, half3 normal, hal
     return ambientMat * sampleColor + diffuse + specular;
   }
   return ambientMat * sampleColor;
+}
+
+// Full multi-light volume shading. Loops over all active lights, accumulating
+// ambient + diffuse + specular contributions. Handles directional, positional,
+// and spot lights with attenuation. Matches OpenGL's ComputeLightingDeclaration.
+inline half3 computeVolumeLighting(
+    half3 sampleColor,
+    half3 normal,
+    half3 viewDir,           // normalized, pointing toward camera (in volume space)
+    half3 ambientMat,
+    half3 diffuseMat,
+    half3 specularMat,
+    half shininess,
+    constant VolumeLightUniforms& lightUniforms,
+    float3 fragPosVolume)    // current sample position in [0,1] volume space
+{
+    half3 totalAmbient  = half3(0.0h);
+    half3 totalDiffuse  = half3(0.0h);
+    half3 totalSpecular = half3(0.0h);
+
+    int numLights = lightUniforms.lightCount;
+    bool twoSided = lightUniforms.twoSidedLighting != 0;
+
+    for (int i = 0; i < numLights && i < MAX_LIGHTS; ++i) {
+        constant VolumeLight& L = lightUniforms.lights[i];
+
+        half3 lightAmbient  = half3(L.ambientColor.rgb);
+        half3 lightDiffuse  = half3(L.diffuseColor.rgb);
+        half3 lightSpecular = half3(L.specularColor.rgb);
+
+        half3 toLight;
+        half attenuation = 1.0h;
+
+        if (L.position.w < 0.5) {
+            // Directional light: direction is pre-normalized in volume space
+            toLight = half3(-L.direction.xyz);
+        } else {
+            // Positional light: compute direction from fragment to light
+            half3 lightPos = half3(L.position.xyz);
+            half3 delta = lightPos - half3(fragPosVolume);
+            half dist = length(delta);
+            toLight = dist > 0.0001h ? delta / dist : half3(0.0h, 0.0h, 1.0h);
+
+            // Attenuation: 1 / (constant + linear*d + quadratic*d^2)
+            half attenDenom = half(L.attenuation.x)
+                            + half(L.attenuation.y) * dist
+                            + half(L.attenuation.z) * dist * dist;
+            attenuation = attenDenom > 0.0h ? 1.0h / attenDenom : 0.0h;
+
+            // Spot light cone check
+            if (L.direction.w <= 90.0) {
+                half spotCos = dot(-toLight, half3(normalize(L.direction.xyz)));
+                half spotCutoff = half(cos(float(L.direction.w) * (M_PI_F / 180.0)));
+                if (spotCos < spotCutoff) {
+                    attenuation = 0.0h;
+                } else {
+                    attenuation *= fast::pow(spotCos, half(L.attenuation.w));
+                }
+            }
+        }
+
+        // Diffuse
+        half nDotL = dot(normal, toLight);
+        if (nDotL < 0.0h && twoSided) {
+            nDotL = -nDotL;
+        }
+        if (nDotL > 0.0h) {
+            totalDiffuse += nDotL * lightDiffuse * attenuation;
+
+            // Phong reflection vector (matches OpenGL's ComputeLightingDeclaration
+            // and computePhongLightingVolumeFast)
+            half3 r = normalize(normal * (2.0h * nDotL) - toLight);
+            half vDotR = dot(viewDir, r);
+            if (vDotR < 0.0h && twoSided) {
+                vDotR = -vDotR;
+            }
+            if (vDotR > 0.0h) {
+                totalSpecular += fast::pow(vDotR, shininess) * lightSpecular * attenuation;
+            }
+        }
+
+        // Ambient (always accumulates)
+        totalAmbient += lightAmbient;
+    }
+
+    return ambientMat * totalAmbient * sampleColor
+         + diffuseMat * totalDiffuse * sampleColor
+         + specularMat * totalSpecular;
 }
 
 // Branchless, fast crop region evaluator (returns 0..26 matching VTK region bit convention)
@@ -1603,7 +1713,8 @@ inline half4 marchVolume(
     texture3d<float> maskTexture,
     texture2d<float> labelMapTransferTexture,
     texture3d<float> minMaxTexture,
-    texture3d<float> normalTexture) {
+    texture3d<float> normalTexture,
+    constant VolumeLightUniforms* lightUniforms) {
   const bool doShading = fc_shading && (volumeUniforms.useGradientShading > 0.5);
   const bool doGradOp = fc_gradientOpacity && (volumeUniforms.useGradientOpacity > 0.5);
   const bool doCropping = volumeUniforms.useCropping > 0.5;
@@ -1787,7 +1898,15 @@ inline half4 marchVolume(
           gradMag = grad.w;
         }
 
-        sampleColor = computePhongLightingVolumeFast(sampleColor, normal, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
+        if (lightUniforms != nullptr && lightUniforms->defaultLighting == 0) {
+          sampleColor = computeVolumeLighting(sampleColor, normal, -viewDirHalf,
+              ambientMat, diffuseMat, specularMat, shininessMat,
+              *lightUniforms, evalPoint);
+        } else {
+          bool twoSided = (lightUniforms != nullptr && lightUniforms->twoSidedLighting != 0);
+          sampleColor = computePhongLightingVolumeFast(sampleColor, normal, lightDirHalf, viewDirHalf,
+              ambientMat, diffuseMat, specularMat, shininessMat, twoSided);
+        }
 
         if (doGradOp) {
           sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(gradMag), 0.5), level(0)).r);
@@ -1824,7 +1943,8 @@ fragment VolumeFragmentOut fragment_volume_main(
     texture3d<float> maskTexture [[texture(4)]],
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
-    texture3d<float> normalTexture [[texture(7)]]) {
+    texture3d<float> normalTexture [[texture(7)]],
+    constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
 
   VolumeFragmentOut output;
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
@@ -1846,7 +1966,8 @@ fragment VolumeFragmentOut fragment_volume_main(
       stepSize, s.totalBoxT, in.position.xy,
       half3(0.0), 0.0h, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture,
-      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
+      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
+      &volumeLights);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
@@ -1868,7 +1989,8 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
     texture3d<float> maskTexture [[texture(4)]],
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
-    texture3d<float> normalTexture [[texture(7)]]) {
+    texture3d<float> normalTexture [[texture(7)]],
+    constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
 
   VolumeFragmentOut output;
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
@@ -1894,7 +2016,8 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
       stepSize, s.totalBoxT, in.position.xy,
       half3(0.0), 0.0h, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture,
-      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture);
+      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
+      &volumeLights);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
@@ -2048,7 +2171,8 @@ inline void marchSegment(
     texture3d<float> maskTexture,
     texture2d<float> labelMapTransferTexture,
     texture3d<float> minMaxTexture,
-    texture3d<float> normalTexture)
+    texture3d<float> normalTexture,
+    constant VolumeLightUniforms* lightUniforms)
 {
     const bool doShading = fc_shading && (volumeUniforms.useGradientShading > 0.5);
     const bool doGradOp = fc_gradientOpacity && (volumeUniforms.useGradientOpacity > 0.5);
@@ -2223,7 +2347,15 @@ inline void marchSegment(
                         gradMag = grad.w;
                     }
 
-                    sampleColor = computePhongLightingVolumeFast(sampleColor, normal, lightDirHalf, viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat);
+                    if (lightUniforms != nullptr && lightUniforms->defaultLighting == 0) {
+                        sampleColor = computeVolumeLighting(sampleColor, normal, -viewDirHalf,
+                            ambientMat, diffuseMat, specularMat, shininessMat,
+                            *lightUniforms, evalPoint);
+                    } else {
+                        bool twoSided = (lightUniforms != nullptr && lightUniforms->twoSidedLighting != 0);
+                        sampleColor = computePhongLightingVolumeFast(sampleColor, normal, lightDirHalf, viewDirHalf,
+                            ambientMat, diffuseMat, specularMat, shininessMat, twoSided);
+                    }
 
                     if (doGradOp) {
                         sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(gradMag), 0.5), level(0)).r);
@@ -2263,7 +2395,8 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
     texture3d<float> normalTexture [[texture(7)]],
-    texture3d<float> brickOccupancy [[texture(8)]])
+    texture3d<float> brickOccupancy [[texture(8)]],
+    constant VolumeLightUniforms& volumeLights [[buffer(4)]])
 {
     VolumeFragmentOut output;
 
@@ -2399,7 +2532,8 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
                     volumeUniforms, b,
                     volumeTexture, transferFunctionTexture,
                     gradientOpacityTexture, maskTexture, labelMapTransferTexture,
-                    minMaxTexture, normalTexture);
+                    minMaxTexture, normalTexture,
+                    &volumeLights);
             }
         }
 

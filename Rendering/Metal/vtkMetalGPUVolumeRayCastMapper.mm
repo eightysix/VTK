@@ -24,6 +24,8 @@
 #include "vtkTriangleFilter.h"
 #include "vtkPlaneCollection.h"
 #include "vtkPlane.h"
+#include "vtkLightCollection.h"
+#include "vtkLight.h"
 #include "vtkPolyData.h"
 #include "vtkPoints.h"
 #include "vtkCellArray.h"
@@ -137,6 +139,30 @@ static_assert(offsetof(VolumeMapperUniforms, UseMask) == 928, "");
 static_assert(offsetof(VolumeMapperUniforms, UseDepthTexture) == 948, "");
 static_assert(offsetof(VolumeMapperUniforms, UseNormalTexture) == 952, "");
 static_assert(offsetof(VolumeMapperUniforms, UseMinMaxAccel) == 960, "");
+
+// Per-light data for volume shading — must match Metal VolumeLight struct
+// Must match Metal VolumeLight (6 x float4 = 96 bytes per light)
+struct VolumeLightData {
+  float position[4];      // xyz + type (0=directional, 1=positional)
+  float direction[4];     // xyz + cone angle
+  float ambientColor[4];  // rgb * intensity
+  float diffuseColor[4];  // rgb * intensity
+  float specularColor[4]; // rgb * intensity
+  float attenuation[4];   // constant, linear, quadratic, spot exponent
+};
+
+// Must match Metal VolumeLightUniforms exactly (800 bytes)
+struct VolumeLightUniforms {
+  VolumeLightData lights[8];  // 8 * 96 = 768 bytes
+  int32_t lightCount;         // 4 bytes
+  int32_t numPositionalLights;// 4 bytes (informational, not used in shader)
+  int32_t twoSidedLighting;   // 4 bytes
+  int32_t defaultLighting;    // 4 bytes
+  int32_t _pad[4];            // 16 bytes; total = 800
+};
+
+static_assert(sizeof(VolumeLightUniforms) == 800,
+  "VolumeLightUniforms must be 800 bytes to match Metal shader struct");
 
 // Per-block data for volume rendering — must match Metal PerBlockData struct
 struct PerBlockData {
@@ -3705,6 +3731,126 @@ void vtkMetalGPUVolumeRayCastMapper::SetClippingPlaneUniforms(
   uniforms->NumClippingPlanes = static_cast<float>(numPlanes);
 }
 //------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::BuildVolumeLightUniforms(
+  vtkRenderer* ren, vtkVolume* vol, vtkMatrix4x4* invModelMatrix,
+  const double modelBounds[6], const double boundsSize[3],
+  VolumeLightUniforms& out)
+{
+  memset(&out, 0, sizeof(out));
+
+  vtkVolumeProperty* property = vol->GetProperty();
+  if (!property || !property->GetShade()) {
+    out.lightCount = 0;
+    out.defaultLighting = 1;
+    return;
+  }
+
+  out.twoSidedLighting = ren->GetTwoSidedLighting() ? 1 : 0;
+
+  vtkLightCollection* lc = ren->GetLights();
+  vtkLight* light = nullptr;
+  vtkCollectionSimpleIterator sit;
+
+  int totalLights = 0;
+  int positionalLights = 0;
+  bool isDefault = true;
+
+  // First pass: count lights and determine if default (single headlight)
+  for (lc->InitTraversal(sit); (light = lc->GetNextLight(sit));) {
+    if (light->GetSwitch() <= 0.0) continue;
+    totalLights++;
+    if (light->GetPositional()) positionalLights++;
+    if (totalLights > 1 || light->GetIntensity() != 1.0 ||
+        light->GetLightType() != VTK_LIGHT_TYPE_HEADLIGHT) {
+      isDefault = false;
+    }
+  }
+
+  out.lightCount = std::min(totalLights, 8);
+  out.numPositionalLights = positionalLights;
+  out.defaultLighting = isDefault ? 1 : 0;
+
+  if (out.lightCount == 0) return;
+
+  // Second pass: fill light data
+  // OpenGL convention: positional lights first, then directional
+  int posIdx = 0;
+  int dirIdx = positionalLights;
+
+  for (lc->InitTraversal(sit); (light = lc->GetNextLight(sit));) {
+    if (light->GetSwitch() <= 0.0) continue;
+
+    int idx = light->GetPositional() ? posIdx++ : dirIdx++;
+    if (idx >= 8) break;
+
+    VolumeLightData& L = out.lights[idx];
+    double intensity = light->GetIntensity();
+
+    // Colors (pre-multiplied by intensity, matching OpenGL)
+    double* aColor = light->GetAmbientColor();
+    double* dColor = light->GetDiffuseColor();
+    double* sColor = light->GetSpecularColor();
+    for (int c = 0; c < 3; ++c) {
+      L.ambientColor[c]  = static_cast<float>(aColor[c] * intensity);
+      L.diffuseColor[c]  = static_cast<float>(dColor[c] * intensity);
+      L.specularColor[c] = static_cast<float>(sColor[c] * intensity);
+    }
+    L.ambientColor[3] = L.diffuseColor[3] = L.specularColor[3] = 1.0f;
+
+    // Direction: transform to volume-local [0,1] space
+    double* lfp = light->GetTransformedFocalPoint();
+    double* lp  = light->GetTransformedPosition();
+    double lightDir[3];
+    vtkMath::Subtract(lfp, lp, lightDir);
+    vtkMath::Normalize(lightDir);
+
+    // Transform direction to model space, then to normalized volume space
+    double dirLocal[4] = { lightDir[0], lightDir[1], lightDir[2], 0.0 };
+    invModelMatrix->MultiplyPoint(dirLocal, dirLocal);
+    // Scale by bounds size for normalized space (direction, not position)
+    dirLocal[0] /= boundsSize[0];
+    dirLocal[1] /= boundsSize[1];
+    dirLocal[2] /= boundsSize[2];
+    double dLen = sqrt(dirLocal[0]*dirLocal[0] + dirLocal[1]*dirLocal[1] + dirLocal[2]*dirLocal[2]);
+    if (dLen > 1e-10) {
+      dirLocal[0] /= dLen; dirLocal[1] /= dLen; dirLocal[2] /= dLen;
+    }
+    L.direction[0] = static_cast<float>(dirLocal[0]);
+    L.direction[1] = static_cast<float>(dirLocal[1]);
+    L.direction[2] = static_cast<float>(dirLocal[2]);
+    L.direction[3] = static_cast<float>(light->GetConeAngle());
+
+    if (light->GetPositional()) {
+      L.position[3] = 1.0f;  // type = positional
+
+      // Transform position to normalized volume [0,1] space
+      double posWorld[4] = { lp[0], lp[1], lp[2], 1.0 };
+      double posLocal[4];
+      invModelMatrix->MultiplyPoint(posWorld, posLocal);
+      if (fabs(posLocal[3]) > 1e-12) {
+        posLocal[0] /= posLocal[3];
+        posLocal[1] /= posLocal[3];
+        posLocal[2] /= posLocal[3];
+      }
+      for (int a = 0; a < 3; ++a) {
+        L.position[a] = static_cast<float>((posLocal[a] - modelBounds[a * 2]) / boundsSize[a]);
+      }
+
+      // Attenuation
+      double* attn = light->GetAttenuationValues();
+      double charSize = std::max({boundsSize[0], boundsSize[1], boundsSize[2]});
+      L.attenuation[0] = static_cast<float>(attn[0]);  // constant
+      L.attenuation[1] = static_cast<float>(attn[1] * charSize);  // linear (scaled)
+      L.attenuation[2] = static_cast<float>(attn[2] * charSize * charSize);  // quadratic (scaled)
+      L.attenuation[3] = static_cast<float>(light->GetExponent());  // spot exponent
+    } else {
+      L.position[3] = 0.0f;  // type = directional
+      L.attenuation[0] = 1.0f;  // no attenuation for directional
+    }
+  }
+}
+
+//------------------------------------------------------------------------------
 bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
   void* mtlDeviceVoid, vtkRenderer* ren, vtkVolume* vol, vtkImageData* input)
 {
@@ -4950,6 +5096,15 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // Mask / label map
   this->SetMaskUniforms(&uniforms, vol);
 
+  // Volume light uniforms for multi-light shading
+  VolumeLightUniforms lightUniforms = {};
+  {
+    double bs[3] = {
+      vb.Size[0], vb.Size[1], vb.Size[2]
+    };
+    this->BuildVolumeLightUniforms(ren, vol, invModelMatrix, this->ModelBounds, bs, lightUniforms);
+  }
+
   // Capture the scene depth texture for early ray termination.
   // The depth buffer is written by opaque geometry in the earlier render pass.
   // When MSAA is active, the depth texture is multisampled and cannot be sampled
@@ -5156,6 +5311,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         (__bridge void*)normTex,
         false, &pbd, MTLCullModeNone);
 
+      [gridEnc setFragmentBytes:&lightUniforms length:sizeof(lightUniforms) atIndex:4];
       [gridEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
       [gridEnc endEncoding];
     }
@@ -5179,6 +5335,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       metalViewport.znear = 0.0;
       metalViewport.zfar = 1.0;
       [offscreenEncoder setViewport:metalViewport];
+
+      [offscreenEncoder setFragmentBytes:&lightUniforms length:sizeof(lightUniforms) atIndex:4];
 
       if (cameraInside)
       {
@@ -5215,6 +5373,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     // fullscreen or proxy-geometry if grid traversal resources are unavailable.
     bool useGridTraversalDirect = (usePartitions && this->VolumeTexture &&
       this->GridTraversalResourcesValid);
+
+    [encoder setFragmentBytes:&lightUniforms length:sizeof(lightUniforms) atIndex:4];
 
     if (useGridTraversalDirect)
     {
