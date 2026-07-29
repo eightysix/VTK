@@ -200,9 +200,23 @@ didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
   benchmarkCmd.title = @"Toggle Benchmark";
   benchmarkCmd.discoverabilityTitle = @"Toggle GPU Benchmark";
   
+  UIKeyCommand* incSampleCmd = [UIKeyCommand
+                                keyCommandWithInput:@"+"
+                                modifierFlags:UIKeyModifierControl | UIKeyModifierAlternate
+                                action:@selector(increaseSampleDistance:)];
+  incSampleCmd.title = @"Increase Sample Distance";
+  incSampleCmd.discoverabilityTitle = @"Increase sample distance by 0.5";
+
+  UIKeyCommand* decSampleCmd = [UIKeyCommand
+                                keyCommandWithInput:@"-"
+                                modifierFlags:UIKeyModifierControl | UIKeyModifierAlternate
+                                action:@selector(decreaseSampleDistance:)];
+  decSampleCmd.title = @"Decrease Sample Distance";
+  decSampleCmd.discoverabilityTitle = @"Decrease sample distance by 0.5";
+
   UIMenu* renderingMenu = [UIMenu
                            menuWithTitle:@"Rendering"
-                           children:@[ nextPresetCmd, prevPresetCmd, benchmarkCmd ]];
+                           children:@[ nextPresetCmd, prevPresetCmd, benchmarkCmd, incSampleCmd, decSampleCmd ]];
 
   // File submenu
   UIKeyCommand* loadFileCmd = [UIKeyCommand

@@ -12,4 +12,7 @@ class vtkVolumeProperty;
 
 - (double)rescale:(double)hu;
 
+- (IBAction)increaseSampleDistance:(nullable id)sender;
+- (IBAction)decreaseSampleDistance:(nullable id)sender;
+
 @end
