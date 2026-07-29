@@ -260,16 +260,31 @@
   {
     CGPoint p = [recognizer locationInView:recognizer.view];
     CGFloat scale = recognizer.view.contentScaleFactor;
+    int* vpSize = ren->GetSize();
     _zoomAnchorDisplay[0] = (int)(p.x * scale);
-    _zoomAnchorDisplay[1] = (int)(p.y * scale);
+    _zoomAnchorDisplay[1] = vpSize[1] - (int)(p.y * scale); // Flip Y (iOS top-left → VTK bottom-left)
 
+    // Compute anchor world point at the focal-plane depth
     ren->SetDisplayPoint(_zoomAnchorDisplay[0], _zoomAnchorDisplay[1], 0);
     ren->DisplayToWorld();
-
     double hom[4];
     ren->GetWorldPoint(hom);
     if (hom[3] == 0.0) return;
-    for (int i = 0; i < 3; ++i) _zoomAnchorWorld[i] = hom[i] / hom[3];
+
+    double pos[3], fp[3];
+    cam->GetPosition(pos);
+    cam->GetFocalPoint(fp);
+    double dist = cam->GetDistance();
+    double dir[3] = {fp[0]-pos[0], fp[1]-pos[1], fp[2]-pos[2]};
+    vtkMath::Normalize(dir);
+
+    double ray[3] = {hom[0]/hom[3] - pos[0], hom[1]/hom[3] - pos[1], hom[2]/hom[3] - pos[2]};
+    vtkMath::Normalize(ray);
+
+    double cosAngle = vtkMath::Dot(ray, dir);
+    if (cosAngle <= 0.0) return;
+    double t = dist / cosAngle;
+    for (int i = 0; i < 3; ++i) _zoomAnchorWorld[i] = pos[i] + ray[i] * t;
 
     _zoomAnchorValid = YES;
 
@@ -289,42 +304,41 @@
 
   if (didZoom)
   {
-    cam->Zoom(factor);
+    cam->Dolly(factor);
 
-    ren->SetDisplayPoint(_zoomAnchorDisplay[0], _zoomAnchorDisplay[1], 0);
-    ren->DisplayToWorld();
-    double newHom[4];
-    ren->GetWorldPoint(newHom);
-    if (newHom[3] == 0.0) return;
-
-    double newWorld[3] = {
-      newHom[0] / newHom[3],
-      newHom[1] / newHom[3],
-      newHom[2] / newHom[3]};
-
-    double d[3] = {
-      _zoomAnchorWorld[0] - newWorld[0],
-      _zoomAnchorWorld[1] - newWorld[1],
-      _zoomAnchorWorld[2] - newWorld[2]};
-
+    // Compute new world point at focal plane for the same screen anchor
     double pos[3], fp[3];
     cam->GetPosition(pos);
     cam->GetFocalPoint(fp);
-    for (int i = 0; i < 3; ++i)
-    {
-      pos[i] += d[i];
-      fp[i] += d[i];
-    }
+    double newDist = cam->GetDistance();
+    double dir[3] = {fp[0]-pos[0], fp[1]-pos[1], fp[2]-pos[2]};
+    vtkMath::Normalize(dir);
+
+    ren->SetDisplayPoint(_zoomAnchorDisplay[0], _zoomAnchorDisplay[1], 0);
+    ren->DisplayToWorld();
+    double hom[4];
+    ren->GetWorldPoint(hom);
+    if (hom[3] == 0.0) return;
+
+    double ray[3] = {hom[0]/hom[3] - pos[0], hom[1]/hom[3] - pos[1], hom[2]/hom[3] - pos[2]};
+    vtkMath::Normalize(ray);
+
+    double cosAngle = vtkMath::Dot(ray, dir);
+    if (cosAngle <= 0.0) return;
+    double t = newDist / cosAngle;
+    double newAnchorWorld[3] = {pos[0] + ray[0]*t, pos[1] + ray[1]*t, pos[2] + ray[2]*t};
+
+    // Translate camera to keep the anchor fixed in world space
+    double d[3] = {
+      _zoomAnchorWorld[0] - newAnchorWorld[0],
+      _zoomAnchorWorld[1] - newAnchorWorld[1],
+      _zoomAnchorWorld[2] - newAnchorWorld[2]};
+
+    for (int i = 0; i < 3; ++i) { pos[i] += d[i]; fp[i] += d[i]; }
     cam->SetPosition(pos);
     cam->SetFocalPoint(fp);
 
     ren->ResetCameraClippingRange();
-
-    ren->SetDisplayPoint(_zoomAnchorDisplay[0], _zoomAnchorDisplay[1], 0);
-    ren->DisplayToWorld();
-    ren->GetWorldPoint(newHom);
-    if (newHom[3] != 0.0)
-      for (int i = 0; i < 3; ++i) _zoomAnchorWorld[i] = newHom[i] / newHom[3];
   }
 
   switch (recognizer.state)
