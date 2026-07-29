@@ -12,12 +12,12 @@
 
 #include "vtkOpenGLRenderer.h"         // for ivar
 #include "vtkRenderingOpenGL2Module.h" // for export macro
-#include "vtkWeakPointer.h"            // for ivar
 
 VTK_ABI_NAMESPACE_BEGIN
 class vtkActor;
 class vtkInformationObjectBaseKey;
 class vtkOpenGLRenderer;
+class vtkShaderProgram;
 
 class VTKRENDERINGOPENGL2_EXPORT vtkGLSLModLight : public vtkGLSLModifierBase
 {
@@ -30,6 +30,7 @@ public:
   {
     int Complexity = 0;
     int Count = 0;
+    bool IBL = false;
   };
 
   static LightStatsBasic GetBasicLightStats(vtkOpenGLRenderer* renderer, vtkActor* actor);
@@ -58,11 +59,32 @@ protected:
   /// @name Light statistics
   int LastLightComplexity = 0;
   int LastLightCount = 0;
+  bool LastLightIBL = false;
 
   /// @name PBR settings
   bool UsePBRTextures = false;
   bool UseAnisotropy = false;
   bool UseClearCoat = false;
+
+  /// @name Cached uniform locations
+  /// Locations for the vtkProperty uniforms set on every draw. Resolved once per
+  /// program link (keyed on the program object + vtkShaderProgram::GetLinkCount)
+  /// so the per-draw std::map<const char*> lookups are skipped.
+  vtkShaderProgram* CachedLocProgram = nullptr;
+  unsigned int CachedLocLinkCount = 0;
+  struct LightUniformLocations
+  {
+    int IntensityOpacity = -1;
+    int IntensityAmbient = -1;
+    int IntensityDiffuse = -1;
+    int IntensitySpecular = -1;
+    int ColorAmbient = -1;
+    int ColorDiffuse = -1;
+    int ColorSpecular = -1;
+    int EnableSpecular = -1;
+    int PowerSpecular = -1;
+    int NormalScale = -1;
+  } Loc;
 
 private:
   vtkGLSLModLight(const vtkGLSLModLight&) = delete;

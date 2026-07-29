@@ -4,7 +4,6 @@ set(classes
   vtkClearRGBPass
   vtkClearZPass
   vtkDataTransferHelper
-  vtkDefaultPass
   vtkDepthImageProcessingPass
   vtkDepthOfFieldPass
   vtkDepthPeelingPass
@@ -16,20 +15,21 @@ set(classes
   vtkFramebufferPass
   vtkGLSLModCamera
   vtkGLSLModCoincidentTopology
-  vtkGLSLModLight
-  vtkGLSLModPixelDebugger
   vtkGLSLModifierBase
   vtkGLSLModifierFactory
+  vtkGLSLModLight
+  vtkGLSLModPixelDebugger
+  vtkHexagonalBokehBlurPass
   vtkGaussianBlurPass
   vtkGenericOpenGLRenderWindow
   vtkHiddenLineRemovalPass
   vtkImageProcessingPass
   vtkLightingMapPass
-  vtkLightsPass
   vtkOSOpenGLRenderWindow
-  vtkOpaquePass
   vtkOpenGLActor
   vtkOpenGLArrayTextureBufferAdapter
+  vtkOpenGLArrayTextureBufferCache
+  vtkOpenGLBatchedLabeledDataMapper
   vtkOpenGLBatchedPolyDataMapper
   vtkOpenGLBillboardTextActor3D
   vtkOpenGLBufferObject
@@ -88,32 +88,28 @@ set(classes
   vtkOpenGLVertexBufferObjectGroup
   vtkOrderIndependentTranslucentPass
   vtkOutlineGlowPass
-  vtkOverlayPass
   vtkPBRIrradianceTexture
   vtkPBRLUTTexture
   vtkPBRPrefilterTexture
   vtkPanoramicProjectionPass
   vtkPixelBufferObject
   vtkPointFillPass
-  vtkRenderPassCollection
   vtkRenderStepsPass
   vtkRenderbuffer
   vtkSSAAPass
   vtkSSAOPass
-  vtkSequencePass
   vtkShader
   vtkShaderProgram
   vtkShadowMapBakerPass
   vtkShadowMapPass
   vtkSimpleMotionBlurPass
   vtkSobelGradientMagnitudePass
+  vtkStencilMaskPass
   vtkTextureObject
   vtkTextureUnitManager
   vtkToneMappingPass
   vtkTransformFeedback
-  vtkTranslucentPass
-  vtkValuePass
-  vtkVolumetricPass)
+  vtkValuePass)
 
 set(headers
   "${CMAKE_CURRENT_BINARY_DIR}/vtkOpenGLError.h"
@@ -136,7 +132,10 @@ if (VTK_USE_WIN32_OPENGL AND (NOT CMAKE_CROSSCOMPILING OR DEFINED CMAKE_CROSSCOM
 endif ()
 
 set(sources)
-set(private_sources)
+set(private_headers
+  "Private/vtkOpenGLBatchedLabeledDataMapperInternals.h")
+set(private_sources
+  "Private/vtkOpenGLBatchedLabeledDataMapperInternals.cxx")
 
 set(private_classes
   vtkOpenGLLowMemoryCellTypeAgent
@@ -177,6 +176,7 @@ set(shader_files
   glsl/vtkPolyDataFS.glsl
   glsl/vtkPolyDataVS.glsl
   glsl/vtkPolyDataEdgesGS.glsl
+  glsl/vtkPolyDataGS.glsl
   glsl/vtkPolyDataWideLineGS.glsl
   glsl/vtkSSAAPassFS.glsl
   glsl/vtkSimpleMotionBlurPassFS.glsl
@@ -237,6 +237,7 @@ set(opengl_overrides
   HardwareSelector
   ImageMapper
   ImageSliceMapper
+  BatchedLabeledDataMapper
   Glyph3DMapper
   HyperTreeGridMapper
   Light

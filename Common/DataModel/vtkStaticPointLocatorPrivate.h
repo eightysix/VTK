@@ -20,6 +20,7 @@
 #include "vtkDataSet.h"
 #include "vtkDoubleArray.h"
 #include "vtkMath.h"
+#include "vtkMathUtilities.h" // for SafeCastFromDouble
 #include "vtkPoints.h"
 #include "vtkSMPThreadLocal.h"
 #include "vtkSMPThreadLocalObject.h"
@@ -126,10 +127,13 @@ struct vtkBucketList
   // BuildLocator() is invoked, otherwise the output is indeterminate.
   void GetBucketIndices(const double* x, int ijk[3]) const
   {
-    // Compute point index. Make sure it lies within range of locator.
-    vtkIdType tmp0 = static_cast<vtkIdType>(((x[0] - bX) * fX));
-    vtkIdType tmp1 = static_cast<vtkIdType>(((x[1] - bY) * fY));
-    vtkIdType tmp2 = static_cast<vtkIdType>(((x[2] - bZ) * fZ));
+    // Compute point index. SafeCastFromDouble clamps to the integer type limits
+    // (mapping NaN to 0) so casting a coordinate far outside the locator bounds
+    // (e.g. VTK_DOUBLE_MAX) is not undefined behavior. Make sure it then lies
+    // within the range of the locator.
+    vtkIdType tmp0 = vtkMathUtilities::SafeCastFromDouble<vtkIdType>((x[0] - bX) * fX);
+    vtkIdType tmp1 = vtkMathUtilities::SafeCastFromDouble<vtkIdType>((x[1] - bY) * fY);
+    vtkIdType tmp2 = vtkMathUtilities::SafeCastFromDouble<vtkIdType>((x[2] - bZ) * fZ);
 
     ijk[0] = tmp0 < 0 ? 0 : std::min(xD - 1, tmp0);
     ijk[1] = tmp1 < 0 ? 0 : std::min(yD - 1, tmp1);
@@ -168,15 +172,15 @@ struct vtkBucketList
   //-----------------------------------------------------------------------------
   // Determine whether a bin/bucket specified by i,j,k is completely contained
   // inside the sphere (center,r2). Return true if contained; false otherwise.
-  bool BucketInsideSphere(int i, int j, int k, double center[3], double r2)
+  bool BucketInsideSphere(int i, int j, int k, const double center[3], double r2)
   {
     double min[3], max[3];
     min[0] = this->bX + i * this->hX;
     min[1] = this->bY + j * this->hY;
     min[2] = this->bZ + k * this->hZ;
-    max[0] += this->hX;
-    max[1] += this->hY;
-    max[2] += this->hZ;
+    max[0] = min[0] + this->hX;
+    max[1] = min[1] + this->hY;
+    max[2] = min[2] + this->hZ;
     return vtkBoundingBox::InsideSphere(min, max, center, r2);
   }
 }; // vtkBucketList
@@ -379,7 +383,7 @@ struct BucketList : public vtkBucketList
           offsets + prevPt->Bucket + 1, curPt->Bucket - prevPt->Bucket, curPt - this->BList->Map);
         prevPt = curPt;
       } // for all batches in this range
-    }   // operator()
+    } // operator()
   };
 
   // Merge points that are pecisely coincident. Operates in parallel on
@@ -485,10 +489,10 @@ struct BucketList : public vtkBucketList
             {
               mergeMap[nearId] = ptId;
             } // if eligible for merging and not yet merged
-          }   // for all nearby points
-        }     // if nearby points exist
-      }       // if point not yet merged
-    }         // MergePoint
+          } // for all nearby points
+        } // if nearby points exist
+      } // if point not yet merged
+    } // MergePoint
 
     // Just allocate a little bit of memory to get started.
     void Initialize()
@@ -523,7 +527,7 @@ struct BucketList : public vtkBucketList
       {
         this->MergePoint(ptId, nearby);
       } // for all points in the locator
-    }   // operator()
+    } // operator()
 
     void Reduce() { this->MergeClose<T>::Reduce(); }
   }; // Merge points in point ordering
@@ -630,9 +634,9 @@ struct BucketList : public vtkBucketList
             vtkIdType ptId = ids[i].PtId;
             this->MergePoint(ptId, nearby);
           } // for all points in bin/bucket
-        }   // if points exist in bin/bucket
-      }     // for all blocks
-    }       // operator()
+        } // if points exist in bin/bucket
+      } // for all blocks
+    } // operator()
 
     void Reduce() { this->MergeClose<T>::Reduce(); }
 
@@ -742,14 +746,14 @@ struct BucketList : public vtkBucketList
                     {
                       mergeMap[ptId2] = ptId;
                     } // if point's data match
-                  }   // if points geometrically coincident
-                }     // if point not yet visited
-              }       // for the remaining points in the bin
-            }         // if point not yet merged
-          }           // for all points in bucket
-        }             // if bucket contains points
-      }               // for all buckets
-    }                 // operator()
+                  } // if points geometrically coincident
+                } // if point not yet visited
+              } // for the remaining points in the bin
+            } // if point not yet merged
+          } // for all points in bucket
+        } // if bucket contains points
+      } // for all buckets
+    } // operator()
 
     void Reduce() {}
   }; // MergePointsWithData

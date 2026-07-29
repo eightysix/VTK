@@ -26,6 +26,7 @@
 
 #include "vtkActorCollection.h" // Needed for access in inline members
 #include "vtkMatrix3x3.h"
+#include "vtkVector.h"           // vtkVector3d
 #include "vtkVolumeCollection.h" // Needed for access in inline members
 
 #include <array> // To store matrices
@@ -49,7 +50,6 @@ class vtkRenderPass;
 class vtkTexture;
 
 class vtkRecti;
-class vtkVector3d;
 
 class VTKRENDERINGCORE_EXPORT VTK_MARSHALAUTO vtkRenderer : public vtkViewport
 {
@@ -563,9 +563,12 @@ public:
   ///@}
 
   /**
-   * Given a pixel location, return the Z value. The z value is
-   * normalized (0,1) between the front and back clipping planes.
-   * By default this functions accesses the `vtkRenderWindow`'s depth buffer
+   * Given a pixel location in window-system coordinates, return the Z value.
+   *
+   * X and Y are in pixels with (0, 0) at the bottom-left corner of the render window.
+   * Returns 1.0 (far plane) for any coordinate outside [0, windowWidth-1] x [0, windowHeight-1].
+   * The Z value is normalized (0,1) between the front and back clipping planes.
+   * By default this function accesses the `vtkRenderWindow`'s depth buffer
    * that is only valid right after this specific renderer has rendered.
    * If `SafeGetZ` is On, this function will use a `vtkHardwareSelector` to
    * get the depth information in flight. This approach always works,
@@ -945,6 +948,24 @@ public:
 
   ///@{
   /**
+   * Set/Get wether or not the skybox background needs to be blurred.
+   */
+  vtkSetMacro(SkyboxBlurEnabled, bool);
+  vtkGetMacro(SkyboxBlurEnabled, bool);
+  vtkBooleanMacro(SkyboxBlurEnabled, bool);
+  ///@}
+
+  ///@{
+  /**
+   * Set the radius parameter of the skybox blur. The blur will be more intense if the skybox blur
+   * is higher.
+   */
+  vtkSetMacro(SkyboxBlurRadius, float);
+  vtkGetMacro(SkyboxBlurRadius, float);
+  ///@}
+
+  ///@{
+  /**
    * If UseOIT is on and there are translucent props in the scene, the renderer will use the
    * OrderIndependentTranslucentPass to render. If UseOIT is disabled, traditional depth sorting is
    * used for translucency.
@@ -1002,8 +1023,8 @@ protected:
 
   // A temporary list of props used for culling, and traversal
   // of all props when rendering
-  vtkProp** PropArray;
-  int PropArrayCount;
+  std::vector<vtkProp*> PropArray;
+  vtkProp* BackgroundProp = nullptr;
 
   // Indicates if the renderer should receive events from an interactor.
   // Typically only used in conjunction with transparent renderers.
@@ -1289,6 +1310,14 @@ private:
    * Rotation matrix of the environment.
    */
   vtkSmartPointer<vtkMatrix3x3> EnvironmentRotationMatrix;
+
+  ///@{
+  /**
+   * Parameter for blurring the skybox
+   */
+  bool SkyboxBlurEnabled = false;
+  float SkyboxBlurRadius = 20.0f;
+  ///@}
 
   /**
    * Tmp members to allow returning double* in GetEnvironmentUp/Right methods.

@@ -82,14 +82,14 @@ void vtkPImageWriter::RecursiveWrite(
       {
         VTK_FORMAT_IF_ERROR_RETURN(
           auto result = vtk::format_to_n(this->InternalFileName, this->InternalFileNameSize,
-            this->FilePattern, this->FilePrefix, this->FileNumber);
+            vtk::runtime(this->FilePattern), this->FilePrefix, this->FileNumber);
           *result.out = '\0', );
       }
       else
       {
         VTK_FORMAT_IF_ERROR_RETURN(
           auto result = vtk::format_to_n(this->InternalFileName, this->InternalFileNameSize,
-            this->FilePattern, "", this->FileNumber);
+            vtk::runtime(this->FilePattern), "", this->FileNumber);
           *result.out = '\0', );
       }
     }
@@ -135,7 +135,7 @@ void vtkPImageWriter::RecursiveWrite(
   if (inputMemorySize < this->MemoryLimit)
   {
 #ifndef NDEBUG
-    int* ext = inInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_EXTENT());
+    const int* ext = inInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_EXTENT());
 #endif
     vtkDebugMacro("Getting input extent: " << ext[0] << ", " << ext[1] << ", " << ext[2] << ", "
                                            << ext[3] << ", " << ext[4] << ", " << ext[5] << endl);
@@ -148,7 +148,7 @@ void vtkPImageWriter::RecursiveWrite(
 
   // if the current request did not fit into memory
   // the we will split the current axis
-  int* updateExtent = inInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_EXTENT());
+  const int* updateExtent = inInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_EXTENT());
   this->GetInput()->GetAxisUpdateExtent(axis, min, max, updateExtent);
 
   vtkDebugMacro("Axes: " << axis << "(" << min << ", " << max << "), UpdateMemory: "

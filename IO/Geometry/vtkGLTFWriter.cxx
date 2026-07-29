@@ -1,7 +1,5 @@
 // SPDX-FileCopyrightText: Copyright (c) Ken Martin, Will Schroeder, Bill Lorensen
 // SPDX-License-Identifier: BSD-3-Clause
-// Hide VTK_DEPRECATED_IN_9_6_0() warnings for this file
-#define VTK_DEPRECATION_LEVEL 0
 
 #include "vtkGLTFWriter.h"
 #include "vtkDataArray.h"
@@ -205,18 +203,19 @@ std::string GetMimeType(const std::string& textureFileName)
   }
 }
 
-std::map<int, int> vtkToGLType = { { VTK_UNSIGNED_CHAR, GL_UNSIGNED_BYTE },
-  { VTK_UNSIGNED_SHORT, GL_UNSIGNED_SHORT }, { VTK_FLOAT, GL_FLOAT } };
-
 int GetGLType(vtkDataArray* da)
 {
+  static const std::map<int, int> vtkToGLType = { { VTK_UNSIGNED_CHAR, GL_UNSIGNED_BYTE },
+    { VTK_UNSIGNED_SHORT, GL_UNSIGNED_SHORT }, { VTK_FLOAT, GL_FLOAT } };
+
   int vtkType = da->GetDataType();
-  if (vtkToGLType.find(vtkType) == vtkToGLType.end())
+  auto i = vtkToGLType.find(vtkType);
+  if (i == vtkToGLType.end())
   {
     vtkLog(WARNING, "No GL type mapping for VTK type: " << vtkType);
     return GL_UNSIGNED_BYTE;
   }
-  return vtkToGLType[vtkType];
+  return i->second;
 }
 
 std::string WriteTextureBufferAndView(const std::string& gltfFullDir,
@@ -827,11 +826,6 @@ void WriteMaterial(
   mat["pbrMetallicRoughness"] = model;
   materials.emplace_back(mat);
 }
-}
-
-std::vector<std::string> vtkGLTFWriter::GetFieldAsStringVector(vtkDataObject* obj, const char* name)
-{
-  return vtkPolyDataMaterial::GetField(obj, name);
 }
 
 std::string vtkGLTFWriter::WriteToString()

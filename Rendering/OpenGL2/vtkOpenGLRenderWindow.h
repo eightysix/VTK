@@ -28,6 +28,7 @@ class vtkOpenGLBufferObject;
 class vtkOpenGLFramebufferObject;
 class vtkOpenGLHardwareSupport;
 class vtkOpenGLQuadHelper;
+class vtkOpenGLArrayTextureBufferCache;
 class vtkOpenGLShaderCache;
 class vtkOpenGLVertexBufferObjectCache;
 class vtkOpenGLVertexArrayObject;
@@ -72,6 +73,16 @@ public:
    */
   static void SetGlobalMaximumNumberOfMultiSamples(int val);
   static int GetGlobalMaximumNumberOfMultiSamples();
+  ///@}
+
+  ///@{
+  /**
+   * When set, New() returns a vtkGenericOpenGLRenderWindow instead of
+   * trying hardware-specific backends (X, EGL, etc.).  Used by ParaView's
+   * Qt integration where raw GLX calls must be avoided.
+   */
+  static void SetUseGenericOpenGLRenderWindow(bool val);
+  static bool GetUseGenericOpenGLRenderWindow();
   ///@}
 
   ///@{
@@ -192,6 +203,11 @@ public:
    * Returns the VBO Cache
    */
   vtkOpenGLVertexBufferObjectCache* GetVBOCache();
+
+  /**
+   * Returns the texture-buffer cache used by the vertex-pulling mappers.
+   */
+  vtkOpenGLArrayTextureBufferCache* GetArrayTextureBufferCache();
 
   ///@{
   /**
@@ -525,6 +541,16 @@ public:
    */
   void SetOpenGLSymbolLoader2(long long toolGetProcAddressFunc, long long glLibHandle);
 
+  /**
+   * Query and save OpenGL state
+   */
+  void SaveGLState();
+
+  /**
+   * Restore OpenGL state at end of the rendering
+   */
+  void RestoreGLState();
+
 protected:
   vtkOpenGLRenderWindow();
   ~vtkOpenGLRenderWindow() override;
@@ -603,16 +629,6 @@ protected:
    * Destroy a not-off-screen window.
    */
   virtual void DestroyWindow() = 0;
-
-  /**
-   * Query and save OpenGL state
-   */
-  void SaveGLState();
-
-  /**
-   * Restore OpenGL state at end of the rendering
-   */
-  void RestoreGLState();
 
   std::map<std::string, int> GLStateIntegers;
 

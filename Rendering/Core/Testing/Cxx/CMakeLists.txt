@@ -142,6 +142,8 @@ set(cxx_tests
   TestStereoBackgroundLeft.cxx
   TestStereoBackgroundRight.cxx
   TestStereoEyeSeparation.cxx
+  TestSkyboxRotation.cxx
+  TestSkyboxRotationVectors.cxx
   TestSurfacePlusEdges.cxx,NO_DATA
   TestTexturedBackground.cxx
   TestTexturedCylinder.cxx
@@ -166,6 +168,7 @@ set(cxx_tests
   TestTupleInterpolator.cxx,NO_VALID,NO_DATA
   TestVertexRendering.cxx,NO_DATA
   TestVertexVisibility.cxx
+  TestViewportGetZ.cxx,NO_DATA,NO_VALID
   TestWindowToImageFilter.cxx
   TestWireframe.cxx,NO_DATA
   TestWorldPointPicker.cxx,NO_DATA

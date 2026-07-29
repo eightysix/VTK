@@ -128,11 +128,15 @@ public:
 
   /**
    * Returns a blob stored at `hash`.
-   * If `copy` is `true`, a copy of the blob is returned.
-   * If `copy` is `false`, the blob pointer is set in the array using `vtkTypeUInt8Array::SetArray`
-   * with the save flag set to `1`.
+   * If `copy` is `true` (the default), a copy of the blob is returned and the
+   * caller owns it independently of this manager.
+   * If `copy` is `false`, the returned array aliases the manager-owned buffer via
+   * `vtkTypeUInt8Array::SetArray` with the save flag set to `1`; it does not take
+   * ownership. The caller must stop using the returned array once the blob is
+   * unregistered or the manager is destroyed, either of which leaves the array
+   * dangling.
    */
-  vtkSmartPointer<vtkTypeUInt8Array> GetBlob(const std::string& hash, bool copy = false) const;
+  vtkSmartPointer<vtkTypeUInt8Array> GetBlob(const std::string& hash, bool copy = true) const;
 
   /**
    * Specifies a `blob` for `hash`. Returns `true` if the `blob` is valid and successfully
@@ -277,6 +281,34 @@ private:
   void operator=(const vtkObjectManager&) = delete;
 
   std::vector<vtkTypeUInt32> ImportFromJSON(const nlohmann::json& json);
+
+  /**
+   * Key under which a state records that its object is a kept-alive root.
+   *
+   * This marker is only a projection of the marshal context's
+   * strong-object store, which is the SSOT for ownership.
+   * It is needed to carry kept-alive status across a
+   * serialize/deserialize boundary (export/import, client/server) where the
+   * receiving side has states but not the live objects yet.
+   */
+  static const char* KEPT_ALIVE_KEY() { return "vtk-object-manager-kept-alive"; }
+
+  /**
+   * Returns `true` if `object` is a kept-alive root, i.e. a strong reference to
+   * it is held by the manager (registered via `RegisterObject`) or by the
+   * deserializer (deserialized as a strong root). The strong-object store is
+   * consulted directly so the answer never depends on a (potentially stale or
+   * overwritten) per-state marker.
+   */
+  bool IsKeptAlive(vtkObjectBase* object);
+
+  /**
+   * Re-stamps the kept-alive marker on the state at `identifier` when `object`
+   * is a kept-alive root. Call this after every (re)serialization of an object,
+   * because the serializer regenerates the state wholesale and has no knowledge
+   * of the manager's ownership bookkeeping.
+   */
+  void MarkKeptAlive(vtkObjectBase* object, vtkTypeUInt32 identifier);
 };
 VTK_ABI_NAMESPACE_END
 #endif

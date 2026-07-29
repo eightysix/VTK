@@ -160,8 +160,17 @@ set(python_files
   vtkmodules/util/data_model.py
   vtkmodules/util/execution_model.py
   vtkmodules/util/functions.py
+  vtkmodules/util/graph.py
+  vtkmodules/util/implicit_functions.py
+  vtkmodules/util/information.py
   vtkmodules/util/keys.py
+  vtkmodules/util/matrix.py
   vtkmodules/util/misc.py
+  vtkmodules/util/molecule.py
+  vtkmodules/util/selection.py
+  vtkmodules/util/string_array.py
+  vtkmodules/util/variant_array.py
+  vtkmodules/util/widgets.py
   vtkmodules/util/numpy_support.py
   vtkmodules/util/xarray_support.py
   vtkmodules/util/pickle_support.py

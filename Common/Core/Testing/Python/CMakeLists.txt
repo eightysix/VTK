@@ -20,6 +20,7 @@ vtk_add_test_python(
   TestFilePath.py
   TestFunctions.py
   TestGhost.py
+  TestGhostCleanup.py
   TestImplicitArrayInstantiation.py
   TestInvokeEvent.py
   TestIterateCollection.py
@@ -52,4 +53,7 @@ vtk_add_test_python(
   TestVtkBufferNumpy.py
   TestWeakref.py
   TestCollectionPythonAPI.py
+  TestInformationDict.py
+  TestStringArrayPythonAPI.py
+  TestVariantArrayPythonAPI.py
   )

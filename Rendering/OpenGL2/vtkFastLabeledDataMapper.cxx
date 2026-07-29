@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) Ken Martin, Will Schroeder, Bill Lorensen
 // SPDX-License-Identifier: BSD-3-Clause
+// Hide VTK_DEPRECATED_IN_9_7_0() warnings for this class.
+#define VTK_DEPRECATION_LEVEL 0
 
 #include "vtkFastLabeledDataMapper.h"
 
@@ -1059,9 +1061,9 @@ struct vtkFastLabeledDataMapper::vtkFastLabeledDataMapperFunctor
     char formatedString[1024];
     for (int i = 0; i < this->NumCurLabels; i++)
     {
-      VTK_FORMAT_IF_ERROR_RETURN(
-        auto result = vtk::format_to_n(formatedString, sizeof(formatedString), FormatString, i);
-        *result.out = '\0', );
+      VTK_FORMAT_IF_ERROR_RETURN(auto result = vtk::format_to_n(formatedString,
+                                   sizeof(formatedString), vtk::runtime(FormatString), i);
+                                 *result.out = '\0', );
       this->SetFormattedString(i, formatedString);
     }
   }
@@ -1078,8 +1080,8 @@ struct vtkFastLabeledDataMapper::vtkFastLabeledDataMapperFunctor
     for (int i = 0; i < this->NumCurLabels; i++)
     {
       VTK_FORMAT_IF_ERROR_RETURN(
-        auto result = vtk::format_to_n(formatedString, sizeof(formatedString), FormatString,
-          static_cast<ValueType>(a[i][activeComp]));
+        auto result = vtk::format_to_n(formatedString, sizeof(formatedString),
+          vtk::runtime(FormatString), static_cast<ValueType>(a[i][activeComp]));
         *result.out = '\0', );
       this->SetFormattedString(i, formatedString);
     }
@@ -1103,8 +1105,8 @@ struct vtkFastLabeledDataMapper::vtkFastLabeledDataMapperFunctor
       for (int j = 0; j < numComp; ++j)
       {
         VTK_FORMAT_IF_ERROR_RETURN(
-          auto result = vtk::format_to_n(
-            formatedString, sizeof(formatedString), FormatString, static_cast<ValueType>(a[i][j]));
+          auto result = vtk::format_to_n(formatedString, sizeof(formatedString),
+            vtk::runtime(FormatString), static_cast<ValueType>(a[i][j]));
           *result.out = '\0', );
 
         ResultString += formatedString;
@@ -1134,8 +1136,8 @@ struct vtkFastLabeledDataMapper::vtkFastLabeledDataMapperFunctor
       else // the user specified a label format
       {
         VTK_FORMAT_IF_ERROR_RETURN(
-          auto result = vtk::format_to_n(formatedString, sizeof(formatedString), FormatString,
-            static_cast<std::string&>(array->GetValue(i)));
+          auto result = vtk::format_to_n(formatedString, sizeof(formatedString),
+            vtk::runtime(FormatString), static_cast<std::string&>(array->GetValue(i)));
           *result.out = '\0', );
         this->SetFormattedString(i, formatedString);
       }

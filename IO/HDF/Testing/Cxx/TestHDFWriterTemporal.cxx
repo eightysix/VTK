@@ -69,7 +69,7 @@ bool TestTemporalData(const std::string& tempDir, const std::string& dataRoot,
   HDFWriter->SetUseExternalTimeSteps(config.UseExternalTimeSteps);
   HDFWriter->SetUseExternalPartitions(config.UseExternalPartitions);
   HDFWriter->SetWriteAllTimeSteps(true);
-  HDFWriter->SetChunkSize(100);
+  HDFWriter->SetChunkSize(10);
   HDFWriter->SetCompressionLevel(4);
   HDFWriter->Write();
 
@@ -493,6 +493,13 @@ int TestHDFWriterTemporal(int argc, char* argv[])
     {
       result &= TestTemporalData(tempDir, dataRoot, baseNames[i], config, parallel_types[i]);
     }
+  }
+
+  // Only test single file writes for structured data
+  for (const auto& baseName : { "temporal_image.vtkhdf", "temporal_rectilinear.vtkhdf",
+         "temporal_structured.vtkhdf", "structured_coords.vtkhdf" })
+  {
+    result &= TestTemporalData(tempDir, dataRoot, baseName, configs[0], -1);
   }
 
   // Use a modified version of temporal_harmonics to make sure that the time values match

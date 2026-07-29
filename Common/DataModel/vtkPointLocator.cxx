@@ -207,7 +207,11 @@ vtkIdType vtkPointLocator::FindClosestPoint(const double x[3])
         {
           ptId = ptIds->GetId(j);
           this->DataSet->GetPoint(ptId, pt);
-          if ((dist2 = vtkMath::Distance2BetweenPoints(x, pt)) < minDist2)
+          dist2 = vtkMath::Distance2BetweenPoints(x, pt);
+          // Always accept the first candidate found: for a query far outside
+          // the locator bounds (e.g. VTK_DOUBLE_MAX) the squared distance
+          // overflows to infinity, which would never compare less than minDist2.
+          if (closest < 0 || dist2 < minDist2)
           {
             closest = ptId;
             minDist2 = dist2;
@@ -220,8 +224,11 @@ vtkIdType vtkPointLocator::FindClosestPoint(const double x[3])
   // Because of the relative location of the points in the buckets, the
   // point found previously may not be the closest point.  Have to
   // search those bucket neighbors that might also contain point.
+  // Skip this refinement when minDist2 is not finite (degenerate query far
+  // outside the bounds): the closest point is already arbitrary and the
+  // search radius would be infinite.
   //
-  if (minDist2 > 0.0)
+  if (minDist2 > 0.0 && vtkMath::IsFinite(minDist2))
   {
     this->GetOverlappingBuckets(&buckets, x, ijk, sqrt(minDist2), 0);
     for (i = 0; i < buckets.GetNumberOfNeighbors(); i++)
@@ -242,9 +249,9 @@ vtkIdType vtkPointLocator::FindClosestPoint(const double x[3])
             minDist2 = dist2;
           }
         } // for each point
-      }   // if points in bucket
-    }     // for each overlapping bucket
-  }       // if not identical point
+      } // if points in bucket
+    } // for each overlapping bucket
+  } // if not identical point
 
   return closest;
 }
@@ -396,8 +403,8 @@ vtkIdType vtkPointLocator::FindClosestPointWithinRadius(
             refinedRadius2 = minDist2;
           }
         } // for each pt in bucket
-      }   // if bucket is within the current best distance
-    }     // for each overlapping bucket
+      } // if bucket is within the current best distance
+    } // for each overlapping bucket
 
     // don't want to checker a smaller radius than we just checked so update
     // ii appropriately
@@ -1286,8 +1293,8 @@ vtkIdType vtkPointLocator::IsInsertedPoint(const double x[3])
           }
         }
       } // if points in bucket
-    }   // for each neighbor
-  }     // for neighbors at this level
+    } // for each neighbor
+  } // for neighbors at this level
 
   return -1;
 }
@@ -1540,9 +1547,9 @@ void vtkPointLocator::GenerateRepresentation(int vtkNotUsed(level), vtkPolyData*
           }
 
         } // over negative faces
-      }   // over i divisions
-    }     // over j divisions
-  }       // over k divisions
+      } // over i divisions
+    } // over j divisions
+  } // over k divisions
 
   pd->SetPoints(pts);
   pts->Delete();

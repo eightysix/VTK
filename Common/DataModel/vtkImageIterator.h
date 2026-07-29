@@ -15,7 +15,9 @@
 #define vtkImageIterator_h
 
 #include "vtkCommonDataModelModule.h" // For export macro
+#include "vtkSetGet.h"                // For VTK_FUTURE_CONST
 #include "vtkSystemIncludes.h"
+
 VTK_ABI_NAMESPACE_BEGIN
 class vtkImageData;
 
@@ -34,12 +36,12 @@ public:
   /**
    * Create an image iterator for a given image data and a given extent
    */
-  vtkImageIterator(vtkImageData* id, int* ext);
+  vtkImageIterator(vtkImageData* id, VTK_FUTURE_CONST int ext[6]);
 
   /**
    * Initialize the image iterator for a given image data, and given extent
    */
-  void Initialize(vtkImageData* id, int* ext);
+  void Initialize(vtkImageData* id, VTK_FUTURE_CONST int ext[6]);
 
   /**
    * Move the iterator to the next span

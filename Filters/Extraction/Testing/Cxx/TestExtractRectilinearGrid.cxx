@@ -75,13 +75,13 @@ int CheckGrid(vtkRectilinearGrid* grid)
       std::cerr << xyz[pntIdx * 3 + 2] << ") ";
       ++rc;
     } // END if
-  }   // END for all points
+  } // END for all points
 
   return (rc);
 }
 
 //------------------------------------------------------------------------------
-void GenerateGrid(vtkRectilinearGrid* grid, int ext[6])
+void GenerateGrid(vtkRectilinearGrid* grid, VTK_FUTURE_CONST int ext[6])
 {
   assert("pre: input grid instance is nullptr!" && (grid != nullptr));
   grid->Initialize();

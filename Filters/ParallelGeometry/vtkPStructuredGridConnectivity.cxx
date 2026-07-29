@@ -257,8 +257,8 @@ void vtkPStructuredGridConnectivity::TransferRemoteNeighborData(
         } // END if has remote cell data && is within the cell extent
 
       } // END for all k
-    }   // END for all j
-  }     // END for all i
+    } // END for all j
+  } // END for all i
 }
 
 //------------------------------------------------------------------------------
@@ -323,7 +323,7 @@ void vtkPStructuredGridConnectivity::PackGhostData()
       } // END if the neighboring grid is remote
 
     } // END for all neighbors
-  }   // END for all local grids
+  } // END for all local grids
 
   this->TotalNumberOfMsgs = this->TotalNumberOfRcvs + this->TotalNumberOfSends;
 }
@@ -365,7 +365,7 @@ void vtkPStructuredGridConnectivity::SerializeBufferSizes(int*& sizesbuf, vtkIdT
       sizesbuf[bidx] = this->SendBufferSizes[gridIdx][nei];
       ++bidx;
     } // END for all neighbors
-  }   // END for all local grids
+  } // END for all local grids
 }
 
 //------------------------------------------------------------------------------
@@ -396,7 +396,7 @@ void vtkPStructuredGridConnectivity::DeserializeBufferSizesForProcess(
 
       this->RcvBufferSizes[rcvGrid][neiIndex] = size;
     } // END if the grid is local
-  }   // END for all tuples
+  } // END for all tuples
 }
 
 //------------------------------------------------------------------------------
@@ -440,7 +440,7 @@ void vtkPStructuredGridConnectivity::ExchangeBufferSizes()
     {
       this->DeserializeBufferSizesForProcess(rcvbuffer + offSet[i], rcvcounts[i], i);
     } // END if remote rank
-  }   // END for all ranks
+  } // END for all ranks
 
   // STEP 6: Deallocate
   delete[] sizesbuffer;
@@ -484,8 +484,8 @@ void vtkPStructuredGridConnectivity::UnpackGhostData()
           this->Neighbors[gridIdx][nei].RcvExtent, this->RcvBuffers[gridIdx][nei],
           this->RcvBufferSizes[gridIdx][nei]);
       } // END if the grid is remote
-    }   // END for all neighbors
-  }     // END for all local grids
+    } // END for all neighbors
+  } // END for all local grids
 }
 
 //------------------------------------------------------------------------------
@@ -550,7 +550,7 @@ void vtkPStructuredGridConnectivity::PostReceives()
         bufferPtr, length, NeighborRank, neiGridIdx, this->MPIRequests[rqstIdx]);
       ++rqstIdx;
     } // END for all neis
-  }   // END for all local grids
+  } // END for all local grids
 
   assert(this->TotalNumberOfRcvs == rqstIdx);
 }
@@ -600,7 +600,7 @@ void vtkPStructuredGridConnectivity::PostSends()
         bufferPtr, length, NeighborRank, gridIdx, this->MPIRequests[rqstIdx]);
       ++rqstIdx;
     } // END for all neis
-  }   // END for all local grids
+  } // END for all local grids
 
   assert(rqstIdx == this->TotalNumberOfMsgs);
 }
@@ -749,8 +749,8 @@ void vtkPStructuredGridConnectivity::SerializeGhostPoints(
         pnts[targetIdx * 3 + 1] = x[1];
         pnts[targetIdx * 3 + 2] = x[2];
       } // END for all k
-    }   // END for all j
-  }     // END for all i
+    } // END for all j
+  } // END for all i
 
   // STEP 5: Push the points on the bytestream
   bytestream.Push(pnts, 3 * N);
@@ -804,26 +804,6 @@ void vtkPStructuredGridConnectivity::DeserializeGhostPoints(
 }
 
 //------------------------------------------------------------------------------
-void vtkPStructuredGridConnectivity::SerializeDataArray(
-  vtkDataArray* dataArray, vtkMultiProcessStream& bytestream)
-{
-  bytestream.Push(dataArray);
-}
-
-//------------------------------------------------------------------------------
-void vtkPStructuredGridConnectivity::DeserializeDataArray(vtkDataArray*& dataArray,
-  int vtkNotUsed(dataType), int numberOfTuples, int numberOfComponents,
-  vtkMultiProcessStream& bytestream)
-{
-  bytestream.Pop(dataArray);
-  if (!dataArray || dataArray->GetNumberOfTuples() != numberOfTuples ||
-    dataArray->GetNumberOfComponents() != numberOfComponents)
-  {
-    vtkErrorMacro("Deserialized data array does not match expected layout");
-  }
-}
-
-//------------------------------------------------------------------------------
 void vtkPStructuredGridConnectivity::SerializeFieldData(
   int GridExtent[6], int ext[6], vtkFieldData* fieldData, vtkMultiProcessStream& bytestream)
 {
@@ -873,23 +853,13 @@ void vtkPStructuredGridConnectivity::SerializeFieldData(
 
           ghostArray->SetTuple(targetIdx, sourceIdx, myArray);
         } // END for k
-      }   // END for j
-    }     // END for i
+      } // END for j
+    } // END for i
 
     // STEP 3: Serialize the ghost array
     bytestream.Push(ghostArray);
     ghostArray->Delete();
   } // END for all arrays
-}
-
-//------------------------------------------------------------------------------
-void vtkPStructuredGridConnectivity::DeserializeFieldData(
-  int* vtkNotUsed(ext), vtkFieldData* fieldData, vtkMultiProcessStream& bytestream)
-{
-  assert("pre: Cannot deserialize an empty bytestream" && !bytestream.Empty());
-  assert("pre: field data should not be nullptr!" && (fieldData != nullptr));
-
-  vtkFieldDataSerializer::Deserialize(bytestream, fieldData);
 }
 
 //------------------------------------------------------------------------------
@@ -1186,7 +1156,7 @@ void vtkPStructuredGridConnectivity::ExchangeGridExtents()
     {
       this->DeserializeGridExtentForProcess(rcvbuffer + offSet[i], rcvcounts[i], i);
     } // END if remote rank
-  }   // END for all ranks
+  } // END for all ranks
 
   // STEP 6: Deallocate
   delete[] buffer;

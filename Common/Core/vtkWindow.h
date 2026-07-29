@@ -15,6 +15,7 @@
 #define vtkWindow_h
 
 #include "vtkCommonCoreModule.h" // For export macro
+#include "vtkDeprecation.h"      // For VTK_DEPRECATED_IN_9_8_0
 #include "vtkObject.h"
 #include "vtkWrappingHints.h" // For VTK_MARSHALAUTO
 
@@ -173,6 +174,7 @@ public:
    * synchronize this process.
    */
   VTK_UNBLOCKTHREADS
+  VTK_MAYSUSPEND
   virtual void Render() {}
 
   /**
@@ -200,6 +202,7 @@ public:
   {
     return nullptr;
   }
+  VTK_MAYSUSPEND
   virtual int GetPixelData(int /*x*/, int /*y*/, int /*x2*/, int /*y2*/, int /*front*/,
     vtkUnsignedCharArray* /*data*/, int /*right*/ = 0)
   {
@@ -211,17 +214,18 @@ public:
   /**
    * Return a best estimate to the dots per inch of the display
    * device being rendered (or printed).
+   * SetDPI() clamps the value to be at least 1 and
+   * invokes vtkCommand::DPIChangedEvent when the DPI is changed.
    */
   VTK_MARSHALEXCLUDE(VTK_MARSHAL_EXCLUDE_REASON_IS_INTERNAL)
   vtkGetMacro(DPI, int);
-  vtkSetClampMacro(DPI, int, 1, VTK_INT_MAX);
+  virtual void SetDPI(int dpi);
   ///@}
 
   /**
    * Attempt to detect and set the DPI of the display device by querying the
-   * system. Note that this is not supported on most backends, and this method
-   * will return false if the DPI could not be detected. Use GetDPI() to
-   * inspect the detected value.
+   * system. This method will return false if the DPI could not be detected.
+   * Use GetDPI() to inspect the detected value.
    */
   virtual bool DetectDPI() { return false; }
 
@@ -243,6 +247,7 @@ public:
    * instead.
    */
   VTK_MARSHALEXCLUDE(VTK_MARSHAL_EXCLUDE_REASON_IS_INTERNAL)
+  VTK_DEPRECATED_IN_9_8_0("Use GetShowWindow instead")
   vtkTypeBool GetOffScreenRendering() { return this->GetShowWindow() ? 0 : 1; }
 
   /**

@@ -63,12 +63,16 @@ vtk_add_test_python(
   TestStructuredGridPlaneCutter.py
   TestSurfaceNets2D.py
   TestSurfaceNets2D2.py
+  TestSurfaceNets2DAtlas.py
   TestSurfaceNets3D.py
   TestSurfaceNets3D2.py
   TestSurfaceNets3D3.py
+  TestSurfaceNets3D4.py
+  TestSurfaceNets3DAtlas.py
   TestSynchronizedTemplates3D.py
   TestWindowedSincPolyDataFilter.py
   TestWindowedSincPolyDataFilter2.py
+  TestCellSizeFilter.py,NO_DATA,NO_VALID
   TestContourFilter.py,NO_DATA,NO_VALID
   TestContourGrid.py,NO_VALID
   TestContourPolyData.py,NO_VALID

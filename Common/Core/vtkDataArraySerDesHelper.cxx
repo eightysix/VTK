@@ -77,14 +77,8 @@ struct ArrayTypeInfo
   std::function<vtkObjectBase*()> New;
   const std::type_info& TypeInfo;
 };
-#define TYPE_INFO_MACRO(className)                                                                 \
-  {                                                                                                \
-    #className, className::New, typeid(className)                                                  \
-  }
-#define TTYPE_INFO_MACRO(className)                                                                \
-  {                                                                                                \
-    #className, className::New, typeid(className)                                                  \
-  }
+#define TYPE_INFO_MACRO(className) { #className, className::New, typeid(className) }
+#define TTYPE_INFO_MACRO(className) { #className, className::New, typeid(className) }
 
 // clang-format off
 #define TEMPLATED_ARRAY_TYPES_INFO_MACRO(className)                                                \
@@ -476,7 +470,7 @@ static nlohmann::json Serialize_vtkDataArray(vtkObjectBase* object, vtkSerialize
     if (id > 0)
     {
       state = context->GetState(id);
-      if (!state.empty())
+      if (auto iter = state.find("MTime"); (iter != state.end() && !iter->is_null()))
       {
         const auto stateMTime = state.at("MTime").get<vtkMTimeType>();
         if (da->GetMTime() <= stateMTime)

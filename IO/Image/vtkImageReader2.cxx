@@ -56,9 +56,6 @@ vtkImageReader2::vtkImageReader2()
   this->FileName = nullptr;
   this->InternalFileName = nullptr;
 
-  this->MemoryBuffer = nullptr;
-  this->MemoryBufferLength = 0;
-
   this->HeaderSize = 0;
   this->ManualHeaderSize = 0;
 
@@ -132,16 +129,16 @@ void vtkImageReader2::ComputeInternalFileName(int slice)
       size_t size = strlen(this->FilePrefix) + filePattern.size() + 10;
       this->InternalFileName = new char[size];
       VTK_FORMAT_IF_ERROR_RETURN(auto result = vtk::format_to_n(this->InternalFileName, size,
-                                   filePattern, this->FilePrefix, slicenum);
+                                   vtk::runtime(filePattern), this->FilePrefix, slicenum);
                                  *result.out = '\0', );
     }
     else if (!filePattern.empty())
     {
       size_t size = filePattern.size() + 10;
       this->InternalFileName = new char[size];
-      VTK_FORMAT_IF_ERROR_RETURN(
-        auto result = vtk::format_to_n(this->InternalFileName, size, filePattern, "", slicenum);
-        *result.out = '\0', );
+      VTK_FORMAT_IF_ERROR_RETURN(auto result = vtk::format_to_n(this->InternalFileName, size,
+                                   vtk::runtime(filePattern), "", slicenum);
+                                 *result.out = '\0', );
     }
     else
     {
@@ -691,7 +688,7 @@ void vtkImageReader2::ExecuteDataWithInformation(vtkDataObject* output, vtkInfor
   data->GetPointData()->GetScalars()->SetName("ImageFile");
 
 #ifndef NDEBUG
-  int* ext = data->GetExtent();
+  const int* ext = data->GetExtent();
 #endif
 
   vtkDebugMacro("Reading extent: " << ext[0] << ", " << ext[1] << ", " << ext[2] << ", " << ext[3]
@@ -707,42 +704,6 @@ void vtkImageReader2::ExecuteDataWithInformation(vtkDataObject* output, vtkInfor
     default:
       vtkErrorMacro(<< "UpdateFromFile: Unknown data type");
   }
-}
-
-//------------------------------------------------------------------------------
-// VTK_DEPRECATED_IN_9_6_0
-void vtkImageReader2::SetMemoryBuffer(const void* membuf)
-{
-  if (this->MemoryBuffer != membuf)
-  {
-    this->MemoryBuffer = membuf;
-    this->Modified();
-  }
-}
-
-//------------------------------------------------------------------------------
-// VTK_DEPRECATED_IN_9_6_0
-const void* vtkImageReader2::GetMemoryBuffer()
-{
-  return this->MemoryBuffer;
-}
-
-//------------------------------------------------------------------------------
-// VTK_DEPRECATED_IN_9_6_0
-void vtkImageReader2::SetMemoryBufferLength(vtkIdType buflen)
-{
-  if (this->MemoryBufferLength != buflen)
-  {
-    this->MemoryBufferLength = buflen;
-    this->Modified();
-  }
-}
-
-//------------------------------------------------------------------------------
-// VTK_DEPRECATED_IN_9_6_0
-vtkIdType vtkImageReader2::GetMemoryBufferLength()
-{
-  return this->MemoryBufferLength;
 }
 
 //------------------------------------------------------------------------------

@@ -142,8 +142,6 @@ public:
     }
   }
 
-  static std::set<vtkXRenderWindowInteractor*> Instances;
-
   // whether application was terminated
   bool LoopDone = false;
   int DisplayConnection;
@@ -154,7 +152,11 @@ private:
   LocalToTimerType LocalToTimer;
 };
 
-std::set<vtkXRenderWindowInteractor*> vtkXRenderWindowInteractorInternals::Instances;
+static std::set<vtkXRenderWindowInteractor*>& XInteractorInstances()
+{
+  static std::set<vtkXRenderWindowInteractor*> Instances;
+  return Instances;
+}
 
 // for some reason the X11 def of KeySym is getting messed up
 typedef XID vtkKeySym;
@@ -235,8 +237,7 @@ void vtkXRenderWindowInteractor::ProcessEvents()
   std::set<Display*> dpys;
   // Make a copy of Instances, the original set might change during loop
   std::vector<vtkXRenderWindowInteractor*> instances(
-    vtkXRenderWindowInteractorInternals::Instances.begin(),
-    vtkXRenderWindowInteractorInternals::Instances.end());
+    XInteractorInstances().begin(), XInteractorInstances().end());
   for (auto rwi : instances)
   {
     if (rwi->RenderWindow->GetGenericDisplayId() == nullptr)
@@ -269,7 +270,7 @@ void vtkXRenderWindowInteractor::ProcessEvents()
   // Set event loop to terminate if there were no displays to check for events
   done = dpys.empty();
 
-  for (auto rwi : vtkXRenderWindowInteractorInternals::Instances)
+  for (auto rwi : XInteractorInstances())
   {
     if (!rwi->Done)
     {
@@ -288,7 +289,7 @@ void vtkXRenderWindowInteractor::WaitForEvents()
   int soonestTimer = 0;
 
   // check to see how long we wait for the next timer
-  for (auto rwi : vtkXRenderWindowInteractorInternals::Instances)
+  for (auto rwi : XInteractorInstances())
   {
     if (rwi->Done)
     {
@@ -313,7 +314,7 @@ void vtkXRenderWindowInteractor::WaitForEvents()
 
   // build the list of unique display connection fds to poll
   std::vector<pollfd> in_fds;
-  for (auto rwi : vtkXRenderWindowInteractorInternals::Instances)
+  for (auto rwi : XInteractorInstances())
   {
     if (!rwi->Done && rwi->RenderWindow->GetGenericDisplayId() != nullptr)
     {
@@ -349,7 +350,7 @@ void vtkXRenderWindowInteractor::StartEventLoop()
     vtkWarningMacro(<< "Cannot start event loop without X display or window.");
     return;
   }
-  for (auto rwi : vtkXRenderWindowInteractorInternals::Instances)
+  for (auto rwi : XInteractorInstances())
   {
     rwi->Done = false;
   }
@@ -398,7 +399,7 @@ void vtkXRenderWindowInteractor::Initialize()
     this->DisplayId = static_cast<Display*>(this->HardwareWindow->GetGenericDisplayId());
   }
 
-  vtkXRenderWindowInteractorInternals::Instances.insert(this);
+  XInteractorInstances().insert(this);
 
   size = ren->GetActualSize();
   size[0] = ((size[0] > 0) ? size[0] : 300);
@@ -446,7 +447,7 @@ void vtkXRenderWindowInteractor::Initialize()
 bool vtkXRenderWindowInteractor::CheckDisplayId(Display* dpy)
 {
   bool good = false;
-  for (auto rwi : vtkXRenderWindowInteractorInternals::Instances)
+  for (auto rwi : XInteractorInstances())
   {
     if (rwi->DisplayId == dpy)
     {
@@ -465,7 +466,7 @@ bool vtkXRenderWindowInteractor::CheckDisplayId(Display* dpy)
 //------------------------------------------------------------------------------
 void vtkXRenderWindowInteractor::Finalize()
 {
-  vtkXRenderWindowInteractorInternals::Instances.erase(this);
+  XInteractorInstances().erase(this);
 
   if (this->RenderWindow)
   {
@@ -812,9 +813,14 @@ void vtkXRenderWindowInteractor::DispatchEvent(XEvent* event)
       vtkKeySym keySym;
       vtkXLookupString(keyEvent, &keyCode, 1, &keySym, nullptr);
 
+      // start at 1 for backward compatibility but should start at 0
+      this->KeyRepeatCount =
+        keyEvent->serial == this->PrevKeyReleaseSerial ? this->KeyRepeatCount + 1 : 1;
+
       xp = keyEvent->x;
       yp = keyEvent->y;
-      this->SetEventInformationFlipY(xp, yp, ctrl, shift, keyCode, 1, vtkXKeysymToString(keySym));
+      this->SetEventInformationFlipY(
+        xp, yp, ctrl, shift, keyCode, this->KeyRepeatCount, vtkXKeysymToString(keySym));
       this->SetAltKey(alt);
       this->InvokeEvent(vtkCommand::KeyPressEvent, nullptr);
       this->InvokeEvent(vtkCommand::CharEvent, nullptr);
@@ -840,9 +846,11 @@ void vtkXRenderWindowInteractor::DispatchEvent(XEvent* event)
 
       xp = keyEvent->x;
       yp = keyEvent->y;
-      this->SetEventInformationFlipY(xp, yp, ctrl, shift, keyCode, 1, vtkXKeysymToString(keySym));
+      this->SetEventInformationFlipY(
+        xp, yp, ctrl, shift, keyCode, this->KeyRepeatCount, vtkXKeysymToString(keySym));
       this->SetAltKey(alt);
       this->InvokeEvent(vtkCommand::KeyReleaseEvent, nullptr);
+      this->PrevKeyReleaseSerial = keyEvent->serial;
     }
     break;
 

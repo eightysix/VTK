@@ -139,6 +139,13 @@ struct vtkCellStateBackend : public vtkDataObjectImplicitBackendInterface<short>
     , AutoTolerance(autoTolerance)
     , DataSet(dataset)
   {
+    vtkNew<vtkGenericCell> cell;
+    if (this->DataSet->GetNumberOfCells() > 0)
+    {
+      // As mentioned in the method doc, call it a first time from first thread before
+      // potential multi-threaded call from GetValueFromDataObject
+      this->DataSet->GetCell(0, cell);
+    }
   }
   ~vtkCellStateBackend() override = default;
 
@@ -259,12 +266,6 @@ bool TrianglesIntersect(double p1[3], double p2[3], double p3[3], double q1[3], 
   // Triangles are disjoint.
   return false;
 }
-}
-
-//------------------------------------------------------------------------------
-bool vtkCellValidator::NoIntersectingFaces(vtkCell* cell, double tolerance)
-{
-  return vtkCellValidator::NoIntersectingFacesStatus(cell, tolerance) == State::Valid;
 }
 
 //------------------------------------------------------------------------------
@@ -686,7 +687,7 @@ vtkCellValidator::State vtkCellValidator::Check(vtkPixel* pixel, double toleranc
   double p[4][3];
   for (vtkIdType i = 0; i < 4; i++)
   {
-    pixel->GetPoints()->GetPoint(pixel->GetPointId(i), p[i]);
+    pixel->GetPoints()->GetPoint(i, p[i]);
   }
 
   // pixel points are axis-aligned and orthogonal, so exactly one coordinate
@@ -773,7 +774,7 @@ vtkCellValidator::State vtkCellValidator::Check(vtkVoxel* voxel, double toleranc
   double p[8][3];
   for (vtkIdType i = 0; i < 8; i++)
   {
-    voxel->GetPoints()->GetPoint(voxel->GetPointId(i), p[i]);
+    voxel->GetPoints()->GetPoint(i, p[i]);
   }
 
   // voxel points are axis-aligned and orthogonal, so exactly one coordinate

@@ -364,7 +364,7 @@ public:
         {
           this->Algo->ProcessYZEdges(row, slice);
         } // for all rows in this slice
-      }   // for all slices in this batch
+      } // for all slices in this batch
     }
   };
   class Pass4
@@ -408,7 +408,7 @@ public:
             this->Algo->GenerateOutput(this->Value, rowPtr, row, slice);
             rowPtr += this->Algo->Inc1;
           } // for all rows in this slice
-        }   // if there are triangles
+        } // if there are triangles
         slicePtr += this->Algo->Inc2;
         eMD0 = eMD1;
         eMD1 = eMD0 + 6 * this->Algo->Dims[1];
@@ -432,19 +432,16 @@ public:
       vtkIdType row;
       vtkIdType* eMD0 = this->Algo->EdgeMetaData + slice * 6 * this->Algo->Dims[1];
       vtkIdType* eMD1 = eMD0 + 6 * this->Algo->Dims[1];
-      TPtr rowPtr, slicePtr = this->Algo->Scalars + slice * this->Algo->Inc2;
       for (; slice < end; ++slice)
       {
         // It's possible to skip entire slices if there is no data to copy
         if (eMD1[3] > eMD0[3]) // there are triangle primitives!
         {
-          for (row = 0, rowPtr = slicePtr; row < this->Algo->Dims[1] - 1; ++row)
+          for (row = 0; row < this->Algo->Dims[1] - 1; ++row)
           {
             this->Algo->InterpolateCellData(&this->CellArrays, row, slice);
-            rowPtr += this->Algo->Inc1;
           } // for all rows in this slice
-        }   // if there are triangles (i.e., output cells)
-        slicePtr += this->Algo->Inc2;
+        } // if there are triangles (i.e., output cells)
         eMD0 = eMD1;
         eMD1 = eMD0 + 6 * this->Algo->Dims[1];
       } // for all slices in this batch
@@ -570,9 +567,9 @@ vtkFlyingEdges3DAlgorithm<TArray>::vtkFlyingEdges3DAlgorithm()
             }
           }
         } // x-edges
-      }   // x+y-edges
-    }     // x+z-edges
-  }       // x+y+z-edges
+      } // x+y-edges
+    } // x+z-edges
+  } // x+y+z-edges
 
   // Okay now build the acceleration structure. This is used to generate
   // output points and triangles when processing a voxel x-row as well as to
@@ -990,7 +987,7 @@ void vtkFlyingEdges3DAlgorithm<TArray>::ProcessXEdge(
       minInt = std::min(i, minInt);
       maxInt = i + 1;
     } // if contour interacts with this x-edge
-  }   // for all x-cell edges along this x-edge
+  } // for all x-cell edges along this x-edge
 
   edgeMetaData[0] += sum; // write back the number of intersections along x-edge
 
@@ -1240,7 +1237,7 @@ void vtkFlyingEdges3DAlgorithm<TArray>::GenerateOutput(
       ++ijk[0];
       sPtr += incs[0];
     } // if not at end of voxel row
-  }   // for all non-trimmed cells along this x-edge
+  } // for all non-trimmed cells along this x-edge
 }
 
 //------------------------------------------------------------------------------
@@ -1583,7 +1580,7 @@ int vtkFlyingEdges3D::RequestData(
   vtkSmartPointer<vtkDataArray> inScalars = this->GetInputArrayToProcess(0, inputVector);
 
   // Determine extent
-  int* inExt = input->GetExtent();
+  VTK_FUTURE_CONST int* inExt = input->GetExtent();
   int exExt[6];
   inInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_EXTENT(), exExt);
   for (int i = 0; i < 3; i++)

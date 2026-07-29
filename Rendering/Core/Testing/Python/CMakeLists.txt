@@ -36,6 +36,7 @@ vtk_add_test_python(
   TestLeaderActor2D.py
   TestOpacity2.py
   TestOpacityVectors.py
+  TestRendererAddRemove.py,NO_VALID
   TestTransformCoordinateSystems.py
   TestWindowToImageTransparency.py
   TexturedSphere.py
@@ -62,6 +63,7 @@ vtk_add_test_python(
 vtk_add_test_python(
   NO_DATA NO_VALID NO_OUTPUT
   pickCellPoints.py
+  TestEnumPropertySetter.py
   TestGetRangeColorTransferFunction.py
   TestGetRangeDiscretizableColorTransferFunction.py
   TestGetRangeLookupTable.py

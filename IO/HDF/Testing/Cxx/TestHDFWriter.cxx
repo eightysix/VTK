@@ -23,13 +23,18 @@
 #include "vtkIntArray.h"
 #include "vtkLogger.h"
 #include "vtkMultiBlockDataSet.h"
+#include "vtkMultiPieceDataSet.h"
 #include "vtkNew.h"
 #include "vtkPartitionedDataSet.h"
 #include "vtkPartitionedDataSetCollection.h"
 #include "vtkPointData.h"
+#include "vtkPoints.h"
 #include "vtkPolyData.h"
 #include "vtkRandomHyperTreeGridSource.h"
+#include "vtkRectilinearGrid.h"
 #include "vtkSphereSource.h"
+#include "vtkStructuredGrid.h"
+#include "vtkTable.h"
 #include "vtkTestUtilities.h"
 #include "vtkTesting.h"
 #include "vtkUnstructuredGrid.h"
@@ -37,6 +42,7 @@
 #include "vtkXMLMultiBlockDataReader.h"
 #include "vtkXMLPartitionedDataSetCollectionReader.h"
 #include "vtkXMLPolyDataReader.h"
+#include "vtkXMLTableReader.h"
 #include "vtkXMLUnstructuredGridReader.h"
 
 #include <cstddef>
@@ -242,6 +248,149 @@ bool TestUnstructuredGrid(const std::string& tempDir, const std::string& dataRoo
     }
   }
   return true;
+}
+
+//----------------------------------------------------------------------------
+bool TestImageDataWriteRead(const std::string& tempDir)
+{
+  vtkNew<vtkImageData> imageData;
+  imageData->SetExtent(0, 3, 0, 2, 0, 1);
+  imageData->SetOrigin(1.0, 2.0, 3.0);
+  imageData->SetSpacing(0.5, 1.0, 2.0);
+
+  vtkIdType numPoints = imageData->GetNumberOfPoints();
+  vtkNew<vtkDoubleArray> scalars;
+  scalars->SetName("PointScalars");
+  scalars->SetNumberOfComponents(1);
+  scalars->SetNumberOfTuples(numPoints);
+  for (vtkIdType idx = 0; idx < numPoints; ++idx)
+  {
+    scalars->SetValue(idx, static_cast<double>(idx));
+  }
+  imageData->GetPointData()->SetScalars(scalars);
+
+  vtkNew<vtkDoubleArray> vectors;
+  vectors->SetName("PointVectors");
+  vectors->SetNumberOfComponents(3);
+  vectors->SetNumberOfTuples(numPoints);
+  for (vtkIdType idx = 0; idx < numPoints; ++idx)
+  {
+    double tuple[3] = { 1.0 * idx, 2.0 * idx, 3.0 * idx };
+    vectors->SetTypedTuple(idx, tuple);
+  }
+  imageData->GetPointData()->SetVectors(vectors);
+
+  std::string filePath = tempDir + "/HDFWriter_imageData.vtkhdf";
+  return TestWriteAndRead(imageData, filePath);
+}
+
+//----------------------------------------------------------------------------
+bool TestRectilinearGridWriteRead(const std::string& tempDir)
+{
+  vtkNew<vtkRectilinearGrid> rectilinearGrid;
+  int dimensions[3] = { 4, 3, 2 };
+  rectilinearGrid->SetDimensions(dimensions);
+
+  vtkNew<vtkDoubleArray> xCoords;
+  xCoords->SetName("XCoordinates");
+  xCoords->SetNumberOfTuples(dimensions[0]);
+  for (int i = 0; i < dimensions[0]; ++i)
+  {
+    xCoords->SetValue(i, static_cast<double>(i));
+  }
+
+  vtkNew<vtkDoubleArray> yCoords;
+  yCoords->SetName("YCoordinates");
+  yCoords->SetNumberOfTuples(dimensions[1]);
+  for (int j = 0; j < dimensions[1]; ++j)
+  {
+    yCoords->SetValue(j, static_cast<double>(j) * 2.0);
+  }
+
+  vtkNew<vtkDoubleArray> zCoords;
+  zCoords->SetName("ZCoordinates");
+  zCoords->SetNumberOfTuples(dimensions[2]);
+  for (int k = 0; k < dimensions[2]; ++k)
+  {
+    zCoords->SetValue(k, static_cast<double>(k) * 3.0);
+  }
+
+  rectilinearGrid->SetXCoordinates(xCoords);
+  rectilinearGrid->SetYCoordinates(yCoords);
+  rectilinearGrid->SetZCoordinates(zCoords);
+
+  vtkIdType numPoints = static_cast<vtkIdType>(dimensions[0]) * dimensions[1] * dimensions[2];
+  vtkNew<vtkDoubleArray> scalars;
+  scalars->SetName("PointScalars");
+  scalars->SetNumberOfComponents(1);
+  scalars->SetNumberOfTuples(numPoints);
+  for (vtkIdType idx = 0; idx < numPoints; ++idx)
+  {
+    scalars->SetValue(idx, static_cast<double>(idx));
+  }
+  rectilinearGrid->GetPointData()->SetScalars(scalars);
+
+  vtkNew<vtkDoubleArray> vectors;
+  vectors->SetName("PointVectors");
+  vectors->SetNumberOfComponents(3);
+  vectors->SetNumberOfTuples(numPoints);
+  for (vtkIdType idx = 0; idx < numPoints; ++idx)
+  {
+    double tuple[3] = { 1.0 * idx, 2.0 * idx, 3.0 * idx };
+    vectors->SetTypedTuple(idx, tuple);
+  }
+  rectilinearGrid->GetPointData()->SetVectors(vectors);
+
+  std::string filePath = tempDir + "/HDFWriter_rectilinearGrid.vtkhdf";
+  return TestWriteAndRead(rectilinearGrid, filePath);
+}
+
+//----------------------------------------------------------------------------
+bool TestStructuredGridWriteRead(const std::string& tempDir)
+{
+  vtkNew<vtkStructuredGrid> structuredGrid;
+  int dimensions[3] = { 3, 3, 2 };
+  structuredGrid->SetDimensions(dimensions);
+
+  vtkNew<vtkPoints> points;
+  vtkIdType numPoints = static_cast<vtkIdType>(dimensions[0]) * dimensions[1] * dimensions[2];
+  points->SetNumberOfPoints(numPoints);
+  vtkIdType pointIndex = 0;
+  for (int k = 0; k < dimensions[2]; ++k)
+  {
+    for (int j = 0; j < dimensions[1]; ++j)
+    {
+      for (int i = 0; i < dimensions[0]; ++i)
+      {
+        points->SetPoint(pointIndex++, i * 1.0, j * 2.0, k * 3.0);
+      }
+    }
+  }
+  structuredGrid->SetPoints(points);
+
+  vtkNew<vtkDoubleArray> scalars;
+  scalars->SetName("PointScalars");
+  scalars->SetNumberOfComponents(1);
+  scalars->SetNumberOfTuples(numPoints);
+  for (vtkIdType idx = 0; idx < numPoints; ++idx)
+  {
+    scalars->SetValue(idx, static_cast<double>(idx));
+  }
+  structuredGrid->GetPointData()->SetScalars(scalars);
+
+  vtkNew<vtkDoubleArray> vectors;
+  vectors->SetName("PointVectors");
+  vectors->SetNumberOfComponents(3);
+  vectors->SetNumberOfTuples(numPoints);
+  for (vtkIdType idx = 0; idx < numPoints; ++idx)
+  {
+    double tuple[3] = { 1.0 * idx, 2.0 * idx, 3.0 * idx };
+    vectors->SetTypedTuple(idx, tuple);
+  }
+  structuredGrid->GetPointData()->SetVectors(vectors);
+
+  std::string filePath = tempDir + "/HDFWriter_structuredGrid.vtkhdf";
+  return TestWriteAndRead(structuredGrid, filePath);
 }
 
 //----------------------------------------------------------------------------
@@ -470,6 +619,47 @@ bool TestRandomHTG(const std::string& tempDir)
 }
 
 //----------------------------------------------------------------------------
+bool TestNullHTG(const std::string& tempDir)
+{
+  // Test that unititialized HTG can be written & read properly
+  vtkNew<vtkHyperTreeGrid> htg; // Keep it uninitialized
+
+  std::string tempPath = tempDir + "/HDFWriter_nullhtg";
+  if (!TestWriteAndReadConfigurations(htg, tempPath))
+  {
+    return false;
+  }
+
+  return true;
+}
+
+//----------------------------------------------------------------------------
+bool TestNoValidPartHTG(const std::string& tempDir)
+{
+  // Test that partitioned inside multiblock without vtkDataset (HTG is vtkDataObject) does not
+  // cause an error
+  vtkNew<vtkHyperTreeGrid> htg;
+  htg->Initialize();
+
+  vtkNew<vtkMultiPieceDataSet> multipiece;
+  multipiece->SetNumberOfPieces(2);
+  multipiece->SetPartition(0, htg);
+  multipiece->SetPartition(1, htg);
+
+  vtkNew<vtkMultiBlockDataSet> mbds;
+  mbds->SetNumberOfBlocks(1);
+  mbds->SetBlock(0, multipiece);
+
+  std::string tempPath = tempDir + "/HDFWriter_nullpart";
+  if (!TestWriteAndReadConfigurations(mbds, tempPath))
+  {
+    return false;
+  }
+
+  return true;
+}
+
+//----------------------------------------------------------------------------
 bool TestSimpleHTG(const std::string& tempDir)
 {
   vtkNew<vtkHyperTreeGridSource> htgSource;
@@ -641,7 +831,7 @@ bool TestFieldDataReadWrite(const std::string& tempDir)
 bool TestWriteAfterReadComposite(const std::string& tempDir)
 {
   // Test that HDF Reader and writer properly release the file lock after they are done
-  std::string writtenName = tempDir + "/pdc_read_write.hdf";
+  std::string writtenName = tempDir + "/pdc_read_write.vtkhdf";
 
   vtkNew<vtkSphereSource> sphere;
   vtkNew<vtkConeSource> cone;
@@ -663,6 +853,25 @@ bool TestWriteAfterReadComposite(const std::string& tempDir)
   // Overwrite the file, check that reader correctly released resources
   // Test errors if write operation did not finish because file lock was not released;
   writer->Write();
+
+  return true;
+}
+
+//----------------------------------------------------------------------------
+bool TestTable(const std::string& tempDir, const std::string& dataRoot)
+{
+  const std::string baseName = "table.vtt";
+  const std::string basePath = dataRoot + "/Data/vtkHDF/" + baseName;
+  vtkNew<vtkXMLTableReader> baseReader;
+  baseReader->SetFileName(basePath.c_str());
+  baseReader->Update();
+  auto baseData = vtkTable::SafeDownCast(baseReader->GetOutput());
+
+  std::string tempPath = tempDir + "/HDFWriter_" + baseName;
+  if (!TestWriteAndReadConfigurations(baseData, tempPath))
+  {
+    return false;
+  }
 
   return true;
 }
@@ -692,9 +901,14 @@ int TestHDFWriter(int argc, char* argv[])
   testPasses &= TestSpherePolyData(tempDir);
   testPasses &= TestSimpleHTG(tempDir);
   testPasses &= TestRandomHTG(tempDir);
+  testPasses &= TestNullHTG(tempDir);
+  testPasses &= TestNoValidPartHTG(tempDir);
   testPasses &= TestPDCCompositeHTG(tempDir);
   testPasses &= TestComplexPolyData(tempDir, dataRoot);
   testPasses &= TestUnstructuredGrid(tempDir, dataRoot);
+  testPasses &= TestImageDataWriteRead(tempDir);
+  testPasses &= TestRectilinearGridWriteRead(tempDir);
+  testPasses &= TestStructuredGridWriteRead(tempDir);
   testPasses &= TestDataSetAttributes(tempDir);
   testPasses &= TestSanitizeName(tempDir, dataRoot);
   testPasses &= TestPartitionedUnstructuredGrid(tempDir, dataRoot);
@@ -704,6 +918,7 @@ int TestHDFWriter(int argc, char* argv[])
   testPasses &= TestMultiBlockIdenticalBlockNames(tempDir, dataRoot);
   testPasses &= TestFieldDataReadWrite(tempDir);
   testPasses &= TestWriteAfterReadComposite(tempDir);
+  testPasses &= TestTable(tempDir, dataRoot);
 
   return testPasses ? EXIT_SUCCESS : EXIT_FAILURE;
 }

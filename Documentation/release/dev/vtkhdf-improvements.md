@@ -1,44 +1,8 @@
-## Proper caching in vtkHDFReader
+## vtkHDFWriter: improve chunk size management
 
-vtkHDFReader cache was reworked to work properly with all supported types but
-vtkHyperTreeGrid, with added support for vtkPartitionedDataSetCollection, vtkMultiBlockDataSet and vtkOverlappingAMR.
+When writing VTKHDF files using `vtkHDFWriter`, chunk size is now constrained between a minimum pre-configured (100) value, and the minimum between configured chunk size and the dataset size. This means that a small dataset will not waste too much space anymore because of a higher chunk size. However, this configuration can be sub-optimal when the dataset changes size a lot over time, or when parallel distribution is unequal.
 
-The caches now ensure the MeshMTime of vtkDataSet provided by
-the vtkHDFReader do not change if they should not.
+## Improved distributed composite HyperTreeGrid support
 
-In this context, the UseCache member is now true by default
-and it have been deprecated for further removal.
-
-GetAttributeOriginalIdName, SetAttributeOriginalIdName and AddFieldArrays have also been deprecated.
-
-vtkHDFUtilities::RetrieveHDFInformation have been deprecated in favor of a version with more arguments.
-
-## Proper distributed support in vtkHDFReader
-
-vtkHDFReader now generates proper vtkPartitionedDataSet distributed contents
-with empty (nullptr) partitions where other ranks have data.
-
-## Piece distribution configuration in vtkHDFReader
-
-When reading partitioned data in parallel, you can now use `vtkHDFReader::SetPieceDistribution`
-to choose the piece distribution strategy: interleave blocks between processes, or allocate "blocks" of partitions.
-
-## Better support for partitioned data writing in vtkHDFWriter
-
-`vtkHDFWriter` is now able to write partitioned data in parallel
-when the number of non-null partitions differ between processes.
-
-## Removal of unspecified Temporal FieldData behavior with vtkOverlappingAMR
-
-vtkOverlappingAMR does not specify properly how to handle temporal field data
-in the VTKHDF specifications, the implementation have been removed before a proper
-reimplementation.
-
-## Quiet support in vtkHDFUtilities::Open
-
-A new argument have been added to vtkHDFUtilities::Open
-to suppress all console output on error. The previous version has been deprecated.
-
-## vtkHyperTreeGrid support in vtkHDFWriter
-
-`vtkHDFWriter` now properly supports the HyperTreeGrid data model. It can write partitioned, temporal and distributed data.
+Writing and reading HyperTreeGrids as part of a multi-block compositer dataset has been improved.
+You can now write and read HyperTreeGrid with a null partition on rank 0 without issues.

@@ -121,12 +121,25 @@ MODULE_MAPPER = {
     "vtkCommonCore": [
         "vtkmodules.numpy_interface.array_overrides",
         "vtkmodules.util.data_array_selection",
+        "vtkmodules.util.information",
+        "vtkmodules.util.string_array",
+        "vtkmodules.util.variant_array",
+    ],
+    "vtkCommonMath": [
+        "vtkmodules.util.matrix",
     ],
     "vtkCommonDataModel": [
         "vtkmodules.util.data_model",
+        "vtkmodules.util.graph",
+        "vtkmodules.util.implicit_functions",
+        "vtkmodules.util.molecule",
+        "vtkmodules.util.selection",
     ],
     "vtkCommonExecutionModel": [
         "vtkmodules.util.execution_model",
+    ],
+    "vtkInteractionWidgets": [
+        "vtkmodules.util.widgets",
     ],
 }
 LOADED_MODULES = set()

@@ -31,7 +31,7 @@
 
 #include "vtkDataAssembly.h" // For vtkDataAssembly
 #include "vtkDataObjectAlgorithm.h"
-#include "vtkDeprecation.h"  // For VTK_DEPRECATED_IN_9_7_0 VTK_DEPRECATED_IN_9_6_0
+#include "vtkDeprecation.h"  // For VTK_DEPRECATED_IN_9_7_0
 #include "vtkIOHDFModule.h"  // For export macro
 #include "vtkSmartPointer.h" // For vtkSmartPointer
 
@@ -57,7 +57,10 @@ class vtkPartitionedDataSet;
 class vtkPartitionedDataSetCollection;
 class vtkPointData;
 class vtkPolyData;
+class vtkRectilinearGrid;
 class vtkResourceStream;
+class vtkStructuredGrid;
+class vtkTable;
 class vtkUnstructuredGrid;
 
 namespace vtkHDFUtilities
@@ -144,6 +147,7 @@ public:
   virtual vtkDataArraySelection* GetPointDataArraySelection();
   virtual vtkDataArraySelection* GetCellDataArraySelection();
   virtual vtkDataArraySelection* GetFieldDataArraySelection();
+  virtual vtkDataArraySelection* GetRowDataArraySelection();
   ///@}
 
   ///@{
@@ -236,6 +240,9 @@ protected:
    * Returns 1 if successful, 0 otherwise.
    */
   int Read(vtkInformation* outInfo, vtkImageData* data);
+  int Read(vtkInformation* outInfo, vtkRectilinearGrid* data);
+  int Read(vtkInformation* outInfo, vtkStructuredGrid* data);
+  int Read(vtkInformation* outInfo, vtkTable* data);
   int Read(vtkInformation* outInfo, vtkUnstructuredGrid* data, vtkPartitionedDataSet* pData);
   int Read(vtkInformation* outInfo, vtkPolyData* data, vtkPartitionedDataSet* pData);
   int Read(vtkInformation* outInfo, vtkHyperTreeGrid* data, vtkPartitionedDataSet* pData);
@@ -244,13 +251,6 @@ protected:
   int Read(vtkInformation* outInfo, vtkMultiBlockDataSet* data);
   int ReadRecursively(vtkInformation* outInfo, vtkMultiBlockDataSet* data, const std::string& path);
   ///@}
-
-  VTK_DEPRECATED_IN_9_6_0("This method is deprecated, do not use")
-  int Read(const std::vector<vtkIdType>& numberOfPoints,
-    const std::vector<vtkIdType>& numberOfCells,
-    const std::vector<vtkIdType>& numberOfConnectivityIds, vtkIdType partOffset,
-    vtkIdType startingPointOffset, vtkIdType startingCellOffset,
-    vtkIdType startingConnectctivityIdOffset, int filePiece, vtkUnstructuredGrid* pieceData);
 
   /**
    * Read the field arrays from the file and add them to the dataset.
@@ -299,9 +299,9 @@ protected:
 
   /**
    * The array selections.
-   * in the same order as vtkDataObject::AttributeTypes: POINT, CELL, FIELD
+   * Key is vtkDataObject::AttributeTypes: POINT, CELL, FIELD,...
    */
-  vtkDataArraySelection* DataArraySelection[3];
+  std::map<int, vtkDataArraySelection*> DataArraySelection;
 
   /**
    * The observer to modify this object when the array selections are
@@ -345,11 +345,19 @@ private:
   bool ReadData(vtkInformation* outInfo, vtkDataObject* data);
 
   /**
+   * Read structured data (image, rectilinear grid, structured grid) into the provided
+   * dataset and according to the provided dimensions.
+   * Return true on success, false otherwise
+   */
+  bool ReadStructuredData(
+    vtkDataSet* data, const int* WholeExtent, const std::vector<int>& updateExtent);
+
+  /**
    * Read the actual data into the provided amr up to maxLevel
    * Return true on success, false otherwise
    */
   bool ReadAMRData(vtkOverlappingAMR* data, unsigned int maxLevel,
-    vtkDataArraySelection* dataArraySelection[3], bool isTemporalData);
+    const std::map<int, vtkDataArraySelection*>& dataArraySelection, bool isTemporalData);
 
   /**
    * Read 'pieceData' specified by 'filePiece' where

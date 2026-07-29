@@ -37,10 +37,6 @@
 #include <deque>
 
 VTK_ABI_NAMESPACE_BEGIN
-vtkInformationKeyMacro(vtkHyperTreeGrid, LEVELS, Integer);
-vtkInformationKeyMacro(vtkHyperTreeGrid, DIMENSION, Integer);
-vtkInformationKeyMacro(vtkHyperTreeGrid, ORIENTATION, Integer);
-vtkInformationKeyRestrictedMacro(vtkHyperTreeGrid, SIZES, DoubleVector, 3);
 
 vtkStandardNewMacro(vtkHyperTreeGrid);
 
@@ -507,8 +503,11 @@ void vtkHyperTreeGrid::GetCellDims(unsigned int cellDims[3]) const
 //------------------------------------------------------------------------------
 void vtkHyperTreeGrid::SetExtent(const int extent[6])
 {
+#if VTK_USE_FUTURE_CONST
+  int description = vtkStructuredData::SetExtent(extent, this->Extent);
+#else
   int description = vtkStructuredData::SetExtent(const_cast<int*>(extent), this->Extent);
-  // why vtkStructuredData::SetExtent don't take const int* ?
+#endif
 
   if (description < 0) // improperly specified
   {

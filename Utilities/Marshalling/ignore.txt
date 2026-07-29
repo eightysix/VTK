@@ -125,7 +125,6 @@ Common/Core/vtkOStrStreamWrapper.h
 Common/Core/vtkOStreamWrapper.h
 Common/Core/vtkObjectFactory.h
 Common/Core/vtkObjectFactoryCollection.h
-Common/Core/vtkOldStyleCallbackCommand.h
 Common/Core/vtkOutputWindow.h
 Common/Core/vtkOverrideAttribute.h
 Common/Core/vtkOverrideInformation.h
@@ -196,9 +195,7 @@ Common/Core/vtkWindows.h
 Common/Core/vtkWrappingHints.h
 Common/Core/vtkXMLFileOutputWindow.h
 Common/DataModel/vtkAMRBox.h
-Common/DataModel/vtkAMRDataInternals.h
 Common/DataModel/vtkAMRDataObject.h
-Common/DataModel/vtkAMRInformation.h
 Common/DataModel/vtkAMRMetaData.h
 Common/DataModel/vtkAMRUtilities.h
 Common/DataModel/vtkAbstractCellLocator.h
@@ -381,6 +378,7 @@ Common/DataModel/vtkMolecule.h
 Common/DataModel/vtkMutableDirectedGraph.h
 Common/DataModel/vtkMutableUndirectedGraph.h
 Common/DataModel/vtkNonLinearCell.h
+Common/DataModel/vtkNonLinearCell3D.h
 Common/DataModel/vtkNonMergingPointLocator.h
 Common/DataModel/vtkNonOverlappingAMR.h
 Common/DataModel/vtkOctreePointLocator.h
@@ -460,7 +458,6 @@ Common/DataModel/vtkTriQuadraticPyramid.h
 Common/DataModel/vtkTriangle.h
 Common/DataModel/vtkTriangleStrip.h
 Common/DataModel/vtkUniformGridAMR.h
-Common/DataModel/vtkUniformGridAMRDataIterator.h
 Common/DataModel/vtkUniformGridAMRIterator.h
 Common/DataModel/vtkUniformHyperTreeGrid.h
 Common/DataModel/vtkUnstructuredGridCellIterator.h
@@ -589,7 +586,6 @@ Imaging/Core/vtkImageDecomposeFilter.h
 Imaging/Core/vtkImageDifference.h
 Imaging/Core/vtkImageExtractComponents.h
 Imaging/Core/vtkImageFlip.h
-Imaging/Core/vtkImageInterpolatorInternals.h
 Imaging/Core/vtkImageIterateFilter.h
 Imaging/Core/vtkImageMagnify.h
 Imaging/Core/vtkImageMask.h
@@ -697,6 +693,23 @@ Interaction/Widgets/vtkXYPlotWidget.h
 Rendering/Annotation/vtkPolarAxesActor2D.h
 Rendering/Annotation/vtkRadialGridActor2D.h
 Rendering/Annotation/vtkScalarBarActorInternal.h
+Rendering/ANARI/vtkAnariActorNode.h
+Rendering/ANARI/vtkAnariCameraNode.h
+Rendering/ANARI/vtkAnariCompositePolyDataMapperNode.h
+Rendering/ANARI/vtkAnariDevice.h
+Rendering/ANARI/vtkAnariFollowerNode.h
+Rendering/ANARI/vtkAnariGlyph3DMapperNode.h
+Rendering/ANARI/vtkAnariLightNode.h
+Rendering/ANARI/vtkAnariPass.h
+Rendering/ANARI/vtkAnariPolyDataMapperInheritInterface.h
+Rendering/ANARI/vtkAnariPolyDataMapperNode.h
+Rendering/ANARI/vtkAnariProfiling.h
+Rendering/ANARI/vtkAnariRenderer.h
+Rendering/ANARI/vtkAnariSceneGraph.h
+Rendering/ANARI/vtkAnariViewNodeFactory.h
+Rendering/ANARI/vtkAnariVolumeMapper.h
+Rendering/ANARI/vtkAnariVolumeMapperNode.h
+Rendering/ANARI/vtkAnariVolumeNode.h
 Rendering/Context2D/vtkAbstractContextBufferId.h
 Rendering/Context2D/vtkContext2D.h
 Rendering/Context2D/vtkContext3D.h
@@ -792,6 +805,7 @@ Rendering/LICOpenGL2/vtkSurfaceLICComposite.h
 Rendering/LICOpenGL2/vtkSurfaceLICHelper.h
 Rendering/LICOpenGL2/vtkTextureIO.h
 Rendering/LOD/vtkQuadricLODActor.h
+Rendering/Label/vtkLabeledFormatter.h
 Rendering/Label/vtkLabelHierarchyAlgorithm.h
 Rendering/Label/vtkLabelHierarchyCompositeIterator.h
 Rendering/Label/vtkLabelHierarchyIterator.h
@@ -813,6 +827,7 @@ Rendering/OpenGL2/vtkGLSLModifierFactory.h
 Rendering/OpenGL2/vtkGenericOpenGLRenderWindow.h
 Rendering/OpenGL2/vtkIOSRenderWindow.h
 Rendering/OpenGL2/vtkOpenGLArrayTextureBufferAdapter.h
+Rendering/OpenGL2/vtkOpenGLArrayTextureBufferCache.h
 Rendering/OpenGL2/vtkOpenGLBatchedPolyDataMapper.h
 Rendering/OpenGL2/vtkOpenGLBillboardTextActor3D.h
 Rendering/OpenGL2/vtkOpenGLBufferObject.h

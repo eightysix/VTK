@@ -25,6 +25,7 @@ vtk_add_test_cxx(vtkFiltersCoreCxxTests tests
   TestCompositeDataProbeFilterWithHyperTreeGrid.cxx
   TestConnectivityFilter.cxx,NO_VALID
   TestConvertToMultiBlock.cxx,NO_VALID
+  TestConvexHull.cxx,NO_VALID
   TestCutter.cxx,NO_VALID
   TestDataObjectToPartitionedDataSetCollection.cxx,NO_VALID
   TestDecimatePolylineFilter.cxx
@@ -36,11 +37,13 @@ vtk_add_test_cxx(vtkFiltersCoreCxxTests tests
   TestDelaunay2DFindTriangle.cxx,NO_VALID
   TestDelaunay2DMeshes.cxx,NO_VALID
   TestDelaunay3D.cxx,NO_VALID
+  TestDelaunay3DValidity.cxx,NO_VALID
   TestExplicitStructuredGridCrop.cxx
   TestExplicitStructuredGridToUnstructuredGrid.cxx
   TestExecutionTimer.cxx,NO_VALID
   TestExtractCells.cxx,NO_VALID
   TestExtractCellsAlongPolyLine.cxx,NO_VALID
+  TestExtractCellsAlongPolyLinePolyhedron.cxx,NO_VALID
   TestFeatureEdges.cxx,NO_VALID
   TestFieldDataToDataSetAttribute.cxx,NO_VALID
   TestFlyingEdges.cxx

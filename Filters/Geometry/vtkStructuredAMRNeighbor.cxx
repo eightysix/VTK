@@ -73,7 +73,7 @@ vtkStructuredAMRNeighbor& vtkStructuredAMRNeighbor::operator=(const vtkStructure
       this->GridOverlapExtent[minIdx] = N.GridOverlapExtent[minIdx];
       this->GridOverlapExtent[maxIdx] = N.GridOverlapExtent[maxIdx];
     } // END for all dimensions
-  }   // END if
+  } // END if
   return *this;
 }
 
@@ -140,14 +140,15 @@ void vtkStructuredAMRNeighbor::GetReceiveExtentOnGrid(int ng, int gridExtent[6],
         ext[i * 2 + 1] += ng;
         break;
       default:; /* NO OP */
-    }           // END switch
-  }             // END for all dimensions
+    } // END switch
+  } // END for all dimensions
   vtkStructuredExtent::Clamp(ext, gridExtent);
 }
 
 //------------------------------------------------------------------------------
-void vtkStructuredAMRNeighbor::ComputeSendAndReceiveExtent(int gridRealExtent[6],
-  int* vtkNotUsed(gridGhostedExtent), int neiRealExtent[6], int* vtkNotUsed(WholeExtent), int N)
+void vtkStructuredAMRNeighbor::ComputeSendAndReceiveExtent(VTK_FUTURE_CONST int gridRealExtent[6],
+  VTK_FUTURE_CONST int vtkNotUsed(gridGhostedExtent)[6], VTK_FUTURE_CONST int neiRealExtent[6],
+  VTK_FUTURE_CONST int vtkNotUsed(WholeExtent)[6], int N)
 {
 
   // TODO: Here we need to make sure that the send/rcv extent between a coarse
@@ -180,8 +181,8 @@ void vtkStructuredAMRNeighbor::ComputeSendAndReceiveExtent(int gridRealExtent[6]
         this->SendExtent[i * 2] -= N;
         break;
       default:; /* NO OP */
-    }           // END switch
-  }             // END for all dimensions
+    } // END switch
+  } // END for all dimensions
 
   // Hmm...restricting receive extent to the real extent of the neighbor
   vtkStructuredExtent::Clamp(this->RcvExtent, neiRealExtent);

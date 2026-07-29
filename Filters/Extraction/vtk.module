@@ -24,18 +24,22 @@ DEPENDS
   VTK::CommonExecutionModel
   VTK::FiltersGeneral
 PRIVATE_DEPENDS
+  VTK::CommonCache
   VTK::CommonDataModel
   VTK::FiltersCore
   VTK::FiltersHyperTree
   VTK::FiltersStatistics
+  VTK::ParallelCore
   VTK::ParallelDIY
 OPTIONAL_DEPENDS
   VTK::ParallelMPI
 TEST_DEPENDS
   VTK::FiltersGeneral
   VTK::FiltersSources
+  VTK::FiltersTemporal
   VTK::IOExodus
   VTK::IOLegacy
+  VTK::IOHDF
   VTK::IOXML
   VTK::InteractionStyle
   VTK::RenderingOpenGL2

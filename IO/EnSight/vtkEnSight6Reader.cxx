@@ -1118,7 +1118,7 @@ int vtkEnSight6Reader::ReadScalarsPerElement(const char* fileName, const char* d
         }
         lineRead = this->ReadNextDataLine(line);
       } // end while
-    }   // end else
+    } // end else
     if (component == 0)
     {
       scalars->SetName(description);
@@ -1288,7 +1288,7 @@ int vtkEnSight6Reader::ReadVectorsPerElement(const char* fileName, const char* d
         }
         lineRead = this->ReadNextDataLine(line);
       } // end while
-    }   // end else
+    } // end else
     output->GetCellData()->AddArray(vectors);
     if (!output->GetCellData()->GetVectors())
     {
@@ -1448,7 +1448,7 @@ int vtkEnSight6Reader::ReadTensorsPerElement(const char* fileName, const char* d
         }
         lineRead = this->ReadNextDataLine(line);
       } // end while
-    }   // end else
+    } // end else
     output->GetCellData()->AddArray(tensors);
     tensors->Delete();
   }
@@ -1720,7 +1720,7 @@ int vtkEnSight6Reader::CreateUnstructuredGridOutput(
         else
         {
           auto resultInt9 = vtk::scan<int, int, int, int, int, int, int, int, int>(
-            lineView, " {:d} {:d} {:d} {:d} {:d} {:d} {:d} {:d}");
+            lineView, " {:d} {:d} {:d} {:d} {:d} {:d} {:d} {:d} {:d}");
           if (resultInt9 && cellType == vtkEnSightReader::QUAD8)
           {
             std::tie(std::ignore, intIds[0], intIds[1], intIds[2], intIds[3], std::ignore,

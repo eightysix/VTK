@@ -10,7 +10,8 @@
 #define vtkHDFUtilities_h
 
 #include "vtkDataArray.h"
-#include "vtkDeprecation.h" // For VTK_DEPRECATED_IN_9_7_0 VTK_DEPRECATED_IN_9_6_0
+#include "vtkDataObject.h"
+#include "vtkDeprecation.h" // For VTK_DEPRECATED_IN_9_7_0
 #include "vtkIOHDFModule.h" // For export macro
 #include "vtkStringArray.h"
 #include "vtkType.h"
@@ -36,7 +37,7 @@ class vtkMemoryResourceStream;
 
 namespace vtkHDFUtilities
 {
-const std::string VTKHDF_ROOT_PATH = "/VTKHDF";
+const std::string& VTKHDF_ROOT_PATH();
 
 /*
  * The number of PolyData topologies saved in vtkHDF format
@@ -47,7 +48,7 @@ constexpr std::size_t NUM_POLY_DATA_TOPOS = 4;
  * A vector of the topology names that are saved in vtkHDF
  * Can be used for the name of the HDF group only
  */
-const std::vector<std::string> POLY_DATA_TOPOS{ "Vertices", "Lines", "Polygons", "Strips" };
+const std::vector<std::string>& POLY_DATA_TOPOS();
 
 /*
  * Attribute tag used in the cache storage to indicate arrays related to the geometry of the data
@@ -59,25 +60,14 @@ constexpr int GEOMETRY_ATTRIBUTE_TAG = -42;
  * How many attribute types we have. This returns 3: point, cell and field
  * attribute types.
  */
-constexpr static int GetNumberOfAttributeTypes()
-{
-  return 3;
-}
-
-/*
- * How many attribute types we have as data array. This returns 2: point and cell.
- */
-constexpr static int GetNumberOfDataArrayTypes()
-{
-  return 2;
-}
+VTKIOHDF_EXPORT std::vector<int> GetAttributeTypes();
 
 /**
  * Read the dataset type string for the given group,
  * and return the index of the type as defined in vtkType.h
  * Return false if not found or on error.
  */
-bool ReadDataSetType(hid_t groupID, int& dataSetType);
+VTKIOHDF_EXPORT bool ReadDataSetType(hid_t groupID, int& dataSetType);
 
 /*
  * Make sure we replace any illegal characters in the objectName (slash, dot) by an underscore, as
@@ -102,9 +92,6 @@ struct VTKIOHDF_EXPORT TemporalGeometryOffsets
 {
 public:
   TemporalGeometryOffsets();
-
-  VTK_DEPRECATED_IN_9_6_0("Member is deprecated. Please use GetOffsets instead.")
-  bool Success = true;
 
   vtkIdType PartOffset = 0;
   vtkIdType PointOffset = 0;
@@ -188,7 +175,8 @@ VTKIOHDF_EXPORT bool GetAttribute(
 /**
  * Get string argument, variable or fixed size
  */
-bool GetStringAttribute(hid_t groupID, const std::string& name, std::string& attribute);
+VTKIOHDF_EXPORT bool GetStringAttribute(
+  hid_t groupID, const std::string& name, std::string& attribute);
 
 /**
  * Read the number of steps of an HDF group
@@ -203,12 +191,8 @@ VTKIOHDF_EXPORT std::vector<hsize_t> GetDimensions(hid_t fileID, const char* dat
 /**
  * Initialize meta information of the file.
  */
-VTK_DEPRECATED_IN_9_7_0("Deprecated. Please use the groupPrefix version instead.")
-VTKIOHDF_EXPORT
-bool RetrieveHDFInformation(hid_t& fileID, hid_t& groupID, const std::string& rootName,
-  std::array<int, 2>& version, int& dataSetType, int& numberOfPieces,
-  std::array<hid_t, 3>& attributeDataGroup);
 
+///@{
 /**
  * Retrieve HDF information from provided rootId, rootName and groupPrefix
  *
@@ -220,12 +204,21 @@ bool RetrieveHDFInformation(hid_t& fileID, hid_t& groupID, const std::string& ro
  * @arg version Set to the version of the file being opened
  * @arg dataSetType Set to the type of the dataset being opened
  * @arg numberOfPieces Set to the number of pieces in the dataset being opened
- * @arg attributeDataGroup Set to the ids of the point/cell/field data group
+ * @arg attributeDataGroup map POINT/CELL/FIELD/ROW to HDF5 data groups
  * @return true on sucess, false otherwise
  */
 VTKIOHDF_EXPORT bool RetrieveHDFInformation(hid_t& rootID, const std::string& rootName,
   const std::string& groupPrefix, hid_t& groupID, std::array<int, 2>& version, int& dataSetType,
+  int& numberOfPieces, std::map<int, hid_t>& attributeDataGroup);
+VTK_DEPRECATED_IN_9_7_0("Deprecated. Please use the groupPrefix version instead.")
+VTKIOHDF_EXPORT bool RetrieveHDFInformation(hid_t& fileID, hid_t& groupID,
+  const std::string& rootName, std::array<int, 2>& version, int& dataSetType, int& numberOfPieces,
+  std::array<hid_t, 3>& attributeDataGroup);
+VTK_DEPRECATED_IN_9_7_0("Deprecated. Please use the std::map version instead.")
+VTKIOHDF_EXPORT bool RetrieveHDFInformation(hid_t& rootID, const std::string& rootName,
+  const std::string& groupPrefix, hid_t& groupID, std::array<int, 2>& version, int& dataSetType,
   int& numberOfPieces, std::array<hid_t, 3>& attributeDataGroup);
+///@}
 
 /**
  * Convenient callback method to retrieve a name when calling a H5Giterate()
@@ -233,11 +226,16 @@ VTKIOHDF_EXPORT bool RetrieveHDFInformation(hid_t& rootID, const std::string& ro
 VTKIOHDF_EXPORT herr_t FileInfoCallBack(
   hid_t loc_id, const char* name, const H5L_info_t* info, void* opdata);
 
+///@{
 /**
  * Returns the names of arrays for 'attributeType' (point or cell).
  */
+VTK_DEPRECATED_IN_9_7_0("Deprecated. Please use the std::map version instead.")
 VTKIOHDF_EXPORT std::vector<std::string> GetArrayNames(
   const std::array<hid_t, 3>& attributeDataGroup, int attributeType);
+VTKIOHDF_EXPORT std::vector<std::string> GetArrayNames(
+  const std::map<int, hid_t>& attributeDataGroup, int attributeType);
+///@}
 
 /**
  * Return the name of all children of an HDF group given its path
@@ -296,13 +294,18 @@ VTKIOHDF_EXPORT std::array<vtkIdType, 2> GetFieldArraySize(
 VTKIOHDF_EXPORT vtkIdType GetArrayOffset(
   hid_t group, vtkIdType step, int attributeType, std::string name);
 
+///@{
 /**
  * Reads and returns a new vtkAbstractArray. The actual type of the array
  * depends on the type of the HDF array. The array is read from the PointData
  * or CellData groups depending on the 'attributeType' parameter.
  */
+VTK_DEPRECATED_IN_9_7_0("Deprecated. Please use the std::map version instead.")
 VTKIOHDF_EXPORT vtkAbstractArray* NewFieldArray(const std::array<hid_t, 3>& attributeDataGroup,
   const char* name, vtkIdType offset, vtkIdType size, vtkIdType dimMaxSize);
+VTKIOHDF_EXPORT vtkAbstractArray* NewFieldArray(const std::map<int, hid_t>& attributeDataGroup,
+  const char* name, vtkIdType offset, vtkIdType size, vtkIdType dimMaxSize);
+///@}
 
 VTKIOHDF_EXPORT vtkStringArray* NewStringArray(
   hid_t dataset, std::vector<hsize_t> dims, std::vector<hsize_t> fileExtent);

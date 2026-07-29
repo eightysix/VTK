@@ -241,8 +241,8 @@ void vtkFieldDataSerializer::DeSerializeToSubExtent(
 
           targetArray->SetTuple(targetIdx, sourceIdx, dataArray);
         } // END for all k
-      }   // END for all j
-    }     // END for all i
+      } // END for all j
+    } // END for all i
 
     dataArray->Delete();
   } // END for all arrays
@@ -290,8 +290,8 @@ vtkDataArray* vtkFieldDataSerializer::ExtractSubExtentData(
 
         subSetArray->SetTuple(targetIdx, sourceIdx, inputDataArray);
       } // END for all k
-    }   // END for all j
-  }     // END for all i
+    } // END for all j
+  } // END for all i
 
   return (subSetArray);
 }
@@ -306,13 +306,6 @@ vtkDataArray* vtkFieldDataSerializer::ExtractSelectedTuples(
   subSetArray->SetNumberOfTuples(tupleIds->GetNumberOfIds());
   subSetArray->InsertTuplesStartingAt(0, tupleIds, inputDataArray);
   return subSetArray;
-}
-
-//------------------------------------------------------------------------------
-void vtkFieldDataSerializer::SerializeDataArray(
-  vtkDataArray* dataArray, vtkMultiProcessStream& bytestream)
-{
-  bytestream.Push(dataArray);
 }
 
 //------------------------------------------------------------------------------
@@ -350,15 +343,4 @@ void vtkFieldDataSerializer::Deserialize(vtkMultiProcessStream& bytestream, vtkF
   } // END for all arrays
 }
 
-//------------------------------------------------------------------------------
-void vtkFieldDataSerializer::DeserializeDataArray(
-  vtkMultiProcessStream& bytestream, vtkDataArray*& dataArray)
-{
-  if (bytestream.Empty())
-  {
-    vtkGenericWarningMacro("Bytestream is empty!");
-    return;
-  }
-  bytestream.Pop(dataArray);
-}
 VTK_ABI_NAMESPACE_END

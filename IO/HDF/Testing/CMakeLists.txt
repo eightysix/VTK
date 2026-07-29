@@ -140,6 +140,8 @@ vtk_module_test_data(
   Data/vtkHDF/Transient/transient_expected_overlapping_amr_2/transient_expected_overlapping_amr_2_0.vti
   Data/vtkHDF/Transient/transient_expected_overlapping_amr_2/transient_expected_overlapping_amr_2_1.vti
 
+  Data/vtkHDF/table.vtt
+
   Data/vtkHDF/composite_partial_array.vtkhdf
 
   Data/vtkHDF/multipiece_temporal_htg.vtkhdf
@@ -152,9 +154,14 @@ vtk_module_test_data(
 
   Data/vtkHDF/multipiece_htg.vtkhdf
   Data/vtkHDF/randomhtg.vtkhdf
+  Data/vtkHDF/htg_3parts_coords.vtkhdf
   Data/vtkHDF/simple_htg.vtkhdf
   Data/vtkHDF/shell_3d.vtkhdf
   Data/vtkHDF/temporal_htg.vtkhdf
+
+  Data/vtkHDF/temporal_rectilinear.vtkhdf
+  Data/vtkHDF/temporal_structured.vtkhdf
+  Data/vtkHDF/structured_coords.vtkhdf
 
   Data/vtkHDF/temporal_image.vtkhdf
   Data/vtkHDF/temporal_image_0.vti

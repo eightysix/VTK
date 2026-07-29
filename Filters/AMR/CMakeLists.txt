@@ -1,6 +1,8 @@
 set(classes
   vtkAMRCutPlane
+  vtkAMRContourFilter
   vtkAMRGaussianPulseSource
+  vtkAMRInterfaceFilter
   vtkAMRResampleFilter
   vtkAMRSliceFilter
   vtkAMRToMultiBlockFilter

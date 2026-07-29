@@ -55,7 +55,10 @@ $if(BASEBRANCH != "master")\
 $endif\
   - [ ] Create update branch: `git checkout -b update-to-v$(VERSION)$(RC)`
   - Make a commit for each of these changes on the update branch:
-    - [ ] Move release note files to `Documentation/release/$(MAJOR).$(MINOR)` folder.
+    - [ ] Move release note files
+      - [ ] Move release note markdown files (*.md) to `Documentation/release/$(MAJOR).$(MINOR)` folder.
+      - [ ] Move release note image files (*.png, *.jpg, *.jpeg, *.gif) to `Documentation/release/imgs/$(MAJOR).$(MINOR)` folder.
+      - [ ] Update image references in `Documentation/release/$(MAJOR).$(MINOR)/*.md` to point to `../imgs/$(MAJOR).$(MINOR)/`.
 $if(BASEBRANCH == "master")\
     - [ ] If `$(BASEBRANCH)` is `master`, update the non-patch version in a
           separate commit (so that `master` gets it as well).
@@ -98,6 +101,8 @@ $endif\
 $if(PATCH == 0)\
   - If `$(PATCH) == 0` Software process updates **these can all be done independently**
     - [ ] Update kwrobot with the new `release` branch rules (@utils/maintainers/ghostflow)
+      - Use the first commit listed by the command:
+      - `git fetch origin; git log --first-parent --reverse origin/master '^origin/release'`
     - [ ] Run [this script][cdash-update-groups] to update the CDash groups
       - This must be done after a nightly run to ensure all builds are in the `release` group
       - See the script itself for usage documentation

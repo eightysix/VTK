@@ -67,6 +67,21 @@ void updateFlippedEdges(
   }
 }
 
+// Present IsInside's raw coordinate array through the point/cell access concept
+// used by vtkPolygon::EarClipPolygon3D, the shared, tested, allocation-free ear
+// clip. A face gives local ids into pts[0..n-1], so a coordinate read is a
+// single pointer offset and the adapter inlines away.
+struct LocalPointAccessor
+{
+  const double* Pts;
+  struct Pt3
+  {
+    const double* P;
+    double operator[](int i) const { return this->P[i]; }
+  };
+  Pt3 operator[](vtkIdType id) const { return Pt3{ this->Pts + 3 * id }; }
+};
+
 //------------------------------------------------------------------------------
 } // anonymous namespace
 
@@ -572,32 +587,6 @@ vtkCell* vtkPolyhedron::GetFace(int faceId)
   return this->Polygon;
 }
 
-// VTK_DEPRECATED_IN_9_6_0()
-//------------------------------------------------------------------------------
-// Specify the faces for this cell.
-void vtkPolyhedron::SetFaces(vtkIdType* faces)
-{
-  // Set up face structure
-  this->GlobalFaces->Reset();
-
-  if (!faces)
-  {
-    return;
-  }
-
-  vtkIdType nfaces = faces[0];
-  this->GlobalFaces->AllocateEstimate(nfaces, nfaces);
-  vtkIdType* face = faces + 1;
-  vtkIdType faceLoc = 1;
-
-  for (vtkIdType fid = 0; fid < nfaces; ++fid)
-  {
-    this->GlobalFaces->InsertNextCell(face[0], &face[1]);
-    faceLoc += face[0] + 1;
-    face = faces + faceLoc;
-  } // for all faces
-}
-
 //------------------------------------------------------------------------------
 // Specify the faces for this cell from a vtkCellArray definition.
 int vtkPolyhedron::SetCellFaces(vtkCellArray* faces)
@@ -616,26 +605,6 @@ int vtkPolyhedron::SetCellFaces(vtkCellArray* faces)
   this->GlobalFaces->DeepCopy(faces);
 
   return 1;
-}
-
-// VTK_DEPRECATED_IN_9_6_0()
-//------------------------------------------------------------------------------
-// Return the list of faces for this cell.
-vtkIdType* vtkPolyhedron::GetFaces()
-{
-  if (!this->GlobalFaces->GetNumberOfCells())
-  {
-    return nullptr;
-  }
-
-  vtkNew<vtkIdTypeArray> tmpFaces;
-  this->GlobalFaces->ExportLegacyFormat(tmpFaces);
-
-  this->LegacyGlobalFaces->Reset();
-  this->LegacyGlobalFaces->InsertNextValue(this->GlobalFaces->GetNumberOfCells());
-  this->LegacyGlobalFaces->InsertTuples(1, tmpFaces->GetNumberOfValues(), 0, tmpFaces);
-
-  return this->LegacyGlobalFaces->GetPointer(0);
 }
 
 vtkCellArray* vtkPolyhedron::GetCellFaces()
@@ -780,10 +749,19 @@ int vtkPolyhedron::IsInside(const double x[3], double tolerance)
     return it != this->PointIdMap.end() ? it->second : -1;
   };
 
-  // Reusable polygon + id list for faces with > 4 vertices.
-  vtkNew<vtkPolygon> poly;
-  vtkNew<vtkIdList> triPtIds;
+  // Reusable scratch for triangulating faces with more than four vertices.
+  // These are stack-local std::vectors (not cached cell members): IsInside is
+  // called per integration substep by streamline/probe filters, so the >4-gon
+  // path must not allocate per call - the vectors are reused across faces within
+  // a call and across calls they cost only a cleared-but-retained buffer. Unlike
+  // the previous implementation they hold no vtkObject, so nothing heavyweight is
+  // ever stranded on the cached vtkPolyhedron (which lives in vtkGenericCell's
+  // cell store and can outlive leak checking).
   std::vector<vtkIdType> localIds;
+  std::vector<int> earTris;
+  std::vector<int> earPrev;
+  std::vector<int> earNext;
+  std::vector<int> earRing;
 
   vtkIdType npts = 0;
   const vtkIdType* fpts = nullptr;
@@ -835,25 +813,33 @@ int vtkPolyhedron::IsInside(const double x[3], double tolerance)
       {
         localIds[i] = toLocal(fpts[i]);
       }
-      poly->PointIds->SetNumberOfIds(npts);
-      poly->Points->SetNumberOfPoints(npts);
-      for (vtkIdType i = 0; i < npts; ++i)
+
+      // Shared allocation-free ear clip (vtkPolygon::EarClipPolygon3D), the same
+      // implementation the rendering triangulators use. Collect the triples and
+      // sum the solid angle of each below; the choice of diagonals does not
+      // affect the sum for a planar face, so the edge mask is ignored.
+      earTris.clear();
+      const LocalPointAccessor accessor{ pts };
+      vtkPolygon::EarClipPolygon3D(accessor, localIds.data(), static_cast<int>(npts), earPrev,
+        earNext, earRing,
+        [&earTris](int a, int b, int c, unsigned char)
+        {
+          earTris.push_back(a);
+          earTris.push_back(b);
+          earTris.push_back(c);
+        });
+
+      if (earTris.empty())
       {
-        poly->PointIds->SetId(i, i); // local ids 0..npts-1
-        poly->Points->SetPoint(i, pts + 3 * localIds[i]);
+        return 0; // degenerate face: conservative
       }
 
-      triPtIds->Reset();
-      if (!poly->TriangulateLocalIds(0, triPtIds))
+      const std::size_t ntri = earTris.size();
+      for (std::size_t i = 0; i + 2 < ntri; i += 3)
       {
-        return 0; // can't triangulate: conservative
-      }
-
-      for (vtkIdType i = 0; i < triPtIds->GetNumberOfIds(); i += 3)
-      {
-        const double* a = pts + 3 * localIds[triPtIds->GetId(i)];
-        const double* b = pts + 3 * localIds[triPtIds->GetId(i + 1)];
-        const double* c = pts + 3 * localIds[triPtIds->GetId(i + 2)];
+        const double* a = pts + 3 * localIds[earTris[i]];
+        const double* b = pts + 3 * localIds[earTris[i + 1]];
+        const double* c = pts + 3 * localIds[earTris[i + 2]];
 
         if (tol > 0.0 && vtkTriangle::DistanceToTriangle(x, a, b, c) <= tol2)
         {
@@ -1320,14 +1306,33 @@ int vtkPolyhedron::EvaluatePosition(const double x[3], double closestPoint[3],
   // compute parametric coordinates
   this->ComputeParametricCoordinate(x, pcoords);
 
-  // construct polydata, the result is stored in this->PolyData,
-  // the cell array is stored in this->Faces
-  this->ConstructPolyData();
+  // The interpolation weights are always needed by callers (e.g. velocity
+  // interpolation during streamline integration).
+  this->InterpolateFunctions(x, weights);
 
-  // Construct cell locator
+  // Inside/outside test first. When the point is inside (the common case while
+  // a streamline integrates through the cell it currently occupies) the closest
+  // boundary point and its distance are not used - minDist2 is zero and the
+  // point itself is the closest point - so the expensive cell-locator closest-
+  // point search (and building the locator) is skipped entirely.
+  const int isInside = this->IsInside(x, std::numeric_limits<double>::infinity());
+  if (isInside)
+  {
+    minDist2 = 0.0;
+    if (closestPoint)
+    {
+      closestPoint[0] = x[0];
+      closestPoint[1] = x[1];
+      closestPoint[2] = x[2];
+    }
+    return 1;
+  }
+
+  // Point is outside: find the closest point on the boundary and its squared
+  // distance. This builds the cell locator lazily on first need.
+  this->ConstructPolyData();
   this->ConstructLocator();
 
-  // find closest point and store the squared distance
   vtkIdType cellId;
   int id;
   double cp[3];
@@ -1341,17 +1346,7 @@ int vtkPolyhedron::EvaluatePosition(const double x[3], double closestPoint[3],
     closestPoint[2] = cp[2];
   }
 
-  // get the MVC weights
-  this->InterpolateFunctions(x, weights);
-
-  // set distance to be zero, if point is inside
-  int isInside = this->IsInside(x, std::numeric_limits<double>::infinity());
-  if (isInside)
-  {
-    minDist2 = 0.0;
-  }
-
-  return isInside;
+  return 0;
 }
 
 //------------------------------------------------------------------------------

@@ -56,7 +56,7 @@
 #include "vtkDataArray.h"
 
 #include "vtkCompiler.h"    // for VTK_USE_EXTERN_TEMPLATE
-#include "vtkDeprecation.h" // For VTK_DEPRECATED_IN_9_6_0
+#include "vtkDeprecation.h" // for VTK_DEPRECATED_IN_9_7_0
 #include "vtkGenericDataArrayLookupHelper.h"
 #include "vtkSmartPointer.h"
 #include "vtkTypeTraits.h"
@@ -78,15 +78,6 @@ public:
   using ArrayTypeTag = std::integral_constant<int, ArrayType>;
   using DataTypeTag = std::integral_constant<int, vtkTypeTraits<ValueTypeT>::VTK_TYPE_ID>;
   using ValueType = ValueTypeT;
-
-  /**
-   * Compile time access to the VTK type identifier.
-   */
-  enum
-  {
-    VTK_DATA_TYPE VTK_DEPRECATED_IN_9_6_0("Use DataTypeTag::value") =
-      vtkTypeTraits<ValueType>::VTK_TYPE_ID
-  };
 
   /// @defgroup vtkGDAConceptMethods vtkGenericDataArray Concept Methods
   /// These signatures must be reimplemented in subclasses as public,
@@ -439,7 +430,6 @@ VTK_ABI_NAMESPACE_END
   T GetDataTypeValueMax() const;                                                                   \
   T* GetValueRange(int comp) VTK_SIZEHINT(2);                                                      \
   T* GetValueRange() VTK_SIZEHINT(2);                                                              \
-  void GetValueRange(T range[2], int comp);                                                        \
   void GetValueRange(T range[2], int comp);
 #define vtkCreateGenericWrappedArrayWriteInterface(T)                                              \
   void InsertTypedTuple(vtkIdType i, const T* tuple) VTK_EXPECTS(0 <= i);                          \
@@ -462,7 +452,7 @@ VTK_ABI_NAMESPACE_END
 #define vtkCreateWrappedArrayWriteInterface(T)                                                     \
   vtkCreateGenericWrappedArrayWriteInterface(T);                                                   \
   void SetTypedTuple(vtkIdType i, const T* tuple) VTK_EXPECTS(0 <= i && i < GetNumberOfTuples());  \
-  void SetTypedComponent(vtkIdType i, int c, ValueType value);                                     \
+  void SetTypedComponent(vtkIdType i, int c, T value);                                             \
   void SetValue(vtkIdType id, T value) VTK_EXPECTS(0 <= id && id < GetNumberOfValues());           \
   bool SetNumberOfValues(vtkIdType number) override;
 

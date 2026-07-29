@@ -135,6 +135,7 @@ void vtkParse_InitFunction(FunctionInfo* func)
   func->SizeHint = NULL;
   func->DeprecatedReason = NULL;
   func->DeprecatedVersion = NULL;
+  func->Line = 0;
   func->IsStatic = 0;
   func->IsVirtual = 0;
   func->IsPureVirtual = 0;
@@ -149,6 +150,7 @@ void vtkParse_InitFunction(FunctionInfo* func)
   func->IsDeprecated = 0;
   func->IsMarshalExcluded = 0;
   func->IsUnblockThreads = 0;
+  func->IsMaySuspend = 0;
   func->IsPropExcluded = 0;
 
 #ifndef VTK_PARSE_LEGACY_REMOVE
@@ -229,6 +231,7 @@ void vtkParse_CopyFunction(FunctionInfo* func, const FunctionInfo* orig)
   func->SizeHint = orig->SizeHint;
   func->DeprecatedReason = orig->DeprecatedReason;
   func->DeprecatedVersion = orig->DeprecatedVersion;
+  func->Line = orig->Line;
   func->IsStatic = orig->IsStatic;
   func->IsVirtual = orig->IsVirtual;
   func->IsPureVirtual = orig->IsPureVirtual;
@@ -244,6 +247,7 @@ void vtkParse_CopyFunction(FunctionInfo* func, const FunctionInfo* orig)
   func->IsDeprecated = orig->IsDeprecated;
   func->IsMarshalExcluded = orig->IsMarshalExcluded;
   func->IsUnblockThreads = orig->IsUnblockThreads;
+  func->IsMaySuspend = orig->IsMaySuspend;
   func->IsPropExcluded = orig->IsPropExcluded;
 
 #ifndef VTK_PARSE_LEGACY_REMOVE

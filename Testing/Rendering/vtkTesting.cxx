@@ -665,8 +665,10 @@ int vtkTesting::RegressionTest(vtkAlgorithm* imageSource, double thresh, ostream
   ic2->SetClipData(1);
   ic2->SetInputConnection(rtExtract->GetOutputPort());
 
-  int* wExt1 = ic1->GetInputInformation()->Get(vtkStreamingDemandDrivenPipeline::WHOLE_EXTENT());
-  int* wExt2 = ic2->GetInputInformation()->Get(vtkStreamingDemandDrivenPipeline::WHOLE_EXTENT());
+  const int* wExt1 =
+    ic1->GetInputInformation()->Get(vtkStreamingDemandDrivenPipeline::WHOLE_EXTENT());
+  const int* wExt2 =
+    ic2->GetInputInformation()->Get(vtkStreamingDemandDrivenPipeline::WHOLE_EXTENT());
   ic1->SetOutputWholeExtent(wExt1[0] + this->BorderOffset, wExt1[1] - this->BorderOffset,
     wExt1[2] + this->BorderOffset, wExt1[3] - this->BorderOffset, wExt1[4], wExt1[5]);
 
@@ -1303,13 +1305,18 @@ int vtkTesting::CompareAverageOfL2Norm(vtkDataSet* dsA, vtkDataSet* dsB, double 
 int vtkTesting::InteractorEventLoop(
   int argc, char* argv[], vtkRenderWindowInteractor* iren, const char* playbackStream)
 {
-  bool disableReplay = false, record = false, playbackFile = false;
+  bool disableReplay = false;
+  bool record = false;
+  bool playbackFile = false;
+  bool showCursor = false;
+
   std::string playbackFileName;
   for (int i = 0; i < argc; i++)
   {
     disableReplay |= (strcmp("--DisableReplay", argv[i]) == 0);
     record |= (strcmp("--Record", argv[i]) == 0);
     playbackFile |= (strcmp("--PlaybackFile", argv[i]) == 0);
+    showCursor |= (strcmp("--ShowCursor", argv[i]) == 0);
     if (playbackFile && playbackFileName.empty())
     {
       if (i + 1 < argc)
@@ -1334,6 +1341,7 @@ int vtkTesting::InteractorEventLoop(
     }
     else
     {
+      recorder->SetShowCursor(showCursor);
       if (playbackStream)
       {
         recorder->ReadFromInputStringOn();

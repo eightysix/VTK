@@ -3,6 +3,7 @@ if(vtk_can_do_onscreen AND NOT VTK_DEFAULT_RENDER_WINDOW_OFFSCREEN)
   vtk_add_test_python(
     TestCameraOrientationWidget.py
     TestCameraOrientationWidgetNoReset.py,NO_VALID
+    TestCameraOrientationWidgetCenterOfRotation.py,NO_VALID
     TestImagePlaneWidget.py
     TestBoxWidget.py
     TestImplicitImageRepresentation.py
@@ -17,3 +18,7 @@ if(vtk_can_do_onscreen AND NOT VTK_DEFAULT_RENDER_WINDOW_OFFSCREEN)
     TestTextWidget.py
     )
 endif()
+
+vtk_add_test_python(
+  TestWidgetsPythonAPI.py,NO_DATA,NO_VALID,NO_OUTPUT
+  )

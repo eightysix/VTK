@@ -3,6 +3,7 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "")
 set(VTK_ENABLE_WEBGPU ON CACHE BOOL "")
 set(VTK_BUILD_EXAMPLES OFF CACHE BOOL "")
 set(VTK_ENABLE_CATALYST OFF CACHE BOOL "")
+set(VTK_JPEG_ENABLE_SIMD OFF CACHE BOOL "")
 # Modules which do not build successfully or do not have required software in the docker image.
 set(VTK_GROUP_ENABLE_Qt NO CACHE STRING "") # no qt
 # ├── Common
@@ -49,5 +50,19 @@ set(VTK_MODULE_ENABLE_VTK_RenderingZSpace NO CACHE STRING "") # no zspace
 set(VTK_MODULE_ENABLE_VTK_fides NO CACHE STRING "") # no adios2
 set(VTK_MODULE_ENABLE_VTK_xdmf3 NO CACHE STRING "") # no boost
 set(VTK_MODULE_ENABLE_VTK_vtkviskores NO CACHE STRING "") # no execinfo.h in viskores's loguru
+set(VTK_MODULE_ENABLE_VTK_conduit NO CACHE STRING "") # conduit
+
+# Run the in-tree unit tests in a browser when CI provides a wasm engine.
+# This must be set at configure time because the engine path is baked into the
+# generated test commands (see CMake/vtkModuleTesting.cmake). When unset, the
+# wasm tests are still built but registered as skipped.
+if (NOT "$ENV{VTK_TESTING_WASM_ENGINE}" STREQUAL "")
+  set(VTK_TESTING_WASM_ENGINE "$ENV{VTK_TESTING_WASM_ENGINE}" CACHE FILEPATH "")
+endif ()
+
+# Emit per-class JSON type manifests for serialization.
+# VTK_WRAP_SERIALIZATION is ON in configure_common.cmake, which is the
+# prerequisite for this cmake_dependent_option.
+set(VTK_BUILD_TYPES_JSON ON CACHE BOOL "")
 
 include("${CMAKE_CURRENT_LIST_DIR}/configure_common.cmake")

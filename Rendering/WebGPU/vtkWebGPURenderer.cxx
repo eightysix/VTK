@@ -25,7 +25,6 @@
 #include "vtkWebGPULight.h"
 #include "vtkWebGPUPolyDataMapper.h"
 #include "vtkWebGPURenderWindow.h"
-
 #include <cstring>
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -149,7 +148,9 @@ void vtkWebGPURenderer::CreateBuffers()
   const auto transformSizePadded = vtkWebGPUConfiguration::Align(transformSize, 32);
 
   // Match WriteLightsBuffer: count (4) + padding (12) + N * 80 bytes per light.
-  const auto lightSize = 16 + this->LightIDs.size() * vtkWebGPULight::GetCacheSizeBytes();
+  // Ensure we have space for at least 1 light to match shader expectations
+  const auto lightCount = std::max(std::size_t(1), this->LightIDs.size());
+  const auto lightSize = 16 + lightCount * vtkWebGPULight::GetCacheSizeBytes();
   const auto lightSizePadded = vtkWebGPUConfiguration::Align(lightSize, 32);
 
   auto* wgpuRenderWindow = vtkWebGPURenderWindow::SafeDownCast(this->GetRenderWindow());
@@ -164,12 +165,27 @@ void vtkWebGPURenderer::CreateBuffers()
     createSceneBindGroup = true;
   }
 
+  bool recreateLightsBuffer = false;
   if (this->SceneLightsBuffer == nullptr)
+  {
+    recreateLightsBuffer = true;
+    createSceneBindGroup = true;
+  }
+  else if (this->AllocatedLightsBufferSize < lightSizePadded)
+  {
+    // Buffer exists but is too small for the number of lights, need to recreate it
+    vtkDebugMacro(<< "Recreating lights buffer: " << this->AllocatedLightsBufferSize << " < "
+                  << lightSizePadded);
+    recreateLightsBuffer = true;
+    createSceneBindGroup = true;
+  }
+
+  if (recreateLightsBuffer)
   {
     const std::string label = "LightInformation-" + this->GetObjectDescription();
     this->SceneLightsBuffer = wgpuConfiguration->CreateBuffer(lightSizePadded,
       wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, false, label.c_str());
-    createSceneBindGroup = true;
+    this->AllocatedLightsBufferSize = lightSizePadded;
   }
 
   if (createSceneBindGroup)
@@ -341,13 +357,13 @@ void vtkWebGPURenderer::UpdateBuffers()
     // This handles actor visibility toggles, additions, and removals.
     // PropsRendered holds the previous frame's rendered props at this point
     // because it is cleared later in UpdateGeometry().
-    if (this->PropArrayCount != static_cast<int>(this->PropsRendered.size()))
+    if (this->PropArray.size() != this->PropsRendered.size())
     {
       this->InvalidateBundle();
     }
     else
     {
-      for (int i = 0; i < this->PropArrayCount; ++i)
+      for (size_t i = 0; i < this->PropArray.size(); ++i)
       {
         if (this->PropsRendered.find(this->PropArray[i]) == this->PropsRendered.end())
         {
@@ -355,6 +371,12 @@ void vtkWebGPURenderer::UpdateBuffers()
           break;
         }
       }
+    }
+    // Invalidate the bundle if the number of lights has changed
+    if (this->LightIDs.size() != this->PreviousLightCount)
+    {
+      this->InvalidateBundle();
+      this->PreviousLightCount = this->LightIDs.size();
     }
   }
   this->UpdateGeometry(); // mappers prepare geometry SSBO and pipeline layout.
@@ -367,15 +389,20 @@ void vtkWebGPURenderer::UpdateBuffers()
 //------------------------------------------------------------------------------
 int vtkWebGPURenderer::UpdateGeometry(vtkFrameBufferObjectBase* /*fbo=nullptr*/)
 {
-  int i;
-
   if (this->DrawBackgroundInClearPass)
   {
     this->PropsRendered.clear();
     this->NumberOfPropsRendered = 0;
   }
 
-  if (this->PropArrayCount == 0)
+  // Render background prop (skybox) before all other geometry.
+  // vtkRenderer stores skybox actors as BackgroundProp rather than in PropArray.
+  if (this->BackgroundProp)
+  {
+    this->BackgroundProp->RenderOpaqueGeometry(this);
+  }
+
+  if (this->PropArray.size() == 0)
   {
     return 0;
   }
@@ -392,7 +419,7 @@ int vtkWebGPURenderer::UpdateGeometry(vtkFrameBufferObjectBase* /*fbo=nullptr*/)
   // do the render library specific stuff about translucent polygonal geometry.
   // As it can be expensive, do a quick check if we can skip this step
   int hasTranslucentPolygonalGeometry = this->UseDepthPeelingForVolumes;
-  for (i = 0; !hasTranslucentPolygonalGeometry && i < this->PropArrayCount; i++)
+  for (std::size_t i = 0; !hasTranslucentPolygonalGeometry && i < this->PropArray.size(); i++)
   {
     hasTranslucentPolygonalGeometry = this->PropArray[i]->HasTranslucentPolygonalGeometry();
   }
@@ -405,7 +432,7 @@ int vtkWebGPURenderer::UpdateGeometry(vtkFrameBufferObjectBase* /*fbo=nullptr*/)
   // render themselves as volumetric geometry.
   if (hasTranslucentPolygonalGeometry == 0 || !this->UseDepthPeelingForVolumes)
   {
-    for (i = 0; i < this->PropArrayCount; i++)
+    for (std::size_t i = 0; i < this->PropArray.size(); i++)
     {
       this->NumberOfPropsRendered += this->PropArray[i]->RenderVolumetricGeometry(this);
     }
@@ -413,7 +440,7 @@ int vtkWebGPURenderer::UpdateGeometry(vtkFrameBufferObjectBase* /*fbo=nullptr*/)
 
   // loop through props and give them a chance to
   // render themselves as an overlay (or underlay)
-  for (i = 0; i < this->PropArrayCount; i++)
+  for (std::size_t i = 0; i < this->PropArray.size(); i++)
   {
     this->NumberOfPropsRendered += this->PropArray[i]->RenderOverlay(this);
   }
@@ -434,7 +461,7 @@ int vtkWebGPURenderer::UpdateOpaquePolygonalGeometry()
   {
     case RenderStageEnum::SyncDeviceResources:
     {
-      for (int i = 0; i < this->PropArrayCount; i++)
+      for (std::size_t i = 0; i < this->PropArray.size(); i++)
       {
         if (auto* wgpuActor = vtkWebGPUActor::SafeDownCast(this->PropArray[i]))
         {
@@ -442,12 +469,12 @@ int vtkWebGPURenderer::UpdateOpaquePolygonalGeometry()
         }
         this->PropArray[i]->RenderOpaqueGeometry(this);
       }
-      result += this->PropArrayCount;
+      result += this->PropArray.size();
     }
     break;
     case RenderStageEnum::RecordingCommands:
     {
-      for (int i = 0; i < this->PropArrayCount; i++)
+      for (std::size_t i = 0; i < this->PropArray.size(); i++)
       {
         const int rendered = this->PropArray[i]->RenderOpaqueGeometry(this);
         if (rendered > 0)
@@ -474,20 +501,20 @@ int vtkWebGPURenderer::UpdateTranslucentPolygonalGeometry()
   {
     case RenderStageEnum::SyncDeviceResources:
     {
-      for (int i = 0; i < this->PropArrayCount; i++)
+      for (std::size_t i = 0; i < this->PropArray.size(); i++)
       {
         if (auto* wgpuActor = vtkWebGPUActor::SafeDownCast(this->PropArray[i]))
         {
-          wgpuActor->SetId(i);
+          wgpuActor->SetId(static_cast<vtkTypeUInt32>(i));
         }
         this->PropArray[i]->RenderTranslucentPolygonalGeometry(this);
       }
-      result += this->PropArrayCount;
+      result += this->PropArray.size();
     }
     break;
     case RenderStageEnum::RecordingCommands:
     {
-      for (int i = 0; i < this->PropArrayCount; i++)
+      for (std::size_t i = 0; i < this->PropArray.size(); i++)
       {
         const int rendered = this->PropArray[i]->RenderTranslucentPolygonalGeometry(this);
         if (rendered > 0)
@@ -810,17 +837,18 @@ wgpu::CommandBuffer vtkWebGPURenderer::EncodePropListRenderCommand(
   // Because all the command encoding / rendering function use the props of the this->PropArray
   // list, we're going to replace the list so that only the props we're interested in are rendered.
   // We need to backup the original list though to restore it afterwards
-  vtkProp** propArrayBackup = this->PropArray;
-  int propCountBackup = this->PropArrayCount;
+  std::vector<vtkProp*> propArrayBackup = this->PropArray;
 
-  this->PropArray = propList;
-  this->PropArrayCount = listLength;
+  this->PropArray.resize(listLength);
+  for (int i = 0; i < listLength; i++)
+  {
+    this->PropArray[i] = propList[i];
+  }
 
   this->RecordRenderCommands();
 
   // Restoring
   this->PropArray = propArrayBackup;
-  this->PropArrayCount = propCountBackup;
 
   vtkWebGPURenderWindow* renderWindow =
     vtkWebGPURenderWindow::SafeDownCast(this->GetRenderWindow());
@@ -907,15 +935,35 @@ void vtkWebGPURenderer::SetupSceneBindGroup()
   auto wgpuRenderWindow = vtkWebGPURenderWindow::SafeDownCast(this->GetRenderWindow());
   wgpu::Device device = wgpuRenderWindow->GetDevice();
 
-  this->SceneBindGroup =
-    vtkWebGPUBindGroupInternals::MakeBindGroup(device, this->SceneBindGroupLayout,
-      {
-        // clang-format off
-        { 0, this->SceneTransformBuffer },
-        { 1, this->SceneLightsBuffer }
-        // clang-format on
-      });
-  this->SceneBindGroup.SetLabel("SceneBindGroup");
+  // Calculate current buffer sizes to bind
+  const auto transformSize = vtkWebGPUCamera::GetCacheSizeBytes();
+  const auto transformSizePadded = vtkWebGPUConfiguration::Align(transformSize, 32);
+  const auto lightCount = std::max(std::size_t(1), this->LightIDs.size());
+  const auto lightSize = 16 + lightCount * vtkWebGPULight::GetCacheSizeBytes();
+  const auto lightSizePadded = vtkWebGPUConfiguration::Align(lightSize, 32);
+
+  std::vector<wgpu::BindGroupEntry> entries;
+  wgpu::BindGroupEntry entry0{};
+  entry0.binding = 0;
+  entry0.buffer = this->SceneTransformBuffer;
+  entry0.offset = 0;
+  entry0.size = transformSizePadded;
+  entries.push_back(entry0);
+
+  wgpu::BindGroupEntry entry1{};
+  entry1.binding = 1;
+  entry1.buffer = this->SceneLightsBuffer;
+  entry1.offset = 0;
+  entry1.size = lightSizePadded;
+  entries.push_back(entry1);
+
+  wgpu::BindGroupDescriptor descriptor;
+  descriptor.label = "SceneBindGroup";
+  descriptor.layout = this->SceneBindGroupLayout;
+  descriptor.entryCount = static_cast<uint32_t>(entries.size());
+  descriptor.entries = entries.data();
+
+  this->SceneBindGroup = device.CreateBindGroup(&descriptor);
 }
 
 //------------------------------------------------------------------------------

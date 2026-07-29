@@ -733,7 +733,8 @@ void vtkXlibHardwareWindow::SetWindowName(const char* cname)
 
   if (this->WindowId)
   {
-    if (vtkXStringListToTextProperty(&name, 1, &win_name_text_prop) == 0)
+    if (vtkXutf8TextListToTextProperty(
+          this->DisplayId, &name, 1, XUTF8StringStyle, &win_name_text_prop) != Success)
     {
       vtkXFree(win_name_text_prop.value);
       vtkWarningMacro(<< "Can't rename window");
@@ -849,6 +850,18 @@ bool vtkXlibHardwareWindow::EnsureDisplay()
   }
 
   return this->DisplayId != nullptr;
+}
+
+//-------------------------------------------------------------------------------------------------
+vtkTypeBool vtkXlibHardwareWindow::GetOwnDisplay()
+{
+  return this->OwnDisplay;
+}
+
+//-------------------------------------------------------------------------------------------------
+void vtkXlibHardwareWindow::SetOwnDisplay(vtkTypeBool ownDisplay)
+{
+  this->OwnDisplay = ownDisplay;
 }
 
 //------------------------------------------------------------------------------------------------

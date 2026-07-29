@@ -161,11 +161,15 @@ public:
 
   /**
    * Find and get the `blob` registered at `hash`.
-   * If `copy` is `true`, a copy of the blob is returned.
-   * If `copy` is `false`, the blob pointer is set in the array using `vtkTypeUInt8Array::SetArray`
-   * with the save flag set to `1`.
+   * If `copy` is `true` (the default), a copy of the blob is returned and the
+   * caller owns it independently of this context.
+   * If `copy` is `false`, the returned array aliases the context-owned buffer via
+   * `vtkTypeUInt8Array::SetArray` with the save flag set to `1`; it does not take
+   * ownership. The caller must stop using the returned array once the blob is
+   * unregistered, this context is destroyed, or `Blobs` is otherwise mutated, any
+   * of which leaves the array dangling.
    */
-  vtkSmartPointer<vtkTypeUInt8Array> GetBlob(const std::string& hash, bool copy = false);
+  vtkSmartPointer<vtkTypeUInt8Array> GetBlob(const std::string& hash, bool copy = true);
 
   /**
    * Return all direct dependencies of the object/state registered at `identifier`.
@@ -193,6 +197,22 @@ public:
    * Make a new `identifier`.
    */
   vtkTypeUInt32 MakeId();
+
+  ///@{
+  /**
+   * When enabled, `MakeId` hands out identifiers counting down from the maximum
+   * value of `vtkTypeUInt32` instead of counting up from 0.
+   *
+   * A mirror context (e.g. a WebAssembly remote session that deserializes states
+   * produced by a server-side context) must not allocate identifiers from the same
+   * range as its remote counterpart. Otherwise, locally registered objects
+   * would occupy identifiers the remote context hands out later for new objects,
+   * and incoming states would then be applied to unrelated local objects.
+   * Default is off.
+   */
+  void SetAllocateIdsDescending(bool allocateIdsDescending);
+  bool GetAllocateIdsDescending() const;
+  ///@}
 
   /**
    * Convenient to push a parent as the 'active' identifier and

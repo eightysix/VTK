@@ -122,8 +122,8 @@ static void vtkRectilinearSynchronizedTemplatesInitializeOutput(TArray* inScalar
 //------------------------------------------------------------------------------
 // Calculate the gradient using central difference.
 template <class TScalarIter>
-void vtkRSTComputePointGradient(int i, int j, int k, TScalarIter& s, int* inExt, int xInc, int yInc,
-  int zInc, double* spacing, double n[3])
+void vtkRSTComputePointGradient(int i, int j, int k, TScalarIter& s, VTK_FUTURE_CONST int* inExt,
+  int xInc, int yInc, int zInc, double* spacing, double n[3])
 {
   double sp, sm;
 
@@ -236,7 +236,7 @@ struct ContourRectilinearGridFunctor
     int* exExt, vtkRectilinearGrid* data, vtkPolyData* output, bool outputTriangles)
   {
     auto ptr = vtk::DataArrayValueRange(inScalars).begin() + index;
-    int* inExt = data->GetExtent();
+    VTK_FUTURE_CONST int* inExt = data->GetExtent();
     int xdim = exExt[1] - exExt[0] + 1;
     int ydim = exExt[3] - exExt[2] + 1;
     double* values = self->GetValues();
@@ -444,7 +444,7 @@ struct ContourRectilinearGridFunctor
                   {
                     *isect2Ptr = *(isect2Ptr - yisectstep + 4);
                   }
-                  else if (k > zMin && i<xMax&&*(isect1Ptr + 5)> - 1)
+                  else if (k > zMin && i < xMax && *(isect1Ptr + 5) > -1)
                   {
                     *isect2Ptr = *(isect1Ptr + 5);
                   }
@@ -700,7 +700,7 @@ int vtkRectilinearSynchronizedTemplates::RequestData(vtkInformation* vtkNotUsed(
     return 1;
   }
 
-  int* inExt = data->GetExtent();
+  VTK_FUTURE_CONST int* inExt = data->GetExtent();
   vtkIdType index = data->GetValueIndexForExtent(inScalars, inExt);
 
   int exExt[6];
@@ -737,16 +737,6 @@ int vtkRectilinearSynchronizedTemplates::RequestUpdateExtent(vtkInformation* vtk
   }
 
   return 1;
-}
-
-//------------------------------------------------------------------------------
-// VTK_DEPRECATED_IN_9_6_0
-void* vtkRectilinearSynchronizedTemplates::GetScalarsForExtent(
-  vtkDataArray* array, int extent[6], vtkRectilinearGrid* data)
-{
-  const vtkIdType valueIndex = data->GetValueIndexForExtent(array, extent);
-  // NOLINTNEXTLINE(bugprone-unsafe-functions)
-  return valueIndex >= 0 ? array->GetVoidPointer(valueIndex) : nullptr;
 }
 
 //------------------------------------------------------------------------------

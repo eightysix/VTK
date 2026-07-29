@@ -233,7 +233,8 @@ void ConvertToDoubleDistance(
 // Templated append for VTK_VOXEL_MODE process mode and any type of output data
 template <class OT>
 void vtkImplicitModellerAppendExecute(vtkImplicitModeller* self, vtkDataSet* input,
-  vtkImageData* outData, int outExt[6], double maxDistance, vtkCellLocator* locator, int id, OT*)
+  vtkImageData* outData, VTK_FUTURE_CONST int outExt[6], double maxDistance,
+  vtkCellLocator* locator, int id, OT*)
 {
   int i, j, k;
   int subId;
@@ -271,7 +272,6 @@ void vtkImplicitModellerAppendExecute(vtkImplicitModeller* self, vtkDataSet* inp
     }
   }
 
-  int testIndex = 0;
   for (k = outExt[4]; k <= outExt[5]; k++)
   {
     x[2] = spacing[2] * k + origin[2];
@@ -280,7 +280,7 @@ void vtkImplicitModellerAppendExecute(vtkImplicitModeller* self, vtkDataSet* inp
       cellId = -1;
       x[1] = spacing[1] * j + origin[1];
       OT* outSI = outIt.BeginSpan();
-      for (i = outExt[0]; i <= outExt[1]; i++, testIndex++)
+      for (i = outExt[0]; i <= outExt[1]; i++)
       {
         x[0] = spacing[0] * i + origin[0];
         ConvertToDoubleDistance(*outSI, prevDistance, prevDistance2, toDoubleScaleFactor);

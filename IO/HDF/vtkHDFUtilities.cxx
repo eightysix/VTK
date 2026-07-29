@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) Ken Martin, Will Schroeder, Bill Lorensen
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Hide VTK_DEPRECATED_IN_9_6_0() warnings for this class.
+// VTK_DEPRECATED_IN_9_7_0()
 #define VTK_DEPRECATION_LEVEL 0
 
 #include "vtkHDFUtilities.h"
@@ -30,14 +30,33 @@
 #include <algorithm>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <sstream>
 
 VTK_ABI_NAMESPACE_BEGIN
 
+const std::string& vtkHDFUtilities::VTKHDF_ROOT_PATH()
+{
+  static std::string root_path = "/VTKHDF";
+  return root_path;
+}
+
+const std::vector<std::string>& vtkHDFUtilities::POLY_DATA_TOPOS()
+{
+  static std::vector<std::string> topos{ "Vertices", "Lines", "Polygons", "Strips" };
+  return topos;
+}
+
 namespace
 {
-const std::map<int, std::string> ARRAY_OFFSET_GROUPS = { { 0, "PointDataOffsets" },
-  { 1, "CellDataOffsets" }, { 2, "FieldDataOffsets" } };
+const std::map<int, std::string>& ARRAY_OFFSET_GROUPS()
+{
+  static const std::map<int, std::string> array_offset_groups = {
+    { vtkDataObject::POINT, "PointDataOffsets" }, { vtkDataObject::CELL, "CellDataOffsets" },
+    { vtkDataObject::FIELD, "FieldDataOffsets" }, { vtkDataObject::ROW, "RowDataOffsets" }
+  };
+  return array_offset_groups;
+}
 
 // Scoped RAII to quiet/unquiet hdf5
 class ScopedH5EQuiet
@@ -318,6 +337,12 @@ herr_t AddName(hid_t group, const char* name, const H5L_info_t*, void* op_data)
 }
 
 //------------------------------------------------------------------------------
+std::vector<int> vtkHDFUtilities::GetAttributeTypes()
+{
+  return { vtkDataObject::POINT, vtkDataObject::CELL, vtkDataObject::FIELD, vtkDataObject::ROW };
+}
+
+//------------------------------------------------------------------------------
 /**
  * Return the dataset type mapped to the "Type" attribute
  * of the groupID group.
@@ -327,7 +352,6 @@ bool vtkHDFUtilities::ReadDataSetType(hid_t groupID, int& dataSetType)
 {
   if (H5Aexists(groupID, "Type") <= 0)
   {
-    vtkDebugWithObjectMacro(nullptr, "Can't find the `Type` attribute.");
     return false;
   }
 
@@ -341,6 +365,18 @@ bool vtkHDFUtilities::ReadDataSetType(hid_t groupID, int& dataSetType)
   else if (typeName == "ImageData")
   {
     dataSetType = VTK_IMAGE_DATA;
+  }
+  else if (typeName == "RectilinearGrid")
+  {
+    dataSetType = VTK_RECTILINEAR_GRID;
+  }
+  else if (typeName == "StructuredGrid")
+  {
+    dataSetType = VTK_STRUCTURED_GRID;
+  }
+  else if (typeName == "Table")
+  {
+    dataSetType = VTK_TABLE;
   }
   else if (typeName == "UnstructuredGrid")
   {
@@ -779,6 +815,24 @@ bool vtkHDFUtilities::RetrieveHDFInformation(hid_t& rootID, const std::string& r
   const std::string& groupPrefix, hid_t& groupID, std::array<int, 2>& version, int& dataSetType,
   int& numberOfPieces, std::array<hid_t, 3>& attributeDataGroup)
 {
+  std::map<int, hid_t> attrs{
+    { vtkDataObject::POINT, attributeDataGroup[0] },
+    { vtkDataObject::CELL, attributeDataGroup[1] },
+    { vtkDataObject::FIELD, attributeDataGroup[2] },
+  };
+  bool res = vtkHDFUtilities::RetrieveHDFInformation(
+    rootID, rootName, groupPrefix, groupID, version, dataSetType, numberOfPieces, attrs);
+  attributeDataGroup[0] = attrs[vtkDataObject::POINT];
+  attributeDataGroup[1] = attrs[vtkDataObject::CELL];
+  attributeDataGroup[2] = attrs[vtkDataObject::FIELD];
+  return res;
+}
+
+//------------------------------------------------------------------------------
+bool vtkHDFUtilities::RetrieveHDFInformation(hid_t& rootID, const std::string& rootName,
+  const std::string& groupPrefix, hid_t& groupID, std::array<int, 2>& version, int& dataSetType,
+  int& numberOfPieces, std::map<int, hid_t>& attributeDataGroup)
+{
   bool error = false;
   {
     ::ScopedH5EQuiet quiet;
@@ -796,24 +850,38 @@ bool vtkHDFUtilities::RetrieveHDFInformation(hid_t& rootID, const std::string& r
 
   {
     ::ScopedH5EQuiet quiet;
-    std::fill(attributeDataGroup.begin(), attributeDataGroup.end(), -1);
+    for (auto& it : attributeDataGroup)
+    {
+      it.second = H5I_INVALID_HID;
+    }
     std::fill(version.begin(), version.end(), 0);
 
-    std::array<std::string, 3> groupNames = { groupPrefix + "/PointData", groupPrefix + "/CellData",
-      groupPrefix + "/FieldData" };
+    std::map<int, std::string> groupNames = { { vtkDataObject::POINT, groupPrefix + "/PointData" },
+      { vtkDataObject::CELL, groupPrefix + "/CellData" },
+      { vtkDataObject::FIELD, groupPrefix + "/FieldData" } };
 
     // XXX: This should be removed once VTK_OVERLAPPING_AMR spec is reworked
     // https://gitlab.kitware.com/vtk/vtk/-/issues/19926
     if (groupPrefix.empty() && dataSetType == VTK_OVERLAPPING_AMR)
     {
-      groupNames = { "/Level0/PointData", "/Level0/CellData", "/Level0/FieldData" };
+      groupNames[vtkDataObject::POINT] = "/Level0/PointData";
+      groupNames[vtkDataObject::CELL] = "/Level0/CellData";
+      groupNames[vtkDataObject::FIELD] = "/Level0/FieldData";
+    }
+    if (groupPrefix.empty() && dataSetType == VTK_TABLE)
+    {
+      groupNames.clear();
+      groupNames[vtkDataObject::ROW] = groupPrefix + "/RowData";
     }
 
     // try to open cell or point group. Its OK if they don't exist.
-    for (size_t i = 0; i < attributeDataGroup.size(); ++i)
+    for (const auto& it : groupNames)
     {
-      std::string path = rootName + groupNames[i];
-      attributeDataGroup[i] = H5Gopen(rootID, path.c_str(), H5P_DEFAULT);
+      std::string path = rootName + it.second;
+      if (H5Lexists(rootID, path.c_str(), H5P_DEFAULT) > 0)
+      {
+        attributeDataGroup[it.first] = H5Gopen(rootID, path.c_str(), H5P_DEFAULT);
+      }
     }
   }
 
@@ -866,11 +934,24 @@ bool vtkHDFUtilities::RetrieveHDFInformation(hid_t& rootID, const std::string& r
 }
 
 //-----------------------------------------------------------------------------
-std::vector<std::string> vtkHDFUtilities::GetArrayNames(
+std::vector<std::string> GetArrayNames(
   const std::array<hid_t, 3>& attributeDataGroup, int attributeType)
 {
+  return vtkHDFUtilities::GetArrayNames(
+    {
+      { vtkDataObject::POINT, attributeDataGroup[0] },
+      { vtkDataObject::CELL, attributeDataGroup[1] },
+      { vtkDataObject::FIELD, attributeDataGroup[2] },
+    },
+    attributeType);
+}
+
+//-----------------------------------------------------------------------------
+std::vector<std::string> vtkHDFUtilities::GetArrayNames(
+  const std::map<int, hid_t>& attributeDataGroup, int attributeType)
+{
   std::vector<std::string> array;
-  hid_t group = attributeDataGroup[attributeType];
+  hid_t group = attributeDataGroup.at(attributeType);
   if (group > 0)
   {
     // H5_INDEX_CRT_ORDER failed with: no creation order index to query
@@ -1093,7 +1174,7 @@ vtkIdType vtkHDFUtilities::GetArrayOffset(
     return -1;
   }
   std::string path = "Steps/";
-  path += ::ARRAY_OFFSET_GROUPS.at(attributeType);
+  path += ::ARRAY_OFFSET_GROUPS().at(attributeType);
   if (H5Lexists(group, path.c_str(), H5P_DEFAULT) <= 0)
   {
     return -1;
@@ -1112,13 +1193,26 @@ vtkIdType vtkHDFUtilities::GetArrayOffset(
 }
 
 //------------------------------------------------------------------------------
-vtkAbstractArray* vtkHDFUtilities::NewFieldArray(const std::array<hid_t, 3>& attributeDataGroup,
+vtkAbstractArray* NewFieldArray(const std::array<hid_t, 3>& attributeDataGroup, const char* name,
+  vtkIdType offset, vtkIdType size, vtkIdType dimMaxSize)
+{
+  return vtkHDFUtilities::NewFieldArray(
+    {
+      { vtkDataObject::POINT, attributeDataGroup[0] },
+      { vtkDataObject::CELL, attributeDataGroup[1] },
+      { vtkDataObject::FIELD, attributeDataGroup[2] },
+    },
+    name, offset, size, dimMaxSize);
+}
+
+//------------------------------------------------------------------------------
+vtkAbstractArray* vtkHDFUtilities::NewFieldArray(const std::map<int, hid_t>& attributeDataGroup,
   const char* name, vtkIdType offset, vtkIdType size, vtkIdType dimMaxSize)
 {
   hid_t tempNativeType = H5I_INVALID_HID;
   std::vector<hsize_t> dims;
   vtkHDF::ScopedH5DHandle dataset = vtkHDFUtilities::OpenDataSet(
-    attributeDataGroup[vtkDataObject::FIELD], name, &tempNativeType, dims);
+    attributeDataGroup.at(vtkDataObject::FIELD), name, &tempNativeType, dims);
   vtkHDF::ScopedH5THandle nativeType = tempNativeType;
   if (dataset < 0)
   {

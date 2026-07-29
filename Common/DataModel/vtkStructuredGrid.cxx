@@ -261,21 +261,6 @@ vtkConstantArray<unsigned char>* vtkStructuredGrid::GetCellTypes()
 }
 
 //------------------------------------------------------------------------------
-vtkConstantArray<int>* vtkStructuredGrid::GetCellTypesArray()
-{
-  if (!this->LegacyStructuredCellTypes)
-  {
-    this->LegacyStructuredCellTypes = vtkSmartPointer<vtkConstantArray<int>>::New();
-    this->LegacyStructuredCellTypes->ConstructBackend(
-      static_cast<int>(this->StructuredCellTypes->GetBackend()->Value));
-    this->LegacyStructuredCellTypes->SetNumberOfComponents(1);
-    this->LegacyStructuredCellTypes->SetNumberOfTuples(
-      this->StructuredCellTypes->GetNumberOfTuples());
-  }
-  return this->LegacyStructuredCellTypes;
-}
-
-//------------------------------------------------------------------------------
 // Turn off a particular data point.
 void vtkStructuredGrid::BlankPoint(vtkIdType ptId)
 {
@@ -510,7 +495,7 @@ void vtkStructuredGrid::ComputeScalarRange()
 }
 
 //------------------------------------------------------------------------------
-void vtkStructuredGrid::Crop(const int* updateExtent)
+void vtkStructuredGrid::Crop(const int updateExtent[6])
 {
   // Do nothing for empty datasets:
   for (int dim = 0; dim < 3; ++dim)

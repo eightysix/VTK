@@ -129,10 +129,9 @@ void vtkExtractStructuredGridHelper::Initialize(
   if (voi[1] < voi[0] || voi[3] < voi[2] || voi[5] < voi[4])
   {
     this->Invalidate();
-    vtkWarningMacro("Invalid volume of interest: ["
-      << " [ " << voi[0] << ", " << voi[1] << " ], "
-      << " [ " << voi[2] << ", " << voi[3] << " ], "
-      << " [ " << voi[4] << ", " << voi[5] << " ] ]");
+    vtkWarningMacro("Invalid volume of interest: [" << " [ " << voi[0] << ", " << voi[1] << " ], "
+                                                    << " [ " << voi[2] << ", " << voi[3] << " ], "
+                                                    << " [ " << voi[4] << ", " << voi[5] << " ] ]");
     return;
   }
 
@@ -309,8 +308,9 @@ void vtkExtractStructuredGridHelper::ComputeBeginAndEnd(
 }
 
 //------------------------------------------------------------------------------
-void vtkExtractStructuredGridHelper::CopyPointsAndPointData(int inExt[6], int outExt[6],
-  vtkPointData* pd, vtkPoints* inpnts, vtkPointData* outPD, vtkPoints* outpnts)
+void vtkExtractStructuredGridHelper::CopyPointsAndPointData(VTK_FUTURE_CONST int inExt[6],
+  VTK_FUTURE_CONST int outExt[6], vtkPointData* pd, vtkPoints* inpnts, vtkPointData* outPD,
+  vtkPoints* outpnts)
 {
   assert("pre: nullptr input point-data!" && (pd != nullptr));
   assert("pre: nullptr output point-data!" && (outPD != nullptr));
@@ -414,8 +414,8 @@ void vtkExtractStructuredGridHelper::CopyPointsAndPointData(int inExt[6], int ou
 }
 
 //------------------------------------------------------------------------------
-void vtkExtractStructuredGridHelper::CopyCellData(
-  int inExt[6], int outExt[6], vtkCellData* cd, vtkCellData* outCD)
+void vtkExtractStructuredGridHelper::CopyCellData(VTK_FUTURE_CONST int inExt[6],
+  VTK_FUTURE_CONST int outExt[6], vtkCellData* cd, vtkCellData* outCD)
 {
   assert("pre: nullptr input cell-data!" && (cd != nullptr));
   assert("pre: nullptr output cell-data!" && (outCD != nullptr));
@@ -526,8 +526,8 @@ void vtkExtractStructuredGridHelper::CopyCellData(
         dstIds->Reset();
 
       } // END else canCopyRange
-    }   // END for all j
-  }     // END for all k
+    } // END for all j
+  } // END for all k
 }
 
 //------------------------------------------------------------------------------

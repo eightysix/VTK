@@ -81,7 +81,7 @@ int vtkStructuredData::GetDataDescription(int dims[3])
 //------------------------------------------------------------------------------
 // Given the extent, returns the data description given the dimensions
 // (eg. VTK_STRUCTURED_SINGLE_POINT,VTK_STRUCTURED_X_LINE, VTK_STRUCTURED_XY_PLANE etc.)
-int vtkStructuredData::GetDataDescriptionFromExtent(int ext[6])
+int vtkStructuredData::GetDataDescriptionFromExtent(VTK_FUTURE_CONST int ext[6])
 {
   int dims[3];
   vtkStructuredExtent::GetDimensions(ext, dims);
@@ -360,18 +360,6 @@ vtkSmartPointer<vtkConstantArray<unsigned char>> vtkStructuredData::GetCellTypes
   cellTypesArray->SetNumberOfComponents(1);
   cellTypesArray->SetNumberOfTuples(vtkStructuredData::GetNumberOfCells(extent));
   return cellTypesArray;
-}
-
-//------------------------------------------------------------------------------
-vtkSmartPointer<vtkConstantArray<int>> vtkStructuredData::GetCellTypesArray(
-  int extent[6], bool usePixelVoxelOrientation)
-{
-  auto resultUC = vtkStructuredData::GetCellTypes(extent, usePixelVoxelOrientation);
-  auto resultInt = vtkSmartPointer<vtkConstantArray<int>>::New();
-  resultInt->ConstructBackend(static_cast<int>(resultUC->GetBackend()->Value));
-  resultInt->SetNumberOfComponents(1);
-  resultInt->SetNumberOfTuples(resultUC->GetNumberOfTuples());
-  return resultInt;
 }
 
 //------------------------------------------------------------------------------

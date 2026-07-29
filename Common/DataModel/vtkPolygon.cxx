@@ -1339,7 +1339,7 @@ int vtkPolyVertexList::CanRemoveVertex(vtkLocalPolyVertex* currentVtx)
         currentSign = sign;
       }
     } // if crossing occurs
-  }   // for the rest of the loop
+  } // for the rest of the loop
 
   if (!oneNegative)
   {
@@ -1628,8 +1628,17 @@ int vtkPolygon::EarCutTriangulation(vtkIdList* outTris, int measure)
   // vertex. Place the structure into a priority queue (those
   // vertices with smallest measure are to be removed first).
   //
-  vtkNew<vtkPriorityQueue> VertexQueue;
-  VertexQueue->Allocate(poly.NumberOfVerts);
+  // Reuse the per-instance priority queue (lazily created, owned as a member so
+  // it is freed with this vtkPolygon and never outlives teardown). Reset() clears
+  // it while keeping its backing storage, so triangulating many polygons through
+  // one (reused) vtkPolygon does not allocate per polygon. The pop order is
+  // identical to a freshly allocated queue, so the output is unchanged.
+  if (!this->EarClipQueue)
+  {
+    this->EarClipQueue = vtkSmartPointer<vtkPriorityQueue>::New();
+  }
+  vtkPriorityQueue* VertexQueue = this->EarClipQueue;
+  VertexQueue->Reset();
   vtkLocalPolyVertex* vtx = poly.Head;
   for (int i = 0; i < poly.NumberOfVerts; i++, vtx = vtx->next)
   {
@@ -2210,6 +2219,37 @@ double vtkPolygon::ComputeArea(vtkPoints* p, vtkIdType numPts, const vtkIdType* 
 }
 
 //------------------------------------------------------------------------------
+double vtkPolygon::ComputeArea(int numPts, double* pts, double normal[3])
+{
+  normal[0] = normal[1] = normal[2] = 0.0;
+  if (numPts < 3)
+  {
+    return 0.0;
+  }
+
+  // Newell's method: accumulate edge contributions over all consecutive pairs.
+  // For planar polygons the result equals 2 * area * unit_normal, regardless
+  // of whether the polygon is convex or the point ordering is non-standard.
+  for (int i = 0; i < numPts; ++i)
+  {
+    const double* pi = pts + 3 * i;
+    const double* pi1 = pts + 3 * ((i + 1) % numPts);
+    normal[0] += (pi[1] - pi1[1]) * (pi[2] + pi1[2]);
+    normal[1] += (pi[2] - pi1[2]) * (pi[0] + pi1[0]);
+    normal[2] += (pi[0] - pi1[0]) * (pi[1] + pi1[1]);
+  }
+
+  const double magnitude = vtkMath::Norm(normal);
+  if (magnitude > 0.0)
+  {
+    normal[0] /= magnitude;
+    normal[1] /= magnitude;
+    normal[2] /= magnitude;
+  }
+  return magnitude * 0.5;
+}
+
+//------------------------------------------------------------------------------
 void vtkPolygon::PrintSelf(ostream& os, vtkIndent indent)
 {
   this->Superclass::PrintSelf(os, indent);
@@ -2424,7 +2464,7 @@ int vtkPolygon::IntersectConvex2DCells(
         return 2;
       }
     } // if edge intersection
-  }   // over all edges
+  } // over all edges
 
   // Loop over edges of first polygon and intersect against second polygon
   numPts = cell1->Points->GetNumberOfPoints();
@@ -2446,7 +2486,7 @@ int vtkPolygon::IntersectConvex2DCells(
         return 2;
       }
     } // if edge intersection
-  }   // over all edges
+  } // over all edges
 
   // Evaluate what we got
   if (idx == 1)

@@ -1,39 +1,61 @@
 // SPDX-FileCopyrightText: Copyright (c) Ken Martin, Will Schroeder, Bill Lorensen
 // SPDX-License-Identifier: BSD-3-Clause
 
-#include "vtkFidesReader.h"
+#include "fidesdefs.h" // For build/config preprocessor defs
 
-#include "vtkDataArraySelection.h"
-#include "vtkFieldData.h"
-#include "vtkImageData.h"
-#include "vtkInformation.h"
-#include "vtkInformationIntegerKey.h"
-#include "vtkInformationVector.h"
-#include "vtkNew.h"
-#include "vtkObjectFactory.h"
-#include "vtkPartitionedDataSet.h"
-#include "vtkPartitionedDataSetCollection.h"
-#include "vtkStreamingDemandDrivenPipeline.h"
-#include "vtkStringArray.h"
-#include "vtkUnstructuredGrid.h"
-#include "vtkmlib/ImageDataConverter.h"
-#include "vtkmlib/UnstructuredGridConverter.h"
-#include "vtksys/SystemTools.hxx"
+#if VTK_HAVE_CONDUIT_PYTHON
+#include "vtkPython.h" // must be first
+#endif
+
+#include "vtkFidesReader.h"
 
 // Fides includes
 #include <vtk_fides.h>
 // clang-format off
+#include VTK_FIDES(fides/DataContainer.h)
 #include VTK_FIDES(fides/DataSetReader.h)
+#include VTK_FIDES(fides/ExternalDataRegistry.h)
+#include VTK_FIDES(fides/FidesTypes.h)
 // clang-format on
 
-#include <viskores/filter/clean_grid/CleanGrid.h>
+#include "vtkDataArraySelection.h"
+#include "vtkFieldData.h"
+#include "vtkInformation.h"
+#include "vtkInformationIntegerKey.h"
+#include "vtkInformationVector.h"
+#include "vtkMultiProcessController.h"
+#include "vtkNew.h"
+#include "vtkObjectFactory.h"
+#include "vtkPartitionedDataSet.h"
+#include "vtkPartitionedDataSetCollection.h"
+#include "vtkSmartPointer.h"
+#include "vtkStreamingDemandDrivenPipeline.h"
+#include "vtkStringArray.h"
+#include "vtksys/SystemTools.hxx"
 
+#ifdef IOFIDES_HAVE_MPI
+#include "vtkMPI.h"
+#include "vtkMPIController.h"
+#endif
+
+#if VTK_HAVE_CONDUIT
+#include "conduit.hpp"
+#include "conduit_cpp_to_c.hpp"
+#if VTK_HAVE_CONDUIT_PYTHON
+#include "conduit_python.hpp"
+#endif
+#endif
+
+#include <algorithm>
+#include <cmath>
 #include <numeric>
+#include <stdexcept>
 #include <utility>
 
 VTK_ABI_NAMESPACE_BEGIN
 
 vtkStandardNewMacro(vtkFidesReader);
+vtkCxxSetObjectMacro(vtkFidesReader, Controller, vtkMultiProcessController);
 
 struct vtkFidesReader::vtkFidesReaderImpl
 {
@@ -47,6 +69,75 @@ struct vtkFidesReader::vtkFidesReaderImpl
   fides::Params AllParams;
   vtkNew<vtkStringArray> SourceNames;
 
+#if VTK_HAVE_CONDUIT
+  std::unordered_map<std::string, std::string> ConduitTokens;
+
+#if VTK_HAVE_CONDUIT_PYTHON
+  std::unordered_map<std::string, vtkPyObjectFwd*> PythonNodes;
+#endif
+
+  // Helper to remove a single node by name
+  bool RemoveConduitNode(const std::string& name)
+  {
+    auto tokenIt = this->ConduitTokens.find(name);
+    if (tokenIt == this->ConduitTokens.end())
+    {
+      return false; // Not found, nothing to do
+    }
+
+    // Clear Conduit token and path
+    fides::io::ExternalDataRegistry::Instance().Unregister(tokenIt->second);
+    this->ConduitTokens.erase(tokenIt);
+    this->Paths.erase(name);
+
+#if VTK_HAVE_CONDUIT_PYTHON
+    // Clear corresponding Python node if it exists
+    auto pyNodeIt = this->PythonNodes.find(name);
+    if (pyNodeIt != this->PythonNodes.end())
+    {
+      vtkPythonScopeGilEnsurer gilEnsurer;
+      Py_DECREF(pyNodeIt->second);
+      this->PythonNodes.erase(pyNodeIt);
+    }
+#endif
+
+    return true; // state changed
+  }
+
+  // Helper to clear all nodes
+  bool ClearConduitNodes()
+  {
+    if (this->ConduitTokens.empty())
+    {
+      return false;
+    }
+
+    // Unregister external memory from Fides
+    for (const auto& pair : this->ConduitTokens)
+    {
+      fides::io::ExternalDataRegistry::Instance().Unregister(pair.second);
+    }
+
+    // Clear local maps
+    this->ConduitTokens.clear();
+    this->Paths.clear();
+
+#if VTK_HAVE_CONDUIT_PYTHON
+    // Decrement ref count on all stored Python nodes
+    if (!this->PythonNodes.empty())
+    {
+      vtkPythonScopeGilEnsurer gilEnsurer;
+      for (const auto& pair : this->PythonNodes)
+      {
+        Py_DECREF(pair.second);
+      }
+      this->PythonNodes.clear();
+    }
+#endif
+    return true; // state changed
+  }
+#endif // VTK_HAVE_CONDUIT
+
   // Metadata of an individual group in ADIOS file
   // This metadata is populated in RequestInformation.
   // and subsequently used in RequestData
@@ -57,6 +148,7 @@ struct vtkFidesReader::vtkFidesReaderImpl
     std::set<std::string> PointDataArrays;
     std::set<std::string> CellDataArrays;
     std::set<std::string> FieldDataArrays;
+    std::set<std::string> CellGridAttributeArrays;
   };
   std::vector<GroupMetaData> GroupMetaDataCollection;
 
@@ -103,28 +195,42 @@ struct vtkFidesReader::vtkFidesReaderImpl
 
 vtkFidesReader::vtkFidesReader()
   : Impl(new vtkFidesReaderImpl())
+  , Controller(nullptr)
 {
+  this->SetController(vtkMultiProcessController::GetGlobalController());
   this->SetNumberOfInputPorts(0);
   this->SetNumberOfOutputPorts(1);
   this->PointDataArraySelection = vtkDataArraySelection::New();
   this->CellDataArraySelection = vtkDataArraySelection::New();
   this->FieldDataArraySelection = vtkDataArraySelection::New();
+  this->CellGridAttributeArraySelection = vtkDataArraySelection::New();
   this->StreamSteps = false;
   this->NextStepStatus = static_cast<StepStatus>(fides::StepStatus::NotReady);
   this->CreateSharedPoints = false;
-  this->DebugOn();
 }
 
 vtkFidesReader::~vtkFidesReader()
 {
-  this->PointDataArraySelection->Delete();
-  this->CellDataArraySelection->Delete();
-  this->FieldDataArraySelection->Delete();
-
+  // Close the reader first so Fides finishes all I/O and teardown while the
+  // underlying Conduit nodes (and Python memory) are still alive.
   if (this->Impl->Reader)
   {
     this->Impl->Reader->Close();
+    this->Impl->Reader.reset();
   }
+
+  // Clean up selections
+  this->PointDataArraySelection->Delete();
+  this->CellDataArraySelection->Delete();
+  this->FieldDataArraySelection->Delete();
+  this->CellGridAttributeArraySelection->Delete();
+
+  // Clean up Fides+Conduit registry tokens and
+#if VTK_HAVE_CONDUIT
+  this->Impl->ClearConduitNodes();
+#endif
+
+  this->SetController(nullptr);
 }
 
 int vtkFidesReader::CanReadFile(const std::string& name)
@@ -178,6 +284,181 @@ void vtkFidesReader::SetDataSourceIO(const std::string& name, const std::string&
   this->Modified();
 }
 
+void vtkFidesReader::SetSchema(const std::string& jsonText)
+{
+  if (this->SchemaString == jsonText)
+  {
+    return;
+  }
+  this->SchemaString = jsonText;
+  this->Modified();
+}
+
+void vtkFidesReader::SetTimeValue(double t)
+{
+  // We unconditionally Modified() so downstream consumers re-execute on
+  // each in-memory step even when the schema otherwise looks stable.
+  this->CurrentTime = t;
+  this->HasCurrentTime = true;
+  this->Modified();
+}
+
+vtkStringArray* vtkFidesReader::GetDataSourceNames()
+{
+  return this->Impl->GetDataSourceNames();
+}
+
+//------------------------------------------------------------------------------
+bool vtkFidesReader::SetDataSourceNode(const std::string& name, vtkPyObjectFwd* conduitNode)
+{
+#if VTK_HAVE_CONDUIT_PYTHON
+  // Passing None or nullptr just clears out any existing resource
+  if (!conduitNode || conduitNode == Py_None)
+  {
+    this->Impl->RemoveConduitNode(name);
+    this->Modified();
+    return true;
+  }
+
+  if (!Py_IsInitialized())
+  {
+    vtkErrorMacro("Python interpreter is not initialized.");
+    return false;
+  }
+
+  if (import_conduit() < 0)
+  {
+    vtkErrorMacro("Failed to import Conduit Python C-API.");
+    return false;
+  }
+
+  if (!PyConduit_Node_Check(conduitNode))
+  {
+    vtkErrorMacro("Provided Python object is not a valid conduit.Node.");
+    return false;
+  }
+
+  // Extract the raw C++ pointer
+  conduit::Node* nodePtr = PyConduit_Node_Get_Node_Ptr(conduitNode);
+  if (!nodePtr)
+  {
+    vtkErrorMacro("Failed to extract C++ pointer from Python conduit.Node.");
+    return false;
+  }
+
+  // Clear any existing node with this name to prevent leaks
+  this->Impl->RemoveConduitNode(name);
+
+  // Register with Fides
+  std::string token;
+  try
+  {
+    auto wrappedNode = fides::WrapExternal(nodePtr);
+    token = fides::io::ExternalDataRegistry::Instance().Register(wrappedNode);
+  }
+  catch (const std::exception& e)
+  {
+    vtkErrorMacro("Fides registration failed: " << e.what());
+    return false;
+  }
+
+  // Store the new state
+  this->Impl->ConduitTokens[name] = token;
+  this->Impl->Paths[name] = token;
+  this->Impl->PythonNodes[name] = conduitNode;
+
+  Py_INCREF(conduitNode);
+  this->Modified();
+
+  return true;
+
+#else
+  (void)name;
+  (void)conduitNode;
+  vtkErrorMacro(
+    "VTK must be compiled with Python wrapping and Conduit support to use this method!");
+  return false;
+#endif
+}
+
+//------------------------------------------------------------------------------
+bool vtkFidesReader::SetDataSourceNode(const std::string& name, conduit_node* conduitNode)
+{
+#if VTK_HAVE_CONDUIT
+  // Intercept nullptr to clear an existing resource
+  if (!conduitNode)
+  {
+    this->Impl->RemoveConduitNode(name);
+    this->Modified();
+    return true;
+  }
+
+  // Convert the C-API node to the C++ API node using Conduit's official bridge
+  conduit::Node* cppNode = conduit::cpp_node(conduitNode);
+  if (!cppNode)
+  {
+    vtkErrorMacro("Failed to convert C-API conduit_node to C++ conduit::Node.");
+    return false;
+  }
+
+  // Clear any existing node, Fides token, and Python DECREF
+  this->Impl->RemoveConduitNode(name);
+
+  // Wrap and register with Fides
+  std::string token;
+  try
+  {
+    auto wrappedNode = fides::WrapExternal(cppNode);
+    token = fides::io::ExternalDataRegistry::Instance().Register(wrappedNode);
+  }
+  catch (const std::exception& e)
+  {
+    vtkErrorMacro("Fides registration failed: " << e.what());
+    return false;
+  }
+
+  // Store the state
+  this->Impl->ConduitTokens[name] = token;
+  this->Impl->Paths[name] = token;
+
+  // Note: There is no reference counting for pure C++. The caller is strictly
+  // responsible for keeping the memory alive until Update() is finished.
+
+  this->Modified();
+  return true;
+
+#else
+  (void)name;
+  (void)conduitNode;
+  vtkErrorMacro("VTK must be compiled with Conduit support to use this method!");
+  return false;
+#endif
+}
+
+//------------------------------------------------------------------------------
+void vtkFidesReader::RemoveDataSourceNode(const std::string& name)
+{
+#if VTK_HAVE_CONDUIT
+  if (this->Impl->RemoveConduitNode(name))
+  {
+    this->Modified();
+  }
+#else
+  (void)name;
+#endif
+}
+
+//------------------------------------------------------------------------------
+void vtkFidesReader::RemoveAllDataSourceNodes()
+{
+#if VTK_HAVE_CONDUIT
+  if (!this->Impl->ClearConduitNodes())
+  {
+    this->Modified();
+  }
+#endif
+}
+
 // This version is used when a json file with the data model is provided
 void vtkFidesReader::ParseDataModel(const std::string& fname)
 {
@@ -195,9 +476,20 @@ void vtkFidesReader::ParseDataModel()
   // If RequestInformation is called again, we may end up deleting it and making
   // a new reader because we have new information about how the reader should
   // actually be opened (e.g., with some type of streaming engine)
+  // Re-parsing may switch to a schema that declares different data sources, so
+  // drop the cached source-name list; GetDataSourceNames repopulates it lazily.
+  this->Impl->SourceNames->Reset();
+
   fides::io::DataSetReader::DataModelInput inputType =
     fides::io::DataSetReader::DataModelInput::JSONFile;
-  if (this->Impl->UsePresetModel)
+  // SchemaString takes precedence: an in-memory schema (e.g. Catalyst flow)
+  // wins over a FileName, which itself wins over a preset BP-attached model.
+  const std::string& dataModel = this->SchemaString.empty() ? this->FileName : this->SchemaString;
+  if (!this->SchemaString.empty())
+  {
+    inputType = fides::io::DataSetReader::DataModelInput::JSONString;
+  }
+  else if (this->Impl->UsePresetModel)
   {
     inputType = fides::io::DataSetReader::DataModelInput::BPFile;
   }
@@ -206,8 +498,32 @@ void vtkFidesReader::ParseDataModel()
     vtkDebugMacro(<< "Setting up Fides DataSetReader with FileName: " << this->FileName
                   << ", inputType: " << static_cast<int>(inputType) << ", StreamSteps: "
                   << this->StreamSteps << ", CreateSharedPoints: " << this->CreateSharedPoints);
-    this->Impl->Reader.reset(new fides::io::DataSetReader(this->FileName, inputType,
-      this->StreamSteps, this->Impl->AllParams, this->CreateSharedPoints));
+    bool usedMpi = false;
+
+#ifdef IOFIDES_HAVE_MPI
+    if (this->Controller && this->Controller->GetCommunicator())
+    {
+      vtkMPICommunicator* vtkComm =
+        vtkMPICommunicator::SafeDownCast(this->Controller->GetCommunicator());
+
+      if (vtkComm && vtkComm->GetMPIComm())
+      {
+        MPI_Comm comm = *(vtkComm->GetMPIComm()->GetHandle());
+        this->Impl->Reader.reset(new fides::io::DataSetReader(dataModel, inputType,
+          this->StreamSteps, comm, this->Impl->AllParams, this->CreateSharedPoints));
+
+        usedMpi = true;
+      }
+    }
+#endif
+
+    // Serial fallback in case VTK is built without MPI, the controller is null,
+    // or the communicator downcast fails
+    if (!usedMpi)
+    {
+      this->Impl->Reader.reset(new fides::io::DataSetReader(
+        dataModel, inputType, this->StreamSteps, this->Impl->AllParams, this->CreateSharedPoints));
+    }
   }
   catch (std::exception& e)
   {
@@ -300,6 +616,13 @@ int vtkFidesReader::RequestDataObject(
     output->Delete();
   }
   return 1;
+}
+
+namespace
+{
+bool IsPointField(fides::FieldAssociation association);
+bool IsCellField(fides::FieldAssociation association);
+bool IsWholeDataSetField(fides::FieldAssociation association);
 }
 
 int vtkFidesReader::RequestInformation(
@@ -438,20 +761,25 @@ int vtkFidesReader::RequestInformation(
         fides::keys::FIELDS());
       for (auto& field : fields.Data)
       {
-        if (field.Association == viskores::cont::Field::Association::Points)
+        if (IsPointField(field.Association))
         {
           groupMetaData.PointDataArrays.insert(field.Name);
           this->PointDataArraySelection->AddArray(field.Name.c_str());
         }
-        else if (field.Association == viskores::cont::Field::Association::Cells)
+        else if (IsCellField(field.Association))
         {
           groupMetaData.CellDataArrays.insert(field.Name);
           this->CellDataArraySelection->AddArray(field.Name.c_str());
         }
-        else if (field.Association == viskores::cont::Field::Association::WholeDataSet)
+        else if (IsWholeDataSetField(field.Association))
         {
           groupMetaData.FieldDataArrays.insert(field.Name);
           this->FieldDataArraySelection->AddArray(field.Name.c_str());
+        }
+        else if (field.Association == fides::FieldAssociation::CellGrid)
+        {
+          groupMetaData.CellGridAttributeArrays.insert(field.Name);
+          this->CellGridAttributeArraySelection->AddArray(field.Name.c_str());
         }
       }
     }
@@ -503,6 +831,27 @@ int vtkFidesReader::RequestInformation(
 
 namespace
 {
+bool IsPointField(fides::FieldAssociation association)
+{
+  return association == fides::FieldAssociation::Points;
+}
+
+bool IsCellField(fides::FieldAssociation association)
+{
+  return association == fides::FieldAssociation::Cells;
+}
+
+bool IsWholeDataSetField(fides::FieldAssociation association)
+{
+  return association == fides::FieldAssociation::WholeDataSet;
+}
+
+fides::metadata::FieldInformation MakeFieldInformation(
+  const std::string& name, fides::FieldAssociation association)
+{
+  return fides::metadata::FieldInformation(name, association);
+}
+
 fides::metadata::Vector<size_t> DetermineBlocksToRead(int nBlocks, int nPieces, int piece)
 {
   int startPiece, endPiece;
@@ -548,35 +897,6 @@ fides::metadata::Vector<size_t> DetermineBlocksToRead(int nBlocks, int nPieces, 
     std::iota(blocksToRead.Data.begin(), blocksToRead.Data.end(), startPiece);
   }
   return blocksToRead;
-}
-
-vtkDataSet* ConvertDataSet(const viskores::cont::DataSet& ds)
-{
-  vtkNew<vtkUnstructuredGrid> dstmp;
-  const auto& cs = ds.GetCellSet();
-  if (cs.IsType<viskores::cont::CellSetSingleType<>>() ||
-    cs.IsType<viskores::cont::CellSetExplicit<>>())
-  {
-    vtkUnstructuredGrid* ug = vtkUnstructuredGrid::New();
-    fromvtkm::Convert(ds, ug, dstmp, /*forceViskores*/ true);
-    return ug;
-  }
-  else if (cs.IsType<viskores::cont::CellSetStructured<2>>() ||
-    cs.IsType<viskores::cont::CellSetStructured<3>>())
-  {
-    const auto& coords = ds.GetCoordinateSystem();
-    auto array = coords.GetData();
-    if (array.IsType<viskores::cont::ArrayHandleUniformPointCoordinates>())
-    {
-      vtkImageData* image = vtkImageData::New();
-      fromvtkm::Convert(ds, image, dstmp);
-      return image;
-    }
-  }
-  viskores::filter::clean_grid::CleanGrid filter;
-  filter.SetCompactPointFields(false);
-  auto result = filter.Execute(ds);
-  return ConvertDataSet(result);
 }
 
 } // end anon namespace
@@ -669,9 +989,20 @@ int vtkFidesReader::RequestData(
   vtkInformation* outInfo = outputVector->GetInformationObject(0);
   output->SetNumberOfPartitionedDataSets(0);
 
+#if VTK_HAVE_CONDUIT
+  // Determine if we are relying on an in-memory Conduit node
+  bool isConduit = !this->Impl->ConduitTokens.empty();
+#else
+  bool isConduit = false;
+#endif
+
   fides::metadata::MetaData selections;
-  // Select time step if downstream requested a specific time step.
-  if (!this->StreamSteps && outInfo->Has(vtkStreamingDemandDrivenPipeline::UPDATE_TIME_STEP()))
+
+  // Select time step if downstream requested a specific time step,
+  // but skip this if we are dealing with a local Conduit snapshot
+  // due to general lack of temporal indexing.
+  if (!this->StreamSteps && outInfo->Has(vtkStreamingDemandDrivenPipeline::UPDATE_TIME_STEP()) &&
+    !isConduit)
   {
     auto step = outInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_TIME_STEP());
     int index = 0;
@@ -707,12 +1038,37 @@ int vtkFidesReader::RequestData(
     vtkDebugMacro(<< "nBlocks: " << nBlocks << ", nPieces: " << nPieces << ", piece: " << piece
                   << (groupMetaData.Name.empty() ? "" : ", groupName: ") << groupMetaData.Name);
 
-    fides::metadata::Vector<size_t> blocksToRead = DetermineBlocksToRead(nBlocks, nPieces, piece);
+    fides::metadata::Vector<size_t> blocksToRead;
+
+    if (isConduit)
+    {
+      // Conduit nodes reflect local in-memory data, and since nBlocks is the
+      // number of local blocks on this rank, let's read all of them
+      for (int b = 0; b < nBlocks; ++b)
+      {
+        blocksToRead.Data.push_back(static_cast<size_t>(b));
+      }
+    }
+    else
+    {
+      // ADIOS2 global block distribution
+      blocksToRead = DetermineBlocksToRead(nBlocks, nPieces, piece);
+    }
+
     if (blocksToRead.Data.empty())
     {
-      // nothing to read on this rank
+      // Nothing to read on this rank for this group, but still occupy the slot
+      // (as an empty partitioned dataset with the group's name) so the output's
+      // group-to-index layout matches ranks that did read this group.
       output->SetNumberOfPartitions(pdsIdx, 0);
-      vtkDebugMacro(<< "No blocks to read on this rank; returning");
+      std::string datasetName;
+      {
+        const auto parts = vtksys::SystemTools::SplitString(groupMetaData.Name);
+        datasetName = parts.empty() ? "mesh" : parts.back();
+      }
+      output->GetMetaData(pdsIdx)->Set(vtkCompositeDataSet::NAME(), datasetName.c_str());
+      vtkDebugMacro(<< "No blocks to read on this rank for this group");
+      ++pdsIdx;
       continue;
     }
     // Select blocks to read.
@@ -728,7 +1084,8 @@ int vtkFidesReader::RequestData(
       if (this->PointDataArraySelection->ArrayIsEnabled(aname.c_str()))
       {
         // if this array was enabled on the global point data array selection.
-        arraySelection.Data.emplace_back(aname, viskores::cont::Field::Association::Points);
+        arraySelection.Data.emplace_back(
+          MakeFieldInformation(aname, fides::FieldAssociation::Points));
       }
     }
     for (const auto& aname : groupMetaData.CellDataArrays)
@@ -736,7 +1093,8 @@ int vtkFidesReader::RequestData(
       if (this->CellDataArraySelection->ArrayIsEnabled(aname.c_str()))
       {
         // if this array was enabled on the global cell data array selection.
-        arraySelection.Data.emplace_back(aname, viskores::cont::Field::Association::Cells);
+        arraySelection.Data.emplace_back(
+          MakeFieldInformation(aname, fides::FieldAssociation::Cells));
       }
     }
     for (const auto& aname : groupMetaData.FieldDataArrays)
@@ -744,46 +1102,121 @@ int vtkFidesReader::RequestData(
       if (this->FieldDataArraySelection->ArrayIsEnabled(aname.c_str()))
       {
         // if this array was enabled on the global field data array selection.
-        arraySelection.Data.emplace_back(aname, viskores::cont::Field::Association::WholeDataSet);
+        arraySelection.Data.emplace_back(
+          MakeFieldInformation(aname, fides::FieldAssociation::WholeDataSet));
+      }
+    }
+    for (const auto& aname : groupMetaData.CellGridAttributeArrays)
+    {
+      if (this->CellGridAttributeArraySelection->ArrayIsEnabled(aname.c_str()))
+      {
+        // if this cell-grid attribute was enabled on the global selection.
+        arraySelection.Data.emplace_back(
+          MakeFieldInformation(aname, fides::FieldAssociation::CellGrid));
       }
     }
     selections.Set(fides::keys::FIELDS(), arraySelection);
 
-    viskores::cont::PartitionedDataSet datasets;
+    std::unique_ptr<fides::DataContainer> container;
     try
     {
       vtkDebugMacro(<< "RequestData() calling ReadDataSet");
-      datasets = this->Impl->Reader->ReadDataSet(this->Impl->Paths, selections);
+      container =
+        this->Impl->Reader->ReadDataSet(this->Impl->Paths, selections, fides::DataSetType::VTK);
       if (this->StreamSteps)
       {
         this->NextStepStatus = static_cast<StepStatus>(fides::StepStatus::NotReady);
       }
     }
-    catch (std::invalid_argument& e)
+    catch (std::exception& e)
     {
       vtkErrorMacro(<< e.what());
       return 0;
     }
-    viskores::Id nParts = datasets.GetNumberOfPartitions();
-    output->SetNumberOfPartitions(pdsIdx, nParts);
-    std::string datasetName;
-    {
-      const auto parts = vtksys::SystemTools::SplitString(groupMetaData.Name);
-      datasetName = parts.empty() ? "mesh" : parts.back();
-    }
-    output->GetMetaData(pdsIdx)->Set(vtkCompositeDataSet::NAME(), datasetName.c_str());
 
-    for (viskores::Id i = 0; i < nParts; i++)
+    // The container holds either a single vtkPartitionedDataSet (a plain
+    // group/dataset) or a whole vtkPartitionedDataSetCollection (a
+    // collection-format file written via WriteCollection, which Fides returns in
+    // one ReadDataSet call independent of our per-group iteration). The
+    // accessors throw when the container holds the other type, and they must run
+    // inside libfides (where the container was created) for their RTTI checks to
+    // match -- a GetDataAs<> instantiated in this module would not match the
+    // wrapper's typeinfo across the library boundary. The single-dataset case is
+    // the common one, so try it first to keep it off the exception path.
+    vtkSmartPointer<vtkPartitionedDataSet> pds;
+    try
     {
-      auto& ds = datasets.GetPartition(i);
-      vtkDataSet* vds = ConvertDataSet(ds);
-      if (vds)
+      pds = fides::GetAsVTKPDS(*container);
+    }
+    catch (const std::exception&)
+    {
+      pds = nullptr;
+    }
+
+    if (pds)
+    {
+      // The VTK Fides backend returns one vtkPartitionedDataSet per group; the
+      // wrap-in-PDSC happens here so multi-group files have somewhere to live.
+      output->SetPartitionedDataSet(pdsIdx, pds);
+      std::string datasetName;
       {
-        output->SetPartition(pdsIdx, i, vds);
-        vds->Delete();
+        const auto parts = vtksys::SystemTools::SplitString(groupMetaData.Name);
+        datasetName = parts.empty() ? "mesh" : parts.back();
+      }
+      output->GetMetaData(pdsIdx)->Set(vtkCompositeDataSet::NAME(), datasetName.c_str());
+      ++pdsIdx;
+      continue;
+    }
+
+    vtkSmartPointer<vtkPartitionedDataSetCollection> collection;
+    try
+    {
+      collection = fides::GetAsVTKPDC(*container);
+    }
+    catch (const std::exception& e)
+    {
+      vtkErrorMacro(<< e.what());
+      return 0;
+    }
+    if (!collection)
+    {
+      vtkErrorMacro(<< "Fides ReadDataSet returned neither a vtkPartitionedDataSet nor a "
+                       "vtkPartitionedDataSetCollection");
+      return 0;
+    }
+
+    // The collection read already returned every item. Append them at the
+    // current index (preserving item names) so any groups read on prior
+    // iterations are kept, then stop iterating groups. The data assembly's item
+    // indices are collection-relative, so only carry it over when this
+    // collection occupies the output from the start.
+    const unsigned int base = pdsIdx;
+    const unsigned int nItems = collection->GetNumberOfPartitionedDataSets();
+    for (unsigned int c = 0; c < nItems; ++c)
+    {
+      output->SetPartitionedDataSet(base + c, collection->GetPartitionedDataSet(c));
+      if (collection->HasMetaData(c) &&
+        collection->GetMetaData(c)->Has(vtkCompositeDataSet::NAME()))
+      {
+        output->GetMetaData(base + c)->Set(vtkCompositeDataSet::NAME(),
+          collection->GetMetaData(c)->Get(vtkCompositeDataSet::NAME()));
       }
     }
-    pdsIdx++;
+    if (base == 0 && collection->GetDataAssembly())
+    {
+      output->SetDataAssembly(collection->GetDataAssembly());
+    }
+    pdsIdx = base + nItems;
+    break;
+  }
+
+  // Stamp the requested data time on the output so downstream filters and
+  // extractors (notably the Fides writer) can forward it through to the BP
+  // file. Used by in-memory flows where the schema itself does not declare a
+  // step variable the executive could otherwise propagate.
+  if (this->HasCurrentTime)
+  {
+    output->GetInformation()->Set(vtkDataObject::DATA_TIME_STEP(), this->CurrentTime);
   }
 
   return 1;
@@ -877,11 +1310,39 @@ void vtkFidesReader::SetFieldArrayStatus(const char* name, int status)
   }
 }
 
+int vtkFidesReader::GetNumberOfCellGridAttributeArrays()
+{
+  return this->CellGridAttributeArraySelection->GetNumberOfArrays();
+}
+
+const char* vtkFidesReader::GetCellGridAttributeArrayName(int index)
+{
+  return this->CellGridAttributeArraySelection->GetArrayName(index);
+}
+
+int vtkFidesReader::GetCellGridAttributeArrayStatus(const char* name)
+{
+  return this->CellGridAttributeArraySelection->ArrayIsEnabled(name);
+}
+
+void vtkFidesReader::SetCellGridAttributeArrayStatus(const char* name, int status)
+{
+  if (status)
+  {
+    this->CellGridAttributeArraySelection->EnableArray(name);
+  }
+  else
+  {
+    this->CellGridAttributeArraySelection->DisableArray(name);
+  }
+}
+
 vtkMTimeType vtkFidesReader::GetMTime()
 {
   auto curMax = std::max(this->Superclass::GetMTime(), this->PointDataArraySelection->GetMTime());
   curMax = std::max(curMax, this->CellDataArraySelection->GetMTime());
-  return std::max(curMax, this->FieldDataArraySelection->GetMTime());
+  curMax = std::max(curMax, this->FieldDataArraySelection->GetMTime());
+  return std::max(curMax, this->CellGridAttributeArraySelection->GetMTime());
 }
 
 VTK_ABI_NAMESPACE_END

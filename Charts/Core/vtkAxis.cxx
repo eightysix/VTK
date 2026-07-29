@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: Copyright (c) Ken Martin, Will Schroeder, Bill Lorensen
 // SPDX-License-Identifier: BSD-3-Clause
-// VTK_DEPRECATED_IN_9_6_0()
-#define VTK_DEPRECATION_LEVEL 0
-
 #include "vtkAxis.h"
 
 #include "vtkAxisExtended.h"
@@ -76,6 +73,7 @@ vtkAxis::vtkAxis()
   this->GridVisible = true;
   this->LabelsVisible = true;
   this->RangeLabelsVisible = false;
+  this->VerticalLabels = false;
   this->LabelOffset = 7;
   this->OverlappingLabels = true;
   this->TicksVisible = true;
@@ -119,40 +117,96 @@ void vtkAxis::SetPosition(int position)
   if (this->Position != position)
   {
     this->Position = position;
-    // Draw the axis label
-    switch (this->Position)
-    {
-      case vtkAxis::LEFT:
-        this->TitleProperties->SetOrientation(90.0);
-        this->TitleProperties->SetVerticalJustificationToBottom();
-        this->LabelProperties->SetJustificationToRight();
-        this->LabelProperties->SetVerticalJustificationToCentered();
-        break;
-      case vtkAxis::RIGHT:
-        this->TitleProperties->SetOrientation(90.0);
-        this->TitleProperties->SetVerticalJustificationToTop();
-        this->LabelProperties->SetJustificationToLeft();
-        this->LabelProperties->SetVerticalJustificationToCentered();
-        break;
-      case vtkAxis::BOTTOM:
-        this->TitleProperties->SetOrientation(0.0);
-        this->TitleProperties->SetVerticalJustificationToTop();
-        this->LabelProperties->SetJustificationToCentered();
-        this->LabelProperties->SetVerticalJustificationToTop();
-        break;
-      case vtkAxis::TOP:
-        this->TitleProperties->SetOrientation(0.0);
-        this->TitleProperties->SetVerticalJustificationToBottom();
+    this->UpdateOrientation();
+    this->Modified();
+  }
+}
+
+void vtkAxis::SetVerticalLabels(bool verticalLabels)
+{
+  if (this->VerticalLabels != verticalLabels)
+  {
+    this->VerticalLabels = verticalLabels;
+    this->UpdateOrientation();
+    this->Modified();
+  }
+}
+
+void vtkAxis::UpdateOrientation()
+{
+  switch (this->Position)
+  {
+    case vtkAxis::LEFT:
+      this->TitleProperties->SetOrientation(90.0);
+      this->TitleProperties->SetVerticalJustificationToBottom();
+      if (this->VerticalLabels)
+      {
         this->LabelProperties->SetJustificationToCentered();
         this->LabelProperties->SetVerticalJustificationToBottom();
-        break;
-      case vtkAxis::PARALLEL:
-        this->TitleProperties->SetOrientation(0.0);
-        this->TitleProperties->SetVerticalJustificationToTop();
+      }
+      else
+      {
         this->LabelProperties->SetJustificationToRight();
         this->LabelProperties->SetVerticalJustificationToCentered();
-        break;
-    }
+      }
+      break;
+    case vtkAxis::RIGHT:
+      this->TitleProperties->SetOrientation(90.0);
+      this->TitleProperties->SetVerticalJustificationToTop();
+      if (this->VerticalLabels)
+      {
+        this->LabelProperties->SetJustificationToCentered();
+        this->LabelProperties->SetVerticalJustificationToTop();
+      }
+      else
+      {
+        this->LabelProperties->SetJustificationToLeft();
+        this->LabelProperties->SetVerticalJustificationToCentered();
+      }
+      break;
+    case vtkAxis::BOTTOM:
+      this->TitleProperties->SetOrientation(0.0);
+      this->TitleProperties->SetVerticalJustificationToTop();
+      if (this->VerticalLabels)
+      {
+        this->LabelProperties->SetJustificationToRight();
+        this->LabelProperties->SetVerticalJustificationToCentered();
+      }
+      else
+      {
+        this->LabelProperties->SetJustificationToCentered();
+        this->LabelProperties->SetVerticalJustificationToTop();
+      }
+      break;
+    case vtkAxis::TOP:
+      this->TitleProperties->SetOrientation(0.0);
+      this->TitleProperties->SetVerticalJustificationToBottom();
+      if (this->VerticalLabels)
+      {
+        this->LabelProperties->SetJustificationToLeft();
+        this->LabelProperties->SetVerticalJustificationToCentered();
+      }
+      else
+      {
+        this->LabelProperties->SetJustificationToCentered();
+        this->LabelProperties->SetVerticalJustificationToBottom();
+      }
+      break;
+    case vtkAxis::PARALLEL:
+      this->TitleProperties->SetOrientation(0.0);
+      this->TitleProperties->SetVerticalJustificationToTop();
+      this->LabelProperties->SetJustificationToRight();
+      this->LabelProperties->SetVerticalJustificationToCentered();
+      break;
+  }
+
+  if (this->VerticalLabels)
+  {
+    this->LabelProperties->SetOrientation(90);
+  }
+  else
+  {
+    this->LabelProperties->SetOrientation(0);
   }
 }
 
@@ -223,6 +277,7 @@ void vtkAxis::Update()
   }
 
   this->UpdateLogScaleActive(false);
+  // VTK_DEPRECATED_IN_9_8_0 remove this->Behavior checks
   if ((this->Behavior == vtkAxis::AUTO || this->Behavior == vtkAxis::FIXED) && this->TickMarksDirty)
   {
     // Regenerate the tick marks/positions if necessary
@@ -249,6 +304,7 @@ void vtkAxis::Update()
   }
 
   // Figure out what type of behavior we should follow
+  // VTK_DEPRECATED_IN_9_8_0 remove this->Behavior checks
   if (this->Resized && (this->Behavior == vtkAxis::AUTO || this->Behavior == vtkAxis::FIXED))
   {
     this->RecalculateTickSpacing();
@@ -882,6 +938,7 @@ void vtkAxis::RecalculateTickSpacing()
 {
   // Calculate the min and max, set the number of ticks and the tick spacing,
   // discard the min and max in this case. TODO: Refactor the function called.
+  // VTK_DEPRECATED_IN_9_8_0 remove this->Behavior checks
   if (this->Behavior == vtkAxis::AUTO || this->Behavior == vtkAxis::FIXED)
   {
     double min = this->Minimum;
@@ -1270,8 +1327,7 @@ void vtkAxis::GenerateTickLabels(double min, double max)
       this->LabelProperties->SetFontSize(tickPositionExtended->GetFontSize());
       if (tickPositionExtended->GetOrientation() == 1)
       {
-        // Set this to 90 to make the labels vertical
-        this->LabelProperties->SetOrientation(90);
+        this->SetVerticalLabels(true);
       }
     }
 
@@ -1555,13 +1611,14 @@ void vtkAxis::GenerateLabelFormat(int notation, double n)
 vtkStdString vtkAxis::GenerateSprintfLabel(double value, const std::string& format)
 {
   // the format is expected to be in printf style format, so it's converted to std::format
-  VTK_FORMAT_IF_ERROR_RETURN(return vtk::format(vtk::printf_to_std_format(format), value), "");
+  VTK_FORMAT_IF_ERROR_RETURN(
+    return vtk::format(vtk::runtime(vtk::printf_to_std_format(format)), value), "");
 }
 
 //------------------------------------------------------------------------------
 vtkStdString vtkAxis::GenerateStdFormatLabel(double value, const std::string& format)
 {
-  VTK_FORMAT_IF_ERROR_RETURN(return vtk::format(format, value), "");
+  VTK_FORMAT_IF_ERROR_RETURN(return vtk::format(vtk::runtime(format), value), "");
 }
 
 //------------------------------------------------------------------------------
@@ -1945,6 +2002,7 @@ void vtkAxis::PrintSelf(ostream& os, vtkIndent indent)
       os << "FIXED";
       break;
 
+    // VTK_DEPRECATED_IN_9_8_0 Remove
     case CUSTOM:
       os << "CUSTOM";
       break;

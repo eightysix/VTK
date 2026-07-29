@@ -132,13 +132,28 @@ public:
    */
   bool EnsureDisplay() override;
 
+  ///@{
+  /**
+   * Get/set whether this window owns the X11 Display connection.
+   * Used during cleanup sequencing to control when the Display is closed.
+   */
+  vtkTypeBool GetOwnDisplay();
+  void SetOwnDisplay(vtkTypeBool ownDisplay);
+  ///@}
+
+  /**
+   * Close the X11 Display connection.
+   * Only closes if OwnDisplay is true. Safe to call even if the window
+   * has already been destroyed (WindowId == 0).
+   */
+  void CloseDisplay();
+
 protected:
   vtkXlibHardwareWindow();
   ~vtkXlibHardwareWindow() override;
 
   // Helper members
   vtkXVisualInfo* GetDesiredVisualInfo();
-  void CloseDisplay();
 
   Display* DisplayId;
   Window ParentId;

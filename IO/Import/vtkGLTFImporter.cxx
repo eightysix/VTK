@@ -514,6 +514,14 @@ int vtkGLTFImporter::ImportBegin()
   vtkNew<vtkEventForwarderCommand> forwarder;
   forwarder->SetTarget(this);
   this->Loader->AddObserver(vtkCommand::ProgressEvent, forwarder);
+  if (this->HasObserver(vtkCommand::WarningEvent))
+  {
+    this->Loader->AddObserver(vtkCommand::WarningEvent, forwarder);
+  }
+  if (this->HasObserver(vtkCommand::ErrorEvent))
+  {
+    this->Loader->AddObserver(vtkCommand::ErrorEvent, forwarder);
+  }
 
   // Check extension
   std::vector<char> glbBuffer;
@@ -646,6 +654,28 @@ void vtkGLTFImporter::ImportActors(vtkRenderer* renderer)
   this->ArmatureActors.clear();
   this->ActorCollection->RemoveAllItems();
 
+  // Tracks how many times each (parent, name) pair has been used so that
+  // duplicate sibling names — which glTF permits — are made unique before
+  // being passed to vtkDataAssembly::AddNode (which requires uniqueness).
+  std::map<int, std::set<std::string>> usedNames;
+  std::map<std::pair<int, std::string>, int> nameCounters;
+  auto makeUniqueName = [&usedNames, &nameCounters](
+                          int parent, const std::string& baseName) -> std::string
+  {
+    auto& usedSet = usedNames[parent];
+    if (usedSet.insert(baseName).second)
+    {
+      return baseName;
+    }
+    auto& counter = nameCounters[{ parent, baseName }];
+    std::string candidate;
+    do
+    {
+      candidate = baseName + "_" + vtk::to_string(++counter);
+    } while (!usedSet.insert(candidate).second);
+    return candidate;
+  };
+
   // Iterate over tree
   while (!nodeIdStack.empty())
   {
@@ -660,11 +690,12 @@ void vtkGLTFImporter::ImportActors(vtkRenderer* renderer)
     std::string dasmNodeName;
     if (!node.Name.empty())
     {
-      dasmNodeName = vtkDataAssembly::MakeValidNodeName(node.Name.c_str());
+      dasmNodeName =
+        makeUniqueName(dasmParent, vtkDataAssembly::MakeValidNodeName(node.Name.c_str()));
     }
     else
     {
-      dasmNodeName = "node" + vtk::to_string(nodeId);
+      dasmNodeName = makeUniqueName(dasmParent, "node_" + vtk::to_string(nodeId));
     }
     const int dasmNode = this->SceneHierarchy->AddNode(dasmNodeName.c_str(), dasmParent);
 
@@ -723,11 +754,12 @@ void vtkGLTFImporter::ImportActors(vtkRenderer* renderer)
             primitiveName += "_primitive_" + vtk::to_string(primitiveId++);
           }
           this->OutputsDescription += primitiveName;
-          meshNodeName = vtkDataAssembly::MakeValidNodeName(primitiveName.c_str());
+          meshNodeName =
+            makeUniqueName(dasmNode, vtkDataAssembly::MakeValidNodeName(primitiveName.c_str()));
         }
         else
         {
-          meshNodeName = "primitive_" + vtk::to_string(primitiveId++);
+          meshNodeName = makeUniqueName(dasmNode, "primitive_" + vtk::to_string(primitiveId++));
         }
         this->OutputsDescription += "Primitive Geometry:\n";
         this->OutputsDescription +=
@@ -1234,37 +1266,6 @@ void vtkGLTFImporter::DisableAnimation(vtkIdType animationIndex)
 bool vtkGLTFImporter::IsAnimationEnabled(vtkIdType animationIndex)
 {
   return this->EnabledAnimations[animationIndex];
-}
-
-//----------------------------------------------------------------------------
-// VTK_DEPRECATED_IN_9_6_0
-bool vtkGLTFImporter::GetTemporalInformation(vtkIdType animationIndex, double frameRate,
-  int& nbTimeSteps, double timeRange[2], vtkDoubleArray* timeSteps)
-{
-  if (animationIndex < this->GetNumberOfAnimations())
-  {
-    const auto& model = this->Loader->GetInternalModel();
-    assert(model);
-
-    timeRange[0] = 0;
-    timeRange[1] = model->Animations[animationIndex].Duration;
-
-    if (frameRate > 0)
-    {
-      nbTimeSteps = 0;
-      timeSteps->Initialize();
-
-      std::vector<double> ts;
-      double period = (1.0 / frameRate);
-      for (double i = timeRange[0]; i < timeRange[1]; i += period)
-      {
-        timeSteps->InsertNextTuple(&i);
-        nbTimeSteps++;
-      }
-    }
-    return true;
-  }
-  return false;
 }
 
 //----------------------------------------------------------------------------

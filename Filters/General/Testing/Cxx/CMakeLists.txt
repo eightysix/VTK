@@ -20,6 +20,7 @@ vtk_add_test_cxx(vtkFiltersGeneralCxxTests tests
   TestCleanUnstructuredGridStrategies.cxx,NO_VALID
   TestClipDatasetPolyhedrons.cxx,NO_VALID
   TestClipInclusiveIsovalue.cxx,NO_VALID
+  TestClipPolyLine.cxx,NO_VALID
   TestContourTriangulator.cxx
   TestContourTriangulatorBadData.cxx
   TestContourTriangulatorCutter.cxx
@@ -62,6 +63,7 @@ vtk_add_test_cxx(vtkFiltersGeneralCxxTests tests
   TestTableBasedClipDataSet.cxx,NO_VALID
   TestTableFFT.cxx,NO_VALID
   TestTableSplitColumnComponents.cxx,NO_VALID
+  TestTableToRectilinearGrid.cxx,NO_VALID
   TestTemporalPathLineFilter.cxx,NO_VALID
   TestTessellator.cxx,NO_VALID
   TestTransformFilter.cxx,NO_VALID

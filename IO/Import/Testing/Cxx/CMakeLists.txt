@@ -101,6 +101,13 @@ vtk_add_test_cxx(vtkIOImportCxxTests tests
     DATA{../Data/glTF/Duck0.bin}
 )
 
+# Test that a file with an unrecognized image type loads successfully with a warning
+vtk_add_test_cxx(vtkIOImportCxxTests tests
+  NO_VALID
+  TestGLTFImporterUnknownImageType,TestGLTFImporterUnknownImageType.cxx
+    DATA{../Data/glTF/UnknownImageType/UnknownImageType.gltf,dummy.avif}
+)
+
 # (vtk/vtk#19097) This test is skipped on wasm architecture.
 if (NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
   set_tests_properties(VTK::IOImportCxx-TestOBJImporter-Malformed PROPERTIES PASS_REGULAR_EXPRESSION "Unexpected point indice value")
@@ -189,7 +196,11 @@ vtk_add_test_cxx(vtkIOImportCxxTests tests
 )
 
 vtk_add_test_cxx(vtkIOImportCxxTests tests
-  TestGLTFImporterHierarchy,TestGLTFImporterHierarchy.cxx DATA{../Data/glTF/ABeautifulGame/ABeautifulGame.glb} -1
+  TestGLTFImporterHierarchy,TestGLTFImporterHierarchy.cxx DATA{../Data/glTF/ABeautifulGame/ABeautifulGame.glb} DATA{../Data/SceneHierarchies/ABeautifulGame.xml}
+)
+
+vtk_add_test_cxx(vtkIOImportCxxTests tests
+  TestGLTFImporterHierarchySameName,TestGLTFImporterHierarchy.cxx DATA{../Data/glTF/TwoQuadsSameName.glb} DATA{../Data/SceneHierarchies/TwoQuadsSameName.xml}
 )
 
 vtk_add_test_cxx(vtkIOImportCxxTests tests

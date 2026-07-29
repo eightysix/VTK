@@ -40,10 +40,6 @@ public:
   bool operator==(const vtkOverlappingAMRMetaData& other) const;
   bool operator!=(const vtkOverlappingAMRMetaData& other) const { return !(*this == other); }
 
-  // VTK_DEPRECATED_IN_9_6_0
-  // Remove once the deprecated Initialize method in parent class is removed
-  using vtkAMRMetaData::Initialize;
-
   /**
    * Initialize the meta information
    * blocksPerLevels is the number of blocks for each level
@@ -222,12 +218,21 @@ public:
   bool FindCell(double q[3], unsigned int level, unsigned int index, int& cellIdx);
 
   /**
-   * find the grid that contains the point q at the specified level
+   * Find a grid that contains the point q at the specified level
+   * Return true if found, false otherwise.
    */
   bool FindGrid(double q[3], int level, unsigned int& gridId);
 
   /**
+   * Clear gridIds and find all gridIds that contains the point q at the specified level
+   * Return true if found, false otherwise.
+   */
+  bool FindGrids(double q[3], unsigned int level, std::vector<unsigned int>& gridIds);
+
+  /**
    * Given a point q, find the highest level grid that contains it.
+   * Return true if point is found and set level and gridId.
+   * Return false otherwise.
    */
   bool FindGrid(double q[3], unsigned int& level, unsigned int& gridId);
 

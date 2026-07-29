@@ -156,7 +156,7 @@ int vtkContourFilter::RequestUpdateExtent(
   if (vtkImageData::SafeDownCast(input) && sType != VTK_BIT && !vtkUniformGrid::SafeDownCast(input))
   {
     int dim = 3;
-    int* uExt = inInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_EXTENT());
+    const int* uExt = inInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_EXTENT());
     if (uExt[0] == uExt[1])
     {
       --dim;
@@ -201,7 +201,7 @@ int vtkContourFilter::RequestUpdateExtent(
   // handle 3D RGrids
   if (vtkRectilinearGrid::SafeDownCast(input) && sType != VTK_BIT)
   {
-    int* uExt = inInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_EXTENT());
+    const int* uExt = inInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_EXTENT());
     // if 3D
     if (uExt[0] < uExt[1] && uExt[2] < uExt[3] && uExt[4] < uExt[5])
     {
@@ -215,7 +215,7 @@ int vtkContourFilter::RequestUpdateExtent(
   // handle 3D SGrids
   if (vtkStructuredGrid::SafeDownCast(input) && sType != VTK_BIT)
   {
-    int* uExt = inInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_EXTENT());
+    const int* uExt = inInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_EXTENT());
     // if 3D
     if (uExt[0] < uExt[1] && uExt[2] < uExt[3] && uExt[4] < uExt[5])
     {
@@ -268,7 +268,7 @@ int vtkContourFilter::RequestData(
   if (vtkImageData::SafeDownCast(input) && sType != VTK_BIT && (!uG || uG->GetDataDimension() == 3))
   {
     int dim = 3;
-    int* uExt = inInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_EXTENT());
+    const int* uExt = inInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_EXTENT());
     if (uExt[0] == uExt[1])
     {
       --dim;
@@ -330,11 +330,6 @@ int vtkContourFilter::RequestData(
         this->SynchronizedTemplates3D->SetInputArrayToProcess(0, this->GetInputArrayInformation(0));
         retVal = this->SynchronizedTemplates3D->ProcessRequest(request, inputVector, outputVector);
       }
-      output = vtkPolyData::GetData(outputVector);
-      if (output->GetCellGhostArray())
-      {
-        output->RemoveGhostCells();
-      }
       return retVal;
     }
   } // if image data
@@ -342,7 +337,7 @@ int vtkContourFilter::RequestData(
   // handle 3D RGrids
   if (vtkRectilinearGrid::SafeDownCast(input) && sType != VTK_BIT)
   {
-    int* uExt = inInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_EXTENT());
+    const int* uExt = inInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_EXTENT());
     // if 3D
     if (uExt[0] < uExt[1] && uExt[2] < uExt[3] && uExt[4] < uExt[5])
     {
@@ -363,7 +358,7 @@ int vtkContourFilter::RequestData(
   // handle 3D SGrids
   if (vtkStructuredGrid::SafeDownCast(input) && sType != VTK_BIT)
   {
-    int* uExt = inInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_EXTENT());
+    const int* uExt = inInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_EXTENT());
     // if 3D
     if (uExt[0] < uExt[1] && uExt[2] < uExt[3] && uExt[4] < uExt[5])
     {
@@ -585,9 +580,9 @@ int vtkContourFilter::RequestData(
           {
             helper.Contour(cell, values[i], cellScalars, cellId);
           } // for all contour values
-        }   // for all cells
-      }     // for all dimensions
-    }       // if using scalar tree
+        } // for all cells
+      } // for all dimensions
+    } // if using scalar tree
     else
     {
       if (this->ScalarTree == nullptr)
@@ -623,8 +618,8 @@ int vtkContourFilter::RequestData(
           progressCounter++;
           helper.Contour(cell, values[i], cellScalars, cellId);
         } // for all cells
-      }   // for all contour values
-    }     // using scalar tree
+      } // for all contour values
+    } // using scalar tree
 
     vtkDebugMacro(<< "Created: " << newPts->GetNumberOfPoints() << " points, "
                   << newVerts->GetNumberOfCells() << " verts, " << newLines->GetNumberOfCells()

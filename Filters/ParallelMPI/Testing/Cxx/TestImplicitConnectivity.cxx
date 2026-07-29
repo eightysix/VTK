@@ -106,7 +106,7 @@ void AddNodeCenteredXYZField(vtkMultiBlockDataSet* mbds)
 // Generates a distributed multi-block dataset, each grid is added using
 // round-robin assignment.
 vtkMultiBlockDataSet* GetDataSet(
-  const int numPartitions, double origin[3], double h[3], int wholeExtent[6])
+  const int numPartitions, double origin[3], double h[3], VTK_FUTURE_CONST int wholeExtent[6])
 {
 
   int dims[3];
@@ -174,7 +174,7 @@ vtkMultiBlockDataSet* GetDataSet(
     {
       mbds->SetBlock(block, nullptr);
     } // END else we don't own the block
-  }   // END for all blocks
+  } // END for all blocks
 
   wholeStructuredGrid->Delete();
   gridPartitioner->Delete();
@@ -195,7 +195,7 @@ double exponential_distribution(const int i, const double beta)
 }
 
 //------------------------------------------------------------------------------
-void GenerateRectGrid(vtkRectilinearGrid* grid, int ext[6], double origin[3])
+void GenerateRectGrid(vtkRectilinearGrid* grid, VTK_FUTURE_CONST int ext[6], double origin[3])
 {
   grid->Initialize();
   grid->SetExtent(ext);
@@ -224,7 +224,7 @@ void GenerateRectGrid(vtkRectilinearGrid* grid, int ext[6], double origin[3])
       coords[i]->SetTuple(j, &val);
       prev = val;
     } // END for all points along this dimension
-  }   // END for all dimensions
+  } // END for all dimensions
 
   grid->SetXCoordinates(coords[0]);
   grid->SetYCoordinates(coords[1]);
@@ -239,7 +239,7 @@ void GenerateRectGrid(vtkRectilinearGrid* grid, int ext[6], double origin[3])
 // Generates a distributed multi-block dataset, each grid is added using
 // round-robin assignment.
 vtkMultiBlockDataSet* GetRectGridDataSet(
-  const int numPartitions, double origin[3], int wholeExtent[6])
+  const int numPartitions, double origin[3], VTK_FUTURE_CONST int wholeExtent[6])
 {
   int dims[3];
   int desc = vtkStructuredData::GetDataDescriptionFromExtent(wholeExtent);
@@ -301,7 +301,7 @@ vtkMultiBlockDataSet* GetRectGridDataSet(
     {
       mbds->SetBlock(block, nullptr);
     } // END else we don't own the block
-  }   // END for all blocks
+  } // END for all blocks
 
   wholeGrid->Delete();
   gridPartitioner->Delete();
@@ -334,7 +334,7 @@ void RegisterRectGrid(vtkMultiBlockDataSet* mbds, vtkStructuredImplicitConnectiv
         grid->GetXCoordinates(), grid->GetYCoordinates(), grid->GetZCoordinates(),
         grid->GetPointData());
     } // END if block belongs to this process
-  }   // END for all blocks
+  } // END for all blocks
 }
 
 //------------------------------------------------------------------------------
@@ -354,7 +354,7 @@ void RegisterGrid(vtkMultiBlockDataSet* mbds, vtkStructuredImplicitConnectivity*
       connectivity->RegisterGrid(
         block, info->Get(vtkDataObject::PIECE_EXTENT()), grid->GetPoints(), grid->GetPointData());
     } // END if block belongs to this process
-  }   // END for all blocks
+  } // END for all blocks
 }
 
 //------------------------------------------------------------------------------

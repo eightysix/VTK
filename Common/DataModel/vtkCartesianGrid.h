@@ -16,7 +16,6 @@
 
 #include "vtkCommonDataModelModule.h" // For export macro
 #include "vtkDataSet.h"
-#include "vtkDeprecation.h"    // For VTK_DEPRECATED_IN_9_6_0()
 #include "vtkStructuredData.h" // For inline methods
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -114,18 +113,13 @@ public:
    */
   vtkStructuredCellArray* GetCells();
 
-  ///@{
   /**
    * Get the array of all cell types in the image data. Each single-component
    * integer value is the same. The array is of size GetNumberOfCells().
    *
    * NOTE: the returned object should not be modified.
    */
-  using vtkDataSet::GetCellTypes; // VTK_DEPRECATED_IN_9_6_0
   vtkConstantArray<unsigned char>* GetCellTypes();
-  VTK_DEPRECATED_IN_9_6_0("Use vtkConstantArray<unsigned char>* GetCellTypes() instead")
-  vtkConstantArray<int>* GetCellTypesArray();
-  ///@}
 
   /**
    * Given the node dimensions of this grid instance, this method computes the
@@ -228,7 +222,7 @@ public:
    * (Extent[0],Extent[2],Extent[4]). As for any dataset, a data array on point
    * data starts at Id=0.
    */
-  void SetExtent(int extent[6]);
+  void SetExtent(VTK_FUTURE_CONST int extent[6]);
   void SetExtent(int xMin, int xMax, int yMin, int yMax, int zMin, int zMax);
   vtkGetVector6Macro(Extent, int);
   ///@}
@@ -262,8 +256,8 @@ public:
    * Given a data array and a coordinate, return the index of the tuple in the
    * array corresponding to that coordinate.
    */
-  vtkIdType GetTupleIndexForExtent(vtkDataArray* array, int extent[6]);
-  vtkIdType GetTupleIndex(vtkDataArray* array, int coordinates[3]);
+  vtkIdType GetTupleIndexForExtent(vtkDataArray* array, VTK_FUTURE_CONST int extent[6]);
+  vtkIdType GetTupleIndex(vtkDataArray* array, VTK_FUTURE_CONST int coordinates[3]);
   vtkIdType GetTupleIndex(vtkDataArray* array, int x, int y, int z);
   ///@}
 
@@ -272,8 +266,8 @@ public:
    * Given a data array and a coordinate, return the index of the value in the
    * array corresponding to that coordinate, considering the number of components.
    */
-  vtkIdType GetValueIndexForExtent(vtkDataArray* array, int extent[6]);
-  vtkIdType GetValueIndex(vtkDataArray* array, int coordinates[3]);
+  vtkIdType GetValueIndexForExtent(vtkDataArray* array, VTK_FUTURE_CONST int extent[6]);
+  vtkIdType GetValueIndex(vtkDataArray* array, VTK_FUTURE_CONST int coordinates[3]);
   vtkIdType GetValueIndex(vtkDataArray* array, int x, int y, int z);
   ///@}
 
@@ -317,7 +311,6 @@ private:
   vtkSmartPointer<vtkPoints> StructuredPoints;
   vtkSmartPointer<vtkStructuredCellArray> StructuredCells;
   vtkSmartPointer<vtkConstantArray<unsigned char>> StructuredCellTypes;
-  vtkSmartPointer<vtkConstantArray<int>> LegacyStructuredCellTypes; // VTK_DEPRECATED_IN_9_6_0
 };
 
 //----------------------------------------------------------------------------

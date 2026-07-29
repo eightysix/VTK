@@ -188,8 +188,8 @@ bool CheckNodeFieldsForGrid(vtkStructuredGrid* grid)
       {
         return false;
       } // END if fuzzy-compare
-    }   // END for all components
-  }     // END for all nodes
+    } // END for all components
+  } // END for all nodes
   return true;
 }
 
@@ -241,8 +241,8 @@ bool CheckCellFieldsForGrid(vtkStructuredGrid* grid)
         nodeIds->Delete();
         return false;
       } // END if fuzz-compare
-    }   // END for all components
-  }     // END for all cells
+    } // END for all components
+  } // END for all cells
   nodeIds->Delete();
   return true;
 }
@@ -294,11 +294,11 @@ bool ProcessOwnsBlock(const int block)
 
 //------------------------------------------------------------------------------
 vtkMultiBlockDataSet* GetDataSet(
-  int WholeExtent[6], double origin[3], double spacing[3], const int numPartitions)
+  VTK_FUTURE_CONST int wholeExtent[6], double origin[3], double spacing[3], const int numPartitions)
 {
   // STEP 0: Get the global grid dimensions
   int dims[3];
-  vtkStructuredData::GetDimensionsFromExtent(WholeExtent, dims);
+  vtkStructuredData::GetDimensionsFromExtent(wholeExtent, dims);
 
   // STEP 1: Get the whole grid as a uniform grid instance
   vtkUniformGrid* wholeGrid = vtkUniformGrid::New();
@@ -361,7 +361,7 @@ vtkMultiBlockDataSet* GetDataSet(
     {
       mbds->SetBlock(block, nullptr);
     } // END else we don't own the block
-  }   // END for all blocks
+  } // END for all blocks
 
   wholeStructuredGrid->Delete();
   gridPartitioner->Delete();

@@ -20,9 +20,7 @@
 #include "vtkRenderingOpenGL2Module.h" // For export macro
 #include "vtkSmartPointer.h"           // For vtkSmartPointer
 #include "vtkWrappingHints.h"          // For VTK_MARSHALAUTO
-#include <memory>                      // for unique_ptr
 #include <string>                      // Ivars
-#include <vector>                      // STL Header
 
 VTK_ABI_NAMESPACE_BEGIN
 class vtkFloatArray;
@@ -40,6 +38,8 @@ class vtkPolyData;
 class vtkTexturedActor2D;
 class vtkPolyDataMapper2D;
 class vtkOverrideAttribute;
+class vtkCameraPass;
+class vtkHexagonalBokehBlurPass;
 
 class VTKRENDERINGOPENGL2_EXPORT VTK_MARSHALAUTO vtkOpenGLRenderer : public vtkRenderer
 {
@@ -264,6 +264,12 @@ protected:
 private:
   vtkOpenGLRenderer(const vtkOpenGLRenderer&) = delete;
   void operator=(const vtkOpenGLRenderer&) = delete;
+
+  /**
+   * Render pass used for background blur.
+   * This pass is only used when `SkyboxBlurEnabled` is true.
+   */
+  vtkSmartPointer<vtkHexagonalBokehBlurPass> BackgroundPass;
 };
 
 #define vtkOpenGLRenderer_OVERRIDE_ATTRIBUTES vtkOpenGLRenderer::CreateOverrideAttributes()
