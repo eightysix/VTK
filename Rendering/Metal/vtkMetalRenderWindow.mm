@@ -54,16 +54,17 @@ bool vtkMetalRenderWindow::InitializeMetal()
       return false;
     }
     // MTLCreateSystemDefaultDevice returns +1 (Create rule); member owns it directly.
-    this->MetalDevice = (__bridge void*)device;
+    this->MetalDevice = (void*)device;
 
     id<MTLCommandQueue> queue = [device newCommandQueue];
     if (!queue)
     {
       vtkErrorMacro(<< "Failed to create Metal command queue");
+      [device release];
+      this->MetalDevice = nullptr;
       return false;
     }
-    // newCommandQueue returns +1 (new rule); member owns it directly.
-    this->MetalQueue = (__bridge void*)queue;
+    this->MetalQueue = (void*)queue;
   }
 
   this->Initialized = true;
@@ -81,7 +82,7 @@ void vtkMetalRenderWindow::CreateMetalLayer()
   @autoreleasepool
   {
     CAMetalLayer* layer = [CAMetalLayer layer];
-    layer.device = (__bridge id<MTLDevice>)this->MetalDevice;
+    layer.device = (id<MTLDevice>)this->MetalDevice;
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     layer.framebufferOnly = YES;
     layer.opaque = NO;
@@ -95,8 +96,8 @@ void vtkMetalRenderWindow::CreateMetalLayer()
     CGFloat h = (this->Size[1] > 0) ? this->Size[1] : 300;
     layer.drawableSize = CGSizeMake(w, h);
 
-    this->MetalLayer = (__bridge void*)layer;
-    CFRetain((__bridge CFTypeRef)layer);
+    this->MetalLayer = (void*)layer;
+    CFRetain((CFTypeRef)layer);
   }
 }
 
@@ -125,19 +126,19 @@ void vtkMetalRenderWindow::Finalize()
 
   if (this->RenderCompletionCallback)
   {
-    [(__bridge id)this->RenderCompletionCallback release];
+    [(id)this->RenderCompletionCallback release];
     this->RenderCompletionCallback = nullptr;
   }
 
   if (this->DepthTexture)
   {
-    [(__bridge id)this->DepthTexture release];
+    [(id)this->DepthTexture release];
     this->DepthTexture = nullptr;
   }
 
   if (this->IdsTexture)
   {
-    [(__bridge id)this->IdsTexture release];
+    [(id)this->IdsTexture release];
     this->IdsTexture = nullptr;
   }
 
@@ -145,19 +146,19 @@ void vtkMetalRenderWindow::Finalize()
 
   if (this->MetalLayer)
   {
-    [(__bridge id)this->MetalLayer release];
+    [(id)this->MetalLayer release];
     this->MetalLayer = nullptr;
   }
 
   if (this->MetalQueue)
   {
-    [(__bridge id)this->MetalQueue release];
+    [(id)this->MetalQueue release];
     this->MetalQueue = nullptr;
   }
 
   if (this->MetalDevice)
   {
-    [(__bridge id)this->MetalDevice release];
+    [(id)this->MetalDevice release];
     this->MetalDevice = nullptr;
   }
 
@@ -183,7 +184,7 @@ bool vtkMetalRenderWindow::AcquireDrawable()
 
   @autoreleasepool
   {
-    CAMetalLayer* layer = (__bridge CAMetalLayer*)this->MetalLayer;
+    CAMetalLayer* layer = (CAMetalLayer*)this->MetalLayer;
     if (!layer)
     {
       return false;
@@ -194,8 +195,8 @@ bool vtkMetalRenderWindow::AcquireDrawable()
     {
       return false;
     }
-    this->CurrentDrawable = (__bridge void*)drawable;
-    CFRetain((__bridge CFTypeRef)drawable);
+    this->CurrentDrawable = (void*)drawable;
+    CFRetain((CFTypeRef)drawable);
   }
   return true;
 }
@@ -205,7 +206,7 @@ void vtkMetalRenderWindow::ReleaseDrawable()
 {
   if (this->CurrentDrawable)
   {
-    [(__bridge id)this->CurrentDrawable release];
+    [(id)this->CurrentDrawable release];
     this->CurrentDrawable = nullptr;
   }
 }
@@ -215,13 +216,13 @@ void vtkMetalRenderWindow::RecreateDepthTexture()
 {
   if (this->DepthTexture)
   {
-    [(__bridge id)this->DepthTexture release];
+    [(id)this->DepthTexture release];
     this->DepthTexture = nullptr;
   }
 
   @autoreleasepool
   {
-    id<MTLDevice> device = (__bridge id<MTLDevice>)this->MetalDevice;
+    id<MTLDevice> device = (id<MTLDevice>)this->MetalDevice;
     MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
                                                                                    width:this->Size[0]
                                                                                   height:this->Size[1]
@@ -233,7 +234,7 @@ void vtkMetalRenderWindow::RecreateDepthTexture()
 
     // newTextureWithDescriptor returns +1 (new rule); member owns it directly.
     id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
-    this->DepthTexture = (__bridge void*)tex;
+    this->DepthTexture = (void*)tex;
   }
 }
 
@@ -242,13 +243,13 @@ void vtkMetalRenderWindow::RecreateIdsTexture()
 {
   if (this->IdsTexture)
   {
-    [(__bridge id)this->IdsTexture release];
+    [(id)this->IdsTexture release];
     this->IdsTexture = nullptr;
   }
 
   @autoreleasepool
   {
-    id<MTLDevice> device = (__bridge id<MTLDevice>)this->MetalDevice;
+    id<MTLDevice> device = (id<MTLDevice>)this->MetalDevice;
     MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Uint
                                                                                     width:this->Size[0]
                                                                                    height:this->Size[1]
@@ -258,7 +259,7 @@ void vtkMetalRenderWindow::RecreateIdsTexture()
 
     // newTextureWithDescriptor returns +1 (new rule); member owns it directly.
     id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
-    this->IdsTexture = (__bridge void*)tex;
+    this->IdsTexture = (void*)tex;
   }
 }
 
@@ -279,7 +280,7 @@ void vtkMetalRenderWindow::CreateMultisampleAttachments()
 
   @autoreleasepool
   {
-    id<MTLDevice> device = (__bridge id<MTLDevice>)this->MetalDevice;
+    id<MTLDevice> device = (id<MTLDevice>)this->MetalDevice;
     if (!device)
     {
       return;
@@ -301,7 +302,7 @@ void vtkMetalRenderWindow::CreateMultisampleAttachments()
       [desc release];
       if (tex)
       {
-        this->MultisampleColorTexture = (__bridge void*)tex;
+        this->MultisampleColorTexture = (void*)tex;
       }
     }
 
@@ -321,7 +322,7 @@ void vtkMetalRenderWindow::CreateMultisampleAttachments()
       [desc release];
       if (tex)
       {
-        this->MultisampleDepthTexture = (__bridge void*)tex;
+        this->MultisampleDepthTexture = (void*)tex;
       }
     }
   }
@@ -332,12 +333,12 @@ void vtkMetalRenderWindow::DestroyMultisampleAttachments()
 {
   if (this->MultisampleColorTexture)
   {
-    [(__bridge id)this->MultisampleColorTexture release];
+    [(id)this->MultisampleColorTexture release];
     this->MultisampleColorTexture = nullptr;
   }
   if (this->MultisampleDepthTexture)
   {
-    [(__bridge id)this->MultisampleDepthTexture release];
+    [(id)this->MultisampleDepthTexture release];
     this->MultisampleDepthTexture = nullptr;
   }
 }
@@ -354,14 +355,14 @@ void vtkMetalRenderWindow::Render()
   {
     @autoreleasepool
     {
-      id<MTLTexture> depthTex = (__bridge id<MTLTexture>)this->DepthTexture;
+      id<MTLTexture> depthTex = (id<MTLTexture>)this->DepthTexture;
       if (!depthTex || depthTex.width != (NSUInteger)this->Size[0] ||
           depthTex.height != (NSUInteger)this->Size[1])
       {
         this->RecreateDepthTexture();
       }
 
-      id<MTLTexture> idsTex = (__bridge id<MTLTexture>)this->IdsTexture;
+      id<MTLTexture> idsTex = (id<MTLTexture>)this->IdsTexture;
       if (!idsTex || idsTex.width != (NSUInteger)this->Size[0] ||
           idsTex.height != (NSUInteger)this->Size[1])
       {
@@ -370,7 +371,7 @@ void vtkMetalRenderWindow::Render()
 
       // Recreate multisample attachments when size or sample count changes
       int effectiveSamples = this->GetEffectiveSampleCount();
-      id<MTLTexture> msaaColorTex = (__bridge id<MTLTexture>)this->MultisampleColorTexture;
+      id<MTLTexture> msaaColorTex = (id<MTLTexture>)this->MultisampleColorTexture;
       bool needsMSAACreation = (effectiveSamples > 1) &&
         (!msaaColorTex || msaaColorTex.width != (NSUInteger)this->Size[0] ||
          msaaColorTex.height != (NSUInteger)this->Size[1] ||
@@ -458,12 +459,12 @@ void vtkMetalRenderWindow::SetRenderCompletionCallback(VTKRenderCompletionBlock 
 {
   if (this->RenderCompletionCallback)
   {
-    [(__bridge id)this->RenderCompletionCallback release];
+    [(id)this->RenderCompletionCallback release];
     this->RenderCompletionCallback = nullptr;
   }
   if (block)
   {
-    this->RenderCompletionCallback = (__bridge void*)[block copy];
+    this->RenderCompletionCallback = (void*)[block copy];
   }
 }
 
@@ -472,8 +473,8 @@ void* vtkMetalRenderWindow::GetCurrentDrawableTexture()
 {
   if (this->CurrentDrawable)
   {
-    id<CAMetalDrawable> drawable = (__bridge id<CAMetalDrawable>)this->CurrentDrawable;
-    return (__bridge void*)drawable.texture;
+    id<CAMetalDrawable> drawable = (id<CAMetalDrawable>)this->CurrentDrawable;
+    return (void*)drawable.texture;
   }
   return nullptr;
 }
@@ -493,7 +494,7 @@ void vtkMetalRenderWindow::SetSize(int width, int height)
 
     @autoreleasepool
     {
-      CAMetalLayer* layer = (__bridge CAMetalLayer*)this->MetalLayer;
+      CAMetalLayer* layer = (CAMetalLayer*)this->MetalLayer;
       if (layer)
       {
         layer.drawableSize = CGSizeMake(width, height);
@@ -515,7 +516,7 @@ void vtkMetalRenderWindow::WaitForCompletion()
 {
   @autoreleasepool
   {
-    id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>)this->CommandBuffer;
+    id<MTLCommandBuffer> buf = (id<MTLCommandBuffer>)this->CommandBuffer;
     if (buf)
     {
       [buf waitUntilCompleted];
@@ -534,7 +535,7 @@ void vtkMetalRenderWindow::GetIdsData(int x1, int y1, int x2, int y2,
 
   @autoreleasepool
   {
-    id<MTLTexture> idsTex = (__bridge id<MTLTexture>)this->IdsTexture;
+    id<MTLTexture> idsTex = (id<MTLTexture>)this->IdsTexture;
 
     // Clamp to texture bounds
     int texW = static_cast<int>(idsTex.width);
