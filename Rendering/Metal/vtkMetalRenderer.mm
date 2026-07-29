@@ -85,7 +85,7 @@ void vtkMetalRenderer::Clear()
 bool vtkMetalRenderer::HasTranslucentPolygonalGeometry()
 {
   // Check if any visible prop has translucent geometry
-  for (int i = 0; i < this->PropArrayCount; i++)
+  for (int i = 0; i < static_cast<int>(this->PropArray.size()); i++)
   {
     if (this->PropArray[i]->GetVisibility() &&
         this->PropArray[i]->HasTranslucentPolygonalGeometry())
@@ -406,7 +406,7 @@ void vtkMetalRenderer::DeviceRender()
       metalViewport.zfar = 1.0;
       [encoder setViewport:metalViewport];
 
-      for (int i = 0; i < this->PropArrayCount; i++)
+      for (int i = 0; i < static_cast<int>(this->PropArray.size()); i++)
       {
         this->NumberOfPropsRendered +=
           this->PropArray[i]->RenderVolumetricGeometry(this);
