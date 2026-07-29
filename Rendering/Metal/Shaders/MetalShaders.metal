@@ -1385,6 +1385,31 @@ inline float volume_random(float2 st) {
   // For a regular sampling grid this shifts the grid phase smoothly across
   // the screen, which breaks banding *without* adding white‑noise grain —
   // usually the most pleasing look for single‑sample (no‑TAA) volume rendering.
+  //
+  // OpenGL equivalent (vtkOpenGLGPUVolumeRayCastMapper): samples a pre-filled
+  // tiled noise texture (in_noiseSampler bound from win->GetNoiseTextureUnit())
+  // via fragment_coord / texture_size.  A tiled field avoids the directional
+  // correlation and GPU precision drift of a sin-based hash.  IGN matches the
+  // quality of a texture at zero asset cost.
+  //
+  // To match GL exactly, replace this function with a tiled noise texture:
+  //
+  //   constexpr sampler sNoise(filter::nearest, address::repeat);
+  //   inline float sampleJitterNoise(texture2d<float> t, float2 st) {
+  //     float2 uv = st / float2(t.get_width(), t.get_height());
+  //     return t.sample(sNoise, uv, level(0)).r;
+  //   }
+  //
+  // Shader side: add noiseTexture [[texture(9)]] to the three volume fragment
+  // entry points and pass to marchVolume. Replace the sample sites:
+  //   marchVolume:    sampleJitterNoise(noiseTexture, screenPos)
+  //   grid traversal: sampleJitterNoise(noiseTexture, in.position.xy)
+  // Then delete this function.
+  //
+  // .mm side: create 128×128 R16Unorm in SetupPipeline (deterministic mt19937,
+  // seed 0xC0FFEE), bind at index 9 in BindEncoderResources and
+  // BindFullscreenTextures, release in ReleaseGraphicsResources. Provide a 1×1
+  // fallback (0.5) so nil binds never occur.
   return fract(52.9829189 * fract(dot(st, float2(0.06711056, 0.00583715))));
 }
 
