@@ -12,4 +12,5 @@
 - (void)activateScrollSlicesMode:(id)sender;
 - (void)activateWindowLevelMode:(id)sender;
 - (void)resetCamera:(id)sender;
+- (void)toggleDynamicSampleRate:(id)sender;
 @end

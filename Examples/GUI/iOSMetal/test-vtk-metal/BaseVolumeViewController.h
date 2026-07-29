@@ -15,4 +15,9 @@ class vtkVolumeProperty;
 - (IBAction)increaseSampleDistance:(nullable id)sender;
 - (IBAction)decreaseSampleDistance:(nullable id)sender;
 
+@property (nonatomic, assign, getter=isDynamicSampleRateAdjustmentEnabled) BOOL dynamicSampleRateAdjustmentEnabled;
+
+- (void)interactionDidStart;
+- (void)interactionDidEnd;
+
 @end

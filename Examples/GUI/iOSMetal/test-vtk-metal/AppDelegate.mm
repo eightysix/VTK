@@ -1,4 +1,5 @@
 #import "AppDelegate.h"
+#import "BaseVolumeViewController.h"
 #import "ViewController.h"
 #import "DICOMVolumeViewController.h"
 #import "FileVolumeViewController.h"
@@ -78,6 +79,23 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
                              [vc isKindOfClass:[NIFTIVolumeViewController class]];
       if (!isDICOMorNIFTI)
         command.attributes = UIMenuElementAttributesDisabled;
+    }
+    return;
+  }
+
+  if (cmdAction == @selector(toggleDynamicSampleRate:))
+  {
+    VTKMetalBaseViewController* vc = [self findMetalViewController];
+    if ([vc isKindOfClass:[BaseVolumeViewController class]])
+    {
+      BaseVolumeViewController* bvc = (BaseVolumeViewController*)vc;
+      command.state = bvc.isDynamicSampleRateAdjustmentEnabled
+        ? UIMenuElementStateOn : UIMenuElementStateOff;
+    }
+    else
+    {
+      command.attributes = UIMenuElementAttributesDisabled;
+      command.state = UIMenuElementStateOn;
     }
   }
 }
@@ -214,9 +232,16 @@ didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
   decSampleCmd.title = @"Decrease Sample Distance";
   decSampleCmd.discoverabilityTitle = @"Decrease sample distance by 0.5";
 
+  UIKeyCommand* dynSampleCmd = [UIKeyCommand
+                                keyCommandWithInput:@"y"
+                                modifierFlags:UIKeyModifierCommand | UIKeyModifierAlternate
+                                action:@selector(toggleDynamicSampleRate:)];
+  dynSampleCmd.title = @"Toggle Dynamic Sample Rate";
+  dynSampleCmd.discoverabilityTitle = @"Toggle automatic sample rate adjustment during interaction";
+
   UIMenu* renderingMenu = [UIMenu
                            menuWithTitle:@"Rendering"
-                           children:@[ nextPresetCmd, prevPresetCmd, benchmarkCmd, incSampleCmd, decSampleCmd ]];
+                           children:@[ nextPresetCmd, prevPresetCmd, benchmarkCmd, dynSampleCmd, incSampleCmd, decSampleCmd ]];
 
   // File submenu
   UIKeyCommand* loadFileCmd = [UIKeyCommand
@@ -332,6 +357,17 @@ didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
 - (void)resetCamera:(id)sender
 {
   [[self findMetalViewController] resetCamera];
+}
+
+- (void)toggleDynamicSampleRate:(id)sender
+{
+  VTKMetalBaseViewController* vc = [self findMetalViewController];
+  if ([vc respondsToSelector:@selector(isDynamicSampleRateAdjustmentEnabled)])
+  {
+    BaseVolumeViewController* bvc = (BaseVolumeViewController*)vc;
+    bvc.dynamicSampleRateAdjustmentEnabled = !bvc.isDynamicSampleRateAdjustmentEnabled;
+    [UIMenuSystem.mainSystem setNeedsRebuild];
+  }
 }
 
 - (void)updateInteractionModeMenu

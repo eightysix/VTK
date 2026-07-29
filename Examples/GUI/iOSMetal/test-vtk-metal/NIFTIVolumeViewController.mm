@@ -160,14 +160,30 @@
 
 - (void)handleWindowLevelPan:(UIPanGestureRecognizer*)recognizer
 {
-  if (recognizer.state != UIGestureRecognizerStateChanged) return;
+  switch (recognizer.state)
+  {
+    case UIGestureRecognizerStateBegan:
+      [self interactionDidStart];
+      return;
+    case UIGestureRecognizerStateChanged:
+    {
+      const double kScale = 0.5;
+      CGPoint t = [recognizer translationInView:recognizer.view];
+      double dW = t.x * kScale;
+      double dL = -t.y * kScale;
+      [self applyWindowLevelWithWidth:_windowWidth + dW level:_windowLevel + dL];
+      [recognizer setTranslation:CGPointZero inView:recognizer.view];
+      break;
+    }
+    case UIGestureRecognizerStateEnded:
+    case UIGestureRecognizerStateCancelled:
+      [self interactionDidEnd];
+      return;
+    default:
+      return;
+  }
 
-  const double kScale = 0.5;
-  CGPoint t = [recognizer translationInView:recognizer.view];
-  double dW = t.x * kScale;
-  double dL = -t.y * kScale;
-  [self applyWindowLevelWithWidth:_windowWidth + dW level:_windowLevel + dL];
-  [recognizer setTranslation:CGPointZero inView:recognizer.view];
+  static_cast<vtkIOSMetalRenderWindow*>([self renderWindow])->Render();
 }
 
 #pragma mark - Clipping Plane (Scroll Slices)
@@ -200,6 +216,7 @@
   switch (recognizer.state)
   {
     case UIGestureRecognizerStateBegan:
+      [self interactionDidStart];
       [self prepareVRClippingPlaneWithCamera:cam];
       break;
     case UIGestureRecognizerStateChanged:
@@ -209,6 +226,10 @@
       [recognizer setTranslation:CGPointZero inView:recognizer.view];
       break;
     }
+    case UIGestureRecognizerStateEnded:
+    case UIGestureRecognizerStateCancelled:
+      [self interactionDidEnd];
+      break;
     default:
       break;
   }

@@ -12,9 +12,25 @@
     vtkSmartPointer<vtkMetalGPUVolumeRayCastMapper> _mapper;
     vtkSmartPointer<vtkVolumeProperty> _property;
 }
+- (void)setHigherVolumeRenderingSampleRate:(BOOL)on;
+@end
+
+@interface VTKMetalBaseViewController (OverrideSupport)
+- (void)handlePinch:(UIPinchGestureRecognizer*)recognizer;
+- (void)handlePan:(UIPanGestureRecognizer*)recognizer;
+- (void)handleRotation:(UIRotationGestureRecognizer*)recognizer;
 @end
 
 @implementation BaseVolumeViewController
+
+- (instancetype)init
+{
+    self = [super init];
+    if (self) {
+        _dynamicSampleRateAdjustmentEnabled = YES;
+    }
+    return self;
+}
 
 - (vtkVolume *)volume { return _volume; }
 - (vtkMetalGPUVolumeRayCastMapper *)mapper { return _mapper; }
@@ -54,6 +70,63 @@
     _mapper->SetSampleDistance(newSd);
     NSLog(@"Sample distance decreased to %.1f", newSd);
     static_cast<vtkRenderWindow*>([self renderWindow])->Render();
+}
+
+#pragma mark - Interaction sample rate
+
+- (void)setHigherVolumeRenderingSampleRate:(BOOL)on
+{
+    float sd = on ? 0.5f : 4.0f;
+    _mapper->AutoAdjustSampleDistancesOff();
+    _mapper->SetSampleDistance(sd);
+    static_cast<vtkRenderWindow*>([self renderWindow])->Render();
+}
+
+- (void)interactionDidStart
+{
+    if (!_dynamicSampleRateAdjustmentEnabled) return;
+    [self setHigherVolumeRenderingSampleRate:NO];
+}
+
+- (void)interactionDidEnd
+{
+    if (!_dynamicSampleRateAdjustmentEnabled) return;
+    [self setHigherVolumeRenderingSampleRate:YES];
+}
+
+#pragma mark - Gesture recognizer overrides
+
+- (void)handlePinch:(UIPinchGestureRecognizer*)recognizer
+{
+    if (recognizer.state == UIGestureRecognizerStateBegan) {
+        [self interactionDidStart];
+    } else if (recognizer.state == UIGestureRecognizerStateEnded ||
+               recognizer.state == UIGestureRecognizerStateCancelled) {
+        [self interactionDidEnd];
+    }
+    [super handlePinch:recognizer];
+}
+
+- (void)handlePan:(UIPanGestureRecognizer*)recognizer
+{
+    if (recognizer.state == UIGestureRecognizerStateBegan) {
+        [self interactionDidStart];
+    } else if (recognizer.state == UIGestureRecognizerStateEnded ||
+               recognizer.state == UIGestureRecognizerStateCancelled) {
+        [self interactionDidEnd];
+    }
+    [super handlePan:recognizer];
+}
+
+- (void)handleRotation:(UIRotationGestureRecognizer*)recognizer
+{
+    if (recognizer.state == UIGestureRecognizerStateBegan) {
+        [self interactionDidStart];
+    } else if (recognizer.state == UIGestureRecognizerStateEnded ||
+               recognizer.state == UIGestureRecognizerStateCancelled) {
+        [self interactionDidEnd];
+    }
+    [super handleRotation:recognizer];
 }
 
 @end
