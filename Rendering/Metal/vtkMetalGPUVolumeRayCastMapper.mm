@@ -821,12 +821,18 @@ struct NormalComputeUniforms
   float scalarScale;
   float scalarBias;
   float gradNormFactor;
+  float invBoundsX, invBoundsY, invBoundsZ;
 };
+
+static_assert(sizeof(NormalComputeUniforms) == 48,
+  "NormalComputeUniforms must match Metal struct (48 bytes)");
 
 static NormalComputeUniforms MakeNormalComputeUniforms(
   const int dims[3],
   const double scalarRange[2],
-  float normalizationFactor)
+  float normalizationFactor,
+  const double boundsSize[3],
+  double avgSpacing)
 {
   NormalComputeUniforms u{};
 
@@ -834,6 +840,10 @@ static NormalComputeUniforms MakeNormalComputeUniforms(
   if (range <= 0.0)
   {
     range = 1.0;
+  }
+  if (avgSpacing < 1e-10)
+  {
+    avgSpacing = 1.0;
   }
 
   u.dimX = static_cast<uint32_t>(dims[0]);
@@ -851,7 +861,16 @@ static NormalComputeUniforms MakeNormalComputeUniforms(
   u.scalarBias =
     -(static_cast<float>(scalarRange[0] / normalizationFactor)) * u.scalarScale;
 
-  u.gradNormFactor = static_cast<float>(range * 0.25 / normalizationFactor);
+  // Match the march-path normalization: 0.5 * range / (normFactor * avgSpacing)
+  u.gradNormFactor = static_cast<float>(
+    range * 0.5 / (normalizationFactor * avgSpacing));
+
+  double bs0 = std::max(boundsSize[0], 1e-10);
+  double bs1 = std::max(boundsSize[1], 1e-10);
+  double bs2 = std::max(boundsSize[2], 1e-10);
+  u.invBoundsX = static_cast<float>(1.0 / bs0);
+  u.invBoundsY = static_cast<float>(1.0 / bs1);
+  u.invBoundsZ = static_cast<float>(1.0 / bs2);
 
   return u;
 }
@@ -1879,8 +1898,22 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureGradientNormalTexture(
     }
 
     // Build uniforms and dispatch compute using shared helpers
+    vtkImageData* input = vtkImageData::SafeDownCast(this->GetInput());
+    VolumeBounds vb = input ? ComputeVolumeBounds(input) : VolumeBounds{};
+    if (!input)
+    {
+      for (int k = 0; k < 3; ++k)
+        vb.Size[k] = 1.0;
+    }
+    double cellSpacing[3] = {1.0, 1.0, 1.0};
+    if (input)
+    {
+      input->GetSpacing(cellSpacing);
+    }
+    double avgSpacing =
+      (fabs(cellSpacing[0]) + fabs(cellSpacing[1]) + fabs(cellSpacing[2])) / 3.0;
     NormalComputeUniforms u = MakeNormalComputeUniforms(
-      dims, this->ScalarRange, this->ScalarNormalizationFactor);
+      dims, this->ScalarRange, this->ScalarNormalizationFactor, vb.Size, avgSpacing);
 
     id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
     cmdBuf.label = @"VTK Volume Normal Compute";
@@ -4818,9 +4851,15 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     double scalarRange = this->ScalarRange[1] - this->ScalarRange[0];
     if (scalarRange <= 0.0)
       scalarRange = 1.0;
+    double cellSpacing[3];
+    input->GetSpacing(cellSpacing);
+    double avgSpacing =
+      (fabs(cellSpacing[0]) + fabs(cellSpacing[1]) + fabs(cellSpacing[2])) / 3.0;
+    if (avgSpacing < 1e-10)
+      avgSpacing = 1.0;
     uniforms.GradientOpacityMin = 0.0f;
     uniforms.GradientOpacityMax = static_cast<float>(
-      (scalarRange * 0.25) / this->ScalarNormalizationFactor);
+      (scalarRange * 0.5) / (this->ScalarNormalizationFactor * avgSpacing));
 
     // Material properties from volume property
     if (property)

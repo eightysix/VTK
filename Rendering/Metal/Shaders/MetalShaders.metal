@@ -867,7 +867,9 @@ struct NormalComputeUniforms {
     float scalarScale;
     float scalarBias;
     float gradNormFactor;
+    float invBoundsX, invBoundsY, invBoundsZ;
 };
+static_assert(sizeof(NormalComputeUniforms) == 48, "NormalComputeUniforms must be 48 bytes");
 
 // Each thread computes one voxel's gradient from 6 neighbors in the volume
 // texture (linear clamp, safe at borders) and stores encoded normal + magnitude.
@@ -893,12 +895,15 @@ kernel void volume_compute_normals(
     float sNZ = volume.sample(sVolume, pos - float3(0, 0, gs.z), level(0)).r;
 
     float3 rawGrad = float3(sPX - sNX, sPY - sNY, sPZ - sNZ);
-    float rawMag = length(rawGrad);
+    float3 dimsF = float3(float(u.dimX), float(u.dimY), float(u.dimZ));
+    float3 invBounds = float3(u.invBoundsX, u.invBoundsY, u.invBoundsZ);
+    float3 physGrad = rawGrad * dimsF * invBounds;
+    float mag = length(physGrad);
 
     // Normalize and encode to [0, 1]
-    float3 normal = rawMag > 1e-6 ? rawGrad / rawMag : float3(0.0, 0.0, 1.0);
+    float3 normal = mag > 1e-6 ? physGrad / mag : float3(0.0, 0.0, 1.0);
     float3 encoded = normal * 0.5 + 0.5;
-    float gradMagNorm = saturate(rawMag / max(u.gradNormFactor, 1e-6));
+    float gradMagNorm = saturate(mag / max(u.gradNormFactor, 1e-6));
 
     normalTex.write(float4(encoded, gradMagNorm), gid);
 }
@@ -1457,12 +1462,12 @@ inline half4 computeGradientFast(texture3d<float> volTex, float3 pos,
   half sNZ = half(volTex.sample(sVolume, pos - float3(0, 0, gradStep.z), level(0)).r);
 
   half3 rawGrad = half3(sPX - sNX, sPY - sNY, sPZ - sNZ);
-  half rawMag = length(rawGrad);
 
   half3 correctedGrad = rawGrad * gradScale;
-  half3 normal = length(correctedGrad) > 0.0h ? normalize(correctedGrad) : half3(0.0h);
+  half mag = length(correctedGrad);
+  half3 normal = mag > 0.0h ? correctedGrad / mag : half3(0.0h);
 
-  return half4(normal, saturate(rawMag / gradNormFactor));
+  return half4(normal, saturate(mag / gradNormFactor));
 }
 
 // Optimized: Pure FP16 math and fast::pow
@@ -1613,7 +1618,9 @@ inline half4 marchVolume(
   float3 invTexSizeGlobal = 1.0 / texSizeGlobal;
   float3 rayDirTexLocal = rayDir * invTexSizeGlobal;
   float3 dt = max(b.gradientStep.xyz, 1e-8);
-  half3 gradScale = half3(1.0 / (dt * texSizeGlobal));
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
+                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  half3 gradScale = half3(1.0 / (dt * texSizeGlobal * boundsSize));
 
   half3 viewDirHalf  = half3(normalize(entryPoint - cameraPos));
   half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection));
@@ -2055,7 +2062,9 @@ inline void marchSegment(
 
     // Global texture bounds are always [0,1] for the global volume texture
     float3 dt = max(b.gradientStep.xyz, 1e-8);
-    half3 gradScale = half3(1.0 / dt);
+    float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
+                          - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+    half3 gradScale = half3(1.0 / (dt * boundsSize));
 
     half3 viewDirHalf  = half3(normalize((rayOrigin + rayDir * t0) - volumeUniforms.cameraVolumePos.xyz));
     half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection));
