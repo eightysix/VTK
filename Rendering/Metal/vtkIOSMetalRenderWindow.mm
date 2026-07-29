@@ -31,7 +31,9 @@ vtkIOSMetalRenderWindow::~vtkIOSMetalRenderWindow()
   if (this->ViewId)
   {
     [this->ViewId removeFromSuperview];
+    [this->ViewId release];
     this->ViewId = nullptr;
+    this->MetalLayer = nullptr;
   }
 }
 
@@ -48,22 +50,19 @@ UIView* vtkIOSMetalRenderWindow::GetViewId()
   // Create the view on first access
   if (!this->ViewId)
   {
-    @autoreleasepool
-    {
-      CGFloat scale = [UIScreen mainScreen].nativeScale;
-      CGFloat w = (this->Size[0] > 0) ? this->Size[0] / scale : 300;
-      CGFloat h = (this->Size[1] > 0) ? this->Size[1] / scale : 300;
-      CGRect frame = CGRectMake(0, 0, w, h);
-      vtkIOSMetalView* view = [[vtkIOSMetalView alloc] initWithFrame:frame];
-      [view setOpaque:YES];
-      this->ViewId = view;
+    CGFloat scale = [UIScreen mainScreen].nativeScale;
+    CGFloat w = (this->Size[0] > 0) ? this->Size[0] / scale : 300;
+    CGFloat h = (this->Size[1] > 0) ? this->Size[1] / scale : 300;
+    CGRect frame = CGRectMake(0, 0, w, h);
+    vtkIOSMetalView* view = [[vtkIOSMetalView alloc] initWithFrame:frame];
+    [view setOpaque:YES];
+    this->ViewId = view;
 
-      CAMetalLayer* metalLayer = (CAMetalLayer*)[view layer];
-      metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-      metalLayer.contentsScale = scale;
-      metalLayer.framebufferOnly = YES;
-      this->MetalLayer = (__bridge void*)metalLayer;
-    }
+    CAMetalLayer* metalLayer = (CAMetalLayer*)[view layer];
+    metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    metalLayer.contentsScale = scale;
+    metalLayer.framebufferOnly = YES;
+    this->MetalLayer = (void*)metalLayer;
   }
   return this->ViewId;
 }
@@ -75,15 +74,12 @@ void vtkIOSMetalRenderWindow::SetSize(int width, int height)
 
   if (this->ViewId)
   {
-    @autoreleasepool
-    {
-      CGFloat scale = [UIScreen mainScreen].nativeScale;
-      CGRect frame = CGRectMake(0, 0, width / scale, height / scale);
-      [this->ViewId setFrame:frame];
+    CGFloat scale = [UIScreen mainScreen].nativeScale;
+    CGRect frame = CGRectMake(0, 0, width / scale, height / scale);
+    [this->ViewId setFrame:frame];
 
-      CAMetalLayer* layer = (CAMetalLayer*)[this->ViewId layer];
-      layer.drawableSize = CGSizeMake(width, height);
-    }
+    CAMetalLayer* layer = (CAMetalLayer*)[this->ViewId layer];
+    layer.drawableSize = CGSizeMake(width, height);
   }
 }
 
