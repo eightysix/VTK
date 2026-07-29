@@ -55,7 +55,7 @@ struct VolumeMapperUniforms
   float CameraVolumePos[4];          // 160..175
   float ViewProjectionMatrix[16];    // 176..239
   uint16_t SampleDistanceHalf;      // 240  (half precision: sufficient for [0,1] space)
-  uint16_t OpacityPreIntegrationFactorHalf; // 242  (half: sampleDistance/unitDistance for shader-side pre-integration)
+  uint16_t OpacityPreIntegrationFactorHalf; // 242  unused; pre-integration baked into TF on CPU. Kept for struct layout.
   uint16_t ScalarMinHalf;           // 244
   uint16_t _padSM;                  // 246
   uint16_t ScalarMaxHalf;           // 248
@@ -938,6 +938,10 @@ static uint8_t ColorToByte(double x)
   return static_cast<uint8_t>(std::clamp(x, 0.0, 1.0) * 255.0);
 }
 
+// Fill a RGBA8 transfer function row without opacity pre-integration.
+// Used for label-map transfer functions: binary label masks typically have
+// opacity 0 or 1, so pre-integration is a no-op. Matches OpenGL's
+// vtkOpenGLVolumeMaskTransferFunction2D::InternalUpdate which stores raw opacity.
 static void FillTransferFunctionRGBA8(
   vtkColorTransferFunction* colorFunc,
   vtkPiecewiseFunction* opacityFunc,
@@ -961,6 +965,7 @@ static void FillTransferFunctionRGBA8(
 
 // Fill a RGBA8 transfer function row with CPU-side opacity pre-integration,
 // matching the OpenGL backend's approach (vtkOpenGLVolumeOpacityTable::InternalUpdate).
+// COMPOSITE blend only; additive blend would need a *= factor instead of pow.
 // preIntegrationFactor = sampleDistance / unitDistance.
 static void FillTransferFunctionRGBA8WithPreIntegration(
   vtkColorTransferFunction* colorFunc,
@@ -2427,11 +2432,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
     {
       id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
 
-      unsigned char tfData[256 * 4];
+      std::vector<unsigned char> tfData(static_cast<size_t>(tfWidth) * 4);
       FillTransferFunctionRGBA8WithPreIntegration(
         colorFunc, opacityFunc,
         this->ScalarRange[0], this->ScalarRange[1],
-        tfWidth, tfData,
+        tfWidth, tfData.data(),
         preIntegrationFactor);
 
       id<MTLTexture> oldTfTex = (__bridge id<MTLTexture>)this->ColorOpacityTexture;
@@ -2462,7 +2467,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
       MTLRegion region = MTLRegionMake2D(0, 0, tfWidth, 1);
       [tex replaceRegion:region
             mipmapLevel:0
-              withBytes:tfData
+              withBytes:tfData.data()
             bytesPerRow:static_cast<NSUInteger>(tfWidth) * 4];
 
       this->LastTransferFunctionScalarRange[0] = this->ScalarRange[0];
@@ -4776,6 +4781,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // Opacity pre-integration is baked into the transfer function texture
   // on the CPU at TF-build time (matches OpenGL backend).
   // Set to 1.0 (no-op) in case any shader variant still reads this field.
+  // Invariant: the march step's physical length equals actualSampleDistance,
+  // enforced in-shader by physicalSampleStep, matching this pre-integration factor.
   uniforms.OpacityPreIntegrationFactorHalf = FloatToHalf(1.0f);
 
   {

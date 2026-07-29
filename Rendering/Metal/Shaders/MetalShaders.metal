@@ -1285,7 +1285,7 @@ struct VolumeMapperUniforms {
   float4 cameraVolumePos;
   float4x4 viewProjection;
   half sampleDistance;
-  half opacityPreIntegrationFactor; // stepDistance/unitDistance for shader-side opacity pre-integration
+  half opacityPreIntegrationFactor; // unused; pre-integration baked into TF on CPU. Kept for struct layout.
   half scalarMin;
   half _pdSM;             // padding — was upper half of float scalarMin
   half scalarMax;
@@ -1401,13 +1401,17 @@ inline float2 intersectBox(float3 orig, float3 dir, float3 boxMin, float3 boxMax
 // Without this, the physical step is direction-dependent (<= sampleDistance), so the
 // pre-integration factor (which assumes a full sampleDistance per step) over-accumulates
 // opacity and the volume renders less translucent than the OpenGL backend.
+// NOTE: boundsSize clamps degenerate axes to 1e-6 (matching computeVolumeBounds),
+// whereas the CPU clamps vb.Size to 1.0. This never matters in practice because
+// maxBound selects the largest axis (always >= 1). The tiny clamp on degenerate axes
+// ensures physPerNorm stays non-zero for the division.
 inline float physicalSampleStep(float3 rayDirNormSpace,
                                 constant VolumeMapperUniforms& u)
 {
   float3 boundsSize = max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
   float  maxBound   = max(boundsSize.x, max(boundsSize.y, boundsSize.z));
   float  physPerNorm = length(rayDirNormSpace * boundsSize);
-  return u.sampleDistance * maxBound / max(physPerNorm, 1e-6);
+  return float(u.sampleDistance) * maxBound / max(physPerNorm, 1e-6);
 }
 
 // Optimized: Gradient fetch with direction correction for anisotropic spacing.
