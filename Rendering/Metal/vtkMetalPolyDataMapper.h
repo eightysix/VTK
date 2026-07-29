@@ -65,10 +65,14 @@ protected:
 
   // 8D: Vertex attribute mappings (attribute name → data source)
   std::map<std::string, ExtraAttributeValue> ExtraAttributes;
+  vtkTimeStamp ExtraAttributesMTime;
 
   // 8C: Render bundle caching — pre-recorded encoder commands for static geometry
   void ReplayRenderBundle(void* mtlRenderCommandEncoder);
   void RebuildRenderBundle(void* mtlRenderCommandEncoder, vtkRenderer* ren, vtkActor* act);
+
+  void DispatchCellToPrimitive(void* device, void* outputBuffer,
+    void* primitiveToCellBuffer, vtkIdType primitiveCount);
 
 private:
   vtkMetalPolyDataMapper(const vtkMetalPolyDataMapper&) = delete;

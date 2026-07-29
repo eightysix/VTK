@@ -5,9 +5,12 @@
  * @class vtkMetalBatchedPolyDataMapper
  * @brief A Metal mapper for batched rendering of multiple vtkPolyData.
  *
- * Accumulates geometry from multiple actors into shared vertex/index buffers
- * and renders them with per-mesh property offsets. Uses a uniform buffer array
- * for per-actor cell ID offsets, opacity, and composite IDs.
+ * Tactical batched renderer that caches one child vtkMetalPolyDataMapper per
+ * vtkPolyData and renders visible elements in flat-index order. This avoids
+ * changing the parent mapper input every frame.
+ *
+ * Future work: true combined vertex/index buffers, per-mesh property binding,
+ * and per-batch-element visual overrides.
  *
  * @sa vtkMetalPolyDataMapper vtkCompositePolyDataMapperDelegator
  */
@@ -18,6 +21,7 @@
 #include "vtkMetalPolyDataMapper.h"
 #include "vtkRenderingMetalModule.h"
 #include "vtkCompositePolyDataMapperDelegator.h"
+#include "vtkSmartPointer.h"
 
 #include <memory>
 #include <vector>
@@ -26,6 +30,7 @@
 VTK_ABI_NAMESPACE_BEGIN
 class vtkCompositePolyDataMapper;
 class vtkPolyData;
+class vtkMetalPolyDataMapper;
 
 class VTKRENDERINGMETAL_EXPORT vtkMetalBatchedPolyDataMapper : public vtkMetalPolyDataMapper
 {
@@ -79,7 +84,6 @@ private:
   static constexpr size_t AlignedPropertiesSize =
     (sizeof(CompositeDataProperties) + PropertiesAlignment - 1) & ~(PropertiesAlignment - 1);
 
-  void BuildBatchedGeometryBuffers(void* mtlDevice);
   void UpdateBatchPropertiesBuffer(void* mtlDevice);
 
   vtkCompositePolyDataMapper* Parent = nullptr;
@@ -93,7 +97,15 @@ private:
 
   vtkTimeStamp ResourcesSyncTimeStamp;
   bool GeometryDirty = true;
-  std::size_t CurrentDrawMeshId = 0;
+  vtkMTimeType CachedChildConfigurationMTime = 0;
+
+  std::map<std::uintptr_t, vtkSmartPointer<vtkMetalPolyDataMapper>> ChildMappers;
+
+  vtkSmartPointer<vtkMetalPolyDataMapper> GetChildMapper(vtkPolyData* polydata);
+  void ReleaseChildMappers(vtkWindow* w);
+  void ReleaseBatchPropertiesBuffer();
+  void ConfigureChildMapper(vtkMetalPolyDataMapper* child);
+  void SetBatchPropertiesBufferConsumed(void* buffer);
 };
 
 VTK_ABI_NAMESPACE_END

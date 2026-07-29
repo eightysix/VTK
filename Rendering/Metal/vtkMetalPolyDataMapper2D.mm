@@ -22,6 +22,8 @@
 #include <cmath>
 #include <cstdint>
 
+#include "vtkMetalMRC.h"
+
 VTK_ABI_NAMESPACE_BEGIN
 
 vtkStandardNewMacro(vtkMetalPolyDataMapper2D);
@@ -38,6 +40,15 @@ struct vtkMetalPolyDataMapper2D::vtkMetalPolyDataMapper2DInternals
   id<MTLBuffer> PositionBuffer = nil;
   id<MTLBuffer> ColorBuffer = nil;
 
+  // Index buffers for indexed drawing
+  id<MTLBuffer> TriangleIndexBuffer = nil;
+  id<MTLBuffer> LineIndexBuffer = nil;
+  id<MTLBuffer> PointIndexBuffer = nil;
+
+  NSUInteger TriangleIndexCount = 0;
+  NSUInteger LineIndexCount = 0;
+  NSUInteger PointIndexCount = 0;
+
   // Uniform buffer for 2D state
   id<MTLBuffer> StateBuffer = nil;
 
@@ -49,20 +60,53 @@ struct vtkMetalPolyDataMapper2D::vtkMetalPolyDataMapper2DInternals
   // Cached state
   vtkIdType CachedInputMTime = 0;
   int CachedSampleCount = 0;
+  int CachedViewportSize[2] = { 0, 0 };
+  double CachedViewportRect[4] = { 0.0, 0.0, 1.0, 1.0 };
+  double CachedColor[3] = { 0.0, 0.0, 0.0 };
+  double CachedOpacity = 1.0;
+
+  void ReleasePipelines()
+  {
+    vtkMetalMRC::ReleaseAndNil(TrianglePipeline);
+    vtkMetalMRC::ReleaseAndNil(LinePipeline);
+    vtkMetalMRC::ReleaseAndNil(PointPipeline);
+  }
 
   void ReleaseBuffers()
   {
-    [PositionBuffer release];
-    PositionBuffer = nil;
-    [ColorBuffer release];
-    ColorBuffer = nil;
-    [StateBuffer release];
-    StateBuffer = nil;
+    vtkMetalMRC::ReleaseAndNil(PositionBuffer);
+    vtkMetalMRC::ReleaseAndNil(ColorBuffer);
+    vtkMetalMRC::ReleaseAndNil(StateBuffer);
+
+    vtkMetalMRC::ReleaseAndNil(TriangleIndexBuffer);
+    vtkMetalMRC::ReleaseAndNil(LineIndexBuffer);
+    vtkMetalMRC::ReleaseAndNil(PointIndexBuffer);
+
+    TriangleIndexCount = 0;
+    LineIndexCount = 0;
+    PointIndexCount = 0;
+
     VertexCount = 0;
     HasTriangles = false;
     HasLines = false;
     HasPoints = false;
+
+    CachedInputMTime = 0;
+    CachedSampleCount = 0;
+    CachedViewportSize[0] = 0;
+    CachedViewportSize[1] = 0;
+    CachedViewportRect[0] = 0.0;
+    CachedViewportRect[1] = 0.0;
+    CachedViewportRect[2] = 1.0;
+    CachedViewportRect[3] = 1.0;
   }
+
+  ~vtkMetalPolyDataMapper2DInternals()
+  {
+    ReleaseBuffers();
+    ReleasePipelines();
+  }
+
 };
 
 //------------------------------------------------------------------------------
@@ -106,9 +150,9 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
 
   @autoreleasepool
   {
-    id<MTLDevice> device = (__bridge id<MTLDevice>)renWin->GetMetalDevice();
+    id<MTLDevice> device = (id<MTLDevice>)renWin->GetMetalDevice();
     id<MTLRenderCommandEncoder> encoder =
-      (__bridge id<MTLRenderCommandEncoder>)renWin->GetCurrentRenderCommandEncoder();
+      (id<MTLRenderCommandEncoder>)renWin->GetCurrentRenderCommandEncoder();
     if (!encoder)
     {
       return;
@@ -117,12 +161,41 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
     // Check if geometry needs rebuilding
     vtkIdType currentMTime = input->GetMTime();
     int sampleCount = renWin->GetEffectiveSampleCount();
-    if (currentMTime != this->Internals->CachedInputMTime ||
-        sampleCount != this->Internals->CachedSampleCount)
+    bool sampleCountChanged = (sampleCount != this->Internals->CachedSampleCount);
+
+    // Compute viewport-dependent state
+    int* size = viewport->GetSize();
+    double* vp = viewport->GetViewport();
+    bool viewportChanged =
+        size[0] != this->Internals->CachedViewportSize[0] ||
+        size[1] != this->Internals->CachedViewportSize[1] ||
+        vp[0] != this->Internals->CachedViewportRect[0] ||
+        vp[1] != this->Internals->CachedViewportRect[1] ||
+        vp[2] != this->Internals->CachedViewportRect[2] ||
+        vp[3] != this->Internals->CachedViewportRect[3];
+
+    bool geometryDirty =
+        currentMTime != this->Internals->CachedInputMTime ||
+        (this->TransformCoordinate && viewportChanged);
+
+    // Release pipelines only on sample-count change (they don't depend on geometry/viewport)
+    if (sampleCountChanged)
+    {
+      this->Internals->ReleasePipelines();
+      this->Internals->CachedSampleCount = sampleCount;
+    }
+
+    if (geometryDirty)
     {
       this->Internals->ReleaseBuffers();
       this->Internals->CachedInputMTime = currentMTime;
       this->Internals->CachedSampleCount = sampleCount;
+      this->Internals->CachedViewportSize[0] = size[0];
+      this->Internals->CachedViewportSize[1] = size[1];
+      this->Internals->CachedViewportRect[0] = vp[0];
+      this->Internals->CachedViewportRect[1] = vp[1];
+      this->Internals->CachedViewportRect[2] = vp[2];
+      this->Internals->CachedViewportRect[3] = vp[3];
 
       // Build geometry from polydata
       vtkPoints* points = input->GetPoints();
@@ -163,10 +236,11 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
           positions[i * 2 + 1] = static_cast<float>(pt[1]);
         }
 
-        this->Internals->PositionBuffer = [device
+        id<MTLBuffer> posBuffer = [device
           newBufferWithBytes:positions.data()
                      length:positions.size() * sizeof(float)
                     options:MTLResourceStorageModeShared];
+        vtkMetalMRC::AssignConsumed(this->Internals->PositionBuffer, posBuffer);
 
         // Create color buffer from actor property
         double r, g, b;
@@ -183,32 +257,120 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
           colors[i * 4 + 3] = static_cast<float>(opacity);
         }
 
-        this->Internals->ColorBuffer = [device
+        id<MTLBuffer> colBuffer = [device
           newBufferWithBytes:colors.data()
                      length:colors.size() * sizeof(float)
                     options:MTLResourceStorageModeShared];
+        vtkMetalMRC::AssignConsumed(this->Internals->ColorBuffer, colBuffer);
       }
 
-      // Determine primitive types
+      // Build index buffers from cell arrays
+      std::vector<uint32_t> triIndices;
+      std::vector<uint32_t> lineIndices;
+      std::vector<uint32_t> pointIndices;
+
       vtkCellArray* polys = input->GetPolys();
       vtkCellArray* lines = input->GetLines();
       vtkCellArray* verts = input->GetVerts();
 
-      this->Internals->HasTriangles = (polys && polys->GetNumberOfCells() > 0);
-      this->Internals->HasLines = (lines && lines->GetNumberOfCells() > 0);
-      this->Internals->HasPoints = (verts && verts->GetNumberOfCells() > 0);
+      if (polys)
+      {
+        const vtkIdType* ids = nullptr;
+        vtkIdType npts = 0;
+        polys->InitTraversal();
+        while (polys->GetNextCell(npts, ids))
+        {
+          if (npts < 3) continue;
+          for (vtkIdType i = 1; i < npts - 1; ++i)
+          {
+            triIndices.push_back(static_cast<uint32_t>(ids[0]));
+            triIndices.push_back(static_cast<uint32_t>(ids[i]));
+            triIndices.push_back(static_cast<uint32_t>(ids[i + 1]));
+          }
+        }
+      }
+
+      if (lines)
+      {
+        const vtkIdType* ids = nullptr;
+        vtkIdType npts = 0;
+        lines->InitTraversal();
+        while (lines->GetNextCell(npts, ids))
+        {
+          if (npts < 2) continue;
+          for (vtkIdType i = 0; i < npts - 1; ++i)
+          {
+            lineIndices.push_back(static_cast<uint32_t>(ids[i]));
+            lineIndices.push_back(static_cast<uint32_t>(ids[i + 1]));
+          }
+        }
+      }
+
+      if (verts)
+      {
+        const vtkIdType* ids = nullptr;
+        vtkIdType npts = 0;
+        verts->InitTraversal();
+        while (verts->GetNextCell(npts, ids))
+        {
+          for (vtkIdType i = 0; i < npts; ++i)
+          {
+            pointIndices.push_back(static_cast<uint32_t>(ids[i]));
+          }
+        }
+      }
+
+      this->Internals->HasTriangles = !triIndices.empty();
+      this->Internals->HasLines = !lineIndices.empty();
+      this->Internals->HasPoints = !pointIndices.empty();
+
+      if (!triIndices.empty())
+      {
+        id<MTLBuffer> buffer =
+          [device newBufferWithBytes:triIndices.data()
+                              length:triIndices.size() * sizeof(uint32_t)
+                             options:MTLResourceStorageModeShared];
+        vtkMetalMRC::AssignConsumed(this->Internals->TriangleIndexBuffer, buffer);
+        this->Internals->TriangleIndexCount = triIndices.size();
+      }
+
+      if (!lineIndices.empty())
+      {
+        id<MTLBuffer> buffer =
+          [device newBufferWithBytes:lineIndices.data()
+                              length:lineIndices.size() * sizeof(uint32_t)
+                             options:MTLResourceStorageModeShared];
+        vtkMetalMRC::AssignConsumed(this->Internals->LineIndexBuffer, buffer);
+        this->Internals->LineIndexCount = lineIndices.size();
+      }
+
+      if (!pointIndices.empty())
+      {
+        id<MTLBuffer> buffer =
+          [device newBufferWithBytes:pointIndices.data()
+                              length:pointIndices.size() * sizeof(uint32_t)
+                             options:MTLResourceStorageModeShared];
+        vtkMetalMRC::AssignConsumed(this->Internals->PointIndexBuffer, buffer);
+        this->Internals->PointIndexCount = pointIndices.size();
+      }
     }
 
     // Compute WCVC (world-to-viewport-clip) matrix
     // For 2D overlay: orthographic projection from viewport pixel coordinates
-    int* size = viewport->GetSize();
-    double* vp = viewport->GetViewport();
-
+    // (size and vp are already captured above)
     // Orthographic projection: maps [vp_x*size_w, (vp_x+vp_w)*size_w] x [vp_y*size_h, (vp_y+vp_h)*size_h] to [-1,1]
+    if (size[0] <= 0 || size[1] <= 0)
+    {
+      return;
+    }
     float vpX = static_cast<float>(vp[0] * size[0]);
     float vpY = static_cast<float>(vp[1] * size[1]);
-    float vpW = static_cast<float>(vp[2] * size[0]);
-    float vpH = static_cast<float>(vp[3] * size[1]);
+    float vpW = static_cast<float>((vp[2] - vp[0]) * size[0]);
+    float vpH = static_cast<float>((vp[3] - vp[1]) * size[1]);
+    if (vpW <= 0.0f || vpH <= 0.0f)
+    {
+      return;
+    }
 
     // Build orthographic matrix: maps viewport coords to NDC [-1,1]
     // Metal NDC: x in [-1,1], y in [-1,1], z in [0,1]
@@ -278,6 +440,37 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
       memcpy([this->Internals->StateBuffer contents], &state, sizeof(state));
     }
 
+    // Update per-vertex ColorBuffer when actor color or opacity changes
+    {
+      double curColor[3];
+      actor->GetProperty()->GetColor(curColor);
+      double curOpacity = actor->GetProperty()->GetOpacity();
+      bool colorChanged =
+          curColor[0] != this->Internals->CachedColor[0] ||
+          curColor[1] != this->Internals->CachedColor[1] ||
+          curColor[2] != this->Internals->CachedColor[2] ||
+          curOpacity != this->Internals->CachedOpacity;
+      if (colorChanged)
+      {
+        this->Internals->CachedColor[0] = curColor[0];
+        this->Internals->CachedColor[1] = curColor[1];
+        this->Internals->CachedColor[2] = curColor[2];
+        this->Internals->CachedOpacity = curOpacity;
+        if (this->Internals->ColorBuffer && this->Internals->VertexCount > 0)
+        {
+          std::vector<float> colors(this->Internals->VertexCount * 4);
+          for (vtkIdType i = 0; i < this->Internals->VertexCount; ++i)
+          {
+            colors[i * 4 + 0] = static_cast<float>(curColor[0]);
+            colors[i * 4 + 1] = static_cast<float>(curColor[1]);
+            colors[i * 4 + 2] = static_cast<float>(curColor[2]);
+            colors[i * 4 + 3] = static_cast<float>(curOpacity);
+          }
+          memcpy([this->Internals->ColorBuffer contents], colors.data(), colors.size() * sizeof(float));
+        }
+      }
+    }
+
     // Create pipeline states if needed
     if (!this->Internals->TrianglePipeline || !this->Internals->LinePipeline ||
         !this->Internals->PointPipeline)
@@ -321,6 +514,11 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
         desc.rasterSampleCount = sampleCount;
+        desc.colorAttachments[0].blendingEnabled = YES;
+        desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
 
         this->Internals->TrianglePipeline =
           [device newRenderPipelineStateWithDescriptor:desc error:&error];
@@ -341,6 +539,11 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassLine;
         desc.rasterSampleCount = sampleCount;
+        desc.colorAttachments[0].blendingEnabled = YES;
+        desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
 
         this->Internals->LinePipeline =
           [device newRenderPipelineStateWithDescriptor:desc error:&error];
@@ -360,6 +563,11 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         desc.vertexDescriptor = vertexDesc;
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         desc.rasterSampleCount = sampleCount;
+        desc.colorAttachments[0].blendingEnabled = YES;
+        desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
 
         this->Internals->PointPipeline =
           [device newRenderPipelineStateWithDescriptor:desc error:&error];
@@ -383,86 +591,52 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
     // Set position buffer at buffer index 0
     [encoder setVertexBuffer:this->Internals->PositionBuffer offset:0 atIndex:0];
 
-    // Draw triangles (fan triangulation of polygons)
-    if (this->Internals->HasTriangles && this->Internals->TrianglePipeline)
+    // Draw triangles using index buffer
+    if (this->Internals->HasTriangles &&
+        this->Internals->TrianglePipeline &&
+        this->Internals->TriangleIndexBuffer &&
+        this->Internals->TriangleIndexCount > 0)
     {
       [encoder setRenderPipelineState:this->Internals->TrianglePipeline];
+      [encoder setVertexBuffer:this->Internals->ColorBuffer offset:0 atIndex:2];
 
-      vtkCellArray* polys = input->GetPolys();
-      const vtkIdType* indices = nullptr;
-      vtkIdType cellSize = 0;
-
-      vtkIdType cellIndex = 0;
-      for (polys->InitTraversal(); polys->GetNextCell(cellSize, indices); cellIndex++)
-      {
-        if (cellSize < 3)
-        {
-          continue;
-        }
-
-        // Fan triangulation: 0-1-2, 0-2-3, 0-3-4, ...
-        std::vector<uint32_t> triIndices;
-        for (vtkIdType i = 1; i < cellSize - 1; i++)
-        {
-          triIndices.push_back(static_cast<uint32_t>(indices[0]));
-          triIndices.push_back(static_cast<uint32_t>(indices[i]));
-          triIndices.push_back(static_cast<uint32_t>(indices[i + 1]));
-        }
-
-        if (!triIndices.empty())
-        {
-          [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                              indexCount:triIndices.size()
-                               indexType:MTLIndexTypeUInt32
-                             indexBuffer:this->Internals->PositionBuffer
-                       indexBufferOffset:0
-                           instanceCount:1
-                                baseVertex:0
-                              baseInstance:0];
-        }
-      }
+      [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                          indexCount:this->Internals->TriangleIndexCount
+                           indexType:MTLIndexTypeUInt32
+                         indexBuffer:this->Internals->TriangleIndexBuffer
+                   indexBufferOffset:0];
     }
 
-    // Draw lines
-    if (this->Internals->HasLines && this->Internals->LinePipeline)
+    // Draw lines using index buffer
+    if (this->Internals->HasLines &&
+        this->Internals->LinePipeline &&
+        this->Internals->LineIndexBuffer &&
+        this->Internals->LineIndexCount > 0)
     {
       [encoder setRenderPipelineState:this->Internals->LinePipeline];
+      [encoder setVertexBuffer:this->Internals->ColorBuffer offset:0 atIndex:2];
 
-      vtkCellArray* lines = input->GetLines();
-      const vtkIdType* indices = nullptr;
-      vtkIdType cellSize = 0;
-
-      vtkIdType vertexOffset = 0;
-      for (lines->InitTraversal(); lines->GetNextCell(cellSize, indices); vertexOffset += cellSize)
-      {
-        if (cellSize < 2)
-        {
-          continue;
-        }
-
-        // Draw line segments
-        [encoder drawPrimitives:MTLPrimitiveTypeLine
-                    vertexStart:vertexOffset
-                    vertexCount:cellSize];
-      }
+      [encoder drawIndexedPrimitives:MTLPrimitiveTypeLine
+                          indexCount:this->Internals->LineIndexCount
+                           indexType:MTLIndexTypeUInt32
+                         indexBuffer:this->Internals->LineIndexBuffer
+                   indexBufferOffset:0];
     }
 
-    // Draw points
-    if (this->Internals->HasPoints && this->Internals->PointPipeline)
+    // Draw points using index buffer
+    if (this->Internals->HasPoints &&
+        this->Internals->PointPipeline &&
+        this->Internals->PointIndexBuffer &&
+        this->Internals->PointIndexCount > 0)
     {
       [encoder setRenderPipelineState:this->Internals->PointPipeline];
+      [encoder setVertexBuffer:this->Internals->ColorBuffer offset:0 atIndex:2];
 
-      vtkCellArray* verts = input->GetVerts();
-      const vtkIdType* indices = nullptr;
-      vtkIdType cellSize = 0;
-
-      vtkIdType vertexOffset = 0;
-      for (verts->InitTraversal(); verts->GetNextCell(cellSize, indices); vertexOffset += cellSize)
-      {
-        [encoder drawPrimitives:MTLPrimitiveTypePoint
-                    vertexStart:vertexOffset
-                    vertexCount:cellSize];
-      }
+      [encoder drawIndexedPrimitives:MTLPrimitiveTypePoint
+                          indexCount:this->Internals->PointIndexCount
+                           indexType:MTLIndexTypeUInt32
+                         indexBuffer:this->Internals->PointIndexBuffer
+                   indexBufferOffset:0];
     }
   }
 }
@@ -471,9 +645,7 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
 void vtkMetalPolyDataMapper2D::ReleaseGraphicsResources(vtkWindow* w)
 {
   this->Internals->ReleaseBuffers();
-  this->Internals->TrianglePipeline = nil;
-  this->Internals->LinePipeline = nil;
-  this->Internals->PointPipeline = nil;
+  this->Internals->ReleasePipelines();
   this->Superclass::ReleaseGraphicsResources(w);
 }
 

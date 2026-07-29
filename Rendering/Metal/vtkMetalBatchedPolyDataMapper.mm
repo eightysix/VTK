@@ -17,11 +17,15 @@
 #include "vtkRenderer.h"
 #include "vtkFloatArray.h"
 #include "vtkUnsignedCharArray.h"
+#include "vtkMetalPolyDataMapper.h"
 
 #import <Metal/Metal.h>
 
 #include <vector>
 #include <map>
+#include <algorithm>
+
+#include "vtkMetalMRC.h"
 
 VTK_ABI_NAMESPACE_BEGIN
 
@@ -31,7 +35,79 @@ vtkStandardNewMacro(vtkMetalBatchedPolyDataMapper);
 vtkMetalBatchedPolyDataMapper::vtkMetalBatchedPolyDataMapper() = default;
 
 //------------------------------------------------------------------------------
-vtkMetalBatchedPolyDataMapper::~vtkMetalBatchedPolyDataMapper() = default;
+vtkMetalBatchedPolyDataMapper::~vtkMetalBatchedPolyDataMapper()
+{
+  this->ReleaseBatchPropertiesBuffer();
+  this->ReleaseChildMappers(nullptr);
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalBatchedPolyDataMapper::ReleaseBatchPropertiesBuffer()
+{
+  if (this->BatchPropertiesBuffer)
+  {
+    [(id)this->BatchPropertiesBuffer release];
+    this->BatchPropertiesBuffer = nullptr;
+    this->BatchPropertiesBufferSize = 0;
+  }
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalBatchedPolyDataMapper::SetBatchPropertiesBufferConsumed(void* buffer)
+{
+  id<MTLBuffer> mtlBuffer = (id<MTLBuffer>)buffer;
+
+  if (this->BatchPropertiesBuffer != buffer)
+  {
+    this->ReleaseBatchPropertiesBuffer();
+    this->BatchPropertiesBuffer = buffer;
+    this->BatchPropertiesBufferSize = mtlBuffer ? (size_t)[mtlBuffer length] : 0;
+  }
+  else
+  {
+    [mtlBuffer release];
+  }
+}
+
+//------------------------------------------------------------------------------
+vtkSmartPointer<vtkMetalPolyDataMapper>
+vtkMetalBatchedPolyDataMapper::GetChildMapper(vtkPolyData* polydata)
+{
+  auto address = reinterpret_cast<std::uintptr_t>(polydata);
+
+  auto it = this->ChildMappers.find(address);
+  if (it == this->ChildMappers.end())
+  {
+    vtkSmartPointer<vtkMetalPolyDataMapper> mapper =
+      vtkSmartPointer<vtkMetalPolyDataMapper>::New();
+
+    mapper->SetInputData(polydata);
+    this->ConfigureChildMapper(mapper);
+    this->ChildMappers[address] = mapper;
+    return mapper;
+  }
+
+  if (it->second->GetInputDataObject(0, 0) != polydata)
+  {
+    it->second->SetInputData(polydata);
+  }
+
+  return it->second;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalBatchedPolyDataMapper::ReleaseChildMappers(vtkWindow* w)
+{
+  for (auto& kv : this->ChildMappers)
+  {
+    if (kv.second)
+    {
+      kv.second->ReleaseGraphicsResources(w);
+    }
+  }
+
+  this->ChildMappers.clear();
+}
 
 //------------------------------------------------------------------------------
 void vtkMetalBatchedPolyDataMapper::PrintSelf(ostream& os, vtkIndent indent)
@@ -48,6 +124,20 @@ void vtkMetalBatchedPolyDataMapper::AddBatchElement(
   auto address = reinterpret_cast<std::uintptr_t>(element.PolyData);
   auto found = this->VTKPolyDataToBatchElement.find(address);
 
+  // Remove stale FlatIndexToPolyData entries pointing to the same address
+  for (auto it = this->FlatIndexToPolyData.begin();
+       it != this->FlatIndexToPolyData.end();)
+  {
+    if (it->second == address && it->first != flatIndex)
+    {
+      it = this->FlatIndexToPolyData.erase(it);
+    }
+    else
+    {
+      ++it;
+    }
+  }
+
   this->FlatIndexToPolyData[flatIndex] = address;
 
   if (found == this->VTKPolyDataToBatchElement.end())
@@ -60,9 +150,11 @@ void vtkMetalBatchedPolyDataMapper::AddBatchElement(
   }
   else
   {
-    auto& batchElement = found->second;
-    batchElement->FlatIndex = flatIndex;
-    batchElement->Marked = true;
+    auto updated = std::make_unique<BatchElement>(std::move(element));
+    updated->Marked = true;
+    found->second = std::move(updated);
+    this->GeometryDirty = true;
+    this->Modified();
   }
 }
 
@@ -82,10 +174,13 @@ vtkMetalBatchedPolyDataMapper::GetBatchElement(vtkPolyData* polydata)
 //------------------------------------------------------------------------------
 void vtkMetalBatchedPolyDataMapper::ClearBatchElements()
 {
+  this->ReleaseChildMappers(nullptr);
+
   this->VTKPolyDataToBatchElement.clear();
   this->FlatIndexToPolyData.clear();
-  this->BatchPropertiesBuffer = nullptr;
-  this->BatchPropertiesBufferSize = 0;
+
+  this->ReleaseBatchPropertiesBuffer();
+
   this->GeometryDirty = true;
   this->Modified();
 }
@@ -121,19 +216,51 @@ void vtkMetalBatchedPolyDataMapper::UnmarkBatchElements()
 //------------------------------------------------------------------------------
 void vtkMetalBatchedPolyDataMapper::ClearUnmarkedBatchElements()
 {
+  bool changed = false;
+
   for (auto iter = this->VTKPolyDataToBatchElement.begin();
        iter != this->VTKPolyDataToBatchElement.end();)
   {
     if (!iter->second->Marked)
     {
-      this->VTKPolyDataToBatchElement.erase(iter++);
-      this->GeometryDirty = true;
-      this->Modified();
+      auto childIt = this->ChildMappers.find(iter->first);
+      if (childIt != this->ChildMappers.end())
+      {
+        if (childIt->second)
+        {
+          childIt->second->ReleaseGraphicsResources(nullptr);
+        }
+        this->ChildMappers.erase(childIt);
+      }
+
+      iter = this->VTKPolyDataToBatchElement.erase(iter);
+      changed = true;
     }
     else
     {
       ++iter;
     }
+  }
+
+  // Clean stale flat-index mappings
+  for (auto fit = this->FlatIndexToPolyData.begin();
+       fit != this->FlatIndexToPolyData.end();)
+  {
+    if (this->VTKPolyDataToBatchElement.find(fit->second) ==
+        this->VTKPolyDataToBatchElement.end())
+    {
+      fit = this->FlatIndexToPolyData.erase(fit);
+    }
+    else
+    {
+      ++fit;
+    }
+  }
+
+  if (changed)
+  {
+    this->GeometryDirty = true;
+    this->Modified();
   }
 }
 
@@ -150,15 +277,12 @@ vtkMTimeType vtkMetalBatchedPolyDataMapper::GetMTime()
 //------------------------------------------------------------------------------
 void vtkMetalBatchedPolyDataMapper::ReleaseGraphicsResources(vtkWindow* w)
 {
-  // Release our batch-specific buffer (cast from void* to id<MTLBuffer>)
-  if (this->BatchPropertiesBuffer)
-  {
-    [(__bridge id)this->BatchPropertiesBuffer release];
-    this->BatchPropertiesBuffer = nullptr;
-  }
-  this->BatchPropertiesBufferSize = 0;
+  this->ReleaseChildMappers(w);
+  this->ReleaseBatchPropertiesBuffer();
+
   this->ResourcesSyncTimeStamp = vtkTimeStamp();
   this->GeometryDirty = true;
+
   this->Superclass::ReleaseGraphicsResources(w);
 }
 
@@ -170,26 +294,19 @@ void vtkMetalBatchedPolyDataMapper::UpdateBatchPropertiesBuffer(void* mtlDevice)
     return;
   }
 
-  id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
+  id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
   const size_t batchSize = this->VTKPolyDataToBatchElement.size();
   const size_t bufferSize = batchSize * AlignedPropertiesSize;
 
   if (this->BatchPropertiesBufferSize != bufferSize)
   {
-    // Release old buffer
-    if (this->BatchPropertiesBuffer)
-    {
-      [(__bridge id)this->BatchPropertiesBuffer release];
-    }
     id<MTLBuffer> newBuf = [device
       newBufferWithLength:bufferSize
                  options:MTLResourceStorageModeShared];
-    // newBufferWithLength returns +1 (new rule); member owns it directly.
-    this->BatchPropertiesBuffer = (__bridge void*)newBuf;
-    this->BatchPropertiesBufferSize = bufferSize;
+    this->SetBatchPropertiesBufferConsumed(newBuf);
   }
 
-  id<MTLBuffer> propBuffer = (__bridge id<MTLBuffer>)this->BatchPropertiesBuffer;
+  id<MTLBuffer> propBuffer = (id<MTLBuffer>)this->BatchPropertiesBuffer;
   char* buf = static_cast<char*>([propBuffer contents]);
   uint32_t cellIdOffsetForSelector = 0;
   uint32_t cellIdOffsetForVerts = 0;
@@ -240,129 +357,36 @@ void vtkMetalBatchedPolyDataMapper::UpdateBatchPropertiesBuffer(void* mtlDevice)
 }
 
 //------------------------------------------------------------------------------
-void vtkMetalBatchedPolyDataMapper::BuildBatchedGeometryBuffers(void* mtlDevice)
+void vtkMetalBatchedPolyDataMapper::ConfigureChildMapper(
+    vtkMetalPolyDataMapper* child)
 {
-  if (this->VTKPolyDataToBatchElement.empty())
-  {
-    return;
-  }
+    child->SetScalarVisibility(this->GetScalarVisibility());
+    child->SetScalarMode(this->GetScalarMode());
+    child->SetColorMode(this->GetColorMode());
+    child->SetInterpolateScalarsBeforeMapping(
+        this->GetInterpolateScalarsBeforeMapping());
+    child->SetLookupTable(this->GetLookupTable());
 
-  id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDevice;
+    // Remove any stale mappings that may exist from a previous configuration
+    child->RemoveAllVertexAttributeMappings();
 
-  // Accumulate geometry from all visible batch elements into combined arrays
-  std::vector<float> allPositions;
-  std::vector<float> allNormals;
-  std::vector<float> allColors;
-  std::vector<uint32_t> allTriIndices;
-  std::vector<uint32_t> allLineIndices;
-
-  for (const auto& iter : this->VTKPolyDataToBatchElement)
-  {
-    const auto& batchElement = iter.second;
-    if (!batchElement->Visibility || !batchElement->PolyData)
+    // Copy extra attribute mappings
+    for (const auto& attr : this->ExtraAttributes)
     {
-      continue;
+        child->MapDataArrayToVertexAttribute(
+            attr.first.c_str(),
+            attr.second.DataArrayName.c_str(),
+            attr.second.FieldAssociation,
+            attr.second.ComponentNumber);
     }
-
-    vtkPolyData* pd = batchElement->PolyData;
-
-    // Copy points as individual triangle vertices (fan-triangulated)
-    vtkCellArray* polys = pd->GetPolys();
-    if (polys && polys->GetNumberOfCells() > 0)
-    {
-      const vtkIdType* pts = nullptr;
-      vtkIdType npts = 0;
-      polys->InitTraversal();
-      while (polys->GetNextCell(npts, pts))
-      {
-        for (vtkIdType i = 1; i + 1 < npts; ++i)
-        {
-          for (int j = 0; j < 3; ++j)
-          {
-            vtkIdType ptId = (j == 0) ? pts[0] : (j == 1 ? pts[i] : pts[i + 1]);
-            double pt[3];
-            pd->GetPoint(ptId, pt);
-            allPositions.push_back(static_cast<float>(pt[0]));
-            allPositions.push_back(static_cast<float>(pt[1]));
-            allPositions.push_back(static_cast<float>(pt[2]));
-
-            double normal[3] = { 0.0, 0.0, 1.0 };
-            if (pd->GetPointData()->GetNormals())
-            {
-              pd->GetPointData()->GetNormals()->GetTuple(ptId, normal);
-            }
-            allNormals.push_back(static_cast<float>(normal[0]));
-            allNormals.push_back(static_cast<float>(normal[1]));
-            allNormals.push_back(static_cast<float>(normal[2]));
-
-            allColors.push_back(1.0f);
-            allColors.push_back(1.0f);
-            allColors.push_back(1.0f);
-            allColors.push_back(1.0f);
-          }
-          uint32_t base = static_cast<uint32_t>(allPositions.size() / 3 - 3);
-          allTriIndices.push_back(base);
-          allTriIndices.push_back(base + 1);
-          allTriIndices.push_back(base + 2);
-        }
-      }
-    }
-
-    // Copy line segments
-    vtkCellArray* lines = pd->GetLines();
-    if (lines && lines->GetNumberOfCells() > 0)
-    {
-      const vtkIdType* pts = nullptr;
-      vtkIdType npts = 0;
-      lines->InitTraversal();
-      while (lines->GetNextCell(npts, pts))
-      {
-        for (vtkIdType i = 0; i + 1 < npts; ++i)
-        {
-          for (int j = 0; j < 2; ++j)
-          {
-            vtkIdType ptId = pts[i + j];
-            double pt[3];
-            pd->GetPoint(ptId, pt);
-            allPositions.push_back(static_cast<float>(pt[0]));
-            allPositions.push_back(static_cast<float>(pt[1]));
-            allPositions.push_back(static_cast<float>(pt[2]));
-
-            allNormals.push_back(0.0f);
-            allNormals.push_back(0.0f);
-            allNormals.push_back(1.0f);
-
-            allColors.push_back(1.0f);
-            allColors.push_back(1.0f);
-            allColors.push_back(1.0f);
-            allColors.push_back(1.0f);
-          }
-          uint32_t base = static_cast<uint32_t>(allPositions.size() / 3 - 2);
-          allLineIndices.push_back(base);
-          allLineIndices.push_back(base + 1);
-        }
-      }
-    }
-  }
-
-  if (allPositions.empty())
-  {
-    this->GeometryDirty = false;
-    return;
-  }
-
-  // Create Metal buffers — use parent's protected methods by delegating
-  // Since Internals is private, we store our own buffers and use the
-  // parent's SetInputData/RenderPiece path instead.
-  // For now, just mark as clean — actual buffer creation happens via
-  // the parent's own geometry pipeline when we set input per mesh.
-  this->GeometryDirty = false;
 }
 
 //------------------------------------------------------------------------------
 void vtkMetalBatchedPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
 {
-  vtkMetalRenderWindow* renWin = vtkMetalRenderWindow::SafeDownCast(ren->GetRenderWindow());
+  vtkMetalRenderWindow* renWin =
+    vtkMetalRenderWindow::SafeDownCast(ren->GetRenderWindow());
+
   if (!renWin || !renWin->GetMetalDevice())
   {
     return;
@@ -373,34 +397,58 @@ void vtkMetalBatchedPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     return;
   }
 
-  // Rebuild batch properties if needed
+  // Propagate parent state changes to existing child mappers
+  vtkMTimeType childConfigMTime =
+      std::max(this->GetMTime(), this->ExtraAttributesMTime.GetMTime());
+  if (childConfigMTime != this->CachedChildConfigurationMTime)
+  {
+    for (auto& kv : this->ChildMappers)
+    {
+      if (kv.second)
+      {
+        this->ConfigureChildMapper(kv.second);
+      }
+    }
+    this->CachedChildConfigurationMTime = childConfigMTime;
+  }
+
+  // Optional: keep batch properties updated.
   vtkMTimeType currentMTime = this->GetMTime();
   if (currentMTime != this->ResourcesSyncTimeStamp)
   {
     this->UpdateBatchPropertiesBuffer(renWin->GetMetalDevice());
   }
 
-  // Render each mesh in the batch individually via the parent class.
-  // Each call to SetInputData + Superclass::RenderPiece handles geometry
-  // building, pipeline state, and draw calls. The BatchPropertiesBuffer
-  // provides per-mesh offsets for cell ID picking.
-  this->CurrentDrawMeshId = 0;
-  for (auto& iter : this->VTKPolyDataToBatchElement)
+  // Render in flat-index order, not pointer-address order.
+  std::vector<const BatchElement*> visible;
+  visible.reserve(this->VTKPolyDataToBatchElement.size());
+
+  for (const auto& kv : this->VTKPolyDataToBatchElement)
   {
-    const auto& batchElement = iter.second;
-    if (!batchElement->Visibility)
+    const BatchElement* elem = kv.second.get();
+    if (elem && elem->Visibility && elem->PolyData)
     {
-      this->CurrentDrawMeshId++;
+      visible.push_back(elem);
+    }
+  }
+
+  std::sort(visible.begin(), visible.end(),
+    [](const BatchElement* a, const BatchElement* b)
+    {
+      return a->FlatIndex < b->FlatIndex;
+    });
+
+  for (const BatchElement* elem : visible)
+  {
+    vtkSmartPointer<vtkMetalPolyDataMapper> mapper =
+      this->GetChildMapper(elem->PolyData);
+
+    if (!mapper)
+    {
       continue;
     }
 
-    // Temporarily set the input to this batch element's polydata
-    this->SetInputData(batchElement->PolyData);
-
-    // Delegate to parent class for actual rendering
-    this->Superclass::RenderPiece(ren, act);
-
-    this->CurrentDrawMeshId++;
+    mapper->RenderPiece(ren, act);
   }
 }
 
