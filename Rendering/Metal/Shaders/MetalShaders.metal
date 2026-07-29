@@ -1380,7 +1380,12 @@ struct VolumeFragmentOut { float4 color [[color(0)]]; };
 constant int MAX_RAY_STEPS = 8192;
 
 inline float volume_random(float2 st) {
-  return fract(sin(dot(st.xy, float2(12.9898, 78.233))) * 43758.5453123);
+  // Interleaved Gradient Noise (Jimenez 2014). Smooth, low‑discrepancy,
+  // deterministic per pixel, no sin‑hash streaks, no texture required.
+  // For a regular sampling grid this shifts the grid phase smoothly across
+  // the screen, which breaks banding *without* adding white‑noise grain —
+  // usually the most pleasing look for single‑sample (no‑TAA) volume rendering.
+  return fract(52.9829189 * fract(dot(st, float2(0.06711056, 0.00583715))));
 }
 
 inline float safeRecip(float x) {
