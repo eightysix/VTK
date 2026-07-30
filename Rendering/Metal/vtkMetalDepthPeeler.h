@@ -82,7 +82,6 @@ private:
   void CreatePipelines(id<MTLDevice> device);
 
   // Fullscreen pass pipeline states
-  id<MTLRenderPipelineState> InitDepthPipeline = nil;
   id<MTLRenderPipelineState> CompositePipeline = nil;
   id<MTLRenderPipelineState> BackBlendPipeline = nil;
   id<MTLRenderPipelineState> AlphaBlendPipeline = nil;

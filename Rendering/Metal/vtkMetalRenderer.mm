@@ -208,6 +208,7 @@ void vtkMetalRenderer::DeviceRender()
       {
         [encoder setDepthStencilState:sOpaqueDepthState];
       }
+      [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
 
       renWin->CommandBuffer = (__bridge void*)commandBuffer;
       renWin->Encoder = (__bridge void*)encoder;
@@ -302,6 +303,7 @@ void vtkMetalRenderer::DeviceRender()
       {
         [encoder setDepthStencilState:sReadOnlyDepthState];
       }
+      [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
 
       renWin->CommandBuffer = (__bridge void*)commandBuffer;
       renWin->Encoder = (__bridge void*)encoder;
@@ -393,6 +395,7 @@ void vtkMetalRenderer::DeviceRender()
       {
         [encoder setDepthStencilState:sReadOnlyDepthState];
       }
+      [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
 
       renWin->CommandBuffer = (__bridge void*)commandBuffer;
       renWin->Encoder = (__bridge void*)encoder;

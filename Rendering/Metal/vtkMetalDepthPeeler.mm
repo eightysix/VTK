@@ -51,8 +51,6 @@ void vtkMetalDepthPeeler::Release()
   this->PeelUniformBuffer = nil;
   [this->PeelSampler release];
   this->PeelSampler = nil;
-  [this->InitDepthPipeline release];
-  this->InitDepthPipeline = nil;
   [this->CompositePipeline release];
   this->CompositePipeline = nil;
   [this->BackBlendPipeline release];
@@ -71,6 +69,14 @@ void vtkMetalDepthPeeler::Release()
 //------------------------------------------------------------------------------
 void vtkMetalDepthPeeler::CreateTextures(id<MTLDevice> device, int width, int height)
 {
+  // Release old textures before creating new ones
+  [this->FrontPeelA release];   this->FrontPeelA = nil;
+  [this->FrontPeelB release];   this->FrontPeelB = nil;
+  [this->BackPeelTemp release]; this->BackPeelTemp = nil;
+  [this->BackAccum release];    this->BackAccum = nil;
+  [this->DepthPeelA release];   this->DepthPeelA = nil;
+  [this->DepthPeelB release];   this->DepthPeelB = nil;
+
   this->CurrentWidth = width;
   this->CurrentHeight = height;
 
@@ -138,37 +144,6 @@ void vtkMetalDepthPeeler::CreatePipelines(id<MTLDevice> device)
     vtkGenericWarningMacro(<< "Failed to compile Metal shaders for depth peeling: "
                            << [[error localizedDescription] UTF8String]);
     return;
-  }
-
-  // --- Init depth pipeline ---
-  // Fullscreen pass: reads nothing, outputs RG32Float with MAX blend
-  {
-    id<MTLFunction> vFunc = [library newFunctionWithName:@"vertex_fullscreen_main"];
-    id<MTLFunction> fFunc = [library newFunctionWithName:@"fragment_peel_init"];
-    if (vFunc && fFunc)
-    {
-      MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
-      desc.vertexFunction = vFunc;
-      desc.fragmentFunction = fFunc;
-      desc.colorAttachments[0].pixelFormat = MTLPixelFormatRG32Float;
-      desc.colorAttachments[0].blendingEnabled = YES;
-      desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationMax;
-      desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationMax;
-      desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
-      desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOne;
-      desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-      desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
-      desc.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
-
-      this->InitDepthPipeline = [device newRenderPipelineStateWithDescriptor:desc error:&error];
-      if (!this->InitDepthPipeline)
-      {
-        vtkGenericWarningMacro(<< "Init depth pipeline: " << [[error localizedDescription] UTF8String]);
-      }
-      [desc release];
-    }
-    [vFunc release];
-    [fFunc release];
   }
 
   // --- Composite pipeline ---
@@ -254,8 +229,7 @@ void vtkMetalDepthPeeler::CreatePipelines(id<MTLDevice> device)
 
   [library release];
 
-  this->PipelinesCreated = (this->InitDepthPipeline && this->CompositePipeline &&
-                            this->BackBlendPipeline);
+  this->PipelinesCreated = (this->CompositePipeline && this->BackBlendPipeline);
 }
 
 //------------------------------------------------------------------------------
@@ -430,6 +404,12 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
         [commandBuffer renderCommandEncoderWithDescriptor:rpd];
       encoder.label = @"VTK Depth Peeling - Back Blend";
 
+      MTLViewport vp;
+      vp.originX = 0; vp.originY = 0;
+      vp.width = width; vp.height = height;
+      vp.znear = 0.0; vp.zfar = 1.0;
+      [encoder setViewport:vp];
+
       [encoder setRenderPipelineState:this->BackBlendPipeline];
       [encoder setFragmentTexture:this->BackPeelTemp atIndex:0];
 
@@ -454,6 +434,12 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
     id<MTLRenderCommandEncoder> encoder =
       [commandBuffer renderCommandEncoderWithDescriptor:rpd];
     encoder.label = @"VTK Depth Peeling - Composite";
+
+    MTLViewport vp;
+    vp.originX = 0; vp.originY = 0;
+    vp.width = width; vp.height = height;
+    vp.znear = 0.0; vp.zfar = 1.0;
+    [encoder setViewport:vp];
 
     [encoder setRenderPipelineState:this->CompositePipeline];
     [encoder setFragmentTexture:frontSrc atIndex:0];

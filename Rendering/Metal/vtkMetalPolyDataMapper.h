@@ -36,6 +36,10 @@ public:
   void RemoveVertexAttributeMapping(const char* vertexAttributeName) override;
   void RemoveAllVertexAttributeMappings() override;
 
+  // P2-8C: Set per-frame prop ID for picking
+  void SetPropId(uint32_t propId);
+  uint32_t GetOrCreatePropId(vtkActor* act);
+
   struct ExtraAttributeValue
   {
     std::string DataArrayName;
@@ -70,9 +74,6 @@ protected:
   // 8C: Render bundle caching — pre-recorded encoder commands for static geometry
   void ReplayRenderBundle(void* mtlRenderCommandEncoder);
   void RebuildRenderBundle(void* mtlRenderCommandEncoder, vtkRenderer* ren, vtkActor* act);
-
-  void DispatchCellToPrimitive(void* device, void* outputBuffer,
-    void* primitiveToCellBuffer, vtkIdType primitiveCount);
 
 private:
   vtkMetalPolyDataMapper(const vtkMetalPolyDataMapper&) = delete;

@@ -29,6 +29,7 @@
 #include "vtkTransform.h"
 #include "vtkMath.h"
 #include "vtkMapper.h"
+#include "vtkScalarsToColors.h"
 #include "vtkNew.h"
 #include "vtkPlaneCollection.h"
 #include "vtkPlane.h"
@@ -36,6 +37,8 @@
 #include "vtkDataObject.h"
 
 #import <Metal/Metal.h>
+
+#include <unordered_map>
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <vector>
@@ -139,19 +142,13 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLBuffer> CoincidentOffsetBuffer = nil;   // P1-5: polygon/line/point depth bias
   id<MTLBuffer> VertexColorBuffer = nil;        // P1-4: vertex visibility color
   id<MTLBuffer> ClipPlaneBuffer = nil;          // P1-6: clipping planes
-  id<MTLBuffer> CellIdOffsetBuffer = nil;       // P2-7: homogeneous cell ID offset
-
   // P2-8: Picking IDs
-  id<MTLBuffer> TriangleCellIdBuffer = nil;    // GPU output: per-triangle-vertex cell IDs
-  id<MTLBuffer> LineCellIdBuffer = nil;        // GPU output: per-line-vertex cell IDs
-  id<MTLBuffer> PointCellIdBuffer = nil;       // GPU output: per-point cell IDs
+  id<MTLBuffer> TriangleCellIdBuffer = nil;    // GPU: per-triangle-vertex cell IDs
+  id<MTLBuffer> LineCellIdBuffer = nil;        // GPU: per-line-index cell IDs (standard 1px lines, by vertex_id)
+  id<MTLBuffer> LineSegmentCellIdBuffer = nil; // GPU: per-line-segment cell IDs (thick/round/miter lines, by instance_id)
+  id<MTLBuffer> PointCellIdBuffer = nil;       // GPU: per-point cell IDs
   id<MTLBuffer> EdgeCellIdBuffer = nil;
   id<MTLBuffer> PropIdBuffer = nil;            // single uint32: actor prop ID
-  id<MTLBuffer> PrimitiveToCellBuffer = nil;   // CPU→GPU: maps primitive index → cell index
-  id<MTLBuffer> TrianglePrimitiveToCellBuffer = nil;
-  id<MTLBuffer> LinePrimitiveToCellBuffer = nil;
-  id<MTLBuffer> EdgePrimitiveToCellBuffer = nil;
-  id<MTLComputePipelineState> CellToPrimitivePipeline = nil;
   vtkIdType TrianglePrimitiveCount = 0;        // number of triangles for compute dispatch
   vtkIdType LinePrimitiveCount = 0;            // number of line segments for compute dispatch
 
@@ -216,6 +213,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   bool CachedEdgeVisibility = false;  // P2-2B: track edge visibility changes
   float CachedLineWidth = -1.0f;     // P3-3A: track line width changes
   int CachedSampleCount = 0;        // 8A: track MSAA sample count changes
+  vtkMTimeType CachedScalarMTime = 0;
 
   // 8C: Render bundle caching — pre-recorded encoder commands for static geometry
   // When geometry hasn't changed between frames, replay cached commands instead of
@@ -350,7 +348,6 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     vtkMetalMRC::ReleaseAndNil(PolygonToTrianglePipeline);
     vtkMetalMRC::ReleaseAndNil(PolyLineToLinePipeline);
     vtkMetalMRC::ReleaseAndNil(PolygonEdgesToLinesPipeline);
-    vtkMetalMRC::ReleaseAndNil(CellToPrimitivePipeline);
   }
 
   void InvalidateRenderBundle()
@@ -406,17 +403,13 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     vtkMetalMRC::ReleaseAndNil(CoincidentOffsetBuffer);
     vtkMetalMRC::ReleaseAndNil(VertexColorBuffer);
     vtkMetalMRC::ReleaseAndNil(ClipPlaneBuffer);
-    vtkMetalMRC::ReleaseAndNil(CellIdOffsetBuffer);
 
     vtkMetalMRC::ReleaseAndNil(TriangleCellIdBuffer);
     vtkMetalMRC::ReleaseAndNil(LineCellIdBuffer);
+    vtkMetalMRC::ReleaseAndNil(LineSegmentCellIdBuffer);
     vtkMetalMRC::ReleaseAndNil(PointCellIdBuffer);
     vtkMetalMRC::ReleaseAndNil(EdgeCellIdBuffer);
     vtkMetalMRC::ReleaseAndNil(PropIdBuffer);
-    vtkMetalMRC::ReleaseAndNil(PrimitiveToCellBuffer);
-    vtkMetalMRC::ReleaseAndNil(TrianglePrimitiveToCellBuffer);
-    vtkMetalMRC::ReleaseAndNil(LinePrimitiveToCellBuffer);
-    vtkMetalMRC::ReleaseAndNil(EdgePrimitiveToCellBuffer);
     TrianglePrimitiveCount = 0;
     LinePrimitiveCount = 0;
 
@@ -466,6 +459,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     BundleExtraAttributesMTime = 0;
 
     CachedExtraAttributesMTime = 0;
+    CachedScalarMTime = 0;
   }
 
   ~vtkMetalPolyDataMapperInternals()
@@ -496,9 +490,10 @@ vtkMetalPolyDataMapper::MapperHashType vtkMetalPolyDataMapper::GenerateHash(vtkP
   return static_cast<MapperHashType>(polydata->GetMTime());
 }
 
-void vtkMetalPolyDataMapper::ReleaseGraphicsResources(vtkWindow*)
+void vtkMetalPolyDataMapper::ReleaseGraphicsResources(vtkWindow* w)
 {
   this->Internals->ReleaseBuffers();
+  this->Superclass::ReleaseGraphicsResources(w);
 }
 
 //------------------------------------------------------------------------------
@@ -730,6 +725,25 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
     else if (peelMode == 2 && this->Internals->TrianglePeelPipeline)
     {
       recordPipeline(this->Internals->TrianglePeelPipeline);
+
+      // Bind previous-frame peel textures required by fragment_peel
+      vtkMetalRenderWindow* peelRenWin =
+          vtkMetalRenderWindow::SafeDownCast(ren->GetRenderWindow());
+      if (peelRenWin)
+      {
+        id<MTLTexture> prevFront =
+            (__bridge id<MTLTexture>)peelRenWin->PeelFrontTexture;
+        id<MTLTexture> prevDepth =
+            (__bridge id<MTLTexture>)peelRenWin->PeelDepthTexture;
+        if (prevFront)
+        {
+          recordFTex(prevFront, 1);
+        }
+        if (prevDepth)
+        {
+          recordFTex(prevDepth, 2);
+        }
+      }
     }
     else
     {
@@ -875,9 +889,9 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       {
         recordVBuf(this->Internals->ThickLineLineWidthBuffer, 0, 4);
       }
-      if (this->Internals->LineCellIdBuffer)
+      if (this->Internals->LineSegmentCellIdBuffer)
       {
-        recordVBuf(this->Internals->LineCellIdBuffer, 0, 5);
+        recordVBuf(this->Internals->LineSegmentCellIdBuffer, 0, 5);
       }
       if (this->Internals->PropIdBuffer)
       {
@@ -919,9 +933,9 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       {
         recordVBuf(this->Internals->ThickLineLineWidthBuffer, 0, 4);
       }
-      if (this->Internals->LineCellIdBuffer)
+      if (this->Internals->LineSegmentCellIdBuffer)
       {
-        recordVBuf(this->Internals->LineCellIdBuffer, 0, 5);
+        recordVBuf(this->Internals->LineSegmentCellIdBuffer, 0, 5);
       }
       if (this->Internals->PropIdBuffer)
       {
@@ -967,9 +981,9 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       {
         recordVBuf(this->Internals->ThickLineLineWidthBuffer, 0, 4);
       }
-      if (this->Internals->LineCellIdBuffer)
+      if (this->Internals->LineSegmentCellIdBuffer)
       {
-        recordVBuf(this->Internals->LineCellIdBuffer, 0, 5);
+        recordVBuf(this->Internals->LineSegmentCellIdBuffer, 0, 5);
       }
       if (this->Internals->PropIdBuffer)
       {
@@ -1142,10 +1156,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       {
         recordVBuf(this->Internals->PointColorUVBuffer, 0, 8);
       }
-      if (this->Internals->CellIdOffsetBuffer)
-      {
-        recordVBuf(this->Internals->CellIdOffsetBuffer, 0, 9);
-      }
+
       if (this->Internals->PointCellIdBuffer)
       {
         recordVBuf(this->Internals->PointCellIdBuffer, 0, 11);
@@ -1204,10 +1215,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       {
         recordVBuf(this->Internals->PointColorUVBuffer, 0, 8);
       }
-      if (this->Internals->CellIdOffsetBuffer)
-      {
-        recordVBuf(this->Internals->CellIdOffsetBuffer, 0, 9);
-      }
+
       if (this->Internals->PointCellIdBuffer)
       {
         recordVBuf(this->Internals->PointCellIdBuffer, 0, 11);
@@ -1274,10 +1282,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       {
         recordVBuf(this->Internals->PointColorUVBuffer, 0, 8);
       }
-      if (this->Internals->CellIdOffsetBuffer)
-      {
-        recordVBuf(this->Internals->CellIdOffsetBuffer, 0, 9);
-      }
+
       if (this->Internals->PointCellIdBuffer)
       {
         recordVBuf(this->Internals->PointCellIdBuffer, 0, 11);
@@ -1336,10 +1341,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       {
         recordVBuf(this->Internals->PointColorUVBuffer, 0, 8);
       }
-      if (this->Internals->CellIdOffsetBuffer)
-      {
-        recordVBuf(this->Internals->CellIdOffsetBuffer, 0, 9);
-      }
+
       if (this->Internals->PointCellIdBuffer)
       {
         recordVBuf(this->Internals->PointCellIdBuffer, 0, 11);
@@ -1436,16 +1438,25 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     bool edgeVisibility = act->GetProperty()->GetEdgeVisibility();
     float lineWidth = static_cast<float>(act->GetProperty()->GetLineWidth());
 
+    vtkMTimeType scalarMTime = this->GetMTime();
+    if (this->GetLookupTable())
+    {
+      scalarMTime = std::max(scalarMTime,
+        static_cast<vtkMTimeType>(this->GetLookupTable()->GetMTime()));
+    }
+
     if (currentMTime != this->Internals->CachedInputMTime ||
         representation != this->Internals->CachedRepresentation ||
         edgeVisibility != this->Internals->CachedEdgeVisibility ||
-        extraMTime != this->Internals->CachedExtraAttributesMTime)
+        extraMTime != this->Internals->CachedExtraAttributesMTime ||
+        scalarMTime != this->Internals->CachedScalarMTime)
     {
       this->Internals->ReleaseBuffers();
       this->Internals->CachedInputMTime = currentMTime;
       this->Internals->CachedRepresentation = representation;
       this->Internals->CachedEdgeVisibility = edgeVisibility;
       this->Internals->CachedExtraAttributesMTime = extraMTime;
+      this->Internals->CachedScalarMTime = scalarMTime;
       this->BuildGeometryBuffers((void*)device, input, act);
     }
 
@@ -1524,6 +1535,8 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       return;
     }
 
+    [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
+
     vtkMetalCamera* metalCamera = vtkMetalCamera::SafeDownCast(ren->GetActiveCamera());
     if (metalCamera)
     {
@@ -1567,6 +1580,7 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     this->UpdateVertexColorUniforms((void*)device, act);
     this->UpdateClipPlaneUniforms((void*)device, act);
     this->UpdateActorTexture((void*)device, act);
+    this->SetPropId(this->GetOrCreatePropId(act));
 
     // P5-5A: Set texture flag (bit 9) in scene uniforms when actor has a texture
     if (this->Internals->ActorTexture)
@@ -1718,12 +1732,89 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   std::vector<float> edgeNormals;
   std::vector<float> edgeColors;
   std::vector<uint32_t> edgeIndices;
-  std::vector<uint32_t> edgePrimToCell;
   std::unordered_map<vtkIdType, uint32_t> edgeVertexMap;
 
-  // P2-8: per-primitive cell ID mapping (primitive index → cell index)
-  std::vector<uint32_t> trianglePrimToCell;
-  std::vector<uint32_t> linePrimToCell;
+  // P2-8: per-vertex cell IDs (replaces per-primitive cell ID mapping)
+  std::vector<uint32_t> triangleVertexCellIds;
+  std::vector<uint32_t> lineVertexCellIds;       // per-vertex, parallel to positions (standard 1px lines, read by vertex_id)
+  std::vector<uint32_t> lineSegmentCellIds;      // per-segment (thick/round/miter lines, read by instance_id)
+  std::vector<uint32_t> edgeVertexCellIds;
+
+  // P10-10A: Extra attribute arrays — parallel to positions (one value per rendered vertex)
+  std::unordered_map<std::string, std::vector<float>> extraAttrArrays;
+  for (const auto& attr : this->ExtraAttributes)
+  {
+    extraAttrArrays[attr.first] = std::vector<float>();
+  }
+  auto emitExtraAttrsForPoint = [&](vtkIdType pointId) {
+    for (const auto& attr : this->ExtraAttributes)
+    {
+      vtkDataArray* da = nullptr;
+      if (attr.second.FieldAssociation == vtkDataObject::FIELD_ASSOCIATION_POINTS)
+      {
+        da = polydata->GetPointData()->GetArray(attr.second.DataArrayName.c_str());
+      }
+      if (da && pointId < da->GetNumberOfTuples())
+      {
+        int numComps = da->GetNumberOfComponents();
+        int comp = attr.second.ComponentNumber;
+        if (comp < 0)
+        {
+          double* tuple = da->GetTuple(pointId);
+          for (int c = 0; c < numComps; ++c)
+          {
+            extraAttrArrays[attr.first].push_back(static_cast<float>(tuple[c]));
+          }
+        }
+        else
+        {
+          extraAttrArrays[attr.first].push_back(
+            static_cast<float>(da->GetComponent(pointId, comp)));
+        }
+      }
+      else
+      {
+        vtkDataArray* dummyDa = da;
+        int effectiveComps = (attr.second.ComponentNumber < 0)
+          ? (dummyDa ? dummyDa->GetNumberOfComponents() : 1) : 1;
+        for (int c = 0; c < effectiveComps; ++c)
+        {
+          extraAttrArrays[attr.first].push_back(0.0f);
+        }
+      }
+    }
+  };
+  auto emitExtraAttrsForCell = [&](vtkIdType cellId) {
+    for (const auto& attr : this->ExtraAttributes)
+    {
+      vtkDataArray* da = nullptr;
+      if (attr.second.FieldAssociation == vtkDataObject::FIELD_ASSOCIATION_CELLS)
+      {
+        da = polydata->GetCellData()->GetArray(attr.second.DataArrayName.c_str());
+      }
+      if (da && cellId < da->GetNumberOfTuples())
+      {
+        int numComps = da->GetNumberOfComponents();
+        int comp = attr.second.ComponentNumber;
+        if (comp < 0)
+        {
+          double* tuple = da->GetTuple(cellId);
+          for (int c = 0; c < numComps; ++c)
+          {
+            extraAttrArrays[attr.first].push_back(static_cast<float>(tuple[c]));
+          }
+        }
+        else
+        {
+          extraAttrArrays[attr.first].push_back(
+            static_cast<float>(da->GetComponent(cellId, comp)));
+        }
+      }
+    }
+  };
+
+  vtkIdType lineCellOffset = polydata->GetNumberOfVerts();
+  vtkIdType polyCellOffset = lineCellOffset + polydata->GetNumberOfLines();
 
   // Get representation for wireframe/edge handling
   int representation = actor ? actor->GetProperty()->GetRepresentation() : VTK_SURFACE;
@@ -1841,7 +1932,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
           // Upload params uniform
           struct { uint32_t numCells; uint32_t cellIdOffset; } tessParams;
           tessParams.numCells = static_cast<uint32_t>(polyOff.size() - 1);
-          tessParams.cellIdOffset = 0;
+          tessParams.cellIdOffset = static_cast<uint32_t>(polyCellOffset);
           id<MTLBuffer> tessParamsBuf = [device
             newBufferWithBytes:&tessParams
                        length:sizeof(tessParams)
@@ -1884,6 +1975,33 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
             this->Internals->TriangleIndexCount = numTris * 3;
             this->Internals->HasTriangles = true;
             this->Internals->TrianglePrimitiveCount = numTris;
+
+            // Expand per-triangle cell IDs to per-point for vertex indexing
+            const uint32_t* triCellIds =
+                (const uint32_t*)[this->Internals->TriangleCellIdBuffer contents];
+            const uint32_t* connData =
+                (const uint32_t*)[this->Internals->TessOutputConnectivityBuffer contents];
+            std::vector<uint32_t> pointCellIds(numPolyPts, 0);
+            std::vector<bool> pointAssigned(numPolyPts, false);
+            for (vtkIdType t = 0; t < numTris; ++t)
+            {
+              uint32_t cid = triCellIds[t];
+              for (int v = 0; v < 3; ++v)
+              {
+                uint32_t ptIdx = connData[t * 3 + v];
+                if (ptIdx < (uint32_t)numPolyPts && !pointAssigned[ptIdx])
+                {
+                  pointCellIds[ptIdx] = cid;
+                  pointAssigned[ptIdx] = true;
+                }
+              }
+            }
+            id<MTLBuffer> perPointCellIds = [device
+                newBufferWithBytes:pointCellIds.data()
+                           length:pointCellIds.size() * sizeof(uint32_t)
+                          options:MTLResourceStorageModeShared];
+            vtkMetalMRC::AssignConsumed(this->Internals->TriangleCellIdBuffer, perPointCellIds);
+
             gpuTessUsed = true;
           }
         }
@@ -1957,7 +2075,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
 
             struct { uint32_t numCells; uint32_t cellIdOffset; } eParams;
             eParams.numCells = static_cast<uint32_t>(eOff.size() - 1);
-            eParams.cellIdOffset = 0;
+            eParams.cellIdOffset = static_cast<uint32_t>(polyCellOffset);
             id<MTLBuffer> eParamsBuf = [device
               newBufferWithBytes:&eParams
                          length:sizeof(eParams)
@@ -1983,7 +2101,26 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
             if (CommitAndWaitForCompletion(cmdBuf))
             {
               vtkMetalMRC::AssignConsumed(this->Internals->EdgeIndexBuffer, edgeOutBuf);
-              vtkMetalMRC::AssignConsumed(this->Internals->EdgeCellIdBuffer, edgeCellIdBuf);
+
+              // Expand per-segment edge cell IDs to per-point for vertex indexing
+              const uint32_t* segEdgeCellIds = (const uint32_t*)[edgeCellIdBuf contents];
+              const uint32_t* edgeConn = (const uint32_t*)[edgeOutBuf contents];
+              std::vector<uint32_t> perPointEdgeCellIds(static_cast<size_t>(numPolyPts), 0);
+              for (vtkIdType s = 0; s < numEdges; ++s)
+              {
+                uint32_t cid = segEdgeCellIds[s];
+                uint32_t p0 = edgeConn[static_cast<size_t>(s) * 2];
+                uint32_t p1 = edgeConn[static_cast<size_t>(s) * 2 + 1];
+                if (p0 < (uint32_t)numPolyPts) perPointEdgeCellIds[p0] = cid;
+                if (p1 < (uint32_t)numPolyPts) perPointEdgeCellIds[p1] = cid;
+              }
+              id<MTLBuffer> perPointEdgeBuf = [device
+                newBufferWithBytes:perPointEdgeCellIds.data()
+                            length:perPointEdgeCellIds.size() * sizeof(uint32_t)
+                           options:MTLResourceStorageModeShared];
+              vtkMetalMRC::AssignConsumed(this->Internals->EdgeCellIdBuffer, perPointEdgeBuf);
+              [edgeCellIdBuf release];
+
               this->Internals->EdgeIndexCount = numEdges * 2;
               this->Internals->EdgeVertexCount = numPolyPts;
               this->Internals->HasEdgeOverlay = true;
@@ -2069,7 +2206,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
 
           struct { uint32_t numCells; uint32_t cellIdOffset; } wParams;
           wParams.numCells = static_cast<uint32_t>(wOff.size() - 1);
-          wParams.cellIdOffset = 0;
+          wParams.cellIdOffset = static_cast<uint32_t>(polyCellOffset);
           id<MTLBuffer> wParamsBuf = [device
             newBufferWithBytes:&wParams
                        length:sizeof(wParams)
@@ -2095,7 +2232,28 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
           if (CommitAndWaitForCompletion(cmdBuf))
           {
             vtkMetalMRC::AssignConsumed(this->Internals->LineIndexBuffer, wireOutBuf);
-            vtkMetalMRC::AssignConsumed(this->Internals->LineCellIdBuffer, wireCellIdBuf);
+
+            // wireCellIdBuf has 1 entry per segment from compute kernel
+            const uint32_t* segCellIds = (const uint32_t*)[wireCellIdBuf contents];
+            vtkMetalMRC::AssignConsumed(this->Internals->LineSegmentCellIdBuffer, wireCellIdBuf);
+
+            // Expand per-segment line cell IDs to per-point for vertex indexing
+            const uint32_t* wireConn = (const uint32_t*)[this->Internals->LineIndexBuffer contents];
+            std::vector<uint32_t> perPointLineCellIds(static_cast<size_t>(numPolyPts), 0);
+            for (vtkIdType s = 0; s < numEdges; ++s)
+            {
+              uint32_t cid = segCellIds[s];
+              uint32_t p0 = wireConn[static_cast<size_t>(s) * 2];
+              uint32_t p1 = wireConn[static_cast<size_t>(s) * 2 + 1];
+              if (p0 < (uint32_t)numPolyPts) perPointLineCellIds[p0] = cid;
+              if (p1 < (uint32_t)numPolyPts) perPointLineCellIds[p1] = cid;
+            }
+            id<MTLBuffer> perPointBuf = [device
+              newBufferWithBytes:perPointLineCellIds.data()
+                          length:perPointLineCellIds.size() * sizeof(uint32_t)
+                         options:MTLResourceStorageModeShared];
+            vtkMetalMRC::AssignConsumed(this->Internals->LineCellIdBuffer, perPointBuf);
+
             this->Internals->LineIndexCount = numEdges * 2;
             this->Internals->HasLines = true;
             this->Internals->LinePrimitiveCount = numEdges;
@@ -2191,7 +2349,7 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
 
             struct { uint32_t numCells; uint32_t cellIdOffset; } lParams;
             lParams.numCells = static_cast<uint32_t>(lOff.size() - 1);
-            lParams.cellIdOffset = 0;
+            lParams.cellIdOffset = static_cast<uint32_t>(lineCellOffset);
             id<MTLBuffer> lParamsBuf = [device
               newBufferWithBytes:&lParams
                          length:sizeof(lParams)
@@ -2219,7 +2377,28 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
               if (!this->Internals->HasLines)
               {
                 vtkMetalMRC::AssignConsumed(this->Internals->LineIndexBuffer, lineOutBuf);
-                vtkMetalMRC::AssignConsumed(this->Internals->LineCellIdBuffer, lineCellIdBuf);
+
+                // lineCellIdBuf has 1 entry per segment from compute kernel
+                // → LineSegmentCellIdBuffer for thick lines (by instance_id)
+                const uint32_t* segCellIds = (const uint32_t*)[lineCellIdBuf contents];
+                vtkMetalMRC::AssignConsumed(this->Internals->LineSegmentCellIdBuffer, lineCellIdBuf);
+
+                // Expand per-segment line cell IDs to per-point for vertex indexing
+                const uint32_t* lineConn = (const uint32_t*)[this->Internals->LineIndexBuffer contents];
+                std::vector<uint32_t> perPointLineCellIds(static_cast<size_t>(numPolyPts), 0);
+                for (vtkIdType s = 0; s < numLineSegs; ++s)
+                {
+                  uint32_t cid = segCellIds[s];
+                  uint32_t p0 = lineConn[static_cast<size_t>(s) * 2];
+                  uint32_t p1 = lineConn[static_cast<size_t>(s) * 2 + 1];
+                  if (p0 < (uint32_t)numPolyPts) perPointLineCellIds[p0] = cid;
+                  if (p1 < (uint32_t)numPolyPts) perPointLineCellIds[p1] = cid;
+                }
+                id<MTLBuffer> perPointBuf = [device
+                  newBufferWithBytes:perPointLineCellIds.data()
+                              length:perPointLineCellIds.size() * sizeof(uint32_t)
+                             options:MTLResourceStorageModeShared];
+                vtkMetalMRC::AssignConsumed(this->Internals->LineCellIdBuffer, perPointBuf);
 
                 this->Internals->LineIndexCount = numLineSegs * 2;
                 this->Internals->HasLines = true;
@@ -2299,11 +2478,14 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
           triangleUVs.push_back(0.0f);
           triangleUVs.push_back(0.0f);
         }
+        emitExtraAttrsForPoint(i);
+        // TODO: emitExtraAttrsForCell not called here — cell association data
+        // is lost after GPU tessellation. Unusual combination; add if needed.
       }
     }
   }
 
-  vtkIdType polyCellIdx = 0;
+  vtkIdType polyCellIdx = polyCellOffset;
   if (!gpuTessUsed)
   {
   // P2-2A: Vertex deduplication map for wireframe polygon edges
@@ -2383,6 +2565,9 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
               surfaceColors.push_back(1.0f);
               surfaceColors.push_back(1.0f);
             }
+            emitExtraAttrsForPoint(v0);
+            emitExtraAttrsForCell(polyCellIdx);
+            lineVertexCellIds.push_back(static_cast<uint32_t>(polyCellIdx) + 1u);
           }
           else
           {
@@ -2440,6 +2625,9 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
               surfaceColors.push_back(1.0f);
               surfaceColors.push_back(1.0f);
             }
+            emitExtraAttrsForPoint(v1);
+            emitExtraAttrsForCell(polyCellIdx);
+            lineVertexCellIds.push_back(static_cast<uint32_t>(polyCellIdx) + 1u);
           }
           else
           {
@@ -2448,7 +2636,7 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
 
           lineIndices.push_back(idx0);
           lineIndices.push_back(idx1);
-          linePrimToCell.push_back(static_cast<uint32_t>(polyCellIdx));
+          lineSegmentCellIds.push_back(static_cast<uint32_t>(polyCellIdx) + 1u);
         }
       }
       else
@@ -2477,12 +2665,14 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
               if (it != triVertexMap.end())
               {
                 triangleIndices.push_back(it->second);
+                // No cellId push, no emitExtraAttrsForPoint — vertex already exists
               }
               else
               {
                 uint32_t vidx = static_cast<uint32_t>(positions.size() / 3);
                 triVertexMap[tri[j]] = vidx;
                 triangleIndices.push_back(vidx);
+                triangleVertexCellIds.push_back(static_cast<uint32_t>(polyCellIdx) + 1u);
 
                 double pt[3];
                 polydata->GetPoint(tri[j], pt);
@@ -2527,6 +2717,7 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
                   triangleUVs.push_back(0.0f);
                   triangleUVs.push_back(0.0f);
                 }
+                emitExtraAttrsForPoint(tri[j]);
               }
             }
           }
@@ -2605,10 +2796,11 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
                 triangleUVs.push_back(0.0f);
                 triangleUVs.push_back(0.0f);
               }
+              triangleVertexCellIds.push_back(static_cast<uint32_t>(polyCellIdx) + 1u);
+              emitExtraAttrsForPoint(tri[j]);
+              emitExtraAttrsForCell(polyCellIdx);
             }
           }
-
-          trianglePrimToCell.push_back(static_cast<uint32_t>(polyCellIdx));
 
         }
       }
@@ -2678,7 +2870,6 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
         edgeNormals.clear();
         edgeColors.clear();
         edgeIndices.clear();
-        edgePrimToCell.clear();
         edgeVertexMap.clear();
 
         auto addEdgeVertex = [&](vtkIdType pointId, vtkIdType cellId = 0) -> uint32_t {
@@ -2721,6 +2912,7 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
             edgeColors.push_back(1.0f);
             edgeColors.push_back(1.0f);
           }
+          edgeVertexCellIds.push_back(static_cast<uint32_t>(cellId + polyCellOffset) + 1u);
           return idx;
         };
 
@@ -2731,7 +2923,6 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
           uint32_t edgeCellId = kv.second.CellId;
           edgeIndices.push_back(addEdgeVertex(a, edgeCellId));
           edgeIndices.push_back(addEdgeVertex(b, edgeCellId));
-          edgePrimToCell.push_back(edgeCellId);
         }
       }
     }
@@ -2739,7 +2930,7 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
 
   // Process lines
   vtkCellArray* lines = polydata->GetLines();
-  vtkIdType lineCellIdx = 0;
+  vtkIdType lineCellIdx = lineCellOffset;
   if (lines && lines->GetNumberOfCells() > 0)
   {
     if (cellFlag != 0 && mappedColors)
@@ -2791,6 +2982,9 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
             triangleUVs.push_back(0.0f);
             triangleUVs.push_back(0.0f);
           }
+          emitExtraAttrsForPoint(pts[i]);
+          emitExtraAttrsForCell(lineCellIdx);
+          lineVertexCellIds.push_back(static_cast<uint32_t>(lineCellIdx) + 1u);
         }
         uint32_t base = nextPointId;
         nextPointId += npts;
@@ -2798,7 +2992,7 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
         {
           lineIndices.push_back(base + i);
           lineIndices.push_back(base + i + 1);
-          linePrimToCell.push_back(static_cast<uint32_t>(lineCellIdx));
+          lineSegmentCellIds.push_back(static_cast<uint32_t>(lineCellIdx) + 1u);
         }
         lineCellIdx++;
       }
@@ -2861,13 +3055,16 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
               triangleUVs.push_back(0.0f);
               triangleUVs.push_back(0.0f);
             }
+            emitExtraAttrsForPoint(pts[i]);
+            emitExtraAttrsForCell(lineCellIdx);
+            lineVertexCellIds.push_back(static_cast<uint32_t>(lineCellIdx) + 1u);
           }
         }
         for (vtkIdType i = 0; i < npts - 1; ++i)
         {
           lineIndices.push_back(pointMap[pts[i]]);
           lineIndices.push_back(pointMap[pts[i + 1]]);
-          linePrimToCell.push_back(static_cast<uint32_t>(lineCellIdx));
+          lineSegmentCellIds.push_back(static_cast<uint32_t>(lineCellIdx) + 1u);
         }
         lineCellIdx++;
       }
@@ -2877,6 +3074,18 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
     // P3-3A: number of line segments for instanced thick line drawing
     this->Internals->ThickLineSegmentCount = lineIndices.size() / 2;
     // P3-3B/3C: same segment count for round cap and miter join pipelines
+    this->Internals->RoundCapLineSegmentCount = this->Internals->ThickLineSegmentCount;
+    this->Internals->MiterJoinLineSegmentCount = this->Internals->ThickLineSegmentCount;
+  }
+
+  // Synchronize line state for wireframe polygon edges
+  // that were added outside the explicit-lines block.
+  if (!lineIndices.empty() && !this->Internals->HasLines)
+  {
+    this->Internals->LineIndexCount = lineIndices.size();
+    this->Internals->HasLines = true;
+    this->Internals->LinePrimitiveCount = lineSegmentCellIds.size();
+    this->Internals->ThickLineSegmentCount = lineIndices.size() / 2;
     this->Internals->RoundCapLineSegmentCount = this->Internals->ThickLineSegmentCount;
     this->Internals->MiterJoinLineSegmentCount = this->Internals->ThickLineSegmentCount;
   }
@@ -2976,19 +3185,14 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
     this->Internals->EdgeVertexCount = edgePositions.size() / 3;
     this->Internals->HasEdgeOverlay = true;
 
-    // P2-8: Create edge primitive-to-cell mapping and dispatch for CPU-built edges
-    if (!edgePrimToCell.empty())
+    // P2-8: Create edge primitive-to-cell mapping for CPU-built edges (per-vertex)
+    if (!edgeVertexCellIds.empty())
     {
-      id<MTLBuffer> primToCell =
-        [device newBufferWithBytes:edgePrimToCell.data()
-                            length:edgePrimToCell.size() * sizeof(uint32_t)
+      id<MTLBuffer> cellIdBuf =
+        [device newBufferWithBytes:edgeVertexCellIds.data()
+                            length:edgeVertexCellIds.size() * sizeof(uint32_t)
                            options:MTLResourceStorageModeShared];
-      vtkMetalMRC::AssignConsumed(this->Internals->EdgePrimitiveToCellBuffer, primToCell);
-
-      id<MTLBuffer> cellIdOut =
-        [device newBufferWithLength:edgePrimToCell.size() * sizeof(uint32_t)
-                            options:MTLResourceStorageModeShared];
-      vtkMetalMRC::AssignConsumed(this->Internals->EdgeCellIdBuffer, cellIdOut);
+      vtkMetalMRC::AssignConsumed(this->Internals->EdgeCellIdBuffer, cellIdBuf);
     }
   }
 
@@ -3033,54 +3237,36 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
     vtkMetalMRC::AssignConsumed(this->Internals->TriangleUVBuffer, zeroUVBuf);
   }
 
-  // 8D: Create extra attribute buffers from user-mapped data arrays.
-  // Each attribute gets a per-point buffer (works correctly for indexed/deduplicated
-  // rendering where vertex count == point count). Buffers are bound at indices 16+
-  // in the render bundle for access by custom shaders.
-  for (auto& itr : this->ExtraAttributes)
+  // 8D: Create extra attribute buffers from per-vertex arrays built during emission.
+  // Each attribute has exactly one value per rendered vertex, matching positions.size() / 3.
+  for (const auto& attr : this->ExtraAttributes)
   {
-    vtkDataArray* da = nullptr;
-    if (itr.second.FieldAssociation == vtkDataObject::FIELD_ASSOCIATION_POINTS)
-    {
-      da = polydata->GetPointData()->GetArray(itr.second.DataArrayName.c_str());
-    }
-    else if (itr.second.FieldAssociation == vtkDataObject::FIELD_ASSOCIATION_CELLS)
-    {
-      da = polydata->GetCellData()->GetArray(itr.second.DataArrayName.c_str());
-    }
-    if (!da)
+    const auto& attrData = extraAttrArrays[attr.first];
+    if (attrData.empty())
     {
       continue;
     }
-
-    int numComps = da->GetNumberOfComponents();
-    int comp = itr.second.ComponentNumber;
-    int effectiveComps = (comp < 0) ? numComps : 1;
-    vtkIdType numTuples = da->GetNumberOfTuples();
-
-    std::vector<float> attrData(numTuples * effectiveComps);
-    for (vtkIdType i = 0; i < numTuples; ++i)
-    {
-      if (comp < 0)
-      {
-        double* tuple = da->GetTuple(i);
-        for (int c = 0; c < numComps; ++c)
-        {
-          attrData[i * numComps + c] = static_cast<float>(tuple[c]);
-        }
-      }
-      else
-      {
-        attrData[i] = static_cast<float>(da->GetComponent(i, comp));
-      }
-    }
-
     id<MTLBuffer> attrBuf = [device
       newBufferWithBytes:attrData.data()
                  length:attrData.size() * sizeof(float)
                 options:MTLResourceStorageModeShared];
-    vtkMetalMRC::AssignConsumed(this->Internals->ExtraAttributeBuffers[itr.first], attrBuf);
-    this->Internals->ExtraAttributeComponentCounts[itr.first] = effectiveComps;
+    vtkMetalMRC::AssignConsumed(this->Internals->ExtraAttributeBuffers[attr.first], attrBuf);
+
+    int numComps = 1;
+    vtkDataArray* da = nullptr;
+    if (attr.second.FieldAssociation == vtkDataObject::FIELD_ASSOCIATION_POINTS)
+    {
+      da = polydata->GetPointData()->GetArray(attr.second.DataArrayName.c_str());
+    }
+    else if (attr.second.FieldAssociation == vtkDataObject::FIELD_ASSOCIATION_CELLS)
+    {
+      da = polydata->GetCellData()->GetArray(attr.second.DataArrayName.c_str());
+    }
+    if (da)
+    {
+      numComps = (attr.second.ComponentNumber < 0) ? da->GetNumberOfComponents() : 1;
+    }
+    this->Internals->ExtraAttributeComponentCounts[attr.first] = numComps;
   }
 
   // P6-6A: When GPU tessellation produced edge overlay, assign edge vertex buffers
@@ -3100,37 +3286,38 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
         this->Internals->SurfaceColorBuffer);
   }
 
-  // P2-8: Create separate primitive-to-cell mapping buffers for triangles and lines
-  if (!trianglePrimToCell.empty())
+  // P2-8: Create per-vertex cell ID buffer for triangles
+  if (!triangleVertexCellIds.empty())
   {
-    id<MTLBuffer> primToCell =
-      [device newBufferWithBytes:trianglePrimToCell.data()
-                          length:trianglePrimToCell.size() * sizeof(uint32_t)
+    id<MTLBuffer> cellIdBuf =
+      [device newBufferWithBytes:triangleVertexCellIds.data()
+                          length:triangleVertexCellIds.size() * sizeof(uint32_t)
                          options:MTLResourceStorageModeShared];
-    vtkMetalMRC::AssignConsumed(this->Internals->TrianglePrimitiveToCellBuffer, primToCell);
+    vtkMetalMRC::AssignConsumed(this->Internals->TriangleCellIdBuffer, cellIdBuf);
 
-    id<MTLBuffer> cellIdOut =
-      [device newBufferWithLength:trianglePrimToCell.size() * sizeof(uint32_t)
-                          options:MTLResourceStorageModeShared];
-    vtkMetalMRC::AssignConsumed(this->Internals->TriangleCellIdBuffer, cellIdOut);
-
-    this->Internals->TrianglePrimitiveCount = trianglePrimToCell.size();
+    this->Internals->TrianglePrimitiveCount = triangleVertexCellIds.size() / 3;
   }
 
-  if (!linePrimToCell.empty())
+  // P2-8: Create per-vertex cell ID buffer for lines
+  if (!lineVertexCellIds.empty())
   {
-    id<MTLBuffer> primToCell =
-      [device newBufferWithBytes:linePrimToCell.data()
-                          length:linePrimToCell.size() * sizeof(uint32_t)
+    id<MTLBuffer> cellIdBuf =
+      [device newBufferWithBytes:lineVertexCellIds.data()
+                          length:lineVertexCellIds.size() * sizeof(uint32_t)
                          options:MTLResourceStorageModeShared];
-    vtkMetalMRC::AssignConsumed(this->Internals->LinePrimitiveToCellBuffer, primToCell);
+    vtkMetalMRC::AssignConsumed(this->Internals->LineCellIdBuffer, cellIdBuf);
 
-    id<MTLBuffer> cellIdOut =
-      [device newBufferWithLength:linePrimToCell.size() * sizeof(uint32_t)
-                          options:MTLResourceStorageModeShared];
-    vtkMetalMRC::AssignConsumed(this->Internals->LineCellIdBuffer, cellIdOut);
+    this->Internals->LinePrimitiveCount = lineSegmentCellIds.size();
+  }
 
-    this->Internals->LinePrimitiveCount = linePrimToCell.size();
+  // P2-8: Create per-segment cell ID buffer for thick/round/miter lines
+  if (!lineSegmentCellIds.empty())
+  {
+    id<MTLBuffer> segCellIdBuf =
+      [device newBufferWithBytes:lineSegmentCellIds.data()
+                          length:lineSegmentCellIds.size() * sizeof(uint32_t)
+                         options:MTLResourceStorageModeShared];
+    vtkMetalMRC::AssignConsumed(this->Internals->LineSegmentCellIdBuffer, segCellIdBuf);
   }
 
   // Prop ID buffer — single uint32
@@ -3312,87 +3499,19 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
                 options:MTLResourceStorageModeShared];
     vtkMetalMRC::AssignConsumed(this->Internals->PointConnectivityBuffer, ptConnBuf);
 
-    // P2-7: Cell ID offset uniform — defaults to 0 for single-actor rendering.
-    // For batched rendering, this would be set to the starting point index.
-    uint32_t cellIdOffset = 0;
-    id<MTLBuffer> cellOffBuf = [device
-      newBufferWithBytes:&cellIdOffset
-                 length:sizeof(uint32_t)
-                options:MTLResourceStorageModeShared];
-    vtkMetalMRC::AssignConsumed(this->Internals->CellIdOffsetBuffer, cellOffBuf);
-
     this->Internals->PointVertexCount = numPts;
 
     // P2-8: Point cell IDs — identity mapping (point i → cell i)
     std::vector<uint32_t> pointCellIds(numPts);
     for (vtkIdType i = 0; i < numPts; ++i)
     {
-      pointCellIds[i] = static_cast<uint32_t>(i);
+      pointCellIds[i] = static_cast<uint32_t>(i) + 1u;
     }
     id<MTLBuffer> ptCellIdBuf = [device
       newBufferWithBytes:pointCellIds.data()
                  length:pointCellIds.size() * sizeof(uint32_t)
                 options:MTLResourceStorageModeShared];
     vtkMetalMRC::AssignConsumed(this->Internals->PointCellIdBuffer, ptCellIdBuf);
-  }
-
-  // P2-8: Create compute pipeline and dispatch cell-to-primitive mapping
-  if (!this->Internals->CellToPrimitivePipeline)
-  {
-    NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
-    NSError* error = nil;
-    id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
-    if (library)
-    {
-      id<MTLFunction> kernelFunc = [library newFunctionWithName:@"cellToPrimitive"];
-      if (kernelFunc)
-      {
-        this->Internals->CellToPrimitivePipeline =
-          [device newComputePipelineStateWithFunction:kernelFunc error:&error];
-        [kernelFunc release];
-      }
-      [library release];
-    }
-  }
-
-  // Dispatch compute kernel for triangle cell IDs
-  if (this->Internals->CellToPrimitivePipeline &&
-      this->Internals->TrianglePrimitiveCount > 0 &&
-      this->Internals->TriangleCellIdBuffer &&
-      this->Internals->TrianglePrimitiveToCellBuffer)
-  {
-    this->DispatchCellToPrimitive(
-      (void*)device,
-      (void*)this->Internals->TriangleCellIdBuffer,
-      (void*)this->Internals->TrianglePrimitiveToCellBuffer,
-      this->Internals->TrianglePrimitiveCount);
-  }
-
-  // Dispatch compute kernel for line cell IDs
-  if (this->Internals->CellToPrimitivePipeline &&
-      this->Internals->LinePrimitiveCount > 0 &&
-      this->Internals->LineCellIdBuffer &&
-      this->Internals->LinePrimitiveToCellBuffer)
-  {
-    this->DispatchCellToPrimitive(
-      (void*)device,
-      (void*)this->Internals->LineCellIdBuffer,
-      (void*)this->Internals->LinePrimitiveToCellBuffer,
-      this->Internals->LinePrimitiveCount);
-  }
-
-  // Dispatch compute kernel for edge cell IDs (CPU-built edge buffers)
-  if (this->Internals->CellToPrimitivePipeline &&
-      this->Internals->EdgeCellIdBuffer &&
-      this->Internals->EdgePrimitiveToCellBuffer &&
-      this->Internals->EdgeIndexCount > 0 &&
-      !edgePrimToCell.empty())
-  {
-    this->DispatchCellToPrimitive(
-      (void*)device,
-      (void*)this->Internals->EdgeCellIdBuffer,
-      (void*)this->Internals->EdgePrimitiveToCellBuffer,
-      edgePrimToCell.size());
   }
 }
 
@@ -3455,6 +3574,15 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   {
     pipelineDesc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
   }
+
+  // Enable alpha blending for transparency support
+  pipelineDesc.colorAttachments[0].blendingEnabled = YES;
+  pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+  pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+  pipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+  pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+  pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+  pipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
 
   // Enable depth testing (matching WebGPU's depthCompare = Less, depthWriteEnabled = true)
   pipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
@@ -3532,6 +3660,13 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
       desc.vertexFunction = vFunc;
       desc.fragmentFunction = fFunc;
       desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      desc.colorAttachments[0].blendingEnabled = YES;
+      desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+      desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+      desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+      desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+      desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+      desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
       if (sampleCount <= 1)
       {
         desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
@@ -3565,6 +3700,13 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
       desc.vertexFunction = vFunc;
       desc.fragmentFunction = fFunc;
       desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      desc.colorAttachments[0].blendingEnabled = YES;
+      desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+      desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+      desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+      desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+      desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+      desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
       if (sampleCount <= 1)
       {
         desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
@@ -3639,6 +3781,13 @@ void vtkMetalPolyDataMapper::EnsureEdgePipelineState(void* mtlDevice)
     desc.fragmentFunction = fFunc;
     desc.vertexDescriptor = vertexDesc;
     desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    desc.colorAttachments[0].blendingEnabled = YES;
+    desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+    desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
     if (sampleCount <= 1)
     {
       desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
@@ -3693,6 +3842,13 @@ void vtkMetalPolyDataMapper::EnsureThickLinePipelineState(void* mtlDevice)
     desc.vertexFunction = vFunc;
     desc.fragmentFunction = fFunc;
     desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    desc.colorAttachments[0].blendingEnabled = YES;
+    desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+    desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
     if (sampleCount <= 1)
     {
       desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
@@ -3747,6 +3903,13 @@ void vtkMetalPolyDataMapper::EnsureRoundCapLinePipelineState(void* mtlDevice)
     desc.vertexFunction = vFunc;
     desc.fragmentFunction = fFunc;
     desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    desc.colorAttachments[0].blendingEnabled = YES;
+    desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+    desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
     if (sampleCount <= 1)
     {
       desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
@@ -3801,6 +3964,13 @@ void vtkMetalPolyDataMapper::EnsureMiterJoinLinePipelineState(void* mtlDevice)
     desc.vertexFunction = vFunc;
     desc.fragmentFunction = fFunc;
     desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    desc.colorAttachments[0].blendingEnabled = YES;
+    desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+    desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
     if (sampleCount <= 1)
     {
       desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
@@ -3892,6 +4062,8 @@ void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
       // No IDs attachment during peeling
       desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
       desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+      desc.rasterSampleCount = this->Internals->CachedSampleCount > 0
+        ? this->Internals->CachedSampleCount : 1;
 
       error = nil;
       this->Internals->TriangleInitPeelPipeline =
@@ -3941,6 +4113,8 @@ void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
       // No depth attachment during peel passes
       desc.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
       desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+      desc.rasterSampleCount = this->Internals->CachedSampleCount > 0
+        ? this->Internals->CachedSampleCount : 1;
 
       error = nil;
       this->Internals->TrianglePeelPipeline =
@@ -4526,48 +4700,29 @@ void vtkMetalPolyDataMapper::UpdateActorTexture(void* mtlDevice, vtkActor* actor
 }
 
 //------------------------------------------------------------------------------
-void vtkMetalPolyDataMapper::DispatchCellToPrimitive(
-    void* mtlDevice,
-    void* outputBuffer,
-    void* primitiveToCellBuffer,
-    vtkIdType primitiveCount)
+void vtkMetalPolyDataMapper::SetPropId(uint32_t propId)
 {
-    if (!this->Internals->CellToPrimitivePipeline ||
-        !outputBuffer ||
-        !primitiveToCellBuffer ||
-        primitiveCount <= 0)
-    {
-      return;
-    }
+  if (this->Internals->PropIdBuffer)
+  {
+    memcpy([this->Internals->PropIdBuffer contents], &propId, sizeof(uint32_t));
+  }
+}
 
-    id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
-    id<MTLBuffer> outBuf = (id<MTLBuffer>)outputBuffer;
-    id<MTLBuffer> primToCellBuf = (id<MTLBuffer>)primitiveToCellBuffer;
-    id<MTLCommandQueue> queue = this->Internals->EnsureComputeQueue(device);
-    id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-
-    [enc setComputePipelineState:this->Internals->CellToPrimitivePipeline];
-    [enc setBuffer:outBuf offset:0 atIndex:0];
-    [enc setBuffer:primToCellBuf offset:0 atIndex:1];
-    [enc setBuffer:this->Internals->CellIdOffsetBuffer offset:0 atIndex:2];
-
-    NSUInteger maxThreads =
-      this->Internals->CellToPrimitivePipeline.maxTotalThreadsPerThreadgroup;
-
-    NSUInteger threadgroupSize =
-      std::min<NSUInteger>(maxThreads, static_cast<NSUInteger>(primitiveCount));
-
-    MTLSize grid = MTLSizeMake(static_cast<NSUInteger>(primitiveCount), 1, 1);
-    MTLSize tg = MTLSizeMake(threadgroupSize, 1, 1);
-
-    [enc dispatchThreads:grid threadsPerThreadgroup:tg];
-    [enc endEncoding];
-
-    if (!CommitAndWaitForCompletion(cmdBuf))
-    {
-      vtkErrorMacro(<< "Cell-to-primitive compute dispatch failed");
-    }
+//------------------------------------------------------------------------------
+uint32_t vtkMetalPolyDataMapper::GetOrCreatePropId(vtkActor* act)
+{
+  // The static map grows monotonically and is never pruned. Acceptable for
+  // typical VTK usage where actors are long-lived. If short-lived actors
+  // are common, consider a weak-reference approach or periodic cleanup.
+  static std::unordered_map<const vtkActor*, uint32_t> propIds;
+  static uint32_t nextId = 1;
+  auto it = propIds.find(act);
+  if (it == propIds.end())
+  {
+    propIds[act] = nextId++;
+    return propIds[act];
+  }
+  return it->second;
 }
 
 VTK_ABI_NAMESPACE_END

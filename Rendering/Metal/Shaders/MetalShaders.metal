@@ -47,11 +47,6 @@ struct ClipPlaneUniforms {
   int numClipPlanes;
 };
 
-// Cell ID offset (P2-7)
-struct CellIdOffsetUniform {
-  uint offset;                 // added to instance_id to get global cell ID
-};
-
 // Per-material uniforms
 struct MaterialUniforms {
   float4 ambientColor;         // rgb + ambient_intensity
@@ -242,7 +237,6 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
 
 fragment FragmentOutput fragment_edge_main(VertexOut in [[stage_in]],
                                    constant MaterialUniforms& material [[buffer(0)]],
-                                   constant LightUniforms& lights [[buffer(1)]],
                                    constant SceneUniforms& scene [[buffer(2)]],
                                    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
                                    constant float4& edgeColor [[buffer(4)]]) {
@@ -777,14 +771,6 @@ fragment FragmentOutput fragment_miter_join_line_main(
 // ---------------------------------------------------------------------------
 // Compute Kernels (Tessellation mapping)
 // ---------------------------------------------------------------------------
-kernel void cellToPrimitive(
-    device uint* cellIds [[buffer(0)]],
-    constant uint* primitiveToCell [[buffer(1)]],
-    constant uint& cellIdOffset [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]) {
-  cellIds[gid] = primitiveToCell[gid] + cellIdOffset + 1u;
-}
-
 struct TessParams { uint numCells; uint cellIdOffset; };
 
 kernel void polygonToTriangle(
@@ -805,7 +791,7 @@ kernel void polygonToTriangle(
   for (uint i = 0u; i < numTriangles; i++) {
     uint triangleId = primitiveCounts[gid] + i;
     edgeArray[triangleId] = (numTriangles == 1u) ? -1.0 : (i == 0u ? 2.0 : (i == numTriangles - 1u ? 0.0 : 1.0));
-    cellIds[triangleId] = gid + params.cellIdOffset;
+    cellIds[triangleId] = gid + params.cellIdOffset + 1u;
 
     outConnectivity[outputOffset] = connectivity[inputOffset];
     outConnectivity[outputOffset + 1u] = connectivity[inputOffset + i + 1u];
@@ -829,7 +815,7 @@ kernel void polyLineToLine(
   uint inputOffset = offsets[gid];
 
   for (uint i = 0u; i < numLines; i++) {
-    cellIds[primitiveCounts[gid] + i] = gid + params.cellIdOffset;
+    cellIds[primitiveCounts[gid] + i] = gid + params.cellIdOffset + 1u;
     outConnectivity[outputOffset] = connectivity[inputOffset + i];
     outConnectivity[outputOffset + 1u] = connectivity[inputOffset + i + 1u];
     outputOffset += 2u;
@@ -851,7 +837,7 @@ kernel void polygonEdgesToLines(
   uint inputOffset = offsets[gid];
 
   for (uint i = 0u; i < numEdges; i++) {
-    cellIds[primitiveCounts[gid] + i] = gid + params.cellIdOffset;
+    cellIds[primitiveCounts[gid] + i] = gid + params.cellIdOffset + 1u;
     outConnectivity[outputOffset] = connectivity[inputOffset + i];
     outConnectivity[outputOffset + 1u] = connectivity[inputOffset + (i + 1u) % numEdges];
     outputOffset += 2u;
