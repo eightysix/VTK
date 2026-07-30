@@ -38,7 +38,6 @@ struct vtkMetalPolyDataMapper2D::vtkMetalPolyDataMapper2DInternals
 
   // Geometry buffers
   id<MTLBuffer> PositionBuffer = nil;
-  id<MTLBuffer> ColorBuffer = nil;
 
   // Index buffers for indexed drawing
   id<MTLBuffer> TriangleIndexBuffer = nil;
@@ -60,10 +59,11 @@ struct vtkMetalPolyDataMapper2D::vtkMetalPolyDataMapper2DInternals
   // Cached state
   vtkIdType CachedInputMTime = 0;
   int CachedSampleCount = 0;
+  MTLPixelFormat CachedDepthFormat = MTLPixelFormatInvalid;
   int CachedViewportSize[2] = { 0, 0 };
   double CachedViewportRect[4] = { 0.0, 0.0, 1.0, 1.0 };
-  double CachedColor[3] = { 0.0, 0.0, 0.0 };
-  double CachedOpacity = 1.0;
+
+  id<MTLDepthStencilState> OverlayDepthState = nil;
 
   void ReleasePipelines()
   {
@@ -75,7 +75,6 @@ struct vtkMetalPolyDataMapper2D::vtkMetalPolyDataMapper2DInternals
   void ReleaseBuffers()
   {
     vtkMetalMRC::ReleaseAndNil(PositionBuffer);
-    vtkMetalMRC::ReleaseAndNil(ColorBuffer);
     vtkMetalMRC::ReleaseAndNil(StateBuffer);
 
     vtkMetalMRC::ReleaseAndNil(TriangleIndexBuffer);
@@ -101,9 +100,15 @@ struct vtkMetalPolyDataMapper2D::vtkMetalPolyDataMapper2DInternals
     CachedViewportRect[3] = 1.0;
   }
 
+  void ReleaseState()
+  {
+    vtkMetalMRC::ReleaseAndNil(OverlayDepthState);
+  }
+
   ~vtkMetalPolyDataMapper2DInternals()
   {
     ReleaseBuffers();
+    ReleaseState();
     ReleasePipelines();
   }
 
@@ -178,11 +183,21 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         currentMTime != this->Internals->CachedInputMTime ||
         (this->TransformCoordinate && viewportChanged);
 
-    // Release pipelines only on sample-count change (they don't depend on geometry/viewport)
-    if (sampleCountChanged)
+    // Release pipelines on sample-count or depth-format change
+    MTLPixelFormat depthFormat = MTLPixelFormatInvalid;
+    id<MTLTexture> depthTex = (id<MTLTexture>)renWin->GetDepthTexture();
+    if (depthTex)
+    {
+      depthFormat = [depthTex pixelFormat];
+    }
+    bool depthFormatChanged =
+        depthFormat != this->Internals->CachedDepthFormat;
+
+    if (sampleCountChanged || depthFormatChanged)
     {
       this->Internals->ReleasePipelines();
       this->Internals->CachedSampleCount = sampleCount;
+      this->Internals->CachedDepthFormat = depthFormat;
     }
 
     if (geometryDirty)
@@ -242,26 +257,6 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
                     options:MTLResourceStorageModeShared];
         vtkMetalMRC::AssignConsumed(this->Internals->PositionBuffer, posBuffer);
 
-        // Create color buffer from actor property
-        double r, g, b;
-        actor->GetProperty()->GetColor(r, g, b);
-        double opacity = actor->GetProperty()->GetOpacity();
-
-        // Upload color data (float4 per vertex)
-        std::vector<float> colors(numPts * 4);
-        for (vtkIdType i = 0; i < numPts; i++)
-        {
-          colors[i * 4] = static_cast<float>(r);
-          colors[i * 4 + 1] = static_cast<float>(g);
-          colors[i * 4 + 2] = static_cast<float>(b);
-          colors[i * 4 + 3] = static_cast<float>(opacity);
-        }
-
-        id<MTLBuffer> colBuffer = [device
-          newBufferWithBytes:colors.data()
-                     length:colors.size() * sizeof(float)
-                    options:MTLResourceStorageModeShared];
-        vtkMetalMRC::AssignConsumed(this->Internals->ColorBuffer, colBuffer);
       }
 
       // Build index buffers from cell arrays
@@ -440,36 +435,7 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
       memcpy([this->Internals->StateBuffer contents], &state, sizeof(state));
     }
 
-    // Update per-vertex ColorBuffer when actor color or opacity changes
-    {
-      double curColor[3];
-      actor->GetProperty()->GetColor(curColor);
-      double curOpacity = actor->GetProperty()->GetOpacity();
-      bool colorChanged =
-          curColor[0] != this->Internals->CachedColor[0] ||
-          curColor[1] != this->Internals->CachedColor[1] ||
-          curColor[2] != this->Internals->CachedColor[2] ||
-          curOpacity != this->Internals->CachedOpacity;
-      if (colorChanged)
-      {
-        this->Internals->CachedColor[0] = curColor[0];
-        this->Internals->CachedColor[1] = curColor[1];
-        this->Internals->CachedColor[2] = curColor[2];
-        this->Internals->CachedOpacity = curOpacity;
-        if (this->Internals->ColorBuffer && this->Internals->VertexCount > 0)
-        {
-          std::vector<float> colors(this->Internals->VertexCount * 4);
-          for (vtkIdType i = 0; i < this->Internals->VertexCount; ++i)
-          {
-            colors[i * 4 + 0] = static_cast<float>(curColor[0]);
-            colors[i * 4 + 1] = static_cast<float>(curColor[1]);
-            colors[i * 4 + 2] = static_cast<float>(curColor[2]);
-            colors[i * 4 + 3] = static_cast<float>(curOpacity);
-          }
-          memcpy([this->Internals->ColorBuffer contents], colors.data(), colors.size() * sizeof(float));
-        }
-      }
-    }
+    // Color is passed via StateBuffer at index 1 (vertex) / 0 (fragment); no per-vertex ColorBuffer needed
 
     // Create pipeline states if needed
     if (!this->Internals->TrianglePipeline || !this->Internals->LinePipeline ||
@@ -512,6 +478,7 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         desc.fragmentFunction = fFunc;
         desc.vertexDescriptor = vertexDesc;
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        desc.depthAttachmentPixelFormat = depthFormat;
         desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
         desc.rasterSampleCount = sampleCount;
         desc.colorAttachments[0].blendingEnabled = YES;
@@ -537,6 +504,7 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         desc.fragmentFunction = fFunc;
         desc.vertexDescriptor = vertexDesc;
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        desc.depthAttachmentPixelFormat = depthFormat;
         desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassLine;
         desc.rasterSampleCount = sampleCount;
         desc.colorAttachments[0].blendingEnabled = YES;
@@ -562,6 +530,7 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         desc.fragmentFunction = fFunc;
         desc.vertexDescriptor = vertexDesc;
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        desc.depthAttachmentPixelFormat = depthFormat;
         desc.rasterSampleCount = sampleCount;
         desc.colorAttachments[0].blendingEnabled = YES;
         desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
@@ -584,6 +553,18 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
       [library release];
     }
 
+    // Create and bind overlay depth-stencil state (always pass, no write)
+    if (!this->Internals->OverlayDepthState)
+    {
+      MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
+      dsDesc.depthCompareFunction = MTLCompareFunctionAlways;
+      dsDesc.depthWriteEnabled = NO;
+      this->Internals->OverlayDepthState =
+          [device newDepthStencilStateWithDescriptor:dsDesc];
+      [dsDesc release];
+    }
+    [encoder setDepthStencilState:this->Internals->OverlayDepthState];
+
     // Set state buffer at buffer index 1
     [encoder setVertexBuffer:this->Internals->StateBuffer offset:0 atIndex:1];
     [encoder setFragmentBuffer:this->Internals->StateBuffer offset:0 atIndex:0];
@@ -598,7 +579,6 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         this->Internals->TriangleIndexCount > 0)
     {
       [encoder setRenderPipelineState:this->Internals->TrianglePipeline];
-      [encoder setVertexBuffer:this->Internals->ColorBuffer offset:0 atIndex:2];
 
       [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                           indexCount:this->Internals->TriangleIndexCount
@@ -614,7 +594,6 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         this->Internals->LineIndexCount > 0)
     {
       [encoder setRenderPipelineState:this->Internals->LinePipeline];
-      [encoder setVertexBuffer:this->Internals->ColorBuffer offset:0 atIndex:2];
 
       [encoder drawIndexedPrimitives:MTLPrimitiveTypeLine
                           indexCount:this->Internals->LineIndexCount
@@ -630,7 +609,6 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         this->Internals->PointIndexCount > 0)
     {
       [encoder setRenderPipelineState:this->Internals->PointPipeline];
-      [encoder setVertexBuffer:this->Internals->ColorBuffer offset:0 atIndex:2];
 
       [encoder drawIndexedPrimitives:MTLPrimitiveTypePoint
                           indexCount:this->Internals->PointIndexCount
@@ -645,6 +623,7 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
 void vtkMetalPolyDataMapper2D::ReleaseGraphicsResources(vtkWindow* w)
 {
   this->Internals->ReleaseBuffers();
+  this->Internals->ReleaseState();
   this->Internals->ReleasePipelines();
   this->Superclass::ReleaseGraphicsResources(w);
 }

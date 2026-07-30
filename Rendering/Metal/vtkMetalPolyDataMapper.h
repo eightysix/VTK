@@ -84,6 +84,9 @@ protected:
   std::map<std::string, ExtraAttributeValue> ExtraAttributes;
   vtkTimeStamp ExtraAttributesMTime;
 
+  // P1-3: Ensure fallback buffers exist for all shader-required bindings
+  void EnsureRequiredBindingFallbacks(void* mtlDevice);
+
   // 8C: Render bundle caching — pre-recorded encoder commands for static geometry
   void ReplayRenderBundle(void* mtlRenderCommandEncoder);
   void RebuildRenderBundle(void* mtlRenderCommandEncoder, vtkRenderer* ren, vtkActor* act);

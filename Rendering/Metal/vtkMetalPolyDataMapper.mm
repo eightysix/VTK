@@ -97,13 +97,31 @@ constexpr uint32_t VTK_METAL_SCENE_FLAG_SPHERE_POINTS       = 1u << 5;
 constexpr uint32_t VTK_METAL_SCENE_FLAG_POINT_SHAPE         = 1u << 7;
 constexpr uint32_t VTK_METAL_SCENE_FLAG_HAS_SURFACE_COLORS  = 1u << 8;
 constexpr uint32_t VTK_METAL_SCENE_FLAG_HAS_ACTOR_TEXTURE   = 1u << 9;
+constexpr uint32_t VTK_METAL_SCENE_FLAG_HAS_SURFACE_ALPHA   = 1u << 10;
 
 constexpr uint32_t VTK_METAL_DYNAMIC_ACTOR_FLAG_MASK =
     VTK_METAL_SCENE_FLAG_VERTEX_VISIBILITY |
     VTK_METAL_SCENE_FLAG_SPHERE_POINTS |
     VTK_METAL_SCENE_FLAG_POINT_SHAPE |
     VTK_METAL_SCENE_FLAG_HAS_SURFACE_COLORS |
-    VTK_METAL_SCENE_FLAG_HAS_ACTOR_TEXTURE;
+    VTK_METAL_SCENE_FLAG_HAS_ACTOR_TEXTURE |
+    VTK_METAL_SCENE_FLAG_HAS_SURFACE_ALPHA;
+
+id<MTLBuffer> CreateZeroBuffer(id<MTLDevice> device, size_t bytes)
+{
+  if (!device || bytes == 0)
+  {
+    return nil;
+  }
+  id<MTLBuffer> buffer =
+      [device newBufferWithLength:bytes
+                          options:MTLResourceStorageModeShared];
+  if (buffer)
+  {
+    memset([buffer contents], 0, bytes);
+  }
+  return buffer;
+}
 
 } // namespace
 
@@ -163,7 +181,19 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLBuffer> LineSegmentCellIdBuffer = nil; // GPU: per-line-segment cell IDs (thick/round/miter lines, by instance_id)
   id<MTLBuffer> PointCellIdBuffer = nil;       // GPU: per-point cell IDs
   id<MTLBuffer> EdgeCellIdBuffer = nil;
+  id<MTLBuffer> EdgeUVBuffer = nil;            // P1-2: edge overlay UV coordinates
   id<MTLBuffer> PropIdBuffer = nil;            // single uint32: actor prop ID
+
+  // P2-4: separate alpha flag for opacity-only overrides
+  bool HasSurfaceAlpha = false;
+
+  // P1-3: zero fallback buffers — always provide valid bindings for shader-required slots
+  id<MTLBuffer> ZeroTriangleCellIdBuffer = nil;
+  id<MTLBuffer> ZeroLineCellIdBuffer = nil;
+  id<MTLBuffer> ZeroEdgeCellIdBuffer = nil;
+  id<MTLBuffer> ZeroTriangleUVBuffer = nil;
+  id<MTLBuffer> ZeroEdgeUVBuffer = nil;
+
   vtkIdType TrianglePrimitiveCount = 0;        // number of triangles for compute dispatch
   vtkIdType LinePrimitiveCount = 0;            // number of line segments for compute dispatch
 
@@ -436,7 +466,17 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     vtkMetalMRC::ReleaseAndNil(LineSegmentCellIdBuffer);
     vtkMetalMRC::ReleaseAndNil(PointCellIdBuffer);
     vtkMetalMRC::ReleaseAndNil(EdgeCellIdBuffer);
+    vtkMetalMRC::ReleaseAndNil(EdgeUVBuffer);
     vtkMetalMRC::ReleaseAndNil(PropIdBuffer);
+
+    vtkMetalMRC::ReleaseAndNil(ZeroTriangleCellIdBuffer);
+    vtkMetalMRC::ReleaseAndNil(ZeroLineCellIdBuffer);
+    vtkMetalMRC::ReleaseAndNil(ZeroEdgeCellIdBuffer);
+    vtkMetalMRC::ReleaseAndNil(ZeroTriangleUVBuffer);
+    vtkMetalMRC::ReleaseAndNil(ZeroEdgeUVBuffer);
+
+    HasSurfaceAlpha = false;
+
     TrianglePrimitiveCount = 0;
     LinePrimitiveCount = 0;
 
@@ -865,17 +905,29 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
         recordFBuf(this->Internals->ClipPlaneBuffer, 0, 5);
         recordVBuf(this->Internals->ClipPlaneBuffer, 0, 5);
       }
+      // P1-3: Fallback-safe cell ID binding for triangles (vertex stage)
       if (this->Internals->TriangleCellIdBuffer)
       {
         recordVBuf(this->Internals->TriangleCellIdBuffer, 0, 6);
       }
+      else if (this->Internals->ZeroTriangleCellIdBuffer)
+      {
+        recordVBuf(this->Internals->ZeroTriangleCellIdBuffer, 0, 6);
+      }
+
       if (this->Internals->PropIdBuffer)
       {
         recordVBuf(this->Internals->PropIdBuffer, 0, 7);
       }
+
+      // P1-3: Fallback-safe UV binding for triangles (vertex stage)
       if (this->Internals->TriangleUVBuffer)
       {
         recordVBuf(this->Internals->TriangleUVBuffer, 0, 8);
+      }
+      else if (this->Internals->ZeroTriangleUVBuffer)
+      {
+        recordVBuf(this->Internals->ZeroTriangleUVBuffer, 0, 8);
       }
       // 8D: Bind extra attribute buffers at buffer indices 16+
       {
@@ -1121,18 +1173,39 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       {
         recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
       }
+
+      // P1-1: Bind clip planes for 1px lines (both vertex and fragment stages)
+      if (this->Internals->ClipPlaneBuffer)
+      {
+        recordVBuf(this->Internals->ClipPlaneBuffer, 0, 5);
+        recordFBuf(this->Internals->ClipPlaneBuffer, 0, 5);
+      }
+
+      // P1-3: Fallback-safe cell ID binding for lines (vertex stage)
       if (this->Internals->LineCellIdBuffer)
       {
         recordVBuf(this->Internals->LineCellIdBuffer, 0, 6);
       }
+      else if (this->Internals->ZeroLineCellIdBuffer)
+      {
+        recordVBuf(this->Internals->ZeroLineCellIdBuffer, 0, 6);
+      }
+
       if (this->Internals->PropIdBuffer)
       {
         recordVBuf(this->Internals->PropIdBuffer, 0, 7);
       }
+
+      // P1-3: Fallback-safe UV binding for lines (vertex stage)
       if (this->Internals->TriangleUVBuffer)
       {
         recordVBuf(this->Internals->TriangleUVBuffer, 0, 8);
       }
+      else if (this->Internals->ZeroTriangleUVBuffer)
+      {
+        recordVBuf(this->Internals->ZeroTriangleUVBuffer, 0, 8);
+      }
+
       {
         id<MTLTexture> texToBind = this->Internals->ActorTexture;
         id<MTLSamplerState> samplerToBind = this->Internals->ActorSampler;
@@ -1186,18 +1259,38 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
     {
       recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
     }
+    // P1-3: Fallback-safe cell ID binding for edges (vertex stage)
     if (this->Internals->EdgeCellIdBuffer)
     {
       recordVBuf(this->Internals->EdgeCellIdBuffer, 0, 6);
     }
-    else if (this->Internals->LineCellIdBuffer)
+    else if (this->Internals->ZeroEdgeCellIdBuffer)
     {
-      recordVBuf(this->Internals->LineCellIdBuffer, 0, 6);
+      recordVBuf(this->Internals->ZeroEdgeCellIdBuffer, 0, 6);
     }
+
     if (this->Internals->PropIdBuffer)
     {
       recordVBuf(this->Internals->PropIdBuffer, 0, 7);
     }
+
+    // P1-2: Bind edge UV buffer (vertex stage index 8)
+    if (this->Internals->EdgeUVBuffer)
+    {
+      recordVBuf(this->Internals->EdgeUVBuffer, 0, 8);
+    }
+    else if (this->Internals->ZeroEdgeUVBuffer)
+    {
+      recordVBuf(this->Internals->ZeroEdgeUVBuffer, 0, 8);
+    }
+
+    // P1-1: Bind clip planes for edge overlay
+    if (this->Internals->ClipPlaneBuffer)
+    {
+      recordVBuf(this->Internals->ClipPlaneBuffer, 0, 5);
+      recordFBuf(this->Internals->ClipPlaneBuffer, 0, 5);
+    }
+
     recordCull(MTLCullModeNone);
     recordIdxDraw(MTLPrimitiveTypeLine, this->Internals->EdgeIndexCount, MTLIndexTypeUInt32,
       this->Internals->EdgeIndexBuffer, 0);
@@ -1487,6 +1580,105 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
 }
 
 //------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::EnsureRequiredBindingFallbacks(void* mtlDevice)
+{
+  id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
+
+  const vtkIdType vertexCount =
+      this->Internals->VertexPositionBuffer
+          ? static_cast<vtkIdType>(
+                [this->Internals->VertexPositionBuffer length] /
+                (3 * sizeof(float)))
+          : 0;
+
+  const vtkIdType edgeVertexCount = this->Internals->EdgeVertexCount;
+
+  // Zero cell ID buffers
+  if (vertexCount > 0)
+  {
+    if (!this->Internals->ZeroTriangleCellIdBuffer)
+    {
+      id<MTLBuffer> buffer =
+          CreateZeroBuffer(device, static_cast<size_t>(vertexCount) * sizeof(uint32_t));
+      if (!buffer)
+      {
+        vtkErrorMacro(<< "Failed to allocate ZeroTriangleCellIdBuffer (" << vertexCount << " entries)");
+      }
+      vtkMetalMRC::AssignConsumed(this->Internals->ZeroTriangleCellIdBuffer, buffer);
+    }
+
+    if (!this->Internals->ZeroLineCellIdBuffer)
+    {
+      id<MTLBuffer> buffer =
+          CreateZeroBuffer(device, static_cast<size_t>(vertexCount) * sizeof(uint32_t));
+      if (!buffer)
+      {
+        vtkErrorMacro(<< "Failed to allocate ZeroLineCellIdBuffer (" << vertexCount << " entries)");
+      }
+      vtkMetalMRC::AssignConsumed(this->Internals->ZeroLineCellIdBuffer, buffer);
+    }
+
+    if (!this->Internals->ZeroTriangleUVBuffer)
+    {
+      id<MTLBuffer> buffer =
+          CreateZeroBuffer(device, static_cast<size_t>(vertexCount) * 2 * sizeof(float));
+      if (!buffer)
+      {
+        vtkErrorMacro(<< "Failed to allocate ZeroTriangleUVBuffer (" << vertexCount << " entries)");
+      }
+      vtkMetalMRC::AssignConsumed(this->Internals->ZeroTriangleUVBuffer, buffer);
+    }
+  }
+
+  if (edgeVertexCount > 0)
+  {
+    if (!this->Internals->ZeroEdgeCellIdBuffer)
+    {
+      id<MTLBuffer> buffer =
+          CreateZeroBuffer(device, static_cast<size_t>(edgeVertexCount) * sizeof(uint32_t));
+      if (!buffer)
+      {
+        vtkErrorMacro(<< "Failed to allocate ZeroEdgeCellIdBuffer (" << edgeVertexCount << " entries)");
+      }
+      vtkMetalMRC::AssignConsumed(this->Internals->ZeroEdgeCellIdBuffer, buffer);
+    }
+
+    if (!this->Internals->ZeroEdgeUVBuffer)
+    {
+      id<MTLBuffer> buffer =
+          CreateZeroBuffer(device, static_cast<size_t>(edgeVertexCount) * 2 * sizeof(float));
+      if (!buffer)
+      {
+        vtkErrorMacro(<< "Failed to allocate ZeroEdgeUVBuffer (" << edgeVertexCount << " entries)");
+      }
+      vtkMetalMRC::AssignConsumed(this->Internals->ZeroEdgeUVBuffer, buffer);
+    }
+  }
+
+  // Prop ID buffer should always exist if anything is drawable.
+  if (!this->Internals->PropIdBuffer)
+  {
+    uint32_t propId = 0;
+    id<MTLBuffer> buffer =
+        [device newBufferWithBytes:&propId
+                            length:sizeof(uint32_t)
+                           options:MTLResourceStorageModeShared];
+    vtkMetalMRC::AssignConsumed(this->Internals->PropIdBuffer, buffer);
+  }
+
+  // Clip plane buffer should always exist.
+  if (!this->Internals->ClipPlaneBuffer)
+  {
+    float cp[28] = {};
+    id<MTLBuffer> buffer =
+        [device newBufferWithBytes:cp
+                            length:sizeof(cp)
+                           options:MTLResourceStorageModeShared];
+    vtkMetalMRC::AssignConsumed(this->Internals->ClipPlaneBuffer, buffer);
+  }
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
 {
   vtkMetalRenderWindow* renWin = vtkMetalRenderWindow::SafeDownCast(ren->GetRenderWindow());
@@ -1524,6 +1716,13 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     {
       scalarMTime = std::max(scalarMTime,
         static_cast<vtkMTimeType>(this->GetLookupTable()->GetMTime()));
+    }
+
+    // P2-1: Include actor property MTime so visual property changes force geometry rebuild
+    {
+      vtkProperty* prop = act ? act->GetProperty() : nullptr;
+      vtkMTimeType propertyMTime = prop ? prop->GetMTime() : 0;
+      scalarMTime = std::max(scalarMTime, propertyMTime);
     }
 
     vtkMTimeType batchOverrideMTime = this->Internals->BatchOverrideMTime;
@@ -1683,6 +1882,11 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         actorFlags |= VTK_METAL_SCENE_FLAG_HAS_SURFACE_COLORS;
       }
 
+      if (this->Internals->HasSurfaceAlpha)
+      {
+        actorFlags |= VTK_METAL_SCENE_FLAG_HAS_SURFACE_ALPHA;
+      }
+
       if (this->Internals->ActorTexture)
       {
         actorFlags |= VTK_METAL_SCENE_FLAG_HAS_ACTOR_TEXTURE;
@@ -1697,6 +1901,20 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     this->UpdateCoincidentOffsetUniforms((void*)device, act);
     this->UpdateVertexColorUniforms((void*)device, act);
     this->UpdateClipPlaneUniforms((void*)device, act);
+
+    // P1-2: Create fallback edge UV buffer if edge overlay is active but no UVs were built
+    if (this->Internals->HasEdgeOverlay &&
+        this->Internals->EdgeVertexCount > 0 &&
+        !this->Internals->EdgeUVBuffer)
+    {
+      size_t uvCount = static_cast<size_t>(this->Internals->EdgeVertexCount) * 2;
+      id<MTLBuffer> buffer = CreateZeroBuffer(device, uvCount * sizeof(float));
+      vtkMetalMRC::AssignConsumed(this->Internals->EdgeUVBuffer, buffer);
+    }
+
+    // P1-3: Ensure fallback buffers exist for all shader-required bindings
+    this->EnsureRequiredBindingFallbacks((void*)device);
+
     if (this->Internals->HasOverridePropId)
     {
       this->SetPropId(this->Internals->OverridePropId);
@@ -1814,7 +2032,10 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         this->Internals->BundleExtraAttributesMTime == extraMTime &&
         this->Internals->BundleBatchOverrideMTime == batchOverrideMTime;
 
-    if (bundleValid)
+    // P1-4: Disable bundle caching during peel passes to avoid stale texture bindings
+    const bool allowBundleCaching = (currentPeelMode == 0);
+
+    if (allowBundleCaching && bundleValid)
     {
       this->ReplayRenderBundle((void*)encoder);
     }
@@ -1822,6 +2043,11 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     {
       this->RebuildRenderBundle((void*)encoder, ren, act);
       this->ReplayRenderBundle((void*)encoder);
+
+      if (!allowBundleCaching)
+      {
+        this->Internals->Bundle.Valid = false;
+      }
     }
   }
 }
@@ -1849,6 +2075,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   std::vector<float> edgePositions;
   std::vector<float> edgeNormals;
   std::vector<float> edgeColors;
+  std::vector<float> edgeUVs;              // P1-2: edge overlay UV coordinates (float2 per vertex)
   std::vector<uint32_t> edgeIndices;
   std::unordered_map<vtkIdType, uint32_t> edgeVertexMap;
 
@@ -2900,19 +3127,12 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
               polydata->GetPoint(tri[j], p[j]);
             }
 
-            // Compute face normal
-            float e1[3] = { (float)(p[1][0] - p[0][0]), (float)(p[1][1] - p[0][1]), (float)(p[1][2] - p[0][2]) };
-            float e2[3] = { (float)(p[2][0] - p[0][0]), (float)(p[2][1] - p[0][1]), (float)(p[2][2] - p[0][2]) };
-            float fn[3] = { 0.0f, 1.0f, 0.0f };
-
-            if (normalArray)
+            // Compute face normal once (used when normalArray is null)
+            float faceNormal[3] = { 0.0f, 1.0f, 0.0f };
+            if (!normalArray)
             {
-              double nn[3];
-              normalArray->GetTuple(tri[0], nn);
-              fn[0] = (float)nn[0]; fn[1] = (float)nn[1]; fn[2] = (float)nn[2];
-            }
-            else
-            {
+              float e1[3] = { (float)(p[1][0] - p[0][0]), (float)(p[1][1] - p[0][1]), (float)(p[1][2] - p[0][2]) };
+              float e2[3] = { (float)(p[2][0] - p[0][0]), (float)(p[2][1] - p[0][1]), (float)(p[2][2] - p[0][2]) };
               float ne1 = std::sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
               float ne2 = std::sqrt(e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]);
               if (ne1 > 1e-8f && ne2 > 1e-8f)
@@ -2920,11 +3140,13 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
                 e1[0] /= ne1; e1[1] /= ne1; e1[2] /= ne1;
                 e2[0] /= ne2; e2[1] /= ne2; e2[2] /= ne2;
               }
+              float fn[3] = { 0.0f, 1.0f, 0.0f };
               fn[0] = e1[1] * e2[2] - e1[2] * e2[1];
               fn[1] = e1[2] * e2[0] - e1[0] * e2[2];
               fn[2] = e1[0] * e2[1] - e1[1] * e2[0];
-              float nn = std::sqrt(fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2]);
-              if (nn > 1e-8f) { fn[0] /= nn; fn[1] /= nn; fn[2] /= nn; }
+              float normalLength = std::sqrt(fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2]);
+              if (normalLength > 1e-8f) { fn[0] /= normalLength; fn[1] /= normalLength; fn[2] /= normalLength; }
+              faceNormal[0] = fn[0]; faceNormal[1] = fn[1]; faceNormal[2] = fn[2];
             }
 
             for (int j = 0; j < 3; ++j)
@@ -2932,9 +3154,22 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
               positions.push_back(static_cast<float>(p[j][0]));
               positions.push_back(static_cast<float>(p[j][1]));
               positions.push_back(static_cast<float>(p[j][2]));
-              normals.push_back(fn[0]);
-              normals.push_back(fn[1]);
-              normals.push_back(fn[2]);
+
+              // P2-2: Per-vertex normals (use each vertex's own normal when available)
+              if (normalArray)
+              {
+                double nn[3];
+                normalArray->GetTuple(tri[j], nn);
+                normals.push_back(static_cast<float>(nn[0]));
+                normals.push_back(static_cast<float>(nn[1]));
+                normals.push_back(static_cast<float>(nn[2]));
+              }
+              else
+              {
+                normals.push_back(faceNormal[0]);
+                normals.push_back(faceNormal[1]);
+                normals.push_back(faceNormal[2]);
+              }
 
               // P1-1B: per-vertex color from cell scalar mapping
               emitSurfaceColor(polyCellIdx, mappedColors ? mappedColors->GetPointer(0) : nullptr);
@@ -3025,6 +3260,7 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
         edgePositions.clear();
         edgeNormals.clear();
         edgeColors.clear();
+        edgeUVs.clear();
         edgeIndices.clear();
         edgeVertexMap.clear();
 
@@ -3068,6 +3304,20 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
             edgeColors.push_back(1.0f);
             edgeColors.push_back(1.0f);
           }
+          // P1-2: Per-vertex texture coordinates for edge overlay
+          if (tcoordArray && tcoordArray->GetNumberOfTuples() > pointId)
+          {
+            double uv[3];
+            tcoordArray->GetTuple(pointId, uv);
+            edgeUVs.push_back(static_cast<float>(uv[0]));
+            edgeUVs.push_back(static_cast<float>(uv[1]));
+          }
+          else
+          {
+            edgeUVs.push_back(0.0f);
+            edgeUVs.push_back(0.0f);
+          }
+
           edgeVertexCellIds.push_back(static_cast<uint32_t>(cellId + polyCellOffset) + 1u);
           return idx;
         };
@@ -3322,6 +3572,16 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
       vtkMetalMRC::AssignConsumed(this->Internals->EdgeSurfaceColorBuffer, colorBuffer);
     }
 
+    // P1-2: Upload edge overlay UV coordinates (float2 per vertex)
+    if (!edgeUVs.empty())
+    {
+      id<MTLBuffer> uvBuffer =
+        [device newBufferWithBytes:edgeUVs.data()
+                            length:edgeUVs.size() * sizeof(float)
+                           options:MTLResourceStorageModeShared];
+      vtkMetalMRC::AssignConsumed(this->Internals->EdgeUVBuffer, uvBuffer);
+    }
+
     id<MTLBuffer> idxBuffer =
       [device newBufferWithBytes:edgeIndices.data()
                           length:edgeIndices.size() * sizeof(uint32_t)
@@ -3351,7 +3611,22 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
                  length:surfaceColors.size() * sizeof(float)
                 options:MTLResourceStorageModeShared];
     vtkMetalMRC::AssignConsumed(this->Internals->SurfaceColorBuffer, surfColorBuf);
-    this->Internals->HasSurfaceColors = (mappedColors != nullptr) || this->Internals->UseBatchColor || this->Internals->UseBatchOpacity;
+    this->Internals->HasSurfaceColors =
+        (mappedColors != nullptr) || this->Internals->UseBatchColor;
+
+    // P2-4: Detect whether any surface color has non-opaque alpha
+    bool hasNonOpaqueAlpha = false;
+    for (size_t ac = 3; ac < surfaceColors.size() && !hasNonOpaqueAlpha; ac += 4)
+    {
+      if (surfaceColors[ac] < 0.999f)
+      {
+        hasNonOpaqueAlpha = true;
+      }
+    }
+    this->Internals->HasSurfaceAlpha =
+        this->Internals->HasSurfaceColors ||
+        this->Internals->UseBatchOpacity ||
+        hasNonOpaqueAlpha;
   }
   else if (!positions.empty())
   {
@@ -3431,6 +3706,13 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
     vtkMetalMRC::AssignRetained(
         this->Internals->EdgeSurfaceColorBuffer,
         this->Internals->SurfaceColorBuffer);
+
+    if (this->Internals->TriangleUVBuffer)
+    {
+      vtkMetalMRC::AssignRetained(
+          this->Internals->EdgeUVBuffer,
+          this->Internals->TriangleUVBuffer);
+    }
   }
 
   // P2-8: Create per-vertex cell ID buffer for triangles
@@ -4879,7 +5161,8 @@ void vtkMetalPolyDataMapper::UpdateActorTexture(void* mtlDevice, vtkActor* actor
   {
     for (int x = 0; x < width; ++x)
     {
-      unsigned char* srcPtr = static_cast<unsigned char*>(image->GetScalarPointer(xMin + x, yMin + y, 0));
+      // P2-3: Flip Y so texture origin (top-left) matches VTK's bottom-left origin
+      unsigned char* srcPtr = static_cast<unsigned char*>(image->GetScalarPointer(xMin + x, yMin + (height - 1 - y), 0));
       int dstIdx = (y * width + x) * 4;
       unsigned char* dst = rgbaData + dstIdx;
 

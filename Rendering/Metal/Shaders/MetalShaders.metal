@@ -210,7 +210,8 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
   float diffuseIntensity = material.diffuseColor.w;
   float3 specularColor = material.specularColor.rgb;
   float specularIntensity = material.specularColor.w;
-  float baseOpacity = hasVertexColors ? in.vertexColor.a : material.opacity;
+  bool hasSurfaceAlpha = (scene.flags & (1u << 10)) != 0u;
+  float baseOpacity = hasSurfaceAlpha ? in.vertexColor.a : material.opacity;
 
   bool hasTexture = (scene.flags & (1u << 9)) != 0u;
   if (hasTexture) {
@@ -239,7 +240,9 @@ fragment FragmentOutput fragment_edge_main(VertexOut in [[stage_in]],
                                    constant MaterialUniforms& material [[buffer(0)]],
                                    constant SceneUniforms& scene [[buffer(2)]],
                                    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
-                                   constant float4& edgeColor [[buffer(4)]]) {
+                                   constant float4& edgeColor [[buffer(4)]],
+                                   constant ClipPlaneUniforms& clipPlanes [[buffer(5)]]) {
+  if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
   FragmentOutput out;
   out.color = float4(edgeColor.rgb, edgeColor.a * material.opacity);
   out.ids = uint4(in.cellId, in.propId, 1u, 0u);
@@ -993,7 +996,8 @@ fragment PeelPassOutput fragment_peel(
   bool hasVertexColors = (scene.flags & (1u << 8)) != 0u;
   float3 ambientColor = hasVertexColors ? in.vertexColor.rgb : material.ambientColor.rgb;
   float3 diffuseColor = hasVertexColors ? in.vertexColor.rgb : material.diffuseColor.rgb;
-  float baseOpacity = hasVertexColors ? in.vertexColor.a : material.opacity;
+  bool hasSurfaceAlpha = (scene.flags & (1u << 10)) != 0u;
+  float baseOpacity = hasSurfaceAlpha ? in.vertexColor.a : material.opacity;
 
   if ((scene.flags & (1u << 9)) != 0u) {
     float4 texColor = actorTexture.sample(actorSampler, in.uv);
@@ -1045,7 +1049,8 @@ fragment float4 fragment_peel_alpha_blend(
   bool hasVertexColors = (scene.flags & (1u << 8)) != 0u;
   float3 ambientColor = hasVertexColors ? in.vertexColor.rgb : material.ambientColor.rgb;
   float3 diffuseColor = hasVertexColors ? in.vertexColor.rgb : material.diffuseColor.rgb;
-  float baseOpacity = hasVertexColors ? in.vertexColor.a : material.opacity;
+  bool hasSurfaceAlpha = (scene.flags & (1u << 10)) != 0u;
+  float baseOpacity = hasSurfaceAlpha ? in.vertexColor.a : material.opacity;
 
   if ((scene.flags & (1u << 9)) != 0u) {
     float4 texColor = actorTexture.sample(actorSampler, in.uv);
