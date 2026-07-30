@@ -24,6 +24,7 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <cmath>
 
 #include "vtkMetalMRC.h"
 
@@ -37,36 +38,7 @@ vtkMetalBatchedPolyDataMapper::vtkMetalBatchedPolyDataMapper() = default;
 //------------------------------------------------------------------------------
 vtkMetalBatchedPolyDataMapper::~vtkMetalBatchedPolyDataMapper()
 {
-  this->ReleaseBatchPropertiesBuffer();
   this->ReleaseChildMappers(nullptr);
-}
-
-//------------------------------------------------------------------------------
-void vtkMetalBatchedPolyDataMapper::ReleaseBatchPropertiesBuffer()
-{
-  if (this->BatchPropertiesBuffer)
-  {
-    [(id)this->BatchPropertiesBuffer release];
-    this->BatchPropertiesBuffer = nullptr;
-    this->BatchPropertiesBufferSize = 0;
-  }
-}
-
-//------------------------------------------------------------------------------
-void vtkMetalBatchedPolyDataMapper::SetBatchPropertiesBufferConsumed(void* buffer)
-{
-  id<MTLBuffer> mtlBuffer = (id<MTLBuffer>)buffer;
-
-  if (this->BatchPropertiesBuffer != buffer)
-  {
-    this->ReleaseBatchPropertiesBuffer();
-    this->BatchPropertiesBuffer = buffer;
-    this->BatchPropertiesBufferSize = mtlBuffer ? (size_t)[mtlBuffer length] : 0;
-  }
-  else
-  {
-    [mtlBuffer release];
-  }
 }
 
 //------------------------------------------------------------------------------
@@ -179,8 +151,6 @@ void vtkMetalBatchedPolyDataMapper::ClearBatchElements()
   this->VTKPolyDataToBatchElement.clear();
   this->FlatIndexToPolyData.clear();
 
-  this->ReleaseBatchPropertiesBuffer();
-
   this->GeometryDirty = true;
   this->Modified();
 }
@@ -278,82 +248,10 @@ vtkMTimeType vtkMetalBatchedPolyDataMapper::GetMTime()
 void vtkMetalBatchedPolyDataMapper::ReleaseGraphicsResources(vtkWindow* w)
 {
   this->ReleaseChildMappers(w);
-  this->ReleaseBatchPropertiesBuffer();
 
-  this->ResourcesSyncTimeStamp = vtkTimeStamp();
   this->GeometryDirty = true;
 
   this->Superclass::ReleaseGraphicsResources(w);
-}
-
-//------------------------------------------------------------------------------
-void vtkMetalBatchedPolyDataMapper::UpdateBatchPropertiesBuffer(void* mtlDevice)
-{
-  if (this->VTKPolyDataToBatchElement.empty())
-  {
-    return;
-  }
-
-  id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
-  const size_t batchSize = this->VTKPolyDataToBatchElement.size();
-  const size_t bufferSize = batchSize * AlignedPropertiesSize;
-
-  if (this->BatchPropertiesBufferSize != bufferSize)
-  {
-    id<MTLBuffer> newBuf = [device
-      newBufferWithLength:bufferSize
-                 options:MTLResourceStorageModeShared];
-    this->SetBatchPropertiesBufferConsumed(newBuf);
-  }
-
-  id<MTLBuffer> propBuffer = (id<MTLBuffer>)this->BatchPropertiesBuffer;
-  char* buf = static_cast<char*>([propBuffer contents]);
-  uint32_t cellIdOffsetForSelector = 0;
-  uint32_t cellIdOffsetForVerts = 0;
-  uint32_t cellIdOffsetForLines = 0;
-  uint32_t cellIdOffsetForPolys = 0;
-
-  for (const auto& iter : this->VTKPolyDataToBatchElement)
-  {
-    const auto& batchElement = iter.second;
-    if (!batchElement->Visibility)
-    {
-      continue;
-    }
-
-    CompositeDataProperties props = {};
-    props.ApplyOverrideColors = batchElement->OverridesColor ? 1u : 0u;
-    props.Opacity = static_cast<float>(batchElement->Opacity);
-    props.CompositeId = batchElement->FlatIndex;
-    props.Pickable = batchElement->Pickability ? 1u : 0u;
-    props.Ambient[0] = static_cast<float>(batchElement->AmbientColor[0]);
-    props.Ambient[1] = static_cast<float>(batchElement->AmbientColor[1]);
-    props.Ambient[2] = static_cast<float>(batchElement->AmbientColor[2]);
-    props.Diffuse[0] = static_cast<float>(batchElement->DiffuseColor[0]);
-    props.Diffuse[1] = static_cast<float>(batchElement->DiffuseColor[1]);
-    props.Diffuse[2] = static_cast<float>(batchElement->DiffuseColor[2]);
-
-    vtkPolyData* pd = batchElement->PolyData;
-    props.CellIdOffsetForVerts = cellIdOffsetForVerts;
-    cellIdOffsetForVerts +=
-      static_cast<uint32_t>(pd->GetNumberOfLines() + pd->GetNumberOfPolys());
-
-    props.CellIdOffsetForLines = cellIdOffsetForLines;
-    cellIdOffsetForLines +=
-      static_cast<uint32_t>(pd->GetNumberOfVerts() + pd->GetNumberOfPolys());
-
-    props.CellIdOffsetForPolys = cellIdOffsetForPolys;
-    cellIdOffsetForPolys +=
-      static_cast<uint32_t>(pd->GetNumberOfVerts() + pd->GetNumberOfLines());
-
-    props.CellIdOffsetForSelector = cellIdOffsetForSelector;
-    cellIdOffsetForSelector += static_cast<uint32_t>(pd->GetNumberOfCells());
-
-    memcpy(buf, &props, sizeof(CompositeDataProperties));
-    buf += AlignedPropertiesSize;
-  }
-
-  this->ResourcesSyncTimeStamp.Modified();
 }
 
 //------------------------------------------------------------------------------
@@ -412,13 +310,6 @@ void vtkMetalBatchedPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     this->CachedChildConfigurationMTime = childConfigMTime;
   }
 
-  // Optional: keep batch properties updated.
-  vtkMTimeType currentMTime = this->GetMTime();
-  if (currentMTime != this->ResourcesSyncTimeStamp)
-  {
-    this->UpdateBatchPropertiesBuffer(renWin->GetMetalDevice());
-  }
-
   // Render in flat-index order, not pointer-address order.
   std::vector<const BatchElement*> visible;
   visible.reserve(this->VTKPolyDataToBatchElement.size());
@@ -438,6 +329,10 @@ void vtkMetalBatchedPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       return a->FlatIndex < b->FlatIndex;
     });
 
+  // Hoist actor-level properties that do not change per-batch-element.
+  double actorOpacity = act->GetProperty()->GetOpacity();
+  bool actorPickable = act->GetPickable();
+
   for (const BatchElement* elem : visible)
   {
     vtkSmartPointer<vtkMetalPolyDataMapper> mapper =
@@ -446,6 +341,57 @@ void vtkMetalBatchedPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     if (!mapper)
     {
       continue;
+    }
+
+    // Apply batch visual overrides for this element.
+    // BatchElement::Opacity is the final desired opacity for the block.
+    // When OverridesColor is true, the block opacity is always applied along
+    // with the override color (the element's diffuse color serves as both
+    // color and opacity override source).
+    // Detect whether opacity is explicitly overridden by comparing against the
+    // actor's baseline opacity, so we don't spuriously override when the element
+    // inherits the actor value.
+    bool overrideColor = elem->OverridesColor;
+    bool overrideOpacity =
+      overrideColor ||
+      (std::abs(elem->Opacity - actorOpacity) > 1e-12);
+
+    // NOTE: Opacity-only overrides switch the shader from material colors
+    // (ambientColor, diffuseColor) to vertex colors. For the common case
+    // where ambient/diffuse/color are synchronized this is fine, but actors
+    // with custom ambient/diffuse colors may see a slight lighting color
+    // change when only opacity is overridden.
+
+    if (overrideColor || overrideOpacity)
+    {
+      double overrideColorArr[3] = {
+        elem->DiffuseColor[0],
+        elem->DiffuseColor[1],
+        elem->DiffuseColor[2]
+      };
+      mapper->SetBatchVisualOverride(
+        overrideColor, overrideColorArr, overrideOpacity, elem->Opacity);
+    }
+    else
+    {
+      mapper->ClearBatchVisualOverride();
+    }
+
+    // Per-block picking ID.
+    // FlatIndex comes from the composite dataset's block index. These IDs
+    // are unique within a single batched mapper, but may collide with IDs
+    // from non-batched actors (which use GetOrCreatePropId's global counter)
+    // or from other batched mappers. If hardware picking is used across
+    // multiple mappers, batch elements should allocate from a shared ID
+    // space or encode the mapper ID separately.
+    bool pickable = actorPickable && elem->Pickability;
+    if (pickable)
+    {
+      mapper->SetOverridePropId(elem->FlatIndex);
+    }
+    else
+    {
+      mapper->SetOverridePropIdToNone();
     }
 
     mapper->RenderPiece(ren, act);

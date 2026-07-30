@@ -40,6 +40,19 @@ public:
   void SetPropId(uint32_t propId);
   uint32_t GetOrCreatePropId(vtkActor* act);
 
+  // Override prop ID (set by vtkMetalBatchedPolyDataMapper for per-block picking)
+  void SetOverridePropId(uint32_t zeroBasedPropId);
+  void SetOverridePropIdToNone();
+  void ClearOverridePropId();
+
+  // Batch visual overrides (set by vtkMetalBatchedPolyDataMapper)
+  void SetBatchVisualOverride(
+    bool overrideColor,
+    const double color[3],
+    bool overrideOpacity,
+    double opacity);
+  void ClearBatchVisualOverride();
+
   struct ExtraAttributeValue
   {
     std::string DataArrayName;

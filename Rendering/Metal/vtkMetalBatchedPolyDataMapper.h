@@ -61,41 +61,10 @@ private:
   vtkMetalBatchedPolyDataMapper(const vtkMetalBatchedPolyDataMapper&) = delete;
   void operator=(const vtkMetalBatchedPolyDataMapper&) = delete;
 
-  /**
-   * Per-mesh properties struct, matching WebGPU's CompositeDataProperties.
-   * Stored in a single MTLBuffer with 256-byte alignment per entry.
-   */
-  struct CompositeDataProperties
-  {
-    uint32_t ApplyOverrideColors = 0;
-    float Opacity = 1.0f;
-    uint32_t CompositeId = 0;
-    uint32_t Pickable = 1;
-    float Ambient[3] = { 1.0f, 1.0f, 1.0f };
-    uint32_t CellIdOffsetForVerts = 0;
-    float Diffuse[3] = { 1.0f, 1.0f, 1.0f };
-    uint32_t CellIdOffsetForLines = 0;
-    uint32_t CellIdOffsetForPolys = 0;
-    uint32_t CellIdOffsetForSelector = 0;
-  };
-
-  // Align to 256 bytes for Metal uniform buffer alignment
-  static constexpr size_t PropertiesAlignment = 256;
-  static constexpr size_t AlignedPropertiesSize =
-    (sizeof(CompositeDataProperties) + PropertiesAlignment - 1) & ~(PropertiesAlignment - 1);
-
-  void UpdateBatchPropertiesBuffer(void* mtlDevice);
-
   vtkCompositePolyDataMapper* Parent = nullptr;
   std::map<std::uintptr_t, std::unique_ptr<BatchElement>> VTKPolyDataToBatchElement;
   std::map<unsigned int, std::uintptr_t> FlatIndexToPolyData;
 
-  // Per-actor property buffer (all meshes' properties packed with alignment)
-  // id<MTLBuffer> stored as void* to avoid ObjC in C++ header
-  void* BatchPropertiesBuffer = nullptr;
-  size_t BatchPropertiesBufferSize = 0;
-
-  vtkTimeStamp ResourcesSyncTimeStamp;
   bool GeometryDirty = true;
   vtkMTimeType CachedChildConfigurationMTime = 0;
 
@@ -103,9 +72,7 @@ private:
 
   vtkSmartPointer<vtkMetalPolyDataMapper> GetChildMapper(vtkPolyData* polydata);
   void ReleaseChildMappers(vtkWindow* w);
-  void ReleaseBatchPropertiesBuffer();
   void ConfigureChildMapper(vtkMetalPolyDataMapper* child);
-  void SetBatchPropertiesBufferConsumed(void* buffer);
 };
 
 VTK_ABI_NAMESPACE_END

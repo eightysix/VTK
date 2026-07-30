@@ -84,8 +84,6 @@ private:
   // Fullscreen pass pipeline states
   id<MTLRenderPipelineState> CompositePipeline = nil;
   id<MTLRenderPipelineState> BackBlendPipeline = nil;
-  id<MTLRenderPipelineState> AlphaBlendPipeline = nil;
-
   // Peeling textures
   id<MTLTexture> FrontPeelA = nil;     // RGBA8 — front accumulation ping-pong A
   id<MTLTexture> FrontPeelB = nil;     // RGBA8 — front accumulation ping-pong B
@@ -93,12 +91,6 @@ private:
   id<MTLTexture> BackAccum = nil;      // RGBA8 — back-to-front accumulation
   id<MTLTexture> DepthPeelA = nil;     // RG32Float — min/max depth ping-pong A
   id<MTLTexture> DepthPeelB = nil;     // RG32Float — min/max depth ping-pong B
-
-  // Uniform buffer for peeling state
-  id<MTLBuffer> PeelUniformBuffer = nil;
-
-  // Sampler for peeling textures
-  id<MTLSamplerState> PeelSampler = nil;
 
   // Cached depth-stencil states (immutable, created once)
   id<MTLDepthStencilState> ReadOnlyDepthState = nil;   // Less, write=NO

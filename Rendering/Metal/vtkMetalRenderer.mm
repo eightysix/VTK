@@ -246,20 +246,40 @@ void vtkMetalRenderer::DeviceRender()
     // === Phase 2: Render translucent geometry ===
     bool hasTranslucent = this->HasTranslucentPolygonalGeometry();
 
-    if (hasTranslucent && this->GetUseDepthPeeling())
+    // Resolve MSAA depth to regular depth texture for volume mapper sampling.
+    // When translucent geometry exists, the translucent pass also resolves MSAA
+    // depth (via StoreAndMultisampleResolve), so the standalone resolve is
+    // only needed when there is no translucent geometry.
+    if (msaa && msaaDepthTex && !hasTranslucent)
     {
-      // Use depth peeling for correct order-independent transparency
-      // Get the depth texture used in the opaque pass
-      id<MTLTexture> depthTex = msaa ? msaaDepthTex :
-        (__bridge id<MTLTexture>)renWin->DepthTexture;
+      id<MTLTexture> depthTex = (__bridge id<MTLTexture>)renWin->DepthTexture;
+      if (depthTex)
+      {
+        MTLRenderPassDescriptor* resolveRpd =
+          [MTLRenderPassDescriptor renderPassDescriptor];
+        resolveRpd.depthAttachment.texture = msaaDepthTex;
+        resolveRpd.depthAttachment.resolveTexture = depthTex;
+        resolveRpd.depthAttachment.loadAction = MTLLoadActionLoad;
+        resolveRpd.depthAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
 
-      this->DepthPeeler->SetMaximumNumberOfPeels(this->MaximumNumberOfPeels);
-      this->DepthPeeler->RenderTranslucentGeometry(
-        this, commandBuffer, drawable.texture, depthTex);
+        id<MTLRenderCommandEncoder> depthResolve =
+          [commandBuffer renderCommandEncoderWithDescriptor:resolveRpd];
+        depthResolve.label = @"VTK MSAA Depth Resolve";
+        [depthResolve endEncoding];
+      }
     }
-    else if (hasTranslucent)
+
+    // Depth peeling is incompatible with MSAA — the intermediate peel textures
+    // are non-MSAA and cannot match an MSAA depth attachment.
+    bool useDepthPeeling = this->GetUseDepthPeeling() && !msaa;
+
+    auto renderStandardTranslucentPass = [&]()
     {
-      // Fallback: simple alpha blending (no depth peeling)
+      if (!hasTranslucent)
+      {
+        return;
+      }
+
       MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
 
       if (msaa && msaaColorTex)
@@ -277,9 +297,18 @@ void vtkMetalRenderer::DeviceRender()
 
       if (msaa && msaaDepthTex)
       {
+        id<MTLTexture> depthTex = (__bridge id<MTLTexture>)renWin->DepthTexture;
         rpd.depthAttachment.texture = msaaDepthTex;
         rpd.depthAttachment.loadAction = MTLLoadActionLoad;
-        rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+        if (depthTex)
+        {
+          rpd.depthAttachment.resolveTexture = depthTex;
+          rpd.depthAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+        }
+        else
+        {
+          rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+        }
       }
       else
       {
@@ -288,7 +317,7 @@ void vtkMetalRenderer::DeviceRender()
         {
           rpd.depthAttachment.texture = depthTex;
           rpd.depthAttachment.loadAction = MTLLoadActionLoad;
-          rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+          rpd.depthAttachment.storeAction = MTLStoreActionStore;
         }
       }
 
@@ -321,29 +350,37 @@ void vtkMetalRenderer::DeviceRender()
 
       [encoder endEncoding];
       renWin->Encoder = nullptr;
-    }
+    };
 
-    // Resolve MSAA depth to regular depth texture for volume mapper sampling.
-    // The volume shader samples the depth buffer for early ray termination,
-    // but multisampled textures cannot be sampled in fragment shaders.
-    if (msaa && msaaDepthTex)
+    if (hasTranslucent && useDepthPeeling)
     {
-      id<MTLTexture> depthTex = (__bridge id<MTLTexture>)renWin->DepthTexture;
-      if (depthTex)
+      if (this->MaximumNumberOfPeels <= 0)
       {
-        MTLRenderPassDescriptor* resolveRpd =
-          [MTLRenderPassDescriptor renderPassDescriptor];
-        resolveRpd.depthAttachment.texture = msaaDepthTex;
-        resolveRpd.depthAttachment.resolveTexture = depthTex;
-        resolveRpd.depthAttachment.loadAction = MTLLoadActionLoad;
-        resolveRpd.depthAttachment.storeAction = MTLStoreActionMultisampleResolve;
-        resolveRpd.depthAttachment.clearDepth = 1.0;
-
-        id<MTLRenderCommandEncoder> depthResolve =
-          [commandBuffer renderCommandEncoderWithDescriptor:resolveRpd];
-        depthResolve.label = @"VTK MSAA Depth Resolve for Volume";
-        [depthResolve endEncoding];
+        renderStandardTranslucentPass();
       }
+      else
+      {
+        // Use depth peeling for correct order-independent transparency
+        // Get the resolved depth texture from the opaque pass
+        // (msaa is always false here because depth peeling is disabled under MSAA)
+        id<MTLTexture> depthTex = (__bridge id<MTLTexture>)renWin->DepthTexture;
+
+        this->DepthPeeler->SetMaximumNumberOfPeels(this->MaximumNumberOfPeels);
+        int peels = this->DepthPeeler->RenderTranslucentGeometry(
+          this, commandBuffer, drawable.texture, depthTex);
+
+        // If depth peeling produced no results (e.g. nil depth texture), fall
+        // back to standard alpha-blended translucent rendering (with encoder).
+        // Peel textures are re-created on the next RenderTranslucentGeometry call.
+        if (peels == 0)
+        {
+          renderStandardTranslucentPass();
+        }
+      }
+    }
+    else if (hasTranslucent)
+    {
+      renderStandardTranslucentPass();
     }
 
     // === Phase 3: Render volumetric geometry ===

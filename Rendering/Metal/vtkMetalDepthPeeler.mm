@@ -47,16 +47,10 @@ void vtkMetalDepthPeeler::Release()
   this->DepthPeelA = nil;
   [this->DepthPeelB release];
   this->DepthPeelB = nil;
-  [this->PeelUniformBuffer release];
-  this->PeelUniformBuffer = nil;
-  [this->PeelSampler release];
-  this->PeelSampler = nil;
   [this->CompositePipeline release];
   this->CompositePipeline = nil;
   [this->BackBlendPipeline release];
   this->BackBlendPipeline = nil;
-  [this->AlphaBlendPipeline release];
-  this->AlphaBlendPipeline = nil;
   [this->ReadOnlyDepthState release];
   this->ReadOnlyDepthState = nil;
   [this->AlwaysDepthState release];
@@ -108,24 +102,6 @@ void vtkMetalDepthPeeler::CreateTextures(id<MTLDevice> device, int width, int he
   this->BackAccum = createRGBA8(width, height);
   this->DepthPeelA = createRG32F(width, height);
   this->DepthPeelB = createRG32F(width, height);
-
-  // Sampler for texture reads (nearest-neighbor for pixel-precise reads)
-  if (!this->PeelSampler)
-  {
-    MTLSamplerDescriptor* sDesc = [[MTLSamplerDescriptor alloc] init];
-    sDesc.minFilter = MTLSamplerMinMagFilterNearest;
-    sDesc.magFilter = MTLSamplerMinMagFilterNearest;
-    sDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
-    sDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
-    this->PeelSampler = [device newSamplerStateWithDescriptor:sDesc];
-  }
-
-  // Uniform buffer for peeling state
-  if (!this->PeelUniformBuffer)
-  {
-    this->PeelUniformBuffer = [device newBufferWithLength:16  // aligned to 16 bytes
-                                                 options:MTLResourceStorageModeShared];
-  }
 }
 
 //------------------------------------------------------------------------------
@@ -260,6 +236,16 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
 
   if (width <= 0 || height <= 0)
   {
+    return 0;
+  }
+
+  // Depth peeling does not support MSAA or nil depth textures.
+  // The intermediate peel textures are non-MSAA, so an MSAA depth attachment
+  // would mismatch the color attachment sample count.
+  if (!depthTexture || depthTexture.sampleCount > 1)
+  {
+    vtkGenericWarningMacro(<< "vtkMetalDepthPeeler: invalid or MSAA depth texture; "
+                           << "falling back to standard transparency.");
     return 0;
   }
 

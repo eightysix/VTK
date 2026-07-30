@@ -90,6 +90,21 @@ bool CommitAndWaitForCompletion(id<MTLCommandBuffer> cmdBuf)
     return cmdBuf.status == MTLCommandBufferStatusCompleted;
 }
 
+// Scene-uniform flag constants (offset 256 in SceneUniformBuffer)
+[[maybe_unused]] constexpr uint32_t VTK_METAL_SCENE_FLAG_PARALLEL_PROJECTION = 1u << 0;
+constexpr uint32_t VTK_METAL_SCENE_FLAG_VERTEX_VISIBILITY   = 1u << 3;
+constexpr uint32_t VTK_METAL_SCENE_FLAG_SPHERE_POINTS       = 1u << 5;
+constexpr uint32_t VTK_METAL_SCENE_FLAG_POINT_SHAPE         = 1u << 7;
+constexpr uint32_t VTK_METAL_SCENE_FLAG_HAS_SURFACE_COLORS  = 1u << 8;
+constexpr uint32_t VTK_METAL_SCENE_FLAG_HAS_ACTOR_TEXTURE   = 1u << 9;
+
+constexpr uint32_t VTK_METAL_DYNAMIC_ACTOR_FLAG_MASK =
+    VTK_METAL_SCENE_FLAG_VERTEX_VISIBILITY |
+    VTK_METAL_SCENE_FLAG_SPHERE_POINTS |
+    VTK_METAL_SCENE_FLAG_POINT_SHAPE |
+    VTK_METAL_SCENE_FLAG_HAS_SURFACE_COLORS |
+    VTK_METAL_SCENE_FLAG_HAS_ACTOR_TEXTURE;
+
 } // namespace
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -202,7 +217,6 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   // 8B: Depth peeling pipeline states (same vertex shader, peeling fragment shaders)
   id<MTLRenderPipelineState> TriangleInitPeelPipeline = nil;  // init depth range
   id<MTLRenderPipelineState> TrianglePeelPipeline = nil;      // main peel pass
-  id<MTLBuffer> PeelUniformBuffer = nil;                       // peel mode + pass index
 
   // 8D: Vertex attribute mapping — custom per-vertex buffers from user-mapped data arrays
   std::unordered_map<std::string, id<MTLBuffer>> ExtraAttributeBuffers;
@@ -319,6 +333,19 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
 
   vtkMTimeType CachedExtraAttributesMTime = 0;
 
+  // Override prop ID state (set by batched mapper for per-block picking)
+  bool HasOverridePropId = false;
+  uint32_t OverridePropId = 0;
+
+  // Batch visual override state (set by batched mapper)
+  bool UseBatchColor = false;
+  double BatchColor[3] = { 1.0, 1.0, 1.0 };
+  bool UseBatchOpacity = false;
+  double BatchOpacity = 1.0;
+  vtkMTimeType BatchOverrideMTime = 0;
+  vtkMTimeType CachedBatchOverrideMTime = 0;
+  vtkMTimeType BundleBatchOverrideMTime = 0;
+
   id<MTLCommandQueue> ComputeQueue = nil;
 
   id<MTLCommandQueue> EnsureComputeQueue(id<MTLDevice> device)
@@ -428,8 +455,6 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     CachedEdgeVisibility = false;
     CachedLineWidth = -1.0f;
 
-    vtkMetalMRC::ReleaseAndNil(PeelUniformBuffer);
-
     for (auto& kv : ExtraAttributeBuffers)
     {
       [kv.second release];
@@ -459,6 +484,8 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     BundleExtraAttributesMTime = 0;
 
     CachedExtraAttributesMTime = 0;
+    CachedBatchOverrideMTime = 0;
+    BundleBatchOverrideMTime = 0;
     CachedScalarMTime = 0;
   }
 
@@ -712,141 +739,200 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
 
   int representation = act->GetProperty()->GetRepresentation();
   float lineWidth = static_cast<float>(act->GetProperty()->GetLineWidth());
-  bool skipTriangles = (representation == VTK_WIREFRAME);
+
+  const bool isSurface = (representation == VTK_SURFACE);
+  const bool isWireframe = (representation == VTK_WIREFRAME);
+  const bool isPoints = (representation == VTK_POINTS);
+
   int peelMode = vtkMetalRenderWindow::SafeDownCast(ren->GetRenderWindow())->DepthPeelingMode;
+  const bool peelPassActive = (peelMode != 0);
+
+  // During peel passes the relevant pipelines are TriangleInitPeelPipeline
+  // (peelMode==1) and TrianglePeelPipeline (peelMode==2); fallback to
+  // TrianglePipeline is invalid inside a peel pass.
+  const bool standardLinePipelineAvailable = this->Internals->LinePipeline != nil;
+  const bool thickLinesAvailable =
+      lineWidth > 1.0f &&
+      this->Internals->ThickLineSegmentCount > 0 &&
+      this->Internals->ThickLinePipeline != nil;
+  const bool miterLinesAvailable =
+      lineWidth > 1.0f &&
+      act->GetProperty()->GetLineJoin() == vtkProperty::LineJoinType::MiterJoin &&
+      this->Internals->MiterJoinLineSegmentCount > 0 &&
+      this->Internals->MiterJoinLinePipeline != nil;
+
+  const bool trianglePipelineAvailable =
+      this->Internals->TrianglePipeline ||
+      (peelMode == 1 && this->Internals->TriangleInitPeelPipeline) ||
+      (peelMode == 2 && this->Internals->TrianglePeelPipeline);
+
+  const bool drawTriangles =
+      isSurface &&
+      this->Internals->HasTriangles &&
+      trianglePipelineAvailable;
+
+  const bool drawLines =
+      (isSurface || isWireframe) &&
+      this->Internals->HasLines &&
+      this->Internals->LineIndexBuffer &&
+      (standardLinePipelineAvailable || thickLinesAvailable || miterLinesAvailable);
+
+  const bool drawEdgeOverlay =
+      isSurface &&
+      act->GetProperty()->GetEdgeVisibility() &&
+      this->Internals->HasEdgeOverlay &&
+      this->Internals->EdgePipeline &&
+      this->Internals->EdgeIndexBuffer;
+
+  const bool drawPointRepresentation =
+      isPoints &&
+      this->Internals->PointVertexCount > 0 &&
+      this->Internals->PointPositionBuffer;
+
+  const bool drawVertexVisibilityDots =
+      !isPoints &&
+      act->GetProperty()->GetVertexVisibility() &&
+      this->Internals->PointVertexCount > 0 &&
+      this->Internals->PointPositionBuffer;
 
   // --- Triangle drawing ---
-  if (!skipTriangles && this->Internals->HasTriangles && this->Internals->TrianglePipeline)
+  bool skipTriangleDraw = false;
+  if (drawTriangles)
   {
-    if (peelMode == 1 && this->Internals->TriangleInitPeelPipeline)
+    if (peelMode == 1)
     {
-      recordPipeline(this->Internals->TriangleInitPeelPipeline);
+      if (this->Internals->TriangleInitPeelPipeline)
+      {
+        recordPipeline(this->Internals->TriangleInitPeelPipeline);
+      }
+      else
+      {
+        vtkWarningMacro(<< "Missing init peel pipeline; skipping triangle draw in peel pass.");
+        skipTriangleDraw = true;
+      }
     }
-    else if (peelMode == 2 && this->Internals->TrianglePeelPipeline)
+    else if (peelMode == 2)
     {
-      recordPipeline(this->Internals->TrianglePeelPipeline);
-
-      // Bind previous-frame peel textures required by fragment_peel
       vtkMetalRenderWindow* peelRenWin =
           vtkMetalRenderWindow::SafeDownCast(ren->GetRenderWindow());
-      if (peelRenWin)
+      if (this->Internals->TrianglePeelPipeline &&
+          peelRenWin && peelRenWin->PeelFrontTexture && peelRenWin->PeelDepthTexture)
       {
-        id<MTLTexture> prevFront =
-            (__bridge id<MTLTexture>)peelRenWin->PeelFrontTexture;
-        id<MTLTexture> prevDepth =
-            (__bridge id<MTLTexture>)peelRenWin->PeelDepthTexture;
-        if (prevFront)
-        {
-          recordFTex(prevFront, 1);
-        }
-        if (prevDepth)
-        {
-          recordFTex(prevDepth, 2);
-        }
+        recordPipeline(this->Internals->TrianglePeelPipeline);
+        recordFTex((__bridge id<MTLTexture>)peelRenWin->PeelFrontTexture, 1);
+        recordFTex((__bridge id<MTLTexture>)peelRenWin->PeelDepthTexture, 2);
+      }
+      else
+      {
+        vtkWarningMacro(<< "Missing peel pipeline or textures; skipping triangle draw in peel pass.");
+        skipTriangleDraw = true;
       }
     }
     else
     {
       recordPipeline(this->Internals->TrianglePipeline);
     }
-    recordVBuf(this->Internals->VertexPositionBuffer, 0, 0);
-    if (this->Internals->VertexNormalBuffer)
+    if (!skipTriangleDraw)
     {
-      recordVBuf(this->Internals->VertexNormalBuffer, 0, 1);
-    }
-    if (this->Internals->SurfaceColorBuffer)
-    {
-      recordVBuf(this->Internals->SurfaceColorBuffer, 0, 3);
-    }
-    if (this->Internals->MaterialUniformBuffer)
-    {
-      recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
-    }
-    if (this->Internals->LightUniformBuffer)
-    {
-      recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
-    }
-    if (this->Internals->SceneUniformBuffer)
-    {
-      recordVBuf(this->Internals->SceneUniformBuffer, 0, 2);
-      recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
-    }
-    if (this->Internals->CoincidentOffsetBuffer)
-    {
-      recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
-    }
-    if (this->Internals->ClipPlaneBuffer)
-    {
-      recordFBuf(this->Internals->ClipPlaneBuffer, 0, 5);
-      recordVBuf(this->Internals->ClipPlaneBuffer, 0, 5);
-    }
-    if (this->Internals->TriangleCellIdBuffer)
-    {
-      recordVBuf(this->Internals->TriangleCellIdBuffer, 0, 6);
-    }
-    if (this->Internals->PropIdBuffer)
-    {
-      recordVBuf(this->Internals->PropIdBuffer, 0, 7);
-    }
-    if (this->Internals->TriangleUVBuffer)
-    {
-      recordVBuf(this->Internals->TriangleUVBuffer, 0, 8);
-    }
-    // 8D: Bind extra attribute buffers at buffer indices 16+
-    {
-      NSUInteger extraIdx = 16;
-      for (const auto& attr : this->ExtraAttributes)
+      recordVBuf(this->Internals->VertexPositionBuffer, 0, 0);
+      if (this->Internals->VertexNormalBuffer)
       {
-        auto it = this->Internals->ExtraAttributeBuffers.find(attr.first);
-        if (it != this->Internals->ExtraAttributeBuffers.end() && it->second)
+        recordVBuf(this->Internals->VertexNormalBuffer, 0, 1);
+      }
+      if (this->Internals->SurfaceColorBuffer)
+      {
+        recordVBuf(this->Internals->SurfaceColorBuffer, 0, 3);
+      }
+      if (this->Internals->MaterialUniformBuffer)
+      {
+        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
+      }
+      if (this->Internals->LightUniformBuffer)
+      {
+        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
+      }
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordVBuf(this->Internals->SceneUniformBuffer, 0, 2);
+        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+      }
+      if (this->Internals->ClipPlaneBuffer)
+      {
+        recordFBuf(this->Internals->ClipPlaneBuffer, 0, 5);
+        recordVBuf(this->Internals->ClipPlaneBuffer, 0, 5);
+      }
+      if (this->Internals->TriangleCellIdBuffer)
+      {
+        recordVBuf(this->Internals->TriangleCellIdBuffer, 0, 6);
+      }
+      if (this->Internals->PropIdBuffer)
+      {
+        recordVBuf(this->Internals->PropIdBuffer, 0, 7);
+      }
+      if (this->Internals->TriangleUVBuffer)
+      {
+        recordVBuf(this->Internals->TriangleUVBuffer, 0, 8);
+      }
+      // 8D: Bind extra attribute buffers at buffer indices 16+
+      {
+        NSUInteger extraIdx = 16;
+        for (const auto& attr : this->ExtraAttributes)
         {
-          recordVBuf(it->second, 0, extraIdx);
-          ++extraIdx;
+          auto it = this->Internals->ExtraAttributeBuffers.find(attr.first);
+          if (it != this->Internals->ExtraAttributeBuffers.end() && it->second)
+          {
+            recordVBuf(it->second, 0, extraIdx);
+            ++extraIdx;
+          }
         }
       }
-    }
-    {
-      id<MTLTexture> texToBind = this->Internals->ActorTexture;
-      id<MTLSamplerState> samplerToBind = this->Internals->ActorSampler;
-      if (!texToBind)
       {
-        texToBind = this->Internals->DefaultTexture;
-        samplerToBind = this->Internals->DefaultSampler;
+        id<MTLTexture> texToBind = this->Internals->ActorTexture;
+        id<MTLSamplerState> samplerToBind = this->Internals->ActorSampler;
+        if (!texToBind)
+        {
+          texToBind = this->Internals->DefaultTexture;
+          samplerToBind = this->Internals->DefaultSampler;
+        }
+        if (texToBind)
+        {
+          recordFTex(texToBind, 0);
+        }
+        if (samplerToBind)
+        {
+          recordFSamp(samplerToBind, 0);
+        }
       }
-      if (texToBind)
+      if (act->GetProperty()->GetBackfaceCulling())
       {
-        recordFTex(texToBind, 0);
+        recordCull(MTLCullModeBack);
       }
-      if (samplerToBind)
+      else if (act->GetProperty()->GetFrontfaceCulling())
       {
-        recordFSamp(samplerToBind, 0);
+        recordCull(MTLCullModeFront);
       }
-    }
-    if (act->GetProperty()->GetBackfaceCulling())
-    {
-      recordCull(MTLCullModeBack);
-    }
-    else if (act->GetProperty()->GetFrontfaceCulling())
-    {
-      recordCull(MTLCullModeFront);
-    }
-    else
-    {
-      recordCull(MTLCullModeNone);
-    }
-    if (this->Internals->IndexBuffer)
-    {
-      recordIdxDraw(MTLPrimitiveTypeTriangle, this->Internals->TriangleIndexCount, MTLIndexTypeUInt32,
-        this->Internals->IndexBuffer, 0);
-    }
-    else
-    {
-      recordDraw(MTLPrimitiveTypeTriangle, 0, this->Internals->TriangleVertexCount);
+      else
+      {
+        recordCull(MTLCullModeNone);
+      }
+      if (this->Internals->IndexBuffer)
+      {
+        recordIdxDraw(MTLPrimitiveTypeTriangle, this->Internals->TriangleIndexCount, MTLIndexTypeUInt32,
+          this->Internals->IndexBuffer, 0);
+      }
+      else
+      {
+        recordDraw(MTLPrimitiveTypeTriangle, 0, this->Internals->TriangleVertexCount);
+      }
     }
   }
 
-  // --- Line drawing ---
-  if (this->Internals->HasLines && this->Internals->LineIndexBuffer)
+  // --- Line drawing (skipped during depth-peel passes) ---
+  if (!peelPassActive && drawLines)
   {
     auto lineJoinType = act->GetProperty()->GetLineJoin();
     bool useRoundCapLines = false;
@@ -855,19 +941,16 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
 
     if (lineWidth > 1.0f)
     {
-      if (lineJoinType == vtkProperty::LineJoinType::RoundCapRoundJoin &&
-          this->Internals->RoundCapLineSegmentCount > 0 && this->Internals->RoundCapLinePipeline)
-      {
-        useRoundCapLines = true;
-      }
-      else if (lineJoinType == vtkProperty::LineJoinType::MiterJoin &&
+      // TODO: Re-enable round-cap lines once topology verification confirms
+      // the CPU-side line-building pass produces correct round-cap vertices.
+      if (lineJoinType == vtkProperty::LineJoinType::MiterJoin &&
                this->Internals->MiterJoinLineSegmentCount > 0 && this->Internals->MiterJoinLinePipeline)
       {
         useMiterJoinLines = true;
       }
-      else if (lineJoinType == vtkProperty::LineJoinType::NoJoin &&
-               this->Internals->ThickLineSegmentCount > 0 && this->Internals->ThickLinePipeline)
+      else if (this->Internals->ThickLineSegmentCount > 0 && this->Internals->ThickLinePipeline)
       {
+        // Fallback: thick lines for round-cap, no-join, and all other non-miter joins
         useThickLines = true;
       }
     }
@@ -1073,10 +1156,8 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
     }
   }
 
-  // --- Edge overlay (wireframe on surface) ---
-  if (representation == VTK_SURFACE && act->GetProperty()->GetEdgeVisibility() &&
-      this->Internals->HasEdgeOverlay && this->Internals->EdgePipeline &&
-      this->Internals->EdgeIndexBuffer)
+  // --- Edge overlay (wireframe on surface, skipped during depth-peel passes) ---
+  if (!peelPassActive && drawEdgeOverlay)
   {
     recordPipeline(this->Internals->EdgePipeline);
     recordVBuf(this->Internals->EdgeVertexPositionBuffer, 0, 0);
@@ -1122,9 +1203,8 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       this->Internals->EdgeIndexBuffer, 0);
   }
 
-  // --- Vertex visibility (dots on surface) ---
-  if (representation != VTK_POINTS && act->GetProperty()->GetVertexVisibility() &&
-      this->Internals->PointVertexCount > 0 && this->Internals->PointPositionBuffer)
+  // --- Vertex visibility (dots on surface, skipped during depth-peel passes) ---
+  if (!peelPassActive && drawVertexVisibilityDots)
   {
     float ptSize = act->GetProperty()->GetPointSize();
     if (ptSize > 1.0f && this->Internals->PointShapedPipeline)
@@ -1248,9 +1328,8 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
     }
   }
 
-  // --- Points (VTK_POINTS representation) ---
-  if (representation == VTK_POINTS && this->Internals->PointVertexCount > 0 &&
-      this->Internals->PointPositionBuffer)
+  // --- Points (VTK_POINTS representation, skipped during depth-peel passes) ---
+  if (!peelPassActive && drawPointRepresentation)
   {
     float ptSize = act->GetProperty()->GetPointSize();
     if (ptSize > 1.0f && this->Internals->PointShapedPipeline)
@@ -1384,6 +1463,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   bool backfaceCulling = act->GetProperty()->GetBackfaceCulling();
   bool frontfaceCulling = act->GetProperty()->GetFrontfaceCulling();
   vtkMTimeType extraMTime = this->ExtraAttributesMTime.GetMTime();
+  vtkMTimeType batchOverrideMTime = this->Internals->BatchOverrideMTime;
 
   // Mark bundle as valid and record the state that was used to create it
   this->Internals->Bundle.Valid = recordedAnyDraw;
@@ -1403,6 +1483,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   this->Internals->BundleBackfaceCulling = backfaceCulling;
   this->Internals->BundleFrontfaceCulling = frontfaceCulling;
   this->Internals->BundleExtraAttributesMTime = extraMTime;
+  this->Internals->BundleBatchOverrideMTime = batchOverrideMTime;
 }
 
 //------------------------------------------------------------------------------
@@ -1445,11 +1526,14 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         static_cast<vtkMTimeType>(this->GetLookupTable()->GetMTime()));
     }
 
+    vtkMTimeType batchOverrideMTime = this->Internals->BatchOverrideMTime;
+
     if (currentMTime != this->Internals->CachedInputMTime ||
         representation != this->Internals->CachedRepresentation ||
         edgeVisibility != this->Internals->CachedEdgeVisibility ||
         extraMTime != this->Internals->CachedExtraAttributesMTime ||
-        scalarMTime != this->Internals->CachedScalarMTime)
+        scalarMTime != this->Internals->CachedScalarMTime ||
+        batchOverrideMTime != this->Internals->CachedBatchOverrideMTime)
     {
       this->Internals->ReleaseBuffers();
       this->Internals->CachedInputMTime = currentMTime;
@@ -1457,6 +1541,7 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       this->Internals->CachedEdgeVisibility = edgeVisibility;
       this->Internals->CachedExtraAttributesMTime = extraMTime;
       this->Internals->CachedScalarMTime = scalarMTime;
+      this->Internals->CachedBatchOverrideMTime = batchOverrideMTime;
       this->BuildGeometryBuffers((void*)device, input, act);
     }
 
@@ -1476,8 +1561,16 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       (act->GetProperty()->GetVertexVisibility() &&
        this->Internals->PointVertexCount > 0);
 
+    bool needTrianglePipeline =
+      (representation == VTK_SURFACE) &&
+      this->Internals->HasTriangles;
+
+    bool needLinePipeline =
+      (representation == VTK_SURFACE || representation == VTK_WIREFRAME) &&
+      this->Internals->HasLines;
+
     bool needSurfacePipelines =
-      (representation != VTK_POINTS);
+      needTrianglePipeline || needLinePipeline;
 
     if (needSurfacePipelines)
     {
@@ -1491,7 +1584,7 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
 
     // 8C: Ensure all pipeline states are created before render bundle recording.
     // These were previously created lazily inside inline draw code.
-    if (representation != VTK_POINTS && representation != VTK_WIREFRAME &&
+    if (representation == VTK_SURFACE &&
         this->Internals->HasEdgeOverlay)
     {
       this->EnsureEdgePipelineState((void*)device);
@@ -1502,19 +1595,14 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       if (lw > 1.0f)
       {
         auto lj = act->GetProperty()->GetLineJoin();
-        if (lj == vtkProperty::LineJoinType::RoundCapRoundJoin &&
-            this->Internals->RoundCapLineSegmentCount > 0)
-        {
-          this->EnsureRoundCapLinePipelineState((void*)device);
-        }
-        else if (lj == vtkProperty::LineJoinType::MiterJoin &&
-                 this->Internals->MiterJoinLineSegmentCount > 0)
+        if (lj == vtkProperty::LineJoinType::MiterJoin &&
+            this->Internals->MiterJoinLineSegmentCount > 0)
         {
           this->EnsureMiterJoinLinePipelineState((void*)device);
         }
-        else if (lj == vtkProperty::LineJoinType::NoJoin &&
-                 this->Internals->ThickLineSegmentCount > 0)
+        else if (this->Internals->ThickLineSegmentCount > 0)
         {
+          // Fallback: thick lines for round-cap and all other non-miter joins
           this->EnsureThickLinePipelineState((void*)device);
         }
       }
@@ -1559,19 +1647,49 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       float ptSize = static_cast<float>(act->GetProperty()->GetPointSize());
       *reinterpret_cast<float*>(buf + 260) = ptSize;
 
+      // Update actor texture before computing flags so the flag reflects current state
+      this->UpdateActorTexture((void*)device, act);
+
       // Merge actor render option flags into SceneUniforms flags (offset 256).
       // Bit 0: parallel projection (set by camera)
       // Bit 3: vertex visibility
       // Bit 5: RenderPointsAsSpheres
       // Bit 7: Point2DShape (0=Round, 1=Square)
       // Bit 8: has surface vertex colors (P1-1A/1B)
+      // Bit 9: has actor texture
       vtkProperty* prop = act->GetProperty();
+      uint32_t flags = *reinterpret_cast<uint32_t*>(buf + 256);
+      flags &= ~VTK_METAL_DYNAMIC_ACTOR_FLAG_MASK;
+
       uint32_t actorFlags = 0;
-      actorFlags |= (prop->GetVertexVisibility() ? 1u : 0u) << 3;
-      actorFlags |= (prop->GetRenderPointsAsSpheres() ? 1u : 0u) << 5;
-      actorFlags |= (static_cast<uint32_t>(prop->GetPoint2DShape())) << 7;
-      actorFlags |= (this->Internals->HasSurfaceColors ? 1u : 0u) << 8;
-      *reinterpret_cast<uint32_t*>(buf + 256) |= actorFlags;
+
+      if (prop->GetVertexVisibility())
+      {
+        actorFlags |= VTK_METAL_SCENE_FLAG_VERTEX_VISIBILITY;
+      }
+
+      if (prop->GetRenderPointsAsSpheres())
+      {
+        actorFlags |= VTK_METAL_SCENE_FLAG_SPHERE_POINTS;
+      }
+
+      if (static_cast<uint32_t>(prop->GetPoint2DShape()) != 0u)
+      {
+        actorFlags |= VTK_METAL_SCENE_FLAG_POINT_SHAPE;
+      }
+
+      if (this->Internals->HasSurfaceColors)
+      {
+        actorFlags |= VTK_METAL_SCENE_FLAG_HAS_SURFACE_COLORS;
+      }
+
+      if (this->Internals->ActorTexture)
+      {
+        actorFlags |= VTK_METAL_SCENE_FLAG_HAS_ACTOR_TEXTURE;
+      }
+
+      flags |= actorFlags;
+      *reinterpret_cast<uint32_t*>(buf + 256) = flags;
     }
 
     this->UpdateMaterialUniforms((void*)device, act);
@@ -1579,14 +1697,13 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     this->UpdateCoincidentOffsetUniforms((void*)device, act);
     this->UpdateVertexColorUniforms((void*)device, act);
     this->UpdateClipPlaneUniforms((void*)device, act);
-    this->UpdateActorTexture((void*)device, act);
-    this->SetPropId(this->GetOrCreatePropId(act));
-
-    // P5-5A: Set texture flag (bit 9) in scene uniforms when actor has a texture
-    if (this->Internals->ActorTexture)
+    if (this->Internals->HasOverridePropId)
     {
-      char* buf = static_cast<char*>([this->Internals->SceneUniformBuffer contents]);
-      *reinterpret_cast<uint32_t*>(buf + 256) |= (1u << 9);
+      this->SetPropId(this->Internals->OverridePropId);
+    }
+    else
+    {
+      this->SetPropId(this->GetOrCreatePropId(act));
     }
 
     // 8C: Update edge color uniform before bundle recording (per-frame update)
@@ -1694,7 +1811,8 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         this->Internals->BundleLineJoin == lineJoin &&
         this->Internals->BundleBackfaceCulling == backfaceCulling &&
         this->Internals->BundleFrontfaceCulling == frontfaceCulling &&
-        this->Internals->BundleExtraAttributesMTime == extraMTime;
+        this->Internals->BundleExtraAttributesMTime == extraMTime &&
+        this->Internals->BundleBatchOverrideMTime == batchOverrideMTime;
 
     if (bundleValid)
     {
@@ -1835,12 +1953,85 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   }
 
   // P1-1A/1B: MapScalars early so both triangle and line paths can use the result.
+  // When batch color override is active, disable scalar coloring.
   int cellFlag = 0;
   vtkUnsignedCharArray* mappedColors = nullptr;
-  if (actor)
+  if (actor && !this->Internals->UseBatchColor)
   {
     mappedColors = this->MapScalars(actor->GetProperty()->GetOpacity(), cellFlag);
   }
+
+  // Helper to get override color or default actor color
+  double actorOpacity = actor ? actor->GetProperty()->GetOpacity() : 1.0;
+  auto getOverrideOrDefaultRGBA = [&](float rgba[4])
+  {
+    if (this->Internals->UseBatchColor)
+    {
+      rgba[0] = static_cast<float>(this->Internals->BatchColor[0]);
+      rgba[1] = static_cast<float>(this->Internals->BatchColor[1]);
+      rgba[2] = static_cast<float>(this->Internals->BatchColor[2]);
+    }
+    else if (actor)
+    {
+      double c[3];
+      actor->GetProperty()->GetColor(c);
+      rgba[0] = static_cast<float>(c[0]);
+      rgba[1] = static_cast<float>(c[1]);
+      rgba[2] = static_cast<float>(c[2]);
+    }
+    else
+    {
+      rgba[0] = rgba[1] = rgba[2] = 1.0f;
+    }
+
+    if (this->Internals->UseBatchOpacity)
+    {
+      rgba[3] = static_cast<float>(this->Internals->BatchOpacity);
+    }
+    else if (this->Internals->UseBatchColor)
+    {
+      // Color override without explicit opacity override: bake actor opacity
+      // because material opacity is forced to 1.0 when batch overrides are active.
+      rgba[3] = static_cast<float>(actorOpacity);
+    }
+    else
+    {
+      // Non-override default path: let material opacity apply once.
+      // Thick-line shaders multiply vertexColor.a by material.opacity,
+      // so this must remain 1.0 to avoid double multiplication.
+      rgba[3] = 1.0f;
+    }
+  };
+
+  // Helper: emit one vertex color (float4) into surfaceColors, respecting batch overrides.
+  // When mappedColors is provided and no batch color override, use it (with optional opacity override).
+  auto emitSurfaceColor = [&](vtkIdType idx, const unsigned char* colors)
+  {
+    if (colors && !this->Internals->UseBatchColor)
+    {
+      float r = colors[idx * 4] / 255.0f;
+      float g = colors[idx * 4 + 1] / 255.0f;
+      float b = colors[idx * 4 + 2] / 255.0f;
+      float a = colors[idx * 4 + 3] / 255.0f;
+      if (this->Internals->UseBatchOpacity)
+      {
+        a = static_cast<float>(this->Internals->BatchOpacity);
+      }
+      surfaceColors.push_back(r);
+      surfaceColors.push_back(g);
+      surfaceColors.push_back(b);
+      surfaceColors.push_back(a);
+    }
+    else
+    {
+      float rgba[4];
+      getOverrideOrDefaultRGBA(rgba);
+      surfaceColors.push_back(rgba[0]);
+      surfaceColors.push_back(rgba[1]);
+      surfaceColors.push_back(rgba[2]);
+      surfaceColors.push_back(rgba[3]);
+    }
+  };
 
   // ---- P6-6A: GPU Tessellation Path ----
   // When per-point coloring (cellFlag == 0) with data normals, use compute shaders
@@ -1855,7 +2046,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   if (useGPUTess)
   {
     // Step 2: Build polygon connectivity arrays for triangle tessellation.
-    if (representation != VTK_WIREFRAME && polys && polys->GetNumberOfCells() > 0)
+    if (representation != VTK_WIREFRAME && representation != VTK_POINTS && polys && polys->GetNumberOfCells() > 0)
     {
       std::vector<uint32_t> polyConn;
       std::vector<uint32_t> polyOff;
@@ -2280,7 +2471,7 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
 
     // Step 4: Build line connectivity for polyline → line segment conversion
     vtkCellArray* lines = polydata->GetLines();
-    if (!gpuTessUsed || (representation == VTK_SURFACE && !this->Internals->HasLines))
+    if (representation != VTK_POINTS && (!gpuTessUsed || (representation == VTK_SURFACE && !this->Internals->HasLines)))
     {
       if (lines && lines->GetNumberOfCells() > 0 && cellFlag == 0)
       {
@@ -2452,18 +2643,16 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
 
         if (mappedColors)
         {
-          const unsigned char* rgba = mappedColors->GetPointer(0);
-          surfaceColors.push_back(rgba[i * 4] / 255.0f);
-          surfaceColors.push_back(rgba[i * 4 + 1] / 255.0f);
-          surfaceColors.push_back(rgba[i * 4 + 2] / 255.0f);
-          surfaceColors.push_back(rgba[i * 4 + 3] / 255.0f);
+          emitSurfaceColor(i, mappedColors->GetPointer(0));
         }
         else
         {
-          surfaceColors.push_back(1.0f);
-          surfaceColors.push_back(1.0f);
-          surfaceColors.push_back(1.0f);
-          surfaceColors.push_back(1.0f);
+          float defRGBA[4];
+          getOverrideOrDefaultRGBA(defRGBA);
+          surfaceColors.push_back(defRGBA[0]);
+          surfaceColors.push_back(defRGBA[1]);
+          surfaceColors.push_back(defRGBA[2]);
+          surfaceColors.push_back(defRGBA[3]);
         }
 
         if (tcoordArray && tcoordArray->GetNumberOfTuples() > i)
@@ -2486,7 +2675,34 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
   }
 
   vtkIdType polyCellIdx = polyCellOffset;
-  if (!gpuTessUsed)
+  // Helper for emitting per-vertex wireframe colors with batch override support.
+  // Defined here so it is available throughout the CPU geometry build.
+  auto emitWireframeColor = [&](vtkIdType pointId, vtkIdType cellId)
+  {
+    const unsigned char* rgba = mappedColors ? mappedColors->GetPointer(0) : nullptr;
+    vtkIdType idx = (cellFlag == 0) ? pointId : cellId;
+    if (rgba && !this->Internals->UseBatchColor)
+    {
+      float a = rgba[idx * 4 + 3] / 255.0f;
+      if (this->Internals->UseBatchOpacity)
+        a = static_cast<float>(this->Internals->BatchOpacity);
+      surfaceColors.push_back(rgba[idx * 4] / 255.0f);
+      surfaceColors.push_back(rgba[idx * 4 + 1] / 255.0f);
+      surfaceColors.push_back(rgba[idx * 4 + 2] / 255.0f);
+      surfaceColors.push_back(a);
+    }
+    else
+    {
+      float defRGBA[4];
+      getOverrideOrDefaultRGBA(defRGBA);
+      surfaceColors.push_back(defRGBA[0]);
+      surfaceColors.push_back(defRGBA[1]);
+      surfaceColors.push_back(defRGBA[2]);
+      surfaceColors.push_back(defRGBA[3]);
+    }
+  };
+
+  if (!gpuTessUsed && representation != VTK_POINTS)
   {
   // P2-2A: Vertex deduplication map for wireframe polygon edges
   std::unordered_map<vtkIdType, uint32_t> wireVertexMap;
@@ -2548,23 +2764,7 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
               triangleUVs.push_back(0.0f);
               triangleUVs.push_back(0.0f);
             }
-            // Color for wireframe vertex
-            if (mappedColors)
-            {
-              const unsigned char* rgba = mappedColors->GetPointer(0);
-              vtkIdType idx = (cellFlag == 0) ? v0 : polyCellIdx;
-              surfaceColors.push_back(rgba[idx * 4] / 255.0f);
-              surfaceColors.push_back(rgba[idx * 4 + 1] / 255.0f);
-              surfaceColors.push_back(rgba[idx * 4 + 2] / 255.0f);
-              surfaceColors.push_back(rgba[idx * 4 + 3] / 255.0f);
-            }
-            else
-            {
-              surfaceColors.push_back(1.0f);
-              surfaceColors.push_back(1.0f);
-              surfaceColors.push_back(1.0f);
-              surfaceColors.push_back(1.0f);
-            }
+            emitWireframeColor(v0, polyCellIdx);
             emitExtraAttrsForPoint(v0);
             emitExtraAttrsForCell(polyCellIdx);
             lineVertexCellIds.push_back(static_cast<uint32_t>(polyCellIdx) + 1u);
@@ -2608,23 +2808,7 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
               triangleUVs.push_back(0.0f);
               triangleUVs.push_back(0.0f);
             }
-            // Color for wireframe vertex
-            if (mappedColors)
-            {
-              const unsigned char* rgba = mappedColors->GetPointer(0);
-              vtkIdType idx = (cellFlag == 0) ? v1 : polyCellIdx;
-              surfaceColors.push_back(rgba[idx * 4] / 255.0f);
-              surfaceColors.push_back(rgba[idx * 4 + 1] / 255.0f);
-              surfaceColors.push_back(rgba[idx * 4 + 2] / 255.0f);
-              surfaceColors.push_back(rgba[idx * 4 + 3] / 255.0f);
-            }
-            else
-            {
-              surfaceColors.push_back(1.0f);
-              surfaceColors.push_back(1.0f);
-              surfaceColors.push_back(1.0f);
-              surfaceColors.push_back(1.0f);
-            }
+            emitWireframeColor(v1, polyCellIdx);
             emitExtraAttrsForPoint(v1);
             emitExtraAttrsForCell(polyCellIdx);
             lineVertexCellIds.push_back(static_cast<uint32_t>(polyCellIdx) + 1u);
@@ -2688,21 +2872,7 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
                 normals.push_back(static_cast<float>(nn[2]));
 
                 // P1-1A: per-vertex color from point scalar mapping
-                if (mappedColors)
-                {
-                  const unsigned char* rgba = mappedColors->GetPointer(0);
-                  surfaceColors.push_back(rgba[tri[j] * 4] / 255.0f);
-                  surfaceColors.push_back(rgba[tri[j] * 4 + 1] / 255.0f);
-                  surfaceColors.push_back(rgba[tri[j] * 4 + 2] / 255.0f);
-                  surfaceColors.push_back(rgba[tri[j] * 4 + 3] / 255.0f);
-                }
-                else
-                {
-                  surfaceColors.push_back(1.0f);
-                  surfaceColors.push_back(1.0f);
-                  surfaceColors.push_back(1.0f);
-                  surfaceColors.push_back(1.0f);
-                }
+                emitSurfaceColor(tri[j], mappedColors ? mappedColors->GetPointer(0) : nullptr);
 
                 // P5-5A: texture coordinates for indexed triangle vertex
                 if (tcoordArray && tcoordArray->GetNumberOfTuples() > tri[j])
@@ -2767,21 +2937,7 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
               normals.push_back(fn[2]);
 
               // P1-1B: per-vertex color from cell scalar mapping
-              if (mappedColors)
-              {
-                const unsigned char* rgba = mappedColors->GetPointer(0);
-                surfaceColors.push_back(rgba[polyCellIdx * 4] / 255.0f);
-                surfaceColors.push_back(rgba[polyCellIdx * 4 + 1] / 255.0f);
-                surfaceColors.push_back(rgba[polyCellIdx * 4 + 2] / 255.0f);
-                surfaceColors.push_back(rgba[polyCellIdx * 4 + 3] / 255.0f);
-              }
-              else
-              {
-                surfaceColors.push_back(1.0f);
-                surfaceColors.push_back(1.0f);
-                surfaceColors.push_back(1.0f);
-                surfaceColors.push_back(1.0f);
-              }
+              emitSurfaceColor(polyCellIdx, mappedColors ? mappedColors->GetPointer(0) : nullptr);
 
               // P5-5A: texture coordinates for non-indexed triangle vertex
               if (tcoordArray && tcoordArray->GetNumberOfTuples() > tri[j])
@@ -2949,6 +3105,10 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
         float cg = rgba[lineCellIdx * 4 + 1] / 255.0f;
         float cb = rgba[lineCellIdx * 4 + 2] / 255.0f;
         float ca = rgba[lineCellIdx * 4 + 3] / 255.0f;
+        if (this->Internals->UseBatchOpacity)
+        {
+          ca = static_cast<float>(this->Internals->BatchOpacity);
+        }
 
         for (vtkIdType i = 0; i < npts; ++i)
         {
@@ -3027,21 +3187,8 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
               normals.push_back(static_cast<float>(n[2]));
             }
             // P1-1A: point color
-            if (mappedColors && cellFlag == 0)
-            {
-              const unsigned char* rgba = mappedColors->GetPointer(0);
-              surfaceColors.push_back(rgba[pts[i] * 4] / 255.0f);
-              surfaceColors.push_back(rgba[pts[i] * 4 + 1] / 255.0f);
-              surfaceColors.push_back(rgba[pts[i] * 4 + 2] / 255.0f);
-              surfaceColors.push_back(rgba[pts[i] * 4 + 3] / 255.0f);
-            }
-            else
-            {
-              surfaceColors.push_back(1.0f);
-              surfaceColors.push_back(1.0f);
-              surfaceColors.push_back(1.0f);
-              surfaceColors.push_back(1.0f);
-            }
+            vtkIdType colorIdx = pts[i];
+            emitSurfaceColor(colorIdx, (mappedColors && cellFlag == 0) ? mappedColors->GetPointer(0) : nullptr);
             // P5-5A: UV for line vertex (point coloring path)
             if (tcoordArray && tcoordArray->GetNumberOfTuples() > pts[i])
             {
@@ -3204,7 +3351,7 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
                  length:surfaceColors.size() * sizeof(float)
                 options:MTLResourceStorageModeShared];
     vtkMetalMRC::AssignConsumed(this->Internals->SurfaceColorBuffer, surfColorBuf);
-    this->Internals->HasSurfaceColors = (mappedColors != nullptr);
+    this->Internals->HasSurfaceColors = (mappedColors != nullptr) || this->Internals->UseBatchColor || this->Internals->UseBatchOpacity;
   }
   else if (!positions.empty())
   {
@@ -3384,11 +3531,23 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
                 options:MTLResourceStorageModeShared];
     vtkMetalMRC::AssignConsumed(this->Internals->PointNormalBuffer, ptNormBuf);
 
-    // Point colors — from MapScalars (per-point RGBA) or default white.
+    // Point colors — from MapScalars (per-point RGBA), batch override, or default white.
     // Matches WebGPU: reads point_colors SSBO indexed by point_id.
     // Note: mappedColors and cellFlag are already set from the early MapScalars call above.
     std::vector<float> pointColors(numPts * 4, 1.0f); // default white
-    if (mappedColors && cellFlag == 0 &&
+    if (this->Internals->UseBatchColor || this->Internals->UseBatchOpacity)
+    {
+      float ptRGBA[4];
+      getOverrideOrDefaultRGBA(ptRGBA);
+      for (vtkIdType i = 0; i < numPts; ++i)
+      {
+        pointColors[i * 4] = ptRGBA[0];
+        pointColors[i * 4 + 1] = ptRGBA[1];
+        pointColors[i * 4 + 2] = ptRGBA[2];
+        pointColors[i * 4 + 3] = ptRGBA[3];
+      }
+    }
+    else if (mappedColors && cellFlag == 0 &&
         mappedColors->GetNumberOfTuples() >= numPts)
     {
       // Per-point colors — normalize unsigned char RGBA to float [0,1]
@@ -4154,8 +4313,18 @@ void vtkMetalPolyDataMapper::UpdateMaterialUniforms(void* mtlDevice, vtkActor* a
   memset(mu, 0, sizeof(mu));
 
   // ambientColor.rgb = property ambient color, .w = ambient intensity
+  // When batch color override is active, use the batch color for ambient too
   double ac[3];
-  prop->GetAmbientColor(ac);
+  if (this->Internals->UseBatchColor)
+  {
+    ac[0] = this->Internals->BatchColor[0];
+    ac[1] = this->Internals->BatchColor[1];
+    ac[2] = this->Internals->BatchColor[2];
+  }
+  else
+  {
+    prop->GetAmbientColor(ac);
+  }
   mu[0] = static_cast<float>(ac[0]);
   mu[1] = static_cast<float>(ac[1]);
   mu[2] = static_cast<float>(ac[2]);
@@ -4163,7 +4332,16 @@ void vtkMetalPolyDataMapper::UpdateMaterialUniforms(void* mtlDevice, vtkActor* a
 
   // diffuseColor.rgb = property diffuse color, .w = diffuse intensity
   double dc[3];
-  prop->GetDiffuseColor(dc);
+  if (this->Internals->UseBatchColor)
+  {
+    dc[0] = this->Internals->BatchColor[0];
+    dc[1] = this->Internals->BatchColor[1];
+    dc[2] = this->Internals->BatchColor[2];
+  }
+  else
+  {
+    prop->GetDiffuseColor(dc);
+  }
   mu[4] = static_cast<float>(dc[0]);
   mu[5] = static_cast<float>(dc[1]);
   mu[6] = static_cast<float>(dc[2]);
@@ -4179,13 +4357,27 @@ void vtkMetalPolyDataMapper::UpdateMaterialUniforms(void* mtlDevice, vtkActor* a
 
   // color = base actor color (unused in lighting shader)
   double rgb[3];
-  prop->GetColor(rgb);
+  if (this->Internals->UseBatchColor)
+  {
+    rgb[0] = this->Internals->BatchColor[0];
+    rgb[1] = this->Internals->BatchColor[1];
+    rgb[2] = this->Internals->BatchColor[2];
+  }
+  else
+  {
+    prop->GetColor(rgb);
+  }
   mu[12] = static_cast<float>(rgb[0]);
   mu[13] = static_cast<float>(rgb[1]);
   mu[14] = static_cast<float>(rgb[2]);
   mu[15] = 1.0f;
 
-  mu[16] = static_cast<float>(prop->GetOpacity());
+  // Option A: when batch override is active, opacity is baked into vertex colors,
+  // so material opacity is 1.0 to avoid double multiplication.
+  // Otherwise, use the actor property opacity.
+  mu[16] = (this->Internals->UseBatchColor || this->Internals->UseBatchOpacity)
+    ? 1.0f
+    : static_cast<float>(prop->GetOpacity());
   mu[17] = static_cast<float>(prop->GetSpecularPower());
 
   if (!this->Internals->MaterialUniformBuffer)
@@ -4429,12 +4621,34 @@ void vtkMetalPolyDataMapper::UpdateVertexColorUniforms(void* mtlDevice, vtkActor
 
   if (actor->GetProperty()->GetVertexVisibility())
   {
-    double vcol[3];
-    actor->GetProperty()->GetVertexColor(vcol);
-    vc[0] = static_cast<float>(vcol[0]);
-    vc[1] = static_cast<float>(vcol[1]);
-    vc[2] = static_cast<float>(vcol[2]);
-    vc[3] = 1.0f;
+    if (this->Internals->UseBatchColor)
+    {
+      vc[0] = static_cast<float>(this->Internals->BatchColor[0]);
+      vc[1] = static_cast<float>(this->Internals->BatchColor[1]);
+      vc[2] = static_cast<float>(this->Internals->BatchColor[2]);
+    }
+    else
+    {
+      double vcol[3];
+      actor->GetProperty()->GetVertexColor(vcol);
+      vc[0] = static_cast<float>(vcol[0]);
+      vc[1] = static_cast<float>(vcol[1]);
+      vc[2] = static_cast<float>(vcol[2]);
+    }
+
+    if (this->Internals->UseBatchOpacity)
+    {
+      vc[3] = static_cast<float>(this->Internals->BatchOpacity);
+    }
+    else if (this->Internals->UseBatchColor)
+    {
+      // Color override without explicit opacity: bake actor opacity
+      vc[3] = static_cast<float>(actor->GetProperty()->GetOpacity());
+    }
+    else
+    {
+      vc[3] = 1.0f;
+    }
   }
 
   if (!this->Internals->VertexColorBuffer)
@@ -4458,15 +4672,34 @@ void vtkMetalPolyDataMapper::UpdateEdgeColorUniform(void* mtlDevice, vtkActor* a
 
   float ec[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
 
-  // Use edge color from actor's property
-  vtkProperty* prop = actor->GetProperty();
-  if (prop)
+  if (this->Internals->UseBatchColor)
   {
-    double ecDouble[3];
-    prop->GetEdgeColor(ecDouble);
-    ec[0] = static_cast<float>(ecDouble[0]);
-    ec[1] = static_cast<float>(ecDouble[1]);
-    ec[2] = static_cast<float>(ecDouble[2]);
+    ec[0] = static_cast<float>(this->Internals->BatchColor[0]);
+    ec[1] = static_cast<float>(this->Internals->BatchColor[1]);
+    ec[2] = static_cast<float>(this->Internals->BatchColor[2]);
+  }
+  else
+  {
+    // Use edge color from actor's property
+    vtkProperty* prop = actor->GetProperty();
+    if (prop)
+    {
+      double ecDouble[3];
+      prop->GetEdgeColor(ecDouble);
+      ec[0] = static_cast<float>(ecDouble[0]);
+      ec[1] = static_cast<float>(ecDouble[1]);
+      ec[2] = static_cast<float>(ecDouble[2]);
+    }
+  }
+
+  if (this->Internals->UseBatchOpacity)
+  {
+    ec[3] = static_cast<float>(this->Internals->BatchOpacity);
+  }
+  else if (this->Internals->UseBatchColor)
+  {
+    // Color override without explicit opacity: bake actor opacity
+    ec[3] = static_cast<float>(actor->GetProperty()->GetOpacity());
   }
 
   if (!this->Internals->EdgeColorUniformBuffer)
@@ -4700,6 +4933,91 @@ void vtkMetalPolyDataMapper::UpdateActorTexture(void* mtlDevice, vtkActor* actor
 }
 
 //------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::SetOverridePropId(uint32_t zeroBasedPropId)
+{
+  this->Internals->HasOverridePropId = true;
+  this->Internals->OverridePropId = zeroBasedPropId;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::SetOverridePropIdToNone()
+{
+  // UINT32_MAX is the explicit no-pick sentinel. The shader maps it to 0.
+  this->Internals->HasOverridePropId = true;
+  this->Internals->OverridePropId = UINT32_MAX;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::ClearOverridePropId()
+{
+  this->Internals->HasOverridePropId = false;
+  this->Internals->OverridePropId = 0;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::SetBatchVisualOverride(
+    bool overrideColor,
+    const double color[3],
+    bool overrideOpacity,
+    double opacity)
+{
+  bool changed = false;
+
+  if (this->Internals->UseBatchColor != overrideColor)
+  {
+    this->Internals->UseBatchColor = overrideColor;
+    changed = true;
+  }
+
+  if (overrideColor)
+  {
+    for (int i = 0; i < 3; ++i)
+    {
+      if (this->Internals->BatchColor[i] != color[i])
+      {
+        this->Internals->BatchColor[i] = color[i];
+        changed = true;
+      }
+    }
+  }
+
+  if (this->Internals->UseBatchOpacity != overrideOpacity)
+  {
+    this->Internals->UseBatchOpacity = overrideOpacity;
+    changed = true;
+  }
+
+  if (overrideOpacity)
+  {
+    if (this->Internals->BatchOpacity != opacity)
+    {
+      this->Internals->BatchOpacity = opacity;
+      changed = true;
+    }
+  }
+
+  if (changed)
+  {
+    this->Internals->BatchOverrideMTime++;
+    this->Internals->InvalidateRenderBundle();
+    this->Modified();
+  }
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::ClearBatchVisualOverride()
+{
+  if (this->Internals->UseBatchColor || this->Internals->UseBatchOpacity)
+  {
+    this->Internals->UseBatchColor = false;
+    this->Internals->UseBatchOpacity = false;
+    this->Internals->BatchOverrideMTime++;
+    this->Internals->InvalidateRenderBundle();
+    this->Modified();
+  }
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalPolyDataMapper::SetPropId(uint32_t propId)
 {
   if (this->Internals->PropIdBuffer)
@@ -4711,11 +5029,19 @@ void vtkMetalPolyDataMapper::SetPropId(uint32_t propId)
 //------------------------------------------------------------------------------
 uint32_t vtkMetalPolyDataMapper::GetOrCreatePropId(vtkActor* act)
 {
+  // Picking ID convention:
+  // - GPU prop ID buffer stores zero-based IDs.
+  // - vertex shaders output propId + 1.
+  // - 0 in the picking buffer means background/no prop.
+  //
+  // Cell IDs are currently written as 1-based on the CPU and passed through
+  // unchanged by the shader. This should eventually be unified with prop IDs.
+  //
   // The static map grows monotonically and is never pruned. Acceptable for
   // typical VTK usage where actors are long-lived. If short-lived actors
   // are common, consider a weak-reference approach or periodic cleanup.
   static std::unordered_map<const vtkActor*, uint32_t> propIds;
-  static uint32_t nextId = 1;
+  static uint32_t nextId = 0;
   auto it = propIds.find(act);
   if (it == propIds.end())
   {

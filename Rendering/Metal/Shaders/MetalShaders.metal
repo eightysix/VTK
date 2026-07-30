@@ -183,7 +183,7 @@ vertex VertexOut vertex_main(uint vertex_id [[vertex_id]],
   out.uv = triangleUVs[vertex_id];
   out.modelPos = in.position; // Direct pass for unbounded planes evaluation
   out.cellId = cellIds[vertex_id];
-  out.propId = propId + 1u;
+  out.propId = (propId == 0xFFFFFFFFu) ? 0u : (propId + 1u);
 
   return out;
 }
@@ -290,7 +290,7 @@ vertex PointVertexOut vertex_point_main(
   out.uv = point_uvs[vertex_id];
   out.lut_uv = point_color_uvs[vertex_id];
   out.cellId = pointCellIds[vertex_id];
-  out.propId = pointPropId + 1u;
+  out.propId = (pointPropId == 0xFFFFFFFFu) ? 0u : (pointPropId + 1u);
   return out;
 }
 
@@ -372,7 +372,7 @@ vertex PointShapedVertexOut vertex_point_shaped_main(
   out.uv = point_uvs[point_id];
   out.lut_uv = point_color_uvs[point_id];
   out.cellId = shapedCellIds[point_id];
-  out.propId = shapedPropId + 1u;
+  out.propId = (shapedPropId == 0xFFFFFFFFu) ? 0u : (shapedPropId + 1u);
   return out;
 }
 
@@ -477,21 +477,25 @@ vertex ThickLineVertexOut vertex_thick_line_main(
   float2 x_basis = segLen < 0.001 ? float2(1.0, 0.0) : (delta / segLen);
   float2 y_basis = float2(-x_basis.y, x_basis.x);
 
-  float w = max(lineWidth, 1.0);
-  float2 adjusted_p0 = p0_screen + p_coord.x * x_basis + p_coord.y * y_basis * w;
-  float2 adjusted_p1 = p1_screen + p_coord.x * x_basis + p_coord.y * y_basis * w;
-  float2 p = mix(adjusted_p0, adjusted_p1, p_coord.x);
+  float t = (p_coord.x + 1.0) * 0.5;
+  float side = p_coord.y;
 
-  float4 p_DC = mix(p0_DC, p1_DC, p_coord.x);
+  float halfW = max(lineWidth, 1.0) * 0.5;
+
+  float2 center = mix(p0_screen, p1_screen, t);
+  float2 p = center + side * y_basis * halfW;
+
+  float4 p_DC = mix(p0_DC, p1_DC, t);
 
   ThickLineVertexOut out;
   out.position = float4(p_DC.w * ((2.0 * p) / resolution - 1.0), p_DC.z, p_DC.w);
-  out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(mix(p0_MC, p1_MC, p_coord.x), 1.0)).xyz;
+  float3 pos_MC = mix(p0_MC, p1_MC, t);
+  out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(pos_MC, 1.0)).xyz;
   out.viewNormal = scene.normalMatrix * float3(0.0, 0.0, 1.0);
-  out.vertexColor = vertexColors[p0_idx];
-  out.dist_to_centerline = p_coord.y;
+  out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], t);
+  out.dist_to_centerline = side;
   out.cellId = cellIds[instance_id];
-  out.propId = propId + 1u;
+  out.propId = (propId == 0xFFFFFFFFu) ? 0u : (propId + 1u);
   return out;
 }
 
@@ -606,7 +610,7 @@ vertex RoundCapLineVertexOut vertex_round_cap_line_main(
   out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], p_coord.z);
   out.dist_to_centerline = p_coord.y;
   out.cellId = cellIds[instance_id];
-  out.propId = propId + 1u;
+  out.propId = (propId == 0xFFFFFFFFu) ? 0u : (propId + 1u);
   return out;
 }
 
@@ -683,7 +687,10 @@ vertex MiterJoinLineVertexOut vertex_miter_join_line_main(
   float2 y_basis = float2(-x_basis.y, x_basis.x);
 
   float w = max(lineWidth, 1.0);
-  float2 offset = p_coord.x * x_basis + p_coord.y * y_basis * w;
+  float halfW = w * 0.5;
+  float t = (p_coord.x + 1.0) * 0.5;
+  float side = p_coord.y;
+  float2 offset = side * y_basis * halfW;
 
   if (p_coord.x == -1.0 && instance_id > 0 && cellIds[instance_id - 1] == cellIds[instance_id]) {
     float4 prev_p0_DC = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix * float4(positions[lineIndices[(instance_id - 1) * 2]], 1.0);
@@ -694,13 +701,13 @@ vertex MiterJoinLineVertexOut vertex_miter_join_line_main(
     float2 prev_dir = prev_len < 0.001 ? float2(1.0, 0.0) : (prev_delta / prev_len);
     
     float2 miter = float2(-prev_dir.y, prev_dir.x) + float2(-x_basis.y, x_basis.x);
-    float miter_len = length(miter);
+    float denom = dot(miter, y_basis);
 
-    if (miter_len > 0.001 && miter_len < 4.0) {
-      miter = miter / miter_len;
-      float miterOffset = w * 0.5 / dot(miter, float2(-x_basis.y, x_basis.x));
+    if (abs(denom) > 1e-3) {
+      float miterOffset = halfW / denom;
+      miterOffset = clamp(miterOffset, -4.0 * halfW, 4.0 * halfW);
       if (sign(dot(p_coord.y * y_basis, miter)) == sign(dot(float2(0.0, 1.0), miter))) {
-        offset = p_coord.x * x_basis + miter * miterOffset;
+        offset = miter * miterOffset;
       }
     }
   }
@@ -714,28 +721,28 @@ vertex MiterJoinLineVertexOut vertex_miter_join_line_main(
     float2 next_dir = next_len < 0.001 ? float2(1.0, 0.0) : (next_delta / next_len);
     
     float2 miter = float2(-x_basis.y, x_basis.x) + float2(-next_dir.y, next_dir.x);
-    float miter_len = length(miter);
+    float denom = dot(miter, y_basis);
 
-    if (miter_len > 0.001 && miter_len < 4.0) {
-      miter = miter / miter_len;
-      float miterOffset = w * 0.5 / dot(miter, float2(-x_basis.y, x_basis.x));
+    if (abs(denom) > 1e-3) {
+      float miterOffset = halfW / denom;
+      miterOffset = clamp(miterOffset, -4.0 * halfW, 4.0 * halfW);
       if (sign(dot(p_coord.y * y_basis, miter)) == sign(dot(float2(0.0, 1.0), miter))) {
-        offset = p_coord.x * x_basis + miter * miterOffset;
+        offset = miter * miterOffset;
       }
     }
   }
 
-  float2 p = p0_screen + offset + (p1_screen - p0_screen) * 0.5 * (p_coord.x + 1.0);
-  float4 p_DC = mix(p0_DC, p1_DC, p_coord.x);
+  float2 p = mix(p0_screen, p1_screen, t) + offset;
+  float4 p_DC = mix(p0_DC, p1_DC, t);
 
   MiterJoinLineVertexOut out;
   out.position = float4(p_DC.w * ((2.0 * p) / resolution - 1.0), p_DC.z, p_DC.w);
-  out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(mix(positions[p0_idx], positions[p1_idx], p_coord.x), 1.0)).xyz;
+  out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(mix(positions[p0_idx], positions[p1_idx], t), 1.0)).xyz;
   out.viewNormal = scene.normalMatrix * float3(0.0, 0.0, 1.0);
-  out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], p_coord.x);
-  out.dist_to_centerline = p_coord.y;
+  out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], t);
+  out.dist_to_centerline = side;
   out.cellId = cellIds[instance_id];
-  out.propId = propId + 1u;
+  out.propId = (propId == 0xFFFFFFFFu) ? 0u : (propId + 1u);
   return out;
 }
 
@@ -1109,7 +1116,7 @@ vertex GlyphVertexOut vertex_glyph_main(
   out.viewNormal = scene.normalMatrix * glyphNormalTransforms[instance_id] * normals[vertex_id];
   out.glyphColor = glyphColors[instance_id];
   out.cellId = glyphPickIds[instance_id] + 1u;
-  out.propId = propId + 1u;
+  out.propId = (propId == 0xFFFFFFFFu) ? 0u : (propId + 1u);
   out.modelPos = pos;
   return out;
 }
@@ -1165,7 +1172,7 @@ vertex GlyphLineVertexOut vertex_glyph_line_main(
   out.viewNormal = scene.normalMatrix * glyphNormalTransforms[instance_id] * normals[vertex_id];
   out.glyphColor = glyphColors[instance_id];
   out.cellId = glyphPickIds[instance_id] + 1u;
-  out.propId = propId + 1u;
+  out.propId = (propId == 0xFFFFFFFFu) ? 0u : (propId + 1u);
   out.modelPos = pos;
   return out;
 }
@@ -1222,7 +1229,7 @@ vertex GlyphPointVertexOut vertex_glyph_point_main(
   out.viewNormal = scene.normalMatrix * glyphNormalTransforms[instance_id] * normals[vertex_id];
   out.glyphColor = glyphColors[instance_id];
   out.cellId = glyphPickIds[instance_id] + 1u;
-  out.propId = propId + 1u;
+  out.propId = (propId == 0xFFFFFFFFu) ? 0u : (propId + 1u);
   out.point_size = scene.pointSize;
   out.modelPos = pos;
   return out;
