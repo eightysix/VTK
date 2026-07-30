@@ -16,6 +16,8 @@
 #include "vtkRenderingMetalModule.h" // for export macro
 #include "vtkWrappingHints.h"        // for VTK_MARSHALAUTO
 
+#include <mutex>
+
 #ifdef __OBJC__
 @protocol MTLDevice;
 @protocol MTLCommandQueue;
@@ -131,6 +133,13 @@ public:
   int GetEffectiveSampleCount();
 
   /**
+   * Get the shared Metal shader library, compiling it on first access.
+   * Returns nil on compilation failure (check error log).
+   * Thread-safe: uses a std::call_once guard.
+   */
+  void* GetSharedShaderLibrary();
+
+  /**
    * Read back the IDs texture (RGBA32Uint) into a vtkTypeUInt32Array.
    * The array is populated with 4 components per pixel: {CellId, PropId, CompositeId, ProcessId}.
    * Y-axis is flipped to match VTK's bottom-left origin.
@@ -199,6 +208,10 @@ protected:
   int PeelIndex = 0;              // current peel iteration
 
   bool Initialized = false;
+
+  // Shared shader library — compiled once and reused across all pipelines.
+  void* SharedShaderLibrary = nullptr;  // id<MTLLibrary>
+  std::once_flag LibraryInitFlag;
 
 private:
   friend class vtkMetalRenderer;

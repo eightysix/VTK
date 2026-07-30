@@ -8,8 +8,10 @@
 #include "vtkRendererCollection.h"
 #include "vtkCommand.h"
 #include "vtkUnsignedIntArray.h"
+#include "vtkMetalShaders.h"
 
 #include <algorithm>
+#include <mutex>
 #include <vector>
 
 #import <Metal/Metal.h>
@@ -116,6 +118,32 @@ void vtkMetalRenderWindow::Initialize()
 }
 
 //------------------------------------------------------------------------------
+void* vtkMetalRenderWindow::GetSharedShaderLibrary()
+{
+  std::call_once(this->LibraryInitFlag, [this]() {
+    @autoreleasepool {
+      id<MTLDevice> device = (id<MTLDevice>)this->MetalDevice;
+      if (!device)
+      {
+        vtkErrorMacro(<< "Cannot compile shader library: Metal device is null");
+        return;
+      }
+      NSString* source = [NSString stringWithUTF8String:vtkMetalShaders];
+      NSError* error = nil;
+      id<MTLLibrary> lib = [device newLibraryWithSource:source options:nil error:&error];
+      if (!lib)
+      {
+        vtkErrorMacro(<< "Failed to compile shared shader library: "
+                      << [[error localizedDescription] UTF8String]);
+        return;
+      }
+      this->SharedShaderLibrary = (void*)lib;
+    }
+  });
+  return this->SharedShaderLibrary;
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalRenderWindow::Finalize()
 {
   this->ReleaseDrawable();
@@ -143,6 +171,12 @@ void vtkMetalRenderWindow::Finalize()
   }
 
   this->DestroyMultisampleAttachments();
+
+  if (this->SharedShaderLibrary)
+  {
+    [(id)this->SharedShaderLibrary release];
+    this->SharedShaderLibrary = nullptr;
+  }
 
   if (this->MetalLayer)
   {

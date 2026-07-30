@@ -47,24 +47,34 @@ vtkMetalBatchedPolyDataMapper::GetChildMapper(vtkPolyData* polydata)
 {
   auto address = reinterpret_cast<std::uintptr_t>(polydata);
 
-  auto it = this->ChildMappers.find(address);
-  if (it == this->ChildMappers.end())
+  while (true)
   {
-    vtkSmartPointer<vtkMetalPolyDataMapper> mapper =
-      vtkSmartPointer<vtkMetalPolyDataMapper>::New();
+    auto it = this->ChildMappers.find(address);
+    if (it == this->ChildMappers.end())
+    {
+      vtkSmartPointer<vtkMetalPolyDataMapper> mapper =
+        vtkSmartPointer<vtkMetalPolyDataMapper>::New();
 
-    mapper->SetInputData(polydata);
-    this->ConfigureChildMapper(mapper);
-    this->ChildMappers[address] = mapper;
-    return mapper;
+      mapper->SetInputData(polydata);
+      this->ConfigureChildMapper(mapper);
+      this->ChildMappers[address] = mapper;
+      return mapper;
+    }
+
+    // Stale-entry guard: if the cached mapper's input no longer matches,
+    // the vtkPolyData was destroyed and a new object reused the address.
+    if (!it->second || it->second->GetInputDataObject(0, 0) != polydata)
+    {
+      if (it->second)
+      {
+        it->second->ReleaseGraphicsResources(nullptr);
+      }
+      this->ChildMappers.erase(it);
+      continue; // retry with a fresh lookup
+    }
+
+    return it->second;
   }
-
-  if (it->second->GetInputDataObject(0, 0) != polydata)
-  {
-    it->second->SetInputData(polydata);
-  }
-
-  return it->second;
 }
 
 //------------------------------------------------------------------------------
@@ -138,6 +148,35 @@ vtkMetalBatchedPolyDataMapper::GetBatchElement(vtkPolyData* polydata)
   auto found = this->VTKPolyDataToBatchElement.find(address);
   if (found != this->VTKPolyDataToBatchElement.end())
   {
+    // Stale-entry guard: if the stored pointer doesn't match the key,
+    // the vtkPolyData was destroyed and a new object reused the address.
+    if (!found->second || found->second->PolyData != polydata)
+    {
+      // Clean up sibling maps to prevent dangling references
+      auto childIt = this->ChildMappers.find(address);
+      if (childIt != this->ChildMappers.end())
+      {
+        if (childIt->second)
+        {
+          childIt->second->ReleaseGraphicsResources(nullptr);
+        }
+        this->ChildMappers.erase(childIt);
+      }
+      for (auto fit = this->FlatIndexToPolyData.begin();
+           fit != this->FlatIndexToPolyData.end();)
+      {
+        if (fit->second == address)
+        {
+          fit = this->FlatIndexToPolyData.erase(fit);
+        }
+        else
+        {
+          ++fit;
+        }
+      }
+      this->VTKPolyDataToBatchElement.erase(found);
+      return nullptr;
+    }
     return found->second.get();
   }
   return nullptr;

@@ -442,12 +442,10 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         !this->Internals->PointPipeline)
     {
       NSError* error = nil;
-      NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
-      id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+      id<MTLLibrary> library = (__bridge id<MTLLibrary>)renWin->GetSharedShaderLibrary();
       if (!library)
       {
-        vtkErrorMacro(<< "Failed to compile Metal shader for 2D mapper: "
-                      << [[error localizedDescription] UTF8String]);
+        vtkErrorMacro(<< "No shared shader library available for 2D mapper");
         return;
       }
 
@@ -458,7 +456,6 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         vtkErrorMacro(<< "Failed to find 2D shader functions");
         [vFunc release];
         [fFunc release];
-        [library release];
         return;
       }
 
@@ -550,7 +547,6 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
       [vertexDesc release];
       [vFunc release];
       [fFunc release];
-      [library release];
     }
 
     // Create and bind overlay depth-stencil state (always pass, no write)

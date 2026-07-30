@@ -17,6 +17,8 @@ set(classes
 set(headers)
 set(sources)
 
+# Standalone headers (not matching a .mm source)
+
 # All Metal sources use .mm (Objective-C++) for Metal API access
 foreach(class IN LISTS classes)
   list(APPEND sources ${class}.mm)

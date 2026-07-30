@@ -105,20 +105,19 @@ void vtkMetalDepthPeeler::CreateTextures(id<MTLDevice> device, int width, int he
 }
 
 //------------------------------------------------------------------------------
-void vtkMetalDepthPeeler::CreatePipelines(id<MTLDevice> device)
+void vtkMetalDepthPeeler::CreatePipelines(vtkMetalRenderWindow* renWin)
 {
   if (this->PipelinesCreated)
   {
     return;
   }
 
+  id<MTLDevice> device = (__bridge id<MTLDevice>)renWin->GetMetalDevice();
   NSError* error = nil;
-  NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
-  id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)renWin->GetSharedShaderLibrary();
   if (!library)
   {
-    vtkGenericWarningMacro(<< "Failed to compile Metal shaders for depth peeling: "
-                           << [[error localizedDescription] UTF8String]);
+    vtkGenericWarningMacro(<< "No shared shader library available for depth peeling");
     return;
   }
 
@@ -203,8 +202,6 @@ void vtkMetalDepthPeeler::CreatePipelines(id<MTLDevice> device)
     [dsDesc release];
   }
 
-  [library release];
-
   this->PipelinesCreated = (this->CompositePipeline && this->BackBlendPipeline);
 }
 
@@ -254,7 +251,7 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
   {
     this->CreateTextures(device, width, height);
   }
-  this->CreatePipelines(device);
+  this->CreatePipelines(renWin);
 
   if (!this->PipelinesCreated)
   {

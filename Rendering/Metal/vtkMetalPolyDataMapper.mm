@@ -259,6 +259,10 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   int CachedSampleCount = 0;        // 8A: track MSAA sample count changes
   vtkMTimeType CachedScalarMTime = 0;
 
+  // Weak reference to the owning render window (set by RenderPiece).
+  // Used by Ensure* methods to access the cached shader library.
+  vtkMetalRenderWindow* CachedRenderWindow = nullptr;
+
   // 8C: Render bundle caching — pre-recorded encoder commands for static geometry
   // When geometry hasn't changed between frames, replay cached commands instead of
   // re-encoding all setVertexBuffer/setFragmentBuffer/drawPrimitives calls.
@@ -1687,6 +1691,9 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     return;
   }
 
+  // Cache render window for use by Ensure* methods
+  this->Internals->CachedRenderWindow = renWin;
+
   vtkPolyData* input = this->GetInput();
   if (!input)
   {
@@ -2272,6 +2279,19 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
 
   if (useGPUTess)
   {
+    // Shared command buffer for batching all GPU tessellation dispatches
+    id<MTLCommandQueue> computeQueue = this->Internals->EnsureComputeQueue(device);
+    id<MTLCommandBuffer> computeCmdBuf = [computeQueue commandBuffer];
+    computeCmdBuf.label = @"VTK Geometry Tessellation";
+    std::vector<id<MTLBuffer>> tempInputBuffers;
+    bool encPolygonTess = false;
+    bool encEdgeVis = false;
+    bool encWireframe = false;
+    vtkIdType numTris = 0;
+    vtkIdType numEdges = 0;
+    id<MTLBuffer> edgeOutBuf = nil, edgeCellIdBuf = nil;
+    id<MTLBuffer> wireOutBuf = nil, wireCellIdBuf = nil;
+
     // Step 2: Build polygon connectivity arrays for triangle tessellation.
     if (representation != VTK_WIREFRAME && representation != VTK_POINTS && polys && polys->GetNumberOfCells() > 0)
     {
@@ -2279,7 +2299,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       std::vector<uint32_t> polyOff;
       std::vector<uint32_t> polyPrimCounts;
       polyOff.push_back(0);
-      vtkIdType numTris = 0;
+      numTris = 0;
 
       vtkIdType npts;
       const vtkIdType* pts;
@@ -2301,19 +2321,18 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
         // Create compute pipeline if needed
         if (!this->Internals->PolygonToTrianglePipeline)
         {
-          NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
-          NSError* error = nil;
-          id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+          id<MTLLibrary> library = (__bridge id<MTLLibrary>)
+            this->Internals->CachedRenderWindow->GetSharedShaderLibrary();
           if (library)
           {
             id<MTLFunction> func = [library newFunctionWithName:@"polygonToTriangle"];
             if (func)
             {
+              NSError* error = nil;
               this->Internals->PolygonToTrianglePipeline =
                 [device newComputePipelineStateWithFunction:func error:&error];
               [func release];
             }
-            [library release];
           }
         }
 
@@ -2357,70 +2376,28 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                       options:MTLResourceStorageModeShared];
           vtkMetalMRC::AssignConsumed(this->Internals->TessParamsBuffer, tessParamsBuf);
 
-          // Dispatch polygonToTriangle compute kernel
-          id<MTLCommandQueue> queue = this->Internals->EnsureComputeQueue(device);
-          id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
-          id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-          [enc setComputePipelineState:this->Internals->PolygonToTrianglePipeline];
-          [enc setBuffer:this->Internals->TessOutputConnectivityBuffer offset:0 atIndex:0];
-          [enc setBuffer:this->Internals->TessEdgeArrayBuffer offset:0 atIndex:1];
-          [enc setBuffer:this->Internals->TriangleCellIdBuffer offset:0 atIndex:2];
-          [enc setBuffer:connBuf offset:0 atIndex:3];
-          [enc setBuffer:offBuf offset:0 atIndex:4];
-          [enc setBuffer:primBuf offset:0 atIndex:5];
-          [enc setBuffer:this->Internals->TessParamsBuffer offset:0 atIndex:6];
-
-          NSUInteger tgMax = this->Internals->PolygonToTrianglePipeline.maxTotalThreadsPerThreadgroup;
-          NSUInteger gridW = tessParams.numCells;
-          MTLSize grid = MTLSizeMake(gridW, 1, 1);
-          MTLSize tg = MTLSizeMake(std::min(tgMax, gridW), 1, 1);
-          [enc dispatchThreads:grid threadsPerThreadgroup:tg];
-          [enc endEncoding];
-          [cmdBuf commit];
-          [cmdBuf waitUntilCompleted];
-
-          [connBuf release];
-          [offBuf release];
-          [primBuf release];
-
-          if (cmdBuf.status == MTLCommandBufferStatusCompleted)
+          // --- Encode polygonToTriangle ---
           {
-            // Use compute output as triangle index buffer
-            vtkMetalMRC::AssignRetained(
-                this->Internals->IndexBuffer,
-                this->Internals->TessOutputConnectivityBuffer);
-            this->Internals->TriangleVertexCount = numPolyPts;
-            this->Internals->TriangleIndexCount = numTris * 3;
-            this->Internals->HasTriangles = true;
-            this->Internals->TrianglePrimitiveCount = numTris;
+            id<MTLComputeCommandEncoder> enc = [computeCmdBuf computeCommandEncoder];
+            [enc setComputePipelineState:this->Internals->PolygonToTrianglePipeline];
+            [enc setBuffer:this->Internals->TessOutputConnectivityBuffer offset:0 atIndex:0];
+            [enc setBuffer:this->Internals->TessEdgeArrayBuffer offset:0 atIndex:1];
+            [enc setBuffer:this->Internals->TriangleCellIdBuffer offset:0 atIndex:2];
+            [enc setBuffer:connBuf offset:0 atIndex:3];
+            [enc setBuffer:offBuf offset:0 atIndex:4];
+            [enc setBuffer:primBuf offset:0 atIndex:5];
+            [enc setBuffer:this->Internals->TessParamsBuffer offset:0 atIndex:6];
+            NSUInteger tgMax = this->Internals->PolygonToTrianglePipeline.maxTotalThreadsPerThreadgroup;
+            MTLSize grid = MTLSizeMake(tessParams.numCells, 1, 1);
+            NSUInteger gW = static_cast<NSUInteger>(tessParams.numCells);
+            MTLSize tg = MTLSizeMake(std::min(tgMax, gW), 1, 1);
+            [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+            [enc endEncoding];
 
-            // Expand per-triangle cell IDs to per-point for vertex indexing
-            const uint32_t* triCellIds =
-                (const uint32_t*)[this->Internals->TriangleCellIdBuffer contents];
-            const uint32_t* connData =
-                (const uint32_t*)[this->Internals->TessOutputConnectivityBuffer contents];
-            std::vector<uint32_t> pointCellIds(numPolyPts, 0);
-            std::vector<bool> pointAssigned(numPolyPts, false);
-            for (vtkIdType t = 0; t < numTris; ++t)
-            {
-              uint32_t cid = triCellIds[t];
-              for (int v = 0; v < 3; ++v)
-              {
-                uint32_t ptIdx = connData[t * 3 + v];
-                if (ptIdx < (uint32_t)numPolyPts && !pointAssigned[ptIdx])
-                {
-                  pointCellIds[ptIdx] = cid;
-                  pointAssigned[ptIdx] = true;
-                }
-              }
-            }
-            id<MTLBuffer> perPointCellIds = [device
-                newBufferWithBytes:pointCellIds.data()
-                           length:pointCellIds.size() * sizeof(uint32_t)
-                          options:MTLResourceStorageModeShared];
-            vtkMetalMRC::AssignConsumed(this->Internals->TriangleCellIdBuffer, perPointCellIds);
-
-            gpuTessUsed = true;
+            tempInputBuffers.push_back(connBuf);
+            tempInputBuffers.push_back(offBuf);
+            tempInputBuffers.push_back(primBuf);
+            encPolygonTess = true;
           }
         }
       }
@@ -2432,7 +2409,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
         std::vector<uint32_t> eOff;
         std::vector<uint32_t> ePrimCounts;
         eOff.push_back(0);
-        vtkIdType numEdges = 0;
+        numEdges = 0;
 
         vtkIdType npts;
         const vtkIdType* pts;
@@ -2453,19 +2430,18 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
         {
           if (!this->Internals->PolygonEdgesToLinesPipeline)
           {
-            NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
-            NSError* error = nil;
-            id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+            id<MTLLibrary> library = (__bridge id<MTLLibrary>)
+              this->Internals->CachedRenderWindow->GetSharedShaderLibrary();
             if (library)
             {
               id<MTLFunction> func = [library newFunctionWithName:@"polygonEdgesToLines"];
               if (func)
               {
+                NSError* error = nil;
                 this->Internals->PolygonEdgesToLinesPipeline =
                   [device newComputePipelineStateWithFunction:func error:&error];
                 [func release];
               }
-              [library release];
             }
           }
 
@@ -2484,10 +2460,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                          length:ePrimCounts.size() * sizeof(uint32_t)
                         options:MTLResourceStorageModeShared];
 
-            id<MTLBuffer> edgeOutBuf = [device
+            edgeOutBuf = [device
               newBufferWithLength:numEdges * 2 * sizeof(uint32_t)
                          options:MTLResourceStorageModeShared];
-            id<MTLBuffer> edgeCellIdBuf = [device
+            edgeCellIdBuf = [device
               newBufferWithLength:numEdges * sizeof(uint32_t)
                          options:MTLResourceStorageModeShared];
 
@@ -2499,8 +2475,8 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                          length:sizeof(eParams)
                         options:MTLResourceStorageModeShared];
 
-            id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+            // --- Encode polygonEdgesToLines (edge visibility) ---
+            id<MTLComputeCommandEncoder> enc = [computeCmdBuf computeCommandEncoder];
             [enc setComputePipelineState:this->Internals->PolygonEdgesToLinesPipeline];
             [enc setBuffer:edgeOutBuf offset:0 atIndex:0];
             [enc setBuffer:edgeCellIdBuf offset:0 atIndex:1];
@@ -2508,50 +2484,18 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
             [enc setBuffer:eOffBuf offset:0 atIndex:3];
             [enc setBuffer:ePrimBuf offset:0 atIndex:4];
             [enc setBuffer:eParamsBuf offset:0 atIndex:5];
-
             NSUInteger tgMax = this->Internals->PolygonEdgesToLinesPipeline.maxTotalThreadsPerThreadgroup;
-            NSUInteger gridW = eParams.numCells;
-            MTLSize grid = MTLSizeMake(gridW, 1, 1);
-            MTLSize tg = MTLSizeMake(std::min(tgMax, gridW), 1, 1);
+            MTLSize grid = MTLSizeMake(eParams.numCells, 1, 1);
+            NSUInteger gW = static_cast<NSUInteger>(eParams.numCells);
+            MTLSize tg = MTLSizeMake(std::min(tgMax, gW), 1, 1);
             [enc dispatchThreads:grid threadsPerThreadgroup:tg];
             [enc endEncoding];
 
-            if (CommitAndWaitForCompletion(cmdBuf))
-            {
-              vtkMetalMRC::AssignConsumed(this->Internals->EdgeIndexBuffer, edgeOutBuf);
-
-              // Expand per-segment edge cell IDs to per-point for vertex indexing
-              const uint32_t* segEdgeCellIds = (const uint32_t*)[edgeCellIdBuf contents];
-              const uint32_t* edgeConn = (const uint32_t*)[edgeOutBuf contents];
-              std::vector<uint32_t> perPointEdgeCellIds(static_cast<size_t>(numPolyPts), 0);
-              for (vtkIdType s = 0; s < numEdges; ++s)
-              {
-                uint32_t cid = segEdgeCellIds[s];
-                uint32_t p0 = edgeConn[static_cast<size_t>(s) * 2];
-                uint32_t p1 = edgeConn[static_cast<size_t>(s) * 2 + 1];
-                if (p0 < (uint32_t)numPolyPts) perPointEdgeCellIds[p0] = cid;
-                if (p1 < (uint32_t)numPolyPts) perPointEdgeCellIds[p1] = cid;
-              }
-              id<MTLBuffer> perPointEdgeBuf = [device
-                newBufferWithBytes:perPointEdgeCellIds.data()
-                            length:perPointEdgeCellIds.size() * sizeof(uint32_t)
-                           options:MTLResourceStorageModeShared];
-              vtkMetalMRC::AssignConsumed(this->Internals->EdgeCellIdBuffer, perPointEdgeBuf);
-              [edgeCellIdBuf release];
-
-              this->Internals->EdgeIndexCount = numEdges * 2;
-              this->Internals->EdgeVertexCount = numPolyPts;
-              this->Internals->HasEdgeOverlay = true;
-            }
-            else
-            {
-              [edgeOutBuf release];
-              [edgeCellIdBuf release];
-            }
-            [eConnBuf release];
-            [eOffBuf release];
-            [ePrimBuf release];
-            [eParamsBuf release];
+            tempInputBuffers.push_back(eConnBuf);
+            tempInputBuffers.push_back(eOffBuf);
+            tempInputBuffers.push_back(ePrimBuf);
+            tempInputBuffers.push_back(eParamsBuf);
+            encEdgeVis = true;
           }
         }
       }
@@ -2563,7 +2507,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       std::vector<uint32_t> wOff;
       std::vector<uint32_t> wPrimCounts;
       wOff.push_back(0);
-      vtkIdType numEdges = 0;
+      numEdges = 0;
 
       vtkIdType npts;
       const vtkIdType* pts;
@@ -2584,19 +2528,18 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       {
         if (!this->Internals->PolygonEdgesToLinesPipeline)
         {
-          NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
-          NSError* error = nil;
-          id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+          id<MTLLibrary> library = (__bridge id<MTLLibrary>)
+            this->Internals->CachedRenderWindow->GetSharedShaderLibrary();
           if (library)
           {
             id<MTLFunction> func = [library newFunctionWithName:@"polygonEdgesToLines"];
             if (func)
             {
+              NSError* error = nil;
               this->Internals->PolygonEdgesToLinesPipeline =
                 [device newComputePipelineStateWithFunction:func error:&error];
               [func release];
             }
-            [library release];
           }
         }
 
@@ -2615,10 +2558,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                        length:wPrimCounts.size() * sizeof(uint32_t)
                       options:MTLResourceStorageModeShared];
 
-          id<MTLBuffer> wireOutBuf = [device
+          wireOutBuf = [device
             newBufferWithLength:numEdges * 2 * sizeof(uint32_t)
                        options:MTLResourceStorageModeShared];
-          id<MTLBuffer> wireCellIdBuf = [device
+          wireCellIdBuf = [device
             newBufferWithLength:numEdges * sizeof(uint32_t)
                        options:MTLResourceStorageModeShared];
 
@@ -2630,8 +2573,8 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                        length:sizeof(wParams)
                       options:MTLResourceStorageModeShared];
 
-id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) commandBuffer];
-          id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+          // --- Encode polygonEdgesToLines (wireframe) ---
+          id<MTLComputeCommandEncoder> enc = [computeCmdBuf computeCommandEncoder];
           [enc setComputePipelineState:this->Internals->PolygonEdgesToLinesPipeline];
           [enc setBuffer:wireOutBuf offset:0 atIndex:0];
           [enc setBuffer:wireCellIdBuf offset:0 atIndex:1];
@@ -2639,66 +2582,150 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
           [enc setBuffer:wOffBuf offset:0 atIndex:3];
           [enc setBuffer:wPrimBuf offset:0 atIndex:4];
           [enc setBuffer:wParamsBuf offset:0 atIndex:5];
-
           NSUInteger tgMax = this->Internals->PolygonEdgesToLinesPipeline.maxTotalThreadsPerThreadgroup;
-          NSUInteger gridW = wParams.numCells;
-          MTLSize grid = MTLSizeMake(gridW, 1, 1);
-          MTLSize tg = MTLSizeMake(std::min(tgMax, gridW), 1, 1);
+          MTLSize grid = MTLSizeMake(wParams.numCells, 1, 1);
+          NSUInteger gW = static_cast<NSUInteger>(wParams.numCells);
+          MTLSize tg = MTLSizeMake(std::min(tgMax, gW), 1, 1);
           [enc dispatchThreads:grid threadsPerThreadgroup:tg];
           [enc endEncoding];
 
-          if (CommitAndWaitForCompletion(cmdBuf))
-          {
-            vtkMetalMRC::AssignConsumed(this->Internals->LineIndexBuffer, wireOutBuf);
-
-            // wireCellIdBuf has 1 entry per segment from compute kernel
-            const uint32_t* segCellIds = (const uint32_t*)[wireCellIdBuf contents];
-            vtkMetalMRC::AssignConsumed(this->Internals->LineSegmentCellIdBuffer, wireCellIdBuf);
-
-            // Expand per-segment line cell IDs to per-point for vertex indexing
-            const uint32_t* wireConn = (const uint32_t*)[this->Internals->LineIndexBuffer contents];
-            std::vector<uint32_t> perPointLineCellIds(static_cast<size_t>(numPolyPts), 0);
-            for (vtkIdType s = 0; s < numEdges; ++s)
-            {
-              uint32_t cid = segCellIds[s];
-              uint32_t p0 = wireConn[static_cast<size_t>(s) * 2];
-              uint32_t p1 = wireConn[static_cast<size_t>(s) * 2 + 1];
-              if (p0 < (uint32_t)numPolyPts) perPointLineCellIds[p0] = cid;
-              if (p1 < (uint32_t)numPolyPts) perPointLineCellIds[p1] = cid;
-            }
-            id<MTLBuffer> perPointBuf = [device
-              newBufferWithBytes:perPointLineCellIds.data()
-                          length:perPointLineCellIds.size() * sizeof(uint32_t)
-                         options:MTLResourceStorageModeShared];
-            vtkMetalMRC::AssignConsumed(this->Internals->LineCellIdBuffer, perPointBuf);
-
-            this->Internals->LineIndexCount = numEdges * 2;
-            this->Internals->HasLines = true;
-            this->Internals->LinePrimitiveCount = numEdges;
-            this->Internals->ThickLineSegmentCount = numEdges;
-            this->Internals->RoundCapLineSegmentCount = numEdges;
-            this->Internals->MiterJoinLineSegmentCount = numEdges;
-            this->Internals->TriangleVertexCount = 0;
-            this->Internals->TriangleIndexCount = 0;
-            this->Internals->HasTriangles = false;
-            gpuTessUsed = true;
-          }
-          else
-          {
-            [wireOutBuf release];
-            [wireCellIdBuf release];
-          }
-          [wConnBuf release];
-          [wOffBuf release];
-          [wPrimBuf release];
-          [wParamsBuf release];
+          tempInputBuffers.push_back(wConnBuf);
+          tempInputBuffers.push_back(wOffBuf);
+          tempInputBuffers.push_back(wPrimBuf);
+          tempInputBuffers.push_back(wParamsBuf);
+          encWireframe = true;
         }
       }
     }
 
-    // Step 4: Build line connectivity for polyline → line segment conversion
+    // --- Single commit + wait for all encoded dispatches ---
+    [computeCmdBuf commit];
+    [computeCmdBuf waitUntilCompleted];
+
+    if (computeCmdBuf.status == MTLCommandBufferStatusCompleted && encPolygonTess)
+    {
+      // Use compute output as triangle index buffer
+      vtkMetalMRC::AssignRetained(
+          this->Internals->IndexBuffer,
+          this->Internals->TessOutputConnectivityBuffer);
+      this->Internals->TriangleVertexCount = numPolyPts;
+      this->Internals->TriangleIndexCount = numTris * 3;
+      this->Internals->HasTriangles = true;
+      this->Internals->TrianglePrimitiveCount = numTris;
+
+      // Expand per-triangle cell IDs to per-point for vertex indexing
+      const uint32_t* triCellIds =
+          (const uint32_t*)[this->Internals->TriangleCellIdBuffer contents];
+      const uint32_t* connData =
+          (const uint32_t*)[this->Internals->TessOutputConnectivityBuffer contents];
+      std::vector<uint32_t> pointCellIds(numPolyPts, 0);
+      std::vector<bool> pointAssigned(numPolyPts, false);
+      for (vtkIdType t = 0; t < numTris; ++t)
+      {
+        uint32_t cid = triCellIds[t];
+        for (int v = 0; v < 3; ++v)
+        {
+          uint32_t ptIdx = connData[t * 3 + v];
+          if (ptIdx < (uint32_t)numPolyPts && !pointAssigned[ptIdx])
+          {
+            pointCellIds[ptIdx] = cid;
+            pointAssigned[ptIdx] = true;
+          }
+        }
+      }
+      id<MTLBuffer> perPointCellIds = [device
+          newBufferWithBytes:pointCellIds.data()
+                     length:pointCellIds.size() * sizeof(uint32_t)
+                    options:MTLResourceStorageModeShared];
+      vtkMetalMRC::AssignConsumed(this->Internals->TriangleCellIdBuffer, perPointCellIds);
+      gpuTessUsed = true;
+    }
+
+    if (computeCmdBuf.status == MTLCommandBufferStatusCompleted && encEdgeVis)
+    {
+      vtkMetalMRC::AssignConsumed(this->Internals->EdgeIndexBuffer, edgeOutBuf);
+
+      const uint32_t* segEdgeCellIds = (const uint32_t*)[edgeCellIdBuf contents];
+      const uint32_t* edgeConn = (const uint32_t*)[edgeOutBuf contents];
+      std::vector<uint32_t> perPointEdgeCellIds(static_cast<size_t>(numPolyPts), 0);
+      for (vtkIdType s = 0; s < numEdges; ++s)
+      {
+        uint32_t cid = segEdgeCellIds[s];
+        uint32_t p0 = edgeConn[static_cast<size_t>(s) * 2];
+        uint32_t p1 = edgeConn[static_cast<size_t>(s) * 2 + 1];
+        if (p0 < (uint32_t)numPolyPts) perPointEdgeCellIds[p0] = cid;
+        if (p1 < (uint32_t)numPolyPts) perPointEdgeCellIds[p1] = cid;
+      }
+      id<MTLBuffer> perPointEdgeBuf = [device
+        newBufferWithBytes:perPointEdgeCellIds.data()
+                    length:perPointEdgeCellIds.size() * sizeof(uint32_t)
+                   options:MTLResourceStorageModeShared];
+      vtkMetalMRC::AssignConsumed(this->Internals->EdgeCellIdBuffer, perPointEdgeBuf);
+      [edgeCellIdBuf release];
+
+      this->Internals->EdgeIndexCount = numEdges * 2;
+      this->Internals->EdgeVertexCount = numPolyPts;
+      this->Internals->HasEdgeOverlay = true;
+    }
+
+    if (computeCmdBuf.status == MTLCommandBufferStatusCompleted && encWireframe)
+    {
+      vtkMetalMRC::AssignConsumed(this->Internals->LineIndexBuffer, wireOutBuf);
+
+      const uint32_t* segCellIds = (const uint32_t*)[wireCellIdBuf contents];
+      vtkMetalMRC::AssignConsumed(this->Internals->LineSegmentCellIdBuffer, wireCellIdBuf);
+
+      const uint32_t* wireConn = (const uint32_t*)[this->Internals->LineIndexBuffer contents];
+      std::vector<uint32_t> perPointLineCellIds(static_cast<size_t>(numPolyPts), 0);
+      for (vtkIdType s = 0; s < numEdges; ++s)
+      {
+        uint32_t cid = segCellIds[s];
+        uint32_t p0 = wireConn[static_cast<size_t>(s) * 2];
+        uint32_t p1 = wireConn[static_cast<size_t>(s) * 2 + 1];
+        if (p0 < (uint32_t)numPolyPts) perPointLineCellIds[p0] = cid;
+        if (p1 < (uint32_t)numPolyPts) perPointLineCellIds[p1] = cid;
+      }
+      id<MTLBuffer> perPointBuf = [device
+        newBufferWithBytes:perPointLineCellIds.data()
+                    length:perPointLineCellIds.size() * sizeof(uint32_t)
+                   options:MTLResourceStorageModeShared];
+      vtkMetalMRC::AssignConsumed(this->Internals->LineCellIdBuffer, perPointBuf);
+
+      this->Internals->LineIndexCount = numEdges * 2;
+      this->Internals->HasLines = true;
+      this->Internals->LinePrimitiveCount = numEdges;
+      this->Internals->ThickLineSegmentCount = numEdges;
+      this->Internals->RoundCapLineSegmentCount = numEdges;
+      this->Internals->MiterJoinLineSegmentCount = numEdges;
+      this->Internals->TriangleVertexCount = 0;
+      this->Internals->TriangleIndexCount = 0;
+      this->Internals->HasTriangles = false;
+      gpuTessUsed = true;
+    }
+
+    else if (computeCmdBuf.status != MTLCommandBufferStatusCompleted)
+    {
+      // One or more dispatches failed — release outputs that were never consumed
+      if (encPolygonTess) { /* Internals already owns TessOutputConnectivityBuffer etc */ }
+      if (encEdgeVis) { [edgeOutBuf release]; [edgeCellIdBuf release]; }
+      if (encWireframe) { [wireOutBuf release]; [wireCellIdBuf release]; }
+    }
+
+    // Release all temporary input buffers after GPU work is complete
+    for (id<MTLBuffer> buf : tempInputBuffers)
+    {
+      [buf release];
+    }
+
+  }
+
+  // Step 4: Build line connectivity for polyline → line segment conversion.
+  // This block runs independently of useGPUTess to ensure polyline-to-line
+  // extraction also works for small geometries or datasets without normals.
+  {
     vtkCellArray* lines = polydata->GetLines();
-    if (representation != VTK_POINTS && (!gpuTessUsed || (representation == VTK_SURFACE && !this->Internals->HasLines)))
+    if (representation != VTK_POINTS &&
+        (!gpuTessUsed || (representation == VTK_SURFACE && !this->Internals->HasLines)))
     {
       if (lines && lines->GetNumberOfCells() > 0 && cellFlag == 0)
       {
@@ -2727,19 +2754,18 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
         {
           if (!this->Internals->PolyLineToLinePipeline)
           {
-            NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
-            NSError* error = nil;
-            id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+            id<MTLLibrary> library = (__bridge id<MTLLibrary>)
+              this->Internals->CachedRenderWindow->GetSharedShaderLibrary();
             if (library)
             {
               id<MTLFunction> func = [library newFunctionWithName:@"polyLineToLine"];
               if (func)
               {
+                NSError* error = nil;
                 this->Internals->PolyLineToLinePipeline =
                   [device newComputePipelineStateWithFunction:func error:&error];
                 [func release];
               }
-              [library release];
             }
           }
 
@@ -2773,8 +2799,11 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
                          length:sizeof(lParams)
                         options:MTLResourceStorageModeShared];
 
-            id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+            id<MTLCommandQueue> lineQueue = this->Internals->EnsureComputeQueue(device);
+            id<MTLCommandBuffer> lineCmdBuf = [lineQueue commandBuffer];
+            lineCmdBuf.label = @"VTK Line Extraction";
+
+            id<MTLComputeCommandEncoder> enc = [lineCmdBuf computeCommandEncoder];
             [enc setComputePipelineState:this->Internals->PolyLineToLinePipeline];
             [enc setBuffer:lineOutBuf offset:0 atIndex:0];
             [enc setBuffer:lineCellIdBuf offset:0 atIndex:1];
@@ -2782,28 +2811,29 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
             [enc setBuffer:lOffBuf offset:0 atIndex:3];
             [enc setBuffer:lPrimBuf offset:0 atIndex:4];
             [enc setBuffer:lParamsBuf offset:0 atIndex:5];
-
             NSUInteger tgMax = this->Internals->PolyLineToLinePipeline.maxTotalThreadsPerThreadgroup;
-            NSUInteger gridW = lParams.numCells;
-            MTLSize grid = MTLSizeMake(gridW, 1, 1);
-            MTLSize tg = MTLSizeMake(std::min(tgMax, gridW), 1, 1);
+            MTLSize grid = MTLSizeMake(lParams.numCells, 1, 1);
+            NSUInteger gW = static_cast<NSUInteger>(lParams.numCells);
+            MTLSize tg = MTLSizeMake(std::min(tgMax, gW), 1, 1);
             [enc dispatchThreads:grid threadsPerThreadgroup:tg];
             [enc endEncoding];
 
-            if (CommitAndWaitForCompletion(cmdBuf))
+            [lineCmdBuf commit];
+            [lineCmdBuf waitUntilCompleted];
+
+            if (lineCmdBuf.status == MTLCommandBufferStatusCompleted)
             {
               if (!this->Internals->HasLines)
               {
                 vtkMetalMRC::AssignConsumed(this->Internals->LineIndexBuffer, lineOutBuf);
 
-                // lineCellIdBuf has 1 entry per segment from compute kernel
-                // → LineSegmentCellIdBuffer for thick lines (by instance_id)
                 const uint32_t* segCellIds = (const uint32_t*)[lineCellIdBuf contents];
                 vtkMetalMRC::AssignConsumed(this->Internals->LineSegmentCellIdBuffer, lineCellIdBuf);
 
-                // Expand per-segment line cell IDs to per-point for vertex indexing
-                const uint32_t* lineConn = (const uint32_t*)[this->Internals->LineIndexBuffer contents];
-                std::vector<uint32_t> perPointLineCellIds(static_cast<size_t>(numPolyPts), 0);
+                const uint32_t* lineConn =
+                  (const uint32_t*)[this->Internals->LineIndexBuffer contents];
+                std::vector<uint32_t> perPointLineCellIds(
+                  static_cast<size_t>(numPolyPts), 0);
                 for (vtkIdType s = 0; s < numLineSegs; ++s)
                 {
                   uint32_t cid = segCellIds[s];
@@ -2824,7 +2854,6 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
                 this->Internals->ThickLineSegmentCount = numLineSegs;
                 this->Internals->RoundCapLineSegmentCount = numLineSegs;
                 this->Internals->MiterJoinLineSegmentCount = numLineSegs;
-
                 gpuTessUsed = true;
               }
               else
@@ -2838,6 +2867,7 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
               [lineOutBuf release];
               [lineCellIdBuf release];
             }
+
             [lConnBuf release];
             [lOffBuf release];
             [lPrimBuf release];
@@ -2846,58 +2876,62 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
         }
       }
     }
+  }
 
-    if (gpuTessUsed)
+  // Build per-point vertex data from GPU tessellation outputs.
+  // Moved outside if(useGPUTess) so this block runs even when Step 4
+  // (line extraction) is the one that set gpuTessUsed = true.
+  if (gpuTessUsed)
+  {
+    positions.reserve(numPolyPts * 3);
+    surfaceColors.reserve(numPolyPts * 4);
+    triangleUVs.reserve(numPolyPts * 2);
+
+    for (vtkIdType i = 0; i < numPolyPts; ++i)
     {
-      positions.reserve(numPolyPts * 3);
-      normals.reserve(numPolyPts * 3);
-      surfaceColors.reserve(numPolyPts * 4);
-      triangleUVs.reserve(numPolyPts * 2);
+      double pt[3];
+      polydata->GetPoint(i, pt);
+      positions.push_back(static_cast<float>(pt[0]));
+      positions.push_back(static_cast<float>(pt[1]));
+      positions.push_back(static_cast<float>(pt[2]));
 
-      for (vtkIdType i = 0; i < numPolyPts; ++i)
+      if (normalArray)
       {
-        double pt[3];
-        polydata->GetPoint(i, pt);
-        positions.push_back(static_cast<float>(pt[0]));
-        positions.push_back(static_cast<float>(pt[1]));
-        positions.push_back(static_cast<float>(pt[2]));
-
+        normals.reserve(numPolyPts * 3);
         double n[3];
         normalArray->GetTuple(i, n);
         normals.push_back(static_cast<float>(n[0]));
         normals.push_back(static_cast<float>(n[1]));
         normals.push_back(static_cast<float>(n[2]));
-
-        if (mappedColors)
-        {
-          emitSurfaceColor(i, mappedColors->GetPointer(0));
-        }
-        else
-        {
-          float defRGBA[4];
-          getOverrideOrDefaultRGBA(defRGBA);
-          surfaceColors.push_back(defRGBA[0]);
-          surfaceColors.push_back(defRGBA[1]);
-          surfaceColors.push_back(defRGBA[2]);
-          surfaceColors.push_back(defRGBA[3]);
-        }
-
-        if (tcoordArray && tcoordArray->GetNumberOfTuples() > i)
-        {
-          double uv[3];
-          tcoordArray->GetTuple(i, uv);
-          triangleUVs.push_back(static_cast<float>(uv[0]));
-          triangleUVs.push_back(static_cast<float>(uv[1]));
-        }
-        else
-        {
-          triangleUVs.push_back(0.0f);
-          triangleUVs.push_back(0.0f);
-        }
-        emitExtraAttrsForPoint(i);
-        // TODO: emitExtraAttrsForCell not called here — cell association data
-        // is lost after GPU tessellation. Unusual combination; add if needed.
       }
+
+      if (mappedColors)
+      {
+        emitSurfaceColor(i, mappedColors->GetPointer(0));
+      }
+      else
+      {
+        float defRGBA[4];
+        getOverrideOrDefaultRGBA(defRGBA);
+        surfaceColors.push_back(defRGBA[0]);
+        surfaceColors.push_back(defRGBA[1]);
+        surfaceColors.push_back(defRGBA[2]);
+        surfaceColors.push_back(defRGBA[3]);
+      }
+
+      if (tcoordArray && tcoordArray->GetNumberOfTuples() > i)
+      {
+        double uv[3];
+        tcoordArray->GetTuple(i, uv);
+        triangleUVs.push_back(static_cast<float>(uv[0]));
+        triangleUVs.push_back(static_cast<float>(uv[1]));
+      }
+      else
+      {
+        triangleUVs.push_back(0.0f);
+        triangleUVs.push_back(0.0f);
+      }
+      emitExtraAttrsForPoint(i);
     }
   }
 
@@ -3488,6 +3522,40 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
   }
   } // end if (!gpuTessUsed)
 
+  float defaultRGBA[4];
+  getOverrideOrDefaultRGBA(defaultRGBA);
+
+  this->UploadVertexDataToMTLBuffers(mtlDevice, polydata, pd,
+    mappedColors, cellFlag, gpuTessUsed, defaultRGBA,
+    positions, normals, surfaceColors, triangleUVs, lineIndices,
+    triangleIndices, edgePositions, edgeNormals, edgeColors, edgeUVs,
+    edgeIndices, triangleVertexCellIds, lineVertexCellIds,
+    lineSegmentCellIds, edgeVertexCellIds, extraAttrArrays);
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
+  vtkPolyData* polydata,
+  vtkPointData* pd,
+  vtkUnsignedCharArray* mappedColors,
+  int cellFlag,
+  bool gpuTessUsed,
+  const float defaultRGBA[4],
+  std::vector<float>& positions, std::vector<float>& normals,
+  const std::vector<float>& surfaceColors, const std::vector<float>& triangleUVs,
+  const std::vector<uint32_t>& lineIndices,
+  const std::vector<uint32_t>& triangleIndices,
+  const std::vector<float>& edgePositions,
+  std::vector<float>& edgeNormals, const std::vector<float>& edgeColors,
+  const std::vector<float>& edgeUVs, const std::vector<uint32_t>& edgeIndices,
+  const std::vector<uint32_t>& triangleVertexCellIds,
+  const std::vector<uint32_t>& lineVertexCellIds,
+  const std::vector<uint32_t>& lineSegmentCellIds,
+  const std::vector<uint32_t>& edgeVertexCellIds,
+  std::unordered_map<std::string, std::vector<float>>& extraAttrArrays)
+{
+  id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
+
   if (!positions.empty())
   {
     id<MTLBuffer> posBuffer = [device
@@ -3504,10 +3572,9 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
                 options:MTLResourceStorageModeShared];
     vtkMetalMRC::AssignConsumed(this->Internals->VertexNormalBuffer, normBuffer);
   }
+  // Vertex descriptor always requires a buffer at index 1 for normals.
   else if (!positions.empty())
   {
-    // Vertex descriptor always requires a buffer at index 1 for normals.
-    // Fill with a default up-facing normal so the pipeline validates.
     normals.assign(positions.size(), 0.0f);
     for (size_t i = 1; i < normals.size(); i += 3)
     {
@@ -3541,7 +3608,6 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
   // P2-2B: Create edge geometry buffers for wireframe overlay on surfaces
   if (!edgeIndices.empty() && !edgePositions.empty())
   {
-    // Ensure normal buffer exists (edge pipeline always expects one)
     if (edgeNormals.empty())
     {
       edgeNormals.assign(edgePositions.size(), 0.0f);
@@ -3628,9 +3694,9 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
         this->Internals->UseBatchOpacity ||
         hasNonOpaqueAlpha;
   }
+  // Always provide a white color buffer so the vertex shader can always read from buffer(3)
   else if (!positions.empty())
   {
-    // Always provide a white color buffer so the vertex shader can always read from buffer(3)
     std::vector<float> whiteColors(positions.size() / 3 * 4, 1.0f);
     id<MTLBuffer> whiteColorBuf = [device
       newBufferWithBytes:whiteColors.data()
@@ -3680,6 +3746,10 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
     {
       da = polydata->GetPointData()->GetArray(attr.second.DataArrayName.c_str());
     }
+    // TODO: emitExtraAttrsForCell not called here — cell association data is
+    // lost after GPU tessellation since the vertex-count-based attribute arrays
+    // use per-point emission only. For the CPU path, cell data is duplicated
+    // per-vertex during emission in BuildGeometryBuffers.
     else if (attr.second.FieldAssociation == vtkDataObject::FIELD_ASSOCIATION_CELLS)
     {
       da = polydata->GetCellData()->GetArray(attr.second.DataArrayName.c_str());
@@ -3816,24 +3886,22 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
     // Point colors — from MapScalars (per-point RGBA), batch override, or default white.
     // Matches WebGPU: reads point_colors SSBO indexed by point_id.
     // Note: mappedColors and cellFlag are already set from the early MapScalars call above.
-    std::vector<float> pointColors(numPts * 4, 1.0f); // default white
+    std::vector<float> pointColors(numPts * 4, 1.0f);
     if (this->Internals->UseBatchColor || this->Internals->UseBatchOpacity)
     {
-      float ptRGBA[4];
-      getOverrideOrDefaultRGBA(ptRGBA);
       for (vtkIdType i = 0; i < numPts; ++i)
       {
-        pointColors[i * 4] = ptRGBA[0];
-        pointColors[i * 4 + 1] = ptRGBA[1];
-        pointColors[i * 4 + 2] = ptRGBA[2];
-        pointColors[i * 4 + 3] = ptRGBA[3];
+        pointColors[i * 4] = defaultRGBA[0];
+        pointColors[i * 4 + 1] = defaultRGBA[1];
+        pointColors[i * 4 + 2] = defaultRGBA[2];
+        pointColors[i * 4 + 3] = defaultRGBA[3];
       }
     }
     else if (mappedColors && cellFlag == 0 &&
         mappedColors->GetNumberOfTuples() >= numPts)
     {
-      // Per-point colors — normalize unsigned char RGBA to float [0,1]
       const unsigned char* rgba = mappedColors->GetPointer(0);
+      // Per-point colors — normalize unsigned char RGBA to float [0,1]
       for (vtkIdType i = 0; i < numPts; ++i)
       {
         pointColors[i * 4] = rgba[i * 4] / 255.0f;
@@ -3911,7 +3979,6 @@ id<MTLCommandBuffer> cmdBuf = [this->Internals->EnsureComputeQueue(device) comma
     // Matches WebGPU: reads point_color_uvs SSBO indexed by point_id.
     std::vector<float> pointColorUVs(numPts * 2, 0.0f);
     // Color UVs are typically the same as regular UVs unless a separate texture channel is used.
-    // For now, use the same UV data.
     if (uvArray && uvArray->GetNumberOfTuples() >= numPts)
     {
       for (vtkIdType i = 0; i < numPts; ++i)
@@ -3969,13 +4036,17 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
 
   id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
 
-  NSError* error = nil;
-  NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
-  id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+  if (!this->Internals->CachedRenderWindow)
+  {
+    vtkErrorMacro(<< "No render window available for shader library access");
+    return;
+  }
+
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)
+    this->Internals->CachedRenderWindow->GetSharedShaderLibrary();
   if (!library)
   {
-    vtkErrorMacro(<< "Failed to compile Metal shader: "
-                  << [[error localizedDescription] UTF8String]);
+    vtkErrorMacro(<< "No shared shader library available");
     return;
   }
 
@@ -3987,7 +4058,6 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
     vtkErrorMacro(<< "Failed to find shader functions");
     [vertexFunc release];
     [fragmentFunc release];
-    [library release];
     return;
   }
 
@@ -4036,7 +4106,7 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
 
   if (!this->Internals->TrianglePipeline)
   {
-    error = nil;
+    NSError* error = nil;
     this->Internals->TrianglePipeline =
       [device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
     if (!this->Internals->TrianglePipeline)
@@ -4049,7 +4119,7 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
 
   if (!this->Internals->LinePipeline)
   {
-    error = nil;
+    NSError* error = nil;
     this->Internals->LinePipeline =
       [device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
     if (!this->Internals->LinePipeline)
@@ -4062,7 +4132,6 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   [fragmentFunc release];
   [vertexDesc release];
   [pipelineDesc release];
-  [library release];
 }
 
 //------------------------------------------------------------------------------
@@ -4078,13 +4147,17 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
 
   id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
 
-  NSError* error = nil;
-  NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
-  id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+  if (!this->Internals->CachedRenderWindow)
+  {
+    vtkErrorMacro(<< "No render window available for shader library access");
+    return;
+  }
+
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)
+    this->Internals->CachedRenderWindow->GetSharedShaderLibrary();
   if (!library)
   {
-    vtkErrorMacro(<< "Failed to compile Metal shader for points: "
-                  << [[error localizedDescription] UTF8String]);
+    vtkErrorMacro(<< "No shared shader library available for points");
     return;
   }
 
@@ -4115,7 +4188,7 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
       desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
       desc.rasterSampleCount = sampleCount;
 
-      error = nil;
+      NSError* error = nil;
       this->Internals->PointPipeline =
         [device newRenderPipelineStateWithDescriptor:desc error:&error];
       if (!this->Internals->PointPipeline)
@@ -4157,7 +4230,7 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
       desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
       desc.rasterSampleCount = sampleCount;
 
-      error = nil;
+      NSError* error = nil;
       this->Internals->PointShapedPipeline =
         [device newRenderPipelineStateWithDescriptor:desc error:&error];
       if (!this->Internals->PointShapedPipeline)
@@ -4169,8 +4242,6 @@ void vtkMetalPolyDataMapper::EnsurePointPipelineStates(void* mtlDevice)
     [vFunc release];
     [fFunc release];
   }
-
-  [library release];
 }
 
 //------------------------------------------------------------------------------
@@ -4186,13 +4257,17 @@ void vtkMetalPolyDataMapper::EnsureEdgePipelineState(void* mtlDevice)
 
   id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
 
-  NSError* error = nil;
-  NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
-  id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+  if (!this->Internals->CachedRenderWindow)
+  {
+    vtkErrorMacro(<< "No render window available for shader library access");
+    return;
+  }
+
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)
+    this->Internals->CachedRenderWindow->GetSharedShaderLibrary();
   if (!library)
   {
-    vtkErrorMacro(<< "Failed to compile Metal shader for edges: "
-                  << [[error localizedDescription] UTF8String]);
+    vtkErrorMacro(<< "No shared shader library available for edges");
     return;
   }
 
@@ -4237,7 +4312,7 @@ void vtkMetalPolyDataMapper::EnsureEdgePipelineState(void* mtlDevice)
     desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassLine;
     desc.rasterSampleCount = sampleCount;
 
-    error = nil;
+    NSError* error = nil;
     this->Internals->EdgePipeline =
       [device newRenderPipelineStateWithDescriptor:desc error:&error];
     if (!this->Internals->EdgePipeline)
@@ -4249,7 +4324,6 @@ void vtkMetalPolyDataMapper::EnsureEdgePipelineState(void* mtlDevice)
   }
   [vFunc release];
   [fFunc release];
-  [library release];
 }
 
 //------------------------------------------------------------------------------
@@ -4265,13 +4339,17 @@ void vtkMetalPolyDataMapper::EnsureThickLinePipelineState(void* mtlDevice)
 
   id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
 
-  NSError* error = nil;
-  NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
-  id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+  if (!this->Internals->CachedRenderWindow)
+  {
+    vtkErrorMacro(<< "No render window available for shader library access");
+    return;
+  }
+
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)
+    this->Internals->CachedRenderWindow->GetSharedShaderLibrary();
   if (!library)
   {
-    vtkErrorMacro(<< "Failed to compile Metal shader for thick lines: "
-                  << [[error localizedDescription] UTF8String]);
+    vtkErrorMacro(<< "No shared shader library available for thick lines");
     return;
   }
 
@@ -4299,7 +4377,7 @@ void vtkMetalPolyDataMapper::EnsureThickLinePipelineState(void* mtlDevice)
     desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
     desc.rasterSampleCount = sampleCount;
 
-    error = nil;
+    NSError* error = nil;
     this->Internals->ThickLinePipeline =
       [device newRenderPipelineStateWithDescriptor:desc error:&error];
     if (!this->Internals->ThickLinePipeline)
@@ -4310,7 +4388,6 @@ void vtkMetalPolyDataMapper::EnsureThickLinePipelineState(void* mtlDevice)
   }
   [vFunc release];
   [fFunc release];
-  [library release];
 }
 
 //------------------------------------------------------------------------------
@@ -4326,13 +4403,17 @@ void vtkMetalPolyDataMapper::EnsureRoundCapLinePipelineState(void* mtlDevice)
 
   id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
 
-  NSError* error = nil;
-  NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
-  id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+  if (!this->Internals->CachedRenderWindow)
+  {
+    vtkErrorMacro(<< "No render window available for shader library access");
+    return;
+  }
+
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)
+    this->Internals->CachedRenderWindow->GetSharedShaderLibrary();
   if (!library)
   {
-    vtkErrorMacro(<< "Failed to compile Metal shader for round cap lines: "
-                  << [[error localizedDescription] UTF8String]);
+    vtkErrorMacro(<< "No shared shader library available for round cap lines");
     return;
   }
 
@@ -4360,7 +4441,7 @@ void vtkMetalPolyDataMapper::EnsureRoundCapLinePipelineState(void* mtlDevice)
     desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
     desc.rasterSampleCount = sampleCount;
 
-    error = nil;
+    NSError* error = nil;
     this->Internals->RoundCapLinePipeline =
       [device newRenderPipelineStateWithDescriptor:desc error:&error];
     if (!this->Internals->RoundCapLinePipeline)
@@ -4371,7 +4452,6 @@ void vtkMetalPolyDataMapper::EnsureRoundCapLinePipelineState(void* mtlDevice)
   }
   [vFunc release];
   [fFunc release];
-  [library release];
 }
 
 //------------------------------------------------------------------------------
@@ -4387,13 +4467,17 @@ void vtkMetalPolyDataMapper::EnsureMiterJoinLinePipelineState(void* mtlDevice)
 
   id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
 
-  NSError* error = nil;
-  NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
-  id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+  if (!this->Internals->CachedRenderWindow)
+  {
+    vtkErrorMacro(<< "No render window available for shader library access");
+    return;
+  }
+
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)
+    this->Internals->CachedRenderWindow->GetSharedShaderLibrary();
   if (!library)
   {
-    vtkErrorMacro(<< "Failed to compile Metal shader for miter join lines: "
-                  << [[error localizedDescription] UTF8String]);
+    vtkErrorMacro(<< "No shared shader library available for miter join lines");
     return;
   }
 
@@ -4421,7 +4505,7 @@ void vtkMetalPolyDataMapper::EnsureMiterJoinLinePipelineState(void* mtlDevice)
     desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
     desc.rasterSampleCount = sampleCount;
 
-    error = nil;
+    NSError* error = nil;
     this->Internals->MiterJoinLinePipeline =
       [device newRenderPipelineStateWithDescriptor:desc error:&error];
     if (!this->Internals->MiterJoinLinePipeline)
@@ -4432,7 +4516,6 @@ void vtkMetalPolyDataMapper::EnsureMiterJoinLinePipelineState(void* mtlDevice)
   }
   [vFunc release];
   [fFunc release];
-  [library release];
 }
 
 //------------------------------------------------------------------------------
@@ -4449,20 +4532,23 @@ void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
 
   id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
 
-  NSError* error = nil;
-  NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
-  id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+  if (!this->Internals->CachedRenderWindow)
+  {
+    vtkErrorMacro(<< "No render window available for shader library access");
+    return;
+  }
+
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)
+    this->Internals->CachedRenderWindow->GetSharedShaderLibrary();
   if (!library)
   {
-    vtkErrorMacro(<< "Failed to compile Metal shader for depth peeling: "
-                  << [[error localizedDescription] UTF8String]);
+    vtkErrorMacro(<< "No shared shader library available for depth peeling");
     return;
   }
 
   id<MTLFunction> vertexFunc = [library newFunctionWithName:@"vertex_main"];
   if (!vertexFunc)
   {
-    [library release];
     return;
   }
 
@@ -4506,7 +4592,7 @@ void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
       desc.rasterSampleCount = this->Internals->CachedSampleCount > 0
         ? this->Internals->CachedSampleCount : 1;
 
-      error = nil;
+      NSError* error = nil;
       this->Internals->TriangleInitPeelPipeline =
         [device newRenderPipelineStateWithDescriptor:desc error:&error];
       if (!this->Internals->TriangleInitPeelPipeline)
@@ -4557,7 +4643,7 @@ void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
       desc.rasterSampleCount = this->Internals->CachedSampleCount > 0
         ? this->Internals->CachedSampleCount : 1;
 
-      error = nil;
+      NSError* error = nil;
       this->Internals->TrianglePeelPipeline =
         [device newRenderPipelineStateWithDescriptor:desc error:&error];
       if (!this->Internals->TrianglePeelPipeline)
@@ -4571,7 +4657,6 @@ void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
 
   [vertexFunc release];
   [vertexDesc release];
-  [library release];
 }
 
 //------------------------------------------------------------------------------

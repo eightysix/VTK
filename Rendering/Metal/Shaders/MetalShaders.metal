@@ -971,7 +971,8 @@ fragment PeelPassOutput fragment_peel(
   
   if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
 
-  uint2 pixel = uint2(in.position.xy) - uint2(scene.viewport.xy);
+  uint2 texSize = uint2(prevFrontTex.get_width(), prevFrontTex.get_height());
+  uint2 pixel = min(uint2(in.position.xy), texSize - 1);
   float4 prevFront = prevFrontTex.read(pixel);
   float2 prevDepth = prevDepthTex.read(pixel).rg;
   
@@ -1038,7 +1039,8 @@ fragment float4 fragment_peel_alpha_blend(
   
   if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
 
-  uint2 pixel = uint2(in.position.xy) - uint2(scene.viewport.xy);
+  uint2 texSize = uint2(prevDepthTex.get_width(), prevDepthTex.get_height());
+  uint2 pixel = min(uint2(in.position.xy), texSize - 1);
   float2 prevDepth = prevDepthTex.read(pixel).rg;
   float fragDepth = in.position.z;
   float epsilon = 0.0000001;

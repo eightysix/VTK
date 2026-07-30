@@ -30,6 +30,7 @@
 VTK_ABI_NAMESPACE_BEGIN
 
 class vtkMetalRenderer;
+class vtkMetalRenderWindow;
 
 class VTKRENDERINGMETAL_EXPORT vtkMetalDepthPeeler
 {
@@ -79,7 +80,7 @@ private:
   void operator=(const vtkMetalDepthPeeler&) = delete;
 
   void CreateTextures(id<MTLDevice> device, int width, int height);
-  void CreatePipelines(id<MTLDevice> device);
+  void CreatePipelines(vtkMetalRenderWindow* renWin);
 
   // Fullscreen pass pipeline states
   id<MTLRenderPipelineState> CompositePipeline = nil;

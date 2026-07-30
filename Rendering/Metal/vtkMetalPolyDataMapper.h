@@ -10,9 +10,13 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 VTK_ABI_NAMESPACE_BEGIN
 class vtkOverrideAttribute;
+class vtkPointData;
+class vtkUnsignedCharArray;
 
 class VTKRENDERINGMETAL_EXPORT VTK_MARSHALAUTO vtkMetalPolyDataMapper
   : public vtkPolyDataMapper
@@ -83,6 +87,23 @@ protected:
   // 8D: Vertex attribute mappings (attribute name → data source)
   std::map<std::string, ExtraAttributeValue> ExtraAttributes;
   vtkTimeStamp ExtraAttributesMTime;
+
+  // Upload vertex data from CPU vectors to GPU Metal buffers
+  void UploadVertexDataToMTLBuffers(void* mtlDevice, vtkPolyData* polydata,
+    vtkPointData* pd, vtkUnsignedCharArray* mappedColors, int cellFlag,
+    bool gpuTessUsed, const float defaultRGBA[4],
+    std::vector<float>& positions, std::vector<float>& normals,
+    const std::vector<float>& surfaceColors, const std::vector<float>& triangleUVs,
+    const std::vector<uint32_t>& lineIndices,
+    const std::vector<uint32_t>& triangleIndices,
+    const std::vector<float>& edgePositions,
+    std::vector<float>& edgeNormals, const std::vector<float>& edgeColors,
+    const std::vector<float>& edgeUVs, const std::vector<uint32_t>& edgeIndices,
+    const std::vector<uint32_t>& triangleVertexCellIds,
+    const std::vector<uint32_t>& lineVertexCellIds,
+    const std::vector<uint32_t>& lineSegmentCellIds,
+    const std::vector<uint32_t>& edgeVertexCellIds,
+    std::unordered_map<std::string, std::vector<float>>& extraAttrArrays);
 
   // P1-3: Ensure fallback buffers exist for all shader-required bindings
   void EnsureRequiredBindingFallbacks(void* mtlDevice);
