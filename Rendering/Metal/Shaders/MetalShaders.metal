@@ -161,6 +161,34 @@ inline void computePhongLighting(
   }
 }
 
+inline uint mapPropId(uint raw) { return (raw == 0xFFFFFFFFu) ? 0u : (raw + 1u); }
+
+struct ResolvedMaterial {
+    float3 ambient;
+    float3 diffuse;
+    float  opacity;
+};
+
+inline ResolvedMaterial resolveMaterial(
+    constant MaterialUniforms& material,
+    constant SceneUniforms& scene,
+    float4 vertexColor, float2 uv,
+    texture2d<float> actorTexture, sampler actorSampler)
+{
+    bool hasVC = (scene.flags & (1u << 8)) != 0u;
+    ResolvedMaterial r;
+    r.ambient = hasVC ? vertexColor.rgb : material.ambientColor.rgb;
+    r.diffuse = hasVC ? vertexColor.rgb : material.diffuseColor.rgb;
+    r.opacity = (scene.flags & (1u << 10)) != 0u ? vertexColor.a : material.opacity;
+    if ((scene.flags & (1u << 9)) != 0u) {
+        float4 tex = actorTexture.sample(actorSampler, uv);
+        r.ambient *= tex.rgb;
+        r.diffuse *= tex.rgb;
+        r.opacity *= tex.a;
+    }
+    return r;
+}
+
 // ---------------------------------------------------------------------------
 // Vertex shader
 // ---------------------------------------------------------------------------
@@ -183,7 +211,7 @@ vertex VertexOut vertex_main(uint vertex_id [[vertex_id]],
   out.uv = triangleUVs[vertex_id];
   out.modelPos = in.position; // Direct pass for unbounded planes evaluation
   out.cellId = cellIds[vertex_id];
-  out.propId = (propId == 0xFFFFFFFFu) ? 0u : (propId + 1u);
+  out.propId = mapPropId(propId);
 
   return out;
 }
@@ -203,32 +231,16 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
 
   float3 N = normalize(in.viewNormal);
 
-  bool hasVertexColors = (scene.flags & (1u << 8)) != 0u;
-  float3 ambientColor = hasVertexColors ? in.vertexColor.rgb : material.ambientColor.rgb;
-  float ambientIntensity = material.ambientColor.w;
-  float3 diffuseColor = hasVertexColors ? in.vertexColor.rgb : material.diffuseColor.rgb;
-  float diffuseIntensity = material.diffuseColor.w;
-  float3 specularColor = material.specularColor.rgb;
-  float specularIntensity = material.specularColor.w;
-  bool hasSurfaceAlpha = (scene.flags & (1u << 10)) != 0u;
-  float baseOpacity = hasSurfaceAlpha ? in.vertexColor.a : material.opacity;
+  ResolvedMaterial r = resolveMaterial(material, scene, in.vertexColor, in.uv, actorTexture, actorSampler);
 
-  bool hasTexture = (scene.flags & (1u << 9)) != 0u;
-  if (hasTexture) {
-    float4 texColor = actorTexture.sample(actorSampler, in.uv);
-    ambientColor *= texColor.rgb;
-    diffuseColor *= texColor.rgb;
-    baseOpacity *= texColor.a;
-  }
-
-  float3 totalAmbient = ambientIntensity * ambientColor;
+  float3 totalAmbient = material.ambientColor.w * r.ambient;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
-  computePhongLighting(N, in.viewPos, diffuseColor, specularColor, specularIntensity, material.specularPower, lights, totalDiffuse, totalSpecular);
+  computePhongLighting(N, in.viewPos, r.diffuse, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
 
   FragmentOutput out;
-  out.color = float4(totalAmbient + diffuseIntensity * totalDiffuse + totalSpecular, baseOpacity);
+  out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, r.opacity);
   out.ids = uint4(in.cellId, in.propId, 1u, 0u);
   
   float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
@@ -293,7 +305,7 @@ vertex PointVertexOut vertex_point_main(
   out.uv = point_uvs[vertex_id];
   out.lut_uv = point_color_uvs[vertex_id];
   out.cellId = pointCellIds[vertex_id];
-  out.propId = (pointPropId == 0xFFFFFFFFu) ? 0u : (pointPropId + 1u);
+  out.propId = mapPropId(pointPropId);
   return out;
 }
 
@@ -375,24 +387,18 @@ vertex PointShapedVertexOut vertex_point_shaped_main(
   out.uv = point_uvs[point_id];
   out.lut_uv = point_color_uvs[point_id];
   out.cellId = shapedCellIds[point_id];
-  out.propId = (shapedPropId == 0xFFFFFFFFu) ? 0u : (shapedPropId + 1u);
+  out.propId = mapPropId(shapedPropId);
   return out;
 }
 
-struct PointFragmentOutput {
-  float4 color [[color(0)]];
-  uint4 ids [[color(1)]];
-  float depth [[depth(any)]];
-};
-
-fragment PointFragmentOutput fragment_point_shaped_main(
+fragment FragmentOutput fragment_point_shaped_main(
     PointShapedVertexOut in [[stage_in]],
     constant MaterialUniforms& material [[buffer(0)]],
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
     constant VertexColorUniforms& vertexColorUniform [[buffer(4)]]) {
-  PointFragmentOutput out;
+  FragmentOutput out;
 
   float d = length(in.p_coord);
   bool drawSpheres = (scene.flags & (1u << 5)) != 0u;
@@ -436,9 +442,9 @@ fragment PointFragmentOutput fragment_point_shaped_main(
 }
 
 // ---------------------------------------------------------------------------
-// Thick line shaders
+// Line shaders (thick line, round cap, miter join — shared struct + fragment)
 // ---------------------------------------------------------------------------
-struct ThickLineVertexOut {
+struct LineVertexOut {
   float4 position [[position]];
   float3 viewPos;
   float3 viewNormal;
@@ -448,7 +454,31 @@ struct ThickLineVertexOut {
   uint propId;
 };
 
-vertex ThickLineVertexOut vertex_thick_line_main(
+inline FragmentOutput shadeLineFragment(LineVertexOut in,
+    constant MaterialUniforms& material,
+    constant LightUniforms& lights,
+    constant CoincidentOffsetUniforms& coinOffset)
+{
+  FragmentOutput out;
+  float3 baseColor = in.vertexColor.rgb;
+  float baseAlpha = in.vertexColor.a * material.opacity;
+  float3 N = normalize(in.viewNormal);
+  N.z = 1.0 - 2.0 * abs(in.dist_to_centerline);
+  N = normalize(N);
+
+  float3 totalDiffuse = float3(0.0), totalSpecular = float3(0.0);
+  computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb,
+      material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
+
+  out.color = float4(material.ambientColor.w * baseColor
+                   + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha);
+  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
+  float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
+  out.depth = in.position.z + coinOffset.lineFactor * cscale + coinOffset.lineOffset / 65000.0;
+  return out;
+}
+
+vertex LineVertexOut vertex_thick_line_main(
     uint vertex_id [[vertex_id]],
     uint instance_id [[instance_id]],
     constant float3* positions [[buffer(0)]],
@@ -490,7 +520,7 @@ vertex ThickLineVertexOut vertex_thick_line_main(
 
   float4 p_DC = mix(p0_DC, p1_DC, t);
 
-  ThickLineVertexOut out;
+  LineVertexOut out;
   out.position = float4(p_DC.w * ((2.0 * p) / resolution - 1.0), p_DC.z, p_DC.w);
   float3 pos_MC = mix(p0_MC, p1_MC, t);
   out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(pos_MC, 1.0)).xyz;
@@ -498,53 +528,23 @@ vertex ThickLineVertexOut vertex_thick_line_main(
   out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], t);
   out.dist_to_centerline = side;
   out.cellId = cellIds[instance_id];
-  out.propId = (propId == 0xFFFFFFFFu) ? 0u : (propId + 1u);
+  out.propId = mapPropId(propId);
   return out;
 }
 
 fragment FragmentOutput fragment_thick_line_main(
-    ThickLineVertexOut in [[stage_in]],
+    LineVertexOut in [[stage_in]],
     constant MaterialUniforms& material [[buffer(0)]],
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
-  FragmentOutput out;
-
-  float3 baseColor = in.vertexColor.rgb;
-  float baseAlpha = in.vertexColor.a * material.opacity;
-
-  float3 N = normalize(in.viewNormal);
-  N.z = 1.0 - 2.0 * abs(in.dist_to_centerline);
-  N = normalize(N);
-
-  float3 totalAmbient = material.ambientColor.w * baseColor;
-  float3 totalDiffuse = float3(0.0);
-  float3 totalSpecular = float3(0.0);
-
-  computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
-
-  out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha);
-  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
-
-  float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
-  out.depth = in.position.z + coinOffset.lineFactor * cscale + coinOffset.lineOffset / 65000.0;
-  return out;
+  return shadeLineFragment(in, material, lights, coinOffset);
 }
 
 // ---------------------------------------------------------------------------
 // Round Cap Line Shaders 
 // ---------------------------------------------------------------------------
-struct RoundCapLineVertexOut {
-  float4 position [[position]];
-  float3 viewPos;
-  float3 viewNormal;
-  float4 vertexColor;
-  float dist_to_centerline;
-  uint cellId;
-  uint propId;
-};
-
-vertex RoundCapLineVertexOut vertex_round_cap_line_main(
+vertex LineVertexOut vertex_round_cap_line_main(
     uint vertex_id [[vertex_id]],
     uint instance_id [[instance_id]],
     constant float3* positions [[buffer(0)]],
@@ -606,60 +606,30 @@ vertex RoundCapLineVertexOut vertex_round_cap_line_main(
 
   float4 p_DC = mix(p0_DC, p1_DC, p_coord.z);
 
-  RoundCapLineVertexOut out;
+  LineVertexOut out;
   out.position = float4(p_DC.w * ((2.0 * p) / resolution - 1.0), p_DC.z, p_DC.w);
   out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(mix(p0_MC, p1_MC, p_coord.z), 1.0)).xyz;
   out.viewNormal = scene.normalMatrix * float3(0.0, 0.0, 1.0);
   out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], p_coord.z);
   out.dist_to_centerline = p_coord.y;
   out.cellId = cellIds[instance_id];
-  out.propId = (propId == 0xFFFFFFFFu) ? 0u : (propId + 1u);
+  out.propId = mapPropId(propId);
   return out;
 }
 
 fragment FragmentOutput fragment_round_cap_line_main(
-    RoundCapLineVertexOut in [[stage_in]],
+    LineVertexOut in [[stage_in]],
     constant MaterialUniforms& material [[buffer(0)]],
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
-  FragmentOutput out;
-
-  float3 baseColor = in.vertexColor.rgb;
-  float baseAlpha = in.vertexColor.a * material.opacity;
-
-  float3 N = normalize(in.viewNormal);
-  N.z = 1.0 - 2.0 * abs(in.dist_to_centerline);
-  N = normalize(N);
-
-  float3 totalAmbient = material.ambientColor.w * baseColor;
-  float3 totalDiffuse = float3(0.0);
-  float3 totalSpecular = float3(0.0);
-  
-  computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
-
-  out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha);
-  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
-
-  float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
-  out.depth = in.position.z + coinOffset.lineFactor * cscale + coinOffset.lineOffset / 65000.0;
-  return out;
+  return shadeLineFragment(in, material, lights, coinOffset);
 }
 
 // ---------------------------------------------------------------------------
 // Miter Join Line Shaders
 // ---------------------------------------------------------------------------
-struct MiterJoinLineVertexOut {
-  float4 position [[position]];
-  float3 viewPos;
-  float3 viewNormal;
-  float4 vertexColor;
-  float dist_to_centerline;
-  uint cellId;
-  uint propId;
-};
-
-vertex MiterJoinLineVertexOut vertex_miter_join_line_main(
+vertex LineVertexOut vertex_miter_join_line_main(
     uint vertex_id [[vertex_id]],
     uint instance_id [[instance_id]],
     constant float3* positions [[buffer(0)]],
@@ -738,44 +708,24 @@ vertex MiterJoinLineVertexOut vertex_miter_join_line_main(
   float2 p = mix(p0_screen, p1_screen, t) + offset;
   float4 p_DC = mix(p0_DC, p1_DC, t);
 
-  MiterJoinLineVertexOut out;
+  LineVertexOut out;
   out.position = float4(p_DC.w * ((2.0 * p) / resolution - 1.0), p_DC.z, p_DC.w);
   out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(mix(positions[p0_idx], positions[p1_idx], t), 1.0)).xyz;
   out.viewNormal = scene.normalMatrix * float3(0.0, 0.0, 1.0);
   out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], t);
   out.dist_to_centerline = side;
   out.cellId = cellIds[instance_id];
-  out.propId = (propId == 0xFFFFFFFFu) ? 0u : (propId + 1u);
+  out.propId = mapPropId(propId);
   return out;
 }
 
 fragment FragmentOutput fragment_miter_join_line_main(
-    MiterJoinLineVertexOut in [[stage_in]],
+    LineVertexOut in [[stage_in]],
     constant MaterialUniforms& material [[buffer(0)]],
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
-  FragmentOutput out;
-
-  float3 baseColor = in.vertexColor.rgb;
-  float baseAlpha = in.vertexColor.a * material.opacity;
-
-  float3 N = normalize(in.viewNormal);
-  N.z = 1.0 - 2.0 * abs(in.dist_to_centerline);
-  N = normalize(N);
-
-  float3 totalAmbient = material.ambientColor.w * baseColor;
-  float3 totalDiffuse = float3(0.0);
-  float3 totalSpecular = float3(0.0);
-  
-  computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
-
-  out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha);
-  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
-
-  float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
-  out.depth = in.position.z + coinOffset.lineFactor * cscale + coinOffset.lineOffset / 65000.0;
-  return out;
+  return shadeLineFragment(in, material, lights, coinOffset);
 }
 
 // ---------------------------------------------------------------------------
@@ -994,33 +944,21 @@ fragment PeelPassOutput fragment_peel(
   }
 
   float3 N = normalize(in.viewNormal);
-  bool hasVertexColors = (scene.flags & (1u << 8)) != 0u;
-  float3 ambientColor = hasVertexColors ? in.vertexColor.rgb : material.ambientColor.rgb;
-  float3 diffuseColor = hasVertexColors ? in.vertexColor.rgb : material.diffuseColor.rgb;
-  bool hasSurfaceAlpha = (scene.flags & (1u << 10)) != 0u;
-  float baseOpacity = hasSurfaceAlpha ? in.vertexColor.a : material.opacity;
-
-  if ((scene.flags & (1u << 9)) != 0u) {
-    float4 texColor = actorTexture.sample(actorSampler, in.uv);
-    ambientColor *= texColor.rgb;
-    diffuseColor *= texColor.rgb;
-    baseOpacity *= texColor.a;
-  }
-
-  float3 totalAmbient = material.ambientColor.w * ambientColor;
+  ResolvedMaterial r = resolveMaterial(material, scene, in.vertexColor, in.uv, actorTexture, actorSampler);
+  float3 totalAmbient = material.ambientColor.w * r.ambient;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
-  computePhongLighting(N, in.viewPos, diffuseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
+  computePhongLighting(N, in.viewPos, r.diffuse, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
 
   float3 fragRGB = totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular;
 
   if (fragDepth >= minDepth - epsilon && fragDepth <= minDepth + epsilon) {
     float prevAlpha = 1.0 - prevFront.a;
-    out.frontDest.rgb = prevAlpha * baseOpacity * fragRGB + prevFront.rgb;
-    out.frontDest.a = 1.0 - (prevAlpha * (1.0 - baseOpacity));
+    out.frontDest.rgb = prevAlpha * r.opacity * fragRGB + prevFront.rgb;
+    out.frontDest.a = 1.0 - (prevAlpha * (1.0 - r.opacity));
   } else if (fragDepth >= maxDepth - epsilon && fragDepth <= maxDepth + epsilon) {
-    out.backTemp = float4(fragRGB * baseOpacity, baseOpacity);
+    out.backTemp = float4(fragRGB * r.opacity, r.opacity);
   }
 
   return out;
@@ -1048,27 +986,15 @@ fragment float4 fragment_peel_alpha_blend(
   if (fragDepth < -prevDepth.x - epsilon || fragDepth > prevDepth.y + epsilon) discard_fragment();
 
   float3 N = normalize(in.viewNormal);
-  bool hasVertexColors = (scene.flags & (1u << 8)) != 0u;
-  float3 ambientColor = hasVertexColors ? in.vertexColor.rgb : material.ambientColor.rgb;
-  float3 diffuseColor = hasVertexColors ? in.vertexColor.rgb : material.diffuseColor.rgb;
-  bool hasSurfaceAlpha = (scene.flags & (1u << 10)) != 0u;
-  float baseOpacity = hasSurfaceAlpha ? in.vertexColor.a : material.opacity;
-
-  if ((scene.flags & (1u << 9)) != 0u) {
-    float4 texColor = actorTexture.sample(actorSampler, in.uv);
-    ambientColor *= texColor.rgb;
-    diffuseColor *= texColor.rgb;
-    baseOpacity *= texColor.a;
-  }
-
-  float3 totalAmbient = material.ambientColor.w * ambientColor;
+  ResolvedMaterial r = resolveMaterial(material, scene, in.vertexColor, in.uv, actorTexture, actorSampler);
+  float3 totalAmbient = material.ambientColor.w * r.ambient;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
-  computePhongLighting(N, in.viewPos, diffuseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
+  computePhongLighting(N, in.viewPos, r.diffuse, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
 
   float3 fragRGB = totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular;
-  return float4(fragRGB * baseOpacity, baseOpacity);
+  return float4(fragRGB * r.opacity, r.opacity);
 }
 
 fragment float4 fragment_peel_composite(
@@ -1104,7 +1030,48 @@ struct GlyphVertexOut {
   float3 modelPos;
   uint cellId;
   uint propId;
+  float point_size [[point_size]];
 };
+
+inline GlyphVertexOut computeGlyphVertex(
+    uint vertex_id, uint instance_id,
+    constant float3* positions, constant float3* normals,
+    constant float4x4* glyphTransforms, constant float3x3* glyphNormalTransforms,
+    constant float4* glyphColors, constant uint* glyphPickIds,
+    constant SceneUniforms& scene, constant uint& propId,
+    float pointSize)
+{
+  GlyphVertexOut out;
+  float3 pos = positions[vertex_id];
+  float4 worldPos = scene.modelMatrix * glyphTransforms[instance_id] * float4(pos, 1.0);
+  out.viewPos = (scene.viewMatrix * worldPos).xyz;
+  out.position = scene.projectionMatrix * float4(out.viewPos, 1.0);
+  out.viewNormal = scene.normalMatrix * glyphNormalTransforms[instance_id] * normals[vertex_id];
+  out.glyphColor = glyphColors[instance_id];
+  out.cellId = glyphPickIds[instance_id] + 1u;
+  out.propId = mapPropId(propId);
+  out.point_size = pointSize;
+  out.modelPos = pos;
+  return out;
+}
+
+inline FragmentOutput shadeGlyphFragment(GlyphVertexOut in,
+    constant MaterialUniforms& material, constant LightUniforms& lights,
+    constant ClipPlaneUniforms& clipPlanes, float depthBias)
+{
+  if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
+  float3 N = normalize(in.viewNormal);
+  float3 totalDiffuse = float3(0.0), totalSpecular = float3(0.0);
+  computePhongLighting(N, in.viewPos, in.glyphColor.rgb, material.specularColor.rgb,
+      material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
+  FragmentOutput out;
+  out.color = float4(material.ambientColor.w * in.glyphColor.rgb
+                   + material.diffuseColor.w * totalDiffuse + totalSpecular,
+                   in.glyphColor.a * material.opacity);
+  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
+  out.depth = in.position.z + depthBias;
+  return out;
+}
 
 vertex GlyphVertexOut vertex_glyph_main(
     uint vertex_id [[vertex_id]], uint instance_id [[instance_id]],
@@ -1113,19 +1080,9 @@ vertex GlyphVertexOut vertex_glyph_main(
     constant float4* glyphColors [[buffer(4)]], constant uint* glyphPickIds [[buffer(5)]],
     constant SceneUniforms& scene [[buffer(8)]], constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
     constant uint& propId [[buffer(10)]]) {
-  
-  GlyphVertexOut out;
-  float3 pos = positions[vertex_id];
-  float4 worldPos = scene.modelMatrix * glyphTransforms[instance_id] * float4(pos, 1.0);
-  
-  out.viewPos = (scene.viewMatrix * worldPos).xyz;
-  out.position = scene.projectionMatrix * float4(out.viewPos, 1.0);
-  out.viewNormal = scene.normalMatrix * glyphNormalTransforms[instance_id] * normals[vertex_id];
-  out.glyphColor = glyphColors[instance_id];
-  out.cellId = glyphPickIds[instance_id] + 1u;
-  out.propId = (propId == 0xFFFFFFFFu) ? 0u : (propId + 1u);
-  out.modelPos = pos;
-  return out;
+  return computeGlyphVertex(vertex_id, instance_id, positions, normals,
+      glyphTransforms, glyphNormalTransforms, glyphColors, glyphPickIds,
+      scene, propId, 0.0);
 }
 
 fragment FragmentOutput fragment_glyph_main(
@@ -1135,135 +1092,51 @@ fragment FragmentOutput fragment_glyph_main(
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
     constant ClipPlaneUniforms& clipPlanes [[buffer(9)]]) {
-  
-  if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
-
-  float3 N = normalize(in.viewNormal);
-  float3 totalAmbient = material.ambientColor.w * in.glyphColor.rgb;
-  float3 totalDiffuse = float3(0.0);
-  float3 totalSpecular = float3(0.0);
-
-  computePhongLighting(N, in.viewPos, in.glyphColor.rgb, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
-
-  FragmentOutput out;
-  out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, in.glyphColor.a * material.opacity);
-  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
-  out.depth = in.position.z;
-  return out;
+  return shadeGlyphFragment(in, material, lights, clipPlanes, 0.0);
 }
 
-struct GlyphLineVertexOut {
-  float4 position [[position]];
-  float3 viewPos;
-  float3 viewNormal;
-  float4 glyphColor;
-  float3 modelPos;
-  uint cellId;
-  uint propId;
-};
-
-vertex GlyphLineVertexOut vertex_glyph_line_main(
+vertex GlyphVertexOut vertex_glyph_line_main(
     uint vertex_id [[vertex_id]], uint instance_id [[instance_id]],
     constant float3* positions [[buffer(0)]], constant float3* normals [[buffer(1)]],
     constant float4x4* glyphTransforms [[buffer(2)]], constant float3x3* glyphNormalTransforms [[buffer(3)]],
     constant float4* glyphColors [[buffer(4)]], constant uint* glyphPickIds [[buffer(5)]],
     constant SceneUniforms& scene [[buffer(8)]], constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
     constant uint& propId [[buffer(10)]]) {
-  
-  GlyphLineVertexOut out;
-  float3 pos = positions[vertex_id];
-  float4 worldPos = scene.modelMatrix * glyphTransforms[instance_id] * float4(pos, 1.0);
-  
-  out.viewPos = (scene.viewMatrix * worldPos).xyz;
-  out.position = scene.projectionMatrix * float4(out.viewPos, 1.0);
-  out.viewNormal = scene.normalMatrix * glyphNormalTransforms[instance_id] * normals[vertex_id];
-  out.glyphColor = glyphColors[instance_id];
-  out.cellId = glyphPickIds[instance_id] + 1u;
-  out.propId = (propId == 0xFFFFFFFFu) ? 0u : (propId + 1u);
-  out.modelPos = pos;
-  return out;
+  return computeGlyphVertex(vertex_id, instance_id, positions, normals,
+      glyphTransforms, glyphNormalTransforms, glyphColors, glyphPickIds,
+      scene, propId, 0.0);
 }
 
 fragment FragmentOutput fragment_glyph_line_main(
-    GlyphLineVertexOut in [[stage_in]],
+    GlyphVertexOut in [[stage_in]],
     constant MaterialUniforms& material [[buffer(0)]],
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
     constant ClipPlaneUniforms& clipPlanes [[buffer(9)]]) {
-  
-  if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
-
-  float3 N = normalize(in.viewNormal);
-  float3 totalAmbient = material.ambientColor.w * in.glyphColor.rgb;
-  float3 totalDiffuse = float3(0.0);
-  float3 totalSpecular = float3(0.0);
-
-  computePhongLighting(N, in.viewPos, in.glyphColor.rgb, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
-
-  FragmentOutput out;
-  out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, in.glyphColor.a * material.opacity);
-  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
-  out.depth = in.position.z;
-  return out;
+  return shadeGlyphFragment(in, material, lights, clipPlanes, 0.0);
 }
 
-struct GlyphPointVertexOut {
-  float4 position [[position]];
-  float3 viewPos;
-  float3 viewNormal;
-  float4 glyphColor;
-  float3 modelPos;
-  uint cellId;
-  uint propId;
-  float point_size [[point_size]];
-};
-
-vertex GlyphPointVertexOut vertex_glyph_point_main(
+vertex GlyphVertexOut vertex_glyph_point_main(
     uint vertex_id [[vertex_id]], uint instance_id [[instance_id]],
     constant float3* positions [[buffer(0)]], constant float3* normals [[buffer(1)]],
     constant float4x4* glyphTransforms [[buffer(2)]], constant float3x3* glyphNormalTransforms [[buffer(3)]],
     constant float4* glyphColors [[buffer(4)]], constant uint* glyphPickIds [[buffer(5)]],
     constant SceneUniforms& scene [[buffer(8)]], constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
     constant uint& propId [[buffer(10)]]) {
-  
-  GlyphPointVertexOut out;
-  float3 pos = positions[vertex_id];
-  float4 worldPos = scene.modelMatrix * glyphTransforms[instance_id] * float4(pos, 1.0);
-  
-  out.viewPos = (scene.viewMatrix * worldPos).xyz;
-  out.position = scene.projectionMatrix * float4(out.viewPos, 1.0);
-  out.viewNormal = scene.normalMatrix * glyphNormalTransforms[instance_id] * normals[vertex_id];
-  out.glyphColor = glyphColors[instance_id];
-  out.cellId = glyphPickIds[instance_id] + 1u;
-  out.propId = (propId == 0xFFFFFFFFu) ? 0u : (propId + 1u);
-  out.point_size = scene.pointSize;
-  out.modelPos = pos;
-  return out;
+  return computeGlyphVertex(vertex_id, instance_id, positions, normals,
+      glyphTransforms, glyphNormalTransforms, glyphColors, glyphPickIds,
+      scene, propId, scene.pointSize);
 }
 
 fragment FragmentOutput fragment_glyph_point_main(
-    GlyphPointVertexOut in [[stage_in]],
+    GlyphVertexOut in [[stage_in]],
     constant MaterialUniforms& material [[buffer(0)]],
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
     constant ClipPlaneUniforms& clipPlanes [[buffer(9)]]) {
-  
-  if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
-
-  float3 N = normalize(in.viewNormal);
-  float3 totalAmbient = material.ambientColor.w * in.glyphColor.rgb;
-  float3 totalDiffuse = float3(0.0);
-  float3 totalSpecular = float3(0.0);
-
-  computePhongLighting(N, in.viewPos, in.glyphColor.rgb, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
-
-  FragmentOutput out;
-  out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, in.glyphColor.a * material.opacity);
-  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
-  out.depth = in.position.z + coinOffset.pointOffset / 65000.0;
-  return out;
+  return shadeGlyphFragment(in, material, lights, clipPlanes, coinOffset.pointOffset / 65000.0);
 }
 
 
@@ -1601,6 +1474,18 @@ inline int computeCropRegion(float3 cropMin, float3 cropMax, float3 pos) {
   return r.x + r.y * 3 + r.z * 9;
 }
 
+inline float3 reconstructRayDir(float2 screenPos, float2 viewportSize,
+    constant VolumeMapperUniforms& u)
+{
+    float2 ndc = (screenPos / viewportSize) * 2.0 - 1.0;
+    float4 wn = u.inverseViewProjection * float4(ndc.x, -ndc.y, 0.0, 1.0); wn.xyz /= wn.w;
+    float4 wf = u.inverseViewProjection * float4(ndc.x, -ndc.y, 1.0, 1.0); wf.xyz /= wf.w;
+    float3 bsz = max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
+    float3 lN = ((u.worldToVolume * float4(wn.xyz, 1.0)).xyz - u.volumeBoundsMin.xyz) / bsz;
+    float3 lF = ((u.worldToVolume * float4(wf.xyz, 1.0)).xyz - u.volumeBoundsMin.xyz) / bsz;
+    return normalize(lF - lN);
+}
+
 struct RaySetup {
     float3 entryPoint;
     float3 exitPoint;
@@ -1688,33 +1573,35 @@ inline RaySetup setupVolumeRay(
     return s;
 }
 
-inline half4 marchVolume(
-    float3 entryPoint,
-    float3 exitPoint,
-    float totalDist,
-    float tTerminateMax,
-    float3 rayDir,
-    float3 blockMinGlobal,
-    float3 blockMaxGlobal,
-    float3 texMinGlobal,
-    float3 texMaxGlobal,
-    float3 cameraPos,
-    float stepSize,
-    float totalBoxT,
-    float2 screenPos,
-    half3 initialColor,
-    half initialOpacity,
+struct MarchParams {
+    float3 rayOrigin;
+    float3 rayDir;
+    float  tStart;
+    float  tEnd;
+    float  stepSize;
+    float  jitter;
+    float  tTerminateMax;
+    float3 blockMinGlobal;
+    float3 blockMaxGlobal;
+    float3 texMinGlobal;
+    float3 texMaxGlobal;
+    bool   checkBounds;
+};
+
+inline half4 marchVolumeUnified(
+    MarchParams p,
+    half3 initialColor, half initialOpacity,
     constant VolumeMapperUniforms& volumeUniforms,
     constant PerBlockData& b,
     texture3d<float> volumeTexture,
     texture2d<float> transferFunctionTexture,
-    texture2d<float> depthTexture,
     texture2d<float> gradientOpacityTexture,
     texture3d<float> maskTexture,
     texture2d<float> labelMapTransferTexture,
     texture3d<float> minMaxTexture,
     texture3d<float> normalTexture,
-    constant VolumeLightUniforms* lightUniforms) {
+    constant VolumeLightUniforms* lightUniforms)
+{
   const bool doShading = fc_shading && (volumeUniforms.useGradientShading > 0.5);
   const bool doGradOp = fc_gradientOpacity && (volumeUniforms.useGradientOpacity > 0.5);
   const bool doCropping = volumeUniforms.useCropping > 0.5;
@@ -1725,15 +1612,15 @@ inline half4 marchVolume(
 
   half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
 
-  float3 texSizeGlobal = max(texMaxGlobal - texMinGlobal, 1e-6);
+  float3 texSizeGlobal = max(p.texMaxGlobal - p.texMinGlobal, 1e-6);
   float3 invTexSizeGlobal = 1.0 / texSizeGlobal;
-  float3 rayDirTexLocal = rayDir * invTexSizeGlobal;
+  float3 rayDirTexLocal = p.rayDir * invTexSizeGlobal;
   float3 dt = max(b.gradientStep.xyz, 1e-8);
   float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
                         - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
   half3 gradScale = half3(1.0 / (dt * texSizeGlobal * boundsSize));
 
-  half3 viewDirHalf  = half3(normalize(entryPoint - cameraPos));
+  half3 viewDirHalf  = half3(normalize((p.rayOrigin + p.rayDir * p.tStart) - volumeUniforms.cameraVolumePos.xyz));
   half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection));
   half3 ambientMat   = half3(volumeUniforms.ambientColor.rgb);
   half3 diffuseMat   = half3(volumeUniforms.diffuseColor.rgb);
@@ -1749,17 +1636,20 @@ inline half4 marchVolume(
 
   uint cropBitmask = volumeUniforms.croppingBitmask;
 
-  float jitter = volumeUniforms.useJittering > 0.5 ? volume_random(screenPos) * stepSize : 0.0;
-  float3 stepVec = rayDir * stepSize;
-  float3 currentPoint = entryPoint + (rayDir * jitter);
-  float currentT = jitter;
+  float firstT = p.checkBounds
+      ? p.jitter
+      : p.jitter + ceil((p.tStart - p.jitter) / p.stepSize) * p.stepSize;
+  float3 stepVec = p.rayDir * p.stepSize;
+  float3 currentPoint = p.rayOrigin + p.rayDir * (p.checkBounds ? p.tStart : 0.0)
+                      + p.rayDir * firstT;
+  float currentT = firstT;
 
-  int maxSteps = min(max(1, int(ceil(totalDist / stepSize))), MAX_RAY_STEPS);
+  int maxSteps = min(max(1, int(ceil((p.tEnd - firstT) / p.stepSize))), MAX_RAY_STEPS);
 
   half3 accumulatedColor = initialColor;
   half accumulatedOpacity = initialOpacity;
 
-  float3 texLocalPos0 = (currentPoint - texMinGlobal) * invTexSizeGlobal;
+  float3 texLocalPos0 = (currentPoint - p.texMinGlobal) * invTexSizeGlobal;
   float3 evalPoint0 = texLocalPos0;
   float prefetchScalar = volumeTexture.sample(sVolume, evalPoint0, level(0)).r;
   float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint0, level(0)).r : 0.0;
@@ -1774,10 +1664,11 @@ inline half4 marchVolume(
     b.minMaxInfo.w > 0.5;
 
   for (int i = 0; i < maxSteps; i++) {
-    if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4)) break;
+    if (p.checkBounds && (any(currentPoint < p.blockMinGlobal - 1e-4) || any(currentPoint > p.blockMaxGlobal + 1e-4))) break;
+    if (!p.checkBounds && currentT >= p.tEnd - 1e-6) break;
 
     if (useMinMax) {
-      float3 texLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
+      float3 texLocalPos = (currentPoint - p.texMinGlobal) * invTexSizeGlobal;
       float3 mmPos = clamp(texLocalPos, float3(0.0), float3(1.0));
       int3 newCell = min(int3(mmPos * mmDimF), int3(mmDimF) - 1);
       if (any(newCell != curCell)) {
@@ -1790,9 +1681,9 @@ inline half4 marchVolume(
         float3 fractCoord = fract(cellCoord);
 
         float3 distToEdge;
-        distToEdge.x = rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x;
-        distToEdge.y = rayDir.y > 0.0 ? (1.0 - fractCoord.y) : fractCoord.y;
-        distToEdge.z = rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
+        distToEdge.x = p.rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x;
+        distToEdge.y = p.rayDir.y > 0.0 ? (1.0 - fractCoord.y) : fractCoord.y;
+        distToEdge.z = p.rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
         distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
 
         float3 tToEdge;
@@ -1802,13 +1693,13 @@ inline half4 marchVolume(
 
         float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
         exactSkip += 1e-4;
-        float skipDist = ceil(exactSkip / stepSize) * stepSize;
-        skipDist = max(stepSize, skipDist);
+        float skipDist = ceil(exactSkip / p.stepSize) * p.stepSize;
+        skipDist = max(p.stepSize, skipDist);
 
-        currentPoint += rayDir * skipDist;
+        currentPoint += p.rayDir * skipDist;
         currentT += skipDist;
 
-        if (any(currentPoint < blockMinGlobal - 1e-4) || any(currentPoint > blockMaxGlobal + 1e-4) || currentT >= totalBoxT) {
+        if (p.checkBounds && (any(currentPoint < p.blockMinGlobal - 1e-4) || any(currentPoint > p.blockMaxGlobal + 1e-4) || currentT >= p.tEnd)) {
           break;
         }
 
@@ -1818,7 +1709,7 @@ inline half4 marchVolume(
       }
     }
 
-    float3 texLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
+    float3 texLocalPos = (currentPoint - p.texMinGlobal) * invTexSizeGlobal;
     float3 evalPoint = texLocalPos;
     bool needsFetch = !prefetchValid;
     float rawScalar = needsFetch
@@ -1830,10 +1721,10 @@ inline half4 marchVolume(
 
     float3 lastPoint = currentPoint;
     currentPoint += stepVec;
-    currentT += stepSize;
+    currentT += p.stepSize;
 
     if (i + 1 < maxSteps) {
-      float3 nextTexLocalPos = (currentPoint - texMinGlobal) * invTexSizeGlobal;
+      float3 nextTexLocalPos = (currentPoint - p.texMinGlobal) * invTexSizeGlobal;
       float3 nextEvalPoint = nextTexLocalPos;
       prefetchScalar = volumeTexture.sample(sVolume, nextEvalPoint, level(0)).r;
       if (doMask) {
@@ -1924,12 +1815,85 @@ inline half4 marchVolume(
       accumulatedOpacity = 1.0h;
       break;
     }
-    if (currentT >= tTerminateMax) {
+    if (currentT >= p.tTerminateMax) {
       break;
     }
   }
 
   return half4(accumulatedColor, accumulatedOpacity);
+}
+
+inline half4 marchVolume(
+    float3 entryPoint,
+    float3 exitPoint,
+    float totalDist,
+    float tTerminateMax,
+    float3 rayDir,
+    float3 blockMinGlobal,
+    float3 blockMaxGlobal,
+    float3 texMinGlobal,
+    float3 texMaxGlobal,
+    float3 cameraPos,
+    float stepSize,
+    float totalBoxT,
+    float2 screenPos,
+    half3 initialColor,
+    half initialOpacity,
+    constant VolumeMapperUniforms& volumeUniforms,
+    constant PerBlockData& b,
+    texture3d<float> volumeTexture,
+    texture2d<float> transferFunctionTexture,
+    texture2d<float> depthTexture,
+    texture2d<float> gradientOpacityTexture,
+    texture3d<float> maskTexture,
+    texture2d<float> labelMapTransferTexture,
+    texture3d<float> minMaxTexture,
+    texture3d<float> normalTexture,
+    constant VolumeLightUniforms* lightUniforms)
+{
+  (void)exitPoint;
+  (void)totalDist;
+  float jitter = volumeUniforms.useJittering > 0.5 ? volume_random(screenPos) * stepSize : 0.0;
+  float tStart = dot(entryPoint - cameraPos, rayDir);
+  MarchParams p = {cameraPos, rayDir, tStart, totalBoxT, stepSize, jitter, tTerminateMax,
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, true};
+  return marchVolumeUnified(p, initialColor, initialOpacity,
+      volumeUniforms, b, volumeTexture, transferFunctionTexture,
+      gradientOpacityTexture, maskTexture, labelMapTransferTexture,
+      minMaxTexture, normalTexture, lightUniforms);
+}
+
+inline void marchSegment(
+    float3 rayOrigin,
+    float3 rayDir,
+    float t0,
+    float t1,
+    float stepSize,
+    float jitter,
+    float tTerminateMax,
+    thread half3& accumulatedColor,
+    thread half& accumulatedOpacity,
+    constant VolumeMapperUniforms& volumeUniforms,
+    constant PerBlockData& b,
+    texture3d<float> volumeTexture,
+    texture2d<float> transferFunctionTexture,
+    texture2d<float> gradientOpacityTexture,
+    texture3d<float> maskTexture,
+    texture2d<float> labelMapTransferTexture,
+    texture3d<float> minMaxTexture,
+    texture3d<float> normalTexture,
+    constant VolumeLightUniforms* lightUniforms)
+{
+  float3 zero = float3(0.0);
+  float3 one = float3(1.0);
+  MarchParams p = {rayOrigin, rayDir, t0, t1, stepSize, jitter, tTerminateMax,
+      zero, one, zero, one, false};
+  half4 result = marchVolumeUnified(p, accumulatedColor, accumulatedOpacity,
+      volumeUniforms, b, volumeTexture, transferFunctionTexture,
+      gradientOpacityTexture, maskTexture, labelMapTransferTexture,
+      minMaxTexture, normalTexture, lightUniforms);
+  accumulatedColor = result.xyz;
+  accumulatedOpacity = result.w;
 }
 
 fragment VolumeFragmentOut fragment_volume_main(
@@ -1997,14 +1961,7 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
   float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
   computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
 
-  float2 uv  = in.position.xy / volumeUniforms.viewportSize;
-  float2 ndc = uv * 2.0 - 1.0;
-  float4 wn = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, 0.0, 1.0); wn.xyz /= wn.w;
-  float4 wf = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, 1.0, 1.0); wf.xyz /= wf.w;
-  float3 bsz = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-  float3 localN = ((volumeUniforms.worldToVolume * float4(wn.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bsz;
-  float3 localF = ((volumeUniforms.worldToVolume * float4(wf.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bsz;
-  float3 rayDir = normalize(localF - localN);
+  float3 rayDir = reconstructRayDir(in.position.xy, volumeUniforms.viewportSize, volumeUniforms);
 
   RaySetup s = setupVolumeRay(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal,
       in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
@@ -2138,247 +2095,6 @@ inline void advanceGridWalker(thread GridWalker& w, float tEnd)
     w.valid = w.tExit > w.tEntry;
 }
 
-// NOTE: marchSegment is a modified copy of marchVolume adapted for
-// sub-interval marching with a global sample schedule. Any bug fix
-// applied to the march loop body must be applied to BOTH functions.
-//
-// Differences from marchVolume:
-//   - Computes jitter externally, receives it as parameter
-//   - Starts at ceil-aligned global schedule position
-//   - Loops until t1 (not totalBoxT)
-//   - Writes to thread half3& / thread half& refs (not returns half4)
-//   - No boundary check (segment is pre-clipped to an active brick)
-//
-// March a ray segment [t0, t1] along a global sample schedule.
-// Uses the same sampling, shading, and accumulation logic as marchVolume
-// but operates on a sub-interval with a pre-determined jitter value.
-// Accumulates into color/opacity (front-to-back).
-inline void marchSegment(
-    float3 rayOrigin,
-    float3 rayDir,
-    float t0,
-    float t1,
-    float stepSize,
-    float jitter,
-    float tTerminateMax,
-    thread half3& accumulatedColor,
-    thread half& accumulatedOpacity,
-    constant VolumeMapperUniforms& volumeUniforms,
-    constant PerBlockData& b,
-    texture3d<float> volumeTexture,
-    texture2d<float> transferFunctionTexture,
-    texture2d<float> gradientOpacityTexture,
-    texture3d<float> maskTexture,
-    texture2d<float> labelMapTransferTexture,
-    texture3d<float> minMaxTexture,
-    texture3d<float> normalTexture,
-    constant VolumeLightUniforms* lightUniforms)
-{
-    const bool doShading = fc_shading && (volumeUniforms.useGradientShading > 0.5);
-    const bool doGradOp = fc_gradientOpacity && (volumeUniforms.useGradientOpacity > 0.5);
-    const bool doCropping = volumeUniforms.useCropping > 0.5;
-    const bool doMask = fc_mask && (volumeUniforms.useMask > 0.5);
-
-    half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
-    half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
-
-    half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
-
-    // Global texture bounds are always [0,1] for the global volume texture
-    float3 dt = max(b.gradientStep.xyz, 1e-8);
-    float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
-                          - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-    half3 gradScale = half3(1.0 / (dt * boundsSize));
-
-    half3 viewDirHalf  = half3(normalize((rayOrigin + rayDir * t0) - volumeUniforms.cameraVolumePos.xyz));
-    half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection));
-    half3 ambientMat   = half3(volumeUniforms.ambientColor.rgb);
-    half3 diffuseMat   = half3(volumeUniforms.diffuseColor.rgb);
-    half3 specularMat  = half3(volumeUniforms.specularColor.rgb);
-    half shininessMat  = half(volumeUniforms.shininess);
-
-    float maskScale = volumeUniforms.maskScale;
-    float maskBias  = volumeUniforms.maskBias;
-    float numLabels = volumeUniforms.labelMapNumLabels;
-
-    float3 cropMin = float3(volumeUniforms.croppingPlanes.x, volumeUniforms.croppingPlanes.z, volumeUniforms.croppingPlanes2.x);
-    float3 cropMax = float3(volumeUniforms.croppingPlanes.y, volumeUniforms.croppingPlanes.w, volumeUniforms.croppingPlanes2.y);
-    uint cropBitmask = volumeUniforms.croppingBitmask;
-
-    // Compute first sample position from the global schedule
-    float firstT = jitter + ceil((t0 - jitter) / stepSize) * stepSize;
-    float3 stepVec = rayDir * stepSize;
-    float3 currentPoint = rayOrigin + rayDir * firstT;
-    float currentT = firstT;
-
-    int maxSteps = min(max(1, int(ceil((t1 - firstT) / stepSize))), MAX_RAY_STEPS);
-
-    float3 mmDimF = b.minMaxInfo.yzw;
-    const bool useMinMax = fc_minmax &&
-        b.minMaxInfo.x > 0.5 &&
-        b.minMaxInfo.y > 0.5 &&
-        b.minMaxInfo.z > 0.5 &&
-        b.minMaxInfo.w > 0.5;
-
-    float prefetchScalar = 0.0;
-    float prefetchMask = 0.0;
-    bool prefetchValid = false;
-    int3 curCell = int3(-1);
-    bool curCellEmpty = false;
-
-    for (int i = 0; i < maxSteps; ++i) {
-        if (currentT >= t1 - 1e-6) break;
-
-        if (useMinMax) {
-            float3 mmPos = clamp(currentPoint, float3(0.0), float3(1.0));
-            int3 newCell = min(int3(mmPos * mmDimF), int3(mmDimF) - 1);
-            if (any(newCell != curCell)) {
-                curCell      = newCell;
-                curCellEmpty = minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5;
-            }
-
-            if (curCellEmpty) {
-                float3 cellCoord = mmPos * mmDimF;
-                float3 fractCoord = fract(cellCoord);
-
-                float3 distToEdge;
-                distToEdge.x = rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x;
-                distToEdge.y = rayDir.y > 0.0 ? (1.0 - fractCoord.y) : fractCoord.y;
-                distToEdge.z = rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
-                distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
-
-                float3 tToEdge;
-                tToEdge.x = abs(rayDir.x) > 1e-5
-                    ? distToEdge.x / abs(rayDir.x * mmDimF.x) : 1e30;
-                tToEdge.y = abs(rayDir.y) > 1e-5
-                    ? distToEdge.y / abs(rayDir.y * mmDimF.y) : 1e30;
-                tToEdge.z = abs(rayDir.z) > 1e-5
-                    ? distToEdge.z / abs(rayDir.z * mmDimF.z) : 1e30;
-
-                float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
-                exactSkip += 1e-4;
-                float skipDist = ceil(exactSkip / stepSize) * stepSize;
-                skipDist = max(stepSize, skipDist);
-
-                currentPoint += rayDir * skipDist;
-                currentT += skipDist;
-
-                if (currentT >= t1 - 1e-6) break;
-
-                prefetchValid = false;
-                curCell = int3(-1);
-                continue;
-            }
-        }
-
-        float3 evalPoint = currentPoint;
-        bool needsFetch = !prefetchValid;
-        float rawScalar = needsFetch
-            ? volumeTexture.sample(sVolume, evalPoint, level(0)).r
-            : prefetchScalar;
-        float rawMask = (doMask && needsFetch)
-            ? maskTexture.sample(sNearest, evalPoint, level(0)).r
-            : prefetchMask;
-
-        float3 lastPoint = currentPoint;
-        currentPoint += stepVec;
-        currentT += stepSize;
-
-        if (i + 1 < maxSteps) {
-            float3 nextEvalPoint = currentPoint;
-            prefetchScalar = volumeTexture.sample(sVolume, nextEvalPoint, level(0)).r;
-            if (doMask) {
-                prefetchMask = maskTexture.sample(sNearest, nextEvalPoint, level(0)).r;
-            }
-            prefetchValid = true;
-        }
-
-        if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, lastPoint))) == 0u)) {
-            continue;
-        }
-
-        half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
-
-        half4 colorOpacity;
-        half maskLabel = 0.0h;
-
-        if (doMask) {
-            float maskVal = rawMask * maskScale + maskBias;
-            if (numLabels > 0.0) {
-                float label = floor(maskVal + 0.5);
-                if (label > 0.0) {
-                    label = clamp(label, 1.0, numLabels - 1.0);
-                    maskLabel = half(label);
-                    float labelY = (label + 0.5) / numLabels;
-                    colorOpacity = half4(labelMapTransferTexture.sample(sNearest, float2(float(scalarNorm), labelY), level(0)));
-                } else {
-                    colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
-                }
-            } else {
-                colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
-            }
-        } else {
-            colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
-        }
-
-        half sampleOpacity = colorOpacity.a;
-        // Opacity pre-integration is baked into the transfer function texture
-        // on the CPU at TF-build time (matches OpenGL backend).
-
-        if (sampleOpacity > 0.001h) {
-            half3 sampleColor = colorOpacity.rgb;
-            half weight = 1.0h - accumulatedOpacity;
-
-            if (sampleOpacity < 0.01h) {
-                accumulatedColor += weight * sampleColor * sampleOpacity;
-                accumulatedOpacity += weight * sampleOpacity;
-            } else {
-                if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
-                    half3 normal;
-                    half gradMag;
-
-                    if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
-                        half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
-                        normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
-                        gradMag = nrmSample.w;
-                    } else {
-                        half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
-                        normal = grad.xyz;
-                        gradMag = grad.w;
-                    }
-
-                    if (lightUniforms != nullptr && lightUniforms->defaultLighting == 0) {
-                        sampleColor = computeVolumeLighting(sampleColor, normal, -viewDirHalf,
-                            ambientMat, diffuseMat, specularMat, shininessMat,
-                            *lightUniforms, evalPoint);
-                    } else {
-                        bool twoSided = (lightUniforms != nullptr && lightUniforms->twoSidedLighting != 0);
-                        sampleColor = computePhongLightingVolumeFast(sampleColor, normal, lightDirHalf, viewDirHalf,
-                            ambientMat, diffuseMat, specularMat, shininessMat, twoSided);
-                    }
-
-                    if (doGradOp) {
-                        sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(gradMag), 0.5), level(0)).r);
-                    }
-                } else if (doShading) {
-                    sampleColor = ambientMat * sampleColor;
-                }
-
-                accumulatedColor += weight * sampleColor * sampleOpacity;
-                accumulatedOpacity += weight * sampleOpacity;
-            }
-        }
-
-        if (accumulatedOpacity >= 0.99h) {
-            accumulatedOpacity = 1.0h;
-            break;
-        }
-        if (currentT >= tTerminateMax) {
-            break;
-        }
-    }
-}
-
 // Single-pass front-to-back grid traversal shader for partitioned volumes.
 // Replaces the per-brick layer composite with a direct traversal of the
 // brick grid along each pixel ray, marching active bricks in true geometric order.
@@ -2403,14 +2119,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
     float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
 
     // Reconstruct ray in normalized [0,1] volume space
-    float2 uv = in.position.xy / volumeUniforms.viewportSize;
-    float2 ndc = uv * 2.0 - 1.0;
-    float4 wn = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, 0.0, 1.0); wn.xyz /= wn.w;
-    float4 wf = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, 1.0, 1.0); wf.xyz /= wf.w;
-    float3 bsz = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-    float3 localN = ((volumeUniforms.worldToVolume * float4(wn.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bsz;
-    float3 localF = ((volumeUniforms.worldToVolume * float4(wf.xyz, 1.0)).xyz - volumeUniforms.volumeBoundsMin.xyz) / bsz;
-    float3 rayDir = normalize(localF - localN);
+    float3 rayDir = reconstructRayDir(in.position.xy, volumeUniforms.viewportSize, volumeUniforms);
 
     // Intersect with full volume bounds [0,1]
     float3 volMin = float3(0.0);
@@ -2475,8 +2184,10 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
     // Depth occlusion termination
     float tTerminateMax = 1e30;
     if (volumeUniforms.useDepthTexture > 0.5) {
+        float2 uv = in.position.xy / volumeUniforms.viewportSize;
         float depthSample = depthTexture.sample(sNearest, uv).r;
         if (depthSample < 1.0) {
+            float2 ndc = uv * 2.0 - 1.0;
             float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, depthSample, 1.0);
             worldTermination.xyz /= worldTermination.w;
             float3 terminationLocal = (worldTermination.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
@@ -2646,124 +2357,35 @@ struct VolumeConvertUniforms {
     uint _pad;
 };
 
-// short -> half
-kernel void volume_convert_short_to_half(
-    device const short* src [[buffer(0)]],
-    texture3d<half, access::write> dst [[texture(0)]],
-    constant VolumeConvertUniforms& u [[buffer(1)]],
-    uint3 gid [[thread_position_in_grid]])
-{
-    if (any(gid >= uint3(u.dimX, u.dimY, u.dimZ))) return;
-    uint srcIdx = (gid.z * u.dimY + gid.y) * u.dimX + gid.x;
-    half4 val;
-    val.x = half(src[srcIdx * u.numComponents + 0]);
-    val.y = u.numComponents > 1 ? half(src[srcIdx * u.numComponents + 1]) : (half)0;
-    val.z = u.numComponents > 2 ? half(src[srcIdx * u.numComponents + 2]) : (half)0;
-    val.w = u.numComponents > 3 ? half(src[srcIdx * u.numComponents + 3]) : (half)0;
-    dst.write(val, gid);
+#define DEFINE_CONVERT_KERNEL(SRC_TYPE, DST_TYPE, SUFFIX)                        \
+kernel void volume_convert_##SUFFIX(                                             \
+    device const SRC_TYPE* src [[buffer(0)]],                                    \
+    texture3d<DST_TYPE, access::write> dst [[texture(0)]],                       \
+    constant VolumeConvertUniforms& u [[buffer(1)]],                             \
+    uint3 gid [[thread_position_in_grid]])                                       \
+{                                                                                \
+    if (any(gid >= uint3(u.dimX, u.dimY, u.dimZ))) return;                      \
+    uint srcIdx = (gid.z * u.dimY + gid.y) * u.dimX + gid.x;                    \
+    DST_TYPE##4 val;                                                             \
+    val.x = DST_TYPE(src[srcIdx * u.numComponents + 0]);                         \
+    val.y = u.numComponents > 1 ? DST_TYPE(src[srcIdx * u.numComponents + 1])   \
+                                : DST_TYPE(0);                                   \
+    val.z = u.numComponents > 2 ? DST_TYPE(src[srcIdx * u.numComponents + 2])   \
+                                : DST_TYPE(0);                                   \
+    val.w = u.numComponents > 3 ? DST_TYPE(src[srcIdx * u.numComponents + 3])   \
+                                : DST_TYPE(0);                                   \
+    dst.write(val, gid);                                                         \
 }
 
-// short -> float
-kernel void volume_convert_short_to_float(
-    device const short* src [[buffer(0)]],
-    texture3d<float, access::write> dst [[texture(0)]],
-    constant VolumeConvertUniforms& u [[buffer(1)]],
-    uint3 gid [[thread_position_in_grid]])
-{
-    if (any(gid >= uint3(u.dimX, u.dimY, u.dimZ))) return;
-    uint srcIdx = (gid.z * u.dimY + gid.y) * u.dimX + gid.x;
-    float4 val;
-    val.x = float(src[srcIdx * u.numComponents + 0]);
-    val.y = u.numComponents > 1 ? float(src[srcIdx * u.numComponents + 1]) : 0.0f;
-    val.z = u.numComponents > 2 ? float(src[srcIdx * u.numComponents + 2]) : 0.0f;
-    val.w = u.numComponents > 3 ? float(src[srcIdx * u.numComponents + 3]) : 0.0f;
-    dst.write(val, gid);
-}
+DEFINE_CONVERT_KERNEL(short, half,  short_to_half)
+DEFINE_CONVERT_KERNEL(short, float, short_to_float)
+DEFINE_CONVERT_KERNEL(int,   half,  int_to_half)
+DEFINE_CONVERT_KERNEL(int,   float, int_to_float)
+DEFINE_CONVERT_KERNEL(uint,  half,  uint_to_half)
+DEFINE_CONVERT_KERNEL(uint,  float, uint_to_float)
+DEFINE_CONVERT_KERNEL(float, half,  float_to_half)
 
-// int -> half
-kernel void volume_convert_int_to_half(
-    device const int* src [[buffer(0)]],
-    texture3d<half, access::write> dst [[texture(0)]],
-    constant VolumeConvertUniforms& u [[buffer(1)]],
-    uint3 gid [[thread_position_in_grid]])
-{
-    if (any(gid >= uint3(u.dimX, u.dimY, u.dimZ))) return;
-    uint srcIdx = (gid.z * u.dimY + gid.y) * u.dimX + gid.x;
-    half4 val;
-    val.x = half(src[srcIdx * u.numComponents + 0]);
-    val.y = u.numComponents > 1 ? half(src[srcIdx * u.numComponents + 1]) : (half)0;
-    val.z = u.numComponents > 2 ? half(src[srcIdx * u.numComponents + 2]) : (half)0;
-    val.w = u.numComponents > 3 ? half(src[srcIdx * u.numComponents + 3]) : (half)0;
-    dst.write(val, gid);
-}
-
-// int -> float
-kernel void volume_convert_int_to_float(
-    device const int* src [[buffer(0)]],
-    texture3d<float, access::write> dst [[texture(0)]],
-    constant VolumeConvertUniforms& u [[buffer(1)]],
-    uint3 gid [[thread_position_in_grid]])
-{
-    if (any(gid >= uint3(u.dimX, u.dimY, u.dimZ))) return;
-    uint srcIdx = (gid.z * u.dimY + gid.y) * u.dimX + gid.x;
-    float4 val;
-    val.x = float(src[srcIdx * u.numComponents + 0]);
-    val.y = u.numComponents > 1 ? float(src[srcIdx * u.numComponents + 1]) : 0.0f;
-    val.z = u.numComponents > 2 ? float(src[srcIdx * u.numComponents + 2]) : 0.0f;
-    val.w = u.numComponents > 3 ? float(src[srcIdx * u.numComponents + 3]) : 0.0f;
-    dst.write(val, gid);
-}
-
-// uint -> half
-kernel void volume_convert_uint_to_half(
-    device const uint* src [[buffer(0)]],
-    texture3d<half, access::write> dst [[texture(0)]],
-    constant VolumeConvertUniforms& u [[buffer(1)]],
-    uint3 gid [[thread_position_in_grid]])
-{
-    if (any(gid >= uint3(u.dimX, u.dimY, u.dimZ))) return;
-    uint srcIdx = (gid.z * u.dimY + gid.y) * u.dimX + gid.x;
-    half4 val;
-    val.x = half(src[srcIdx * u.numComponents + 0]);
-    val.y = u.numComponents > 1 ? half(src[srcIdx * u.numComponents + 1]) : (half)0;
-    val.z = u.numComponents > 2 ? half(src[srcIdx * u.numComponents + 2]) : (half)0;
-    val.w = u.numComponents > 3 ? half(src[srcIdx * u.numComponents + 3]) : (half)0;
-    dst.write(val, gid);
-}
-
-// uint -> float
-kernel void volume_convert_uint_to_float(
-    device const uint* src [[buffer(0)]],
-    texture3d<float, access::write> dst [[texture(0)]],
-    constant VolumeConvertUniforms& u [[buffer(1)]],
-    uint3 gid [[thread_position_in_grid]])
-{
-    if (any(gid >= uint3(u.dimX, u.dimY, u.dimZ))) return;
-    uint srcIdx = (gid.z * u.dimY + gid.y) * u.dimX + gid.x;
-    float4 val;
-    val.x = float(src[srcIdx * u.numComponents + 0]);
-    val.y = u.numComponents > 1 ? float(src[srcIdx * u.numComponents + 1]) : 0.0f;
-    val.z = u.numComponents > 2 ? float(src[srcIdx * u.numComponents + 2]) : 0.0f;
-    val.w = u.numComponents > 3 ? float(src[srcIdx * u.numComponents + 3]) : 0.0f;
-    dst.write(val, gid);
-}
-
-// float -> half (handles all component counts, including 3→4 expansion)
-kernel void volume_convert_float_to_half(
-    device const float* src [[buffer(0)]],
-    texture3d<half, access::write> dst [[texture(0)]],
-    constant VolumeConvertUniforms& u [[buffer(1)]],
-    uint3 gid [[thread_position_in_grid]])
-{
-    if (any(gid >= uint3(u.dimX, u.dimY, u.dimZ))) return;
-    uint srcIdx = (gid.z * u.dimY + gid.y) * u.dimX + gid.x;
-    half4 val;
-    val.x = half(src[srcIdx * u.numComponents + 0]);
-    val.y = u.numComponents > 1 ? half(src[srcIdx * u.numComponents + 1]) : (half)0;
-    val.z = u.numComponents > 2 ? half(src[srcIdx * u.numComponents + 2]) : (half)0;
-    val.w = u.numComponents > 3 ? half(src[srcIdx * u.numComponents + 3]) : (half)0;
-    dst.write(val, gid);
-}
+#undef DEFINE_CONVERT_KERNEL
 
 // ushort -> normalized half with clamping to [0,255] (for ushort→uchar normalization).
 // Writes normalized values to a Unorm texture; the shader samples them as [0,1] and
