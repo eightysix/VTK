@@ -200,7 +200,11 @@
   return self.view.window ? self.view.window.backingScaleFactor
                           : [NSScreen mainScreen].backingScaleFactor;
 #else
-  return self.view.contentScaleFactor;
+  // vtkIOSMetalRenderWindow uses the screen's native scale to convert between
+  // point-based frames and pixel drawable sizes, so we must stay in sync with it.
+  // (On Mac Catalyst / "Designed for iPad" the view's contentScaleFactor may
+  // report 1.0 while the backing store is 2x, which would shrink the view.)
+  return [UIScreen mainScreen].nativeScale;
 #endif
 }
 

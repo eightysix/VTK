@@ -319,20 +319,6 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
   return YES;
 }
 
-#pragma mark - View Switching
-
-- (ViewController*)viewControllerForSwitch
-{
-#if TARGET_OS_OSX
-  ViewController* rootVC = (ViewController*)self.window.contentViewController;
-#else
-  ViewController* rootVC = (ViewController*)self.window.rootViewController;
-#endif
-  NSAssert([rootVC isKindOfClass:[ViewController class]],
-           @"Root view controller must be a ViewController");
-  return rootVC;
-}
-
 - (void)nextPreset:(id)sender
 {
   FileVolumeViewController* vc = (FileVolumeViewController*)[self findMetalViewController];
@@ -613,6 +599,18 @@ didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
 #endif
 
 #pragma mark - View Switching
+
+- (ViewController*)viewControllerForSwitch
+{
+#if TARGET_OS_OSX
+  ViewController* rootVC = (ViewController*)self.window.contentViewController;
+#else
+  ViewController* rootVC = (ViewController*)self.window.rootViewController;
+#endif
+  NSAssert([rootVC isKindOfClass:[ViewController class]],
+           @"Root view controller must be a ViewController");
+  return rootVC;
+}
 
 - (void)selectViewAtIndex:(NSInteger)index
 {
