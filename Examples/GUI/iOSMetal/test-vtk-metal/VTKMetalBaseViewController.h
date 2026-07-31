@@ -14,6 +14,7 @@
  */
 typedef NS_ENUM(NSInteger, VTKGestureState)
 {
+  VTKGestureStateNone = -1,
   VTKGestureStateBegan = 0,
   VTKGestureStateChanged = 1,
   VTKGestureStateEnded = 2,

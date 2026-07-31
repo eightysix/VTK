@@ -53,9 +53,16 @@
   double _macPinchScale;
   BOOL _magnifyActive;
   double _macRotationAngle;
-  BOOL _rotateActive;
   double _scrollAccumulator;
 #endif
+
+  // Gesture interaction state shared by both platforms.  macOS magnify/rotate
+  // events and iOS pinch/rotation recognizers drive the same handlers.
+  BOOL _pinchActive;
+  BOOL _rotateActive;
+  CGFloat _lastPinchScale;
+  CGFloat _lastRotationAngle;
+  NSInteger _lastPanTouchCount;
 }
 #if !TARGET_OS_OSX
 @property (nonatomic, strong) UIPinchGestureRecognizer* pinchRecognizer;
@@ -211,7 +218,8 @@
   self.panRecognizer =
     [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
   self.panRecognizer.delegate = self;
-  self.panRecognizer.maximumNumberOfTouches = 1;
+  self.panRecognizer.minimumNumberOfTouches = 1;
+  self.panRecognizer.maximumNumberOfTouches = 2;
   [view addGestureRecognizer:self.panRecognizer];
 
   self.rotationRecognizer =
@@ -219,6 +227,10 @@
                                                   action:@selector(handleRotation:)];
   self.rotationRecognizer.delegate = self;
   [view addGestureRecognizer:self.rotationRecognizer];
+
+  _lastPanTouchCount = 0;
+  _pinchActive = NO;
+  _rotateActive = NO;
 }
 
 - (void)forwardTouchPosition:(UIGestureRecognizer*)recognizer
@@ -235,9 +247,10 @@
     case UIGestureRecognizerStateBegan: return VTKGestureStateBegan;
     case UIGestureRecognizerStateChanged: return VTKGestureStateChanged;
     case UIGestureRecognizerStateEnded: return VTKGestureStateEnded;
-    case UIGestureRecognizerStateCancelled:
+    case UIGestureRecognizerStateCancelled: return VTKGestureStateCancelled;
     case UIGestureRecognizerStateFailed:
-    case UIGestureRecognizerStatePossible: return VTKGestureStateCancelled;
+    case UIGestureRecognizerStatePossible:
+    default: return VTKGestureStateNone;
   }
 }
 
@@ -251,11 +264,95 @@
 - (void)handlePan:(UIPanGestureRecognizer*)recognizer
 {
   [self forwardTouchPosition:recognizer];
+
   CGPoint p = [recognizer locationInView:recognizer.view];
   CGPoint t = [recognizer translationInView:recognizer.view];
-  [self handleDragAtViewPoint:p
-                  translation:t
-                        state:[self gestureStateFromRecognizer:recognizer]];
+  NSInteger touches = recognizer.numberOfTouches;
+  VTKGestureState state = [self gestureStateFromRecognizer:recognizer];
+  if (state == VTKGestureStateNone)
+  {
+    return;
+  }
+
+  // The pan recognizer accepts 1-2 fingers.  When the finger count changes we
+  // bridge between the one-finger interaction (trackball/zoom/pan, driven via
+  // handleDragAtViewPoint:) and the two-finger gestures (pinch/rotate, driven
+  // by their own recognizers).  Without this the pan would fail when a second
+  // finger lands and the one-finger interaction would stay dead until every
+  // finger was lifted.
+  if (state == VTKGestureStateEnded || state == VTKGestureStateCancelled)
+  {
+    if (_lastPanTouchCount == 2)
+    {
+      // Two fingers lifted: close out any in-flight pinch/rotate interaction.
+      if (_rotateActive)
+      {
+        [self handleRotationAngle:_lastRotationAngle state:VTKGestureStateEnded];
+      }
+      if (_pinchActive)
+      {
+        [self handlePinchScale:_lastPinchScale state:VTKGestureStateEnded];
+      }
+    }
+    else if (_lastPanTouchCount == 1)
+    {
+      [self handleDragAtViewPoint:p translation:t state:state];
+    }
+    _lastPanTouchCount = 0;
+    return;
+  }
+
+  if (touches == _lastPanTouchCount)
+  {
+    // Finger count unchanged: only a single finger drives the one-finger
+    // interaction.  Two fingers are handled by the pinch/rotation recognizers.
+    if (touches == 1)
+    {
+      [self handleDragAtViewPoint:p translation:t state:state];
+    }
+    return;
+  }
+
+  NSInteger oldCount = _lastPanTouchCount;
+  _lastPanTouchCount = touches;
+
+  if (touches == 1 && oldCount == 2)
+  {
+    // Two fingers -> one finger: end the two-finger gestures (if they are
+    // still active) and restart the one-finger interaction so it keeps
+    // responding without requiring a full lift-and-retouch.
+    if (_rotateActive)
+    {
+      [self handleRotationAngle:_lastRotationAngle state:VTKGestureStateEnded];
+    }
+    if (_pinchActive)
+    {
+      [self handlePinchScale:_lastPinchScale state:VTKGestureStateEnded];
+    }
+    [self handleDragAtViewPoint:p translation:t state:VTKGestureStateBegan];
+  }
+  else if (touches == 2 && oldCount == 1)
+  {
+    // One finger -> two fingers: end the one-finger interaction; the pinch and
+    // rotation recognizers take over.  They may already have fired their Start
+    // events while the one-finger interaction was still active (in which case
+    // the style ignored StartGesture because its state was busy), so re-arm the
+    // gesture state if needed.
+    [self handleDragAtViewPoint:p translation:t state:VTKGestureStateEnded];
+    if (_rotateActive)
+    {
+      _iren->StartRotateEvent();
+    }
+    if (_pinchActive)
+    {
+      _iren->StartPinchEvent();
+    }
+  }
+  else if (touches == 1)
+  {
+    // Gesture began with a single finger.
+    [self handleDragAtViewPoint:p translation:t state:state];
+  }
 }
 
 - (void)handleRotation:(UIRotationGestureRecognizer*)recognizer
@@ -268,13 +365,15 @@
 - (BOOL)gestureRecognizer:(UIGestureRecognizer*)a
     shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer*)b
 {
-  BOOL pinchOrRotation =
-    ([a isKindOfClass:[UIPinchGestureRecognizer class]] ||
-     [a isKindOfClass:[UIRotationGestureRecognizer class]]);
-  BOOL otherIsSame =
-    ([b isKindOfClass:[UIPinchGestureRecognizer class]] ||
-     [b isKindOfClass:[UIRotationGestureRecognizer class]]);
-  return pinchOrRotation && otherIsSame;
+  // Pinch, rotation, and the (1-2 finger) pan all track the same touches.  Let
+  // them recognize together so the interaction can transition between
+  // one-finger and two-finger gestures without a recognizer failing midway and
+  // leaving the interaction dead until all fingers are lifted.
+  BOOL isOurs =
+    (a == self.pinchRecognizer || a == self.rotationRecognizer || a == self.panRecognizer);
+  BOOL otherIsOurs =
+    (b == self.pinchRecognizer || b == self.rotationRecognizer || b == self.panRecognizer);
+  return isOurs && otherIsOurs;
 }
 
 #endif
@@ -596,12 +695,27 @@
 
 - (void)handlePinchScale:(CGFloat)scale state:(VTKGestureState)state
 {
+  if (state == VTKGestureStateNone)
+  {
+    return;
+  }
+
   if (state == VTKGestureStateBegan)
   {
+    _pinchActive = YES;
     [self interactionDidStart];
+  }
+  else if (!_pinchActive)
+  {
+    // Ignore Changed/Ended/Cancelled for an interaction that never started (a
+    // recognizer that failed or was force-ended during a finger-count
+    // transition).  Ending it again would tear down a different interaction
+    // that is still in flight.
+    return;
   }
 
   scale = MAX(-3.0, MIN(3.0, scale));
+  _lastPinchScale = scale;
   _iren->SetScale(scale);
 
   switch (state)
@@ -615,14 +729,11 @@
     case VTKGestureStateEnded:
     case VTKGestureStateCancelled:
       _iren->EndPinchEvent();
+      _pinchActive = NO;
+      [self interactionDidEnd];
       break;
     default:
       break;
-  }
-
-  if (state == VTKGestureStateEnded || state == VTKGestureStateCancelled)
-  {
-    [self interactionDidEnd];
   }
 
   _renWin->Render();
@@ -630,11 +741,22 @@
 
 - (void)handleRotationAngle:(CGFloat)angle state:(VTKGestureState)state
 {
-  if (state == VTKGestureStateBegan)
+  if (state == VTKGestureStateNone)
   {
-    [self interactionDidStart];
+    return;
   }
 
+  if (state == VTKGestureStateBegan)
+  {
+    _rotateActive = YES;
+    [self interactionDidStart];
+  }
+  else if (!_rotateActive)
+  {
+    return;
+  }
+
+  _lastRotationAngle = angle;
   _iren->SetRotation(angle);
 
   switch (state)
@@ -648,14 +770,11 @@
     case VTKGestureStateEnded:
     case VTKGestureStateCancelled:
       _iren->EndRotateEvent();
+      _rotateActive = NO;
+      [self interactionDidEnd];
       break;
     default:
       break;
-  }
-
-  if (state == VTKGestureStateEnded || state == VTKGestureStateCancelled)
-  {
-    [self interactionDidEnd];
   }
 
   _renWin->Render();
