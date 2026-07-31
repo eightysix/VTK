@@ -6,6 +6,7 @@ dawn
 build
 build_ios
 build_ios_metal
+build_macos_metal
 buildServer.json
 
 # Do not add ExternalData module staging files
