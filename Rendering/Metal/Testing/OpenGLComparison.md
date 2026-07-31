@@ -7,7 +7,11 @@ both backends and compares them with `vtkImageDifference` using the same
 thresholded-error metric `vtkTesting` uses for baseline regression.
 
 Numbers below were produced on Apple Silicon, macOS, `SetMultiSamples(0)`,
-`SwapBuffersOff()` (back buffer read-back), threshold 20.
+`SwapBuffersOff()` (back buffer read-back), threshold 20, at commit
+`27e89cda53` (Metal parity fixes for lighting, backface materials, glyph
+normals, gradient backgrounds, and fake-tube line shading). The run is fully
+reproducible: rerunning the harness produces byte-identical images and
+identical errors.
 
 ```
 scene                          error   thresholded error
@@ -15,17 +19,17 @@ scene                          error   thresholded error
 RenderWindow                       39.322          0.000
 Camera                             10.078          0.000
 Light                              61.965          0.000
-ActorProperty                   10456.472       7677.969
-PointRender                      6901.410       3029.404
-DepthPeeling                    49491.677      37757.492
+ActorProperty                    1949.314        167.807
+PointRender                      4894.647       2193.884
+DepthPeeling                     4425.217        808.961
 CompositePolyDataMapper           241.004          0.000
-Glyph3DMapper                   18812.837      15880.383
+Glyph3DMapper                     444.277          0.000
 HardwareSelector                  307.776          0.000
-PolyDataMapper2D                14604.102      12822.630
-Texture                         11356.438       9219.059
+PolyDataMapper2D                  286.047          0.000
+Texture                           177.318          0.000
 VolumeRayCast                    2612.763        789.835
 -------------------------------------------------------------------
-worst thresholded error: 37757.5
+worst thresholded error: 2193.88
 ```
 
 ## How to read this
@@ -44,7 +48,7 @@ worst thresholded error: 37757.5
 
 - **RenderWindow** (`BuildRenderWindowScene`): single cone, default material.
   Difference is only anti-aliasing/rounding at edges; `>10%` pixels fraction
-  <= 0.34%.
+  ~0.2%.
 - **Camera** (`BuildCameraScene`): cone after the full camera-operation
   sequence (azimuth/elevation/roll/dolly/zoom), ending in parallel projection.
   Identical projection math.
@@ -55,38 +59,46 @@ worst thresholded error: 37757.5
   mapper. The Metal delegator path matches GL.
 - **HardwareSelector** (`BuildHardwareSelectorScene`): cone + sphere side by
   side. Basic opaque geometry path, matches GL.
+- **Glyph3DMapper** (`BuildGlyphScene`): a 4x4 plane of instanced spheres with
+  per-instance scalar colors (`vtkGlyph3DMapper`, `ColorModeToMapScalars`).
+  Now matches GL exactly (`>10%` fraction 0.0%): the per-instance normal
+  transform is padded to Metal's `float3x3` 16-byte-column layout, and the
+  instance material/light buffers follow the `vtkMetalPolyDataMapper`
+  conventions.
+- **PolyDataMapper2D** (`BuildPolyDataMapper2DScene`): a 3D cone plus an
+  orange 2D overlay quad in display coordinates. `vtkMetalRenderer` now drives
+  `vtkRenderer::RenderOverlay()`, so the quad renders in Metal and matches GL
+  (`>10%` fraction ~0.1%).
+- **Texture** (`BuildTextureScene`): a checkerboard-textured plane
+  (`vtkTexture`, interpolation on, repeat off, edge clamp). The Metal sampling
+  path matches the OpenGL texture unit behavior (`>10%` fraction 0.0%).
 
 ### Divergent scenes and likely causes
 
-- **ActorProperty** — error 10456 / thresholded 7677, ~19.7% of pixels >10%.
-  A translucent (opacity 0.5) sphere with a backface property. Metal does not
-  perform depth peeling (see below); the translucent surface is blended with
-  painter-order-only, so front/back-face ordering and overdraw differ from
-  OpenGL's depth-peeled result.
-- **PointRender** — error 6901 / thresholded 3029, ~21.6% of pixels >10%.
-  Sphere with `EdgeVisibilityOn()`, `SetLineWidth(7)`, `RenderLinesAsTubesOn()`.
-  Likely cause: the Metal mapper does not implement line/tube primitives with
-  the same width/render style as OpenGL, so the edge strokes differ.
-- **DepthPeeling** — error 49491 / thresholded 37757, ~86.2% of pixels >10%.
+- **ActorProperty** — error 1949 / thresholded 167.8, ~3.2% of pixels >10%.
+  A translucent (opacity 0.5) sphere with a backface property. Backface
+  materials are now implemented and match GL; the residual difference is a
+  uniform slight darkening of the Metal sphere — every differing pixel is
+  GL-brighter by 26-60 gray levels across the 210x210 sphere region — a subtle
+  front/back-face translucency compositing or lighting rounding difference.
+  Neither backend depth-peels this scene (the flag is off); both use
+  painter-order blending.
+- **PointRender** — error 4894 / thresholded 2193.9, ~20.0% of pixels >10%
+  (the worst remaining scene). Sphere with `EdgeVisibilityOn()`,
+  `SetLineWidth(7)`, `RenderLinesAsTubesOn()`. The edges now render as GL-style
+  fake tubes (cylinder normals with the GL `emix` edge blend, miter-joined
+  closed loops per polygon), so the surface and tube shading match. The
+  residual divergence is at the sphere's silhouette: the flat tube quads sit at
+  chord depth behind the curved surface, so the middle of each tube fragment is
+  depth-culled and the tubes read as hollow/broken arcs (edge streaks) where GL
+  shows continuous arcs; line anti-aliasing also differs (GL softer).
+- **DepthPeeling** — error 4425 / thresholded 808.9, ~17.2% of pixels >10%.
   Three overlapping translucent spheres with `SetUseDepthPeeling(true)` and 20
-  peels. `vtkMetalRenderer` does not implement depth peeling; the flag is
-  ignored and the spheres are blended in a single translucent pass, so the
-  compositing is fundamentally different. This is the largest divergence and
-  the main missing Metal feature this scene exercises.
-- **Glyph3DMapper** — error 18812 / thresholded 15880, ~19.3% of pixels >10%.
-  A 4x4 plane of instanced spheres with per-instance scalar colors
-  (`vtkGlyph3DMapper`, `ColorModeToMapScalars`). The Metal glyph mapper
-  instancing/color path diverges from GL — per-instance colors and lighting are
-  not matched exactly.
-- **PolyDataMapper2D** — error 14604 / thresholded 12822, ~10.7% of pixels >10%.
-  A 3D cone plus an orange 2D overlay quad in display coordinates. The Metal
-  backend does not drive `vtkRenderer::RenderOverlay`, so the quad is entirely
-  absent from the Metal image. The differing pixels are exactly the quad area.
-- **Texture** — error 11356 / thresholded 9219, ~16.1% of pixels >10%.
-  A checkerboard-textured plane (`vtkTexture`, interpolation on, repeat off,
-  edge clamp). The Metal sampling/filtering path (or how the base `vtkTexture`
-  uploads) does not match the OpenGL texture unit behavior at edges/filtering.
-- **VolumeRayCast** — error 2612 / thresholded 789, ~9.9% of pixels >10%.
+  peels. `vtkMetalRenderer` drives its depth peeler
+  (`vtkMetalDepthPeeler`), which now tracks GL closely; residual differences
+  concentrate in the sphere-overlap regions and are consistent with peel-count
+  / front-to-back compositing rounding.
+- **VolumeRayCast** — error 2612 / thresholded 789.8, ~28.5% of pixels >10%.
   Analytic 32^3 volume through the GPU ray-cast mapper with a shaded transfer
   function (`ShadeOn`, ambient/diffuse/specular). The Metal volume mapper is a
   newer port; ray sampling/step size and shading terms differ slightly from the
