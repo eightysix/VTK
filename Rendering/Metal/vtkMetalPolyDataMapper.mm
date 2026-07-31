@@ -3521,6 +3521,16 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
             continue;
           }
           uint32_t loopCellId = static_cast<uint32_t>(polyLoopIdx + polyCellOffset) + 1u;
+          // Emit the closing segment once more at the start of the loop so the
+          // wrap-around vertex (pts[0], shared by the p_{n-1}->p_0 and p_0->p_1
+          // segments) has a same-cellId neighbor on both sides. The miter shader
+          // gates joins on instance_id > 0 / < segmentCount-1, so without this
+          // duplicate the seam at pts[0] is never joined and shows a notch. The
+          // duplicate quad exactly overlaps the loop's own closing segment, so
+          // it is a no-op for opaque edges.
+          edgeTubeIndices.push_back(addEdgeVertex(pts[npts - 1], polyLoopIdx));
+          edgeTubeIndices.push_back(addEdgeVertex(pts[0], polyLoopIdx));
+          edgeTubeCellIds.push_back(loopCellId);
           for (vtkIdType i = 0; i < npts; ++i)
           {
             uint32_t va = addEdgeVertex(pts[i], polyLoopIdx);
@@ -3828,10 +3838,6 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
     this->Internals->EdgeVertexCount = edgePositions.size() / 3;
     this->Internals->HasEdgeOverlay = true;
 
-    if (!edgeColors.empty())
-    {
-      // P2-8: Create edge primitive-to-cell mapping for CPU-built edges (per-vertex)
-    }
     if (!edgeVertexCellIds.empty())
     {
       id<MTLBuffer> cellIdBuf =

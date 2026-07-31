@@ -153,7 +153,7 @@ void vtkMetalRenderer::DeviceRender()
       {
         rpd.colorAttachments[0].texture = msaaColorTex;
         rpd.colorAttachments[0].resolveTexture = drawable.texture;
-        rpd.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+        rpd.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
       }
       else
       {
@@ -237,7 +237,7 @@ void vtkMetalRenderer::DeviceRender()
       {
         static id<MTLRenderPipelineState> gradientPipeline = nil;
         static int gradientPipelineSampleCount = 0;
-        if (!gradientPipeline || gradientPipelineSampleCount != (int)msaa)
+        if (!gradientPipeline || gradientPipelineSampleCount != renWin->GetEffectiveSampleCount())
         {
           @autoreleasepool
           {
@@ -274,7 +274,7 @@ void vtkMetalRenderer::DeviceRender()
                   vtkGenericWarningMacro(<< "Gradient pipeline: "
                                          << [[error localizedDescription] UTF8String]);
                 }
-                gradientPipelineSampleCount = msaa ? 1 : 0;
+                gradientPipelineSampleCount = renWin->GetEffectiveSampleCount();
                 [desc release];
               }
               [vFunc release];
@@ -384,7 +384,7 @@ void vtkMetalRenderer::DeviceRender()
       {
         rpd.colorAttachments[0].texture = msaaColorTex;
         rpd.colorAttachments[0].resolveTexture = drawable.texture;
-        rpd.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+        rpd.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
       }
       else
       {
@@ -723,6 +723,10 @@ void vtkMetalRenderer::DeviceRender()
     {
       MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
 
+      // Loading msaaColorTex is valid here only because the opaque and
+      // translucent passes store (StoreAndMultisampleResolve) rather than
+      // discard the multisample buffer. This pass draws the 2D overlay into
+      // it and re-resolves onto the drawable, keeping the scene intact.
       if (msaa && msaaColorTex)
       {
         rpd.colorAttachments[0].texture = msaaColorTex;
