@@ -2,10 +2,8 @@
 
 set -e
 
-SCHEME="test-vtk-metal"
-PROJECT_NAME="test-vtk-metal"
+SCHEME="test-vtk-metal-mac"
 PROJECT_DIR="Examples/GUI/iOSMetal"
-OUTPUT_DIR="build"
 
 show_usage() {
     echo "Usage: $0 [debug|release]"
@@ -24,35 +22,28 @@ elif [[ -n "$1" ]]; then
     show_usage
 fi
 
-echo "Building $SCHEME ($CONFIG) for Mac (Designed for iPad)..."
+echo "Building $SCHEME ($CONFIG) for Mac..."
 
-xcodebuild -project "$PROJECT_DIR/$PROJECT_NAME.xcodeproj" \
+xcodebuild -project "$PROJECT_DIR/test-vtk-metal.xcodeproj" \
     -scheme "$SCHEME" \
     -configuration "$CONFIG" \
-    -destination 'generic/platform=iOS' \
+    -destination 'platform=macOS' \
     build
 
-DERIVED_DATA_PATH=$(find ~/Library/Developer/Xcode/DerivedData/${PROJECT_NAME}-* -maxdepth 0 -type d 2>/dev/null | head -1)
+DERIVED_DATA_PATH=$(find ~/Library/Developer/Xcode/DerivedData/test-vtk-metal-* -maxdepth 0 -type d 2>/dev/null | head -1)
 if [[ -z "$DERIVED_DATA_PATH" ]]; then
-    echo "Error: Could not find DerivedData for $PROJECT_NAME"
+    echo "Error: Could not find DerivedData for test-vtk-metal"
     exit 1
 fi
 
-IOS_APP="$DERIVED_DATA_PATH/Build/Products/${CONFIG}-iphoneos/${SCHEME}.app"
+MAC_APP="$DERIVED_DATA_PATH/Build/Products/${CONFIG}/${SCHEME}.app"
 
-if [[ ! -d "$IOS_APP" ]]; then
-    echo "Error: Built app not found at $IOS_APP"
+if [[ ! -d "$MAC_APP" ]]; then
+    echo "Error: Built app not found at $MAC_APP"
     exit 1
 fi
 
-echo "Creating wrapper structure in project folder..."
-rm -rf "$OUTPUT_DIR/${SCHEME}.app"
-mkdir -p "$OUTPUT_DIR/${SCHEME}.app/Wrapper"
-cp -R "$IOS_APP" "$OUTPUT_DIR/${SCHEME}.app/Wrapper/"
-ln -sf "Wrapper/${SCHEME}.app" "$OUTPUT_DIR/${SCHEME}.app/WrappedBundle"
-
-echo "Wrapper created at: $PWD/$OUTPUT_DIR/${SCHEME}.app"
 echo "Launching app..."
-open "$OUTPUT_DIR/${SCHEME}.app"
+open "$MAC_APP"
 
 echo "Done!"
