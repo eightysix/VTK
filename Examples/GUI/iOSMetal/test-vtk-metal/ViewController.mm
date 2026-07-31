@@ -14,7 +14,7 @@
   self.selectedIndex = 0;
 }
 
-- (UIViewController*)viewControllerAtIndex:(NSInteger)index
+- (id)viewControllerAtIndex:(NSInteger)index
 {
   switch (index)
   {
@@ -31,24 +31,37 @@
 - (void)setSelectedIndex:(NSInteger)selectedIndex
 {
   _selectedIndex = selectedIndex;
-  
-  for (UIViewController* child in self.childViewControllers)
+
+  for (id child in self.childViewControllers)
   {
-    [child willMoveToParentViewController:nil];
-    [child.view removeFromSuperview];
-    [child removeFromParentViewController];
+#if TARGET_OS_OSX
+    NSViewController *childVC = child;
+#else
+    UIViewController *childVC = child;
+    [childVC willMoveToParentViewController:nil];
+#endif
+    [childVC.view removeFromSuperview];
+    [childVC removeFromParentViewController];
   }
-  
-  UIViewController* vc = [self viewControllerAtIndex:selectedIndex];
+
+#if TARGET_OS_OSX
+  NSViewController *vc = [self viewControllerAtIndex:selectedIndex];
+  vc.view.frame = self.view.bounds;
+  vc.view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  [self addChildViewController:vc];
+  [self.view addSubview:vc.view];
+#else
+  UIViewController *vc = [self viewControllerAtIndex:selectedIndex];
   vc.view.frame = self.view.bounds;
   vc.view.autoresizingMask =
-  UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
   [self.view addSubview:vc.view];
   [self addChildViewController:vc];
   [vc didMoveToParentViewController:self];
+#endif
 }
 
-- (UIViewController*)currentViewController
+- (id)currentViewController
 {
   return self.childViewControllers.lastObject;
 }

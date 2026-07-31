@@ -1,8 +1,19 @@
+#import <TargetConditionals.h>
 #import "BaseVolumeViewController.h"
+
+#if TARGET_OS_OSX
+#import <Cocoa/Cocoa.h>
+#else
+#import <UIKit/UIKit.h>
+#endif
 
 @class VolumeRenderingPreset;
 
+#if TARGET_OS_OSX
+@interface FileVolumeViewController : BaseVolumeViewController
+#else
 @interface FileVolumeViewController : BaseVolumeViewController <UIDocumentPickerDelegate>
+#endif
 
 - (NSArray<NSString *> *)documentTypes;
 - (void)loadFromURL:(NSURL *)url;

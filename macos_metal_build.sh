@@ -71,7 +71,7 @@ LIBTOOL_INPUT=$(find "${BUILD_DIR}/install/lib" -name "*.a" | tr '\n' ' ')
 libtool -static -o "${VERSION_DIR}/vtk" ${LIBTOOL_INPUT}
 
 echo "Step 5b: Creating Info.plist..."
-cat > "${VERSION_DIR}/Resources/Info.plist" <<'PLIST'
+cat > "${VERSION_DIR}/Resources/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

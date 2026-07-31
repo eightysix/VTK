@@ -15,12 +15,6 @@
 - (void)setHigherVolumeRenderingSampleRate:(BOOL)on;
 @end
 
-@interface VTKMetalBaseViewController (OverrideSupport)
-- (void)handlePinch:(UIPinchGestureRecognizer*)recognizer;
-- (void)handlePan:(UIPanGestureRecognizer*)recognizer;
-- (void)handleRotation:(UIRotationGestureRecognizer*)recognizer;
-@end
-
 @implementation BaseVolumeViewController
 
 - (instancetype)init
@@ -92,41 +86,6 @@
 {
     if (!_dynamicSampleRateAdjustmentEnabled) return;
     [self setHigherVolumeRenderingSampleRate:YES];
-}
-
-#pragma mark - Gesture recognizer overrides
-
-- (void)handlePinch:(UIPinchGestureRecognizer*)recognizer
-{
-    if (recognizer.state == UIGestureRecognizerStateBegan) {
-        [self interactionDidStart];
-    } else if (recognizer.state == UIGestureRecognizerStateEnded ||
-               recognizer.state == UIGestureRecognizerStateCancelled) {
-        [self interactionDidEnd];
-    }
-    [super handlePinch:recognizer];
-}
-
-- (void)handlePan:(UIPanGestureRecognizer*)recognizer
-{
-    if (recognizer.state == UIGestureRecognizerStateBegan) {
-        [self interactionDidStart];
-    } else if (recognizer.state == UIGestureRecognizerStateEnded ||
-               recognizer.state == UIGestureRecognizerStateCancelled) {
-        [self interactionDidEnd];
-    }
-    [super handlePan:recognizer];
-}
-
-- (void)handleRotation:(UIRotationGestureRecognizer*)recognizer
-{
-    if (recognizer.state == UIGestureRecognizerStateBegan) {
-        [self interactionDidStart];
-    } else if (recognizer.state == UIGestureRecognizerStateEnded ||
-               recognizer.state == UIGestureRecognizerStateCancelled) {
-        [self interactionDidEnd];
-    }
-    [super handleRotation:recognizer];
 }
 
 @end

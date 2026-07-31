@@ -13,11 +13,21 @@
 #include "vtkMetalPolyDataMapper.h"
 #include "vtkMetalRenderer.h"
 #include "vtkMetalRenderWindow.h"
+#if TARGET_OS_OSX
+#include "vtkCocoaMetalRenderWindow.h"
+#else
 #include "vtkIOSMetalRenderWindow.h"
+#endif
+
+#import <QuartzCore/QuartzCore.h>
 
 @interface VTKMetalBaseViewController ()
 {
+#if TARGET_OS_OSX
+  vtkNew<vtkCocoaMetalRenderWindow> _renWin;
+#else
   vtkNew<vtkIOSMetalRenderWindow> _renWin;
+#endif
   vtkNew<vtkMetalRenderer> _renderer;
   vtkNew<vtkRenderWindowInteractor> _iren;
 
@@ -25,6 +35,7 @@
   int _zoomAnchorDisplay[2];
   double _zoomAnchorWorld[3];
   BOOL _zoomAnchorValid;
+  double _zoomLastTranslationY;
 
   // Benchmark state
   BOOL _benchmarkRunning;
@@ -34,10 +45,23 @@
   CFTimeInterval _benchmarkTotalStartTime;
   double _benchmarkAccumulatedGPUTime;
   double _benchmarkAccumulatedAngle;
+
+#if TARGET_OS_OSX
+  // Mouse drag state
+  BOOL _dragActive;
+  CGPoint _dragStartPoint;
+  double _macPinchScale;
+  BOOL _magnifyActive;
+  double _macRotationAngle;
+  BOOL _rotateActive;
+  double _scrollAccumulator;
+#endif
 }
+#if !TARGET_OS_OSX
 @property (nonatomic, strong) UIPinchGestureRecognizer* pinchRecognizer;
 @property (nonatomic, strong) UIPanGestureRecognizer* panRecognizer;
 @property (nonatomic, strong) UIRotationGestureRecognizer* rotationRecognizer;
+#endif
 @end
 
 @implementation VTKMetalBaseViewController
@@ -119,9 +143,8 @@
   _renWin->AddRenderer(_renderer);
 
   // Set size (Retina-aware)
-  CGFloat scale = [UIScreen mainScreen].nativeScale;
-  _renWin->SetSize((int)lround(scale * self.view.bounds.size.width),
-                   (int)lround(scale * self.view.bounds.size.height));
+  _renWin->SetSize((int)lround([self contentScaleFactor] * self.view.bounds.size.width),
+                   (int)lround([self contentScaleFactor] * self.view.bounds.size.height));
 
   // Set up interactor
   _iren->SetRenderWindow(_renWin);
@@ -135,6 +158,16 @@
   _renWin->Render();
 
   // Add the Metal view as subview
+#if TARGET_OS_OSX
+  NSView* vtkView = _renWin->GetViewId();
+  if (vtkView)
+  {
+    vtkView.frame = self.view.bounds;
+    vtkView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [self.view addSubview:vtkView];
+    _renWin->SetViewEventDelegate(self);
+  }
+#else
   UIView* vtkView = _renWin->GetViewId();
   if (vtkView)
   {
@@ -144,12 +177,29 @@
     [self.view addSubview:vtkView];
     [self setupGestureRecognizersOnView:vtkView];
   }
+#endif
 }
 
 - (void)setupVTKPipeline
 {
   // Subclasses must override this method
 }
+
+#pragma mark - Scale factor
+
+- (CGFloat)contentScaleFactor
+{
+#if TARGET_OS_OSX
+  return self.view.window ? self.view.window.backingScaleFactor
+                          : [NSScreen mainScreen].backingScaleFactor;
+#else
+  return self.view.contentScaleFactor;
+#endif
+}
+
+#pragma mark - iOS Gesture Recognizers
+
+#if !TARGET_OS_OSX
 
 - (void)setupGestureRecognizersOnView:(UIView*)view
 {
@@ -178,70 +228,237 @@
   _iren->SetEventInformationFlipY((int)(p.x * scale), (int)(p.y * scale), 0, 0, 0, 0, 0);
 }
 
+- (VTKGestureState)gestureStateFromRecognizer:(UIGestureRecognizer*)recognizer
+{
+  switch (recognizer.state)
+  {
+    case UIGestureRecognizerStateBegan: return VTKGestureStateBegan;
+    case UIGestureRecognizerStateChanged: return VTKGestureStateChanged;
+    case UIGestureRecognizerStateEnded: return VTKGestureStateEnded;
+    case UIGestureRecognizerStateCancelled:
+    case UIGestureRecognizerStateFailed:
+    case UIGestureRecognizerStatePossible: return VTKGestureStateCancelled;
+  }
+}
+
 - (void)handlePinch:(UIPinchGestureRecognizer*)recognizer
 {
   [self forwardTouchPosition:recognizer];
-
-  CGFloat scale = recognizer.scale;
-  scale = MAX(-3.0, MIN(3.0, scale));
-  _iren->SetScale(scale);
-
-  switch (recognizer.state)
-  {
-    case UIGestureRecognizerStateBegan:
-      _iren->StartPinchEvent();
-      break;
-    case UIGestureRecognizerStateChanged:
-      _iren->PinchEvent();
-      break;
-    case UIGestureRecognizerStateEnded:
-    case UIGestureRecognizerStateCancelled:
-      _iren->EndPinchEvent();
-      break;
-    default:
-      break;
-  }
-
-  _renWin->Render();
+  [self handlePinchScale:recognizer.scale
+                   state:[self gestureStateFromRecognizer:recognizer]];
 }
 
 - (void)handlePan:(UIPanGestureRecognizer*)recognizer
 {
   [self forwardTouchPosition:recognizer];
+  CGPoint p = [recognizer locationInView:recognizer.view];
+  CGPoint t = [recognizer translationInView:recognizer.view];
+  [self handleDragAtViewPoint:p
+                  translation:t
+                        state:[self gestureStateFromRecognizer:recognizer]];
+}
+
+- (void)handleRotation:(UIRotationGestureRecognizer*)recognizer
+{
+  [self forwardTouchPosition:recognizer];
+  double angle = -[recognizer rotation] * 180.0 / M_PI;
+  [self handleRotationAngle:angle state:[self gestureStateFromRecognizer:recognizer]];
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer*)a
+    shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer*)b
+{
+  BOOL pinchOrRotation =
+    ([a isKindOfClass:[UIPinchGestureRecognizer class]] ||
+     [a isKindOfClass:[UIRotationGestureRecognizer class]]);
+  BOOL otherIsSame =
+    ([b isKindOfClass:[UIPinchGestureRecognizer class]] ||
+     [b isKindOfClass:[UIRotationGestureRecognizer class]]);
+  return pinchOrRotation && otherIsSame;
+}
+
+#endif
+
+#pragma mark - macOS Event Forwarding
+
+#if TARGET_OS_OSX
+
+- (void)updateEventPositionForView:(NSView*)view event:(NSEvent*)event
+{
+  CGPoint p = [view convertPoint:event.locationInWindow fromView:nil];
+  CGFloat scale = [self contentScaleFactor];
+  // NSView coordinates are already bottom-left based (unlike UIKit), so no flip is needed.
+  _iren->SetEventInformation((int)(p.x * scale), (int)(p.y * scale),
+    (event.modifierFlags & NSEventModifierFlagControl) ? 1 : 0,
+    (event.modifierFlags & NSEventModifierFlagShift) ? 1 : 0, 0, 0, 0);
+}
+
+- (void)metalView:(NSView*)view mouseDown:(NSEvent*)event
+{
+  _dragActive = YES;
+  _dragStartPoint = [view convertPoint:event.locationInWindow fromView:nil];
+  [self updateEventPositionForView:view event:event];
+  [self handleDragAtViewPoint:_dragStartPoint
+                  translation:CGPointZero
+                        state:VTKGestureStateBegan];
+}
+
+- (void)metalView:(NSView*)view mouseDragged:(NSEvent*)event
+{
+  if (!_dragActive) { return; }
+  CGPoint p = [view convertPoint:event.locationInWindow fromView:nil];
+  [self updateEventPositionForView:view event:event];
+  // Normalize translation to "down-positive" (UIKit convention) so the shared
+  // drag handlers behave identically on both platforms.
+  CGPoint t = CGPointMake(p.x - _dragStartPoint.x, _dragStartPoint.y - p.y);
+  [self handleDragAtViewPoint:p translation:t state:VTKGestureStateChanged];
+}
+
+- (void)metalView:(NSView*)view mouseUp:(NSEvent*)event
+{
+  if (!_dragActive) { return; }
+  _dragActive = NO;
+  CGPoint p = [view convertPoint:event.locationInWindow fromView:nil];
+  [self updateEventPositionForView:view event:event];
+  CGPoint t = CGPointMake(p.x - _dragStartPoint.x, _dragStartPoint.y - p.y);
+  [self handleDragAtViewPoint:p translation:t state:VTKGestureStateEnded];
+}
+
+- (void)metalView:(NSView*)view scrollWheel:(NSEvent*)event
+{
+  [self updateEventPositionForView:view event:event];
+
+  if (event.hasPreciseScrollingDeltas)
+  {
+    // Trackpad: accumulate precise deltas and emit discrete wheel steps.
+    _scrollAccumulator += event.scrollingDeltaY;
+    const double kStep = 12.0;
+    while (_scrollAccumulator >= kStep)
+    {
+      [self handleScrollDeltaY:kStep];
+      _scrollAccumulator -= kStep;
+    }
+    while (_scrollAccumulator <= -kStep)
+    {
+      [self handleScrollDeltaY:-kStep];
+      _scrollAccumulator += kStep;
+    }
+  }
+  else
+  {
+    [self handleScrollDeltaY:event.scrollingDeltaY];
+  }
+}
+
+- (void)metalView:(NSView*)view magnifyWithEvent:(NSEvent*)event
+{
+  [self updateEventPositionForView:view event:event];
+
+  NSEventPhase phase = event.phase;
+  BOOL began = (phase == NSEventPhaseBegan) ||
+    (!_magnifyActive && phase != NSEventPhaseEnded && phase != NSEventPhaseCancelled);
+  BOOL ended = (phase == NSEventPhaseEnded) || (phase == NSEventPhaseCancelled);
+
+  if (began)
+  {
+    _magnifyActive = YES;
+    _macPinchScale = 1.0;
+  }
+  if (!ended)
+  {
+    _macPinchScale *= (1.0 + event.magnification);
+  }
+
+  [self handlePinchScale:_macPinchScale
+                   state:began ? VTKGestureStateBegan
+                                : (ended ? VTKGestureStateEnded : VTKGestureStateChanged)];
+  if (ended)
+  {
+    _magnifyActive = NO;
+  }
+}
+
+- (void)metalView:(NSView*)view rotateWithEvent:(NSEvent*)event
+{
+  [self updateEventPositionForView:view event:event];
+
+  NSEventPhase phase = event.phase;
+  BOOL began = (phase == NSEventPhaseBegan) ||
+    (!_rotateActive && phase != NSEventPhaseEnded && phase != NSEventPhaseCancelled);
+  BOOL ended = (phase == NSEventPhaseEnded) || (phase == NSEventPhaseCancelled);
+
+  if (began)
+  {
+    _rotateActive = YES;
+    _macRotationAngle = 0.0;
+  }
+  if (!ended)
+  {
+    _macRotationAngle += -event.rotation * 180.0 / M_PI;
+  }
+
+  [self handleRotationAngle:_macRotationAngle
+                      state:began ? VTKGestureStateBegan
+                                  : (ended ? VTKGestureStateEnded : VTKGestureStateChanged)];
+  if (ended)
+  {
+    _rotateActive = NO;
+  }
+}
+
+#endif
+
+#pragma mark - Shared Interaction Hooks
+
+- (void)handleDragAtViewPoint:(CGPoint)point
+                  translation:(CGPoint)translation
+                        state:(VTKGestureState)state
+{
+  if (state == VTKGestureStateBegan)
+  {
+    _zoomLastTranslationY = 0.0;
+    [self interactionDidStart];
+  }
 
   switch (self.interactionMode)
   {
     case VTKInteractionModeZoom:
-      [self handleZoomPan:recognizer];
+      [self handleZoomDragAtViewPoint:point translation:translation state:state];
       break;
     case VTKInteractionModeTrackball:
-      [self handleTrackballPan:recognizer];
+      [self handleTrackballDragAtViewPoint:point state:state];
       break;
     default:
-      [self handlePanPan:recognizer];
+      [self handlePanDragAtViewPoint:point translation:translation state:state];
       break;
+  }
+
+  if (state == VTKGestureStateEnded || state == VTKGestureStateCancelled)
+  {
+    [self interactionDidEnd];
   }
 
   _renWin->Render();
 }
 
-- (void)handlePanPan:(UIPanGestureRecognizer*)recognizer
+- (void)handlePanDragAtViewPoint:(CGPoint)point
+                     translation:(CGPoint)translation
+                           state:(VTKGestureState)state
 {
-  CGPoint translation = [recognizer translationInView:recognizer.view];
-  CGFloat scale = recognizer.view.contentScaleFactor;
-  double t[2] = { scale * translation.x, -scale * translation.y };
+  double t[2] = { [self contentScaleFactor] * translation.x,
+                  [self contentScaleFactor] * -translation.y };
   _iren->SetTranslation(t);
 
-  switch (recognizer.state)
+  switch (state)
   {
-    case UIGestureRecognizerStateBegan:
+    case VTKGestureStateBegan:
       _iren->StartPanEvent();
       break;
-    case UIGestureRecognizerStateChanged:
+    case VTKGestureStateChanged:
       _iren->PanEvent();
       break;
-    case UIGestureRecognizerStateEnded:
-    case UIGestureRecognizerStateCancelled:
+    case VTKGestureStateEnded:
+    case VTKGestureStateCancelled:
       _iren->EndPanEvent();
       break;
     default:
@@ -249,20 +466,21 @@
   }
 }
 
-- (void)handleZoomPan:(UIPanGestureRecognizer*)recognizer
+- (void)handleZoomDragAtViewPoint:(CGPoint)point
+                      translation:(CGPoint)translation
+                            state:(VTKGestureState)state
 {
   vtkRenderer* ren = _renderer;
   if (!ren) return;
   vtkCamera* cam = ren->GetActiveCamera();
   if (!cam) return;
 
-  if (recognizer.state == UIGestureRecognizerStateBegan || !_zoomAnchorValid)
+  if (state == VTKGestureStateBegan || !_zoomAnchorValid)
   {
-    CGPoint p = [recognizer locationInView:recognizer.view];
-    CGFloat scale = recognizer.view.contentScaleFactor;
+    CGFloat scale = [self contentScaleFactor];
     int* vpSize = ren->GetSize();
-    _zoomAnchorDisplay[0] = (int)(p.x * scale);
-    _zoomAnchorDisplay[1] = vpSize[1] - (int)(p.y * scale); // Flip Y (iOS top-left → VTK bottom-left)
+    _zoomAnchorDisplay[0] = (int)(point.x * scale);
+    _zoomAnchorDisplay[1] = vpSize[1] - (int)(point.y * scale); // Flip Y (top-left → bottom-left)
 
     // Compute anchor world point at the focal-plane depth
     ren->SetDisplayPoint(_zoomAnchorDisplay[0], _zoomAnchorDisplay[1], 0);
@@ -288,17 +506,17 @@
 
     _zoomAnchorValid = YES;
 
-    if (recognizer.state == UIGestureRecognizerStateBegan)
+    if (state == VTKGestureStateBegan)
     {
       _iren->InvokeEvent(vtkCommand::StartInteractionEvent, nullptr);
     }
     return;
   }
 
-  CGPoint deltaPt = [recognizer translationInView:recognizer.view];
-  double factor = 1.0 - deltaPt.y / 200.0;
+  double deltaY = translation.y - _zoomLastTranslationY;
+  _zoomLastTranslationY = translation.y;
+  double factor = 1.0 - deltaY / 200.0;
   factor = vtkMath::ClampValue(factor, 0.01, 100.0);
-  [recognizer setTranslation:CGPointZero inView:recognizer.view];
 
   const BOOL didZoom = (fabs(factor - 1.0) > 1e-6);
 
@@ -341,14 +559,14 @@
     ren->ResetCameraClippingRange();
   }
 
-  switch (recognizer.state)
+  switch (state)
   {
-    case UIGestureRecognizerStateChanged:
+    case VTKGestureStateChanged:
       if (didZoom)
         _iren->InvokeEvent(vtkCommand::InteractionEvent, nullptr);
       break;
-    case UIGestureRecognizerStateEnded:
-    case UIGestureRecognizerStateCancelled:
+    case VTKGestureStateEnded:
+    case VTKGestureStateCancelled:
       _iren->InvokeEvent(vtkCommand::EndInteractionEvent, nullptr);
       _zoomAnchorValid = NO;
       break;
@@ -357,18 +575,18 @@
   }
 }
 
-- (void)handleTrackballPan:(UIPanGestureRecognizer*)recognizer
+- (void)handleTrackballDragAtViewPoint:(CGPoint)point state:(VTKGestureState)state
 {
-  switch (recognizer.state)
+  switch (state)
   {
-    case UIGestureRecognizerStateBegan:
+    case VTKGestureStateBegan:
       _iren->InvokeEvent(vtkCommand::LeftButtonPressEvent, nullptr);
       break;
-    case UIGestureRecognizerStateChanged:
+    case VTKGestureStateChanged:
       _iren->InvokeEvent(vtkCommand::MouseMoveEvent, nullptr);
       break;
-    case UIGestureRecognizerStateEnded:
-    case UIGestureRecognizerStateCancelled:
+    case VTKGestureStateEnded:
+    case VTKGestureStateCancelled:
       _iren->InvokeEvent(vtkCommand::LeftButtonReleaseEvent, nullptr);
       break;
     default:
@@ -376,50 +594,114 @@
   }
 }
 
-- (void)handleRotation:(UIRotationGestureRecognizer*)recognizer
+- (void)handlePinchScale:(CGFloat)scale state:(VTKGestureState)state
 {
-  [self forwardTouchPosition:recognizer];
+  if (state == VTKGestureStateBegan)
+  {
+    [self interactionDidStart];
+  }
 
-  double angle = -[recognizer rotation] * 180.0 / M_PI;
+  scale = MAX(-3.0, MIN(3.0, scale));
+  _iren->SetScale(scale);
+
+  switch (state)
+  {
+    case VTKGestureStateBegan:
+      _iren->StartPinchEvent();
+      break;
+    case VTKGestureStateChanged:
+      _iren->PinchEvent();
+      break;
+    case VTKGestureStateEnded:
+    case VTKGestureStateCancelled:
+      _iren->EndPinchEvent();
+      break;
+    default:
+      break;
+  }
+
+  if (state == VTKGestureStateEnded || state == VTKGestureStateCancelled)
+  {
+    [self interactionDidEnd];
+  }
+
+  _renWin->Render();
+}
+
+- (void)handleRotationAngle:(CGFloat)angle state:(VTKGestureState)state
+{
+  if (state == VTKGestureStateBegan)
+  {
+    [self interactionDidStart];
+  }
+
   _iren->SetRotation(angle);
 
-  switch (recognizer.state)
+  switch (state)
   {
-    case UIGestureRecognizerStateBegan:
+    case VTKGestureStateBegan:
       _iren->StartRotateEvent();
       break;
-    case UIGestureRecognizerStateChanged:
+    case VTKGestureStateChanged:
       _iren->RotateEvent();
       break;
-    case UIGestureRecognizerStateEnded:
-    case UIGestureRecognizerStateCancelled:
+    case VTKGestureStateEnded:
+    case VTKGestureStateCancelled:
       _iren->EndRotateEvent();
       break;
     default:
       break;
   }
 
+  if (state == VTKGestureStateEnded || state == VTKGestureStateCancelled)
+  {
+    [self interactionDidEnd];
+  }
+
   _renWin->Render();
 }
 
-- (BOOL)gestureRecognizer:(UIGestureRecognizer*)a
-    shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer*)b
+- (void)handleScrollDeltaY:(CGFloat)deltaY
 {
-  BOOL pinchOrRotation =
-    ([a isKindOfClass:[UIPinchGestureRecognizer class]] ||
-     [a isKindOfClass:[UIRotationGestureRecognizer class]]);
-  BOOL otherIsSame =
-    ([b isKindOfClass:[UIPinchGestureRecognizer class]] ||
-     [b isKindOfClass:[UIRotationGestureRecognizer class]]);
-  return pinchOrRotation && otherIsSame;
+  if (deltaY > 0)
+  {
+    _iren->InvokeEvent(vtkCommand::MouseWheelForwardEvent, nullptr);
+  }
+  else if (deltaY < 0)
+  {
+    _iren->InvokeEvent(vtkCommand::MouseWheelBackwardEvent, nullptr);
+  }
+  _renWin->Render();
 }
 
+- (void)interactionDidStart
+{
+}
+
+- (void)interactionDidEnd
+{
+}
+
+#pragma mark - Layout
+
+#if TARGET_OS_OSX
+- (void)viewDidLayout
+{
+  [super viewDidLayout];
+  [self updateRenderSize];
+}
+#else
 - (void)viewDidLayoutSubviews
 {
   [super viewDidLayoutSubviews];
-  CGFloat scale = [UIScreen mainScreen].nativeScale;
-  int w = (int)lround(scale * self.view.bounds.size.width);
-  int h = (int)lround(scale * self.view.bounds.size.height);
+  [self updateRenderSize];
+}
+#endif
+
+- (void)updateRenderSize
+{
+  int w = (int)lround([self contentScaleFactor] * self.view.bounds.size.width);
+  int h = (int)lround([self contentScaleFactor] * self.view.bounds.size.height);
   _renWin->SetSize(w, h);
   _iren->UpdateSize(w, h);
   _renWin->Render();

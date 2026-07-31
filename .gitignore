@@ -4,6 +4,7 @@ xcuserdata
 
 dawn
 build
+build-mac
 build_ios
 build_ios_metal
 build_macos_metal

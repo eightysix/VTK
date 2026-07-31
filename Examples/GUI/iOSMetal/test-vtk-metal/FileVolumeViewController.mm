@@ -8,7 +8,12 @@
 #include "vtkColorTransferFunction.h"
 #include "vtkPiecewiseFunction.h"
 #include "vtkMetalRenderer.h"
-#include "vtkIOSMetalRenderWindow.h"
+#include "vtkRenderWindow.h"
+#if TARGET_OS_OSX
+#import <Cocoa/Cocoa.h>
+#else
+#import <UIKit/UIKit.h>
+#endif
 
 @interface FileVolumeViewController ()
 @property (nonatomic, strong, readwrite) VolumeRenderingPreset *currentPreset;
@@ -41,14 +46,30 @@
 
 - (void)loadFile:(id)sender
 {
+#if TARGET_OS_OSX
+  NSOpenPanel* panel = [NSOpenPanel openPanel];
+  panel.canChooseFiles = YES;
+  panel.canChooseDirectories = [[self documentTypes] containsObject:@"public.folder"];
+  panel.allowsMultipleSelection = NO;
+  if ([panel runModal] == NSModalResponseOK)
+  {
+    NSURL* url = panel.URL;
+    if (url)
+    {
+      [self loadFromURL:url];
+    }
+  }
+#else
   UIDocumentPickerViewController *picker =
       [[UIDocumentPickerViewController alloc] initWithDocumentTypes:[self documentTypes]
-                                                              inMode:UIDocumentPickerModeOpen];
+                                                               inMode:UIDocumentPickerModeOpen];
   picker.delegate = self;
   picker.allowsMultipleSelection = NO;
   [self presentViewController:picker animated:YES completion:nil];
+#endif
 }
 
+#if !TARGET_OS_OSX
 - (void)documentPicker:(UIDocumentPickerViewController *)controller
     didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls
 {
@@ -69,6 +90,7 @@
 - (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller
 {
 }
+#endif
 
 - (void)setupVTKPipeline
 {
@@ -110,7 +132,7 @@
   property->SetScalarOpacity(opacityFunc);
   property->SetInterpolationTypeToLinear();
 
-  static_cast<vtkIOSMetalRenderWindow *>([self renderWindow])->Render();
+  static_cast<vtkRenderWindow *>([self renderWindow])->Render();
 }
 
 #pragma mark - Preset Cycling

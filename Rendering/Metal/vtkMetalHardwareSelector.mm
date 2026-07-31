@@ -217,4 +217,119 @@ int vtkMetalHardwareSelector::Convert(int xRelative, int yRelative, unsigned cha
   return 0;
 }
 
+//------------------------------------------------------------------------------
+vtkHardwareSelector::PixelInformation vtkMetalHardwareSelector::GetPixelInformation(
+  const unsigned int inDisplayPosition[2], int maxDist, unsigned int outSelectedPosition[2])
+{
+  // Base case: single pixel, decoded from the single-pass ID buffer.
+  const unsigned int maxDistance = (maxDist < 0) ? 0 : static_cast<unsigned int>(maxDist);
+  if (maxDistance == 0)
+  {
+    outSelectedPosition[0] = inDisplayPosition[0];
+    outSelectedPosition[1] = inDisplayPosition[1];
+    if (inDisplayPosition[0] < this->Area[0] || inDisplayPosition[0] > this->Area[2] ||
+      inDisplayPosition[1] < this->Area[1] || inDisplayPosition[1] > this->Area[3])
+    {
+      return PixelInformation();
+    }
+
+    const unsigned int displayPosition[2] = { inDisplayPosition[0] - this->Area[0],
+      inDisplayPosition[1] - this->Area[1] };
+
+    int actorId = this->Convert(displayPosition[0], displayPosition[1], this->PixBuffer[ACTOR_PASS]);
+    if (actorId <= 0)
+    {
+      // the pixel did not hit any actor.
+      return PixelInformation();
+    }
+
+    PixelInformation info;
+    info.Valid = true;
+    info.PropID = actorId;
+    info.Prop = this->GetPropFromID(actorId);
+    if (this->ActorPassOnly)
+    {
+      return info;
+    }
+
+    const int compositeId =
+      this->Convert(displayPosition[0], displayPosition[1], this->PixBuffer[COMPOSITE_INDEX_PASS]);
+    if (compositeId < 0 || compositeId > 0xffffff)
+    {
+      // the pixel did not hit any composite.
+      return PixelInformation();
+    }
+    info.CompositeID = static_cast<unsigned int>(compositeId);
+
+    int low24 =
+      this->Convert(displayPosition[0], displayPosition[1], this->PixBuffer[CELL_ID_LOW24]);
+    int high24 =
+      this->Convert(displayPosition[0], displayPosition[1], this->PixBuffer[CELL_ID_HIGH24]);
+    info.AttributeID = this->GetID(low24, high24, 0);
+
+    info.ProcessID = this->Convert(displayPosition[0], displayPosition[1], this->PixBuffer[PROCESS_PASS]);
+    return info;
+  }
+
+  // Iterate over successively growing boxes around the queried pixel.
+  unsigned int dispPos[2] = { inDisplayPosition[0], inDisplayPosition[1] };
+  unsigned int curPos[2] = { 0, 0 };
+  PixelInformation info;
+  info = this->GetPixelInformation(inDisplayPosition, 0, outSelectedPosition);
+  if (info.Valid)
+  {
+    return info;
+  }
+  for (unsigned int dist = 1; dist < maxDistance; ++dist)
+  {
+    // Vertical sides of box.
+    for (unsigned int y = ((dispPos[1] > dist) ? (dispPos[1] - dist) : 0);
+         y <= dispPos[1] + dist; ++y)
+    {
+      curPos[1] = y;
+      if (dispPos[0] >= dist)
+      {
+        curPos[0] = dispPos[0] - dist;
+        info = this->GetPixelInformation(curPos, 0, outSelectedPosition);
+        if (info.Valid)
+        {
+          return info;
+        }
+      }
+      curPos[0] = dispPos[0] + dist;
+      info = this->GetPixelInformation(curPos, 0, outSelectedPosition);
+      if (info.Valid)
+      {
+        return info;
+      }
+    }
+    // Horizontal sides of box.
+    for (unsigned int x = ((dispPos[0] >= dist) ? (dispPos[0] - (dist - 1)) : 0);
+         x <= dispPos[0] + (dist - 1); ++x)
+    {
+      curPos[0] = x;
+      if (dispPos[1] >= dist)
+      {
+        curPos[1] = dispPos[1] - dist;
+        info = this->GetPixelInformation(curPos, 0, outSelectedPosition);
+        if (info.Valid)
+        {
+          return info;
+        }
+      }
+      curPos[1] = dispPos[1] + dist;
+      info = this->GetPixelInformation(curPos, 0, outSelectedPosition);
+      if (info.Valid)
+      {
+        return info;
+      }
+    }
+  }
+
+  // nothing hit.
+  outSelectedPosition[0] = inDisplayPosition[0];
+  outSelectedPosition[1] = inDisplayPosition[1];
+  return PixelInformation();
+}
+
 VTK_ABI_NAMESPACE_END

@@ -33,6 +33,12 @@ if(APPLE_IOS)
     OVERRIDE vtkIOSMetalRenderWindow)
   list(APPEND sources vtkIOSMetalRenderWindow.mm)
   list(APPEND headers vtkIOSMetalRenderWindow.h)
+elseif(APPLE)
+  vtk_object_factory_declare(
+    BASE vtkRenderWindow
+    OVERRIDE vtkCocoaMetalRenderWindow)
+  list(APPEND sources vtkCocoaMetalRenderWindow.mm)
+  list(APPEND headers vtkCocoaMetalRenderWindow.h)
 endif()
 
 # Metal shader compilation - embed shader source as C++ string constant
@@ -63,6 +69,13 @@ vtk_module_add_module(
 # Link Metal framework
 if(APPLE_IOS)
   vtk_module_link(VTK::RenderingMetal PUBLIC "-framework Metal" "-framework QuartzCore" "-framework UIKit")
+  if(VTK_REQUIRED_OBJCXX_FLAGS)
+    set_source_files_properties(
+      ${sources}
+      PROPERTIES COMPILE_FLAGS "${VTK_REQUIRED_OBJCXX_FLAGS}")
+  endif()
+elseif(APPLE)
+  vtk_module_link(VTK::RenderingMetal PUBLIC "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
   if(VTK_REQUIRED_OBJCXX_FLAGS)
     set_source_files_properties(
       ${sources}

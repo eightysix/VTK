@@ -8,7 +8,6 @@
 #include "vtkDICOMReader.h"
 #include "vtkImageData.h"
 #include "vtkImageShiftScale.h"
-#include "vtkIOSMetalRenderWindow.h"
 #include "vtkMath.h"
 #include "vtkMetalGPUVolumeRayCastMapper.h"
 #include "vtkMetalRenderer.h"
@@ -16,13 +15,10 @@
 #include "vtkPiecewiseFunction.h"
 #include "vtkPlane.h"
 #include "vtkRenderer.h"
+#include "vtkRenderWindow.h"
 #include "vtkStringArray.h"
 #include "vtkVolume.h"
 #include "vtkVolumeProperty.h"
-
-@interface VTKMetalBaseViewController (ClipPlaneSupp)
-- (void)handlePan:(UIPanGestureRecognizer*)recognizer;
-@end
 
 @interface DICOMVolumeViewController ()
 {
@@ -35,7 +31,10 @@
   vtkSmartPointer<vtkPiecewiseFunction> _savedOTF;
   double _windowWidth;
   double _windowLevel;
+
+  CGPoint _dragLastTranslation;
 }
+- (CGPoint)dragDeltaForTranslation:(CGPoint)t state:(VTKGestureState)state;
 @end
 
 @implementation DICOMVolumeViewController
@@ -102,7 +101,7 @@
   [self applyCurrentPreset];
 
   renderer->ResetCamera();
-  static_cast<vtkIOSMetalRenderWindow *>([self renderWindow])->Render();
+  static_cast<vtkRenderWindow *>([self renderWindow])->Render();
 }
 
 - (double)rescale:(double)hu
@@ -160,56 +159,99 @@
   prop->SetColor(newCTF);
   prop->SetScalarOpacity(newOTF);
 
-  static_cast<vtkIOSMetalRenderWindow*>([self renderWindow])->Render();
+  static_cast<vtkRenderWindow*>([self renderWindow])->Render();
 }
 
-- (void)handleWindowLevelPan:(UIPanGestureRecognizer*)recognizer
+- (CGPoint)dragDeltaForTranslation:(CGPoint)t state:(VTKGestureState)state
 {
-  switch (recognizer.state)
+  CGPoint delta;
+  if (state == VTKGestureStateBegan)
   {
-    case UIGestureRecognizerStateBegan:
+    _dragLastTranslation = t;
+    delta = CGPointZero;
+  }
+  else
+  {
+    delta = CGPointMake(t.x - _dragLastTranslation.x, t.y - _dragLastTranslation.y);
+    _dragLastTranslation = t;
+  }
+  return delta;
+}
+
+- (void)handleWindowLevelDragAtViewPoint:(CGPoint)point
+                             translation:(CGPoint)translation
+                                   state:(VTKGestureState)state
+{
+  switch (state)
+  {
+    case VTKGestureStateBegan:
       [self interactionDidStart];
+      _dragLastTranslation = translation;
       return;
-    case UIGestureRecognizerStateChanged:
+    case VTKGestureStateChanged:
     {
       const double kScale = 0.5;
-      CGPoint t = [recognizer translationInView:recognizer.view];
-      double dW = t.x * kScale;
-      double dL = -t.y * kScale;
+      CGPoint delta = [self dragDeltaForTranslation:translation state:state];
+      double dW = delta.x * kScale;
+      double dL = -delta.y * kScale;
       [self applyWindowLevelWithWidth:_windowWidth + dW level:_windowLevel + dL];
-      [recognizer setTranslation:CGPointZero inView:recognizer.view];
       break;
     }
-    case UIGestureRecognizerStateEnded:
-    case UIGestureRecognizerStateCancelled:
+    case VTKGestureStateEnded:
+    case VTKGestureStateCancelled:
       [self interactionDidEnd];
       return;
     default:
       return;
   }
 
-  static_cast<vtkIOSMetalRenderWindow*>([self renderWindow])->Render();
+  static_cast<vtkRenderWindow*>([self renderWindow])->Render();
 }
 
 #pragma mark - Clipping Plane (Scroll Slices)
 
-- (void)handlePan:(UIPanGestureRecognizer*)recognizer
+- (void)handleDragAtViewPoint:(CGPoint)point
+                  translation:(CGPoint)translation
+                        state:(VTKGestureState)state
 {
   if (self.interactionMode == VTKInteractionModeScrollSlices)
   {
-    [self handleScrollSlicesPan:recognizer];
+    [self handleScrollSlicesDragAtViewPoint:point translation:translation state:state];
   }
   else if (self.interactionMode == VTKInteractionModeWindowLevel)
   {
-    [self handleWindowLevelPan:recognizer];
+    [self handleWindowLevelDragAtViewPoint:point translation:translation state:state];
   }
   else
   {
-    [super handlePan:recognizer];
+    [super handleDragAtViewPoint:point translation:translation state:state];
   }
 }
 
-- (void)handleScrollSlicesPan:(UIPanGestureRecognizer*)recognizer
+- (void)handleScrollDeltaY:(CGFloat)deltaY
+{
+  if (self.interactionMode == VTKInteractionModeScrollSlices)
+  {
+    if (!_clipPlane || !_volumeData) return;
+
+    vtkRenderer* ren = static_cast<vtkMetalRenderer*>([self renderer]);
+    vtkCamera* cam = ren ? ren->GetActiveCamera() : nullptr;
+    if (!_clipPlaneHasUserPos && cam)
+    {
+      [self prepareVRClippingPlaneWithCamera:cam];
+    }
+    [self translateVRClippingPlane:deltaY];
+    static_cast<vtkRenderWindow*>([self renderWindow])->Render();
+  }
+  else
+  {
+    [super handleScrollDeltaY:deltaY];
+  }
+}
+
+- (void)handleScrollSlicesDragAtViewPoint:(CGPoint)point
+                              translation:(CGPoint)translation
+                                    state:(VTKGestureState)state
 {
   if (!_clipPlane || !_volumeData) return;
 
@@ -218,28 +260,27 @@
   vtkCamera* cam = ren->GetActiveCamera();
   if (!cam) return;
 
-  switch (recognizer.state)
+  switch (state)
   {
-    case UIGestureRecognizerStateBegan:
+    case VTKGestureStateBegan:
       [self interactionDidStart];
       [self prepareVRClippingPlaneWithCamera:cam];
       break;
-    case UIGestureRecognizerStateChanged:
+    case VTKGestureStateChanged:
     {
-      CGPoint translation = [recognizer translationInView:recognizer.view];
-      [self translateVRClippingPlane:translation.y];
-      [recognizer setTranslation:CGPointZero inView:recognizer.view];
+      CGPoint delta = [self dragDeltaForTranslation:translation state:state];
+      [self translateVRClippingPlane:delta.y];
       break;
     }
-    case UIGestureRecognizerStateEnded:
-    case UIGestureRecognizerStateCancelled:
+    case VTKGestureStateEnded:
+    case VTKGestureStateCancelled:
       [self interactionDidEnd];
       break;
     default:
       break;
   }
 
-  static_cast<vtkIOSMetalRenderWindow*>([self renderWindow])->Render();
+  static_cast<vtkRenderWindow*>([self renderWindow])->Render();
 }
 
 - (void)prepareVRClippingPlaneWithCamera:(vtkCamera*)cam
