@@ -25,7 +25,11 @@ static const void* const kVtkCocoaMetalViewEventDelegateKey =
     [self setWantsLayer:YES];
     CAMetalLayer* layer = [CAMetalLayer layer];
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+#ifdef VTK_METAL_ENABLE_COLOR_READBACK
+    layer.framebufferOnly = NO;
+#else
     layer.framebufferOnly = YES;
+#endif
     layer.opaque = NO;
     [self setLayer:layer];
     self.allowedTouchTypes = NSTouchTypeMaskDirect;
@@ -127,7 +131,11 @@ NSView* vtkCocoaMetalRenderWindow::GetViewId()
     metalLayer.device = (id<MTLDevice>)this->MetalDevice;
     metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     metalLayer.contentsScale = scale;
+#ifdef VTK_METAL_ENABLE_COLOR_READBACK
+    metalLayer.framebufferOnly = NO;
+#else
     metalLayer.framebufferOnly = YES;
+#endif
     metalLayer.drawableSize = CGSizeMake(this->Size[0], this->Size[1]);
 
     // Drop the standalone layer created by vtkMetalRenderWindow::CreateMetalLayer

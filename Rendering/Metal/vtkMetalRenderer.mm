@@ -618,6 +618,33 @@ void vtkMetalRenderer::DeviceRender()
       }
     }
 
+#ifdef VTK_METAL_ENABLE_COLOR_READBACK
+    // === Phase 4: Copy the resolved color buffer to a shared texture so the
+    // CPU can read it back (vtkRenderWindow::GetPixelData and the image-based
+    // regression tests). The blit is scheduled before present on this same
+    // command buffer, so it always captures the final frame. Compiled only
+    // into test builds so production frames do not pay for this copy.
+    {
+      id<MTLTexture> colorCopyTex = (__bridge id<MTLTexture>)renWin->ColorCopyTexture;
+      if (colorCopyTex)
+      {
+        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+        blit.label = @"VTK Color Readback Copy";
+        [blit copyFromTexture:drawable.texture
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:MTLOriginMake(0, 0, 0)
+                   sourceSize:MTLSizeMake((NSUInteger)drawable.texture.width,
+                         (NSUInteger)drawable.texture.height, 1)
+                    toTexture:colorCopyTex
+             destinationSlice:0
+             destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+      }
+    }
+#endif
+
     // Commit and present
     [commandBuffer presentDrawable:drawable];
     [commandBuffer commit];

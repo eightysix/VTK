@@ -5,8 +5,9 @@
 //
 // NOTE: the Metal 2D fragment shader only outputs color (no picking IDs), and
 // vtkMetalRenderer::DeviceRender does not currently drive RenderOverlay(), so
-// this is a smoke test: it verifies that a 2D mapper/actor can be added to the
-// scene and that the 3D geometry still renders.
+// the overlay quad does not appear in the image. The test verifies that a 2D
+// mapper/actor can be added to the scene, that the 3D geometry still renders,
+// and uses image-baseline regression on the 3D output.
 
 #include "TestMetalHelpers.h"
 
@@ -95,5 +96,7 @@ int TestMetalPolyDataMapper2D(int argc, char* argv[])
     return EXIT_FAILURE;
   }
 
-  return EXIT_SUCCESS;
+  // Image-based regression against a baseline (3D geometry; the overlay is not
+  // driven by DeviceRender yet, so it does not appear in the image).
+  return vtkMetalTesting::RegressionExitCode(vtkRegressionTestImage(renWin));
 }

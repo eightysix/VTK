@@ -101,5 +101,6 @@ int TestMetalActorProperty(int argc, char* argv[])
     return EXIT_FAILURE;
   }
 
-  return EXIT_SUCCESS;
+  // Image-based regression against a baseline (final translucent-surface state).
+  return vtkMetalTesting::RegressionExitCode(vtkRegressionTestImage(renWin));
 }

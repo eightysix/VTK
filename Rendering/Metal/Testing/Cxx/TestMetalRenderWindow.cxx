@@ -9,6 +9,7 @@
 #include "vtkUnsignedIntArray.h"
 
 #include "vtkConeSource.h"
+#include "vtkRegressionTestImage.h"
 #include "vtkRenderer.h"
 
 #include <cstring>
@@ -16,8 +17,6 @@
 
 int TestMetalRenderWindow(int argc, char* argv[])
 {
-  (void)argc;
-  (void)argv;
 
   vtkNew<vtkCocoaMetalRenderWindow> renWin;
   renWin->SetSize(400, 400);
@@ -93,5 +92,11 @@ int TestMetalRenderWindow(int argc, char* argv[])
     return EXIT_FAILURE;
   }
 
-  return EXIT_SUCCESS;
+  // Image-based regression against a baseline (the cone scene).
+  const int retVal = vtkRegressionTestImage(renWin);
+  if (retVal == vtkTesting::NOT_RUN || retVal == vtkTesting::DO_INTERACTOR)
+  {
+    return EXIT_SUCCESS;
+  }
+  return (retVal == vtkTesting::PASSED) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

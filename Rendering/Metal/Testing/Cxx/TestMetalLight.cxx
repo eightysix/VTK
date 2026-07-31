@@ -110,5 +110,6 @@ int TestMetalLight(int argc, char* argv[])
     }
   }
 
-  return EXIT_SUCCESS;
+  // Image-based regression against a baseline (final light setup).
+  return vtkMetalTesting::RegressionExitCode(vtkRegressionTestImage(renWin));
 }

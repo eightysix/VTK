@@ -74,5 +74,6 @@ int TestMetalPointRender(int argc, char* argv[])
     return EXIT_FAILURE;
   }
 
-  return EXIT_SUCCESS;
+  // Image-based regression against a baseline (final thick-line state).
+  return vtkMetalTesting::RegressionExitCode(vtkRegressionTestImage(renWin));
 }

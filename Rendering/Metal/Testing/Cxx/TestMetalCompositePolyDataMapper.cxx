@@ -140,5 +140,6 @@ int TestMetalCompositePolyDataMapper(int argc, char* argv[])
     return EXIT_FAILURE;
   }
 
-  return EXIT_SUCCESS;
+  // Image-based regression against a baseline (final rotated frame).
+  return vtkMetalTesting::RegressionExitCode(vtkRegressionTestImage(renWin));
 }

@@ -8,9 +8,11 @@
 #include "vtkRendererCollection.h"
 #include "vtkCommand.h"
 #include "vtkUnsignedIntArray.h"
+#include "vtkUnsignedCharArray.h"
 #include "vtkMetalShaders.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <mutex>
 #include <vector>
 
@@ -86,7 +88,15 @@ void vtkMetalRenderWindow::CreateMetalLayer()
     CAMetalLayer* layer = [CAMetalLayer layer];
     layer.device = (id<MTLDevice>)this->MetalDevice;
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+#ifdef VTK_METAL_ENABLE_COLOR_READBACK
+    // NO so the drawable texture can be blitted into the shared color-copy
+    // texture used for CPU read-back (GetPixelData / image regression tests).
+    layer.framebufferOnly = NO;
+#else
+    // Production default: lets the system optimize the drawable (it is only
+    // ever presented, never read back).
     layer.framebufferOnly = YES;
+#endif
     layer.opaque = NO;
 #if TARGET_OS_IOS
     layer.contentsScale = [UIScreen mainScreen].nativeScale;
@@ -169,6 +179,12 @@ void vtkMetalRenderWindow::Finalize()
   {
     [(id)this->IdsTexture release];
     this->IdsTexture = nullptr;
+  }
+
+  if (this->ColorCopyTexture)
+  {
+    [(id)this->ColorCopyTexture release];
+    this->ColorCopyTexture = nullptr;
   }
 
   this->DestroyMultisampleAttachments();
@@ -299,6 +315,36 @@ void vtkMetalRenderWindow::RecreateIdsTexture()
 }
 
 //------------------------------------------------------------------------------
+void vtkMetalRenderWindow::RecreateColorCopyTexture()
+{
+#ifdef VTK_METAL_ENABLE_COLOR_READBACK
+  if (this->ColorCopyTexture)
+  {
+    [(id)this->ColorCopyTexture release];
+    this->ColorCopyTexture = nullptr;
+  }
+
+  @autoreleasepool
+  {
+    id<MTLDevice> device = (id<MTLDevice>)this->MetalDevice;
+    MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                   width:this->Size[0]
+                                                                                  height:this->Size[1]
+                                                                               mipmapped:NO];
+    // Shared storage allows synchronous CPU reads via getBytes after the GPU
+    // frame completes. RenderTarget/ShaderRead usage keeps it a valid blit
+    // destination.
+    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    desc.storageMode = MTLStorageModeShared;
+
+    // newTextureWithDescriptor returns +1 (new rule); member owns it directly.
+    id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+    this->ColorCopyTexture = (void*)tex;
+  }
+#endif
+}
+
+//------------------------------------------------------------------------------
 int vtkMetalRenderWindow::GetEffectiveSampleCount()
 {
   return (this->MultiSamples > 1) ? this->MultiSamples : 1;
@@ -403,6 +449,15 @@ void vtkMetalRenderWindow::Render()
       {
         this->RecreateIdsTexture();
       }
+
+#ifdef VTK_METAL_ENABLE_COLOR_READBACK
+      id<MTLTexture> colorCopyTex = (id<MTLTexture>)this->ColorCopyTexture;
+      if (!colorCopyTex || colorCopyTex.width != (NSUInteger)this->Size[0] ||
+          colorCopyTex.height != (NSUInteger)this->Size[1])
+      {
+        this->RecreateColorCopyTexture();
+      }
+#endif
 
       // Recreate multisample attachments when size or sample count changes
       int effectiveSamples = this->GetEffectiveSampleCount();
@@ -642,6 +697,193 @@ void vtkMetalRenderWindow::GetIdsData(int x1, int y1, int x2, int y2,
       }
     }
   }
+}
+
+//------------------------------------------------------------------------------
+int vtkMetalRenderWindow::ReadColorCopyData(
+  int x, int y, int width, int height, int ncomp, void* dest)
+{
+#ifndef VTK_METAL_ENABLE_COLOR_READBACK
+  (void)x;
+  (void)y;
+  (void)width;
+  (void)height;
+  (void)ncomp;
+  (void)dest;
+  return 0;
+#else
+  if (!dest)
+  {
+    return 0;
+  }
+
+  @autoreleasepool
+  {
+    id<MTLTexture> colorTex = (__bridge id<MTLTexture>)this->ColorCopyTexture;
+    if (!colorTex)
+    {
+      return 0;
+    }
+
+    // Clamp to texture bounds
+    int texW = static_cast<int>(colorTex.width);
+    int texH = static_cast<int>(colorTex.height);
+    int xMin = std::max(0, x);
+    int yMin = std::max(0, y);
+    int xMax = std::min(texW - 1, x + width - 1);
+    int yMax = std::min(texH - 1, y + height - 1);
+
+    int w = xMax - xMin + 1;
+    int h = yMax - yMin + 1;
+    if (w <= 0 || h <= 0)
+    {
+      return 0;
+    }
+
+    // Wait for the frame whose blit wrote ColorCopyTexture to finish before
+    // reading it back (getBytes would otherwise race the GPU).
+    this->WaitForCompletion();
+
+    // Read the texture region. MTLStorageModeShared allows direct CPU access.
+    // Region in texture coordinates: origin is top-left for Metal.
+    MTLRegion region = MTLRegionMake2D(xMin, yMin, w, h);
+    std::vector<uint8_t> texData(w * h * 4);
+    [colorTex getBytes:texData.data() bytesPerRow:w * 4 fromRegion:region mipmapLevel:0];
+
+    // Copy into the output array with Y-flip (Metal top-left → VTK bottom-left)
+    // and BGRA → RGB(A) channel conversion.
+    unsigned char* out = static_cast<unsigned char*>(dest);
+    for (int row = 0; row < h; ++row)
+    {
+      int srcY = h - 1 - row; // flip Y
+      for (int col = 0; col < w; ++col)
+      {
+        const uint8_t* src = &texData[(srcY * w + col) * 4];
+        unsigned char* dst = &out[(row * w + col) * ncomp];
+        dst[0] = src[2]; // B
+        dst[1] = src[1]; // G
+        dst[2] = src[0]; // R
+        if (ncomp == 4)
+        {
+          dst[3] = src[3]; // A
+        }
+      }
+    }
+    return 1;
+  }
+#endif
+}
+
+//------------------------------------------------------------------------------
+unsigned char* vtkMetalRenderWindow::GetPixelData(
+  int x1, int y1, int x2, int y2, int front, int right)
+{
+  (void)front;
+  (void)right;
+
+  int x_low = std::min(x1, x2);
+  int x_hi = std::max(x1, x2);
+  int y_low = std::min(y1, y2);
+  int y_hi = std::max(y1, y2);
+
+  int width = (x_hi - x_low) + 1;
+  int height = (y_hi - y_low) + 1;
+
+  unsigned char* data = new unsigned char[width * height * 3];
+  if (!this->ReadColorCopyData(x_low, y_low, width, height, 3, data))
+  {
+    // No color-copy texture available (e.g. no frame rendered yet): return a
+    // zeroed image rather than null so callers can still consume the buffer.
+    std::fill(data, data + width * height * 3, 0);
+  }
+  return data;
+}
+
+//------------------------------------------------------------------------------
+int vtkMetalRenderWindow::GetPixelData(
+  int x1, int y1, int x2, int y2, int front, vtkUnsignedCharArray* data, int right)
+{
+  (void)front;
+  (void)right;
+
+  if (!data)
+  {
+    return 0;
+  }
+
+  int x_low = std::min(x1, x2);
+  int x_hi = std::max(x1, x2);
+  int y_low = std::min(y1, y2);
+  int y_hi = std::max(y1, y2);
+
+  int width = (x_hi - x_low) + 1;
+  int height = (y_hi - y_low) + 1;
+  int size = 3 * width * height;
+
+  data->SetNumberOfComponents(3);
+  data->SetNumberOfValues(size);
+
+  if (!this->ReadColorCopyData(x_low, y_low, width, height, 3, data->GetPointer(0)))
+  {
+    std::fill(data->GetPointer(0), data->GetPointer(0) + size, 0);
+    return 0;
+  }
+  return 1;
+}
+
+//------------------------------------------------------------------------------
+unsigned char* vtkMetalRenderWindow::GetRGBACharPixelData(
+  int x1, int y1, int x2, int y2, int front, int right)
+{
+  (void)front;
+  (void)right;
+
+  int x_low = std::min(x1, x2);
+  int x_hi = std::max(x1, x2);
+  int y_low = std::min(y1, y2);
+  int y_hi = std::max(y1, y2);
+
+  int width = (x_hi - x_low) + 1;
+  int height = (y_hi - y_low) + 1;
+
+  unsigned char* data = new unsigned char[width * height * 4];
+  if (!this->ReadColorCopyData(x_low, y_low, width, height, 4, data))
+  {
+    std::fill(data, data + width * height * 4, 0);
+  }
+  return data;
+}
+
+//------------------------------------------------------------------------------
+int vtkMetalRenderWindow::GetRGBACharPixelData(
+  int x1, int y1, int x2, int y2, int front, vtkUnsignedCharArray* data, int right)
+{
+  (void)front;
+  (void)right;
+
+  if (!data)
+  {
+    return 0;
+  }
+
+  int x_low = std::min(x1, x2);
+  int x_hi = std::max(x1, x2);
+  int y_low = std::min(y1, y2);
+  int y_hi = std::max(y1, y2);
+
+  int width = (x_hi - x_low) + 1;
+  int height = (y_hi - y_low) + 1;
+  int size = 4 * width * height;
+
+  data->SetNumberOfComponents(4);
+  data->SetNumberOfValues(size);
+
+  if (!this->ReadColorCopyData(x_low, y_low, width, height, 4, data->GetPointer(0)))
+  {
+    std::fill(data->GetPointer(0), data->GetPointer(0) + size, 0);
+    return 0;
+  }
+  return 1;
 }
 
 VTK_ABI_NAMESPACE_END

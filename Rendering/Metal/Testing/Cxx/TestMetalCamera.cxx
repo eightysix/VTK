@@ -19,7 +19,6 @@ int TestMetalCamera(int argc, char* argv[])
 {
   (void)argc;
   (void)argv;
-
   vtkNew<vtkCocoaMetalRenderWindow> renWin;
   renWin->SetSize(400, 400);
   renWin->SetMultiSamples(0);
@@ -94,5 +93,6 @@ int TestMetalCamera(int argc, char* argv[])
     return EXIT_FAILURE;
   }
 
-  return EXIT_SUCCESS;
+  // Image-based regression against a baseline (final camera state).
+  return vtkMetalTesting::RegressionExitCode(vtkRegressionTestImage(renWin));
 }

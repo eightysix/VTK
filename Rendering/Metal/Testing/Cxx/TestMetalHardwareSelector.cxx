@@ -163,5 +163,6 @@ int TestMetalHardwareSelector(int argc, char* argv[])
     return EXIT_FAILURE;
   }
 
-  return EXIT_SUCCESS;
+  // Render a regular frame (selection ended) and compare against a baseline.
+  return vtkMetalTesting::RegressionExitCode(vtkRegressionTestImage(renWin));
 }

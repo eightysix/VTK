@@ -61,7 +61,11 @@ UIView* vtkIOSMetalRenderWindow::GetViewId()
     CAMetalLayer* metalLayer = (CAMetalLayer*)[view layer];
     metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     metalLayer.contentsScale = scale;
+#ifdef VTK_METAL_ENABLE_COLOR_READBACK
+    metalLayer.framebufferOnly = NO;
+#else
     metalLayer.framebufferOnly = YES;
+#endif
     this->MetalLayer = (void*)metalLayer;
   }
   return this->ViewId;

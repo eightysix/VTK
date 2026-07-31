@@ -3,17 +3,19 @@
 //
 // Shared verification helpers for the Metal rendering backend tests.
 //
-// Image-baseline regression is not supported yet (vtkMetalRenderWindow does not
-// implement GetPixelData()/ReadPixels()), so tests verify rendering indirectly
-// via the GPU picking IDs texture (GetIdsData), which is written every render
-// pass. Tests must call RenderAndWait() before any read-back so the read does
-// not race the GPU.
+// Image-baseline regression is supported via vtkMetalRenderWindow's color
+// read-back (GetPixelData()/GetRGBACharPixelData()): tests end with
+// vtkRegressionTestImage() and compare against PNG baselines. The GPU picking
+// IDs texture (GetIdsData) is still used for intermediate structural checks.
+// Tests must call RenderAndWait() before any read-back so the read does not
+// race the GPU.
 
 #ifndef TestMetalHelpers_h
 #define TestMetalHelpers_h
 
 #include "vtkCocoaMetalRenderWindow.h"
 #include "vtkNew.h"
+#include "vtkRegressionTestImage.h"
 #include "vtkRenderWindow.h"
 #include "vtkUnsignedIntArray.h"
 
@@ -22,6 +24,18 @@
 
 namespace vtkMetalTesting
 {
+
+// Map the vtkRegressionTestImage() return value to an exit code.
+// NOT_RUN (no -V baseline passed, e.g. direct invocation) and DO_INTERACTOR
+// are treated as success.
+inline int RegressionExitCode(int retVal)
+{
+  if (retVal == vtkTesting::NOT_RUN || retVal == vtkTesting::DO_INTERACTOR)
+  {
+    return EXIT_SUCCESS;
+  }
+  return (retVal == vtkTesting::PASSED) ? EXIT_SUCCESS : EXIT_FAILURE;
+}
 
 // Render a frame and block until the GPU finishes. Returns false if the
 // drawable acquisition or the command buffer creation failed.

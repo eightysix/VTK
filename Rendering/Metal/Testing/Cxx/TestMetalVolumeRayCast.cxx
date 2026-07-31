@@ -3,8 +3,9 @@
 
 // Test the Metal GPU volume ray-cast mapper.
 //
-// Note: the volume fragment shader only writes color (no picking IDs), so this
-// test is a smoke test: it verifies the render pipeline runs to completion.
+// The volume fragment shader only writes color (no picking IDs), so the
+// test uses image-baseline regression (vtkRegressionTestImage) to verify the
+// rendered output.
 
 #include "TestMetalHelpers.h"
 
@@ -60,8 +61,11 @@ int TestMetalVolumeRayCast(int argc, char* argv[])
   property->SetDiffuse(0.8);
   property->SetSpecular(0.3);
 
+  vtkNew<vtkMetalGPUVolumeRayCastMapper> mapper;
+  mapper->SetInputConnection(source->GetOutputPort());
+
   vtkNew<vtkVolume> volume;
-  volume->SetMapper(vtk::TakeSmartPointer(vtkMetalGPUVolumeRayCastMapper::New()));
+  volume->SetMapper(mapper);
   volume->SetProperty(property);
 
   renderer->AddVolume(volume);
@@ -87,5 +91,6 @@ int TestMetalVolumeRayCast(int argc, char* argv[])
     return EXIT_FAILURE;
   }
 
-  return EXIT_SUCCESS;
+  // Image-based regression against a baseline (final volume frame).
+  return vtkMetalTesting::RegressionExitCode(vtkRegressionTestImage(renWin));
 }

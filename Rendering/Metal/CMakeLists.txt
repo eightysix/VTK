@@ -66,6 +66,14 @@ vtk_module_add_module(
   SOURCES ${sources} ${vtk_object_factory_source}
   PRIVATE_HEADERS ${vtk_object_factory_header})
 
+# Color read-back (GetPixelData / image-baseline regression tests) requires the
+# CAMetalLayer drawable to be blittable (framebufferOnly=NO) and copies the
+# whole frame into a shared texture every render. Keep that overhead out of
+# production builds by compiling it in only when the test suites are enabled.
+if(VTK_BUILD_TESTING)
+  target_compile_definitions(vtkRenderingMetal PRIVATE VTK_METAL_ENABLE_COLOR_READBACK)
+endif()
+
 # Link Metal framework
 if(APPLE_IOS)
   vtk_module_link(VTK::RenderingMetal PUBLIC "-framework Metal" "-framework QuartzCore" "-framework UIKit" "-framework Accelerate")

@@ -36,6 +36,7 @@ class id;
 #endif
 
 class vtkUnsignedIntArray;
+class vtkUnsignedCharArray;
 
 VTK_ABI_NAMESPACE_BEGIN
 
@@ -153,6 +154,36 @@ public:
    */
   void GetIdsData(int x1, int y1, int x2, int y2, vtkUnsignedIntArray* data);
 
+  /**
+   * Read the color framebuffer back as RGBRGBRGB (3 components per pixel).
+   * The caller owns the returned array. The front/right arguments are
+   * accepted for API compatibility; Metal has a single (drawable) buffer.
+   * Y-axis is flipped to match VTK's bottom-left origin.
+   */
+  unsigned char* GetPixelData(
+    int x1, int y1, int x2, int y2, int front, int right = 0) override;
+
+  /**
+   * Read the color framebuffer back as RGBRGBRGB into the given array.
+   */
+  int GetPixelData(
+    int x1, int y1, int x2, int y2, int front, vtkUnsignedCharArray* data, int right = 0) override;
+
+  /**
+   * Read the color framebuffer back as RGBARGBA (4 components per pixel).
+   * The caller owns the returned array. The front/right arguments are
+   * accepted for API compatibility; Metal has a single (drawable) buffer.
+   * Y-axis is flipped to match VTK's bottom-left origin.
+   */
+  unsigned char* GetRGBACharPixelData(
+    int x1, int y1, int x2, int y2, int front, int right = 0) override;
+
+  /**
+   * Read the color framebuffer back as RGBARGBA into the given array.
+   */
+  int GetRGBACharPixelData(int x1, int y1, int x2, int y2, int front,
+    vtkUnsignedCharArray* data, int right = 0) override;
+
 protected:
   vtkMetalRenderWindow();
   ~vtkMetalRenderWindow() override;
@@ -176,6 +207,12 @@ protected:
    * Recreate the IDs texture for GPU-based picking.
    */
   void RecreateIdsTexture();
+
+  /**
+   * Recreate the shared color-copy texture used for CPU read-back of the
+   * rendered frame (GetPixelData / GetRGBACharPixelData).
+   */
+  void RecreateColorCopyTexture();
 
   /**
    * Create/destroy multisampled color and depth textures for MSAA rendering.
@@ -203,6 +240,7 @@ protected:
   void* Encoder = nullptr;         // id<MTLRenderCommandEncoder>
   void* DepthTexture = nullptr;    // id<MTLTexture>
   void* IdsTexture = nullptr;      // id<MTLTexture> — RGBA32Uint for picking IDs
+  void* ColorCopyTexture = nullptr; // id<MTLTexture> — BGRA8Unorm, MTLStorageModeShared, color read-back
   void* MultisampleColorTexture = nullptr; // id<MTLTexture> — MSAA color (MTLTextureType2DMultisample)
   void* MultisampleDepthTexture = nullptr; // id<MTLTexture> — MSAA depth (MTLTextureType2DMultisample)
   void* ColorCopyPipeline = nullptr; // id<MTLRenderPipelineState>
@@ -225,6 +263,13 @@ private:
   friend class vtkMetalDepthPeeler;
   friend class vtkMetalPolyDataMapper;
   friend class vtkMetalPolyDataMapper2D;
+
+  /**
+   * Copy a region of the shared color-copy texture into a byte buffer.
+   * ncomp is 3 (RGB) or 4 (RGBA). Output rows are bottom-up (VTK convention)
+   * and BGRA is converted to RGB(A). Returns 1 on success, 0 on failure.
+   */
+  int ReadColorCopyData(int x, int y, int width, int height, int ncomp, void* dest);
 
   vtkMetalRenderWindow(const vtkMetalRenderWindow&) = delete;
   void operator=(const vtkMetalRenderWindow&) = delete;

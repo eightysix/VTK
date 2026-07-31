@@ -88,5 +88,6 @@ int TestMetalGlyph3DMapper(int argc, char* argv[])
     return EXIT_FAILURE;
   }
 
-  return EXIT_SUCCESS;
+  // Image-based regression against a baseline.
+  return vtkMetalTesting::RegressionExitCode(vtkRegressionTestImage(renWin));
 }
