@@ -62,6 +62,12 @@ public:
     double opacity);
   void ClearBatchVisualOverride();
 
+  // A/B switch for the single-pass surface edges (new path) vs. the legacy
+  // chord-depth edge overlay draw. Default off (new path).
+  vtkSetMacro(UseLegacyEdgeOverlay, bool);
+  vtkGetMacro(UseLegacyEdgeOverlay, bool);
+  vtkBooleanMacro(UseLegacyEdgeOverlay, bool);
+
   struct ExtraAttributeValue
   {
     std::string DataArrayName;
@@ -85,6 +91,7 @@ protected:
   void UpdateCoincidentOffsetUniforms(void* mtlDevice, vtkActor* actor);
   void UpdateVertexColorUniforms(void* mtlDevice, vtkActor* actor);
   void UpdateEdgeColorUniform(void* mtlDevice, vtkActor* actor);
+  void UpdateEdgeUniforms(void* mtlDevice, vtkActor* actor);
   void UpdateClipPlaneUniforms(void* mtlDevice, vtkActor* actor);
   void UpdateActorTexture(void* mtlDevice, vtkActor* actor);
   void EnsurePeelPipelineStates(void* mtlDevice);
@@ -99,6 +106,10 @@ protected:
   std::map<std::string, ExtraAttributeValue> ExtraAttributes;
   vtkTimeStamp ExtraAttributesMTime;
 
+  // A/B switch for the single-pass surface edges vs. the legacy chord-depth
+  // edge overlay draw. Default off (new path).
+  bool UseLegacyEdgeOverlay = false;
+
   // Upload vertex data from CPU vectors to GPU Metal buffers
   void UploadVertexDataToMTLBuffers(void* mtlDevice, vtkPolyData* polydata,
     vtkPointData* pd, vtkUnsignedCharArray* mappedColors, int cellFlag,
@@ -107,6 +118,9 @@ protected:
     const std::vector<float>& surfaceColors, const std::vector<float>& triangleUVs,
     const std::vector<uint32_t>& lineIndices,
     const std::vector<uint32_t>& triangleIndices,
+    const std::vector<float>& triangleBary,
+    const std::vector<uint32_t>& triangleEdgeFlags,
+    const std::vector<float>& trianglePos,
     const std::vector<float>& edgePositions,
     std::vector<float>& edgeNormals, const std::vector<float>& edgeColors,
     const std::vector<float>& edgeUVs, const std::vector<uint32_t>& edgeIndices,

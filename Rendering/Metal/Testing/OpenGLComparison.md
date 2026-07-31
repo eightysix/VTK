@@ -7,9 +7,10 @@ both backends and compares them with `vtkImageDifference` using the same
 thresholded-error metric `vtkTesting` uses for baseline regression.
 
 Numbers below were produced on Apple Silicon, macOS, `SetMultiSamples(0)`,
-`SwapBuffersOff()` (back buffer read-back), threshold 20, at commit
-`27e89cda53` (Metal parity fixes for lighting, backface materials, glyph
-normals, gradient backgrounds, and fake-tube line shading). The run is fully
+`SwapBuffersOff()` (back buffer read-back), threshold 20. The single-pass
+surface-edge port (`applySurfaceEdges` mirroring `vtkPolyDataEdgesGS.glsl` +
+`vtkOpenGLPolyDataMapper::ReplaceShaderEdges`) is active, so PointRender edges
+are now rendered on the surface fragment and match GL. The run is fully
 reproducible: rerunning the harness produces byte-identical images and
 identical errors.
 
@@ -20,7 +21,7 @@ RenderWindow                       39.322          0.000
 Camera                             10.078          0.000
 Light                              61.965          0.000
 ActorProperty                    1949.314        167.807
-PointRender                      4894.647       2193.884
+PointRender                      1668.277          0.000
 DepthPeeling                     4425.217        808.961
 CompositePolyDataMapper           241.004          0.000
 Glyph3DMapper                     444.277          0.000
@@ -29,7 +30,7 @@ PolyDataMapper2D                  286.047          0.000
 Texture                           177.318          0.000
 VolumeRayCast                    2612.763        789.835
 -------------------------------------------------------------------
-worst thresholded error: 2193.88
+worst thresholded error: 808.961
 ```
 
 ## How to read this
@@ -54,6 +55,13 @@ worst thresholded error: 2193.88
   Identical projection math.
 - **Light** (`BuildLightScene`): cone lit by a single spot light (the test's
   final state). Identical lighting model.
+- **PointRender** (`BuildPointRenderScene`): sphere with `EdgeVisibilityOn()`,
+  `SetLineWidth(7)`, `RenderLinesAsTubesOn()`. The single-pass edge port draws
+  the GL-style fake-tube edges directly on the surface fragment (edge
+  equations built per-triangle in the vertex entry from the three corner
+  positions, evaluated at the fragment's window position), so the surface and
+  tube shading match GL to within a few gray levels (only 15 pixels differ,
+  max delta 3/255). The previous chord-depth flat-tube overlay is retired.
 - **CompositePolyDataMapper** (`BuildCompositeScene`): cone + sphere + cube as
   a `vtkPartitionedDataSetCollection` rendered through the composite poly data
   mapper. The Metal delegator path matches GL.
@@ -83,15 +91,6 @@ worst thresholded error: 2193.88
   front/back-face translucency compositing or lighting rounding difference.
   Neither backend depth-peels this scene (the flag is off); both use
   painter-order blending.
-- **PointRender** — error 4894 / thresholded 2193.9, ~20.0% of pixels >10%
-  (the worst remaining scene). Sphere with `EdgeVisibilityOn()`,
-  `SetLineWidth(7)`, `RenderLinesAsTubesOn()`. The edges now render as GL-style
-  fake tubes (cylinder normals with the GL `emix` edge blend, miter-joined
-  closed loops per polygon), so the surface and tube shading match. The
-  residual divergence is at the sphere's silhouette: the flat tube quads sit at
-  chord depth behind the curved surface, so the middle of each tube fragment is
-  depth-culled and the tubes read as hollow/broken arcs (edge streaks) where GL
-  shows continuous arcs; line anti-aliasing also differs (GL softer).
 - **DepthPeeling** — error 4425 / thresholded 808.9, ~17.2% of pixels >10%.
   Three overlapping translucent spheres with `SetUseDepthPeeling(true)` and 20
   peels. `vtkMetalRenderer` drives its depth peeler

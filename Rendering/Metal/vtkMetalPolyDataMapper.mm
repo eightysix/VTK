@@ -180,6 +180,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLBuffer> MaterialUniformBuffer = nil;
   id<MTLBuffer> LightUniformBuffer = nil;
   id<MTLBuffer> CoincidentOffsetBuffer = nil;   // P1-5: polygon/line/point depth bias
+  id<MTLBuffer> EdgeUniformBuffer = nil;        // per-frame single-pass edge uniforms (fragment buffer(4))
   id<MTLBuffer> VertexColorBuffer = nil;        // P1-4: vertex visibility color
   id<MTLBuffer> ClipPlaneBuffer = nil;          // P1-6: clipping planes
   // P2-8: Picking IDs
@@ -212,6 +213,13 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLBuffer> TessEdgeArrayBuffer = nil;          // GPU output: per-triangle edge visibility
   id<MTLBuffer> TessParamsBuffer = nil;             // uniform: numCells + cellIdOffset
   bool UseGPUTessellation = false;
+
+  // Single-pass surface edges: per-triangle-corner barycentrics + boundary flags
+  id<MTLBuffer> TriangleBaryBuffer = nil;      // float3 per triangle corner (3*numTris)
+  id<MTLBuffer> TriangleEdgeFlagBuffer = nil;  // uint   per triangle corner (3*numTris)
+  id<MTLBuffer> TrianglePosBuffer = nil;       // float3[3] corner object positions per corner record (3*numTris)
+  bool SurfaceUsesIndexedEntry = false;        // pipeline-selection key: edges folded into fragment
+  bool CachedSurfaceUsesIndexedEntry = false;  // indexedEntry baked into cached pipelines; rebuild on flip
 
   vtkIdType TriangleVertexCount = 0;
   vtkIdType TriangleIndexCount = 0;
@@ -481,6 +489,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     vtkMetalMRC::ReleaseAndNil(MaterialUniformBuffer);
     vtkMetalMRC::ReleaseAndNil(LightUniformBuffer);
     vtkMetalMRC::ReleaseAndNil(CoincidentOffsetBuffer);
+    vtkMetalMRC::ReleaseAndNil(EdgeUniformBuffer);
     vtkMetalMRC::ReleaseAndNil(VertexColorBuffer);
     vtkMetalMRC::ReleaseAndNil(ClipPlaneBuffer);
 
@@ -506,6 +515,11 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     vtkMetalMRC::ReleaseAndNil(TessOutputConnectivityBuffer);
     vtkMetalMRC::ReleaseAndNil(TessEdgeArrayBuffer);
     vtkMetalMRC::ReleaseAndNil(TessParamsBuffer);
+    vtkMetalMRC::ReleaseAndNil(TriangleBaryBuffer);
+    vtkMetalMRC::ReleaseAndNil(TriangleEdgeFlagBuffer);
+    vtkMetalMRC::ReleaseAndNil(TrianglePosBuffer);
+    SurfaceUsesIndexedEntry = false;
+    CachedSurfaceUsesIndexedEntry = false;
     UseGPUTessellation = false;
 
     TriangleVertexCount = 0;
@@ -841,6 +855,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       (standardLinePipelineAvailable || thickLinesAvailable || miterLinesAvailable);
 
   const bool drawEdgeOverlay =
+      this->UseLegacyEdgeOverlay &&
       isSurface &&
       act->GetProperty()->GetEdgeVisibility() &&
       this->Internals->HasEdgeOverlay &&
@@ -926,6 +941,13 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       {
         recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
       }
+      // Single-pass surface edges: fragment_main (TrianglePipeline / peel variants)
+      // reads EdgeUniforms at buffer(4). Bind explicitly here; a retained binding
+      // from an earlier 1px-line draw in the same pass is not guaranteed.
+      if (this->Internals->EdgeUniformBuffer)
+      {
+        recordFBuf(this->Internals->EdgeUniformBuffer, 0, 4);
+      }
       if (this->Internals->ClipPlaneBuffer)
       {
         recordFBuf(this->Internals->ClipPlaneBuffer, 0, 5);
@@ -997,7 +1019,23 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       {
         recordCull(MTLCullModeNone);
       }
-      if (this->Internals->IndexBuffer)
+      if (this->Internals->SurfaceUsesIndexedEntry)
+      {
+        if (this->Internals->IndexBuffer && this->Internals->TriangleBaryBuffer &&
+            this->Internals->TriangleEdgeFlagBuffer && this->Internals->TrianglePosBuffer)
+        {
+          recordVBuf(this->Internals->IndexBuffer, 0, 9);
+          recordVBuf(this->Internals->TriangleBaryBuffer, 0, 10);
+          recordVBuf(this->Internals->TriangleEdgeFlagBuffer, 0, 11);
+          recordVBuf(this->Internals->TrianglePosBuffer, 0, 12);
+          recordDraw(MTLPrimitiveTypeTriangle, 0, this->Internals->TriangleIndexCount);
+        }
+        else
+        {
+          vtkWarningMacro(<< "Indexed surface entry buffers missing; skipping triangle draw.");
+        }
+      }
+      else if (this->Internals->IndexBuffer)
       {
         recordIdxDraw(MTLPrimitiveTypeTriangle, this->Internals->TriangleIndexCount, MTLIndexTypeUInt32,
           this->Internals->IndexBuffer, 0);
@@ -1199,6 +1237,10 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       {
         recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
       }
+      if (this->Internals->EdgeUniformBuffer)
+      {
+        recordFBuf(this->Internals->EdgeUniformBuffer, 0, 4);
+      }
 
       // P1-1: Bind clip planes for 1px lines (both vertex and fragment stages)
       if (this->Internals->ClipPlaneBuffer)
@@ -1336,20 +1378,20 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       recordVBuf(this->Internals->SceneUniformBuffer, 0, 2);
       recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
     }
-    if (this->Internals->CoincidentOffsetBuffer)
-    {
-      recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
-    }
-    if (this->Internals->EdgeColorUniformBuffer)
-    {
-      recordFBuf(this->Internals->EdgeColorUniformBuffer, 0, 4);
-    }
-    if (this->Internals->MaterialUniformBuffer)
-    {
-      recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
-    }
-    // P1-3: Fallback-safe cell ID binding for edges (vertex stage)
-    if (this->Internals->EdgeCellIdBuffer)
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+      }
+      if (this->Internals->EdgeColorUniformBuffer)
+      {
+        recordFBuf(this->Internals->EdgeColorUniformBuffer, 0, 4);
+      }
+      if (this->Internals->MaterialUniformBuffer)
+      {
+        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
+      }
+      // P1-3: Fallback-safe cell ID binding for edges (vertex stage)
+      if (this->Internals->EdgeCellIdBuffer)
     {
       recordVBuf(this->Internals->EdgeCellIdBuffer, 0, 6);
     }
@@ -2043,8 +2085,11 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     // (from the hardware selector); otherwise fall back to overrides/0.
     this->UpdatePickUniforms(ren, act);
 
-    // 8C: Update edge color uniform before bundle recording (per-frame update)
-    if (representation == VTK_SURFACE &&
+    // 8C: Update edge color uniform before bundle recording (per-frame update).
+    // UpdateEdgeUniforms runs unconditionally so fragment buffer(4) is always
+    // valid for every pipeline built on fragment_main (including line draws).
+    this->UpdateEdgeUniforms((void*)device, act);
+    if (this->UseLegacyEdgeOverlay && representation == VTK_SURFACE &&
         edgeVisibility &&
         this->Internals->HasEdgeOverlay)
     {
@@ -2180,6 +2225,28 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   }
 
   id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
+  vtkProperty* bprop = actor ? actor->GetProperty() : nullptr;
+  int rep = bprop ? bprop->GetRepresentation() : VTK_SURFACE;
+  bool edgeVis = bprop ? bprop->GetEdgeVisibility() : false;
+  // Single-pass edge pipeline-selection key: edges folded into fragment_main.
+  this->Internals->SurfaceUsesIndexedEntry =
+    edgeVis && rep == VTK_SURFACE && !this->UseLegacyEdgeOverlay;
+
+  // The triangle/peel pipelines bake the indexed-entry vertex function. When
+  // the key flips at runtime (e.g. the UseLegacyEdgeOverlay A/B switch), the
+  // cached pipelines must be invalidated so the rebuild picks the right vertex
+  // entry. This is the single point where the key is recomputed each frame,
+  // so it is the correct place to release on a flip.
+  if (this->Internals->SurfaceUsesIndexedEntry !=
+      this->Internals->CachedSurfaceUsesIndexedEntry)
+  {
+    vtkMetalMRC::ReleaseAndNil(this->Internals->TrianglePipeline);
+    vtkMetalMRC::ReleaseAndNil(this->Internals->TriangleInitPeelPipeline);
+    vtkMetalMRC::ReleaseAndNil(this->Internals->TrianglePeelPipeline);
+    this->Internals->CachedSurfaceUsesIndexedEntry =
+      this->Internals->SurfaceUsesIndexedEntry;
+  }
+
   std::vector<float> positions;
   std::vector<float> normals;
   std::vector<float> surfaceColors;  // P1-1A/1B: float4 per vertex
@@ -2189,6 +2256,28 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   // P2-2C: Triangle index buffers — deduplicated vertices + index buffer
   std::vector<uint32_t> triangleIndices;
   std::unordered_map<vtkIdType, uint32_t> triVertexMap;
+
+  // Single-pass edges: per-triangle-corner bary + boundary flags (parallel to triangleIndices)
+  std::vector<float> triangleBary;
+  std::vector<uint32_t> triangleEdgeFlags;
+  std::vector<float> trianglePos;   // float3[3] corner object positions per corner record
+  static const float kBary[3][3] = { {1,0,0}, {0,1,0}, {0,0,1} };
+  // Host mirror of the kernel's isBoundary: true iff (a,b) is a consecutive polygon pair.
+  auto edgeIsBoundary = [&](vtkIdType a, vtkIdType b, vtkIdType npts, const vtkIdType* pts) -> bool {
+    for (vtkIdType k = 0; k < npts; ++k)
+    {
+      vtkIdType x = pts[k];
+      vtkIdType y = pts[(k + 1) % npts];
+      if ((x == a && y == b) || (x == b && y == a)) return true;
+    }
+    return false;
+  };
+  // Bit order (c1c2, c2c0, c0c1): bit0 = edge opposite corner 0, bit1 = corner 1, bit2 = corner 2.
+  auto packedEdgeFlags = [&](const vtkIdType tri[3], vtkIdType npts, const vtkIdType* pts) -> uint32_t {
+    return (edgeIsBoundary(tri[1], tri[2], npts, pts) ? 1u : 0u)
+         | (edgeIsBoundary(tri[2], tri[0], npts, pts) ? 2u : 0u)
+         | (edgeIsBoundary(tri[0], tri[1], npts, pts) ? 4u : 0u);
+  };
 
   // P2-2B: Edge geometry for wireframe overlay on surfaces (separate vertex + index buffers)
   std::vector<float> edgePositions;
@@ -2511,6 +2600,19 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                        options:MTLResourceStorageModeShared];
           vtkMetalMRC::AssignConsumed(this->Internals->TriangleCellIdBuffer, triCellIdBuf);
 
+          // Single-pass edges: per-triangle-corner bary + boundary flags.
+          // Allocated unconditionally because polygonToTriangle always writes them.
+          {
+            id<MTLBuffer> tessBaryBuf = [device
+              newBufferWithLength:numTris * 3 * sizeof(float) * 3
+                         options:MTLResourceStorageModeShared];
+            vtkMetalMRC::AssignConsumed(this->Internals->TriangleBaryBuffer, tessBaryBuf);
+            id<MTLBuffer> tessFlagBuf = [device
+              newBufferWithLength:numTris * 3 * sizeof(uint32_t)
+                         options:MTLResourceStorageModeShared];
+            vtkMetalMRC::AssignConsumed(this->Internals->TriangleEdgeFlagBuffer, tessFlagBuf);
+          }
+
           // Upload params uniform
           struct { uint32_t numCells; uint32_t cellIdOffset; } tessParams;
           tessParams.numCells = static_cast<uint32_t>(polyOff.size() - 1);
@@ -2528,6 +2630,8 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
             [enc setBuffer:this->Internals->TessOutputConnectivityBuffer offset:0 atIndex:0];
             [enc setBuffer:this->Internals->TessEdgeArrayBuffer offset:0 atIndex:1];
             [enc setBuffer:this->Internals->TriangleCellIdBuffer offset:0 atIndex:2];
+            [enc setBuffer:this->Internals->TriangleBaryBuffer offset:0 atIndex:7];
+            [enc setBuffer:this->Internals->TriangleEdgeFlagBuffer offset:0 atIndex:8];
             [enc setBuffer:connBuf offset:0 atIndex:3];
             [enc setBuffer:offBuf offset:0 atIndex:4];
             [enc setBuffer:primBuf offset:0 atIndex:5];
@@ -2547,8 +2651,8 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
         }
       }
 
-      // Step 3: Build polygon edge connectivity for edge visibility
-      if (edgeVisibility)
+      // Step 3: Build polygon edge connectivity for edge visibility (legacy overlay only)
+      if (edgeVisibility && this->UseLegacyEdgeOverlay)
       {
         std::vector<uint32_t> eConn;
         std::vector<uint32_t> eOff;
@@ -3081,6 +3185,36 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     }
   }
 
+  // Single-pass edges (GPU tessellation path): build the per-triangle-corner
+  // corner-position records from the compute connectivity + point positions.
+  if (gpuTessUsed && this->Internals->TessOutputConnectivityBuffer &&
+      this->Internals->TrianglePrimitiveCount > 0 && !positions.empty())
+  {
+    const uint32_t* conn = static_cast<const uint32_t*>(
+        [this->Internals->TessOutputConnectivityBuffer contents]);
+    vtkIdType numT = this->Internals->TrianglePrimitiveCount;
+    std::vector<float> triPos;
+    triPos.reserve(static_cast<size_t>(numT) * 27);
+    for (vtkIdType t = 0; t < numT; ++t)
+    {
+      uint32_t c[3] = { conn[t * 3 + 0], conn[t * 3 + 1], conn[t * 3 + 2] };
+      for (int r = 0; r < 3; ++r)
+      {
+        for (int k = 0; k < 3; ++k)
+        {
+          triPos.push_back(positions[c[k] * 3 + 0]);
+          triPos.push_back(positions[c[k] * 3 + 1]);
+          triPos.push_back(positions[c[k] * 3 + 2]);
+        }
+      }
+    }
+    id<MTLBuffer> posBuf = [device
+      newBufferWithBytes:triPos.data()
+                 length:triPos.size() * sizeof(float)
+                options:MTLResourceStorageModeShared];
+    vtkMetalMRC::AssignConsumed(this->Internals->TrianglePosBuffer, posBuf);
+  }
+
   vtkIdType polyCellIdx = polyCellOffset;
   // Helper for emitting per-vertex wireframe colors with batch override support.
   // Defined here so it is available throughout the CPU geometry build.
@@ -3125,7 +3259,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
         continue;
       }
 
-      if (representation == VTK_WIREFRAME)
+    if (representation == VTK_WIREFRAME)
       {
         // P2-2A: Wireframe — extract edges from polygon as line segments.
         // For each polygon with vertices [v0, v1, ..., vn-1], emit line segments
@@ -3246,9 +3380,24 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
         for (vtkIdType i = 1; i < npts - 1; ++i)
         {
           vtkIdType tri[3] = { pts[0], pts[i], pts[i + 1] };
+          uint32_t packed = packedEdgeFlags(tri, npts, pts);
 
           if (useIndexBuffer)
           {
+            // Single-pass edges: per-corner records carry the 3 corner object
+            // positions (identical for all 3 corners) so the vertex shader can
+            // build the triangle's window-space edge equations.
+            double triPt[3][3];
+            for (int j = 0; j < 3; ++j) polydata->GetPoint(tri[j], triPt[j]);
+            for (int r = 0; r < 3; ++r)
+            {
+              for (int j = 0; j < 3; ++j)
+              {
+                trianglePos.push_back(static_cast<float>(triPt[j][0]));
+                trianglePos.push_back(static_cast<float>(triPt[j][1]));
+                trianglePos.push_back(static_cast<float>(triPt[j][2]));
+              }
+            }
             // Indexed path: deduplicate vertices by point ID
             for (int j = 0; j < 3; ++j)
             {
@@ -3256,6 +3405,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
               if (it != triVertexMap.end())
               {
                 triangleIndices.push_back(it->second);
+                triangleBary.push_back(kBary[j][0]);
+                triangleBary.push_back(kBary[j][1]);
+                triangleBary.push_back(kBary[j][2]);
+                triangleEdgeFlags.push_back(packed);
                 // No cellId push, no emitExtraAttrsForPoint — vertex already exists
               }
               else
@@ -3263,6 +3416,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                 uint32_t vidx = static_cast<uint32_t>(positions.size() / 3);
                 triVertexMap[tri[j]] = vidx;
                 triangleIndices.push_back(vidx);
+                triangleBary.push_back(kBary[j][0]);
+                triangleBary.push_back(kBary[j][1]);
+                triangleBary.push_back(kBary[j][2]);
+                triangleEdgeFlags.push_back(packed);
                 triangleVertexCellIds.push_back(static_cast<uint32_t>(polyCellIdx) + 1u);
 
                 double pt[3];
@@ -3331,6 +3488,20 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
 
             for (int j = 0; j < 3; ++j)
             {
+              triangleBary.push_back(kBary[j][0]);
+              triangleBary.push_back(kBary[j][1]);
+              triangleBary.push_back(kBary[j][2]);
+              triangleEdgeFlags.push_back(packed);
+
+              // Single-pass edges: per-corner records carry the 3 corner object
+              // positions (identical for all 3 corners).
+              for (int r = 0; r < 3; ++r)
+              {
+                trianglePos.push_back(static_cast<float>(p[r][0]));
+                trianglePos.push_back(static_cast<float>(p[r][1]));
+                trianglePos.push_back(static_cast<float>(p[r][2]));
+              }
+
               positions.push_back(static_cast<float>(p[j][0]));
               positions.push_back(static_cast<float>(p[j][1]));
               positions.push_back(static_cast<float>(p[j][2]));
@@ -3380,6 +3551,19 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       polyCellIdx++;
     }
 
+    // Single-pass edges: non-indexed surfaces still route through the indirection
+    // vertex entry (vertex_main_indexed reads bary/flags by vertex_id), so build
+    // an identity index buffer covering all emitted triangle vertices.
+    if (this->Internals->SurfaceUsesIndexedEntry && triangleIndices.empty() && !positions.empty())
+    {
+      uint32_t n = static_cast<uint32_t>(positions.size() / 3);
+      triangleIndices.reserve(n);
+      for (uint32_t k = 0; k < n; ++k)
+      {
+        triangleIndices.push_back(k);
+      }
+    }
+
     if (representation == VTK_WIREFRAME)
     {
       // Wireframe: no triangles, only lines
@@ -3395,14 +3579,15 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       this->Internals->HasTriangles = !positions.empty();
     }
 
-    // P2-2B: Edge overlay — extract unique polygon boundary edges for VTK_SURFACE
+    // P2-2B: Edge overlay — extract unique polygon boundary edges for VTK_SURFACE.
+    // Legacy chord-depth overlay only; the new path bakes edges into fragment_main.
     struct EdgeInfo
     {
       vtkIdType A = 0;
       vtkIdType B = 0;
       uint32_t CellId = 0;
     };
-    if (representation == VTK_SURFACE && edgeVisibility)
+    if (this->UseLegacyEdgeOverlay && representation == VTK_SURFACE && edgeVisibility)
     {
       std::unordered_map<EdgeKey, EdgeInfo, EdgeKeyHash> uniqueEdges;
 
@@ -3705,7 +3890,8 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   this->UploadVertexDataToMTLBuffers(mtlDevice, polydata, pd,
     mappedColors, cellFlag, gpuTessUsed, defaultRGBA,
     positions, normals, surfaceColors, triangleUVs, lineIndices,
-    triangleIndices, edgePositions, edgeNormals, edgeColors, edgeUVs,
+    triangleIndices, triangleBary, triangleEdgeFlags, trianglePos,
+    edgePositions, edgeNormals, edgeColors, edgeUVs,
     edgeIndices, triangleVertexCellIds, lineVertexCellIds,
     lineSegmentCellIds, edgeVertexCellIds, edgeTubeIndices,
     edgeTubeCellIds, extraAttrArrays);
@@ -3723,6 +3909,9 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
   const std::vector<float>& surfaceColors, const std::vector<float>& triangleUVs,
   const std::vector<uint32_t>& lineIndices,
   const std::vector<uint32_t>& triangleIndices,
+  const std::vector<float>& triangleBary,
+  const std::vector<uint32_t>& triangleEdgeFlags,
+  const std::vector<float>& trianglePos,
   const std::vector<float>& edgePositions,
   std::vector<float>& edgeNormals, const std::vector<float>& edgeColors,
   const std::vector<float>& edgeUVs, const std::vector<uint32_t>& edgeIndices,
@@ -3783,6 +3972,31 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
                  length:triangleIndices.size() * sizeof(uint32_t)
                 options:MTLResourceStorageModeShared];
     vtkMetalMRC::AssignConsumed(this->Internals->IndexBuffer, triIdxBuf);
+  }
+
+  // Single-pass edges: per-triangle-corner bary + boundary flags (CPU paths)
+  if (!triangleBary.empty() && !triangleEdgeFlags.empty())
+  {
+    id<MTLBuffer> baryBuf = [device
+      newBufferWithBytes:triangleBary.data()
+                 length:triangleBary.size() * sizeof(float)
+                options:MTLResourceStorageModeShared];
+    vtkMetalMRC::AssignConsumed(this->Internals->TriangleBaryBuffer, baryBuf);
+
+    id<MTLBuffer> flagBuf = [device
+      newBufferWithBytes:triangleEdgeFlags.data()
+                 length:triangleEdgeFlags.size() * sizeof(uint32_t)
+                options:MTLResourceStorageModeShared];
+    vtkMetalMRC::AssignConsumed(this->Internals->TriangleEdgeFlagBuffer, flagBuf);
+
+    if (!trianglePos.empty())
+    {
+      id<MTLBuffer> posBuf = [device
+        newBufferWithBytes:trianglePos.data()
+                   length:trianglePos.size() * sizeof(float)
+                  options:MTLResourceStorageModeShared];
+      vtkMetalMRC::AssignConsumed(this->Internals->TrianglePosBuffer, posBuf);
+    }
   }
 
   // P2-2B: Create edge geometry buffers for wireframe overlay on surfaces
@@ -4286,11 +4500,22 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   id<MTLFunction> vertexFunc = [library newFunctionWithName:@"vertex_main"];
   id<MTLFunction> fragmentFunc = [library newFunctionWithName:@"fragment_main"];
 
-  if (!vertexFunc || !fragmentFunc)
+  // Single-pass surface edges: when the indexed entry is active the triangle
+  // pipeline reads deduplicated arrays through the index buffer (no stage_in).
+  const bool indexedEntry = this->Internals->SurfaceUsesIndexedEntry;
+  id<MTLFunction> triVertexFunc = indexedEntry
+    ? [library newFunctionWithName:@"vertex_main_indexed"]
+    : vertexFunc;
+
+  if (!vertexFunc || !fragmentFunc || !triVertexFunc)
   {
     vtkErrorMacro(<< "Failed to find shader functions");
     [vertexFunc release];
     [fragmentFunc release];
+    if (triVertexFunc != vertexFunc)
+    {
+      [triVertexFunc release];
+    }
     return;
   }
 
@@ -4309,9 +4534,12 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   vertexDesc.layouts[1].stepFunction = MTLVertexStepFunctionPerVertex;
 
   MTLRenderPipelineDescriptor* pipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
-  pipelineDesc.vertexFunction = vertexFunc;
+  pipelineDesc.vertexFunction = triVertexFunc;
   pipelineDesc.fragmentFunction = fragmentFunc;
-  pipelineDesc.vertexDescriptor = vertexDesc;
+  if (!indexedEntry)
+  {
+    pipelineDesc.vertexDescriptor = vertexDesc;
+  }
   pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
   // 8A: Skip IDs attachment when MSAA is active — render pass only has 1 color attachment
   if (sampleCount <= 1)
@@ -4348,6 +4576,9 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
     }
   }
 
+  // The line pipeline always keeps vertex_main + the attribute descriptor.
+  pipelineDesc.vertexFunction = vertexFunc;
+  pipelineDesc.vertexDescriptor = vertexDesc;
   pipelineDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassLine;
 
   if (!this->Internals->LinePipeline)
@@ -4363,6 +4594,10 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
 
   [vertexFunc release];
   [fragmentFunc release];
+  if (triVertexFunc != vertexFunc)
+  {
+    [triVertexFunc release];
+  }
   [vertexDesc release];
   [pipelineDesc release];
 }
@@ -4779,7 +5014,10 @@ void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
     return;
   }
 
-  id<MTLFunction> vertexFunc = [library newFunctionWithName:@"vertex_main"];
+  const bool indexedEntry = this->Internals->SurfaceUsesIndexedEntry;
+  id<MTLFunction> vertexFunc = indexedEntry
+    ? [library newFunctionWithName:@"vertex_main_indexed"]
+    : [library newFunctionWithName:@"vertex_main"];
   if (!vertexFunc)
   {
     return;
@@ -4809,7 +5047,10 @@ void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
       MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
       desc.vertexFunction = vertexFunc;
       desc.fragmentFunction = fragFunc;
-      desc.vertexDescriptor = vertexDesc;
+      if (!indexedEntry)
+      {
+        desc.vertexDescriptor = vertexDesc;
+      }
       // color(0): RG32Float (depth range) with MAX blend
       desc.colorAttachments[0].pixelFormat = MTLPixelFormatRG32Float;
       desc.colorAttachments[0].blendingEnabled = YES;
@@ -4848,7 +5089,10 @@ void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
       MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
       desc.vertexFunction = vertexFunc;
       desc.fragmentFunction = fragFunc;
-      desc.vertexDescriptor = vertexDesc;
+      if (!indexedEntry)
+      {
+        desc.vertexDescriptor = vertexDesc;
+      }
       // color(0): RGBA8 (backTemp) — no blend, direct write
       desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
       desc.colorAttachments[0].blendingEnabled = NO;
@@ -5343,6 +5587,66 @@ void vtkMetalPolyDataMapper::UpdateEdgeColorUniform(void* mtlDevice, vtkActor* a
   }
 
   memcpy([this->Internals->EdgeColorUniformBuffer contents], ec, sizeof(ec));
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::UpdateEdgeUniforms(void* mtlDevice, vtkActor* actor)
+{
+  if (!mtlDevice || !actor)
+  {
+    return;
+  }
+
+  id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
+
+  // Must stay layout-compatible with EdgeUniforms in MetalShaders.metal.
+  struct MetalEdgeUniforms
+  {
+    float edgeColor[4];
+    float edgeWidth;
+    uint32_t flags;
+    float pad;
+  };
+
+  MetalEdgeUniforms e;
+  memset(&e, 0, sizeof(e));
+  e.edgeColor[3] = 1.0f;
+  e.edgeWidth = 1.1f;
+
+  vtkProperty* prop = actor->GetProperty();
+  if (prop)
+  {
+    double ecDouble[3] = { 0.0, 0.0, 0.0 };
+    prop->GetEdgeColor(ecDouble);
+    e.edgeColor[0] = static_cast<float>(ecDouble[0]);
+    e.edgeColor[1] = static_cast<float>(ecDouble[1]);
+    e.edgeColor[2] = static_cast<float>(ecDouble[2]);
+    e.edgeColor[3] = static_cast<float>(prop->GetEdgeOpacity());
+    double w = prop->GetUseLineWidthForEdgeThickness() ? prop->GetLineWidth() : prop->GetEdgeWidth();
+    if (w < 1.1)
+    {
+      w = 1.1;
+    }
+    e.edgeWidth = static_cast<float>(w);
+    e.flags = (prop->GetEdgeVisibility() ? 1u : 0u) | (prop->GetRenderLinesAsTubes() ? 2u : 0u);
+  }
+
+  if (this->Internals->UseBatchColor)
+  {
+    e.edgeColor[0] = static_cast<float>(this->Internals->BatchColor[0]);
+    e.edgeColor[1] = static_cast<float>(this->Internals->BatchColor[1]);
+    e.edgeColor[2] = static_cast<float>(this->Internals->BatchColor[2]);
+  }
+
+  if (!this->Internals->EdgeUniformBuffer)
+  {
+    id<MTLBuffer> buffer =
+      [device newBufferWithLength:sizeof(e)
+                          options:MTLResourceStorageModeShared];
+    vtkMetalMRC::AssignConsumed(this->Internals->EdgeUniformBuffer, buffer);
+  }
+
+  memcpy([this->Internals->EdgeUniformBuffer contents], &e, sizeof(e));
 }
 
 //------------------------------------------------------------------------------

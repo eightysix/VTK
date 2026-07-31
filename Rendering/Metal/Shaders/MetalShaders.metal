@@ -36,6 +36,14 @@ struct CoincidentOffsetUniforms {
   float pointOffset;
 };
 
+// Single-pass surface edges (per-frame uniform, fragment buffer(4))
+struct EdgeUniforms {
+  float4 edgeColor;     // rgb + edgeOpacity
+  float  edgeWidth;     // pixels = UseLineWidthForEdgeThickness ? LineWidth : EdgeWidth
+  uint   flags;         // bit0 = edgeVisibility, bit1 = renderLinesAsTubes
+  float  _pad;
+};
+
 // Vertex color override (P1-4)
 struct VertexColorUniforms {
   float4 color;
@@ -99,6 +107,12 @@ struct VertexOut {
   uint cellId;           // P2-8: flat-interpolated cell ID (1-based, 0=background)
   uint propId;           // P2-8: flat-interpolated prop ID (1-based, 0=background)
   uint compositeIndex;   // P2-8: flat-interpolated composite index (0 = no composite)
+  float3 bary;           // per-corner barycentric coords (indexed entry only)
+  float3 baryW;          // bary * clip-space w (linear in window space)
+  uint   edgeFlags;      // boundary-edge mask (indexed entry only)
+  float2 ePos0;          // window-space triangle corner positions (indexed entry only)
+  float2 ePos1;
+  float2 ePos2;
 };
 
 // Per-draw picking identity. propId is the renderer's PropArray index assigned
@@ -218,6 +232,84 @@ inline ResolvedMaterial resolveMaterial(
     return r;
 }
 
+// Single-pass surface edges (port of vtkOpenGLPolyDataMapper::ReplaceShaderEdges).
+// The edge band is drawn on the surface fragment itself, so no separate depth
+// term is added. Per-triangle window-space edge equations are built from the
+// three corner positions (passed as constant varyings from the indexed vertex
+// entry) and evaluated at the fragment's window position. This mirrors the GL
+// geometry shader exactly, avoiding the barycentric/gradient reconstruction.
+// Sign conventions match GL: edist > 0 means inside the triangle.
+inline void applySurfaceEdges(thread float3& N,
+                              thread ResolvedMaterial& r,
+                              VertexOut in,
+                              constant LightUniforms& lights,
+                              constant EdgeUniforms& edge,
+                              constant SceneUniforms& scene) {
+  if ((edge.flags & 1u) == 0u) return;
+  if (in.edgeFlags == 0u) return;
+
+  // Window-space corner positions (y-up, matching GL window layout).
+  float2 p[3] = { in.ePos0, in.ePos1, in.ePos2 };
+  // Fragment window position flipped to the same y-up convention.
+  float2 fp = float2(in.position.x, scene.viewport.w - in.position.y);
+
+  // GL GS: ccw = sign of the 2D cross of the two edges at corner 0.
+  float ccw = sign((p[1].x - p[0].x) * (p[2].y - p[0].y) -
+                   (p[1].y - p[0].y) * (p[2].x - p[0].x));
+
+  // GL GS: edgeEqn[i] = (n.x, n.y, 0, -dot(p[i], n)), n = ccw * (-dy, dx)/len.
+  float4 eq[3];
+  for (int i = 0; i < 3; ++i) {
+    float2 e = normalize(p[(i + 1) % 3] - p[i]);
+    float2 n = ccw * float2(-e.y, e.x);
+    eq[i] = float4(n.x, n.y, 0.0, -dot(p[i], n));
+  }
+
+  float lw = max(edge.edgeWidth, 0.001);
+  // GL: inactive edges get edgeEqn[i].z = lineWidth so they never win the min.
+  // CPU bit layout (c1c2, c2c0, c0c1): bit0 = edge(1,2), bit1 = edge(2,0),
+  // bit2 = edge(0,1).
+  eq[0].z = (in.edgeFlags & 4u) != 0u ? 0.0 : lw;   // edge 0->1
+  eq[1].z = (in.edgeFlags & 1u) != 0u ? 0.0 : lw;   // edge 1->2
+  eq[2].z = (in.edgeFlags & 2u) != 0u ? 0.0 : lw;   // edge 2->0
+
+  float ed[3];
+  ed[0] = dot(eq[0].xy, fp) + eq[0].w + eq[0].z;
+  ed[1] = dot(eq[1].xy, fp) + eq[1].w + eq[1].z;
+  ed[2] = dot(eq[2].xy, fp) + eq[2].w + eq[2].z;
+
+  float emix = clamp(0.5 + 0.5 * lw - min(ed[0], min(ed[1], ed[2])), 0.0, 1.0);
+
+  // nearest-edge screen normal (GL cedge.xy)
+  float2 n2 = (ed[0] <= ed[1] && ed[0] <= ed[2]) ? eq[0].xy
+             : ((ed[1] <= ed[2]) ? eq[1].xy : eq[2].xy);
+  float3 tnorm = normalize(cross(N, cross(float3(n2, 0.0), N)));
+
+  float cdist = min(ed[0], ed[1]);
+  float rdist = 2.0 * min(cdist, ed[2]) / lw;
+
+  float3 ec = edge.edgeColor.rgb;
+  float  eo = edge.edgeColor.a;
+  // GL only fakes tubes when lights are present; otherwise the flat branch
+  bool tube = ((edge.flags & 2u) != 0u) && lights.lightCount > 0;
+
+  if (tube) {
+    // tube branch: mix BOTH diffuse and ambient toward edgeColor
+    r.diffuse = mix(r.diffuse, ec, emix * eo);
+    r.ambient = mix(r.ambient, ec, emix * eo);
+    // self-occlusion A-term (GL :736-737)
+    float A = tnorm.z;
+    rdist = 0.5 * rdist + 0.5 * (rdist + A) / (1.0 + abs(A));
+    float lenZ = clamp(sqrt(max(1.0 - rdist * rdist, 0.0)), 0.0, 1.0);
+    float3 tubeN = normalize(rdist * tnorm + N * lenZ);
+    N = mix(N, tubeN, emix);
+  } else {
+    // flat branch (RenderLinesAsTubes off)
+    r.diffuse = mix(r.diffuse, float3(0.0), emix * eo);
+    r.ambient = mix(r.ambient, ec,            emix * eo);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Vertex shader
 // ---------------------------------------------------------------------------
@@ -242,6 +334,67 @@ vertex VertexOut vertex_main(uint vertex_id [[vertex_id]],
   out.cellId = cellIds[vertex_id];
   out.propId = mapPropId(pickIds.propId);
   out.compositeIndex = pickIds.compositeIndex;
+  out.bary = float3(0.0);
+  out.baryW = float3(0.0);
+  out.edgeFlags = 0u;
+  out.ePos0 = float2(0.0);
+  out.ePos1 = float2(0.0);
+  out.ePos2 = float2(0.0);
+
+  return out;
+}
+
+// Indirection vertex entry for single-pass surface edges. The deduplicated
+// triangle vertex arrays are read through the triangle index buffer, while
+// bary/flags are read by vertex_id (per triangle corner). Drawn non-indexed.
+vertex VertexOut vertex_main_indexed(uint vertex_id [[vertex_id]],
+                                     constant packed_float3* positions [[buffer(0)]],
+                                     constant packed_float3* normals   [[buffer(1)]],
+                                     constant SceneUniforms& scene     [[buffer(2)]],
+                                     constant float4*        colors    [[buffer(3)]],
+                                     constant ClipPlaneUniforms& clip  [[buffer(5)]],
+                                     constant uint*          cellIds   [[buffer(6)]],
+                                     constant PickIds&       pickIds   [[buffer(7)]],
+                                     constant float2*        uvs       [[buffer(8)]],
+                                     constant uint*          triIdx    [[buffer(9)]],
+                                     constant packed_float3* bary      [[buffer(10)]],
+                                     constant uint*          eflags    [[buffer(11)]],
+                                     constant packed_float3* triPos    [[buffer(12)]]) {
+  VertexOut out;
+
+  uint idx = triIdx[vertex_id];
+  float3 inPos = float3(positions[idx]);
+  float3 inNrm = float3(normals[idx]);
+
+  float4 worldPos = scene.modelMatrix * float4(inPos, 1.0);
+  float4 viewPos = scene.viewMatrix * worldPos;
+  out.viewPos = viewPos.xyz;
+  out.position = scene.projectionMatrix * viewPos;
+  out.viewNormal = scene.normalMatrix * inNrm;
+  out.vertexColor = colors[idx];
+  out.uv = uvs[idx];
+  out.modelPos = inPos;
+  out.cellId = cellIds[idx];
+  out.propId = mapPropId(pickIds.propId);
+  out.compositeIndex = pickIds.compositeIndex;
+  out.bary = bary[vertex_id];
+  out.baryW = out.bary * out.position.w;
+  out.edgeFlags = eflags[vertex_id];
+
+  // Window-space positions of the triangle's 3 corners, for the surface-edge
+  // distance field. Record layout: 3 consecutive float3 per corner record
+  // (corner 0/1/2 object positions), replicated for each of the 3 corners.
+  // All 3 corners emit identical values, so interpolation is exact.
+  float2 eW[3];
+  for (int j = 0; j < 3; ++j) {
+    float4 clip = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix *
+                  float4(float3(triPos[vertex_id * 3 + j]), 1.0);
+    float2 ndc = clip.xy / clip.w;
+    eW[j] = scene.viewport.zw * (0.5 * ndc + 0.5);   // y-up window coords
+  }
+  out.ePos0 = eW[0];
+  out.ePos1 = eW[1];
+  out.ePos2 = eW[2];
 
   return out;
 }
@@ -254,6 +407,7 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
                               constant LightUniforms& lights [[buffer(1)]],
                               constant SceneUniforms& scene [[buffer(2)]],
                               constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+                              constant EdgeUniforms& edge [[buffer(4)]],
                               constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
                               texture2d<float> actorTexture [[texture(0)]],
                               sampler actorSampler [[sampler(0)]],
@@ -277,6 +431,7 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
   }
 
   ResolvedMaterial r = resolveMaterial(m, scene, in.vertexColor, in.uv, actorTexture, actorSampler);
+  applySurfaceEdges(N, r, in, lights, edge, scene);
 
   float3 totalAmbient = m.ambientColor.w * r.ambient;
   float3 totalDiffuse = float3(0.0);
@@ -812,10 +967,21 @@ fragment FragmentOutput fragment_miter_join_line_main(
 // ---------------------------------------------------------------------------
 struct TessParams { uint numCells; uint cellIdOffset; };
 
+inline bool tessIsBoundary(uint a, uint b, constant uint* connectivity, uint inputOffset, uint npts) {
+  for (uint k = 0u; k < npts; ++k) {
+    uint x = connectivity[inputOffset + k];
+    uint y = connectivity[inputOffset + (k + 1u) % npts];
+    if ((x == a && y == b) || (x == b && y == a)) return true;
+  }
+  return false;
+}
+
 kernel void polygonToTriangle(
     device uint* outConnectivity [[buffer(0)]],
     device float* edgeArray [[buffer(1)]],
     device uint* cellIds [[buffer(2)]],
+    device float3* outBary [[buffer(7)]],
+    device uint* outEdgeFlags [[buffer(8)]],
     constant uint* connectivity [[buffer(3)]],
     constant uint* offsets [[buffer(4)]],
     constant uint* primitiveCounts [[buffer(5)]],
@@ -823,6 +989,7 @@ kernel void polygonToTriangle(
     uint gid [[thread_position_in_grid]]) {
   if (gid >= params.numCells) return;
 
+  uint npts = offsets[gid + 1u] - offsets[gid];
   uint numTriangles = primitiveCounts[gid + 1u] - primitiveCounts[gid];
   uint outputOffset = primitiveCounts[gid] * 3u;
   uint inputOffset = offsets[gid];
@@ -832,9 +999,23 @@ kernel void polygonToTriangle(
     edgeArray[triangleId] = (numTriangles == 1u) ? -1.0 : (i == 0u ? 2.0 : (i == numTriangles - 1u ? 0.0 : 1.0));
     cellIds[triangleId] = gid + params.cellIdOffset + 1u;
 
-    outConnectivity[outputOffset] = connectivity[inputOffset];
-    outConnectivity[outputOffset + 1u] = connectivity[inputOffset + i + 1u];
-    outConnectivity[outputOffset + 2u] = connectivity[inputOffset + i + 2u];
+    uint c0 = connectivity[inputOffset];
+    uint c1 = connectivity[inputOffset + i + 1u];
+    uint c2 = connectivity[inputOffset + i + 2u];
+    outConnectivity[outputOffset] = c0;
+    outConnectivity[outputOffset + 1u] = c1;
+    outConnectivity[outputOffset + 2u] = c2;
+
+    uint f12 = tessIsBoundary(c1, c2, connectivity, inputOffset, npts) ? 1u : 0u;
+    uint f20 = tessIsBoundary(c2, c0, connectivity, inputOffset, npts) ? 1u : 0u;
+    uint f01 = tessIsBoundary(c0, c1, connectivity, inputOffset, npts) ? 1u : 0u;
+    uint packed = (f12) | (f20 << 1u) | (f01 << 2u);
+    outBary[outputOffset] = float3(1.0, 0.0, 0.0);
+    outBary[outputOffset + 1u] = float3(0.0, 1.0, 0.0);
+    outBary[outputOffset + 2u] = float3(0.0, 0.0, 1.0);
+    outEdgeFlags[outputOffset] = packed;
+    outEdgeFlags[outputOffset + 1u] = packed;
+    outEdgeFlags[outputOffset + 2u] = packed;
     outputOffset += 3u;
   }
 }
@@ -1035,6 +1216,7 @@ fragment PeelPassOutput fragment_peel(
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+    constant EdgeUniforms& edge [[buffer(4)]],
     constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
     texture2d<float> actorTexture [[texture(0)]],
     sampler actorSampler [[sampler(0)]],
@@ -1079,6 +1261,7 @@ fragment PeelPassOutput fragment_peel(
     m.specularPower = material.backfaceSpecularPower;
   }
   ResolvedMaterial r = resolveMaterial(m, scene, in.vertexColor, in.uv, actorTexture, actorSampler);
+  applySurfaceEdges(N, r, in, lights, edge, scene);
   float3 totalAmbient = m.ambientColor.w * r.ambient;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
@@ -1105,6 +1288,7 @@ fragment float4 fragment_peel_alpha_blend(
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+    constant EdgeUniforms& edge [[buffer(4)]],
     constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
     texture2d<float> actorTexture [[texture(0)]],
     sampler actorSampler [[sampler(0)]],
@@ -1134,6 +1318,7 @@ fragment float4 fragment_peel_alpha_blend(
     m.specularPower = material.backfaceSpecularPower;
   }
   ResolvedMaterial r = resolveMaterial(m, scene, in.vertexColor, in.uv, actorTexture, actorSampler);
+  applySurfaceEdges(N, r, in, lights, edge, scene);
   float3 totalAmbient = m.ambientColor.w * r.ambient;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
