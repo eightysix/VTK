@@ -2107,11 +2107,14 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   auto emitExtraAttrsForPoint = [&](vtkIdType pointId) {
     for (const auto& attr : this->ExtraAttributes)
     {
-      vtkDataArray* da = nullptr;
-      if (attr.second.FieldAssociation == vtkDataObject::FIELD_ASSOCIATION_POINTS)
+      // Each lambda is gated by field association so the point and cell paths
+      // never double-emit for the same attribute (which would push one extra
+      // zero per vertex and break the positions-parallel invariant).
+      if (attr.second.FieldAssociation != vtkDataObject::FIELD_ASSOCIATION_POINTS)
       {
-        da = polydata->GetPointData()->GetArray(attr.second.DataArrayName.c_str());
+        continue;
       }
+      vtkDataArray* da = polydata->GetPointData()->GetArray(attr.second.DataArrayName.c_str());
       if (da && pointId < da->GetNumberOfTuples())
       {
         int numComps = da->GetNumberOfComponents();
@@ -2132,9 +2135,9 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       }
       else
       {
-        vtkDataArray* dummyDa = da;
+        // Zero-fill to stay parallel with positions (missing/OOB point array).
         int effectiveComps = (attr.second.ComponentNumber < 0)
-          ? (dummyDa ? dummyDa->GetNumberOfComponents() : 1) : 1;
+          ? (da ? da->GetNumberOfComponents() : 1) : 1;
         for (int c = 0; c < effectiveComps; ++c)
         {
           extraAttrArrays[attr.first].push_back(0.0f);
@@ -2145,12 +2148,12 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   auto emitExtraAttrsForCell = [&](vtkIdType cellId) {
     for (const auto& attr : this->ExtraAttributes)
     {
-      vtkDataArray* da = nullptr;
-      if (attr.second.FieldAssociation == vtkDataObject::FIELD_ASSOCIATION_CELLS)
+      if (attr.second.FieldAssociation != vtkDataObject::FIELD_ASSOCIATION_CELLS)
       {
-        da = polydata->GetCellData()->GetArray(attr.second.DataArrayName.c_str());
+        continue;
       }
-      if (da && cellId < da->GetNumberOfTuples())
+      vtkDataArray* da = polydata->GetCellData()->GetArray(attr.second.DataArrayName.c_str());
+      if (da && cellId >= 0 && cellId < da->GetNumberOfTuples())
       {
         int numComps = da->GetNumberOfComponents();
         int comp = attr.second.ComponentNumber;
@@ -2168,8 +2171,35 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
             static_cast<float>(da->GetComponent(cellId, comp)));
         }
       }
+      else
+      {
+        // Zero-fill to stay parallel with positions (missing/OOB cell array).
+        int effectiveComps = (attr.second.ComponentNumber < 0)
+          ? (da ? da->GetNumberOfComponents() : 1) : 1;
+        for (int c = 0; c < effectiveComps; ++c)
+        {
+          extraAttrArrays[attr.first].push_back(0.0f);
+        }
+      }
     }
   };
+
+  // P10-10B: Cell-associated extra attributes are per-primitive — a shared
+  // vertex cannot carry two different cell values. When any is mapped, force the
+  // CPU, non-indexed triangle path and disable GPU tessellation so every
+  // rendered vertex is unique and can carry its own cell's value. (CPU line and
+  // wireframe paths deduplicate vertices by point ID, so a point shared by two
+  // cells carries the first cell's value — inherent to deduplication, and those
+  // pipelines do not bind extra-attribute buffers anyway.)
+  bool hasCellAssociatedExtraAttrs = false;
+  for (const auto& attr : this->ExtraAttributes)
+  {
+    if (attr.second.FieldAssociation == vtkDataObject::FIELD_ASSOCIATION_CELLS)
+    {
+      hasCellAssociatedExtraAttrs = true;
+      break;
+    }
+  }
 
   vtkIdType lineCellOffset = polydata->GetNumberOfVerts();
   vtkIdType polyCellOffset = lineCellOffset + polydata->GetNumberOfLines();
@@ -2280,7 +2310,8 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   // Falls back to CPU for per-cell coloring, computed normals, or small geometries.
   vtkCellArray* polys = polydata->GetPolys();
   vtkIdType numPolyPts = polydata->GetNumberOfPoints();
-  bool useGPUTess = (cellFlag == 0) && normalArray && (numPolyPts > 1000);
+  bool useGPUTess = (cellFlag == 0) && normalArray && (numPolyPts > 1000) &&
+    !hasCellAssociatedExtraAttrs;
   bool gpuTessUsed = false;
 
   if (useGPUTess)
@@ -2731,6 +2762,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   {
     vtkCellArray* lines = polydata->GetLines();
     if (representation != VTK_POINTS &&
+        !hasCellAssociatedExtraAttrs &&
         (!gpuTessUsed || (representation == VTK_SURFACE && !this->Internals->HasLines)))
     {
       if (lines && lines->GetNumberOfCells() > 0 && cellFlag == 0)
@@ -3101,7 +3133,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
         // normals for vertices shared between faces with different orientations.
         // When cellFlag != 0 (per-cell coloring), vertices at the same point may
         // have different colors from different cells, so no deduplication is possible.
-        bool useIndexBuffer = (cellFlag == 0) && normalArray;
+        bool useIndexBuffer = (cellFlag == 0) && normalArray && !hasCellAssociatedExtraAttrs;
 
         for (vtkIdType i = 1; i < npts - 1; ++i)
         {
@@ -3211,8 +3243,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                 normals.push_back(faceNormal[2]);
               }
 
-              // P1-1B: per-vertex color from cell scalar mapping
-              emitSurfaceColor(polyCellIdx, mappedColors ? mappedColors->GetPointer(0) : nullptr);
+              // P1-1A/1B: per-vertex color — point index for per-point coloring
+              // (cellFlag == 0), cell index for per-cell coloring.
+              emitSurfaceColor((cellFlag == 0) ? tri[j] : polyCellIdx,
+                mappedColors ? mappedColors->GetPointer(0) : nullptr);
 
               // P5-5A: texture coordinates for non-indexed triangle vertex
               if (tcoordArray && tcoordArray->GetNumberOfTuples() > tri[j])
@@ -3731,6 +3765,37 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
     vtkMetalMRC::AssignConsumed(this->Internals->TriangleUVBuffer, zeroUVBuf);
   }
 
+  // 8D validation: every active extra attribute must have exactly one value
+  // tuple per rendered vertex, matching positions.size() / 3. Under the current
+  // emission paths (point and cell lambdas gated by field association, cell
+  // attrs forced onto the CPU non-indexed path) this holds by construction; a
+  // mismatch here signals an emission bug, so log it loudly instead of silently
+  // uploading a short buffer.
+  {
+    const vtkIdType vertexCount = static_cast<vtkIdType>(positions.size() / 3);
+    for (const auto& attr : this->ExtraAttributes)
+    {
+      int comps = 1;
+      vtkDataArray* da =
+        (attr.second.FieldAssociation == vtkDataObject::FIELD_ASSOCIATION_CELLS)
+          ? polydata->GetCellData()->GetArray(attr.second.DataArrayName.c_str())
+          : polydata->GetPointData()->GetArray(attr.second.DataArrayName.c_str());
+      if (da)
+      {
+        comps = (attr.second.ComponentNumber < 0) ? da->GetNumberOfComponents() : 1;
+      }
+      const size_t expected = static_cast<size_t>(vertexCount) * comps;
+      const size_t actual = extraAttrArrays[attr.first].size();
+      if (actual != expected)
+      {
+        vtkErrorMacro(<< "Extra attribute '" << attr.first
+                      << "' size mismatch: expected " << expected
+                      << " (" << vertexCount << " verts x " << comps << " comps)"
+                      << ", got " << actual << ".");
+      }
+    }
+  }
+
   // 8D: Create extra attribute buffers from per-vertex arrays built during emission.
   // Each attribute has exactly one value per rendered vertex, matching positions.size() / 3.
   for (const auto& attr : this->ExtraAttributes)
@@ -3752,10 +3817,6 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
     {
       da = polydata->GetPointData()->GetArray(attr.second.DataArrayName.c_str());
     }
-    // TODO: emitExtraAttrsForCell not called here — cell association data is
-    // lost after GPU tessellation since the vertex-count-based attribute arrays
-    // use per-point emission only. For the CPU path, cell data is duplicated
-    // per-vertex during emission in BuildGeometryBuffers.
     else if (attr.second.FieldAssociation == vtkDataObject::FIELD_ASSOCIATION_CELLS)
     {
       da = polydata->GetCellData()->GetArray(attr.second.DataArrayName.c_str());
