@@ -51,6 +51,9 @@ CMAKE_CMD=(cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}" -GNinja \
 
 "${CMAKE_CMD[@]}"
 
+echo "Step 2a: Pointing clangd at this build..."
+"${SCRIPT_DIR}/clangd_switch.sh" ios
+
 echo "Step 3: Building..."
 cmake --build "${BUILD_DIR}" -j"$(sysctl -n hw.ncpu)"
 

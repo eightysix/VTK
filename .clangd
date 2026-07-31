@@ -1,12 +1,7 @@
 CompileFlags:
-  CompilationDatabase: build_ios_metal
+  # Symlink to the active build's compile_commands.json, managed by clangd_switch.sh
+  CompilationDatabase: .clangd-db
   Add:
-    # iOS SDK
-    - -isysroot
-    - /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk
-    # Target arm64 iOS (matches ios_metal_build.sh)
-    - -target
-    - arm64-apple-ios16.0
     # C++17 (matches VTK's cmake CMAKE_CXX_STANDARD=17)
     - -std=gnu++17
 

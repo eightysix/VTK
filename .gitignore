@@ -2,6 +2,8 @@ xcuserdata
 
 .mimocode
 
+.clangd-db
+
 dawn
 build
 build-mac
