@@ -259,6 +259,7 @@
   {
     case VTKGestureStateBegan:
       [self interactionDidStart];
+      _dragLastTranslation = translation;
       [self prepareVRClippingPlaneWithCamera:cam];
       break;
     case VTKGestureStateChanged:
