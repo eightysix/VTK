@@ -49,6 +49,11 @@ public:
   void SetOverridePropIdToNone();
   void ClearOverridePropId();
 
+  // Override the composite index written to the picking texture's CompositeId
+  // channel (set by vtkMetalBatchedPolyDataMapper for per-block picking).
+  void SetOverrideCompositeIndex(uint32_t compositeIndex);
+  void ClearOverrideCompositeIndex();
+
   // Batch visual overrides (set by vtkMetalBatchedPolyDataMapper)
   void SetBatchVisualOverride(
     bool overrideColor,
@@ -83,6 +88,12 @@ protected:
   void UpdateClipPlaneUniforms(void* mtlDevice, vtkActor* actor);
   void UpdateActorTexture(void* mtlDevice, vtkActor* actor);
   void EnsurePeelPipelineStates(void* mtlDevice);
+
+  // Picking: write {propId, compositeIndex} into the PropIdBuffer (PickIds).
+  // During a selection pass propId is the prop's per-render PropArray index
+  // (queried from the hardware selector); otherwise it falls back to
+  // overrides/0.
+  void UpdatePickUniforms(vtkRenderer* ren, vtkActor* act);
 
   // 8D: Vertex attribute mappings (attribute name → data source)
   std::map<std::string, ExtraAttributeValue> ExtraAttributes;

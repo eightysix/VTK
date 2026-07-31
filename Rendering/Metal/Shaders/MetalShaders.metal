@@ -88,6 +88,15 @@ struct VertexOut {
   float3 modelPos;       // Optimized 6-plane clip validation
   uint cellId;           // P2-8: flat-interpolated cell ID (1-based, 0=background)
   uint propId;           // P2-8: flat-interpolated prop ID (1-based, 0=background)
+  uint compositeIndex;   // P2-8: flat-interpolated composite index (0 = no composite)
+};
+
+// Per-draw picking identity. propId is the renderer's PropArray index assigned
+// per-render during selection passes; compositeIndex carries the composite
+// dataset block index (flat index) for batched blocks.
+struct PickIds {
+  uint propId;
+  uint compositeIndex;
 };
 
 // Fragment output with explicit depth
@@ -198,7 +207,7 @@ vertex VertexOut vertex_main(uint vertex_id [[vertex_id]],
                              constant float4* vertexColors [[buffer(3)]],
                              constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
                              constant uint* cellIds [[buffer(6)]],
-                             constant uint& propId [[buffer(7)]],
+                             constant PickIds& pickIds [[buffer(7)]],
                              constant float2* triangleUVs [[buffer(8)]]) {
   VertexOut out;
 
@@ -211,7 +220,8 @@ vertex VertexOut vertex_main(uint vertex_id [[vertex_id]],
   out.uv = triangleUVs[vertex_id];
   out.modelPos = in.position; // Direct pass for unbounded planes evaluation
   out.cellId = cellIds[vertex_id];
-  out.propId = mapPropId(propId);
+  out.propId = mapPropId(pickIds.propId);
+  out.compositeIndex = pickIds.compositeIndex;
 
   return out;
 }
@@ -241,7 +251,7 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
 
   FragmentOutput out;
   out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, r.opacity);
-  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
+  out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
   
   float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
   out.depth = in.position.z + coinOffset.polygonFactor * cscale + coinOffset.polygonOffset / 65000.0;
@@ -257,7 +267,7 @@ fragment FragmentOutput fragment_edge_main(VertexOut in [[stage_in]],
   if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
   FragmentOutput out;
   out.color = float4(edgeColor.rgb, edgeColor.a * material.opacity);
-  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
+  out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
 
   float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
   out.depth = in.position.z + coinOffset.lineFactor * cscale + coinOffset.lineOffset / 65000.0;
@@ -278,6 +288,7 @@ struct PointVertexOut {
   float2 lut_uv;
   uint cellId;
   uint propId;
+  uint compositeIndex;
 };
 
 vertex PointVertexOut vertex_point_main(
@@ -290,7 +301,7 @@ vertex PointVertexOut vertex_point_main(
     constant float2* point_uvs [[buffer(7)]],
     constant float2* point_color_uvs [[buffer(8)]],
     constant uint* pointCellIds [[buffer(11)]],
-    constant uint& pointPropId [[buffer(12)]]) {
+    constant PickIds& pickIds [[buffer(12)]]) {
   PointVertexOut out;
   float3 pos = point_positions[vertex_id];
   float4 worldPos = scene.modelMatrix * float4(pos, 1.0);
@@ -305,7 +316,8 @@ vertex PointVertexOut vertex_point_main(
   out.uv = point_uvs[vertex_id];
   out.lut_uv = point_color_uvs[vertex_id];
   out.cellId = pointCellIds[vertex_id];
-  out.propId = mapPropId(pointPropId);
+  out.propId = mapPropId(pickIds.propId);
+  out.compositeIndex = pickIds.compositeIndex;
   return out;
 }
 
@@ -329,7 +341,7 @@ fragment FragmentOutput fragment_point_main(PointVertexOut in [[stage_in]],
 
   FragmentOutput out;
   out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha * material.opacity);
-  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
+  out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
   out.depth = in.position.z + coinOffset.pointOffset / 65000.0;
   return out;
 }
@@ -348,6 +360,7 @@ struct PointShapedVertexOut {
   float2 lut_uv;
   uint cellId;
   uint propId;
+  uint compositeIndex;
 };
 
 vertex PointShapedVertexOut vertex_point_shaped_main(
@@ -362,7 +375,7 @@ vertex PointShapedVertexOut vertex_point_shaped_main(
     constant float2* point_uvs [[buffer(7)]],
     constant float2* point_color_uvs [[buffer(8)]],
     constant uint* shapedCellIds [[buffer(11)]],
-    constant uint& shapedPropId [[buffer(12)]]) {
+    constant PickIds& pickIds [[buffer(12)]]) {
   
   const float2 tri_verts[4] = { float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1) };
   uint point_id = connectivity[instance_id];
@@ -387,7 +400,8 @@ vertex PointShapedVertexOut vertex_point_shaped_main(
   out.uv = point_uvs[point_id];
   out.lut_uv = point_color_uvs[point_id];
   out.cellId = shapedCellIds[point_id];
-  out.propId = mapPropId(shapedPropId);
+  out.propId = mapPropId(pickIds.propId);
+  out.compositeIndex = pickIds.compositeIndex;
   return out;
 }
 
@@ -436,7 +450,7 @@ fragment FragmentOutput fragment_point_shaped_main(
   computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
 
   out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha * material.opacity);
-  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
+  out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
   out.depth += coinOffset.pointOffset / 65000.0;
   return out;
 }
@@ -452,6 +466,7 @@ struct LineVertexOut {
   float dist_to_centerline;
   uint cellId;
   uint propId;
+  uint compositeIndex;
 };
 
 inline FragmentOutput shadeLineFragment(LineVertexOut in,
@@ -472,7 +487,7 @@ inline FragmentOutput shadeLineFragment(LineVertexOut in,
 
   out.color = float4(material.ambientColor.w * baseColor
                    + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha);
-  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
+  out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
   float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
   out.depth = in.position.z + coinOffset.lineFactor * cscale + coinOffset.lineOffset / 65000.0;
   return out;
@@ -487,7 +502,7 @@ vertex LineVertexOut vertex_thick_line_main(
     constant float4* vertexColors [[buffer(3)]],
     constant float& lineWidth [[buffer(4)]],
     constant uint* cellIds [[buffer(5)]],
-    constant uint& propId [[buffer(6)]]) {
+    constant PickIds& pickIds [[buffer(6)]]) {
   
   const float2 tri_verts[4] = { float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1) };
   float2 p_coord = tri_verts[vertex_id];
@@ -528,7 +543,8 @@ vertex LineVertexOut vertex_thick_line_main(
   out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], t);
   out.dist_to_centerline = side;
   out.cellId = cellIds[instance_id];
-  out.propId = mapPropId(propId);
+  out.propId = mapPropId(pickIds.propId);
+  out.compositeIndex = pickIds.compositeIndex;
   return out;
 }
 
@@ -553,7 +569,7 @@ vertex LineVertexOut vertex_round_cap_line_main(
     constant float4* vertexColors [[buffer(3)]],
     constant float& lineWidth [[buffer(4)]],
     constant uint* cellIds [[buffer(5)]],
-    constant uint& propId [[buffer(6)]]) {
+    constant PickIds& pickIds [[buffer(6)]]) {
 
   float3 p_coord;
   const int CAP_SEGMENTS = 5;
@@ -613,7 +629,8 @@ vertex LineVertexOut vertex_round_cap_line_main(
   out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], p_coord.z);
   out.dist_to_centerline = p_coord.y;
   out.cellId = cellIds[instance_id];
-  out.propId = mapPropId(propId);
+  out.propId = mapPropId(pickIds.propId);
+  out.compositeIndex = pickIds.compositeIndex;
   return out;
 }
 
@@ -638,7 +655,7 @@ vertex LineVertexOut vertex_miter_join_line_main(
     constant float4* vertexColors [[buffer(3)]],
     constant float& lineWidth [[buffer(4)]],
     constant uint* cellIds [[buffer(5)]],
-    constant uint& propId [[buffer(6)]],
+    constant PickIds& pickIds [[buffer(6)]],
     constant uint& segmentCount [[buffer(7)]]) {
   
   const float2 tri_verts[4] = { float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1) };
@@ -715,7 +732,8 @@ vertex LineVertexOut vertex_miter_join_line_main(
   out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], t);
   out.dist_to_centerline = side;
   out.cellId = cellIds[instance_id];
-  out.propId = mapPropId(propId);
+  out.propId = mapPropId(pickIds.propId);
+  out.compositeIndex = pickIds.compositeIndex;
   return out;
 }
 
@@ -1030,6 +1048,7 @@ struct GlyphVertexOut {
   float3 modelPos;
   uint cellId;
   uint propId;
+  uint compositeIndex;
   float point_size [[point_size]];
 };
 
@@ -1038,7 +1057,7 @@ inline GlyphVertexOut computeGlyphVertex(
     constant float3* positions, constant float3* normals,
     constant float4x4* glyphTransforms, constant float3x3* glyphNormalTransforms,
     constant float4* glyphColors, constant uint* glyphPickIds,
-    constant SceneUniforms& scene, constant uint& propId,
+    constant SceneUniforms& scene, constant PickIds& pickIds,
     float pointSize)
 {
   GlyphVertexOut out;
@@ -1049,7 +1068,8 @@ inline GlyphVertexOut computeGlyphVertex(
   out.viewNormal = scene.normalMatrix * glyphNormalTransforms[instance_id] * normals[vertex_id];
   out.glyphColor = glyphColors[instance_id];
   out.cellId = glyphPickIds[instance_id] + 1u;
-  out.propId = mapPropId(propId);
+  out.propId = mapPropId(pickIds.propId);
+  out.compositeIndex = pickIds.compositeIndex;
   out.point_size = pointSize;
   out.modelPos = pos;
   return out;
@@ -1068,7 +1088,7 @@ inline FragmentOutput shadeGlyphFragment(GlyphVertexOut in,
   out.color = float4(material.ambientColor.w * in.glyphColor.rgb
                    + material.diffuseColor.w * totalDiffuse + totalSpecular,
                    in.glyphColor.a * material.opacity);
-  out.ids = uint4(in.cellId, in.propId, 1u, 0u);
+  out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
   out.depth = in.position.z + depthBias;
   return out;
 }
@@ -1079,10 +1099,10 @@ vertex GlyphVertexOut vertex_glyph_main(
     constant float4x4* glyphTransforms [[buffer(2)]], constant float3x3* glyphNormalTransforms [[buffer(3)]],
     constant float4* glyphColors [[buffer(4)]], constant uint* glyphPickIds [[buffer(5)]],
     constant SceneUniforms& scene [[buffer(8)]], constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
-    constant uint& propId [[buffer(10)]]) {
+    constant PickIds& pickIds [[buffer(10)]]) {
   return computeGlyphVertex(vertex_id, instance_id, positions, normals,
       glyphTransforms, glyphNormalTransforms, glyphColors, glyphPickIds,
-      scene, propId, 0.0);
+      scene, pickIds, 0.0);
 }
 
 fragment FragmentOutput fragment_glyph_main(
@@ -1101,10 +1121,10 @@ vertex GlyphVertexOut vertex_glyph_line_main(
     constant float4x4* glyphTransforms [[buffer(2)]], constant float3x3* glyphNormalTransforms [[buffer(3)]],
     constant float4* glyphColors [[buffer(4)]], constant uint* glyphPickIds [[buffer(5)]],
     constant SceneUniforms& scene [[buffer(8)]], constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
-    constant uint& propId [[buffer(10)]]) {
+    constant PickIds& pickIds [[buffer(10)]]) {
   return computeGlyphVertex(vertex_id, instance_id, positions, normals,
       glyphTransforms, glyphNormalTransforms, glyphColors, glyphPickIds,
-      scene, propId, 0.0);
+      scene, pickIds, 0.0);
 }
 
 fragment FragmentOutput fragment_glyph_line_main(
@@ -1123,10 +1143,10 @@ vertex GlyphVertexOut vertex_glyph_point_main(
     constant float4x4* glyphTransforms [[buffer(2)]], constant float3x3* glyphNormalTransforms [[buffer(3)]],
     constant float4* glyphColors [[buffer(4)]], constant uint* glyphPickIds [[buffer(5)]],
     constant SceneUniforms& scene [[buffer(8)]], constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
-    constant uint& propId [[buffer(10)]]) {
+    constant PickIds& pickIds [[buffer(10)]]) {
   return computeGlyphVertex(vertex_id, instance_id, positions, normals,
       glyphTransforms, glyphNormalTransforms, glyphColors, glyphPickIds,
-      scene, propId, scene.pointSize);
+      scene, pickIds, scene.pointSize);
 }
 
 fragment FragmentOutput fragment_glyph_point_main(

@@ -416,21 +416,22 @@ void vtkMetalBatchedPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       mapper->ClearBatchVisualOverride();
     }
 
-    // Per-block picking ID.
-    // FlatIndex comes from the composite dataset's block index. These IDs
-    // are unique within a single batched mapper, but may collide with IDs
-    // from non-batched actors (which use GetOrCreatePropId's global counter)
-    // or from other batched mappers. If hardware picking is used across
-    // multiple mappers, batch elements should allocate from a shared ID
-    // space or encode the mapper ID separately.
+    // Per-block picking.
+    // The prop ID is derived per-render by the child mapper from the active
+    // hardware selector (the parent actor's index in the selector's visible
+    // PropArray), so all blocks of this batched mapper report the parent
+    // actor's prop. The composite channel carries the block's FlatIndex so
+    // the picked block can be identified on readback.
     bool pickable = actorPickable && elem->Pickability;
     if (pickable)
     {
-      mapper->SetOverridePropId(elem->FlatIndex);
+      mapper->ClearOverridePropId();
+      mapper->SetOverrideCompositeIndex(elem->FlatIndex);
     }
     else
     {
       mapper->SetOverridePropIdToNone();
+      mapper->ClearOverrideCompositeIndex();
     }
 
     mapper->RenderPiece(ren, act);

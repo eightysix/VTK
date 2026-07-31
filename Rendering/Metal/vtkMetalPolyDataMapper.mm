@@ -5,6 +5,8 @@
 
 #include "vtkMetalRenderWindow.h"
 #include "vtkMetalRenderer.h"
+#include "vtkMetalHardwareSelector.h"
+#include "vtkMetalPickTypes.h"
 #include "vtkMetalCamera.h"
 #include "vtkMetalShaders.h"
 #include "vtkObjectFactory.h"
@@ -123,6 +125,11 @@ id<MTLBuffer> CreateZeroBuffer(id<MTLDevice> device, size_t bytes)
   return buffer;
 }
 
+// Shared GPU/CPU picking ID layout (see vtkMetalPickTypes.h). Written into
+// PropIdBuffer before each draw; consumed by vertex shaders as buffer(7)/
+// buffer(6)/buffer(12)/buffer(10).
+using PickIds = vtkMetalPickIds;
+
 } // namespace
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -182,7 +189,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLBuffer> PointCellIdBuffer = nil;       // GPU: per-point cell IDs
   id<MTLBuffer> EdgeCellIdBuffer = nil;
   id<MTLBuffer> EdgeUVBuffer = nil;            // P1-2: edge overlay UV coordinates
-  id<MTLBuffer> PropIdBuffer = nil;            // single uint32: actor prop ID
+  id<MTLBuffer> PropIdBuffer = nil;            // PickIds {propId, compositeIndex}: picking IDs
 
   // P2-4: separate alpha flag for opacity-only overrides
   bool HasSurfaceAlpha = false;
@@ -370,6 +377,10 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   // Override prop ID state (set by batched mapper for per-block picking)
   bool HasOverridePropId = false;
   uint32_t OverridePropId = 0;
+
+  // Override composite index state (set by batched mapper for per-block picking)
+  bool HasOverrideCompositeIndex = false;
+  uint32_t OverrideCompositeIndex = 0;
 
   // Batch visual override state (set by batched mapper)
   bool UseBatchColor = false;
@@ -1662,10 +1673,10 @@ void vtkMetalPolyDataMapper::EnsureRequiredBindingFallbacks(void* mtlDevice)
   // Prop ID buffer should always exist if anything is drawable.
   if (!this->Internals->PropIdBuffer)
   {
-    uint32_t propId = 0;
+    PickIds ids = { 0, 0 };
     id<MTLBuffer> buffer =
-        [device newBufferWithBytes:&propId
-                            length:sizeof(uint32_t)
+        [device newBufferWithBytes:&ids
+                            length:sizeof(PickIds)
                            options:MTLResourceStorageModeShared];
     vtkMetalMRC::AssignConsumed(this->Internals->PropIdBuffer, buffer);
   }
@@ -1922,14 +1933,9 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     // P1-3: Ensure fallback buffers exist for all shader-required bindings
     this->EnsureRequiredBindingFallbacks((void*)device);
 
-    if (this->Internals->HasOverridePropId)
-    {
-      this->SetPropId(this->Internals->OverridePropId);
-    }
-    else
-    {
-      this->SetPropId(this->GetOrCreatePropId(act));
-    }
+    // Picking IDs: during a selection pass write the prop's per-render index
+    // (from the hardware selector); otherwise fall back to overrides/0.
+    this->UpdatePickUniforms(ren, act);
 
     // 8C: Update edge color uniform before bundle recording (per-frame update)
     if (representation == VTK_SURFACE &&
@@ -3819,12 +3825,12 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
     vtkMetalMRC::AssignConsumed(this->Internals->LineSegmentCellIdBuffer, segCellIdBuf);
   }
 
-  // Prop ID buffer — single uint32
+  // Prop ID buffer — PickIds {propId, compositeIndex}
   {
-    uint32_t propId = 0;
+    PickIds ids = { 0, 0 };
     id<MTLBuffer> propIdBuf = [device
-      newBufferWithBytes:&propId
-                 length:sizeof(uint32_t)
+      newBufferWithBytes:&ids
+                 length:sizeof(PickIds)
                 options:MTLResourceStorageModeShared];
     vtkMetalMRC::AssignConsumed(this->Internals->PropIdBuffer, propIdBuf);
   }
@@ -5323,6 +5329,20 @@ void vtkMetalPolyDataMapper::ClearOverridePropId()
 }
 
 //------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::SetOverrideCompositeIndex(uint32_t compositeIndex)
+{
+  this->Internals->HasOverrideCompositeIndex = true;
+  this->Internals->OverrideCompositeIndex = compositeIndex;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::ClearOverrideCompositeIndex()
+{
+  this->Internals->HasOverrideCompositeIndex = false;
+  this->Internals->OverrideCompositeIndex = 0;
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalPolyDataMapper::SetBatchVisualOverride(
     bool overrideColor,
     const double color[3],
@@ -5386,37 +5406,70 @@ void vtkMetalPolyDataMapper::ClearBatchVisualOverride()
 }
 
 //------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::UpdatePickUniforms(vtkRenderer* ren, vtkActor* act)
+{
+  uint32_t propId = 0;
+  uint32_t compositeIndex = 0;
+
+  if (this->Internals->HasOverridePropId && this->Internals->OverridePropId == UINT32_MAX)
+  {
+    // Explicit no-pick sentinel (shader maps UINT32_MAX + 1 to 0).
+    propId = UINT32_MAX;
+  }
+  else if (vtkMetalHardwareSelector* sel =
+      ren ? vtkMetalHardwareSelector::SafeDownCast(ren->GetSelector()) : nullptr)
+  {
+    // Per-render prop ID: the prop's index in the selector's visible PropArray.
+    int id = sel->GetPropID(act);
+    if (id >= 0)
+    {
+      propId = static_cast<uint32_t>(id);
+    }
+    else
+    {
+      // Defensive: an actor rendered outside the selector's PropArray (e.g. a
+      // multi-renderer configuration) would otherwise resolve to PropArray[0].
+      propId = UINT32_MAX;
+    }
+  }
+  else if (this->Internals->HasOverridePropId)
+  {
+    propId = this->Internals->OverridePropId;
+  }
+
+  if (this->Internals->HasOverrideCompositeIndex)
+  {
+    compositeIndex = this->Internals->OverrideCompositeIndex;
+  }
+
+  if (this->Internals->PropIdBuffer)
+  {
+    PickIds ids = { propId, compositeIndex };
+    memcpy([this->Internals->PropIdBuffer contents], &ids, sizeof(PickIds));
+  }
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalPolyDataMapper::SetPropId(uint32_t propId)
 {
   if (this->Internals->PropIdBuffer)
   {
-    memcpy([this->Internals->PropIdBuffer contents], &propId, sizeof(uint32_t));
+    PickIds ids;
+    memcpy(&ids, [this->Internals->PropIdBuffer contents], sizeof(PickIds));
+    ids.PropId = propId;
+    memcpy([this->Internals->PropIdBuffer contents], &ids, sizeof(PickIds));
   }
 }
 
 //------------------------------------------------------------------------------
 uint32_t vtkMetalPolyDataMapper::GetOrCreatePropId(vtkActor* act)
 {
-  // Picking ID convention:
-  // - GPU prop ID buffer stores zero-based IDs.
-  // - vertex shaders output propId + 1.
-  // - 0 in the picking buffer means background/no prop.
-  //
-  // Cell IDs are currently written as 1-based on the CPU and passed through
-  // unchanged by the shader. This should eventually be unified with prop IDs.
-  //
-  // The static map grows monotonically and is never pruned. Acceptable for
-  // typical VTK usage where actors are long-lived. If short-lived actors
-  // are common, consider a weak-reference approach or periodic cleanup.
-  static std::unordered_map<const vtkActor*, uint32_t> propIds;
-  static uint32_t nextId = 0;
-  auto it = propIds.find(act);
-  if (it == propIds.end())
-  {
-    propIds[act] = nextId++;
-    return propIds[act];
-  }
-  return it->second;
+  // DEPRECATED: Prop IDs are assigned per-render by the hardware selector.
+  // This function returns 0 and should not be called externally.
+  (void)act;
+  vtkWarningMacro(<< "GetOrCreatePropId is deprecated. "
+                  << "Prop IDs are assigned per-render during selection passes.");
+  return 0;
 }
 
 VTK_ABI_NAMESPACE_END

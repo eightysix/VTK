@@ -18,6 +18,7 @@ set(headers)
 set(sources)
 
 # Standalone headers (not matching a .mm source)
+list(APPEND headers vtkMetalPickTypes.h)
 
 # All Metal sources use .mm (Objective-C++) for Metal API access
 foreach(class IN LISTS classes)

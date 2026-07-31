@@ -5,6 +5,8 @@
 
 #include "vtkMetalRenderWindow.h"
 #include "vtkMetalRenderer.h"
+#include "vtkMetalHardwareSelector.h"
+#include "vtkMetalPickTypes.h"
 #include "vtkMetalCamera.h"
 #include "vtkMetalShaders.h"
 #include "vtkObjectFactory.h"
@@ -35,6 +37,12 @@
 #include <cmath>
 #include <algorithm>
 #include <cassert>
+#include <cstring>
+
+// Shared GPU/CPU picking ID layout (see vtkMetalPickTypes.h). Written into
+// PropIdBuffer before each glyph draw; consumed by vertex shaders as
+// buffer(10).
+using PickIds = vtkMetalPickIds;
 
 VTK_ABI_NAMESPACE_BEGIN
 
@@ -56,7 +64,7 @@ enum GlyphBufferSlot : int
   kGlyphPickId = 5,           // uint32 per instance
   kGlyphScene = 8,            // SceneUniforms
   kGlyphClipPlane = 9,        // ClipPlaneUniforms
-  kGlyphPropId = 10,          // uint32 prop ID (constant)
+  kGlyphPropId = 10,          // PickIds {propId, compositeIndex} (constant)
 };
 
 // ---------------------------------------------------------------------------
@@ -914,13 +922,27 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     memset([I->ClipPlaneBuffer contents], 0, sizeof(float) * 4 * 6 + 16);
   }
 
-  // Prop ID
+  // Prop ID (PickIds {propId, compositeIndex})
   if (!I->PropIdBuffer)
   {
-    I->PropIdBuffer = [device newBufferWithLength:sizeof(uint32_t)
+    I->PropIdBuffer = [device newBufferWithLength:sizeof(PickIds)
                                          options:MTLResourceStorageModeShared];
-    static uint32_t propIdCtr = 1;
-    *static_cast<uint32_t*>([I->PropIdBuffer contents]) = propIdCtr++;
+  }
+  {
+    // Per-render prop ID from the active hardware selector; 0 when not picking.
+    uint32_t glyphPropId = 0;
+    vtkMetalHardwareSelector* sel =
+      vtkMetalHardwareSelector::SafeDownCast(ren->GetSelector());
+    if (sel)
+    {
+      int id = sel->GetPropID(actor);
+      if (id >= 0)
+      {
+        glyphPropId = static_cast<uint32_t>(id);
+      }
+    }
+    PickIds ids = { glyphPropId, 0 };
+    memcpy([I->PropIdBuffer contents], &ids, sizeof(PickIds));
   }
 
   // Cull mode

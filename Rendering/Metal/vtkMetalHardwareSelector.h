@@ -37,6 +37,18 @@ public:
    */
   bool CaptureBuffers() override;
 
+  /**
+   * Return the per-render prop ID (index into the visible PropArray) for the
+   * given prop, or -1 if the prop is not part of the selection render.
+   *
+   * The Metal renderer renders props through its normal opaque/translucent
+   * path during a selection render (the base class's per-pass Render() loop is
+   * not used), so the selector cannot rely on vtkHardwareSelector::Render to
+   * assign PropID per prop. Instead, mappers look up their own index here while
+   * they render; the index matches what GetPropFromID() expects on readback.
+   */
+  int GetPropID(vtkProp* prop) const;
+
   void BeginRenderProp() override {}
   void EndRenderProp() override {}
   void RenderCompositeIndex(unsigned int) override {}
@@ -75,6 +87,7 @@ private:
 
   vtkNew<vtkUnsignedIntArray> IdBuffer;
   vtkProp** PropArray = nullptr;
+  int PropCount = 0;
 
   vtkMetalHardwareSelector(const vtkMetalHardwareSelector&) = delete;
   void operator=(const vtkMetalHardwareSelector&) = delete;

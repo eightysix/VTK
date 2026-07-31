@@ -52,6 +52,17 @@ bool vtkMetalHardwareSelector::CaptureBuffers()
     return false;
   }
 
+  // Hardware picking renders IDs to an RGBA32Uint attachment, which cannot be
+  // multisampled. Force sampleCount == 1 for the duration of the selection
+  // render so the IDs attachment is present and the readback is valid.
+  // Mappers rebuild their pipelines at the forced sample count and rebuild
+  // again when the original sample count is restored on the next regular frame.
+  const int savedMultiSamples = renWin->GetMultiSamples();
+  if (savedMultiSamples > 1)
+  {
+    renWin->SetMultiSamples(1);
+  }
+
   this->BeginSelection();
 
   // Trigger a re-render so the IDs texture is populated.
@@ -64,6 +75,11 @@ bool vtkMetalHardwareSelector::CaptureBuffers()
 
   this->BuildPropHitList(this->PixBuffer[ACTOR_PASS]);
   this->EndSelection();
+
+  if (savedMultiSamples > 1)
+  {
+    renWin->SetMultiSamples(savedMultiSamples);
+  }
   return true;
 }
 
@@ -101,6 +117,8 @@ void vtkMetalHardwareSelector::BeginSelection()
     *iPtr = i;
     this->PixBuffer[i] = iPtr;
   }
+
+  this->PropCount = propArrayCount;
 }
 
 //------------------------------------------------------------------------------
@@ -120,6 +138,23 @@ vtkProp* vtkMetalHardwareSelector::GetPropFromID(int id)
 }
 
 //------------------------------------------------------------------------------
+int vtkMetalHardwareSelector::GetPropID(vtkProp* prop) const
+{
+  if (!prop || !this->PropArray)
+  {
+    return -1;
+  }
+  for (int i = 0; i < this->PropCount; ++i)
+  {
+    if (this->PropArray[i] == prop)
+    {
+      return i;
+    }
+  }
+  return -1;
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalHardwareSelector::ReleasePixBuffers()
 {
   this->IdBuffer->Reset();
@@ -131,6 +166,7 @@ void vtkMetalHardwareSelector::ReleasePixBuffers()
   }
   delete[] this->PropArray;
   this->PropArray = nullptr;
+  this->PropCount = 0;
 }
 
 //------------------------------------------------------------------------------
