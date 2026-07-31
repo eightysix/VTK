@@ -56,6 +56,16 @@ struct MaterialUniforms {
   float opacity;
   float specularPower;
   float2 _padding;
+  // Backface material (mirrors the front layout). Used by fragment_main and the
+  // peel shaders when the actor has a backface property; identical to the front
+  // material otherwise.
+  float4 backfaceAmbientColor;
+  float4 backfaceDiffuseColor;
+  float4 backfaceSpecularColor;
+  float4 backfaceColor;
+  float backfaceOpacity;
+  float backfaceSpecularPower;
+  float2 _padding2;
 };
 
 // Light data
@@ -155,16 +165,26 @@ inline void computePhongLighting(
         attenuation *= select(0.0f, pow(max(spotCos, 0.0f), L.attenuation.w), spotCos > spotCutoff);
       }
     }
-
     float NdotL = max(dot(N, toLight), 0.0);
+    // Headlight follows the VTK/OpenGL convention: both diffuse and specular
+    // are driven by N.z directly (L == V == H for a headlight).
     float df = (lightType == 0) ? max(N.z, 0.000001f) : NdotL;
     
     totalDiffuse += df * diffuseColor * lightColor * attenuation;
     
     // Only calculate reflect direction / specular if illuminated and valid specular intensity
-    if (NdotL > 0.0 && specularIntensity > 0.0) {
-      float3 reflDir = reflect(-toLight, N);
-      float sf = pow(max(dot(viewDir, reflDir), 0.0), specularPower);
+    if (df > 0.0 && specularIntensity > 0.0)
+    {
+      float sf;
+      if (lightType == 0)
+      {
+        sf = pow(df, specularPower);
+      }
+      else
+      {
+        float3 reflDir = reflect(-toLight, N);
+        sf = pow(max(dot(viewDir, reflDir), 0.0), specularPower);
+      }
       totalSpecular += sf * specularIntensity * specularColor * lightColor * attenuation;
     }
   }
@@ -179,7 +199,7 @@ struct ResolvedMaterial {
 };
 
 inline ResolvedMaterial resolveMaterial(
-    constant MaterialUniforms& material,
+    MaterialUniforms material,
     constant SceneUniforms& scene,
     float4 vertexColor, float2 uv,
     texture2d<float> actorTexture, sampler actorSampler)
@@ -236,21 +256,36 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
                               constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
                               constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
                               texture2d<float> actorTexture [[texture(0)]],
-                              sampler actorSampler [[sampler(0)]]) {
+                              sampler actorSampler [[sampler(0)]],
+                              bool frontFacing [[front_facing]]) {
   if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
 
+  // Match vtkOpenGLPolyDataMapper: backfaces flip the geometric normal (so
+  // lighting sees the outward normal) and, when a backface property is set,
+  // swap in the backface material.
   float3 N = normalize(in.viewNormal);
+  MaterialUniforms m = material;
+  if (!frontFacing)
+  {
+    N = -N;
+    m.ambientColor = material.backfaceAmbientColor;
+    m.diffuseColor = material.backfaceDiffuseColor;
+    m.specularColor = material.backfaceSpecularColor;
+    m.color = material.backfaceColor;
+    m.opacity = material.backfaceOpacity;
+    m.specularPower = material.backfaceSpecularPower;
+  }
 
-  ResolvedMaterial r = resolveMaterial(material, scene, in.vertexColor, in.uv, actorTexture, actorSampler);
+  ResolvedMaterial r = resolveMaterial(m, scene, in.vertexColor, in.uv, actorTexture, actorSampler);
 
-  float3 totalAmbient = material.ambientColor.w * r.ambient;
+  float3 totalAmbient = m.ambientColor.w * r.ambient;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
-  computePhongLighting(N, in.viewPos, r.diffuse, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
+  computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, lights, totalDiffuse, totalSpecular);
 
   FragmentOutput out;
-  out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, r.opacity);
+  out.color = float4(totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular, r.opacity);
   out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
   
   float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
@@ -293,11 +328,11 @@ struct PointVertexOut {
 
 vertex PointVertexOut vertex_point_main(
     uint vertex_id [[vertex_id]],
-    constant float3* point_positions [[buffer(0)]],
+    constant packed_float3* point_positions [[buffer(0)]],
     constant SceneUniforms& scene [[buffer(1)]],
-    constant float3* point_normals [[buffer(2)]],
+    constant packed_float3* point_normals [[buffer(2)]],
     constant float4* point_colors [[buffer(3)]],
-    constant float3* point_tangents [[buffer(6)]],
+    constant packed_float3* point_tangents [[buffer(6)]],
     constant float2* point_uvs [[buffer(7)]],
     constant float2* point_color_uvs [[buffer(8)]],
     constant uint* pointCellIds [[buffer(11)]],
@@ -309,10 +344,10 @@ vertex PointVertexOut vertex_point_main(
   
   out.viewPos = viewPos.xyz;
   out.position = scene.projectionMatrix * viewPos;
-  out.viewNormal = scene.normalMatrix * point_normals[vertex_id];
+  out.viewNormal = scene.normalMatrix * float3(point_normals[vertex_id]);
   out.point_size = 1.0;
   out.pointColor = point_colors[vertex_id];
-  out.tangent = scene.normalMatrix * point_tangents[vertex_id];
+  out.tangent = scene.normalMatrix * float3(point_tangents[vertex_id]);
   out.uv = point_uvs[vertex_id];
   out.lut_uv = point_color_uvs[vertex_id];
   out.cellId = pointCellIds[vertex_id];
@@ -366,12 +401,12 @@ struct PointShapedVertexOut {
 vertex PointShapedVertexOut vertex_point_shaped_main(
     uint vertex_id [[vertex_id]],
     uint instance_id [[instance_id]],
-    constant float3* point_positions [[buffer(0)]],
+    constant packed_float3* point_positions [[buffer(0)]],
     constant uint* connectivity [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
-    constant float3* point_normals [[buffer(3)]],
+    constant packed_float3* point_normals [[buffer(3)]],
     constant float4* point_colors [[buffer(4)]],
-    constant float3* point_tangents [[buffer(6)]],
+    constant packed_float3* point_tangents [[buffer(6)]],
     constant float2* point_uvs [[buffer(7)]],
     constant float2* point_color_uvs [[buffer(8)]],
     constant uint* shapedCellIds [[buffer(11)]],
@@ -393,10 +428,10 @@ vertex PointShapedVertexOut vertex_point_shaped_main(
   PointShapedVertexOut out;
   out.position = float4(clipPos.w * ((2.0 * expanded) / resolution - 1.0), clipPos.z, clipPos.w);
   out.viewPos = viewPos.xyz;
-  out.viewNormal = scene.normalMatrix * point_normals[point_id];
+  out.viewNormal = scene.normalMatrix * float3(point_normals[point_id]);
   out.p_coord = corner;
   out.pointColor = point_colors[point_id];
-  out.tangent = scene.normalMatrix * point_tangents[point_id];
+  out.tangent = scene.normalMatrix * float3(point_tangents[point_id]);
   out.uv = point_uvs[point_id];
   out.lut_uv = point_color_uvs[point_id];
   out.cellId = shapedCellIds[point_id];
@@ -464,10 +499,19 @@ struct LineVertexOut {
   float3 viewNormal;
   float4 vertexColor;
   float dist_to_centerline;
+  float lineHalfW;
   uint cellId;
   uint propId;
   uint compositeIndex;
 };
+
+// Lateral (across-the-tube) direction in view space for fake-tube shading.
+inline float3 lateralDir(float3 segViewDir) {
+  float3 s = normalize(segViewDir);
+  float3 lat = cross(s, float3(0.0, 0.0, 1.0));
+  if (length(lat) < 1e-4) { lat = float3(1.0, 0.0, 0.0); }
+  return normalize(lat);
+}
 
 inline FragmentOutput shadeLineFragment(LineVertexOut in,
     constant MaterialUniforms& material,
@@ -477,9 +521,17 @@ inline FragmentOutput shadeLineFragment(LineVertexOut in,
   FragmentOutput out;
   float3 baseColor = in.vertexColor.rgb;
   float baseAlpha = in.vertexColor.a * material.opacity;
-  float3 N = normalize(in.viewNormal);
-  N.z = 1.0 - 2.0 * abs(in.dist_to_centerline);
-  N = normalize(N);
+  // Fake-tube shading: rotate the view-facing normal toward the lateral
+  // (across-the-tube) direction so the tube reads as a lit cylinder instead of
+  // a flat quad. Matches the vtkOpenGLPolyDataMapper tube normal construction,
+  // including the emix blend that keeps the tube edges lit (the edge normal is
+  // half cylinder, half view-facing, which keeps N.z from dropping to zero).
+  float r = clamp(in.dist_to_centerline, -1.0, 1.0);
+  float lenZ = clamp(sqrt(max(1.0 - r * r, 0.0)), 0.0, 1.0);
+  float3 lateral = normalize(in.viewNormal);
+  float3 cylinderN = normalize(r * lateral + lenZ * float3(0.0, 0.0, 1.0));
+  float emix = clamp(0.5 + in.lineHalfW * (1.0 - abs(r)), 0.0, 1.0);
+  float3 N = normalize(mix(float3(0.0, 0.0, 1.0), cylinderN, emix));
 
   float3 totalDiffuse = float3(0.0), totalSpecular = float3(0.0);
   computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb,
@@ -496,7 +548,7 @@ inline FragmentOutput shadeLineFragment(LineVertexOut in,
 vertex LineVertexOut vertex_thick_line_main(
     uint vertex_id [[vertex_id]],
     uint instance_id [[instance_id]],
-    constant float3* positions [[buffer(0)]],
+    constant packed_float3* positions [[buffer(0)]],
     constant uint* lineIndices [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant float4* vertexColors [[buffer(3)]],
@@ -539,9 +591,12 @@ vertex LineVertexOut vertex_thick_line_main(
   out.position = float4(p_DC.w * ((2.0 * p) / resolution - 1.0), p_DC.z, p_DC.w);
   float3 pos_MC = mix(p0_MC, p1_MC, t);
   out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(pos_MC, 1.0)).xyz;
-  out.viewNormal = scene.normalMatrix * float3(0.0, 0.0, 1.0);
+  float3 segView = (scene.viewMatrix * scene.modelMatrix * float4(p1_MC, 1.0)).xyz
+                 - (scene.viewMatrix * scene.modelMatrix * float4(p0_MC, 1.0)).xyz;
+  out.viewNormal = lateralDir(segView);
   out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], t);
   out.dist_to_centerline = side;
+  out.lineHalfW = halfW;
   out.cellId = cellIds[instance_id];
   out.propId = mapPropId(pickIds.propId);
   out.compositeIndex = pickIds.compositeIndex;
@@ -563,7 +618,7 @@ fragment FragmentOutput fragment_thick_line_main(
 vertex LineVertexOut vertex_round_cap_line_main(
     uint vertex_id [[vertex_id]],
     uint instance_id [[instance_id]],
-    constant float3* positions [[buffer(0)]],
+    constant packed_float3* positions [[buffer(0)]],
     constant uint* lineIndices [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant float4* vertexColors [[buffer(3)]],
@@ -625,9 +680,12 @@ vertex LineVertexOut vertex_round_cap_line_main(
   LineVertexOut out;
   out.position = float4(p_DC.w * ((2.0 * p) / resolution - 1.0), p_DC.z, p_DC.w);
   out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(mix(p0_MC, p1_MC, p_coord.z), 1.0)).xyz;
-  out.viewNormal = scene.normalMatrix * float3(0.0, 0.0, 1.0);
+  float3 segView = (scene.viewMatrix * scene.modelMatrix * float4(p1_MC, 1.0)).xyz
+                 - (scene.viewMatrix * scene.modelMatrix * float4(p0_MC, 1.0)).xyz;
+  out.viewNormal = lateralDir(segView);
   out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], p_coord.z);
-  out.dist_to_centerline = p_coord.y;
+  out.dist_to_centerline = 2.0 * p_coord.y - 1.0;
+  out.lineHalfW = 0.5 * w;
   out.cellId = cellIds[instance_id];
   out.propId = mapPropId(pickIds.propId);
   out.compositeIndex = pickIds.compositeIndex;
@@ -649,7 +707,7 @@ fragment FragmentOutput fragment_round_cap_line_main(
 vertex LineVertexOut vertex_miter_join_line_main(
     uint vertex_id [[vertex_id]],
     uint instance_id [[instance_id]],
-    constant float3* positions [[buffer(0)]],
+    constant packed_float3* positions [[buffer(0)]],
     constant uint* lineIndices [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant float4* vertexColors [[buffer(3)]],
@@ -727,10 +785,13 @@ vertex LineVertexOut vertex_miter_join_line_main(
 
   LineVertexOut out;
   out.position = float4(p_DC.w * ((2.0 * p) / resolution - 1.0), p_DC.z, p_DC.w);
-  out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(mix(positions[p0_idx], positions[p1_idx], t), 1.0)).xyz;
-  out.viewNormal = scene.normalMatrix * float3(0.0, 0.0, 1.0);
+  out.viewPos = (scene.viewMatrix * scene.modelMatrix * float4(mix(float3(positions[p0_idx]), float3(positions[p1_idx]), t), 1.0)).xyz;
+  float3 segView = (scene.viewMatrix * scene.modelMatrix * float4(float3(positions[p1_idx]), 1.0)).xyz
+                 - (scene.viewMatrix * scene.modelMatrix * float4(float3(positions[p0_idx]), 1.0)).xyz;
+  out.viewNormal = lateralDir(segView);
   out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], t);
   out.dist_to_centerline = side;
+  out.lineHalfW = halfW;
   out.cellId = cellIds[instance_id];
   out.propId = mapPropId(pickIds.propId);
   out.compositeIndex = pickIds.compositeIndex;
@@ -905,6 +966,48 @@ vertex FullscreenVertexOut vertex_fullscreen_main(uint vertex_id [[vertex_id]]) 
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Background gradient (matches vtkOpenGLRenderer's gradient background)
+// ---------------------------------------------------------------------------
+struct BackgroundGradientUniforms {
+  float4 stopColors[2];    // [0]=Background (bottom), [1]=Background2 (top)
+  int mode;                // VTK_GRADIENT_VERTICAL=0, HORIZONTAL=1, RADIAL_SIDE=2, RADIAL_CORNER=3
+  int dither;              // add +/-0.5/255 noise, like GL DitherGradient
+  float2 _pad;
+  float2 viewportSize;     // full window size (pixels)
+};
+
+struct GradientFragmentOutput {
+  float4 color [[color(0)]];
+  uint4 ids [[color(1)]];
+};
+
+fragment GradientFragmentOutput fragment_gradient_background(
+    FullscreenVertexOut in [[stage_in]],
+    constant BackgroundGradientUniforms& u [[buffer(0)]]) {
+  float2 uv = float2(in.position.x / u.viewportSize.x, 1.0 - in.position.y / u.viewportSize.y);
+  float value = 0.0;
+  if (u.mode == 1) {
+    value = uv.x;
+  } else if (u.mode == 2) {
+    value = clamp(length(uv - 0.5) * 2.0, 0.0, 1.0);
+  } else if (u.mode == 3) {
+    value = length(uv - 0.5) * 1.41421356;
+  } else {
+    value = uv.y;
+  }
+  float3 color = mix(u.stopColors[0].rgb, u.stopColors[1].rgb, value);
+  if (u.dither != 0) {
+    const float granularity = 0.001960784313725;  // 0.5 / 255.0
+    float noise = fract(sin(dot(uv, float2(12.9898, 78.233))) * 43758.5453123);
+    color += mix(-granularity, granularity, noise);
+  }
+  GradientFragmentOutput out;
+  out.color = float4(color, 1.0);
+  out.ids = uint4(0u, 0u, 0u, 0u);
+  return out;
+}
+
 struct PeelInitOutput { float2 depthRange [[color(0)]]; };
 struct PeelPassOutput { float4 backTemp  [[color(0)]]; float4 frontDest [[color(1)]]; float2 depthDest [[color(2)]]; };
 
@@ -927,6 +1030,7 @@ fragment PeelInitOutput fragment_peel_init(
 
 fragment PeelPassOutput fragment_peel(
     VertexOut in [[stage_in]],
+    bool frontFacing [[front_facing]],
     constant MaterialUniforms& material [[buffer(0)]],
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
@@ -961,15 +1065,27 @@ fragment PeelPassOutput fragment_peel(
     return out;
   }
 
+  // Backfaces flip the geometric normal and swap in the backface material.
   float3 N = normalize(in.viewNormal);
-  ResolvedMaterial r = resolveMaterial(material, scene, in.vertexColor, in.uv, actorTexture, actorSampler);
-  float3 totalAmbient = material.ambientColor.w * r.ambient;
+  MaterialUniforms m = material;
+  if (!frontFacing)
+  {
+    N = -N;
+    m.ambientColor = material.backfaceAmbientColor;
+    m.diffuseColor = material.backfaceDiffuseColor;
+    m.specularColor = material.backfaceSpecularColor;
+    m.color = material.backfaceColor;
+    m.opacity = material.backfaceOpacity;
+    m.specularPower = material.backfaceSpecularPower;
+  }
+  ResolvedMaterial r = resolveMaterial(m, scene, in.vertexColor, in.uv, actorTexture, actorSampler);
+  float3 totalAmbient = m.ambientColor.w * r.ambient;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
-  computePhongLighting(N, in.viewPos, r.diffuse, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
+  computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, lights, totalDiffuse, totalSpecular);
 
-  float3 fragRGB = totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular;
+  float3 fragRGB = totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular;
 
   if (fragDepth >= minDepth - epsilon && fragDepth <= minDepth + epsilon) {
     float prevAlpha = 1.0 - prevFront.a;
@@ -984,6 +1100,7 @@ fragment PeelPassOutput fragment_peel(
 
 fragment float4 fragment_peel_alpha_blend(
     VertexOut in [[stage_in]],
+    bool frontFacing [[front_facing]],
     constant MaterialUniforms& material [[buffer(0)]],
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
@@ -1003,15 +1120,27 @@ fragment float4 fragment_peel_alpha_blend(
 
   if (fragDepth < -prevDepth.x - epsilon || fragDepth > prevDepth.y + epsilon) discard_fragment();
 
+  // Backfaces flip the geometric normal and swap in the backface material.
   float3 N = normalize(in.viewNormal);
-  ResolvedMaterial r = resolveMaterial(material, scene, in.vertexColor, in.uv, actorTexture, actorSampler);
-  float3 totalAmbient = material.ambientColor.w * r.ambient;
+  MaterialUniforms m = material;
+  if (!frontFacing)
+  {
+    N = -N;
+    m.ambientColor = material.backfaceAmbientColor;
+    m.diffuseColor = material.backfaceDiffuseColor;
+    m.specularColor = material.backfaceSpecularColor;
+    m.color = material.backfaceColor;
+    m.opacity = material.backfaceOpacity;
+    m.specularPower = material.backfaceSpecularPower;
+  }
+  ResolvedMaterial r = resolveMaterial(m, scene, in.vertexColor, in.uv, actorTexture, actorSampler);
+  float3 totalAmbient = m.ambientColor.w * r.ambient;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
-  computePhongLighting(N, in.viewPos, r.diffuse, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
+  computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, lights, totalDiffuse, totalSpecular);
 
-  float3 fragRGB = totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular;
+  float3 fragRGB = totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular;
   return float4(fragRGB * r.opacity, r.opacity);
 }
 
@@ -1069,7 +1198,7 @@ struct GlyphPointVertexOut {
 template <typename T>
 inline T computeGlyphVertex(
     uint vertex_id, uint instance_id,
-    constant float3* positions, constant float3* normals,
+    constant packed_float3* positions, constant packed_float3* normals,
     constant float4x4* glyphTransforms, constant float3x3* glyphNormalTransforms,
     constant float4* glyphColors, constant uint* glyphPickIds,
     constant SceneUniforms& scene, constant PickIds& pickIds)
@@ -1079,7 +1208,7 @@ inline T computeGlyphVertex(
   float4 worldPos = scene.modelMatrix * glyphTransforms[instance_id] * float4(pos, 1.0);
   out.viewPos = (scene.viewMatrix * worldPos).xyz;
   out.position = scene.projectionMatrix * float4(out.viewPos, 1.0);
-  out.viewNormal = scene.normalMatrix * glyphNormalTransforms[instance_id] * normals[vertex_id];
+  out.viewNormal = scene.normalMatrix * glyphNormalTransforms[instance_id] * float3(normals[vertex_id]);
   out.glyphColor = glyphColors[instance_id];
   out.cellId = glyphPickIds[instance_id] + 1u;
   out.propId = mapPropId(pickIds.propId);
@@ -1109,7 +1238,7 @@ inline FragmentOutput shadeGlyphFragment(T in,
 
 vertex GlyphVertexOut vertex_glyph_main(
     uint vertex_id [[vertex_id]], uint instance_id [[instance_id]],
-    constant float3* positions [[buffer(0)]], constant float3* normals [[buffer(1)]],
+    constant packed_float3* positions [[buffer(0)]], constant packed_float3* normals [[buffer(1)]],
     constant float4x4* glyphTransforms [[buffer(2)]], constant float3x3* glyphNormalTransforms [[buffer(3)]],
     constant float4* glyphColors [[buffer(4)]], constant uint* glyphPickIds [[buffer(5)]],
     constant SceneUniforms& scene [[buffer(8)]], constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
@@ -1130,7 +1259,7 @@ fragment FragmentOutput fragment_glyph_main(
 
 vertex GlyphVertexOut vertex_glyph_line_main(
     uint vertex_id [[vertex_id]], uint instance_id [[instance_id]],
-    constant float3* positions [[buffer(0)]], constant float3* normals [[buffer(1)]],
+    constant packed_float3* positions [[buffer(0)]], constant packed_float3* normals [[buffer(1)]],
     constant float4x4* glyphTransforms [[buffer(2)]], constant float3x3* glyphNormalTransforms [[buffer(3)]],
     constant float4* glyphColors [[buffer(4)]], constant uint* glyphPickIds [[buffer(5)]],
     constant SceneUniforms& scene [[buffer(8)]], constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
@@ -1151,7 +1280,7 @@ fragment FragmentOutput fragment_glyph_line_main(
 
 vertex GlyphPointVertexOut vertex_glyph_point_main(
     uint vertex_id [[vertex_id]], uint instance_id [[instance_id]],
-    constant float3* positions [[buffer(0)]], constant float3* normals [[buffer(1)]],
+    constant packed_float3* positions [[buffer(0)]], constant packed_float3* normals [[buffer(1)]],
     constant float4x4* glyphTransforms [[buffer(2)]], constant float3x3* glyphNormalTransforms [[buffer(3)]],
     constant float4* glyphColors [[buffer(4)]], constant uint* glyphPickIds [[buffer(5)]],
     constant SceneUniforms& scene [[buffer(8)]], constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],

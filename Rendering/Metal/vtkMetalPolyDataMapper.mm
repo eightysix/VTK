@@ -233,6 +233,10 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   bool HasEdgeOverlay = false;
   id<MTLBuffer> EdgeColorUniformBuffer = nil;   // edge color (float4 RGBA)
   id<MTLRenderPipelineState> EdgePipeline = nil; // pipeline for edge rendering
+  id<MTLBuffer> EdgeTubeIndexBuffer = nil;      // per-polygon closed-loop segments for mitered edge tubes
+  id<MTLBuffer> EdgeTubeCellIdBuffer = nil;     // per-segment cell id for edge tube loops
+  id<MTLBuffer> EdgeTubeSegmentCountBuffer = nil; // uint32: total edge tube segment count
+  vtkIdType EdgeTubeSegmentCount = 0;
 
   // P3-3A: Thick line pipeline — screen-space quad expansion for lineWidth > 1
   id<MTLRenderPipelineState> ThickLinePipeline = nil;
@@ -450,6 +454,10 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     vtkMetalMRC::ReleaseAndNil(EdgeSurfaceColorBuffer);
     vtkMetalMRC::ReleaseAndNil(EdgeIndexBuffer);
     vtkMetalMRC::ReleaseAndNil(EdgeColorUniformBuffer);
+    vtkMetalMRC::ReleaseAndNil(EdgeTubeIndexBuffer);
+    vtkMetalMRC::ReleaseAndNil(EdgeTubeCellIdBuffer);
+    vtkMetalMRC::ReleaseAndNil(EdgeTubeSegmentCountBuffer);
+    EdgeTubeSegmentCount = 0;
     EdgeIndexCount = 0;
     EdgeVertexCount = 0;
     HasEdgeOverlay = false;
@@ -836,8 +844,11 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       isSurface &&
       act->GetProperty()->GetEdgeVisibility() &&
       this->Internals->HasEdgeOverlay &&
-      this->Internals->EdgePipeline &&
-      this->Internals->EdgeIndexBuffer;
+      this->Internals->EdgeIndexBuffer &&
+      (this->Internals->EdgePipeline ||
+       (lineWidth > 1.0f &&
+        this->Internals->EdgeTubeSegmentCount > 0 &&
+        (this->Internals->MiterJoinLinePipeline || this->Internals->ThickLinePipeline)));
 
   const bool drawPointRepresentation =
       isPoints &&
@@ -1247,7 +1258,70 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   // --- Edge overlay (wireframe on surface, skipped during depth-peel passes) ---
   if (!peelPassActive && drawEdgeOverlay)
   {
-    recordPipeline(this->Internals->EdgePipeline);
+    // When lineWidth > 1, polygon edges render as thick tubes (matching GL's
+    // fake-tube edge rendering). Per-polygon closed-loop segments let the miter
+    // join shader connect edges into continuous tubes.
+    const bool edgeTubes =
+      lineWidth > 1.0f && this->Internals->EdgeTubeSegmentCount > 0 &&
+      (this->Internals->MiterJoinLinePipeline || this->Internals->ThickLinePipeline);
+
+    if (edgeTubes)
+    {
+      if (this->Internals->MiterJoinLinePipeline)
+      {
+        recordPipeline(this->Internals->MiterJoinLinePipeline);
+      }
+      else
+      {
+        recordPipeline(this->Internals->ThickLinePipeline);
+      }
+      recordVBuf(this->Internals->EdgeVertexPositionBuffer, 0, 0);
+      recordVBuf(this->Internals->EdgeTubeIndexBuffer, 0, 1);
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordVBuf(this->Internals->SceneUniformBuffer, 0, 2);
+        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->EdgeSurfaceColorBuffer)
+      {
+        recordVBuf(this->Internals->EdgeSurfaceColorBuffer, 0, 3);
+      }
+      if (this->Internals->ThickLineLineWidthBuffer)
+      {
+        recordVBuf(this->Internals->ThickLineLineWidthBuffer, 0, 4);
+      }
+      if (this->Internals->EdgeTubeCellIdBuffer)
+      {
+        recordVBuf(this->Internals->EdgeTubeCellIdBuffer, 0, 5);
+      }
+      if (this->Internals->PropIdBuffer)
+      {
+        recordVBuf(this->Internals->PropIdBuffer, 0, 6);
+      }
+      if (this->Internals->MiterJoinLinePipeline &&
+        this->Internals->EdgeTubeSegmentCountBuffer)
+      {
+        recordVBuf(this->Internals->EdgeTubeSegmentCountBuffer, 0, 7);
+      }
+      if (this->Internals->MaterialUniformBuffer)
+      {
+        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
+      }
+      if (this->Internals->LightUniformBuffer)
+      {
+        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
+      }
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+      }
+      recordCull(MTLCullModeNone);
+      recordDraw(MTLPrimitiveTypeTriangleStrip, 0, 4,
+        this->Internals->EdgeTubeSegmentCount);
+    }
+    else
+    {
+      recordPipeline(this->Internals->EdgePipeline);
     recordVBuf(this->Internals->EdgeVertexPositionBuffer, 0, 0);
     if (this->Internals->EdgeVertexNormalBuffer)
     {
@@ -1306,9 +1380,10 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       recordFBuf(this->Internals->ClipPlaneBuffer, 0, 5);
     }
 
-    recordCull(MTLCullModeNone);
-    recordIdxDraw(MTLPrimitiveTypeLine, this->Internals->EdgeIndexCount, MTLIndexTypeUInt32,
-      this->Internals->EdgeIndexBuffer, 0);
+      recordCull(MTLCullModeNone);
+      recordIdxDraw(MTLPrimitiveTypeLine, this->Internals->EdgeIndexCount, MTLIndexTypeUInt32,
+        this->Internals->EdgeIndexBuffer, 0);
+    }
   }
 
   // --- Vertex visibility (dots on surface, skipped during depth-peel passes) ---
@@ -1805,6 +1880,19 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         this->Internals->HasEdgeOverlay)
     {
       this->EnsureEdgePipelineState((void*)device);
+      if (act->GetProperty()->GetEdgeVisibility() &&
+          act->GetProperty()->GetLineWidth() > 1.0f &&
+          this->Internals->EdgeTubeSegmentCount > 0)
+      {
+        if (act->GetProperty()->GetLineJoin() == vtkProperty::LineJoinType::MiterJoin)
+        {
+          this->EnsureMiterJoinLinePipelineState((void*)device);
+        }
+        else
+        {
+          this->EnsureThickLinePipelineState((void*)device);
+        }
+      }
     }
     if (this->Internals->HasLines && this->Internals->LineIndexBuffer)
     {
@@ -2115,6 +2203,8 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   std::vector<uint32_t> lineVertexCellIds;       // per-vertex, parallel to positions (standard 1px lines, read by vertex_id)
   std::vector<uint32_t> lineSegmentCellIds;      // per-segment (thick/round/miter lines, read by instance_id)
   std::vector<uint32_t> edgeVertexCellIds;
+  std::vector<uint32_t> edgeTubeIndices;        // per-polygon closed-loop segment pairs for edge tubes
+  std::vector<uint32_t> edgeTubeCellIds;        // per-segment cell id, parallel to edgeTubeIndices/2
 
   // P10-10A: Extra attribute arrays — parallel to positions (one value per rendered vertex)
   std::unordered_map<std::string, std::vector<float>> extraAttrArrays;
@@ -3380,22 +3470,16 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
             edgeNormals.push_back(static_cast<float>(n[2]));
           }
 
-          if (mappedColors)
-          {
-            const unsigned char* rgba = mappedColors->GetPointer(0);
-            vtkIdType idx2 = (cellFlag == 0) ? pointId : cellId;
-            edgeColors.push_back(rgba[idx2 * 4] / 255.0f);
-            edgeColors.push_back(rgba[idx2 * 4 + 1] / 255.0f);
-            edgeColors.push_back(rgba[idx2 * 4 + 2] / 255.0f);
-            edgeColors.push_back(rgba[idx2 * 4 + 3] / 255.0f);
-          }
-          else
-          {
-            edgeColors.push_back(1.0f);
-            edgeColors.push_back(1.0f);
-            edgeColors.push_back(1.0f);
-            edgeColors.push_back(1.0f);
-          }
+          // Edges always render with the property's edge color (matching
+          // vtkOpenGLPolyDataMapper, where emix fully replaces the diffuse with
+          // the edge color on edge fragments regardless of scalar mapping).
+          double* ec = actor->GetProperty()->GetEdgeColor();
+          double eo = actor->GetProperty()->GetEdgeOpacity();
+          edgeColors.push_back(static_cast<float>(ec[0]));
+          edgeColors.push_back(static_cast<float>(ec[1]));
+          edgeColors.push_back(static_cast<float>(ec[2]));
+          edgeColors.push_back(static_cast<float>(eo));
+
           // P1-2: Per-vertex texture coordinates for edge overlay
           if (tcoordArray && tcoordArray->GetNumberOfTuples() > pointId)
           {
@@ -3421,6 +3505,31 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
           uint32_t edgeCellId = kv.second.CellId;
           edgeIndices.push_back(addEdgeVertex(a, edgeCellId));
           edgeIndices.push_back(addEdgeVertex(b, edgeCellId));
+        }
+
+        // Edge tubes: emit each polygon's boundary as a closed loop so
+        // consecutive segments share a vertex and cell id, letting the miter
+        // join shader connect them into continuous tubes (matching GL's
+        // fake-tube edge rendering, where coverage extends to shared vertices).
+        vtkIdType polyLoopIdx = 0;
+        polys->InitTraversal();
+        while (polys->GetNextCell(npts, pts))
+        {
+          if (npts < 3)
+          {
+            ++polyLoopIdx;
+            continue;
+          }
+          uint32_t loopCellId = static_cast<uint32_t>(polyLoopIdx + polyCellOffset) + 1u;
+          for (vtkIdType i = 0; i < npts; ++i)
+          {
+            uint32_t va = addEdgeVertex(pts[i], polyLoopIdx);
+            uint32_t vb = addEdgeVertex(pts[(i + 1) % npts], polyLoopIdx);
+            edgeTubeIndices.push_back(va);
+            edgeTubeIndices.push_back(vb);
+            edgeTubeCellIds.push_back(loopCellId);
+          }
+          ++polyLoopIdx;
         }
       }
     }
@@ -3588,7 +3697,8 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     positions, normals, surfaceColors, triangleUVs, lineIndices,
     triangleIndices, edgePositions, edgeNormals, edgeColors, edgeUVs,
     edgeIndices, triangleVertexCellIds, lineVertexCellIds,
-    lineSegmentCellIds, edgeVertexCellIds, extraAttrArrays);
+    lineSegmentCellIds, edgeVertexCellIds, edgeTubeIndices,
+    edgeTubeCellIds, extraAttrArrays);
 }
 
 //------------------------------------------------------------------------------
@@ -3610,6 +3720,8 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
   const std::vector<uint32_t>& lineVertexCellIds,
   const std::vector<uint32_t>& lineSegmentCellIds,
   const std::vector<uint32_t>& edgeVertexCellIds,
+  const std::vector<uint32_t>& edgeTubeIndices,
+  const std::vector<uint32_t>& edgeTubeCellIds,
   std::unordered_map<std::string, std::vector<float>>& extraAttrArrays)
 {
   id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
@@ -3716,7 +3828,10 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
     this->Internals->EdgeVertexCount = edgePositions.size() / 3;
     this->Internals->HasEdgeOverlay = true;
 
-    // P2-8: Create edge primitive-to-cell mapping for CPU-built edges (per-vertex)
+    if (!edgeColors.empty())
+    {
+      // P2-8: Create edge primitive-to-cell mapping for CPU-built edges (per-vertex)
+    }
     if (!edgeVertexCellIds.empty())
     {
       id<MTLBuffer> cellIdBuf =
@@ -3724,6 +3839,33 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
                             length:edgeVertexCellIds.size() * sizeof(uint32_t)
                            options:MTLResourceStorageModeShared];
       vtkMetalMRC::AssignConsumed(this->Internals->EdgeCellIdBuffer, cellIdBuf);
+    }
+
+    // Edge tube loop segments + cell ids (mitered thick-edge overlay)
+    if (!edgeTubeIndices.empty())
+    {
+      id<MTLBuffer> tubeIdxBuf =
+        [device newBufferWithBytes:edgeTubeIndices.data()
+                            length:edgeTubeIndices.size() * sizeof(uint32_t)
+                           options:MTLResourceStorageModeShared];
+      vtkMetalMRC::AssignConsumed(this->Internals->EdgeTubeIndexBuffer, tubeIdxBuf);
+
+      if (!edgeTubeCellIds.empty())
+      {
+        id<MTLBuffer> tubeCellBuf =
+          [device newBufferWithBytes:edgeTubeCellIds.data()
+                              length:edgeTubeCellIds.size() * sizeof(uint32_t)
+                             options:MTLResourceStorageModeShared];
+        vtkMetalMRC::AssignConsumed(this->Internals->EdgeTubeCellIdBuffer, tubeCellBuf);
+      }
+
+      uint32_t tubeCount = static_cast<uint32_t>(edgeTubeIndices.size() / 2);
+      id<MTLBuffer> tubeCountBuf =
+        [device newBufferWithLength:sizeof(uint32_t)
+                            options:MTLResourceStorageModeShared];
+      memcpy([tubeCountBuf contents], &tubeCount, sizeof(tubeCount));
+      vtkMetalMRC::AssignConsumed(this->Internals->EdgeTubeSegmentCountBuffer, tubeCountBuf);
+      this->Internals->EdgeTubeSegmentCount = edgeTubeIndices.size() / 2;
     }
   }
 
@@ -4761,7 +4903,8 @@ void vtkMetalPolyDataMapper::UpdateMaterialUniforms(void* mtlDevice, vtkActor* a
   // specularColor: rgb + specular_intensity
   // color: base color (unused in lighting)
   // opacity, specularPower, 2 pad
-  float mu[20];
+  // then the same 20 floats again for the backface material.
+  float mu[40];
   memset(mu, 0, sizeof(mu));
 
   // ambientColor.rgb = property ambient color, .w = ambient intensity
@@ -4831,6 +4974,37 @@ void vtkMetalPolyDataMapper::UpdateMaterialUniforms(void* mtlDevice, vtkActor* a
     ? 1.0f
     : static_cast<float>(prop->GetOpacity());
   mu[17] = static_cast<float>(prop->GetSpecularPower());
+
+  // Backface material: mirror the front material, then override with the
+  // actor's backface property when present (matches vtkOpenGLPolyDataMapper,
+  // which substitutes the backface property's lighting params on backfaces).
+  memcpy(&mu[20], &mu[0], 18 * sizeof(float));
+  if (vtkProperty* backProp = actor->GetBackfaceProperty())
+  {
+    double bac[3], bdc[3], bsc[3], brgb[3];
+    backProp->GetAmbientColor(bac);
+    backProp->GetDiffuseColor(bdc);
+    backProp->GetSpecularColor(bsc);
+    backProp->GetColor(brgb);
+    mu[20] = static_cast<float>(bac[0]);
+    mu[21] = static_cast<float>(bac[1]);
+    mu[22] = static_cast<float>(bac[2]);
+    mu[23] = static_cast<float>(backProp->GetAmbient());
+    mu[24] = static_cast<float>(bdc[0]);
+    mu[25] = static_cast<float>(bdc[1]);
+    mu[26] = static_cast<float>(bdc[2]);
+    mu[27] = static_cast<float>(backProp->GetDiffuse());
+    mu[28] = static_cast<float>(bsc[0]);
+    mu[29] = static_cast<float>(bsc[1]);
+    mu[30] = static_cast<float>(bsc[2]);
+    mu[31] = static_cast<float>(backProp->GetSpecular());
+    mu[32] = static_cast<float>(brgb[0]);
+    mu[33] = static_cast<float>(brgb[1]);
+    mu[34] = static_cast<float>(brgb[2]);
+    mu[35] = 1.0f;
+    mu[36] = static_cast<float>(backProp->GetOpacity());
+    mu[37] = static_cast<float>(backProp->GetSpecularPower());
+  }
 
   if (!this->Internals->MaterialUniformBuffer)
   {
@@ -5331,8 +5505,10 @@ void vtkMetalPolyDataMapper::UpdateActorTexture(void* mtlDevice, vtkActor* actor
   {
     for (int x = 0; x < width; ++x)
     {
-      // P2-3: Flip Y so texture origin (top-left) matches VTK's bottom-left origin
-      unsigned char* srcPtr = static_cast<unsigned char*>(image->GetScalarPointer(xMin + x, yMin + (height - 1 - y), 0));
+      // Match vtkOpenGLTexture/vtkOpenGLPolyDataMapper: VTK image row 0 (min y)
+      // is uploaded first, so texcoord (0,0) samples the bottom row exactly as
+      // OpenGL renders it. No vertical flip.
+      unsigned char* srcPtr = static_cast<unsigned char*>(image->GetScalarPointer(xMin + x, yMin + y, 0));
       int dstIdx = (y * width + x) * 4;
       unsigned char* dst = rgbaData + dstIdx;
 
@@ -5374,10 +5550,13 @@ void vtkMetalPolyDataMapper::UpdateActorTexture(void* mtlDevice, vtkActor* actor
 
   delete[] rgbaData;
 
-  // Create sampler state
+  // Create sampler state. Match vtkTexture's repeat/edge-clamp settings
+  // (GL: GL_REPEAT, GL_CLAMP_TO_EDGE, or GL_CLAMP).
   MTLSamplerDescriptor* samplerDesc = [[MTLSamplerDescriptor alloc] init];
-  samplerDesc.sAddressMode = MTLSamplerAddressModeRepeat;
-  samplerDesc.tAddressMode = MTLSamplerAddressModeRepeat;
+  MTLSamplerAddressMode addrMode =
+    texture->GetRepeat() ? MTLSamplerAddressModeRepeat : MTLSamplerAddressModeClampToEdge;
+  samplerDesc.sAddressMode = addrMode;
+  samplerDesc.tAddressMode = addrMode;
   samplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
   samplerDesc.magFilter = MTLSamplerMinMagFilterLinear;
   id<MTLSamplerState> newSampler = [device newSamplerStateWithDescriptor:samplerDesc];

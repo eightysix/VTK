@@ -40,7 +40,7 @@ static void EnsureDepthStencilStates(id<MTLDevice> device)
     if (!sOpaqueDepthState)
     {
       MTLDepthStencilDescriptor* desc = [[MTLDepthStencilDescriptor alloc] init];
-      desc.depthCompareFunction = MTLCompareFunctionLess;
+      desc.depthCompareFunction = MTLCompareFunctionLessEqual;
       desc.depthWriteEnabled = YES;
       sOpaqueDepthState = [device newDepthStencilStateWithDescriptor:desc];
       [desc release];
@@ -49,7 +49,7 @@ static void EnsureDepthStencilStates(id<MTLDevice> device)
     if (!sReadOnlyDepthState)
     {
       MTLDepthStencilDescriptor* desc = [[MTLDepthStencilDescriptor alloc] init];
-      desc.depthCompareFunction = MTLCompareFunctionLess;
+      desc.depthCompareFunction = MTLCompareFunctionLessEqual;
       desc.depthWriteEnabled = NO;
       sReadOnlyDepthState = [device newDepthStencilStateWithDescriptor:desc];
       [desc release];
@@ -228,6 +228,104 @@ void vtkMetalRenderer::DeviceRender()
       {
         this->ActiveCamera->Render(this);
         this->ActiveCamera->UpdateViewport(this);
+      }
+
+      // Draw the gradient/textured background (matches vtkOpenGLRenderer::Clear):
+      // a full-window quad interpolating between Background (bottom) and
+      // Background2 (top) is drawn before any geometry.
+      if (!this->Transparent() && this->GetGradientBackground())
+      {
+        static id<MTLRenderPipelineState> gradientPipeline = nil;
+        static int gradientPipelineSampleCount = 0;
+        if (!gradientPipeline || gradientPipelineSampleCount != (int)msaa)
+        {
+          @autoreleasepool
+          {
+            id<MTLLibrary> library = (__bridge id<MTLLibrary>)renWin->GetSharedShaderLibrary();
+            if (library)
+            {
+              id<MTLFunction> vFunc = [library newFunctionWithName:@"vertex_fullscreen_main"];
+              id<MTLFunction> fFunc =
+                [library newFunctionWithName:@"fragment_gradient_background"];
+              if (vFunc && fFunc)
+              {
+                MTLRenderPipelineDescriptor* desc =
+                  [[MTLRenderPipelineDescriptor alloc] init];
+                desc.vertexFunction = vFunc;
+                desc.fragmentFunction = fFunc;
+                desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+                // Match the opaque pass attachments: an RGBA32Uint IDs attachment
+                // when MSAA is inactive (the same rule the scene pipelines use).
+                if (!msaa)
+                {
+                  desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;
+                }
+                desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+                if (msaa)
+                {
+                  desc.rasterSampleCount = static_cast<NSUInteger>(
+                    renWin->GetEffectiveSampleCount());
+                }
+                NSError* error = nil;
+                gradientPipeline =
+                  [device newRenderPipelineStateWithDescriptor:desc error:&error];
+                if (!gradientPipeline)
+                {
+                  vtkGenericWarningMacro(<< "Gradient pipeline: "
+                                         << [[error localizedDescription] UTF8String]);
+                }
+                gradientPipelineSampleCount = msaa ? 1 : 0;
+                [desc release];
+              }
+              [vFunc release];
+              [fFunc release];
+            }
+          }
+        }
+
+        if (gradientPipeline)
+        {
+          static id<MTLBuffer> gradientStateBuffer = nil;
+          if (!gradientStateBuffer)
+          {
+            gradientStateBuffer = [device newBufferWithLength:sizeof(float) * 16
+                                                     options:MTLResourceStorageModeShared];
+          }
+          if (gradientStateBuffer)
+          {
+            double bg[3], bg2[3];
+            this->GetBackground(bg);
+            this->GetBackground2(bg2);
+            float* state = (float*)[gradientStateBuffer contents];
+            state[0] = static_cast<float>(bg[0]);
+            state[1] = static_cast<float>(bg[1]);
+            state[2] = static_cast<float>(bg[2]);
+            state[3] = 1.0f;
+            state[4] = static_cast<float>(bg2[0]);
+            state[5] = static_cast<float>(bg2[1]);
+            state[6] = static_cast<float>(bg2[2]);
+            state[7] = 1.0f;
+            int* istate = (int*)&state[8];
+            istate[0] = static_cast<int>(this->GetGradientMode());
+            istate[1] = this->GetDitherGradient() ? 1 : 0;
+            float* fstate = (float*)&state[12];
+            fstate[0] = static_cast<float>(size[0]);
+            fstate[1] = static_cast<float>(size[1]);
+
+            [encoder setRenderPipelineState:gradientPipeline];
+            [encoder setDepthStencilState:sReadOnlyDepthState];
+            [encoder setCullMode:MTLCullModeNone];
+            [encoder setVertexBuffer:nil offset:0 atIndex:0];
+            [encoder setFragmentBuffer:gradientStateBuffer offset:0 atIndex:0];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+          }
+        }
+
+        // Restore the opaque depth state for geometry.
+        if (activeDepthTex)
+        {
+          [encoder setDepthStencilState:sOpaqueDepthState];
+        }
       }
 
       // Create default headlight if none exist
@@ -616,6 +714,73 @@ void vtkMetalRenderer::DeviceRender()
           [blitEncoder endEncoding];
         }
       }
+    }
+
+    // === Phase 3c: Render overlay (2D) geometry ===
+    // vtkMetalRenderer::DeviceRender replaces the base-class render loop, so it
+    // must drive vtkRenderer::RenderOverlay() itself (vtkActor2D overlays such
+    // as vtkPolyDataMapper2D props are drawn here, in display coordinates).
+    {
+      MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+
+      if (msaa && msaaColorTex)
+      {
+        rpd.colorAttachments[0].texture = msaaColorTex;
+        rpd.colorAttachments[0].resolveTexture = drawable.texture;
+        rpd.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+      }
+      else
+      {
+        rpd.colorAttachments[0].texture = drawable.texture;
+        rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+      }
+      rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
+
+      // 2D pipelines declare a depth attachment matching the depth texture's
+      // format, so attach it (depth reads only; the 2D mapper uses an
+      // always-pass, no-write depth state).
+      if (msaa && msaaDepthTex)
+      {
+        rpd.depthAttachment.texture = msaaDepthTex;
+        rpd.depthAttachment.loadAction = MTLLoadActionLoad;
+        rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+      }
+      else
+      {
+        id<MTLTexture> depthTex = (__bridge id<MTLTexture>)renWin->DepthTexture;
+        if (depthTex)
+        {
+          rpd.depthAttachment.texture = depthTex;
+          rpd.depthAttachment.loadAction = MTLLoadActionLoad;
+          rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+        }
+      }
+
+      id<MTLRenderCommandEncoder> encoder =
+        [commandBuffer renderCommandEncoderWithDescriptor:rpd];
+      encoder.label = @"VTK Overlay Encoder";
+
+      [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
+
+      renWin->SetCurrentCommandBuffer((__bridge void*)commandBuffer);
+      renWin->Encoder = (__bridge void*)encoder;
+
+      MTLViewport metalViewport;
+      metalViewport.originX = viewport[0] * size[0];
+      metalViewport.originY = viewport[1] * size[1];
+      metalViewport.width = viewport[2] * size[0];
+      metalViewport.height = viewport[3] * size[1];
+      metalViewport.znear = 0.0;
+      metalViewport.zfar = 1.0;
+      [encoder setViewport:metalViewport];
+
+      for (int i = 0; i < this->PropArrayCount; i++)
+      {
+        this->NumberOfPropsRendered += this->PropArray[i]->RenderOverlay(this);
+      }
+
+      [encoder endEncoding];
+      renWin->Encoder = nullptr;
     }
 
 #ifdef VTK_METAL_ENABLE_COLOR_READBACK

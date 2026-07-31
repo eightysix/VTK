@@ -27,6 +27,7 @@
 #include "vtkCollection.h"
 #include "vtkLight.h"
 #include "vtkLightCollection.h"
+#include "vtkTransform.h"
 #include "vtkNew.h"
 
 #import <Metal/Metal.h>
@@ -801,8 +802,20 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     I->InstTransformBuffer = [device newBufferWithBytes:transforms.data()
                                                 length:transforms.size() * sizeof(vtkTypeFloat32)
                                                options:MTLResourceStorageModeShared];
-    I->InstNormalTransformBuffer = [device newBufferWithBytes:normTransforms.data()
-                                                      length:normTransforms.size() * sizeof(vtkTypeFloat32)
+    // Metal's float3x3 in a buffer has 16-byte-aligned columns (48-byte stride),
+    // so scatter the row-major 9-value normal transform into column-major with
+    // the 3 float3 columns placed at 16-byte boundaries.
+    std::vector<vtkTypeFloat32> paddedNormals(instCount * 12, 0.f);
+    for (vtkIdType i = 0; i < instCount; ++i)
+    {
+      const vtkTypeFloat32* src = &normTransforms[i * 9];
+      vtkTypeFloat32* dst = &paddedNormals[i * 12];
+      dst[0] = src[0]; dst[1] = src[3]; dst[2] = src[6];
+      dst[4] = src[1]; dst[5] = src[4]; dst[6] = src[7];
+      dst[8] = src[2]; dst[9] = src[5]; dst[10] = src[8];
+    }
+    I->InstNormalTransformBuffer = [device newBufferWithBytes:paddedNormals.data()
+                                                      length:paddedNormals.size() * sizeof(vtkTypeFloat32)
                                                      options:MTLResourceStorageModeShared];
     I->InstColorBuffer = [device newBufferWithBytes:colors.data()
                                             length:colors.size() * sizeof(vtkTypeFloat32)
@@ -846,15 +859,17 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
            vtkMetalCamera::GetSceneTransformsSize());
   }
 
-  // Material
+  // Material (40 floats: front material + backface material, matching the
+  // shader's MaterialUniforms layout)
   if (!I->MaterialBuffer)
   {
-    I->MaterialBuffer = [device newBufferWithLength:sizeof(float) * 18
+    I->MaterialBuffer = [device newBufferWithLength:sizeof(float) * 40
                                            options:MTLResourceStorageModeShared];
   }
   {
     vtkProperty* p = actor->GetProperty();
     float* mb = static_cast<float*>([I->MaterialBuffer contents]);
+    memset(mb, 0, sizeof(float) * 40);
     double amb[3], dif[3], spc[3];
     p->GetAmbientColor(amb);
     p->GetDiffuseColor(dif);
@@ -865,9 +880,11 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     mb[12] = mb[13] = mb[14] = mb[15] = 0.f;
     mb[16] = p->GetOpacity();
     mb[17] = p->GetSpecularPower();
+    memcpy(&mb[20], &mb[0], 18 * sizeof(float));
   }
 
-  // Lights
+  // Lights — same convention as vtkMetalPolyDataMapper: lightType 0 = headlight,
+  // 1 = directional, 2 = point, 3 = spot, with positions/directions in view space.
   if (!I->LightBuffer)
   {
     I->LightBuffer = [device newBufferWithLength:sizeof(float) * (16 * 8 + 4)
@@ -878,23 +895,84 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     vtkLightCollection* lc = ren->GetLights();
     vtkLight* light;
     vtkCollectionSimpleIterator cookie;
+    vtkCamera* cam = ren->GetActiveCamera();
+    vtkTransform* viewTF = cam ? cam->GetModelViewTransformObject() : nullptr;
     int cnt = 0;
     lc->InitTraversal(cookie);
     while ((light = lc->GetNextLight(cookie)) && cnt < 8)
     {
       float* lb = reinterpret_cast<float*>(buf + cnt * 64);
-      double* pos = light->GetPosition();
-      double* fp = light->GetFocalPoint();
-      double dir[3] = { fp[0] - pos[0], fp[1] - pos[1], fp[2] - pos[2] };
+      memset(lb, 0, 16 * sizeof(float));
       double* col = light->GetDiffuseColor();
-      lb[0] = pos[0]; lb[1] = pos[1]; lb[2] = pos[2];
-      lb[3] = static_cast<float>(light->GetLightType());
-      lb[4] = dir[0]; lb[5] = dir[1]; lb[6] = dir[2];
+      int lightType = light->GetLightType();
+      if (lightType == VTK_LIGHT_TYPE_HEADLIGHT)
+      {
+        lb[3] = 0.0f;
+      }
+      else if (light->GetPositional())
+      {
+        lb[3] = (light->GetConeAngle() < 90.0) ? 3.0f : 2.0f;
+        if (viewTF)
+        {
+          double pos[3], tPos[3];
+          light->GetPosition(pos);
+          viewTF->TransformPoint(pos, tPos);
+          lb[0] = static_cast<float>(tPos[0]);
+          lb[1] = static_cast<float>(tPos[1]);
+          lb[2] = static_cast<float>(tPos[2]);
+          double* lfp = light->GetTransformedFocalPoint();
+          double* lp = light->GetTransformedPosition();
+          double lightDir[3];
+          vtkMath::Subtract(lfp, lp, lightDir);
+          vtkMath::Normalize(lightDir);
+          double tDir[3];
+          viewTF->TransformNormal(lightDir, tDir);
+          lb[4] = static_cast<float>(tDir[0]);
+          lb[5] = static_cast<float>(tDir[1]);
+          lb[6] = static_cast<float>(tDir[2]);
+        }
+        else
+        {
+          double pos[3];
+          light->GetPosition(pos);
+          lb[0] = static_cast<float>(pos[0]);
+          lb[1] = static_cast<float>(pos[1]);
+          lb[2] = static_cast<float>(pos[2]);
+          lb[4] = lb[5] = 0.0f;
+          lb[6] = -1.0f;
+        }
+      }
+      else
+      {
+        lb[3] = 1.0f;
+        if (viewTF)
+        {
+          double* lfp = light->GetTransformedFocalPoint();
+          double* lp = light->GetTransformedPosition();
+          double lightDir[3];
+          vtkMath::Subtract(lfp, lp, lightDir);
+          vtkMath::Normalize(lightDir);
+          double tDir[3];
+          viewTF->TransformNormal(lightDir, tDir);
+          lb[4] = static_cast<float>(tDir[0]);
+          lb[5] = static_cast<float>(tDir[1]);
+          lb[6] = static_cast<float>(tDir[2]);
+        }
+        else
+        {
+          lb[4] = lb[5] = 0.0f;
+          lb[6] = -1.0f;
+        }
+      }
       lb[7] = light->GetConeAngle();
-      lb[8] = col[0]; lb[9] = col[1]; lb[10] = col[2];
-      lb[11] = light->GetIntensity();
+      lb[8] = static_cast<float>(col[0]) * static_cast<float>(light->GetIntensity());
+      lb[9] = static_cast<float>(col[1]) * static_cast<float>(light->GetIntensity());
+      lb[10] = static_cast<float>(col[2]) * static_cast<float>(light->GetIntensity());
+      lb[11] = 1.0f;
       const double* att = light->GetAttenuationValues();
-      lb[12] = att[0]; lb[13] = att[1]; lb[14] = att[2];
+      lb[12] = static_cast<float>(att[0]);
+      lb[13] = static_cast<float>(att[1]);
+      lb[14] = static_cast<float>(att[2]);
       lb[15] = light->GetExponent();
       ++cnt;
     }
@@ -984,17 +1062,20 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
   };
 
   // Draw
-  if (I->HasTriangles)
+  if (I->SrcPositionBuffer && I->SrcVertexCount > 0)
   {
-    bindAndDraw(I->TriPipeline, MTLPrimitiveTypeTriangle, I->TriVertexCount);
-  }
-  if (I->HasLines)
-  {
-    bindAndDraw(I->LinePipeline, MTLPrimitiveTypeLine, I->LineVertexCount);
-  }
-  if (I->HasPoints)
-  {
-    bindAndDraw(I->PtPipeline, MTLPrimitiveTypePoint, I->PtVertexCount);
+    if (I->HasTriangles)
+    {
+      bindAndDraw(I->TriPipeline, MTLPrimitiveTypeTriangle, I->TriVertexCount);
+    }
+    if (I->HasLines)
+    {
+      bindAndDraw(I->LinePipeline, MTLPrimitiveTypeLine, I->LineVertexCount);
+    }
+    if (I->HasPoints)
+    {
+      bindAndDraw(I->PtPipeline, MTLPrimitiveTypePoint, I->PtVertexCount);
+    }
   }
 }
 
