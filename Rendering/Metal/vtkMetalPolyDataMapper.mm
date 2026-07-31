@@ -1861,6 +1861,24 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       // Layout: ViewMatrix(64) + ProjectionMatrix(64) + NormalMatrix(48) +
       //         ModelMatrix(64) + Viewport(16) + Flags(256) + PointSize(260)
       char* buf = static_cast<char*>([this->Internals->SceneUniformBuffer contents]);
+
+      // The cached camera transforms carry the camera's model matrix (identity).
+      // The shader applies scene.modelMatrix to model-space vertices, so store the
+      // actor's model-to-world matrix here (transposed like the camera matrices,
+      // since Metal indexes matrices column-major).
+      {
+        vtkNew<vtkMatrix4x4> actorMatrix;
+        act->GetModelToWorldMatrix(actorMatrix);
+        float* modelMat = reinterpret_cast<float*>(buf + 176);
+        for (int col = 0; col < 4; ++col)
+        {
+          for (int row = 0; row < 4; ++row)
+          {
+            modelMat[col * 4 + row] = static_cast<float>(actorMatrix->GetElement(row, col));
+          }
+        }
+      }
+
       float ptSize = static_cast<float>(act->GetProperty()->GetPointSize());
       *reinterpret_cast<float*>(buf + 260) = ptSize;
 

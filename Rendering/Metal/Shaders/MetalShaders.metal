@@ -1049,18 +1049,32 @@ struct GlyphVertexOut {
   uint cellId;
   uint propId;
   uint compositeIndex;
+};
+
+// Point glyphs write [[point_size]], which is only valid for point topology.
+// Metal rejects a pipeline whose vertex shader outputs point_size with a
+// triangle/line primitive topology, so the point path uses a separate struct.
+struct GlyphPointVertexOut {
+  float4 position [[position]];
+  float3 viewPos;
+  float3 viewNormal;
+  float4 glyphColor;
+  float3 modelPos;
+  uint cellId;
+  uint propId;
+  uint compositeIndex;
   float point_size [[point_size]];
 };
 
-inline GlyphVertexOut computeGlyphVertex(
+template <typename T>
+inline T computeGlyphVertex(
     uint vertex_id, uint instance_id,
     constant float3* positions, constant float3* normals,
     constant float4x4* glyphTransforms, constant float3x3* glyphNormalTransforms,
     constant float4* glyphColors, constant uint* glyphPickIds,
-    constant SceneUniforms& scene, constant PickIds& pickIds,
-    float pointSize)
+    constant SceneUniforms& scene, constant PickIds& pickIds)
 {
-  GlyphVertexOut out;
+  T out;
   float3 pos = positions[vertex_id];
   float4 worldPos = scene.modelMatrix * glyphTransforms[instance_id] * float4(pos, 1.0);
   out.viewPos = (scene.viewMatrix * worldPos).xyz;
@@ -1070,12 +1084,12 @@ inline GlyphVertexOut computeGlyphVertex(
   out.cellId = glyphPickIds[instance_id] + 1u;
   out.propId = mapPropId(pickIds.propId);
   out.compositeIndex = pickIds.compositeIndex;
-  out.point_size = pointSize;
   out.modelPos = pos;
   return out;
 }
 
-inline FragmentOutput shadeGlyphFragment(GlyphVertexOut in,
+template <typename T>
+inline FragmentOutput shadeGlyphFragment(T in,
     constant MaterialUniforms& material, constant LightUniforms& lights,
     constant ClipPlaneUniforms& clipPlanes, float depthBias)
 {
@@ -1100,9 +1114,8 @@ vertex GlyphVertexOut vertex_glyph_main(
     constant float4* glyphColors [[buffer(4)]], constant uint* glyphPickIds [[buffer(5)]],
     constant SceneUniforms& scene [[buffer(8)]], constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
     constant PickIds& pickIds [[buffer(10)]]) {
-  return computeGlyphVertex(vertex_id, instance_id, positions, normals,
-      glyphTransforms, glyphNormalTransforms, glyphColors, glyphPickIds,
-      scene, pickIds, 0.0);
+  return computeGlyphVertex<GlyphVertexOut>(vertex_id, instance_id, positions, normals,
+      glyphTransforms, glyphNormalTransforms, glyphColors, glyphPickIds, scene, pickIds);
 }
 
 fragment FragmentOutput fragment_glyph_main(
@@ -1122,9 +1135,8 @@ vertex GlyphVertexOut vertex_glyph_line_main(
     constant float4* glyphColors [[buffer(4)]], constant uint* glyphPickIds [[buffer(5)]],
     constant SceneUniforms& scene [[buffer(8)]], constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
     constant PickIds& pickIds [[buffer(10)]]) {
-  return computeGlyphVertex(vertex_id, instance_id, positions, normals,
-      glyphTransforms, glyphNormalTransforms, glyphColors, glyphPickIds,
-      scene, pickIds, 0.0);
+  return computeGlyphVertex<GlyphVertexOut>(vertex_id, instance_id, positions, normals,
+      glyphTransforms, glyphNormalTransforms, glyphColors, glyphPickIds, scene, pickIds);
 }
 
 fragment FragmentOutput fragment_glyph_line_main(
@@ -1137,20 +1149,22 @@ fragment FragmentOutput fragment_glyph_line_main(
   return shadeGlyphFragment(in, material, lights, clipPlanes, 0.0);
 }
 
-vertex GlyphVertexOut vertex_glyph_point_main(
+vertex GlyphPointVertexOut vertex_glyph_point_main(
     uint vertex_id [[vertex_id]], uint instance_id [[instance_id]],
     constant float3* positions [[buffer(0)]], constant float3* normals [[buffer(1)]],
     constant float4x4* glyphTransforms [[buffer(2)]], constant float3x3* glyphNormalTransforms [[buffer(3)]],
     constant float4* glyphColors [[buffer(4)]], constant uint* glyphPickIds [[buffer(5)]],
     constant SceneUniforms& scene [[buffer(8)]], constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
     constant PickIds& pickIds [[buffer(10)]]) {
-  return computeGlyphVertex(vertex_id, instance_id, positions, normals,
-      glyphTransforms, glyphNormalTransforms, glyphColors, glyphPickIds,
-      scene, pickIds, scene.pointSize);
+  GlyphPointVertexOut out = computeGlyphVertex<GlyphPointVertexOut>(
+      vertex_id, instance_id, positions, normals,
+      glyphTransforms, glyphNormalTransforms, glyphColors, glyphPickIds, scene, pickIds);
+  out.point_size = scene.pointSize;
+  return out;
 }
 
 fragment FragmentOutput fragment_glyph_point_main(
-    GlyphVertexOut in [[stage_in]],
+    GlyphPointVertexOut in [[stage_in]],
     constant MaterialUniforms& material [[buffer(0)]],
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],

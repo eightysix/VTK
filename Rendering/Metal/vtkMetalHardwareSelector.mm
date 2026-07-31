@@ -69,6 +69,11 @@ bool vtkMetalHardwareSelector::CaptureBuffers()
   // For point field association, mappers check the selector and draw points.
   renWin->Render();
 
+  // The render is submitted to the GPU asynchronously; wait for it to finish
+  // before reading back the IDs texture (getBytes on a shared-storage texture
+  // would otherwise race the GPU and yield stale or partial data).
+  renWin->WaitForCompletion();
+
   // Read back the IDs texture into our buffer.
   renWin->GetIdsData(
     this->Area[0], this->Area[1], this->Area[2], this->Area[3], this->IdBuffer);
@@ -239,12 +244,15 @@ vtkHardwareSelector::PixelInformation vtkMetalHardwareSelector::GetPixelInformat
     int actorId = this->Convert(displayPosition[0], displayPosition[1], this->PixBuffer[ACTOR_PASS]);
     if (actorId <= 0)
     {
-      // the pixel did not hit any actor.
+      // the pixel did not hit any actor (the shader maps background to 0).
       return PixelInformation();
     }
 
     PixelInformation info;
     info.Valid = true;
+    // The shader encodes the prop index as id + 1 (mapPropId), so undo the
+    // offset to recover the 0-based index into PropArray.
+    actorId -= 1;
     info.PropID = actorId;
     info.Prop = this->GetPropFromID(actorId);
     if (this->ActorPassOnly)
@@ -261,13 +269,16 @@ vtkHardwareSelector::PixelInformation vtkMetalHardwareSelector::GetPixelInformat
     }
     info.CompositeID = static_cast<unsigned int>(compositeId);
 
-    int low24 =
-      this->Convert(displayPosition[0], displayPosition[1], this->PixBuffer[CELL_ID_LOW24]);
-    int high24 =
+    // The shader encodes cell/point ids as id + 1, so undo the offset.
+    const int attributeId =
       this->Convert(displayPosition[0], displayPosition[1], this->PixBuffer[CELL_ID_HIGH24]);
-    info.AttributeID = this->GetID(low24, high24, 0);
+    if (attributeId > 0)
+    {
+      info.AttributeID = attributeId - 1;
+    }
 
-    info.ProcessID = this->Convert(displayPosition[0], displayPosition[1], this->PixBuffer[PROCESS_PASS]);
+    // The Metal shaders always write 0 to the process-id channel, so leave
+    // ProcessID unset (matching the base class "no process" semantics).
     return info;
   }
 

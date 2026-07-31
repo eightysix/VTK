@@ -291,7 +291,7 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
       [commandBuffer renderCommandEncoderWithDescriptor:rpd];
     encoder.label = @"VTK Depth Peeling - Init";
 
-    renWin->CommandBuffer = (__bridge void*)commandBuffer;
+    renWin->SetCurrentCommandBuffer((__bridge void*)commandBuffer);
     renWin->Encoder = (__bridge void*)encoder;
 
     MTLViewport metalViewport;
@@ -349,7 +349,7 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
         [commandBuffer renderCommandEncoderWithDescriptor:rpd];
       encoder.label = [NSString stringWithFormat:@"VTK Depth Peeling - Peel %d", peel];
 
-      renWin->CommandBuffer = (__bridge void*)commandBuffer;
+      renWin->SetCurrentCommandBuffer((__bridge void*)commandBuffer);
       renWin->Encoder = (__bridge void*)encoder;
 
       MTLViewport metalViewport;

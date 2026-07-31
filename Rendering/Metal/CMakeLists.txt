@@ -68,14 +68,14 @@ vtk_module_add_module(
 
 # Link Metal framework
 if(APPLE_IOS)
-  vtk_module_link(VTK::RenderingMetal PUBLIC "-framework Metal" "-framework QuartzCore" "-framework UIKit")
+  vtk_module_link(VTK::RenderingMetal PUBLIC "-framework Metal" "-framework QuartzCore" "-framework UIKit" "-framework Accelerate")
   if(VTK_REQUIRED_OBJCXX_FLAGS)
     set_source_files_properties(
       ${sources}
       PROPERTIES COMPILE_FLAGS "${VTK_REQUIRED_OBJCXX_FLAGS}")
   endif()
 elseif(APPLE)
-  vtk_module_link(VTK::RenderingMetal PUBLIC "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
+  vtk_module_link(VTK::RenderingMetal PUBLIC "-framework Metal" "-framework QuartzCore" "-framework Cocoa" "-framework Accelerate")
   if(VTK_REQUIRED_OBJCXX_FLAGS)
     set_source_files_properties(
       ${sources}

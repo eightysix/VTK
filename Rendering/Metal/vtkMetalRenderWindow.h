@@ -107,6 +107,13 @@ public:
   void* GetCurrentCommandBuffer();
 
   /**
+   * Store the command buffer of the current frame. Takes ownership (retains)
+   * so that WaitForCompletion() can safely block on it after the renderer's
+   * autorelease scope has drained; the previous buffer is released.
+   */
+  void SetCurrentCommandBuffer(void* commandBuffer);
+
+  /**
    * Get the current drawable texture.
    * Only valid during a render pass when a drawable is acquired.
    */

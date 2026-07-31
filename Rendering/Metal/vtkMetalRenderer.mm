@@ -210,7 +210,7 @@ void vtkMetalRenderer::DeviceRender()
       }
       [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
 
-      renWin->CommandBuffer = (__bridge void*)commandBuffer;
+      renWin->SetCurrentCommandBuffer((__bridge void*)commandBuffer);
       renWin->Encoder = (__bridge void*)encoder;
 
       // Set viewport
@@ -295,6 +295,20 @@ void vtkMetalRenderer::DeviceRender()
       }
       rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;  // preserve opaque rendering
 
+      // Picking IDs attachment — the standard pipelines declare
+      // colorAttachments[1] (RGBA32Uint), so omitting it here makes the
+      // pass/pipeline mismatch and the translucent pass draws nothing.
+      if (!msaa)
+      {
+        id<MTLTexture> idsTex = (__bridge id<MTLTexture>)renWin->IdsTexture;
+        if (idsTex)
+        {
+          rpd.colorAttachments[1].texture = idsTex;
+          rpd.colorAttachments[1].loadAction = MTLLoadActionLoad; // keep opaque IDs
+          rpd.colorAttachments[1].storeAction = MTLStoreActionStore;
+        }
+      }
+
       if (msaa && msaaDepthTex)
       {
         id<MTLTexture> depthTex = (__bridge id<MTLTexture>)renWin->DepthTexture;
@@ -334,7 +348,7 @@ void vtkMetalRenderer::DeviceRender()
       }
       [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
 
-      renWin->CommandBuffer = (__bridge void*)commandBuffer;
+      renWin->SetCurrentCommandBuffer((__bridge void*)commandBuffer);
       renWin->Encoder = (__bridge void*)encoder;
 
       MTLViewport metalViewport;
@@ -434,7 +448,7 @@ void vtkMetalRenderer::DeviceRender()
       }
       [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
 
-      renWin->CommandBuffer = (__bridge void*)commandBuffer;
+      renWin->SetCurrentCommandBuffer((__bridge void*)commandBuffer);
       renWin->Encoder = (__bridge void*)encoder;
 
       MTLViewport metalViewport;

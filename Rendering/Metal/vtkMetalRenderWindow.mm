@@ -148,9 +148,10 @@ void vtkMetalRenderWindow::Finalize()
 {
   this->ReleaseDrawable();
 
-  // Encoder and CommandBuffer are transient; managed by ARC in vtkMetalRenderer.
+  // Encoder is transient (managed by ARC in vtkMetalRenderer); the command
+  // buffer is retained by SetCurrentCommandBuffer, so release it here.
   this->Encoder = nullptr;
-  this->CommandBuffer = nullptr;
+  this->SetCurrentCommandBuffer(nullptr);
 
   if (this->RenderCompletionCallback)
   {
@@ -486,6 +487,32 @@ void vtkMetalRenderWindow::SetCurrentRenderCommandEncoder(void* encoder)
 void* vtkMetalRenderWindow::GetCurrentCommandBuffer()
 {
   return this->CommandBuffer;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalRenderWindow::SetCurrentCommandBuffer(void* commandBuffer)
+{
+  if (commandBuffer == this->CommandBuffer)
+  {
+    return;
+  }
+
+  @autoreleasepool
+  {
+    if (this->CommandBuffer)
+    {
+      CFRelease((CFTypeRef)this->CommandBuffer);
+    }
+    this->CommandBuffer = commandBuffer;
+    if (commandBuffer)
+    {
+      // The renderer's ARC local is released when DeviceRender returns, so
+      // retain the buffer here to keep it alive until the next frame (or
+      // Finalize) replaces it. This makes WaitForCompletion() safe to call
+      // after the frame's autorelease scope has drained.
+      CFRetain((CFTypeRef)commandBuffer);
+    }
+  }
 }
 
 //------------------------------------------------------------------------------
