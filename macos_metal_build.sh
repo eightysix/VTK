@@ -5,6 +5,7 @@
 # Usage:
 #   ./macos_metal_build.sh              # macOS build (fresh)
 #   ./macos_metal_build.sh --resume     # macOS build (resume existing)
+#   ./macos_metal_build.sh --tests      # also enable the module test suites
 #
 
 set -e
@@ -12,10 +13,12 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build_macos_metal"
 RESUME=0
+TESTS=0
 
 for arg in "$@"; do
   case "$arg" in
     --resume) RESUME=1 ;;
+    --tests) TESTS=1 ;;
   esac
 done
 
@@ -36,7 +39,8 @@ CMAKE_CMD=(cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}" -GNinja \
     -DCMAKE_BUILD_TYPE:STRING=Release \
     -DBUILD_SHARED_LIBS:BOOL=OFF \
     -DVTK_BUILD_EXAMPLES:BOOL=OFF \
-    -DBUILD_TESTING:BOOL=OFF \
+    -DVTK_BUILD_TESTING:STRING=$(if [ "$TESTS" -eq 1 ]; then echo ON; else echo OFF; fi) \
+    -DBUILD_TESTING:BOOL=$(if [ "$TESTS" -eq 1 ]; then echo ON; else echo OFF; fi) \
     -DVTK_ENABLE_WRAPPING:BOOL=OFF \
     -DVTK_MODULE_ENABLE_VTK_RenderingLICOpenGL2:STRING=DONT_WANT \
     -DVTK_MODULE_ENABLE_VTK_RenderingWebGPU:STRING=DONT_WANT \

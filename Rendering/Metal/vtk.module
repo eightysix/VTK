@@ -21,4 +21,12 @@ PRIVATE_DEPENDS
   VTK::CommonMath
   VTK::CommonSystem
   VTK::FiltersGeneral
+TEST_DEPENDS
+  VTK::CommonColor
+  VTK::FiltersSources
+  VTK::InteractionStyle
+  VTK::RenderingAnnotation
+  VTK::RenderingUI
+  VTK::TestingCore
+  VTK::TestingRendering
 INCLUDE_MARSHAL

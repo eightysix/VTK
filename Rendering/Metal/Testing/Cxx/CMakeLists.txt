@@ -1,0 +1,4 @@
+vtk_add_test_cxx(vtkRenderingMetalCxxTests tests
+  TestMetalRenderWindow.cxx,NO_DATA,NO_VALID,NO_SERDES)
+
+vtk_test_cxx_executable(vtkRenderingMetalCxxTests tests)
