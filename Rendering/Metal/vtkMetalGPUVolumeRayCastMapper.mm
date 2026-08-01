@@ -4360,12 +4360,14 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     BOOL mask    = (featureMask & VolumeFeature_Mask) ? YES : NO;
     BOOL minmax  = (featureMask & VolumeFeature_MinMax) ? YES : NO;
     BOOL normalTex = (featureMask & VolumeFeature_NormalTexture) ? YES : NO;
+    BOOL linearInterp = (featureMask & VolumeFeature_LinearInterpolation) ? YES : NO;
 
     [constants setConstantValue:&shading type:MTLDataTypeBool withName:@"fc_shading"];
     [constants setConstantValue:&gradOp  type:MTLDataTypeBool withName:@"fc_gradientOpacity"];
     [constants setConstantValue:&mask    type:MTLDataTypeBool withName:@"fc_mask"];
     [constants setConstantValue:&minmax  type:MTLDataTypeBool withName:@"fc_minmax"];
     [constants setConstantValue:&normalTex type:MTLDataTypeBool withName:@"fc_normalTexture"];
+    [constants setConstantValue:&linearInterp type:MTLDataTypeBool withName:@"fc_linearInterpolation"];
 
     fragFunc = [library newFunctionWithName:fragName
                              constantValues:constants
@@ -4613,7 +4615,7 @@ void vtkMetalGPUVolumeRayCastMapper::BuildGlobalPerBlockData(
     pbd.VolumeBoundsMax[k]  = 1.0f;
     pbd.TextureBoundsMin[k] = 0.0f;
     pbd.TextureBoundsMax[k] = 1.0f;
-    pbd.GradientStep[k]     = (dims[k] > 0) ? 1.0f / dims[k] : 1.0f;
+    pbd.GradientStep[k]     = (dims[k] > 1) ? 1.0f / (dims[k] - 1) : 1.0f;
   }
   pbd.VolumeBoundsMin[3]  = 1.0f;
   pbd.VolumeBoundsMax[3]  = 1.0f;
@@ -4677,6 +4679,8 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
     featureMask |= VolumeFeature_Mask;
   if (uniforms->UseMinMaxAccel > 0.5f)
     featureMask |= VolumeFeature_MinMax;
+  if (uniforms->UseLinearVolumeInterpolation > 0.5f)
+    featureMask |= VolumeFeature_LinearInterpolation;
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)
     (static_cast<vtkMetalRenderWindow*>(ren->GetRenderWindow()))->GetMetalDevice();
@@ -5125,6 +5129,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     featureMask |= VolumeFeature_MinMax;
   if (hasNormalTexture)
     featureMask |= VolumeFeature_NormalTexture;
+  if (uniforms.UseLinearVolumeInterpolation > 0.5f)
+    featureMask |= VolumeFeature_LinearInterpolation;
 
   // Image-space downsampling requires offscreen rendering at reduced resolution.
   // Partitioned volumes no longer force offscreen rendering because grid traversal

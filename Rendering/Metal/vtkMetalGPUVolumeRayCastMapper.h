@@ -78,6 +78,7 @@ enum VolumeShaderFeatureFlags : uint32_t
   VolumeFeature_Mask            = 1u << 2,
   VolumeFeature_MinMax          = 1u << 3,
   VolumeFeature_NormalTexture    = 1u << 4,
+  VolumeFeature_LinearInterpolation = 1u << 5,
 };
 
 VTK_ABI_NAMESPACE_BEGIN

@@ -1569,6 +1569,9 @@ constant bool fc_gradientOpacity [[function_constant(1)]];
 constant bool fc_mask [[function_constant(2)]];
 constant bool fc_minmax [[function_constant(3)]];
 constant bool fc_normalTexture [[function_constant(4)]];
+// Bakes vtkVolumeProperty::GetInterpolationType() into the pipeline, so the
+// unused volume/TF/gradient-opacity sampler path is dead-code eliminated.
+constant bool fc_linearInterpolation [[function_constant(5)]];
 
 // ============================================================================
 // Volume Ray Casting Mapper
@@ -1764,22 +1767,26 @@ inline float physicalSampleStep(float3 rayDirNormSpace,
 // gradient-opacity textures (vtkVolumeInputHelper), defaulting to nearest.
 // The Metal backend previously hardcoded trilinear sampling (sVolume), which
 // made a default-property volume render smoother than the GL reference.
-inline float sampleVolumeScalar(texture3d<float> volTex, float3 pos, float useLinear) {
-  if (useLinear > 0.5) {
+// Interpolation is specialized at pipeline-creation time via the
+// fc_linearInterpolation function constant (driven by the property), so the
+// unused sampler path is eliminated — matching GL, which bakes interpolation
+// into texture filter state with no per-sample branch.
+inline float sampleVolumeScalar(texture3d<float> volTex, float3 pos) {
+  if (fc_linearInterpolation) {
     return volTex.sample(sVolume, pos, level(0)).r;
   }
   return volTex.sample(sNearest, pos, level(0)).r;
 }
 
-inline half4 sampleTransferFunction(texture2d<float> tfTex, float2 uv, float useLinear) {
-  if (useLinear > 0.5) {
+inline half4 sampleTransferFunction(texture2d<float> tfTex, float2 uv) {
+  if (fc_linearInterpolation) {
     return half4(tfTex.sample(sVolume, uv, level(0)));
   }
   return half4(tfTex.sample(sNearest, uv, level(0)));
 }
 
-inline half sampleGradientOpacity(texture2d<float> gradTex, float value, float useLinear) {
-  if (useLinear > 0.5) {
+inline half sampleGradientOpacity(texture2d<float> gradTex, float value) {
+  if (fc_linearInterpolation) {
     return half(gradTex.sample(sVolume, float2(value, 0.5), level(0)).r);
   }
   return half(gradTex.sample(sNearest, float2(value, 0.5), level(0)).r);
@@ -1788,24 +1795,24 @@ inline half sampleGradientOpacity(texture2d<float> gradTex, float value, float u
 // Mirrors vtkVolumeTexture::ComputeCellToPointMatrix for point data: shifts
 // [0,1] texture coordinates so samples land on texel centers, matching the
 // OpenGL backend's ip_textureCoords convention.
-inline float3 cellToPointTextureCoord(float3 texCoord, texture3d<float> volTex) {
-  float3 texelCount = float3(volTex.get_width(), volTex.get_height(), volTex.get_depth());
-  float3 texelCountMinus1 = max(texelCount - 1.0, 1e-4);
-  return (texCoord * texelCountMinus1 + 0.5) / texelCount;
+// scale/offset are precomputed once per march (see marchVolumeUnified) so the
+// per-sample conversion is a single fused multiply-add instead of 3 texture
+// queries (get_width/get_height/get_depth) plus 3 divisions.
+inline float3 cellToPointTextureCoord(float3 texCoord, float3 scale, float3 offset) {
+  return texCoord * scale + offset;
 }
 
 // Optimized: Gradient fetch with direction correction for anisotropic spacing.
 // gradScale = 1 / (gradientStep * texSizeGlobal) converts raw central-difference
 // components from texture-local to normalized-volume space.
 inline half4 computeGradientFast(texture3d<float> volTex, float3 pos,
-                                 float3 gradStep, half3 gradScale, half gradNormFactor,
-                                 float useLinear) {
-  half sPX = half(sampleVolumeScalar(volTex, pos + float3(gradStep.x, 0, 0), useLinear));
-  half sNX = half(sampleVolumeScalar(volTex, pos - float3(gradStep.x, 0, 0), useLinear));
-  half sPY = half(sampleVolumeScalar(volTex, pos + float3(0, gradStep.y, 0), useLinear));
-  half sNY = half(sampleVolumeScalar(volTex, pos - float3(0, gradStep.y, 0), useLinear));
-  half sPZ = half(sampleVolumeScalar(volTex, pos + float3(0, 0, gradStep.z), useLinear));
-  half sNZ = half(sampleVolumeScalar(volTex, pos - float3(0, 0, gradStep.z), useLinear));
+                                 float3 gradStep, half3 gradScale, half gradNormFactor) {
+  half sPX = half(sampleVolumeScalar(volTex, pos + float3(gradStep.x, 0, 0)));
+  half sNX = half(sampleVolumeScalar(volTex, pos - float3(gradStep.x, 0, 0)));
+  half sPY = half(sampleVolumeScalar(volTex, pos + float3(0, gradStep.y, 0)));
+  half sNY = half(sampleVolumeScalar(volTex, pos - float3(0, gradStep.y, 0)));
+  half sPZ = half(sampleVolumeScalar(volTex, pos + float3(0, 0, gradStep.z)));
+  half sNZ = half(sampleVolumeScalar(volTex, pos - float3(0, 0, gradStep.z)));
 
   half3 rawGrad = half3(sPX - sNX, sPY - sNY, sPZ - sNZ);
 
@@ -1825,16 +1832,21 @@ inline half3 computePhongLightingVolumeFast(half3 sampleColor, half3 normal, hal
                                             half3 ambientMat, half3 diffuseMat, half3 specularMat, half shininess,
                                             bool twoSided = false) {
   half nDotL = dot(normal, -lightDir);
-  half3 r = normalize(normal * (2.0h * nDotL) + lightDir);
-  half vDotR = dot(r, -viewDir);
-  if (nDotL < 0.0h && twoSided) {
-    nDotL = -nDotL;
-  }
-  if (nDotL > 0.0h) {
-    half3 diffuse = nDotL * diffuseMat * sampleColor;
-    vDotR = max(vDotR, 0.0h);
-    half3 specular = pow(vDotR, shininess) * specularMat;
-    return ambientMat * sampleColor + diffuse + specular;
+  // Reflection vector uses the un-negated nDotL (matches OpenGL's
+  // ComputeLightingDeclaration, which computes r before the two-sided flip).
+  // Guard on (nDotL > 0 || twoSided): for back-facing non-twoSided samples the
+  // result is discarded, so skip the normalize/dot entirely.
+  if (nDotL > 0.0h || twoSided) {
+    half3 r = normalize(normal * (2.0h * nDotL) + lightDir);
+    half vDotR = max(dot(r, -viewDir), 0.0h);
+    if (nDotL < 0.0h && twoSided) {
+      nDotL = -nDotL;
+    }
+    if (nDotL > 0.0h) {
+      half3 diffuse = nDotL * diffuseMat * sampleColor;
+      half3 specular = fast::pow(vDotR, shininess) * specularMat;
+      return ambientMat * sampleColor + diffuse + specular;
+    }
   }
   return ambientMat * sampleColor;
 }
@@ -1914,7 +1926,7 @@ inline half3 computeVolumeLighting(
                 vDotR = -vDotR;
             }
             if (vDotR > 0.0h) {
-                totalSpecular += pow(vDotR, shininess) * lightSpecular * attenuation;
+                totalSpecular += fast::pow(vDotR, shininess) * lightSpecular * attenuation;
             }
         }
 
@@ -2065,7 +2077,6 @@ inline half4 marchVolumeUnified(
   const bool doGradOp = fc_gradientOpacity && (volumeUniforms.useGradientOpacity > 0.5);
   const bool doCropping = volumeUniforms.useCropping > 0.5;
   const bool doMask = fc_mask && (volumeUniforms.useMask > 0.5);
-  const float useLinearInterp = volumeUniforms.useLinearVolumeInterpolation;
 
   half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
   half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
@@ -2075,6 +2086,12 @@ inline half4 marchVolumeUnified(
   float3 texSizeGlobal = max(p.texMaxGlobal - p.texMinGlobal, 1e-6);
   float3 invTexSizeGlobal = 1.0 / texSizeGlobal;
   float3 rayDirTexLocal = p.rayDir * invTexSizeGlobal;
+  // Cell-to-point conversion factors, computed once (texel centers at (i+0.5)/dims).
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  // Advance of the cellToPoint-adjusted sample position per step (constant).
+  float3 evalStep = rayDirTexLocal * p.stepSize * ctpScale;
   float3 dt = max(b.gradientStep.xyz, 1e-8);
   float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
                         - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
@@ -2109,10 +2126,13 @@ inline half4 marchVolumeUnified(
   half3 accumulatedColor = initialColor;
   half accumulatedOpacity = initialOpacity;
 
+  // Sample position carried incrementally through the march: advance one ray
+  // step per iteration instead of recomputing
+  // cellToPoint((currentPoint - texMinGlobal) * invTexSizeGlobal) per sample.
   float3 texLocalPos0 = (currentPoint - p.texMinGlobal) * invTexSizeGlobal;
-  float3 evalPoint0 = cellToPointTextureCoord(texLocalPos0, volumeTexture);
-  float prefetchScalar = sampleVolumeScalar(volumeTexture, evalPoint0, useLinearInterp);
-  float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint0, level(0)).r : 0.0;
+  float3 evalPoint = cellToPointTextureCoord(texLocalPos0, ctpScale, ctpOffset);
+  float prefetchScalar = sampleVolumeScalar(volumeTexture, evalPoint);
+  float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint, level(0)).r : 0.0;
   bool prefetchValid = true;
   int3  curCell     = int3(-1);
   bool  curCellEmpty = false;
@@ -2127,8 +2147,7 @@ inline half4 marchVolumeUnified(
     if (!p.checkBounds && currentT >= p.tEnd - 1e-6) break;
 
     if (useMinMax) {
-      float3 texLocalPos = (currentPoint - p.texMinGlobal) * invTexSizeGlobal;
-      float3 mmPos = clamp(cellToPointTextureCoord(texLocalPos, volumeTexture), float3(0.0), float3(1.0));
+      float3 mmPos = clamp(evalPoint, float3(0.0), float3(1.0));
       int3 newCell = min(int3(mmPos * mmDimF), int3(mmDimF) - 1);
       if (any(newCell != curCell)) {
         curCell      = newCell;
@@ -2162,38 +2181,40 @@ inline half4 marchVolumeUnified(
           break;
         }
 
+        // Re-sync the incremental sample position after the empty-cell jump.
+        evalPoint = cellToPointTextureCoord((currentPoint - p.texMinGlobal) * invTexSizeGlobal, ctpScale, ctpOffset);
         prefetchValid = false;
         curCell = int3(-1);
         continue;
       }
     }
 
-    float3 texLocalPos = (currentPoint - p.texMinGlobal) * invTexSizeGlobal;
-    float3 evalPoint = cellToPointTextureCoord(texLocalPos, volumeTexture);
     bool needsFetch = !prefetchValid;
     float rawScalar = needsFetch
-      ? sampleVolumeScalar(volumeTexture, evalPoint, useLinearInterp)
+      ? sampleVolumeScalar(volumeTexture, evalPoint)
       : prefetchScalar;
     float rawMask = (doMask && needsFetch)
       ? maskTexture.sample(sNearest, evalPoint, level(0)).r
       : prefetchMask;
 
-    float3 lastPoint = currentPoint;
-    currentPoint += stepVec;
-    currentT += p.stepSize;
-
-    if (i + 1 < maxSteps) {
-      float3 nextTexLocalPos = (currentPoint - p.texMinGlobal) * invTexSizeGlobal;
-      float3 nextEvalPoint = cellToPointTextureCoord(nextTexLocalPos, volumeTexture);
-      prefetchScalar = sampleVolumeScalar(volumeTexture, nextEvalPoint, useLinearInterp);
-      if (doMask) {
-        prefetchMask = maskTexture.sample(sNearest, nextEvalPoint, level(0)).r;
-      }
-      prefetchValid = true;
+    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, currentPoint))) == 0u)) {
+      currentPoint += stepVec;
+      currentT += p.stepSize;
+      evalPoint += evalStep;
+      prefetchValid = false;
+      continue;
     }
 
-    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, lastPoint))) == 0u)) {
-      continue;
+    currentPoint += stepVec;
+    currentT += p.stepSize;
+    evalPoint += evalStep;
+
+    if (i + 1 < maxSteps) {
+      prefetchScalar = sampleVolumeScalar(volumeTexture, evalPoint);
+      if (doMask) {
+        prefetchMask = maskTexture.sample(sNearest, evalPoint, level(0)).r;
+      }
+      prefetchValid = true;
     }
 
     half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
@@ -2211,13 +2232,13 @@ inline half4 marchVolumeUnified(
           float labelY = (label + 0.5) / numLabels;
           colorOpacity = half4(labelMapTransferTexture.sample(sNearest, float2(float(scalarNorm), labelY), level(0)));
         } else {
-          colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5), useLinearInterp);
+          colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
         }
       } else {
-        colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5), useLinearInterp);
+        colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
       }
     } else {
-      colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5), useLinearInterp);
+      colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
     }
 
     half sampleOpacity = colorOpacity.a;
@@ -2243,7 +2264,7 @@ inline half4 marchVolumeUnified(
           normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
           gradMag = nrmSample.w;
         } else {
-          half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor, useLinearInterp);
+          half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
           normal = grad.xyz;
           gradMag = grad.w;
         }
@@ -2261,7 +2282,7 @@ inline half4 marchVolumeUnified(
         }
 
         if (doGradOp) {
-          sampleOpacity *= sampleGradientOpacity(gradientOpacityTexture, float(gradMag), useLinearInterp);
+          sampleOpacity *= sampleGradientOpacity(gradientOpacityTexture, float(gradMag));
         }
       } else if (doShading) {
         sampleColor = ambientMat * sampleColor;
