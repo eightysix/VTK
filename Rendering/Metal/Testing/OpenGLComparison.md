@@ -167,6 +167,21 @@ worst thresholded error: 0.00653595
   without bit-identical sampling, which different backend arithmetic cannot
   guarantee, and is below the documented baseline.
 
+### Inter-device variability
+
+The residual magnitude is GPU-dependent. The numbers above were produced on an
+Apple M2 (the documented run): `VolumeRayCast` is `0.007` there. On other Apple
+Silicon generations the same commit yields a different thresholded error for
+this scene — e.g. an M1 machine reports `VolumeRayCast` at `0.005`. This is not
+a build/checkout difference: different Metal GPU implementations round the
+half-precision gradient/lighting and `fast::pow` differently at the sample
+positions, so a different set of near-texel-boundary gradient taps crosses the
+cell boundary and a slightly different subset of the ~40 specular-edge pixels
+lands over the threshold. The `worst thresholded error` therefore varies by a
+few thousandths across machines (0.007 on M2, 0.005 on M1), while remaining
+reproducible *within* a machine. When comparing measurements, report the
+device the numbers were produced on.
+
 ## Running the analysis yourself
 
 The volume shaders are embedded in the framework at build time, so a stale
