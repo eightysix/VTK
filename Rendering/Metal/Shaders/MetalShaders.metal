@@ -2205,18 +2205,6 @@ inline half4 marchVolumeUnified(
       continue;
     }
 
-    currentPoint += stepVec;
-    currentT += p.stepSize;
-    evalPoint += evalStep;
-
-    if (i + 1 < maxSteps) {
-      prefetchScalar = sampleVolumeScalar(volumeTexture, evalPoint);
-      if (doMask) {
-        prefetchMask = maskTexture.sample(sNearest, evalPoint, level(0)).r;
-      }
-      prefetchValid = true;
-    }
-
     half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
 
     half4 colorOpacity;
@@ -2291,6 +2279,18 @@ inline half4 marchVolumeUnified(
       accumulatedColor += weight * sampleColor * sampleOpacity;
       accumulatedOpacity += weight * sampleOpacity;
       }
+    }
+
+    currentPoint += stepVec;
+    currentT += p.stepSize;
+    evalPoint += evalStep;
+
+    if (i + 1 < maxSteps) {
+      prefetchScalar = sampleVolumeScalar(volumeTexture, evalPoint);
+      if (doMask) {
+        prefetchMask = maskTexture.sample(sNearest, evalPoint, level(0)).r;
+      }
+      prefetchValid = true;
     }
 
     if (accumulatedOpacity >= 0.99h) {
