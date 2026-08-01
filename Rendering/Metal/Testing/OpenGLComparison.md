@@ -169,7 +169,12 @@ worst thresholded error: 0.00653595
 
 ## Running the analysis yourself
 
+The volume shaders are embedded in the framework at build time, so a stale
+library produces stale numbers. After any Metal backend change, rebuild first
+(with tests, so the harness is relinked against the freshly embedded shader):
+
 ```sh
+./macos_metal_build.sh --resume --tests
 ./build_macos_metal/bin/vtkMetalGLVisualComparison --out /tmp/visual_compare
 # then inspect /tmp/visual_compare/<Scene>.gl.png / .metal.png / .diff.png
 ```
