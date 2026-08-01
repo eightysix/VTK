@@ -223,6 +223,15 @@ protected:
    */
   void RecreateColorCopyTexture();
 
+#ifdef VTK_METAL_ENABLE_OFFSCREEN_TARGET
+  /**
+   * Recreate the private offscreen color texture used when OffScreenRendering
+   * is enabled (benchmark timing). Same format/usage as the drawable texture
+   * so every pass accepts it as the color attachment.
+   */
+  void RecreateOffscreenColorTexture();
+#endif
+
   /**
    * Create/destroy multisampled color and depth textures for MSAA rendering.
    */
@@ -250,6 +259,9 @@ protected:
   void* DepthTexture = nullptr;    // id<MTLTexture>
   void* IdsTexture = nullptr;      // id<MTLTexture> — RGBA32Uint for picking IDs
   void* ColorCopyTexture = nullptr; // id<MTLTexture> — BGRA8Unorm, MTLStorageModeShared, color read-back
+#ifdef VTK_METAL_ENABLE_OFFSCREEN_TARGET
+  void* OffscreenColorTexture = nullptr; // id<MTLTexture> — BGRA8Unorm, MTLStorageModePrivate, offscreen target
+#endif
   void* MultisampleColorTexture = nullptr; // id<MTLTexture> — MSAA color (MTLTextureType2DMultisample)
   void* MultisampleDepthTexture = nullptr; // id<MTLTexture> — MSAA depth (MTLTextureType2DMultisample)
   void* ColorCopyPipeline = nullptr; // id<MTLRenderPipelineState>

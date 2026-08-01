@@ -71,8 +71,14 @@ vtk_module_add_module(
 # CAMetalLayer drawable to be blittable (framebufferOnly=NO) and copies the
 # whole frame into a shared texture every render. Keep that overhead out of
 # production builds by compiling it in only when the test suites are enabled.
+# The offscreen render target is likewise test-only: it lets the benchmark
+# harness render into a private texture instead of a CAMetalLayer drawable (whose
+# nextDrawable is paced to the display refresh cadence on recent macOS), so the
+# Metal timing is not throttled by the compositor.
 if(VTK_BUILD_TESTING)
-  target_compile_definitions(vtkRenderingMetal PRIVATE VTK_METAL_ENABLE_COLOR_READBACK)
+  target_compile_definitions(vtkRenderingMetal PRIVATE
+    VTK_METAL_ENABLE_COLOR_READBACK
+    VTK_METAL_ENABLE_OFFSCREEN_TARGET)
 endif()
 
 # Link Metal framework

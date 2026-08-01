@@ -120,17 +120,36 @@ void vtkMetalRenderer::DeviceRender()
 
     EnsureDepthStencilStates(device);
 
-    // Acquire drawable
-    CAMetalLayer* layer = (__bridge CAMetalLayer*)renWin->GetMetalLayer();
-    if (!layer)
+    // Acquire the color target. Normal rendering renders into a CAMetalLayer
+    // drawable; the test-only offscreen path (benchmark timing) renders into a
+    // private window-owned texture instead, skipping nextDrawable/present so
+    // the CAMetalLayer display pacing cannot throttle the timed loop.
+    id<CAMetalDrawable> drawable = nil;
+    id<MTLTexture> colorTarget = nil;
+#ifdef VTK_METAL_ENABLE_OFFSCREEN_TARGET
+    if (renWin->GetOffScreenRendering())
     {
-      return;
+      colorTarget = (__bridge id<MTLTexture>)renWin->OffscreenColorTexture;
+      if (!colorTarget)
+      {
+        return;
+      }
     }
-
-    id<CAMetalDrawable> drawable = [layer nextDrawable];
-    if (!drawable)
+    else
+#endif
     {
-      return;
+      CAMetalLayer* layer = (__bridge CAMetalLayer*)renWin->GetMetalLayer();
+      if (!layer)
+      {
+        return;
+      }
+
+      drawable = [layer nextDrawable];
+      if (!drawable)
+      {
+        return;
+      }
+      colorTarget = drawable.texture;
     }
 
     id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
@@ -155,12 +174,12 @@ void vtkMetalRenderer::DeviceRender()
       if (msaa && msaaColorTex)
       {
         rpd.colorAttachments[0].texture = msaaColorTex;
-        rpd.colorAttachments[0].resolveTexture = drawable.texture;
+        rpd.colorAttachments[0].resolveTexture = colorTarget;
         rpd.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
       }
       else
       {
-        rpd.colorAttachments[0].texture = drawable.texture;
+        rpd.colorAttachments[0].texture = colorTarget;
         rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
       }
       rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -390,12 +409,12 @@ void vtkMetalRenderer::DeviceRender()
       if (msaa && msaaColorTex)
       {
         rpd.colorAttachments[0].texture = msaaColorTex;
-        rpd.colorAttachments[0].resolveTexture = drawable.texture;
+        rpd.colorAttachments[0].resolveTexture = colorTarget;
         rpd.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
       }
       else
       {
-        rpd.colorAttachments[0].texture = drawable.texture;
+        rpd.colorAttachments[0].texture = colorTarget;
         rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
       }
       rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;  // preserve opaque rendering
@@ -486,7 +505,7 @@ void vtkMetalRenderer::DeviceRender()
 
         this->DepthPeeler->SetMaximumNumberOfPeels(this->MaximumNumberOfPeels);
         int peels = this->DepthPeeler->RenderTranslucentGeometry(
-          this, commandBuffer, drawable.texture, depthTex);
+          this, commandBuffer, colorTarget, depthTex);
 
         // If depth peeling produced no results (e.g. nil depth texture), fall
         // back to standard alpha-blended translucent rendering (with encoder).
@@ -501,7 +520,7 @@ void vtkMetalRenderer::DeviceRender()
     {
       id<MTLTexture> depthTex = (__bridge id<MTLTexture>)renWin->DepthTexture;
       int oitResult = this->OrderIndependentTranslucentPass->RenderTranslucentGeometry(
-        this, commandBuffer, drawable.texture, depthTex);
+        this, commandBuffer, colorTarget, depthTex);
       // Fall back to standard alpha-blended translucent rendering if OIT
       // could not run (e.g. nil/MSAA depth texture).
       if (oitResult == 0)
@@ -526,13 +545,13 @@ void vtkMetalRenderer::DeviceRender()
       if (msaa && msaaColorTex)
       {
         rpd.colorAttachments[0].texture = msaaColorTex;
-        rpd.colorAttachments[0].resolveTexture = drawable.texture;
+        rpd.colorAttachments[0].resolveTexture = colorTarget;
         rpd.colorAttachments[0].storeAction =
           MTLStoreActionMultisampleResolve;
       }
       else
       {
-        rpd.colorAttachments[0].texture = drawable.texture;
+        rpd.colorAttachments[0].texture = colorTarget;
         rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
       }
       rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
@@ -683,12 +702,12 @@ void vtkMetalRenderer::DeviceRender()
           if (msaa && msaaColorTex)
           {
             rpd.colorAttachments[0].texture = msaaColorTex;
-            rpd.colorAttachments[0].resolveTexture = drawable.texture;
+            rpd.colorAttachments[0].resolveTexture = colorTarget;
             rpd.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
           }
           else
           {
-            rpd.colorAttachments[0].texture = drawable.texture;
+            rpd.colorAttachments[0].texture = colorTarget;
             rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
           }
           rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
@@ -760,12 +779,12 @@ void vtkMetalRenderer::DeviceRender()
       if (msaa && msaaColorTex)
       {
         rpd.colorAttachments[0].texture = msaaColorTex;
-        rpd.colorAttachments[0].resolveTexture = drawable.texture;
+        rpd.colorAttachments[0].resolveTexture = colorTarget;
         rpd.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
       }
       else
       {
-        rpd.colorAttachments[0].texture = drawable.texture;
+        rpd.colorAttachments[0].texture = colorTarget;
         rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
       }
       rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
@@ -829,12 +848,12 @@ void vtkMetalRenderer::DeviceRender()
       {
         id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
         blit.label = @"VTK Color Readback Copy";
-        [blit copyFromTexture:drawable.texture
+        [blit copyFromTexture:colorTarget
                   sourceSlice:0
                   sourceLevel:0
                  sourceOrigin:MTLOriginMake(0, 0, 0)
-                   sourceSize:MTLSizeMake((NSUInteger)drawable.texture.width,
-                         (NSUInteger)drawable.texture.height, 1)
+                   sourceSize:MTLSizeMake((NSUInteger)colorTarget.width,
+                         (NSUInteger)colorTarget.height, 1)
                     toTexture:colorCopyTex
              destinationSlice:0
              destinationLevel:0
@@ -845,7 +864,10 @@ void vtkMetalRenderer::DeviceRender()
 #endif
 
     // Commit and present
-    [commandBuffer presentDrawable:drawable];
+    if (drawable)
+    {
+      [commandBuffer presentDrawable:drawable];
+    }
     [commandBuffer commit];
 
     // Notify application of GPU completion (benchmarking etc.)

@@ -9,7 +9,7 @@
 //
 // Usage:
 //   vtkMetalGLVisualComparison [--out <dir>] [--threshold <value>]
-//     [--scene <name>] [--backend gl|metal] [--bench] [--frames <n>]
+//     [--scene <name>] [--backend gl|metal] [--bench] [--frames <n>] [--reps <n>]
 //
 // The default output directory is "visual_compare" under the current working
 // directory. When --threshold is given, the process exits non-zero if any
@@ -21,6 +21,11 @@
 // each frame so every timed render performs real work, and both backends are
 // synchronized inside the timed region (Metal WaitForCompletion, OpenGL
 // glFinish) so the wall-clock time covers GPU time for both.
+//
+// --reps repeats the whole per-scene measurement (fresh window each run) the
+// given number of times and reports the mean of the per-run averages plus the
+// run-to-run standard deviation, which dilutes the noise (thermal/background
+// load on laptops) that shows up in single runs.
 //
 // Note: the OpenGL backend needs the vtkShaderProgram object-factory override
 // (vtkOpenGLShaderProgram), so vtkRenderingOpenGL2 and vtkRenderingVolumeOpenGL2
@@ -194,6 +199,17 @@ BenchStats BenchmarkScene(
     vtkCocoaMetalRenderWindow::SafeDownCast(renWin)->SetColorReadbackEnabled(false);
   }
 
+  // Render both backends into offscreen buffers for the timed loop. On recent
+  // macOS the CAMetalLayer's nextDrawable is paced to the display refresh
+  // cadence even for window-less layers, capping every Metal scene at the
+  // refresh rate regardless of complexity; the test-only offscreen target
+  // (VTK_METAL_ENABLE_OFFSCREEN_TARGET) skips drawable presentation so the
+  // timed loop measures real GPU time. The GL backend renders into its standard
+  // offscreen framebuffer (vtkOpenGLFramebufferObject), which skips the display
+  // path the same way SwapBuffersOff() does. Enabling it for both backends
+  // makes the two configurations symmetric.
+  renWin->SetOffScreenRendering(true);
+
   vtkSmartPointer<vtkRenderer> renderer = vtkMetalScenes::NewRenderer(backend);
   renWin->AddRenderer(renderer);
   spec.Build(renderer, backend);
@@ -242,6 +258,46 @@ BenchStats BenchmarkScene(
   return stats;
 }
 
+// Aggregate of a backend's timings across repeated BenchmarkScene runs.
+struct BenchAggregate
+{
+  double MeanMs = 0.0;   // mean of the per-run averages (the reported number)
+  double StdDevMs = 0.0; // sample std-dev of the per-run averages (0 if reps < 2)
+};
+
+// Run BenchmarkScene `reps` times (fresh window each run) and aggregate the
+// per-run averages. Multiple runs dilute run-to-run noise; MeanMs is the
+// headline, StdDevMs quantifies how much the per-run averages spread.
+BenchAggregate RunBenchmark(
+  const SceneSpec& spec, vtkMetalScenes::BackendKind backend, int frames, int reps)
+{
+  reps = std::max(1, reps);
+  std::vector<double> avgs;
+  avgs.reserve(reps);
+  for (int r = 0; r < reps; ++r)
+  {
+    avgs.push_back(BenchmarkScene(spec, backend, frames).AvgMs);
+  }
+
+  double sum = 0.0;
+  for (double v : avgs)
+  {
+    sum += v;
+  }
+  const double mean = sum / reps;
+
+  double varSum = 0.0;
+  for (double v : avgs)
+  {
+    varSum += (v - mean) * (v - mean);
+  }
+
+  BenchAggregate agg;
+  agg.MeanMs = mean;
+  agg.StdDevMs = (reps > 1) ? std::sqrt(varSum / (reps - 1)) : 0.0;
+  return agg;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -252,6 +308,7 @@ int main(int argc, char* argv[])
   std::string backendFilter;
   bool bench = false;
   int benchFrames = 30;
+  int benchReps = 1;
   int warmupFrames = 0;
   for (int i = 1; i < argc; ++i)
   {
@@ -279,6 +336,10 @@ int main(int argc, char* argv[])
     else if (arg == "--frames" && i + 1 < argc)
     {
       benchFrames = std::atoi(argv[++i]);
+    }
+    else if (arg == "--reps" && i + 1 < argc)
+    {
+      benchReps = std::max(1, std::atoi(argv[++i]));
     }
     else if (arg == "--warmup" && i + 1 < argc)
     {
@@ -368,9 +429,25 @@ int main(int argc, char* argv[])
 
   if (bench)
   {
-    std::cout << "\nBenchmark (" << benchFrames << " frames after warmup):\n";
-    std::cout << "scene                          "
-                 "GL ms/f   GL fps   Metal ms/f  Metal fps    M/GL\n";
+    if (benchReps > 1)
+    {
+      std::cout << "\nBenchmark (" << benchFrames << " frames x " << benchReps
+                << " runs per scene, mean of run averages ± σ):\n";
+    }
+    else
+    {
+      std::cout << "\nBenchmark (" << benchFrames << " frames after warmup):\n";
+    }
+    if (benchReps > 1)
+    {
+      std::cout << "scene                          "
+                   "GL ms/f   ±σ   GL fps   Metal ms/f   ±σ   Metal fps    M/GL\n";
+    }
+    else
+    {
+      std::cout << "scene                          "
+                   "GL ms/f   GL fps   Metal ms/f  Metal fps    M/GL\n";
+    }
     std::cout << "-------------------------------------------------------------------\n";
     for (const SceneSpec& spec : kScenes)
     {
@@ -381,27 +458,46 @@ int main(int argc, char* argv[])
       const bool benchGl = backendFilter.empty() || backendFilter == "gl";
       const bool benchMetal = backendFilter.empty() || backendFilter == "metal";
 
+      char glCell[32], metalCell[32];
+      const auto fmtMs = [benchReps](char* dst, size_t n, const BenchAggregate& a) {
+        if (benchReps > 1)
+        {
+          std::snprintf(dst, n, "%.2f±%.2f", a.MeanMs, a.StdDevMs);
+        }
+        else
+        {
+          std::snprintf(dst, n, "%.2f", a.MeanMs);
+        }
+      };
+
       char line[256];
       if (benchGl && benchMetal)
       {
-        const BenchStats gl = BenchmarkScene(spec, vtkMetalScenes::BackendKind::OpenGL, benchFrames);
-        const BenchStats metal =
-          BenchmarkScene(spec, vtkMetalScenes::BackendKind::Metal, benchFrames);
-        std::snprintf(line, sizeof(line), "%-30s %8.2f %8.1f  %10.2f %10.1f  %6.2f\n", spec.Name,
-          gl.AvgMs, 1000.0 / gl.AvgMs, metal.AvgMs, 1000.0 / metal.AvgMs, metal.AvgMs / gl.AvgMs);
+        const BenchAggregate gl =
+          RunBenchmark(spec, vtkMetalScenes::BackendKind::OpenGL, benchFrames, benchReps);
+        const BenchAggregate metal =
+          RunBenchmark(spec, vtkMetalScenes::BackendKind::Metal, benchFrames, benchReps);
+        fmtMs(glCell, sizeof(glCell), gl);
+        fmtMs(metalCell, sizeof(metalCell), metal);
+        std::snprintf(line, sizeof(line), "%-30s %9s %6.1f  %11s %8.1f  %6.2f\n", spec.Name,
+          glCell, 1000.0 / gl.MeanMs, metalCell, 1000.0 / metal.MeanMs,
+          metal.MeanMs / gl.MeanMs);
       }
       else if (benchGl)
       {
-        const BenchStats gl = BenchmarkScene(spec, vtkMetalScenes::BackendKind::OpenGL, benchFrames);
-        std::snprintf(line, sizeof(line), "%-30s %8.2f %8.1f  %10s %10s  %6s\n", spec.Name,
-          gl.AvgMs, 1000.0 / gl.AvgMs, "-", "-", "-");
+        const BenchAggregate gl =
+          RunBenchmark(spec, vtkMetalScenes::BackendKind::OpenGL, benchFrames, benchReps);
+        fmtMs(glCell, sizeof(glCell), gl);
+        std::snprintf(line, sizeof(line), "%-30s %9s %6.1f  %11s %8s  %6s\n", spec.Name, glCell,
+          1000.0 / gl.MeanMs, "-", "-", "-");
       }
       else if (benchMetal)
       {
-        const BenchStats metal =
-          BenchmarkScene(spec, vtkMetalScenes::BackendKind::Metal, benchFrames);
-        std::snprintf(line, sizeof(line), "%-30s %8s %8s  %10.2f %10.1f  %6s\n", spec.Name, "-",
-          "-", metal.AvgMs, 1000.0 / metal.AvgMs, "-");
+        const BenchAggregate metal =
+          RunBenchmark(spec, vtkMetalScenes::BackendKind::Metal, benchFrames, benchReps);
+        fmtMs(metalCell, sizeof(metalCell), metal);
+        std::snprintf(line, sizeof(line), "%-30s %9s %6s  %11s %8.1f  %6s\n", spec.Name, "-", "-",
+          metalCell, 1000.0 / metal.MeanMs, "-");
       }
       else
       {

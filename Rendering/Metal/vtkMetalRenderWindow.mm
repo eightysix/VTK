@@ -187,6 +187,14 @@ void vtkMetalRenderWindow::Finalize()
     this->ColorCopyTexture = nullptr;
   }
 
+#ifdef VTK_METAL_ENABLE_OFFSCREEN_TARGET
+  if (this->OffscreenColorTexture)
+  {
+    [(id)this->OffscreenColorTexture release];
+    this->OffscreenColorTexture = nullptr;
+  }
+#endif
+
   this->DestroyMultisampleAttachments();
 
   if (this->SharedShaderLibrary)
@@ -345,6 +353,37 @@ void vtkMetalRenderWindow::RecreateColorCopyTexture()
 }
 
 //------------------------------------------------------------------------------
+#ifdef VTK_METAL_ENABLE_OFFSCREEN_TARGET
+void vtkMetalRenderWindow::RecreateOffscreenColorTexture()
+{
+  if (this->OffscreenColorTexture)
+  {
+    [(id)this->OffscreenColorTexture release];
+    this->OffscreenColorTexture = nullptr;
+  }
+
+  @autoreleasepool
+  {
+    id<MTLDevice> device = (id<MTLDevice>)this->MetalDevice;
+    MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                   width:this->Size[0]
+                                                                                  height:this->Size[1]
+                                                                               mipmapped:NO];
+    // Private storage: only the GPU renders to this buffer; it is never read
+    // back by the CPU (benchmark timing only). RenderTarget/ShaderRead usage
+    // matches the drawable texture so all passes (opaque, translucent, OIT,
+    // depth-peel and overlay resolves) accept it as a color attachment.
+    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    desc.storageMode = MTLStorageModePrivate;
+
+    // newTextureWithDescriptor returns +1 (new rule); member owns it directly.
+    id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+    this->OffscreenColorTexture = (void*)tex;
+  }
+}
+#endif
+
+//------------------------------------------------------------------------------
 int vtkMetalRenderWindow::GetEffectiveSampleCount()
 {
   return (this->MultiSamples > 1) ? this->MultiSamples : 1;
@@ -456,6 +495,18 @@ void vtkMetalRenderWindow::Render()
           colorCopyTex.height != (NSUInteger)this->Size[1])
       {
         this->RecreateColorCopyTexture();
+      }
+#endif
+
+#ifdef VTK_METAL_ENABLE_OFFSCREEN_TARGET
+      if (this->GetOffScreenRendering())
+      {
+        id<MTLTexture> offscreenTex = (id<MTLTexture>)this->OffscreenColorTexture;
+        if (!offscreenTex || offscreenTex.width != (NSUInteger)this->Size[0] ||
+            offscreenTex.height != (NSUInteger)this->Size[1])
+        {
+          this->RecreateOffscreenColorTexture();
+        }
       }
 #endif
 
