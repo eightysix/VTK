@@ -1631,7 +1631,7 @@ struct VolumeMapperUniforms {
   float labelMapNumLabels;
   float useDepthTexture;
   float useNormalTexture;
-  float _padMask;
+  float useLinearVolumeInterpolation; // 1.0 = trilinear (VTK_LINEAR_INTERPOLATION), 0.0 = nearest
   // Min-max acceleration texture
   float useMinMaxAccel;
   float minMaxDimX;
@@ -1759,17 +1759,53 @@ inline float physicalSampleStep(float3 rayDirNormSpace,
   return float(u.sampleDistance) * maxBound / max(physPerNorm, 1e-6);
 }
 
+// Honors vtkVolumeProperty::GetInterpolationType(): the OpenGL backend applies
+// the property's interpolation to the volume data, transfer-function and
+// gradient-opacity textures (vtkVolumeInputHelper), defaulting to nearest.
+// The Metal backend previously hardcoded trilinear sampling (sVolume), which
+// made a default-property volume render smoother than the GL reference.
+inline float sampleVolumeScalar(texture3d<float> volTex, float3 pos, float useLinear) {
+  if (useLinear > 0.5) {
+    return volTex.sample(sVolume, pos, level(0)).r;
+  }
+  return volTex.sample(sNearest, pos, level(0)).r;
+}
+
+inline half4 sampleTransferFunction(texture2d<float> tfTex, float2 uv, float useLinear) {
+  if (useLinear > 0.5) {
+    return half4(tfTex.sample(sVolume, uv, level(0)));
+  }
+  return half4(tfTex.sample(sNearest, uv, level(0)));
+}
+
+inline half sampleGradientOpacity(texture2d<float> gradTex, float value, float useLinear) {
+  if (useLinear > 0.5) {
+    return half(gradTex.sample(sVolume, float2(value, 0.5), level(0)).r);
+  }
+  return half(gradTex.sample(sNearest, float2(value, 0.5), level(0)).r);
+}
+
+// Mirrors vtkVolumeTexture::ComputeCellToPointMatrix for point data: shifts
+// [0,1] texture coordinates so samples land on texel centers, matching the
+// OpenGL backend's ip_textureCoords convention.
+inline float3 cellToPointTextureCoord(float3 texCoord, texture3d<float> volTex) {
+  float3 texelCount = float3(volTex.get_width(), volTex.get_height(), volTex.get_depth());
+  float3 texelCountMinus1 = max(texelCount - 1.0, 1e-4);
+  return (texCoord * texelCountMinus1 + 0.5) / texelCount;
+}
+
 // Optimized: Gradient fetch with direction correction for anisotropic spacing.
 // gradScale = 1 / (gradientStep * texSizeGlobal) converts raw central-difference
 // components from texture-local to normalized-volume space.
 inline half4 computeGradientFast(texture3d<float> volTex, float3 pos,
-                                 float3 gradStep, half3 gradScale, half gradNormFactor) {
-  half sPX = half(volTex.sample(sVolume, pos + float3(gradStep.x, 0, 0), level(0)).r);
-  half sNX = half(volTex.sample(sVolume, pos - float3(gradStep.x, 0, 0), level(0)).r);
-  half sPY = half(volTex.sample(sVolume, pos + float3(0, gradStep.y, 0), level(0)).r);
-  half sNY = half(volTex.sample(sVolume, pos - float3(0, gradStep.y, 0), level(0)).r);
-  half sPZ = half(volTex.sample(sVolume, pos + float3(0, 0, gradStep.z), level(0)).r);
-  half sNZ = half(volTex.sample(sVolume, pos - float3(0, 0, gradStep.z), level(0)).r);
+                                 float3 gradStep, half3 gradScale, half gradNormFactor,
+                                 float useLinear) {
+  half sPX = half(sampleVolumeScalar(volTex, pos + float3(gradStep.x, 0, 0), useLinear));
+  half sNX = half(sampleVolumeScalar(volTex, pos - float3(gradStep.x, 0, 0), useLinear));
+  half sPY = half(sampleVolumeScalar(volTex, pos + float3(0, gradStep.y, 0), useLinear));
+  half sNY = half(sampleVolumeScalar(volTex, pos - float3(0, gradStep.y, 0), useLinear));
+  half sPZ = half(sampleVolumeScalar(volTex, pos + float3(0, 0, gradStep.z), useLinear));
+  half sNZ = half(sampleVolumeScalar(volTex, pos - float3(0, 0, gradStep.z), useLinear));
 
   half3 rawGrad = half3(sPX - sNX, sPY - sNY, sPZ - sNZ);
 
@@ -1780,20 +1816,24 @@ inline half4 computeGradientFast(texture3d<float> volTex, float3 pos,
   return half4(normal, saturate(mag / gradNormFactor));
 }
 
-// Optimized: Pure FP16 math and fast::pow
+// Mirrors OpenGL's ComputeLightingDeclaration default-light path (headlight):
+//   nDotL = dot(normal, -g_ldir)     with g_ldir = normalize(cameraPos - vertexPos)
+//   r     = normalize(2*nDotL*normal + g_ldir)
+//   vDotR = dot(r, -g_vdir)
+//   specular = pow(vDotR, shininess) * in_specular * in_lightSpecularColor
 inline half3 computePhongLightingVolumeFast(half3 sampleColor, half3 normal, half3 lightDir, half3 viewDir,
                                             half3 ambientMat, half3 diffuseMat, half3 specularMat, half shininess,
                                             bool twoSided = false) {
   half nDotL = dot(normal, -lightDir);
+  half3 r = normalize(normal * (2.0h * nDotL) + lightDir);
+  half vDotR = dot(r, -viewDir);
   if (nDotL < 0.0h && twoSided) {
     nDotL = -nDotL;
   }
   if (nDotL > 0.0h) {
     half3 diffuse = nDotL * diffuseMat * sampleColor;
-    half3 r = normal * (2.0h * nDotL) + lightDir;
-    half vDotR = max(dot(r, -viewDir), 0.0h);
-    // fast::pow utilizes M2 hardware approximations, significantly faster than pow()
-    half3 specular = fast::pow(vDotR, shininess) * specularMat;
+    vDotR = max(vDotR, 0.0h);
+    half3 specular = pow(vDotR, shininess) * specularMat;
     return ambientMat * sampleColor + diffuse + specular;
   }
   return ambientMat * sampleColor;
@@ -1874,7 +1914,7 @@ inline half3 computeVolumeLighting(
                 vDotR = -vDotR;
             }
             if (vDotR > 0.0h) {
-                totalSpecular += fast::pow(vDotR, shininess) * lightSpecular * attenuation;
+                totalSpecular += pow(vDotR, shininess) * lightSpecular * attenuation;
             }
         }
 
@@ -2025,6 +2065,7 @@ inline half4 marchVolumeUnified(
   const bool doGradOp = fc_gradientOpacity && (volumeUniforms.useGradientOpacity > 0.5);
   const bool doCropping = volumeUniforms.useCropping > 0.5;
   const bool doMask = fc_mask && (volumeUniforms.useMask > 0.5);
+  const float useLinearInterp = volumeUniforms.useLinearVolumeInterpolation;
 
   half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
   half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
@@ -2069,8 +2110,8 @@ inline half4 marchVolumeUnified(
   half accumulatedOpacity = initialOpacity;
 
   float3 texLocalPos0 = (currentPoint - p.texMinGlobal) * invTexSizeGlobal;
-  float3 evalPoint0 = texLocalPos0;
-  float prefetchScalar = volumeTexture.sample(sVolume, evalPoint0, level(0)).r;
+  float3 evalPoint0 = cellToPointTextureCoord(texLocalPos0, volumeTexture);
+  float prefetchScalar = sampleVolumeScalar(volumeTexture, evalPoint0, useLinearInterp);
   float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint0, level(0)).r : 0.0;
   bool prefetchValid = true;
   int3  curCell     = int3(-1);
@@ -2083,12 +2124,11 @@ inline half4 marchVolumeUnified(
     b.minMaxInfo.w > 0.5;
 
   for (int i = 0; i < maxSteps; i++) {
-    if (p.checkBounds && (any(currentPoint < p.blockMinGlobal - 1e-4) || any(currentPoint > p.blockMaxGlobal + 1e-4))) break;
     if (!p.checkBounds && currentT >= p.tEnd - 1e-6) break;
 
     if (useMinMax) {
       float3 texLocalPos = (currentPoint - p.texMinGlobal) * invTexSizeGlobal;
-      float3 mmPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+      float3 mmPos = clamp(cellToPointTextureCoord(texLocalPos, volumeTexture), float3(0.0), float3(1.0));
       int3 newCell = min(int3(mmPos * mmDimF), int3(mmDimF) - 1);
       if (any(newCell != curCell)) {
         curCell      = newCell;
@@ -2129,10 +2169,10 @@ inline half4 marchVolumeUnified(
     }
 
     float3 texLocalPos = (currentPoint - p.texMinGlobal) * invTexSizeGlobal;
-    float3 evalPoint = texLocalPos;
+    float3 evalPoint = cellToPointTextureCoord(texLocalPos, volumeTexture);
     bool needsFetch = !prefetchValid;
     float rawScalar = needsFetch
-      ? volumeTexture.sample(sVolume, evalPoint, level(0)).r
+      ? sampleVolumeScalar(volumeTexture, evalPoint, useLinearInterp)
       : prefetchScalar;
     float rawMask = (doMask && needsFetch)
       ? maskTexture.sample(sNearest, evalPoint, level(0)).r
@@ -2144,8 +2184,8 @@ inline half4 marchVolumeUnified(
 
     if (i + 1 < maxSteps) {
       float3 nextTexLocalPos = (currentPoint - p.texMinGlobal) * invTexSizeGlobal;
-      float3 nextEvalPoint = nextTexLocalPos;
-      prefetchScalar = volumeTexture.sample(sVolume, nextEvalPoint, level(0)).r;
+      float3 nextEvalPoint = cellToPointTextureCoord(nextTexLocalPos, volumeTexture);
+      prefetchScalar = sampleVolumeScalar(volumeTexture, nextEvalPoint, useLinearInterp);
       if (doMask) {
         prefetchMask = maskTexture.sample(sNearest, nextEvalPoint, level(0)).r;
       }
@@ -2171,13 +2211,13 @@ inline half4 marchVolumeUnified(
           float labelY = (label + 0.5) / numLabels;
           colorOpacity = half4(labelMapTransferTexture.sample(sNearest, float2(float(scalarNorm), labelY), level(0)));
         } else {
-          colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
+          colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5), useLinearInterp);
         }
       } else {
-        colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
+        colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5), useLinearInterp);
       }
     } else {
-      colorOpacity = half4(transferFunctionTexture.sample(sVolume, float2(float(scalarNorm), 0.5), level(0)));
+      colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5), useLinearInterp);
     }
 
     half sampleOpacity = colorOpacity.a;
@@ -2203,7 +2243,7 @@ inline half4 marchVolumeUnified(
           normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
           gradMag = nrmSample.w;
         } else {
-          half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
+          half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor, useLinearInterp);
           normal = grad.xyz;
           gradMag = grad.w;
         }
@@ -2214,12 +2254,14 @@ inline half4 marchVolumeUnified(
               *lightUniforms, evalPoint);
         } else {
           bool twoSided = (lightUniforms != nullptr && lightUniforms->twoSidedLighting != 0);
-          sampleColor = computePhongLightingVolumeFast(sampleColor, normal, lightDirHalf, viewDirHalf,
+          // OpenGL headlight convention: light and view directions are the per-pixel
+          // ray direction toward the camera (g_ldir == g_vdir == normalize(cameraPos - vertexPos)).
+          sampleColor = computePhongLightingVolumeFast(sampleColor, normal, -viewDirHalf, -viewDirHalf,
               ambientMat, diffuseMat, specularMat, shininessMat, twoSided);
         }
 
         if (doGradOp) {
-          sampleOpacity *= half(gradientOpacityTexture.sample(sVolume, float2(float(gradMag), 0.5), level(0)).r);
+          sampleOpacity *= sampleGradientOpacity(gradientOpacityTexture, float(gradMag), useLinearInterp);
         }
       } else if (doShading) {
         sampleColor = ambientMat * sampleColor;
@@ -2235,6 +2277,9 @@ inline half4 marchVolumeUnified(
       break;
     }
     if (currentT >= p.tTerminateMax) {
+      break;
+    }
+    if (p.checkBounds && (any(currentPoint < p.blockMinGlobal - 1e-4) || any(currentPoint > p.blockMaxGlobal + 1e-4))) {
       break;
     }
   }
@@ -2272,7 +2317,7 @@ inline half4 marchVolume(
 {
   (void)exitPoint;
   (void)totalDist;
-  float jitter = volumeUniforms.useJittering > 0.5 ? volume_random(screenPos) * stepSize : 0.0;
+  float jitter = (volumeUniforms.useJittering > 0.5 ? volume_random(screenPos) : 1.0) * stepSize;
   float tStart = dot(entryPoint - cameraPos, rayDir);
   MarchParams p = {cameraPos, rayDir, tStart, totalBoxT, stepSize, jitter, tTerminateMax,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, true};
@@ -2629,7 +2674,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
     float stepSize = physicalSampleStep(rayDir, volumeUniforms);
     float jitter = volumeUniforms.useJittering > 0.5
         ? volume_random(in.position.xy + float2(0.5, 0.5)) * stepSize
-        : 0.0;
+        : 1.0 * stepSize;
 
     // Grid traversal loop
     half3 color = 0.0h;

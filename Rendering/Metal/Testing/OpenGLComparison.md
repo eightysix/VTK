@@ -14,7 +14,10 @@ are now rendered on the surface fragment and match GL. The order-independent
 translucent pass is implemented in Metal (`vtkMetalOrderIndependentTranslucentPass`),
 mirroring the GL default OIT path (`vtkOrderIndependentTranslucentPass`:
 RGBA16F + R16F accumulate, then a fullscreen weighted-average resolve over the
-drawable), so translucent rendering matches GL by construction. The run is
+drawable), so translucent rendering matches GL by construction. The volume
+ray-cast march loop now uses the same sample→accumulate→advance→terminate
+order as the GL reference (the bounds-termination check moved to the loop tail,
+after accumulation), so the rim and silhouette match GL exactly. The run is
 fully reproducible: rerunning the harness produces byte-identical images and
 identical errors.
 
@@ -42,16 +45,16 @@ RenderWindow                       39.322          0.000
 Camera                             10.078          0.000
 Light                              61.965          0.000
 ActorProperty                     606.631          0.000
-PointRender                      1668.277          0.000
+PointRender                      1668.115          0.000
 DepthPeeling                      740.265          0.000
 CompositePolyDataMapper           241.004          0.000
 Glyph3DMapper                     444.277          0.000
 HardwareSelector                  307.776          0.000
 PolyDataMapper2D                  286.047          0.000
 Texture                           177.318          0.000
-VolumeRayCast                    2612.763        789.835
+VolumeRayCast                     621.982          0.005
 -------------------------------------------------------------------
-worst thresholded error: 789.835
+worst thresholded error: 0.005
 ```
 
 ## How to read this
@@ -66,7 +69,7 @@ worst thresholded error: 789.835
 
 ## Per-scene results
 
-### Visually identical (thresholded error 0.000)
+### Visually identical (thresholded error ≤ 0.005)
 
 - **OIT scenes** (`BuildAP_*`, the `AP_*` rows): a single translucent sphere
   with an optional backface property, rendered through the order-independent
@@ -124,15 +127,19 @@ worst thresholded error: 789.835
   three peel targets with `glBlendEquation(GL_MAX)`; enabling MAX blending on
   the Metal `backTemp` attachment reproduces the reference behavior and brings
   the scene to 0.000 thresholded error (raw error 4425 → 740).
-
-### Divergent scenes and likely causes
-
-- **VolumeRayCast** — error 2612 / thresholded 789.8, ~28.5% of pixels >10%.
-  Analytic 32^3 volume through the GPU ray-cast mapper with a shaded transfer
-  function (`ShadeOn`, ambient/diffuse/specular). The Metal volume mapper is a
-  newer port; ray sampling/step size and shading terms differ slightly from the
-  OpenGL shader, giving a moderate, smooth divergence (worst near the volume
-  edges where classification changes fastest).
+- **VolumeRayCast** (`BuildVolumeScene`): analytic 32^3 volume through the GPU
+  ray-cast mapper with a shaded transfer function (`ShadeOn`,
+  ambient/diffuse/specular). Previously divergent (error 2612 / thresholded
+  789.8, ~28.5% of pixels >10%); now matches GL to within 0.005 thresholded
+  error (raw 621.982). The Metal march loop checked the box bounds at the top
+  of the loop, *before* sampling, so rays that grazed the silhouette (box
+  segment shorter than one step) broke with zero samples and left a black rim,
+  while GL samples the (clamped border) position and accumulates it before
+  terminating. The bounds check moved to the loop tail — after the
+  sample/accumulate step and after advancing — reproducing the GL
+  sample→accumulate→advance→terminate order, so silhouettes and rims match GL
+  exactly (the volume `clamp_to_edge` sampler provides the same border
+  clamping).
 
 ## Running the analysis yourself
 

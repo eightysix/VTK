@@ -120,7 +120,7 @@ struct VolumeMapperUniforms
   float LabelMapNumLabels;        // 944
   float UseDepthTexture;          // 948
   float UseNormalTexture;         // 952
-  float _padMask;                 // 956
+  float UseLinearVolumeInterpolation; // 956  1.0 = trilinear (VTK_LINEAR_INTERPOLATION), 0.0 = nearest
   // Min-max acceleration texture
   float UseMinMaxAccel;           // 960
   float MinMaxDimX;               // 964
@@ -4963,13 +4963,22 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
     uniforms.UseGradientShading = shadeOn ? 1.0f : 0.0f;
     uniforms.UseGradientOpacity = (shadeOn && hasGradOp) ? 1.0f : 0.0f;
+    // Match the OpenGL backend: the property's interpolation type applies to the
+    // volume data, transfer-function and gradient-opacity textures
+    // (vtkVolumeInputHelper). Defaults to nearest.
+    uniforms.UseLinearVolumeInterpolation =
+      (property && property->GetInterpolationType() == VTK_LINEAR_INTERPOLATION) ? 1.0f : 0.0f;
 
-    // Gradient step: 1/dims per axis for central differences in [0,1] space
+    // Gradient step: 1/(dims-1) per axis for central differences, matching the
+    // OpenGL backend's CellStep (vtkVolumeTexture.cxx: 1/extent-span), which is
+    // applied in adjusted (cellToPoint) texture space. Using 1/dims here would
+    // shift the gradient stencil by ~3%, visibly changing specular/diffuse on
+    // high-frequency (aliased) data.
     int dims[3];
     input->GetDimensions(dims);
     for (int k = 0; k < 3; ++k)
     {
-      uniforms.GradientStep[k] = (dims[k] > 0) ? 1.0f / dims[k] : 1.0f;
+      uniforms.GradientStep[k] = (dims[k] > 1) ? 1.0f / (dims[k] - 1) : 1.0f;
     }
 
     // Gradient opacity normalization range
