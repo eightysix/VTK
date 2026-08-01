@@ -18,9 +18,9 @@
 // With --bench, each enabled backend additionally times --frames renders of
 // every scene (default 30) after a warmup render and prints per-scene
 // average ms/frame, fps and the Metal/GL ratio. The camera is nudged slightly
-// each frame so every timed render performs real work, and Metal frames are
-// synchronized with WaitForCompletion inside the timed region so the
-// wall-clock time includes GPU time.
+// each frame so every timed render performs real work, and both backends are
+// synchronized inside the timed region (Metal WaitForCompletion, OpenGL
+// glFinish) so the wall-clock time covers GPU time for both.
 //
 // Note: the OpenGL backend needs the vtkShaderProgram object-factory override
 // (vtkOpenGLShaderProgram), so vtkRenderingOpenGL2 and vtkRenderingVolumeOpenGL2
@@ -36,6 +36,7 @@ VTK_MODULE_INIT(vtkRenderingOpenGL2);
 VTK_MODULE_INIT(vtkRenderingVolumeOpenGL2);
 
 #include "vtkCocoaMetalRenderWindow.h"
+#include "vtk_glad.h"
 #include "vtkImageDifference.h"
 #include "vtkImageExtractComponents.h"
 #include "vtkPNGWriter.h"
@@ -154,8 +155,9 @@ struct BenchStats
 // Build a fresh window/renderer for the scene, render one warmup frame (which
 // compiles shaders / builds pipeline states), then time `frames` renders.
 // The active camera is rotated slightly each frame so Render() does real work,
-// and the Metal backend is synchronized with WaitForCompletion inside the timed
-// region so the measurement covers GPU time, not just CPU submission.
+// and both backends are synchronized inside the timed region (Metal
+// WaitForCompletion, OpenGL glFinish) so the measurement covers GPU time, not
+// just CPU submission.
 BenchStats BenchmarkScene(
   const SceneSpec& spec, vtkMetalScenes::BackendKind backend, int frames)
 {
@@ -183,6 +185,10 @@ BenchStats BenchmarkScene(
   {
     vtkCocoaMetalRenderWindow::SafeDownCast(renWin)->WaitForCompletion();
   }
+  else
+  {
+    glFinish();
+  }
 
   double minMs = std::numeric_limits<double>::max();
   double maxMs = 0.0;
@@ -195,6 +201,14 @@ BenchStats BenchmarkScene(
     if (backend == vtkMetalScenes::BackendKind::Metal)
     {
       vtkCocoaMetalRenderWindow::SafeDownCast(renWin)->WaitForCompletion();
+    }
+    else
+    {
+      // OpenGL submits asynchronously; block until the GPU finishes so the
+      // measurement covers GPU time the same way WaitForCompletion does for
+      // Metal. Without this the GL times are pure CPU-submit latency and the
+      // comparison is apples-to-oranges.
+      glFinish();
     }
     const auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();

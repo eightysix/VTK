@@ -269,11 +269,14 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
     [enc endEncoding];
   };
 
-  // Clear all peeling textures
+  // Clear the two textures that are read (never cleared in-loop) before the
+  // loop starts: FrontPeelA (front source of peel 0) and BackAccum (blended
+  // into by every back-blend). The remaining targets are cleared by folding
+  // loadAction=Clear into the pass that first writes them (the init pass for
+  // DepthPeelA, the peel pass for DepthPeelB/BackPeelTemp/frontDst), avoiding
+  // a dedicated render pass per clear.
   clearTexture(this->FrontPeelA, MTLClearColorMake(0, 0, 0, 0));
   clearTexture(this->BackAccum, MTLClearColorMake(0, 0, 0, 0));
-  clearTexture(this->DepthPeelA, MTLClearColorMake(-1.0, -1.0, 0, 0));
-  clearTexture(this->DepthPeelB, MTLClearColorMake(-1.0, -1.0, 0, 0));
 
   // --- Pass 1: Initialize depth range ---
   // Render translucent geometry with MAX blending on DepthPeelA.
@@ -281,7 +284,8 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
   {
     MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
     rpd.colorAttachments[0].texture = this->DepthPeelA;
-    rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rpd.colorAttachments[0].clearColor = MTLClearColorMake(-1.0, -1.0, 0, 0);
     rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
     rpd.depthAttachment.texture = depthTexture;
     rpd.depthAttachment.loadAction = MTLLoadActionLoad;
@@ -327,22 +331,22 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
   int numPeels = 0;
   for (int peel = 0; peel < this->MaximumNumberOfPeels; ++peel)
   {
-    // Clear peel targets
-    clearTexture(depthDst, MTLClearColorMake(-1.0, -1.0, 0, 0));
-    clearTexture(this->BackPeelTemp, MTLClearColorMake(0, 0, 0, 0));
-    clearTexture(frontDst, MTLClearColorMake(0, 0, 0, 0));
-
-    // Peel pass: render translucent geometry to 3 targets
+    // Peel pass: render translucent geometry to 3 targets. The targets are
+    // cleared here (loadAction=Clear) rather than in separate render passes
+    // (each clear is a full render-pass encoder in Metal).
     {
       MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
       rpd.colorAttachments[0].texture = this->BackPeelTemp;
-      rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
+      rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+      rpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
       rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
       rpd.colorAttachments[1].texture = frontDst;
-      rpd.colorAttachments[1].loadAction = MTLLoadActionLoad;
+      rpd.colorAttachments[1].loadAction = MTLLoadActionClear;
+      rpd.colorAttachments[1].clearColor = MTLClearColorMake(0, 0, 0, 0);
       rpd.colorAttachments[1].storeAction = MTLStoreActionStore;
       rpd.colorAttachments[2].texture = depthDst;
-      rpd.colorAttachments[2].loadAction = MTLLoadActionLoad;
+      rpd.colorAttachments[2].loadAction = MTLLoadActionClear;
+      rpd.colorAttachments[2].clearColor = MTLClearColorMake(-1.0, -1.0, 0, 0);
       rpd.colorAttachments[2].storeAction = MTLStoreActionStore;
 
       id<MTLRenderCommandEncoder> encoder =
