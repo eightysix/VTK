@@ -16,8 +16,13 @@
  *   3. Peel loop: for each iteration, peel front and back fragments
  *   4. Composite front and back accumulation buffers
  *
- * Key difference from OpenGL2: no occlusion queries are used. A fixed
- * maximum peel count (default 8) is used instead.
+ * Key difference from OpenGL2: instead of stalling the GPU with per-peel
+ * occlusion queries, the back-blend pass counts the fragments it writes via
+ * MTLRenderPassDescriptor.visibilityResultMode (MTLVisibilityResultModeCounting).
+ * The count is read back once the frame's command buffer completes, and the
+ * next frame runs only as many peels as were observed to write fragments
+ * (plus a safety margin), bounded by the maximum peel count. This converges
+ * to the scene's actual depth complexity while never stalling the pipeline.
  */
 
 #ifndef vtkMetalDepthPeeler_h
@@ -101,6 +106,18 @@ private:
   int CurrentWidth = 0;
   int CurrentHeight = 0;
   int MaximumNumberOfPeels = 8;
+
+  // Visibility buffer: each peel's back-blend pass counts the fragments it
+  // wrote (MTLVisibilityResultModeCounting) into this shared buffer. The
+  // count is read back after the command buffer completes and feeds
+  // NextPeelCount, so the next frame stops early once no more fragments are
+  // being written. Shared storage lets the CPU read it without a blit.
+  id<MTLBuffer> VisibilityBuffer = nil;
+  int NextPeelCount = 0; // 0 means "unknown, run all MaximumNumberOfPeels"
+
+  // Previous frame's command buffer; its status tells whether VisibilityBuffer
+  // holds a completed frame's counts before we read them.
+  id<MTLCommandBuffer> LastCommandBuffer = nil;
 
   bool PipelinesCreated = false;
 };

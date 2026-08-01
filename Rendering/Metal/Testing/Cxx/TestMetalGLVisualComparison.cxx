@@ -98,8 +98,12 @@ const SceneSpec kScenes[] = {
 };
 
 // Render one scene with one backend and write an RGB PNG. Returns the image.
+// If warmupFrames > 0, that many warmup frames (with a tiny camera nudge) are
+// rendered before the captured frame, so stateful backends (e.g. the adaptive
+// depth-peel count) converge before the image is captured.
 vtkSmartPointer<vtkImageData> RenderAndCapture(
-  const SceneSpec& spec, vtkMetalScenes::BackendKind backend, const std::string& path)
+  const SceneSpec& spec, vtkMetalScenes::BackendKind backend, const std::string& path,
+  int warmupFrames = 0)
 {
   vtkSmartPointer<vtkRenderWindow> renWin = vtkMetalScenes::NewRenderWindow(backend);
   renWin->SetSize(spec.Width, spec.Height);
@@ -110,6 +114,20 @@ vtkSmartPointer<vtkImageData> RenderAndCapture(
   vtkSmartPointer<vtkRenderer> renderer = vtkMetalScenes::NewRenderer(backend);
   renWin->AddRenderer(renderer);
   spec.Build(renderer, backend);
+
+  for (int i = 0; i < std::max(0, warmupFrames); ++i)
+  {
+    renderer->GetActiveCamera()->Azimuth(0.1);
+    renWin->Render();
+    if (backend == vtkMetalScenes::BackendKind::Metal)
+    {
+      vtkCocoaMetalRenderWindow::SafeDownCast(renWin)->WaitForCompletion();
+    }
+    else
+    {
+      glFinish();
+    }
+  }
 
   renWin->Render();
   if (backend == vtkMetalScenes::BackendKind::Metal)
@@ -234,6 +252,7 @@ int main(int argc, char* argv[])
   std::string backendFilter;
   bool bench = false;
   int benchFrames = 30;
+  int warmupFrames = 0;
   for (int i = 1; i < argc; ++i)
   {
     std::string arg = argv[i];
@@ -260,6 +279,10 @@ int main(int argc, char* argv[])
     else if (arg == "--frames" && i + 1 < argc)
     {
       benchFrames = std::atoi(argv[++i]);
+    }
+    else if (arg == "--warmup" && i + 1 < argc)
+    {
+      warmupFrames = std::atoi(argv[++i]);
     }
     else
     {
@@ -302,11 +325,12 @@ int main(int argc, char* argv[])
     vtkSmartPointer<vtkImageData> metalImage;
     if (renderGl)
     {
-      glImage = RenderAndCapture(spec, vtkMetalScenes::BackendKind::OpenGL, glPath);
+      glImage = RenderAndCapture(spec, vtkMetalScenes::BackendKind::OpenGL, glPath, warmupFrames);
     }
     if (renderMetal)
     {
-      metalImage = RenderAndCapture(spec, vtkMetalScenes::BackendKind::Metal, metalPath);
+      metalImage =
+        RenderAndCapture(spec, vtkMetalScenes::BackendKind::Metal, metalPath, warmupFrames);
     }
     if ((renderGl && !glImage) || (renderMetal && !metalImage))
     {

@@ -12,6 +12,8 @@
 
 #include <vector>
 #include <functional>
+#include <algorithm>
+#include <cstring>
 
 VTK_ABI_NAMESPACE_BEGIN
 
@@ -55,6 +57,11 @@ void vtkMetalDepthPeeler::Release()
   this->ReadOnlyDepthState = nil;
   [this->AlwaysDepthState release];
   this->AlwaysDepthState = nil;
+  [this->VisibilityBuffer release];
+  this->VisibilityBuffer = nil;
+  [this->LastCommandBuffer release];
+  this->LastCommandBuffer = nil;
+  this->NextPeelCount = 0;
   this->PipelinesCreated = false;
   this->CurrentWidth = 0;
   this->CurrentHeight = 0;
@@ -258,6 +265,69 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
     return 0;
   }
 
+  // Frame-delayed early termination. The previous frame's back-blend passes
+  // counted the fragments they wrote into VisibilityBuffer; once that command
+  // buffer has completed, read the counts back and cap how many peels the
+  // next frame needs (highest peel that wrote fragments + 1, plus a one-peel
+  // safety margin for small inter-frame scene changes). This mirrors the
+  // occlusion-query early exit in vtkDualDepthPeelingPass without stalling
+  // the GPU per peel.
+  bool bufferTouchSafe = false; // CPU may memset VisibilityBuffer (no in-flight GPU writer)
+  if (this->LastCommandBuffer)
+  {
+    if (this->LastCommandBuffer.status == MTLCommandBufferStatusCompleted &&
+      this->VisibilityBuffer)
+    {
+      const uint8_t* bytes = (const uint8_t*)this->VisibilityBuffer.contents;
+      int lastWritten = -1;
+      for (int i = 0; i < this->MaximumNumberOfPeels; ++i)
+      {
+        uint32_t count;
+        memcpy(&count, bytes + i * 8, sizeof(uint32_t));
+        if (count > 0)
+        {
+          lastWritten = i;
+        }
+      }
+      // lastWritten + 2 peels: the peel that last wrote fragments, plus one
+      // more, plus one peel of margin. At least one peel is always done.
+      this->NextPeelCount =
+        std::min(this->MaximumNumberOfPeels, std::max(1, lastWritten + 2));
+      bufferTouchSafe = true;
+    }
+    [this->LastCommandBuffer release];
+    this->LastCommandBuffer = nil;
+  }
+  else
+  {
+    // No prior frame to wait on; the buffer (if any) is idle.
+    bufferTouchSafe = true;
+  }
+
+  // Ensure the visibility buffer is big enough (one uint64 slot per peel; the
+  // offset must be a multiple of 8). Shared storage lets the CPU read the
+  // counts after GPU completion.
+  NSUInteger visSize = static_cast<NSUInteger>(this->MaximumNumberOfPeels) * 8;
+  if (!this->VisibilityBuffer || this->VisibilityBuffer.length < visSize)
+  {
+    [this->VisibilityBuffer release];
+    this->VisibilityBuffer =
+      [device newBufferWithLength:visSize options:MTLResourceStorageModeShared];
+    memset(this->VisibilityBuffer.contents, 0, visSize);
+  }
+  else if (bufferTouchSafe)
+  {
+    // Zero stale counts from earlier frames so they never influence readback.
+    memset(this->VisibilityBuffer.contents, 0, visSize);
+  }
+
+  // How many peels to run this frame.
+  int peelLimit = this->MaximumNumberOfPeels;
+  if (this->NextPeelCount > 0)
+  {
+    peelLimit = std::min(peelLimit, this->NextPeelCount);
+  }
+
   // Helper to clear a single-attachment render target
   auto clearTexture = [&](id<MTLTexture> tex, MTLClearColor clear) {
     MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -329,7 +399,7 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
   id<MTLTexture> depthDst = this->DepthPeelB;
 
   int numPeels = 0;
-  for (int peel = 0; peel < this->MaximumNumberOfPeels; ++peel)
+  for (int peel = 0; peel < peelLimit; ++peel)
   {
     // Peel pass: render translucent geometry to 3 targets. The targets are
     // cleared here (loadAction=Clear) rather than in separate render passes
@@ -387,9 +457,19 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
       rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
       rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
 
+      // Count fragments written by this peel's back-blend pass. Because the
+      // fragment shader discards empty pixels (backTemp.a < 0.001), the count
+      // is exactly the number of pixels this peel contributed. Written once
+      // per peel into its own 8-byte slot so the CPU can find the last peel
+      // that produced fragments.
+      rpd.visibilityResultBuffer = this->VisibilityBuffer;
+
       id<MTLRenderCommandEncoder> encoder =
         [commandBuffer renderCommandEncoderWithDescriptor:rpd];
       encoder.label = @"VTK Depth Peeling - Back Blend";
+
+      [encoder setVisibilityResultMode:MTLVisibilityResultModeCounting
+                                offset:static_cast<NSUInteger>(peel) * 8];
 
       MTLViewport vp;
       vp.originX = 0; vp.originY = 0;
@@ -436,6 +516,12 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
 
     [encoder endEncoding];
   }
+
+  // Remember this command buffer so the next frame can check whether the
+  // visibility counts are ready before reading them back.
+  [this->LastCommandBuffer release];
+  this->LastCommandBuffer = commandBuffer;
+  [this->LastCommandBuffer retain];
 
   return numPeels;
 }
