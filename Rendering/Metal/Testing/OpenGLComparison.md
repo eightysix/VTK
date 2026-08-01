@@ -17,9 +17,12 @@ RGBA16F + R16F accumulate, then a fullscreen weighted-average resolve over the
 drawable), so translucent rendering matches GL by construction. The volume
 ray-cast march loop now uses the same sample→accumulate→advance→terminate
 order as the GL reference (the bounds-termination check moved to the loop tail,
-after accumulation), so the rim and silhouette match GL exactly. The run is
-fully reproducible: rerunning the harness produces byte-identical images and
-identical errors.
+after accumulation), so the rim and silhouette match GL exactly. The volume
+gradient and phong lighting are computed in half (16-bit) precision with
+`fast::pow` (a deliberate performance choice: a float-precision experiment
+reduced the VolumeRayCast thresholded error from 0.007 to 0.005 but was
+reverted as not worth the cost). The run is fully reproducible: rerunning the
+harness produces byte-identical images and identical errors.
 
 ```
 scene                          error   thresholded error
@@ -52,9 +55,9 @@ Glyph3DMapper                     444.277          0.000
 HardwareSelector                  307.776          0.000
 PolyDataMapper2D                  286.047          0.000
 Texture                           177.318          0.000
-VolumeRayCast                     621.982          0.005
--------------------------------------------------------------------
-worst thresholded error: 0.005
+VolumeRayCast                     621.654          0.007
+------------------------------------------------------------------
+worst thresholded error: 0.00653595
 ```
 
 ## How to read this
@@ -130,16 +133,39 @@ worst thresholded error: 0.005
 - **VolumeRayCast** (`BuildVolumeScene`): analytic 32^3 volume through the GPU
   ray-cast mapper with a shaded transfer function (`ShadeOn`,
   ambient/diffuse/specular). Previously divergent (error 2612 / thresholded
-  789.8, ~28.5% of pixels >10%); now matches GL to within 0.005 thresholded
-  error (raw 621.982). The Metal march loop checked the box bounds at the top
-  of the loop, *before* sampling, so rays that grazed the silhouette (box
-  segment shorter than one step) broke with zero samples and left a black rim,
-  while GL samples the (clamped border) position and accumulates it before
-  terminating. The bounds check moved to the loop tail — after the
-  sample/accumulate step and after advancing — reproducing the GL
-  sample→accumulate→advance→terminate order, so silhouettes and rims match GL
-  exactly (the volume `clamp_to_edge` sampler provides the same border
-  clamping).
+  789.8, ~28.5% of pixels >10%); now matches GL to within 0.007 thresholded
+  error (raw 621.654). Two fixes account for most of the convergence:
+  1. The march loop checked the box bounds at the top of the loop, *before*
+     sampling, so rays that grazed the silhouette (box segment shorter than
+     one step) broke with zero samples and left a black rim, while GL samples
+     the (clamped border) position and accumulates it before terminating. The
+     bounds check moved to the loop tail — after the sample/accumulate step
+     and after advancing — reproducing the GL
+     sample→accumulate→advance→terminate order, so silhouettes and rims match
+     GL exactly (the volume `clamp_to_edge` sampler provides the same border
+     clamping).
+  2. A later perf pass advanced the sample position (`evalPoint += evalStep`)
+     *before* the gradient/shading block, so the gradient was fetched one ray
+     step ahead of the scalar it lit. The fetch order was restored to
+     sample-then-advance.
+- **VolumeRayCast residual (0.007)**: the ~40 thresholded pixels (0.02%) are
+  all interior (none on the silhouette), all in the blue channel, on the edge
+  of the specular highlight. Ruled out as sources: the termination threshold
+  (GL `1 - 1/255` strict `>` vs Metal's `>= 0.99` — no image change), jitter
+  (`UseJittering` defaults to 0, so neither backend jitters), step semantics
+  (both march at a constant 1.0 physical sample distance), linear vs nearest
+  interpolation, and the ray entry point (Metal's analytic `intersectBox` vs
+  GL's interpolated proxy `ip_textureCoords` — overriding Metal's entry with
+  the interpolated position produced no change). Computing the gradient and
+  lighting in float precision (matching GL) instead of half reduced the error
+  to `0.005`, but the gain was small and the change was reverted to keep the
+  half-precision + `fast::pow` shading path. The mechanism is float-rounding-
+  level sample-position divergence (entry and step composed in different
+  spaces/arithmetic); near a texel boundary the nearest-interpolated gradient
+  taps land in different cells, rotating the gradient a few degrees and
+  shifting the specular highlight boundary by ~1px. This is irreducible
+  without bit-identical sampling, which different backend arithmetic cannot
+  guarantee, and is below the documented baseline.
 
 ## Running the analysis yourself
 
