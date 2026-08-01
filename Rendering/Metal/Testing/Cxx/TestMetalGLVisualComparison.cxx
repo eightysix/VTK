@@ -9,11 +9,18 @@
 //
 // Usage:
 //   vtkMetalGLVisualComparison [--out <dir>] [--threshold <value>]
-//     [--scene <name>] [--backend gl|metal]
+//     [--scene <name>] [--backend gl|metal] [--bench] [--frames <n>]
 //
 // The default output directory is "visual_compare" under the current working
 // directory. When --threshold is given, the process exits non-zero if any
 // scene's thresholded error exceeds the value.
+//
+// With --bench, each enabled backend additionally times --frames renders of
+// every scene (default 30) after a warmup render and prints per-scene
+// average ms/frame, fps and the Metal/GL ratio. The camera is nudged slightly
+// each frame so every timed render performs real work, and Metal frames are
+// synchronized with WaitForCompletion inside the timed region so the
+// wall-clock time includes GPU time.
 //
 // Note: the OpenGL backend needs the vtkShaderProgram object-factory override
 // (vtkOpenGLShaderProgram), so vtkRenderingOpenGL2 and vtkRenderingVolumeOpenGL2
@@ -36,10 +43,13 @@ VTK_MODULE_INIT(vtkRenderingVolumeOpenGL2);
 #include "vtkRenderer.h"
 #include "vtkWindowToImageFilter.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -133,6 +143,73 @@ vtkSmartPointer<vtkImageData> RenderAndCapture(
   return extract->GetOutput();
 }
 
+// Per-backend wall-clock render timing for one scene.
+struct BenchStats
+{
+  double MinMs = 0.0;
+  double AvgMs = 0.0;
+  double MaxMs = 0.0;
+};
+
+// Build a fresh window/renderer for the scene, render one warmup frame (which
+// compiles shaders / builds pipeline states), then time `frames` renders.
+// The active camera is rotated slightly each frame so Render() does real work,
+// and the Metal backend is synchronized with WaitForCompletion inside the timed
+// region so the measurement covers GPU time, not just CPU submission.
+BenchStats BenchmarkScene(
+  const SceneSpec& spec, vtkMetalScenes::BackendKind backend, int frames)
+{
+  frames = std::max(1, frames);
+
+  vtkSmartPointer<vtkRenderWindow> renWin = vtkMetalScenes::NewRenderWindow(backend);
+  renWin->SetSize(spec.Width, spec.Height);
+  renWin->SetMultiSamples(0);
+  renWin->SwapBuffersOff();
+
+  // The Metal backend blits every frame into a shared read-back texture (so
+  // GetPixelData works) unless disabled; that blit is pure per-frame overhead
+  // for a benchmark that never captures.
+  if (backend == vtkMetalScenes::BackendKind::Metal)
+  {
+    vtkCocoaMetalRenderWindow::SafeDownCast(renWin)->SetColorReadbackEnabled(false);
+  }
+
+  vtkSmartPointer<vtkRenderer> renderer = vtkMetalScenes::NewRenderer(backend);
+  renWin->AddRenderer(renderer);
+  spec.Build(renderer, backend);
+
+  renWin->Render();
+  if (backend == vtkMetalScenes::BackendKind::Metal)
+  {
+    vtkCocoaMetalRenderWindow::SafeDownCast(renWin)->WaitForCompletion();
+  }
+
+  double minMs = std::numeric_limits<double>::max();
+  double maxMs = 0.0;
+  double sumMs = 0.0;
+  for (int i = 0; i < frames; ++i)
+  {
+    renderer->GetActiveCamera()->Azimuth(0.1);
+    const auto t0 = std::chrono::steady_clock::now();
+    renWin->Render();
+    if (backend == vtkMetalScenes::BackendKind::Metal)
+    {
+      vtkCocoaMetalRenderWindow::SafeDownCast(renWin)->WaitForCompletion();
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    minMs = std::min(minMs, ms);
+    maxMs = std::max(maxMs, ms);
+    sumMs += ms;
+  }
+
+  BenchStats stats;
+  stats.MinMs = minMs;
+  stats.AvgMs = sumMs / frames;
+  stats.MaxMs = maxMs;
+  return stats;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -141,6 +218,8 @@ int main(int argc, char* argv[])
   double threshold = -1.0;
   std::string sceneFilter;
   std::string backendFilter;
+  bool bench = false;
+  int benchFrames = 30;
   for (int i = 1; i < argc; ++i)
   {
     std::string arg = argv[i];
@@ -159,6 +238,14 @@ int main(int argc, char* argv[])
     else if (arg == "--backend" && i + 1 < argc)
     {
       backendFilter = argv[++i];
+    }
+    else if (arg == "--bench")
+    {
+      bench = true;
+    }
+    else if (arg == "--frames" && i + 1 < argc)
+    {
+      benchFrames = std::atoi(argv[++i]);
     }
     else
     {
@@ -239,6 +326,52 @@ int main(int argc, char* argv[])
     diffWriter->SetFileName(diffPath.c_str());
     diffWriter->SetInputConnection(diff->GetOutputPort());
     diffWriter->Write();
+  }
+
+  if (bench)
+  {
+    std::cout << "\nBenchmark (" << benchFrames << " frames after warmup):\n";
+    std::cout << "scene                          "
+                 "GL ms/f   GL fps   Metal ms/f  Metal fps    M/GL\n";
+    std::cout << "-------------------------------------------------------------------\n";
+    for (const SceneSpec& spec : kScenes)
+    {
+      if (!sceneFilter.empty() && sceneFilter != spec.Name)
+      {
+        continue;
+      }
+      const bool benchGl = backendFilter.empty() || backendFilter == "gl";
+      const bool benchMetal = backendFilter.empty() || backendFilter == "metal";
+
+      char line[256];
+      if (benchGl && benchMetal)
+      {
+        const BenchStats gl = BenchmarkScene(spec, vtkMetalScenes::BackendKind::OpenGL, benchFrames);
+        const BenchStats metal =
+          BenchmarkScene(spec, vtkMetalScenes::BackendKind::Metal, benchFrames);
+        std::snprintf(line, sizeof(line), "%-30s %8.2f %8.1f  %10.2f %10.1f  %6.2f\n", spec.Name,
+          gl.AvgMs, 1000.0 / gl.AvgMs, metal.AvgMs, 1000.0 / metal.AvgMs, metal.AvgMs / gl.AvgMs);
+      }
+      else if (benchGl)
+      {
+        const BenchStats gl = BenchmarkScene(spec, vtkMetalScenes::BackendKind::OpenGL, benchFrames);
+        std::snprintf(line, sizeof(line), "%-30s %8.2f %8.1f  %10s %10s  %6s\n", spec.Name,
+          gl.AvgMs, 1000.0 / gl.AvgMs, "-", "-", "-");
+      }
+      else if (benchMetal)
+      {
+        const BenchStats metal =
+          BenchmarkScene(spec, vtkMetalScenes::BackendKind::Metal, benchFrames);
+        std::snprintf(line, sizeof(line), "%-30s %8s %8s  %10.2f %10.1f  %6s\n", spec.Name, "-",
+          "-", metal.AvgMs, 1000.0 / metal.AvgMs, "-");
+      }
+      else
+      {
+        continue;
+      }
+      std::cout << line;
+    }
+    std::cout << "-------------------------------------------------------------------\n";
   }
 
   std::cout << "-------------------------------------------------------------------\n";

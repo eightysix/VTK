@@ -125,6 +125,15 @@ public:
    */
   void* GetDepthTexture();
 
+  /**
+   * Toggle the per-frame color read-back blit (drawable -> shared texture).
+   * Enabled by default so GetPixelData/GetRGBACharPixelData can read back the
+   * rendered frame. Disable to remove the blit's per-frame overhead when no
+   * image is being captured (e.g. while benchmarking).
+   */
+  vtkSetMacro(ColorReadbackEnabled, bool);
+  vtkGetMacro(ColorReadbackEnabled, bool);
+
 #ifdef __OBJC__
   /**
    * Set a block to be called when the GPU finishes rendering each frame.
@@ -258,6 +267,11 @@ protected:
   bool OITActive = false;
 
   bool Initialized = false;
+
+  // When true, the resolved color buffer is blitted into the shared color-copy
+  // texture at the end of each frame so GetPixelData/GetRGBACharPixelData can
+  // read it back. Defaults to true; benchmark drivers disable it.
+  bool ColorReadbackEnabled = true;
 
   // Shared shader library — compiled once and reused across all pipelines.
   void* SharedShaderLibrary = nullptr;  // id<MTLLibrary>

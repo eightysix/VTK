@@ -15,6 +15,7 @@
 #include "vtkLightCollection.h"
 #include "vtkViewport.h"
 #include "vtkActor.h"
+#include "vtkActor2D.h"
 #include "vtkActorCollection.h"
 #include "vtkVolume.h"
 #include "vtkVolumeCollection.h"
@@ -514,7 +515,10 @@ void vtkMetalRenderer::DeviceRender()
     }
 
     // === Phase 3: Render volumetric geometry ===
-    if (!this->UseDepthPeelingForVolumes)
+    // Create the pass only when the renderer actually has volumes; an empty
+    // render pass costs real CPU per frame in the Metal runtime.
+    const bool hasVolumes = (this->GetVolumes()->GetNumberOfItems() > 0);
+    if (!this->UseDepthPeelingForVolumes && hasVolumes)
     {
       MTLRenderPassDescriptor* rpd =
         [MTLRenderPassDescriptor renderPassDescriptor];
@@ -738,6 +742,14 @@ void vtkMetalRenderer::DeviceRender()
     // vtkMetalRenderer::DeviceRender replaces the base-class render loop, so it
     // must drive vtkRenderer::RenderOverlay() itself (vtkActor2D overlays such
     // as vtkPolyDataMapper2D props are drawn here, in display coordinates).
+    // Create the pass only when an overlay-capable prop is visible; an empty
+    // render pass costs real CPU per frame in the Metal runtime.
+    bool hasOverlayProps = false;
+    for (int i = 0; i < this->PropArrayCount && !hasOverlayProps; ++i)
+    {
+      hasOverlayProps = (vtkActor2D::SafeDownCast(this->PropArray[i]) != nullptr);
+    }
+    if (hasOverlayProps)
     {
       MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
 
@@ -813,7 +825,7 @@ void vtkMetalRenderer::DeviceRender()
     // into test builds so production frames do not pay for this copy.
     {
       id<MTLTexture> colorCopyTex = (__bridge id<MTLTexture>)renWin->ColorCopyTexture;
-      if (colorCopyTex)
+      if (colorCopyTex && renWin->GetColorReadbackEnabled())
       {
         id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
         blit.label = @"VTK Color Readback Copy";
