@@ -252,6 +252,11 @@ protected:
   void* PeelDepthTexture = nullptr; // id<MTLTexture> — previous depth (RG32Float)
   int PeelIndex = 0;              // current peel iteration
 
+  // 8C: Order-independent transparency (OIT) state — set by
+  // vtkMetalOrderIndependentTranslucentPass before rendering the translucent
+  // accumulate pass, read by vtkMetalPolyDataMapper during RenderPiece().
+  bool OITActive = false;
+
   bool Initialized = false;
 
   // Shared shader library — compiled once and reused across all pipelines.
@@ -261,6 +266,7 @@ protected:
 private:
   friend class vtkMetalRenderer;
   friend class vtkMetalDepthPeeler;
+  friend class vtkMetalOrderIndependentTranslucentPass;
   friend class vtkMetalPolyDataMapper;
   friend class vtkMetalPolyDataMapper2D;
 

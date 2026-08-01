@@ -5,6 +5,7 @@
 
 #include "vtkMetalRenderWindow.h"
 #include "vtkMetalDepthPeeler.h"
+#include "vtkMetalOrderIndependentTranslucentPass.h"
 #include "vtkMetalCamera.h"
 #include "vtkMetalGPUVolumeRayCastMapper.h"
 #include "vtkMetalShaders.h"
@@ -62,6 +63,7 @@ vtkStandardNewMacro(vtkMetalRenderer);
 //------------------------------------------------------------------------------
 vtkMetalRenderer::vtkMetalRenderer()
   : DepthPeeler(new vtkMetalDepthPeeler)
+  , OrderIndependentTranslucentPass(new vtkMetalOrderIndependentTranslucentPass)
 {
 }
 
@@ -370,6 +372,10 @@ void vtkMetalRenderer::DeviceRender()
     // Depth peeling is incompatible with MSAA — the intermediate peel textures
     // are non-MSAA and cannot match an MSAA depth attachment.
     bool useDepthPeeling = this->GetUseDepthPeeling() && !msaa;
+    // OIT accumulate + resolve (matches GL's vtkOrderIndependentTranslucentPass
+    // default when UseOIT is true). Like depth peeling, it needs a non-MSAA
+    // depth buffer, and depth peeling takes priority when enabled.
+    bool useOIT = this->GetUseOIT() && !msaa && !useDepthPeeling;
 
     auto renderStandardTranslucentPass = [&]()
     {
@@ -488,6 +494,18 @@ void vtkMetalRenderer::DeviceRender()
         {
           renderStandardTranslucentPass();
         }
+      }
+    }
+    else if (hasTranslucent && useOIT)
+    {
+      id<MTLTexture> depthTex = (__bridge id<MTLTexture>)renWin->DepthTexture;
+      int oitResult = this->OrderIndependentTranslucentPass->RenderTranslucentGeometry(
+        this, commandBuffer, drawable.texture, depthTex);
+      // Fall back to standard alpha-blended translucent rendering if OIT
+      // could not run (e.g. nil/MSAA depth texture).
+      if (oitResult == 0)
+      {
+        renderStandardTranslucentPass();
       }
     }
     else if (hasTranslucent)
@@ -849,6 +867,10 @@ void vtkMetalRenderer::ReleaseGraphicsResources(vtkWindow* w)
   if (this->DepthPeeler)
   {
     this->DepthPeeler->Release();
+  }
+  if (this->OrderIndependentTranslucentPass)
+  {
+    this->OrderIndependentTranslucentPass->Release();
   }
   this->Superclass::ReleaseGraphicsResources(w);
 }

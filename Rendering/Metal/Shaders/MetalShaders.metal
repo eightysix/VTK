@@ -448,6 +448,66 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
   return out;
 }
 
+// OIT accumulate output: matches the shader-side premultiplication done by
+// vtkOrderIndependentTranslucentPass::PostReplaceShaderValues in GL:
+//   color0 = (lit.rgb * opacity, opacity)
+//   color1 = opacity  (revealage)
+// The pipeline blends color0 with (ONE, ONE) for RGB and (ZERO,
+// ONE_MINUS_SRC_ALPHA) for alpha, and color1 with (ONE, ONE), mirroring
+// glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ZERO, GL_ONE_MINUS_SRC_ALPHA).
+struct OITAccumulateOutput {
+  float4 color [[color(0)]];
+  float reveal [[color(1)]];
+  float depth [[depth(any)]];
+};
+
+fragment OITAccumulateOutput fragment_main_oit(VertexOut in [[stage_in]],
+    constant MaterialUniforms& material [[buffer(0)]],
+    constant LightUniforms& lights [[buffer(1)]],
+    constant SceneUniforms& scene [[buffer(2)]],
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+    constant EdgeUniforms& edge [[buffer(4)]],
+    constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
+    texture2d<float> actorTexture [[texture(0)]],
+    sampler actorSampler [[sampler(0)]],
+    bool frontFacing [[front_facing]]) {
+  if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
+
+  // Same backface handling as fragment_main.
+  float3 N = normalize(in.viewNormal);
+  MaterialUniforms m = material;
+  if (!frontFacing)
+  {
+    N = -N;
+    m.ambientColor = material.backfaceAmbientColor;
+    m.diffuseColor = material.backfaceDiffuseColor;
+    m.specularColor = material.backfaceSpecularColor;
+    m.color = material.backfaceColor;
+    m.opacity = material.backfaceOpacity;
+    m.specularPower = material.backfaceSpecularPower;
+  }
+
+  ResolvedMaterial r = resolveMaterial(m, scene, in.vertexColor, in.uv, actorTexture, actorSampler);
+  applySurfaceEdges(N, r, in, lights, edge, scene);
+
+  float3 totalAmbient = m.ambientColor.w * r.ambient;
+  float3 totalDiffuse = float3(0.0);
+  float3 totalSpecular = float3(0.0);
+
+  computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, lights, totalDiffuse, totalSpecular);
+
+  float3 litRGB = totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular;
+  float opacity = r.opacity;
+
+  OITAccumulateOutput out;
+  out.color = float4(litRGB * opacity, opacity);
+  out.reveal = opacity;
+
+  float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
+  out.depth = in.position.z + coinOffset.polygonFactor * cscale + coinOffset.polygonOffset / 65000.0;
+  return out;
+}
+
 fragment FragmentOutput fragment_edge_main(VertexOut in [[stage_in]],
                                    constant MaterialUniforms& material [[buffer(0)]],
                                    constant SceneUniforms& scene [[buffer(2)]],
@@ -1349,6 +1409,23 @@ fragment float4 fragment_peel_back_blend(
   float4 backTemp = backTempTex.read(uint2(in.position.xy));
   if (backTemp.a < 0.001) discard_fragment();
   return backTemp;
+}
+
+// OIT resolve: mirrors vtkOrderIndependentTranslucentPassFinalFS.glsl.
+// AccumTex.a holds the accumulated transmittance product (1 - sum of opacities),
+// so total opacity = 1 - accum.a. RGB holds the weighted color sum, divided by
+// the revealage (sum of opacities) to recover the weighted average color.
+// The pipeline blends this over the destination with the standard over blend
+// (SRC_ALPHA, ONE_MINUS_SRC_ALPHA).
+fragment float4 fragment_oit_resolve(
+    FullscreenVertexOut in [[stage_in]],
+    texture2d<float, access::read> accumTex [[texture(0)]],
+    texture2d<float, access::read> revealTex [[texture(1)]]) {
+  
+  uint2 pixel = uint2(in.position.xy);
+  float4 accum = accumTex.read(pixel);
+  float reveal = revealTex.read(pixel).r;
+  return float4(accum.rgb / max(reveal, 0.01), 1.0 - accum.a);
 }
 
 // ---------------------------------------------------------------------------

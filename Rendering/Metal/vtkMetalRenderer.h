@@ -22,6 +22,7 @@ VTK_ABI_NAMESPACE_BEGIN
 
 class vtkOverrideAttribute;
 class vtkMetalDepthPeeler;
+class vtkMetalOrderIndependentTranslucentPass;
 
 class VTKRENDERINGMETAL_EXPORT VTK_MARSHALAUTO vtkMetalRenderer : public vtkRenderer
 {
@@ -68,6 +69,7 @@ protected:
 
 private:
   std::unique_ptr<vtkMetalDepthPeeler> DepthPeeler;
+  std::unique_ptr<vtkMetalOrderIndependentTranslucentPass> OrderIndependentTranslucentPass;
   vtkMetalRenderer(const vtkMetalRenderer&) = delete;
   void operator=(const vtkMetalRenderer&) = delete;
 };

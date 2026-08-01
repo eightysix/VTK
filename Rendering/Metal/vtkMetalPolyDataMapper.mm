@@ -267,6 +267,10 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLRenderPipelineState> TriangleInitPeelPipeline = nil;  // init depth range
   id<MTLRenderPipelineState> TrianglePeelPipeline = nil;      // main peel pass
 
+  // 8C: Order-independent transparency accumulate pipeline. Same vertex shader,
+  // fragment_main_oit outputs premultiplied color (RGBA16F) + revealage (R16F).
+  id<MTLRenderPipelineState> TriangleOITPipeline = nil;
+
   // 8D: Vertex attribute mapping — custom per-vertex buffers from user-mapped data arrays
   std::unordered_map<std::string, id<MTLBuffer>> ExtraAttributeBuffers;
   std::unordered_map<std::string, int> ExtraAttributeComponentCounts;
@@ -369,6 +373,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   float BundleLineWidth = -1.0f;
   int BundleSampleCount = 0;
   int BundlePeelMode = 0;
+  bool BundleOITActive = false;
   vtkMTimeType BundleTextureMTime = 0;
   bool BundleHasActorTexture = false;
 
@@ -428,6 +433,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     vtkMetalMRC::ReleaseAndNil(MiterJoinLinePipeline);
     vtkMetalMRC::ReleaseAndNil(TriangleInitPeelPipeline);
     vtkMetalMRC::ReleaseAndNil(TrianglePeelPipeline);
+    vtkMetalMRC::ReleaseAndNil(TriangleOITPipeline);
 
     vtkMetalMRC::ReleaseAndNil(PolygonToTrianglePipeline);
     vtkMetalMRC::ReleaseAndNil(PolyLineToLinePipeline);
@@ -823,6 +829,9 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
 
   int peelMode = vtkMetalRenderWindow::SafeDownCast(ren->GetRenderWindow())->DepthPeelingMode;
   const bool peelPassActive = (peelMode != 0);
+  vtkMetalRenderWindow* renWin =
+      vtkMetalRenderWindow::SafeDownCast(ren->GetRenderWindow());
+  const bool oitActive = renWin->OITActive;
 
   // During peel passes the relevant pipelines are TriangleInitPeelPipeline
   // (peelMode==1) and TrianglePeelPipeline (peelMode==2); fallback to
@@ -841,14 +850,19 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   const bool trianglePipelineAvailable =
       this->Internals->TrianglePipeline ||
       (peelMode == 1 && this->Internals->TriangleInitPeelPipeline) ||
-      (peelMode == 2 && this->Internals->TrianglePeelPipeline);
+      (peelMode == 2 && this->Internals->TrianglePeelPipeline) ||
+      (oitActive && this->Internals->TriangleOITPipeline);
 
   const bool drawTriangles =
       isSurface &&
       this->Internals->HasTriangles &&
       trianglePipelineAvailable;
 
+  // Lines, edge overlays, and point dots are not drawn during depth-peel or
+  // OIT accumulate passes — those pipelines write to different color
+  // attachments than the pass provides.
   const bool drawLines =
+      !peelPassActive && !oitActive &&
       (isSurface || isWireframe) &&
       this->Internals->HasLines &&
       this->Internals->LineIndexBuffer &&
@@ -906,6 +920,18 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       else
       {
         vtkWarningMacro(<< "Missing peel pipeline or textures; skipping triangle draw in peel pass.");
+        skipTriangleDraw = true;
+      }
+    }
+    else if (oitActive)
+    {
+      if (this->Internals->TriangleOITPipeline)
+      {
+        recordPipeline(this->Internals->TriangleOITPipeline);
+      }
+      else
+      {
+        vtkWarningMacro(<< "Missing OIT accumulate pipeline; skipping triangle draw.");
         skipTriangleDraw = true;
       }
     }
@@ -1298,7 +1324,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   }
 
   // --- Edge overlay (wireframe on surface, skipped during depth-peel passes) ---
-  if (!peelPassActive && drawEdgeOverlay)
+  if (!peelPassActive && !oitActive && drawEdgeOverlay)
   {
     // When lineWidth > 1, polygon edges render as thick tubes (matching GL's
     // fake-tube edge rendering). Per-polygon closed-loop segments let the miter
@@ -1429,7 +1455,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   }
 
   // --- Vertex visibility (dots on surface, skipped during depth-peel passes) ---
-  if (!peelPassActive && drawVertexVisibilityDots)
+  if (!peelPassActive && !oitActive && drawVertexVisibilityDots)
   {
     float ptSize = act->GetProperty()->GetPointSize();
     if (ptSize > 1.0f && this->Internals->PointShapedPipeline)
@@ -1554,7 +1580,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   }
 
   // --- Points (VTK_POINTS representation, skipped during depth-peel passes) ---
-  if (!peelPassActive && drawPointRepresentation)
+  if (!peelPassActive && !oitActive && drawPointRepresentation)
   {
     float ptSize = act->GetProperty()->GetPointSize();
     if (ptSize > 1.0f && this->Internals->PointShapedPipeline)
@@ -1698,6 +1724,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   this->Internals->BundleLineWidth = lineWidth;
   this->Internals->BundleSampleCount = this->Internals->CachedSampleCount;
   this->Internals->BundlePeelMode = peelMode;
+  this->Internals->BundleOITActive = oitActive;
   this->Internals->BundleTextureMTime = this->Internals->CachedTextureMTime;
   this->Internals->BundleHasActorTexture = hasActorTexture;
   this->Internals->BundleVertexVisibility = vertexVisibility;
@@ -1958,6 +1985,10 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     {
       this->EnsurePeelPipelineStates((void*)device);
     }
+    if (renWin->OITActive)
+    {
+      this->EnsureOITPipelineStates((void*)device);
+    }
 
     // Use the encoder already created by vtkMetalRenderer::DeviceRender().
     // Do NOT create a new render pass, command buffer, or drawable here.
@@ -2175,6 +2206,7 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     vtkMTimeType textureMTime = this->Internals->CachedTextureMTime;
 
     int currentPeelMode = renWin->DepthPeelingMode;
+    bool currentOITActive = renWin->OITActive;
 
     bool bundleValid =
         this->Internals->Bundle.Valid &&
@@ -2184,6 +2216,7 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         this->Internals->BundleLineWidth == lineWidth &&
         this->Internals->BundleSampleCount == currentSampleCount &&
         this->Internals->BundlePeelMode == currentPeelMode &&
+        this->Internals->BundleOITActive == currentOITActive &&
         this->Internals->BundleTextureMTime == textureMTime &&
         this->Internals->BundleHasActorTexture == hasActorTexture &&
         this->Internals->BundleVertexVisibility == vertexVisibility &&
@@ -2197,7 +2230,7 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         this->Internals->BundleBatchOverrideMTime == batchOverrideMTime;
 
     // P1-4: Disable bundle caching during peel passes to avoid stale texture bindings
-    const bool allowBundleCaching = (currentPeelMode == 0);
+    const bool allowBundleCaching = (currentPeelMode == 0 && !currentOITActive);
 
     if (allowBundleCaching && bundleValid)
     {
@@ -2243,6 +2276,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     vtkMetalMRC::ReleaseAndNil(this->Internals->TrianglePipeline);
     vtkMetalMRC::ReleaseAndNil(this->Internals->TriangleInitPeelPipeline);
     vtkMetalMRC::ReleaseAndNil(this->Internals->TrianglePeelPipeline);
+    vtkMetalMRC::ReleaseAndNil(this->Internals->TriangleOITPipeline);
     this->Internals->CachedSurfaceUsesIndexedEntry =
       this->Internals->SurfaceUsesIndexedEntry;
   }
@@ -5134,6 +5168,114 @@ void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
 
   [vertexFunc release];
   [vertexDesc release];
+}
+
+//------------------------------------------------------------------------------
+// 8C: Create the order-independent transparency accumulate pipeline state for
+// triangle rendering. Uses the same vertex shader (vertex_main) and a fragment
+// shader (fragment_main_oit) that outputs premultiplied color to color(0)
+// (RGBA16F) and revealage to color(1) (R16F).
+//
+// The blend configuration mirrors vtkOrderIndependentTranslucentPass in GL:
+//   glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ZERO, GL_ONE_MINUS_SRC_ALPHA)
+// applied to the shader output (C*a, a):
+//   color(0).rgb = C*a + dst.rgb                    (ONE, ONE)
+//   color(0).a   = dst.a * (1 - a)                  (ZERO, ONE_MINUS_SRC_ALPHA)
+//   color(1).r   = a + dst.r                        (ONE, ONE)
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::EnsureOITPipelineStates(void* mtlDevice)
+{
+  if (this->Internals->TriangleOITPipeline)
+  {
+    return;
+  }
+
+  id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
+
+  if (!this->Internals->CachedRenderWindow)
+  {
+    vtkErrorMacro(<< "No render window available for shader library access");
+    return;
+  }
+
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)
+    this->Internals->CachedRenderWindow->GetSharedShaderLibrary();
+  if (!library)
+  {
+    vtkErrorMacro(<< "No shared shader library available for OIT");
+    return;
+  }
+
+  const bool indexedEntry = this->Internals->SurfaceUsesIndexedEntry;
+  id<MTLFunction> vertexFunc = indexedEntry
+    ? [library newFunctionWithName:@"vertex_main_indexed"]
+    : [library newFunctionWithName:@"vertex_main"];
+  id<MTLFunction> fragFunc = [library newFunctionWithName:@"fragment_main_oit"];
+  if (!vertexFunc || !fragFunc)
+  {
+    vtkErrorMacro(<< "Failed to find OIT shader functions");
+    [vertexFunc release];
+    [fragFunc release];
+    return;
+  }
+
+  MTLVertexDescriptor* vertexDesc = [[MTLVertexDescriptor alloc] init];
+  vertexDesc.attributes[0].format = MTLVertexFormatFloat3;
+  vertexDesc.attributes[0].offset = 0;
+  vertexDesc.attributes[0].bufferIndex = 0;
+  vertexDesc.attributes[1].format = MTLVertexFormatFloat3;
+  vertexDesc.attributes[1].offset = 0;
+  vertexDesc.attributes[1].bufferIndex = 1;
+  vertexDesc.layouts[0].stride = sizeof(float) * 3;
+  vertexDesc.layouts[0].stepRate = 1;
+  vertexDesc.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
+  vertexDesc.layouts[1].stride = sizeof(float) * 3;
+  vertexDesc.layouts[1].stepRate = 1;
+  vertexDesc.layouts[1].stepFunction = MTLVertexStepFunctionPerVertex;
+
+  MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+  desc.vertexFunction = vertexFunc;
+  desc.fragmentFunction = fragFunc;
+  if (!indexedEntry)
+  {
+    desc.vertexDescriptor = vertexDesc;
+  }
+  // color(0): RGBA16F accumulate — RGB: (ONE, ONE) add, A: (ZERO, ONE_MINUS_SRC_ALPHA) add
+  desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+  desc.colorAttachments[0].blendingEnabled = YES;
+  desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+  desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+  desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+  desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOne;
+  desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorZero;
+  desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+  // color(1): R16F revealage — (ONE, ONE) add
+  desc.colorAttachments[1].pixelFormat = MTLPixelFormatR16Float;
+  desc.colorAttachments[1].blendingEnabled = YES;
+  desc.colorAttachments[1].rgbBlendOperation = MTLBlendOperationAdd;
+  desc.colorAttachments[1].alphaBlendOperation = MTLBlendOperationAdd;
+  desc.colorAttachments[1].sourceRGBBlendFactor = MTLBlendFactorOne;
+  desc.colorAttachments[1].destinationRGBBlendFactor = MTLBlendFactorOne;
+  desc.colorAttachments[1].sourceAlphaBlendFactor = MTLBlendFactorOne;
+  desc.colorAttachments[1].destinationAlphaBlendFactor = MTLBlendFactorOne;
+  // Depth test against the resolved opaque depth (read-only state set by the pass)
+  desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+  desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+  // OIT runs without MSAA (matching depth peeling); the accumulate textures
+  // are non-MSAA, so the sample count must stay 1.
+  desc.rasterSampleCount = 1;
+
+  NSError* error = nil;
+  this->Internals->TriangleOITPipeline =
+    [device newRenderPipelineStateWithDescriptor:desc error:&error];
+  if (!this->Internals->TriangleOITPipeline)
+  {
+    vtkErrorMacro(<< "OIT accumulate pipeline: " << [[error localizedDescription] UTF8String]);
+  }
+  [desc release];
+  [vertexDesc release];
+  [vertexFunc release];
+  [fragFunc release];
 }
 
 //------------------------------------------------------------------------------

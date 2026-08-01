@@ -55,6 +55,23 @@ struct SceneSpec
 };
 
 const SceneSpec kScenes[] = {
+  { "AP_OpaqueNoBF", vtkMetalScenes::BuildAP_OpaqueNoBF, 400, 400 },
+  { "AP_OpaqueBF", vtkMetalScenes::BuildAP_OpaqueBF, 400, 400 },
+  { "AP_TransNoBF", vtkMetalScenes::BuildAP_TransNoBF, 400, 400 },
+  { "AP_TransBFbf05", vtkMetalScenes::BuildAP_TransBFbf05, 400, 400 },
+  { "AP_TransBFbf10", vtkMetalScenes::BuildAP_TransBFbf10, 400, 400 },
+  { "AP_OpFrTransBF", vtkMetalScenes::BuildAP_OpFrTransBF, 400, 400 },
+  { "AP_Trans25BF05", vtkMetalScenes::BuildAP_Trans25BF05, 400, 400 },
+  { "AP_Trans75BF05", vtkMetalScenes::BuildAP_Trans75BF05, 400, 400 },
+  { "AP_FrontCull", vtkMetalScenes::BuildAP_FrontCull, 400, 400 },
+  { "AP_BackCull", vtkMetalScenes::BuildAP_BackCull, 400, 400 },
+  { "AP_GB05", vtkMetalScenes::BuildAP_GB05, 400, 400 },
+  { "AP_GB10", vtkMetalScenes::BuildAP_GB10, 400, 400 },
+  { "AP_RG05", vtkMetalScenes::BuildAP_RG05, 400, 400 },
+  { "AP_GR25", vtkMetalScenes::BuildAP_GR25, 400, 400 },
+  { "AP_GR7510", vtkMetalScenes::BuildAP_GR7510, 400, 400 },
+  { "AP_GR7525", vtkMetalScenes::BuildAP_GR7525, 400, 400 },
+  { "AP_GR2510", vtkMetalScenes::BuildAP_GR2510, 400, 400 },
   { "RenderWindow", vtkMetalScenes::BuildRenderWindowScene, 400, 400 },
   { "Camera", vtkMetalScenes::BuildCameraScene, 400, 400 },
   { "Light", vtkMetalScenes::BuildLightScene, 400, 400 },

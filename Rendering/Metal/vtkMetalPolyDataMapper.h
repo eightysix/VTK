@@ -95,6 +95,7 @@ protected:
   void UpdateClipPlaneUniforms(void* mtlDevice, vtkActor* actor);
   void UpdateActorTexture(void* mtlDevice, vtkActor* actor);
   void EnsurePeelPipelineStates(void* mtlDevice);
+  void EnsureOITPipelineStates(void* mtlDevice);
 
   // Picking: write {propId, compositeIndex} into the PropIdBuffer (PickIds).
   // During a selection pass propId is the prop's per-render PropArray index

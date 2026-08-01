@@ -2,6 +2,7 @@ set(classes
   vtkMetalRenderWindow
   vtkMetalRenderer
   vtkMetalDepthPeeler
+  vtkMetalOrderIndependentTranslucentPass
   vtkMetalActor
   vtkMetalPolyDataMapper
   vtkMetalBatchedPolyDataMapper

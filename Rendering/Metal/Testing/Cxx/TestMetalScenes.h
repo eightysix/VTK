@@ -339,6 +339,114 @@ inline void BuildActorPropertyScene(vtkRenderer* renderer, BackendKind b)
   renderer->ResetCamera();
 }
 
+// --- Order-independent transparency (OIT) regression scenes ---------------
+// A single translucent sphere (with an optional backface property) rendered
+// through the order-independent translucent pass. These exercise the OIT
+// accumulate + resolve math with a discriminating set of front/back opacities
+// and front/back colors: front opacity in {0.25, 0.5, 0.75}, back opacity in
+// {0.25, 0.5, 1.0}, and green/red, green/blue, red/green color pairs. Each
+// front/back (a_f, a_b) combination has a closed-form OIT result, so an exact
+// GL match here pins down the OIT compositing and backface-material handling.
+inline void BuildAP_DiagSceneEx(vtkRenderer* renderer, BackendKind b, double opacity,
+  bool useBackProp, double bfOpacity, const double frontColor[3], const double backColor[3])
+{
+  vtkNew<vtkSphereSource> sphere;
+  vtkSmartPointer<vtkPolyDataMapper> mapper = NewPolyDataMapper(b);
+  mapper->SetInputConnection(sphere->GetOutputPort());
+  vtkSmartPointer<vtkActor> actor = NewActor(b);
+  ConfigureActor(actor, b);
+  actor->SetMapper(mapper);
+  actor->GetProperty()->SetAmbient(0.0);
+  actor->GetProperty()->SetDiffuse(1.0);
+  actor->GetProperty()->SetSpecular(0.0);
+  actor->GetProperty()->SetDiffuseColor(frontColor[0], frontColor[1], frontColor[2]);
+  if (useBackProp)
+  {
+    vtkSmartPointer<vtkProperty> backProp = NewProperty(b);
+    backProp->SetDiffuseColor(backColor[0], backColor[1], backColor[2]);
+    backProp->SetOpacity(bfOpacity);
+    actor->SetBackfaceProperty(backProp);
+  }
+  renderer->AddActor(actor);
+  actor->GetProperty()->SetRepresentationToSurface();
+  actor->GetProperty()->EdgeVisibilityOff();
+  actor->GetProperty()->SetOpacity(opacity);
+  vtkSmartPointer<vtkCamera> camera = NewCamera(b);
+  renderer->SetActiveCamera(camera);
+  renderer->ResetCamera();
+}
+
+inline void BuildAP_DiagScene(vtkRenderer* renderer, BackendKind b, double opacity,
+  bool useBackProp, double bfOpacity)
+{
+  const double frontColor[3] = { 0.0, 1.0, 0.0 };
+  const double backColor[3] = { 1.0, 0.0, 0.0 };
+  BuildAP_DiagSceneEx(renderer, b, opacity, useBackProp, bfOpacity, frontColor, backColor);
+}
+
+inline void BuildAP_OpaqueNoBF(vtkRenderer* r, BackendKind b) { BuildAP_DiagScene(r, b, 1.0, false, 1.0); }
+inline void BuildAP_OpaqueBF(vtkRenderer* r, BackendKind b) { BuildAP_DiagScene(r, b, 1.0, true, 1.0); }
+inline void BuildAP_TransNoBF(vtkRenderer* r, BackendKind b) { BuildAP_DiagScene(r, b, 0.5, false, 1.0); }
+inline void BuildAP_TransBFbf05(vtkRenderer* r, BackendKind b) { BuildAP_DiagScene(r, b, 0.5, true, 0.5); }
+inline void BuildAP_TransBFbf10(vtkRenderer* r, BackendKind b) { BuildAP_DiagScene(r, b, 0.5, true, 1.0); }
+inline void BuildAP_OpFrTransBF(vtkRenderer* r, BackendKind b) { BuildAP_DiagScene(r, b, 1.0, true, 0.5); }
+inline void BuildAP_Trans25BF05(vtkRenderer* r, BackendKind b) { BuildAP_DiagScene(r, b, 0.25, true, 0.5); }
+inline void BuildAP_Trans75BF05(vtkRenderer* r, BackendKind b) { BuildAP_DiagScene(r, b, 0.75, true, 0.5); }
+
+inline void BuildAP_CullScene(vtkRenderer* renderer, BackendKind b, int frontCull, int backCull)
+{
+  BuildAP_DiagScene(renderer, b, 0.5, true, 0.5);
+  vtkActor* actor = renderer->GetActors()->GetLastActor();
+  vtkProperty* prop = actor->GetProperty();
+  prop->SetFrontfaceCulling(frontCull);
+  prop->SetBackfaceCulling(backCull);
+}
+inline void BuildAP_FrontCull(vtkRenderer* r, BackendKind b) { BuildAP_CullScene(r, b, 1, 0); }
+inline void BuildAP_BackCull(vtkRenderer* r, BackendKind b) { BuildAP_CullScene(r, b, 0, 1); }
+
+inline void BuildAP_GB05(vtkRenderer* r, BackendKind b)
+{
+  const double f[3] = { 0.0, 1.0, 0.0 };
+  const double bk[3] = { 0.0, 0.0, 1.0 };
+  BuildAP_DiagSceneEx(r, b, 0.5, true, 0.5, f, bk);
+}
+inline void BuildAP_GB10(vtkRenderer* r, BackendKind b)
+{
+  const double f[3] = { 0.0, 1.0, 0.0 };
+  const double bk[3] = { 0.0, 0.0, 1.0 };
+  BuildAP_DiagSceneEx(r, b, 0.5, true, 1.0, f, bk);
+}
+inline void BuildAP_RG05(vtkRenderer* r, BackendKind b)
+{
+  const double f[3] = { 1.0, 0.0, 0.0 };
+  const double bk[3] = { 0.0, 1.0, 0.0 };
+  BuildAP_DiagSceneEx(r, b, 0.5, true, 0.5, f, bk);
+}
+inline void BuildAP_GR25(vtkRenderer* r, BackendKind b)
+{
+  const double f[3] = { 0.0, 1.0, 0.0 };
+  const double bk[3] = { 1.0, 0.0, 0.0 };
+  BuildAP_DiagSceneEx(r, b, 0.5, true, 0.25, f, bk);
+}
+inline void BuildAP_GR7510(vtkRenderer* r, BackendKind b)
+{
+  const double f[3] = { 0.0, 1.0, 0.0 };
+  const double bk[3] = { 1.0, 0.0, 0.0 };
+  BuildAP_DiagSceneEx(r, b, 0.75, true, 1.0, f, bk);
+}
+inline void BuildAP_GR7525(vtkRenderer* r, BackendKind b)
+{
+  const double f[3] = { 0.0, 1.0, 0.0 };
+  const double bk[3] = { 1.0, 0.0, 0.0 };
+  BuildAP_DiagSceneEx(r, b, 0.75, true, 0.25, f, bk);
+}
+inline void BuildAP_GR2510(vtkRenderer* r, BackendKind b)
+{
+  const double f[3] = { 0.0, 1.0, 0.0 };
+  const double bk[3] = { 1.0, 0.0, 0.0 };
+  BuildAP_DiagSceneEx(r, b, 0.25, true, 1.0, f, bk);
+}
+
 // TestMetalPointRender: sphere with thick tube edges (final state of the
 // test's points-as-spheres / lines-as-tubes sequence).
 inline void BuildPointRenderScene(vtkRenderer* renderer, BackendKind b)

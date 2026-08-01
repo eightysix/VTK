@@ -10,17 +10,38 @@ Numbers below were produced on Apple Silicon, macOS, `SetMultiSamples(0)`,
 `SwapBuffersOff()` (back buffer read-back), threshold 20. The single-pass
 surface-edge port (`applySurfaceEdges` mirroring `vtkPolyDataEdgesGS.glsl` +
 `vtkOpenGLPolyDataMapper::ReplaceShaderEdges`) is active, so PointRender edges
-are now rendered on the surface fragment and match GL. The run is fully
-reproducible: rerunning the harness produces byte-identical images and
+are now rendered on the surface fragment and match GL. The order-independent
+translucent pass is implemented in Metal (`vtkMetalOrderIndependentTranslucentPass`),
+mirroring the GL default OIT path (`vtkOrderIndependentTranslucentPass`:
+RGBA16F + R16F accumulate, then a fullscreen weighted-average resolve over the
+drawable), so translucent rendering matches GL by construction. The run is
+fully reproducible: rerunning the harness produces byte-identical images and
 identical errors.
 
 ```
 scene                          error   thresholded error
 -------------------------------------------------------------------
+AP_OpaqueNoBF                     237.895          0.000
+AP_OpaqueBF                       237.895          0.000
+AP_TransNoBF                      204.000          0.000
+AP_TransBFbf05                    209.736          0.000
+AP_TransBFbf10                    272.187          0.000
+AP_OpFrTransBF                    237.895          0.000
+AP_Trans25BF05                    203.335          0.000
+AP_Trans75BF05                    239.540          0.000
+AP_FrontCull                      151.352          0.000
+AP_BackCull                       123.367          0.000
+AP_GB05                           209.736          0.000
+AP_GB10                           272.187          0.000
+AP_RG05                           209.736          0.000
+AP_GR25                           168.059          0.000
+AP_GR7510                         274.841          0.000
+AP_GR7525                         214.532          0.000
+AP_GR2510                         292.489          0.000
 RenderWindow                       39.322          0.000
 Camera                             10.078          0.000
 Light                              61.965          0.000
-ActorProperty                    1949.314        167.807
+ActorProperty                     606.631          0.000
 PointRender                      1668.277          0.000
 DepthPeeling                     4425.217        808.961
 CompositePolyDataMapper           241.004          0.000
@@ -47,6 +68,14 @@ worst thresholded error: 808.961
 
 ### Visually identical (thresholded error 0.000)
 
+- **OIT scenes** (`BuildAP_*`, the `AP_*` rows): a single translucent sphere
+  with an optional backface property, rendered through the order-independent
+  translucent pass. The front/back opacity and color combinations have
+  closed-form OIT results, so an exact GL match pins down the accumulate
+  (RGBA16F + R16F, blend `(ONE, ONE, ZERO, ONE_MINUS_SRC_ALPHA)`) and resolve
+  (`rgb/max(reveal, 0.01)`, `alpha = 1 - accum.a`, standard over-blend) math
+  plus backface-material handling. All 11 alpha/color combinations match GL
+  exactly.
 - **RenderWindow** (`BuildRenderWindowScene`): single cone, default material.
   Difference is only anti-aliasing/rounding at edges; `>10%` pixels fraction
   ~0.2%.
@@ -55,6 +84,10 @@ worst thresholded error: 808.961
   Identical projection math.
 - **Light** (`BuildLightScene`): cone lit by a single spot light (the test's
   final state). Identical lighting model.
+- **ActorProperty** (`BuildActorPropertyScene`): translucent (opacity 0.5)
+  sphere with a backface property. Previously divergent (error 1949 /
+  thresholded 167.8); it now matches GL exactly because Metal runs the same
+  OIT accumulate + resolve pass GL uses by default (`vtkRenderer::UseOIT`).
 - **PointRender** (`BuildPointRenderScene`): sphere with `EdgeVisibilityOn()`,
   `SetLineWidth(7)`, `RenderLinesAsTubesOn()`. The single-pass edge port draws
   the GL-style fake-tube edges directly on the surface fragment (edge
@@ -83,14 +116,6 @@ worst thresholded error: 808.961
 
 ### Divergent scenes and likely causes
 
-- **ActorProperty** — error 1949 / thresholded 167.8, ~3.2% of pixels >10%.
-  A translucent (opacity 0.5) sphere with a backface property. Backface
-  materials are now implemented and match GL; the residual difference is a
-  uniform slight darkening of the Metal sphere — every differing pixel is
-  GL-brighter by 26-60 gray levels across the 210x210 sphere region — a subtle
-  front/back-face translucency compositing or lighting rounding difference.
-  Neither backend depth-peels this scene (the flag is off); both use
-  painter-order blending.
 - **DepthPeeling** — error 4425 / thresholded 808.9, ~17.2% of pixels >10%.
   Three overlapping translucent spheres with `SetUseDepthPeeling(true)` and 20
   peels. `vtkMetalRenderer` drives its depth peeler
