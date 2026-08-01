@@ -43,7 +43,7 @@ Camera                             10.078          0.000
 Light                              61.965          0.000
 ActorProperty                     606.631          0.000
 PointRender                      1668.277          0.000
-DepthPeeling                     4425.217        808.961
+DepthPeeling                      740.265          0.000
 CompositePolyDataMapper           241.004          0.000
 Glyph3DMapper                     444.277          0.000
 HardwareSelector                  307.776          0.000
@@ -51,7 +51,7 @@ PolyDataMapper2D                  286.047          0.000
 Texture                           177.318          0.000
 VolumeRayCast                    2612.763        789.835
 -------------------------------------------------------------------
-worst thresholded error: 808.961
+worst thresholded error: 789.835
 ```
 
 ## How to read this
@@ -113,15 +113,20 @@ worst thresholded error: 808.961
 - **Texture** (`BuildTextureScene`): a checkerboard-textured plane
   (`vtkTexture`, interpolation on, repeat off, edge clamp). The Metal sampling
   path matches the OpenGL texture unit behavior (`>10%` fraction 0.0%).
+- **DepthPeeling** (`BuildDepthPeelingScene`): three overlapping translucent
+  spheres with `SetUseDepthPeeling(true)` and 20 peels. Now matches GL exactly
+  (`>10%` fraction 0.0%). The Metal peel pipeline
+  (`vtkMetalPolyDataMapper::EnsurePeelPipelineStates`) originally wrote the
+  `backTemp` target (attachment 0) with blending disabled, so the last
+  non-back fragment at each pixel overwrote (erased) back faces captured
+  earlier in the same peel — a pixel-order-dependent missing band below the
+  seam. The GL reference (`vtkDualDepthPeelingPass`) blends all
+  three peel targets with `glBlendEquation(GL_MAX)`; enabling MAX blending on
+  the Metal `backTemp` attachment reproduces the reference behavior and brings
+  the scene to 0.000 thresholded error (raw error 4425 → 740).
 
 ### Divergent scenes and likely causes
 
-- **DepthPeeling** — error 4425 / thresholded 808.9, ~17.2% of pixels >10%.
-  Three overlapping translucent spheres with `SetUseDepthPeeling(true)` and 20
-  peels. `vtkMetalRenderer` drives its depth peeler
-  (`vtkMetalDepthPeeler`), which now tracks GL closely; residual differences
-  concentrate in the sphere-overlap regions and are consistent with peel-count
-  / front-to-back compositing rounding.
 - **VolumeRayCast** — error 2612 / thresholded 789.8, ~28.5% of pixels >10%.
   Analytic 32^3 volume through the GPU ray-cast mapper with a shaded transfer
   function (`ShadeOn`, ambient/diffuse/specular). The Metal volume mapper is a

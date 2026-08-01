@@ -5127,9 +5127,18 @@ void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
       {
         desc.vertexDescriptor = vertexDesc;
       }
-      // color(0): RGBA8 (backTemp) — no blend, direct write
+      // color(0): RGBA8 (backTemp) — MAX blend, matching the GL reference
+      // (vtkDualDepthPeelingPass uses glBlendEquation(GL_MAX) for all three
+      // peel targets). Non-back fragments write backTemp = 0, and MAX blending
+      // preserves previously peeled back fragments instead of overwriting them.
       desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
-      desc.colorAttachments[0].blendingEnabled = NO;
+      desc.colorAttachments[0].blendingEnabled = YES;
+      desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationMax;
+      desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationMax;
+      desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+      desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOne;
+      desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+      desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
       // color(1): RGBA8 (frontDest) — MAX blend
       desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA8Unorm;
       desc.colorAttachments[1].blendingEnabled = YES;
