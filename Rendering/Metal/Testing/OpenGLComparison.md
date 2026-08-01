@@ -182,77 +182,120 @@ few thousandths across machines (0.007 on M2, 0.005 on M1), while remaining
 reproducible *within* a machine. When comparing measurements, report the
 device the numbers were produced on.
 
-## Benchmarks on this device (Apple M1)
+## Benchmarks
 
-The numbers below are from the same harness run in `--bench` mode on the
-machine that produced the images above: a Mac mini with an **Apple M1** (8
-cores, 4P/4E). Each scene is rendered `--frames 30` times after a warmup frame
-(which compiles shaders / builds pipeline states); the camera is nudged 0.1°
-azimuth every timed frame so `Render()` does real work, and both backends are
-synchronized inside the timed region (Metal `WaitForCompletion`, OpenGL
-`glFinish`) so the wall-clock ms/frame covers GPU time for both. Rerun with:
+The benchmark tables below are produced by the harness in `--bench` mode. Each
+scene is rendered `--frames 30` times after a warmup frame (which compiles
+shaders / builds pipeline states); the camera is nudged 0.1° azimuth every timed
+frame so `Render()` does real work. Both backends run symmetric configurations:
+private offscreen targets (Metal `VTK_METAL_ENABLE_OFFSCREEN_TARGET` texture,
+GL `vtkOpenGLFramebufferObject`), `SetMultiSamples(0)`, `SwapBuffersOff()`, and
+GPU-synchronized timing (Metal `WaitForCompletion`, OpenGL `glFinish`) so the
+wall-clock ms/frame covers GPU time for both. The offscreen targets exist
+because Metal drawable delivery can be **display-paced**: before they were
+added, every Metal scene flatlined at ~8.3 ms/frame (~120 fps) regardless of
+complexity, with the profile showing the time inside `-[CAMetalLayer
+nextDrawable]` (usleep). Whether that was a property of the SoC or of the macOS
+version was never pinned down, and it no longer matters — the harness skips
+`nextDrawable`/present entirely, so the timing is honest on any machine. Image
+capture and the visual comparison are unaffected: they still use the normal
+drawable path. Rerun on any machine with:
 
 ```sh
-./build_macos_metal/bin/vtkMetalGLVisualComparison --bench --frames 30
+./build_macos_metal/bin/vtkMetalGLVisualComparison --bench --frames 30 --reps 3
 ```
 
-```
-scene                          GL ms/f   GL fps   Metal ms/f  Metal fps    M/GL
--------------------------------------------------------------------
-AP_OpaqueNoBF                      0.49   2054.5        0.36     2790.3    0.74
-AP_OpaqueBF                        0.49   2026.2        0.32     3157.6    0.64
-AP_TransNoBF                       0.91   1094.3        0.53     1895.3    0.58
-AP_TransBFbf05                     0.77   1297.4        0.51     1978.4    0.66
-AP_TransBFbf10                     0.90   1105.8        0.55     1825.5    0.61
-AP_OpFrTransBF                     0.54   1864.1        0.36     2804.1    0.66
-AP_Trans25BF05                     0.81   1232.9        0.60     1668.8    0.74
-AP_Trans75BF05                     0.82   1214.8        0.53     1881.2    0.65
-AP_FrontCull                       0.89   1128.9        0.54     1839.5    0.61
-AP_BackCull                        0.80   1246.1        0.56     1785.9    0.70
-AP_GB05                            0.79   1260.4        0.59     1701.5    0.74
-AP_GB10                            0.79   1271.6        0.57     1759.3    0.72
-AP_RG05                            0.77   1299.1        0.59     1706.1    0.76
-AP_GR25                            0.92   1091.5        0.59     1704.0    0.64
-AP_GR7510                          0.87   1146.8        0.56     1792.8    0.64
-AP_GR7525                          0.87   1143.1        0.53     1891.7    0.60
-AP_GR2510                          0.85   1176.9        0.57     1741.2    0.68
-RenderWindow                       0.54   1865.5        0.33     2988.8    0.62
-Camera                             0.50   1998.3        0.33     3068.2    0.65
-Light                              0.39   2581.3        0.42     2397.1    1.08
-ActorProperty                      0.86   1160.9        0.61     1631.5    0.71
-PointRender                        0.65   1528.9        0.51     1973.4    0.77
-DepthPeeling                       3.89    257.0        1.35      740.7    0.35
-CompositePolyDataMapper            0.57   1747.4        0.46     2164.0    0.81
-Glyph3DMapper                      0.53   1903.8        0.40     2511.2    0.76
-HardwareSelector                   0.45   2213.7        0.43     2333.0    0.95
-PolyDataMapper2D                   0.50   1987.4        0.41     2431.0    0.82
-Texture                            0.40   2492.8        0.37     2737.9    0.91
-VolumeRayCast                      1.43    696.9        0.62     1611.7    0.43
--------------------------------------------------------------------
-```
+`--frames` is the number of timed renders per run; `--reps` repeats the whole
+per-scene measurement (fresh window each run) and the harness reports the mean
+of the per-run averages plus the run-to-run standard deviation. The tables
+below use the mean of 3 runs.
 
 How to read the table:
 
 - **`GL ms/f` / `Metal ms/f`** are average GPU-synchronized milliseconds per
   frame; **`M/GL`** is the Metal-to-GL time ratio, so values below 1 mean Metal
   is faster. `fps` = 1000/ms.
-- **DepthPeeling (M/GL 0.35)** is the headline: Metal at ~1.35 ms/frame vs GL
-  at ~3.89 ms/frame. GL pays ~3.8 ms in per-peel occlusion-query stalls —
-  `vtkDualDepthPeelingPass::PeelingDone()` blocks the CPU waiting for the query
-  result every peel. Metal instead uses a *frame-delayed adaptive early exit*:
-  the back-blend pass writes a visibility count (`MTLVisibilityResultModeCounting`
-  on `vtkMetalDepthPeeler::VisibilityBuffer`, one 8-byte slot per peel), the CPU
+- **DepthPeeling is the headline**: Metal is ~2× faster than GL (M/GL 0.43 on
+  the M2). GL pays per-peel occlusion-query stalls —
+  `vtkDualDepthPeelingPass::PeelingDone()` blocks the
+  CPU waiting for the query result every peel. Metal instead uses a
+  *frame-delayed adaptive early exit*: the back-blend pass writes a visibility
+  count (`MTLVisibilityResultModeCounting` on
+  `vtkMetalDepthPeeler::VisibilityBuffer`, one 8-byte slot per peel), the CPU
   reads it back only after the previous frame's command buffer completes, and
   the next frame renders only `lastWritten + 2` peels. The scene needs only 3
   peels (2 DIFFERS, 3–5 are byte-identical to the full 20-peel output), so Metal
   runs 5 peels instead of 20. The trade-off is one frame of lag if the
   translucency depth of the scene changes suddenly.
-- Every other scene is ≤ GL, **except Light (M/GL 1.08)**, the only scene where
-  Metal is slightly slower. The slowest absolute Metal time is DepthPeeling
-  (1.35 ms); everything else is well under 1 ms.
-- The volume ray-cast residual noted above (0.005 on this M1, 0.007 on the M2
-  that produced the reference numbers) is GPU-dependent, and so are these
-  timings; report the device when quoting either.
+- The slowest absolute Metal time is DepthPeeling; all other scenes are well
+  under 1 ms/frame.
+- Numbers are **device-dependent and noisy**: the timings and the per-scene
+  visual residual (see "Inter-device variability") vary with the GPU, the macOS
+  version, and the display configuration, and run-to-run variance was ~±15% on
+  the M2's integrated GPU. Report the device when quoting either, and treat
+  individual cells as indicative, not exact.
+
+### MacBook Air (Apple M2)
+
+MacBook Air with an **Apple M2** (Mac14,2), macOS 15.7.5, internal 60 Hz screen
+only.
+
+This is the machine where the Metal drawable pacing described above was first
+observed, so the offscreen benchmark config was introduced here. Whether the
+cause was the SoC or the macOS version was never pinned down, and it is moot
+now that the harness renders offscreen.
+
+```
+scene                          GL ms/f   GL fps   Metal ms/f  Metal fps    M/GL
+-------------------------------------------------------------------
+AP_OpaqueNoBF                      0.32   3122.4        0.29     3446.7    0.91
+AP_OpaqueBF                        0.39   2583.3        0.37     2703.6    0.96
+AP_TransNoBF                       0.73   1365.1        0.46     2190.3    0.62
+AP_TransBFbf05                     0.78   1279.9        0.45     2237.3    0.57
+AP_TransBFbf10                     0.66   1511.7        0.42     2356.9    0.64
+AP_OpFrTransBF                     0.43   2324.0        0.38     2602.0    0.89
+AP_Trans25BF05                     0.75   1341.2        0.43     2331.0    0.58
+AP_Trans75BF05                     0.70   1428.0        0.46     2194.7    0.65
+AP_FrontCull                       0.76   1307.8        0.43     2322.1    0.56
+AP_BackCull                        0.77   1303.4        0.44     2264.8    0.58
+AP_GB05                            0.74   1344.2        0.45     2245.2    0.60
+AP_GB10                            0.75   1327.1        0.47     2134.1    0.62
+AP_RG05                            0.75   1335.4        0.49     2021.3    0.66
+AP_GR25                            0.76   1321.0        0.53     1900.9    0.69
+AP_GR7510                          0.88   1137.7        0.43     2309.0    0.49
+AP_GR7525                          0.91   1102.0        0.44     2281.3    0.48
+AP_GR2510                          0.78   1284.2        0.47     2124.2    0.60
+RenderWindow                       0.47   2120.7        0.29     3455.9    0.61
+Camera                             0.49   2059.6        0.32     3099.2    0.66
+Light                              0.59   1692.1        0.30     3305.0    0.51
+ActorProperty                      0.77   1303.7        0.50     1986.0    0.66
+PointRender                        0.82   1221.3        0.39     2578.3    0.47
+DepthPeeling                       3.90    256.7        1.69      593.3    0.43
+CompositePolyDataMapper            0.48   2079.5        0.34     2908.5    0.71
+Glyph3DMapper                      0.57   1749.1        0.36     2749.7    0.64
+HardwareSelector                   0.55   1820.2        0.35     2865.5    0.64
+PolyDataMapper2D                   0.62   1608.5        0.37     2737.9    0.59
+Texture                            0.55   1817.8        0.31     3184.0    0.57
+VolumeRayCast                      1.51    661.8        0.61     1641.6    0.40
+-------------------------------------------------------------------
+```
+
+Device-specific notes:
+
+- The run-to-run σ reported by `--reps` quantifies the spread here (e.g.
+  DepthPeeling GL 3.90±0.21, VolumeRayCast GL 1.51±0.06, Metal 0.61±0.06);
+  treat cells as indicative, not exact.
+- The visual comparison is unaffected by the offscreen config: the thresholded
+  table reproduces (worst 0.00653595, VolumeRayCast 0.007; PointRender's raw
+  error drifts ±0.2 run-to-run while staying 0.000 thresholded).
+
+### Recording another machine
+
+To add a machine, run the command above (`--bench --frames 30 --reps 3`), then
+add a subsection here with the device model, macOS version, and display
+configuration, followed by the table and any device-specific notes. Since both
+the timings and the residual are GPU-dependent, always quote the device
+alongside the numbers.
 
 ## Running the analysis yourself
 
