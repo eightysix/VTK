@@ -107,8 +107,6 @@ struct VertexOut {
   uint cellId;           // P2-8: flat-interpolated cell ID (1-based, 0=background)
   uint propId;           // P2-8: flat-interpolated prop ID (1-based, 0=background)
   uint compositeIndex;   // P2-8: flat-interpolated composite index (0 = no composite)
-  float3 bary;           // per-corner barycentric coords (indexed entry only)
-  float3 baryW;          // bary * clip-space w (linear in window space)
   uint   edgeFlags;      // boundary-edge mask (indexed entry only)
   float2 ePos0;          // window-space triangle corner positions (indexed entry only)
   float2 ePos1;
@@ -334,8 +332,6 @@ vertex VertexOut vertex_main(uint vertex_id [[vertex_id]],
   out.cellId = cellIds[vertex_id];
   out.propId = mapPropId(pickIds.propId);
   out.compositeIndex = pickIds.compositeIndex;
-  out.bary = float3(0.0);
-  out.baryW = float3(0.0);
   out.edgeFlags = 0u;
   out.ePos0 = float2(0.0);
   out.ePos1 = float2(0.0);
@@ -346,7 +342,7 @@ vertex VertexOut vertex_main(uint vertex_id [[vertex_id]],
 
 // Indirection vertex entry for single-pass surface edges. The deduplicated
 // triangle vertex arrays are read through the triangle index buffer, while
-// bary/flags are read by vertex_id (per triangle corner). Drawn non-indexed.
+// edge flags are read by vertex_id (per triangle corner). Drawn non-indexed.
 vertex VertexOut vertex_main_indexed(uint vertex_id [[vertex_id]],
                                      constant packed_float3* positions [[buffer(0)]],
                                      constant packed_float3* normals   [[buffer(1)]],
@@ -357,9 +353,8 @@ vertex VertexOut vertex_main_indexed(uint vertex_id [[vertex_id]],
                                      constant PickIds&       pickIds   [[buffer(7)]],
                                      constant float2*        uvs       [[buffer(8)]],
                                      constant uint*          triIdx    [[buffer(9)]],
-                                     constant packed_float3* bary      [[buffer(10)]],
-                                     constant uint*          eflags    [[buffer(11)]],
-                                     constant packed_float3* triPos    [[buffer(12)]]) {
+                                     constant uint*          eflags    [[buffer(10)]],
+                                     constant packed_float3* triPos    [[buffer(11)]]) {
   VertexOut out;
 
   uint idx = triIdx[vertex_id];
@@ -377,8 +372,6 @@ vertex VertexOut vertex_main_indexed(uint vertex_id [[vertex_id]],
   out.cellId = cellIds[idx];
   out.propId = mapPropId(pickIds.propId);
   out.compositeIndex = pickIds.compositeIndex;
-  out.bary = bary[vertex_id];
-  out.baryW = out.bary * out.position.w;
   out.edgeFlags = eflags[vertex_id];
 
   // Window-space positions of the triangle's 3 corners, for the surface-edge
@@ -1025,7 +1018,7 @@ fragment FragmentOutput fragment_miter_join_line_main(
 // ---------------------------------------------------------------------------
 // Compute Kernels (Tessellation mapping)
 // ---------------------------------------------------------------------------
-struct TessParams { uint numCells; uint cellIdOffset; };
+struct TessParams { uint numCells; uint cellIdOffset; uint writeEdgeFlags; };
 
 inline bool tessIsBoundary(uint a, uint b, constant uint* connectivity, uint inputOffset, uint npts) {
   for (uint k = 0u; k < npts; ++k) {
@@ -1040,8 +1033,7 @@ kernel void polygonToTriangle(
     device uint* outConnectivity [[buffer(0)]],
     device float* edgeArray [[buffer(1)]],
     device uint* cellIds [[buffer(2)]],
-    device float3* outBary [[buffer(7)]],
-    device uint* outEdgeFlags [[buffer(8)]],
+    device uint* outEdgeFlags [[buffer(7)]],
     constant uint* connectivity [[buffer(3)]],
     constant uint* offsets [[buffer(4)]],
     constant uint* primitiveCounts [[buffer(5)]],
@@ -1066,16 +1058,18 @@ kernel void polygonToTriangle(
     outConnectivity[outputOffset + 1u] = c1;
     outConnectivity[outputOffset + 2u] = c2;
 
-    uint f12 = tessIsBoundary(c1, c2, connectivity, inputOffset, npts) ? 1u : 0u;
-    uint f20 = tessIsBoundary(c2, c0, connectivity, inputOffset, npts) ? 1u : 0u;
-    uint f01 = tessIsBoundary(c0, c1, connectivity, inputOffset, npts) ? 1u : 0u;
-    uint packed = (f12) | (f20 << 1u) | (f01 << 2u);
-    outBary[outputOffset] = float3(1.0, 0.0, 0.0);
-    outBary[outputOffset + 1u] = float3(0.0, 1.0, 0.0);
-    outBary[outputOffset + 2u] = float3(0.0, 0.0, 1.0);
-    outEdgeFlags[outputOffset] = packed;
-    outEdgeFlags[outputOffset + 1u] = packed;
-    outEdgeFlags[outputOffset + 2u] = packed;
+    // Single-pass surface edges: boundary mask is only needed when the
+    // indexed-entry pipeline is active, so skip the O(npts) boundary test
+    // entirely otherwise.
+    if (params.writeEdgeFlags != 0u) {
+      uint f12 = tessIsBoundary(c1, c2, connectivity, inputOffset, npts) ? 1u : 0u;
+      uint f20 = tessIsBoundary(c2, c0, connectivity, inputOffset, npts) ? 1u : 0u;
+      uint f01 = tessIsBoundary(c0, c1, connectivity, inputOffset, npts) ? 1u : 0u;
+      uint packed = (f12) | (f20 << 1u) | (f01 << 2u);
+      outEdgeFlags[outputOffset] = packed;
+      outEdgeFlags[outputOffset + 1u] = packed;
+      outEdgeFlags[outputOffset + 2u] = packed;
+    }
     outputOffset += 3u;
   }
 }

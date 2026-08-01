@@ -119,7 +119,6 @@ protected:
     const std::vector<float>& surfaceColors, const std::vector<float>& triangleUVs,
     const std::vector<uint32_t>& lineIndices,
     const std::vector<uint32_t>& triangleIndices,
-    const std::vector<float>& triangleBary,
     const std::vector<uint32_t>& triangleEdgeFlags,
     const std::vector<float>& trianglePos,
     const std::vector<float>& edgePositions,

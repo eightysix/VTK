@@ -165,6 +165,9 @@ int vtkMetalOrderIndependentTranslucentPass::RenderTranslucentGeometry(
   int width = size[0];
   int height = size[1];
 
+  // Renderer sub-rect inside the full-size textures (matches vtkMetalRenderer)
+  double* viewport = renderer->GetViewport();
+
   if (width <= 0 || height <= 0)
   {
     return 0;
@@ -233,10 +236,10 @@ int vtkMetalOrderIndependentTranslucentPass::RenderTranslucentGeometry(
     renWin->Encoder = (__bridge void*)encoder;
 
     MTLViewport metalViewport;
-    metalViewport.originX = 0;
-    metalViewport.originY = 0;
-    metalViewport.width = width;
-    metalViewport.height = height;
+    metalViewport.originX = viewport[0] * width;
+    metalViewport.originY = viewport[1] * height;
+    metalViewport.width = viewport[2] * width;
+    metalViewport.height = viewport[3] * height;
     metalViewport.znear = 0.0;
     metalViewport.zfar = 1.0;
     [encoder setViewport:metalViewport];
@@ -265,10 +268,10 @@ int vtkMetalOrderIndependentTranslucentPass::RenderTranslucentGeometry(
     encoder.label = @"VTK Order Independent - Resolve";
 
     MTLViewport vp;
-    vp.originX = 0;
-    vp.originY = 0;
-    vp.width = width;
-    vp.height = height;
+    vp.originX = viewport[0] * width;
+    vp.originY = viewport[1] * height;
+    vp.width = viewport[2] * width;
+    vp.height = viewport[3] * height;
     vp.znear = 0.0;
     vp.zfar = 1.0;
     [encoder setViewport:vp];

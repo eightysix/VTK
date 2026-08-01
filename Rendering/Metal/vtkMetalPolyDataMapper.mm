@@ -214,8 +214,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLBuffer> TessParamsBuffer = nil;             // uniform: numCells + cellIdOffset
   bool UseGPUTessellation = false;
 
-  // Single-pass surface edges: per-triangle-corner barycentrics + boundary flags
-  id<MTLBuffer> TriangleBaryBuffer = nil;      // float3 per triangle corner (3*numTris)
+  // Single-pass surface edges: per-triangle-corner boundary flags + corner positions
   id<MTLBuffer> TriangleEdgeFlagBuffer = nil;  // uint   per triangle corner (3*numTris)
   id<MTLBuffer> TrianglePosBuffer = nil;       // float3[3] corner object positions per corner record (3*numTris)
   bool SurfaceUsesIndexedEntry = false;        // pipeline-selection key: edges folded into fragment
@@ -521,7 +520,6 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     vtkMetalMRC::ReleaseAndNil(TessOutputConnectivityBuffer);
     vtkMetalMRC::ReleaseAndNil(TessEdgeArrayBuffer);
     vtkMetalMRC::ReleaseAndNil(TessParamsBuffer);
-    vtkMetalMRC::ReleaseAndNil(TriangleBaryBuffer);
     vtkMetalMRC::ReleaseAndNil(TriangleEdgeFlagBuffer);
     vtkMetalMRC::ReleaseAndNil(TrianglePosBuffer);
     SurfaceUsesIndexedEntry = false;
@@ -1047,13 +1045,12 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       }
       if (this->Internals->SurfaceUsesIndexedEntry)
       {
-        if (this->Internals->IndexBuffer && this->Internals->TriangleBaryBuffer &&
-            this->Internals->TriangleEdgeFlagBuffer && this->Internals->TrianglePosBuffer)
+        if (this->Internals->IndexBuffer && this->Internals->TriangleEdgeFlagBuffer &&
+            this->Internals->TrianglePosBuffer)
         {
           recordVBuf(this->Internals->IndexBuffer, 0, 9);
-          recordVBuf(this->Internals->TriangleBaryBuffer, 0, 10);
-          recordVBuf(this->Internals->TriangleEdgeFlagBuffer, 0, 11);
-          recordVBuf(this->Internals->TrianglePosBuffer, 0, 12);
+          recordVBuf(this->Internals->TriangleEdgeFlagBuffer, 0, 10);
+          recordVBuf(this->Internals->TrianglePosBuffer, 0, 11);
           recordDraw(MTLPrimitiveTypeTriangle, 0, this->Internals->TriangleIndexCount);
         }
         else
@@ -2291,11 +2288,9 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   std::vector<uint32_t> triangleIndices;
   std::unordered_map<vtkIdType, uint32_t> triVertexMap;
 
-  // Single-pass edges: per-triangle-corner bary + boundary flags (parallel to triangleIndices)
-  std::vector<float> triangleBary;
+  // Single-pass edges: per-triangle-corner boundary flags (parallel to triangleIndices)
   std::vector<uint32_t> triangleEdgeFlags;
   std::vector<float> trianglePos;   // float3[3] corner object positions per corner record
-  static const float kBary[3][3] = { {1,0,0}, {0,1,0}, {0,0,1} };
   // Host mirror of the kernel's isBoundary: true iff (a,b) is a consecutive polygon pair.
   auto edgeIsBoundary = [&](vtkIdType a, vtkIdType b, vtkIdType npts, const vtkIdType* pts) -> bool {
     for (vtkIdType k = 0; k < npts; ++k)
@@ -2634,13 +2629,11 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                        options:MTLResourceStorageModeShared];
           vtkMetalMRC::AssignConsumed(this->Internals->TriangleCellIdBuffer, triCellIdBuf);
 
-          // Single-pass edges: per-triangle-corner bary + boundary flags.
-          // Allocated unconditionally because polygonToTriangle always writes them.
+          // Single-pass edges: per-triangle-corner boundary flags. Only the
+          // indexed-entry pipeline reads them, so skip allocation otherwise.
+          bool singlePassEdges = this->Internals->SurfaceUsesIndexedEntry;
+          if (singlePassEdges)
           {
-            id<MTLBuffer> tessBaryBuf = [device
-              newBufferWithLength:numTris * 3 * sizeof(float) * 3
-                         options:MTLResourceStorageModeShared];
-            vtkMetalMRC::AssignConsumed(this->Internals->TriangleBaryBuffer, tessBaryBuf);
             id<MTLBuffer> tessFlagBuf = [device
               newBufferWithLength:numTris * 3 * sizeof(uint32_t)
                          options:MTLResourceStorageModeShared];
@@ -2648,9 +2641,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
           }
 
           // Upload params uniform
-          struct { uint32_t numCells; uint32_t cellIdOffset; } tessParams;
+          struct { uint32_t numCells; uint32_t cellIdOffset; uint32_t writeEdgeFlags; } tessParams;
           tessParams.numCells = static_cast<uint32_t>(polyOff.size() - 1);
           tessParams.cellIdOffset = static_cast<uint32_t>(polyCellOffset);
+          tessParams.writeEdgeFlags = singlePassEdges ? 1u : 0u;
           id<MTLBuffer> tessParamsBuf = [device
             newBufferWithBytes:&tessParams
                        length:sizeof(tessParams)
@@ -2664,8 +2658,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
             [enc setBuffer:this->Internals->TessOutputConnectivityBuffer offset:0 atIndex:0];
             [enc setBuffer:this->Internals->TessEdgeArrayBuffer offset:0 atIndex:1];
             [enc setBuffer:this->Internals->TriangleCellIdBuffer offset:0 atIndex:2];
-            [enc setBuffer:this->Internals->TriangleBaryBuffer offset:0 atIndex:7];
-            [enc setBuffer:this->Internals->TriangleEdgeFlagBuffer offset:0 atIndex:8];
+            if (singlePassEdges)
+            {
+              [enc setBuffer:this->Internals->TriangleEdgeFlagBuffer offset:0 atIndex:7];
+            }
             [enc setBuffer:connBuf offset:0 atIndex:3];
             [enc setBuffer:offBuf offset:0 atIndex:4];
             [enc setBuffer:primBuf offset:0 atIndex:5];
@@ -2750,9 +2746,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
               newBufferWithLength:numEdges * sizeof(uint32_t)
                          options:MTLResourceStorageModeShared];
 
-            struct { uint32_t numCells; uint32_t cellIdOffset; } eParams;
+            struct { uint32_t numCells; uint32_t cellIdOffset; uint32_t writeEdgeFlags; } eParams;
             eParams.numCells = static_cast<uint32_t>(eOff.size() - 1);
             eParams.cellIdOffset = static_cast<uint32_t>(polyCellOffset);
+            eParams.writeEdgeFlags = 0u;
             id<MTLBuffer> eParamsBuf = [device
               newBufferWithBytes:&eParams
                          length:sizeof(eParams)
@@ -2848,9 +2845,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
             newBufferWithLength:numEdges * sizeof(uint32_t)
                        options:MTLResourceStorageModeShared];
 
-          struct { uint32_t numCells; uint32_t cellIdOffset; } wParams;
+          struct { uint32_t numCells; uint32_t cellIdOffset; uint32_t writeEdgeFlags; } wParams;
           wParams.numCells = static_cast<uint32_t>(wOff.size() - 1);
           wParams.cellIdOffset = static_cast<uint32_t>(polyCellOffset);
+          wParams.writeEdgeFlags = 0u;
           id<MTLBuffer> wParamsBuf = [device
             newBufferWithBytes:&wParams
                        length:sizeof(wParams)
@@ -3075,9 +3073,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
               newBufferWithLength:numLineSegs * sizeof(uint32_t)
                          options:MTLResourceStorageModeShared];
 
-            struct { uint32_t numCells; uint32_t cellIdOffset; } lParams;
+            struct { uint32_t numCells; uint32_t cellIdOffset; uint32_t writeEdgeFlags; } lParams;
             lParams.numCells = static_cast<uint32_t>(lOff.size() - 1);
             lParams.cellIdOffset = static_cast<uint32_t>(lineCellOffset);
+            lParams.writeEdgeFlags = 0u;
             id<MTLBuffer> lParamsBuf = [device
               newBufferWithBytes:&lParams
                          length:sizeof(lParams)
@@ -3221,7 +3220,8 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
 
   // Single-pass edges (GPU tessellation path): build the per-triangle-corner
   // corner-position records from the compute connectivity + point positions.
-  if (gpuTessUsed && this->Internals->TessOutputConnectivityBuffer &&
+  if (this->Internals->SurfaceUsesIndexedEntry &&
+      gpuTessUsed && this->Internals->TessOutputConnectivityBuffer &&
       this->Internals->TrianglePrimitiveCount > 0 && !positions.empty())
   {
     const uint32_t* conn = static_cast<const uint32_t*>(
@@ -3414,22 +3414,26 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
         for (vtkIdType i = 1; i < npts - 1; ++i)
         {
           vtkIdType tri[3] = { pts[0], pts[i], pts[i + 1] };
-          uint32_t packed = packedEdgeFlags(tri, npts, pts);
+          bool singlePassEdges = this->Internals->SurfaceUsesIndexedEntry;
+          uint32_t packed = singlePassEdges ? packedEdgeFlags(tri, npts, pts) : 0;
 
           if (useIndexBuffer)
           {
             // Single-pass edges: per-corner records carry the 3 corner object
             // positions (identical for all 3 corners) so the vertex shader can
             // build the triangle's window-space edge equations.
-            double triPt[3][3];
-            for (int j = 0; j < 3; ++j) polydata->GetPoint(tri[j], triPt[j]);
-            for (int r = 0; r < 3; ++r)
+            if (singlePassEdges)
             {
-              for (int j = 0; j < 3; ++j)
+              double triPt[3][3];
+              for (int j = 0; j < 3; ++j) polydata->GetPoint(tri[j], triPt[j]);
+              for (int r = 0; r < 3; ++r)
               {
-                trianglePos.push_back(static_cast<float>(triPt[j][0]));
-                trianglePos.push_back(static_cast<float>(triPt[j][1]));
-                trianglePos.push_back(static_cast<float>(triPt[j][2]));
+                for (int j = 0; j < 3; ++j)
+                {
+                  trianglePos.push_back(static_cast<float>(triPt[j][0]));
+                  trianglePos.push_back(static_cast<float>(triPt[j][1]));
+                  trianglePos.push_back(static_cast<float>(triPt[j][2]));
+                }
               }
             }
             // Indexed path: deduplicate vertices by point ID
@@ -3439,10 +3443,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
               if (it != triVertexMap.end())
               {
                 triangleIndices.push_back(it->second);
-                triangleBary.push_back(kBary[j][0]);
-                triangleBary.push_back(kBary[j][1]);
-                triangleBary.push_back(kBary[j][2]);
-                triangleEdgeFlags.push_back(packed);
+                if (singlePassEdges) triangleEdgeFlags.push_back(packed);
                 // No cellId push, no emitExtraAttrsForPoint — vertex already exists
               }
               else
@@ -3450,10 +3451,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                 uint32_t vidx = static_cast<uint32_t>(positions.size() / 3);
                 triVertexMap[tri[j]] = vidx;
                 triangleIndices.push_back(vidx);
-                triangleBary.push_back(kBary[j][0]);
-                triangleBary.push_back(kBary[j][1]);
-                triangleBary.push_back(kBary[j][2]);
-                triangleEdgeFlags.push_back(packed);
+                if (singlePassEdges) triangleEdgeFlags.push_back(packed);
                 triangleVertexCellIds.push_back(static_cast<uint32_t>(polyCellIdx) + 1u);
 
                 double pt[3];
@@ -3522,18 +3520,18 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
 
             for (int j = 0; j < 3; ++j)
             {
-              triangleBary.push_back(kBary[j][0]);
-              triangleBary.push_back(kBary[j][1]);
-              triangleBary.push_back(kBary[j][2]);
-              triangleEdgeFlags.push_back(packed);
-
-              // Single-pass edges: per-corner records carry the 3 corner object
-              // positions (identical for all 3 corners).
-              for (int r = 0; r < 3; ++r)
+              if (singlePassEdges)
               {
-                trianglePos.push_back(static_cast<float>(p[r][0]));
-                trianglePos.push_back(static_cast<float>(p[r][1]));
-                trianglePos.push_back(static_cast<float>(p[r][2]));
+                triangleEdgeFlags.push_back(packed);
+
+                // Single-pass edges: per-corner records carry the 3 corner object
+                // positions (identical for all 3 corners).
+                for (int r = 0; r < 3; ++r)
+                {
+                  trianglePos.push_back(static_cast<float>(p[r][0]));
+                  trianglePos.push_back(static_cast<float>(p[r][1]));
+                  trianglePos.push_back(static_cast<float>(p[r][2]));
+                }
               }
 
               positions.push_back(static_cast<float>(p[j][0]));
@@ -3586,7 +3584,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     }
 
     // Single-pass edges: non-indexed surfaces still route through the indirection
-    // vertex entry (vertex_main_indexed reads bary/flags by vertex_id), so build
+    // vertex entry (vertex_main_indexed reads flags by vertex_id), so build
     // an identity index buffer covering all emitted triangle vertices.
     if (this->Internals->SurfaceUsesIndexedEntry && triangleIndices.empty() && !positions.empty())
     {
@@ -3924,7 +3922,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   this->UploadVertexDataToMTLBuffers(mtlDevice, polydata, pd,
     mappedColors, cellFlag, gpuTessUsed, defaultRGBA,
     positions, normals, surfaceColors, triangleUVs, lineIndices,
-    triangleIndices, triangleBary, triangleEdgeFlags, trianglePos,
+    triangleIndices, triangleEdgeFlags, trianglePos,
     edgePositions, edgeNormals, edgeColors, edgeUVs,
     edgeIndices, triangleVertexCellIds, lineVertexCellIds,
     lineSegmentCellIds, edgeVertexCellIds, edgeTubeIndices,
@@ -3943,7 +3941,6 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
   const std::vector<float>& surfaceColors, const std::vector<float>& triangleUVs,
   const std::vector<uint32_t>& lineIndices,
   const std::vector<uint32_t>& triangleIndices,
-  const std::vector<float>& triangleBary,
   const std::vector<uint32_t>& triangleEdgeFlags,
   const std::vector<float>& trianglePos,
   const std::vector<float>& edgePositions,
@@ -4008,15 +4005,9 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
     vtkMetalMRC::AssignConsumed(this->Internals->IndexBuffer, triIdxBuf);
   }
 
-  // Single-pass edges: per-triangle-corner bary + boundary flags (CPU paths)
-  if (!triangleBary.empty() && !triangleEdgeFlags.empty())
+  // Single-pass edges: per-triangle-corner boundary flags + corner positions (CPU paths)
+  if (!triangleEdgeFlags.empty())
   {
-    id<MTLBuffer> baryBuf = [device
-      newBufferWithBytes:triangleBary.data()
-                 length:triangleBary.size() * sizeof(float)
-                options:MTLResourceStorageModeShared];
-    vtkMetalMRC::AssignConsumed(this->Internals->TriangleBaryBuffer, baryBuf);
-
     id<MTLBuffer> flagBuf = [device
       newBufferWithBytes:triangleEdgeFlags.data()
                  length:triangleEdgeFlags.size() * sizeof(uint32_t)
