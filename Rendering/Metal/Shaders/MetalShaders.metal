@@ -27,6 +27,31 @@ struct SceneUniforms {
   float pointSize;
 };
 
+// Scene flag bits (must match VTK_METAL_SCENE_FLAG_* in vtkMetalPolyDataMapper.mm).
+constant uint kSceneFlagParallelProjection  = 1u << 0;
+constant uint kSceneFlagVertexVisibility    = 1u << 3;
+constant uint kSceneFlagSpherePoints        = 1u << 5;
+constant uint kSceneFlagPointShape          = 1u << 7;
+constant uint kSceneFlagHasSurfaceColors    = 1u << 8;
+constant uint kSceneFlagHasActorTexture     = 1u << 9;
+constant uint kSceneFlagHasSurfaceAlpha     = 1u << 10;
+
+// Compile-time feature specialization for the surface shader (the "GL way"):
+// one shader source, specialized per feature set at pipeline creation via
+// MTLFunctionConstantValues. Every pipeline that uses vertex_main/fragment_main
+// must specify a value for each constant (indices 6-11 avoid colliding with the
+// volume shaders' function constants 0-5); the mapper sets them all-true for the
+// full-behavior pipelines (peel/OIT/edge/line/base) and per-feature-mask for
+// the surface pipelines, so a plain opaque surface compiles to a lean program
+// with no vertexColor/uv/edge/ID work — matching what GL's shader-template
+// substitution produces.
+constant bool kHasSurfaceColors [[function_constant(6)]];
+constant bool kHasActorTexture  [[function_constant(7)]];
+constant bool kHasSurfaceAlpha  [[function_constant(8)]];
+constant bool kHasBackface      [[function_constant(9)]];
+constant bool kHasEdgeFlags     [[function_constant(10)]];
+constant bool kEmitIds          [[function_constant(11)]];
+
 // Coincident topology offset (P1-5)
 struct CoincidentOffsetUniforms {
   float polygonFactor;
@@ -154,7 +179,16 @@ inline void computePhongLighting(
   
   float3 viewDir = normalize(-viewPos);
   
-  for (int i = 0; i < lights.lightCount && i < MAX_LIGHTS; ++i) {
+  // GL unrolls per-light code with compile-time constant indices
+  // (lightColor0, lightDirectionVC1, ...) so the compiler can constant-fold the
+  // light type and keep uniforms in registers. A runtime-bounded loop here
+  // forces dynamic indexing into the lights array on every fragment, which is
+  // measurably slower on Apple GPUs. Unroll over the compile-time MAX_LIGHTS
+  // bound with a uniform guard so the index is constant in every iteration.
+  #pragma unroll
+  for (int i = 0; i < MAX_LIGHTS; ++i)
+  {
+    if (i >= lights.lightCount) continue;
     Light L = lights.lights[i];
     int lightType = int(L.position.w);
     float3 lightColor = L.color.rgb * L.color.w;
@@ -216,12 +250,12 @@ inline ResolvedMaterial resolveMaterial(
     float4 vertexColor, float2 uv,
     texture2d<float> actorTexture, sampler actorSampler)
 {
-    bool hasVC = (scene.flags & (1u << 8)) != 0u;
+    bool hasVC = (scene.flags & kSceneFlagHasSurfaceColors) != 0u;
     ResolvedMaterial r;
     r.ambient = hasVC ? vertexColor.rgb : material.ambientColor.rgb;
     r.diffuse = hasVC ? vertexColor.rgb : material.diffuseColor.rgb;
-    r.opacity = (scene.flags & (1u << 10)) != 0u ? vertexColor.a : material.opacity;
-    if ((scene.flags & (1u << 9)) != 0u) {
+    r.opacity = (scene.flags & kSceneFlagHasSurfaceAlpha) != 0u ? vertexColor.a : material.opacity;
+    if ((scene.flags & kSceneFlagHasActorTexture) != 0u) {
         float4 tex = actorTexture.sample(actorSampler, uv);
         r.ambient *= tex.rgb;
         r.diffuse *= tex.rgb;
@@ -326,12 +360,24 @@ vertex VertexOut vertex_main(uint vertex_id [[vertex_id]],
   out.viewPos = viewPos.xyz;
   out.position = scene.projectionMatrix * viewPos;
   out.viewNormal = scene.normalMatrix * in.normal;
-  out.vertexColor = vertexColors[vertex_id];
-  out.uv = triangleUVs[vertex_id];
+  // Feature-conditional per-vertex loads (compile-time via function constants):
+  // the lean surface variant skips the color/UV/ID streams the fragment shader
+  // does not consume, so the loads are not pure per-vertex bandwidth.
+  out.vertexColor = kHasSurfaceColors ? vertexColors[vertex_id] : float4(0.0);
+  out.uv = kHasActorTexture ? triangleUVs[vertex_id] : float2(0.0);
   out.modelPos = in.position; // Direct pass for unbounded planes evaluation
-  out.cellId = cellIds[vertex_id];
-  out.propId = mapPropId(pickIds.propId);
-  out.compositeIndex = pickIds.compositeIndex;
+  if (kEmitIds)
+  {
+    out.cellId = cellIds[vertex_id];
+    out.propId = mapPropId(pickIds.propId);
+    out.compositeIndex = pickIds.compositeIndex;
+  }
+  else
+  {
+    out.cellId = 0u;
+    out.propId = 0u;
+    out.compositeIndex = 0u;
+  }
   out.edgeFlags = 0u;
   out.ePos0 = float2(0.0);
   out.ePos1 = float2(0.0);
@@ -366,28 +412,47 @@ vertex VertexOut vertex_main_indexed(uint vertex_id [[vertex_id]],
   out.viewPos = viewPos.xyz;
   out.position = scene.projectionMatrix * viewPos;
   out.viewNormal = scene.normalMatrix * inNrm;
-  out.vertexColor = colors[idx];
-  out.uv = uvs[idx];
+  out.vertexColor = kHasSurfaceColors ? colors[idx] : float4(0.0);
+  out.uv = kHasActorTexture ? uvs[idx] : float2(0.0);
   out.modelPos = inPos;
-  out.cellId = cellIds[idx];
-  out.propId = mapPropId(pickIds.propId);
-  out.compositeIndex = pickIds.compositeIndex;
-  out.edgeFlags = eflags[vertex_id];
-
-  // Window-space positions of the triangle's 3 corners, for the surface-edge
-  // distance field. Record layout: 3 consecutive float3 per corner record
-  // (corner 0/1/2 object positions), replicated for each of the 3 corners.
-  // All 3 corners emit identical values, so interpolation is exact.
-  float2 eW[3];
-  for (int j = 0; j < 3; ++j) {
-    float4 clip = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix *
-                  float4(float3(triPos[vertex_id * 3 + j]), 1.0);
-    float2 ndc = clip.xy / clip.w;
-    eW[j] = scene.viewport.zw * (0.5 * ndc + 0.5);   // y-up window coords
+  if (kEmitIds)
+  {
+    out.cellId = cellIds[idx];
+    out.propId = mapPropId(pickIds.propId);
+    out.compositeIndex = pickIds.compositeIndex;
   }
-  out.ePos0 = eW[0];
-  out.ePos1 = eW[1];
-  out.ePos2 = eW[2];
+  else
+  {
+    out.cellId = 0u;
+    out.propId = 0u;
+    out.compositeIndex = 0u;
+  }
+  if (kHasEdgeFlags)
+  {
+    out.edgeFlags = eflags[vertex_id];
+
+    // Window-space positions of the triangle's 3 corners, for the surface-edge
+    // distance field. Record layout: 3 consecutive float3 per corner record
+    // (corner 0/1/2 object positions), replicated for each of the 3 corners.
+    // All 3 corners emit identical values, so interpolation is exact.
+    float2 eW[3];
+    for (int j = 0; j < 3; ++j) {
+      float4 clip = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix *
+                    float4(float3(triPos[vertex_id * 3 + j]), 1.0);
+      float2 ndc = clip.xy / clip.w;
+      eW[j] = scene.viewport.zw * (0.5 * ndc + 0.5);   // y-up window coords
+    }
+    out.ePos0 = eW[0];
+    out.ePos1 = eW[1];
+    out.ePos2 = eW[2];
+  }
+  else
+  {
+    out.edgeFlags = 0u;
+    out.ePos0 = float2(0.0);
+    out.ePos1 = float2(0.0);
+    out.ePos2 = float2(0.0);
+  }
 
   return out;
 }
@@ -409,22 +474,45 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
 
   // Match vtkOpenGLPolyDataMapper: backfaces flip the geometric normal (so
   // lighting sees the outward normal) and, when a backface property is set,
-  // swap in the backface material.
+  // swap in the backface material. The material swap is compile-time gated on
+  // kHasBackface; without a backface property the backface fields mirror the
+  // front ones, so skipping the swap is equivalent (and matches GL).
   float3 N = normalize(in.viewNormal);
   MaterialUniforms m = material;
   if (!frontFacing)
   {
     N = -N;
-    m.ambientColor = material.backfaceAmbientColor;
-    m.diffuseColor = material.backfaceDiffuseColor;
-    m.specularColor = material.backfaceSpecularColor;
-    m.color = material.backfaceColor;
-    m.opacity = material.backfaceOpacity;
-    m.specularPower = material.backfaceSpecularPower;
+    if (kHasBackface)
+    {
+      m.ambientColor = material.backfaceAmbientColor;
+      m.diffuseColor = material.backfaceDiffuseColor;
+      m.specularColor = material.backfaceSpecularColor;
+      m.color = material.backfaceColor;
+      m.opacity = material.backfaceOpacity;
+      m.specularPower = material.backfaceSpecularPower;
+    }
   }
 
-  ResolvedMaterial r = resolveMaterial(m, scene, in.vertexColor, in.uv, actorTexture, actorSampler);
-  applySurfaceEdges(N, r, in, lights, edge, scene);
+  // Feature-conditional material resolution (compile-time via function
+  // constants): the lean surface variant skips resolveMaterial/applySurfaceEdges
+  // entirely, matching what GL's shader-template substitution produces for a
+  // plain opaque surface.
+  ResolvedMaterial r;
+  if (kHasSurfaceColors || kHasActorTexture || kHasSurfaceAlpha)
+  {
+    r = resolveMaterial(m, scene, in.vertexColor, in.uv, actorTexture, actorSampler);
+  }
+  else
+  {
+    r.ambient = m.ambientColor.rgb;
+    r.diffuse = m.diffuseColor.rgb;
+    r.opacity = m.opacity;
+  }
+
+  if (kHasEdgeFlags)
+  {
+    applySurfaceEdges(N, r, in, lights, edge, scene);
+  }
 
   float3 totalAmbient = m.ambientColor.w * r.ambient;
   float3 totalDiffuse = float3(0.0);
@@ -434,8 +522,11 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
 
   FragmentOutput out;
   out.color = float4(totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular, r.opacity);
-  out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
-  
+  if (kEmitIds)
+  {
+    out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
+  }
+
   float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
   out.depth = in.position.z + coinOffset.polygonFactor * cscale + coinOffset.polygonOffset / 65000.0;
   return out;

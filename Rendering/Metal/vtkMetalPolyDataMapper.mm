@@ -43,6 +43,7 @@
 #include <unordered_map>
 #import <QuartzCore/CAMetalLayer.h>
 
+#include <map>
 #include <vector>
 #include <unordered_map>
 #include <cmath>
@@ -154,6 +155,27 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
 
   id<MTLRenderPipelineState> TrianglePipeline = nil;
   id<MTLRenderPipelineState> LinePipeline = nil;
+
+  // Surface pipeline specialization (the "GL way"): one shader source,
+  // specialized per feature set at pipeline creation via function constants.
+  // TriangleSurfacePipelines caches one pipeline per feature mask, so a plain
+  // opaque surface (no scalar colors, no actor texture, no alpha, no backface
+  // material, no single-pass edges) compiles to a lean program with no
+  // vertexColor/uv/edge/ID varying traffic or fragment work — matching what
+  // GL's shader-template substitution produces. The emit-IDs bit is set when a
+  // hardware selector is active. Bits map 1:1 to the shader's function
+  // constant indices (kHasSurfaceColors..kEmitIds in MetalShaders.metal).
+  enum : uint32_t
+  {
+    kSurfaceFeatureColors = 1u << 0,
+    kSurfaceFeatureTexture = 1u << 1,
+    kSurfaceFeatureAlpha = 1u << 2,
+    kSurfaceFeatureBackface = 1u << 3,
+    kSurfaceFeatureEdges = 1u << 4,
+    kSurfaceFeatureEmitIds = 1u << 5,
+  };
+  uint32_t SurfaceFeatureMask = 0;
+  std::map<uint32_t, id<MTLRenderPipelineState>> TriangleSurfacePipelines;
 
   // P5-5A: Actor texture and sampler for texture mapping
   id<MTLTexture> ActorTexture = nil;
@@ -375,6 +397,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   bool BundleOITActive = false;
   vtkMTimeType BundleTextureMTime = 0;
   bool BundleHasActorTexture = false;
+  bool BundleSelectorActive = false;
 
   bool BundleVertexVisibility = false;
   float BundlePointSize = -1.0f;
@@ -424,6 +447,11 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     InvalidateRenderBundle();
     vtkMetalMRC::ReleaseAndNil(TrianglePipeline);
     vtkMetalMRC::ReleaseAndNil(LinePipeline);
+    for (auto& entry : TriangleSurfacePipelines)
+    {
+      [entry.second release];
+    }
+    TriangleSurfacePipelines.clear();
     vtkMetalMRC::ReleaseAndNil(PointPipeline);
     vtkMetalMRC::ReleaseAndNil(PointShapedPipeline);
     vtkMetalMRC::ReleaseAndNil(EdgePipeline);
@@ -454,6 +482,8 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     vtkMetalMRC::ReleaseAndNil(LineIndexBuffer);
     vtkMetalMRC::ReleaseAndNil(SurfaceColorBuffer);
     HasSurfaceColors = false;
+    HasSurfaceAlpha = false;
+    SurfaceFeatureMask = 0;
     vtkMetalMRC::ReleaseAndNil(TriangleUVBuffer);
 
     vtkMetalMRC::ReleaseAndNil(ActorTexture);
@@ -555,6 +585,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     BundlePeelMode = 0;
     BundleTextureMTime = 0;
     BundleHasActorTexture = false;
+    BundleSelectorActive = false;
     BundleVertexVisibility = false;
     BundlePointSize = -1.0f;
     BundleRenderPointsAsSpheres = false;
@@ -935,7 +966,22 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
     }
     else
     {
-      recordPipeline(this->Internals->TrianglePipeline);
+      // Surface pipeline specialized to the current feature set (the "GL way"):
+      // computed per-frame in RenderPiece; the emit-IDs bit is added when a
+      // hardware selector is active. The variant is created in
+      // EnsurePipelineStates and cached; fall back to the full pipeline if the
+      // specialized one is missing.
+      const bool selectorActive = (ren->GetSelector() != nullptr);
+      const uint32_t drawMask = this->Internals->SurfaceFeatureMask |
+        (selectorActive ? this->Internals->kSurfaceFeatureEmitIds : 0u);
+      auto it = this->Internals->TriangleSurfacePipelines.find(drawMask);
+      id<MTLRenderPipelineState> triPipeline =
+        (it != this->Internals->TriangleSurfacePipelines.end()) ? it->second : nil;
+      if (!triPipeline)
+      {
+        triPipeline = this->Internals->TrianglePipeline;
+      }
+      recordPipeline(triPipeline);
     }
     if (!skipTriangleDraw)
     {
@@ -1724,6 +1770,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   this->Internals->BundleOITActive = oitActive;
   this->Internals->BundleTextureMTime = this->Internals->CachedTextureMTime;
   this->Internals->BundleHasActorTexture = hasActorTexture;
+  this->Internals->BundleSelectorActive = (ren->GetSelector() != nullptr);
   this->Internals->BundleVertexVisibility = vertexVisibility;
   this->Internals->BundlePointSize = pointSize;
   this->Internals->BundleRenderPointsAsSpheres = renderPointsAsSpheres;
@@ -1903,6 +1950,40 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       this->BuildGeometryBuffers((void*)device, input, act);
     }
 
+    // Keep the actor texture up to date before computing the surface feature
+    // mask and scene flags: a textured actor must never take a texture-less
+    // surface pipeline, including on the first frame before the texture upload.
+    this->UpdateActorTexture((void*)device, act);
+
+    // Surface feature mask (the "GL way"): mirrors the feature set GL conditions
+    // on when it compiles a surface shader. The mask keys the specialized
+    // triangle pipelines; a plain opaque surface (no scalar colors, no texture,
+    // no alpha, no backface property, no single-pass edges) yields a lean
+    // program. The emit-IDs bit is added at draw time when a hardware selector
+    // is active.
+    uint32_t featureMask = 0;
+    if (this->Internals->HasSurfaceColors)
+    {
+      featureMask |= this->Internals->kSurfaceFeatureColors;
+    }
+    if (this->Internals->ActorTexture)
+    {
+      featureMask |= this->Internals->kSurfaceFeatureTexture;
+    }
+    if (this->Internals->HasSurfaceAlpha)
+    {
+      featureMask |= this->Internals->kSurfaceFeatureAlpha;
+    }
+    if (act->GetBackfaceProperty() != nullptr)
+    {
+      featureMask |= this->Internals->kSurfaceFeatureBackface;
+    }
+    if (this->Internals->SurfaceUsesIndexedEntry)
+    {
+      featureMask |= this->Internals->kSurfaceFeatureEdges;
+    }
+    this->Internals->SurfaceFeatureMask = featureMask;
+
     // P3-3A: Track line width changes (buffer updated at draw time)
     this->Internals->CachedLineWidth = lineWidth;
 
@@ -2039,9 +2120,6 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
 
       float ptSize = static_cast<float>(act->GetProperty()->GetPointSize());
       *reinterpret_cast<float*>(buf + 260) = ptSize;
-
-      // Update actor texture before computing flags so the flag reflects current state
-      this->UpdateActorTexture((void*)device, act);
 
       // Merge actor render option flags into SceneUniforms flags (offset 256).
       // Bit 0: parallel projection (set by camera)
@@ -2205,6 +2283,11 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     int currentPeelMode = renWin->DepthPeelingMode;
     bool currentOITActive = renWin->OITActive;
 
+    // The surface pipeline's picking-ID output depends on whether a hardware
+    // selector is active (selector passes need the RGBA32Uint IDs attachment),
+    // so the bundle must be rebuilt when that state flips.
+    bool currentSelectorActive = (ren->GetSelector() != nullptr);
+
     bool bundleValid =
         this->Internals->Bundle.Valid &&
         this->Internals->BundleGeometryMTime == this->Internals->CachedInputMTime &&
@@ -2216,6 +2299,7 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         this->Internals->BundleOITActive == currentOITActive &&
         this->Internals->BundleTextureMTime == textureMTime &&
         this->Internals->BundleHasActorTexture == hasActorTexture &&
+        this->Internals->BundleSelectorActive == currentSelectorActive &&
         this->Internals->BundleVertexVisibility == vertexVisibility &&
         this->Internals->BundlePointSize == pointSize &&
         this->Internals->BundleRenderPointsAsSpheres == renderPointsAsSpheres &&
@@ -2271,6 +2355,11 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       this->Internals->CachedSurfaceUsesIndexedEntry)
   {
     vtkMetalMRC::ReleaseAndNil(this->Internals->TrianglePipeline);
+    for (auto& entry : this->Internals->TriangleSurfacePipelines)
+    {
+      [entry.second release];
+    }
+    this->Internals->TriangleSurfacePipelines.clear();
     vtkMetalMRC::ReleaseAndNil(this->Internals->TriangleInitPeelPipeline);
     vtkMetalMRC::ReleaseAndNil(this->Internals->TrianglePeelPipeline);
     vtkMetalMRC::ReleaseAndNil(this->Internals->TriangleOITPipeline);
@@ -3407,9 +3496,13 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
         // When normals are computed per-face, each vertex gets the face normal of
         // whichever triangle first emits it, so deduplication would produce incorrect
         // normals for vertices shared between faces with different orientations.
-        // When cellFlag != 0 (per-cell coloring), vertices at the same point may
+        // When cellFlag != 0 with per-cell colors, vertices at the same point may
         // have different colors from different cells, so no deduplication is possible.
-        bool useIndexBuffer = (cellFlag == 0) && normalArray && !hasCellAssociatedExtraAttrs;
+        // A null mappedColors (no scalars) is uniform per actor, so dedup is safe
+        // there too — matching GL, which indexes the polydata's own points and never
+        // expands to 3 vertices per triangle.
+        bool useIndexBuffer = normalArray && !hasCellAssociatedExtraAttrs &&
+          (cellFlag == 0 || mappedColors == nullptr);
 
         for (vtkIdType i = 1; i < npts - 1; ++i)
         {
@@ -4498,11 +4591,6 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
 //------------------------------------------------------------------------------
 void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
 {
-  if (this->Internals->TrianglePipeline && this->Internals->LinePipeline)
-  {
-    return;
-  }
-
   // 8A: Use cached sample count (set by RenderPiece before this call)
   int sampleCount = this->Internals->CachedSampleCount > 0 ? this->Internals->CachedSampleCount : 1;
 
@@ -4522,14 +4610,145 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
     return;
   }
 
-  id<MTLFunction> vertexFunc = [library newFunctionWithName:@"vertex_main"];
-  id<MTLFunction> fragmentFunc = [library newFunctionWithName:@"fragment_main"];
+  // Specialized surface pipelines (the "GL way"): one shader source specialized
+  // per feature set at pipeline creation via function constants. The current
+  // feature mask (computed per-frame in RenderPiece) plus its emit-IDs variant
+  // are ensured, so a plain opaque surface compiles to a lean program — no
+  // vertexColor/uv/edge/ID varying traffic or fragment work — and selector
+  // toggling never rebuilds mid-frame. The base TrianglePipeline (full feature
+  // set via default function constants) remains for the peel/OIT/edge/line
+  // passes.
+  {
+    const uint32_t masks[2] = { this->Internals->SurfaceFeatureMask,
+      this->Internals->SurfaceFeatureMask | this->Internals->kSurfaceFeatureEmitIds };
+    for (uint32_t mask : masks)
+    {
+      if (this->Internals->TriangleSurfacePipelines.count(mask) != 0)
+      {
+        continue;
+      }
+
+      const bool emitIds = (mask & this->Internals->kSurfaceFeatureEmitIds) != 0u;
+      const bool indexedEntry = (mask & this->Internals->kSurfaceFeatureEdges) != 0u;
+      const char* vName = indexedEntry ? "vertex_main_indexed" : "vertex_main";
+
+      MTLFunctionConstantValues* consts = [[MTLFunctionConstantValues alloc] init];
+      BOOL cv;
+      cv = (mask & this->Internals->kSurfaceFeatureColors) ? YES : NO;
+      [consts setConstantValue:&cv type:MTLDataTypeBool atIndex:6];
+      cv = (mask & this->Internals->kSurfaceFeatureTexture) ? YES : NO;
+      [consts setConstantValue:&cv type:MTLDataTypeBool atIndex:7];
+      cv = (mask & this->Internals->kSurfaceFeatureAlpha) ? YES : NO;
+      [consts setConstantValue:&cv type:MTLDataTypeBool atIndex:8];
+      cv = (mask & this->Internals->kSurfaceFeatureBackface) ? YES : NO;
+      [consts setConstantValue:&cv type:MTLDataTypeBool atIndex:9];
+      cv = (mask & this->Internals->kSurfaceFeatureEdges) ? YES : NO;
+      [consts setConstantValue:&cv type:MTLDataTypeBool atIndex:10];
+      cv = emitIds ? YES : NO;
+      [consts setConstantValue:&cv type:MTLDataTypeBool atIndex:11];
+
+      NSError* error = nil;
+      id<MTLFunction> vFunc =
+        [library newFunctionWithName:@(vName) constantValues:consts error:&error];
+      if (!vFunc)
+      {
+        vtkErrorMacro(<< "Specialized surface vertex function: "
+          << [[error localizedDescription] UTF8String]);
+        [consts release];
+        continue;
+      }
+      id<MTLFunction> fFunc =
+        [library newFunctionWithName:@"fragment_main" constantValues:consts error:&error];
+      [consts release];
+      if (!fFunc)
+      {
+        vtkErrorMacro(<< "Specialized surface fragment function: "
+          << [[error localizedDescription] UTF8String]);
+        [vFunc release];
+        continue;
+      }
+
+      MTLRenderPipelineDescriptor* specDesc = [[MTLRenderPipelineDescriptor alloc] init];
+      specDesc.vertexFunction = vFunc;
+      specDesc.fragmentFunction = fFunc;
+      if (!indexedEntry)
+      {
+        MTLVertexDescriptor* vd = [[MTLVertexDescriptor alloc] init];
+        vd.attributes[0].format = MTLVertexFormatFloat3;
+        vd.attributes[0].offset = 0;
+        vd.attributes[0].bufferIndex = 0;
+        vd.attributes[1].format = MTLVertexFormatFloat3;
+        vd.attributes[1].offset = 0;
+        vd.attributes[1].bufferIndex = 1;
+        vd.layouts[0].stride = sizeof(float) * 3;
+        vd.layouts[0].stepRate = 1;
+        vd.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
+        vd.layouts[1].stride = sizeof(float) * 3;
+        vd.layouts[1].stepRate = 1;
+        vd.layouts[1].stepFunction = MTLVertexStepFunctionPerVertex;
+        specDesc.vertexDescriptor = vd;
+        [vd release];
+      }
+      specDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      // 8A: Skip IDs attachment when MSAA is active — render pass only has 1 color attachment
+      if (emitIds && sampleCount <= 1)
+      {
+        specDesc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+      }
+      specDesc.colorAttachments[0].blendingEnabled = YES;
+      specDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+      specDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+      specDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+      specDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+      specDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+      specDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+      specDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+      specDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+      specDesc.rasterSampleCount = sampleCount;
+
+      id<MTLRenderPipelineState> pipeline =
+        [device newRenderPipelineStateWithDescriptor:specDesc error:&error];
+      if (!pipeline)
+      {
+        vtkErrorMacro(<< "Specialized surface triangle pipeline: "
+          << [[error localizedDescription] UTF8String]);
+      }
+      else
+      {
+        this->Internals->TriangleSurfacePipelines[mask] = pipeline;
+      }
+      [specDesc release];
+      [vFunc release];
+      [fFunc release];
+    }
+  }
+
+  if (this->Internals->TrianglePipeline && this->Internals->LinePipeline)
+  {
+    return;
+  }
+
+  // All non-specialized pipelines (base triangle/line, edge, peel, OIT) need
+  // the full feature set since Metal function constants have no default values;
+  // build an all-true constant set for them.
+  NSError* error = nil;
+  MTLFunctionConstantValues* fullConsts = [[MTLFunctionConstantValues alloc] init];
+  BOOL cv = YES;
+  for (NSUInteger idx = 6; idx <= 11; ++idx)
+  {
+    [fullConsts setConstantValue:&cv type:MTLDataTypeBool atIndex:idx];
+  }
+
+  id<MTLFunction> vertexFunc =
+    [library newFunctionWithName:@"vertex_main" constantValues:fullConsts error:&error];
+  id<MTLFunction> fragmentFunc =
+    [library newFunctionWithName:@"fragment_main" constantValues:fullConsts error:&error];
 
   // Single-pass surface edges: when the indexed entry is active the triangle
   // pipeline reads deduplicated arrays through the index buffer (no stage_in).
   const bool indexedEntry = this->Internals->SurfaceUsesIndexedEntry;
   id<MTLFunction> triVertexFunc = indexedEntry
-    ? [library newFunctionWithName:@"vertex_main_indexed"]
+    ? [library newFunctionWithName:@"vertex_main_indexed" constantValues:fullConsts error:&error]
     : vertexFunc;
 
   if (!vertexFunc || !fragmentFunc || !triVertexFunc)
@@ -4592,7 +4811,6 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
 
   if (!this->Internals->TrianglePipeline)
   {
-    NSError* error = nil;
     this->Internals->TrianglePipeline =
       [device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
     if (!this->Internals->TrianglePipeline)
@@ -4608,7 +4826,6 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
 
   if (!this->Internals->LinePipeline)
   {
-    NSError* error = nil;
     this->Internals->LinePipeline =
       [device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
     if (!this->Internals->LinePipeline)
@@ -4623,6 +4840,7 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   {
     [triVertexFunc release];
   }
+  [fullConsts release];
   [vertexDesc release];
   [pipelineDesc release];
 }
@@ -4767,7 +4985,16 @@ void vtkMetalPolyDataMapper::EnsureEdgePipelineState(void* mtlDevice)
   // Edge pipeline uses vertex_main + fragment_edge_main
   // vertex_main: transforms position, outputs vertex color
   // fragment_edge_main: outputs flat edge color from uniform
-  id<MTLFunction> vFunc = [library newFunctionWithName:@"vertex_main"];
+  NSError* edgeError = nil;
+  MTLFunctionConstantValues* fullConsts = [[MTLFunctionConstantValues alloc] init];
+  BOOL cv = YES;
+  for (NSUInteger idx = 6; idx <= 11; ++idx)
+  {
+    [fullConsts setConstantValue:&cv type:MTLDataTypeBool atIndex:idx];
+  }
+  id<MTLFunction> vFunc =
+    [library newFunctionWithName:@"vertex_main" constantValues:fullConsts error:&edgeError];
+  [fullConsts release];
   id<MTLFunction> fFunc = [library newFunctionWithName:@"fragment_edge_main"];
   if (vFunc && fFunc)
   {
@@ -5040,9 +5267,17 @@ void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
   }
 
   const bool indexedEntry = this->Internals->SurfaceUsesIndexedEntry;
+  NSError* peelError = nil;
+  MTLFunctionConstantValues* fullConsts = [[MTLFunctionConstantValues alloc] init];
+  BOOL cv = YES;
+  for (NSUInteger idx = 6; idx <= 11; ++idx)
+  {
+    [fullConsts setConstantValue:&cv type:MTLDataTypeBool atIndex:idx];
+  }
   id<MTLFunction> vertexFunc = indexedEntry
-    ? [library newFunctionWithName:@"vertex_main_indexed"]
-    : [library newFunctionWithName:@"vertex_main"];
+    ? [library newFunctionWithName:@"vertex_main_indexed" constantValues:fullConsts error:&peelError]
+    : [library newFunctionWithName:@"vertex_main" constantValues:fullConsts error:&peelError];
+  [fullConsts release];
   if (!vertexFunc)
   {
     return;
@@ -5207,9 +5442,17 @@ void vtkMetalPolyDataMapper::EnsureOITPipelineStates(void* mtlDevice)
   }
 
   const bool indexedEntry = this->Internals->SurfaceUsesIndexedEntry;
+  NSError* oitError = nil;
+  MTLFunctionConstantValues* fullConsts = [[MTLFunctionConstantValues alloc] init];
+  BOOL cv = YES;
+  for (NSUInteger idx = 6; idx <= 11; ++idx)
+  {
+    [fullConsts setConstantValue:&cv type:MTLDataTypeBool atIndex:idx];
+  }
   id<MTLFunction> vertexFunc = indexedEntry
-    ? [library newFunctionWithName:@"vertex_main_indexed"]
-    : [library newFunctionWithName:@"vertex_main"];
+    ? [library newFunctionWithName:@"vertex_main_indexed" constantValues:fullConsts error:&oitError]
+    : [library newFunctionWithName:@"vertex_main" constantValues:fullConsts error:&oitError];
+  [fullConsts release];
   id<MTLFunction> fragFunc = [library newFunctionWithName:@"fragment_main_oit"];
   if (!vertexFunc || !fragFunc)
   {

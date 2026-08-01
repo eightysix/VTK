@@ -10,6 +10,7 @@
 // Usage:
 //   vtkMetalGLVisualComparison [--out <dir>] [--threshold <value>]
 //     [--scene <name>] [--backend gl|metal] [--bench] [--frames <n>] [--reps <n>]
+//     [--complexity]
 //
 // The default output directory is "visual_compare" under the current working
 // directory. When --threshold is given, the process exits non-zero if any
@@ -26,6 +27,12 @@
 // given number of times and reports the mean of the per-run averages plus the
 // run-to-run standard deviation, which dilutes the noise (thermal/background
 // load on laptops) that shows up in single runs.
+//
+// --complexity additionally benchmarks the kBenchScenes complexity-scaling
+// scenes (GPU-bound geometry, CPU-bound draw-call count, depth-peel count, and
+// volume size). These are bench-only and do not participate in the visual
+// comparison, so the canonical --bench table is unchanged unless the flag is
+// passed.
 //
 // Note: the OpenGL backend needs the vtkShaderProgram object-factory override
 // (vtkOpenGLShaderProgram), so vtkRenderingOpenGL2 and vtkRenderingVolumeOpenGL2
@@ -55,6 +62,7 @@ VTK_MODULE_INIT(vtkRenderingVolumeOpenGL2);
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <vector>
@@ -100,6 +108,37 @@ const SceneSpec kScenes[] = {
   { "PolyDataMapper2D", vtkMetalScenes::BuildPolyDataMapper2DScene, 600, 300 },
   { "Texture", vtkMetalScenes::BuildTextureScene, 600, 300 },
   { "VolumeRayCast", vtkMetalScenes::BuildVolumeScene, 400, 400 },
+};
+
+// Complexity-scaling scenes, benchmark-only. Registered behind --complexity so
+// the canonical --bench output (used to regenerate the doc table) is
+// unchanged. Each scene grows one workload axis: GPU-bound geometry, CPU-bound
+// draw-call count, depth-peel count, and volume size.
+const SceneSpec kBenchScenes[] = {
+  { "CpxGeomLo", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
+      vtkMetalScenes::BuildGeometryGridScene(r, b, 4, 30);
+    }, 800, 800 },
+  { "CpxGeomHi", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
+      vtkMetalScenes::BuildGeometryGridScene(r, b, 10, 60);
+    }, 800, 800 },
+  { "CpxActorLo", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
+      vtkMetalScenes::BuildActorGridScene(r, b, 8);
+    }, 800, 800 },
+  { "CpxActorHi", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
+      vtkMetalScenes::BuildActorGridScene(r, b, 32);
+    }, 800, 800 },
+  { "CpxPeel3", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
+      vtkMetalScenes::BuildPeelChainScene(r, b, 3);
+    }, 400, 400 },
+  { "CpxPeel12", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
+      vtkMetalScenes::BuildPeelChainScene(r, b, 12);
+    }, 400, 400 },
+  { "CpxVol64", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
+      vtkMetalScenes::BuildVolumeSceneSized(r, b, 64);
+    }, 400, 400 },
+  { "CpxVol128", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
+      vtkMetalScenes::BuildVolumeSceneSized(r, b, 128);
+    }, 400, 400 },
 };
 
 // Render one scene with one backend and write an RGB PNG. Returns the image.
@@ -310,6 +349,9 @@ int main(int argc, char* argv[])
   int benchFrames = 30;
   int benchReps = 1;
   int warmupFrames = 0;
+  bool complexity = false;
+  int sizeW = 0;
+  int sizeH = 0;
   for (int i = 1; i < argc; ++i)
   {
     std::string arg = argv[i];
@@ -344,6 +386,16 @@ int main(int argc, char* argv[])
     else if (arg == "--warmup" && i + 1 < argc)
     {
       warmupFrames = std::atoi(argv[++i]);
+    }
+    else if (arg == "--complexity")
+    {
+      complexity = true;
+    }
+    else if (arg == "--size" && i + 1 < argc)
+    {
+      // Override the window size for the benchmark scenes (e.g. "400x400"),
+      // used to decompose per-vertex vs per-fragment cost.
+      std::sscanf(argv[++i], "%dx%d", &sizeW, &sizeH);
     }
     else
     {
@@ -449,7 +501,20 @@ int main(int argc, char* argv[])
                    "GL ms/f   GL fps   Metal ms/f  Metal fps    M/GL\n";
     }
     std::cout << "-------------------------------------------------------------------\n";
-    for (const SceneSpec& spec : kScenes)
+    std::vector<SceneSpec> benchScenes(std::begin(kScenes), std::end(kScenes));
+    if (complexity)
+    {
+      benchScenes.insert(benchScenes.end(), std::begin(kBenchScenes), std::end(kBenchScenes));
+    }
+    if (sizeW > 0 && sizeH > 0)
+    {
+      for (SceneSpec& spec : benchScenes)
+      {
+        spec.Width = sizeW;
+        spec.Height = sizeH;
+      }
+    }
+    for (const SceneSpec& spec : benchScenes)
     {
       if (!sceneFilter.empty() && sceneFilter != spec.Name)
       {

@@ -23,6 +23,7 @@
 
 #include "vtkActor.h"
 #include "vtkActor2D.h"
+#include "vtkAppendPolyData.h"
 #include "vtkCamera.h"
 #include "vtkCellArray.h"
 #include "vtkCocoaMetalRenderWindow.h"
@@ -793,6 +794,149 @@ inline void BuildVolumeScene(vtkRenderer* renderer, BackendKind b)
   renderer->GetActiveCamera()->Azimuth(30);
   renderer->GetActiveCamera()->Elevation(-40);
   renderer->GetActiveCamera()->Azimuth(-60);
+}
+
+// TestMetalVolumeRayCast with a parameterized volume extent.
+inline void BuildVolumeSceneSized(vtkRenderer* renderer, BackendKind b, int dim)
+{
+  vtkNew<vtkRTAnalyticSource> source;
+  source->SetWholeExtent(0, dim, 0, dim, 0, dim);
+  source->SetCenter(dim / 2, dim / 2, dim / 2);
+
+  vtkNew<vtkColorTransferFunction> color;
+  color->AddRGBPoint(0.0, 0.0, 0.0, 0.0);
+  color->AddRGBPoint(0.25, 1.0, 0.0, 0.0);
+  color->AddRGBPoint(0.75, 0.0, 1.0, 0.0);
+  color->AddRGBPoint(1.0, 0.0, 0.0, 1.0);
+
+  vtkNew<vtkPiecewiseFunction> opacity;
+  opacity->AddPoint(0.0, 0.0);
+  opacity->AddPoint(0.5, 0.15);
+  opacity->AddPoint(1.0, 0.9);
+
+  vtkNew<vtkVolumeProperty> property;
+  property->SetColor(color);
+  property->SetScalarOpacity(opacity);
+  property->ShadeOn();
+  property->SetAmbient(0.2);
+  property->SetDiffuse(0.8);
+  property->SetSpecular(0.3);
+
+  vtkSmartPointer<vtkGPUVolumeRayCastMapper> mapper = NewVolumeMapper(b);
+  mapper->SetInputConnection(source->GetOutputPort());
+
+  vtkNew<vtkVolume> volume;
+  volume->SetMapper(mapper);
+  volume->SetProperty(property);
+  renderer->AddVolume(volume);
+
+  vtkSmartPointer<vtkCamera> camera = NewCamera(b);
+  renderer->SetActiveCamera(camera);
+  renderer->ResetCamera();
+  renderer->GetActiveCamera()->Elevation(20);
+  renderer->GetActiveCamera()->Azimuth(30);
+  renderer->GetActiveCamera()->Elevation(-40);
+  renderer->GetActiveCamera()->Azimuth(-60);
+}
+
+// ---- Complexity-scaling benchmark scenes ----------------------------------
+// These are registered in the harness's bench-only list (--complexity) to
+// probe how the Metal/GL timing ratio behaves as a single workload axis
+// grows. Four axes: GPU-bound geometry (merged into one draw call), CPU-bound
+// draw-call count (many actors), depth-peel count (overlapping translucent
+// spheres along the view axis), and volume size.
+
+// GPU-bound: a grid of spheres merged into a single polydata rendered by one
+// mapper/draw call, so the frame time is dominated by rasterization/fill
+// rather than per-draw overhead. n*n spheres, each res*res*2 triangles.
+inline void BuildGeometryGridScene(vtkRenderer* renderer, BackendKind b, int n, int res)
+{
+  vtkNew<vtkAppendPolyData> append;
+  const double spacing = 1.8;
+  for (int i = 0; i < n; ++i)
+  {
+    for (int j = 0; j < n; ++j)
+    {
+      vtkNew<vtkSphereSource> sphere;
+      sphere->SetThetaResolution(res);
+      sphere->SetPhiResolution(res);
+      sphere->SetRadius(0.8);
+      sphere->SetCenter(i * spacing, j * spacing, 0.0);
+      sphere->Update();
+      append->AddInputData(sphere->GetOutput());
+    }
+  }
+
+  vtkSmartPointer<vtkPolyDataMapper> mapper = NewPolyDataMapper(b);
+  mapper->SetInputConnection(append->GetOutputPort());
+  vtkSmartPointer<vtkActor> actor = NewActor(b);
+  ConfigureActor(actor, b);
+  actor->SetMapper(mapper);
+  renderer->AddActor(actor);
+
+  vtkSmartPointer<vtkCamera> camera = NewCamera(b);
+  renderer->SetActiveCamera(camera);
+  renderer->ResetCamera();
+}
+
+// CPU-bound: an n*n grid of spheres, each its own mapper and actor, so the
+// frame time is dominated by per-actor draw-call/state-change overhead rather
+// than fill rate (small, cheap spheres).
+inline void BuildActorGridScene(vtkRenderer* renderer, BackendKind b, int n)
+{
+  const double spacing = 1.5;
+  for (int i = 0; i < n; ++i)
+  {
+    for (int j = 0; j < n; ++j)
+    {
+      vtkNew<vtkSphereSource> sphere;
+      sphere->SetThetaResolution(8);
+      sphere->SetPhiResolution(8);
+      sphere->SetRadius(0.55);
+      vtkSmartPointer<vtkPolyDataMapper> mapper = NewPolyDataMapper(b);
+      mapper->SetInputConnection(sphere->GetOutputPort());
+      vtkSmartPointer<vtkActor> actor = NewActor(b);
+      ConfigureActor(actor, b);
+      actor->SetMapper(mapper);
+      actor->SetPosition(i * spacing, j * spacing, 0.0);
+      renderer->AddActor(actor);
+    }
+  }
+
+  vtkSmartPointer<vtkCamera> camera = NewCamera(b);
+  renderer->SetActiveCamera(camera);
+  renderer->ResetCamera();
+}
+
+// Depth-peel count: n translucent spheres stacked along the view axis, so the
+// screen-space depth complexity at the center grows with n. GL pays one
+// blocking occlusion-query stall per peel; Metal's adaptive early exit does
+// not, so the ratio should widen as n grows.
+inline void BuildPeelChainScene(vtkRenderer* renderer, BackendKind b, int n)
+{
+  renderer->SetBackground(0.2, 0.2, 0.3);
+  renderer->SetBackground2(0.4, 0.2, 0.3);
+  renderer->GradientBackgroundOn();
+
+  vtkNew<vtkSphereSource> sphere;
+  sphere->SetThetaResolution(20);
+  sphere->SetPhiResolution(20);
+  for (int i = 0; i < n; ++i)
+  {
+    const double z = (n == 1) ? 0.0 : (2.0 * i / (n - 1) - 1.0);
+    const double r = 0.4 + 0.6 * i / n;
+    renderer->AddActor(MakeTranslucentSphere(b, sphere, 0.0, 0.0, z * 2.0, r, 0.6, 0.8, 0.35));
+  }
+
+  vtkSmartPointer<vtkCamera> camera = NewCamera(b);
+  renderer->SetActiveCamera(camera);
+  renderer->ResetCamera();
+  camera->Zoom(1.2);
+  renderer->ResetCameraClippingRange();
+
+  renderer->SetUseDepthPeeling(true);
+  renderer->SetMaximumNumberOfPeels(32);
+  renderer->SetOcclusionRatio(0.0);
 }
 
 } // namespace vtkMetalScenes

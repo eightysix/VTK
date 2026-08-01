@@ -289,6 +289,96 @@ Device-specific notes:
   table reproduces (worst 0.00653595, VolumeRayCast 0.007; PointRender's raw
   error drifts ±0.2 run-to-run while staying 0.000 thresholded).
 
+### Geometry-bound scenes (`--complexity`)
+
+The harness also registers `--complexity` scenes that scale one workload axis
+(documented in the source). The GPU-bound geometry scenes (`CpxGeomLo`/`CpxGeomHi`,
+a 4×4/10×10 grid of `vtkSphereSource` spheres merged into a single polydata,
+800×800) were the last Metal laggard: `CpxGeomHi` ran ~1.5× slower than GL while
+`CpxActorLo`/`CpxActorHi` (CPU-bound, per-actor draw calls) and the volume scenes
+were already at parity.
+
+The cause was not the fragment shader (the fill-rate hypothesis): the gap
+persisted down to a 1-pixel render, so it was vertex-side. Metal's CPU geometry
+path expanded every triangle to 3 non-indexed vertices (`TriangleVertexCount`
+2,088,000 = 3×696,000), while GL builds a vertex buffer from the polydata's own
+deduplicated points and indexes it (348,200 unique vertices — the strip-shared
+corners are processed once). Metal was running the vertex shader ~6× more often
+than GL (2,088,000 vs 348,200), plus the extra per-vertex bandwidth.
+
+The fix in `vtkMetalPolyDataMapper::BuildGeometryBuffers` relaxes the
+`useIndexBuffer` deduplication condition from `cellFlag == 0` (per-point
+coloring only) to also cover `cellFlag != 0` when `mappedColors == nullptr`
+(no scalars → uniform per-actor color), which is the common opaque case. The
+`cellFlag != 0` signal is a trap in this scene: `vtkAbstractMapper`'s
+`GetAbstractScalars` sets `cellFlag = 1` in the default scalar mode whenever
+point scalars are missing — even when cell scalars are also missing — while
+`vtkMapper::MapScalars` returns null for no scalars at all. So Metal saw
+`cellFlag != 0` and bailed on dedup even though the grid has no per-cell data
+whatsoever. GL never expands in this situation either: its `Colors` is null so
+`HaveCellScalars` stays false, the vertex buffer is the polydata's own points,
+and the fragment shader just uses the material color. With `mappedColors ==
+nullptr` there is nothing per-cell to differentiate, so dedup is safe and the
+buffers match GL. Result on this repo's machine (Apple M1 Mac mini — the same
+machine that reproduces the documented M1 VolumeRayCast residual 0.005):
+
+```
+scene                          GL ms/f   GL fps   Metal ms/f  Metal fps    M/GL
+-------------------------------------------------------------------
+CpxGeomLo                         0.79   1270.1        0.63     1588.7    0.80
+CpxGeomHi                         2.53    395.4        2.29      437.6    0.90
+CpxActorLo                        1.26    796.7        0.94     1063.4    0.75
+CpxActorHi                       12.84     77.9       12.51       79.9    0.97
+CpxPeel3                          4.29    233.1        1.12      892.6    0.26
+CpxPeel12                        12.89     77.6        3.57      279.8    0.28
+CpxVol64                          1.51    661.8        0.59     1686.7    0.39
+CpxVol128                         1.61    620.8        0.56     1776.3    0.35
+```
+
+`CpxGeomHi` went from M/GL ~1.46 to 0.90 (Metal now faster than GL); the rest of
+the table was already at or better than parity. The shared-vertex cell-id for
+picking in the dedup paths follows the existing first-wins convention (same as
+the GPU-tess and per-point-coloring dedup paths). What this fix does *not*
+cover — scenes with real per-cell colors — is described next.
+
+### The per-cell color caveat (the "cell-texture port")
+
+The dedup above only applies when there is nothing per-cell to differentiate.
+Scenes that genuinely carry per-cell colors still expand to 3 vertices per
+triangle in Metal, because Metal resolves the cell color in the **vertex**
+stage while GL resolves it in the **fragment** stage:
+
+- **GL** treats cell identity as a per-*primitive* quantity delivered by
+  hardware. `AppendCellTextures` packs one RGBA texel per output primitive into
+  a texture buffer, where each texel is its owning cell's color
+  (`newColors[i] = Colors[ccmap->GetValue(i)]`, `vtkOpenGLPolyDataMapper.cxx`)
+  and `CellCellMap` + `PrimitiveIDOffset` map strips and polygon fans back to
+  their cells. The fragment shader fetches it with
+  `texelFetchBuffer(textureC, gl_PrimitiveID + PrimitiveIDOffset)` —
+  `gl_PrimitiveID` is the index of the triangle being rasterized, so it is
+  unambiguous even though vertices are shared across cells. The vertex buffer
+  therefore stays point-indexed whether the color is per-point, per-cell, or
+  absent.
+- **Metal** carries both the color and the cell id as per-*vertex* attributes:
+  `emitSurfaceColor(polyCellIdx, ...)` bakes the cell's RGBA into the vertex at
+  geometry-build time, and the cell id is a flat-interpolated vertex attribute
+  in the shader. A shared corner belongs to multiple cells, so it has no single
+  cell id or color and the vertex must be duplicated per triangle. The fragment
+  reads the flat-interpolated provoking-vertex value, so a deduplicated corner
+  would be ambiguous → wrong color.
+
+Porting the cell-texture path to Metal would mean: stop writing cell colors
+into the vertex stream when `cellFlag != 0`; allow dedup even when
+`mappedColors != nullptr`; upload the per-primitive RGBA to a Metal
+texture/buffer; and resolve the cell id per-primitive in `fragment_main` (e.g.
+MSL `[[primitive_id]]`, the direct analog of `gl_PrimitiveID`, indexing a
+per-primitive cell-id buffer), gated behind a new function constant like
+`kHasCellTexture`. The payoff is the same class of win as `CpxGeomHi` for
+per-cell-colored scenes (3× vertices → point count) plus exact per-pixel cell
+ids for picking (GL parity) instead of first-wins. The current behavior is
+correct — just heavier on the vertex stage — so this is an optimization and a
+picking-exactness fix, not a correctness fix.
+
 ### Recording another machine
 
 To add a machine, run the command above (`--bench --frames 30 --reps 3`), then
