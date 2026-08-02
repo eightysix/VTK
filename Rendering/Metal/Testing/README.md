@@ -123,12 +123,17 @@ Notes:
      A missing baseline makes the test fail with an `ImageNotFound` measurement
      and writes the rendered image to
      `build_macos_metal/Testing/Temporary/<TestName>.png`.
-   - Copy that PNG to `Rendering/Metal/Testing/Data/Baseline/<TestName>.png`
-     and rebuild the data targets so ExternalData picks it up:
-     `ninja -C build_macos_metal VTKData`. ExternalData converts the plain PNG
-     into a tracked `.sha512` marker plus a content object in the repo
-     `.ExternalData/SHA512/` store (this also happens automatically during a
-     full `./macos_metal_build.sh` build). Re-run the test; it should pass.
+   - Copy that PNG to `Rendering/Metal/Testing/Data/Baseline/<TestName>.png`.
+     The first time a baseline is added, `ninja -C build_macos_metal VTKData`
+     stages it (ExternalData resolves it from the committed `.ExternalData/`
+     store into the build tree). Re-run the test; it should pass.
+   - To store the object and produce the tracked `.sha512` marker
+     (`<new-hash>` = `shasum -a 512 <TestName>.png`):
+     - `cp <TestName>.png .ExternalData/SHA512/<new-hash>`
+     - `shasum -a 512 <TestName>.png > Rendering/Metal/Testing/Data/Baseline/<TestName>.png.sha512`
+     - Remove the stale staged copy so the test re-resolves the new object:
+       `rm -f build_macos_metal/ExternalData/Rendering/Metal/Testing/Data/Baseline/<TestName>.png*`
+       then `ninja -C build_macos_metal VTKData`.
 
 ## Baseline management
 
@@ -147,8 +152,12 @@ Notes:
   missing; it regenerates the image in `build_macos_metal/Testing/Temporary/`.
 - If a renderer change intentionally alters the output, update the baseline
   deliberately: run the test, review the generated PNG, copy it into
-  `Rendering/Metal/Testing/Data/Baseline/`, run `ninja -C build_macos_metal
-  VTKData`, and commit the updated `.sha512` + store objects.
+  `Rendering/Metal/Testing/Data/Baseline/`, then re-hash it into the store and
+  `.sha512` marker as described in step 5 above, and commit the updated
+  `.sha512` + store objects. Note `ninja VTKData` only stages already-known
+  objects into the build tree; it does **not** re-derive `.sha512` markers from
+  new PNGs — that is a manual `shasum` + store-copy step (or the git pre-commit
+  hook when one is installed).
 
 ## Current limitations
 

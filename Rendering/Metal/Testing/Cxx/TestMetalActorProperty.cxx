@@ -60,7 +60,7 @@ int TestMetalActorProperty(int argc, char* argv[])
   {
     return EXIT_FAILURE;
   }
-  if (!vtkMetalTesting::VerifyRegionRendered(renWin, 160, 160, 239, 239, 500))
+  if (!vtkMetalTesting::VerifyRegionRendered(renWin, renderer, 160, 160, 239, 239, 500))
   {
     return EXIT_FAILURE;
   }
@@ -72,7 +72,7 @@ int TestMetalActorProperty(int argc, char* argv[])
   {
     return EXIT_FAILURE;
   }
-  if (!vtkMetalTesting::VerifyRegionRendered(renWin, 160, 160, 239, 239, 100))
+  if (!vtkMetalTesting::VerifyRegionRendered(renWin, renderer, 160, 160, 239, 239, 100))
   {
     return EXIT_FAILURE;
   }
@@ -84,7 +84,7 @@ int TestMetalActorProperty(int argc, char* argv[])
   {
     return EXIT_FAILURE;
   }
-  if (!vtkMetalTesting::VerifyRegionRendered(renWin, 160, 160, 239, 239, 50))
+  if (!vtkMetalTesting::VerifyRegionRendered(renWin, renderer, 160, 160, 239, 239, 50))
   {
     return EXIT_FAILURE;
   }
@@ -96,7 +96,7 @@ int TestMetalActorProperty(int argc, char* argv[])
   {
     return EXIT_FAILURE;
   }
-  if (!vtkMetalTesting::VerifyRegionRendered(renWin, 160, 160, 239, 239, 500))
+  if (!vtkMetalTesting::VerifyRegionRendered(renWin, renderer, 160, 160, 239, 239, 500))
   {
     return EXIT_FAILURE;
   }

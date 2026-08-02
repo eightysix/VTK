@@ -89,7 +89,7 @@ int TestMetalLight(int argc, char* argv[])
     return EXIT_FAILURE;
   }
 
-  if (!vtkMetalTesting::VerifyRegionRendered(renWin, 160, 160, 239, 239, 500))
+  if (!vtkMetalTesting::VerifyRegionRendered(renWin, renderer, 160, 160, 239, 239, 500))
   {
     return EXIT_FAILURE;
   }
@@ -102,7 +102,7 @@ int TestMetalLight(int argc, char* argv[])
     {
       return EXIT_FAILURE;
     }
-    if (!vtkMetalTesting::VerifyRegionRendered(renWin, 160, 160, 239, 239, 100))
+    if (!vtkMetalTesting::VerifyRegionRendered(renWin, renderer, 160, 160, 239, 239, 100))
     {
       std::cerr << "Rendering failed with " << renderer->GetLights()->GetNumberOfItems()
                 << " lights left" << std::endl;

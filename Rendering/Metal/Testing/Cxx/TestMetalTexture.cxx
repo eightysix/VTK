@@ -88,7 +88,7 @@ int TestMetalTexture(int argc, char* argv[])
   vtkMetalTesting::RenderAndWait(renWin);
 
   // The textured plane fills the viewport center.
-  if (!vtkMetalTesting::VerifyRegionRendered(renWin, 150, 75, 450, 225, 2000))
+  if (!vtkMetalTesting::VerifyRegionRendered(renWin, renderer, 150, 75, 450, 225, 2000))
   {
     std::cerr << "Textured plane did not fill the expected viewport region." << std::endl;
     return EXIT_FAILURE;
@@ -97,7 +97,7 @@ int TestMetalTexture(int argc, char* argv[])
   // Re-render: exercises the cached texture upload path.
   vtkMetalTesting::RenderAndWait(renWin);
 
-  if (!vtkMetalTesting::VerifyRegionRendered(renWin, 150, 75, 450, 225, 2000))
+  if (!vtkMetalTesting::VerifyRegionRendered(renWin, renderer, 150, 75, 450, 225, 2000))
   {
     std::cerr << "Textured plane rendering changed after a re-render." << std::endl;
     return EXIT_FAILURE;

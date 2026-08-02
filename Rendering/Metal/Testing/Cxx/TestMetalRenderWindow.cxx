@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) Ken Martin, Will Schroeder, Bill Lorensen
 // SPDX-License-Identifier: BSD-3-Clause
+#include "TestMetalHelpers.h"
+
 #include "vtkCocoaMetalRenderWindow.h"
 #include "vtkMetalActor.h"
 #include "vtkMetalCamera.h"
 #include "vtkMetalPolyDataMapper.h"
 #include "vtkMetalRenderer.h"
 #include "vtkNew.h"
-#include "vtkUnsignedIntArray.h"
 
 #include "vtkConeSource.h"
 #include "vtkRegressionTestImage.h"
@@ -63,32 +64,13 @@ int TestMetalRenderWindow(int argc, char* argv[])
   }
   renWin->WaitForCompletion();
 
-  // The IDs texture is written on every render pass, so a valid draw should
-  // produce non-zero cell/prop IDs in the center of the cone.
-  vtkNew<vtkUnsignedIntArray> ids;
-  renWin->GetIdsData(0, 0, 399, 399, ids);
-  if (ids->GetNumberOfTuples() == 0)
+  // A valid draw must put non-background pixels in the center of the cone.
+  // Verified via the color read-back (the same signal vtkRegressionTestImage
+  // compares) rather than the picking IDs texture, which the surface
+  // pipelines only populate during a hardware-selection pass.
+  if (!vtkMetalTesting::VerifyRegionRendered(renWin, renderer, 160, 160, 239, 239, 500))
   {
-    std::cerr << "GetIdsData returned no tuples" << std::endl;
-    return EXIT_FAILURE;
-  }
-
-  bool foundRender = false;
-  for (int y = 160; y < 240 && !foundRender; ++y)
-  {
-    for (int x = 160; x < 240; ++x)
-    {
-      vtkIdType index = y * 400 + x;
-      if (ids->GetComponent(index, 0) != 0 || ids->GetComponent(index, 1) != 0)
-      {
-        foundRender = true;
-        break;
-      }
-    }
-  }
-  if (!foundRender)
-  {
-    std::cerr << "No geometry drawn (all cell/prop IDs are zero)" << std::endl;
+    std::cerr << "No geometry drawn (center region is all background)" << std::endl;
     return EXIT_FAILURE;
   }
 

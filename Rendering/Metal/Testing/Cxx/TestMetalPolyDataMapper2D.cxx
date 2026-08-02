@@ -83,7 +83,7 @@ int TestMetalPolyDataMapper2D(int argc, char* argv[])
   }
 
   // The 3D cone (left half) must still render.
-  if (!vtkMetalTesting::VerifyRegionRendered(renWin, 80, 80, 240, 220, 200))
+  if (!vtkMetalTesting::VerifyRegionRendered(renWin, renderer, 80, 80, 240, 220, 200))
   {
     std::cerr << "3D geometry did not render alongside the 2D overlay." << std::endl;
     return EXIT_FAILURE;

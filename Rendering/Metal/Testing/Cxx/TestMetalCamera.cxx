@@ -88,7 +88,7 @@ int TestMetalCamera(int argc, char* argv[])
     return EXIT_FAILURE;
   }
 
-  if (!vtkMetalTesting::VerifyRegionRendered(renWin, 0, 0, 399, 399, 100))
+  if (!vtkMetalTesting::VerifyRegionRendered(renWin, renderer, 0, 0, 399, 399, 100))
   {
     return EXIT_FAILURE;
   }

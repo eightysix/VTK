@@ -106,23 +106,23 @@ int TestMetalCompositePolyDataMapper(int argc, char* argv[])
     return EXIT_FAILURE;
   }
 
-  if (!vtkMetalTesting::VerifyRegionRendered(renWin, 80, 80, 199, 219, 300))
+  if (!vtkMetalTesting::VerifyRegionRendered(renWin, renderer, 80, 80, 199, 219, 300))
   {
     std::cerr << "First block (cone) not rendered" << std::endl;
     return EXIT_FAILURE;
   }
-  if (!vtkMetalTesting::VerifyRegionRendered(renWin, 250, 80, 349, 219, 300))
+  if (!vtkMetalTesting::VerifyRegionRendered(renWin, renderer, 250, 80, 349, 219, 300))
   {
     std::cerr << "Second block (sphere) not rendered" << std::endl;
     return EXIT_FAILURE;
   }
-  if (!vtkMetalTesting::VerifyRegionRendered(renWin, 400, 80, 519, 219, 300))
+  if (!vtkMetalTesting::VerifyRegionRendered(renWin, renderer, 400, 80, 519, 219, 300))
   {
     std::cerr << "Third block (cube) not rendered" << std::endl;
     return EXIT_FAILURE;
   }
 
-  if (vtkMetalTesting::CountCompositePixels(renWin, 0, 0, 599, 299) == 0)
+  if (vtkMetalTesting::CountCompositePixels(renWin, renderer, 0, 0, 599, 299) == 0)
   {
     std::cerr << "No pixels with a non-zero composite index were found" << std::endl;
     return EXIT_FAILURE;
@@ -135,7 +135,7 @@ int TestMetalCompositePolyDataMapper(int argc, char* argv[])
   {
     return EXIT_FAILURE;
   }
-  if (!vtkMetalTesting::VerifyRegionRendered(renWin, 80, 80, 519, 219, 500))
+  if (!vtkMetalTesting::VerifyRegionRendered(renWin, renderer, 80, 80, 519, 219, 500))
   {
     return EXIT_FAILURE;
   }

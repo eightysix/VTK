@@ -78,7 +78,7 @@ int TestMetalDepthPeeling(int argc, char* argv[])
   {
     return EXIT_FAILURE;
   }
-  if (!vtkMetalTesting::VerifyRegionRendered(renWin, 120, 120, 279, 279, 1000))
+  if (!vtkMetalTesting::VerifyRegionRendered(renWin, renderer, 120, 120, 279, 279, 1000))
   {
     return EXIT_FAILURE;
   }

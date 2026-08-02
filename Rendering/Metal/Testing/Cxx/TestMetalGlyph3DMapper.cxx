@@ -70,7 +70,7 @@ int TestMetalGlyph3DMapper(int argc, char* argv[])
   }
 
   // The glyphs cover the center of the viewport: check a broad region.
-  if (!vtkMetalTesting::VerifyRegionRendered(renWin, 150, 75, 450, 225, 500))
+  if (!vtkMetalTesting::VerifyRegionRendered(renWin, renderer, 150, 75, 450, 225, 500))
   {
     std::cerr << "Glyph rendering did not fill the expected viewport region." << std::endl;
     return EXIT_FAILURE;
@@ -82,7 +82,7 @@ int TestMetalGlyph3DMapper(int argc, char* argv[])
     return EXIT_FAILURE;
   }
 
-  if (!vtkMetalTesting::VerifyRegionRendered(renWin, 150, 75, 450, 225, 500))
+  if (!vtkMetalTesting::VerifyRegionRendered(renWin, renderer, 150, 75, 450, 225, 500))
   {
     std::cerr << "Glyph rendering changed after a re-render." << std::endl;
     return EXIT_FAILURE;
