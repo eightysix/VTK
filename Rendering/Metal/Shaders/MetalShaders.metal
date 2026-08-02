@@ -36,6 +36,7 @@ constant uint kSceneFlagHasSurfaceColors    = 1u << 8;
 constant uint kSceneFlagHasActorTexture     = 1u << 9;
 constant uint kSceneFlagHasSurfaceAlpha     = 1u << 10;
 constant uint kSceneFlagHasCellTexture      = 1u << 11;
+constant uint kSceneFlagUsePrimitiveCellIds = 1u << 12;
 
 // Compile-time feature specialization for the surface shader (the "GL way"):
 // one shader source, specialized per feature set at pipeline creation via
@@ -640,7 +641,14 @@ inline FragmentColorAndIds evaluateSurfaceFragment(VertexOut in,
   out.emitIds = kEmitIds;
   if (kEmitIds)
   {
-    uint cellId = ((scene.flags & kSceneFlagHasCellTexture) != 0u)
+    // The flat-interpolated in.cellId is ambiguous for deduplicated (shared
+    // vertex) geometry: a shared vertex carries the first triangle's id, so the
+    // provoking vertex's "first-wins" value does not always name the owning
+    // cell. When the mapper built the per-primitive cell-id buffer
+    // (kSceneFlagUsePrimitiveCellIds), read the exact id by primitive id
+    // instead — matching GL, which uses gl_PrimitiveID. With no cell ids at all
+    // (kEmitIds is a compile-time constant), the whole block is dead.
+    uint cellId = ((scene.flags & kSceneFlagUsePrimitiveCellIds) != 0u)
       ? cellPrimitiveIds[prim_id] : in.cellId;
     out.ids = uint4(cellId, in.propId, in.compositeIndex, 0u);
   }

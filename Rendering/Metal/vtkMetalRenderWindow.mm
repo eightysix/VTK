@@ -772,8 +772,13 @@ void vtkMetalRenderWindow::GetIdsData(int x1, int y1, int x2, int y2,
     }
 
     // Read the texture region. MTLStorageModeShared allows direct CPU access.
-    // Region in texture coordinates: origin is top-left for Metal.
-    MTLRegion region = MTLRegionMake2D(xMin, yMin, width, height);
+    // Region in texture coordinates: origin is top-left for Metal, while VTK
+    // y grows upward. Map the VTK y range [yMin, yMax] to texture rows
+    // [texH - 1 - yMax, texH - 1 - yMin] (top to bottom) so the crop samples
+    // the same vertical band the color image shows; the loop below then flips
+    // rows within the crop so row 0 is VTK yMin.
+    int texYMin = texH - 1 - yMax;
+    MTLRegion region = MTLRegionMake2D(xMin, texYMin, width, height);
     std::vector<uint32_t> texData(width * height * 4);
     [idsTex getBytes:texData.data()
          bytesPerRow:width * 4 * sizeof(uint32_t)

@@ -386,8 +386,18 @@ void vtkMetalRenderer::DeviceRender()
         this->CreateLight();
       }
 
-      // Render opaque geometry
-      this->UpdateOpaquePolygonalGeometry();
+      // Render opaque geometry. During a selection render (hardware selector
+      // active) skip non-pickable props, matching the base-class selector
+      // behavior so non-pickable props neither appear in the ID buffer nor
+      // occlude pickable props in it.
+      for (int i = 0; i < this->PropArrayCount; ++i)
+      {
+        if (this->Selector && !this->PropArray[i]->GetPickable())
+        {
+          continue;
+        }
+        this->NumberOfPropsRendered += this->PropArray[i]->RenderOpaqueGeometry(this);
+      }
 
       [encoder endEncoding];
       renWin->Encoder = nullptr;
@@ -631,6 +641,10 @@ void vtkMetalRenderer::DeviceRender()
 
       for (int i = 0; i < this->PropArrayCount; i++)
       {
+        if (this->Selector && !this->PropArray[i]->GetPickable())
+        {
+          continue;
+        }
         this->NumberOfPropsRendered +=
           this->PropArray[i]->RenderVolumetricGeometry(this);
       }
@@ -859,6 +873,10 @@ void vtkMetalRenderer::DeviceRender()
 
       for (int i = 0; i < this->PropArrayCount; i++)
       {
+        if (this->Selector && !this->PropArray[i]->GetPickable())
+        {
+          continue;
+        }
         this->NumberOfPropsRendered += this->PropArray[i]->RenderOverlay(this);
       }
 
@@ -922,8 +940,17 @@ void vtkMetalRenderer::DeviceRender()
 //------------------------------------------------------------------------------
 int vtkMetalRenderer::UpdateGeometry(vtkFrameBufferObjectBase*)
 {
-  return this->UpdateOpaquePolygonalGeometry() +
-         this->UpdateTranslucentPolygonalGeometry();
+  int result = 0;
+  for (int i = 0; i < this->PropArrayCount; ++i)
+  {
+    if (this->Selector && !this->PropArray[i]->GetPickable())
+    {
+      continue;
+    }
+    result += this->PropArray[i]->RenderOpaqueGeometry(this);
+    result += this->PropArray[i]->RenderTranslucentPolygonalGeometry(this);
+  }
+  return result;
 }
 
 //------------------------------------------------------------------------------
