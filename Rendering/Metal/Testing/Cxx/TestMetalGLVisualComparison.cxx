@@ -154,6 +154,7 @@ const SceneSpec kScenes[] = {
   { "Glyph3DMapper", vtkMetalScenes::BuildGlyphScene, 600, 300 },
   { "HardwareSelector", vtkMetalScenes::BuildHardwareSelectorScene, 600, 300 },
   { "PolyDataMapper2D", vtkMetalScenes::BuildPolyDataMapper2DScene, 600, 300 },
+  { "ImageMapper", vtkMetalScenes::BuildImageMapperScene, 600, 300 },
   { "Texture", vtkMetalScenes::BuildTextureScene, 600, 300 },
   { "VolumeRayCast", vtkMetalScenes::BuildVolumeScene, 400, 400 },
   { "CellColor", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
@@ -169,9 +170,10 @@ const SceneSpec kScenes[] = {
 // (lean opaque pipeline), CpxPoint* carry per-point scalars (color arrives as
 // an interpolated varying), and CpxCell* carry per-cell scalars (color resolved
 // per-primitive in the fragment shader — the cell-texture port). CpxActor*
-// scale the CPU-bound draw-call count, CpxPeel* the depth-peel count, and
-// CpxVol* the volume size. With --complexity they are both benchmarked and
-// captured (PNG + thresholded error like the visual scenes).
+// scale the CPU-bound draw-call count, CpxPeel* the depth-peel count,
+// CpxVol* the volume size, and CpxImg* the image-mapper fill rate (a large
+// RGB image drawn 1:1 by vtkImageMapper). With --complexity they are both
+// benchmarked and captured (PNG + thresholded error like the visual scenes).
 const SceneSpec kBenchScenes[] = {
   { "CpxGeomLo", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
       vtkMetalScenes::BuildGeometryGridScene(r, b, 4, 30);
@@ -218,6 +220,12 @@ const SceneSpec kBenchScenes[] = {
   { "CpxVol128", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
       vtkMetalScenes::BuildVolumeSceneSized(r, b, 128);
     }, 400, 400 },
+  { "CpxImg1024", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
+      vtkMetalScenes::BuildImageSizeScene(r, b, 1024);
+    }, 1024, 1024 },
+  { "CpxImg2048", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
+      vtkMetalScenes::BuildImageSizeScene(r, b, 2048);
+    }, 2048, 2048 },
 };
 
 // Render one scene with one backend and write an RGB PNG. Returns the image.

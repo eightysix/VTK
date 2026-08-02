@@ -1434,6 +1434,34 @@ fragment float4 fragment_2d_main(Vertex2DOut in [[stage_in]]) {
 }
 
 // ---------------------------------------------------------------------------
+// 2D Image Mapper shaders (textured quad, used by vtkMetalImageMapper).
+// Reuses the Mapper2DState wcvc matrix so image coordinates (viewport pixels,
+// VTK bottom-left origin) map to NDC exactly like the plain 2D mapper.
+// ---------------------------------------------------------------------------
+struct Image2DVertexIn {
+  float2 position [[attribute(0)]];
+  float2 texCoord [[attribute(1)]];
+};
+
+struct Image2DVertexOut {
+  float4 position [[position]];
+  float2 texCoord;
+};
+
+vertex Image2DVertexOut vertex_2d_image_main(Image2DVertexIn in [[stage_in]],
+                                             constant Mapper2DState& state [[buffer(1)]]) {
+  Image2DVertexOut out;
+  out.position = state.wcvcMatrix * float4(in.position, 0.0, 1.0);
+  out.texCoord = in.texCoord;
+  return out;
+}
+
+fragment float4 fragment_2d_image_main(Image2DVertexOut in [[stage_in]],
+                                       texture2d<float> imageTexture [[texture(0)]]) {
+  return imageTexture.sample(sNearest, in.texCoord);
+}
+
+// ---------------------------------------------------------------------------
 // Depth Peeling Shaders
 // ---------------------------------------------------------------------------
 struct PeelUniforms { uint mode; uint peelPass; float2 viewportSize; };

@@ -6,8 +6,9 @@ harness renders the final state of each `TestMetal*.cxx` regression test with
 both backends and compares them with `vtkImageDifference` using the same
 thresholded-error metric `vtkTesting` uses for baseline regression.
 
-Numbers below were produced on Apple Silicon, macOS, `SetMultiSamples(0)`,
-`SwapBuffersOff()` (back buffer read-back), threshold 20. The single-pass
+Numbers below are from the current run on this repo's Apple M1 Mac mini
+(Macmini9,1, macOS 14.8), `SetMultiSamples(0)`, `SwapBuffersOff()` (back buffer
+read-back), threshold 20. The single-pass
 surface-edge port (`applySurfaceEdges` mirroring `vtkPolyDataEdgesGS.glsl` +
 `vtkOpenGLPolyDataMapper::ReplaceShaderEdges`) is active, so PointRender edges
 are now rendered on the surface fragment and match GL. The order-independent
@@ -20,8 +21,8 @@ order as the GL reference (the bounds-termination check moved to the loop tail,
 after accumulation), so the rim and silhouette match GL exactly. The volume
 gradient and phong lighting are computed in half (16-bit) precision with
 `fast::pow` (a deliberate performance choice: a float-precision experiment
-reduced the VolumeRayCast thresholded error from 0.007 to 0.005 but was
-reverted as not worth the cost). The run is fully reproducible: rerunning the
+reduced the VolumeRayCast thresholded error from 0.007 to 0.005 on the M2 but
+was reverted as not worth the cost). The run is fully reproducible: rerunning the
 harness produces byte-identical images and identical errors.
 
 ```
@@ -48,16 +49,18 @@ RenderWindow                       39.322          0.000
 Camera                             10.078          0.000
 Light                              61.965          0.000
 ActorProperty                     606.631          0.000
-PointRender                      1668.115          0.000
+PointRender                      1668.191          0.000
 DepthPeeling                      740.265          0.000
 CompositePolyDataMapper           241.004          0.000
 Glyph3DMapper                     444.277          0.000
 HardwareSelector                  307.776          0.000
 PolyDataMapper2D                  286.047          0.000
+ImageMapper                       125.212          0.000
 Texture                           177.318          0.000
-VolumeRayCast                     621.654          0.007
+VolumeRayCast                     621.983          0.005
+CellColor                        2835.801          0.000
 ------------------------------------------------------------------
-worst thresholded error: 0.00653595
+worst thresholded error: 0.00522876
 ```
 
 ## How to read this
@@ -106,6 +109,10 @@ worst thresholded error: 0.00653595
   mapper. The Metal delegator path matches GL.
 - **HardwareSelector** (`BuildHardwareSelectorScene`): cone + sphere side by
   side. Basic opaque geometry path, matches GL.
+- **CellColor** (`BuildCellColorGridScene`): a 4×4 grid of spheres with
+  per-cell scalars (`ScalarModeToUseCellData`, `ColorModeToMapScalars`) —
+  the small variant of the complexity scenes below, exercising the cell-texture
+  port (`kHasCellTexture` per-primitive color fetch). Matches GL exactly.
 - **Glyph3DMapper** (`BuildGlyphScene`): a 4x4 plane of instanced spheres with
   per-instance scalar colors (`vtkGlyph3DMapper`, `ColorModeToMapScalars`).
   Now matches GL exactly (`>10%` fraction 0.0%): the per-instance normal
@@ -116,6 +123,21 @@ worst thresholded error: 0.00653595
   orange 2D overlay quad in display coordinates. `vtkMetalRenderer` now drives
   `vtkRenderer::RenderOverlay()`, so the quad renders in Metal and matches GL
   (`>10%` fraction ~0.1%).
+- **ImageMapper** (`BuildImageMapperScene`): two 2D images rendered in the
+  overlay pass (`vtkMetalImageMapper` / `vtkOpenGLImageMapper`) — a 64×64 RGB
+  uchar quadrant image at identity window/level and a 64×64 unsigned-short
+  gradient (window 1000, level 500). The Metal quad is drawn with a top-origin
+  coordinate mapping so uploaded texture row 0 (the image's bottom row) is
+  sampled by the bottom vertex and lands at the framebuffer bottom, matching
+  GL's orientation exactly (`>10%` fraction 0.0%). Two fixes converged it from
+  a fully inverted image: removing a Y-negation from the mapper's vertex
+  transform (the old comment claimed Metal NDC needed flipping, but Metal and
+  GL NDC both run +1 top / −1 bottom), and correcting
+  `vtkMetalRenderWindow::ReadColorCopyData`'s partial-read mapping so a VTK
+  rect (y bottom-left) addresses the top-origin texture as
+  `MTLRegionMake2D(x, texH-1-(y+h-1), w, h)`. Full-window readbacks are
+  byte-identical under either mapping (the RenderWindow scene error is
+  unchanged).
 - **Texture** (`BuildTextureScene`): a checkerboard-textured plane
   (`vtkTexture`, interpolation on, repeat off, edge clamp). The Metal sampling
   path matches the OpenGL texture unit behavior (`>10%` fraction 0.0%).
@@ -133,8 +155,8 @@ worst thresholded error: 0.00653595
 - **VolumeRayCast** (`BuildVolumeScene`): analytic 32^3 volume through the GPU
   ray-cast mapper with a shaded transfer function (`ShadeOn`,
   ambient/diffuse/specular). Previously divergent (error 2612 / thresholded
-  789.8, ~28.5% of pixels >10%); now matches GL to within 0.007 thresholded
-  error (raw 621.654). Two fixes account for most of the convergence:
+  789.8, ~28.5% of pixels >10%); now matches GL to within 0.005 thresholded
+  error (raw 621.983). Two fixes account for most of the convergence:
   1. The march loop checked the box bounds at the top of the loop, *before*
      sampling, so rays that grazed the silhouette (box segment shorter than
      one step) broke with zero samples and left a black rim, while GL samples
@@ -148,7 +170,7 @@ worst thresholded error: 0.00653595
      *before* the gradient/shading block, so the gradient was fetched one ray
      step ahead of the scalar it lit. The fetch order was restored to
      sample-then-advance.
-- **VolumeRayCast residual (0.007)**: the ~40 thresholded pixels (0.02%) are
+- **VolumeRayCast residual (0.005)**: the ~40 thresholded pixels (0.02%) are
   all interior (none on the silhouette), all in the blue channel, on the edge
   of the specular highlight. Ruled out as sources: the termination threshold
   (GL `1 - 1/255` strict `>` vs Metal's `>= 0.99` — no image change), jitter
@@ -158,8 +180,9 @@ worst thresholded error: 0.00653595
   GL's interpolated proxy `ip_textureCoords` — overriding Metal's entry with
   the interpolated position produced no change). Computing the gradient and
   lighting in float precision (matching GL) instead of half reduced the error
-  to `0.005`, but the gain was small and the change was reverted to keep the
-  half-precision + `fast::pow` shading path. The mechanism is float-rounding-
+  on the M2 (from 0.007 to 0.005), but the gain was small and the change was
+  reverted to keep the half-precision + `fast::pow` shading path. The mechanism
+  is float-rounding-
   level sample-position divergence (entry and step composed in different
   spaces/arithmetic); near a texel boundary the nearest-interpolated gradient
   taps land in different cells, rotating the gradient a few degrees and
@@ -169,10 +192,10 @@ worst thresholded error: 0.00653595
 
 ### Inter-device variability
 
-The residual magnitude is GPU-dependent. The numbers above were produced on an
-Apple M2 (the documented run): `VolumeRayCast` is `0.007` there. On other Apple
-Silicon generations the same commit yields a different thresholded error for
-this scene — e.g. an M1 machine reports `VolumeRayCast` at `0.005`. This is not
+The residual magnitude is GPU-dependent. The numbers above are from the current
+run on this repo's Apple M1 Mac mini (Macmini9,1, macOS 14.8): `VolumeRayCast`
+is `0.005` there (worst thresholded error 0.00522876). The original documented
+run on an Apple M2 MacBook Air reported `0.007` for the same scene. This is not
 a build/checkout difference: different Metal GPU implementations round the
 half-precision gradient/lighting and `fast::pow` differently at the sample
 positions, so a different set of near-texel-boundary gradient taps crosses the
@@ -538,6 +561,32 @@ saving pays for a ~1.1–1.3× fragment fetch, which is where GL lives (its
 picking exact in this path — per-primitive cell ids report the owning cell
 where the per-vertex first-wins value was ambiguous — so the common
 per-cell-colored case is now both at near-parity and exact.
+
+### Image-mapper fill rate (`CpxImg*`)
+
+The `CpxImg*` scenes isolate the image-mapper texture/fragment path: a single
+RGB image sized to fill the window, drawn 1:1 by `vtkImageMapper` in the
+overlay pass (window size = image size, so every window pixel is one texel).
+`CpxImg1024` and `CpxImg2048` are registered in `kBenchScenes` behind
+`--complexity` alongside the small `ImageMapper` scene from the visual table.
+Both backends are visually identical here (thresholded error 0.000 for all
+three). Results on this repo's Apple M1 Mac mini, `--frames 30 --reps 5`:
+
+```
+scene                          GL ms/f   ±σ   GL fps   Metal ms/f  ±σ   Metal fps    M/GL
+ImageMapper (600x300)          0.69±0.11 1444.8    0.37±0.03   2671.7    0.54
+CpxImg1024                     2.32±0.10  431.4    1.30±0.01    768.9    0.56
+CpxImg2048                     6.78±0.19  147.5    5.26±0.03    190.2    0.78
+```
+
+Metal is consistently faster and the gain tracks the workload: ~1.8× at
+600×300 and 1024×1024, dropping to ~1.3× at 2048×2048 as the shared per-pixel
+work (nearest-sampled texture read + clear + full-window fill) dominates the
+fixed per-frame cost. The backends run the same single-quad fragment load, so
+the gap is the leaner Metal overlay path (no GL state machinery per draw), the
+same factor that shows up in `PolyDataMapper2D`. Note the visual *error* still
+grows with image size (raw 6499 at 1024², 23418 at 2048²) even at 0.000
+thresholded — pixel-identical texel sampling, but more pixels to round.
 
 ### Recording another machine
 

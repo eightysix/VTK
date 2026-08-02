@@ -8,6 +8,7 @@ set(classes
   vtkMetalBatchedPolyDataMapper
   vtkMetalCompositePolyDataMapperDelegator
   vtkMetalPolyDataMapper2D
+  vtkMetalImageMapper
   vtkMetalCamera
   vtkMetalProperty
   vtkMetalLight

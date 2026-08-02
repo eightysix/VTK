@@ -809,21 +809,28 @@ int vtkMetalRenderWindow::ReadColorCopyData(
     // reading it back (getBytes would otherwise race the GPU).
     this->WaitForCompletion();
 
-    // Read the texture region. MTLStorageModeShared allows direct CPU access.
-    // Region in texture coordinates: origin is top-left for Metal.
-    MTLRegion region = MTLRegionMake2D(xMin, yMin, w, h);
+    // The requested rect uses VTK window coordinates (origin at the lower
+    // left, y up), but the texture is top-origin (texture row 0 is the top of
+    // the framebuffer). A VTK row vtkY maps to texture row (texH-1-vtkY), so
+    // the contiguous texture region holding the rect's rows runs from
+    // (texH-1)-(yMin+h-1) to (texH-1)-yMin, in reverse row order. Read that
+    // region, then emit rows bottom-up so output row 0 is the rect's bottom
+    // (VTK convention), matching vtkOpenGLRenderWindow::GetPixelData.
+    const int firstTexRow = (texH - 1) - (yMin + h - 1);
+    MTLRegion region = MTLRegionMake2D(xMin, firstTexRow, w, h);
     std::vector<uint8_t> texData(w * h * 4);
     [colorTex getBytes:texData.data() bytesPerRow:w * 4 fromRegion:region mipmapLevel:0];
 
-    // Copy into the output array with Y-flip (Metal top-left → VTK bottom-left)
-    // and BGRA → RGB(A) channel conversion.
+    // Copy into the output array (bottom-up) with BGRA → RGB(A) channel
+    // conversion.
     unsigned char* out = static_cast<unsigned char*>(dest);
     for (int row = 0; row < h; ++row)
     {
-      int srcY = h - 1 - row; // flip Y
+      const int vtkRow = yMin + row;
+      const int srcRow = (yMin + h - 1) - vtkRow; // rows are reversed in the texture
       for (int col = 0; col < w; ++col)
       {
-        const uint8_t* src = &texData[(srcY * w + col) * 4];
+        const uint8_t* src = &texData[(srcRow * w + col) * 4];
         unsigned char* dst = &out[(row * w + col) * ncomp];
         dst[0] = src[2]; // B
         dst[1] = src[1]; // G

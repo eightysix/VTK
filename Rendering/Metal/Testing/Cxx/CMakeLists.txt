@@ -9,6 +9,7 @@ vtk_add_test_cxx(vtkRenderingMetalCxxTests tests
   TestMetalGlyph3DMapper.cxx,NO_DATA,NO_SERDES
   TestMetalHardwareSelector.cxx,NO_DATA,NO_SERDES
   TestMetalPolyDataMapper2D.cxx,NO_DATA,NO_SERDES
+  TestMetalImageMapper.cxx,NO_DATA,NO_SERDES
   TestMetalTexture.cxx,NO_DATA,NO_SERDES
   TestMetalVolumeRayCast.cxx,NO_DATA,NO_SERDES)
 

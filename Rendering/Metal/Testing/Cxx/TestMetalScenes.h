@@ -40,6 +40,7 @@
 #include "vtkGlyph3DMapper.h"
 #include "vtkGPUVolumeRayCastMapper.h"
 #include "vtkImageData.h"
+#include "vtkImageMapper.h"
 #include "vtkLight.h"
 #include "vtkLightCollection.h"
 #include "vtkMetalActor.h"
@@ -47,6 +48,7 @@
 #include "vtkMetalCompositePolyDataMapperDelegator.h"
 #include "vtkMetalGlyph3DMapper.h"
 #include "vtkMetalGPUVolumeRayCastMapper.h"
+#include "vtkMetalImageMapper.h"
 #include "vtkMetalPolyDataMapper.h"
 #include "vtkMetalPolyDataMapper2D.h"
 #include "vtkMetalProperty.h"
@@ -57,6 +59,7 @@
 #include "vtkOpenGLCamera.h"
 #include "vtkOpenGLGlyph3DMapper.h"
 #include "vtkOpenGLGPUVolumeRayCastMapper.h"
+#include "vtkOpenGLImageMapper.h"
 #include "vtkOpenGLPolyDataMapper.h"
 #include "vtkOpenGLPolyDataMapper2D.h"
 #include "vtkOpenGLProperty.h"
@@ -150,6 +153,15 @@ inline vtkSmartPointer<vtkPolyDataMapper2D> NewPolyDataMapper2D(BackendKind b)
     return vtkSmartPointer<vtkOpenGLPolyDataMapper2D>::New();
   }
   return vtkSmartPointer<vtkMetalPolyDataMapper2D>::New();
+}
+
+inline vtkSmartPointer<vtkImageMapper> NewImageMapper(BackendKind b)
+{
+  if (b == BackendKind::OpenGL)
+  {
+    return vtkSmartPointer<vtkOpenGLImageMapper>::New();
+  }
+  return vtkSmartPointer<vtkMetalImageMapper>::New();
 }
 
 inline vtkSmartPointer<vtkGPUVolumeRayCastMapper> NewVolumeMapper(BackendKind b)
@@ -702,6 +714,136 @@ inline void BuildPolyDataMapper2DScene(vtkRenderer* renderer, BackendKind b)
   quadActor->SetMapper(quadMapper);
   quadActor->GetProperty()->SetColor(1.0, 0.5, 0.0);
   renderer->AddActor(quadActor);
+}
+
+// TestMetalImageMapper: two 2D images rendered in the overlay pass -- a
+// 64x64 RGB uchar image with a distinct color per quadrant (identity
+// window/level, char path) at (0,0), and a 64x64 single-component
+// unsigned-short gradient 0..1000 along x+y (real window/level, short path)
+// at (300,0). The window must be at least 600x300 for both to fit.
+inline vtkSmartPointer<vtkImageData> CreateQuadrantImage()
+{
+  constexpr int dim = 64;
+  vtkNew<vtkImageData> image;
+  image->SetDimensions(dim, dim, 1);
+  image->AllocateScalars(VTK_UNSIGNED_CHAR, 3);
+
+  unsigned char* ptr = static_cast<unsigned char*>(image->GetScalarPointer());
+  for (int y = 0; y < dim; ++y)
+  {
+    for (int x = 0; x < dim; ++x)
+    {
+      unsigned char r = 0, g = 0, b = 0;
+      const bool left = x < dim / 2;
+      const bool bottom = y < dim / 2;
+      if (left && bottom)
+      {
+        r = 255;
+      }
+      else if (!left && bottom)
+      {
+        g = 255;
+      }
+      else if (left && !bottom)
+      {
+        b = 255;
+      }
+      else
+      {
+        r = g = b = 255;
+      }
+      ptr[(y * dim + x) * 3 + 0] = r;
+      ptr[(y * dim + x) * 3 + 1] = g;
+      ptr[(y * dim + x) * 3 + 2] = b;
+    }
+  }
+  return image;
+}
+
+inline vtkSmartPointer<vtkImageData> CreateGradientImage()
+{
+  constexpr int dim = 64;
+  vtkNew<vtkImageData> image;
+  image->SetDimensions(dim, dim, 1);
+  image->AllocateScalars(VTK_UNSIGNED_SHORT, 1);
+
+  unsigned short* ptr = static_cast<unsigned short*>(image->GetScalarPointer());
+  for (int y = 0; y < dim; ++y)
+  {
+    for (int x = 0; x < dim; ++x)
+    {
+      ptr[y * dim + x] = static_cast<unsigned short>(1000 * (x + y) / (2 * (dim - 1)));
+    }
+  }
+  return image;
+}
+
+inline void BuildImageMapperScene(vtkRenderer* renderer, BackendKind b)
+{
+  renderer->SetBackground(0.2, 0.2, 0.2);
+
+  // Give the renderer an explicit backend camera. Without one vtkRenderer
+  // auto-creates vtkCamera::New(), which the vtkRenderingOpenGL2 object
+  // factory hijacks into vtkOpenGLCamera even on a Metal renderer.
+  vtkSmartPointer<vtkCamera> camera = NewCamera(b);
+  renderer->SetActiveCamera(camera);
+
+  vtkSmartPointer<vtkImageMapper> mapper1 = NewImageMapper(b);
+  mapper1->SetInputData(CreateQuadrantImage());
+  mapper1->SetColorLevel(127.5);
+  mapper1->SetColorWindow(255.0);
+  vtkNew<vtkActor2D> actor1;
+  actor1->SetMapper(mapper1);
+  actor1->SetPosition(0, 0);
+  renderer->AddActor(actor1);
+
+  vtkSmartPointer<vtkImageMapper> mapper2 = NewImageMapper(b);
+  mapper2->SetInputData(CreateGradientImage());
+  mapper2->SetColorLevel(500.0);
+  mapper2->SetColorWindow(1000.0);
+  vtkNew<vtkActor2D> actor2;
+  actor2->SetMapper(mapper2);
+  actor2->SetPosition(300, 0);
+  renderer->AddActor(actor2);
+}
+
+// Large-image fill-rate scenes: a single RGB image sized to fill the window,
+// exercising the image-mapper texture/fragment path at 1:1 (CpxImg*).
+inline vtkSmartPointer<vtkImageData> CreateSizedImage(int dim)
+{
+  vtkNew<vtkImageData> image;
+  image->SetDimensions(dim, dim, 1);
+  image->AllocateScalars(VTK_UNSIGNED_CHAR, 3);
+
+  unsigned char* ptr = static_cast<unsigned char*>(image->GetScalarPointer());
+  for (int y = 0; y < dim; ++y)
+  {
+    for (int x = 0; x < dim; ++x)
+    {
+      const int idx = y * dim + x;
+      ptr[idx * 3 + 0] = static_cast<unsigned char>(x * 255 / (dim - 1));
+      ptr[idx * 3 + 1] = static_cast<unsigned char>(y * 255 / (dim - 1));
+      ptr[idx * 3 + 2] = static_cast<unsigned char>((x ^ y) & 0xff);
+    }
+  }
+  return image;
+}
+
+inline void BuildImageSizeScene(vtkRenderer* renderer, BackendKind b, int dim)
+{
+  renderer->SetBackground(0.2, 0.2, 0.2);
+
+  vtkSmartPointer<vtkCamera> camera = NewCamera(b);
+  renderer->SetActiveCamera(camera);
+
+  vtkSmartPointer<vtkImageMapper> mapper = NewImageMapper(b);
+  mapper->SetInputData(CreateSizedImage(dim));
+  mapper->SetColorLevel(127.5);
+  mapper->SetColorWindow(255.0);
+  vtkNew<vtkActor2D> actor;
+  actor->SetMapper(mapper);
+  actor->SetPosition(0, 0);
+  renderer->AddActor(actor);
 }
 
 // TestMetalTexture: a plane textured with a 64x64 checkerboard image.
