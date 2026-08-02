@@ -19,9 +19,9 @@
 #define vtkMetalBatchedPolyDataMapper_h
 
 #include "vtkMetalPolyDataMapper.h"
-#include "vtkRenderingMetalModule.h"
-#include "vtkCompositePolyDataMapperDelegator.h"
-#include "vtkSmartPointer.h"
+#include "vtkRenderingMetalModule.h"    // For export macro
+#include "vtkCompositePolyDataMapperDelegator.h" // For BatchElement
+#include "vtkSmartPointer.h"           // For vtkSmartPointer
 
 #include <memory>
 #include <vector>
