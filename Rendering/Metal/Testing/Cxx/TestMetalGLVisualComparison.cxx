@@ -61,6 +61,7 @@ VTK_MODULE_INIT(vtkRenderingOpenGL2);
 VTK_MODULE_INIT(vtkRenderingVolumeOpenGL2);
 
 #include "vtkCocoaMetalRenderWindow.h"
+#include "vtkObjectFactory.h"
 #include "vtk_glad.h"
 #include "vtkImageDifference.h"
 #include "vtkImageExtractComponents.h"
@@ -236,6 +237,14 @@ vtkSmartPointer<vtkImageData> RenderAndCapture(
   const SceneSpec& spec, vtkMetalScenes::BackendKind backend, const std::string& path,
   int warmupFrames = 0)
 {
+  // Library code creates backend classes through the object factory (e.g.
+  // vtkOpenGLImageMapper and vtkCompositePolyDataMapper build their textures
+  // with vtkNew<vtkTexture>). This process links both vtkRenderingOpenGL2 and
+  // vtkRenderingMetal, so pin the factory to the backend we are rendering so
+  // those internal allocations resolve to the matching backend class.
+  vtkObjectFactory::SetPreferences(
+    backend == vtkMetalScenes::BackendKind::OpenGL ? "RenderingBackend=OpenGL"
+                                                   : "RenderingBackend=Metal");
   vtkSmartPointer<vtkRenderWindow> renWin = vtkMetalScenes::NewRenderWindow(backend);
   renWin->SetSize(spec.Width, spec.Height);
   renWin->SetMultiSamples(0);
@@ -312,6 +321,10 @@ BenchStats BenchmarkScene(
 {
   frames = std::max(1, frames);
 
+  // Pin the object factory to the backend being timed (see RenderAndCapture).
+  vtkObjectFactory::SetPreferences(
+    backend == vtkMetalScenes::BackendKind::OpenGL ? "RenderingBackend=OpenGL"
+                                                   : "RenderingBackend=Metal");
   vtkSmartPointer<vtkRenderWindow> renWin = vtkMetalScenes::NewRenderWindow(backend);
   renWin->SetSize(spec.Width, spec.Height);
   renWin->SetMultiSamples(0);

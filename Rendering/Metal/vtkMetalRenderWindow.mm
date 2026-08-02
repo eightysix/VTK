@@ -478,6 +478,8 @@ void vtkMetalRenderWindow::Render()
     this->Initialize();
   }
 
+  this->FrameRendererIndex = 0;
+
   if (this->Size[0] > 0 && this->Size[1] > 0)
   {
     @autoreleasepool

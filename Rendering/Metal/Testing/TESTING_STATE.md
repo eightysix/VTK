@@ -1,19 +1,25 @@
 # Metal Testing State
 
-Snapshot of the state of testing for the Metal rendering backend, taken on the
-`metal-ios` branch (head `bc4e9d93cd`) on this repo's Apple M1 Mac mini
-(Macmini9,1, macOS 14.8), arm64 Release build in `build_macos_metal` (Ninja,
+Snapshot of the state of testing for the Metal rendering backend. Historical
+run: `metal-ios` branch head `bc4e9d93cd` on this repo's Apple M1 Mac mini
+(Macmini9,1, macOS 14.8). Current working-tree run: this repo's Apple M2
+MacBook Air (Mac14,2, macOS 15.7.5), after the texture-cluster fixes described
+below. Both arm64 Release builds in `build_macos_metal` (Ninja,
 `VTK_MODULE_ENABLE_VTK_RenderingMetal=YES`).
 
 Two test surfaces exist:
 
 1. A bespoke Metal suite under `Rendering/Metal/Testing/` (13 image-baseline
    regression tests + a HeaderTest + a dual-backend visual-parity harness).
-   Status: **all 15 pass**.
+   Status: **all 15 pass** (unchanged from the historical run).
 2. The generic multi-backend suite in `Rendering/Core/Testing/Cxx/`, which
    registers the same ~175 tests once per backend and was wired up for Metal
    through object-factory overrides (`--vtk-factory-prefer
-   RenderingBackend=Metal`). Status: **55 pass / 120 fail (33 crash)**.
+   RenderingBackend=Metal`). Historical status: **55 pass / 120 fail (33
+   crash)**. Current working-tree status: **61 pass / 95 fail (19 crash)** — the
+   14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture` factory
+   override (they now render; 5 of them pass outright), and no new crashes were
+   introduced. The pass count measures 55–61 across runs (run-to-run flakiness).
 
 ---
 
@@ -109,16 +115,52 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
   `TEST_OPTIONAL_DEPENDS` so the generic test executable links Metal's autoinit
   factory.
 
-### Tally (run 2026-08-02, `ctest -R "RenderingCoreCxx-Metal" -j 8`)
+### Tally (working tree, rerun 2026-08-02 on the M2 MacBook Air,
+`ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  55 Passed  87 Failed  33 "Subprocess aborted"
+175 tests:  61 Passed  95 Failed (incl. image/pick fails)  19 "Subprocess aborted"
 ```
 
-### Image-compare failures (87)
+(Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted.)
 
-81 have a `vtkTesting` `ImageError`; 6 fail without an image compare (see
-below). Buckets by thresholded error (threshold 0.05):
+### The texture cluster is fixed
+
+The largest historical crash class (OpenGL-texture fallback: `vtkTexture::New()`
+returned `vtkOpenGLTexture`, whose `Load()` called
+`vtkTextureObject::SetContext(vtkOpenGLRenderWindow*)` on a Metal window →
+SIGSEGV) is resolved by `vtkMetalTexture` (`Rendering/Metal/vtkMetalTexture.h`),
+a `vtkTexture` factory override registered with `RenderingBackend=Metal` whose
+`Load()` is a no-op because the Metal poly-data mapper uploads actor textures
+itself (`vtkMetalPolyDataMapper::UpdateActorTexture`). As a result
+`TestTextureWrap`, `TestBackfaceTexture`, `TestTextureRGBA`,
+`TestTextureRGBADepthPeeling`, `TestTextureSize` now **pass**; the other texture
+tests (`TestActor2DTextures`, `TestBackfaceCulling`, `TestImageAndAnnotations`,
+`TestPickTextActor`, `TestRenderLinesAsTubes{OrthoCamera}`, `TestTexturedCylinder`,
+`TestTextureInterpolateScalars`, `TestTilingCxx`) render without crashing but
+still fail image comparison (texture-feature fidelity gaps).
+
+`TestTextureWrap` specifically was debugged to a pass this session:
+multi-renderer viewport tiling collapsed because `vtkMetalRenderer::DeviceRender`
+scaled the fractional viewport by the renderer's *own* pixel size and used
+`viewport[2]`/`viewport[3]` directly as the width/height. All five viewport
+sites in `vtkMetalRenderer.mm` (opaque, translucent, volume, volume-framebuffer
+blit, overlay) and both sites in `vtkMetalOrderIndependentTranslucentPass.mm`
+now use `(viewport[2]-viewport[0]) * winSize` (window size). The window also
+shares one drawable across renderers: the first renderer clears the full
+attachment, later renderers load it, only the last presents
+(`vtkMetalRenderWindow::FrameRendererIndex`). ClampToBorder textures get their
+arbitrary border color from the fragment shader (`MaterialUniforms.borderColor`)
+since Metal's sampler border-color presets are black/white only; the ClampToBorder
+sampler clamps to edge and `resolveMaterial` substitutes the border color where
+uv escapes [0,1].
+
+### Image-compare failures
+
+Current run: 95 image/pick failures = the historical 87 (below) plus 8
+texture-cluster tests that used to crash and now render with image differences.
+Of the 87: 81 have a `vtkTesting` `ImageError`; 6 fail without an image compare
+(see below). Buckets by thresholded error (threshold 0.05):
 
 | Bucket | Range | Count | Examples |
 |--------|-------|-------|----------|
@@ -132,31 +174,32 @@ The 6 non-image failures are all selection/read-back checks:
 (image matches, pick check fails), `TestReadPixels` (read-back reports an
 error; the test's `ERR|` regex matched).
 
-### Crashes (33)
+### Crashes (19; all pre-existing classes, none from the texture cluster)
 
 Signal-level crashes are reported as `Subprocess aborted` with a `Caught
 SIGSEGV` line but no backtrace in the ctest log, so crash causes were
-re-derived from the previous run's full signal stacks plus the current run's
-frames. Current-run attribution:
+re-derived from the earlier run's full signal stacks. Current-run attribution:
 
 | Cause | Count | Tests |
 |-------|-------|-------|
-| OpenGL texture fallback — `vtkTexture::New()` returns `vtkOpenGLTexture`, `Load()` calls `vtkTextureObject::SetContext(vtkOpenGLRenderWindow*)` on a Metal window → SIGSEGV | 14 | `TestActor2DTextures`, `TestBackfaceCulling`, `TestBackfaceTexture`, `TestImageAndAnnotations`, `TestPickTextActor`, `TestRenderLinesAsTubes`, `TestRenderLinesAsTubesOrthoCamera`, `TestTextureInterpolateScalars`, `TestTextureRGBA`, `TestTextureRGBADepthPeeling`, `TestTextureSize`, `TestTextureWrap`, `TestTexturedCylinder`, `TestTilingCxx` |
 | `vtkMetalPolyDataMapper::BuildGeometryBuffers` on the composite/legacy path | 8 | `TestActor2D`, `TestBlockOpacity`, `TestCompositePolyDataMapper`, `TestCompositePolyDataMapper{BlockOpacities,Pickability,Spheres,ToggleScalarVisibilities,Vertices}` |
+| SIGSEGV with no backtrace; prior stack analysis attributes these to the OpenGL factory fallback in label/text/image rendering | 9 | `TestFollowerPicking`, `TestInteractorStyleImageProperty`, `TestLabeledContourMapper`, `TestLabeledContourMapperNoLabels`, `TestLabeledContourMapperWithActorMatrix`, `TestResizingWindowToImageFilter`, `TestTranslucentImageActor{AlphaBlending,DepthPeeling}`, `TestWindowToImageFilter` |
 | `CreateMultisampleAttachments` (MSAA) | 1 | `TestOpacityMSAA` |
-| SIGSEGV with no backtrace; prior stack analysis attributes these to the same OpenGL factory fallback in label/text/image rendering | 9 | `TestFollowerPicking`, `TestInteractorStyleImageProperty`, `TestLabeledContourMapper`, `TestLabeledContourMapperNoLabels`, `TestLabeledContourMapperWithActorMatrix`, `TestResizingWindowToImageFilter`, `TestTranslucentImageActor{AlphaBlending,DepthPeeling}`, `TestWindowToImageFilter` |
 | `vtkMetalHardwareSelector` selection path (`SelectionChanged`, "Color buffer depth must be at least 8 bit") | 1 | `TestAreaSelections` |
 
-Combined with the earlier detailed stack analysis, ~23 of the 33 crashes are
-the object-factory fallback to OpenGL (textures, image/text labels), and ~10
-are genuine Metal bugs (composite-mapper buffer building, MSAA attachments,
-area selection).
+The 14-test OpenGL-texture-fallback crash row from the historical tally is gone
+(fixed by `vtkMetalTexture`, see above). ~8 of the remaining 19 crashes are
+genuine Metal bugs (composite-mapper buffer building, MSAA attachments, area
+selection); the other ~9 are the label/text/image OpenGL-fallback class that the
+`vtkMetalTexture` fix did not cover (no `vtkTexture` involved).
 
-### Theme clusters in the 120 failures
+### Theme clusters in the 95 failures
 
 - **Textures** (~16): every `TestTexture*`, `TestBackfaceTexture`,
-  `TestTexturedCylinder`, `TestTilingCxx`, `TestActor2DTextures` — crashes on
-  the OpenGL fallback.
+  `TestTexturedCylinder`, `TestTilingCxx`, `TestActor2DTextures` — historically
+  crashed on the OpenGL fallback; now render, with 5 passing and the rest
+  failing image comparison on texture-feature fidelity (filter/wrap/interpolation
+  edge cases, textured-cylinder seams).
 - **Composite mapper** (~20): 8 crashes in `BuildGeometryBuffers` +
   `TestCompositePolyDataMapper{Scalars,CellScalars,Picking,PartialFieldData,
   OverrideScalarArray,OverrideLUT,CameraShiftScale,CustomShader,NaNPartial,
@@ -180,7 +223,7 @@ area selection).
 
 ### Evidence the core path is correct
 
-The 55 passes include the strongest-scrutiny tests: `TestOpacity` (passes with
+The 61 passes include the strongest-scrutiny tests: `TestOpacity` (passes with
 the `TIGHT_VALID` metric — the Lab-space color path matches GL to
 `0.00038`), `TestOSConeCxx`, `TestMace`, `TestTranslucentLUTAlphaBlending`,
 `TestTranslucentLUTDepthPeeling`, `TestScalarModeToggle`,
@@ -195,10 +238,14 @@ fundamental geometry/lighting/color path.
 
 ## 3. Known gaps / next steps (highest value first)
 
-1. **Texture support** — `vtkTexture`/`vtkTextureObject` has no Metal override,
-   so the factory falls back to OpenGL and crashes on `SetContext`. This alone
-   explains ~16 crash tests. A `vtkMetalTexture`/`vtkMetalTextureObject`
-   (or a texture-less stub for `TestTexture*`) unblocks them.
+1. **Texture support — DONE** — `vtkMetalTexture` (`Rendering/Metal/vtkMetalTexture`)
+   now overrides `vtkTexture` for `RenderingBackend=Metal` (no-op `Load`; the
+   poly-data mapper uploads actor textures in `UpdateActorTexture`). This
+   eliminated all 14 texture-fallback crashes; 5 texture tests now pass and the
+   rest fail image comparison instead of SIGSEGV. Follow-ups: border-color and
+   filter/mipmap fidelity (`TestTextureInterpolateScalars`,
+   `TestTexturedCylinder`), and renderers that bypass the poly-data mapper
+   (2D image/text in the label cluster).
 2. **Composite mapper crash** — `vtkMetalPolyDataMapper::BuildGeometryBuffers`
    crashes on the composite/legacy path (`vtkCompositePolyDataMapperDelegator`
    interaction); ~8 crash tests plus ~12 image-fails.
@@ -231,6 +278,10 @@ ctest --test-dir build_macos_metal -R "RenderingCoreCxx-Metal" -j 8 --output-on-
 Run environment: a GUI login session is required (the render window attaches to
 the WindowServer); headless SSH will not work.
 
-Numbers in this file are from the 2026-08-02 run at commit `bc4e9d93cd`
-(working tree clean). Re-running is reproducible except where a crash's signal
-stack ordering varies.
+Numbers in this file: historical tally from the 2026-08-02 run at commit
+`bc4e9d93cd` (M1 Mac mini); working-tree tally from the same date rerun on the
+M2 MacBook Air with the texture-cluster changes present. The image-compare
+buckets and theme clusters below are preserved from the historical analysis of
+the 87 image/pick failures (that set is unchanged, minus the 8 texture tests
+now counted there). Re-running is reproducible except where a crash's signal
+stack ordering varies; the pass count fluctuates 55–61 run to run.

@@ -254,6 +254,14 @@ protected:
    */
   void ReleaseDrawable();
 
+  /**
+   * Per-frame index of the renderer currently rendering (0-based). Reset to 0
+   * at the start of Render(); incremented by vtkMetalRenderer::DeviceRender.
+   * Used to share one drawable across renderers (first clears, last presents).
+   */
+  int GetFrameRendererIndex() const { return FrameRendererIndex; }
+  void BumpFrameRendererIndex() { ++FrameRendererIndex; }
+
   // Metal objects (stored as void* to avoid Obj-C in header)
   void* MetalDevice = nullptr;    // id<MTLDevice>
   void* MetalQueue = nullptr;     // id<MTLCommandQueue>
@@ -283,6 +291,9 @@ protected:
   // vtkMetalOrderIndependentTranslucentPass before rendering the translucent
   // accumulate pass, read by vtkMetalPolyDataMapper during RenderPiece().
   bool OITActive = false;
+
+  // Per-frame renderer index (see GetFrameRendererIndex).
+  int FrameRendererIndex = 0;
 
   bool Initialized = false;
 

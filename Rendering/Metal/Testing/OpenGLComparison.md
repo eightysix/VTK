@@ -281,6 +281,23 @@ observed, so the offscreen benchmark config was introduced here. Whether the
 cause was the SoC or the macOS version was never pinned down, and it is moot
 now that the harness renders offscreen.
 
+Working-tree verification (2026-08-02, texture-cluster changes present): the
+harness must pin the active backend per process via
+`vtkObjectFactory::SetPreferences("RenderingBackend=OpenGL"|"RenderingBackend=Metal")`
+at the head of `RenderAndCapture`/`BenchmarkScene` (`TestMetalGLVisualComparison.cxx`).
+Without the pin, the `vtkMetalTexture` override registered by `vtkRenderingMetal`
+hijacks the generic `vtkNew<vtkTexture>` allocations inside the GL libraries
+(`vtkOpenGLImageMapper::Render`, `vtkCompositePolyDataMapper::Render`) and the
+GL scenes render blank. With the pin, the visual table reproduces this machine's
+documented numbers byte-for-byte — worst thresholded error 0.00653595, and
+`VolumeRayCast` 0.007 (the documented M2 residual; see "Inter-device
+variability"). Perf reruns at `--frames 30 --reps 3` show no regression: every
+scene at or better than the table below, with run-to-run flakiness within the
+documented ±15–20% (e.g. isolated `CompositePolyDataMapper`/`CellColor`
+reruns 0.80–1.04, `Glyph3DMapper` 1.04, GL sometimes faster — GL
+`CompositePolyDataMapper` 0.38 vs 0.48 documented). Report each cell with the
+variance caveat, not as a hard number.
+
 ```
 scene                          GL ms/f   GL fps   Metal ms/f  Metal fps    M/GL
 -------------------------------------------------------------------

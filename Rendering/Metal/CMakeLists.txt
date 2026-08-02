@@ -12,6 +12,7 @@ set(classes
   vtkMetalCamera
   vtkMetalProperty
   vtkMetalLight
+  vtkMetalTexture
   vtkMetalHardwareSelector
   vtkMetalGlyph3DMapper
   vtkMetalGPUVolumeRayCastMapper)
@@ -79,6 +80,9 @@ vtk_object_factory_declare(
 vtk_object_factory_declare(
   BASE vtkProperty
   OVERRIDE vtkMetalProperty)
+vtk_object_factory_declare(
+  BASE vtkTexture
+  OVERRIDE vtkMetalTexture)
 vtk_object_factory_declare(
   BASE vtkHardwareSelector
   OVERRIDE vtkMetalHardwareSelector)

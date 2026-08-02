@@ -122,7 +122,10 @@ struct MaterialUniforms {
   float4 color;                // base color (unused in lighting)
   float opacity;
   float specularPower;
-  float2 _padding;
+  // ShowTexturesOnBackface: when 0 the actor texture is not applied to back
+  // faces (matches vtkOpenGLPolyDataMapper's showTexturesOnBackface uniform).
+  float showTexturesOnBackface;
+  float _padding;
   // Backface material (mirrors the front layout). Used by fragment_main and the
   // peel shaders when the actor has a backface property; identical to the front
   // material otherwise.
@@ -133,6 +136,11 @@ struct MaterialUniforms {
   float backfaceOpacity;
   float backfaceSpecularPower;
   float2 _padding2;
+  // Actor-texture ClampToBorder support: Metal's sampler border-color presets
+  // cannot represent arbitrary border colors, so when a ClampToBorder texture
+  // is active the sampler clamps to edge and this field supplies the border
+  // color; .w is 1.0 when the fallback is in use, 0.0 otherwise.
+  float4 borderColor;
 };
 
 // Light data
@@ -197,7 +205,6 @@ struct FragmentOutputNoDepth {
   float4 color [[color(0)]];
   uint4 ids [[color(1)]];
 };
-
 
 // ---------------------------------------------------------------------------
 // Shared Shader Helper Functions
@@ -309,14 +316,27 @@ inline ResolvedMaterial resolveMaterial(
     MaterialUniforms material,
     float4 vertexColor, float2 uv,
     texture2d<float> actorTexture, sampler actorSampler,
-    bool useVertexColor, bool useTexture)
+    bool useVertexColor, bool useTexture,
+    bool frontFacing, bool showTexturesOnBackface)
 {
     ResolvedMaterial r;
     r.ambient = useVertexColor ? vertexColor.rgb : material.ambientColor.rgb;
     r.diffuse = useVertexColor ? vertexColor.rgb : material.diffuseColor.rgb;
     r.opacity = useVertexColor ? vertexColor.a : material.opacity;
-    if (useTexture) {
-        float4 tex = actorTexture.sample(actorSampler, uv);
+    if (useTexture && (frontFacing || showTexturesOnBackface)) {
+        float4 tex;
+        if (material.borderColor.w > 0.0f) {
+            // ClampToBorder with an arbitrary border color (Metal sampler
+            // presets only cover black/white): clamp the sample coordinates to
+            // [0,1] and substitute the border color where uv escapes the range.
+            float2 clampedUV = clamp(uv, 0.0f, 1.0f);
+            tex = actorTexture.sample(actorSampler, clampedUV);
+            float outside = max(step(1.0f, abs(uv.x - 0.5f) * 2.0f),
+                                step(1.0f, abs(uv.y - 0.5f) * 2.0f));
+            tex = mix(tex, material.borderColor, outside);
+        } else {
+            tex = actorTexture.sample(actorSampler, uv);
+        }
         r.ambient *= tex.rgb;
         r.diffuse *= tex.rgb;
         r.opacity *= tex.a;
@@ -594,7 +614,8 @@ inline FragmentColorAndIds evaluateSurfaceFragment(VertexOut in,
     // Compile-time flags: the specialized surface pipelines bake the color and
     // texture decisions in (GL compiles the scalar-color path in directly).
     r = resolveMaterial(m, effColor, in.uv, actorTexture, actorSampler,
-      kHasSurfaceColors || kHasCellTexture, kHasActorTexture);
+      kHasSurfaceColors || kHasCellTexture, kHasActorTexture,
+      frontFacing, material.showTexturesOnBackface);
   }
   else
   {
@@ -727,7 +748,8 @@ fragment OITAccumulateOutput fragment_main_oit(VertexOut in [[stage_in]],
 
   ResolvedMaterial r = resolveMaterial(m, resolveCellColor(in, prim_id, scene, cellColorTex), in.uv, actorTexture, actorSampler,
     (scene.flags & kSceneFlagHasSurfaceColors) != 0u,
-    (scene.flags & kSceneFlagHasActorTexture) != 0u);
+    (scene.flags & kSceneFlagHasActorTexture) != 0u,
+    frontFacing, material.showTexturesOnBackface);
   applySurfaceEdges(N, r, in, lights, edge, scene);
 
   float3 totalAmbient = m.ambientColor.w * r.ambient;
@@ -1593,7 +1615,8 @@ fragment PeelPassOutput fragment_peel(
   }
   ResolvedMaterial r = resolveMaterial(m, resolveCellColor(in, prim_id, scene, cellColorTex), in.uv, actorTexture, actorSampler,
     (scene.flags & kSceneFlagHasSurfaceColors) != 0u,
-    (scene.flags & kSceneFlagHasActorTexture) != 0u);
+    (scene.flags & kSceneFlagHasActorTexture) != 0u,
+    frontFacing, material.showTexturesOnBackface);
   applySurfaceEdges(N, r, in, lights, edge, scene);
   float3 totalAmbient = m.ambientColor.w * r.ambient;
   float3 totalDiffuse = float3(0.0);
@@ -1654,7 +1677,8 @@ fragment float4 fragment_peel_alpha_blend(
   }
   ResolvedMaterial r = resolveMaterial(m, resolveCellColor(in, prim_id, scene, cellColorTex), in.uv, actorTexture, actorSampler,
     (scene.flags & kSceneFlagHasSurfaceColors) != 0u,
-    (scene.flags & kSceneFlagHasActorTexture) != 0u);
+    (scene.flags & kSceneFlagHasActorTexture) != 0u,
+    frontFacing, material.showTexturesOnBackface);
   applySurfaceEdges(N, r, in, lights, edge, scene);
   float3 totalAmbient = m.ambientColor.w * r.ambient;
   float3 totalDiffuse = float3(0.0);

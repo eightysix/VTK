@@ -4498,6 +4498,7 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
                 options:MTLResourceStorageModeShared];
     vtkMetalMRC::AssignConsumed(this->Internals->TriangleUVBuffer, uvBuf);
   }
+  
   else if (!positions.empty())
   {
     // Always provide a zero UV buffer so the vertex shader can always read from buffer(8)
@@ -5826,9 +5827,10 @@ void vtkMetalPolyDataMapper::UpdateMaterialUniforms(void* mtlDevice, vtkActor* a
   // diffuseColor: rgb + diffuse_intensity
   // specularColor: rgb + specular_intensity
   // color: base color (unused in lighting)
-  // opacity, specularPower, 2 pad
-  // then the same 20 floats again for the backface material.
-  float mu[40];
+  // opacity, specularPower, showTexturesOnBackface, pad
+  // then the same fields again for the backface material,
+  // then borderColor (actor-texture ClampToBorder color + active flag).
+  float mu[44];
   memset(mu, 0, sizeof(mu));
 
   // ambientColor.rgb = property ambient color, .w = ambient intensity
@@ -5898,6 +5900,10 @@ void vtkMetalPolyDataMapper::UpdateMaterialUniforms(void* mtlDevice, vtkActor* a
     ? 1.0f
     : static_cast<float>(prop->GetOpacity());
   mu[17] = static_cast<float>(prop->GetSpecularPower());
+  // mu[18] = showTexturesOnBackface (1.0 skips the texture on back faces),
+  // mu[19] = padding. Matches the shader's MaterialUniforms layout.
+  mu[18] = prop->GetShowTexturesOnBackface() ? 1.0f : 0.0f;
+  mu[19] = 0.0f;
 
   // Backface material: mirror the front material, then override with the
   // actor's backface property when present (matches vtkOpenGLPolyDataMapper,
@@ -5928,6 +5934,19 @@ void vtkMetalPolyDataMapper::UpdateMaterialUniforms(void* mtlDevice, vtkActor* a
     mu[35] = 1.0f;
     mu[36] = static_cast<float>(backProp->GetOpacity());
     mu[37] = static_cast<float>(backProp->GetSpecularPower());
+  }
+
+  // Actor-texture ClampToBorder color (mu[40..43]): the shader clamps the
+  // sample coordinates and substitutes this color where uv escapes [0,1],
+  // because Metal's sampler border-color presets cannot express arbitrary
+  // border colors. The flag (mu[43]) is 1.0 only for ClampToBorder textures.
+  if (vtkTexture* tex = actor->GetTexture())
+  {
+    float* bc = tex->GetBorderColor();
+    mu[40] = bc[0];
+    mu[41] = bc[1];
+    mu[42] = bc[2];
+    mu[43] = (tex->GetWrap() == vtkTexture::ClampToBorder) ? 1.0f : 0.0f;
   }
 
   if (!this->Internals->MaterialUniformBuffer)
@@ -6545,11 +6564,33 @@ void vtkMetalPolyDataMapper::UpdateActorTexture(void* mtlDevice, vtkActor* actor
 
   delete[] rgbaData;
 
-  // Create sampler state. Match vtkTexture's repeat/edge-clamp settings
-  // (GL: GL_REPEAT, GL_CLAMP_TO_EDGE, or GL_CLAMP).
+  // Create sampler state. Match vtkTexture's wrap mode (GL: GL_REPEAT,
+  // GL_CLAMP_TO_EDGE, GL_MIRRORED_REPEAT, or GL_CLAMP_TO_BORDER).
   MTLSamplerDescriptor* samplerDesc = [[MTLSamplerDescriptor alloc] init];
-  MTLSamplerAddressMode addrMode =
-    texture->GetRepeat() ? MTLSamplerAddressModeRepeat : MTLSamplerAddressModeClampToEdge;
+  MTLSamplerAddressMode addrMode = MTLSamplerAddressModeClampToEdge;
+  switch (texture->GetWrap())
+  {
+    case vtkTexture::ClampToEdge:
+      addrMode = MTLSamplerAddressModeClampToEdge;
+      break;
+    case vtkTexture::Repeat:
+      addrMode = MTLSamplerAddressModeRepeat;
+      break;
+    case vtkTexture::MirroredRepeat:
+      addrMode = MTLSamplerAddressModeMirrorRepeat;
+      break;
+    case vtkTexture::ClampToBorder:
+      // Arbitrary border colors cannot be expressed by Metal's sampler
+      // border-color presets, so clamp to edge here and let the fragment
+      // shader substitute the material border color outside [0,1] (see
+      // resolveMaterial). This also works on platforms without
+      // ClampToBorderColor support (iOS).
+      addrMode = MTLSamplerAddressModeClampToEdge;
+      break;
+    default:
+      addrMode = MTLSamplerAddressModeClampToEdge;
+      break;
+  }
   samplerDesc.sAddressMode = addrMode;
   samplerDesc.tAddressMode = addrMode;
   samplerDesc.minFilter = MTLSamplerMinMagFilterLinear;

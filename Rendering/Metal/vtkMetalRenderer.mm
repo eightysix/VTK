@@ -133,8 +133,19 @@ void vtkMetalRenderer::DeviceRender()
     // drawable; the test-only offscreen path (benchmark timing) renders into a
     // private window-owned texture instead, skipping nextDrawable/present so
     // the CAMetalLayer display pacing cannot throttle the timed loop.
+    //
+    // With multiple renderers in one window, all renderers share a single
+    // drawable (acquired once via the render window). The first renderer clears
+    // the whole attachment; later renderers load it so their viewport regions
+    // accumulate. Only the last renderer presents, so the layer shows the
+    // composited frame exactly once.
     id<CAMetalDrawable> drawable = nil;
     id<MTLTexture> colorTarget = nil;
+    const int frameRendererIndex = renWin->GetFrameRendererIndex();
+    renWin->BumpFrameRendererIndex();
+    const int totalRenderers = renWin->GetRenderers()->GetNumberOfItems();
+    const bool firstRenderer = (frameRendererIndex == 0);
+    const bool lastRenderer = (frameRendererIndex + 1 >= totalRenderers);
 #ifdef VTK_METAL_ENABLE_OFFSCREEN_TARGET
     if (renWin->GetOffScreenRendering())
     {
@@ -147,17 +158,11 @@ void vtkMetalRenderer::DeviceRender()
     else
 #endif
     {
-      CAMetalLayer* layer = (__bridge CAMetalLayer*)renWin->GetMetalLayer();
-      if (!layer)
+      if (!renWin->AcquireDrawable())
       {
         return;
       }
-
-      drawable = [layer nextDrawable];
-      if (!drawable)
-      {
-        return;
-      }
+      drawable = (__bridge id<CAMetalDrawable>)renWin->CurrentDrawable;
       colorTarget = drawable.texture;
     }
 
@@ -167,6 +172,11 @@ void vtkMetalRenderer::DeviceRender()
     // Get viewport dimensions
     int* size = this->GetSize();
     double* viewport = this->GetViewport();
+    // The Metal viewport is expressed in window (drawable) pixels; the
+    // renderer's fractional viewport must be scaled by the WINDOW size, not the
+    // renderer's own pixel size, or multi-renderer viewport tiling collapses
+    // (each renderer would draw into an overlapping sliver of the window).
+    int* winSize = renWin->GetSize();
 
     // Determine if MSAA is active
     const bool msaa = (renWin->GetEffectiveSampleCount() > 1);
@@ -191,8 +201,16 @@ void vtkMetalRenderer::DeviceRender()
         rpd.colorAttachments[0].texture = colorTarget;
         rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
       }
-      rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
-      rpd.colorAttachments[0].clearColor = MTLClearColorMake(bgColor[0], bgColor[1], bgColor[2], 1.0);
+      // The first renderer of the frame clears the full attachment; later
+      // renderers load it so their (non-overlapping) viewport regions compose
+      // onto the same drawable.
+      const MTLStoreAction colorStore = msaa ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionStore;
+      rpd.colorAttachments[0].loadAction = firstRenderer ? MTLLoadActionClear : MTLLoadActionLoad;
+      if (firstRenderer)
+      {
+        rpd.colorAttachments[0].clearColor = MTLClearColorMake(bgColor[0], bgColor[1], bgColor[2], 1.0);
+      }
+      rpd.colorAttachments[0].storeAction = colorStore;
 
       // IDs texture for GPU picking (skip when MSAA active)
       if (!msaa)
@@ -201,8 +219,11 @@ void vtkMetalRenderer::DeviceRender()
         if (idsTex)
         {
           rpd.colorAttachments[1].texture = idsTex;
-          rpd.colorAttachments[1].loadAction = MTLLoadActionClear;
-          rpd.colorAttachments[1].clearColor = MTLClearColorMake(0, 0, 0, 0);
+          rpd.colorAttachments[1].loadAction = firstRenderer ? MTLLoadActionClear : MTLLoadActionLoad;
+          if (firstRenderer)
+          {
+            rpd.colorAttachments[1].clearColor = MTLClearColorMake(0, 0, 0, 0);
+          }
           rpd.colorAttachments[1].storeAction = MTLStoreActionStore;
         }
       }
@@ -212,7 +233,7 @@ void vtkMetalRenderer::DeviceRender()
       if (msaa && msaaDepthTex)
       {
         rpd.depthAttachment.texture = msaaDepthTex;
-        rpd.depthAttachment.loadAction = MTLLoadActionClear;
+        rpd.depthAttachment.loadAction = firstRenderer ? MTLLoadActionClear : MTLLoadActionLoad;
         rpd.depthAttachment.clearDepth = 1.0;
         rpd.depthAttachment.storeAction = MTLStoreActionStore;
       }
@@ -222,7 +243,7 @@ void vtkMetalRenderer::DeviceRender()
         if (depthTex)
         {
           rpd.depthAttachment.texture = depthTex;
-          rpd.depthAttachment.loadAction = MTLLoadActionClear;
+          rpd.depthAttachment.loadAction = firstRenderer ? MTLLoadActionClear : MTLLoadActionLoad;
           rpd.depthAttachment.clearDepth = 1.0;
           rpd.depthAttachment.storeAction = MTLStoreActionStore;
         }
@@ -246,10 +267,10 @@ void vtkMetalRenderer::DeviceRender()
 
       // Set viewport
       MTLViewport metalViewport;
-      metalViewport.originX = viewport[0] * size[0];
-      metalViewport.originY = viewport[1] * size[1];
-      metalViewport.width = viewport[2] * size[0];
-      metalViewport.height = viewport[3] * size[1];
+      metalViewport.originX = viewport[0] * winSize[0];
+      metalViewport.originY = viewport[1] * winSize[1];
+      metalViewport.width = (viewport[2] - viewport[0]) * winSize[0];
+      metalViewport.height = (viewport[3] - viewport[1]) * winSize[1];
       metalViewport.znear = 0.0;
       metalViewport.zfar = 1.0;
       [encoder setViewport:metalViewport];
@@ -485,10 +506,10 @@ void vtkMetalRenderer::DeviceRender()
       renWin->Encoder = (__bridge void*)encoder;
 
       MTLViewport metalViewport;
-      metalViewport.originX = viewport[0] * size[0];
-      metalViewport.originY = viewport[1] * size[1];
-      metalViewport.width = viewport[2] * size[0];
-      metalViewport.height = viewport[3] * size[1];
+      metalViewport.originX = viewport[0] * winSize[0];
+      metalViewport.originY = viewport[1] * winSize[1];
+      metalViewport.width = (viewport[2] - viewport[0]) * winSize[0];
+      metalViewport.height = (viewport[3] - viewport[1]) * winSize[1];
       metalViewport.znear = 0.0;
       metalViewport.zfar = 1.0;
       [encoder setViewport:metalViewport];
@@ -600,10 +621,10 @@ void vtkMetalRenderer::DeviceRender()
       renWin->Encoder = (__bridge void*)encoder;
 
       MTLViewport metalViewport;
-      metalViewport.originX = viewport[0] * size[0];
-      metalViewport.originY = viewport[1] * size[1];
-      metalViewport.width = viewport[2] * size[0];
-      metalViewport.height = viewport[3] * size[1];
+      metalViewport.originX = viewport[0] * winSize[0];
+      metalViewport.originY = viewport[1] * winSize[1];
+      metalViewport.width = (viewport[2] - viewport[0]) * winSize[0];
+      metalViewport.height = (viewport[3] - viewport[1]) * winSize[1];
       metalViewport.znear = 0.0;
       metalViewport.zfar = 1.0;
       [encoder setViewport:metalViewport];
@@ -744,10 +765,10 @@ void vtkMetalRenderer::DeviceRender()
 
               // Set viewport to full window
               MTLViewport metalViewport;
-              metalViewport.originX = viewport[0] * size[0];
-              metalViewport.originY = viewport[1] * size[1];
-              metalViewport.width = viewport[2] * size[0];
-              metalViewport.height = viewport[3] * size[1];
+              metalViewport.originX = viewport[0] * winSize[0];
+              metalViewport.originY = viewport[1] * winSize[1];
+              metalViewport.width = (viewport[2] - viewport[0]) * winSize[0];
+              metalViewport.height = (viewport[3] - viewport[1]) * winSize[1];
               metalViewport.znear = 0.0;
               metalViewport.zfar = 1.0;
               [blitEncoder setViewport:metalViewport];
@@ -828,10 +849,10 @@ void vtkMetalRenderer::DeviceRender()
       renWin->Encoder = (__bridge void*)encoder;
 
       MTLViewport metalViewport;
-      metalViewport.originX = viewport[0] * size[0];
-      metalViewport.originY = viewport[1] * size[1];
-      metalViewport.width = viewport[2] * size[0];
-      metalViewport.height = viewport[3] * size[1];
+      metalViewport.originX = viewport[0] * winSize[0];
+      metalViewport.originY = viewport[1] * winSize[1];
+      metalViewport.width = (viewport[2] - viewport[0]) * winSize[0];
+      metalViewport.height = (viewport[3] - viewport[1]) * winSize[1];
       metalViewport.znear = 0.0;
       metalViewport.zfar = 1.0;
       [encoder setViewport:metalViewport];
@@ -872,8 +893,9 @@ void vtkMetalRenderer::DeviceRender()
     }
 #endif
 
-    // Commit and present
-    if (drawable)
+    // Commit and present. Only the last renderer presents the shared drawable
+    // (presenting it more than once per frame is invalid on CAMetalLayer).
+    if (drawable && lastRenderer)
     {
       [commandBuffer presentDrawable:drawable];
     }
