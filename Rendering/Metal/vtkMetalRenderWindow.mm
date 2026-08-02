@@ -370,6 +370,7 @@ void vtkMetalRenderWindow::RecreateColorCopyTexture()
 //------------------------------------------------------------------------------
 void vtkMetalRenderWindow::RecreateDepthCopyTexture()
 {
+#ifdef VTK_METAL_ENABLE_COLOR_READBACK
   if (this->DepthCopyTexture)
   {
     [(id)this->DepthCopyTexture release];
@@ -385,9 +386,9 @@ void vtkMetalRenderWindow::RecreateDepthCopyTexture()
     }
     MTLTextureDescriptor* desc =
       [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-                                                        width:this->Size[0]
-                                                       height:this->Size[1]
-                                                    mipmapped:NO];
+                                                         width:this->Size[0]
+                                                        height:this->Size[1]
+                                                     mipmapped:NO];
     // Shared storage allows synchronous CPU reads via getBytes after the GPU
     // frame completes. RenderTarget/ShaderRead/ShaderWrite usage makes it a
     // valid blit (and MSAA resolve) destination.
@@ -398,6 +399,7 @@ void vtkMetalRenderWindow::RecreateDepthCopyTexture()
     id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
     this->DepthCopyTexture = (void*)tex;
   }
+#endif
 }
 
 //------------------------------------------------------------------------------

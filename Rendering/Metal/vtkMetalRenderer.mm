@@ -239,7 +239,9 @@ void vtkMetalRenderer::DeviceRender()
         // Resolve the multisampled depth into the non-MSAA DepthTexture so the
         // CPU read-back (GetZbufferData) can blit it out, like the volume pass
         // below. StoreAndMultisampleResolve keeps the MSAA content so later
-        // passes (translucent/volume/overlay) still load it.
+        // passes (translucent/volume/overlay) still load it. Compiled only into
+        // test builds so production MSAA frames do not pay for this resolve.
+#ifdef VTK_METAL_ENABLE_COLOR_READBACK
         id<MTLTexture> resolveDepthTex = (__bridge id<MTLTexture>)renWin->DepthTexture;
         if (resolveDepthTex)
         {
@@ -250,6 +252,9 @@ void vtkMetalRenderer::DeviceRender()
         {
           rpd.depthAttachment.storeAction = MTLStoreActionStore;
         }
+#else
+        rpd.depthAttachment.storeAction = MTLStoreActionStore;
+#endif
       }
       else
       {
