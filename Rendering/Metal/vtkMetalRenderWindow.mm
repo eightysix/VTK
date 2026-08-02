@@ -10,6 +10,8 @@
 #include "vtkCommand.h"
 #include "vtkUnsignedIntArray.h"
 #include "vtkUnsignedCharArray.h"
+#include "vtkFloatArray.h"
+#include "vtkNew.h"
 #include "vtkMetalShaders.h"
 
 #include <algorithm>
@@ -194,6 +196,12 @@ void vtkMetalRenderWindow::Finalize()
     this->ColorCopyTexture = nullptr;
   }
 
+  if (this->DepthCopyTexture)
+  {
+    [(id)this->DepthCopyTexture release];
+    this->DepthCopyTexture = nullptr;
+  }
+
 #ifdef VTK_METAL_ENABLE_OFFSCREEN_TARGET
   if (this->OffscreenColorTexture)
   {
@@ -357,6 +365,39 @@ void vtkMetalRenderWindow::RecreateColorCopyTexture()
     this->ColorCopyTexture = (void*)tex;
   }
 #endif
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalRenderWindow::RecreateDepthCopyTexture()
+{
+  if (this->DepthCopyTexture)
+  {
+    [(id)this->DepthCopyTexture release];
+    this->DepthCopyTexture = nullptr;
+  }
+
+  @autoreleasepool
+  {
+    id<MTLDevice> device = (id<MTLDevice>)this->MetalDevice;
+    if (!device)
+    {
+      return;
+    }
+    MTLTextureDescriptor* desc =
+      [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                                        width:this->Size[0]
+                                                       height:this->Size[1]
+                                                    mipmapped:NO];
+    // Shared storage allows synchronous CPU reads via getBytes after the GPU
+    // frame completes. RenderTarget/ShaderRead/ShaderWrite usage makes it a
+    // valid blit (and MSAA resolve) destination.
+    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    desc.storageMode = MTLStorageModeShared;
+
+    // newTextureWithDescriptor returns +1 (new rule); member owns it directly.
+    id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+    this->DepthCopyTexture = (void*)tex;
+  }
 }
 
 //------------------------------------------------------------------------------
@@ -533,6 +574,13 @@ void vtkMetalRenderWindow::Render()
           colorCopyTex.height != (NSUInteger)this->Size[1])
       {
         this->RecreateColorCopyTexture();
+      }
+
+      id<MTLTexture> depthCopyTex = (id<MTLTexture>)this->DepthCopyTexture;
+      if (!depthCopyTex || depthCopyTex.width != (NSUInteger)this->Size[0] ||
+          depthCopyTex.height != (NSUInteger)this->Size[1])
+      {
+        this->RecreateDepthCopyTexture();
       }
 #endif
 
@@ -1002,6 +1050,66 @@ int vtkMetalRenderWindow::GetRGBACharPixelData(
 }
 
 //------------------------------------------------------------------------------
+float* vtkMetalRenderWindow::GetRGBAPixelData(int x1, int y1, int x2, int y2, int front, int right)
+{
+  (void)front;
+  (void)right;
+
+  vtkNew<vtkUnsignedCharArray> rgba;
+  if (!this->GetRGBACharPixelData(x1, y1, x2, y2, front, rgba, right))
+  {
+    return nullptr;
+  }
+
+  const vtkIdType n = rgba->GetNumberOfValues();
+  float* data = new float[n];
+  const unsigned char* src = rgba->GetPointer(0);
+  const float inv = 1.0f / 255.0f;
+  for (vtkIdType i = 0; i < n; ++i)
+  {
+    data[i] = src[i] * inv;
+  }
+  return data;
+}
+
+//------------------------------------------------------------------------------
+int vtkMetalRenderWindow::GetRGBAPixelData(
+  int x1, int y1, int x2, int y2, int front, vtkFloatArray* data, int right)
+{
+  (void)front;
+  (void)right;
+
+  if (!data)
+  {
+    return 0;
+  }
+
+  vtkNew<vtkUnsignedCharArray> rgba;
+  if (!this->GetRGBACharPixelData(x1, y1, x2, y2, front, rgba, right))
+  {
+    return 0;
+  }
+
+  const vtkIdType n = rgba->GetNumberOfValues();
+  data->SetNumberOfComponents(4);
+  data->SetNumberOfValues(n);
+  const unsigned char* src = rgba->GetPointer(0);
+  float* dst = data->GetPointer(0);
+  const float inv = 1.0f / 255.0f;
+  for (vtkIdType i = 0; i < n; ++i)
+  {
+    dst[i] = src[i] * inv;
+  }
+  return 1;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalRenderWindow::ReleaseRGBAPixelData(float* data)
+{
+  delete[] data;
+}
+
+//------------------------------------------------------------------------------
 int vtkMetalRenderWindow::GetColorBufferSizes(int* rgba)
 {
   if (rgba == nullptr)
@@ -1015,6 +1123,138 @@ int vtkMetalRenderWindow::GetColorBufferSizes(int* rgba)
   rgba[1] = 8;
   rgba[2] = 8;
   rgba[3] = 8;
+  return 1;
+}
+
+//------------------------------------------------------------------------------
+int vtkMetalRenderWindow::ReadDepthCopyData(int x, int y, int width, int height, float* dest)
+{
+#ifndef VTK_METAL_ENABLE_COLOR_READBACK
+  (void)x;
+  (void)y;
+  (void)width;
+  (void)height;
+  (void)dest;
+  return 0;
+#else
+  if (!dest)
+  {
+    return 0;
+  }
+
+  @autoreleasepool
+  {
+    id<MTLTexture> depthTex = (__bridge id<MTLTexture>)this->DepthCopyTexture;
+    if (!depthTex)
+    {
+      return 0;
+    }
+
+    int texW = static_cast<int>(depthTex.width);
+    int texH = static_cast<int>(depthTex.height);
+    int xMin = std::max(0, x);
+    int yMin = std::max(0, y);
+    int xMax = std::min(texW - 1, x + width - 1);
+    int yMax = std::min(texH - 1, y + height - 1);
+
+    int w = xMax - xMin + 1;
+    int h = yMax - yMin + 1;
+    if (w <= 0 || h <= 0)
+    {
+      return 0;
+    }
+
+    // Wait for the frame whose copy wrote DepthCopyTexture to finish before
+    // reading it back (getBytes would otherwise race the GPU).
+    this->WaitForCompletion();
+
+    // The requested rect uses VTK window coordinates (origin at the lower
+    // left, y up), but the texture is top-origin (texture row 0 is the top of
+    // the framebuffer), so read the flipped region and emit rows bottom-up.
+    const int firstTexRow = (texH - 1) - (yMin + h - 1);
+    MTLRegion region = MTLRegionMake2D(xMin, firstTexRow, w, h);
+    std::vector<float> texData(w * h);
+    [depthTex getBytes:texData.data() bytesPerRow:w * sizeof(float) fromRegion:region mipmapLevel:0];
+
+    for (int row = 0; row < h; ++row)
+    {
+      const int vtkRow = yMin + row;
+      const int srcRow = (yMin + h - 1) - vtkRow; // rows are reversed in the texture
+      std::copy(&texData[srcRow * w], &texData[srcRow * w] + w, dest + row * w);
+    }
+    return 1;
+  }
+#endif
+}
+
+//------------------------------------------------------------------------------
+float* vtkMetalRenderWindow::GetZbufferData(int x1, int y1, int x2, int y2)
+{
+  int x_low = std::min(x1, x2);
+  int x_hi = std::max(x1, x2);
+  int y_low = std::min(y1, y2);
+  int y_hi = std::max(y1, y2);
+
+  int width = (x_hi - x_low) + 1;
+  int height = (y_hi - y_low) + 1;
+
+  float* data = new float[width * height];
+  if (!this->ReadDepthCopyData(x_low, y_low, width, height, data))
+  {
+    std::fill(data, data + width * height, 0.0f);
+  }
+  return data;
+}
+
+//------------------------------------------------------------------------------
+int vtkMetalRenderWindow::GetZbufferData(int x1, int y1, int x2, int y2, float* z)
+{
+  if (!z)
+  {
+    return 0;
+  }
+
+  int x_low = std::min(x1, x2);
+  int x_hi = std::max(x1, x2);
+  int y_low = std::min(y1, y2);
+  int y_hi = std::max(y1, y2);
+
+  int width = (x_hi - x_low) + 1;
+  int height = (y_hi - y_low) + 1;
+
+  if (!this->ReadDepthCopyData(x_low, y_low, width, height, z))
+  {
+    std::fill(z, z + width * height, 0.0f);
+    return 0;
+  }
+  return 1;
+}
+
+//------------------------------------------------------------------------------
+int vtkMetalRenderWindow::GetZbufferData(int x1, int y1, int x2, int y2, vtkFloatArray* z)
+{
+  if (!z)
+  {
+    return 0;
+  }
+
+  int x_low = std::min(x1, x2);
+  int x_hi = std::max(x1, x2);
+  int y_low = std::min(y1, y2);
+  int y_hi = std::max(y1, y2);
+
+  int width = (x_hi - x_low) + 1;
+  int height = (y_hi - y_low) + 1;
+  int size = width * height;
+
+  z->SetNumberOfComponents(1);
+  z->SetNumberOfValues(size);
+
+  if (!this->ReadDepthCopyData(x_low, y_low, width, height, z->GetPointer(0)))
+  {
+    std::fill(z->GetPointer(0), z->GetPointer(0) + size, 0.0f);
+    return 0;
+  }
   return 1;
 }
 

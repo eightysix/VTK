@@ -208,7 +208,8 @@ void vtkMetalRenderer::DeviceRender()
       rpd.colorAttachments[0].loadAction = firstRenderer ? MTLLoadActionClear : MTLLoadActionLoad;
       if (firstRenderer)
       {
-        rpd.colorAttachments[0].clearColor = MTLClearColorMake(bgColor[0], bgColor[1], bgColor[2], 1.0);
+        rpd.colorAttachments[0].clearColor =
+          MTLClearColorMake(bgColor[0], bgColor[1], bgColor[2], this->GetBackgroundAlpha());
       }
       rpd.colorAttachments[0].storeAction = colorStore;
 
@@ -235,7 +236,20 @@ void vtkMetalRenderer::DeviceRender()
         rpd.depthAttachment.texture = msaaDepthTex;
         rpd.depthAttachment.loadAction = firstRenderer ? MTLLoadActionClear : MTLLoadActionLoad;
         rpd.depthAttachment.clearDepth = 1.0;
-        rpd.depthAttachment.storeAction = MTLStoreActionStore;
+        // Resolve the multisampled depth into the non-MSAA DepthTexture so the
+        // CPU read-back (GetZbufferData) can blit it out, like the volume pass
+        // below. StoreAndMultisampleResolve keeps the MSAA content so later
+        // passes (translucent/volume/overlay) still load it.
+        id<MTLTexture> resolveDepthTex = (__bridge id<MTLTexture>)renWin->DepthTexture;
+        if (resolveDepthTex)
+        {
+          rpd.depthAttachment.resolveTexture = resolveDepthTex;
+          rpd.depthAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+        }
+        else
+        {
+          rpd.depthAttachment.storeAction = MTLStoreActionStore;
+        }
       }
       else
       {
@@ -903,6 +917,32 @@ void vtkMetalRenderer::DeviceRender()
                    sourceSize:MTLSizeMake((NSUInteger)colorTarget.width,
                          (NSUInteger)colorTarget.height, 1)
                     toTexture:colorCopyTex
+             destinationSlice:0
+             destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+      }
+    }
+
+    // Copy the resolved depth buffer to a shared texture so the CPU can read
+    // it back (vtkRenderWindow::GetZbufferData → vtkSelectVisiblePoints and
+    // vtkWorldPointPicker). The non-MSAA DepthTexture always holds the final
+    // depth: it is the render target when MSAA is off, and the MSAA depth
+    // resolve target when MSAA is on (see the opaque and volume passes).
+    {
+      id<MTLTexture> depthCopyTex = (__bridge id<MTLTexture>)renWin->DepthCopyTexture;
+      id<MTLTexture> depthTex = (__bridge id<MTLTexture>)renWin->DepthTexture;
+      if (depthCopyTex && depthTex && renWin->GetColorReadbackEnabled())
+      {
+        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+        blit.label = @"VTK Depth Readback Copy";
+        [blit copyFromTexture:depthTex
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:MTLOriginMake(0, 0, 0)
+                   sourceSize:MTLSizeMake((NSUInteger)depthTex.width,
+                         (NSUInteger)depthTex.height, 1)
+                    toTexture:depthCopyTex
              destinationSlice:0
              destinationLevel:0
             destinationOrigin:MTLOriginMake(0, 0, 0)];

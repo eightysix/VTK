@@ -204,10 +204,49 @@ public:
     vtkUnsignedCharArray* data, int right = 0) override;
 
   /**
+   * Read the color framebuffer back as normalized float RGBARGBA (4
+   * components per pixel, each in [0,1]). The caller owns the returned
+   * array. The front/right arguments are accepted for API compatibility;
+   * Metal has a single (drawable) buffer. Y-axis is flipped to match VTK's
+   * bottom-left origin.
+   */
+  float* GetRGBAPixelData(
+    int x1, int y1, int x2, int y2, int front, int right = 0) override;
+
+  /**
+   * Read the color framebuffer back as normalized float RGBARGBA into the
+   * given array.
+   */
+  int GetRGBAPixelData(
+    int x1, int y1, int x2, int y2, int front, vtkFloatArray* data, int right = 0) override;
+
+  /**
+   * Free memory returned by the float GetRGBAPixelData overload.
+   */
+  void ReleaseRGBAPixelData(float* data) override;
+
+  /**
    * Return the number of bits per channel of the color buffers. The Metal
    * color attachments are BGRA8Unorm (8 bits per channel).
    */
   int GetColorBufferSizes(int* rgba) override;
+
+  /**
+   * Read the depth framebuffer back as normalized floats in [0,1] (near to
+   * far). The caller owns the returned array. Y-axis is flipped to match
+   * VTK's bottom-left origin.
+   */
+  float* GetZbufferData(int x, int y, int x2, int y2) override;
+
+  /**
+   * Read the depth framebuffer back into a caller-provided float array.
+   */
+  int GetZbufferData(int x, int y, int x2, int y2, float* z) override;
+
+  /**
+   * Read the depth framebuffer back into the given array.
+   */
+  int GetZbufferData(int x, int y, int x2, int y2, vtkFloatArray* z) override;
 
 protected:
   vtkMetalRenderWindow();
@@ -238,6 +277,12 @@ protected:
    * rendered frame (GetPixelData / GetRGBACharPixelData).
    */
   void RecreateColorCopyTexture();
+
+  /**
+   * Recreate the shared depth-copy texture used for CPU read-back of the
+   * rendered depth buffer (GetZbufferData).
+   */
+  void RecreateDepthCopyTexture();
 
 #ifdef VTK_METAL_ENABLE_OFFSCREEN_TARGET
   /**
@@ -283,6 +328,7 @@ protected:
   void* DepthTexture = nullptr;    // id<MTLTexture>
   void* IdsTexture = nullptr;      // id<MTLTexture> — RGBA32Uint for picking IDs
   void* ColorCopyTexture = nullptr; // id<MTLTexture> — BGRA8Unorm, MTLStorageModeShared, color read-back
+  void* DepthCopyTexture = nullptr; // id<MTLTexture> — Depth32Float, MTLStorageModeShared, depth read-back
 #ifdef VTK_METAL_ENABLE_OFFSCREEN_TARGET
   void* OffscreenColorTexture = nullptr; // id<MTLTexture> — BGRA8Unorm, MTLStorageModePrivate, offscreen target
 #endif
@@ -329,6 +375,13 @@ private:
    * and BGRA is converted to RGB(A). Returns 1 on success, 0 on failure.
    */
   int ReadColorCopyData(int x, int y, int width, int height, int ncomp, void* dest);
+
+  /**
+   * Copy a region of the shared depth-copy texture into a float buffer.
+   * Output rows are bottom-up (VTK convention). Returns 1 on success, 0 on
+   * failure.
+   */
+  int ReadDepthCopyData(int x, int y, int width, int height, float* dest);
 
   vtkMetalRenderWindow(const vtkMetalRenderWindow&) = delete;
   void operator=(const vtkMetalRenderWindow&) = delete;
