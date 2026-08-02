@@ -72,7 +72,7 @@ inspection tool, not a pass/fail test.
   (`vtkImageDifference`, threshold 20, same metric `vtkTesting` uses) exceeds
   the value.
 
-The scenes are the final rendered states of the 12 `TestMetal*.cxx` regression
+The scenes are the final rendered states of the 13 `TestMetal*.cxx` regression
 tests, reproduced backend-agnostically in `TestMetalScenes.h`. As of writing,
 `RenderWindow`, `Camera`, `Light`, `CompositePolyDataMapper` and
 `HardwareSelector` match OpenGL to within a few hundredths of a percent of
