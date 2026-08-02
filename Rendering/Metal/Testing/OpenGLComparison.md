@@ -208,7 +208,10 @@ drawable path. Rerun on any machine with:
 `--frames` is the number of timed renders per run; `--reps` repeats the whole
 per-scene measurement (fresh window each run) and the harness reports the mean
 of the per-run averages plus the run-to-run standard deviation. The tables
-below use the mean of 3 runs.
+below use the mean of 3 runs. `--gpu-mem` additionally prints the Metal
+device's `currentAllocatedSize` after each scene — useful for checking that
+the interleaved GL+Metal runs do not accumulate GPU memory (see the glitch
+note in the complexity section below).
 
 How to read the table:
 
@@ -329,37 +332,66 @@ machine that reproduces the documented M1 VolumeRayCast residual 0.005):
 ```
 scene                          GL ms/f   GL fps   Metal ms/f  Metal fps    M/GL
 -------------------------------------------------------------------
-CpxGeomLo                         0.84   1194.3        0.63     1593.0    0.75
-CpxGeomHi                         2.46    406.2        2.47      404.7    1.00
-CpxCellLo                         0.84   1196.2        0.77     1291.2    0.93
-CpxCellHi                         2.55    391.4        2.68      372.5    1.05
-CpxPointLo                        0.81   1231.0        0.75     1336.5    0.92
-CpxPointHi                        2.40    415.9        2.39      419.2    0.99
-CpxGeomBig                        4.10    244.0        4.02      249.0    0.98
-CpxPointBig                       4.14    241.4        4.15      241.2    1.00
-CpxCellBig                        4.23    236.3        4.16      240.5    0.98
-CpxActorLo                        1.26    796.7        0.94     1063.4    0.75
-CpxActorHi                       12.84     77.9       12.51       79.9    0.97
-CpxPeel3                          4.29    233.1        1.12      892.6    0.26
-CpxPeel12                        12.89     77.6        3.57      279.8    0.28
-CpxVol64                          1.51    661.8        0.59     1686.7    0.39
-CpxVol128                         1.61    620.8        0.56     1776.3    0.35
+CpxGeomLo                         0.59   1705.4        0.65     1539.5    1.11
+CpxGeomHi                         2.01    498.5        2.14      466.3    1.07
+CpxCellLo                         0.60   1655.4        0.78     1282.1    1.29
+CpxCellHi                         2.12    471.4        2.46      406.0    1.16
+CpxPointLo                        0.60   1653.5        0.72     1383.0    1.20
+CpxPointHi                        2.06    486.5        2.29      437.3    1.11
+CpxGeomBig                        3.53    283.0        3.96      252.3    1.12
+CpxPointBig                       3.31    302.0        3.89      257.3    1.17
+CpxCellBig                        3.55    282.1        3.87      258.6    1.09
+CpxActorLo                        1.01    993.6        0.88     1132.7    0.88
+CpxActorHi                       12.33     81.1       12.68       78.9    1.03
+CpxPeel3                          3.71    269.2        1.12      889.2    0.30
+CpxPeel12                        11.79     84.8        3.89      256.9    0.33
+CpxVol64                          1.14    880.6        0.56     1793.5    0.49
+CpxVol128                         1.17    851.9        0.57     1747.9    0.49
 ```
 
-The `CpxGeom*`/`CpxCell*`/`CpxPoint*` rows are from a clean 15-scene `--reps 3`
-run; the `CpxActor*`/`CpxPeel*`/`CpxVol*` rows keep their original clean-run
-values because those tail scenes occasionally hit the transient empty-frame
-glitch (one backend reporting ~0.05–0.15 ms — nothing rendered) after the heavy
-`Cpx*Big` scenes in longer runs. Absolute ms also move ±20% run-to-run with the
-M1's GPU clock; the M/GL ratio is the meaningful metric and reproduces.
+All rows above are from a single clean 45-scene `--reps 3` run after the harness
+autorelease-pool fix described below. Earlier full-suite runs occasionally hit
+the transient empty-frame glitch (one backend reporting ~0.05–0.15 ms — nothing
+rendered) in the tail scenes after the heavy `Cpx*Big` scenes, so the
+`CpxActor*`/`CpxPeel*`/`CpxVol*` rows had to be salvaged from shorter runs;
+with the fix the whole 45-scene run completes cleanly in one pass. Absolute ms
+still move ±20% run-to-run with the M1's GPU clock and the M/GL ratios move with
+them (the geometry scenes measured ~0.92–1.05 in the earlier 15-scene run and
+~1.07–1.29 here), so treat cells as indicative rather than exact.
 
-`CpxGeomHi` went from M/GL ~1.46 to parity (0.92–1.00 across runs); the
-per-cell and per-point geometry scenes sit at 0.92–1.05, and the CPU-bound /
-peel / volume rows were already at or better than parity. The shared-vertex
-cell-id for picking in the dedup paths follows the existing first-wins
-convention (same as the GPU-tess and per-point-coloring dedup paths). What the
-dedup fix does *not* cover — scenes with real per-cell colors — is what the
-cell-texture port adds, described next.
+`CpxGeomHi` went from M/GL ~1.46 to ~1.07; the per-cell and per-point geometry
+scenes sit at ~1.07–1.29, and the CPU-bound / peel / volume rows are at or
+better than parity (0.88, 0.30–0.33, 0.49). The shared-vertex cell-id for
+picking in the dedup paths follows the existing first-wins convention (same as
+the GPU-tess and per-point-coloring dedup paths). What the dedup fix does *not*
+cover — scenes with real per-cell colors — is what the cell-texture port adds,
+described next.
+
+### Transient empty-frame glitch (fixed)
+
+Long `--bench --reps 3 --complexity` runs used to corrupt the tail scenes: after
+the heavy `Cpx*Big` scenes, the *next* scene's Metal rows occasionally reported
+~0.05–0.15 ms — nothing rendered — and stayed broken for the rest of the run.
+`--gpu-mem` (added to the harness, backed by
+`vtkMetalRenderWindow::GetAllocatedSize()`) traced it to GPU memory:
+`MTLDevice.currentAllocatedSize` grew monotonically across the interleaved
+GL+Metal scenes, from ~810 MB to ~2.9 GB, until the device ran out of memory
+(Apple's GL-on-Metal `GLDRendererMetal` command buffer failed with
+`MTLCommandBufferErrorDomain` Code=8 "Insufficient Memory"). After that every
+new Metal window got a nil device and rendered nothing — the "0.05 ms" frames
+were empty. A Metal-only control run (`--backend metal`) stayed flat (~75–250
+MB, peak on the `Cpx*Big` scenes), proving the Metal backend releases its
+per-window GPU resources correctly; the accumulation came from the interleaved
+*GL* runs.
+
+The leak was in the harness, not a backend: the GL/Cocoa window path creates
+autoreleased Objective-C objects, and the CLI `main()` never drains the
+autorelease pool, so every GL window churn leaked GPU-resident autoreleased
+objects (GL-on-Metal allocates on the same default `MTLDevice`). The fix wraps
+each capture and each bench scene in an explicit `objc_autoreleasePoolPush` /
+`Pop`. With the fix, the combined 45-scene run's memory stays flat at ~64–560 MB
+(peak on the `Cpx*Big` scenes), matching the Metal-only profile, and the full
+suite completes in one clean run.
 
 ### The per-cell color caveat (the "cell-texture port")
 
@@ -403,42 +435,41 @@ GL model:
 
 Results on this repo's machine (Apple M1 Mac mini), `--reps 3` — per-cell
 scenes went from the same ~1.5× vertex-bound regime `CpxGeomHi` was in to
-parity:
+~1.1–1.3× (the same run as the complexity table above):
 
 ```
 scene                          GL ms/f  Metal ms/f   M/GL        tris
-CpxCellLo                         0.84        0.77    0.93       ~27k
-CpxCellHi                         2.55        2.68    1.05      ~696k
-CpxCellBig                        4.23        4.16    0.98      ~1.8M
-CpxPointLo                        0.81        0.75    0.92       ~27k
-CpxPointHi                        2.40        2.39    0.99      ~696k
+CpxCellLo                         0.60        0.78    1.29       ~27k
+CpxCellHi                         2.12        2.46    1.16      ~696k
+CpxCellBig                        3.55        3.87    1.09      ~1.8M
+CpxPointLo                        0.60        0.72    1.20       ~27k
+CpxPointHi                        2.06        2.29    1.11      ~696k
 ```
 
-The investigation of the residual ~5% at mid-scale (`CpxCellHi` ~1.05):
+The investigation of the residual at mid-scale (`CpxCellHi` ~1.16):
 
 - **The gap is the fetch, not the pipeline.** Temporarily skipping the buffer
-  load in `resolveCellColor` (returning a constant) moved `CpxCellHi` from 1.05
-  to ~0.99 and `CpxCellLo` from ~1.06 to ~0.87 — the per-fragment indexed color
-  read is the entire residual. The point-colored control (`CpxPoint*`, same
-  geometry, color arrives as an interpolated varying, no fetch) runs 0.92–1.04,
-  proving the scalar pipeline itself is at parity.
+  load in `resolveCellColor` (returning a constant) moved `CpxCellHi` to ~0.99
+  and `CpxCellLo` to ~0.87 — the per-fragment indexed color read is the entire
+  residual. The point-colored control (`CpxPoint*`, same geometry, color
+  arrives as an interpolated varying, no fetch) runs below the per-cell rows
+  in the same run, proving the scalar pipeline itself is at parity.
 - **RGBA8 texture vs float buffer is a wash.** The port was first built against
   a `MTLPixelFormatRGBA32Float` buffer; switching to RGBA8Unorm changed nothing
   measurable (~1.5–2× GL's `texelFetchBuffer` cost, ~0.15–0.2 ms at
   `CpxCellHi`). The texture won on the 4× smaller footprint and the GL-faithful
   quantization, not on speed.
 - **It does not amplify with complexity.** At 1.8M triangles (`CpxCellBig`) the
-  ratio converges to 0.91–1.09 as the scene becomes geometry-bound and the
+  ratio converges toward ~1.09 as the scene becomes geometry-bound and the
   per-fragment cost is amortized; GL's own cell-texture path degrades at scale
-  too (its `CpxCellBig` runs 4.2–4.4 ms vs 3.9–4.0 for the point-colored
-  control).
+  too (its `CpxCellBig` runs 3.55 ms vs 3.31 for the point-colored control).
 
 The remaining cost is the irreducible price of dedup: the ~6× vertex-stage
-saving pays for a ~1.05× fragment fetch, which is exactly where GL lives (its
+saving pays for a ~1.1–1.3× fragment fetch, which is where GL lives (its
 `gl_PrimitiveID` + `texelFetchBuffer` does the same work). The port also makes
 picking exact in this path — per-primitive cell ids report the owning cell
 where the per-vertex first-wins value was ambiguous — so the common
-per-cell-colored case is now both at parity and exact.
+per-cell-colored case is now both at near-parity and exact.
 
 ### Recording another machine
 
