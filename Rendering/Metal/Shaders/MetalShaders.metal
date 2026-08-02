@@ -35,6 +35,7 @@ constant uint kSceneFlagPointShape          = 1u << 7;
 constant uint kSceneFlagHasSurfaceColors    = 1u << 8;
 constant uint kSceneFlagHasActorTexture     = 1u << 9;
 constant uint kSceneFlagHasSurfaceAlpha     = 1u << 10;
+constant uint kSceneFlagHasCellTexture      = 1u << 11;
 
 // Compile-time feature specialization for the surface shader (the "GL way"):
 // one shader source, specialized per feature set at pipeline creation via
@@ -51,6 +52,26 @@ constant bool kHasSurfaceAlpha  [[function_constant(8)]];
 constant bool kHasBackface      [[function_constant(9)]];
 constant bool kHasEdgeFlags     [[function_constant(10)]];
 constant bool kEmitIds          [[function_constant(11)]];
+constant bool kHasCellTexture   [[function_constant(12)]];
+
+// The per-cell color port ("cell texture"): when per-cell colors are present
+// and the vertex stream is deduplicated, the cell RGBA cannot live in the
+// vertices (a shared corner belongs to multiple cells), so it is resolved
+// per-primitive in the fragment stage via [[primitive_id]] — the direct analog
+// of GL's gl_PrimitiveID + textureC. The cell colors live in a 2D RGBA8Unorm
+// texture (kCellColorTex, texture(8)) laid out row-major with width
+// kCellTextureWidth so the div/mod in the shader compile to a shift and mask;
+// this mirrors GL's RGBA8 buffer texture, which fetches through the texture
+// unit rather than a raw device-buffer load. cellPrimitiveIds is the matching
+// 1-based cell id per triangle (0 = background) so picking reports the exact
+// owning cell instead of the provoking vertex's first-wins value.
+// kSceneFlagHasCellTexture (set only when a cell-color texture was built)
+// switches the resolved color/ID source at runtime so the all-true
+// full-feature pipelines stay correct for plain per-vertex actors.
+// Texture layout constant, must match kCellTextureWidth in
+// vtkMetalPolyDataMapper.mm. 2^13 width gives up to 8192*16384 = 134M
+// triangles, the same cap as a desktop GL buffer texture.
+constant uint kCellTextureWidth = 8192u;
 
 // Coincident topology offset (P1-5)
 struct CoincidentOffsetUniforms {
@@ -264,6 +285,24 @@ inline ResolvedMaterial resolveMaterial(
     return r;
 }
 
+// Per-cell color port: the effective per-fragment color. When the mapper built
+// a per-primitive cell-color texture (kSceneFlagHasCellTexture) the cell RGBA
+// indexed by primitive id wins over the flat per-vertex color; otherwise the
+// per-vertex color applies (whether it is actually used is decided inside
+// resolveMaterial via kSceneFlagHasSurfaceColors). The kHasCellTexture
+// compile-time gate lets the lean opaque-surface pipelines drop the texture
+// access entirely.
+inline float4 resolveCellColor(VertexOut in, uint primId,
+                               constant SceneUniforms& scene,
+                               texture2d<float, access::read> cellColorTex) {
+  if (kHasCellTexture && (scene.flags & kSceneFlagHasCellTexture) != 0u)
+  {
+    return cellColorTex.read(
+      uint2(primId % kCellTextureWidth, primId / kCellTextureWidth));
+  }
+  return in.vertexColor;
+}
+
 // Single-pass surface edges (port of vtkOpenGLPolyDataMapper::ReplaceShaderEdges).
 // The edge band is drawn on the surface fragment itself, so no separate depth
 // term is added. Per-triangle window-space edge equations are built from the
@@ -467,8 +506,11 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
                               constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
                               constant EdgeUniforms& edge [[buffer(4)]],
                               constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
+                              texture2d<float, access::read> cellColorTex [[texture(8)]],
+                              constant uint* cellPrimitiveIds [[buffer(7)]],
                               texture2d<float> actorTexture [[texture(0)]],
                               sampler actorSampler [[sampler(0)]],
+                              uint prim_id [[primitive_id]],
                               bool frontFacing [[front_facing]]) {
   if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
 
@@ -496,11 +538,14 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
   // Feature-conditional material resolution (compile-time via function
   // constants): the lean surface variant skips resolveMaterial/applySurfaceEdges
   // entirely, matching what GL's shader-template substitution produces for a
-  // plain opaque surface.
+  // plain opaque surface. The per-cell color port replaces the flat vertex
+  // color with the per-primitive cell RGBA when the mapper built a cell-color
+  // buffer.
+  float4 effColor = resolveCellColor(in, prim_id, scene, cellColorTex);
   ResolvedMaterial r;
-  if (kHasSurfaceColors || kHasActorTexture || kHasSurfaceAlpha)
+  if (kHasSurfaceColors || kHasActorTexture || kHasSurfaceAlpha || kHasCellTexture)
   {
-    r = resolveMaterial(m, scene, in.vertexColor, in.uv, actorTexture, actorSampler);
+    r = resolveMaterial(m, scene, effColor, in.uv, actorTexture, actorSampler);
   }
   else
   {
@@ -524,7 +569,9 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
   out.color = float4(totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular, r.opacity);
   if (kEmitIds)
   {
-    out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
+    uint cellId = ((scene.flags & kSceneFlagHasCellTexture) != 0u)
+      ? cellPrimitiveIds[prim_id] : in.cellId;
+    out.ids = uint4(cellId, in.propId, in.compositeIndex, 0u);
   }
 
   float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
@@ -552,8 +599,10 @@ fragment OITAccumulateOutput fragment_main_oit(VertexOut in [[stage_in]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
     constant EdgeUniforms& edge [[buffer(4)]],
     constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
+    texture2d<float, access::read> cellColorTex [[texture(8)]],
     texture2d<float> actorTexture [[texture(0)]],
     sampler actorSampler [[sampler(0)]],
+    uint prim_id [[primitive_id]],
     bool frontFacing [[front_facing]]) {
   if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
 
@@ -571,7 +620,7 @@ fragment OITAccumulateOutput fragment_main_oit(VertexOut in [[stage_in]],
     m.specularPower = material.backfaceSpecularPower;
   }
 
-  ResolvedMaterial r = resolveMaterial(m, scene, in.vertexColor, in.uv, actorTexture, actorSampler);
+  ResolvedMaterial r = resolveMaterial(m, scene, resolveCellColor(in, prim_id, scene, cellColorTex), in.uv, actorTexture, actorSampler);
   applySurfaceEdges(N, r, in, lights, edge, scene);
 
   float3 totalAmbient = m.ambientColor.w * r.ambient;
@@ -1363,10 +1412,12 @@ fragment PeelPassOutput fragment_peel(
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
     constant EdgeUniforms& edge [[buffer(4)]],
     constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
+    texture2d<float, access::read> cellColorTex [[texture(8)]],
     texture2d<float> actorTexture [[texture(0)]],
     sampler actorSampler [[sampler(0)]],
     texture2d<float, access::read> prevFrontTex [[texture(1)]],
-    texture2d<float, access::read> prevDepthTex [[texture(2)]]) {
+    texture2d<float, access::read> prevDepthTex [[texture(2)]],
+    uint prim_id [[primitive_id]]) {
   
   if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
 
@@ -1405,7 +1456,7 @@ fragment PeelPassOutput fragment_peel(
     m.opacity = material.backfaceOpacity;
     m.specularPower = material.backfaceSpecularPower;
   }
-  ResolvedMaterial r = resolveMaterial(m, scene, in.vertexColor, in.uv, actorTexture, actorSampler);
+  ResolvedMaterial r = resolveMaterial(m, scene, resolveCellColor(in, prim_id, scene, cellColorTex), in.uv, actorTexture, actorSampler);
   applySurfaceEdges(N, r, in, lights, edge, scene);
   float3 totalAmbient = m.ambientColor.w * r.ambient;
   float3 totalDiffuse = float3(0.0);
@@ -1435,9 +1486,11 @@ fragment float4 fragment_peel_alpha_blend(
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
     constant EdgeUniforms& edge [[buffer(4)]],
     constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
+    texture2d<float, access::read> cellColorTex [[texture(8)]],
     texture2d<float> actorTexture [[texture(0)]],
     sampler actorSampler [[sampler(0)]],
-    texture2d<float, access::read> prevDepthTex [[texture(2)]]) {
+    texture2d<float, access::read> prevDepthTex [[texture(2)]],
+    uint prim_id [[primitive_id]]) {
   
   if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
 
@@ -1462,7 +1515,7 @@ fragment float4 fragment_peel_alpha_blend(
     m.opacity = material.backfaceOpacity;
     m.specularPower = material.backfaceSpecularPower;
   }
-  ResolvedMaterial r = resolveMaterial(m, scene, in.vertexColor, in.uv, actorTexture, actorSampler);
+  ResolvedMaterial r = resolveMaterial(m, scene, resolveCellColor(in, prim_id, scene, cellColorTex), in.uv, actorTexture, actorSampler);
   applySurfaceEdges(N, r, in, lights, edge, scene);
   float3 totalAmbient = m.ambientColor.w * r.ambient;
   float3 totalDiffuse = float3(0.0);

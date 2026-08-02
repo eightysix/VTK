@@ -101,6 +101,7 @@ constexpr uint32_t VTK_METAL_SCENE_FLAG_POINT_SHAPE         = 1u << 7;
 constexpr uint32_t VTK_METAL_SCENE_FLAG_HAS_SURFACE_COLORS  = 1u << 8;
 constexpr uint32_t VTK_METAL_SCENE_FLAG_HAS_ACTOR_TEXTURE   = 1u << 9;
 constexpr uint32_t VTK_METAL_SCENE_FLAG_HAS_SURFACE_ALPHA   = 1u << 10;
+constexpr uint32_t VTK_METAL_SCENE_FLAG_HAS_CELL_TEXTURE    = 1u << 11;
 
 constexpr uint32_t VTK_METAL_DYNAMIC_ACTOR_FLAG_MASK =
     VTK_METAL_SCENE_FLAG_VERTEX_VISIBILITY |
@@ -108,7 +109,8 @@ constexpr uint32_t VTK_METAL_DYNAMIC_ACTOR_FLAG_MASK =
     VTK_METAL_SCENE_FLAG_POINT_SHAPE |
     VTK_METAL_SCENE_FLAG_HAS_SURFACE_COLORS |
     VTK_METAL_SCENE_FLAG_HAS_ACTOR_TEXTURE |
-    VTK_METAL_SCENE_FLAG_HAS_SURFACE_ALPHA;
+    VTK_METAL_SCENE_FLAG_HAS_SURFACE_ALPHA |
+    VTK_METAL_SCENE_FLAG_HAS_CELL_TEXTURE;
 
 id<MTLBuffer> CreateZeroBuffer(id<MTLDevice> device, size_t bytes)
 {
@@ -131,6 +133,12 @@ id<MTLBuffer> CreateZeroBuffer(id<MTLDevice> device, size_t bytes)
 // buffer(6)/buffer(12)/buffer(10).
 using PickIds = vtkMetalPickIds;
 
+// Cell-color texture layout: must match kCellTextureWidth in
+// MetalShaders.metal. 2^13 texels per row so the fragment shader's div/mod on
+// the primitive id compile to a shift and mask; 8192*16384 texels covers up
+// to 134M triangles (the same cap as a desktop GL buffer texture).
+constexpr NSUInteger kCellTextureWidth = 8192;
+
 } // namespace
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -149,6 +157,19 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   // P1-1A/1B: per-vertex color for triangle/line surfaces (float4 RGBA per vertex)
   id<MTLBuffer> SurfaceColorBuffer = nil;
   bool HasSurfaceColors = false;
+
+  // Per-cell color port (the "cell texture"): one RGBA8Unorm texel per output
+  // triangle in a 2D texture, resolved in the fragment shader via
+  // [[primitive_id]] — the direct analog of GL's gl_PrimitiveID + textureC
+  // (a buffer texture). The texture is laid out row-major with width
+  // kCellTextureWidth so the shader's div/mod are a shift and mask; fetching
+  // through the texture unit avoids the per-fragment device-buffer load that a
+  // float4 buffer would require. CellPrimitiveIdBuffer carries the matching
+  // 1-based cell id so picking reports the exact owning cell instead of the
+  // provoking vertex's first-wins value.
+  id<MTLTexture> CellColorTexture = nil;
+  id<MTLBuffer> CellPrimitiveIdBuffer = nil;
+  vtkIdType CellColorCount = 0;
 
   // P5-5A: texture coordinates for triangles (float2 per vertex)
   id<MTLBuffer> TriangleUVBuffer = nil;
@@ -173,6 +194,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     kSurfaceFeatureBackface = 1u << 3,
     kSurfaceFeatureEdges = 1u << 4,
     kSurfaceFeatureEmitIds = 1u << 5,
+    kSurfaceFeatureCellTexture = 1u << 6,
   };
   uint32_t SurfaceFeatureMask = 0;
   std::map<uint32_t, id<MTLRenderPipelineState>> TriangleSurfacePipelines;
@@ -223,6 +245,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLBuffer> ZeroEdgeCellIdBuffer = nil;
   id<MTLBuffer> ZeroTriangleUVBuffer = nil;
   id<MTLBuffer> ZeroEdgeUVBuffer = nil;
+  id<MTLBuffer> ZeroCellPrimitiveIdBuffer = nil;
 
   vtkIdType TrianglePrimitiveCount = 0;        // number of triangles for compute dispatch
   vtkIdType LinePrimitiveCount = 0;            // number of line segments for compute dispatch
@@ -483,6 +506,9 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     vtkMetalMRC::ReleaseAndNil(SurfaceColorBuffer);
     HasSurfaceColors = false;
     HasSurfaceAlpha = false;
+    vtkMetalMRC::ReleaseAndNil(CellColorTexture);
+    vtkMetalMRC::ReleaseAndNil(CellPrimitiveIdBuffer);
+    CellColorCount = 0;
     SurfaceFeatureMask = 0;
     vtkMetalMRC::ReleaseAndNil(TriangleUVBuffer);
 
@@ -541,6 +567,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     vtkMetalMRC::ReleaseAndNil(ZeroEdgeCellIdBuffer);
     vtkMetalMRC::ReleaseAndNil(ZeroTriangleUVBuffer);
     vtkMetalMRC::ReleaseAndNil(ZeroEdgeUVBuffer);
+    vtkMetalMRC::ReleaseAndNil(ZeroCellPrimitiveIdBuffer);
 
     HasSurfaceAlpha = false;
 
@@ -1031,6 +1058,27 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       else if (this->Internals->ZeroTriangleCellIdBuffer)
       {
         recordVBuf(this->Internals->ZeroTriangleCellIdBuffer, 0, 6);
+      }
+
+      // Per-cell color port: per-primitive cell RGBA (texture(8), fetched
+      // through the texture unit like GL's textureC) + exact cell id for the
+      // fragment shader (buffer(7)). The 1x1 white DefaultTexture covers the
+      // all-true full-feature pipelines used by plain per-vertex actors — the
+      // shader only reads the texture when kSceneFlagHasCellTexture is set.
+      id<MTLTexture> cellColorTex = this->Internals->CellColorTexture;
+      if (!cellColorTex)
+      {
+        cellColorTex = this->Internals->DefaultTexture;
+      }
+      recordFTex(cellColorTex, 8);
+
+      if (this->Internals->CellPrimitiveIdBuffer)
+      {
+        recordFBuf(this->Internals->CellPrimitiveIdBuffer, 0, 7);
+      }
+      else if (this->Internals->ZeroCellPrimitiveIdBuffer)
+      {
+        recordFBuf(this->Internals->ZeroCellPrimitiveIdBuffer, 0, 7);
       }
 
       if (this->Internals->PropIdBuffer)
@@ -1831,6 +1879,27 @@ void vtkMetalPolyDataMapper::EnsureRequiredBindingFallbacks(void* mtlDevice)
       }
       vtkMetalMRC::AssignConsumed(this->Internals->ZeroTriangleUVBuffer, buffer);
     }
+
+    // Zero per-primitive cell-id fallback, sized to the triangle count so the
+    // all-true full-feature pipelines (which reference buffer(7) for the
+    // exact-cell-id pick path) never read out of range for plain per-vertex
+    // actors. The cell-color path now samples a texture (texture(8)) whose
+    // fallback is the 1x1 white DefaultTexture, only read when the runtime
+    // cell-texture flag is set.
+    const vtkIdType primCount = vertexCount / 3;
+    if (primCount > 0)
+    {
+      if (!this->Internals->ZeroCellPrimitiveIdBuffer)
+      {
+        id<MTLBuffer> buffer =
+            CreateZeroBuffer(device, static_cast<size_t>(primCount) * sizeof(uint32_t));
+        if (!buffer)
+        {
+          vtkErrorMacro(<< "Failed to allocate ZeroCellPrimitiveIdBuffer (" << primCount << " entries)");
+        }
+        vtkMetalMRC::AssignConsumed(this->Internals->ZeroCellPrimitiveIdBuffer, buffer);
+      }
+    }
   }
 
   if (edgeVertexCount > 0)
@@ -1962,9 +2031,16 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     // program. The emit-IDs bit is added at draw time when a hardware selector
     // is active.
     uint32_t featureMask = 0;
-    if (this->Internals->HasSurfaceColors)
+    // Per-cell colors are resolved per-primitive via the cell-color buffer
+    // (kSurfaceFeatureCellTexture), so no per-vertex colors are baked and the
+    // lean pipeline skips the vertexColor stream.
+    if (this->Internals->HasSurfaceColors && this->Internals->CellColorCount == 0)
     {
       featureMask |= this->Internals->kSurfaceFeatureColors;
+    }
+    if (this->Internals->CellColorCount > 0)
+    {
+      featureMask |= this->Internals->kSurfaceFeatureCellTexture;
     }
     if (this->Internals->ActorTexture)
     {
@@ -2162,6 +2238,11 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       if (this->Internals->ActorTexture)
       {
         actorFlags |= VTK_METAL_SCENE_FLAG_HAS_ACTOR_TEXTURE;
+      }
+
+      if (this->Internals->CellColorCount > 0)
+      {
+        actorFlags |= VTK_METAL_SCENE_FLAG_HAS_CELL_TEXTURE;
       }
 
       flags |= actorFlags;
@@ -2377,6 +2458,13 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   std::vector<uint32_t> triangleIndices;
   std::unordered_map<vtkIdType, uint32_t> triVertexMap;
 
+  // Per-cell color port ("cell texture"): parallel arrays over output triangles
+  // (same ordering as triangleIndices / the tessellation connectivity). float4
+  // RGBA per triangle for the fragment shader, plus the 1-based cell id per
+  // triangle for exact per-pixel picking.
+  std::vector<float> cellColors;
+  std::vector<uint32_t> cellPrimitiveIds;
+
   // Single-pass edges: per-triangle-corner boundary flags (parallel to triangleIndices)
   std::vector<uint32_t> triangleEdgeFlags;
   std::vector<float> trianglePos;   // float3[3] corner object positions per corner record
@@ -2546,6 +2634,13 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     mappedColors = this->MapScalars(actor->GetProperty()->GetOpacity(), cellFlag);
   }
 
+  // Per-cell color port (the "cell texture"): when scalars are per-cell, the
+  // RGBA is resolved per-primitive in the fragment shader via [[primitive_id]]
+  // (GL's gl_PrimitiveID + textureC) instead of being baked into every vertex,
+  // so the vertex stream stays deduplicated. Enabled only when the geometry can
+  // be indexed (see useIndexBuffer below).
+  bool useCellTexture = (cellFlag != 0) && (mappedColors != nullptr);
+
   // Helper to get override color or default actor color
   double actorOpacity = actor ? actor->GetProperty()->GetOpacity() : 1.0;
   auto getOverrideOrDefaultRGBA = [&](float rgba[4])
@@ -2618,6 +2713,38 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     }
   };
 
+  // Per-cell color port: emit one float4 RGBA for an output triangle into
+  // cellColors (indexed by primitive id in the fragment shader). Mirrors
+  // emitSurfaceColor's batch-override handling.
+  auto emitCellColor = [&](vtkIdType idx)
+  {
+    if (mappedColors && !this->Internals->UseBatchColor)
+    {
+      const unsigned char* colors = mappedColors->GetPointer(0);
+      float r = colors[idx * 4] / 255.0f;
+      float g = colors[idx * 4 + 1] / 255.0f;
+      float b = colors[idx * 4 + 2] / 255.0f;
+      float a = colors[idx * 4 + 3] / 255.0f;
+      if (this->Internals->UseBatchOpacity)
+      {
+        a = static_cast<float>(this->Internals->BatchOpacity);
+      }
+      cellColors.push_back(r);
+      cellColors.push_back(g);
+      cellColors.push_back(b);
+      cellColors.push_back(a);
+    }
+    else
+    {
+      float rgba[4];
+      getOverrideOrDefaultRGBA(rgba);
+      cellColors.push_back(rgba[0]);
+      cellColors.push_back(rgba[1]);
+      cellColors.push_back(rgba[2]);
+      cellColors.push_back(rgba[3]);
+    }
+  };
+
   // ---- P6-6A: GPU Tessellation Path ----
   // When per-point coloring (cellFlag == 0) with data normals, use compute shaders
   // for polygon → triangle fan tessellation, edge array generation, and line segment
@@ -2625,7 +2752,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   // Falls back to CPU for per-cell coloring, computed normals, or small geometries.
   vtkCellArray* polys = polydata->GetPolys();
   vtkIdType numPolyPts = polydata->GetNumberOfPoints();
-  bool useGPUTess = (cellFlag == 0) && normalArray && (numPolyPts > 1000) &&
+  bool useGPUTess = cellFlag == 0 && normalArray && (numPolyPts > 1000) &&
     !hasCellAssociatedExtraAttrs;
   bool gpuTessUsed = false;
 
@@ -2988,6 +3115,21 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
           (const uint32_t*)[this->Internals->TriangleCellIdBuffer contents];
       const uint32_t* connData =
           (const uint32_t*)[this->Internals->TessOutputConnectivityBuffer contents];
+
+      // Per-cell color port: build the per-primitive RGBA + exact cell id from
+      // the per-triangle cell ids (1-based, polyCellOffset-relative) before
+      // TriangleCellIdBuffer is replaced with the per-point expansion below.
+      if (useCellTexture)
+      {
+        cellColors.reserve(static_cast<size_t>(numTris) * 4);
+        cellPrimitiveIds.reserve(static_cast<size_t>(numTris));
+        for (vtkIdType t = 0; t < numTris; ++t)
+        {
+          emitCellColor(static_cast<vtkIdType>(triCellIds[t]) - 1);
+          cellPrimitiveIds.push_back(triCellIds[t]);
+        }
+      }
+
       std::vector<uint32_t> pointCellIds(numPolyPts, 0);
       std::vector<bool> pointAssigned(numPolyPts, false);
       for (vtkIdType t = 0; t < numTris; ++t)
@@ -3277,7 +3419,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
         normals.push_back(static_cast<float>(n[2]));
       }
 
-      if (mappedColors)
+      if (mappedColors && cellFlag == 0)
       {
         emitSurfaceColor(i, mappedColors->GetPointer(0));
       }
@@ -3497,12 +3639,14 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
         // whichever triangle first emits it, so deduplication would produce incorrect
         // normals for vertices shared between faces with different orientations.
         // When cellFlag != 0 with per-cell colors, vertices at the same point may
-        // have different colors from different cells, so no deduplication is possible.
+        // have different colors from different cells. The cell-texture port
+        // (useCellTexture) resolves those colors per-primitive in the fragment
+        // shader, so the vertex stream can still be deduplicated there too.
         // A null mappedColors (no scalars) is uniform per actor, so dedup is safe
         // there too — matching GL, which indexes the polydata's own points and never
         // expands to 3 vertices per triangle.
         bool useIndexBuffer = normalArray && !hasCellAssociatedExtraAttrs &&
-          (cellFlag == 0 || mappedColors == nullptr);
+          (cellFlag == 0 || mappedColors == nullptr || useCellTexture);
 
         for (vtkIdType i = 1; i < npts - 1; ++i)
         {
@@ -3560,8 +3704,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                 normals.push_back(static_cast<float>(nn[1]));
                 normals.push_back(static_cast<float>(nn[2]));
 
-                // P1-1A: per-vertex color from point scalar mapping
-                emitSurfaceColor(tri[j], mappedColors ? mappedColors->GetPointer(0) : nullptr);
+                // P1-1A: per-vertex color — point scalar mapping only. Per-cell
+                // colors are emitted once per triangle below (cell-texture port).
+                emitSurfaceColor(tri[j],
+                  (cellFlag == 0) ? mappedColors->GetPointer(0) : nullptr);
 
                 // P5-5A: texture coordinates for indexed triangle vertex
                 if (tcoordArray && tcoordArray->GetNumberOfTuples() > tri[j])
@@ -3578,6 +3724,13 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                 }
                 emitExtraAttrsForPoint(tri[j]);
               }
+            }
+            // Per-cell color port: one RGBA + exact cell id per output
+            // triangle, parallel to the 3 indices just emitted.
+            if (useCellTexture)
+            {
+              emitCellColor(polyCellIdx);
+              cellPrimitiveIds.push_back(static_cast<uint32_t>(polyCellIdx) + 1u);
             }
           }
           else
@@ -4019,7 +4172,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     edgePositions, edgeNormals, edgeColors, edgeUVs,
     edgeIndices, triangleVertexCellIds, lineVertexCellIds,
     lineSegmentCellIds, edgeVertexCellIds, edgeTubeIndices,
-    edgeTubeCellIds, extraAttrArrays);
+    edgeTubeCellIds, cellColors, cellPrimitiveIds, extraAttrArrays);
 }
 
 //------------------------------------------------------------------------------
@@ -4045,6 +4198,8 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
   const std::vector<uint32_t>& edgeVertexCellIds,
   const std::vector<uint32_t>& edgeTubeIndices,
   const std::vector<uint32_t>& edgeTubeCellIds,
+  const std::vector<float>& cellColors,
+  const std::vector<uint32_t>& cellPrimitiveIds,
   std::unordered_map<std::string, std::vector<float>>& extraAttrArrays)
 {
   id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
@@ -4227,6 +4382,13 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
         hasNonOpaqueAlpha = true;
       }
     }
+    for (size_t ac = 3; ac < cellColors.size() && !hasNonOpaqueAlpha; ac += 4)
+    {
+      if (cellColors[ac] < 0.999f)
+      {
+        hasNonOpaqueAlpha = true;
+      }
+    }
     this->Internals->HasSurfaceAlpha =
         this->Internals->HasSurfaceColors ||
         this->Internals->UseBatchOpacity ||
@@ -4241,6 +4403,55 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
                  length:whiteColors.size() * sizeof(float)
                 options:MTLResourceStorageModeShared];
     vtkMetalMRC::AssignConsumed(this->Internals->SurfaceColorBuffer, whiteColorBuf);
+  }
+
+  // Per-cell color port ("cell texture"): upload the per-primitive RGBA and
+  // exact cell-id arrays built during the geometry emission above. cellColors
+  // is only non-empty when useCellTexture was active, so CellColorCount > 0
+  // doubles as the runtime signal that gates the fragment shader's cell-color
+  // resolution (kSceneFlagHasCellTexture). The RGBA is laid out row-major into
+  // a 2D RGBA8Unorm texture (matching GL's RGBA8 buffer texture) so the
+  // fragment shader fetches it through the texture unit, not as a
+  // device-buffer load; the row stride lets the shader's div/mod on the
+  // primitive id compile to a shift and mask.
+  if (!cellColors.empty())
+  {
+    const size_t cellCount = cellPrimitiveIds.size();
+    const NSUInteger texHeight =
+      static_cast<NSUInteger>((cellCount + kCellTextureWidth - 1) / kCellTextureWidth);
+    MTLTextureDescriptor* texDesc = [MTLTextureDescriptor
+      texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                   width:static_cast<NSUInteger>(kCellTextureWidth)
+                                  height:texHeight
+                               mipmapped:NO];
+    texDesc.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> cellColorTex = [device newTextureWithDescriptor:texDesc];
+    if (cellColorTex)
+    {
+      std::vector<unsigned char> bytes(cellColors.size());
+      for (size_t i = 0; i < cellColors.size(); ++i)
+      {
+        bytes[i] = static_cast<unsigned char>(std::min(1.0f, std::max(0.0f, cellColors[i])) * 255.0f +
+          0.5f);
+      }
+      [cellColorTex replaceRegion:MTLRegionMake2D(0, 0, kCellTextureWidth, texHeight)
+                      mipmapLevel:0
+                        withBytes:bytes.data()
+                      bytesPerRow:kCellTextureWidth * 4];
+      vtkMetalMRC::AssignConsumed(this->Internals->CellColorTexture, cellColorTex);
+    }
+    else
+    {
+      vtkErrorMacro(<< "Failed to allocate CellColorTexture for " << cellCount << " cells");
+    }
+
+    id<MTLBuffer> cellIdBuf = [device
+      newBufferWithBytes:cellPrimitiveIds.data()
+                 length:cellPrimitiveIds.size() * sizeof(uint32_t)
+                options:MTLResourceStorageModeShared];
+    vtkMetalMRC::AssignConsumed(this->Internals->CellPrimitiveIdBuffer, cellIdBuf);
+
+    this->Internals->CellColorCount = static_cast<vtkIdType>(cellCount);
   }
 
   // P5-5A: Create triangle UV buffer (float2 per triangle/line vertex)
@@ -4646,6 +4857,8 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
       [consts setConstantValue:&cv type:MTLDataTypeBool atIndex:10];
       cv = emitIds ? YES : NO;
       [consts setConstantValue:&cv type:MTLDataTypeBool atIndex:11];
+      cv = (mask & this->Internals->kSurfaceFeatureCellTexture) ? YES : NO;
+      [consts setConstantValue:&cv type:MTLDataTypeBool atIndex:12];
 
       NSError* error = nil;
       id<MTLFunction> vFunc =
@@ -4734,7 +4947,7 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   NSError* error = nil;
   MTLFunctionConstantValues* fullConsts = [[MTLFunctionConstantValues alloc] init];
   BOOL cv = YES;
-  for (NSUInteger idx = 6; idx <= 11; ++idx)
+  for (NSUInteger idx = 6; idx <= 12; ++idx)
   {
     [fullConsts setConstantValue:&cv type:MTLDataTypeBool atIndex:idx];
   }
@@ -4988,7 +5201,7 @@ void vtkMetalPolyDataMapper::EnsureEdgePipelineState(void* mtlDevice)
   NSError* edgeError = nil;
   MTLFunctionConstantValues* fullConsts = [[MTLFunctionConstantValues alloc] init];
   BOOL cv = YES;
-  for (NSUInteger idx = 6; idx <= 11; ++idx)
+  for (NSUInteger idx = 6; idx <= 12; ++idx)
   {
     [fullConsts setConstantValue:&cv type:MTLDataTypeBool atIndex:idx];
   }
@@ -5270,7 +5483,7 @@ void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
   NSError* peelError = nil;
   MTLFunctionConstantValues* fullConsts = [[MTLFunctionConstantValues alloc] init];
   BOOL cv = YES;
-  for (NSUInteger idx = 6; idx <= 11; ++idx)
+  for (NSUInteger idx = 6; idx <= 12; ++idx)
   {
     [fullConsts setConstantValue:&cv type:MTLDataTypeBool atIndex:idx];
   }
@@ -5343,7 +5556,17 @@ void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
   // frontDest and depthDest use MAX blend
   if (!this->Internals->TrianglePeelPipeline)
   {
-    id<MTLFunction> fragFunc = [library newFunctionWithName:@"fragment_peel"];
+    // fragment_peel declares function constant kHasCellTexture (index 12), so
+    // it must be specialized with the full feature set like the vertex entry.
+    MTLFunctionConstantValues* peelConsts = [[MTLFunctionConstantValues alloc] init];
+    BOOL pcv = YES;
+    for (NSUInteger idx = 6; idx <= 12; ++idx)
+    {
+      [peelConsts setConstantValue:&pcv type:MTLDataTypeBool atIndex:idx];
+    }
+    id<MTLFunction> fragFunc =
+      [library newFunctionWithName:@"fragment_peel" constantValues:peelConsts error:&peelError];
+    [peelConsts release];
     if (fragFunc)
     {
       MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
@@ -5445,15 +5668,18 @@ void vtkMetalPolyDataMapper::EnsureOITPipelineStates(void* mtlDevice)
   NSError* oitError = nil;
   MTLFunctionConstantValues* fullConsts = [[MTLFunctionConstantValues alloc] init];
   BOOL cv = YES;
-  for (NSUInteger idx = 6; idx <= 11; ++idx)
+  for (NSUInteger idx = 6; idx <= 12; ++idx)
   {
     [fullConsts setConstantValue:&cv type:MTLDataTypeBool atIndex:idx];
   }
   id<MTLFunction> vertexFunc = indexedEntry
     ? [library newFunctionWithName:@"vertex_main_indexed" constantValues:fullConsts error:&oitError]
     : [library newFunctionWithName:@"vertex_main" constantValues:fullConsts error:&oitError];
+  // fragment_main_oit declares function constant kHasCellTexture (index 12), so
+  // it must be specialized with the full feature set like the vertex entry.
+  id<MTLFunction> fragFunc =
+    [library newFunctionWithName:@"fragment_main_oit" constantValues:fullConsts error:&oitError];
   [fullConsts release];
-  id<MTLFunction> fragFunc = [library newFunctionWithName:@"fragment_main_oit"];
   if (!vertexFunc || !fragFunc)
   {
     vtkErrorMacro(<< "Failed to find OIT shader functions");

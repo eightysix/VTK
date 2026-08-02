@@ -108,18 +108,49 @@ const SceneSpec kScenes[] = {
   { "PolyDataMapper2D", vtkMetalScenes::BuildPolyDataMapper2DScene, 600, 300 },
   { "Texture", vtkMetalScenes::BuildTextureScene, 600, 300 },
   { "VolumeRayCast", vtkMetalScenes::BuildVolumeScene, 400, 400 },
+  { "CellColor", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
+      vtkMetalScenes::BuildCellColorGridScene(r, b, 4, 30);
+    }, 800, 800 },
 };
 
-// Complexity-scaling scenes, benchmark-only. Registered behind --complexity so
-// the canonical --bench output (used to regenerate the doc table) is
-// unchanged. Each scene grows one workload axis: GPU-bound geometry, CPU-bound
-// draw-call count, depth-peel count, and volume size.
+// Complexity-scaling scenes, registered behind --complexity so the canonical
+// --bench output (used to regenerate the doc table) is unchanged. Each scene
+// grows one workload axis. The GPU-bound geometry scenes use the same 4x4 /
+// 10x10 / 16x16 grid of vtkSphereSource spheres (merged into one polydata) with
+// three coloring modes to isolate the fragment paths: CpxGeom* carry no scalars
+// (lean opaque pipeline), CpxPoint* carry per-point scalars (color arrives as
+// an interpolated varying), and CpxCell* carry per-cell scalars (color resolved
+// per-primitive in the fragment shader — the cell-texture port). CpxActor*
+// scale the CPU-bound draw-call count, CpxPeel* the depth-peel count, and
+// CpxVol* the volume size. With --complexity they are both benchmarked and
+// captured (PNG + thresholded error like the visual scenes).
 const SceneSpec kBenchScenes[] = {
   { "CpxGeomLo", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
       vtkMetalScenes::BuildGeometryGridScene(r, b, 4, 30);
     }, 800, 800 },
   { "CpxGeomHi", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
       vtkMetalScenes::BuildGeometryGridScene(r, b, 10, 60);
+    }, 800, 800 },
+  { "CpxCellLo", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
+      vtkMetalScenes::BuildCellColorGridScene(r, b, 4, 30);
+    }, 800, 800 },
+  { "CpxCellHi", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
+      vtkMetalScenes::BuildCellColorGridScene(r, b, 10, 60);
+    }, 800, 800 },
+  { "CpxPointLo", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
+      vtkMetalScenes::BuildPointColorGridScene(r, b, 4, 30);
+    }, 800, 800 },
+  { "CpxPointHi", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
+      vtkMetalScenes::BuildPointColorGridScene(r, b, 10, 60);
+    }, 800, 800 },
+  { "CpxGeomBig", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
+      vtkMetalScenes::BuildGeometryGridScene(r, b, 16, 60);
+    }, 800, 800 },
+  { "CpxPointBig", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
+      vtkMetalScenes::BuildPointColorGridScene(r, b, 16, 60);
+    }, 800, 800 },
+  { "CpxCellBig", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
+      vtkMetalScenes::BuildCellColorGridScene(r, b, 16, 60);
     }, 800, 800 },
   { "CpxActorLo", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
       vtkMetalScenes::BuildActorGridScene(r, b, 8);
@@ -420,11 +451,12 @@ int main(int argc, char* argv[])
 
   std::cout << "scene                          error   thresholded error\n";
   std::cout << "-------------------------------------------------------------------\n";
-  for (const SceneSpec& spec : kScenes)
-  {
+  // Capture GL/Metal images for one scene, write the .gl/.metal/.diff PNGs, and
+  // report the thresholded error (also tracking the worst across all scenes).
+  const auto captureAndDiff = [&](const SceneSpec& spec) {
     if (!sceneFilter.empty() && sceneFilter != spec.Name)
     {
-      continue;
+      return;
     }
 
     const std::string glPath = outDir + "/" + spec.Name + ".gl.png";
@@ -448,11 +480,11 @@ int main(int argc, char* argv[])
     if ((renderGl && !glImage) || (renderMetal && !metalImage))
     {
       failed = true;
-      continue;
+      return;
     }
     if (!renderGl || !renderMetal)
     {
-      continue;
+      return;
     }
 
     vtkNew<vtkImageDifference> diff;
@@ -477,6 +509,21 @@ int main(int argc, char* argv[])
     diffWriter->SetFileName(diffPath.c_str());
     diffWriter->SetInputConnection(diff->GetOutputPort());
     diffWriter->Write();
+  };
+
+  for (const SceneSpec& spec : kScenes)
+  {
+    captureAndDiff(spec);
+  }
+  // With --complexity the scaling scenes are captured too, so their per-backend
+  // PNGs and thresholded errors are available for inspection alongside the bench
+  // table.
+  if (complexity)
+  {
+    for (const SceneSpec& spec : kBenchScenes)
+    {
+      captureAndDiff(spec);
+    }
   }
 
   if (bench)

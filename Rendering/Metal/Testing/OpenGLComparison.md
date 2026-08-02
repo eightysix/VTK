@@ -292,11 +292,15 @@ Device-specific notes:
 ### Geometry-bound scenes (`--complexity`)
 
 The harness also registers `--complexity` scenes that scale one workload axis
-(documented in the source). The GPU-bound geometry scenes (`CpxGeomLo`/`CpxGeomHi`,
-a 4×4/10×10 grid of `vtkSphereSource` spheres merged into a single polydata,
-800×800) were the last Metal laggard: `CpxGeomHi` ran ~1.5× slower than GL while
-`CpxActorLo`/`CpxActorHi` (CPU-bound, per-actor draw calls) and the volume scenes
-were already at parity.
+(documented in the source). The GPU-bound geometry scenes share a 4×4 / 10×10 /
+16×16 grid of `vtkSphereSource` spheres merged into a single polydata (800×800),
+built in three coloring modes to isolate the fragment paths: `CpxGeom*` carry no
+scalars (lean opaque pipeline), `CpxPoint*` carry per-point scalars (color
+arrives as an interpolated varying), and `CpxCell*` carry per-cell scalars
+(color resolved per-primitive in the fragment shader — the cell-texture port
+below). These were the last Metal laggards: before the fixes below `CpxGeomHi`
+ran ~1.5× slower than GL while `CpxActorLo`/`CpxActorHi` (CPU-bound, per-actor
+draw calls) and the volume scenes were already at parity.
 
 The cause was not the fragment shader (the fill-rate hypothesis): the gap
 persisted down to a 1-pixel render, so it was vertex-side. Metal's CPU geometry
@@ -325,8 +329,15 @@ machine that reproduces the documented M1 VolumeRayCast residual 0.005):
 ```
 scene                          GL ms/f   GL fps   Metal ms/f  Metal fps    M/GL
 -------------------------------------------------------------------
-CpxGeomLo                         0.79   1270.1        0.63     1588.7    0.80
-CpxGeomHi                         2.53    395.4        2.29      437.6    0.90
+CpxGeomLo                         0.84   1194.3        0.63     1593.0    0.75
+CpxGeomHi                         2.46    406.2        2.47      404.7    1.00
+CpxCellLo                         0.84   1196.2        0.77     1291.2    0.93
+CpxCellHi                         2.55    391.4        2.68      372.5    1.05
+CpxPointLo                        0.81   1231.0        0.75     1336.5    0.92
+CpxPointHi                        2.40    415.9        2.39      419.2    0.99
+CpxGeomBig                        4.10    244.0        4.02      249.0    0.98
+CpxPointBig                       4.14    241.4        4.15      241.2    1.00
+CpxCellBig                        4.23    236.3        4.16      240.5    0.98
 CpxActorLo                        1.26    796.7        0.94     1063.4    0.75
 CpxActorHi                       12.84     77.9       12.51       79.9    0.97
 CpxPeel3                          4.29    233.1        1.12      892.6    0.26
@@ -335,49 +346,99 @@ CpxVol64                          1.51    661.8        0.59     1686.7    0.39
 CpxVol128                         1.61    620.8        0.56     1776.3    0.35
 ```
 
-`CpxGeomHi` went from M/GL ~1.46 to 0.90 (Metal now faster than GL); the rest of
-the table was already at or better than parity. The shared-vertex cell-id for
-picking in the dedup paths follows the existing first-wins convention (same as
-the GPU-tess and per-point-coloring dedup paths). What this fix does *not*
-cover — scenes with real per-cell colors — is described next.
+The `CpxGeom*`/`CpxCell*`/`CpxPoint*` rows are from a clean 15-scene `--reps 3`
+run; the `CpxActor*`/`CpxPeel*`/`CpxVol*` rows keep their original clean-run
+values because those tail scenes occasionally hit the transient empty-frame
+glitch (one backend reporting ~0.05–0.15 ms — nothing rendered) after the heavy
+`Cpx*Big` scenes in longer runs. Absolute ms also move ±20% run-to-run with the
+M1's GPU clock; the M/GL ratio is the meaningful metric and reproduces.
+
+`CpxGeomHi` went from M/GL ~1.46 to parity (0.92–1.00 across runs); the
+per-cell and per-point geometry scenes sit at 0.92–1.05, and the CPU-bound /
+peel / volume rows were already at or better than parity. The shared-vertex
+cell-id for picking in the dedup paths follows the existing first-wins
+convention (same as the GPU-tess and per-point-coloring dedup paths). What the
+dedup fix does *not* cover — scenes with real per-cell colors — is what the
+cell-texture port adds, described next.
 
 ### The per-cell color caveat (the "cell-texture port")
 
-The dedup above only applies when there is nothing per-cell to differentiate.
-Scenes that genuinely carry per-cell colors still expand to 3 vertices per
-triangle in Metal, because Metal resolves the cell color in the **vertex**
-stage while GL resolves it in the **fragment** stage:
+Per-cell-colored scenes were the last gap. Metal resolved the cell color as a
+per-*vertex* quantity — `emitSurfaceColor(polyCellIdx, ...)` baked the cell's
+RGBA into the vertex at geometry-build time and the cell id was a
+flat-interpolated vertex attribute — so a shared corner (which belongs to
+multiple cells) had to be duplicated per triangle and the vertex stream
+expanded to 3 vertices per triangle. GL instead treats cell identity as a
+per-*primitive* quantity delivered by hardware, and the port moves Metal to the
+GL model:
 
-- **GL** treats cell identity as a per-*primitive* quantity delivered by
-  hardware. `AppendCellTextures` packs one RGBA texel per output primitive into
-  a texture buffer, where each texel is its owning cell's color
-  (`newColors[i] = Colors[ccmap->GetValue(i)]`, `vtkOpenGLPolyDataMapper.cxx`)
-  and `CellCellMap` + `PrimitiveIDOffset` map strips and polygon fans back to
-  their cells. The fragment shader fetches it with
+- **GL** (`vtkOpenGLPolyDataMapper`): `AppendCellTextures` packs one RGBA texel
+  per output primitive into a texture buffer, where each texel is its owning
+  cell's color (`newColors[i] = Colors[ccmap->GetValue(i)]`), and `CellCellMap`
+  + `PrimitiveIDOffset` map strips and polygon fans back to their cells. The
+  fragment shader fetches it with
   `texelFetchBuffer(textureC, gl_PrimitiveID + PrimitiveIDOffset)` —
   `gl_PrimitiveID` is the index of the triangle being rasterized, so it is
   unambiguous even though vertices are shared across cells. The vertex buffer
-  therefore stays point-indexed whether the color is per-point, per-cell, or
-  absent.
-- **Metal** carries both the color and the cell id as per-*vertex* attributes:
-  `emitSurfaceColor(polyCellIdx, ...)` bakes the cell's RGBA into the vertex at
-  geometry-build time, and the cell id is a flat-interpolated vertex attribute
-  in the shader. A shared corner belongs to multiple cells, so it has no single
-  cell id or color and the vertex must be duplicated per triangle. The fragment
-  reads the flat-interpolated provoking-vertex value, so a deduplicated corner
-  would be ambiguous → wrong color.
+  stays point-indexed whether the color is per-point, per-cell, or absent.
+- **Metal** now does the same: `BuildGeometryBuffers` keeps `useIndexBuffer`
+  dedup for cell-colored scenes and stops baking the cell color into the vertex
+  stream. The per-primitive RGBA is packed into a 2D **RGBA8Unorm** texture
+  (the analog of GL's RGBA8 buffer texture; the cell color source is 8-bit
+  `mappedColors`, so this quantizes identically and uses 4 bytes/cell instead of
+  16 for a float buffer), laid out row-major with `kCellTextureWidth = 8192` on
+  both sides (matches the `8192u` constant in `MetalShaders.metal`) so the
+  shader's `primId % width` / `primId / width` compile to a shift and mask; the
+  8192×16384 layout caps at 134M triangles. A per-primitive cell-id buffer (the
+  analog of GL's `CellCellMap` + `PrimitiveIDOffset`) supplies picking, and the
+  fragment shader resolves the color with `[[primitive_id]]` — MSL's analog of
+  `gl_PrimitiveID` — in `resolveCellColor`
+  (`cellColorTex.read(uint2(prim_id % width, prim_id / width))`). It is gated
+  behind the `kHasCellTexture` function constant (12) plus a runtime
+  `kSceneFlagHasCellTexture` flag (feature bit `1u << 11`) so the all-true
+  full-feature pipelines stay correct for plain per-vertex actors, and all four
+  fragment paths (opaque, OIT, and both peel variants) take the texture. The
+  zero-fallback is the 1×1 white `DefaultTexture` bound at slot 8, so a scene
+  without a cell-color texture reads white instead of garbage.
 
-Porting the cell-texture path to Metal would mean: stop writing cell colors
-into the vertex stream when `cellFlag != 0`; allow dedup even when
-`mappedColors != nullptr`; upload the per-primitive RGBA to a Metal
-texture/buffer; and resolve the cell id per-primitive in `fragment_main` (e.g.
-MSL `[[primitive_id]]`, the direct analog of `gl_PrimitiveID`, indexing a
-per-primitive cell-id buffer), gated behind a new function constant like
-`kHasCellTexture`. The payoff is the same class of win as `CpxGeomHi` for
-per-cell-colored scenes (3× vertices → point count) plus exact per-pixel cell
-ids for picking (GL parity) instead of first-wins. The current behavior is
-correct — just heavier on the vertex stage — so this is an optimization and a
-picking-exactness fix, not a correctness fix.
+Results on this repo's machine (Apple M1 Mac mini), `--reps 3` — per-cell
+scenes went from the same ~1.5× vertex-bound regime `CpxGeomHi` was in to
+parity:
+
+```
+scene                          GL ms/f  Metal ms/f   M/GL        tris
+CpxCellLo                         0.84        0.77    0.93       ~27k
+CpxCellHi                         2.55        2.68    1.05      ~696k
+CpxCellBig                        4.23        4.16    0.98      ~1.8M
+CpxPointLo                        0.81        0.75    0.92       ~27k
+CpxPointHi                        2.40        2.39    0.99      ~696k
+```
+
+The investigation of the residual ~5% at mid-scale (`CpxCellHi` ~1.05):
+
+- **The gap is the fetch, not the pipeline.** Temporarily skipping the buffer
+  load in `resolveCellColor` (returning a constant) moved `CpxCellHi` from 1.05
+  to ~0.99 and `CpxCellLo` from ~1.06 to ~0.87 — the per-fragment indexed color
+  read is the entire residual. The point-colored control (`CpxPoint*`, same
+  geometry, color arrives as an interpolated varying, no fetch) runs 0.92–1.04,
+  proving the scalar pipeline itself is at parity.
+- **RGBA8 texture vs float buffer is a wash.** The port was first built against
+  a `MTLPixelFormatRGBA32Float` buffer; switching to RGBA8Unorm changed nothing
+  measurable (~1.5–2× GL's `texelFetchBuffer` cost, ~0.15–0.2 ms at
+  `CpxCellHi`). The texture won on the 4× smaller footprint and the GL-faithful
+  quantization, not on speed.
+- **It does not amplify with complexity.** At 1.8M triangles (`CpxCellBig`) the
+  ratio converges to 0.91–1.09 as the scene becomes geometry-bound and the
+  per-fragment cost is amortized; GL's own cell-texture path degrades at scale
+  too (its `CpxCellBig` runs 4.2–4.4 ms vs 3.9–4.0 for the point-colored
+  control).
+
+The remaining cost is the irreducible price of dedup: the ~6× vertex-stage
+saving pays for a ~1.05× fragment fetch, which is exactly where GL lives (its
+`gl_PrimitiveID` + `texelFetchBuffer` does the same work). The port also makes
+picking exact in this path — per-primitive cell ids report the owning cell
+where the per-vertex first-wins value was ambiguous — so the common
+per-cell-colored case is now both at parity and exact.
 
 ### Recording another machine
 

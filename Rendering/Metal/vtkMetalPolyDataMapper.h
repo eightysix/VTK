@@ -130,6 +130,8 @@ protected:
     const std::vector<uint32_t>& edgeVertexCellIds,
     const std::vector<uint32_t>& edgeTubeIndices,
     const std::vector<uint32_t>& edgeTubeCellIds,
+    const std::vector<float>& cellColors,
+    const std::vector<uint32_t>& cellPrimitiveIds,
     std::unordered_map<std::string, std::vector<float>>& extraAttrArrays);
 
   // P1-3: Ensure fallback buffers exist for all shader-required bindings

@@ -26,6 +26,7 @@
 #include "vtkAppendPolyData.h"
 #include "vtkCamera.h"
 #include "vtkCellArray.h"
+#include "vtkCellData.h"
 #include "vtkCocoaMetalRenderWindow.h"
 #include "vtkCocoaRenderWindow.h"
 #include "vtkColorTransferFunction.h"
@@ -34,6 +35,8 @@
 #include "vtkConeSource.h"
 #include "vtkCubeSource.h"
 #include "vtkElevationFilter.h"
+#include "vtkFloatArray.h"
+#include "vtkPointData.h"
 #include "vtkGlyph3DMapper.h"
 #include "vtkGPUVolumeRayCastMapper.h"
 #include "vtkImageData.h"
@@ -869,6 +872,109 @@ inline void BuildGeometryGridScene(vtkRenderer* renderer, BackendKind b, int n, 
 
   vtkSmartPointer<vtkPolyDataMapper> mapper = NewPolyDataMapper(b);
   mapper->SetInputConnection(append->GetOutputPort());
+  vtkSmartPointer<vtkActor> actor = NewActor(b);
+  ConfigureActor(actor, b);
+  actor->SetMapper(mapper);
+  renderer->AddActor(actor);
+
+  vtkSmartPointer<vtkCamera> camera = NewCamera(b);
+  renderer->SetActiveCamera(camera);
+  renderer->ResetCamera();
+}
+
+// Same geometry grid as BuildGeometryGridScene, but with per-cell scalar colors
+// (ScalarModeToUseCellData) so the mapper exercises the "cell-texture" port:
+// the vertex stream stays deduplicated (point count, not 3x triangles) while
+// each triangle resolves the RGBA of its owning cell per-primitive.
+inline void BuildCellColorGridScene(vtkRenderer* renderer, BackendKind b, int n, int res)
+{
+  vtkNew<vtkAppendPolyData> append;
+  const double spacing = 1.8;
+  for (int i = 0; i < n; ++i)
+  {
+    for (int j = 0; j < n; ++j)
+    {
+      vtkNew<vtkSphereSource> sphere;
+      sphere->SetThetaResolution(res);
+      sphere->SetPhiResolution(res);
+      sphere->SetRadius(0.8);
+      sphere->SetCenter(i * spacing, j * spacing, 0.0);
+      sphere->Update();
+      append->AddInputData(sphere->GetOutput());
+    }
+  }
+  append->Update();
+  vtkSmartPointer<vtkPolyData> poly = vtkSmartPointer<vtkPolyData>::New();
+  poly->ShallowCopy(append->GetOutput());
+
+  const vtkIdType ncells = poly->GetNumberOfCells();
+  vtkNew<vtkFloatArray> cellScalars;
+  cellScalars->SetNumberOfComponents(1);
+  cellScalars->SetNumberOfTuples(ncells);
+  for (vtkIdType c = 0; c < ncells; ++c)
+  {
+    cellScalars->SetValue(c, (ncells > 1) ? static_cast<double>(c) / (ncells - 1) : 0.0);
+  }
+  cellScalars->SetName("cellScalars");
+  poly->GetCellData()->SetScalars(cellScalars);
+
+  vtkSmartPointer<vtkPolyDataMapper> mapper = NewPolyDataMapper(b);
+  mapper->SetInputData(poly);
+  mapper->ScalarVisibilityOn();
+  mapper->SetScalarModeToUseCellData();
+  mapper->SetColorModeToMapScalars();
+  mapper->SetScalarRange(0.0, 1.0);
+  vtkSmartPointer<vtkActor> actor = NewActor(b);
+  ConfigureActor(actor, b);
+  actor->SetMapper(mapper);
+  renderer->AddActor(actor);
+
+  vtkSmartPointer<vtkCamera> camera = NewCamera(b);
+  renderer->SetActiveCamera(camera);
+  renderer->ResetCamera();
+}
+
+// Diagnostic: the same grid as BuildGeometryGridScene but with per-point
+// scalar colors, so the bench can compare the lean (no scalars), per-point,
+// and per-cell colored fragment paths on identical geometry.
+inline void BuildPointColorGridScene(vtkRenderer* renderer, BackendKind b, int n, int res)
+{
+  vtkNew<vtkAppendPolyData> append;
+  const double spacing = 1.8;
+  for (int i = 0; i < n; ++i)
+  {
+    for (int j = 0; j < n; ++j)
+    {
+      vtkNew<vtkSphereSource> sphere;
+      sphere->SetThetaResolution(res);
+      sphere->SetPhiResolution(res);
+      sphere->SetRadius(0.8);
+      sphere->SetCenter(i * spacing, j * spacing, 0.0);
+      sphere->Update();
+      append->AddInputData(sphere->GetOutput());
+    }
+  }
+  append->Update();
+  vtkSmartPointer<vtkPolyData> poly = vtkSmartPointer<vtkPolyData>::New();
+  poly->ShallowCopy(append->GetOutput());
+
+  const vtkIdType npoints = poly->GetNumberOfPoints();
+  vtkNew<vtkFloatArray> pointScalars;
+  pointScalars->SetNumberOfComponents(1);
+  pointScalars->SetNumberOfTuples(npoints);
+  for (vtkIdType p = 0; p < npoints; ++p)
+  {
+    pointScalars->SetValue(p, (npoints > 1) ? static_cast<double>(p) / (npoints - 1) : 0.0);
+  }
+  pointScalars->SetName("pointScalars");
+  poly->GetPointData()->SetScalars(pointScalars);
+
+  vtkSmartPointer<vtkPolyDataMapper> mapper = NewPolyDataMapper(b);
+  mapper->SetInputData(poly);
+  mapper->ScalarVisibilityOn();
+  mapper->SetScalarModeToUsePointData();
+  mapper->SetColorModeToMapScalars();
+  mapper->SetScalarRange(0.0, 1.0);
   vtkSmartPointer<vtkActor> actor = NewActor(b);
   ConfigureActor(actor, b);
   actor->SetMapper(mapper);
