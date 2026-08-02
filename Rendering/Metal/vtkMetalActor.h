@@ -39,5 +39,7 @@ private:
   void operator=(const vtkMetalActor&) = delete;
 };
 
+#define vtkMetalActor_OVERRIDE_ATTRIBUTES vtkMetalActor::CreateOverrideAttributes()
+
 VTK_ABI_NAMESPACE_END
 #endif // vtkMetalActor_h

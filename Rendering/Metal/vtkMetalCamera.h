@@ -52,5 +52,7 @@ private:
   SceneTransforms CachedSceneTransforms;
 };
 
+#define vtkMetalCamera_OVERRIDE_ATTRIBUTES vtkMetalCamera::CreateOverrideAttributes()
+
 VTK_ABI_NAMESPACE_END
 #endif

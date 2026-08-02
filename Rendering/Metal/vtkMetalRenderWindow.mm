@@ -4,6 +4,7 @@
 #include "vtkMetalRenderWindow.h"
 
 #include "vtkObjectFactory.h"
+#include "vtkOverrideAttribute.h"
 #include "vtkRenderer.h"
 #include "vtkRendererCollection.h"
 #include "vtkCommand.h"
@@ -25,6 +26,12 @@
 VTK_ABI_NAMESPACE_BEGIN
 
 vtkStandardNewMacro(vtkMetalRenderWindow);
+
+//------------------------------------------------------------------------------
+vtkOverrideAttribute* vtkMetalRenderWindow::CreateOverrideAttributes()
+{
+  return vtkOverrideAttribute::CreateAttributeChain("RenderingBackend", "Metal", nullptr);
+}
 
 //------------------------------------------------------------------------------
 vtkMetalRenderWindow::vtkMetalRenderWindow() = default;

@@ -10,6 +10,7 @@
 #include "vtkMetalGPUVolumeRayCastMapper.h"
 #include "vtkMetalShaders.h"
 #include "vtkObjectFactory.h"
+#include "vtkOverrideAttribute.h"
 #include "vtkRenderer.h"
 #include "vtkRendererCollection.h"
 #include "vtkLightCollection.h"
@@ -60,6 +61,14 @@ static void EnsureDepthStencilStates(id<MTLDevice> device)
 }
 
 vtkStandardNewMacro(vtkMetalRenderer);
+
+//------------------------------------------------------------------------------
+// Register the "RenderingBackend=Metal" override attribute for this class.
+//------------------------------------------------------------------------------
+vtkOverrideAttribute* vtkMetalRenderer::CreateOverrideAttributes()
+{
+  return vtkOverrideAttribute::CreateAttributeChain("RenderingBackend", "Metal", nullptr);
+}
 
 //------------------------------------------------------------------------------
 vtkMetalRenderer::vtkMetalRenderer()

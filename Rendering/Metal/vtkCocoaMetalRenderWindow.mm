@@ -4,6 +4,7 @@
 #include "vtkCocoaMetalRenderWindow.h"
 
 #include "vtkObjectFactory.h"
+#include "vtkOverrideAttribute.h"
 
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/CAMetalLayer.h>

@@ -14,6 +14,7 @@
 #define vtkMetalHardwareSelector_h
 
 #include "vtkHardwareSelector.h"
+#include "vtkOverrideAttribute.h"
 #include "vtkRenderingMetalModule.h" // for export macro
 #include "vtkWrappingHints.h"        // for VTK_MARSHALAUTO
 #include "vtkNew.h"
@@ -28,6 +29,7 @@ class VTKRENDERINGMETAL_EXPORT VTK_MARSHALAUTO vtkMetalHardwareSelector
 public:
   static vtkMetalHardwareSelector* New();
   VTK_NEWINSTANCE
+  static vtkOverrideAttribute* CreateOverrideAttributes();
   vtkTypeMacro(vtkMetalHardwareSelector, vtkHardwareSelector);
   void PrintSelf(ostream& os, vtkIndent indent) override;
 
@@ -92,6 +94,9 @@ private:
   vtkMetalHardwareSelector(const vtkMetalHardwareSelector&) = delete;
   void operator=(const vtkMetalHardwareSelector&) = delete;
 };
+
+#define vtkMetalHardwareSelector_OVERRIDE_ATTRIBUTES \
+  vtkMetalHardwareSelector::CreateOverrideAttributes()
 
 VTK_ABI_NAMESPACE_END
 #endif

@@ -9,6 +9,7 @@
 #define vtkMetalGPUVolumeRayCastMapper_h
 
 #include "vtkGPUVolumeRayCastMapper.h"
+#include "vtkOverrideAttribute.h"
 #include "vtkRenderingMetalModule.h" // For export macro
 #include "vtkTimeStamp.h"            // For time stamp
 #include "vtkWrappingHints.h"        // For VTK_MARSHALAUTO
@@ -88,6 +89,7 @@ class VTKRENDERINGMETAL_EXPORT VTK_MARSHALAUTO vtkMetalGPUVolumeRayCastMapper
 {
 public:
   static vtkMetalGPUVolumeRayCastMapper* New();
+  static vtkOverrideAttribute* CreateOverrideAttributes();
   vtkTypeMacro(vtkMetalGPUVolumeRayCastMapper, vtkGPUVolumeRayCastMapper);
   void PrintSelf(ostream& os, vtkIndent indent) override;
 
@@ -377,6 +379,9 @@ private:
     bool useDepth, const void* pbd, uint32_t cullMode);
   void BuildGlobalPerBlockData(PerBlockData& pbd, vtkImageData* input);
 };
+
+#define vtkMetalGPUVolumeRayCastMapper_OVERRIDE_ATTRIBUTES \
+  vtkMetalGPUVolumeRayCastMapper::CreateOverrideAttributes()
 
 VTK_ABI_NAMESPACE_END
 #endif

@@ -40,7 +40,6 @@ class VTKRENDERINGMETAL_EXPORT VTK_MARSHALAUTO vtkCocoaMetalRenderWindow
 public:
   static vtkCocoaMetalRenderWindow* New();
   VTK_NEWINSTANCE
-  static vtkOverrideAttribute* CreateOverrideAttributes();
   vtkTypeMacro(vtkCocoaMetalRenderWindow, vtkMetalRenderWindow);
   void PrintSelf(ostream& os, vtkIndent indent) override;
 
@@ -66,6 +65,9 @@ private:
 
   NSView* ViewId = nullptr;
 };
+
+#define vtkCocoaMetalRenderWindow_OVERRIDE_ATTRIBUTES \
+  vtkCocoaMetalRenderWindow::CreateOverrideAttributes()
 
 VTK_ABI_NAMESPACE_END
 #endif

@@ -4,12 +4,19 @@
 #include "vtkMetalActor.h"
 
 #include "vtkObjectFactory.h"
+#include "vtkOverrideAttribute.h"
 #include "vtkMapper.h"
 #include "vtkRenderer.h"
 
 VTK_ABI_NAMESPACE_BEGIN
 
 vtkStandardNewMacro(vtkMetalActor);
+
+//------------------------------------------------------------------------------
+vtkOverrideAttribute* vtkMetalActor::CreateOverrideAttributes()
+{
+  return vtkOverrideAttribute::CreateAttributeChain("RenderingBackend", "Metal", nullptr);
+}
 
 //------------------------------------------------------------------------------
 vtkMetalActor::vtkMetalActor() = default;

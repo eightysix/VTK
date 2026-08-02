@@ -4,11 +4,18 @@
 #include "vtkMetalLight.h"
 
 #include "vtkObjectFactory.h"
+#include "vtkOverrideAttribute.h"
 #include "vtkLight.h"
 
 VTK_ABI_NAMESPACE_BEGIN
 
 vtkStandardNewMacro(vtkMetalLight);
+
+//------------------------------------------------------------------------------
+vtkOverrideAttribute* vtkMetalLight::CreateOverrideAttributes()
+{
+  return vtkOverrideAttribute::CreateAttributeChain("RenderingBackend", "Metal", nullptr);
+}
 
 //------------------------------------------------------------------------------
 vtkMetalLight::vtkMetalLight() = default;

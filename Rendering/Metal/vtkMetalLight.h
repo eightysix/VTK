@@ -38,5 +38,7 @@ private:
   void operator=(const vtkMetalLight&) = delete;
 };
 
+#define vtkMetalLight_OVERRIDE_ATTRIBUTES vtkMetalLight::CreateOverrideAttributes()
+
 VTK_ABI_NAMESPACE_END
 #endif // vtkMetalLight_h

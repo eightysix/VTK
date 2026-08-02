@@ -10,6 +10,7 @@
 #include "vtkMetalCamera.h"
 #include "vtkMetalShaders.h"
 #include "vtkObjectFactory.h"
+#include "vtkOverrideAttribute.h"
 #include "vtkPolyData.h"
 #include "vtkCellArray.h"
 #include "vtkCellData.h"
@@ -144,6 +145,12 @@ constexpr NSUInteger kCellTextureWidth = 8192;
 VTK_ABI_NAMESPACE_BEGIN
 
 vtkStandardNewMacro(vtkMetalPolyDataMapper);
+
+//------------------------------------------------------------------------------
+vtkOverrideAttribute* vtkMetalPolyDataMapper::CreateOverrideAttributes()
+{
+  return vtkOverrideAttribute::CreateAttributeChain("RenderingBackend", "Metal", nullptr);
+}
 
 //------------------------------------------------------------------------------
 struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals

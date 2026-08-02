@@ -43,6 +43,49 @@ elseif(APPLE)
   list(APPEND headers vtkCocoaMetalRenderWindow.h)
 endif()
 
+# Register the remaining Metal classes as factory overrides for their base
+# classes (RenderingCore / RenderingVolume).  Each override carries a
+# "RenderingBackend=Metal" override attribute so that the object factory can
+# select the Metal classes at runtime via
+# `--vtk-factory-prefer RenderingBackend=Metal` (used by the generic
+# Rendering/Core test suite, mirroring the OpenGL and WebGPU backends).
+vtk_object_factory_declare(
+  BASE vtkRenderer
+  OVERRIDE vtkMetalRenderer)
+vtk_object_factory_declare(
+  BASE vtkActor
+  OVERRIDE vtkMetalActor)
+vtk_object_factory_declare(
+  BASE vtkPolyDataMapper
+  OVERRIDE vtkMetalPolyDataMapper)
+vtk_object_factory_declare(
+  BASE vtkCompositePolyDataMapperDelegator
+  OVERRIDE vtkMetalCompositePolyDataMapperDelegator)
+vtk_object_factory_declare(
+  BASE vtkGlyph3DMapper
+  OVERRIDE vtkMetalGlyph3DMapper)
+vtk_object_factory_declare(
+  BASE vtkPolyDataMapper2D
+  OVERRIDE vtkMetalPolyDataMapper2D)
+vtk_object_factory_declare(
+  BASE vtkImageMapper
+  OVERRIDE vtkMetalImageMapper)
+vtk_object_factory_declare(
+  BASE vtkCamera
+  OVERRIDE vtkMetalCamera)
+vtk_object_factory_declare(
+  BASE vtkLight
+  OVERRIDE vtkMetalLight)
+vtk_object_factory_declare(
+  BASE vtkProperty
+  OVERRIDE vtkMetalProperty)
+vtk_object_factory_declare(
+  BASE vtkHardwareSelector
+  OVERRIDE vtkMetalHardwareSelector)
+vtk_object_factory_declare(
+  BASE vtkGPUVolumeRayCastMapper
+  OVERRIDE vtkMetalGPUVolumeRayCastMapper)
+
 # Metal shader compilation - embed shader source as C++ string constant
 vtk_encode_string(
   INPUT "Shaders/MetalShaders.metal"

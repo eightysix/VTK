@@ -149,5 +149,7 @@ private:
   std::unique_ptr<vtkMetalPolyDataMapperInternals> Internals;
 };
 
+#define vtkMetalPolyDataMapper_OVERRIDE_ATTRIBUTES vtkMetalPolyDataMapper::CreateOverrideAttributes()
+
 VTK_ABI_NAMESPACE_END
 #endif

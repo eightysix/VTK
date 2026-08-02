@@ -32,5 +32,7 @@ private:
   void operator=(const vtkMetalProperty&) = delete;
 };
 
+#define vtkMetalProperty_OVERRIDE_ATTRIBUTES vtkMetalProperty::CreateOverrideAttributes()
+
 VTK_ABI_NAMESPACE_END
 #endif

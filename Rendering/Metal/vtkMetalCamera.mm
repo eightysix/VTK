@@ -4,6 +4,7 @@
 #include "vtkMetalCamera.h"
 #include "vtkMatrix4x4.h"
 #include "vtkObjectFactory.h"
+#include "vtkOverrideAttribute.h"
 #include "vtkRenderer.h"
 #include "vtkViewport.h"
 
@@ -12,6 +13,12 @@
 VTK_ABI_NAMESPACE_BEGIN
 
 vtkStandardNewMacro(vtkMetalCamera);
+
+//------------------------------------------------------------------------------
+vtkOverrideAttribute* vtkMetalCamera::CreateOverrideAttributes()
+{
+  return vtkOverrideAttribute::CreateAttributeChain("RenderingBackend", "Metal", nullptr);
+}
 
 vtkMetalCamera::vtkMetalCamera() = default;
 vtkMetalCamera::~vtkMetalCamera() = default;

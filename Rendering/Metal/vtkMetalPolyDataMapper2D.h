@@ -57,5 +57,8 @@ private:
   std::unique_ptr<vtkMetalPolyDataMapper2DInternals> Internals;
 };
 
+#define vtkMetalPolyDataMapper2D_OVERRIDE_ATTRIBUTES \
+  vtkMetalPolyDataMapper2D::CreateOverrideAttributes()
+
 VTK_ABI_NAMESPACE_END
 #endif

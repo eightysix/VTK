@@ -267,6 +267,14 @@ if (TARGET VTK::RenderingWebGPU)
     PROPERTIES TIMEOUT ${VTK_TEST_TIMEOUT_TestManyRenderWindows})
 endif ()
 
+if (TARGET VTK::RenderingMetal)
+  set(vtk_test_prefix "Metal-")
+  vtk_add_test_cxx(vtkRenderingCoreCxxTests tests
+    --vtk-factory-prefer RenderingBackend=Metal
+    ${cxx_tests})
+  unset(vtk_test_prefix)
+endif ()
+
 vtk_test_cxx_executable(vtkRenderingCoreCxxTests tests)
 
 if (TARGET VTK::RenderingWebGPU)

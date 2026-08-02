@@ -10,6 +10,7 @@
 #include "vtkColorTransferFunction.h"
 #include "vtkImageData.h"
 #include "vtkObjectFactory.h"
+#include "vtkOverrideAttribute.h"
 #include "vtkPiecewiseFunction.h"
 #include "vtkPointData.h"
 #include "vtkRenderer.h"
@@ -1082,6 +1083,12 @@ static inline void SetFragmentTextureOrFallback(
 VTK_ABI_NAMESPACE_BEGIN
 
 vtkStandardNewMacro(vtkMetalGPUVolumeRayCastMapper);
+
+//------------------------------------------------------------------------------
+vtkOverrideAttribute* vtkMetalGPUVolumeRayCastMapper::CreateOverrideAttributes()
+{
+  return vtkOverrideAttribute::CreateAttributeChain("RenderingBackend", "Metal", nullptr);
+}
 
 //------------------------------------------------------------------------------
 vtkMetalGPUVolumeRayCastMapper::vtkMetalGPUVolumeRayCastMapper()

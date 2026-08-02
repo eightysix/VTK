@@ -3,10 +3,17 @@
 
 #include "vtkMetalProperty.h"
 #include "vtkObjectFactory.h"
+#include "vtkOverrideAttribute.h"
 
 VTK_ABI_NAMESPACE_BEGIN
 
 vtkStandardNewMacro(vtkMetalProperty);
+
+//------------------------------------------------------------------------------
+vtkOverrideAttribute* vtkMetalProperty::CreateOverrideAttributes()
+{
+  return vtkOverrideAttribute::CreateAttributeChain("RenderingBackend", "Metal", nullptr);
+}
 
 vtkMetalProperty::vtkMetalProperty() = default;
 vtkMetalProperty::~vtkMetalProperty() = default;

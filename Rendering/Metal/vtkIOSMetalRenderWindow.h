@@ -22,7 +22,6 @@ class VTKRENDERINGMETAL_EXPORT VTK_MARSHALAUTO vtkIOSMetalRenderWindow
 public:
   static vtkIOSMetalRenderWindow* New();
   VTK_NEWINSTANCE
-  static vtkOverrideAttribute* CreateOverrideAttributes();
   vtkTypeMacro(vtkIOSMetalRenderWindow, vtkMetalRenderWindow);
   void PrintSelf(ostream& os, vtkIndent indent) override;
 
@@ -40,6 +39,9 @@ private:
 
   UIView* ViewId = nullptr;
 };
+
+#define vtkIOSMetalRenderWindow_OVERRIDE_ATTRIBUTES \
+  vtkIOSMetalRenderWindow::CreateOverrideAttributes()
 
 VTK_ABI_NAMESPACE_END
 #endif

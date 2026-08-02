@@ -5,6 +5,7 @@
 #include "vtkMetalRenderWindow.h"
 
 #include "vtkObjectFactory.h"
+#include "vtkOverrideAttribute.h"
 #include "vtkRenderer.h"
 #include "vtkRenderWindow.h"
 #include "vtkUnsignedIntArray.h"
@@ -19,6 +20,12 @@
 VTK_ABI_NAMESPACE_BEGIN
 
 vtkStandardNewMacro(vtkMetalHardwareSelector);
+
+//------------------------------------------------------------------------------
+vtkOverrideAttribute* vtkMetalHardwareSelector::CreateOverrideAttributes()
+{
+  return vtkOverrideAttribute::CreateAttributeChain("RenderingBackend", "Metal", nullptr);
+}
 
 //------------------------------------------------------------------------------
 vtkMetalHardwareSelector::vtkMetalHardwareSelector() = default;

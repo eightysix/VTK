@@ -74,5 +74,7 @@ private:
   void operator=(const vtkMetalRenderer&) = delete;
 };
 
+#define vtkMetalRenderer_OVERRIDE_ATTRIBUTES vtkMetalRenderer::CreateOverrideAttributes()
+
 VTK_ABI_NAMESPACE_END
 #endif // vtkMetalRenderer_h
