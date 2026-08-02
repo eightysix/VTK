@@ -10,7 +10,7 @@
 // Usage:
 //   vtkMetalGLVisualComparison [--out <dir>] [--threshold <value>]
 //     [--scene <name>] [--backend gl|metal] [--bench] [--frames <n>] [--reps <n>]
-//     [--complexity] [--perframe]
+//     [--complexity] [--perframe] [--gpu-mem] [--host-mem]
 //
 // The default output directory is "visual_compare" under the current working
 // directory. When --threshold is given, the process exits non-zero if any
@@ -21,7 +21,12 @@
 // average ms/frame, fps and the Metal/GL ratio. The camera is nudged slightly
 // each frame so every timed render performs real work, and both backends are
 // synchronized inside the timed region (Metal WaitForCompletion, OpenGL
-// glFinish) so the wall-clock time covers GPU time for both.
+// glFinish) so the wall-clock time covers GPU time for both. The bench is
+// grouped by backend — the whole GL suite runs first, then the whole Metal
+// suite — rather than interleaved per scene, so both backends are measured in
+// the same sustained clock state (per-scene interleaving biased the ratio:
+// GL landed in a fresh clock state while Metal inherited the throttled state
+// right after GL's reps).
 //
 // --reps repeats the whole per-scene measurement (fresh window each run) the
 // given number of times and reports the mean of the per-run averages plus the
@@ -36,6 +41,11 @@
 //
 // --perframe prints every timed frame's ms, for diagnosing transient empty
 // frames (near-zero ms) in the timed loop.
+//
+// --gpu-mem prints the Metal device's currentAllocatedSize (MB) after each
+// bench run, and --host-mem prints this process's resident set size (MB), so
+// a full --bench run doubles as a leak check: both should stay flat across a
+// scene's reps and return to a low baseline between scenes.
 //
 // Note: the OpenGL backend needs the vtkShaderProgram object-factory override
 // (vtkOpenGLShaderProgram), so vtkRenderingOpenGL2 and vtkRenderingVolumeOpenGL2
@@ -65,6 +75,9 @@ VTK_MODULE_INIT(vtkRenderingVolumeOpenGL2);
 #include <cstdio>
 #include <cstdlib>
 
+#include <mach/mach.h>
+#include <mach/task_info.h>
+
 extern "C" void* objc_autoreleasePoolPush(void);
 extern "C" void objc_autoreleasePoolPop(void* pool);
 #include <filesystem>
@@ -85,6 +98,25 @@ bool gPerFrame = false;
 // after each backend's bench run, to track GPU memory accumulation across
 // scenes. Only meaningful for the Metal backend.
 bool gGpuMem = false;
+
+// Diagnostic: when set, print this process's resident set size (MB) after each
+// backend's bench run, to track host-RAM accumulation across scenes. Unlike
+// gpu-mem it is meaningful for both backends.
+bool gHostMem = false;
+
+// Process resident set size in bytes (host RAM footprint), queried via the
+// mach task info API. This is the same "RSS" that ps reports for the process.
+double GetProcessRSS()
+{
+  mach_task_basic_info info;
+  mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+  if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+        reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS)
+  {
+    return static_cast<double>(info.resident_size);
+  }
+  return 0.0;
+}
 
 struct SceneSpec
 {
@@ -355,6 +387,11 @@ BenchStats BenchmarkScene(
       std::printf("[gpu-mem/%s] %.1f MB\n", spec.Name, mb);
     }
   }
+  if (gHostMem)
+  {
+    const double mb = GetProcessRSS() / (1024.0 * 1024.0);
+    std::printf("[host-mem/%s] %.1f MB\n", spec.Name, mb);
+  }
   return stats;
 }
 
@@ -455,6 +492,10 @@ int main(int argc, char* argv[])
     else if (arg == "--gpu-mem")
     {
       gGpuMem = true;
+    }
+    else if (arg == "--host-mem")
+    {
+      gHostMem = true;
     }
     else if (arg == "--complexity")
     {
@@ -603,63 +644,93 @@ int main(int argc, char* argv[])
         spec.Height = sizeH;
       }
     }
+
+    const bool benchGl = backendFilter.empty() || backendFilter == "gl";
+    const bool benchMetal = backendFilter.empty() || backendFilter == "metal";
+
+    std::vector<SceneSpec> toBench;
     for (const SceneSpec& spec : benchScenes)
     {
       if (!sceneFilter.empty() && sceneFilter != spec.Name)
       {
         continue;
       }
+      toBench.push_back(spec);
+    }
+
+    // Group by backend instead of interleaving GL/Metal per scene: each backend
+    // now runs its whole suite back-to-back in one sustained pass. The old
+    // per-scene interleave measured GL first (fresh clock state) and Metal
+    // immediately after GL's reps (inheriting the throttled state), which
+    // biased the ratio — individual GL rows caught a clock boost and showed up
+    // as "Metal slower" even when the clean single-backend numbers were at or
+    // below parity. Grouping gives both backends the same sustained-state
+    // comparison in one process.
+    std::vector<BenchAggregate> glResults(toBench.size());
+    std::vector<BenchAggregate> metalResults(toBench.size());
+    for (size_t i = 0; i < toBench.size(); ++i)
+    {
       void* arPool = objc_autoreleasePoolPush();
-      const bool benchGl = backendFilter.empty() || backendFilter == "gl";
-      const bool benchMetal = backendFilter.empty() || backendFilter == "metal";
+      if (benchGl)
+      {
+        glResults[i] = RunBenchmark(
+          toBench[i], vtkMetalScenes::BackendKind::OpenGL, benchFrames, benchReps);
+      }
+      objc_autoreleasePoolPop(arPool);
+    }
+    for (size_t i = 0; i < toBench.size(); ++i)
+    {
+      void* arPool = objc_autoreleasePoolPush();
+      if (benchMetal)
+      {
+        metalResults[i] =
+          RunBenchmark(toBench[i], vtkMetalScenes::BackendKind::Metal, benchFrames, benchReps);
+      }
+      objc_autoreleasePoolPop(arPool);
+    }
 
-      char glCell[32], metalCell[32];
-      const auto fmtMs = [benchReps](char* dst, size_t n, const BenchAggregate& a) {
-        if (benchReps > 1)
-        {
-          std::snprintf(dst, n, "%.2f±%.2f", a.MeanMs, a.StdDevMs);
-        }
-        else
-        {
-          std::snprintf(dst, n, "%.2f", a.MeanMs);
-        }
-      };
+    char glCell[32], metalCell[32];
+    const auto fmtMs = [benchReps](char* dst, size_t n, const BenchAggregate& a) {
+      if (benchReps > 1)
+      {
+        std::snprintf(dst, n, "%.2f±%.2f", a.MeanMs, a.StdDevMs);
+      }
+      else
+      {
+        std::snprintf(dst, n, "%.2f", a.MeanMs);
+      }
+    };
 
+    for (size_t i = 0; i < toBench.size(); ++i)
+    {
+      const BenchAggregate& gl = glResults[i];
+      const BenchAggregate& metal = metalResults[i];
       char line[256];
       if (benchGl && benchMetal)
       {
-        const BenchAggregate gl =
-          RunBenchmark(spec, vtkMetalScenes::BackendKind::OpenGL, benchFrames, benchReps);
-        const BenchAggregate metal =
-          RunBenchmark(spec, vtkMetalScenes::BackendKind::Metal, benchFrames, benchReps);
         fmtMs(glCell, sizeof(glCell), gl);
         fmtMs(metalCell, sizeof(metalCell), metal);
-        std::snprintf(line, sizeof(line), "%-30s %9s %6.1f  %11s %8.1f  %6.2f\n", spec.Name,
-          glCell, 1000.0 / gl.MeanMs, metalCell, 1000.0 / metal.MeanMs,
-          metal.MeanMs / gl.MeanMs);
+        std::snprintf(line, sizeof(line), "%-30s %9s %6.1f  %11s %8.1f  %6.2f\n",
+          toBench[i].Name, glCell, 1000.0 / gl.MeanMs, metalCell,
+          1000.0 / metal.MeanMs, metal.MeanMs / gl.MeanMs);
       }
       else if (benchGl)
       {
-        const BenchAggregate gl =
-          RunBenchmark(spec, vtkMetalScenes::BackendKind::OpenGL, benchFrames, benchReps);
         fmtMs(glCell, sizeof(glCell), gl);
-        std::snprintf(line, sizeof(line), "%-30s %9s %6.1f  %11s %8s  %6s\n", spec.Name, glCell,
-          1000.0 / gl.MeanMs, "-", "-", "-");
+        std::snprintf(line, sizeof(line), "%-30s %9s %6.1f  %11s %8s  %6s\n",
+          toBench[i].Name, glCell, 1000.0 / gl.MeanMs, "-", "-", "-");
       }
       else if (benchMetal)
       {
-        const BenchAggregate metal =
-          RunBenchmark(spec, vtkMetalScenes::BackendKind::Metal, benchFrames, benchReps);
         fmtMs(metalCell, sizeof(metalCell), metal);
-        std::snprintf(line, sizeof(line), "%-30s %9s %6s  %11s %8.1f  %6s\n", spec.Name, "-", "-",
-          metalCell, 1000.0 / metal.MeanMs, "-");
+        std::snprintf(line, sizeof(line), "%-30s %9s %6s  %11s %8.1f  %6s\n",
+          toBench[i].Name, "-", "-", metalCell, 1000.0 / metal.MeanMs, "-");
       }
       else
       {
         continue;
       }
       std::cout << line;
-      objc_autoreleasePoolPop(arPool);
     }
     std::cout << "-------------------------------------------------------------------\n";
   }

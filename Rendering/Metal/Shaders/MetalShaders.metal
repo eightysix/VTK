@@ -53,6 +53,19 @@ constant bool kHasBackface      [[function_constant(9)]];
 constant bool kHasEdgeFlags     [[function_constant(10)]];
 constant bool kEmitIds          [[function_constant(11)]];
 constant bool kHasCellTexture   [[function_constant(12)]];
+// Number of enabled lights, baked per pipeline like GL's shader-template
+// unrolling: the surface pipelines compile with the exact count so the lighting
+// loop unrolls to exactly that many iterations with no runtime guards; the
+// shared full-behavior pipelines (base/peel/OIT/glyph/point/line) are
+// specialized with the maximum and keep the runtime guard. Metal function
+// constants cannot carry an initializer, so every pipeline whose fragment
+// function reaches computePhongLighting must supply index 13.
+constant int kLightCount [[function_constant(13)]];
+// Light type of the first light (the only one when kLightCount == 1), baked the
+// same way: 0 = headlight, 1 = directional/camera, 2 = point, 3 = spot. With
+// the single-light surface pipelines the compiler folds this into the type
+// dispatch, pruning the dead paths — matching GL's per-complexity shaders.
+constant int kLightType [[function_constant(14)]];
 
 // The per-cell color port ("cell texture"): when per-cell colors are present
 // and the vertex stream is deduplicated, the cell RGBA cannot live in the
@@ -167,11 +180,22 @@ struct PickIds {
   uint compositeIndex;
 };
 
-// Fragment output with explicit depth
+// Fragment output with explicit depth. Only used when a coincident polygon
+// offset is active; writing depth from the fragment stage disables early-Z, so
+// the plain-surface pipelines use fragment_main_nodepth below and let the
+// rasterizer handle depth like GL (which only emits gl_FragDepth when the
+// Coincident shader replacement is applied).
 struct FragmentOutput {
   float4 color [[color(0)]];
   uint4 ids [[color(1)]];
   float depth [[depth(any)]];
+};
+
+// Early-Z-friendly surface output: no [[depth(any)]] member, so the hardware
+// performs the depth test before the fragment shader and writes depth itself.
+struct FragmentOutputNoDepth {
+  float4 color [[color(0)]];
+  uint4 ids [[color(1)]];
 };
 
 
@@ -192,34 +216,44 @@ inline bool isClipped(float3 modelPos, constant ClipPlaneUniforms& clipPlanes) {
 }
 
 // Unified fast lighting calculation preventing duplicated loops / logic across fragments
+// lightLoopBound is the loop upper bound. The surface fragments pass the baked
+// function constant kLightCount (exact enabled-light count, so the loop unrolls
+// to exactly that many constant-index iterations — matching GL's shader-template
+// unrolling of lightColor0, lightDirectionVC1, ...). Every other fragment entry
+// passes the plain constant MAX_LIGHTS so it keeps the runtime lightCount guard
+// and never references a function constant (those pipelines need no constant
+// specialization).
+// bakedLightType mirrors GL's per-complexity shaders: for the single-light
+// surface pipelines it is the compile-time kLightType (so the type dispatch
+// folds to one path); everywhere else it is -1 and the type is read from the
+// light uniform.
 inline void computePhongLighting(
     float3 N, float3 viewPos, float3 diffuseColor, float3 specularColor, 
     float specularIntensity, float specularPower,
+    int lightLoopBound, int bakedLightType,
     constant LightUniforms& lights,
     thread float3& totalDiffuse, thread float3& totalSpecular) {
   
   float3 viewDir = normalize(-viewPos);
   
-  // GL unrolls per-light code with compile-time constant indices
-  // (lightColor0, lightDirectionVC1, ...) so the compiler can constant-fold the
-  // light type and keep uniforms in registers. A runtime-bounded loop here
-  // forces dynamic indexing into the lights array on every fragment, which is
-  // measurably slower on Apple GPUs. Unroll over the compile-time MAX_LIGHTS
-  // bound with a uniform guard so the index is constant in every iteration.
   #pragma unroll
-  for (int i = 0; i < MAX_LIGHTS; ++i)
+  for (int i = 0; i < lightLoopBound; ++i)
   {
     if (i >= lights.lightCount) continue;
     Light L = lights.lights[i];
-    int lightType = int(L.position.w);
-    float3 lightColor = L.color.rgb * L.color.w;
+    int lightType = (lightLoopBound == 1 && bakedLightType >= 0) ? bakedLightType : int(L.position.w);
+    // L.color is already diffuse*intensity on the CPU (color.w is always 1.0),
+    // and L.direction is already unit length (normalized then rotated by the
+    // rigid view transform in UpdateLightUniforms), so no per-fragment multiply
+    // or normalize — matching GL's pre-baked lightColor0 / lightDirectionVC.
+    float3 lightColor = L.color.rgb;
     float attenuation = 1.0;
     float3 toLight;
     
     if (lightType == 0) { // Headlight
       toLight = float3(0.0, 0.0, 1.0);
     } else if (lightType == 1) { // Directional
-      toLight = normalize(-L.direction.xyz);
+      toLight = -L.direction.xyz;
     } else { // Point / Spot
       toLight = L.position.xyz - viewPos;
       float dist = length(toLight);
@@ -227,7 +261,7 @@ inline void computePhongLighting(
       attenuation = 1.0 / (L.attenuation.x + L.attenuation.y * dist + L.attenuation.z * dist * dist);
       
       if (lightType == 3) { // Spot specifics
-        float spotCos = dot(-toLight, normalize(L.direction.xyz));
+        float spotCos = dot(-toLight, L.direction.xyz);
         float spotCutoff = cos(L.direction.w * (M_PI_F / 180.0));
         attenuation *= select(0.0f, pow(max(spotCos, 0.0f), L.attenuation.w), spotCos > spotCutoff);
       }
@@ -265,18 +299,23 @@ struct ResolvedMaterial {
     float  opacity;
 };
 
+// useVertexColor / useTexture are the effective "is this actor colored / is the
+// actor texture active" decisions. The specialized surface pipelines pass the
+// compile-time function-constant values so the selects fold away exactly like
+// GL's shader-template substitution (which bakes the scalar-color path in at
+// compile time); the shared OIT/peel/edge pipelines pass the runtime scene
+// flags since a single pipeline serves arbitrary actors.
 inline ResolvedMaterial resolveMaterial(
     MaterialUniforms material,
-    constant SceneUniforms& scene,
     float4 vertexColor, float2 uv,
-    texture2d<float> actorTexture, sampler actorSampler)
+    texture2d<float> actorTexture, sampler actorSampler,
+    bool useVertexColor, bool useTexture)
 {
-    bool hasVC = (scene.flags & kSceneFlagHasSurfaceColors) != 0u;
     ResolvedMaterial r;
-    r.ambient = hasVC ? vertexColor.rgb : material.ambientColor.rgb;
-    r.diffuse = hasVC ? vertexColor.rgb : material.diffuseColor.rgb;
-    r.opacity = (scene.flags & kSceneFlagHasSurfaceAlpha) != 0u ? vertexColor.a : material.opacity;
-    if ((scene.flags & kSceneFlagHasActorTexture) != 0u) {
+    r.ambient = useVertexColor ? vertexColor.rgb : material.ambientColor.rgb;
+    r.diffuse = useVertexColor ? vertexColor.rgb : material.diffuseColor.rgb;
+    r.opacity = useVertexColor ? vertexColor.a : material.opacity;
+    if (useTexture) {
         float4 tex = actorTexture.sample(actorSampler, uv);
         r.ambient *= tex.rgb;
         r.diffuse *= tex.rgb;
@@ -499,19 +538,26 @@ vertex VertexOut vertex_main_indexed(uint vertex_id [[vertex_id]],
 // ---------------------------------------------------------------------------
 // Fragment shader
 // ---------------------------------------------------------------------------
-fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
-                              constant MaterialUniforms& material [[buffer(0)]],
-                              constant LightUniforms& lights [[buffer(1)]],
-                              constant SceneUniforms& scene [[buffer(2)]],
-                              constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
-                              constant EdgeUniforms& edge [[buffer(4)]],
-                              constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
-                              texture2d<float, access::read> cellColorTex [[texture(8)]],
-                              constant uint* cellPrimitiveIds [[buffer(7)]],
-                              texture2d<float> actorTexture [[texture(0)]],
-                              sampler actorSampler [[sampler(0)]],
-                              uint prim_id [[primitive_id]],
-                              bool frontFacing [[front_facing]]) {
+struct FragmentColorAndIds {
+  float4 color;
+  uint4 ids;
+  bool emitIds;
+};
+
+// Shared surface fragment evaluation (used by both the early-Z and the
+// coincident-offset entry points so the two never drift).
+inline FragmentColorAndIds evaluateSurfaceFragment(VertexOut in,
+                             constant MaterialUniforms& material,
+                             constant LightUniforms& lights,
+                             constant SceneUniforms& scene,
+                             constant EdgeUniforms& edge,
+                             constant ClipPlaneUniforms& clipPlanes,
+                             texture2d<float, access::read> cellColorTex,
+                             constant uint* cellPrimitiveIds,
+                             texture2d<float> actorTexture,
+                             sampler actorSampler,
+                             uint prim_id,
+                             bool frontFacing) {
   if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
 
   // Match vtkOpenGLPolyDataMapper: backfaces flip the geometric normal (so
@@ -545,7 +591,10 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
   ResolvedMaterial r;
   if (kHasSurfaceColors || kHasActorTexture || kHasSurfaceAlpha || kHasCellTexture)
   {
-    r = resolveMaterial(m, scene, effColor, in.uv, actorTexture, actorSampler);
+    // Compile-time flags: the specialized surface pipelines bake the color and
+    // texture decisions in (GL compiles the scalar-color path in directly).
+    r = resolveMaterial(m, effColor, in.uv, actorTexture, actorSampler,
+      kHasSurfaceColors || kHasCellTexture, kHasActorTexture);
   }
   else
   {
@@ -563,17 +612,73 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
-  computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, lights, totalDiffuse, totalSpecular);
+  computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, kLightCount, kLightType, lights, totalDiffuse, totalSpecular);
 
-  FragmentOutput out;
+  FragmentColorAndIds out;
   out.color = float4(totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular, r.opacity);
+  out.emitIds = kEmitIds;
   if (kEmitIds)
   {
     uint cellId = ((scene.flags & kSceneFlagHasCellTexture) != 0u)
       ? cellPrimitiveIds[prim_id] : in.cellId;
     out.ids = uint4(cellId, in.propId, in.compositeIndex, 0u);
   }
+  return out;
+}
 
+// Plain-surface variant: no depth output, so the renderer keeps early-Z and
+// writes depth through the rasterizer (what GL does when no coincident offset
+// is active). This is the lean fast path for opaque surface draws.
+fragment FragmentOutputNoDepth fragment_main_nodepth(VertexOut in [[stage_in]],
+                              constant MaterialUniforms& material [[buffer(0)]],
+                              constant LightUniforms& lights [[buffer(1)]],
+                              constant SceneUniforms& scene [[buffer(2)]],
+                              constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+                              constant EdgeUniforms& edge [[buffer(4)]],
+                              constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
+                              texture2d<float, access::read> cellColorTex [[texture(8)]],
+                              constant uint* cellPrimitiveIds [[buffer(7)]],
+                              texture2d<float> actorTexture [[texture(0)]],
+                              sampler actorSampler [[sampler(0)]],
+                              uint prim_id [[primitive_id]],
+                              bool frontFacing [[front_facing]]) {
+  FragmentColorAndIds v = evaluateSurfaceFragment(in, material, lights, scene, edge,
+    clipPlanes, cellColorTex, cellPrimitiveIds, actorTexture, actorSampler,
+    prim_id, frontFacing);
+  FragmentOutputNoDepth out;
+  out.color = v.color;
+  if (v.emitIds)
+  {
+    out.ids = v.ids;
+  }
+  return out;
+}
+
+// Coincident-offset variant: writes depth from the fragment stage exactly like
+// GL's ReplaceShaderCoincidentOffset. Only selected by the mapper when a
+// polygon factor/offset is actually active.
+fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
+                              constant MaterialUniforms& material [[buffer(0)]],
+                              constant LightUniforms& lights [[buffer(1)]],
+                              constant SceneUniforms& scene [[buffer(2)]],
+                              constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+                              constant EdgeUniforms& edge [[buffer(4)]],
+                              constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
+                              texture2d<float, access::read> cellColorTex [[texture(8)]],
+                              constant uint* cellPrimitiveIds [[buffer(7)]],
+                              texture2d<float> actorTexture [[texture(0)]],
+                              sampler actorSampler [[sampler(0)]],
+                              uint prim_id [[primitive_id]],
+                              bool frontFacing [[front_facing]]) {
+  FragmentColorAndIds v = evaluateSurfaceFragment(in, material, lights, scene, edge,
+    clipPlanes, cellColorTex, cellPrimitiveIds, actorTexture, actorSampler,
+    prim_id, frontFacing);
+  FragmentOutput out;
+  out.color = v.color;
+  if (v.emitIds)
+  {
+    out.ids = v.ids;
+  }
   float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
   out.depth = in.position.z + coinOffset.polygonFactor * cscale + coinOffset.polygonOffset / 65000.0;
   return out;
@@ -620,14 +725,16 @@ fragment OITAccumulateOutput fragment_main_oit(VertexOut in [[stage_in]],
     m.specularPower = material.backfaceSpecularPower;
   }
 
-  ResolvedMaterial r = resolveMaterial(m, scene, resolveCellColor(in, prim_id, scene, cellColorTex), in.uv, actorTexture, actorSampler);
+  ResolvedMaterial r = resolveMaterial(m, resolveCellColor(in, prim_id, scene, cellColorTex), in.uv, actorTexture, actorSampler,
+    (scene.flags & kSceneFlagHasSurfaceColors) != 0u,
+    (scene.flags & kSceneFlagHasActorTexture) != 0u);
   applySurfaceEdges(N, r, in, lights, edge, scene);
 
   float3 totalAmbient = m.ambientColor.w * r.ambient;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
-  computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, lights, totalDiffuse, totalSpecular);
+  computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
 
   float3 litRGB = totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular;
   float opacity = r.opacity;
@@ -720,7 +827,7 @@ fragment FragmentOutput fragment_point_main(PointVertexOut in [[stage_in]],
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
   
-  computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
+  computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
 
   FragmentOutput out;
   out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha * material.opacity);
@@ -830,7 +937,7 @@ fragment FragmentOutput fragment_point_shaped_main(
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
   
-  computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
+  computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
 
   out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha * material.opacity);
   out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
@@ -883,7 +990,7 @@ inline FragmentOutput shadeLineFragment(LineVertexOut in,
 
   float3 totalDiffuse = float3(0.0), totalSpecular = float3(0.0);
   computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb,
-      material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
+      material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
 
   out.color = float4(material.ambientColor.w * baseColor
                    + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha);
@@ -1456,13 +1563,15 @@ fragment PeelPassOutput fragment_peel(
     m.opacity = material.backfaceOpacity;
     m.specularPower = material.backfaceSpecularPower;
   }
-  ResolvedMaterial r = resolveMaterial(m, scene, resolveCellColor(in, prim_id, scene, cellColorTex), in.uv, actorTexture, actorSampler);
+  ResolvedMaterial r = resolveMaterial(m, resolveCellColor(in, prim_id, scene, cellColorTex), in.uv, actorTexture, actorSampler,
+    (scene.flags & kSceneFlagHasSurfaceColors) != 0u,
+    (scene.flags & kSceneFlagHasActorTexture) != 0u);
   applySurfaceEdges(N, r, in, lights, edge, scene);
   float3 totalAmbient = m.ambientColor.w * r.ambient;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
-  computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, lights, totalDiffuse, totalSpecular);
+  computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
 
   float3 fragRGB = totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular;
 
@@ -1515,13 +1624,15 @@ fragment float4 fragment_peel_alpha_blend(
     m.opacity = material.backfaceOpacity;
     m.specularPower = material.backfaceSpecularPower;
   }
-  ResolvedMaterial r = resolveMaterial(m, scene, resolveCellColor(in, prim_id, scene, cellColorTex), in.uv, actorTexture, actorSampler);
+  ResolvedMaterial r = resolveMaterial(m, resolveCellColor(in, prim_id, scene, cellColorTex), in.uv, actorTexture, actorSampler,
+    (scene.flags & kSceneFlagHasSurfaceColors) != 0u,
+    (scene.flags & kSceneFlagHasActorTexture) != 0u);
   applySurfaceEdges(N, r, in, lights, edge, scene);
   float3 totalAmbient = m.ambientColor.w * r.ambient;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
-  computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, lights, totalDiffuse, totalSpecular);
+  computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
 
   float3 fragRGB = totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular;
   return float4(fragRGB * r.opacity, r.opacity);
@@ -1626,7 +1737,7 @@ inline FragmentOutput shadeGlyphFragment(T in,
   float3 N = normalize(in.viewNormal);
   float3 totalDiffuse = float3(0.0), totalSpecular = float3(0.0);
   computePhongLighting(N, in.viewPos, in.glyphColor.rgb, material.specularColor.rgb,
-      material.specularColor.w, material.specularPower, lights, totalDiffuse, totalSpecular);
+      material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
   FragmentOutput out;
   out.color = float4(material.ambientColor.w * in.glyphColor.rgb
                    + material.diffuseColor.w * totalDiffuse + totalSpecular,

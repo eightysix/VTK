@@ -195,8 +195,21 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     kSurfaceFeatureEdges = 1u << 4,
     kSurfaceFeatureEmitIds = 1u << 5,
     kSurfaceFeatureCellTexture = 1u << 6,
+    // Not a shader function constant: selects the depth-writing fragment entry
+    // (fragment_main) vs the early-Z entry (fragment_main_nodepth) when a
+    // coincident polygon offset is active.
+    kSurfaceFeatureDepthOffset = 1u << 7,
   };
   uint32_t SurfaceFeatureMask = 0;
+  bool SurfaceNeedsDepthWrite = false;
+  // Number of enabled lights for the current frame (computed in
+  // UpdateLightUniforms). Surface pipelines are additionally keyed by this
+  // count so the shader's lighting loop unrolls to exactly that many lights.
+  int SurfaceLightCount = 1;
+  // Shader light type of the first enabled light (0 headlight, 1
+  // directional/camera, 2 point, 3 spot), baked like the count so the
+  // single-light surface pipelines fold the per-fragment type dispatch.
+  int SurfaceLightType = 1;
   std::map<uint32_t, id<MTLRenderPipelineState>> TriangleSurfacePipelines;
 
   // P5-5A: Actor texture and sampler for texture mapping
@@ -1001,7 +1014,12 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       const bool selectorActive = (ren->GetSelector() != nullptr);
       const uint32_t drawMask = this->Internals->SurfaceFeatureMask |
         (selectorActive ? this->Internals->kSurfaceFeatureEmitIds : 0u);
-      auto it = this->Internals->TriangleSurfacePipelines.find(drawMask);
+      // Key must match EnsurePipelineStates: mask in the low bits, light count
+      // in the next 4 bits, first light type in the next 2.
+      const uint32_t drawKey = drawMask |
+        (static_cast<uint32_t>(this->Internals->SurfaceLightCount) << 8) |
+        (static_cast<uint32_t>(this->Internals->SurfaceLightType) << 12);
+      auto it = this->Internals->TriangleSurfacePipelines.find(drawKey);
       id<MTLRenderPipelineState> triPipeline =
         (it != this->Internals->TriangleSurfacePipelines.end()) ? it->second : nil;
       if (!triPipeline)
@@ -2024,6 +2042,11 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     // surface pipeline, including on the first frame before the texture upload.
     this->UpdateActorTexture((void*)device, act);
 
+    // Coincident offset state must be known before the surface feature mask is
+    // computed: a nonzero polygon factor/units selects the depth-writing
+    // fragment variant (kSurfaceFeatureDepthOffset).
+    this->UpdateCoincidentOffsetUniforms((void*)device, act);
+
     // Surface feature mask (the "GL way"): mirrors the feature set GL conditions
     // on when it compiles a surface shader. The mask keys the specialized
     // triangle pipelines; a plain opaque surface (no scalar colors, no texture,
@@ -2058,6 +2081,10 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     {
       featureMask |= this->Internals->kSurfaceFeatureEdges;
     }
+    if (this->Internals->SurfaceNeedsDepthWrite)
+    {
+      featureMask |= this->Internals->kSurfaceFeatureDepthOffset;
+    }
     this->Internals->SurfaceFeatureMask = featureMask;
 
     // P3-3A: Track line width changes (buffer updated at draw time)
@@ -2089,6 +2116,9 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
 
     if (needSurfacePipelines)
     {
+      // Compute the enabled-light count first so the surface pipelines are
+      // specialized with the current number of lights.
+      this->UpdateLightUniforms((void*)device, ren);
       this->EnsurePipelineStates((void*)device);
     }
 
@@ -2250,8 +2280,6 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     }
 
     this->UpdateMaterialUniforms((void*)device, act);
-    this->UpdateLightUniforms((void*)device, ren);
-    this->UpdateCoincidentOffsetUniforms((void*)device, act);
     this->UpdateVertexColorUniforms((void*)device, act);
     this->UpdateClipPlaneUniforms((void*)device, act);
 
@@ -4830,11 +4858,20 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   // set via default function constants) remains for the peel/OIT/edge/line
   // passes.
   {
+    // The map key packs the feature mask in the low bits, the enabled light
+    // count in the next 4 bits, and the first light's type in the next 2 bits,
+    // so one pipeline exists per (mask, lightCount, lightType) triple. The
+    // count and type are baked via function constants kLightCount/kLightType,
+    // matching GL's shader-template unrolling of the per-light code.
+    const uint32_t lightKeyBits =
+      (static_cast<uint32_t>(this->Internals->SurfaceLightCount) << 8) |
+      (static_cast<uint32_t>(this->Internals->SurfaceLightType) << 12);
     const uint32_t masks[2] = { this->Internals->SurfaceFeatureMask,
       this->Internals->SurfaceFeatureMask | this->Internals->kSurfaceFeatureEmitIds };
     for (uint32_t mask : masks)
     {
-      if (this->Internals->TriangleSurfacePipelines.count(mask) != 0)
+      const uint32_t key = mask | lightKeyBits;
+      if (this->Internals->TriangleSurfacePipelines.count(key) != 0)
       {
         continue;
       }
@@ -4842,6 +4879,12 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
       const bool emitIds = (mask & this->Internals->kSurfaceFeatureEmitIds) != 0u;
       const bool indexedEntry = (mask & this->Internals->kSurfaceFeatureEdges) != 0u;
       const char* vName = indexedEntry ? "vertex_main_indexed" : "vertex_main";
+      // Depth writing disables early-Z, so only use fragment_main (which writes
+      // [[depth(any)]]) when a coincident polygon offset is active; the plain
+      // surfaces take fragment_main_nodepth so the rasterizer handles depth.
+      const char* fName =
+        (mask & this->Internals->kSurfaceFeatureDepthOffset) != 0u
+          ? "fragment_main" : "fragment_main_nodepth";
 
       MTLFunctionConstantValues* consts = [[MTLFunctionConstantValues alloc] init];
       BOOL cv;
@@ -4859,6 +4902,10 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
       [consts setConstantValue:&cv type:MTLDataTypeBool atIndex:11];
       cv = (mask & this->Internals->kSurfaceFeatureCellTexture) ? YES : NO;
       [consts setConstantValue:&cv type:MTLDataTypeBool atIndex:12];
+      int lightCount = this->Internals->SurfaceLightCount;
+      [consts setConstantValue:&lightCount type:MTLDataTypeInt atIndex:13];
+      int lightType = this->Internals->SurfaceLightType;
+      [consts setConstantValue:&lightType type:MTLDataTypeInt atIndex:14];
 
       NSError* error = nil;
       id<MTLFunction> vFunc =
@@ -4871,7 +4918,7 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
         continue;
       }
       id<MTLFunction> fFunc =
-        [library newFunctionWithName:@"fragment_main" constantValues:consts error:&error];
+        [library newFunctionWithName:@(fName) constantValues:consts error:&error];
       [consts release];
       if (!fFunc)
       {
@@ -4928,7 +4975,7 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
       }
       else
       {
-        this->Internals->TriangleSurfacePipelines[mask] = pipeline;
+        this->Internals->TriangleSurfacePipelines[key] = pipeline;
       }
       [specDesc release];
       [vFunc release];
@@ -4951,6 +4998,15 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   {
     [fullConsts setConstantValue:&cv type:MTLDataTypeBool atIndex:idx];
   }
+  // Full-behavior pipelines keep the runtime lightCount guard: bake the maximum
+  // so the loop can iterate up to the uniform count.
+  int fullLightCount = 8;
+  [fullConsts setConstantValue:&fullLightCount type:MTLDataTypeInt atIndex:13];
+  // kLightType is only consulted when the loop bound is exactly 1; the full
+  // pipelines run the loop to the uniform count, so bake -1 to keep the type
+  // read from the light uniform.
+  int fullLightType = -1;
+  [fullConsts setConstantValue:&fullLightType type:MTLDataTypeInt atIndex:14];
 
   id<MTLFunction> vertexFunc =
     [library newFunctionWithName:@"vertex_main" constantValues:fullConsts error:&error];
@@ -6034,6 +6090,11 @@ void vtkMetalPolyDataMapper::UpdateLightUniforms(void* mtlDevice, vtkRenderer* r
     lu.lights[0].attenuation[3] = 0.0f;
     lu.lightCount = 1;
   }
+  this->Internals->SurfaceLightCount = lu.lightCount;
+  // Bake the first light's shader type (position.w carries it: 0 headlight,
+  // 1 directional/camera, 2 point, 3 spot). The count==0 fallback above is a
+  // headlight (position[3] = 0).
+  this->Internals->SurfaceLightType = (int)lu.lights[0].position[3];
 
   if (!this->Internals->LightUniformBuffer)
   {
@@ -6082,6 +6143,12 @@ void vtkMetalPolyDataMapper::UpdateCoincidentOffsetUniforms(void* mtlDevice, vtk
       co[1] = static_cast<float>(zShift * 4.0);
     }
   }
+
+  // Triangle surface draws must write depth from the fragment stage (switching
+  // to the fragment_main pipeline variant) only when a polygon offset applies,
+  // mirroring GL's ReplaceShaderCoincidentOffset. Lines/points/edges keep their
+  // own fragment functions which always write depth.
+  this->Internals->SurfaceNeedsDepthWrite = (co[0] != 0.0f || co[1] != 0.0f);
 
   if (!this->Internals->CoincidentOffsetBuffer)
   {

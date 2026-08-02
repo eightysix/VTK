@@ -208,10 +208,20 @@ drawable path. Rerun on any machine with:
 `--frames` is the number of timed renders per run; `--reps` repeats the whole
 per-scene measurement (fresh window each run) and the harness reports the mean
 of the per-run averages plus the run-to-run standard deviation. The tables
-below use the mean of 3 runs. `--gpu-mem` additionally prints the Metal
-device's `currentAllocatedSize` after each scene — useful for checking that
-the interleaved GL+Metal runs do not accumulate GPU memory (see the glitch
-note in the complexity section below).
+below use the mean of 5 runs. The bench is grouped by backend: the harness runs
+the whole suite for one backend (all GL scenes back-to-back), then the whole
+suite for the other (all Metal scenes back-to-back), so both backends are timed
+in the same sustained GPU-clock state. An earlier per-scene GL/Metal interleave
+measured GL first (fresh clock state) and Metal immediately after GL's reps
+(inheriting the throttled state), which showed up as stray `>1` M/GL rows for
+geometry scenes whose clean single-backend runs were at parity; grouping
+reproduces the clean numbers in one process. `--gpu-mem` additionally prints
+the Metal device's `currentAllocatedSize` after each scene, and `--host-mem`
+prints the process's resident set size — useful for checking that the runs do
+not accumulate GPU or host memory (see the glitch note in the complexity
+section below). A `--bench --host-mem --gpu-mem` run doubles as a leak check:
+both numbers stay flat across a scene's reps and return to a low baseline
+between scenes.
 
 How to read the table:
 
@@ -332,40 +342,98 @@ machine that reproduces the documented M1 VolumeRayCast residual 0.005):
 ```
 scene                          GL ms/f   GL fps   Metal ms/f  Metal fps    M/GL
 -------------------------------------------------------------------
-CpxGeomLo                         0.59   1705.4        0.65     1539.5    1.11
-CpxGeomHi                         2.01    498.5        2.14      466.3    1.07
-CpxCellLo                         0.60   1655.4        0.78     1282.1    1.29
-CpxCellHi                         2.12    471.4        2.46      406.0    1.16
-CpxPointLo                        0.60   1653.5        0.72     1383.0    1.20
-CpxPointHi                        2.06    486.5        2.29      437.3    1.11
-CpxGeomBig                        3.53    283.0        3.96      252.3    1.12
-CpxPointBig                       3.31    302.0        3.89      257.3    1.17
-CpxCellBig                        3.55    282.1        3.87      258.6    1.09
-CpxActorLo                        1.01    993.6        0.88     1132.7    0.88
-CpxActorHi                       12.33     81.1       12.68       78.9    1.03
-CpxPeel3                          3.71    269.2        1.12      889.2    0.30
-CpxPeel12                        11.79     84.8        3.89      256.9    0.33
-CpxVol64                          1.14    880.6        0.56     1793.5    0.49
-CpxVol128                         1.17    851.9        0.57     1747.9    0.49
+CpxGeomLo                     0.51±0.06 1956.2   0.50±0.03    1994.6    0.98
+CpxGeomHi                     2.15±0.16  465.7   1.90±0.04     526.7    0.88
+CpxCellLo                     0.59±0.06 1686.6   0.53±0.03    1892.5    0.89
+CpxCellHi                     2.09±0.05  478.5   1.97±0.05     507.8    0.94
+CpxPointLo                    0.56±0.10 1796.1   0.44±0.04    2260.5    0.79
+CpxPointHi                    2.08±0.06  481.8   1.91±0.02     523.9    0.92
+CpxGeomBig                    3.51±0.11  285.2   3.38±0.01     296.0    0.96
+CpxPointBig                   3.41±0.23  293.6   3.33±0.02     300.7    0.98
+CpxCellBig                    3.43±0.05  291.5   3.41±0.02     293.6    0.99
+CpxActorLo                    0.95±0.04 1049.4   0.73±0.05    1362.7    0.77
+CpxActorHi                   12.72±0.25   78.6  11.39±0.07      87.8    0.90
+CpxPeel3                      3.84±0.07  260.5   1.13±0.03     882.1    0.30
+CpxPeel12                    12.37±0.08   80.8   4.02±0.03     248.9    0.32
+CpxVol64                      1.28±0.05  782.5   0.57±0.03    1765.2    0.44
+CpxVol128                     1.24±0.06  804.8   0.58±0.02    1733.7    0.46
 ```
 
-All rows above are from a single clean 45-scene `--reps 3` run after the harness
-autorelease-pool fix described below. Earlier full-suite runs occasionally hit
-the transient empty-frame glitch (one backend reporting ~0.05–0.15 ms — nothing
-rendered) in the tail scenes after the heavy `Cpx*Big` scenes, so the
-`CpxActor*`/`CpxPeel*`/`CpxVol*` rows had to be salvaged from shorter runs;
-with the fix the whole 45-scene run completes cleanly in one pass. Absolute ms
-still move ±20% run-to-run with the M1's GPU clock and the M/GL ratios move with
-them (the geometry scenes measured ~0.92–1.05 in the earlier 15-scene run and
-~1.07–1.29 here), so treat cells as indicative rather than exact.
+All rows above are from a single clean 45-scene `--reps 5` run after the harness
+autorelease-pool fix described below and the grouped-backend benchmark
+restructure described in the benchmark section above. The harness now runs the
+whole suite grouped by backend — all GL scenes back-to-back, then all Metal
+scenes back-to-back — instead of interleaving GL/Metal per scene, so both
+backends are measured in the same sustained GPU-clock state. Earlier
+per-scene-interleaved runs showed stray `>1` rows (CpxCellLo 1.06, CpxGeomBig
+1.03, CpxPointBig 1.05) that vanished in clean single-backend runs; grouping the
+bench reproduces those clean numbers in one process, and the grouped run above
+lands every geometry row at 0.79–0.99. Absolute ms still move ±20% run-to-run
+with the M1's GPU clock and the M/GL ratios move with them, so treat cells as
+indicative rather than exact.
 
 `CpxGeomHi` went from M/GL ~1.46 to ~1.07; the per-cell and per-point geometry
-scenes sit at ~1.07–1.29, and the CPU-bound / peel / volume rows are at or
-better than parity (0.88, 0.30–0.33, 0.49). The shared-vertex cell-id for
-picking in the dedup paths follows the existing first-wins convention (same as
-the GPU-tess and per-point-coloring dedup paths). What the dedup fix does *not*
-cover — scenes with real per-cell colors — is what the cell-texture port adds,
-described next.
+scenes sat at ~1.07–1.29 until the light-count/type specialization below brought
+every geometry row to parity or better (0.79–0.99 in the grouped run), and the
+CPU-bound / peel / volume rows are at or better than parity (0.83, 0.30–0.33,
+0.42–0.46). The shared-vertex
+cell-id for picking in the dedup paths follows the existing first-wins convention
+(same as the GPU-tess and per-point-coloring dedup paths). What the dedup fix
+does *not* cover — scenes with real per-cell colors — is what the cell-texture
+port adds, described next.
+
+### Light-count/type specialization (baked function constants)
+
+After the dedup fix the geometry scenes were still ~7–11% slower than GL in the
+full runs. The remaining cost was the per-fragment lighting loop:
+the shader read each light's type, position and color from the uniform buffer
+every fragment and dispatched on the type at runtime, while GL's shader-template
+substitution compiles the exact per-light code statically
+(`vtkOpenGLRenderer::UpdateLights()` classifies the single camera light as
+complexity 2 / Directional). With sub-pixel triangles the scene is
+fragment-ALU-bound, so that per-fragment type dispatch measured real.
+
+The Metal mapper now bakes the lighting setup into the pipeline the same way GL
+bakes it into the shader source:
+
+- `kLightCount [[function_constant(13)]]`: the surface pipelines are specialized
+  with the exact number of enabled lights (computed per-frame in
+  `UpdateLightUniforms`), so `computePhongLighting`'s loop unrolls to exactly
+  that many iterations with no runtime guard. The shared
+  base/peel/OIT/glyph/point/line pipelines are specialized with the maximum (8)
+  and keep the runtime guard, since a single pipeline serves arbitrary actors.
+- `kLightType [[function_constant(14)]]`: for the single-light case the surface
+  pipelines also bake the first light's type (0 headlight, 1
+  directional/camera, 2 point, 3 spot — the value already encoded in
+  `position.w` by `UpdateLightUniforms`). The shader folds the type into the
+  loop: `lightLoopBound == 1` selects `bakedLightType` (a function constant,
+  dead branches pruned by the compiler) instead of reading `L.position.w` per
+  fragment.
+
+Every non-surface call site of `computePhongLighting` passes the plain constant
+`MAX_LIGHTS` (loop bound) and `-1` (type), so only the `fragment_main` /
+`fragment_main_nodepth` surface entries reference the function constants and
+only those pipelines need indices 13/14 set. The surface pipeline cache key
+packs the feature mask in the low bits, the light count in the next 4, and the
+first light's type in the next 2 — one pipeline per (mask, count, type) triple.
+Metal function constants cannot carry an initializer, so every pipeline whose
+fragment function reaches `computePhongLighting` must supply index 13 (and 14
+for the surface entries).
+
+The loop body also drops the per-fragment ops GL never pays: the light
+direction is normalized once on the CPU (then rotated by the rigid view
+transform, staying unit length), so the shader uses `-L.direction.xyz` directly
+instead of `normalize(...)` — the same assumption GL's `// normalized`
+declaration makes — and `L.color` arrives already scaled by intensity
+(`color[3]` is always 1.0), so the shader reads `L.color.rgb` without the
+multiply-by-`w`. Both removals match GL's pre-baked `lightColor0` /
+`lightDirectionVC` uniforms exactly.
+
+Result on the same M1 machine: the isolated Lo trio dropped to 0.84–0.94 M/GL
+across three separate runs (avg ~0.86–0.89), and the grouped-backend full run
+above moved every geometry row to parity or better (0.79–0.99); the isolated
+single-scene runs sit a tick below the grouped ones because a clean single
+backend gets the full sustained clock state to itself.
 
 ### Transient empty-frame glitch (fixed)
 
