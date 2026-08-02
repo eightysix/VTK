@@ -10,7 +10,7 @@
 // Usage:
 //   vtkMetalGLVisualComparison [--out <dir>] [--threshold <value>]
 //     [--scene <name>] [--backend gl|metal] [--bench] [--frames <n>] [--reps <n>]
-//     [--complexity]
+//     [--complexity] [--perframe]
 //
 // The default output directory is "visual_compare" under the current working
 // directory. When --threshold is given, the process exits non-zero if any
@@ -33,6 +33,9 @@
 // volume size). These are bench-only and do not participate in the visual
 // comparison, so the canonical --bench table is unchanged unless the flag is
 // passed.
+//
+// --perframe prints every timed frame's ms, for diagnosing transient empty
+// frames (near-zero ms) in the timed loop.
 //
 // Note: the OpenGL backend needs the vtkShaderProgram object-factory override
 // (vtkOpenGLShaderProgram), so vtkRenderingOpenGL2 and vtkRenderingVolumeOpenGL2
@@ -60,6 +63,10 @@ VTK_MODULE_INIT(vtkRenderingVolumeOpenGL2);
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+
+extern "C" void* objc_autoreleasePoolPush(void);
+extern "C" void objc_autoreleasePoolPop(void* pool);
 #include <filesystem>
 #include <iostream>
 #include <iterator>
@@ -69,6 +76,15 @@ VTK_MODULE_INIT(vtkRenderingVolumeOpenGL2);
 
 namespace
 {
+
+// Diagnostic: when set, BenchmarkScene prints every timed frame's ms to stdout
+// so a transient empty frame (near-zero ms) is visible in the output.
+bool gPerFrame = false;
+
+// Diagnostic: when set, print the Metal device's currentAllocatedSize (MB)
+// after each backend's bench run, to track GPU memory accumulation across
+// scenes. Only meaningful for the Metal backend.
+bool gGpuMem = false;
 
 struct SceneSpec
 {
@@ -316,6 +332,11 @@ BenchStats BenchmarkScene(
     }
     const auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    if (gPerFrame)
+    {
+      std::printf("[%s/%s] frame %3d: %.4f ms\n",
+        backend == vtkMetalScenes::BackendKind::Metal ? "metal" : "gl", spec.Name, i, ms);
+    }
     minMs = std::min(minMs, ms);
     maxMs = std::max(maxMs, ms);
     sumMs += ms;
@@ -325,6 +346,15 @@ BenchStats BenchmarkScene(
   stats.MinMs = minMs;
   stats.AvgMs = sumMs / frames;
   stats.MaxMs = maxMs;
+  if (gGpuMem && backend == vtkMetalScenes::BackendKind::Metal)
+  {
+    vtkCocoaMetalRenderWindow* metalWin = vtkCocoaMetalRenderWindow::SafeDownCast(renWin);
+    if (metalWin)
+    {
+      const double mb = static_cast<double>(metalWin->GetAllocatedSize()) / (1024.0 * 1024.0);
+      std::printf("[gpu-mem/%s] %.1f MB\n", spec.Name, mb);
+    }
+  }
   return stats;
 }
 
@@ -417,6 +447,14 @@ int main(int argc, char* argv[])
     else if (arg == "--warmup" && i + 1 < argc)
     {
       warmupFrames = std::atoi(argv[++i]);
+    }
+    else if (arg == "--perframe")
+    {
+      gPerFrame = true;
+    }
+    else if (arg == "--gpu-mem")
+    {
+      gGpuMem = true;
     }
     else if (arg == "--complexity")
     {
@@ -513,7 +551,9 @@ int main(int argc, char* argv[])
 
   for (const SceneSpec& spec : kScenes)
   {
+    void* arPool = objc_autoreleasePoolPush();
     captureAndDiff(spec);
+    objc_autoreleasePoolPop(arPool);
   }
   // With --complexity the scaling scenes are captured too, so their per-backend
   // PNGs and thresholded errors are available for inspection alongside the bench
@@ -522,7 +562,9 @@ int main(int argc, char* argv[])
   {
     for (const SceneSpec& spec : kBenchScenes)
     {
+      void* arPool = objc_autoreleasePoolPush();
       captureAndDiff(spec);
+      objc_autoreleasePoolPop(arPool);
     }
   }
 
@@ -567,6 +609,7 @@ int main(int argc, char* argv[])
       {
         continue;
       }
+      void* arPool = objc_autoreleasePoolPush();
       const bool benchGl = backendFilter.empty() || backendFilter == "gl";
       const bool benchMetal = backendFilter.empty() || backendFilter == "metal";
 
@@ -616,6 +659,7 @@ int main(int argc, char* argv[])
         continue;
       }
       std::cout << line;
+      objc_autoreleasePoolPop(arPool);
     }
     std::cout << "-------------------------------------------------------------------\n";
   }

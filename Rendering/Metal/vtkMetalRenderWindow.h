@@ -16,6 +16,7 @@
 #include "vtkRenderingMetalModule.h" // for export macro
 #include "vtkWrappingHints.h"        // for VTK_MARSHALAUTO
 
+#include <cstdint>
 #include <mutex>
 
 #ifdef __OBJC__
@@ -88,6 +89,11 @@ public:
    * Get the Metal command queue.
    */
   void* GetMetalQueue();
+
+  /**
+   * Get the Metal device's current allocated GPU memory (bytes).
+   */
+  uint64_t GetAllocatedSize();
 
   /**
    * Get the current render command encoder.

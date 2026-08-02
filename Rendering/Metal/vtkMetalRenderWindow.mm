@@ -692,6 +692,20 @@ void vtkMetalRenderWindow::WaitForCompletion()
 }
 
 //------------------------------------------------------------------------------
+uint64_t vtkMetalRenderWindow::GetAllocatedSize()
+{
+  @autoreleasepool
+  {
+    id<MTLDevice> device = (id<MTLDevice>)this->MetalDevice;
+    if (!device)
+    {
+      return 0;
+    }
+    return (uint64_t)device.currentAllocatedSize;
+  }
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalRenderWindow::GetIdsData(int x1, int y1, int x2, int y2,
                                        vtkUnsignedIntArray* data)
 {
