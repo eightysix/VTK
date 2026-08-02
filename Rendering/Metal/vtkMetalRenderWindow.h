@@ -203,6 +203,12 @@ public:
   int GetRGBACharPixelData(int x1, int y1, int x2, int y2, int front,
     vtkUnsignedCharArray* data, int right = 0) override;
 
+  /**
+   * Return the number of bits per channel of the color buffers. The Metal
+   * color attachments are BGRA8Unorm (8 bits per channel).
+   */
+  int GetColorBufferSizes(int* rgba) override;
+
 protected:
   vtkMetalRenderWindow();
   ~vtkMetalRenderWindow() override;

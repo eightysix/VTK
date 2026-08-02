@@ -996,4 +996,21 @@ int vtkMetalRenderWindow::GetRGBACharPixelData(
   return 1;
 }
 
+//------------------------------------------------------------------------------
+int vtkMetalRenderWindow::GetColorBufferSizes(int* rgba)
+{
+  if (rgba == nullptr)
+  {
+    return 0;
+  }
+
+  // The drawable, the multisample color attachment, and the color-copy
+  // texture are all BGRA8Unorm (8 bits per channel).
+  rgba[0] = 8;
+  rgba[1] = 8;
+  rgba[2] = 8;
+  rgba[3] = 8;
+  return 1;
+}
+
 VTK_ABI_NAMESPACE_END

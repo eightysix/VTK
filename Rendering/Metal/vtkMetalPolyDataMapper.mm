@@ -1993,6 +1993,15 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     return;
   }
 
+  // Pull data through the input pipeline (matching vtkOpenGLPolyDataMapper).
+  // Without this, mappers fed by an intermediate filter (e.g. the
+  // vtkGeometryFilter inside vtkDataSetMapper, or reader pipelines) render
+  // empty, since the renderer only updates the mapper's direct input.
+  if (!this->Static)
+  {
+    this->GetInputAlgorithm()->Update();
+  }
+
   // 8A: Invalidate all pipeline states when MSAA sample count changes
   int currentSampleCount = renWin->GetEffectiveSampleCount();
   if (currentSampleCount != this->Internals->CachedSampleCount)
