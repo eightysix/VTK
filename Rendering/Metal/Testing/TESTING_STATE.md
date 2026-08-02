@@ -3,9 +3,9 @@
 Snapshot of the state of testing for the Metal rendering backend. Historical
 run: `metal-ios` branch head `bc4e9d93cd` on this repo's Apple M1 Mac mini
 (Macmini9,1, macOS 14.8). Current working-tree run: this repo's Apple M2
-MacBook Air (Mac14,2, macOS 15.7.5), after the texture-cluster fixes described
-below. Both arm64 Release builds in `build_macos_metal` (Ninja,
-`VTK_MODULE_ENABLE_VTK_RenderingMetal=YES`).
+MacBook Air (Mac14,2, macOS 15.7.5), after the texture-cluster and
+composite-mapper fixes described below. Both arm64 Release builds in
+`build_macos_metal` (Ninja, `VTK_MODULE_ENABLE_VTK_RenderingMetal=YES`).
 
 Two test surfaces exist:
 
@@ -16,10 +16,12 @@ Two test surfaces exist:
    registers the same ~175 tests once per backend and was wired up for Metal
    through object-factory overrides (`--vtk-factory-prefer
    RenderingBackend=Metal`). Historical status: **55 pass / 120 fail (33
-   crash)**. Current working-tree status: **61 pass / 95 fail (19 crash)** — the
-   14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture` factory
-   override (they now render; 5 of them pass outright), and no new crashes were
-   introduced. The pass count measures 55–61 across runs (run-to-run flakiness).
+   crash)**. Current working-tree status: **64 pass / 100 fail (11 crash)** —
+   the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
+   factory override and the 8 composite-mapper `BuildGeometryBuffers` crashes
+   by a `mappedColors != nullptr` guard (they now render; 4 of the composite
+   tests pass outright), and no new crashes were introduced. The pass count
+   fluctuates run to run (run-to-run flakiness).
 
 ---
 
@@ -119,10 +121,12 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  61 Passed  95 Failed (incl. image/pick fails)  19 "Subprocess aborted"
+175 tests:  64 Passed  100 Failed (incl. image/pick fails)  11 "Subprocess aborted"
 ```
 
-(Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted.)
+(Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
+working-tree run: 61 Passed / 95 Failed / 19 aborted — the composite-mapper
+crash cluster below is since fixed.)
 
 ### The texture cluster is fixed
 
@@ -155,12 +159,34 @@ since Metal's sampler border-color presets are black/white only; the ClampToBord
 sampler clamps to edge and `resolveMaterial` substitutes the border color where
 uv escapes [0,1].
 
+### The composite-mapper crash cluster is fixed
+
+The second-largest historical crash class (8 `Subprocess aborted` in
+`vtkMetalPolyDataMapper::BuildGeometryBuffers` on the composite/legacy path)
+is resolved by a one-line null guard at `vtkMetalPolyDataMapper.mm:3745`:
+the indexed-triangle path called `mappedColors->GetPointer(0)` whenever
+`cellFlag == 0` without checking `mappedColors != nullptr`. With block
+display-attribute overrides active (`vtkMetalBatchedPolyDataMapper` sets
+`SetBatchVisualOverride` → `Internals->UseBatchColor`), `MapScalars` is skipped
+(`Rendering/Metal/vtkMetalPolyDataMapper.mm:2667`) so `mappedColors` is null and
+`cellFlag == 0`, and the unguarded call SIGSEGV'd. Every sibling site already
+guards with `mappedColors && ...`; the fix makes line 3745 consistent.
+
+`TestCompositePolyDataMapper`, `TestCompositePolyDataMapperBlockOpacities`,
+`TestCompositePolyDataMapperToggleScalarVisibilities`, and the
+`StaticBounds`/`SharedArray`/`PartialPointData` composite tests now **pass**;
+`TestActor2D`, `TestBlockOpacity`, `TestCompositePolyDataMapper{Spheres,
+Vertices}` and the rest render without crashing but still fail image
+comparison (block-opacity / per-block feature fidelity gaps). The composite
+mapper remains the largest *image-compare* cluster.
+
 ### Image-compare failures
 
-Current run: 95 image/pick failures = the historical 87 (below) plus 8
-texture-cluster tests that used to crash and now render with image differences.
-Of the 87: 81 have a `vtkTesting` `ImageError`; 6 fail without an image compare
-(see below). Buckets by thresholded error (threshold 0.05):
+Current run: 100 image/pick failures = the historical 87 (below) plus 8
+texture-cluster tests that used to crash and now render with image differences,
+plus 5 composite-cluster tests that used to crash and now render with image
+differences. Of the 87: 81 have a `vtkTesting` `ImageError`; 6 fail without an
+image compare (see below). Buckets by thresholded error (threshold 0.05):
 
 | Bucket | Range | Count | Examples |
 |--------|-------|-------|----------|
@@ -174,7 +200,7 @@ The 6 non-image failures are all selection/read-back checks:
 (image matches, pick check fails), `TestReadPixels` (read-back reports an
 error; the test's `ERR|` regex matched).
 
-### Crashes (19; all pre-existing classes, none from the texture cluster)
+### Crashes (11; all pre-existing classes, none from the texture or composite clusters)
 
 Signal-level crashes are reported as `Subprocess aborted` with a `Caught
 SIGSEGV` line but no backtrace in the ctest log, so crash causes were
@@ -182,28 +208,29 @@ re-derived from the earlier run's full signal stacks. Current-run attribution:
 
 | Cause | Count | Tests |
 |-------|-------|-------|
-| `vtkMetalPolyDataMapper::BuildGeometryBuffers` on the composite/legacy path | 8 | `TestActor2D`, `TestBlockOpacity`, `TestCompositePolyDataMapper`, `TestCompositePolyDataMapper{BlockOpacities,Pickability,Spheres,ToggleScalarVisibilities,Vertices}` |
 | SIGSEGV with no backtrace; prior stack analysis attributes these to the OpenGL factory fallback in label/text/image rendering | 9 | `TestFollowerPicking`, `TestInteractorStyleImageProperty`, `TestLabeledContourMapper`, `TestLabeledContourMapperNoLabels`, `TestLabeledContourMapperWithActorMatrix`, `TestResizingWindowToImageFilter`, `TestTranslucentImageActor{AlphaBlending,DepthPeeling}`, `TestWindowToImageFilter` |
 | `CreateMultisampleAttachments` (MSAA) | 1 | `TestOpacityMSAA` |
 | `vtkMetalHardwareSelector` selection path (`SelectionChanged`, "Color buffer depth must be at least 8 bit") | 1 | `TestAreaSelections` |
 
 The 14-test OpenGL-texture-fallback crash row from the historical tally is gone
-(fixed by `vtkMetalTexture`, see above). ~8 of the remaining 19 crashes are
-genuine Metal bugs (composite-mapper buffer building, MSAA attachments, area
-selection); the other ~9 are the label/text/image OpenGL-fallback class that the
-`vtkMetalTexture` fix did not cover (no `vtkTexture` involved).
+(fixed by `vtkMetalTexture`, see above), and the 8-test composite-mapper
+`BuildGeometryBuffers` row is gone (see above). The 11 remaining crashes are
+genuine Metal bugs: 9 are the label/text/image OpenGL-fallback class that the
+`vtkMetalTexture` fix did not cover (no `vtkTexture` involved), plus MSAA
+attachments and the area-selection path.
 
-### Theme clusters in the 95 failures
+### Theme clusters in the 100 failures
 
 - **Textures** (~16): every `TestTexture*`, `TestBackfaceTexture`,
   `TestTexturedCylinder`, `TestTilingCxx`, `TestActor2DTextures` — historically
   crashed on the OpenGL fallback; now render, with 5 passing and the rest
   failing image comparison on texture-feature fidelity (filter/wrap/interpolation
   edge cases, textured-cylinder seams).
-- **Composite mapper** (~20): 8 crashes in `BuildGeometryBuffers` +
+- **Composite mapper** (~20): the crash cluster is gone (see above), but
   `TestCompositePolyDataMapper{Scalars,CellScalars,Picking,PartialFieldData,
   OverrideScalarArray,OverrideLUT,CameraShiftScale,CustomShader,NaNPartial,
-  MixedGeometry*,BlockTextures}` — the largest failing cluster.
+  MixedGeometry*,BlockTextures}` still fail image comparison — the largest
+  failing cluster.
 - **Glyph instancing** (~9): `TestGlyph3DMapper{Arrow,BackfaceColor,Indexing,
   OrientationArray,Picking,PointSize,QuaternionArray,TreeIndexing,
   CompositeDisplayAttributeInheritance}` fail 0.15–0.6.
@@ -211,7 +238,7 @@ selection); the other ~9 are the label/text/image OpenGL-fallback class that the
   `TestSelectVisiblePoints`, `TestAreaSelections` (crash), `TestWorldPointPicker`.
 - **2D overlay / image mapper**: `TestPolyDataMapper2D` (0.235),
   `TestPolyDataMapper2D{Point,Cell}ScalarColorMapping` (0.236/0.246),
-  `TestImageMapper_1..4` (0.86–0.92), `TestActor2D` (crash).
+  `TestImageMapper_1..4` (0.86–0.92), `TestActor2D` (now renders; image fail).
 - **LUT / color mapping** (~5): `TestBareScalarsToColors` 0.925,
   `TestDirectScalarsToColors` 0.696, `TestMapVectorsToColors` 0.962,
   `TestMapVectorsAsRGBColors` 0.899, `TestColorByStringArrayDefaultLookupTable2D` 0.482.
@@ -223,16 +250,17 @@ selection); the other ~9 are the label/text/image OpenGL-fallback class that the
 
 ### Evidence the core path is correct
 
-The 61 passes include the strongest-scrutiny tests: `TestOpacity` (passes with
+The 64 passes include the strongest-scrutiny tests: `TestOpacity` (passes with
 the `TIGHT_VALID` metric — the Lab-space color path matches GL to
 `0.00038`), `TestOSConeCxx`, `TestMace`, `TestTranslucentLUTAlphaBlending`,
 `TestTranslucentLUTDepthPeeling`, `TestScalarModeToggle`,
-`TestPointRendering_{1,2,Round_1,Round_2}`, and the basic Glyph3D,
-`FrustumClip`, `RGrid`, `TestQuad`, and composite-mapper partial-point-data
-tests. `Rendering/Metal/Testing/OpenGLComparison.md` shows every bespoke scene
-now matches OpenGL to a thresholded error of 0.000 (0.005 for volume). Failures
-cluster in features Metal still implements incompletely (see below), not in the
-fundamental geometry/lighting/color path.
+`TestPointRendering_{1,2,Round_1,Round_2}`, `TestCompositePolyDataMapper` and its
+`BlockOpacities`/`ToggleScalarVisibilities`/`PartialPointData`/`StaticBounds`/
+`SharedArray` variants, and the basic Glyph3D, `FrustumClip`, `RGrid`,
+`TestQuad`. `Rendering/Metal/Testing/OpenGLComparison.md` shows every bespoke
+scene now matches OpenGL to a thresholded error of 0.000 (0.005 for volume).
+Failures cluster in features Metal still implements incompletely (see below),
+not in the fundamental geometry/lighting/color path.
 
 ---
 
@@ -246,9 +274,12 @@ fundamental geometry/lighting/color path.
    filter/mipmap fidelity (`TestTextureInterpolateScalars`,
    `TestTexturedCylinder`), and renderers that bypass the poly-data mapper
    (2D image/text in the label cluster).
-2. **Composite mapper crash** — `vtkMetalPolyDataMapper::BuildGeometryBuffers`
-   crashes on the composite/legacy path (`vtkCompositePolyDataMapperDelegator`
-   interaction); ~8 crash tests plus ~12 image-fails.
+2. **Composite mapper crash — DONE** — a missing `mappedColors != nullptr` guard
+   in the indexed-triangle path of `vtkMetalPolyDataMapper::BuildGeometryBuffers`
+   (`vtkMetalPolyDataMapper.mm:3745`) crashed whenever block display overrides
+   skipped `MapScalars`. All 8 composite-cluster crashes are gone; 4 tests now
+   pass and the rest fail image comparison. The composite mapper is now the
+   largest *image-compare* cluster (~20 tests) rather than a crash source.
 3. **MSAA attachments** — `CreateMultisampleAttachments`; `TestOpacityMSAA`.
 4. **Hardware selector** — selection path (`TestAreaSelections` crash,
    `TestHardwareSelector`/`TestPointSelection*`/`TestSelectVisiblePoints`

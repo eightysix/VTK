@@ -3742,7 +3742,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                 // P1-1A: per-vertex color — point scalar mapping only. Per-cell
                 // colors are emitted once per triangle below (cell-texture port).
                 emitSurfaceColor(tri[j],
-                  (cellFlag == 0) ? mappedColors->GetPointer(0) : nullptr);
+                  (mappedColors && cellFlag == 0) ? mappedColors->GetPointer(0) : nullptr);
 
                 // P5-5A: texture coordinates for indexed triangle vertex
                 if (tcoordArray && tcoordArray->GetNumberOfTuples() > tri[j])
