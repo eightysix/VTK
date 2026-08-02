@@ -393,7 +393,36 @@ void vtkMetalRenderWindow::RecreateOffscreenColorTexture()
 //------------------------------------------------------------------------------
 int vtkMetalRenderWindow::GetEffectiveSampleCount()
 {
-  return (this->MultiSamples > 1) ? this->MultiSamples : 1;
+  int requested = (this->MultiSamples > 1) ? this->MultiSamples : 1;
+  if (requested <= 1)
+  {
+    return 1;
+  }
+
+  id<MTLDevice> device = (id<MTLDevice>)this->MetalDevice;
+  if (!device)
+  {
+    // Device not created yet; be conservative so texture creation never
+    // requests an unsupported sample count.
+    return 4;
+  }
+
+  // Metal validates the sample count when the multisample texture is created
+  // and aborts on an unsupported value, so clamp to the device's maximum.
+  // The Apple GPU family supports only 1/2/4 samples; discrete Mac GPUs
+  // typically support up to 8.
+  bool appleGpu = false;
+  if (@available(macOS 10.15, iOS 13.0, *))
+  {
+    appleGpu = [device supportsFamily:MTLGPUFamilyApple1];
+  }
+  else
+  {
+    appleGpu = true;
+  }
+  int maxSamples = appleGpu ? 4 : 8;
+
+  return (requested < maxSamples) ? requested : maxSamples;
 }
 
 //------------------------------------------------------------------------------

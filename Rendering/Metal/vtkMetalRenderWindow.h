@@ -151,7 +151,11 @@ public:
 
   /**
    * Get the effective sample count for multisampling.
-   * Returns MultiSamples if > 1, otherwise 1.
+   * Returns MultiSamples if > 1, otherwise 1, clamped to the device's maximum
+   * supported MSAA sample count (4 on Apple GPU family, 8 elsewhere). All
+   * MSAA resource creation and pipeline-state sample counts must go through
+   * this value so the requested count is never validated and rejected by
+   * Metal.
    */
   int GetEffectiveSampleCount();
 

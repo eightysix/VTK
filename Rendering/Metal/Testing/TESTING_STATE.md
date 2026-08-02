@@ -16,12 +16,13 @@ Two test surfaces exist:
    registers the same ~175 tests once per backend and was wired up for Metal
    through object-factory overrides (`--vtk-factory-prefer
    RenderingBackend=Metal`). Historical status: **55 pass / 120 fail (33
-   crash)**. Current working-tree status: **64 pass / 100 fail (11 crash)** —
+   crash)**. Current working-tree status: **65 pass / 100 fail (10 crash)** —
    the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
-   factory override and the 8 composite-mapper `BuildGeometryBuffers` crashes
-   by a `mappedColors != nullptr` guard (they now render; 4 of the composite
-   tests pass outright), and no new crashes were introduced. The pass count
-   fluctuates run to run (run-to-run flakiness).
+   factory override, the 8 composite-mapper `BuildGeometryBuffers` crashes by
+   a `mappedColors != nullptr` guard (they now render; 4 of the composite
+   tests pass outright), and `TestOpacityMSAA` by clamping the MSAA sample
+   count to the device maximum (see below). No new crashes were introduced.
+   The pass count fluctuates run to run (run-to-run flakiness).
 
 ---
 
@@ -121,12 +122,12 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  64 Passed  100 Failed (incl. image/pick fails)  11 "Subprocess aborted"
+175 tests:  65 Passed  100 Failed (incl. image/pick fails)  10 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
 working-tree run: 61 Passed / 95 Failed / 19 aborted — the composite-mapper
-crash cluster below is since fixed.)
+crash cluster below is since fixed, and `TestOpacityMSAA` since passes.)
 
 ### The texture cluster is fixed
 
@@ -200,7 +201,7 @@ The 6 non-image failures are all selection/read-back checks:
 (image matches, pick check fails), `TestReadPixels` (read-back reports an
 error; the test's `ERR|` regex matched).
 
-### Crashes (11; all pre-existing classes, none from the texture or composite clusters)
+### Crashes (10; all pre-existing classes, none from the texture or composite clusters)
 
 Signal-level crashes are reported as `Subprocess aborted` with a `Caught
 SIGSEGV` line but no backtrace in the ctest log, so crash causes were
@@ -209,15 +210,27 @@ re-derived from the earlier run's full signal stacks. Current-run attribution:
 | Cause | Count | Tests |
 |-------|-------|-------|
 | SIGSEGV with no backtrace; prior stack analysis attributes these to the OpenGL factory fallback in label/text/image rendering | 9 | `TestFollowerPicking`, `TestInteractorStyleImageProperty`, `TestLabeledContourMapper`, `TestLabeledContourMapperNoLabels`, `TestLabeledContourMapperWithActorMatrix`, `TestResizingWindowToImageFilter`, `TestTranslucentImageActor{AlphaBlending,DepthPeeling}`, `TestWindowToImageFilter` |
-| `CreateMultisampleAttachments` (MSAA) | 1 | `TestOpacityMSAA` |
 | `vtkMetalHardwareSelector` selection path (`SelectionChanged`, "Color buffer depth must be at least 8 bit") | 1 | `TestAreaSelections` |
 
 The 14-test OpenGL-texture-fallback crash row from the historical tally is gone
-(fixed by `vtkMetalTexture`, see above), and the 8-test composite-mapper
-`BuildGeometryBuffers` row is gone (see above). The 11 remaining crashes are
-genuine Metal bugs: 9 are the label/text/image OpenGL-fallback class that the
-`vtkMetalTexture` fix did not cover (no `vtkTexture` involved), plus MSAA
-attachments and the area-selection path.
+(fixed by `vtkMetalTexture`, see above), the 8-test composite-mapper
+`BuildGeometryBuffers` row is gone (see above), and the `TestOpacityMSAA` MSAA
+row is gone (see below). The 10 remaining crashes are genuine Metal bugs: 9 are
+the label/text/image OpenGL-fallback class that the `vtkMetalTexture` fix did
+not cover (no `vtkTexture` involved), plus the area-selection path.
+
+### The MSAA crash is fixed
+
+`TestOpacityMSAA` requests `renWin->SetMultiSamples(8)`, but the Apple GPU
+family supports only 1/2/4 MSAA samples. `CreateMultisampleAttachments` handed
+the requested count straight to `newTextureWithDescriptor:`, and Metal's
+descriptor validation aborted on the unsupported sample count. The fix clamps
+`vtkMetalRenderWindow::GetEffectiveSampleCount()` to the device maximum (4 on
+Apple-family GPUs via `supportsFamily:`, 8 elsewhere), and since every MSAA
+resource and pipeline-state sample count already routes through that single
+value (the renderer's opaque/translucent/volume/overlay passes and the
+poly-data/glyph/image/volume mapper PSOs), the clamp applies everywhere.
+`TestOpacityMSAA` now renders and passes its image comparison.
 
 ### Theme clusters in the 100 failures
 
@@ -280,13 +293,23 @@ not in the fundamental geometry/lighting/color path.
    skipped `MapScalars`. All 8 composite-cluster crashes are gone; 4 tests now
    pass and the rest fail image comparison. The composite mapper is now the
    largest *image-compare* cluster (~20 tests) rather than a crash source.
-3. **MSAA attachments** — `CreateMultisampleAttachments`; `TestOpacityMSAA`.
+3. **MSAA attachments — DONE** — `TestOpacityMSAA` requested `MultiSamples(8)`,
+   which the Apple GPU family does not support (max 4); Metal's descriptor
+   validation aborted in `CreateMultisampleAttachments`.
+   `vtkMetalRenderWindow::GetEffectiveSampleCount()` now clamps the requested
+   sample count to the device maximum (4 on Apple-family GPUs, 8 elsewhere) at
+   the single choke point every MSAA resource and pipeline state reads from.
+   `TestOpacityMSAA` now passes its image comparison.
 4. **Hardware selector** — selection path (`TestAreaSelections` crash,
    `TestHardwareSelector`/`TestPointSelection*`/`TestSelectVisiblePoints`
    wrong results, `TestWorldPointPicker` pick check).
 5. **Read-back** — `TestReadPixels` errors; `TestWindowToImageFilter` /
    `TestResizingWindowToImageFilter` crash.
-6. **Glyph instancing colors**, **2D overlay + image mapper**, **LUT/color
+6. **Label/text/image OpenGL-fallback cluster** — the 9 remaining crashes all
+   instantiate the OpenGL label/text/image classes (e.g.
+   `vtkOpenGLLabeledContourMapper::ApplyStencil`) against a Metal window; this
+   needs Metal overrides for the label/text rendering stack.
+7. **Glyph instancing colors**, **2D overlay + image mapper**, **LUT/color
    mapping**, **stereo/multiview + gradient background**, **TStrips** — all
    render but diverge from GL.
 
