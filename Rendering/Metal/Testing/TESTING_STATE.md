@@ -3,8 +3,8 @@
 Snapshot of the state of testing for the Metal rendering backend. Historical
 run: `metal-ios` branch head `bc4e9d93cd` on this repo's Apple M1 Mac mini
 (Macmini9,1, macOS 14.8). Current working-tree run: this repo's Apple M2
-MacBook Air (Mac14,2, macOS 15.7.5), after the texture-cluster and
-composite-mapper fixes described below. Both arm64 Release builds in
+MacBook Air (Mac14,2, macOS 15.7.5), after the texture-cluster, composite-mapper,
+and selection cell-ID fixes described below. Both arm64 Release builds in
 `build_macos_metal` (Ninja, `VTK_MODULE_ENABLE_VTK_RenderingMetal=YES`).
 
 Two test surfaces exist:
@@ -16,15 +16,16 @@ Two test surfaces exist:
    registers the same ~175 tests once per backend and was wired up for Metal
    through object-factory overrides (`--vtk-factory-prefer
    RenderingBackend=Metal`). Historical status: **55 pass / 120 fail (33
-   crash)**. Current working-tree status: **66 pass / 100 fail (9 crash)** —
+   crash)**. Current working-tree status: **69 pass / 97 fail (9 crash)** —
    the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
    factory override, the 8 composite-mapper `BuildGeometryBuffers` crashes by
    a `mappedColors != nullptr` guard (they now render; 4 of the composite
    tests pass outright), `TestOpacityMSAA` by clamping the MSAA sample
-   count to the device maximum (see below), and the `TestAreaSelections`
-   crash by a missing `GetColorBufferSizes` override (see below). No new
-   crashes were introduced. The pass count fluctuates run to run
-   (run-to-run flakiness).
+   count to the device maximum (see below), the `TestAreaSelections`
+   crash by a missing `GetColorBufferSizes` override (see below), and the
+   `TestAreaSelections` cell-set fidelity by exact per-primitive cell ids
+   (see the selection-cluster section below). No new crashes were introduced.
+   The pass count fluctuates run to run (run-to-run flakiness).
 
 ---
 
@@ -124,29 +125,48 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  66 Passed  100 Failed (incl. image/pick fails)  9 "Subprocess aborted"
+175 tests:  69 Passed  97 Failed (incl. image/pick fails)  9 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
 working-tree run: 61 Passed / 95 Failed / 19 aborted — the composite-mapper
-crash cluster below is since fixed, and `TestOpacityMSAA` since passes. This
+crash cluster below is since fixed, and `TestOpacityMSAA` since passes. Previous
 run: 66 Passed / 100 Failed / 9 aborted — the `TestAreaSelections` area-selection
-crash is fixed by the `GetColorBufferSizes` override below.)
+crash was fixed by the `GetColorBufferSizes` override below. This run:
+69 Passed / 97 Failed / 9 aborted — the three new passes are `TestAreaSelections`
+(now stable: the per-primitive cell-id work below makes the extracted-cell set
+match OpenGL), `TestHardwareSelector` (was "0 nodes returned"), and
+`TestAxesActor` (documented gross-fail 0.612; treat as flaky until reproduced).)
 
-### The selection cluster is partially fixed
+### The selection cluster is fixed
 
-`TestAreaSelections` is no longer a crash: `vtkMetalRenderWindow` did not
+`TestAreaSelections` no longer crashes: `vtkMetalRenderWindow` did not
 override `GetColorBufferSizes`, so the base class left `rgba` uninitialized
 and `vtkHardwareSelector::Select` aborted on the "Color buffer depth must be
 at least 8 bit" check (`vtkRenderWindow.h:642`, `vtkHardwareSelector.cxx:346`).
 A new override reports the BGRA8Unorm attachments (8 bits per channel), so the
-test now runs and renders the full scene. It still fails image comparison
-(0.35–380, run-dependent): the area-selection cell extraction renders a
-different (taller) cell set than OpenGL, and the extracted-cells actor is
-flaky between a populated and an empty result on the first frame of a fresh
-process. `TestHardwareSelector` (0 nodes returned), `TestPointSelection*`,
-`TestSelectVisiblePoints`, `TestWorldPointPicker`, `TestReadPixels` are
-unchanged. The selection path remains the item-4 next step.
+test runs and renders the full scene.
+
+The remaining cell-set fidelity gap is also fixed. Metal reported 60 sphere
+cells where OpenGL reported 139, and the Metal ID set contained only even raw
+cell indices. The cause was the CPU triangle-emission path deduplicating
+vertices by point ID (`useIndexBuffer` when `mappedColors == nullptr`, which
+the test sphere satisfies): a shared vertex carries the *first* triangle's
+`cellId`, and the surface fragment flat-interpolated `in.cellId`, so the
+"provoking vertex first-wins" value did not name the owning cell. OpenGL
+matches the exact cell with `gl_PrimitiveID`.
+
+The fix (`e9e8a6bb66`) emulates GL's `gl_PrimitiveID` behavior:
+`vtkMetalPolyDataMapper` now emits an exact per-primitive cell-id buffer
+unconditionally (previously only built for per-cell-colored geometry), and the
+surface fragment reads `cellPrimitiveIds[prim_id]` when the new
+`kSceneFlagUsePrimitiveCellIds` scene flag (bit 12) is set, instead of the
+ambiguous flat `in.cellId`. `TestAreaSelections` now **passes** (stable across
+repeated runs): the Metal and GL selection ID lists are identical (139 cells)
+and the image regression passes under both backends. `TestHardwareSelector`
+(was "0 nodes returned") also passes this run, presumably on the same exact-ID
+mechanism. `TestPointSelection*`, `TestSelectVisiblePoints`,
+`TestWorldPointPicker`, `TestReadPixels` remain.
 
 Also fixed: `vtkMetalPolyDataMapper::RenderPiece` now calls
 `GetInputAlgorithm()->Update()` (matching `vtkOpenGLPolyDataMapper`). Without
@@ -211,23 +231,26 @@ mapper remains the largest *image-compare* cluster.
 
 ### Image-compare failures
 
-Current run: 100 image/pick failures = the historical 87 (below) plus 8
+Current run: 97 image/pick failures = the historical 87 (below) plus 8
 texture-cluster tests that used to crash and now render with image differences,
 plus 5 composite-cluster tests that used to crash and now render with image
-differences. Of the 87: 81 have a `vtkTesting` `ImageError`; 6 fail without an
-image compare (see below). Buckets by thresholded error (threshold 0.05):
+differences, minus the selection-cluster gains (`TestAreaSelections`,
+`TestHardwareSelector` — see above) and the flaky `TestAxesActor` pass. Of the
+87: 81 have a `vtkTesting` `ImageError`; 6 fail without an image compare (5
+now, see below). Buckets by thresholded error (threshold 0.05):
 
 | Bucket | Range | Count | Examples |
 |--------|-------|-------|----------|
 | near-miss | 0.05 – 0.1 | 8 | `TestActorLightingFlag` 0.051, `TestEdgeFlags` 0.068, `TestQuadPointRep` 0.069, `TestMixedGeometry_3` 0.070, `TestVertexRendering` 0.072, `TestLineRenderingTranslucent` 0.079, `TestGlyph3DMapperPicking` 0.080, `TestMixedGeometryCellScalars` 0.092 |
 | mid | 0.1 – 0.5 | 44 | `TestSurfacePlusEdges` 0.104, `TestGlyph3DMapperIndexing` 0.155, `TestCompositePolyDataMapperPicking` 0.176, `TestWireframe` 0.239, `TestPolyDataMapper2D` 0.235, `TestCoincident` 0.334, `TestCompositePolyDataMapperCustomShader` 0.385, `TestColorByStringArrayDefaultLookupTable2D` 0.482 |
-| gross | >= 0.5 | 29 | `TestMapVectorsToColors` 0.962, `TestBareScalarsToColors` 0.925, `TestImageMapper_1..4` 0.86–0.92, `RenderNonFinite` 0.913, `TestStereoBackground{Left,Right}` 0.887, `TestGradientBackground*` 0.51–0.79, `TestAxesActor` 0.612, `TestPolyDataMapperNormals` 0.552 |
+| gross | >= 0.5 | 29 | `TestMapVectorsToColors` 0.962, `TestBareScalarsToColors` 0.925, `TestImageMapper_1..4` 0.86–0.92, `RenderNonFinite` 0.913, `TestStereoBackground{Left,Right}` 0.887, `TestGradientBackground*` 0.51–0.79, `TestAxesActor` 0.612 (passed this run), `TestPolyDataMapperNormals` 0.552 |
 
-The 6 non-image failures are all selection/read-back checks:
-`TestHardwareSelector`, `TestPointSelection`, `TestPointSelectionWithCellData`,
+The 5 non-image failures are all selection/read-back checks:
+`TestPointSelection`, `TestPointSelectionWithCellData`,
 `TestSelectVisiblePoints` (selection results wrong), `TestWorldPointPicker`
 (image matches, pick check fails), `TestReadPixels` (read-back reports an
-error; the test's `ERR|` regex matched).
+error; the test's `ERR|` regex matched). `TestHardwareSelector` left this set
+(see the selection-cluster section above).
 
 ### Crashes (9; all pre-existing classes, none from the texture or composite clusters)
 
@@ -276,9 +299,9 @@ poly-data/glyph/image/volume mapper PSOs), the clamp applies everywhere.
 - **Glyph instancing** (~9): `TestGlyph3DMapper{Arrow,BackfaceColor,Indexing,
   OrientationArray,Picking,PointSize,QuaternionArray,TreeIndexing,
   CompositeDisplayAttributeInheritance}` fail 0.15–0.6.
-- **Selection/picking** (~6): `TestHardwareSelector`, `TestPointSelection*`,
-  `TestSelectVisiblePoints`, `TestAreaSelections` (crash fixed; now a
-  flaky image-fail on the extracted-cell set), `TestWorldPointPicker`.
+- **Selection/picking** (~4): `TestPointSelection*`, `TestSelectVisiblePoints`,
+  `TestWorldPointPicker` (`TestAreaSelections` and `TestHardwareSelector` now
+  pass — see the selection-cluster section above).
 - **2D overlay / image mapper**: `TestPolyDataMapper2D` (0.235),
   `TestPolyDataMapper2D{Point,Cell}ScalarColorMapping` (0.236/0.246),
   `TestImageMapper_1..4` (0.86–0.92), `TestActor2D` (now renders; image fail).
@@ -293,13 +316,14 @@ poly-data/glyph/image/volume mapper PSOs), the clamp applies everywhere.
 
 ### Evidence the core path is correct
 
-The 64 passes include the strongest-scrutiny tests: `TestOpacity` (passes with
+The 69 passes include the strongest-scrutiny tests: `TestOpacity` (passes with
 the `TIGHT_VALID` metric — the Lab-space color path matches GL to
 `0.00038`), `TestOSConeCxx`, `TestMace`, `TestTranslucentLUTAlphaBlending`,
 `TestTranslucentLUTDepthPeeling`, `TestScalarModeToggle`,
 `TestPointRendering_{1,2,Round_1,Round_2}`, `TestCompositePolyDataMapper` and its
 `BlockOpacities`/`ToggleScalarVisibilities`/`PartialPointData`/`StaticBounds`/
-`SharedArray` variants, and the basic Glyph3D, `FrustumClip`, `RGrid`,
+`SharedArray` variants, `TestAreaSelections` and `TestHardwareSelector` (exact
+per-primitive cell ids), and the basic Glyph3D, `FrustumClip`, `RGrid`,
 `TestQuad`. `Rendering/Metal/Testing/OpenGLComparison.md` shows every bespoke
 scene now matches OpenGL to a thresholded error of 0.000 (0.005 for volume).
 Failures cluster in features Metal still implements incompletely (see below),
@@ -330,16 +354,18 @@ not in the fundamental geometry/lighting/color path.
    sample count to the device maximum (4 on Apple-family GPUs, 8 elsewhere) at
    the single choke point every MSAA resource and pipeline state reads from.
    `TestOpacityMSAA` now passes its image comparison.
-4. **Hardware selector / selection** — `TestAreaSelections` **no longer crashes**:
-   `vtkMetalRenderWindow` was missing a `GetColorBufferSizes` override, so
-   `vtkHardwareSelector::Select` aborted on an uninitialized `rgba`
-   (`TestAreaSelections` → `Subprocess aborted`). The new override (8/8/8/8)
-   removes that crash; the test now renders the full scene but still fails
-   image comparison on the extracted-cell set (a taller cell set than GL, and
-   flaky between populated/empty on a fresh process's first frame). Remaining:
-   `TestHardwareSelector` (0 nodes), `TestPointSelection*`,
+4. **Hardware selector / selection — DONE** — `TestAreaSelections` first
+   stopped crashing via the `GetColorBufferSizes` override (8/8/8/8 for the
+   BGRA8Unorm attachments; `vtkHardwareSelector::Select` had aborted on an
+   uninitialized `rgba`), then started passing via the exact per-primitive
+   cell-id port (`e9e8a6bb66`): the mapper emits `cellPrimitiveIds` per
+   triangle unconditionally and the surface fragment reads
+   `cellPrimitiveIds[prim_id]` under `kSceneFlagUsePrimitiveCellIds`,
+   emulating GL's `gl_PrimitiveID`. Metal and GL selection ID lists are now
+   identical (139 cells), and `TestAreaSelections` passes under both backends;
+   `TestHardwareSelector` also passes. Remaining: `TestPointSelection*`,
    `TestSelectVisiblePoints`, `TestWorldPointPicker` (pick check),
-   `TestAreaSelections` cell-set fidelity, and the first-frame flakiness.
+   `TestReadPixels`.
 5. **Read-back** — `TestReadPixels` errors; `TestWindowToImageFilter` /
    `TestResizingWindowToImageFilter` crash.
 6. **Label/text/image OpenGL-fallback cluster** — the 9 remaining crashes all
@@ -370,11 +396,14 @@ Run environment: a GUI login session is required (the render window attaches to
 the WindowServer); headless SSH will not work.
 
 Numbers in this file: historical tally from the 2026-08-02 run at commit
-`bc4e9d93cd` (M1 Mac mini); working-tree tally from the same date rerun on the
+`bc4e9d93cd` (M1 Mac mini); working-tree tallies from the same date rerun on the
 M2 MacBook Air with the texture-cluster changes present, then again after the
 `GetColorBufferSizes` override and the `RenderPiece` input-`Update()` fix
-(66 Passed / 100 Failed / 9 aborted). The image-compare buckets and theme
-clusters below are preserved from the historical analysis of
-the 87 image/pick failures (that set is unchanged, minus the 8 texture tests
-now counted there). Re-running is reproducible except where a crash's signal
-stack ordering varies; the pass count fluctuates 55–61 run to run.
+(66 Passed / 100 Failed / 9 aborted), then again after the per-primitive
+cell-id selection fix (`e9e8a6bb66`; 69 Passed / 97 Failed / 9 aborted —
+`TestAreaSelections` and `TestHardwareSelector` now pass, `TestAxesActor`
+passed this run). The image-compare buckets and theme clusters below are
+preserved from the historical analysis of the 87 image/pick failures (that set
+is unchanged, minus the 8 texture tests now counted there). Re-running is
+reproducible except where a crash's signal stack ordering varies; the pass
+count fluctuates 55–61 run to run.
