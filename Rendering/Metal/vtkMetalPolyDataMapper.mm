@@ -38,6 +38,9 @@
 #include "vtkPlane.h"
 #include "vtkTexture.h"
 #include "vtkDataObject.h"
+#include "vtkPoints.h"
+#include "vtkDataArray.h"
+#include "vtkSmartPointer.h"
 
 #import <Metal/Metal.h>
 
@@ -85,6 +88,177 @@ inline EdgeKey MakeEdgeKey(vtkIdType a, vtkIdType b)
         std::swap(a, b);
     }
     return EdgeKey{ a, b };
+}
+
+// P1-1B: InterpolateScalarsBeforeMapping — Metal has no scalar-as-texture
+// pipeline (with the flag set, the base-class MapScalars routes through
+// MapScalarsToTexture and returns nullptr, leaving the mesh uncolored). To
+// reproduce GL's per-fragment scalar interpolation, each polygon is
+// fan-triangulated exactly like the triangle-emission path and every fan
+// triangle is split into a barycentric (segments+1)^2 grid. Every point-data
+// array (scalars, normals, tcoords, ...) is interpolated at the grid points, so
+// the per-vertex LUT colors computed downstream approximate the scalar
+// interpolation + lookup GL performs in the fragment stage. Within a
+// sub-triangle the color field is linear; for a smooth LUT this converges to
+// the textured result as segments grow.
+// Returns nullptr when subdivision cannot be applied (mixed cell types, no
+// polys), leaving the caller to fall back to per-vertex corner colors.
+vtkSmartPointer<vtkPolyData> SubdividePolysForScalarInterpolation(
+  vtkPolyData* input, int segments)
+{
+  if (!input || segments < 1)
+  {
+    return nullptr;
+  }
+  if (input->GetNumberOfVerts() > 0 || input->GetNumberOfLines() > 0 ||
+    input->GetNumberOfStrips() > 0 || input->GetNumberOfPolys() == 0)
+  {
+    return nullptr;
+  }
+
+  vtkCellArray* polys = input->GetPolys();
+  vtkPointData* srcPD = input->GetPointData();
+  const int numArrays = srcPD->GetNumberOfArrays();
+  const int S = segments;
+
+  // Destination arrays mirror the source ordering (and names), so
+  // GetAbstractScalars resolves the same scalar array by id or name downstream.
+  std::vector<vtkSmartPointer<vtkDataArray>> dstArrays(numArrays);
+  std::vector<std::vector<double>> cornerA(numArrays);
+  std::vector<std::vector<double>> cornerB(numArrays);
+  std::vector<std::vector<double>> cornerC(numArrays);
+  std::vector<std::vector<double>> outTuple(numArrays);
+  for (int a = 0; a < numArrays; ++a)
+  {
+    vtkDataArray* src = srcPD->GetArray(a);
+    vtkSmartPointer<vtkDataArray> dst;
+    dst.TakeReference(vtkDataArray::CreateDataArray(src->GetDataType()));
+    dst->SetName(src->GetName());
+    dst->SetNumberOfComponents(src->GetNumberOfComponents());
+    dstArrays[a] = dst;
+    const int nc = src->GetNumberOfComponents();
+    cornerA[a].resize(nc);
+    cornerB[a].resize(nc);
+    cornerC[a].resize(nc);
+    outTuple[a].resize(nc);
+  }
+
+  vtkNew<vtkPoints> newPoints;
+  vtkNew<vtkCellArray> newPolys;
+
+  vtkIdType npts;
+  const vtkIdType* pts;
+  polys->InitTraversal();
+  while (polys->GetNextCell(npts, pts) && npts >= 3)
+  {
+    // Fan-triangulate the polygon like the triangle-emission path.
+    for (vtkIdType i = 1; i < npts - 1; ++i)
+    {
+      const vtkIdType A = pts[0];
+      const vtkIdType B = pts[i];
+      const vtkIdType C = pts[i + 1];
+
+      for (int a = 0; a < numArrays; ++a)
+      {
+        srcPD->GetArray(a)->GetTuple(A, cornerA[a].data());
+        srcPD->GetArray(a)->GetTuple(B, cornerB[a].data());
+        srcPD->GetArray(a)->GetTuple(C, cornerC[a].data());
+      }
+      double pA[3], pB[3], pC[3];
+      input->GetPoint(A, pA);
+      input->GetPoint(B, pB);
+      input->GetPoint(C, pC);
+
+      // Barycentric lattice: grid point (ia, ib) has ic = S - ia - ib.
+      std::vector<std::vector<vtkIdType>> grid(S + 1);
+      for (int ia = 0; ia <= S; ++ia)
+      {
+        grid[ia].resize(S - ia + 1, -1);
+      }
+      auto gridId = [&grid](int ia, int ib) -> vtkIdType& { return grid[ia][ib]; };
+
+      for (int ia = 0; ia <= S; ++ia)
+      {
+        for (int ib = 0; ib <= S - ia; ++ib)
+        {
+          const int ic = S - ia - ib;
+          const double wA = static_cast<double>(ia) / S;
+          const double wB = static_cast<double>(ib) / S;
+          const double wC = static_cast<double>(ic) / S;
+
+          double np[3];
+          for (int c = 0; c < 3; ++c)
+          {
+            np[c] = wA * pA[c] + wB * pB[c] + wC * pC[c];
+          }
+          gridId(ia, ib) = newPoints->InsertNextPoint(np);
+
+          for (int a = 0; a < numArrays; ++a)
+          {
+            vtkDataArray* dst = dstArrays[a];
+            const int nc = dst->GetNumberOfComponents();
+            const double* tA = cornerA[a].data();
+            const double* tB = cornerB[a].data();
+            const double* tC = cornerC[a].data();
+            double* out = outTuple[a].data();
+            for (int c = 0; c < nc; ++c)
+            {
+              out[c] = wA * tA[c] + wB * tB[c] + wC * tC[c];
+            }
+            dst->InsertNextTuple(out);
+          }
+        }
+      }
+
+      // Emit the subdivided triangles, preserving the parent fan winding.
+      for (int ia = 0; ia < S; ++ia)
+      {
+        for (int ib = 0; ib < S - ia; ++ib)
+        {
+          const vtkIdType p00 = gridId(ia, ib);
+          const vtkIdType p10 = gridId(ia + 1, ib);
+          const vtkIdType p01 = gridId(ia, ib + 1);
+          const vtkIdType t0[3] = { p00, p10, p01 };
+          newPolys->InsertNextCell(3, t0);
+          // Second triangle exists only when (ia+1, ib+1) is inside the lattice.
+          if (ib + 1 <= S - (ia + 1))
+          {
+            const vtkIdType p11 = gridId(ia + 1, ib + 1);
+            const vtkIdType t1[3] = { p10, p11, p01 };
+            newPolys->InsertNextCell(3, t1);
+          }
+        }
+      }
+    }
+  }
+
+  vtkNew<vtkPolyData> result;
+  result->SetPoints(newPoints);
+  result->SetPolys(newPolys);
+  for (int a = 0; a < numArrays; ++a)
+  {
+    result->GetPointData()->AddArray(dstArrays[a]);
+  }
+  // Preserve the active attribute roles so scalar/normal/tcoord lookups resolve
+  // on the subdivided data.
+  vtkPointData* dstPD = result->GetPointData();
+  if (srcPD->GetScalars())
+  {
+    dstPD->SetActiveScalars(srcPD->GetScalars()->GetName());
+  }
+  if (srcPD->GetNormals())
+  {
+    dstPD->SetActiveNormals(srcPD->GetNormals()->GetName());
+  }
+  if (srcPD->GetTCoords())
+  {
+    dstPD->SetActiveTCoords(srcPD->GetTCoords()->GetName());
+  }
+  if (srcPD->GetTangents())
+  {
+    dstPD->SetActiveTangents(srcPD->GetTangents()->GetName());
+  }
+  return result;
 }
 
 bool CommitAndWaitForCompletion(id<MTLCommandBuffer> cmdBuf)
@@ -2507,6 +2681,29 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       this->Internals->SurfaceUsesIndexedEntry;
   }
 
+  // P1-1B: InterpolateScalarsBeforeMapping — subdivide the polys so per-vertex
+  // LUT colors approximate GL's scalar interpolation (Metal has no
+  // scalar-as-texture pipeline). Only for pure-poly surface inputs with
+  // point-data scalars, no batch color override, and no extra attributes.
+  bool useSubdividedPolydata = false;
+  vtkSmartPointer<vtkPolyData> subdividedPolydata;
+  if (this->InterpolateScalarsBeforeMapping && rep == VTK_SURFACE &&
+    !this->Internals->UseBatchColor && this->ExtraAttributes.empty())
+  {
+    int sCellFlag = 0;
+    vtkAbstractArray* sArray = vtkAbstractMapper::GetAbstractScalars(
+      polydata, this->ScalarMode, this->ArrayAccessMode, this->ArrayId, this->ArrayName, sCellFlag);
+    if (sCellFlag == 0 && vtkArrayDownCast<vtkDataArray>(sArray) != nullptr)
+    {
+      subdividedPolydata = SubdividePolysForScalarInterpolation(polydata, 4);
+      if (subdividedPolydata)
+      {
+        polydata = subdividedPolydata;
+        useSubdividedPolydata = true;
+      }
+    }
+  }
+
   std::vector<float> positions;
   std::vector<float> normals;
   std::vector<float> surfaceColors;  // P1-1A/1B: float4 per vertex
@@ -2690,7 +2887,18 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   vtkUnsignedCharArray* mappedColors = nullptr;
   if (actor && !this->Internals->UseBatchColor)
   {
-    mappedColors = this->MapScalars(actor->GetProperty()->GetOpacity(), cellFlag);
+    // Metal has no scalar-as-texture pipeline: with
+    // InterpolateScalarsBeforeMapping on, the base-class MapScalars routes
+    // through MapScalarsToTexture and returns nullptr, leaving the mesh
+    // uncolored. Temporarily clear the flag so scalars map to per-vertex
+    // colors. For interpolate mappers the polys were subdivided above
+    // (SubdividePolysForScalarInterpolation), so per-vertex colors at the grid
+    // points reproduce the scalar-interpolated look. The flag is restored
+    // without Modified() to avoid a spurious geometry rebuild every frame.
+    const int prevInterpolate = this->InterpolateScalarsBeforeMapping;
+    this->InterpolateScalarsBeforeMapping = 0;
+    mappedColors = this->MapScalars(polydata, actor->GetProperty()->GetOpacity(), cellFlag);
+    this->InterpolateScalarsBeforeMapping = prevInterpolate;
   }
 
   // Per-cell color port (the "cell texture"): when scalars are per-cell, the
@@ -2812,7 +3020,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   vtkCellArray* polys = polydata->GetPolys();
   vtkIdType numPolyPts = polydata->GetNumberOfPoints();
   bool useGPUTess = cellFlag == 0 && normalArray && (numPolyPts > 1000) &&
-    !hasCellAssociatedExtraAttrs;
+    !hasCellAssociatedExtraAttrs && !useSubdividedPolydata;
   bool gpuTessUsed = false;
 
   if (useGPUTess)

@@ -18,6 +18,9 @@
 #include "vtkFloatArray.h"
 #include "vtkUnsignedCharArray.h"
 #include "vtkTexture.h"
+#include "vtkAbstractMapper.h"
+#include "vtkLookupTable.h"
+#include "vtkColorTransferFunction.h"
 #include "vtkMetalPolyDataMapper.h"
 
 #import <Metal/Metal.h>
@@ -383,6 +386,36 @@ void vtkMetalBatchedPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       continue;
     }
 
+    // Mirror vtkOpenGLBatchedPolyDataMapper::SetShaderValues: when the parent
+    // colors missing arrays with the NaN color and this block requests scalar
+    // coloring but has no matching scalar array, color the block with the
+    // active LUT's NaN color instead of the actor color.
+    bool useNanColor = false;
+    double nanColor[4] = { -1., -1., -1., -1. };
+    if (!elem->OverridesColor && elem->ScalarVisibility && this->Parent &&
+      this->Parent->GetColorMissingArraysWithNanColor())
+    {
+      int cellFlag = 0;
+      vtkAbstractArray* scalars = vtkAbstractMapper::GetAbstractScalars(elem->PolyData,
+        elem->ScalarMode, elem->ArrayAccessMode, elem->ArrayId,
+        elem->ArrayName.empty() ? nullptr : elem->ArrayName.c_str(), cellFlag);
+      if (scalars == nullptr)
+      {
+        vtkScalarsToColors* lut = elem->LookupTable ? elem->LookupTable : this->GetLookupTable();
+        if (auto* vtkLut = vtkLookupTable::SafeDownCast(lut))
+        {
+          vtkLut->GetNanColor(nanColor);
+          useNanColor = true;
+        }
+        else if (auto* ctf = vtkColorTransferFunction::SafeDownCast(lut))
+        {
+          ctf->GetNanColor(nanColor);
+          nanColor[3] = 1.0;
+          useNanColor = true;
+        }
+      }
+    }
+
     // Apply batch visual overrides for this element.
     // BatchElement::Opacity is the final desired opacity for the block.
     // When OverridesColor is true, the block opacity is always applied along
@@ -402,7 +435,11 @@ void vtkMetalBatchedPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     // with custom ambient/diffuse colors may see a slight lighting color
     // change when only opacity is overridden.
 
-    if (overrideColor || overrideOpacity)
+    if (useNanColor)
+    {
+      mapper->SetBatchVisualOverride(true, nanColor, true, elem->Opacity);
+    }
+    else if (overrideColor || overrideOpacity)
     {
       double overrideColorArr[3] = {
         elem->DiffuseColor[0],
@@ -439,6 +476,25 @@ void vtkMetalBatchedPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     // over the actor's texture, so blocks with a block texture image render
     // textured while blocks without one keep the actor's default appearance.
     mapper->SetBlockTexture(elem->Texture);
+
+    // Per-block scalar mapping attributes. ConfigureChildMapper pushes only the
+    // batch-level defaults; each block may override any of them (scalar mode,
+    // array id/name, lookup table, scalar range, ...). Push the element's
+    // attributes so scalar-to-color mapping uses the block's settings instead
+    // of the child mapper's defaults (e.g. ArrayId -1, which resolves to no
+    // array under USE_POINT_FIELD_DATA and renders the block uncolored).
+    mapper->SetScalarVisibility(elem->ScalarVisibility);
+    mapper->SetColorMode(elem->ColorMode);
+    mapper->SetScalarMode(elem->ScalarMode);
+    mapper->SetArrayAccessMode(elem->ArrayAccessMode);
+    mapper->SetArrayComponent(elem->ArrayComponent);
+    mapper->SetArrayId(elem->ArrayId);
+    mapper->SetArrayName(elem->ArrayName.empty() ? nullptr : elem->ArrayName.c_str());
+    mapper->SetFieldDataTupleId(elem->FieldDataTupleId);
+    mapper->SetUseLookupTableScalarRange(elem->UseLookupTableScalarRange);
+    mapper->SetScalarRange(elem->ScalarRange.GetData());
+    mapper->SetInterpolateScalarsBeforeMapping(elem->InterpolateScalarsBeforeMapping);
+    mapper->SetLookupTable(elem->LookupTable ? elem->LookupTable : this->GetLookupTable());
 
     mapper->RenderPiece(ren, act);
   }

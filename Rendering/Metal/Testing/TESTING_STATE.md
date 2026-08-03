@@ -16,19 +16,22 @@ Two test surfaces exist:
    registers the same ~175 tests once per backend and was wired up for Metal
    through    object-factory overrides (`--vtk-factory-prefer
    RenderingBackend=Metal`). Historical status: **55 pass / 120 fail (33
-   crash)**. Current working-tree status: **72 pass / 94 fail (9 crash)** —
-   the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
-   factory override, the 8 composite-mapper `BuildGeometryBuffers` crashes by
-   a `mappedColors != nullptr` guard (they now render; 4 of the composite
-   tests pass outright), `TestOpacityMSAA` by clamping the MSAA sample
-   count to the device maximum (see below), the `TestAreaSelections`
-   crash by a missing `GetColorBufferSizes` override (see below), and the
-   `TestAreaSelections` cell-set fidelity by exact per-primitive cell ids
-   (see the selection-cluster section below). The three read-back tests
-   `TestReadPixels`, `TestSelectVisiblePoints` and `TestWorldPointPicker`
-   now pass via the color/depth read-back work (see the read-back-cluster
-   section below). No new crashes were introduced. The pass count fluctuates
-   run to run (run-to-run flakiness).
+    crash)**. Current working-tree status: **81 pass / 85 fail (9 crash)** —
+    the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
+    factory override, the 8 composite-mapper `BuildGeometryBuffers` crashes by
+    a `mappedColors != nullptr` guard (they now render), `TestOpacityMSAA` by
+    clamping the MSAA sample count to the device maximum (see below), the
+    `TestAreaSelections` crash by a missing `GetColorBufferSizes` override
+    (see below), and the `TestAreaSelections` cell-set fidelity by exact
+    per-primitive cell ids (see the selection-cluster section below). The three
+    read-back tests `TestReadPixels`, `TestSelectVisiblePoints` and
+    `TestWorldPointPicker` now pass via the color/depth read-back work (see the
+    read-back-cluster section below), and the composite per-block scalar
+    overrides (`TestCompositePolyDataMapperOverrideLUT`,
+    `OverrideScalarArray`, `NaNPartial`) now pass via the per-block
+    scalar-attribute forwarding and the interpolate/NaN-color ports (see the
+    composite-cluster section below). No new crashes were introduced. The pass
+    count fluctuates run to run (run-to-run flakiness).
 
 ---
 
@@ -128,7 +131,7 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  73 Passed  93 Failed (incl. image/pick fails)  9 "Subprocess aborted"
+175 tests:  81 Passed  85 Failed (incl. image/pick fails)  9 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
@@ -142,9 +145,18 @@ match OpenGL), `TestHardwareSelector` (was "0 nodes returned"), and
 `TestAxesActor` (documented gross-fail 0.612; treat as flaky until reproduced).
 Latest run: 72 Passed / 94 Failed / 9 aborted — the three read-back tests
 `TestReadPixels`, `TestSelectVisiblePoints` and `TestWorldPointPicker` now pass
-via the read-back cluster below. Newest run: 73 Passed / 93 Failed / 9 aborted —
+via the read-back cluster below. Next run: 73 Passed / 93 Failed / 9 aborted —
 `TestCompositePolyDataMapperBlockTextures` now passes via the per-block-texture
-port described in the composite-mapper section below.)
+port described in the composite-mapper section below. Current run:
+81 Passed / 85 Failed / 9 aborted — the composite per-block scalar-override
+cluster below now fixes `TestCompositePolyDataMapperOverrideLUT`,
+`TestCompositePolyDataMapperOverrideScalarArray` and
+`TestCompositePolyDataMapperNaNPartial` (all three confirmed via stash-check to
+fail at the previous commit); the remaining 5-pass delta over the prior run is
+within the documented run-to-run flakiness. The 9 aborts are unchanged
+(`TestFollowerPicking`, `TestInteractorStyleImageProperty`,
+`TestLabeledContourMapper{NoLabels,WithActorMatrix}`, `TestResizingWindowToImageFilter`,
+`TestTranslucentImageActor{AlphaBlending,DepthPeeling}`, `TestWindowToImageFilter`).)
 
 ### The selection cluster is fixed
 
@@ -272,19 +284,66 @@ guards with `mappedColors && ...`; the fix makes line 3745 consistent.
 
 `TestCompositePolyDataMapper`, `TestCompositePolyDataMapperBlockOpacities`,
 `TestCompositePolyDataMapperToggleScalarVisibilities`, the
-`StaticBounds`/`SharedArray`/`PartialPointData` composite tests, and now
+`StaticBounds`/`SharedArray`/`PartialPointData` composite tests,
 `TestCompositePolyDataMapperBlockTextures` (per-block textures, fixed by
 forwarding the batch element's `Texture` to the child Metal mapper and by
-mirroring GL's cell-scalar texture-size handling in `UpdateActorTexture`)
-now **pass**;
+mirroring GL's cell-scalar texture-size handling in `UpdateActorTexture`),
+and now `TestCompositePolyDataMapperOverrideScalarArray`,
+`TestCompositePolyDataMapperNaNPartial` and
+`TestCompositePolyDataMapperOverrideLUT` (per-block scalar overrides, fixed by
+the per-block scalar-attribute forwarding and the interpolate/NaN-color ports
+below) now **pass**;
 `TestActor2D`, `TestBlockOpacity`, `TestCompositePolyDataMapper{Spheres,
 Vertices}` and the rest render without crashing but still fail image
 comparison (block-opacity / per-block feature fidelity gaps). The composite
 mapper remains the largest *image-compare* cluster.
 
+### The composite per-block scalar-override cluster is fixed
+
+`vtkMetalBatchedPolyDataMapper::RenderPiece` never pushed the batch element's
+scalar attributes (`ArrayId`, `ArrayName`, `ScalarMode`, `ArrayComponent`,
+`ScalarRange`, `UseLookupTableScalarRange`, `FieldDataTupleId`, the block LUT,
+...) to the child mappers, so the child `vtkMetalPolyDataMapper` always saw
+`ArrayId == -1` and mapped no scalars (white mesh) for the per-block
+`ColorByArrayComponent`/`SetBlockLookupTable` overrides that
+`TestCompositePolyDataMapperOverrideScalarArray`, `NaNPartial` and `OverrideLUT`
+exercise. `RenderPiece` now forwards every batch element scalar field to the
+child before `RenderPiece(ren, act)` (mirroring how
+`vtkCompositePolyDataMapper::Render` pushes block overrides onto its delegate),
+fixing `OverrideScalarArray` and `NaNPartial`.
+
+For `TestCompositePolyDataMapperOverrideLUT` two further Metal gaps had to be
+closed:
+
+- **Scalar-as-texture interpolation.** The base `vtkMapper::MapScalars` with
+  `InterpolateScalarsBeforeMapping` on routes through `MapScalarsToTexture`
+  and returns `nullptr`, because Metal has no scalar-texture/LUT-texture
+  pipeline — the mesh rendered white. The fix reproduces GL's per-fragment
+  scalar interpolation on the CPU: `BuildGeometryBuffers` fans the polys and
+  splits each fan triangle into a barycentric 4×4 grid
+  (`SubdividePolysForScalarInterpolation`), interpolating every point-data
+  array at the grid points; `MapScalars` then maps the grid scalars through
+  the block LUT to per-vertex colors and the fragment stage's RGBA
+  interpolation approximates the textured gradient. The whole-image mean
+  pixel error is ~0.034/255 with the 0.05 test threshold; the residual is
+  density-independent (S=4, 8 and 16 are byte-identical to 4 decimals) and
+  comes from GL's bilinear-filtered LUT texture averaging colors at
+  breakpoints (half-texel alignment) vs the exact per-vertex breakpoint
+  colors, plus the label-glyph antialiasing — not from the grid. S=4 is the
+  smallest density that hits this floor (16× triangle amplification; S=3 has
+  ~11× more error and a thinner pass margin, S=2 fails outright). The
+  workaround is gated on `InterpolateScalarsBeforeMapping`
+  + point scalars + surface + no batch color override, and disables the GPU
+  tessellation path.
+- **NaN/missing-array colors.** `ColorMissingArraysWithNanColor` had no Metal
+  support: blocks with no scalar array rendered actor-white instead of the LUT
+  NaN color. `RenderPiece` now falls back to the NaN color
+  (`vtkLookupTable::GetNanColor` / `vtkColorTransferFunction::GetNanColor`)
+  via `SetBatchVisualOverride` when a visible block has no scalars.
+
 ### Image-compare failures
 
-Current run (2026-08-03): 94 failed = 91 image-compare + 3 non-image. Buckets
+Current run (2026-08-03): 85 failed = 82 image-compare + 3 non-image. Buckets
 by max `vtkTesting` TIGHT_VALID error per test (threshold 0.05):
 
 | Bucket | Range | Count | Examples |
@@ -293,7 +352,7 @@ by max `vtkTesting` TIGHT_VALID error per test (threshold 0.05):
 | mid | 0.1 – 0.5 | 51 | `TestSurfacePlusEdges`, `TestGlyph3DMapperIndexing`, `TestCompositePolyDataMapperPicking`, `TestWireframe`, `TestPolyDataMapper2D`, `TestCoincident`, `TestCompositePolyDataMapperCustomShader`, `TestColorByStringArrayDefaultLookupTable2D`, `TestGradientBackground` |
 | gross | >= 0.5 | 30 | `TestStereoBackground{Left,Right}` 0.887, `TestNViewports*` 0.85–0.88, `TestDirectScalarsToColors` 0.858, `TestMapVectorsToColors` 0.747, `TestImageMapper_1..4` 0.63–0.72, `TestActor2D` 0.618, `TestTilingCxx` 0.616, `TestBareScalarsToColors` 0.584, `RenderNonFinite` 0.543 |
 
-(90 of the 91 image-compare failures exceed the 0.05 threshold; the 91st,
+(81 of the 82 image-compare failures exceed the 0.05 threshold; the 82nd,
 `TestCompositePolyDataMapperPickability`, has a below-threshold ImageError of
 0.015 but still fails its own pickability check.) The 3 non-image failures:
 `TestPointSelection`, `TestPointSelectionWithCellData` (selection returns
@@ -333,19 +392,23 @@ value (the renderer's opaque/translucent/volume/overlay passes and the
 poly-data/glyph/image/volume mapper PSOs), the clamp applies everywhere.
 `TestOpacityMSAA` now renders and passes its image comparison.
 
-### Theme clusters in the 94 failures
+### Theme clusters in the 85 failures
 
 - **Textures** (~16): every `TestTexture*`, `TestBackfaceTexture`,
   `TestTexturedCylinder`, `TestTilingCxx`, `TestActor2DTextures` — historically
   crashed on the OpenGL fallback; now render, with 5 passing and the rest
   failing image comparison on texture-feature fidelity (filter/wrap/interpolation
   edge cases, textured-cylinder seams).
-- **Composite mapper** (~19): the crash cluster is gone (see above), but
-  `TestCompositePolyDataMapper{Scalars,CellScalars,Picking,PartialFieldData,
-  OverrideScalarArray,OverrideLUT,CameraShiftScale,CustomShader,NaNPartial,
-  MixedGeometry*}` still fail image comparison — the largest
-  failing cluster. (`TestCompositePolyDataMapperBlockTextures` now passes
-  via the per-block-texture port described in the composite-cluster section.)
+- **Composite mapper** (~19): the crash cluster is gone (see above), and
+  `TestCompositePolyDataMapper{Scalars,CellScalars,Spheres,Vertices,Picking,
+  PartialFieldData,CameraShiftScale,CustomShader,MixedGeometry*,
+  Pickability}` now render, but still fail image comparison — the largest
+  failing cluster. (`TestCompositePolyDataMapperBlockTextures`,
+  `TestCompositePolyDataMapperOverrideScalarArray`,
+  `TestCompositePolyDataMapperNaNPartial` and
+  `TestCompositePolyDataMapperOverrideLUT` now pass via the per-block
+  texture/scalar-attribute ports described in the composite-cluster
+  sections above.)
 - **Glyph instancing** (~9): `TestGlyph3DMapper{Arrow,BackfaceColor,Indexing,
   OrientationArray,Picking,PointSize,QuaternionArray,TreeIndexing,
   CompositeDisplayAttributeInheritance}` fail 0.15–0.6.
@@ -401,9 +464,14 @@ not in the fundamental geometry/lighting/color path.
 2. **Composite mapper crash — DONE** — a missing `mappedColors != nullptr` guard
    in the indexed-triangle path of `vtkMetalPolyDataMapper::BuildGeometryBuffers`
    (`vtkMetalPolyDataMapper.mm:3745`) crashed whenever block display overrides
-   skipped `MapScalars`. All 8 composite-cluster crashes are gone; 4 tests now
-   pass and the rest fail image comparison. The composite mapper is now the
-   largest *image-compare* cluster (~20 tests) rather than a crash source.
+   skipped `MapScalars`. All 8 composite-cluster crashes are gone; the composite
+   mapper is now an *image-compare* cluster. **Per-block scalar overrides — DONE**
+   (`TestCompositePolyDataMapperOverrideScalarArray`, `NaNPartial`, `OverrideLUT`
+   now pass): the batched mapper forwards per-block scalar attributes to child
+   mappers, a NaN-color fallback covers `ColorMissingArraysWithNanColor`, and
+   `InterpolateScalarsBeforeMapping` blocks get CPU-subdivided so per-vertex LUT
+   colors approximate GL's scalar-texture interpolation (Metal has no
+   scalar-texture pipeline).
 3. **MSAA attachments — DONE** — `TestOpacityMSAA` requested `MultiSamples(8)`,
    which the Apple GPU family does not support (max 4); Metal's descriptor
    validation aborted in `CreateMultisampleAttachments`.
@@ -460,9 +528,13 @@ M2 MacBook Air with the texture-cluster changes present, then again after the
 cell-id selection fix (`e9e8a6bb66`; 69 Passed / 97 Failed / 9 aborted —
 `TestAreaSelections` and `TestHardwareSelector` now pass, `TestAxesActor`
 passed this run), and most recently after the read-back cluster fixes
-(uncommitted working tree; 72 Passed / 94 Failed / 9 aborted —
-`TestReadPixels`, `TestSelectVisiblePoints` and `TestWorldPointPicker` now
-pass). The image-compare buckets above are from that latest run's
-`LastTest.log` (max TIGHT_VALID error per test). Re-running is reproducible
-except where a crash's signal stack ordering varies; the pass count fluctuates
-run to run.
+(72 Passed / 94 Failed / 9 aborted — `TestReadPixels`, `TestSelectVisiblePoints`
+and `TestWorldPointPicker` now pass), then after the per-block-texture port
+(73 Passed / 93 Failed / 9 aborted — `TestCompositePolyDataMapperBlockTextures`
+now passes), and finally after the per-block scalar-override cluster
+(81 Passed / 85 Failed / 9 aborted — `TestCompositePolyDataMapperOverrideLUT`,
+`OverrideScalarArray` and `NaNPartial` now pass; the remaining pass-count delta
+over the prior run is within documented run-to-run flakiness). The image-compare
+buckets above are from that latest run's `LastTest.log` (max TIGHT_VALID error
+per test). Re-running is reproducible except where a crash's signal stack
+ordering varies; the pass count fluctuates run to run.
