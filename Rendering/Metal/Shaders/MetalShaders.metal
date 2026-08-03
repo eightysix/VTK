@@ -39,6 +39,7 @@ constant uint kSceneFlagHasCellTexture      = 1u << 11;
 constant uint kSceneFlagUsePrimitiveCellIds = 1u << 12;
 constant uint kSceneFlagHasScalarLUT        = 1u << 13;
 constant uint kSceneFlagLinesUnlit           = 1u << 14;
+constant uint kSceneFlagGlyphHasNormals      = 1u << 15;
 
 // Compile-time feature specialization for the surface shader (the "GL way"):
 // one shader source, specialized per feature set at pipeline creation via
@@ -1914,10 +1915,31 @@ inline T computeGlyphVertex(
 template <typename T>
 inline FragmentOutput shadeGlyphFragment(T in,
     constant MaterialUniforms& material, constant LightUniforms& lights,
-    constant ClipPlaneUniforms& clipPlanes, float depthBias)
+    constant ClipPlaneUniforms& clipPlanes, uint sceneFlags, float depthBias)
 {
   if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
-  float3 N = normalize(in.viewNormal);
+  // Sources without point normals (e.g. vtkArrowSource) get a geometric normal
+  // computed from screen-space derivatives, oriented to face the camera, matching
+  // vtkOpenGLPolyDataMapper's no-point-normals fragment path.
+  float3 N;
+  if ((sceneFlags & kSceneFlagGlyphHasNormals) != 0u)
+  {
+    N = normalize(in.viewNormal);
+  }
+  else
+  {
+    float3 fdx = dfdx(in.viewPos);
+    float3 fdy = dfdy(in.viewPos);
+    N = normalize(cross(fdx, fdy));
+    if ((sceneFlags & kSceneFlagParallelProjection) != 0u)
+    {
+      if (N.z < 0.0) N = -N;
+    }
+    else if (dot(N, in.viewPos) > 0.0)
+    {
+      N = -N;
+    }
+  }
   float3 totalDiffuse = float3(0.0), totalSpecular = float3(0.0);
   computePhongLighting(N, in.viewPos, in.glyphColor.rgb, material.specularColor.rgb,
       material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
@@ -1948,7 +1970,7 @@ fragment FragmentOutput fragment_glyph_main(
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
     constant ClipPlaneUniforms& clipPlanes [[buffer(9)]]) {
-  return shadeGlyphFragment(in, material, lights, clipPlanes, 0.0);
+  return shadeGlyphFragment(in, material, lights, clipPlanes, scene.flags, 0.0);
 }
 
 vertex GlyphVertexOut vertex_glyph_line_main(
@@ -1969,7 +1991,7 @@ fragment FragmentOutput fragment_glyph_line_main(
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
     constant ClipPlaneUniforms& clipPlanes [[buffer(9)]]) {
-  return shadeGlyphFragment(in, material, lights, clipPlanes, 0.0);
+  return shadeGlyphFragment(in, material, lights, clipPlanes, scene.flags, 0.0);
 }
 
 vertex GlyphPointVertexOut vertex_glyph_point_main(
@@ -1993,7 +2015,7 @@ fragment FragmentOutput fragment_glyph_point_main(
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
     constant ClipPlaneUniforms& clipPlanes [[buffer(9)]]) {
-  return shadeGlyphFragment(in, material, lights, clipPlanes, coinOffset.pointOffset / 65000.0);
+  return shadeGlyphFragment(in, material, lights, clipPlanes, scene.flags, coinOffset.pointOffset / 65000.0);
 }
 
 

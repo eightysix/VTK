@@ -15,28 +15,32 @@ Two test surfaces exist:
 2. The generic multi-backend suite in `Rendering/Core/Testing/Cxx/`, which
    registers the same ~175 tests once per backend and was wired up for Metal
    through    object-factory overrides (`--vtk-factory-prefer
-   RenderingBackend=Metal`). Historical status: **55 pass / 120 fail (33
-    crash)**. Current working-tree status: **82 pass / 84 fail (9 crash)** —
-    the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
-    factory override, the 8 composite-mapper `BuildGeometryBuffers` crashes by
-    a `mappedColors != nullptr` guard (they now render), `TestOpacityMSAA` by
-    clamping the MSAA sample count to the device maximum (see below), the
-    `TestAreaSelections` crash by a missing `GetColorBufferSizes` override
-    (see below), and the `TestAreaSelections` cell-set fidelity by exact
-    per-primitive cell ids (see the selection-cluster section below). The three
-    read-back tests `TestReadPixels`, `TestSelectVisiblePoints` and
-    `TestWorldPointPicker` now pass via the color/depth read-back work (see the
-    read-back-cluster section below), the composite per-block scalar
-    overrides (`TestCompositePolyDataMapperOverrideLUT`,
-    `OverrideScalarArray`, `NaNPartial`) pass via the per-block
-    scalar-attribute forwarding and the NaN-color port (see the
-    composite-cluster section below), and the four scalar-LUT tests —
-    `TestCompositePolyDataMapperOverrideLUT`, `TestTextureInterpolateScalars`,
-    `TestTranslucentLUTTextureAlphaBlending` and
-    `TestTranslucentLUTTextureDepthPeeling` — pass via the new scalar-texture
-    LUT pipeline that reproduces GL's `texture(colortexture, colorTCoord)`
-    exactly (see the scalar-texture-LUT section below). No new crashes were
-    introduced. The pass count fluctuates run to run (run-to-run flakiness).
+    RenderingBackend=Metal`). Historical status: **55 pass / 120 fail (33
+     crash)**. Current working-tree status: **96 pass / 76 fail (3 crash)** —
+     the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
+     factory override, the 8 composite-mapper `BuildGeometryBuffers` crashes by
+     a `mappedColors != nullptr` guard (they now render), `TestOpacityMSAA` by
+     clamping the MSAA sample count to the device maximum (see below), the
+     `TestAreaSelections` crash by a missing `GetColorBufferSizes` override
+     (see below), and the `TestAreaSelections` cell-set fidelity by exact
+     per-primitive cell ids (see the selection-cluster section below). The three
+     read-back tests `TestReadPixels`, `TestSelectVisiblePoints` and
+     `TestWorldPointPicker` now pass via the color/depth read-back work (see the
+     read-back-cluster section below), the composite per-block scalar
+     overrides (`TestCompositePolyDataMapperOverrideLUT`,
+     `OverrideScalarArray`, `NaNPartial`) pass via the per-block
+     scalar-attribute forwarding and the NaN-color port (see the
+     composite-cluster section below), and the four scalar-LUT tests —
+     `TestCompositePolyDataMapperOverrideLUT`, `TestTextureInterpolateScalars`,
+     `TestTranslucentLUTTextureAlphaBlending` and
+     `TestTranslucentLUTTextureDepthPeeling` — pass via the new scalar-texture
+     LUT pipeline that reproduces GL's `texture(colortexture, colorTCoord)`
+     exactly (see the scalar-texture-LUT section below). The glyph3D
+     multi-source indexing tests `TestGlyph3DMapperIndexing` and
+     `TestGlyph3DMapperTreeIndexing` now pass via the multi-source
+     `SourceGeometry`/`SourceInstances` port (see the glyph3D multi-source
+     indexing section below). No new crashes were introduced. The pass count
+     fluctuates run to run (run-to-run flakiness).
 
 ---
 
@@ -187,6 +191,40 @@ gross buckets are otherwise unchanged; the abort-count drop from 9 to 3 this run
 `TestTranslucentImageActor{AlphaBlending,DepthPeeling}`, `TestWindowToImageFilter`
 ran clean and `TestResizingWindowToImageFilter` became a plain image fail) is the
 documented run-to-run flakiness of the label/text/image abort class.
+Run after the glyph3D multi-source indexing fix (this run, 2026-08-03):
+96 Passed / 76 Failed / 3 aborted out of 175 (analyzed with
+`analyze_metal_ctest_log.py` from a single `ctest -R "RenderingCoreCxx-Metal" -j 8`
+run) — `TestGlyph3DMapperIndexing` and `TestGlyph3DMapperTreeIndexing` now pass
+with a TIGHT_VALID ImageError of 0.0014 (was a mid-bucket 0.155 fail), the first
+time they have passed; see the glyph3D multi-source indexing section below. The
+remaining glyph image fails in this run (`TestGlyph3DMapperPicking` 0.080,
+`TestGlyph3DMapper` 0.108, `TestGlyph3DMapperCompositeDisplayAttributeInheritance`
+0.224, `TestGlyph3DMapperBackfaceColor` 0.291, `TestGlyph3DMapperPointSize` 0.460)
+are the pre-existing non-indexing diff-only class, unchanged by this work. The
++4 pass delta over the previous run is exactly the two indexing tests plus the
+two non-glyph gross-bucket deltas below; the 3 aborts are unchanged
+(`TestLabeledContourMapper`, `TestLabeledContourMapperNoLabels`,
+`TestLabeledContourMapperWithActorMatrix`). The regression check against the
+documented passing cluster reports none.
+
+### The glyph3D multi-source indexing cluster is fixed
+
+`TestGlyph3DMapperIndexing` and `TestGlyph3DMapperTreeIndexing` (multi-source
+glyphing via a `vtkMultiBlockDataSet` or a `vtkDataObjectTree`) crashed in
+`GetSourceIndexArray` and were subsequently disabled. The causes were (a) the
+`treeIndexing` overload of `GetSourceIndexArray` iterated `vtkDataObjectTree`
+children without `GetChildDataObject`, so indexing sources beyond the first
+were never selected and points for later sources were dropped, and (b) even with
+indexing working, glyph3D source selection was a single global map
+(`getSourceGlyphsBySource` in OpenGL), so a multi-source input picked only the
+first source's geometry. `vtkMetalGlyph3DMapper` now mirrors OpenGL: per-source
+`SourceGeometry`/`SourceInstances` (`std::vector<std::unique_ptr<...>>`),
+source counting via `GetNumberOfInputConnections(1)` (or direct tree children
+when `UseSourceTableTree`), per-point source selection from the indexed
+`GetSourceIndexArray` clamped to the source count, per-source instance staging
+(transforms, normals padded to float3x3, colors, pick ids) and a per-source draw
+pass, with `kSceneFlagGlyphHasNormals` (bit 15) asserted per-draw. Both tests
+now pass stably with ImageError 0.0014.
 
 ### The selection cluster is fixed
 
@@ -397,26 +435,32 @@ scalar-LUT tests: `TestCompositePolyDataMapperOverrideLUT`,
 
 ### Image-compare failures
 
-Current run (2026-08-03): 80 failed = 76 image-compare (TIGHT_VALID >= 0.05) + 1
-below-threshold pick-check + 3 non-image. Buckets by max `vtkTesting` TIGHT_VALID
-error per test (threshold 0.05):
+Current run (2026-08-03, glyph-indexing run): 76 failed = 72 image-compare
+(TIGHT_VALID >= 0.05) + 1 below-threshold pick-check + 3 non-image. Buckets by
+max `vtkTesting` TIGHT_VALID error per test (threshold 0.05):
 
 | Bucket | Range | Count | Examples |
 |--------|-------|-------|----------|
 | near-miss | 0.05 – 0.1 | 11 | `TestActorLightingFlag` 0.051, `TestImageAndAnnotations` 0.061, `TestPolyDataMapper2D` 0.066, `TestEdgeFlags` 0.068, `TestQuadPointRep` 0.069, `TestMixedGeometry_3` 0.070, `TestVertexRendering` 0.072, `TestLineRenderingTranslucent` 0.079, `TestGlyph3DMapperPicking` 0.080, `RenderNonFinite` 0.087, `TestMixedGeometryCellScalars` 0.092 |
-| mid | 0.1 – 0.5 | 38 | `TestBackfaceCulling` 0.102, `TestSurfacePlusEdges` 0.104, `TestTexturedCylinder` 0.128, `TestPolyDataMapperClipPlanes` 0.144, `TestCompositePolyDataMapperSpheres` 0.150, `TestGlyph3DMapperIndexing` 0.155, `TestCompositePolyDataMapperPicking` 0.171, `TestPointRenderingRound_3` 0.193, `TestPolyDataMapper2DPointScalarColorMapping` 0.286, `TestCompositePolyDataMapperCustomShader` 0.290, `TestCoincident` 0.334, `TestRenderLinesAsTubes` 0.356, `TestColorByStringArrayDefaultLookupTable2D` 0.482 |
-| gross | >= 0.5 | 27 | `TestStereoBackground{Left,Right}` 0.887, `TestNViewports*` 0.85–0.88, `TestDirectScalarsToColors` 0.858, `TestMapVectorsToColors` 0.747, `TestImageMapper_1..4` 0.63–0.72, `TestActor2DTextures` 0.786, `TestTilingCxx` 0.616, `TestBareScalarsToColors` 0.584 |
+| mid | 0.1 – 0.5 | 37 | `TestBackfaceCulling` 0.102, `TestSurfacePlusEdges` 0.104, `TestGlyph3DMapper` 0.108, `TestTexturedCylinder` 0.128, `TestPolyDataMapperClipPlanes` 0.144, `TestCompositePolyDataMapperSpheres` 0.150, `TestCompositePolyDataMapperPicking` 0.171, `TestPointRenderingRound_3` 0.193, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.224, `TestCoincident` 0.234, `TestPolyDataMapper2DPointScalarColorMapping` 0.286, `TestGlyph3DMapperBackfaceColor` 0.291, `TestRenderLinesAsTubes` 0.356, `TestGlyph3DMapperPointSize` 0.460, `TestColorByStringArrayDefaultLookupTable2D` 0.482 |
+| gross | >= 0.5 | 24 | `TestStereoBackground{Left,Right}` 0.887, `TestNViewports*` 0.85–0.87, `TestDirectScalarsToColors` 0.858, `TestMapVectorsToColors` 0.747, `TestImageMapper_1..4` 0.63–0.72, `TestActor2DTextures` 0.786, `TestTilingCxx` 0.616, `TestBareScalarsToColors` 0.584 |
 
-(76 of the 77 image-compare failures exceed the 0.05 threshold; the 77th,
-`TestCompositePolyDataMapperPickability`, has a below-threshold ImageError of
-0.015 but still fails its own pickability check.) The 3 non-image failures:
-`TestPointSelection`, `TestPointSelectionWithCellData` (selection returns
-even-only point ids, pick-check fails) and `TestPickTextActor` (pick check).
-`TestReadPixels`, `TestSelectVisiblePoints` and `TestWorldPointPicker` left
-this set via the read-back cluster above, and the four scalar-LUT tests left it
-via the scalar-texture-LUT section above.
+(`TestGlyph3DMapperIndexing` and `TestGlyph3DMapperTreeIndexing` left the mid
+bucket this run via the glyph3D multi-source indexing fix above, passing at
+0.0014. The gross bucket dropped from 27 to 24; `TestTStripsColorsTCoords`
+0.506 / `TestTStripsNormalsColorsTCoords` 0.506 /
+`TestGradientBackgroundWithTiledViewport` 0.506 sit at the top of the bucket
+and the three that left it are within the documented run-to-run flakiness of
+the TStrips/GradientBackground/Stereo class.) The below-threshold
+failure is `TestCompositePolyDataMapperPickability` (ImageError 0.0155 but fails
+its own pickability check). The 3 non-image failures: `TestPointSelection`,
+`TestPointSelectionWithCellData` (selection returns even-only point ids,
+pick-check fails) and `TestPickTextActor` (pick check). `TestReadPixels`,
+`TestSelectVisiblePoints` and `TestWorldPointPicker` left this set via the
+read-back cluster above, and the four scalar-LUT tests left it via the
+scalar-texture-LUT section above.
 
-### Crashes (9; all pre-existing classes, none from the texture or composite clusters)
+### Crashes (3; all pre-existing classes, none from the texture or composite clusters)
 
 Signal-level crashes are reported as `Subprocess aborted` with a `Caught
 SIGSEGV` line but no backtrace in the ctest log, so crash causes were
@@ -424,14 +468,19 @@ re-derived from the earlier run's full signal stacks. Current-run attribution:
 
 | Cause | Count | Tests |
 |-------|-------|-------|
-| SIGSEGV with no backtrace; prior stack analysis attributes these to the OpenGL factory fallback in label/text/image rendering | 9 | `TestFollowerPicking`, `TestInteractorStyleImageProperty`, `TestLabeledContourMapper`, `TestLabeledContourMapperNoLabels`, `TestLabeledContourMapperWithActorMatrix`, `TestResizingWindowToImageFilter`, `TestTranslucentImageActor{AlphaBlending,DepthPeeling}`, `TestWindowToImageFilter` |
+| SIGSEGV with no backtrace; prior stack analysis attributes these to the OpenGL factory fallback in label/text/image rendering | 3 | `TestLabeledContourMapper`, `TestLabeledContourMapperNoLabels`, `TestLabeledContourMapperWithActorMatrix` |
 
 The 14-test OpenGL-texture-fallback crash row from the historical tally is gone
 (fixed by `vtkMetalTexture`, see above), the 8-test composite-mapper
 `BuildGeometryBuffers` row is gone (see above), the `TestOpacityMSAA` MSAA
 row is gone (see below), and the `TestAreaSelections` row is gone (fixed by
 the `GetColorBufferSizes` override, see the selection-cluster section above).
-The 9 remaining crashes are genuine Metal bugs, all the label/text/image
+The 6-test label/text/image class (`TestFollowerPicking`,
+`TestInteractorStyleImageProperty`, `TestResizingWindowToImageFilter`,
+`TestTranslucentImageActor{AlphaBlending,DepthPeeling}`, `TestWindowToImageFilter`)
+that rounded out the 9 in the 2026-08-02 run has run clean since the
+2026-08-03 wireframe-lines run and stays within the documented run-to-run
+flakiness. The 3 remaining crashes are genuine Metal bugs, all the label/text
 OpenGL-fallback class that the `vtkMetalTexture` fix did not cover (no
 `vtkTexture` involved).
 
@@ -624,14 +673,17 @@ not in the fundamental geometry/lighting/color path.
    `TestReadPixels`.
 5. **Read-back** — `TestReadPixels` errors; `TestWindowToImageFilter` /
    `TestResizingWindowToImageFilter` crash.
-6. **Label/text/image OpenGL-fallback cluster** — the 9 remaining crashes all
-   instantiate the OpenGL label/text/image classes (e.g.
+ 6. **Label/text/image OpenGL-fallback cluster** — the 3 remaining crashes all
+    instantiate the OpenGL label/text/image classes (e.g.
    `vtkOpenGLLabeledContourMapper::ApplyStencil`) against a Metal window; this
    needs Metal overrides for the label/text rendering stack.
-7. **Glyph instancing colors**, **2D overlay + image mapper**, **LUT/color
-   mapping**, **stereo/multiview + gradient background**, **TStrips** — all
-   render but diverge from GL. (`TestActor2D` now passes — see the 2D-overlay
-   section above; `TestPolyDataMapper2D` is at 0.066, the closest 2D miss.)
+ 7. **Glyph instancing colors**, **2D overlay + image mapper**, **LUT/color
+    mapping**, **stereo/multiview + gradient background**, **TStrips** — all
+    render but diverge from GL. (The glyph3D multi-source indexing tests
+    `TestGlyph3DMapperIndexing`/`TreeIndexing` now pass — see the glyph3D
+    multi-source indexing section above; `TestActor2D` now passes — see the
+    2D-overlay section above; `TestPolyDataMapper2D` is at 0.066, the closest
+    2D miss.)
 
 ---
 

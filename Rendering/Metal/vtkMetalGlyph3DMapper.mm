@@ -13,6 +13,8 @@
 #include "vtkPolyData.h"
 #include "vtkCellArray.h"
 #include "vtkPointData.h"
+#include "vtkDataObjectTree.h"
+#include "vtkDataObjectTreeIterator.h"
 #include "vtkProperty.h"
 #include "vtkActor.h"
 #include "vtkRenderer.h"
@@ -68,30 +70,73 @@ enum GlyphBufferSlot : int
   kGlyphPropId = 10,          // PickIds {propId, compositeIndex} (constant)
 };
 
+// Scene-uniform flag bit indicating the glyph source carries point normals.
+// Must match kSceneFlagGlyphHasNormals in MetalShaders.metal.
+constexpr uint32_t VTK_METAL_SCENE_FLAG_GLYPH_HAS_NORMALS = 1u << 15;
+
 // ---------------------------------------------------------------------------
 // Per-instance glyph data computed on CPU and uploaded to GPU
 // ---------------------------------------------------------------------------
 struct vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals
 {
-  // Source geometry (cached from glyph source polydata)
-  id<MTLBuffer> SrcPositionBuffer = nil;
-  id<MTLBuffer> SrcNormalBuffer = nil;
-  vtkIdType SrcVertexCount = 0;
-  vtkIdType TriVertexCount = 0;
-  vtkIdType LineVertexCount = 0;
-  vtkIdType PtVertexCount = 0;
-  bool HasTriangles = false;
-  bool HasLines = false;
-  bool HasPoints = false;
-  vtkIdType CachedSourceMTime = 0;
+  // Per-source geometry (cached from glyph source polydata)
+  struct SourceGeometry
+  {
+    id<MTLBuffer> PositionBuffer = nil;
+    id<MTLBuffer> NormalBuffer = nil;
+    vtkIdType VertexCount = 0;
+    vtkIdType TriVertexCount = 0;
+    vtkIdType LineVertexCount = 0;
+    vtkIdType PtVertexCount = 0;
+    bool HasTriangles = false;
+    bool HasLines = false;
+    bool HasPoints = false;
+    bool HasNormals = false;
+    vtkIdType CachedSourceMTime = 0;
 
-  // Per-instance attribute buffers
-  id<MTLBuffer> InstTransformBuffer = nil;
-  id<MTLBuffer> InstNormalTransformBuffer = nil;
-  id<MTLBuffer> InstColorBuffer = nil;
-  id<MTLBuffer> InstPickIdBuffer = nil;
-  uint32_t NumInstances = 0;
+    void Release()
+    {
+      [PositionBuffer release];
+      PositionBuffer = nil;
+      [NormalBuffer release];
+      NormalBuffer = nil;
+      VertexCount = 0;
+      TriVertexCount = LineVertexCount = PtVertexCount = 0;
+      HasTriangles = HasLines = HasPoints = HasNormals = false;
+      CachedSourceMTime = 0;
+    }
+
+    ~SourceGeometry() { Release(); }
+  };
+  std::vector<std::unique_ptr<SourceGeometry>> Sources;
+
+  // Per-source instance attribute buffers
+  struct SourceInstances
+  {
+    id<MTLBuffer> TransformBuffer = nil;
+    id<MTLBuffer> NormalTransformBuffer = nil;
+    id<MTLBuffer> ColorBuffer = nil;
+    id<MTLBuffer> PickIdBuffer = nil;
+    uint32_t NumInstances = 0;
+
+    void Release()
+    {
+      [TransformBuffer release];
+      TransformBuffer = nil;
+      [NormalTransformBuffer release];
+      NormalTransformBuffer = nil;
+      [ColorBuffer release];
+      ColorBuffer = nil;
+      [PickIdBuffer release];
+      PickIdBuffer = nil;
+      NumInstances = 0;
+    }
+
+    ~SourceInstances() { Release(); }
+  };
+  std::vector<std::unique_ptr<SourceInstances>> Instances;
   vtkIdType CachedInputMTime = 0;
+  vtkIdType CachedNumSources = 0;
 
   // Pipeline states
   id<MTLRenderPipelineState> TriPipeline = nil;
@@ -110,27 +155,12 @@ struct vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals
 
   void ReleaseSourceBuffers()
   {
-    [SrcPositionBuffer release];
-    SrcPositionBuffer = nil;
-    [SrcNormalBuffer release];
-    SrcNormalBuffer = nil;
-    SrcVertexCount = 0;
-    TriVertexCount = LineVertexCount = PtVertexCount = 0;
-    HasTriangles = HasLines = HasPoints = false;
-    CachedSourceMTime = 0;
+    Sources.clear();
   }
 
   void ReleaseInstanceBuffers()
   {
-    [InstTransformBuffer release];
-    InstTransformBuffer = nil;
-    [InstNormalTransformBuffer release];
-    InstNormalTransformBuffer = nil;
-    [InstColorBuffer release];
-    InstColorBuffer = nil;
-    [InstPickIdBuffer release];
-    InstPickIdBuffer = nil;
-    NumInstances = 0;
+    Instances.clear();
   }
 
   void ReleaseAll()
@@ -187,13 +217,35 @@ void vtkMetalGlyph3DMapper::ReleaseGraphicsResources(vtkWindow*)
 }
 
 // ---------------------------------------------------------------------------
+// Return the child at the given direct-child index of a source table tree.
+// Mirrors vtkOpenGLGlyph3DMapper::getChildDataObject.
+// ---------------------------------------------------------------------------
+static vtkDataObject* GetSourceTableTreeChild(vtkDataObjectTree* tree, vtkIdType child)
+{
+  vtkDataObject* result = nullptr;
+  if (tree)
+  {
+    vtkDataObjectTreeIterator* it = tree->NewTreeIterator();
+    it->SetTraverseSubTree(false);
+    it->SetVisitOnlyLeaves(false);
+    it->InitTraversal();
+    for (vtkIdType i = 0; i < child; ++i)
+    {
+      it->GoToNextItem();
+    }
+    result = it->GetCurrentDataObject();
+    it->Delete();
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Build Metal buffers from glyph source polydata geometry.
 // Extracts triangles (fan-triangulated polygons), line segments, and points.
 // ---------------------------------------------------------------------------
 static void BuildSourceGeometry(id<MTLDevice> device, vtkPolyData* src,
-  vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals* I)
+  vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals::SourceGeometry& g)
 {
-  I->ReleaseSourceBuffers();
   if (!src || src->GetNumberOfPoints() == 0)
   {
     return;
@@ -201,11 +253,15 @@ static void BuildSourceGeometry(id<MTLDevice> device, vtkPolyData* src,
 
   vtkPointData* pd = src->GetPointData();
   vtkDataArray* normals = pd ? pd->GetNormals() : nullptr;
+  g.HasNormals = (normals != nullptr);
+  vtkCellArray* polys = src->GetPolys();
+  vtkCellArray* lines = src->GetLines();
+  vtkCellArray* verts = src->GetVerts();
+  vtkCellArray* strips = src->GetStrips();
 
   std::vector<float> triPos, triNrm, linePos, lineNrm, ptPos, ptNrm;
 
   // Polygons → triangles via fan triangulation
-  vtkCellArray* polys = src->GetPolys();
   if (polys)
   {
     const vtkIdType* pts = nullptr;
@@ -215,6 +271,30 @@ static void BuildSourceGeometry(id<MTLDevice> device, vtkPolyData* src,
       for (vtkIdType i = 1; i + 1 < npts; ++i)
       {
         vtkIdType tri[3] = { pts[0], pts[i], pts[i + 1] };
+        double faceNrm[3] = { 0.f, 1.f, 0.f };
+        if (!normals)
+        {
+          double pa[3], pb[3], pc[3], e1[3], e2[3];
+          src->GetPoint(tri[0], pa);
+          src->GetPoint(tri[1], pb);
+          src->GetPoint(tri[2], pc);
+          for (int k = 0; k < 3; ++k)
+          {
+            e1[k] = pb[k] - pa[k];
+            e2[k] = pc[k] - pa[k];
+          }
+          faceNrm[0] = e1[1] * e2[2] - e1[2] * e2[1];
+          faceNrm[1] = e1[2] * e2[0] - e1[0] * e2[2];
+          faceNrm[2] = e1[0] * e2[1] - e1[1] * e2[0];
+          double len = std::sqrt(
+            faceNrm[0] * faceNrm[0] + faceNrm[1] * faceNrm[1] + faceNrm[2] * faceNrm[2]);
+          if (len > 0.0)
+          {
+            faceNrm[0] /= len;
+            faceNrm[1] /= len;
+            faceNrm[2] /= len;
+          }
+        }
         for (int j = 0; j < 3; ++j)
         {
           double pt[3];
@@ -232,9 +312,9 @@ static void BuildSourceGeometry(id<MTLDevice> device, vtkPolyData* src,
           }
           else
           {
-            triNrm.push_back(0.f);
-            triNrm.push_back(1.f);
-            triNrm.push_back(0.f);
+            triNrm.push_back(static_cast<float>(faceNrm[0]));
+            triNrm.push_back(static_cast<float>(faceNrm[1]));
+            triNrm.push_back(static_cast<float>(faceNrm[2]));
           }
         }
       }
@@ -242,7 +322,6 @@ static void BuildSourceGeometry(id<MTLDevice> device, vtkPolyData* src,
   }
 
   // Lines
-  vtkCellArray* lines = src->GetLines();
   if (lines)
   {
     const vtkIdType* pts = nullptr;
@@ -278,7 +357,6 @@ static void BuildSourceGeometry(id<MTLDevice> device, vtkPolyData* src,
   }
 
   // Verts
-  vtkCellArray* verts = src->GetVerts();
   if (verts)
   {
     const vtkIdType* pts = nullptr;
@@ -334,32 +412,32 @@ static void BuildSourceGeometry(id<MTLDevice> device, vtkPolyData* src,
   {
     usePos = &triPos;
     useNrm = &triNrm;
-    I->HasTriangles = true;
-    I->TriVertexCount = triPos.size() / 3;
+    g.HasTriangles = true;
+    g.TriVertexCount = triPos.size() / 3;
   }
   else if (!linePos.empty())
   {
     usePos = &linePos;
     useNrm = &lineNrm;
-    I->HasLines = true;
-    I->LineVertexCount = linePos.size() / 3;
+    g.HasLines = true;
+    g.LineVertexCount = linePos.size() / 3;
   }
   else
   {
     usePos = &ptPos;
     useNrm = &ptNrm;
-    I->HasPoints = true;
-    I->PtVertexCount = ptPos.size() / 3;
+    g.HasPoints = true;
+    g.PtVertexCount = ptPos.size() / 3;
   }
 
-  I->SrcPositionBuffer = [device newBufferWithBytes:usePos->data()
-                                             length:usePos->size() * sizeof(float)
-                                            options:MTLResourceStorageModeShared];
-  I->SrcNormalBuffer = [device newBufferWithBytes:useNrm->data()
-                                           length:useNrm->size() * sizeof(float)
-                                          options:MTLResourceStorageModeShared];
-  I->SrcVertexCount = usePos->size() / 3;
-  I->CachedSourceMTime = src->GetMTime();
+  g.PositionBuffer = [device newBufferWithBytes:usePos->data()
+                                        length:usePos->size() * sizeof(float)
+                                       options:MTLResourceStorageModeShared];
+  g.NormalBuffer = [device newBufferWithBytes:useNrm->data()
+                                       length:useNrm->size() * sizeof(float)
+                                      options:MTLResourceStorageModeShared];
+  g.VertexCount = usePos->size() / 3;
+  g.CachedSourceMTime = src->GetMTime();
 }
 
 // ---------------------------------------------------------------------------
@@ -525,12 +603,6 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     this->SetSourceData(defSrc);
   }
 
-  vtkPolyData* source = vtkPolyData::SafeDownCast(this->GetSource(0));
-  if (!source || source->GetNumberOfPoints() == 0)
-  {
-    return;
-  }
-
   vtkMetalRenderWindow* renWin = vtkMetalRenderWindow::SafeDownCast(ren->GetRenderWindow());
   if (!renWin || !renWin->GetMetalDevice())
   {
@@ -549,14 +621,54 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     I->CachedSampleCount = sampleCount;
   }
 
-  // Rebuild source geometry if source changed
-  if (source->GetMTime() != I->CachedSourceMTime)
+  // Determine the number of glyph sources. Mirror vtkOpenGLGlyph3DMapper:
+  // with UseSourceTableTree each direct child of the source tree is a source;
+  // otherwise each input connection on port 1 is a source.
+  vtkIdType numSources = 0;
+  if (this->UseSourceTableTree)
   {
-    BuildSourceGeometry(device, source, I);
+    vtkDataObjectTree* tree = this->GetSourceTableTree();
+    if (tree)
+    {
+      vtkDataObjectTreeIterator* it = tree->NewTreeIterator();
+      it->SetTraverseSubTree(false);
+      it->SetVisitOnlyLeaves(false);
+      for (it->InitTraversal(); !it->IsDoneWithTraversal(); it->GoToNextItem())
+      {
+        ++numSources;
+      }
+      it->Delete();
+    }
   }
-  if (I->SrcVertexCount == 0)
+  else
+  {
+    numSources = this->GetNumberOfInputConnections(1);
+  }
+  if (numSources < 1)
   {
     return;
+  }
+
+  // Rebuild per-source geometry when any source changes
+  I->Sources.resize(numSources);
+  for (vtkIdType si = 0; si < numSources; ++si)
+  {
+    vtkPolyData* src =
+      this->UseSourceTableTree
+      ? vtkPolyData::SafeDownCast(GetSourceTableTreeChild(this->GetSourceTableTree(), si))
+      : vtkPolyData::SafeDownCast(this->GetSource(si));
+    if (!src || src->GetNumberOfPoints() == 0)
+    {
+      continue;
+    }
+    if (!I->Sources[si])
+    {
+      I->Sources[si] = std::make_unique<vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals::SourceGeometry>();
+    }
+    if (src->GetMTime() != I->Sources[si]->CachedSourceMTime)
+    {
+      BuildSourceGeometry(device, src, *I->Sources[si]);
+    }
   }
 
   // Get input dataset
@@ -572,12 +684,15 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     return;
   }
 
-  // Rebuild instance data if input changed
+  // Rebuild instance data when the input or source configuration changed
   vtkIdType inputMTime = ds->GetMTime();
-  if (inputMTime != I->CachedInputMTime)
+  if (inputMTime != I->CachedInputMTime || numSources != I->CachedNumSources)
   {
     I->ReleaseInstanceBuffers();
     I->CachedInputMTime = inputMTime;
+    I->CachedNumSources = numSources;
+
+    I->Instances.resize(numSources);
 
     auto* orientArr = this->GetOrientationArray(ds);
     auto* scaleArr = this->GetScaleArray(ds);
@@ -585,6 +700,7 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     vtkBitArray* maskArr = this->Masking
       ? vtkArrayDownCast<vtkBitArray>(this->GetMaskArray(ds))
       : nullptr;
+    vtkDataArray* indexArr = this->GetSourceIndexArray(ds);
 
     // Validate orientation array
     if (orientArr)
@@ -610,17 +726,6 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
       mappedColors->DeepCopy(this->Colors);
     }
 
-    // Count unmasked points
-    vtkIdType instCount = 0;
-    for (vtkIdType pid = 0; pid < numPoints; ++pid)
-    {
-      if (maskArr && maskArr->GetValue(pid) == 0)
-        continue;
-      ++instCount;
-    }
-    if (instCount == 0)
-      return;
-
     double rangeSize = this->Range[1] - this->Range[0];
     if (rangeSize == 0.0)
       rangeSize = 1.0;
@@ -629,16 +734,65 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     actor->GetProperty()->GetColor(actorCol);
     actorCol[3] = actor->GetProperty()->GetOpacity();
 
-    std::vector<vtkTypeFloat32> transforms(instCount * 16);
-    std::vector<vtkTypeFloat32> normTransforms(instCount * 9);
-    std::vector<vtkTypeFloat32> colors(instCount * 4);
-    std::vector<vtkIdType> pickIds(instCount);
-
-    vtkIdType idx = 0;
+    // First pass: count unmasked points per source. Per-point source selection
+    // mirrors vtkOpenGLGlyph3DMapper: when the source index array is present
+    // each point selects a source (clamped to the number of sources); otherwise
+    // every point uses source 0.
+    std::vector<vtkIdType> perSourceCount(numSources, 0);
     for (vtkIdType pid = 0; pid < numPoints; ++pid)
     {
       if (maskArr && maskArr->GetValue(pid) == 0)
         continue;
+      int si = 0;
+      if (indexArr)
+      {
+        double value = vtkMath::Norm(indexArr->GetTuple(pid), indexArr->GetNumberOfComponents());
+        si = vtkMath::ClampValue(static_cast<int>(value), 0, static_cast<int>(numSources) - 1);
+      }
+      ++perSourceCount[si];
+    }
+
+    vtkIdType totalInst = 0;
+    for (vtkIdType si = 0; si < numSources; ++si)
+    {
+      totalInst += perSourceCount[si];
+    }
+    if (totalInst == 0)
+      return;
+
+    std::vector<std::vector<vtkTypeFloat32>> perSourceTransforms(numSources);
+    std::vector<std::vector<vtkTypeFloat32>> perSourceNormTransforms(numSources);
+    std::vector<std::vector<vtkTypeFloat32>> perSourceColors(numSources);
+    std::vector<std::vector<vtkIdType>> perSourcePickIds(numSources);
+    for (vtkIdType si = 0; si < numSources; ++si)
+    {
+      perSourceTransforms[si].resize(perSourceCount[si] * 16);
+      perSourceNormTransforms[si].resize(perSourceCount[si] * 9);
+      perSourceColors[si].resize(perSourceCount[si] * 4);
+      perSourcePickIds[si].resize(perSourceCount[si]);
+    }
+
+    std::vector<vtkIdType> cursor(numSources, 0);
+    for (vtkIdType pid = 0; pid < numPoints; ++pid)
+    {
+      if (maskArr && maskArr->GetValue(pid) == 0)
+        continue;
+
+      int si = 0;
+      if (indexArr)
+      {
+        double value = vtkMath::Norm(indexArr->GetTuple(pid), indexArr->GetNumberOfComponents());
+        si = vtkMath::ClampValue(static_cast<int>(value), 0, static_cast<int>(numSources) - 1);
+      }
+
+      // Skip points whose selected source has no drawable geometry.
+      if (si >= numSources || !I->Sources[si] || I->Sources[si]->VertexCount == 0)
+      {
+        continue;
+      }
+
+      vtkIdType idx = cursor[si];
+      ++cursor[si];
 
       // Color
       float r = static_cast<float>(actorCol[0]);
@@ -654,10 +808,10 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
         b = rgba[2] / 255.f;
         a = rgba[3] / 255.f;
       }
-      colors[idx * 4 + 0] = r;
-      colors[idx * 4 + 1] = g;
-      colors[idx * 4 + 2] = b;
-      colors[idx * 4 + 3] = a;
+      perSourceColors[si][idx * 4 + 0] = r;
+      perSourceColors[si][idx * 4 + 1] = g;
+      perSourceColors[si][idx * 4 + 2] = b;
+      perSourceColors[si][idx * 4 + 3] = a;
 
       // Scale
       double sx = 1.0, sy = 1.0, sz = 1.0;
@@ -776,12 +930,12 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
       }
 
       // Transpose to column-major for Metal and copy
-      vtkTypeFloat32* m = &transforms[idx * 16];
+      vtkTypeFloat32* m = &perSourceTransforms[si][idx * 16];
       for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++)
           m[i * 4 + j] = static_cast<vtkTypeFloat32>(tf[j * 4 + i]);
 
-      vtkTypeFloat32* nm = &normTransforms[idx * 9];
+      vtkTypeFloat32* nm = &perSourceNormTransforms[si][idx * 9];
       for (int i = 0; i < 3; i++)
         for (int j = 0; j < 3; j++)
           nm[i * 3 + j] = static_cast<vtkTypeFloat32>(ntf[i * 3 + j]);
@@ -792,45 +946,61 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
       {
         selId = static_cast<vtkIdType>(*selArr->GetTuple(pid));
       }
-      pickIds[idx] = selId;
-      ++idx;
+      perSourcePickIds[si][idx] = selId;
     }
 
-    assert(idx == instCount);
-
-    // Upload to GPU
-    I->InstTransformBuffer = [device newBufferWithBytes:transforms.data()
-                                                length:transforms.size() * sizeof(vtkTypeFloat32)
-                                               options:MTLResourceStorageModeShared];
-    // Metal's float3x3 in a buffer has 16-byte-aligned columns (48-byte stride),
-    // so scatter the row-major 9-value normal transform into column-major with
-    // the 3 float3 columns placed at 16-byte boundaries.
-    std::vector<vtkTypeFloat32> paddedNormals(instCount * 12, 0.f);
-    for (vtkIdType i = 0; i < instCount; ++i)
+    // Upload per-source instance buffers to the GPU
+    for (vtkIdType si = 0; si < numSources; ++si)
     {
-      const vtkTypeFloat32* src = &normTransforms[i * 9];
-      vtkTypeFloat32* dst = &paddedNormals[i * 12];
-      dst[0] = src[0]; dst[1] = src[3]; dst[2] = src[6];
-      dst[4] = src[1]; dst[5] = src[4]; dst[6] = src[7];
-      dst[8] = src[2]; dst[9] = src[5]; dst[10] = src[8];
-    }
-    I->InstNormalTransformBuffer = [device newBufferWithBytes:paddedNormals.data()
-                                                      length:paddedNormals.size() * sizeof(vtkTypeFloat32)
-                                                     options:MTLResourceStorageModeShared];
-    I->InstColorBuffer = [device newBufferWithBytes:colors.data()
-                                            length:colors.size() * sizeof(vtkTypeFloat32)
-                                           options:MTLResourceStorageModeShared];
-
-    std::vector<uint32_t> pick32(instCount);
-    for (uint32_t i = 0; i < static_cast<uint32_t>(instCount); ++i)
-      pick32[i] = static_cast<uint32_t>(pickIds[i]);
-    I->InstPickIdBuffer = [device newBufferWithBytes:pick32.data()
-                                             length:pick32.size() * sizeof(uint32_t)
+      const vtkIdType n = perSourceCount[si];
+      if (n == 0)
+        continue;
+      auto& inst = I->Instances[si];
+      inst = std::make_unique<vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals::SourceInstances>();
+      inst->TransformBuffer = [device newBufferWithBytes:perSourceTransforms[si].data()
+                                                 length:perSourceTransforms[si].size() * sizeof(vtkTypeFloat32)
+                                                options:MTLResourceStorageModeShared];
+      // Metal's float3x3 in a buffer has 16-byte-aligned columns (48-byte stride),
+      // so scatter the row-major 9-value normal transform into column-major with
+      // the 3 float3 columns placed at 16-byte boundaries.
+      std::vector<vtkTypeFloat32> paddedNormals(n * 12, 0.f);
+      for (vtkIdType i = 0; i < n; ++i)
+      {
+        const vtkTypeFloat32* src = &perSourceNormTransforms[si][i * 9];
+        vtkTypeFloat32* dst = &paddedNormals[i * 12];
+        dst[0] = src[0]; dst[1] = src[3]; dst[2] = src[6];
+        dst[4] = src[1]; dst[5] = src[4]; dst[6] = src[7];
+        dst[8] = src[2]; dst[9] = src[5]; dst[10] = src[8];
+      }
+      inst->NormalTransformBuffer = [device newBufferWithBytes:paddedNormals.data()
+                                                       length:paddedNormals.size() * sizeof(vtkTypeFloat32)
+                                                      options:MTLResourceStorageModeShared];
+      inst->ColorBuffer = [device newBufferWithBytes:perSourceColors[si].data()
+                                             length:perSourceColors[si].size() * sizeof(vtkTypeFloat32)
                                             options:MTLResourceStorageModeShared];
-    I->NumInstances = static_cast<uint32_t>(instCount);
+
+      std::vector<uint32_t> pick32(n);
+      for (uint32_t i = 0; i < static_cast<uint32_t>(n); ++i)
+        pick32[i] = static_cast<uint32_t>(perSourcePickIds[si][i]);
+      inst->PickIdBuffer = [device newBufferWithBytes:pick32.data()
+                                              length:pick32.size() * sizeof(uint32_t)
+                                             options:MTLResourceStorageModeShared];
+      inst->NumInstances = static_cast<uint32_t>(n);
+    }
   }
 
-  if (I->NumInstances == 0)
+  // Quick check: does any source have drawable geometry and instances?
+  bool anyDrawable = false;
+  for (vtkIdType si = 0; si < numSources; ++si)
+  {
+    if (I->Sources[si] && I->Sources[si]->VertexCount > 0 && I->Instances[si] &&
+      I->Instances[si]->NumInstances > 0)
+    {
+      anyDrawable = true;
+      break;
+    }
+  }
+  if (!anyDrawable)
   {
     return;
   }
@@ -857,6 +1027,14 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     }
     memcpy([I->SceneBuffer contents], cam->GetCachedSceneTransforms(),
            vtkMetalCamera::GetSceneTransformsSize());
+    {
+      // SceneUniforms.flags lives at float offset 64 (see SceneUniforms in
+      // MetalShaders.metal); clear the glyph-has-normals bit here (the camera
+      // never sets it) and OR it in per-draw before each source is rendered.
+      float* s = static_cast<float*>([I->SceneBuffer contents]);
+      unsigned flags = (unsigned)s[64];
+      s[64] = (float)(flags & ~VTK_METAL_SCENE_FLAG_GLYPH_HAS_NORMALS);
+    }
   }
 
   // Material (40 floats: front material + backface material, matching the
@@ -1032,19 +1210,27 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     [enc setCullMode:MTLCullModeNone];
 
   // Helper lambda to bind all buffers and draw
-  auto bindAndDraw = [&](id<MTLRenderPipelineState> pipeline,
-                          MTLPrimitiveType primType,
-                          vtkIdType vertCount)
+  auto bindAndDraw =
+    [&](id<MTLRenderPipelineState> pipeline, MTLPrimitiveType primType, vtkIdType vertCount,
+      const vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals::SourceGeometry& g,
+      const vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals::SourceInstances& inst)
   {
-    if (!pipeline)
+    if (!pipeline || g.VertexCount == 0 || inst.NumInstances == 0)
       return;
+    // Per-source scene flag: signal the glyph fragment whether this source
+    // carries point normals so it can skip the derivative-based fallback.
+    float* sc = static_cast<float*>([I->SceneBuffer contents]);
+    unsigned flags = (unsigned)sc[64];
+    sc[64] = (float)((flags & ~VTK_METAL_SCENE_FLAG_GLYPH_HAS_NORMALS) |
+      (g.HasNormals ? VTK_METAL_SCENE_FLAG_GLYPH_HAS_NORMALS : 0));
+
     [enc setRenderPipelineState:pipeline];
-    [enc setVertexBuffer:I->SrcPositionBuffer offset:0 atIndex:kGlyphSrcPosition];
-    [enc setVertexBuffer:I->SrcNormalBuffer offset:0 atIndex:kGlyphSrcNormal];
-    [enc setVertexBuffer:I->InstTransformBuffer offset:0 atIndex:kGlyphTransform];
-    [enc setVertexBuffer:I->InstNormalTransformBuffer offset:0 atIndex:kGlyphNormalTransform];
-    [enc setVertexBuffer:I->InstColorBuffer offset:0 atIndex:kGlyphInstanceColor];
-    [enc setVertexBuffer:I->InstPickIdBuffer offset:0 atIndex:kGlyphPickId];
+    [enc setVertexBuffer:g.PositionBuffer offset:0 atIndex:kGlyphSrcPosition];
+    [enc setVertexBuffer:g.NormalBuffer offset:0 atIndex:kGlyphSrcNormal];
+    [enc setVertexBuffer:inst.TransformBuffer offset:0 atIndex:kGlyphTransform];
+    [enc setVertexBuffer:inst.NormalTransformBuffer offset:0 atIndex:kGlyphNormalTransform];
+    [enc setVertexBuffer:inst.ColorBuffer offset:0 atIndex:kGlyphInstanceColor];
+    [enc setVertexBuffer:inst.PickIdBuffer offset:0 atIndex:kGlyphPickId];
     [enc setVertexBuffer:I->SceneBuffer offset:0 atIndex:kGlyphScene];
     [enc setVertexBuffer:I->ClipPlaneBuffer offset:0 atIndex:kGlyphClipPlane];
     [enc setVertexBuffer:I->PropIdBuffer offset:0 atIndex:kGlyphPropId];
@@ -1058,23 +1244,27 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     [enc drawPrimitives:primType
             vertexStart:0
           vertexCount:vertCount
-        instanceCount:I->NumInstances];
+        instanceCount:inst.NumInstances];
   };
 
-  // Draw
-  if (I->SrcPositionBuffer && I->SrcVertexCount > 0)
+  // Draw one instanced pass per source
+  for (vtkIdType si = 0; si < numSources; ++si)
   {
-    if (I->HasTriangles)
+    const auto& g = I->Sources[si];
+    const auto& inst = I->Instances[si];
+    if (!g || g->VertexCount == 0 || !inst || inst->NumInstances == 0)
+      continue;
+    if (g->HasTriangles)
     {
-      bindAndDraw(I->TriPipeline, MTLPrimitiveTypeTriangle, I->TriVertexCount);
+      bindAndDraw(I->TriPipeline, MTLPrimitiveTypeTriangle, g->TriVertexCount, *g, *inst);
     }
-    if (I->HasLines)
+    if (g->HasLines)
     {
-      bindAndDraw(I->LinePipeline, MTLPrimitiveTypeLine, I->LineVertexCount);
+      bindAndDraw(I->LinePipeline, MTLPrimitiveTypeLine, g->LineVertexCount, *g, *inst);
     }
-    if (I->HasPoints)
+    if (g->HasPoints)
     {
-      bindAndDraw(I->PtPipeline, MTLPrimitiveTypePoint, I->PtVertexCount);
+      bindAndDraw(I->PtPipeline, MTLPrimitiveTypePoint, g->PtVertexCount, *g, *inst);
     }
   }
 }
