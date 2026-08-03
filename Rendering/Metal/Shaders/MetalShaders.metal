@@ -1545,6 +1545,17 @@ fragment float4 fragment_2d_image_main(Image2DVertexOut in [[stage_in]],
   return imageTexture.sample(sNearest, in.texCoord);
 }
 
+// 2D textured text fragment shader (used by vtkMetalPolyDataMapper2D for
+// vtkTextActor / vtkTextMapper). Multiplies the sampled texture color by the
+// actor's color/opacity, matching vtkPolyData2DFS.glsl's
+// "gl_FragData[0] = gl_FragData[0] * texture2D(texture1, ...)".
+fragment float4 fragment_2d_text_main(Image2DVertexOut in [[stage_in]],
+                                      constant Mapper2DState& state [[buffer(0)]],
+                                      texture2d<float> imageTexture [[texture(0)]]) {
+  float4 texColor = imageTexture.sample(sNearest, in.texCoord);
+  return texColor * state.color;
+}
+
 // ---------------------------------------------------------------------------
 // Image Slice Mapper selection shaders (cell/point-ID picking).
 // Encodes the pixel index (computed from the texture coordinates and the image

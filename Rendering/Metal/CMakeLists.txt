@@ -16,6 +16,10 @@ set(classes
   vtkMetalHardwareSelector
   vtkMetalGlyph3DMapper
   vtkMetalGPUVolumeRayCastMapper
+  vtkMetalTextActor
+  vtkMetalTextActor3D
+  vtkMetalTextMapper
+  vtkMetalBillboardTextActor3D
   vtkMetalImageSliceMapper)
 
 set(headers)
@@ -90,6 +94,18 @@ vtk_object_factory_declare(
 vtk_object_factory_declare(
   BASE vtkGPUVolumeRayCastMapper
   OVERRIDE vtkMetalGPUVolumeRayCastMapper)
+vtk_object_factory_declare(
+  BASE vtkTextActor
+  OVERRIDE vtkMetalTextActor)
+vtk_object_factory_declare(
+  BASE vtkTextActor3D
+  OVERRIDE vtkMetalTextActor3D)
+vtk_object_factory_declare(
+  BASE vtkTextMapper
+  OVERRIDE vtkMetalTextMapper)
+vtk_object_factory_declare(
+  BASE vtkBillboardTextActor3D
+  OVERRIDE vtkMetalBillboardTextActor3D)
 vtk_object_factory_declare(
   BASE vtkImageSliceMapper
   OVERRIDE vtkMetalImageSliceMapper)
