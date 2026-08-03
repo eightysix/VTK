@@ -233,10 +233,24 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)renWin->GetMetalDevice();
 
-  // Get viewport dimensions
-  int* size = renderer->GetSize();
-  int width = size[0];
-  int height = size[1];
+  // Get the tile-aware viewport rectangle. GetTiledSizeAndOrigin returns the
+  // intersection of the renderer's normalized viewport with the window's tile
+  // viewport (vtkWindowToImageFilter), in physical drawable pixels with a
+  // lower-left (y-up) origin (matches vtkDepthPeelingPass.cxx). Metal's
+  // framebuffer origin is top-left, so the y coordinate is flipped against the
+  // actual drawable height. The drawable is always the physical window size
+  // even while tiling (renWin->GetSize() would return the virtual tiled size),
+  // so the peel textures are sized to the drawable and the composite pass reads
+  // them at the tile rect (absolute render-target pixels).
+  int tileOrigin[2], tileSize[2];
+  renderer->GetTiledSizeAndOrigin(&tileSize[0], &tileSize[1], &tileOrigin[0], &tileOrigin[1]);
+  const double viewportX = tileOrigin[0];
+  const double viewportY =
+    static_cast<double>(drawableTexture.height) - (tileOrigin[1] + tileSize[1]);
+  const double viewportW = tileSize[0];
+  const double viewportH = tileSize[1];
+  const int width = static_cast<int>(drawableTexture.width);
+  const int height = static_cast<int>(drawableTexture.height);
 
   if (width <= 0 || height <= 0)
   {
@@ -369,10 +383,10 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
     renWin->Encoder = (__bridge void*)encoder;
 
     MTLViewport metalViewport;
-    metalViewport.originX = 0;
-    metalViewport.originY = 0;
-    metalViewport.width = width;
-    metalViewport.height = height;
+    metalViewport.originX = viewportX;
+    metalViewport.originY = viewportY;
+    metalViewport.width = viewportW;
+    metalViewport.height = viewportH;
     metalViewport.znear = 0.0;
     metalViewport.zfar = 1.0;
     [encoder setViewport:metalViewport];
@@ -472,8 +486,8 @@ int vtkMetalDepthPeeler::RenderTranslucentGeometry(
                                 offset:static_cast<NSUInteger>(peel) * 8];
 
       MTLViewport vp;
-      vp.originX = 0; vp.originY = 0;
-      vp.width = width; vp.height = height;
+      vp.originX = viewportX; vp.originY = viewportY;
+      vp.width = viewportW; vp.height = viewportH;
       vp.znear = 0.0; vp.zfar = 1.0;
       [encoder setViewport:vp];
 

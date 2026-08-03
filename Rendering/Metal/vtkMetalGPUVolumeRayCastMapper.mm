@@ -5145,14 +5145,20 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   const float imageSampleDist = this->ImageSampleDistance;
   const bool useImageSampling = (imageSampleDist != 1.0f);
 
-  // Viewport size for depth texture UV computation in the shader
-  int* winSize = ren->GetSize();
-  int renderWidth = winSize[0];
-  int renderHeight = winSize[1];
+  // Viewport size for depth texture UV computation in the shader. This must be
+  // the tile-cropped renderer rect (GetTiledSizeAndOrigin, matching
+  // vtkOpenGLGPUVolumeRayCastMapper.cxx) — the renderer's encoder renders with
+  // that rect as the viewport, and the shader divides in.position.xy by it.
+  // ren->GetSize() would return the virtual tiled size (vtkWindowToImageFilter),
+  // which is larger than the physical drawable and scales the UVs wrong.
+  int tileOrigin[2], tileSize[2];
+  ren->GetTiledSizeAndOrigin(&tileSize[0], &tileSize[1], &tileOrigin[0], &tileOrigin[1]);
+  int renderWidth = tileSize[0];
+  int renderHeight = tileSize[1];
   if (useImageSampling)
   {
-    renderWidth = std::max(1, static_cast<int>(winSize[0] / imageSampleDist));
-    renderHeight = std::max(1, static_cast<int>(winSize[1] / imageSampleDist));
+    renderWidth = std::max(1, static_cast<int>(tileSize[0] / imageSampleDist));
+    renderHeight = std::max(1, static_cast<int>(tileSize[1] / imageSampleDist));
   }
   uniforms.ViewportSize[0] = static_cast<float>(renderWidth);
   uniforms.ViewportSize[1] = static_cast<float>(renderHeight);
@@ -5183,8 +5189,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     // Generic fallback: compute VP from vtkCamera matrices.
     // Metal clip-space uses Z in [0,1], so nearz=0, farz=1.
     vtkCamera* cam = ren->GetActiveCamera();
-    int* size = ren->GetSize();
-    double aspect = (size[1] > 0) ? static_cast<double>(size[0]) / size[1] : 1.0;
+    double aspect = (tileSize[1] > 0) ? static_cast<double>(tileSize[0]) / tileSize[1] : 1.0;
     vtkMatrix4x4* V4 = cam->GetViewTransformMatrix();
     vtkMatrix4x4* P4 = cam->GetProjectionTransformMatrix(aspect, 0.0, 1.0);
     // Compute P*V column-major (Metal convention: column vectors)
@@ -5244,9 +5249,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   {
     // Image-space downsampling: render to offscreen texture at reduced resolution,
     // then blit to screen. This cuts fragment count by up to 4x at 0.5x scale.
-    int* winSize = ren->GetSize();
-    int fboWidth = std::max(1, static_cast<int>(winSize[0] / imageSampleDist));
-    int fboHeight = std::max(1, static_cast<int>(winSize[1] / imageSampleDist));
+    int fboWidth = std::max(1, static_cast<int>(tileSize[0] / imageSampleDist));
+    int fboHeight = std::max(1, static_cast<int>(tileSize[1] / imageSampleDist));
 
     if (!this->EnsureImageSampleResources(mtlDevice, fboWidth, fboHeight))
     {

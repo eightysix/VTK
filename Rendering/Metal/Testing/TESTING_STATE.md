@@ -17,7 +17,7 @@ Two test surfaces exist:
    registers the same ~175 tests once per backend and was wired up for Metal
      through    object-factory overrides (`--vtk-factory-prefer
        RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
-        crash)**. Current working-tree status: **134 pass / 38 fail (3 crash)** —
+        crash)**. Current working-tree status: **139 pass / 33 fail (3 crash)** —
      the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
      factory override, the 8 composite-mapper `BuildGeometryBuffers` crashes by
      a `mappedColors != nullptr` guard (they now render), `TestOpacityMSAA` by
@@ -332,6 +332,76 @@ pre-existing thick-line tube-shading fidelity gap, not the lighting flag). The
 3 aborts are unchanged (`TestLabeledContourMapper`,
 `TestLabeledContourMapperNoLabels`, `TestLabeledContourMapperWithActorMatrix`).
 The regression check against the documented passing cluster reports none.
+
+Run after the tiled-viewport/tile-aware-gradient fix (this run, 2026-08-03): 139 Passed /
+33 Failed / 3 aborted out of 175 (analyzed with `analyze_metal_ctest_log.py` from a single
+`ctest -R "RenderingCoreCxx-Metal" -j 8` run; failures exported with
+`export_image_compare.sh`) — the three gradient-background tests now pass for the first
+time (`TestGradientBackground` at 0.0023, `TestGradientBackgroundWithTiledViewport` at
+0.0012, `TestGradientBackgroundWithTiledViewports` at 0.0014; were mid-bucket 0.3449
+and gross-bucket 0.5063/0.5856 fails), `TestTilingCxx` improved from gross 0.6159 to mid
+0.2054, and `TestGlyph3DMapper` (mid 0.1082) and `RenderNonFinite` (near-miss 0.0870)
+also left the failure set this run, both stable across three re-runs; see the
+tiled-viewport/gradient-background section below. The +5 pass delta over the previous
+run is exactly those five tests; the 3 aborts are unchanged (`TestLabeledContourMapper`,
+`TestLabeledContourMapperNoLabels`, `TestLabeledContourMapperWithActorMatrix`).
+The regression check against the documented passing cluster reports none.
+
+### The tiled-viewport and tile-aware gradient-background cluster is fixed
+
+`TestGradientBackground` and the tiled pair `TestGradientBackgroundWithTiledViewport`/
+`TestGradientBackgroundWithTiledViewports` (renderers whose fractional viewports tile a
+larger virtual window while `vtkWindowToImageFilter` drives physical tiles) failed image
+comparison at mid 0.3449 / gross 0.5063 / gross 0.5856: the gradient was drawn with
+full-window UVs that repeated per tile instead of spanning the renderer's viewport, and
+the Metal viewports were computed from the untiled renderer size with no tile origin.
+The Metal viewport sites in `vtkMetalRenderer.mm` (opaque, translucent, volume,
+volume-framebuffer blit, overlay) now derive `viewportX/Y/W/H` from
+`vtkViewport::GetTiledSizeAndOrigin` and flip Y against the physical drawable height
+(Metal top-origin vs VTK bottom-left), matching GL's `vtkOpenGLCamera::Render`/
+`vtkOpenGLRenderer::Clear` tile handling. The gradient background state now carries the
+physical viewport rect plus the renderer and tile viewports (normalized), and
+`fragment_gradient_background` maps the fragment position through tileViewport→
+rendererViewport so the quad spans the renderer's whole virtual viewport coherently under
+tiling instead of repeating per tile (tcoord = fragment pos normalized across the
+renderer's viewport, matching GL). `vtkMetalCamera::Render` computes its aspect and
+cached `Viewport` from `GetTiledSizeAndOrigin` + the window's actual physical size. All
+three tests now pass (TIGHT_VALID ~1e-03), `TestTilingCxx` improved from gross
+0.6159 to mid 0.2054 on the same viewport-rect corrections, and `TestGlyph3DMapper` (mid
+0.1082) + `RenderNonFinite` (near-miss 0.0870) also left the failure set this run (stable
+across re-runs; see the run paragraph above).
+
+### The sibling translucent/volume passes are tile-aware (follow-up, same run)
+
+The tiled-viewport fix above covered the renderer's own viewport sites, but the
+three sibling passes still derived their rects from the virtual window size
+(`ren->GetSize()` / `renderer->GetSize()`, which return the *virtual* tiled
+size via `vtkWindow::GetSize()`) or from fractional-viewport math against it, so
+under `vtkWindowToImageFilter` tiling their viewports/UVs were 2x too large and
+their textures wrong-sized. All three now use
+`vtkViewport::GetTiledSizeAndOrigin` exactly like their OpenGL counterparts:
+
+- `vtkMetalOrderIndependentTranslucentPass.mm` (matches
+  `vtkOrderIndependentTranslucentPass.cxx:198`): the accumulate/reveal textures
+  are sized to the physical drawable (`drawableTexture`), not
+  `renderer->GetSize()`, and the accumulate + resolve viewports are the tile
+  rect (Y flipped against the drawable height). The resolve shader reads
+  `in.position.xy` at absolute render-target pixels, so drawable-sized textures
+  + tile-rect viewport keep the accumulate and resolve regions aligned.
+- `vtkMetalDepthPeeler.mm` (matches `vtkDepthPeelingPass.cxx:358`): the six
+  peel textures are sized to the physical drawable and the init, peel,
+  back-blend, and composite viewports are the tile rect.
+- `vtkMetalGPUVolumeRayCastMapper.mm` (matches
+  `vtkOpenGLGPUVolumeRayCastMapper.cxx:1835,3215`): the `ViewportSize` uniform
+  (GL's `in_inverseWindowSize` = 1/tile size, used for the depth-texture UV and
+  ray reconstruction), the generic-aspect fallback, and the image-sample FBO
+  size all derive from the tile size instead of `ren->GetSize()`.
+
+The image-sample blit path in `vtkMetalRenderer.mm` already used the tile rect
+(the committed fix); the volume offscreen render + blit are now consistent with
+it. No metric changes: the suite re-ran at the same 139/33/3 with identical
+bucket membership (6 near-miss / 21 mid / 2 gross) and no regression vs the
+documented passing cluster.
 
 ### The point-rendering cluster is fixed
 
@@ -688,16 +758,16 @@ failures.
 
 ### Image-compare failures
 
-Current run (2026-08-03, overlay-depth/texture run): 42 failed = 35 image-compare
+Current run (2026-08-03, tiled-viewport/gradient run): 36 failed = 29 image-compare
 (TIGHT_VALID >= 0.05) + 1 below-threshold pick-check + 3 non-image + 3 aborts.
 Buckets by
 max `vtkTesting` TIGHT_VALID error per test (threshold 0.05):
 
 | Bucket | Range | Count | Examples |
 |--------|-------|-------|----------|
-| near-miss | 0.05 – 0.1 | 6 | `TestActorLightingFlag` 0.0513, `TestPolyDataMapper2D` 0.0664, `TestEdgeFlags` 0.0681, `TestLineRenderingTranslucent` 0.0790, `TestGlyph3DMapperPicking` 0.0800, `RenderNonFinite` 0.0870 |
-| mid | 0.1 – 0.5 | 24 | `TestGlyph3DMapper` 0.1082, `TestMixedGeometryCellScalars` 0.1373, `TestCompositePolyDataMapperSpheres` 0.1499, `TestPolyDataMapperClipPlanes` 0.1526, `TestTransformCoordinateUseDouble` 0.1635, `TestCompositePolyDataMapperPicking` 0.1712, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.2241, `TestCoincident` 0.2343, `TestRenderLinesAsTubesOrthoCamera` 0.2292, `TestRenderLinesAsTubes` 0.2292, `TestStereoEyeSeparation` 0.2584, `TestCompositePolyDataMapperPartialFieldData` 0.2622, `TestPolyDataMapperNormals` 0.2698, `TestPolyDataMapper2DPointScalarColorMapping` 0.2861, `TestCompositePolyDataMapperVertices` 0.2891, `TestCompositePolyDataMapperCustomShader` 0.2897, `TestGlyph3DMapperBackfaceColor` 0.2914, `TestPolyDataMapper2DCellScalarColorMapping` 0.2943, `TestResetCameraScreenSpace` 0.3438, `TestGradientBackground` 0.3449, `TestCompositePolyDataMapperCameraShiftScale` 0.3601, `TestResizingWindowToImageFilter` 0.4130, `TestGlyph3DMapperPointSize` 0.4596, `TestColorByStringArrayDefaultLookupTable2D` 0.4821 |
-| gross | >= 0.5 | 5 | `TestGradientBackgroundWithTiledViewport` 0.5063, `TestGradientBackgroundWithTiledViewports` 0.5856, `TestOffAxisStereo` 0.5921, `TestTilingCxx` 0.6159, `TestSplitViewportStereoHorizontal` 0.6816 |
+| near-miss | 0.05 – 0.1 | 6 | `TestRenderLinesAsTubesOrthoCamera` 0.0535, `TestRenderLinesAsTubes` 0.0535, `TestPolyDataMapper2D` 0.0664, `TestEdgeFlags` 0.0681, `TestLineRenderingTranslucent` 0.0790, `TestGlyph3DMapperPicking` 0.0800 |
+| mid | 0.1 – 0.5 | 21 | `TestMixedGeometryCellScalars` 0.1373, `TestCompositePolyDataMapperSpheres` 0.1499, `TestPolyDataMapperClipPlanes` 0.1526, `TestTransformCoordinateUseDouble` 0.1635, `TestCompositePolyDataMapperPicking` 0.1712, `TestTilingCxx` 0.2054, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.2241, `TestCoincident` 0.2343, `TestStereoEyeSeparation` 0.2584, `TestCompositePolyDataMapperPartialFieldData` 0.2643, `TestGlyph3DMapperBackfaceColor` 0.2657, `TestPolyDataMapperNormals` 0.2698, `TestPolyDataMapper2DPointScalarColorMapping` 0.2861, `TestCompositePolyDataMapperVertices` 0.2891, `TestCompositePolyDataMapperCustomShader` 0.2897, `TestPolyDataMapper2DCellScalarColorMapping` 0.2943, `TestResetCameraScreenSpace` 0.3438, `TestCompositePolyDataMapperCameraShiftScale` 0.3601, `TestResizingWindowToImageFilter` 0.4130, `TestGlyph3DMapperPointSize` 0.4599, `TestColorByStringArrayDefaultLookupTable2D` 0.4821 |
+| gross | >= 0.5 | 2 | `TestOffAxisStereo` 0.5921, `TestSplitViewportStereoHorizontal` 0.6816 |
 
 (`TestNActors{OneMapper,NMappersOneInput}` left the mid bucket via the
 per-actor edge-color fix above (passing at ~1.2e-05), and
@@ -732,7 +802,16 @@ time any of the three have passed.) This run the near-miss bucket dropped from 6
 to 5: `TestActorLightingFlag` (0.0513, now passing at 9.53e-05) left via the
 surface lighting-flag fix above, and `TestRenderLinesAsTubes`/`OrthoCamera`
 improved from 0.2350/0.2349 to 0.2292/0.2292 (still mid) via the tube-light
-bake below — the pass count is unchanged.
+bake below — the pass count is unchanged.) This run the mid bucket dropped from 24
+to 21 and gross from 5 to 2: the three gradient tests `TestGradientBackground`
+(mid 0.3449), `TestGradientBackgroundWithTiledViewport` and
+`TestGradientBackgroundWithTiledViewports` (both gross) left via the
+tiled-viewport/gradient-background section below — the first time any have passed
+(now ~1e-03), `TestGlyph3DMapper` (mid 0.1082) and `RenderNonFinite` (near-miss
+0.0870) also left (stable across re-runs), `TestTilingCxx` moved gross→mid
+(0.6159→0.2054), and `TestRenderLinesAsTubes`/`OrthoCamera` moved mid→near-miss
+(0.2292→0.0535). The +5 pass delta is exactly the gradient trio plus
+`TestGlyph3DMapper` and `RenderNonFinite`.
 
 ### Crashes (3; all pre-existing classes, none from the texture or composite clusters)
 

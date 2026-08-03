@@ -418,7 +418,8 @@ inline void applySurfaceEdges(thread float3& N,
   // Window-space corner positions (y-up, matching GL window layout).
   float2 p[3] = { in.ePos0, in.ePos1, in.ePos2 };
   // Fragment window position flipped to the same y-up convention.
-  float2 fp = float2(in.position.x, scene.viewport.w - in.position.y);
+  float2 fp = float2(in.position.x - scene.viewport.x,
+                     scene.viewport.w - (in.position.y - scene.viewport.y));
 
   // GL GS: ccw = sign of the 2D cross of the two edges at corner 0.
   float ccw = sign((p[1].x - p[0].x) * (p[2].y - p[0].y) -
@@ -1756,7 +1757,20 @@ struct BackgroundGradientUniforms {
   int mode;                // VTK_GRADIENT_VERTICAL=0, HORIZONTAL=1, RADIAL_SIDE=2, RADIAL_CORNER=3
   int dither;              // add +/-0.5/255 noise, like GL DitherGradient
   float2 _pad;
-  float2 viewportSize;     // full window size (pixels)
+  // The gradient quad in GL spans the renderer's full (virtual) viewport and is
+  // clipped to the current tile, so the fragment's tcoord equals its position
+  // normalized across the RENDERER's viewport (not the tile). The tile rect in
+  // drawable pixels gives the tile-local position; rendererViewport is the
+  // renderer's normalized viewport; tileViewport is that viewport clipped to
+  // the window's tile viewport. Mapping tile-local -> tileViewport -> renderer
+  // reproduces the GL tcoord, which keeps the gradient coherent across the
+  // assembled image for vtkWindowToImageFilter tiling.
+  float4 viewportRect;     // (originX, originY, width, height) of the renderer's
+                           // tile-cropped viewport, in drawable pixels (Metal
+                           // top-left origin).
+  float4 rendererViewport; // renderer's normalized viewport (x0, y0, x1, y1)
+  float4 tileViewport;     // rendererViewport clipped to the window's tile
+                           // viewport, normalized (x0, y0, x1, y1)
 };
 
 struct GradientFragmentOutput {
@@ -1767,7 +1781,11 @@ struct GradientFragmentOutput {
 fragment GradientFragmentOutput fragment_gradient_background(
     FullscreenVertexOut in [[stage_in]],
     constant BackgroundGradientUniforms& u [[buffer(0)]]) {
-  float2 uv = float2(in.position.x / u.viewportSize.x, 1.0 - in.position.y / u.viewportSize.y);
+  float2 tileLocal = float2((in.position.x - u.viewportRect.x) / u.viewportRect.z,
+                            1.0 - (in.position.y - u.viewportRect.y) / u.viewportRect.w);
+  float2 viewportSize = u.rendererViewport.zw - u.rendererViewport.xy;
+  float2 uv = (tileLocal * (u.tileViewport.zw - u.tileViewport.xy) +
+               u.tileViewport.xy - u.rendererViewport.xy) / viewportSize;
   float value = 0.0;
   if (u.mode == 1) {
     value = uv.x;

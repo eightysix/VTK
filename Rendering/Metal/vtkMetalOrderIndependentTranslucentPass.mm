@@ -160,20 +160,24 @@ int vtkMetalOrderIndependentTranslucentPass::RenderTranslucentGeometry(
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)renWin->GetMetalDevice();
 
-  // Get viewport dimensions
-  int* size = renderer->GetSize();
-  int width = size[0];
-  int height = size[1];
-
-  // Renderer sub-rect inside the full-size textures (matches vtkMetalRenderer).
-  // The fractional viewport scales against the WINDOW size, not the renderer's
-  // own pixel size, or the sub-rect collapses for multi-renderer tiling.
-  int* winSize = renWin->GetSize();
-  const int winWidth = winSize[0];
-  const int winHeight = winSize[1];
-
-  // Renderer sub-rect inside the full-size textures (matches vtkMetalRenderer)
-  double* viewport = renderer->GetViewport();
+  // Get the tile-aware viewport rectangle. GetTiledSizeAndOrigin returns the
+  // intersection of the renderer's normalized viewport with the window's tile
+  // viewport (vtkWindowToImageFilter), in physical drawable pixels with a
+  // lower-left (y-up) origin (matches vtkOrderIndependentTranslucentPass.cxx).
+  // Metal's framebuffer origin is top-left, so the y coordinate is flipped
+  // against the actual drawable height. The drawable is always the physical
+  // window size even while tiling (renWin->GetSize() would return the virtual
+  // tiled size), so the accumulation textures are sized to the drawable and
+  // the resolve reads them at the tile rect (absolute render-target pixels).
+  int tileOrigin[2], tileSize[2];
+  renderer->GetTiledSizeAndOrigin(&tileSize[0], &tileSize[1], &tileOrigin[0], &tileOrigin[1]);
+  const double viewportX = tileOrigin[0];
+  const double viewportY =
+    static_cast<double>(drawableTexture.height) - (tileOrigin[1] + tileSize[1]);
+  const double viewportW = tileSize[0];
+  const double viewportH = tileSize[1];
+  const int width = static_cast<int>(drawableTexture.width);
+  const int height = static_cast<int>(drawableTexture.height);
 
   if (width <= 0 || height <= 0)
   {
@@ -243,10 +247,10 @@ int vtkMetalOrderIndependentTranslucentPass::RenderTranslucentGeometry(
     renWin->Encoder = (__bridge void*)encoder;
 
     MTLViewport metalViewport;
-    metalViewport.originX = viewport[0] * winWidth;
-    metalViewport.originY = (1.0 - viewport[3]) * winHeight;
-    metalViewport.width = (viewport[2] - viewport[0]) * winWidth;
-    metalViewport.height = (viewport[3] - viewport[1]) * winHeight;
+    metalViewport.originX = viewportX;
+    metalViewport.originY = viewportY;
+    metalViewport.width = viewportW;
+    metalViewport.height = viewportH;
     metalViewport.znear = 0.0;
     metalViewport.zfar = 1.0;
     [encoder setViewport:metalViewport];
@@ -275,10 +279,10 @@ int vtkMetalOrderIndependentTranslucentPass::RenderTranslucentGeometry(
     encoder.label = @"VTK Order Independent - Resolve";
 
     MTLViewport vp;
-    vp.originX = viewport[0] * winWidth;
-    vp.originY = (1.0 - viewport[3]) * winHeight;
-    vp.width = (viewport[2] - viewport[0]) * winWidth;
-    vp.height = (viewport[3] - viewport[1]) * winHeight;
+    vp.originX = viewportX;
+    vp.originY = viewportY;
+    vp.width = viewportW;
+    vp.height = viewportH;
     vp.znear = 0.0;
     vp.zfar = 1.0;
     [encoder setViewport:vp];

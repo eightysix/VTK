@@ -26,6 +26,7 @@
 #include "vtkVolume.h"
 #include "vtkVolumeCollection.h"
 
+#include <algorithm>
 #include <vector>
 
 #import <Metal/Metal.h>
@@ -231,14 +232,21 @@ void vtkMetalRenderer::DeviceRender()
     id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
     commandBuffer.label = @"VTK Metal Renderer";
 
-    // Get viewport dimensions
-    int* size = this->GetSize();
-    double* viewport = this->GetViewport();
-    // The Metal viewport is expressed in window (drawable) pixels; the
-    // renderer's fractional viewport must be scaled by the WINDOW size, not the
-    // renderer's own pixel size, or multi-renderer viewport tiling collapses
-    // (each renderer would draw into an overlapping sliver of the window).
-    int* winSize = renWin->GetSize();
+    // Get the viewport rectangle. GetTiledSizeAndOrigin returns the
+    // intersection of the renderer's normalized viewport with the window's
+    // tile viewport (vtkWindowToImageFilter), in physical drawable pixels with
+    // a lower-left (y-up) origin. Metal's framebuffer origin is top-left, so
+    // the y coordinate is flipped against the actual drawable height. The
+    // drawable is always the physical window size even while tiling, so use
+    // colorTarget.height (not renWin->GetSize(), which is the virtual tiled
+    // size) for the flip.
+    int tileOrigin[2], tileSize[2];
+    this->GetTiledSizeAndOrigin(&tileSize[0], &tileSize[1], &tileOrigin[0], &tileOrigin[1]);
+    const double viewportX = tileOrigin[0];
+    const double viewportY =
+      static_cast<double>(colorTarget.height) - (tileOrigin[1] + tileSize[1]);
+    const double viewportW = tileSize[0];
+    const double viewportH = tileSize[1];
 
     // Determine if MSAA is active
     const bool msaa = (renWin->GetEffectiveSampleCount() > 1);
@@ -348,10 +356,10 @@ void vtkMetalRenderer::DeviceRender()
 
       // Set viewport
       MTLViewport metalViewport;
-      metalViewport.originX = viewport[0] * winSize[0];
-      metalViewport.originY = (1.0 - viewport[3]) * winSize[1];
-      metalViewport.width = (viewport[2] - viewport[0]) * winSize[0];
-      metalViewport.height = (viewport[3] - viewport[1]) * winSize[1];
+      metalViewport.originX = viewportX;
+      metalViewport.originY = viewportY;
+      metalViewport.width = viewportW;
+      metalViewport.height = viewportH;
       metalViewport.znear = 0.0;
       metalViewport.zfar = 1.0;
       [encoder setViewport:metalViewport];
@@ -432,7 +440,7 @@ void vtkMetalRenderer::DeviceRender()
           if (!this->Internals->GradientStateBuffer)
           {
             this->Internals->GradientStateBuffer =
-              [device newBufferWithLength:sizeof(float) * 16
+              [device newBufferWithLength:sizeof(float) * 24
                                   options:MTLResourceStorageModeShared];
           }
           if (this->Internals->GradientStateBuffer)
@@ -470,8 +478,31 @@ void vtkMetalRenderer::DeviceRender()
             // the flat background is a plain clear, so no dither noise there.
             istate[1] = (this->GetGradientBackground() && this->GetDitherGradient()) ? 1 : 0;
             float* fstate = (float*)&state[12];
-            fstate[0] = static_cast<float>(size[0]);
-            fstate[1] = static_cast<float>(size[1]);
+            // viewportRect: the renderer's tile-cropped rect (originX, originY,
+            // width, height) in drawable pixels (Metal top-left origin).
+            fstate[0] = static_cast<float>(viewportX);
+            fstate[1] = static_cast<float>(viewportY);
+            fstate[2] = static_cast<float>(viewportW);
+            fstate[3] = static_cast<float>(viewportH);
+            // rendererViewport + tileViewport reproduce the GL gradient quad:
+            // the tcoord is the fragment's position normalized across the
+            // renderer's viewport, so tiled renders crop a coherent gradient
+            // instead of repeating it per tile.
+            double* vport = this->GetViewport();
+            double tvport[4];
+            renWin->GetTileViewport(tvport);
+            fstate[4] = static_cast<float>(vport[0]);
+            fstate[5] = static_cast<float>(vport[1]);
+            fstate[6] = static_cast<float>(vport[2]);
+            fstate[7] = static_cast<float>(vport[3]);
+            // tileViewport = rendererViewport clipped to the window's tile
+            // viewport, matching vtkViewport::NormalizedViewportToView. This is
+            // the tile's normalized rect in the window; GetTiledSizeAndOrigin
+            // returns tile-relative pixels, so do NOT derive it from that.
+            fstate[8] = static_cast<float>(std::max(vport[0], tvport[0]));
+            fstate[9] = static_cast<float>(std::max(vport[1], tvport[1]));
+            fstate[10] = static_cast<float>(std::min(vport[2], tvport[2]));
+            fstate[11] = static_cast<float>(std::min(vport[3], tvport[3]));
 
             [encoder setRenderPipelineState:gradientPipeline];
             [encoder setDepthStencilState:sReadOnlyDepthState];
@@ -811,10 +842,10 @@ void vtkMetalRenderer::DeviceRender()
       renWin->Encoder = (__bridge void*)encoder;
 
       MTLViewport metalViewport;
-      metalViewport.originX = viewport[0] * winSize[0];
-      metalViewport.originY = (1.0 - viewport[3]) * winSize[1];
-      metalViewport.width = (viewport[2] - viewport[0]) * winSize[0];
-      metalViewport.height = (viewport[3] - viewport[1]) * winSize[1];
+      metalViewport.originX = viewportX;
+      metalViewport.originY = viewportY;
+      metalViewport.width = viewportW;
+      metalViewport.height = viewportH;
       metalViewport.znear = 0.0;
       metalViewport.zfar = 1.0;
       [encoder setViewport:metalViewport];
@@ -926,10 +957,10 @@ void vtkMetalRenderer::DeviceRender()
       renWin->Encoder = (__bridge void*)encoder;
 
       MTLViewport metalViewport;
-      metalViewport.originX = viewport[0] * winSize[0];
-      metalViewport.originY = (1.0 - viewport[3]) * winSize[1];
-      metalViewport.width = (viewport[2] - viewport[0]) * winSize[0];
-      metalViewport.height = (viewport[3] - viewport[1]) * winSize[1];
+      metalViewport.originX = viewportX;
+      metalViewport.originY = viewportY;
+      metalViewport.width = viewportW;
+      metalViewport.height = viewportH;
       metalViewport.znear = 0.0;
       metalViewport.zfar = 1.0;
       [encoder setViewport:metalViewport];
@@ -1072,12 +1103,12 @@ void vtkMetalRenderer::DeviceRender()
               id<MTLTexture> offscreenTex =
                 (__bridge id<MTLTexture>)metalMapper->GetImageSampleColorTexture();
 
-              // Set viewport to full window
+              // Set viewport to the renderer's tile rect
               MTLViewport metalViewport;
-              metalViewport.originX = viewport[0] * winSize[0];
-              metalViewport.originY = (1.0 - viewport[3]) * winSize[1];
-              metalViewport.width = (viewport[2] - viewport[0]) * winSize[0];
-              metalViewport.height = (viewport[3] - viewport[1]) * winSize[1];
+              metalViewport.originX = viewportX;
+              metalViewport.originY = viewportY;
+              metalViewport.width = viewportW;
+              metalViewport.height = viewportH;
               metalViewport.znear = 0.0;
               metalViewport.zfar = 1.0;
               [blitEncoder setViewport:metalViewport];
@@ -1158,10 +1189,10 @@ void vtkMetalRenderer::DeviceRender()
       renWin->Encoder = (__bridge void*)encoder;
 
       MTLViewport metalViewport;
-      metalViewport.originX = viewport[0] * winSize[0];
-      metalViewport.originY = (1.0 - viewport[3]) * winSize[1];
-      metalViewport.width = (viewport[2] - viewport[0]) * winSize[0];
-      metalViewport.height = (viewport[3] - viewport[1]) * winSize[1];
+      metalViewport.originX = viewportX;
+      metalViewport.originY = viewportY;
+      metalViewport.width = viewportW;
+      metalViewport.height = viewportH;
       metalViewport.znear = 0.0;
       metalViewport.zfar = 1.0;
       [encoder setViewport:metalViewport];

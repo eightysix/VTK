@@ -7,6 +7,7 @@
 #include "vtkOverrideAttribute.h"
 #include "vtkRenderer.h"
 #include "vtkViewport.h"
+#include "vtkWindow.h"
 
 #import <Metal/Metal.h>
 
@@ -32,8 +33,13 @@ void vtkMetalCamera::Render(vtkRenderer* ren)
 {
   this->ComputeViewTransform();
 
-  int* size = ren->GetSize();
-  double aspect = (size[1] > 0) ? static_cast<double>(size[0]) / size[1] : 1.0;
+  // The projection aspect must match the current tile: the intersection of the
+  // renderer's normalized viewport with the window's tile viewport
+  // (vtkWindowToImageFilter) in physical pixels. Using ren->GetSize() here
+  // would pick up the virtual tiled size and distort the frustum per tile.
+  int usize, vsize, lowerLeft[2];
+  ren->GetTiledSizeAndOrigin(&usize, &vsize, &lowerLeft[0], &lowerLeft[1]);
+  double aspect = (vsize > 0) ? static_cast<double>(usize) / vsize : 1.0;
 
   vtkMatrix4x4* viewMatrix = this->GetViewTransformMatrix();
   // Metal maps clip-space Z to [0, 1] (not [-1, 1] like OpenGL).
@@ -89,11 +95,23 @@ void vtkMetalCamera::Render(vtkRenderer* ren)
         this->CachedSceneTransforms.NormalMatrix[i][j] = static_cast<float>(inv[i][j]);
   }
 
-  int* sz = ren->GetSize();
-  this->CachedSceneTransforms.Viewport[0] = 0;
-  this->CachedSceneTransforms.Viewport[1] = 0;
-  this->CachedSceneTransforms.Viewport[2] = static_cast<float>(sz[0]);
-  this->CachedSceneTransforms.Viewport[3] = static_cast<float>(sz[1]);
+  // The viewport field carries the renderer's tile-cropped rect in drawable
+  // pixels. x,y are the Metal viewport origin (y-down from the top of the
+  // drawable, so the y-up lower-left origin from GetTiledSizeAndOrigin is
+  // flipped against the actual drawable height), and z,w are the rect size.
+  // Shaders use z,w for viewport-relative positions (point sprites, edges) and
+  // x,y to convert fragment positions to that same space.
+  int physicalHeight = vsize;
+  if (ren->GetVTKWindow())
+  {
+    int* actualSize = ren->GetVTKWindow()->GetActualSize();
+    physicalHeight = actualSize[1];
+  }
+  this->CachedSceneTransforms.Viewport[0] = static_cast<float>(lowerLeft[0]);
+  this->CachedSceneTransforms.Viewport[1] =
+    static_cast<float>(physicalHeight - (lowerLeft[1] + vsize));
+  this->CachedSceneTransforms.Viewport[2] = static_cast<float>(usize);
+  this->CachedSceneTransforms.Viewport[3] = static_cast<float>(vsize);
 
   // Encode parallel projection into flags (bit 0), matching WebGPU's SceneTransforms
   this->CachedSceneTransforms.Flags = this->ParallelProjection ? 1u : 0u;
