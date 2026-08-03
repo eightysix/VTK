@@ -38,6 +38,7 @@ constant uint kSceneFlagHasSurfaceAlpha     = 1u << 10;
 constant uint kSceneFlagHasCellTexture      = 1u << 11;
 constant uint kSceneFlagUsePrimitiveCellIds = 1u << 12;
 constant uint kSceneFlagHasScalarLUT        = 1u << 13;
+constant uint kSceneFlagLinesUnlit           = 1u << 14;
 
 // Compile-time feature specialization for the surface shader (the "GL way"):
 // one shader source, specialized per feature set at pipeline creation via
@@ -611,7 +612,8 @@ inline FragmentColorAndIds evaluateSurfaceFragment(VertexOut in,
                              texture2d<float> lutTexture,
                              sampler lutSampler,
                              uint prim_id,
-                             bool frontFacing) {
+                             bool frontFacing,
+                             bool unlitLines) {
   if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
 
   // Match vtkOpenGLPolyDataMapper: backfaces flip the geometric normal (so
@@ -677,10 +679,24 @@ inline FragmentColorAndIds evaluateSurfaceFragment(VertexOut in,
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
-  computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, kLightCount, kLightType, lights, totalDiffuse, totalSpecular);
+  // 1px lines from inputs without point normals (or flat interpolation) render
+  // unlit: vtkOpenGLPolyDataMapper::GetNeedToRebuildShaders computes
+  //   needLighting = (isTrisOrStrips || (!isTrisOrStrips &&
+  //                    interpolation != VTK_FLAT && haveNormals))
+  // so for line primitives without normals GL goes to the NoLighting path and
+  // emits the flat vertex color. Mirror that: skip the Phong loop and output
+  // the ambient/diffuse material terms (which carry the vertex color) — GL's
+  // gl_FragData[0] = vec4(ambientColor + diffuseColor, opacity).
+  if (!unlitLines)
+  {
+    computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, kLightCount, kLightType, lights, totalDiffuse, totalSpecular);
+  }
 
   FragmentColorAndIds out;
-  out.color = float4(totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular, r.opacity);
+  float3 finalColor = unlitLines
+    ? (totalAmbient + m.diffuseColor.w * r.diffuse)
+    : (totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular);
+  out.color = float4(finalColor, r.opacity);
   out.emitIds = kEmitIds;
   if (kEmitIds)
   {
@@ -694,6 +710,34 @@ inline FragmentColorAndIds evaluateSurfaceFragment(VertexOut in,
     uint cellId = ((scene.flags & kSceneFlagUsePrimitiveCellIds) != 0u)
       ? cellPrimitiveIds[prim_id] : in.cellId;
     out.ids = uint4(cellId, in.propId, in.compositeIndex, 0u);
+  }
+  return out;
+}
+
+// Assemble the depth-writing fragment output (color + optional IDs + the
+// coincident-offset depth term, mirroring GL's ReplaceShaderCoincidentOffset).
+// Shared by fragment_main and fragment_main_line so the two never drift.
+inline FragmentOutput makeFragmentOutput(FragmentColorAndIds v, thread const VertexOut& in,
+                                         constant CoincidentOffsetUniforms& coinOffset) {
+  FragmentOutput out;
+  out.color = v.color;
+  if (v.emitIds)
+  {
+    out.ids = v.ids;
+  }
+  float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
+  out.depth = in.position.z + coinOffset.polygonFactor * cscale + coinOffset.polygonOffset / 65000.0;
+  return out;
+}
+
+// Early-Z variant of the output assembly (no depth output; the rasterizer
+// writes depth, keeping early-Z for opaque surface draws).
+inline FragmentOutputNoDepth makeFragmentOutputNoDepth(FragmentColorAndIds v) {
+  FragmentOutputNoDepth out;
+  out.color = v.color;
+  if (v.emitIds)
+  {
+    out.ids = v.ids;
   }
   return out;
 }
@@ -716,16 +760,10 @@ fragment FragmentOutputNoDepth fragment_main_nodepth(VertexOut in [[stage_in]],
                               sampler lutSampler [[sampler(1)]],
                               uint prim_id [[primitive_id]],
                               bool frontFacing [[front_facing]]) {
-  FragmentColorAndIds v = evaluateSurfaceFragment(in, material, lights, scene, edge,
-    clipPlanes, cellColorTex, cellPrimitiveIds, actorTexture, actorSampler,
-    lutTexture, lutSampler, prim_id, frontFacing);
-  FragmentOutputNoDepth out;
-  out.color = v.color;
-  if (v.emitIds)
-  {
-    out.ids = v.ids;
-  }
-  return out;
+  return makeFragmentOutputNoDepth(
+    evaluateSurfaceFragment(in, material, lights, scene, edge,
+      clipPlanes, cellColorTex, cellPrimitiveIds, actorTexture, actorSampler,
+      lutTexture, lutSampler, prim_id, frontFacing, false));
 }
 
 // Coincident-offset variant: writes depth from the fragment stage exactly like
@@ -746,18 +784,39 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
                               sampler lutSampler [[sampler(1)]],
                               uint prim_id [[primitive_id]],
                               bool frontFacing [[front_facing]]) {
-  FragmentColorAndIds v = evaluateSurfaceFragment(in, material, lights, scene, edge,
-    clipPlanes, cellColorTex, cellPrimitiveIds, actorTexture, actorSampler,
-    lutTexture, lutSampler, prim_id, frontFacing);
-  FragmentOutput out;
-  out.color = v.color;
-  if (v.emitIds)
-  {
-    out.ids = v.ids;
-  }
-  float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
-  out.depth = in.position.z + coinOffset.polygonFactor * cscale + coinOffset.polygonOffset / 65000.0;
-  return out;
+  return makeFragmentOutput(
+    evaluateSurfaceFragment(in, material, lights, scene, edge,
+      clipPlanes, cellColorTex, cellPrimitiveIds, actorTexture, actorSampler,
+      lutTexture, lutSampler, prim_id, frontFacing, false),
+    in, coinOffset);
+}
+
+// 1px line variant of fragment_main: honors the kSceneFlagLinesUnlit scene flag
+// so lines drawn from inputs without point normals (or flat interpolation)
+// render with the flat vertex color, matching vtkOpenGLPolyDataMapper's
+// NoLighting path for line primitives. Surface draws keep using fragment_main
+// (unlitLines = false), so a shared actor flag never affects triangle shading.
+fragment FragmentOutput fragment_main_line(VertexOut in [[stage_in]],
+                              constant MaterialUniforms& material [[buffer(0)]],
+                              constant LightUniforms& lights [[buffer(1)]],
+                              constant SceneUniforms& scene [[buffer(2)]],
+                              constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+                              constant EdgeUniforms& edge [[buffer(4)]],
+                              constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
+                              texture2d<float, access::read> cellColorTex [[texture(8)]],
+                              constant uint* cellPrimitiveIds [[buffer(7)]],
+                              texture2d<float> actorTexture [[texture(0)]],
+                              sampler actorSampler [[sampler(0)]],
+                              texture2d<float> lutTexture [[texture(9)]],
+                              sampler lutSampler [[sampler(1)]],
+                              uint prim_id [[primitive_id]],
+                              bool frontFacing [[front_facing]]) {
+  return makeFragmentOutput(
+    evaluateSurfaceFragment(in, material, lights, scene, edge,
+      clipPlanes, cellColorTex, cellPrimitiveIds, actorTexture, actorSampler,
+      lutTexture, lutSampler, prim_id, frontFacing,
+      (scene.flags & kSceneFlagLinesUnlit) != 0u),
+    in, coinOffset);
 }
 
 // OIT accumulate output: matches the shader-side premultiplication done by

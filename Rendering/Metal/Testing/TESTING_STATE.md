@@ -176,6 +176,17 @@ Run after the 2D-overlay-mapper fix: 83 Passed / 83 Failed / 9 aborted —
 was not computed and the mapper returned early, and a stray Y-flip in the WCVC
 orthographic matrix inverted the quad). The +1 delta over the previous run is
 exactly that test; the 9 aborts are unchanged.
+Run after the wireframe-lines fix (this run, 2026-08-03): 92 Passed / 80 Failed
+/ 3 aborted out of 175 (analyzed with `analyze_metal_ctest_log.py` from a single
+`ctest -R "RenderingCoreCxx-Metal" -j 8` run) — `TestWireframe` now passes via
+the unlit-1px-line path below (`fragment_main_line` + `kSceneFlagLinesUnlit`),
+which reproduces GL's NoLighting decision for line primitives without point
+normals (was a mid-bucket 0.239 image fail; now white wires). The near-miss and
+gross buckets are otherwise unchanged; the abort-count drop from 9 to 3 this run
+(`TestFollowerPicking`, `TestInteractorStyleImageProperty`,
+`TestTranslucentImageActor{AlphaBlending,DepthPeeling}`, `TestWindowToImageFilter`
+ran clean and `TestResizingWindowToImageFilter` became a plain image fail) is the
+documented run-to-run flakiness of the label/text/image abort class.
 
 ### The selection cluster is fixed
 
@@ -386,16 +397,17 @@ scalar-LUT tests: `TestCompositePolyDataMapperOverrideLUT`,
 
 ### Image-compare failures
 
-Current run (2026-08-03): 83 failed = 80 image-compare + 3 non-image. Buckets
-by max `vtkTesting` TIGHT_VALID error per test (threshold 0.05):
+Current run (2026-08-03): 80 failed = 76 image-compare (TIGHT_VALID >= 0.05) + 1
+below-threshold pick-check + 3 non-image. Buckets by max `vtkTesting` TIGHT_VALID
+error per test (threshold 0.05):
 
 | Bucket | Range | Count | Examples |
 |--------|-------|-------|----------|
 | near-miss | 0.05 – 0.1 | 11 | `TestActorLightingFlag` 0.051, `TestImageAndAnnotations` 0.061, `TestPolyDataMapper2D` 0.066, `TestEdgeFlags` 0.068, `TestQuadPointRep` 0.069, `TestMixedGeometry_3` 0.070, `TestVertexRendering` 0.072, `TestLineRenderingTranslucent` 0.079, `TestGlyph3DMapperPicking` 0.080, `RenderNonFinite` 0.087, `TestMixedGeometryCellScalars` 0.092 |
-| mid | 0.1 – 0.5 | 41 | `TestSurfacePlusEdges` 0.104, `TestCompositePolyDataMapperPicking` 0.176, `TestGlyph3DMapperIndexing` 0.155, `TestWireframe` 0.239, `TestPolyDataMapper2DPointScalarColorMapping` 0.286, `TestCoincident` 0.334, `TestCompositePolyDataMapperCustomShader` 0.290, `TestColorByStringArrayDefaultLookupTable2D` 0.482, `TestGradientBackground` 0.469 |
+| mid | 0.1 – 0.5 | 38 | `TestBackfaceCulling` 0.102, `TestSurfacePlusEdges` 0.104, `TestTexturedCylinder` 0.128, `TestPolyDataMapperClipPlanes` 0.144, `TestCompositePolyDataMapperSpheres` 0.150, `TestGlyph3DMapperIndexing` 0.155, `TestCompositePolyDataMapperPicking` 0.171, `TestPointRenderingRound_3` 0.193, `TestPolyDataMapper2DPointScalarColorMapping` 0.286, `TestCompositePolyDataMapperCustomShader` 0.290, `TestCoincident` 0.334, `TestRenderLinesAsTubes` 0.356, `TestColorByStringArrayDefaultLookupTable2D` 0.482 |
 | gross | >= 0.5 | 27 | `TestStereoBackground{Left,Right}` 0.887, `TestNViewports*` 0.85–0.88, `TestDirectScalarsToColors` 0.858, `TestMapVectorsToColors` 0.747, `TestImageMapper_1..4` 0.63–0.72, `TestActor2DTextures` 0.786, `TestTilingCxx` 0.616, `TestBareScalarsToColors` 0.584 |
 
-(79 of the 80 image-compare failures exceed the 0.05 threshold; the 80th,
+(76 of the 77 image-compare failures exceed the 0.05 threshold; the 77th,
 `TestCompositePolyDataMapperPickability`, has a below-threshold ImageError of
 0.015 but still fails its own pickability check.) The 3 non-image failures:
 `TestPointSelection`, `TestPointSelectionWithCellData` (selection returns
@@ -458,6 +470,40 @@ vertex shader has no `[[point_size]]` output (`TestPolyDataMapper2D` 0.066),
 2D scalar color mapping is ignored (`TestPolyDataMapper2D{Point,Cell}
 ScalarColorMapping` 0.286/0.294), and textured 2D actors render flat gray
 instead of their texture (`TestActor2DTextures` 0.786).
+
+### Wireframe / 1px lines render unlit like GL
+
+`TestWireframe` (a single cone at `SetRepresentationToWireframe`, line width 1)
+failed with pure-black wires (TIGHT_VALID 0.239): the Metal 1px-line pipeline
+always ran the full Phong fragment with the default headlight, and the cone's
+surface normals are near-silhouette so `df = max(N.z, eps)` collapsed to ~0.
+
+`vtkOpenGLPolyDataMapper::GetNeedToRebuildShaders` computes, for line
+primitives, `needLighting = (interpolation != VTK_FLAT && haveNormals)`; a
+vtkConeSource has no point normals, so GL takes the NoLighting path and emits
+the flat vertex color (`vtkGLSLModLight` case 0:
+`gl_FragData[0] = vec4(ambientColor + diffuseColor, opacity)`), i.e. white
+lines. The fix (`fragment_main_line` + `kSceneFlagLinesUnlit`, bit 14):
+
+- The mapper sets `kSceneFlagLinesUnlit` per actor in `RenderPiece` when
+  `!(prop->GetLighting() && prop->GetInterpolation() != VTK_FLAT && input-has-
+  point-normals)` — GL's exact line decision.
+- The `LinePipeline` now uses a dedicated `fragment_main_line` entry that passes
+  that flag into `evaluateSurfaceFragment`; when set it skips
+  `computePhongLighting` and outputs `ambientIntensity*ambientColor +
+  diffuseIntensity*diffuseColor` (the flat vertex/material color), matching GL.
+- Surface draws still use `fragment_main`/`fragment_main_nodepth` with
+  `unlitLines = false`, so an actor without normals keeps full triangle
+  lighting (GL lights tris regardless of normals), and thick-line/tube
+  pipelines (`shadeLineFragment`) are untouched — GL always lights those.
+
+`TestWireframe` now passes with white wires (1,360 white pixels vs the GL
+baseline's 1,388 — a 28-pixel anti-aliasing delta, well under threshold). The
+other line-image tests (`TestVertexRendering` 0.072, `TestLineRenderingTranslucent`
+0.079, `TestMixedGeometry_3` 0.070, `TestMixedGeometryCellScalars` 0.092,
+`TestSurfacePlusEdges` 0.104, `TestEdgeThickness` 0.278, `TestRenderLinesAsTubes`
+0.356) are unchanged — their errors are separate fidelity gaps (point rendering,
+thick-line/tube shading, edge overlay), not the 1px-line lighting path.
 
 ### Theme clusters in the 83 failures
 
@@ -625,7 +671,10 @@ after the scalar-texture LUT pipeline
 (82 Passed / 84 Failed / 9 aborted — `TestTextureInterpolateScalars` now passes,
 completing the four scalar-LUT tests), and then after the 2D-overlay-mapper fix
 (83 Passed / 83 Failed / 9 aborted — `TestActor2D` now passes via the
-`vtkMetalPolyDataMapper2D` `Update()` / no-Y-flip fix). The image-compare
-buckets above are from that latest run's `LastTest.log` (max TIGHT_VALID error
-per test). Re-running is reproducible except where a crash's signal stack
+`vtkMetalPolyDataMapper2D` `Update()` / no-Y-flip fix), and then after the
+wireframe-lines fix (92 Passed / 80 Failed / 3 aborted — `TestWireframe` now
+passes via the `fragment_main_line` / `kSceneFlagLinesUnlit` unlit-line path).
+The image-compare buckets above are from that latest run's `LastTest.log` (max
+TIGHT_VALID error per test), analyzed with `analyze_metal_ctest_log.py`.
+Re-running is reproducible except where a crash's signal stack
 ordering varies; the pass count fluctuates run to run.

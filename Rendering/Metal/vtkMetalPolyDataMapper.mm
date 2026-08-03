@@ -111,6 +111,11 @@ constexpr uint32_t VTK_METAL_SCENE_FLAG_USE_PRIMITIVE_CELL_IDS = 1u << 12;
 // fragment resolves its color from a LUT texture via the
 // interpolated scalar texture coordinate instead of per-vertex colors.
 constexpr uint32_t VTK_METAL_SCENE_FLAG_HAS_SCALAR_LUT      = 1u << 13;
+// 1px lines from inputs without point normals (or flat interpolation) render
+// with the flat vertex color: matches vtkOpenGLPolyDataMapper's NoLighting
+// decision for line primitives in GetNeedToRebuildShaders. Read only by the
+// dedicated fragment_main_line entry, so surface draws never see it.
+constexpr uint32_t VTK_METAL_SCENE_FLAG_LINES_UNLIT         = 1u << 14;
 
 constexpr uint32_t VTK_METAL_DYNAMIC_ACTOR_FLAG_MASK =
     VTK_METAL_SCENE_FLAG_VERTEX_VISIBILITY |
@@ -121,7 +126,8 @@ constexpr uint32_t VTK_METAL_DYNAMIC_ACTOR_FLAG_MASK =
     VTK_METAL_SCENE_FLAG_HAS_SURFACE_ALPHA |
     VTK_METAL_SCENE_FLAG_HAS_CELL_TEXTURE |
     VTK_METAL_SCENE_FLAG_USE_PRIMITIVE_CELL_IDS |
-    VTK_METAL_SCENE_FLAG_HAS_SCALAR_LUT;
+    VTK_METAL_SCENE_FLAG_HAS_SCALAR_LUT |
+    VTK_METAL_SCENE_FLAG_LINES_UNLIT;
 
 id<MTLBuffer> CreateZeroBuffer(id<MTLDevice> device, size_t bytes)
 {
@@ -2396,6 +2402,19 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       if (this->Internals->CellPrimitiveIdCount > 0)
       {
         actorFlags |= VTK_METAL_SCENE_FLAG_USE_PRIMITIVE_CELL_IDS;
+      }
+
+      // P2-2A: Match vtkOpenGLPolyDataMapper::GetNeedToRebuildShaders — line
+      // primitives are lit only when the input has point normals and the
+      // interpolation is not flat. Without normals GL takes the NoLighting path
+      // and emits the flat vertex color; fragment_main_line uses this flag to
+      // skip Phong lighting for the 1px line draw.
+      bool lineHaveNormals = (input->GetPointData()->GetNormals() != nullptr);
+      bool lineLighting =
+        prop->GetLighting() && prop->GetInterpolation() != VTK_FLAT && lineHaveNormals;
+      if (!lineLighting)
+      {
+        actorFlags |= VTK_METAL_SCENE_FLAG_LINES_UNLIT;
       }
 
       flags |= actorFlags;
@@ -5319,6 +5338,10 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
     [library newFunctionWithName:@"vertex_main" constantValues:fullConsts error:&error];
   id<MTLFunction> fragmentFunc =
     [library newFunctionWithName:@"fragment_main" constantValues:fullConsts error:&error];
+  // 1px line fragment: honors kSceneFlagLinesUnlit so lines from inputs without
+  // point normals render with the flat vertex color (GL NoLighting path).
+  id<MTLFunction> lineFragmentFunc =
+    [library newFunctionWithName:@"fragment_main_line" constantValues:fullConsts error:&error];
 
   // Single-pass surface edges: when the indexed entry is active the triangle
   // pipeline reads deduplicated arrays through the index buffer (no stage_in).
@@ -5327,11 +5350,12 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
     ? [library newFunctionWithName:@"vertex_main_indexed" constantValues:fullConsts error:&error]
     : vertexFunc;
 
-  if (!vertexFunc || !fragmentFunc || !triVertexFunc)
+  if (!vertexFunc || !fragmentFunc || !lineFragmentFunc || !triVertexFunc)
   {
     vtkErrorMacro(<< "Failed to find shader functions");
     [vertexFunc release];
     [fragmentFunc release];
+    [lineFragmentFunc release];
     if (triVertexFunc != vertexFunc)
     {
       [triVertexFunc release];
@@ -5399,6 +5423,7 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   pipelineDesc.vertexFunction = vertexFunc;
   pipelineDesc.vertexDescriptor = vertexDesc;
   pipelineDesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassLine;
+  pipelineDesc.fragmentFunction = lineFragmentFunc;
 
   if (!this->Internals->LinePipeline)
   {
@@ -5412,6 +5437,7 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
 
   [vertexFunc release];
   [fragmentFunc release];
+  [lineFragmentFunc release];
   if (triVertexFunc != vertexFunc)
   {
     [triVertexFunc release];
