@@ -16,8 +16,8 @@ Two test surfaces exist:
 2. The generic multi-backend suite in `Rendering/Core/Testing/Cxx/`, which
    registers the same ~175 tests once per backend and was wired up for Metal
      through    object-factory overrides (`--vtk-factory-prefer
-       RenderingBackend=Metal`). Historical status: **55 pass / 120 fail (33
-        crash)**. Current working-tree status: **133 pass / 39 fail (3 crash)** —
+       RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
+        crash)**. Current working-tree status: **134 pass / 38 fail (3 crash)** —
      the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
      factory override, the 8 composite-mapper `BuildGeometryBuffers` crashes by
      a `mappedColors != nullptr` guard (they now render), `TestOpacityMSAA` by
@@ -303,6 +303,21 @@ and text-texture section below. The +3 pass delta over the previous run is
 exactly those three tests; the 3 aborts are unchanged (`TestLabeledContourMapper`,
 `TestLabeledContourMapperNoLabels`, `TestLabeledContourMapperWithActorMatrix`).
 The regression check against the documented passing cluster reports none.
+Run after the surface lighting-flag fix (this run, 2026-08-03): 134 Passed /
+38 Failed / 3 aborted out of 175 (analyzed with `analyze_metal_ctest_log.py`
+from a single `ctest -R "RenderingCoreCxx-Metal" -j 8` run; failures exported
+with `export_image_compare.sh`) — `TestActorLightingFlag` now passes (TIGHT_VALID
+9.53e-05, was a 0.0513 near-miss fail): the central cone (property lighting
+disabled) now renders flat white like the GL baseline instead of being shaded
+like its neighbors. The mapper now bakes `vtkProperty::GetLighting()` into a new
+`kSceneFlagLightingDisabled` scene bit (set when `!GetLighting()`) that every
+surface/point/glyph fragment honors by skipping `computePhongLighting` and
+emitting GL's NoLighting output `ambientIntensity*ambientColor +
+diffuseIntensity*diffuseColor` (see the surface lighting-flag section below).
+The +1 pass delta over the previous run is exactly that test; the 3 aborts are
+unchanged (`TestLabeledContourMapper`, `TestLabeledContourMapperNoLabels`,
+`TestLabeledContourMapperWithActorMatrix`). The regression check against the
+documented passing cluster reports none.
 
 ### The point-rendering cluster is fixed
 
@@ -874,7 +889,47 @@ cell-scalar lines, thick-line/tube shading). `TestVertexRendering` 0.072 and
 (vertex dots), and `TestSurfacePlusEdges` + `TestEdgeThickness` (edge
 overlay) left via the per-actor edge-color fix above.
 
-### Theme clusters in the 42 failures
+### Surface / point draws respect the property lighting flag
+
+`TestActorLightingFlag` (three cones; the middle one sets
+`GetProperty()->SetLighting(false)`) failed at 0.0513: the middle cone was
+still Phong-shaded, so all three cones looked alike, while the GL baseline
+renders the middle cone flat white. `vtkGLSLModLight::GetBasicLightStats` drops
+the light complexity to 0 whenever `property->GetLighting()` is false, and the
+GL fragment then emits `gl_FragData[0] = vec4(ambientColor + diffuseColor,
+opacity)` (the flat material color) for every primitive type. The Metal
+surface/point fragments ignored the flag and always ran `computePhongLighting`.
+The fix (`kSceneFlagLightingDisabled`, bit 16):
+
+- The mapper sets `VTK_METAL_SCENE_FLAG_LIGHTING_DISABLED` per actor in
+  `RenderPiece` when `!prop->GetLighting()` (lines already fold
+  `prop->GetLighting()` into the existing `VTK_METAL_SCENE_FLAG_LINES_UNLIT`
+  decision, so they are unaffected).
+- `fragment_main`, `fragment_main_nodepth`, `fragment_main_oit`, `fragment_peel`
+  and the point fragments (`fragment_point_main`, `fragment_point_shaped_main`)
+  now skip `computePhongLighting` when the flag is set and output
+  `ambientIntensity*ambientColor + diffuseIntensity*diffuseColor` — GL's
+  NoLighting result — instead of `ambient + diffuse*df + specular`. The glyph
+  fragment (`shadeGlyphFragment`) honors the same bit if a caller ever sets it.
+- `evaluateSurfaceFragment`'s `unlitLines` parameter was renamed `unlit`; the
+  surface entries pass `kSceneFlagLightingDisabled`, the line entry keeps
+  passing `kSceneFlagLinesUnlit`, so triangle and line decisions stay separate
+  (an actor without normals keeps full triangle lighting; a lit-but-normalless
+  line actor keeps flat lines).
+
+Known gap (pre-existing, same root cause): the thick-line/tube pipelines
+(`shadeLineFragment`) never read the scene uniforms and still always run the
+Phong loop, so a `RenderLinesAsTubes` actor with `SetLighting(false)` stays lit;
+no test exercises that combination (GL also forces `needLighting = true` for
+tubes, but still clears it when `GetLighting()` is false).
+
+`TestActorLightingFlag` now passes (TIGHT_VALID 9.53e-05). The regression check
+reports no new failures: the other five near-miss tests keep their exact prior
+metrics (`TestPolyDataMapper2D` 0.0664, `TestEdgeFlags` 0.0681,
+`TestLineRenderingTranslucent` 0.0790, `TestGlyph3DMapperPicking` 0.0800,
+`RenderNonFinite` 0.0870).
+
+### Theme clusters in the remaining failures
 
 - **Textures** (~13): every `TestTexture*`, `TestBackfaceTexture`,
   `TestTilingCxx`, `TestActor2DTextures` — historically
@@ -902,12 +957,12 @@ overlay) left via the per-actor edge-color fix above.
 - **Selection/picking** (~3): `TestPointSelection*` and `TestPickTextActor`
   (`TestAreaSelections`, `TestHardwareSelector`, `TestSelectVisiblePoints`,
   `TestWorldPointPicker`, `TestReadPixels`, `TestRemoveActors` now pass — see the
-  selection/read-back cluster sections above). The 6 near-miss image tests
-  (`TestActorLightingFlag`,
-  `TestEdgeFlags`,
+  selection/read-back cluster sections above). The 5 near-miss image tests
+  (`TestEdgeFlags`,
   `TestLineRenderingTranslucent`,
   `TestGlyph3DMapperPicking`, `RenderNonFinite`, `TestPolyDataMapper2D`)
-  are the next easy-win targets (`TestImageAndAnnotations` left via the
+  are the next easy-win targets (`TestActorLightingFlag` left via the
+  surface lighting-flag fix above, and `TestImageAndAnnotations` via the
   overlay depth/texture fix above).
 - **Point rendering** — DONE: the four point tests `TestPointRendering_3/_4` +
   `TestPointRenderingRound_3/_4` plus the vertex-visibility tests

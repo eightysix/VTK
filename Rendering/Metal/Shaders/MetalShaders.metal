@@ -40,6 +40,10 @@ constant uint kSceneFlagUsePrimitiveCellIds = 1u << 12;
 constant uint kSceneFlagHasScalarLUT        = 1u << 13;
 constant uint kSceneFlagLinesUnlit           = 1u << 14;
 constant uint kSceneFlagGlyphHasNormals      = 1u << 15;
+// Property lighting disabled (vtkProperty::SetLighting(false)): every draw of
+// the actor skips the Phong loop and emits the flat ambient+diffuse material
+// color, matching vtkGLSLModLight's complexity-0 path in GL.
+constant uint kSceneFlagLightingDisabled     = 1u << 16;
 
 // Compile-time feature specialization for the surface shader (the "GL way"):
 // one shader source, specialized per feature set at pipeline creation via
@@ -620,7 +624,7 @@ inline FragmentColorAndIds evaluateSurfaceFragment(VertexOut in,
                              sampler lutSampler,
                              uint prim_id,
                              bool frontFacing,
-                             bool unlitLines) {
+                             bool unlit) {
   if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
 
   // Match vtkOpenGLPolyDataMapper: backfaces flip the geometric normal (so
@@ -693,21 +697,19 @@ inline FragmentColorAndIds evaluateSurfaceFragment(VertexOut in,
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
-  // 1px lines from inputs without point normals (or flat interpolation) render
-  // unlit: vtkOpenGLPolyDataMapper::GetNeedToRebuildShaders computes
-  //   needLighting = (isTrisOrStrips || (!isTrisOrStrips &&
-  //                    interpolation != VTK_FLAT && haveNormals))
-  // so for line primitives without normals GL goes to the NoLighting path and
-  // emits the flat vertex color. Mirror that: skip the Phong loop and output
-  // the ambient/diffuse material terms (which carry the vertex color) — GL's
-  // gl_FragData[0] = vec4(ambientColor + diffuseColor, opacity).
-  if (!unlitLines)
+  // Unlit draws render with the flat vertex/material color: GL's NoLighting
+  // path emits gl_FragData[0] = vec4(ambientColor + diffuseColor, opacity),
+  // where ambientColor = ambientIntensity*ambientColorUniform and diffuseColor
+  // = diffuseIntensity*diffuseColorUniform. Skip the Phong loop and output the
+  // ambient/diffuse material terms (which carry the vertex color) — exactly the
+  // pre-applied-intensity form used by the lit path.
+  if (!unlit)
   {
     computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, kLightCount, kLightType, lights, totalDiffuse, totalSpecular);
   }
 
   FragmentColorAndIds out;
-  float3 finalColor = unlitLines
+  float3 finalColor = unlit
     ? (totalAmbient + m.diffuseColor.w * r.diffuse)
     : (totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular);
   out.color = float4(finalColor, r.opacity);
@@ -777,7 +779,8 @@ fragment FragmentOutputNoDepth fragment_main_nodepth(VertexOut in [[stage_in]],
   return makeFragmentOutputNoDepth(
     evaluateSurfaceFragment(in, material, lights, scene, edge,
       clipPlanes, cellColorTex, cellPrimitiveIds, actorTexture, actorSampler,
-      lutTexture, lutSampler, prim_id, frontFacing, false));
+      lutTexture, lutSampler, prim_id, frontFacing,
+      (scene.flags & kSceneFlagLightingDisabled) != 0u));
 }
 
 // Coincident-offset variant: writes depth from the fragment stage exactly like
@@ -801,15 +804,17 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
   return makeFragmentOutput(
     evaluateSurfaceFragment(in, material, lights, scene, edge,
       clipPlanes, cellColorTex, cellPrimitiveIds, actorTexture, actorSampler,
-      lutTexture, lutSampler, prim_id, frontFacing, false),
+      lutTexture, lutSampler, prim_id, frontFacing,
+      (scene.flags & kSceneFlagLightingDisabled) != 0u),
     in, coinOffset);
 }
 
 // 1px line variant of fragment_main: honors the kSceneFlagLinesUnlit scene flag
 // so lines drawn from inputs without point normals (or flat interpolation)
 // render with the flat vertex color, matching vtkOpenGLPolyDataMapper's
-// NoLighting path for line primitives. Surface draws keep using fragment_main
-// (unlitLines = false), so a shared actor flag never affects triangle shading.
+// NoLighting path for line primitives. Surface draws respect the property
+// lighting flag instead (kSceneFlagLightingDisabled) in fragment_main /
+// fragment_main_nodepth, so a shared actor flag never affects triangle shading.
 fragment FragmentOutput fragment_main_line(VertexOut in [[stage_in]],
                               constant MaterialUniforms& material [[buffer(0)]],
                               constant LightUniforms& lights [[buffer(1)]],
@@ -894,9 +899,17 @@ fragment OITAccumulateOutput fragment_main_oit(VertexOut in [[stage_in]],
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
-  computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
+  // Property lighting disabled (vtkProperty::SetLighting(false)): emit the flat
+  // ambient/diffuse material color like GL's NoLighting path.
+  const bool unlit = (scene.flags & kSceneFlagLightingDisabled) != 0u;
+  if (!unlit)
+  {
+    computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
+  }
 
-  float3 litRGB = totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular;
+  float3 litRGB = unlit
+    ? (totalAmbient + m.diffuseColor.w * r.diffuse)
+    : (totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular);
   float opacity = r.opacity;
 
   OITAccumulateOutput out;
@@ -983,14 +996,22 @@ fragment FragmentOutput fragment_point_main(PointVertexOut in [[stage_in]],
   float3 baseColor = showVertices ? vertexColorUniform.color.rgb : in.pointColor.rgb;
   float baseAlpha = showVertices ? vertexColorUniform.color.a : in.pointColor.a;
 
+  // Property lighting disabled (vtkProperty::SetLighting(false)): emit the flat
+  // vertex color like GL's NoLighting path.
+  const bool unlit = (scene.flags & kSceneFlagLightingDisabled) != 0u;
   float3 totalAmbient = material.ambientColor.w * baseColor;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
-  
-  computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
+
+  if (!unlit)
+  {
+    computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
+  }
 
   FragmentOutput out;
-  out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha * material.opacity);
+  out.color = float4(unlit
+    ? (totalAmbient + material.diffuseColor.w * baseColor)
+    : (totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular), baseAlpha * material.opacity);
   out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
   out.depth = in.position.z + coinOffset.pointOffset / 65000.0;
   return out;
@@ -1093,13 +1114,21 @@ fragment FragmentOutput fragment_point_shaped_main(
   float3 baseColor = showVertices ? vertexColorUniform.color.rgb : in.pointColor.rgb;
   float baseAlpha = showVertices ? vertexColorUniform.color.a : in.pointColor.a;
 
+  // Property lighting disabled (vtkProperty::SetLighting(false)): emit the flat
+  // vertex color like GL's NoLighting path.
+  const bool unlit = (scene.flags & kSceneFlagLightingDisabled) != 0u;
   float3 totalAmbient = material.ambientColor.w * baseColor;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
-  
-  computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
 
-  out.color = float4(totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha * material.opacity);
+  if (!unlit)
+  {
+    computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
+  }
+
+  out.color = float4(unlit
+    ? (totalAmbient + material.diffuseColor.w * baseColor)
+    : (totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular), baseAlpha * material.opacity);
   out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
   out.depth += coinOffset.pointOffset / 65000.0;
   return out;
@@ -1857,9 +1886,17 @@ fragment PeelPassOutput fragment_peel(
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
-  computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
+  // Property lighting disabled (vtkProperty::SetLighting(false)): emit the flat
+  // ambient/diffuse material color like GL's NoLighting path.
+  const bool unlit = (scene.flags & kSceneFlagLightingDisabled) != 0u;
+  if (!unlit)
+  {
+    computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
+  }
 
-  float3 fragRGB = totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular;
+  float3 fragRGB = unlit
+    ? (totalAmbient + m.diffuseColor.w * r.diffuse)
+    : (totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular);
 
   if (fragDepth >= minDepth - epsilon && fragDepth <= minDepth + epsilon) {
     float prevAlpha = 1.0 - prevFront.a;
@@ -1990,12 +2027,20 @@ inline FragmentOutput shadeGlyphFragment(T in,
       N = -N;
     }
   }
+  // Property lighting disabled (vtkProperty::SetLighting(false)): emit the flat
+  // glyph color like GL's NoLighting path.
+  const bool unlit = (sceneFlags & kSceneFlagLightingDisabled) != 0u;
   float3 totalDiffuse = float3(0.0), totalSpecular = float3(0.0);
-  computePhongLighting(N, in.viewPos, in.glyphColor.rgb, material.specularColor.rgb,
-      material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
+  if (!unlit)
+  {
+    computePhongLighting(N, in.viewPos, in.glyphColor.rgb, material.specularColor.rgb,
+        material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
+  }
+  float3 lit = unlit
+    ? material.diffuseColor.w * in.glyphColor.rgb
+    : material.diffuseColor.w * totalDiffuse + totalSpecular;
   FragmentOutput out;
-  out.color = float4(material.ambientColor.w * in.glyphColor.rgb
-                   + material.diffuseColor.w * totalDiffuse + totalSpecular,
+  out.color = float4(material.ambientColor.w * in.glyphColor.rgb + lit,
                    in.glyphColor.a * material.opacity);
   out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
   out.depth = in.position.z + depthBias;

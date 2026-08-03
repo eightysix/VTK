@@ -116,6 +116,11 @@ constexpr uint32_t VTK_METAL_SCENE_FLAG_HAS_SCALAR_LUT      = 1u << 13;
 // decision for line primitives in GetNeedToRebuildShaders. Read only by the
 // dedicated fragment_main_line entry, so surface draws never see it.
 constexpr uint32_t VTK_METAL_SCENE_FLAG_LINES_UNLIT         = 1u << 14;
+// Property lighting disabled (vtkProperty::SetLighting(false)): surfaces and
+// points skip the Phong loop and emit the flat ambient+diffuse color, matching
+// vtkGLSLModLight's complexity-0 path (lines are already covered by
+// VTK_METAL_SCENE_FLAG_LINES_UNLIT, which folds prop->GetLighting() in).
+constexpr uint32_t VTK_METAL_SCENE_FLAG_LIGHTING_DISABLED   = 1u << 16;
 
 constexpr uint32_t VTK_METAL_DYNAMIC_ACTOR_FLAG_MASK =
     VTK_METAL_SCENE_FLAG_VERTEX_VISIBILITY |
@@ -127,7 +132,8 @@ constexpr uint32_t VTK_METAL_DYNAMIC_ACTOR_FLAG_MASK =
     VTK_METAL_SCENE_FLAG_HAS_CELL_TEXTURE |
     VTK_METAL_SCENE_FLAG_USE_PRIMITIVE_CELL_IDS |
     VTK_METAL_SCENE_FLAG_HAS_SCALAR_LUT |
-    VTK_METAL_SCENE_FLAG_LINES_UNLIT;
+    VTK_METAL_SCENE_FLAG_LINES_UNLIT |
+    VTK_METAL_SCENE_FLAG_LIGHTING_DISABLED;
 
 id<MTLBuffer> CreateZeroBuffer(id<MTLDevice> device, size_t bytes)
 {
@@ -2559,6 +2565,17 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       if (!lineLighting)
       {
         actorFlags |= VTK_METAL_SCENE_FLAG_LINES_UNLIT;
+      }
+
+      // P2-2B: Match vtkGLSLModLight::GetBasicLightStats — with property
+      // lighting disabled the light complexity is 0, so every surface/point
+      // draw emits the flat ambient+diffuse color (gl_FragData[0] =
+      // vec4(ambientColor + diffuseColor, opacity)). fragment_main,
+      // fragment_main_nodepth, fragment_main_oit, fragment_peel and the point
+      // fragments skip Phong when this flag is set.
+      if (!prop->GetLighting())
+      {
+        actorFlags |= VTK_METAL_SCENE_FLAG_LIGHTING_DISABLED;
       }
 
       flags |= actorFlags;
