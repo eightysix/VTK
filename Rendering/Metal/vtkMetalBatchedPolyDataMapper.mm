@@ -17,6 +17,7 @@
 #include "vtkRenderer.h"
 #include "vtkFloatArray.h"
 #include "vtkUnsignedCharArray.h"
+#include "vtkTexture.h"
 #include "vtkMetalPolyDataMapper.h"
 
 #import <Metal/Metal.h>
@@ -433,6 +434,11 @@ void vtkMetalBatchedPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       mapper->SetOverridePropIdToNone();
       mapper->ClearOverrideCompositeIndex();
     }
+
+    // Per-block texture. The child mapper's UpdateActorTexture prefers this
+    // over the actor's texture, so blocks with a block texture image render
+    // textured while blocks without one keep the actor's default appearance.
+    mapper->SetBlockTexture(elem->Texture);
 
     mapper->RenderPiece(ren, act);
   }

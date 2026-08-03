@@ -128,7 +128,7 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  72 Passed  94 Failed (incl. image/pick fails)  9 "Subprocess aborted"
+175 tests:  73 Passed  93 Failed (incl. image/pick fails)  9 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
@@ -142,7 +142,9 @@ match OpenGL), `TestHardwareSelector` (was "0 nodes returned"), and
 `TestAxesActor` (documented gross-fail 0.612; treat as flaky until reproduced).
 Latest run: 72 Passed / 94 Failed / 9 aborted — the three read-back tests
 `TestReadPixels`, `TestSelectVisiblePoints` and `TestWorldPointPicker` now pass
-via the read-back cluster below.)
+via the read-back cluster below. Newest run: 73 Passed / 93 Failed / 9 aborted —
+`TestCompositePolyDataMapperBlockTextures` now passes via the per-block-texture
+port described in the composite-mapper section below.)
 
 ### The selection cluster is fixed
 
@@ -269,8 +271,12 @@ display-attribute overrides active (`vtkMetalBatchedPolyDataMapper` sets
 guards with `mappedColors && ...`; the fix makes line 3745 consistent.
 
 `TestCompositePolyDataMapper`, `TestCompositePolyDataMapperBlockOpacities`,
-`TestCompositePolyDataMapperToggleScalarVisibilities`, and the
-`StaticBounds`/`SharedArray`/`PartialPointData` composite tests now **pass**;
+`TestCompositePolyDataMapperToggleScalarVisibilities`, the
+`StaticBounds`/`SharedArray`/`PartialPointData` composite tests, and now
+`TestCompositePolyDataMapperBlockTextures` (per-block textures, fixed by
+forwarding the batch element's `Texture` to the child Metal mapper and by
+mirroring GL's cell-scalar texture-size handling in `UpdateActorTexture`)
+now **pass**;
 `TestActor2D`, `TestBlockOpacity`, `TestCompositePolyDataMapper{Spheres,
 Vertices}` and the rest render without crashing but still fail image
 comparison (block-opacity / per-block feature fidelity gaps). The composite
@@ -334,11 +340,12 @@ poly-data/glyph/image/volume mapper PSOs), the clamp applies everywhere.
   crashed on the OpenGL fallback; now render, with 5 passing and the rest
   failing image comparison on texture-feature fidelity (filter/wrap/interpolation
   edge cases, textured-cylinder seams).
-- **Composite mapper** (~20): the crash cluster is gone (see above), but
+- **Composite mapper** (~19): the crash cluster is gone (see above), but
   `TestCompositePolyDataMapper{Scalars,CellScalars,Picking,PartialFieldData,
   OverrideScalarArray,OverrideLUT,CameraShiftScale,CustomShader,NaNPartial,
-  MixedGeometry*,BlockTextures}` still fail image comparison — the largest
-  failing cluster.
+  MixedGeometry*}` still fail image comparison — the largest
+  failing cluster. (`TestCompositePolyDataMapperBlockTextures` now passes
+  via the per-block-texture port described in the composite-cluster section.)
 - **Glyph instancing** (~9): `TestGlyph3DMapper{Arrow,BackfaceColor,Indexing,
   OrientationArray,Picking,PointSize,QuaternionArray,TreeIndexing,
   CompositeDisplayAttributeInheritance}` fail 0.15–0.6.

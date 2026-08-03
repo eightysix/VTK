@@ -16,6 +16,7 @@
 VTK_ABI_NAMESPACE_BEGIN
 class vtkOverrideAttribute;
 class vtkPointData;
+class vtkTexture;
 class vtkUnsignedCharArray;
 
 class VTKRENDERINGMETAL_EXPORT VTK_MARSHALAUTO vtkMetalPolyDataMapper
@@ -61,6 +62,11 @@ public:
     bool overrideOpacity,
     double opacity);
   void ClearBatchVisualOverride();
+
+  // Per-block texture override (set by vtkMetalBatchedPolyDataMapper for blocks
+  // with a block texture image). Takes precedence over the actor's texture.
+  // Passing nullptr falls back to the actor's texture.
+  void SetBlockTexture(vtkTexture* texture);
 
   // A/B switch for the single-pass surface edges (new path) vs. the legacy
   // chord-depth edge overlay draw. Default off (new path).

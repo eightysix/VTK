@@ -228,6 +228,9 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLTexture> DefaultTexture = nil;   // 1x1 white fallback
   id<MTLSamplerState> DefaultSampler = nil;
   vtkIdType CachedTextureMTime = 0;
+  // Per-block texture override (set by vtkMetalBatchedPolyDataMapper). Takes
+  // precedence over the actor's texture in UpdateActorTexture.
+  vtkSmartPointer<vtkTexture> BlockTexture;
 
   // Point geometry — separate buffers so points can draw independently
   id<MTLBuffer> PointPositionBuffer = nil;   // float3 per point
@@ -6454,7 +6457,7 @@ void vtkMetalPolyDataMapper::UpdateClipPlaneUniforms(void* mtlDevice, vtkActor* 
 }
 
 //------------------------------------------------------------------------------
-// P5-5A: Create Metal texture from actor's vtkTexture
+// P5-5A: Create Metal texture from actor's vtkTexture (or per-block texture)
 void vtkMetalPolyDataMapper::UpdateActorTexture(void* mtlDevice, vtkActor* actor)
 {
   if (!mtlDevice || !actor)
@@ -6464,7 +6467,9 @@ void vtkMetalPolyDataMapper::UpdateActorTexture(void* mtlDevice, vtkActor* actor
 
   id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
 
-  vtkTexture* texture = actor->GetTexture();
+  vtkTexture* texture = this->Internals->BlockTexture.Get()
+    ? this->Internals->BlockTexture.Get()
+    : actor->GetTexture();
 
   if (!texture || !texture->GetInput())
   {
@@ -6492,11 +6497,48 @@ void vtkMetalPolyDataMapper::UpdateActorTexture(void* mtlDevice, vtkActor* actor
   this->Internals->CachedTextureMTime = texMTime;
 
   vtkImageData* image = texture->GetInput();
+  vtkDataArray* scalars = image->GetPointData()->GetScalars();
+  if (!scalars)
+  {
+    vtkMetalMRC::ReleaseAndNil(this->Internals->ActorTexture);
+    vtkMetalMRC::ReleaseAndNil(this->Internals->ActorSampler);
+    this->Internals->CachedTextureMTime = 0;
+    this->Internals->InvalidateRenderBundle();
+    return;
+  }
+
+  // Guard: only unsigned char textures are supported
+  if (scalars->GetDataType() != VTK_UNSIGNED_CHAR)
+  {
+    vtkErrorMacro(<< "vtkMetalPolyDataMapper: only unsigned char textures are currently supported");
+    vtkMetalMRC::ReleaseAndNil(this->Internals->ActorTexture);
+    vtkMetalMRC::ReleaseAndNil(this->Internals->ActorSampler);
+    this->Internals->CachedTextureMTime = texMTime;
+    this->Internals->InvalidateRenderBundle();
+    return;
+  }
+
   int extent[6];
   image->GetExtent(extent);
   int width = extent[1] - extent[0] + 1;
   int height = extent[3] - extent[2] + 1;
   int numComponents = image->GetNumberOfScalarComponents();
+
+  // Match vtkOpenGLTexture::Load: when the scalar tuple count equals the cell
+  // count (a one-tuple-per-cell image like a 1x1 block texture), shrink the
+  // texture dimensions by 1 along each axis. Reading the extent-sized grid
+  // would otherwise access scalar data out of bounds.
+  if (image->GetNumberOfCells() == scalars->GetNumberOfTuples())
+  {
+    if (width > 1)
+    {
+      --width;
+    }
+    if (height > 1)
+    {
+      --height;
+    }
+  }
 
   if (width <= 0 || height <= 0)
   {
@@ -6531,28 +6573,6 @@ void vtkMetalPolyDataMapper::UpdateActorTexture(void* mtlDevice, vtkActor* actor
 
   // Convert image data to RGBA8 and upload
   unsigned char* rgbaData = new unsigned char[width * height * 4];
-  vtkDataArray* scalars = image->GetPointData()->GetScalars();
-  if (!scalars)
-  {
-    delete[] rgbaData;
-    vtkMetalMRC::ReleaseAndNil(this->Internals->ActorTexture);
-    vtkMetalMRC::ReleaseAndNil(this->Internals->ActorSampler);
-    this->Internals->CachedTextureMTime = 0;
-    this->Internals->InvalidateRenderBundle();
-    return;
-  }
-
-  // Guard: only unsigned char textures are supported
-  if (scalars->GetDataType() != VTK_UNSIGNED_CHAR)
-  {
-    vtkErrorMacro(<< "vtkMetalPolyDataMapper: only unsigned char textures are currently supported");
-    delete[] rgbaData;
-    vtkMetalMRC::ReleaseAndNil(this->Internals->ActorTexture);
-    vtkMetalMRC::ReleaseAndNil(this->Internals->ActorSampler);
-    this->Internals->CachedTextureMTime = texMTime;
-    this->Internals->InvalidateRenderBundle();
-    return;
-  }
 
   int xMin = extent[0];
   int yMin = extent[2];
@@ -6676,6 +6696,24 @@ void vtkMetalPolyDataMapper::ClearOverrideCompositeIndex()
 {
   this->Internals->HasOverrideCompositeIndex = false;
   this->Internals->OverrideCompositeIndex = 0;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::SetBlockTexture(vtkTexture* texture)
+{
+  if (this->Internals->BlockTexture == texture)
+  {
+    return;
+  }
+
+  this->Internals->BlockTexture = texture;
+
+  // Force the next UpdateActorTexture to re-examine the texture (the mtime
+  // cache key may match between two different texture objects, so invalidate
+  // explicitly). The bundle rebuild happens inside UpdateActorTexture when it
+  // detects the change.
+  this->Internals->CachedTextureMTime = 0;
+  this->Internals->InvalidateRenderBundle();
 }
 
 //------------------------------------------------------------------------------
