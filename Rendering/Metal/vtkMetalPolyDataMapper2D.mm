@@ -152,6 +152,8 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
   {
     return;
   }
+  this->GetInputAlgorithm()->Update();
+  input = this->GetInput();
 
   @autoreleasepool
   {
@@ -392,12 +394,12 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
     wcvc[14] = -ndcNear / (ndcFar - ndcNear);
     wcvc[15] = 1.0f;
 
-    // Flip Y to convert from VTK bottom-left to Metal top-left origin
-    // This is done by negating the Y row in the matrix
-    wcvc[1] = -wcvc[1];
-    wcvc[5] = -wcvc[5];
-    wcvc[9] = -wcvc[9];
-    wcvc[13] = -wcvc[13];
+    // NOTE: no Y flip here. Metal's NDC maps +y to the top of the framebuffer,
+    // and the VTK viewport origin is the bottom-left with y growing up, so the
+    // identity y mapping (bottom → NDC -1, top → NDC +1) lands 2D geometry at
+    // the same screen location as the 3D passes (whose camera already emits
+    // Metal NDC). The color read-back additionally re-orders rows bottom-up,
+    // so the regression PNG matches the on-screen image.
 
     // Create or update state buffer
     struct Mapper2DState {
