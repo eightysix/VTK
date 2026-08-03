@@ -1718,6 +1718,27 @@ fragment GradientFragmentOutput fragment_gradient_background(
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Textured background (matches vtkOpenGLRenderer's textured background). The v
+// coordinate is flipped because vertex_fullscreen_main emits v=1 at the window
+// bottom while the texture is uploaded with VTK row 0 (min-y) first, so the
+// image appears upright (image top at the window top) exactly like OpenGL.
+// ---------------------------------------------------------------------------
+struct TexturedBackgroundOutput {
+  float4 color [[color(0)]];
+  uint4 ids [[color(1)]];
+};
+
+fragment TexturedBackgroundOutput fragment_textured_background(
+    FullscreenVertexOut in [[stage_in]],
+    texture2d<float> backgroundTexture [[texture(0)]]) {
+  float2 uv = float2(in.texCoord.x, 1.0 - in.texCoord.y);
+  TexturedBackgroundOutput out;
+  out.color = backgroundTexture.sample(sVolume, uv);
+  out.ids = uint4(0u, 0u, 0u, 0u);
+  return out;
+}
+
 struct PeelInitOutput { float2 depthRange [[color(0)]]; };
 struct PeelPassOutput { float4 backTemp  [[color(0)]]; float4 frontDest [[color(1)]]; float2 depthDest [[color(2)]]; };
 

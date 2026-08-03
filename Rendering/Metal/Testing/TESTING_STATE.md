@@ -16,7 +16,7 @@ Two test surfaces exist:
    registers the same ~175 tests once per backend and was wired up for Metal
    through    object-factory overrides (`--vtk-factory-prefer
     RenderingBackend=Metal`). Historical status: **55 pass / 120 fail (33
-     crash)**. Current working-tree status: **96 pass / 76 fail (3 crash)** —
+     crash)**. Current working-tree status: **99 pass / 73 fail (3 crash)** —
      the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
      factory override, the 8 composite-mapper `BuildGeometryBuffers` crashes by
      a `mappedColors != nullptr` guard (they now render), `TestOpacityMSAA` by
@@ -39,7 +39,10 @@ Two test surfaces exist:
      multi-source indexing tests `TestGlyph3DMapperIndexing` and
      `TestGlyph3DMapperTreeIndexing` now pass via the multi-source
      `SourceGeometry`/`SourceInstances` port (see the glyph3D multi-source
-     indexing section below). No new crashes were introduced. The pass count
+     indexing section below), and `TestTexturedBackground` plus the stereo
+     backgrounds `TestStereoBackgroundLeft`/`TestStereoBackgroundRight` now pass
+     via the textured-background implementation (see the textured-background
+     section below). No new crashes were introduced. The pass count
      fluctuates run to run (run-to-run flakiness).
 
 ---
@@ -140,7 +143,7 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  83 Passed  83 Failed (incl. image/pick fails)  9 "Subprocess aborted"
+175 tests:  99 Passed  73 Failed (incl. image/pick fails)  3 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
@@ -206,6 +209,16 @@ two non-glyph gross-bucket deltas below; the 3 aborts are unchanged
 (`TestLabeledContourMapper`, `TestLabeledContourMapperNoLabels`,
 `TestLabeledContourMapperWithActorMatrix`). The regression check against the
 documented passing cluster reports none.
+Run after the textured-background fix (this run, 2026-08-03): 99 Passed /
+73 Failed / 3 aborted out of 175 (analyzed with `analyze_metal_ctest_log.py` from
+a single `ctest -R "RenderingCoreCxx-Metal" -j 8` run) — `TestTexturedBackground`
+and the stereo backgrounds `TestStereoBackgroundLeft`/`TestStereoBackgroundRight`
+now pass (ImageErrors 0.0104 / 0.0132, down from a gross-bucket ~0.8865), the
+first time they have passed; see the textured-background section below. The +3
+pass delta over the previous run is exactly those three tests (all formerly
+gross-bucket fails); the 3 aborts are unchanged (`TestLabeledContourMapper`,
+`TestLabeledContourMapperNoLabels`, `TestLabeledContourMapperWithActorMatrix`).
+The regression check against the documented passing cluster reports none.
 
 ### The glyph3D multi-source indexing cluster is fixed
 
@@ -225,6 +238,23 @@ when `UseSourceTableTree`), per-point source selection from the indexed
 (transforms, normals padded to float3x3, colors, pick ids) and a per-source draw
 pass, with `kSceneFlagGlyphHasNormals` (bit 15) asserted per-draw. Both tests
 now pass stably with ImageError 0.0014.
+
+### The textured-background cluster is fixed
+
+`TestTexturedBackground` and the stereo pair `TestStereoBackgroundLeft`/
+`TestStereoBackgroundRight` (renderers using `SetBackgroundTexture` with
+`SetViewport`/stereo eye views) failed image comparison at a gross ~0.8865.
+The Metal renderer drew only the gradient background and never the textured
+one. `vtkMetalRenderer` now mirrors `vtkOpenGLRenderer`:
+`GetCurrentTexturedBackground()` (new, via a `vtkMetalRendererInternals` pimpl)
+returns the effect only when the texture is set, the viewport matches, and the
+stereo eye matches OpenGL's selection rules (left eye / both eyes), and a cached
+`MTLTexture` is uploaded from the image data once per frame (kept in the pimpl
+so it survives renderer re-creation). The background draw now uses a new
+`fragment_textured_background` shader (with the depth-buffer-disabled blend /
+clip-space quad pipeline from the gradient path). All three tests now pass with
+TIGHT_VALID ImageErrors of 0.0104 / 0.0132 / 0.0104 (was 0.8865 gross).
+
 
 ### The selection cluster is fixed
 
@@ -435,7 +465,7 @@ scalar-LUT tests: `TestCompositePolyDataMapperOverrideLUT`,
 
 ### Image-compare failures
 
-Current run (2026-08-03, glyph-indexing run): 76 failed = 72 image-compare
+Current run (2026-08-03, textured-background run): 73 failed = 69 image-compare
 (TIGHT_VALID >= 0.05) + 1 below-threshold pick-check + 3 non-image. Buckets by
 max `vtkTesting` TIGHT_VALID error per test (threshold 0.05):
 
@@ -443,15 +473,17 @@ max `vtkTesting` TIGHT_VALID error per test (threshold 0.05):
 |--------|-------|-------|----------|
 | near-miss | 0.05 – 0.1 | 11 | `TestActorLightingFlag` 0.051, `TestImageAndAnnotations` 0.061, `TestPolyDataMapper2D` 0.066, `TestEdgeFlags` 0.068, `TestQuadPointRep` 0.069, `TestMixedGeometry_3` 0.070, `TestVertexRendering` 0.072, `TestLineRenderingTranslucent` 0.079, `TestGlyph3DMapperPicking` 0.080, `RenderNonFinite` 0.087, `TestMixedGeometryCellScalars` 0.092 |
 | mid | 0.1 – 0.5 | 37 | `TestBackfaceCulling` 0.102, `TestSurfacePlusEdges` 0.104, `TestGlyph3DMapper` 0.108, `TestTexturedCylinder` 0.128, `TestPolyDataMapperClipPlanes` 0.144, `TestCompositePolyDataMapperSpheres` 0.150, `TestCompositePolyDataMapperPicking` 0.171, `TestPointRenderingRound_3` 0.193, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.224, `TestCoincident` 0.234, `TestPolyDataMapper2DPointScalarColorMapping` 0.286, `TestGlyph3DMapperBackfaceColor` 0.291, `TestRenderLinesAsTubes` 0.356, `TestGlyph3DMapperPointSize` 0.460, `TestColorByStringArrayDefaultLookupTable2D` 0.482 |
-| gross | >= 0.5 | 24 | `TestStereoBackground{Left,Right}` 0.887, `TestNViewports*` 0.85–0.87, `TestDirectScalarsToColors` 0.858, `TestMapVectorsToColors` 0.747, `TestImageMapper_1..4` 0.63–0.72, `TestActor2DTextures` 0.786, `TestTilingCxx` 0.616, `TestBareScalarsToColors` 0.584 |
+| gross | >= 0.5 | 21 | `TestNViewports*` 0.85–0.87, `TestDirectScalarsToColors` 0.858, `TestMapVectorsToColors` 0.747, `TestImageMapper_1..4` 0.63–0.72, `TestActor2DTextures` 0.786, `TestTilingCxx` 0.616, `TestBareScalarsToColors` 0.584 |
 
 (`TestGlyph3DMapperIndexing` and `TestGlyph3DMapperTreeIndexing` left the mid
 bucket this run via the glyph3D multi-source indexing fix above, passing at
-0.0014. The gross bucket dropped from 27 to 24; `TestTStripsColorsTCoords`
+0.0014, and `TestTexturedBackground` + `TestStereoBackground{Left,Right}` left
+the gross bucket via the textured-background fix below, now passing at
+0.010/0.013. The gross bucket dropped from 24 to 21; `TestTStripsColorsTCoords`
 0.506 / `TestTStripsNormalsColorsTCoords` 0.506 /
 `TestGradientBackgroundWithTiledViewport` 0.506 sit at the top of the bucket
-and the three that left it are within the documented run-to-run flakiness of
-the TStrips/GradientBackground/Stereo class.) The below-threshold
+and the three that left it are exactly the textured-background tests above.)
+The below-threshold
 failure is `TestCompositePolyDataMapperPickability` (ImageError 0.0155 but fails
 its own pickability check). The 3 non-image failures: `TestPointSelection`,
 `TestPointSelectionWithCellData` (selection returns even-only point ids,
@@ -554,7 +586,7 @@ other line-image tests (`TestVertexRendering` 0.072, `TestLineRenderingTransluce
 0.356) are unchanged — their errors are separate fidelity gaps (point rendering,
 thick-line/tube shading, edge overlay), not the 1px-line lighting path.
 
-### Theme clusters in the 83 failures
+### Theme clusters in the 73 failures
 
 - **Textures** (~15): every `TestTexture*`, `TestBackfaceTexture`,
   `TestTexturedCylinder`, `TestTilingCxx`, `TestActor2DTextures` — historically
@@ -594,15 +626,17 @@ thick-line/tube shading, edge overlay), not the 1px-line lighting path.
 - **LUT / color mapping** (~5): `TestBareScalarsToColors` 0.584,
   `TestDirectScalarsToColors` 0.858, `TestMapVectorsToColors` 0.747,
   `TestMapVectorsAsRGBColors` 0.632, `TestColorByStringArrayDefaultLookupTable2D` 0.482.
-- **Stereo / multiview / gradient background**: `TestOffAxisStereo`,
-  `TestStereoBackground{Left,Right}`, `TestStereoEyeSeparation`,
+- **Stereo / multiview / gradient background**: `TestStereoBackground{Left,Right}`
+  now pass via the textured-background implementation (see the textured-background
+  section below); still failing: `TestOffAxisStereo`,
+  `TestStereoEyeSeparation`,
   `TestSplitViewportStereoHorizontal`, the 5 `TestNViewports*`, and 3
   `TestGradientBackground*` (0.5–0.8).
 - **TStrips** (4) and `TestPolyDataMapperNormals` (0.608) fail 0.4–0.55.
 
 ### Evidence the core path is correct
 
-The 83 passes include the strongest-scrutiny tests: `TestOpacity` (passes with
+The 99 passes include the strongest-scrutiny tests: `TestOpacity` (passes with
 the `TIGHT_VALID` metric — the Lab-space color path matches GL to
 `0.00038`), `TestOSConeCxx`, `TestMace`, the four scalar-LUT tests
 (`TestCompositePolyDataMapperOverrideLUT`, `TestTextureInterpolateScalars`,
@@ -614,7 +648,9 @@ at ImageError 1.2e-06–1.2e-04), `TestTranslucentLUTAlphaBlending`,
 `SharedArray` variants, `TestAreaSelections` and `TestHardwareSelector` (exact
 per-primitive cell ids), the read-back cluster (`TestReadPixels`,
 `TestSelectVisiblePoints`, `TestWorldPointPicker`), `TestActor2D` (2D overlay
-quad matches GL to 0.027), and the basic Glyph3D,
+quad matches GL to 0.027), the textured-background cluster
+(`TestTexturedBackground`, `TestStereoBackground{Left,Right}`), and the basic
+Glyph3D,
 `FrustumClip`, `RGrid`, `TestQuad`. `Rendering/Metal/Testing/OpenGLComparison.md`
 shows every bespoke scene now matches OpenGL to a thresholded error of 0.000
 (0.005 for volume).
@@ -678,12 +714,14 @@ not in the fundamental geometry/lighting/color path.
    `vtkOpenGLLabeledContourMapper::ApplyStencil`) against a Metal window; this
    needs Metal overrides for the label/text rendering stack.
  7. **Glyph instancing colors**, **2D overlay + image mapper**, **LUT/color
-    mapping**, **stereo/multiview + gradient background**, **TStrips** — all
-    render but diverge from GL. (The glyph3D multi-source indexing tests
-    `TestGlyph3DMapperIndexing`/`TreeIndexing` now pass — see the glyph3D
-    multi-source indexing section above; `TestActor2D` now passes — see the
-    2D-overlay section above; `TestPolyDataMapper2D` is at 0.066, the closest
-    2D miss.)
+     mapping**, **stereo/multiview + gradient background**, **TStrips** — all
+     render but diverge from GL. (The glyph3D multi-source indexing tests
+     `TestGlyph3DMapperIndexing`/`TreeIndexing` now pass — see the glyph3D
+     multi-source indexing section above; `TestActor2D` now passes — see the
+     2D-overlay section above; `TestPolyDataMapper2D` is at 0.066, the closest
+     2D miss; the textured/stereo backgrounds `TestTexturedBackground` and
+     `TestStereoBackground{Left,Right}` now pass — see the textured-background
+     section above.)
 
 ---
 
@@ -725,7 +763,13 @@ completing the four scalar-LUT tests), and then after the 2D-overlay-mapper fix
 (83 Passed / 83 Failed / 9 aborted — `TestActor2D` now passes via the
 `vtkMetalPolyDataMapper2D` `Update()` / no-Y-flip fix), and then after the
 wireframe-lines fix (92 Passed / 80 Failed / 3 aborted — `TestWireframe` now
-passes via the `fragment_main_line` / `kSceneFlagLinesUnlit` unlit-line path).
+passes via the `fragment_main_line` / `kSceneFlagLinesUnlit` unlit-line path),
+and then after the glyph3D multi-source indexing fix
+(96 Passed / 76 Failed / 3 aborted — `TestGlyph3DMapperIndexing` and
+`TestGlyph3DMapperTreeIndexing` now pass), and then after the
+textured-background fix
+(99 Passed / 73 Failed / 3 aborted — `TestTexturedBackground` and
+`TestStereoBackground{Left,Right}` now pass).
 The image-compare buckets above are from that latest run's `LastTest.log` (max
 TIGHT_VALID error per test), analyzed with `analyze_metal_ctest_log.py`.
 Re-running is reproducible except where a crash's signal stack

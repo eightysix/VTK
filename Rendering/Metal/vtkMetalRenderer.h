@@ -23,6 +23,8 @@ VTK_ABI_NAMESPACE_BEGIN
 class vtkOverrideAttribute;
 class vtkMetalDepthPeeler;
 class vtkMetalOrderIndependentTranslucentPass;
+class vtkTexture;
+class vtkMetalRendererInternals;
 
 class VTKRENDERINGMETAL_EXPORT VTK_MARSHALAUTO vtkMetalRenderer : public vtkRenderer
 {
@@ -67,9 +69,16 @@ protected:
    */
   bool HasTranslucentPolygonalGeometry();
 
+  /**
+   * Return the texture to use for the textured background, honoring the
+   * stereo eye selection (matches vtkOpenGLRenderer::GetCurrentTexturedBackground).
+   */
+  vtkTexture* GetCurrentTexturedBackground();
+
 private:
   std::unique_ptr<vtkMetalDepthPeeler> DepthPeeler;
   std::unique_ptr<vtkMetalOrderIndependentTranslucentPass> OrderIndependentTranslucentPass;
+  std::unique_ptr<vtkMetalRendererInternals> Internals;
   vtkMetalRenderer(const vtkMetalRenderer&) = delete;
   void operator=(const vtkMetalRenderer&) = delete;
 };

@@ -8,9 +8,14 @@
 #include "vtkMetalOrderIndependentTranslucentPass.h"
 #include "vtkMetalCamera.h"
 #include "vtkMetalGPUVolumeRayCastMapper.h"
+#include "vtkMetalMRC.h"
 #include "vtkMetalShaders.h"
 #include "vtkObjectFactory.h"
 #include "vtkOverrideAttribute.h"
+#include "vtkImageData.h"
+#include "vtkPointData.h"
+#include "vtkTexture.h"
+#include "vtkWeakPointer.h"
 #include "vtkRenderer.h"
 #include "vtkRendererCollection.h"
 #include "vtkLightCollection.h"
@@ -20,6 +25,8 @@
 #include "vtkActorCollection.h"
 #include "vtkVolume.h"
 #include "vtkVolumeCollection.h"
+
+#include <vector>
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -60,6 +67,24 @@ static void EnsureDepthStencilStates(id<MTLDevice> device)
   }
 }
 
+// PIMPL: per-renderer GPU state for the textured background. The uploaded
+// texture/sampler are recreated when the background vtkTexture (or its input
+// image) changes.
+class vtkMetalRendererInternals
+{
+public:
+  ~vtkMetalRendererInternals()
+  {
+    vtkMetalMRC::ReleaseAndNil(BackgroundTexture);
+    vtkMetalMRC::ReleaseAndNil(BackgroundSampler);
+  }
+
+  vtkWeakPointer<vtkTexture> CachedBackground;
+  vtkMTimeType CachedBackgroundMTime = 0;
+  id<MTLTexture> BackgroundTexture = nil;
+  id<MTLSamplerState> BackgroundSampler = nil;
+};
+
 vtkStandardNewMacro(vtkMetalRenderer);
 
 //------------------------------------------------------------------------------
@@ -74,6 +99,7 @@ vtkOverrideAttribute* vtkMetalRenderer::CreateOverrideAttributes()
 vtkMetalRenderer::vtkMetalRenderer()
   : DepthPeeler(new vtkMetalDepthPeeler)
   , OrderIndependentTranslucentPass(new vtkMetalOrderIndependentTranslucentPass)
+  , Internals(new vtkMetalRendererInternals)
 {
 }
 
@@ -106,6 +132,33 @@ bool vtkMetalRenderer::HasTranslucentPolygonalGeometry()
     }
   }
   return false;
+}
+
+//------------------------------------------------------------------------------
+vtkTexture* vtkMetalRenderer::GetCurrentTexturedBackground()
+{
+  vtkRenderWindow* renWin = this->GetRenderWindow();
+  if (!renWin)
+  {
+    return nullptr;
+  }
+
+  if (!renWin->GetStereoRender() && this->BackgroundTexture)
+  {
+    return this->BackgroundTexture;
+  }
+  else if (renWin->GetStereoRender() && this->GetActiveCamera()->GetLeftEye() == 1 &&
+    this->BackgroundTexture)
+  {
+    // left eye uses the (left) background texture
+    return this->BackgroundTexture;
+  }
+  else if (renWin->GetStereoRender() && this->RightBackgroundTexture)
+  {
+    // right eye uses the right background texture
+    return this->RightBackgroundTexture;
+  }
+  return nullptr;
 }
 
 //------------------------------------------------------------------------------
@@ -303,8 +356,13 @@ void vtkMetalRenderer::DeviceRender()
 
       // Draw the gradient/textured background (matches vtkOpenGLRenderer::Clear):
       // a full-window quad interpolating between Background (bottom) and
-      // Background2 (top) is drawn before any geometry.
-      if (!this->Transparent() && this->GetGradientBackground())
+      // Background2 (top) — or sampling the background texture — is drawn
+      // before any geometry. A textured background takes precedence over a
+      // gradient one, exactly like vtkOpenGLRenderer.
+      vtkTexture* currentTexturedBackground =
+        this->GetTexturedBackground() ? this->GetCurrentTexturedBackground() : nullptr;
+
+      if (!this->Transparent() && this->GetGradientBackground() && !currentTexturedBackground)
       {
         static id<MTLRenderPipelineState> gradientPipeline = nil;
         static int gradientPipelineSampleCount = 0;
@@ -396,6 +454,192 @@ void vtkMetalRenderer::DeviceRender()
         if (activeDepthTex)
         {
           [encoder setDepthStencilState:sOpaqueDepthState];
+        }
+      }
+
+      // Draw the textured background (matches vtkOpenGLRenderer::Clear): a
+      // full-window quad sampling the renderer's background texture. The
+      // stereo eye selection is handled by GetCurrentTexturedBackground
+      // (left eye uses BackgroundTexture, right eye uses RightBackgroundTexture).
+      if (!this->Transparent() && currentTexturedBackground)
+      {
+        static id<MTLRenderPipelineState> texturedBackgroundPipeline = nil;
+        static int texturedBackgroundPipelineSampleCount = 0;
+        if (!texturedBackgroundPipeline ||
+          texturedBackgroundPipelineSampleCount != renWin->GetEffectiveSampleCount())
+        {
+          @autoreleasepool
+          {
+            id<MTLLibrary> library =
+              (__bridge id<MTLLibrary>)renWin->GetSharedShaderLibrary();
+            if (library)
+            {
+              id<MTLFunction> vFunc = [library newFunctionWithName:@"vertex_fullscreen_main"];
+              id<MTLFunction> fFunc =
+                [library newFunctionWithName:@"fragment_textured_background"];
+              if (vFunc && fFunc)
+              {
+                MTLRenderPipelineDescriptor* desc =
+                  [[MTLRenderPipelineDescriptor alloc] init];
+                desc.vertexFunction = vFunc;
+                desc.fragmentFunction = fFunc;
+                desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+                // Match the opaque pass attachments: an RGBA32Uint IDs attachment
+                // when MSAA is inactive (the same rule the scene pipelines use).
+                if (!msaa)
+                {
+                  desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;
+                }
+                desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+                if (msaa)
+                {
+                  desc.rasterSampleCount = static_cast<NSUInteger>(
+                    renWin->GetEffectiveSampleCount());
+                }
+                NSError* error = nil;
+                texturedBackgroundPipeline =
+                  [device newRenderPipelineStateWithDescriptor:desc error:&error];
+                if (!texturedBackgroundPipeline)
+                {
+                  vtkGenericWarningMacro(<< "Textured background pipeline: "
+                                         << [[error localizedDescription] UTF8String]);
+                }
+                texturedBackgroundPipelineSampleCount =
+                  renWin->GetEffectiveSampleCount();
+                [desc release];
+              }
+              [vFunc release];
+              [fFunc release];
+            }
+          }
+        }
+
+        if (texturedBackgroundPipeline)
+        {
+          // (Re)upload the background image when the texture or its input changed.
+          vtkTexture* bgTexture = currentTexturedBackground;
+          vtkMTimeType bgMTime = bgTexture->GetMTime();
+          if (!this->Internals->CachedBackground.GetPointer() ||
+            this->Internals->CachedBackground != bgTexture ||
+            this->Internals->CachedBackgroundMTime != bgMTime)
+          {
+            vtkMetalMRC::ReleaseAndNil(this->Internals->BackgroundTexture);
+            vtkMetalMRC::ReleaseAndNil(this->Internals->BackgroundSampler);
+
+            vtkImageData* bgImage = bgTexture->GetInput();
+            if (bgImage && bgImage->GetPointData()->GetScalars())
+            {
+              int extent[6];
+              bgImage->GetExtent(extent);
+              int width = extent[1] - extent[0] + 1;
+              int height = extent[3] - extent[2] + 1;
+              int numComponents = bgImage->GetNumberOfScalarComponents();
+
+              if (width > 0 && height > 0)
+              {
+                MTLTextureDescriptor* texDesc =
+                  [[MTLTextureDescriptor alloc] init];
+                texDesc.textureType = MTLTextureType2D;
+                texDesc.pixelFormat = MTLPixelFormatRGBA8Unorm;
+                texDesc.width = static_cast<NSUInteger>(width);
+                texDesc.height = static_cast<NSUInteger>(height);
+                texDesc.mipmapLevelCount = 1;
+                texDesc.usage = MTLTextureUsageShaderRead;
+                texDesc.storageMode = MTLStorageModeShared;
+
+                id<MTLTexture> tex =
+                  [device newTextureWithDescriptor:texDesc];
+                [texDesc release];
+                if (tex)
+                {
+                  // Convert to RGBA8. Row 0 (min y) is uploaded first, matching
+                  // the VTK texture convention; the fragment shader flips the
+                  // v coordinate so the image appears upright like OpenGL.
+                  std::vector<unsigned char> rgbaData(
+                    static_cast<size_t>(width) * height * 4);
+                  int xMin = extent[0];
+                  int yMin = extent[2];
+                  for (int y = 0; y < height; ++y)
+                  {
+                    for (int x = 0; x < width; ++x)
+                    {
+                      unsigned char* srcPtr = static_cast<unsigned char*>(
+                        bgImage->GetScalarPointer(xMin + x, yMin + y, 0));
+                      size_t dstIdx =
+                        (static_cast<size_t>(y) * width + x) * 4;
+                      unsigned char* dst = rgbaData.data() + dstIdx;
+                      switch (numComponents)
+                      {
+                        case 1:
+                          dst[0] = dst[1] = dst[2] = srcPtr[0];
+                          dst[3] = 255;
+                          break;
+                        case 2:
+                          dst[0] = dst[1] = dst[2] = srcPtr[0];
+                          dst[3] = srcPtr[1];
+                          break;
+                        case 3:
+                          dst[0] = srcPtr[0];
+                          dst[1] = srcPtr[1];
+                          dst[2] = srcPtr[2];
+                          dst[3] = 255;
+                          break;
+                        default:
+                          dst[0] = srcPtr[0];
+                          dst[1] = srcPtr[1];
+                          dst[2] = srcPtr[2];
+                          dst[3] = srcPtr[3];
+                          break;
+                      }
+                    }
+                  }
+
+                  MTLRegion region = MTLRegionMake2D(0, 0, width, height);
+                  [tex replaceRegion:region
+                            mipmapLevel:0
+                              withBytes:rgbaData.data()
+                            bytesPerRow:width * 4];
+                  vtkMetalMRC::AssignConsumed(
+                    this->Internals->BackgroundTexture, tex);
+                }
+              }
+            }
+
+            this->Internals->CachedBackground = bgTexture;
+            this->Internals->CachedBackgroundMTime = bgMTime;
+          }
+
+          if (this->Internals->BackgroundTexture)
+          {
+            if (!this->Internals->BackgroundSampler)
+            {
+              MTLSamplerDescriptor* sDesc = [[MTLSamplerDescriptor alloc] init];
+              sDesc.minFilter = MTLSamplerMinMagFilterLinear;
+              sDesc.magFilter = MTLSamplerMinMagFilterLinear;
+              sDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+              sDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+              this->Internals->BackgroundSampler =
+                [device newSamplerStateWithDescriptor:sDesc];
+              [sDesc release];
+            }
+
+            [encoder setRenderPipelineState:texturedBackgroundPipeline];
+            [encoder setDepthStencilState:sReadOnlyDepthState];
+            [encoder setCullMode:MTLCullModeNone];
+            [encoder setVertexBuffer:nil offset:0 atIndex:0];
+            [encoder setFragmentTexture:this->Internals->BackgroundTexture atIndex:0];
+            if (this->Internals->BackgroundSampler)
+            {
+              [encoder setFragmentSamplerState:this->Internals->BackgroundSampler atIndex:0];
+            }
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+          }
+
+          // Restore the opaque depth state for geometry.
+          if (activeDepthTex)
+          {
+            [encoder setDepthStencilState:sOpaqueDepthState];
+          }
         }
       }
 
@@ -1008,6 +1252,13 @@ void vtkMetalRenderer::ReleaseGraphicsResources(vtkWindow* w)
   if (this->OrderIndependentTranslucentPass)
   {
     this->OrderIndependentTranslucentPass->Release();
+  }
+  if (this->Internals)
+  {
+    vtkMetalMRC::ReleaseAndNil(this->Internals->BackgroundTexture);
+    vtkMetalMRC::ReleaseAndNil(this->Internals->BackgroundSampler);
+    this->Internals->CachedBackground = nullptr;
+    this->Internals->CachedBackgroundMTime = 0;
   }
   this->Superclass::ReleaseGraphicsResources(w);
 }
