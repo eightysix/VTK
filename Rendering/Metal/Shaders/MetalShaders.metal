@@ -395,7 +395,8 @@ inline void applySurfaceEdges(thread float3& N,
                               VertexOut in,
                               constant LightUniforms& lights,
                               constant EdgeUniforms& edge,
-                              constant SceneUniforms& scene) {
+                              constant SceneUniforms& scene,
+                              float ambientIntensity) {
   if ((edge.flags & 1u) == 0u) return;
   if (in.edgeFlags == 0u) return;
 
@@ -447,7 +448,9 @@ inline void applySurfaceEdges(thread float3& N,
   if (tube) {
     // tube branch: mix BOTH diffuse and ambient toward edgeColor
     r.diffuse = mix(r.diffuse, ec, emix * eo);
-    r.ambient = mix(r.ambient, ec, emix * eo);
+    // GL mixes toward ambientIntensity*edgeColor (vtkPolyDataFS :706) because
+    // the intensity is pre-applied to ambientColor; mirror that here.
+    r.ambient = mix(r.ambient, ambientIntensity * ec, emix * eo);
     // self-occlusion A-term (GL :736-737)
     float A = tnorm.z;
     rdist = 0.5 * rdist + 0.5 * (rdist + A) / (1.0 + abs(A));
@@ -455,7 +458,10 @@ inline void applySurfaceEdges(thread float3& N,
     float3 tubeN = normalize(rdist * tnorm + N * lenZ);
     N = mix(N, tubeN, emix);
   } else {
-    // flat branch (RenderLinesAsTubes off)
+    // flat branch (RenderLinesAsTubes off): GL mixes toward the FULL edge
+    // color (vtkPolyDataFS :713), so the pre-applied intensity must be
+    // dropped. This is what makes edges render at their SetEdgeColor even when
+    // the property ambient coefficient is 0.
     r.diffuse = mix(r.diffuse, float3(0.0), emix * eo);
     r.ambient = mix(r.ambient, ec,            emix * eo);
   }
@@ -671,12 +677,19 @@ inline FragmentColorAndIds evaluateSurfaceFragment(VertexOut in,
     r.opacity = m.opacity;
   }
 
+  // GL pre-applies the ambient intensity to ambientColor (ambientIntensity *
+  // ambientColorUniform, vtkOpenGLPolyDataMapper Color::Impl) and the edge mix
+  // then replaces that whole value with the full edge color. Pre-apply here so
+  // the flat edge branch can drop the intensity exactly like GL; surfaces with
+  // no edges see the same totalAmbient either way.
+  r.ambient = m.ambientColor.w * r.ambient;
+
   if (kHasEdgeFlags)
   {
-    applySurfaceEdges(N, r, in, lights, edge, scene);
+    applySurfaceEdges(N, r, in, lights, edge, scene, m.ambientColor.w);
   }
 
-  float3 totalAmbient = m.ambientColor.w * r.ambient;
+  float3 totalAmbient = r.ambient;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
@@ -872,9 +885,12 @@ fragment OITAccumulateOutput fragment_main_oit(VertexOut in [[stage_in]],
   {
     r.opacity = in.vertexColor.a * r.opacity;
   }
-  applySurfaceEdges(N, r, in, lights, edge, scene);
+  // Pre-apply the ambient intensity so applySurfaceEdges can replace it with
+  // the full edge color (see evaluateSurfaceFragment).
+  r.ambient = m.ambientColor.w * r.ambient;
+  applySurfaceEdges(N, r, in, lights, edge, scene, m.ambientColor.w);
 
-  float3 totalAmbient = m.ambientColor.w * r.ambient;
+  float3 totalAmbient = r.ambient;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
@@ -1713,7 +1729,10 @@ fragment GradientFragmentOutput fragment_gradient_background(
     color += mix(-granularity, granularity, noise);
   }
   GradientFragmentOutput out;
-  out.color = float4(color, 1.0);
+  // GL: the flat background is the clear color (alpha = BackgroundAlpha, no
+  // overlay is drawn); the gradient overlay writes alpha 1.0. The alpha is
+  // carried in stopColors[0].a to match both.
+  out.color = float4(color, u.stopColors[0].a);
   out.ids = uint4(0u, 0u, 0u, 0u);
   return out;
 }
@@ -1823,8 +1842,11 @@ fragment PeelPassOutput fragment_peel(
   {
     r.opacity = in.vertexColor.a * r.opacity;
   }
-  applySurfaceEdges(N, r, in, lights, edge, scene);
-  float3 totalAmbient = m.ambientColor.w * r.ambient;
+  // Pre-apply the ambient intensity so applySurfaceEdges can replace it with
+  // the full edge color (see evaluateSurfaceFragment).
+  r.ambient = m.ambientColor.w * r.ambient;
+  applySurfaceEdges(N, r, in, lights, edge, scene, m.ambientColor.w);
+  float3 totalAmbient = r.ambient;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 

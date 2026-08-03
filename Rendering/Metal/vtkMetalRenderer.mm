@@ -77,12 +77,21 @@ public:
   {
     vtkMetalMRC::ReleaseAndNil(BackgroundTexture);
     vtkMetalMRC::ReleaseAndNil(BackgroundSampler);
+    vtkMetalMRC::ReleaseAndNil(GradientStateBuffer);
   }
 
   vtkWeakPointer<vtkTexture> CachedBackground;
   vtkMTimeType CachedBackgroundMTime = 0;
   id<MTLTexture> BackgroundTexture = nil;
   id<MTLSamplerState> BackgroundSampler = nil;
+
+  // Per-renderer gradient-background uniform buffer. A single static shared
+  // buffer is unsafe in multi-viewport windows: every renderer overwrites its
+  // contents in place while the GPU executes the previously committed command
+  // buffers asynchronously, so every section would show the LAST renderer's
+  // background. Each renderer owns its own copy, written only during its own
+  // DeviceRender pass.
+  id<MTLBuffer> GradientStateBuffer = nil;
 };
 
 vtkStandardNewMacro(vtkMetalRenderer);
@@ -340,7 +349,7 @@ void vtkMetalRenderer::DeviceRender()
       // Set viewport
       MTLViewport metalViewport;
       metalViewport.originX = viewport[0] * winSize[0];
-      metalViewport.originY = viewport[1] * winSize[1];
+      metalViewport.originY = (1.0 - viewport[3]) * winSize[1];
       metalViewport.width = (viewport[2] - viewport[0]) * winSize[0];
       metalViewport.height = (viewport[3] - viewport[1]) * winSize[1];
       metalViewport.znear = 0.0;
@@ -362,7 +371,13 @@ void vtkMetalRenderer::DeviceRender()
       vtkTexture* currentTexturedBackground =
         this->GetTexturedBackground() ? this->GetCurrentTexturedBackground() : nullptr;
 
-      if (!this->Transparent() && this->GetGradientBackground() && !currentTexturedBackground)
+      // The background must be painted for EVERY renderer in its own viewport
+      // region. The first renderer's MTLLoadActionClear only fills the whole
+      // attachment with the first renderer's color; without this pass the
+      // later renderers in a multi-viewport window would leave their regions
+      // showing the first renderer's clear color. When gradient mode is off
+      // the same pass paints a flat Background color (Background2 == Background).
+      if (!this->Transparent() && !currentTexturedBackground)
       {
         static id<MTLRenderPipelineState> gradientPipeline = nil;
         static int gradientPipelineSampleCount = 0;
@@ -414,29 +429,46 @@ void vtkMetalRenderer::DeviceRender()
 
         if (gradientPipeline)
         {
-          static id<MTLBuffer> gradientStateBuffer = nil;
-          if (!gradientStateBuffer)
+          if (!this->Internals->GradientStateBuffer)
           {
-            gradientStateBuffer = [device newBufferWithLength:sizeof(float) * 16
-                                                     options:MTLResourceStorageModeShared];
+            this->Internals->GradientStateBuffer =
+              [device newBufferWithLength:sizeof(float) * 16
+                                  options:MTLResourceStorageModeShared];
           }
-          if (gradientStateBuffer)
+          if (this->Internals->GradientStateBuffer)
           {
             double bg[3], bg2[3];
             this->GetBackground(bg);
             this->GetBackground2(bg2);
-            float* state = (float*)[gradientStateBuffer contents];
+            // In flat (non-gradient) mode the "gradient" shader gets equal top
+            // and bottom colors so it paints a constant Background.
+            if (!this->GetGradientBackground())
+            {
+              bg2[0] = bg[0];
+              bg2[1] = bg[1];
+              bg2[2] = bg[2];
+            }
+            // GL: the flat background is the clear color (alpha =
+            // BackgroundAlpha, no overlay drawn); the gradient overlay writes
+            // alpha 1.0. Mirror that in the stop-color alpha the shader emits.
+            const float bgAlpha = this->GetGradientBackground()
+              ? 1.0f
+              : static_cast<float>(this->GetBackgroundAlpha());
+            float* state =
+              (float*)[this->Internals->GradientStateBuffer contents];
             state[0] = static_cast<float>(bg[0]);
             state[1] = static_cast<float>(bg[1]);
             state[2] = static_cast<float>(bg[2]);
-            state[3] = 1.0f;
+            state[3] = bgAlpha;
             state[4] = static_cast<float>(bg2[0]);
             state[5] = static_cast<float>(bg2[1]);
             state[6] = static_cast<float>(bg2[2]);
-            state[7] = 1.0f;
+            state[7] = bgAlpha;
             int* istate = (int*)&state[8];
             istate[0] = static_cast<int>(this->GetGradientMode());
-            istate[1] = this->GetDitherGradient() ? 1 : 0;
+            // GL only draws (and dithers) the overlay when gradient mode is on;
+            // the flat background is a plain clear, so no dither noise there.
+            istate[1] = (this->GetGradientBackground() && this->GetDitherGradient()) ? 1 : 0;
             float* fstate = (float*)&state[12];
             fstate[0] = static_cast<float>(size[0]);
             fstate[1] = static_cast<float>(size[1]);
@@ -445,7 +477,7 @@ void vtkMetalRenderer::DeviceRender()
             [encoder setDepthStencilState:sReadOnlyDepthState];
             [encoder setCullMode:MTLCullModeNone];
             [encoder setVertexBuffer:nil offset:0 atIndex:0];
-            [encoder setFragmentBuffer:gradientStateBuffer offset:0 atIndex:0];
+            [encoder setFragmentBuffer:this->Internals->GradientStateBuffer offset:0 atIndex:0];
             [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
           }
         }
@@ -780,7 +812,7 @@ void vtkMetalRenderer::DeviceRender()
 
       MTLViewport metalViewport;
       metalViewport.originX = viewport[0] * winSize[0];
-      metalViewport.originY = viewport[1] * winSize[1];
+      metalViewport.originY = (1.0 - viewport[3]) * winSize[1];
       metalViewport.width = (viewport[2] - viewport[0]) * winSize[0];
       metalViewport.height = (viewport[3] - viewport[1]) * winSize[1];
       metalViewport.znear = 0.0;
@@ -895,7 +927,7 @@ void vtkMetalRenderer::DeviceRender()
 
       MTLViewport metalViewport;
       metalViewport.originX = viewport[0] * winSize[0];
-      metalViewport.originY = viewport[1] * winSize[1];
+      metalViewport.originY = (1.0 - viewport[3]) * winSize[1];
       metalViewport.width = (viewport[2] - viewport[0]) * winSize[0];
       metalViewport.height = (viewport[3] - viewport[1]) * winSize[1];
       metalViewport.znear = 0.0;
@@ -1043,7 +1075,7 @@ void vtkMetalRenderer::DeviceRender()
               // Set viewport to full window
               MTLViewport metalViewport;
               metalViewport.originX = viewport[0] * winSize[0];
-              metalViewport.originY = viewport[1] * winSize[1];
+              metalViewport.originY = (1.0 - viewport[3]) * winSize[1];
               metalViewport.width = (viewport[2] - viewport[0]) * winSize[0];
               metalViewport.height = (viewport[3] - viewport[1]) * winSize[1];
               metalViewport.znear = 0.0;
@@ -1127,7 +1159,7 @@ void vtkMetalRenderer::DeviceRender()
 
       MTLViewport metalViewport;
       metalViewport.originX = viewport[0] * winSize[0];
-      metalViewport.originY = viewport[1] * winSize[1];
+      metalViewport.originY = (1.0 - viewport[3]) * winSize[1];
       metalViewport.width = (viewport[2] - viewport[0]) * winSize[0];
       metalViewport.height = (viewport[3] - viewport[1]) * winSize[1];
       metalViewport.znear = 0.0;

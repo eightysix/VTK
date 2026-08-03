@@ -244,7 +244,7 @@ int vtkMetalOrderIndependentTranslucentPass::RenderTranslucentGeometry(
 
     MTLViewport metalViewport;
     metalViewport.originX = viewport[0] * winWidth;
-    metalViewport.originY = viewport[1] * winHeight;
+    metalViewport.originY = (1.0 - viewport[3]) * winHeight;
     metalViewport.width = (viewport[2] - viewport[0]) * winWidth;
     metalViewport.height = (viewport[3] - viewport[1]) * winHeight;
     metalViewport.znear = 0.0;
@@ -276,7 +276,7 @@ int vtkMetalOrderIndependentTranslucentPass::RenderTranslucentGeometry(
 
     MTLViewport vp;
     vp.originX = viewport[0] * winWidth;
-    vp.originY = viewport[1] * winHeight;
+    vp.originY = (1.0 - viewport[3]) * winHeight;
     vp.width = (viewport[2] - viewport[0]) * winWidth;
     vp.height = (viewport[3] - viewport[1]) * winHeight;
     vp.znear = 0.0;

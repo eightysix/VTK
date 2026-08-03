@@ -381,6 +381,12 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   float CachedLineWidth = -1.0f;     // P3-3A: track line width changes
   int CachedSampleCount = 0;        // 8A: track MSAA sample count changes
   vtkMTimeType CachedScalarMTime = 0;
+  // The MTime of the actor that produced the current geometry buffers. A single
+  // mapper may be shared by multiple actors (each with its own property colors
+  // baked into the geometry), so the rebuild gate must include the actor's own
+  // MTime — the mapper's MTime alone cannot distinguish them once the input
+  // pipeline has stamped it during the first render.
+  vtkMTimeType CachedActorMTime = 0;
 
   // Weak reference to the owning render window (set by RenderPiece).
   // Used by Ensure* methods to access the cached shader library.
@@ -415,6 +421,12 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
       id<MTLBuffer> buffer;
       NSUInteger offset;
       NSUInteger index;
+      // When >= 0, this binding is one of the mapper's per-frame uniform
+      // buffers (see UniformSlot below). The recorded buffer pointer is a
+      // template; at replay time the current (renderer, actor)'s copy of that
+      // slot is substituted, so a draw never reads uniforms that a later
+      // renderer/actor overwrote in place while the GPU executed asynchronously.
+      int uniformSlot = -1;
     };
     struct SetTextureParams
     {
@@ -464,6 +476,67 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   };
 
   RenderBundle Bundle;
+
+  // Per-(renderer, actor) uniform-buffer slots. The mapper's uniform buffers
+  // (scene/camera, material, lights, ...) are single shared buffers updated in
+  // place for the current renderer and actor while the mapper records its draw
+  // commands. Command buffers are committed per renderer and executed by the
+  // GPU asynchronously, so without per-(renderer, actor) storage every draw in
+  // a multi-viewport window (or with actors sharing one mapper) would read the
+  // LAST renderer's camera / LAST actor's material. Each (renderer, actor)
+  // gets its own copy, written from the shared template in RenderPiece and
+  // substituted at bundle-replay time.
+  enum UniformSlot
+  {
+    kUniformScene = 0,
+    kUniformMaterial = 1,
+    kUniformLight = 2,
+    kUniformCoincidentOffset = 3,
+    kUniformEdge = 4,
+    kUniformVertexColor = 5,
+    kUniformClipPlane = 6,
+    kUniformPropId = 7,
+    kUniformEdgeColor = 8,
+    kUniformThickLineWidth = 9,
+    kUniformMiterJoinSegments = 10,
+    kUniformEdgeTubeSegments = 11,
+    kUniformSlotCount = 12
+  };
+
+  struct PerRendererActorUniforms
+  {
+    id<MTLBuffer> Buffers[kUniformSlotCount] = { nil };
+
+    void Release()
+    {
+      for (int i = 0; i < kUniformSlotCount; ++i)
+      {
+        vtkMetalMRC::ReleaseAndNil(Buffers[i]);
+      }
+    }
+  };
+
+  std::map<std::pair<vtkRenderer*, vtkActor*>, PerRendererActorUniforms>
+    RendererActorUniforms;
+
+  PerRendererActorUniforms* GetRendererActorUniforms(vtkRenderer* ren, vtkActor* act)
+  {
+    if (!ren || !act)
+    {
+      return nullptr;
+    }
+    return &this->RendererActorUniforms[std::make_pair(ren, act)];
+  }
+
+  PerRendererActorUniforms* FindRendererActorUniforms(vtkRenderer* ren, vtkActor* act)
+  {
+    if (!ren || !act)
+    {
+      return nullptr;
+    }
+    auto it = this->RendererActorUniforms.find(std::make_pair(ren, act));
+    return (it != this->RendererActorUniforms.end()) ? &it->second : nullptr;
+  }
 
   // Bundle validity tracking — detects when the bundle needs rebuilding.
   // Bundle is valid only when ALL of these match the values at bundle creation time.
@@ -631,6 +704,12 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     vtkMetalMRC::ReleaseAndNil(ZeroEdgeUVBuffer);
     vtkMetalMRC::ReleaseAndNil(ZeroCellPrimitiveIdBuffer);
 
+    for (auto& kv : RendererActorUniforms)
+    {
+      kv.second.Release();
+    }
+    RendererActorUniforms.clear();
+
     HasSurfaceAlpha = false;
 
     TrianglePrimitiveCount = 0;
@@ -688,6 +767,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     CachedBatchOverrideMTime = 0;
     BundleBatchOverrideMTime = 0;
     CachedScalarMTime = 0;
+    CachedActorMTime = 0;
   }
 
   ~vtkMetalPolyDataMapperInternals()
@@ -793,10 +873,16 @@ void vtkMetalPolyDataMapper::RemoveAllVertexAttributeMappings()
 // 8C: Render bundle — replay cached encoder commands on the current render encoder.
 // Uniform buffers (scene, material, light, etc.) are updated in-place each frame,
 // so replaying the same buffer bindings reads the latest content automatically.
-void vtkMetalPolyDataMapper::ReplayRenderBundle(void* mtlEncoder)
+// Buffer bindings tagged with a UniformSlot are swapped for the current
+// (renderer, actor)'s copy: the recorded pointer is only a template, because the
+// shared buffers are overwritten by each renderer/actor while the GPU executes
+// the previously committed command buffers asynchronously.
+void vtkMetalPolyDataMapper::ReplayRenderBundle(
+  void* mtlEncoder, vtkRenderer* ren, vtkActor* act)
 {
   id<MTLRenderCommandEncoder> encoder = (id<MTLRenderCommandEncoder>)mtlEncoder;
   using Cmd = vtkMetalPolyDataMapperInternals::RenderBundleDrawCommand;
+  auto* uniforms = this->Internals->FindRendererActorUniforms(ren, act);
   for (const auto& cmd : this->Internals->Bundle.Commands)
   {
     switch (cmd.type)
@@ -807,13 +893,30 @@ void vtkMetalPolyDataMapper::ReplayRenderBundle(void* mtlEncoder)
       case Cmd::SetVertexBuffer:
       {
         const auto& p = std::get<Cmd::SetBufferParams>(cmd.params);
-        [encoder setVertexBuffer:p.buffer offset:p.offset atIndex:p.index];
+        id<MTLBuffer> buffer = p.buffer;
+        if (p.uniformSlot >= 0 && uniforms && uniforms->Buffers[p.uniformSlot])
+        {
+          buffer = uniforms->Buffers[p.uniformSlot];
+        }
+        [encoder setVertexBuffer:buffer offset:p.offset atIndex:p.index];
         break;
       }
       case Cmd::SetFragmentBuffer:
       {
         const auto& p = std::get<Cmd::SetBufferParams>(cmd.params);
-        [encoder setFragmentBuffer:p.buffer offset:p.offset atIndex:p.index];
+        id<MTLBuffer> buffer = p.buffer;
+        if (p.uniformSlot >= 0 && uniforms && uniforms->Buffers[p.uniformSlot])
+        {
+          buffer = uniforms->Buffers[p.uniformSlot];
+        }
+        if (getenv("DBG_EDGE") && p.index == 4)
+        {
+          float* fb = (float*)[buffer contents];
+          fprintf(stderr, "[DBG] Replay setFragmentBuffer(4) act=%p slot=%d buf=%p data=(%f,%f,%f,%f) len=%llu\n",
+            (void*)act, p.uniformSlot, (void*)buffer, fb[0], fb[1], fb[2], fb[3],
+            (unsigned long long)[buffer length]);
+        }
+        [encoder setFragmentBuffer:buffer offset:p.offset atIndex:p.index];
         break;
       }
       case Cmd::SetFragmentTexture:
@@ -884,6 +987,24 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   auto& commands = this->Internals->Bundle.Commands;
   commands.clear();
 
+  // Map the mapper's shared per-frame uniform buffers to their UniformSlots so
+  // recorded bindings can be tagged and swapped for the current (renderer,
+  // actor)'s copy at replay time. Only non-nil buffers are mapped (the record
+  // sites below also guard on nil).
+  std::map<id<MTLBuffer>, int> uniformSlotOf;
+  uniformSlotOf[this->Internals->SceneUniformBuffer] = this->Internals->kUniformScene;
+  uniformSlotOf[this->Internals->MaterialUniformBuffer] = this->Internals->kUniformMaterial;
+  uniformSlotOf[this->Internals->LightUniformBuffer] = this->Internals->kUniformLight;
+  uniformSlotOf[this->Internals->CoincidentOffsetBuffer] = this->Internals->kUniformCoincidentOffset;
+  uniformSlotOf[this->Internals->EdgeUniformBuffer] = this->Internals->kUniformEdge;
+  uniformSlotOf[this->Internals->VertexColorBuffer] = this->Internals->kUniformVertexColor;
+  uniformSlotOf[this->Internals->ClipPlaneBuffer] = this->Internals->kUniformClipPlane;
+  uniformSlotOf[this->Internals->PropIdBuffer] = this->Internals->kUniformPropId;
+  uniformSlotOf[this->Internals->EdgeColorUniformBuffer] = this->Internals->kUniformEdgeColor;
+  uniformSlotOf[this->Internals->ThickLineLineWidthBuffer] = this->Internals->kUniformThickLineWidth;
+  uniformSlotOf[this->Internals->MiterJoinSegmentCountBuffer] = this->Internals->kUniformMiterJoinSegments;
+  uniformSlotOf[this->Internals->EdgeTubeSegmentCountBuffer] = this->Internals->kUniformEdgeTubeSegments;
+
   // Helper lambdas to record encoder commands into the bundle
   auto recordPipeline = [&commands](id<MTLRenderPipelineState> pipeline) {
     Cmd cmd;
@@ -891,16 +1012,28 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
     cmd.params = PSParams{ pipeline };
     commands.push_back(cmd);
   };
-  auto recordVBuf = [&commands](id<MTLBuffer> buffer, NSUInteger offset, NSUInteger index) {
+  auto recordVBuf = [&commands, &uniformSlotOf](id<MTLBuffer> buffer, NSUInteger offset, NSUInteger index) {
     Cmd cmd;
     cmd.type = Cmd::SetVertexBuffer;
-    cmd.params = BufParams{ buffer, offset, index };
+    int slot = -1;
+    auto it = uniformSlotOf.find(buffer);
+    if (it != uniformSlotOf.end())
+    {
+      slot = it->second;
+    }
+    cmd.params = BufParams{ buffer, offset, index, slot };
     commands.push_back(cmd);
   };
-  auto recordFBuf = [&commands](id<MTLBuffer> buffer, NSUInteger offset, NSUInteger index) {
+  auto recordFBuf = [&commands, &uniformSlotOf](id<MTLBuffer> buffer, NSUInteger offset, NSUInteger index) {
     Cmd cmd;
     cmd.type = Cmd::SetFragmentBuffer;
-    cmd.params = BufParams{ buffer, offset, index };
+    int slot = -1;
+    auto it = uniformSlotOf.find(buffer);
+    if (it != uniformSlotOf.end())
+    {
+      slot = it->second;
+    }
+    cmd.params = BufParams{ buffer, offset, index, slot };
     commands.push_back(cmd);
   };
   auto recordFTex = [&commands](id<MTLTexture> texture, NSUInteger index) {
@@ -2128,13 +2261,15 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     }
 
     vtkMTimeType batchOverrideMTime = this->Internals->BatchOverrideMTime;
+    vtkMTimeType actorMTime = act ? act->GetMTime() : 0;
 
     if (currentMTime != this->Internals->CachedInputMTime ||
         representation != this->Internals->CachedRepresentation ||
         edgeVisibility != this->Internals->CachedEdgeVisibility ||
         extraMTime != this->Internals->CachedExtraAttributesMTime ||
         scalarMTime != this->Internals->CachedScalarMTime ||
-        batchOverrideMTime != this->Internals->CachedBatchOverrideMTime)
+        batchOverrideMTime != this->Internals->CachedBatchOverrideMTime ||
+        actorMTime != this->Internals->CachedActorMTime)
     {
       this->Internals->ReleaseBuffers();
       this->Internals->CachedInputMTime = currentMTime;
@@ -2143,6 +2278,7 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       this->Internals->CachedExtraAttributesMTime = extraMTime;
       this->Internals->CachedScalarMTime = scalarMTime;
       this->Internals->CachedBatchOverrideMTime = batchOverrideMTime;
+      this->Internals->CachedActorMTime = actorMTime;
       this->BuildGeometryBuffers((void*)device, input, act);
     }
 
@@ -2513,6 +2649,50 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       [sDesc release];
     }
 
+    // Per-(renderer, actor) uniform buffer copies. The mapper's uniform buffers
+    // (scene/camera, material, lights, ...) are single shared buffers updated
+    // in place for the current renderer/actor while the draw commands are
+    // recorded. Command buffers are committed per renderer and the GPU executes
+    // them asynchronously, so without per-(renderer, actor) storage every draw
+    // would read the LAST renderer's camera (multi-viewport aspect distortion)
+    // or LAST actor's material (shared-mapper color leaks). Each (renderer,
+    // actor) renders through its own copy, substituted at bundle-replay time.
+    if (auto* uniforms = this->Internals->GetRendererActorUniforms(ren, act))
+    {
+      auto syncSlot = [&](int slot, id<MTLBuffer> shared) {
+        if (!shared)
+        {
+          return;
+        }
+        id<MTLBuffer>& target = uniforms->Buffers[slot];
+        if (!target || [target length] != [shared length])
+        {
+          vtkMetalMRC::AssignConsumed(target,
+            [device newBufferWithLength:[shared length]
+                                options:MTLResourceStorageModeShared]);
+        }
+        memcpy([target contents], [shared contents], [shared length]);
+      };
+      syncSlot(this->Internals->kUniformScene, this->Internals->SceneUniformBuffer);
+      syncSlot(this->Internals->kUniformMaterial, this->Internals->MaterialUniformBuffer);
+      syncSlot(this->Internals->kUniformLight, this->Internals->LightUniformBuffer);
+      syncSlot(this->Internals->kUniformCoincidentOffset, this->Internals->CoincidentOffsetBuffer);
+      syncSlot(this->Internals->kUniformEdge, this->Internals->EdgeUniformBuffer);
+      if (getenv("DBG_EDGE"))
+      {
+        float* ec = (float*)[uniforms->Buffers[this->Internals->kUniformEdge] contents];
+        fprintf(stderr, "[DBG] sync edge slot act=%p copy=(%f,%f,%f,%f)\n",
+          (void*)act, ec[0], ec[1], ec[2], ec[3]);
+      }
+      syncSlot(this->Internals->kUniformVertexColor, this->Internals->VertexColorBuffer);
+      syncSlot(this->Internals->kUniformClipPlane, this->Internals->ClipPlaneBuffer);
+      syncSlot(this->Internals->kUniformPropId, this->Internals->PropIdBuffer);
+      syncSlot(this->Internals->kUniformEdgeColor, this->Internals->EdgeColorUniformBuffer);
+      syncSlot(this->Internals->kUniformThickLineWidth, this->Internals->ThickLineLineWidthBuffer);
+      syncSlot(this->Internals->kUniformMiterJoinSegments, this->Internals->MiterJoinSegmentCountBuffer);
+      syncSlot(this->Internals->kUniformEdgeTubeSegments, this->Internals->EdgeTubeSegmentCountBuffer);
+    }
+
     // 8C: Render bundle — check if cached encoder commands can be replayed.
     // Bundle is valid when geometry, representation, edge visibility, line width,
     // MSAA sample count, and depth peeling mode all match the values at bundle creation.
@@ -2566,12 +2746,12 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
 
     if (allowBundleCaching && bundleValid)
     {
-      this->ReplayRenderBundle((void*)encoder);
+      this->ReplayRenderBundle((void*)encoder, ren, act);
     }
     else
     {
       this->RebuildRenderBundle((void*)encoder, ren, act);
-      this->ReplayRenderBundle((void*)encoder);
+      this->ReplayRenderBundle((void*)encoder, ren, act);
 
       if (!allowBundleCaching)
       {
@@ -6695,6 +6875,12 @@ void vtkMetalPolyDataMapper::UpdateEdgeUniforms(void* mtlDevice, vtkActor* actor
   }
 
   memcpy([this->Internals->EdgeUniformBuffer contents], &e, sizeof(e));
+
+  if (getenv("DBG_EDGE"))
+  {
+    fprintf(stderr, "[DBG] UpdateEdgeUniforms act=%p edgeColor=(%f,%f,%f,%f) flags=%u\n",
+      (void*)actor, e.edgeColor[0], e.edgeColor[1], e.edgeColor[2], e.edgeColor[3], e.flags);
+  }
 }
 
 //------------------------------------------------------------------------------

@@ -145,7 +145,7 @@ protected:
   void EnsureRequiredBindingFallbacks(void* mtlDevice);
 
   // 8C: Render bundle caching — pre-recorded encoder commands for static geometry
-  void ReplayRenderBundle(void* mtlRenderCommandEncoder);
+  void ReplayRenderBundle(void* mtlRenderCommandEncoder, vtkRenderer* ren, vtkActor* act);
   void RebuildRenderBundle(void* mtlRenderCommandEncoder, vtkRenderer* ren, vtkActor* act);
 
 private:

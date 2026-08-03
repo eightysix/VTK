@@ -113,6 +113,7 @@ def main(argv=None):
             passing_named = {"TestAreaSelections", "TestHardwareSelector",
                              "TestAxesActor", "TestReadPixels",
                              "TestSelectVisiblePoints", "TestWorldPointPicker",
+                             "TestRemoveActors",
                              "TestCompositePolyDataMapperBlockTextures",
                              "TestCompositePolyDataMapperOverrideLUT",
                              "TestCompositePolyDataMapperOverrideScalarArray",
@@ -120,7 +121,16 @@ def main(argv=None):
                              "TestTextureInterpolateScalars",
                              "TestTranslucentLUTTextureAlphaBlending",
                              "TestTranslucentLUTTextureDepthPeeling",
-                             "TestOpacityMSAA", "TestActor2D"}
+                             "TestOpacityMSAA", "TestActor2D",
+                             "TestTexturedBackground", "TestStereoBackgroundLeft",
+                             "TestStereoBackgroundRight",
+                             "TestGlyph3DMapperIndexing", "TestGlyph3DMapperTreeIndexing",
+                             "TestWireframe", "TestSurfacePlusEdges",
+                             "TestTexturedCylinder", "TestEdgeThickness",
+                             "TestNActorsOneMapper", "TestNActorsNMappersOneInput",
+                             "TestNViewportsOneActor", "TestNViewportsNActorsOneMapper",
+                             "TestNViewportsNActorsNMappersOneInput",
+                             "TestNViewportsNActorsNMappersNInputs"}
             regressed = sorted((fails | aborts) & passing_named)
             print("\nREGRESSION CHECK vs TESTING_STATE.md passing cluster:")
             print("  " + (", ".join(regressed) if regressed else "none"))
