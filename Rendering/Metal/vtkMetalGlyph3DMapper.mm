@@ -1028,12 +1028,15 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     memcpy([I->SceneBuffer contents], cam->GetCachedSceneTransforms(),
            vtkMetalCamera::GetSceneTransformsSize());
     {
-      // SceneUniforms.flags lives at float offset 64 (see SceneUniforms in
-      // MetalShaders.metal); clear the glyph-has-normals bit here (the camera
-      // never sets it) and OR it in per-draw before each source is rendered.
-      float* s = static_cast<float*>([I->SceneBuffer contents]);
-      unsigned flags = (unsigned)s[64];
-      s[64] = (float)(flags & ~VTK_METAL_SCENE_FLAG_GLYPH_HAS_NORMALS);
+      // SceneUniforms.flags is a uint at byte offset 256 (see SceneUniforms in
+      // MetalShaders.metal; float offset 64); clear the glyph-has-normals bit
+      // here (the camera never sets it) and OR it in per-draw before each
+      // source is rendered. The camera writes Flags as a raw uint, so the
+      // read/modify/write must be a bit-pattern reinterpret — a float cast
+      // would numerically convert the value and corrupt the bits.
+      char* s = static_cast<char*>([I->SceneBuffer contents]);
+      uint32_t flags = *reinterpret_cast<uint32_t*>(s + 256);
+      *reinterpret_cast<uint32_t*>(s + 256) = flags & ~VTK_METAL_SCENE_FLAG_GLYPH_HAS_NORMALS;
     }
   }
 
@@ -1219,10 +1222,12 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
       return;
     // Per-source scene flag: signal the glyph fragment whether this source
     // carries point normals so it can skip the derivative-based fallback.
-    float* sc = static_cast<float*>([I->SceneBuffer contents]);
-    unsigned flags = (unsigned)sc[64];
-    sc[64] = (float)((flags & ~VTK_METAL_SCENE_FLAG_GLYPH_HAS_NORMALS) |
-      (g.HasNormals ? VTK_METAL_SCENE_FLAG_GLYPH_HAS_NORMALS : 0));
+    // Bit-pattern uint access (see the note at the memcpy site above).
+    char* sc = static_cast<char*>([I->SceneBuffer contents]);
+    uint32_t flags = *reinterpret_cast<uint32_t*>(sc + 256);
+    *reinterpret_cast<uint32_t*>(sc + 256) =
+      (flags & ~VTK_METAL_SCENE_FLAG_GLYPH_HAS_NORMALS) |
+      (g.HasNormals ? VTK_METAL_SCENE_FLAG_GLYPH_HAS_NORMALS : 0);
 
     [enc setRenderPipelineState:pipeline];
     [enc setVertexBuffer:g.PositionBuffer offset:0 atIndex:kGlyphSrcPosition];
