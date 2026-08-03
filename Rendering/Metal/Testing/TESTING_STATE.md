@@ -16,8 +16,8 @@ Two test surfaces exist:
 2. The generic multi-backend suite in `Rendering/Core/Testing/Cxx/`, which
    registers the same ~175 tests once per backend and was wired up for Metal
    through    object-factory overrides (`--vtk-factory-prefer
-    RenderingBackend=Metal`). Historical status: **55 pass / 120 fail (33
-     crash)**. Current working-tree status: **119 pass / 53 fail (3 crash)** —
+     RenderingBackend=Metal`). Historical status: **55 pass / 120 fail (33
+      crash)**. Current working-tree status: **123 pass / 49 fail (3 crash)** —
      the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
      factory override, the 8 composite-mapper `BuildGeometryBuffers` crashes by
      a `mappedColors != nullptr` guard (they now render), `TestOpacityMSAA` by
@@ -49,11 +49,15 @@ Two test surfaces exist:
      alpha/dither fix restored `TestReadPixels`/`TestRemoveActors`, and the eight
      sub-viewport `vtkImageMapper` tests (`TestImageMapper_1..4`,
      `TestDirectScalarsToColors`, `TestBareScalarsToColors`,
-     `TestMapVectorsAsRGBColors`, `TestMapVectorsToColors`) now pass via the 2D
-     image-mapper viewport-WCVC fix (see the 2D image-mapper section below). No
-     new crashes
-     were introduced. The pass count
-     fluctuates run to run (run-to-run flakiness).
+      `TestMapVectorsAsRGBColors`, `TestMapVectorsToColors`) now pass via the 2D
+      image-mapper viewport-WCVC fix (see the 2D image-mapper section below), and
+      the four triangle-strip tests
+      `TestTStrips{TCoords,NormalsTCoords,NormalsColorsTCoords,ColorsTCoords}` now
+      pass via CPU-side strip decomposition plus the property-texture fallback
+      (see the triangle-strip section below). No
+      new crashes
+      were introduced. The pass count
+      fluctuates run to run (run-to-run flakiness).
 
 ---
 
@@ -154,7 +158,7 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  119 Passed  53 Failed (incl. image/pick fails)  3 "Subprocess aborted"
+175 tests:  123 Passed  49 Failed (incl. image/pick fails)  3 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
@@ -258,6 +262,18 @@ ImageErrors ~1e-07-1e-06, all were gross- or mid-bucket fails), the first time
 any of the eight have passed; see the 2D image-mapper viewport-WCVC section
 below. The +8 pass delta over the previous run is exactly those eight tests; the
 3 aborts are unchanged (`TestLabeledContourMapper`,
+`TestLabeledContourMapperNoLabels`, `TestLabeledContourMapperWithActorMatrix`).
+The regression check against the documented passing cluster reports none.
+Run after the triangle-strip support fix (this run, 2026-08-03): 123 Passed /
+49 Failed / 3 aborted out of 175 (analyzed with `analyze_metal_ctest_log.py`
+from a single `ctest -R "RenderingCoreCxx-Metal" -j 8` run; failures exported
+with `export_image_compare.sh`) — the four `TestTStrips*` tests
+(`TestTStripsColorsTCoords`, `TestTStripsNormalsColorsTCoords`,
+`TestTStripsNormalsTCoords`, `TestTStripsTCoords`) now pass, the first time any
+have passed; they were gross/mid-bucket fails (0.4035/0.5062) that rendered only
+the background because the mapper dropped `GetStrips()` geometry (see the
+triangle-strip section below). The +4 pass delta over the previous run is exactly
+those four tests; the 3 aborts are unchanged (`TestLabeledContourMapper`,
 `TestLabeledContourMapperNoLabels`, `TestLabeledContourMapperWithActorMatrix`).
 The regression check against the documented passing cluster reports none.
 
@@ -540,17 +556,64 @@ scalar-LUT tests: `TestCompositePolyDataMapperOverrideLUT`,
   `scalarCoords` load on the runtime scene flag so translucent non-LUT actors
   skip the read.
 
+### The triangle-strip cluster is fixed
+
+All four `TestTStrips*` tests (`TestTStripsColorsTCoords`,
+`TestTStripsNormalsColorsTCoords`, `TestTStripsNormalsTCoords`,
+`TestTStripsTCoords`) rendered only the turquoise background because the Metal
+poly-data mapper read `GetPolys()`/`GetLines()`/`GetVerts()` but never
+`GetStrips()`: the `vtkStripper` output geometry was silently dropped, so the
+beach-textured plane never drew (TIGHT_VALID 0.4035/0.5062).
+
+`vtkMetalPolyDataMapper` now treats strips as first-class geometry, mirroring
+GL's CPU-side decomposition in `vtkOpenGLIndexBufferObject::AppendStripIndexBuffer`
+(`vtkOpenGLIndexBufferObject.cxx:409`):
+
+- The surface path decomposes each strip with GL's winding
+  `tri_j = (v_j, v_{j+1+j%2}, v_{j+1+(j+1)%2})`, routed through the same
+  `emitSurfaceTriangle` helper as polygon fans (shared indexed dedup when
+  normals/conditions allow, non-indexed 3-vertices-per-triangle otherwise, the
+  per-primitive exact `cellPrimitiveIds` port, and the `useCellTexture` per-cell
+  color port).
+- The wireframe path emits GL's `AppendStripIndexBuffer(wireframe=true)` edge
+  set — `(v0,v1)` then the two outer edges `(v_j,v_{j+2})`, `(v_{j+1},v_{j+2})`
+  of each constituent triangle — through the shared wireframe vertex-dedup map.
+- Strip cells are first-class in the polydata cell array: the per-primitive cell
+  ids (cell colors, pick/ID pass) start at `polyCellOffset + numPolys`, and the
+  legacy edge-overlay (`UseLegacyEdgeOverlay`) extracts each strip's boundary
+  edges and emits edge tubes with the strip's absolute cell id for miter joins.
+- The GPU-tessellation path (`useGPUTess`) now falls back to the CPU path
+  whenever strips are present (`!hasStrips`), since the tess kernel only fans
+  polys; polys-only meshes are unaffected.
+- `vtkMetalPolyDataMapper2D` applies the same GL-winding decomposition to
+  `GetStrips()`.
+
+A second gap: the `TestTStrips*` suite sets its beach texture as a *named
+property texture* (`actor->GetProperty()->SetTexture("mytexture", texture)`),
+not `actor->SetTexture()`, so `UpdateActorTexture` saw no texture and the plane
+rendered white. The mapper now falls back to the first non-PBR-slot named
+property texture (skipping `albedoTex`/`normalTex`/`materialTex`/`brdfTex`/
+`emissiveTex`/`anisotropyTex`/`coatNormalTex`/`colortexture`, which GL's BRDF
+consumes rather than the diffuse sampler), mirroring how GL routes every bound
+2D texture through the diffuse `tcolor` path.
+
+All four tests now pass with the beach texture visible (TIGHT_VALID well under
+0.05). Regression check: the strips change only re-routes geometry that was
+previously dropped; the polys-only path produces identical vertex streams, and
+the full-suite fail count dropped exactly by the four strip tests with no new
+failures.
+
 ### Image-compare failures
 
-Current run (2026-08-03, 2D image-mapper viewport-WCVC-fix run): 53 failed = 49 image-compare
+Current run (2026-08-03, triangle-strip-support run): 49 failed = 45 image-compare
 (TIGHT_VALID >= 0.05) + 1 below-threshold pick-check + 3 non-image. Buckets by
 max `vtkTesting` TIGHT_VALID error per test (threshold 0.05):
 
 | Bucket | Range | Count | Examples |
 |--------|-------|-------|----------|
 | near-miss | 0.05 – 0.1 | 11 | `TestActorLightingFlag` 0.0513, `TestImageAndAnnotations` 0.0607, `TestPolyDataMapper2D` 0.0664, `TestEdgeFlags` 0.0681, `TestQuadPointRep` 0.0690, `TestMixedGeometry_3` 0.0701, `TestVertexRendering` 0.0724, `TestLineRenderingTranslucent` 0.0790, `TestGlyph3DMapperPicking` 0.0800, `RenderNonFinite` 0.0870, `TestMixedGeometryCellScalars` 0.0921 |
-| mid | 0.1 – 0.5 | 30 | `TestBackfaceCulling` 0.1016, `TestGlyph3DMapper` 0.1082, `TestPolyDataMapperClipPlanes` 0.1440, `TestCompositePolyDataMapperSpheres` 0.1499, `TestCompositePolyDataMapperPicking` 0.1712, `TestPointRenderingRound_3` 0.1933, `TestPointRendering_3` 0.2215, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.2241, `TestTransformCoordinateUseDouble` 0.2251, `TestCoincident` 0.2343, `TestStereoEyeSeparation` 0.2584, `TestCompositePolyDataMapperPartialFieldData` 0.2524, `TestPolyDataMapperNormals` 0.2698, `TestPolyDataMapper2DPointScalarColorMapping` 0.2861, `TestCompositePolyDataMapperVertices` 0.2891, `TestCompositePolyDataMapperCustomShader` 0.2897, `TestGlyph3DMapperBackfaceColor` 0.2914, `TestPolyDataMapper2DCellScalarColorMapping` 0.2943, `TestRenderLinesAsTubesOrthoCamera` 0.3263, `TestRenderLinesAsTubes` 0.3263, `TestResetCameraScreenSpace` 0.3438, `TestGradientBackground` 0.3449, `TestCompositePolyDataMapperCameraShiftScale` 0.3601, `TestPointRenderingRound_4` 0.3604, `TestPointRendering_4` 0.3811, `TestTStripsNormalsTCoords` 0.4035, `TestTStripsTCoords` 0.4035, `TestResizingWindowToImageFilter` 0.4130, `TestGlyph3DMapperPointSize` 0.4596, `TestColorByStringArrayDefaultLookupTable2D` 0.4821 |
-| gross | >= 0.5 | 8 | `TestTStripsNormalsColorsTCoords` 0.5062, `TestTStripsColorsTCoords` 0.5062, `TestGradientBackgroundWithTiledViewport` 0.5063, `TestGradientBackgroundWithTiledViewports` 0.5856, `TestOffAxisStereo` 0.5921, `TestTilingCxx` 0.6159, `TestSplitViewportStereoHorizontal` 0.6816, `TestActor2DTextures` 0.7862 |
+| mid | 0.1 – 0.5 | 28 | `TestBackfaceCulling` 0.1016, `TestGlyph3DMapper` 0.1082, `TestPolyDataMapperClipPlanes` 0.1440, `TestCompositePolyDataMapperSpheres` 0.1499, `TestCompositePolyDataMapperPicking` 0.1712, `TestPointRenderingRound_3` 0.1933, `TestPointRendering_3` 0.2215, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.2241, `TestTransformCoordinateUseDouble` 0.2251, `TestCoincident` 0.2343, `TestStereoEyeSeparation` 0.2584, `TestCompositePolyDataMapperPartialFieldData` 0.2498, `TestPolyDataMapperNormals` 0.2698, `TestPolyDataMapper2DPointScalarColorMapping` 0.2861, `TestCompositePolyDataMapperVertices` 0.2891, `TestCompositePolyDataMapperCustomShader` 0.2897, `TestGlyph3DMapperBackfaceColor` 0.2914, `TestPolyDataMapper2DCellScalarColorMapping` 0.2944, `TestRenderLinesAsTubesOrthoCamera` 0.3263, `TestRenderLinesAsTubes` 0.3263, `TestResetCameraScreenSpace` 0.3438, `TestGradientBackground` 0.3449, `TestCompositePolyDataMapperCameraShiftScale` 0.3601, `TestPointRenderingRound_4` 0.3604, `TestPointRendering_4` 0.3811, `TestResizingWindowToImageFilter` 0.4130, `TestGlyph3DMapperPointSize` 0.4596, `TestColorByStringArrayDefaultLookupTable2D` 0.4821 |
+| gross | >= 0.5 | 6 | `TestGradientBackgroundWithTiledViewport` 0.5063, `TestGradientBackgroundWithTiledViewports` 0.5856, `TestOffAxisStereo` 0.5921, `TestTilingCxx` 0.6159, `TestSplitViewportStereoHorizontal` 0.6816, `TestActor2DTextures` 0.7862 |
 
 (`TestNActors{OneMapper,NMappersOneInput}` left the mid bucket via the
 per-actor edge-color fix above (passing at ~1.2e-05), and
@@ -561,14 +624,18 @@ per-actor-edge-uniform work (the NViewports family was documented at gross
 `TestImageMapper_1..4`, `TestBareScalarsToColors`, `TestMapVectorsAsRGBColors`
 and `TestMapVectorsToColors` (all gross) plus `TestDirectScalarsToColors` (mid)
 left via the 2D image-mapper viewport-WCVC fix below — the first time any of the
-eight have passed (ImageErrors ~1e-07-1e-06).) The below-threshold
+eight have passed (ImageErrors ~1e-07-1e-06).) This run the mid bucket dropped
+from 30 to 28 and gross from 8 to 6: the four `TestTStrips*` tests (two at 0.4035
+mid, two at 0.5062 gross) left via the triangle-strip section below — the first
+time any have passed.) The below-threshold
 failure is `TestCompositePolyDataMapperPickability` (ImageError 0.0155 but fails
 its own pickability check). The 3 non-image failures: `TestPointSelection`,
 `TestPointSelectionWithCellData` (selection returns even-only point ids,
 pick-check fails) and `TestPickTextActor` (pick check). `TestReadPixels`,
 `TestSelectVisiblePoints` and `TestWorldPointPicker` left this set via the
-read-back cluster above, and the four scalar-LUT tests left it via the
-scalar-texture-LUT section above.
+read-back cluster above, the four scalar-LUT tests left it via the
+scalar-texture-LUT section above, and the four `TestTStrips*` tests left it via
+the triangle-strip section below.
 
 ### Crashes (3; all pre-existing classes, none from the texture or composite clusters)
 
@@ -688,7 +755,7 @@ unchanged — their errors are separate fidelity gaps (point rendering,
 thick-line/tube shading). `TestSurfacePlusEdges` and `TestEdgeThickness` (edge
 overlay) have since left the failure set with the per-actor edge-color fix above.
 
-### Theme clusters in the 53 failures
+### Theme clusters in the 49 failures
 
 - **Textures** (~13): every `TestTexture*`, `TestBackfaceTexture`,
   `TestTilingCxx`, `TestActor2DTextures` — historically
@@ -739,8 +806,11 @@ overlay) have since left the failure set with the per-actor edge-color fix above
   `TestStereoEyeSeparation`,
   `TestSplitViewportStereoHorizontal`, and 3
   `TestGradientBackground*` (0.34–0.59).
-- **TStrips** (4) fail 0.40–0.51; `TestPolyDataMapperNormals` (0.270) and
-  the wireframe-class `TestTStrips*` also sit in the mid bucket.
+- **Triangle strips** — DONE: the four `TestTStrips*` tests now pass via CPU-side
+  strip decomposition in `vtkMetalPolyDataMapper`/`vtkMetalPolyDataMapper2D`
+  (GL's `AppendStripIndexBuffer` winding) and the property-texture fallback in
+  `UpdateActorTexture` (see the triangle-strip section above);
+  `TestPolyDataMapperNormals` (0.270) remains in the mid bucket.
 
 ### Evidence the core path is correct
 
@@ -763,7 +833,9 @@ quad matches GL to 0.027), the textured-background cluster
 multi-viewport cluster (`TestNViewports*`), the eight sub-viewport
 `vtkImageMapper` tests (`TestImageMapper_1..4`, `TestDirectScalarsToColors`,
 `TestBareScalarsToColors`, `TestMapVectorsAsRGBColors`, `TestMapVectorsToColors`
-at ImageError ~1e-07-1e-06), and the basic
+at ImageError ~1e-07-1e-06), the four triangle-strip tests
+(`TestTStrips{TCoords,NormalsTCoords,NormalsColorsTCoords,ColorsTCoords}`, the
+first time any strip-geometry test has passed), and the basic
 Glyph3D,
 `FrustumClip`, `RGrid`, `TestQuad`. `Rendering/Metal/Testing/OpenGLComparison.md`
 shows every bespoke scene now matches OpenGL to a thresholded error of 0.000
@@ -829,7 +901,7 @@ not in the fundamental geometry/lighting/color path.
    `vtkOpenGLLabeledContourMapper::ApplyStencil`) against a Metal window; this
    needs Metal overrides for the label/text rendering stack.
  7. **Glyph instancing colors**, **2D overlay (image mapper done)**, **LUT/color
-      mapping**, **stereo/multiview + gradient background**, **TStrips** — all
+      mapping**, **stereo/multiview + gradient background** — all
       render but diverge from GL. (The glyph3D multi-source indexing tests
       `TestGlyph3DMapperIndexing`/`TreeIndexing` now pass — see the glyph3D
       multi-source indexing section above; `TestActor2D` now passes — see the
@@ -840,6 +912,14 @@ not in the fundamental geometry/lighting/color path.
       the closest 2D miss; the textured/stereo backgrounds `TestTexturedBackground`
       and `TestStereoBackground{Left,Right}` now pass — see the textured-background
       section above.)
+ 8. **Triangle strips — DONE** — `vtkMetalPolyDataMapper` and
+    `vtkMetalPolyDataMapper2D` now decompose `GetStrips()` on the CPU exactly like
+    GL's `AppendStripIndexBuffer` (shared indexed/non-indexed surface emit,
+    wireframe edges, strip cell ids after polys, legacy edge-overlay tubes), the
+    GPU-tess path falls back to CPU only when strips are present, and
+    `UpdateActorTexture` falls back to the property's named textures (the
+    `TestTStrips*` suite's `mytexture` beach texture) — all four `TestTStrips*`
+    tests now pass (see the triangle-strip section above).
 
 ---
 
@@ -894,12 +974,16 @@ now pass via the ambient-pre-applied edge shader, `TestReadPixels` and
 `TestRemoveActors` are restored via the flat-background alpha/dither fix, and
 `TestNViewportsNActors*`, `TestSurfacePlusEdges`, `TestTexturedCylinder`,
 `TestEdgeThickness`, `TestAxesActor` are gone from the failure set), and then
-after the 2D image-mapper viewport-WCVC fix
-(119 Passed / 53 Failed / 3 aborted — `TestImageMapper_1..4`,
-`TestDirectScalarsToColors`, `TestBareScalarsToColors`, `TestMapVectorsAsRGBColors`
-and `TestMapVectorsToColors` now pass via the size-only WCVC ortho in
-`vtkMetalImageMapper::DrawPixels`).
-The image-compare buckets above are from that latest run's `LastTest.log` (max
+ after the 2D image-mapper viewport-WCVC fix
+ (119 Passed / 53 Failed / 3 aborted — `TestImageMapper_1..4`,
+ `TestDirectScalarsToColors`, `TestBareScalarsToColors`, `TestMapVectorsAsRGBColors`
+ and `TestMapVectorsToColors` now pass via the size-only WCVC ortho in
+ `vtkMetalImageMapper::DrawPixels`), and then after the triangle-strip support fix
+ (123 Passed / 49 Failed / 3 aborted — the four `TestTStrips*` tests now pass via
+ CPU-side strip decomposition in `vtkMetalPolyDataMapper`/`vtkMetalPolyDataMapper2D`
+ matching GL's `AppendStripIndexBuffer`, plus the property-texture fallback in
+ `UpdateActorTexture`).
+ The image-compare buckets above are from that latest run's `LastTest.log` (max
 TIGHT_VALID error per test), analyzed with `analyze_metal_ctest_log.py`.
 Re-running is reproducible except where a crash's signal stack
 ordering varies; the pass count fluctuates run to run.

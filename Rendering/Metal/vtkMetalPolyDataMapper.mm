@@ -3159,9 +3159,15 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   // extraction. Moves fan triangulation off the CPU and produces edge arrays for free.
   // Falls back to CPU for per-cell coloring, computed normals, or small geometries.
   vtkCellArray* polys = polydata->GetPolys();
+  // P11-11A: Triangle strips are first-class geometry in OpenGL (a dedicated
+  // IBO decomposed on the CPU with strip winding); the GPU tessellation kernel
+  // only knows fan triangulation, so fall back to the CPU path (which handles
+  // strips below) whenever strips are present.
+  vtkCellArray* strips = polydata->GetStrips();
+  const bool hasStrips = strips && strips->GetNumberOfCells() > 0;
   vtkIdType numPolyPts = polydata->GetNumberOfPoints();
   bool useGPUTess = cellFlag == 0 && normalArray && (numPolyPts > 1000) &&
-    !hasCellAssociatedExtraAttrs && !useScalarLUT;
+    !hasCellAssociatedExtraAttrs && !useScalarLUT && !hasStrips;
   bool gpuTessUsed = false;
 
   if (useGPUTess)
@@ -3925,6 +3931,320 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   {
   // P2-2A: Vertex deduplication map for wireframe polygon edges
   std::unordered_map<vtkIdType, uint32_t> wireVertexMap;
+  // Whether the surface triangle stream can be deduplicated by point id (see
+  // the P2-2C discussion below; constant for the whole build).
+  bool useIndexBuffer = normalArray && !hasCellAssociatedExtraAttrs &&
+    (cellFlag == 0 || mappedColors == nullptr || useCellTexture);
+
+  // Helper: add a wireframe vertex (deduplicated by point id), mirroring the
+  // polygon wireframe code. Polygons and triangle strips both route through
+  // this (P11-11A).
+  auto addWireframeVertex = [&](vtkIdType v, vtkIdType cellId) -> uint32_t
+  {
+    auto it = wireVertexMap.find(v);
+    if (it != wireVertexMap.end())
+    {
+      return it->second;
+    }
+    uint32_t idx = static_cast<uint32_t>(positions.size() / 3);
+    wireVertexMap[v] = idx;
+
+    double p[3];
+    polydata->GetPoint(v, p);
+    positions.push_back(static_cast<float>(p[0]));
+    positions.push_back(static_cast<float>(p[1]));
+    positions.push_back(static_cast<float>(p[2]));
+    if (normalArray)
+    {
+      double n[3];
+      normalArray->GetTuple(v, n);
+      normals.push_back(static_cast<float>(n[0]));
+      normals.push_back(static_cast<float>(n[1]));
+      normals.push_back(static_cast<float>(n[2]));
+    }
+    // P5-5A: UV for wireframe vertex
+    if (tcoordArray && tcoordArray->GetNumberOfTuples() > v)
+    {
+      double uv[3];
+      tcoordArray->GetTuple(v, uv);
+      triangleUVs.push_back(static_cast<float>(uv[0]));
+      triangleUVs.push_back(static_cast<float>(uv[1]));
+    }
+    else
+    {
+      triangleUVs.push_back(0.0f);
+      triangleUVs.push_back(0.0f);
+    }
+    emitWireframeColor(v, cellId);
+    emitExtraAttrsForPoint(v);
+    emitExtraAttrsForCell(cellId);
+    lineVertexCellIds.push_back(static_cast<uint32_t>(cellId) + 1u);
+    return idx;
+  };
+
+  // Helper: emit a line segment between two wireframe vertices.
+  auto emitLineSegment = [&](vtkIdType v0, vtkIdType v1, vtkIdType cellId)
+  {
+    uint32_t idx0 = addWireframeVertex(v0, cellId);
+    uint32_t idx1 = addWireframeVertex(v1, cellId);
+    lineIndices.push_back(idx0);
+    lineIndices.push_back(idx1);
+    lineSegmentCellIds.push_back(static_cast<uint32_t>(cellId) + 1u);
+  };
+
+  // Helper: extract a polygon or triangle-strip as line segments (wireframe).
+  // Polygons emit their closed boundary loop; strips use the GL
+  // AppendStripIndexBuffer(wireframe=true) pattern — (v0,v1) followed by the
+  // two outer edges of each constituent triangle.
+  auto emitWireframeCell = [&](bool isStrip, vtkIdType npts, const vtkIdType* pts, vtkIdType cellId)
+  {
+    if (isStrip)
+    {
+      emitLineSegment(pts[0], pts[1], cellId);
+      for (vtkIdType j = 0; j < npts - 2; ++j)
+      {
+        emitLineSegment(pts[j], pts[j + 2], cellId);
+        emitLineSegment(pts[j + 1], pts[j + 2], cellId);
+      }
+    }
+    else
+    {
+      for (vtkIdType i = 0; i < npts; ++i)
+      {
+        emitLineSegment(pts[i], pts[(i + 1) % npts], cellId);
+      }
+    }
+  };
+
+  // Helper: emit one surface triangle (indexed or non-indexed). Shared by the
+  // polygon fan path and the triangle-strip decomposition path (P11-11A).
+  // `packed` carries the per-corner boundary flags for the single-pass edge
+  // pipeline (0 when edges are inactive); the caller derives it from the
+  // owning cell's topology (polygon consecutive edges vs strip structure).
+  auto emitSurfaceTriangle = [&](const vtkIdType tri[3], vtkIdType cellId, uint32_t packed)
+  {
+    bool singlePassEdges = this->Internals->SurfaceUsesIndexedEntry;
+
+    if (useIndexBuffer)
+    {
+      // Single-pass edges: per-corner records carry the 3 corner object
+      // positions (identical for all 3 corners) so the vertex shader can
+      // build the triangle's window-space edge equations.
+      if (singlePassEdges)
+      {
+        double triPt[3][3];
+        for (int j = 0; j < 3; ++j) polydata->GetPoint(tri[j], triPt[j]);
+        for (int r = 0; r < 3; ++r)
+        {
+          for (int j = 0; j < 3; ++j)
+          {
+            trianglePos.push_back(static_cast<float>(triPt[j][0]));
+            trianglePos.push_back(static_cast<float>(triPt[j][1]));
+            trianglePos.push_back(static_cast<float>(triPt[j][2]));
+          }
+        }
+      }
+      // Indexed path: deduplicate vertices by point ID
+      for (int j = 0; j < 3; ++j)
+      {
+        auto it = triVertexMap.find(tri[j]);
+        if (it != triVertexMap.end())
+        {
+          triangleIndices.push_back(it->second);
+          if (singlePassEdges) triangleEdgeFlags.push_back(packed);
+          // No cellId push, no emitExtraAttrsForPoint — vertex already exists
+        }
+        else
+        {
+          uint32_t vidx = static_cast<uint32_t>(positions.size() / 3);
+          triVertexMap[tri[j]] = vidx;
+          triangleIndices.push_back(vidx);
+          if (singlePassEdges) triangleEdgeFlags.push_back(packed);
+          triangleVertexCellIds.push_back(static_cast<uint32_t>(cellId) + 1u);
+
+          double pt[3];
+          polydata->GetPoint(tri[j], pt);
+          positions.push_back(static_cast<float>(pt[0]));
+          positions.push_back(static_cast<float>(pt[1]));
+          positions.push_back(static_cast<float>(pt[2]));
+
+          // useIndexBuffer requires normalArray, so it's always non-null here
+          double nn[3];
+          normalArray->GetTuple(tri[j], nn);
+          normals.push_back(static_cast<float>(nn[0]));
+          normals.push_back(static_cast<float>(nn[1]));
+          normals.push_back(static_cast<float>(nn[2]));
+
+          // P1-1A: per-vertex color — point scalar mapping only. Per-cell
+          // colors are emitted once per triangle below (cell-texture port).
+          emitSurfaceColor(tri[j],
+            (mappedColors && cellFlag == 0) ? mappedColors->GetPointer(0) : nullptr);
+
+          // P5-5A: texture coordinates for indexed triangle vertex
+          if (tcoordArray && tcoordArray->GetNumberOfTuples() > tri[j])
+          {
+            double uv[3];
+            tcoordArray->GetTuple(tri[j], uv);
+            triangleUVs.push_back(static_cast<float>(uv[0]));
+            triangleUVs.push_back(static_cast<float>(uv[1]));
+          }
+          else
+          {
+            triangleUVs.push_back(0.0f);
+            triangleUVs.push_back(0.0f);
+          }
+          emitExtraAttrsForPoint(tri[j]);
+        }
+      }
+      // Per-cell color port: one RGBA per output triangle (when cell
+      // colors are active), parallel to the 3 indices just emitted. The
+      // exact cell id is emitted unconditionally per-primitive so the
+      // pick/ID pass reports the owning cell instead of the provoking
+      // vertex's first-wins value (shared-vertex geometry).
+      if (useCellTexture)
+      {
+        emitCellColor(cellId);
+      }
+      cellPrimitiveIds.push_back(static_cast<uint32_t>(cellId) + 1u);
+    }
+    else
+    {
+      // Non-indexed path: emit 3 unique vertices per triangle (cell coloring)
+      double p[3][3];
+      for (int j = 0; j < 3; ++j)
+      {
+        polydata->GetPoint(tri[j], p[j]);
+      }
+
+      // Compute face normal once (used when normalArray is null)
+      float faceNormal[3] = { 0.0f, 1.0f, 0.0f };
+      if (!normalArray)
+      {
+        float e1[3] = { (float)(p[1][0] - p[0][0]), (float)(p[1][1] - p[0][1]), (float)(p[1][2] - p[0][2]) };
+        float e2[3] = { (float)(p[2][0] - p[0][0]), (float)(p[2][1] - p[0][1]), (float)(p[2][2] - p[0][2]) };
+        float ne1 = std::sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
+        float ne2 = std::sqrt(e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]);
+        if (ne1 > 1e-8f && ne2 > 1e-8f)
+        {
+          e1[0] /= ne1; e1[1] /= ne1; e1[2] /= ne1;
+          e2[0] /= ne2; e2[1] /= ne2; e2[2] /= ne2;
+        }
+        float fn[3] = { 0.0f, 1.0f, 0.0f };
+        fn[0] = e1[1] * e2[2] - e1[2] * e2[1];
+        fn[1] = e1[2] * e2[0] - e1[0] * e2[2];
+        fn[2] = e1[0] * e2[1] - e1[1] * e2[0];
+        float normalLength = std::sqrt(fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2]);
+        if (normalLength > 1e-8f) { fn[0] /= normalLength; fn[1] /= normalLength; fn[2] /= normalLength; }
+        faceNormal[0] = fn[0]; faceNormal[1] = fn[1]; faceNormal[2] = fn[2];
+      }
+
+      for (int j = 0; j < 3; ++j)
+      {
+        if (singlePassEdges)
+        {
+          triangleEdgeFlags.push_back(packed);
+
+          // Single-pass edges: per-corner records carry the 3 corner object
+          // positions (identical for all 3 corners).
+          for (int r = 0; r < 3; ++r)
+          {
+            trianglePos.push_back(static_cast<float>(p[r][0]));
+            trianglePos.push_back(static_cast<float>(p[r][1]));
+            trianglePos.push_back(static_cast<float>(p[r][2]));
+          }
+        }
+
+        positions.push_back(static_cast<float>(p[j][0]));
+        positions.push_back(static_cast<float>(p[j][1]));
+        positions.push_back(static_cast<float>(p[j][2]));
+
+        // P2-2: Per-vertex normals (use each vertex's own normal when available)
+        if (normalArray)
+        {
+          double nn[3];
+          normalArray->GetTuple(tri[j], nn);
+          normals.push_back(static_cast<float>(nn[0]));
+          normals.push_back(static_cast<float>(nn[1]));
+          normals.push_back(static_cast<float>(nn[2]));
+        }
+        else
+        {
+          normals.push_back(faceNormal[0]);
+          normals.push_back(faceNormal[1]);
+          normals.push_back(faceNormal[2]);
+        }
+
+        // P1-1A/1B: per-vertex color — point index for per-point coloring
+        // (cellFlag == 0), cell index for per-cell coloring.
+        emitSurfaceColor((cellFlag == 0) ? tri[j] : cellId,
+          mappedColors ? mappedColors->GetPointer(0) : nullptr);
+
+        // P5-5A: texture coordinates for non-indexed triangle vertex
+        if (tcoordArray && tcoordArray->GetNumberOfTuples() > tri[j])
+        {
+          double uv[3];
+          tcoordArray->GetTuple(tri[j], uv);
+          triangleUVs.push_back(static_cast<float>(uv[0]));
+          triangleUVs.push_back(static_cast<float>(uv[1]));
+        }
+        else
+        {
+          triangleUVs.push_back(0.0f);
+          triangleUVs.push_back(0.0f);
+        }
+        triangleVertexCellIds.push_back(static_cast<uint32_t>(cellId) + 1u);
+        emitExtraAttrsForPoint(tri[j]);
+        emitExtraAttrsForCell(cellId);
+      }
+      // Per-primitive exact cell id, parallel to the 3 vertices just
+      // emitted, so the pick/ID pass can read it by primitive id.
+      cellPrimitiveIds.push_back(static_cast<uint32_t>(cellId) + 1u);
+    }
+  };
+
+  // Helper: emit one polygon or triangle-strip cell as surface triangles.
+  // Polygons are fan-triangulated; strips are decomposed with the winding GL
+  // uses (see P11-11A).
+  auto emitSurfaceCell = [&](bool isStrip, vtkIdType npts, const vtkIdType* pts, vtkIdType cellId)
+  {
+    bool singlePassEdges = this->Internals->SurfaceUsesIndexedEntry;
+
+    if (!isStrip)
+    {
+      // VTK_SURFACE: Fan-triangulate polygon for filled rendering
+      for (vtkIdType i = 1; i < npts - 1; ++i)
+      {
+        vtkIdType tri[3] = { pts[0], pts[i], pts[i + 1] };
+        uint32_t packed = singlePassEdges ? packedEdgeFlags(tri, npts, pts) : 0;
+        emitSurfaceTriangle(tri, cellId, packed);
+      }
+    }
+    else
+    {
+      // P11-11A: Triangle strips — decompose to triangles the same way GL's
+      // AppendStripIndexBuffer does: tri_j = (v_j, v_{j+1+j%2}, v_{j+1+(j+1)%2}).
+      for (vtkIdType j = 0; j < npts - 2; ++j)
+      {
+        vtkIdType tri[3] = { pts[j], pts[j + 1 + j % 2], pts[j + 1 + (j + 1) % 2] };
+        uint32_t packed = 0;
+        if (singlePassEdges)
+        {
+          // Consecutive strip triangles share edge (v_{j+1}, v_{j+2}); the
+          // remaining edges of each triangle are strip boundary. In
+          // packedEdgeFlags bit order (edge opposite corner 0, 1, 2):
+          //   bit0 (tri[1],tri[2]) — boundary only for the last triangle
+          //   bit1 (tri[2],tri[0]) — boundary for j even or the first triangle
+          //   bit2 (tri[0],tri[1]) — boundary for j odd or the first triangle
+          packed = (j == npts - 3 ? 1u : 0u)
+                 | ((j == 0 || j % 2 == 0) ? 2u : 0u)
+                 | ((j == 0 || j % 2 == 1) ? 4u : 0u);
+        }
+        emitSurfaceTriangle(tri, cellId, packed);
+      }
+    }
+  };
+
+  // P2-2A: process polygon cells (filled surface or wireframe edges).
   if (polys && polys->GetNumberOfCells() > 0)
   {
     vtkIdType npts;
@@ -3936,317 +4256,53 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       {
         continue;
       }
-
-    if (representation == VTK_WIREFRAME)
+      if (representation == VTK_WIREFRAME)
       {
-        // P2-2A: Wireframe — extract edges from polygon as line segments.
-        // For each polygon with vertices [v0, v1, ..., vn-1], emit line segments
-        // (v0,v1), (v1,v2), ..., (vn-2,vn-1), (vn-1,v0) — closing the polygon.
-        // This matches WebGPU's polygon_edges_to_lines compute shader.
-        // Deduplicate vertices by point ID to avoid duplicates for shared edges.
-        for (vtkIdType i = 0; i < npts; ++i)
-        {
-          vtkIdType v0 = pts[i];
-          vtkIdType v1 = pts[(i + 1) % npts];  // wraps to close polygon
-
-          // Add vertex v0 if not already added
-          auto it0 = wireVertexMap.find(v0);
-          uint32_t idx0;
-          if (it0 == wireVertexMap.end())
-          {
-            idx0 = static_cast<uint32_t>(positions.size() / 3);
-            wireVertexMap[v0] = idx0;
-
-            double p[3];
-            polydata->GetPoint(v0, p);
-            positions.push_back(static_cast<float>(p[0]));
-            positions.push_back(static_cast<float>(p[1]));
-            positions.push_back(static_cast<float>(p[2]));
-            if (normalArray)
-            {
-              double n[3];
-              normalArray->GetTuple(v0, n);
-              normals.push_back(static_cast<float>(n[0]));
-              normals.push_back(static_cast<float>(n[1]));
-              normals.push_back(static_cast<float>(n[2]));
-            }
-            // P5-5A: UV for wireframe vertex
-            if (tcoordArray && tcoordArray->GetNumberOfTuples() > v0)
-            {
-              double uv[3];
-              tcoordArray->GetTuple(v0, uv);
-              triangleUVs.push_back(static_cast<float>(uv[0]));
-              triangleUVs.push_back(static_cast<float>(uv[1]));
-            }
-            else
-            {
-              triangleUVs.push_back(0.0f);
-              triangleUVs.push_back(0.0f);
-            }
-            emitWireframeColor(v0, polyCellIdx);
-            emitExtraAttrsForPoint(v0);
-            emitExtraAttrsForCell(polyCellIdx);
-            lineVertexCellIds.push_back(static_cast<uint32_t>(polyCellIdx) + 1u);
-          }
-          else
-          {
-            idx0 = it0->second;
-          }
-
-          // Add vertex v1 if not already added
-          auto it1 = wireVertexMap.find(v1);
-          uint32_t idx1;
-          if (it1 == wireVertexMap.end())
-          {
-            idx1 = static_cast<uint32_t>(positions.size() / 3);
-            wireVertexMap[v1] = idx1;
-
-            double p[3];
-            polydata->GetPoint(v1, p);
-            positions.push_back(static_cast<float>(p[0]));
-            positions.push_back(static_cast<float>(p[1]));
-            positions.push_back(static_cast<float>(p[2]));
-            if (normalArray)
-            {
-              double n[3];
-              normalArray->GetTuple(v1, n);
-              normals.push_back(static_cast<float>(n[0]));
-              normals.push_back(static_cast<float>(n[1]));
-              normals.push_back(static_cast<float>(n[2]));
-            }
-            // P5-5A: UV for wireframe vertex
-            if (tcoordArray && tcoordArray->GetNumberOfTuples() > v1)
-            {
-              double uv[3];
-              tcoordArray->GetTuple(v1, uv);
-              triangleUVs.push_back(static_cast<float>(uv[0]));
-              triangleUVs.push_back(static_cast<float>(uv[1]));
-            }
-            else
-            {
-              triangleUVs.push_back(0.0f);
-              triangleUVs.push_back(0.0f);
-            }
-            emitWireframeColor(v1, polyCellIdx);
-            emitExtraAttrsForPoint(v1);
-            emitExtraAttrsForCell(polyCellIdx);
-            lineVertexCellIds.push_back(static_cast<uint32_t>(polyCellIdx) + 1u);
-          }
-          else
-          {
-            idx1 = it1->second;
-          }
-
-          lineIndices.push_back(idx0);
-          lineIndices.push_back(idx1);
-          lineSegmentCellIds.push_back(static_cast<uint32_t>(polyCellIdx) + 1u);
-        }
+        emitWireframeCell(false, npts, pts, polyCellIdx);
       }
       else
       {
-        // VTK_SURFACE: Fan-triangulate polygon for filled rendering
-        // P2-2C: When cellFlag == 0 (per-point coloring) AND normals come from
-        // the data (normalArray), deduplicate vertices by point ID and build an
-        // index buffer. Each unique point has identical position, normal, and color.
-        // When normals are computed per-face, each vertex gets the face normal of
-        // whichever triangle first emits it, so deduplication would produce incorrect
-        // normals for vertices shared between faces with different orientations.
-        // When cellFlag != 0 with per-cell colors, vertices at the same point may
-        // have different colors from different cells. The cell-texture port
-        // (useCellTexture) resolves those colors per-primitive in the fragment
-        // shader, so the vertex stream can still be deduplicated there too.
-        // A null mappedColors (no scalars) is uniform per actor, so dedup is safe
-        // there too — matching GL, which indexes the polydata's own points and never
-        // expands to 3 vertices per triangle.
-        bool useIndexBuffer = normalArray && !hasCellAssociatedExtraAttrs &&
-          (cellFlag == 0 || mappedColors == nullptr || useCellTexture);
-
-        for (vtkIdType i = 1; i < npts - 1; ++i)
-        {
-          vtkIdType tri[3] = { pts[0], pts[i], pts[i + 1] };
-          bool singlePassEdges = this->Internals->SurfaceUsesIndexedEntry;
-          uint32_t packed = singlePassEdges ? packedEdgeFlags(tri, npts, pts) : 0;
-
-          if (useIndexBuffer)
-          {
-            // Single-pass edges: per-corner records carry the 3 corner object
-            // positions (identical for all 3 corners) so the vertex shader can
-            // build the triangle's window-space edge equations.
-            if (singlePassEdges)
-            {
-              double triPt[3][3];
-              for (int j = 0; j < 3; ++j) polydata->GetPoint(tri[j], triPt[j]);
-              for (int r = 0; r < 3; ++r)
-              {
-                for (int j = 0; j < 3; ++j)
-                {
-                  trianglePos.push_back(static_cast<float>(triPt[j][0]));
-                  trianglePos.push_back(static_cast<float>(triPt[j][1]));
-                  trianglePos.push_back(static_cast<float>(triPt[j][2]));
-                }
-              }
-            }
-            // Indexed path: deduplicate vertices by point ID
-            for (int j = 0; j < 3; ++j)
-            {
-              auto it = triVertexMap.find(tri[j]);
-              if (it != triVertexMap.end())
-              {
-                triangleIndices.push_back(it->second);
-                if (singlePassEdges) triangleEdgeFlags.push_back(packed);
-                // No cellId push, no emitExtraAttrsForPoint — vertex already exists
-              }
-              else
-              {
-                uint32_t vidx = static_cast<uint32_t>(positions.size() / 3);
-                triVertexMap[tri[j]] = vidx;
-                triangleIndices.push_back(vidx);
-                if (singlePassEdges) triangleEdgeFlags.push_back(packed);
-                triangleVertexCellIds.push_back(static_cast<uint32_t>(polyCellIdx) + 1u);
-
-                double pt[3];
-                polydata->GetPoint(tri[j], pt);
-                positions.push_back(static_cast<float>(pt[0]));
-                positions.push_back(static_cast<float>(pt[1]));
-                positions.push_back(static_cast<float>(pt[2]));
-
-                // useIndexBuffer requires normalArray, so it's always non-null here
-                double nn[3];
-                normalArray->GetTuple(tri[j], nn);
-                normals.push_back(static_cast<float>(nn[0]));
-                normals.push_back(static_cast<float>(nn[1]));
-                normals.push_back(static_cast<float>(nn[2]));
-
-                // P1-1A: per-vertex color — point scalar mapping only. Per-cell
-                // colors are emitted once per triangle below (cell-texture port).
-                emitSurfaceColor(tri[j],
-                  (mappedColors && cellFlag == 0) ? mappedColors->GetPointer(0) : nullptr);
-
-                // P5-5A: texture coordinates for indexed triangle vertex
-                if (tcoordArray && tcoordArray->GetNumberOfTuples() > tri[j])
-                {
-                  double uv[3];
-                  tcoordArray->GetTuple(tri[j], uv);
-                  triangleUVs.push_back(static_cast<float>(uv[0]));
-                  triangleUVs.push_back(static_cast<float>(uv[1]));
-                }
-                else
-                {
-                  triangleUVs.push_back(0.0f);
-                  triangleUVs.push_back(0.0f);
-                }
-                emitExtraAttrsForPoint(tri[j]);
-              }
-            }
-            // Per-cell color port: one RGBA per output triangle (when cell
-            // colors are active), parallel to the 3 indices just emitted. The
-            // exact cell id is emitted unconditionally per-primitive so the
-            // pick/ID pass reports the owning cell instead of the provoking
-            // vertex's first-wins value (shared-vertex geometry).
-            if (useCellTexture)
-            {
-              emitCellColor(polyCellIdx);
-            }
-            cellPrimitiveIds.push_back(static_cast<uint32_t>(polyCellIdx) + 1u);
-          }
-          else
-          {
-            // Non-indexed path: emit 3 unique vertices per triangle (cell coloring)
-            double p[3][3];
-            for (int j = 0; j < 3; ++j)
-            {
-              polydata->GetPoint(tri[j], p[j]);
-            }
-
-            // Compute face normal once (used when normalArray is null)
-            float faceNormal[3] = { 0.0f, 1.0f, 0.0f };
-            if (!normalArray)
-            {
-              float e1[3] = { (float)(p[1][0] - p[0][0]), (float)(p[1][1] - p[0][1]), (float)(p[1][2] - p[0][2]) };
-              float e2[3] = { (float)(p[2][0] - p[0][0]), (float)(p[2][1] - p[0][1]), (float)(p[2][2] - p[0][2]) };
-              float ne1 = std::sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
-              float ne2 = std::sqrt(e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]);
-              if (ne1 > 1e-8f && ne2 > 1e-8f)
-              {
-                e1[0] /= ne1; e1[1] /= ne1; e1[2] /= ne1;
-                e2[0] /= ne2; e2[1] /= ne2; e2[2] /= ne2;
-              }
-              float fn[3] = { 0.0f, 1.0f, 0.0f };
-              fn[0] = e1[1] * e2[2] - e1[2] * e2[1];
-              fn[1] = e1[2] * e2[0] - e1[0] * e2[2];
-              fn[2] = e1[0] * e2[1] - e1[1] * e2[0];
-              float normalLength = std::sqrt(fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2]);
-              if (normalLength > 1e-8f) { fn[0] /= normalLength; fn[1] /= normalLength; fn[2] /= normalLength; }
-              faceNormal[0] = fn[0]; faceNormal[1] = fn[1]; faceNormal[2] = fn[2];
-            }
-
-            for (int j = 0; j < 3; ++j)
-            {
-              if (singlePassEdges)
-              {
-                triangleEdgeFlags.push_back(packed);
-
-                // Single-pass edges: per-corner records carry the 3 corner object
-                // positions (identical for all 3 corners).
-                for (int r = 0; r < 3; ++r)
-                {
-                  trianglePos.push_back(static_cast<float>(p[r][0]));
-                  trianglePos.push_back(static_cast<float>(p[r][1]));
-                  trianglePos.push_back(static_cast<float>(p[r][2]));
-                }
-              }
-
-              positions.push_back(static_cast<float>(p[j][0]));
-              positions.push_back(static_cast<float>(p[j][1]));
-              positions.push_back(static_cast<float>(p[j][2]));
-
-              // P2-2: Per-vertex normals (use each vertex's own normal when available)
-              if (normalArray)
-              {
-                double nn[3];
-                normalArray->GetTuple(tri[j], nn);
-                normals.push_back(static_cast<float>(nn[0]));
-                normals.push_back(static_cast<float>(nn[1]));
-                normals.push_back(static_cast<float>(nn[2]));
-              }
-              else
-              {
-                normals.push_back(faceNormal[0]);
-                normals.push_back(faceNormal[1]);
-                normals.push_back(faceNormal[2]);
-              }
-
-              // P1-1A/1B: per-vertex color — point index for per-point coloring
-              // (cellFlag == 0), cell index for per-cell coloring.
-              emitSurfaceColor((cellFlag == 0) ? tri[j] : polyCellIdx,
-                mappedColors ? mappedColors->GetPointer(0) : nullptr);
-
-              // P5-5A: texture coordinates for non-indexed triangle vertex
-              if (tcoordArray && tcoordArray->GetNumberOfTuples() > tri[j])
-              {
-                double uv[3];
-                tcoordArray->GetTuple(tri[j], uv);
-                triangleUVs.push_back(static_cast<float>(uv[0]));
-                triangleUVs.push_back(static_cast<float>(uv[1]));
-              }
-              else
-              {
-                triangleUVs.push_back(0.0f);
-                triangleUVs.push_back(0.0f);
-              }
-              triangleVertexCellIds.push_back(static_cast<uint32_t>(polyCellIdx) + 1u);
-              emitExtraAttrsForPoint(tri[j]);
-              emitExtraAttrsForCell(polyCellIdx);
-            }
-            // Per-primitive exact cell id, parallel to the 3 vertices just
-            // emitted, so the pick/ID pass can read it by primitive id.
-            cellPrimitiveIds.push_back(static_cast<uint32_t>(polyCellIdx) + 1u);
-          }
-
-        }
+        emitSurfaceCell(false, npts, pts, polyCellIdx);
       }
       polyCellIdx++;
     }
+  }
+
+  // P11-11A: process triangle strips. Like GL, strips are a first-class
+  // primitive type; their cells come after polys in the polydata cell array,
+  // so the per-primitive cell ids (cell colors, picking) start at
+  // polyCellOffset + numPolys.
+  if (hasStrips)
+  {
+    vtkIdType stripCellIdx = polyCellOffset + (polys ? polys->GetNumberOfCells() : 0);
+    vtkIdType npts;
+    const vtkIdType* pts;
+    strips->InitTraversal();
+    while (strips->GetNextCell(npts, pts) && npts > 0)
+    {
+      if (npts < 3)
+      {
+        continue;
+      }
+      if (representation == VTK_WIREFRAME)
+      {
+        emitWireframeCell(true, npts, pts, stripCellIdx);
+      }
+      else
+      {
+        emitSurfaceCell(true, npts, pts, stripCellIdx);
+      }
+      stripCellIdx++;
+    }
+  }
+
+  // Finalize triangle/edge buffers when either polys or strips produced
+  // geometry above.
+  if ((polys && polys->GetNumberOfCells() > 0) || hasStrips)
+  {
+    // Reused by the legacy edge-overlay tube loop below (traversal locals).
+    vtkIdType npts;
+    const vtkIdType* pts;
 
     // Single-pass edges: non-indexed surfaces still route through the indirection
     // vertex entry (vertex_main_indexed reads flags by vertex_id), so build
@@ -4288,6 +4344,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     {
       std::unordered_map<EdgeKey, EdgeInfo, EdgeKeyHash> uniqueEdges;
 
+      const vtkIdType numPolyCells = polys ? polys->GetNumberOfCells() : 0;
       if (polys)
       {
         vtkIdType edgeCellIdx = 0;
@@ -4315,6 +4372,45 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
               uniqueEdges[key] = info;
             }
           }
+          ++edgeCellIdx;
+        }
+      }
+      // P11-11A: Triangle-strip boundary edges for the legacy edge overlay.
+      // Boundary edges are the strip's true silhouette: (v0,v1), the far
+      // edge (v_j, v_{j+2}) of each decomposed triangle, and the final
+      // (v_{npts-2}, v_{npts-1}) — the internal (v_{j+1}, v_{j+2}) edges
+      // shared between consecutive triangles are not boundary edges.
+      if (hasStrips)
+      {
+        vtkIdType edgeCellIdx = 0;
+        const vtkIdType* spts = nullptr;
+        vtkIdType snpts = 0;
+        strips->InitTraversal();
+        while (strips->GetNextCell(snpts, spts))
+        {
+          if (snpts < 3)
+          {
+            ++edgeCellIdx;
+            continue;
+          }
+          auto addStripEdge = [&](vtkIdType a, vtkIdType b)
+          {
+            EdgeKey key = MakeEdgeKey(a, b);
+            if (uniqueEdges.find(key) == uniqueEdges.end())
+            {
+              EdgeInfo info;
+              info.A = a;
+              info.B = b;
+              info.CellId = static_cast<uint32_t>(numPolyCells + edgeCellIdx);
+              uniqueEdges[key] = info;
+            }
+          };
+          addStripEdge(spts[0], spts[1]);
+          for (vtkIdType j = 0; j < snpts - 2; ++j)
+          {
+            addStripEdge(spts[j], spts[j + 2]);
+          }
+          addStripEdge(spts[snpts - 2], spts[snpts - 1]);
           ++edgeCellIdx;
         }
       }
@@ -4422,6 +4518,40 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
             edgeTubeCellIds.push_back(loopCellId);
           }
           ++polyLoopIdx;
+        }
+
+        // P11-11A: Edge tubes for triangle strips — emit each strip's boundary
+        // edge segments (same set collected into uniqueEdges above) with the
+        // strip's absolute cell id so miter joins work where boundary edges
+        // share a vertex.
+        if (hasStrips)
+        {
+          vtkIdType stripLoopIdx = 0;
+          const vtkIdType* spts = nullptr;
+          vtkIdType snpts = 0;
+          strips->InitTraversal();
+          while (strips->GetNextCell(snpts, spts))
+          {
+            if (snpts < 3)
+            {
+              ++stripLoopIdx;
+              continue;
+            }
+            uint32_t loopCellId = static_cast<uint32_t>(numPolyCells + stripLoopIdx + polyCellOffset) + 1u;
+            auto emitTubeSegment = [&](vtkIdType a, vtkIdType b)
+            {
+              edgeTubeIndices.push_back(addEdgeVertex(a, stripLoopIdx));
+              edgeTubeIndices.push_back(addEdgeVertex(b, stripLoopIdx));
+              edgeTubeCellIds.push_back(loopCellId);
+            };
+            emitTubeSegment(spts[0], spts[1]);
+            for (vtkIdType j = 0; j < snpts - 2; ++j)
+            {
+              emitTubeSegment(spts[j], spts[j + 2]);
+            }
+            emitTubeSegment(spts[snpts - 2], spts[snpts - 1]);
+            ++stripLoopIdx;
+          }
         }
       }
     }
@@ -6952,10 +7082,34 @@ void vtkMetalPolyDataMapper::UpdateActorTexture(void* mtlDevice, vtkActor* actor
 
   id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
 
+  // P11-11B: Fall back to the property's named textures (e.g. the "mytexture"
+  // beach texture used by the TestTStrips* suite) when the actor has no
+  // primary texture. The Metal backend has a single diffuse sampler slot, so
+  // the first named property texture stands in for it — mirroring the GL
+  // mapper, which routes every bound 2D texture through the same diffuse
+  // tcolor path. PBR-only slots (albedoTex, normalTex, ...) are skipped since
+  // they are consumed by the PBR BRDF, not the diffuse sampler.
   vtkTexture* texture = this->Internals->BlockTexture.Get()
     ? this->Internals->BlockTexture.Get()
     : actor->GetTexture();
-
+  if (!texture && actor->GetProperty())
+  {
+    // GL consumes the named 2D property textures as diffuse samplers but
+    // ignores the PBR slot textures (sampled by the BRDF, not the diffuse
+    // path). Mirror that: take the first non-slot named texture.
+    const auto& propTextures = actor->GetProperty()->GetAllTextures();
+    for (const auto& pt : propTextures)
+    {
+      if (pt.second && pt.first != "albedoTex" && pt.first != "normalTex" &&
+        pt.first != "materialTex" && pt.first != "brdfTex" &&
+        pt.first != "emissiveTex" && pt.first != "anisotropyTex" &&
+        pt.first != "coatNormalTex" && pt.first != "colortexture")
+      {
+        texture = pt.second;
+        break;
+      }
+    }
+  }
   if (!texture || !texture->GetInput())
   {
     if (this->Internals->ActorTexture != nil ||

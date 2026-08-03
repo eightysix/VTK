@@ -269,6 +269,7 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
       vtkCellArray* polys = input->GetPolys();
       vtkCellArray* lines = input->GetLines();
       vtkCellArray* verts = input->GetVerts();
+      vtkCellArray* strips = input->GetStrips();
 
       if (polys)
       {
@@ -283,6 +284,25 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
             triIndices.push_back(static_cast<uint32_t>(ids[0]));
             triIndices.push_back(static_cast<uint32_t>(ids[i]));
             triIndices.push_back(static_cast<uint32_t>(ids[i + 1]));
+          }
+        }
+      }
+
+      // P11-11A: Triangle strips — decompose with GL's winding
+      // (tri_j = v_j, v_{j+1+j%2}, v_{j+1+(j+1)%2}), same as the 3D mapper.
+      if (strips)
+      {
+        const vtkIdType* ids = nullptr;
+        vtkIdType npts = 0;
+        strips->InitTraversal();
+        while (strips->GetNextCell(npts, ids))
+        {
+          if (npts < 3) continue;
+          for (vtkIdType j = 0; j < npts - 2; ++j)
+          {
+            triIndices.push_back(static_cast<uint32_t>(ids[j]));
+            triIndices.push_back(static_cast<uint32_t>(ids[j + 1 + j % 2]));
+            triIndices.push_back(static_cast<uint32_t>(ids[j + 1 + (j + 1) % 2]));
           }
         }
       }
