@@ -17,6 +17,7 @@
 #include "vtkWrappingHints.h"        // for VTK_MARSHALAUTO
 
 #include <cstdint>
+#include <map>
 #include <mutex>
 
 #ifdef __OBJC__
@@ -160,6 +161,23 @@ public:
   int GetEffectiveSampleCount();
 
   /**
+   * Register the id<MTLTexture> bound to the given texture unit (mirroring
+   * OpenGL's per-unit texture binding state). vtkMetalTexture uploads its
+   * input image and calls SetBoundTexture during Load; 2D mappers read the
+   * GENERAL_TEXTURE_UNIT property key set by vtkTextMapper/vtkTexturedActor2D
+   * and fetch the matching texture with GetBoundTexture. The window retains
+   * the texture until it is replaced or released.
+   */
+  void SetBoundTexture(int unit, void* texture);
+
+  /**
+   * Return the id<MTLTexture> registered for the given texture unit, or
+   * nullptr if none. The caller must not release the returned texture; the
+   * window owns the reference.
+   */
+  void* GetBoundTexture(int unit);
+
+  /**
    * Get the shared Metal shader library, compiling it on first access.
    * Returns nil on compilation failure (check error log).
    * Thread-safe: uses a std::call_once guard.
@@ -284,6 +302,11 @@ protected:
    */
   void RecreateDepthCopyTexture();
 
+  /**
+   * Release every texture registered with SetBoundTexture.
+   */
+  void ReleaseBoundTextures();
+
 #ifdef VTK_METAL_ENABLE_OFFSCREEN_TARGET
   /**
    * Recreate the private offscreen color texture used when OffScreenRendering
@@ -350,6 +373,11 @@ protected:
 
   // Per-frame renderer index (see GetFrameRendererIndex).
   int FrameRendererIndex = 0;
+
+  // Texture-unit registry (unit -> id<MTLTexture>), mirroring OpenGL's
+  // per-unit texture binding so mappers can resolve a vtkTexture by the
+  // GENERAL_TEXTURE_UNIT property key.
+  std::map<int, void*> BoundTextures;
 
   bool Initialized = false;
 

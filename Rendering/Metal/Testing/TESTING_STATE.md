@@ -16,8 +16,8 @@ Two test surfaces exist:
 2. The generic multi-backend suite in `Rendering/Core/Testing/Cxx/`, which
    registers the same ~175 tests once per backend and was wired up for Metal
      through    object-factory overrides (`--vtk-factory-prefer
-      RenderingBackend=Metal`). Historical status: **55 pass / 120 fail (33
-       crash)**. Current working-tree status: **130 pass / 42 fail (3 crash)** —
+       RenderingBackend=Metal`). Historical status: **55 pass / 120 fail (33
+        crash)**. Current working-tree status: **133 pass / 39 fail (3 crash)** —
      the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
      factory override, the 8 composite-mapper `BuildGeometryBuffers` crashes by
      a `mappedColors != nullptr` guard (they now render), `TestOpacityMSAA` by
@@ -161,7 +161,7 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  123 Passed  49 Failed (incl. image/pick fails)  3 "Subprocess aborted"
+175 tests:  133 Passed  39 Failed (incl. image/pick fails)  3 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
@@ -291,6 +291,18 @@ exactly those seven tests; the 3 aborts are unchanged
 (`TestLabeledContourMapper`, `TestLabeledContourMapperNoLabels`,
 `TestLabeledContourMapperWithActorMatrix`). The regression check against the
 documented passing cluster reports none.
+Run after the 2D overlay depth-ordering + text-texture fix (this run,
+2026-08-03): 133 Passed / 39 Failed / 3 aborted out of 175 (analyzed with
+`analyze_metal_ctest_log.py` from a single `ctest -R "RenderingCoreCxx-Metal" -j 8`
+run; failures exported with `export_image_compare.sh`) — `TestImageAndAnnotations`
+now passes (TIGHT_VALID 0.0461, was a 0.0607 near-miss fail), the first time it
+has passed, and the two texture tests `TestActor2DTextures` (was a gross 0.7862
+fail, now 3.9e-08) and `TestBackfaceCulling` (was a mid 0.1016 fail, now 0.0091)
+also pass, the first time either has passed; see the 2D overlay depth-ordering
+and text-texture section below. The +3 pass delta over the previous run is
+exactly those three tests; the 3 aborts are unchanged (`TestLabeledContourMapper`,
+`TestLabeledContourMapperNoLabels`, `TestLabeledContourMapperWithActorMatrix`).
+The regression check against the documented passing cluster reports none.
 
 ### The point-rendering cluster is fixed
 
@@ -484,6 +496,10 @@ tests (`TestActor2DTextures`, `TestBackfaceCulling`, `TestImageAndAnnotations`,
 `TestPickTextActor`, `TestRenderLinesAsTubes{OrthoCamera}`, `TestTexturedCylinder`,
 `TestTilingCxx`) render without crashing but
 still fail image comparison (texture-feature fidelity gaps).
+`TestActor2DTextures`, `TestBackfaceCulling` and `TestImageAndAnnotations` have
+since left this list — the first two via the textured-2D path and the last via
+the overlay depth-ordering (see the 2D overlay depth-ordering and text-texture
+section below).
 
 `TestTextureWrap` specifically was debugged to a pass this session:
 multi-renderer viewport tiling collapsed because `vtkMetalRenderer::DeviceRender`
@@ -643,15 +659,16 @@ failures.
 
 ### Image-compare failures
 
-Current run (2026-08-03, point-rendering run): 42 failed = 38 image-compare
-(TIGHT_VALID >= 0.05) + 1 below-threshold pick-check + 3 non-image. Buckets by
+Current run (2026-08-03, overlay-depth/texture run): 42 failed = 35 image-compare
+(TIGHT_VALID >= 0.05) + 1 below-threshold pick-check + 3 non-image + 3 aborts.
+Buckets by
 max `vtkTesting` TIGHT_VALID error per test (threshold 0.05):
 
 | Bucket | Range | Count | Examples |
 |--------|-------|-------|----------|
-| near-miss | 0.05 – 0.1 | 7 | `TestActorLightingFlag` 0.0513, `TestImageAndAnnotations` 0.0607, `TestPolyDataMapper2D` 0.0664, `TestEdgeFlags` 0.0681, `TestLineRenderingTranslucent` 0.0790, `TestGlyph3DMapperPicking` 0.0800, `RenderNonFinite` 0.0870 |
-| mid | 0.1 – 0.5 | 25 | `TestBackfaceCulling` 0.1016, `TestGlyph3DMapper` 0.1082, `TestMixedGeometryCellScalars` 0.1373, `TestCompositePolyDataMapperSpheres` 0.1499, `TestPolyDataMapperClipPlanes` 0.1526, `TestCompositePolyDataMapperPicking` 0.1712, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.2241, `TestTransformCoordinateUseDouble` 0.2251, `TestCoincident` 0.2343, `TestCompositePolyDataMapperPartialFieldData` 0.2560, `TestStereoEyeSeparation` 0.2584, `TestPolyDataMapperNormals` 0.2698, `TestPolyDataMapper2DPointScalarColorMapping` 0.2861, `TestCompositePolyDataMapperVertices` 0.2891, `TestCompositePolyDataMapperCustomShader` 0.2897, `TestGlyph3DMapperBackfaceColor` 0.2914, `TestPolyDataMapper2DCellScalarColorMapping` 0.2943, `TestRenderLinesAsTubesOrthoCamera` 0.3263, `TestRenderLinesAsTubes` 0.3263, `TestResetCameraScreenSpace` 0.3438, `TestGradientBackground` 0.3449, `TestCompositePolyDataMapperCameraShiftScale` 0.3601, `TestResizingWindowToImageFilter` 0.4130, `TestGlyph3DMapperPointSize` 0.4596, `TestColorByStringArrayDefaultLookupTable2D` 0.4821 |
-| gross | >= 0.5 | 6 | `TestGradientBackgroundWithTiledViewport` 0.5063, `TestGradientBackgroundWithTiledViewports` 0.5856, `TestOffAxisStereo` 0.5921, `TestTilingCxx` 0.6159, `TestSplitViewportStereoHorizontal` 0.6816, `TestActor2DTextures` 0.7862 |
+| near-miss | 0.05 – 0.1 | 6 | `TestActorLightingFlag` 0.0513, `TestPolyDataMapper2D` 0.0664, `TestEdgeFlags` 0.0681, `TestLineRenderingTranslucent` 0.0790, `TestGlyph3DMapperPicking` 0.0800, `RenderNonFinite` 0.0870 |
+| mid | 0.1 – 0.5 | 24 | `TestGlyph3DMapper` 0.1082, `TestMixedGeometryCellScalars` 0.1373, `TestCompositePolyDataMapperSpheres` 0.1499, `TestPolyDataMapperClipPlanes` 0.1526, `TestTransformCoordinateUseDouble` 0.1635, `TestCompositePolyDataMapperPicking` 0.1712, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.2241, `TestCoincident` 0.2343, `TestRenderLinesAsTubesOrthoCamera` 0.2349, `TestRenderLinesAsTubes` 0.2350, `TestStereoEyeSeparation` 0.2584, `TestCompositePolyDataMapperPartialFieldData` 0.2622, `TestPolyDataMapperNormals` 0.2698, `TestPolyDataMapper2DPointScalarColorMapping` 0.2861, `TestCompositePolyDataMapperVertices` 0.2891, `TestCompositePolyDataMapperCustomShader` 0.2897, `TestGlyph3DMapperBackfaceColor` 0.2914, `TestPolyDataMapper2DCellScalarColorMapping` 0.2943, `TestResetCameraScreenSpace` 0.3438, `TestGradientBackground` 0.3449, `TestCompositePolyDataMapperCameraShiftScale` 0.3601, `TestResizingWindowToImageFilter` 0.4130, `TestGlyph3DMapperPointSize` 0.4596, `TestColorByStringArrayDefaultLookupTable2D` 0.4821 |
+| gross | >= 0.5 | 5 | `TestGradientBackgroundWithTiledViewport` 0.5063, `TestGradientBackgroundWithTiledViewports` 0.5856, `TestOffAxisStereo` 0.5921, `TestTilingCxx` 0.6159, `TestSplitViewportStereoHorizontal` 0.6816 |
 
 (`TestNActors{OneMapper,NMappersOneInput}` left the mid bucket via the
 per-actor edge-color fix above (passing at ~1.2e-05), and
@@ -677,7 +694,12 @@ pick-check fails) and `TestPickTextActor` (pick check). `TestReadPixels`,
 `TestSelectVisiblePoints` and `TestWorldPointPicker` left this set via the
 read-back cluster above, the four scalar-LUT tests left it via the
 scalar-texture-LUT section above, and the four `TestTStrips*` tests left it via
-the triangle-strip section below.
+the triangle-strip section below.) This run the near-miss bucket dropped from 7
+to 6 and gross from 6 to 5: `TestImageAndAnnotations` (near-miss 0.0607, now
+passing at 0.0461), `TestActor2DTextures` (gross 0.7862, now passing at
+3.9e-08) and `TestBackfaceCulling` (mid 0.1016, now passing at 0.0091) all left
+via the 2D overlay depth-ordering and text-texture section below — the first
+time any of the three have passed.
 
 ### Crashes (3; all pre-existing classes, none from the texture or composite clusters)
 
@@ -734,10 +756,63 @@ poly-data/glyph/image/volume mapper PSOs), the clamp applies everywhere.
   removed, matching the OpenGL matrix exactly.
 
 Remaining 2D fidelity gaps (all pre-existing, now documented values): the 2D
-vertex shader has no `[[point_size]]` output (`TestPolyDataMapper2D` 0.066),
+vertex shader has no `[[point_size]]` output (`TestPolyDataMapper2D` 0.066) and
 2D scalar color mapping is ignored (`TestPolyDataMapper2D{Point,Cell}
-ScalarColorMapping` 0.286/0.294), and textured 2D actors render flat gray
-instead of their texture (`TestActor2DTextures` 0.786).
+ScalarColorMapping` 0.286/0.294). The textured-2D gap is closed by the
+2D overlay depth-ordering and text-texture section below
+(`TestActor2DTextures` now passes at 3.9e-08).
+
+### The 2D overlay depth-ordering and text-texture is fixed
+
+Two Metal gaps left `TestImageAndAnnotations` (overlay text on top of images
+with `DisplayLocation`-dependent ordering) failing at 0.0607, `TestActor2DTextures`
+at a gross 0.7862, and `TestBackfaceCulling` at 0.1016. Both gaps live in the
+2D overlay path (`vtkMetalPolyDataMapper2D` / `vtkMetalImageMapper` +
+`vtkMetalTexture`):
+
+- **No overlay depth ordering.** The Metal overlay pass ran with
+  `MTLCompareFunctionAlways` / depth-write-off, so the GL semantics encoded in
+  `vtkOpenGLPolyDataMapper2D::SetCameraShaderParameters` (foreground
+  `DisplayLocation` props at wcvc Z = −1, background at +1, drawn into a
+  depth-testing overlay pass) had no Metal equivalent: background images
+  overwrote foreground text and foreground images covered text at equal depth.
+  Both mappers now encode `DisplayLocation` into the wcvc Z translate (Metal's
+  clip/NDC z range is [0,1], so foreground = 0, background = 1) and the overlay
+  depth-stencil state is `LessEqual` with depth write on. Equal-depth foreground
+  props still resolve by render order, matching GL.
+- **No text texture path.** `vtkTextMapper`/`vtkTextActor` route their glyph
+  raster through `vtkTexture` + the actor's `GENERAL_TEXTURE_UNIT` property key.
+  The Metal `vtkTexture` was a no-op factory override and the 2D mapper never
+  sampled a texture, so text quads rendered flat gray and textured 2D actors
+  ignored their image. `vtkMetalTexture::Load` now uploads the input image to an
+  `id<MTLTexture>` and registers it with the render window's per-unit registry
+  (`vtkMetalRenderWindow::SetBoundTexture`/`GetBoundTexture`, mirroring GL's
+  per-unit binding state; released on window teardown via
+  `ReleaseBoundTextures`). `vtkMetalPolyDataMapper2D` builds an interleaved
+  position+texcoord buffer and draws it through a new textured pipeline
+  (`vertex_2d_image_main` + `fragment_2d_text_main`) that samples the bound
+  texture and multiplies by the actor's color/opacity, exactly like
+  `vtkPolyData2DFS.glsl`.
+- **All textures collided on unit 0.** Core `vtkTexture::GetTextureUnit()`
+  returns 0 unconditionally; the GL backend overrides it with a per-texture
+  unit. Without the override every `vtkMetalTexture` registered under unit 0,
+  so after the first frame's cache hit (`Registered && CachedMTime ==
+  imageMTime` skips re-registration) every text quad resolved the *last*
+  uploaded texture — the corner-annotation labels all rendered the same string
+  ("foreground/transparent"). `vtkMetalTexture` now overrides `GetTextureUnit()`
+  to allocate a unique, stable unit per instance (a static atomic counter),
+  mirroring `vtkOpenGLTexture`.
+- **Glyph gaps wrote depth.** `fragment_2d_text_main` now `discard_fragment()`s
+  when the multiplied alpha is <= 0 (matching `vtkPolyData2DFS.glsl`'s
+  `if (gl_FragData[0].a <= 0.0) discard;`), so a text quad's transparent
+  bounding box no longer occludes background props in the depth-testing overlay
+  pass.
+
+`TestImageAndAnnotations` now passes at TIGHT_VALID 0.0461 (first time),
+`TestActor2DTextures` at 3.9e-08 and `TestBackfaceCulling` at 0.0091 (both
+first time). The remaining overlay-text fidelity gap is pure text anti-aliasing
+(the residual ~0.046 is glyph edge AA vs the GL FreeType raster), unchanged by
+this work. `TestPickTextActor` (pick check) remains a separate gap.
 
 ### The 2D image mapper viewport WCVC is fixed
 
@@ -803,10 +878,11 @@ overlay) left via the per-actor edge-color fix above.
 
 - **Textures** (~13): every `TestTexture*`, `TestBackfaceTexture`,
   `TestTilingCxx`, `TestActor2DTextures` — historically
-  crashed on the OpenGL fallback; now render, with 7 passing
+  crashed on the OpenGL fallback; now render, with 9 passing
   (`TestTextureWrap`, `TestBackfaceTexture`, `TestTextureRGBA`,
   `TestTextureRGBADepthPeeling`, `TestTextureSize`,
-  `TestTextureInterpolateScalars`, `TestTexturedCylinder`) and the rest
+  `TestTextureInterpolateScalars`, `TestTexturedCylinder`,
+  `TestActor2DTextures`, `TestBackfaceCulling`) and the rest
   failing image comparison on texture-feature fidelity (filter/wrap/interpolation
   edge cases, tiling).
 - **Composite mapper** (~19): the crash cluster is gone (see above), and
@@ -826,22 +902,24 @@ overlay) left via the per-actor edge-color fix above.
 - **Selection/picking** (~3): `TestPointSelection*` and `TestPickTextActor`
   (`TestAreaSelections`, `TestHardwareSelector`, `TestSelectVisiblePoints`,
   `TestWorldPointPicker`, `TestReadPixels`, `TestRemoveActors` now pass — see the
-  selection/read-back cluster sections above). The 7 near-miss image tests
+  selection/read-back cluster sections above). The 6 near-miss image tests
   (`TestActorLightingFlag`,
   `TestEdgeFlags`,
-  `TestImageAndAnnotations`, `TestLineRenderingTranslucent`,
-  `TestGlyph3DMapperPicking`, `RenderNonFinite`, `TestMixedGeometryCellScalars`)
-  are the next easy-win targets.
+  `TestLineRenderingTranslucent`,
+  `TestGlyph3DMapperPicking`, `RenderNonFinite`, `TestPolyDataMapper2D`)
+  are the next easy-win targets (`TestImageAndAnnotations` left via the
+  overlay depth/texture fix above).
 - **Point rendering** — DONE: the four point tests `TestPointRendering_3/_4` +
   `TestPointRenderingRound_3/_4` plus the vertex-visibility tests
   `TestVertexRendering`, `TestQuadPointRep` and `TestMixedGeometry_3` now pass
   via the point-lighting fix (see the point-rendering section above).
 - **2D overlay / image mapper**: `TestPolyDataMapper2D` (0.066; point size not
-  in the 2D shader), `TestPolyDataMapper2D{Point,Cell}ScalarColorMapping`
-  (0.286/0.294; 2D scalar colors ignored), `TestActor2DTextures` (0.786; textured
-  2D actors render flat gray). `TestActor2D` now passes via the 2D-overlay
-  section above, and `TestImageMapper_1..4` now pass via the 2D image-mapper
-  viewport-WCVC fix (see the 2D image-mapper section above).
+  in the 2D shader) and `TestPolyDataMapper2D{Point,Cell}ScalarColorMapping`
+  (0.286/0.294; 2D scalar colors ignored). `TestActor2D` now passes via the
+  2D-overlay section above, `TestImageMapper_1..4` now pass via the 2D
+  image-mapper viewport-WCVC fix (see the 2D image-mapper section above), and
+  `TestActor2DTextures` now passes via the 2D overlay depth-ordering and
+  text-texture fix (see that section above).
 - **LUT / color mapping** (~1): `TestColorByStringArrayDefaultLookupTable2D` 0.482.
   `TestBareScalarsToColors`, `TestDirectScalarsToColors`, `TestMapVectorsToColors`
   and `TestMapVectorsAsRGBColors` now pass via the 2D image-mapper viewport-WCVC
@@ -862,7 +940,7 @@ overlay) left via the per-actor edge-color fix above.
 
 ### Evidence the core path is correct
 
-The 130 passes include the strongest-scrutiny tests: `TestOpacity` (passes with
+The 133 passes include the strongest-scrutiny tests: `TestOpacity` (passes with
 the `TIGHT_VALID` metric — the Lab-space color path matches GL to
 `0.00038`), `TestOSConeCxx`, `TestMace`, the four scalar-LUT tests
 (`TestCompositePolyDataMapperOverrideLUT`, `TestTextureInterpolateScalars`,

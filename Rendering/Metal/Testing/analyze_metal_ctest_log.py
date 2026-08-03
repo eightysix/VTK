@@ -130,7 +130,9 @@ def main(argv=None):
                              "TestNActorsOneMapper", "TestNActorsNMappersOneInput",
                              "TestNViewportsOneActor", "TestNViewportsNActorsOneMapper",
                              "TestNViewportsNActorsNMappersOneInput",
-                             "TestNViewportsNActorsNMappersNInputs"}
+                             "TestNViewportsNActorsNMappersNInputs",
+                             "TestImageAndAnnotations", "TestActor2DTextures",
+                             "TestBackfaceCulling"}
             regressed = sorted((fails | aborts) & passing_named)
             print("\nREGRESSION CHECK vs TESTING_STATE.md passing cluster:")
             print("  " + (", ".join(regressed) if regressed else "none"))

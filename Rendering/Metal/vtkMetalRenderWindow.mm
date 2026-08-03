@@ -212,6 +212,8 @@ void vtkMetalRenderWindow::Finalize()
 
   this->DestroyMultisampleAttachments();
 
+  this->ReleaseBoundTextures();
+
   if (this->SharedShaderLibrary)
   {
     [(id)this->SharedShaderLibrary release];
@@ -237,6 +239,46 @@ void vtkMetalRenderWindow::Finalize()
   }
 
   this->Initialized = false;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalRenderWindow::SetBoundTexture(int unit, void* texture)
+{
+  auto it = this->BoundTextures.find(unit);
+  id<MTLTexture> old = it != this->BoundTextures.end() ? (__bridge id<MTLTexture>)it->second : nil;
+
+  if (texture)
+  {
+    id<MTLTexture> newTex = (__bridge id<MTLTexture>)texture;
+    if (old != newTex)
+    {
+      [newTex retain];
+      [old release];
+      this->BoundTextures[unit] = texture;
+    }
+  }
+  else if (old)
+  {
+    [old release];
+    this->BoundTextures.erase(unit);
+  }
+}
+
+//------------------------------------------------------------------------------
+void* vtkMetalRenderWindow::GetBoundTexture(int unit)
+{
+  auto it = this->BoundTextures.find(unit);
+  return it != this->BoundTextures.end() ? it->second : nullptr;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalRenderWindow::ReleaseBoundTextures()
+{
+  for (auto& kv : this->BoundTextures)
+  {
+    [(__bridge id)kv.second release];
+  }
+  this->BoundTextures.clear();
 }
 
 //------------------------------------------------------------------------------

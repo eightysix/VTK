@@ -1624,12 +1624,19 @@ fragment float4 fragment_2d_image_main(Image2DVertexOut in [[stage_in]],
 // 2D textured text fragment shader (used by vtkMetalPolyDataMapper2D for
 // vtkTextActor / vtkTextMapper). Multiplies the sampled texture color by the
 // actor's color/opacity, matching vtkPolyData2DFS.glsl's
-// "gl_FragData[0] = gl_FragData[0] * texture2D(texture1, ...)".
+// "gl_FragData[0] = gl_FragData[0] * texture2D(texture1, ...)". Fragments with
+// fully transparent alpha are discarded (as the GL shader does) so that the
+// overlay depth pass only writes depth at glyph pixels; otherwise a
+// foreground text quad's full bounding box would occlude background props.
 fragment float4 fragment_2d_text_main(Image2DVertexOut in [[stage_in]],
                                       constant Mapper2DState& state [[buffer(0)]],
                                       texture2d<float> imageTexture [[texture(0)]]) {
   float4 texColor = imageTexture.sample(sNearest, in.texCoord);
-  return texColor * state.color;
+  float4 fragColor = texColor * state.color;
+  if (fragColor.a <= 0.0) {
+    discard_fragment();
+  }
+  return fragColor;
 }
 
 // ---------------------------------------------------------------------------

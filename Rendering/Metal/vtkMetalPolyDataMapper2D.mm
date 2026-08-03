@@ -15,6 +15,8 @@
 #include "vtkViewport.h"
 #include "vtkCoordinate.h"
 #include "vtkMatrix4x4.h"
+#include "vtkInformation.h"
+#include "vtkProp.h"
 
 #import <Metal/Metal.h>
 
@@ -36,8 +38,17 @@ struct vtkMetalPolyDataMapper2D::vtkMetalPolyDataMapper2DInternals
   id<MTLRenderPipelineState> LinePipeline = nil;
   id<MTLRenderPipelineState> PointPipeline = nil;
 
+  // Pipeline for textured geometry (text): samples the texture bound to the
+  // actor's GENERAL_TEXTURE_UNIT and multiplies by the actor's color/opacity.
+  id<MTLRenderPipelineState> TexturedPipeline = nil;
+
   // Geometry buffers
   id<MTLBuffer> PositionBuffer = nil;
+
+  // Interleaved position + texture-coordinate buffer (float4 per vertex: xy
+  // position, uv texcoord) used by the textured pipeline when the input
+  // polydata carries TCoords (e.g. vtkTextMapper / vtkTextActor quads).
+  id<MTLBuffer> TexCoordBuffer = nil;
 
   // Index buffers for indexed drawing
   id<MTLBuffer> TriangleIndexBuffer = nil;
@@ -55,6 +66,7 @@ struct vtkMetalPolyDataMapper2D::vtkMetalPolyDataMapper2DInternals
   bool HasTriangles = false;
   bool HasLines = false;
   bool HasPoints = false;
+  bool HasTextureCoords = false;
 
   // Cached state
   vtkIdType CachedInputMTime = 0;
@@ -70,11 +82,13 @@ struct vtkMetalPolyDataMapper2D::vtkMetalPolyDataMapper2DInternals
     vtkMetalMRC::ReleaseAndNil(TrianglePipeline);
     vtkMetalMRC::ReleaseAndNil(LinePipeline);
     vtkMetalMRC::ReleaseAndNil(PointPipeline);
+    vtkMetalMRC::ReleaseAndNil(TexturedPipeline);
   }
 
   void ReleaseBuffers()
   {
     vtkMetalMRC::ReleaseAndNil(PositionBuffer);
+    vtkMetalMRC::ReleaseAndNil(TexCoordBuffer);
     vtkMetalMRC::ReleaseAndNil(StateBuffer);
 
     vtkMetalMRC::ReleaseAndNil(TriangleIndexBuffer);
@@ -89,6 +103,7 @@ struct vtkMetalPolyDataMapper2D::vtkMetalPolyDataMapper2DInternals
     HasTriangles = false;
     HasLines = false;
     HasPoints = false;
+    HasTextureCoords = false;
 
     CachedInputMTime = 0;
     CachedSampleCount = 0;
@@ -259,6 +274,35 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
                     options:MTLResourceStorageModeShared];
         vtkMetalMRC::AssignConsumed(this->Internals->PositionBuffer, posBuffer);
 
+        // Upload texture coordinates (if any) as an interleaved
+        // position+texcoord buffer for the textured pipeline. This mirrors the
+        // OpenGL path, which uploads the polydata TCoords ("tcoordMC") and
+        // samples the actor's bound texture when the texture unit is set.
+        vtkDataArray* tcoords = input->GetPointData()->GetTCoords();
+        if (tcoords && tcoords->GetNumberOfTuples() == numPts &&
+          tcoords->GetNumberOfComponents() >= 2)
+        {
+          std::vector<float> posTc(numPts * 4);
+          for (vtkIdType i = 0; i < numPts; i++)
+          {
+            double* pt = posData->GetTuple(i);
+            double* tc = tcoords->GetTuple(i);
+            posTc[i * 4] = static_cast<float>(pt[0]);
+            posTc[i * 4 + 1] = static_cast<float>(pt[1]);
+            posTc[i * 4 + 2] = static_cast<float>(tc[0]);
+            posTc[i * 4 + 3] = static_cast<float>(tc[1]);
+          }
+          id<MTLBuffer> posTcBuffer = [device
+            newBufferWithBytes:posTc.data()
+                       length:posTc.size() * sizeof(float)
+                      options:MTLResourceStorageModeShared];
+          vtkMetalMRC::AssignConsumed(this->Internals->TexCoordBuffer, posTcBuffer);
+          this->Internals->HasTextureCoords = true;
+        }
+        else
+        {
+          this->Internals->HasTextureCoords = false;
+        }
       }
 
       // Build index buffers from cell arrays
@@ -373,45 +417,45 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
     }
 
     // Compute WCVC (world-to-viewport-clip) matrix
-    // For 2D overlay: orthographic projection from viewport pixel coordinates
-    // (size and vp are already captured above)
-    // Orthographic projection: maps [vp_x*size_w, (vp_x+vp_w)*size_w] x [vp_y*size_h, (vp_y+vp_h)*size_h] to [-1,1]
+    // For 2D overlay: orthographic projection from viewport pixel coordinates.
+    // Mirrors vtkOpenGLPolyDataMapper2D::SetTransformShaderParameters: the
+    // polydata points are in actor-local display coordinates, and the actor's
+    // viewport-pixel position offsets the ortho range so local coords land at
+    // the correct screen location. The renderer's own pixel size (GetSize) is
+    // used as the range, so sub-viewport renderers map correctly too.
     if (size[0] <= 0 || size[1] <= 0)
     {
       return;
     }
-    float vpX = static_cast<float>(vp[0] * size[0]);
-    float vpY = static_cast<float>(vp[1] * size[1]);
-    float vpW = static_cast<float>((vp[2] - vp[0]) * size[0]);
-    float vpH = static_cast<float>((vp[3] - vp[1]) * size[1]);
-    if (vpW <= 0.0f || vpH <= 0.0f)
-    {
-      return;
-    }
 
-    // Build orthographic matrix: maps viewport coords to NDC [-1,1]
-    // Metal NDC: x in [-1,1], y in [-1,1], z in [0,1]
-    // VTK viewport: origin at bottom-left, Metal origin at top-left
-    float ndcLeft = -1.0f;
-    float ndcRight = 1.0f;
-    float ndcBottom = -1.0f;
-    float ndcTop = 1.0f;
-    float ndcNear = 0.0f;
-    float ndcFar = 1.0f;
+    int* actorPos = actor->GetPositionCoordinate()->GetComputedViewportValue(viewport);
+    float xoff = static_cast<float>(actorPos[0]);
+    float yoff = static_cast<float>(actorPos[1]);
 
-    float worldLeft = vpX;
-    float worldRight = vpX + vpW;
-    float worldBottom = vpY;
-    float worldTop = vpY + vpH;
+    // Build orthographic matrix: maps actor-local coords + position offset to
+    // NDC [-1,1]. Metal NDC: x in [-1,1], y in [-1,1], z in [0,1].
 
-    // Standard orthographic matrix
+    float worldLeft = -xoff;
+    float worldRight = static_cast<float>(size[0]) - xoff;
+    float worldBottom = -yoff;
+    float worldTop = static_cast<float>(size[1]) - yoff;
+
+    // Standard orthographic matrix. The 2D overlay renders with depth test
+    // enabled (LessEqual, depth write on), so the Z row must encode the prop's
+    // display location like vtkOpenGLPolyDataMapper2D::SetCameraShaderParameters:
+    // foreground props at depth 0 (near), background props at depth 1 (far).
+    // Metal's clip/NDC z range is [0,1], so the Z translate is 0 for
+    // foreground and 1 for background. This keeps background overlays from
+    // overwriting foreground text/geometry while letting foreground overlays
+    // (later in render order) win at equal depth.
     float wcvc[16] = { 0 };
     wcvc[0] = 2.0f / (worldRight - worldLeft);
     wcvc[5] = 2.0f / (worldTop - worldBottom);
-    wcvc[10] = 1.0f / (ndcFar - ndcNear);
+    wcvc[10] = 0.0f;
     wcvc[12] = -(worldRight + worldLeft) / (worldRight - worldLeft);
     wcvc[13] = -(worldTop + worldBottom) / (worldTop - worldBottom);
-    wcvc[14] = -ndcNear / (ndcFar - ndcNear);
+    wcvc[14] =
+      actor->GetProperty()->GetDisplayLocation() == VTK_FOREGROUND_LOCATION ? 0.0f : 1.0f;
     wcvc[15] = 1.0f;
 
     // NOTE: no Y flip here. Metal's NDC maps +y to the top of the framebuffer,
@@ -571,12 +615,74 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
       [fFunc release];
     }
 
-    // Create and bind overlay depth-stencil state (always pass, no write)
+    // Create the textured pipeline (position+texcoord interleaved vertex
+    // buffer, texture sampled in the fragment shader) if needed.
+    if (!this->Internals->TexturedPipeline)
+    {
+      NSError* error = nil;
+      id<MTLLibrary> library = (__bridge id<MTLLibrary>)renWin->GetSharedShaderLibrary();
+      if (!library)
+      {
+        vtkErrorMacro(<< "No shared shader library available for 2D textured mapper");
+        return;
+      }
+
+      id<MTLFunction> tvFunc = [library newFunctionWithName:@"vertex_2d_image_main"];
+      id<MTLFunction> tfFunc = [library newFunctionWithName:@"fragment_2d_text_main"];
+      if (!tvFunc || !tfFunc)
+      {
+        vtkErrorMacro(<< "Failed to find 2D textured shader functions");
+        [tvFunc release];
+        [tfFunc release];
+        return;
+      }
+
+      MTLVertexDescriptor* texVertexDesc = [[MTLVertexDescriptor alloc] init];
+      texVertexDesc.attributes[0].format = MTLVertexFormatFloat2;
+      texVertexDesc.attributes[0].offset = 0;
+      texVertexDesc.attributes[0].bufferIndex = 0;
+      texVertexDesc.attributes[1].format = MTLVertexFormatFloat2;
+      texVertexDesc.attributes[1].offset = sizeof(float) * 2;
+      texVertexDesc.attributes[1].bufferIndex = 0;
+      texVertexDesc.layouts[0].stride = sizeof(float) * 4;
+      texVertexDesc.layouts[0].stepRate = 1;
+      texVertexDesc.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
+
+      MTLRenderPipelineDescriptor* tdesc = [[MTLRenderPipelineDescriptor alloc] init];
+      tdesc.vertexFunction = tvFunc;
+      tdesc.fragmentFunction = tfFunc;
+      tdesc.vertexDescriptor = texVertexDesc;
+      tdesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      tdesc.depthAttachmentPixelFormat = depthFormat;
+      tdesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+      tdesc.rasterSampleCount = sampleCount;
+      tdesc.colorAttachments[0].blendingEnabled = YES;
+      tdesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+      tdesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+      tdesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+      tdesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+
+      this->Internals->TexturedPipeline =
+        [device newRenderPipelineStateWithDescriptor:tdesc error:&error];
+      if (!this->Internals->TexturedPipeline)
+      {
+        vtkErrorMacro(<< "2D textured pipeline: " << [[error localizedDescription] UTF8String]);
+      }
+      [tdesc release];
+      [texVertexDesc release];
+      [tvFunc release];
+      [tfFunc release];
+    }
+
+    // Create and bind overlay depth-stencil state (LessEqual, write on),
+    // matching the OpenGL overlay depth state: the Z row of the wcvc matrix
+    // encodes foreground (near) vs background (far), and equal-depth foreground
+    // props resolve by render order.
     if (!this->Internals->OverlayDepthState)
     {
       MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-      dsDesc.depthCompareFunction = MTLCompareFunctionAlways;
-      dsDesc.depthWriteEnabled = NO;
+      dsDesc.depthCompareFunction = MTLCompareFunctionLessEqual;
+      dsDesc.depthWriteEnabled = YES;
       this->Internals->OverlayDepthState =
           [device newDepthStencilStateWithDescriptor:dsDesc];
       [dsDesc release];
@@ -587,11 +693,42 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
     [encoder setVertexBuffer:this->Internals->StateBuffer offset:0 atIndex:1];
     [encoder setFragmentBuffer:this->Internals->StateBuffer offset:0 atIndex:0];
 
+    // Textured geometry (e.g. vtkTextMapper / vtkTextActor): resolve the
+    // texture registered for the actor's GENERAL_TEXTURE_UNIT and draw the
+    // interleaved position+texcoord buffer, sampling the texture in the
+    // fragment shader (multiplied by the actor's color/opacity). Mirrors the
+    // OpenGL 2D mapper's "texture1" path.
+    vtkInformation* info = actor->GetPropertyKeys();
+    id<MTLTexture> boundTex = nil;
+    bool texturedDraw = false;
+    if (this->Internals->HasTextureCoords && this->Internals->TexturedPipeline &&
+      this->Internals->TexCoordBuffer && this->Internals->HasTriangles && info &&
+      info->Has(vtkProp::GENERAL_TEXTURE_UNIT()))
+    {
+      int tunit = info->Get(vtkProp::GENERAL_TEXTURE_UNIT());
+      boundTex = (__bridge id<MTLTexture>)renWin->GetBoundTexture(tunit);
+      texturedDraw = (boundTex != nil);
+    }
+
+    if (texturedDraw && this->Internals->TriangleIndexBuffer &&
+      this->Internals->TriangleIndexCount > 0)
+    {
+      [encoder setRenderPipelineState:this->Internals->TexturedPipeline];
+      [encoder setVertexBuffer:this->Internals->TexCoordBuffer offset:0 atIndex:0];
+      [encoder setFragmentTexture:boundTex atIndex:0];
+
+      [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                          indexCount:this->Internals->TriangleIndexCount
+                           indexType:MTLIndexTypeUInt32
+                         indexBuffer:this->Internals->TriangleIndexBuffer
+                   indexBufferOffset:0];
+    }
+
     // Set position buffer at buffer index 0
     [encoder setVertexBuffer:this->Internals->PositionBuffer offset:0 atIndex:0];
 
     // Draw triangles using index buffer
-    if (this->Internals->HasTriangles &&
+    if (!texturedDraw && this->Internals->HasTriangles &&
         this->Internals->TrianglePipeline &&
         this->Internals->TriangleIndexBuffer &&
         this->Internals->TriangleIndexCount > 0)

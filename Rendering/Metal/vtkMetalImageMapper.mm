@@ -14,6 +14,7 @@
 #include "vtkDataArray.h"
 #include "vtkImageData.h"
 #include "vtkPointData.h"
+#include "vtkProperty2D.h"
 #include "vtkViewport.h"
 #include "vtkWindow.h"
 
@@ -53,6 +54,11 @@ struct vtkMetalImageMapper::vtkMetalImageMapperInternals
   // RenderData. Position2 is used for the RenderToRectangle path.
   int Position[2] = { 0, 0 };
   int Position2[2] = { 0, 0 };
+
+  // Display location (VTK_BACKGROUND_LOCATION / VTK_FOREGROUND_LOCATION) of the
+  // actor being rendered; encoded into the wcvc Z row so the overlay depth test
+  // orders background props behind foreground props.
+  int DisplayLocation = VTK_FOREGROUND_LOCATION;
 
   void ReleasePipeline()
   {
@@ -542,6 +548,7 @@ void vtkMetalImageMapper::RenderData(vtkViewport* viewport, vtkImageData* data, 
   int* actorPos = actor->GetActualPositionCoordinate()->GetComputedViewportValue(viewport);
   this->Internals->Position[0] = actorPos[0] + this->PositionAdjustment[0];
   this->Internals->Position[1] = actorPos[1] + this->PositionAdjustment[1];
+  this->Internals->DisplayLocation = actor->GetProperty()->GetDisplayLocation();
   int* actorPos2 = actor->GetActualPosition2Coordinate()->GetComputedViewportValue(viewport);
   this->Internals->Position2[0] = actorPos2[0];
   this->Internals->Position2[1] = actorPos2[1];
@@ -631,12 +638,18 @@ void vtkMetalImageMapper::DrawPixels(
     // bottom), so no Y negation is applied here: the quad's bottom vertex
     // (texCoord v=0, which samples the texture's first row = the image's
     // bottom row after upload) lands at NDC -1, the bottom of the framebuffer.
+    // The Z row encodes the actor's display location so the overlay depth test
+    // (LessEqual, write on) resolves foreground props over background props,
+    // mirroring vtkOpenGLPolyDataMapper2D::SetCameraShaderParameters. Metal's
+    // clip/NDC z range is [0,1], so foreground maps to depth 0 and background
+    // to depth 1.
     float wcvc[16] = { 0 };
     wcvc[0] = 2.0f / vpW;
     wcvc[5] = 2.0f / vpH;
-    wcvc[10] = 1.0f;
+    wcvc[10] = 0.0f;
     wcvc[12] = -(2.0f * vpX + vpW) / vpW;
     wcvc[13] = -(2.0f * vpY + vpH) / vpH;
+    wcvc[14] = this->Internals->DisplayLocation == VTK_FOREGROUND_LOCATION ? 0.0f : 1.0f;
     wcvc[15] = 1.0f;
 
     // State buffer (only the wcvc matrix is consumed by the vertex shader).
@@ -759,12 +772,15 @@ void vtkMetalImageMapper::DrawPixels(
       return;
     }
 
-    // Overlay depth-stencil state (always pass, no write).
+    // Overlay depth-stencil state (LessEqual, write on): the wcvc Z row encodes
+    // the actor's display location, so foreground props win over background
+    // props and equal-depth foreground props resolve by render order, matching
+    // the OpenGL overlay depth behavior.
     if (!this->Internals->OverlayDepthState)
     {
       MTLDepthStencilDescriptor* dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-      dsDesc.depthCompareFunction = MTLCompareFunctionAlways;
-      dsDesc.depthWriteEnabled = NO;
+      dsDesc.depthCompareFunction = MTLCompareFunctionLessEqual;
+      dsDesc.depthWriteEnabled = YES;
       this->Internals->OverlayDepthState = [device newDepthStencilStateWithDescriptor:dsDesc];
       [dsDesc release];
     }
