@@ -136,7 +136,7 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  82 Passed  84 Failed (incl. image/pick fails)  9 "Subprocess aborted"
+175 tests:  83 Passed  83 Failed (incl. image/pick fails)  9 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
@@ -170,6 +170,12 @@ section below), completing all four scalar-LUT tests
 the first and last two were already passing via the per-block scalar-override
 cluster). The +1 delta over the previous run is exactly that test; the 9 aborts
 are unchanged.)
+Run after the 2D-overlay-mapper fix: 83 Passed / 83 Failed / 9 aborted —
+`TestActor2D` now passes via the `vtkMetalPolyDataMapper2D` fix below
+(`RenderOverlay` never called `GetInputAlgorithm()->Update()`, so 2D geometry
+was not computed and the mapper returned early, and a stray Y-flip in the WCVC
+orthographic matrix inverted the quad). The +1 delta over the previous run is
+exactly that test; the 9 aborts are unchanged.
 
 ### The selection cluster is fixed
 
@@ -380,16 +386,16 @@ scalar-LUT tests: `TestCompositePolyDataMapperOverrideLUT`,
 
 ### Image-compare failures
 
-Current run (2026-08-03): 84 failed = 81 image-compare + 3 non-image. Buckets
+Current run (2026-08-03): 83 failed = 80 image-compare + 3 non-image. Buckets
 by max `vtkTesting` TIGHT_VALID error per test (threshold 0.05):
 
 | Bucket | Range | Count | Examples |
 |--------|-------|-------|----------|
-| near-miss | 0.05 – 0.1 | 10 | `TestActorLightingFlag` 0.051, `TestEdgeFlags` 0.068, `TestQuadPointRep` 0.069, `TestMixedGeometry_3` 0.070, `TestImageAndAnnotations` 0.070, `TestVertexRendering` 0.072, `TestLineRenderingTranslucent` 0.079, `TestGlyph3DMapperPicking` 0.080, `RenderNonFinite` 0.087, `TestMixedGeometryCellScalars` 0.092 |
-| mid | 0.1 – 0.5 | 43 | `TestSurfacePlusEdges` 0.104, `TestCompositePolyDataMapperPicking` 0.176, `TestGlyph3DMapperIndexing` 0.155, `TestWireframe` 0.239, `TestPolyDataMapper2D` 0.235, `TestCoincident` 0.334, `TestCompositePolyDataMapperCustomShader` 0.290, `TestColorByStringArrayDefaultLookupTable2D` 0.482, `TestGradientBackground` 0.469 |
-| gross | >= 0.5 | 27 | `TestStereoBackground{Left,Right}` 0.887, `TestNViewports*` 0.85–0.88, `TestDirectScalarsToColors` 0.858, `TestMapVectorsToColors` 0.747, `TestImageMapper_1..4` 0.63–0.72, `TestActor2DTextures` 0.594, `TestTilingCxx` 0.616, `TestBareScalarsToColors` 0.584 |
+| near-miss | 0.05 – 0.1 | 11 | `TestActorLightingFlag` 0.051, `TestImageAndAnnotations` 0.061, `TestPolyDataMapper2D` 0.066, `TestEdgeFlags` 0.068, `TestQuadPointRep` 0.069, `TestMixedGeometry_3` 0.070, `TestVertexRendering` 0.072, `TestLineRenderingTranslucent` 0.079, `TestGlyph3DMapperPicking` 0.080, `RenderNonFinite` 0.087, `TestMixedGeometryCellScalars` 0.092 |
+| mid | 0.1 – 0.5 | 41 | `TestSurfacePlusEdges` 0.104, `TestCompositePolyDataMapperPicking` 0.176, `TestGlyph3DMapperIndexing` 0.155, `TestWireframe` 0.239, `TestPolyDataMapper2DPointScalarColorMapping` 0.286, `TestCoincident` 0.334, `TestCompositePolyDataMapperCustomShader` 0.290, `TestColorByStringArrayDefaultLookupTable2D` 0.482, `TestGradientBackground` 0.469 |
+| gross | >= 0.5 | 27 | `TestStereoBackground{Left,Right}` 0.887, `TestNViewports*` 0.85–0.88, `TestDirectScalarsToColors` 0.858, `TestMapVectorsToColors` 0.747, `TestImageMapper_1..4` 0.63–0.72, `TestActor2DTextures` 0.786, `TestTilingCxx` 0.616, `TestBareScalarsToColors` 0.584 |
 
-(80 of the 81 image-compare failures exceed the 0.05 threshold; the 81st,
+(79 of the 80 image-compare failures exceed the 0.05 threshold; the 80th,
 `TestCompositePolyDataMapperPickability`, has a below-threshold ImageError of
 0.015 but still fails its own pickability check.) The 3 non-image failures:
 `TestPointSelection`, `TestPointSelectionWithCellData` (selection returns
@@ -430,7 +436,30 @@ value (the renderer's opaque/translucent/volume/overlay passes and the
 poly-data/glyph/image/volume mapper PSOs), the clamp applies everywhere.
 `TestOpacityMSAA` now renders and passes its image comparison.
 
-### Theme clusters in the 84 failures
+### The 2D overlay mapper is fixed
+
+`TestActor2D` (a 3D plane with scalar-texture LUT plus a yellow
+`vtkPolyDataMapper2D` quad at normalized viewport coords) now passes
+(ImageError 0.027 vs. 0.05 threshold; was 0.276). Two bugs in
+`vtkMetalPolyDataMapper2D::RenderOverlay`:
+
+- It never called `this->GetInputAlgorithm()->Update()`, so the 2D source
+  pipeline (e.g. `planeSource2`) never executed and the mapper returned early
+  with 0 points. OpenGL's `vtkOpenGLPolyDataMapper2D.cxx` calls `Update()`
+  before reading `GetInput()`; the Metal override now does the same.
+- The WCVC orthographic matrix negated the viewport Y coords
+  (`wcvc[1]/[5]/[9]/[13]`), mirroring an OpenGL-style flip. Metal's NDC
+  `+y = framebuffer top` already matches VTK's y-up viewport, and the renderer's
+  `ReadColorCopyData` emits rows bottom-up, so the flip inverted the quad. It is
+  removed, matching the OpenGL matrix exactly.
+
+Remaining 2D fidelity gaps (all pre-existing, now documented values): the 2D
+vertex shader has no `[[point_size]]` output (`TestPolyDataMapper2D` 0.066),
+2D scalar color mapping is ignored (`TestPolyDataMapper2D{Point,Cell}
+ScalarColorMapping` 0.286/0.294), and textured 2D actors render flat gray
+instead of their texture (`TestActor2DTextures` 0.786).
+
+### Theme clusters in the 83 failures
 
 - **Textures** (~15): every `TestTexture*`, `TestBackfaceTexture`,
   `TestTexturedCylinder`, `TestTilingCxx`, `TestActor2DTextures` — historically
@@ -461,9 +490,12 @@ poly-data/glyph/image/volume mapper PSOs), the clamp applies everywhere.
   `TestImageAndAnnotations`, `TestVertexRendering`, `TestLineRenderingTranslucent`,
   `TestGlyph3DMapperPicking`, `RenderNonFinite`, `TestMixedGeometryCellScalars`)
   are the next easy-win targets.
-- **2D overlay / image mapper**: `TestPolyDataMapper2D` (0.235),
-  `TestPolyDataMapper2D{Point,Cell}ScalarColorMapping` (0.236/0.246),
-  `TestImageMapper_1..4` (0.63–0.72), `TestActor2D` (now renders; image fail).
+- **2D overlay / image mapper**: `TestPolyDataMapper2D` (0.066; point size not
+  in the 2D shader), `TestPolyDataMapper2D{Point,Cell}ScalarColorMapping`
+  (0.286/0.294; 2D scalar colors ignored),
+  `TestImageMapper_1..4` (0.63–0.72), `TestActor2DTextures` (0.786; textured
+  2D actors render flat gray). `TestActor2D` now passes — see the 2D-overlay
+  section above.
 - **LUT / color mapping** (~5): `TestBareScalarsToColors` 0.584,
   `TestDirectScalarsToColors` 0.858, `TestMapVectorsToColors` 0.747,
   `TestMapVectorsAsRGBColors` 0.632, `TestColorByStringArrayDefaultLookupTable2D` 0.482.
@@ -475,7 +507,7 @@ poly-data/glyph/image/volume mapper PSOs), the clamp applies everywhere.
 
 ### Evidence the core path is correct
 
-The 82 passes include the strongest-scrutiny tests: `TestOpacity` (passes with
+The 83 passes include the strongest-scrutiny tests: `TestOpacity` (passes with
 the `TIGHT_VALID` metric — the Lab-space color path matches GL to
 `0.00038`), `TestOSConeCxx`, `TestMace`, the four scalar-LUT tests
 (`TestCompositePolyDataMapperOverrideLUT`, `TestTextureInterpolateScalars`,
@@ -486,7 +518,8 @@ at ImageError 1.2e-06–1.2e-04), `TestTranslucentLUTAlphaBlending`,
 `BlockOpacities`/`ToggleScalarVisibilities`/`PartialPointData`/`StaticBounds`/
 `SharedArray` variants, `TestAreaSelections` and `TestHardwareSelector` (exact
 per-primitive cell ids), the read-back cluster (`TestReadPixels`,
-`TestSelectVisiblePoints`, `TestWorldPointPicker`), and the basic Glyph3D,
+`TestSelectVisiblePoints`, `TestWorldPointPicker`), `TestActor2D` (2D overlay
+quad matches GL to 0.027), and the basic Glyph3D,
 `FrustumClip`, `RGrid`, `TestQuad`. `Rendering/Metal/Testing/OpenGLComparison.md`
 shows every bespoke scene now matches OpenGL to a thresholded error of 0.000
 (0.005 for volume).
@@ -551,7 +584,8 @@ not in the fundamental geometry/lighting/color path.
    needs Metal overrides for the label/text rendering stack.
 7. **Glyph instancing colors**, **2D overlay + image mapper**, **LUT/color
    mapping**, **stereo/multiview + gradient background**, **TStrips** — all
-   render but diverge from GL.
+   render but diverge from GL. (`TestActor2D` now passes — see the 2D-overlay
+   section above; `TestPolyDataMapper2D` is at 0.066, the closest 2D miss.)
 
 ---
 
@@ -589,7 +623,9 @@ now passes), and finally after the per-block scalar-override cluster
 over the prior run is within documented run-to-run flakiness), and most recently
 after the scalar-texture LUT pipeline
 (82 Passed / 84 Failed / 9 aborted — `TestTextureInterpolateScalars` now passes,
-completing the four scalar-LUT tests). The image-compare
+completing the four scalar-LUT tests), and then after the 2D-overlay-mapper fix
+(83 Passed / 83 Failed / 9 aborted — `TestActor2D` now passes via the
+`vtkMetalPolyDataMapper2D` `Update()` / no-Y-flip fix). The image-compare
 buckets above are from that latest run's `LastTest.log` (max TIGHT_VALID error
 per test). Re-running is reproducible except where a crash's signal stack
 ordering varies; the pass count fluctuates run to run.
