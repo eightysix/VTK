@@ -317,7 +317,21 @@ diffuseIntensity*diffuseColor` (see the surface lighting-flag section below).
 The +1 pass delta over the previous run is exactly that test; the 3 aborts are
 unchanged (`TestLabeledContourMapper`, `TestLabeledContourMapperNoLabels`,
 `TestLabeledContourMapperWithActorMatrix`). The regression check against the
-documented passing cluster reports none.
+  documented passing cluster reports none.
+Run after the thick-line/tube lighting bake (this run, 2026-08-03): 134 Passed /
+38 Failed / 3 aborted out of 175 (analyzed with `analyze_metal_ctest_log.py`
+from a single `ctest -R "RenderingCoreCxx-Metal" -j 8` run) — the pass count is
+unchanged, but the thick-line/tube pipelines now bake
+`vtkProperty::GetLighting()` into a dedicated `kLightingDisabled` function
+constant (16), closing the documented "Known gap": a `RenderLinesAsTubes` actor
+with `SetLighting(false)` now renders its tubes flat like GL instead of running
+the Phong loop (see the tube-light bake section below). The only metric deltas:
+`TestRenderLinesAsTubes` and `TestRenderLinesAsTubesOrthoCamera` improved from
+0.2350/0.2349 to 0.2292/0.2292 (still mid-bucket; the residual error is the
+pre-existing thick-line tube-shading fidelity gap, not the lighting flag). The
+3 aborts are unchanged (`TestLabeledContourMapper`,
+`TestLabeledContourMapperNoLabels`, `TestLabeledContourMapperWithActorMatrix`).
+The regression check against the documented passing cluster reports none.
 
 ### The point-rendering cluster is fixed
 
@@ -682,7 +696,7 @@ max `vtkTesting` TIGHT_VALID error per test (threshold 0.05):
 | Bucket | Range | Count | Examples |
 |--------|-------|-------|----------|
 | near-miss | 0.05 – 0.1 | 6 | `TestActorLightingFlag` 0.0513, `TestPolyDataMapper2D` 0.0664, `TestEdgeFlags` 0.0681, `TestLineRenderingTranslucent` 0.0790, `TestGlyph3DMapperPicking` 0.0800, `RenderNonFinite` 0.0870 |
-| mid | 0.1 – 0.5 | 24 | `TestGlyph3DMapper` 0.1082, `TestMixedGeometryCellScalars` 0.1373, `TestCompositePolyDataMapperSpheres` 0.1499, `TestPolyDataMapperClipPlanes` 0.1526, `TestTransformCoordinateUseDouble` 0.1635, `TestCompositePolyDataMapperPicking` 0.1712, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.2241, `TestCoincident` 0.2343, `TestRenderLinesAsTubesOrthoCamera` 0.2349, `TestRenderLinesAsTubes` 0.2350, `TestStereoEyeSeparation` 0.2584, `TestCompositePolyDataMapperPartialFieldData` 0.2622, `TestPolyDataMapperNormals` 0.2698, `TestPolyDataMapper2DPointScalarColorMapping` 0.2861, `TestCompositePolyDataMapperVertices` 0.2891, `TestCompositePolyDataMapperCustomShader` 0.2897, `TestGlyph3DMapperBackfaceColor` 0.2914, `TestPolyDataMapper2DCellScalarColorMapping` 0.2943, `TestResetCameraScreenSpace` 0.3438, `TestGradientBackground` 0.3449, `TestCompositePolyDataMapperCameraShiftScale` 0.3601, `TestResizingWindowToImageFilter` 0.4130, `TestGlyph3DMapperPointSize` 0.4596, `TestColorByStringArrayDefaultLookupTable2D` 0.4821 |
+| mid | 0.1 – 0.5 | 24 | `TestGlyph3DMapper` 0.1082, `TestMixedGeometryCellScalars` 0.1373, `TestCompositePolyDataMapperSpheres` 0.1499, `TestPolyDataMapperClipPlanes` 0.1526, `TestTransformCoordinateUseDouble` 0.1635, `TestCompositePolyDataMapperPicking` 0.1712, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.2241, `TestCoincident` 0.2343, `TestRenderLinesAsTubesOrthoCamera` 0.2292, `TestRenderLinesAsTubes` 0.2292, `TestStereoEyeSeparation` 0.2584, `TestCompositePolyDataMapperPartialFieldData` 0.2622, `TestPolyDataMapperNormals` 0.2698, `TestPolyDataMapper2DPointScalarColorMapping` 0.2861, `TestCompositePolyDataMapperVertices` 0.2891, `TestCompositePolyDataMapperCustomShader` 0.2897, `TestGlyph3DMapperBackfaceColor` 0.2914, `TestPolyDataMapper2DCellScalarColorMapping` 0.2943, `TestResetCameraScreenSpace` 0.3438, `TestGradientBackground` 0.3449, `TestCompositePolyDataMapperCameraShiftScale` 0.3601, `TestResizingWindowToImageFilter` 0.4130, `TestGlyph3DMapperPointSize` 0.4596, `TestColorByStringArrayDefaultLookupTable2D` 0.4821 |
 | gross | >= 0.5 | 5 | `TestGradientBackgroundWithTiledViewport` 0.5063, `TestGradientBackgroundWithTiledViewports` 0.5856, `TestOffAxisStereo` 0.5921, `TestTilingCxx` 0.6159, `TestSplitViewportStereoHorizontal` 0.6816 |
 
 (`TestNActors{OneMapper,NMappersOneInput}` left the mid bucket via the
@@ -714,7 +728,11 @@ to 6 and gross from 6 to 5: `TestImageAndAnnotations` (near-miss 0.0607, now
 passing at 0.0461), `TestActor2DTextures` (gross 0.7862, now passing at
 3.9e-08) and `TestBackfaceCulling` (mid 0.1016, now passing at 0.0091) all left
 via the 2D overlay depth-ordering and text-texture section below — the first
-time any of the three have passed.
+time any of the three have passed.) This run the near-miss bucket dropped from 6
+to 5: `TestActorLightingFlag` (0.0513, now passing at 9.53e-05) left via the
+surface lighting-flag fix above, and `TestRenderLinesAsTubes`/`OrthoCamera`
+improved from 0.2350/0.2349 to 0.2292/0.2292 (still mid) via the tube-light
+bake below — the pass count is unchanged.
 
 ### Crashes (3; all pre-existing classes, none from the texture or composite clusters)
 
@@ -875,8 +893,10 @@ lines. The fix (`fragment_main_line` + `kSceneFlagLinesUnlit`, bit 14):
   diffuseIntensity*diffuseColor` (the flat vertex/material color), matching GL.
 - Surface draws still use `fragment_main`/`fragment_main_nodepth` with
   `unlitLines = false`, so an actor without normals keeps full triangle
-  lighting (GL lights tris regardless of normals), and thick-line/tube
-  pipelines (`shadeLineFragment`) are untouched — GL always lights those.
+  lighting (GL lights tris regardless of normals). The thick-line/tube
+  pipelines (`shadeLineFragment`) are compiled with the actor's lighting state
+  baked via the `kLightingDisabled` function constant (16); see the tube-light
+  bake section below.
 
 `TestWireframe` now passes with white wires (1,360 white pixels vs the GL
 baseline's 1,388 — a 28-pixel anti-aliasing delta, well under threshold). The
@@ -889,7 +909,7 @@ cell-scalar lines, thick-line/tube shading). `TestVertexRendering` 0.072 and
 (vertex dots), and `TestSurfacePlusEdges` + `TestEdgeThickness` (edge
 overlay) left via the per-actor edge-color fix above.
 
-### Surface / point draws respect the property lighting flag
+### Surface / point / tube draws respect the property lighting flag
 
 `TestActorLightingFlag` (three cones; the middle one sets
 `GetProperty()->SetLighting(false)`) failed at 0.0513: the middle cone was
@@ -899,7 +919,7 @@ the light complexity to 0 whenever `property->GetLighting()` is false, and the
 GL fragment then emits `gl_FragData[0] = vec4(ambientColor + diffuseColor,
 opacity)` (the flat material color) for every primitive type. The Metal
 surface/point fragments ignored the flag and always ran `computePhongLighting`.
-The fix (`kSceneFlagLightingDisabled`, bit 16):
+The fix (surface/point runtime flag + tube pipeline bake):
 
 - The mapper sets `VTK_METAL_SCENE_FLAG_LIGHTING_DISABLED` per actor in
   `RenderPiece` when `!prop->GetLighting()` (lines already fold
@@ -916,12 +936,20 @@ The fix (`kSceneFlagLightingDisabled`, bit 16):
   passing `kSceneFlagLinesUnlit`, so triangle and line decisions stay separate
   (an actor without normals keeps full triangle lighting; a lit-but-normalless
   line actor keeps flat lines).
-
-Known gap (pre-existing, same root cause): the thick-line/tube pipelines
-(`shadeLineFragment`) never read the scene uniforms and still always run the
-Phong loop, so a `RenderLinesAsTubes` actor with `SetLighting(false)` stays lit;
-no test exercises that combination (GL also forces `needLighting = true` for
-tubes, but still clears it when `GetLighting()` is false).
+- Thick-line/tube pipelines follow GL's design: GL forces `needLighting = true`
+  for tubes but still clears it when `GetLighting()` is false, so the lighting
+  state is a compile-time specialization, not a runtime flag. Each tube PSO
+  family (`thick-line`, `round-cap`, `miter-join`) now has a lit and an unlit
+  variant baked with the `kLightingDisabled` function constant (16), selected
+  in `RenderPiece` from `act->GetProperty()->GetLighting()`; `shadeLineFragment`
+  skips the fake-tube normal construction and `computePhongLighting` when baked
+  unlit, emitting `ambientColor.w*baseColor + diffuseColor.w*baseColor` with no
+  specular (GL's complexity-0 tube output). The unlit variants are also
+  registered in the availability/`edgeTubes`/`drawEdgeOverlay` checks, and the
+  bundle cache key records the property lighting so lit and unlit actors sharing
+  a mapper don't alias each other's pipeline. No test exercises the unlit-tube
+  combination in the generic suite, but the bespoke `TestMetalPointRender`
+  scene's tubes-plus-lighting renders identically.
 
 `TestActorLightingFlag` now passes (TIGHT_VALID 9.53e-05). The regression check
 reports no new failures: the other five near-miss tests keep their exact prior
@@ -1178,9 +1206,16 @@ now pass via the ambient-pre-applied edge shader, `TestReadPixels` and
  `UpdateActorTexture`), and then after the point-rendering lighting fix
  (130 Passed / 42 Failed / 3 aborted — `TestPointRendering{,_Round}_3/4`,
  `TestVertexRendering`, `TestQuadPointRep` and `TestMixedGeometry_3` now pass via
- the `HasVerts` gate and the hoisted `UpdateLightUniforms` call in
- `vtkMetalPolyDataMapper::RenderPiece`).
- The image-compare buckets above are from that latest run's `LastTest.log` (max
+  the `HasVerts` gate and the hoisted `UpdateLightUniforms` call in
+  `vtkMetalPolyDataMapper::RenderPiece`), then after the surface lighting-flag fix
+  (134 Passed / 38 Failed / 3 aborted — `TestActorLightingFlag` now passes via the
+  `kSceneFlagLightingDisabled` runtime flag in the surface/point fragments), and
+  then after the thick-line/tube lighting bake
+  (134 Passed / 38 Failed / 3 aborted — the tube pipelines now bake
+  `GetLighting()` into the `kLightingDisabled` function constant; pass count
+  unchanged, `TestRenderLinesAsTubes{OrthoCamera}` improved 0.2350/0.2349 →
+  0.2292/0.2292).
+  The image-compare buckets above are from that latest run's `LastTest.log` (max
 TIGHT_VALID error per test), analyzed with `analyze_metal_ctest_log.py`.
 Re-running is reproducible except where a crash's signal stack
 ordering varies; the pass count fluctuates run to run.

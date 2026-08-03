@@ -82,6 +82,17 @@ constant int kLightType [[function_constant(14)]];
 // whose vertex/fragment functions reach the surface entries (indices 6-14 are
 // the existing constants; 15 is this one).
 constant bool kHasScalarLUT [[function_constant(15)]];
+// Property lighting disabled (vtkProperty::SetLighting(false)): the compile-time
+// analog of vtkGLSLModLight's complexity-0 shader. The mapper bakes it into the
+// per-actor specialized pipelines (surface + thick-line tube variants) via
+// MTLFunctionConstantValues, so the unlit variant drops the Phong loop (and the
+// fake-tube normal construction) entirely — the same "no lighting code compiled
+// in" outcome GL gets from selecting a NoLighting shader. Every fragment
+// function that reaches shadeLineFragment/evaluateSurfaceFragment must supply
+// this constant; the shared full-behavior pipelines (base/1px-line) bake NO and
+// fall back to the runtime kSceneFlagLightingDisabled scene flag, since a single
+// shared pipeline serves actors of mixed lighting state.
+constant bool kLightingDisabled [[function_constant(16)]];
 
 // The per-cell color port ("cell texture"): when per-cell colors are present
 // and the vertex stream is deduplicated, the cell RGBA cannot live in the
@@ -780,7 +791,7 @@ fragment FragmentOutputNoDepth fragment_main_nodepth(VertexOut in [[stage_in]],
     evaluateSurfaceFragment(in, material, lights, scene, edge,
       clipPlanes, cellColorTex, cellPrimitiveIds, actorTexture, actorSampler,
       lutTexture, lutSampler, prim_id, frontFacing,
-      (scene.flags & kSceneFlagLightingDisabled) != 0u));
+      kLightingDisabled || (scene.flags & kSceneFlagLightingDisabled) != 0u));
 }
 
 // Coincident-offset variant: writes depth from the fragment stage exactly like
@@ -805,7 +816,7 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
     evaluateSurfaceFragment(in, material, lights, scene, edge,
       clipPlanes, cellColorTex, cellPrimitiveIds, actorTexture, actorSampler,
       lutTexture, lutSampler, prim_id, frontFacing,
-      (scene.flags & kSceneFlagLightingDisabled) != 0u),
+      kLightingDisabled || (scene.flags & kSceneFlagLightingDisabled) != 0u),
     in, coinOffset);
 }
 
@@ -1165,24 +1176,33 @@ inline FragmentOutput shadeLineFragment(LineVertexOut in,
   FragmentOutput out;
   float3 baseColor = in.vertexColor.rgb;
   float baseAlpha = in.vertexColor.a * material.opacity;
-  // Fake-tube shading: rotate the view-facing normal toward the lateral
-  // (across-the-tube) direction so the tube reads as a lit cylinder instead of
-  // a flat quad. Matches the vtkOpenGLPolyDataMapper tube normal construction,
-  // including the emix blend that keeps the tube edges lit (the edge normal is
-  // half cylinder, half view-facing, which keeps N.z from dropping to zero).
-  float r = clamp(in.dist_to_centerline, -1.0, 1.0);
-  float lenZ = clamp(sqrt(max(1.0 - r * r, 0.0)), 0.0, 1.0);
-  float3 lateral = normalize(in.viewNormal);
-  float3 cylinderN = normalize(r * lateral + lenZ * float3(0.0, 0.0, 1.0));
-  float emix = clamp(0.5 + in.lineHalfW * (1.0 - abs(r)), 0.0, 1.0);
-  float3 N = normalize(mix(float3(0.0, 0.0, 1.0), cylinderN, emix));
 
   float3 totalDiffuse = float3(0.0), totalSpecular = float3(0.0);
-  computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb,
-      material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
+  // Property lighting disabled (vtkProperty::SetLighting(false)): emit the flat
+  // ambient+diffuse material color, matching vtkGLSLModLight's complexity-0
+  // path. This is a compile-time branch via kLightingDisabled (GL bakes the
+  // complexity into a NoLighting shader), so the unlit pipeline variant drops
+  // the fake-tube normal construction and Phong loop entirely.
+  if (!kLightingDisabled)
+  {
+    // Fake-tube shading: rotate the view-facing normal toward the lateral
+    // (across-the-tube) direction so the tube reads as a lit cylinder instead of
+    // a flat quad. Matches the vtkOpenGLPolyDataMapper tube normal construction,
+    // including the emix blend that keeps the tube edges lit (the edge normal is
+    // half cylinder, half view-facing, which keeps N.z from dropping to zero).
+    float r = clamp(in.dist_to_centerline, -1.0, 1.0);
+    float lenZ = clamp(sqrt(max(1.0 - r * r, 0.0)), 0.0, 1.0);
+    float3 lateral = normalize(in.viewNormal);
+    float3 cylinderN = normalize(r * lateral + lenZ * float3(0.0, 0.0, 1.0));
+    float emix = clamp(0.5 + in.lineHalfW * (1.0 - abs(r)), 0.0, 1.0);
+    float3 N = normalize(mix(float3(0.0, 0.0, 1.0), cylinderN, emix));
+
+    computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb,
+        material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
+  }
 
   out.color = float4(material.ambientColor.w * baseColor
-                   + material.diffuseColor.w * totalDiffuse + totalSpecular, baseAlpha);
+                   + material.diffuseColor.w * (kLightingDisabled ? baseColor : totalDiffuse) + totalSpecular, baseAlpha);
   out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
   float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
   out.depth = in.position.z + coinOffset.lineFactor * cscale + coinOffset.lineOffset / 65000.0;

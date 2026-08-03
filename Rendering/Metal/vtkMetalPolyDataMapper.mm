@@ -245,6 +245,11 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     // (index 15) so the surface pipeline samples the LUT
     // texture for its color (GL's texture(colortexture, ...) path).
     kSurfaceFeatureScalarLUT = 1u << 8,
+    // Property lighting disabled (vtkProperty::SetLighting(false)): baked into
+    // the kLightingDisabled function constant (index 16) so the unlit surface
+    // pipeline compiles with the Phong loop removed — the GL complexity-0
+    // analog (vtkGLSLModLight bakes the light complexity into the shader).
+    kSurfaceFeatureLightingDisabled = 1u << 9,
   };
   uint32_t SurfaceFeatureMask = 0;
   bool SurfaceNeedsDepthWrite = false;
@@ -356,17 +361,23 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLBuffer> EdgeTubeSegmentCountBuffer = nil; // uint32: total edge tube segment count
   vtkIdType EdgeTubeSegmentCount = 0;
 
-  // P3-3A: Thick line pipeline — screen-space quad expansion for lineWidth > 1
+  // P3-3A: Thick line pipeline — screen-space quad expansion for lineWidth > 1.
+  // Each tube family has a lit and an unlit (kLightingDisabled) variant — the
+  // GL complexity-0 analog — selected per-actor at record time; the unlit
+  // variant compiles with the Phong loop and fake-tube normal removed.
   id<MTLRenderPipelineState> ThickLinePipeline = nil;
+  id<MTLRenderPipelineState> ThickLinePipelineUnlit = nil;
   id<MTLBuffer> ThickLineLineWidthBuffer = nil;  // float: line width in pixels
   vtkIdType ThickLineSegmentCount = 0;           // number of line segments for instanced draw
 
   // P3-3B: Round Cap + Round Join line pipeline — 36 verts per instance
   id<MTLRenderPipelineState> RoundCapLinePipeline = nil;
+  id<MTLRenderPipelineState> RoundCapLinePipelineUnlit = nil;
   vtkIdType RoundCapLineSegmentCount = 0;
 
   // P3-3C: Miter Join line pipeline — 4 verts per instance, miter offsets in shader
   id<MTLRenderPipelineState> MiterJoinLinePipeline = nil;
+  id<MTLRenderPipelineState> MiterJoinLinePipelineUnlit = nil;
   vtkIdType MiterJoinLineSegmentCount = 0;
   id<MTLBuffer> MiterJoinSegmentCountBuffer = nil;  // uint32: total segment count for bounds check
 
@@ -570,6 +581,11 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
 
   bool BundleBackfaceCulling = false;
   bool BundleFrontfaceCulling = false;
+  // Property lighting flag (vtkProperty::GetLighting): the tube-line family and
+  // the surface pipelines are specialized per lighting state (GL rebuilds
+  // shaders when the property lighting flag changes), so the bundle must be
+  // rebuilt when this flips.
+  bool BundleLighting = false;
 
   vtkMTimeType BundleExtraAttributesMTime = 0;
 
@@ -618,8 +634,11 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     vtkMetalMRC::ReleaseAndNil(PointShapedPipeline);
     vtkMetalMRC::ReleaseAndNil(EdgePipeline);
     vtkMetalMRC::ReleaseAndNil(ThickLinePipeline);
+    vtkMetalMRC::ReleaseAndNil(ThickLinePipelineUnlit);
     vtkMetalMRC::ReleaseAndNil(RoundCapLinePipeline);
+    vtkMetalMRC::ReleaseAndNil(RoundCapLinePipelineUnlit);
     vtkMetalMRC::ReleaseAndNil(MiterJoinLinePipeline);
+    vtkMetalMRC::ReleaseAndNil(MiterJoinLinePipelineUnlit);
     vtkMetalMRC::ReleaseAndNil(TriangleInitPeelPipeline);
     vtkMetalMRC::ReleaseAndNil(TrianglePeelPipeline);
     vtkMetalMRC::ReleaseAndNil(TriangleOITPipeline);
@@ -1085,6 +1104,12 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   int representation = act->GetProperty()->GetRepresentation();
   float lineWidth = static_cast<float>(act->GetProperty()->GetLineWidth());
 
+  // The tube-line families are specialized per lighting state (lit/unlit
+  // variants via kLightingDisabled), so the availability and selection below
+  // must consult the variant matching this actor's property lighting flag.
+  const bool propLighting = act->GetProperty()->GetLighting();
+  const bool tubeLightingDisabled = !propLighting;
+
   const bool isSurface = (representation == VTK_SURFACE);
   const bool isWireframe = (representation == VTK_WIREFRAME);
   const bool isPoints = (representation == VTK_POINTS);
@@ -1102,12 +1127,16 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   const bool thickLinesAvailable =
       lineWidth > 1.0f &&
       this->Internals->ThickLineSegmentCount > 0 &&
-      this->Internals->ThickLinePipeline != nil;
+      (tubeLightingDisabled
+        ? this->Internals->ThickLinePipelineUnlit != nil
+        : this->Internals->ThickLinePipeline != nil);
   const bool miterLinesAvailable =
       lineWidth > 1.0f &&
       act->GetProperty()->GetLineJoin() == vtkProperty::LineJoinType::MiterJoin &&
       this->Internals->MiterJoinLineSegmentCount > 0 &&
-      this->Internals->MiterJoinLinePipeline != nil;
+      (tubeLightingDisabled
+        ? this->Internals->MiterJoinLinePipelineUnlit != nil
+        : this->Internals->MiterJoinLinePipeline != nil);
 
   const bool trianglePipelineAvailable =
       this->Internals->TrianglePipeline ||
@@ -1139,7 +1168,12 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       (this->Internals->EdgePipeline ||
        (lineWidth > 1.0f &&
         this->Internals->EdgeTubeSegmentCount > 0 &&
-        (this->Internals->MiterJoinLinePipeline || this->Internals->ThickLinePipeline)));
+        ((tubeLightingDisabled
+            ? this->Internals->MiterJoinLinePipelineUnlit
+            : this->Internals->MiterJoinLinePipeline) ||
+         (tubeLightingDisabled
+            ? this->Internals->ThickLinePipelineUnlit
+            : this->Internals->ThickLinePipeline))));
 
   const bool drawPointRepresentation =
       (isPoints || this->Internals->HasVerts) &&
@@ -1209,10 +1243,11 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
         (selectorActive ? this->Internals->kSurfaceFeatureEmitIds : 0u);
       // Key must match EnsurePipelineStates: mask in the low bits, light count
       // in the next 4 bits, first light type in the next 2. The feature mask
-      // uses bits 0-8, so the light key starts at bit 9.
+      // uses bits 0-9 (kSurfaceFeatureLightingDisabled = 1 << 9), so the light
+      // key starts at bit 10.
       const uint32_t drawKey = drawMask |
-        (static_cast<uint32_t>(this->Internals->SurfaceLightCount) << 9) |
-        (static_cast<uint32_t>(this->Internals->SurfaceLightType) << 13);
+        (static_cast<uint32_t>(this->Internals->SurfaceLightCount) << 10) |
+        (static_cast<uint32_t>(this->Internals->SurfaceLightType) << 14);
       auto it = this->Internals->TriangleSurfacePipelines.find(drawKey);
       id<MTLRenderPipelineState> triPipeline =
         (it != this->Internals->TriangleSurfacePipelines.end()) ? it->second : nil;
@@ -1423,11 +1458,17 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       // TODO: Re-enable round-cap lines once topology verification confirms
       // the CPU-side line-building pass produces correct round-cap vertices.
       if (lineJoinType == vtkProperty::LineJoinType::MiterJoin &&
-               this->Internals->MiterJoinLineSegmentCount > 0 && this->Internals->MiterJoinLinePipeline)
+               this->Internals->MiterJoinLineSegmentCount > 0 &&
+               (tubeLightingDisabled
+                 ? this->Internals->MiterJoinLinePipelineUnlit
+                 : this->Internals->MiterJoinLinePipeline))
       {
         useMiterJoinLines = true;
       }
-      else if (this->Internals->ThickLineSegmentCount > 0 && this->Internals->ThickLinePipeline)
+      else if (this->Internals->ThickLineSegmentCount > 0 &&
+               (tubeLightingDisabled
+                 ? this->Internals->ThickLinePipelineUnlit
+                 : this->Internals->ThickLinePipeline))
       {
         // Fallback: thick lines for round-cap, no-join, and all other non-miter joins
         useThickLines = true;
@@ -1436,7 +1477,9 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
 
     if (useRoundCapLines)
     {
-      recordPipeline(this->Internals->RoundCapLinePipeline);
+      recordPipeline(tubeLightingDisabled
+        ? this->Internals->RoundCapLinePipelineUnlit
+        : this->Internals->RoundCapLinePipeline);
       recordVBuf(this->Internals->VertexPositionBuffer, 0, 0);
       recordVBuf(this->Internals->LineIndexBuffer, 0, 1);
       if (this->Internals->SceneUniformBuffer)
@@ -1480,7 +1523,9 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
     }
     else if (useMiterJoinLines)
     {
-      recordPipeline(this->Internals->MiterJoinLinePipeline);
+      recordPipeline(tubeLightingDisabled
+        ? this->Internals->MiterJoinLinePipelineUnlit
+        : this->Internals->MiterJoinLinePipeline);
       recordVBuf(this->Internals->VertexPositionBuffer, 0, 0);
       recordVBuf(this->Internals->LineIndexBuffer, 0, 1);
       if (this->Internals->SceneUniformBuffer)
@@ -1528,7 +1573,9 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
     }
     else if (useThickLines)
     {
-      recordPipeline(this->Internals->ThickLinePipeline);
+      recordPipeline(tubeLightingDisabled
+        ? this->Internals->ThickLinePipelineUnlit
+        : this->Internals->ThickLinePipeline);
       recordVBuf(this->Internals->VertexPositionBuffer, 0, 0);
       recordVBuf(this->Internals->LineIndexBuffer, 0, 1);
       if (this->Internals->SceneUniformBuffer)
@@ -1668,17 +1715,28 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
     // join shader connect edges into continuous tubes.
     const bool edgeTubes =
       lineWidth > 1.0f && this->Internals->EdgeTubeSegmentCount > 0 &&
-      (this->Internals->MiterJoinLinePipeline || this->Internals->ThickLinePipeline);
+      ((tubeLightingDisabled
+          ? this->Internals->MiterJoinLinePipelineUnlit
+          : this->Internals->MiterJoinLinePipeline) ||
+       (tubeLightingDisabled
+          ? this->Internals->ThickLinePipelineUnlit
+          : this->Internals->ThickLinePipeline));
 
     if (edgeTubes)
     {
-      if (this->Internals->MiterJoinLinePipeline)
+      if (tubeLightingDisabled
+            ? this->Internals->MiterJoinLinePipelineUnlit
+            : this->Internals->MiterJoinLinePipeline)
       {
-        recordPipeline(this->Internals->MiterJoinLinePipeline);
+        recordPipeline(tubeLightingDisabled
+          ? this->Internals->MiterJoinLinePipelineUnlit
+          : this->Internals->MiterJoinLinePipeline);
       }
       else
       {
-        recordPipeline(this->Internals->ThickLinePipeline);
+        recordPipeline(tubeLightingDisabled
+          ? this->Internals->ThickLinePipelineUnlit
+          : this->Internals->ThickLinePipeline);
       }
       recordVBuf(this->Internals->EdgeVertexPositionBuffer, 0, 0);
       recordVBuf(this->Internals->EdgeTubeIndexBuffer, 0, 1);
@@ -1703,7 +1761,9 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       {
         recordVBuf(this->Internals->PropIdBuffer, 0, 6);
       }
-      if (this->Internals->MiterJoinLinePipeline &&
+      if ((tubeLightingDisabled
+            ? this->Internals->MiterJoinLinePipelineUnlit
+            : this->Internals->MiterJoinLinePipeline) &&
         this->Internals->EdgeTubeSegmentCountBuffer)
       {
         recordVBuf(this->Internals->EdgeTubeSegmentCountBuffer, 0, 7);
@@ -2072,6 +2132,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   this->Internals->BundleLineJoin = lineJoin;
   this->Internals->BundleBackfaceCulling = backfaceCulling;
   this->Internals->BundleFrontfaceCulling = frontfaceCulling;
+  this->Internals->BundleLighting = act->GetProperty()->GetLighting();
   this->Internals->BundleExtraAttributesMTime = extraMTime;
   this->Internals->BundleBatchOverrideMTime = batchOverrideMTime;
 }
@@ -2328,6 +2389,13 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     {
       featureMask |= this->Internals->kSurfaceFeatureScalarLUT;
     }
+    // Property lighting disabled: bake it into the surface pipeline (the GL
+    // complexity-0 analog via function constant 16) so the unlit surface
+    // compiles with the Phong loop removed.
+    if (!act->GetProperty()->GetLighting())
+    {
+      featureMask |= this->Internals->kSurfaceFeatureLightingDisabled;
+    }
     if (this->Internals->ActorTexture)
     {
       featureMask |= this->Internals->kSurfaceFeatureTexture;
@@ -2403,13 +2471,14 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
           act->GetProperty()->GetLineWidth() > 1.0f &&
           this->Internals->EdgeTubeSegmentCount > 0)
       {
+        const bool edgeLightingDisabled = !act->GetProperty()->GetLighting();
         if (act->GetProperty()->GetLineJoin() == vtkProperty::LineJoinType::MiterJoin)
         {
-          this->EnsureMiterJoinLinePipelineState((void*)device);
+          this->EnsureMiterJoinLinePipelineState((void*)device, edgeLightingDisabled);
         }
         else
         {
-          this->EnsureThickLinePipelineState((void*)device);
+          this->EnsureThickLinePipelineState((void*)device, edgeLightingDisabled);
         }
       }
     }
@@ -2419,15 +2488,16 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       if (lw > 1.0f)
       {
         auto lj = act->GetProperty()->GetLineJoin();
+        const bool lineLightingDisabled = !act->GetProperty()->GetLighting();
         if (lj == vtkProperty::LineJoinType::MiterJoin &&
             this->Internals->MiterJoinLineSegmentCount > 0)
         {
-          this->EnsureMiterJoinLinePipelineState((void*)device);
+          this->EnsureMiterJoinLinePipelineState((void*)device, lineLightingDisabled);
         }
         else if (this->Internals->ThickLineSegmentCount > 0)
         {
           // Fallback: thick lines for round-cap and all other non-miter joins
-          this->EnsureThickLinePipelineState((void*)device);
+          this->EnsureThickLinePipelineState((void*)device, lineLightingDisabled);
         }
       }
     }
@@ -2763,6 +2833,7 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         this->Internals->BundleLineJoin == lineJoin &&
         this->Internals->BundleBackfaceCulling == backfaceCulling &&
         this->Internals->BundleFrontfaceCulling == frontfaceCulling &&
+        this->Internals->BundleLighting == act->GetProperty()->GetLighting() &&
         this->Internals->BundleExtraAttributesMTime == extraMTime &&
         this->Internals->BundleBatchOverrideMTime == batchOverrideMTime;
 
@@ -5517,13 +5588,13 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
     // The map key packs the feature mask in the low bits, the enabled light
     // count in the next 4 bits, and the first light's type in the next 2 bits,
     // so one pipeline exists per (mask, lightCount, lightType) triple. The
-    // feature mask uses bits 0-8 (kSurfaceFeatureScalarLUT = 1 << 8), so the
-    // light key starts at bit 9. The count and type are baked via function
+    // feature mask uses bits 0-9 (kSurfaceFeatureLightingDisabled = 1 << 9), so
+    // the light key starts at bit 10. The count and type are baked via function
     // constants kLightCount/kLightType, matching GL's shader-template unrolling
     // of the per-light code.
     const uint32_t lightKeyBits =
-      (static_cast<uint32_t>(this->Internals->SurfaceLightCount) << 9) |
-      (static_cast<uint32_t>(this->Internals->SurfaceLightType) << 13);
+      (static_cast<uint32_t>(this->Internals->SurfaceLightCount) << 10) |
+      (static_cast<uint32_t>(this->Internals->SurfaceLightType) << 14);
     const uint32_t masks[2] = { this->Internals->SurfaceFeatureMask,
       this->Internals->SurfaceFeatureMask | this->Internals->kSurfaceFeatureEmitIds };
     for (uint32_t mask : masks)
@@ -5566,6 +5637,8 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
       [consts setConstantValue:&lightType type:MTLDataTypeInt atIndex:14];
       cv = (mask & this->Internals->kSurfaceFeatureScalarLUT) ? YES : NO;
       [consts setConstantValue:&cv type:MTLDataTypeBool atIndex:15];
+      cv = (mask & this->Internals->kSurfaceFeatureLightingDisabled) ? YES : NO;
+      [consts setConstantValue:&cv type:MTLDataTypeBool atIndex:16];
 
       NSError* error = nil;
       id<MTLFunction> vFunc =
@@ -5671,6 +5744,11 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   // specialized surface pipeline handles InterpolateScalarsBeforeMapping actors.
   BOOL fullHasScalarLUT = NO;
   [fullConsts setConstantValue:&fullHasScalarLUT type:MTLDataTypeBool atIndex:15];
+  // The shared base pipeline serves actors of mixed lighting state, so keep the
+  // lighting decision at runtime (fragment_main reads the scene flag); the
+  // specialized surface pipelines bake it instead.
+  BOOL fullLightingDisabled = NO;
+  [fullConsts setConstantValue:&fullLightingDisabled type:MTLDataTypeBool atIndex:16];
 
   id<MTLFunction> vertexFunc =
     [library newFunctionWithName:@"vertex_main" constantValues:fullConsts error:&error];
@@ -5991,9 +6069,77 @@ void vtkMetalPolyDataMapper::EnsureEdgePipelineState(void* mtlDevice)
 }
 
 //------------------------------------------------------------------------------
-void vtkMetalPolyDataMapper::EnsureThickLinePipelineState(void* mtlDevice)
+// Build one tube-line pipeline (thick/round-cap/miter) specialized for the
+// requested lighting state: kLightingDisabled (function constant 16) bakes the
+// property lighting flag at pipeline creation — the GL complexity-0 analog — so
+// the unlit variant compiles with the Phong loop and fake-tube normal removed.
+static id<MTLRenderPipelineState> BuildTubeLinePipelineVariant(
+  id<MTLDevice> device,
+  id<MTLLibrary> library,
+  int sampleCount,
+  const char* vertexName,
+  const char* fragmentName,
+  bool lightingDisabled,
+  NSError** outError)
 {
-  if (this->Internals->ThickLinePipeline)
+  MTLFunctionConstantValues* consts = [[MTLFunctionConstantValues alloc] init];
+  BOOL cv = lightingDisabled ? YES : NO;
+  [consts setConstantValue:&cv type:MTLDataTypeBool atIndex:16];
+
+  NSError* error = nil;
+  id<MTLFunction> vFunc =
+    [library newFunctionWithName:@(vertexName) constantValues:consts error:&error];
+  id<MTLFunction> fFunc =
+    [library newFunctionWithName:@(fragmentName) constantValues:consts error:&error];
+  [consts release];
+  if (!vFunc || !fFunc)
+  {
+    if (outError)
+    {
+      *outError = error ? error : nil;
+    }
+    [vFunc release];
+    [fFunc release];
+    return nil;
+  }
+
+  MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+  desc.vertexFunction = vFunc;
+  desc.fragmentFunction = fFunc;
+  desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+  desc.colorAttachments[0].blendingEnabled = YES;
+  desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+  desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+  desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+  desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+  desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+  desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+  if (sampleCount <= 1)
+  {
+    desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
+  }
+  desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+  desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+  desc.rasterSampleCount = sampleCount;
+
+  id<MTLRenderPipelineState> pipeline =
+    [device newRenderPipelineStateWithDescriptor:desc error:&error];
+  if (outError)
+  {
+    *outError = pipeline ? nil : error;
+  }
+  [desc release];
+  [vFunc release];
+  [fFunc release];
+  return pipeline;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::EnsureThickLinePipelineState(void* mtlDevice, bool lightingDisabled)
+{
+  id<MTLRenderPipelineState>* storage =
+    lightingDisabled ? &this->Internals->ThickLinePipelineUnlit : &this->Internals->ThickLinePipeline;
+  if (*storage)
   {
     return;
   }
@@ -6017,47 +6163,22 @@ void vtkMetalPolyDataMapper::EnsureThickLinePipelineState(void* mtlDevice)
     return;
   }
 
-  id<MTLFunction> vFunc = [library newFunctionWithName:@"vertex_thick_line_main"];
-  id<MTLFunction> fFunc = [library newFunctionWithName:@"fragment_thick_line_main"];
-  if (vFunc && fFunc)
+  NSError* error = nil;
+  *storage = BuildTubeLinePipelineVariant(device, library, sampleCount,
+    "vertex_thick_line_main", "fragment_thick_line_main", lightingDisabled, &error);
+  if (!*storage)
   {
-    MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
-    desc.vertexFunction = vFunc;
-    desc.fragmentFunction = fFunc;
-    desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    desc.colorAttachments[0].blendingEnabled = YES;
-    desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-    desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
-    desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-    desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
-    if (sampleCount <= 1)
-    {
-      desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
-    }
-    desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
-    // Thick lines are rendered as triangle strips (quads)
-    desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-    desc.rasterSampleCount = sampleCount;
-
-    NSError* error = nil;
-    this->Internals->ThickLinePipeline =
-      [device newRenderPipelineStateWithDescriptor:desc error:&error];
-    if (!this->Internals->ThickLinePipeline)
-    {
-      vtkErrorMacro(<< "Thick line pipeline: " << [[error localizedDescription] UTF8String]);
-    }
-    [desc release];
+    vtkErrorMacro(<< "Thick line " << (lightingDisabled ? "unlit" : "lit")
+      << " pipeline: " << [[error localizedDescription] UTF8String]);
   }
-  [vFunc release];
-  [fFunc release];
 }
 
 //------------------------------------------------------------------------------
-void vtkMetalPolyDataMapper::EnsureRoundCapLinePipelineState(void* mtlDevice)
+void vtkMetalPolyDataMapper::EnsureRoundCapLinePipelineState(void* mtlDevice, bool lightingDisabled)
 {
-  if (this->Internals->RoundCapLinePipeline)
+  id<MTLRenderPipelineState>* storage =
+    lightingDisabled ? &this->Internals->RoundCapLinePipelineUnlit : &this->Internals->RoundCapLinePipeline;
+  if (*storage)
   {
     return;
   }
@@ -6081,47 +6202,22 @@ void vtkMetalPolyDataMapper::EnsureRoundCapLinePipelineState(void* mtlDevice)
     return;
   }
 
-  id<MTLFunction> vFunc = [library newFunctionWithName:@"vertex_round_cap_line_main"];
-  id<MTLFunction> fFunc = [library newFunctionWithName:@"fragment_round_cap_line_main"];
-  if (vFunc && fFunc)
+  NSError* error = nil;
+  *storage = BuildTubeLinePipelineVariant(device, library, sampleCount,
+    "vertex_round_cap_line_main", "fragment_round_cap_line_main", lightingDisabled, &error);
+  if (!*storage)
   {
-    MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
-    desc.vertexFunction = vFunc;
-    desc.fragmentFunction = fFunc;
-    desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    desc.colorAttachments[0].blendingEnabled = YES;
-    desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-    desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
-    desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-    desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
-    if (sampleCount <= 1)
-    {
-      desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
-    }
-    desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
-    // Round cap lines are rendered as triangle lists
-    desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-    desc.rasterSampleCount = sampleCount;
-
-    NSError* error = nil;
-    this->Internals->RoundCapLinePipeline =
-      [device newRenderPipelineStateWithDescriptor:desc error:&error];
-    if (!this->Internals->RoundCapLinePipeline)
-    {
-      vtkErrorMacro(<< "Round cap line pipeline: " << [[error localizedDescription] UTF8String]);
-    }
-    [desc release];
+    vtkErrorMacro(<< "Round cap line " << (lightingDisabled ? "unlit" : "lit")
+      << " pipeline: " << [[error localizedDescription] UTF8String]);
   }
-  [vFunc release];
-  [fFunc release];
 }
 
 //------------------------------------------------------------------------------
-void vtkMetalPolyDataMapper::EnsureMiterJoinLinePipelineState(void* mtlDevice)
+void vtkMetalPolyDataMapper::EnsureMiterJoinLinePipelineState(void* mtlDevice, bool lightingDisabled)
 {
-  if (this->Internals->MiterJoinLinePipeline)
+  id<MTLRenderPipelineState>* storage =
+    lightingDisabled ? &this->Internals->MiterJoinLinePipelineUnlit : &this->Internals->MiterJoinLinePipeline;
+  if (*storage)
   {
     return;
   }
@@ -6145,41 +6241,14 @@ void vtkMetalPolyDataMapper::EnsureMiterJoinLinePipelineState(void* mtlDevice)
     return;
   }
 
-  id<MTLFunction> vFunc = [library newFunctionWithName:@"vertex_miter_join_line_main"];
-  id<MTLFunction> fFunc = [library newFunctionWithName:@"fragment_miter_join_line_main"];
-  if (vFunc && fFunc)
+  NSError* error = nil;
+  *storage = BuildTubeLinePipelineVariant(device, library, sampleCount,
+    "vertex_miter_join_line_main", "fragment_miter_join_line_main", lightingDisabled, &error);
+  if (!*storage)
   {
-    MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
-    desc.vertexFunction = vFunc;
-    desc.fragmentFunction = fFunc;
-    desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    desc.colorAttachments[0].blendingEnabled = YES;
-    desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-    desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
-    desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-    desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
-    if (sampleCount <= 1)
-    {
-      desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
-    }
-    desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
-    // Miter join lines are rendered as triangle strips (quads)
-    desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-    desc.rasterSampleCount = sampleCount;
-
-    NSError* error = nil;
-    this->Internals->MiterJoinLinePipeline =
-      [device newRenderPipelineStateWithDescriptor:desc error:&error];
-    if (!this->Internals->MiterJoinLinePipeline)
-    {
-      vtkErrorMacro(<< "Miter join line pipeline: " << [[error localizedDescription] UTF8String]);
-    }
-    [desc release];
+    vtkErrorMacro(<< "Miter join line " << (lightingDisabled ? "unlit" : "lit")
+      << " pipeline: " << [[error localizedDescription] UTF8String]);
   }
-  [vFunc release];
-  [fFunc release];
 }
 
 //------------------------------------------------------------------------------
