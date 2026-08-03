@@ -123,6 +123,7 @@ protected:
     bool gpuTessUsed, const float defaultRGBA[4],
     std::vector<float>& positions, std::vector<float>& normals,
     const std::vector<float>& surfaceColors, const std::vector<float>& triangleUVs,
+    const std::vector<float>& triangleScalarCoords, bool useScalarLUT,
     const std::vector<uint32_t>& lineIndices,
     const std::vector<uint32_t>& triangleIndices,
     const std::vector<uint32_t>& triangleEdgeFlags,

@@ -37,6 +37,7 @@ constant uint kSceneFlagHasActorTexture     = 1u << 9;
 constant uint kSceneFlagHasSurfaceAlpha     = 1u << 10;
 constant uint kSceneFlagHasCellTexture      = 1u << 11;
 constant uint kSceneFlagUsePrimitiveCellIds = 1u << 12;
+constant uint kSceneFlagHasScalarLUT        = 1u << 13;
 
 // Compile-time feature specialization for the surface shader (the "GL way"):
 // one shader source, specialized per feature set at pipeline creation via
@@ -67,6 +68,14 @@ constant int kLightCount [[function_constant(13)]];
 // the single-light surface pipelines the compiler folds this into the type
 // dispatch, pruning the dead paths — matching GL's per-complexity shaders.
 constant int kLightType [[function_constant(14)]];
+// Scalar-texture coloring (InterpolateScalarsBeforeMapping): when set, the
+// fragment stage interpolates a per-vertex scalar texture coordinate
+// (out.scalarCoord) and looks the color up in a LUT texture
+// (kScalarLUTTex, texture(9)) — GL's texture(colortexture, colorTCoord) path —
+// instead of using per-vertex LUT colors. Must be supplied by every pipeline
+// whose vertex/fragment functions reach the surface entries (indices 6-14 are
+// the existing constants; 15 is this one).
+constant bool kHasScalarLUT [[function_constant(15)]];
 
 // The per-cell color port ("cell texture"): when per-cell colors are present
 // and the vertex stream is deduplicated, the cell RGBA cannot live in the
@@ -171,6 +180,7 @@ struct VertexOut {
   float3 viewNormal;
   float4 vertexColor;    // P1-1A: per-vertex color from scalar mapping
   float2 uv;             // P5-5A: texture coordinates
+  float2 scalarCoord;    // interpolated LUT texture coordinate (scalar-texture coloring)
   float3 modelPos;       // Optimized 6-plane clip validation
   uint cellId;           // P2-8: flat-interpolated cell ID (1-based, 0=background)
   uint propId;           // P2-8: flat-interpolated prop ID (1-based, 0=background)
@@ -345,16 +355,24 @@ inline ResolvedMaterial resolveMaterial(
     return r;
 }
 
-// Per-cell color port: the effective per-fragment color. When the mapper built
-// a per-primitive cell-color texture (kSceneFlagHasCellTexture) the cell RGBA
-// indexed by primitive id wins over the flat per-vertex color; otherwise the
-// per-vertex color applies (whether it is actually used is decided inside
-// resolveMaterial via kSceneFlagHasSurfaceColors). The kHasCellTexture
-// compile-time gate lets the lean opaque-surface pipelines drop the texture
-// access entirely.
+// Per-cell color port / scalar-texture coloring: the effective per-fragment
+// color. When the mapper built a per-primitive cell-color texture
+// (kSceneFlagHasCellTexture) the cell RGBA indexed by primitive id wins over
+// the flat per-vertex color; when scalar-texture coloring is active
+// (kSceneFlagHasScalarLUT) the LUT lookup replaces both —
+// GL's texture(colortexture, colorTCoord) path, driven by the mapper's
+// ColorCoordinates + ColorTextureMap. The kHasCellTexture/kHasScalarLUT
+// compile-time gates let the lean opaque-surface pipelines drop the texture
+// accesses entirely.
 inline float4 resolveCellColor(VertexOut in, uint primId,
                                constant SceneUniforms& scene,
-                               texture2d<float, access::read> cellColorTex) {
+                               texture2d<float, access::read> cellColorTex,
+                               texture2d<float> lutTexture,
+                               sampler lutSampler) {
+  if (kHasScalarLUT && (scene.flags & kSceneFlagHasScalarLUT) != 0u)
+  {
+    return lutTexture.sample(lutSampler, in.scalarCoord);
+  }
   if (kHasCellTexture && (scene.flags & kSceneFlagHasCellTexture) != 0u)
   {
     return cellColorTex.read(
@@ -451,7 +469,8 @@ vertex VertexOut vertex_main(uint vertex_id [[vertex_id]],
                              constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
                              constant uint* cellIds [[buffer(6)]],
                              constant PickIds& pickIds [[buffer(7)]],
-                             constant float2* triangleUVs [[buffer(8)]]) {
+                             constant float2* triangleUVs [[buffer(8)]],
+                             constant float2* scalarCoords [[buffer(12)]]) {
   VertexOut out;
 
   float4 worldPos = scene.modelMatrix * float4(in.position, 1.0);
@@ -461,9 +480,16 @@ vertex VertexOut vertex_main(uint vertex_id [[vertex_id]],
   out.viewNormal = scene.normalMatrix * in.normal;
   // Feature-conditional per-vertex loads (compile-time via function constants):
   // the lean surface variant skips the color/UV/ID streams the fragment shader
-  // does not consume, so the loads are not pure per-vertex bandwidth.
+  // does not consume, so the loads are not pure per-vertex bandwidth. The
+  // scalar-coord load is also gated on the runtime scene flag: the shared
+  // full-behavior peel/OIT pipelines compile kHasScalarLUT on for every
+  // translucent actor, but only actors actually using a scalar LUT set the flag.
   out.vertexColor = kHasSurfaceColors ? vertexColors[vertex_id] : float4(0.0);
   out.uv = kHasActorTexture ? triangleUVs[vertex_id] : float2(0.0);
+  out.scalarCoord =
+    (kHasScalarLUT && (scene.flags & kSceneFlagHasScalarLUT) != 0u)
+    ? scalarCoords[vertex_id]
+    : float2(0.0);
   out.modelPos = in.position; // Direct pass for unbounded planes evaluation
   if (kEmitIds)
   {
@@ -499,7 +525,8 @@ vertex VertexOut vertex_main_indexed(uint vertex_id [[vertex_id]],
                                      constant float2*        uvs       [[buffer(8)]],
                                      constant uint*          triIdx    [[buffer(9)]],
                                      constant uint*          eflags    [[buffer(10)]],
-                                     constant packed_float3* triPos    [[buffer(11)]]) {
+                                     constant packed_float3* triPos    [[buffer(11)]],
+                                     constant float2*        scalarCoords [[buffer(12)]]) {
   VertexOut out;
 
   uint idx = triIdx[vertex_id];
@@ -513,6 +540,10 @@ vertex VertexOut vertex_main_indexed(uint vertex_id [[vertex_id]],
   out.viewNormal = scene.normalMatrix * inNrm;
   out.vertexColor = kHasSurfaceColors ? colors[idx] : float4(0.0);
   out.uv = kHasActorTexture ? uvs[idx] : float2(0.0);
+  out.scalarCoord =
+    (kHasScalarLUT && (scene.flags & kSceneFlagHasScalarLUT) != 0u)
+    ? scalarCoords[idx]
+    : float2(0.0);
   out.modelPos = inPos;
   if (kEmitIds)
   {
@@ -577,6 +608,8 @@ inline FragmentColorAndIds evaluateSurfaceFragment(VertexOut in,
                              constant uint* cellPrimitiveIds,
                              texture2d<float> actorTexture,
                              sampler actorSampler,
+                             texture2d<float> lutTexture,
+                             sampler lutSampler,
                              uint prim_id,
                              bool frontFacing) {
   if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
@@ -607,16 +640,26 @@ inline FragmentColorAndIds evaluateSurfaceFragment(VertexOut in,
   // entirely, matching what GL's shader-template substitution produces for a
   // plain opaque surface. The per-cell color port replaces the flat vertex
   // color with the per-primitive cell RGBA when the mapper built a cell-color
-  // buffer.
-  float4 effColor = resolveCellColor(in, prim_id, scene, cellColorTex);
+  // buffer; scalar-texture coloring (kSceneFlagHasScalarLUT) replaces it with
+  // the LUT lookup. GL computes
+  //   opacity = opacityUniform * texColor.a
+  // for the texture-mapped path, with the per-actor/per-block opacity baked
+  // into in.vertexColor.a by the mapper (the vertex stream is otherwise unused
+  // in this mode), so the baked alpha is multiplied in after resolveMaterial.
+  const bool scalarLUTActive = kHasScalarLUT && (scene.flags & kSceneFlagHasScalarLUT) != 0u;
+  float4 effColor = resolveCellColor(in, prim_id, scene, cellColorTex, lutTexture, lutSampler);
   ResolvedMaterial r;
-  if (kHasSurfaceColors || kHasActorTexture || kHasSurfaceAlpha || kHasCellTexture)
+  if (kHasSurfaceColors || kHasActorTexture || kHasSurfaceAlpha || kHasCellTexture || kHasScalarLUT)
   {
     // Compile-time flags: the specialized surface pipelines bake the color and
     // texture decisions in (GL compiles the scalar-color path in directly).
     r = resolveMaterial(m, effColor, in.uv, actorTexture, actorSampler,
-      kHasSurfaceColors || kHasCellTexture, kHasActorTexture,
+      kHasSurfaceColors || kHasCellTexture || scalarLUTActive, kHasActorTexture,
       frontFacing, material.showTexturesOnBackface);
+    if (scalarLUTActive)
+    {
+      r.opacity = in.vertexColor.a * r.opacity;
+    }
   }
   else
   {
@@ -669,11 +712,13 @@ fragment FragmentOutputNoDepth fragment_main_nodepth(VertexOut in [[stage_in]],
                               constant uint* cellPrimitiveIds [[buffer(7)]],
                               texture2d<float> actorTexture [[texture(0)]],
                               sampler actorSampler [[sampler(0)]],
+                              texture2d<float> lutTexture [[texture(9)]],
+                              sampler lutSampler [[sampler(1)]],
                               uint prim_id [[primitive_id]],
                               bool frontFacing [[front_facing]]) {
   FragmentColorAndIds v = evaluateSurfaceFragment(in, material, lights, scene, edge,
     clipPlanes, cellColorTex, cellPrimitiveIds, actorTexture, actorSampler,
-    prim_id, frontFacing);
+    lutTexture, lutSampler, prim_id, frontFacing);
   FragmentOutputNoDepth out;
   out.color = v.color;
   if (v.emitIds)
@@ -697,11 +742,13 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
                               constant uint* cellPrimitiveIds [[buffer(7)]],
                               texture2d<float> actorTexture [[texture(0)]],
                               sampler actorSampler [[sampler(0)]],
+                              texture2d<float> lutTexture [[texture(9)]],
+                              sampler lutSampler [[sampler(1)]],
                               uint prim_id [[primitive_id]],
                               bool frontFacing [[front_facing]]) {
   FragmentColorAndIds v = evaluateSurfaceFragment(in, material, lights, scene, edge,
     clipPlanes, cellColorTex, cellPrimitiveIds, actorTexture, actorSampler,
-    prim_id, frontFacing);
+    lutTexture, lutSampler, prim_id, frontFacing);
   FragmentOutput out;
   out.color = v.color;
   if (v.emitIds)
@@ -736,6 +783,8 @@ fragment OITAccumulateOutput fragment_main_oit(VertexOut in [[stage_in]],
     texture2d<float, access::read> cellColorTex [[texture(8)]],
     texture2d<float> actorTexture [[texture(0)]],
     sampler actorSampler [[sampler(0)]],
+    texture2d<float> lutTexture [[texture(9)]],
+    sampler lutSampler [[sampler(1)]],
     uint prim_id [[primitive_id]],
     bool frontFacing [[front_facing]]) {
   if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
@@ -754,10 +803,15 @@ fragment OITAccumulateOutput fragment_main_oit(VertexOut in [[stage_in]],
     m.specularPower = material.backfaceSpecularPower;
   }
 
-  ResolvedMaterial r = resolveMaterial(m, resolveCellColor(in, prim_id, scene, cellColorTex), in.uv, actorTexture, actorSampler,
-    (scene.flags & kSceneFlagHasSurfaceColors) != 0u,
+  const bool scalarLUTActive = kHasScalarLUT && (scene.flags & kSceneFlagHasScalarLUT) != 0u;
+  ResolvedMaterial r = resolveMaterial(m, resolveCellColor(in, prim_id, scene, cellColorTex, lutTexture, lutSampler), in.uv, actorTexture, actorSampler,
+    (scene.flags & (kSceneFlagHasSurfaceColors | kSceneFlagHasScalarLUT)) != 0u,
     (scene.flags & kSceneFlagHasActorTexture) != 0u,
     frontFacing, material.showTexturesOnBackface);
+  if (scalarLUTActive)
+  {
+    r.opacity = in.vertexColor.a * r.opacity;
+  }
   applySurfaceEdges(N, r, in, lights, edge, scene);
 
   float3 totalAmbient = m.ambientColor.w * r.ambient;
@@ -1580,6 +1634,8 @@ fragment PeelPassOutput fragment_peel(
     texture2d<float, access::read> cellColorTex [[texture(8)]],
     texture2d<float> actorTexture [[texture(0)]],
     sampler actorSampler [[sampler(0)]],
+    texture2d<float> lutTexture [[texture(9)]],
+    sampler lutSampler [[sampler(1)]],
     texture2d<float, access::read> prevFrontTex [[texture(1)]],
     texture2d<float, access::read> prevDepthTex [[texture(2)]],
     uint prim_id [[primitive_id]]) {
@@ -1621,10 +1677,15 @@ fragment PeelPassOutput fragment_peel(
     m.opacity = material.backfaceOpacity;
     m.specularPower = material.backfaceSpecularPower;
   }
-  ResolvedMaterial r = resolveMaterial(m, resolveCellColor(in, prim_id, scene, cellColorTex), in.uv, actorTexture, actorSampler,
-    (scene.flags & kSceneFlagHasSurfaceColors) != 0u,
+  const bool scalarLUTActive = kHasScalarLUT && (scene.flags & kSceneFlagHasScalarLUT) != 0u;
+  ResolvedMaterial r = resolveMaterial(m, resolveCellColor(in, prim_id, scene, cellColorTex, lutTexture, lutSampler), in.uv, actorTexture, actorSampler,
+    (scene.flags & (kSceneFlagHasSurfaceColors | kSceneFlagHasScalarLUT)) != 0u,
     (scene.flags & kSceneFlagHasActorTexture) != 0u,
     frontFacing, material.showTexturesOnBackface);
+  if (scalarLUTActive)
+  {
+    r.opacity = in.vertexColor.a * r.opacity;
+  }
   applySurfaceEdges(N, r, in, lights, edge, scene);
   float3 totalAmbient = m.ambientColor.w * r.ambient;
   float3 totalDiffuse = float3(0.0);
@@ -1643,59 +1704,6 @@ fragment PeelPassOutput fragment_peel(
   }
 
   return out;
-}
-
-fragment float4 fragment_peel_alpha_blend(
-    VertexOut in [[stage_in]],
-    bool frontFacing [[front_facing]],
-    constant MaterialUniforms& material [[buffer(0)]],
-    constant LightUniforms& lights [[buffer(1)]],
-    constant SceneUniforms& scene [[buffer(2)]],
-    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
-    constant EdgeUniforms& edge [[buffer(4)]],
-    constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
-    texture2d<float, access::read> cellColorTex [[texture(8)]],
-    texture2d<float> actorTexture [[texture(0)]],
-    sampler actorSampler [[sampler(0)]],
-    texture2d<float, access::read> prevDepthTex [[texture(2)]],
-    uint prim_id [[primitive_id]]) {
-  
-  if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
-
-  uint2 texSize = uint2(prevDepthTex.get_width(), prevDepthTex.get_height());
-  uint2 pixel = min(uint2(in.position.xy), texSize - 1);
-  float2 prevDepth = prevDepthTex.read(pixel).rg;
-  float fragDepth = in.position.z;
-  float epsilon = 0.0000001;
-
-  if (fragDepth < -prevDepth.x - epsilon || fragDepth > prevDepth.y + epsilon) discard_fragment();
-
-  // Backfaces flip the geometric normal and swap in the backface material.
-  float3 N = normalize(in.viewNormal);
-  MaterialUniforms m = material;
-  if (!frontFacing)
-  {
-    N = -N;
-    m.ambientColor = material.backfaceAmbientColor;
-    m.diffuseColor = material.backfaceDiffuseColor;
-    m.specularColor = material.backfaceSpecularColor;
-    m.color = material.backfaceColor;
-    m.opacity = material.backfaceOpacity;
-    m.specularPower = material.backfaceSpecularPower;
-  }
-  ResolvedMaterial r = resolveMaterial(m, resolveCellColor(in, prim_id, scene, cellColorTex), in.uv, actorTexture, actorSampler,
-    (scene.flags & kSceneFlagHasSurfaceColors) != 0u,
-    (scene.flags & kSceneFlagHasActorTexture) != 0u,
-    frontFacing, material.showTexturesOnBackface);
-  applySurfaceEdges(N, r, in, lights, edge, scene);
-  float3 totalAmbient = m.ambientColor.w * r.ambient;
-  float3 totalDiffuse = float3(0.0);
-  float3 totalSpecular = float3(0.0);
-
-  computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
-
-  float3 fragRGB = totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular;
-  return float4(fragRGB * r.opacity, r.opacity);
 }
 
 fragment float4 fragment_peel_composite(

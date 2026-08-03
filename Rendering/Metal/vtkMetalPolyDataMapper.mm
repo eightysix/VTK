@@ -90,177 +90,6 @@ inline EdgeKey MakeEdgeKey(vtkIdType a, vtkIdType b)
     return EdgeKey{ a, b };
 }
 
-// P1-1B: InterpolateScalarsBeforeMapping — Metal has no scalar-as-texture
-// pipeline (with the flag set, the base-class MapScalars routes through
-// MapScalarsToTexture and returns nullptr, leaving the mesh uncolored). To
-// reproduce GL's per-fragment scalar interpolation, each polygon is
-// fan-triangulated exactly like the triangle-emission path and every fan
-// triangle is split into a barycentric (segments+1)^2 grid. Every point-data
-// array (scalars, normals, tcoords, ...) is interpolated at the grid points, so
-// the per-vertex LUT colors computed downstream approximate the scalar
-// interpolation + lookup GL performs in the fragment stage. Within a
-// sub-triangle the color field is linear; for a smooth LUT this converges to
-// the textured result as segments grow.
-// Returns nullptr when subdivision cannot be applied (mixed cell types, no
-// polys), leaving the caller to fall back to per-vertex corner colors.
-vtkSmartPointer<vtkPolyData> SubdividePolysForScalarInterpolation(
-  vtkPolyData* input, int segments)
-{
-  if (!input || segments < 1)
-  {
-    return nullptr;
-  }
-  if (input->GetNumberOfVerts() > 0 || input->GetNumberOfLines() > 0 ||
-    input->GetNumberOfStrips() > 0 || input->GetNumberOfPolys() == 0)
-  {
-    return nullptr;
-  }
-
-  vtkCellArray* polys = input->GetPolys();
-  vtkPointData* srcPD = input->GetPointData();
-  const int numArrays = srcPD->GetNumberOfArrays();
-  const int S = segments;
-
-  // Destination arrays mirror the source ordering (and names), so
-  // GetAbstractScalars resolves the same scalar array by id or name downstream.
-  std::vector<vtkSmartPointer<vtkDataArray>> dstArrays(numArrays);
-  std::vector<std::vector<double>> cornerA(numArrays);
-  std::vector<std::vector<double>> cornerB(numArrays);
-  std::vector<std::vector<double>> cornerC(numArrays);
-  std::vector<std::vector<double>> outTuple(numArrays);
-  for (int a = 0; a < numArrays; ++a)
-  {
-    vtkDataArray* src = srcPD->GetArray(a);
-    vtkSmartPointer<vtkDataArray> dst;
-    dst.TakeReference(vtkDataArray::CreateDataArray(src->GetDataType()));
-    dst->SetName(src->GetName());
-    dst->SetNumberOfComponents(src->GetNumberOfComponents());
-    dstArrays[a] = dst;
-    const int nc = src->GetNumberOfComponents();
-    cornerA[a].resize(nc);
-    cornerB[a].resize(nc);
-    cornerC[a].resize(nc);
-    outTuple[a].resize(nc);
-  }
-
-  vtkNew<vtkPoints> newPoints;
-  vtkNew<vtkCellArray> newPolys;
-
-  vtkIdType npts;
-  const vtkIdType* pts;
-  polys->InitTraversal();
-  while (polys->GetNextCell(npts, pts) && npts >= 3)
-  {
-    // Fan-triangulate the polygon like the triangle-emission path.
-    for (vtkIdType i = 1; i < npts - 1; ++i)
-    {
-      const vtkIdType A = pts[0];
-      const vtkIdType B = pts[i];
-      const vtkIdType C = pts[i + 1];
-
-      for (int a = 0; a < numArrays; ++a)
-      {
-        srcPD->GetArray(a)->GetTuple(A, cornerA[a].data());
-        srcPD->GetArray(a)->GetTuple(B, cornerB[a].data());
-        srcPD->GetArray(a)->GetTuple(C, cornerC[a].data());
-      }
-      double pA[3], pB[3], pC[3];
-      input->GetPoint(A, pA);
-      input->GetPoint(B, pB);
-      input->GetPoint(C, pC);
-
-      // Barycentric lattice: grid point (ia, ib) has ic = S - ia - ib.
-      std::vector<std::vector<vtkIdType>> grid(S + 1);
-      for (int ia = 0; ia <= S; ++ia)
-      {
-        grid[ia].resize(S - ia + 1, -1);
-      }
-      auto gridId = [&grid](int ia, int ib) -> vtkIdType& { return grid[ia][ib]; };
-
-      for (int ia = 0; ia <= S; ++ia)
-      {
-        for (int ib = 0; ib <= S - ia; ++ib)
-        {
-          const int ic = S - ia - ib;
-          const double wA = static_cast<double>(ia) / S;
-          const double wB = static_cast<double>(ib) / S;
-          const double wC = static_cast<double>(ic) / S;
-
-          double np[3];
-          for (int c = 0; c < 3; ++c)
-          {
-            np[c] = wA * pA[c] + wB * pB[c] + wC * pC[c];
-          }
-          gridId(ia, ib) = newPoints->InsertNextPoint(np);
-
-          for (int a = 0; a < numArrays; ++a)
-          {
-            vtkDataArray* dst = dstArrays[a];
-            const int nc = dst->GetNumberOfComponents();
-            const double* tA = cornerA[a].data();
-            const double* tB = cornerB[a].data();
-            const double* tC = cornerC[a].data();
-            double* out = outTuple[a].data();
-            for (int c = 0; c < nc; ++c)
-            {
-              out[c] = wA * tA[c] + wB * tB[c] + wC * tC[c];
-            }
-            dst->InsertNextTuple(out);
-          }
-        }
-      }
-
-      // Emit the subdivided triangles, preserving the parent fan winding.
-      for (int ia = 0; ia < S; ++ia)
-      {
-        for (int ib = 0; ib < S - ia; ++ib)
-        {
-          const vtkIdType p00 = gridId(ia, ib);
-          const vtkIdType p10 = gridId(ia + 1, ib);
-          const vtkIdType p01 = gridId(ia, ib + 1);
-          const vtkIdType t0[3] = { p00, p10, p01 };
-          newPolys->InsertNextCell(3, t0);
-          // Second triangle exists only when (ia+1, ib+1) is inside the lattice.
-          if (ib + 1 <= S - (ia + 1))
-          {
-            const vtkIdType p11 = gridId(ia + 1, ib + 1);
-            const vtkIdType t1[3] = { p10, p11, p01 };
-            newPolys->InsertNextCell(3, t1);
-          }
-        }
-      }
-    }
-  }
-
-  vtkNew<vtkPolyData> result;
-  result->SetPoints(newPoints);
-  result->SetPolys(newPolys);
-  for (int a = 0; a < numArrays; ++a)
-  {
-    result->GetPointData()->AddArray(dstArrays[a]);
-  }
-  // Preserve the active attribute roles so scalar/normal/tcoord lookups resolve
-  // on the subdivided data.
-  vtkPointData* dstPD = result->GetPointData();
-  if (srcPD->GetScalars())
-  {
-    dstPD->SetActiveScalars(srcPD->GetScalars()->GetName());
-  }
-  if (srcPD->GetNormals())
-  {
-    dstPD->SetActiveNormals(srcPD->GetNormals()->GetName());
-  }
-  if (srcPD->GetTCoords())
-  {
-    dstPD->SetActiveTCoords(srcPD->GetTCoords()->GetName());
-  }
-  if (srcPD->GetTangents())
-  {
-    dstPD->SetActiveTangents(srcPD->GetTangents()->GetName());
-  }
-  return result;
-}
-
 bool CommitAndWaitForCompletion(id<MTLCommandBuffer> cmdBuf)
 {
     [cmdBuf commit];
@@ -278,6 +107,10 @@ constexpr uint32_t VTK_METAL_SCENE_FLAG_HAS_ACTOR_TEXTURE   = 1u << 9;
 constexpr uint32_t VTK_METAL_SCENE_FLAG_HAS_SURFACE_ALPHA   = 1u << 10;
 constexpr uint32_t VTK_METAL_SCENE_FLAG_HAS_CELL_TEXTURE    = 1u << 11;
 constexpr uint32_t VTK_METAL_SCENE_FLAG_USE_PRIMITIVE_CELL_IDS = 1u << 12;
+// Scalar-texture coloring (InterpolateScalarsBeforeMapping): the surface
+// fragment resolves its color from a LUT texture via the
+// interpolated scalar texture coordinate instead of per-vertex colors.
+constexpr uint32_t VTK_METAL_SCENE_FLAG_HAS_SCALAR_LUT      = 1u << 13;
 
 constexpr uint32_t VTK_METAL_DYNAMIC_ACTOR_FLAG_MASK =
     VTK_METAL_SCENE_FLAG_VERTEX_VISIBILITY |
@@ -287,7 +120,8 @@ constexpr uint32_t VTK_METAL_DYNAMIC_ACTOR_FLAG_MASK =
     VTK_METAL_SCENE_FLAG_HAS_ACTOR_TEXTURE |
     VTK_METAL_SCENE_FLAG_HAS_SURFACE_ALPHA |
     VTK_METAL_SCENE_FLAG_HAS_CELL_TEXTURE |
-    VTK_METAL_SCENE_FLAG_USE_PRIMITIVE_CELL_IDS;
+    VTK_METAL_SCENE_FLAG_USE_PRIMITIVE_CELL_IDS |
+    VTK_METAL_SCENE_FLAG_HAS_SCALAR_LUT;
 
 id<MTLBuffer> CreateZeroBuffer(id<MTLDevice> device, size_t bytes)
 {
@@ -358,6 +192,18 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   // P5-5A: texture coordinates for triangles (float2 per vertex)
   id<MTLBuffer> TriangleUVBuffer = nil;
 
+  // Scalar-texture coloring (InterpolateScalarsBeforeMapping): the LUT is
+  // uploaded as a 2-row texture (row 0 = color ramp, row 1 =
+  // NaN color) and the per-vertex scalar texture coordinates
+  // (vtkMapper::ColorCoordinates, float2) live in ScalarCoordBuffer (vertex
+  // buffer(12), parallel to positions). The fragment shader interpolates the
+  // coordinate and samples the texture — GL's texture(colortexture, ...) path.
+  id<MTLBuffer> ScalarCoordBuffer = nil;
+  id<MTLTexture> ScalarLUTTexture = nil;      // fragment texture(9)
+  id<MTLSamplerState> ScalarLUTSampler = nil; // nearest min/mag, clamp-to-edge, sampler(1)
+  bool HasScalarLUT = false;
+  id<MTLBuffer> ZeroScalarCoordBuffer = nil;
+
   id<MTLRenderPipelineState> TrianglePipeline = nil;
   id<MTLRenderPipelineState> LinePipeline = nil;
 
@@ -383,6 +229,10 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     // (fragment_main) vs the early-Z entry (fragment_main_nodepth) when a
     // coincident polygon offset is active.
     kSurfaceFeatureDepthOffset = 1u << 7,
+    // Scalar-texture coloring: drives the kHasScalarLUT function constant
+    // (index 15) so the surface pipeline samples the LUT
+    // texture for its color (GL's texture(colortexture, ...) path).
+    kSurfaceFeatureScalarLUT = 1u << 8,
   };
   uint32_t SurfaceFeatureMask = 0;
   bool SurfaceNeedsDepthWrite = false;
@@ -712,6 +562,11 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     CellPrimitiveIdCount = 0;
     SurfaceFeatureMask = 0;
     vtkMetalMRC::ReleaseAndNil(TriangleUVBuffer);
+    vtkMetalMRC::ReleaseAndNil(ScalarCoordBuffer);
+    vtkMetalMRC::ReleaseAndNil(ScalarLUTTexture);
+    vtkMetalMRC::ReleaseAndNil(ScalarLUTSampler);
+    HasScalarLUT = false;
+    vtkMetalMRC::ReleaseAndNil(ZeroScalarCoordBuffer);
 
     vtkMetalMRC::ReleaseAndNil(ActorTexture);
     vtkMetalMRC::ReleaseAndNil(ActorSampler);
@@ -1203,10 +1058,11 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       const uint32_t drawMask = this->Internals->SurfaceFeatureMask |
         (selectorActive ? this->Internals->kSurfaceFeatureEmitIds : 0u);
       // Key must match EnsurePipelineStates: mask in the low bits, light count
-      // in the next 4 bits, first light type in the next 2.
+      // in the next 4 bits, first light type in the next 2. The feature mask
+      // uses bits 0-8, so the light key starts at bit 9.
       const uint32_t drawKey = drawMask |
-        (static_cast<uint32_t>(this->Internals->SurfaceLightCount) << 8) |
-        (static_cast<uint32_t>(this->Internals->SurfaceLightType) << 12);
+        (static_cast<uint32_t>(this->Internals->SurfaceLightCount) << 9) |
+        (static_cast<uint32_t>(this->Internals->SurfaceLightType) << 13);
       auto it = this->Internals->TriangleSurfacePipelines.find(drawKey);
       id<MTLRenderPipelineState> triPipeline =
         (it != this->Internals->TriangleSurfacePipelines.end()) ? it->second : nil;
@@ -1300,6 +1156,40 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       else if (this->Internals->ZeroTriangleUVBuffer)
       {
         recordVBuf(this->Internals->ZeroTriangleUVBuffer, 0, 8);
+      }
+
+      // P1-1B: Scalar-texture coloring — per-vertex scalar coordinates
+      // (buffer(12)) and the LUT (fragment texture(9) /
+      // sampler(1)). Read only by the surface/OIT/peel fragments when the
+      // kHasScalarLUT constant and the runtime kSceneFlagHasScalarLUT are both
+      // on; plain actors get a valid zero/white fallback binding.
+      if (this->Internals->ScalarCoordBuffer)
+      {
+        recordVBuf(this->Internals->ScalarCoordBuffer, 0, 12);
+      }
+      else if (this->Internals->ZeroScalarCoordBuffer)
+      {
+        recordVBuf(this->Internals->ZeroScalarCoordBuffer, 0, 12);
+      }
+      {
+        id<MTLTexture> lutTex = this->Internals->ScalarLUTTexture;
+        if (!lutTex)
+        {
+          lutTex = this->Internals->DefaultTexture;
+        }
+        id<MTLSamplerState> lutSamp = this->Internals->ScalarLUTSampler;
+        if (!lutSamp)
+        {
+          lutSamp = this->Internals->DefaultSampler;
+        }
+        if (lutTex)
+        {
+          recordFTex(lutTex, 9);
+        }
+        if (lutSamp)
+        {
+          recordFSamp(lutSamp, 1);
+        }
       }
       // 8D: Bind extra attribute buffers at buffer indices 16+
       {
@@ -2086,6 +1976,22 @@ void vtkMetalPolyDataMapper::EnsureRequiredBindingFallbacks(void* mtlDevice)
       vtkMetalMRC::AssignConsumed(this->Internals->ZeroTriangleUVBuffer, buffer);
     }
 
+    // Zero scalar-coordinate fallback (float2 per vertex, buffer(12)). The
+    // scalar-texture surface pipelines only read it when the specialized
+    // kHasScalarLUT constant is active (HasScalarLUT), but a valid binding keeps
+    // the full-behavior variants safe if they are ever selected for a
+    // scalar-texture actor.
+    if (!this->Internals->ZeroScalarCoordBuffer)
+    {
+      id<MTLBuffer> buffer =
+          CreateZeroBuffer(device, static_cast<size_t>(vertexCount) * 2 * sizeof(float));
+      if (!buffer)
+      {
+        vtkErrorMacro(<< "Failed to allocate ZeroScalarCoordBuffer (" << vertexCount << " entries)");
+      }
+      vtkMetalMRC::AssignConsumed(this->Internals->ZeroScalarCoordBuffer, buffer);
+    }
+
     // Zero per-primitive cell-id fallback, sized to the triangle count so the
     // all-true full-feature pipelines (which reference buffer(7) for the
     // exact-cell-id pick path) never read out of range for plain per-vertex
@@ -2253,14 +2159,21 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     uint32_t featureMask = 0;
     // Per-cell colors are resolved per-primitive via the cell-color buffer
     // (kSurfaceFeatureCellTexture), so no per-vertex colors are baked and the
-    // lean pipeline skips the vertexColor stream.
-    if (this->Internals->HasSurfaceColors && this->Internals->CellColorCount == 0)
+    // lean pipeline skips the vertexColor stream. Scalar-texture mode also needs
+    // the color stream enabled: the fragment shader reads in.vertexColor.a as the
+    // baked actor/block opacity for the LUT path.
+    if (this->Internals->CellColorCount == 0 &&
+        (this->Internals->HasSurfaceColors || this->Internals->HasScalarLUT))
     {
       featureMask |= this->Internals->kSurfaceFeatureColors;
     }
     if (this->Internals->CellColorCount > 0)
     {
       featureMask |= this->Internals->kSurfaceFeatureCellTexture;
+    }
+    if (this->Internals->HasScalarLUT)
+    {
+      featureMask |= this->Internals->kSurfaceFeatureScalarLUT;
     }
     if (this->Internals->ActorTexture)
     {
@@ -2460,6 +2373,11 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       if (this->Internals->HasSurfaceAlpha)
       {
         actorFlags |= VTK_METAL_SCENE_FLAG_HAS_SURFACE_ALPHA;
+      }
+
+      if (this->Internals->HasScalarLUT)
+      {
+        actorFlags |= VTK_METAL_SCENE_FLAG_HAS_SCALAR_LUT;
       }
 
       if (this->Internals->ActorTexture)
@@ -2681,33 +2599,23 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       this->Internals->SurfaceUsesIndexedEntry;
   }
 
-  // P1-1B: InterpolateScalarsBeforeMapping — subdivide the polys so per-vertex
-  // LUT colors approximate GL's scalar interpolation (Metal has no
-  // scalar-as-texture pipeline). Only for pure-poly surface inputs with
-  // point-data scalars, no batch color override, and no extra attributes.
-  bool useSubdividedPolydata = false;
-  vtkSmartPointer<vtkPolyData> subdividedPolydata;
-  if (this->InterpolateScalarsBeforeMapping && rep == VTK_SURFACE &&
-    !this->Internals->UseBatchColor && this->ExtraAttributes.empty())
-  {
-    int sCellFlag = 0;
-    vtkAbstractArray* sArray = vtkAbstractMapper::GetAbstractScalars(
-      polydata, this->ScalarMode, this->ArrayAccessMode, this->ArrayId, this->ArrayName, sCellFlag);
-    if (sCellFlag == 0 && vtkArrayDownCast<vtkDataArray>(sArray) != nullptr)
-    {
-      subdividedPolydata = SubdividePolysForScalarInterpolation(polydata, 4);
-      if (subdividedPolydata)
-      {
-        polydata = subdividedPolydata;
-        useSubdividedPolydata = true;
-      }
-    }
-  }
+  // P1-1B: InterpolateScalarsBeforeMapping — the real fix. With the flag set,
+  // the base-class MapScalars routes through MapScalarsToTexture and fills
+  // this->ColorCoordinates (per-point float2) + this->ColorTextureMap (the
+  // 2-row LUT ramp/NaN image) instead of per-vertex colors. The coords are
+  // uploaded as a float2 vertex stream and the LUT image as a 2-row
+  // texture — GL's texture(colortexture, colorTCoord) path. See the
+  // scalarCoord binding below (buffer(12) / texture(9)).
+  bool useScalarLUT = false;
 
   std::vector<float> positions;
   std::vector<float> normals;
   std::vector<float> surfaceColors;  // P1-1A/1B: float4 per vertex
   std::vector<float> triangleUVs;    // P5-5A: float2 per vertex
+  // P1-1B: scalar-texture coloring — float2 per vertex, parallel to positions.
+  // Only filled when useScalarLUT is active (InterpolateScalarsBeforeMapping
+  // with point scalars that MapScalarsToTexture could map).
+  std::vector<float> triangleScalarCoords;
   std::vector<uint32_t> lineIndices;
 
   // P2-2C: Triangle index buffers — deduplicated vertices + index buffer
@@ -2883,22 +2791,32 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
 
   // P1-1A/1B: MapScalars early so both triangle and line paths can use the result.
   // When batch color override is active, disable scalar coloring.
+  // When InterpolateScalarsBeforeMapping is on (surface representation only, so
+  // lines/wireframe/points keep per-vertex colors like GL's !DrawingVertices
+  // gate) and the scalars/LUT qualify, the base-class MapScalars routes through
+  // MapScalarsToTexture: Colors stays null and this->ColorCoordinates +
+  // this->ColorTextureMap are filled for the scalar-texture pipeline (the
+  // "real fix"). Otherwise it returns per-vertex colors like GL.
   int cellFlag = 0;
   vtkUnsignedCharArray* mappedColors = nullptr;
   if (actor && !this->Internals->UseBatchColor)
   {
-    // Metal has no scalar-as-texture pipeline: with
-    // InterpolateScalarsBeforeMapping on, the base-class MapScalars routes
-    // through MapScalarsToTexture and returns nullptr, leaving the mesh
-    // uncolored. Temporarily clear the flag so scalars map to per-vertex
-    // colors. For interpolate mappers the polys were subdivided above
-    // (SubdividePolysForScalarInterpolation), so per-vertex colors at the grid
-    // points reproduce the scalar-interpolated look. The flag is restored
-    // without Modified() to avoid a spurious geometry rebuild every frame.
+    const bool wantScalarLUT =
+      this->InterpolateScalarsBeforeMapping != 0 && rep == VTK_SURFACE;
+    // Cleared only for the MapScalars call; restored without Modified() so no
+    // spurious geometry rebuild fires every frame.
     const int prevInterpolate = this->InterpolateScalarsBeforeMapping;
-    this->InterpolateScalarsBeforeMapping = 0;
+    if (!wantScalarLUT && prevInterpolate != 0)
+    {
+      this->InterpolateScalarsBeforeMapping = 0;
+    }
     mappedColors = this->MapScalars(polydata, actor->GetProperty()->GetOpacity(), cellFlag);
     this->InterpolateScalarsBeforeMapping = prevInterpolate;
+    if (wantScalarLUT &&
+        this->ColorCoordinates != nullptr && this->ColorTextureMap != nullptr)
+    {
+      useScalarLUT = true;
+    }
   }
 
   // Per-cell color port (the "cell texture"): when scalars are per-cell, the
@@ -2948,12 +2866,36 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       // so this must remain 1.0 to avoid double multiplication.
       rgba[3] = 1.0f;
     }
+
+    if (useScalarLUT)
+    {
+      // Scalar-texture mode: the fragment shader computes
+      //   opacity = in.vertexColor.a * lutColor.a
+      // matching GL's texture-mapped path (opacityUniform * texColor.a), so the
+      // effective actor/block opacity is baked into the vertex alpha here and
+      // the material opacity is NOT applied in this mode.
+      rgba[3] = this->Internals->UseBatchOpacity
+        ? static_cast<float>(this->Internals->BatchOpacity)
+        : static_cast<float>(actorOpacity);
+    }
   };
 
   // Helper: emit one vertex color (float4) into surfaceColors, respecting batch overrides.
   // When mappedColors is provided and no batch color override, use it (with optional opacity override).
+  // When scalar-texture coloring is active, the color is resolved in the fragment
+  // shader from the LUT texture (scalarCoord), so the vertex color only carries
+  // the effective opacity in alpha and the scalar texture coordinate is pushed
+  // into triangleScalarCoords (parallel to positions) for the vertex stream.
+  const float* scalarCoordPtr = useScalarLUT
+    ? static_cast<const float*>(this->ColorCoordinates->GetVoidPointer(0))
+    : nullptr;
   auto emitSurfaceColor = [&](vtkIdType idx, const unsigned char* colors)
   {
+    if (useScalarLUT)
+    {
+      triangleScalarCoords.push_back(scalarCoordPtr[idx * 2]);
+      triangleScalarCoords.push_back(scalarCoordPtr[idx * 2 + 1]);
+    }
     if (colors && !this->Internals->UseBatchColor)
     {
       float r = colors[idx * 4] / 255.0f;
@@ -3020,7 +2962,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   vtkCellArray* polys = polydata->GetPolys();
   vtkIdType numPolyPts = polydata->GetNumberOfPoints();
   bool useGPUTess = cellFlag == 0 && normalArray && (numPolyPts > 1000) &&
-    !hasCellAssociatedExtraAttrs && !useSubdividedPolydata;
+    !hasCellAssociatedExtraAttrs && !useScalarLUT;
   bool gpuTessUsed = false;
 
   if (useGPUTess)
@@ -3673,6 +3615,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     positions.reserve(numPolyPts * 3);
     surfaceColors.reserve(numPolyPts * 4);
     triangleUVs.reserve(numPolyPts * 2);
+    if (useScalarLUT)
+    {
+      triangleScalarCoords.reserve(numPolyPts * 2);
+    }
 
     for (vtkIdType i = 0; i < numPolyPts; ++i)
     {
@@ -3698,12 +3644,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       }
       else
       {
-        float defRGBA[4];
-        getOverrideOrDefaultRGBA(defRGBA);
-        surfaceColors.push_back(defRGBA[0]);
-        surfaceColors.push_back(defRGBA[1]);
-        surfaceColors.push_back(defRGBA[2]);
-        surfaceColors.push_back(defRGBA[3]);
+        emitSurfaceColor(i, nullptr);
       }
 
       if (tcoordArray && tcoordArray->GetNumberOfTuples() > i)
@@ -4446,7 +4387,8 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
 
   this->UploadVertexDataToMTLBuffers(mtlDevice, polydata, pd,
     mappedColors, cellFlag, gpuTessUsed, defaultRGBA,
-    positions, normals, surfaceColors, triangleUVs, lineIndices,
+    positions, normals, surfaceColors, triangleUVs, triangleScalarCoords,
+    useScalarLUT, lineIndices,
     triangleIndices, triangleEdgeFlags, trianglePos,
     edgePositions, edgeNormals, edgeColors, edgeUVs,
     edgeIndices, triangleVertexCellIds, lineVertexCellIds,
@@ -4464,6 +4406,7 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
   const float defaultRGBA[4],
   std::vector<float>& positions, std::vector<float>& normals,
   const std::vector<float>& surfaceColors, const std::vector<float>& triangleUVs,
+  const std::vector<float>& triangleScalarCoords, bool useScalarLUT,
   const std::vector<uint32_t>& lineIndices,
   const std::vector<uint32_t>& triangleIndices,
   const std::vector<uint32_t>& triangleEdgeFlags,
@@ -4682,6 +4625,101 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
                  length:whiteColors.size() * sizeof(float)
                 options:MTLResourceStorageModeShared];
     vtkMetalMRC::AssignConsumed(this->Internals->SurfaceColorBuffer, whiteColorBuf);
+  }
+
+  // P1-1C: Scalar-texture coloring (InterpolateScalarsBeforeMapping). Upload the
+  // per-vertex scalar texture coordinates (float2, parallel to the triangle
+  // positions; buffer(12)) and the LUT texture created by the
+  // base class in ColorTextureMap (a 2-row RGBA8 image: row 0 is the color
+  // ramp, row 1 the NaN color). The fragment shader interpolates scalarCoord and
+  // samples lutTexture through the linear clamp sampler — GL's
+  // texture(colortexture, colorTCoordVCVSOutput.st) path — so the mapping is
+  // exact, unlike the CPU-subdivision approximation it replaces.
+  if (useScalarLUT && this->ColorTextureMap != nullptr && !triangleScalarCoords.empty())
+  {
+    id<MTLBuffer> coordBuf = [device
+      newBufferWithBytes:triangleScalarCoords.data()
+                 length:triangleScalarCoords.size() * sizeof(float)
+                options:MTLResourceStorageModeShared];
+    vtkMetalMRC::AssignConsumed(this->Internals->ScalarCoordBuffer, coordBuf);
+    this->Internals->HasScalarLUT = true;
+
+    int lutDims[3];
+    this->ColorTextureMap->GetDimensions(lutDims);
+    const int lutWidth = lutDims[0];
+    const int lutHeight = lutDims[1];
+    if (lutWidth > 0 && lutHeight > 0)
+    {
+      MTLTextureDescriptor* lutDesc = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                     width:static_cast<NSUInteger>(lutWidth)
+                                    height:static_cast<NSUInteger>(lutHeight)
+                                 mipmapped:NO];
+      lutDesc.usage = MTLTextureUsageShaderRead;
+      id<MTLTexture> lutTex = [device newTextureWithDescriptor:lutDesc];
+      if (lutTex)
+      {
+        unsigned char* lutRaw =
+          static_cast<unsigned char*>(this->ColorTextureMap->GetScalarPointer());
+        [lutTex replaceRegion:MTLRegionMake2D(0, 0, lutWidth, lutHeight)
+                  mipmapLevel:0
+                    withBytes:lutRaw
+                  bytesPerRow:static_cast<NSUInteger>(lutWidth * 4)];
+        vtkMetalMRC::AssignConsumed(this->Internals->ScalarLUTTexture, lutTex);
+      }
+      else
+      {
+        vtkErrorMacro(<< "Failed to allocate scalar LUT texture");
+        this->Internals->HasScalarLUT = false;
+      }
+    }
+    else
+    {
+      this->Internals->HasScalarLUT = false;
+    }
+
+    if (this->Internals->HasScalarLUT)
+    {
+      if (!this->Internals->ScalarLUTSampler)
+      {
+        // GL renders the 2-row LUT (row 0 = ramp, row 1 = NaN) effectively row-0-only.
+        // Linear filtering would blend the ramp with the NaN row at t = 0.49 (the
+        // non-NaN texture coordinate) and mute the colors, so use nearest filtering.
+        MTLSamplerDescriptor* lutSDesc = [[MTLSamplerDescriptor alloc] init];
+        lutSDesc.minFilter = MTLSamplerMinMagFilterNearest;
+        lutSDesc.magFilter = MTLSamplerMinMagFilterNearest;
+        lutSDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+        lutSDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+        this->Internals->ScalarLUTSampler = [device newSamplerStateWithDescriptor:lutSDesc];
+        [lutSDesc release];
+      }
+
+      // A LUT alpha below opaque makes the surface translucent; flag it so the
+      // translucent pipeline selection matches GL's opacity-aware LUT handling.
+      if (!this->Internals->HasSurfaceAlpha)
+      {
+        unsigned char* lutRaw =
+          static_cast<unsigned char*>(this->ColorTextureMap->GetScalarPointer());
+        bool lutHasAlpha = false;
+        for (int y = 0; y < lutHeight && !lutHasAlpha; ++y)
+        {
+          const unsigned char* row = lutRaw + y * lutWidth * 4;
+          for (int x = 0; x < lutWidth; ++x)
+          {
+            if (row[x * 4 + 3] < 254)
+            {
+              lutHasAlpha = true;
+              break;
+            }
+          }
+        }
+        this->Internals->HasSurfaceAlpha |= lutHasAlpha;
+      }
+    }
+  }
+  else
+  {
+    this->Internals->HasScalarLUT = false;
   }
 
   // Per-cell color port ("cell texture"): upload the per-primitive RGBA and
@@ -5122,11 +5160,13 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
     // The map key packs the feature mask in the low bits, the enabled light
     // count in the next 4 bits, and the first light's type in the next 2 bits,
     // so one pipeline exists per (mask, lightCount, lightType) triple. The
-    // count and type are baked via function constants kLightCount/kLightType,
-    // matching GL's shader-template unrolling of the per-light code.
+    // feature mask uses bits 0-8 (kSurfaceFeatureScalarLUT = 1 << 8), so the
+    // light key starts at bit 9. The count and type are baked via function
+    // constants kLightCount/kLightType, matching GL's shader-template unrolling
+    // of the per-light code.
     const uint32_t lightKeyBits =
-      (static_cast<uint32_t>(this->Internals->SurfaceLightCount) << 8) |
-      (static_cast<uint32_t>(this->Internals->SurfaceLightType) << 12);
+      (static_cast<uint32_t>(this->Internals->SurfaceLightCount) << 9) |
+      (static_cast<uint32_t>(this->Internals->SurfaceLightType) << 13);
     const uint32_t masks[2] = { this->Internals->SurfaceFeatureMask,
       this->Internals->SurfaceFeatureMask | this->Internals->kSurfaceFeatureEmitIds };
     for (uint32_t mask : masks)
@@ -5167,6 +5207,8 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
       [consts setConstantValue:&lightCount type:MTLDataTypeInt atIndex:13];
       int lightType = this->Internals->SurfaceLightType;
       [consts setConstantValue:&lightType type:MTLDataTypeInt atIndex:14];
+      cv = (mask & this->Internals->kSurfaceFeatureScalarLUT) ? YES : NO;
+      [consts setConstantValue:&cv type:MTLDataTypeBool atIndex:15];
 
       NSError* error = nil;
       id<MTLFunction> vFunc =
@@ -5268,6 +5310,10 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
   // read from the light uniform.
   int fullLightType = -1;
   [fullConsts setConstantValue:&fullLightType type:MTLDataTypeInt atIndex:14];
+  // Base triangle/line (opaque fallback) do not read the scalar stream; the
+  // specialized surface pipeline handles InterpolateScalarsBeforeMapping actors.
+  BOOL fullHasScalarLUT = NO;
+  [fullConsts setConstantValue:&fullHasScalarLUT type:MTLDataTypeBool atIndex:15];
 
   id<MTLFunction> vertexFunc =
     [library newFunctionWithName:@"vertex_main" constantValues:fullConsts error:&error];
@@ -5522,6 +5568,10 @@ void vtkMetalPolyDataMapper::EnsureEdgePipelineState(void* mtlDevice)
   {
     [fullConsts setConstantValue:&cv type:MTLDataTypeBool atIndex:idx];
   }
+  // Edges never use the scalar-texture stream; keep buffer(12) unbounded reads
+  // out of the vertex function.
+  BOOL edgeHasScalarLUT = NO;
+  [fullConsts setConstantValue:&edgeHasScalarLUT type:MTLDataTypeBool atIndex:15];
   id<MTLFunction> vFunc =
     [library newFunctionWithName:@"vertex_main" constantValues:fullConsts error:&edgeError];
   [fullConsts release];
@@ -5804,6 +5854,12 @@ void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
   {
     [fullConsts setConstantValue:&cv type:MTLDataTypeBool atIndex:idx];
   }
+  // Peel fragments resolve scalar-texture colors at runtime (scene flag); the
+  // vertex stream must interpolate scalarCoord (buffer(12)) so compile the
+  // scalar path in. Translucent InterpolateScalarsBeforeMapping actors therefore
+  // take this pipeline, and the triangle draw binds buffer(12)/texture(9).
+  BOOL peelHasScalarLUT = YES;
+  [fullConsts setConstantValue:&peelHasScalarLUT type:MTLDataTypeBool atIndex:15];
   id<MTLFunction> vertexFunc = indexedEntry
     ? [library newFunctionWithName:@"vertex_main_indexed" constantValues:fullConsts error:&peelError]
     : [library newFunctionWithName:@"vertex_main" constantValues:fullConsts error:&peelError];
@@ -5875,12 +5931,16 @@ void vtkMetalPolyDataMapper::EnsurePeelPipelineStates(void* mtlDevice)
   {
     // fragment_peel declares function constant kHasCellTexture (index 12), so
     // it must be specialized with the full feature set like the vertex entry.
+    // Index 15 (kHasScalarLUT) must also be supplied: without it Metal drops the
+    // scalar-texture branch and the peel pass falls back to the flat vertex
+    // color. YES here so the runtime scene flag can enable the LUT path.
     MTLFunctionConstantValues* peelConsts = [[MTLFunctionConstantValues alloc] init];
     BOOL pcv = YES;
     for (NSUInteger idx = 6; idx <= 12; ++idx)
     {
       [peelConsts setConstantValue:&pcv type:MTLDataTypeBool atIndex:idx];
     }
+    [peelConsts setConstantValue:&pcv type:MTLDataTypeBool atIndex:15];
     id<MTLFunction> fragFunc =
       [library newFunctionWithName:@"fragment_peel" constantValues:peelConsts error:&peelError];
     [peelConsts release];
@@ -5989,6 +6049,11 @@ void vtkMetalPolyDataMapper::EnsureOITPipelineStates(void* mtlDevice)
   {
     [fullConsts setConstantValue:&cv type:MTLDataTypeBool atIndex:idx];
   }
+  // fragment_main_oit resolves scalar-texture colors at runtime (scene flag), so
+  // the vertex stream must interpolate scalarCoord (buffer(12)) — compile the
+  // scalar path in; the triangle draw binds buffer(12)/texture(9).
+  BOOL oitHasScalarLUT = YES;
+  [fullConsts setConstantValue:&oitHasScalarLUT type:MTLDataTypeBool atIndex:15];
   id<MTLFunction> vertexFunc = indexedEntry
     ? [library newFunctionWithName:@"vertex_main_indexed" constantValues:fullConsts error:&oitError]
     : [library newFunctionWithName:@"vertex_main" constantValues:fullConsts error:&oitError];
