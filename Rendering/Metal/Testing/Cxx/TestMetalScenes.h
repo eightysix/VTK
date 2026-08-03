@@ -41,6 +41,9 @@
 #include "vtkGPUVolumeRayCastMapper.h"
 #include "vtkImageData.h"
 #include "vtkImageMapper.h"
+#include "vtkImageProperty.h"
+#include "vtkImageSlice.h"
+#include "vtkImageSliceMapper.h"
 #include "vtkLight.h"
 #include "vtkLightCollection.h"
 #include "vtkMetalActor.h"
@@ -805,6 +808,32 @@ inline void BuildImageMapperScene(vtkRenderer* renderer, BackendKind b)
   actor2->SetMapper(mapper2);
   actor2->SetPosition(300, 0);
   renderer->AddActor(actor2);
+}
+
+// TestMetalImageSliceMapper: a 3D image slice (vtkImageSlice +
+// vtkImageSliceMapper) displaying a 64x64 quadrant image, rendered through the
+// opaque geometry pass. The mapper is created through the object factory, so
+// it resolves to vtkMetalImageSliceMapper / vtkOpenGLImageSliceMapper for the
+// respective backends (the vtkRenderingMetal / vtkRenderingOpenGL2 factory
+// overrides carry the RenderingBackend override attribute).
+inline void BuildImageSliceMapperScene(vtkRenderer* renderer, BackendKind b)
+{
+  renderer->SetBackground(0.2, 0.2, 0.2);
+
+  // Give the renderer an explicit backend camera (see BuildImageMapperScene).
+  vtkSmartPointer<vtkCamera> camera = NewCamera(b);
+  renderer->SetActiveCamera(camera);
+
+  vtkNew<vtkImageSliceMapper> mapper;
+  mapper->SetInputData(CreateQuadrantImage());
+
+  vtkNew<vtkImageSlice> slice;
+  slice->SetMapper(mapper);
+  renderer->AddViewProp(slice);
+
+  renderer->ResetCamera();
+  renderer->GetActiveCamera()->Zoom(1.4);
+  renderer->ResetCameraClippingRange();
 }
 
 // Large-image fill-rate scenes: a single RGB image sized to fill the window,

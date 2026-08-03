@@ -805,49 +805,74 @@ void vtkMetalRenderWindow::GetIdsData(int x1, int y1, int x2, int y2,
   @autoreleasepool
   {
     id<MTLTexture> idsTex = (id<MTLTexture>)this->IdsTexture;
+    const int texW = static_cast<int>(idsTex.width);
+    const int texH = static_cast<int>(idsTex.height);
 
-    // Clamp to texture bounds
-    int texW = static_cast<int>(idsTex.width);
-    int texH = static_cast<int>(idsTex.height);
-    int xMin = std::max(0, std::min(x1, x2));
-    int yMin = std::max(0, std::min(y1, y2));
-    int xMax = std::min(texW - 1, std::max(x1, x2));
-    int yMax = std::min(texH - 1, std::max(y1, y2));
+    const int xMin = std::min(x1, x2);
+    const int yMin = std::min(y1, y2);
+    const int xMax = std::max(x1, x2);
+    const int yMax = std::max(y1, y2);
 
-    int width = xMax - xMin + 1;
-    int height = yMax - yMin + 1;
+    const int width = xMax - xMin + 1;
+    const int height = yMax - yMin + 1;
     if (width <= 0 || height <= 0)
     {
       return;
     }
 
-    // Read the texture region. MTLStorageModeShared allows direct CPU access.
-    // Region in texture coordinates: origin is top-left for Metal, while VTK
-    // y grows upward. Map the VTK y range [yMin, yMax] to texture rows
-    // [texH - 1 - yMax, texH - 1 - yMin] (top to bottom) so the crop samples
-    // the same vertical band the color image shows; the loop below then flips
-    // rows within the crop so row 0 is VTK yMin.
-    int texYMin = texH - 1 - yMax;
-    MTLRegion region = MTLRegionMake2D(xMin, texYMin, width, height);
-    std::vector<uint32_t> texData(width * height * 4);
-    [idsTex getBytes:texData.data()
-         bytesPerRow:width * 4 * sizeof(uint32_t)
-        fromRegion:region
-       mipmapLevel:0];
-
-    // Copy into the output array with Y-flip (Metal top-left → VTK bottom-left).
-    // Output format: 4 components per pixel: {CellId, PropId, CompositeId, ProcessId}.
+    // The output mirrors the requested area in size, with out-of-texture
+    // pixels zeroed. Keeping the buffer width equal to the area width
+    // (x2 - x1 + 1) makes the stride the selector's Convert/GetPixelInformation
+    // uses consistent with the buffer layout even when the area extends past
+    // the window edge.
     data->SetNumberOfComponents(4);
     data->SetNumberOfTuples(width * height);
     uint32_t* dst = data->GetPointer(0);
+    std::fill(dst, dst + width * height * 4, 0u);
 
+    // Clip the texture read to the actual texture bounds.
+    const int rxMin = std::max(0, xMin);
+    const int ryMin = std::max(0, yMin);
+    const int rxMax = std::min(texW - 1, xMax);
+    const int ryMax = std::min(texH - 1, yMax);
+    if (rxMax < rxMin || ryMax < ryMin)
+    {
+      return;
+    }
+
+    const int rw = rxMax - rxMin + 1;
+    const int rh = ryMax - ryMin + 1;
+
+    // Read the texture region. MTLStorageModeShared allows direct CPU access.
+    // Region in texture coordinates: origin is top-left for Metal, while VTK
+    // y grows upward. Sample the band [ryMin, ryMax] and flip rows within the
+    // crop below so row 0 of the output is VTK yMin.
+    const int texYMin = texH - 1 - ryMax;
+    MTLRegion region = MTLRegionMake2D(rxMin, texYMin, rw, rh);
+    std::vector<uint32_t> texData(rw * rh * 4);
+    [idsTex getBytes:texData.data()
+         bytesPerRow:rw * 4 * sizeof(uint32_t)
+        fromRegion:region
+       mipmapLevel:0];
+
+    // Output format: 4 components per pixel: {CellId, PropId, CompositeId, ProcessId}.
     for (int y = 0; y < height; ++y)
     {
-      int srcY = height - 1 - y; // flip Y
+      const int vtkY = yMin + y;
+      if (vtkY < ryMin || vtkY > ryMax)
+      {
+        continue; // out-of-texture rows are already zero-filled.
+      }
+      const int srcRow = ryMax - vtkY; // flipped texture row within the crop
       for (int x = 0; x < width; ++x)
       {
-        int srcIdx = (srcY * width + x) * 4;
-        int dstIdx = (y * width + x) * 4;
+        const int vtkX = xMin + x;
+        if (vtkX < rxMin || vtkX > rxMax)
+        {
+          continue;
+        }
+        const int srcIdx = (srcRow * rw + (vtkX - rxMin)) * 4;
+        const int dstIdx = (y * width + x) * 4;
         dst[dstIdx + 0] = texData[srcIdx + 0]; // cell_id
         dst[dstIdx + 1] = texData[srcIdx + 1]; // prop_id
         dst[dstIdx + 2] = texData[srcIdx + 2]; // composite_id

@@ -1546,6 +1546,51 @@ fragment float4 fragment_2d_image_main(Image2DVertexOut in [[stage_in]],
 }
 
 // ---------------------------------------------------------------------------
+// Image Slice Mapper selection shaders (cell/point-ID picking).
+// Encodes the pixel index (computed from the texture coordinates and the image
+// dimensions) into the RGBA32Uint picking attachment using the same Ids layout
+// as the 3D surface shaders: {attributeId, propId, compositeIndex, processId},
+// with attributeId and propId stored 1-based (0 = background) to match
+// vtkMetalHardwareSelector::Convert / GetPixelInformation.
+// ---------------------------------------------------------------------------
+struct SliceSelectionVertexIn {
+  float3 position  [[attribute(0)]];
+  float2 texCoord  [[attribute(1)]];
+};
+
+struct SliceSelectionUniforms {
+  float2 imgDims;      // stride dimensions (cells: width-1/height-1, points: width/height)
+  uint   propId;       // 0-based selector PropArray index
+  uint   compositeIndex;
+};
+
+vertex Image2DVertexOut vertex_slice_selection_main(SliceSelectionVertexIn in [[stage_in]],
+                                                    constant SceneUniforms& scene [[buffer(1)]]) {
+  Image2DVertexOut out;
+  float4 clip = scene.projectionMatrix * scene.viewMatrix * scene.modelMatrix *
+                float4(in.position, 1.0);
+  out.position = clip;
+  out.texCoord = in.texCoord;
+  return out;
+}
+
+struct SliceSelectionFragmentOut {
+  uint4 ids [[color(1)]];   // matches the 3D surface shaders' picking attachment
+};
+
+fragment SliceSelectionFragmentOut fragment_slice_selection_main(Image2DVertexOut in [[stage_in]],
+                                                                 constant SliceSelectionUniforms& u [[buffer(2)]]) {
+  int i = int(floor(in.texCoord.x * u.imgDims.x));
+  int j = int(floor(in.texCoord.y * u.imgDims.y));
+  i = clamp(i, 0, int(u.imgDims.x) - 1);
+  j = clamp(j, 0, int(u.imgDims.y) - 1);
+  uint pixelId = uint(j) * uint(u.imgDims.x) + uint(i);
+  SliceSelectionFragmentOut out;
+  out.ids = uint4(pixelId + 1u, u.propId + 1u, u.compositeIndex, 0u);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Depth Peeling Shaders
 // ---------------------------------------------------------------------------
 struct PeelUniforms { uint mode; uint peelPass; float2 viewportSize; };

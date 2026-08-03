@@ -15,7 +15,8 @@ set(classes
   vtkMetalTexture
   vtkMetalHardwareSelector
   vtkMetalGlyph3DMapper
-  vtkMetalGPUVolumeRayCastMapper)
+  vtkMetalGPUVolumeRayCastMapper
+  vtkMetalImageSliceMapper)
 
 set(headers)
 set(sources)
@@ -89,6 +90,9 @@ vtk_object_factory_declare(
 vtk_object_factory_declare(
   BASE vtkGPUVolumeRayCastMapper
   OVERRIDE vtkMetalGPUVolumeRayCastMapper)
+vtk_object_factory_declare(
+  BASE vtkImageSliceMapper
+  OVERRIDE vtkMetalImageSliceMapper)
 
 # Metal shader compilation - embed shader source as C++ string constant
 vtk_encode_string(

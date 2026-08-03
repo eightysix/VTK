@@ -156,6 +156,7 @@ const SceneSpec kScenes[] = {
   { "HardwareSelector", vtkMetalScenes::BuildHardwareSelectorScene, 600, 300 },
   { "PolyDataMapper2D", vtkMetalScenes::BuildPolyDataMapper2DScene, 600, 300 },
   { "ImageMapper", vtkMetalScenes::BuildImageMapperScene, 600, 300 },
+  { "ImageSliceMapper", vtkMetalScenes::BuildImageSliceMapperScene, 300, 300 },
   { "Texture", vtkMetalScenes::BuildTextureScene, 600, 300 },
   { "VolumeRayCast", vtkMetalScenes::BuildVolumeScene, 400, 400 },
   { "CellColor", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
