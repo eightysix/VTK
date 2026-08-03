@@ -326,6 +326,10 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   vtkIdType LineIndexCount = 0;
   bool HasTriangles = false;
   bool HasLines = false;
+  // VTK_VERTEX / VTK_POLY_VERTEX cells present. Like GL, vertex cells are
+  // drawn as points regardless of the property's representation, so the point
+  // primitives must render even when representation != VTK_POINTS.
+  bool HasVerts = false;
 
   // P2-2A: Wireframe representation — polygon edges extracted as line segments
   // When representation == VTK_WIREFRAME, polygon edges are added to LineIndexBuffer
@@ -729,6 +733,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     LineIndexCount = 0;
     HasTriangles = false;
     HasLines = false;
+    HasVerts = false;
     CachedInputMTime = 0;
     CachedRepresentation = -1;
     CachedEdgeVisibility = false;
@@ -1131,7 +1136,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
         (this->Internals->MiterJoinLinePipeline || this->Internals->ThickLinePipeline)));
 
   const bool drawPointRepresentation =
-      isPoints &&
+      (isPoints || this->Internals->HasVerts) &&
       this->Internals->PointVertexCount > 0 &&
       this->Internals->PointPositionBuffer;
 
@@ -2351,7 +2356,7 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     }
 
     bool needPointPipelines =
-      (representation == VTK_POINTS) ||
+      (representation == VTK_POINTS || this->Internals->HasVerts) ||
       (act->GetProperty()->GetVertexVisibility() &&
        this->Internals->PointVertexCount > 0);
 
@@ -2366,11 +2371,14 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     bool needSurfacePipelines =
       needTrianglePipeline || needLinePipeline;
 
+    // Light uniforms are needed by both the surface and point paths (point
+    // fragments are lit identically to surfaces), so create/refresh them once
+    // here rather than per-path. The enabled-light count also drives surface
+    // pipeline specialization below.
+    this->UpdateLightUniforms((void*)device, ren);
+
     if (needSurfacePipelines)
     {
-      // Compute the enabled-light count first so the surface pipelines are
-      // specialized with the current number of lights.
-      this->UpdateLightUniforms((void*)device, ren);
       this->EnsurePipelineStates((void*)device);
     }
 
@@ -5263,6 +5271,9 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
 
   // Build point buffers — all unique point positions with an identity connectivity map.
   vtkIdType numPts = polydata->GetNumberOfPoints();
+  // Vertex cells are drawn as points under any representation (matching GL).
+  this->Internals->HasVerts =
+    polydata->GetVerts() != nullptr && polydata->GetVerts()->GetNumberOfCells() > 0;
   if (numPts > 0)
   {
     std::vector<float> pointPositions(numPts * 3);

@@ -15,9 +15,9 @@ Two test surfaces exist:
    test `TestMetalImageSliceMapper` added by `3ec24ca9c5`).
 2. The generic multi-backend suite in `Rendering/Core/Testing/Cxx/`, which
    registers the same ~175 tests once per backend and was wired up for Metal
-   through    object-factory overrides (`--vtk-factory-prefer
-     RenderingBackend=Metal`). Historical status: **55 pass / 120 fail (33
-      crash)**. Current working-tree status: **123 pass / 49 fail (3 crash)** —
+     through    object-factory overrides (`--vtk-factory-prefer
+      RenderingBackend=Metal`). Historical status: **55 pass / 120 fail (33
+       crash)**. Current working-tree status: **130 pass / 42 fail (3 crash)** —
      the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
      factory override, the 8 composite-mapper `BuildGeometryBuffers` crashes by
      a `mappedColors != nullptr` guard (they now render), `TestOpacityMSAA` by
@@ -54,7 +54,10 @@ Two test surfaces exist:
       the four triangle-strip tests
       `TestTStrips{TCoords,NormalsTCoords,NormalsColorsTCoords,ColorsTCoords}` now
       pass via CPU-side strip decomposition plus the property-texture fallback
-      (see the triangle-strip section below). No
+      (see the triangle-strip section below), and the point-rendering cluster
+      (`TestPointRendering{,_Round}_3/4`, `TestVertexRendering`, `TestQuadPointRep`,
+      `TestMixedGeometry_3`) now passes via the `HasVerts` gate and the hoisted
+      `UpdateLightUniforms` call (see the point-rendering section below). No
       new crashes
       were introduced. The pass count
       fluctuates run to run (run-to-run flakiness).
@@ -276,6 +279,41 @@ triangle-strip section below). The +4 pass delta over the previous run is exactl
 those four tests; the 3 aborts are unchanged (`TestLabeledContourMapper`,
 `TestLabeledContourMapperNoLabels`, `TestLabeledContourMapperWithActorMatrix`).
 The regression check against the documented passing cluster reports none.
+Run after the point-rendering lighting fix (this run, 2026-08-03): 130 Passed /
+42 Failed / 3 aborted out of 175 (analyzed with `analyze_metal_ctest_log.py`
+from a single `ctest -R "RenderingCoreCxx-Metal" -j 8` run; failures exported
+with `export_image_compare.sh`) — the four point tests `TestPointRendering_3/_4`
+and `TestPointRenderingRound_3/_4` plus the vertex-visibility tests
+`TestVertexRendering`, `TestQuadPointRep` and `TestMixedGeometry_3` now pass
+(ImageErrors 0.069-0.38 were mid/near-miss bucket fails; see the
+point-rendering section below). The +7 pass delta over the previous run is
+exactly those seven tests; the 3 aborts are unchanged
+(`TestLabeledContourMapper`, `TestLabeledContourMapperNoLabels`,
+`TestLabeledContourMapperWithActorMatrix`). The regression check against the
+documented passing cluster reports none.
+
+### The point-rendering cluster is fixed
+
+`TestPointRendering_3/_4` and `TestPointRenderingRound_3/_4` (round-point
+rendering with point sizes 3.0/7.0) rendered entirely black, and the
+vertex-visibility tests `TestVertexRendering`, `TestQuadPointRep` and
+`TestMixedGeometry_3` were near-miss image fails, all from the same root cause:
+`vtkMetalPolyDataMapper::RenderPiece` only created the light-uniform buffer in
+the `needSurfacePipelines` branch, so a points-only/vertex-cell polydata (no
+triangles or lines) had no `LightUniformBuffer` and `fragment_point_shaped_main`
+read zero bytes from `lights [[buffer(1)]]` — the Phong fragment output black
+points even though the point geometry and draw were correct.
+
+The fix (`vtkMetalPolyDataMapper.mm`): the mapper now tracks vertex cells via a
+`HasVerts` flag (set in `BuildGeometryBuffers` from `GetVerts()`, reset in
+`ReleaseGeometryBuffers`), the point-representation gate becomes
+`(representation == VTK_POINTS || HasVerts)`, and `UpdateLightUniforms` is
+hoisted out of both pipeline branches so the light uniforms are created/refreshed
+once per frame whenever any geometry (surface, line, or point) is drawn.
+`TestPointRendering_1..4`, `TestPointRenderingRound_1..4`, `TestVertexRendering`,
+`TestQuadPointRep` and `TestMixedGeometry_1..3` all pass. The remaining
+`TestPointSelection`/`TestPointSelectionWithCellData` failures are separate
+pick-check gaps (point field-association selection is not yet implemented).
 
 ### The per-actor edge-color cluster is fixed
 
@@ -605,14 +643,14 @@ failures.
 
 ### Image-compare failures
 
-Current run (2026-08-03, triangle-strip-support run): 49 failed = 45 image-compare
+Current run (2026-08-03, point-rendering run): 42 failed = 38 image-compare
 (TIGHT_VALID >= 0.05) + 1 below-threshold pick-check + 3 non-image. Buckets by
 max `vtkTesting` TIGHT_VALID error per test (threshold 0.05):
 
 | Bucket | Range | Count | Examples |
 |--------|-------|-------|----------|
-| near-miss | 0.05 – 0.1 | 11 | `TestActorLightingFlag` 0.0513, `TestImageAndAnnotations` 0.0607, `TestPolyDataMapper2D` 0.0664, `TestEdgeFlags` 0.0681, `TestQuadPointRep` 0.0690, `TestMixedGeometry_3` 0.0701, `TestVertexRendering` 0.0724, `TestLineRenderingTranslucent` 0.0790, `TestGlyph3DMapperPicking` 0.0800, `RenderNonFinite` 0.0870, `TestMixedGeometryCellScalars` 0.0921 |
-| mid | 0.1 – 0.5 | 28 | `TestBackfaceCulling` 0.1016, `TestGlyph3DMapper` 0.1082, `TestPolyDataMapperClipPlanes` 0.1440, `TestCompositePolyDataMapperSpheres` 0.1499, `TestCompositePolyDataMapperPicking` 0.1712, `TestPointRenderingRound_3` 0.1933, `TestPointRendering_3` 0.2215, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.2241, `TestTransformCoordinateUseDouble` 0.2251, `TestCoincident` 0.2343, `TestStereoEyeSeparation` 0.2584, `TestCompositePolyDataMapperPartialFieldData` 0.2498, `TestPolyDataMapperNormals` 0.2698, `TestPolyDataMapper2DPointScalarColorMapping` 0.2861, `TestCompositePolyDataMapperVertices` 0.2891, `TestCompositePolyDataMapperCustomShader` 0.2897, `TestGlyph3DMapperBackfaceColor` 0.2914, `TestPolyDataMapper2DCellScalarColorMapping` 0.2944, `TestRenderLinesAsTubesOrthoCamera` 0.3263, `TestRenderLinesAsTubes` 0.3263, `TestResetCameraScreenSpace` 0.3438, `TestGradientBackground` 0.3449, `TestCompositePolyDataMapperCameraShiftScale` 0.3601, `TestPointRenderingRound_4` 0.3604, `TestPointRendering_4` 0.3811, `TestResizingWindowToImageFilter` 0.4130, `TestGlyph3DMapperPointSize` 0.4596, `TestColorByStringArrayDefaultLookupTable2D` 0.4821 |
+| near-miss | 0.05 – 0.1 | 7 | `TestActorLightingFlag` 0.0513, `TestImageAndAnnotations` 0.0607, `TestPolyDataMapper2D` 0.0664, `TestEdgeFlags` 0.0681, `TestLineRenderingTranslucent` 0.0790, `TestGlyph3DMapperPicking` 0.0800, `RenderNonFinite` 0.0870 |
+| mid | 0.1 – 0.5 | 25 | `TestBackfaceCulling` 0.1016, `TestGlyph3DMapper` 0.1082, `TestMixedGeometryCellScalars` 0.1373, `TestCompositePolyDataMapperSpheres` 0.1499, `TestPolyDataMapperClipPlanes` 0.1526, `TestCompositePolyDataMapperPicking` 0.1712, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.2241, `TestTransformCoordinateUseDouble` 0.2251, `TestCoincident` 0.2343, `TestCompositePolyDataMapperPartialFieldData` 0.2560, `TestStereoEyeSeparation` 0.2584, `TestPolyDataMapperNormals` 0.2698, `TestPolyDataMapper2DPointScalarColorMapping` 0.2861, `TestCompositePolyDataMapperVertices` 0.2891, `TestCompositePolyDataMapperCustomShader` 0.2897, `TestGlyph3DMapperBackfaceColor` 0.2914, `TestPolyDataMapper2DCellScalarColorMapping` 0.2943, `TestRenderLinesAsTubesOrthoCamera` 0.3263, `TestRenderLinesAsTubes` 0.3263, `TestResetCameraScreenSpace` 0.3438, `TestGradientBackground` 0.3449, `TestCompositePolyDataMapperCameraShiftScale` 0.3601, `TestResizingWindowToImageFilter` 0.4130, `TestGlyph3DMapperPointSize` 0.4596, `TestColorByStringArrayDefaultLookupTable2D` 0.4821 |
 | gross | >= 0.5 | 6 | `TestGradientBackgroundWithTiledViewport` 0.5063, `TestGradientBackgroundWithTiledViewports` 0.5856, `TestOffAxisStereo` 0.5921, `TestTilingCxx` 0.6159, `TestSplitViewportStereoHorizontal` 0.6816, `TestActor2DTextures` 0.7862 |
 
 (`TestNActors{OneMapper,NMappersOneInput}` left the mid bucket via the
@@ -627,7 +665,11 @@ left via the 2D image-mapper viewport-WCVC fix below — the first time any of t
 eight have passed (ImageErrors ~1e-07-1e-06).) This run the mid bucket dropped
 from 30 to 28 and gross from 8 to 6: the four `TestTStrips*` tests (two at 0.4035
 mid, two at 0.5062 gross) left via the triangle-strip section below — the first
-time any have passed.) The below-threshold
+time any have passed.) This run the near-miss bucket dropped from 11 to 7 and
+mid from 28 to 25: the four point tests
+(`TestPointRendering{,_Round}_3/4`), `TestVertexRendering`, `TestQuadPointRep`
+and `TestMixedGeometry_3` left via the point-rendering section below — the first
+time any of those seven have passed (ImageErrors 0.069-0.38).) The below-threshold
 failure is `TestCompositePolyDataMapperPickability` (ImageError 0.0155 but fails
 its own pickability check). The 3 non-image failures: `TestPointSelection`,
 `TestPointSelectionWithCellData` (selection returns even-only point ids,
@@ -748,14 +790,16 @@ lines. The fix (`fragment_main_line` + `kSceneFlagLinesUnlit`, bit 14):
 
 `TestWireframe` now passes with white wires (1,360 white pixels vs the GL
 baseline's 1,388 — a 28-pixel anti-aliasing delta, well under threshold). The
-other line-image tests (`TestVertexRendering` 0.072, `TestLineRenderingTranslucent`
-0.079, `TestMixedGeometry_3` 0.070, `TestMixedGeometryCellScalars` 0.092,
+other line-image tests (`TestLineRenderingTranslucent`
+0.079, `TestMixedGeometryCellScalars` 0.137,
 `TestRenderLinesAsTubes` 0.326, `TestRenderLinesAsTubesOrthoCamera` 0.326) are
-unchanged — their errors are separate fidelity gaps (point rendering,
-thick-line/tube shading). `TestSurfacePlusEdges` and `TestEdgeThickness` (edge
-overlay) have since left the failure set with the per-actor edge-color fix above.
+unchanged — their errors are separate fidelity gaps (translucent lines,
+cell-scalar lines, thick-line/tube shading). `TestVertexRendering` 0.072 and
+`TestMixedGeometry_3` 0.070 left the set via the point-rendering fix above
+(vertex dots), and `TestSurfacePlusEdges` + `TestEdgeThickness` (edge
+overlay) left via the per-actor edge-color fix above.
 
-### Theme clusters in the 49 failures
+### Theme clusters in the 42 failures
 
 - **Textures** (~13): every `TestTexture*`, `TestBackfaceTexture`,
   `TestTilingCxx`, `TestActor2DTextures` — historically
@@ -782,12 +826,16 @@ overlay) have since left the failure set with the per-actor edge-color fix above
 - **Selection/picking** (~3): `TestPointSelection*` and `TestPickTextActor`
   (`TestAreaSelections`, `TestHardwareSelector`, `TestSelectVisiblePoints`,
   `TestWorldPointPicker`, `TestReadPixels`, `TestRemoveActors` now pass — see the
-  selection/read-back cluster sections above). The 10 near-miss image tests
+  selection/read-back cluster sections above). The 7 near-miss image tests
   (`TestActorLightingFlag`,
-  `TestEdgeFlags`, `TestQuadPointRep`, `TestMixedGeometry_3`,
-  `TestImageAndAnnotations`, `TestVertexRendering`, `TestLineRenderingTranslucent`,
+  `TestEdgeFlags`,
+  `TestImageAndAnnotations`, `TestLineRenderingTranslucent`,
   `TestGlyph3DMapperPicking`, `RenderNonFinite`, `TestMixedGeometryCellScalars`)
   are the next easy-win targets.
+- **Point rendering** — DONE: the four point tests `TestPointRendering_3/_4` +
+  `TestPointRenderingRound_3/_4` plus the vertex-visibility tests
+  `TestVertexRendering`, `TestQuadPointRep` and `TestMixedGeometry_3` now pass
+  via the point-lighting fix (see the point-rendering section above).
 - **2D overlay / image mapper**: `TestPolyDataMapper2D` (0.066; point size not
   in the 2D shader), `TestPolyDataMapper2D{Point,Cell}ScalarColorMapping`
   (0.286/0.294; 2D scalar colors ignored), `TestActor2DTextures` (0.786; textured
@@ -814,14 +862,16 @@ overlay) have since left the failure set with the per-actor edge-color fix above
 
 ### Evidence the core path is correct
 
-The 119 passes include the strongest-scrutiny tests: `TestOpacity` (passes with
+The 130 passes include the strongest-scrutiny tests: `TestOpacity` (passes with
 the `TIGHT_VALID` metric — the Lab-space color path matches GL to
 `0.00038`), `TestOSConeCxx`, `TestMace`, the four scalar-LUT tests
 (`TestCompositePolyDataMapperOverrideLUT`, `TestTextureInterpolateScalars`,
 `TestTranslucentLUTTextureAlphaBlending`, `TestTranslucentLUTTextureDepthPeeling`
 at ImageError 1.2e-06–1.2e-04), `TestTranslucentLUTAlphaBlending`,
 `TestTranslucentLUTDepthPeeling`, `TestScalarModeToggle`,
-`TestPointRendering_{1,2,Round_1,Round_2}`, `TestCompositePolyDataMapper` and its
+`TestPointRendering_{1,2,3,4,Round_1,Round_2,Round_3,Round_4}` (all eight point
+tests), `TestVertexRendering`, `TestQuadPointRep`,
+`TestCompositePolyDataMapper` and its
 `BlockOpacities`/`ToggleScalarVisibilities`/`PartialPointData`/`StaticBounds`/
 `SharedArray` variants, `TestAreaSelections` and `TestHardwareSelector` (exact
 per-primitive cell ids), the read-back cluster (`TestReadPixels`,
@@ -920,6 +970,16 @@ not in the fundamental geometry/lighting/color path.
     `UpdateActorTexture` falls back to the property's named textures (the
     `TestTStrips*` suite's `mytexture` beach texture) — all four `TestTStrips*`
     tests now pass (see the triangle-strip section above).
+ 9. **Point rendering — DONE** — `vtkMetalPolyDataMapper` now creates the
+    light-uniform buffer when only points/vertex cells are drawn (previously only
+    the surface branch did, so point fragments read an empty `lights` buffer and
+    rendered black) and tracks vertex cells via a `HasVerts` flag so the
+    `VTK_POINTS`/vertex-representation gate is exact. All four point tests
+    `TestPointRendering{,_Round}_3/4` and the vertex-visibility tests
+    `TestVertexRendering`, `TestQuadPointRep`, `TestMixedGeometry_3` now pass
+    (see the point-rendering section above). Remaining point-adjacent:
+    `TestPointSelection*` (pick-check; point field-association selection not yet
+    implemented).
 
 ---
 
@@ -982,7 +1042,11 @@ now pass via the ambient-pre-applied edge shader, `TestReadPixels` and
  (123 Passed / 49 Failed / 3 aborted — the four `TestTStrips*` tests now pass via
  CPU-side strip decomposition in `vtkMetalPolyDataMapper`/`vtkMetalPolyDataMapper2D`
  matching GL's `AppendStripIndexBuffer`, plus the property-texture fallback in
- `UpdateActorTexture`).
+ `UpdateActorTexture`), and then after the point-rendering lighting fix
+ (130 Passed / 42 Failed / 3 aborted — `TestPointRendering{,_Round}_3/4`,
+ `TestVertexRendering`, `TestQuadPointRep` and `TestMixedGeometry_3` now pass via
+ the `HasVerts` gate and the hoisted `UpdateLightUniforms` call in
+ `vtkMetalPolyDataMapper::RenderPiece`).
  The image-compare buckets above are from that latest run's `LastTest.log` (max
 TIGHT_VALID error per test), analyzed with `analyze_metal_ctest_log.py`.
 Re-running is reproducible except where a crash's signal stack
