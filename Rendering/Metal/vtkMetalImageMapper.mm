@@ -610,24 +610,21 @@ void vtkMetalImageMapper::DrawPixels(
     };
     const uint32_t indices[6] = { 0, 1, 2, 0, 2, 3 };
 
-    // Compute the wcvc matrix (identical construction to
-    // vtkMetalPolyDataMapper2D): maps viewport pixels (VTK bottom-left origin)
-    // to Metal NDC. Metal's framebuffer y grows downward, so the Y row of the
-    // orthographic matrix is negated.
+    // Compute the wcvc matrix: maps viewport pixels (VTK bottom-left origin,
+    // renderer-local) to Metal NDC. The quad is positioned in the renderer's
+    // own viewport-pixel space (see the Position[] vertices above), and
+    // viewport->GetSize() already returns that space's extent in pixels, so no
+    // viewport-fraction scaling is applied here. Metal's framebuffer y grows
+    // downward, so the Y row of the orthographic matrix is negated.
     int* size = viewport->GetSize();
-    double* vp = viewport->GetViewport();
     if (size[0] <= 0 || size[1] <= 0)
     {
       return;
     }
-    float vpX = static_cast<float>(vp[0] * size[0]);
-    float vpY = static_cast<float>(vp[1] * size[1]);
-    float vpW = static_cast<float>((vp[2] - vp[0]) * size[0]);
-    float vpH = static_cast<float>((vp[3] - vp[1]) * size[1]);
-    if (vpW <= 0.0f || vpH <= 0.0f)
-    {
-      return;
-    }
+    const float vpX = 0.0f;
+    const float vpY = 0.0f;
+    const float vpW = static_cast<float>(size[0]);
+    const float vpH = static_cast<float>(size[1]);
 
     // Standard orthographic matrix mapping the viewport pixel rect (VTK
     // bottom-left origin) to NDC. Metal's NDC y matches OpenGL's (+1 top, -1
