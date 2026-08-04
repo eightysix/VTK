@@ -19,8 +19,8 @@ Two test surfaces exist:
 2. The generic multi-backend suite in `Rendering/Core/Testing/Cxx/`, which
    registers the same ~175 tests once per backend and was wired up for Metal
       through    object-factory overrides (`--vtk-factory-prefer
-        RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
-         crash)**. Current working-tree status: **153 pass / 22 fail (0 crash)** —
+         RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
+          crash)**. Current working-tree status: **156 pass / 19 fail (0 crash)** —
       the last crash class, `vtkLabeledContourMapper`, is fixed by the
       `vtkMetalLabeledContourMapper` override (see the labeled-contour-mapper
       section below); the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
@@ -175,7 +175,7 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  155 Passed  20 Failed (incl. image/pick fails)  0 "Subprocess aborted"
+175 tests:  156 Passed  19 Failed (incl. image/pick fails)  0 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
@@ -465,6 +465,61 @@ The +1 pass delta over the previous run is exactly that test; the failure set is
 otherwise unchanged (16 image-compare + 1 below-threshold pick-check + 3
 non-image fails, no new failures). The regression check against the documented
 passing cluster reports none.
+Run after the resize-capture offscreen-target gate fix (this run, 2026-08-04):
+156 Passed / 19 Failed / 0 aborted out of 175 (analyzed with
+`analyze_metal_ctest_log.py` from a single `ctest -R "RenderingCoreCxx-Metal" -j 8`
+run; failures exported with `export_image_compare.sh`) — `TestResizingWindowToImageFilter`
+now passes (TIGHT_VALID ImageErrors 4.3e-04 / 5.4e-04 / 3.5e-04 / 1.9e-04 across
+the four resolutions, was a mid-bucket 0.4130 image fail): the Metal renderer and
+render window gated their offscreen color target on `GetOffScreenRendering()`
+(`!ShowWindow`), but `vtkResizingWindowToImageFilter` sets only
+`UseOffScreenBuffers` (leaving `ShowWindow` true) and resizes through the base
+`vtkRenderWindow::SetSize`, so the first capture fell back to the stale 400x400
+`CAMetalLayer` drawable while the depth/viewport/read-back were sized for the new
+resolution — only the top-left 400x400 of the read-back was valid and nothing
+drew (see the resize-capture offscreen-target section below). The +1 pass delta
+over the previous run is exactly that test; the failure set is otherwise
+unchanged (15 image-compare + 1 below-threshold pick-check + 3 non-image fails,
+no new failures). The regression check against the documented passing cluster
+reports none.
+
+### The resize-capture offscreen-target gate is fixed (`TestResizingWindowToImageFilter` now passes)
+
+`TestResizingWindowToImageFilter` renders a sphere, captures the window at four
+resolutions (1280x720, 1440x1080, 2048x1080, 4096x2160) through
+`vtkResizingWindowToImageFilter`, then re-displays each capture. It failed under
+Metal: the first capture (which happens before the test calls
+`SetOffScreenRendering(true)`) read back only a 400x400 top-left region with no
+sphere.
+
+The root cause is a gate mismatch between the Metal backend and the capture
+filters. `vtkResizingWindowToImageFilter::RequestData` (`Rendering/Core/`) calls
+`SetUseOffScreenBuffers(true)` — leaving `ShowWindow` true — and then resizes via
+`renWin->vtkRenderWindow::SetSize(...)`, deliberately bypassing the
+`vtkMetalRenderWindow::SetSize` override so `CAMetalLayer.drawableSize` stays at
+the window's original 400x400. The Metal renderer and render window, however,
+gated their offscreen color target on `GetOffScreenRendering()` (= `!ShowWindow`),
+which is false at that point, so the capture rendered into the stale 400x400
+drawable while the depth attachment, viewport, and read-back (`ColorCopyTexture`)
+were all sized for the new resolution — a mismatched render pass (nothing drew)
+and a read-back of only the top-left 400x400, black elsewhere. OpenGL is
+unaffected because `vtkOpenGLRenderWindow` keys its FBO off `UseOffScreenBuffers`.
+
+`vtkWindow::SetOffScreenRendering` always sets both ivars together
+(`ShowWindow = !val`, `UseOffScreenBuffers = val`), so gating on
+`GetUseOffScreenBuffers()` instead is strictly more correct: it covers the normal
+offscreen case and the resize-capture case. The two sites —
+
+- the color-target selection in `vtkMetalRenderer::DeviceRender`
+  (`Rendering/Metal/vtkMetalRenderer.mm`), and
+- the offscreen-texture recreation in `vtkMetalRenderWindow::Render`
+  (`Rendering/Metal/vtkMetalRenderWindow.mm`)
+
+— now both gate on `GetUseOffScreenBuffers()`. The on-screen drawable path
+(`ShowWindow` true, `UseOffScreenBuffers` false) is unchanged, so nothing that
+worked before regresses. `TestResizingWindowToImageFilter` now passes all four
+resolutions (TIGHT_VALID ImageErrors 4.3e-04 / 5.4e-04 / 3.5e-04 / 1.9e-04), and
+the full-suite fail count dropped exactly by that one test with no new failures.
 
 ### The edge-flag support is fixed (`TestEdgeFlags` now passes)
 
@@ -1132,7 +1187,7 @@ failures.
 
 ### Image-compare failures
 
-Current run (2026-08-04, 2D line-width/point-size fix): 26 failed = 22
+Current run (2026-08-04, resize-capture offscreen-target fix): 19 failed = 15
 image-compare (TIGHT_VALID >= 0.05) + 1 below-threshold pick-check + 3 non-image
 + 0 aborts.
 Buckets by
@@ -1140,8 +1195,8 @@ max `vtkTesting` TIGHT_VALID error per test (threshold 0.05):
 
 | Bucket | Range | Count | Examples |
 |--------|-------|-------|----------|
-| near-miss | 0.05 – 0.1 | 5 | `TestRenderLinesAsTubesOrthoCamera` 0.0535, `TestRenderLinesAsTubes` 0.0535, `TestEdgeFlags` 0.0681, `TestLineRenderingTranslucent` 0.0790, `TestGlyph3DMapperPicking` 0.0800 |
-| mid | 0.1 – 0.5 | 16 | `TestMixedGeometryCellScalars` 0.1373, `TestCompositePolyDataMapperSpheres` 0.1499, `TestPolyDataMapperClipPlanes` 0.1526, `TestTransformCoordinateUseDouble` 0.1635, `TestCompositePolyDataMapperPicking` 0.1712, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.2241, `TestCoincident` 0.2343, `TestCompositePolyDataMapperPartialFieldData` 0.2493, `TestGlyph3DMapperBackfaceColor` 0.2657, `TestPolyDataMapperNormals` 0.2698, `TestCompositePolyDataMapperVertices` 0.2891, `TestCompositePolyDataMapperCustomShader` 0.2897, `TestResetCameraScreenSpace` 0.3438, `TestCompositePolyDataMapperCameraShiftScale` 0.3601, `TestResizingWindowToImageFilter` 0.4130, `TestGlyph3DMapperPointSize` 0.4599 |
+| near-miss | 0.05 – 0.1 | 4 | `TestRenderLinesAsTubesOrthoCamera` 0.0535, `TestRenderLinesAsTubes` 0.0535, `TestLineRenderingTranslucent` 0.0790, `TestGlyph3DMapperPicking` 0.0800 |
+| mid | 0.1 – 0.5 | 11 | `TestMixedGeometryCellScalars` 0.1373, `TestPolyDataMapperClipPlanes` 0.1526, `TestTransformCoordinateUseDouble` 0.1635, `TestCompositePolyDataMapperPicking` 0.1712, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.2241, `TestCompositePolyDataMapperPartialFieldData` 0.2544, `TestGlyph3DMapperBackfaceColor` 0.2657, `TestPolyDataMapperNormals` 0.2698, `TestResetCameraScreenSpace` 0.3438, `TestCompositePolyDataMapperCameraShiftScale` 0.3601, `TestGlyph3DMapperPointSize` 0.4599 |
 | gross | >= 0.5 | 0 | — |
 
 (`TestNActors{OneMapper,NMappersOneInput}` left the mid bucket via the
@@ -1201,6 +1256,10 @@ passed (all at TIGHT_VALID 0) — and `TestColorByStringArrayDefaultLookupTable2
 delta is exactly those four tests.) This run the mid bucket dropped from 17 to 16:
 `TestTilingCxx` (mid 0.2195) left via the 2D overlay tile-cropping section above —
 the first time it has passed (ImageError 0). The +1 pass delta is exactly that
+test; the bucket membership is otherwise unchanged.) This run the mid bucket dropped from 16
+to 15: `TestResizingWindowToImageFilter` (mid 0.4130) left via the
+resize-capture offscreen-target gate fix above — the first time it has passed
+(all four resolutions, TIGHT_VALID ≤ 5.4e-04). The +1 pass delta is exactly that
 test; the bucket membership is otherwise unchanged.
 
 ### Crashes (3; all pre-existing classes, none from the texture or composite clusters)
@@ -1662,10 +1721,10 @@ not in the fundamental geometry/lighting/color path.
    identical (139 cells), and `TestAreaSelections` passes under both backends;
     `TestHardwareSelector` also passes. Remaining: `TestPointSelection*`,
     `TestSelectVisiblePoints`, `TestWorldPointPicker` (pick check).
- 5. **Read-back** — the read-back cluster (`TestReadPixels`, `TestRemoveActors`,
+ 5. **Read-back — DONE** — the read-back cluster (`TestReadPixels`, `TestRemoveActors`,
     `TestWindowToImageFilter`, `TestSelectVisiblePoints`, `TestWorldPointPicker`)
-    now passes; `TestResizingWindowToImageFilter` (0.413, mid bucket) remains the
-    read-back-class gap.
+    and `TestResizingWindowToImageFilter` (resize captures) now pass; no
+    read-back-class failures remain.
  6. **Label/text/image OpenGL-fallback cluster** — the 3 remaining crashes all
     instantiate the OpenGL label/text/image classes (e.g.
    `vtkOpenGLLabeledContourMapper::ApplyStencil`) against a Metal window; this
@@ -1816,3 +1875,12 @@ see the coincident point-color/line-offset section above), the bespoke
 bespoke suite re-ran at 16/16), and the remaining failure set is unchanged
 (17 image-compare + 1 below-threshold pick-check + 3 non-image); the tally above
 and the buckets are from this run, exported with `export_image_compare.sh`.
+
+Newest working-tree run (2026-08-04, after the resize-capture offscreen-target
+gate fix): 156 Passed / 19 Failed / 0 aborted — `TestResizingWindowToImageFilter`
+now passes (all four resolutions, TIGHT_VALID ≤ 5.4e-04) via the
+`GetUseOffScreenBuffers()` gate in `vtkMetalRenderer`/`vtkMetalRenderWindow`
+(see the resize-capture offscreen-target section above); the remaining failure
+set is unchanged (15 image-compare + 1 below-threshold pick-check + 3 non-image);
+the tally above and the buckets are from this run, exported with
+`export_image_compare.sh`.

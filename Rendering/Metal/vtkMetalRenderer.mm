@@ -217,7 +217,13 @@ void vtkMetalRenderer::DeviceRender()
     const bool firstRenderer = (frameRendererIndex % totalRenderers == 0);
     const bool lastRenderer = ((frameRendererIndex + 1) % totalRenderers == 0);
 #ifdef VTK_METAL_ENABLE_OFFSCREEN_TARGET
-    if (renWin->GetOffScreenRendering())
+    // Use the offscreen target whenever offscreen buffers are requested. The
+    // render window keeps UseOffScreenBuffers/OffScreenRendering in sync, but
+    // vtkResizingWindowToImageFilter and vtkWindowToImageFilter set only
+    // UseOffScreenBuffers (ShowWindow stays true), so gating on OffScreenRendering
+    // here would fall back to the (possibly stale-sized) drawable for their
+    // resized captures.
+    if (renWin->GetUseOffScreenBuffers())
     {
       colorTarget = (__bridge id<MTLTexture>)renWin->OffscreenColorTexture;
       if (!colorTarget)

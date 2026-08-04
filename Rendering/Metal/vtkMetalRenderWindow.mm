@@ -673,7 +673,10 @@ void vtkMetalRenderWindow::Render()
 #endif
 
 #ifdef VTK_METAL_ENABLE_OFFSCREEN_TARGET
-      if (this->GetOffScreenRendering())
+      // Match vtkMetalRenderer: honor UseOffScreenBuffers (not just
+      // OffScreenRendering) so resize-capture filters that only set
+      // UseOffScreenBuffers get an offscreen target of the new size.
+      if (this->GetUseOffScreenBuffers())
       {
         id<MTLTexture> offscreenTex = (id<MTLTexture>)this->OffscreenColorTexture;
         if (!offscreenTex || offscreenTex.width != (NSUInteger)this->Size[0] ||
