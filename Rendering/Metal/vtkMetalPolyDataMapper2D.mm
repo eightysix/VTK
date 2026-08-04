@@ -3,6 +3,7 @@
 
 #include "vtkMetalPolyDataMapper2D.h"
 
+#include "vtkMetalHardwareSelector.h"
 #include "vtkMetalRenderWindow.h"
 #include "vtkMetalShaders.h"
 #include "vtkObjectFactory.h"
@@ -12,6 +13,7 @@
 #include "vtkCellArray.h"
 #include "vtkPointData.h"
 #include "vtkProperty2D.h"
+#include "vtkRenderer.h"
 #include "vtkViewport.h"
 #include "vtkCoordinate.h"
 #include "vtkMatrix4x4.h"
@@ -33,6 +35,7 @@ VTK_ABI_NAMESPACE_BEGIN
 // MetalShaders.metal.
 constexpr uint32_t kFlagUseVertexColors = 1u;
 constexpr uint32_t kFlagUseCellColors = 2u;
+constexpr uint32_t kFlagPicking = 4u;
 
 vtkStandardNewMacro(vtkMetalPolyDataMapper2D);
 
@@ -704,7 +707,7 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
       float pointSize;
       float lineWidth;
       uint32_t flags;
-      uint32_t padding;
+      uint32_t pickingId;
     };
 
     Mapper2DState state = {};
@@ -721,7 +724,22 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
     state.flags = this->Internals->HaveCellScalars
       ? kFlagUseCellColors
       : (this->Colors && this->ScalarVisibility ? kFlagUseVertexColors : 0u);
-    state.padding = 0;
+
+    // Hardware-selector support: during a picking render the fragment shaders
+    // write the prop index (id + 1, 0 = background) into the RGBA32Uint IDs
+    // attachment, mirroring vtkOpenGLPolyDataMapper2D's mapperIndex output and
+    // the 3D Metal mapper's PickIds. UINT32_MAX (the no-pick sentinel) makes
+    // the shader emit 0 so the prop is skipped in the readback.
+    if (vtkRenderer* ren = vtkRenderer::SafeDownCast(viewport))
+    {
+      if (vtkMetalHardwareSelector* hsel =
+          vtkMetalHardwareSelector::SafeDownCast(ren->GetSelector()))
+      {
+        const int id = hsel->GetPropID(actor);
+        state.pickingId = (id >= 0) ? static_cast<uint32_t>(id) : UINT32_MAX;
+        state.flags |= kFlagPicking;
+      }
+    }
 
     if (!this->Internals->StateBuffer)
     {
@@ -790,6 +808,13 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         desc.fragmentFunction = fFunc;
         desc.vertexDescriptor = vertexDesc;
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        // Match the render pass attachments: an RGBA32Uint IDs attachment is
+        // present whenever MSAA is inactive (the same rule the scene pipelines
+        // use), so the 2D picking fragments can write the prop id there.
+        if (sampleCount <= 1)
+        {
+          desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;
+        }
         desc.depthAttachmentPixelFormat = depthFormat;
         desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
         desc.rasterSampleCount = sampleCount;
@@ -816,6 +841,13 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         desc.fragmentFunction = fFunc;
         desc.vertexDescriptor = vertexDesc;
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        // Match the render pass attachments: an RGBA32Uint IDs attachment is
+        // present whenever MSAA is inactive (the same rule the scene pipelines
+        // use), so the 2D picking fragments can write the prop id there.
+        if (sampleCount <= 1)
+        {
+          desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;
+        }
         desc.depthAttachmentPixelFormat = depthFormat;
         desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassLine;
         desc.rasterSampleCount = sampleCount;
@@ -842,6 +874,13 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         desc.fragmentFunction = fFunc;
         desc.vertexDescriptor = vertexDesc;
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        // Match the render pass attachments: an RGBA32Uint IDs attachment is
+        // present whenever MSAA is inactive (the same rule the scene pipelines
+        // use), so the 2D picking fragments can write the prop id there.
+        if (sampleCount <= 1)
+        {
+          desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;
+        }
         desc.depthAttachmentPixelFormat = depthFormat;
         desc.rasterSampleCount = sampleCount;
         desc.colorAttachments[0].blendingEnabled = YES;
@@ -873,6 +912,14 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
           desc.vertexFunction = tlVFunc;
           desc.fragmentFunction = tlFFunc;
           desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+          // Match the render pass attachments: an RGBA32Uint IDs attachment is
+          // present whenever MSAA is inactive (the same rule the scene
+          // pipelines use), so the 2D picking fragments can write the prop id
+          // there.
+          if (sampleCount <= 1)
+          {
+            desc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;
+          }
           desc.depthAttachmentPixelFormat = depthFormat;
           desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
           desc.rasterSampleCount = sampleCount;
@@ -942,6 +989,13 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
       tdesc.fragmentFunction = tfFunc;
       tdesc.vertexDescriptor = texVertexDesc;
       tdesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      // Match the render pass attachments: an RGBA32Uint IDs attachment is
+      // present whenever MSAA is inactive, so the 2D text picking fragments can
+      // write the prop id there.
+      if (sampleCount <= 1)
+      {
+        tdesc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;
+      }
       tdesc.depthAttachmentPixelFormat = depthFormat;
       tdesc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
       tdesc.rasterSampleCount = sampleCount;
@@ -1060,6 +1114,9 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
               : (id<MTLBuffer>)this->Internals->ColorBuffer)
           offset:0
           atIndex:4];
+        // The thick-line fragment shader reads Mapper2DState (picking flag/id)
+        // from fragment buffer 0.
+        [encoder setFragmentBuffer:this->Internals->StateBuffer offset:0 atIndex:0];
 
         const NSUInteger segmentCount = this->Internals->LineIndexCount / 2;
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip

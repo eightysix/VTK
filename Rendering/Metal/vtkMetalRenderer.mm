@@ -1172,6 +1172,22 @@ void vtkMetalRenderer::DeviceRender()
       }
       rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
 
+      // Picking IDs attachment — the 2D pipelines declare colorAttachments[1]
+      // (RGBA32Uint, mirroring the scene pipelines), and the 2D mappers write
+      // the prop id there during a hardware selection render. Without it the
+      // overlay draws would be discarded and 2D props (vtkTextActor,
+      // vtkPolyDataMapper2D) could never be picked.
+      if (!msaa)
+      {
+        id<MTLTexture> idsTex = (__bridge id<MTLTexture>)renWin->IdsTexture;
+        if (idsTex)
+        {
+          rpd.colorAttachments[1].texture = idsTex;
+          rpd.colorAttachments[1].loadAction = MTLLoadActionLoad; // keep scene IDs
+          rpd.colorAttachments[1].storeAction = MTLStoreActionStore;
+        }
+      }
+
       // 2D pipelines declare a depth attachment matching the depth texture's
       // format, so attach it (depth reads only; the 2D mapper uses an
       // always-pass, no-write depth state).

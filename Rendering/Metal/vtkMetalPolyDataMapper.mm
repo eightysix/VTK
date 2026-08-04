@@ -1177,6 +1177,10 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   vtkMTimeType BundleTextureMTime = 0;
   bool BundleHasActorTexture = false;
   bool BundleSelectorActive = false;
+  // Point-selection pass (vtkHardwareSelector with FIELD_ASSOCIATION_POINTS):
+  // the bundle records the point-sprite draw instead of the surface geometry,
+  // so it must be rebuilt when the pass type flips.
+  bool BundleSelectingPoints = false;
 
   bool BundleVertexVisibility = false;
   float BundlePointSize = -1.0f;
@@ -1745,6 +1749,13 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   int representation = act->GetProperty()->GetRepresentation();
   float lineWidth = static_cast<float>(act->GetProperty()->GetLineWidth());
 
+  // Point-selection pass: draw every vertex as a point sprite instead of the
+  // surface geometry (see RenderPiece for the scene point size). This also
+  // gates the draw flags below so the surface/line/edge draws are skipped.
+  vtkMetalHardwareSelector* sel = vtkMetalHardwareSelector::SafeDownCast(ren->GetSelector());
+  const bool selectingPoints =
+    sel && sel->GetFieldAssociation() == vtkDataObject::FIELD_ASSOCIATION_POINTS;
+
   // The tube-line families are specialized per lighting state (lit/unlit
   // variants via kLightingDisabled), so the availability and selection below
   // must consult the variant matching this actor's property lighting flag.
@@ -1805,6 +1816,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       (oitActive && this->Internals->TriangleOITPipeline);
 
   const bool drawTriangles =
+      !selectingPoints &&
       isSurface &&
       this->Internals->HasTriangles &&
       trianglePipelineAvailable;
@@ -1814,6 +1826,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   // the OIT line pipelines that target the RGBA16F/R16F attachments — the
   // standard BGRA8 pipelines would mismatch the pass and draw nothing.
   const bool drawLines =
+      !selectingPoints &&
       !peelPassActive &&
       (isSurface || isWireframe) &&
       this->Internals->HasLines &&
@@ -1823,6 +1836,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
         : (standardLinePipelineAvailable || thickLinesAvailable || miterLinesAvailable));
 
   const bool drawEdgeOverlay =
+      !selectingPoints &&
       this->UseLegacyEdgeOverlay &&
       isSurface &&
       act->GetProperty()->GetEdgeVisibility() &&
@@ -1839,11 +1853,13 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
             : this->Internals->ThickLinePipeline))));
 
   const bool drawPointRepresentation =
+      !selectingPoints &&
       (isPoints || this->Internals->HasVerts) &&
       this->Internals->PointVertexCount > 0 &&
       this->Internals->PointPositionBuffer;
 
   const bool drawVertexVisibilityDots =
+      !selectingPoints &&
       !isPoints &&
       act->GetProperty()->GetVertexVisibility() &&
       this->Internals->PointVertexCount > 0 &&
@@ -2386,6 +2402,143 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
     }
   }
 
+  // --- Point selection: draw every vertex as a point sprite carrying the
+  // point id (GL's point-picking pass renders all primitives as GL_POINTS;
+  // see RenderPiece for the 6.0px scene point size). The shaped pipeline
+  // honors scene.pointSize; the PointCellIdBuffer (identity + 1) feeds the
+  // fragment's ID channel so the readback reports the actual point ids.
+  if (selectingPoints && this->Internals->PointVertexCount > 0 &&
+      this->Internals->PointPositionBuffer)
+  {
+    if (this->Internals->PointShapedPipeline)
+    {
+      recordPipeline(this->Internals->PointShapedPipeline);
+      recordVBuf(this->Internals->PointPositionBuffer, 0, 0);
+      recordVBuf(this->Internals->PointConnectivityBuffer, 0, 1);
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordVBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->PointNormalBuffer)
+      {
+        recordVBuf(this->Internals->PointNormalBuffer, 0, 3);
+      }
+      if (this->Internals->PointColorBuffer)
+      {
+        recordVBuf(this->Internals->PointColorBuffer, 0, 4);
+      }
+      if (this->Internals->PointTangentBuffer)
+      {
+        recordVBuf(this->Internals->PointTangentBuffer, 0, 6);
+      }
+      if (this->Internals->PointUVBuffer)
+      {
+        recordVBuf(this->Internals->PointUVBuffer, 0, 7);
+      }
+      if (this->Internals->PointColorUVBuffer)
+      {
+        recordVBuf(this->Internals->PointColorUVBuffer, 0, 8);
+      }
+
+      if (this->Internals->PointCellIdBuffer)
+      {
+        recordVBuf(this->Internals->PointCellIdBuffer, 0, 11);
+      }
+      if (this->Internals->PropIdBuffer)
+      {
+        recordVBuf(this->Internals->PropIdBuffer, 0, 12);
+      }
+      if (this->Internals->MaterialUniformBuffer)
+      {
+        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
+      }
+      if (this->Internals->LightUniformBuffer)
+      {
+        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
+      }
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+      }
+      if (this->Internals->VertexColorBuffer)
+      {
+        recordFBuf(this->Internals->VertexColorBuffer, 0, 4);
+      }
+      if (this->Internals->ClipPlaneBuffer)
+      {
+        recordFBuf(this->Internals->ClipPlaneBuffer, 0, 5);
+      }
+      recordDraw(MTLPrimitiveTypeTriangleStrip, 0, 4, this->Internals->PointVertexCount);
+    }
+    else if (this->Internals->PointPipeline)
+    {
+      recordPipeline(this->Internals->PointPipeline);
+      recordVBuf(this->Internals->PointPositionBuffer, 0, 0);
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordVBuf(this->Internals->SceneUniformBuffer, 0, 1);
+      }
+      if (this->Internals->PointNormalBuffer)
+      {
+        recordVBuf(this->Internals->PointNormalBuffer, 0, 2);
+      }
+      if (this->Internals->PointColorBuffer)
+      {
+        recordVBuf(this->Internals->PointColorBuffer, 0, 3);
+      }
+      if (this->Internals->PointTangentBuffer)
+      {
+        recordVBuf(this->Internals->PointTangentBuffer, 0, 6);
+      }
+      if (this->Internals->PointUVBuffer)
+      {
+        recordVBuf(this->Internals->PointUVBuffer, 0, 7);
+      }
+      if (this->Internals->PointColorUVBuffer)
+      {
+        recordVBuf(this->Internals->PointColorUVBuffer, 0, 8);
+      }
+
+      if (this->Internals->PointCellIdBuffer)
+      {
+        recordVBuf(this->Internals->PointCellIdBuffer, 0, 11);
+      }
+      if (this->Internals->PropIdBuffer)
+      {
+        recordVBuf(this->Internals->PropIdBuffer, 0, 12);
+      }
+      if (this->Internals->MaterialUniformBuffer)
+      {
+        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
+      }
+      if (this->Internals->LightUniformBuffer)
+      {
+        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
+      }
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+      }
+      if (this->Internals->VertexColorBuffer)
+      {
+        recordFBuf(this->Internals->VertexColorBuffer, 0, 4);
+      }
+      if (this->Internals->ClipPlaneBuffer)
+      {
+        recordFBuf(this->Internals->ClipPlaneBuffer, 0, 5);
+      }
+      recordDraw(MTLPrimitiveTypePoint, 0, this->Internals->PointVertexCount);
+    }
+  }
+
   // --- Line drawing (skipped during depth-peel passes) ---
   if (!peelPassActive && drawLines)
   {
@@ -2887,6 +3040,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   this->Internals->BundleTextureMTime = this->Internals->CachedTextureMTime;
   this->Internals->BundleHasActorTexture = hasActorTexture;
   this->Internals->BundleSelectorActive = (ren->GetSelector() != nullptr);
+  this->Internals->BundleSelectingPoints = selectingPoints;
   this->Internals->BundleVertexVisibility = vertexVisibility;
   this->Internals->BundlePointSize = pointSize;
   this->Internals->BundleRenderPointsAsSpheres = renderPointsAsSpheres;
@@ -3073,6 +3227,16 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
   @autoreleasepool
   {
     id<MTLDevice> device = (id<MTLDevice>)renWin->GetMetalDevice();
+
+    // Point-selection pass: when the hardware selector targets points, GL
+    // renders every primitive as a GL_POINTS sprite carrying the vertex id
+    // (vtkOpenGLPolyDataMapper::RenderPieceStart/PointPicking). The Metal
+    // bundle records the equivalent point-sprite draw instead of the surface
+    // geometry, so this flag keys the scene point size, the pipeline-setup
+    // gate and the bundle rebuild.
+    vtkMetalHardwareSelector* sel = vtkMetalHardwareSelector::SafeDownCast(ren->GetSelector());
+    const bool selectingPoints =
+      sel && sel->GetFieldAssociation() == vtkDataObject::FIELD_ASSOCIATION_POINTS;
 
     vtkIdType currentMTime = input->GetMTime();
     vtkMTimeType extraMTime = this->ExtraAttributesMTime.GetMTime();
@@ -3329,7 +3493,10 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     bool needPointPipelines =
       (representation == VTK_POINTS || this->Internals->HasVerts) ||
       (act->GetProperty()->GetVertexVisibility() &&
-       this->Internals->PointVertexCount > 0);
+       this->Internals->PointVertexCount > 0) ||
+      // Point selection renders every vertex as a point sprite; the point
+      // pipelines must exist even when no regular point draw happens.
+      (selectingPoints && this->Internals->PointVertexCount > 0);
 
     bool needTrianglePipeline =
       (representation == VTK_SURFACE) &&
@@ -3520,7 +3687,14 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         }
       }
 
-      float ptSize = static_cast<float>(act->GetProperty()->GetPointSize());
+      // GL's point selection (vtkOpenGLPolyDataMapper::RenderPieceStart +
+      // RenderPieceDraw) renders every primitive as a GL_POINTS sprite sized by
+      // GetPointPickingPrimitiveSize (6 for triangle primitives) so the selection
+      // coverage is dilated beyond the raw silhouette. The shaped point pipeline
+      // rasterizes its quads at scene.pointSize, so feed it 6.0 during a
+      // point-selection pass; otherwise honor the actor's property point size.
+      float ptSize =
+        selectingPoints ? 6.0f : static_cast<float>(act->GetProperty()->GetPointSize());
       *reinterpret_cast<float*>(buf + 260) = ptSize;
 
       // Merge actor render option flags into SceneUniforms flags (offset 256).
@@ -3799,6 +3973,7 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         this->Internals->BundleTextureMTime == textureMTime &&
         this->Internals->BundleHasActorTexture == hasActorTexture &&
         this->Internals->BundleSelectorActive == currentSelectorActive &&
+        this->Internals->BundleSelectingPoints == selectingPoints &&
         this->Internals->BundleVertexVisibility == vertexVisibility &&
         this->Internals->BundlePointSize == pointSize &&
         this->Internals->BundleRenderPointsAsSpheres == renderPointsAsSpheres &&

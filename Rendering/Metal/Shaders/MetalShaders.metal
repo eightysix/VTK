@@ -1904,17 +1904,29 @@ kernel void volume_compute_normals(
 // ---------------------------------------------------------------------------
 // 2D Mapper shaders
 // ---------------------------------------------------------------------------
-// Mapper2DState.flags bits. Must match the kFlagUse* constants in
-// vtkMetalPolyDataMapper2D.mm.
-constant uint kFlagUseVertexColors = 1u;
-constant uint kFlagUseCellColors = 2u;
+ // Mapper2DState.flags bits. Must match the kFlagUse* constants in
+ // vtkMetalPolyDataMapper2D.mm.
+ constant uint kFlagUseVertexColors = 1u;
+ constant uint kFlagUseCellColors = 2u;
+ constant uint kFlagPicking = 4u;
 
-struct Mapper2DState { float4x4 wcvcMatrix; float4 color; float pointSize; float lineWidth; uint flags; };
-struct Vertex2DIn {
-  float2 position [[attribute(0)]];
-  float4 color [[attribute(2)]];
-};
-struct Vertex2DOut { float4 position [[position]]; float4 color; };
+ struct Mapper2DState { float4x4 wcvcMatrix; float4 color; float pointSize; float lineWidth; uint flags; uint pickingId; };
+ struct Vertex2DIn {
+   float2 position [[attribute(0)]];
+   float4 color [[attribute(2)]];
+ };
+ struct Vertex2DOut { float4 position [[position]]; float4 color; };
+
+ // 2D fragment output. Mirrors the 3D surface fragment layout: the RGBA32Uint
+ // picking attachment (color(1)) carries {attributeId, propId, compositeIndex,
+ // processId} with the prop id stored 1-based (0 = background) so the selector
+ // readback can tell an actual prop from an unrendered pixel. The ids output is
+ // only written while the picking flag is set; otherwise the pipeline's color(1)
+ // attachment is absent (or the output is discarded by Metal).
+ struct Fragment2DOut {
+   float4 color [[color(0)]];
+   uint4 ids [[color(1)]];
+ };
 
 // [[point_size]] is only valid for point topology; Metal rejects a pipeline
 // whose vertex shader outputs it for triangle/line topology, so the 2D point
@@ -1940,14 +1952,21 @@ vertex Vertex2DPointOut vertex_2d_point_main(Vertex2DIn in [[stage_in]], constan
   return out;
 }
 
-fragment float4 fragment_2d_main(Vertex2DOut in [[stage_in]],
-                                 constant Mapper2DState& state [[buffer(0)]],
-                                 constant float4* cellColors [[buffer(1)]],
-                                 uint prim_id [[primitive_id]]) {
+fragment Fragment2DOut fragment_2d_main(Vertex2DOut in [[stage_in]],
+                                        constant Mapper2DState& state [[buffer(0)]],
+                                        constant float4* cellColors [[buffer(1)]],
+                                        uint prim_id [[primitive_id]]) {
+  Fragment2DOut out;
+  out.ids = uint4(0u);
   if ((state.flags & kFlagUseCellColors) != 0u) {
-    return cellColors[prim_id];
+    out.color = cellColors[prim_id];
+  } else {
+    out.color = in.color;
   }
-  return in.color;
+  if ((state.flags & kFlagPicking) != 0u) {
+    out.ids = uint4(0u, mapPropId(state.pickingId), 0u, 0u);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -2004,8 +2023,15 @@ vertex Vertex2DOut vertex_thick_line_2d_main(
   return out;
 }
 
-fragment float4 fragment_thick_line_2d_main(Vertex2DOut in [[stage_in]]) {
-  return in.color;
+fragment Fragment2DOut fragment_thick_line_2d_main(Vertex2DOut in [[stage_in]],
+                                                   constant Mapper2DState& state [[buffer(0)]]) {
+  Fragment2DOut out;
+  out.ids = uint4(0u);
+  out.color = in.color;
+  if ((state.flags & kFlagPicking) != 0u) {
+    out.ids = uint4(0u, mapPropId(state.pickingId), 0u, 0u);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -2043,15 +2069,26 @@ fragment float4 fragment_2d_image_main(Image2DVertexOut in [[stage_in]],
 // fully transparent alpha are discarded (as the GL shader does) so that the
 // overlay depth pass only writes depth at glyph pixels; otherwise a
 // foreground text quad's full bounding box would occlude background props.
-fragment float4 fragment_2d_text_main(Image2DVertexOut in [[stage_in]],
-                                      constant Mapper2DState& state [[buffer(0)]],
-                                      texture2d<float> imageTexture [[texture(0)]]) {
+fragment Fragment2DOut fragment_2d_text_main(Image2DVertexOut in [[stage_in]],
+                                             constant Mapper2DState& state [[buffer(0)]],
+                                             texture2d<float> imageTexture [[texture(0)]]) {
+  Fragment2DOut out;
+  out.ids = uint4(0u);
+  if ((state.flags & kFlagPicking) != 0u) {
+    // Picking renders the whole quad as the prop (matching the GL 2D shader,
+    // which substitutes gl_FragData[0] = vec4(mapperIndex,1.0) before its alpha
+    // discard, so glyph and transparent quad pixels both carry the prop id).
+    out.color = float4(1.0);
+    out.ids = uint4(0u, mapPropId(state.pickingId), 0u, 0u);
+    return out;
+  }
   float4 texColor = imageTexture.sample(sNearest, in.texCoord);
   float4 fragColor = texColor * state.color;
   if (fragColor.a <= 0.0) {
     discard_fragment();
   }
-  return fragColor;
+  out.color = fragColor;
+  return out;
 }
 
 // ---------------------------------------------------------------------------

@@ -19,16 +19,18 @@ Two test surfaces exist:
 2. The generic multi-backend suite in `Rendering/Core/Testing/Cxx/`, which
    registers the same ~175 tests once per backend and was wired up for Metal
        through    object-factory overrides (`--vtk-factory-prefer
-               RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
-                 crash)**. Current working-tree status: **172 pass / 3 fail (0 crash)** —
-        the last three composite-mapper selection/coloring failures are closed by
-        the field-data color-index and composite-id fixes below
-        (`TestCompositePolyDataMapperPartialFieldData`,
-        `TestCompositePolyDataMapperPicking` and
-        `TestCompositePolyDataMapperPickability` now pass; see the composite
-        selection/coloring section below); the remaining 3 failures are the
-        pre-existing non-image pick class (`TestPointSelection`,
-        `TestPointSelectionWithCellData`, `TestPickTextActor`),
+                RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
+                  crash)**. Current working-tree status: **175 pass / 0 fail (0 crash)** —
+         the last three non-image pick failures are closed by the point-selection
+         and 2D overlay picking fixes below
+         (`TestPointSelection`, `TestPointSelectionWithCellData` and
+         `TestPickTextActor` now pass; see the point-selection and 2D overlay
+         picking sections below), and the composite-mapper selection/coloring
+         failures by the field-data color-index and composite-id fixes below
+         (`TestCompositePolyDataMapperPartialFieldData`,
+         `TestCompositePolyDataMapperPicking` and
+         `TestCompositePolyDataMapperPickability` now pass; see the composite
+         selection/coloring section below),
         `TestGlyph3DMapperCompositeDisplayAttributeInheritance` now passes via the
        composite per-block display-attribute inheritance port in the Metal glyph
        mapper (see the composite display-attribute section below),
@@ -184,12 +186,19 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
   `TEST_OPTIONAL_DEPENDS` so the generic test executable links Metal's autoinit
   factory.
 
-### Tally (working tree, rerun 2026-08-04 on the M2 MacBook Air,
+### Tally (working tree, rerun 2026-08-05 on the M2 MacBook Air,
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  162 Passed  13 Failed (incl. image/pick fails)  0 "Subprocess aborted"
+175 tests:  175 Passed  0 Failed  0 "Subprocess aborted"
 ```
+
+The last three non-image failures are now closed: `TestPointSelection`,
+`TestPointSelectionWithCellData` (point field-association selection) and
+`TestPickTextActor` (2D overlay prop picking) all pass — see the
+point-selection and 2D overlay picking sections below. The full 175-test
+generic suite is green for the first time, and the bespoke Metal suite re-runs
+at 16/16.
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
 working-tree run: 61 Passed / 95 Failed / 19 aborted — the composite-mapper
@@ -620,6 +629,22 @@ failure set is otherwise unchanged (3 non-image fails:
 `TestPointSelection`, `TestPointSelectionWithCellData`, `TestPickTextActor`, no
 new failures; 0 image-compare failures exported). The regression check against
 the documented passing cluster reports none.
+Run after the point-selection and 2D overlay picking fixes (this run,
+2026-08-05): 175 Passed / 0 Failed / 0 aborted out of 175 (analyzed with
+`analyze_metal_ctest_log.py` from a single `ctest -R "RenderingCoreCxx-Metal" -j 8`
+run; failures exported with `export_image_compare.sh --no-run`) — the last three
+non-image failures now pass for the first time: `TestPointSelection`,
+`TestPointSelectionWithCellData` (both exit 0; the Turn-On point-id sets now
+match GL's `Points: 0 26 27 28 … 43`) and `TestPickTextActor` (exit 0; the pick
+at (145,145) returns actor1 as GL does). Point field-association selection is
+implemented in `vtkMetalPolyDataMapper` (see the point-selection section below),
+and 2D overlay picking — including the `vtkTextActor`/`vtkTextMapper` glyph-quad
+path — is implemented in `vtkMetalPolyDataMapper2D` + the renderer's overlay
+pass (see the 2D overlay picking section below). The +3 pass delta over the
+previous run is exactly those three tests; the failure set is now empty, no new
+failures, 0 image-compare failures. The regression check against the documented
+passing cluster reports none. The suite (all 175 tests) is green for the first
+time; the bespoke `RenderingMetal` suite re-runs at 16/16.
 
 ### The composite field-data / composite-id picking fixes (the last three composite-mapper failures close)
 
@@ -657,6 +682,83 @@ and `TestCompositePolyDataMapperPickability` now pass (the full 21-test
 172 pass / 3 fail / 0 aborted with the failure set otherwise unchanged (the 3
 pre-existing non-image pick failures) and no regression against the documented
 passing cluster.
+
+### The point-selection pass (`TestPointSelection` and `TestPointSelectionWithCellData` now pass)
+
+The two point-selection tests drive `vtkHardwareSelector::Select` with
+`FIELD_ASSOCIATION_POINTS` against a scattered point cloud and assert the exact
+Turn-On id list (`Points: 0 26 27 28 … 43`). The Metal mapper previously only
+supported cell-field-association selection (the surface path feeds the
+fragment's ID channels from `cellPrimitiveIds`), so with a points selector it
+drew nothing and the readback returned an empty id set.
+
+GL implements point selection in `vtkOpenGLPolyDataMapper::RenderPieceStart` +
+`RenderPieceDraw`: every primitive is rendered as a `GL_POINTS` sprite carrying
+the vertex id, sized by `GetPointPickingPrimitiveSize` (6.0 for triangle
+primitives) so the selection coverage is dilated beyond the raw silhouette.
+`vtkMetalPolyDataMapper` now mirrors that:
+
+- A `selectingPoints` bool (`vtkMetalHardwareSelector` active with
+  `GetFieldAssociation() == FIELD_ASSOCIATION_POINTS`) is hoisted at the top of
+  `RenderPiece` and again in the record/bundle path, and gates
+  `drawTriangles` / `drawLines` / `drawEdgeOverlay` /
+  `drawPointRepresentation` / `drawVertexVisibilityDots` to off so no surface or
+  regular-point geometry is drawn during the pass.
+- The dedicated point-selection draw records every source vertex through the
+  point pipeline as a sprite: the shaped pipeline (when available) as a
+  4-vertex `MTLPrimitiveTypeTriangleStrip` quad, else the basic point pipeline
+  as `MTLPrimitiveTypePoint`, binding the position buffer at index 0 and the
+  `PointCellIdBuffer` (identity + 1) at index 11 so the fragment's ID channel
+  carries the actual point id (the readback undoes the +1 via `mapPropId`).
+- `needPointPipelines` is extended with `(selectingPoints && PointVertexCount > 0)`
+  so the point pipelines exist even when no regular point draw happens, and the
+  scene point size is forced to `6.0f` during a point-selection pass (matching
+  GL's `GetPointPickingPrimitiveSize`) instead of the actor's property point size.
+- The pass type is folded into the draw-bundle key (`BundleSelectingPoints`), so
+  the recorded draw switches back to the surface geometry when the selector is
+  released or its field association changes.
+
+With this in place both point-selection tests exit 0 with the exact GL Turn-On
+id list.
+
+### The 2D overlay picking fix (`TestPickTextActor` now passes)
+
+`TestPickTextActor` calls `vtkPropPicker::Pick` → `vtkRenderer::PickProp`, which
+drives a `vtkMetalHardwareSelector` render, against a scene containing
+`vtkTextActor` overlay props. The Metal 2D mapper had no selector support at all
+(the pipelines declared a single BGRA8 color attachment and the fragment
+shaders returned only the quad color), so 2D props were never written into the
+IDs attachment and the pick returned `0x0`.
+
+GL's 2D picking is `vtkOpenGLPolyDataMapper2D::ReplaceShaderPicking`: the
+fragment shader substitutes `gl_FragData[0] = vec4(mapperIndex, 1.0)` (after the
+alpha discard for the textured/text path) so a 2D prop picks by its whole quad.
+The Metal port mirrors this end to end:
+
+- `vtkMetalPolyDataMapper2D` now detects an active `vtkMetalHardwareSelector` on
+  its `vtkRenderer` viewport and sets `state.pickingId = GetPropID(actor)` +
+  `state.flags |= kFlagPicking` (a new `Mapper2DState.flags` bit, mirroring the
+  `kFlagUse*` constants in `vtkMetalPolyDataMapper2D.mm`); `UINT32_MAX` — the
+  selector's no-pick sentinel — makes the shader emit 0 via the existing
+  `mapPropId` helper so non-pickable props are skipped in the readback.
+- Every 2D pipeline descriptor (the three BGRA8 line/triangle families and the
+  textured text descriptor) now declares `colorAttachments[1] =
+  MTLPixelFormatRGBA32Uint` when `sampleCount <= 1`, matching the scene
+  pipelines' attachment rule.
+- A new `Fragment2DOut` struct returns `color(0)` plus `ids [[color(1)]]` =
+  `uint4(0u, mapPropId(state.pickingId), 0u, 0u)` from `fragment_2d_main`,
+  `fragment_thick_line_2d_main` and `fragment_2d_text_main` (the ids output is
+  only written while `kFlagPicking` is set). The textured text path writes the
+  whole quad as the prop before its alpha discard, matching GL's behavior.
+- The thick-line draw now binds `StateBuffer` to fragment buffer 0 so
+  `fragment_thick_line_2d_main` can read the picking flag/id.
+- Critically, `vtkMetalRenderer`'s overlay pass (Phase 3c) had never attached
+  the IDs texture: `rpd.colorAttachments[1]` was missing, so even if the 2D
+  shaders wrote ids they were discarded by the driver. The overlay pass now
+  attaches `renWin->IdsTexture` at `colorAttachments[1]` (load, keep scene IDs;
+  store) whenever MSAA is inactive, exactly like the scene passes.
+
+`TestPickTextActor` now exits 0 with the pick at (145,145) returning actor1.
 
 ### The VBO coordinate shift/scale port (`TestCompositePolyDataMapperCameraShiftScale` passes)
 
@@ -1311,9 +1413,9 @@ The fix (`vtkMetalPolyDataMapper.mm`): the mapper now tracks vertex cells via a
 hoisted out of both pipeline branches so the light uniforms are created/refreshed
 once per frame whenever any geometry (surface, line, or point) is drawn.
 `TestPointRendering_1..4`, `TestPointRenderingRound_1..4`, `TestVertexRendering`,
-`TestQuadPointRep` and `TestMixedGeometry_1..3` all pass. The remaining
-`TestPointSelection`/`TestPointSelectionWithCellData` failures are separate
-pick-check gaps (point field-association selection is not yet implemented).
+`TestQuadPointRep` and `TestMixedGeometry_1..3` all pass. The
+`TestPointSelection`/`TestPointSelectionWithCellData` pick-check gaps were
+separate from the lighting bug and are closed by the point-selection pass below.
 
 ### The per-actor edge-color cluster is fixed
 
@@ -1509,8 +1611,9 @@ and the image regression passes under both backends. `TestHardwareSelector`
 (was "0 nodes returned") also passes this run, presumably on the same exact-ID
 mechanism. `TestSelectVisiblePoints` and `TestWorldPointPicker` now pass via
 the depth read-back (see the read-back-cluster section below); `TestReadPixels`
-passes via the color read-back fixes there. `TestPointSelection*` remain (the
-point field-association selection pass is not yet implemented).
+passes via the color read-back fixes there. `TestPointSelection*` are closed by
+the point-selection pass below (the Metal mapper now renders every vertex as a
+point sprite during a points-field-association selection, matching GL).
 
 Also fixed: `vtkMetalPolyDataMapper::RenderPiece` now calls
 `GetInputAlgorithm()->Update()` (matching `vtkOpenGLPolyDataMapper`). Without
@@ -1740,9 +1843,8 @@ failures.
 
 ### Image-compare failures
 
-Current run (2026-08-05, composite field-data/composite-id picking fixes): 3
-failed = 0 image-compare (TIGHT_VALID >= 0.05) + 3 non-image pick fails + 0
-aborts.
+Current run (2026-08-05, point-selection + 2D overlay picking fixes): 0 failed =
+0 image-compare (TIGHT_VALID >= 0.05) + 0 non-image pick fails + 0 aborts.
 Buckets by
 max `vtkTesting` TIGHT_VALID error per test (threshold 0.05):
 
@@ -1757,10 +1859,10 @@ The three composite failures listed in the previous run's buckets
 `TestCompositePolyDataMapperPartialFieldData` 0.2544 and the below-threshold
 pick-check `TestCompositePolyDataMapperPickability`) all left via the composite
 field-data / composite-id picking fixes above; `TestCompositePolyDataMapperCameraShiftScale`
-(past mid 0.3601) has passed since the VBO shift/scale work. The only remaining
-failures are the 3 non-image pick class: `TestPointSelection`,
-`TestPointSelectionWithCellData` (selection returns even-only point ids,
-pick-check fails) and `TestPickTextActor` (pick check).
+(past mid 0.3601) has passed since the VBO shift/scale work. The last 3 non-image
+pick failures (`TestPointSelection`, `TestPointSelectionWithCellData` and
+`TestPickTextActor`) left via the point-selection and 2D overlay picking fixes
+above — the 175-test suite is green for the first time.
 
 (`TestNActors{OneMapper,NMappersOneInput}` left the mid bucket via the
 per-actor edge-color fix above (passing at ~1.2e-05), and
@@ -1831,7 +1933,12 @@ pick-check is gone: `TestCompositePolyDataMapperPicking` (mid 0.1712),
 via the composite field-data / composite-id picking fixes below — the first time
 any of the three have passed. The +3 pass delta is exactly those three tests (the
 three documented run-to-run-flaky image-compare fails cleared independently); the
-failure set is otherwise the unchanged 3 non-image pick class.
+failure set is otherwise the unchanged 3 non-image pick class.) This run
+(2026-08-05) the 3 non-image pick fails dropped to 0:
+`TestPointSelection` and `TestPointSelectionWithCellData` left via the
+point-selection section above (exact GL point-id sets) and `TestPickTextActor`
+left via the 2D overlay picking fix above — the 175-test suite is green for the
+first time.
 
 ### Crashes (historical; 0 in the current run)
 
@@ -2174,17 +2281,13 @@ against the previously-passing cluster is clean.
   OrientationArray,Picking,PointSize,QuaternionArray,
   CompositeDisplayAttributeInheritance}` fail 0.15–0.6
   (`TestGlyph3DMapperTreeIndexing` passes).
-- **Selection/picking** (~3): `TestPointSelection*` and `TestPickTextActor`
+- **Selection/picking — DONE**: `TestPointSelection` and
+  `TestPointSelectionWithCellData` now pass via the point-selection pass above,
+  and `TestPickTextActor` now passes via the 2D overlay picking fix above
   (`TestAreaSelections`, `TestHardwareSelector`, `TestSelectVisiblePoints`,
   `TestWorldPointPicker`, `TestReadPixels`, `TestRemoveActors` now pass — see the
-  selection/read-back cluster sections above). The 4 near-miss image tests
-  (`TestEdgeFlags`,
-  `TestLineRenderingTranslucent`,
-  `TestGlyph3DMapperPicking`, `RenderNonFinite`)
-  are the next easy-win targets (`TestActorLightingFlag` left via the
-  surface lighting-flag fix above, `TestImageAndAnnotations` via the
-  overlay depth/texture fix above, and `TestPolyDataMapper2D` via the
-  2D overlay line-width and point-size fix below).
+  selection/read-back cluster sections above). No selection/picking-class
+  failures remain.
 - **Point rendering** — DONE: the four point tests `TestPointRendering_3/_4` +
   `TestPointRenderingRound_3/_4` plus the vertex-visibility tests
   `TestVertexRendering`, `TestQuadPointRep` and `TestMixedGeometry_3` now pass
@@ -2230,7 +2333,9 @@ tests), `TestVertexRendering`, `TestQuadPointRep`,
 `TestCompositePolyDataMapper` and its
 `BlockOpacities`/`ToggleScalarVisibilities`/`PartialPointData`/`StaticBounds`/
 `SharedArray` variants, `TestAreaSelections` and `TestHardwareSelector` (exact
-per-primitive cell ids), the read-back cluster (`TestReadPixels`,
+per-primitive cell ids), `TestPointSelection` and `TestPointSelectionWithCellData`
+(exact GL point-id sets), `TestPickTextActor` (2D overlay prop picking), the
+read-back cluster (`TestReadPixels`,
 `TestSelectVisiblePoints`, `TestWorldPointPicker`, `TestRemoveActors`),
 `TestNActors{OneMapper,NMappersOneInput}` (exact edge colors),
 `TestActor2D` (2D overlay
@@ -2296,10 +2401,12 @@ not in the fundamental geometry/lighting/color path.
    cell-id port (`e9e8a6bb66`): the mapper emits `cellPrimitiveIds` per
    triangle unconditionally and the surface fragment reads
    `cellPrimitiveIds[prim_id]` under `kSceneFlagUsePrimitiveCellIds`,
-   emulating GL's `gl_PrimitiveID`. Metal and GL selection ID lists are now
-   identical (139 cells), and `TestAreaSelections` passes under both backends;
-    `TestHardwareSelector` also passes. Remaining: `TestPointSelection*`,
-    `TestSelectVisiblePoints`, `TestWorldPointPicker` (pick check).
+    emulating GL's `gl_PrimitiveID`. Metal and GL selection ID lists are now
+    identical (139 cells), and `TestAreaSelections` passes under both backends;
+     `TestHardwareSelector` also passes. Point field-association selection
+     (`TestPointSelection*`) now passes via the point-selection pass above, and
+     2D overlay picking (`TestPickTextActor`) via the 2D overlay picking fix
+     above. No selection/picking-class failures remain.
  5. **Read-back — DONE** — the read-back cluster (`TestReadPixels`, `TestRemoveActors`,
     `TestWindowToImageFilter`, `TestSelectVisiblePoints`, `TestWorldPointPicker`)
     and `TestResizingWindowToImageFilter` (resize captures) now pass; no
@@ -2340,9 +2447,10 @@ not in the fundamental geometry/lighting/color path.
     `VTK_POINTS`/vertex-representation gate is exact. All four point tests
     `TestPointRendering{,_Round}_3/4` and the vertex-visibility tests
     `TestVertexRendering`, `TestQuadPointRep`, `TestMixedGeometry_3` now pass
-    (see the point-rendering section above). Remaining point-adjacent:
-    `TestPointSelection*` (pick-check; point field-association selection not yet
-    implemented).
+    (see the point-rendering section above). Point field-association selection
+    `TestPointSelection*` now passes too via the point-selection pass (see the
+    point-selection section above), so the point-adjacent pick-check gap is
+    closed.
 
 ---
 
@@ -2472,3 +2580,12 @@ shading behind `kSceneFlagLinesTubeShading` (see the point/line draw-order +
 flat wide-line shading section above); the remaining failure set is unchanged
 (10 image-compare + 1 below-threshold pick-check + 3 non-image); the tally above
 and the buckets are from this run, exported with `export_image_compare.sh`.
+
+Newest working-tree run (2026-08-05, after the point-selection and 2D overlay
+picking fixes): 175 Passed / 0 Failed / 0 aborted — `TestPointSelection`,
+`TestPointSelectionWithCellData` (point field-association selection) and
+`TestPickTextActor` (2D overlay prop picking) now pass (see the point-selection
+and 2D overlay picking sections above); the 175-test generic suite is green for
+the first time and the bespoke `RenderingMetal` suite re-runs at 16/16; the
+tally above and the buckets are from this run, exported with
+`export_image_compare.sh`.
