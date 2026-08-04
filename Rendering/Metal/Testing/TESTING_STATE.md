@@ -19,8 +19,8 @@ Two test surfaces exist:
 2. The generic multi-backend suite in `Rendering/Core/Testing/Cxx/`, which
    registers the same ~175 tests once per backend and was wired up for Metal
        through    object-factory overrides (`--vtk-factory-prefer
-             RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
-               crash)**. Current working-tree status: **161 pass / 14 fail (0 crash)** —
+              RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
+                crash)**. Current working-tree status: **162 pass / 13 fail (0 crash)** —
         `TestGlyph3DMapperCompositeDisplayAttributeInheritance` now passes via the
        composite per-block display-attribute inheritance port in the Metal glyph
        mapper (see the composite display-attribute section below),
@@ -180,7 +180,7 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  161 Passed  14 Failed (incl. image/pick fails)  0 "Subprocess aborted"
+175 tests:  162 Passed  13 Failed (incl. image/pick fails)  0 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
@@ -563,6 +563,51 @@ delta over the previous run is exactly that test; the failure set is otherwise
 unchanged (10 image-compare + 1 below-threshold pick-check + 3 non-image fails,
 no new failures). The regression check against the documented passing cluster
 reports none.
+Run after the 2D transform-coordinate double-precision fix (this run, 2026-08-04):
+162 Passed / 13 Failed / 0 aborted out of 175 (analyzed with
+`analyze_metal_ctest_log.py` from a single `ctest -R "RenderingCoreCxx-Metal" -j 8`
+run; failures exported with `export_image_compare.sh --no-run`) —
+`TestTransformCoordinateUseDouble` now passes for the first time (ImageError 0,
+pixel-perfect against the GL baseline): the Metal 2D mapper truncated the
+`vtkCoordinate` transform to integer pixels even when the mapper's
+`TransformCoordinateUseDouble` flag was set, so the test's 0.0002 sub-pixel box
+offset was lost and Metal's rasterizer tie-broke the exact-boundary lines one
+pixel left (columns 99/199/399 vs GL's 100/200/0); the mapper now mirrors
+`vtkOpenGLPolyDataMapper2D` and uses `GetComputedDoubleViewportValue` when the
+flag is set (see the 2D transform-coordinate double-precision section below). The
++1 pass delta over the previous run is exactly that test; the failure set is
+otherwise unchanged (9 image-compare + 1 below-threshold pick-check + 3
+non-image fails, no new failures). The regression check against the documented
+passing cluster reports none.
+
+### The 2D transform-coordinate double-precision fix (`TestTransformCoordinateUseDouble` now passes)
+
+`TestTransformCoordinateUseDouble` builds seven sub-viewport renderers and draws
+a white 1px box outline in each at the renderer's normalized-viewport bounds,
+shifting every corner by 0.0002 so the lines fall just inside the top/right pixel
+row instead of straddling two. It failed image comparison at a mid-bucket 0.1635:
+the Metal render placed the box edges one pixel left of GL (vertical lines at
+columns 99/199/399 instead of 100/200/0).
+
+The root cause is in `vtkMetalPolyDataMapper2D::RenderOverlay`
+(`Rendering/Metal/vtkMetalPolyDataMapper2D.mm`): the TransformCoordinate path
+always called `GetComputedViewportValue`, which rounds the normalized-viewport
+coordinate to an integer pixel, dropping the 0.0002 offset. On the exact
+boundary Metal's line rasterizer tie-broke to the left-hand pixel, while
+`vtkOpenGLPolyDataMapper2D` honors the mapper's `TransformCoordinateUseDouble`
+flag and uses `GetComputedDoubleViewportValue` (`vtkOpenGLPolyDataMapper2D.cxx`),
+preserving the fraction so the line lands on the top/right pixel like the
+baseline.
+
+The fix mirrors the OpenGL mapper exactly: when `TransformCoordinateUseDouble`
+is set, the Metal mapper now calls `GetComputedDoubleViewportValue` (the
+double-precision viewport pixel coordinate, preserved through the float position
+buffer); otherwise the int `GetComputedViewportValue` path is unchanged, so the
+default (flag off) behavior is byte-identical to before. `TestTransformCoordinateUseDouble`
+now passes at TIGHT_VALID 0 (pixel-perfect), and the full suite re-ran at
+162 pass / 13 fail / 0 aborted with the failure set otherwise unchanged and no
+regression against the documented passing cluster (the OpenGL-factory variants
+of the same 2D tests still pass unchanged).
 
 ### The point/line draw-order + flat wide-line shading fix (`TestMixedGeometryCellScalars` now passes)
 

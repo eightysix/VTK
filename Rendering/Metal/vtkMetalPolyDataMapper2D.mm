@@ -289,8 +289,16 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         for (vtkIdType i = 0; i < numPts; i++)
         {
           this->TransformCoordinate->SetValue(points->GetPoint(i));
-          int* p = this->TransformCoordinate->GetComputedViewportValue(viewport);
-          tempPoints->SetPoint(i, p[0], p[1], 0.0);
+          if (this->TransformCoordinateUseDouble)
+          {
+            double* dtmp = this->TransformCoordinate->GetComputedDoubleViewportValue(viewport);
+            tempPoints->SetPoint(i, dtmp[0], dtmp[1], 0.0);
+          }
+          else
+          {
+            int* p = this->TransformCoordinate->GetComputedViewportValue(viewport);
+            tempPoints->SetPoint(i, p[0], p[1], 0.0);
+          }
         }
         transformedPoints = tempPoints;
       }
