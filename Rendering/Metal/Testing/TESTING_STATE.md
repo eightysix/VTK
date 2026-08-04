@@ -20,7 +20,7 @@ Two test surfaces exist:
    registers the same ~175 tests once per backend and was wired up for Metal
        through    object-factory overrides (`--vtk-factory-prefer
           RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
-           crash)**. Current working-tree status: **157 pass / 18 fail (0 crash)** —
+            crash)**. Current working-tree status: **158 pass / 17 fail (0 crash)** —
       the last crash class, `vtkLabeledContourMapper`, is fixed by the
       `vtkMetalLabeledContourMapper` override (see the labeled-contour-mapper
       section below); the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
@@ -175,7 +175,7 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  157 Passed  18 Failed (incl. image/pick fails)  0 "Subprocess aborted"
+175 tests:  158 Passed  17 Failed (incl. image/pick fails)  0 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
@@ -494,6 +494,62 @@ see the glyph3D backface-color section below). The +1 pass delta over the
 previous run is exactly that test; the failure set is otherwise unchanged
 (14 image-compare + 3 non-image fails, no new failures). The regression check
 against the documented passing cluster reports none.
+Run after the glyph3D point-selection fix (this run, 2026-08-04): 158 Passed /
+17 Failed / 0 aborted out of 175 (analyzed with `analyze_metal_ctest_log.py`
+from a single `ctest -R "RenderingCoreCxx-Metal" -j 8` run; failures exported
+with `export_image_compare.sh`) — `TestGlyph3DMapperPicking` now passes for the
+first time (TIGHT_VALID ImageError 0; was a near-miss 0.0800 image fail): the
+Metal selection pass rendered glyphs with their exact sphere silhouettes, while
+GL dilates pick coverage by drawing every glyph-source vertex as a 6.0px point
+during point selection (`vtkOpenGLGlyph3DHelper::GlyphRender`), so a pick
+rectangle grazing a glyph column could miss points GL would catch. The Metal
+glyph mapper now mirrors that — with a point-field-association hardware
+selector active it routes every source vertex through the point pipeline at
+`scene.pointSize` = 6.0, and the Turn-On id set is now identical to GL's 21 ids
+(see the glyph3D point-selection section below). The +1 pass delta over the
+previous run is exactly that test; the failure set is otherwise unchanged
+(13 image-compare + 1 below-threshold pick-check + 3 non-image fails, no new
+failures). The regression check against the documented passing cluster reports
+none.
+
+### The glyph3D point-selection fix (`TestGlyph3DMapperPicking` now passes)
+
+`TestGlyph3DMapperPicking` renders two 7x7 grids of sphere glyphs (the right
+actor shifted +2 world units and `PickableOff`) and area-picks a 30px-wide
+rectangle (x 53-82) over the left actor's left columns, asserting the selected
+point-id set. Under Metal the selection returned fewer ids than GL: the pick
+rectangle grazed glyph column 2, whose sphere silhouettes ended at x≈51 —
+just outside the rectangle.
+
+A probe built from the test's own compile flags dumped both backends'
+selection buffers (GL: `/tmp/gl_pass{0,1,2,5}_*.ppm` via
+`vtkHardwareSelector::SavePixelBuffer`; Metal: `/tmp/metal_ids.bin` via
+`vtkMetalRenderWindow::GetIdsData`, raw ids are id+1). GL's pass 2
+(`POINT_ID_LOW24`) covered all 30 area columns (rows 21-122) with the full
+21-id grid `{2,3,4,9,10,11,16,17,18,23,24,25,30,31,32,37,38,39,44,45,46}`;
+Metal's single-pass IdBuffer covered only window-x 57-65 and 72-80 at the same
+grid positions — the geometry was correct but the coverage too narrow. The gap
+is GL's `vtkOpenGLGlyph3DHelper::GlyphRender`: during point selection it draws
+every glyph-source vertex as a 6.0px `GL_POINT`, dilating coverage by ~3px on
+either side of the silhouette.
+
+The fix in `vtkMetalGlyph3DMapper.mm`:
+
+- **Point-size uniform.** When `ren->GetSelector()` targets
+  `vtkDataObject::FIELD_ASSOCIATION_POINTS`, write 6.0 into the
+  `SceneUniforms.pointSize` float at byte offset 260 (after the uint Flags at
+  256), matching GL's 6.0px sprites; the camera default of 1.0 is kept
+  otherwise.
+- **Selection draw path.** In the source draw loop, when selecting points,
+  bind the existing point pipeline (`MTLPrimitiveTypePoint`,
+  `g->VertexCount`) for every source regardless of its topology
+  (triangle/line/point alike), instead of the surface geometry. Non-selection
+  rendering is unchanged.
+
+The Metal Turn-On set now equals GL's 21 ids, the regression image matches
+(TIGHT_VALID ImageError 0), and the full-suite re-run shows no new failures —
+the remaining 17 fails are the unchanged 13 image-compare + 1 below-threshold
+pick-check (`TestCompositePolyDataMapperPickability`) + 3 non-image set.
 
 ### The glyph3D backface-color fix (`TestGlyph3DMapperBackfaceColor` now passes)
 

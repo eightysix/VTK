@@ -1019,6 +1019,16 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     return;
   }
 
+  // Metal selection renders all ID channels in a single pass. Mirror GL's point
+  // selection (vtkOpenGLGlyph3DHelper::GlyphRender): when the selector targets
+  // points, draw every glyph-source vertex as a 6.0px point instead of the
+  // surface geometry. The dilated coverage (sphere silhouette + ~3px) is what
+  // makes GL pick glyphs whose silhouette barely grazes the pick rectangle;
+  // rendering the raw silhouette here would miss those boundary points.
+  vtkMetalHardwareSelector* sel = vtkMetalHardwareSelector::SafeDownCast(ren->GetSelector());
+  const bool selectingPoints =
+    sel && sel->GetFieldAssociation() == vtkDataObject::FIELD_ASSOCIATION_POINTS;
+
   // Camera + scene uniforms
   vtkMetalCamera* cam = vtkMetalCamera::SafeDownCast(ren->GetActiveCamera());
   if (cam)
@@ -1032,15 +1042,40 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     memcpy([I->SceneBuffer contents], cam->GetCachedSceneTransforms(),
            vtkMetalCamera::GetSceneTransformsSize());
     {
+      char* s = static_cast<char*>([I->SceneBuffer contents]);
+
+      // The cached camera transforms carry the camera's model matrix (identity).
+      // The shader applies scene.modelMatrix to model-space vertices, so store
+      // the actor's model-to-world matrix here (transposed like the camera
+      // matrices, since Metal indexes matrices column-major). Matches
+      // vtkMetalPolyDataMapper. SceneUniforms layout: ViewMatrix(64) +
+      // ProjectionMatrix(64) + NormalMatrix(48) + ModelMatrix(176..240).
+      vtkNew<vtkMatrix4x4> actorMatrix;
+      actor->GetModelToWorldMatrix(actorMatrix);
+      float* modelMat = reinterpret_cast<float*>(s + 176);
+      for (int col = 0; col < 4; ++col)
+      {
+        for (int row = 0; row < 4; ++row)
+        {
+          modelMat[col * 4 + row] = static_cast<float>(actorMatrix->GetElement(row, col));
+        }
+      }
+
       // SceneUniforms.flags is a uint at byte offset 256 (see SceneUniforms in
       // MetalShaders.metal; float offset 64); clear the glyph-has-normals bit
       // here (the camera never sets it) and OR it in per-draw before each
       // source is rendered. The camera writes Flags as a raw uint, so the
       // read/modify/write must be a bit-pattern reinterpret — a float cast
       // would numerically convert the value and corrupt the bits.
-      char* s = static_cast<char*>([I->SceneBuffer contents]);
       uint32_t flags = *reinterpret_cast<uint32_t*>(s + 256);
       *reinterpret_cast<uint32_t*>(s + 256) = flags & ~VTK_METAL_SCENE_FLAG_GLYPH_HAS_NORMALS;
+
+      // SceneUniforms.pointSize is at byte offset 260 (Flags(256) + PointSize(260),
+      // see vtkMetalCamera::SceneTransforms). The point pipeline (used for glyph
+      // point sources and, during point selection, for every source) rasterizes
+      // points at this size. GL uses 6.0px for its point-selection sprites, so
+      // match that exactly; the camera default of 1.0 is fine otherwise.
+      *reinterpret_cast<float*>(s + 260) = selectingPoints ? 6.0f : 1.0f;
     }
   }
 
@@ -1223,8 +1258,6 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
   {
     // Per-render prop ID from the active hardware selector; 0 when not picking.
     uint32_t glyphPropId = 0;
-    vtkMetalHardwareSelector* sel =
-      vtkMetalHardwareSelector::SafeDownCast(ren->GetSelector());
     if (sel)
     {
       int id = sel->GetPropID(actor);
@@ -1299,6 +1332,15 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     const auto& inst = I->Instances[si];
     if (!g || g->VertexCount == 0 || !inst || inst->NumInstances == 0)
       continue;
+    if (selectingPoints)
+    {
+      // GL's point selection renders every glyph vertex as a 6.0px point; the
+      // point pipeline's vertex shader rasterizes [[point_size]] = scene.pointSize
+      // (set to 6.0 above). Drawing all source vertices this way reproduces GL's
+      // dilated selection coverage for triangle/line/point sources alike.
+      bindAndDraw(I->PtPipeline, MTLPrimitiveTypePoint, g->VertexCount, *g, *inst);
+      continue;
+    }
     if (g->HasTriangles)
     {
       bindAndDraw(I->TriPipeline, MTLPrimitiveTypeTriangle, g->TriVertexCount, *g, *inst);
