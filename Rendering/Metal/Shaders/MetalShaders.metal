@@ -195,6 +195,7 @@ struct VertexOut {
   float4 position [[position]];
   float3 viewPos;
   float3 viewNormal;
+  //VTK::Normal::Dec  // user shader (Metal): insert extra vertex-out/fragment-in varyings here
   float4 vertexColor;    // P1-1A: per-vertex color from scalar mapping
   float2 uv;             // P5-5A: texture coordinates
   float2 scalarCoord;    // interpolated LUT texture coordinate (scalar-texture coloring)
@@ -502,6 +503,7 @@ vertex VertexOut vertex_main(uint vertex_id [[vertex_id]],
   out.viewPos = viewPos.xyz;
   out.position = scene.projectionMatrix * viewPos;
   out.viewNormal = scene.normalMatrix * in.normal;
+  //VTK::Normal::Impl  // user shader (Metal): vertex-body insertion point (model-space normal is in.normal)
   // Feature-conditional per-vertex loads (compile-time via function constants):
   // the lean surface variant skips the color/UV/ID streams the fragment shader
   // does not consume, so the loads are not pure per-vertex bandwidth. The
@@ -622,6 +624,7 @@ struct FragmentColorAndIds {
 
 // Shared surface fragment evaluation (used by both the early-Z and the
 // coincident-offset entry points so the two never drift).
+// VTK-METAL-SCOPE: fragment
 inline FragmentColorAndIds evaluateSurfaceFragment(VertexOut in,
                              constant MaterialUniforms& material,
                              constant LightUniforms& lights,
@@ -699,6 +702,8 @@ inline FragmentColorAndIds evaluateSurfaceFragment(VertexOut in,
   // the flat edge branch can drop the intensity exactly like GL; surfaces with
   // no edges see the same totalAmbient either way.
   r.ambient = m.ambientColor.w * r.ambient;
+
+  //VTK::Normal::Impl  // user shader (Metal): fragment-body insertion point (resolved material is in r)
 
   if (kHasEdgeFlags)
   {

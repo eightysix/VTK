@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <string>
 
 #ifdef __OBJC__
 @protocol MTLDevice;
@@ -183,6 +184,16 @@ public:
    * Thread-safe: uses a std::call_once guard.
    */
   void* GetSharedShaderLibrary();
+
+  /**
+   * Get a Metal shader library compiled from the given MSL source, creating
+   * and caching it on first access. Used by mappers to honor per-actor
+   * vtkShaderProperty replacements (a custom shader compiles the shared
+   * MetalShaders.metal source with the user's //VTK:: substitutions applied).
+   * The returned library is owned by the render window and released in
+   * Finalize(). Returns nullptr on compilation failure.
+   */
+  void* GetShaderLibraryForSource(const std::string& source);
 
   /**
    * Read back the IDs texture (RGBA32Uint) into a vtkTypeUInt32Array.
@@ -433,6 +444,11 @@ protected:
   // Shared shader library — compiled once and reused across all pipelines.
   void* SharedShaderLibrary = nullptr;  // id<MTLLibrary>
   std::once_flag LibraryInitFlag;
+
+  // Custom shader libraries (id<MTLLibrary>) compiled from the shared MSL
+  // source with per-actor vtkShaderProperty replacements applied, keyed by the
+  // full source string. Owned by the window; released in Finalize().
+  std::map<std::string, void*> CustomShaderLibraries;
 
 private:
   friend class vtkMetalRenderer;

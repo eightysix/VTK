@@ -18,6 +18,7 @@
 #include "vtkImageData.h"
 #include "vtkProperty.h"
 #include "vtkActor.h"
+#include "vtkShaderProperty.h"
 #include "vtkRenderer.h"
 #include "vtkRenderWindow.h"
 #include "vtkInformation.h"
@@ -53,6 +54,8 @@
 #include <cmath>
 #include <variant>
 #include <utility>
+#include <algorithm>
+#include <cctype>
 
 // MRC ownership helpers for Objective-C manual retain/release
 #include "vtkMetalMRC.h"
@@ -95,6 +98,559 @@ bool CommitAndWaitForCompletion(id<MTLCommandBuffer> cmdBuf)
     [cmdBuf commit];
     [cmdBuf waitUntilCompleted];
     return cmdBuf.status == MTLCommandBufferStatusCompleted;
+}
+
+// ---------------------------------------------------------------------------
+// Per-actor shader replacement support (the Metal analog of the OpenGL
+// backend's GLSL //VTK:: substitution).
+//
+// The Metal backend compiles one monolithic MSL source (MetalShaders.metal).
+// A user's shader replacements (vtkShaderProperty::AddVertexShaderReplacement
+// / AddFragmentShaderReplacement) are string substitutions over that source,
+// targeting the //VTK:: marker tokens embedded in the surface shaders. Because
+// the same token text is used by both vertex and fragment bodies (as in GLSL),
+// every token occurrence is classified by the scope of the function it sits
+// in: a Vertex-type replacement only rewrites top-level (struct) and vertex
+// occurrences, and a Fragment-type replacement only rewrites fragment
+// occurrences. A replacement whose original token never appears in its scope
+// is a harmless no-op (matching vtkShaderProgram::Substitute).
+// ---------------------------------------------------------------------------
+enum class ShaderScope
+{
+  TopLevel,
+  Vertex,
+  Fragment,
+  Other
+};
+
+enum : uint32_t
+{
+  kScopeTopLevel = 1u << 0,
+  kScopeVertex = 1u << 1,
+  kScopeFragment = 1u << 2
+};
+
+static std::string TrimCopy(const std::string& s)
+{
+  const size_t b = s.find_first_not_of(" \t");
+  if (b == std::string::npos)
+  {
+    return std::string();
+  }
+  const size_t e = s.find_last_not_of(" \t");
+  return s.substr(b, e - b + 1);
+}
+
+// Classify every line of the MSL source as top-level / vertex / fragment /
+// other. A function header is a line starting with `vertex`, `fragment` or
+// `kernel`, or an `inline` function preceded by a `// VTK-METAL-SCOPE: <s>`
+// marker comment. The header may span lines up to the `{` that opens the
+// body; the body runs to the matching closing brace (brace counted).
+static std::vector<ShaderScope> ComputeLineScopes(const std::string& source)
+{
+  std::vector<std::string> lines;
+  {
+    std::string cur;
+    for (char c : source)
+    {
+      if (c == '\n')
+      {
+        lines.push_back(cur);
+        cur.clear();
+      }
+      else
+      {
+        cur.push_back(c);
+      }
+    }
+    if (!cur.empty())
+    {
+      lines.push_back(cur);
+    }
+  }
+
+  std::vector<ShaderScope> scopes(lines.size(), ShaderScope::TopLevel);
+  ShaderScope pending = ShaderScope::TopLevel;
+  const size_t n = lines.size();
+  for (size_t i = 0; i < n; ++i)
+  {
+    const std::string t = TrimCopy(lines[i]);
+
+    // Explicit scope marker for inline helper functions.
+    if (t.compare(0, 19, "// VTK-METAL-SCOPE:") == 0)
+    {
+      if (t.find("fragment") != std::string::npos)
+      {
+        pending = ShaderScope::Fragment;
+      }
+      else if (t.find("vertex") != std::string::npos)
+      {
+        pending = ShaderScope::Vertex;
+      }
+      continue;
+    }
+
+    ShaderScope funcScope = ShaderScope::Other;
+    if (t.compare(0, 7, "vertex ") == 0)
+    {
+      funcScope = ShaderScope::Vertex;
+    }
+    else if (t.compare(0, 9, "fragment ") == 0)
+    {
+      funcScope = ShaderScope::Fragment;
+    }
+    else if (t.compare(0, 7, "kernel ") == 0)
+    {
+      funcScope = ShaderScope::Other;
+    }
+    else if (t.compare(0, 7, "inline ") == 0 && pending != ShaderScope::TopLevel)
+    {
+      funcScope = pending;
+    }
+
+    if (funcScope != ShaderScope::Other || pending != ShaderScope::TopLevel)
+    {
+      // A function header starts here (it may span multiple lines). Find the
+      // line holding the `{` that opens the body, then mark every line through
+      // the matching closing brace with the function's scope.
+      size_t body = i;
+      while (body < n && lines[body].find('{') == std::string::npos)
+      {
+        ++body;
+      }
+      if (body < n)
+      {
+        int depth = 0;
+        for (size_t li = body; li < n; ++li)
+        {
+          scopes[li] = funcScope;
+          for (char c : lines[li])
+          {
+            if (c == '{')
+            {
+              ++depth;
+            }
+            else if (c == '}')
+            {
+              --depth;
+            }
+          }
+          if (depth == 0)
+          {
+            break;
+          }
+        }
+        i = body;
+      }
+    }
+    pending = ShaderScope::TopLevel;
+  }
+  return scopes;
+}
+
+// Apply one replacement to the in-scope source lines. Lines are edited in
+// place: the line count (and therefore scope alignment) is preserved because
+// replacement values never contain newlines that need re-splitting, and the
+// original token text never spans a line. With replaceAll=false only the first
+// matching occurrence across all in-scope lines is replaced.
+static void ReplaceInScope(std::vector<std::string>& lines,
+  const std::vector<ShaderScope>& scopes, const std::string& original,
+  const std::string& replacement, bool replaceAll, uint32_t scopeMask)
+{
+  bool firstReplaced = false;
+  for (size_t i = 0; i < lines.size(); ++i)
+  {
+    uint32_t lineMask = 0;
+    switch (scopes[i])
+    {
+      case ShaderScope::TopLevel:
+        lineMask = kScopeTopLevel;
+        break;
+      case ShaderScope::Vertex:
+        lineMask = kScopeVertex;
+        break;
+      case ShaderScope::Fragment:
+        lineMask = kScopeFragment;
+        break;
+      default:
+        break;
+    }
+    if ((lineMask & scopeMask) == 0)
+    {
+      continue;
+    }
+
+    std::string& line = lines[i];
+    size_t pos = 0;
+    while ((pos = line.find(original, pos)) != std::string::npos)
+    {
+      if (!replaceAll && firstReplaced)
+      {
+        return;
+      }
+      line.replace(pos, original.size(), replacement);
+      pos += replacement.size();
+      if (!replaceAll)
+      {
+        firstReplaced = true;
+        return;
+      }
+    }
+  }
+}
+
+// The scope of the first line (within `scopeMask`) that contains `original`.
+// Used to translate a replacement value with the rules of the location it will
+// actually be injected into (e.g. `//VTK::Normal::Dec` lives only in the
+// top-level struct, while `//VTK::Normal::Impl` lives in the vertex and
+// fragment bodies).
+static ShaderScope FindTokenScope(const std::vector<std::string>& lines,
+  const std::vector<ShaderScope>& scopes, const std::string& original, uint32_t scopeMask)
+{
+  for (size_t i = 0; i < lines.size(); ++i)
+  {
+    uint32_t lineMask = 0;
+    switch (scopes[i])
+    {
+      case ShaderScope::TopLevel:
+        lineMask = kScopeTopLevel;
+        break;
+      case ShaderScope::Vertex:
+        lineMask = kScopeVertex;
+        break;
+      case ShaderScope::Fragment:
+        lineMask = kScopeFragment;
+        break;
+      default:
+        break;
+    }
+    if ((lineMask & scopeMask) != 0 && lines[i].find(original) != std::string::npos)
+    {
+      return scopes[i];
+    }
+  }
+  return ShaderScope::Other;
+}
+
+// ---------------------------------------------------------------------------
+// GLSL→MSL shim for user shader replacements.
+//
+// The Metal template uses the same //VTK:: marker tokens as GL, so a
+// replacement written for the GLSL backend (the shared multi-backend shader
+// tests) is not valid MSL verbatim. This performs a bounded, lexical
+// translation of the constructs those replacements use:
+//   - `out vecN X;` / `in vecN X;`  ->  `floatN X;`     (struct varyings)
+//   - `vecN`/`matN` types           ->  `floatN`/`floatNxN`
+//   - `normalMC` (GL model normal)  ->  `in.normal`     (vertex body)
+//   - tracked varying reads/writes  ->  `in.X`/`out.X`  (fragment/vertex body)
+//   - `diffuseColor` (GL fragment)  ->  `r.diffuse`     (fragment body)
+// MSL-native replacements pass through untouched: every rule fires only on
+// GLSL tokens and honors C-identifier word boundaries.
+// ---------------------------------------------------------------------------
+
+// Replace every word-boundary occurrence of `word` in `text` with
+// `replacement`. When skipDotQualified is set, occurrences already prefixed
+// with a `.` (e.g. `in.myNormal` or `out.myNormal`) are left alone so a
+// Metal-native replacement is not double-qualified.
+static void ReplaceWord(std::string& text, const std::string& word,
+  const std::string& replacement, bool skipDotQualified)
+{
+  size_t pos = 0;
+  while ((pos = text.find(word, pos)) != std::string::npos)
+  {
+    const bool boundaryBefore = (pos == 0) ||
+      !(isalnum(static_cast<unsigned char>(text[pos - 1])) || text[pos - 1] == '_');
+    const size_t after = pos + word.size();
+    const bool boundaryAfter = (after >= text.size()) ||
+      !(isalnum(static_cast<unsigned char>(text[after])) || text[after] == '_');
+    const bool dotQualified = (pos > 0 && text[pos - 1] == '.');
+    if (boundaryBefore && boundaryAfter && (!skipDotQualified || !dotQualified))
+    {
+      text.replace(pos, word.size(), replacement);
+      pos += replacement.size();
+    }
+    else
+    {
+      pos += word.size();
+    }
+  }
+}
+
+// Scan a replacement value for GLSL varying declarations (`out vec3 NAME;`,
+// `in vec4 NAME;`) and record the names. The declarations live at the
+// top-level (struct) scope of the Metal template; the names are later used to
+// qualify reads/writes in the vertex and fragment bodies.
+static void CollectVaryingNames(const std::string& code, std::vector<std::string>& names)
+{
+  size_t start = 0;
+  while (start <= code.size())
+  {
+    const size_t nl = code.find('\n', start);
+    const size_t end = (nl == std::string::npos) ? code.size() : nl;
+    std::string line = code.substr(start, end - start);
+    start = (nl == std::string::npos) ? code.size() + 1 : nl + 1;
+
+    const size_t b = line.find_first_not_of(" \t");
+    if (b == std::string::npos)
+    {
+      continue;
+    }
+    size_t q = b;
+    if (line.compare(q, 4, "out ") == 0 || line.compare(q, 3, "in ") == 0)
+    {
+      q = (line.compare(q, 4, "out ") == 0) ? q + 4 : q + 3;
+    }
+    else if (line.compare(q, 7, "varying") == 0)
+    {
+      q = q + 7;
+      while (q < line.size() && line[q] == ' ')
+      {
+        ++q;
+      }
+    }
+    else
+    {
+      continue;
+    }
+
+    // Expect `vec<N> NAME[;]` (GLSL only; MSL `floatN` declarations are left
+    // untouched and are not tracked).
+    const size_t vt = line.find("vec", q);
+    if (vt == std::string::npos || vt != q || vt + 4 > line.size() ||
+      !isdigit(static_cast<unsigned char>(line[vt + 3])))
+    {
+      continue;
+    }
+    const size_t nb = line.find_first_not_of(" \t", vt + 4);
+    if (nb == std::string::npos)
+    {
+      continue;
+    }
+    const size_t ne = line.find_first_of(" \t[;", nb);
+    if (ne == std::string::npos)
+    {
+      continue;
+    }
+    std::string name = line.substr(nb, ne - nb);
+    if (!name.empty() &&
+      std::find(names.begin(), names.end(), name) == names.end())
+    {
+      names.push_back(name);
+    }
+  }
+}
+
+// Apply the lexical GLSL→MSL translation to a replacement value destined for
+// the given scope.
+static void TranslateGlslToMsl(std::string& code, uint32_t scopeMask,
+  const std::vector<std::string>& varyingNames)
+{
+  if (scopeMask & kScopeTopLevel)
+  {
+    // `out vecN X;` / `in vecN X;` -> `floatN X;`: strip the GLSL qualifier at
+    // statement starts before the type rewrite below turns `vecN` into `floatN`.
+    std::string out;
+    out.reserve(code.size());
+    size_t start = 0;
+    while (start <= code.size())
+    {
+      const size_t nl = code.find('\n', start);
+      const size_t end = (nl == std::string::npos) ? code.size() : nl;
+      std::string line = code.substr(start, end - start);
+      const size_t b = line.find_first_not_of(" \t");
+      if (b != std::string::npos)
+      {
+        if (line.compare(b, 4, "out ") == 0 && line.find("vec", b + 4) == b + 4)
+        {
+          line.erase(b, 4);
+        }
+        else if (line.compare(b, 3, "in ") == 0 && line.find("vec", b + 3) == b + 3)
+        {
+          line.erase(b, 3);
+        }
+      }
+      out += line;
+      if (nl != std::string::npos)
+      {
+        out += '\n';
+        start = nl + 1;
+      }
+      else
+      {
+        break;
+      }
+    }
+    code = out;
+  }
+
+  if (scopeMask & kScopeVertex)
+  {
+    // GL writes the varying through the `out` instance; MSL struct members are
+    // accessed via the vertex function's `VertexOut out` local.
+    for (const auto& name : varyingNames)
+    {
+      ReplaceWord(code, name, "out." + name, /*skipDotQualified=*/true);
+    }
+    ReplaceWord(code, "normalMC", "in.normal", /*skipDotQualified=*/true);
+  }
+  else if (scopeMask & kScopeFragment)
+  {
+    // GL reads the varying by bare name; MSL reads the interpolated struct
+    // member through the fragment function's `VertexOut in` parameter.
+    for (const auto& name : varyingNames)
+    {
+      ReplaceWord(code, name, "in." + name, /*skipDotQualified=*/true);
+    }
+    ReplaceWord(code, "diffuseColor", "r.diffuse", /*skipDotQualified=*/true);
+    // GL folds the diffuse intensity into the diffuse color before the lighting
+    // (vec3 diffuseColor = diffuseIntensity * diffuseColorUniform), so a custom
+    // `diffuseColor = X` replacement REPLACES the intensity-scaled value and the
+    // final GL color uses X directly. MSL applies the intensity at the end
+    // (m.diffuseColor.w * totalDiffuse), so divide X back out to reproduce GL.
+    size_t assign = 0;
+    while ((assign = code.find("r.diffuse = ", assign)) != std::string::npos)
+    {
+      const size_t semi = code.find(';', assign);
+      if (semi != std::string::npos)
+      {
+        code.insert(semi, " / m.diffuseColor.w");
+        assign = semi + std::string(" / m.diffuseColor.w").size();
+      }
+      else
+      {
+        break;
+      }
+    }
+  }
+
+  // GLSL type names -> MSL equivalents (word-boundary so `myVec3` is safe).
+  const std::pair<const char*, const char*> typeMap[] = {
+    { "vec4", "float4" }, { "vec3", "float3" }, { "vec2", "float2" },
+    { "mat4", "float4x4" }, { "mat3", "float3x3" }, { "mat2", "float2x2" },
+  };
+  for (const auto& tp : typeMap)
+  {
+    ReplaceWord(code, tp.first, tp.second, /*skipDotQualified=*/false);
+  }
+}
+
+// Build the MSL source compiled for a custom-shader actor: the shared template
+// plus the actor's replacements applied in scope. Returns false (and leaves
+// outSource untouched) when the actor has no shader replacements.
+static bool BuildCustomShaderSource(vtkActor* actor, std::string& outSource)
+{
+  vtkShaderProperty* sp = actor ? actor->GetShaderProperty() : nullptr;
+  if (!sp || sp->GetNumberOfShaderReplacements() == 0)
+  {
+    return false;
+  }
+
+  std::vector<std::string> lines;
+  {
+    std::string cur;
+    for (const char* p = vtkMetalShaders; *p; ++p)
+    {
+      if (*p == '\n')
+      {
+        lines.push_back(cur);
+        cur.clear();
+      }
+      else
+      {
+        cur.push_back(*p);
+      }
+    }
+    if (!cur.empty())
+    {
+      lines.push_back(cur);
+    }
+  }
+  const std::vector<ShaderScope> scopes = ComputeLineScopes(vtkMetalShaders);
+
+  // Collect the varying names declared by the GLSL-style Dec replacements
+  // first so the body replacements can qualify reads/writes correctly.
+  const int count = sp->GetNumberOfShaderReplacements();
+  std::vector<std::string> varyingNames;
+  for (int i = 0; i < count; ++i)
+  {
+    std::string rname;
+    bool replaceFirst = false;
+    std::string replacementValue;
+    bool replaceAll = false;
+    sp->GetNthShaderReplacement(i, rname, replaceFirst, replacementValue, replaceAll);
+    const std::string typeStr = sp->GetNthShaderReplacementTypeAsString(i);
+    if (typeStr == "Vertex" || typeStr == "Fragment")
+    {
+      CollectVaryingNames(replacementValue, varyingNames);
+    }
+  }
+
+  // GL applies the replaceFirst replacements before the template's default
+  // substitutions and the rest after. The MSL template has no defaults left to
+  // inject between the two, but preserve the ordering for API fidelity.
+  for (int pass = 0; pass < 2; ++pass)
+  {
+    const bool wantFirst = (pass == 0);
+    for (int i = 0; i < count; ++i)
+    {
+      std::string name;
+      bool replaceFirst = false;
+      std::string replacementValue;
+      bool replaceAll = false;
+      sp->GetNthShaderReplacement(i, name, replaceFirst, replacementValue, replaceAll);
+      if (replaceFirst != wantFirst)
+      {
+        continue;
+      }
+
+      const std::string typeStr = sp->GetNthShaderReplacementTypeAsString(i);
+      uint32_t scopeMask = 0;
+      if (typeStr == "Vertex")
+      {
+        scopeMask = kScopeTopLevel | kScopeVertex;
+      }
+      else if (typeStr == "Fragment")
+      {
+        scopeMask = kScopeFragment;
+      }
+      else
+      {
+        // Geometry/tessellation replacements have no Metal surface analog.
+        continue;
+      }
+
+      // Translate the value with the rules of the scope its token is actually
+      // injected into (a vertex replacement like `//VTK::Normal::Impl` that
+      // lands in the vertex body must not have its struct-declaration sibling
+      // rewritten).
+      uint32_t translateScope = 0;
+      switch (FindTokenScope(lines, scopes, name, scopeMask))
+      {
+        case ShaderScope::TopLevel:
+          translateScope = kScopeTopLevel;
+          break;
+        case ShaderScope::Vertex:
+          translateScope = kScopeVertex;
+          break;
+        case ShaderScope::Fragment:
+          translateScope = kScopeFragment;
+          break;
+        default:
+          translateScope = scopeMask;
+          break;
+      }
+      TranslateGlslToMsl(replacementValue, translateScope, varyingNames);
+      ReplaceInScope(lines, scopes, name, replacementValue, replaceAll, scopeMask);
+    }
+  }
+
+  outSource.clear();
+  for (const auto& line : lines)
+  {
+    outSource += line;
+    outSource += '\n';
+  }
+  return true;
 }
 
 // Scene-uniform flag constants (offset 256 in SceneUniformBuffer)
@@ -261,7 +817,20 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   // directional/camera, 2 point, 3 spot), baked like the count so the
   // single-light surface pipelines fold the per-fragment type dispatch.
   int SurfaceLightType = 1;
-  std::map<uint32_t, id<MTLRenderPipelineState>> TriangleSurfacePipelines;
+  // TriangleSurfacePipelines is keyed by (feature mask | light count | light
+  // type) in the low 32 bits and the effective shader library pointer in the
+  // high 32 bits, so actors with different custom shaders (different
+  // vtkShaderProperty replacements) get distinct surface pipelines.
+  std::map<uint64_t, id<MTLRenderPipelineState>> TriangleSurfacePipelines;
+
+  // Custom shader support: the shader library the specialized surface
+  // pipelines are compiled from. Equals the shared library when the current
+  // actor has no shader replacements, or a per-actor library built from
+  // MetalShaders.metal + the actor's substitutions (cached by the render
+  // window keyed on source). Raw pointer, set per-frame in RenderPiece and
+  // consumed by RebuildRenderBundle in the same call; both the render window
+  // and any built pipelines keep it alive.
+  id<MTLLibrary> EffectiveShaderLibrary = nil;
 
   // P5-5A: Actor texture and sampler for texture mapping
   id<MTLTexture> ActorTexture = nil;
@@ -646,6 +1215,10 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     vtkMetalMRC::ReleaseAndNil(PolygonToTrianglePipeline);
     vtkMetalMRC::ReleaseAndNil(PolyLineToLinePipeline);
     vtkMetalMRC::ReleaseAndNil(PolygonEdgesToLinesPipeline);
+
+    // The effective shader library pointer is transient (the render window owns
+    // the libraries); just forget it so a later frame re-resolves it.
+    EffectiveShaderLibrary = nil;
   }
 
   void InvalidateRenderBundle()
@@ -1242,12 +1815,19 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       const uint32_t drawMask = this->Internals->SurfaceFeatureMask |
         (selectorActive ? this->Internals->kSurfaceFeatureEmitIds : 0u);
       // Key must match EnsurePipelineStates: mask in the low bits, light count
-      // in the next 4 bits, first light type in the next 2. The feature mask
-      // uses bits 0-9 (kSurfaceFeatureLightingDisabled = 1 << 9), so the light
-      // key starts at bit 10.
-      const uint32_t drawKey = drawMask |
-        (static_cast<uint32_t>(this->Internals->SurfaceLightCount) << 10) |
-        (static_cast<uint32_t>(this->Internals->SurfaceLightType) << 14);
+      // in the next 4 bits, first light type in the next 2, and the effective
+      // shader library pointer in the high 32 bits (set by EnsurePipelineStates
+      // during this same RenderPiece call). The feature mask uses bits 0-9
+      // (kSurfaceFeatureLightingDisabled = 1 << 9), so the light key starts at
+      // bit 10.
+      const uint64_t drawKey =
+        static_cast<uint64_t>(drawMask |
+          (static_cast<uint32_t>(this->Internals->SurfaceLightCount) << 10) |
+          (static_cast<uint32_t>(this->Internals->SurfaceLightType) << 14)) |
+        (static_cast<uint64_t>(
+           static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
+             this->Internals->EffectiveShaderLibrary)))
+         << 32);
       auto it = this->Internals->TriangleSurfacePipelines.find(drawKey);
       id<MTLRenderPipelineState> triPipeline =
         (it != this->Internals->TriangleSurfacePipelines.end()) ? it->second : nil;
@@ -2453,7 +3033,7 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
 
     if (needSurfacePipelines)
     {
-      this->EnsurePipelineStates((void*)device);
+      this->EnsurePipelineStates((void*)device, act);
     }
 
     if (needPointPipelines)
@@ -5555,7 +6135,7 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
 }
 
 //------------------------------------------------------------------------------
-void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
+void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice, vtkActor* actor)
 {
   // 8A: Use cached sample count (set by RenderPiece before this call)
   int sampleCount = this->Internals->CachedSampleCount > 0 ? this->Internals->CachedSampleCount : 1;
@@ -5576,6 +6156,32 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
     return;
   }
 
+  // Custom shader support: when the actor carries vtkShaderProperty shader
+  // replacements, the specialized surface pipelines are compiled from a
+  // per-actor library built from MetalShaders.metal plus the user's
+  // substitutions (cached by the render window keyed on the source text). The
+  // base triangle/line pipelines below stay on the shared library — custom
+  // replacements only target the surface shaders, which the specialized
+  // pipelines cover.
+  id<MTLLibrary> surfaceLibrary = library;
+  {
+    std::string customSource;
+    if (BuildCustomShaderSource(actor, customSource))
+    {
+      id<MTLLibrary> customLib = (__bridge id<MTLLibrary>)
+        this->Internals->CachedRenderWindow->GetShaderLibraryForSource(customSource);
+      if (customLib)
+      {
+        surfaceLibrary = customLib;
+      }
+      else
+      {
+        vtkWarningMacro(<< "Custom shader library failed to compile; using the shared shader library");
+      }
+    }
+  }
+  this->Internals->EffectiveShaderLibrary = surfaceLibrary;
+
   // Specialized surface pipelines (the "GL way"): one shader source specialized
   // per feature set at pipeline creation via function constants. The current
   // feature mask (computed per-frame in RenderPiece) plus its emit-IDs variant
@@ -5595,11 +6201,17 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
     const uint32_t lightKeyBits =
       (static_cast<uint32_t>(this->Internals->SurfaceLightCount) << 10) |
       (static_cast<uint32_t>(this->Internals->SurfaceLightType) << 14);
+    // The effective shader library pointer rides in the high 32 bits so custom
+    // shader actors get their own surface pipelines (the shared library is the
+    // same pointer for every plain actor, so those entries are unaffected).
+    const uint64_t libKey =
+      static_cast<uint64_t>(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(surfaceLibrary)))
+      << 32;
     const uint32_t masks[2] = { this->Internals->SurfaceFeatureMask,
       this->Internals->SurfaceFeatureMask | this->Internals->kSurfaceFeatureEmitIds };
     for (uint32_t mask : masks)
     {
-      const uint32_t key = mask | lightKeyBits;
+      const uint64_t key = static_cast<uint64_t>(mask | lightKeyBits) | libKey;
       if (this->Internals->TriangleSurfacePipelines.count(key) != 0)
       {
         continue;
@@ -5642,7 +6254,7 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
 
       NSError* error = nil;
       id<MTLFunction> vFunc =
-        [library newFunctionWithName:@(vName) constantValues:consts error:&error];
+        [surfaceLibrary newFunctionWithName:@(vName) constantValues:consts error:&error];
       if (!vFunc)
       {
         vtkErrorMacro(<< "Specialized surface vertex function: "
@@ -5651,7 +6263,7 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice)
         continue;
       }
       id<MTLFunction> fFunc =
-        [library newFunctionWithName:@(fName) constantValues:consts error:&error];
+        [surfaceLibrary newFunctionWithName:@(fName) constantValues:consts error:&error];
       [consts release];
       if (!fFunc)
       {

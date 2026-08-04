@@ -17,7 +17,7 @@ Two test surfaces exist:
    registers the same ~175 tests once per backend and was wired up for Metal
       through    object-factory overrides (`--vtk-factory-prefer
         RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
-         crash)**. Current working-tree status: **150 pass / 25 fail (0 crash)** —
+         crash)**. Current working-tree status: **151 pass / 24 fail (0 crash)** —
       the last crash class, `vtkLabeledContourMapper`, is fixed by the
       `vtkMetalLabeledContourMapper` override (see the labeled-contour-mapper
       section below); the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
@@ -403,6 +403,16 @@ pick-check + 3 non-image fails, no new failures). The regression check against
 the documented passing cluster reports none. The temporary `TestTilingDebug`
 debug harness used to diagnose the bar was removed (its CMakeLists entry and the
 source file), restoring the suite to 175 tests.
+Run after the custom-shader support fix (this run, 2026-08-04): 151 Passed /
+24 Failed / 0 aborted out of 175 (analyzed with `analyze_metal_ctest_log.py` from
+a single `ctest -R "RenderingCoreCxx-Metal" -j 8` run; failures exported with
+`export_image_compare.sh`) — `TestCompositePolyDataMapperCustomShader` now passes
+(the first shader-replacement test to pass on Metal; was a gross 0.2897 image
+fail), via the `vtkShaderProperty` replacement mechanism and GLSL→MSL shim
+described in the custom-shader section below (TIGHT_VALID 1.18e-06). The +1 pass delta over the previous
+run is exactly that test; the failure set is otherwise unchanged (20 image-compare
++ 1 below-threshold pick-check + 3 non-image fails, no new failures). The
+regression check against the documented passing cluster reports none.
 
 ### The labeled-contour-mapper cluster is fixed
 
@@ -479,6 +489,70 @@ draws exactly its visible slice of the overlay. `TestTilingCxx` passes at
 ImageError 0; the scalar bar body renders as a single continuous run at
 x373-407/y39-291 matching the GL baseline. The 2D actor/image-mapper cluster
 (`TestActor2D`, `TestActor2DTextures`, `TestImageMapper_1..4`) still passes.
+
+### The `vtkShaderProperty` replacement mechanism and GLSL→MSL shim
+
+`TestCompositePolyDataMapperCustomShader` — the multi-backend shader-replacement
+test that injects four GLSL replacements into the vertex/fragment shaders via
+`vtkShaderProperty` to color the sphere by `abs(modelNormal)` — failed at a gross
+0.2897 (systematically ~30% darker than the GL baseline). It was the last
+remaining shader-replacement test, and the Metal backend had no mechanism at all
+for `vtkShaderProperty` replacements: the GL shaders are templates with
+`//VTK::Token` markers that `vtkOpenGLShaderProperty`'s `GetShaderReplacements`
+lets the user substitute, while the Metal shaders are precompiled `id<MTLLibrary>`
+objects from `MetalShaders.metal` that nothing could specialize per-actor.
+
+The Metal implementation (`vtkMetalPolyDataMapper.mm`) now:
+
+- **Substitution engine.** `BuildCustomShaderSource(actor, outSource)` reads the
+  actor's replacements through the abstract `vtkShaderProperty` API
+  (`GetNumberOfShaderReplacements`, `GetNthShaderReplacement`,
+  `GetNthShaderReplacementTypeAsString`), and — when any exist — re-emits the
+  shared `MetalShaders.metal` source with the replacements applied in scope.
+  `ComputeLineScopes` classifies every line (TopLevel/Vertex/Fragment/Other) via
+  `vertex`/`fragment` function-header detection plus `// VTK-METAL-SCOPE:`
+  markers, so `//VTK::Normal::Dec` (a struct member, top-level) and
+  `//VTK::Normal::Impl` (one instance in `vertex_main`, one in
+  `evaluateSurfaceFragment`) are each replaced in the right places.
+- **Per-actor pipeline specialization.** `vtkMetalPolyDataMapper::EnsurePipelineStates`
+  now takes the `vtkActor`; when the actor has replacements it compiles the
+  substituted source through `vtkMetalRenderWindow::GetShaderLibraryForSource`
+  (new; compiles + caches `id<MTLLibrary>` keyed on the full source string, owned
+  by the window and released in `Finalize()`) and builds the specialized surface
+  pipelines from that library. The surface-pipeline cache key widened to
+  `uint64_t`: the low 32 bits are the existing feature mask, the high 32 bits are
+  the effective library pointer, so a custom-shader actor and a plain actor on
+  the same mapper never alias each other's pipeline.
+- **Bounded GLSL→MSL shim.** The injected replacement text is GLSL written for
+  the GL template, so it must be translated before it can compile as MSL.
+  `TranslateGlslToMsl` handles the scope it is injected into: top-level `out`/`in`
+  varying declarations become plain `floatN` members, vertex-body code rewrites
+  the tracked varyings to `out.X` and `normalMC` to `in.normal`, fragment-body
+  code rewrites them to `in.X` and `diffuseColor` to `r.diffuse`, and the GLSL
+  type names map to MSL (`vec4`→`float4`, `mat4`→`float4x4`, ...). It is a
+  lexical translator for the bounded class of replacements the shared tests use,
+  not a general GLSL compiler.
+- **Diffuse-intensity parity.** GL declares `vec3 diffuseColor =
+  diffuseIntensity * diffuseColorUniform` and lets the user's replacement
+  overwrite that value, so a custom `diffuseColor = X` REPLACES the
+  intensity-scaled color and the final GL output uses `X` directly. MSL applies
+  the intensity at the end (`m.diffuseColor.w * totalDiffuse`), which would have
+  darkened every custom diffuse by the property's `SetDiffuse` coefficient
+  (0.7 here — the observed metric). The shim therefore rewrites a fragment
+  `diffuseColor = X;` to `r.diffuse = X / m.diffuseColor.w;`, cancelling the
+  end-of-pipeline intensity exactly like GL's override does.
+
+`TestCompositePolyDataMapperCustomShader` now passes at TIGHT_VALID 1.18e-06
+(was 0.0758 before the intensity-parity fix, gross 0.2897 before the mechanism
+existed). Base rendering is untouched: an actor with no replacements returns early
+from `BuildCustomShaderSource`, so the shared-library pipelines are selected
+exactly as before; the full suite re-ran at 151 pass / 24 fail / 0 aborted with
+the failure set otherwise unchanged and no regression against the documented
+passing cluster. Known limits (beyond the shim's lexical scope): the single
+`evaluateSurfaceFragment` is shared by multiple fragment entry points, so a
+fragment replacement changes all surface pipelines uniformly (GL can substitute
+per-shader-source), and the shim only translates the GLSL idioms the shared
+tests exercise.
 
 ### The sibling translucent/volume passes are tile-aware (follow-up, same run)
 

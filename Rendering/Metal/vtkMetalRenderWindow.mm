@@ -163,6 +163,36 @@ void* vtkMetalRenderWindow::GetSharedShaderLibrary()
 }
 
 //------------------------------------------------------------------------------
+void* vtkMetalRenderWindow::GetShaderLibraryForSource(const std::string& source)
+{
+  auto it = this->CustomShaderLibraries.find(source);
+  if (it != this->CustomShaderLibraries.end())
+  {
+    return it->second;
+  }
+
+  id<MTLDevice> device = (id<MTLDevice>)this->MetalDevice;
+  if (!device)
+  {
+    vtkErrorMacro(<< "Cannot compile custom shader library: Metal device is null");
+    return nullptr;
+  }
+
+  NSError* error = nil;
+  NSString* nsSource = [NSString stringWithUTF8String:source.c_str()];
+  id<MTLLibrary> lib = [device newLibraryWithSource:nsSource options:nil error:&error];
+  if (!lib)
+  {
+    vtkErrorMacro(<< "Failed to compile custom shader library: "
+                  << [[error localizedDescription] UTF8String]);
+    return nullptr;
+  }
+
+  this->CustomShaderLibraries[source] = (void*)lib;
+  return (void*)lib;
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalRenderWindow::Finalize()
 {
   this->ReleaseDrawable();
@@ -219,6 +249,12 @@ void vtkMetalRenderWindow::Finalize()
     [(id)this->SharedShaderLibrary release];
     this->SharedShaderLibrary = nullptr;
   }
+
+  for (auto& kv : this->CustomShaderLibraries)
+  {
+    [(id)kv.second release];
+  }
+  this->CustomShaderLibraries.clear();
 
   if (this->MetalLayer)
   {
