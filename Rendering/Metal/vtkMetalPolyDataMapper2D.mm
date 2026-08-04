@@ -44,6 +44,11 @@ struct vtkMetalPolyDataMapper2D::vtkMetalPolyDataMapper2DInternals
   id<MTLRenderPipelineState> LinePipeline = nil;
   id<MTLRenderPipelineState> PointPipeline = nil;
 
+  // Pipeline for lineWidth > 1: each line segment is expanded into a
+  // screen-space quad (4-vertex triangle strip per instance) because Metal
+  // cannot rasterize wide lines natively.
+  id<MTLRenderPipelineState> ThickLinePipeline = nil;
+
   // Pipeline for textured geometry (text): samples the texture bound to the
   // actor's GENERAL_TEXTURE_UNIT and multiplies by the actor's color/opacity.
   id<MTLRenderPipelineState> TexturedPipeline = nil;
@@ -106,6 +111,7 @@ struct vtkMetalPolyDataMapper2D::vtkMetalPolyDataMapper2DInternals
     vtkMetalMRC::ReleaseAndNil(TrianglePipeline);
     vtkMetalMRC::ReleaseAndNil(LinePipeline);
     vtkMetalMRC::ReleaseAndNil(PointPipeline);
+    vtkMetalMRC::ReleaseAndNil(ThickLinePipeline);
     vtkMetalMRC::ReleaseAndNil(TexturedPipeline);
   }
 
@@ -696,11 +702,13 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
       }
 
       id<MTLFunction> vFunc = [library newFunctionWithName:@"vertex_2d_main"];
+      id<MTLFunction> vPointFunc = [library newFunctionWithName:@"vertex_2d_point_main"];
       id<MTLFunction> fFunc = [library newFunctionWithName:@"fragment_2d_main"];
-      if (!vFunc || !fFunc)
+      if (!vFunc || !vPointFunc || !fFunc)
       {
         vtkErrorMacro(<< "Failed to find 2D shader functions");
         [vFunc release];
+        [vPointFunc release];
         [fFunc release];
         return;
       }
@@ -779,7 +787,7 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
       if (!this->Internals->PointPipeline)
       {
         MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
-        desc.vertexFunction = vFunc;
+        desc.vertexFunction = vPointFunc;
         desc.fragmentFunction = fFunc;
         desc.vertexDescriptor = vertexDesc;
         desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -800,8 +808,48 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         [desc release];
       }
 
+      // Thick line pipeline (lineWidth > 1): 4-vertex triangle strip per
+      // segment, expanded in screen space. No vertex descriptor attributes --
+      // the shader reads positions/indices directly via [[vertex_id]] and
+      // [[instance_id]].
+      if (!this->Internals->ThickLinePipeline)
+      {
+        id<MTLFunction> tlVFunc = [library newFunctionWithName:@"vertex_thick_line_2d_main"];
+        id<MTLFunction> tlFFunc = [library newFunctionWithName:@"fragment_thick_line_2d_main"];
+        if (tlVFunc && tlFFunc)
+        {
+          MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+          desc.vertexFunction = tlVFunc;
+          desc.fragmentFunction = tlFFunc;
+          desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+          desc.depthAttachmentPixelFormat = depthFormat;
+          desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+          desc.rasterSampleCount = sampleCount;
+          desc.colorAttachments[0].blendingEnabled = YES;
+          desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+          desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+          desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+          desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+
+          this->Internals->ThickLinePipeline =
+            [device newRenderPipelineStateWithDescriptor:desc error:&error];
+          if (!this->Internals->ThickLinePipeline)
+          {
+            vtkErrorMacro(<< "2D thick line pipeline: " << [[error localizedDescription] UTF8String]);
+          }
+          [desc release];
+        }
+        else
+        {
+          vtkErrorMacro(<< "Failed to find 2D thick line shader functions");
+        }
+        [tlVFunc release];
+        [tlFFunc release];
+      }
+
       [vertexDesc release];
       [vFunc release];
+      [vPointFunc release];
       [fFunc release];
     }
 
@@ -943,22 +991,51 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
 
     // Draw lines using index buffer
     if (this->Internals->HasLines &&
-        this->Internals->LinePipeline &&
         this->Internals->LineIndexBuffer &&
         this->Internals->LineIndexCount > 0)
     {
-      [encoder setRenderPipelineState:this->Internals->LinePipeline];
-      [encoder setFragmentBuffer:(this->Internals->LineCellColorBuffer
-            ? (id<MTLBuffer>)this->Internals->LineCellColorBuffer
-            : (id<MTLBuffer>)this->Internals->ColorBuffer)
-        offset:0
-        atIndex:1];
+      const bool useThickLines =
+        state.lineWidth > 1.0f && this->Internals->ThickLinePipeline;
+      if (useThickLines)
+      {
+        // Metal cannot rasterize wide lines, so each segment is drawn as a
+        // screen-space quad (triangle strip, 4 vertices per instance).
+        [encoder setRenderPipelineState:this->Internals->ThickLinePipeline];
+        [encoder setVertexBuffer:this->Internals->LineIndexBuffer offset:0 atIndex:1];
+        [encoder setVertexBuffer:this->Internals->StateBuffer offset:0 atIndex:2];
+        [encoder setVertexBuffer:this->Internals->ColorBuffer offset:0 atIndex:3];
+        [encoder setVertexBuffer:(this->Internals->LineCellColorBuffer
+              ? (id<MTLBuffer>)this->Internals->LineCellColorBuffer
+              : (id<MTLBuffer>)this->Internals->ColorBuffer)
+          offset:0
+          atIndex:4];
 
-      [encoder drawIndexedPrimitives:MTLPrimitiveTypeLine
-                          indexCount:this->Internals->LineIndexCount
-                           indexType:MTLIndexTypeUInt32
-                         indexBuffer:this->Internals->LineIndexBuffer
-                   indexBufferOffset:0];
+        const NSUInteger segmentCount = this->Internals->LineIndexCount / 2;
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
+                    vertexStart:0
+                    vertexCount:4
+                  instanceCount:segmentCount];
+
+        // Restore the plain-pipeline vertex bindings (state at index 1, color
+        // attribute at index 2) for the point draw below.
+        [encoder setVertexBuffer:this->Internals->StateBuffer offset:0 atIndex:1];
+        [encoder setVertexBuffer:this->Internals->ColorBuffer offset:0 atIndex:2];
+      }
+      else if (this->Internals->LinePipeline)
+      {
+        [encoder setRenderPipelineState:this->Internals->LinePipeline];
+        [encoder setFragmentBuffer:(this->Internals->LineCellColorBuffer
+              ? (id<MTLBuffer>)this->Internals->LineCellColorBuffer
+              : (id<MTLBuffer>)this->Internals->ColorBuffer)
+          offset:0
+          atIndex:1];
+
+        [encoder drawIndexedPrimitives:MTLPrimitiveTypeLine
+                            indexCount:this->Internals->LineIndexCount
+                             indexType:MTLIndexTypeUInt32
+                           indexBuffer:this->Internals->LineIndexBuffer
+                     indexBufferOffset:0];
+      }
     }
 
     // Draw points using index buffer

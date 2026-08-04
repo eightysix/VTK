@@ -17,7 +17,7 @@ Two test surfaces exist:
    registers the same ~175 tests once per backend and was wired up for Metal
       through    object-factory overrides (`--vtk-factory-prefer
         RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
-         crash)**. Current working-tree status: **142 pass / 33 fail (0 crash)** —
+         crash)**. Current working-tree status: **149 pass / 26 fail (0 crash)** —
       the last crash class, `vtkLabeledContourMapper`, is fixed by the
       `vtkMetalLabeledContourMapper` override (see the labeled-contour-mapper
       section below); the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
@@ -163,7 +163,7 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  145 Passed  30 Failed (incl. image/pick fails)  0 "Subprocess aborted"
+175 tests:  149 Passed  26 Failed (incl. image/pick fails)  0 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
@@ -373,6 +373,23 @@ eye-pass presents are suppressed for CPU-composited stereo (see the
 stereo-composite write-back section below). The +3 pass delta over the previous
 run is exactly those three tests; the failure set is otherwise unchanged (26
 image-compare + 1 below-threshold pick-check + 3 non-image fails, no new
+failures). The regression check against the documented passing cluster reports
+none.
+Run after the 2D poly-data-mapper line-width/point-size fix (this run, 2026-08-04):
+149 Passed / 26 Failed / 0 aborted out of 175 (analyzed with
+`analyze_metal_ctest_log.py` from a single `ctest -R "RenderingCoreCxx-Metal" -j 8`
+run; failures exported with `export_image_compare.sh`) — the full
+`TestPolyDataMapper2D` family now passes for the first time:
+`TestPolyDataMapper2D` (was a 0.0664 near-miss fail) and the point-scalar /
+cell-scalar variants (were 0.2861/0.2943 mid-bucket fails) all pass at TIGHT_VALID
+0: the Metal 2D shaders now emit `[[point_size]]` from the actor's point size and
+render `lineWidth > 1` as screen-space quads instead of always drawing 1px
+lines/points (see the 2D overlay line-width and point-size section below).
+`TestColorByStringArrayDefaultLookupTable2D` (was a 0.4821 mid-bucket fail) also
+left the failure set — fixed by the 2D scalar-color mapping commit `bd68ee20b2`,
+whose effect this run documents for the first time. The +4 pass delta over the
+previous run is exactly those four tests; the failure set is otherwise unchanged
+(22 image-compare + 1 below-threshold pick-check + 3 non-image fails, no new
 failures). The regression check against the documented passing cluster reports
 none.
 
@@ -820,7 +837,7 @@ failures.
 
 ### Image-compare failures
 
-Current run (2026-08-04, stereo-composite write-back fix): 30 failed = 26
+Current run (2026-08-04, 2D line-width/point-size fix): 26 failed = 22
 image-compare (TIGHT_VALID >= 0.05) + 1 below-threshold pick-check + 3 non-image
 + 0 aborts.
 Buckets by
@@ -828,8 +845,8 @@ max `vtkTesting` TIGHT_VALID error per test (threshold 0.05):
 
 | Bucket | Range | Count | Examples |
 |--------|-------|-------|----------|
-| near-miss | 0.05 – 0.1 | 6 | `TestRenderLinesAsTubesOrthoCamera` 0.0535, `TestRenderLinesAsTubes` 0.0535, `TestPolyDataMapper2D` 0.0664, `TestEdgeFlags` 0.0681, `TestLineRenderingTranslucent` 0.0790, `TestGlyph3DMapperPicking` 0.0800 |
-| mid | 0.1 – 0.5 | 20 | `TestMixedGeometryCellScalars` 0.1373, `TestCompositePolyDataMapperSpheres` 0.1499, `TestPolyDataMapperClipPlanes` 0.1526, `TestTransformCoordinateUseDouble` 0.1635, `TestCompositePolyDataMapperPicking` 0.1712, `TestTilingCxx` 0.2054, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.2241, `TestCoincident` 0.2343, `TestCompositePolyDataMapperPartialFieldData` 0.2560, `TestGlyph3DMapperBackfaceColor` 0.2657, `TestPolyDataMapperNormals` 0.2698, `TestPolyDataMapper2DPointScalarColorMapping` 0.2861, `TestCompositePolyDataMapperVertices` 0.2891, `TestCompositePolyDataMapperCustomShader` 0.2897, `TestPolyDataMapper2DCellScalarColorMapping` 0.2943, `TestResetCameraScreenSpace` 0.3438, `TestCompositePolyDataMapperCameraShiftScale` 0.3601, `TestResizingWindowToImageFilter` 0.4130, `TestGlyph3DMapperPointSize` 0.4599, `TestColorByStringArrayDefaultLookupTable2D` 0.4821 |
+| near-miss | 0.05 – 0.1 | 5 | `TestRenderLinesAsTubesOrthoCamera` 0.0535, `TestRenderLinesAsTubes` 0.0535, `TestEdgeFlags` 0.0681, `TestLineRenderingTranslucent` 0.0790, `TestGlyph3DMapperPicking` 0.0800 |
+| mid | 0.1 – 0.5 | 17 | `TestMixedGeometryCellScalars` 0.1373, `TestCompositePolyDataMapperSpheres` 0.1499, `TestPolyDataMapperClipPlanes` 0.1526, `TestTransformCoordinateUseDouble` 0.1635, `TestCompositePolyDataMapperPicking` 0.1712, `TestTilingCxx` 0.2195, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.2241, `TestCoincident` 0.2343, `TestCompositePolyDataMapperPartialFieldData` 0.2583, `TestGlyph3DMapperBackfaceColor` 0.2657, `TestPolyDataMapperNormals` 0.2698, `TestCompositePolyDataMapperVertices` 0.2891, `TestCompositePolyDataMapperCustomShader` 0.2897, `TestResetCameraScreenSpace` 0.3438, `TestCompositePolyDataMapperCameraShiftScale` 0.3601, `TestResizingWindowToImageFilter` 0.4130, `TestGlyph3DMapperPointSize` 0.4599 |
 | gross | >= 0.5 | 0 | — |
 
 (`TestNActors{OneMapper,NMappersOneInput}` left the mid bucket via the
@@ -880,7 +897,13 @@ tiled-viewport/gradient-background section below — the first time any have pas
 (mid 0.2584) all left via the stereo-composite write-back section below — the
 first time any have passed (OffAxisStereo now ~2.9e-03). The +3 pass delta is
 exactly the three stereo tests, and the regression check against the
-previously-passing cluster is clean.
+previously-passing cluster is clean.) This run the near-miss bucket dropped from 6
+to 5 and mid from 20 to 17: `TestPolyDataMapper2D` (near-miss 0.0664) and its
+point-scalar / cell-scalar variants (mid 0.2861/0.2943) left via the 2D overlay
+line-width and point-size section below — the first time any of the three have
+passed (all at TIGHT_VALID 0) — and `TestColorByStringArrayDefaultLookupTable2D`
+(mid 0.4821) left via the 2D scalar-color mapping commit `bd68ee20b2`. The +4 pass
+delta is exactly those four tests.
 
 ### Crashes (3; all pre-existing classes, none from the texture or composite clusters)
 
@@ -936,12 +959,55 @@ poly-data/glyph/image/volume mapper PSOs), the clamp applies everywhere.
   `ReadColorCopyData` emits rows bottom-up, so the flip inverted the quad. It is
   removed, matching the OpenGL matrix exactly.
 
-Remaining 2D fidelity gaps (all pre-existing, now documented values): the 2D
-vertex shader has no `[[point_size]]` output (`TestPolyDataMapper2D` 0.066) and
-2D scalar color mapping is ignored (`TestPolyDataMapper2D{Point,Cell}
-ScalarColorMapping` 0.286/0.294). The textured-2D gap is closed by the
-2D overlay depth-ordering and text-texture section below
+Remaining 2D fidelity gaps (all pre-existing, now documented values): 2D scalar
+color mapping (`TestPolyDataMapper2D{Point,Cell}ScalarColorMapping` 0.286/0.294)
+and 2D line width/point size (`TestPolyDataMapper2D` 0.066) were both closed
+after this section was written — the first by the scalar-color commit `bd68ee20b2`
+and the second by the 2D overlay line-width and point-size section below, so the
+whole `TestPolyDataMapper2D` family now passes. The textured-2D gap is closed by
+the 2D overlay depth-ordering and text-texture section below
 (`TestActor2DTextures` now passes at 3.9e-08).
+
+### The 2D overlay line-width and point-size is fixed
+
+`TestPolyDataMapper2D` failed at a near-miss 0.0664 (and the scalar variants at
+0.2861/0.2943): the 2D polydata mapper passed the actor's `pointSize`/`lineWidth`
+into the `Mapper2DState` uniform buffer, but the shaders ignored them, so
+`vtkProperty2D::SetPointSize(10)`/`SetLineWidth(10)` had no effect and Metal
+always rasterized 1px lines and points (points fell back to Metal's default 1px
+size because `vertex_2d_main` never wrote `[[point_size]]`). Fixes in
+`Rendering/Metal/Shaders/MetalShaders.metal` + `vtkMetalPolyDataMapper2D.mm`:
+
+- **Point size.** Metal's `[[point_size]]` output is only valid for point
+  topology (a pipeline whose vertex shader outputs it for triangle/line topology
+  is rejected), so the point path uses a dedicated `Vertex2DPointOut` struct and
+  `vertex_2d_point_main`, which emits `point_size = max(state.pointSize, 1.0)`
+  (the same dedicated-struct pattern as the 3D glyph point shaders). The point
+  pipeline now binds `vertex_2d_point_main`.
+- **Line width.** Metal has no native line-width support, so `lineWidth > 1` is
+  drawn as a screen-space quad per segment: a new `ThickLinePipeline` +
+  `vertex_thick_line_2d_main`/`fragment_thick_line_2d_main` expand each segment
+  into a 4-vertex triangle strip per instance (mirroring the 3D mapper's
+  `vertex_thick_line_main`), computing the perpendicular in the 2D mapper's
+  viewport-pixel space and mapping the expanded quad to NDC through the existing
+  WCVC matrix. Colors support all three modes — per-vertex (interpolated along
+  the segment like GL), per-cell (indexed by `instance_id`, aligned with the
+  existing cell-color buffer), and the plain property color. Line segments at
+  `lineWidth <= 1` keep the plain 1px `LinePipeline`. The thick-line draw
+  restores the plain-pipeline vertex bindings afterwards so the point draw reads
+  the correct state buffer.
+- **Selection.** The thick-line path applies whenever `state.lineWidth > 1`,
+  the per-segment instanced draw costs the same 4 vertices per segment as the
+  GL-style approach, and the pipeline/buffer work is cached on the mapper like
+  every other pipeline state, so the non-2D overlay passes (textured text,
+  images, 3D geometry) are unaffected.
+
+The whole `TestPolyDataMapper2D` family now passes at TIGHT_VALID 0 (base +
+point-scalar + cell-scalar variants), the first time any have passed, and the
+related 2D overlay tests (`TestActor2D`, `TestActor2DTextures`,
+`TestImageAndAnnotations`) still pass. The residual 2D overlay text error
+(`TestImageAndAnnotations` ~0.046, glyph-edge AA vs the GL FreeType raster) and
+`TestPickTextActor` (pick check) are unchanged.
 
 ### The 2D overlay depth-ordering and text-texture is fixed
 
@@ -1175,25 +1241,28 @@ against the previously-passing cluster is clean.
 - **Selection/picking** (~3): `TestPointSelection*` and `TestPickTextActor`
   (`TestAreaSelections`, `TestHardwareSelector`, `TestSelectVisiblePoints`,
   `TestWorldPointPicker`, `TestReadPixels`, `TestRemoveActors` now pass — see the
-  selection/read-back cluster sections above). The 5 near-miss image tests
+  selection/read-back cluster sections above). The 4 near-miss image tests
   (`TestEdgeFlags`,
   `TestLineRenderingTranslucent`,
-  `TestGlyph3DMapperPicking`, `RenderNonFinite`, `TestPolyDataMapper2D`)
+  `TestGlyph3DMapperPicking`, `RenderNonFinite`)
   are the next easy-win targets (`TestActorLightingFlag` left via the
-  surface lighting-flag fix above, and `TestImageAndAnnotations` via the
-  overlay depth/texture fix above).
+  surface lighting-flag fix above, `TestImageAndAnnotations` via the
+  overlay depth/texture fix above, and `TestPolyDataMapper2D` via the
+  2D overlay line-width and point-size fix below).
 - **Point rendering** — DONE: the four point tests `TestPointRendering_3/_4` +
   `TestPointRenderingRound_3/_4` plus the vertex-visibility tests
   `TestVertexRendering`, `TestQuadPointRep` and `TestMixedGeometry_3` now pass
   via the point-lighting fix (see the point-rendering section above).
-- **2D overlay / image mapper**: `TestPolyDataMapper2D` (0.066; point size not
-  in the 2D shader) and `TestPolyDataMapper2D{Point,Cell}ScalarColorMapping`
-  (0.286/0.294; 2D scalar colors ignored). `TestActor2D` now passes via the
+- **2D overlay / image mapper**: the full `TestPolyDataMapper2D` family (base +
+  point-scalar + cell-scalar variants) now passes via the 2D overlay line-width
+  and point-size fix below (`[[point_size]]` + screen-space thick-line quads) and
+  the 2D scalar-color mapping commit `bd68ee20b2`. `TestActor2D` now passes via the
   2D-overlay section above, `TestImageMapper_1..4` now pass via the 2D
   image-mapper viewport-WCVC fix (see the 2D image-mapper section above), and
   `TestActor2DTextures` now passes via the 2D overlay depth-ordering and
   text-texture fix (see that section above).
-- **LUT / color mapping** (~1): `TestColorByStringArrayDefaultLookupTable2D` 0.482.
+- **LUT / color mapping** — DONE: `TestColorByStringArrayDefaultLookupTable2D`
+  (0.482) now passes via the 2D scalar-color mapping commit `bd68ee20b2`.
   `TestBareScalarsToColors`, `TestDirectScalarsToColors`, `TestMapVectorsToColors`
   and `TestMapVectorsAsRGBColors` now pass via the 2D image-mapper viewport-WCVC
   fix (all four render `vtkImageMapper` in sub-viewports).
@@ -1310,9 +1379,11 @@ not in the fundamental geometry/lighting/color path.
        multi-source indexing section above; `TestActor2D` now passes — see the
        2D-overlay section above; the sub-viewport `vtkImageMapper` tests
        `TestImageMapper_1..4`, `TestDirectScalarsToColors`, `TestBareScalarsToColors`,
-       `TestMapVectorsAsRGBColors`, `TestMapVectorsToColors` now pass via the 2D
-       image-mapper viewport-WCVC fix above; `TestPolyDataMapper2D` is at 0.066,
-       the closest 2D miss; the textured/stereo backgrounds `TestTexturedBackground`
+        `TestMapVectorsAsRGBColors`, `TestMapVectorsToColors` now pass via the 2D
+        image-mapper viewport-WCVC fix above; the full `TestPolyDataMapper2D`
+        family (base + point-scalar + cell-scalar variants) now passes via the 2D
+        scalar-color commit `bd68ee20b2` and the 2D overlay line-width and
+        point-size fix below; the textured/stereo backgrounds `TestTexturedBackground`
        and `TestStereoBackground{Left,Right}` now pass — see the textured-background
        section above; the CPU-composited stereo tests `TestOffAxisStereo`,
        `TestStereoEyeSeparation`, `TestSplitViewportStereoHorizontal` now pass —
@@ -1421,3 +1492,12 @@ now pass via the ambient-pre-applied edge shader, `TestReadPixels` and
 TIGHT_VALID error per test), analyzed with `analyze_metal_ctest_log.py`.
 Re-running is reproducible except where a crash's signal stack
 ordering varies; the pass count fluctuates run to run.
+
+Current working-tree run (2026-08-04, after the 2D scalar-color mapping commit
+`bd68ee20b2` and the 2D overlay line-width/point-size fix):
+(149 Passed / 26 Failed / 0 aborted — `TestPolyDataMapper2D` and its
+point-scalar / cell-scalar variants now pass via the `[[point_size]]` point
+shader and the screen-space thick-line quad pipeline, and
+`TestColorByStringArrayDefaultLookupTable2D` now passes via the 2D scalar-color
+mapping commit `bd68ee20b2`; the tally above and the buckets below are from this
+run).

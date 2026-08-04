@@ -1640,10 +1640,27 @@ struct Vertex2DIn {
 };
 struct Vertex2DOut { float4 position [[position]]; float4 color; };
 
+// [[point_size]] is only valid for point topology; Metal rejects a pipeline
+// whose vertex shader outputs it for triangle/line topology, so the 2D point
+// path uses a dedicated struct (same pattern as the 3D glyph point shaders).
+struct Vertex2DPointOut {
+  float4 position [[position]];
+  float4 color;
+  float point_size [[point_size]];
+};
+
 vertex Vertex2DOut vertex_2d_main(Vertex2DIn in [[stage_in]], constant Mapper2DState& state [[buffer(1)]]) {
   Vertex2DOut out;
   out.position = state.wcvcMatrix * float4(in.position, 0.0, 1.0);
   out.color = (state.flags & kFlagUseVertexColors) != 0u ? in.color : state.color;
+  return out;
+}
+
+vertex Vertex2DPointOut vertex_2d_point_main(Vertex2DIn in [[stage_in]], constant Mapper2DState& state [[buffer(1)]]) {
+  Vertex2DPointOut out;
+  out.position = state.wcvcMatrix * float4(in.position, 0.0, 1.0);
+  out.color = (state.flags & kFlagUseVertexColors) != 0u ? in.color : state.color;
+  out.point_size = max(state.pointSize, 1.0);
   return out;
 }
 
@@ -1654,6 +1671,64 @@ fragment float4 fragment_2d_main(Vertex2DOut in [[stage_in]],
   if ((state.flags & kFlagUseCellColors) != 0u) {
     return cellColors[prim_id];
   }
+  return in.color;
+}
+
+// ---------------------------------------------------------------------------
+// Thick 2D lines. Metal has no line-width support, so lineWidth > 1 is drawn
+// as a screen-space quad per segment (triangle strip of 4 vertices per
+// instance), mirroring the 3D mapper's vertex_thick_line_main. The 2D mapper's
+// positions are already in viewport pixels, so the expansion happens directly
+// in pixel space and the wcvc matrix maps the expanded quad to NDC.
+//
+// Buffer layout (vertex):
+//   buffer(0): packed float2 positions (viewport pixels)
+//   buffer(1): line index buffer (uint pairs, one pair per segment/instance)
+//   buffer(2): Mapper2DState
+//   buffer(3): per-vertex float4 colors
+//   buffer(4): per-segment float4 cell colors (when cell scalars are active)
+// ---------------------------------------------------------------------------
+vertex Vertex2DOut vertex_thick_line_2d_main(
+    uint vertex_id [[vertex_id]],
+    uint instance_id [[instance_id]],
+    constant float2* positions [[buffer(0)]],
+    constant uint* lineIndices [[buffer(1)]],
+    constant Mapper2DState& state [[buffer(2)]],
+    constant float4* vertexColors [[buffer(3)]],
+    constant float4* cellColors [[buffer(4)]]) {
+  const float2 tri_verts[4] = { float2(-1, -1), float2(1, -1), float2(-1, 1), float2(1, 1) };
+  float2 p_coord = tri_verts[vertex_id];
+
+  uint p0_idx = lineIndices[instance_id * 2];
+  uint p1_idx = lineIndices[instance_id * 2 + 1];
+  float2 p0_pix = positions[p0_idx];
+  float2 p1_pix = positions[p1_idx];
+
+  float2 delta = p1_pix - p0_pix;
+  float segLen = length(delta);
+  float2 x_basis = segLen < 0.001 ? float2(1.0, 0.0) : (delta / segLen);
+  float2 y_basis = float2(-x_basis.y, x_basis.x);
+
+  float t = (p_coord.x + 1.0) * 0.5;
+  float side = p_coord.y;
+  float halfW = max(state.lineWidth, 1.0) * 0.5;
+
+  float2 center = mix(p0_pix, p1_pix, t);
+  float2 p = center + side * y_basis * halfW;
+
+  Vertex2DOut out;
+  out.position = state.wcvcMatrix * float4(p, 0.0, 1.0);
+  if ((state.flags & kFlagUseCellColors) != 0u) {
+    out.color = cellColors[instance_id];
+  } else if ((state.flags & kFlagUseVertexColors) != 0u) {
+    out.color = mix(vertexColors[p0_idx], vertexColors[p1_idx], t);
+  } else {
+    out.color = state.color;
+  }
+  return out;
+}
+
+fragment float4 fragment_thick_line_2d_main(Vertex2DOut in [[stage_in]]) {
   return in.color;
 }
 
