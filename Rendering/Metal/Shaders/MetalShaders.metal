@@ -731,14 +731,17 @@ inline FragmentColorAndIds evaluateSurfaceFragment(VertexOut in,
   // where ambientColor = ambientIntensity*ambientColorUniform and diffuseColor
   // = diffuseIntensity*diffuseColorUniform. Skip the Phong loop and output the
   // ambient/diffuse material terms (which carry the vertex color) — exactly the
-  // pre-applied-intensity form used by the lit path.
-  if (!unlit)
+  // pre-applied-intensity form used by the lit path. A light-less renderer is
+  // also NoLighting in GL (complexity 0), so lights.lightCount == 0 takes the
+  // same flat path.
+  const bool flat = unlit || lights.lightCount == 0;
+  if (!flat)
   {
     computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, kLightCount, kLightType, lights, totalDiffuse, totalSpecular);
   }
 
   FragmentColorAndIds out;
-  float3 finalColor = unlit
+  float3 finalColor = flat
     ? (totalAmbient + m.diffuseColor.w * r.diffuse)
     : (totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular);
   out.color = float4(finalColor, r.opacity);
@@ -933,12 +936,13 @@ fragment OITAccumulateOutput fragment_main_line_oit(VertexOut in [[stage_in]],
   float3 totalSpecular = float3(0.0);
 
   const bool unlit = (scene.flags & kSceneFlagLinesUnlit) != 0u;
-  if (!unlit)
+  const bool flat = unlit || lights.lightCount == 0;
+  if (!flat)
   {
     computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
   }
 
-  float3 litRGB = unlit
+  float3 litRGB = flat
     ? (totalAmbient + m.diffuseColor.w * r.diffuse)
     : (totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular);
   float opacity = r.opacity;
@@ -1000,14 +1004,16 @@ fragment OITAccumulateOutput fragment_main_oit(VertexOut in [[stage_in]],
   float3 totalSpecular = float3(0.0);
 
   // Property lighting disabled (vtkProperty::SetLighting(false)): emit the flat
-  // ambient/diffuse material color like GL's NoLighting path.
+  // ambient/diffuse material color like GL's NoLighting path. A light-less
+  // renderer is also NoLighting in GL (complexity 0).
   const bool unlit = (scene.flags & kSceneFlagLightingDisabled) != 0u;
-  if (!unlit)
+  const bool flat = unlit || lights.lightCount == 0;
+  if (!flat)
   {
     computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
   }
 
-  float3 litRGB = unlit
+  float3 litRGB = flat
     ? (totalAmbient + m.diffuseColor.w * r.diffuse)
     : (totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular);
   float opacity = r.opacity;
@@ -1049,6 +1055,7 @@ struct PointVertexOut {
   float3 tangent;
   float2 uv;
   float2 lut_uv;
+  float3 modelPos;
   uint cellId;
   uint propId;
   uint compositeIndex;
@@ -1078,6 +1085,7 @@ vertex PointVertexOut vertex_point_main(
   out.tangent = scene.normalMatrix * float3(point_tangents[vertex_id]);
   out.uv = point_uvs[vertex_id];
   out.lut_uv = point_color_uvs[vertex_id];
+  out.modelPos = pos;
   out.cellId = pointCellIds[vertex_id];
   out.propId = mapPropId(pickIds.propId);
   out.compositeIndex = pickIds.compositeIndex;
@@ -1089,7 +1097,9 @@ fragment FragmentOutput fragment_point_main(PointVertexOut in [[stage_in]],
                                     constant LightUniforms& lights [[buffer(1)]],
                                     constant SceneUniforms& scene [[buffer(2)]],
                                     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
-                                    constant VertexColorUniforms& vertexColorUniform [[buffer(4)]]) {
+                                    constant VertexColorUniforms& vertexColorUniform [[buffer(4)]],
+                                    constant ClipPlaneUniforms& clipPlanes [[buffer(5)]]) {
+  if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
   float3 N = normalize(in.viewNormal);
 
   bool showVertices = (scene.flags & kSceneFlagVertexVisibility) != 0u;
@@ -1120,19 +1130,21 @@ fragment FragmentOutput fragment_point_main(PointVertexOut in [[stage_in]],
   }
 
   // Property lighting disabled (vtkProperty::SetLighting(false)): emit the flat
-  // vertex color like GL's NoLighting path.
+  // vertex color like GL's NoLighting path. A light-less renderer is also
+  // NoLighting in GL (complexity 0).
   const bool unlit = (scene.flags & kSceneFlagLightingDisabled) != 0u;
+  const bool flat = unlit || lights.lightCount == 0;
   float3 totalAmbient = material.ambientColor.w * ambientBase;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
-  if (!unlit)
+  if (!flat)
   {
     computePhongLighting(N, in.viewPos, diffuseBase, material.specularColor.rgb, material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
   }
 
   FragmentOutput out;
-  out.color = float4(unlit
+  out.color = float4(flat
     ? (totalAmbient + material.diffuseColor.w * diffuseBase)
     : (totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular), baseAlpha * material.opacity);
   out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
@@ -1152,6 +1164,7 @@ struct PointShapedVertexOut {
   float3 tangent;
   float2 uv;
   float2 lut_uv;
+  float3 modelPos;
   uint cellId;
   uint propId;
   uint compositeIndex;
@@ -1193,6 +1206,7 @@ vertex PointShapedVertexOut vertex_point_shaped_main(
   out.tangent = scene.normalMatrix * float3(point_tangents[point_id]);
   out.uv = point_uvs[point_id];
   out.lut_uv = point_color_uvs[point_id];
+  out.modelPos = pos;
   out.cellId = shapedCellIds[point_id];
   out.propId = mapPropId(pickIds.propId);
   out.compositeIndex = pickIds.compositeIndex;
@@ -1205,8 +1219,11 @@ fragment FragmentOutput fragment_point_shaped_main(
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
-    constant VertexColorUniforms& vertexColorUniform [[buffer(4)]]) {
+    constant VertexColorUniforms& vertexColorUniform [[buffer(4)]],
+    constant ClipPlaneUniforms& clipPlanes [[buffer(5)]]) {
   FragmentOutput out;
+
+  if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
 
   float d = length(in.p_coord);
   bool drawSpheres = (scene.flags & (1u << 5)) != 0u;
@@ -1258,18 +1275,20 @@ fragment FragmentOutput fragment_point_shaped_main(
   }
 
   // Property lighting disabled (vtkProperty::SetLighting(false)): emit the flat
-  // vertex color like GL's NoLighting path.
+  // vertex color like GL's NoLighting path. A light-less renderer is also
+  // NoLighting in GL (complexity 0).
   const bool unlit = (scene.flags & kSceneFlagLightingDisabled) != 0u;
+  const bool flat = unlit || lights.lightCount == 0;
   float3 totalAmbient = material.ambientColor.w * ambientBase;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
-  if (!unlit)
+  if (!flat)
   {
     computePhongLighting(N, in.viewPos, diffuseBase, material.specularColor.rgb, material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
   }
 
-  out.color = float4(unlit
+  out.color = float4(flat
     ? (totalAmbient + material.diffuseColor.w * diffuseBase)
     : (totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular), baseAlpha * material.opacity);
   out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
@@ -1287,6 +1306,7 @@ struct LineVertexOut {
   float4 vertexColor;
   float dist_to_centerline;
   float lineHalfW;
+  float3 modelPos;
   uint cellId;
   uint propId;
   uint compositeIndex;
@@ -1304,9 +1324,11 @@ inline FragmentOutput shadeLineFragment(LineVertexOut in,
     constant MaterialUniforms& material,
     constant LightUniforms& lights,
     constant CoincidentOffsetUniforms& coinOffset,
-    constant SceneUniforms& scene)
+    constant SceneUniforms& scene,
+    constant ClipPlaneUniforms& clipPlanes)
 {
   FragmentOutput out;
+  if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
   float3 baseColor = in.vertexColor.rgb;
   float baseAlpha = in.vertexColor.a * material.opacity;
 
@@ -1315,8 +1337,10 @@ inline FragmentOutput shadeLineFragment(LineVertexOut in,
   // ambient+diffuse material color, matching vtkGLSLModLight's complexity-0
   // path. This is a compile-time branch via kLightingDisabled (GL bakes the
   // complexity into a NoLighting shader), so the unlit pipeline variant drops
-  // the Phong loop entirely.
-  if (!kLightingDisabled)
+  // the Phong loop entirely. A light-less renderer (lights.lightCount == 0) is
+  // also complexity-0 in GL and must emit the same flat color.
+  const bool flat = kLightingDisabled || lights.lightCount == 0;
+  if (!flat)
   {
     // Wide lines emulate GL's native glLineWidth rendering with a flat
     // view-facing normal (uniform lighting across the width). With
@@ -1343,7 +1367,7 @@ inline FragmentOutput shadeLineFragment(LineVertexOut in,
   }
 
   out.color = float4(material.ambientColor.w * baseColor
-                   + material.diffuseColor.w * (kLightingDisabled ? baseColor : totalDiffuse) + totalSpecular, baseAlpha);
+                   + material.diffuseColor.w * (flat ? baseColor : totalDiffuse) + totalSpecular, baseAlpha);
   out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
   float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
   out.depth = in.position.z + coinOffset.lineFactor * cscale + coinOffset.lineOffset / 65000.0;
@@ -1402,6 +1426,7 @@ vertex LineVertexOut vertex_thick_line_main(
   out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], t);
   out.dist_to_centerline = side;
   out.lineHalfW = halfW;
+  out.modelPos = mix(p0_MC, p1_MC, t);
   out.cellId = cellIds[instance_id];
   out.propId = mapPropId(pickIds.propId);
   out.compositeIndex = pickIds.compositeIndex;
@@ -1413,8 +1438,9 @@ fragment FragmentOutput fragment_thick_line_main(
     constant MaterialUniforms& material [[buffer(0)]],
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
-    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
-  return shadeLineFragment(in, material, lights, coinOffset, scene);
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+    constant ClipPlaneUniforms& clipPlanes [[buffer(5)]]) {
+  return shadeLineFragment(in, material, lights, coinOffset, scene, clipPlanes);
 }
 
 // ---------------------------------------------------------------------------
@@ -1491,6 +1517,7 @@ vertex LineVertexOut vertex_round_cap_line_main(
   out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], p_coord.z);
   out.dist_to_centerline = 2.0 * p_coord.y - 1.0;
   out.lineHalfW = 0.5 * w;
+  out.modelPos = mix(p0_MC, p1_MC, p_coord.z);
   out.cellId = cellIds[instance_id];
   out.propId = mapPropId(pickIds.propId);
   out.compositeIndex = pickIds.compositeIndex;
@@ -1502,8 +1529,9 @@ fragment FragmentOutput fragment_round_cap_line_main(
     constant MaterialUniforms& material [[buffer(0)]],
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
-    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
-  return shadeLineFragment(in, material, lights, coinOffset, scene);
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+    constant ClipPlaneUniforms& clipPlanes [[buffer(5)]]) {
+  return shadeLineFragment(in, material, lights, coinOffset, scene, clipPlanes);
 }
 
 // ---------------------------------------------------------------------------
@@ -1597,6 +1625,7 @@ vertex LineVertexOut vertex_miter_join_line_main(
   out.vertexColor = mix(vertexColors[p0_idx], vertexColors[p1_idx], t);
   out.dist_to_centerline = side;
   out.lineHalfW = halfW;
+  out.modelPos = mix(float3(positions[p0_idx]), float3(positions[p1_idx]), t);
   out.cellId = cellIds[instance_id];
   out.propId = mapPropId(pickIds.propId);
   out.compositeIndex = pickIds.compositeIndex;
@@ -1608,8 +1637,9 @@ fragment FragmentOutput fragment_miter_join_line_main(
     constant MaterialUniforms& material [[buffer(0)]],
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
-    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
-  return shadeLineFragment(in, material, lights, coinOffset, scene);
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+    constant ClipPlaneUniforms& clipPlanes [[buffer(5)]]) {
+  return shadeLineFragment(in, material, lights, coinOffset, scene, clipPlanes);
 }
 
 // OIT accumulate variant of shadeLineFragment: emits the same lit color as the
@@ -1620,13 +1650,18 @@ inline OITAccumulateOutput shadeLineFragmentOIT(LineVertexOut in,
     constant MaterialUniforms& material,
     constant LightUniforms& lights,
     constant CoincidentOffsetUniforms& coinOffset,
-    constant SceneUniforms& scene)
+    constant SceneUniforms& scene,
+    constant ClipPlaneUniforms& clipPlanes)
 {
+  if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
   float3 baseColor = in.vertexColor.rgb;
   float opacity = in.vertexColor.a * material.opacity;
 
   float3 totalDiffuse = float3(0.0), totalSpecular = float3(0.0);
-  if (!kLightingDisabled)
+  // Match shadeLineFragment: property lighting disabled or a light-less renderer
+  // emits the flat ambient+diffuse material color (GL's complexity-0 path).
+  const bool flat = kLightingDisabled || lights.lightCount == 0;
+  if (!flat)
   {
     float3 N;
     if ((scene.flags & kSceneFlagLinesTubeShading) != 0u)
@@ -1648,7 +1683,7 @@ inline OITAccumulateOutput shadeLineFragmentOIT(LineVertexOut in,
   }
 
   float3 litRGB = material.ambientColor.w * baseColor
-                + material.diffuseColor.w * (kLightingDisabled ? baseColor : totalDiffuse) + totalSpecular;
+                + material.diffuseColor.w * (flat ? baseColor : totalDiffuse) + totalSpecular;
 
   OITAccumulateOutput out;
   out.color = float4(litRGB * opacity, opacity);
@@ -1663,8 +1698,9 @@ fragment OITAccumulateOutput fragment_thick_line_main_oit(
     constant MaterialUniforms& material [[buffer(0)]],
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
-    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
-  return shadeLineFragmentOIT(in, material, lights, coinOffset, scene);
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+    constant ClipPlaneUniforms& clipPlanes [[buffer(5)]]) {
+  return shadeLineFragmentOIT(in, material, lights, coinOffset, scene, clipPlanes);
 }
 
 fragment OITAccumulateOutput fragment_round_cap_line_main_oit(
@@ -1672,8 +1708,9 @@ fragment OITAccumulateOutput fragment_round_cap_line_main_oit(
     constant MaterialUniforms& material [[buffer(0)]],
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
-    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
-  return shadeLineFragmentOIT(in, material, lights, coinOffset, scene);
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+    constant ClipPlaneUniforms& clipPlanes [[buffer(5)]]) {
+  return shadeLineFragmentOIT(in, material, lights, coinOffset, scene, clipPlanes);
 }
 
 fragment OITAccumulateOutput fragment_miter_join_line_main_oit(
@@ -1681,8 +1718,9 @@ fragment OITAccumulateOutput fragment_miter_join_line_main_oit(
     constant MaterialUniforms& material [[buffer(0)]],
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
-    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
-  return shadeLineFragmentOIT(in, material, lights, coinOffset, scene);
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+    constant ClipPlaneUniforms& clipPlanes [[buffer(5)]]) {
+  return shadeLineFragmentOIT(in, material, lights, coinOffset, scene, clipPlanes);
 }
 
 // ---------------------------------------------------------------------------
@@ -2252,14 +2290,16 @@ fragment PeelPassOutput fragment_peel(
   float3 totalSpecular = float3(0.0);
 
   // Property lighting disabled (vtkProperty::SetLighting(false)): emit the flat
-  // ambient/diffuse material color like GL's NoLighting path.
+  // ambient/diffuse material color like GL's NoLighting path. A light-less
+  // renderer is also NoLighting in GL (complexity 0).
   const bool unlit = (scene.flags & kSceneFlagLightingDisabled) != 0u;
-  if (!unlit)
+  const bool flat = unlit || lights.lightCount == 0;
+  if (!flat)
   {
     computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
   }
 
-  float3 fragRGB = unlit
+  float3 fragRGB = flat
     ? (totalAmbient + m.diffuseColor.w * r.diffuse)
     : (totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular);
 
@@ -2417,15 +2457,17 @@ inline FragmentOutput shadeGlyphFragment(T in,
   const float3 baseAmbient = (backface && hasBackface) ? m.ambientColor.rgb : in.glyphColor.rgb;
   const float3 baseDiffuse = (backface && hasBackface) ? m.diffuseColor.rgb : in.glyphColor.rgb;
   // Property lighting disabled (vtkProperty::SetLighting(false)): emit the flat
-  // glyph color like GL's NoLighting path.
+  // glyph color like GL's NoLighting path. A light-less renderer is also
+  // NoLighting in GL (complexity 0).
   const bool unlit = (sceneFlags & kSceneFlagLightingDisabled) != 0u;
+  const bool flat = unlit || lights.lightCount == 0;
   float3 totalDiffuse = float3(0.0), totalSpecular = float3(0.0);
-  if (!unlit)
+  if (!flat)
   {
     computePhongLighting(N, in.viewPos, baseDiffuse, m.specularColor.rgb,
         m.specularColor.w, m.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
   }
-  float3 lit = unlit
+  float3 lit = flat
     ? m.diffuseColor.w * baseDiffuse
     : m.diffuseColor.w * totalDiffuse + totalSpecular;
   FragmentOutput out;

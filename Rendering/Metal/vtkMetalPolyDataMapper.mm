@@ -29,6 +29,7 @@
 #include "vtkLight.h"
 #include "vtkLightCollection.h"
 #include "vtkCamera.h"
+#include "vtkMatrix3x3.h"
 #include "vtkMatrix4x4.h"
 #include "vtkTransform.h"
 #include "vtkMath.h"
@@ -2214,6 +2215,10 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       {
         recordFBuf(this->Internals->VertexColorBuffer, 0, 4);
       }
+      if (this->Internals->ClipPlaneBuffer)
+      {
+        recordFBuf(this->Internals->ClipPlaneBuffer, 0, 5);
+      }
       recordDraw(MTLPrimitiveTypePoint, 0, this->Internals->PointVertexCount);
     }
   }
@@ -2289,6 +2294,10 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       {
         recordFBuf(this->Internals->VertexColorBuffer, 0, 4);
       }
+      if (this->Internals->ClipPlaneBuffer)
+      {
+        recordFBuf(this->Internals->ClipPlaneBuffer, 0, 5);
+      }
       recordDraw(MTLPrimitiveTypeTriangleStrip, 0, 4, pointDrawCount);
     }
     else if (this->Internals->PointPipeline)
@@ -2347,6 +2356,10 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       if (this->Internals->VertexColorBuffer)
       {
         recordFBuf(this->Internals->VertexColorBuffer, 0, 4);
+      }
+      if (this->Internals->ClipPlaneBuffer)
+      {
+        recordFBuf(this->Internals->ClipPlaneBuffer, 0, 5);
       }
       recordDraw(MTLPrimitiveTypePoint, 0, pointDrawCount);
     }
@@ -2437,6 +2450,12 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       {
         recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
       }
+      // Thick-line fragment stages test clip planes; the vertex stage uses
+      // slot 5 for cell IDs, so bind only the fragment stage here.
+      if (this->Internals->ClipPlaneBuffer)
+      {
+        recordFBuf(this->Internals->ClipPlaneBuffer, 0, 5);
+      }
       recordCull(MTLCullModeNone);
       recordDraw(MTLPrimitiveTypeTriangleStrip, 0, 36, this->Internals->RoundCapLineSegmentCount);
     }
@@ -2491,6 +2510,12 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       {
         recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
       }
+      // Thick-line fragment stages test clip planes; the vertex stage uses
+      // slot 5 for cell IDs, so bind only the fragment stage here.
+      if (this->Internals->ClipPlaneBuffer)
+      {
+        recordFBuf(this->Internals->ClipPlaneBuffer, 0, 5);
+      }
       recordCull(MTLCullModeNone);
       recordDraw(MTLPrimitiveTypeTriangleStrip, 0, 4, this->Internals->MiterJoinLineSegmentCount);
     }
@@ -2540,6 +2565,12 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       if (this->Internals->CoincidentOffsetBuffer)
       {
         recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+      }
+      // Thick-line fragment stages test clip planes; the vertex stage uses
+      // slot 5 for cell IDs, so bind only the fragment stage here.
+      if (this->Internals->ClipPlaneBuffer)
+      {
+        recordFBuf(this->Internals->ClipPlaneBuffer, 0, 5);
       }
       recordCull(MTLCullModeNone);
       recordDraw(MTLPrimitiveTypeTriangleStrip, 0, 4, this->Internals->ThickLineSegmentCount);
@@ -3285,6 +3316,33 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
           for (int row = 0; row < 4; ++row)
           {
             modelMat[col * 4 + row] = static_cast<float>(actorMatrix->GetElement(row, col));
+          }
+        }
+
+        // Rebuild the view-space normal matrix from the combined view * model
+        // rotation (the camera's cached NormalMatrix only contains the view 3x3).
+        // The cached ViewMatrix is stored transposed (Metal indexes matrices
+        // column-major), so element (row, col) lives at buf[col * 4 + row].
+        vtkNew<vtkMatrix3x3> viewRot;
+        vtkNew<vtkMatrix3x3> modelRot;
+        vtkNew<vtkMatrix3x3> normalMat;
+        const float* viewMat = reinterpret_cast<float*>(buf);
+        for (int r = 0; r < 3; ++r)
+        {
+          for (int c = 0; c < 3; ++c)
+          {
+            viewRot->SetElement(r, c, viewMat[c * 4 + r]);
+            modelRot->SetElement(r, c, actorMatrix->GetElement(r, c));
+          }
+        }
+        vtkMatrix3x3::Multiply3x3(viewRot, modelRot, normalMat);
+        vtkMatrix3x3::Invert(normalMat, normalMat);
+        float* normalMatBuf = reinterpret_cast<float*>(buf + 128);
+        for (int i = 0; i < 3; ++i)
+        {
+          for (int j = 0; j < 3; ++j)
+          {
+            normalMatBuf[i * 4 + j] = static_cast<float>(normalMat->GetElement(i, j));
           }
         }
       }
@@ -8139,30 +8197,12 @@ void vtkMetalPolyDataMapper::UpdateLightUniforms(void* mtlDevice, vtkRenderer* r
   }
 
   lu.lightCount = count;
-
-  if (count == 0)
-  {
-    // Headlight: at camera, type 0
-    lu.lights[0].position[0] = 0.0f;
-    lu.lights[0].position[1] = 0.0f;
-    lu.lights[0].position[2] = 0.0f;
-    lu.lights[0].position[3] = 0.0f;
-    lu.lights[0].direction[0] = 0.0f;
-    lu.lights[0].direction[1] = 0.0f;
-    lu.lights[0].direction[2] = -1.0f;
-    lu.lights[0].direction[3] = 0.0f;
-    lu.lights[0].color[0] = lu.lights[0].color[1] = lu.lights[0].color[2] = 1.0f;
-    lu.lights[0].color[3] = 1.0f;
-    lu.lights[0].attenuation[0] = 1.0f;
-    lu.lights[0].attenuation[1] = 0.0f;
-    lu.lights[0].attenuation[2] = 0.0f;
-    lu.lights[0].attenuation[3] = 0.0f;
-    lu.lightCount = 1;
-  }
   this->Internals->SurfaceLightCount = lu.lightCount;
   // Bake the first light's shader type (position.w carries it: 0 headlight,
-  // 1 directional/camera, 2 point, 3 spot). The count==0 fallback above is a
-  // headlight (position[3] = 0).
+  // 1 directional/camera, 2 point, 3 spot). With no lights the first slot is
+  // zeroed (headlight type), which is irrelevant since the fragments fall back
+  // to flat NoLighting shading when lights.lightCount == 0, matching GL's
+  // complexity-0 shader for light-less renderers.
   this->Internals->SurfaceLightType = (int)lu.lights[0].position[3];
 
   if (!this->Internals->LightUniformBuffer)

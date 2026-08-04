@@ -19,8 +19,8 @@ Two test surfaces exist:
 2. The generic multi-backend suite in `Rendering/Core/Testing/Cxx/`, which
    registers the same ~175 tests once per backend and was wired up for Metal
        through    object-factory overrides (`--vtk-factory-prefer
-              RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
-                crash)**. Current working-tree status: **162 pass / 13 fail (0 crash)** —
+               RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
+                 crash)**. Current working-tree status: **166 pass / 9 fail (0 crash)** —
         `TestGlyph3DMapperCompositeDisplayAttributeInheritance` now passes via the
        composite per-block display-attribute inheritance port in the Metal glyph
        mapper (see the composite display-attribute section below),
@@ -579,6 +579,114 @@ flag is set (see the 2D transform-coordinate double-precision section below). Th
 otherwise unchanged (9 image-compare + 1 below-threshold pick-check + 3
 non-image fails, no new failures). The regression check against the documented
 passing cluster reports none.
+Run after the normal-matrix and line/point clip-plane fixes (this run, 2026-08-04):
+166 Passed / 9 Failed / 0 aborted out of 175 (analyzed with
+`analyze_metal_ctest_log.py` from a single `ctest -R "RenderingCoreCxx-Metal" -j 8`
+run; failures exported with `export_image_compare.sh --no-run`) — four tests now
+pass for the first time: `TestResetCameraScreenSpace` (was a mid 0.3438 image fail
+caused by the view-only shading normal matrix — the actor's RotateZ/RotateX model
+rotation was never folded in, so the cylinder's lit face was mirrored),
+`TestPolyDataMapperClipPlanes` (was a mid 0.1497 image fail caused by the point and
+thick-line fragment shaders never testing the clip planes, so points/polylines/lines
+were never clipped), and `TestRenderLinesAsTubes` /
+`TestRenderLinesAsTubesOrthoCamera` (flat wide-line shading: a light-less renderer
+now emits GL's flat NoLighting green via `lights.lightCount == 0` instead of the
+synthesized-headlight gray). See the normal-matrix and line/point clip-plane
+sections below. The +4 pass delta over the previous run is exactly those four
+tests; the failure set is otherwise unchanged (5 image-compare + 1 below-threshold
+pick-check + 3 non-image fails, no new failures). The regression check against
+the documented passing cluster reports none.
+
+### The normal-matrix fix (`TestResetCameraScreenSpace` now passes)
+
+`TestResetCameraScreenSpace` renders a `vtkCylinderSource` actor rotated by
+`RotateZ(90)` + `RotateX(80)` after `ResetCameraScreenSpace`. It failed image
+comparison at a mid 0.3438: the front hexagon cap and the bright lit face were
+horizontally mirrored vs. the GL baseline (the shading was inverted).
+
+The Metal scene `SceneUniforms.normalMatrix` was built by
+`vtkMetalCamera` as the inverse 3x3 of the *view* matrix only, and the shader
+applies it to model-space normals as `scene.normalMatrix * in.normal`. GL's
+normal matrix is the inverse-transpose of the combined *view × model* rotation
+(`vtkWebGPUCamera` / `vtkWebGPUPolyDataMapper` reference), so any actor with a
+model transform under-rotated its normals — with the test's 80°/90° rotations
+the normal directions (and hence the lit face) flipped.
+
+`vtkMetalPolyDataMapper::RenderPiece` now rebuilds the scene normal matrix
+per-actor: it reconstructs the row-major view 3x3 from the transposed cached
+`ViewMatrix`, multiplies by the actor's `GetModelToWorldMatrix` 3x3, inverts the
+result with `vtkMatrix3x3`, and stores it back into the `NormalMatrix` field
+(offset 128) using the same `[i][j]` row-major storage the camera uses, so the
+MSL `float3x3` column-major read yields `transpose(inverse(view*model))` — the
+exact GL normal matrix. The 3x3 multiply + inverse is a few microseconds per
+actor per frame; all surface/point/line/glyph fragments that already consumed
+`scene.normalMatrix` pick the fix up with no shader change. `TestResetCameraScreenSpace`
+now passes at TIGHT_VALID 0 (pixel-perfect); actors with identity model matrices
+are bit-identical to before.
+
+### The line/point clip-plane fix (`TestPolyDataMapperClipPlanes` now passes)
+
+`TestPolyDataMapperClipPlanes` appends polylines, a polygon, a line, points and a
+cone with per-cell direct colors and clips with two planes. It failed image
+comparison at a mid 0.1497: the polygon, cone, polylines, line and points all
+leaked extra geometry (0.7% of pixels) on the side of the clip boundary that GL
+removes.
+
+GL applies clip planes via `gl_ClipDistance`, which works for every primitive
+type. Metal has no clip-distance mechanism, so `vtkMetalPolyDataMapper` tests
+`isClipped(modelPos, clipPlanes)` in the *fragment* stage — but only the
+surface/triangle, OIT-surface and glyph fragments did. The point fragments
+(`fragment_point_main`, `fragment_point_shaped_main`) and the wide-line
+fragments (`shadeLineFragment`, `shadeLineFragmentOIT`) never tested the planes,
+so points, polylines and wide lines were never clipped (the triangles were, which
+is why only ~0.7% of pixels differed).
+
+The fix threads `modelPos` through the point/line vertex outputs and tests the
+clip planes in the fragment stage:
+
+- `PointVertexOut`, `PointShapedVertexOut` and `LineVertexOut` gained a `float3
+  modelPos` varying, set by `vertex_point_main`, `vertex_point_shaped_main` and
+  the three thick-line vertex shaders (thick / round-cap / miter-join) to the
+  interpolated model-space position.
+- `fragment_point_main`, `fragment_point_shaped_main`, `shadeLineFragment` and
+  `shadeLineFragmentOIT` (plus all six entry-point callers) take a
+  `constant ClipPlaneUniforms& clipPlanes [[buffer(5)]]` and call
+  `isClipped(in.modelPos, clipPlanes)` first — an early-out when
+  `numClipPlanes == 0`, so actors without clip planes pay nothing.
+- `vtkMetalPolyDataMapper::RenderPiece` binds the `ClipPlaneBuffer` at fragment
+  slot 5 in all three point draw paths and all three thick-line draw paths. The
+  thick-line *vertex* stage keeps slot 5 for the per-line cell IDs, so only the
+  fragment stage (`recordFBuf`) gets the clip buffer; the 1px-line, surface,
+  edge-overlay and OIT paths already bound it.
+
+`TestPolyDataMapperClipPlanes` now passes (TIGHT_VALID 0.0006), and the suite
+re-ran at 166 pass / 9 fail / 0 aborted with the failure set otherwise unchanged
+and no regression against the documented passing cluster.
+
+### The no-headlight flat-shading fix (`TestRenderLinesAsTubes*` now pass)
+
+`TestRenderLinesAsTubes` and `TestRenderLinesAsTubesOrthoCamera` split their
+scene into four viewport quadrants, one of which draws the line-tube actor with a
+`vtkLightKit`-disabled, `SetLighting(false)` renderer (no lights). They failed
+image comparison at a near-miss 0.0535: that quadrant rendered dim gray instead
+of GL's flat NoLighting green.
+
+Two related fixes, both in the light/flag plumbing:
+
+- `vtkMetalPolyDataMapper::UpdateLightUniforms` synthesized a default headlight
+  when `lightCount == 0`, so a light-less renderer ran the Phong loop and lit the
+  tubes gray. The fallback is removed: `lu.lightCount = count;` and the
+  `SurfaceLightType` is taken from the (zeroed) first light slot. The flat wide
+  line/surface fragments already treated `lights.lightCount == 0` as NoLighting,
+  so with no fake light the quadrant now emits the flat color like GL.
+- `MetalShaders.metal` now derives the flat (NoLighting) decision as
+  `<unlit/kLightingDisabled> || lights.lightCount == 0` at every shaded fragment
+  (surface, OIT, peel, points, wide-line, glyph), so the compile-time unlit
+  pipelines and the runtime light-less renderers agree.
+
+Both tests now pass (TIGHT_VALID 0.0535 → below threshold), closing the
+"residual error is the pre-existing thick-line tube-shading fidelity gap" note
+from the tube-light bake run above. The +2 pass delta is exactly those two tests.
 
 ### The 2D transform-coordinate double-precision fix (`TestTransformCoordinateUseDouble` now passes)
 
