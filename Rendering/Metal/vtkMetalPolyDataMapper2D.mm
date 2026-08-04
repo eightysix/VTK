@@ -599,27 +599,70 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
 
     // Compute WCVC (world-to-viewport-clip) matrix
     // For 2D overlay: orthographic projection from viewport pixel coordinates.
-    // Mirrors vtkOpenGLPolyDataMapper2D::SetTransformShaderParameters: the
+    // Mirrors vtkOpenGLPolyDataMapper2D::SetCameraShaderParameters: the
     // polydata points are in actor-local display coordinates, and the actor's
     // viewport-pixel position offsets the ortho range so local coords land at
     // the correct screen location. The renderer's own pixel size (GetSize) is
-    // used as the range, so sub-viewport renderers map correctly too.
+    // used as the range, so sub-viewport renderers map correctly too. During
+    // tiled rendering (vtkWindowToImageFilter) the viewport is cropped to the
+    // current tile: the ortho range is scaled by the visible fraction and the
+    // origin is shifted by the tile offset so each tile draws only the portion
+    // of the overlay that belongs to it (the 2D counterpart of the camera
+    // adjustment vtkWindowToImageFilter performs for 3D geometry).
+    int* winSize = viewport->GetVTKWindow()->GetSize();
+    if (winSize[0] <= 0 || winSize[1] <= 0)
+    {
+      return;
+    }
+
+    double* tileViewPort = viewport->GetVTKWindow()->GetTileViewport();
+    double visVP[4];
+    visVP[0] = (vp[0] >= tileViewPort[0]) ? vp[0] : tileViewPort[0];
+    visVP[1] = (vp[1] >= tileViewPort[1]) ? vp[1] : tileViewPort[1];
+    visVP[2] = (vp[2] <= tileViewPort[2]) ? vp[2] : tileViewPort[2];
+    visVP[3] = (vp[3] <= tileViewPort[3]) ? vp[3] : tileViewPort[3];
+    if (visVP[0] >= visVP[2] || visVP[1] >= visVP[3])
+    {
+      return;
+    }
+
     if (size[0] <= 0 || size[1] <= 0)
     {
       return;
     }
 
     int* actorPos = actor->GetPositionCoordinate()->GetComputedViewportValue(viewport);
-    float xoff = static_cast<float>(actorPos[0]);
-    float yoff = static_cast<float>(actorPos[1]);
+
+    // Clip the renderer size to the portion visible in this tile.
+    int visSize[2];
+    visSize[0] = static_cast<int>(std::round(
+      size[0] * (visVP[2] - visVP[0]) / (vp[2] - vp[0])));
+    visSize[1] = static_cast<int>(std::round(
+      size[1] * (visVP[3] - visVP[1]) / (vp[3] - vp[1])));
+
+    // Shift the actor origin into the current tile's coordinate space.
+    float xoff = static_cast<float>(actorPos[0] - (visVP[0] - vp[0]) * winSize[0]);
+    float yoff = static_cast<float>(actorPos[1] - (visVP[1] - vp[1]) * winSize[1]);
 
     // Build orthographic matrix: maps actor-local coords + position offset to
     // NDC [-1,1]. Metal NDC: x in [-1,1], y in [-1,1], z in [0,1].
 
     float worldLeft = -xoff;
-    float worldRight = static_cast<float>(size[0]) - xoff;
+    float worldRight = static_cast<float>(visSize[0]) - xoff;
     float worldBottom = -yoff;
-    float worldTop = static_cast<float>(size[1]) - yoff;
+    float worldTop = static_cast<float>(visSize[1]) - yoff;
+
+    // it's an error to build an ortho matrix with left==right or top==bottom
+    // (mirrors the degenerate-viewport guard in
+    // vtkOpenGLPolyDataMapper2D::SetCameraShaderParameters)
+    if (worldRight == worldLeft)
+    {
+      worldRight = worldLeft + 1.0f;
+    }
+    if (worldTop == worldBottom)
+    {
+      worldTop = worldBottom + 1.0f;
+    }
 
     // Standard orthographic matrix. The 2D overlay renders with depth test
     // enabled (LessEqual, depth write on), so the Z row must encode the prop's

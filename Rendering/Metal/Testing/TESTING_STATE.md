@@ -17,7 +17,7 @@ Two test surfaces exist:
    registers the same ~175 tests once per backend and was wired up for Metal
       through    object-factory overrides (`--vtk-factory-prefer
         RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
-         crash)**. Current working-tree status: **149 pass / 26 fail (0 crash)** —
+         crash)**. Current working-tree status: **150 pass / 25 fail (0 crash)** —
       the last crash class, `vtkLabeledContourMapper`, is fixed by the
       `vtkMetalLabeledContourMapper` override (see the labeled-contour-mapper
       section below); the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
@@ -163,7 +163,7 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  149 Passed  26 Failed (incl. image/pick fails)  0 "Subprocess aborted"
+175 tests:  150 Passed  25 Failed (incl. image/pick fails)  0 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
@@ -392,6 +392,17 @@ previous run is exactly those four tests; the failure set is otherwise unchanged
 (22 image-compare + 1 below-threshold pick-check + 3 non-image fails, no new
 failures). The regression check against the documented passing cluster reports
 none.
+Run after the 2D overlay tile-cropping fix (this run, 2026-08-04): 150 Passed /
+25 Failed / 0 aborted out of 175 (analyzed with `analyze_metal_ctest_log.py` from
+a single `ctest -R "RenderingCoreCxx-Metal" -j 8` run; failures exported with
+`export_image_compare.sh`) — `TestTilingCxx` now passes (ImageError 0, was a mid
+0.2195 fail), the first time it has passed; see the 2D overlay tile-cropping
+section below. The +1 pass delta over the previous run is exactly that test; the
+failure set is otherwise unchanged (21 image-compare + 1 below-threshold
+pick-check + 3 non-image fails, no new failures). The regression check against
+the documented passing cluster reports none. The temporary `TestTilingDebug`
+debug harness used to diagnose the bar was removed (its CMakeLists entry and the
+source file), restoring the suite to 175 tests.
 
 ### The labeled-contour-mapper cluster is fixed
 
@@ -449,6 +460,25 @@ three tests now pass (TIGHT_VALID ~1e-03), `TestTilingCxx` improved from gross
 0.6159 to mid 0.2054 on the same viewport-rect corrections, and `TestGlyph3DMapper` (mid
 0.1082) + `RenderNonFinite` (near-miss 0.0870) also left the failure set this run (stable
 across re-runs; see the run paragraph above).
+
+### The 2D overlay tile cropping is fixed (`TestTilingCxx` now passes at 0)
+
+`TestTilingCxx` (160x160 window, ren1 left 75%, ren2 right 25% with a vertical
+`vtkScalarBarActor`, captured 3x2 tiled via `vtkWindowToImageFilter`) failed at mid
+0.2195: under tiling `vtkWindow::GetSize()` reports the *virtual* window
+(`Size * TileScale`, e.g. 480x320) while each physical tile is 160x160, so the 2D
+overlay pass sized and positioned the bar with full-virtual-window math inside a
+physical tile — the bar was split into two squished copies, one per affected tile.
+`vtkMetalPolyDataMapper2D::SetShaderParameters2D` now mirrors
+`vtkOpenGLPolyDataMapper2D::SetCameraShaderParameters`: it intersects the renderer
+viewport with `GetTileViewport()`, scales the ortho range by the visible fraction
+(`visSize`, the same viewport-derived scaling GL applies — the previous port only
+shifted `xoff` and left the range at the full `size`), and shifts the actor origin
+by the tile offset (`xoff/yoff = actorPos - (visVP - vp) * winSize`). Each tile now
+draws exactly its visible slice of the overlay. `TestTilingCxx` passes at
+ImageError 0; the scalar bar body renders as a single continuous run at
+x373-407/y39-291 matching the GL baseline. The 2D actor/image-mapper cluster
+(`TestActor2D`, `TestActor2DTextures`, `TestImageMapper_1..4`) still passes.
 
 ### The sibling translucent/volume passes are tile-aware (follow-up, same run)
 
@@ -846,7 +876,7 @@ max `vtkTesting` TIGHT_VALID error per test (threshold 0.05):
 | Bucket | Range | Count | Examples |
 |--------|-------|-------|----------|
 | near-miss | 0.05 – 0.1 | 5 | `TestRenderLinesAsTubesOrthoCamera` 0.0535, `TestRenderLinesAsTubes` 0.0535, `TestEdgeFlags` 0.0681, `TestLineRenderingTranslucent` 0.0790, `TestGlyph3DMapperPicking` 0.0800 |
-| mid | 0.1 – 0.5 | 17 | `TestMixedGeometryCellScalars` 0.1373, `TestCompositePolyDataMapperSpheres` 0.1499, `TestPolyDataMapperClipPlanes` 0.1526, `TestTransformCoordinateUseDouble` 0.1635, `TestCompositePolyDataMapperPicking` 0.1712, `TestTilingCxx` 0.2195, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.2241, `TestCoincident` 0.2343, `TestCompositePolyDataMapperPartialFieldData` 0.2583, `TestGlyph3DMapperBackfaceColor` 0.2657, `TestPolyDataMapperNormals` 0.2698, `TestCompositePolyDataMapperVertices` 0.2891, `TestCompositePolyDataMapperCustomShader` 0.2897, `TestResetCameraScreenSpace` 0.3438, `TestCompositePolyDataMapperCameraShiftScale` 0.3601, `TestResizingWindowToImageFilter` 0.4130, `TestGlyph3DMapperPointSize` 0.4599 |
+| mid | 0.1 – 0.5 | 16 | `TestMixedGeometryCellScalars` 0.1373, `TestCompositePolyDataMapperSpheres` 0.1499, `TestPolyDataMapperClipPlanes` 0.1526, `TestTransformCoordinateUseDouble` 0.1635, `TestCompositePolyDataMapperPicking` 0.1712, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.2241, `TestCoincident` 0.2343, `TestCompositePolyDataMapperPartialFieldData` 0.2493, `TestGlyph3DMapperBackfaceColor` 0.2657, `TestPolyDataMapperNormals` 0.2698, `TestCompositePolyDataMapperVertices` 0.2891, `TestCompositePolyDataMapperCustomShader` 0.2897, `TestResetCameraScreenSpace` 0.3438, `TestCompositePolyDataMapperCameraShiftScale` 0.3601, `TestResizingWindowToImageFilter` 0.4130, `TestGlyph3DMapperPointSize` 0.4599 |
 | gross | >= 0.5 | 0 | — |
 
 (`TestNActors{OneMapper,NMappersOneInput}` left the mid bucket via the
@@ -903,7 +933,10 @@ point-scalar / cell-scalar variants (mid 0.2861/0.2943) left via the 2D overlay
 line-width and point-size section below — the first time any of the three have
 passed (all at TIGHT_VALID 0) — and `TestColorByStringArrayDefaultLookupTable2D`
 (mid 0.4821) left via the 2D scalar-color mapping commit `bd68ee20b2`. The +4 pass
-delta is exactly those four tests.
+delta is exactly those four tests.) This run the mid bucket dropped from 17 to 16:
+`TestTilingCxx` (mid 0.2195) left via the 2D overlay tile-cropping section above —
+the first time it has passed (ImageError 0). The +1 pass delta is exactly that
+test; the bucket membership is otherwise unchanged.
 
 ### Crashes (3; all pre-existing classes, none from the texture or composite clusters)
 
@@ -1215,15 +1248,15 @@ against the previously-passing cluster is clean.
 
 ### Theme clusters in the remaining failures
 
-- **Textures** (~13): every `TestTexture*`, `TestBackfaceTexture`,
-  `TestTilingCxx`, `TestActor2DTextures` — historically
-  crashed on the OpenGL fallback; now render, with 9 passing
+- **Textures** (~12): every `TestTexture*`, `TestBackfaceTexture`,
+  `TestActor2DTextures` — historically
+  crashed on the OpenGL fallback; now render, with 10 passing
   (`TestTextureWrap`, `TestBackfaceTexture`, `TestTextureRGBA`,
   `TestTextureRGBADepthPeeling`, `TestTextureSize`,
   `TestTextureInterpolateScalars`, `TestTexturedCylinder`,
-  `TestActor2DTextures`, `TestBackfaceCulling`) and the rest
+  `TestActor2DTextures`, `TestBackfaceCulling`, `TestTilingCxx`) and the rest
   failing image comparison on texture-feature fidelity (filter/wrap/interpolation
-  edge cases, tiling).
+  edge cases).
 - **Composite mapper** (~19): the crash cluster is gone (see above), and
   `TestCompositePolyDataMapper{Scalars,CellScalars,Spheres,Vertices,Picking,
   PartialFieldData,CameraShiftScale,CustomShader,MixedGeometry*,
@@ -1501,3 +1534,10 @@ shader and the screen-space thick-line quad pipeline, and
 `TestColorByStringArrayDefaultLookupTable2D` now passes via the 2D scalar-color
 mapping commit `bd68ee20b2`; the tally above and the buckets below are from this
 run).
+
+Latest working-tree run (2026-08-04, after the 2D overlay tile-cropping fix):
+150 Passed / 25 Failed / 0 aborted — `TestTilingCxx` now passes (ImageError 0)
+via the per-tile visVP/visSize/xoff/yoff ortho adjustment in
+`vtkMetalPolyDataMapper2D` (see the 2D overlay tile-cropping section above); the
+tally above and the buckets below are from this run, exported with
+`export_image_compare.sh`.
