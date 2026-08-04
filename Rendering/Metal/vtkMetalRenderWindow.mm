@@ -638,6 +638,16 @@ void vtkMetalRenderWindow::Render()
   this->FrameRendererIndex = 0;
   this->DrawablePresented = false;
 
+  // Mirror vtkRenderWindow::Render(): if SetSize has not been called yet,
+  // default to a reasonable size so the depth/color textures created below
+  // match the viewport of the very first frame. Without this, the first
+  // frame renders with a nil DepthTexture and OIT falls back to standard
+  // transparency.
+  if (0 == this->Size[0] && 0 == this->Size[1])
+  {
+    this->SetSize(300, 300);
+  }
+
   if (this->Size[0] > 0 && this->Size[1] > 0)
   {
     @autoreleasepool

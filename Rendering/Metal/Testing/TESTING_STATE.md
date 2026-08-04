@@ -19,9 +19,11 @@ Two test surfaces exist:
 2. The generic multi-backend suite in `Rendering/Core/Testing/Cxx/`, which
    registers the same ~175 tests once per backend and was wired up for Metal
        through    object-factory overrides (`--vtk-factory-prefer
-          RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
-            crash)**. Current working-tree status: **158 pass / 17 fail (0 crash)** —
-      the last crash class, `vtkLabeledContourMapper`, is fixed by the
+           RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
+             crash)**. Current working-tree status: **159 pass / 16 fail (0 crash)** —
+       `TestLineRenderingTranslucent` now passes via the OIT translucent-line
+      pipelines (see the OIT translucent-line section below), the
+      last crash class, `vtkLabeledContourMapper`, is fixed by the
       `vtkMetalLabeledContourMapper` override (see the labeled-contour-mapper
       section below); the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
      factory override, the 8 composite-mapper `BuildGeometryBuffers` crashes by
@@ -511,6 +513,85 @@ previous run is exactly that test; the failure set is otherwise unchanged
 (13 image-compare + 1 below-threshold pick-check + 3 non-image fails, no new
 failures). The regression check against the documented passing cluster reports
 none.
+Run after the OIT translucent-line fix (this run, 2026-08-04): 159 Passed /
+16 Failed / 0 aborted out of 175 (analyzed with `analyze_metal_ctest_log.py`
+from a single `ctest -R "RenderingCoreCxx-Metal" -j 8` run; failures exported
+with `export_image_compare.sh`) — `TestLineRenderingTranslucent` now passes for
+the first time (TIGHT_VALID ImageError 0.0315735, was a mid-bucket 0.0790303
+image fail): the OIT accumulate pass targets RGBA16F/R16F attachments, and the
+line draws were skipped there because line pipelines only existed in the
+non-OIT BGRA8 variants, so translucent lines were invisible during OIT (see
+the OIT translucent-line section below). The `vtkMetalOrderIndependentTranslucentPass`
+first-frame "invalid or MSAA depth texture; falling back to standard
+transparency" warning is also gone: `vtkMetalRenderWindow::Render` now applies
+the superclass's 300x300 size default before creating the depth texture, so the
+very first frame has a valid DepthTexture. The +1 pass delta over the previous
+run is exactly that test; the failure set is otherwise unchanged
+(12 image-compare + 1 below-threshold pick-check + 3 non-image fails, no new
+failures). The regression check against the documented passing cluster reports
+none.
+
+### The OIT translucent-line fix (`TestLineRenderingTranslucent` now passes)
+
+`TestLineRenderingTranslucent` renders the `TestLineRendering` line scene
+(line width 4, `MiterJoin` join, opacity 0.4) with `SetMultiSamples(0)`, which
+disables MSAA and enables VTK's order-independent translucent pass. It failed
+image comparison at a mid-bucket 0.0790303: under OIT the translucent lines
+were invisible.
+
+The OIT accumulate pass (`vtkMetalOrderIndependentTranslucentPass`) creates
+RGBA16F + R16F intermediate textures, and its resolve shader
+(`fragment_oit_resolve`) emits `float4(accum.rgb / max(reveal, 0.01),
+1.0 - accum.a)` against a `ReadOnlyDepthState` (Less, no depth write) using the
+scene's non-MSAA Depth32Float. The line draw in `vtkMetalPolyDataMapper::RenderPiece`
+was gated on `!oitActive` ("those pipelines write to different color
+attachments than the pass provides"), so during the OIT accumulate frame the
+lines were simply never recorded.
+
+The fix, following the existing triangle OIT pipeline (`EnsureOITPipelineStates`)
+and the tube-line pipeline pattern (`BuildTubeLinePipelineVariant`):
+
+- **OIT line pipelines.** New `BuildOITLinePipelineVariant` builds
+  miter-join / thick / round-cap variants against the RGBA16F/R16F attachments
+  with the same blend config as the triangle OIT pipeline (color(0) RGB
+  ONE/ONE add, A ZERO/ONE_MINUS_SRC_ALPHA add; color(1) ONE/ONE add),
+  `MTLPrimitiveTopologyClassTriangle`, sample count 1, and the function
+  constant 16 (`kLightingDisabled`) split; a dedicated `EnsureLineOITPipelineState`
+  does the same for 1px lines via `vertex_main` + `fragment_main_line_oit`.
+- **Draw gate.** `drawLines` now permits the OIT accumulate pass and selects
+  the OIT pipeline variants (`LineOITPipeline` /
+  `MiterJoinLineOITPipeline[Unlit]` / `ThickLineOITPipeline[Unlit]` /
+  `RoundCapLineOITPipeline[Unlit]`) when `oitActive`, while the non-OIT path is
+  untouched. Depth-peel passes still skip lines. The OIT pipelines are created
+  lazily in the `renWin->OITActive` ensure block (miter if
+  `MiterJoinLineSegmentCount > 0`, else thick if `ThickLineSegmentCount > 0`,
+  else 1px if `lineWidth <= 1.0f`), so scenes without translucent lines never
+  pay for them.
+- **OIT line fragment shaders.** `shadeLineFragmentOIT` mirrors
+  `shadeLineFragment` (same cylinder-normal Phong lighting and coincident-depth
+  offset) but writes premultiplied color/revealage; `fragment_main_line_oit`
+  mirrors `fragment_main_oit` for 1px lines, honoring the
+  `kSceneFlagLinesUnlit` scene flag and `resolveMaterial`/`resolveCellColor`
+  (cellColorTex texture 8, lutTexture 9, lutSampler 1 bound in the OIT draw).
+  The three tube entry points (`fragment_{thick,round_cap,miter_join}_line_main_oit`)
+  wrap it.
+
+**First-frame depth texture.** The `vtkMetalOrderIndependentTranslucentPass`
+"invalid or MSAA depth texture" warning fired once per process on the first
+frame: `vtkMetalRenderWindow::Render` checked `Size[0] > 0` before the
+superclass `vtkRenderWindow::Render` applied its `SetSize(300, 300)` default,
+so no DepthTexture existed during the first OIT pass and it fell back to
+standard transparency (the second frame rendered correctly, which is why the
+old code still failed at only 0.079). The Metal render window now applies the
+same size default first, so every frame has a valid DepthTexture and the
+warning is gone.
+
+`TestLineRenderingTranslucent` passes at TIGHT_VALID 0.0315735 (deterministic
+across five re-runs; the residual error is the OIT-vs-alpha-blend fidelity gap),
+`TestLineRendering` (opaque) and all six `TestTranslucent*` tests still pass,
+and the full suite re-ran at 159 pass / 16 fail / 0 aborted with the failure
+set otherwise unchanged and no regression against the documented passing
+cluster.
 
 ### The glyph3D point-selection fix (`TestGlyph3DMapperPicking` now passes)
 

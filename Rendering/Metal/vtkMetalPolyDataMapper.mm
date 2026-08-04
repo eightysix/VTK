@@ -776,6 +776,8 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
 
   id<MTLRenderPipelineState> TrianglePipeline = nil;
   id<MTLRenderPipelineState> LinePipeline = nil;
+  // 8C: OIT accumulate variant of the 1px line pipeline (RGBA16F + R16F).
+  id<MTLRenderPipelineState> LineOITPipeline = nil;
 
   // Surface pipeline specialization (the "GL way"): one shader source,
   // specialized per feature set at pipeline creation via function constants.
@@ -952,6 +954,18 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLRenderPipelineState> MiterJoinLinePipelineUnlit = nil;
   vtkIdType MiterJoinLineSegmentCount = 0;
   id<MTLBuffer> MiterJoinSegmentCountBuffer = nil;  // uint32: total segment count for bounds check
+
+  // 8C: OIT accumulate variants of the tube line pipelines. They write
+  // premultiplied color to color(0) (RGBA16F) and revealage to color(1) (R16F),
+  // so translucent lines participate in the order-independent translucent pass
+  // exactly like the triangle OIT pipeline. Same lit/unlit split as the
+  // standard variants; OIT runs without MSAA, so no sample-count variants.
+  id<MTLRenderPipelineState> ThickLineOITPipeline = nil;
+  id<MTLRenderPipelineState> ThickLineOITPipelineUnlit = nil;
+  id<MTLRenderPipelineState> RoundCapLineOITPipeline = nil;
+  id<MTLRenderPipelineState> RoundCapLineOITPipelineUnlit = nil;
+  id<MTLRenderPipelineState> MiterJoinLineOITPipeline = nil;
+  id<MTLRenderPipelineState> MiterJoinLineOITPipelineUnlit = nil;
 
   // P2-2C: Triangle index buffers — deduplicated vertices + index buffer
   // IndexBuffer is populated when vertices can be deduplicated.
@@ -1197,6 +1211,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     InvalidateRenderBundle();
     vtkMetalMRC::ReleaseAndNil(TrianglePipeline);
     vtkMetalMRC::ReleaseAndNil(LinePipeline);
+    vtkMetalMRC::ReleaseAndNil(LineOITPipeline);
     for (auto& entry : TriangleSurfacePipelines)
     {
       [entry.second release];
@@ -1211,6 +1226,12 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     vtkMetalMRC::ReleaseAndNil(RoundCapLinePipelineUnlit);
     vtkMetalMRC::ReleaseAndNil(MiterJoinLinePipeline);
     vtkMetalMRC::ReleaseAndNil(MiterJoinLinePipelineUnlit);
+    vtkMetalMRC::ReleaseAndNil(ThickLineOITPipeline);
+    vtkMetalMRC::ReleaseAndNil(ThickLineOITPipelineUnlit);
+    vtkMetalMRC::ReleaseAndNil(RoundCapLineOITPipeline);
+    vtkMetalMRC::ReleaseAndNil(RoundCapLineOITPipelineUnlit);
+    vtkMetalMRC::ReleaseAndNil(MiterJoinLineOITPipeline);
+    vtkMetalMRC::ReleaseAndNil(MiterJoinLineOITPipelineUnlit);
     vtkMetalMRC::ReleaseAndNil(TriangleInitPeelPipeline);
     vtkMetalMRC::ReleaseAndNil(TrianglePeelPipeline);
     vtkMetalMRC::ReleaseAndNil(TriangleOITPipeline);
@@ -1715,6 +1736,25 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
         ? this->Internals->MiterJoinLinePipelineUnlit != nil
         : this->Internals->MiterJoinLinePipeline != nil);
 
+  // OIT accumulate variants of the line pipelines. During the OIT pass the
+  // accumulate render pass provides RGBA16F + R16F attachments, so the standard
+  // BGRA8 line pipelines cannot be used; these variants write the premultiplied
+  // color / revealage pairs like the triangle OIT pipeline.
+  const bool standardLineOITAvailable = this->Internals->LineOITPipeline != nil;
+  const bool thickLinesOITAvailable =
+      lineWidth > 1.0f &&
+      this->Internals->ThickLineSegmentCount > 0 &&
+      (tubeLightingDisabled
+        ? this->Internals->ThickLineOITPipelineUnlit != nil
+        : this->Internals->ThickLineOITPipeline != nil);
+  const bool miterLinesOITAvailable =
+      lineWidth > 1.0f &&
+      act->GetProperty()->GetLineJoin() == vtkProperty::LineJoinType::MiterJoin &&
+      this->Internals->MiterJoinLineSegmentCount > 0 &&
+      (tubeLightingDisabled
+        ? this->Internals->MiterJoinLineOITPipelineUnlit != nil
+        : this->Internals->MiterJoinLineOITPipeline != nil);
+
   const bool trianglePipelineAvailable =
       this->Internals->TrianglePipeline ||
       (peelMode == 1 && this->Internals->TriangleInitPeelPipeline) ||
@@ -1726,15 +1766,18 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       this->Internals->HasTriangles &&
       trianglePipelineAvailable;
 
-  // Lines, edge overlays, and point dots are not drawn during depth-peel or
-  // OIT accumulate passes — those pipelines write to different color
-  // attachments than the pass provides.
+  // Lines are skipped during depth-peel passes (those pipelines write to the
+  // peel targets). During OIT accumulate passes they ARE drawn, but only with
+  // the OIT line pipelines that target the RGBA16F/R16F attachments — the
+  // standard BGRA8 pipelines would mismatch the pass and draw nothing.
   const bool drawLines =
-      !peelPassActive && !oitActive &&
+      !peelPassActive &&
       (isSurface || isWireframe) &&
       this->Internals->HasLines &&
       this->Internals->LineIndexBuffer &&
-      (standardLinePipelineAvailable || thickLinesAvailable || miterLinesAvailable);
+      (oitActive
+        ? (standardLineOITAvailable || thickLinesOITAvailable || miterLinesOITAvailable)
+        : (standardLinePipelineAvailable || thickLinesAvailable || miterLinesAvailable));
 
   const bool drawEdgeOverlay =
       this->UseLegacyEdgeOverlay &&
@@ -2044,15 +2087,23 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       if (lineJoinType == vtkProperty::LineJoinType::MiterJoin &&
                this->Internals->MiterJoinLineSegmentCount > 0 &&
                (tubeLightingDisabled
-                 ? this->Internals->MiterJoinLinePipelineUnlit
-                 : this->Internals->MiterJoinLinePipeline))
+                 ? (oitActive
+                     ? this->Internals->MiterJoinLineOITPipelineUnlit
+                     : this->Internals->MiterJoinLinePipelineUnlit)
+                 : (oitActive
+                     ? this->Internals->MiterJoinLineOITPipeline
+                     : this->Internals->MiterJoinLinePipeline)))
       {
         useMiterJoinLines = true;
       }
       else if (this->Internals->ThickLineSegmentCount > 0 &&
                (tubeLightingDisabled
-                 ? this->Internals->ThickLinePipelineUnlit
-                 : this->Internals->ThickLinePipeline))
+                 ? (oitActive
+                     ? this->Internals->ThickLineOITPipelineUnlit
+                     : this->Internals->ThickLinePipelineUnlit)
+                 : (oitActive
+                     ? this->Internals->ThickLineOITPipeline
+                     : this->Internals->ThickLinePipeline)))
       {
         // Fallback: thick lines for round-cap, no-join, and all other non-miter joins
         useThickLines = true;
@@ -2062,8 +2113,12 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
     if (useRoundCapLines)
     {
       recordPipeline(tubeLightingDisabled
-        ? this->Internals->RoundCapLinePipelineUnlit
-        : this->Internals->RoundCapLinePipeline);
+        ? (oitActive
+            ? this->Internals->RoundCapLineOITPipelineUnlit
+            : this->Internals->RoundCapLinePipelineUnlit)
+        : (oitActive
+            ? this->Internals->RoundCapLineOITPipeline
+            : this->Internals->RoundCapLinePipeline));
       recordVBuf(this->Internals->VertexPositionBuffer, 0, 0);
       recordVBuf(this->Internals->LineIndexBuffer, 0, 1);
       if (this->Internals->SceneUniformBuffer)
@@ -2108,8 +2163,12 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
     else if (useMiterJoinLines)
     {
       recordPipeline(tubeLightingDisabled
-        ? this->Internals->MiterJoinLinePipelineUnlit
-        : this->Internals->MiterJoinLinePipeline);
+        ? (oitActive
+            ? this->Internals->MiterJoinLineOITPipelineUnlit
+            : this->Internals->MiterJoinLinePipelineUnlit)
+        : (oitActive
+            ? this->Internals->MiterJoinLineOITPipeline
+            : this->Internals->MiterJoinLinePipeline));
       recordVBuf(this->Internals->VertexPositionBuffer, 0, 0);
       recordVBuf(this->Internals->LineIndexBuffer, 0, 1);
       if (this->Internals->SceneUniformBuffer)
@@ -2158,8 +2217,12 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
     else if (useThickLines)
     {
       recordPipeline(tubeLightingDisabled
-        ? this->Internals->ThickLinePipelineUnlit
-        : this->Internals->ThickLinePipeline);
+        ? (oitActive
+            ? this->Internals->ThickLineOITPipelineUnlit
+            : this->Internals->ThickLinePipelineUnlit)
+        : (oitActive
+            ? this->Internals->ThickLineOITPipeline
+            : this->Internals->ThickLinePipeline));
       recordVBuf(this->Internals->VertexPositionBuffer, 0, 0);
       recordVBuf(this->Internals->LineIndexBuffer, 0, 1);
       if (this->Internals->SceneUniformBuffer)
@@ -2204,7 +2267,8 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
     else
     {
       // Standard 1px lines
-      recordPipeline(this->Internals->LinePipeline);
+      recordPipeline(oitActive ? this->Internals->LineOITPipeline
+                               : this->Internals->LinePipeline);
       recordVBuf(this->Internals->VertexPositionBuffer, 0, 0);
       if (this->Internals->VertexNormalBuffer)
       {
@@ -2283,6 +2347,38 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
         if (samplerToBind)
         {
           recordFSamp(samplerToBind, 0);
+        }
+      }
+      // OIT 1px line fragment reads cellColorTex (texture 8), lutTexture (9),
+      // lutSampler (1) via resolveCellColor, matching the triangle OIT bindings.
+      if (oitActive)
+      {
+        id<MTLTexture> cellColorTex = this->Internals->CellColorTexture;
+        if (!cellColorTex)
+        {
+          cellColorTex = this->Internals->DefaultTexture;
+        }
+        if (cellColorTex)
+        {
+          recordFTex(cellColorTex, 8);
+        }
+        id<MTLTexture> lutTex = this->Internals->ScalarLUTTexture;
+        if (!lutTex)
+        {
+          lutTex = this->Internals->DefaultTexture;
+        }
+        id<MTLSamplerState> lutSamp = this->Internals->ScalarLUTSampler;
+        if (!lutSamp)
+        {
+          lutSamp = this->Internals->DefaultSampler;
+        }
+        if (lutTex)
+        {
+          recordFTex(lutTex, 9);
+        }
+        if (lutSamp)
+        {
+          recordFSamp(lutSamp, 1);
         }
       }
       recordCull(MTLCullModeNone);
@@ -3092,6 +3188,25 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     if (renWin->OITActive)
     {
       this->EnsureOITPipelineStates((void*)device);
+      // Ensure OIT line pipelines when this mapper has line geometry.
+      if (this->Internals->HasLines && this->Internals->LineIndexBuffer)
+      {
+        const bool lineLightingDisabled = !act->GetProperty()->GetLighting();
+        auto lineJoin = act->GetProperty()->GetLineJoin();
+        if (lineJoin == vtkProperty::LineJoinType::MiterJoin &&
+            this->Internals->MiterJoinLineSegmentCount > 0)
+        {
+          this->EnsureMiterJoinLineOITPipelineState((void*)device, lineLightingDisabled);
+        }
+        else if (this->Internals->ThickLineSegmentCount > 0)
+        {
+          this->EnsureThickLineOITPipelineState((void*)device, lineLightingDisabled);
+        }
+        else if (static_cast<float>(act->GetProperty()->GetLineWidth()) <= 1.0f)
+        {
+          this->EnsureLineOITPipelineState((void*)device);
+        }
+      }
     }
 
     // Use the encoder already created by vtkMetalRenderer::DeviceRender().
@@ -6884,6 +6999,80 @@ static id<MTLRenderPipelineState> BuildTubeLinePipelineVariant(
 }
 
 //------------------------------------------------------------------------------
+// Build an OIT accumulate variant of a tube line pipeline. Unlike
+// BuildTubeLinePipelineVariant this writes premultiplied color to color(0)
+// (RGBA16F) and revealage to color(1) (R16F) with the same blend configuration
+// as the triangle OIT pipeline (see EnsureOITPipelineStates), so translucent
+// lines accumulate into the OIT textures during the order-independent pass.
+// OIT always runs without MSAA, so the sample count is fixed at 1.
+//------------------------------------------------------------------------------
+static id<MTLRenderPipelineState> BuildOITLinePipelineVariant(
+  id<MTLDevice> device,
+  id<MTLLibrary> library,
+  const char* vertexName,
+  const char* fragmentName,
+  bool lightingDisabled,
+  NSError** outError)
+{
+  MTLFunctionConstantValues* consts = [[MTLFunctionConstantValues alloc] init];
+  BOOL cv = lightingDisabled ? YES : NO;
+  [consts setConstantValue:&cv type:MTLDataTypeBool atIndex:16];
+
+  NSError* error = nil;
+  id<MTLFunction> vFunc =
+    [library newFunctionWithName:@(vertexName) constantValues:consts error:&error];
+  id<MTLFunction> fFunc =
+    [library newFunctionWithName:@(fragmentName) constantValues:consts error:&error];
+  [consts release];
+  if (!vFunc || !fFunc)
+  {
+    if (outError)
+    {
+      *outError = error ? error : nil;
+    }
+    [vFunc release];
+    [fFunc release];
+    return nil;
+  }
+
+  MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+  desc.vertexFunction = vFunc;
+  desc.fragmentFunction = fFunc;
+  // color(0): RGBA16F accumulate — RGB: (ONE, ONE) add, A: (ZERO, ONE_MINUS_SRC_ALPHA) add
+  desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+  desc.colorAttachments[0].blendingEnabled = YES;
+  desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+  desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+  desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+  desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOne;
+  desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorZero;
+  desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+  // color(1): R16F revealage — (ONE, ONE) add
+  desc.colorAttachments[1].pixelFormat = MTLPixelFormatR16Float;
+  desc.colorAttachments[1].blendingEnabled = YES;
+  desc.colorAttachments[1].rgbBlendOperation = MTLBlendOperationAdd;
+  desc.colorAttachments[1].alphaBlendOperation = MTLBlendOperationAdd;
+  desc.colorAttachments[1].sourceRGBBlendFactor = MTLBlendFactorOne;
+  desc.colorAttachments[1].destinationRGBBlendFactor = MTLBlendFactorOne;
+  desc.colorAttachments[1].sourceAlphaBlendFactor = MTLBlendFactorOne;
+  desc.colorAttachments[1].destinationAlphaBlendFactor = MTLBlendFactorOne;
+  desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+  desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+  desc.rasterSampleCount = 1;
+
+  id<MTLRenderPipelineState> pipeline =
+    [device newRenderPipelineStateWithDescriptor:desc error:&error];
+  if (outError)
+  {
+    *outError = pipeline ? nil : error;
+  }
+  [desc release];
+  [vFunc release];
+  [fFunc release];
+  return pipeline;
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalPolyDataMapper::EnsureThickLinePipelineState(void* mtlDevice, bool lightingDisabled)
 {
   id<MTLRenderPipelineState>* storage =
@@ -6996,6 +7185,114 @@ void vtkMetalPolyDataMapper::EnsureMiterJoinLinePipelineState(void* mtlDevice, b
   if (!*storage)
   {
     vtkErrorMacro(<< "Miter join line " << (lightingDisabled ? "unlit" : "lit")
+      << " pipeline: " << [[error localizedDescription] UTF8String]);
+  }
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::EnsureThickLineOITPipelineState(void* mtlDevice, bool lightingDisabled)
+{
+  id<MTLRenderPipelineState>* storage =
+    lightingDisabled ? &this->Internals->ThickLineOITPipelineUnlit : &this->Internals->ThickLineOITPipeline;
+  if (*storage)
+  {
+    return;
+  }
+
+  id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
+
+  if (!this->Internals->CachedRenderWindow)
+  {
+    vtkErrorMacro(<< "No render window available for shader library access");
+    return;
+  }
+
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)
+    this->Internals->CachedRenderWindow->GetSharedShaderLibrary();
+  if (!library)
+  {
+    vtkErrorMacro(<< "No shared shader library available for OIT thick lines");
+    return;
+  }
+
+  NSError* error = nil;
+  *storage = BuildOITLinePipelineVariant(device, library,
+    "vertex_thick_line_main", "fragment_thick_line_main_oit", lightingDisabled, &error);
+  if (!*storage)
+  {
+    vtkErrorMacro(<< "OIT thick line " << (lightingDisabled ? "unlit" : "lit")
+      << " pipeline: " << [[error localizedDescription] UTF8String]);
+  }
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::EnsureRoundCapLineOITPipelineState(void* mtlDevice, bool lightingDisabled)
+{
+  id<MTLRenderPipelineState>* storage =
+    lightingDisabled ? &this->Internals->RoundCapLineOITPipelineUnlit : &this->Internals->RoundCapLineOITPipeline;
+  if (*storage)
+  {
+    return;
+  }
+
+  id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
+
+  if (!this->Internals->CachedRenderWindow)
+  {
+    vtkErrorMacro(<< "No render window available for shader library access");
+    return;
+  }
+
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)
+    this->Internals->CachedRenderWindow->GetSharedShaderLibrary();
+  if (!library)
+  {
+    vtkErrorMacro(<< "No shared shader library available for OIT round cap lines");
+    return;
+  }
+
+  NSError* error = nil;
+  *storage = BuildOITLinePipelineVariant(device, library,
+    "vertex_round_cap_line_main", "fragment_round_cap_line_main_oit", lightingDisabled, &error);
+  if (!*storage)
+  {
+    vtkErrorMacro(<< "OIT round cap line " << (lightingDisabled ? "unlit" : "lit")
+      << " pipeline: " << [[error localizedDescription] UTF8String]);
+  }
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::EnsureMiterJoinLineOITPipelineState(void* mtlDevice, bool lightingDisabled)
+{
+  id<MTLRenderPipelineState>* storage =
+    lightingDisabled ? &this->Internals->MiterJoinLineOITPipelineUnlit : &this->Internals->MiterJoinLineOITPipeline;
+  if (*storage)
+  {
+    return;
+  }
+
+  id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
+
+  if (!this->Internals->CachedRenderWindow)
+  {
+    vtkErrorMacro(<< "No render window available for shader library access");
+    return;
+  }
+
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)
+    this->Internals->CachedRenderWindow->GetSharedShaderLibrary();
+  if (!library)
+  {
+    vtkErrorMacro(<< "No shared shader library available for OIT miter join lines");
+    return;
+  }
+
+  NSError* error = nil;
+  *storage = BuildOITLinePipelineVariant(device, library,
+    "vertex_miter_join_line_main", "fragment_miter_join_line_main_oit", lightingDisabled, &error);
+  if (!*storage)
+  {
+    vtkErrorMacro(<< "OIT miter join line " << (lightingDisabled ? "unlit" : "lit")
       << " pipeline: " << [[error localizedDescription] UTF8String]);
   }
 }
@@ -7304,6 +7601,115 @@ void vtkMetalPolyDataMapper::EnsureOITPipelineStates(void* mtlDevice)
   if (!this->Internals->TriangleOITPipeline)
   {
     vtkErrorMacro(<< "OIT accumulate pipeline: " << [[error localizedDescription] UTF8String]);
+  }
+  [desc release];
+  [vertexDesc release];
+  [vertexFunc release];
+  [fragFunc release];
+}
+
+//------------------------------------------------------------------------------
+// 8C: Create the order-independent transparency accumulate pipeline for 1px
+// lines. Uses vertex_main + fragment_main_line_oit, which outputs premultiplied
+// color to color(0) (RGBA16F) and revealage to color(1) (R16F) like the
+// triangle OIT pipeline, so 1px translucent lines accumulate during OIT.
+//------------------------------------------------------------------------------
+void vtkMetalPolyDataMapper::EnsureLineOITPipelineState(void* mtlDevice)
+{
+  if (this->Internals->LineOITPipeline)
+  {
+    return;
+  }
+
+  id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
+
+  if (!this->Internals->CachedRenderWindow)
+  {
+    vtkErrorMacro(<< "No render window available for shader library access");
+    return;
+  }
+
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)
+    this->Internals->CachedRenderWindow->GetSharedShaderLibrary();
+  if (!library)
+  {
+    vtkErrorMacro(<< "No shared shader library available for OIT 1px lines");
+    return;
+  }
+
+  NSError* error = nil;
+  MTLFunctionConstantValues* fullConsts = [[MTLFunctionConstantValues alloc] init];
+  BOOL cv = YES;
+  for (NSUInteger idx = 6; idx <= 12; ++idx)
+  {
+    [fullConsts setConstantValue:&cv type:MTLDataTypeBool atIndex:idx];
+  }
+  int fullLightCount = 8;
+  [fullConsts setConstantValue:&fullLightCount type:MTLDataTypeInt atIndex:13];
+  int fullLightType = -1;
+  [fullConsts setConstantValue:&fullLightType type:MTLDataTypeInt atIndex:14];
+  BOOL fullHasScalarLUT = NO;
+  [fullConsts setConstantValue:&fullHasScalarLUT type:MTLDataTypeBool atIndex:15];
+  BOOL fullLightingDisabled = NO;
+  [fullConsts setConstantValue:&fullLightingDisabled type:MTLDataTypeBool atIndex:16];
+  id<MTLFunction> vertexFunc =
+    [library newFunctionWithName:@"vertex_main" constantValues:fullConsts error:&error];
+  id<MTLFunction> fragFunc =
+    [library newFunctionWithName:@"fragment_main_line_oit" constantValues:fullConsts error:&error];
+  [fullConsts release];
+  if (!vertexFunc || !fragFunc)
+  {
+    vtkErrorMacro(<< "Failed to find OIT 1px line shader functions");
+    [vertexFunc release];
+    [fragFunc release];
+    return;
+  }
+
+  MTLVertexDescriptor* vertexDesc = [[MTLVertexDescriptor alloc] init];
+  vertexDesc.attributes[0].format = MTLVertexFormatFloat3;
+  vertexDesc.attributes[0].offset = 0;
+  vertexDesc.attributes[0].bufferIndex = 0;
+  vertexDesc.attributes[1].format = MTLVertexFormatFloat3;
+  vertexDesc.attributes[1].offset = 0;
+  vertexDesc.attributes[1].bufferIndex = 1;
+  vertexDesc.layouts[0].stride = sizeof(float) * 3;
+  vertexDesc.layouts[0].stepRate = 1;
+  vertexDesc.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
+  vertexDesc.layouts[1].stride = sizeof(float) * 3;
+  vertexDesc.layouts[1].stepRate = 1;
+  vertexDesc.layouts[1].stepFunction = MTLVertexStepFunctionPerVertex;
+
+  MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+  desc.vertexFunction = vertexFunc;
+  desc.fragmentFunction = fragFunc;
+  desc.vertexDescriptor = vertexDesc;
+  // color(0): RGBA16F accumulate — RGB: (ONE, ONE) add, A: (ZERO, ONE_MINUS_SRC_ALPHA) add
+  desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+  desc.colorAttachments[0].blendingEnabled = YES;
+  desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+  desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+  desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+  desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOne;
+  desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorZero;
+  desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+  // color(1): R16F revealage — (ONE, ONE) add
+  desc.colorAttachments[1].pixelFormat = MTLPixelFormatR16Float;
+  desc.colorAttachments[1].blendingEnabled = YES;
+  desc.colorAttachments[1].rgbBlendOperation = MTLBlendOperationAdd;
+  desc.colorAttachments[1].alphaBlendOperation = MTLBlendOperationAdd;
+  desc.colorAttachments[1].sourceRGBBlendFactor = MTLBlendFactorOne;
+  desc.colorAttachments[1].destinationRGBBlendFactor = MTLBlendFactorOne;
+  desc.colorAttachments[1].sourceAlphaBlendFactor = MTLBlendFactorOne;
+  desc.colorAttachments[1].destinationAlphaBlendFactor = MTLBlendFactorOne;
+  desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+  desc.inputPrimitiveTopology = MTLPrimitiveTopologyClassLine;
+  desc.rasterSampleCount = 1;
+
+  this->Internals->LineOITPipeline =
+    [device newRenderPipelineStateWithDescriptor:desc error:&error];
+  if (!this->Internals->LineOITPipeline)
+  {
+    vtkErrorMacro(<< "OIT 1px line pipeline: " << [[error localizedDescription] UTF8String]);
   }
   [desc release];
   [vertexDesc release];

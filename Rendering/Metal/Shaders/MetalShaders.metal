@@ -879,6 +879,74 @@ struct OITAccumulateOutput {
   float depth [[depth(any)]];
 };
 
+// OIT accumulate variant of fragment_main_line: mirrors fragment_main_oit so
+// 1px translucent lines accumulate into the order-independent translucent pass
+// (premultiplied color to color(0) RGBA16F, revealage to color(1) R16F). The
+// unlit decision uses the kSceneFlagLinesUnlit scene flag like fragment_main_line.
+fragment OITAccumulateOutput fragment_main_line_oit(VertexOut in [[stage_in]],
+                              constant MaterialUniforms& material [[buffer(0)]],
+                              constant LightUniforms& lights [[buffer(1)]],
+                              constant SceneUniforms& scene [[buffer(2)]],
+                              constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
+                              constant EdgeUniforms& edge [[buffer(4)]],
+                              constant ClipPlaneUniforms& clipPlanes [[buffer(5)]],
+                              texture2d<float, access::read> cellColorTex [[texture(8)]],
+                              texture2d<float> actorTexture [[texture(0)]],
+                              sampler actorSampler [[sampler(0)]],
+                              texture2d<float> lutTexture [[texture(9)]],
+                              sampler lutSampler [[sampler(1)]],
+                              uint prim_id [[primitive_id]],
+                              bool frontFacing [[front_facing]]) {
+  if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
+
+  float3 N = normalize(in.viewNormal);
+  MaterialUniforms m = material;
+  if (!frontFacing)
+  {
+    N = -N;
+    m.ambientColor = material.backfaceAmbientColor;
+    m.diffuseColor = material.backfaceDiffuseColor;
+    m.specularColor = material.backfaceSpecularColor;
+    m.color = material.backfaceColor;
+    m.opacity = material.backfaceOpacity;
+    m.specularPower = material.backfaceSpecularPower;
+  }
+
+  const bool scalarLUTActive = kHasScalarLUT && (scene.flags & kSceneFlagHasScalarLUT) != 0u;
+  ResolvedMaterial r = resolveMaterial(m, resolveCellColor(in, prim_id, scene, cellColorTex, lutTexture, lutSampler), in.uv, actorTexture, actorSampler,
+    (scene.flags & (kSceneFlagHasSurfaceColors | kSceneFlagHasScalarLUT)) != 0u,
+    (scene.flags & kSceneFlagHasActorTexture) != 0u,
+    frontFacing, material.showTexturesOnBackface);
+  if (scalarLUTActive)
+  {
+    r.opacity = in.vertexColor.a * r.opacity;
+  }
+  r.ambient = m.ambientColor.w * r.ambient;
+  applySurfaceEdges(N, r, in, lights, edge, scene, m.ambientColor.w);
+
+  float3 totalAmbient = r.ambient;
+  float3 totalDiffuse = float3(0.0);
+  float3 totalSpecular = float3(0.0);
+
+  const bool unlit = (scene.flags & kSceneFlagLinesUnlit) != 0u;
+  if (!unlit)
+  {
+    computePhongLighting(N, in.viewPos, r.diffuse, m.specularColor.rgb, m.specularColor.w, m.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
+  }
+
+  float3 litRGB = unlit
+    ? (totalAmbient + m.diffuseColor.w * r.diffuse)
+    : (totalAmbient + m.diffuseColor.w * totalDiffuse + totalSpecular);
+  float opacity = r.opacity;
+
+  OITAccumulateOutput out;
+  out.color = float4(litRGB * opacity, opacity);
+  out.reveal = opacity;
+  float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
+  out.depth = in.position.z + coinOffset.lineFactor * cscale + coinOffset.lineOffset / 65000.0;
+  return out;
+}
+
 fragment OITAccumulateOutput fragment_main_oit(VertexOut in [[stage_in]],
     constant MaterialUniforms& material [[buffer(0)]],
     constant LightUniforms& lights [[buffer(1)]],
@@ -1529,6 +1597,70 @@ fragment FragmentOutput fragment_miter_join_line_main(
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
   return shadeLineFragment(in, material, lights, coinOffset);
+}
+
+// OIT accumulate variant of shadeLineFragment: emits the same lit color as the
+// tube line fragments but writes premultiplied color to color(0) (RGBA16F) and
+// revealage to color(1) (R16F), mirroring fragment_main_oit so translucent lines
+// participate in the order-independent translucent pass like triangles.
+inline OITAccumulateOutput shadeLineFragmentOIT(LineVertexOut in,
+    constant MaterialUniforms& material,
+    constant LightUniforms& lights,
+    constant CoincidentOffsetUniforms& coinOffset)
+{
+  float3 baseColor = in.vertexColor.rgb;
+  float opacity = in.vertexColor.a * material.opacity;
+
+  float3 totalDiffuse = float3(0.0), totalSpecular = float3(0.0);
+  if (!kLightingDisabled)
+  {
+    float r = clamp(in.dist_to_centerline, -1.0, 1.0);
+    float lenZ = clamp(sqrt(max(1.0 - r * r, 0.0)), 0.0, 1.0);
+    float3 lateral = normalize(in.viewNormal);
+    float3 cylinderN = normalize(r * lateral + lenZ * float3(0.0, 0.0, 1.0));
+    float emix = clamp(0.5 + in.lineHalfW * (1.0 - abs(r)), 0.0, 1.0);
+    float3 N = normalize(mix(float3(0.0, 0.0, 1.0), cylinderN, emix));
+
+    computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb,
+        material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
+  }
+
+  float3 litRGB = material.ambientColor.w * baseColor
+                + material.diffuseColor.w * (kLightingDisabled ? baseColor : totalDiffuse) + totalSpecular;
+
+  OITAccumulateOutput out;
+  out.color = float4(litRGB * opacity, opacity);
+  out.reveal = opacity;
+  float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
+  out.depth = in.position.z + coinOffset.lineFactor * cscale + coinOffset.lineOffset / 65000.0;
+  return out;
+}
+
+fragment OITAccumulateOutput fragment_thick_line_main_oit(
+    LineVertexOut in [[stage_in]],
+    constant MaterialUniforms& material [[buffer(0)]],
+    constant LightUniforms& lights [[buffer(1)]],
+    constant SceneUniforms& scene [[buffer(2)]],
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
+  return shadeLineFragmentOIT(in, material, lights, coinOffset);
+}
+
+fragment OITAccumulateOutput fragment_round_cap_line_main_oit(
+    LineVertexOut in [[stage_in]],
+    constant MaterialUniforms& material [[buffer(0)]],
+    constant LightUniforms& lights [[buffer(1)]],
+    constant SceneUniforms& scene [[buffer(2)]],
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
+  return shadeLineFragmentOIT(in, material, lights, coinOffset);
+}
+
+fragment OITAccumulateOutput fragment_miter_join_line_main_oit(
+    LineVertexOut in [[stage_in]],
+    constant MaterialUniforms& material [[buffer(0)]],
+    constant LightUniforms& lights [[buffer(1)]],
+    constant SceneUniforms& scene [[buffer(2)]],
+    constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
+  return shadeLineFragmentOIT(in, material, lights, coinOffset);
 }
 
 // ---------------------------------------------------------------------------

@@ -92,6 +92,10 @@ protected:
   void EnsureThickLinePipelineState(void* mtlDevice, bool lightingDisabled);
   void EnsureRoundCapLinePipelineState(void* mtlDevice, bool lightingDisabled);
   void EnsureMiterJoinLinePipelineState(void* mtlDevice, bool lightingDisabled);
+  void EnsureThickLineOITPipelineState(void* mtlDevice, bool lightingDisabled);
+  void EnsureRoundCapLineOITPipelineState(void* mtlDevice, bool lightingDisabled);
+  void EnsureMiterJoinLineOITPipelineState(void* mtlDevice, bool lightingDisabled);
+  void EnsureLineOITPipelineState(void* mtlDevice);
   void UpdateMaterialUniforms(void* mtlDevice, vtkActor* actor);
   void UpdateLightUniforms(void* mtlDevice, vtkRenderer* ren);
   void UpdateCoincidentOffsetUniforms(void* mtlDevice, vtkActor* actor);
