@@ -809,8 +809,10 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
       // see vtkMetalCamera::SceneTransforms). The point pipeline (used for glyph
       // point sources and, during point selection, for every source) rasterizes
       // points at this size. GL uses 6.0px for its point-selection sprites, so
-      // match that exactly; the camera default of 1.0 is fine otherwise.
-      *reinterpret_cast<float*>(s + 260) = selectingPoints ? 6.0f : 1.0f;
+      // match that exactly; otherwise honor the actor's property point size like
+      // vtkOpenGLGlyph3DHelper (actor->GetProperty()->GetPointSize()).
+      *reinterpret_cast<float*>(s + 260) =
+        selectingPoints ? 6.0f : static_cast<float>(actor->GetProperty()->GetPointSize());
     }
   }
 
@@ -1455,6 +1457,14 @@ void vtkMetalGlyph3DMapper::DrawInstances(vtkRenderer* ren, vtkActor* actor, voi
       // point pipeline's vertex shader rasterizes [[point_size]] = scene.pointSize
       // (set to 6.0 above). Drawing all source vertices this way reproduces GL's
       // dilated selection coverage for triangle/line/point sources alike.
+      bindAndDraw(I->PtPipeline, MTLPrimitiveTypePoint, g->VertexCount, *g, *inst);
+      continue;
+    }
+    // VTK_POINTS representation draws every source vertex as a point sprite
+    // (GL's GetOpenGLMode maps all primitive types to GL_POINTS for VTK_POINTS),
+    // sized by the actor property point size via scene.pointSize.
+    if (!selectingPoints && actor->GetProperty()->GetRepresentation() == VTK_POINTS)
+    {
       bindAndDraw(I->PtPipeline, MTLPrimitiveTypePoint, g->VertexCount, *g, *inst);
       continue;
     }

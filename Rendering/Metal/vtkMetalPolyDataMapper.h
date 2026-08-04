@@ -33,6 +33,11 @@ public:
   void ReleaseGraphicsResources(vtkWindow*) override;
   MapperHashType GenerateHash(vtkPolyData* polydata) override;
 
+  // Store the VBO shift-scale method (the base class virtual setter is empty).
+  // The method keys the per-frame shift/scale computation in RenderPiece; the
+  // Modified() forces a geometry rebuild when the method changes.
+  void SetVBOShiftScaleMethod(int method) override;
+
   // 8D: Vertex attribute mapping — map VTK data arrays to generic vertex attributes
   void MapDataArrayToVertexAttribute(const char* vertexAttributeName,
     const char* dataArrayName,

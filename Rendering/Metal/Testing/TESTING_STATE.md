@@ -20,7 +20,15 @@ Two test surfaces exist:
    registers the same ~175 tests once per backend and was wired up for Metal
        through    object-factory overrides (`--vtk-factory-prefer
                RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
-                 crash)**. Current working-tree status: **166 pass / 9 fail (0 crash)** —
+                 crash)**. Current working-tree status: **172 pass / 3 fail (0 crash)** —
+        the last three composite-mapper selection/coloring failures are closed by
+        the field-data color-index and composite-id fixes below
+        (`TestCompositePolyDataMapperPartialFieldData`,
+        `TestCompositePolyDataMapperPicking` and
+        `TestCompositePolyDataMapperPickability` now pass; see the composite
+        selection/coloring section below); the remaining 3 failures are the
+        pre-existing non-image pick class (`TestPointSelection`,
+        `TestPointSelectionWithCellData`, `TestPickTextActor`),
         `TestGlyph3DMapperCompositeDisplayAttributeInheritance` now passes via the
        composite per-block display-attribute inheritance port in the Metal glyph
        mapper (see the composite display-attribute section below),
@@ -593,9 +601,76 @@ were never clipped), and `TestRenderLinesAsTubes` /
 now emits GL's flat NoLighting green via `lights.lightCount == 0` instead of the
 synthesized-headlight gray). See the normal-matrix and line/point clip-plane
 sections below. The +4 pass delta over the previous run is exactly those four
-tests; the failure set is otherwise unchanged (5 image-compare + 1 below-threshold
+ tests; the failure set is otherwise unchanged (5 image-compare + 1 below-threshold
 pick-check + 3 non-image fails, no new failures). The regression check against
 the documented passing cluster reports none.
+Run after the composite field-data/composite-id picking fixes (this run,
+2026-08-05): 172 Passed / 3 Failed / 0 aborted out of 175 (analyzed with
+`analyze_metal_ctest_log.py` from a single `ctest -R "RenderingCoreCxx-Metal" -j 8`
+run; failures exported with `export_image_compare.sh --no-run`) — three
+composite-mapper failures now pass for the first time:
+`TestCompositePolyDataMapperPartialFieldData` (was a mid-bucket 0.250855 image
+fail), `TestCompositePolyDataMapperPicking` (was a mid-bucket 0.171174 image
+fail) and `TestCompositePolyDataMapperPickability` (was the below-threshold
+pick-check fail; ImageError 0.0154542 but its own pickability check failed).
+See the composite field-data and composite-id picking section below. The +6 pass
+delta over the previous run is exactly those three tests plus the three
+documented run-to-run-flaky image-compare fails that cleared this run; the
+failure set is otherwise unchanged (3 non-image fails:
+`TestPointSelection`, `TestPointSelectionWithCellData`, `TestPickTextActor`, no
+new failures; 0 image-compare failures exported). The regression check against
+the documented passing cluster reports none.
+
+### The composite field-data / composite-id picking fixes (the last three composite-mapper failures close)
+
+`TestCompositePolyDataMapperPartialFieldData` renders multiblock cylinders where
+only some blocks carry a field-data array, mapped through the LUT. It failed at a
+mid 0.250855: the field-data blocks rendered black. GL treats field-data scalars
+(`cellFlag == 2`) as per-cell colors, but `vtkMapper::MapScalars` produces a
+single color tuple for the whole block, and the Metal mapper indexed
+`mappedColors` by the polydata *cell id* — an out-of-bounds read returning
+garbage (black). `vtkMetalPolyDataMapper` now maps the color index through a
+`mappedColorIndex` helper that, for `cellFlag == 2`, clamps to the
+`FieldDataTupleId` color (mirroring GL's `std::fill` of the single field-data
+color in `vtkOpenGLPolyDataMapper::AppendCellTextures`); the helper is applied at
+all four color-index sites (per-cell texture, wireframe, non-indexed triangles,
+lines), and `emitSurfaceColor` gained an optional color-index argument.
+
+`TestCompositePolyDataMapperPicking` failed because the GPU line-extraction step
+set `gpuTessUsed = true` even when the polygon tessellation had not run, so the
+CPU surface builder (guarded by `!gpuTessUsed`) was skipped and the surface
+vanished. `gpuTessUsed` is now set to `Internals->HasTriangles`, so the GPU
+layout is kept only when the surface was actually tessellated on the GPU.
+
+`TestCompositePolyDataMapperPickability` failed because the Metal composite path
+reported the block's raw flat index as the pick `COMPOSITE_INDEX`, while GL
+reports the value from the mapper's `CompositeIdArrayName` cell array (the test
+uses `vtkCompositeIndex`, values 7-10, vs flat indices 1-4). The Metal batched
+mapper now reads the named cell array (when present and `unsigned int`) and uses
+its per-block value, matching
+`vtkOpenGLBatchedPolyDataMapper::ProcessCompositePixelBuffers`; the flat index
+remains the fallback when no array is named.
+
+`TestCompositePolyDataMapperPicking`, `TestCompositePolyDataMapperPartialFieldData`
+and `TestCompositePolyDataMapperPickability` now pass (the full 21-test
+`Metal-TestCompositePolyDataMapper` set is green), and the suite re-ran at
+172 pass / 3 fail / 0 aborted with the failure set otherwise unchanged (the 3
+pre-existing non-image pick failures) and no regression against the documented
+passing cluster.
+
+### The VBO coordinate shift/scale port (`TestCompositePolyDataMapperCameraShiftScale` passes)
+
+GL bakes shifted/scaled float32 positions via `vtkOpenGLVertexBufferObject::
+UpdateShiftScale` and folds the inverse transform into the model matrix, keeping
+relative precision for data far from the origin. The Metal mapper now mirrors
+this: `SetVBOShiftScaleMethod` (the base-class virtual setter is empty) stores
+the mapper's shift-scale method, RenderPiece recomputes the shift/scale from the
+points range (or the camera near-plane/focal-point shift for the camera-based
+methods), a value change forces a geometry rebuild, the positions are baked as
+`(p - shift) * scale` in the triangle/line/point builders, and the inverse
+affine (`Translate(shift) * Scale(1/scale)`) is folded into the scene model
+matrix. `TestCompositePolyDataMapperCameraShiftScale` passes with this in
+place; the identity values (shift 0, scale 1) leave ordinary data unchanged.
 
 ### The normal-matrix fix (`TestResetCameraScreenSpace` now passes)
 
@@ -1665,17 +1740,27 @@ failures.
 
 ### Image-compare failures
 
-Current run (2026-08-04, resize-capture offscreen-target fix): 19 failed = 15
-image-compare (TIGHT_VALID >= 0.05) + 1 below-threshold pick-check + 3 non-image
-+ 0 aborts.
+Current run (2026-08-05, composite field-data/composite-id picking fixes): 3
+failed = 0 image-compare (TIGHT_VALID >= 0.05) + 3 non-image pick fails + 0
+aborts.
 Buckets by
 max `vtkTesting` TIGHT_VALID error per test (threshold 0.05):
 
 | Bucket | Range | Count | Examples |
 |--------|-------|-------|----------|
-| near-miss | 0.05 – 0.1 | 4 | `TestRenderLinesAsTubesOrthoCamera` 0.0535, `TestRenderLinesAsTubes` 0.0535, `TestLineRenderingTranslucent` 0.0790, `TestGlyph3DMapperPicking` 0.0800 |
-| mid | 0.1 – 0.5 | 11 | `TestMixedGeometryCellScalars` 0.1373, `TestPolyDataMapperClipPlanes` 0.1526, `TestTransformCoordinateUseDouble` 0.1635, `TestCompositePolyDataMapperPicking` 0.1712, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.2241, `TestCompositePolyDataMapperPartialFieldData` 0.2544, `TestGlyph3DMapperBackfaceColor` 0.2657, `TestPolyDataMapperNormals` 0.2698, `TestResetCameraScreenSpace` 0.3438, `TestCompositePolyDataMapperCameraShiftScale` 0.3601, `TestGlyph3DMapperPointSize` 0.4599 |
+| near-miss | 0.05 – 0.1 | 0 | — |
+| mid | 0.1 – 0.5 | 0 | — |
 | gross | >= 0.5 | 0 | — |
+
+The three composite failures listed in the previous run's buckets
+(`TestCompositePolyDataMapperPicking` 0.1712,
+`TestCompositePolyDataMapperPartialFieldData` 0.2544 and the below-threshold
+pick-check `TestCompositePolyDataMapperPickability`) all left via the composite
+field-data / composite-id picking fixes above; `TestCompositePolyDataMapperCameraShiftScale`
+(past mid 0.3601) has passed since the VBO shift/scale work. The only remaining
+failures are the 3 non-image pick class: `TestPointSelection`,
+`TestPointSelectionWithCellData` (selection returns even-only point ids,
+pick-check fails) and `TestPickTextActor` (pick check).
 
 (`TestNActors{OneMapper,NMappersOneInput}` left the mid bucket via the
 per-actor edge-color fix above (passing at ~1.2e-05), and
@@ -1738,13 +1823,22 @@ test; the bucket membership is otherwise unchanged.) This run the mid bucket dro
 to 15: `TestResizingWindowToImageFilter` (mid 0.4130) left via the
 resize-capture offscreen-target gate fix above — the first time it has passed
 (all four resolutions, TIGHT_VALID ≤ 5.4e-04). The +1 pass delta is exactly that
-test; the bucket membership is otherwise unchanged.
+test; the bucket membership is otherwise unchanged.) This run (2026-08-05) the
+mid bucket dropped from 15 to 0 and gross from 2 to 0, and the below-threshold
+pick-check is gone: `TestCompositePolyDataMapperPicking` (mid 0.1712),
+`TestCompositePolyDataMapperPartialFieldData` (mid 0.2544) and
+`TestCompositePolyDataMapperPickability` (below-threshold pick-check) all left
+via the composite field-data / composite-id picking fixes below — the first time
+any of the three have passed. The +3 pass delta is exactly those three tests (the
+three documented run-to-run-flaky image-compare fails cleared independently); the
+failure set is otherwise the unchanged 3 non-image pick class.
 
-### Crashes (3; all pre-existing classes, none from the texture or composite clusters)
+### Crashes (historical; 0 in the current run)
 
 Signal-level crashes are reported as `Subprocess aborted` with a `Caught
 SIGSEGV` line but no backtrace in the ctest log, so crash causes were
-re-derived from the earlier run's full signal stacks. Current-run attribution:
+re-derived from the earlier run's full signal stacks. The current run (2026-08-05)
+reports 0 aborts; the historical crash rows below are all resolved:
 
 | Cause | Count | Tests |
 |-------|-------|-------|
@@ -1760,9 +1854,11 @@ The 6-test label/text/image class (`TestFollowerPicking`,
 `TestTranslucentImageActor{AlphaBlending,DepthPeeling}`, `TestWindowToImageFilter`)
 that rounded out the 9 in the 2026-08-02 run has run clean since the
 2026-08-03 wireframe-lines run and stays within the documented run-to-run
-flakiness. The 3 remaining crashes are genuine Metal bugs, all the label/text
-OpenGL-fallback class that the `vtkMetalTexture` fix did not cover (no
-`vtkTexture` involved).
+flakiness. The 3 label/text crashes (genuine Metal bugs, all the label/text
+OpenGL-fallback class that the `vtkMetalTexture` fix did not cover — no
+`vtkTexture` involved) were resolved by the `vtkMetalLabeledContourMapper`
+override in the labeled-contour-mapper fix run (see the labeled-contour-mapper
+section above); all runs since that one report 0 aborts.
 
 ### The MSAA crash is fixed
 
@@ -2060,13 +2156,18 @@ against the previously-passing cluster is clean.
   failing image comparison on texture-feature fidelity (filter/wrap/interpolation
   edge cases).
 - **Composite mapper** (~19): the crash cluster is gone (see above), and
-  `TestCompositePolyDataMapper{Scalars,CellScalars,Spheres,Vertices,Picking,
-  PartialFieldData,CameraShiftScale,CustomShader,MixedGeometry*,
-  Pickability}` now render, but still fail image comparison — the largest
-  failing cluster. (`TestCompositePolyDataMapperBlockTextures`,
+  `TestCompositePolyDataMapper{Scalars,CellScalars,Spheres,Vertices,MixedGeometry*}`
+  now render but still fail image comparison. The picking/coloring cluster is
+  closed: `TestCompositePolyDataMapperPicking`,
+  `TestCompositePolyDataMapperPartialFieldData`,
+  `TestCompositePolyDataMapperPickability` and
+  `TestCompositePolyDataMapperCameraShiftScale` all pass (see the composite
+  field-data / composite-id picking section above, and the VBO shift/scale
+  work below). (`TestCompositePolyDataMapperBlockTextures`,
   `TestCompositePolyDataMapperOverrideScalarArray`,
-  `TestCompositePolyDataMapperNaNPartial` and
-  `TestCompositePolyDataMapperOverrideLUT` now pass via the per-block
+  `TestCompositePolyDataMapperNaNPartial`,
+  `TestCompositePolyDataMapperOverrideLUT` and
+  `TestCompositePolyDataMapperCustomShader` also pass via the per-block
   texture/scalar-attribute ports and the scalar-texture LUT pipeline described
   in the composite-cluster / scalar-texture-LUT sections above.)
 - **Glyph instancing** (~8): `TestGlyph3DMapper{Arrow,BackfaceColor,Indexing,

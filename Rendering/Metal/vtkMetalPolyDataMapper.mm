@@ -1004,6 +1004,17 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   // pipeline has stamped it during the first render.
   vtkMTimeType CachedActorMTime = 0;
 
+  // VBO coordinate shift/scale (mirrors vtkOpenGLVertexBufferObject::UpdateShiftScale).
+  // Vertex positions are baked into the float32 buffers as
+  // (coord - VBOShift) * VBOScale; the inverse affine transform is folded into
+  // the scene model matrix at record time so world-space positions are exact.
+  // Rebuilt per-frame in RenderPiece from the mapper's shift-scale method and
+  // the active camera; a change forces a geometry rebuild (the bake-in is only
+  // valid while the baked values are current).
+  double VBOShift[3] = { 0.0, 0.0, 0.0 };
+  double VBOScale[3] = { 1.0, 1.0, 1.0 };
+  bool VBOShiftScaleEnabled = false;
+
   // Weak reference to the owning render window (set by RenderPiece).
   // Used by Ensure* methods to access the cached shader library.
   vtkMetalRenderWindow* CachedRenderWindow = nullptr;
@@ -1435,6 +1446,16 @@ vtkMetalPolyDataMapper::MapperHashType vtkMetalPolyDataMapper::GenerateHash(vtkP
     return 0;
   }
   return static_cast<MapperHashType>(polydata->GetMTime());
+}
+
+void vtkMetalPolyDataMapper::SetVBOShiftScaleMethod(int method)
+{
+  if (this->ShiftScaleMethod == method)
+  {
+    return;
+  }
+  this->ShiftScaleMethod = method;
+  this->Modified();
 }
 
 void vtkMetalPolyDataMapper::ReleaseGraphicsResources(vtkWindow* w)
@@ -3076,13 +3097,148 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     vtkMTimeType batchOverrideMTime = this->Internals->BatchOverrideMTime;
     vtkMTimeType actorMTime = act ? act->GetMTime() : 0;
 
+    // VBO coordinate shift/scale (mirrors vtkOpenGLVertexBufferObject::
+    // UpdateShiftScale). The computed values are baked into the geometry
+    // buffers in BuildGeometryBuffers and the inverse affine transform is
+    // folded into the scene model matrix below, so whenever the values change
+    // the geometry must be rebuilt — the gate below forces that. With
+    // DISABLE_SHIFT_SCALE (and for near-origin data under AUTO_SHIFT_SCALE) the
+    // identity values are kept and nothing changes.
+    bool vboShiftScaleChanged = false;
+    vtkDataArray* pointsArray =
+      input->GetPoints() ? input->GetPoints()->GetData() : nullptr;
+    if (pointsArray)
+    {
+      int ssMethod = this->GetVBOShiftScaleMethod();
+      bool enabled = false;
+      double shift[3] = { 0.0, 0.0, 0.0 };
+      double scale[3] = { 1.0, 1.0, 1.0 };
+
+      if (ssMethod != vtkPolyDataMapper::DISABLE_SHIFT_SCALE)
+      {
+        if (ssMethod == vtkPolyDataMapper::AUTO_SHIFT_SCALE)
+        {
+          // diag2 / dist2 heuristic from the GL VBO: enable only when the data
+          // is far from the origin relative to its size, or huge when near it.
+          double diag2 = 0.0;
+          double dist2 = 0.0;
+          int comps = pointsArray->GetNumberOfComponents();
+          for (int i = 0; i < comps; ++i)
+          {
+            double range[2];
+            pointsArray->GetRange(range, i);
+            double delta = range[1] - range[0];
+            diag2 += delta * delta;
+            double dshift = 0.5 * (range[1] + range[0]);
+            dist2 += dshift * dshift;
+          }
+          enabled =
+            (diag2 > 0 &&
+              (std::fabs(dist2) / diag2 > 1.0e6 || std::fabs(std::log10(diag2)) > 3.0)) ||
+            (diag2 == 0 && dist2 > 1.0e6);
+        }
+        else
+        {
+          enabled = true;
+        }
+
+        if (enabled)
+        {
+          if (ssMethod == vtkPolyDataMapper::AUTO_SHIFT_SCALE ||
+            ssMethod == vtkPolyDataMapper::ALWAYS_AUTO_SHIFT_SCALE)
+          {
+            // Bounds-based shift/scale: shift to the center, scale by extent.
+            for (int i = 0; i < 3; ++i)
+            {
+              double range[2];
+              pointsArray->GetRange(range, i);
+              shift[i] = 0.5 * (range[1] + range[0]);
+              double delta = range[1] - range[0];
+              scale[i] = (delta > 0) ? (1.0 / delta) : 1.0;
+            }
+          }
+          else if (ssMethod == vtkPolyDataMapper::AUTO_SHIFT)
+          {
+            for (int i = 0; i < 3; ++i)
+            {
+              double range[2];
+              pointsArray->GetRange(range, i);
+              shift[i] = 0.5 * (range[1] + range[0]);
+            }
+          }
+          else if (ssMethod == vtkPolyDataMapper::NEAR_PLANE_SHIFT_SCALE ||
+            ssMethod == vtkPolyDataMapper::FOCAL_POINT_SHIFT_SCALE)
+          {
+            // Camera-based shift/scale pushed through the inverse actor matrix.
+            vtkCamera* cam = ren->GetActiveCamera();
+            if (cam)
+            {
+              double* ishift = cam->GetNearPlaneShift();
+              double iscale = cam->GetNearPlaneScale();
+              if (ssMethod == vtkPolyDataMapper::FOCAL_POINT_SHIFT_SCALE)
+              {
+                ishift = cam->GetFocalPointShift();
+                iscale = cam->GetFocalPointScale();
+              }
+              double amatrix[16];
+              act->GetMatrix(amatrix);
+              double imatrix[16];
+              vtkMatrix4x4::Invert(amatrix, imatrix);
+              double tmp[4];
+              tmp[0] = ishift[0];
+              tmp[1] = ishift[1];
+              tmp[2] = ishift[2];
+              tmp[3] = 1.0;
+              vtkMatrix4x4::MultiplyPoint(imatrix, tmp, tmp);
+              shift[0] = tmp[0] / tmp[3];
+              shift[1] = tmp[1] / tmp[3];
+              shift[2] = tmp[2] / tmp[3];
+              tmp[0] = iscale;
+              tmp[1] = iscale;
+              tmp[2] = iscale;
+              tmp[3] = 1.0;
+              vtkMatrix4x4::MultiplyPoint(imatrix, tmp, tmp);
+              scale[0] = tmp[0] ? (tmp[3] / tmp[0]) : 1.0;
+              scale[1] = tmp[1] ? (tmp[3] / tmp[1]) : 1.0;
+              scale[2] = tmp[2] ? (tmp[3] / tmp[2]) : 1.0;
+            }
+            else
+            {
+              enabled = false;
+            }
+          }
+        }
+      }
+
+      bool changed =
+        enabled != this->Internals->VBOShiftScaleEnabled ||
+        shift[0] != this->Internals->VBOShift[0] ||
+        shift[1] != this->Internals->VBOShift[1] ||
+        shift[2] != this->Internals->VBOShift[2] ||
+        scale[0] != this->Internals->VBOScale[0] ||
+        scale[1] != this->Internals->VBOScale[1] ||
+        scale[2] != this->Internals->VBOScale[2];
+      if (changed)
+      {
+        this->Internals->VBOShiftScaleEnabled = enabled;
+        this->Internals->VBOShift[0] = shift[0];
+        this->Internals->VBOShift[1] = shift[1];
+        this->Internals->VBOShift[2] = shift[2];
+        this->Internals->VBOScale[0] = scale[0];
+        this->Internals->VBOScale[1] = scale[1];
+        this->Internals->VBOScale[2] = scale[2];
+        vboShiftScaleChanged = true;
+      }
+    }
+
     if (currentMTime != this->Internals->CachedInputMTime ||
         representation != this->Internals->CachedRepresentation ||
         edgeVisibility != this->Internals->CachedEdgeVisibility ||
         extraMTime != this->Internals->CachedExtraAttributesMTime ||
         scalarMTime != this->Internals->CachedScalarMTime ||
         batchOverrideMTime != this->Internals->CachedBatchOverrideMTime ||
-        actorMTime != this->Internals->CachedActorMTime)
+        actorMTime != this->Internals->CachedActorMTime ||
+        vboShiftScaleChanged)
     {
       this->Internals->ReleaseBuffers();
       this->Internals->CachedInputMTime = currentMTime;
@@ -3310,12 +3466,29 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       {
         vtkNew<vtkMatrix4x4> actorMatrix;
         act->GetModelToWorldMatrix(actorMatrix);
+
+        // When VBO coordinates were shifted/scaled (the positions are baked as
+        // (p - shift) * scale), the model matrix must map the baked values back
+        // to model space: adjusted = actorMatrix * Translate(shift) * Scale(1/scale).
+        // With the shift-scale disabled the extra transform is the identity, so
+        // the multiply is unconditional.
+        vtkNew<vtkMatrix4x4> vboInverse;
+        vboInverse->Identity();
+        vboInverse->SetElement(0, 0, 1.0 / this->Internals->VBOScale[0]);
+        vboInverse->SetElement(1, 1, 1.0 / this->Internals->VBOScale[1]);
+        vboInverse->SetElement(2, 2, 1.0 / this->Internals->VBOScale[2]);
+        vboInverse->SetElement(0, 3, this->Internals->VBOShift[0]);
+        vboInverse->SetElement(1, 3, this->Internals->VBOShift[1]);
+        vboInverse->SetElement(2, 3, this->Internals->VBOShift[2]);
+        vtkNew<vtkMatrix4x4> adjusted;
+        vtkMatrix4x4::Multiply4x4(actorMatrix, vboInverse, adjusted);
+
         float* modelMat = reinterpret_cast<float*>(buf + 176);
         for (int col = 0; col < 4; ++col)
         {
           for (int row = 0; row < 4; ++row)
           {
-            modelMat[col * 4 + row] = static_cast<float>(actorMatrix->GetElement(row, col));
+            modelMat[col * 4 + row] = static_cast<float>(adjusted->GetElement(row, col));
           }
         }
 
@@ -3673,6 +3846,15 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   this->Internals->SurfaceUsesIndexedEntry =
     edgeVis && rep == VTK_SURFACE && !this->UseLegacyEdgeOverlay;
 
+  // VBO coordinate shift/scale: positions are baked as (pt - VBOShift) * VBOScale
+  // so the float32 buffers keep full relative precision for data far from the
+  // origin (mirrors vtkOpenGLVertexBufferObject::UpdateShiftScale). The inverse
+  // affine transform is folded into the scene model matrix in RenderPiece, so the
+  // values are read here only. When disabled the identity (shift 0, scale 1)
+  // leaves the emitted coordinates unchanged.
+  const double* vboShift = this->Internals->VBOShift;
+  const double* vboScale = this->Internals->VBOScale;
+
   // The triangle/peel pipelines bake the indexed-entry vertex function. When
   // the key flips at runtime (e.g. the UseLegacyEdgeOverlay A/B switch), the
   // cached pipelines must be invalidated so the rebuild picks the right vertex
@@ -4002,19 +4184,23 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   const float* scalarCoordPtr = useScalarLUT
     ? static_cast<const float*>(this->ColorCoordinates->GetVoidPointer(0))
     : nullptr;
-  auto emitSurfaceColor = [&](vtkIdType idx, const unsigned char* colors)
+  auto emitSurfaceColor = [&](vtkIdType idx, const unsigned char* colors, vtkIdType colorIdx = -1)
   {
     if (useScalarLUT)
     {
       triangleScalarCoords.push_back(scalarCoordPtr[idx * 2]);
       triangleScalarCoords.push_back(scalarCoordPtr[idx * 2 + 1]);
     }
+    if (colorIdx < 0)
+    {
+      colorIdx = idx;
+    }
     if (colors && !this->Internals->UseBatchColor)
     {
-      float r = colors[idx * 4] / 255.0f;
-      float g = colors[idx * 4 + 1] / 255.0f;
-      float b = colors[idx * 4 + 2] / 255.0f;
-      float a = colors[idx * 4 + 3] / 255.0f;
+      float r = colors[colorIdx * 4] / 255.0f;
+      float g = colors[colorIdx * 4 + 1] / 255.0f;
+      float b = colors[colorIdx * 4 + 2] / 255.0f;
+      float a = colors[colorIdx * 4 + 3] / 255.0f;
       if (this->Internals->UseBatchOpacity)
       {
         a = static_cast<float>(this->Internals->BatchOpacity);
@@ -4035,6 +4221,29 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     }
   };
 
+  // Index into mappedColors for a given polydata cell. Per-cell scalars
+  // (cellFlag == 1) map one color per cell, but field-data scalars
+  // (cellFlag == 2) produce a single color for the whole block (this->Colors
+  // holds one tuple per field-array tuple, typically 1). Match GL's
+  // BuildCellTextures (vtkOpenGLPolyDataMapper.cxx) which fills every cell
+  // with the FieldDataTupleId color; never index past the color array.
+  auto mappedColorIndex = [&](vtkIdType cellId) -> vtkIdType
+  {
+    if (!mappedColors)
+    {
+      return cellId;
+    }
+    if (cellFlag == 2)
+    {
+      const vtkIdType fdt =
+        (this->FieldDataTupleId > -1 && this->ScalarMode == VTK_SCALAR_MODE_USE_FIELD_DATA)
+        ? this->FieldDataTupleId
+        : 0;
+      return std::min(fdt, mappedColors->GetNumberOfTuples() - 1);
+    }
+    return cellId;
+  };
+
   // Per-cell color port: emit one float4 RGBA for an output triangle into
   // cellColors (indexed by primitive id in the fragment shader). Mirrors
   // emitSurfaceColor's batch-override handling.
@@ -4043,10 +4252,11 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     if (mappedColors && !this->Internals->UseBatchColor)
     {
       const unsigned char* colors = mappedColors->GetPointer(0);
-      float r = colors[idx * 4] / 255.0f;
-      float g = colors[idx * 4 + 1] / 255.0f;
-      float b = colors[idx * 4 + 2] / 255.0f;
-      float a = colors[idx * 4 + 3] / 255.0f;
+      const vtkIdType ci = mappedColorIndex(idx);
+      float r = colors[ci * 4] / 255.0f;
+      float g = colors[ci * 4 + 1] / 255.0f;
+      float b = colors[ci * 4 + 2] / 255.0f;
+      float a = colors[ci * 4 + 3] / 255.0f;
       if (this->Internals->UseBatchOpacity)
       {
         a = static_cast<float>(this->Internals->BatchOpacity);
@@ -4796,7 +5006,14 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
                 this->Internals->ThickLineSegmentCount = numLineSegs;
                 this->Internals->RoundCapLineSegmentCount = numLineSegs;
                 this->Internals->MiterJoinLineSegmentCount = numLineSegs;
-                gpuTessUsed = true;
+                // Line extraction alone must not switch the vertex buffers to
+                // the per-point GPU-tessellated layout: the surface is still
+                // built on the CPU when the polygon tessellation did not run
+                // (small geometries, missing normals). Only keep the GPU layout
+                // when the surface was actually tessellated on the GPU
+                // (HasTriangles) — otherwise the CPU surface builder below
+                // would be skipped and the surface would not render.
+                gpuTessUsed = this->Internals->HasTriangles;
               }
               else
               {
@@ -4837,9 +5054,9 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     {
       double pt[3];
       polydata->GetPoint(i, pt);
-      positions.push_back(static_cast<float>(pt[0]));
-      positions.push_back(static_cast<float>(pt[1]));
-      positions.push_back(static_cast<float>(pt[2]));
+      positions.push_back(static_cast<float>((pt[0] - vboShift[0]) * vboScale[0]));
+      positions.push_back(static_cast<float>((pt[1] - vboShift[1]) * vboScale[1]));
+      positions.push_back(static_cast<float>((pt[2] - vboShift[2]) * vboScale[2]));
 
       if (normalArray)
       {
@@ -4913,7 +5130,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   auto emitWireframeColor = [&](vtkIdType pointId, vtkIdType cellId)
   {
     const unsigned char* rgba = mappedColors ? mappedColors->GetPointer(0) : nullptr;
-    vtkIdType idx = (cellFlag == 0) ? pointId : cellId;
+    vtkIdType idx = (cellFlag == 0) ? pointId : mappedColorIndex(cellId);
     if (rgba && !this->Internals->UseBatchColor)
     {
       float a = rgba[idx * 4 + 3] / 255.0f;
@@ -4959,9 +5176,9 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
 
     double p[3];
     polydata->GetPoint(v, p);
-    positions.push_back(static_cast<float>(p[0]));
-    positions.push_back(static_cast<float>(p[1]));
-    positions.push_back(static_cast<float>(p[2]));
+    positions.push_back(static_cast<float>((p[0] - vboShift[0]) * vboScale[0]));
+    positions.push_back(static_cast<float>((p[1] - vboShift[1]) * vboScale[1]));
+    positions.push_back(static_cast<float>((p[2] - vboShift[2]) * vboScale[2]));
     if (normalArray)
     {
       double n[3];
@@ -5052,9 +5269,12 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
         {
           for (int j = 0; j < 3; ++j)
           {
-            trianglePos.push_back(static_cast<float>(triPt[j][0]));
-            trianglePos.push_back(static_cast<float>(triPt[j][1]));
-            trianglePos.push_back(static_cast<float>(triPt[j][2]));
+            trianglePos.push_back(
+              static_cast<float>((triPt[j][0] - vboShift[0]) * vboScale[0]));
+            trianglePos.push_back(
+              static_cast<float>((triPt[j][1] - vboShift[1]) * vboScale[1]));
+            trianglePos.push_back(
+              static_cast<float>((triPt[j][2] - vboShift[2]) * vboScale[2]));
           }
         }
       }
@@ -5078,9 +5298,9 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
 
           double pt[3];
           polydata->GetPoint(tri[j], pt);
-          positions.push_back(static_cast<float>(pt[0]));
-          positions.push_back(static_cast<float>(pt[1]));
-          positions.push_back(static_cast<float>(pt[2]));
+          positions.push_back(static_cast<float>((pt[0] - vboShift[0]) * vboScale[0]));
+          positions.push_back(static_cast<float>((pt[1] - vboShift[1]) * vboScale[1]));
+          positions.push_back(static_cast<float>((pt[2] - vboShift[2]) * vboScale[2]));
 
           // useIndexBuffer requires normalArray, so it's always non-null here
           double nn[3];
@@ -5136,8 +5356,8 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       {
         float e1[3] = { (float)(p[1][0] - p[0][0]), (float)(p[1][1] - p[0][1]), (float)(p[1][2] - p[0][2]) };
         float e2[3] = { (float)(p[2][0] - p[0][0]), (float)(p[2][1] - p[0][1]), (float)(p[2][2] - p[0][2]) };
-        float ne1 = std::sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
-        float ne2 = std::sqrt(e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]);
+        float ne1 = std::hypot(e1[0], e1[1], e1[2]);
+        float ne2 = std::hypot(e2[0], e2[1], e2[2]);
         if (ne1 > 1e-8f && ne2 > 1e-8f)
         {
           e1[0] /= ne1; e1[1] /= ne1; e1[2] /= ne1;
@@ -5147,7 +5367,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
         fn[0] = e1[1] * e2[2] - e1[2] * e2[1];
         fn[1] = e1[2] * e2[0] - e1[0] * e2[2];
         fn[2] = e1[0] * e2[1] - e1[1] * e2[0];
-        float normalLength = std::sqrt(fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2]);
+        float normalLength = std::hypot(fn[0], fn[1], fn[2]);
         if (normalLength > 1e-8f) { fn[0] /= normalLength; fn[1] /= normalLength; fn[2] /= normalLength; }
         faceNormal[0] = fn[0]; faceNormal[1] = fn[1]; faceNormal[2] = fn[2];
       }
@@ -5162,15 +5382,15 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
           // positions (identical for all 3 corners).
           for (int r = 0; r < 3; ++r)
           {
-            trianglePos.push_back(static_cast<float>(p[r][0]));
-            trianglePos.push_back(static_cast<float>(p[r][1]));
-            trianglePos.push_back(static_cast<float>(p[r][2]));
+            trianglePos.push_back(static_cast<float>((p[r][0] - vboShift[0]) * vboScale[0]));
+            trianglePos.push_back(static_cast<float>((p[r][1] - vboShift[1]) * vboScale[1]));
+            trianglePos.push_back(static_cast<float>((p[r][2] - vboShift[2]) * vboScale[2]));
           }
         }
 
-        positions.push_back(static_cast<float>(p[j][0]));
-        positions.push_back(static_cast<float>(p[j][1]));
-        positions.push_back(static_cast<float>(p[j][2]));
+        positions.push_back(static_cast<float>((p[j][0] - vboShift[0]) * vboScale[0]));
+        positions.push_back(static_cast<float>((p[j][1] - vboShift[1]) * vboScale[1]));
+        positions.push_back(static_cast<float>((p[j][2] - vboShift[2]) * vboScale[2]));
 
         // P2-2: Per-vertex normals (use each vertex's own normal when available)
         if (normalArray)
@@ -5191,7 +5411,8 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
         // P1-1A/1B: per-vertex color — point index for per-point coloring
         // (cellFlag == 0), cell index for per-cell coloring.
         emitSurfaceColor((cellFlag == 0) ? tri[j] : cellId,
-          mappedColors ? mappedColors->GetPointer(0) : nullptr);
+          mappedColors ? mappedColors->GetPointer(0) : nullptr,
+          (cellFlag == 0) ? tri[j] : mappedColorIndex(cellId));
 
         // P5-5A: texture coordinates for non-indexed triangle vertex
         if (tcoordArray && tcoordArray->GetNumberOfTuples() > tri[j])
@@ -5484,9 +5705,9 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
 
           double p[3];
           polydata->GetPoint(pointId, p);
-          edgePositions.push_back(static_cast<float>(p[0]));
-          edgePositions.push_back(static_cast<float>(p[1]));
-          edgePositions.push_back(static_cast<float>(p[2]));
+          edgePositions.push_back(static_cast<float>((p[0] - vboShift[0]) * vboScale[0]));
+          edgePositions.push_back(static_cast<float>((p[1] - vboShift[1]) * vboScale[1]));
+          edgePositions.push_back(static_cast<float>((p[2] - vboShift[2]) * vboScale[2]));
 
           if (normalArray)
           {
@@ -5623,10 +5844,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
       while (lines->GetNextCell(npts, pts) && npts > 0)
       {
         const unsigned char* rgba = mappedColors->GetPointer(0);
-        float cr = rgba[lineCellIdx * 4] / 255.0f;
-        float cg = rgba[lineCellIdx * 4 + 1] / 255.0f;
-        float cb = rgba[lineCellIdx * 4 + 2] / 255.0f;
-        float ca = rgba[lineCellIdx * 4 + 3] / 255.0f;
+        float cr = rgba[mappedColorIndex(lineCellIdx) * 4] / 255.0f;
+        float cg = rgba[mappedColorIndex(lineCellIdx) * 4 + 1] / 255.0f;
+        float cb = rgba[mappedColorIndex(lineCellIdx) * 4 + 2] / 255.0f;
+        float ca = rgba[mappedColorIndex(lineCellIdx) * 4 + 3] / 255.0f;
         if (this->Internals->UseBatchOpacity)
         {
           ca = static_cast<float>(this->Internals->BatchOpacity);
@@ -5636,9 +5857,9 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
         {
           double pt[3];
           polydata->GetPoint(pts[i], pt);
-          positions.push_back(static_cast<float>(pt[0]));
-          positions.push_back(static_cast<float>(pt[1]));
-          positions.push_back(static_cast<float>(pt[2]));
+          positions.push_back(static_cast<float>((pt[0] - vboShift[0]) * vboScale[0]));
+          positions.push_back(static_cast<float>((pt[1] - vboShift[1]) * vboScale[1]));
+          positions.push_back(static_cast<float>((pt[2] - vboShift[2]) * vboScale[2]));
           if (normalArray)
           {
             double n[3];
@@ -5697,9 +5918,9 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
             pointMap[pts[i]] = nextPointId++;
             double pt[3];
             polydata->GetPoint(pts[i], pt);
-            positions.push_back(static_cast<float>(pt[0]));
-            positions.push_back(static_cast<float>(pt[1]));
-            positions.push_back(static_cast<float>(pt[2]));
+            positions.push_back(static_cast<float>((pt[0] - vboShift[0]) * vboScale[0]));
+            positions.push_back(static_cast<float>((pt[1] - vboShift[1]) * vboScale[1]));
+            positions.push_back(static_cast<float>((pt[2] - vboShift[2]) * vboScale[2]));
             if (normalArray)
             {
               double n[3];
@@ -5804,6 +6025,11 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
   std::unordered_map<std::string, std::vector<float>>& extraAttrArrays)
 {
   id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
+
+  // VBO coordinate shift/scale (see BuildGeometryBuffers): positions are baked
+  // as (pt - VBOShift) * VBOScale; identity when disabled.
+  const double* vboShift = this->Internals->VBOShift;
+  const double* vboScale = this->Internals->VBOScale;
 
   if (!positions.empty())
   {
@@ -6323,9 +6549,12 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
     {
       double pt[3];
       polydata->GetPoint(i, pt);
-      pointPositions[i * 3] = static_cast<float>(pt[0]);
-      pointPositions[i * 3 + 1] = static_cast<float>(pt[1]);
-      pointPositions[i * 3 + 2] = static_cast<float>(pt[2]);
+      pointPositions[i * 3] =
+        static_cast<float>((pt[0] - vboShift[0]) * vboScale[0]);
+      pointPositions[i * 3 + 1] =
+        static_cast<float>((pt[1] - vboShift[1]) * vboScale[1]);
+      pointPositions[i * 3 + 2] =
+        static_cast<float>((pt[2] - vboShift[2]) * vboScale[2]);
     }
     id<MTLBuffer> ptPosBuf = [device
       newBufferWithBytes:pointPositions.data()

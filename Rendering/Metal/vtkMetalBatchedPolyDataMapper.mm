@@ -307,6 +307,7 @@ void vtkMetalBatchedPolyDataMapper::ConfigureChildMapper(
     child->SetInterpolateScalarsBeforeMapping(
         this->GetInterpolateScalarsBeforeMapping());
     child->SetLookupTable(this->GetLookupTable());
+    child->SetVBOShiftScaleMethod(this->GetVBOShiftScaleMethod());
 
     // Remove any stale mappings that may exist from a previous configuration
     child->RemoveAllVertexAttributeMappings();
@@ -458,13 +459,31 @@ void vtkMetalBatchedPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     // The prop ID is derived per-render by the child mapper from the active
     // hardware selector (the parent actor's index in the selector's visible
     // PropArray), so all blocks of this batched mapper report the parent
-    // actor's prop. The composite channel carries the block's FlatIndex so
+    // actor's prop. The composite channel carries the block's composite id so
     // the picked block can be identified on readback.
     bool pickable = actorPickable && elem->Pickability;
     if (pickable)
     {
       mapper->ClearOverridePropId();
-      mapper->SetOverrideCompositeIndex(elem->FlatIndex);
+
+      // When the parent names a composite-id cell array, report the block's
+      // composite id from that array (matching
+      // vtkOpenGLBatchedPolyDataMapper::ProcessCompositePixelBuffers, which
+      // replaces the drawn flat index with the composite-array value) instead
+      // of the raw flat index. The array is constant per block for the
+      // standard use, so the first tuple reproduces GL's per-cell result.
+      unsigned int compositeIndex = elem->FlatIndex;
+      if (this->Parent)
+      {
+        const char* cidName = this->Parent->GetCompositeIdArrayName();
+        vtkCellData* cd = elem->PolyData ? elem->PolyData->GetCellData() : nullptr;
+        vtkDataArray* cid = (cidName && cd) ? cd->GetArray(cidName) : nullptr;
+        if (cid && cid->GetNumberOfTuples() > 0 && cid->GetDataType() == VTK_UNSIGNED_INT)
+        {
+          compositeIndex = static_cast<unsigned int>(cid->GetTuple1(0));
+        }
+      }
+      mapper->SetOverrideCompositeIndex(compositeIndex);
     }
     else
     {
