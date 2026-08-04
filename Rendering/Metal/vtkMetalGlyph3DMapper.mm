@@ -73,6 +73,10 @@ enum GlyphBufferSlot : int
 // Scene-uniform flag bit indicating the glyph source carries point normals.
 // Must match kSceneFlagGlyphHasNormals in MetalShaders.metal.
 constexpr uint32_t VTK_METAL_SCENE_FLAG_GLYPH_HAS_NORMALS = 1u << 15;
+// Scene-uniform flag bit indicating the actor has a backface property (the
+// glyph fragment then swaps in the backface material for back faces).
+// Must match kSceneFlagGlyphHasBackface in MetalShaders.metal.
+constexpr uint32_t VTK_METAL_SCENE_FLAG_GLYPH_HAS_BACKFACE = 1u << 18;
 
 // ---------------------------------------------------------------------------
 // Per-instance glyph data computed on CPU and uploaded to GPU
@@ -1061,7 +1065,36 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     mb[12] = mb[13] = mb[14] = mb[15] = 0.f;
     mb[16] = p->GetOpacity();
     mb[17] = p->GetSpecularPower();
+    // Backface material: mirror the front material, then override with the
+    // actor's backface property when present (matches vtkOpenGLGlyph3DHelper,
+    // which substitutes the backface property's lighting params on backfaces).
     memcpy(&mb[20], &mb[0], 18 * sizeof(float));
+    if (vtkProperty* backProp = actor->GetBackfaceProperty())
+    {
+      double bac[3], bdc[3], bsc[3], brgb[3];
+      backProp->GetAmbientColor(bac);
+      backProp->GetDiffuseColor(bdc);
+      backProp->GetSpecularColor(bsc);
+      backProp->GetColor(brgb);
+      mb[20] = static_cast<float>(bac[0]);
+      mb[21] = static_cast<float>(bac[1]);
+      mb[22] = static_cast<float>(bac[2]);
+      mb[23] = static_cast<float>(backProp->GetAmbient());
+      mb[24] = static_cast<float>(bdc[0]);
+      mb[25] = static_cast<float>(bdc[1]);
+      mb[26] = static_cast<float>(bdc[2]);
+      mb[27] = static_cast<float>(backProp->GetDiffuse());
+      mb[28] = static_cast<float>(bsc[0]);
+      mb[29] = static_cast<float>(bsc[1]);
+      mb[30] = static_cast<float>(bsc[2]);
+      mb[31] = static_cast<float>(backProp->GetSpecular());
+      mb[32] = static_cast<float>(brgb[0]);
+      mb[33] = static_cast<float>(brgb[1]);
+      mb[34] = static_cast<float>(brgb[2]);
+      mb[35] = 1.0f;
+      mb[36] = static_cast<float>(backProp->GetOpacity());
+      mb[37] = static_cast<float>(backProp->GetSpecularPower());
+    }
   }
 
   // Lights — same convention as vtkMetalPolyDataMapper: lightType 0 = headlight,
@@ -1212,6 +1245,10 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
   else
     [enc setCullMode:MTLCullModeNone];
 
+  // Whether the actor has a backface property (constant for this whole render):
+  // the glyph fragment swaps the backface material in when set.
+  bool hasBackface = actor->GetBackfaceProperty() != nullptr;
+
   // Helper lambda to bind all buffers and draw
   auto bindAndDraw =
     [&](id<MTLRenderPipelineState> pipeline, MTLPrimitiveType primType, vtkIdType vertCount,
@@ -1221,13 +1258,16 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     if (!pipeline || g.VertexCount == 0 || inst.NumInstances == 0)
       return;
     // Per-source scene flag: signal the glyph fragment whether this source
-    // carries point normals so it can skip the derivative-based fallback.
-    // Bit-pattern uint access (see the note at the memcpy site above).
+    // carries point normals so it can skip the derivative-based fallback, and
+    // whether the actor has a backface property so it can swap the backface
+    // material in. Bit-pattern uint access (see the note at the memcpy site
+    // above).
     char* sc = static_cast<char*>([I->SceneBuffer contents]);
     uint32_t flags = *reinterpret_cast<uint32_t*>(sc + 256);
     *reinterpret_cast<uint32_t*>(sc + 256) =
-      (flags & ~VTK_METAL_SCENE_FLAG_GLYPH_HAS_NORMALS) |
-      (g.HasNormals ? VTK_METAL_SCENE_FLAG_GLYPH_HAS_NORMALS : 0);
+      (flags & ~(VTK_METAL_SCENE_FLAG_GLYPH_HAS_NORMALS | VTK_METAL_SCENE_FLAG_GLYPH_HAS_BACKFACE)) |
+      (g.HasNormals ? VTK_METAL_SCENE_FLAG_GLYPH_HAS_NORMALS : 0) |
+      (hasBackface ? VTK_METAL_SCENE_FLAG_GLYPH_HAS_BACKFACE : 0);
 
     [enc setRenderPipelineState:pipeline];
     [enc setVertexBuffer:g.PositionBuffer offset:0 atIndex:kGlyphSrcPosition];

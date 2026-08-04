@@ -18,9 +18,9 @@ Two test surfaces exist:
     `vtkMetalShaderProperty` override below).
 2. The generic multi-backend suite in `Rendering/Core/Testing/Cxx/`, which
    registers the same ~175 tests once per backend and was wired up for Metal
-      through    object-factory overrides (`--vtk-factory-prefer
-         RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
-          crash)**. Current working-tree status: **156 pass / 19 fail (0 crash)** —
+       through    object-factory overrides (`--vtk-factory-prefer
+          RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
+           crash)**. Current working-tree status: **157 pass / 18 fail (0 crash)** —
       the last crash class, `vtkLabeledContourMapper`, is fixed by the
       `vtkMetalLabeledContourMapper` override (see the labeled-contour-mapper
       section below); the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
@@ -175,7 +175,7 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  156 Passed  19 Failed (incl. image/pick fails)  0 "Subprocess aborted"
+175 tests:  157 Passed  18 Failed (incl. image/pick fails)  0 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
@@ -482,6 +482,65 @@ over the previous run is exactly that test; the failure set is otherwise
 unchanged (15 image-compare + 1 below-threshold pick-check + 3 non-image fails,
 no new failures). The regression check against the documented passing cluster
 reports none.
+Run after the glyph3D backface-color fix (this run, 2026-08-04): 157 Passed /
+18 Failed / 0 aborted out of 175 (analyzed with `analyze_metal_ctest_log.py`
+from a single `ctest -R "RenderingCoreCxx-Metal" -j 8` run; failures exported
+with `export_image_compare.sh`) — `TestGlyph3DMapperBackfaceColor` now passes
+(the glyph mapper previously mirrored the front material into the backface
+material slots without reading `actor->GetBackfaceProperty()` and the glyph
+fragment shader had no `front_facing` handling, so the magenta backface
+property never reached the inner "mouth" surfaces, which rendered black/unlit;
+see the glyph3D backface-color section below). The +1 pass delta over the
+previous run is exactly that test; the failure set is otherwise unchanged
+(14 image-compare + 3 non-image fails, no new failures). The regression check
+against the documented passing cluster reports none.
+
+### The glyph3D backface-color fix (`TestGlyph3DMapperBackfaceColor` now passes)
+
+`TestGlyph3DMapperBackfaceColor` renders partial spheres (`vtkSphereSource` with
+`SetStartTheta(20)`/`SetEndTheta(330)`) through `vtkGlyph3DMapper` whose actor
+sets a magenta `vtkBackfaceProperty`. The baseline expects the yellow outer
+shells and magenta exposed inner "mouth" surfaces; under Metal the mouths
+rendered black/unlit.
+
+The glyph path in the Metal backend had no backface support at all. In
+`vtkMetalGlyph3DMapper.mm` the material upload (`UpdateMaterialUniforms`-style
+40-float `MaterialBuffer`) mirrored the front material into the backface slots
+with a plain `memcpy` and never queried `actor->GetBackfaceProperty()`, so the
+magenta color never reached the GPU. And the glyph fragment shader
+(`shadeGlyphFragment` in `MetalShaders.metal`) had no `[[front_facing]]`
+parameter, no backface normal flip, and no backface material swap — backfaces
+were lit with the outward normals, yielding black inner surfaces (the surface
+mapper's `evaluateSurfaceFragment` already had the correct pattern).
+
+The fix mirrors the surface path and GL (`vtkOpenGLGlyph3DHelper`):
+
+- **Material upload.** The mapper now reads `actor->GetBackfaceProperty()` and
+  fills the backface material slots (ambient/diffuse/specular color +
+  intensity, color, opacity, specular power), mirroring `vtkMetalPolyDataMapper`.
+- **Scene flag.** A new `kSceneFlagGlyphHasBackface` scene bit (18, next free
+  after `kSceneFlagHasPointColors` 17) is asserted per-draw when the actor has a
+  backface property, alongside the existing `kSceneFlagGlyphHasNormals` bit.
+  The glyph path uses runtime flags rather than the function-constant
+  specialization the surface path uses for `kHasBackface`, consistent with how
+  `kSceneFlagGlyphHasNormals`/`kSceneFlagLightingDisabled` are already handled,
+  so no extra pipeline variants are created.
+- **Shader.** `shadeGlyphFragment` takes a `frontFacing` argument. Backfaces
+  flip the geometric normal (`N = -N`, matching the surface shader and GL's
+  light mod) and, when the flag is set, swap in the backface material. Colors
+  match GL's `ReplaceShaderColor` exactly: front faces use the per-glyph color,
+  back faces use the backface material color, and backface opacity is the
+  property value without the glyph-color alpha. The triangle entry point
+  `fragment_glyph_main` reads `[[front_facing]]`; the line/point entry points
+  pass `true` because non-triangle primitives are always front-facing (GL's
+  rule), so the new `[[front_facing]]` attribute is only used on the triangle
+  pipeline.
+
+`TestGlyph3DMapperBackfaceColor` now passes at ImageError 0 (was 0.2657). The
+rest of the pipeline is untouched: only `vtkMetalGlyph3DMapper` and the three
+glyph fragment entry points changed, the new scene bit collides with nothing,
+and the full suite re-ran at 157 pass / 18 fail / 0 aborted with no regression
+against the documented passing cluster.
 
 ### The resize-capture offscreen-target gate is fixed (`TestResizingWindowToImageFilter` now passes)
 

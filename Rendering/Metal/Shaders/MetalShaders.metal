@@ -48,6 +48,10 @@ constant uint kSceneFlagLightingDisabled     = 1u << 16;
 // scalarColor VBO for the point draw). When clear, point fragments light the
 // material ambient/diffuse colors like GL's no-scalar-color material path.
 constant uint kSceneFlagHasPointColors       = 1u << 17;
+// The actor has a backface property: the glyph fragment swaps the backface
+// material in (and colors backfaces from it) instead of using the mirrored
+// front-material slots, matching vtkOpenGLGlyph3DHelper::ReplaceShaderColor.
+constant uint kSceneFlagGlyphHasBackface     = 1u << 18;
 
 // Compile-time feature specialization for the surface shader (the "GL way"):
 // one shader source, specialized per feature set at pipeline creation via
@@ -2209,9 +2213,16 @@ inline T computeGlyphVertex(
 template <typename T>
 inline FragmentOutput shadeGlyphFragment(T in,
     constant MaterialUniforms& material, constant LightUniforms& lights,
-    constant ClipPlaneUniforms& clipPlanes, uint sceneFlags, float depthBias)
+    constant ClipPlaneUniforms& clipPlanes, uint sceneFlags, float depthBias,
+    bool frontFacing)
 {
   if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
+  // Backface handling mirrors evaluateSurfaceFragment and GL's light mod: flip
+  // the geometric normal so lighting sees the outward normal and, when the actor
+  // has a backface property, swap in the backface material. Lines and points are
+  // always front-facing (GL's rule), so their entry points pass frontFacing true.
+  const bool backface = !frontFacing;
+  const bool hasBackface = (sceneFlags & kSceneFlagGlyphHasBackface) != 0u;
   // Sources without point normals (e.g. vtkArrowSource) get a geometric normal
   // computed from screen-space derivatives, oriented to face the camera, matching
   // vtkOpenGLPolyDataMapper's no-point-normals fragment path.
@@ -2219,6 +2230,7 @@ inline FragmentOutput shadeGlyphFragment(T in,
   if ((sceneFlags & kSceneFlagGlyphHasNormals) != 0u)
   {
     N = normalize(in.viewNormal);
+    if (backface) N = -N;
   }
   else
   {
@@ -2233,22 +2245,38 @@ inline FragmentOutput shadeGlyphFragment(T in,
     {
       N = -N;
     }
+    if (backface) N = -N;
   }
+  // GL colors front faces with the per-glyph color and backfaces with the
+  // (backface) material color, and the backface opacity is the property's value
+  // without the glyph-color alpha (vtkOpenGLGlyph3DHelper::ReplaceShaderColor).
+  MaterialUniforms m = material;
+  if (backface && hasBackface)
+  {
+    m.ambientColor = material.backfaceAmbientColor;
+    m.diffuseColor = material.backfaceDiffuseColor;
+    m.specularColor = material.backfaceSpecularColor;
+    m.color = material.backfaceColor;
+    m.opacity = material.backfaceOpacity;
+    m.specularPower = material.backfaceSpecularPower;
+  }
+  const float3 baseAmbient = (backface && hasBackface) ? m.ambientColor.rgb : in.glyphColor.rgb;
+  const float3 baseDiffuse = (backface && hasBackface) ? m.diffuseColor.rgb : in.glyphColor.rgb;
   // Property lighting disabled (vtkProperty::SetLighting(false)): emit the flat
   // glyph color like GL's NoLighting path.
   const bool unlit = (sceneFlags & kSceneFlagLightingDisabled) != 0u;
   float3 totalDiffuse = float3(0.0), totalSpecular = float3(0.0);
   if (!unlit)
   {
-    computePhongLighting(N, in.viewPos, in.glyphColor.rgb, material.specularColor.rgb,
-        material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
+    computePhongLighting(N, in.viewPos, baseDiffuse, m.specularColor.rgb,
+        m.specularColor.w, m.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
   }
   float3 lit = unlit
-    ? material.diffuseColor.w * in.glyphColor.rgb
-    : material.diffuseColor.w * totalDiffuse + totalSpecular;
+    ? m.diffuseColor.w * baseDiffuse
+    : m.diffuseColor.w * totalDiffuse + totalSpecular;
   FragmentOutput out;
-  out.color = float4(material.ambientColor.w * in.glyphColor.rgb + lit,
-                   in.glyphColor.a * material.opacity);
+  out.color = float4(m.ambientColor.w * baseAmbient + lit,
+                   (backface && hasBackface) ? m.opacity : in.glyphColor.a * m.opacity);
   out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
   out.depth = in.position.z + depthBias;
   return out;
@@ -2271,8 +2299,9 @@ fragment FragmentOutput fragment_glyph_main(
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
-    constant ClipPlaneUniforms& clipPlanes [[buffer(9)]]) {
-  return shadeGlyphFragment(in, material, lights, clipPlanes, scene.flags, 0.0);
+    constant ClipPlaneUniforms& clipPlanes [[buffer(9)]],
+    bool frontFacing [[front_facing]]) {
+  return shadeGlyphFragment(in, material, lights, clipPlanes, scene.flags, 0.0, frontFacing);
 }
 
 vertex GlyphVertexOut vertex_glyph_line_main(
@@ -2293,7 +2322,7 @@ fragment FragmentOutput fragment_glyph_line_main(
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
     constant ClipPlaneUniforms& clipPlanes [[buffer(9)]]) {
-  return shadeGlyphFragment(in, material, lights, clipPlanes, scene.flags, 0.0);
+  return shadeGlyphFragment(in, material, lights, clipPlanes, scene.flags, 0.0, true);
 }
 
 vertex GlyphPointVertexOut vertex_glyph_point_main(
@@ -2317,7 +2346,7 @@ fragment FragmentOutput fragment_glyph_point_main(
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]],
     constant ClipPlaneUniforms& clipPlanes [[buffer(9)]]) {
-  return shadeGlyphFragment(in, material, lights, clipPlanes, scene.flags, coinOffset.pointOffset / 65000.0);
+  return shadeGlyphFragment(in, material, lights, clipPlanes, scene.flags, coinOffset.pointOffset / 65000.0, true);
 }
 
 
