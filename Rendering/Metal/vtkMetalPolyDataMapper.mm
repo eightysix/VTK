@@ -64,6 +64,20 @@
 namespace
 {
 
+// Debug-only env flags. Cached on first use: these sit in per-actor hot paths
+// (bundle replay/rebuild, uniform sync) where getenv()'s process-wide env lock
+// costs real cycles on draw-call-bound scenes.
+bool DebugEdgeEnabled()
+{
+  static const bool enabled = getenv("DBG_EDGE") != nullptr;
+  return enabled;
+}
+bool DebugTextureMappedGeometryEnabled()
+{
+  static const bool enabled = getenv("DBG_TMG") != nullptr;
+  return enabled;
+}
+
 struct EdgeKey
 {
     vtkIdType A;
@@ -1573,7 +1587,7 @@ void vtkMetalPolyDataMapper::ReplayRenderBundle(
         {
           buffer = uniforms->Buffers[p.uniformSlot];
         }
-        if (getenv("DBG_EDGE") && p.index == 4)
+        if (DebugEdgeEnabled() && p.index == 4)
         {
           float* fb = (float*)[buffer contents];
           fprintf(stderr, "[DBG] Replay setFragmentBuffer(4) act=%p slot=%d buf=%p data=(%f,%f,%f,%f) len=%llu\n",
@@ -1671,11 +1685,9 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
 
   // Helper lambdas to record encoder commands into the bundle
   auto recordPipeline = [&commands](id<MTLRenderPipelineState> pipeline) {
-    if (getenv("DBG_TMG"))
-      fprintf(stderr, "[DBG-TMG-draw] SetPipeline %s (buf colors=%s, pos=%s)\n",
-        pipeline.label ? [pipeline.label UTF8String] : "?",
-        getenv("DBG_TMG2") ? "?" : "?",
-        getenv("DBG_TMG2") ? "?" : "?");
+    if (DebugTextureMappedGeometryEnabled())
+      fprintf(stderr, "[DBG-TMG-draw] SetPipeline %s\n",
+        pipeline.label ? [pipeline.label UTF8String] : "?");
     Cmd cmd;
     cmd.type = Cmd::SetPipelineState;
     cmd.params = PSParams{ pipeline };
@@ -1725,7 +1737,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   };
   auto recordDraw = [&commands, &recordedAnyDraw](MTLPrimitiveType ptype, NSUInteger vstart, NSUInteger vcount,
                         NSUInteger icount = 0) {
-    if (getenv("DBG_TMG"))
+    if (DebugTextureMappedGeometryEnabled())
       fprintf(stderr, "[DBG-TMG-draw] DrawPrimitives ptype=%d vstart=%llu vcount=%llu instances=%llu\n",
         (int)ptype, (unsigned long long)vstart, (unsigned long long)vcount, (unsigned long long)icount);
     Cmd cmd;
@@ -1736,7 +1748,7 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   };
   auto recordIdxDraw = [&commands, &recordedAnyDraw](MTLPrimitiveType ptype, NSUInteger indexCount, MTLIndexType itype,
                            id<MTLBuffer> ibuf, NSUInteger offset) {
-    if (getenv("DBG_TMG"))
+    if (DebugTextureMappedGeometryEnabled())
       fprintf(stderr, "[DBG-TMG-draw] DrawIndexed ptype=%d indexCount=%llu itype=%d buf=%p offset=%llu\n",
         (int)ptype, (unsigned long long)indexCount, (int)itype, (void*)ibuf, (unsigned long long)offset);
     Cmd cmd;
@@ -3609,8 +3621,10 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     vtkMetalCamera* metalCamera = vtkMetalCamera::SafeDownCast(ren->GetActiveCamera());
     if (metalCamera)
     {
-      metalCamera->Render(ren);
-
+      // Camera transforms are cached by vtkMetalRenderer::DeviceRender, which
+      // calls ActiveCamera->Render(ren) once per frame before any mapper. The
+      // camera Render recomputes the full view/projection/normal matrices, so
+      // do not repeat it here per actor (draw-call-bound scenes pay it 1024x).
       if (!this->Internals->SceneUniformBuffer)
       {
         this->Internals->SceneUniformBuffer = [device
@@ -3631,6 +3645,9 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       // actor's model-to-world matrix here (transposed like the camera matrices,
       // since Metal indexes matrices column-major).
       {
+        // Compute the scene uniforms with stack arrays instead of heap vtkNew
+        // matrix objects: this block runs once per actor per frame, and the 6
+        // allocations/actor become ~6k allocations on a 32x32 actor grid.
         vtkNew<vtkMatrix4x4> actorMatrix;
         act->GetModelToWorldMatrix(actorMatrix);
 
@@ -3639,23 +3656,23 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         // to model space: adjusted = actorMatrix * Translate(shift) * Scale(1/scale).
         // With the shift-scale disabled the extra transform is the identity, so
         // the multiply is unconditional.
-        vtkNew<vtkMatrix4x4> vboInverse;
-        vboInverse->Identity();
-        vboInverse->SetElement(0, 0, 1.0 / this->Internals->VBOScale[0]);
-        vboInverse->SetElement(1, 1, 1.0 / this->Internals->VBOScale[1]);
-        vboInverse->SetElement(2, 2, 1.0 / this->Internals->VBOScale[2]);
-        vboInverse->SetElement(0, 3, this->Internals->VBOShift[0]);
-        vboInverse->SetElement(1, 3, this->Internals->VBOShift[1]);
-        vboInverse->SetElement(2, 3, this->Internals->VBOShift[2]);
-        vtkNew<vtkMatrix4x4> adjusted;
-        vtkMatrix4x4::Multiply4x4(actorMatrix, vboInverse, adjusted);
+        double vboInverse[16];
+        vtkMatrix4x4::Identity(vboInverse);
+        vboInverse[0] = 1.0 / this->Internals->VBOScale[0];
+        vboInverse[5] = 1.0 / this->Internals->VBOScale[1];
+        vboInverse[10] = 1.0 / this->Internals->VBOScale[2];
+        vboInverse[3] = this->Internals->VBOShift[0];
+        vboInverse[7] = this->Internals->VBOShift[1];
+        vboInverse[11] = this->Internals->VBOShift[2];
+        double adjusted[16];
+        vtkMatrix4x4::Multiply4x4(*actorMatrix->Element, vboInverse, adjusted);
 
         float* modelMat = reinterpret_cast<float*>(buf + 176);
         for (int col = 0; col < 4; ++col)
         {
           for (int row = 0; row < 4; ++row)
           {
-            modelMat[col * 4 + row] = static_cast<float>(adjusted->GetElement(row, col));
+            modelMat[col * 4 + row] = static_cast<float>(adjusted[row * 4 + col]);
           }
         }
 
@@ -3663,26 +3680,24 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
         // rotation (the camera's cached NormalMatrix only contains the view 3x3).
         // The cached ViewMatrix is stored transposed (Metal indexes matrices
         // column-major), so element (row, col) lives at buf[col * 4 + row].
-        vtkNew<vtkMatrix3x3> viewRot;
-        vtkNew<vtkMatrix3x3> modelRot;
-        vtkNew<vtkMatrix3x3> normalMat;
+        double viewRot[9], modelRot[9], normalMat[9], normalMatInv[9];
         const float* viewMat = reinterpret_cast<float*>(buf);
         for (int r = 0; r < 3; ++r)
         {
           for (int c = 0; c < 3; ++c)
           {
-            viewRot->SetElement(r, c, viewMat[c * 4 + r]);
-            modelRot->SetElement(r, c, actorMatrix->GetElement(r, c));
+            viewRot[r * 3 + c] = viewMat[c * 4 + r];
+            modelRot[r * 3 + c] = actorMatrix->GetElement(r, c);
           }
         }
         vtkMatrix3x3::Multiply3x3(viewRot, modelRot, normalMat);
-        vtkMatrix3x3::Invert(normalMat, normalMat);
+        vtkMatrix3x3::Invert(normalMat, normalMatInv);
         float* normalMatBuf = reinterpret_cast<float*>(buf + 128);
         for (int i = 0; i < 3; ++i)
         {
           for (int j = 0; j < 3; ++j)
           {
-            normalMatBuf[i * 4 + j] = static_cast<float>(normalMat->GetElement(i, j));
+            normalMatBuf[i * 4 + j] = static_cast<float>(normalMatInv[i * 3 + j]);
           }
         }
       }
@@ -3920,7 +3935,7 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       syncSlot(this->Internals->kUniformLight, this->Internals->LightUniformBuffer);
       syncSlot(this->Internals->kUniformCoincidentOffset, this->Internals->CoincidentOffsetBuffer);
       syncSlot(this->Internals->kUniformEdge, this->Internals->EdgeUniformBuffer);
-      if (getenv("DBG_EDGE"))
+      if (DebugEdgeEnabled())
       {
         float* ec = (float*)[uniforms->Buffers[this->Internals->kUniformEdge] contents];
         fprintf(stderr, "[DBG] sync edge slot act=%p copy=(%f,%f,%f,%f)\n",
@@ -5678,7 +5693,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     }
   }
 
-  if (getenv("DBG_TMG") && polys && polys->GetNumberOfCells() > 0)
+  if (DebugTextureMappedGeometryEnabled() && polys && polys->GetNumberOfCells() > 0)
   {
     fprintf(stderr,
       "[DBG-TMG] polyCellOffset=%lld numVerts=%lld numLines=%lld cellFlag=%d normalArray=%s mappedColors=%s useCellTexture=%d useIndexBuffer=%d\n",
@@ -8825,7 +8840,7 @@ void vtkMetalPolyDataMapper::UpdateEdgeUniforms(void* mtlDevice, vtkActor* actor
 
   memcpy([this->Internals->EdgeUniformBuffer contents], &e, sizeof(e));
 
-  if (getenv("DBG_EDGE"))
+  if (DebugEdgeEnabled())
   {
     fprintf(stderr, "[DBG] UpdateEdgeUniforms act=%p edgeColor=(%f,%f,%f,%f) flags=%u\n",
       (void*)actor, e.edgeColor[0], e.edgeColor[1], e.edgeColor[2], e.edgeColor[3], e.flags);
