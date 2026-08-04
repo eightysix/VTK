@@ -11,8 +11,11 @@ Two test surfaces exist:
 
 1. A bespoke Metal suite under `Rendering/Metal/Testing/` (14 image-baseline
    regression tests + a HeaderTest + a dual-backend visual-parity harness).
-   Status: **all 16 pass** (unchanged from the historical run except the 14th
-   test `TestMetalImageSliceMapper` added by `3ec24ca9c5`).
+    Status: **all 16 pass** (unchanged from the historical run except the 14th
+    test `TestMetalImageSliceMapper` added by `3ec24ca9c5`; the working tree had
+    regressed `TestMetalCamera`/`TestMetalPointRender` to a
+    `vtkShaderProperty::New()` null-override abort, fixed by the
+    `vtkMetalShaderProperty` override below).
 2. The generic multi-backend suite in `Rendering/Core/Testing/Cxx/`, which
    registers the same ~175 tests once per backend and was wired up for Metal
       through    object-factory overrides (`--vtk-factory-prefer
@@ -62,7 +65,13 @@ Two test surfaces exist:
       `UpdateLightUniforms` call (see the point-rendering section below), and the
       composite vertex/sphere tests `TestCompositePolyDataMapperSpheres` and
       `TestCompositePolyDataMapperVertices` now pass via the per-block edge/vertex
-      color fix (see the per-block edge/vertex-color section below). No
+      color fix (see the per-block edge/vertex-color section below). The coincident
+      point/line fixes make `TestCoincident` pass for the first time (see the
+      coincident point-color/line-offset section below), and the new
+      `vtkMetalShaderProperty` factory override restores the bespoke
+      `TestMetalCamera`/`TestMetalPointRender` (which the working tree had
+      regressed to a `vtkShaderProperty::New()` null-override abort; see the
+      vtkMetalShaderProperty section below). No
       new crashes
       were introduced. The pass count
       fluctuates run to run (run-to-run flakiness).
@@ -166,7 +175,7 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  153 Passed  22 Failed (incl. image/pick fails)  0 "Subprocess aborted"
+175 tests:  154 Passed  21 Failed (incl. image/pick fails)  0 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
@@ -427,6 +436,23 @@ previous run is exactly those two tests; the failure set is otherwise unchanged
 (18 image-compare + 1 below-threshold pick-check + 3 non-image fails, no new
 failures). The regression check against the documented passing cluster reports
 none.
+Run after the coincident point-color/line-offset fix and the
+`vtkMetalShaderProperty` factory override (this run, 2026-08-04): 154 Passed /
+21 Failed / 0 aborted out of 175 (analyzed with `analyze_metal_ctest_log.py` from
+a single `ctest -R "RenderingCoreCxx-Metal" -j 8` run; failures exported with
+`export_image_compare.sh`) — `TestCoincident` now passes for the first time
+(ImageError 0; ctest method `LOOSE_VALID` 0.00443623, `TIGHT_VALID` 0.0154217):
+the Metal point fragments ignored the property's point color and rendered the
+pink coincident dots white, and the 1px-line coincident depth offset was dropped
+so the pink dots z-fought with the coincident surface (see the coincident
+point-color/line-offset section below). The +1 pass delta over the previous run is
+exactly that test; the failure set is otherwise unchanged (17 image-compare + 1
+below-threshold pick-check + 3 non-image fails, no new failures). The regression
+check against the documented passing cluster reports none. The bespoke suite's
+`TestMetalCamera` and `TestMetalPointRender` — Subprocess aborted on the working
+tree via a `vtkShaderProperty::New()` null-override crash in
+`vtkProp::GetShaderProperty()` — now pass via the `vtkMetalShaderProperty` factory
+override (see below); the bespoke suite re-ran at 16/16 pass.
 
 ### The labeled-contour-mapper cluster is fixed
 
@@ -672,6 +698,67 @@ actor's property; the alpha/opacity handling (batch opacity baked in when
 unchanged. `TestCompositePolyDataMapperVertices` drops from 0.2891 to 0.0244 and
 `TestCompositePolyDataMapperSpheres` from 0.1499 to 0.0215 (both pass); the rest
 of the composite-mapper suite is unaffected.
+
+### The coincident point-color and line-offset fix (`TestCoincident` now passes)
+
+`TestCoincident` renders two coincident spheres (one pink, one transparent) whose
+vertices alias in projected space, plus a 1px pink line drawn coincident with the
+front sphere. It failed on Metal with two visual defects:
+
+- **Point color ignored.** The point/vertex fragments resolved the point color
+  from the vertex color stream only, so the pink dots (GL draws them from
+  `vtkProperty::GetColor()`) rendered white whenever the geometry carried no
+  per-point scalar colors. Fix in `Rendering/Metal/Shaders/MetalShaders.metal`:
+  the point fragments now fall back to the material ambient/diffuse color when no
+  per-point scalars are present, and a new `kSceneFlagHasPointColors` scene bit
+  (`1u << 17`, `VTK_METAL_SCENE_FLAG_HAS_POINT_COLORS`) distinguishes "the vertex
+  stream carries real per-point colors" from "the vertex stream is a dummy 1.0
+  constant", so batch color/opacity and per-point colors both resolve correctly.
+- **1px-line coincident offset dropped.** GL's line shader applies a coincident
+  depth offset (`0` for polygons, `-4` for lines) so the pink line floats in
+  front of the coincident surface; the Metal line fragment hardcoded the surface
+  offset. Fix: `makeFragmentOutput` now takes explicit `factor`/`offset`
+  arguments, `fragment_main` passes the polygon offsets and `fragment_main_line`
+  passes the line offsets, restoring GL's line-in-front behavior.
+
+`TestCoincident` passes at ImageError 0; the pink `(255,76,255)` dots and the
+floating 1px line match the GL baseline. `Internals->HasPointColors` is set only
+for batch color/opacity or mapped per-point colors, so the base path is
+unchanged.
+
+### The `vtkMetalShaderProperty` factory override (bespoke crash fix)
+
+`TestMetalCamera` and `TestMetalPointRender` aborted (Subprocess aborted) on the
+working tree even though the historical run documented them passing. The crash
+was in `vtkProp::GetShaderProperty()`: `vtkShaderProperty` is an abstract class
+declared with `vtkAbstractObjectFactoryNewMacro`, so `New()` returns null unless a
+factory override exists; the Metal backend registered none, the OpenGL override
+was not selected under `--vtk-factory-prefer RenderingBackend=Metal`, and the
+lazily-created property dereferenced null in `vtkObjectBase::Register` (lldb:
+`Error: no override found for 'vtkShaderProperty'`). The crash reproduced with
+the point/line fixes stashed, so it was independent of them.
+
+Fix: a new concrete `vtkMetalShaderProperty`
+(`Rendering/Metal/vtkMetalShaderProperty.h` / `.mm`) overrides `vtkShaderProperty`
+for `RenderingBackend=Metal`
+(`vtk_object_factory_declare(BASE vtkShaderProperty OVERRIDE vtkMetalShaderProperty)`
+in `Rendering/Metal/CMakeLists.txt`). It is a functional port of
+`vtkOpenGLShaderProperty`'s replacement storage: a PIMPL holding
+`std::map<std::tuple<int,std::string,bool>, std::tuple<std::string,bool>>` keyed
+on (shader stage, OriginalValue, ReplaceFirst) mapping to (Replacement,
+ReplaceAll), with the stage names (`"Vertex"`/`"Fragment"`/...) matching the
+OpenGL strings the shim and tests use. It deliberately does not depend on
+`vtkShader.h` (Rendering/OpenGL2-only); `Clear*ShaderReplacement` calls
+`Modified()` only when a key was actually removed, like the OpenGL reference.
+`vtkMetalPolyDataMapper::BuildCustomShaderSource` reads replacements through the
+abstract `vtkShaderProperty` API, so the custom-shader mechanism above works
+unchanged against the new subclass.
+
+`TestMetalCamera` and `TestMetalPointRender` pass again; the bespoke suite is
+back to 16/16. The generated factory
+(`build_macos_metal/Rendering/Metal/vtkRenderingMetalObjectFactory.cxx`) registers
+`"vtkShaderProperty"` → `"vtkMetalShaderProperty"` with the
+`RenderingBackend=Metal` override attribute.
 
 ### The flat-background alpha and dither cluster is fixed
 
@@ -1661,3 +1748,13 @@ via the per-tile visVP/visSize/xoff/yoff ortho adjustment in
 `vtkMetalPolyDataMapper2D` (see the 2D overlay tile-cropping section above); the
 tally above and the buckets below are from this run, exported with
 `export_image_compare.sh`.
+
+Newest working-tree run (2026-08-04, after the coincident point-color/line-offset
+fix and the `vtkMetalShaderProperty` factory override):
+154 Passed / 21 Failed / 0 aborted — `TestCoincident` now passes (ImageError 0;
+see the coincident point-color/line-offset section above), the bespoke
+`TestMetalCamera`/`TestMetalPointRender` abort is fixed via the
+`vtkMetalShaderProperty` override (see the vtkMetalShaderProperty section above;
+bespoke suite re-ran at 16/16), and the remaining failure set is unchanged
+(17 image-compare + 1 below-threshold pick-check + 3 non-image); the tally above
+and the buckets are from this run, exported with `export_image_compare.sh`.

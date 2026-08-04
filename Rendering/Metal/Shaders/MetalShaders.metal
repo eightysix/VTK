@@ -44,6 +44,10 @@ constant uint kSceneFlagGlyphHasNormals      = 1u << 15;
 // the actor skips the Phong loop and emits the flat ambient+diffuse material
 // color, matching vtkGLSLModLight's complexity-0 path in GL.
 constant uint kSceneFlagLightingDisabled     = 1u << 16;
+// Per-point scalar colors were baked into the point color buffer (GL's
+// scalarColor VBO for the point draw). When clear, point fragments light the
+// material ambient/diffuse colors like GL's no-scalar-color material path.
+constant uint kSceneFlagHasPointColors       = 1u << 17;
 
 // Compile-time feature specialization for the surface shader (the "GL way"):
 // one shader source, specialized per feature set at pipeline creation via
@@ -750,8 +754,11 @@ inline FragmentColorAndIds evaluateSurfaceFragment(VertexOut in,
 // Assemble the depth-writing fragment output (color + optional IDs + the
 // coincident-offset depth term, mirroring GL's ReplaceShaderCoincidentOffset).
 // Shared by fragment_main and fragment_main_line so the two never drift.
+// The caller passes the primitive-specific factor/offset: surfaces use the
+// polygon parameters, lines use the line parameters (GL selects by primitive
+// type in vtkGLSLModCoincidentTopology::GetCoincidentParameters).
 inline FragmentOutput makeFragmentOutput(FragmentColorAndIds v, thread const VertexOut& in,
-                                         constant CoincidentOffsetUniforms& coinOffset) {
+                                         float factor, float offset) {
   FragmentOutput out;
   out.color = v.color;
   if (v.emitIds)
@@ -759,7 +766,7 @@ inline FragmentOutput makeFragmentOutput(FragmentColorAndIds v, thread const Ver
     out.ids = v.ids;
   }
   float cscale = length(float2(dfdx(in.position.z), dfdy(in.position.z)));
-  out.depth = in.position.z + coinOffset.polygonFactor * cscale + coinOffset.polygonOffset / 65000.0;
+  out.depth = in.position.z + factor * cscale + offset / 65000.0;
   return out;
 }
 
@@ -823,7 +830,7 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
       clipPlanes, cellColorTex, cellPrimitiveIds, actorTexture, actorSampler,
       lutTexture, lutSampler, prim_id, frontFacing,
       kLightingDisabled || (scene.flags & kSceneFlagLightingDisabled) != 0u),
-    in, coinOffset);
+    in, coinOffset.polygonFactor, coinOffset.polygonOffset);
 }
 
 // 1px line variant of fragment_main: honors the kSceneFlagLinesUnlit scene flag
@@ -852,7 +859,7 @@ fragment FragmentOutput fragment_main_line(VertexOut in [[stage_in]],
       clipPlanes, cellColorTex, cellPrimitiveIds, actorTexture, actorSampler,
       lutTexture, lutSampler, prim_id, frontFacing,
       (scene.flags & kSceneFlagLinesUnlit) != 0u),
-    in, coinOffset);
+    in, coinOffset.lineFactor, coinOffset.lineOffset);
 }
 
 // OIT accumulate output: matches the shader-side premultiplication done by
@@ -1009,25 +1016,48 @@ fragment FragmentOutput fragment_point_main(PointVertexOut in [[stage_in]],
                                     constant VertexColorUniforms& vertexColorUniform [[buffer(4)]]) {
   float3 N = normalize(in.viewNormal);
 
-  bool showVertices = (scene.flags & (1u << 3)) != 0u;
-  float3 baseColor = showVertices ? vertexColorUniform.color.rgb : in.pointColor.rgb;
-  float baseAlpha = showVertices ? vertexColorUniform.color.a : in.pointColor.a;
+  bool showVertices = (scene.flags & kSceneFlagVertexVisibility) != 0u;
+  // GL resolves the point base color by whether the scalarColor VBO exists: the
+  // per-point scalar color when present, otherwise the material ambient/diffuse
+  // colors (ambientColorUniform/diffuseColorUniform in the material path of
+  // vtkOpenGLPolyDataMapper::ReplaceShaderColor). Vertex-visibility dots always
+  // use the property vertex color (GL's DrawingVertices material path).
+  const bool hasPointColors = (scene.flags & kSceneFlagHasPointColors) != 0u;
+  float3 ambientBase;
+  float3 diffuseBase;
+  float baseAlpha;
+  if (showVertices)
+  {
+    ambientBase = diffuseBase = vertexColorUniform.color.rgb;
+    baseAlpha = vertexColorUniform.color.a;
+  }
+  else if (hasPointColors)
+  {
+    ambientBase = diffuseBase = in.pointColor.rgb;
+    baseAlpha = in.pointColor.a;
+  }
+  else
+  {
+    ambientBase = material.ambientColor.rgb;
+    diffuseBase = material.diffuseColor.rgb;
+    baseAlpha = 1.0f;
+  }
 
   // Property lighting disabled (vtkProperty::SetLighting(false)): emit the flat
   // vertex color like GL's NoLighting path.
   const bool unlit = (scene.flags & kSceneFlagLightingDisabled) != 0u;
-  float3 totalAmbient = material.ambientColor.w * baseColor;
+  float3 totalAmbient = material.ambientColor.w * ambientBase;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
   if (!unlit)
   {
-    computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
+    computePhongLighting(N, in.viewPos, diffuseBase, material.specularColor.rgb, material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
   }
 
   FragmentOutput out;
   out.color = float4(unlit
-    ? (totalAmbient + material.diffuseColor.w * baseColor)
+    ? (totalAmbient + material.diffuseColor.w * diffuseBase)
     : (totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular), baseAlpha * material.opacity);
   out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
   out.depth = in.position.z + coinOffset.pointOffset / 65000.0;
@@ -1127,24 +1157,44 @@ fragment FragmentOutput fragment_point_shaped_main(
     out.depth = in.position.z;
   }
 
-  bool showVertices = (scene.flags & (1u << 3)) != 0u;
-  float3 baseColor = showVertices ? vertexColorUniform.color.rgb : in.pointColor.rgb;
-  float baseAlpha = showVertices ? vertexColorUniform.color.a : in.pointColor.a;
+  bool showVertices = (scene.flags & kSceneFlagVertexVisibility) != 0u;
+  // Same base-color resolution as fragment_point_main: per-point scalar colors
+  // when present (GL's scalarColor VBO), otherwise the material colors.
+  const bool hasPointColors = (scene.flags & kSceneFlagHasPointColors) != 0u;
+  float3 ambientBase;
+  float3 diffuseBase;
+  float baseAlpha;
+  if (showVertices)
+  {
+    ambientBase = diffuseBase = vertexColorUniform.color.rgb;
+    baseAlpha = vertexColorUniform.color.a;
+  }
+  else if (hasPointColors)
+  {
+    ambientBase = diffuseBase = in.pointColor.rgb;
+    baseAlpha = in.pointColor.a;
+  }
+  else
+  {
+    ambientBase = material.ambientColor.rgb;
+    diffuseBase = material.diffuseColor.rgb;
+    baseAlpha = 1.0f;
+  }
 
   // Property lighting disabled (vtkProperty::SetLighting(false)): emit the flat
   // vertex color like GL's NoLighting path.
   const bool unlit = (scene.flags & kSceneFlagLightingDisabled) != 0u;
-  float3 totalAmbient = material.ambientColor.w * baseColor;
+  float3 totalAmbient = material.ambientColor.w * ambientBase;
   float3 totalDiffuse = float3(0.0);
   float3 totalSpecular = float3(0.0);
 
   if (!unlit)
   {
-    computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb, material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
+    computePhongLighting(N, in.viewPos, diffuseBase, material.specularColor.rgb, material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
   }
 
   out.color = float4(unlit
-    ? (totalAmbient + material.diffuseColor.w * baseColor)
+    ? (totalAmbient + material.diffuseColor.w * diffuseBase)
     : (totalAmbient + material.diffuseColor.w * totalDiffuse + totalSpecular), baseAlpha * material.opacity);
   out.ids = uint4(in.cellId, in.propId, in.compositeIndex, 0u);
   out.depth += coinOffset.pointOffset / 65000.0;

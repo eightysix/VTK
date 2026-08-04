@@ -677,6 +677,7 @@ constexpr uint32_t VTK_METAL_SCENE_FLAG_LINES_UNLIT         = 1u << 14;
 // vtkGLSLModLight's complexity-0 path (lines are already covered by
 // VTK_METAL_SCENE_FLAG_LINES_UNLIT, which folds prop->GetLighting() in).
 constexpr uint32_t VTK_METAL_SCENE_FLAG_LIGHTING_DISABLED   = 1u << 16;
+constexpr uint32_t VTK_METAL_SCENE_FLAG_HAS_POINT_COLORS    = 1u << 17;
 
 constexpr uint32_t VTK_METAL_DYNAMIC_ACTOR_FLAG_MASK =
     VTK_METAL_SCENE_FLAG_VERTEX_VISIBILITY |
@@ -689,7 +690,8 @@ constexpr uint32_t VTK_METAL_DYNAMIC_ACTOR_FLAG_MASK =
     VTK_METAL_SCENE_FLAG_USE_PRIMITIVE_CELL_IDS |
     VTK_METAL_SCENE_FLAG_HAS_SCALAR_LUT |
     VTK_METAL_SCENE_FLAG_LINES_UNLIT |
-    VTK_METAL_SCENE_FLAG_LIGHTING_DISABLED;
+    VTK_METAL_SCENE_FLAG_LIGHTING_DISABLED |
+    VTK_METAL_SCENE_FLAG_HAS_POINT_COLORS;
 
 id<MTLBuffer> CreateZeroBuffer(id<MTLDevice> device, size_t bytes)
 {
@@ -846,6 +848,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLBuffer> PointPositionBuffer = nil;   // float3 per point
   id<MTLBuffer> PointNormalBuffer = nil;     // float3 per point (from data or default)
   id<MTLBuffer> PointColorBuffer = nil;      // float4 per point (RGBA, from MapScalars)
+  bool HasPointColors = false;               // PointColorBuffer carries real per-point colors
   id<MTLBuffer> PointTangentBuffer = nil;    // float3 per point (from data or default)
   id<MTLBuffer> PointUVBuffer = nil;         // float2 per point (from data or default)
   id<MTLBuffer> PointColorUVBuffer = nil;    // float2 per point (from data or default)
@@ -1277,6 +1280,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     vtkMetalMRC::ReleaseAndNil(PointPositionBuffer);
     vtkMetalMRC::ReleaseAndNil(PointNormalBuffer);
     vtkMetalMRC::ReleaseAndNil(PointColorBuffer);
+    HasPointColors = false;
     vtkMetalMRC::ReleaseAndNil(PointTangentBuffer);
     vtkMetalMRC::ReleaseAndNil(PointUVBuffer);
     vtkMetalMRC::ReleaseAndNil(PointColorUVBuffer);
@@ -3174,6 +3178,11 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       if (this->Internals->HasSurfaceColors)
       {
         actorFlags |= VTK_METAL_SCENE_FLAG_HAS_SURFACE_COLORS;
+      }
+
+      if (this->Internals->HasPointColors)
+      {
+        actorFlags |= VTK_METAL_SCENE_FLAG_HAS_POINT_COLORS;
       }
 
       if (this->Internals->HasSurfaceAlpha)
@@ -5998,8 +6007,10 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
     // Matches WebGPU: reads point_colors SSBO indexed by point_id.
     // Note: mappedColors and cellFlag are already set from the early MapScalars call above.
     std::vector<float> pointColors(numPts * 4, 1.0f);
+    this->Internals->HasPointColors = false;
     if (this->Internals->UseBatchColor || this->Internals->UseBatchOpacity)
     {
+      this->Internals->HasPointColors = true;
       for (vtkIdType i = 0; i < numPts; ++i)
       {
         pointColors[i * 4] = defaultRGBA[0];
@@ -6011,6 +6022,7 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
     else if (mappedColors && cellFlag == 0 &&
         mappedColors->GetNumberOfTuples() >= numPts)
     {
+      this->Internals->HasPointColors = true;
       const unsigned char* rgba = mappedColors->GetPointer(0);
       // Per-point colors — normalize unsigned char RGBA to float [0,1]
       for (vtkIdType i = 0; i < numPts; ++i)

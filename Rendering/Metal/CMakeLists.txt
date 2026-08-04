@@ -21,7 +21,8 @@ set(classes
   vtkMetalTextMapper
   vtkMetalBillboardTextActor3D
   vtkMetalImageSliceMapper
-  vtkMetalLabeledContourMapper)
+  vtkMetalLabeledContourMapper
+  vtkMetalShaderProperty)
 set(headers)
 set(sources)
 
@@ -112,6 +113,9 @@ vtk_object_factory_declare(
 vtk_object_factory_declare(
   BASE vtkLabeledContourMapper
   OVERRIDE vtkMetalLabeledContourMapper)
+vtk_object_factory_declare(
+  BASE vtkShaderProperty
+  OVERRIDE vtkMetalShaderProperty)
 
 # Metal shader compilation - embed shader source as C++ string constant
 vtk_encode_string(
