@@ -13,8 +13,13 @@
 #include "vtkPolyData.h"
 #include "vtkCellArray.h"
 #include "vtkPointData.h"
+#include "vtkColor.h"
+#include "vtkCompositeDataDisplayAttributes.h"
+#include "vtkCompositeDataSet.h"
+#include "vtkCompositeDataSetRange.h"
 #include "vtkDataObjectTree.h"
 #include "vtkDataObjectTreeIterator.h"
+#include "vtkDataObjectTreeRange.h"
 #include "vtkProperty.h"
 #include "vtkActor.h"
 #include "vtkRenderer.h"
@@ -37,6 +42,8 @@
 
 #include <vector>
 #include <memory>
+#include <map>
+#include <set>
 #include <cmath>
 #include <algorithm>
 #include <cassert>
@@ -138,9 +145,22 @@ struct vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals
 
     ~SourceInstances() { Release(); }
   };
-  std::vector<std::unique_ptr<SourceInstances>> Instances;
-  vtkIdType CachedInputMTime = 0;
-  vtkIdType CachedNumSources = 0;
+
+  // Cached per-dataset instance attribute buffers (a composite input is
+  // expanded into one entry per leaf dataset, each carrying the per-source
+  // instanced buffers plus the mtimes they were built with).
+  struct DataSetInstances
+  {
+    std::vector<std::unique_ptr<SourceInstances>> Instances;
+    vtkIdType CachedInputMTime = 0;
+    vtkIdType CachedNumSources = 0;
+    vtkMTimeType CachedBlockMTime = 0;
+
+    void Release() { Instances.clear(); }
+  };
+  std::map<const vtkDataSet*, std::unique_ptr<DataSetInstances>> DataSetCache;
+  // Last time BlockAttributes was modified (invalidates baked per-instance colors).
+  vtkMTimeType BlockMTime = 0;
 
   // Pipeline states
   id<MTLRenderPipelineState> TriPipeline = nil;
@@ -164,7 +184,40 @@ struct vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals
 
   void ReleaseInstanceBuffers()
   {
-    Instances.clear();
+    DataSetCache.clear();
+  }
+
+  // Drop cached entries for datasets that are not present in the input
+  // composite dataset, mirroring vtkOpenGLGlyph3DMapper::ClearUnusedCachedEntries.
+  void ClearUnusedCachedEntries(vtkDataObject* inputDataObject)
+  {
+    std::set<const vtkDataSet*> inputChildren;
+    if (auto* cd = vtkCompositeDataSet::SafeDownCast(inputDataObject))
+    {
+      using Opts = vtk::CompositeDataSetOptions;
+      for (vtkDataObject* child : vtk::Range(cd, Opts::SkipEmptyNodes))
+      {
+        if (auto* ds = vtkDataSet::SafeDownCast(child))
+        {
+          inputChildren.insert(ds);
+        }
+      }
+    }
+    else if (auto* ds = vtkDataSet::SafeDownCast(inputDataObject))
+    {
+      inputChildren.insert(ds);
+    }
+    for (auto it = DataSetCache.begin(); it != DataSetCache.end();)
+    {
+      if (inputChildren.find(it->first) == inputChildren.end())
+      {
+        it = DataSetCache.erase(it);
+      }
+      else
+      {
+        ++it;
+      }
+    }
   }
 
   void ReleaseAll()
@@ -675,336 +728,18 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     }
   }
 
-  // Get input dataset
+  // Record the block-attribute mtime so per-block overrides (color/opacity)
+  // invalidate the baked per-instance colors.
+  I->BlockMTime = this->BlockAttributes ? this->BlockAttributes->GetMTime() : 0;
+
+  // Drop cached instances for datasets no longer present in the input.
+  I->ClearUnusedCachedEntries(inputDataObject);
+
+  // Render a vtkDataSet directly, or every block of a composite dataset
+  // applying the per-block display attributes (color/opacity/visibility).
   vtkDataSet* ds = vtkDataSet::SafeDownCast(inputDataObject);
-  if (!ds)
-  {
-    return;
-  }
-
-  const vtkIdType numPoints = ds->GetNumberOfPoints();
-  if (numPoints < 1)
-  {
-    return;
-  }
-
-  // Rebuild instance data when the input or source configuration changed
-  vtkIdType inputMTime = ds->GetMTime();
-  if (inputMTime != I->CachedInputMTime || numSources != I->CachedNumSources)
-  {
-    I->ReleaseInstanceBuffers();
-    I->CachedInputMTime = inputMTime;
-    I->CachedNumSources = numSources;
-
-    I->Instances.resize(numSources);
-
-    auto* orientArr = this->GetOrientationArray(ds);
-    auto* scaleArr = this->GetScaleArray(ds);
-    auto* selArr = this->GetSelectionIdArray(ds);
-    vtkBitArray* maskArr = this->Masking
-      ? vtkArrayDownCast<vtkBitArray>(this->GetMaskArray(ds))
-      : nullptr;
-    vtkDataArray* indexArr = this->GetSourceIndexArray(ds);
-
-    // Validate orientation array
-    if (orientArr)
-    {
-      int nc = orientArr->GetNumberOfComponents();
-      if ((this->OrientationMode == ROTATION || this->OrientationMode == DIRECTION) && nc != 3)
-      {
-        vtkErrorMacro("Orientation array must have 3 components, got " << nc);
-        return;
-      }
-      if (this->OrientationMode == QUATERNION && nc != 4)
-      {
-        vtkErrorMacro("Orientation array must have 4 components, got " << nc);
-        return;
-      }
-    }
-
-    // Map input scalars to colors
-    vtkNew<vtkUnsignedCharArray> mappedColors;
-    this->MapScalars(actor->GetProperty()->GetOpacity());
-    if (this->Colors && this->Colors->GetNumberOfTuples() > 0)
-    {
-      mappedColors->DeepCopy(this->Colors);
-    }
-
-    double rangeSize = this->Range[1] - this->Range[0];
-    if (rangeSize == 0.0)
-      rangeSize = 1.0;
-
-    double actorCol[4];
-    actor->GetProperty()->GetColor(actorCol);
-    actorCol[3] = actor->GetProperty()->GetOpacity();
-
-    // First pass: count unmasked points per source. Per-point source selection
-    // mirrors vtkOpenGLGlyph3DMapper: when the source index array is present
-    // each point selects a source (clamped to the number of sources); otherwise
-    // every point uses source 0.
-    std::vector<vtkIdType> perSourceCount(numSources, 0);
-    for (vtkIdType pid = 0; pid < numPoints; ++pid)
-    {
-      if (maskArr && maskArr->GetValue(pid) == 0)
-        continue;
-      int si = 0;
-      if (indexArr)
-      {
-        double value = vtkMath::Norm(indexArr->GetTuple(pid), indexArr->GetNumberOfComponents());
-        si = vtkMath::ClampValue(static_cast<int>(value), 0, static_cast<int>(numSources) - 1);
-      }
-      ++perSourceCount[si];
-    }
-
-    vtkIdType totalInst = 0;
-    for (vtkIdType si = 0; si < numSources; ++si)
-    {
-      totalInst += perSourceCount[si];
-    }
-    if (totalInst == 0)
-      return;
-
-    std::vector<std::vector<vtkTypeFloat32>> perSourceTransforms(numSources);
-    std::vector<std::vector<vtkTypeFloat32>> perSourceNormTransforms(numSources);
-    std::vector<std::vector<vtkTypeFloat32>> perSourceColors(numSources);
-    std::vector<std::vector<vtkIdType>> perSourcePickIds(numSources);
-    for (vtkIdType si = 0; si < numSources; ++si)
-    {
-      perSourceTransforms[si].resize(perSourceCount[si] * 16);
-      perSourceNormTransforms[si].resize(perSourceCount[si] * 9);
-      perSourceColors[si].resize(perSourceCount[si] * 4);
-      perSourcePickIds[si].resize(perSourceCount[si]);
-    }
-
-    std::vector<vtkIdType> cursor(numSources, 0);
-    for (vtkIdType pid = 0; pid < numPoints; ++pid)
-    {
-      if (maskArr && maskArr->GetValue(pid) == 0)
-        continue;
-
-      int si = 0;
-      if (indexArr)
-      {
-        double value = vtkMath::Norm(indexArr->GetTuple(pid), indexArr->GetNumberOfComponents());
-        si = vtkMath::ClampValue(static_cast<int>(value), 0, static_cast<int>(numSources) - 1);
-      }
-
-      // Skip points whose selected source has no drawable geometry.
-      if (si >= numSources || !I->Sources[si] || I->Sources[si]->VertexCount == 0)
-      {
-        continue;
-      }
-
-      vtkIdType idx = cursor[si];
-      ++cursor[si];
-
-      // Color
-      float r = static_cast<float>(actorCol[0]);
-      float g = static_cast<float>(actorCol[1]);
-      float b = static_cast<float>(actorCol[2]);
-      float a = static_cast<float>(actorCol[3]);
-      if (mappedColors && mappedColors->GetNumberOfTuples() > pid)
-      {
-        unsigned char rgba[4];
-        mappedColors->GetTypedTuple(pid, rgba);
-        r = rgba[0] / 255.f;
-        g = rgba[1] / 255.f;
-        b = rgba[2] / 255.f;
-        a = rgba[3] / 255.f;
-      }
-      perSourceColors[si][idx * 4 + 0] = r;
-      perSourceColors[si][idx * 4 + 1] = g;
-      perSourceColors[si][idx * 4 + 2] = b;
-      perSourceColors[si][idx * 4 + 3] = a;
-
-      // Scale
-      double sx = 1.0, sy = 1.0, sz = 1.0;
-      if (scaleArr)
-      {
-        double* t = scaleArr->GetTuple(pid);
-        switch (this->ScaleMode)
-        {
-          case SCALE_BY_MAGNITUDE:
-            sx = sy = sz = vtkMath::Norm(t, scaleArr->GetNumberOfComponents());
-            break;
-          case SCALE_BY_COMPONENTS:
-            if (scaleArr->GetNumberOfComponents() == 3)
-            {
-              sx = t[0];
-              sy = t[1];
-              sz = t[2];
-            }
-            break;
-          default:
-            break;
-        }
-        if (this->Clamping && this->ScaleMode != NO_DATA_SCALING)
-        {
-          sx = vtkMath::ClampValue(sx, this->Range[0], this->Range[1]);
-          sx = (sx - this->Range[0]) / rangeSize;
-          sy = vtkMath::ClampValue(sy, this->Range[0], this->Range[1]);
-          sy = (sy - this->Range[0]) / rangeSize;
-          sz = vtkMath::ClampValue(sz, this->Range[0], this->Range[1]);
-          sz = (sz - this->Range[0]) / rangeSize;
-        }
-      }
-      sx *= this->ScaleFactor;
-      sy *= this->ScaleFactor;
-      sz *= this->ScaleFactor;
-
-      // Transform (column-major)
-      double tf[16];
-      double ntf[9];
-      vtkMatrix4x4::Identity(tf);
-      vtkMatrix3x3::Identity(ntf);
-
-      double pt[3];
-      ds->GetPoint(pid, pt);
-      tf[3] = pt[0];
-      tf[7] = pt[1];
-      tf[11] = pt[2];
-
-      if (orientArr)
-      {
-        double orient[4];
-        orientArr->GetTuple(pid, orient);
-        double rot[3][3];
-        vtkQuaterniond q;
-
-        switch (this->OrientationMode)
-        {
-          case ROTATION:
-          {
-            double a1 = vtkMath::RadiansFromDegrees(orient[2]);
-            vtkQuaterniond qz(cos(.5 * a1), 0, 0, sin(.5 * a1));
-            a1 = vtkMath::RadiansFromDegrees(orient[0]);
-            vtkQuaterniond qx(cos(.5 * a1), sin(.5 * a1), 0, 0);
-            a1 = vtkMath::RadiansFromDegrees(orient[1]);
-            vtkQuaterniond qy(cos(.5 * a1), 0, sin(.5 * a1), 0);
-            q = qz * qx * qy;
-            break;
-          }
-          case QUATERNION:
-            q.Set(orient);
-            break;
-          default:
-          {
-            if (orient[1] == 0.0 && orient[2] == 0.0)
-            {
-              if (orient[0] < 0)
-                q.Set(0.0, 0.0, 1.0, 0.0);
-            }
-            else
-            {
-              double vm = vtkMath::Norm(orient);
-              double vn[3] = { (orient[0] + vm) / 2.0, orient[1] / 2.0, orient[2] / 2.0 };
-              double f = 1.0 / sqrt(vn[0] * vn[0] + vn[1] * vn[1] + vn[2] * vn[2]);
-              vn[0] *= f;
-              vn[1] *= f;
-              vn[2] *= f;
-              q.Set(0.0, vn[0], vn[1], vn[2]);
-            }
-            break;
-          }
-        }
-        q.ToMatrix3x3(rot);
-        for (int i = 0; i < 3; i++)
-          for (int j = 0; j < 3; j++)
-          {
-            tf[4 * i + j] = rot[i][j];
-            ntf[3 * i + j] = rot[j][i];
-          }
-      }
-
-      // Apply scale
-      if (this->Scaling)
-      {
-        if (sx == 0.0) sx = 1e-10;
-        if (sy == 0.0) sy = 1e-10;
-        if (sz == 0.0) sz = 1e-10;
-        for (int i = 0; i < 3; i++)
-        {
-          tf[4 * i] *= sx;
-          ntf[i] /= sx;
-          tf[4 * i + 1] *= sy;
-          ntf[i + 3] /= sy;
-          tf[4 * i + 2] *= sz;
-          ntf[i + 6] /= sz;
-        }
-      }
-
-      // Transpose to column-major for Metal and copy
-      vtkTypeFloat32* m = &perSourceTransforms[si][idx * 16];
-      for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 4; j++)
-          m[i * 4 + j] = static_cast<vtkTypeFloat32>(tf[j * 4 + i]);
-
-      vtkTypeFloat32* nm = &perSourceNormTransforms[si][idx * 9];
-      for (int i = 0; i < 3; i++)
-        for (int j = 0; j < 3; j++)
-          nm[i * 3 + j] = static_cast<vtkTypeFloat32>(ntf[i * 3 + j]);
-
-      // Pick ID
-      vtkIdType selId = pid;
-      if (this->UseSelectionIds && selArr && selArr->GetNumberOfTuples() > 0)
-      {
-        selId = static_cast<vtkIdType>(*selArr->GetTuple(pid));
-      }
-      perSourcePickIds[si][idx] = selId;
-    }
-
-    // Upload per-source instance buffers to the GPU
-    for (vtkIdType si = 0; si < numSources; ++si)
-    {
-      const vtkIdType n = perSourceCount[si];
-      if (n == 0)
-        continue;
-      auto& inst = I->Instances[si];
-      inst = std::make_unique<vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals::SourceInstances>();
-      inst->TransformBuffer = [device newBufferWithBytes:perSourceTransforms[si].data()
-                                                 length:perSourceTransforms[si].size() * sizeof(vtkTypeFloat32)
-                                                options:MTLResourceStorageModeShared];
-      // Metal's float3x3 in a buffer has 16-byte-aligned columns (48-byte stride),
-      // so scatter the row-major 9-value normal transform into column-major with
-      // the 3 float3 columns placed at 16-byte boundaries.
-      std::vector<vtkTypeFloat32> paddedNormals(n * 12, 0.f);
-      for (vtkIdType i = 0; i < n; ++i)
-      {
-        const vtkTypeFloat32* src = &perSourceNormTransforms[si][i * 9];
-        vtkTypeFloat32* dst = &paddedNormals[i * 12];
-        dst[0] = src[0]; dst[1] = src[3]; dst[2] = src[6];
-        dst[4] = src[1]; dst[5] = src[4]; dst[6] = src[7];
-        dst[8] = src[2]; dst[9] = src[5]; dst[10] = src[8];
-      }
-      inst->NormalTransformBuffer = [device newBufferWithBytes:paddedNormals.data()
-                                                       length:paddedNormals.size() * sizeof(vtkTypeFloat32)
-                                                      options:MTLResourceStorageModeShared];
-      inst->ColorBuffer = [device newBufferWithBytes:perSourceColors[si].data()
-                                             length:perSourceColors[si].size() * sizeof(vtkTypeFloat32)
-                                            options:MTLResourceStorageModeShared];
-
-      std::vector<uint32_t> pick32(n);
-      for (uint32_t i = 0; i < static_cast<uint32_t>(n); ++i)
-        pick32[i] = static_cast<uint32_t>(perSourcePickIds[si][i]);
-      inst->PickIdBuffer = [device newBufferWithBytes:pick32.data()
-                                              length:pick32.size() * sizeof(uint32_t)
-                                             options:MTLResourceStorageModeShared];
-      inst->NumInstances = static_cast<uint32_t>(n);
-    }
-  }
-
-  // Quick check: does any source have drawable geometry and instances?
-  bool anyDrawable = false;
-  for (vtkIdType si = 0; si < numSources; ++si)
-  {
-    if (I->Sources[si] && I->Sources[si]->VertexCount > 0 && I->Instances[si] &&
-      I->Instances[si]->NumInstances > 0)
-    {
-      anyDrawable = true;
-      break;
-    }
-  }
-  if (!anyDrawable)
+  vtkCompositeDataSet* cd = vtkCompositeDataSet::SafeDownCast(inputDataObject);
+  if (!ds && !cd)
   {
     return;
   }
@@ -1080,7 +815,9 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
   }
 
   // Material (40 floats: front material + backface material, matching the
-  // shader's MaterialUniforms layout)
+  // shader's MaterialUniforms layout). The block display attributes are baked
+  // into the per-instance colors rather than this buffer, so the actor's
+  // property is used here.
   if (!I->MaterialBuffer)
   {
     I->MaterialBuffer = [device newBufferWithLength:sizeof(float) * 40
@@ -1249,14 +986,403 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     memset([I->ClipPlaneBuffer contents], 0, sizeof(float) * 4 * 6 + 16);
   }
 
-  // Prop ID (PickIds {propId, compositeIndex})
+  // Cull mode
+  if (actor->GetProperty()->GetBackfaceCulling())
+    [enc setCullMode:MTLCullModeBack];
+  else if (actor->GetProperty()->GetFrontfaceCulling())
+    [enc setCullMode:MTLCullModeFront];
+  else
+    [enc setCullMode:MTLCullModeNone];
+
+  // Base color/opacity for a vtkDataSet input (block overrides are layered on
+  // top of these when walking a composite input).
+  double baseColor[3];
+  actor->GetProperty()->GetColor(baseColor);
+  const double baseOpacity = actor->GetProperty()->GetOpacity();
+
+  if (ds)
+  {
+    RenderDataSet(ren, actor, ds, 0, baseColor, baseOpacity, true, device, enc, numSources);
+  }
+  else if (cd)
+  {
+    unsigned int flatIndex = 0;
+    RenderChildren(ren, actor, cd, flatIndex, baseColor, baseOpacity, true, device, enc,
+      numSources);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Build (and upload) the instanced glyph buffers for one dataset using the
+// supplied base color/opacity (which already carries per-block display-attribute
+// overrides). Cached per dataset; rebuilt when the dataset, the source
+// configuration, or BlockAttributes change. Returns true when at least one
+// source has drawable geometry and instances.
+// ---------------------------------------------------------------------------
+bool vtkMetalGlyph3DMapper::BuildAndUploadInstances(
+  void* mtlDevice, vtkActor* actor, vtkDataSet* ds, const double color[3], double opacity, vtkIdType numSources)
+{
+  id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
+  using Internals = vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals;
+  auto* I = this->Internals.get();
+
+  const vtkIdType numPoints = ds->GetNumberOfPoints();
+  if (numPoints < 1)
+  {
+    return false;
+  }
+
+  auto& cacheSlot = I->DataSetCache[ds];
+  if (!cacheSlot)
+  {
+    cacheSlot = std::make_unique<Internals::DataSetInstances>();
+  }
+  Internals::DataSetInstances* entry = cacheSlot.get();
+
+  const vtkIdType inputMTime = ds->GetMTime();
+  if (inputMTime != entry->CachedInputMTime || numSources != entry->CachedNumSources ||
+    I->BlockMTime != entry->CachedBlockMTime)
+  {
+    entry->Instances.clear();
+    entry->CachedInputMTime = inputMTime;
+    entry->CachedNumSources = numSources;
+    entry->CachedBlockMTime = I->BlockMTime;
+    entry->Instances.resize(numSources);
+
+    auto* orientArr = this->GetOrientationArray(ds);
+    auto* scaleArr = this->GetScaleArray(ds);
+    auto* selArr = this->GetSelectionIdArray(ds);
+    vtkBitArray* maskArr = this->Masking
+      ? vtkArrayDownCast<vtkBitArray>(this->GetMaskArray(ds))
+      : nullptr;
+    vtkDataArray* indexArr = this->GetSourceIndexArray(ds);
+
+    // Validate orientation array
+    if (orientArr)
+    {
+      int nc = orientArr->GetNumberOfComponents();
+      if ((this->OrientationMode == vtkGlyph3DMapper::ROTATION ||
+            this->OrientationMode == vtkGlyph3DMapper::DIRECTION) && nc != 3)
+      {
+        vtkErrorWithObjectMacro(
+          this, "Orientation array must have 3 components, got " << nc);
+        return false;
+      }
+      if (this->OrientationMode == vtkGlyph3DMapper::QUATERNION && nc != 4)
+      {
+        vtkErrorWithObjectMacro(
+          this, "Orientation array must have 4 components, got " << nc);
+        return false;
+      }
+    }
+
+    // Map input scalars to colors (the returned array is also cached on the
+    // mapper; a side effect of MapScalars)
+    vtkUnsignedCharArray* mapped = this->MapScalars(ds, opacity);
+    vtkNew<vtkUnsignedCharArray> mappedColors;
+    if (mapped && mapped->GetNumberOfTuples() > 0)
+    {
+      mappedColors->DeepCopy(mapped);
+    }
+
+    double rangeSize = this->Range[1] - this->Range[0];
+    if (rangeSize == 0.0)
+      rangeSize = 1.0;
+
+    double actorCol[4] = { color[0], color[1], color[2], opacity };
+
+    // First pass: count unmasked points per source. Per-point source selection
+    // mirrors vtkOpenGLGlyph3DMapper: when the source index array is present
+    // each point selects a source (clamped to the number of sources); otherwise
+    // every point uses source 0.
+    std::vector<vtkIdType> perSourceCount(numSources, 0);
+    for (vtkIdType pid = 0; pid < numPoints; ++pid)
+    {
+      if (maskArr && maskArr->GetValue(pid) == 0)
+        continue;
+      int si = 0;
+      if (indexArr)
+      {
+        double value = vtkMath::Norm(indexArr->GetTuple(pid), indexArr->GetNumberOfComponents());
+        si = vtkMath::ClampValue(static_cast<int>(value), 0, static_cast<int>(numSources) - 1);
+      }
+      ++perSourceCount[si];
+    }
+
+    vtkIdType totalInst = 0;
+    for (vtkIdType si = 0; si < numSources; ++si)
+    {
+      totalInst += perSourceCount[si];
+    }
+    if (totalInst == 0)
+      return false;
+
+    std::vector<std::vector<vtkTypeFloat32>> perSourceTransforms(numSources);
+    std::vector<std::vector<vtkTypeFloat32>> perSourceNormTransforms(numSources);
+    std::vector<std::vector<vtkTypeFloat32>> perSourceColors(numSources);
+    std::vector<std::vector<vtkIdType>> perSourcePickIds(numSources);
+    for (vtkIdType si = 0; si < numSources; ++si)
+    {
+      perSourceTransforms[si].resize(perSourceCount[si] * 16);
+      perSourceNormTransforms[si].resize(perSourceCount[si] * 9);
+      perSourceColors[si].resize(perSourceCount[si] * 4);
+      perSourcePickIds[si].resize(perSourceCount[si]);
+    }
+
+    std::vector<vtkIdType> cursor(numSources, 0);
+    for (vtkIdType pid = 0; pid < numPoints; ++pid)
+    {
+      if (maskArr && maskArr->GetValue(pid) == 0)
+        continue;
+
+      int si = 0;
+      if (indexArr)
+      {
+        double value = vtkMath::Norm(indexArr->GetTuple(pid), indexArr->GetNumberOfComponents());
+        si = vtkMath::ClampValue(static_cast<int>(value), 0, static_cast<int>(numSources) - 1);
+      }
+
+      // Skip points whose selected source has no drawable geometry.
+      if (si >= numSources || !I->Sources[si] || I->Sources[si]->VertexCount == 0)
+      {
+        continue;
+      }
+
+      vtkIdType idx = cursor[si];
+      ++cursor[si];
+
+      // Color
+      float r = static_cast<float>(actorCol[0]);
+      float g = static_cast<float>(actorCol[1]);
+      float b = static_cast<float>(actorCol[2]);
+      float a = static_cast<float>(actorCol[3]);
+      if (mappedColors && mappedColors->GetNumberOfTuples() > pid)
+      {
+        unsigned char rgba[4];
+        mappedColors->GetTypedTuple(pid, rgba);
+        r = rgba[0] / 255.f;
+        g = rgba[1] / 255.f;
+        b = rgba[2] / 255.f;
+        a = rgba[3] / 255.f;
+      }
+      perSourceColors[si][idx * 4 + 0] = r;
+      perSourceColors[si][idx * 4 + 1] = g;
+      perSourceColors[si][idx * 4 + 2] = b;
+      perSourceColors[si][idx * 4 + 3] = a;
+
+      // Scale
+      double sx = 1.0, sy = 1.0, sz = 1.0;
+      if (scaleArr)
+      {
+        double* t = scaleArr->GetTuple(pid);
+        switch (this->ScaleMode)
+        {
+          case vtkGlyph3DMapper::SCALE_BY_MAGNITUDE:
+            sx = sy = sz = vtkMath::Norm(t, scaleArr->GetNumberOfComponents());
+            break;
+          case vtkGlyph3DMapper::SCALE_BY_COMPONENTS:
+            if (scaleArr->GetNumberOfComponents() == 3)
+            {
+              sx = t[0];
+              sy = t[1];
+              sz = t[2];
+            }
+            break;
+          default:
+            break;
+        }
+        if (this->Clamping && this->ScaleMode != vtkGlyph3DMapper::NO_DATA_SCALING)
+        {
+          sx = vtkMath::ClampValue(sx, this->Range[0], this->Range[1]);
+          sx = (sx - this->Range[0]) / rangeSize;
+          sy = vtkMath::ClampValue(sy, this->Range[0], this->Range[1]);
+          sy = (sy - this->Range[0]) / rangeSize;
+          sz = vtkMath::ClampValue(sz, this->Range[0], this->Range[1]);
+          sz = (sz - this->Range[0]) / rangeSize;
+        }
+      }
+      sx *= this->ScaleFactor;
+      sy *= this->ScaleFactor;
+      sz *= this->ScaleFactor;
+
+      // Transform (column-major)
+      double tf[16];
+      double ntf[9];
+      vtkMatrix4x4::Identity(tf);
+      vtkMatrix3x3::Identity(ntf);
+
+      double pt[3];
+      ds->GetPoint(pid, pt);
+      tf[3] = pt[0];
+      tf[7] = pt[1];
+      tf[11] = pt[2];
+
+      if (orientArr)
+      {
+        double orient[4];
+        orientArr->GetTuple(pid, orient);
+        double rot[3][3];
+        vtkQuaterniond q;
+
+        switch (this->OrientationMode)
+        {
+          case vtkGlyph3DMapper::ROTATION:
+          {
+            double a1 = vtkMath::RadiansFromDegrees(orient[2]);
+            vtkQuaterniond qz(cos(.5 * a1), 0, 0, sin(.5 * a1));
+            a1 = vtkMath::RadiansFromDegrees(orient[0]);
+            vtkQuaterniond qx(cos(.5 * a1), sin(.5 * a1), 0, 0);
+            a1 = vtkMath::RadiansFromDegrees(orient[1]);
+            vtkQuaterniond qy(cos(.5 * a1), 0, sin(.5 * a1), 0);
+            q = qz * qx * qy;
+            break;
+          }
+          case vtkGlyph3DMapper::QUATERNION:
+            q.Set(orient);
+            break;
+          default:
+          {
+            if (orient[1] == 0.0 && orient[2] == 0.0)
+            {
+              if (orient[0] < 0)
+                q.Set(0.0, 0.0, 1.0, 0.0);
+            }
+            else
+            {
+              double vm = vtkMath::Norm(orient);
+              double vn[3] = { (orient[0] + vm) / 2.0, orient[1] / 2.0, orient[2] / 2.0 };
+              double f = 1.0 / sqrt(vn[0] * vn[0] + vn[1] * vn[1] + vn[2] * vn[2]);
+              vn[0] *= f;
+              vn[1] *= f;
+              vn[2] *= f;
+              q.Set(0.0, vn[0], vn[1], vn[2]);
+            }
+            break;
+          }
+        }
+        q.ToMatrix3x3(rot);
+        for (int i = 0; i < 3; i++)
+          for (int j = 0; j < 3; j++)
+          {
+            tf[4 * i + j] = rot[i][j];
+            ntf[3 * i + j] = rot[j][i];
+          }
+      }
+
+      // Apply scale
+      if (this->Scaling)
+      {
+        if (sx == 0.0) sx = 1e-10;
+        if (sy == 0.0) sy = 1e-10;
+        if (sz == 0.0) sz = 1e-10;
+        for (int i = 0; i < 3; i++)
+        {
+          tf[4 * i] *= sx;
+          ntf[i] /= sx;
+          tf[4 * i + 1] *= sy;
+          ntf[i + 3] /= sy;
+          tf[4 * i + 2] *= sz;
+          ntf[i + 6] /= sz;
+        }
+      }
+
+      // Transpose to column-major for Metal and copy
+      vtkTypeFloat32* m = &perSourceTransforms[si][idx * 16];
+      for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+          m[i * 4 + j] = static_cast<vtkTypeFloat32>(tf[j * 4 + i]);
+
+      vtkTypeFloat32* nm = &perSourceNormTransforms[si][idx * 9];
+      for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+          nm[i * 3 + j] = static_cast<vtkTypeFloat32>(ntf[i * 3 + j]);
+
+      // Pick ID
+      vtkIdType selId = pid;
+      if (this->UseSelectionIds && selArr && selArr->GetNumberOfTuples() > 0)
+      {
+        selId = static_cast<vtkIdType>(*selArr->GetTuple(pid));
+      }
+      perSourcePickIds[si][idx] = selId;
+    }
+
+    // Upload per-source instance buffers to the GPU
+    for (vtkIdType si = 0; si < numSources; ++si)
+    {
+      const vtkIdType n = perSourceCount[si];
+      if (n == 0)
+        continue;
+      auto& inst = entry->Instances[si];
+      inst = std::make_unique<Internals::SourceInstances>();
+      inst->TransformBuffer = [device newBufferWithBytes:perSourceTransforms[si].data()
+                                                 length:perSourceTransforms[si].size() * sizeof(vtkTypeFloat32)
+                                                options:MTLResourceStorageModeShared];
+      // Metal's float3x3 in a buffer has 16-byte-aligned columns (48-byte stride),
+      // so scatter the row-major 9-value normal transform into column-major with
+      // the 3 float3 columns placed at 16-byte boundaries.
+      std::vector<vtkTypeFloat32> paddedNormals(n * 12, 0.f);
+      for (vtkIdType i = 0; i < n; ++i)
+      {
+        const vtkTypeFloat32* src = &perSourceNormTransforms[si][i * 9];
+        vtkTypeFloat32* dst = &paddedNormals[i * 12];
+        dst[0] = src[0]; dst[1] = src[3]; dst[2] = src[6];
+        dst[4] = src[1]; dst[5] = src[4]; dst[6] = src[7];
+        dst[8] = src[2]; dst[9] = src[5]; dst[10] = src[8];
+      }
+      inst->NormalTransformBuffer = [device newBufferWithBytes:paddedNormals.data()
+                                                       length:paddedNormals.size() * sizeof(vtkTypeFloat32)
+                                                      options:MTLResourceStorageModeShared];
+      inst->ColorBuffer = [device newBufferWithBytes:perSourceColors[si].data()
+                                             length:perSourceColors[si].size() * sizeof(vtkTypeFloat32)
+                                            options:MTLResourceStorageModeShared];
+
+      std::vector<uint32_t> pick32(n);
+      for (uint32_t i = 0; i < static_cast<uint32_t>(n); ++i)
+        pick32[i] = static_cast<uint32_t>(perSourcePickIds[si][i]);
+      inst->PickIdBuffer = [device newBufferWithBytes:pick32.data()
+                                              length:pick32.size() * sizeof(uint32_t)
+                                             options:MTLResourceStorageModeShared];
+      inst->NumInstances = static_cast<uint32_t>(n);
+    }
+  }
+
+  // Quick check: does any source have drawable geometry and instances?
+  for (vtkIdType si = 0; si < numSources; ++si)
+  {
+    if (I->Sources[si] && I->Sources[si]->VertexCount > 0 && entry->Instances[si] &&
+      entry->Instances[si]->NumInstances > 0)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Issue one instanced draw per glyph source for a dataset's cached instance
+// buffers.
+// ---------------------------------------------------------------------------
+void vtkMetalGlyph3DMapper::DrawInstances(vtkRenderer* ren, vtkActor* actor, void* mtlDevice,
+  void* encoder, vtkDataSet* ds, unsigned int compositeIndex, vtkIdType numSources)
+{
+  id<MTLDevice> device = (id<MTLDevice>)mtlDevice;
+  id<MTLRenderCommandEncoder> enc = (id<MTLRenderCommandEncoder>)encoder;
+  using Internals = vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals;
+  auto* I = this->Internals.get();
+  auto& cacheSlot = I->DataSetCache[ds];
+
+  vtkMetalHardwareSelector* sel = vtkMetalHardwareSelector::SafeDownCast(ren->GetSelector());
+  const bool selectingPoints =
+    sel && sel->GetFieldAssociation() == vtkDataObject::FIELD_ASSOCIATION_POINTS;
+
+  // Prop ID (PickIds {propId, compositeIndex}) — written per block so the flat
+  // composite index reaches the vertex shader for picking.
   if (!I->PropIdBuffer)
   {
     I->PropIdBuffer = [device newBufferWithLength:sizeof(PickIds)
                                          options:MTLResourceStorageModeShared];
   }
   {
-    // Per-render prop ID from the active hardware selector; 0 when not picking.
     uint32_t glyphPropId = 0;
     if (sel)
     {
@@ -1266,17 +1392,9 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
         glyphPropId = static_cast<uint32_t>(id);
       }
     }
-    PickIds ids = { glyphPropId, 0 };
+    PickIds ids = { glyphPropId, compositeIndex };
     memcpy([I->PropIdBuffer contents], &ids, sizeof(PickIds));
   }
-
-  // Cull mode
-  if (actor->GetProperty()->GetBackfaceCulling())
-    [enc setCullMode:MTLCullModeBack];
-  else if (actor->GetProperty()->GetFrontfaceCulling())
-    [enc setCullMode:MTLCullModeFront];
-  else
-    [enc setCullMode:MTLCullModeNone];
 
   // Whether the actor has a backface property (constant for this whole render):
   // the glyph fragment swaps the backface material in when set.
@@ -1285,8 +1403,7 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
   // Helper lambda to bind all buffers and draw
   auto bindAndDraw =
     [&](id<MTLRenderPipelineState> pipeline, MTLPrimitiveType primType, vtkIdType vertCount,
-      const vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals::SourceGeometry& g,
-      const vtkMetalGlyph3DMapper::vtkMetalGlyph3DMapperInternals::SourceInstances& inst)
+      const Internals::SourceGeometry& g, const Internals::SourceInstances& inst)
   {
     if (!pipeline || g.VertexCount == 0 || inst.NumInstances == 0)
       return;
@@ -1329,7 +1446,7 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
   for (vtkIdType si = 0; si < numSources; ++si)
   {
     const auto& g = I->Sources[si];
-    const auto& inst = I->Instances[si];
+    const auto& inst = cacheSlot->Instances[si];
     if (!g || g->VertexCount == 0 || !inst || inst->NumInstances == 0)
       continue;
     if (selectingPoints)
@@ -1352,6 +1469,107 @@ void vtkMetalGlyph3DMapper::Render(vtkRenderer* ren, vtkActor* actor)
     if (g->HasPoints)
     {
       bindAndDraw(I->PtPipeline, MTLPrimitiveTypePoint, g->PtVertexCount, *g, *inst);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Render the glyphs for one (leaf) dataset, building its cached instance
+// buffers if needed and drawing them.
+// ---------------------------------------------------------------------------
+void vtkMetalGlyph3DMapper::RenderDataSet(vtkRenderer* ren, vtkActor* actor, vtkDataSet* ds,
+  unsigned int compositeIndex, const double color[3], double opacity, bool pickable,
+  void* mtlDevice, void* encoder, vtkIdType numSources)
+{
+  // Skip unpickable blocks when performing selection.
+  if (ren->GetSelector() && !pickable)
+  {
+    return;
+  }
+
+  if (!BuildAndUploadInstances(mtlDevice, actor, ds, color, opacity, numSources))
+  {
+    return;
+  }
+
+  DrawInstances(ren, actor, mtlDevice, encoder, ds, compositeIndex, numSources);
+}
+
+// ---------------------------------------------------------------------------
+// Recursively walk a composite dataset, applying the per-block display
+// attributes (visibility, pickability, color, opacity) inherited from parent
+// blocks, and render each visible leaf dataset.
+// ---------------------------------------------------------------------------
+void vtkMetalGlyph3DMapper::RenderChildren(vtkRenderer* ren, vtkActor* actor, vtkDataObject* dobj,
+  unsigned int& flatIndex, const double color[3], double opacity, bool pickable, void* mtlDevice,
+  void* encoder, vtkIdType numSources)
+{
+  vtkCompositeDataDisplayAttributes* cda = this->BlockAttributes;
+
+  // Effective per-block attributes, inheriting from parent blocks when no
+  // override is present (mirrors vtkOpenGLGlyph3DMapper::RenderChildren).
+  bool blockVis = true;
+  if (cda && cda->HasBlockVisibility(dobj))
+  {
+    blockVis = cda->GetBlockVisibility(dobj);
+  }
+  bool blockPick = pickable;
+  if (cda && cda->HasBlockPickability(dobj))
+  {
+    blockPick = cda->GetBlockPickability(dobj);
+  }
+  double blockColor[3] = { color[0], color[1], color[2] };
+  if (cda && cda->HasBlockColor(dobj))
+  {
+    vtkColor3d c = cda->GetBlockColor(dobj);
+    blockColor[0] = c[0];
+    blockColor[1] = c[1];
+    blockColor[2] = c[2];
+  }
+  double blockOpacity = opacity;
+  if (cda && cda->HasBlockOpacity(dobj))
+  {
+    blockOpacity = cda->GetBlockOpacity(dobj);
+  }
+
+  // Advance flat-index. After this point, flatIndex no longer points to this
+  // block.
+  const auto originalFlatIndex = flatIndex;
+  flatIndex++;
+
+  if (auto* dObjTree = vtkDataObjectTree::SafeDownCast(dobj))
+  {
+    using Opts = vtk::DataObjectTreeOptions;
+    for (vtkDataObject* child : vtk::Range(dObjTree, Opts::None))
+    {
+      if (!child)
+      {
+        ++flatIndex;
+      }
+      else
+      {
+        RenderChildren(ren, actor, child, flatIndex, blockColor, blockOpacity, blockPick, mtlDevice,
+          encoder, numSources);
+      }
+    }
+  }
+  else
+  {
+    // Skip invisible blocks and unpickable ones when performing selection.
+    if (!blockVis || (ren->GetSelector() && !blockPick))
+    {
+      return;
+    }
+    auto* ds = vtkDataSet::SafeDownCast(dobj);
+    if (ds)
+    {
+      RenderDataSet(ren, actor, ds, originalFlatIndex, blockColor, blockOpacity, blockPick,
+        mtlDevice, encoder, numSources);
+    }
+    else
+    {
+      vtkErrorWithObjectMacro(this,
+        "Expected a vtkDataObjectTree or vtkDataSet input. Got " << dobj->GetClassName());
     }
   }
 }

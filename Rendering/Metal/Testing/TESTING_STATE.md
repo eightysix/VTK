@@ -19,8 +19,11 @@ Two test surfaces exist:
 2. The generic multi-backend suite in `Rendering/Core/Testing/Cxx/`, which
    registers the same ~175 tests once per backend and was wired up for Metal
        through    object-factory overrides (`--vtk-factory-prefer
-           RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
-             crash)**. Current working-tree status: **159 pass / 16 fail (0 crash)** —
+            RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
+              crash)**. Current working-tree status: **160 pass / 15 fail (0 crash)** —
+        `TestGlyph3DMapperCompositeDisplayAttributeInheritance` now passes via the
+       composite per-block display-attribute inheritance port in the Metal glyph
+       mapper (see the composite display-attribute section below),
        `TestLineRenderingTranslucent` now passes via the OIT translucent-line
       pipelines (see the OIT translucent-line section below), the
       last crash class, `vtkLabeledContourMapper`, is fixed by the
@@ -73,10 +76,10 @@ Two test surfaces exist:
       `vtkMetalShaderProperty` factory override restores the bespoke
       `TestMetalCamera`/`TestMetalPointRender` (which the working tree had
       regressed to a `vtkShaderProperty::New()` null-override abort; see the
-      vtkMetalShaderProperty section below). No
-      new crashes
-      were introduced. The pass count
-      fluctuates run to run (run-to-run flakiness).
+       vtkMetalShaderProperty section below). No
+       new crashes
+       were introduced. The pass count
+       fluctuates run to run (run-to-run flakiness).
 
 ---
 
@@ -177,7 +180,7 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  158 Passed  17 Failed (incl. image/pick fails)  0 "Subprocess aborted"
+175 tests:  160 Passed  15 Failed (incl. image/pick fails)  0 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
@@ -530,6 +533,21 @@ run is exactly that test; the failure set is otherwise unchanged
 (12 image-compare + 1 below-threshold pick-check + 3 non-image fails, no new
 failures). The regression check against the documented passing cluster reports
 none.
+Run after the composite display-attribute inheritance fix (this run, 2026-08-04):
+160 Passed / 15 Failed / 0 aborted out of 175 (analyzed with
+`analyze_metal_ctest_log.py` from a single `ctest -R "RenderingCoreCxx-Metal" -j 8`
+run; failures exported with `export_image_compare.sh --no-run`) —
+`TestGlyph3DMapperCompositeDisplayAttributeInheritance` now passes for the first
+time (was a mid-bucket 0.224 image fail that rendered only the black background):
+the Metal glyph mapper rejected composite inputs, so the `vtkPartitionedDataSetCollection`
+(12 colored shapes with block 3 at 50% opacity and block 9 hidden) never drew;
+the mapper now walks composite datasets recursively, applying the inherited
+per-block display attributes (visibility/pickability/color/opacity) like
+`vtkOpenGLGlyph3DMapper` (see the composite display-attribute section below). The
++1 pass delta over the previous run is exactly that test; the failure set is
+otherwise unchanged (11 image-compare + 1 below-threshold pick-check + 3
+non-image fails, no new failures). The regression check against the documented
+passing cluster reports none.
 
 ### The OIT translucent-line fix (`TestLineRenderingTranslucent` now passes)
 
@@ -592,6 +610,59 @@ across five re-runs; the residual error is the OIT-vs-alpha-blend fidelity gap),
 and the full suite re-ran at 159 pass / 16 fail / 0 aborted with the failure
 set otherwise unchanged and no regression against the documented passing
 cluster.
+
+### The composite display-attribute inheritance fix (`TestGlyph3DMapperCompositeDisplayAttributeInheritance` now passes)
+
+`TestGlyph3DMapperCompositeDisplayAttributeInheritance` renders the 12 shapes of
+a `vtkPartitionedDataSetCollectionSource` through `vtkGlyph3DMapper` with a
+`vtkCompositeDataDisplayAttributes` set on the mapper: blocks 0-8 and 10 are
+colored (yellow/red/magenta), block 3 is at 50% opacity, block 9 is hidden, and
+`SetOrientationArray("Normals")`/`ScaleFactor(0.5)` drive the per-point glyph
+transform. Under Metal nothing drew — the black-background baseline mismatch was
+a mid-bucket 0.224 image fail.
+
+The root cause is in `vtkMetalGlyph3DMapper::Render` (`Rendering/Metal/vtkMetalGlyph3DMapper.mm`):
+the mapper only handled a `vtkDataSet` input and early-returned when
+`vtkDataSet::SafeDownCast(inputDataObject)` was null, so a `vtkCompositeDataSet`
+(including the `vtkPartitionedDataSetCollection` this test feeds) never reached
+any draw call. `vtkOpenGLGlyph3DMapper` handles this by walking the composite
+tree with `RenderChildren`, applying the per-block display attributes
+(visibility/pickability/color/opacity) inherited from parent blocks and passing
+the flat composite index through to the pick buffer.
+
+The Metal mapper now ports that structure:
+
+- **Internals rework.** The single-dataset `Instances` vector was replaced with
+  a `DataSetCache` (`std::map<const vtkDataSet*, DataSetInstances>`), each entry
+  holding the per-source instanced buffers plus the mtimes they were built with
+  (`CachedInputMTime`/`CachedNumSources`/`CachedBlockMTime`). A
+  `ClearUnusedCachedEntries` pass drops entries for datasets no longer in the
+  input, mirroring the OpenGL mapper.
+- **Composite walk.** New member helpers `RenderChildren` (recursive,
+  flat-index-increment-before-recurse with null-child skipping, matching GL),
+  `RenderDataSet`, `BuildAndUploadInstances` and `DrawInstances`. `RenderChildren`
+  layers block overrides onto the inherited parent color/opacity and skips
+  invisible blocks (and unpickable blocks during a selection pass); leaf
+  `vtkDataSet`s render through `RenderDataSet`, which builds the cached instance
+  buffers and issues one instanced draw per glyph source.
+- **Per-block pick ids.** `DrawInstances` writes the `PickIds {propId,
+  compositeIndex}` for the current block into the `PropIdBuffer` before each
+  draw, so the flat composite index reaches the glyph vertex shader for picking
+  exactly as the per-dataset path did (composite index 0 for a plain
+  `vtkDataSet` input).
+- **Cache invalidation.** A per-dataset entry is rebuilt when the dataset mtime,
+  the source count, or `BlockAttributes` mtime changes (`BlockMTime` recorded at
+  the top of `Render`); block-color/opacity changes therefore invalidate the
+  baked per-instance colors without touching the transform buffers of other
+  datasets.
+
+The new member helpers are declared in `vtkMetalGlyph3DMapper.h` with
+`void*` device/encoder parameters (cast inside the `.mm`), following the
+`vtkMetalPolyDataMapper.h` convention so the header stays Objective-C-free.
+`TestGlyph3DMapperCompositeDisplayAttributeInheritance` now passes (TIGHT_VALID
+0), the bespoke `TestMetalGlyph3DMapper` still passes, and the full suite re-ran
+at 160 pass / 15 fail / 0 aborted with the failure set otherwise unchanged and
+no regression against the documented passing cluster.
 
 ### The glyph3D point-selection fix (`TestGlyph3DMapperPicking` now passes)
 
