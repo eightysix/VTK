@@ -124,7 +124,7 @@ protected:
   // Upload vertex data from CPU vectors to GPU Metal buffers
   void UploadVertexDataToMTLBuffers(void* mtlDevice, vtkPolyData* polydata,
     vtkPointData* pd, vtkUnsignedCharArray* mappedColors, int cellFlag,
-    bool gpuTessUsed, const float defaultRGBA[4],
+    int representation, bool gpuTessUsed, const float defaultRGBA[4],
     std::vector<float>& positions, std::vector<float>& normals,
     const std::vector<float>& surfaceColors, const std::vector<float>& triangleUVs,
     const std::vector<float>& triangleScalarCoords, bool useScalarLUT,

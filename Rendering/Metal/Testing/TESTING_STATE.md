@@ -19,8 +19,8 @@ Two test surfaces exist:
 2. The generic multi-backend suite in `Rendering/Core/Testing/Cxx/`, which
    registers the same ~175 tests once per backend and was wired up for Metal
        through    object-factory overrides (`--vtk-factory-prefer
-            RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
-              crash)**. Current working-tree status: **160 pass / 15 fail (0 crash)** —
+             RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
+               crash)**. Current working-tree status: **161 pass / 14 fail (0 crash)** —
         `TestGlyph3DMapperCompositeDisplayAttributeInheritance` now passes via the
        composite per-block display-attribute inheritance port in the Metal glyph
        mapper (see the composite display-attribute section below),
@@ -180,7 +180,7 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  160 Passed  15 Failed (incl. image/pick fails)  0 "Subprocess aborted"
+175 tests:  161 Passed  14 Failed (incl. image/pick fails)  0 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
@@ -548,6 +548,64 @@ per-block display attributes (visibility/pickability/color/opacity) like
 otherwise unchanged (11 image-compare + 1 below-threshold pick-check + 3
 non-image fails, no new failures). The regression check against the documented
 passing cluster reports none.
+Run after the point/line draw-order + flat wide-line shading fix (this run,
+2026-08-04): 161 Passed / 14 Failed / 0 aborted out of 175 (analyzed with
+`analyze_metal_ctest_log.py` from a single `ctest -R "RenderingCoreCxx-Metal" -j 8`
+run; failures exported with `export_image_compare.sh --no-run`) —
+`TestMixedGeometryCellScalars` now passes for the first time (TIGHT_VALID
+ImageError 0.000, was a mid-bucket 0.137264 image fail): the Metal mapper drew
+wide lines before points, so the 20px point sprites (drawn last, LEQUAL depth)
+overwrote the 10px blue polyline where they overlapped, and wide non-tube lines
+used the fake-tube cylinder normal (a blue gradient darker toward the long
+borders) while GL's native `glLineWidth` renders a flat strip (see the
+point/line draw-order + flat wide-line shading section below). The +1 pass
+delta over the previous run is exactly that test; the failure set is otherwise
+unchanged (10 image-compare + 1 below-threshold pick-check + 3 non-image fails,
+no new failures). The regression check against the documented passing cluster
+reports none.
+
+### The point/line draw-order + flat wide-line shading fix (`TestMixedGeometryCellScalars` now passes)
+
+`TestMixedGeometryCellScalars` renders a `vtkPolyPointSource` (5 points),
+`vtkPolyLineSource` (open polyline) and `vtkRegularPolygonSource` (8-sided
+polygon) appended with per-cell scalar values (points 0.1, line 0.5, polygon
+0.9) through a single mapper with the line width 10 and point size 20. It
+failed image comparison at a mid-bucket 0.137264 with exactly the line wrong:
+the baseline blue polyline (1365 px) rendered as only 319 px of blue plus a
+strong blue gradient across the line width.
+
+Two root causes, both in `vtkMetalPolyDataMapper` / `MetalShaders.metal`:
+
+- **Draw order.** `vtkOpenGLPolyDataMapper` draws primitives in
+  points → lines → triangle order (`PrimitiveStart` → `PrimitiveVertices`),
+  so later primitives overwrite earlier ones at equal depth (LEQUAL depth
+  test). The Metal mapper recorded the wide-line draw *before* the point
+  draws, so the 20px point sprites (drawn last) occluded the 10px polyline
+  wherever the S-curve passed under or near the points. The two point blocks
+  ("vertex visibility" dots and the VTK_POINTS representation pass) were moved
+  ahead of the line-drawing block, restoring the GL points-first order
+  (triangles → points → lines → edge overlay in the file); the depth-peel / OIT
+  gates on each block are unchanged.
+- **Wide-line shading.** The thick-line / round-cap / miter-join fragment
+  shaders (`shadeLineFragment`, `shadeLineFragmentOIT`) always built the
+  fake-tube cylinder normal (`dist_to_centerline`-based cross-section) for the
+  Phong lighting, producing a blue gradient darker toward the long borders.
+  GL's native `glLineWidth` wide lines are a flat screen-space strip, and the
+  baseline shows a uniform color. The fragments now use a flat view-facing
+  normal `float3(0,0,1)` unless the new `kSceneFlagLinesTubeShading` scene bit
+  (1u << 19, wired to `vtkProperty::GetRenderLinesAsTubes()`) is set, which
+  keeps the cylinder shading exactly for `RenderLinesAsTubes` scenes. The
+  fragments gained a `constant SceneUniforms& scene` argument (all 6 thick/OIT
+  call sites updated); 1px lines, surface, points, and glyph fragments are
+  untouched, so the flag only affects wide non-tube lines.
+
+`TestMixedGeometryCellScalars` now passes at TIGHT_VALID 0.000 (pixel-perfect:
+red/green/blue/white pixel counts match the baseline exactly), and the
+`RenderLinesAsTubes` tests are unchanged (`TestRenderLinesAsTubes` /
+`TestRenderLinesAsTubesOrthoCamera` still at their pre-existing near-miss
+0.0535, since the cylinder path is preserved behind the flag). The full suite
+re-ran at 161 pass / 14 fail / 0 aborted with the failure set otherwise
+unchanged and no regression against the documented passing cluster.
 
 ### The OIT translucent-line fix (`TestLineRenderingTranslucent` now passes)
 
@@ -2151,3 +2209,12 @@ now passes (all four resolutions, TIGHT_VALID ≤ 5.4e-04) via the
 set is unchanged (15 image-compare + 1 below-threshold pick-check + 3 non-image);
 the tally above and the buckets are from this run, exported with
 `export_image_compare.sh`.
+
+Newest working-tree run (2026-08-04, after the point/line draw-order + flat
+wide-line shading fix): 161 Passed / 14 Failed / 0 aborted —
+`TestMixedGeometryCellScalars` now passes (TIGHT_VALID 0.000, was a mid-bucket
+0.137264) via the points-before-lines draw reorder and the flat wide-line
+shading behind `kSceneFlagLinesTubeShading` (see the point/line draw-order +
+flat wide-line shading section above); the remaining failure set is unchanged
+(10 image-compare + 1 below-threshold pick-check + 3 non-image); the tally above
+and the buckets are from this run, exported with `export_image_compare.sh`.

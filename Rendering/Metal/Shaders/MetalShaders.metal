@@ -52,6 +52,10 @@ constant uint kSceneFlagHasPointColors       = 1u << 17;
 // material in (and colors backfaces from it) instead of using the mirrored
 // front-material slots, matching vtkOpenGLGlyph3DHelper::ReplaceShaderColor.
 constant uint kSceneFlagGlyphHasBackface     = 1u << 18;
+// RenderLinesAsTubes: wide lines build a fake cylinder normal across the width
+// (lit tube look); when clear, wide lines are flat across the width like GL's
+// native glLineWidth rendering.
+constant uint kSceneFlagLinesTubeShading     = 1u << 19;
 
 // Compile-time feature specialization for the surface shader (the "GL way"):
 // one shader source, specialized per feature set at pipeline creation via
@@ -1299,7 +1303,8 @@ inline float3 lateralDir(float3 segViewDir) {
 inline FragmentOutput shadeLineFragment(LineVertexOut in,
     constant MaterialUniforms& material,
     constant LightUniforms& lights,
-    constant CoincidentOffsetUniforms& coinOffset)
+    constant CoincidentOffsetUniforms& coinOffset,
+    constant SceneUniforms& scene)
 {
   FragmentOutput out;
   float3 baseColor = in.vertexColor.rgb;
@@ -1310,20 +1315,28 @@ inline FragmentOutput shadeLineFragment(LineVertexOut in,
   // ambient+diffuse material color, matching vtkGLSLModLight's complexity-0
   // path. This is a compile-time branch via kLightingDisabled (GL bakes the
   // complexity into a NoLighting shader), so the unlit pipeline variant drops
-  // the fake-tube normal construction and Phong loop entirely.
+  // the Phong loop entirely.
   if (!kLightingDisabled)
   {
-    // Fake-tube shading: rotate the view-facing normal toward the lateral
-    // (across-the-tube) direction so the tube reads as a lit cylinder instead of
-    // a flat quad. Matches the vtkOpenGLPolyDataMapper tube normal construction,
-    // including the emix blend that keeps the tube edges lit (the edge normal is
-    // half cylinder, half view-facing, which keeps N.z from dropping to zero).
-    float r = clamp(in.dist_to_centerline, -1.0, 1.0);
-    float lenZ = clamp(sqrt(max(1.0 - r * r, 0.0)), 0.0, 1.0);
-    float3 lateral = normalize(in.viewNormal);
-    float3 cylinderN = normalize(r * lateral + lenZ * float3(0.0, 0.0, 1.0));
-    float emix = clamp(0.5 + in.lineHalfW * (1.0 - abs(r)), 0.0, 1.0);
-    float3 N = normalize(mix(float3(0.0, 0.0, 1.0), cylinderN, emix));
+    // Wide lines emulate GL's native glLineWidth rendering with a flat
+    // view-facing normal (uniform lighting across the width). With
+    // RenderLinesAsTubes, GL builds real tube geometry whose fragment normals
+    // rotate around the tube axis, so the fake-tube normal replicates that
+    // cylinder shading instead.
+    float3 N;
+    if ((scene.flags & kSceneFlagLinesTubeShading) != 0u)
+    {
+      float r = clamp(in.dist_to_centerline, -1.0, 1.0);
+      float lenZ = clamp(sqrt(max(1.0 - r * r, 0.0)), 0.0, 1.0);
+      float3 lateral = normalize(in.viewNormal);
+      float3 cylinderN = normalize(r * lateral + lenZ * float3(0.0, 0.0, 1.0));
+      float emix = clamp(0.5 + in.lineHalfW * (1.0 - abs(r)), 0.0, 1.0);
+      N = normalize(mix(float3(0.0, 0.0, 1.0), cylinderN, emix));
+    }
+    else
+    {
+      N = float3(0.0, 0.0, 1.0);
+    }
 
     computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb,
         material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
@@ -1401,7 +1414,7 @@ fragment FragmentOutput fragment_thick_line_main(
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
-  return shadeLineFragment(in, material, lights, coinOffset);
+  return shadeLineFragment(in, material, lights, coinOffset, scene);
 }
 
 // ---------------------------------------------------------------------------
@@ -1490,7 +1503,7 @@ fragment FragmentOutput fragment_round_cap_line_main(
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
-  return shadeLineFragment(in, material, lights, coinOffset);
+  return shadeLineFragment(in, material, lights, coinOffset, scene);
 }
 
 // ---------------------------------------------------------------------------
@@ -1596,7 +1609,7 @@ fragment FragmentOutput fragment_miter_join_line_main(
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
-  return shadeLineFragment(in, material, lights, coinOffset);
+  return shadeLineFragment(in, material, lights, coinOffset, scene);
 }
 
 // OIT accumulate variant of shadeLineFragment: emits the same lit color as the
@@ -1606,7 +1619,8 @@ fragment FragmentOutput fragment_miter_join_line_main(
 inline OITAccumulateOutput shadeLineFragmentOIT(LineVertexOut in,
     constant MaterialUniforms& material,
     constant LightUniforms& lights,
-    constant CoincidentOffsetUniforms& coinOffset)
+    constant CoincidentOffsetUniforms& coinOffset,
+    constant SceneUniforms& scene)
 {
   float3 baseColor = in.vertexColor.rgb;
   float opacity = in.vertexColor.a * material.opacity;
@@ -1614,12 +1628,20 @@ inline OITAccumulateOutput shadeLineFragmentOIT(LineVertexOut in,
   float3 totalDiffuse = float3(0.0), totalSpecular = float3(0.0);
   if (!kLightingDisabled)
   {
-    float r = clamp(in.dist_to_centerline, -1.0, 1.0);
-    float lenZ = clamp(sqrt(max(1.0 - r * r, 0.0)), 0.0, 1.0);
-    float3 lateral = normalize(in.viewNormal);
-    float3 cylinderN = normalize(r * lateral + lenZ * float3(0.0, 0.0, 1.0));
-    float emix = clamp(0.5 + in.lineHalfW * (1.0 - abs(r)), 0.0, 1.0);
-    float3 N = normalize(mix(float3(0.0, 0.0, 1.0), cylinderN, emix));
+    float3 N;
+    if ((scene.flags & kSceneFlagLinesTubeShading) != 0u)
+    {
+      float r = clamp(in.dist_to_centerline, -1.0, 1.0);
+      float lenZ = clamp(sqrt(max(1.0 - r * r, 0.0)), 0.0, 1.0);
+      float3 lateral = normalize(in.viewNormal);
+      float3 cylinderN = normalize(r * lateral + lenZ * float3(0.0, 0.0, 1.0));
+      float emix = clamp(0.5 + in.lineHalfW * (1.0 - abs(r)), 0.0, 1.0);
+      N = normalize(mix(float3(0.0, 0.0, 1.0), cylinderN, emix));
+    }
+    else
+    {
+      N = float3(0.0, 0.0, 1.0);
+    }
 
     computePhongLighting(N, in.viewPos, baseColor, material.specularColor.rgb,
         material.specularColor.w, material.specularPower, MAX_LIGHTS, -1, lights, totalDiffuse, totalSpecular);
@@ -1642,7 +1664,7 @@ fragment OITAccumulateOutput fragment_thick_line_main_oit(
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
-  return shadeLineFragmentOIT(in, material, lights, coinOffset);
+  return shadeLineFragmentOIT(in, material, lights, coinOffset, scene);
 }
 
 fragment OITAccumulateOutput fragment_round_cap_line_main_oit(
@@ -1651,7 +1673,7 @@ fragment OITAccumulateOutput fragment_round_cap_line_main_oit(
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
-  return shadeLineFragmentOIT(in, material, lights, coinOffset);
+  return shadeLineFragmentOIT(in, material, lights, coinOffset, scene);
 }
 
 fragment OITAccumulateOutput fragment_miter_join_line_main_oit(
@@ -1660,7 +1682,7 @@ fragment OITAccumulateOutput fragment_miter_join_line_main_oit(
     constant LightUniforms& lights [[buffer(1)]],
     constant SceneUniforms& scene [[buffer(2)]],
     constant CoincidentOffsetUniforms& coinOffset [[buffer(3)]]) {
-  return shadeLineFragmentOIT(in, material, lights, coinOffset);
+  return shadeLineFragmentOIT(in, material, lights, coinOffset, scene);
 }
 
 // ---------------------------------------------------------------------------

@@ -678,6 +678,11 @@ constexpr uint32_t VTK_METAL_SCENE_FLAG_LINES_UNLIT         = 1u << 14;
 // VTK_METAL_SCENE_FLAG_LINES_UNLIT, which folds prop->GetLighting() in).
 constexpr uint32_t VTK_METAL_SCENE_FLAG_LIGHTING_DISABLED   = 1u << 16;
 constexpr uint32_t VTK_METAL_SCENE_FLAG_HAS_POINT_COLORS    = 1u << 17;
+// RenderLinesAsTubes: wide lines build a fake cylinder normal across the width
+// (lit tube look), matching GL's real tube geometry; otherwise wide lines are
+// flat across the width like GL's native glLineWidth rendering. Read only by
+// the thick-line/round-cap/miter-join line fragments.
+constexpr uint32_t VTK_METAL_SCENE_FLAG_LINES_TUBE_SHADING  = 1u << 19;
 
 constexpr uint32_t VTK_METAL_DYNAMIC_ACTOR_FLAG_MASK =
     VTK_METAL_SCENE_FLAG_VERTEX_VISIBILITY |
@@ -691,7 +696,8 @@ constexpr uint32_t VTK_METAL_DYNAMIC_ACTOR_FLAG_MASK =
     VTK_METAL_SCENE_FLAG_HAS_SCALAR_LUT |
     VTK_METAL_SCENE_FLAG_LINES_UNLIT |
     VTK_METAL_SCENE_FLAG_LIGHTING_DISABLED |
-    VTK_METAL_SCENE_FLAG_HAS_POINT_COLORS;
+    VTK_METAL_SCENE_FLAG_HAS_POINT_COLORS |
+    VTK_METAL_SCENE_FLAG_LINES_TUBE_SHADING;
 
 id<MTLBuffer> CreateZeroBuffer(id<MTLDevice> device, size_t bytes)
 {
@@ -856,6 +862,8 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   id<MTLBuffer> PointColorUVBuffer = nil;    // float2 per point (from data or default)
   id<MTLBuffer> PointConnectivityBuffer = nil; // uint32 per entry (identity map)
   vtkIdType PointVertexCount = 0;             // number of points to draw
+  id<MTLBuffer> VertPointConnectivityBuffer = nil; // uint32 per entry (vert-cell point ids only)
+  vtkIdType VertPointVertexCount = 0;         // number of vert-cell points to draw
 
   id<MTLRenderPipelineState> PointPipeline = nil;       // basic 1px
   id<MTLRenderPipelineState> PointShapedPipeline = nil; // instanced quads
@@ -1307,6 +1315,8 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     vtkMetalMRC::ReleaseAndNil(PointColorUVBuffer);
     vtkMetalMRC::ReleaseAndNil(PointConnectivityBuffer);
     PointVertexCount = 0;
+    vtkMetalMRC::ReleaseAndNil(VertPointConnectivityBuffer);
+    VertPointVertexCount = 0;
 
     vtkMetalMRC::ReleaseAndNil(SceneUniformBuffer);
     vtkMetalMRC::ReleaseAndNil(MaterialUniformBuffer);
@@ -1635,6 +1645,11 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
 
   // Helper lambdas to record encoder commands into the bundle
   auto recordPipeline = [&commands](id<MTLRenderPipelineState> pipeline) {
+    if (getenv("DBG_TMG"))
+      fprintf(stderr, "[DBG-TMG-draw] SetPipeline %s (buf colors=%s, pos=%s)\n",
+        pipeline.label ? [pipeline.label UTF8String] : "?",
+        getenv("DBG_TMG2") ? "?" : "?",
+        getenv("DBG_TMG2") ? "?" : "?");
     Cmd cmd;
     cmd.type = Cmd::SetPipelineState;
     cmd.params = PSParams{ pipeline };
@@ -1684,6 +1699,9 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   };
   auto recordDraw = [&commands, &recordedAnyDraw](MTLPrimitiveType ptype, NSUInteger vstart, NSUInteger vcount,
                         NSUInteger icount = 0) {
+    if (getenv("DBG_TMG"))
+      fprintf(stderr, "[DBG-TMG-draw] DrawPrimitives ptype=%d vstart=%llu vcount=%llu instances=%llu\n",
+        (int)ptype, (unsigned long long)vstart, (unsigned long long)vcount, (unsigned long long)icount);
     Cmd cmd;
     cmd.type = Cmd::DrawPrimitives;
     cmd.params = DrawParams{ ptype, vstart, vcount, icount };
@@ -1692,6 +1710,9 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   };
   auto recordIdxDraw = [&commands, &recordedAnyDraw](MTLPrimitiveType ptype, NSUInteger indexCount, MTLIndexType itype,
                            id<MTLBuffer> ibuf, NSUInteger offset) {
+    if (getenv("DBG_TMG"))
+      fprintf(stderr, "[DBG-TMG-draw] DrawIndexed ptype=%d indexCount=%llu itype=%d buf=%p offset=%llu\n",
+        (int)ptype, (unsigned long long)indexCount, (int)itype, (void*)ibuf, (unsigned long long)offset);
     Cmd cmd;
     cmd.type = Cmd::DrawIndexedPrimitives;
     cmd.params = IdxParams{ ptype, indexCount, itype, ibuf, offset };
@@ -2069,6 +2090,265 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       {
         recordDraw(MTLPrimitiveTypeTriangle, 0, this->Internals->TriangleVertexCount);
       }
+    }
+  }
+
+  // --- Vertex visibility (dots on surface, skipped during depth-peel passes) ---
+  if (!peelPassActive && !oitActive && drawVertexVisibilityDots)
+  {
+    float ptSize = act->GetProperty()->GetPointSize();
+    if (ptSize > 1.0f && this->Internals->PointShapedPipeline)
+    {
+      recordPipeline(this->Internals->PointShapedPipeline);
+      recordVBuf(this->Internals->PointPositionBuffer, 0, 0);
+      recordVBuf(this->Internals->PointConnectivityBuffer, 0, 1);
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordVBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->PointNormalBuffer)
+      {
+        recordVBuf(this->Internals->PointNormalBuffer, 0, 3);
+      }
+      if (this->Internals->PointColorBuffer)
+      {
+        recordVBuf(this->Internals->PointColorBuffer, 0, 4);
+      }
+      if (this->Internals->PointTangentBuffer)
+      {
+        recordVBuf(this->Internals->PointTangentBuffer, 0, 6);
+      }
+      if (this->Internals->PointUVBuffer)
+      {
+        recordVBuf(this->Internals->PointUVBuffer, 0, 7);
+      }
+      if (this->Internals->PointColorUVBuffer)
+      {
+        recordVBuf(this->Internals->PointColorUVBuffer, 0, 8);
+      }
+
+      if (this->Internals->PointCellIdBuffer)
+      {
+        recordVBuf(this->Internals->PointCellIdBuffer, 0, 11);
+      }
+      if (this->Internals->PropIdBuffer)
+      {
+        recordVBuf(this->Internals->PropIdBuffer, 0, 12);
+      }
+      if (this->Internals->MaterialUniformBuffer)
+      {
+        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
+      }
+      if (this->Internals->LightUniformBuffer)
+      {
+        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
+      }
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+      }
+      if (this->Internals->VertexColorBuffer)
+      {
+        recordFBuf(this->Internals->VertexColorBuffer, 0, 4);
+      }
+      recordDraw(MTLPrimitiveTypeTriangleStrip, 0, 4, this->Internals->PointVertexCount);
+    }
+    else if (this->Internals->PointPipeline)
+    {
+      recordPipeline(this->Internals->PointPipeline);
+      recordVBuf(this->Internals->PointPositionBuffer, 0, 0);
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordVBuf(this->Internals->SceneUniformBuffer, 0, 1);
+      }
+      if (this->Internals->PointNormalBuffer)
+      {
+        recordVBuf(this->Internals->PointNormalBuffer, 0, 2);
+      }
+      if (this->Internals->PointColorBuffer)
+      {
+        recordVBuf(this->Internals->PointColorBuffer, 0, 3);
+      }
+      if (this->Internals->PointTangentBuffer)
+      {
+        recordVBuf(this->Internals->PointTangentBuffer, 0, 6);
+      }
+      if (this->Internals->PointUVBuffer)
+      {
+        recordVBuf(this->Internals->PointUVBuffer, 0, 7);
+      }
+      if (this->Internals->PointColorUVBuffer)
+      {
+        recordVBuf(this->Internals->PointColorUVBuffer, 0, 8);
+      }
+
+      if (this->Internals->PointCellIdBuffer)
+      {
+        recordVBuf(this->Internals->PointCellIdBuffer, 0, 11);
+      }
+      if (this->Internals->PropIdBuffer)
+      {
+        recordVBuf(this->Internals->PropIdBuffer, 0, 12);
+      }
+      if (this->Internals->MaterialUniformBuffer)
+      {
+        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
+      }
+      if (this->Internals->LightUniformBuffer)
+      {
+        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
+      }
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+      }
+      if (this->Internals->VertexColorBuffer)
+      {
+        recordFBuf(this->Internals->VertexColorBuffer, 0, 4);
+      }
+      recordDraw(MTLPrimitiveTypePoint, 0, this->Internals->PointVertexCount);
+    }
+  }
+
+  // --- Points (VTK_POINTS representation, skipped during depth-peel passes) ---
+  if (!peelPassActive && !oitActive && drawPointRepresentation)
+  {
+    // When vertex cells are drawn as points under a surface/wireframe
+    // representation, the point pass is restricted to the vert-cell points
+    // (VertPointConnectivityBuffer), matching GL's PrimitivePoints pass;
+    // otherwise all points are drawn (VTK_POINTS representation).
+    const vtkIdType pointDrawCount = (this->Internals->VertPointVertexCount > 0)
+        ? this->Internals->VertPointVertexCount
+        : this->Internals->PointVertexCount;
+    float ptSize = act->GetProperty()->GetPointSize();
+    if (ptSize > 1.0f && this->Internals->PointShapedPipeline)
+    {
+      recordPipeline(this->Internals->PointShapedPipeline);
+      recordVBuf(this->Internals->PointPositionBuffer, 0, 0);
+      recordVBuf((this->Internals->VertPointVertexCount > 0)
+          ? this->Internals->VertPointConnectivityBuffer
+          : this->Internals->PointConnectivityBuffer, 0, 1);
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordVBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->PointNormalBuffer)
+      {
+        recordVBuf(this->Internals->PointNormalBuffer, 0, 3);
+      }
+      if (this->Internals->PointColorBuffer)
+      {
+        recordVBuf(this->Internals->PointColorBuffer, 0, 4);
+      }
+      if (this->Internals->PointTangentBuffer)
+      {
+        recordVBuf(this->Internals->PointTangentBuffer, 0, 6);
+      }
+      if (this->Internals->PointUVBuffer)
+      {
+        recordVBuf(this->Internals->PointUVBuffer, 0, 7);
+      }
+      if (this->Internals->PointColorUVBuffer)
+      {
+        recordVBuf(this->Internals->PointColorUVBuffer, 0, 8);
+      }
+
+      if (this->Internals->PointCellIdBuffer)
+      {
+        recordVBuf(this->Internals->PointCellIdBuffer, 0, 11);
+      }
+      if (this->Internals->PropIdBuffer)
+      {
+        recordVBuf(this->Internals->PropIdBuffer, 0, 12);
+      }
+      if (this->Internals->MaterialUniformBuffer)
+      {
+        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
+      }
+      if (this->Internals->LightUniformBuffer)
+      {
+        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
+      }
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+      }
+      if (this->Internals->VertexColorBuffer)
+      {
+        recordFBuf(this->Internals->VertexColorBuffer, 0, 4);
+      }
+      recordDraw(MTLPrimitiveTypeTriangleStrip, 0, 4, pointDrawCount);
+    }
+    else if (this->Internals->PointPipeline)
+    {
+      recordPipeline(this->Internals->PointPipeline);
+      recordVBuf(this->Internals->PointPositionBuffer, 0, 0);
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordVBuf(this->Internals->SceneUniformBuffer, 0, 1);
+      }
+      if (this->Internals->PointNormalBuffer)
+      {
+        recordVBuf(this->Internals->PointNormalBuffer, 0, 2);
+      }
+      if (this->Internals->PointColorBuffer)
+      {
+        recordVBuf(this->Internals->PointColorBuffer, 0, 3);
+      }
+      if (this->Internals->PointTangentBuffer)
+      {
+        recordVBuf(this->Internals->PointTangentBuffer, 0, 6);
+      }
+      if (this->Internals->PointUVBuffer)
+      {
+        recordVBuf(this->Internals->PointUVBuffer, 0, 7);
+      }
+      if (this->Internals->PointColorUVBuffer)
+      {
+        recordVBuf(this->Internals->PointColorUVBuffer, 0, 8);
+      }
+
+      if (this->Internals->PointCellIdBuffer)
+      {
+        recordVBuf(this->Internals->PointCellIdBuffer, 0, 11);
+      }
+      if (this->Internals->PropIdBuffer)
+      {
+        recordVBuf(this->Internals->PropIdBuffer, 0, 12);
+      }
+      if (this->Internals->MaterialUniformBuffer)
+      {
+        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
+      }
+      if (this->Internals->LightUniformBuffer)
+      {
+        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
+      }
+      if (this->Internals->SceneUniformBuffer)
+      {
+        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
+      }
+      if (this->Internals->CoincidentOffsetBuffer)
+      {
+        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
+      }
+      if (this->Internals->VertexColorBuffer)
+      {
+        recordFBuf(this->Internals->VertexColorBuffer, 0, 4);
+      }
+      recordDraw(MTLPrimitiveTypePoint, 0, pointDrawCount);
     }
   }
 
@@ -2528,256 +2808,6 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
       recordCull(MTLCullModeNone);
       recordIdxDraw(MTLPrimitiveTypeLine, this->Internals->EdgeIndexCount, MTLIndexTypeUInt32,
         this->Internals->EdgeIndexBuffer, 0);
-    }
-  }
-
-  // --- Vertex visibility (dots on surface, skipped during depth-peel passes) ---
-  if (!peelPassActive && !oitActive && drawVertexVisibilityDots)
-  {
-    float ptSize = act->GetProperty()->GetPointSize();
-    if (ptSize > 1.0f && this->Internals->PointShapedPipeline)
-    {
-      recordPipeline(this->Internals->PointShapedPipeline);
-      recordVBuf(this->Internals->PointPositionBuffer, 0, 0);
-      recordVBuf(this->Internals->PointConnectivityBuffer, 0, 1);
-      if (this->Internals->SceneUniformBuffer)
-      {
-        recordVBuf(this->Internals->SceneUniformBuffer, 0, 2);
-      }
-      if (this->Internals->PointNormalBuffer)
-      {
-        recordVBuf(this->Internals->PointNormalBuffer, 0, 3);
-      }
-      if (this->Internals->PointColorBuffer)
-      {
-        recordVBuf(this->Internals->PointColorBuffer, 0, 4);
-      }
-      if (this->Internals->PointTangentBuffer)
-      {
-        recordVBuf(this->Internals->PointTangentBuffer, 0, 6);
-      }
-      if (this->Internals->PointUVBuffer)
-      {
-        recordVBuf(this->Internals->PointUVBuffer, 0, 7);
-      }
-      if (this->Internals->PointColorUVBuffer)
-      {
-        recordVBuf(this->Internals->PointColorUVBuffer, 0, 8);
-      }
-
-      if (this->Internals->PointCellIdBuffer)
-      {
-        recordVBuf(this->Internals->PointCellIdBuffer, 0, 11);
-      }
-      if (this->Internals->PropIdBuffer)
-      {
-        recordVBuf(this->Internals->PropIdBuffer, 0, 12);
-      }
-      if (this->Internals->MaterialUniformBuffer)
-      {
-        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
-      }
-      if (this->Internals->LightUniformBuffer)
-      {
-        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
-      }
-      if (this->Internals->SceneUniformBuffer)
-      {
-        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
-      }
-      if (this->Internals->CoincidentOffsetBuffer)
-      {
-        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
-      }
-      if (this->Internals->VertexColorBuffer)
-      {
-        recordFBuf(this->Internals->VertexColorBuffer, 0, 4);
-      }
-      recordDraw(MTLPrimitiveTypeTriangleStrip, 0, 4, this->Internals->PointVertexCount);
-    }
-    else if (this->Internals->PointPipeline)
-    {
-      recordPipeline(this->Internals->PointPipeline);
-      recordVBuf(this->Internals->PointPositionBuffer, 0, 0);
-      if (this->Internals->SceneUniformBuffer)
-      {
-        recordVBuf(this->Internals->SceneUniformBuffer, 0, 1);
-      }
-      if (this->Internals->PointNormalBuffer)
-      {
-        recordVBuf(this->Internals->PointNormalBuffer, 0, 2);
-      }
-      if (this->Internals->PointColorBuffer)
-      {
-        recordVBuf(this->Internals->PointColorBuffer, 0, 3);
-      }
-      if (this->Internals->PointTangentBuffer)
-      {
-        recordVBuf(this->Internals->PointTangentBuffer, 0, 6);
-      }
-      if (this->Internals->PointUVBuffer)
-      {
-        recordVBuf(this->Internals->PointUVBuffer, 0, 7);
-      }
-      if (this->Internals->PointColorUVBuffer)
-      {
-        recordVBuf(this->Internals->PointColorUVBuffer, 0, 8);
-      }
-
-      if (this->Internals->PointCellIdBuffer)
-      {
-        recordVBuf(this->Internals->PointCellIdBuffer, 0, 11);
-      }
-      if (this->Internals->PropIdBuffer)
-      {
-        recordVBuf(this->Internals->PropIdBuffer, 0, 12);
-      }
-      if (this->Internals->MaterialUniformBuffer)
-      {
-        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
-      }
-      if (this->Internals->LightUniformBuffer)
-      {
-        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
-      }
-      if (this->Internals->SceneUniformBuffer)
-      {
-        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
-      }
-      if (this->Internals->CoincidentOffsetBuffer)
-      {
-        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
-      }
-      if (this->Internals->VertexColorBuffer)
-      {
-        recordFBuf(this->Internals->VertexColorBuffer, 0, 4);
-      }
-      recordDraw(MTLPrimitiveTypePoint, 0, this->Internals->PointVertexCount);
-    }
-  }
-
-  // --- Points (VTK_POINTS representation, skipped during depth-peel passes) ---
-  if (!peelPassActive && !oitActive && drawPointRepresentation)
-  {
-    float ptSize = act->GetProperty()->GetPointSize();
-    if (ptSize > 1.0f && this->Internals->PointShapedPipeline)
-    {
-      recordPipeline(this->Internals->PointShapedPipeline);
-      recordVBuf(this->Internals->PointPositionBuffer, 0, 0);
-      recordVBuf(this->Internals->PointConnectivityBuffer, 0, 1);
-      if (this->Internals->SceneUniformBuffer)
-      {
-        recordVBuf(this->Internals->SceneUniformBuffer, 0, 2);
-      }
-      if (this->Internals->PointNormalBuffer)
-      {
-        recordVBuf(this->Internals->PointNormalBuffer, 0, 3);
-      }
-      if (this->Internals->PointColorBuffer)
-      {
-        recordVBuf(this->Internals->PointColorBuffer, 0, 4);
-      }
-      if (this->Internals->PointTangentBuffer)
-      {
-        recordVBuf(this->Internals->PointTangentBuffer, 0, 6);
-      }
-      if (this->Internals->PointUVBuffer)
-      {
-        recordVBuf(this->Internals->PointUVBuffer, 0, 7);
-      }
-      if (this->Internals->PointColorUVBuffer)
-      {
-        recordVBuf(this->Internals->PointColorUVBuffer, 0, 8);
-      }
-
-      if (this->Internals->PointCellIdBuffer)
-      {
-        recordVBuf(this->Internals->PointCellIdBuffer, 0, 11);
-      }
-      if (this->Internals->PropIdBuffer)
-      {
-        recordVBuf(this->Internals->PropIdBuffer, 0, 12);
-      }
-      if (this->Internals->MaterialUniformBuffer)
-      {
-        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
-      }
-      if (this->Internals->LightUniformBuffer)
-      {
-        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
-      }
-      if (this->Internals->SceneUniformBuffer)
-      {
-        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
-      }
-      if (this->Internals->CoincidentOffsetBuffer)
-      {
-        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
-      }
-      if (this->Internals->VertexColorBuffer)
-      {
-        recordFBuf(this->Internals->VertexColorBuffer, 0, 4);
-      }
-      recordDraw(MTLPrimitiveTypeTriangleStrip, 0, 4, this->Internals->PointVertexCount);
-    }
-    else if (this->Internals->PointPipeline)
-    {
-      recordPipeline(this->Internals->PointPipeline);
-      recordVBuf(this->Internals->PointPositionBuffer, 0, 0);
-      if (this->Internals->SceneUniformBuffer)
-      {
-        recordVBuf(this->Internals->SceneUniformBuffer, 0, 1);
-      }
-      if (this->Internals->PointNormalBuffer)
-      {
-        recordVBuf(this->Internals->PointNormalBuffer, 0, 2);
-      }
-      if (this->Internals->PointColorBuffer)
-      {
-        recordVBuf(this->Internals->PointColorBuffer, 0, 3);
-      }
-      if (this->Internals->PointTangentBuffer)
-      {
-        recordVBuf(this->Internals->PointTangentBuffer, 0, 6);
-      }
-      if (this->Internals->PointUVBuffer)
-      {
-        recordVBuf(this->Internals->PointUVBuffer, 0, 7);
-      }
-      if (this->Internals->PointColorUVBuffer)
-      {
-        recordVBuf(this->Internals->PointColorUVBuffer, 0, 8);
-      }
-
-      if (this->Internals->PointCellIdBuffer)
-      {
-        recordVBuf(this->Internals->PointCellIdBuffer, 0, 11);
-      }
-      if (this->Internals->PropIdBuffer)
-      {
-        recordVBuf(this->Internals->PropIdBuffer, 0, 12);
-      }
-      if (this->Internals->MaterialUniformBuffer)
-      {
-        recordFBuf(this->Internals->MaterialUniformBuffer, 0, 0);
-      }
-      if (this->Internals->LightUniformBuffer)
-      {
-        recordFBuf(this->Internals->LightUniformBuffer, 0, 1);
-      }
-      if (this->Internals->SceneUniformBuffer)
-      {
-        recordFBuf(this->Internals->SceneUniformBuffer, 0, 2);
-      }
-      if (this->Internals->CoincidentOffsetBuffer)
-      {
-        recordFBuf(this->Internals->CoincidentOffsetBuffer, 0, 3);
-      }
-      if (this->Internals->VertexColorBuffer)
-      {
-        recordFBuf(this->Internals->VertexColorBuffer, 0, 4);
-      }
-      recordDraw(MTLPrimitiveTypePoint, 0, this->Internals->PointVertexCount);
     }
   }
 
@@ -3350,6 +3380,14 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       if (!prop->GetLighting())
       {
         actorFlags |= VTK_METAL_SCENE_FLAG_LIGHTING_DISABLED;
+      }
+
+      // P2-2C: RenderLinesAsTubes — the thick-line fragments switch between
+      // flat wide-line shading (GL native glLineWidth) and the fake-tube
+      // cylinder normal (GL's real tube geometry) on this flag.
+      if (prop->GetRenderLinesAsTubes())
+      {
+        actorFlags |= VTK_METAL_SCENE_FLAG_LINES_TUBE_SHADING;
       }
 
       flags |= actorFlags;
@@ -5186,6 +5224,34 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     }
   }
 
+  if (getenv("DBG_TMG") && polys && polys->GetNumberOfCells() > 0)
+  {
+    fprintf(stderr,
+      "[DBG-TMG] polyCellOffset=%lld numVerts=%lld numLines=%lld cellFlag=%d normalArray=%s mappedColors=%s useCellTexture=%d useIndexBuffer=%d\n",
+      (long long)polyCellOffset, (long long)polydata->GetNumberOfVerts(),
+      (long long)polydata->GetNumberOfLines(), cellFlag,
+      normalArray ? "yes" : "no", mappedColors ? "yes" : "no",
+      (int)((cellFlag != 0) && (mappedColors != nullptr)),
+      (int)useIndexBuffer);
+    fprintf(stderr, "[DBG-TMG] positions=%zu tris=%zu cellColors=%zu cellPrimitiveIds=%zu triVertCellIds=%zu\n",
+      positions.size() / 3, triangleIndices.size() / 3, cellColors.size() / 4,
+      cellPrimitiveIds.size(), triangleVertexCellIds.size());
+    for (size_t v = 0; v < positions.size() / 3; ++v)
+    {
+      fprintf(stderr, "  v[%zu] = (%.3f, %.3f, %.3f)\n", v,
+        positions[v * 3], positions[v * 3 + 1], positions[v * 3 + 2]);
+    }
+    for (size_t c = 0; c < cellColors.size() / 4; ++c)
+    {
+      fprintf(stderr, "  cellColor[%zu] = (%.3f, %.3f, %.3f, %.3f)\n", c,
+        cellColors[c * 4], cellColors[c * 4 + 1], cellColors[c * 4 + 2], cellColors[c * 4 + 3]);
+    }
+    for (size_t p = 0; p < cellPrimitiveIds.size(); ++p)
+    {
+      fprintf(stderr, "  cellPrimId[%zu] = %u\n", p, cellPrimitiveIds[p]);
+    }
+  }
+
   // P11-11A: process triangle strips. Like GL, strips are a first-class
   // primitive type; their cells come after polys in the polydata cell array,
   // so the per-primitive cell ids (cell colors, picking) start at
@@ -5640,7 +5706,7 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   getOverrideOrDefaultRGBA(defaultRGBA);
 
   this->UploadVertexDataToMTLBuffers(mtlDevice, polydata, pd,
-    mappedColors, cellFlag, gpuTessUsed, defaultRGBA,
+    mappedColors, cellFlag, rep, gpuTessUsed, defaultRGBA,
     positions, normals, surfaceColors, triangleUVs, triangleScalarCoords,
     useScalarLUT, lineIndices,
     triangleIndices, triangleEdgeFlags, trianglePos,
@@ -5656,6 +5722,7 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
   vtkPointData* pd,
   vtkUnsignedCharArray* mappedColors,
   int cellFlag,
+  int representation,
   bool gpuTessUsed,
   const float defaultRGBA[4],
   std::vector<float>& positions, std::vector<float>& normals,
@@ -6273,6 +6340,44 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
         pointColors[i * 4 + 3] = rgba[i * 4 + 3] / 255.0f;
       }
     }
+    else if (mappedColors && cellFlag == 1 && this->Internals->HasVerts)
+    {
+      // Cell-scalar coloring with vertex cells: each vert cell's points take
+      // the cell's mapped color, matching GL's PrimitivePoints pass which
+      // resolves the color by primitive id from the cell-texture.
+      this->Internals->HasPointColors = true;
+      const unsigned char* rgba = mappedColors->GetPointer(0);
+      vtkCellArray* vertCells = polydata->GetVerts();
+      if (vertCells && mappedColors->GetNumberOfTuples() > 0)
+      {
+        const vtkIdType* pts = nullptr;
+        vtkIdType npts = 0;
+        vtkIdType cellId = 0;
+        for (vertCells->InitTraversal(); vertCells->GetNextCell(npts, pts); ++cellId)
+        {
+          if (cellId >= mappedColors->GetNumberOfTuples())
+          {
+            break;
+          }
+          const float r = rgba[cellId * 4] / 255.0f;
+          const float g = rgba[cellId * 4 + 1] / 255.0f;
+          const float b = rgba[cellId * 4 + 2] / 255.0f;
+          const float a = rgba[cellId * 4 + 3] / 255.0f;
+          for (vtkIdType i = 0; i < npts; ++i)
+          {
+            const vtkIdType p = pts[i];
+            if (p < 0 || p >= numPts)
+            {
+              continue;
+            }
+            pointColors[p * 4] = r;
+            pointColors[p * 4 + 1] = g;
+            pointColors[p * 4 + 2] = b;
+            pointColors[p * 4 + 3] = a;
+          }
+        }
+      }
+    }
     id<MTLBuffer> ptColorBuf = [device
       newBufferWithBytes:pointColors.data()
                  length:pointColors.size() * sizeof(float)
@@ -6358,7 +6463,7 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
                 options:MTLResourceStorageModeShared];
     vtkMetalMRC::AssignConsumed(this->Internals->PointColorUVBuffer, ptColUVBuf);
 
-    // Connectivity: identity map — vertex_index i maps to point i.
+    // Connectivity: identity map — draw vertex i → point i (all points).
     std::vector<uint32_t> connectivity(numPts);
     for (vtkIdType i = 0; i < numPts; ++i)
     {
@@ -6369,6 +6474,38 @@ void vtkMetalPolyDataMapper::UploadVertexDataToMTLBuffers(void* mtlDevice,
                  length:connectivity.size() * sizeof(uint32_t)
                 options:MTLResourceStorageModeShared];
     vtkMetalMRC::AssignConsumed(this->Internals->PointConnectivityBuffer, ptConnBuf);
+
+    // Vert-only connectivity: when vertex cells are drawn as points under a
+    // surface/wireframe representation, restrict the point draw to the points
+    // referenced by the vertex cells — matching GL's PrimitivePoints pass
+    // (vtkOpenGLIndexBufferObject::CreatePointIndexBuffer on the verts cell
+    // array). For VTK_POINTS representation all points are drawn instead, so
+    // the identity map above is kept. The vertex-visibility dots pass keeps
+    // using the full identity map, matching GL's CreateVertexIndexBuffer.
+    this->Internals->VertPointVertexCount = 0;
+    if (this->Internals->HasVerts && representation != VTK_POINTS)
+    {
+      vtkCellArray* vertCells = polydata->GetVerts();
+      if (vertCells && vertCells->GetNumberOfCells() > 0)
+      {
+        std::vector<uint32_t> vertConnectivity;
+        const vtkIdType* pts = nullptr;
+        vtkIdType npts = 0;
+        for (vertCells->InitTraversal(); vertCells->GetNextCell(npts, pts);)
+        {
+          for (vtkIdType i = 0; i < npts; ++i)
+          {
+            vertConnectivity.push_back(static_cast<uint32_t>(pts[i]));
+          }
+        }
+        id<MTLBuffer> vertConnBuf = [device
+          newBufferWithBytes:vertConnectivity.data()
+                     length:vertConnectivity.size() * sizeof(uint32_t)
+                    options:MTLResourceStorageModeShared];
+        vtkMetalMRC::AssignConsumed(this->Internals->VertPointConnectivityBuffer, vertConnBuf);
+        this->Internals->VertPointVertexCount = vertConnectivity.size();
+      }
+    }
 
     this->Internals->PointVertexCount = numPts;
 
