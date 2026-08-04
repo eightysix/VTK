@@ -17,6 +17,7 @@
 #include "vtkMatrix4x4.h"
 #include "vtkInformation.h"
 #include "vtkProp.h"
+#include "vtkUnsignedCharArray.h"
 
 #import <Metal/Metal.h>
 
@@ -27,6 +28,11 @@
 #include "vtkMetalMRC.h"
 
 VTK_ABI_NAMESPACE_BEGIN
+
+// Mapper2DState.flags bits. Must match the kFlagUse* constants in
+// MetalShaders.metal.
+constexpr uint32_t kFlagUseVertexColors = 1u;
+constexpr uint32_t kFlagUseCellColors = 2u;
 
 vtkStandardNewMacro(vtkMetalPolyDataMapper2D);
 
@@ -50,6 +56,21 @@ struct vtkMetalPolyDataMapper2D::vtkMetalPolyDataMapper2DInternals
   // polydata carries TCoords (e.g. vtkTextMapper / vtkTextActor quads).
   id<MTLBuffer> TexCoordBuffer = nil;
 
+  // Per-vertex color buffer (float4 per vertex, vertex buffer index 2). Used
+  // when scalars map to per-vertex colors (point data), mirroring the OpenGL
+  // "diffuseColor" vertex attribute. Always bound (as white when unused) so the
+  // pipeline's color attribute never reads out of bounds.
+  id<MTLBuffer> ColorBuffer = nil;
+
+  // Per-primitive cell color buffers (float4 per primitive, fragment buffer
+  // index 1). When cell scalars are present the shared corner vertices cannot
+  // carry per-cell colors, so the fragment shader resolves them with
+  // [[primitive_id]] -- the direct analog of GL's gl_PrimitiveID + textureC.
+  // Each draw type starts its primitive id at 0, so each needs its own buffer.
+  id<MTLBuffer> TriangleCellColorBuffer = nil;
+  id<MTLBuffer> LineCellColorBuffer = nil;
+  id<MTLBuffer> PointCellColorBuffer = nil;
+
   // Index buffers for indexed drawing
   id<MTLBuffer> TriangleIndexBuffer = nil;
   id<MTLBuffer> LineIndexBuffer = nil;
@@ -67,9 +88,12 @@ struct vtkMetalPolyDataMapper2D::vtkMetalPolyDataMapper2DInternals
   bool HasLines = false;
   bool HasPoints = false;
   bool HasTextureCoords = false;
+  bool HaveCellScalars = false;
 
   // Cached state
   vtkIdType CachedInputMTime = 0;
+  vtkIdType CachedMapperMTime = 0;
+  vtkIdType CachedActorMTime = 0;
   int CachedSampleCount = 0;
   MTLPixelFormat CachedDepthFormat = MTLPixelFormatInvalid;
   int CachedViewportSize[2] = { 0, 0 };
@@ -90,6 +114,10 @@ struct vtkMetalPolyDataMapper2D::vtkMetalPolyDataMapper2DInternals
     vtkMetalMRC::ReleaseAndNil(PositionBuffer);
     vtkMetalMRC::ReleaseAndNil(TexCoordBuffer);
     vtkMetalMRC::ReleaseAndNil(StateBuffer);
+    vtkMetalMRC::ReleaseAndNil(ColorBuffer);
+    vtkMetalMRC::ReleaseAndNil(TriangleCellColorBuffer);
+    vtkMetalMRC::ReleaseAndNil(LineCellColorBuffer);
+    vtkMetalMRC::ReleaseAndNil(PointCellColorBuffer);
 
     vtkMetalMRC::ReleaseAndNil(TriangleIndexBuffer);
     vtkMetalMRC::ReleaseAndNil(LineIndexBuffer);
@@ -104,8 +132,11 @@ struct vtkMetalPolyDataMapper2D::vtkMetalPolyDataMapper2DInternals
     HasLines = false;
     HasPoints = false;
     HasTextureCoords = false;
+    HaveCellScalars = false;
 
     CachedInputMTime = 0;
+    CachedMapperMTime = 0;
+    CachedActorMTime = 0;
     CachedSampleCount = 0;
     CachedViewportSize[0] = 0;
     CachedViewportSize[1] = 0;
@@ -182,6 +213,8 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
 
     // Check if geometry needs rebuilding
     vtkIdType currentMTime = input->GetMTime();
+    vtkIdType mapperMTime = this->GetMTime();
+    vtkIdType actorMTime = actor->GetMTime();
     int sampleCount = renWin->GetEffectiveSampleCount();
     bool sampleCountChanged = (sampleCount != this->Internals->CachedSampleCount);
 
@@ -198,6 +231,8 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
 
     bool geometryDirty =
         currentMTime != this->Internals->CachedInputMTime ||
+        mapperMTime != this->Internals->CachedMapperMTime ||
+        actorMTime != this->Internals->CachedActorMTime ||
         (this->TransformCoordinate && viewportChanged);
 
     // Release pipelines on sample-count or depth-format change
@@ -221,6 +256,8 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
     {
       this->Internals->ReleaseBuffers();
       this->Internals->CachedInputMTime = currentMTime;
+      this->Internals->CachedMapperMTime = mapperMTime;
+      this->Internals->CachedActorMTime = actorMTime;
       this->Internals->CachedSampleCount = sampleCount;
       this->Internals->CachedViewportSize[0] = size[0];
       this->Internals->CachedViewportSize[1] = size[1];
@@ -305,15 +342,90 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         }
       }
 
+      // Map scalars to colors, mirroring vtkOpenGLPolyDataMapper2D::UpdateVBO.
+      // this->Colors holds one RGBA per point (point data) or per cell (cell
+      // data). Cell colors are indexed by VTK cell-id order (verts, lines,
+      // polys, strips).
+      this->MapScalars(actor->GetProperty()->GetOpacity());
+      this->Internals->HaveCellScalars = false;
+      if (this->ScalarVisibility)
+      {
+        if ((this->ScalarMode == VTK_SCALAR_MODE_USE_CELL_DATA ||
+              this->ScalarMode == VTK_SCALAR_MODE_USE_CELL_FIELD_DATA ||
+              this->ScalarMode == VTK_SCALAR_MODE_USE_FIELD_DATA ||
+              !input->GetPointData()->GetScalars()) &&
+          this->ScalarMode != VTK_SCALAR_MODE_USE_POINT_FIELD_DATA && this->Colors)
+        {
+          this->Internals->HaveCellScalars = true;
+        }
+      }
+
+      // Per-vertex colors (point data) live in a float4 buffer indexed by vertex
+      // id (vertex buffer index 2). A buffer is always uploaded (white when no
+      // vertex colors are active) so the pipeline's color attribute never reads
+      // out of bounds.
+      {
+        const vtkIdType numPts = this->Internals->VertexCount;
+        std::vector<float> colors(numPts * 4, 1.0f);
+        if (this->Colors && !this->Internals->HaveCellScalars)
+        {
+          const vtkIdType nColors = std::min(this->Colors->GetNumberOfTuples(), numPts);
+          const int nComp = this->Colors->GetNumberOfComponents();
+          for (vtkIdType i = 0; i < nColors; i++)
+          {
+            const unsigned char* c = this->Colors->GetPointer(i * nComp);
+            colors[i * 4 + 0] = static_cast<float>(c[0]) / 255.0f;
+            colors[i * 4 + 1] = static_cast<float>(nComp > 1 ? c[1] : c[0]) / 255.0f;
+            colors[i * 4 + 2] = static_cast<float>(nComp > 2 ? c[2] : c[0]) / 255.0f;
+            colors[i * 4 + 3] = static_cast<float>(nComp > 3 ? c[3] : 255) / 255.0f;
+          }
+        }
+        id<MTLBuffer> colorBuffer = [device
+          newBufferWithBytes:colors.data()
+                     length:colors.size() * sizeof(float)
+                    options:MTLResourceStorageModeShared];
+        vtkMetalMRC::AssignConsumed(this->Internals->ColorBuffer, colorBuffer);
+      }
+
       // Build index buffers from cell arrays
       std::vector<uint32_t> triIndices;
       std::vector<uint32_t> lineIndices;
       std::vector<uint32_t> pointIndices;
+      std::vector<float> triCellColors;
+      std::vector<float> lineCellColors;
+      std::vector<float> pointCellColors;
 
       vtkCellArray* polys = input->GetPolys();
       vtkCellArray* lines = input->GetLines();
       vtkCellArray* verts = input->GetVerts();
       vtkCellArray* strips = input->GetStrips();
+
+      const bool useCellColors = this->Internals->HaveCellScalars;
+      unsigned char* cellColorData = useCellColors ? this->Colors->GetPointer(0) : nullptr;
+      const int cellColorComp = useCellColors ? this->Colors->GetNumberOfComponents() : 0;
+      auto pushCellColor = [&](std::vector<float>& buf, vtkIdType cellId) {
+        float r = 1.0f, g = 1.0f, b = 1.0f, a = 1.0f;
+        if (cellColorData && cellColorComp >= 3)
+        {
+          r = static_cast<float>(cellColorData[cellId * cellColorComp + 0]) / 255.0f;
+          g = static_cast<float>(cellColorData[cellId * cellColorComp + 1]) / 255.0f;
+          b = static_cast<float>(cellColorData[cellId * cellColorComp + 2]) / 255.0f;
+          if (cellColorComp >= 4)
+          {
+            a = static_cast<float>(cellColorData[cellId * cellColorComp + 3]) / 255.0f;
+          }
+        }
+        buf.push_back(r);
+        buf.push_back(g);
+        buf.push_back(b);
+        buf.push_back(a);
+      };
+
+      // VTK numbers cell ids in order: verts, lines, polys, strips.
+      const vtkIdType nVertsCells = verts ? verts->GetNumberOfCells() : 0;
+      const vtkIdType nLineCells = lines ? lines->GetNumberOfCells() : 0;
+      const vtkIdType nPolyCells = polys ? polys->GetNumberOfCells() : 0;
+      vtkIdType cellCounter = 0;
 
       if (polys)
       {
@@ -322,18 +434,27 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         polys->InitTraversal();
         while (polys->GetNextCell(npts, ids))
         {
-          if (npts < 3) continue;
-          for (vtkIdType i = 1; i < npts - 1; ++i)
+          const vtkIdType cellId = nVertsCells + nLineCells + cellCounter;
+          if (npts >= 3)
           {
-            triIndices.push_back(static_cast<uint32_t>(ids[0]));
-            triIndices.push_back(static_cast<uint32_t>(ids[i]));
-            triIndices.push_back(static_cast<uint32_t>(ids[i + 1]));
+            for (vtkIdType i = 1; i < npts - 1; ++i)
+            {
+              triIndices.push_back(static_cast<uint32_t>(ids[0]));
+              triIndices.push_back(static_cast<uint32_t>(ids[i]));
+              triIndices.push_back(static_cast<uint32_t>(ids[i + 1]));
+              if (useCellColors)
+              {
+                pushCellColor(triCellColors, cellId);
+              }
+            }
           }
+          ++cellCounter;
         }
       }
 
       // P11-11A: Triangle strips — decompose with GL's winding
       // (tri_j = v_j, v_{j+1+j%2}, v_{j+1+(j+1)%2}), same as the 3D mapper.
+      cellCounter = 0;
       if (strips)
       {
         const vtkIdType* ids = nullptr;
@@ -341,16 +462,25 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         strips->InitTraversal();
         while (strips->GetNextCell(npts, ids))
         {
-          if (npts < 3) continue;
-          for (vtkIdType j = 0; j < npts - 2; ++j)
+          const vtkIdType cellId = nVertsCells + nLineCells + nPolyCells + cellCounter;
+          if (npts >= 3)
           {
-            triIndices.push_back(static_cast<uint32_t>(ids[j]));
-            triIndices.push_back(static_cast<uint32_t>(ids[j + 1 + j % 2]));
-            triIndices.push_back(static_cast<uint32_t>(ids[j + 1 + (j + 1) % 2]));
+            for (vtkIdType j = 0; j < npts - 2; ++j)
+            {
+              triIndices.push_back(static_cast<uint32_t>(ids[j]));
+              triIndices.push_back(static_cast<uint32_t>(ids[j + 1 + j % 2]));
+              triIndices.push_back(static_cast<uint32_t>(ids[j + 1 + (j + 1) % 2]));
+              if (useCellColors)
+              {
+                pushCellColor(triCellColors, cellId);
+              }
+            }
           }
+          ++cellCounter;
         }
       }
 
+      cellCounter = 0;
       if (lines)
       {
         const vtkIdType* ids = nullptr;
@@ -358,15 +488,24 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         lines->InitTraversal();
         while (lines->GetNextCell(npts, ids))
         {
-          if (npts < 2) continue;
-          for (vtkIdType i = 0; i < npts - 1; ++i)
+          const vtkIdType cellId = nVertsCells + cellCounter;
+          if (npts >= 2)
           {
-            lineIndices.push_back(static_cast<uint32_t>(ids[i]));
-            lineIndices.push_back(static_cast<uint32_t>(ids[i + 1]));
+            for (vtkIdType i = 0; i < npts - 1; ++i)
+            {
+              lineIndices.push_back(static_cast<uint32_t>(ids[i]));
+              lineIndices.push_back(static_cast<uint32_t>(ids[i + 1]));
+              if (useCellColors)
+              {
+                pushCellColor(lineCellColors, cellId);
+              }
+            }
           }
+          ++cellCounter;
         }
       }
 
+      cellCounter = 0;
       if (verts)
       {
         const vtkIdType* ids = nullptr;
@@ -374,10 +513,16 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         verts->InitTraversal();
         while (verts->GetNextCell(npts, ids))
         {
+          const vtkIdType cellId = cellCounter;
           for (vtkIdType i = 0; i < npts; ++i)
           {
             pointIndices.push_back(static_cast<uint32_t>(ids[i]));
+            if (useCellColors)
+            {
+              pushCellColor(pointCellColors, cellId);
+            }
           }
+          ++cellCounter;
         }
       }
 
@@ -413,6 +558,36 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
                              options:MTLResourceStorageModeShared];
         vtkMetalMRC::AssignConsumed(this->Internals->PointIndexBuffer, buffer);
         this->Internals->PointIndexCount = pointIndices.size();
+      }
+
+      // Per-primitive cell color buffers (one float4 per primitive, matched to
+      // the primitive-id order of each draw).
+      if (useCellColors)
+      {
+        if (!triCellColors.empty())
+        {
+          id<MTLBuffer> buffer =
+            [device newBufferWithBytes:triCellColors.data()
+                                length:triCellColors.size() * sizeof(float)
+                               options:MTLResourceStorageModeShared];
+          vtkMetalMRC::AssignConsumed(this->Internals->TriangleCellColorBuffer, buffer);
+        }
+        if (!lineCellColors.empty())
+        {
+          id<MTLBuffer> buffer =
+            [device newBufferWithBytes:lineCellColors.data()
+                                length:lineCellColors.size() * sizeof(float)
+                               options:MTLResourceStorageModeShared];
+          vtkMetalMRC::AssignConsumed(this->Internals->LineCellColorBuffer, buffer);
+        }
+        if (!pointCellColors.empty())
+        {
+          id<MTLBuffer> buffer =
+            [device newBufferWithBytes:pointCellColors.data()
+                                length:pointCellColors.size() * sizeof(float)
+                               options:MTLResourceStorageModeShared];
+          vtkMetalMRC::AssignConsumed(this->Internals->PointCellColorBuffer, buffer);
+        }
       }
     }
 
@@ -486,7 +661,9 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
     state.color[3] = static_cast<float>(opacity);
     state.pointSize = static_cast<float>(actor->GetProperty()->GetPointSize());
     state.lineWidth = static_cast<float>(actor->GetProperty()->GetLineWidth());
-    state.flags = 0;
+    state.flags = this->Internals->HaveCellScalars
+      ? kFlagUseCellColors
+      : (this->Colors && this->ScalarVisibility ? kFlagUseVertexColors : 0u);
     state.padding = 0;
 
     if (!this->Internals->StateBuffer)
@@ -501,7 +678,10 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
       memcpy([this->Internals->StateBuffer contents], &state, sizeof(state));
     }
 
-    // Color is passed via StateBuffer at index 1 (vertex) / 0 (fragment); no per-vertex ColorBuffer needed
+    // Property color is passed via StateBuffer at index 1 (vertex) / 0
+    // (fragment). Scalar colors override it: per-vertex colors arrive through
+    // the vertex buffer at index 2, per-cell colors through the fragment
+    // buffer at index 1 (indexed by [[primitive_id]]).
 
     // Create pipeline states if needed
     if (!this->Internals->TrianglePipeline || !this->Internals->LinePipeline ||
@@ -532,6 +712,16 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
       vertexDesc.layouts[0].stride = sizeof(float) * 2;
       vertexDesc.layouts[0].stepRate = 1;
       vertexDesc.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
+
+      // Per-vertex color attribute (float4, buffer index 2). A buffer is always
+      // bound at index 2 so this attribute never reads out of bounds; the
+      // shader only consumes it when kFlagUseVertexColors is set.
+      vertexDesc.attributes[2].format = MTLVertexFormatFloat4;
+      vertexDesc.attributes[2].offset = 0;
+      vertexDesc.attributes[2].bufferIndex = 2;
+      vertexDesc.layouts[2].stride = sizeof(float) * 4;
+      vertexDesc.layouts[2].stepRate = 1;
+      vertexDesc.layouts[2].stepFunction = MTLVertexStepFunctionPerVertex;
 
       // Triangle pipeline
       if (!this->Internals->TrianglePipeline)
@@ -693,6 +883,10 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
     [encoder setVertexBuffer:this->Internals->StateBuffer offset:0 atIndex:1];
     [encoder setFragmentBuffer:this->Internals->StateBuffer offset:0 atIndex:0];
 
+    // Bind the per-vertex color buffer (white when unused) for the plain 2D
+    // pipelines' color attribute at buffer index 2.
+    [encoder setVertexBuffer:this->Internals->ColorBuffer offset:0 atIndex:2];
+
     // Textured geometry (e.g. vtkTextMapper / vtkTextActor): resolve the
     // texture registered for the actor's GENERAL_TEXTURE_UNIT and draw the
     // interleaved position+texcoord buffer, sampling the texture in the
@@ -734,6 +928,11 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         this->Internals->TriangleIndexCount > 0)
     {
       [encoder setRenderPipelineState:this->Internals->TrianglePipeline];
+      [encoder setFragmentBuffer:(this->Internals->TriangleCellColorBuffer
+            ? (id<MTLBuffer>)this->Internals->TriangleCellColorBuffer
+            : (id<MTLBuffer>)this->Internals->ColorBuffer)
+        offset:0
+        atIndex:1];
 
       [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                           indexCount:this->Internals->TriangleIndexCount
@@ -749,6 +948,11 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         this->Internals->LineIndexCount > 0)
     {
       [encoder setRenderPipelineState:this->Internals->LinePipeline];
+      [encoder setFragmentBuffer:(this->Internals->LineCellColorBuffer
+            ? (id<MTLBuffer>)this->Internals->LineCellColorBuffer
+            : (id<MTLBuffer>)this->Internals->ColorBuffer)
+        offset:0
+        atIndex:1];
 
       [encoder drawIndexedPrimitives:MTLPrimitiveTypeLine
                           indexCount:this->Internals->LineIndexCount
@@ -764,6 +968,11 @@ void vtkMetalPolyDataMapper2D::RenderOverlay(vtkViewport* viewport, vtkActor2D* 
         this->Internals->PointIndexCount > 0)
     {
       [encoder setRenderPipelineState:this->Internals->PointPipeline];
+      [encoder setFragmentBuffer:(this->Internals->PointCellColorBuffer
+            ? (id<MTLBuffer>)this->Internals->PointCellColorBuffer
+            : (id<MTLBuffer>)this->Internals->ColorBuffer)
+        offset:0
+        atIndex:1];
 
       [encoder drawIndexedPrimitives:MTLPrimitiveTypePoint
                           indexCount:this->Internals->PointIndexCount

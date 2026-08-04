@@ -1628,18 +1628,32 @@ kernel void volume_compute_normals(
 // ---------------------------------------------------------------------------
 // 2D Mapper shaders
 // ---------------------------------------------------------------------------
+// Mapper2DState.flags bits. Must match the kFlagUse* constants in
+// vtkMetalPolyDataMapper2D.mm.
+constant uint kFlagUseVertexColors = 1u;
+constant uint kFlagUseCellColors = 2u;
+
 struct Mapper2DState { float4x4 wcvcMatrix; float4 color; float pointSize; float lineWidth; uint flags; };
-struct Vertex2DIn { float2 position [[attribute(0)]]; };
+struct Vertex2DIn {
+  float2 position [[attribute(0)]];
+  float4 color [[attribute(2)]];
+};
 struct Vertex2DOut { float4 position [[position]]; float4 color; };
 
 vertex Vertex2DOut vertex_2d_main(Vertex2DIn in [[stage_in]], constant Mapper2DState& state [[buffer(1)]]) {
   Vertex2DOut out;
   out.position = state.wcvcMatrix * float4(in.position, 0.0, 1.0);
-  out.color = state.color;
+  out.color = (state.flags & kFlagUseVertexColors) != 0u ? in.color : state.color;
   return out;
 }
 
-fragment float4 fragment_2d_main(Vertex2DOut in [[stage_in]]) {
+fragment float4 fragment_2d_main(Vertex2DOut in [[stage_in]],
+                                 constant Mapper2DState& state [[buffer(0)]],
+                                 constant float4* cellColors [[buffer(1)]],
+                                 uint prim_id [[primitive_id]]) {
+  if ((state.flags & kFlagUseCellColors) != 0u) {
+    return cellColors[prim_id];
+  }
   return in.color;
 }
 
