@@ -15,10 +15,12 @@ Two test surfaces exist:
    test `TestMetalImageSliceMapper` added by `3ec24ca9c5`).
 2. The generic multi-backend suite in `Rendering/Core/Testing/Cxx/`, which
    registers the same ~175 tests once per backend and was wired up for Metal
-     through    object-factory overrides (`--vtk-factory-prefer
-       RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
-        crash)**. Current working-tree status: **139 pass / 33 fail (3 crash)** —
-     the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
+      through    object-factory overrides (`--vtk-factory-prefer
+        RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
+         crash)**. Current working-tree status: **142 pass / 33 fail (0 crash)** —
+      the last crash class, `vtkLabeledContourMapper`, is fixed by the
+      `vtkMetalLabeledContourMapper` override (see the labeled-contour-mapper
+      section below); the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
      factory override, the 8 composite-mapper `BuildGeometryBuffers` crashes by
      a `mappedColors != nullptr` guard (they now render), `TestOpacityMSAA` by
      clamping the MSAA sample count to the device maximum (see below), the
@@ -346,6 +348,53 @@ tiled-viewport/gradient-background section below. The +5 pass delta over the pre
 run is exactly those five tests; the 3 aborts are unchanged (`TestLabeledContourMapper`,
 `TestLabeledContourMapperNoLabels`, `TestLabeledContourMapperWithActorMatrix`).
 The regression check against the documented passing cluster reports none.
+Run after the labeled-contour-mapper fix (this run, 2026-08-04): 142 Passed /
+33 Failed / 0 aborted out of 175 (analyzed with `analyze_metal_ctest_log.py` from a
+single `ctest -R "RenderingCoreCxx-Metal" -j 8` run) — the last crash class,
+`vtkLabeledContourMapper` (all three tests crashed in
+`vtkOpenGLLabeledContourMapper::ApplyStencil`/`RemoveStencil`, which were wrongly
+dispatched because no Metal override existed for `vtkLabeledContourMapper` and the
+object factory selected the OpenGL override even under
+`--vtk-factory-prefer RenderingBackend=Metal`), now resolves to a Metal override
+(see the labeled-contour-mapper section below). `TestLabeledContourMapper`,
+`TestLabeledContourMapperNoLabels` and `TestLabeledContourMapperWithActorMatrix`
+now pass (TIGHT_VALID ImageErrors 0.0002 / 0 / 0.0286). The +3 pass delta over
+the previous run is exactly those three tests; the failure set is otherwise
+unchanged (33 image-compare/pick fails, no new failures). The regression check
+against the documented passing cluster reports none.
+
+### The labeled-contour-mapper cluster is fixed
+
+The last remaining crash class was the `TestLabeledContourMapper` trio, all three
+SIGSEGVing inside `vtkOpenGLLabeledContourMapper::ApplyStencil`/
+`RemoveStencil` (called from the base `vtkLabeledContourMapper::Render` via
+`vtkMetalRenderer::DeviceRender`). `vtkLabeledContourMapper::New()` goes through
+the object factory (`vtkObjectFactoryNewMacro`, `vtkLabeledContourMapper.cxx:187`),
+and the only registered override was `vtkOpenGLLabeledContourMapper` (via the
+OpenGL2 `opengl_overrides` list), so even with `--vtk-factory-prefer
+RenderingBackend=Metal` the factory returned the OpenGL subclass, whose stencil
+pass casts the render window to a GL window and dereferences null Metal context
+state. The base `vtkLabeledContourMapper::ApplyStencil`/`RemoveStencil` are
+already no-ops ("Handled in backend override", `vtkLabeledContourMapper.cxx:830,
+845`).
+
+A new `vtkMetalLabeledContourMapper` override (`Rendering/Metal/`), registered
+via `vtk_object_factory_declare(BASE vtkLabeledContourMapper OVERRIDE
+vtkMetalLabeledContourMapper)` with the usual `RenderingBackend=Metal`
+attribute chain, now captures the factory selection. Because the Metal backend
+has no stencil buffer yet (depth attachments are Depth32Float-only, no
+`MTLPixelFormatStencil8` anywhere in `Rendering/Metal/`), the stencil passes
+inherit the base no-ops: isolines draw continuously and the label quads compose
+on top, which is exact for the opaque label backgrounds these tests use (the
+isolines never pass behind a label, so the stencil is a visual no-op here; a
+translucent-background label would differ only where the isoline crosses it).
+`CreateLabels` additionally mirrors the OpenGL override by folding the actor's
+matrix into each label's user matrix (`vtkOpenGLLabeledContourMapper.cxx`), which
+`TestLabeledContourMapperWithActorMatrix` needs because the label `vtkTextActor3D`
+instances are rendered as separate actors and do not inherit the transformed
+mapper actor's matrix. All three tests pass (TIGHT_VALID 0.0002 / 0 / 0.0286),
+and the full suite is now at **142 pass / 33 fail / 0 aborted** with no
+regressions.
 
 ### The tiled-viewport and tile-aware gradient-background cluster is fixed
 
@@ -758,8 +807,8 @@ failures.
 
 ### Image-compare failures
 
-Current run (2026-08-03, tiled-viewport/gradient run): 36 failed = 29 image-compare
-(TIGHT_VALID >= 0.05) + 1 below-threshold pick-check + 3 non-image + 3 aborts.
+Current run (2026-08-04, labeled-contour-mapper fix): 33 failed = 29 image-compare
+(TIGHT_VALID >= 0.05) + 1 below-threshold pick-check + 3 non-image + 0 aborts.
 Buckets by
 max `vtkTesting` TIGHT_VALID error per test (threshold 0.05):
 
