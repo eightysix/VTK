@@ -17,7 +17,7 @@ Two test surfaces exist:
    registers the same ~175 tests once per backend and was wired up for Metal
       through    object-factory overrides (`--vtk-factory-prefer
         RenderingBackend=Metal`).    Historical status: **55 pass / 120 fail (33
-         crash)**. Current working-tree status: **151 pass / 24 fail (0 crash)** —
+         crash)**. Current working-tree status: **153 pass / 22 fail (0 crash)** —
       the last crash class, `vtkLabeledContourMapper`, is fixed by the
       `vtkMetalLabeledContourMapper` override (see the labeled-contour-mapper
       section below); the 14 OpenGL-texture-fallback crashes are fixed by the `vtkMetalTexture`
@@ -59,7 +59,10 @@ Two test surfaces exist:
       (see the triangle-strip section below), and the point-rendering cluster
       (`TestPointRendering{,_Round}_3/4`, `TestVertexRendering`, `TestQuadPointRep`,
       `TestMixedGeometry_3`) now passes via the `HasVerts` gate and the hoisted
-      `UpdateLightUniforms` call (see the point-rendering section below). No
+      `UpdateLightUniforms` call (see the point-rendering section below), and the
+      composite vertex/sphere tests `TestCompositePolyDataMapperSpheres` and
+      `TestCompositePolyDataMapperVertices` now pass via the per-block edge/vertex
+      color fix (see the per-block edge/vertex-color section below). No
       new crashes
       were introduced. The pass count
       fluctuates run to run (run-to-run flakiness).
@@ -163,7 +166,7 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  150 Passed  25 Failed (incl. image/pick fails)  0 "Subprocess aborted"
+175 tests:  153 Passed  22 Failed (incl. image/pick fails)  0 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
@@ -413,6 +416,17 @@ described in the custom-shader section below (TIGHT_VALID 1.18e-06). The +1 pass
 run is exactly that test; the failure set is otherwise unchanged (20 image-compare
 + 1 below-threshold pick-check + 3 non-image fails, no new failures). The
 regression check against the documented passing cluster reports none.
+Run after the per-block edge/vertex-color fix (this run, 2026-08-04): 153 Passed /
+22 Failed / 0 aborted out of 175 (analyzed with `analyze_metal_ctest_log.py` from
+a single `ctest -R "RenderingCoreCxx-Metal" -j 8` run; failures exported with
+`export_image_compare.sh`) — `TestCompositePolyDataMapperSpheres` (was a mid
+0.1499 fail) and `TestCompositePolyDataMapperVertices` (was a mid 0.2891 fail) now
+pass (TIGHT_VALID ImageErrors 0.0215 / 0.0244), the first time either has passed;
+see the per-block edge/vertex-color section below. The +2 pass delta over the
+previous run is exactly those two tests; the failure set is otherwise unchanged
+(18 image-compare + 1 below-threshold pick-check + 3 non-image fails, no new
+failures). The regression check against the documented passing cluster reports
+none.
 
 ### The labeled-contour-mapper cluster is fixed
 
@@ -626,6 +640,38 @@ the full edge color `ec`, and the tube branch toward `ambientIntensity * ec`
 TIGHT_VALID ImageErrors ~1.2e-05, matching the documented passing cluster;
 fresh render captures show 0 black-edge pixels and all sampled edges exact-match
 the baseline.
+
+### The per-block edge/vertex-color cluster is fixed
+
+`TestCompositePolyDataMapperVertices` and `TestCompositePolyDataMapperSpheres`
+(colored composite blocks with global `actor->GetProperty()->SetEdgeColor` /
+`SetVertexColor` overrides and `RenderLinesAsTubes`/`RenderPointsAsSpheres`)
+rendered the edge tubes and vertex spheres in each block's `SetBlockColor` color
+instead of the property's grey edges / pink vertices. The Metal backend was
+injecting the per-block override color into the edge/vertex uniform RGB
+whenever `Internals->UseBatchColor` was active (i.e. on any block with a color
+display-attribute override).
+
+OpenGL never does this: `vtkOpenGLBatchedPolyDataMapper::DrawIBO` skips
+`SetShaderValues` for `PrimitiveVertices` (`primType <= PrimitiveTriStrips`), so
+the block color never reaches vertex rendering and
+`SetPropertyShaderParameters` always uploads `ppty->GetVertexColor()`
+(`vtkOpenGLPolyDataMapper.cxx:3218/3230`); the `edgeColor` uniform is likewise
+always `actor->GetProperty()->GetEdgeColor()` (`vtkOpenGLPolyDataMapper.cxx:2903`),
+never touched by the batched mapper's per-block shader values. The per-block color
+only ever affects the *surface* ambient/diffuse material (and the point/lines
+geometry buffers), exactly like the block-opacity override bakes into vertex
+alpha.
+
+Fix in `Rendering/Metal/vtkMetalPolyDataMapper.mm`: removed the `UseBatchColor`
+RGB override from the three edge/vertex uniform updates —
+`UpdateVertexColorUniforms`, `UpdateEdgeColorUniform` (legacy edge overlay) and
+`UpdateEdgeUniforms` (single-pass surface edges). The RGB always comes from the
+actor's property; the alpha/opacity handling (batch opacity baked in when
+`UseBatchOpacity`, material opacity forced to 1.0 under batch overrides) is
+unchanged. `TestCompositePolyDataMapperVertices` drops from 0.2891 to 0.0244 and
+`TestCompositePolyDataMapperSpheres` from 0.1499 to 0.0215 (both pass); the rest
+of the composite-mapper suite is unaffected.
 
 ### The flat-background alpha and dither cluster is fixed
 

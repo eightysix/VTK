@@ -7564,20 +7564,16 @@ void vtkMetalPolyDataMapper::UpdateVertexColorUniforms(void* mtlDevice, vtkActor
 
   if (actor->GetProperty()->GetVertexVisibility())
   {
-    if (this->Internals->UseBatchColor)
-    {
-      vc[0] = static_cast<float>(this->Internals->BatchColor[0]);
-      vc[1] = static_cast<float>(this->Internals->BatchColor[1]);
-      vc[2] = static_cast<float>(this->Internals->BatchColor[2]);
-    }
-    else
-    {
-      double vcol[3];
-      actor->GetProperty()->GetVertexColor(vcol);
-      vc[0] = static_cast<float>(vcol[0]);
-      vc[1] = static_cast<float>(vcol[1]);
-      vc[2] = static_cast<float>(vcol[2]);
-    }
+    // The vertex color always comes from the actor property, never from a
+    // per-block color override. OpenGL mirrors this: the batched mapper skips
+    // SetShaderValues for the vertices pass, so the block color never reaches
+    // vertex rendering and SetPropertyShaderParameters always uploads
+    // ppty->GetVertexColor() (vtkOpenGLPolyDataMapper.cxx:3218/3230).
+    double vcol[3];
+    actor->GetProperty()->GetVertexColor(vcol);
+    vc[0] = static_cast<float>(vcol[0]);
+    vc[1] = static_cast<float>(vcol[1]);
+    vc[2] = static_cast<float>(vcol[2]);
 
     if (this->Internals->UseBatchOpacity)
     {
@@ -7615,24 +7611,18 @@ void vtkMetalPolyDataMapper::UpdateEdgeColorUniform(void* mtlDevice, vtkActor* a
 
   float ec[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
 
-  if (this->Internals->UseBatchColor)
+  // The edge color always comes from the actor property, never from a per-block
+  // color override. OpenGL mirrors this: the edgeColor uniform is always set
+  // from actor->GetProperty()->GetEdgeColor() (vtkOpenGLPolyDataMapper.cxx:2903)
+  // and is never touched by the batched mapper's per-block SetShaderValues.
+  vtkProperty* prop = actor->GetProperty();
+  if (prop)
   {
-    ec[0] = static_cast<float>(this->Internals->BatchColor[0]);
-    ec[1] = static_cast<float>(this->Internals->BatchColor[1]);
-    ec[2] = static_cast<float>(this->Internals->BatchColor[2]);
-  }
-  else
-  {
-    // Use edge color from actor's property
-    vtkProperty* prop = actor->GetProperty();
-    if (prop)
-    {
-      double ecDouble[3];
-      prop->GetEdgeColor(ecDouble);
-      ec[0] = static_cast<float>(ecDouble[0]);
-      ec[1] = static_cast<float>(ecDouble[1]);
-      ec[2] = static_cast<float>(ecDouble[2]);
-    }
+    double ecDouble[3];
+    prop->GetEdgeColor(ecDouble);
+    ec[0] = static_cast<float>(ecDouble[0]);
+    ec[1] = static_cast<float>(ecDouble[1]);
+    ec[2] = static_cast<float>(ecDouble[2]);
   }
 
   if (this->Internals->UseBatchOpacity)
@@ -7698,12 +7688,8 @@ void vtkMetalPolyDataMapper::UpdateEdgeUniforms(void* mtlDevice, vtkActor* actor
     e.flags = (prop->GetEdgeVisibility() ? 1u : 0u) | (prop->GetRenderLinesAsTubes() ? 2u : 0u);
   }
 
-  if (this->Internals->UseBatchColor)
-  {
-    e.edgeColor[0] = static_cast<float>(this->Internals->BatchColor[0]);
-    e.edgeColor[1] = static_cast<float>(this->Internals->BatchColor[1]);
-    e.edgeColor[2] = static_cast<float>(this->Internals->BatchColor[2]);
-  }
+  // The edge color always comes from the actor property, never from a per-block
+  // color override (see UpdateEdgeColorUniform for the OpenGL reference).
 
   if (!this->Internals->EdgeUniformBuffer)
   {
