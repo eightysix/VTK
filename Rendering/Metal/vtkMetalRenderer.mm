@@ -207,8 +207,15 @@ void vtkMetalRenderer::DeviceRender()
     const int frameRendererIndex = renWin->GetFrameRendererIndex();
     renWin->BumpFrameRendererIndex();
     const int totalRenderers = renWin->GetRenderers()->GetNumberOfItems();
-    const bool firstRenderer = (frameRendererIndex == 0);
-    const bool lastRenderer = (frameRendererIndex + 1 >= totalRenderers);
+    // first/last renderer of the current eye pass, not of the whole window
+    // frame. In stereo the scene is rendered once per eye (Renderers->Render()
+    // runs once for each eye), so every eye pass must clear the color/depth
+    // attachments and present at most once: using the index modulo the renderer
+    // count keeps each pass independent instead of treating the second eye as a
+    // continuation of the first (which would load the first eye's color/depth
+    // and depth-cull the second eye's geometry against them).
+    const bool firstRenderer = (frameRendererIndex % totalRenderers == 0);
+    const bool lastRenderer = ((frameRendererIndex + 1) % totalRenderers == 0);
 #ifdef VTK_METAL_ENABLE_OFFSCREEN_TARGET
     if (renWin->GetOffScreenRendering())
     {
@@ -1263,11 +1270,22 @@ void vtkMetalRenderer::DeviceRender()
     }
 #endif
 
-    // Commit and present. Only the last renderer presents the shared drawable
-    // (presenting it more than once per frame is invalid on CAMetalLayer).
-    if (drawable && lastRenderer)
+    // Commit and present. Only the last renderer of a pass presents the shared
+    // drawable, and only once per frame (presenting it more than once per
+    // frame is invalid on CAMetalLayer). When a CPU-side stereo composite will
+    // be written back by vtkRenderWindow::CopyResultFrame (via SetPixelData),
+    // the eye passes must not present: the composite is the only present, and
+    // it renders into the still-unpresented drawable.
+    const int stereoType = renWin->GetStereoType();
+    const bool compositeWriteBack = renWin->GetStereoRender() &&
+      (stereoType == VTK_STEREO_RED_BLUE || stereoType == VTK_STEREO_ANAGLYPH ||
+        stereoType == VTK_STEREO_INTERLACED || stereoType == VTK_STEREO_DRESDEN ||
+        stereoType == VTK_STEREO_CHECKERBOARD ||
+        stereoType == VTK_STEREO_SPLITVIEWPORT_HORIZONTAL);
+    if (drawable && lastRenderer && !compositeWriteBack && !renWin->GetDrawablePresented())
     {
       [commandBuffer presentDrawable:drawable];
+      renWin->MarkDrawablePresented();
     }
     [commandBuffer commit];
 

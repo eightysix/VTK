@@ -295,7 +295,13 @@ bool vtkMetalRenderWindow::AcquireDrawable()
 {
   if (this->CurrentDrawable)
   {
-    return true;
+    if (!this->DrawablePresented)
+    {
+      return true;
+    }
+    // The current drawable was already presented this frame; it can no longer
+    // be rendered into, so release it and acquire a fresh one.
+    this->ReleaseDrawable();
   }
 
   @autoreleasepool
@@ -312,6 +318,7 @@ bool vtkMetalRenderWindow::AcquireDrawable()
       return false;
     }
     this->CurrentDrawable = (void*)drawable;
+    this->DrawablePresented = false;
     CFRetain((CFTypeRef)drawable);
   }
   return true;
@@ -593,6 +600,7 @@ void vtkMetalRenderWindow::Render()
   }
 
   this->FrameRendererIndex = 0;
+  this->DrawablePresented = false;
 
   if (this->Size[0] > 0 && this->Size[1] > 0)
   {
@@ -1193,6 +1201,225 @@ int vtkMetalRenderWindow::GetColorBufferSizes(int* rgba)
   rgba[2] = 8;
   rgba[3] = 8;
   return 1;
+}
+
+//------------------------------------------------------------------------------
+int vtkMetalRenderWindow::WritePixelData(
+  int x_low, int y_low, int width, int height, int ncomp, const unsigned char* data)
+{
+  if (!this->Initialized)
+  {
+    this->Initialize();
+  }
+  if (!this->Initialized)
+  {
+    return 0;
+  }
+
+  id<MTLDevice> device = (__bridge id<MTLDevice>)this->MetalDevice;
+  id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)this->MetalQueue;
+  if (!device || !queue)
+  {
+    return 0;
+  }
+
+  @autoreleasepool
+  {
+    // Convert the bottom-up VTK RGB(A) image into a top-origin BGRA staging
+    // texture (matching the drawable and the color-copy texture formats so a
+    // plain blit preserves the bytes).
+    MTLTextureDescriptor* desc =
+      [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                         width:(NSUInteger)width
+                                                        height:(NSUInteger)height
+                                                     mipmapped:NO];
+    desc.storageMode = MTLStorageModeShared;
+    desc.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> staging = [device newTextureWithDescriptor:desc];
+    if (!staging)
+    {
+      return 0;
+    }
+
+    const NSUInteger bpr = (NSUInteger)width * 4;
+    std::vector<uint8_t> bgra(bpr * (NSUInteger)height);
+    for (int row = 0; row < height; ++row)
+    {
+      // VTK row 0 is the bottom row (y_low) while the texture is top-origin,
+      // so the row order is flipped here.
+      const unsigned char* src = data + static_cast<size_t>(row) * width * ncomp;
+      uint8_t* dst = bgra.data() + static_cast<size_t>(height - 1 - row) * bpr;
+      for (int col = 0; col < width; ++col)
+      {
+        const unsigned char* s = src + static_cast<size_t>(col) * ncomp;
+        uint8_t* d = dst + static_cast<size_t>(col) * 4;
+        d[0] = s[2]; // B
+        d[1] = s[1]; // G
+        d[2] = s[0]; // R
+        d[3] = (ncomp == 4) ? s[3] : 255; // A
+      }
+    }
+    [staging replaceRegion:MTLRegionMake2D(0, 0, width, height)
+               mipmapLevel:0
+                 withBytes:bgra.data()
+               bytesPerRow:bpr];
+
+    if (!this->AcquireDrawable())
+    {
+      [staging release];
+      return 0;
+    }
+    id<CAMetalDrawable> drawable = (__bridge id<CAMetalDrawable>)this->CurrentDrawable;
+    id<MTLTexture> drawableTex = drawable.texture;
+
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    commandBuffer.label = @"VTK SetPixelData";
+
+    MTLOrigin destOrigin = MTLOriginMake((NSUInteger)x_low, (NSUInteger)y_low, 0);
+    MTLSize srcSize = MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1);
+
+    // A framebuffer-only drawable texture can only be a render target; skip
+    // the drawable write (and the present) in that case so the blit never
+    // asserts. The color-copy texture is still updated below.
+    const bool canWriteDrawable = !drawableTex.framebufferOnly;
+    if (canWriteDrawable)
+    {
+      id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+      blit.label = @"VTK SetPixelData Copy to Drawable";
+      [blit copyFromTexture:staging
+                sourceSlice:0
+                sourceLevel:0
+               sourceOrigin:MTLOriginMake(0, 0, 0)
+                 sourceSize:srcSize
+                  toTexture:drawableTex
+           destinationSlice:0
+           destinationLevel:0
+          destinationOrigin:destOrigin];
+      [blit endEncoding];
+    }
+
+#ifdef VTK_METAL_ENABLE_COLOR_READBACK
+    id<MTLTexture> colorCopyTex = (__bridge id<MTLTexture>)this->ColorCopyTexture;
+    if (colorCopyTex && this->GetColorReadbackEnabled())
+    {
+      id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+      blit.label = @"VTK SetPixelData Copy to Readback";
+      [blit copyFromTexture:staging
+                sourceSlice:0
+                sourceLevel:0
+               sourceOrigin:MTLOriginMake(0, 0, 0)
+                 sourceSize:srcSize
+                  toTexture:colorCopyTex
+           destinationSlice:0
+           destinationLevel:0
+          destinationOrigin:destOrigin];
+      [blit endEncoding];
+    }
+#endif
+
+    if (canWriteDrawable && !this->DrawablePresented)
+    {
+      [commandBuffer presentDrawable:drawable];
+      this->DrawablePresented = true;
+    }
+    [commandBuffer commit];
+
+    // Keep the read-back sync anchored on this buffer so a subsequent
+    // GetPixelData waits for the composite copy to complete.
+    this->SetCurrentCommandBuffer((__bridge void*)commandBuffer);
+    // The command buffer retains the staging texture until it completes.
+    [staging release];
+    return 1;
+  }
+}
+
+//------------------------------------------------------------------------------
+int vtkMetalRenderWindow::SetPixelData(
+  int x1, int y1, int x2, int y2, unsigned char* data, int front, int right)
+{
+  (void)front;
+  (void)right;
+
+  int x_low = std::min(x1, x2);
+  int x_hi = std::max(x1, x2);
+  int y_low = std::min(y1, y2);
+  int y_hi = std::max(y1, y2);
+
+  int width = (x_hi - x_low) + 1;
+  int height = (y_hi - y_low) + 1;
+  if (!data || width <= 0 || height <= 0)
+  {
+    return 0;
+  }
+  return this->WritePixelData(x_low, y_low, width, height, 3, data);
+}
+
+//------------------------------------------------------------------------------
+int vtkMetalRenderWindow::SetPixelData(
+  int x1, int y1, int x2, int y2, vtkUnsignedCharArray* data, int front, int right)
+{
+  if (!data)
+  {
+    return 0;
+  }
+  int x_low = std::min(x1, x2);
+  int x_hi = std::max(x1, x2);
+  int y_low = std::min(y1, y2);
+  int y_hi = std::max(y1, y2);
+  int width = (x_hi - x_low) + 1;
+  int height = (y_hi - y_low) + 1;
+  int size = 3 * width * height;
+  if (data->GetMaxId() + 1 != size)
+  {
+    vtkErrorMacro("Buffer is of wrong size.");
+    return 0;
+  }
+  return this->WritePixelData(x_low, y_low, width, height, 3, data->GetPointer(0));
+}
+
+//------------------------------------------------------------------------------
+int vtkMetalRenderWindow::SetRGBACharPixelData(
+  int x1, int y1, int x2, int y2, unsigned char* data, int front, int blend, int right)
+{
+  (void)front;
+  (void)blend;
+  (void)right;
+
+  int x_low = std::min(x1, x2);
+  int x_hi = std::max(x1, x2);
+  int y_low = std::min(y1, y2);
+  int y_hi = std::max(y1, y2);
+
+  int width = (x_hi - x_low) + 1;
+  int height = (y_hi - y_low) + 1;
+  if (!data || width <= 0 || height <= 0)
+  {
+    return 0;
+  }
+  return this->WritePixelData(x_low, y_low, width, height, 4, data);
+}
+
+//------------------------------------------------------------------------------
+int vtkMetalRenderWindow::SetRGBACharPixelData(
+  int x1, int y1, int x2, int y2, vtkUnsignedCharArray* data, int front, int blend, int right)
+{
+  if (!data)
+  {
+    return 0;
+  }
+  int x_low = std::min(x1, x2);
+  int x_hi = std::max(x1, x2);
+  int y_low = std::min(y1, y2);
+  int y_hi = std::max(y1, y2);
+  int width = (x_hi - x_low) + 1;
+  int height = (y_hi - y_low) + 1;
+  int size = 4 * width * height;
+  if (data->GetMaxId() + 1 != size)
+  {
+    vtkErrorMacro("Buffer is of wrong size.");
+    return 0;
+  }
+  return this->WritePixelData(x_low, y_low, width, height, 4, data->GetPointer(0));
 }
 
 //------------------------------------------------------------------------------

@@ -250,6 +250,37 @@ public:
   int GetColorBufferSizes(int* rgba) override;
 
   /**
+   * Write RGB image data into the color buffer (VTK window coordinates,
+   * bottom-up origin). The image is drawn into the current drawable and, when
+   * color read-back is enabled, into the shared color-copy texture so a
+   * subsequent GetPixelData returns it; the drawable is presented exactly once.
+   * The front/right arguments are accepted for API compatibility; Metal has a
+   * single (drawable) buffer.
+   */
+  int SetPixelData(
+    int x1, int y1, int x2, int y2, unsigned char* data, int front, int right = 0) override;
+
+  /**
+   * Write RGB image data into the color buffer from an array.
+   */
+  int SetPixelData(
+    int x1, int y1, int x2, int y2, vtkUnsignedCharArray* data, int front, int right = 0) override;
+
+  /**
+   * Write RGBA image data into the color buffer. Same semantics as
+   * SetPixelData with a 4-component image. The blend argument is accepted for
+   * API compatibility; the buffer contents are always replaced.
+   */
+  int SetRGBACharPixelData(
+    int x1, int y1, int x2, int y2, unsigned char* data, int front, int blend = 0, int right = 0) override;
+
+  /**
+   * Write RGBA image data into the color buffer from an array.
+   */
+  int SetRGBACharPixelData(int x1, int y1, int x2, int y2, vtkUnsignedCharArray* data,
+    int front, int blend = 0, int right = 0) override;
+
+  /**
    * Read the depth framebuffer back as normalized floats in [0,1] (near to
    * far). The caller owns the returned array. Y-axis is flipped to match
    * VTK's bottom-left origin.
@@ -340,6 +371,14 @@ protected:
   int GetFrameRendererIndex() const { return FrameRendererIndex; }
   void BumpFrameRendererIndex() { ++FrameRendererIndex; }
 
+  /**
+   * True when the current drawable has already been presented this frame.
+   * A presented drawable can no longer be rendered into, so AcquireDrawable
+   * obtains a fresh drawable in that case.
+   */
+  bool GetDrawablePresented() const { return DrawablePresented; }
+  void MarkDrawablePresented() { DrawablePresented = true; }
+
   // Metal objects (stored as void* to avoid Obj-C in header)
   void* MetalDevice = nullptr;    // id<MTLDevice>
   void* MetalQueue = nullptr;     // id<MTLCommandQueue>
@@ -374,6 +413,11 @@ protected:
   // Per-frame renderer index (see GetFrameRendererIndex).
   int FrameRendererIndex = 0;
 
+  // Set when the current drawable is presented; reset at the start of each
+  // Render() and whenever a fresh drawable is acquired (see
+  // GetDrawablePresented).
+  bool DrawablePresented = false;
+
   // Texture-unit registry (unit -> id<MTLTexture>), mirroring OpenGL's
   // per-unit texture binding so mappers can resolve a vtkTexture by the
   // GENERAL_TEXTURE_UNIT property key.
@@ -403,6 +447,16 @@ private:
    * and BGRA is converted to RGB(A). Returns 1 on success, 0 on failure.
    */
   int ReadColorCopyData(int x, int y, int width, int height, int ncomp, void* dest);
+
+  /**
+   * Write a bottom-up VTK image (3 or 4 components per pixel) into the color
+   * buffer. The image is converted to BGRA, uploaded to a staging texture,
+   * blitted into the current (unpresented) drawable and, when read-back is
+   * enabled, into the shared color-copy texture. The drawable is presented
+   * exactly once. Returns 1 on success, 0 on failure.
+   */
+  int WritePixelData(int x_low, int y_low, int width, int height, int ncomp,
+    const unsigned char* data);
 
   /**
    * Copy a region of the shared depth-copy texture into a float buffer.

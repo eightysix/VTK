@@ -159,11 +159,11 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
   `TEST_OPTIONAL_DEPENDS` so the generic test executable links Metal's autoinit
   factory.
 
-### Tally (working tree, rerun 2026-08-03 on the M2 MacBook Air,
+### Tally (working tree, rerun 2026-08-04 on the M2 MacBook Air,
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  133 Passed  39 Failed (incl. image/pick fails)  3 "Subprocess aborted"
+175 tests:  145 Passed  30 Failed (incl. image/pick fails)  0 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
@@ -362,6 +362,19 @@ now pass (TIGHT_VALID ImageErrors 0.0002 / 0 / 0.0286). The +3 pass delta over
 the previous run is exactly those three tests; the failure set is otherwise
 unchanged (33 image-compare/pick fails, no new failures). The regression check
 against the documented passing cluster reports none.
+Run after the stereo-composite write-back fix (this run, 2026-08-04): 145 Passed /
+30 Failed / 0 aborted out of 175 (analyzed with `analyze_metal_ctest_log.py` from a
+single `ctest -R "RenderingCoreCxx-Metal" -j 8` run) — `TestOffAxisStereo` (gross
+0.5921), `TestSplitViewportStereoHorizontal` (gross 0.6816) and
+`TestStereoEyeSeparation` (mid 0.2584) now pass, the first time any have passed;
+`vtkMetalRenderWindow` now implements `SetPixelData`/`SetRGBACharPixelData` (the
+CPU-side composite was previously dropped by the base-class no-op) and the
+eye-pass presents are suppressed for CPU-composited stereo (see the
+stereo-composite write-back section below). The +3 pass delta over the previous
+run is exactly those three tests; the failure set is otherwise unchanged (26
+image-compare + 1 below-threshold pick-check + 3 non-image fails, no new
+failures). The regression check against the documented passing cluster reports
+none.
 
 ### The labeled-contour-mapper cluster is fixed
 
@@ -807,16 +820,17 @@ failures.
 
 ### Image-compare failures
 
-Current run (2026-08-04, labeled-contour-mapper fix): 33 failed = 29 image-compare
-(TIGHT_VALID >= 0.05) + 1 below-threshold pick-check + 3 non-image + 0 aborts.
+Current run (2026-08-04, stereo-composite write-back fix): 30 failed = 26
+image-compare (TIGHT_VALID >= 0.05) + 1 below-threshold pick-check + 3 non-image
++ 0 aborts.
 Buckets by
 max `vtkTesting` TIGHT_VALID error per test (threshold 0.05):
 
 | Bucket | Range | Count | Examples |
 |--------|-------|-------|----------|
 | near-miss | 0.05 – 0.1 | 6 | `TestRenderLinesAsTubesOrthoCamera` 0.0535, `TestRenderLinesAsTubes` 0.0535, `TestPolyDataMapper2D` 0.0664, `TestEdgeFlags` 0.0681, `TestLineRenderingTranslucent` 0.0790, `TestGlyph3DMapperPicking` 0.0800 |
-| mid | 0.1 – 0.5 | 21 | `TestMixedGeometryCellScalars` 0.1373, `TestCompositePolyDataMapperSpheres` 0.1499, `TestPolyDataMapperClipPlanes` 0.1526, `TestTransformCoordinateUseDouble` 0.1635, `TestCompositePolyDataMapperPicking` 0.1712, `TestTilingCxx` 0.2054, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.2241, `TestCoincident` 0.2343, `TestStereoEyeSeparation` 0.2584, `TestCompositePolyDataMapperPartialFieldData` 0.2643, `TestGlyph3DMapperBackfaceColor` 0.2657, `TestPolyDataMapperNormals` 0.2698, `TestPolyDataMapper2DPointScalarColorMapping` 0.2861, `TestCompositePolyDataMapperVertices` 0.2891, `TestCompositePolyDataMapperCustomShader` 0.2897, `TestPolyDataMapper2DCellScalarColorMapping` 0.2943, `TestResetCameraScreenSpace` 0.3438, `TestCompositePolyDataMapperCameraShiftScale` 0.3601, `TestResizingWindowToImageFilter` 0.4130, `TestGlyph3DMapperPointSize` 0.4599, `TestColorByStringArrayDefaultLookupTable2D` 0.4821 |
-| gross | >= 0.5 | 2 | `TestOffAxisStereo` 0.5921, `TestSplitViewportStereoHorizontal` 0.6816 |
+| mid | 0.1 – 0.5 | 20 | `TestMixedGeometryCellScalars` 0.1373, `TestCompositePolyDataMapperSpheres` 0.1499, `TestPolyDataMapperClipPlanes` 0.1526, `TestTransformCoordinateUseDouble` 0.1635, `TestCompositePolyDataMapperPicking` 0.1712, `TestTilingCxx` 0.2054, `TestGlyph3DMapperCompositeDisplayAttributeInheritance` 0.2241, `TestCoincident` 0.2343, `TestCompositePolyDataMapperPartialFieldData` 0.2560, `TestGlyph3DMapperBackfaceColor` 0.2657, `TestPolyDataMapperNormals` 0.2698, `TestPolyDataMapper2DPointScalarColorMapping` 0.2861, `TestCompositePolyDataMapperVertices` 0.2891, `TestCompositePolyDataMapperCustomShader` 0.2897, `TestPolyDataMapper2DCellScalarColorMapping` 0.2943, `TestResetCameraScreenSpace` 0.3438, `TestCompositePolyDataMapperCameraShiftScale` 0.3601, `TestResizingWindowToImageFilter` 0.4130, `TestGlyph3DMapperPointSize` 0.4599, `TestColorByStringArrayDefaultLookupTable2D` 0.4821 |
+| gross | >= 0.5 | 0 | — |
 
 (`TestNActors{OneMapper,NMappersOneInput}` left the mid bucket via the
 per-actor edge-color fix above (passing at ~1.2e-05), and
@@ -860,7 +874,13 @@ tiled-viewport/gradient-background section below — the first time any have pas
 0.0870) also left (stable across re-runs), `TestTilingCxx` moved gross→mid
 (0.6159→0.2054), and `TestRenderLinesAsTubes`/`OrthoCamera` moved mid→near-miss
 (0.2292→0.0535). The +5 pass delta is exactly the gradient trio plus
-`TestGlyph3DMapper` and `RenderNonFinite`.
+`TestGlyph3DMapper` and `RenderNonFinite`.) This run the mid bucket dropped from
+21 to 20 and gross from 2 to 0: `TestOffAxisStereo` (gross 0.5921),
+`TestSplitViewportStereoHorizontal` (gross 0.6816) and `TestStereoEyeSeparation`
+(mid 0.2584) all left via the stereo-composite write-back section below — the
+first time any have passed (OffAxisStereo now ~2.9e-03). The +3 pass delta is
+exactly the three stereo tests, and the regression check against the
+previously-passing cluster is clean.
 
 ### Crashes (3; all pre-existing classes, none from the texture or composite clusters)
 
@@ -1085,6 +1105,48 @@ metrics (`TestPolyDataMapper2D` 0.0664, `TestEdgeFlags` 0.0681,
 `TestLineRenderingTranslucent` 0.0790, `TestGlyph3DMapperPicking` 0.0800,
 `RenderNonFinite` 0.0870).
 
+### The stereo-composite write-back is implemented
+
+`TestOffAxisStereo` (gross 0.5921), `TestSplitViewportStereoHorizontal` (gross
+0.6816) and `TestStereoEyeSeparation` (mid 0.2584) all failed because the
+CPU-side stereo composite was never written back to the framebuffer. VTK's
+`vtkRenderWindow::StereoRenderComplete` computes the composite (e.g.
+`vtkStereoCompositor::RedBlue`) into `ResultFrame` and calls
+`CopyResultFrame` → `SetPixelData`; `vtkMetalRenderWindow` did not override
+`SetPixelData`/`SetRGBACharPixelData`, so the base-class no-op left the second
+eye pass alone on the drawable (the observed red-blue output was a partial
+right-eye image — 10,158 nonblack pixels, 0 colorful).
+
+- `vtkMetalRenderWindow` now overrides both `SetPixelData` overloads and both
+  `SetRGBACharPixelData` overloads. They share a `WritePixelData` helper that
+  converts the bottom-up VTK RGB(A) rows into a top-origin BGRA8Unorm staging
+  texture (`MTLStorageModeShared`), blits it into the current drawable and, when
+  color read-back is enabled, into the shared color-copy texture, presents the
+  drawable exactly once, commits, and re-arms `SetCurrentCommandBuffer` so a
+  subsequent `GetPixelData` waits for the composite copy. A framebuffer-only
+  drawable texture skips the drawable blit/present (the read-back texture is
+  still updated).
+- The drawable is presented once per frame (CAMetalLayer rejects a second
+  present). `vtkMetalRenderWindow` tracks `DrawablePresented` (reset in
+  `Render()` and on fresh acquisition); `AcquireDrawable` releases and
+  re-fetches `nextDrawable` if the current one was already presented.
+- `vtkMetalRenderer` suppresses the eye-pass presents for the CPU-composited
+  stereo types (RED_BLUE, ANAGLYPH, INTERLACED, DRESDEN, CHECKERBOARD,
+  SPLITVIEWPORT_HORIZONTAL) and for any already-presented drawable; the
+  composite `SetPixelData` is the sole present of the frame.
+- Each eye pass is a full window pass: `firstRenderer`/`lastRenderer` are now
+  computed per pass (`frameRendererIndex % totalRenderers`) instead of per
+  window frame. Previously the second eye was treated as a continuation of the
+  first, so its color/depth attachments were loaded (not cleared) and the
+  right-eye geometry was depth-culled against the left eye's depth (the
+  observed symptom: the anaglyph's blue channel dark at 27.2 mean vs 197.8
+  baseline).
+
+All three now pass: `TestOffAxisStereo` TIGHT_VALID 2.88e-03, exit 0, no
+double-present warnings; the red/blue channels of the composite match the left
+and right gray passes exactly at every nonblack pixel. The regression check
+against the previously-passing cluster is clean.
+
 ### Theme clusters in the remaining failures
 
 - **Textures** (~13): every `TestTexture*`, `TestBackfaceTexture`,
@@ -1139,10 +1201,10 @@ metrics (`TestPolyDataMapper2D` 0.0664, `TestEdgeFlags` 0.0681,
   now pass via the textured-background implementation (see the textured-background
   section below), as do the 3 `TestNViewportsNActors*` multiview tests via the
   multi-viewport background work (see the flat-background section above;
-  `TestNViewportsOneActor` passes too). Still failing: `TestOffAxisStereo`,
-  `TestStereoEyeSeparation`,
-  `TestSplitViewportStereoHorizontal`, and 3
-  `TestGradientBackground*` (0.34–0.59).
+  `TestNViewportsOneActor` passes too). `TestOffAxisStereo`,
+  `TestStereoEyeSeparation` and `TestSplitViewportStereoHorizontal` now pass via
+  the stereo-composite write-back fix (see the stereo-composite section below).
+  Still failing: 3 `TestGradientBackground*` (0.34–0.59).
 - **Triangle strips** — DONE: the four `TestTStrips*` tests now pass via CPU-side
   strip decomposition in `vtkMetalPolyDataMapper`/`vtkMetalPolyDataMapper2D`
   (GL's `AppendStripIndexBuffer` winding) and the property-texture fallback in
@@ -1151,7 +1213,7 @@ metrics (`TestPolyDataMapper2D` 0.0664, `TestEdgeFlags` 0.0681,
 
 ### Evidence the core path is correct
 
-The 133 passes include the strongest-scrutiny tests: `TestOpacity` (passes with
+The 145 passes include the strongest-scrutiny tests: `TestOpacity` (passes with
 the `TIGHT_VALID` metric — the Lab-space color path matches GL to
 `0.00038`), `TestOSConeCxx`, `TestMace`, the four scalar-LUT tests
 (`TestCompositePolyDataMapperOverrideLUT`, `TestTextureInterpolateScalars`,
@@ -1174,7 +1236,9 @@ multi-viewport cluster (`TestNViewports*`), the eight sub-viewport
 `TestBareScalarsToColors`, `TestMapVectorsAsRGBColors`, `TestMapVectorsToColors`
 at ImageError ~1e-07-1e-06), the four triangle-strip tests
 (`TestTStrips{TCoords,NormalsTCoords,NormalsColorsTCoords,ColorsTCoords}`, the
-first time any strip-geometry test has passed), and the basic
+first time any strip-geometry test has passed), the stereo-composite cluster
+(`TestOffAxisStereo`, `TestStereoEyeSeparation`, `TestSplitViewportStereoHorizontal`
+at ImageError 2.9e-03–5e-05), and the basic
 Glyph3D,
 `FrustumClip`, `RGrid`, `TestQuad`. `Rendering/Metal/Testing/OpenGLComparison.md`
 shows every bespoke scene now matches OpenGL to a thresholded error of 0.000
@@ -1239,18 +1303,21 @@ not in the fundamental geometry/lighting/color path.
     instantiate the OpenGL label/text/image classes (e.g.
    `vtkOpenGLLabeledContourMapper::ApplyStencil`) against a Metal window; this
    needs Metal overrides for the label/text rendering stack.
- 7. **Glyph instancing colors**, **2D overlay (image mapper done)**, **LUT/color
-      mapping**, **stereo/multiview + gradient background** — all
-      render but diverge from GL. (The glyph3D multi-source indexing tests
-      `TestGlyph3DMapperIndexing`/`TreeIndexing` now pass — see the glyph3D
-      multi-source indexing section above; `TestActor2D` now passes — see the
-      2D-overlay section above; the sub-viewport `vtkImageMapper` tests
-      `TestImageMapper_1..4`, `TestDirectScalarsToColors`, `TestBareScalarsToColors`,
-      `TestMapVectorsAsRGBColors`, `TestMapVectorsToColors` now pass via the 2D
-      image-mapper viewport-WCVC fix above; `TestPolyDataMapper2D` is at 0.066,
-      the closest 2D miss; the textured/stereo backgrounds `TestTexturedBackground`
-      and `TestStereoBackground{Left,Right}` now pass — see the textured-background
-      section above.)
+  7. **Glyph instancing colors**, **2D overlay (image mapper done)**, **LUT/color
+       mapping**, **stereo/multiview done**, **gradient background** — all
+       render but diverge from GL. (The glyph3D multi-source indexing tests
+       `TestGlyph3DMapperIndexing`/`TreeIndexing` now pass — see the glyph3D
+       multi-source indexing section above; `TestActor2D` now passes — see the
+       2D-overlay section above; the sub-viewport `vtkImageMapper` tests
+       `TestImageMapper_1..4`, `TestDirectScalarsToColors`, `TestBareScalarsToColors`,
+       `TestMapVectorsAsRGBColors`, `TestMapVectorsToColors` now pass via the 2D
+       image-mapper viewport-WCVC fix above; `TestPolyDataMapper2D` is at 0.066,
+       the closest 2D miss; the textured/stereo backgrounds `TestTexturedBackground`
+       and `TestStereoBackground{Left,Right}` now pass — see the textured-background
+       section above; the CPU-composited stereo tests `TestOffAxisStereo`,
+       `TestStereoEyeSeparation`, `TestSplitViewportStereoHorizontal` now pass —
+       see the stereo-composite write-back section above. The 3
+       `TestGradientBackground*` tests (0.34–0.59) remain.)
  8. **Triangle strips — DONE** — `vtkMetalPolyDataMapper` and
     `vtkMetalPolyDataMapper2D` now decompose `GetStrips()` on the CPU exactly like
     GL's `AppendStripIndexBuffer` (shared indexed/non-indexed surface emit,
@@ -1342,7 +1409,14 @@ now pass via the ambient-pre-applied edge shader, `TestReadPixels` and
   (134 Passed / 38 Failed / 3 aborted — the tube pipelines now bake
   `GetLighting()` into the `kLightingDisabled` function constant; pass count
   unchanged, `TestRenderLinesAsTubes{OrthoCamera}` improved 0.2350/0.2349 →
-  0.2292/0.2292).
+  0.2292/0.2292), and then after the labeled-contour-mapper fix
+  (142 Passed / 33 Failed / 0 aborted — the `TestLabeledContourMapper` trio now
+  passes via the Metal `vtkLabeledContourMapper` override), and then after the
+  stereo-composite write-back fix
+  (145 Passed / 30 Failed / 0 aborted — `TestOffAxisStereo`,
+  `TestSplitViewportStereoHorizontal` and `TestStereoEyeSeparation` now pass via
+  the `SetPixelData`/`SetRGBACharPixelData` overrides and the eye-pass present
+  suppression in `vtkMetalRenderWindow`/`vtkMetalRenderer`).
   The image-compare buckets above are from that latest run's `LastTest.log` (max
 TIGHT_VALID error per test), analyzed with `analyze_metal_ctest_log.py`.
 Re-running is reproducible except where a crash's signal stack
