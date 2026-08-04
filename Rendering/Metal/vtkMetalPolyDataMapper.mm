@@ -3516,6 +3516,22 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   // Single-pass edges: per-triangle-corner boundary flags (parallel to triangleIndices)
   std::vector<uint32_t> triangleEdgeFlags;
   std::vector<float> trianglePos;   // float3[3] corner object positions per corner record
+
+  // Per-point user edge flags (vtkDataSetAttributes::EDGEFLAG). Mirrors
+  // vtkOpenGLPolyDataMapper::BuildIBO: only a 1-component vtkUnsignedCharArray
+  // is honored. The flag at point p controls the edge from p to the next point
+  // in the cell (GL AppendEdgeFlagIndexBuffer / AppendTriangleIndexBuffer), so
+  // an edge is drawn only when its starting point's flag is non-zero.
+  vtkDataArray* edgeFlagAttr = polydata->GetPointData()->GetAttribute(vtkDataSetAttributes::EDGEFLAG);
+  if (edgeFlagAttr &&
+    (edgeFlagAttr->GetNumberOfComponents() != 1 || !edgeFlagAttr->IsA("vtkUnsignedCharArray")))
+  {
+    edgeFlagAttr = nullptr;
+  }
+  auto pointEdgeFlag = [&](vtkIdType p) -> bool {
+    return edgeFlagAttr == nullptr || edgeFlagAttr->GetComponent(p, 0) != 0.0;
+  };
+
   // Host mirror of the kernel's isBoundary: true iff (a,b) is a consecutive polygon pair.
   auto edgeIsBoundary = [&](vtkIdType a, vtkIdType b, vtkIdType npts, const vtkIdType* pts) -> bool {
     for (vtkIdType k = 0; k < npts; ++k)
@@ -3527,10 +3543,12 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     return false;
   };
   // Bit order (c1c2, c2c0, c0c1): bit0 = edge opposite corner 0, bit1 = corner 1, bit2 = corner 2.
+  // An edge is active only when it is a polygon boundary edge AND the user edge
+  // flag of its starting corner is set (matches GL's val & mask edge values).
   auto packedEdgeFlags = [&](const vtkIdType tri[3], vtkIdType npts, const vtkIdType* pts) -> uint32_t {
-    return (edgeIsBoundary(tri[1], tri[2], npts, pts) ? 1u : 0u)
-         | (edgeIsBoundary(tri[2], tri[0], npts, pts) ? 2u : 0u)
-         | (edgeIsBoundary(tri[0], tri[1], npts, pts) ? 4u : 0u);
+    return ((edgeIsBoundary(tri[1], tri[2], npts, pts) && pointEdgeFlag(tri[1])) ? 1u : 0u)
+         | ((edgeIsBoundary(tri[2], tri[0], npts, pts) && pointEdgeFlag(tri[2])) ? 2u : 0u)
+         | ((edgeIsBoundary(tri[0], tri[1], npts, pts) && pointEdgeFlag(tri[0])) ? 4u : 0u);
   };
 
   // P2-2B: Edge geometry for wireframe overlay on surfaces (separate vertex + index buffers)
@@ -3956,15 +3974,33 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
           }
 
           // Upload params uniform
-          struct { uint32_t numCells; uint32_t cellIdOffset; uint32_t writeEdgeFlags; } tessParams;
+          struct { uint32_t numCells; uint32_t cellIdOffset; uint32_t writeEdgeFlags;
+                   uint32_t hasUserEdgeFlags; } tessParams;
           tessParams.numCells = static_cast<uint32_t>(polyOff.size() - 1);
           tessParams.cellIdOffset = static_cast<uint32_t>(polyCellOffset);
           tessParams.writeEdgeFlags = singlePassEdges ? 1u : 0u;
+          tessParams.hasUserEdgeFlags = edgeFlagAttr ? 1u : 0u;
           id<MTLBuffer> tessParamsBuf = [device
             newBufferWithBytes:&tessParams
                        length:sizeof(tessParams)
                       options:MTLResourceStorageModeShared];
           vtkMetalMRC::AssignConsumed(this->Internals->TessParamsBuffer, tessParamsBuf);
+
+          // Per-point user edge flags (uint32 0/1) consumed by the kernel when
+          // hasUserEdgeFlags is set; only allocated when the attribute exists.
+          id<MTLBuffer> edgeFlagBuf = nil;
+          if (edgeFlagAttr)
+          {
+            std::vector<uint32_t> pointFlags(static_cast<size_t>(numPolyPts), 0);
+            for (vtkIdType p = 0; p < numPolyPts; ++p)
+            {
+              pointFlags[static_cast<size_t>(p)] = pointEdgeFlag(p) ? 1u : 0u;
+            }
+            edgeFlagBuf = [device
+              newBufferWithBytes:pointFlags.data()
+                          length:pointFlags.size() * sizeof(uint32_t)
+                         options:MTLResourceStorageModeShared];
+          }
 
           // --- Encode polygonToTriangle ---
           {
@@ -3981,6 +4017,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
             [enc setBuffer:offBuf offset:0 atIndex:4];
             [enc setBuffer:primBuf offset:0 atIndex:5];
             [enc setBuffer:this->Internals->TessParamsBuffer offset:0 atIndex:6];
+            if (edgeFlagBuf)
+            {
+              [enc setBuffer:edgeFlagBuf offset:0 atIndex:8];
+            }
             NSUInteger tgMax = this->Internals->PolygonToTrianglePipeline.maxTotalThreadsPerThreadgroup;
             MTLSize grid = MTLSizeMake(tessParams.numCells, 1, 1);
             NSUInteger gW = static_cast<NSUInteger>(tessParams.numCells);
@@ -3991,6 +4031,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
             tempInputBuffers.push_back(connBuf);
             tempInputBuffers.push_back(offBuf);
             tempInputBuffers.push_back(primBuf);
+            if (edgeFlagBuf)
+            {
+              tempInputBuffers.push_back(edgeFlagBuf);
+            }
             encPolygonTess = true;
           }
         }
@@ -4016,7 +4060,15 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
           }
           eOff.push_back(eOff.back() + static_cast<uint32_t>(npts));
           ePrimCounts.push_back(static_cast<uint32_t>(numEdges));
-          numEdges += npts;
+          // Count only user-flagged edges so the kernel's primitiveCounts
+          // offsets stay consistent with the filtered output.
+          for (vtkIdType i = 0; i < npts; ++i)
+          {
+            if (pointEdgeFlag(pts[i]))
+            {
+              ++numEdges;
+            }
+          }
         }
         ePrimCounts.push_back(static_cast<uint32_t>(numEdges));
 
@@ -4061,14 +4113,31 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
               newBufferWithLength:numEdges * sizeof(uint32_t)
                          options:MTLResourceStorageModeShared];
 
-            struct { uint32_t numCells; uint32_t cellIdOffset; uint32_t writeEdgeFlags; } eParams;
+            struct { uint32_t numCells; uint32_t cellIdOffset; uint32_t writeEdgeFlags;
+                     uint32_t hasUserEdgeFlags; } eParams;
             eParams.numCells = static_cast<uint32_t>(eOff.size() - 1);
             eParams.cellIdOffset = static_cast<uint32_t>(polyCellOffset);
-            eParams.writeEdgeFlags = 0u;
+            eParams.writeEdgeFlags = edgeFlagAttr ? 1u : 0u;
+            eParams.hasUserEdgeFlags = edgeFlagAttr ? 1u : 0u;
             id<MTLBuffer> eParamsBuf = [device
               newBufferWithBytes:&eParams
                          length:sizeof(eParams)
                         options:MTLResourceStorageModeShared];
+
+            // Per-point user edge flags (uint32 0/1) for polygonEdgesToLines.
+            id<MTLBuffer> eEdgeFlagBuf = nil;
+            if (edgeFlagAttr)
+            {
+              std::vector<uint32_t> pointFlags(static_cast<size_t>(numPolyPts), 0);
+              for (vtkIdType p = 0; p < numPolyPts; ++p)
+              {
+                pointFlags[static_cast<size_t>(p)] = pointEdgeFlag(p) ? 1u : 0u;
+              }
+              eEdgeFlagBuf = [device
+                newBufferWithBytes:pointFlags.data()
+                            length:pointFlags.size() * sizeof(uint32_t)
+                           options:MTLResourceStorageModeShared];
+            }
 
             // --- Encode polygonEdgesToLines (edge visibility) ---
             id<MTLComputeCommandEncoder> enc = [computeCmdBuf computeCommandEncoder];
@@ -4079,6 +4148,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
             [enc setBuffer:eOffBuf offset:0 atIndex:3];
             [enc setBuffer:ePrimBuf offset:0 atIndex:4];
             [enc setBuffer:eParamsBuf offset:0 atIndex:5];
+            if (eEdgeFlagBuf)
+            {
+              [enc setBuffer:eEdgeFlagBuf offset:0 atIndex:6];
+            }
             NSUInteger tgMax = this->Internals->PolygonEdgesToLinesPipeline.maxTotalThreadsPerThreadgroup;
             MTLSize grid = MTLSizeMake(eParams.numCells, 1, 1);
             NSUInteger gW = static_cast<NSUInteger>(eParams.numCells);
@@ -4090,6 +4163,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
             tempInputBuffers.push_back(eOffBuf);
             tempInputBuffers.push_back(ePrimBuf);
             tempInputBuffers.push_back(eParamsBuf);
+            if (eEdgeFlagBuf)
+            {
+              tempInputBuffers.push_back(eEdgeFlagBuf);
+            }
             encEdgeVis = true;
           }
         }
@@ -4115,7 +4192,15 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
         }
         wOff.push_back(wOff.back() + static_cast<uint32_t>(npts));
         wPrimCounts.push_back(static_cast<uint32_t>(numEdges));
-        numEdges += npts;
+        // Count only user-flagged edges so the kernel's primitiveCounts
+        // offsets stay consistent with the filtered output.
+        for (vtkIdType i = 0; i < npts; ++i)
+        {
+          if (pointEdgeFlag(pts[i]))
+          {
+            ++numEdges;
+          }
+        }
       }
       wPrimCounts.push_back(static_cast<uint32_t>(numEdges));
 
@@ -4160,14 +4245,31 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
             newBufferWithLength:numEdges * sizeof(uint32_t)
                        options:MTLResourceStorageModeShared];
 
-          struct { uint32_t numCells; uint32_t cellIdOffset; uint32_t writeEdgeFlags; } wParams;
+          struct { uint32_t numCells; uint32_t cellIdOffset; uint32_t writeEdgeFlags;
+                   uint32_t hasUserEdgeFlags; } wParams;
           wParams.numCells = static_cast<uint32_t>(wOff.size() - 1);
           wParams.cellIdOffset = static_cast<uint32_t>(polyCellOffset);
-          wParams.writeEdgeFlags = 0u;
+          wParams.writeEdgeFlags = edgeFlagAttr ? 1u : 0u;
+          wParams.hasUserEdgeFlags = edgeFlagAttr ? 1u : 0u;
           id<MTLBuffer> wParamsBuf = [device
             newBufferWithBytes:&wParams
                        length:sizeof(wParams)
                       options:MTLResourceStorageModeShared];
+
+          // Per-point user edge flags (uint32 0/1) for polygonEdgesToLines.
+          id<MTLBuffer> wEdgeFlagBuf = nil;
+          if (edgeFlagAttr)
+          {
+            std::vector<uint32_t> pointFlags(static_cast<size_t>(numPolyPts), 0);
+            for (vtkIdType p = 0; p < numPolyPts; ++p)
+            {
+              pointFlags[static_cast<size_t>(p)] = pointEdgeFlag(p) ? 1u : 0u;
+            }
+            wEdgeFlagBuf = [device
+              newBufferWithBytes:pointFlags.data()
+                          length:pointFlags.size() * sizeof(uint32_t)
+                         options:MTLResourceStorageModeShared];
+          }
 
           // --- Encode polygonEdgesToLines (wireframe) ---
           id<MTLComputeCommandEncoder> enc = [computeCmdBuf computeCommandEncoder];
@@ -4178,6 +4280,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
           [enc setBuffer:wOffBuf offset:0 atIndex:3];
           [enc setBuffer:wPrimBuf offset:0 atIndex:4];
           [enc setBuffer:wParamsBuf offset:0 atIndex:5];
+          if (wEdgeFlagBuf)
+          {
+            [enc setBuffer:wEdgeFlagBuf offset:0 atIndex:6];
+          }
           NSUInteger tgMax = this->Internals->PolygonEdgesToLinesPipeline.maxTotalThreadsPerThreadgroup;
           MTLSize grid = MTLSizeMake(wParams.numCells, 1, 1);
           NSUInteger gW = static_cast<NSUInteger>(wParams.numCells);
@@ -4189,6 +4295,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
           tempInputBuffers.push_back(wOffBuf);
           tempInputBuffers.push_back(wPrimBuf);
           tempInputBuffers.push_back(wParamsBuf);
+          if (wEdgeFlagBuf)
+          {
+            tempInputBuffers.push_back(wEdgeFlagBuf);
+          }
           encWireframe = true;
         }
       }
@@ -4409,10 +4519,12 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
               newBufferWithLength:numLineSegs * sizeof(uint32_t)
                          options:MTLResourceStorageModeShared];
 
-            struct { uint32_t numCells; uint32_t cellIdOffset; uint32_t writeEdgeFlags; } lParams;
+            struct { uint32_t numCells; uint32_t cellIdOffset; uint32_t writeEdgeFlags;
+                     uint32_t hasUserEdgeFlags; } lParams;
             lParams.numCells = static_cast<uint32_t>(lOff.size() - 1);
             lParams.cellIdOffset = static_cast<uint32_t>(lineCellOffset);
             lParams.writeEdgeFlags = 0u;
+            lParams.hasUserEdgeFlags = 0u;
             id<MTLBuffer> lParamsBuf = [device
               newBufferWithBytes:&lParams
                          length:sizeof(lParams)
@@ -4680,7 +4792,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
   // Helper: extract a polygon or triangle-strip as line segments (wireframe).
   // Polygons emit their closed boundary loop; strips use the GL
   // AppendStripIndexBuffer(wireframe=true) pattern — (v0,v1) followed by the
-  // two outer edges of each constituent triangle.
+  // two outer edges of each constituent triangle. When a user edge-flag
+  // attribute is present, a polygon edge is emitted only when the flag of its
+  // starting point is set (matching GL's AppendEdgeFlagIndexBuffer; strips
+  // ignore edge flags like GL).
   auto emitWireframeCell = [&](bool isStrip, vtkIdType npts, const vtkIdType* pts, vtkIdType cellId)
   {
     if (isStrip)
@@ -4696,7 +4811,10 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
     {
       for (vtkIdType i = 0; i < npts; ++i)
       {
-        emitLineSegment(pts[i], pts[(i + 1) % npts], cellId);
+        if (pointEdgeFlag(pts[i]))
+        {
+          emitLineSegment(pts[i], pts[(i + 1) % npts], cellId);
+        }
       }
     }
   };
@@ -5047,6 +5165,13 @@ void vtkMetalPolyDataMapper::BuildGeometryBuffers(void* mtlDevice, vtkPolyData* 
           {
             vtkIdType a = pts[i];
             vtkIdType b = pts[(i + 1) % npts];
+            // Polygon boundary edges honor the user edge flag of their
+            // starting point (GL AppendTriangleIndexBuffer val & mask);
+            // strip boundary edges below ignore flags like GL.
+            if (!pointEdgeFlag(a))
+            {
+              continue;
+            }
             EdgeKey key = MakeEdgeKey(a, b);
             if (uniqueEdges.find(key) == uniqueEdges.end())
             {

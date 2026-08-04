@@ -175,7 +175,7 @@ ctest --test-dir build_macos_metal -R "RenderingMetalCxx|RenderingMetal-HeaderTe
 `ctest -R "RenderingCoreCxx-Metal" -j 8`)
 
 ```
-175 tests:  154 Passed  21 Failed (incl. image/pick fails)  0 "Subprocess aborted"
+175 tests:  155 Passed  20 Failed (incl. image/pick fails)  0 "Subprocess aborted"
 ```
 
 (Historical run at commit `bc4e9d93cd`: 55 Passed / 87 Failed / 33 aborted. Prior
@@ -453,6 +453,64 @@ check against the documented passing cluster reports none. The bespoke suite's
 tree via a `vtkShaderProperty::New()` null-override crash in
 `vtkProp::GetShaderProperty()` — now pass via the `vtkMetalShaderProperty` factory
 override (see below); the bespoke suite re-ran at 16/16 pass.
+Run after the edge-flag support fix (this run, 2026-08-04): 155 Passed /
+20 Failed / 0 aborted out of 175 (analyzed with `analyze_metal_ctest_log.py` from
+a single `ctest -R "RenderingCoreCxx-Metal" -j 8` run; failures exported with
+`export_image_compare.sh`) — `TestEdgeFlags` now passes for the first time
+(TIGHT_VALID 0.0102255, was a 0.0681 near-miss fail): the Metal poly-data mapper
+now honors the `vtkDataSetAttributes::EDGEFLAG` point attribute in the CPU
+wireframe path, the GPU wireframe/surface-edge tessellation kernels, and the
+legacy and single-pass edge overlays (see the edge-flag support section below).
+The +1 pass delta over the previous run is exactly that test; the failure set is
+otherwise unchanged (16 image-compare + 1 below-threshold pick-check + 3
+non-image fails, no new failures). The regression check against the documented
+passing cluster reports none.
+
+### The edge-flag support is fixed (`TestEdgeFlags` now passes)
+
+`TestEdgeFlags` draws a square from four triangles (plus a five-point polygon)
+with a per-point `vtkDataSetAttributes::EDGEFLAG` attribute (`vtkEdgeFlags`, a
+1-component `vtkUnsignedCharArray`) that hides the internal edges: only the
+boundary of the square is drawn. The Metal mapper previously derived edge
+visibility from the polygon boundary alone and never consulted the attribute, so
+the internal edges rendered and the test failed at a near-miss 0.0681.
+
+The Metal poly-data mapper (`vtkMetalPolyDataMapper.mm`) and the tessellation
+kernels (`Rendering/Metal/Shaders/MetalShaders.metal`) now reproduce GL's
+semantics exactly. GL's `AppendEdgeFlagIndexBuffer` draws the edge from point `p`
+to the next point in a polygon only when `p`'s flag is non-zero, and the
+surface-edge `AppendTriangleIndexBuffer` masks its per-corner boundary values
+(`val & mask`) by the three corner flags; triangle strips ignore edge flags
+(`AppendStripIndexBuffer` takes none).
+
+- **Attribute read.** `BuildGeometryBuffers` reads the active `EDGEFLAG`
+  attribute and honors it only when it is a 1-component `vtkUnsignedCharArray`
+  (GL's `vtkArrayDownCast` gate); anything else falls back to null. A
+  `pointEdgeFlag(p)` lambda resolves visibility per point.
+- **CPU wireframe** (`emitWireframeCell`): the polygon branch skips the edge
+  `(pts[i], pts[(i+1)%npts])` when `pointEdgeFlag(pts[i])` is false; the strip
+  branch is unchanged (strips ignore flags).
+- **GPU wireframe kernel** (`polygonEdgesToLines`): the host `wPrimCounts`
+  prefix sum now counts only flag-on edges and the kernel iterates the polygon
+  and skips flag-off edges, so the output offsets stay consistent. The unfiltered
+  behavior (all polygon edges) is preserved when no attribute exists
+  (`writeEdgeFlags == 0`).
+- **Surface edges.** The single-pass `polygonToTriangle` kernel and the legacy
+  edge-overlay pass both gate their boundary flags through the per-starting-point
+  flag test (`tessEdgeVisible` in the shader; `pointEdgeFlag` on the CPU legacy
+  `uniqueEdges` path), matching GL's `val & mask`.
+- **Host/GPU params.** The `TessParams` struct gained a `hasUserEdgeFlags`
+  field (host structs kept in lockstep), and a per-point uint32 0/1 flag buffer
+  is bound at buffer index 8 (`polygonToTriangle`) / 6 (`polygonEdgesToLines`)
+  only when the attribute exists; the kernels read it only when the flag is set,
+  so unbound-buffer and base-path behavior are unchanged.
+
+`TestEdgeFlags` passes at TIGHT_VALID 0.0102255. With no edge-flag attribute
+present every path behaves exactly as before; the six edge/wireframe/strip
+tests (`TestEdgeFlags`, `TestSurfacePlusEdges`, `TestEdgeOpacity`,
+`TestEdgeThickness`, `TestWireframe`, `TestTStripsColorsTCoords`) all pass, and
+the full suite re-ran at 155 pass / 20 fail / 0 aborted with the failure set
+otherwise unchanged and no regression against the documented passing cluster.
 
 ### The labeled-contour-mapper cluster is fixed
 

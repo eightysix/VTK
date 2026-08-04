@@ -1530,7 +1530,7 @@ fragment FragmentOutput fragment_miter_join_line_main(
 // ---------------------------------------------------------------------------
 // Compute Kernels (Tessellation mapping)
 // ---------------------------------------------------------------------------
-struct TessParams { uint numCells; uint cellIdOffset; uint writeEdgeFlags; };
+struct TessParams { uint numCells; uint cellIdOffset; uint writeEdgeFlags; uint hasUserEdgeFlags; };
 
 inline bool tessIsBoundary(uint a, uint b, constant uint* connectivity, uint inputOffset, uint npts) {
   for (uint k = 0u; k < npts; ++k) {
@@ -1539,6 +1539,18 @@ inline bool tessIsBoundary(uint a, uint b, constant uint* connectivity, uint inp
     if ((x == a && y == b) || (x == b && y == a)) return true;
   }
   return false;
+}
+
+// A polygon edge (a -> b) is visible when it is a polygon boundary edge and,
+// when a user edge-flag attribute is present (hasUserEdgeFlags), the flag of
+// the edge's starting point is non-zero (GL AppendEdgeFlagIndexBuffer). When
+// hasUserEdgeFlags is 0 the flag term is skipped, so the boundary-only
+// behavior (all polygon edges) is preserved.
+inline bool tessEdgeVisible(uint a, uint b, constant uint* connectivity, uint inputOffset,
+                            uint npts, constant uint* edgeFlags, uint hasUserEdgeFlags) {
+  if (!tessIsBoundary(a, b, connectivity, inputOffset, npts)) return false;
+  if (hasUserEdgeFlags != 0u && edgeFlags[a] == 0u) return false;
+  return true;
 }
 
 kernel void polygonToTriangle(
@@ -1550,6 +1562,7 @@ kernel void polygonToTriangle(
     constant uint* offsets [[buffer(4)]],
     constant uint* primitiveCounts [[buffer(5)]],
     constant TessParams& params [[buffer(6)]],
+    constant uint* edgeFlags [[buffer(8)]],
     uint gid [[thread_position_in_grid]]) {
   if (gid >= params.numCells) return;
 
@@ -1572,11 +1585,13 @@ kernel void polygonToTriangle(
 
     // Single-pass surface edges: boundary mask is only needed when the
     // indexed-entry pipeline is active, so skip the O(npts) boundary test
-    // entirely otherwise.
+    // entirely otherwise. When a user edge-flag attribute is present, an edge
+    // is additionally gated on the flag of its starting corner (GL
+    // val & mask semantics).
     if (params.writeEdgeFlags != 0u) {
-      uint f12 = tessIsBoundary(c1, c2, connectivity, inputOffset, npts) ? 1u : 0u;
-      uint f20 = tessIsBoundary(c2, c0, connectivity, inputOffset, npts) ? 1u : 0u;
-      uint f01 = tessIsBoundary(c0, c1, connectivity, inputOffset, npts) ? 1u : 0u;
+      uint f12 = tessEdgeVisible(c1, c2, connectivity, inputOffset, npts, edgeFlags, params.hasUserEdgeFlags) ? 1u : 0u;
+      uint f20 = tessEdgeVisible(c2, c0, connectivity, inputOffset, npts, edgeFlags, params.hasUserEdgeFlags) ? 1u : 0u;
+      uint f01 = tessEdgeVisible(c0, c1, connectivity, inputOffset, npts, edgeFlags, params.hasUserEdgeFlags) ? 1u : 0u;
       uint packed = (f12) | (f20 << 1u) | (f01 << 2u);
       outEdgeFlags[outputOffset] = packed;
       outEdgeFlags[outputOffset + 1u] = packed;
@@ -1615,18 +1630,28 @@ kernel void polygonEdgesToLines(
     constant uint* offsets [[buffer(3)]],
     constant uint* primitiveCounts [[buffer(4)]],
     constant TessParams& params [[buffer(5)]],
+    constant uint* edgeFlags [[buffer(6)]],
     uint gid [[thread_position_in_grid]]) {
   if (gid >= params.numCells) return;
 
+  // primitiveCounts holds cumulative VISIBLE edge counts; when a user
+  // edge-flag attribute is present (writeEdgeFlags != 0) hidden edges are
+  // skipped entirely, otherwise every polygon edge is emitted.
   uint numEdges = primitiveCounts[gid + 1u] - primitiveCounts[gid];
   uint outputOffset = primitiveCounts[gid] * 2u;
   uint inputOffset = offsets[gid];
+  uint npts = offsets[gid + 1u] - offsets[gid];
 
-  for (uint i = 0u; i < numEdges; i++) {
-    cellIds[primitiveCounts[gid] + i] = gid + params.cellIdOffset + 1u;
+  uint out = 0u;
+  for (uint i = 0u; i < npts; i++) {
+    bool visible =
+      params.writeEdgeFlags == 0u || edgeFlags[connectivity[inputOffset + i]] != 0u;
+    if (!visible) continue;
+    cellIds[primitiveCounts[gid] + out] = gid + params.cellIdOffset + 1u;
     outConnectivity[outputOffset] = connectivity[inputOffset + i];
-    outConnectivity[outputOffset + 1u] = connectivity[inputOffset + (i + 1u) % numEdges];
+    outConnectivity[outputOffset + 1u] = connectivity[inputOffset + (i + 1u) % npts];
     outputOffset += 2u;
+    out++;
   }
 }
 
