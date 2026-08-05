@@ -181,6 +181,7 @@ private:
   double Transfer2DYAxisRange[2] = { 0.0, 1.0 }; // value range of the Y-axis array
   std::string Transfer2DYAxisArrayName;        // cached array name to detect changes
   bool Transfer2DEnabled = false;        // TF_2D mode active and textures ready
+  bool Transfer2DUseGradient = false;    // TF_2D without a Y-axis array: y-axis is gradient magnitude (OpenGL parity)
   void* MinMaxTexture = nullptr;         // id<MTLTexture> (3D) — 4x downsampled min-max accel
   void* MinMaxScratchTexture = nullptr;  // id<MTLTexture> — reusable scratch occupancy (R8Unorm 3D)
   int MinMaxDims[3] = {};               // dimensions of the min-max texture

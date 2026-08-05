@@ -138,16 +138,17 @@ struct VolumeMapperUniforms
   float UseTransfer2D;            // 984  yNorm = yRaw * scale + bias
   float Transfer2DYAxisScale;     // 988
   float Transfer2DYAxisBias;      // 992
-  float AverageIPRangeMin;        // 996  (native scalar units / ScalarNormalizationFactor)
-  float AverageIPRangeMax;        // 1000
-  float MaskType;                 // 1004  (0=label map, 1=binary mask)
+  float Transfer2DUseGradient;    // 996  (1.0 = y-axis is gradient magnitude, no Y-axis array)
+  float AverageIPRangeMin;        // 1000  (native scalar units / ScalarNormalizationFactor)
+  float AverageIPRangeMax;        // 1004
+  float MaskType;                 // 1008  (0=label map, 1=binary mask)
   // Final color window/level (matches OpenGL in_scale/in_bias in finalizeRayCast)
-  float FinalColorScale;          // 1008  (1.0 / FinalColorWindow)
-  float FinalColorBias;           // 1012  (0.5 - FinalColorLevel / FinalColorWindow)
+  float FinalColorScale;          // 1012  (1.0 / FinalColorWindow)
+  float FinalColorBias;           // 1016  (0.5 - FinalColorLevel / FinalColorWindow)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1016,
-  "VolumeMapperUniforms must be 1016 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1020,
+  "VolumeMapperUniforms must be 1020 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -157,9 +158,9 @@ static_assert(offsetof(VolumeMapperUniforms, UseMask) == 928, "");
 static_assert(offsetof(VolumeMapperUniforms, UseDepthTexture) == 948, "");
 static_assert(offsetof(VolumeMapperUniforms, UseNormalTexture) == 952, "");
 static_assert(offsetof(VolumeMapperUniforms, UseMinMaxAccel) == 960, "");
-static_assert(offsetof(VolumeMapperUniforms, AverageIPRangeMin) == 996, "");
-static_assert(offsetof(VolumeMapperUniforms, AverageIPRangeMax) == 1000, "");
-static_assert(offsetof(VolumeMapperUniforms, MaskType) == 1004, "");
+static_assert(offsetof(VolumeMapperUniforms, AverageIPRangeMin) == 1000, "");
+static_assert(offsetof(VolumeMapperUniforms, AverageIPRangeMax) == 1004, "");
+static_assert(offsetof(VolumeMapperUniforms, MaskType) == 1008, "");
 
 // Per-light data for volume shading — must match Metal VolumeLight struct
 // Must match Metal VolumeLight (6 x float4 = 96 bytes per light)
@@ -2369,6 +2370,16 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureEffectiveInput()
   // Point data on an image data input can be used directly.
   if (img && !this->CellFlag)
   {
+    // Never replace an existing effective input built from this dataset (e.g. a
+    // cell-to-point proxy) with the raw image: that would drop the only
+    // reference to the proxy and free it while callers may still hold a raw
+    // pointer to it (use-after-free). Keep the existing input when it is valid
+    // for the same source data.
+    if (this->EffectiveInput && this->EffectiveInputSource == dataSet &&
+      dataSet->GetMTime() <= this->EffectiveInputTime.GetMTime())
+    {
+      return true;
+    }
     if (this->EffectiveInput != img)
     {
       this->EffectiveInput = img;
@@ -2491,8 +2502,13 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
   // This mirrors vtkGPUVolumeRayCastMapper::Update, which the OpenGL backend
   // relies on; reading GetPointData()->GetScalars() directly fails when the
   // test sets ScalarModeToUsePointFieldData + SelectScalarArray.
+  // Use a local cellFlag (GetScalars sets it by reference) so the member still
+  // reflects the original input's scalar association for later EnsureEffectiveInput
+  // calls — mutating it here could cause the cell-data proxy to be replaced and
+  // freed while GPURender still holds a raw pointer to it.
+  int cellFlag = this->CellFlag;
   vtkDataArray* scalars = this->GetScalars(
-    input, this->ScalarMode, this->ArrayAccessMode, this->ArrayId, this->ArrayName, this->CellFlag);
+    input, this->ScalarMode, this->ArrayAccessMode, this->ArrayId, this->ArrayName, cellFlag);
   if (!scalars)
   {
     return false;
@@ -3155,9 +3171,17 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransfer2DYAxisTexture(
   const char* yName = this->GetTransfer2DYAxisArray();
   if (!yName)
   {
-    vtkErrorMacro("TF_2D mode requires a Y-axis scalar array (SetTransfer2DYAxisArray)");
-    this->Transfer2DEnabled = false;
-    return false;
+    // Legacy TF_2D mode (e.g. TestGPURayCastTransfer2D): no Y-axis array set,
+    // so the shader uses the gradient magnitude as the second axis (matching
+    // the OpenGL backend's Transfer2DUseGradient=true path).
+    this->Transfer2DUseGradient = true;
+    if (this->Transfer2DYAxisTexture)
+    {
+      ReleaseMetalObject(this->Transfer2DYAxisTexture);
+      this->Transfer2DYAxisUploadTime.Modified();
+      this->Transfer2DYAxisArrayName.clear();
+    }
+    return true;
   }
 
   vtkDataArray* arr = nullptr;
@@ -3171,10 +3195,18 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransfer2DYAxisTexture(
   }
   if (!arr)
   {
-    vtkErrorMacro("TF_2D mode: Y-axis array '" << yName << "' not found on input");
-    this->Transfer2DEnabled = false;
-    return false;
+    // Same fallback: array not found on the input, use gradient magnitude.
+    this->Transfer2DUseGradient = true;
+    if (this->Transfer2DYAxisTexture)
+    {
+      ReleaseMetalObject(this->Transfer2DYAxisTexture);
+      this->Transfer2DYAxisUploadTime.Modified();
+      this->Transfer2DYAxisArrayName.clear();
+    }
+    return true;
   }
+
+  this->Transfer2DUseGradient = false;
 
   int dims[3];
   input->GetDimensions(dims);
@@ -5431,8 +5463,12 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   // Cache scalar range once (used by both TF texture and uniforms). Resolve the
   // active scalar array via the mapper's scalar mode (see UpdateVolumeTexture).
+  // Note: pass a local cellFlag so GetScalars (which takes it by reference and
+  // sets it based on where the scalars were found) cannot clobber the member,
+  // which still describes the original input's scalar association.
+  int cellFlag = this->CellFlag;
   vtkDataArray* scalars = this->GetScalars(
-    input, this->ScalarMode, this->ArrayAccessMode, this->ArrayId, this->ArrayName, this->CellFlag);
+    input, this->ScalarMode, this->ArrayAccessMode, this->ArrayId, this->ArrayName, cellFlag);
   if (scalars)
   {
     scalars->GetRange(this->ScalarRange, 0);
@@ -5859,11 +5895,13 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   uniforms.UseRenderToImage = this->RenderToImage ? 1.0f : 0.0f;
   uniforms.ClampDepthToBackface = this->ClampDepthToBackface ? 1.0f : 0.0f;
 
-  // 2D transfer function mode — sample the primary scalar against the Y-axis
-  // scalar array in the 2D lookup image. yNorm = yRaw * scale + bias.
-  bool tf2dActive = (this->Transfer2DEnabled && this->Transfer2DTexture &&
-    this->Transfer2DYAxisTexture);
+  // 2D transfer function mode — sample the primary scalar against the second
+  // axis in the 2D lookup image. The second axis is either the Y-axis scalar
+  // array (yNorm = yRaw * scale + bias) or, when no array is set, the gradient
+  // magnitude computed in the shader (OpenGL parity).
+  bool tf2dActive = (this->Transfer2DEnabled && this->Transfer2DTexture);
   uniforms.UseTransfer2D = tf2dActive ? 1.0f : 0.0f;
+  uniforms.Transfer2DUseGradient = this->Transfer2DUseGradient ? 1.0f : 0.0f;
   if (tf2dActive)
   {
     double r0 = this->Transfer2DYAxisRange[0];

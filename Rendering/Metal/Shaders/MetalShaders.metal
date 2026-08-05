@@ -2671,10 +2671,13 @@ struct VolumeMapperUniforms {
   float useRenderToImage;
   float clampDepthToBackface;
   // 2D transfer function mode (TF_2D): sample the primary scalar against the
-  // Y-axis scalar array in a 2D color/opacity lookup image.
+  // Y-axis scalar array in a 2D color/opacity lookup image. When
+  // transfer2DUseGradient == 1.0 the second axis is the gradient magnitude
+  // instead of a Y-axis array (OpenGL Transfer2DUseGradient parity).
   float useTransfer2D;
   float transfer2DYAxisScale;  // yNorm = yRaw * scale + bias
   float transfer2DYAxisBias;
+  float transfer2DUseGradient; // 1.0 = y-axis is gradient magnitude
   // AverageIP scalar range (native scalar units, pre-divided by the volume
   // normalization factor so it compares against scalarMin + (scalarMax-scalarMin)*norm)
   float averageIPRangeMin;
@@ -3322,8 +3325,18 @@ inline half4 marchVolumeUnified(
     const bool fc_needsPerSampleOpacity =
       (fc_blendMode == 0 || fc_blendMode == 3 || fc_blendMode == 4);
     if (fc_needsPerSampleOpacity && doTransfer2D) {
-      half secondNorm = saturate(
-          half(sampleSecondScalar(transfer2DYAxisTexture, evalPoint)) * secondScale + secondBias);
+      half secondNorm;
+      if (volumeUniforms.transfer2DUseGradient > 0.5) {
+        // Legacy TF_2D (no Y-axis array): the second axis is the gradient
+        // magnitude, using the same normalization as gradient opacity — this is
+        // the OpenGL backend's grad.w, which it feeds to both the gradient
+        // opacity table and the 2D transfer function y-coordinate.
+        half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
+        secondNorm = grad.w;
+      } else {
+        secondNorm = saturate(
+            half(sampleSecondScalar(transfer2DYAxisTexture, evalPoint)) * secondScale + secondBias);
+      }
       colorOpacity = sampleTransferFunction2D(
           transferFunction2DTexture, float2(float(scalarNorm), float(secondNorm)));
     } else if (fc_needsPerSampleOpacity && doMask) {
