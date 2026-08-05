@@ -1448,7 +1448,15 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     ExtraAttributeBuffers.clear();
     ExtraAttributeComponentCounts.clear();
 
-    ReleasePipelines();
+    // Pipelines are intentionally NOT released here: they are keyed by the
+    // surface feature mask, light count/type, shader library, and sample count
+    // (the specialized surface map), or hold the full-feature base pipelines
+    // whose descriptors are fixed, so they never depend on the geometry
+    // content. Releasing them on every input MTime change (e.g. a mapper whose
+    // polydata is Modified() each frame) recompiles shaders every frame.
+    // vtkMetalPolyDataMapper::ReleaseGraphicsResources / the internals
+    // destructor release them once, and a sample-count change does so at the
+    // RenderPiece entry.
 
     vtkMetalMRC::ReleaseAndNil(ComputeQueue);
 
@@ -1479,6 +1487,7 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
 
   ~vtkMetalPolyDataMapperInternals()
   {
+    ReleasePipelines();
     ReleaseBuffers();
   }
 };
@@ -1517,6 +1526,7 @@ void vtkMetalPolyDataMapper::SetVBOShiftScaleMethod(int method)
 
 void vtkMetalPolyDataMapper::ReleaseGraphicsResources(vtkWindow* w)
 {
+  this->Internals->ReleasePipelines();
   this->Internals->ReleaseBuffers();
   this->Superclass::ReleaseGraphicsResources(w);
 }
