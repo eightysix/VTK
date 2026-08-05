@@ -100,8 +100,17 @@ set (VolumeCxxTests
 
 # everyone gets these tests
 vtk_add_test_cxx(vtkRenderingVolumeCxxTests tests
+  --vtk-factory-prefer RenderingBackend=OpenGL
   ${VolumeCxxTests}
   )
+
+if (TARGET VTK::RenderingMetal)
+  set(vtk_test_prefix "Metal-")
+  vtk_add_test_cxx(vtkRenderingVolumeCxxTests tests
+    --vtk-factory-prefer RenderingBackend=Metal
+    ${VolumeCxxTests})
+  unset(vtk_test_prefix)
+endif ()
 
 vtk_test_cxx_executable(vtkRenderingVolumeCxxTests tests
   DISABLE_FLOATING_POINT_EXCEPTIONS
