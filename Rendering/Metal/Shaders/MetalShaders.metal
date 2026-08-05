@@ -2682,6 +2682,9 @@ struct VolumeMapperUniforms {
   // Mask type: 0 = label map (colored via labelMapTransferTexture), 1 = binary
   // (samples with mask <= 0 are skipped, matching the OpenGL backend).
   float maskType;
+  // Final color window/level (matches OpenGL in_scale/in_bias in finalizeRayCast)
+  float finalColorScale;
+  float finalColorBias;
 };
 
 struct VolumeLight {
@@ -3454,12 +3457,13 @@ inline half4 marchVolumeUnified(
     }
   }
 
+  half4 finalColor;
   if (fc_blendMode == 1) {   // MAXIMUM_INTENSITY_BLEND
     half4 c = sampleTransferFunction(transferFunctionTexture, float2(float(mipMaxScalar), 0.5));
-    return half4(c.rgb * c.a, c.a);
+    finalColor = half4(c.rgb * c.a, c.a);
   } else if (fc_blendMode == 2) {  // MINIMUM_INTENSITY_BLEND
     half4 c = sampleTransferFunction(transferFunctionTexture, float2(float(minipMinScalar), 0.5));
-    return half4(c.rgb * c.a, c.a);
+    finalColor = half4(c.rgb * c.a, c.a);
   } else if (fc_blendMode == 3) {  // AVERAGE_INTENSITY_BLEND
     // OpenGL discards the fragment when no in-range sample was found; return a
     // fully transparent fragment so the background shows through.
@@ -3467,12 +3471,20 @@ inline half4 marchVolumeUnified(
       return half4(0.0h);
     }
     half avg = saturate(avgBlendSum / half(avgBlendCount));
-    return half4(avg, avg, avg, 1.0h);
+    finalColor = half4(avg, avg, avg, 1.0h);
   } else if (fc_blendMode == 4) {  // ADDITIVE_BLEND
     half sum = saturate(additiveSum);
-    return half4(sum, sum, sum, 1.0h);
+    finalColor = half4(sum, sum, sum, 1.0h);
+  } else {
+    finalColor = half4(accumulatedColor, accumulatedOpacity);
   }
-  return half4(accumulatedColor, accumulatedOpacity);
+
+  // Final color window/level (matches OpenGL raycasterfs.glsl finalizeRayCast):
+  //   rgb = rgb * in_scale + in_bias * alpha
+  half wlScale = half(volumeUniforms.finalColorScale);
+  half wlBias = half(volumeUniforms.finalColorBias);
+  finalColor.rgb = finalColor.rgb * wlScale + wlBias * finalColor.a;
+  return finalColor;
 }
 
 inline half4 marchVolume(

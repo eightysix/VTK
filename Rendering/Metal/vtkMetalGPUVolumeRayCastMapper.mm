@@ -141,10 +141,13 @@ struct VolumeMapperUniforms
   float AverageIPRangeMin;        // 996  (native scalar units / ScalarNormalizationFactor)
   float AverageIPRangeMax;        // 1000
   float MaskType;                 // 1004  (0=label map, 1=binary mask)
+  // Final color window/level (matches OpenGL in_scale/in_bias in finalizeRayCast)
+  float FinalColorScale;          // 1008  (1.0 / FinalColorWindow)
+  float FinalColorBias;           // 1012  (0.5 - FinalColorLevel / FinalColorWindow)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1008,
-  "VolumeMapperUniforms must be 1008 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1016,
+  "VolumeMapperUniforms must be 1016 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -5662,6 +5665,20 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   }
 
   uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;
+
+  // Final color window/level (matches OpenGL's in_scale/in_bias, applied in the
+  // shader after the ray cast as rgb * scale + bias * alpha).
+  if (this->FinalColorWindow != 0.0)
+  {
+    uniforms.FinalColorScale = static_cast<float>(1.0 / this->FinalColorWindow);
+    uniforms.FinalColorBias =
+      static_cast<float>(0.5 - this->FinalColorLevel / this->FinalColorWindow);
+  }
+  else
+  {
+    uniforms.FinalColorScale = 1.0f;
+    uniforms.FinalColorBias = 0.0f;
+  }
 
   // Gradient-based shading uniforms
   {
