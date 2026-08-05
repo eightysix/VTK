@@ -156,10 +156,20 @@ struct VolumeMapperUniforms
   // inverse.
   float TextureToVolumeMatrix[16]; // 1040..1103
   float VolumeToTextureMatrix[16]; // 1104..1167
+  // Independent multi-component support (OpenGL in_scalarsRange parity).
+  uint16_t ScalarMinCompHalf[4];   // 1168..1175  per-component scalar range / ScalarNormalizationFactor
+  uint16_t _padSMComp[4];          // 1176..1183
+  uint16_t ScalarMaxCompHalf[4];   // 1184..1191
+  uint16_t _padSMaxComp[4];        // 1192..1199
+  float ComponentWeight[4];        // 1200..1215
+  uint32_t NumComponents;          // 1216..1219
+  float UseIndependentComponents;  // 1220..1223
+  float _padIndependent[3];        // 1224..1235
+  float _padEnd2[3];               // 1236..1247  (trailing pad to 1248)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1168,
-  "VolumeMapperUniforms must be 1168 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1248,
+  "VolumeMapperUniforms must be 1248 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -174,6 +184,9 @@ static_assert(offsetof(VolumeMapperUniforms, AverageIPRangeMax) == 1004, "");
 static_assert(offsetof(VolumeMapperUniforms, MaskType) == 1008, "");
 static_assert(offsetof(VolumeMapperUniforms, TextureToVolumeMatrix) == 1040, "");
 static_assert(offsetof(VolumeMapperUniforms, VolumeToTextureMatrix) == 1104, "");
+static_assert(offsetof(VolumeMapperUniforms, ScalarMinCompHalf) == 1168, "");
+static_assert(offsetof(VolumeMapperUniforms, ComponentWeight) == 1200, "");
+static_assert(offsetof(VolumeMapperUniforms, NumComponents) == 1216, "");
 
 // Per-light data for volume shading — must match Metal VolumeLight struct
 // Must match Metal VolumeLight (6 x float4 = 96 bytes per light)
@@ -2151,6 +2164,10 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   ReleaseMetalObject(this->PipelineState);
   ReleaseMetalObject(this->VolumeTexture);
   ReleaseMetalObject(this->ColorOpacityTexture);
+  ReleaseMetalObject(this->ComponentTransferFunctionTexture1);
+  ReleaseMetalObject(this->ComponentTransferFunctionTexture2);
+  ReleaseMetalObject(this->ComponentTransferFunctionTexture3);
+  this->LastIndependentComponents = false;
   ReleaseMetalObject(this->GradientOpacityTexture);
   ReleaseMetalObject(this->Transfer2DTexture);
   ReleaseMetalObject(this->Transfer2DYAxisTexture);
@@ -3165,6 +3182,118 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
       this->LastTransferFunctionSampleDist = actualSampleDistance;
       this->TransferFunctionUploadTime.Modified();
     }
+  }
+
+  // Independent multi-component transfer functions: components 1..3 get their
+  // own color/opacity tables built over their own scalar ranges (OpenGL
+  // OpacityTables[i]/RGBTables[i] parity). Component 0 reuses ColorOpacityTexture.
+  const bool independentComps =
+    property->GetIndependentComponents() && this->VolumeNumComponents > 1;
+
+  if (independentComps)
+  {
+    bool compChanged = (this->VolumeNumComponents != this->LastVolumeNumComponents) ||
+      !this->LastIndependentComponents;
+
+    bool compRangeChanged = false;
+    for (int c = 0; c < 4; ++c)
+    {
+      if (this->ComponentScalarRange[c][0] != this->LastComponentScalarRange[c][0] ||
+        this->ComponentScalarRange[c][1] != this->LastComponentScalarRange[c][1])
+      {
+        compRangeChanged = true;
+      }
+    }
+
+    bool doCompReload = (this->ComponentTransferFunctionTexture1 == nullptr) ||
+      compChanged || compRangeChanged;
+    for (int c = 1; c < std::min(4, this->VolumeNumComponents); ++c)
+    {
+      vtkColorTransferFunction* cf = property->GetRGBTransferFunction(c);
+      vtkPiecewiseFunction* of = property->GetScalarOpacity(c);
+      if (cf && of)
+      {
+        doCompReload |= (cf->GetMTime() > this->ComponentTransferFunctionUpdateTime.GetMTime());
+        doCompReload |= (of->GetMTime() > this->ComponentTransferFunctionUpdateTime.GetMTime());
+      }
+    }
+
+    if (doCompReload)
+    {
+      @autoreleasepool
+      {
+        id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
+
+        const int tfWidth = 256;
+        void* compSlots[3] = { &this->ComponentTransferFunctionTexture1,
+                               &this->ComponentTransferFunctionTexture2,
+                               &this->ComponentTransferFunctionTexture3 };
+
+        for (int c = 1; c < std::min(4, this->VolumeNumComponents); ++c)
+        {
+          vtkColorTransferFunction* cf = property->GetRGBTransferFunction(c);
+          vtkPiecewiseFunction* of = property->GetScalarOpacity(c);
+          if (!cf || !of)
+          {
+            continue;
+          }
+
+          double unitDist = property->GetScalarOpacityUnitDistance(c);
+          if (unitDist <= 0.0)
+          {
+            unitDist = 1.0;
+          }
+          double preIntegrationFactor = actualSampleDistance / unitDist;
+
+          std::vector<uint16_t> tfData(static_cast<size_t>(tfWidth) * 4);
+          FillTransferFunctionRGBA16FWithPreIntegration(
+            cf, of,
+            this->ComponentScalarRange[c][0], this->ComponentScalarRange[c][1],
+            tfWidth, tfData.data(),
+            preIntegrationFactor);
+
+          // Swap rather than rewrite — see the single-path block above.
+          ReleaseMetalObject(*static_cast<void**>(compSlots[c - 1]));
+
+          id<MTLTexture> tex = NewTexture2D(
+            device,
+            MTLPixelFormatRGBA16Float,
+            static_cast<NSUInteger>(tfWidth), 1,
+            MTLTextureUsageShaderRead,
+            MTLStorageModeShared);
+          if (!tex)
+          {
+            vtkErrorMacro("Failed to create component transfer function texture");
+            return false;
+          }
+          AssignMetalObject(*static_cast<void**>(compSlots[c - 1]), tex);
+
+          MTLRegion region = MTLRegionMake2D(0, 0, tfWidth, 1);
+          [tex replaceRegion:region
+                mipmapLevel:0
+                  withBytes:tfData.data()
+                bytesPerRow:static_cast<NSUInteger>(tfWidth) * 8];
+        }
+
+        for (int c = 0; c < 4; ++c)
+        {
+          this->LastComponentScalarRange[c][0] = this->ComponentScalarRange[c][0];
+          this->LastComponentScalarRange[c][1] = this->ComponentScalarRange[c][1];
+        }
+        this->LastVolumeNumComponents = this->VolumeNumComponents;
+        this->LastIndependentComponents = true;
+        this->ComponentTransferFunctionUpdateTime.Modified();
+      }
+    }
+  }
+  else if (this->LastIndependentComponents)
+  {
+    // Transitioned out of independent mode: drop the per-component textures.
+    this->LastIndependentComponents = false;
+    this->LastVolumeNumComponents = 1;
+    ReleaseMetalObject(this->ComponentTransferFunctionTexture1);
+    ReleaseMetalObject(this->ComponentTransferFunctionTexture2);
+    ReleaseMetalObject(this->ComponentTransferFunctionTexture3);
   }
 
   return this->ColorOpacityTexture != nullptr;
@@ -5400,6 +5529,9 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
   SetFragmentTextureOrFallback(encoder, 9, this->Transfer2DTexture, this->ColorOpacityTexture);
   SetFragmentTextureOrFallback(encoder, 10, this->Transfer2DYAxisTexture, this->DummyVolumeTexture);
   SetFragmentTextureOrFallback(encoder, 11, this->BlankingTexture, this->DummyVolumeTexture);
+  SetFragmentTextureOrFallback(encoder, 12, this->ComponentTransferFunctionTexture1, this->ColorOpacityTexture);
+  SetFragmentTextureOrFallback(encoder, 13, this->ComponentTransferFunctionTexture2, this->ColorOpacityTexture);
+  SetFragmentTextureOrFallback(encoder, 14, this->ComponentTransferFunctionTexture3, this->ColorOpacityTexture);
 }
 
 //------------------------------------------------------------------------------
@@ -5433,6 +5565,9 @@ void vtkMetalGPUVolumeRayCastMapper::BindFullscreenTextures(
   SetFragmentTextureOrFallback(encoder, 9, this->Transfer2DTexture, this->ColorOpacityTexture);
   SetFragmentTextureOrFallback(encoder, 10, this->Transfer2DYAxisTexture, this->DummyVolumeTexture);
   SetFragmentTextureOrFallback(encoder, 11, this->BlankingTexture, this->DummyVolumeTexture);
+  SetFragmentTextureOrFallback(encoder, 12, this->ComponentTransferFunctionTexture1, this->ColorOpacityTexture);
+  SetFragmentTextureOrFallback(encoder, 13, this->ComponentTransferFunctionTexture2, this->ColorOpacityTexture);
+  SetFragmentTextureOrFallback(encoder, 14, this->ComponentTransferFunctionTexture3, this->ColorOpacityTexture);
 }
 
 //------------------------------------------------------------------------------
@@ -5648,11 +5783,31 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   if (scalars)
   {
     scalars->GetRange(this->ScalarRange, 0);
+    // Per-component scalar ranges for the independent multi-component path
+    // (OpenGL ScalarRange[n] parity).
+    const int numComp = scalars->GetNumberOfComponents();
+    for (int c = 0; c < 4; ++c)
+    {
+      if (c < numComp)
+      {
+        scalars->GetRange(this->ComponentScalarRange[c], c);
+      }
+      else
+      {
+        this->ComponentScalarRange[c][0] = 0.0;
+        this->ComponentScalarRange[c][1] = 1.0;
+      }
+    }
   }
   else
   {
     this->ScalarRange[0] = 0.0;
     this->ScalarRange[1] = 1.0;
+    for (int c = 0; c < 4; ++c)
+    {
+      this->ComponentScalarRange[c][0] = 0.0;
+      this->ComponentScalarRange[c][1] = 1.0;
+    }
   }
 
   // Phase 5: GPU-accelerated min-max generation.
@@ -5922,6 +6077,33 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
          ? this->ScalarRange[1]
          : this->ScalarRange[0] + 1.0) /
       normFactor));
+  }
+
+  // Independent multi-component support (OpenGL in_scalarsRange parity):
+  // per-component scalar ranges (divided by the volume normalization factor,
+  // in the same [0,1] space as the normalized sample), component weights, and
+  // the component/independent flags consumed by the shader's
+  // useIndependentPath branch.
+  {
+    vtkVolumeProperty* prop = vol->GetProperty();
+    const bool independent =
+      prop && prop->GetIndependentComponents() && this->VolumeNumComponents > 1;
+    uniforms.UseIndependentComponents = independent ? 1.0f : 0.0f;
+    uniforms.NumComponents =
+      static_cast<uint32_t>(std::max(1, std::min(4, this->VolumeNumComponents)));
+
+    float normFactor = this->ScalarNormalizationFactor;
+    for (int c = 0; c < 4; ++c)
+    {
+      uniforms.ComponentWeight[c] =
+        prop ? static_cast<float>(prop->GetComponentWeight(c)) : 1.0f;
+      double cMin = this->ComponentScalarRange[c][0];
+      double cMax = (this->ComponentScalarRange[c][1] > this->ComponentScalarRange[c][0])
+        ? this->ComponentScalarRange[c][1]
+        : this->ComponentScalarRange[c][0] + 1.0;
+      uniforms.ScalarMinCompHalf[c] = FloatToHalf(static_cast<float>(cMin / normFactor));
+      uniforms.ScalarMaxCompHalf[c] = FloatToHalf(static_cast<float>(cMax / normFactor));
+    }
   }
 
   uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;

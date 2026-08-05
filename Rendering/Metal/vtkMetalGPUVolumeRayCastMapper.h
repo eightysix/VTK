@@ -225,6 +225,22 @@ private:
   int VolumeNumComponents = 1;
   int CurrentSampleCount = 0;
 
+  // Independent multi-component transfer-function textures (id<MTLTexture>, 2D
+  // RGBA16F) for components 1..3; component 0 uses ColorOpacityTexture. Only
+  // populated when the volume has > 1 component and vtkVolumeProperty is in
+  // independent-components mode (OpenGL OpacityTables[i]/RGBTables[i] parity).
+  void* ComponentTransferFunctionTexture1 = nullptr;
+  void* ComponentTransferFunctionTexture2 = nullptr;
+  void* ComponentTransferFunctionTexture3 = nullptr;
+  vtkTimeStamp ComponentTransferFunctionUpdateTime;
+
+  // Per-component scalar ranges (normalized units) for the independent path,
+  // plus change detection for TF re-upload (OpenGL ScalarRange[n] parity).
+  double ComponentScalarRange[4][2] = { { 0.0, 1.0 }, { 0.0, 1.0 }, { 0.0, 1.0 }, { 0.0, 1.0 } };
+  double LastComponentScalarRange[4][2] = { { 0.0, 1.0 }, { 0.0, 1.0 }, { 0.0, 1.0 }, { 0.0, 1.0 } };
+  int LastVolumeNumComponents = 1;
+  bool LastIndependentComponents = false;
+
   bool PreferHalfPrecision = true;  // when true, prefer half-float (16-bit) for volume textures when the scalar range fits within [−65504, 65504]; covers native float and integer types
   // Enables a precomputed RGBA8Unorm normal texture to replace 6 gradient
   // fetches per sample with 1 normal texture fetch.  Adds ~4 bytes/voxel of
