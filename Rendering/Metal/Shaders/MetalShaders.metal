@@ -2664,6 +2664,13 @@ struct VolumeMapperUniforms {
   float minMaxDimX;
   float minMaxDimY;
   float minMaxDimZ;
+  float useRenderToImage;
+  float clampDepthToBackface;
+  // 2D transfer function mode (TF_2D): sample the primary scalar against the
+  // Y-axis scalar array in a 2D color/opacity lookup image.
+  float useTransfer2D;
+  float transfer2DYAxisScale;  // yNorm = yRaw * scale + bias
+  float transfer2DYAxisBias;
 };
 
 struct VolumeLight {
@@ -2718,6 +2725,7 @@ vertex VolumeVertexOut vertex_volume_main(
 }
 
 struct VolumeFragmentOut { float4 color [[color(0)]]; };
+struct VolumeFragmentOutRTT { float4 color [[color(0)]]; float depth [[color(1)]]; };
 
 constant int MAX_RAY_STEPS = 8192;
 
@@ -2807,6 +2815,23 @@ inline half4 sampleTransferFunction(texture2d<float> tfTex, float2 uv) {
     return half4(tfTex.sample(sVolume, uv, level(0)));
   }
   return half4(tfTex.sample(sNearest, uv, level(0)));
+}
+
+// 2D transfer function lookup at (primaryScalarNorm, secondScalarNorm).
+inline half4 sampleTransferFunction2D(texture2d<float> tf2DTex, float2 uv) {
+  if (fc_linearInterpolation) {
+    return half4(tf2DTex.sample(sVolume, uv, level(0)));
+  }
+  return half4(tf2DTex.sample(sNearest, uv, level(0)));
+}
+
+// Fetch the Y-axis scalar array (e.g. "Temp") at the same normalized volume
+// coordinate as the primary volume texture.
+inline float sampleSecondScalar(texture3d<float> yAxisTex, float3 pos) {
+  if (fc_linearInterpolation) {
+    return yAxisTex.sample(sVolume, pos, level(0)).r;
+  }
+  return yAxisTex.sample(sNearest, pos, level(0)).r;
 }
 
 inline half sampleGradientOpacity(texture2d<float> gradTex, float value) {
@@ -3090,39 +3115,52 @@ inline half4 marchVolumeUnified(
     constant PerBlockData& b,
     texture3d<float> volumeTexture,
     texture2d<float> transferFunctionTexture,
+    texture2d<float> transferFunction2DTexture,
+    texture3d<float> transfer2DYAxisTexture,
     texture2d<float> gradientOpacityTexture,
     texture3d<float> maskTexture,
     texture2d<float> labelMapTransferTexture,
     texture3d<float> minMaxTexture,
     texture3d<float> normalTexture,
-    constant VolumeLightUniforms* lightUniforms)
+    constant VolumeLightUniforms* lightUniforms,
+    thread float3* firstOpaquePos,
+    thread bool*  haveOpaquePos)
 {
   const bool doShading = fc_shading && (volumeUniforms.useGradientShading > 0.5);
   const bool doGradOp = fc_gradientOpacity && (volumeUniforms.useGradientOpacity > 0.5);
   const bool doCropping = volumeUniforms.useCropping > 0.5;
   const bool doMask = fc_mask && (volumeUniforms.useMask > 0.5);
+  const bool doTransfer2D = volumeUniforms.useTransfer2D > 0.5;
 
   half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
   half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+
+  half secondScale = half(volumeUniforms.transfer2DYAxisScale);
+  half secondBias  = half(volumeUniforms.transfer2DYAxisBias);
 
   half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
 
   float3 texSizeGlobal = max(p.texMaxGlobal - p.texMinGlobal, 1e-6);
   float3 invTexSizeGlobal = 1.0 / texSizeGlobal;
   float3 rayDirTexLocal = p.rayDir * invTexSizeGlobal;
-  // Cell-to-point conversion factors, computed once (texel centers at (i+0.5)/dims).
-  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
-  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
-  float3 ctpOffset  = 0.5 / texelCount;
-  // Advance of the cellToPoint-adjusted sample position per step (constant).
-  float3 evalStep = rayDirTexLocal * p.stepSize * ctpScale;
+  // Advance of the sample position per step (constant).
+  float3 evalStep = rayDirTexLocal * p.stepSize;
   float3 dt = max(b.gradientStep.xyz, 1e-8);
   float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
                         - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
   half3 gradScale = half3(1.0 / (dt * texSizeGlobal * boundsSize));
 
-  half3 viewDirHalf  = half3(normalize((p.rayOrigin + p.rayDir * p.tStart) - volumeUniforms.cameraVolumePos.xyz));
-  half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection));
+  // Lighting directions must live in the same (physical/data) space as the
+  // gradient normal: the normal is expressed per world-unit (gradScale divides
+  // by the per-axis bounds), so the headlight direction must be converted from
+  // the normalized volume frame back to data space (offset * boundsSize) before
+  // computing nDotL/vDotR. OpenGL computes g_ldir/g_vdir directly in object
+  // space (normalize(eyePosObj - vertexPosObj)); using the distorted volume
+  // frame here would bias nDotL for anisotropic bounds and fire specular on
+  // surfaces where OpenGL's nDotL is <= 0.
+  float3 entryVolPos = p.rayOrigin + p.rayDir * p.tStart;
+  half3 viewDirHalf  = half3(normalize((entryVolPos - volumeUniforms.cameraVolumePos.xyz) * boundsSize));
+  half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection * boundsSize));
   half3 ambientMat   = half3(volumeUniforms.ambientColor.rgb);
   half3 diffuseMat   = half3(volumeUniforms.diffuseColor.rgb);
   half3 specularMat  = half3(volumeUniforms.specularColor.rgb);
@@ -3151,10 +3189,12 @@ inline half4 marchVolumeUnified(
   half accumulatedOpacity = initialOpacity;
 
   // Sample position carried incrementally through the march: advance one ray
-  // step per iteration instead of recomputing
-  // cellToPoint((currentPoint - texMinGlobal) * invTexSizeGlobal) per sample.
+  // step per iteration instead of recomputing. Sampling happens at the raw
+  // normalized volume coordinate, matching the OpenGL backend, which fetches
+  // the volume at g_dataPos directly (raw texture coordinates) rather than at
+  // cell-to-point adjusted positions.
   float3 texLocalPos0 = (currentPoint - p.texMinGlobal) * invTexSizeGlobal;
-  float3 evalPoint = cellToPointTextureCoord(texLocalPos0, ctpScale, ctpOffset);
+  float3 evalPoint = texLocalPos0;
   float prefetchScalar = sampleVolumeScalar(volumeTexture, evalPoint);
   float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint, level(0)).r : 0.0;
   bool prefetchValid = true;
@@ -3206,7 +3246,7 @@ inline half4 marchVolumeUnified(
         }
 
         // Re-sync the incremental sample position after the empty-cell jump.
-        evalPoint = cellToPointTextureCoord((currentPoint - p.texMinGlobal) * invTexSizeGlobal, ctpScale, ctpOffset);
+        evalPoint = (currentPoint - p.texMinGlobal) * invTexSizeGlobal;
         prefetchValid = false;
         curCell = int3(-1);
         continue;
@@ -3234,7 +3274,12 @@ inline half4 marchVolumeUnified(
     half4 colorOpacity;
     half maskLabel = 0.0h;
 
-    if (doMask) {
+    if (doTransfer2D) {
+      half secondNorm = saturate(
+          half(sampleSecondScalar(transfer2DYAxisTexture, evalPoint)) * secondScale + secondBias);
+      colorOpacity = sampleTransferFunction2D(
+          transferFunction2DTexture, float2(float(scalarNorm), float(secondNorm)));
+    } else if (doMask) {
       float maskVal = rawMask * maskScale + maskBias;
       if (numLabels > 0.0) {
         float label = floor(maskVal + 0.5);
@@ -3254,6 +3299,13 @@ inline half4 marchVolumeUnified(
     }
 
     half sampleOpacity = colorOpacity.a;
+    // RenderToImage depth: record the world position of the first non-skipped
+    // sample whose transfer-function opacity is positive (matches the OpenGL
+    // backend's l_opaqueFragPos update).
+    if (haveOpaquePos != nullptr && *haveOpaquePos && sampleOpacity > 0.0h) {
+      *firstOpaquePos = currentPoint;
+      *haveOpaquePos = false;
+    }
     // Opacity pre-integration is baked into the transfer function texture
     // on the CPU at TF-build time (matches OpenGL backend).
 
@@ -3352,6 +3404,8 @@ inline half4 marchVolume(
     constant PerBlockData& b,
     texture3d<float> volumeTexture,
     texture2d<float> transferFunctionTexture,
+    texture2d<float> transferFunction2DTexture,
+    texture3d<float> transfer2DYAxisTexture,
     texture2d<float> depthTexture,
     texture2d<float> gradientOpacityTexture,
     texture3d<float> maskTexture,
@@ -3368,8 +3422,10 @@ inline half4 marchVolume(
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, true};
   return marchVolumeUnified(p, initialColor, initialOpacity,
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
+      transferFunction2DTexture, transfer2DYAxisTexture,
       gradientOpacityTexture, maskTexture, labelMapTransferTexture,
-      minMaxTexture, normalTexture, lightUniforms);
+      minMaxTexture, normalTexture, lightUniforms,
+      nullptr, nullptr);
 }
 
 inline void marchSegment(
@@ -3386,6 +3442,8 @@ inline void marchSegment(
     constant PerBlockData& b,
     texture3d<float> volumeTexture,
     texture2d<float> transferFunctionTexture,
+    texture2d<float> transferFunction2DTexture,
+    texture3d<float> transfer2DYAxisTexture,
     texture2d<float> gradientOpacityTexture,
     texture3d<float> maskTexture,
     texture2d<float> labelMapTransferTexture,
@@ -3399,8 +3457,10 @@ inline void marchSegment(
       zero, one, zero, one, false};
   half4 result = marchVolumeUnified(p, accumulatedColor, accumulatedOpacity,
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
+      transferFunction2DTexture, transfer2DYAxisTexture,
       gradientOpacityTexture, maskTexture, labelMapTransferTexture,
-      minMaxTexture, normalTexture, lightUniforms);
+      minMaxTexture, normalTexture, lightUniforms,
+      nullptr, nullptr);
   accumulatedColor = result.xyz;
   accumulatedOpacity = result.w;
 }
@@ -3417,6 +3477,8 @@ fragment VolumeFragmentOut fragment_volume_main(
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
     texture3d<float> normalTexture [[texture(7)]],
+    texture2d<float> transferFunction2DTexture [[texture(9)]],
+    texture3d<float> transfer2DYAxisTexture [[texture(10)]],
     constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
 
   VolumeFragmentOut output;
@@ -3438,7 +3500,8 @@ fragment VolumeFragmentOut fragment_volume_main(
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos,
       stepSize, s.totalBoxT, in.position.xy,
       half3(0.0), 0.0h, volumeUniforms, b,
-      volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture,
+      volumeTexture, transferFunctionTexture, transferFunction2DTexture, transfer2DYAxisTexture,
+      depthTexture, gradientOpacityTexture,
       maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
       &volumeLights);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
@@ -3463,6 +3526,8 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
     texture3d<float> normalTexture [[texture(7)]],
+    texture2d<float> transferFunction2DTexture [[texture(9)]],
+    texture3d<float> transfer2DYAxisTexture [[texture(10)]],
     constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
 
   VolumeFragmentOut output;
@@ -3481,17 +3546,95 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos,
       stepSize, s.totalBoxT, in.position.xy,
       half3(0.0), 0.0h, volumeUniforms, b,
-      volumeTexture, transferFunctionTexture, depthTexture, gradientOpacityTexture,
+      volumeTexture, transferFunctionTexture, transferFunction2DTexture, transfer2DYAxisTexture,
+      depthTexture, gradientOpacityTexture,
       maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
       &volumeLights);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
 
-// ============================================================================
-// Grid traversal for partitioned volume rendering.
-// Single-pass front-to-back brick grid traversal using 3D DDA.
-// ============================================================================
+// RenderToImage fragment shader: proxy-geometry ray-cast that additionally
+// exports a depth image. color(0) holds the composited color, color(1) holds
+// the NDC depth (mapped to [0,1]) of the first sample whose transfer-function
+// opacity is positive (1.0 when the ray passes the volume without accumulating
+// opacity). Mirrors fragment_volume_main so the render matches the on-screen
+// (proxy-geometry) path.
+fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    texture2d<float> gradientOpacityTexture [[texture(3)]],
+    texture3d<float> maskTexture [[texture(4)]],
+    texture2d<float> labelMapTransferTexture [[texture(5)]],
+    texture3d<float> minMaxTexture [[texture(6)]],
+    texture3d<float> normalTexture [[texture(7)]],
+    texture2d<float> transferFunction2DTexture [[texture(9)]],
+    texture3d<float> transfer2DYAxisTexture [[texture(10)]],
+    constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
+
+  VolumeFragmentOutRTT output;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  float3 rayDir = in.localPos - cameraPos;
+  float dirLength = length(rayDir);
+  if (dirLength < 0.0001) { output.color = float4(0.0); output.depth = 1.0; return output; }
+  rayDir /= dirLength;
+
+  RaySetup s = setupVolumeRay(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { output.color = float4(0.0); output.depth = 1.0; return output; }
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  float jitter = (volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) : 1.0) * stepSize;
+  float tStart = dot(s.entryPoint - cameraPos, rayDir);
+  MarchParams p = {cameraPos, rayDir, tStart, s.totalBoxT, stepSize, jitter, s.tTerminateMax,
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, true};
+
+  float3 firstOpaquePos = float3(-1.0);
+  bool searching = true;
+  if (volumeUniforms.clampDepthToBackface > 0.5) {
+    firstOpaquePos = s.entryPoint;
+  }
+
+  half4 _marchResult = marchVolumeUnified(p, half3(0.0), 0.0h,
+      volumeUniforms, b, volumeTexture, transferFunctionTexture,
+      transferFunction2DTexture, transfer2DYAxisTexture,
+      gradientOpacityTexture, maskTexture, labelMapTransferTexture,
+      minMaxTexture, normalTexture, &volumeLights,
+      &firstOpaquePos, &searching);
+
+  output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
+
+  // searching == false means the march recorded the first opaque sample.
+  // If no sample accumulated opacity, fall back to the entry point when
+  // clamping to the backface is requested, otherwise emit depth 1.0.
+  // The march operates in volume-normalized space ([0,1] box); transform the
+  // recorded position to world space before projecting (mirrors the OpenGL
+  // backend's in_volumeMatrix[0] * in_textureDatasetMatrix[0] chain). The Metal
+  // projection maps clip Z to [0,1] (nearz=0, farz=1), which is already the
+  // [0,1] depth range expected by GetDepthImage consumers.
+  float3 firstOpaqueWorld = volumeUniforms.volumeBoundsMin.xyz +
+      firstOpaquePos * (volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz);
+  float4 clipPos = volumeUniforms.viewProjection * float4(firstOpaqueWorld, 1.0);
+  float ndcZ = clamp(clipPos.z / clipPos.w, 0.0, 1.0);
+  if (searching) {
+    if (volumeUniforms.clampDepthToBackface > 0.5) {
+      output.depth = ndcZ;
+    } else {
+      output.depth = 1.0;
+    }
+  } else {
+    output.depth = ndcZ;
+  }
+  return output;
+}
+
 
 struct GridTraversalUniforms {
     int gridDimsX;          // nx
@@ -3621,6 +3764,8 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
     texture3d<float> minMaxTexture [[texture(6)]],
     texture3d<float> normalTexture [[texture(7)]],
     texture3d<float> brickOccupancy [[texture(8)]],
+    texture2d<float> transferFunction2DTexture [[texture(9)]],
+    texture3d<float> transfer2DYAxisTexture [[texture(10)]],
     constant VolumeLightUniforms& volumeLights [[buffer(4)]])
 {
     VolumeFragmentOut output;
@@ -3751,6 +3896,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
                     color, opacity,
                     volumeUniforms, b,
                     volumeTexture, transferFunctionTexture,
+                    transferFunction2DTexture, transfer2DYAxisTexture,
                     gradientOpacityTexture, maskTexture, labelMapTransferTexture,
                     minMaxTexture, normalTexture,
                     &volumeLights);

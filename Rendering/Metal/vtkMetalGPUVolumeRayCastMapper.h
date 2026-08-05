@@ -11,17 +11,21 @@
 #include "vtkGPUVolumeRayCastMapper.h"
 #include "vtkOverrideAttribute.h"
 #include "vtkRenderingMetalModule.h" // For export macro
+#include "vtkSmartPointer.h"         // For vtkSmartPointer
 #include "vtkTimeStamp.h"            // For time stamp
 #include "vtkWrappingHints.h"        // For VTK_MARSHALAUTO
 
 #include <array>        // For std::array
 #include <vector>       // For std::vector
+#include <string>       // For std::string
 #include <unordered_map> // For pipeline cache
 #include <functional>    // For std::hash
 
 class vtkDataArray;
+class vtkDataSet;
 class vtkImageData;
 class vtkPiecewiseFunction;
+class vtkRenderWindow;
 class vtkVolume;
 
 // Forward declarations for types defined in the .mm file.
@@ -37,7 +41,8 @@ enum class VolumePipelineType : uint32_t
   FullscreenDirect = 3,      // Fullscreen ray-cast for camera-inside (BGRA8Unorm + depth)
   FullscreenOffscreen = 4,   // Fullscreen ray-cast for camera-inside (RGBA16Float, no depth)
   GridTraversalDirect = 5,   // Single-pass grid traversal fullscreen (BGRA8Unorm + depth)
-  GridTraversalOffscreen = 6 // Single-pass grid traversal fullscreen (RGBA16Float, no depth)
+  GridTraversalOffscreen = 6, // Single-pass grid traversal fullscreen (RGBA16Float, no depth)
+  RenderToImage = 7           // RenderToImage (RGBA16Float color + R32Float depth export)
 };
 
 struct VolumePipelineKey
@@ -95,6 +100,8 @@ public:
 
   void GPURender(vtkRenderer* ren, vtkVolume* vol) override;
 
+  int IsRenderSupported(vtkRenderWindow* window, vtkVolumeProperty* property) override;
+
   void ReleaseGraphicsResources(vtkWindow* window) override;
 
   void GetReductionRatio(double ratio[3]) override;
@@ -124,6 +131,10 @@ public:
 
   void SetUsePrecomputedNormals(bool val) { this->UsePrecomputedNormals = val; }
   bool GetUsePrecomputedNormals() const { return this->UsePrecomputedNormals; }
+
+  // RenderToImage support (low-level color/depth texture export).
+  void GetColorImage(vtkImageData*) override;
+  void GetDepthImage(vtkImageData*) override;
 
   void SetPreferHalfPrecision(bool val) { this->PreferHalfPrecision = val; }
   bool GetPreferHalfPrecision() const { return this->PreferHalfPrecision; }
@@ -158,6 +169,13 @@ private:
 
   void* ColorOpacityTexture = nullptr;   // id<MTLTexture>  (2D)
   void* GradientOpacityTexture = nullptr; // id<MTLTexture> (256x1 RGBA8Unorm)
+  void* Transfer2DTexture = nullptr;     // id<MTLTexture> (2D RGBA16Float) — 2D transfer function image
+  void* Transfer2DYAxisTexture = nullptr; // id<MTLTexture> (3D R16Float/R32Float) — Y-axis scalar array (e.g. "Temp")
+  vtkTimeStamp Transfer2DUploadTime;
+  vtkTimeStamp Transfer2DYAxisUploadTime;
+  double Transfer2DYAxisRange[2] = { 0.0, 1.0 }; // value range of the Y-axis array
+  std::string Transfer2DYAxisArrayName;        // cached array name to detect changes
+  bool Transfer2DEnabled = false;        // TF_2D mode active and textures ready
   void* MinMaxTexture = nullptr;         // id<MTLTexture> (3D) — 4x downsampled min-max accel
   void* MinMaxScratchTexture = nullptr;  // id<MTLTexture> — reusable scratch occupancy (R8Unorm 3D)
   int MinMaxDims[3] = {};               // dimensions of the min-max texture
@@ -275,6 +293,16 @@ private:
   bool EnsureImageSampleResources(void* device, int width, int height);
   void ReleaseImageSampleResources();
 
+  // RenderToImage (color/depth texture export, vtkGPUVolumeRayCastMapper RTT mode)
+  void* RTTColorTexture = nullptr;   // id<MTLTexture> — window-sized RGBA16Float color
+  void* RTTDepthTexture = nullptr;   // id<MTLTexture> — window-sized R32Float depth image
+  int RTTWidth = 0;
+  int RTTHeight = 0;
+  int RTTDepthScalarType = -1;       // cached DepthImageScalarType to detect changes
+  bool EnsureRTTResources(void* device, int width, int height, int depthScalarType);
+  void ReleaseRTTResources();
+
+
   // Cache/timestamps
   vtkTimeStamp VolumeUploadTime;
   vtkTimeStamp TransferFunctionUploadTime;
@@ -284,10 +312,25 @@ private:
 
   // Helper methods
   bool UpdateVolumeTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
+
+  // Effective-input abstraction: converts vtkRectilinearGrid inputs and
+  // cell-scalar inputs into an equivalent vtkImageData with point scalars so
+  // the remainder of the pipeline (which only understands vtkImageData with
+  // point data) works unchanged. Returns true on success.
+  bool EnsureEffectiveInput();
+  vtkSmartPointer<vtkImageData> EffectiveInput; // vtkImageData proxy (point scalars)
+  vtkSmartPointer<vtkDataSet> EffectiveInputSource; // dataset the proxy was built from
+  vtkTimeStamp EffectiveInputTime;
+
   bool UpdateTransferFunctionTexture(
     void* mtlDevice, void* mtlQueue, vtkVolume* vol,
     double actualSampleDistance);
   bool UpdateGradientOpacityTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
+  // 2D transfer function mode (TF_2D): uploads the 2D lookup image and the
+  // Y-axis scalar array used as its second coordinate.
+  bool UpdateTransfer2DTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
+  bool UpdateTransfer2DYAxisTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol,
+    vtkImageData* input);
   bool UpdateMinMaxTexture(void* mtlDevice, vtkVolume* vol, vtkImageData* input, vtkDataArray* scalars, bool skipGlobalTexture = false);
   bool SetupBuffers(void* mtlDevice, vtkRenderer* ren, vtkVolume* vol, vtkImageData* input);
   bool SetupPipeline(void* mtlDevice, vtkRenderer* ren);
