@@ -3004,17 +3004,21 @@ inline half3 computePhongLightingVolumeFast(half3 sampleColor, half3 normal, hal
 
 // Full multi-light volume shading. Loops over all active lights, accumulating
 // ambient + diffuse + specular contributions. Handles directional, positional,
-// and spot lights with attenuation. Matches OpenGL's ComputeLightingDeclaration.
+// and spot lights with attenuation. Matches OpenGL's ComputeLightingDeclaration:
+// the light direction is the direction the light *travels* (from the light
+// toward the scene / fragment), consistent with in_lightDirection =
+// normalize(focalPoint - position), and vDotR uses -viewDir (OpenGL's
+// dot(-viewDirection, r)).
 inline half3 computeVolumeLighting(
     half3 sampleColor,
     half3 normal,
-    half3 viewDir,           // normalized, pointing toward camera (in volume space)
+    half3 viewDir,           // normalized, pointing toward camera (data space)
     half3 ambientMat,
     half3 diffuseMat,
     half3 specularMat,
     half shininess,
     constant VolumeLightUniforms& lightUniforms,
-    float3 fragPosVolume)    // current sample position in [0,1] volume space
+    float3 fragPosVolume)    // current sample position in data space
 {
     half3 totalAmbient  = half3(0.0h);
     half3 totalDiffuse  = half3(0.0h);
@@ -3034,12 +3038,16 @@ inline half3 computeVolumeLighting(
         half attenuation = 1.0h;
 
         if (L.position.w < 0.5) {
-            // Directional light: direction is pre-normalized in volume space
-            toLight = half3(-L.direction.xyz);
+            // Directional light: direction is pre-normalized in data space and
+            // points along the light's travel direction (OpenGL
+            // in_lightDirection parity).
+            toLight = half3(L.direction.xyz);
         } else {
-            // Positional light: compute direction from fragment to light
+            // Positional light: compute the direction the light travels
+            // (light -> fragment, matching OpenGL's
+            // normalize(fragWorldPos - lightPosition)).
             half3 lightPos = half3(L.position.xyz);
-            half3 delta = lightPos - half3(fragPosVolume);
+            half3 delta = half3(fragPosVolume) - lightPos;
             half dist = length(delta);
             toLight = dist > 0.0001h ? delta / dist : half3(0.0h, 0.0h, 1.0h);
 
@@ -3049,9 +3057,12 @@ inline half3 computeVolumeLighting(
                             + half(L.attenuation.z) * dist * dist;
             attenuation = attenDenom > 0.0h ? 1.0h / attenDenom : 0.0h;
 
-            // Spot light cone check
+            // Spot light cone check: the cone axis is L.direction (the light's
+            // travel direction); a fragment is inside the cone when the
+            // light->fragment direction is within the cone angle of the axis
+            // (OpenGL coneDot = dot(vertLightDirection, lightDir)).
             if (L.direction.w <= 90.0) {
-                half spotCos = dot(-toLight, half3(normalize(L.direction.xyz)));
+                half spotCos = dot(toLight, half3(normalize(L.direction.xyz)));
                 half spotCutoff = half(cos(float(L.direction.w) * (M_PI_F / 180.0)));
                 if (spotCos < spotCutoff) {
                     attenuation = 0.0h;
@@ -3072,7 +3083,7 @@ inline half3 computeVolumeLighting(
             // Phong reflection vector (matches OpenGL's ComputeLightingDeclaration
             // and computePhongLightingVolumeFast)
             half3 r = normalize(normal * (2.0h * nDotL) - toLight);
-            half vDotR = dot(viewDir, r);
+            half vDotR = dot(-viewDir, r);
             if (vDotR < 0.0h && twoSided) {
                 vDotR = -vDotR;
             }
@@ -3729,7 +3740,8 @@ inline half4 marchVolumeUnified(
             if (lightUniforms != nullptr && lightUniforms->defaultLighting == 0) {
               ccRGB = computeVolumeLighting(ccRGB, normal, -viewDirHalf,
                   ambC, difC, speC, shiC,
-                  *lightUniforms, evalPoint);
+                  *lightUniforms,
+                  volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize);
             } else {
               bool twoSided = (lightUniforms != nullptr && lightUniforms->twoSidedLighting != 0);
               // OpenGL headlight convention: light and view directions are the per-pixel
@@ -3775,7 +3787,8 @@ inline half4 marchVolumeUnified(
         if (lightUniforms != nullptr && lightUniforms->defaultLighting == 0) {
           sampleColor = computeVolumeLighting(sampleColor, normal, -viewDirHalf,
               ambientMat, diffuseMat, specularMat, shininessMat,
-              *lightUniforms, evalPoint);
+              *lightUniforms,
+              volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize);
         } else {
           bool twoSided = (lightUniforms != nullptr && lightUniforms->twoSidedLighting != 0);
           // OpenGL headlight convention: light and view directions are the per-pixel

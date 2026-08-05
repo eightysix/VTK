@@ -4698,7 +4698,7 @@ void vtkMetalGPUVolumeRayCastMapper::SetClippingPlaneUniforms(
 //------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::BuildVolumeLightUniforms(
   vtkRenderer* ren, vtkVolume* vol, vtkMatrix4x4* invModelMatrix,
-  const double modelBounds[6], const double boundsSize[3],
+  const double vtkNotUsed(modelBounds)[6], const double vtkNotUsed(boundsSize)[3],
   VolumeLightUniforms& out)
 {
   memset(&out, 0, sizeof(out));
@@ -4762,20 +4762,21 @@ void vtkMetalGPUVolumeRayCastMapper::BuildVolumeLightUniforms(
     }
     L.ambientColor[3] = L.diffuseColor[3] = L.specularColor[3] = 1.0f;
 
-    // Direction: transform to volume-local [0,1] space
+    // Direction: transform to model (data) space.
+    // The gradient normal used by the shader is expressed per data unit
+    // (computeGradientFast), and the shader's view/frag positions are converted
+    // into data space (boundsSize), so the light direction must live in the same
+    // space. OpenGL computes in_lightDirection in eye space; the model-to-eye
+    // transform is rigid, so a data-space direction is equivalent.
     double* lfp = light->GetTransformedFocalPoint();
     double* lp  = light->GetTransformedPosition();
     double lightDir[3];
     vtkMath::Subtract(lfp, lp, lightDir);
     vtkMath::Normalize(lightDir);
 
-    // Transform direction to model space, then to normalized volume space
+    // Transform direction to model space
     double dirLocal[4] = { lightDir[0], lightDir[1], lightDir[2], 0.0 };
     invModelMatrix->MultiplyPoint(dirLocal, dirLocal);
-    // Scale by bounds size for normalized space (direction, not position)
-    dirLocal[0] /= boundsSize[0];
-    dirLocal[1] /= boundsSize[1];
-    dirLocal[2] /= boundsSize[2];
     double dLen = sqrt(dirLocal[0]*dirLocal[0] + dirLocal[1]*dirLocal[1] + dirLocal[2]*dirLocal[2]);
     if (dLen > 1e-10) {
       dirLocal[0] /= dLen; dirLocal[1] /= dLen; dirLocal[2] /= dLen;
@@ -4788,7 +4789,7 @@ void vtkMetalGPUVolumeRayCastMapper::BuildVolumeLightUniforms(
     if (light->GetPositional()) {
       L.position[3] = 1.0f;  // type = positional
 
-      // Transform position to normalized volume [0,1] space
+      // Transform position to model (data) space
       double posWorld[4] = { lp[0], lp[1], lp[2], 1.0 };
       double posLocal[4];
       invModelMatrix->MultiplyPoint(posWorld, posLocal);
@@ -4797,16 +4798,16 @@ void vtkMetalGPUVolumeRayCastMapper::BuildVolumeLightUniforms(
         posLocal[1] /= posLocal[3];
         posLocal[2] /= posLocal[3];
       }
-      for (int a = 0; a < 3; ++a) {
-        L.position[a] = static_cast<float>((posLocal[a] - modelBounds[a * 2]) / boundsSize[a]);
-      }
+      L.position[0] = static_cast<float>(posLocal[0]);
+      L.position[1] = static_cast<float>(posLocal[1]);
+      L.position[2] = static_cast<float>(posLocal[2]);
 
-      // Attenuation
+      // Attenuation (raw values; the shader distance is in data units, which
+      // match OpenGL's eye-space distance up to a rigid transform).
       double* attn = light->GetAttenuationValues();
-      double charSize = std::max({boundsSize[0], boundsSize[1], boundsSize[2]});
       L.attenuation[0] = static_cast<float>(attn[0]);  // constant
-      L.attenuation[1] = static_cast<float>(attn[1] * charSize);  // linear (scaled)
-      L.attenuation[2] = static_cast<float>(attn[2] * charSize * charSize);  // quadratic (scaled)
+      L.attenuation[1] = static_cast<float>(attn[1]);  // linear
+      L.attenuation[2] = static_cast<float>(attn[2]);  // quadratic
       L.attenuation[3] = static_cast<float>(light->GetExponent());  // spot exponent
     } else {
       L.position[3] = 0.0f;  // type = directional
