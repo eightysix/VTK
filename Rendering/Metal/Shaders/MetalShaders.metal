@@ -3860,8 +3860,8 @@ fragment float4 fragment_image_sample_blit(
 // vtkOpenGLRayCastImageDisplayHelper.
 // ---------------------------------------------------------------------------
 struct RayCastDisplayVertex {
-  float4 position;  // NDC xyz (w unused)
-  float2 texCoord;
+  float x, y, z, w;  // NDC xyz (w unused) - plain floats, 16 bytes
+  float u, v;        // 8 bytes -> 24-byte stride matching the C++ side
 };
 
 struct RayCastDisplayVertexOut {
@@ -3873,8 +3873,8 @@ vertex RayCastDisplayVertexOut vertex_raycast_display(
     const device RayCastDisplayVertex* verts [[buffer(0)]],
     uint vertex_id [[vertex_id]]) {
   RayCastDisplayVertexOut out;
-  out.position = float4(verts[vertex_id].position.xyz, 1.0);
-  out.texCoord = verts[vertex_id].texCoord;
+  out.position = float4(verts[vertex_id].x, verts[vertex_id].y, verts[vertex_id].z, 1.0);
+  out.texCoord = float2(verts[vertex_id].u, verts[vertex_id].v);
   return out;
 }
 
