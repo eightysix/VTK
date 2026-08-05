@@ -289,47 +289,6 @@ inline uint16_t FloatToHalf(float f)
 #endif
 }
 
-// Decode IEEE 754 half-precision bits back to a float (diagnostics / CPU
-// readback). Mirrors FloatToHalf on the encode side.
-inline float HalfToFloatBits(uint16_t h)
-{
-  uint32_t sign = static_cast<uint32_t>(h & 0x8000) << 16;
-  uint32_t exponent = (h >> 10) & 0x1F;
-  uint32_t mantissa = h & 0x3FF;
-  uint32_t f;
-  if (exponent == 0)
-  {
-    if (mantissa == 0)
-    {
-      f = sign;
-    }
-    else
-    {
-      // Denormal: normalize into a normal float
-      int e = -1;
-      uint32_t m = mantissa;
-      do
-      {
-        ++e;
-        m <<= 1;
-      } while ((m & 0x400) == 0);
-      m &= 0x3FF;
-      f = sign | ((uint32_t)(127 - 15 - e) << 23) | (m << 13);
-    }
-  }
-  else if (exponent == 31)
-  {
-    f = sign | 0x7F800000 | (mantissa << 13);
-  }
-  else
-  {
-    f = sign | ((uint32_t)(exponent - 15 + 127) << 23) | (mantissa << 13);
-  }
-  float result;
-  std::memcpy(&result, &f, sizeof(result));
-  return result;
-}
-
 // Returns true when half-float can safely represent the full scalar range.
 inline bool HalfRangeIsSafe(double r0, double r1)
 {
@@ -1469,7 +1428,9 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureRTTResources(
   {
     id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
 
-    id<MTLTexture> colorTex = NewTexture2D(device, MTLPixelFormatRGBA16Float, width, height,
+    // RGBA8 matches the OpenGL RenderToImage color target
+    // (Create2D(w, h, 4, VTK_UNSIGNED_CHAR)); GetColorImage outputs uchar anyway.
+    id<MTLTexture> colorTex = NewTexture2D(device, MTLPixelFormatRGBA8Unorm, width, height,
       MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, MTLStorageModeShared);
     if (!colorTex)
     {
@@ -2224,7 +2185,7 @@ void vtkMetalGPUVolumeRayCastMapper::GetColorImage(vtkImageData* output)
 {
   if (!output || !this->RTTColorTexture || this->RTTWidth <= 0 || this->RTTHeight <= 0)
   {
-    vtkErrorMacro("RTT_DEBUG GetColorImage early return: tex=" << (this->RTTColorTexture ? "set" : "null")
+    vtkErrorMacro("GetColorImage early return: tex=" << (this->RTTColorTexture ? "set" : "null")
       << " w=" << this->RTTWidth << " h=" << this->RTTHeight);
     return;
   }
@@ -2247,7 +2208,7 @@ void vtkMetalGPUVolumeRayCastMapper::GetColorImage(vtkImageData* output)
     output->AllocateScalars(VTK_UNSIGNED_CHAR, 4);
 
     unsigned char* ptr = static_cast<unsigned char*>(output->GetScalarPointer());
-    const NSUInteger bytesPerRow = static_cast<NSUInteger>(w) * 8; // RGBA16Float
+    const NSUInteger bytesPerRow = static_cast<NSUInteger>(w) * 4; // RGBA8Unorm
     void* tmp = malloc(bytesPerRow * static_cast<NSUInteger>(h));
     if (!tmp)
     {
@@ -2259,24 +2220,16 @@ void vtkMetalGPUVolumeRayCastMapper::GetColorImage(vtkImageData* output)
            fromRegion:MTLRegionMake2D(0, 0, w, h)
           mipmapLevel:0 slice:0];
 
-    __fp16* src = static_cast<__fp16*>(tmp);
+    unsigned char* src = static_cast<unsigned char*>(tmp);
     // Metal getBytes returns the top texture row first; vtkImageData expects
     // the first row at the bottom of the image (matching OpenGL readback), so
-    // flip rows vertically.
+    // flip rows vertically. The RGBA8Unorm bytes are already 0-255.
     for (int y = 0; y < h; ++y)
     {
-      for (int x = 0; x < w; ++x)
-      {
-        const __fp16* s = src + 4 * (y * w + x);
-        const int dstRow = (h - 1 - y);
-        unsigned char* o = ptr + 4 * (dstRow * w + x);
-        for (int c = 0; c < 4; ++c)
-        {
-          float v = (float)s[c];
-          v = (v < 0.0f) ? 0.0f : ((v > 1.0f) ? 1.0f : v);
-          o[c] = static_cast<unsigned char>(v * 255.0f + 0.5f);
-        }
-      }
+      const unsigned char* s = src + 4 * (y * w);
+      const int dstRow = (h - 1 - y);
+      unsigned char* o = ptr + 4 * (dstRow * w);
+      std::memcpy(o, s, 4 * static_cast<NSUInteger>(w));
     }
   }
 }
@@ -2515,20 +2468,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
   if (!scalars)
   {
     return false;
-  }
-
-  // TEMP DEBUG
-  {
-    int ddims[3];
-    input->GetDimensions(ddims);
-    vtkIdType cIdx = ((ddims[2] / 2) * ddims[1] + ddims[1] / 2) * ddims[0] + ddims[0] / 2;
-    double rng[2];
-    scalars->GetRange(rng);
-    std::cout << "[UVT] name=" << (scalars->GetName() ? scalars->GetName() : "-")
-              << " nc=" << scalars->GetNumberOfComponents() << " range=[" << rng[0] << "," << rng[1] << "]"
-              << " centerVal=" << scalars->GetComponent(cIdx, 0)
-              << " activeScalars=" << (input->GetPointData()->GetScalars() ? input->GetPointData()->GetScalars()->GetName() : "(null)")
-              << std::endl;
   }
 
   bool doReload = (this->VolumeTexture == nullptr);
@@ -2968,26 +2907,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
         this->ScalarRange[0], this->ScalarRange[1],
         tfWidth, tfData.data(),
         preIntegrationFactor);
-
-      // TEMP DEBUG: dump TF table stats
-      {
-        float maxA = 0.0f, minA = 1.0f, maxR = 0.0f;
-        for (int i = 0; i < tfWidth; ++i)
-        {
-          float a = HalfToFloatBits(tfData[i * 4 + 3]);
-          float r = HalfToFloatBits(tfData[i * 4 + 0]);
-          maxA = std::max(maxA, a); minA = std::min(minA, a);
-          maxR = std::max(maxR, r);
-        }
-        std::cout << "[TFDBG] range=[" << this->ScalarRange[0] << "," << this->ScalarRange[1]
-                  << "] alphaMin=" << minA << " alphaMax=" << maxA
-                  << " colorMaxR=" << maxR
-                  << " preIntFactor=" << preIntegrationFactor
-                  << " blendMode=" << (this->GetBlendMode())
-                  << " indep=" << (property->GetIndependentComponents() ? 1 : 0)
-                  << " tfMode=" << static_cast<int>(property->GetTransferFunctionMode())
-                  << std::endl;
-      }
 
       // Swap rather than rewrite: in-flight frames on the GPU may still be
       // sampling the old texture.  Metal command buffers retain a strong
@@ -5462,20 +5381,6 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     this->ScalarRange[1] = 1.0;
   }
 
-  // TEMP DEBUG
-  {
-    int ddims[3];
-    input->GetDimensions(ddims);
-    int nc = scalars ? scalars->GetNumberOfComponents() : -1;
-    const char* an = scalars ? scalars->GetName() : "(null)";
-    std::cout << "[MDBG2] GPURender dims=" << ddims[0] << "x" << ddims[1] << "x" << ddims[2]
-              << " nc=" << nc << " name=" << (an ? an : "-")
-              << " scalarRange=[" << this->ScalarRange[0] << "," << this->ScalarRange[1] << "]"
-              << " tfMode=" << (vol->GetProperty() ? static_cast<int>(vol->GetProperty()->GetTransferFunctionMode()) : -1)
-              << " has2D=" << (vol->GetProperty() && vol->GetProperty()->GetTransferFunction2D() ? 1 : 0)
-              << std::endl;
-  }
-
   // Phase 5: GPU-accelerated min-max generation.
   // For single-block volumes with UseGPUMinMax, we must upload the volume
   // texture first, then dispatch compute kernels. For partitioned volumes
@@ -6043,7 +5948,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
     void* rttPso = this->GetOrCreateVolumePipeline(mtlDevice,
       static_cast<uint32_t>(VolumePipelineType::RenderToImage),
-      MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, featureMask);
+      MTLPixelFormatRGBA8Unorm, MTLPixelFormatInvalid, 1, featureMask);
     if (!rttPso) { [rttEnc endEncoding]; return; }
 
     [rttEnc setFragmentBytes:&lightUniforms length:sizeof(lightUniforms) atIndex:4];

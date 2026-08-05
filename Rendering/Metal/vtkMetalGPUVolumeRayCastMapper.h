@@ -294,7 +294,7 @@ private:
   void ReleaseImageSampleResources();
 
   // RenderToImage (color/depth texture export, vtkGPUVolumeRayCastMapper RTT mode)
-  void* RTTColorTexture = nullptr;   // id<MTLTexture> — window-sized RGBA16Float color
+  void* RTTColorTexture = nullptr;   // id<MTLTexture> — window-sized RGBA8Unorm color
   void* RTTDepthTexture = nullptr;   // id<MTLTexture> — window-sized R32Float depth image
   int RTTWidth = 0;
   int RTTHeight = 0;
