@@ -1,41 +1,42 @@
 Metal volume image-compare failures (run: Aug 05 2026, full RenderingVolumeCxx-Metal suite)
 
-32 image-compare failures (TIGHT_VALID threshold 0.05):
+Blend-mode (MIP/MinIP/AverageIP/Additive) and binary-mask support is now implemented
+in the Metal volume ray-cast backend. This fixes TestGPURayCastAverageIP,
+TestGPURayCastMIPBinaryMask, and also TestGPURayCastCompositeBinaryMask1 /
+TestGPURayCastCompositeBinaryMask (previously failing because the mask was ignored).
+
+28 image-compare failures (TIGHT_VALID threshold 0.05):
   gross (>=0.5):
-    TestGPURayCastCameraInsideSmallSpacing    0.564738
-    TestGPURayCastThreeComponentsAdditive     0.604790
+    TestGPURayCastThreeComponentsAdditive    0.525820
+    TestGPURayCastCameraInsideSmallSpacing   0.564738
   mid (0.1-0.5):
-    TestGPURayCastCompositeBinaryMask1         0.107602
-    TestGPURayCastVolumePicking                0.123568
-    TestGPURayCastAverageIP                    0.128444
-    TestGPURayCastPositionalLights             0.147344
+    TestGPURayCastVolumePicking              0.123568
+    TestSmartVolumeMapperWindowLevel         0.140651
+    TestGPURayCastPositionalLights           0.147344
     TestGPURayCastFourComponentsDependentGradient 0.162799
-    TestGPURayCastVolumeGhostArrays            0.164621
-    TestGPURayCastCameraInside                 0.165599
-    TestGPURayCastCameraInsideTransformation   0.196790
-    TestGPURayCastComputeNormalFromOpacity     0.212580
-    TestGPURayCastVolumeLightKit               0.222312
+    TestGPURayCastVolumeGhostArrays          0.164621
+    TestGPURayCastCameraInside               0.165599
+    TestGPURayCastCameraInsideTransformation 0.196790
+    TestGPURayCastComputeNormalFromOpacity   0.212580
+    TestGPURayCastVolumeLightKit             0.222312
     TestGPURayCastTwoComponentsDependentGradient 0.228205
-    TestSmartVolumeMapperWindowLevel           0.241087
-    TestGPURayCastTwoComponentsDependent       0.295232
-    TestGPURayCastLargeColorTransferFunction   0.325402
-    TestGPURayCastClippingUserTransform        0.329561
-    TestGPURayCastCompositeBinaryMask          0.330325
-    TestGPURayCastMIPBinaryMask                0.335253
-    TestGPURayCastTwoComponentsIndependent     0.337196
-    TestGPURayCastMapperRectilinearGrid        0.386168
-    TestGPURayCastThreeComponentsIndependent   0.415203
-    TestGPURayCastOrientedVolume               0.430471
-    TestGPURayCastTwoComponentsGradient        0.449477
+    TestGPURayCastTwoComponentsDependent     0.295232
+    TestGPURayCastLargeColorTransferFunction 0.325402
+    TestGPURayCastClippingUserTransform      0.326917
+    TestGPURayCastTwoComponentsIndependent   0.337196
+    TestGPURayCastMapperRectilinearGrid      0.386168
+    TestGPURayCastThreeComponentsIndependent 0.415203
+    TestGPURayCastOrientedVolume             0.430471
+    TestGPURayCastTwoComponentsGradient      0.449477
   near-miss (0.05-0.1):
-    TestGPURayCastRenderToTexture              0.050107
-    TestSmartVolumeMapperVolumeUpdate          0.052489
-    TestMultiBlockMapperRectilinearGrid        0.054150
-    TestGPURayCastCropping1                    0.054390
-    TestMultiBlockMapper                       0.057540
+    TestGPURayCastRenderToTexture            0.050107
+    TestSmartVolumeMapperVolumeUpdate        0.052489
+    TestMultiBlockMapperRectilinearGrid      0.054150
+    TestGPURayCastCropping1                  0.054390
+    TestMultiBlockMapper                     0.057540
     TestGPURayCastCameraInsideNonUniformScaleTransform 0.069706
-    TestGPURayCastVolumeUniformGridBlanking    0.070561
-    TestGPURayCastShadedClipping               0.083452
+    TestGPURayCastVolumeUniformGridBlanking  0.070561
+    TestGPURayCastShadedClipping             0.083452
 
 12 non-image failures (crash / pick-check, no render exported):
     ProjectedTetrahedraZoomIn

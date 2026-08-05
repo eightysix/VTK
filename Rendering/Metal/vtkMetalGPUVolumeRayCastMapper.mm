@@ -138,10 +138,13 @@ struct VolumeMapperUniforms
   float UseTransfer2D;            // 984  yNorm = yRaw * scale + bias
   float Transfer2DYAxisScale;     // 988
   float Transfer2DYAxisBias;      // 992
+  float AverageIPRangeMin;        // 996  (native scalar units / ScalarNormalizationFactor)
+  float AverageIPRangeMax;        // 1000
+  float MaskType;                 // 1004  (0=label map, 1=binary mask)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 996,
-  "VolumeMapperUniforms must be 996 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1008,
+  "VolumeMapperUniforms must be 1008 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -151,6 +154,9 @@ static_assert(offsetof(VolumeMapperUniforms, UseMask) == 928, "");
 static_assert(offsetof(VolumeMapperUniforms, UseDepthTexture) == 948, "");
 static_assert(offsetof(VolumeMapperUniforms, UseNormalTexture) == 952, "");
 static_assert(offsetof(VolumeMapperUniforms, UseMinMaxAccel) == 960, "");
+static_assert(offsetof(VolumeMapperUniforms, AverageIPRangeMin) == 996, "");
+static_assert(offsetof(VolumeMapperUniforms, AverageIPRangeMax) == 1000, "");
+static_assert(offsetof(VolumeMapperUniforms, MaskType) == 1004, "");
 
 // Per-light data for volume shading — must match Metal VolumeLight struct
 // Must match Metal VolumeLight (6 x float4 = 96 bytes per light)
@@ -175,6 +181,25 @@ struct VolumeLightUniforms {
 
 static_assert(sizeof(VolumeLightUniforms) == 800,
   "VolumeLightUniforms must be 800 bytes to match Metal shader struct");
+
+// Map vtkVolumeMapper::BlendMode to the VolumeShaderFeatureFlags bit used to
+// specialize the fc_blendMode function constant (composite → no flag).
+static uint32_t BlendModeToFeatureFlag(int blendMode)
+{
+  switch (blendMode)
+  {
+    case vtkVolumeMapper::MAXIMUM_INTENSITY_BLEND:
+      return VolumeFeature_BlendMaximumIntensity;
+    case vtkVolumeMapper::MINIMUM_INTENSITY_BLEND:
+      return VolumeFeature_BlendMinimumIntensity;
+    case vtkVolumeMapper::AVERAGE_INTENSITY_BLEND:
+      return VolumeFeature_BlendAverageIntensity;
+    case vtkVolumeMapper::ADDITIVE_BLEND:
+      return VolumeFeature_BlendAdditive;
+    default:
+      return 0;
+  }
+}
 
 // Per-block data for volume rendering — must match Metal PerBlockData struct
 struct PerBlockData {
@@ -3551,90 +3576,109 @@ void vtkMetalGPUVolumeRayCastMapper::SetMaskUniforms(void* uniforms, vtkVolume* 
 
   vtkImageData* maskInput = this->MaskInput;
   vtkVolumeProperty* property = vol->GetProperty();
+  const bool hasMask =
+    maskInput && property &&
+    (this->MaskType == vtkGPUVolumeRayCastMapper::LabelMapMaskType ||
+      this->MaskType == vtkGPUVolumeRayCastMapper::BinaryMaskType);
 
-  if (maskInput && property &&
-      this->MaskType == vtkGPUVolumeRayCastMapper::LabelMapMaskType)
+  if (hasMask)
   {
     u->UseMask = 1.0f;
     u->MaskBlendFactor = this->MaskBlendFactor;
-    u->MaskScale = 1.0f;  // Default scale for unsigned char mask
-    u->MaskBias = 0.0f;   // Default bias for unsigned char mask
+    u->MaskType = (this->MaskType == vtkGPUVolumeRayCastMapper::BinaryMaskType) ? 1.0f : 0.0f;
 
-    // Compute mask scale/bias based on the mask data type
-    int cellFlag = 0;
-    vtkDataArray* arr = this->GetScalars(
-      maskInput, this->ScalarMode, this->ArrayAccessMode,
-      this->ArrayId, this->ArrayName, cellFlag);
-    if (arr)
+    if (this->MaskType == vtkGPUVolumeRayCastMapper::BinaryMaskType)
     {
-      int dataType = arr->GetDataType();
-      if (dataType == VTK_UNSIGNED_CHAR)
-      {
-        u->MaskScale = 1.0f / 255.0f;
-        u->MaskBias = 0.0f;
-      }
-      else if (dataType == VTK_CHAR)
-      {
-        u->MaskScale = 2.0f / 255.0f;
-        u->MaskBias = -1.0f;
-      }
-      else if (dataType == VTK_UNSIGNED_SHORT)
-      {
-        u->MaskScale = 1.0f / 65535.0f;
-        u->MaskBias = 0.0f;
-      }
-      else if (dataType == VTK_SHORT)
-      {
-        u->MaskScale = 2.0f / 65535.0f;
-        u->MaskBias = -1.0f;
-      }
-      else
-      {
-        // For float or other types, compute from range
-        double range[2];
-        arr->GetRange(range);
-        double dataRange = range[1] - range[0];
-        if (dataRange > 0.0)
-        {
-          u->MaskScale = static_cast<float>(1.0 / dataRange);
-          u->MaskBias = static_cast<float>(-range[0] / dataRange);
-        }
-      }
-    }
-
-    // Get the number of labels for quantization
-    // numLabels = maxLabel + 1, so the shader can use label indices directly.
-    std::set<int> labels = property->GetLabelMapLabels();
-    int maxLabel = labels.empty() ? 0 : *(labels.rbegin());
-    int numLabels = labels.empty() ? 0 : maxLabel + 1;
-    u->LabelMapNumLabels = static_cast<float>(numLabels);
-    // Determine scale to convert sampled mask value back to label index.
-    // Unorm formats normalize to [0,1] at sample time, so we scale back.
-    id<MTLTexture> maskTex = (__bridge id<MTLTexture>)this->MaskTexture;
-    if (maskTex)
-    {
-      switch (maskTex.pixelFormat)
-      {
-        case MTLPixelFormatR8Unorm:
-          u->MaskScale = 255.0f;
-          break;
-        case MTLPixelFormatR16Unorm:
-          u->MaskScale = 65535.0f;
-          break;
-        default:
-          u->MaskScale = 1.0f;
-          break;
-      }
+      // Binary mask: samples whose mask value (raw * scale + bias) is <= 0 are
+      // skipped by the shader (mirrors OpenGL's BinaryMaskImplementation).
+      // The mask texture is unorm-normalized at sample time, so scale=1/bias=0
+      // recovers the [0,1] value directly (0 → skipped, 1 → kept).
+      u->MaskScale = 1.0f;
+      u->MaskBias = 0.0f;
+      u->LabelMapNumLabels = 0.0f;
     }
     else
     {
-      u->MaskScale = 1.0f;
+      u->MaskScale = 1.0f;  // Default scale for unsigned char mask
+      u->MaskBias = 0.0f;   // Default bias for unsigned char mask
+
+      // Compute mask scale/bias based on the mask data type
+      int cellFlag = 0;
+      vtkDataArray* arr = this->GetScalars(
+        maskInput, this->ScalarMode, this->ArrayAccessMode,
+        this->ArrayId, this->ArrayName, cellFlag);
+      if (arr)
+      {
+        int dataType = arr->GetDataType();
+        if (dataType == VTK_UNSIGNED_CHAR)
+        {
+          u->MaskScale = 1.0f / 255.0f;
+          u->MaskBias = 0.0f;
+        }
+        else if (dataType == VTK_CHAR)
+        {
+          u->MaskScale = 2.0f / 255.0f;
+          u->MaskBias = -1.0f;
+        }
+        else if (dataType == VTK_UNSIGNED_SHORT)
+        {
+          u->MaskScale = 1.0f / 65535.0f;
+          u->MaskBias = 0.0f;
+        }
+        else if (dataType == VTK_SHORT)
+        {
+          u->MaskScale = 2.0f / 65535.0f;
+          u->MaskBias = -1.0f;
+        }
+        else
+        {
+          // For float or other types, compute from range
+          double range[2];
+          arr->GetRange(range);
+          double dataRange = range[1] - range[0];
+          if (dataRange > 0.0)
+          {
+            u->MaskScale = static_cast<float>(1.0 / dataRange);
+            u->MaskBias = static_cast<float>(-range[0] / dataRange);
+          }
+        }
+      }
+
+      // Get the number of labels for quantization
+      // numLabels = maxLabel + 1, so the shader can use label indices directly.
+      std::set<int> labels = property->GetLabelMapLabels();
+      int maxLabel = labels.empty() ? 0 : *(labels.rbegin());
+      int numLabels = labels.empty() ? 0 : maxLabel + 1;
+      u->LabelMapNumLabels = static_cast<float>(numLabels);
+      // Determine scale to convert sampled mask value back to label index.
+      // Unorm formats normalize to [0,1] at sample time, so we scale back.
+      id<MTLTexture> maskTex = (__bridge id<MTLTexture>)this->MaskTexture;
+      if (maskTex)
+      {
+        switch (maskTex.pixelFormat)
+        {
+          case MTLPixelFormatR8Unorm:
+            u->MaskScale = 255.0f;
+            break;
+          case MTLPixelFormatR16Unorm:
+            u->MaskScale = 65535.0f;
+            break;
+          default:
+            u->MaskScale = 1.0f;
+            break;
+        }
+      }
+      else
+      {
+        u->MaskScale = 1.0f;
+      }
+      u->MaskBias = 0.0f;
     }
-    u->MaskBias = 0.0f;
   }
   else
   {
     u->UseMask = 0.0f;
+    u->MaskType = 0.0f;
     u->MaskBlendFactor = 0.0f;
     u->MaskScale = 1.0f;
     u->MaskBias = 0.0f;
@@ -4968,6 +5012,20 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     [constants setConstantValue:&normalTex type:MTLDataTypeBool withName:@"fc_normalTexture"];
     [constants setConstantValue:&linearInterp type:MTLDataTypeBool withName:@"fc_linearInterpolation"];
 
+    // Blend mode function constant: 0=composite, 1=MIP, 2=MinIP, 3=AverageIP,
+    // 4=additive (vtkVolumeMapper::BlendMode). Encoded in the feature mask so
+    // each blend mode gets its own specialized pipeline.
+    int blendMode = 0;
+    if (featureMask & VolumeFeature_BlendMaximumIntensity)
+      blendMode = static_cast<int>(vtkVolumeMapper::MAXIMUM_INTENSITY_BLEND);
+    else if (featureMask & VolumeFeature_BlendMinimumIntensity)
+      blendMode = static_cast<int>(vtkVolumeMapper::MINIMUM_INTENSITY_BLEND);
+    else if (featureMask & VolumeFeature_BlendAverageIntensity)
+      blendMode = static_cast<int>(vtkVolumeMapper::AVERAGE_INTENSITY_BLEND);
+    else if (featureMask & VolumeFeature_BlendAdditive)
+      blendMode = static_cast<int>(vtkVolumeMapper::ADDITIVE_BLEND);
+    [constants setConstantValue:&blendMode type:MTLDataTypeInt withName:@"fc_blendMode"];
+
     fragFunc = [library newFunctionWithName:fragName
                              constantValues:constants
                                       error:&error];
@@ -5304,6 +5362,7 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
     featureMask |= VolumeFeature_MinMax;
   if (uniforms->UseLinearVolumeInterpolation > 0.5f)
     featureMask |= VolumeFeature_LinearInterpolation;
+  featureMask |= BlendModeToFeatureFlag(this->GetBlendMode());
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)
     (static_cast<vtkMetalRenderWindow*>(ren->GetRenderWindow()))->GetMetalDevice();
@@ -5509,10 +5568,15 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   }
 
   // Update mask / label map textures
-  if (this->MaskInput && this->MaskType == vtkGPUVolumeRayCastMapper::LabelMapMaskType)
+  if (this->MaskInput &&
+    (this->MaskType == vtkGPUVolumeRayCastMapper::LabelMapMaskType ||
+      this->MaskType == vtkGPUVolumeRayCastMapper::BinaryMaskType))
   {
     this->UpdateMaskTexture(mtlDevice, mtlQueue, vol);
-    this->UpdateLabelMapTransferTexture(mtlDevice, mtlQueue, vol);
+    if (this->MaskType == vtkGPUVolumeRayCastMapper::LabelMapMaskType)
+    {
+      this->UpdateLabelMapTransferTexture(mtlDevice, mtlQueue, vol);
+    }
   }
 
   if (!this->SetupBuffers(mtlDevice, ren, vol, input))
@@ -5728,6 +5792,25 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // Mask / label map
   this->SetMaskUniforms(&uniforms, vol);
 
+  // AverageIP scalar range. The average range is pre-divided by the volume
+  // normalization factor so the shader compares it against scalarMin +
+  // (scalarMax - scalarMin) * scalarNorm in the same normalized-by-normFactor
+  // units as the ScalarMin/Max uniforms.
+  {
+    double avgRange[2];
+    this->GetAverageIPScalarRange(avgRange);
+    if (avgRange[1] < avgRange[0])
+    {
+      double tmp = avgRange[1];
+      avgRange[1] = avgRange[0];
+      avgRange[0] = tmp;
+    }
+    uniforms.AverageIPRangeMin =
+      static_cast<float>(avgRange[0] / this->ScalarNormalizationFactor);
+    uniforms.AverageIPRangeMax =
+      static_cast<float>(avgRange[1] / this->ScalarNormalizationFactor);
+  }
+
   // Volume light uniforms for multi-light shading
   VolumeLightUniforms lightUniforms = {};
   {
@@ -5793,6 +5876,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     featureMask |= VolumeFeature_NormalTexture;
   if (uniforms.UseLinearVolumeInterpolation > 0.5f)
     featureMask |= VolumeFeature_LinearInterpolation;
+  featureMask |= BlendModeToFeatureFlag(this->GetBlendMode());
 
   // Image-space downsampling requires offscreen rendering at reduced resolution.
   // Partitioned volumes no longer force offscreen rendering because grid traversal

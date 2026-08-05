@@ -2596,6 +2596,10 @@ constant bool fc_normalTexture [[function_constant(4)]];
 // Bakes vtkVolumeProperty::GetInterpolationType() into the pipeline, so the
 // unused volume/TF/gradient-opacity sampler path is dead-code eliminated.
 constant bool fc_linearInterpolation [[function_constant(5)]];
+// Bakes vtkVolumeMapper::GetBlendMode() into the pipeline.
+// 0=composite (default), 1=maximum intensity (MIP), 2=minimum intensity (MinIP),
+// 3=average intensity (AverageIP), 4=additive.
+constant int fc_blendMode [[function_constant(17)]];
 
 // ============================================================================
 // Volume Ray Casting Mapper
@@ -2671,6 +2675,13 @@ struct VolumeMapperUniforms {
   float useTransfer2D;
   float transfer2DYAxisScale;  // yNorm = yRaw * scale + bias
   float transfer2DYAxisBias;
+  // AverageIP scalar range (native scalar units, pre-divided by the volume
+  // normalization factor so it compares against scalarMin + (scalarMax-scalarMin)*norm)
+  float averageIPRangeMin;
+  float averageIPRangeMax;
+  // Mask type: 0 = label map (colored via labelMapTransferTexture), 1 = binary
+  // (samples with mask <= 0 are skipped, matching the OpenGL backend).
+  float maskType;
 };
 
 struct VolumeLight {
@@ -3188,6 +3199,16 @@ inline half4 marchVolumeUnified(
   half3 accumulatedColor = initialColor;
   half accumulatedOpacity = initialOpacity;
 
+  // Non-composite blend-mode accumulators. Only the active mode's accumulator
+  // is ever touched; dead branches are eliminated via the fc_blendMode function
+  // constant so composite pipelines carry no extra cost.
+  half mipMaxScalar = 0.0h;    // MIP: max normalized scalar along the ray
+  half minipMinScalar = 1.0h;  // MinIP: min normalized scalar along the ray
+  half avgBlendSum = 0.0h;     // AverageIP: sum(opacity * scalar) over in-range samples
+  int avgBlendCount = 0;       // AverageIP: number of in-range samples
+  half additiveSum = 0.0h;     // Additive: sum(opacity * scalar)
+  bool firstBlendSample = true;
+
   // Sample position carried incrementally through the march: advance one ray
   // step per iteration instead of recomputing. Sampling happens at the raw
   // normalized volume coordinate, matching the OpenGL backend, which fetches
@@ -3269,17 +3290,39 @@ inline half4 marchVolumeUnified(
       continue;
     }
 
+    // Binary mask: exclude samples whose (scaled/biased) mask value is <= 0,
+    // matching the OpenGL backend's g_skip in BinaryMaskImplementation.
+    // Label maps (maskType == 0) instead colorize samples in the doMask branch below.
+    if (doMask && volumeUniforms.maskType > 0.5) {
+      float binMask = rawMask * maskScale + maskBias;
+      if (binMask <= 0.0) {
+        currentPoint += stepVec;
+        currentT += p.stepSize;
+        evalPoint += evalStep;
+        prefetchValid = false;
+        continue;
+      }
+    }
+
     half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
 
     half4 colorOpacity;
     half maskLabel = 0.0h;
 
-    if (doTransfer2D) {
+    // MIP/MinIP only track the scalar extremum; the transfer function is
+    // re-sampled once at the end (matching OpenGL, whose MIP/MinIP path never
+    // computes g_srcColor inside the march loop). All other modes need the
+    // per-sample opacity. The fc_needsPerSampleOpacity test folds away at
+    // compile time via the fc_blendMode function constant, so MIP/MinIP
+    // pipelines carry no transfer-function fetch in the loop.
+    const bool fc_needsPerSampleOpacity =
+      (fc_blendMode == 0 || fc_blendMode == 3 || fc_blendMode == 4);
+    if (fc_needsPerSampleOpacity && doTransfer2D) {
       half secondNorm = saturate(
           half(sampleSecondScalar(transfer2DYAxisTexture, evalPoint)) * secondScale + secondBias);
       colorOpacity = sampleTransferFunction2D(
           transferFunction2DTexture, float2(float(scalarNorm), float(secondNorm)));
-    } else if (doMask) {
+    } else if (fc_needsPerSampleOpacity && doMask) {
       float maskVal = rawMask * maskScale + maskBias;
       if (numLabels > 0.0) {
         float label = floor(maskVal + 0.5);
@@ -3294,11 +3337,41 @@ inline half4 marchVolumeUnified(
       } else {
         colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
       }
-    } else {
+    } else if (fc_needsPerSampleOpacity) {
       colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
+    } else {
+      colorOpacity = half4(0.0h);
     }
 
     half sampleOpacity = colorOpacity.a;
+
+    // Non-composite blend modes: accumulate over every non-skipped sample.
+    // MIP/MinIP track the raw scalar (independent of opacity, matching the
+    // OpenGL backend). AverageIP/Additive accumulate opacity-weighted scalar.
+    // Dead branches are eliminated at compile time via fc_blendMode.
+    if (fc_blendMode == 1) {           // MAXIMUM_INTENSITY_BLEND
+      if (firstBlendSample || mipMaxScalar < scalarNorm) {
+        mipMaxScalar = scalarNorm;
+      }
+      firstBlendSample = false;
+    } else if (fc_blendMode == 2) {    // MINIMUM_INTENSITY_BLEND
+      if (firstBlendSample || minipMinScalar > scalarNorm) {
+        minipMinScalar = scalarNorm;
+      }
+      firstBlendSample = false;
+    } else if (fc_blendMode == 3) {    // AVERAGE_INTENSITY_BLEND
+      // Intensity in the volume scalar range (native units pre-divided by the
+      // normalization factor, matching the averageIPRangeMin/Max uniforms).
+      half intensityNorm =
+        volumeUniforms.scalarMin + (volumeUniforms.scalarMax - volumeUniforms.scalarMin) * scalarNorm;
+      if (intensityNorm >= half(volumeUniforms.averageIPRangeMin) &&
+          intensityNorm <= half(volumeUniforms.averageIPRangeMax)) {
+        avgBlendSum += sampleOpacity * scalarNorm;
+        avgBlendCount++;
+      }
+    } else if (fc_blendMode == 4) {    // ADDITIVE_BLEND
+      additiveSum += sampleOpacity * scalarNorm;
+    }
     // RenderToImage depth: record the world position of the first non-skipped
     // sample whose transfer-function opacity is positive (matches the OpenGL
     // backend's l_opaqueFragPos update).
@@ -3309,7 +3382,7 @@ inline half4 marchVolumeUnified(
     // Opacity pre-integration is baked into the transfer function texture
     // on the CPU at TF-build time (matches OpenGL backend).
 
-    if (sampleOpacity > 0.001h) {
+    if (fc_blendMode == 0 && sampleOpacity > 0.001h) {
       half3 sampleColor = colorOpacity.rgb;
       half weight = 1.0h - accumulatedOpacity;
 
@@ -3381,6 +3454,24 @@ inline half4 marchVolumeUnified(
     }
   }
 
+  if (fc_blendMode == 1) {   // MAXIMUM_INTENSITY_BLEND
+    half4 c = sampleTransferFunction(transferFunctionTexture, float2(float(mipMaxScalar), 0.5));
+    return half4(c.rgb * c.a, c.a);
+  } else if (fc_blendMode == 2) {  // MINIMUM_INTENSITY_BLEND
+    half4 c = sampleTransferFunction(transferFunctionTexture, float2(float(minipMinScalar), 0.5));
+    return half4(c.rgb * c.a, c.a);
+  } else if (fc_blendMode == 3) {  // AVERAGE_INTENSITY_BLEND
+    // OpenGL discards the fragment when no in-range sample was found; return a
+    // fully transparent fragment so the background shows through.
+    if (avgBlendCount == 0) {
+      return half4(0.0h);
+    }
+    half avg = saturate(avgBlendSum / half(avgBlendCount));
+    return half4(avg, avg, avg, 1.0h);
+  } else if (fc_blendMode == 4) {  // ADDITIVE_BLEND
+    half sum = saturate(additiveSum);
+    return half4(sum, sum, sum, 1.0h);
+  }
   return half4(accumulatedColor, accumulatedOpacity);
 }
 

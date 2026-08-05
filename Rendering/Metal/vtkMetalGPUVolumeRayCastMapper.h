@@ -85,6 +85,11 @@ enum VolumeShaderFeatureFlags : uint32_t
   VolumeFeature_MinMax          = 1u << 3,
   VolumeFeature_NormalTexture    = 1u << 4,
   VolumeFeature_LinearInterpolation = 1u << 5,
+  // Blend modes (vtkVolumeMapper::BlendMode). Composite (0) uses no flag.
+  VolumeFeature_BlendMaximumIntensity = 1u << 6,
+  VolumeFeature_BlendMinimumIntensity = 1u << 7,
+  VolumeFeature_BlendAverageIntensity = 1u << 8,
+  VolumeFeature_BlendAdditive         = 1u << 9,
 };
 
 VTK_ABI_NAMESPACE_BEGIN
