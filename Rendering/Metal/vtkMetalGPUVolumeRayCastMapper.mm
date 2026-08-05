@@ -2980,8 +2980,15 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlankingTexture(
 {
   (void)mtlQueueVoid;
 
-  vtkSmartPointer<vtkUnsignedCharArray> cellBlank = input->GetCellGhostArray();
-  vtkSmartPointer<vtkUnsignedCharArray> pointBlank = input->GetPointGhostArray();
+  // The ghost arrays live on the original dataset, not the effective input:
+  // for cell data EnsureEffectiveInput builds a cell-sized proxy that carries
+  // only the scalars, so reading the ghost arrays here from `input` would find
+  // none and silently disable blanking.
+  vtkImageData* source = vtkImageData::SafeDownCast(this->TransformedInputs[0]);
+  vtkSmartPointer<vtkUnsignedCharArray> cellBlank =
+    source ? source->GetCellGhostArray() : nullptr;
+  vtkSmartPointer<vtkUnsignedCharArray> pointBlank =
+    source ? source->GetPointGhostArray() : nullptr;
   bool blankCells = (cellBlank != nullptr);
   bool blankPoints = (pointBlank != nullptr);
 
@@ -2996,7 +3003,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlankingTexture(
   }
 
   bool doReload = (this->BlankingTexture == nullptr);
-  doReload |= (input->GetMTime() > this->BlankingUploadTime.GetMTime());
+  doReload |= (source && source->GetMTime() > this->BlankingUploadTime.GetMTime());
   doReload |= (this->BlankingPoints != pointBlank);
   doReload |= (this->BlankingCells != cellBlank);
   doReload |= (cellBlank && cellBlank->GetMTime() > this->BlankingUploadTime.GetMTime());
@@ -3021,16 +3028,32 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlankingTexture(
       return false;
     }
 
-    // The blanking texture has the same (point) dimensions as the volume so
+    // The blanking texture has the same dimensions as the volume texture so
     // texel (i,j,k) aligns with the volume texel sampled at the same
     // coordinate, matching the OpenGL backend's Create3DFromRaw(blockSize).
     // Two components: .x = point-blank flag, .y = cell-blank flag.
+    // For cell data the volume texture is cell-sized (built from the cell-data
+    // proxy), so dims == the original cell dimensions; the original point
+    // dimensions are one larger along each axis.
     const vtkIdType nx = dims[0];
     const vtkIdType ny = dims[1];
     const vtkIdType nz = dims[2];
-    const vtkIdType cellStrideI = nx - 1;
-    const vtkIdType cellStrideJ = (nx - 1) * (ny - 1);
     const vtkIdType numTexels = nx * ny * nz;
+
+    int pdims[3] = { static_cast<int>(nx), static_cast<int>(ny), static_cast<int>(nz) };
+    if (source)
+    {
+      source->GetDimensions(pdims);
+    }
+    const vtkIdType p0 = pdims[0];
+    const vtkIdType p1 = pdims[1];
+    const vtkIdType p2 = pdims[2];
+    const vtkIdType c0 = std::max<vtkIdType>(1, p0 - 1);
+    const vtkIdType c1 = std::max<vtkIdType>(1, p1 - 1);
+    const vtkIdType c2 = std::max<vtkIdType>(1, p2 - 1);
+    // True when the volume texture (dims) holds one texel per cell, i.e. the
+    // cell-data path. For point data dims equals the original point dims.
+    const bool cellData = (c0 == nx && c1 == ny && c2 == nz);
 
     std::vector<unsigned char> blankingData(static_cast<size_t>(numTexels) * 2, 0);
 
@@ -3044,7 +3067,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlankingTexture(
           for (vtkIdType i = 0; i < nx; ++i)
           {
             vtkIdType texel = (k * ny + j) * nx + i;
-            vtkIdType ptId = texel;
+            // Point data: texel (i,j,k) is point (i,j,k) (ptId == texel).
+            // Cell data: the texel is the cell's lower-corner point; the shader
+            // samples the +-half-step neighbors so the other corners are
+            // caught by their own texels.
+            vtkIdType ptId = (k * p1 + j) * p0 + i;
             blankingData[texel * 2 + 0] = src[ptId];
           }
         }
@@ -3064,7 +3091,18 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateBlankingTexture(
           {
             const vtkIdType ic = (i < nx - 1) ? i : nx - 2;
             vtkIdType texel = (k * ny + j) * nx + i;
-            vtkIdType cellId = kc * cellStrideJ + jc * cellStrideI + ic;
+            vtkIdType cellId;
+            if (cellData)
+            {
+              // Cell data: texel (i,j,k) is cell (i,j,k) directly.
+              cellId = (k * c1 + j) * c0 + i;
+            }
+            else
+            {
+              // Point data: store cell (i,j,k)'s flag at its lower-corner point
+              // texel, clamping the last point slice onto the last cell.
+              cellId = (kc * c1 + jc) * c0 + ic;
+            }
             blankingData[texel * 2 + 1] = src[cellId];
           }
         }

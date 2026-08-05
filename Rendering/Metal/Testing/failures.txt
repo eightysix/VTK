@@ -5,37 +5,36 @@ volume ray-cast backend (cell/point ghost arrays are uploaded into a
 cell-centered RG8 3D texture and skipped during the march, mirroring the
 OpenGL backend's in_blanking texture + g_skip logic). This fixes
 TestGPURayCastVolumeUniformGridBlanking (0.0706 -> 0.0001) and
-TestGPURayCastVolumeGhostArrays (0.1646 -> pass).
+TestGPURayCastVolumeGhostArrays (0.1646 -> pass). The blanking texture is now
+built from the original dataset's ghost arrays (the cell-data effective-input
+proxy carries only scalars), fixing TestGPURayCastVolumeGhostArraysCellData
+(0.1630 -> pass).
 
-25 image-compare failures (TIGHT_VALID threshold 0.05):
+21 image-compare failures (TIGHT_VALID threshold 0.05):
   gross (>=0.5):
-    TestGPURayCastThreeComponentsAdditive    0.5239
-    TestGPURayCastCameraInsideSmallSpacing   0.5729
+    TestGPURayCastCameraInsideSmallSpacing    0.5729
   mid (0.1-0.5):
-    TestGPURayCastVolumePicking              0.1234
-    TestGPURayCastCameraInside               0.1315
-    TestGPURayCastPositionalLights           0.1475
+    TestGPURayCastVolumePicking               0.1234
+    TestGPURayCastCameraInside                0.1315
+    TestGPURayCastOrientedVolume              0.1410
+    TestGPURayCastMapperSampleDistance        0.1419
     TestGPURayCastFourComponentsDependentGradient 0.1611
-    TestGPURayCastVolumeGhostArraysCellData  0.1630
-    TestGPURayCastCameraInsideTransformation 0.1967
-    TestGPURayCastComputeNormalFromOpacity   0.2115
-    TestGPURayCastIndependentVectorMode      0.2229
-    TestGPURayCastVolumeLightKit             0.2230
-    TestGPURayCastTwoComponentsDependentGradient 0.2282
-    TestGPURayCastTwoComponentsDependent     0.2443
+    TestGPURayCastCameraInsideTransformation  0.1967
+    TestGPURayCastTwoComponentsDependentGradient 0.2281
+    TestGPURayCastTwoComponentsDependent     0.2451
     TestGPURayCastLargeColorTransferFunction 0.3250
     TestGPURayCastClippingUserTransform      0.3258
-    TestGPURayCastTwoComponentsIndependent   0.3371
-    TestGPURayCastMapperRectilinearGrid      0.3826
-    TestGPURayCastThreeComponentsIndependent 0.4161
-    TestGPURayCastOrientedVolume             0.4325
-    TestGPURayCastTwoComponentsGradient      0.4495
+    TestGPURayCastComputeNormalFromOpacity   0.3837
+    TestGPURayCastMapperRectilinearGrid      0.3838
+    TestGPURayCastTwoComponentsGradient      0.4505
   near-miss (0.05-0.1):
     TestGPURayCastCropping1                  0.0506
     TestMultiBlockMapperRectilinearGrid      0.0552
-    TestGPURayCastRenderToTexture            0.0552
+    TestGPURayCastRenderToTexture            0.0553
     TestGPURayCastCameraInsideNonUniformScaleTransform 0.0595
-    TestGPURayCastShadedClipping             0.0840
+    TestGPURayCastIndependentVectorMode      0.0600
+    TestGPURayCastShadedClipping             0.0842
+    TestGPURayCastPositionalLights           0.0953
 
 7 non-image failures (crash / pick-check, no render exported):
     ProjectedTetrahedraZoomIn
