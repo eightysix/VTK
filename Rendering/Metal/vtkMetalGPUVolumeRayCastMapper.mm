@@ -2130,6 +2130,7 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   ReleaseMetalObject(this->Transfer2DTexture);
   ReleaseMetalObject(this->Transfer2DYAxisTexture);
   this->Transfer2DEnabled = false;
+  this->Transfer2DUseGradient = false;
   ReleaseMetalObject(this->MinMaxTexture);
   ReleaseMetalObject(this->MinMaxScratchTexture);
   this->ReleaseGradientNormalTexture();
@@ -3168,12 +3169,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransfer2DYAxisTexture(
     return true;
   }
 
-  const char* yName = this->GetTransfer2DYAxisArray();
-  if (!yName)
-  {
-    // Legacy TF_2D mode (e.g. TestGPURayCastTransfer2D): no Y-axis array set,
-    // so the shader uses the gradient magnitude as the second axis (matching
-    // the OpenGL backend's Transfer2DUseGradient=true path).
+  // Legacy TF_2D mode (e.g. TestGPURayCastTransfer2D): no usable Y-axis array,
+  // so the shader uses the gradient magnitude as the second axis (matching the
+  // OpenGL backend's Transfer2DUseGradient=true path).
+  const auto useGradientFallback = [this]() {
     this->Transfer2DUseGradient = true;
     if (this->Transfer2DYAxisTexture)
     {
@@ -3181,6 +3180,12 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransfer2DYAxisTexture(
       this->Transfer2DYAxisUploadTime.Modified();
       this->Transfer2DYAxisArrayName.clear();
     }
+  };
+
+  const char* yName = this->GetTransfer2DYAxisArray();
+  if (!yName)
+  {
+    useGradientFallback();
     return true;
   }
 
@@ -3195,14 +3200,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransfer2DYAxisTexture(
   }
   if (!arr)
   {
-    // Same fallback: array not found on the input, use gradient magnitude.
-    this->Transfer2DUseGradient = true;
-    if (this->Transfer2DYAxisTexture)
-    {
-      ReleaseMetalObject(this->Transfer2DYAxisTexture);
-      this->Transfer2DYAxisUploadTime.Modified();
-      this->Transfer2DYAxisArrayName.clear();
-    }
+    useGradientFallback();
     return true;
   }
 

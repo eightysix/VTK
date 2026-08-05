@@ -3315,6 +3315,11 @@ inline half4 marchVolumeUnified(
 
     half4 colorOpacity;
     half maskLabel = 0.0h;
+    // Gradient shared between the TF_2D gradient y-axis and shading/gradient
+    // opacity so it is computed at most once per sample (computeGradientFast
+    // is 6 texture fetches).
+    half4 sharedGrad = half4(0.0h);
+    bool sharedGradReady = false;
 
     // MIP/MinIP only track the scalar extremum; the transfer function is
     // re-sampled once at the end (matching OpenGL, whose MIP/MinIP path never
@@ -3331,8 +3336,9 @@ inline half4 marchVolumeUnified(
         // magnitude, using the same normalization as gradient opacity — this is
         // the OpenGL backend's grad.w, which it feeds to both the gradient
         // opacity table and the 2D transfer function y-coordinate.
-        half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
-        secondNorm = grad.w;
+        sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
+        sharedGradReady = true;
+        secondNorm = sharedGrad.w;
       } else {
         secondNorm = saturate(
             half(sampleSecondScalar(transfer2DYAxisTexture, evalPoint)) * secondScale + secondBias);
@@ -3418,9 +3424,12 @@ inline half4 marchVolumeUnified(
           normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
           gradMag = nrmSample.w;
         } else {
-          half4 grad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
-          normal = grad.xyz;
-          gradMag = grad.w;
+          if (!sharedGradReady) {
+            sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
+            sharedGradReady = true;
+          }
+          normal = sharedGrad.xyz;
+          gradMag = sharedGrad.w;
         }
 
         if (lightUniforms != nullptr && lightUniforms->defaultLighting == 0) {
