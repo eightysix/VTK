@@ -3157,8 +3157,12 @@ inline half4 marchVolumeUnified(
   float3 texSizeGlobal = max(p.texMaxGlobal - p.texMinGlobal, 1e-6);
   float3 invTexSizeGlobal = 1.0 / texSizeGlobal;
   float3 rayDirTexLocal = p.rayDir * invTexSizeGlobal;
-  // Advance of the sample position per step (constant).
-  float3 evalStep = rayDirTexLocal * p.stepSize;
+  // Cell-to-point conversion factors, computed once (texel centers at (i+0.5)/dims).
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  // Advance of the cellToPoint-adjusted sample position per step (constant).
+  float3 evalStep = rayDirTexLocal * p.stepSize * ctpScale;
   float3 dt = max(b.gradientStep.xyz, 1e-8);
   float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
                         - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
@@ -3213,12 +3217,9 @@ inline half4 marchVolumeUnified(
   bool firstBlendSample = true;
 
   // Sample position carried incrementally through the march: advance one ray
-  // step per iteration instead of recomputing. Sampling happens at the raw
-  // normalized volume coordinate, matching the OpenGL backend, which fetches
-  // the volume at g_dataPos directly (raw texture coordinates) rather than at
-  // cell-to-point adjusted positions.
+  // step per iteration instead of recomputing.
   float3 texLocalPos0 = (currentPoint - p.texMinGlobal) * invTexSizeGlobal;
-  float3 evalPoint = texLocalPos0;
+  float3 evalPoint = cellToPointTextureCoord(texLocalPos0, ctpScale, ctpOffset);
   float prefetchScalar = sampleVolumeScalar(volumeTexture, evalPoint);
   float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint, level(0)).r : 0.0;
   bool prefetchValid = true;
@@ -3270,7 +3271,7 @@ inline half4 marchVolumeUnified(
         }
 
         // Re-sync the incremental sample position after the empty-cell jump.
-        evalPoint = (currentPoint - p.texMinGlobal) * invTexSizeGlobal;
+        evalPoint = cellToPointTextureCoord((currentPoint - p.texMinGlobal) * invTexSizeGlobal, ctpScale, ctpOffset);
         prefetchValid = false;
         curCell = int3(-1);
         continue;
