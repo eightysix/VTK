@@ -2707,6 +2707,13 @@ struct VolumeMapperUniforms {
   uint numComponents;
   float useIndependentComponents;
   float _padIndependent[3];
+  // Per-component material (OpenGL in_ambient[i]/in_diffuse[i]/in_specular[i]/
+  // in_shininess[i] parity). Only consulted by the independent path, which
+  // shades each component against its own material and its own gradient.
+  float4 ambientColorComp[4];
+  float4 diffuseColorComp[4];
+  float4 specularColorComp[4];
+  float shininessComp[4];
 };
 
 struct VolumeLight {
@@ -2846,6 +2853,16 @@ inline float sampleVolumeScalar(texture3d<float> volTex, float3 pos) {
   return volTex.sample(sNearest, pos, level(0)).r;
 }
 
+// Full-texel fetch honoring the pipeline's interpolation specialization. Used
+// by the independent multi-component path, which needs every channel (one per
+// component) at the same sample position.
+inline float4 sampleVolumeTexel(texture3d<float> volTex, float3 pos) {
+  if (fc_linearInterpolation) {
+    return volTex.sample(sVolume, pos, level(0));
+  }
+  return volTex.sample(sNearest, pos, level(0));
+}
+
 inline half4 sampleTransferFunction(texture2d<float> tfTex, float2 uv) {
   if (fc_linearInterpolation) {
     return half4(tfTex.sample(sVolume, uv, level(0)));
@@ -2926,6 +2943,35 @@ inline half4 computeGradientFast(texture3d<float> volTex, float3 pos,
   half3 normal = mag > 0.0h ? correctedGrad / mag : half3(0.0h);
 
   return half4(normal, saturate(mag / gradNormFactor));
+}
+
+// Central-difference gradient for every component at once (independent
+// multi-component path). The volume texture stores one channel per component,
+// so six RGBA texel fetches yield all components' gradients (OpenGL
+// computeGradient(g_dataPos, c, ...) parity — each gradient is computed from
+// its own component's channel). Only direction matters for the shading model;
+// the magnitude is stored in .w for the gradient-opacity table.
+inline void computeGradientsAllComponents(
+    texture3d<float> volTex, float3 pos, float3 gradStep,
+    float4x4 volumeToTexture, half gradNormFactor, thread half4 gradOut[4]) {
+  float4 pX = sampleVolumeTexel(volTex, pos + float3(gradStep.x, 0, 0));
+  float4 nX = sampleVolumeTexel(volTex, pos - float3(gradStep.x, 0, 0));
+  float4 pY = sampleVolumeTexel(volTex, pos + float3(0, gradStep.y, 0));
+  float4 nY = sampleVolumeTexel(volTex, pos - float3(0, gradStep.y, 0));
+  float4 pZ = sampleVolumeTexel(volTex, pos + float3(0, 0, gradStep.z));
+  float4 nZ = sampleVolumeTexel(volTex, pos - float3(0, 0, gradStep.z));
+
+  float3x3 texToModelLin =
+    float3x3(volumeToTexture[0].xyz, volumeToTexture[1].xyz, volumeToTexture[2].xyz);
+  float3x3 texToModelT = transpose(texToModelLin);
+
+  for (int c = 0; c < 4; ++c) {
+    float3 gradTex = float3(pX[c] - nX[c], pY[c] - nY[c], pZ[c] - nZ[c]) / max(gradStep, 1e-8);
+    half3 corrected = half3(texToModelT * gradTex);
+    half mag = length(corrected);
+    half3 normal = mag > 0.0h ? corrected / mag : half3(0.0h);
+    gradOut[c] = half4(normal, saturate(mag / gradNormFactor));
+  }
 }
 
 // Mirrors OpenGL's ComputeLightingDeclaration default-light path (headlight):
@@ -3290,6 +3336,12 @@ inline half4 marchVolumeUnified(
   int avgBlendCountComp[4] = {0, 0, 0, 0};
   half additiveSumComp[4] = {0.0h, 0.0h, 0.0h, 0.0h};
 
+  // Per-component gradients (independent path only): computed lazily at most
+  // once per sample from a single six-texel batch and reused by the
+  // gradient-opacity step and the per-component shading in the composite loop.
+  half4 compGrad[4] = {half4(0.0h), half4(0.0h), half4(0.0h), half4(0.0h)};
+  bool compGradReady = false;
+
   // Sample position carried incrementally through the march: advance one ray
   // step per iteration instead of recomputing. texLocalPos lives in [0,1]
   // texture space; currentPoint is in normalized volume space (the AABB).
@@ -3547,17 +3599,16 @@ inline half4 marchVolumeUnified(
     half sampleOpacity = colorOpacity.a;
 
     if (useIndependentPath) {
-      // Gradient opacity applied to the per-component alpha using the shared
-      // gradient magnitude (OpenGL computes a per-component gradient, but the
-      // magnitude is the same so the shared value is equivalent).
+      // Gradient opacity applied per component using that component's own
+      // gradient magnitude (OpenGL computeGradientOpacity(gradient, i) parity).
       if (fc_needsPerSampleOpacity && doGradOp) {
-        if (!sharedGradReady) {
-          sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
-          sharedGradReady = true;
+        if (!compGradReady) {
+          computeGradientsAllComponents(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor, compGrad);
+          compGradReady = true;
         }
         int nComp = min(4, int(volumeUniforms.numComponents));
         for (int c = 0; c < nComp; ++c) {
-          compColor[c].a *= sampleGradientOpacity(gradientOpacityTexture, float(sharedGrad.w));
+          compColor[c].a *= sampleGradientOpacity(gradientOpacityTexture, float(compGrad[c].w));
         }
       }
       // Combined per-sample alpha (OpenGL totalAlpha): weighted sum of the
@@ -3663,22 +3714,28 @@ inline half4 marchVolumeUnified(
               half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
               normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
             } else {
-              if (!sharedGradReady) {
-                sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
-                sharedGradReady = true;
+              if (!compGradReady) {
+                computeGradientsAllComponents(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor, compGrad);
+                compGradReady = true;
               }
-              normal = sharedGrad.xyz;
+              normal = compGrad[c].xyz;
             }
+            // Per-component material and shininess (OpenGL lightingComponent
+            // index parity).
+            half3 ambC = half3(volumeUniforms.ambientColorComp[c].rgb);
+            half3 difC = half3(volumeUniforms.diffuseColorComp[c].rgb);
+            half3 speC = half3(volumeUniforms.specularColorComp[c].rgb);
+            half  shiC = half(volumeUniforms.shininessComp[c]);
             if (lightUniforms != nullptr && lightUniforms->defaultLighting == 0) {
               ccRGB = computeVolumeLighting(ccRGB, normal, -viewDirHalf,
-                  ambientMat, diffuseMat, specularMat, shininessMat,
+                  ambC, difC, speC, shiC,
                   *lightUniforms, evalPoint);
             } else {
               bool twoSided = (lightUniforms != nullptr && lightUniforms->twoSidedLighting != 0);
               // OpenGL headlight convention: light and view directions are the per-pixel
               // ray direction toward the camera (g_ldir == g_vdir == normalize(cameraPos - vertexPos)).
               ccRGB = computePhongLightingVolumeFast(ccRGB, normal, -viewDirHalf, -viewDirHalf,
-                  ambientMat, diffuseMat, specularMat, shininessMat, twoSided);
+                  ambC, difC, speC, shiC, twoSided);
             }
           }
           tmpRGB += ccRGB * cc.a * w;

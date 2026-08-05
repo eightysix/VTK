@@ -166,10 +166,16 @@ struct VolumeMapperUniforms
   float UseIndependentComponents;  // 1220..1223
   float _padIndependent[3];        // 1224..1235
   float _padEnd2[3];               // 1236..1247  (trailing pad to 1248)
+  // Per-component material (OpenGL in_ambient[4]/in_diffuse[4]/in_specular[4]/
+  // in_shininess[4] parity). Indexed by component in the independent path.
+  float AmbientColorComp[4][4];    // 1248..1311
+  float DiffuseColorComp[4][4];    // 1312..1375
+  float SpecularColorComp[4][4];   // 1376..1439
+  float ShininessComp[4];          // 1440..1455  (total 1456, 16-byte aligned)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1248,
-  "VolumeMapperUniforms must be 1248 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1456,
+  "VolumeMapperUniforms must be 1456 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -187,6 +193,10 @@ static_assert(offsetof(VolumeMapperUniforms, VolumeToTextureMatrix) == 1104, "")
 static_assert(offsetof(VolumeMapperUniforms, ScalarMinCompHalf) == 1168, "");
 static_assert(offsetof(VolumeMapperUniforms, ComponentWeight) == 1200, "");
 static_assert(offsetof(VolumeMapperUniforms, NumComponents) == 1216, "");
+static_assert(offsetof(VolumeMapperUniforms, AmbientColorComp) == 1248, "");
+static_assert(offsetof(VolumeMapperUniforms, DiffuseColorComp) == 1312, "");
+static_assert(offsetof(VolumeMapperUniforms, SpecularColorComp) == 1376, "");
+static_assert(offsetof(VolumeMapperUniforms, ShininessComp) == 1440, "");
 
 // Per-light data for volume shading — must match Metal VolumeLight struct
 // Must match Metal VolumeLight (6 x float4 = 96 bytes per light)
@@ -6189,6 +6199,23 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       uniforms.SpecularColor[0] = uniforms.SpecularColor[1] = uniforms.SpecularColor[2] =
         static_cast<float>(spec);
       uniforms.Shininess = static_cast<float>(power);
+
+      // Per-component materials for the independent multi-component path
+      // (OpenGL in_ambient[i]/in_diffuse[i]/in_specular[i]/in_shininess[i]).
+      for (int c = 0; c < 4; ++c)
+      {
+        double ambC = property->GetAmbient(c);
+        double difC = property->GetDiffuse(c);
+        double speC = property->GetSpecular(c);
+        double powC = property->GetSpecularPower(c);
+        uniforms.AmbientColorComp[c][0] = uniforms.AmbientColorComp[c][1] =
+          uniforms.AmbientColorComp[c][2] = static_cast<float>(ambC);
+        uniforms.DiffuseColorComp[c][0] = uniforms.DiffuseColorComp[c][1] =
+          uniforms.DiffuseColorComp[c][2] = static_cast<float>(difC);
+        uniforms.SpecularColorComp[c][0] = uniforms.SpecularColorComp[c][1] =
+          uniforms.SpecularColorComp[c][2] = static_cast<float>(speC);
+        uniforms.ShininessComp[c] = static_cast<float>(powC);
+      }
     }
 
     // Light direction: headlight (camera-to-volume direction in volume [0,1] space)
