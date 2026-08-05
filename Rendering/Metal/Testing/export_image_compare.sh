@@ -1,8 +1,13 @@
 #!/bin/bash
 #
-# Re-runs the generic Metal image-comparison suite and exports the failing
-# renders (Metal + baseline + diff PNGs) plus a per-test metric manifest into a
-# review folder, so failures can be inspected side by side.
+# Re-runs a Metal image-comparison suite and exports the failing renders
+# (Metal + baseline + diff PNGs) plus a per-test metric manifest into a review
+# folder, so failures can be inspected side by side.
+#
+# Handles both the Rendering/Core suite (RenderingCoreCxx-Metal, the default)
+# and the Rendering/Volume suite (RenderingVolumeCxx-Metal); pick one with
+# --prefix. The baseline directory defaults to the matching suite (Core or
+# Volume) and can be overridden with --baseline-dir.
 #
 # "Image-compare" failures are tests that rendered and produced a
 # vtkRegressionTestImage comparison (reported as
@@ -11,13 +16,21 @@
 # (pick/selection) render no output and are only listed in the summary.
 #
 # Usage:
-#   ./export_image_compare.sh              # run suite, export + manifest
-#   ./export_image_compare.sh --no-run     # export from the last run's artifacts
+#   ./export_image_compare.sh                    # core suite: run, export + manifest
+#   ./export_image_compare.sh --prefix RenderingVolumeCxx-Metal
+#   ./export_image_compare.sh --no-run           # export from the last run's artifacts
 #   ./export_image_compare.sh --out /tmp/compare --jobs 4
 #
 # Options:
 #   -b, --build-dir DIR   Metal build tree (default: <repo>/build_macos_metal)
-#   -o, --out DIR         review output dir (default: <build>/Testing/ImageCompareReview)
+#   -o, --out DIR         review output dir (default: <build>/Testing/ImageCompareReview
+#                         or .../ImageCompareReviewVolume for the volume suite)
+#   -p, --prefix PREFIX   ctest test prefix (default: RenderingCoreCxx-Metal;
+#                         use RenderingVolumeCxx-Metal for the volume suite)
+#   -d, --baseline-dir DIR
+#                         baseline PNG dir (default derived from --prefix:
+#                         <build>/ExternalData/Rendering/Core/... or
+#                         <build>/ExternalData/Rendering/Volume/...)
 #   -j, --jobs N          ctest parallelism (default: 8)
 #   -n, --no-run          skip the ctest run; export from the last run's artifacts
 #   -h, --help            show this help
@@ -32,6 +45,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 BUILD_DIR="${REPO_ROOT}/build_macos_metal"
 OUT_DIR=""
+TEST_PREFIX="RenderingCoreCxx-Metal"
+BASELINE_DIR=""
 JOBS=8
 RUN=1
 
@@ -44,6 +59,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -b|--build-dir) BUILD_DIR="$2"; shift 2 ;;
     -o|--out) OUT_DIR="$2"; shift 2 ;;
+    -p|--prefix) TEST_PREFIX="$2"; shift 2 ;;
+    -d|--baseline-dir) BASELINE_DIR="$2"; shift 2 ;;
     -j|--jobs) JOBS="$2"; shift 2 ;;
     -n|--no-run) RUN=0; shift ;;
     -h|--help) usage ;;
@@ -56,11 +73,19 @@ if [ ! -d "$BUILD_DIR" ]; then
   exit 1
 fi
 BUILD_DIR="$(cd "$BUILD_DIR" && pwd)"
-OUT_DIR="${OUT_DIR:-${BUILD_DIR}/Testing/ImageCompareReview}"
+
+if [[ "$TEST_PREFIX" == *Volume* ]]; then
+  REVIEW_DIR="ImageCompareReviewVolume"
+  DEFAULT_BASELINE="ExternalData/Rendering/Volume/Testing/Data/Baseline"
+else
+  REVIEW_DIR="ImageCompareReview"
+  DEFAULT_BASELINE="ExternalData/Rendering/Core/Testing/Data/Baseline"
+fi
+OUT_DIR="${OUT_DIR:-${BUILD_DIR}/Testing/${REVIEW_DIR}}"
 mkdir -p "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"
+BASELINE_DIR="${BASELINE_DIR:-${BUILD_DIR}/${DEFAULT_BASELINE}}"
 
-TEST_PREFIX="RenderingCoreCxx-Metal"
 LOG="${BUILD_DIR}/Testing/Temporary/LastTest.log"
 FAILED_LIST="${BUILD_DIR}/Testing/Temporary/LastTestsFailed.log"
 
@@ -72,13 +97,13 @@ else
 fi
 
 echo "== exporting image-compare failures to ${OUT_DIR}"
-python3 - "$BUILD_DIR" "$OUT_DIR" "$LOG" "$FAILED_LIST" "$TEST_PREFIX" <<'PYEOF'
+python3 - "$BUILD_DIR" "$OUT_DIR" "$LOG" "$FAILED_LIST" "$TEST_PREFIX" "$BASELINE_DIR" <<'PYEOF'
 import os
 import re
 import shutil
 import sys
 
-build_dir, out_dir, log, failed_list, test_prefix = sys.argv[1:6]
+build_dir, out_dir, log, failed_list, test_prefix, baseline_dir = sys.argv[1:7]
 
 fail_img = re.compile(r'Failed Image Test \( ([A-Za-z0-9_]+\.png) \) : ([\d.eE+-]+)')
 test_line = re.compile(r'^[0-9]+/[0-9]+ Test: (\S+)')
@@ -119,11 +144,10 @@ if not failures and os.path.exists(log):
             print("WARNING: %s contains no '%s' tests; run the suite first" % (log, test_prefix))
 
 temp_dir = os.path.join(build_dir, 'Testing', 'Temporary')
-base_dir = os.path.join(build_dir, 'ExternalData', 'Rendering', 'Core', 'Testing', 'Data', 'Baseline')
 for name, f in failures.items():
     f.setdefault('metal', os.path.join(temp_dir, name + '.png'))
     f.setdefault('diff', os.path.join(temp_dir, name + '.diff.png'))
-    f.setdefault('baseline', os.path.join(base_dir, name + '.png'))
+    f.setdefault('baseline', os.path.join(baseline_dir, name + '.png'))
 
 failed_tests = []
 if os.path.exists(failed_list):
@@ -131,7 +155,7 @@ if os.path.exists(failed_list):
         for line in f:
             line = line.strip()
             if line:
-                failed_tests.append(line.split(':', 1)[-1].replace('VTK::RenderingCoreCxx-Metal-', ''))
+                failed_tests.append(line.split(':', 1)[-1].replace('VTK::' + test_prefix + '-', ''))
 
 for old in os.listdir(out_dir):
     os.remove(os.path.join(out_dir, old))
