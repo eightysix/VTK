@@ -399,29 +399,56 @@ void vtkMetalImageSliceMapper::RenderPolygon(
     tris->Modified();
   }
 
-  // now rebuild the points/tcoords as needed
+  // Rebuild the polygon geometry only when it actually changes. The polydata
+  // is Modified() every frame otherwise, which makes vtkMetalPolyDataMapper
+  // see a new input MTime, release its geometry buffers and re-record its
+  // render bundle every frame. Compare the incoming coordinates/tcoords with
+  // the current contents and write only on a real difference.
+  double cur[3], curT[2];
+  bool polygonChanged = false;
+
   if (!points)
   {
     double coords[12], tcoords[8];
     this->MakeTextureGeometry(extent, coords, tcoords);
 
-    polyPoints->SetNumberOfPoints(4);
-    if (textured)
+    polygonChanged = (polyPoints->GetNumberOfPoints() != 4) ||
+      (textured && polyTCoords && polyTCoords->GetNumberOfTuples() != 4);
+    for (int i = 0; i < 4 && !polygonChanged; i++)
     {
-      polyTCoords->SetNumberOfTuples(4);
+      polyPoints->GetPoint(i, cur);
+      polygonChanged = (cur[0] != coords[3 * i] || cur[1] != coords[3 * i + 1] ||
+        cur[2] != coords[3 * i + 2]);
     }
-    for (int i = 0; i < 4; i++)
+    if (!polygonChanged && textured && polyTCoords)
     {
-      polyPoints->SetPoint(i, coords[3 * i], coords[3 * i + 1], coords[3 * i + 2]);
-      if (textured)
+      for (int i = 0; i < 4 && !polygonChanged; i++)
       {
-        polyTCoords->SetTuple(i, &tcoords[2 * i]);
+        polyTCoords->GetTuple(i, curT);
+        polygonChanged = (curT[0] != tcoords[2 * i] || curT[1] != tcoords[2 * i + 1]);
       }
     }
-    polyPoints->Modified();
-    if (textured)
+
+    if (polygonChanged)
     {
-      polyTCoords->Modified();
+      polyPoints->SetNumberOfPoints(4);
+      if (textured)
+      {
+        polyTCoords->SetNumberOfTuples(4);
+      }
+      for (int i = 0; i < 4; i++)
+      {
+        polyPoints->SetPoint(i, coords[3 * i], coords[3 * i + 1], coords[3 * i + 2]);
+        if (textured)
+        {
+          polyTCoords->SetTuple(i, &tcoords[2 * i]);
+        }
+      }
+      polyPoints->Modified();
+      if (textured)
+      {
+        polyTCoords->Modified();
+      }
     }
   }
   else if (points->GetNumberOfPoints())
@@ -439,31 +466,57 @@ void vtkMetalImageSliceMapper::RenderPolygon(
     double tcoord[2];
     double invDirection[9];
 
-    polyPoints->DeepCopy(points);
-    if (textured)
+    polygonChanged = (polyPoints->GetNumberOfPoints() != ncoords) ||
+      (textured && polyTCoords && polyTCoords->GetNumberOfTuples() != ncoords);
+    for (vtkIdType i = 0; i < ncoords && !polygonChanged; i++)
+    {
+      points->GetPoint(i, cur);
+      polyPoints->GetPoint(i, coord);
+      polygonChanged = (cur[0] != coord[0] || cur[1] != coord[1] || cur[2] != coord[2]);
+    }
+    if (!polygonChanged && textured && polyTCoords)
     {
       vtkMatrix3x3::Invert(this->DataDirection, invDirection);
-      polyTCoords->SetNumberOfTuples(ncoords);
-    }
-
-    for (vtkIdType i = 0; i < ncoords; i++)
-    {
-      if (textured)
+      for (vtkIdType i = 0; i < ncoords && !polygonChanged; i++)
       {
-        // convert points from 3D model coords to 2D texture coords
         points->GetPoint(i, coord);
         vtkMath::Subtract(coord, origin, coord);
         vtkMatrix3x3::MultiplyPoint(invDirection, coord, coord);
         tcoord[0] = (coord[0] - xshift) / xscale;
         tcoord[1] = (coord[1] - yshift) / yscale;
-        polyTCoords->SetTuple(i, tcoord);
+        polyTCoords->GetTuple(i, curT);
+        polygonChanged = (curT[0] != tcoord[0] || curT[1] != tcoord[1]);
       }
     }
-    if (textured)
+
+    if (polygonChanged)
     {
-      polyTCoords->Modified();
+      polyPoints->DeepCopy(points);
+      if (textured)
+      {
+        vtkMatrix3x3::Invert(this->DataDirection, invDirection);
+        polyTCoords->SetNumberOfTuples(ncoords);
+      }
+
+      for (vtkIdType i = 0; i < ncoords; i++)
+      {
+        if (textured)
+        {
+          // convert points from 3D model coords to 2D texture coords
+          points->GetPoint(i, coord);
+          vtkMath::Subtract(coord, origin, coord);
+          vtkMatrix3x3::MultiplyPoint(invDirection, coord, coord);
+          tcoord[0] = (coord[0] - xshift) / xscale;
+          tcoord[1] = (coord[1] - yshift) / yscale;
+          polyTCoords->SetTuple(i, tcoord);
+        }
+      }
+      if (textured)
+      {
+        polyTCoords->Modified();
+      }
+      polyPoints->Modified();
     }
-    polyPoints->Modified();
   }
   else // no polygon to render
   {
