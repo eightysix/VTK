@@ -1,50 +1,44 @@
 Metal volume image-compare failures (run: Aug 05 2026, full RenderingVolumeCxx-Metal suite)
 
-Blend-mode (MIP/MinIP/AverageIP/Additive) and binary-mask support is now implemented
-in the Metal volume ray-cast backend. This fixes TestGPURayCastAverageIP,
-TestGPURayCastMIPBinaryMask, and also TestGPURayCastCompositeBinaryMask1 /
-TestGPURayCastCompositeBinaryMask (previously failing because the mask was ignored).
+Uniform-grid blanking and ghost-array support is now implemented in the Metal
+volume ray-cast backend (cell/point ghost arrays are uploaded into a
+cell-centered RG8 3D texture and skipped during the march, mirroring the
+OpenGL backend's in_blanking texture + g_skip logic). This fixes
+TestGPURayCastVolumeUniformGridBlanking (0.0706 -> 0.0001) and
+TestGPURayCastVolumeGhostArrays (0.1646 -> pass).
 
-28 image-compare failures (TIGHT_VALID threshold 0.05):
+25 image-compare failures (TIGHT_VALID threshold 0.05):
   gross (>=0.5):
-    TestGPURayCastThreeComponentsAdditive    0.525820
-    TestGPURayCastCameraInsideSmallSpacing   0.564738
+    TestGPURayCastThreeComponentsAdditive    0.5239
+    TestGPURayCastCameraInsideSmallSpacing   0.5729
   mid (0.1-0.5):
-    TestGPURayCastVolumePicking              0.123568
-    TestSmartVolumeMapperWindowLevel         0.140651
-    TestGPURayCastPositionalLights           0.147344
-    TestGPURayCastFourComponentsDependentGradient 0.162799
-    TestGPURayCastVolumeGhostArrays          0.164621
-    TestGPURayCastCameraInside               0.165599
-    TestGPURayCastCameraInsideTransformation 0.196790
-    TestGPURayCastComputeNormalFromOpacity   0.212580
-    TestGPURayCastVolumeLightKit             0.222312
-    TestGPURayCastTwoComponentsDependentGradient 0.228205
-    TestGPURayCastTwoComponentsDependent     0.295232
-    TestGPURayCastLargeColorTransferFunction 0.325402
-    TestGPURayCastClippingUserTransform      0.326917
-    TestGPURayCastTwoComponentsIndependent   0.337196
-    TestGPURayCastMapperRectilinearGrid      0.386168
-    TestGPURayCastThreeComponentsIndependent 0.415203
-    TestGPURayCastOrientedVolume             0.430471
-    TestGPURayCastTwoComponentsGradient      0.449477
+    TestGPURayCastVolumePicking              0.1234
+    TestGPURayCastCameraInside               0.1315
+    TestGPURayCastPositionalLights           0.1475
+    TestGPURayCastFourComponentsDependentGradient 0.1611
+    TestGPURayCastVolumeGhostArraysCellData  0.1630
+    TestGPURayCastCameraInsideTransformation 0.1967
+    TestGPURayCastComputeNormalFromOpacity   0.2115
+    TestGPURayCastIndependentVectorMode      0.2229
+    TestGPURayCastVolumeLightKit             0.2230
+    TestGPURayCastTwoComponentsDependentGradient 0.2282
+    TestGPURayCastTwoComponentsDependent     0.2443
+    TestGPURayCastLargeColorTransferFunction 0.3250
+    TestGPURayCastClippingUserTransform      0.3258
+    TestGPURayCastTwoComponentsIndependent   0.3371
+    TestGPURayCastMapperRectilinearGrid      0.3826
+    TestGPURayCastThreeComponentsIndependent 0.4161
+    TestGPURayCastOrientedVolume             0.4325
+    TestGPURayCastTwoComponentsGradient      0.4495
   near-miss (0.05-0.1):
-    TestGPURayCastRenderToTexture            0.050107
-    TestSmartVolumeMapperVolumeUpdate        0.052489
-    TestMultiBlockMapperRectilinearGrid      0.054150
-    TestGPURayCastCropping1                  0.054390
-    TestMultiBlockMapper                     0.057540
-    TestGPURayCastCameraInsideNonUniformScaleTransform 0.069706
-    TestGPURayCastVolumeUniformGridBlanking  0.070561
-    TestGPURayCastShadedClipping             0.083452
+    TestGPURayCastCropping1                  0.0506
+    TestMultiBlockMapperRectilinearGrid      0.0552
+    TestGPURayCastRenderToTexture            0.0552
+    TestGPURayCastCameraInsideNonUniformScaleTransform 0.0595
+    TestGPURayCastShadedClipping             0.0840
 
-12 non-image failures (crash / pick-check, no render exported):
+7 non-image failures (crash / pick-check, no render exported):
     ProjectedTetrahedraZoomIn
-    TestGPURayCastDataTypesMIP
-    TestGPURayCastDataTypesMinIP
-    TestGPURayCastIndependentVectorMode
-    TestGPURayCastTransfer2D
-    TestGPURayCastVolumeGhostArraysCellData
     TestMultiBlockUnstructuredGridVolumeMapper
     TestProjectedTetrahedra
     TestProjectedTetrahedraOffscreen

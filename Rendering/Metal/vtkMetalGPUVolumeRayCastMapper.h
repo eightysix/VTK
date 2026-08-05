@@ -26,6 +26,7 @@ class vtkDataSet;
 class vtkImageData;
 class vtkPiecewiseFunction;
 class vtkRenderWindow;
+class vtkUnsignedCharArray;
 class vtkVolume;
 
 // Forward declarations for types defined in the .mm file.
@@ -201,6 +202,14 @@ private:
   int LastLabelMapMaxLabel = -1;
   size_t LastLabelMapLabelCount = 0;
 
+  // Blanking support (vtkUniformGrid / ghost arrays): a 3D texture at cell
+  // granularity marking which cells/points are blanked. Mirrors the OpenGL
+  // backend's blanking texture in vtkVolumeTexture.cxx.
+  void* BlankingTexture = nullptr;        // id<MTLTexture> (3D) — RG8Unorm cell-centered blanking flags (.x=point, .y=cell)
+  vtkTimeStamp BlankingUploadTime;
+  vtkSmartPointer<vtkUnsignedCharArray> BlankingPoints; // cached point ghost array (detects changes)
+  vtkSmartPointer<vtkUnsignedCharArray> BlankingCells;  // cached cell ghost array (detects changes)
+
   // Buffers
   void* UniformBuffers[3] = { nullptr, nullptr, nullptr }; // id<MTLBuffer>[3] — triple-buffered
   int UniformFrameIndex = 0;            // rotation index for triple-buffered uniforms
@@ -318,6 +327,9 @@ private:
 
   // Helper methods
   bool UpdateVolumeTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);
+  // Upload the cell/point ghost-array blanking flags into a cell-centered 3D
+  // texture. Returns true on success (or when no blanking is present).
+  bool UpdateBlankingTexture(void* mtlDevice, void* mtlQueue, vtkImageData* input);
 
   // Effective-input abstraction: converts vtkRectilinearGrid inputs and
   // cell-scalar inputs into an equivalent vtkImageData with point scalars so

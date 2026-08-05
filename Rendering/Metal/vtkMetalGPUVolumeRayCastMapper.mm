@@ -23,6 +23,7 @@
 #include "vtkCamera.h"
 #include "vtkCellData.h"
 #include "vtkMatrix4x4.h"
+#include "vtkUnsignedCharArray.h"
 #include "vtkSMPTools.h"
 #include "vtkMath.h"
 #include "vtkClipConvexPolyData.h"
@@ -145,10 +146,13 @@ struct VolumeMapperUniforms
   // Final color window/level (matches OpenGL in_scale/in_bias in finalizeRayCast)
   float FinalColorScale;          // 1012  (1.0 / FinalColorWindow)
   float FinalColorBias;           // 1016  (0.5 - FinalColorLevel / FinalColorWindow)
+  // Uniform-grid blanking (ghost arrays)
+  float UseBlanking;              // 1020  (1.0 = blanking texture bound and in use)
+  float BlankingMode;             // 1024  (1 = cell, 2 = point, 3 = both)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1020,
-  "VolumeMapperUniforms must be 1020 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1028,
+  "VolumeMapperUniforms must be 1028 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -2137,6 +2141,10 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
 
   this->ReleaseMaskResources();
 
+  ReleaseMetalObject(this->BlankingTexture);
+  this->BlankingPoints = nullptr;
+  this->BlankingCells = nullptr;
+
   // Phase 5: Release GPU min-max compute pipelines
   ReleaseMetalObject(this->MinMaxComputePipeline);
   ReleaseMetalObject(this->DilateComputePipeline);
@@ -2846,6 +2854,14 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
     }
   }
 
+  // Upload cell/point ghost-array blanking flags (vtkUniformGrid). Kept in
+  // sync with the effective input here so the blanking texture stays valid for
+  // the whole render frame.
+  if (!this->UpdateBlankingTexture(mtlDeviceVoid, mtlQueueVoid, input))
+  {
+    return false;
+  }
+
   // Phase 1C: Pre-warm common pipeline permutations to avoid first-use hitches.
   // PSO compilation takes 50-200ms on Apple Silicon; warming them up here on the
   // render thread (synchronous) ensures subsequent toggles are frame-rate smooth.
@@ -2899,6 +2915,136 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
   }
 
   return true;
+}
+
+//------------------------------------------------------------------------------
+bool vtkMetalGPUVolumeRayCastMapper::UpdateBlankingTexture(
+  void* mtlDeviceVoid, void* mtlQueueVoid, vtkImageData* input)
+{
+  (void)mtlQueueVoid;
+
+  vtkSmartPointer<vtkUnsignedCharArray> cellBlank = input->GetCellGhostArray();
+  vtkSmartPointer<vtkUnsignedCharArray> pointBlank = input->GetPointGhostArray();
+  bool blankCells = (cellBlank != nullptr);
+  bool blankPoints = (pointBlank != nullptr);
+
+  // No blanking present: release the texture (if any) so the uniforms disable
+  // the blanking path this frame.
+  if (!blankCells && !blankPoints)
+  {
+    this->BlankingPoints = nullptr;
+    this->BlankingCells = nullptr;
+    ReleaseMetalObject(this->BlankingTexture);
+    return true;
+  }
+
+  bool doReload = (this->BlankingTexture == nullptr);
+  doReload |= (input->GetMTime() > this->BlankingUploadTime.GetMTime());
+  doReload |= (this->BlankingPoints != pointBlank);
+  doReload |= (this->BlankingCells != cellBlank);
+  doReload |= (cellBlank && cellBlank->GetMTime() > this->BlankingUploadTime.GetMTime());
+  doReload |= (pointBlank && pointBlank->GetMTime() > this->BlankingUploadTime.GetMTime());
+
+  this->BlankingPoints = pointBlank;
+  this->BlankingCells = cellBlank;
+
+  if (!doReload)
+  {
+    return true;
+  }
+
+  @autoreleasepool
+  {
+    id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
+
+    int dims[3];
+    input->GetDimensions(dims);
+    if (dims[0] < 1 || dims[1] < 1 || dims[2] < 1)
+    {
+      return false;
+    }
+
+    // The blanking texture has the same (point) dimensions as the volume so
+    // texel (i,j,k) aligns with the volume texel sampled at the same
+    // coordinate, matching the OpenGL backend's Create3DFromRaw(blockSize).
+    // Two components: .x = point-blank flag, .y = cell-blank flag.
+    const vtkIdType nx = dims[0];
+    const vtkIdType ny = dims[1];
+    const vtkIdType nz = dims[2];
+    const vtkIdType cellStrideI = nx - 1;
+    const vtkIdType cellStrideJ = (nx - 1) * (ny - 1);
+    const vtkIdType numTexels = nx * ny * nz;
+
+    std::vector<unsigned char> blankingData(static_cast<size_t>(numTexels) * 2, 0);
+
+    if (blankPoints)
+    {
+      const unsigned char* src = pointBlank->GetPointer(0);
+      for (vtkIdType k = 0; k < nz; ++k)
+      {
+        for (vtkIdType j = 0; j < ny; ++j)
+        {
+          for (vtkIdType i = 0; i < nx; ++i)
+          {
+            vtkIdType texel = (k * ny + j) * nx + i;
+            vtkIdType ptId = texel;
+            blankingData[texel * 2 + 0] = src[ptId];
+          }
+        }
+      }
+    }
+
+    if (blankCells)
+    {
+      const unsigned char* src = cellBlank->GetPointer(0);
+      for (vtkIdType k = 0; k < nz; ++k)
+      {
+        const vtkIdType kc = (k < nz - 1) ? k : nz - 2;
+        for (vtkIdType j = 0; j < ny; ++j)
+        {
+          const vtkIdType jc = (j < ny - 1) ? j : ny - 2;
+          for (vtkIdType i = 0; i < nx; ++i)
+          {
+            const vtkIdType ic = (i < nx - 1) ? i : nx - 2;
+            vtkIdType texel = (k * ny + j) * nx + i;
+            vtkIdType cellId = kc * cellStrideJ + jc * cellStrideI + ic;
+            blankingData[texel * 2 + 1] = src[cellId];
+          }
+        }
+      }
+    }
+
+    ReleaseMetalObject(this->BlankingTexture);
+
+    id<MTLTexture> tex = NewTexture3D(
+      device,
+      MTLPixelFormatRG8Unorm,
+      static_cast<NSUInteger>(nx),
+      static_cast<NSUInteger>(ny),
+      static_cast<NSUInteger>(nz),
+      MTLTextureUsageShaderRead,
+      MTLStorageModeShared);
+    if (!tex)
+    {
+      vtkErrorMacro("Failed to create blanking texture");
+      return false;
+    }
+    AssignMetalObject(this->BlankingTexture, tex);
+
+    MTLRegion region = MTLRegionMake3D(0, 0, 0, nx, ny, nz);
+    NSUInteger bytesPerRow = static_cast<NSUInteger>(nx) * 2;
+    NSUInteger bytesPerImage = bytesPerRow * ny;
+    [tex replaceRegion:region
+          mipmapLevel:0
+                slice:0
+            withBytes:blankingData.data()
+          bytesPerRow:bytesPerRow
+        bytesPerImage:bytesPerImage];
+
+    this->BlankingUploadTime.Modified();
+  }
+
+  return this->BlankingTexture != nullptr;
 }
 
 //------------------------------------------------------------------------------
@@ -5223,6 +5369,7 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
   SetFragmentTextureOrFallback(encoder, 7, this->GradientNormalTexture, this->DummyVolumeTexture);
   SetFragmentTextureOrFallback(encoder, 9, this->Transfer2DTexture, this->ColorOpacityTexture);
   SetFragmentTextureOrFallback(encoder, 10, this->Transfer2DYAxisTexture, this->DummyVolumeTexture);
+  SetFragmentTextureOrFallback(encoder, 11, this->BlankingTexture, this->DummyVolumeTexture);
 }
 
 //------------------------------------------------------------------------------
@@ -5255,6 +5402,7 @@ void vtkMetalGPUVolumeRayCastMapper::BindFullscreenTextures(
   SetFragmentTextureOrFallback(encoder, 7, normalTexVoid, this->DummyVolumeTexture);
   SetFragmentTextureOrFallback(encoder, 9, this->Transfer2DTexture, this->ColorOpacityTexture);
   SetFragmentTextureOrFallback(encoder, 10, this->Transfer2DYAxisTexture, this->DummyVolumeTexture);
+  SetFragmentTextureOrFallback(encoder, 11, this->BlankingTexture, this->DummyVolumeTexture);
 }
 
 //------------------------------------------------------------------------------
@@ -5712,6 +5860,19 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   {
     uniforms.FinalColorScale = 1.0f;
     uniforms.FinalColorBias = 0.0f;
+  }
+
+  // Uniform-grid blanking (ghost arrays): enabled when a blanking texture was
+  // uploaded for this frame. Mode mirrors the OpenGL backend
+  // (1 = cell blanking, 2 = point blanking, 3 = both).
+  uniforms.UseBlanking = this->BlankingTexture ? 1.0f : 0.0f;
+  uniforms.BlankingMode = 0.0f;
+  if (this->BlankingTexture)
+  {
+    bool hasCells = (this->BlankingCells != nullptr);
+    bool hasPoints = (this->BlankingPoints != nullptr);
+    uniforms.BlankingMode =
+      (hasCells && hasPoints) ? 3.0f : (hasPoints ? 2.0f : (hasCells ? 1.0f : 0.0f));
   }
 
   // Gradient-based shading uniforms

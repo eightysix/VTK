@@ -2688,6 +2688,10 @@ struct VolumeMapperUniforms {
   // Final color window/level (matches OpenGL in_scale/in_bias in finalizeRayCast)
   float finalColorScale;
   float finalColorBias;
+  // Uniform-grid blanking (ghost arrays): blankingMode 1=cell, 2=point, 3=both.
+  // Mirrors the OpenGL backend's g_skip blanking logic.
+  float useBlanking;
+  float blankingMode;
 };
 
 struct VolumeLight {
@@ -3139,6 +3143,7 @@ inline half4 marchVolumeUnified(
     texture2d<float> labelMapTransferTexture,
     texture3d<float> minMaxTexture,
     texture3d<float> normalTexture,
+    texture3d<float> blankingTexture,
     constant VolumeLightUniforms* lightUniforms,
     thread float3* firstOpaquePos,
     thread bool*  haveOpaquePos)
@@ -3148,6 +3153,7 @@ inline half4 marchVolumeUnified(
   const bool doCropping = volumeUniforms.useCropping > 0.5;
   const bool doMask = fc_mask && (volumeUniforms.useMask > 0.5);
   const bool doTransfer2D = volumeUniforms.useTransfer2D > 0.5;
+  const bool doBlanking = volumeUniforms.useBlanking > 0.5;
 
   half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
   half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
@@ -3190,6 +3196,17 @@ inline half4 marchVolumeUnified(
   float maskScale = volumeUniforms.maskScale;
   float maskBias  = volumeUniforms.maskBias;
   float numLabels = volumeUniforms.labelMapNumLabels;
+
+  // Blanking: the blanking texture has the same (point) dimensions as the
+  // global volume, so the half-cell-step offset in normalized texel space is
+  // computed from its own dimensions (which equal the volume dims in the
+  // single-block path; grid-traversal bricks map the full [0,1] range so the
+  // global blanking dims remain correct). Sampling at +-half step catches the
+  // neighboring point/cell flags, mirroring the OpenGL backend's
+  // in_cellStep/2.0 offsets.
+  float3 blankHalfStep = 0.5f / float3(blankingTexture.get_width(),
+                                        blankingTexture.get_height(),
+                                        blankingTexture.get_depth());
 
   float3 cropMin = float3(volumeUniforms.croppingPlanes.x, volumeUniforms.croppingPlanes.z, volumeUniforms.croppingPlanes2.x);
   float3 cropMax = float3(volumeUniforms.croppingPlanes.y, volumeUniforms.croppingPlanes.w, volumeUniforms.croppingPlanes2.y);
@@ -3303,6 +3320,42 @@ inline half4 marchVolumeUnified(
     if (doMask && volumeUniforms.maskType > 0.5) {
       float binMask = rawMask * maskScale + maskBias;
       if (binMask <= 0.0) {
+        currentPoint += stepVec;
+        currentT += p.stepSize;
+        evalPoint += evalStep;
+        prefetchValid = false;
+        continue;
+      }
+    }
+
+    // Uniform-grid blanking: skip the texel if the current or neighboring
+    // points/cells (that share this texel) are blanked, matching the OpenGL
+    // backend's g_skip logic. Component 0 = point blanking, 1 = cell blanking.
+    // Each neighbor is sampled once; both flag components are read from the
+    // same RG texel. blankingMode: 1 = cell, 2 = point, 3 = both.
+    if (doBlanking) {
+      float4 bCur = blankingTexture.sample(sNearest, evalPoint, level(0));
+      float4 bXP = blankingTexture.sample(sNearest, evalPoint + float3(blankHalfStep.x, 0.0, 0.0), level(0));
+      float4 bXN = blankingTexture.sample(sNearest, evalPoint - float3(blankHalfStep.x, 0.0, 0.0), level(0));
+      float4 bYP = blankingTexture.sample(sNearest, evalPoint + float3(0.0, blankHalfStep.y, 0.0), level(0));
+      float4 bYN = blankingTexture.sample(sNearest, evalPoint - float3(0.0, blankHalfStep.y, 0.0), level(0));
+      float4 bZP = blankingTexture.sample(sNearest, evalPoint + float3(0.0, 0.0, blankHalfStep.z), level(0));
+      float4 bZN = blankingTexture.sample(sNearest, evalPoint - float3(0.0, 0.0, blankHalfStep.z), level(0));
+
+      const bool anyPoint = (bCur.x > 0.0 || bXP.x > 0.0 || bXN.x > 0.0 ||
+                             bYP.x > 0.0 || bYN.x > 0.0 || bZP.x > 0.0 || bZN.x > 0.0);
+      const bool anyCell  = (bCur.y > 0.0 || bXP.y > 0.0 || bXN.y > 0.0 ||
+                             bYP.y > 0.0 || bYN.y > 0.0 || bZP.y > 0.0 || bZN.y > 0.0);
+
+      bool blanked = false;
+      if (volumeUniforms.blankingMode == 1.0) {
+        blanked = anyCell;
+      } else if (volumeUniforms.blankingMode == 2.0) {
+        blanked = anyPoint;
+      } else {
+        blanked = (anyCell || anyPoint);
+      }
+      if (blanked) {
         currentPoint += stepVec;
         currentT += p.stepSize;
         evalPoint += evalStep;
@@ -3538,6 +3591,7 @@ inline half4 marchVolume(
     texture2d<float> labelMapTransferTexture,
     texture3d<float> minMaxTexture,
     texture3d<float> normalTexture,
+    texture3d<float> blankingTexture,
     constant VolumeLightUniforms* lightUniforms)
 {
   (void)exitPoint;
@@ -3550,7 +3604,7 @@ inline half4 marchVolume(
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
       transferFunction2DTexture, transfer2DYAxisTexture,
       gradientOpacityTexture, maskTexture, labelMapTransferTexture,
-      minMaxTexture, normalTexture, lightUniforms,
+      minMaxTexture, normalTexture, blankingTexture, lightUniforms,
       nullptr, nullptr);
 }
 
@@ -3575,6 +3629,7 @@ inline void marchSegment(
     texture2d<float> labelMapTransferTexture,
     texture3d<float> minMaxTexture,
     texture3d<float> normalTexture,
+    texture3d<float> blankingTexture,
     constant VolumeLightUniforms* lightUniforms)
 {
   float3 zero = float3(0.0);
@@ -3585,7 +3640,7 @@ inline void marchSegment(
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
       transferFunction2DTexture, transfer2DYAxisTexture,
       gradientOpacityTexture, maskTexture, labelMapTransferTexture,
-      minMaxTexture, normalTexture, lightUniforms,
+      minMaxTexture, normalTexture, blankingTexture, lightUniforms,
       nullptr, nullptr);
   accumulatedColor = result.xyz;
   accumulatedOpacity = result.w;
@@ -3605,6 +3660,7 @@ fragment VolumeFragmentOut fragment_volume_main(
     texture3d<float> normalTexture [[texture(7)]],
     texture2d<float> transferFunction2DTexture [[texture(9)]],
     texture3d<float> transfer2DYAxisTexture [[texture(10)]],
+    texture3d<float> blankingTexture [[texture(11)]],
     constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
 
   VolumeFragmentOut output;
@@ -3629,7 +3685,7 @@ fragment VolumeFragmentOut fragment_volume_main(
       volumeTexture, transferFunctionTexture, transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
       maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
-      &volumeLights);
+      blankingTexture, &volumeLights);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
@@ -3654,6 +3710,7 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
     texture3d<float> normalTexture [[texture(7)]],
     texture2d<float> transferFunction2DTexture [[texture(9)]],
     texture3d<float> transfer2DYAxisTexture [[texture(10)]],
+    texture3d<float> blankingTexture [[texture(11)]],
     constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
 
   VolumeFragmentOut output;
@@ -3675,7 +3732,7 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
       volumeTexture, transferFunctionTexture, transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
       maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
-      &volumeLights);
+      blankingTexture, &volumeLights);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
@@ -3700,6 +3757,7 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
     texture3d<float> normalTexture [[texture(7)]],
     texture2d<float> transferFunction2DTexture [[texture(9)]],
     texture3d<float> transfer2DYAxisTexture [[texture(10)]],
+    texture3d<float> blankingTexture [[texture(11)]],
     constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
 
   VolumeFragmentOutRTT output;
@@ -3732,7 +3790,7 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
       transferFunction2DTexture, transfer2DYAxisTexture,
       gradientOpacityTexture, maskTexture, labelMapTransferTexture,
-      minMaxTexture, normalTexture, &volumeLights,
+      minMaxTexture, normalTexture, blankingTexture, &volumeLights,
       &firstOpaquePos, &searching);
 
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
@@ -3892,6 +3950,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
     texture3d<float> brickOccupancy [[texture(8)]],
     texture2d<float> transferFunction2DTexture [[texture(9)]],
     texture3d<float> transfer2DYAxisTexture [[texture(10)]],
+    texture3d<float> blankingTexture [[texture(11)]],
     constant VolumeLightUniforms& volumeLights [[buffer(4)]])
 {
     VolumeFragmentOut output;
@@ -4024,7 +4083,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
                     volumeTexture, transferFunctionTexture,
                     transferFunction2DTexture, transfer2DYAxisTexture,
                     gradientOpacityTexture, maskTexture, labelMapTransferTexture,
-                    minMaxTexture, normalTexture,
+                    minMaxTexture, normalTexture, blankingTexture,
                     &volumeLights);
             }
         }
