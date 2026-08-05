@@ -6191,7 +6191,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     bool hasGradOp = property && property->HasGradientOpacity();
 
     uniforms.UseGradientShading = shadeOn ? 1.0f : 0.0f;
-    uniforms.UseGradientOpacity = (shadeOn && hasGradOp) ? 1.0f : 0.0f;
+    // Gradient opacity applies whenever the property declares it, independent of
+    // shading (OpenGL vtkVolumeShaderComposer HasGradientOpacity parity).
+    uniforms.UseGradientOpacity = hasGradOp ? 1.0f : 0.0f;
     // Match the OpenGL backend: the property's interpolation type applies to the
     // volume data, transfer-function and gradient-opacity textures
     // (vtkVolumeInputHelper). Defaults to nearest.

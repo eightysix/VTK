@@ -1,5 +1,13 @@
 Metal volume image-compare failures (run: Aug 05 2026, full RenderingVolumeCxx-Metal suite)
 
+Gradient opacity no longer depends on shading being enabled: the Metal backend
+was gating UseGradientOpacity on property->GetShade(), but the OpenGL backend
+applies gradient opacity whenever the property declares it. This fixes
+TestGPURayCastTwoComponentsGradient (0.4505 -> pass): previously the whole
+right-half box rendered as a plain purple slab (gradient opacity skipped), the
+baseline shows only the x=17 boundary plane sliver with gradient darkening at
+the top/bottom edges.
+
 Uniform-grid blanking and ghost-array support is now implemented in the Metal
 volume ray-cast backend (cell/point ghost arrays are uploaded into a
 cell-centered RG8 3D texture and skipped during the march, mirroring the
@@ -10,7 +18,7 @@ built from the original dataset's ghost arrays (the cell-data effective-input
 proxy carries only scalars), fixing TestGPURayCastVolumeGhostArraysCellData
 (0.1630 -> pass).
 
-21 image-compare failures (TIGHT_VALID threshold 0.05):
+20 image-compare failures (TIGHT_VALID threshold 0.05):
   gross (>=0.5):
     TestGPURayCastCameraInsideSmallSpacing    0.5729
   mid (0.1-0.5):
@@ -26,7 +34,6 @@ proxy carries only scalars), fixing TestGPURayCastVolumeGhostArraysCellData
     TestGPURayCastClippingUserTransform      0.3258
     TestGPURayCastComputeNormalFromOpacity   0.3837
     TestGPURayCastMapperRectilinearGrid      0.3838
-    TestGPURayCastTwoComponentsGradient      0.4505
   near-miss (0.05-0.1):
     TestGPURayCastCropping1                  0.0506
     TestMultiBlockMapperRectilinearGrid      0.0552
