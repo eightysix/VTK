@@ -1144,21 +1144,60 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     kUniformSlotCount = 12
   };
 
+  // Per-(renderer, actor) uniform storage. All twelve uniform structs are
+  // packed into ONE contiguous buffer (see UniformSlotOffsets) instead of
+  // twelve small buffers, so a draw can rebind them with a single batched
+  // setVertexBuffers:/setFragmentBuffers: call (one resource, one render-state
+  // update per stage) instead of twelve individual set*Buffer calls.
   struct PerRendererActorUniforms
   {
-    id<MTLBuffer> Buffers[kUniformSlotCount] = { nil };
+    id<MTLBuffer> Buffer = nil;
 
     void Release()
     {
-      for (int i = 0; i < kUniformSlotCount; ++i)
-      {
-        vtkMetalMRC::ReleaseAndNil(Buffers[i]);
-      }
+      vtkMetalMRC::ReleaseAndNil(Buffer);
     }
   };
 
   std::map<std::pair<vtkRenderer*, vtkActor*>, PerRendererActorUniforms>
     RendererActorUniforms;
+
+  // Packed-uniform-buffer layout: slot i occupies
+  // [UniformSlotOffsets[i], UniformSlotOffsets[i] + 16-byte-aligned size).
+  // Offsets are 16-byte aligned so they are valid set*Buffer offsets. Built
+  // once from the shared template buffer lengths (every buffer exists by the
+  // time the first RenderPiece uniform write runs).
+  NSUInteger UniformSlotOffsets[kUniformSlotCount] = {};
+  NSUInteger UniformRegionBytes = 0;
+  bool UniformLayoutBuilt = false;
+
+  void BuildUniformLayout()
+  {
+    if (this->UniformLayoutBuilt)
+    {
+      return;
+    }
+    id<MTLBuffer> shared[kUniformSlotCount] = {
+      this->SceneUniformBuffer, this->MaterialUniformBuffer, this->LightUniformBuffer,
+      this->CoincidentOffsetBuffer, this->EdgeUniformBuffer, this->VertexColorBuffer,
+      this->ClipPlaneBuffer, this->PropIdBuffer, this->EdgeColorUniformBuffer,
+      this->ThickLineLineWidthBuffer, this->MiterJoinSegmentCountBuffer,
+      this->EdgeTubeSegmentCountBuffer
+    };
+    // Fallback sizes for the rarely-nil slots at layout time (edge color).
+    constexpr NSUInteger kDefaultSlotSizes[kUniformSlotCount] = {
+      272, 176, 528, 32, 32, 16, 112, 16, 16, 16, 16, 16
+    };
+    NSUInteger off = 0;
+    for (int i = 0; i < kUniformSlotCount; ++i)
+    {
+      this->UniformSlotOffsets[i] = off;
+      NSUInteger len = shared[i] ? (NSUInteger)[shared[i] length] : kDefaultSlotSizes[i];
+      off += (len + 15u) & ~(NSUInteger)15u;
+    }
+    this->UniformRegionBytes = off;
+    this->UniformLayoutBuilt = true;
+  }
 
   PerRendererActorUniforms* GetRendererActorUniforms(vtkRenderer* ren, vtkActor* act)
   {
@@ -1552,15 +1591,122 @@ void vtkMetalPolyDataMapper::RemoveAllVertexAttributeMappings()
 // Uniform buffers (scene, material, light, etc.) are updated in-place each frame,
 // so replaying the same buffer bindings reads the latest content automatically.
 // Buffer bindings tagged with a UniformSlot are swapped for the current
-// (renderer, actor)'s copy: the recorded pointer is only a template, because the
-// shared buffers are overwritten by each renderer/actor while the GPU executes
-// the previously committed command buffers asynchronously.
+// (renderer, actor)'s packed uniform buffer: the recorded pointer is only a
+// template, because the shared buffers are overwritten by each renderer/actor
+// while the GPU executes the previously committed command buffers asynchronously.
 void vtkMetalPolyDataMapper::ReplayRenderBundle(
   void* mtlEncoder, vtkRenderer* ren, vtkActor* act)
 {
   id<MTLRenderCommandEncoder> encoder = (id<MTLRenderCommandEncoder>)mtlEncoder;
   using Cmd = vtkMetalPolyDataMapperInternals::RenderBundleDrawCommand;
   auto* uniforms = this->Internals->FindRendererActorUniforms(ren, act);
+  id<MTLBuffer> packed = (uniforms && uniforms->Buffer) ? uniforms->Buffer : nil;
+
+  // Batch the recorded uniform-buffer binds into one setVertexBuffers: and one
+  // setFragmentBuffers: call, so each draw rebinds a single packed uniform
+  // buffer (one resource, one render-state update per stage) instead of up to
+  // twelve individual set*Buffer calls. A shader index can only be batched
+  // when every recorded bind at that index maps to the same uniform slot AND
+  // the index is never used for a non-uniform (geometry) buffer: pipelines
+  // disagree on fragment buffer(4) (EdgeUniforms for the surface pipeline,
+  // VertexColorUniforms for the points pipeline), and vertex buffer(12) is
+  // PropIdBuffer in the point pipelines but ScalarCoordBuffer in the scalar
+  // pipeline. Conflicting/geometry indices stay as in-order individual binds.
+  constexpr int kShaderBufferCount = 13; // shader buffer indices 0..12
+  int vSlotAt[kShaderBufferCount] = {};
+  int fSlotAt[kShaderBufferCount] = {};
+  bool vBatched[kShaderBufferCount] = {};
+  bool fBatched[kShaderBufferCount] = {};
+  bool vConflict[kShaderBufferCount] = {};
+  bool fConflict[kShaderBufferCount] = {};
+  bool vNonUniform[kShaderBufferCount] = {};
+  bool fNonUniform[kShaderBufferCount] = {};
+  bool anyBatched = false;
+  if (packed)
+  {
+    for (const auto& cmd : this->Internals->Bundle.Commands)
+    {
+      switch (cmd.type)
+      {
+        case Cmd::SetVertexBuffer:
+        {
+          const auto& p = std::get<Cmd::SetBufferParams>(cmd.params);
+          if (p.index >= kShaderBufferCount)
+          {
+            break;
+          }
+          if (p.uniformSlot < 0)
+          {
+            vNonUniform[p.index] = true;
+          }
+          else if (!vBatched[p.index])
+          {
+            vSlotAt[p.index] = p.uniformSlot;
+            vBatched[p.index] = true;
+          }
+          else if (vSlotAt[p.index] != p.uniformSlot)
+          {
+            vConflict[p.index] = true;
+          }
+          break;
+        }
+        case Cmd::SetFragmentBuffer:
+        {
+          const auto& p = std::get<Cmd::SetBufferParams>(cmd.params);
+          if (p.index >= kShaderBufferCount)
+          {
+            break;
+          }
+          if (p.uniformSlot < 0)
+          {
+            fNonUniform[p.index] = true;
+          }
+          else if (!fBatched[p.index])
+          {
+            fSlotAt[p.index] = p.uniformSlot;
+            fBatched[p.index] = true;
+          }
+          else if (fSlotAt[p.index] != p.uniformSlot)
+          {
+            fConflict[p.index] = true;
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    }
+    for (int i = 0; i < kShaderBufferCount; ++i)
+    {
+      if (vBatched[i] && !vConflict[i] && !vNonUniform[i])
+      {
+        anyBatched = true;
+      }
+      if (fBatched[i] && !fConflict[i] && !fNonUniform[i])
+      {
+        anyBatched = true;
+      }
+    }
+    if (anyBatched)
+    {
+      id<MTLBuffer> vBufs[kShaderBufferCount];
+      NSUInteger vOffs[kShaderBufferCount];
+      id<MTLBuffer> fBufs[kShaderBufferCount];
+      NSUInteger fOffs[kShaderBufferCount];
+      for (int i = 0; i < kShaderBufferCount; ++i)
+      {
+        const bool vBatch = vBatched[i] && !vConflict[i] && !vNonUniform[i];
+        const bool fBatch = fBatched[i] && !fConflict[i] && !fNonUniform[i];
+        vBufs[i] = vBatch ? packed : nil;
+        vOffs[i] = vBatch ? this->Internals->UniformSlotOffsets[vSlotAt[i]] : 0;
+        fBufs[i] = fBatch ? packed : nil;
+        fOffs[i] = fBatch ? this->Internals->UniformSlotOffsets[fSlotAt[i]] : 0;
+      }
+      [encoder setVertexBuffers:vBufs offsets:vOffs withRange:NSMakeRange(0, kShaderBufferCount)];
+      [encoder setFragmentBuffers:fBufs offsets:fOffs withRange:NSMakeRange(0, kShaderBufferCount)];
+    }
+  }
+
   for (const auto& cmd : this->Internals->Bundle.Commands)
   {
     switch (cmd.type)
@@ -1571,10 +1717,23 @@ void vtkMetalPolyDataMapper::ReplayRenderBundle(
       case Cmd::SetVertexBuffer:
       {
         const auto& p = std::get<Cmd::SetBufferParams>(cmd.params);
-        id<MTLBuffer> buffer = p.buffer;
-        if (p.uniformSlot >= 0 && uniforms && uniforms->Buffers[p.uniformSlot])
+        // Skip uniform binds already covered by the batched setVertexBuffers
+        // call (the batch bound the packed buffer at the slot's offset for the
+        // whole draw, so the per-command bind would be redundant).
+        if (packed && p.uniformSlot >= 0 && p.index < kShaderBufferCount &&
+          vBatched[p.index] && !vConflict[p.index] && !vNonUniform[p.index] &&
+          vSlotAt[p.index] == p.uniformSlot)
         {
-          buffer = uniforms->Buffers[p.uniformSlot];
+          break;
+        }
+        id<MTLBuffer> buffer = p.buffer;
+        if (p.uniformSlot >= 0 && uniforms && uniforms->Buffer)
+        {
+          buffer = uniforms->Buffer;
+          [encoder setVertexBuffer:buffer
+                            offset:this->Internals->UniformSlotOffsets[p.uniformSlot]
+                           atIndex:p.index];
+          break;
         }
         [encoder setVertexBuffer:buffer offset:p.offset atIndex:p.index];
         break;
@@ -1582,17 +1741,30 @@ void vtkMetalPolyDataMapper::ReplayRenderBundle(
       case Cmd::SetFragmentBuffer:
       {
         const auto& p = std::get<Cmd::SetBufferParams>(cmd.params);
-        id<MTLBuffer> buffer = p.buffer;
-        if (p.uniformSlot >= 0 && uniforms && uniforms->Buffers[p.uniformSlot])
+        if (DebugEdgeEnabled() && p.index == 4 &&
+          p.uniformSlot == this->Internals->kUniformEdge && packed)
         {
-          buffer = uniforms->Buffers[p.uniformSlot];
+          float* fb = reinterpret_cast<float*>(
+            static_cast<char*>([packed contents]) +
+            this->Internals->UniformSlotOffsets[p.uniformSlot]);
+          fprintf(stderr, "[DBG] Replay setFragmentBuffer(4) act=%p slot=%d data=(%f,%f,%f,%f)\n",
+            (void*)act, p.uniformSlot, fb[0], fb[1], fb[2], fb[3]);
         }
-        if (DebugEdgeEnabled() && p.index == 4)
+        // Skip uniform binds already covered by the batched setFragmentBuffers call.
+        if (packed && p.uniformSlot >= 0 && p.index < kShaderBufferCount &&
+          fBatched[p.index] && !fConflict[p.index] && !fNonUniform[p.index] &&
+          fSlotAt[p.index] == p.uniformSlot)
         {
-          float* fb = (float*)[buffer contents];
-          fprintf(stderr, "[DBG] Replay setFragmentBuffer(4) act=%p slot=%d buf=%p data=(%f,%f,%f,%f) len=%llu\n",
-            (void*)act, p.uniformSlot, (void*)buffer, fb[0], fb[1], fb[2], fb[3],
-            (unsigned long long)[buffer length]);
+          break;
+        }
+        id<MTLBuffer> buffer = p.buffer;
+        if (p.uniformSlot >= 0 && uniforms && uniforms->Buffer)
+        {
+          buffer = uniforms->Buffer;
+          [encoder setFragmentBuffer:buffer
+                              offset:this->Internals->UniformSlotOffsets[p.uniformSlot]
+                             atIndex:p.index];
+          break;
         }
         [encoder setFragmentBuffer:buffer offset:p.offset atIndex:p.index];
         break;
@@ -3913,22 +4085,25 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
     // them asynchronously, so without per-(renderer, actor) storage every draw
     // would read the LAST renderer's camera (multi-viewport aspect distortion)
     // or LAST actor's material (shared-mapper color leaks). Each (renderer,
-    // actor) renders through its own copy, substituted at bundle-replay time.
+    // actor) renders through its own packed copy, substituted at replay time.
     if (auto* uniforms = this->Internals->GetRendererActorUniforms(ren, act))
     {
+      this->Internals->BuildUniformLayout();
+      id<MTLBuffer>& target = uniforms->Buffer;
+      if (!target)
+      {
+        vtkMetalMRC::AssignConsumed(target,
+          [device newBufferWithLength:this->Internals->UniformRegionBytes
+                              options:MTLResourceStorageModeShared]);
+      }
+      char* dst = static_cast<char*>([target contents]);
       auto syncSlot = [&](int slot, id<MTLBuffer> shared) {
         if (!shared)
         {
           return;
         }
-        id<MTLBuffer>& target = uniforms->Buffers[slot];
-        if (!target || [target length] != [shared length])
-        {
-          vtkMetalMRC::AssignConsumed(target,
-            [device newBufferWithLength:[shared length]
-                                options:MTLResourceStorageModeShared]);
-        }
-        memcpy([target contents], [shared contents], [shared length]);
+        memcpy(dst + this->Internals->UniformSlotOffsets[slot], [shared contents],
+          [shared length]);
       };
       syncSlot(this->Internals->kUniformScene, this->Internals->SceneUniformBuffer);
       syncSlot(this->Internals->kUniformMaterial, this->Internals->MaterialUniformBuffer);
@@ -3937,7 +4112,8 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       syncSlot(this->Internals->kUniformEdge, this->Internals->EdgeUniformBuffer);
       if (DebugEdgeEnabled())
       {
-        float* ec = (float*)[uniforms->Buffers[this->Internals->kUniformEdge] contents];
+        float* ec = reinterpret_cast<float*>(
+          dst + this->Internals->UniformSlotOffsets[this->Internals->kUniformEdge]);
         fprintf(stderr, "[DBG] sync edge slot act=%p copy=(%f,%f,%f,%f)\n",
           (void*)act, ec[0], ec[1], ec[2], ec[3]);
       }
