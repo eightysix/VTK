@@ -149,10 +149,17 @@ struct VolumeMapperUniforms
   // Uniform-grid blanking (ghost arrays)
   float UseBlanking;              // 1020  (1.0 = blanking texture bound and in use)
   float BlankingMode;             // 1024  (1 = cell, 2 = point, 3 = both)
+  float _padDirAlign[3];          // 1028..1039  (pad to 16-byte for float4x4)
+  // Image-data direction support (OpenGL TextureToDataset parity):
+  // TextureToVolume maps [0,1] texture coords to model-space (rotated dataset)
+  // coords including the image-data direction matrix; VolumeToTexture is its
+  // inverse.
+  float TextureToVolumeMatrix[16]; // 1040..1103
+  float VolumeToTextureMatrix[16]; // 1104..1167
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1028,
-  "VolumeMapperUniforms must be 1028 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1168,
+  "VolumeMapperUniforms must be 1168 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -165,6 +172,8 @@ static_assert(offsetof(VolumeMapperUniforms, UseMinMaxAccel) == 960, "");
 static_assert(offsetof(VolumeMapperUniforms, AverageIPRangeMin) == 1000, "");
 static_assert(offsetof(VolumeMapperUniforms, AverageIPRangeMax) == 1004, "");
 static_assert(offsetof(VolumeMapperUniforms, MaskType) == 1008, "");
+static_assert(offsetof(VolumeMapperUniforms, TextureToVolumeMatrix) == 1040, "");
+static_assert(offsetof(VolumeMapperUniforms, VolumeToTextureMatrix) == 1104, "");
 
 // Per-light data for volume shading — must match Metal VolumeLight struct
 // Must match Metal VolumeLight (6 x float4 = 96 bytes per light)
@@ -995,18 +1004,30 @@ static VolumeBounds ComputeVolumeBounds(vtkImageData* input)
   input->GetExtent(ext);
   input->GetOrigin(origin);
   input->GetSpacing(spacing);
-  double x0 = origin[0] + spacing[0] * ext[0];
-  double x1 = origin[0] + spacing[0] * ext[1];
-  double y0 = origin[1] + spacing[1] * ext[2];
-  double y1 = origin[1] + spacing[1] * ext[3];
-  double z0 = origin[2] + spacing[2] * ext[4];
-  double z1 = origin[2] + spacing[2] * ext[5];
-  bounds.Min[0] = std::min(x0, x1);
-  bounds.Max[0] = std::max(x0, x1);
-  bounds.Min[1] = std::min(y0, y1);
-  bounds.Max[1] = std::max(y0, y1);
-  bounds.Min[2] = std::min(z0, z1);
-  bounds.Max[2] = std::max(z0, z1);
+  vtkMatrix3x3* direction = input->GetDirectionMatrix();
+
+  // Rotate the 8 extents corners through the image-data direction matrix and
+  // take the axis-aligned bounds, mirroring the OpenGL backend's
+  // vtkVolumeTexture::ComputeBounds (LoadedBoundsAA).
+  int ijkCorners[8][3] = {
+    { ext[0], ext[2], ext[4] }, { ext[1], ext[2], ext[4] }, { ext[0], ext[3], ext[4] },
+    { ext[1], ext[3], ext[4] }, { ext[0], ext[2], ext[5] }, { ext[1], ext[2], ext[5] },
+    { ext[0], ext[3], ext[5] }, { ext[1], ext[3], ext[5] },
+  };
+  double xyz[3];
+  bounds.Min[0] = bounds.Min[1] = bounds.Min[2] = VTK_DOUBLE_MAX;
+  bounds.Max[0] = bounds.Max[1] = bounds.Max[2] = VTK_DOUBLE_MIN;
+  for (int i = 0; i < 8; ++i)
+  {
+    vtkImageData::TransformContinuousIndexToPhysicalPoint(
+      ijkCorners[i][0], ijkCorners[i][1], ijkCorners[i][2], origin, spacing,
+      direction->GetData(), xyz);
+    for (int k = 0; k < 3; ++k)
+    {
+      bounds.Min[k] = std::min(bounds.Min[k], xyz[k]);
+      bounds.Max[k] = std::max(bounds.Max[k], xyz[k]);
+    }
+  }
   for (int i = 0; i < 3; ++i)
   {
     bounds.Size[i] = bounds.Max[i] - bounds.Min[i];
@@ -2430,13 +2451,22 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureEffectiveInput()
     img->GetSpacing(spacing);
     img->GetOrigin(origin);
     proxy->SetDimensions(cdims);
-    double shiftedOrigin[3];
+    // Shift the origin to the center of cell (0,0,0), rotating the half-cell
+    // offset through the direction matrix so the cell-data proxy lands on the
+    // same physical positions as the source cell centers.
+    vtkMatrix3x3* dirMat = img->GetDirectionMatrix();
+    double shiftedOrigin[3] = { 0.0, 0.0, 0.0 };
     for (int i = 0; i < 3; ++i)
     {
-      shiftedOrigin[i] = origin[i] + 0.5 * spacing[i];
+      for (int j = 0; j < 3; ++j)
+      {
+        shiftedOrigin[i] += 0.5 * dirMat->GetElement(i, j) * spacing[j];
+      }
+      shiftedOrigin[i] += origin[i];
     }
     proxy->SetOrigin(shiftedOrigin);
     proxy->SetSpacing(spacing);
+    proxy->SetDirectionMatrix(img->GetDirectionMatrix());
     proxy->GetPointData()->SetScalars(scalars);
     proxy->Modified();
   }
@@ -5788,6 +5818,54 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     {
       uniforms.VolumeToWorldMatrix[c * 4 + r] = modelMatrix->GetElement(r, c);
       uniforms.WorldToVolumeMatrix[c * 4 + r] = invModelMatrix->GetElement(r, c);
+    }
+  }
+
+  // TextureToVolume / VolumeToTexture (OpenGL TextureToDataset parity): maps
+  // [0,1] texture coordinates to model-space (rotated dataset) coordinates,
+  // including the image-data direction matrix. The box geometry spans the
+  // rotated AABB, so the vertex shader uses VolumeToTexture to compute the
+  // texture coordinate of each corner and the fragment shader maps every
+  // sample position back to texture space before looking up the volume.
+  {
+    int ext[6];
+    double origin[3], spacing[3];
+    input->GetExtent(ext);
+    input->GetOrigin(origin);
+    input->GetSpacing(spacing);
+    vtkMatrix3x3* dir = input->GetDirectionMatrix();
+
+    double width[3];
+    for (int c = 0; c < 3; ++c)
+    {
+      width[c] = std::fabs(spacing[c]) * static_cast<double>(ext[2 * c + 1] - ext[2 * c]);
+    }
+
+    double blockOrigin[3];
+    vtkImageData::TransformContinuousIndexToPhysicalPoint(
+      ext[0], ext[2], ext[4], origin, spacing, dir->GetData(), blockOrigin);
+
+    vtkNew<vtkMatrix4x4> texToVol;
+    texToVol->Identity();
+    for (int c = 0; c < 3; ++c)
+    {
+      for (int i = 0; i < 3; ++i)
+      {
+        texToVol->SetElement(c, i, dir->GetElement(c, i) * width[i]);
+      }
+      texToVol->SetElement(c, 3, blockOrigin[c]);
+    }
+
+    vtkNew<vtkMatrix4x4> volToTex;
+    vtkMatrix4x4::Invert(texToVol, volToTex);
+
+    for (int r = 0; r < 4; ++r)
+    {
+      for (int c = 0; c < 4; ++c)
+      {
+        uniforms.TextureToVolumeMatrix[c * 4 + r] = texToVol->GetElement(r, c);
+        uniforms.VolumeToTextureMatrix[c * 4 + r] = volToTex->GetElement(r, c);
+      }
     }
   }
 

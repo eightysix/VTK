@@ -2692,6 +2692,10 @@ struct VolumeMapperUniforms {
   // Mirrors the OpenGL backend's g_skip blanking logic.
   float useBlanking;
   float blankingMode;
+  // Image-data direction support (OpenGL TextureToDataset parity): maps [0,1]
+  // texture coords to model-space (rotated dataset) coords, and its inverse.
+  float4x4 textureToVolume;
+  float4x4 volumeToTexture;
 };
 
 struct VolumeLight {
@@ -2872,11 +2876,15 @@ inline float3 cellToPointTextureCoord(float3 texCoord, float3 scale, float3 offs
   return texCoord * scale + offset;
 }
 
-// Optimized: Gradient fetch with direction correction for anisotropic spacing.
-// gradScale = 1 / (gradientStep * texSizeGlobal) converts raw central-difference
-// components from texture-local to normalized-volume space.
+// Gradient fetch with direction correction for anisotropic spacing and image-data
+// direction. The raw central-difference gradient is in texel units along the
+// texture (i/j/k) axes; dividing by gradStep gives a per-texture-coordinate-unit
+// gradient, which is then transformed to model (data) space via the transpose of
+// the volumeToTexture linear part. This handles both per-axis spacing and the
+// direction matrix (matches the OpenGL backend's textureToEye * computeGradient()
+// normal transform).
 inline half4 computeGradientFast(texture3d<float> volTex, float3 pos,
-                                 float3 gradStep, half3 gradScale, half gradNormFactor) {
+                                 float3 gradStep, float4x4 volumeToTexture, half gradNormFactor) {
   half sPX = half(sampleVolumeScalar(volTex, pos + float3(gradStep.x, 0, 0)));
   half sNX = half(sampleVolumeScalar(volTex, pos - float3(gradStep.x, 0, 0)));
   half sPY = half(sampleVolumeScalar(volTex, pos + float3(0, gradStep.y, 0)));
@@ -2886,7 +2894,10 @@ inline half4 computeGradientFast(texture3d<float> volTex, float3 pos,
 
   half3 rawGrad = half3(sPX - sNX, sPY - sNY, sPZ - sNZ);
 
-  half3 correctedGrad = rawGrad * gradScale;
+  float3 gradTex = float3(rawGrad) / max(gradStep, 1e-8);
+  float3x3 texToModelLin =
+    float3x3(volumeToTexture[0].xyz, volumeToTexture[1].xyz, volumeToTexture[2].xyz);
+  half3 correctedGrad = half3(transpose(texToModelLin) * gradTex);
   half mag = length(correctedGrad);
   half3 normal = mag > 0.0h ? correctedGrad / mag : half3(0.0h);
 
@@ -3163,28 +3174,28 @@ inline half4 marchVolumeUnified(
 
   half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
 
-  float3 texSizeGlobal = max(p.texMaxGlobal - p.texMinGlobal, 1e-6);
-  float3 invTexSizeGlobal = 1.0 / texSizeGlobal;
-  float3 rayDirTexLocal = p.rayDir * invTexSizeGlobal;
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
+                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  // Advance of the sample position in texture space per ray step (constant),
+  // including the image-data direction matrix: the ray direction/step are in
+  // normalized volume space and are converted to [0,1] texture coords via
+  // volumeToTexture (OpenGL TextureToDataset parity).
+  float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(p.rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * p.stepSize;
   // Cell-to-point conversion factors, computed once (texel centers at (i+0.5)/dims).
   float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
   float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
   float3 ctpOffset  = 0.5 / texelCount;
-  // Advance of the cellToPoint-adjusted sample position per step (constant).
-  float3 evalStep = rayDirTexLocal * p.stepSize * ctpScale;
-  float3 dt = max(b.gradientStep.xyz, 1e-8);
-  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
-                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-  half3 gradScale = half3(1.0 / (dt * texSizeGlobal * boundsSize));
+  float3 evalStep = texStep * ctpScale;
 
   // Lighting directions must live in the same (physical/data) space as the
-  // gradient normal: the normal is expressed per world-unit (gradScale divides
-  // by the per-axis bounds), so the headlight direction must be converted from
-  // the normalized volume frame back to data space (offset * boundsSize) before
-  // computing nDotL/vDotR. OpenGL computes g_ldir/g_vdir directly in object
-  // space (normalize(eyePosObj - vertexPosObj)); using the distorted volume
-  // frame here would bias nDotL for anisotropic bounds and fire specular on
-  // surfaces where OpenGL's nDotL is <= 0.
+  // gradient normal: the normal is expressed per world-unit (the gradient is
+  // scaled by the direction/spacing transform), so the headlight direction must
+  // be converted from the normalized volume frame back to data space (offset *
+  // boundsSize) before computing nDotL/vDotR. OpenGL computes g_ldir/g_vdir
+  // directly in object space (normalize(eyePosObj - vertexPosObj)); using the
+  // distorted volume frame here would bias nDotL for anisotropic bounds and fire
+  // specular on surfaces where OpenGL's nDotL is <= 0.
   float3 entryVolPos = p.rayOrigin + p.rayDir * p.tStart;
   half3 viewDirHalf  = half3(normalize((entryVolPos - volumeUniforms.cameraVolumePos.xyz) * boundsSize));
   half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection * boundsSize));
@@ -3237,9 +3248,11 @@ inline half4 marchVolumeUnified(
   bool firstBlendSample = true;
 
   // Sample position carried incrementally through the march: advance one ray
-  // step per iteration instead of recomputing.
-  float3 texLocalPos0 = (currentPoint - p.texMinGlobal) * invTexSizeGlobal;
-  float3 evalPoint = cellToPointTextureCoord(texLocalPos0, ctpScale, ctpOffset);
+  // step per iteration instead of recomputing. texLocalPos lives in [0,1]
+  // texture space; currentPoint is in normalized volume space (the AABB).
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
+  float3 evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
   float prefetchScalar = sampleVolumeScalar(volumeTexture, evalPoint);
   float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint, level(0)).r : 0.0;
   bool prefetchValid = true;
@@ -3251,9 +3264,29 @@ inline half4 marchVolumeUnified(
     b.minMaxInfo.y > 0.5 &&
     b.minMaxInfo.z > 0.5 &&
     b.minMaxInfo.w > 0.5;
+  // True once any sample inside [0,1]^3 texture space has been reached. The
+  // texture cube is axis-aligned and the ray is a straight line in texture
+  // space, so a ray's in-bounds samples form a single contiguous interval:
+  // after it has been inside and gone out, it can never re-enter.
+  bool seenInBounds = false;
 
   for (int i = 0; i < maxSteps; i++) {
     if (!p.checkBounds && currentT >= p.tEnd - 1e-6) break;
+
+    // The proxy box spans the axis-aligned bounds of the rotated volume, so
+    // rays through its corner regions fall outside the [0,1]^3 texture cube.
+    // Skip those samples (they contain no data) and keep marching; once the
+    // ray has passed through the cube and left it, stop entirely.
+    if (any(texLocalPos < float3(0.0)) || any(texLocalPos > float3(1.0))) {
+      if (seenInBounds) break;
+      currentPoint += stepVec;
+      currentT += p.stepSize;
+      texLocalPos += texStep;
+      evalPoint += evalStep;
+      prefetchValid = false;
+      continue;
+    }
+    seenInBounds = true;
 
     if (useMinMax) {
       float3 mmPos = clamp(evalPoint, float3(0.0), float3(1.0));
@@ -3291,7 +3324,9 @@ inline half4 marchVolumeUnified(
         }
 
         // Re-sync the incremental sample position after the empty-cell jump.
-        evalPoint = cellToPointTextureCoord((currentPoint - p.texMinGlobal) * invTexSizeGlobal, ctpScale, ctpOffset);
+        texLocalPos = (volumeUniforms.volumeToTexture *
+            float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
+        evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
         prefetchValid = false;
         curCell = int3(-1);
         continue;
@@ -3309,6 +3344,7 @@ inline half4 marchVolumeUnified(
     if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, currentPoint))) == 0u)) {
       currentPoint += stepVec;
       currentT += p.stepSize;
+      texLocalPos += texStep;
       evalPoint += evalStep;
       prefetchValid = false;
       continue;
@@ -3322,6 +3358,7 @@ inline half4 marchVolumeUnified(
       if (binMask <= 0.0) {
         currentPoint += stepVec;
         currentT += p.stepSize;
+        texLocalPos += texStep;
         evalPoint += evalStep;
         prefetchValid = false;
         continue;
@@ -3358,6 +3395,7 @@ inline half4 marchVolumeUnified(
       if (blanked) {
         currentPoint += stepVec;
         currentT += p.stepSize;
+        texLocalPos += texStep;
         evalPoint += evalStep;
         prefetchValid = false;
         continue;
@@ -3389,7 +3427,7 @@ inline half4 marchVolumeUnified(
         // magnitude, using the same normalization as gradient opacity — this is
         // the OpenGL backend's grad.w, which it feeds to both the gradient
         // opacity table and the 2D transfer function y-coordinate.
-        sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
+        sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
         sharedGradReady = true;
         secondNorm = sharedGrad.w;
       } else {
@@ -3478,7 +3516,7 @@ inline half4 marchVolumeUnified(
           gradMag = nrmSample.w;
         } else {
           if (!sharedGradReady) {
-            sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, gradScale, gradNormFactor);
+            sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
             sharedGradReady = true;
           }
           normal = sharedGrad.xyz;
@@ -3511,6 +3549,7 @@ inline half4 marchVolumeUnified(
 
     currentPoint += stepVec;
     currentT += p.stepSize;
+    texLocalPos += texStep;
     evalPoint += evalStep;
 
     if (i + 1 < maxSteps) {
