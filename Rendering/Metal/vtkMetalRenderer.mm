@@ -181,6 +181,12 @@ void vtkMetalRenderer::DeviceRender()
     return;
   }
 
+  // vtkRenderer::UpdateGeometry resets this counter each frame, but this
+  // renderer replaces the base render loop (DeviceRender) without calling
+  // UpdateGeometry. Reset it here so per-frame prop counts do not accumulate
+  // across frames (vtkFixedPointVolumeRayCastMapper::CaptureZBuffer checks it).
+  this->NumberOfPropsRendered = 0;
+
   @autoreleasepool
   {
     id<MTLDevice> device = (__bridge id<MTLDevice>)renWin->GetMetalDevice();

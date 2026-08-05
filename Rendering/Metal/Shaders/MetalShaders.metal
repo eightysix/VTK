@@ -3854,6 +3854,38 @@ fragment float4 fragment_image_sample_blit(
   return offscreenColor.sample(sVolume, in.texCoord);
 }
 
+// ---------------------------------------------------------------------------
+// RayCastImageDisplayHelper: draw a CPU-produced ray-cast image (vtkFixedPoint
+// VolumeRayCastMapper) as a textured quad at a viewport region, matching
+// vtkOpenGLRayCastImageDisplayHelper.
+// ---------------------------------------------------------------------------
+struct RayCastDisplayVertex {
+  float4 position;  // NDC xyz (w unused)
+  float2 texCoord;
+};
+
+struct RayCastDisplayVertexOut {
+  float4 position [[position]];
+  float2 texCoord;
+};
+
+vertex RayCastDisplayVertexOut vertex_raycast_display(
+    const device RayCastDisplayVertex* verts [[buffer(0)]],
+    uint vertex_id [[vertex_id]]) {
+  RayCastDisplayVertexOut out;
+  out.position = float4(verts[vertex_id].position.xyz, 1.0);
+  out.texCoord = verts[vertex_id].texCoord;
+  return out;
+}
+
+fragment float4 fragment_raycast_display(
+    RayCastDisplayVertexOut in [[stage_in]],
+    texture2d<float> source [[texture(0)]],
+    sampler sourceSampler [[sampler(0)]],
+    constant float& scale [[buffer(0)]]) {
+  return source.sample(sourceSampler, in.texCoord) * scale;
+}
+
 // --- PHASE 7: GPU COMPUTE KERNELS FOR DATA TYPE CONVERSION ---
 // Reads raw scalar data from a device buffer and writes the converted
 // result directly into a 3D texture.  Replaces the CPU vtkSMPTools loop

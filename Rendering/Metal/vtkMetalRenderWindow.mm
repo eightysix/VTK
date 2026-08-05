@@ -873,7 +873,14 @@ void vtkMetalRenderWindow::WaitForCompletion()
     id<MTLCommandBuffer> buf = (id<MTLCommandBuffer>)this->CommandBuffer;
     if (buf)
     {
-      [buf waitUntilCompleted];
+      // A command buffer that has not been committed (still being encoded,
+      // e.g. a CPU-side readback requested mid-frame by a software volume
+      // mapper) can never complete; waitUntilCompleted on it would block
+      // forever. Only block on committed buffers.
+      if (buf.status != MTLCommandBufferStatusNotEnqueued)
+      {
+        [buf waitUntilCompleted];
+      }
     }
   }
 }
