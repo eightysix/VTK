@@ -165,7 +165,8 @@ struct VolumeMapperUniforms
   uint32_t NumComponents;          // 1216..1219
   float UseIndependentComponents;  // 1220..1223
   float _padIndependent[3];        // 1224..1235
-  float _padEnd2[3];               // 1236..1247  (trailing pad to 1248)
+  float UseDependentRGBA;          // 1236..1239  (4-comp dependent RGBA: raw RGB color, opacity LUT on scalar.w)
+  float _padEnd2[2];               // 1240..1247  (trailing pad to 1248)
   // Per-component material (OpenGL in_ambient[4]/in_diffuse[4]/in_specular[4]/
   // in_shininess[4] parity). Indexed by component in the independent path.
   float AmbientColorComp[4][4];    // 1248..1311
@@ -3160,12 +3161,21 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
     return false;
   }
 
+  // Dependent RGBA (4-component): the opacity LUT is built over the LAST
+  // component's scalar range (OpenGL UpdateTransferFunctions RGBA branch passes
+  // numComp - 1 to UpdateOpacityTransferFunction). The shader samples it with
+  // the raw normalized fetch (scalar.w), so the table range alone determines
+  // the sampled opacity. Color is unused in this mode (raw scalar.xyz).
+  const bool dependentRGBA =
+    (this->VolumeNumComponents == 4) && property && !property->GetIndependentComponents();
+  const double* tfRange = dependentRGBA ? this->ComponentScalarRange[3] : this->ScalarRange;
+
   bool sampleDistChanged =
     (actualSampleDistance != this->LastTransferFunctionSampleDist);
 
   bool scalarRangeChanged =
-    (this->ScalarRange[0] != this->LastTransferFunctionScalarRange[0]) ||
-    (this->ScalarRange[1] != this->LastTransferFunctionScalarRange[1]);
+    (tfRange[0] != this->LastTransferFunctionScalarRange[0]) ||
+    (tfRange[1] != this->LastTransferFunctionScalarRange[1]);
 
   bool doReload = (this->ColorOpacityTexture == nullptr);
   doReload |= (colorFunc->GetMTime() > this->TransferFunctionUploadTime.GetMTime());
@@ -3190,7 +3200,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
       std::vector<uint16_t> tfData(static_cast<size_t>(tfWidth) * 4);
       FillTransferFunctionRGBA16FWithPreIntegration(
         colorFunc, opacityFunc,
-        this->ScalarRange[0], this->ScalarRange[1],
+        tfRange[0], tfRange[1],
         tfWidth, tfData.data(),
         preIntegrationFactor);
 
@@ -3225,8 +3235,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
               withBytes:tfData.data()
             bytesPerRow:static_cast<NSUInteger>(tfWidth) * 8];
 
-      this->LastTransferFunctionScalarRange[0] = this->ScalarRange[0];
-      this->LastTransferFunctionScalarRange[1] = this->ScalarRange[1];
+      this->LastTransferFunctionScalarRange[0] = tfRange[0];
+      this->LastTransferFunctionScalarRange[1] = tfRange[1];
       this->LastTransferFunctionSampleDist = actualSampleDistance;
       this->TransferFunctionUploadTime.Modified();
     }
@@ -3363,8 +3373,30 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
     return false;
   }
 
+  // Gradient opacity LUT range (OpenGL vtkVolumeInputHelper parity):
+  //   single-component / independent mode  -> component 0's scalar range
+  //   dependent multi-component (LA/RGBA)  -> the LAST component's scalar range
+  //     (UpdateGradientOpacityTransferFunction passes numComp - 1 for RGBA/LA).
+  // The shader normalizes the gradient magnitude against the range of the
+  // component the gradient is computed on (component 0 for LA), so the LUT
+  // coordinate saturates to 1.0 at data boundaries regardless of the table
+  // range — hence the table range alone determines the sampled opacity.
+  const bool dependentMulti =
+    (this->VolumeNumComponents > 1) && (property->GetIndependentComponents() == 0);
+  const int gradComp = dependentMulti ? (this->VolumeNumComponents - 1) : 0;
+  const double* gradRange =
+    dependentMulti ? this->ComponentScalarRange[gradComp] : this->ScalarRange;
+  double scalarRange = gradRange[1] - gradRange[0];
+  if (scalarRange <= 0.0)
+  {
+    scalarRange = 1.0;
+  }
+  double gradMax = scalarRange * 0.25;
+
   bool doReload = (this->GradientOpacityTexture == nullptr);
   doReload |= (gradOpacityFunc->GetMTime() > this->GradientOpacityUploadTime.GetMTime());
+  doReload |= (gradRange[0] != this->LastGradientOpacityScalarRange[0] ||
+               gradRange[1] != this->LastGradientOpacityScalarRange[1]);
 
   if (doReload)
   {
@@ -3375,12 +3407,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
       // Build 256-entry gradient opacity lookup table.
       // Range: [0, 0.25 * scalarRange] — matches the normalization in the shader
       // where gradient magnitude is normalized to [0, 0.25 * dataRange].
-      double scalarRange = this->ScalarRange[1] - this->ScalarRange[0];
-      if (scalarRange <= 0.0)
-      {
-        scalarRange = 1.0;
-      }
-      double gradMax = scalarRange * 0.25;
 
       unsigned char gradData[256 * 4]; // RGBA8Unorm (R channel used)
       double table[256];
@@ -3420,6 +3446,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
               withBytes:gradData
             bytesPerRow:256 * 4];
 
+      this->LastGradientOpacityScalarRange[0] = gradRange[0];
+      this->LastGradientOpacityScalarRange[1] = gradRange[1];
       this->GradientOpacityUploadTime.Modified();
     }
   }
@@ -6138,6 +6166,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     const bool independent =
       prop && prop->GetIndependentComponents() && this->VolumeNumComponents > 1;
     uniforms.UseIndependentComponents = independent ? 1.0f : 0.0f;
+    // 4-component dependent mode treats the volume as raw RGBA: the shader uses
+    // scalar.xyz directly for color and the opacity LUT for scalar.w (OpenGL
+    // computeColor/computeOpacity RGBA parity).
+    uniforms.UseDependentRGBA =
+      prop && !prop->GetIndependentComponents() && (this->VolumeNumComponents == 4) ? 1.0f : 0.0f;
     uniforms.NumComponents =
       static_cast<uint32_t>(std::max(1, std::min(4, this->VolumeNumComponents)));
 
@@ -6212,8 +6245,18 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       uniforms.GradientStep[k] = (dims[k] > 1) ? 1.0f / (dims[k] - 1) : 1.0f;
     }
 
-    // Gradient opacity normalization range
-    double scalarRange = this->ScalarRange[1] - this->ScalarRange[0];
+    // Gradient opacity normalization range. OpenGL's computeGradient uses the
+    // range of the component the gradient is computed on: component 0 for the
+    // single-input LA/1-comp paths, but the LAST component for dependent RGBA
+    // (ComputeLightingDeclaration passes lightingComponent = 3). The gradient
+    // itself is still computed on component 0 in the Metal shader, but the
+    // normalization range must follow GL so gradient.w saturates at the same
+    // boundary magnitude.
+    const bool dependentRGBA =
+      (this->VolumeNumComponents == 4) && property && !property->GetIndependentComponents();
+    const double* gradNormRange =
+      dependentRGBA ? this->ComponentScalarRange[3] : this->ScalarRange;
+    double scalarRange = gradNormRange[1] - gradNormRange[0];
     if (scalarRange <= 0.0)
       scalarRange = 1.0;
     double cellSpacing[3];

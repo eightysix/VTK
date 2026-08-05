@@ -8,6 +8,26 @@ right-half box rendered as a plain purple slab (gradient opacity skipped), the
 baseline shows only the x=17 boundary plane sliver with gradient darkening at
 the top/bottom edges.
 
+The shader now applies gradient opacity to the per-sample alpha outside the
+shading block for the dependent-composite path, and the gradient-opacity LUT is
+built over the LAST component's scalar range in dependent multi-component mode
+(OpenGL vtkVolumeInputHelper passes numComp - 1 for the LA/RGBA mode; the
+shader still normalizes the gradient magnitude against the component it is
+computed on). This fixes TestGPURayCastTwoComponentsDependentGradient
+(0.2281 -> pass): previously the quadrant interiors rendered solid (gradient
+opacity skipped when shading is off) and the boundary cross stayed dimmed
+(the baseline brightens the boundary planes via the opacity component's range).
+
+4-component dependent (RGBA) data is now treated as raw RGBA: color comes from
+scalar.xyz directly and opacity from scalar.w mapped through the opacity LUT
+built over the LAST component's range (OpenGL computeColor/computeOpacity RGBA
+parity — computeColor returns vec4(scalar.xyz, opacity), computeOpacity reads
+scalar.w). The gradient-opacity LUT and the shader gradient normalization range
+also follow the last component in this mode. This fixes
+TestGPURayCastFourComponentsDependentGradient (0.1773 -> pass): previously the
+vase rendered ~4x dimmer because the color came from the default color LUT
+(black@0 / white@1024) instead of the raw RGB (value/255).
+
 Uniform-grid blanking and ghost-array support is now implemented in the Metal
 volume ray-cast backend (cell/point ghost arrays are uploaded into a
 cell-centered RG8 3D texture and skipped during the march, mirroring the
@@ -18,17 +38,15 @@ built from the original dataset's ghost arrays (the cell-data effective-input
 proxy carries only scalars), fixing TestGPURayCastVolumeGhostArraysCellData
 (0.1630 -> pass).
 
-20 image-compare failures (TIGHT_VALID threshold 0.05):
+18 image-compare failures (TIGHT_VALID threshold 0.05):
   gross (>=0.5):
     TestGPURayCastCameraInsideSmallSpacing    0.5729
   mid (0.1-0.5):
     TestGPURayCastVolumePicking               0.1234
     TestGPURayCastCameraInside                0.1315
-    TestGPURayCastOrientedVolume              0.1410
+    TestGPURayCastOrientedVolume              0.1370
     TestGPURayCastMapperSampleDistance        0.1419
-    TestGPURayCastFourComponentsDependentGradient 0.1611
-    TestGPURayCastCameraInsideTransformation  0.1967
-    TestGPURayCastTwoComponentsDependentGradient 0.2281
+    TestGPURayCastCameraInsideTransformation  0.1674
     TestGPURayCastTwoComponentsDependent     0.2451
     TestGPURayCastLargeColorTransferFunction 0.3250
     TestGPURayCastClippingUserTransform      0.3258

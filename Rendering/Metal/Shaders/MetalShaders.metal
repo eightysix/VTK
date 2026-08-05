@@ -2707,6 +2707,7 @@ struct VolumeMapperUniforms {
   uint numComponents;
   float useIndependentComponents;
   float _padIndependent[3];
+  float useDependentRGBA;
   // Per-component material (OpenGL in_ambient[i]/in_diffuse[i]/in_specular[i]/
   // in_shininess[i] parity). Only consulted by the independent path, which
   // shades each component against its own material and its own gradient.
@@ -3455,6 +3456,11 @@ inline half4 marchVolumeUnified(
       } else {
         rawScalar4 = volumeTexture.sample(sNearest, evalPoint, level(0));
       }
+    } else if (volumeUniforms.useDependentRGBA > 0.5) {
+      // 4-component dependent RGBA: color and opacity come from the raw RGBA
+      // channels (OpenGL computeColor/computeOpacity RGBA parity), so the full
+      // texel is needed regardless of the component-0 prefetch cache.
+      rawScalar4 = sampleVolumeTexel(volumeTexture, evalPoint);
     }
     float rawMask = (doMask && needsFetch)
       ? maskTexture.sample(sNearest, evalPoint, level(0)).r
@@ -3602,7 +3608,19 @@ inline half4 marchVolumeUnified(
         colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
       }
     } else if (fc_needsPerSampleOpacity) {
-      colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
+      if (volumeUniforms.useDependentRGBA > 0.5) {
+        // 4-component dependent RGBA: color is the raw RGB channels and opacity
+        // comes from the 4th component mapped through the opacity LUT (OpenGL
+        // computeColor/computeOpacity RGBA parity: computeColor returns
+        // vec4(scalar.xyz, opacity), computeOpacity reads scalar.w). The LUT is
+        // built over the last component's scalar range, so the raw normalized
+        // fetch (rawScalar4.a) is the table coordinate.
+        half rgbaOpacity =
+          sampleTransferFunction(transferFunctionTexture, float2(rawScalar4.a, 0.5)).a;
+        colorOpacity = half4(half3(rawScalar4.rgb), rgbaOpacity);
+      } else {
+        colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
+      }
     } else {
       colorOpacity = half4(0.0h);
     }
@@ -3761,6 +3779,25 @@ inline half4 marchVolumeUnified(
       half3 sampleColor = colorOpacity.rgb;
       half weight = 1.0h - accumulatedOpacity;
 
+      // Gradient magnitude for gradient opacity and/or shading, computed at
+      // most once per sample (sharedGrad/sharedGradReady). Gradient opacity is
+      // applied to the per-sample alpha whenever the property declares it,
+      // independent of shading — OpenGL ComputeLightingSingleInput parity
+      // (color.a *= computeGradientOpacity(gradient)), which fixes the
+      // dependent-component path rendering flat solid color when shading is off.
+      if (doGradOp && maskLabel == 0.0h) {
+        if (!sharedGradReady) {
+          if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
+            half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
+            sharedGrad = half4(normalize(nrmSample.xyz * 2.0h - 1.0h), nrmSample.w);
+          } else {
+            sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
+          }
+          sharedGradReady = true;
+        }
+        sampleOpacity *= sampleGradientOpacity(gradientOpacityTexture, float(sharedGrad.w));
+      }
+
       if (sampleOpacity < 0.01h) {
         accumulatedColor += weight * sampleColor * sampleOpacity;
         accumulatedOpacity += weight * sampleOpacity;
@@ -3769,20 +3806,16 @@ inline half4 marchVolumeUnified(
       if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
 
         half3 normal;
-        half gradMag;
-
-        if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
-          half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
-          normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
-          gradMag = nrmSample.w;
-        } else {
-          if (!sharedGradReady) {
+        if (!sharedGradReady) {
+          if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
+            half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
+            sharedGrad = half4(normalize(nrmSample.xyz * 2.0h - 1.0h), nrmSample.w);
+          } else {
             sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
-            sharedGradReady = true;
           }
-          normal = sharedGrad.xyz;
-          gradMag = sharedGrad.w;
+          sharedGradReady = true;
         }
+        normal = sharedGrad.xyz;
 
         if (lightUniforms != nullptr && lightUniforms->defaultLighting == 0) {
           sampleColor = computeVolumeLighting(sampleColor, normal, -viewDirHalf,
@@ -3795,10 +3828,6 @@ inline half4 marchVolumeUnified(
           // ray direction toward the camera (g_ldir == g_vdir == normalize(cameraPos - vertexPos)).
           sampleColor = computePhongLightingVolumeFast(sampleColor, normal, -viewDirHalf, -viewDirHalf,
               ambientMat, diffuseMat, specularMat, shininessMat, twoSided);
-        }
-
-        if (doGradOp) {
-          sampleOpacity *= sampleGradientOpacity(gradientOpacityTexture, float(gradMag));
         }
       } else if (doShading) {
         sampleColor = ambientMat * sampleColor;
