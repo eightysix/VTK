@@ -2735,6 +2735,12 @@ struct VolumeMapperUniforms {
   float useParallelProjection;
   float projectionDirection[4];
   float _padParallelEnd[3];
+  // Precomputed NDC -> [0,1] normalized volume-space matrix (folds
+  // inverseViewProjection * worldToVolume * the volume-bounds normalize into a
+  // single transform) so the fullscreen/grid ray setup and depth-termination
+  // paths do one matrix-vector multiply instead of two matrix chains plus a
+  // bounds re-normalize per fragment.
+  float4x4 ndcToVolume;
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -3156,12 +3162,9 @@ inline float3 reconstructRayDir(float2 screenPos, float2 viewportSize,
     constant VolumeMapperUniforms& u)
 {
     float2 ndc = (screenPos / viewportSize) * 2.0 - 1.0;
-    float4 wn = u.inverseViewProjection * float4(ndc.x, -ndc.y, 0.0, 1.0); wn.xyz /= wn.w;
-    float4 wf = u.inverseViewProjection * float4(ndc.x, -ndc.y, 1.0, 1.0); wf.xyz /= wf.w;
-    float3 bsz = max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
-    float3 lN = ((u.worldToVolume * float4(wn.xyz, 1.0)).xyz - u.volumeBoundsMin.xyz) / bsz;
-    float3 lF = ((u.worldToVolume * float4(wf.xyz, 1.0)).xyz - u.volumeBoundsMin.xyz) / bsz;
-    return normalize(lF - lN);
+    float4 wn = u.ndcToVolume * float4(ndc.x, -ndc.y, 0.0, 1.0); wn.xyz /= wn.w;
+    float4 wf = u.ndcToVolume * float4(ndc.x, -ndc.y, 1.0, 1.0); wf.xyz /= wf.w;
+    return normalize(wf.xyz - wn.xyz);
 }
 
 // The pixel's position on the near (view) plane in [0,1] normalized volume
@@ -3172,9 +3175,8 @@ inline float3 parallelRayOrigin(float2 screenPos, float2 viewportSize,
     constant VolumeMapperUniforms& u)
 {
     float2 ndc = (screenPos / viewportSize) * 2.0 - 1.0;
-    float4 wn = u.inverseViewProjection * float4(ndc.x, -ndc.y, 0.0, 1.0); wn.xyz /= wn.w;
-    float3 bsz = max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
-    return ((u.worldToVolume * float4(wn.xyz, 1.0)).xyz - u.volumeBoundsMin.xyz) / bsz;
+    float4 wn = u.ndcToVolume * float4(ndc.x, -ndc.y, 0.0, 1.0);
+    return wn.xyz / wn.w;
 }
 
 struct RaySetup {
@@ -3252,9 +3254,8 @@ inline RaySetup setupVolumeRay(
         float depthSample = depthTexture.sample(sNearest, screenPos / viewportSize).r;
         if (depthSample < 1.0) {
             float2 ndcXY = (screenPos / viewportSize) * 2.0 - 1.0;
-            float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
-            worldTermination.xyz /= worldTermination.w;
-            float3 terminationLocal = (worldTermination.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+            float4 worldTermination = volumeUniforms.ndcToVolume * float4(ndcXY.x, -ndcXY.y, depthSample, 1.0);
+            float3 terminationLocal = worldTermination.xyz / worldTermination.w;
             s.tTerminateMax = dot(terminationLocal - s.entryPoint, rayDir);
             if (s.tTerminateMax <= 0.0) return s;
         }
@@ -4230,8 +4231,8 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
-// Reconstructs the ray from screen UV using inverseViewProjection (same approach
-// as the composite shader) instead of relying on proxy-geometry vertices.
+// Reconstructs the ray from screen UV (via the precomputed ndcToVolume matrix)
+// instead of relying on proxy-geometry vertices.
 // This eliminates the CPU-heavy ClipConvexPolyData + DensifyPolyData + TriangleFilter
 // pipeline that the proxy-based path requires for camera-inside rendering.
 // The march loop is identical to fragment_volume_main.
@@ -4655,9 +4656,8 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
         float depthSample = depthTexture.sample(sNearest, uv).r;
         if (depthSample < 1.0) {
             float2 ndc = uv * 2.0 - 1.0;
-            float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, depthSample, 1.0);
-            worldTermination.xyz /= worldTermination.w;
-            float3 terminationLocal = (worldTermination.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+            float4 worldTermination = volumeUniforms.ndcToVolume * float4(ndc.x, -ndc.y, depthSample, 1.0);
+            float3 terminationLocal = worldTermination.xyz / worldTermination.w;
             float tDepth = dot(terminationLocal - (rayOrigin + rayDir * tStart), rayDir);
             if (tDepth <= 0.0) {
                 output.color = float4(0.0);

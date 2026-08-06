@@ -193,11 +193,17 @@ struct VolumeMapperUniforms
   // position. w is unused.
   float UseParallelProjection;     // 1504
   float ProjectionDirection[4];    // 1508..1523
-  float _padParallelEnd[3];        // 1524..1535 (total 1536, 16-byte aligned)
+  float _padParallelEnd[3];        // 1524..1535
+  // Precomputed NDC -> [0,1] normalized volume-space matrix (folds
+  // InverseViewProjection * WorldToVolumeMatrix * the volume-bounds normalize
+  // into a single transform) so the fullscreen/grid ray setup and the depth
+  // termination paths do one matrix-vector multiply instead of two matrix
+  // chains plus a bounds re-normalize per fragment.
+  float NDCToVolumeMatrix[16];     // 1536..1599 (total 1600, 16-byte aligned)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1536,
-  "VolumeMapperUniforms must be 1536 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1600,
+  "VolumeMapperUniforms must be 1600 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -1222,8 +1228,15 @@ static void FillTransferFunctionRGBA16FWithPreIntegration(
 // backend (vtkOpenGLVolumeLookupTable::ComputeIdealTextureSize +
 // GetMaximumSupportedTextureWidth): the ideal width is the min-sample estimate
 // of the color and opacity functions over the scalar range, rounded up to a
-// power of two and clamped to a 1024-texel floor. The combined RGBA table
-// shares a single width, so the larger of the two estimates is used.
+// power of two and clamped to a 1024-texel floor. The estimate is
+// (range / minimum node spacing), which is unbounded for pathological
+// transfer functions with near-coincident nodes, so it is additionally capped
+// at kMaxTransferFunctionWidth (Apple GPUs support up to 16384-wide 2D
+// textures; no dense realistic transfer function approaches this). The
+// combined RGBA table shares a single width, so the larger of the two
+// estimates is used.
+static const int kMaxTransferFunctionWidth = 16384;
+
 static int ComputeTransferFunctionWidth(
   vtkColorTransferFunction* colorFunc,
   vtkPiecewiseFunction* opacityFunc,
@@ -1240,7 +1253,8 @@ static int ComputeTransferFunctionWidth(
     idealWidth = std::max(
       idealWidth, opacityFunc->EstimateMinNumberOfSamples(range[0], range[1]));
   }
-  return std::max(1024, vtkMath::NearestPowerOfTwo(idealWidth));
+  return std::min(kMaxTransferFunctionWidth,
+    std::max(1024, vtkMath::NearestPowerOfTwo(idealWidth)));
 }
 
 //------------------------------------------------------------------------------
@@ -3291,7 +3305,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
     if (unitDist <= 0.0) unitDist = 1.0;
     double preIntegrationFactor = actualSampleDistance / unitDist;
 
-    const int tfWidth = ComputeTransferFunctionWidth(colorFunc, opacityFunc, tfRange);
+    const int tfWidth = ComputeTransferFunctionWidth(
+      colorFunc, opacityFunc, tfRange);
 
     @autoreleasepool
     {
@@ -6267,8 +6282,14 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // (volume) space, then map it to the normalized volume frame (same mapping
   // as cameraVolumePos) and normalize. With the perspective path unchanged
   // (rays converge to CameraVolumePos) parallel cameras now cast parallel rays.
-  uniforms.UseParallelProjection =
-    ren->GetActiveCamera()->GetParallelProjection() ? 1.0f : 0.0f;
+  const bool parallelProjection =
+    ren->GetActiveCamera()->GetParallelProjection();
+  uniforms.UseParallelProjection = parallelProjection ? 1.0f : 0.0f;
+  uniforms.ProjectionDirection[0] = 0.0f;
+  uniforms.ProjectionDirection[1] = 0.0f;
+  uniforms.ProjectionDirection[2] = 1.0f;
+  uniforms.ProjectionDirection[3] = 0.0f;
+  if (parallelProjection)
   {
     double dir[3];
     ren->GetActiveCamera()->GetDirectionOfProjection(dir);
@@ -6287,13 +6308,6 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       uniforms.ProjectionDirection[1] = static_cast<float>(dirV[1] / len);
       uniforms.ProjectionDirection[2] = static_cast<float>(dirV[2] / len);
     }
-    else
-    {
-      uniforms.ProjectionDirection[0] = 0.0f;
-      uniforms.ProjectionDirection[1] = 0.0f;
-      uniforms.ProjectionDirection[2] = 1.0f;
-    }
-    uniforms.ProjectionDirection[3] = 0.0f;
   }
 
   double maxBoundsSize = std::max({ vb.Size[0], vb.Size[1], vb.Size[2] });
@@ -6733,6 +6747,10 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   // Compute inverse view-projection matrix for depth buffer occlusion.
   // Used in the fragment shader to unproject depth values to world space.
+  // NDCToVolumeMatrix folds that inverse, WorldToVolumeMatrix and the
+  // volume-bounds normalize into one transform so the shader does a single
+  // matrix-vector multiply per fragment instead of two matrix chains plus a
+  // bounds re-normalize.
   {
     simd_float4x4 vpMat;
     memcpy(&vpMat, uniforms.ViewProjectionMatrix, sizeof(vpMat));
@@ -6741,10 +6759,35 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     {
       simd_float4x4 invVP = simd::inverse(vpMat);
       memcpy(uniforms.InverseViewProjection, &invVP, sizeof(invVP));
+
+      simd_float4x4 w2v;
+      memcpy(&w2v, uniforms.WorldToVolumeMatrix, sizeof(w2v));
+
+      // Volume-bounds normalize: v' = (v - boundsMin) / boundsSize, using the
+      // same float32 bounds and 1e-6 size clamp the shader applied before.
+      simd_float4x4 norm;
+      float bsz[3];
+      for (int k = 0; k < 3; ++k)
+      {
+        bsz[k] = std::max(
+          uniforms.VolumeBoundsMax[k] - uniforms.VolumeBoundsMin[k], 1e-6f);
+      }
+      norm.columns[0] = simd_make_float4(1.0f / bsz[0], 0.0f, 0.0f, 0.0f);
+      norm.columns[1] = simd_make_float4(0.0f, 1.0f / bsz[1], 0.0f, 0.0f);
+      norm.columns[2] = simd_make_float4(0.0f, 0.0f, 1.0f / bsz[2], 0.0f);
+      norm.columns[3] = simd_make_float4(
+        -uniforms.VolumeBoundsMin[0] / bsz[0],
+        -uniforms.VolumeBoundsMin[1] / bsz[1],
+        -uniforms.VolumeBoundsMin[2] / bsz[2],
+        1.0f);
+
+      simd_float4x4 ndcToVolume = simd_mul(norm, simd_mul(w2v, invVP));
+      memcpy(uniforms.NDCToVolumeMatrix, &ndcToVolume, sizeof(ndcToVolume));
     }
     else
     {
       memset(uniforms.InverseViewProjection, 0, sizeof(uniforms.InverseViewProjection));
+      memset(uniforms.NDCToVolumeMatrix, 0, sizeof(uniforms.NDCToVolumeMatrix));
     }
   }
 

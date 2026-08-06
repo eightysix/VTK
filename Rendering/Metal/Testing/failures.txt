@@ -65,36 +65,32 @@ built from the original dataset's ghost arrays (the cell-data effective-input
 proxy carries only scalars), fixing TestGPURayCastVolumeGhostArraysCellData
 (0.1630 -> pass).
 
-18 image-compare failures (TIGHT_VALID threshold 0.05):
+13 image-compare failures (TIGHT_VALID threshold 0.05):
   gross (>=0.5):
-    TestGPURayCastCameraInsideSmallSpacing    0.5729
+    TestGPURayCastCameraInsideSmallSpacing    0.5733
   mid (0.1-0.5):
-    TestGPURayCastVolumePicking               0.1234
-    TestGPURayCastCameraInside                0.1315
-    TestGPURayCastOrientedVolume              0.1370
-    TestGPURayCastCameraInsideTransformation  0.1674
-    TestGPURayCastTwoComponentsDependent     0.2451
-    TestGPURayCastLargeColorTransferFunction 0.3250
-    TestGPURayCastClippingUserTransform      0.3258
+    TestGPURayCastCameraInside                0.1301
+    TestGPURayCastCameraInsideTransformation  0.1676
+    TestGPURayCastTwoComponentsDependent     0.2424
+    TestGPURayCastClippingUserTransform      0.2436
+    TestGPURayCastMapperRectilinearGrid      0.3824
     TestGPURayCastComputeNormalFromOpacity   0.3837
-    TestGPURayCastMapperRectilinearGrid      0.3838
   near-miss (0.05-0.1):
-    TestGPURayCastCropping1                  0.0506
-    TestMultiBlockMapperRectilinearGrid      0.0552
-    TestGPURayCastRenderToTexture            0.0553
-    TestGPURayCastCameraInsideNonUniformScaleTransform 0.0595
-    TestGPURayCastIndependentVectorMode      0.0600
-    TestGPURayCastShadedClipping             0.0842
+    TestGPURayCastCropping1                  0.0505
+    TestMultiBlockMapperRectilinearGrid      0.0556
+    TestGPURayCastRenderToTexture            0.0560
+    TestGPURayCastCameraInsideNonUniformScaleTransform 0.0593
+    TestGPURayCastShadedClipping             0.0909
     TestGPURayCastPositionalLights           0.0953
 
-7 non-image failures (crash / pick-check, no render exported):
+7 non-image failures (crash / pick-check, no render exported; 4 also abort):
     ProjectedTetrahedraZoomIn
     TestMultiBlockUnstructuredGridVolumeMapper
     TestProjectedTetrahedra
-    TestProjectedTetrahedraOffscreen
-    TestProjectedTetrahedraTransform
-    TestProjectedTetrahedraVectorComponent
-    TestSmartVolumeMapperImplicitArray
+    TestProjectedTetrahedraOffscreen   (abort)
+    TestProjectedTetrahedraTransform   (abort)
+    TestProjectedTetrahedraVectorComponent (abort)
+    TestSmartVolumeMapperImplicitArray (abort)
 
 PNG exports + manifest: build_macos_metal/Testing/ImageCompareReviewVolume/
 
@@ -114,4 +110,28 @@ it (selection box hugged the cone), whereas the baseline picks the volume
 
 After this fix the suite is at 74 pass / 19 fail / 4 abort (23 total), down from
 TestGPURayCastVolumePicking alone; every other failure is unchanged.
+
+Since then three commits landed and moved three more image tests to passing:
+  - Signed-short volumes are now stored as R16Snorm (instead of half-float) so
+    large color-transfer-function label values survive the upload; fixes
+    TestGPURayCastLargeColorTransferFunction (0.3250 -> pass).
+  - The transfer-function table width is sized and clamped like the OpenGL
+    backend (ComputeIdealTextureSize + GetMaximumSupportedTextureWidth,
+    capped at 16384) so oversized tables no longer exceed the GPU's max 2D
+    texture width.
+  - Parallel projection is now supported (direction-of-projection derived rays,
+    depth-termination via inverse view-projection); fixes
+    TestGPURayCastOrientedVolume (0.1370 -> pass). TestGPURayCastClippingUserTransform
+    also improved 0.3258 -> 0.2436.
+
+The ray-setup path was also collapsed into a single precomputed
+NDCToVolumeMatrix uniform (ndcToVolume = volume-bounds-normalize *
+worldToVolume * inverseViewProjection), replacing the per-fragment two-matrix
+chain plus bounds re-normalize in the fullscreen/grid ray setup and both
+depth-termination sites. This is a pure perf change: every image-compare metric
+is bit-identical to the pre-change run.
+
+Current suite state: 77 pass / 16 fail / 4 abort (20 total non-passing; 13
+image-compare + 7 non-image, of which 4 abort). All remaining failures are the
+pre-existing ones listed above.
 
