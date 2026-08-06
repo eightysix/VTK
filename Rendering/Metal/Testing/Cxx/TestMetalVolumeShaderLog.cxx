@@ -69,9 +69,16 @@
 //                                     buffer finishes, so overflow discards
 //                                     messages and ordering is not preserved
 //     MTL_LOG_TO_STDERR=1             forward buffered messages to stderr
-//   To run this test with the messages visible:
-//     MTL_LOG_LEVEL=MTLLogLevelDebug MTL_LOG_TO_STDERR=1 \
+//   To run this test with the messages visible (verified form; the 8192-byte
+//   buffer is not required for this particular test -- its ~1 KB of messages
+//   also fits the 1024-byte default -- but a larger buffer is safer with
+//   heavier call sites, which overflow and silently drop messages):
+//     MTL_LOG_LEVEL=MTLLogLevelDebug MTL_LOG_BUFFER_SIZE=8192 MTL_LOG_TO_STDERR=1 \
 //       ctest -R TestMetalVolumeShaderLog
+//   Or run the test binary directly (useful with rg to count the messages):
+//     MTL_LOG_LEVEL=MTLLogLevelDebug MTL_LOG_BUFFER_SIZE=8192 MTL_LOG_TO_STDERR=1 \
+//       <build>/bin/vtkRenderingMetalCxxTests TestMetalVolumeShaderLog \
+//       2>&1 | rg "VTK_METAL_VOLUME_LOG"
 //
 // Viewing the messages
 //     - stderr (above) is the most reliable way with ctest
@@ -203,8 +210,8 @@ int TestMetalVolumeShaderLog(int argc, char* argv[])
   std::cout << "Shader logging test complete. The volume shaders emitted "
             << "\"VTK_METAL_VOLUME_LOG\" os_log messages for the proxy and "
             << "fullscreen paths; see them with:" << std::endl
-            << "  MTL_LOG_LEVEL=MTLLogLevelDebug MTL_LOG_TO_STDERR=1 "
-            << "ctest -R TestMetalVolumeShaderLog" << std::endl;
+            << "  MTL_LOG_LEVEL=MTLLogLevelDebug MTL_LOG_BUFFER_SIZE=8192 "
+            << "MTL_LOG_TO_STDERR=1 ctest -R TestMetalVolumeShaderLog" << std::endl;
 
   return EXIT_SUCCESS;
 }
