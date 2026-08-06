@@ -169,7 +169,8 @@ struct VolumeMapperUniforms
   float UseIndependentComponents;  // 1220..1223
   float _padIndependent[3];        // 1224..1235
   float UseDependentRGBA;          // 1236..1239  (4-comp dependent RGBA: raw RGB color, opacity LUT on scalar.w)
-  float _padEnd2[2];               // 1240..1247  (trailing pad to 1248)
+  float UseComputeNormalFromOpacity; // 1240..1243  (1.0 = shade with the opacity-field gradient; OpenGL ComputeNormalFromOpacity parity)
+  float _padEnd2[1];               // 1244..1247  (trailing pad to 1248)
   // Per-component material (OpenGL in_ambient[4]/in_diffuse[4]/in_specular[4]/
   // in_shininess[4] parity). Indexed by component in the independent path.
   float AmbientColorComp[4][4];    // 1248..1311
@@ -232,6 +233,7 @@ static_assert(offsetof(VolumeMapperUniforms, VolumeToTextureMatrix) == 1104, "")
 static_assert(offsetof(VolumeMapperUniforms, ScalarMinCompHalf) == 1168, "");
 static_assert(offsetof(VolumeMapperUniforms, ComponentWeight) == 1200, "");
 static_assert(offsetof(VolumeMapperUniforms, NumComponents) == 1216, "");
+static_assert(offsetof(VolumeMapperUniforms, UseComputeNormalFromOpacity) == 1240, "");
 static_assert(offsetof(VolumeMapperUniforms, AmbientColorComp) == 1248, "");
 static_assert(offsetof(VolumeMapperUniforms, DiffuseColorComp) == 1312, "");
 static_assert(offsetof(VolumeMapperUniforms, SpecularColorComp) == 1376, "");
@@ -3110,6 +3112,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       VolumeFeature_Shading | VolumeFeature_Mask | VolumeFeature_MinMax,
       VolumeFeature_Shading | VolumeFeature_NormalTexture,
       VolumeFeature_Shading | VolumeFeature_NormalTexture | VolumeFeature_MinMax,
+      VolumeFeature_Shading | VolumeFeature_ComputeNormalFromOpacity,
     };
 
     struct PreWarmSpec {
@@ -5637,6 +5640,8 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     BOOL minmax  = (featureMask & VolumeFeature_MinMax) ? YES : NO;
     BOOL normalTex = (featureMask & VolumeFeature_NormalTexture) ? YES : NO;
     BOOL linearInterp = (featureMask & VolumeFeature_LinearInterpolation) ? YES : NO;
+    BOOL computeNormalFromOpacity =
+      (featureMask & VolumeFeature_ComputeNormalFromOpacity) ? YES : NO;
 
     [constants setConstantValue:&shading type:MTLDataTypeBool withName:@"fc_shading"];
     [constants setConstantValue:&gradOp  type:MTLDataTypeBool withName:@"fc_gradientOpacity"];
@@ -5644,6 +5649,8 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     [constants setConstantValue:&minmax  type:MTLDataTypeBool withName:@"fc_minmax"];
     [constants setConstantValue:&normalTex type:MTLDataTypeBool withName:@"fc_normalTexture"];
     [constants setConstantValue:&linearInterp type:MTLDataTypeBool withName:@"fc_linearInterpolation"];
+    [constants setConstantValue:&computeNormalFromOpacity type:MTLDataTypeBool
+                        withName:@"fc_computeNormalFromOpacity"];
 
     // Blend mode function constant: 0=composite, 1=MIP, 2=MinIP, 3=AverageIP,
     // 4=additive (vtkVolumeMapper::BlendMode). Encoded in the feature mask so
@@ -6028,6 +6035,8 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
     featureMask |= VolumeFeature_Mask;
   if (uniforms->UseMinMaxAccel > 0.5f)
     featureMask |= VolumeFeature_MinMax;
+  if (uniforms->UseComputeNormalFromOpacity > 0.5f)
+    featureMask |= VolumeFeature_ComputeNormalFromOpacity;
   if (uniforms->UseLinearVolumeInterpolation > 0.5f)
     featureMask |= VolumeFeature_LinearInterpolation;
   featureMask |= BlendModeToFeatureFlag(this->GetBlendMode());
@@ -6726,6 +6735,10 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   bool hasNormalTexture = (this->GradientNormalTexture != nullptr);
   uniforms.UseNormalTexture = hasNormalTexture ? 1.0f : 0.0f;
 
+  // Shade with the opacity-field gradient instead of the scalar gradient
+  // (OpenGL vtkVolumeMapper::GetComputeNormalFromOpacity parity).
+  uniforms.UseComputeNormalFromOpacity = this->ComputeNormalFromOpacity ? 1.0f : 0.0f;
+
   // Build feature mask for shader function constant specialization.
   int featureMask = 0;
   if (uniforms.UseGradientShading > 0.5f)
@@ -6738,6 +6751,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     featureMask |= VolumeFeature_MinMax;
   if (hasNormalTexture)
     featureMask |= VolumeFeature_NormalTexture;
+  if (uniforms.UseComputeNormalFromOpacity > 0.5f)
+    featureMask |= VolumeFeature_ComputeNormalFromOpacity;
   if (uniforms.UseLinearVolumeInterpolation > 0.5f)
     featureMask |= VolumeFeature_LinearInterpolation;
   featureMask |= BlendModeToFeatureFlag(this->GetBlendMode());

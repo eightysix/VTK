@@ -2596,6 +2596,10 @@ constant bool fc_normalTexture [[function_constant(4)]];
 // Bakes vtkVolumeProperty::GetInterpolationType() into the pipeline, so the
 // unused volume/TF/gradient-opacity sampler path is dead-code eliminated.
 constant bool fc_linearInterpolation [[function_constant(5)]];
+// Bakes vtkVolumeMapper::GetComputeNormalFromOpacity() into the pipeline: the
+// shading normal becomes the gradient of the opacity field (OpenGL
+// computeDensityGradient parity) instead of the scalar field.
+constant bool fc_computeNormalFromOpacity [[function_constant(18)]];
 // Bakes vtkVolumeMapper::GetBlendMode() into the pipeline.
 // 0=composite (default), 1=maximum intensity (MIP), 2=minimum intensity (MinIP),
 // 3=average intensity (AverageIP), 4=additive.
@@ -2708,6 +2712,10 @@ struct VolumeMapperUniforms {
   float useIndependentComponents;
   float _padIndependent[3];
   float useDependentRGBA;
+  // 1.0 = shade with the opacity-field gradient (OpenGL
+  // vtkVolumeMapper::GetComputeNormalFromOpacity parity). Occupies what would
+  // otherwise be the float4-alignment pad before ambientColorComp.
+  float useComputeNormalFromOpacity;
   // Per-component material (OpenGL in_ambient[i]/in_diffuse[i]/in_specular[i]/
   // in_shininess[i] parity). Only consulted by the independent path, which
   // shades each component against its own material and its own gradient.
@@ -3091,11 +3099,63 @@ inline half4 computeGradientFast(texture3d<float> volTex, float3 pos,
   float3 gradTex = float3(rawGrad) / max(gradStep, 1e-8);
   float3x3 texToModelLin =
     float3x3(volumeToTexture[0].xyz, volumeToTexture[1].xyz, volumeToTexture[2].xyz);
-  half3 correctedGrad = half3(transpose(texToModelLin) * gradTex);
-  half mag = length(correctedGrad);
-  half3 normal = mag > 0.0h ? correctedGrad / mag : half3(0.0h);
+  float3 correctedGrad = transpose(texToModelLin) * gradTex;
+  float mag = length(correctedGrad);
+  half3 normal = mag > 0.0f ? half3(correctedGrad / mag) : half3(0.0h);
 
-  return half4(normal, saturate(mag / gradNormFactor));
+  return half4(normal, saturate(half(mag) / gradNormFactor));
+}
+
+// OpenGL computeDensityGradient parity (vtkVolumeShaderComposer.h
+// ComputeDensityGradientDeclaration): when vtkVolumeMapper's
+// ComputeNormalFromOpacity is set the shading normal is the gradient of the
+// *opacity* field rather than the scalar field — six neighbor scalars are
+// normalized (scalarScale/scalarBias) and mapped through the component's
+// opacity transfer function, then the central difference of the opacities
+// forms the gradient. The return shape matches computeGradientFast (xyz =
+// normalized model-space normal, w = normalized magnitude); only the direction
+// is consumed for lighting — gradient opacity keeps the scalar-gradient
+// magnitude (OpenGL uses computeGradient for gradient opacity even when
+// ComputeNormalFromOpacity is set).
+inline half4 computeDensityGradientFast(
+    texture3d<float> volTex,
+    texture2d<float> tf0, texture2d<float> tf1,
+    texture2d<float> tf2, texture2d<float> tf3,
+    float3 pos, float3 gradStep,
+    float4x4 volumeToTexture,
+    half gradNormFactor,
+    int c, half scalarScale, half scalarBias) {
+  half sPX = half(sampleVolumeTexel(volTex, pos + float3(gradStep.x, 0, 0))[c]);
+  half sNX = half(sampleVolumeTexel(volTex, pos - float3(gradStep.x, 0, 0))[c]);
+  half sPY = half(sampleVolumeTexel(volTex, pos + float3(0, gradStep.y, 0))[c]);
+  half sNY = half(sampleVolumeTexel(volTex, pos - float3(0, gradStep.y, 0))[c]);
+  half sPZ = half(sampleVolumeTexel(volTex, pos + float3(0, 0, gradStep.z))[c]);
+  half sNZ = half(sampleVolumeTexel(volTex, pos - float3(0, 0, gradStep.z))[c]);
+
+  half opPX = sampleComponentTransferFunction(tf0, tf1, tf2, tf3,
+      float2(saturate(sPX * scalarScale + scalarBias), 0.5), c).a;
+  half opNX = sampleComponentTransferFunction(tf0, tf1, tf2, tf3,
+      float2(saturate(sNX * scalarScale + scalarBias), 0.5), c).a;
+  half opPY = sampleComponentTransferFunction(tf0, tf1, tf2, tf3,
+      float2(saturate(sPY * scalarScale + scalarBias), 0.5), c).a;
+  half opNY = sampleComponentTransferFunction(tf0, tf1, tf2, tf3,
+      float2(saturate(sNY * scalarScale + scalarBias), 0.5), c).a;
+  half opPZ = sampleComponentTransferFunction(tf0, tf1, tf2, tf3,
+      float2(saturate(sPZ * scalarScale + scalarBias), 0.5), c).a;
+  half opNZ = sampleComponentTransferFunction(tf0, tf1, tf2, tf3,
+      float2(saturate(sNZ * scalarScale + scalarBias), 0.5), c).a;
+
+  half3 rawGrad = half3(opPX - opNX, opPY - opNY, opPZ - opNZ);
+
+  float3 gradTex = float3(rawGrad) / max(gradStep, 1e-8);
+  float3x3 texToModelLin =
+    float3x3(volumeToTexture[0].xyz, volumeToTexture[1].xyz, volumeToTexture[2].xyz);
+  float3 correctedGrad = transpose(texToModelLin) * gradTex;
+  float mag = length(correctedGrad);
+
+  half3 normal = mag > 0.0f ? half3(correctedGrad / mag) : half3(0.0h);
+
+  return half4(normal, saturate(half(mag) / gradNormFactor));
 }
 
 // Central-difference gradient for every component at once (independent
@@ -3120,10 +3180,10 @@ inline void computeGradientsAllComponents(
 
   for (int c = 0; c < 4; ++c) {
     float3 gradTex = float3(pX[c] - nX[c], pY[c] - nY[c], pZ[c] - nZ[c]) / max(gradStep, 1e-8);
-    half3 corrected = half3(texToModelT * gradTex);
-    half mag = length(corrected);
-    half3 normal = mag > 0.0h ? corrected / mag : half3(0.0h);
-    gradOut[c] = half4(normal, saturate(mag / gradNormFactor));
+    float3 corrected = texToModelT * gradTex;
+    float mag = length(corrected);
+    half3 normal = mag > 0.0f ? half3(corrected / mag) : half3(0.0h);
+    gradOut[c] = half4(normal, saturate(half(mag) / gradNormFactor));
   }
 }
 
@@ -3923,7 +3983,15 @@ inline half4 marchVolumeUnified(
           half3 ccRGB = cc.rgb;
           if (sampleOpacity >= 0.01h && doShading) {
             half3 normal;
-            if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
+            if (fc_computeNormalFromOpacity && volumeUniforms.useComputeNormalFromOpacity > 0.5) {
+              half cMin = half(volumeUniforms.scalarMinComp[c]);
+              half cRange = max(half(volumeUniforms.scalarMaxComp[c]) - cMin, 1e-4h);
+              normal = computeDensityGradientFast(volumeTexture,
+                  transferFunctionTexture, transferFunctionTexture1,
+                  transferFunctionTexture2, transferFunctionTexture3,
+                  evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture,
+                  gradNormFactor, c, 1.0h / cRange, -cMin / cRange).xyz;
+            } else if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
               half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
               normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
             } else {
@@ -3990,16 +4058,24 @@ inline half4 marchVolumeUnified(
       if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
 
         half3 normal;
-        if (!sharedGradReady) {
-          if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
-            half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
-            sharedGrad = half4(normalize(nrmSample.xyz * 2.0h - 1.0h), nrmSample.w);
-          } else {
-            sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
+        if (fc_computeNormalFromOpacity && volumeUniforms.useComputeNormalFromOpacity > 0.5) {
+          normal = computeDensityGradientFast(volumeTexture,
+              transferFunctionTexture, transferFunctionTexture1,
+              transferFunctionTexture2, transferFunctionTexture3,
+              evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture,
+              gradNormFactor, 0, scalarScale, scalarBias).xyz;
+        } else {
+          if (!sharedGradReady) {
+            if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
+              half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
+              sharedGrad = half4(normalize(nrmSample.xyz * 2.0h - 1.0h), nrmSample.w);
+            } else {
+              sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
+            }
+            sharedGradReady = true;
           }
-          sharedGradReady = true;
+          normal = sharedGrad.xyz;
         }
-        normal = sharedGrad.xyz;
 
         if (lightUniforms != nullptr && lightUniforms->defaultLighting == 0) {
           sampleColor = computeVolumeLighting(sampleColor, normal, -viewDirHalf,

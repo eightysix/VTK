@@ -93,6 +93,7 @@ enum VolumeShaderFeatureFlags : uint32_t
   VolumeFeature_BlendMinimumIntensity = 1u << 7,
   VolumeFeature_BlendAverageIntensity = 1u << 8,
   VolumeFeature_BlendAdditive         = 1u << 9,
+  VolumeFeature_ComputeNormalFromOpacity = 1u << 10,
 };
 
 VTK_ABI_NAMESPACE_BEGIN
