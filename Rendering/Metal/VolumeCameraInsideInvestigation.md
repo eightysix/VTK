@@ -3,9 +3,9 @@
 Status: **on-hold**. All concrete hypotheses raised during this investigation
 have been tested and refuted or verified as parity-correct. The residual
 camera-inside image diffs are well-characterized (obligueness-dependent,
-sub-texel) but their root cause has not been isolated, in part because the
-OpenGL backend renders black on this Metal-only build, so the checked-in
-baselines are the only GL reference available.
+sub-texel) but their root cause has not been isolated. The GL backend is
+available as a live reference on this build: the GL suite can be run
+directly and its pipeline instrumented (see section 8, lead 5).
 
 This document is a record of the investigation: the committed state, every
 experiment run (with methodology, data, and outcome), the verified
@@ -372,12 +372,14 @@ them.
    and would be tested by the same experiment (a numerically-exact GL comb
    in the Metal shader).
 
-5. **A GL reference render.** On a machine with a working GL backend, render
-   the four tests with GL and diff GL-vs-Metal directly (image-to-image).
-   This machine's GL backend renders black (`vtkRenderingVolumeOpenGL2CxxTests`
-   reports the same 0.809873 as a black image), so it was impossible here.
-   Direct GL-vs-Metal comparison would remove all baseline-generation
-   uncertainty and localize the error to a per-pixel spatial pattern.
+5. **A GL reference render.** The GL backend is available on this build:
+   render the four tests with GL (`TestGPURayCastCameraInside*` with
+   `RenderingBackend=OpenGL`) and diff GL-vs-Metal directly (image-to-image),
+   and/or instrument the GL pipeline (shader-log the GL comb, textures, and
+   uniform matrices the same way section 5 did for Metal). Direct GL-vs-Metal
+   comparison would remove
+   all baseline-generation uncertainty and localize the error to a per-pixel
+   spatial pattern.
 
 ## 9. Workflow notes (for reproducibility)
 
