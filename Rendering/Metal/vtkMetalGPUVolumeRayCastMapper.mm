@@ -185,11 +185,19 @@ struct VolumeMapperUniforms
   uint32_t SelectionVolumeDimX;    // 1480  volume dimensions for the voxel index
   uint32_t SelectionVolumeDimY;    // 1484
   uint32_t SelectionVolumeDimZ;    // 1488
-  uint32_t _padSelEnd[3];          // 1492..1503 (total 1504, 16-byte aligned)
+  uint32_t _padSelEnd[3];          // 1492..1503
+  // Parallel-projection support (OpenGL in_projectionDirection parity): when
+  // useParallelProjection is set the fragment shader builds every ray from the
+  // interpolated proxy-box position along this constant direction (in [0,1]
+  // normalized volume space) instead of converging rays from the camera
+  // position. w is unused.
+  float UseParallelProjection;     // 1504
+  float ProjectionDirection[4];    // 1508..1523
+  float _padParallelEnd[3];        // 1524..1535 (total 1536, 16-byte aligned)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1504,
-  "VolumeMapperUniforms must be 1504 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1536,
+  "VolumeMapperUniforms must be 1536 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -6214,6 +6222,41 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   uniforms.CameraVolumePos[1] = NormalizeToVolumeSpace(vb, 1, camPosVolume[1]);
   uniforms.CameraVolumePos[2] = NormalizeToVolumeSpace(vb, 2, camPosVolume[2]);
   uniforms.CameraVolumePos[3] = 1.0f;
+
+  // Parallel-projection support (OpenGL in_projectionDirection parity): the
+  // fragment shader needs a constant ray direction expressed in [0,1] volume
+  // space. Transform the camera's world direction of projection into model
+  // (volume) space, then map it to the normalized volume frame (same mapping
+  // as cameraVolumePos) and normalize. With the perspective path unchanged
+  // (rays converge to CameraVolumePos) parallel cameras now cast parallel rays.
+  uniforms.UseParallelProjection =
+    ren->GetActiveCamera()->GetParallelProjection() ? 1.0f : 0.0f;
+  {
+    double dir[3];
+    ren->GetActiveCamera()->GetDirectionOfProjection(dir);
+    double dirV[4] = { dir[0], dir[1], dir[2], 0.0 };
+    invModelMatrix->MultiplyPoint(dirV, dirV);
+    if (vb.Size[0] > 1e-10)
+      dirV[0] /= vb.Size[0];
+    if (vb.Size[1] > 1e-10)
+      dirV[1] /= vb.Size[1];
+    if (vb.Size[2] > 1e-10)
+      dirV[2] /= vb.Size[2];
+    double len = vtkMath::Norm(dirV);
+    if (len > 1e-12)
+    {
+      uniforms.ProjectionDirection[0] = static_cast<float>(dirV[0] / len);
+      uniforms.ProjectionDirection[1] = static_cast<float>(dirV[1] / len);
+      uniforms.ProjectionDirection[2] = static_cast<float>(dirV[2] / len);
+    }
+    else
+    {
+      uniforms.ProjectionDirection[0] = 0.0f;
+      uniforms.ProjectionDirection[1] = 0.0f;
+      uniforms.ProjectionDirection[2] = 1.0f;
+    }
+    uniforms.ProjectionDirection[3] = 0.0f;
+  }
 
   double maxBoundsSize = std::max({ vb.Size[0], vb.Size[1], vb.Size[2] });
 

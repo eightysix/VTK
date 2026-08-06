@@ -2728,7 +2728,18 @@ struct VolumeMapperUniforms {
   uint selectionVolumeDimY;
   uint selectionVolumeDimZ;
   uint _padSelEnd[3];
+  // Parallel-projection support (OpenGL in_projectionDirection parity): when
+  // useParallelProjection is set every ray is built from the interpolated
+  // proxy-box position along this constant direction (in [0,1] normalized
+  // volume space) instead of converging rays from the camera position. w unused.
+  float useParallelProjection;
+  float projectionDirection[4];
+  float _padParallelEnd[3];
 };
+
+inline float3 projectionDir(constant VolumeMapperUniforms& u) {
+    return float3(u.projectionDirection[0], u.projectionDirection[1], u.projectionDirection[2]);
+}
 
 struct VolumeLight {
     float4 position;      // xyz = position (positional lights), w = type (0=directional, 1=positional)
@@ -3151,6 +3162,19 @@ inline float3 reconstructRayDir(float2 screenPos, float2 viewportSize,
     float3 lN = ((u.worldToVolume * float4(wn.xyz, 1.0)).xyz - u.volumeBoundsMin.xyz) / bsz;
     float3 lF = ((u.worldToVolume * float4(wf.xyz, 1.0)).xyz - u.volumeBoundsMin.xyz) / bsz;
     return normalize(lF - lN);
+}
+
+// The pixel's position on the near (view) plane in [0,1] normalized volume
+// space. Used as the ray origin for parallel projection on the fullscreen
+// (camera-inside / grid-traversal) paths, matching OpenGL's g_rayOrigin for
+// parallel cameras.
+inline float3 parallelRayOrigin(float2 screenPos, float2 viewportSize,
+    constant VolumeMapperUniforms& u)
+{
+    float2 ndc = (screenPos / viewportSize) * 2.0 - 1.0;
+    float4 wn = u.inverseViewProjection * float4(ndc.x, -ndc.y, 0.0, 1.0); wn.xyz /= wn.w;
+    float3 bsz = max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
+    return ((u.worldToVolume * float4(wn.xyz, 1.0)).xyz - u.volumeBoundsMin.xyz) / bsz;
 }
 
 struct RaySetup {
@@ -4106,18 +4130,26 @@ fragment VolumeFragmentOut fragment_volume_main(
   float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
   computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
 
-  float3 rayDir = in.localPos - cameraPos;
-  float dirLength = length(rayDir);
-  if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
-  rayDir /= dirLength;
+  // Parallel projection (OpenGL in_projectionDirection parity): cast parallel
+  // rays starting on the proxy box along the constant projection direction.
+  // Perspective keeps the converging-ray formulation (vertexPos - cameraPos).
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 rayOrigin = parallel ? in.localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (in.localPos - cameraPos);
+  if (!parallel)
+  {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
+    rayDir /= dirLength;
+  }
 
-  RaySetup s = setupVolumeRay(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal,
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
       in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
   if (!s.valid) { output.color = float4(0.0); return output; }
 
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
-      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos,
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
       stepSize, s.totalBoxT, in.position.xy,
       half3(0.0), 0.0h, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
@@ -4165,18 +4197,23 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
   float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
   computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
 
-  float3 rayDir = in.localPos - cameraPos;
-  float dirLength = length(rayDir);
-  if (dirLength < 0.0001) { return output; }
-  rayDir /= dirLength;
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 rayOrigin = parallel ? in.localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (in.localPos - cameraPos);
+  if (!parallel)
+  {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { return output; }
+    rayDir /= dirLength;
+  }
 
-  RaySetup s = setupVolumeRay(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal,
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
       in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
   if (!s.valid) { return output; }
 
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
-      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos,
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
       stepSize, s.totalBoxT, in.position.xy,
       half3(0.0), 0.0h, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
@@ -4223,15 +4260,21 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
   float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
   computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
 
-  float3 rayDir = reconstructRayDir(in.position.xy, volumeUniforms.viewportSize, volumeUniforms);
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 rayOrigin = parallel
+    ? parallelRayOrigin(in.position.xy, volumeUniforms.viewportSize, volumeUniforms)
+    : cameraPos;
+  float3 rayDir = parallel
+    ? projectionDir(volumeUniforms)
+    : reconstructRayDir(in.position.xy, volumeUniforms.viewportSize, volumeUniforms);
 
-  RaySetup s = setupVolumeRay(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal,
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
       in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
   if (!s.valid) { output.color = float4(0.0); return output; }
 
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
-      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos,
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
       stepSize, s.totalBoxT, in.position.xy,
       half3(0.0), 0.0h, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
@@ -4273,15 +4316,21 @@ fragment VolumeSelectionOut fragment_volume_fullscreen_selection_main(
   float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
   computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
 
-  float3 rayDir = reconstructRayDir(in.position.xy, volumeUniforms.viewportSize, volumeUniforms);
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 rayOrigin = parallel
+    ? parallelRayOrigin(in.position.xy, volumeUniforms.viewportSize, volumeUniforms)
+    : cameraPos;
+  float3 rayDir = parallel
+    ? projectionDir(volumeUniforms)
+    : reconstructRayDir(in.position.xy, volumeUniforms.viewportSize, volumeUniforms);
 
-  RaySetup s = setupVolumeRay(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal,
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
       in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
   if (!s.valid) { return output; }
 
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
-      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos,
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
       stepSize, s.totalBoxT, in.position.xy,
       half3(0.0), 0.0h, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
@@ -4326,19 +4375,24 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
   float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
   computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
 
-  float3 rayDir = in.localPos - cameraPos;
-  float dirLength = length(rayDir);
-  if (dirLength < 0.0001) { output.color = float4(0.0); output.depth = 1.0; return output; }
-  rayDir /= dirLength;
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 rayOrigin = parallel ? in.localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (in.localPos - cameraPos);
+  if (!parallel)
+  {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { output.color = float4(0.0); output.depth = 1.0; return output; }
+    rayDir /= dirLength;
+  }
 
-  RaySetup s = setupVolumeRay(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal,
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
       in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
   if (!s.valid) { output.color = float4(0.0); output.depth = 1.0; return output; }
 
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   float jitter = (volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) : 1.0) * stepSize;
-  float tStart = dot(s.entryPoint - cameraPos, rayDir);
-  MarchParams p = {cameraPos, rayDir, tStart, s.totalBoxT, stepSize, jitter, s.tTerminateMax,
+  float tStart = parallel ? 0.0 : dot(s.entryPoint - cameraPos, rayDir);
+  MarchParams p = {rayOrigin, rayDir, tStart, s.totalBoxT, stepSize, jitter, s.tTerminateMax,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, true};
 
   float3 firstOpaquePos = float3(-1.0);
@@ -4522,13 +4576,22 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
 
     float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
 
+    // Parallel projection: origin on the view plane, constant direction.
+    // Perspective: converging rays from the camera position.
+    bool parallel = volumeUniforms.useParallelProjection > 0.5;
+    float3 rayOrigin = parallel
+      ? parallelRayOrigin(in.position.xy, volumeUniforms.viewportSize, volumeUniforms)
+      : cameraPos;
+
     // Reconstruct ray in normalized [0,1] volume space
-    float3 rayDir = reconstructRayDir(in.position.xy, volumeUniforms.viewportSize, volumeUniforms);
+    float3 rayDir = parallel
+      ? projectionDir(volumeUniforms)
+      : reconstructRayDir(in.position.xy, volumeUniforms.viewportSize, volumeUniforms);
 
     // Intersect with full volume bounds [0,1]
     float3 volMin = float3(0.0);
     float3 volMax = float3(1.0);
-    float2 tVol = intersectBox(cameraPos, rayDir, volMin, volMax);
+    float2 tVol = intersectBox(rayOrigin, rayDir, volMin, volMax);
     float tStart = max(tVol.x, 0.0);
     float tEnd = tVol.y;
 
@@ -4553,8 +4616,8 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
             volumeUniforms.clippingPlane6Normal, volumeUniforms.clippingPlane7Normal
         };
 
-        float3 entryPoint = cameraPos + rayDir * tStart;
-        float3 exitPoint = cameraPos + rayDir * tEnd;
+        float3 entryPoint = rayOrigin + rayDir * tStart;
+        float3 exitPoint = rayOrigin + rayDir * tEnd;
 
         bool valid = true;
         for (int cp = 0; cp < numClipPlanes && cp < 8; cp++) {
@@ -4581,7 +4644,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
 
         // Recompute t from clipped entry/exit
         float3 d = exitPoint - entryPoint;
-        tStart = dot(entryPoint - cameraPos, rayDir);
+        tStart = dot(entryPoint - rayOrigin, rayDir);
         tEnd = tStart + length(d);
     }
 
@@ -4595,7 +4658,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
             float4 worldTermination = volumeUniforms.inverseViewProjection * float4(ndc.x, -ndc.y, depthSample, 1.0);
             worldTermination.xyz /= worldTermination.w;
             float3 terminationLocal = (worldTermination.xyz - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-            float tDepth = dot(terminationLocal - (cameraPos + rayDir * tStart), rayDir);
+            float tDepth = dot(terminationLocal - (rayOrigin + rayDir * tStart), rayDir);
             if (tDepth <= 0.0) {
                 output.color = float4(0.0);
                 return output;
@@ -4622,7 +4685,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
 
     int3 gridDims = int3(grid.gridDimsX, grid.gridDimsY, grid.gridDimsZ);
     float tEndRel = tEnd - tStart;
-    GridWalker walker = initGridWalker(cameraPos, rayDir, tStart, tEndRel, gridDims);
+    GridWalker walker = initGridWalker(rayOrigin, rayDir, tStart, tEndRel, gridDims);
 
     int maxCells = gridDims.x + gridDims.y + gridDims.z + 3;
     int cellsVisited = 0;
@@ -4640,7 +4703,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
 
             if (segmentT1 > segmentT0 + 1e-8) {
                 marchSegment(
-                    cameraPos, rayDir,
+                    rayOrigin, rayDir,
                     segmentT0, segmentT1,
                     stepSize, jitter, tTerminateMax,
                     color, opacity,
