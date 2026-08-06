@@ -167,7 +167,8 @@ struct VolumeMapperUniforms
   float ComponentWeight[4];        // 1200..1215
   uint32_t NumComponents;          // 1216..1219
   float UseIndependentComponents;  // 1220..1223
-  float _padIndependent[3];        // 1224..1235
+  float UseDependentLA;            // 1224..1227  (dependent 2-comp LA: color LUT on comp0, opacity LUT on last comp)
+  float _padIndependent[2];        // 1228..1235
   float UseDependentRGBA;          // 1236..1239  (4-comp dependent RGBA: raw RGB color, opacity LUT on scalar.w)
   float UseComputeNormalFromOpacity; // 1240..1243  (1.0 = shade with the opacity-field gradient; OpenGL ComputeNormalFromOpacity parity)
   float _padEnd2[1];               // 1244..1247  (trailing pad to 1248)
@@ -1214,16 +1215,18 @@ static void FillTransferFunctionRGBA8WithPreIntegration(
 static void FillTransferFunctionRGBA16FWithPreIntegration(
   vtkColorTransferFunction* colorFunc,
   vtkPiecewiseFunction* opacityFunc,
-  double scalarMin,
-  double scalarMax,
+  double colorMin,
+  double colorMax,
+  double opacityMin,
+  double opacityMax,
   int width,
   uint16_t* row,
   double preIntegrationFactor)
 {
   std::vector<double> rgb(width * 3);
   std::vector<double> alpha(width);
-  colorFunc->GetTable(scalarMin, scalarMax, width, rgb.data());
-  opacityFunc->GetTable(scalarMin, scalarMax, width, alpha.data());
+  colorFunc->GetTable(colorMin, colorMax, width, rgb.data());
+  opacityFunc->GetTable(opacityMin, opacityMax, width, alpha.data());
   for (int i = 0; i < width; ++i)
   {
     double a = alpha[i];
@@ -1236,6 +1239,25 @@ static void FillTransferFunctionRGBA16FWithPreIntegration(
     row[i * 4 + 2] = FloatToHalf(static_cast<float>(std::clamp(rgb[i * 3 + 2], 0.0, 1.0)));
     row[i * 4 + 3] = FloatToHalf(static_cast<float>(std::clamp(a, 0.0, 1.0)));
   }
+}
+
+// Two-range variant used by dependent multi-component volumes (OpenGL
+// UpdateColorTransferFunction(component) / UpdateOpacityTransferFunction(
+// component) parity): the RGB channels map one scalar range (component 0) while
+// the alpha channel maps another (the last component). The shader samples the
+// shared RGBA table at the two corresponding normalized coordinates.
+static void FillTransferFunctionRGBA16FWithPreIntegration(
+  vtkColorTransferFunction* colorFunc,
+  vtkPiecewiseFunction* opacityFunc,
+  double scalarMin,
+  double scalarMax,
+  int width,
+  uint16_t* row,
+  double preIntegrationFactor)
+{
+  FillTransferFunctionRGBA16FWithPreIntegration(
+    colorFunc, opacityFunc, scalarMin, scalarMax, scalarMin, scalarMax,
+    width, row, preIntegrationFactor);
 }
 
 // Compute the transfer function table width using the same rule as the OpenGL
@@ -3369,14 +3391,40 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
   // the sampled opacity. Color is unused in this mode (raw scalar.xyz).
   const bool dependentRGBA =
     (this->VolumeNumComponents == 4) && property && !property->GetIndependentComponents();
-  const double* tfRange = dependentRGBA ? this->ComponentScalarRange[3] : this->ScalarRange;
+  // Dependent 2-component (LA): color maps the FIRST component's range and
+  // opacity the LAST component's range (OpenGL UpdateColorTransferFunction(0)
+  // / UpdateOpacityTransferFunction(numComp - 1) parity). The shader samples
+  // the shared RGBA table at the first-component-normalized coordinate for RGB
+  // and at the last-component-normalized coordinate for A.
+  const bool dependentLA =
+    (this->VolumeNumComponents == 2) && property && !property->GetIndependentComponents();
+  const double* colorRange =
+    dependentLA ? this->ComponentScalarRange[0] : this->ScalarRange;
+  const double* opacityRange =
+    dependentLA ? this->ComponentScalarRange[1]
+                : (dependentRGBA ? this->ComponentScalarRange[3] : this->ScalarRange);
+  // Table width estimate: keep the pre-existing range choice (the last
+  // component's range for dependent RGBA, component 0's range otherwise) so
+  // the width is unchanged for all existing paths.
+  const double* widthRange =
+    dependentRGBA ? this->ComponentScalarRange[3] : this->ScalarRange;
 
   bool sampleDistChanged =
     (actualSampleDistance != this->LastTransferFunctionSampleDist);
 
+  // Primary change detection uses the pre-existing table range (widthRange): it
+  // equals the color range for every path except dependent RGBA, where the RGB
+  // channels of the shared table are never sampled (raw scalar RGB is used), so
+  // only the last-component range (widthRange == opacityRange) needs tracking
+  // there. The opacity range only needs separate tracking when dependent LA
+  // splits the table across two ranges; for all other paths it equals
+  // widthRange, so no redundant comparisons are performed.
   bool scalarRangeChanged =
-    (tfRange[0] != this->LastTransferFunctionScalarRange[0]) ||
-    (tfRange[1] != this->LastTransferFunctionScalarRange[1]);
+    (widthRange[0] != this->LastTransferFunctionScalarRange[0]) ||
+    (widthRange[1] != this->LastTransferFunctionScalarRange[1]) ||
+    (dependentLA &&
+      ((opacityRange[0] != this->LastTransferFunctionOpacityScalarRange[0]) ||
+       (opacityRange[1] != this->LastTransferFunctionOpacityScalarRange[1])));
 
   bool doReload = (this->ColorOpacityTexture == nullptr);
   doReload |= (colorFunc->GetMTime() > this->TransferFunctionUploadTime.GetMTime());
@@ -3387,13 +3435,19 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
   if (doReload)
   {
     // Compute pre-integration factor (sampleDistance / unitDistance), same as
-    // vtkOpenGLVolumeOpacityTable::InternalUpdate.
-    double unitDist = property->GetScalarOpacityUnitDistance(0);
+    // vtkOpenGLVolumeOpacityTable::InternalUpdate. OpenGL parity: for
+    // dependent modes the opacity function is sampled over the LAST component
+    // (vtkVolumeInputHelper::UpdateOpacityTransferFunction passes numComp - 1
+    // for RGBA/LA), so the unit distance follows that component too. For
+    // 1-component volumes the index is 0 and this matches the classic path.
+    const int opacityComp =
+      (dependentLA || dependentRGBA) ? (this->VolumeNumComponents - 1) : 0;
+    double unitDist = property->GetScalarOpacityUnitDistance(opacityComp);
     if (unitDist <= 0.0) unitDist = 1.0;
     double preIntegrationFactor = actualSampleDistance / unitDist;
 
     const int tfWidth = ComputeTransferFunctionWidth(
-      colorFunc, opacityFunc, tfRange);
+      colorFunc, opacityFunc, widthRange);
 
     @autoreleasepool
     {
@@ -3402,7 +3456,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
       std::vector<uint16_t> tfData(static_cast<size_t>(tfWidth) * 4);
       FillTransferFunctionRGBA16FWithPreIntegration(
         colorFunc, opacityFunc,
-        tfRange[0], tfRange[1],
+        colorRange[0], colorRange[1],
+        opacityRange[0], opacityRange[1],
         tfWidth, tfData.data(),
         preIntegrationFactor);
 
@@ -3437,8 +3492,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
               withBytes:tfData.data()
             bytesPerRow:static_cast<NSUInteger>(tfWidth) * 8];
 
-      this->LastTransferFunctionScalarRange[0] = tfRange[0];
-      this->LastTransferFunctionScalarRange[1] = tfRange[1];
+      this->LastTransferFunctionScalarRange[0] = widthRange[0];
+      this->LastTransferFunctionScalarRange[1] = widthRange[1];
+      this->LastTransferFunctionOpacityScalarRange[0] = opacityRange[0];
+      this->LastTransferFunctionOpacityScalarRange[1] = opacityRange[1];
       this->LastTransferFunctionSampleDist = actualSampleDistance;
       this->TransferFunctionUploadTime.Modified();
     }
@@ -6454,6 +6511,13 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     const bool independent =
       prop && prop->GetIndependentComponents() && this->VolumeNumComponents > 1;
     uniforms.UseIndependentComponents = independent ? 1.0f : 0.0f;
+    // Dependent 2-component mode (LA): color is the color LUT at the first
+    // component's normalized value and opacity is the opacity LUT at the LAST
+    // component's normalized value (OpenGL computeColor/computeOpacity LA
+    // parity; the table splits RGB over component 0's range and A over the last
+    // component's range).
+    uniforms.UseDependentLA =
+      prop && !prop->GetIndependentComponents() && (this->VolumeNumComponents == 2) ? 1.0f : 0.0f;
     // 4-component dependent mode treats the volume as raw RGBA: the shader uses
     // scalar.xyz directly for color and the opacity LUT for scalar.w (OpenGL
     // computeColor/computeOpacity RGBA parity).

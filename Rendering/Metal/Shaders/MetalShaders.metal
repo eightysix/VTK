@@ -2770,7 +2770,14 @@ struct VolumeMapperUniforms {
   float componentWeight[4];
   uint numComponents;
   float useIndependentComponents;
-  float _padIndependent[3];
+  // 1.0 = dependent 2-component (LA): color is looked up in the color LUT at
+  // the first component's normalized value (RGB channels) and opacity in the
+  // opacity LUT at the LAST component's normalized value (A channel) — OpenGL
+  // computeColor/computeOpacity LA parity. The single RGBA transfer-function
+  // texture stores RGB over component 0's scalar range and A over the last
+  // component's scalar range, so it is sampled twice.
+  float useDependentLA;
+  float _padIndependent[2];
   float useDependentRGBA;
   // 1.0 = shade with the opacity-field gradient (OpenGL
   // vtkVolumeMapper::GetComputeNormalFromOpacity parity). Occupies what would
@@ -3776,7 +3783,8 @@ inline half4 marchVolumeUnified(
     // keep rectEvalPoint == evalPoint and the branch is a no-op.
     float3 rectEvalPoint = evalPoint;
     if (doRectilinear &&
-        (needsFetch || useIndependentPath || volumeUniforms.useDependentRGBA > 0.5)) {
+        (needsFetch || useIndependentPath || volumeUniforms.useDependentRGBA > 0.5 ||
+         volumeUniforms.useDependentLA > 0.5)) {
       rectEvalPoint = rectilinearSamplePosition(evalPoint, true, rectCoords, volumeUniforms);
     }
     float rawScalar = needsFetch
@@ -3793,10 +3801,11 @@ inline half4 marchVolumeUnified(
       } else {
         rawScalar4 = volumeTexture.sample(sNearest, rectEvalPoint, level(0));
       }
-    } else if (volumeUniforms.useDependentRGBA > 0.5) {
-      // 4-component dependent RGBA: color and opacity come from the raw RGBA
-      // channels (OpenGL computeColor/computeOpacity RGBA parity), so the full
-      // texel is needed regardless of the component-0 prefetch cache.
+    } else if (volumeUniforms.useDependentRGBA > 0.5 || volumeUniforms.useDependentLA > 0.5) {
+      // 4-component dependent RGBA / 2-component dependent LA: color and
+      // opacity come from the raw channels (OpenGL computeColor/computeOpacity
+      // RGBA/LA parity), so the full texel is needed regardless of the
+      // component-0 prefetch cache.
       rawScalar4 = sampleVolumeTexel(volumeTexture, rectEvalPoint);
     }
     float rawMask = (doMask && needsFetch)
@@ -3972,6 +3981,23 @@ inline half4 marchVolumeUnified(
         half rgbaOpacity =
           sampleTransferFunction(transferFunctionTexture, float2(rawScalar4.a, 0.5)).a;
         colorOpacity = half4(half3(rawScalar4.rgb), rgbaOpacity);
+      } else if (volumeUniforms.useDependentLA > 0.5) {
+        // 2-component dependent LA: color is the color LUT at the first
+        // component's normalized value (scalarNorm, RGB channels) and opacity
+        // is the opacity LUT at the LAST component's normalized value (A
+        // channel) — OpenGL computeColor/computeOpacity LA parity (color at
+        // scalar.x, opacity at scalar.y). The two LUTs share the single RGBA
+        // table — RGB over component 0's range, A over the last component's
+        // range — so it is sampled at the two different coordinates.
+        half4 laColor = sampleTransferFunction(
+            transferFunctionTexture, float2(float(scalarNorm), 0.5));
+        half lastMin = half(volumeUniforms.scalarMinComp[1]);
+        half lastMax = half(volumeUniforms.scalarMaxComp[1]);
+        half lastNorm = saturate(
+            (half(rawScalar4.g) - lastMin) / max(lastMax - lastMin, 1e-4h));
+        half laOpacity = sampleTransferFunction(
+            transferFunctionTexture, float2(float(lastNorm), 0.5)).a;
+        colorOpacity = half4(laColor.rgb, laOpacity);
       } else {
         colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
       }

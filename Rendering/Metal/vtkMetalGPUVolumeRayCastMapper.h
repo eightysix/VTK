@@ -314,6 +314,9 @@ private:
   // Adaptive sample distance
   double ReductionFactor = 1.0;
   double LastTransferFunctionScalarRange[2] = { 0.0, 0.0 };
+  // Dependent 2-component (LA) split the table: RGB over component 0's range,
+  // A over the last component's range. Track the opacity-range half separately.
+  double LastTransferFunctionOpacityScalarRange[2] = { 0.0, 0.0 };
   double LastTransferFunctionSampleDist = -1.0;
   double LastGradientOpacityScalarRange[2] = { 0.0, 0.0 };
   double LastLabelMapScalarRange[2] = { 0.0, 0.0 };
