@@ -2981,14 +2981,22 @@ inline float3 cellToPointTextureCoord(float3 texCoord, float3 scale, float3 offs
 
 // OpenGL ShadingSingleInput rectilinear parity (vtkVolumeShaderComposer.h): the
 // proxy renders with uniform spacing over the bounds, but the actual per-axis
-// coordinate curves are non-uniform. For each sample, walk the axis's coordinate
-// array to find the containing cell (ijk, pCoords) and convert the recovered
+// coordinate curves are non-uniform. For each sample, find the containing cell
+// (ijk, pCoords) in the axis's coordinate array and convert the recovered
 // index-space position (ijk + pCoords) to a [0,1] texture coordinate by dividing
 // by the per-axis point count — the same remap GL applies at every evaluate
 // point, including the sign(in_cellSpacing) flip for descending grids.
 // rectCoords holds float3 texels (x/y/z per axis, padded to the longest axis),
-// each axis pre-scaled by its own GetScaleAndBias so the walk happens in
+// each axis pre-scaled by its own GetScaleAndBias so the lookup happens in
 // [0,1]-normalized coordinate space (OpenGL in_coordTexs parity).
+//
+// Ascending axes use a monotonic binary search (O(log n) vs the GL linear
+// scan); the recovered cell is identical for strictly-increasing coordinate
+// curves, including the GL edge cases: samples below coord[0] or above
+// coord[n-1] map to 0 (the linear scan completes without a match, leaving
+// ijk = pCoords = 0), and a sample exactly on coord[n-1] maps to (n-1)/n (the
+// scan hits the s == xNext branch at the last index). Descending axes keep the
+// exact GL linear-scan swap semantics (pathological, not exercised by tests).
 inline float3 rectilinearSampleCoord(float3 dataPosWorld,
                                      constant packed_float3* rectCoords,
                                      constant VolumeMapperUniforms& u)
@@ -2999,29 +3007,49 @@ inline float3 rectilinearSampleCoord(float3 dataPosWorld,
   for (int j = 0; j < 3; ++j) {
     int n = sizes[j];
     if (n <= 1) { continue; }
+    float s = scaled[j];
     float xPrev = rectCoords[0][j];
     float xNext = rectCoords[n - 1][j];
-    bool descending = xNext < xPrev;
-    if (descending) { float t = xNext; xNext = xPrev; xPrev = t; }
-    float s = scaled[j];
-    int ijk = 0;
-    float pCoords = 0.0;
-    for (int i = 0; i < n; ++i) {
-      xNext = rectCoords[i][j];
-      if (s >= xPrev && s < xNext) {
-        ijk = i - 1;
-        pCoords = (s - xPrev) / max(xNext - xPrev, 1e-8);
-        break;
+    if (xNext < xPrev) {
+      // Descending curve: exact OpenGL linear-scan parity (swap + sign flip).
+      float tmp = xNext;
+      xNext = xPrev;
+      xPrev = tmp;
+      int ijk = 0;
+      float pCoords = 0.0;
+      for (int i = 0; i < n; ++i) {
+        xNext = rectCoords[i][j];
+        if (s >= xPrev && s < xNext) {
+          ijk = i - 1;
+          pCoords = (s - xPrev) / max(xNext - xPrev, 1e-8);
+          break;
+        }
+        if (s == xNext) {
+          ijk = i - 1;
+          pCoords = 1.0;
+          break;
+        }
+        xPrev = xNext;
       }
-      if (s == xNext) {
-        ijk = i - 1;
-        pCoords = 1.0;
-        break;
-      }
-      xPrev = xNext;
+      out[j] = -(float(ijk) + pCoords) / float(n);
+      continue;
     }
-    float sign = descending ? -1.0 : 1.0;
-    out[j] = sign * (float(ijk) + pCoords) / float(n);
+    // Ascending: largest index with coord[lo] <= s.
+    int lo = 0;
+    int hi = n - 1;
+    while (lo < hi) {
+      int mid = (lo + hi + 1) >> 1;
+      if (rectCoords[mid][j] <= s) { lo = mid; }
+      else { hi = mid - 1; }
+    }
+    if (s < xPrev) { continue; }          // below range -> 0
+    if (lo == n - 1) {                    // at/above the top coordinate
+      if (s == xNext) { out[j] = float(n - 1) / float(n); }
+      continue;                           // above range -> 0
+    }
+    float denom = max(rectCoords[lo + 1][j] - rectCoords[lo][j], 1e-8);
+    float pCoords = (s - rectCoords[lo][j]) / denom;
+    out[j] = (float(lo) + pCoords) / float(n);
   }
   return out;
 }
@@ -3581,9 +3609,20 @@ inline half4 marchVolumeUnified(
     }
 
     bool needsFetch = !prefetchValid;
+    // Rectilinear mode remaps every scalar/texel fetch through the per-axis
+    // coordinate curves (OpenGL ShadingSingleInput remaps for all component
+    // counts). The remapped coordinate is computed at most once per sample and
+    // only when a fetch actually needs it: the needsFetch scalar, the
+    // independent multi-component texel, and the dependent-RGBA texel all read
+    // the same evalPoint, so one walk serves all three. Non-rectilinear inputs
+    // keep rectEvalPoint == evalPoint and the branch is a no-op.
+    float3 rectEvalPoint = evalPoint;
+    if (doRectilinear &&
+        (needsFetch || useIndependentPath || volumeUniforms.useDependentRGBA > 0.5)) {
+      rectEvalPoint = rectilinearSamplePosition(evalPoint, true, rectCoords, volumeUniforms);
+    }
     float rawScalar = needsFetch
-      ? sampleVolumeScalar(volumeTexture,
-          rectilinearSamplePosition(evalPoint, doRectilinear, rectCoords, volumeUniforms))
+      ? sampleVolumeScalar(volumeTexture, rectEvalPoint)
       : prefetchScalar;
     // Independent multi-component path: the volume texture stores one channel
     // per component (2-comp -> RG, 3-comp -> RGBA with filler alpha), so the
@@ -3592,16 +3631,15 @@ inline half4 marchVolumeUnified(
     float4 rawScalar4 = float4(rawScalar, 0.0, 0.0, 0.0);
     if (useIndependentPath) {
       if (fc_linearInterpolation) {
-        rawScalar4 = volumeTexture.sample(sVolume, evalPoint, level(0));
+        rawScalar4 = volumeTexture.sample(sVolume, rectEvalPoint, level(0));
       } else {
-        rawScalar4 = volumeTexture.sample(sNearest, evalPoint, level(0));
+        rawScalar4 = volumeTexture.sample(sNearest, rectEvalPoint, level(0));
       }
     } else if (volumeUniforms.useDependentRGBA > 0.5) {
       // 4-component dependent RGBA: color and opacity come from the raw RGBA
       // channels (OpenGL computeColor/computeOpacity RGBA parity), so the full
       // texel is needed regardless of the component-0 prefetch cache.
-      rawScalar4 = sampleVolumeTexel(volumeTexture,
-          rectilinearSamplePosition(evalPoint, doRectilinear, rectCoords, volumeUniforms));
+      rawScalar4 = sampleVolumeTexel(volumeTexture, rectEvalPoint);
     }
     float rawMask = (doMask && needsFetch)
       ? maskTexture.sample(sNearest, evalPoint, level(0)).r
