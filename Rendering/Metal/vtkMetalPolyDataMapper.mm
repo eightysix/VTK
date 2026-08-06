@@ -687,6 +687,13 @@ constexpr uint32_t VTK_METAL_SCENE_FLAG_HAS_SCALAR_LUT      = 1u << 13;
 // decision for line primitives in GetNeedToRebuildShaders. Read only by the
 // dedicated fragment_main_line entry, so surface draws never see it.
 constexpr uint32_t VTK_METAL_SCENE_FLAG_LINES_UNLIT         = 1u << 14;
+// The actor's input actually has point normals. When clear, the vertex-normal
+// buffer holds the mapper's dummy (0,1,0) fill (the Metal vertex descriptor
+// requires a slot-1 buffer), so lit line fragments must synthesize a
+// camera-aligned normal from view-position derivatives like GL's
+// ReplaceShaderNormal no-point-normals path. Mirrors
+// VTK_METAL_SCENE_FLAG_GLYPH_HAS_NORMALS for the line entry points.
+constexpr uint32_t VTK_METAL_SCENE_FLAG_LINES_HAVE_NORMALS  = 1u << 20;
 // Property lighting disabled (vtkProperty::SetLighting(false)): surfaces and
 // points skip the Phong loop and emit the flat ambient+diffuse color, matching
 // vtkGLSLModLight's complexity-0 path (lines are already covered by
@@ -712,7 +719,8 @@ constexpr uint32_t VTK_METAL_DYNAMIC_ACTOR_FLAG_MASK =
     VTK_METAL_SCENE_FLAG_LINES_UNLIT |
     VTK_METAL_SCENE_FLAG_LIGHTING_DISABLED |
     VTK_METAL_SCENE_FLAG_HAS_POINT_COLORS |
-    VTK_METAL_SCENE_FLAG_LINES_TUBE_SHADING;
+    VTK_METAL_SCENE_FLAG_LINES_TUBE_SHADING |
+    VTK_METAL_SCENE_FLAG_LINES_HAVE_NORMALS;
 
 id<MTLBuffer> CreateZeroBuffer(id<MTLDevice> device, size_t bytes)
 {
@@ -3971,12 +3979,25 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
 
       // P2-2A: Match vtkOpenGLPolyDataMapper::GetNeedToRebuildShaders — line
       // primitives are lit only when the input has point normals and the
-      // interpolation is not flat. Without normals GL takes the NoLighting path
-      // and emits the flat vertex color; fragment_main_line uses this flag to
-      // skip Phong lighting for the 1px line draw.
+      // interpolation is not flat, EXCEPT polygon wireframe edges. GL renders
+      // those through the PrimitiveTris cellBO (CreateTriangleLineIndexBuffer),
+      // so isTrisOrStrips makes them lit regardless of normals. The wireframe
+      // edges of a normal-less mesh (e.g. vtkCameraActor's frustum) are
+      // therefore lit like triangles; fragment_main_line uses this flag to
+      // skip Phong lighting only for the genuinely-unlit 1px line draws.
       bool lineHaveNormals = (input->GetPointData()->GetNormals() != nullptr);
+      if (lineHaveNormals)
+      {
+        actorFlags |= VTK_METAL_SCENE_FLAG_LINES_HAVE_NORMALS;
+      }
+      bool inputHasTrisOrStrips =
+        (input->GetNumberOfPolys() > 0 || input->GetNumberOfStrips() > 0);
+      bool isTrisOrStripsLike =
+        (prop->GetRepresentation() == VTK_WIREFRAME) && inputHasTrisOrStrips;
       bool lineLighting =
-        prop->GetLighting() && prop->GetInterpolation() != VTK_FLAT && lineHaveNormals;
+        prop->GetLighting() &&
+        (isTrisOrStripsLike ||
+         (!isTrisOrStripsLike && prop->GetInterpolation() != VTK_FLAT && lineHaveNormals));
       if (!lineLighting)
       {
         actorFlags |= VTK_METAL_SCENE_FLAG_LINES_UNLIT;

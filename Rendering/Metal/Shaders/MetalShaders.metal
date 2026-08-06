@@ -40,6 +40,10 @@ constant uint kSceneFlagUsePrimitiveCellIds = 1u << 12;
 constant uint kSceneFlagHasScalarLUT        = 1u << 13;
 constant uint kSceneFlagLinesUnlit           = 1u << 14;
 constant uint kSceneFlagGlyphHasNormals      = 1u << 15;
+// The actor's input actually has point normals. When clear the vertex-normal
+// buffer holds the mapper's dummy (0,1,0) fill, so lit line
+// fragments synthesize a camera-aligned derivative normal like GL.
+constant uint kSceneFlagLinesHaveNormals     = 1u << 20;
 // Property lighting disabled (vtkProperty::SetLighting(false)): every draw of
 // the actor skips the Phong loop and emits the flat ambient+diffuse material
 // color, matching vtkGLSLModLight's complexity-0 path in GL.
@@ -844,6 +848,22 @@ fragment FragmentOutput fragment_main(VertexOut in [[stage_in]],
     in, coinOffset.polygonFactor, coinOffset.polygonOffset);
 }
 
+// Synthesize a camera-aligned normal for line fragments whose input has no
+// point normals, matching GL's ReplaceShaderNormal no-point-normals path
+// (vtkOpenGLPolyDataMapper). The scale is derived from the raw fdx/fdy
+// (abs(fdx)+abs(fdy) is exactly fwidth) so the derivatives are evaluated once.
+inline float3 lineDerivativeNormal(float3 viewPos)
+{
+  float3 fdx = dfdx(viewPos);
+  float3 fdy = dfdy(viewPos);
+  float scale = 1.0 / length(abs(fdx) + abs(fdy));
+  fdx *= scale;
+  fdy *= scale;
+  float addOrSubtract = (dot(fdx, fdy) >= 0.0) ? 1.0 : -1.0;
+  float3 lineVec = addOrSubtract * fdy + fdx;
+  return normalize(cross(float3(lineVec.y, -lineVec.x, 0.0), lineVec));
+}
+
 // 1px line variant of fragment_main: honors the kSceneFlagLinesUnlit scene flag
 // so lines drawn from inputs without point normals (or flat interpolation)
 // render with the flat vertex color, matching vtkOpenGLPolyDataMapper's
@@ -865,10 +885,30 @@ fragment FragmentOutput fragment_main_line(VertexOut in [[stage_in]],
                               sampler lutSampler [[sampler(1)]],
                               uint prim_id [[primitive_id]],
                               bool frontFacing [[front_facing]]) {
+  VertexOut v = in;
+  // Wireframe polygon edges and line cells from inputs without point normals
+  // carry the mapper's dummy (0,1,0) vertex normal (the Metal vertex descriptor
+  // needs a slot-1 buffer), which would light wrongly. Match GL's
+  // ReplaceShaderNormal no-point-normals path (vtkOpenGLPolyDataMapper):
+  // generate a camera-aligned normal from screen-space derivatives of the view
+  // position so lit wireframes (isTrisOrStrips) shade like the GL PrimitiveTris
+  // draw. The mapper clears kSceneFlagLinesHaveNormals for such inputs. The
+  // synthesis runs only when the normal is actually consumed: line vertices
+  // always carry edgeFlags == 0 (vertex_main), so applySurfaceEdges never reads
+  // it, and the flat path (kSceneFlagLinesUnlit or no lights) skips Phong.
+  const bool noPointNormals = (scene.flags & kSceneFlagLinesHaveNormals) == 0u;
+  const bool litLines =
+    (scene.flags & kSceneFlagLinesUnlit) == 0u && lights.lightCount > 0;
+  if (noPointNormals && litLines)
+  {
+    v.viewNormal = lineDerivativeNormal(v.viewPos);
+  }
+  // Lines are always front-facing in GL (gl_FrontFacing is true for line
+  // primitives); the rasterizer's front_facing is only defined for triangles.
   return makeFragmentOutput(
-    evaluateSurfaceFragment(in, material, lights, scene, edge,
+    evaluateSurfaceFragment(v, material, lights, scene, edge,
       clipPlanes, cellColorTex, cellPrimitiveIds, actorTexture, actorSampler,
-      lutTexture, lutSampler, prim_id, frontFacing,
+      lutTexture, lutSampler, prim_id, frontFacing || noPointNormals,
       (scene.flags & kSceneFlagLinesUnlit) != 0u),
     in, coinOffset.lineFactor, coinOffset.lineOffset);
 }
@@ -906,9 +946,29 @@ fragment OITAccumulateOutput fragment_main_line_oit(VertexOut in [[stage_in]],
                               bool frontFacing [[front_facing]]) {
   if (isClipped(in.modelPos, clipPlanes)) discard_fragment();
 
-  float3 N = normalize(in.viewNormal);
+  // Same no-point-normals fallback as fragment_main_line: wireframe edges and
+  // line cells from inputs without point normals get a camera-aligned
+  // derivative normal (GL's ReplaceShaderNormal path) so lit OIT wireframes
+  // shade like GL. The synthesis runs only when the normal is actually
+  // consumed — line vertices always carry edgeFlags == 0 (vertex_main), so
+  // applySurfaceEdges never reads it, and the flat path (kSceneFlagLinesUnlit
+  // or no lights) skips Phong. See fragment_main_line for the
+  // kSceneFlagLinesHaveNormals rationale.
+  VertexOut v = in;
+  const bool noPointNormals = (scene.flags & kSceneFlagLinesHaveNormals) == 0u;
+  const bool litLines =
+    (scene.flags & kSceneFlagLinesUnlit) == 0u && lights.lightCount > 0;
+  if (noPointNormals && litLines)
+  {
+    v.viewNormal = lineDerivativeNormal(v.viewPos);
+  }
+  // Lines are always front-facing in GL (gl_FrontFacing is true for line
+  // primitives); the rasterizer's front_facing is only defined for triangles.
+  const bool isFrontFacing = frontFacing || noPointNormals;
+
+  float3 N = normalize(v.viewNormal);
   MaterialUniforms m = material;
-  if (!frontFacing)
+  if (!isFrontFacing)
   {
     N = -N;
     m.ambientColor = material.backfaceAmbientColor;
@@ -923,7 +983,7 @@ fragment OITAccumulateOutput fragment_main_line_oit(VertexOut in [[stage_in]],
   ResolvedMaterial r = resolveMaterial(m, resolveCellColor(in, prim_id, scene, cellColorTex, lutTexture, lutSampler), in.uv, actorTexture, actorSampler,
     (scene.flags & (kSceneFlagHasSurfaceColors | kSceneFlagHasScalarLUT)) != 0u,
     (scene.flags & kSceneFlagHasActorTexture) != 0u,
-    frontFacing, material.showTexturesOnBackface);
+    isFrontFacing, material.showTexturesOnBackface);
   if (scalarLUTActive)
   {
     r.opacity = in.vertexColor.a * r.opacity;
