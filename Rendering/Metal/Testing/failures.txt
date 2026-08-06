@@ -14,6 +14,19 @@ entry-side samples are outside so rotated-volume corner regions still march
 (and composite) through to the data cube, and axis-aligned grazing rays still
 terminate via the block-bounds exit.
 
+Cell-data volume proxies now span the full cell extent instead of the
+cell-center envelope. The effective-input proxy for cell data shifts the origin
+by half a cell so texel centers land on cell centers, which made
+ComputeVolumeBounds return bounds inset by half a cell on each side, while the
+OpenGL backend computes bounds over the full cell extent (iMax =
+extent[1] + IsCellData). The proxy box was therefore ~half a cell smaller per
+side than the GL baseline (a ~3.6px/side shrink in a 138px panel), so the outer
+half of the boundary cells was never traversed. ComputeVolumeBounds now expands
+the index corners by half a cell on each side when the input is a cell-data
+proxy (CellFlag == 1). This fixes TestGPURayCastIndependentVectorMode
+(0.0600 -> pass, bottom-right cell-data magnitude panel) and
+TestGPURayCastVolumePicking (0.1234 -> pass).
+
 Gradient opacity no longer depends on shading being enabled: the Metal backend
 was gating UseGradientOpacity on property->GetShade(), but the OpenGL backend
 applies gradient opacity whenever the property declares it. This fixes

@@ -1035,7 +1035,7 @@ struct VolumeBounds
   double Size[3];
 };
 
-static VolumeBounds ComputeVolumeBounds(vtkImageData* input)
+static VolumeBounds ComputeVolumeBounds(vtkImageData* input, bool expandHalfCell = false)
 {
   VolumeBounds bounds{};
   int ext[6];
@@ -1045,13 +1045,27 @@ static VolumeBounds ComputeVolumeBounds(vtkImageData* input)
   input->GetSpacing(spacing);
   vtkMatrix3x3* direction = input->GetDirectionMatrix();
 
+  // Cell-data proxies carry the cell scalars at point positions (the effective
+  // input shifts the origin by half a cell so texel centers land on cell
+  // centers), so their extent covers only the cell-center envelope. Expand the
+  // index corners by half a cell on each side so the proxy box spans the full
+  // cell extent, matching the OpenGL backend's vtkVolumeTexture::ComputeBounds
+  // (iMax = extent[1] + IsCellData over the original cell-data extent). The
+  // volume-to-texture matrix stays based on the unexpanded proxy extent, so the
+  // boundary cells are reached through the clamp-to-edge sampling of the march.
+  double expand = expandHalfCell ? 0.5 : 0.0;
   // Rotate the 8 extents corners through the image-data direction matrix and
   // take the axis-aligned bounds, mirroring the OpenGL backend's
   // vtkVolumeTexture::ComputeBounds (LoadedBoundsAA).
-  int ijkCorners[8][3] = {
-    { ext[0], ext[2], ext[4] }, { ext[1], ext[2], ext[4] }, { ext[0], ext[3], ext[4] },
-    { ext[1], ext[3], ext[4] }, { ext[0], ext[2], ext[5] }, { ext[1], ext[2], ext[5] },
-    { ext[0], ext[3], ext[5] }, { ext[1], ext[3], ext[5] },
+  double ijkCorners[8][3] = {
+    { ext[0] - expand, ext[2] - expand, ext[4] - expand },
+    { ext[1] + expand, ext[2] - expand, ext[4] - expand },
+    { ext[0] - expand, ext[3] + expand, ext[4] - expand },
+    { ext[1] + expand, ext[3] + expand, ext[4] - expand },
+    { ext[0] - expand, ext[2] - expand, ext[5] + expand },
+    { ext[1] + expand, ext[2] - expand, ext[5] + expand },
+    { ext[0] - expand, ext[3] + expand, ext[5] + expand },
+    { ext[1] + expand, ext[3] + expand, ext[5] + expand },
   };
   double xyz[3];
   bounds.Min[0] = bounds.Min[1] = bounds.Min[2] = VTK_DOUBLE_MAX;
@@ -2143,7 +2157,7 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureGradientNormalTexture(
       return false;
     }
     vtkImageData* input = this->EffectiveInput;
-    VolumeBounds vb = input ? ComputeVolumeBounds(input) : VolumeBounds{};
+    VolumeBounds vb = input ? ComputeVolumeBounds(input, this->CellFlag == 1) : VolumeBounds{};
     if (!input)
     {
       for (int k = 0; k < 3; ++k)
@@ -2623,7 +2637,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
 
     if (needsVolumeRebuild)
     {
-      VolumeBounds vb = ComputeVolumeBounds(input);
+      VolumeBounds vb = ComputeVolumeBounds(input, this->CellFlag == 1);
       this->ModelBounds[0] = vb.Min[0];
       this->ModelBounds[1] = vb.Max[0];
       this->ModelBounds[2] = vb.Min[1];
@@ -2693,7 +2707,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
 
       // Store model-space bounds using image extent (handles non-zero extents and negative spacing)
       {
-        VolumeBounds vb = ComputeVolumeBounds(input);
+        VolumeBounds vb = ComputeVolumeBounds(input, this->CellFlag == 1);
         this->ModelBounds[0] = vb.Min[0];
         this->ModelBounds[1] = vb.Max[0];
         this->ModelBounds[2] = vb.Min[1];
@@ -4923,7 +4937,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
     // Use model-space bounds for vertex positions (using extent for correctness)
     if (input)
     {
-      VolumeBounds vb = ComputeVolumeBounds(input);
+      VolumeBounds vb = ComputeVolumeBounds(input, this->CellFlag == 1);
       this->ModelBounds[0] = vb.Min[0];
       this->ModelBounds[1] = vb.Max[0];
       this->ModelBounds[2] = vb.Min[1];
