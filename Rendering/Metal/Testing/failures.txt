@@ -84,3 +84,21 @@ proxy carries only scalars), fixing TestGPURayCastVolumeGhostArraysCellData
     TestSmartVolumeMapperImplicitArray
 
 PNG exports + manifest: build_macos_metal/Testing/ImageCompareReviewVolume/
+
+Hardware selection (vtkHardwareSelector) is now implemented for the Metal
+volume ray-cast backend: when a selection render is active with CELLS field
+association, the volume is ray-cast with a dedicated selection pipeline
+(VolumePipelineType::SelectionDirect / SelectionFullscreen) that additionally
+writes the picking ids {voxelId, propId, compositeIndex} into the RGBA32Uint
+color attachment 1 wherever the ray accumulated opacity > 3/255 — the Metal
+equivalent of the OpenGL backend's CheckPickingState + PickingActorPassExit.
+The renderer attaches the shared IdsTexture (load action) to the volume pass so
+depth-tested volume fragments only override the ids where their rays accumulate
+opacity. This fixes TestGPURayCastVolumePicking (0.1234 -> pass): previously the
+volume was invisible to hardware picking and the picker reported the cone behind
+it (selection box hugged the cone), whereas the baseline picks the volume
+(selection spans the whole scene).
+
+After this fix the suite is at 74 pass / 19 fail / 4 abort (23 total), down from
+TestGPURayCastVolumePicking alone; every other failure is unchanged.
+

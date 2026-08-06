@@ -959,6 +959,22 @@ void vtkMetalRenderer::DeviceRender()
         }
       }
 
+      // Hardware selection (vtkHardwareSelector): the volume mapper's selection
+      // pipeline writes the picking ids ({voxelId, propId, compositeIndex}) into
+      // the same RGBA32Uint attachment 1 the opaque passes already populated.
+      // Load it so the depth-tested volume only overrides ids where its rays
+      // accumulate opacity (vtkOpenGLGPUVolumeRayCastMapper ACTOR_PASS parity).
+      if (!msaa && this->Selector)
+      {
+        id<MTLTexture> idsTex = (__bridge id<MTLTexture>)renWin->IdsTexture;
+        if (idsTex)
+        {
+          rpd.colorAttachments[1].texture = idsTex;
+          rpd.colorAttachments[1].loadAction = MTLLoadActionLoad;
+          rpd.colorAttachments[1].storeAction = MTLStoreActionStore;
+        }
+      }
+
       id<MTLRenderCommandEncoder> encoder =
         [commandBuffer renderCommandEncoderWithDescriptor:rpd];
       encoder.label = @"VTK Volume Encoder";

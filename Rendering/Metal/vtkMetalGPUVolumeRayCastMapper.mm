@@ -36,6 +36,9 @@
 #include "vtkPolyData.h"
 #include "vtkPoints.h"
 #include "vtkCellArray.h"
+#include "vtkDataObject.h"
+#include "vtkHardwareSelector.h"
+#include "vtkMetalHardwareSelector.h"
 #include <limits>
 
 #import <Metal/Metal.h>
@@ -173,10 +176,20 @@ struct VolumeMapperUniforms
   float DiffuseColorComp[4][4];    // 1312..1375
   float SpecularColorComp[4][4];   // 1376..1439
   float ShininessComp[4];          // 1440..1455  (total 1456, 16-byte aligned)
+  // Hardware-selection (vtkHardwareSelector) support — OpenGL CheckPickingState
+  // / PickingActorPassExit parity. selectionMode == 0 keeps the normal path.
+  float SelectionMode;             // 1456
+  float _padSel[3];                // 1460..1471
+  uint32_t SelectionPropId;        // 1472  0-based selector PropArray index
+  uint32_t SelectionCompositeIndex; // 1476 (0 for a single vtkVolume)
+  uint32_t SelectionVolumeDimX;    // 1480  volume dimensions for the voxel index
+  uint32_t SelectionVolumeDimY;    // 1484
+  uint32_t SelectionVolumeDimZ;    // 1488
+  uint32_t _padSelEnd[3];          // 1492..1503 (total 1504, 16-byte aligned)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1456,
-  "VolumeMapperUniforms must be 1456 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1504,
+  "VolumeMapperUniforms must be 1504 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -198,6 +211,8 @@ static_assert(offsetof(VolumeMapperUniforms, AmbientColorComp) == 1248, "");
 static_assert(offsetof(VolumeMapperUniforms, DiffuseColorComp) == 1312, "");
 static_assert(offsetof(VolumeMapperUniforms, SpecularColorComp) == 1376, "");
 static_assert(offsetof(VolumeMapperUniforms, ShininessComp) == 1440, "");
+static_assert(offsetof(VolumeMapperUniforms, SelectionMode) == 1456, "");
+static_assert(offsetof(VolumeMapperUniforms, SelectionPropId) == 1472, "");
 
 // Per-light data for volume shading — must match Metal VolumeLight struct
 // Must match Metal VolumeLight (6 x float4 = 96 bytes per light)
@@ -5394,6 +5409,14 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
       fragName = @"fragment_volume_rtt_main";
       useVolumeVertex = true;
       break;
+    case VolumePipelineType::SelectionDirect:
+      fragName = @"fragment_volume_selection_main";
+      useVolumeVertex = true;
+      break;
+    case VolumePipelineType::SelectionFullscreen:
+      fragName = @"fragment_volume_fullscreen_selection_main";
+      useVolumeVertex = false;
+      break;
   }
 
   // Create function constants for shader specialization.
@@ -5407,7 +5430,9 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     pt == VolumePipelineType::FullscreenOffscreen ||
     pt == VolumePipelineType::GridTraversalDirect ||
     pt == VolumePipelineType::GridTraversalOffscreen ||
-    pt == VolumePipelineType::RenderToImage);
+    pt == VolumePipelineType::RenderToImage ||
+    pt == VolumePipelineType::SelectionDirect ||
+    pt == VolumePipelineType::SelectionFullscreen);
 
   if (hasFeatureConstants)
   {
@@ -5501,9 +5526,22 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     pipelineDesc.colorAttachments[1].pixelFormat = MTLPixelFormatR32Float;
   }
 
+  // The selection pipelines additionally write the picking IDs
+  // ({voxelId, propId, compositeIndex}) to an RGBA32Uint attachment 1 — the
+  // same format used by the surface mappers' picking pipelines and read back
+  // by vtkMetalHardwareSelector.
+  if (pt == VolumePipelineType::SelectionDirect ||
+    pt == VolumePipelineType::SelectionFullscreen)
+  {
+    pipelineDesc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;
+    pipelineDesc.colorAttachments[1].blendingEnabled = NO;
+  }
+
   // DirectScreen and FullscreenDirect use blending; offscreen pipelines do not.
   if (pt == VolumePipelineType::DirectScreen || pt == VolumePipelineType::FullscreenDirect ||
-      pt == VolumePipelineType::GridTraversalDirect)
+      pt == VolumePipelineType::GridTraversalDirect ||
+      pt == VolumePipelineType::SelectionDirect ||
+      pt == VolumePipelineType::SelectionFullscreen)
   {
     pipelineDesc.colorAttachments[0].blendingEnabled = YES;
     pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
@@ -5771,7 +5809,9 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
   VolumeMapperUniforms* uniforms = static_cast<VolumeMapperUniforms*>(uniformsVoid);
 
   uint32_t pipelineType = useDirectPipeline
-    ? static_cast<uint32_t>(VolumePipelineType::FullscreenDirect)
+    ? (uniforms->SelectionMode > 0.5f
+        ? static_cast<uint32_t>(VolumePipelineType::SelectionFullscreen)
+        : static_cast<uint32_t>(VolumePipelineType::FullscreenDirect))
     : static_cast<uint32_t>(VolumePipelineType::FullscreenOffscreen);
 
   int featureMask = 0;
@@ -6463,6 +6503,45 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     featureMask |= VolumeFeature_LinearInterpolation;
   featureMask |= BlendModeToFeatureFlag(this->GetBlendMode());
 
+  // Hardware-selection support (vtkHardwareSelector): during a selection render
+  // with CELLS field association the volume is ray-cast with the selection
+  // pipeline that writes {voxelId, propId, compositeIndex} into the RGBA32Uint
+  // picking attachment wherever the ray accumulates opacity — the Metal
+  // equivalent of the OpenGL backend's CheckPickingState / PickingActorPassExit.
+  // Without this the volume would be invisible to hardware picking and the
+  // picker would report whatever polygonal prop lies behind it.
+  bool selectionRender = false;
+  uint32_t selectionPropId = 0;
+  if (vtkHardwareSelector* selector = ren->GetSelector())
+  {
+    if (selector->GetFieldAssociation() == vtkDataObject::FIELD_ASSOCIATION_CELLS)
+    {
+      vtkMetalHardwareSelector* metalSelector =
+        vtkMetalHardwareSelector::SafeDownCast(selector);
+      int propId = metalSelector ? metalSelector->GetPropID(vol) : -1;
+      if (propId >= 0)
+      {
+        selectionRender = true;
+        selectionPropId = static_cast<uint32_t>(propId);
+        int ext[6];
+        input->GetExtent(ext);
+        // The selector treats index 0 as "empty space" (the id attachment
+        // encodes ids as value + 1), so the maximum cell id is the number of
+        // voxels. Mirror the OpenGL backend's EndPicking bookkeeping.
+        selector->UpdateMaximumCellId(static_cast<vtkIdType>(ext[1] - ext[0] + 1) *
+          (ext[3] - ext[2] + 1) * (ext[5] - ext[4] + 1));
+      }
+    }
+  }
+  uniforms.SelectionMode = selectionRender ? 1.0f : 0.0f;
+  uniforms.SelectionPropId = selectionPropId;
+  uniforms.SelectionCompositeIndex = 0;
+  int selDims[3];
+  input->GetDimensions(selDims);
+  uniforms.SelectionVolumeDimX = static_cast<uint32_t>(selDims[0]);
+  uniforms.SelectionVolumeDimY = static_cast<uint32_t>(selDims[1]);
+  uniforms.SelectionVolumeDimZ = static_cast<uint32_t>(selDims[2]);
+
   // Image-space downsampling requires offscreen rendering at reduced resolution.
   // Partitioned volumes no longer force offscreen rendering because grid traversal
   // composites correctly in a single pass.
@@ -6798,7 +6877,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     else
     {
       void* directPso = this->GetOrCreateVolumePipeline(mtlDevice,
-        static_cast<uint32_t>(VolumePipelineType::DirectScreen),
+        static_cast<uint32_t>(selectionRender
+          ? VolumePipelineType::SelectionDirect
+          : VolumePipelineType::DirectScreen),
         MTLPixelFormatBGRA8Unorm, MTLPixelFormatDepth32Float,
         static_cast<uint32_t>(sampleCount), featureMask);
       this->BindEncoderResources(encoder, uniformBuf, directPso, true);

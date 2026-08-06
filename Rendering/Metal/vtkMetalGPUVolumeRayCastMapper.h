@@ -43,7 +43,9 @@ enum class VolumePipelineType : uint32_t
   FullscreenOffscreen = 4,   // Fullscreen ray-cast for camera-inside (RGBA16Float, no depth)
   GridTraversalDirect = 5,   // Single-pass grid traversal fullscreen (BGRA8Unorm + depth)
   GridTraversalOffscreen = 6, // Single-pass grid traversal fullscreen (RGBA16Float, no depth)
-  RenderToImage = 7           // RenderToImage (RGBA16Float color + R32Float depth export)
+  RenderToImage = 7,          // RenderToImage (RGBA16Float color + R32Float depth export)
+  SelectionDirect = 8,        // Hardware-selection ray-cast (BGRA8Unorm + depth + RGBA32Uint ids)
+  SelectionFullscreen = 9     // Hardware-selection fullscreen ray-cast, camera inside (BGRA8Unorm + depth + RGBA32Uint ids)
 };
 
 struct VolumePipelineKey

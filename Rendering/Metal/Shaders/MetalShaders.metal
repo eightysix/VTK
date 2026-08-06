@@ -2715,6 +2715,19 @@ struct VolumeMapperUniforms {
   float4 diffuseColorComp[4];
   float4 specularColorComp[4];
   float shininessComp[4];
+  // Hardware-selection (vtkHardwareSelector) support — OpenGL PickingActorPassExit
+  // / PickingIdLow24PassExit parity. The fragment_volume_selection_main variants
+  // write {voxelId, propId, compositeIndex} into the RGBA32Uint color(1)
+  // attachment wherever the ray accumulated opacity > 3/255; selectionMode == 0
+  // keeps the normal path.
+  float selectionMode;
+  float _padSel[3];
+  uint selectionPropId;          // 0-based selector PropArray index (shader adds 1)
+  uint selectionCompositeIndex;  // 0 for a single vtkVolume
+  uint selectionVolumeDimX;      // volume dimensions for the voxel index
+  uint selectionVolumeDimY;
+  uint selectionVolumeDimZ;
+  uint _padSelEnd[3];
 };
 
 struct VolumeLight {
@@ -2770,6 +2783,26 @@ vertex VolumeVertexOut vertex_volume_main(
 
 struct VolumeFragmentOut { float4 color [[color(0)]]; };
 struct VolumeFragmentOutRTT { float4 color [[color(0)]]; float depth [[color(1)]]; };
+struct VolumeSelectionOut { float4 color [[color(0)]]; uint4 ids [[color(1)]]; };
+
+// Shared picking-id encoding for the hardware-selection fragment variants
+// (OpenGL PickingActorPassExit / PickingIdLow24PassExit parity): returns the
+// RGBA32Uint attachment value {voxelIdx + 1, propId + 1, compositeIndex, 0}
+// wherever the ray accumulated opacity > 3/255, otherwise 0. The ids are
+// encoded as value + 1 because vtkMetalHardwareSelector decodes - 1 and index 0
+// means "empty space".
+inline uint4 volumeSelectionIds(float3 entryPoint, float accumulatedOpacity,
+    constant VolumeMapperUniforms& volumeUniforms) {
+  if (accumulatedOpacity <= 3.0 / 255.0) { return uint4(0u); }
+  float3 dimsF = float3(float(volumeUniforms.selectionVolumeDimX),
+      float(volumeUniforms.selectionVolumeDimY), float(volumeUniforms.selectionVolumeDimZ));
+  uint3 voxelCoords = uint3(entryPoint * dimsF);
+  uint dimX = max(volumeUniforms.selectionVolumeDimX, 1u);
+  uint dimY = max(volumeUniforms.selectionVolumeDimY, 1u);
+  uint voxelIdx = dimX * dimY * voxelCoords.z + dimX * voxelCoords.y + voxelCoords.x + 1u;
+  return uint4(voxelIdx, volumeUniforms.selectionPropId + 1u,
+      volumeUniforms.selectionCompositeIndex, 0u);
+}
 
 constant int MAX_RAY_STEPS = 8192;
 
@@ -4096,7 +4129,70 @@ fragment VolumeFragmentOut fragment_volume_main(
   return output;
 }
 
-// Fullscreen volume ray-cast shader: used when the camera is inside the volume.
+// Hardware-selection variant of fragment_volume_main (vtkHardwareSelector,
+// cell field association): runs the identical ray march but additionally writes
+// the picking IDs — {voxel index, prop id, composite index} — into the RGBA32Uint
+// color(1) attachment wherever the ray accumulated opacity > 3/255. This is the
+// Metal equivalent of the OpenGL backend's PickingActorPassExit shader exit.
+// The ids are encoded as value + 1 (vtkMetalHardwareSelector decodes - 1, and
+// index 0 means "empty space"), so 1 is added to the voxel and prop indices.
+// Fragments below the opacity threshold write 0 and leave the underlying
+// polygonal prop's ids untouched.
+fragment VolumeSelectionOut fragment_volume_selection_main(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    texture2d<float> gradientOpacityTexture [[texture(3)]],
+    texture3d<float> maskTexture [[texture(4)]],
+    texture2d<float> labelMapTransferTexture [[texture(5)]],
+    texture3d<float> minMaxTexture [[texture(6)]],
+    texture3d<float> normalTexture [[texture(7)]],
+    texture2d<float> transferFunction2DTexture [[texture(9)]],
+    texture3d<float> transfer2DYAxisTexture [[texture(10)]],
+    texture3d<float> blankingTexture [[texture(11)]],
+    texture2d<float> transferFunctionTexture1 [[texture(12)]],
+    texture2d<float> transferFunctionTexture2 [[texture(13)]],
+    texture2d<float> transferFunctionTexture3 [[texture(14)]],
+    constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
+
+  VolumeSelectionOut output;
+  output.color = float4(0.0);
+  output.ids = uint4(0u);
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  float3 rayDir = in.localPos - cameraPos;
+  float dirLength = length(rayDir);
+  if (dirLength < 0.0001) { return output; }
+  rayDir /= dirLength;
+
+  RaySetup s = setupVolumeRay(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { return output; }
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos,
+      stepSize, s.totalBoxT, in.position.xy,
+      half3(0.0), 0.0h, volumeUniforms, b,
+      volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
+      transferFunction2DTexture, transfer2DYAxisTexture,
+      depthTexture, gradientOpacityTexture,
+      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
+      blankingTexture, &volumeLights);
+
+  // PickingActorPassExit parity: only fragments that accumulated a certain
+  // level of opacity receive a picking id (index 0 is reserved for empty space).
+  // PickingActorPassExit parity: only fragments that accumulated a certain
+  // level of opacity receive a picking id (index 0 is reserved for empty space).
+  output.ids = volumeSelectionIds(s.entryPoint, float(_marchResult.w), volumeUniforms);
+  output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
+  return output;
+}
 // Reconstructs the ray from screen UV using inverseViewProjection (same approach
 // as the composite shader) instead of relying on proxy-geometry vertices.
 // This eliminates the CPU-heavy ClipConvexPolyData + DensifyPolyData + TriangleFilter
@@ -4143,6 +4239,58 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
       depthTexture, gradientOpacityTexture,
       maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
       blankingTexture, &volumeLights);
+  output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
+  return output;
+}
+
+// Hardware-selection variant of fragment_volume_fullscreen_main: same ray march
+// (camera-inside path) plus picking-id output, mirroring
+// fragment_volume_selection_main.
+fragment VolumeSelectionOut fragment_volume_fullscreen_selection_main(
+    FullscreenVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    texture2d<float> gradientOpacityTexture [[texture(3)]],
+    texture3d<float> maskTexture [[texture(4)]],
+    texture2d<float> labelMapTransferTexture [[texture(5)]],
+    texture3d<float> minMaxTexture [[texture(6)]],
+    texture3d<float> normalTexture [[texture(7)]],
+    texture2d<float> transferFunction2DTexture [[texture(9)]],
+    texture3d<float> transfer2DYAxisTexture [[texture(10)]],
+    texture3d<float> blankingTexture [[texture(11)]],
+    texture2d<float> transferFunctionTexture1 [[texture(12)]],
+    texture2d<float> transferFunctionTexture2 [[texture(13)]],
+    texture2d<float> transferFunctionTexture3 [[texture(14)]],
+    constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
+
+  VolumeSelectionOut output;
+  output.color = float4(0.0);
+  output.ids = uint4(0u);
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  float3 rayDir = reconstructRayDir(in.position.xy, volumeUniforms.viewportSize, volumeUniforms);
+
+  RaySetup s = setupVolumeRay(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { return output; }
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, cameraPos,
+      stepSize, s.totalBoxT, in.position.xy,
+      half3(0.0), 0.0h, volumeUniforms, b,
+      volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
+      transferFunction2DTexture, transfer2DYAxisTexture,
+      depthTexture, gradientOpacityTexture,
+      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
+      blankingTexture, &volumeLights);
+
+  output.ids = volumeSelectionIds(s.entryPoint, float(_marchResult.w), volumeUniforms);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
