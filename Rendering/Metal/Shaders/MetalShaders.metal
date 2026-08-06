@@ -7,6 +7,22 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// Metal shader logging (os_log, Metal 3.2 / macOS 15+): the volume ray-cast
+// mapper compiles this source with the VTK_METAL_ENABLE_LOGGING preprocessor
+// macro (and -fmetal-enable-logging via MTLCompileOptions.enableLogging) in
+// test builds, so the os_log calls below are only compiled into the volume
+// shader library there. Every other library compiled from this source passes
+// no such macro, so the #if blocks vanish and the shaders behave exactly as
+// before. Messages are held in the Metal log buffer until the process is
+// launched with MTL_LOG_LEVEL set (they are dropped otherwise), e.g.:
+//
+//   MTL_LOG_LEVEL=MTLLogLevelDebug MTL_LOG_TO_STDERR=1 ctest -R TestMetalVolumeShaderLog
+//
+// which forwards them to the test's stderr.
+#if defined(VTK_METAL_ENABLE_LOGGING)
+#include <metal_logging>
+#endif
+
 // Constexpr samplers: avoids per-draw sampler binding overhead.
 // sVolume — linear min/mag, clamp-to-edge (volume data, transfer function, gradient opacity)
 // sNearest — nearest min/mag, clamp-to-edge (depth, mask, label map, min-max occupancy)
@@ -2892,6 +2908,13 @@ vertex VolumeVertexOut vertex_volume_main(
   out.position = volumeUniforms.viewProjection * volumeUniforms.volumeToWorld * float4(modelPos, 1.0);
   out.localPos = (modelPos - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
   out.instanceID = 0;
+  // Debug only (test builds): the proxy geometry has only a handful of
+  // vertices, so this stays bounded to a few messages per frame. Verified by
+  // TestMetalVolumeShaderLog.
+#if defined(VTK_METAL_ENABLE_LOGGING)
+  os_log_default.log_info("VTK_METAL_VOLUME_LOG vertex_volume_main modelPos=(%f, %f, %f)",
+    modelPos.x, modelPos.y, modelPos.z);
+#endif
   return out;
 }
 
@@ -4518,6 +4541,15 @@ fragment VolumeFragmentOut fragment_volume_main(
     if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
     rayDir /= dirLength;
   }
+  // Debug only (test builds): one message per frame, gated to the center
+  // pixel. Verified by TestMetalVolumeShaderLog.
+#if defined(VTK_METAL_ENABLE_LOGGING)
+  if (all(abs(in.position.xy - 0.5f * volumeUniforms.viewportSize) < 1.0f))
+  {
+    os_log_default.log_info("VTK_METAL_VOLUME_LOG fragment_volume_main center camera=(%f, %f, %f)",
+      cameraPos.x, cameraPos.y, cameraPos.z);
+  }
+#endif
 
   RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
       in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
@@ -4645,6 +4677,15 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
   float3 rayDir = parallel
     ? projectionDir(volumeUniforms)
     : reconstructRayDir(in.position.xy, volumeUniforms.viewportSize, volumeUniforms);
+  // Debug only (test builds): one message per frame, gated to the center
+  // pixel. Verified by TestMetalVolumeShaderLog.
+#if defined(VTK_METAL_ENABLE_LOGGING)
+  if (all(abs(in.position.xy - 0.5f * volumeUniforms.viewportSize) < 1.0f))
+  {
+    os_log_default.log_info("VTK_METAL_VOLUME_LOG fragment_volume_fullscreen_main center camera=(%f, %f, %f)",
+      cameraPos.x, cameraPos.y, cameraPos.z);
+  }
+#endif
 
   RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
       in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);

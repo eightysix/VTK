@@ -12,7 +12,8 @@ vtk_add_test_cxx(vtkRenderingMetalCxxTests tests
   TestMetalImageMapper.cxx,NO_DATA,NO_SERDES
   TestMetalImageSliceMapper.cxx,NO_DATA,NO_SERDES
   TestMetalTexture.cxx,NO_DATA,NO_SERDES
-  TestMetalVolumeRayCast.cxx,NO_DATA,NO_SERDES)
+  TestMetalVolumeRayCast.cxx,NO_DATA,NO_SERDES
+  TestMetalVolumeShaderLog.cxx,NO_DATA,NO_SERDES)
 
 vtk_test_cxx_executable(vtkRenderingMetalCxxTests tests)
 

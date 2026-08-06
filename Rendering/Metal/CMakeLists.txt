@@ -153,10 +153,16 @@ vtk_module_add_module(
 # harness render into a private texture instead of a CAMetalLayer drawable (whose
 # nextDrawable is paced to the display refresh cadence on recent macOS), so the
 # Metal timing is not throttled by the compositor.
+# Shader logging (os_log, Metal 3.2 / macOS 15+) is test-only as well: it is
+# enabled in the volume ray-cast mapper's shader library compile (via
+# MTLCompileOptions.enableLogging + the VTK_METAL_ENABLE_LOGGING preprocessor
+# macro) so the volume shaders can emit debug messages that land in the unified
+# logging system. See TestMetalVolumeShaderLog.
 if(VTK_BUILD_TESTING)
   target_compile_definitions(vtkRenderingMetal PRIVATE
     VTK_METAL_ENABLE_COLOR_READBACK
-    VTK_METAL_ENABLE_OFFSCREEN_TARGET)
+    VTK_METAL_ENABLE_OFFSCREEN_TARGET
+    VTK_METAL_ENABLE_LOGGING)
 endif()
 
 # Link Metal framework
