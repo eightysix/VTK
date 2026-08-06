@@ -42,6 +42,9 @@ Options:
                         or .../ImageCompareReviewVolume for the volume suite)
   -p, --prefix PREFIX   ctest test prefix (default: RenderingCoreCxx-Metal;
                         use RenderingVolumeCxx-Metal for the volume suite)
+  -x, --exclude REGEX   ctest -E regex excluded from the run/analysis
+                        (e.g. RenderingVolumeCxx-Metal to keep only the
+                        OpenGL volume suite)
   -d, --baseline-dir DIR
                         baseline PNG dir (default derived from --prefix:
                         <build>/ExternalData/Rendering/Core/... or
@@ -124,7 +127,7 @@ def suite_runlog(prefix):
         else "/tmp/metal_suite_run.log"
 
 
-def parse_ctest_console(path, prefix):
+def parse_ctest_console(path, prefix, exclude=None):
     """Failed/aborted test names from a ctest console log.
 
     Handles both the modern per-test lines ("Test #123: VTK::<prefix>-<name> ...
@@ -134,16 +137,22 @@ def parse_ctest_console(path, prefix):
     esc = re.escape(prefix)
     inline = re.compile(r"Test #\d+: VTK::" + esc + r"-(\S+)")
     legacy = re.compile(r"\t\d+ - VTK::" + esc + r"-(\S+) \(([^)]+)\)")
+    excl = re.compile(exclude) if exclude else None
     fails, aborts = set(), set()
     with open(path, errors="replace") as fh:
         for line in fh:
             m = legacy.search(line)
             if m:
-                (aborts if m.group(2) == "Subprocess aborted" else fails).add(m.group(1))
+                name = m.group(1)
+                if excl and excl.search(name):
+                    continue
+                (aborts if m.group(2) == "Subprocess aborted" else fails).add(name)
                 continue
             m = inline.search(line)
             if m:
                 name = m.group(1)
+                if excl and excl.search(name):
+                    continue
                 if "Subprocess aborted" in line:
                     aborts.add(name)
                 elif "Failed" in line:
@@ -151,19 +160,20 @@ def parse_ctest_console(path, prefix):
     return fails, aborts
 
 
-def parse_lastlog(path, prefix):
+def parse_lastlog(path, prefix, exclude=None):
     """All test names, image-compare failure metrics, and comparison image paths.
 
     An image-compare failure is identified by the
     "Failed Image Test ( <Test>.png ) : <metric>" line vtkTesting emits only
     when an image comparison fails (the ImageError DartMeasurement is also
     printed for passing comparisons and non-image failures, so it is not used
-    as the discriminator). Returns (names, imgfails, imgs) where imgfails maps
+    as the discriminator).     Returns (names, imgfails, imgs) where imgfails maps
     test name -> TIGHT_VALID metric and imgs maps test name -> {metal, baseline,
     diff} paths when present in the log.
     """
     fail_img = re.compile(r"Failed Image Test \( ([A-Za-z0-9_]+\.png) \) : "
                           r"([\d.eE+-]+)")
+    excl = re.compile(exclude) if exclude else None
     with open(path, errors="replace") as fh:
         log = fh.read()
     esc = re.escape(prefix)
@@ -176,6 +186,8 @@ def parse_lastlog(path, prefix):
         if not m:
             continue
         name = m.group(1)
+        if excl and excl.search(name):
+            continue
         err = fail_img.search(b)
         if err:
             imgfails[name] = float(err.group(2))
@@ -210,11 +222,13 @@ def bucket(err):
     return "gross"
 
 
-def run_ctest(build_dir, prefix, jobs, runlog):
+def run_ctest(build_dir, prefix, exclude, jobs, runlog):
+    cmd = ["ctest", "--test-dir", build_dir, "-R", prefix, "-j", str(jobs)]
+    if exclude:
+        cmd += ["-E", exclude]
     with open(runlog, "w") as fh:
-        proc = subprocess.Popen(
-            ["ctest", "--test-dir", build_dir, "-R", prefix, "-j", str(jobs)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
         for line in proc.stdout or []:
             sys.stdout.write(line)
             fh.write(line)
@@ -239,6 +253,8 @@ def main(argv=None):
                     help="ctest parallelism (default: %(default)s)")
     ap.add_argument("-n", "--no-run", action="store_true",
                     help="skip the ctest run; analyze/export last run's artifacts")
+    ap.add_argument("-x", "--exclude", default=None,
+                    help="ctest -E regex excluded from the run/analysis")
     ap.add_argument("-r", "--runlog", default=None,
                     help="ctest console log (default: /tmp/metal_suite_run.log "
                          "or /tmp/metal_volume_suite_run.log for the volume "
@@ -277,22 +293,23 @@ def main(argv=None):
                                "LastTestsFailed.log")
 
     if not args.no_run:
-        print(f"== ctest --test-dir {build_dir} -R {args.prefix} -j {args.jobs}")
-        run_ctest(build_dir, args.prefix, args.jobs, runlog)
+        print(f"== ctest --test-dir {build_dir} -R {args.prefix} "
+              f"-E {args.exclude} -j {args.jobs}")
+        run_ctest(build_dir, args.prefix, args.exclude, args.jobs, runlog)
     else:
         print("== --no-run: analyzing/exporting the last run's artifacts")
 
     fails, aborts = set(), set()
     runlog_had = False
     if os.path.isfile(runlog):
-        fails, aborts = parse_ctest_console(runlog, args.prefix)
+        fails, aborts = parse_ctest_console(runlog, args.prefix, args.exclude)
         runlog_had = bool(fails or aborts)
     elif args.no_run:
         print(f"WARNING: --runlog not found: {runlog}")
 
     if not os.path.isfile(lastlog):
         sys.exit(f"missing --lastlog: {lastlog}")
-    names, imgfails, imgs = parse_lastlog(lastlog, args.prefix)
+    names, imgfails, imgs = parse_lastlog(lastlog, args.prefix, args.exclude)
     if not names:
         sys.exit(f"no '{args.prefix}' tests found in {lastlog}; "
                  "run the suite first")
