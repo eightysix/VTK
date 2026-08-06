@@ -15,6 +15,7 @@
 #ifndef vtkOpenGLRayCastImageDisplayHelper_h
 #define vtkOpenGLRayCastImageDisplayHelper_h
 
+#include "vtkOverrideAttribute.h"
 #include "vtkRayCastImageDisplayHelper.h"
 #include "vtkRenderingVolumeOpenGL2Module.h" // For export macro
 
@@ -31,6 +32,7 @@ class VTKRENDERINGVOLUMEOPENGL2_EXPORT vtkOpenGLRayCastImageDisplayHelper
 {
 public:
   static vtkOpenGLRayCastImageDisplayHelper* New();
+  static vtkOverrideAttribute* CreateOverrideAttributes();
   vtkTypeMacro(vtkOpenGLRayCastImageDisplayHelper, vtkRayCastImageDisplayHelper);
   void PrintSelf(ostream& os, vtkIndent indent) override;
 
@@ -63,6 +65,9 @@ private:
   vtkOpenGLRayCastImageDisplayHelper(const vtkOpenGLRayCastImageDisplayHelper&) = delete;
   void operator=(const vtkOpenGLRayCastImageDisplayHelper&) = delete;
 };
+
+#define vtkOpenGLRayCastImageDisplayHelper_OVERRIDE_ATTRIBUTES \
+  vtkOpenGLRayCastImageDisplayHelper::CreateOverrideAttributes()
 
 VTK_ABI_NAMESPACE_END
 #endif

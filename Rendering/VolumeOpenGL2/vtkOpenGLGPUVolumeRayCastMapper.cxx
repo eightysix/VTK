@@ -48,6 +48,7 @@
 #include <vtkOpenGLShaderCache.h>
 #include <vtkOpenGLShaderProperty.h>
 #include <vtkOpenGLVertexArrayObject.h>
+#include <vtkOverrideAttribute.h>
 #include <vtkPixelBufferObject.h>
 #include <vtkPixelExtent.h>
 #include <vtkPixelTransfer.h>
@@ -94,6 +95,12 @@
 
 VTK_ABI_NAMESPACE_BEGIN
 vtkStandardNewMacro(vtkOpenGLGPUVolumeRayCastMapper);
+
+//------------------------------------------------------------------------------
+vtkOverrideAttribute* vtkOpenGLGPUVolumeRayCastMapper::CreateOverrideAttributes()
+{
+  return vtkOverrideAttribute::CreateAttributeChain("RenderingBackend", "OpenGL", nullptr);
+}
 
 //------------------------------------------------------------------------------
 class vtkOpenGLGPUVolumeRayCastMapper::vtkInternal

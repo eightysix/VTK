@@ -10,6 +10,7 @@
 #include "vtkOpenGLShaderCache.h"
 #include "vtkOpenGLState.h"
 #include "vtkOpenGLVertexArrayObject.h"
+#include "vtkOverrideAttribute.h"
 #include "vtkProperty.h"
 #include "vtkRenderer.h"
 #include "vtkShaderProgram.h"
@@ -27,6 +28,12 @@
 
 VTK_ABI_NAMESPACE_BEGIN
 vtkStandardNewMacro(vtkOpenGLRayCastImageDisplayHelper);
+
+//------------------------------------------------------------------------------
+vtkOverrideAttribute* vtkOpenGLRayCastImageDisplayHelper::CreateOverrideAttributes()
+{
+  return vtkOverrideAttribute::CreateAttributeChain("RenderingBackend", "OpenGL", nullptr);
+}
 
 //------------------------------------------------------------------------------
 // Construct a new vtkOpenGLRayCastImageDisplayHelper with default values
