@@ -3771,16 +3771,25 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       {
         const bool lineLightingDisabled = !act->GetProperty()->GetLighting();
         auto lineJoin = act->GetProperty()->GetLineJoin();
-        if (lineJoin == vtkProperty::LineJoinType::MiterJoin &&
+        // Mirror the availability checks in RebuildRenderBundle: the miter and
+        // thick tube pipelines only apply when lineWidth > 1, so 1px lines must
+        // route to the standard line OIT pipeline. ThickLineSegmentCount is
+        // non-zero for every line batch (it tracks the 1px segment count too),
+        // so without the lineWidth guard a 1px wireframe would ensure the thick
+        // pipeline here while the draw gate looks for the standard one and
+        // skips the lines entirely.
+        const float lineWidth = static_cast<float>(act->GetProperty()->GetLineWidth());
+        if (lineWidth > 1.0f &&
+            lineJoin == vtkProperty::LineJoinType::MiterJoin &&
             this->Internals->MiterJoinLineSegmentCount > 0)
         {
           this->EnsureMiterJoinLineOITPipelineState((void*)device, lineLightingDisabled);
         }
-        else if (this->Internals->ThickLineSegmentCount > 0)
+        else if (lineWidth > 1.0f && this->Internals->ThickLineSegmentCount > 0)
         {
           this->EnsureThickLineOITPipelineState((void*)device, lineLightingDisabled);
         }
-        else if (static_cast<float>(act->GetProperty()->GetLineWidth()) <= 1.0f)
+        else
         {
           this->EnsureLineOITPipelineState((void*)device);
         }
