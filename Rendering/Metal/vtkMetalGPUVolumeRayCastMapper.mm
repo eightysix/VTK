@@ -1191,6 +1191,31 @@ static void FillTransferFunctionRGBA16FWithPreIntegration(
   }
 }
 
+// Compute the transfer function table width using the same rule as the OpenGL
+// backend (vtkOpenGLVolumeLookupTable::ComputeIdealTextureSize +
+// GetMaximumSupportedTextureWidth): the ideal width is the min-sample estimate
+// of the color and opacity functions over the scalar range, rounded up to a
+// power of two and clamped to a 1024-texel floor. The combined RGBA table
+// shares a single width, so the larger of the two estimates is used.
+static int ComputeTransferFunctionWidth(
+  vtkColorTransferFunction* colorFunc,
+  vtkPiecewiseFunction* opacityFunc,
+  const double range[2])
+{
+  int idealWidth = 1024;
+  if (colorFunc)
+  {
+    idealWidth = std::max(
+      idealWidth, colorFunc->EstimateMinNumberOfSamples(range[0], range[1]));
+  }
+  if (opacityFunc)
+  {
+    idealWidth = std::max(
+      idealWidth, opacityFunc->EstimateMinNumberOfSamples(range[0], range[1]));
+  }
+  return std::max(1024, vtkMath::NearestPowerOfTwo(idealWidth));
+}
+
 //------------------------------------------------------------------------------
 // Refactoring 12: create a dummy 3D texture filled with a constant value
 static id<MTLTexture> CreateDummy3DTexture(
@@ -3220,7 +3245,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
     if (unitDist <= 0.0) unitDist = 1.0;
     double preIntegrationFactor = actualSampleDistance / unitDist;
 
-    const int tfWidth = 256;
+    const int tfWidth = ComputeTransferFunctionWidth(colorFunc, opacityFunc, tfRange);
 
     @autoreleasepool
     {
@@ -3311,7 +3336,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
       {
         id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
 
-        const int tfWidth = 256;
         void* compSlots[3] = { &this->ComponentTransferFunctionTexture1,
                                &this->ComponentTransferFunctionTexture2,
                                &this->ComponentTransferFunctionTexture3 };
@@ -3324,6 +3348,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
           {
             continue;
           }
+
+          const int tfWidth =
+            ComputeTransferFunctionWidth(cf, of, this->ComponentScalarRange[c]);
 
           double unitDist = property->GetScalarOpacityUnitDistance(c);
           if (unitDist <= 0.0)
