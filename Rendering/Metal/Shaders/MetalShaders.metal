@@ -2741,6 +2741,17 @@ struct VolumeMapperUniforms {
   // paths do one matrix-vector multiply instead of two matrix chains plus a
   // bounds re-normalize per fragment.
   float4x4 ndcToVolume;
+  // Rectilinear-grid support (OpenGL in_coordTexs / in_coordsScale /
+  // in_coordsBias parity): when useRectilinear is set, the fragment shader walks
+  // the per-axis coordinate curves (rectCoords buffer at fragment buffer(5),
+  // float3 per index padded to the longest axis) to map each sample's data-space
+  // position back to the index-space texture coordinate instead of sampling the
+  // uniform-spacing proxy directly. rectCoordsSizes xyz = point count per axis.
+  float useRectilinear;
+  float _padRect[3];
+  float4 rectCoordsSizes;   // xyz = number of coordinates per axis
+  float4 rectCoordsScale;   // per-axis GetScaleAndBias scale
+  float4 rectCoordsBias;    // per-axis GetScaleAndBias bias
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -2966,6 +2977,69 @@ inline half sampleGradientOpacity(texture2d<float> gradTex, float value) {
 // queries (get_width/get_height/get_depth) plus 3 divisions.
 inline float3 cellToPointTextureCoord(float3 texCoord, float3 scale, float3 offset) {
   return texCoord * scale + offset;
+}
+
+// OpenGL ShadingSingleInput rectilinear parity (vtkVolumeShaderComposer.h): the
+// proxy renders with uniform spacing over the bounds, but the actual per-axis
+// coordinate curves are non-uniform. For each sample, walk the axis's coordinate
+// array to find the containing cell (ijk, pCoords) and convert the recovered
+// index-space position (ijk + pCoords) to a [0,1] texture coordinate by dividing
+// by the per-axis point count — the same remap GL applies at every evaluate
+// point, including the sign(in_cellSpacing) flip for descending grids.
+// rectCoords holds float3 texels (x/y/z per axis, padded to the longest axis),
+// each axis pre-scaled by its own GetScaleAndBias so the walk happens in
+// [0,1]-normalized coordinate space (OpenGL in_coordTexs parity).
+inline float3 rectilinearSampleCoord(float3 dataPosWorld,
+                                     constant packed_float3* rectCoords,
+                                     constant VolumeMapperUniforms& u)
+{
+  int3 sizes = max(int3(u.rectCoordsSizes.xyz), int3(1));
+  float3 scaled = dataPosWorld * u.rectCoordsScale.xyz + u.rectCoordsBias.xyz;
+  float3 out = float3(0.0);
+  for (int j = 0; j < 3; ++j) {
+    int n = sizes[j];
+    if (n <= 1) { continue; }
+    float xPrev = rectCoords[0][j];
+    float xNext = rectCoords[n - 1][j];
+    bool descending = xNext < xPrev;
+    if (descending) { float t = xNext; xNext = xPrev; xPrev = t; }
+    float s = scaled[j];
+    int ijk = 0;
+    float pCoords = 0.0;
+    for (int i = 0; i < n; ++i) {
+      xNext = rectCoords[i][j];
+      if (s >= xPrev && s < xNext) {
+        ijk = i - 1;
+        pCoords = (s - xPrev) / max(xNext - xPrev, 1e-8);
+        break;
+      }
+      if (s == xNext) {
+        ijk = i - 1;
+        pCoords = 1.0;
+        break;
+      }
+      xPrev = xNext;
+    }
+    float sign = descending ? -1.0 : 1.0;
+    out[j] = sign * (float(ijk) + pCoords) / float(n);
+  }
+  return out;
+}
+
+// Converts a cellToPoint-shifted proxy [0,1] texture coordinate (Metal evalPoint
+// == OpenGL g_dataPos) to the index-space texture coordinate used for the scalar
+// fetch in rectilinear mode. The ray marches along the uniform-spacing proxy and
+// only the scalar lookup is remapped through the real coordinate curves; the
+// crop/mask/min-max/gradient tests keep using the proxy position, exactly like
+// the OpenGL backend. Returns evalPoint unchanged when not in rectilinear mode.
+inline float3 rectilinearSamplePosition(float3 evalPoint, bool doRectilinear,
+                                        constant packed_float3* rectCoords,
+                                        constant VolumeMapperUniforms& u)
+{
+  if (!doRectilinear) return evalPoint;
+  float3 boundsSize = max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
+  float3 dataPosWorld = u.volumeBoundsMin.xyz + evalPoint * boundsSize;
+  return rectilinearSampleCoord(dataPosWorld, rectCoords, u);
 }
 
 // Gradient fetch with direction correction for anisotropic spacing and image-data
@@ -3298,6 +3372,7 @@ inline half4 marchVolumeUnified(
     texture3d<float> minMaxTexture,
     texture3d<float> normalTexture,
     texture3d<float> blankingTexture,
+    constant packed_float3* rectCoords,
     constant VolumeLightUniforms* lightUniforms,
     thread float3* firstOpaquePos,
     thread bool*  haveOpaquePos)
@@ -3308,6 +3383,7 @@ inline half4 marchVolumeUnified(
   const bool doMask = fc_mask && (volumeUniforms.useMask > 0.5);
   const bool doTransfer2D = volumeUniforms.useTransfer2D > 0.5;
   const bool doBlanking = volumeUniforms.useBlanking > 0.5;
+  const bool doRectilinear = volumeUniforms.useRectilinear > 0.5;
 
   half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
   half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
@@ -3418,7 +3494,8 @@ inline half4 marchVolumeUnified(
   float3 texLocalPos = (volumeUniforms.volumeToTexture *
       float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
   float3 evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
-  float prefetchScalar = sampleVolumeScalar(volumeTexture, evalPoint);
+  float prefetchScalar = sampleVolumeScalar(volumeTexture,
+      rectilinearSamplePosition(evalPoint, doRectilinear, rectCoords, volumeUniforms));
   float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint, level(0)).r : 0.0;
   bool prefetchValid = true;
   int3  curCell     = int3(-1);
@@ -3505,7 +3582,8 @@ inline half4 marchVolumeUnified(
 
     bool needsFetch = !prefetchValid;
     float rawScalar = needsFetch
-      ? sampleVolumeScalar(volumeTexture, evalPoint)
+      ? sampleVolumeScalar(volumeTexture,
+          rectilinearSamplePosition(evalPoint, doRectilinear, rectCoords, volumeUniforms))
       : prefetchScalar;
     // Independent multi-component path: the volume texture stores one channel
     // per component (2-comp -> RG, 3-comp -> RGBA with filler alpha), so the
@@ -3522,7 +3600,8 @@ inline half4 marchVolumeUnified(
       // 4-component dependent RGBA: color and opacity come from the raw RGBA
       // channels (OpenGL computeColor/computeOpacity RGBA parity), so the full
       // texel is needed regardless of the component-0 prefetch cache.
-      rawScalar4 = sampleVolumeTexel(volumeTexture, evalPoint);
+      rawScalar4 = sampleVolumeTexel(volumeTexture,
+          rectilinearSamplePosition(evalPoint, doRectilinear, rectCoords, volumeUniforms));
     }
     float rawMask = (doMask && needsFetch)
       ? maskTexture.sample(sNearest, evalPoint, level(0)).r
@@ -3911,7 +3990,8 @@ inline half4 marchVolumeUnified(
     evalPoint += evalStep;
 
     if (i + 1 < maxSteps) {
-      prefetchScalar = sampleVolumeScalar(volumeTexture, evalPoint);
+      prefetchScalar = sampleVolumeScalar(volumeTexture,
+          rectilinearSamplePosition(evalPoint, doRectilinear, rectCoords, volumeUniforms));
       if (doMask) {
         prefetchMask = maskTexture.sample(sNearest, evalPoint, level(0)).r;
       }
@@ -4052,6 +4132,7 @@ inline half4 marchVolume(
     texture3d<float> minMaxTexture,
     texture3d<float> normalTexture,
     texture3d<float> blankingTexture,
+    constant packed_float3* rectCoords,
     constant VolumeLightUniforms* lightUniforms)
 {
   (void)exitPoint;
@@ -4065,7 +4146,7 @@ inline half4 marchVolume(
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       gradientOpacityTexture, maskTexture, labelMapTransferTexture,
-      minMaxTexture, normalTexture, blankingTexture, lightUniforms,
+      minMaxTexture, normalTexture, blankingTexture, rectCoords, lightUniforms,
       nullptr, nullptr);
 }
 
@@ -4094,6 +4175,7 @@ inline void marchSegment(
     texture3d<float> minMaxTexture,
     texture3d<float> normalTexture,
     texture3d<float> blankingTexture,
+    constant packed_float3* rectCoords,
     constant VolumeLightUniforms* lightUniforms)
 {
   float3 zero = float3(0.0);
@@ -4105,7 +4187,7 @@ inline void marchSegment(
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       gradientOpacityTexture, maskTexture, labelMapTransferTexture,
-      minMaxTexture, normalTexture, blankingTexture, lightUniforms,
+      minMaxTexture, normalTexture, blankingTexture, rectCoords, lightUniforms,
       nullptr, nullptr);
   accumulatedColor = result.xyz;
   accumulatedOpacity = result.w;
@@ -4129,6 +4211,7 @@ fragment VolumeFragmentOut fragment_volume_main(
     texture2d<float> transferFunctionTexture1 [[texture(12)]],
     texture2d<float> transferFunctionTexture2 [[texture(13)]],
     texture2d<float> transferFunctionTexture3 [[texture(14)]],
+    constant packed_float3* rectCoords [[buffer(5)]],
     constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
 
   VolumeFragmentOut output;
@@ -4162,7 +4245,7 @@ fragment VolumeFragmentOut fragment_volume_main(
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
       maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
-      blankingTexture, &volumeLights);
+      blankingTexture, rectCoords, &volumeLights);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
@@ -4194,6 +4277,7 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
     texture2d<float> transferFunctionTexture1 [[texture(12)]],
     texture2d<float> transferFunctionTexture2 [[texture(13)]],
     texture2d<float> transferFunctionTexture3 [[texture(14)]],
+    constant packed_float3* rectCoords [[buffer(5)]],
     constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
 
   VolumeSelectionOut output;
@@ -4226,7 +4310,7 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
       maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
-      blankingTexture, &volumeLights);
+      blankingTexture, rectCoords, &volumeLights);
 
   // PickingActorPassExit parity: only fragments that accumulated a certain
   // level of opacity receive a picking id (index 0 is reserved for empty space).
@@ -4259,6 +4343,7 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
     texture2d<float> transferFunctionTexture1 [[texture(12)]],
     texture2d<float> transferFunctionTexture2 [[texture(13)]],
     texture2d<float> transferFunctionTexture3 [[texture(14)]],
+    constant packed_float3* rectCoords [[buffer(5)]],
     constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
 
   VolumeFragmentOut output;
@@ -4287,7 +4372,7 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
       maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
-      blankingTexture, &volumeLights);
+      blankingTexture, rectCoords, &volumeLights);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
 }
@@ -4313,6 +4398,7 @@ fragment VolumeSelectionOut fragment_volume_fullscreen_selection_main(
     texture2d<float> transferFunctionTexture1 [[texture(12)]],
     texture2d<float> transferFunctionTexture2 [[texture(13)]],
     texture2d<float> transferFunctionTexture3 [[texture(14)]],
+    constant packed_float3* rectCoords [[buffer(5)]],
     constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
 
   VolumeSelectionOut output;
@@ -4343,7 +4429,7 @@ fragment VolumeSelectionOut fragment_volume_fullscreen_selection_main(
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
       maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
-      blankingTexture, &volumeLights);
+      blankingTexture, rectCoords, &volumeLights);
 
   output.ids = volumeSelectionIds(s.entryPoint, float(_marchResult.w), volumeUniforms);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
@@ -4374,6 +4460,7 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
     texture2d<float> transferFunctionTexture1 [[texture(12)]],
     texture2d<float> transferFunctionTexture2 [[texture(13)]],
     texture2d<float> transferFunctionTexture3 [[texture(14)]],
+    constant packed_float3* rectCoords [[buffer(5)]],
     constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
 
   VolumeFragmentOutRTT output;
@@ -4412,7 +4499,7 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       gradientOpacityTexture, maskTexture, labelMapTransferTexture,
-      minMaxTexture, normalTexture, blankingTexture, &volumeLights,
+      minMaxTexture, normalTexture, blankingTexture, rectCoords, &volumeLights,
       &firstOpaquePos, &searching);
 
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
@@ -4576,6 +4663,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
     texture2d<float> transferFunctionTexture1 [[texture(12)]],
     texture2d<float> transferFunctionTexture2 [[texture(13)]],
     texture2d<float> transferFunctionTexture3 [[texture(14)]],
+    constant packed_float3* rectCoords [[buffer(5)]],
     constant VolumeLightUniforms& volumeLights [[buffer(4)]])
 {
     VolumeFragmentOut output;
@@ -4717,7 +4805,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
                     transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
                     transferFunction2DTexture, transfer2DYAxisTexture,
                     gradientOpacityTexture, maskTexture, labelMapTransferTexture,
-                    minMaxTexture, normalTexture, blankingTexture,
+                    minMaxTexture, normalTexture, blankingTexture, rectCoords,
                     &volumeLights);
             }
         }

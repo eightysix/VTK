@@ -200,10 +200,21 @@ struct VolumeMapperUniforms
   // termination paths do one matrix-vector multiply instead of two matrix
   // chains plus a bounds re-normalize per fragment.
   float NDCToVolumeMatrix[16];     // 1536..1599 (total 1600, 16-byte aligned)
+  // Rectilinear-grid support (OpenGL in_coordTexs / in_coordsScale /
+  // in_coordsBias parity): when UseRectilinear is set the fragment shader walks
+  // the per-axis coordinate curves (RectCoordsBuffer at fragment buffer 5,
+  // float3 per index padded to the longest axis) to remap each sample's
+  // data-space position to the index-space texture coordinate instead of
+  // sampling the uniform-spacing proxy directly.
+  float UseRectilinear;            // 1600
+  float _padRect[3];               // 1604..1615
+  float RectCoordsSizes[4];        // 1616..1631  xyz = number of coords per axis
+  float RectCoordsScale[4];        // 1632..1647  per-axis GetScaleAndBias scale
+  float RectCoordsBias[4];         // 1648..1663  per-axis GetScaleAndBias bias
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1600,
-  "VolumeMapperUniforms must be 1600 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1664,
+  "VolumeMapperUniforms must be 1664 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -227,6 +238,7 @@ static_assert(offsetof(VolumeMapperUniforms, SpecularColorComp) == 1376, "");
 static_assert(offsetof(VolumeMapperUniforms, ShininessComp) == 1440, "");
 static_assert(offsetof(VolumeMapperUniforms, SelectionMode) == 1456, "");
 static_assert(offsetof(VolumeMapperUniforms, SelectionPropId) == 1472, "");
+static_assert(offsetof(VolumeMapperUniforms, UseRectilinear) == 1600, "");
 
 // Per-light data for volume shading — must match Metal VolumeLight struct
 // Must match Metal VolumeLight (6 x float4 = 96 bytes per light)
@@ -2341,6 +2353,8 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
 
   ReleaseMetalObject(this->VertexBuffer);
   ReleaseMetalObject(this->IndexBuffer);
+  ReleaseMetalObject(this->RectCoordsBuffer);
+  ReleaseMetalObject(this->DummyRectCoordsBuffer);
 }
 
 //------------------------------------------------------------------------------
@@ -2549,6 +2563,7 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureEffectiveInput()
       this->EffectiveInput = img;
       this->EffectiveInputTime.Modified();
     }
+    this->RectilinearInput = false;
     return true;
   }
 
@@ -2603,6 +2618,7 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureEffectiveInput()
     proxy->SetDirectionMatrix(img->GetDirectionMatrix());
     proxy->GetPointData()->SetScalars(scalars);
     proxy->Modified();
+    this->RectilinearInput = false;
   }
   else if (rGrid)
   {
@@ -2643,6 +2659,49 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureEffectiveInput()
       proxy->SetSpacing(spacing);
       proxy->GetPointData()->SetScalars(scalars);
       proxy->Modified();
+    }
+
+    // Rectilinear coordinate curves for the index-space remap (OpenGL
+    // in_coordTexs / in_coordsScale / in_coordsBias parity): each axis is
+    // normalized via the same GetScaleAndBias used by vtkVolumeTexture (so the
+    // shader walk happens in [0,1] normalized coordinate space) and packed into
+    // a float3-per-index array padded to the longest axis, matching the 1D
+    // float3 coord texture GL uploads.
+    this->RectilinearInput = true;
+    vtkDataArray* axisCoords[3] = { rGrid->GetXCoordinates(), rGrid->GetYCoordinates(),
+      rGrid->GetZCoordinates() };
+    int sizes[3];
+    for (int a = 0; a < 3; ++a)
+    {
+      sizes[a] = (axisCoords[a] && axisCoords[a]->GetNumberOfTuples() > 0)
+        ? static_cast<int>(axisCoords[a]->GetNumberOfTuples())
+        : 1;
+    }
+    int maxSize = std::max(sizes[0], std::max(sizes[1], sizes[2]));
+    this->RectCoordsData.assign(static_cast<size_t>(maxSize) * 3, 0.0f);
+    for (int a = 0; a < 3; ++a)
+    {
+      const double* r = axisCoords[a] ? axisCoords[a]->GetFiniteRange(0) : nullptr;
+      float fRange[2] = { 0.0f, 1.0f };
+      if (r)
+      {
+        fRange[0] = static_cast<float>(r[0]);
+        fRange[1] = static_cast<float>(r[1]);
+      }
+      if (fRange[1] == fRange[0])
+      {
+        fRange[1] = fRange[0] + 1e-6f;
+      }
+      float scale = 1.0f / (fRange[1] - fRange[0]);
+      float bias = -fRange[0] * scale;
+      this->RectCoordsScale[a] = scale;
+      this->RectCoordsBias[a] = bias;
+      this->RectCoordsSizes[a] = static_cast<float>(sizes[a]);
+      for (int i = 0; i < sizes[a]; ++i)
+      {
+        this->RectCoordsData[static_cast<size_t>(i) * 3 + a] =
+          static_cast<float>(axisCoords[a]->GetTuple1(i)) * scale + bias;
+      }
     }
   }
   else
@@ -2731,6 +2790,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       }
 
       this->VolumeUploadTime.Modified();
+      this->UpdateRectilinearCoordsBuffer(mtlDeviceVoid);
     }
 
     if (needsGridRebuild &&
@@ -3023,6 +3083,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       } // end if (!gpuConversionUsed)
 
       this->VolumeUploadTime.Modified();
+      this->UpdateRectilinearCoordsBuffer(mtlDeviceVoid);
     }
   }
 
@@ -3087,6 +3148,29 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
   }
 
   return true;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::UpdateRectilinearCoordsBuffer(void* mtlDeviceVoid)
+{
+  // Rebuilds the fragment buffer(5) coord-curve data (float3 per index, each
+  // axis GetScaleAndBias-normalized, padded to the longest axis). Only built for
+  // rectilinear inputs; released whenever the input is not rectilinear.
+  ReleaseMetalObject(this->RectCoordsBuffer);
+  if (!this->RectilinearInput || this->RectCoordsData.empty())
+  {
+    return;
+  }
+  @autoreleasepool
+  {
+    id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
+    NSUInteger byteCount =
+      static_cast<NSUInteger>(this->RectCoordsData.size()) * sizeof(float);
+    id<MTLBuffer> buf = [device newBufferWithBytes:this->RectCoordsData.data()
+                                            length:byteCount
+                                           options:MTLResourceStorageModeShared];
+    AssignMetalObject(this->RectCoordsBuffer, buf);
+  }
 }
 
 //------------------------------------------------------------------------------
@@ -5020,6 +5104,13 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         }
         AssignMetalObject(this->UniformBuffers[i], buf);
       }
+      // Zeroed fallback for the fragment buffer(5) rectilinear-coord slot; the
+      // shader only reads it when UseRectilinear is set, so a zeroed dummy is
+      // safe for all other inputs (matches the SetFragmentTextureOrFallback
+      // pattern used for textures).
+      id<MTLBuffer> dummyRect =
+        [device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+      AssignMetalObject(this->DummyRectCoordsBuffer, dummyRect);
     }
 
     // Use model-space bounds for vertex positions (using extent for correctness)
@@ -5735,6 +5826,12 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
   [encoder setVertexBuffer:uniformBuf offset:0 atIndex:1];
   [encoder setFragmentBuffer:uniformBuf offset:0 atIndex:1];
 
+  // Rectilinear coord curves (float3 per index). Zeroed dummy for non-rectilinear.
+  id<MTLBuffer> rectCoordsBuf =
+    this->RectCoordsBuffer ? (__bridge id<MTLBuffer>)this->RectCoordsBuffer
+                           : (__bridge id<MTLBuffer>)this->DummyRectCoordsBuffer;
+  [encoder setFragmentBuffer:rectCoordsBuf offset:0 atIndex:5];
+
   SetFragmentTextureOrFallback(encoder, 0, this->VolumeTexture, this->DummyVolumeTexture);
   [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->ColorOpacityTexture atIndex:1];
   SetFragmentTextureOrFallback(encoder, 2, this->DepthTextureOcclusion, this->DummyDepthTexture);
@@ -5770,6 +5867,12 @@ void vtkMetalGPUVolumeRayCastMapper::BindFullscreenTextures(
   [encoder setVertexBytes:pbd length:sizeof(PerBlockData) atIndex:2];
   [encoder setFragmentBytes:pbd length:sizeof(PerBlockData) atIndex:2];
   [encoder setFragmentBuffer:uniformBuf offset:0 atIndex:1];
+
+  // Rectilinear coord curves (float3 per index). Zeroed dummy for non-rectilinear.
+  id<MTLBuffer> rectCoordsBuf =
+    this->RectCoordsBuffer ? (__bridge id<MTLBuffer>)this->RectCoordsBuffer
+                           : (__bridge id<MTLBuffer>)this->DummyRectCoordsBuffer;
+  [encoder setFragmentBuffer:rectCoordsBuf offset:0 atIndex:5];
 
   SetFragmentTextureOrFallback(encoder, 0, volTexVoid, this->DummyVolumeTexture);
   [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->ColorOpacityTexture atIndex:1];
@@ -6790,6 +6893,24 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       memset(uniforms.NDCToVolumeMatrix, 0, sizeof(uniforms.NDCToVolumeMatrix));
     }
   }
+
+  // Rectilinear-grid index-space remap uniforms (OpenGL in_coordsScale /
+  // in_coordsBias parity). The fragment shader walks RectCoordsBuffer (buffer 5)
+  // only when UseRectilinear is set; for image/cell-data inputs the flag stays 0
+  // and sampling uses the uniform-spacing proxy directly.
+  uniforms.UseRectilinear = this->RectilinearInput ? 1.0f : 0.0f;
+  uniforms.RectCoordsSizes[0] = this->RectCoordsSizes[0];
+  uniforms.RectCoordsSizes[1] = this->RectCoordsSizes[1];
+  uniforms.RectCoordsSizes[2] = this->RectCoordsSizes[2];
+  uniforms.RectCoordsSizes[3] = 0.0f;
+  uniforms.RectCoordsScale[0] = this->RectCoordsScale[0];
+  uniforms.RectCoordsScale[1] = this->RectCoordsScale[1];
+  uniforms.RectCoordsScale[2] = this->RectCoordsScale[2];
+  uniforms.RectCoordsScale[3] = 0.0f;
+  uniforms.RectCoordsBias[0] = this->RectCoordsBias[0];
+  uniforms.RectCoordsBias[1] = this->RectCoordsBias[1];
+  uniforms.RectCoordsBias[2] = this->RectCoordsBias[2];
+  uniforms.RectCoordsBias[3] = 0.0f;
 
   // Wait for the uniform buffer slot for this frame to be free
   dispatch_semaphore_wait((dispatch_semaphore_t)this->FrameSemaphore, DISPATCH_TIME_FOREVER);

@@ -219,6 +219,8 @@ private:
   void* VertexBuffer = nullptr;         // id<MTLBuffer>
   void* IndexBuffer = nullptr;          // id<MTLBuffer>
   int IndexCount = 0;
+  void* RectCoordsBuffer = nullptr;     // id<MTLBuffer> — float3 per index, rectilinear coord curves
+  void* DummyRectCoordsBuffer = nullptr; // id<MTLBuffer> — zeroed fallback for non-rectilinear inputs
 
   // Volume state
   double ModelBounds[6] = { 0.0, 1.0, 0.0, 1.0, 0.0, 1.0 };
@@ -357,6 +359,18 @@ private:
   vtkSmartPointer<vtkImageData> EffectiveInput; // vtkImageData proxy (point scalars)
   vtkSmartPointer<vtkDataSet> EffectiveInputSource; // dataset the proxy was built from
   vtkTimeStamp EffectiveInputTime;
+
+  // Rectilinear-grid support: per-axis coordinate curves (float3 per index, x/y/z
+  // per axis, padded to the longest axis) that let the fragment shader remap the
+  // uniform-spacing proxy sampling back to the real index space (OpenGL
+  // in_coordTexs / in_coordsScale / in_coordsBias parity). Populated in
+  // EnsureEffectiveInput; uploaded to RectCoordsBuffer on volume re-upload.
+  bool RectilinearInput = false;
+  std::vector<float> RectCoordsData;   // float3 per index, each axis GetScaleAndBias-normalized
+  float RectCoordsSizes[3] = { 0.0f, 0.0f, 0.0f };
+  float RectCoordsScale[3] = { 1.0f, 1.0f, 1.0f };
+  float RectCoordsBias[3] = { 0.0f, 0.0f, 0.0f };
+  void UpdateRectilinearCoordsBuffer(void* mtlDevice);
 
   bool UpdateTransferFunctionTexture(
     void* mtlDevice, void* mtlQueue, vtkVolume* vol,
