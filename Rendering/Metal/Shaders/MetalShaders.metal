@@ -2827,6 +2827,17 @@ struct VolumeMapperUniforms {
   float4 rectCoordsSizes;   // xyz = number of coordinates per axis
   float4 rectCoordsScale;   // per-axis GetScaleAndBias scale
   float4 rectCoordsBias;    // per-axis GetScaleAndBias bias
+  // Camera-inside near-plane clip (OpenGL near-plane proxy-clip parity): when
+  // the camera is inside the volume (near frustum plane crosses the bounding
+  // box), OpenGL clips the proxy box against the near plane — pushed into the
+  // volume by a precision offset — and starts sampling there. Metal's
+  // fullscreen/proxy ray setup reconstructs the ray from the eye and only
+  // intersects the box, so setupVolumeRay clamps the entry to this plane.
+  // Origin and normal are in [0,1] normalized volume space.
+  float useCameraInsideNearClip;
+  float _padNearClip[3];
+  float4 cameraInsideNearPlaneOrigin;
+  float4 cameraInsideNearPlaneNormal;
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -3488,6 +3499,23 @@ inline RaySetup setupVolumeRay(
     float2 t = intersectBox(cameraPos, rayDir, blockMinGlobal, blockMaxGlobal);
     float tStart = max(t.x, 0.0);
     if (tStart >= t.y) return s;
+
+    // Camera-inside near-plane clip (OpenGL parity): OpenGL clips the proxy box
+    // against the camera near plane (pushed in by a precision offset) and starts
+    // the march there, so the eye->near-plane slab is never sampled. The fullscreen
+    // and proxy paths reconstruct the ray from the eye, so clamp the entry to the
+    // same plane to reproduce the OpenGL sample comb. The plane intersection
+    // distance varies per ray (off-axis rays meet the plane further out), so the
+    // plane is passed as origin+normal rather than a single scalar.
+    if (volumeUniforms.useCameraInsideNearClip > 0.5) {
+        float denom = dot(rayDir, volumeUniforms.cameraInsideNearPlaneNormal.xyz);
+        if (abs(denom) > 1e-6) {
+            float tNear = dot(volumeUniforms.cameraInsideNearPlaneOrigin.xyz - cameraPos,
+                volumeUniforms.cameraInsideNearPlaneNormal.xyz) / denom;
+            tStart = max(tStart, tNear);
+            if (tStart >= t.y) return s;
+        }
+    }
 
     s.entryPoint = cameraPos + rayDir * tStart;
     s.exitPoint = cameraPos + rayDir * t.y;

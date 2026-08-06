@@ -213,10 +213,19 @@ struct VolumeMapperUniforms
   float RectCoordsSizes[4];        // 1616..1631  xyz = number of coords per axis
   float RectCoordsScale[4];        // 1632..1647  per-axis GetScaleAndBias scale
   float RectCoordsBias[4];         // 1648..1663  per-axis GetScaleAndBias bias
+  // Camera-inside near-plane clip (OpenGL near-plane proxy-clip parity): when
+  // the near frustum plane crosses the bounding box, OpenGL clips the proxy box
+  // against the near plane (pushed in by a precision offset) and starts the
+  // march there. setupVolumeRay clamps the ray entry to this plane (origin and
+  // normal in [0,1] normalized volume space).
+  float UseCameraInsideNearClip;   // 1664
+  float _padNearClip[3];           // 1668..1679
+  float CameraInsideNearPlaneOrigin[4]; // 1680..1695
+  float CameraInsideNearPlaneNormal[4]; // 1696..1711 (total 1712, 16-byte aligned)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1664,
-  "VolumeMapperUniforms must be 1664 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1712,
+  "VolumeMapperUniforms must be 1712 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -242,6 +251,10 @@ static_assert(offsetof(VolumeMapperUniforms, ShininessComp) == 1440, "");
 static_assert(offsetof(VolumeMapperUniforms, SelectionMode) == 1456, "");
 static_assert(offsetof(VolumeMapperUniforms, SelectionPropId) == 1472, "");
 static_assert(offsetof(VolumeMapperUniforms, UseRectilinear) == 1600, "");
+static_assert(offsetof(VolumeMapperUniforms, RectCoordsBias) == 1648, "");
+static_assert(offsetof(VolumeMapperUniforms, UseCameraInsideNearClip) == 1664, "");
+static_assert(offsetof(VolumeMapperUniforms, CameraInsideNearPlaneOrigin) == 1680, "");
+static_assert(offsetof(VolumeMapperUniforms, CameraInsideNearPlaneNormal) == 1696, "");
 
 // Per-light data for volume shading — must match Metal VolumeLight struct
 // Must match Metal VolumeLight (6 x float4 = 96 bytes per light)
@@ -6444,6 +6457,72 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   uniforms.CameraVolumePos[1] = NormalizeToVolumeSpace(vb, 1, camPosVolume[1]);
   uniforms.CameraVolumePos[2] = NormalizeToVolumeSpace(vb, 2, camPosVolume[2]);
   uniforms.CameraVolumePos[3] = 1.0f;
+
+  // Camera-inside near-plane clip (OpenGL near-plane proxy-clip parity): when
+  // the near frustum plane crosses the bounding box, OpenGL clips the proxy box
+  // against the near plane (pushed into the volume by a precision offset) and
+  // starts the march there, so the eye->near-plane slab is never sampled. The
+  // fullscreen/proxy shaders reconstruct the ray from the eye and only intersect
+  // the box, so setupVolumeRay clamps the entry to this plane. The plane is
+  // expressed in [0,1] normalized volume space (origin via
+  // NormalizeToVolumeSpace, normal scaled by the per-axis bounds size) so the
+  // per-ray intersection distance is directly comparable to the box t-range.
+  uniforms.UseCameraInsideNearClip = this->IsCameraInside(ren, vol) ? 1.0f : 0.0f;
+  uniforms.CameraInsideNearPlaneOrigin[3] = 1.0f;
+  uniforms.CameraInsideNearPlaneNormal[3] = 0.0f;
+  if (uniforms.UseCameraInsideNearClip > 0.5f)
+  {
+    vtkCamera* cam = ren->GetActiveCamera();
+    double fplanes[24];
+    cam->GetFrustumPlanes(ren->GetTiledAspectRatio(), fplanes);
+
+    // Near frustum plane (index 4*4=16) in world space.
+    double pNormal[3];
+    double pOrigin[4] = { 0.0, 0.0, 0.0, 1.0 };
+    for (int i = 0; i < 3; ++i)
+    {
+      pNormal[i] = fplanes[16 + i];
+      pOrigin[i] = -fplanes[16 + 3] * fplanes[16 + i];
+    }
+
+    // Transform origin to model (data) space and the normal via the transpose of
+    // the inverse model matrix (same convention as the clipped-proxy geometry
+    // build in SetupBuffers, so the uniform clamp and the proxy-path clip agree).
+    invModelMatrix->MultiplyPoint(pOrigin, pOrigin);
+    const double* invMat = invModelMatrix->GetData();
+    double pNormalV[3];
+    pNormalV[0] = pNormal[0] * invMat[0] + pNormal[1] * invMat[1] + pNormal[2] * invMat[2];
+    pNormalV[1] = pNormal[0] * invMat[4] + pNormal[1] * invMat[5] + pNormal[2] * invMat[6];
+    pNormalV[2] = pNormal[0] * invMat[8] + pNormal[1] * invMat[9] + pNormal[2] * invMat[10];
+    vtkMath::Normalize(pNormalV);
+
+    // Precision offset identical to OpenGL's (and SetupBuffers'): a fraction of
+    // the near-far distance, floored for very small volumes to avoid hardware
+    // near-plane clipping.
+    double offset = (cam->GetClippingRange()[1] - cam->GetClippingRange()[0]) * 0.001;
+    double minOffset = static_cast<double>(std::numeric_limits<float>::epsilon()) * 1000.0;
+    offset = offset < minOffset ? minOffset : offset;
+    for (int i = 0; i < 3; ++i)
+    {
+      pOrigin[i] += (pNormalV[i] * offset);
+    }
+
+    uniforms.CameraInsideNearPlaneOrigin[0] = NormalizeToVolumeSpace(vb, 0, pOrigin[0]);
+    uniforms.CameraInsideNearPlaneOrigin[1] = NormalizeToVolumeSpace(vb, 1, pOrigin[1]);
+    uniforms.CameraInsideNearPlaneOrigin[2] = NormalizeToVolumeSpace(vb, 2, pOrigin[2]);
+
+    // Normal in normalized volume space: componentwise scaled by the bounds size
+    // (the [0,1] frame stretches each axis by 1/Size), then renormalized.
+    double pNormalN[3];
+    for (int i = 0; i < 3; ++i)
+    {
+      pNormalN[i] = pNormalV[i] * vb.Size[i];
+    }
+    vtkMath::Normalize(pNormalN);
+    uniforms.CameraInsideNearPlaneNormal[0] = static_cast<float>(pNormalN[0]);
+    uniforms.CameraInsideNearPlaneNormal[1] = static_cast<float>(pNormalN[1]);
+    uniforms.CameraInsideNearPlaneNormal[2] = static_cast<float>(pNormalN[2]);
+  }
 
   // Parallel-projection support (OpenGL in_projectionDirection parity): the
   // fragment shader needs a constant ray direction expressed in [0,1] volume
