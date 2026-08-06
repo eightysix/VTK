@@ -623,6 +623,25 @@ static VolumeFormat ChooseVolumeFormat(
       }
       break;
 
+    case VTK_SHORT:
+      // Signed 16-bit data stored as signed-normalized (OpenGL R16_SNORM
+      // parity): the raw short bits upload directly, the GPU normalizes each
+      // value v to v/32767, and the shader un-normalizes back to the [0,1]
+      // scalar range via scalarMin/scalarMax. Unlike half-float storage this
+      // keeps every short value exact -- half loses the low bit above 2048
+      // (ulp 2), which rounds odd label values down one entry and shifts the
+      // transfer-function sample (e.g. label 4001 -> 4000 -> transparent).
+      fmt.BytesPerComponent = 2;
+      fmt.NeedsConversion = false;
+      fmt.NormalizationFactor = 32768.0f;
+      switch (componentsForFormat)
+      {
+        case 1: fmt.Format = MTLPixelFormatR16Snorm; break;
+        case 2: fmt.Format = MTLPixelFormatRG16Snorm; break;
+        default: fmt.Format = MTLPixelFormatRGBA16Snorm; break;
+      }
+      break;
+
     default:
       if (useHalf)
       {
@@ -1799,6 +1818,17 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
         numTuples,
         65535);
     }
+    else if (dataType == VTK_SHORT && numComponents == 3)
+    {
+      // RGBA16Snorm alpha channel: 32767 is the largest positive snorm value
+      // and normalizes to 1.0 (fully opaque), matching the Expand3To4 fillers
+      // used for the other 16-bit formats.
+      Expand3To4<short>(
+        static_cast<const short*>(scalars->GetVoidPointer(0)),
+        static_cast<short*>(uploadPointer),
+        numTuples,
+        32767);
+    }
     else
     {
       std::memcpy(uploadPointer, scalars->GetVoidPointer(0), totalBytes);
@@ -2914,6 +2944,14 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
             static_cast<unsigned short*>(uploadPointer),
             numTuples,
             65535);
+        }
+        else if (dataType == VTK_SHORT && numComponents == 3)
+        {
+          Expand3To4<short>(
+            static_cast<const short*>(scalars->GetVoidPointer(0)),
+            static_cast<short*>(uploadPointer),
+            numTuples,
+            32767);
         }
         else
         {
