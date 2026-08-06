@@ -3383,18 +3383,22 @@ inline half4 marchVolumeUnified(
 
     // The proxy box spans the axis-aligned bounds of the rotated volume, so
     // rays through its corner regions fall outside the [0,1]^3 texture cube.
-    // Skip those samples (they contain no data) and keep marching; once the
-    // ray has passed through the cube and left it, stop entirely.
+    // The OpenGL backend never skips these samples: its clamp-to-edge sampler
+    // clamps the coordinate back into the cube and the boundary voxel is
+    // composited (grazing rays, rotated-volume corner regions). Replicate that
+    // by clamping texLocalPos and sampling the boundary slab. seenInBounds
+    // stays false while entry-side samples are outside so the ray keeps
+    // marching through rotated-volume corner regions; axis-aligned grazing
+    // rays still terminate via the block-bounds exit below, and once the ray
+    // has been inside the cube and left it, stop entirely.
     if (any(texLocalPos < float3(0.0)) || any(texLocalPos > float3(1.0))) {
       if (seenInBounds) break;
-      currentPoint += stepVec;
-      currentT += p.stepSize;
-      texLocalPos += texStep;
-      evalPoint += evalStep;
+      texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+      evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
       prefetchValid = false;
-      continue;
+    } else {
+      seenInBounds = true;
     }
-    seenInBounds = true;
 
     if (useMinMax) {
       float3 mmPos = clamp(evalPoint, float3(0.0), float3(1.0));

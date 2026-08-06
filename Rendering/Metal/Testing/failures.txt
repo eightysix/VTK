@@ -1,4 +1,18 @@
-Metal volume image-compare failures (run: Aug 05 2026, full RenderingVolumeCxx-Metal suite)
+Metal volume image-compare failures (run: Aug 06 2026, full RenderingVolumeCxx-Metal suite)
+
+Out-of-bounds samples on the entry side of the [0,1]^3 texture cube are now
+clamped and composited (boundary slab) instead of skipped. The OpenGL backend
+never drops these samples: its clamp-to-edge sampler clamps the coordinate back
+into the cube and composites the boundary voxel. For axis-aligned volumes this
+only affects grazing rays whose first step exits the cube (sample-positions
+outside the cube imply the ray chord is shorter than one step), which is exactly
+why the Metal contour was ~3px slimmer per side than the GL baseline. This
+fixes TestGPURayCastMapperSampleDistance (0.1419 -> pass): previously the
+corner-grazing rays composited nothing, so the RGB contour shrank; now the
+clamped first sample matches the baseline. seenInBounds stays false while
+entry-side samples are outside so rotated-volume corner regions still march
+(and composite) through to the data cube, and axis-aligned grazing rays still
+terminate via the block-bounds exit.
 
 Gradient opacity no longer depends on shading being enabled: the Metal backend
 was gating UseGradientOpacity on property->GetShade(), but the OpenGL backend
@@ -45,7 +59,6 @@ proxy carries only scalars), fixing TestGPURayCastVolumeGhostArraysCellData
     TestGPURayCastVolumePicking               0.1234
     TestGPURayCastCameraInside                0.1315
     TestGPURayCastOrientedVolume              0.1370
-    TestGPURayCastMapperSampleDistance        0.1419
     TestGPURayCastCameraInsideTransformation  0.1674
     TestGPURayCastTwoComponentsDependent     0.2451
     TestGPURayCastLargeColorTransferFunction 0.3250
