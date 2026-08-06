@@ -131,7 +131,17 @@ chain plus bounds re-normalize in the fullscreen/grid ray setup and both
 depth-termination sites. This is a pure perf change: every image-compare metric
 is bit-identical to the pre-change run.
 
-Current suite state: 77 pass / 16 fail / 4 abort (20 total non-passing; 13
+Cropping fences no longer shift ~half a texel vs the baseline. The OpenGL
+backend tests the crop region against g_dataPos, which lives in
+cellToPoint-shifted texture space (in_cellToPoint applied to the interpolated
+proxy-box coords), while the crop planes are in plain [0,1] texture space — that
+half-texel offset is baked into the baseline. The Metal backend was testing the
+crop against currentPoint (unshifted [0,1] volume space), so the fence edges sat
+~1px from the GL image. The crop test now uses evalPoint (the cellToPoint-shifted
+sample position), matching GL's g_dataPos. This fixes TestGPURayCastCropping1
+(0.0505 -> 0.0002, pass).
+
+Current suite state: 78 pass / 15 fail / 4 abort (19 total non-passing; 12
 image-compare + 7 non-image, of which 4 abort). All remaining failures are the
 pre-existing ones listed above.
 

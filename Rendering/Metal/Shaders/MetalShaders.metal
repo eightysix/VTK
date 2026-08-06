@@ -3528,7 +3528,12 @@ inline half4 marchVolumeUnified(
       ? maskTexture.sample(sNearest, evalPoint, level(0)).r
       : prefetchMask;
 
-    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, currentPoint))) == 0u)) {
+    // Crop region is tested against the cellToPoint-shifted sample position
+    // (evalPoint) to match the OpenGL baseline: GL crops against g_dataPos,
+    // which lives in cellToPoint-adjusted texture space, while the crop planes
+    // are in plain [0,1] texture space. Testing the unshifted currentPoint here
+    // shifts the fence edges by ~half a texel vs the baseline.
+    if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, evalPoint))) == 0u)) {
       currentPoint += stepVec;
       currentT += p.stepSize;
       texLocalPos += texStep;
