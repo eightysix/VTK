@@ -308,6 +308,43 @@ per-sample scalar value or ray entry/tstep derivation (a per-sample fetch or
 coordinate difference), which the next probe should compare directly on both
 backends at the same divergent pixel.
 
+## Scalar-normalization probe: TF-coordinate precision is not the cause
+
+The Metal transfer-function lookup coordinate is computed in 16-bit `half`
+precision while GL computes the identical mapping in full `float32`:
+
+- GL: `scalar = texture3D(in_volume[0], g_dataPos) * in_volume_scale[0] +
+  in_volume_bias[0]` (all `float`, `vtkVolumeShaderComposer.h` 2690-2706), then
+  `computeOpacity`/`computeColor` sample the opacity/color table at the
+  resulting `float` coordinate.
+- Metal: `scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias)`
+  with `scalarScale`/`scalarBias` also `half`
+  (`MetalShaders.metal` 3661-3662, 3984). Casting `rawScalar` (an `R16Unorm`
+  sample in [0,1]) to `half` quantizes it to ~11 significant bits — for the
+  scalar range (0,4370)/65535 the scale is ≈15, so the TF coordinate is
+  quantized by up to ~7.5 texels of the 1024-wide opacity table, far coarser
+  than GL's float32 coordinate.
+
+To test this, the Metal `scalarScale`/`scalarBias`/`scalarNorm` (and the
+per-component `scalarNormComp`) were temporarily changed to `float` precision
+and `NoShadeNoGradOpNoTransform` re-captured on genuine Metal and OpenGL
+(`/tmp/bc/floatnorm/`):
+
+| metric | half (baseline) | float (probe) |
+|---|---|---|
+| mean\|M−G\| | 1.31 | 1.36 |
+| max\|M−G\| | 24 | 23 |
+| px with \|Δ\|≥5 | 1444 | 1591 |
+| px with \|Δ\|≥9 | 80 | 87 |
+
+Takeaway: **the TF-coordinate precision is not the cause** — the delta table is
+again essentially unchanged. The half-vs-float normalization hypothesis is
+rejected; the probe was reverted. The residual is therefore not in the scalar →
+TF-coordinate mapping either; the per-sample scalar *value* itself (the raw
+texture sample, or the ray position it is fetched at) or the ray entry/tstep
+derivation remain the candidate divergence.
+
+
 ## Gradient-magnitude math: Metal vs GL
 
 Both backends compute the gf LUT input as a spacing-weighted central difference
@@ -620,12 +657,17 @@ color before/after shading; for pixel (256,256) the first sample is at
       refining the step makes the error *worse* → the divergence is **not** a
       sampling-phase/comb artifact.
    - **Composite accumulation precision is not involved**: running the Metal
-      composite in `float` instead of `half` leaves the delta table essentially
-      unchanged (max|Δ| 24→22, px ≥9 80→89, see the float-accumulation probe).
-   The candidate causes are the per-sample scalar fetch or coordinate/tstep
-   derivation (GL full-screen ray origin/`g_dirStep` chain vs Metal
-   `setupVolumeRay`; GL volume-texture `scale`/`bias` + sampler vs Metal
-   16-bit-unorm path) — all active for any camera position.
+       composite in `float` instead of `half` leaves the delta table essentially
+       unchanged (max|Δ| 24→22, px ≥9 80→89, see the float-accumulation probe).
+   - **TF-coordinate precision is not involved**: computing the Metal scalar
+      normalization (`scalarScale`/`scalarBias`/`scalarNorm`) in `float`
+      instead of `half` leaves the delta table essentially unchanged
+      (max|Δ| 24→23, px ≥9 80→87, see the scalar-normalization probe).
+    The candidate causes are the per-sample scalar value (raw texture sample or
+    the ray position it is fetched at) or coordinate/tstep
+    derivation (GL full-screen ray origin/`g_dirStep` chain vs Metal
+    `setupVolumeRay`; GL volume-texture `scale`/`bias` + sampler vs Metal
+    16-bit-unorm path) — all active for any camera position.
    The previously-suspected `firstT` comb mismatch
    (`MetalShaders.metal` 3723-3725, `ceil` on the `checkBounds == false` path)
    is **not** involved: the camera-inside test marches through `marchVolume`
@@ -643,15 +685,17 @@ color before/after shading; for pixel (256,256) the first sample is at
 
 For the **contained residual mismatch** (max|Δ|=24 inside / 21 outside):
 the divergence is camera-position-independent, step-size-independent (fixed
-step sweep above), and precision-independent (float-accumulation probe), so the
-fix must be in a per-sample quantity that both backends compute differently.
+step sweep above), and precision-independent (float-accumulation and
+scalar-normalization probes), so the fix must be in a per-sample quantity that
+both backends compute differently.
 Candidate causes to compare at a logged divergent pixel: (a) the GL full-screen
 ray origin/step (`g_dirStep`) vs Metal `setupVolumeRay` entry/tstep, and (b)
 the GL volume-texture `scale`/`bias`+ sampler fetch vs the Metal 16-bit-unorm
 sample — compare raw sample scalars along a divergent ray on both backends. The
-sample-distance knob is exhausted (it does not change the divergence) and so is
-composite accumulation precision, so the next probe should log per-sample
-scalars on both backends for the same divergent pixel (e.g. using the
+sample-distance knob is exhausted (it does not change the divergence), as are
+composite accumulation precision and the TF-coordinate precision, so the next
+probe should log per-sample scalars on both backends for the same divergent
+pixel (e.g. using the
 `MetalShaders.metal` `VTK_METAL_ENABLE_LOGGING` dump plus an equivalent GL-side
 log) and diff the trace. Validate with:
 
@@ -683,6 +727,7 @@ command listed (assume the directory may be erased at any time):
 | `recheck/` | full variant table recaptured with genuine OpenGL (`RenderingBackend=OpenGL` verified in stderr) | section 2 + `analyze.py` on each variant, `-T /tmp/bc/recheck` |
 | `sweep/` | camera-outside fixed-step sweep (`sd{0.0675…4.0}_{Metal,OpenGL}.png` + logs), auto-adjust off | `VTK_FIXED_SAMPLE_DISTANCE=<sd>` on `…NoTransformCamOutsideFixedStep` for both backends |
 | `floatacc2/` | `NoShadeNoGradOpNoTransform` captures with Metal composite temporarily in `float` precision (`OpenGL.png`/`Metal.png`) — delta ≈ unchanged, probe reverted | section 2 on `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransform` with the float-accumulation shader edit |
+| `floatnorm/` | `NoShadeNoGradOpNoTransform` captures with Metal scalar normalization (`scalarScale`/`scalarBias`/`scalarNorm`) in `float` precision (`NoTransform_GL_floatnorm.png`/`NoTransform_MT_floatnorm.png`) — delta ≈ unchanged, probe reverted | section 2 on the same test with the scalar-normalization shader edit |
 | `analyze.py` | delta-stats + heatmap/mask script | section 3 (inline listing) |
 | `vol512.npy` | 512³ `headsq` array (uint16, [0,4370]) | `make_vol512.py` (offline verification, step 1) |
 | `metal3.log` | per-sample MARCH/SAMPLE/LIGHT/LIGHT2 dump (3247 lines) | `make_metal3_log.sh` (per-sample GPU logging) |
