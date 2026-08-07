@@ -279,6 +279,35 @@ Takeaways:
   entry/tstep derivation (GL full-screen `g_dirStep` vs Metal
   `setupVolumeRay`) — not the step size itself.
 
+## Float-accumulation probe: composite precision is not the cause
+
+The residual (no-shade / no-gf / no-transform) divergence grows with sample
+count, so the composite accumulation precision was the next suspect: GL
+accumulates the front-to-back composite in full `float`
+(`g_fragColor = (1.0f - g_fragColor.a) * g_srcColor + g_fragColor;`,
+`vtkVolumeShaderComposer.h` 2613/2996) while Metal accumulates in 16-bit
+`half` (`half3 accumulatedColor`, `half accumulatedOpacity`,
+`MetalShaders.metal` 3737-3738, weight math 4275-4281).
+
+To test this, the Metal accumulators (`accumulatedColor`, `accumulatedOpacity`)
+and the weight arithmetic were temporarily changed to `float` precision and the
+`NoShadeNoGradOpNoTransform` scene re-captured on genuine Metal and OpenGL
+(`/tmp/bc/floatacc2/`):
+
+| metric | half (baseline) | float (probe) |
+|---|---|---|
+| mean\|M−G\| | 1.31 | 1.26 |
+| max\|M−G\| | 24 | 22 |
+| px with \|Δ\|≥5 | 1444 | 1271 |
+| px with \|Δ\|≥9 | 80 | 89 |
+
+Takeaway: **the composite accumulation precision is not the cause** — the
+delta table is essentially unchanged. The half-vs-float hypothesis is
+rejected; the probe was reverted. This further narrows the residual to the
+per-sample scalar value or ray entry/tstep derivation (a per-sample fetch or
+coordinate difference), which the next probe should compare directly on both
+backends at the same divergent pixel.
+
 ## Gradient-magnitude math: Metal vs GL
 
 Both backends compute the gf LUT input as a spacing-weighted central difference
@@ -587,9 +616,12 @@ color before/after shading; for pixel (256,256) the first sample is at
      `AutoAdjustSampleDistances`; the earlier "4× samples → bit-identical"
      result was a capture fluke where the OpenGL run fell back to Metal.
    - **Forcing an explicit step on both backends** (`AutoAdjustSampleDistancesOff`,
-     camera-outside step sweep above) still diverges at every step size, and
-     refining the step makes the error *worse* → the divergence is **not** a
-     sampling-phase/comb artifact.
+      camera-outside step sweep above) still diverges at every step size, and
+      refining the step makes the error *worse* → the divergence is **not** a
+      sampling-phase/comb artifact.
+   - **Composite accumulation precision is not involved**: running the Metal
+      composite in `float` instead of `half` leaves the delta table essentially
+      unchanged (max|Δ| 24→22, px ≥9 80→89, see the float-accumulation probe).
    The candidate causes are the per-sample scalar fetch or coordinate/tstep
    derivation (GL full-screen ray origin/`g_dirStep` chain vs Metal
    `setupVolumeRay`; GL volume-texture `scale`/`bias` + sampler vs Metal
@@ -610,14 +642,15 @@ color before/after shading; for pixel (256,256) the first sample is at
 ## Fix plan
 
 For the **contained residual mismatch** (max|Δ|=24 inside / 21 outside):
-the divergence is camera-position-independent and step-size-independent (fixed
-step sweep above), so the fix must be in a per-sample quantity that both
-backends compute differently. Candidate causes to compare at a logged divergent
-pixel: (a) the GL full-screen ray origin/step (`g_dirStep`) vs Metal
-`setupVolumeRay` entry/tstep, and (b) the GL volume-texture `scale`/`bias`+
-sampler fetch vs the Metal 16-bit-unorm sample — compare raw sample scalars
-along a divergent ray on both backends. The sample-distance knob is exhausted
-(it does not change the divergence), so the next probe should log per-sample
+the divergence is camera-position-independent, step-size-independent (fixed
+step sweep above), and precision-independent (float-accumulation probe), so the
+fix must be in a per-sample quantity that both backends compute differently.
+Candidate causes to compare at a logged divergent pixel: (a) the GL full-screen
+ray origin/step (`g_dirStep`) vs Metal `setupVolumeRay` entry/tstep, and (b)
+the GL volume-texture `scale`/`bias`+ sampler fetch vs the Metal 16-bit-unorm
+sample — compare raw sample scalars along a divergent ray on both backends. The
+sample-distance knob is exhausted (it does not change the divergence) and so is
+composite accumulation precision, so the next probe should log per-sample
 scalars on both backends for the same divergent pixel (e.g. using the
 `MetalShaders.metal` `VTK_METAL_ENABLE_LOGGING` dump plus an equivalent GL-side
 log) and diff the trace. Validate with:
@@ -649,6 +682,7 @@ command listed (assume the directory may be erased at any time):
 | `SampleDist0_5/`, `SampleDist0_25/` | original test at 0.5× / 0.25× sample distance — delta identical to the original failure | sections 2+3 on `TestGPURayCastCameraInsideTransformationSampleDist0_5` / `…SampleDist0_25` |
 | `recheck/` | full variant table recaptured with genuine OpenGL (`RenderingBackend=OpenGL` verified in stderr) | section 2 + `analyze.py` on each variant, `-T /tmp/bc/recheck` |
 | `sweep/` | camera-outside fixed-step sweep (`sd{0.0675…4.0}_{Metal,OpenGL}.png` + logs), auto-adjust off | `VTK_FIXED_SAMPLE_DISTANCE=<sd>` on `…NoTransformCamOutsideFixedStep` for both backends |
+| `floatacc2/` | `NoShadeNoGradOpNoTransform` captures with Metal composite temporarily in `float` precision (`OpenGL.png`/`Metal.png`) — delta ≈ unchanged, probe reverted | section 2 on `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransform` with the float-accumulation shader edit |
 | `analyze.py` | delta-stats + heatmap/mask script | section 3 (inline listing) |
 | `vol512.npy` | 512³ `headsq` array (uint16, [0,4370]) | `make_vol512.py` (offline verification, step 1) |
 | `metal3.log` | per-sample MARCH/SAMPLE/LIGHT/LIGHT2 dump (3247 lines) | `make_metal3_log.sh` (per-sample GPU logging) |
