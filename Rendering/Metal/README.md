@@ -16,6 +16,12 @@ environment variable) from an application that invokes
 > `vtkObjectFactory::SetPreferences()` in-process (as `vtkMetalGLVisualComparison`
 > does) when a test must select a specific backend.
 
+## Investigation reports
+
+- `TestGPURayCastCameraInsideTransformation.md` — Metal-vs-OpenGL divergence on
+  the camera-inside volume ray-cast test (gradient opacity + Phong shading);
+  full isolation workflow, reproduction steps, and fix plan.
+
 ## Volume rendering: nearest-vs-linear interpolation discrepancy
 
 ### Symptom

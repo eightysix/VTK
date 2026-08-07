@@ -10,6 +10,10 @@ set (VolumeCxxTests
   TestGPURayCastCameraInsideNonUniformScaleTransform.cxx
   TestGPURayCastCameraInsideSmallSpacing.cxx
   TestGPURayCastCameraInsideTransformation.cxx
+  TestGPURayCastCameraInsideTransformationConstGradOp.cxx
+  TestGPURayCastCameraInsideTransformationNoGradOp.cxx
+  TestGPURayCastCameraInsideTransformationNoShade.cxx
+  TestGPURayCastCameraInsideTransformationNoShadeNoGradOp.cxx
   TestGPURayCastClipping.cxx
   TestGPURayCastClippingPolyData.cxx
   TestGPURayCastClippingUserTransform.cxx
