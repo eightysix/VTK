@@ -392,9 +392,22 @@ systematically ~2× darker than GL's (Metal max-channel mean 118 vs GL 221 on a
 color whose brightest sample is ~221), i.e. Metal either finds a lower max
 scalar or maps the found scalar to a lower color. The final-color math is
 structurally identical on both backends (`rgb * a` with the same TF table), so
-the divergence is in the scalar MIP value itself. This is a *separate, larger*
-Metal MIP bug that is orthogonal to the composite residual being chased here —
-but it also confirms the residual is not a compositing artifact.
+the divergence is in the scalar MIP value itself.
+
+**RESOLVED (commit `fa52bf3773`):** the Metal mapper's CPU-side transfer-function
+fill unconditionally pre-integrated the opacity with `1−(1−a)^factor`
+(`factor = sampleDistance / unitDistance`), whereas the OpenGL backend only
+pre-integrates for `COMPOSITE_BLEND`, scales by `factor` for `ADDITIVE_BLEND`,
+and keeps the **raw** table for MIP/MinIP/Average. MIP therefore sampled the
+pre-integrated opacity (e.g. 0.401 instead of the raw 0.85 at the same max
+scalar) and rendered ~2× darker. Fixed with `ApplyOpacityBlendCorrection`
+(blend-mode-aware fill) plus `LastTransferFunctionBlendMode` change-detection so
+a runtime blend-mode switch rebuilds the table (GL `LastBlendMode` parity).
+
+After the fix the MaxIP divergence collapses from mean|Δ|=100.8 (all 262144 px)
+to **mean|Δ|=0.151** with a residual of **957 px ≥9 (max 85)** confined to rays
+that graze the bone isosurface — the same TF-edge sample-position residual as
+composite (see the root-cause analysis below).
 
 
 ## Gradient-magnitude math: Metal vs GL
@@ -720,12 +733,19 @@ color before/after shading; for pixel (256,256) the first sample is at
       *identical* to the linear baseline (1.31/24/1444/80, see the
       nearest-interpolation variant) → the difference is in the sample
       *positions*, not the trilinear fetch.
-   - **Maximum-intensity blend exposes a separate, larger Metal MIP bug**:
-      with compositing removed (`SetBlendModeToMaximumIntensity()`) the Metal
-      MIP render is ~2× darker than GL (mean|Δ|=100.8, 262144 px) — a distinct
-      MIP-scalar tracking divergence, orthogonal to the composite residual
-      (see the maximum-intensity variant). It also confirms the residual is
-      not a compositing artifact.
+    - **Maximum-intensity blend exposed a separate, larger Metal MIP bug**:
+       with compositing removed (`SetBlendModeToMaximumIntensity()`) the Metal
+       MIP render was ~2× darker than GL (mean|Δ|=100.8, 262144 px). **Fixed** by
+       `fa52bf3773` (blend-mode-aware CPU TF fill: only COMPOSITE pre-integrates,
+       MIP/MinIP/Average use the raw opacity table, matching
+       `vtkOpenGLVolumeOpacityTable::InternalUpdate`). Post-fix mean|Δ|=0.151
+       with only the boundary-sample residual (see the maximum-intensity
+       variant). This confirmed the residual is not a compositing artifact.
+    The residual that remains (composite max|Δ|=24, MaxIP max|Δ|=85, boundary
+    contours only) is inherent float32 sample-comb noise: the combs are
+    identical by construction, but independent float32 pipelines flip
+    nearest-interpolation samples across voxel Voronoi boundaries on
+    isosurface-grazing rays — see the Fix plan root-cause analysis.
     The candidate causes are the per-sample scalar value (raw texture sample or
     the ray position it is fetched at) or coordinate/tstep
     derivation (GL full-screen ray origin/`g_dirStep` chain vs Metal
@@ -744,31 +764,44 @@ color before/after shading; for pixel (256,256) the first sample is at
    sensitivity because the sample-distance override is ignored; the gradient
    failure must be investigated separately.
 
-## Fix plan
+ ## Fix plan
 
 For the **contained residual mismatch** (max|Δ|=24 inside / 21 outside):
 the divergence is camera-position-independent, step-size-independent (fixed
 step sweep above), and precision-independent (float-accumulation and
 scalar-normalization probes), interpolation-independent (nearest variant), and
-composite-path-independent (MaxIP variant), so the fix must be in a per-sample
-quantity that both backends compute differently.
-Candidate causes to compare at a logged divergent pixel: (a) the GL full-screen
-ray origin/step (`g_dirStep`) vs Metal `setupVolumeRay` entry/tstep, and (b)
-the GL volume-texture `scale`/`bias`+ sampler fetch vs the Metal 16-bit-unorm
-sample — compare raw sample scalars along a divergent ray on both backends. The
-sample-distance knob is exhausted (it does not change the divergence), as are
-composite accumulation precision and the TF-coordinate precision, so the next
-probe should log per-sample scalars on both backends for the same divergent
-pixel (e.g. using the
-`MetalShaders.metal` `VTK_METAL_ENABLE_LOGGING` dump plus an equivalent GL-side
-log) and diff the trace. Validate with:
+composite-path-independent (MaxIP variant).
 
-```sh
-ctest --test-dir build_macos_metal \
-  -R "TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransform" \
-  --output-on-failure
-```
+**Root cause established (Aug 2026):** the residual is *inherent float32
+sample-comb noise*, not a Metal correctness bug. Evidence:
 
+1. **The sample combs are mathematically identical by construction.** Both
+   backends march from the near-plane-clipped entry (`entry + 1 full step`, no
+   jitter), use the identical physical sample distance (`GL_OPTABLE`/`MTL_OPTABLE`
+   both log 0.270059), apply the identical near-plane precision offset
+   `(far−near)·0.001` (GL `vtkOpenGLGPUVolumeRayCastMapper.cxx` vs the Metal
+   uniform path agree to 6 digits), and apply the identical cell-to-point
+   `(dims−1)/dims` shift (GL `in_cellToPoint` matrix vs Metal
+   `cellToPointTextureCoord`). A CPU model of both combs for a divergent pixel
+   (the two shaders' step/entry formulas) yields bit-identical texture
+   coordinates.
+2. **Residual pixels are exactly the tangential/grazing rays** on the bone
+   isosurface where the opacity TF ramps 0.02→0.85 over scalars 1000→1150. With
+   the test's default `VTK_NEAREST_INTERPOLATION`, each sample snaps to the
+   nearest voxel; a sample position within float32-rounding of a voxel Voronoi
+   boundary flips to the neighboring voxel. GL-Metal max-scalar deltas up to 80
+   scalar units (norm 0.018) are reproduced by 1e-5-texture-unit comb shifts in
+   the CPU model.
+3. **No systematic bias**: at the ≥9-divergent pixels 382 are GL-brighter and
+   355 Metal-brighter, so there is no half-voxel phase/entry offset to fix.
+4. The ray-direction/entry float differences originate in independent pipelines
+   (GL: `normalize(ip_vertexPos − eyePos)` over the clipped+densified proxy with
+   GLSL float32; Metal: `normalize(localPos − cameraPos)` in normalized volume
+   space). Bit-identical output would require literally identical float32
+   instruction sequences across both backends.
+
+The residual is therefore bounded and cosmetic: composite max|Δ|=24 on ~80 px
+(0.03%), MaxIP max|Δ|=85 on ~957 px (0.37%), both on boundary-only contours.
 The original full test (GF/OpenGL #681, Metal #782) remains **unfixed**: its
 divergence lives in the gradient-opacity × shading path and is orthogonal to
 the contained residual — see the gradient-magnitude section above for the
@@ -793,7 +826,7 @@ command listed (assume the directory may be erased at any time):
 | `floatacc2/` | `NoShadeNoGradOpNoTransform` captures with Metal composite temporarily in `float` precision (`OpenGL.png`/`Metal.png`) — delta ≈ unchanged, probe reverted | section 2 on `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransform` with the float-accumulation shader edit |
 | `floatnorm/` | `NoShadeNoGradOpNoTransform` captures with Metal scalar normalization (`scalarScale`/`scalarBias`/`scalarNorm`) in `float` precision (`NoTransform_GL_floatnorm.png`/`NoTransform_MT_floatnorm.png`) — delta ≈ unchanged, probe reverted | section 2 on the same test with the scalar-normalization shader edit |
 | `nearest/` | `NoShadeNoGradOpNoTransformNearest` captures (`OpenGL_probe.png`/`Metal_probe.png`) — delta *identical* to the linear baseline (1.31/24/1444/80) | section 2 on `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNearest` |
-| `maxip/` | `NoShadeNoGradOpNoTransformMaxIP` captures (`OpenGL_probe.png`/`Metal_probe.png`) — separate, larger Metal MIP divergence (mean\|Δ\|=100.8, all 262144 px; Metal ~2× darker) | section 2 on `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformMaxIP` |
+| `maxip/` | `NoShadeNoGradOpNoTransformMaxIP` captures (`OpenGL_probe.png`/`Metal_probe.png`) — pre-fix MIP divergence (mean\|Δ\|=100.8, all 262144 px; Metal ~2× darker). Fixed by `fa52bf3773` (blend-mode-aware TF fill); post-fix residual mean\|Δ\|=0.151, 957 px ≥9 (max 85) on the bone isosurface contour — inherent sample-comb float noise, see the Fix plan section | section 2 on `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformMaxIP` (fixed binary), plus `maxip-fix/`, `maxip-gl/` for the post-fix Metal/GL comparison |
 | `analyze.py` | delta-stats + heatmap/mask script | section 3 (inline listing) |
 | `vol512.npy` | 512³ `headsq` array (uint16, [0,4370]) | `make_vol512.py` (offline verification, step 1) |
 | `metal3.log` | per-sample MARCH/SAMPLE/LIGHT/LIGHT2 dump (3247 lines) | `make_metal3_log.sh` (per-sample GPU logging) |
