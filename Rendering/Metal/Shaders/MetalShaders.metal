@@ -3194,14 +3194,16 @@ inline float3 rectilinearSamplePosition(float3 evalPoint, bool doRectilinear,
 // Shared tail of computeGradientFast / densityGradientFast: transforms a
 // texture-space gradient into model space, normalizes it, and packs the
 // gradient-opacity magnitude. Computed in float to avoid half-precision
-// overflow (mag > 65504) for full 3D gradients.
-inline half4 normalizedGradient(float3 gradTex, float4x4 volumeToTexture, half gradNormFactor) {
+// overflow (mag > 65504) for full 3D gradients, and to match the OpenGL
+// backend's all-float computeGradient: half rounding of the six neighbor
+// samples and of grad.w was amplified by steep gradient-opacity ramps.
+inline float4 normalizedGradient(float3 gradTex, float4x4 volumeToTexture, float gradNormFactor) {
   float3x3 texToModelLin =
     float3x3(volumeToTexture[0].xyz, volumeToTexture[1].xyz, volumeToTexture[2].xyz);
   float3 correctedGrad = transpose(texToModelLin) * gradTex;
   float mag = length(correctedGrad);
-  half3 normal = mag > 0.0f ? half3(correctedGrad / mag) : half3(0.0h);
-  return half4(normal, saturate(half(mag) / gradNormFactor));
+  float3 normal = mag > 0.0f ? correctedGrad / mag : float3(0.0f);
+  return float4(normal, saturate(mag / gradNormFactor));
 }
 
 // OpenGL computeDensityGradient parity (vtkVolumeShaderComposer.h
@@ -3215,58 +3217,58 @@ inline half4 normalizedGradient(float3 gradTex, float4x4 volumeToTexture, half g
 // is consumed for lighting — gradient opacity keeps the scalar-gradient
 // magnitude (OpenGL uses computeGradient for gradient opacity even when
 // ComputeNormalFromOpacity is set).
-inline half4 densityGradientFromNeighbors(
-    half sPX, half sNX, half sPY, half sNY, half sPZ, half sNZ,
+inline float4 densityGradientFromNeighbors(
+    float sPX, float sNX, float sPY, float sNY, float sPZ, float sNZ,
     texture2d<float> tf0, texture2d<float> tf1,
     texture2d<float> tf2, texture2d<float> tf3,
     float3 gradStep, float4x4 volumeToTexture,
-    half gradNormFactor, int c, half scalarScale, half scalarBias) {
-  half opPX = sampleComponentTransferFunction(tf0, tf1, tf2, tf3,
-      float2(saturate(sPX * scalarScale + scalarBias), 0.5), c).a;
-  half opNX = sampleComponentTransferFunction(tf0, tf1, tf2, tf3,
-      float2(saturate(sNX * scalarScale + scalarBias), 0.5), c).a;
-  half opPY = sampleComponentTransferFunction(tf0, tf1, tf2, tf3,
-      float2(saturate(sPY * scalarScale + scalarBias), 0.5), c).a;
-  half opNY = sampleComponentTransferFunction(tf0, tf1, tf2, tf3,
-      float2(saturate(sNY * scalarScale + scalarBias), 0.5), c).a;
-  half opPZ = sampleComponentTransferFunction(tf0, tf1, tf2, tf3,
-      float2(saturate(sPZ * scalarScale + scalarBias), 0.5), c).a;
-  half opNZ = sampleComponentTransferFunction(tf0, tf1, tf2, tf3,
-      float2(saturate(sNZ * scalarScale + scalarBias), 0.5), c).a;
+    float gradNormFactor, int c, float scalarScale, float scalarBias) {
+  float opPX = float(sampleComponentTransferFunction(tf0, tf1, tf2, tf3,
+      float2(saturate(sPX * scalarScale + scalarBias), 0.5), c).a);
+  float opNX = float(sampleComponentTransferFunction(tf0, tf1, tf2, tf3,
+      float2(saturate(sNX * scalarScale + scalarBias), 0.5), c).a);
+  float opPY = float(sampleComponentTransferFunction(tf0, tf1, tf2, tf3,
+      float2(saturate(sPY * scalarScale + scalarBias), 0.5), c).a);
+  float opNY = float(sampleComponentTransferFunction(tf0, tf1, tf2, tf3,
+      float2(saturate(sNY * scalarScale + scalarBias), 0.5), c).a);
+  float opPZ = float(sampleComponentTransferFunction(tf0, tf1, tf2, tf3,
+      float2(saturate(sPZ * scalarScale + scalarBias), 0.5), c).a);
+  float opNZ = float(sampleComponentTransferFunction(tf0, tf1, tf2, tf3,
+      float2(saturate(sNZ * scalarScale + scalarBias), 0.5), c).a);
 
-  half3 opGrad = half3(opPX - opNX, opPY - opNY, opPZ - opNZ);
-  float3 gradTex = float3(opGrad) / max(gradStep, 1e-8);
+  float3 opGrad = float3(opPX - opNX, opPY - opNY, opPZ - opNZ);
+  float3 gradTex = opGrad / max(gradStep, 1e-8);
   return normalizedGradient(gradTex, volumeToTexture, gradNormFactor);
 }
 
-inline half4 computeGradientFast(texture3d<float> volTex, float3 pos,
-                                 float3 gradStep, float4x4 volumeToTexture, half gradNormFactor) {
-  half sPX = half(sampleVolumeScalar(volTex, pos + float3(gradStep.x, 0, 0)));
-  half sNX = half(sampleVolumeScalar(volTex, pos - float3(gradStep.x, 0, 0)));
-  half sPY = half(sampleVolumeScalar(volTex, pos + float3(0, gradStep.y, 0)));
-  half sNY = half(sampleVolumeScalar(volTex, pos - float3(0, gradStep.y, 0)));
-  half sPZ = half(sampleVolumeScalar(volTex, pos + float3(0, 0, gradStep.z)));
-  half sNZ = half(sampleVolumeScalar(volTex, pos - float3(0, 0, gradStep.z)));
+inline float4 computeGradientFast(texture3d<float> volTex, float3 pos,
+                                 float3 gradStep, float4x4 volumeToTexture, float gradNormFactor) {
+  float sPX = sampleVolumeScalar(volTex, pos + float3(gradStep.x, 0, 0));
+  float sNX = sampleVolumeScalar(volTex, pos - float3(gradStep.x, 0, 0));
+  float sPY = sampleVolumeScalar(volTex, pos + float3(0, gradStep.y, 0));
+  float sNY = sampleVolumeScalar(volTex, pos - float3(0, gradStep.y, 0));
+  float sPZ = sampleVolumeScalar(volTex, pos + float3(0, 0, gradStep.z));
+  float sNZ = sampleVolumeScalar(volTex, pos - float3(0, 0, gradStep.z));
 
-  half3 rawGrad = half3(sPX - sNX, sPY - sNY, sPZ - sNZ);
-  float3 gradTex = float3(rawGrad) / max(gradStep, 1e-8);
+  float3 rawGrad = float3(sPX - sNX, sPY - sNY, sPZ - sNZ);
+  float3 gradTex = rawGrad / max(gradStep, 1e-8);
   return normalizedGradient(gradTex, volumeToTexture, gradNormFactor);
 }
 
-inline half4 computeDensityGradientFast(
+inline float4 computeDensityGradientFast(
     texture3d<float> volTex,
     texture2d<float> tf0, texture2d<float> tf1,
     texture2d<float> tf2, texture2d<float> tf3,
     float3 pos, float3 gradStep,
     float4x4 volumeToTexture,
-    half gradNormFactor,
-    int c, half scalarScale, half scalarBias) {
-  half sPX = half(sampleVolumeTexel(volTex, pos + float3(gradStep.x, 0, 0))[c]);
-  half sNX = half(sampleVolumeTexel(volTex, pos - float3(gradStep.x, 0, 0))[c]);
-  half sPY = half(sampleVolumeTexel(volTex, pos + float3(0, gradStep.y, 0))[c]);
-  half sNY = half(sampleVolumeTexel(volTex, pos - float3(0, gradStep.y, 0))[c]);
-  half sPZ = half(sampleVolumeTexel(volTex, pos + float3(0, 0, gradStep.z))[c]);
-  half sNZ = half(sampleVolumeTexel(volTex, pos - float3(0, 0, gradStep.z))[c]);
+    float gradNormFactor,
+    int c, float scalarScale, float scalarBias) {
+  float sPX = sampleVolumeScalar(volTex, pos + float3(gradStep.x, 0, 0));
+  float sNX = sampleVolumeScalar(volTex, pos - float3(gradStep.x, 0, 0));
+  float sPY = sampleVolumeScalar(volTex, pos + float3(0, gradStep.y, 0));
+  float sNY = sampleVolumeScalar(volTex, pos - float3(0, gradStep.y, 0));
+  float sPZ = sampleVolumeScalar(volTex, pos + float3(0, 0, gradStep.z));
+  float sNZ = sampleVolumeScalar(volTex, pos - float3(0, 0, gradStep.z));
   return densityGradientFromNeighbors(sPX, sNX, sPY, sNY, sPZ, sNZ,
       tf0, tf1, tf2, tf3, gradStep, volumeToTexture, gradNormFactor, c, scalarScale, scalarBias);
 }
@@ -3278,27 +3280,27 @@ inline half4 computeDensityGradientFast(
 // 6-fetch when both features are active. Returns the scalar gradient (for
 // sharedGrad / gradient opacity) and writes the density gradient via
 // densityGradOut (for the shading normal).
-inline half4 computeScalarAndDensityGradient(
+inline float4 computeScalarAndDensityGradient(
     texture3d<float> volTex,
     texture2d<float> tf0, texture2d<float> tf1,
     texture2d<float> tf2, texture2d<float> tf3,
     float3 pos, float3 gradStep,
     float4x4 volumeToTexture,
-    half gradNormFactor,
-    half scalarScale, half scalarBias,
-    thread half4& densityGradOut) {
-  half sPX = half(sampleVolumeScalar(volTex, pos + float3(gradStep.x, 0, 0)));
-  half sNX = half(sampleVolumeScalar(volTex, pos - float3(gradStep.x, 0, 0)));
-  half sPY = half(sampleVolumeScalar(volTex, pos + float3(0, gradStep.y, 0)));
-  half sNY = half(sampleVolumeScalar(volTex, pos - float3(0, gradStep.y, 0)));
-  half sPZ = half(sampleVolumeScalar(volTex, pos + float3(0, 0, gradStep.z)));
-  half sNZ = half(sampleVolumeScalar(volTex, pos - float3(0, 0, gradStep.z)));
+    float gradNormFactor,
+    float scalarScale, float scalarBias,
+    thread float4& densityGradOut) {
+  float sPX = sampleVolumeScalar(volTex, pos + float3(gradStep.x, 0, 0));
+  float sNX = sampleVolumeScalar(volTex, pos - float3(gradStep.x, 0, 0));
+  float sPY = sampleVolumeScalar(volTex, pos + float3(0, gradStep.y, 0));
+  float sNY = sampleVolumeScalar(volTex, pos - float3(0, gradStep.y, 0));
+  float sPZ = sampleVolumeScalar(volTex, pos + float3(0, 0, gradStep.z));
+  float sNZ = sampleVolumeScalar(volTex, pos - float3(0, 0, gradStep.z));
 
   densityGradOut = densityGradientFromNeighbors(sPX, sNX, sPY, sNY, sPZ, sNZ,
       tf0, tf1, tf2, tf3, gradStep, volumeToTexture, gradNormFactor, 0, scalarScale, scalarBias);
 
-  half3 rawGrad = half3(sPX - sNX, sPY - sNY, sPZ - sNZ);
-  float3 gradTex = float3(rawGrad) / max(gradStep, 1e-8);
+  float3 rawGrad = float3(sPX - sNX, sPY - sNY, sPZ - sNZ);
+  float3 gradTex = rawGrad / max(gradStep, 1e-8);
   return normalizedGradient(gradTex, volumeToTexture, gradNormFactor);
 }
 
@@ -3310,7 +3312,7 @@ inline half4 computeScalarAndDensityGradient(
 // the magnitude is stored in .w for the gradient-opacity table.
 inline void computeGradientsAllComponents(
     texture3d<float> volTex, float3 pos, float3 gradStep,
-    float4x4 volumeToTexture, half gradNormFactor, thread half4 gradOut[4]) {
+    float4x4 volumeToTexture, float gradNormFactor, thread float4 gradOut[4]) {
   float4 pX = sampleVolumeTexel(volTex, pos + float3(gradStep.x, 0, 0));
   float4 nX = sampleVolumeTexel(volTex, pos - float3(gradStep.x, 0, 0));
   float4 pY = sampleVolumeTexel(volTex, pos + float3(0, gradStep.y, 0));
@@ -3326,8 +3328,8 @@ inline void computeGradientsAllComponents(
     float3 gradTex = float3(pX[c] - nX[c], pY[c] - nY[c], pZ[c] - nZ[c]) / max(gradStep, 1e-8);
     float3 corrected = texToModelT * gradTex;
     float mag = length(corrected);
-    half3 normal = mag > 0.0f ? half3(corrected / mag) : half3(0.0h);
-    gradOut[c] = half4(normal, saturate(half(mag) / gradNormFactor));
+    float3 normal = mag > 0.0f ? corrected / mag : float3(0.0f);
+    gradOut[c] = float4(normal, saturate(mag / gradNormFactor));
   }
 }
 
@@ -3782,7 +3784,7 @@ inline half4 marchVolumeUnified(
   // Per-component gradients (independent path only): computed lazily at most
   // once per sample from a single six-texel batch and reused by the
   // gradient-opacity step and the per-component shading in the composite loop.
-  half4 compGrad[4] = {half4(0.0h), half4(0.0h), half4(0.0h), half4(0.0h)};
+  float4 compGrad[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
   bool compGradReady = false;
 
   // Sample position carried incrementally through the march: advance one ray
@@ -4038,12 +4040,12 @@ inline half4 marchVolumeUnified(
     // Gradient shared between the TF_2D gradient y-axis and shading/gradient
     // opacity so it is computed at most once per sample (computeGradientFast
     // is 6 texture fetches).
-    half4 sharedGrad = half4(0.0h);
+    float4 sharedGrad = float4(0.0f);
     bool sharedGradReady = false;
     // Opacity-field gradient cached by the gradient-opacity block when
     // ComputeNormalFromOpacity is combined with gradient opacity, so the
     // shading block reuses the shared six-neighbor fetch instead of refetching.
-    half4 cachedDensityGrad = half4(0.0h);
+    float4 cachedDensityGrad = float4(0.0f);
     bool densityGradReady = false;
 
     // Per-component transfer-function results (independent path only).
@@ -4266,11 +4268,11 @@ inline half4 marchVolumeUnified(
           if (sampleOpacity >= 0.01h && doShading) {
             half3 normal;
             if (fc_computeNormalFromOpacity && volumeUniforms.useComputeNormalFromOpacity > 0.5) {
-              normal = computeDensityGradientFast(volumeTexture,
+              normal = half3(computeDensityGradientFast(volumeTexture,
                   transferFunctionTexture, transferFunctionTexture1,
                   transferFunctionTexture2, transferFunctionTexture3,
                   evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture,
-                  gradNormFactor, c, compScale[c], compBias[c]).xyz;
+                  gradNormFactor, c, compScale[c], compBias[c]).xyz);
             } else if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
               half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
               normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
@@ -4279,7 +4281,7 @@ inline half4 marchVolumeUnified(
                 computeGradientsAllComponents(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor, compGrad);
                 compGradReady = true;
               }
-              normal = compGrad[c].xyz;
+              normal = half3(compGrad[c].xyz);
             }
             // Per-component material and shininess (OpenGL lightingComponent
             // index parity).
@@ -4321,7 +4323,7 @@ inline half4 marchVolumeUnified(
         if (!sharedGradReady) {
           if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
             half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
-            sharedGrad = half4(normalize(nrmSample.xyz * 2.0h - 1.0h), nrmSample.w);
+            sharedGrad = float4(float3(normalize(nrmSample.xyz * 2.0h - 1.0h)), nrmSample.w);
           } else if (fc_computeNormalFromOpacity && volumeUniforms.useComputeNormalFromOpacity > 0.5) {
             sharedGrad = computeScalarAndDensityGradient(volumeTexture,
                 transferFunctionTexture, transferFunctionTexture1,
@@ -4365,25 +4367,25 @@ inline half4 marchVolumeUnified(
         half3 normal;
         if (fc_computeNormalFromOpacity && volumeUniforms.useComputeNormalFromOpacity > 0.5) {
           if (densityGradReady) {
-            normal = cachedDensityGrad.xyz;
+            normal = half3(cachedDensityGrad.xyz);
           } else {
-            normal = computeDensityGradientFast(volumeTexture,
+            normal = half3(computeDensityGradientFast(volumeTexture,
                 transferFunctionTexture, transferFunctionTexture1,
                 transferFunctionTexture2, transferFunctionTexture3,
                 evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture,
-                gradNormFactor, 0, scalarScale, scalarBias).xyz;
+                gradNormFactor, 0, scalarScale, scalarBias).xyz);
           }
         } else {
           if (!sharedGradReady) {
             if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
               half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
-              sharedGrad = half4(normalize(nrmSample.xyz * 2.0h - 1.0h), nrmSample.w);
+              sharedGrad = float4(float3(normalize(nrmSample.xyz * 2.0h - 1.0h)), nrmSample.w);
             } else {
               sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
             }
             sharedGradReady = true;
           }
-          normal = sharedGrad.xyz;
+          normal = half3(sharedGrad.xyz);
         }
 
         // TEMP DEBUG: lighting per-sample values (test builds only).
