@@ -6,11 +6,9 @@
 /// gradient opacity / no vtkProp3D transform. Reads VTK_FIXED_SAMPLE_DISTANCE
 /// (world units) and VTK_FIXED_AUTO_ADJUST (0/1) from the environment; when
 /// the sample distance is set, AutoAdjustSampleDistances is disabled so the
-/// requested step is honored by both backends, letting us sweep step sizes to
-/// find a value where Metal and OpenGL converge. Sweep results are recorded in
-/// Rendering/Metal/TestGPURayCastCameraInsideTransformation.md: no step size
-/// makes the backends match, so the residual divergence is not a
-/// sampling-phase artifact.
+/// requested step is honored by both backends, letting us sweep step sizes on
+/// both backends at once. See the fixed-step sweep procedure in
+/// Rendering/Metal/VolumeRayCastBackendComparisonProcedures.md.
 
 #include "vtkCamera.h"
 #include "vtkColorTransferFunction.h"

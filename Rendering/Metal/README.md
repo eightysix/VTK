@@ -18,9 +18,10 @@ environment variable) from an application that invokes
 
 ## Investigation reports
 
-- `TestGPURayCastCameraInsideTransformation.md` — Metal-vs-OpenGL divergence on
-  the camera-inside volume ray-cast test (gradient opacity + Phong shading);
-  full isolation workflow, reproduction steps, and fix plan.
+- `VolumeRayCastBackendComparisonProcedures.md` — procedures to produce and
+  analyze artifacts comparing the Metal and OpenGL volume ray-cast backends
+  (dual-backend captures, delta stats, isolation variants, probes, offline
+  verification).
 
 ## Volume rendering: nearest-vs-linear interpolation discrepancy
 
