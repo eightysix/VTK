@@ -127,6 +127,10 @@ one makes Metal diverge, sibling tests were created in
 | `TestGPURayCastCameraInsideTransformationConstGradOp.cxx` | gradient opacity constant `0.7` everywhere (`gf: 0.7@0, 0.7@2000`) |
 | `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransform.cxx` | also drop the `vtkProp3D` transform (`Rotate*`/`SetOrigin`), camera repositioned inside the axis-aligned bounds |
 | `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutside.cxx` | also move the camera outside (no near-plane clip) |
+| `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNearPlaneTiny.cxx` | camera inside, but near-plane pulled onto the eye (`SetClippingRange(0.001, …)`) so the near-plane clip is a no-op |
+| `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformFineStep.cxx` | camera inside, `SetSampleDistance(0.25)` (4× more samples) |
+| `TestGPURayCastCameraInsideTransformationSampleDist0_5.cxx` | original test, `SetSampleDistance(0.5)` (2× more samples) |
+| `TestGPURayCastCameraInsideTransformationSampleDist0_25.cxx` | original test, `SetSampleDistance(0.25)` (4× more samples) |
 
 Each is registered in `Rendering/Volume/Testing/Cxx/CMakeLists.txt`, e.g.:
 
@@ -137,6 +141,10 @@ Each is registered in `Rendering/Volume/Testing/Cxx/CMakeLists.txt`, e.g.:
   TestGPURayCastCameraInsideTransformationNoShadeNoGradOp.cxx
   TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransform.cxx
   TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutside.cxx
+  TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNearPlaneTiny.cxx
+  TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformFineStep.cxx
+  TestGPURayCastCameraInsideTransformationSampleDist0_5.cxx
+  TestGPURayCastCameraInsideTransformationSampleDist0_25.cxx
 ```
 
 Each variant is run through ctest the same way as the original (swap the test
@@ -144,7 +152,7 @@ name; the regex matches both backends):
 
 ```sh
 ctest --test-dir build_macos_metal \
-  -R "TestGPURayCastCameraInsideTransformation(ConstGradOp|NoGradOp|NoShade|NoShadeNoGradOp|NoShadeNoGradOpNoTransform|NoShadeNoGradOpNoTransformCamOutside)?" \
+  -R "TestGPURayCastCameraInsideTransformation(ConstGradOp|NoGradOp|NoShade|NoShadeNoGradOp|NoShadeNoGradOpNoTransform|NoShadeNoGradOpNoTransformCamOutside|NoShadeNoGradOpNoTransformNearPlaneTiny|NoShadeNoGradOpNoTransformFineStep|SampleDist0_5|SampleDist0_25)?" \
   --output-on-failure
 ```
 
@@ -167,6 +175,10 @@ comparing `max(|Metal−GL|)` across channels:
 | ConstGradOp (gf≡0.7) | (102,77,62) → (105,79,62) | +1.21 | 1.67 | 17 | 1.006·gl + 1.9 | 46069 |
 | NoShade, no gf, **no transform** | (236,180,145) → (235,179,144) | −0.56 | 1.31 | 24 | 0.985·gl + 3.0 | 1444 |
 | NoShade, no gf, **no transform, camera outside** | (253,174,133) → (253,174,133) | **+0.00** | **0.00** | **0** | 1.000·gl | **0** |
+| NoShade, no gf, no transform, near plane at eye | (236,180,145) → (235,179,144) | −0.56 | 1.31 | 24 | 0.985·gl + 3.0 | 1444 |
+| NoShade, no gf, no transform, **4× samples** | (235,179,144) → (235,179,144) | **+0.00** | **0.00** | **0** | 1.000·gl | **0** |
+| Original, **0.5× sample distance** | (86,66,54) → (127,92,74) | +28.82 | 42.04 | 90 | 0.778·gl + 64 | 262144 |
+| Original, **0.25× sample distance** | (86,66,54) → (127,92,74) | +28.82 | 42.04 | 90 | 0.778·gl + 64 | 262144 |
 
 Delta visualizations (`_delta_heatmap.png`, `_delta_mask.png`) are produced by
 `analyze.py` above, run from `/tmp/bc/` for each variant.
@@ -185,17 +197,33 @@ Delta visualizations (`_delta_heatmap.png`, `_delta_mask.png`) are produced by
 4. The varying gf ramp is steep: 0 → 0.5 over 0 → 90 data units. Small
    per-sample gradient-magnitude differences are amplified dramatically.
 
-The two additional variants below (`NoShadeNoGradOpNoTransform`,
-`NoShadeNoGradOpNoTransformCamOutside`, section 2 capture + section 3
-analysis) remove the next two parts of the original scene:
+The four additional variants below (section 2 capture + section 3 analysis)
+remove/refine the next parts of the original scene, working only on the
+contained `NoShadeNoGradOp`-style scene (no shading, no gradient opacity):
 
 5. **Dropping the `vtkProp3D` transform** (axis-aligned volume, camera still
    inside) cuts the masked pixels ~10× (14453 → 1444), but a residual
    max|Δ|=24 stays, concentrated in the band where the near-plane clip slices
-   the volume (`NoTransform_delta_mask.png`, upper-middle region).
+   the volume (`NoTransform_delta_mask.png`, upper-middle region). Metal is
+   only ever *brighter* there (no pixel is dimmer by ≥5).
 6. **Dropping camera-inside too** (camera outside, no near-plane clip) makes
-   Metal **bit-identical** to GL: max|Δ|=0, every pixel equal. The entire
-   remaining divergence is in the camera-inside / near-plane-clip path.
+   Metal **bit-identical** to GL: max|Δ|=0, every pixel equal. The remaining
+   divergence is therefore in the camera-inside path.
+7. **Near-plane distance is irrelevant** (`NearPlaneTiny`, near plane pulled
+   onto the eye): byte-for-byte identical delta table to the default-clip
+   `NoTransform` row → the divergence does not come from the clipped entry
+   distance.
+8. **4× samples collapse it** (`FineStep`, `SampleDistance 0.25`): **bit-identical**,
+   max|Δ|=0. The camera-inside residual is a per-sample phase artifact on the
+   grazing rays around the near-plane silhouette; with four times the samples
+   the first-sample-out-of-bounds region shrinks and both backends quantize to
+   the same 8-bit output.
+9. **The original full test does *not* respond to finer sampling**
+   (`SampleDist0_5`, `SampleDist0_25`): the delta table is identical to the
+   original (+28.82, 262144 masked). The dominant original-test failure is
+   therefore the gradient-opacity × shading interaction (takeaways 1–4), a
+   *separate* mechanism from the camera-inside sampling artifact above — more
+   than one issue is at work, and they must be investigated independently.
 
 ## Gradient-magnitude math: Metal vs GL
 
@@ -488,49 +516,56 @@ color before/after shading; for pixel (256,256) the first sample is at
 
 ## Conclusion
 
-- The gradient-opacity **magnitude normalization** is equivalent to GL
-  (algebra + numeric check + ConstGradOp all agree), so the failure is **not** a
-  normalization bug.
-- The divergence only materializes with the *varying* gf because its ramp is
-  steep; the residual trigger is a **sample-comb phase offset** between the two
-  backends' first sample:
-  - OpenGL begins the ray one full step past the entry point:
-    `g_rayOrigin += g_rayJitter` with `g_rayJitter = g_dirStep`
-    (`vtkVolumeShaderComposer.h` ~460-465) — samples at
-    `entry + step, entry + 2·step, …`.
-  - Metal begins at `firstT = jitter + ceil((tStart − jitter)/stepSize)·stepSize`
-    (`MetalShaders.metal` 3723-3725) — the next multiple of `stepSize` ≥ entry.
-- The two combs sample different 1-voxel neighbor sets for the central
-  difference at high-frequency features, perturbing `gradW`; the steep `gf`
-  ramp amplifies that into the visible brightness difference. With a constant
-  `gf` the input is irrelevant, which is exactly why ConstGradOp is
-  near-identical.
-- **Confirmed by elimination** (`NoShadeNoGradOpNoTransformCamOutside`): with
-  shading, gradient opacity, the transform, *and* the camera-inside clip all
-  removed, Metal is **bit-identical** to GL (max|Δ|=0). Re-adding the
-  camera-inside near-plane clip (NoTransform variant) brings the divergence
-  back (max|Δ|=24, concentrated along the clip silhouette), while re-adding the
-  transform only widens it. The remaining divergence is therefore **entirely in
-  the camera-inside (`checkBounds == false`) first-sample phase**, consistent
-  with the GL first-sample `entry + step` vs Metal
-  `ceil(entry/step)·step` mismatch above. The camera-outside
-  (`checkBounds == true`) path already matches GL exactly and is not affected.
+**Two independent mechanisms are at work.**
+
+1. **Camera-inside sampling artifact (contained scene, no shade / no gf).**
+   With shading, gradient opacity and the transform all removed, the camera-inside
+   render still diverges in a blob of grazing rays around the near-plane
+   silhouette (max|Δ|=24, Metal only ever brighter, 1444 px). Elimination
+   results:
+   - Camera outside → **bit-identical** (`NoShadeNoGradOpNoTransformCamOutside`).
+   - Near-plane pulled onto the eye → **identical delta table** to the default
+     clip (`NearPlaneTiny`): the clipped-entry distance is irrelevant.
+   - **4× samples → bit-identical** (`FineStep`, `SampleDistance 0.25`).
+   So the residual is a per-sample phase artifact on rays that graze the volume
+   boundary near the near-plane silhouette (their first samples land on the
+   `[0,1]` box boundary and are clamped, `MetalShaders.metal` 3821-3828, vs
+   OpenGL's clamp-to-edge sampler); refining the step shrinks the affected
+   region until both backends round to identical 8-bit output.
+   The previously-suspected `firstT` comb mismatch
+   (`MetalShaders.metal` 3723-3725, `ceil` on the `checkBounds == false` path)
+   is **not** involved: the camera-inside test marches through `marchVolume`
+   (`checkBounds == true`, `firstT = jitter = stepSize`), whose comb already
+   matches GL — changing that `firstT` had zero effect on the render.
+
+2. **Gradient-opacity × shading interaction (original full test).**
+   The full original scene is **unaffected** by finer sampling
+   (`SampleDist0_5`, `SampleDist0_25` give the byte-identical delta table of
+   the original, +28.82 / 262144 px). Its failure therefore does **not** come
+   from the camera-inside sampling artifact above; it is driven by the steep
+   varying `gf` interacting with shading (takeaways 1–4) and must be
+   investigated separately.
 
 ## Fix plan
 
-Align Metal's first-sample phase with OpenGL's (advance one full `stepSize`
-from the clipped entry, matching `g_rayOrigin += g_dirStep`), then re-run both
-ctests. Concretely, change the `firstT` computation at
-`Rendering/Metal/Shaders/MetalShaders.metal:3723` so the first sample lands at
-`tStart + stepSize` (for the camera-inside `checkBounds == false` path) instead
-of `ceil(tStart/stepSize)·stepSize`, rebuild, and confirm:
+For the **contained camera-inside artifact**: align the near-silhouette first
+sample with OpenGL's clamp-to-edge behavior, or (as proven) increase the
+default sampling density so the affected region quantizes away. The candidate
+fixes are (a) reproduce GL's texture clamp semantics for out-of-bounds samples
+in `marchVolume` (clamp the *texture coordinate* as the sampler would, instead
+of clamping `texLocalPos` before the cell→point conversion), or (b) refine the
+default `SampleDistance` for camera-inside renders. Validate with:
 
 ```sh
-ctest --test-dir build_macos_metal -R "TestGPURayCastCameraInsideTransformation" --output-on-failure
+ctest --test-dir build_macos_metal \
+  -R "TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransform" \
+  --output-on-failure
 ```
 
-Both the GL (#681) and Metal (#782) runs must pass; the captured images can be
-re-checked with the delta pipeline above to confirm the divergence is gone.
+The original full test (GF/OpenGL #681, Metal #782) remains **unfixed**: its
+divergence lives in the gradient-opacity × shading path and is orthogonal to
+the camera-inside artifact — see the gradient-magnitude section above for the
+state of that investigation.
 
 ## Artifacts
 
@@ -543,6 +578,9 @@ command listed (assume the directory may be erased at any time):
 | `noshade/`, `TestGPURayCastCameraInsideTransformationNoGradOp/`, `TestGPURayCastCameraInsideTransformationNoShadeNoGradOp/`, `ConstGradOp/` | per-variant captures (`opengl/`, `metal/`) + `_delta_heatmap.png`, `_delta_mask.png` | sections 2+3 on each variant (swap the test name) |
 | `NoTransform/` | `NoShadeNoGradOpNoTransform` captures (no vtkProp3D transform) + delta mask/heatmap | sections 2+3 on `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransform` |
 | `CamOutside/` | `NoShadeNoGradOpNoTransformCamOutside` captures (camera outside, no near-plane clip) — **bit-identical** to GL | sections 2+3 on `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutside` |
+| `NearPlaneTiny/` | `NoShadeNoGradOpNoTransformNearPlaneTiny` captures (near plane on the eye) — delta identical to `NoTransform/` | sections 2+3 on `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNearPlaneTiny` |
+| `FineStep/` | `NoShadeNoGradOpNoTransformFineStep` captures (4× samples) — **bit-identical** to GL | sections 2+3 on `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformFineStep` |
+| `SampleDist0_5/`, `SampleDist0_25/` | original test at 0.5× / 0.25× sample distance — delta identical to the original failure | sections 2+3 on `TestGPURayCastCameraInsideTransformationSampleDist0_5` / `…SampleDist0_25` |
 | `analyze.py` | delta-stats + heatmap/mask script | section 3 (inline listing) |
 | `vol512.npy` | 512³ `headsq` array (uint16, [0,4370]) | `make_vol512.py` (offline verification, step 1) |
 | `metal3.log` | per-sample MARCH/SAMPLE/LIGHT/LIGHT2 dump (3247 lines) | `make_metal3_log.sh` (per-sample GPU logging) |
