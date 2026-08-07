@@ -14,13 +14,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build_macos_metal"
 RESUME=0
 TESTS=0
+TESTS_EXPLICIT=0
 
 for arg in "$@"; do
   case "$arg" in
     --resume) RESUME=1 ;;
-    --tests) TESTS=1 ;;
+    --tests) TESTS=1; TESTS_EXPLICIT=1 ;;
   esac
 done
+
+if [ "$RESUME" -eq 1 ] && [ "$TESTS_EXPLICIT" -eq 0 ] && [ -f "${BUILD_DIR}/CMakeCache.txt" ]; then
+  CACHED_TESTS=$(grep -E "^VTK_BUILD_TESTING:STRING=" "${BUILD_DIR}/CMakeCache.txt" | cut -d= -f2)
+  case "$CACHED_TESTS" in
+    ON|on|On|TRUE|true|True|YES|yes|1) TESTS=1 ;;
+  esac
+fi
 
 MIN_VERSION="14.0"
 PLATFORM="MacOSX"
