@@ -14,6 +14,8 @@ set (VolumeCxxTests
   TestGPURayCastCameraInsideTransformationNoGradOp.cxx
   TestGPURayCastCameraInsideTransformationNoShade.cxx
   TestGPURayCastCameraInsideTransformationNoShadeNoGradOp.cxx
+  TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransform.cxx
+  TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutside.cxx
   TestGPURayCastClipping.cxx
   TestGPURayCastClippingPolyData.cxx
   TestGPURayCastClippingUserTransform.cxx

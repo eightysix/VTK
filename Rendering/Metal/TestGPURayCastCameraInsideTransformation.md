@@ -116,7 +116,7 @@ This prints the delta table rows used below and writes
 
 The test combines three features: Phong shading (`ShadeOn`), gradient opacity
 (`gf: 0@0, 0.5@90, 0.7@100`), and camera-inside-with-clipping. To find which
-one makes Metal diverge, four sibling tests were created in
+one makes Metal diverge, sibling tests were created in
 `Rendering/Volume/Testing/Cxx/`:
 
 | file | change vs original |
@@ -125,6 +125,8 @@ one makes Metal diverge, four sibling tests were created in
 | `TestGPURayCastCameraInsideTransformationNoGradOp.cxx` | drop `SetGradientOpacity` |
 | `TestGPURayCastCameraInsideTransformationNoShadeNoGradOp.cxx` | `ShadeOff()` + no gradient opacity |
 | `TestGPURayCastCameraInsideTransformationConstGradOp.cxx` | gradient opacity constant `0.7` everywhere (`gf: 0.7@0, 0.7@2000`) |
+| `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransform.cxx` | also drop the `vtkProp3D` transform (`Rotate*`/`SetOrigin`), camera repositioned inside the axis-aligned bounds |
+| `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutside.cxx` | also move the camera outside (no near-plane clip) |
 
 Each is registered in `Rendering/Volume/Testing/Cxx/CMakeLists.txt`, e.g.:
 
@@ -133,6 +135,8 @@ Each is registered in `Rendering/Volume/Testing/Cxx/CMakeLists.txt`, e.g.:
   TestGPURayCastCameraInsideTransformationNoGradOp.cxx
   TestGPURayCastCameraInsideTransformationNoShade.cxx
   TestGPURayCastCameraInsideTransformationNoShadeNoGradOp.cxx
+  TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransform.cxx
+  TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutside.cxx
 ```
 
 Each variant is run through ctest the same way as the original (swap the test
@@ -140,7 +144,7 @@ name; the regex matches both backends):
 
 ```sh
 ctest --test-dir build_macos_metal \
-  -R "TestGPURayCastCameraInsideTransformation(ConstGradOp|NoGradOp|NoShade|NoShadeNoGradOp)?" \
+  -R "TestGPURayCastCameraInsideTransformation(ConstGradOp|NoGradOp|NoShade|NoShadeNoGradOp|NoShadeNoGradOpNoTransform|NoShadeNoGradOpNoTransformCamOutside)?" \
   --output-on-failure
 ```
 
@@ -161,6 +165,8 @@ comparing `max(|Metal−GL|)` across channels:
 | ShadeOn, no gf | (100,76,61) → (101,76,61) | +0.47 | 1.11 | 17 | 1.009·gl + 0.4 | 16527 |
 | NoShade, no gf | (252,191,153) → (253,188,152) | −0.97 | 1.21 | 8 | ≈ 1.0·gl | 14453 |
 | ConstGradOp (gf≡0.7) | (102,77,62) → (105,79,62) | +1.21 | 1.67 | 17 | 1.006·gl + 1.9 | 46069 |
+| NoShade, no gf, **no transform** | (236,180,145) → (235,179,144) | −0.56 | 1.31 | 24 | 0.985·gl + 3.0 | 1444 |
+| NoShade, no gf, **no transform, camera outside** | (253,174,133) → (253,174,133) | **+0.00** | **0.00** | **0** | 1.000·gl | **0** |
 
 Delta visualizations (`_delta_heatmap.png`, `_delta_mask.png`) are produced by
 `analyze.py` above, run from `/tmp/bc/` for each variant.
@@ -178,6 +184,18 @@ Delta visualizations (`_delta_heatmap.png`, `_delta_mask.png`) are produced by
    composited opacity) that blows up.
 4. The varying gf ramp is steep: 0 → 0.5 over 0 → 90 data units. Small
    per-sample gradient-magnitude differences are amplified dramatically.
+
+The two additional variants below (`NoShadeNoGradOpNoTransform`,
+`NoShadeNoGradOpNoTransformCamOutside`, section 2 capture + section 3
+analysis) remove the next two parts of the original scene:
+
+5. **Dropping the `vtkProp3D` transform** (axis-aligned volume, camera still
+   inside) cuts the masked pixels ~10× (14453 → 1444), but a residual
+   max|Δ|=24 stays, concentrated in the band where the near-plane clip slices
+   the volume (`NoTransform_delta_mask.png`, upper-middle region).
+6. **Dropping camera-inside too** (camera outside, no near-plane clip) makes
+   Metal **bit-identical** to GL: max|Δ|=0, every pixel equal. The entire
+   remaining divergence is in the camera-inside / near-plane-clip path.
 
 ## Gradient-magnitude math: Metal vs GL
 
@@ -487,6 +505,16 @@ color before/after shading; for pixel (256,256) the first sample is at
   ramp amplifies that into the visible brightness difference. With a constant
   `gf` the input is irrelevant, which is exactly why ConstGradOp is
   near-identical.
+- **Confirmed by elimination** (`NoShadeNoGradOpNoTransformCamOutside`): with
+  shading, gradient opacity, the transform, *and* the camera-inside clip all
+  removed, Metal is **bit-identical** to GL (max|Δ|=0). Re-adding the
+  camera-inside near-plane clip (NoTransform variant) brings the divergence
+  back (max|Δ|=24, concentrated along the clip silhouette), while re-adding the
+  transform only widens it. The remaining divergence is therefore **entirely in
+  the camera-inside (`checkBounds == false`) first-sample phase**, consistent
+  with the GL first-sample `entry + step` vs Metal
+  `ceil(entry/step)·step` mismatch above. The camera-outside
+  (`checkBounds == true`) path already matches GL exactly and is not affected.
 
 ## Fix plan
 
@@ -513,6 +541,8 @@ command listed (assume the directory may be erased at any time):
 |---|---|---|
 | `gl/`, `metal/`, `metal2/`, `metal3/` | original test, each backend's render + `.diff.png` | section 2 (dummy-baseline capture, `RenderingBackend=OpenGL`/`Metal`) |
 | `noshade/`, `TestGPURayCastCameraInsideTransformationNoGradOp/`, `TestGPURayCastCameraInsideTransformationNoShadeNoGradOp/`, `ConstGradOp/` | per-variant captures (`opengl/`, `metal/`) + `_delta_heatmap.png`, `_delta_mask.png` | sections 2+3 on each variant (swap the test name) |
+| `NoTransform/` | `NoShadeNoGradOpNoTransform` captures (no vtkProp3D transform) + delta mask/heatmap | sections 2+3 on `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransform` |
+| `CamOutside/` | `NoShadeNoGradOpNoTransformCamOutside` captures (camera outside, no near-plane clip) — **bit-identical** to GL | sections 2+3 on `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutside` |
 | `analyze.py` | delta-stats + heatmap/mask script | section 3 (inline listing) |
 | `vol512.npy` | 512³ `headsq` array (uint16, [0,4370]) | `make_vol512.py` (offline verification, step 1) |
 | `metal3.log` | per-sample MARCH/SAMPLE/LIGHT/LIGHT2 dump (3247 lines) | `make_metal3_log.sh` (per-sample GPU logging) |
