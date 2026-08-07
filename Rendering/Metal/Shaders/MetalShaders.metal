@@ -3624,7 +3624,11 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
   bool pxOkContained =
       all(abs(screenPos - float2(372.5, 131.5)) < 0.5) ||
       all(abs(screenPos - float2(422.5, 92.5)) < 0.5);
-  return (camOk && pxOk) || (camOkClip && pxOkClip) || pxOkAny || pxOkContained;
+  // TEMP DEBUG: NoShade left-half comparison pixels (left side matches GL).
+  bool pxOkLeft =
+      all(abs(screenPos - float2(80.5, 400.5)) < 0.5) ||
+      all(abs(screenPos - float2(150.5, 250.5)) < 0.5);
+  return (camOk && pxOk) || (camOkClip && pxOkClip) || pxOkAny || pxOkContained || pxOkLeft;
 }
 
 inline half4 marchVolumeUnified(
@@ -3809,6 +3813,7 @@ inline half4 marchVolumeUnified(
   }
 #endif
 
+  int lastIter = -1;
   for (int i = 0; i < maxSteps; i++) {
     if (!p.checkBounds && currentT >= p.tEnd - 1e-6) break;
 
@@ -4303,7 +4308,25 @@ inline half4 marchVolumeUnified(
           }
           sharedGradReady = true;
         }
+        half opBeforeGf = sampleOpacity;
         sampleOpacity *= sampleGradientOpacity(gradientOpacityTexture, float(sharedGrad.w));
+#if defined(VTK_METAL_ENABLE_LOGGING)
+        if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
+          half dSPX = half(sampleVolumeScalar(volumeTexture, evalPoint + float3(b.gradientStep.x, 0, 0)));
+          half dSNX = half(sampleVolumeScalar(volumeTexture, evalPoint - float3(b.gradientStep.x, 0, 0)));
+          half dSPY = half(sampleVolumeScalar(volumeTexture, evalPoint + float3(0, b.gradientStep.y, 0)));
+          half dSNY = half(sampleVolumeScalar(volumeTexture, evalPoint - float3(0, b.gradientStep.y, 0)));
+          half dSPZ = half(sampleVolumeScalar(volumeTexture, evalPoint + float3(0, 0, b.gradientStep.z)));
+          half dSNZ = half(sampleVolumeScalar(volumeTexture, evalPoint - float3(0, 0, b.gradientStep.z)));
+          os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG GRADOP px=(%d, %d) i=%d pos=(%f, %f, %f) gradW=%f gradOp=%f opBefore=%f opAfter=%f norm=%f raw=%f gstep=(%f, %f, %f) nb=(%f, %f, %f, %f, %f, %f)",
+              int(p.screenPos.x), int(p.screenPos.y), i,
+              evalPoint.x, evalPoint.y, evalPoint.z,
+              float(sharedGrad.w), float(sampleGradientOpacity(gradientOpacityTexture, float(sharedGrad.w))),
+              float(opBeforeGf), float(sampleOpacity), float(scalarNorm), rawScalar,
+              b.gradientStep.x, b.gradientStep.y, b.gradientStep.z,
+              float(dSPX), float(dSNX), float(dSPY), float(dSNY), float(dSPZ), float(dSNZ));
+        }
+#endif
       }
 
       // Apply shading to every alpha>0 sample, matching OpenGL's composite
@@ -4392,6 +4415,7 @@ inline half4 marchVolumeUnified(
     currentT += p.stepSize;
     texLocalPos += texStep;
     evalPoint += evalStep;
+    lastIter = i;
 
     if (i + 1 < maxSteps) {
       prefetchScalar = sampleVolumeScalar(volumeTexture,
@@ -4510,6 +4534,17 @@ inline half4 marchVolumeUnified(
   half wlScale = half(volumeUniforms.finalColorScale);
   half wlBias = half(volumeUniforms.finalColorBias);
   finalColor.rgb = finalColor.rgb * wlScale + wlBias * finalColor.a;
+
+#if defined(VTK_METAL_ENABLE_LOGGING)
+  bool gridGate = (((int(p.screenPos.x) & 31) == 16) && ((int(p.screenPos.y) & 31) == 16));
+  if (p.screenPos.x > 0.0 && (gridGate || debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos))) {
+    os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG FINAL px=(%d, %d) vp=(%f, %f) lastIter=%d accOp=%f accCol=(%f, %f, %f) final=(%f, %f, %f)",
+        int(p.screenPos.x), int(p.screenPos.y), volumeUniforms.viewportSize.x, volumeUniforms.viewportSize.y, lastIter,
+        float(accumulatedOpacity),
+        float(accumulatedColor.r), float(accumulatedColor.g), float(accumulatedColor.b),
+        float(finalColor.r), float(finalColor.g), float(finalColor.b));
+  }
+#endif
   return finalColor;
 }
 
