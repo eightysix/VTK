@@ -4306,12 +4306,12 @@ inline half4 marchVolumeUnified(
         sampleOpacity *= sampleGradientOpacity(gradientOpacityTexture, float(sharedGrad.w));
       }
 
-      if (sampleOpacity < 0.01h) {
-        accumulatedColor += weight * sampleColor * sampleOpacity;
-        accumulatedOpacity += weight * sampleOpacity;
-      } else {
-
-      if (doShading && maskLabel == 0.0h && (sampleOpacity * weight > 0.002h)) {
+      // Apply shading to every alpha>0 sample, matching OpenGL's composite
+      // (g_srcColor = computeColor() whenever g_srcColor.a > 0.0). The previous
+      // 0.01 early-exit left low-gradient samples unlit (flat LUT color), which
+      // diverged from OpenGL's lit color and rendered the shaded result
+      // systematically brighter.
+      if (doShading && maskLabel == 0.0h && sampleOpacity > 0.0h) {
 
         half3 normal;
         if (fc_computeNormalFromOpacity && volumeUniforms.useComputeNormalFromOpacity > 0.5) {
@@ -4341,7 +4341,7 @@ inline half4 marchVolumeUnified(
 #if defined(VTK_METAL_ENABLE_LOGGING)
         if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
           half nDotLDbg = dot(normal, viewDirHalf);
-          os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG LIGHT px=(%d, %d) i=%d raw=%f norm=%f opIn=%f gradW=%f gradOp=%f nDotL=%f amb=(%f, %f, %f) dif=(%f, %f, %f) spe=(%f, %f, %f) colBefore=(%f, %f, %f) colAfter=(%f, %f, %f) vd=(%f, %f, %f)",
+          os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG LIGHT px=(%d, %d) i=%d raw=%f norm=%f opIn=%f gradW=%f gradOp=%f nDotL=%f amb=(%f, %f, %f) dif=(%f, %f, %f) spe=(%f, %f, %f) colBefore=(%f, %f, %f) colAfter=(%f, %f, %f) vd=(%f, %f, %f) pos=(%f, %f, %f) nrm=(%f, %f, %f)",
               int(p.screenPos.x), int(p.screenPos.y), i,
               rawScalar, float(scalarNorm), float(sampleOpacity),
               float(sharedGrad.w), float(sampleGradientOpacity(gradientOpacityTexture, float(sharedGrad.w))),
@@ -4351,7 +4351,9 @@ inline half4 marchVolumeUnified(
               float(specularMat.x), float(specularMat.y), float(specularMat.z),
               float(colorOpacity.r), float(colorOpacity.g), float(colorOpacity.b),
               float(sampleColor.r), float(sampleColor.g), float(sampleColor.b),
-              float(viewDirHalf.x), float(viewDirHalf.y), float(viewDirHalf.z));
+              float(viewDirHalf.x), float(viewDirHalf.y), float(viewDirHalf.z),
+              float(evalPoint.x), float(evalPoint.y), float(evalPoint.z),
+              float(normal.x), float(normal.y), float(normal.z));
         }
 #endif
 
@@ -4384,7 +4386,6 @@ inline half4 marchVolumeUnified(
 
       accumulatedColor += weight * sampleColor * sampleOpacity;
       accumulatedOpacity += weight * sampleOpacity;
-      }
     }
 
     currentPoint += stepVec;
