@@ -6251,10 +6251,14 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
               << scalars->GetFiniteRange(0)[1] << ")"
               << " pt=" << scalars->GetNumberOfComponents() << std::endl;
     {
+      const vtkIdType nvals = scalars->GetNumberOfTuples() * scalars->GetNumberOfComponents();
       const unsigned short* p = static_cast<const unsigned short*>(scalars->GetVoidPointer(0));
-      std::cerr << "VTK_METAL_VOLUME_LOG DEBUG MTL_FIRSTVALS " << p[0] << " " << p[1] << " "
-                << p[2] << " " << p[1000] << " " << p[65536] << " " << p[134217728 - 1]
-                << std::endl;
+      auto probe = [&](vtkIdType i) -> unsigned short {
+        return i < nvals ? p[i] : 0;
+      };
+      std::cerr << "VTK_METAL_VOLUME_LOG DEBUG MTL_FIRSTVALS " << probe(0) << " " << probe(1)
+                << " " << probe(2) << " " << probe(1000) << " " << probe(65536) << " "
+                << probe(nvals - 1) << std::endl;
     }
     // Per-component scalar ranges for the independent multi-component path
     // (OpenGL ScalarRange[n] parity).
