@@ -3631,6 +3631,7 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
   // TEMP DEBUG: CamOutsideFixedStep ring + border pixels.
   bool pxOkCamOut =
       all(abs(screenPos - float2(45.5, 113.5)) < 0.5) ||   // ring, d=46
+      all(abs(screenPos - float2(32.5, 346.5)) < 0.5) ||   // ring, max|d|=34
       all(abs(screenPos - float2(0.5, 256.5)) < 0.5) ||    // left border
       all(abs(screenPos - float2(511.5, 256.5)) < 0.5) ||  // right border
       all(abs(screenPos - float2(256.5, 2.5)) < 0.5) ||    // top border
@@ -3746,8 +3747,14 @@ inline half4 marchVolumeUnified(
 
   int maxSteps = min(max(1, int(ceil((p.tEnd - firstT) / p.stepSize))), MAX_RAY_STEPS);
 
-  half3 accumulatedColor = initialColor;
-  half accumulatedOpacity = initialOpacity;
+  // OpenGL composites in full float (g_fragColor is a vec4; the front-to-back
+  // accumulator and weights are float). Accumulating in half caps the opacity
+  // once per-sample increments fall below the half mantissa ulp (~0.00049 at
+  // accA~0.8), so the interior of a volume renders systematically dimmer than
+  // the GL reference. Promote the composite accumulators (and the weight
+  // arithmetic) to float; the per-sample TF values stay half.
+  float3 accumulatedColor = float3(initialColor);
+  float accumulatedOpacity = float(initialOpacity);
 
   // Non-composite blend-mode accumulators. Only the active mode's accumulator
   // is ever touched; dead branches are eliminated via the fc_blendMode function
@@ -4126,12 +4133,16 @@ inline half4 marchVolumeUnified(
     // DEBUG: per-sample march data (test builds only).
 #if defined(VTK_METAL_ENABLE_LOGGING)
     if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
-      os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG SAMPLE px=(%d, %d) i=%d t=%f tex=(%f, %f, %f) eval=(%f, %f, %f) raw=%f norm=%f op=%f mip=%f rgb=(%f, %f, %f)",
+      os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG SAMPLE px=(%d, %d) i=%d t=%f tex=(%f, %f, %f) eval=(%f, %f, %f) raw=%f norm=%f op=%f mip=%f rgb=(%f, %f, %f) w=%f accA=%f accC=(%f, %f, %f) maxSteps=%d termMax=%f",
           int(p.screenPos.x), int(p.screenPos.y), i, currentT,
           texLocalPos.x, texLocalPos.y, texLocalPos.z,
           evalPoint.x, evalPoint.y, evalPoint.z,
           rawScalar, float(scalarNorm), float(sampleOpacity), float(mipMaxScalar),
-          float(colorOpacity.r), float(colorOpacity.g), float(colorOpacity.b));
+          float(colorOpacity.r), float(colorOpacity.g), float(colorOpacity.b),
+          float(1.0h - accumulatedOpacity),
+          float(accumulatedOpacity),
+          float(accumulatedColor.r), float(accumulatedColor.g), float(accumulatedColor.b),
+          maxSteps, p.tTerminateMax);
     }
 #endif
 
@@ -4287,13 +4298,13 @@ inline half4 marchVolumeUnified(
           tmpRGB += ccRGB * cc.a * w;
           tmpA += (cc.a * cc.a) / sampleOpacity;
         }
-        half weight = 1.0h - accumulatedOpacity;
-        accumulatedColor += weight * tmpRGB;
+        float weight = 1.0f - accumulatedOpacity;
+        accumulatedColor += weight * float3(tmpRGB);
         accumulatedOpacity += weight * tmpA;
       }
     } else if (fc_blendMode == 0 && sampleOpacity > 0.0h) {
       half3 sampleColor = colorOpacity.rgb;
-      half weight = 1.0h - accumulatedOpacity;
+      float weight = 1.0f - accumulatedOpacity;
 
       // Gradient magnitude for gradient opacity and/or shading, computed at
       // most once per sample (sharedGrad/sharedGradReady). Gradient opacity is
@@ -4417,7 +4428,7 @@ inline half4 marchVolumeUnified(
         sampleColor = ambientMat * sampleColor;
       }
 
-      accumulatedColor += weight * sampleColor * sampleOpacity;
+      accumulatedColor += weight * float3(sampleColor) * float(sampleOpacity);
       accumulatedOpacity += weight * sampleOpacity;
     }
 
@@ -4437,8 +4448,8 @@ inline half4 marchVolumeUnified(
     }
 
     // OpenGL parity: g_opacityThreshold = 1.0 - 1.0/255.0 (vtkVolumeShaderComposer.h).
-    if (accumulatedOpacity >= 1.0h - 1.0h / 255.0h) {
-      accumulatedOpacity = 1.0h;
+    if (accumulatedOpacity >= 1.0f - 1.0f / 255.0f) {
+      accumulatedOpacity = 1.0f;
       break;
     }
     if (currentT >= p.tTerminateMax) {
@@ -4508,7 +4519,7 @@ inline half4 marchVolumeUnified(
       sum = saturate(sum);
       finalColor = half4(sum, sum, sum, 1.0h);
     } else {
-      finalColor = half4(accumulatedColor, accumulatedOpacity);
+      finalColor = half4(half3(accumulatedColor), half(accumulatedOpacity));
     }
   } else if (fc_blendMode == 1) {   // MAXIMUM_INTENSITY_BLEND
     half4 c = sampleTransferFunction(transferFunctionTexture, float2(float(mipMaxScalar), 0.5));
@@ -4537,7 +4548,7 @@ inline half4 marchVolumeUnified(
     half sum = saturate(additiveSum);
     finalColor = half4(sum, sum, sum, 1.0h);
   } else {
-    finalColor = half4(accumulatedColor, accumulatedOpacity);
+    finalColor = half4(half3(accumulatedColor), half(accumulatedOpacity));
   }
 
   // Final color window/level (matches OpenGL raycasterfs.glsl finalizeRayCast):
