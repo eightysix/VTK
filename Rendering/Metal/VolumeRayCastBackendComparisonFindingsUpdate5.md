@@ -272,3 +272,32 @@ Metal-side-only changes.
 → `B` (seed) → `C` (skip) → `E` only if a measured residual remains. Each step is
 verified by re-running the lattice check (§3) and the variant/sample-distance
 captures before moving on.
+
+## 10. Status: option A implemented
+
+`A` is done. `SampleDistance` was promoted from `half` to full `float32`
+(`MetalShaders.metal` struct field and `vtkMetalGPUVolumeRayCastMapper.mm`
+mirror, offset 240; the unused `opacityPreIntegrationFactor` half that shared
+the 4-byte slot was dropped, so **all struct offsets are unchanged** —
+`static_assert(sizeof(VolumeMapperUniforms) == 1712)` still holds). The write
+site stores `static_cast<float>(actualSampleDistance / maxBoundsSize)` and
+`physicalSampleStep` reads it directly.
+
+Re-measured on the fixed-step camera-outside capture (sd = 0.5, same pixels as
+§3): the logged `stepSize` moved from the half-quantized `0.003513` to
+`0.003514`, and the per-step lattice drift against GL's `g_dirStep` dropped to
+the log's print-precision floor (≤ 6e-4 voxels/step, i.e. the `%f` truncation).
+An exact float32 simulation now gives:
+
+```
+GL   g_dirStep = [ 0.00053709 -0.00062803 -0.00340865]
+Metal evalStep = [ 0.00053709 -0.00062803 -0.00340865]
+per-step diff   = ~5e-11 texels   (relative ~1.1e-7)
+coherent accumulation over a 440-sample ray: <= 1e-4 voxels
+```
+
+The only step-level residual left is the mat-vec folding order (Metal
+`adjustedLin·(rayDir·boundsSize)·stepSize` vs GL
+`ip_inverseTextureDataAdjusted·rayDir·sampleDistance`), worth one ulp. Option A
+therefore removes the entire half-quantization residual; the next candidate for
+measurement is the seed phase (B) and the minmax-skip arithmetic (C).

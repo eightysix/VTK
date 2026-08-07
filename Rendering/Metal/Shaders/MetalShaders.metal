@@ -2692,8 +2692,7 @@ struct VolumeMapperUniforms {
   float4 volumeBoundsMax;
   float4 cameraVolumePos;
   float4x4 viewProjection;
-  half sampleDistance;
-  half opacityPreIntegrationFactor; // unused; pre-integration baked into TF on CPU. Kept for struct layout.
+  float sampleDistance;             // full float32 (OpenGL in_sampleDistance parity; was half)
   half scalarMin;
   half _pdSM;             // padding — was upper half of float scalarMin
   half scalarMax;
@@ -3010,7 +3009,7 @@ inline float physicalSampleStep(float3 rayDirNormSpace,
   float3 boundsSize = max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
   float  maxBound   = max(boundsSize.x, max(boundsSize.y, boundsSize.z));
   float  physPerNorm = length(rayDirNormSpace * boundsSize);
-  return float(u.sampleDistance) * maxBound / max(physPerNorm, 1e-6);
+  return u.sampleDistance * maxBound / max(physPerNorm, 1e-6);
 }
 
 // Honors vtkVolumeProperty::GetInterpolationType(): the OpenGL backend applies
@@ -3642,7 +3641,9 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
       all(abs(screenPos - float2(0.5, 256.5)) < 0.5) ||    // left border
       all(abs(screenPos - float2(511.5, 256.5)) < 0.5) ||  // right border
       all(abs(screenPos - float2(256.5, 2.5)) < 0.5) ||    // top border
-      all(abs(screenPos - float2(256.5, 510.5)) < 0.5);    // bottom
+      all(abs(screenPos - float2(256.5, 510.5)) < 0.5) ||  // bottom
+      all(abs(screenPos - float2(480.5, 508.5)) < 0.5) ||  // high-delta skin surface
+      all(abs(screenPos - float2(201.5, 13.5)) < 0.5);     // high-delta skin surface
   return (camOk && pxOk) || (camOkClip && pxOkClip) || pxOkAny || pxOkContained || pxOkLeft ||
          pxOkCamOut;
 }

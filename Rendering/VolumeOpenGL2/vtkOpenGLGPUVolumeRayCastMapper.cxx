@@ -3597,6 +3597,25 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::BindTransformations(
   // handle cell/point differences in tcoords
   prog->SetUniformMatrix4x4v("in_cellToPoint", numVolumes, this->CellToPointVec.data());
 
+  {
+    // TEMP DEBUG: dump the matrices that drive g_dirStep so the Metal backend
+    // can reproduce GL's step arithmetic exactly.
+    const float* it = this->InvTexMatVec.data();
+    const float* ct = this->CellToPointVec.data();
+    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_UNIFORMS nVol=" << numVolumes
+              << " sampleDist=" << this->ActualSampleDistance << "\n"
+              << "  invTexDataset=[" << it[0] << "," << it[1] << "," << it[2] << "," << it[3]
+              << "," << it[4] << "," << it[5] << "," << it[6] << "," << it[7] << "," << it[8]
+              << "," << it[9] << "," << it[10] << "," << it[11] << "," << it[12] << "," << it[13]
+              << "," << it[14] << "," << it[15] << "]\n"
+              << "  cellToPoint=[" << ct[0] << "," << ct[1] << "," << ct[2] << "," << ct[3] << ","
+              << ct[4] << "," << ct[5] << "," << ct[6] << "," << ct[7] << "," << ct[8] << ","
+              << ct[9] << "," << ct[10] << "," << ct[11] << "," << ct[12] << "," << ct[13] << ","
+              << ct[14] << "," << ct[15] << "]\n"
+              << "  eyePosObjs=(" << this->EyePosVec[0] << "," << this->EyePosVec[1] << ","
+              << this->EyePosVec[2] << ")\n";
+  }
+
   prog->SetUniform3fv(
     "in_texMin", numVolumes, reinterpret_cast<const float(*)[3]>(this->TexMinVec.data()));
   prog->SetUniform3fv(

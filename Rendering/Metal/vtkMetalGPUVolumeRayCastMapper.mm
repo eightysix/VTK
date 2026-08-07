@@ -94,8 +94,7 @@ struct VolumeMapperUniforms
   float VolumeBoundsMax[4];          // 144..159
   float CameraVolumePos[4];          // 160..175
   float ViewProjectionMatrix[16];    // 176..239
-  uint16_t SampleDistanceHalf;      // 240  (half precision: sufficient for [0,1] space)
-  uint16_t OpacityPreIntegrationFactorHalf; // 242  unused; pre-integration baked into TF on CPU. Kept for struct layout.
+  float SampleDistance;             // 240  (full float32; OpenGL in_sampleDistance parity. Was half + an unused half)
   uint16_t ScalarMinHalf;           // 244
   uint16_t _padSM;                  // 246
   uint16_t ScalarMaxHalf;           // 248
@@ -6646,15 +6645,12 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   double maxBoundsSize = std::max({ vb.Size[0], vb.Size[1], vb.Size[2] });
 
-  uniforms.SampleDistanceHalf =
-    FloatToHalf(static_cast<float>(actualSampleDistance / maxBoundsSize));
+  uniforms.SampleDistance = static_cast<float>(actualSampleDistance / maxBoundsSize);
 
   // Opacity pre-integration is baked into the transfer function texture
   // on the CPU at TF-build time (matches OpenGL backend).
-  // Set to 1.0 (no-op) in case any shader variant still reads this field.
   // Invariant: the march step's physical length equals actualSampleDistance,
-  // enforced in-shader by physicalSampleStep, matching this pre-integration factor.
-  uniforms.OpacityPreIntegrationFactorHalf = FloatToHalf(1.0f);
+  // enforced in-shader by physicalSampleStep.
 
   {
     float normFactor = this->ScalarNormalizationFactor;
