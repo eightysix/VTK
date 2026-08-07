@@ -3695,10 +3695,24 @@ inline half4 marchVolumeUnified(
   float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(p.rayDir * boundsSize, 0.0)).xyz;
   float3 texStep = rayDirTexLocal * p.stepSize;
   // Cell-to-point conversion factors, computed once (texel centers at (i+0.5)/dims).
+  // OpenGL CellToPointMatrix parity (vtkVolumeTexture::ComputeCellToPointMatrix):
+  // scale = (d-0.5)/d - 0.5/d, offset = 0.5/d, both float32 divisions -- NOT
+  // (d-1)/d, which can differ from GL's two-stage expression in the last ulp.
   float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
-  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpScale   = max((texelCount - 0.5) / texelCount - 0.5 / texelCount, 1e-4);
   float3 ctpOffset  = 0.5 / texelCount;
-  float3 evalStep = texStep * ctpScale;
+  // Advance evalPoint in GL's cell-to-point-adjusted texture space with GL's
+  // g_dirStep arithmetic: fold the cell-to-point scale into the dataset->texture
+  // matrix (GL's ip_inverseTextureDataAdjusted = in_cellToPoint *
+  // in_inverseTextureDatasetMatrix; since cellToPoint is diagonal, the linear 3x3
+  // of that product is the rows of volumeToTexture scaled by ctpScale), then one
+  // mat-vec times the dataset-space direction and one scalar multiply by the step.
+  // This removes the per-sample ctpScale re-multiply that accumulated rounding.
+  float3x3 adjustedLin = float3x3(
+      volumeUniforms.volumeToTexture[0].xyz * ctpScale,
+      volumeUniforms.volumeToTexture[1].xyz * ctpScale,
+      volumeUniforms.volumeToTexture[2].xyz * ctpScale);
+  float3 evalStep = (adjustedLin * (p.rayDir * boundsSize)) * p.stepSize;
 
   // Lighting directions must live in the same (physical/data) space as the
   // gradient normal: the normal is expressed per world-unit (the gradient is
@@ -3750,7 +3764,9 @@ inline half4 marchVolumeUnified(
   float3 stepVec = p.rayDir * p.stepSize;
   float3 currentPoint = p.rayOrigin + p.rayDir * (p.checkBounds ? p.tStart : 0.0)
                       + p.rayDir * firstT;
-  float currentT = firstT;
+  // Integer step counter (OpenGL g_currentT parity: ++g_currentT per sample).
+  // The ray distance is recovered as firstT + currentT * p.stepSize.
+  int currentT = 0;
 
   int maxSteps = max(1, int(ceil((p.tEnd - firstT) / p.stepSize)));
 
@@ -3837,7 +3853,7 @@ inline half4 marchVolumeUnified(
 
   int lastIter = -1;
   for (int i = 0; i < maxSteps; i++) {
-    if (!p.checkBounds && currentT >= p.tEnd - 1e-6) break;
+    if (!p.checkBounds && currentT >= maxSteps) break;
 
     // The proxy box spans the axis-aligned bounds of the rotated volume, so
     // rays through its corner regions fall outside the [0,1]^3 texture cube.
@@ -3883,13 +3899,15 @@ inline half4 marchVolumeUnified(
 
         float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
         exactSkip += 1e-4;
-        float skipDist = ceil(exactSkip / p.stepSize) * p.stepSize;
-        skipDist = max(p.stepSize, skipDist);
+        // Skip an integer number of steps; keep the float distance consistent
+        // with the integer counter (skipDist == skipSteps * p.stepSize).
+        int skipSteps = max(1, int(ceil(exactSkip / p.stepSize)));
+        float skipDist = float(skipSteps) * p.stepSize;
 
         currentPoint += p.rayDir * skipDist;
-        currentT += skipDist;
+        currentT += skipSteps;
 
-        if (p.checkBounds && (any(currentPoint < p.blockMinGlobal - 1e-4) || any(currentPoint > p.blockMaxGlobal + 1e-4) || currentT >= p.tEnd)) {
+        if (p.checkBounds && (any(currentPoint < p.blockMinGlobal - 1e-4) || any(currentPoint > p.blockMaxGlobal + 1e-4) || currentT >= maxSteps)) {
           break;
         }
 
@@ -3949,7 +3967,7 @@ inline half4 marchVolumeUnified(
     // shifts the fence edges by ~half a texel vs the baseline.
     if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, evalPoint))) == 0u)) {
       currentPoint += stepVec;
-      currentT += p.stepSize;
+      currentT += 1;
       texLocalPos += texStep;
       evalPoint += evalStep;
       prefetchValid = false;
@@ -3963,7 +3981,7 @@ inline half4 marchVolumeUnified(
       float binMask = rawMask * maskScale + maskBias;
       if (binMask <= 0.0) {
         currentPoint += stepVec;
-        currentT += p.stepSize;
+        currentT += 1;
         texLocalPos += texStep;
         evalPoint += evalStep;
         prefetchValid = false;
@@ -4000,7 +4018,7 @@ inline half4 marchVolumeUnified(
       }
       if (blanked) {
         currentPoint += stepVec;
-        currentT += p.stepSize;
+        currentT += 1;
         texLocalPos += texStep;
         evalPoint += evalStep;
         prefetchValid = false;
@@ -4141,7 +4159,7 @@ inline half4 marchVolumeUnified(
 #if defined(VTK_METAL_ENABLE_LOGGING)
     if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
       os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG SAMPLE px=(%d, %d) i=%d t=%f tex=(%f, %f, %f) eval=(%f, %f, %f) raw=%f norm=%f op=%f mip=%f rgb=(%f, %f, %f) w=%f accA=%f accC=(%f, %f, %f) maxSteps=%d termMax=%f",
-          int(p.screenPos.x), int(p.screenPos.y), i, currentT,
+          int(p.screenPos.x), int(p.screenPos.y), i, firstT + float(currentT) * p.stepSize,
           texLocalPos.x, texLocalPos.y, texLocalPos.z,
           evalPoint.x, evalPoint.y, evalPoint.z,
           rawScalar, float(scalarNorm), float(sampleOpacity), float(mipMaxScalar),
@@ -4440,7 +4458,7 @@ inline half4 marchVolumeUnified(
     }
 
     currentPoint += stepVec;
-    currentT += p.stepSize;
+    currentT += 1;
     texLocalPos += texStep;
     evalPoint += evalStep;
     lastIter = i;
@@ -4459,7 +4477,7 @@ inline half4 marchVolumeUnified(
       accumulatedOpacity = 1.0f;
       break;
     }
-    if (currentT >= p.tTerminateMax) {
+    if (firstT + float(currentT) * p.stepSize >= p.tTerminateMax) {
       break;
     }
     if (p.checkBounds && (any(currentPoint < p.blockMinGlobal - 1e-4) || any(currentPoint > p.blockMaxGlobal + 1e-4))) {
