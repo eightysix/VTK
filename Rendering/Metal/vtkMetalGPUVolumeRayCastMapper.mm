@@ -3738,23 +3738,19 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
     {
       id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
 
-      // Build 256-entry gradient opacity lookup table.
-      // Range: [0, 0.25 * scalarRange] — matches the normalization in the shader
-      // where gradient magnitude is normalized to [0, 0.25 * dataRange].
+      // Gradient opacity LUT parity with
+      // vtkOpenGLVolumeGradientOpacityTable::InternalUpdate: a single-channel
+      // float table whose width is the GL table width
+      // (GetMaximumSupportedTextureWidth over EstimateMinNumberOfSamples of
+      // the full component range — 1024 for typical functions), sampled over
+      // [0, 0.25 * scalarRange] by the shader-normalized gradient magnitude.
+      // The old 256-entry RGBA8Unorm build quantized the table to 8 bits,
+      // which near the steep knee of a gradient-opacity ramp turned small
+      // gradW differences into full LUT levels.
+      const int tfWidth = ComputeTransferFunctionWidth(nullptr, gradOpacityFunc, gradRange);
 
-      unsigned char gradData[256 * 4]; // RGBA8Unorm (R channel used)
-      double table[256];
-      gradOpacityFunc->GetTable(0.0, gradMax, 256, table);
-
-      for (int i = 0; i < 256; ++i)
-      {
-        unsigned char val =
-          static_cast<unsigned char>(std::max(0.0, std::min(1.0, table[i])) * 255.0);
-        gradData[i * 4 + 0] = val;
-        gradData[i * 4 + 1] = val;
-        gradData[i * 4 + 2] = val;
-        gradData[i * 4 + 3] = 255;
-      }
+      std::vector<float> gradData(static_cast<size_t>(tfWidth));
+      gradOpacityFunc->GetTable(0.0, gradMax, tfWidth, gradData.data());
 
       // Swap (not in-place update) — see UpdateTransferFunctionTexture for
       // the full rationale: in-flight GPU frames may still be sampling the
@@ -3763,8 +3759,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
 
       id<MTLTexture> tex = NewTexture2D(
         device,
-        MTLPixelFormatRGBA8Unorm,
-        256, 1,
+        MTLPixelFormatR32Float,
+        static_cast<NSUInteger>(tfWidth), 1,
         MTLTextureUsageShaderRead,
         MTLStorageModeShared);
       if (!tex)
@@ -3774,11 +3770,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
       }
       AssignMetalObject(this->GradientOpacityTexture, tex);
 
-      MTLRegion region = MTLRegionMake2D(0, 0, 256, 1);
+      MTLRegion region = MTLRegionMake2D(0, 0, static_cast<NSUInteger>(tfWidth), 1);
       [tex replaceRegion:region
             mipmapLevel:0
-              withBytes:gradData
-            bytesPerRow:256 * 4];
+              withBytes:gradData.data()
+            bytesPerRow:static_cast<NSUInteger>(tfWidth) * 4];
 
       this->LastGradientOpacityScalarRange[0] = gradRange[0];
       this->LastGradientOpacityScalarRange[1] = gradRange[1];
