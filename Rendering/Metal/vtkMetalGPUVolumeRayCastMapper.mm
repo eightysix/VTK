@@ -6550,6 +6550,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     uniforms.CameraInsideNearPlaneOrigin[0] = NormalizeToVolumeSpace(vb, 0, pOrigin[0]);
     uniforms.CameraInsideNearPlaneOrigin[1] = NormalizeToVolumeSpace(vb, 1, pOrigin[1]);
     uniforms.CameraInsideNearPlaneOrigin[2] = NormalizeToVolumeSpace(vb, 2, pOrigin[2]);
+    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG METAL_NEARPLANE origin=(" << pOrigin[0] << ", "
+              << pOrigin[1] << ", " << pOrigin[2] << ") normal=(" << pNormalV[0] << ", "
+              << pNormalV[1] << ", " << pNormalV[2] << ") volumePos=("
+              << uniforms.CameraVolumePos[0] << ", " << uniforms.CameraVolumePos[1] << ", "
+              << uniforms.CameraVolumePos[2] << ")" << std::endl;
 
     // Normal in normalized volume space: componentwise scaled by the bounds size
     // (the [0,1] frame stretches each axis by 1/Size), then renormalized.

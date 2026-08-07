@@ -3565,6 +3565,10 @@ inline RaySetup setupVolumeRay(
         }
         s.totalDist = length(s.exitPoint - s.entryPoint);
         if (s.totalDist < 1e-6) return s;
+        // totalBoxT must reflect the clipped entry/exit: it is the march length
+        // passed to marchVolume as p.tEnd. Ray dir is unit length, so the chord
+        // length equals the traversal time along rayDir.
+        s.totalBoxT = s.totalDist;
     }
 
     s.tTerminateMax = 1e30;
@@ -3611,7 +3615,12 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
       all(abs(screenPos - float2(17.5, 1.5)) < 0.5) ||
       all(abs(screenPos - float2(50.5, 15.5)) < 0.5) ||
       all(abs(screenPos - float2(150.5, 150.5)) < 0.5);
-  return camOk && pxOk;
+  // TEMP DEBUG: ClippingUserTransform proxy path (parallel, camera outside).
+  bool camOkClip = all(abs(dc - float3(0.5, 3.141854, 0.5)) < 1e-3);
+  bool pxOkClip = all(abs(screenPos - float2(250.5, 250.5)) < 0.5);
+  // TEMP DEBUG: CameraInsideTransformation (camera inside rotated volume).
+  bool pxOkAny = all(abs(screenPos - float2(256.5, 256.5)) < 0.5);
+  return (camOk && pxOk) || (camOkClip && pxOkClip) || pxOkAny;
 }
 
 inline half4 marchVolumeUnified(
@@ -3775,12 +3784,18 @@ inline half4 marchVolumeUnified(
 
   // DEBUG: one header per gated fragment (test builds only).
 #if defined(VTK_METAL_ENABLE_LOGGING)
-  if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
-    os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG MARCH px=(%d, %d) camera=(%f, %f, %f) rayDir=(%f, %f, %f) tStart=%f tEnd=%f stepSize=%f firstT=%f jitter=%f entry=(%f, %f, %f) scalarMin=%f scalarMax=%f texelCount=(%f, %f, %f) texelDims=(%u, %u, %u)",
+    if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
+    os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG MARCH px=(%d, %d) camera=(%f, %f, %f) rayDir=(%f, %f, %f) tStart=%f tEnd=%f useClip=%f nClip=%f p0o=(%f, %f, %f) p0n=(%f, %f, %f) p1o=(%f, %f, %f) p1n=(%f, %f, %f) stepSize=%f firstT=%f jitter=%f entry=(%f, %f, %f) scalarMin=%f scalarMax=%f texelCount=(%f, %f, %f) texelDims=(%u, %u, %u)",
         int(p.screenPos.x), int(p.screenPos.y),
         volumeUniforms.cameraVolumePos.x, volumeUniforms.cameraVolumePos.y, volumeUniforms.cameraVolumePos.z,
         p.rayDir.x, p.rayDir.y, p.rayDir.z,
-        p.tStart, p.tEnd, p.stepSize, firstT, p.jitter,
+        p.tStart, p.tEnd,
+        float(volumeUniforms.useClipping), float(volumeUniforms.numClippingPlanes),
+        volumeUniforms.clippingPlane0Origin.x, volumeUniforms.clippingPlane0Origin.y, volumeUniforms.clippingPlane0Origin.z,
+        volumeUniforms.clippingPlane0Normal.x, volumeUniforms.clippingPlane0Normal.y, volumeUniforms.clippingPlane0Normal.z,
+        volumeUniforms.clippingPlane1Origin.x, volumeUniforms.clippingPlane1Origin.y, volumeUniforms.clippingPlane1Origin.z,
+        volumeUniforms.clippingPlane1Normal.x, volumeUniforms.clippingPlane1Normal.y, volumeUniforms.clippingPlane1Normal.z,
+        p.stepSize, firstT, p.jitter,
         p.rayOrigin.x + p.rayDir.x * p.tStart,
         p.rayOrigin.y + p.rayDir.y * p.tStart,
         p.rayOrigin.z + p.rayDir.z * p.tStart,
@@ -4094,11 +4109,11 @@ inline half4 marchVolumeUnified(
     // DEBUG: per-sample march data (test builds only).
 #if defined(VTK_METAL_ENABLE_LOGGING)
     if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
-      os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG SAMPLE px=(%d, %d) i=%d tex=(%f, %f, %f) eval=(%f, %f, %f) raw=%f norm=%f op=%f rgb=(%f, %f, %f)",
-          int(p.screenPos.x), int(p.screenPos.y), i,
+      os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG SAMPLE px=(%d, %d) i=%d t=%f tex=(%f, %f, %f) eval=(%f, %f, %f) raw=%f norm=%f op=%f mip=%f rgb=(%f, %f, %f)",
+          int(p.screenPos.x), int(p.screenPos.y), i, currentT,
           texLocalPos.x, texLocalPos.y, texLocalPos.z,
           evalPoint.x, evalPoint.y, evalPoint.z,
-          rawScalar, float(scalarNorm), float(sampleOpacity),
+          rawScalar, float(scalarNorm), float(sampleOpacity), float(mipMaxScalar),
           float(colorOpacity.r), float(colorOpacity.g), float(colorOpacity.b));
     }
 #endif
@@ -4318,6 +4333,24 @@ inline half4 marchVolumeUnified(
           normal = sharedGrad.xyz;
         }
 
+        // TEMP DEBUG: lighting per-sample values (test builds only).
+#if defined(VTK_METAL_ENABLE_LOGGING)
+        if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
+          half nDotLDbg = dot(normal, viewDirHalf);
+          os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG LIGHT px=(%d, %d) i=%d raw=%f norm=%f opIn=%f gradW=%f gradOp=%f nDotL=%f amb=(%f, %f, %f) dif=(%f, %f, %f) spe=(%f, %f, %f) colBefore=(%f, %f, %f) colAfter=(%f, %f, %f) vd=(%f, %f, %f)",
+              int(p.screenPos.x), int(p.screenPos.y), i,
+              rawScalar, float(scalarNorm), float(sampleOpacity),
+              float(sharedGrad.w), float(sampleGradientOpacity(gradientOpacityTexture, float(sharedGrad.w))),
+              float(nDotLDbg),
+              float(ambientMat.x), float(ambientMat.y), float(ambientMat.z),
+              float(diffuseMat.x), float(diffuseMat.y), float(diffuseMat.z),
+              float(specularMat.x), float(specularMat.y), float(specularMat.z),
+              float(colorOpacity.r), float(colorOpacity.g), float(colorOpacity.b),
+              float(sampleColor.r), float(sampleColor.g), float(sampleColor.b),
+              float(viewDirHalf.x), float(viewDirHalf.y), float(viewDirHalf.z));
+        }
+#endif
+
         if (lightUniforms != nullptr && lightUniforms->defaultLighting == 0) {
           sampleColor = computeVolumeLighting(sampleColor, normal, -viewDirHalf,
               ambientMat, diffuseMat, specularMat, shininessMat,
@@ -4330,6 +4363,17 @@ inline half4 marchVolumeUnified(
           sampleColor = computePhongLightingVolumeFast(sampleColor, normal, -viewDirHalf, -viewDirHalf,
               ambientMat, diffuseMat, specularMat, shininessMat, twoSided);
         }
+
+        // TEMP DEBUG (after lighting applied).
+#if defined(VTK_METAL_ENABLE_LOGGING)
+        if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
+          os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG LIGHT2 px=(%d, %d) i=%d nDotL=%f litBefore=(%f, %f, %f) litAfter=(%f, %f, %f)",
+              int(p.screenPos.x), int(p.screenPos.y), i,
+              float(dot(normal, viewDirHalf)),
+              float(colorOpacity.r), float(colorOpacity.g), float(colorOpacity.b),
+              float(sampleColor.r), float(sampleColor.g), float(sampleColor.b));
+        }
+#endif
       } else if (doShading) {
         sampleColor = ambientMat * sampleColor;
       }
@@ -4513,6 +4557,7 @@ inline void marchSegment(
     float stepSize,
     float jitter,
     float tTerminateMax,
+    float2 screenPos,
     thread half3& accumulatedColor,
     thread half& accumulatedOpacity,
     constant VolumeMapperUniforms& volumeUniforms,
@@ -4536,7 +4581,7 @@ inline void marchSegment(
   float3 zero = float3(0.0);
   float3 one = float3(1.0);
   MarchParams p = {rayOrigin, rayDir, t0, t1, stepSize, jitter, tTerminateMax,
-      zero, one, zero, one, float2(-1.0), false};
+      zero, one, zero, one, screenPos, false};
   half4 result = marchVolumeUnified(p, accumulatedColor, accumulatedOpacity,
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
@@ -5172,6 +5217,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
                     rayOrigin, rayDir,
                     segmentT0, segmentT1,
                     stepSize, jitter, tTerminateMax,
+                    in.position.xy,
                     color, opacity,
                     volumeUniforms, b,
                     volumeTexture, transferFunctionTexture,

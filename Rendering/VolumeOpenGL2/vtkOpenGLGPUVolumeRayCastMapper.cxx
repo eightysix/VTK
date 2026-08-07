@@ -1206,6 +1206,9 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::RenderVolumeGeometry(
 
       nearPlane->SetOrigin(pOrigin);
       nearPlane->SetNormal(pNormalV);
+      std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_NEARPLANE origin=(" << pOrigin[0] << ", "
+                << pOrigin[1] << ", " << pOrigin[2] << ") normal=(" << pNormalV[0] << ", "
+                << pNormalV[1] << ", " << pNormalV[2] << ")" << std::endl;
 
       vtkNew<vtkPlaneCollection> planes;
       planes->RemoveAllItems();
