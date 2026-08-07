@@ -8,7 +8,9 @@
 #include "vtkCamera.h"
 #include "vtkColorTransferFunction.h"
 #include "vtkGPUVolumeRayCastMapper.h"
+#include "vtkImageData.h"
 #include "vtkImageResize.h"
+#include "vtkPointData.h"
 #include "vtkInteractorStyleTrackballCamera.h"
 #include "vtkNew.h"
 #include "vtkPiecewiseFunction.h"
@@ -49,6 +51,20 @@ int TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransform(int argc,
   resample->SetResizeMethodToOutputDimensions();
   resample->SetOutputDimensions(512, 512, 512);
   resample->Update();
+  {
+    vtkImageData* out = resample->GetOutput();
+    vtkDataArray* sa = out->GetPointData()->GetScalars();
+    double r[2];
+    sa->GetRange(r);
+    double fr[2];
+    sa->GetFiniteRange(fr);
+    const unsigned short* sp = static_cast<const unsigned short*>(sa->GetVoidPointer(0));
+    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG TEST_RESAMPLE dt=" << sa->GetDataType()
+              << " dims=" << out->GetDimensions()[0] << "x" << out->GetDimensions()[1] << "x"
+              << out->GetDimensions()[2] << " range=(" << r[0] << "," << r[1]
+              << ") finite=(" << fr[0] << "," << fr[1] << ") first=" << sp[0] << " "
+              << sp[1] << " " << sp[65536] << std::endl;
+  }
 
   // Prepare TFs
   vtkNew<vtkColorTransferFunction> ctf;

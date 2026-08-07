@@ -1216,10 +1216,31 @@ static void FillTransferFunctionRGBA8(
   }
 }
 
-// Fill a RGBA8 transfer function row with CPU-side opacity pre-integration,
-// matching the OpenGL backend's approach (vtkOpenGLVolumeOpacityTable::InternalUpdate).
-// COMPOSITE blend only; additive blend would need a *= factor instead of pow.
-// preIntegrationFactor = sampleDistance / unitDistance.
+// Apply the OpenGL backend's blend-mode-specific opacity correction
+// (vtkOpenGLVolumeOpacityTable::InternalUpdate): COMPOSITE pre-integrates the
+// opacity with 1 - (1-a)^factor, ADDITIVE scales it by factor, and all other
+// blend modes (MIP/MinIP/Average) use the raw table values.
+static double ApplyOpacityBlendCorrection(double a, double factor, int blendMode)
+{
+  if (a <= 0.0001 || factor <= 0.0)
+  {
+    return a;
+  }
+  if (blendMode == vtkVolumeMapper::COMPOSITE_BLEND)
+  {
+    return 1.0 - std::pow(1.0 - a, factor);
+  }
+  if (blendMode == vtkVolumeMapper::ADDITIVE_BLEND)
+  {
+    return a * factor;
+  }
+  return a;
+}
+
+// Fill a RGBA8 transfer function row with the blend-mode-dependent opacity
+// correction, matching the OpenGL backend's approach
+// (vtkOpenGLVolumeOpacityTable::InternalUpdate). COMPOSITE pre-integrates with
+// 1 - (1-a)^factor, ADDITIVE scales by factor, all other blend modes are raw.
 static void FillTransferFunctionRGBA8WithPreIntegration(
   vtkColorTransferFunction* colorFunc,
   vtkPiecewiseFunction* opacityFunc,
@@ -1227,7 +1248,8 @@ static void FillTransferFunctionRGBA8WithPreIntegration(
   double scalarMax,
   int width,
   uint8_t* row,
-  double preIntegrationFactor)
+  double factor,
+  int blendMode)
 {
   std::vector<double> rgb(width * 3);
   std::vector<double> alpha(width);
@@ -1235,11 +1257,7 @@ static void FillTransferFunctionRGBA8WithPreIntegration(
   opacityFunc->GetTable(scalarMin, scalarMax, width, alpha.data());
   for (int i = 0; i < width; ++i)
   {
-    double a = alpha[i];
-    if (a > 0.0001 && preIntegrationFactor > 0.0)
-    {
-      a = 1.0 - std::pow(1.0 - a, preIntegrationFactor);
-    }
+    double a = ApplyOpacityBlendCorrection(alpha[i], factor, blendMode);
     row[i * 4 + 0] = ColorToByte(rgb[i * 3 + 0]);
     row[i * 4 + 1] = ColorToByte(rgb[i * 3 + 1]);
     row[i * 4 + 2] = ColorToByte(rgb[i * 3 + 2]);
@@ -1247,12 +1265,12 @@ static void FillTransferFunctionRGBA8WithPreIntegration(
   }
 }
 
-// Fill a RGBA16Float transfer function row with CPU-side opacity pre-integration,
-// matching the OpenGL backend's approach (vtkOpenGLVolumeOpacityTable::InternalUpdate).
-// Unlike the RGBA8 variant, the alpha channel retains full float precision so
-// that low-opacity transfer functions (e.g. 0.005 max opacity) do not round to
-// zero after the 8-bit quantization step. COMPOSITE blend only; additive blend
-// would need a *= factor instead of pow.
+// Fill a RGBA16Float transfer function row with the blend-mode-dependent
+// opacity correction, matching the OpenGL backend's approach
+// (vtkOpenGLVolumeOpacityTable::InternalUpdate). Unlike the RGBA8 variant, the
+// alpha channel retains full float precision so that low-opacity transfer
+// functions (e.g. 0.005 max opacity) do not round to zero after the 8-bit
+// quantization step.
 static void FillTransferFunctionRGBA16FWithPreIntegration(
   vtkColorTransferFunction* colorFunc,
   vtkPiecewiseFunction* opacityFunc,
@@ -1262,7 +1280,8 @@ static void FillTransferFunctionRGBA16FWithPreIntegration(
   double opacityMax,
   int width,
   uint16_t* row,
-  double preIntegrationFactor)
+  double factor,
+  int blendMode)
 {
   std::vector<double> rgb(width * 3);
   std::vector<double> alpha(width);
@@ -1270,11 +1289,7 @@ static void FillTransferFunctionRGBA16FWithPreIntegration(
   opacityFunc->GetTable(opacityMin, opacityMax, width, alpha.data());
   for (int i = 0; i < width; ++i)
   {
-    double a = alpha[i];
-    if (a > 0.0001 && preIntegrationFactor > 0.0)
-    {
-      a = 1.0 - std::pow(1.0 - a, preIntegrationFactor);
-    }
+    double a = ApplyOpacityBlendCorrection(alpha[i], factor, blendMode);
     row[i * 4 + 0] = FloatToHalf(static_cast<float>(std::clamp(rgb[i * 3 + 0], 0.0, 1.0)));
     row[i * 4 + 1] = FloatToHalf(static_cast<float>(std::clamp(rgb[i * 3 + 1], 0.0, 1.0)));
     row[i * 4 + 2] = FloatToHalf(static_cast<float>(std::clamp(rgb[i * 3 + 2], 0.0, 1.0)));
@@ -1294,11 +1309,12 @@ static void FillTransferFunctionRGBA16FWithPreIntegration(
   double scalarMax,
   int width,
   uint16_t* row,
-  double preIntegrationFactor)
+  double factor,
+  int blendMode)
 {
   FillTransferFunctionRGBA16FWithPreIntegration(
     colorFunc, opacityFunc, scalarMin, scalarMax, scalarMin, scalarMax,
-    width, row, preIntegrationFactor);
+    width, row, factor, blendMode);
 }
 
 // Compute the transfer function table width using the same rule as the OpenGL
@@ -3455,6 +3471,13 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
 
   bool sampleDistChanged =
     (actualSampleDistance != this->LastTransferFunctionSampleDist);
+  // The opacity correction applied at table-build time depends on the blend
+  // mode (OpenGL vtkOpenGLVolumeOpacityTable::NeedsUpdate tracks LastBlendMode):
+  // COMPOSITE pre-integrates, ADDITIVE scales, MIP/MinIP/Average stay raw. A
+  // blend-mode change must therefore rebuild the table even when the transfer
+  // functions themselves are unchanged.
+  bool blendModeChanged =
+    (this->GetBlendMode() != this->LastTransferFunctionBlendMode);
 
   // Primary change detection uses the pre-existing table range (widthRange): it
   // equals the color range for every path except dependent RGBA, where the RGB
@@ -3475,6 +3498,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
   doReload |= (opacityFunc->GetMTime() > this->TransferFunctionUploadTime.GetMTime());
   doReload |= scalarRangeChanged;
   doReload |= sampleDistChanged;
+  doReload |= blendModeChanged;
 
   if (doReload)
   {
@@ -3498,12 +3522,16 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
       id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
 
       std::vector<uint16_t> tfData(static_cast<size_t>(tfWidth) * 4);
+      std::cerr << "VTK_METAL_VOLUME_LOG DEBUG MTL_OPTABLE range=(" << colorRange[0] << ","
+                << colorRange[1] << ") width=" << tfWidth
+                << " sampleDist=" << actualSampleDistance << " unitDist=" << unitDist
+                << " preIntFactor=" << preIntegrationFactor << std::endl;
       FillTransferFunctionRGBA16FWithPreIntegration(
         colorFunc, opacityFunc,
         colorRange[0], colorRange[1],
         opacityRange[0], opacityRange[1],
         tfWidth, tfData.data(),
-        preIntegrationFactor);
+        preIntegrationFactor, this->GetBlendMode());
 
       // Swap rather than rewrite: in-flight frames on the GPU may still be
       // sampling the old texture.  Metal command buffers retain a strong
@@ -3541,6 +3569,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
       this->LastTransferFunctionOpacityScalarRange[0] = opacityRange[0];
       this->LastTransferFunctionOpacityScalarRange[1] = opacityRange[1];
       this->LastTransferFunctionSampleDist = actualSampleDistance;
+      this->LastTransferFunctionBlendMode = this->GetBlendMode();
       this->TransferFunctionUploadTime.Modified();
     }
   }
@@ -3567,7 +3596,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
     }
 
     bool doCompReload = (this->ComponentTransferFunctionTexture1 == nullptr) ||
-      compChanged || compRangeChanged;
+      compChanged || compRangeChanged || blendModeChanged;
     for (int c = 1; c < std::min(4, this->VolumeNumComponents); ++c)
     {
       vtkColorTransferFunction* cf = property->GetRGBTransferFunction(c);
@@ -3613,7 +3642,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
             cf, of,
             this->ComponentScalarRange[c][0], this->ComponentScalarRange[c][1],
             tfWidth, tfData.data(),
-            preIntegrationFactor);
+            preIntegrationFactor, this->GetBlendMode());
 
           // Swap rather than rewrite — see the single-path block above.
           ReleaseMetalObject(*static_cast<void**>(compSlots[c - 1]));
@@ -6215,6 +6244,18 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   if (scalars)
   {
     scalars->GetRange(this->ScalarRange, 0);
+    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG MTL_GETRANGE dt=" << scalars->GetDataType()
+              << " tuples=" << scalars->GetNumberOfTuples()
+              << " range=(" << this->ScalarRange[0] << "," << this->ScalarRange[1] << ")"
+              << " finite=(" << scalars->GetFiniteRange(0)[0] << ","
+              << scalars->GetFiniteRange(0)[1] << ")"
+              << " pt=" << scalars->GetNumberOfComponents() << std::endl;
+    {
+      const unsigned short* p = static_cast<const unsigned short*>(scalars->GetVoidPointer(0));
+      std::cerr << "VTK_METAL_VOLUME_LOG DEBUG MTL_FIRSTVALS " << p[0] << " " << p[1] << " "
+                << p[2] << " " << p[1000] << " " << p[65536] << " " << p[134217728 - 1]
+                << std::endl;
+    }
     // Per-component scalar ranges for the independent multi-component path
     // (OpenGL ScalarRange[n] parity).
     const int numComp = scalars->GetNumberOfComponents();
@@ -6617,6 +6658,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   {
     float normFactor = this->ScalarNormalizationFactor;
+    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG MTL_UNIFORM_SCALAR range=(" << this->ScalarRange[0]
+              << "," << this->ScalarRange[1] << ") normFactor=" << normFactor << std::endl;
     uniforms.ScalarMinHalf = FloatToHalf(static_cast<float>(this->ScalarRange[0] / normFactor));
     uniforms.ScalarMaxHalf = FloatToHalf(static_cast<float>(
       (this->ScalarRange[1] > this->ScalarRange[0]

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "vtkOpenGLVolumeOpacityTable.h"
 
+#include <iostream>
+
 #include "vtkObjectFactory.h"
 #include "vtkOpenGLRenderWindow.h"
 #include "vtkPiecewiseFunction.h"
@@ -22,6 +24,11 @@ void vtkOpenGLVolumeOpacityTable::InternalUpdate(
   }
 
   scalarOpacity->GetTable(this->LastRange[0], this->LastRange[1], this->TextureWidth, this->Table);
+  std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_OPTABLE range=(" << this->LastRange[0] << ","
+            << this->LastRange[1] << ") width=" << this->TextureWidth
+            << " sampleDist=" << sampleDistance << " unitDist=" << unitDistance
+            << " table[25%]=" << this->Table[this->TextureWidth / 4]
+            << " table[50%]=" << this->Table[this->TextureWidth / 2] << std::endl;
 
   // Correct the opacity array for the spacing between the planes if we
   // are using a composite blending operation

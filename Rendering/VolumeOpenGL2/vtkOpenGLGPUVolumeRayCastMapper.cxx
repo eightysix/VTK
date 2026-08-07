@@ -1544,6 +1544,10 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::UpdateSamplingDistance(
     }
   }
 
+  std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_SAMPLING autoAdjust="
+            << this->Parent->AutoAdjustSampleDistances
+            << " lock=" << this->Parent->LockSampleDistanceToInputSpacing
+            << " sampleDistance=" << this->Parent->SampleDistance << std::endl;
   if (!this->Parent->AutoAdjustSampleDistances)
   {
     if (this->Parent->LockSampleDistanceToInputSpacing)
@@ -1572,6 +1576,8 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::UpdateSamplingDistance(
     }
 
     this->ActualSampleDistance = this->Parent->SampleDistance;
+    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_SAMPLING_RESULT !autoAdjust actual="
+              << this->ActualSampleDistance << std::endl;
   }
   else
   {
@@ -1598,6 +1604,10 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::UpdateSamplingDistance(
     // To go faster (reduceFactor<1.0), we multiply this distance
     // by 1/reduceFactor.
     this->ActualSampleDistance = static_cast<float>(minWorldSpacing);
+    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_SAMPLING_RESULT autoAdjust actual="
+              << this->ActualSampleDistance
+              << " minWorldSpacing=" << minWorldSpacing
+              << " reduction=" << this->Parent->ReductionFactor << std::endl;
 
     if (this->Parent->ReductionFactor < 1.0 && this->Parent->ReductionFactor != 0.0)
     {
@@ -3632,6 +3642,12 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::SetVolumeShaderParameters(
       scalePtr = &volTex->Scale;
       biasPtr = &volTex->Bias;
     }
+    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_TEX scale=(" << (*scalePtr)[0] << ","
+              << (*scalePtr)[1] << "," << (*scalePtr)[2] << "," << (*scalePtr)[3]
+              << ") bias=(" << (*biasPtr)[0] << "," << (*biasPtr)[1] << "," << (*biasPtr)[2]
+              << "," << (*biasPtr)[3] << ") scalarRange=(" << volTex->ScalarRange[0][0] << ","
+              << volTex->ScalarRange[0][1] << ") handleLarge=" << volTex->HandleLargeDataTypes
+              << std::endl;
     vtkInternal::CopyVector<float, 4>(*scalePtr, this->ScaleVec.data(), index * 4);
     vtkInternal::CopyVector<float, 4>(*biasPtr, this->BiasVec.data(), index * 4);
     vtkInternal::CopyVector<float, 3>(block->CellStep, this->StepVec.data(), index * 3);

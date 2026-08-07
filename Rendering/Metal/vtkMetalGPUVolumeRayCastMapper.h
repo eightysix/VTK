@@ -318,6 +318,7 @@ private:
   // A over the last component's range. Track the opacity-range half separately.
   double LastTransferFunctionOpacityScalarRange[2] = { 0.0, 0.0 };
   double LastTransferFunctionSampleDist = -1.0;
+  int LastTransferFunctionBlendMode = vtkVolumeMapper::COMPOSITE_BLEND;
   double LastGradientOpacityScalarRange[2] = { 0.0, 0.0 };
   double LastLabelMapScalarRange[2] = { 0.0, 0.0 };
   void ComputeReductionFactor(double allocatedTime);

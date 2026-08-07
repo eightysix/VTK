@@ -3620,7 +3620,11 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
   bool pxOkClip = all(abs(screenPos - float2(250.5, 250.5)) < 0.5);
   // TEMP DEBUG: CameraInsideTransformation (camera inside rotated volume).
   bool pxOkAny = all(abs(screenPos - float2(256.5, 256.5)) < 0.5);
-  return (camOk && pxOk) || (camOkClip && pxOkClip) || pxOkAny;
+  // TEMP DEBUG: NoShadeNoGradOpNoTransform camera-inside divergent pixels.
+  bool pxOkContained =
+      all(abs(screenPos - float2(372.5, 131.5)) < 0.5) ||
+      all(abs(screenPos - float2(422.5, 92.5)) < 0.5);
+  return (camOk && pxOk) || (camOkClip && pxOkClip) || pxOkAny || pxOkContained;
 }
 
 inline half4 marchVolumeUnified(
@@ -4473,6 +4477,15 @@ inline half4 marchVolumeUnified(
   } else if (fc_blendMode == 1) {   // MAXIMUM_INTENSITY_BLEND
     half4 c = sampleTransferFunction(transferFunctionTexture, float2(float(mipMaxScalar), 0.5));
     finalColor = half4(c.rgb * c.a, c.a);
+#if defined(VTK_METAL_ENABLE_LOGGING)
+    if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
+      os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG MIPFINAL px=(%d, %d) mip=%f c=(%f, %f, %f, %f) out=(%f, %f, %f)",
+          int(p.screenPos.x), int(p.screenPos.y),
+          float(mipMaxScalar),
+          float(c.r), float(c.g), float(c.b), float(c.a),
+          float(finalColor.r), float(finalColor.g), float(finalColor.b));
+    }
+#endif
   } else if (fc_blendMode == 2) {  // MINIMUM_INTENSITY_BLEND
     half4 c = sampleTransferFunction(transferFunctionTexture, float2(float(minipMinScalar), 0.5));
     finalColor = half4(c.rgb * c.a, c.a);
