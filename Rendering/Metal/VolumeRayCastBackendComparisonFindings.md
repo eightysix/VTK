@@ -220,8 +220,9 @@ directly rather than infer it.
 | `Rendering/Volume/Testing/Cxx/TestGPURayCastCameraInsideTransformationNoShadeNoTransform.cxx` | NoShade + no vtkProp3D transform |
 | `Rendering/Volume/Testing/Cxx/TestGPURayCastCameraInsideTransformationNoShadeAmp.cxx` | amplifier (section 5), default fixed step 0.008 |
 | `CMakeLists.txt` entries | all four above registered in `Rendering/Volume/Testing/Cxx/` |
-| `/tmp/bc/make_metal_noshade_log.sh` | regenerates `/tmp/bc/metal_noshade.log` (NoShade variant of the procedures doc's `make_metal3_log.sh`) |
-| `/tmp/bc/verify_gradient_noshade.py` | numpy replay of `gradW`/`gradOp` from GRADOP log lines (shade-off analog of the procedures doc's `verify_gradient.py`) |
+| `Rendering/Metal/BackendComparisonTools/` | persisted copies of all comparison scripts (path-parameterized, build dir defaults to `<repo-root>/build_macos_metal`): `capture_variants.sh`, `capture_sweep.sh`, `make_metal3_log.sh`, `make_metal_noshade_log.sh`, `analyze.py`, `make_vol512.py`, `verify_gradient.py`, `verify_gradient_noshade.py`, `replay_422_92.py`, `finestep_sim.py` |
+| `make_metal_noshade_log.sh` | regenerates `/tmp/bc/metal_noshade.log` (NoShade variant of the procedures doc's `make_metal3_log.sh`); persisted in `BackendComparisonTools/` |
+| `verify_gradient_noshade.py` | numpy replay of `gradW`/`gradOp` from GRADOP log lines (shade-off analog of the procedures doc's `verify_gradient.py`); persisted in `BackendComparisonTools/` |
 | `/tmp/bc/caprun/` | fresh per-variant captures, logs, delta heatmaps/masks: `TestGPURayCastCameraInsideTransformation*`, `sweep/` (camera-outside step sweep), `TestGPURayCastCameraInsideTransformationNoShadeAmp*` (amplifier + fine-step sweep `sd0.03375…0.004`) |
 
 All captures were verified GL-engaged (`GL_SAMPLING`/`GL_OPTABLE`/`GL_TEX`

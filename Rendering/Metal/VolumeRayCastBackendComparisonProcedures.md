@@ -462,7 +462,10 @@ gated pixels.
 ## Artifacts
 
 All captures and analysis live in `/tmp/bc/`; each item is regenerable from the
-command listed (assume the directory may be erased at any time):
+command listed (assume the directory may be erased at any time). Tool scripts are
+persisted in `Rendering/Metal/BackendComparisonTools/` (the inline listings below
+are copies for reader convenience; the persisted copies parameterize the build
+dir, defaulting to `<repo-root>/build_macos_metal`):
 
 | artifact | contents | regenerate with |
 |---|---|---|
@@ -482,5 +485,10 @@ command listed (assume the directory may be erased at any time):
 | `analyze.py` | delta-stats + heatmap/mask script | section 3 (inline listing) |
 | `vol512.npy` | 512³ `headsq` array (uint16) | `make_vol512.py` (offline verification, step 1) |
 | `metal3.log` | per-sample MARCH/SAMPLE/LIGHT/LIGHT2 dump | `make_metal3_log.sh` (per-sample GPU logging) |
+| `metal_noshade.log` | NoShade SAMPLE + GRADOP dump | `make_metal_noshade_log.sh` (findings doc section 5) |
 | `verify_gradient.py` | numpy replay of `gradW`/`gf` chain | offline verification, step 2 (inline listing) |
+| `verify_gradient_noshade.py` | numpy replay of `gradW`/`gradOp` from GRADOP lines | findings doc section 5 |
+| `replay_422_92.py`, `finestep_sim.py` | historical px (422,92) trace replays (default-vs-4x composite) | persisted `BackendComparisonTools/` |
+| `capture_variants.sh` | both-backend capture for a variant set (OpenGL/Metal) + GL_SAMPLING check | `Rendering/Metal/BackendComparisonTools/capture_variants.sh` |
+| `capture_sweep.sh` | camera-outside fixed-step sweep, both backends | `Rendering/Metal/BackendComparisonTools/capture_sweep.sh` |
 | `baseline.png` | copy of the committed baseline | `cp build_macos_metal/ExternalData/Rendering/Volume/Testing/Data/Baseline/TestGPURayCastCameraInsideTransformation.png /tmp/bc/baseline.png` |
