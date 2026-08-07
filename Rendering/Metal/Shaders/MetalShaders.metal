@@ -2941,7 +2941,12 @@ inline uint4 volumeSelectionIds(float3 entryPoint, float accumulatedOpacity,
       volumeUniforms.selectionCompositeIndex, 0u);
 }
 
-constant int MAX_RAY_STEPS = 8192;
+// The OpenGL raycaster marches the ray with an unbounded loop, terminating only
+// when the sample position passes the exit face (g_currentT >= g_terminatePointMax)
+// or the opacity threshold is reached. Metal's maxSteps is therefore computed from
+// the ray length / step size alone (always finite for a bounded volume); a fixed
+// sample-count clamp would truncate long camera-inside rays at fine steps and
+// render the far end of the volume dimmer than GL.
 
 inline float volume_random(float2 st) {
   // Interleaved Gradient Noise (Jimenez 2014). Smooth, low‑discrepancy,
@@ -3745,7 +3750,7 @@ inline half4 marchVolumeUnified(
                       + p.rayDir * firstT;
   float currentT = firstT;
 
-  int maxSteps = min(max(1, int(ceil((p.tEnd - firstT) / p.stepSize))), MAX_RAY_STEPS);
+  int maxSteps = max(1, int(ceil((p.tEnd - firstT) / p.stepSize)));
 
   // OpenGL composites in full float (g_fragColor is a vec4; the front-to-back
   // accumulator and weights are float). Accumulating in half caps the opacity
