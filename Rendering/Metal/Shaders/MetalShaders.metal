@@ -2693,10 +2693,8 @@ struct VolumeMapperUniforms {
   float4 cameraVolumePos;
   float4x4 viewProjection;
   float sampleDistance;             // full float32 (OpenGL in_sampleDistance parity; was half)
-  half scalarMin;
-  half _pdSM;             // padding — was upper half of float scalarMin
-  half scalarMax;
-  half _pdSMax;           // padding — was upper half of float scalarMax
+  float scalarMin;                  // full float32 (OpenGL in_volume_scale/in_volume_bias parity; was half)
+  float scalarMax;                  // full float32 (OpenGL in_volume_scale/in_volume_bias parity; was half)
   float useJittering;
   float4x4 inverseViewProjection;
   float2 viewportSize;
@@ -3644,8 +3642,57 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
       all(abs(screenPos - float2(256.5, 510.5)) < 0.5) ||  // bottom
       all(abs(screenPos - float2(480.5, 508.5)) < 0.5) ||  // high-delta skin surface
       all(abs(screenPos - float2(201.5, 13.5)) < 0.5);     // high-delta skin surface
+  // TEMP DEBUG: post-option-A residual pixels (|d|>=5 at VTK_FIXED_SAMPLE_DISTANCE=0.5).
+  bool pxOkResid =
+      all(abs(screenPos - float2(182.5, 43.5)) < 0.5) ||
+      all(abs(screenPos - float2(183.5, 43.5)) < 0.5) ||
+      all(abs(screenPos - float2(219.5, 3.5)) < 0.5) ||
+      all(abs(screenPos - float2(283.5, 7.5)) < 0.5) ||
+      all(abs(screenPos - float2(279.5, 11.5)) < 0.5) ||
+      all(abs(screenPos - float2(311.5, 16.5)) < 0.5) ||
+      all(abs(screenPos - float2(311.5, 17.5)) < 0.5) ||
+      all(abs(screenPos - float2(319.5, 25.5)) < 0.5) ||
+      all(abs(screenPos - float2(319.5, 26.5)) < 0.5) ||
+      all(abs(screenPos - float2(208.5, 83.5)) < 0.5) ||
+      all(abs(screenPos - float2(327.5, 112.5)) < 0.5) ||
+      all(abs(screenPos - float2(195.5, 133.5)) < 0.5) ||
+      all(abs(screenPos - float2(357.5, 154.5)) < 0.5) ||
+      all(abs(screenPos - float2(322.5, 172.5)) < 0.5) ||
+      all(abs(screenPos - float2(372.5, 175.5)) < 0.5) ||
+      all(abs(screenPos - float2(104.5, 245.5)) < 0.5) ||
+      all(abs(screenPos - float2(265.5, 246.5)) < 0.5) ||
+      all(abs(screenPos - float2(382.5, 207.5)) < 0.5) ||
+      all(abs(screenPos - float2(188.5, 307.5)) < 0.5) ||
+      all(abs(screenPos - float2(197.5, 280.5)) < 0.5) ||
+      all(abs(screenPos - float2(249.5, 314.5)) < 0.5) ||
+      all(abs(screenPos - float2(250.5, 314.5)) < 0.5) ||
+      all(abs(screenPos - float2(8.5, 324.5)) < 0.5) ||
+      all(abs(screenPos - float2(222.5, 326.5)) < 0.5) ||
+      all(abs(screenPos - float2(210.5, 375.5)) < 0.5) ||
+      all(abs(screenPos - float2(262.5, 356.5)) < 0.5) ||
+      all(abs(screenPos - float2(501.5, 332.5)) < 0.5) ||
+      all(abs(screenPos - float2(190.5, 437.5)) < 0.5) ||
+      all(abs(screenPos - float2(296.5, 438.5)) < 0.5) ||
+      all(abs(screenPos - float2(482.5, 398.5)) < 0.5) ||
+      all(abs(screenPos - float2(38.5, 448.5)) < 0.5) ||
+      all(abs(screenPos - float2(6.5, 451.5)) < 0.5) ||
+      all(abs(screenPos - float2(34.5, 485.5)) < 0.5) ||
+      all(abs(screenPos - float2(14.5, 493.5)) < 0.5) ||
+      all(abs(screenPos - float2(14.5, 494.5)) < 0.5) ||
+      all(abs(screenPos - float2(373.5, 466.5)) < 0.5) ||
+      all(abs(screenPos - float2(466.5, 451.5)) < 0.5) ||
+      all(abs(screenPos - float2(482.5, 469.5)) < 0.5) ||
+      all(abs(screenPos - float2(482.5, 470.5)) < 0.5) ||
+      all(abs(screenPos - float2(482.5, 471.5)) < 0.5) ||
+      all(abs(screenPos - float2(482.5, 472.5)) < 0.5) ||
+      all(abs(screenPos - float2(482.5, 473.5)) < 0.5) ||
+      all(abs(screenPos - float2(484.5, 479.5)) < 0.5) ||
+      all(abs(screenPos - float2(490.5, 484.5)) < 0.5) ||
+      all(abs(screenPos - float2(491.5, 485.5)) < 0.5) ||
+      all(abs(screenPos - float2(495.5, 497.5)) < 0.5) ||
+      all(abs(screenPos - float2(480.5, 511.5)) < 0.5);
   return (camOk && pxOk) || (camOkClip && pxOkClip) || pxOkAny || pxOkContained || pxOkLeft ||
-         pxOkCamOut;
+         pxOkCamOut || pxOkResid;
 }
 
 inline half4 marchVolumeUnified(
@@ -3679,8 +3726,12 @@ inline half4 marchVolumeUnified(
   const bool doBlanking = volumeUniforms.useBlanking > 0.5;
   const bool doRectilinear = volumeUniforms.useRectilinear > 0.5;
 
-  half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
-  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+  // Scalar window/level normalization in full float32 (OpenGL parity: the GL
+  // shader applies scalar = raw * in_volume_scale + in_volume_bias in float
+  // after sampling; the half-precision version here quantized the norm to half
+  // ulp (~1e-4) which shifted the opacity/color ramp lookups).
+  float scalarScale = 1.0f / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4f);
+  float scalarBias  = -volumeUniforms.scalarMin * scalarScale;
 
   half secondScale = half(volumeUniforms.transfer2DYAxisScale);
   half secondBias  = half(volumeUniforms.transfer2DYAxisBias);
@@ -4027,12 +4078,12 @@ inline half4 marchVolumeUnified(
       }
     }
 
-    half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
+    float scalarNorm = saturate(rawScalar * scalarScale + scalarBias);
 
     // Per-component normalization against each component's own scalar range
     // (OpenGL in_scalarsRange parity); defaults to the single-path norm when
     // the independent path is inactive.
-    half scalarNormComp[4] = {scalarNorm, scalarNorm, scalarNorm, scalarNorm};
+    half scalarNormComp[4] = {half(scalarNorm), half(scalarNorm), half(scalarNorm), half(scalarNorm)};
     // Per-component scalar->normalized scale/bias (OpenGL in_scalarsRange
     // parity), computed here once per sample so the density-gradient shading
     // path reuses them instead of recomputing the reciprocal per lit sample.

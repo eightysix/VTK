@@ -95,10 +95,8 @@ struct VolumeMapperUniforms
   float CameraVolumePos[4];          // 160..175
   float ViewProjectionMatrix[16];    // 176..239
   float SampleDistance;             // 240  (full float32; OpenGL in_sampleDistance parity. Was half + an unused half)
-  uint16_t ScalarMinHalf;           // 244
-  uint16_t _padSM;                  // 246
-  uint16_t ScalarMaxHalf;           // 248
-  uint16_t _padSMax;                // 250
+  float ScalarMin;                 // 244  (full float32; OpenGL in_volume_scale/in_volume_bias parity. Was half pair)
+  float ScalarMax;                 // 248  (full float32; OpenGL in_volume_scale/in_volume_bias parity. Was half pair)
   float UseJittering;                // 252
   float InverseViewProjection[16];   // 256..319
   float ViewportSize[2];            // 320..327
@@ -6656,12 +6654,12 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     float normFactor = this->ScalarNormalizationFactor;
     std::cerr << "VTK_METAL_VOLUME_LOG DEBUG MTL_UNIFORM_SCALAR range=(" << this->ScalarRange[0]
               << "," << this->ScalarRange[1] << ") normFactor=" << normFactor << std::endl;
-    uniforms.ScalarMinHalf = FloatToHalf(static_cast<float>(this->ScalarRange[0] / normFactor));
-    uniforms.ScalarMaxHalf = FloatToHalf(static_cast<float>(
+    uniforms.ScalarMin = static_cast<float>(this->ScalarRange[0] / normFactor);
+    uniforms.ScalarMax = static_cast<float>(
       (this->ScalarRange[1] > this->ScalarRange[0]
          ? this->ScalarRange[1]
          : this->ScalarRange[0] + 1.0) /
-      normFactor));
+      normFactor);
   }
 
   // Independent multi-component support (OpenGL in_scalarsRange parity):
