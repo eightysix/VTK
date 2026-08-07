@@ -3628,7 +3628,15 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
   bool pxOkLeft =
       all(abs(screenPos - float2(80.5, 400.5)) < 0.5) ||
       all(abs(screenPos - float2(150.5, 250.5)) < 0.5);
-  return (camOk && pxOk) || (camOkClip && pxOkClip) || pxOkAny || pxOkContained || pxOkLeft;
+  // TEMP DEBUG: CamOutsideFixedStep ring + border pixels.
+  bool pxOkCamOut =
+      all(abs(screenPos - float2(45.5, 113.5)) < 0.5) ||   // ring, d=46
+      all(abs(screenPos - float2(0.5, 256.5)) < 0.5) ||    // left border
+      all(abs(screenPos - float2(511.5, 256.5)) < 0.5) ||  // right border
+      all(abs(screenPos - float2(256.5, 2.5)) < 0.5) ||    // top border
+      all(abs(screenPos - float2(256.5, 510.5)) < 0.5);    // bottom
+  return (camOk && pxOk) || (camOkClip && pxOkClip) || pxOkAny || pxOkContained || pxOkLeft ||
+         pxOkCamOut;
 }
 
 inline half4 marchVolumeUnified(
@@ -4224,7 +4232,9 @@ inline half4 marchVolumeUnified(
     // on the CPU at TF-build time (matches OpenGL backend).
 
     if (useIndependentPath) {
-      if (fc_blendMode == 0 && sampleOpacity > 0.001h) {
+      // OpenGL composites every sample with positive opacity (g_srcColor.a > 0.0);
+      // the 0.001h gate here would drop low-opacity leading samples (border rays).
+      if (fc_blendMode == 0 && sampleOpacity > 0.0h) {
         // OpenGL composite accumulation: per-component colors are combined via
         // g_srcColor = sum(color[i] * weight[i]) and the weighted opacity sum
         // is used for the alpha accumulation (srcBlend = dstAlpha factor),
@@ -4281,7 +4291,7 @@ inline half4 marchVolumeUnified(
         accumulatedColor += weight * tmpRGB;
         accumulatedOpacity += weight * tmpA;
       }
-    } else if (fc_blendMode == 0 && sampleOpacity > 0.001h) {
+    } else if (fc_blendMode == 0 && sampleOpacity > 0.0h) {
       half3 sampleColor = colorOpacity.rgb;
       half weight = 1.0h - accumulatedOpacity;
 
@@ -4426,7 +4436,8 @@ inline half4 marchVolumeUnified(
       prefetchValid = true;
     }
 
-    if (accumulatedOpacity >= 0.99h) {
+    // OpenGL parity: g_opacityThreshold = 1.0 - 1.0/255.0 (vtkVolumeShaderComposer.h).
+    if (accumulatedOpacity >= 1.0h - 1.0h / 255.0h) {
       accumulatedOpacity = 1.0h;
       break;
     }
