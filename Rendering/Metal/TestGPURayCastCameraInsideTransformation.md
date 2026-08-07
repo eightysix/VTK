@@ -344,6 +344,58 @@ TF-coordinate mapping either; the per-sample scalar *value* itself (the raw
 texture sample, or the ray position it is fetched at) or the ray entry/tstep
 derivation remain the candidate divergence.
 
+## Nearest-interpolation variant: the sampler is not the cause
+
+`SetInterpolationTypeToNearest()` on both backends removes the trilinear
+sampler (cell-to-point texel offsets, R16Unorm/`texture3D` filtering) from the
+contained scene entirely: with nearest-neighbor lookup each sample reads one
+raw texel, so any interpolation-related backend difference disappears.
+
+Test: `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNearest`
+(the contained scene + `SetInterpolationTypeToNearest()`), genuine Metal and
+OpenGL, `/tmp/bc/nearest/`:
+
+| metric | linear (baseline) | nearest (probe) |
+|---|---|---|
+| mean\|M−G\| | 1.31 | 1.31 |
+| max\|M−G\| | 24 | 24 |
+| px with \|Δ\|≥5 | 1444 | 1444 |
+| px with \|Δ\|≥9 | 80 | 80 |
+
+Takeaway: **the delta table is identical to the linear baseline** — the
+trilinear sampler is not the cause. With nearest lookup the per-sample scalar
+is a raw texel read on both backends, yet the divergence persists unchanged, so
+the difference must be in the *positions* the samples are taken at (ray
+entry/tstep / sample-texel alignment), not in the interpolation itself.
+
+## Maximum-intensity variant: a separate, larger MIP divergence
+
+`SetBlendModeToMaximumIntensity()` removes the opacity-weighted front-to-back
+compositing from the contained scene: only the per-sample scalar is tracked
+(MIP keeps the max normalized scalar) and the color TF is sampled once at the
+end, so the composite path is bypassed entirely.
+
+Test: `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformMaxIP`
+(the contained scene + `SetBlendModeToMaximumIntensity()`), genuine Metal and
+OpenGL, `/tmp/bc/maxip/`:
+
+| metric | value |
+|---|---|
+| mean\|M−G\| | 100.8 |
+| max\|M−G\| | 155 |
+| px with \|Δ\|≥5 | 262144 (all) |
+| GL center / Metal center | 221 / 118 |
+
+Takeaway: **the residual is NOT in the composite path — but the MIP path
+itself diverges far more than the composite does.** Metal's MIP render is
+systematically ~2× darker than GL's (Metal max-channel mean 118 vs GL 221 on a
+color whose brightest sample is ~221), i.e. Metal either finds a lower max
+scalar or maps the found scalar to a lower color. The final-color math is
+structurally identical on both backends (`rgb * a` with the same TF table), so
+the divergence is in the scalar MIP value itself. This is a *separate, larger*
+Metal MIP bug that is orthogonal to the composite residual being chased here —
+but it also confirms the residual is not a compositing artifact.
+
 
 ## Gradient-magnitude math: Metal vs GL
 
@@ -663,6 +715,17 @@ color before/after shading; for pixel (256,256) the first sample is at
       normalization (`scalarScale`/`scalarBias`/`scalarNorm`) in `float`
       instead of `half` leaves the delta table essentially unchanged
       (max|Δ| 24→23, px ≥9 80→87, see the scalar-normalization probe).
+   - **Nearest-neighbor interpolation is not involved**: switching both
+      backends to `SetInterpolationTypeToNearest()` leaves the delta table
+      *identical* to the linear baseline (1.31/24/1444/80, see the
+      nearest-interpolation variant) → the difference is in the sample
+      *positions*, not the trilinear fetch.
+   - **Maximum-intensity blend exposes a separate, larger Metal MIP bug**:
+      with compositing removed (`SetBlendModeToMaximumIntensity()`) the Metal
+      MIP render is ~2× darker than GL (mean|Δ|=100.8, 262144 px) — a distinct
+      MIP-scalar tracking divergence, orthogonal to the composite residual
+      (see the maximum-intensity variant). It also confirms the residual is
+      not a compositing artifact.
     The candidate causes are the per-sample scalar value (raw texture sample or
     the ray position it is fetched at) or coordinate/tstep
     derivation (GL full-screen ray origin/`g_dirStep` chain vs Metal
@@ -686,8 +749,9 @@ color before/after shading; for pixel (256,256) the first sample is at
 For the **contained residual mismatch** (max|Δ|=24 inside / 21 outside):
 the divergence is camera-position-independent, step-size-independent (fixed
 step sweep above), and precision-independent (float-accumulation and
-scalar-normalization probes), so the fix must be in a per-sample quantity that
-both backends compute differently.
+scalar-normalization probes), interpolation-independent (nearest variant), and
+composite-path-independent (MaxIP variant), so the fix must be in a per-sample
+quantity that both backends compute differently.
 Candidate causes to compare at a logged divergent pixel: (a) the GL full-screen
 ray origin/step (`g_dirStep`) vs Metal `setupVolumeRay` entry/tstep, and (b)
 the GL volume-texture `scale`/`bias`+ sampler fetch vs the Metal 16-bit-unorm
@@ -728,6 +792,8 @@ command listed (assume the directory may be erased at any time):
 | `sweep/` | camera-outside fixed-step sweep (`sd{0.0675…4.0}_{Metal,OpenGL}.png` + logs), auto-adjust off | `VTK_FIXED_SAMPLE_DISTANCE=<sd>` on `…NoTransformCamOutsideFixedStep` for both backends |
 | `floatacc2/` | `NoShadeNoGradOpNoTransform` captures with Metal composite temporarily in `float` precision (`OpenGL.png`/`Metal.png`) — delta ≈ unchanged, probe reverted | section 2 on `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransform` with the float-accumulation shader edit |
 | `floatnorm/` | `NoShadeNoGradOpNoTransform` captures with Metal scalar normalization (`scalarScale`/`scalarBias`/`scalarNorm`) in `float` precision (`NoTransform_GL_floatnorm.png`/`NoTransform_MT_floatnorm.png`) — delta ≈ unchanged, probe reverted | section 2 on the same test with the scalar-normalization shader edit |
+| `nearest/` | `NoShadeNoGradOpNoTransformNearest` captures (`OpenGL_probe.png`/`Metal_probe.png`) — delta *identical* to the linear baseline (1.31/24/1444/80) | section 2 on `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNearest` |
+| `maxip/` | `NoShadeNoGradOpNoTransformMaxIP` captures (`OpenGL_probe.png`/`Metal_probe.png`) — separate, larger Metal MIP divergence (mean\|Δ\|=100.8, all 262144 px; Metal ~2× darker) | section 2 on `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformMaxIP` |
 | `analyze.py` | delta-stats + heatmap/mask script | section 3 (inline listing) |
 | `vol512.npy` | 512³ `headsq` array (uint16, [0,4370]) | `make_vol512.py` (offline verification, step 1) |
 | `metal3.log` | per-sample MARCH/SAMPLE/LIGHT/LIGHT2 dump (3247 lines) | `make_metal3_log.sh` (per-sample GPU logging) |
