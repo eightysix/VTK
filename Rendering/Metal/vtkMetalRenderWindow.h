@@ -261,6 +261,14 @@ public:
   int GetColorBufferSizes(int* rgba) override;
 
   /**
+   * Return the number of bits in the depth buffer. The Metal depth attachment
+   * is Depth32Float (32 bits), so report 32 to match the precision used by
+   * depth-based renderer logic (e.g. vtkRenderer's near-clipping-plane
+   * tolerance selection).
+   */
+  int GetDepthBufferSize() override;
+
+  /**
    * Write RGB image data into the color buffer (VTK window coordinates,
    * bottom-up origin). The image is drawn into the current drawable and, when
    * color read-back is enabled, into the shared color-copy texture so a

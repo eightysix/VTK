@@ -6504,6 +6504,15 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   if (uniforms.UseCameraInsideNearClip > 0.5f)
   {
     vtkCamera* cam = ren->GetActiveCamera();
+    double pos[3], fp[3], up[3];
+    cam->GetPosition(pos);
+    cam->GetFocalPoint(fp);
+    cam->GetViewUp(up);
+    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG METAL_CAM position=(" << pos[0] << ", " << pos[1]
+              << ", " << pos[2] << ") focal=(" << fp[0] << ", " << fp[1] << ", " << fp[2]
+              << ") up=(" << up[0] << ", " << up[1] << ", " << up[2] << ") viewAngle="
+              << cam->GetViewAngle() << " clipRange=(" << cam->GetClippingRange()[0] << ", "
+              << cam->GetClippingRange()[1] << ")" << std::endl;
     double fplanes[24];
     cam->GetFrustumPlanes(ren->GetTiledAspectRatio(), fplanes);
 

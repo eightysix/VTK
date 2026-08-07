@@ -3595,8 +3595,24 @@ struct MarchParams {
     float3 blockMaxGlobal;
     float3 texMinGlobal;
     float3 texMaxGlobal;
+    float2 screenPos;  // in-viewport pixel coords; (-1,-1) when unknown
     bool   checkBounds;
 };
+
+// Debug helper (test builds): per-sample march dumps, gated to a handful of
+// pixels on the final CameraInside frame. Used to verify the ray geometry and
+// scalar normalization against ground truth offline.
+inline bool debugMarchGate(float3 camera, float2 screenPos) {
+  float3 dc = camera;
+  bool camOk = all(abs(dc - float3(0.678174, 0.486826, 0.964175)) < 1e-3);
+  // screenPos is the fragment's pixel-center coordinate, i.e. (px + 0.5, py + 0.5).
+  bool pxOk =
+      all(abs(screenPos - float2(46.5, 1.5)) < 0.5) ||
+      all(abs(screenPos - float2(17.5, 1.5)) < 0.5) ||
+      all(abs(screenPos - float2(50.5, 15.5)) < 0.5) ||
+      all(abs(screenPos - float2(150.5, 150.5)) < 0.5);
+  return camOk && pxOk;
+}
 
 inline half4 marchVolumeUnified(
     MarchParams p,
@@ -3756,6 +3772,23 @@ inline half4 marchVolumeUnified(
   // space, so a ray's in-bounds samples form a single contiguous interval:
   // after it has been inside and gone out, it can never re-enter.
   bool seenInBounds = false;
+
+  // DEBUG: one header per gated fragment (test builds only).
+#if defined(VTK_METAL_ENABLE_LOGGING)
+  if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
+    os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG MARCH px=(%d, %d) camera=(%f, %f, %f) rayDir=(%f, %f, %f) tStart=%f tEnd=%f stepSize=%f firstT=%f jitter=%f entry=(%f, %f, %f) scalarMin=%f scalarMax=%f texelCount=(%f, %f, %f) texelDims=(%u, %u, %u)",
+        int(p.screenPos.x), int(p.screenPos.y),
+        volumeUniforms.cameraVolumePos.x, volumeUniforms.cameraVolumePos.y, volumeUniforms.cameraVolumePos.z,
+        p.rayDir.x, p.rayDir.y, p.rayDir.z,
+        p.tStart, p.tEnd, p.stepSize, firstT, p.jitter,
+        p.rayOrigin.x + p.rayDir.x * p.tStart,
+        p.rayOrigin.y + p.rayDir.y * p.tStart,
+        p.rayOrigin.z + p.rayDir.z * p.tStart,
+        float(volumeUniforms.scalarMin), float(volumeUniforms.scalarMax),
+        float(texelCount.x), float(texelCount.y), float(texelCount.z),
+        volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  }
+#endif
 
   for (int i = 0; i < maxSteps; i++) {
     if (!p.checkBounds && currentT >= p.tEnd - 1e-6) break;
@@ -4057,6 +4090,18 @@ inline half4 marchVolumeUnified(
     }
 
     half sampleOpacity = colorOpacity.a;
+
+    // DEBUG: per-sample march data (test builds only).
+#if defined(VTK_METAL_ENABLE_LOGGING)
+    if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
+      os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG SAMPLE px=(%d, %d) i=%d tex=(%f, %f, %f) eval=(%f, %f, %f) raw=%f norm=%f op=%f rgb=(%f, %f, %f)",
+          int(p.screenPos.x), int(p.screenPos.y), i,
+          texLocalPos.x, texLocalPos.y, texLocalPos.z,
+          evalPoint.x, evalPoint.y, evalPoint.z,
+          rawScalar, float(scalarNorm), float(sampleOpacity),
+          float(colorOpacity.r), float(colorOpacity.g), float(colorOpacity.b));
+    }
+#endif
 
     if (useIndependentPath) {
       // Gradient opacity applied per component using that component's own
@@ -4450,7 +4495,7 @@ inline half4 marchVolume(
   float jitter = (volumeUniforms.useJittering > 0.5 ? volume_random(screenPos) : 1.0) * stepSize;
   float tStart = dot(entryPoint - cameraPos, rayDir);
   MarchParams p = {cameraPos, rayDir, tStart, totalBoxT, stepSize, jitter, tTerminateMax,
-      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, true};
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, screenPos, true};
   return marchVolumeUnified(p, initialColor, initialOpacity,
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
@@ -4491,7 +4536,7 @@ inline void marchSegment(
   float3 zero = float3(0.0);
   float3 one = float3(1.0);
   MarchParams p = {rayOrigin, rayDir, t0, t1, stepSize, jitter, tTerminateMax,
-      zero, one, zero, one, false};
+      zero, one, zero, one, float2(-1.0), false};
   half4 result = marchVolumeUnified(p, accumulatedColor, accumulatedOpacity,
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
@@ -4814,7 +4859,7 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
   float jitter = (volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) : 1.0) * stepSize;
   float tStart = parallel ? 0.0 : dot(s.entryPoint - cameraPos, rayDir);
   MarchParams p = {rayOrigin, rayDir, tStart, s.totalBoxT, stepSize, jitter, s.tTerminateMax,
-      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, true};
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, in.position.xy, true};
 
   float3 firstOpaquePos = float3(-1.0);
   bool searching = true;
