@@ -127,6 +127,7 @@ one makes Metal diverge, sibling tests were created in
 | `TestGPURayCastCameraInsideTransformationConstGradOp.cxx` | gradient opacity constant `0.7` everywhere (`gf: 0.7@0, 0.7@2000`) |
 | `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransform.cxx` | also drop the `vtkProp3D` transform (`Rotate*`/`SetOrigin`), camera repositioned inside the axis-aligned bounds |
 | `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutside.cxx` | also move the camera outside (no near-plane clip) |
+| `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutsideFixedStep.cxx` | camera outside, env-driven step sweep: `VTK_FIXED_SAMPLE_DISTANCE` disables `AutoAdjustSampleDistances` and forces the step on both backends |
 | `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNearPlaneTiny.cxx` | camera inside, but near-plane pulled onto the eye (`SetClippingRange(0.001, …)`) so the near-plane clip is a no-op |
 | `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformFineStep.cxx` | camera inside, `SetSampleDistance(0.25)` (a no-op probe: the override is ignored while `AutoAdjustSampleDistances` is on) |
 | `TestGPURayCastCameraInsideTransformationSampleDist0_5.cxx` | original test, `SetSampleDistance(0.5)` (2× more samples) |
@@ -141,6 +142,7 @@ Each is registered in `Rendering/Volume/Testing/Cxx/CMakeLists.txt`, e.g.:
   TestGPURayCastCameraInsideTransformationNoShadeNoGradOp.cxx
   TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransform.cxx
   TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutside.cxx
+  TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutsideFixedStep.cxx
   TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNearPlaneTiny.cxx
   TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformFineStep.cxx
   TestGPURayCastCameraInsideTransformationSampleDist0_5.cxx
@@ -241,6 +243,41 @@ contained `NoShadeNoGradOp`-style scene (no shading, no gradient opacity):
    are byte-for-byte the original render — this row does **not** demonstrate
    that the gradient-opacity failure is sampling-insensitive, it only confirms
    the sample-distance override is ignored.
+
+## Fixed-step sweep: the divergence is not a sampling-phase artifact
+
+To test whether the residual (no-shade / no-gf / no-transform) divergence is a
+per-sample phase/comb artifact — which should shrink or vanish as the step is
+refined — `AutoAdjustSampleDistances` was disabled and the step forced to the
+same explicit world-space value on *both* backends at once, using
+`TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutsideFixedStep.cxx`
+(camera outside, env vars `VTK_FIXED_SAMPLE_DISTANCE` /
+`VTK_FIXED_AUTO_ADJUST`). Each row captures genuine Metal and OpenGL renders
+(GL verified engaged via the `GL_SAMPLING`/`GL_OPTABLE`/`GL_TEX` stderr logs);
+the OpenGL backend is deterministic run-to-run (max|Δ|=0 across reruns).
+
+| forced step (world units) | max\|M−G\| | px with \|Δ\|>1 | px with \|Δ\|>9 |
+|---|---|---|---|
+| 0.0675 | 66 | 196776 | 81040 |
+| 0.135 | 56 | 192301 | 71695 |
+| 0.27 | 20 | 128559 | 1974 |
+| 0.5 | **17** | 84302 | 241 |
+| 1.0 | 41 | 62860 | 307 |
+| 2.0 | 76 | 55481 | 405 |
+| 4.0 | 123 | 35453 | 758 |
+
+Takeaways:
+
+- **No step size makes the backends match**: `max|M−G|` is ≥ 17 everywhere.
+- **Refining the step makes the divergence *worse*** (66 at 0.0675 vs 20 at
+  0.27): the error grows as samples are added. A comb/phase artifact would
+  shrink with more samples, so the divergence is **not** a sampling-phase
+  artifact.
+- The error accumulates per-sample, pointing at a difference in each sample's
+  scalar value or its position along the ray — i.e. the per-sample texture
+  fetch (GL `scale`/`bias` + sampler vs Metal 16-bit-unorm path) or the ray
+  entry/tstep derivation (GL full-screen `g_dirStep` vs Metal
+  `setupVolumeRay`) — not the step size itself.
 
 ## Gradient-magnitude math: Metal vs GL
 
@@ -549,10 +586,14 @@ color before/after shading; for pixel (256,256) the first sample is at
      (max|Δ|=24) because the override is a no-op under default
      `AutoAdjustSampleDistances`; the earlier "4× samples → bit-identical"
      result was a capture fluke where the OpenGL run fell back to Metal.
-   The candidate causes are the per-sample coordinate/tstep derivation (GL
-   full-screen ray origin/`g_dirStep` chain vs Metal `setupVolumeRay`) or the
-   GL volume-texture `scale`/`bias` + shader fetch vs the Metal 16-bit unorm
-   path — all active for any camera position.
+   - **Forcing an explicit step on both backends** (`AutoAdjustSampleDistancesOff`,
+     camera-outside step sweep above) still diverges at every step size, and
+     refining the step makes the error *worse* → the divergence is **not** a
+     sampling-phase/comb artifact.
+   The candidate causes are the per-sample scalar fetch or coordinate/tstep
+   derivation (GL full-screen ray origin/`g_dirStep` chain vs Metal
+   `setupVolumeRay`; GL volume-texture `scale`/`bias` + sampler vs Metal
+   16-bit-unorm path) — all active for any camera position.
    The previously-suspected `firstT` comb mismatch
    (`MetalShaders.metal` 3723-3725, `ceil` on the `checkBounds == false` path)
    is **not** involved: the camera-inside test marches through `marchVolume`
@@ -569,15 +610,17 @@ color before/after shading; for pixel (256,256) the first sample is at
 ## Fix plan
 
 For the **contained residual mismatch** (max|Δ|=24 inside / 21 outside):
-the divergence is camera-position-independent, so the fix must be in a shared
-per-sample quantity. Candidate causes to compare at a logged divergent pixel:
-(a) the GL full-screen ray origin/step (`g_dirStep`) vs Metal `setupVolumeRay`
-entry/tstep, and (b) the GL volume-texture `scale`/`bias`+fetch vs the Metal
-16-bit-unorm sample — compare raw sample scalars along a divergent ray on both
-backends. Note that `SetSampleDistance` cannot be used to probe step
-sensitivity until the tests disable `AutoAdjustSampleDistances` (and
-`LockSampleDistanceToInputSpacing`); a real fine-step variant would need
-`mapper->AutoAdjustSampleDistancesOff()`. Validate with:
+the divergence is camera-position-independent and step-size-independent (fixed
+step sweep above), so the fix must be in a per-sample quantity that both
+backends compute differently. Candidate causes to compare at a logged divergent
+pixel: (a) the GL full-screen ray origin/step (`g_dirStep`) vs Metal
+`setupVolumeRay` entry/tstep, and (b) the GL volume-texture `scale`/`bias`+
+sampler fetch vs the Metal 16-bit-unorm sample — compare raw sample scalars
+along a divergent ray on both backends. The sample-distance knob is exhausted
+(it does not change the divergence), so the next probe should log per-sample
+scalars on both backends for the same divergent pixel (e.g. using the
+`MetalShaders.metal` `VTK_METAL_ENABLE_LOGGING` dump plus an equivalent GL-side
+log) and diff the trace. Validate with:
 
 ```sh
 ctest --test-dir build_macos_metal \
@@ -604,6 +647,8 @@ command listed (assume the directory may be erased at any time):
 | `NearPlaneTiny/` | `NoShadeNoGradOpNoTransformNearPlaneTiny` captures (near plane on the eye) — delta identical to `NoTransform/` | sections 2+3 on `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNearPlaneTiny` |
 | `FineStep/` | `NoShadeNoGradOpNoTransformFineStep` captures (requested 0.25 sample distance) — the byte-identical copies are invalid (OpenGL run fell back to Metal); genuine GL gives max|Δ|=24, identical to `NoTransform/` because the override is a no-op | sections 2+3 on `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformFineStep` |
 | `SampleDist0_5/`, `SampleDist0_25/` | original test at 0.5× / 0.25× sample distance — delta identical to the original failure | sections 2+3 on `TestGPURayCastCameraInsideTransformationSampleDist0_5` / `…SampleDist0_25` |
+| `recheck/` | full variant table recaptured with genuine OpenGL (`RenderingBackend=OpenGL` verified in stderr) | section 2 + `analyze.py` on each variant, `-T /tmp/bc/recheck` |
+| `sweep/` | camera-outside fixed-step sweep (`sd{0.0675…4.0}_{Metal,OpenGL}.png` + logs), auto-adjust off | `VTK_FIXED_SAMPLE_DISTANCE=<sd>` on `…NoTransformCamOutsideFixedStep` for both backends |
 | `analyze.py` | delta-stats + heatmap/mask script | section 3 (inline listing) |
 | `vol512.npy` | 512³ `headsq` array (uint16, [0,4370]) | `make_vol512.py` (offline verification, step 1) |
 | `metal3.log` | per-sample MARCH/SAMPLE/LIGHT/LIGHT2 dump (3247 lines) | `make_metal3_log.sh` (per-sample GPU logging) |
