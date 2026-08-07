@@ -1,90 +1,28 @@
-Metal volume image-compare failures (run: Aug 06 2026, full RenderingVolumeCxx-Metal suite)
+Metal volume image-compare failures (run: Aug 07 2026, full RenderingVolumeCxx-Metal suite)
 
-Out-of-bounds samples on the entry side of the [0,1]^3 texture cube are now
-clamped and composited (boundary slab) instead of skipped. The OpenGL backend
-never drops these samples: its clamp-to-edge sampler clamps the coordinate back
-into the cube and composites the boundary voxel. For axis-aligned volumes this
-only affects grazing rays whose first step exits the cube (sample-positions
-outside the cube imply the ray chord is shorter than one step), which is exactly
-why the Metal contour was ~3px slimmer per side than the GL baseline. This
-fixes TestGPURayCastMapperSampleDistance (0.1419 -> pass): previously the
-corner-grazing rays composited nothing, so the RGB contour shrank; now the
-clamped first sample matches the baseline. seenInBounds stays false while
-entry-side samples are outside so rotated-volume corner regions still march
-(and composite) through to the data cube, and axis-aligned grazing rays still
-terminate via the block-bounds exit.
+Current suite state: 88 pass / 18 fail / 4 abort (22 total non-passing, total
+110 tests). All image-compare failures are near-miss.
 
-Cell-data volume proxies now span the full cell extent instead of the
-cell-center envelope. The effective-input proxy for cell data shifts the origin
-by half a cell so texel centers land on cell centers, which made
-ComputeVolumeBounds return bounds inset by half a cell on each side, while the
-OpenGL backend computes bounds over the full cell extent (iMax =
-extent[1] + IsCellData). The proxy box was therefore ~half a cell smaller per
-side than the GL baseline (a ~3.6px/side shrink in a 138px panel), so the outer
-half of the boundary cells was never traversed. ComputeVolumeBounds now expands
-the index corners by half a cell on each side when the input is a cell-data
-proxy (CellFlag == 1). This fixes TestGPURayCastIndependentVectorMode
-(0.0600 -> pass, bottom-right cell-data magnitude panel) and
-TestGPURayCastVolumePicking (0.1234 -> pass).
-
-Gradient opacity no longer depends on shading being enabled: the Metal backend
-was gating UseGradientOpacity on property->GetShade(), but the OpenGL backend
-applies gradient opacity whenever the property declares it. This fixes
-TestGPURayCastTwoComponentsGradient (0.4505 -> pass): previously the whole
-right-half box rendered as a plain purple slab (gradient opacity skipped), the
-baseline shows only the x=17 boundary plane sliver with gradient darkening at
-the top/bottom edges.
-
-The shader now applies gradient opacity to the per-sample alpha outside the
-shading block for the dependent-composite path, and the gradient-opacity LUT is
-built over the LAST component's scalar range in dependent multi-component mode
-(OpenGL vtkVolumeInputHelper passes numComp - 1 for the LA/RGBA mode; the
-shader still normalizes the gradient magnitude against the component it is
-computed on). This fixes TestGPURayCastTwoComponentsDependentGradient
-(0.2281 -> pass): previously the quadrant interiors rendered solid (gradient
-opacity skipped when shading is off) and the boundary cross stayed dimmed
-(the baseline brightens the boundary planes via the opacity component's range).
-
-4-component dependent (RGBA) data is now treated as raw RGBA: color comes from
-scalar.xyz directly and opacity from scalar.w mapped through the opacity LUT
-built over the LAST component's range (OpenGL computeColor/computeOpacity RGBA
-parity — computeColor returns vec4(scalar.xyz, opacity), computeOpacity reads
-scalar.w). The gradient-opacity LUT and the shader gradient normalization range
-also follow the last component in this mode. This fixes
-TestGPURayCastFourComponentsDependentGradient (0.1773 -> pass): previously the
-vase rendered ~4x dimmer because the color came from the default color LUT
-(black@0 / white@1024) instead of the raw RGB (value/255).
-
-Uniform-grid blanking and ghost-array support is now implemented in the Metal
-volume ray-cast backend (cell/point ghost arrays are uploaded into a
-cell-centered RG8 3D texture and skipped during the march, mirroring the
-OpenGL backend's in_blanking texture + g_skip logic). This fixes
-TestGPURayCastVolumeUniformGridBlanking (0.0706 -> 0.0001) and
-TestGPURayCastVolumeGhostArrays (0.1646 -> pass). The blanking texture is now
-built from the original dataset's ghost arrays (the cell-data effective-input
-proxy carries only scalars), fixing TestGPURayCastVolumeGhostArraysCellData
-(0.1630 -> pass).
-
-13 image-compare failures (TIGHT_VALID threshold 0.05):
-  gross (>=0.5):
-    TestGPURayCastCameraInsideSmallSpacing    0.5733
-  mid (0.1-0.5):
-    TestGPURayCastCameraInside                0.1301
-    TestGPURayCastCameraInsideTransformation  0.1676
-    TestGPURayCastTwoComponentsDependent     0.2424
-    TestGPURayCastClippingUserTransform      0.2436
-    TestGPURayCastMapperRectilinearGrid      0.3824
-    TestGPURayCastComputeNormalFromOpacity   0.3837
+IMAGE-COMPARE FAILS (TIGHT_VALID threshold 0.05): 2
   near-miss (0.05-0.1):
-    TestGPURayCastCropping1                  0.0505
-    TestMultiBlockMapperRectilinearGrid      0.0556
-    TestGPURayCastRenderToTexture            0.0560
-    TestGPURayCastCameraInsideNonUniformScaleTransform 0.0593
-    TestGPURayCastShadedClipping             0.0909
-    TestGPURayCastPositionalLights           0.0953
+    TestGPURayCastRenderToTexture                 0.0557
+    TestGPURayCastCameraInsideNonUniformScaleTransform 0.0575
 
-7 non-image failures (crash / pick-check, no render exported; 4 also abort):
+NON-IMAGE FAILS (no Failed Image Test; 20):
     ProjectedTetrahedraZoomIn
+    TestGPURayCastCameraInsideTransformationConstGradOp
+    TestGPURayCastCameraInsideTransformationNoGradOp
+    TestGPURayCastCameraInsideTransformationNoShade
+    TestGPURayCastCameraInsideTransformationNoShadeNoGradOp
+    TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransform
+    TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutside
+    TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutsideFixedStep
+    TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformFineStep
+    TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformMaxIP
+    TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNearPlaneTiny
+    TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNearest
+    TestGPURayCastCameraInsideTransformationSampleDist0_25
+    TestGPURayCastCameraInsideTransformationSampleDist0_5
     TestMultiBlockUnstructuredGridVolumeMapper
     TestProjectedTetrahedra
     TestProjectedTetrahedraOffscreen   (abort)
@@ -93,55 +31,3 @@ proxy carries only scalars), fixing TestGPURayCastVolumeGhostArraysCellData
     TestSmartVolumeMapperImplicitArray (abort)
 
 PNG exports + manifest: build_macos_metal/Testing/ImageCompareReviewVolume/
-
-Hardware selection (vtkHardwareSelector) is now implemented for the Metal
-volume ray-cast backend: when a selection render is active with CELLS field
-association, the volume is ray-cast with a dedicated selection pipeline
-(VolumePipelineType::SelectionDirect / SelectionFullscreen) that additionally
-writes the picking ids {voxelId, propId, compositeIndex} into the RGBA32Uint
-color attachment 1 wherever the ray accumulated opacity > 3/255 — the Metal
-equivalent of the OpenGL backend's CheckPickingState + PickingActorPassExit.
-The renderer attaches the shared IdsTexture (load action) to the volume pass so
-depth-tested volume fragments only override the ids where their rays accumulate
-opacity. This fixes TestGPURayCastVolumePicking (0.1234 -> pass): previously the
-volume was invisible to hardware picking and the picker reported the cone behind
-it (selection box hugged the cone), whereas the baseline picks the volume
-(selection spans the whole scene).
-
-After this fix the suite is at 74 pass / 19 fail / 4 abort (23 total), down from
-TestGPURayCastVolumePicking alone; every other failure is unchanged.
-
-Since then three commits landed and moved three more image tests to passing:
-  - Signed-short volumes are now stored as R16Snorm (instead of half-float) so
-    large color-transfer-function label values survive the upload; fixes
-    TestGPURayCastLargeColorTransferFunction (0.3250 -> pass).
-  - The transfer-function table width is sized and clamped like the OpenGL
-    backend (ComputeIdealTextureSize + GetMaximumSupportedTextureWidth,
-    capped at 16384) so oversized tables no longer exceed the GPU's max 2D
-    texture width.
-  - Parallel projection is now supported (direction-of-projection derived rays,
-    depth-termination via inverse view-projection); fixes
-    TestGPURayCastOrientedVolume (0.1370 -> pass). TestGPURayCastClippingUserTransform
-    also improved 0.3258 -> 0.2436.
-
-The ray-setup path was also collapsed into a single precomputed
-NDCToVolumeMatrix uniform (ndcToVolume = volume-bounds-normalize *
-worldToVolume * inverseViewProjection), replacing the per-fragment two-matrix
-chain plus bounds re-normalize in the fullscreen/grid ray setup and both
-depth-termination sites. This is a pure perf change: every image-compare metric
-is bit-identical to the pre-change run.
-
-Cropping fences no longer shift ~half a texel vs the baseline. The OpenGL
-backend tests the crop region against g_dataPos, which lives in
-cellToPoint-shifted texture space (in_cellToPoint applied to the interpolated
-proxy-box coords), while the crop planes are in plain [0,1] texture space — that
-half-texel offset is baked into the baseline. The Metal backend was testing the
-crop against currentPoint (unshifted [0,1] volume space), so the fence edges sat
-~1px from the GL image. The crop test now uses evalPoint (the cellToPoint-shifted
-sample position), matching GL's g_dataPos. This fixes TestGPURayCastCropping1
-(0.0505 -> 0.0002, pass).
-
-Current suite state: 78 pass / 15 fail / 4 abort (19 total non-passing; 12
-image-compare + 7 non-image, of which 4 abort). All remaining failures are the
-pre-existing ones listed above.
-
