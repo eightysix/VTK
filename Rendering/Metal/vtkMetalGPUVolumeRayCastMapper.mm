@@ -262,10 +262,18 @@ struct VolumeMapperUniforms
   float _padNearClip[3];           // 1668..1679
   float CameraInsideNearPlaneOrigin[4]; // 1680..1695
   float CameraInsideNearPlaneNormal[4]; // 1696..1711 (total 1712, 16-byte aligned)
+  // OpenGL ComputeClipPosition parity: the vertex shader computes P*V*M*v
+  // in-shader with these three matrices (like GL's in_projectionMatrix *
+  // in_modelViewMatrix * in_volumeMatrix[0]), instead of consuming the
+  // CPU-precomputed ViewProjectionMatrix whose float32 rounding differs from
+  // the GPU's by ~1 ulp. Rows 0,1,3 of ProjectionMatrix match GL's (nearz=0
+  // vs -1 only changes the Z row, irrelevant to the XY/w barycentric weights).
+  float ProjectionMatrix[16];       // 1712..1775
+  float ModelViewMatrix[16];        // 1776..1839 (total 1840, 16-byte aligned)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1712,
-  "VolumeMapperUniforms must be 1712 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1840,
+  "VolumeMapperUniforms must be 1840 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -296,6 +304,8 @@ static_assert(offsetof(VolumeMapperUniforms, RectCoordsBias) == 1648, "");
 static_assert(offsetof(VolumeMapperUniforms, UseCameraInsideNearClip) == 1664, "");
 static_assert(offsetof(VolumeMapperUniforms, CameraInsideNearPlaneOrigin) == 1680, "");
 static_assert(offsetof(VolumeMapperUniforms, CameraInsideNearPlaneNormal) == 1696, "");
+static_assert(offsetof(VolumeMapperUniforms, ProjectionMatrix) == 1712, "");
+static_assert(offsetof(VolumeMapperUniforms, ModelViewMatrix) == 1776, "");
 
 // Per-light data for volume shading — must match Metal VolumeLight struct
 // Must match Metal VolumeLight (6 x float4 = 96 bytes per light)
@@ -7159,6 +7169,13 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
           P[3 * 4 + r] * V[c * 4 + 3];
       }
     }
+    // OpenGL ComputeClipPosition parity: upload P and V separately so the vertex
+    // shader computes P*V*M*v in-shader exactly like GLSL (rather than consuming
+    // the CPU-precomputed ViewProjectionMatrix, whose float32 rounding differs
+    // from the GPU's by ~1 ulp). P and V are already column-major float32 here,
+    // matching the float4x4 layout the shader expects.
+    memcpy(uniforms.ProjectionMatrix, P, sizeof(uniforms.ProjectionMatrix));
+    memcpy(uniforms.ModelViewMatrix, V, sizeof(uniforms.ModelViewMatrix));
   }
   else
   {
@@ -7178,6 +7195,17 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
           sum += static_cast<float>(P4->GetElement(r, k)) *
                  static_cast<float>(V4->GetElement(k, c));
         uniforms.ViewProjectionMatrix[c * 4 + r] = sum;
+      }
+    }
+    // OpenGL ComputeClipPosition parity (see the metalCamera branch above):
+    // store P and V column-major so the vertex shader can reproduce GL's
+    // in-shader P*V*M*v product.
+    for (int c = 0; c < 4; ++c)
+    {
+      for (int r = 0; r < 4; ++r)
+      {
+        uniforms.ProjectionMatrix[c * 4 + r] = static_cast<float>(P4->GetElement(r, c));
+        uniforms.ModelViewMatrix[c * 4 + r] = static_cast<float>(V4->GetElement(r, c));
       }
     }
   }

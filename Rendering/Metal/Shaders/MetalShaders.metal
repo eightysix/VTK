@@ -2854,6 +2854,16 @@ struct VolumeMapperUniforms {
   float _padNearClip[3];
   float4 cameraInsideNearPlaneOrigin;
   float4 cameraInsideNearPlaneNormal;
+  // OpenGL ComputeClipPosition parity: the GL vertex shader computes
+  // gl_Position = in_projectionMatrix * in_modelViewMatrix * in_volumeMatrix[0] * v
+  // with three separate float32 uniforms multiplied in the shader. Feeding the
+  // vertex shader the same three matrices (instead of a CPU-precomputed
+  // viewProjection) reproduces GL's float32 intermediate rounding, so the
+  // window-space barycentric weights — and therefore the interpolated
+  // data-space cap anchor — are bit-identical. Rows 0,1,3 of projectionMatrix
+  // match GL's (nearz=0 vs -1 only changes the Z row, irrelevant to XY/w).
+  float4x4 projectionMatrix;
+  float4x4 modelViewMatrix;
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -2918,7 +2928,14 @@ vertex VolumeVertexOut vertex_volume_main(
   {
     modelPos = b.volumeBoundsMin.xyz + in.position * (b.volumeBoundsMax.xyz - b.volumeBoundsMin.xyz);
   }
-  out.position = volumeUniforms.viewProjection * volumeUniforms.volumeToWorld * float4(modelPos, 1.0);
+  // OpenGL ComputeClipPosition parity: GL computes
+  // gl_Position = in_projectionMatrix * in_modelViewMatrix * in_volumeMatrix[0] * v
+  // with three separate float32 uniforms in the shader. Mirroring that exactly
+  // (rather than consuming a CPU-precomputed viewProjection) keeps the
+  // window-space barycentric weights — hence the interpolated data-space anchor
+  // — bit-identical with GL.
+  out.position = volumeUniforms.projectionMatrix * volumeUniforms.modelViewMatrix *
+      volumeUniforms.volumeToWorld * float4(modelPos, 1.0);
   if (volumeUniforms.useCameraInsideNearClip > 0.5)
   {
     out.localPos = modelPos;  // data-space (interpolated in data space like GL)
