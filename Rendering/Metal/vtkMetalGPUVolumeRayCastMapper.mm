@@ -29,7 +29,6 @@
 #include "vtkMath.h"
 #include "vtkClipConvexPolyData.h"
 #include "vtkDensifyPolyData.h"
-#include "vtkTriangleFilter.h"
 #include "vtkPlaneCollection.h"
 #include "vtkPlane.h"
 #include "vtkLightCollection.h"
@@ -5536,16 +5535,19 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         clip->SetInputData(boxSource);
         clip->SetPlanes(planes);
 
-        // Clip, densify, then triangulate to guarantee triangle output
+        // Clip, then densify — no vtkTriangleFilter. The OpenGL backend draws
+        // the first 3 vertices of every densified cell directly (see
+        // vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::RenderVolumeGeometry),
+        // and we must replicate that exactly: the extra triangulation of the
+        // clipped cap/side polygons produces interior-spanning triangles (and
+        // misses the near-plane cap at some pixels), which breaks the
+        // fragment anchors vs GL.
         vtkNew<vtkDensifyPolyData> densifyPolyData;
         densifyPolyData->SetInputConnection(clip->GetOutputPort());
         densifyPolyData->SetNumberOfSubdivisions(2);
+        densifyPolyData->Update();
 
-        vtkNew<vtkTriangleFilter> triFilter;
-        triFilter->SetInputConnection(densifyPolyData->GetOutputPort());
-        triFilter->Update();
-
-        vtkPolyData* finalPolyData = triFilter->GetOutput();
+        vtkPolyData* finalPolyData = densifyPolyData->GetOutput();
         vtkPoints* points = finalPolyData->GetPoints();
         vtkCellArray* polys = finalPolyData->GetPolys();
 
@@ -5573,6 +5575,9 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
           vertices.push_back(static_cast<float>((pt[2] - bmin[2]) / bsize[2]));
         }
 
+        // Build the index list exactly like the OpenGL backend: the first 3
+        // vertices of every cell (densified triangles plus the clipped cap/side
+        // polygons that pass through densify un-triangulated).
         std::vector<unsigned int> indices;
         vtkIdType npts;
         const vtkIdType* pts;
@@ -5580,7 +5585,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         polys->InitTraversal();
         while (polys->GetNextCell(npts, pts))
         {
-          if (npts != 3) continue;
+          if (npts < 3) continue;
           indices.push_back(static_cast<unsigned int>(pts[0]));
           indices.push_back(static_cast<unsigned int>(pts[1]));
           indices.push_back(static_cast<unsigned int>(pts[2]));
