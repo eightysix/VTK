@@ -438,24 +438,66 @@ MTL_LOG_TO_STDERR=1 \
 ```
 
 The per-pixel gate is `debugMarchGate` in `MetalShaders.metal`; it currently
-also dumps (422,92) unconditionally (camera-agnostic) via `pxOkAlways`.
+also dumps (422,92) unconditionally (camera-agnostic) via `pxOkAlways`. This
+Metal pixel is GL `(422,419)` (y-flip), so pair it with
+`VTK_GL_SAMPLE_DUMP_PX=422,419` on the GL side.
 
 **OpenGL** — per-sample raw dump at the matched pixel. BOTH env vars are
-required (the sample dump block sits under the RAY dump gate):
+required (the sample dump block sits under the RAY dump gate). The dump pixel
+is in `glReadPixels` coords (bottom origin), so for the Metal-matched pixel
+use the y-flipped value: Metal `(422,92)` == GL `(422,419)`. (Using
+`VTK_GL_SAMPLE_DUMP_PX=422,92` captures a *different* physical pixel — see the
+pixel-pairing note under `compare_gl_metal_samples.py`.)
 
 ```sh
 VTK_GL_RAY_DUMP=1 \
 VTK_GL_SAMPLE_DUMP=1 \
-VTK_GL_SAMPLE_DUMP_PX=422,92 \
+VTK_GL_SAMPLE_DUMP_PX=422,419 \
   "$BIN" TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNoJitter \
     --vtk-factory-prefer RenderingBackend=OpenGL \
     -D "$EXT" -T "$TMP" -V "$BASELINE" 2> gl_samples.log
-# verify: rg -c 'GL_SAMPLE px=\(422, 92\)' gl_samples.log   (expect 175 * frames)
+# verify: rg -c 'GL_SAMPLE px=\(422, 419\)' gl_samples.log   (expect 175 * frames)
 ```
 
 The GL dump lives in `vtkOpenGLGPUVolumeRayCastMapper.cxx` (`DoGPURender`,
 `if (getenv("VTK_GL_SAMPLE_DUMP"))`), printing every sample's channel-encoded
 scalar (16-bit float pack) for the pixel named by `VTK_GL_SAMPLE_DUMP_PX`.
+
+## Per-sample GL↔Metal comparison — `compare_gl_metal_samples.py`
+
+`Rendering/Metal/BackendComparisonTools/compare_gl_metal_samples.py` diffs the
+per-sample dumps of both backends for one physical pixel, printing per-sample
+positions and raw scalars side by side plus the max position/raw divergence.
+
+**Pixel pairing (important):** the Metal `MARCH`/`SAMPLE` logs use Metal
+`screenPos` (origin top-left) while the `GL_SAMPLE` dump uses `glReadPixels`
+coords (origin bottom-left). For the 512×512 viewport the same physical pixel is
+Metal `(x, y)` == GL `(x, 511 - y)`. So to compare against Metal pixel
+`(422, 92)`, the GL log must be captured with `VTK_GL_SAMPLE_DUMP_PX=422,419`
+— *not* `422,92`. Capturing GL at `(422,92)` and Metal at `(422,92)` compares
+two different physical pixels, and the sample positions then diverge
+systematically (a false positive). The `GL_RAY` gate list already carries the
+flipped `(422, 419)` entry, and its `origin`/`step` match the Metal `MARCH`
+ray to ~1e-5, confirming the pairing.
+
+Usage (logs produced by the cheatsheet invocations below):
+
+```sh
+python3 Rendering/Metal/BackendComparisonTools/compare_gl_metal_samples.py \
+  gl_samples.log metal_samples.log 422 92
+```
+
+The tool was developed and validated against the NoJitter variant
+(`TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNoJitter`,
+6 frames, deterministic per backend); its docstring embeds the exact GL and
+Metal capture commands so the inputs are reproducible. For other tests, capture
+the same test name on both backends with the cheatsheet invocations (swap the
+pixel if the gate differs).
+
+Expected result for the NoJitter test: positions agree to ≤1e-5 and raw scalars
+to ≤1e-6 across all samples, with only a handful of larger raw diffs
+(i=30, 134, 167) that are frame-ordering / camera-animation artifacts rather
+than backend differences.
 
 ## Per-sample GPU logging — regenerate `/tmp/bc/metal3.log`
 
@@ -544,6 +586,7 @@ dir, defaulting to `<repo-root>/build_macos_metal`):
 | `verify_gradient.py` | numpy replay of `gradW`/`gf` chain | offline verification, step 2 (inline listing) |
 | `verify_gradient_noshade.py` | numpy replay of `gradW`/`gradOp` from GRADOP lines | findings doc section 5 |
 | `replay_422_92.py`, `finestep_sim.py` | historical px (422,92) trace replays (default-vs-4x composite) | persisted `BackendComparisonTools/` |
+| `compare_gl_metal_samples.py` | per-sample GL↔Metal log diff for one pixel (y-flipped pairing) | `Rendering/Metal/BackendComparisonTools/compare_gl_metal_samples.py gl_samples.log metal_samples.log 422 92` |
 | `capture_variants.sh` | both-backend capture for a variant set (OpenGL/Metal) + GL_SAMPLING check | `Rendering/Metal/BackendComparisonTools/capture_variants.sh` |
 | `capture_sweep.sh` | camera-outside fixed-step sweep, both backends | `Rendering/Metal/BackendComparisonTools/capture_sweep.sh` |
 | `baseline.png` | copy of the committed baseline | `cp build_macos_metal/ExternalData/Rendering/Volume/Testing/Data/Baseline/TestGPURayCastCameraInsideTransformation.png /tmp/bc/baseline.png` |
