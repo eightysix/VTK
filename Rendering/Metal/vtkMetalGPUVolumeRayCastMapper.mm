@@ -5441,15 +5441,17 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
           vtkNew<vtkPoints> points;
           points->SetDataTypeToDouble();
 
+          // Corner order matches GL's ijkCorners {000,100,010,110,001,101,011,111}
+          // so that the shared tris[36] triangulates the faces with identical diagonals.
           double geometry[24] = {
             this->ModelBounds[0], this->ModelBounds[2], this->ModelBounds[4],
             this->ModelBounds[1], this->ModelBounds[2], this->ModelBounds[4],
-            this->ModelBounds[1], this->ModelBounds[3], this->ModelBounds[4],
             this->ModelBounds[0], this->ModelBounds[3], this->ModelBounds[4],
+            this->ModelBounds[1], this->ModelBounds[3], this->ModelBounds[4],
             this->ModelBounds[0], this->ModelBounds[2], this->ModelBounds[5],
             this->ModelBounds[1], this->ModelBounds[2], this->ModelBounds[5],
-            this->ModelBounds[1], this->ModelBounds[3], this->ModelBounds[5],
             this->ModelBounds[0], this->ModelBounds[3], this->ModelBounds[5],
+            this->ModelBounds[1], this->ModelBounds[3], this->ModelBounds[5],
           };
 
           for (int i = 0; i < 8; ++i)
@@ -6068,13 +6070,13 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
     pipeline = (__bridge id<MTLRenderPipelineState>)this->PipelineState;
   }
   [encoder setRenderPipelineState:pipeline];
-  // Metal's framebuffer is y-down while clip/NDC is y-up (the viewport
-  // transform mirrors Y), so triangle winding — and hence front/back
-  // classification — is inverted relative to OpenGL. Declare clockwise as
-  // front-facing so proxy-box back-face culling matches GL's GL_BACK/GL_CCW
-  // semantics (keeps the near-plane cap for camera-inside, culls the far box
-  // faces), matching vtkVolumeStateRAII's GL_BACK cull.
-  [encoder setFrontFacingWinding:MTLWindingClockwise];
+  // Back-face culling parity with GL (vtkVolumeStateRAII: GL_CULL_FACE +
+  // glCullFace(GL_BACK), default front face GL_CCW). Now that the boxSource
+  // corner order matches GL's ijkCorners (update 28), the clip/densify mesh is
+  // byte-identical to GL's, so the front-facing winding must be
+  // counter-clockwise like GL's — the previous MTLWindingClockwise rendered
+  // the byte-identical mesh fully culled (dark image).
+  [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
   [encoder setCullMode:MTLCullModeBack];
 
   // Only bind depth state if the pipeline uses depth testing.
