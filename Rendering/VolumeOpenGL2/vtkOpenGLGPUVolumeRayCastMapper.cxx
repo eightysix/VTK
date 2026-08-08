@@ -72,6 +72,10 @@
 
 #include <vtkVolumeInputHelper.h>
 
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+
 #include "vtkOpenGLVolumeGradientOpacityTable.h"
 #include "vtkOpenGLVolumeMaskGradientOpacityTransferFunction2D.h"
 #include "vtkOpenGLVolumeMaskTransferFunction2D.h"
@@ -153,6 +157,9 @@ public:
     this->DepthMaskOverride = false;
 
     this->Partitions[0] = this->Partitions[1] = this->Partitions[2] = 1;
+
+    // TEMP DEBUG: dump interpolated ray geometry when VTK_GL_RAY_DUMP is set.
+    this->DebugRayDump = getenv("VTK_GL_RAY_DUMP") != nullptr;
   }
 
   // Destructor
@@ -362,6 +369,14 @@ public:
 
   void FinishRendering(int numComponents);
 
+  /**
+   * TEMP DEBUG: dump the interpolated ray geometry (g_rayOrigin / g_dirStep)
+   * for a handful of pixels so the Metal backend can reproduce the OpenGL
+   * reference exactly. Enabled via the VTK_GL_RAY_DUMP environment variable
+   * (the shader-side hook is injected in BuildShader).
+   */
+  void DumpDebugRays(vtkRenderer* ren, vtkShaderProgram* prog, vtkVolume* vol, double geometry[24]);
+
   vtkMTimeType LastModifiedLightTime(vtkLightCollection* lights);
 
   inline bool ShaderRebuildNeeded(
@@ -510,6 +525,9 @@ public:
   bool Transfer2DUseGradient = true;
   vtkSmartPointer<vtkVolumeTexture> Transfer2DYAxisScalars;
   vtkTimeStamp Transfer2DYAxisScalarsUpdateTime;
+
+  // TEMP DEBUG: dump interpolated ray geometry (VTK_GL_RAY_DUMP).
+  bool DebugRayDump = false;
 
   vtkNew<vtkContourFilter> ContourFilter;
   vtkNew<vtkPolyDataMapper> ContourMapper;
@@ -2869,7 +2887,77 @@ void vtkOpenGLGPUVolumeRayCastMapper::BuildShader(vtkRenderer* ren)
   }
 
   auto numComp = this->AssembledInputs[0].Texture->GetLoadedScalars()->GetNumberOfComponents();
+
+  // TEMP DEBUG: hook the fragment shader to dump the interpolated ray geometry
+  // (g_rayOrigin / g_dirStep) for the gated pixels. Enabled by VTK_GL_RAY_DUMP.
+  if (this->Impl->DebugRayDump)
+  {
+    vtkShader* fragmentShader = shaders[vtkShader::Fragment];
+    std::string fragSrc = fragmentShader->GetSource();
+    vtkShaderProgram::Substitute(
+      fragSrc, "in vec3 ip_vertexPos;",
+      "in vec3 ip_vertexPos;\n"
+      "uniform vec2 in_debugPixel;\n"
+      "uniform int in_debugChannel;");
+    vtkShaderProgram::Substitute(fragSrc, "//VTK::CallWorker::Impl",
+      "initializeRayCast();\n"
+      "  if (in_debugChannel >= 0)\n"
+      "  {\n"
+      "    if (all(lessThan(abs(gl_FragCoord.xy - in_debugPixel), vec2(0.5))))\n"
+      "    {\n"
+      "      int field = in_debugChannel % 3;\n"
+      "      vec3 base = (in_debugChannel < 3) ? g_rayOrigin : ((in_debugChannel < 6) ? g_dirStep :\n"
+      "        ((in_debugChannel < 9) ? ip_vertexPos : ip_textureCoords));\n"
+      "      float v = (field == 0) ? base.x : ((field == 1) ? base.y : base.z);\n"
+      "      float av = abs(v);\n"
+      "      float b0 = 0.0;\n"
+      "      float b1 = 0.0;\n"
+      "      float b2 = 0.0;\n"
+      "      float b3 = 0.0;\n"
+      "      if (av != 0.0)\n"
+      "      {\n"
+      "        float e = floor(log2(av));\n"
+      "        float f = av * exp2(-e);\n"
+      "        if (f >= 2.0)\n"
+      "        {\n"
+      "          f *= 0.5;\n"
+      "          e += 1.0;\n"
+      "        }\n"
+      "        if (f < 1.0)\n"
+      "        {\n"
+      "          f *= 2.0;\n"
+      "          e -= 1.0;\n"
+      "        }\n"
+      "        float m23 = floor((f - 1.0) * 8388608.0);\n"
+      "        b0 = mod(m23, 256.0);\n"
+      "        b1 = mod(floor(m23 / 256.0), 256.0);\n"
+      "        b2 = floor(m23 / 65536.0);\n"
+      "        b3 = clamp(e + 64.0, 0.0, 127.0);\n"
+      "        if (v < 0.0)\n"
+      "        {\n"
+      "          b3 += 128.0;\n"
+      "        }\n"
+      "      }\n"
+      "      fragOutput0 = vec4(b0, b1, b2, b3) / 255.0;\n"
+      "      return;\n"
+      "    }\n"
+      "  }\n"
+      "  castRay(-1.0, -1.0);\n"
+      "  finalizeRayCast();");
+    fragmentShader->SetSource(fragSrc);
+
+    std::cerr << "VTK_METAL_VOLUME_LOG === FRAG SHADER ===\n" << fragSrc
+              << "\n=== FRAG SHADER END ===\n";
+    std::cerr << "VTK_METAL_VOLUME_LOG === VERT SHADER ===\n"
+              << shaders[vtkShader::Vertex]->GetSource() << "\n=== VERT SHADER END ===\n";
+  }
+
   this->ReplaceShaderValues(shaders, ren, vol, numComp);
+  if (this->Impl->DebugRayDump)
+  {
+    std::cerr << "VTK_METAL_VOLUME_LOG === COMPILED FRAG ===\n"
+              << shaders[vtkShader::Fragment]->GetSource() << "\n=== COMPILED FRAG END ===\n";
+  }
 
   // user specified post replacements
   for (const auto& i : repMap)
@@ -3513,6 +3601,17 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::BindTransformations(
       dataToWorld->DeepCopy(volMatrix);
       texToDataMat->DeepCopy(volTex->GetCurrentBlock()->TextureToDataset.GetPointer());
 
+      {
+        // TEMP DEBUG: probe the actual CellToPointMatrix source for parity.
+        std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_CTP "
+                  << volTex->CellToPointMatrix->Element[0][0] << ","
+                  << volTex->CellToPointMatrix->Element[1][1] << ","
+                  << volTex->CellToPointMatrix->Element[2][2] << ","
+                  << volTex->CellToPointMatrix->Element[0][3] << ","
+                  << volTex->CellToPointMatrix->Element[1][3] << ","
+                  << volTex->CellToPointMatrix->Element[2][3] << "\n";
+      }
+
       // Texture matrices (texture to view)
       vtkMatrix4x4::Multiply4x4(volMatrix, texToDataMat.GetPointer(), texToViewMat.GetPointer());
       vtkMatrix4x4::Multiply4x4(modelViewMat, texToViewMat.GetPointer(), texToViewMat.GetPointer());
@@ -4043,6 +4142,9 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::RenderSingleInput(
 
     this->RenderVolumeGeometry(ren, prog, vol, block->VolumeGeometry);
 
+    // TEMP DEBUG: dump interpolated ray geometry for Metal-parity analysis.
+    this->DumpDebugRays(ren, prog, vol, block->VolumeGeometry);
+
     this->FinishRendering(numComp);
     block = volumeTex->GetNextBlock();
     if (this->CurrentMask)
@@ -4050,6 +4152,102 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::RenderSingleInput(
       this->CurrentMask->GetNextBlock();
     }
   }
+}
+
+//------------------------------------------------------------------------------
+void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
+  vtkRenderer* ren, vtkShaderProgram* prog, vtkVolume* vol, double geometry[24])
+{
+  // TEMP DEBUG: dump the interpolated ray geometry (g_rayOrigin / g_dirStep) for
+  // a handful of pixels so the Metal backend can match the OpenGL reference
+  // exactly. Each float is encoded as a 23-bit mantissa (bytes 0..2) plus a
+  // sign bit and 5-bit exponent (byte 3) across a single render, since
+  // floatBitsToUint is unavailable in the GLSL 150 shader. Channel layout:
+  // origin.xyz = 0..2, step.xyz = 3..5.
+  // Enabled via the VTK_GL_RAY_DUMP environment variable.
+  if (!this->DebugRayDump)
+  {
+    return;
+  }
+
+  // The volume pass composites with GL_ONE/GL_ONE_MINUS_SRC_ALPHA, which would
+  // corrupt the encoded bytes, so blend must be disabled for the debug renders.
+  glDisable(GL_BLEND);
+  glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+
+  // Pixel centers in gl_FragCoord space (y flipped relative to Metal's screenPos).
+  // Pixels are paired with the Metal debugMarchGate pixels so the two backends'
+  // rays can be compared directly. Metal screenPos (x, y) == GL (x, 511 - y).
+  const float pixels[14][2] = { { 307.5f, 503.5f }, { 307.5f, 504.5f }, { 307.5f, 502.5f },
+    { 480.5f, 111.5f }, { 496.5f, 23.5f }, { 93.5f, 310.5f }, { 242.5f, 181.5f },
+    { 322.5f, 339.5f }, { 382.5f, 304.5f }, { 357.5f, 357.5f }, { 372.5f, 380.5f },
+    { 256.5f, 256.5f }, { 104.5f, 266.5f }, { 188.5f, 204.5f } };
+
+  for (size_t p = 0; p < 14; ++p)
+  {
+    const float px = pixels[p][0];
+    const float py = pixels[p][1];
+    const GLint gx = static_cast<GLint>(px);
+    const GLint gy = static_cast<GLint>(py);
+
+    float origin[3] = { 0.0f, 0.0f, 0.0f };
+    float step[3] = { 0.0f, 0.0f, 0.0f };
+    float vpos[3] = { 0.0f, 0.0f, 0.0f };
+    float tcoord[3] = { 0.0f, 0.0f, 0.0f };
+    float debugPixel[2] = { px, py };
+
+    for (int f = 0; f < 12; ++f)
+    {
+      unsigned char bytes[4] = { 0, 0, 0, 0 };
+
+      prog->SetUniform2f("in_debugPixel", debugPixel);
+      prog->SetUniformi("in_debugChannel", f);
+      glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+      this->RenderVolumeGeometry(ren, prog, vol, geometry);
+      glReadPixels(gx, gy, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, bytes);
+
+      float v = 0.0f;
+      if (bytes[0] != 0 || bytes[1] != 0 || bytes[2] != 0 || bytes[3] != 0)
+      {
+        double m23 = static_cast<double>(bytes[0]) + 256.0 * bytes[1] + 65536.0 * bytes[2];
+        double mant = 1.0 + m23 / 8388608.0;
+        int e = static_cast<int>(bytes[3] & 0x7F) - 64;
+        double sign = (bytes[3] & 0x80) ? -1.0 : 1.0;
+        v = static_cast<float>(sign * mant * std::pow(2.0, e));
+      }
+      float* dest = (f < 3) ? origin : (f < 6) ? step : (f < 9) ? vpos : tcoord;
+      dest[f % 3] = v;
+    }
+
+    // Skip pixels that were never covered by the volume (framebuffer held the
+    // clear color instead of an encoded value).
+    if (origin[0] == 0.0f && origin[1] == 0.0f && origin[2] == 0.0f)
+    {
+      continue;
+    }
+
+    double* cp = ren->GetActiveCamera()->GetPosition();
+    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_RAY px=(" << static_cast<int>(px) << ", "
+              << static_cast<int>(py) << ") cam=(" << cp[0] << ", " << cp[1] << ", " << cp[2]
+              << ") origin=(" << origin[0] << ", " << origin[1] << ", " << origin[2] << ") step=("
+              << step[0] << ", " << step[1] << ", " << step[2] << ") vpos=(" << vpos[0] << ", "
+              << vpos[1] << ", " << vpos[2] << ") tex=(" << tcoord[0] << ", " << tcoord[1] << ", "
+              << tcoord[2] << ")" << std::endl;
+    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_BOX " << std::setprecision(6);
+    for (int i = 0; i < 8; ++i)
+    {
+      std::cerr << " c" << i << "=(" << geometry[i * 3] << ", " << geometry[i * 3 + 1] << ", "
+                << geometry[i * 3 + 2] << ")";
+    }
+    std::cerr << std::endl;
+  }
+
+  // Restore the real composite image for the gated pixels.
+  prog->SetUniformi("in_debugChannel", -1);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+  this->RenderVolumeGeometry(ren, prog, vol, geometry);
 }
 
 //------------------------------------------------------------------------------

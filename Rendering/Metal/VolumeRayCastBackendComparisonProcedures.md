@@ -122,6 +122,7 @@ feature differs between backends, create sibling tests in
 | `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransform.cxx` | also drop the `vtkProp3D` transform (`Rotate*`/`SetOrigin`), camera repositioned inside the axis-aligned bounds |
 | `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutside.cxx` | also move the camera outside (no near-plane clip) |
 | `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutsideFixedStep.cxx` | camera outside, env-driven step sweep: `VTK_FIXED_SAMPLE_DISTANCE` disables `AutoAdjustSampleDistances` and forces the step on both backends |
+| `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutsideNoJitter.cxx` | camera outside with `SetUseJittering(false)` on the mapper (both backends then offset the first sample by exactly one step), ruling out the random-noise source |
 | `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNearPlaneTiny.cxx` | camera inside, but near-plane pulled onto the eye (`SetClippingRange(0.001, …)`) so the near-plane clip is a no-op |
 | `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformFineStep.cxx` | camera inside, `SetSampleDistance(0.25)` (a no-op probe: the override is ignored while `AutoAdjustSampleDistances` is on) |
 | `TestGPURayCastCameraInsideTransformationSampleDist0_5.cxx` | original test, `SetSampleDistance(0.5)` (2× more samples) |
@@ -137,6 +138,7 @@ Each is registered in `Rendering/Volume/Testing/Cxx/CMakeLists.txt`, e.g.:
   TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransform.cxx
   TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutside.cxx
   TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutsideFixedStep.cxx
+  TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformCamOutsideNoJitter.cxx
   TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNearPlaneTiny.cxx
   TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformFineStep.cxx
   TestGPURayCastCameraInsideTransformationSampleDist0_5.cxx

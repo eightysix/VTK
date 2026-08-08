@@ -3691,8 +3691,17 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
       all(abs(screenPos - float2(491.5, 485.5)) < 0.5) ||
       all(abs(screenPos - float2(495.5, 497.5)) < 0.5) ||
       all(abs(screenPos - float2(480.5, 511.5)) < 0.5);
+  // TEMP DEBUG: CamOutsideNoJitter max-delta residual pixels.
+  bool pxOkNoJitter =
+      all(abs(screenPos - float2(307.5, 8.5)) < 0.5) ||
+      all(abs(screenPos - float2(307.5, 7.5)) < 0.5) ||
+      all(abs(screenPos - float2(307.5, 9.5)) < 0.5) ||
+      all(abs(screenPos - float2(480.5, 400.5)) < 0.5) ||
+      all(abs(screenPos - float2(496.5, 488.5)) < 0.5) ||
+      all(abs(screenPos - float2(93.5, 201.5)) < 0.5) ||
+      all(abs(screenPos - float2(242.5, 330.5)) < 0.5);
   return (camOk && pxOk) || (camOkClip && pxOkClip) || pxOkAny || pxOkContained || pxOkLeft ||
-         pxOkCamOut || pxOkResid;
+         pxOkCamOut || pxOkResid || pxOkNoJitter;
 }
 
 inline half4 marchVolumeUnified(
