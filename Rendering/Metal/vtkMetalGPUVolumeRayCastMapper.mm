@@ -6028,6 +6028,13 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
     pipeline = (__bridge id<MTLRenderPipelineState>)this->PipelineState;
   }
   [encoder setRenderPipelineState:pipeline];
+  // Metal's framebuffer is y-down while clip/NDC is y-up (the viewport
+  // transform mirrors Y), so triangle winding — and hence front/back
+  // classification — is inverted relative to OpenGL. Declare clockwise as
+  // front-facing so proxy-box back-face culling matches GL's GL_BACK/GL_CCW
+  // semantics (keeps the near-plane cap for camera-inside, culls the far box
+  // faces), matching vtkVolumeStateRAII's GL_BACK cull.
+  [encoder setFrontFacingWinding:MTLWindingClockwise];
   [encoder setCullMode:MTLCullModeBack];
 
   // Only bind depth state if the pipeline uses depth testing.
