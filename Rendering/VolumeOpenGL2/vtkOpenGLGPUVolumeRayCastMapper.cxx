@@ -4011,6 +4011,33 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::SetCameraShaderParameters(
   prog->SetUniformMatrix("in_modelViewMatrix", modelViewMatrix);
   prog->SetUniformMatrix("in_inverseModelViewMatrix", this->InverseModelViewMat.GetPointer());
 
+  // TEMP DEBUG: dump float32 bits of the three clip-chain matrices.
+  {
+    unsigned char pbits[64], vbits[64], mbits[64];
+    for (int i = 0; i < 16; ++i)
+    {
+      float pf = static_cast<float>(projectionMatrix->GetElement(i / 4, i % 4));
+      float vf = static_cast<float>(modelViewMatrix->GetElement(i / 4, i % 4));
+      memcpy(pbits + i * 4, &pf, 4);
+      memcpy(vbits + i * 4, &vf, 4);
+    }
+    for (int i = 0; i < 16; ++i)
+    {
+      float mf = static_cast<float>(this->VolMatVec[i]);
+      memcpy(mbits + i * 4, &mf, 4);
+    }
+    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_CLIPMAT P=";
+    for (int i = 0; i < 64; ++i)
+      std::cerr << std::hex << std::setfill('0') << std::setw(2) << (int)pbits[i];
+    std::cerr << " V=";
+    for (int i = 0; i < 64; ++i)
+      std::cerr << std::hex << std::setfill('0') << std::setw(2) << (int)vbits[i];
+    std::cerr << " M=";
+    for (int i = 0; i < 64; ++i)
+      std::cerr << std::hex << std::setfill('0') << std::setw(2) << (int)mbits[i];
+    std::cerr << std::dec << std::endl;
+  }
+
   if (cam->GetParallelProjection())
   {
     float fvalue3[3];

@@ -7214,6 +7214,28 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     // matching the float4x4 layout the shader expects.
     memcpy(uniforms.ProjectionMatrix, P, sizeof(uniforms.ProjectionMatrix));
     memcpy(uniforms.ModelViewMatrix, V, sizeof(uniforms.ModelViewMatrix));
+    // TEMP DEBUG: dump float32 bits of the three clip-chain matrices.
+    {
+      std::cerr << "VTK_METAL_VOLUME_LOG DEBUG MTL_CLIPMAT P=";
+      for (int i = 0; i < 64; ++i)
+      {
+        std::cerr << std::hex << std::setfill('0') << std::setw(2)
+                  << (int)reinterpret_cast<const unsigned char*>(uniforms.ProjectionMatrix)[i];
+      }
+      std::cerr << " V=";
+      for (int i = 0; i < 64; ++i)
+      {
+        std::cerr << std::hex << std::setfill('0') << std::setw(2)
+                  << (int)reinterpret_cast<const unsigned char*>(uniforms.ModelViewMatrix)[i];
+      }
+      std::cerr << " M=";
+      for (int i = 0; i < 64; ++i)
+      {
+        std::cerr << std::hex << std::setfill('0') << std::setw(2)
+                  << (int)reinterpret_cast<const unsigned char*>(uniforms.VolumeToWorldMatrix)[i];
+      }
+      std::cerr << std::dec << std::endl;
+    }
   }
   else
   {
