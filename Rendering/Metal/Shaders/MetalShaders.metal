@@ -3631,8 +3631,10 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
   bool pxOkContained =
       all(abs(screenPos - float2(372.5, 131.5)) < 0.5) ||
       all(abs(screenPos - float2(422.5, 92.5)) < 0.5);
-  // TEMP DEBUG: always dump the GL-matched pixel (422, 92) regardless of camera.
-  bool pxOkAlways = all(abs(screenPos - float2(422.5, 92.5)) < 0.5);
+  // TEMP DEBUG: always dump the GL-matched pixel (422, 419) regardless of camera.
+  //   Metal screenPos (top-left) == GL glReadPixels (422, 92). This is the worst
+  //   |Metal-GL| pixel in the NoJitter render (d=199: GL dark, Metal bright).
+  bool pxOkAlways = all(abs(screenPos - float2(422.5, 419.5)) < 0.5);
   // TEMP DEBUG: NoShade left-half comparison pixels (left side matches GL).
   bool pxOkLeft =
       all(abs(screenPos - float2(80.5, 400.5)) < 0.5) ||

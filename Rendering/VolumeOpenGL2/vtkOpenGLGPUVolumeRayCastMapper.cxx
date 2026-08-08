@@ -3001,7 +3001,11 @@ void vtkOpenGLGPUVolumeRayCastMapper::BuildShader(vtkRenderer* ren)
       "        float dbgRaw = texture3D(in_volume[0], g_dataPos).r;\n"
       "        float val = (in_debugChannel == 1) ? g_dataPos.x :\n"
       "                    (in_debugChannel == 2) ? g_dataPos.y :\n"
-      "                    (in_debugChannel == 3) ? g_dataPos.z : dbgRaw;\n"
+      "                    (in_debugChannel == 3) ? g_dataPos.z :\n"
+      "                    (in_debugChannel == 4) ? g_srcColor.r :\n"
+      "                    (in_debugChannel == 5) ? g_srcColor.g :\n"
+      "                    (in_debugChannel == 6) ? g_srcColor.b :\n"
+      "                    (in_debugChannel == 7) ? g_srcColor.a : dbgRaw;\n"
       "        float av = abs(val);\n"
       "        float b0 = 0.0;\n"
       "        float b1 = 0.0;\n"
@@ -4371,9 +4375,9 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
       : 175;
     for (int s = 0; s < maxSample; ++s)
     {
-      float chan[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+      float chan[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
       prog->SetUniformi("in_debugSample", s);
-      for (int c = 0; c < 4; ++c)
+      for (int c = 0; c < 8; ++c)
       {
         unsigned char bytes[4] = { 0, 0, 0, 0 };
         prog->SetUniformi("in_debugChannel", c);
@@ -4399,12 +4403,14 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
         }
         chan[c] = v;
       }
-      if (chan[0] != 0.0f || chan[1] != 0.0f || chan[2] != 0.0f || chan[3] != 0.0f)
+      if (chan[0] != 0.0f || chan[1] != 0.0f || chan[2] != 0.0f || chan[3] != 0.0f ||
+        chan[4] != 0.0f || chan[5] != 0.0f || chan[6] != 0.0f || chan[7] != 0.0f)
       {
         std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_SAMPLE px=(" << gx << ", " << gy
                   << ") i=" << s << " raw=" << chan[0]
                   << " pos=(" << chan[1] << ", " << chan[2] << ", " << chan[3] << ")"
-                  << std::endl;
+                  << " color=(" << chan[4] << ", " << chan[5] << ", " << chan[6] << ")"
+                  << " op=" << chan[7] << std::endl;
       }
     }
   }
@@ -4479,6 +4485,34 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
   glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
   this->RenderVolumeGeometry(ren, prog, vol, geometry);
+
+  // TEMP DEBUG: read back the real composite framebuffer at the Metal-parity
+  // pixels (glReadPixels coords, bottom-left) to see what GL actually writes.
+  if (getenv("VTK_GL_COMPOSITE_DUMP") != nullptr)
+  {
+    const int dbgPx[4][2] = { { 422, 92 }, { 422, 419 }, { 256, 256 }, { 372, 131 } };
+    for (const auto& px : dbgPx)
+    {
+      unsigned char bytes[4] = { 0, 0, 0, 0 };
+      glReadPixels(px[0], px[1], 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, bytes);
+      std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_COMPOSITE px=(" << px[0] << ", " << px[1]
+                << ") rgba=" << static_cast<int>(bytes[0]) << "," << static_cast<int>(bytes[1])
+                << "," << static_cast<int>(bytes[2]) << "," << static_cast<int>(bytes[3])
+                << std::endl;
+    }
+    if (getenv("VTK_GL_COMPOSITE_ROW") != nullptr)
+    {
+      int rowY = atoi(getenv("VTK_GL_COMPOSITE_ROW"));
+      for (int gx2 = 400; gx2 <= 440; ++gx2)
+      {
+        unsigned char bytes[4] = { 0, 0, 0, 0 };
+        glReadPixels(gx2, rowY, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, bytes);
+        std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_COMPOSITE_ROW y=" << rowY << " x=" << gx2
+                  << " rgba=" << static_cast<int>(bytes[0]) << "," << static_cast<int>(bytes[1])
+                  << "," << static_cast<int>(bytes[2]) << std::endl;
+      }
+    }
+  }
 }
 
 //------------------------------------------------------------------------------
