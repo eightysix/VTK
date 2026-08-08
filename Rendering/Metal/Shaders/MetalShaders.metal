@@ -2919,6 +2919,38 @@ struct PerBlockData {
   float4 minMaxInfo;    // useMinMax, dimX, dimY, dimZ
 };
 
+// The Metal compiler is invoked with fast-math enabled (MTLCompileOptions
+// defaults to fastMathEnabled=YES), which reassociates floating-point
+// expressions and contracts mul+add into FMA. The clip chain below must use
+// strict [0,1,2,3] mul+add in both the matrix product and the vector multiply
+// to match the GL driver's compiled arithmetic bit-for-bit; disable
+// reassociation and contraction for the following functions so the exact
+// ordering and rounding survive compilation.
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+
+// Strict [0,1,2,3] 4x4 multiply matching the GLSL mat4 operator codegen
+// (column-major float4x4, so (A*B)[c][r] = sum_k A[k][r] * B[c][k]), with the
+// same contraction pattern as GLSL dot products: first term plain multiply,
+// remaining terms fused (fma). Verified bit-exact against GL's clip on the
+// camera-inside cap mesh.
+inline float4x4 matrixMulStrict(const float4x4 A, const float4x4 B)
+{
+  float4x4 R;
+  for (int c = 0; c < 4; ++c)
+  {
+    for (int r = 0; r < 4; ++r)
+    {
+      float t = A[0][r] * B[c][0];
+      t = fma(A[1][r], B[c][1], t);
+      t = fma(A[2][r], B[c][2], t);
+      t = fma(A[3][r], B[c][3], t);
+      R[c][r] = t;
+    }
+  }
+  return R;
+}
+
 vertex VolumeVertexOut vertex_volume_main(
     VolumeVertexIn in [[stage_in]],
     uint vertexId [[vertex_id]],
@@ -2947,8 +2979,27 @@ vertex VolumeVertexOut vertex_volume_main(
   // (rather than consuming a CPU-precomputed viewProjection) keeps the
   // window-space barycentric weights — hence the interpolated data-space anchor
   // — bit-identical with GL.
-  out.position = volumeUniforms.projectionMatrix * volumeUniforms.modelViewMatrix *
-      volumeUniforms.volumeToWorld * float4(modelPos, 1.0);
+  //
+  // The built-in float4x4 multiply and matrix-vector multiply do not match the
+  // GL driver's instruction order (≤1 ULP clip shifts that perturb the
+  // interpolated anchor). Hand-write both the matrix product ((P*V)*W) and the
+  // vector multiply in strict [0,1,2,3] mul+add order so the clip matches GL
+  // bit-for-bit.
+  float4x4 mvp = matrixMulStrict(
+      matrixMulStrict(volumeUniforms.projectionMatrix, volumeUniforms.modelViewMatrix),
+      volumeUniforms.volumeToWorld);
+  float4 v = float4(modelPos, 1.0);
+  // GLSL dot-product codegen (Apple GL on Metal): the first term is a plain
+  // multiply, the second and third terms are fused (fma), and the last term is
+  // a plain mul+add. Mirror that exact contraction pattern so the clip —
+  // hence the interpolated anchor — matches GL bit-for-bit.
+  float4 clip;
+  float acc;
+  acc = mvp[0][0] * v.x; acc = fma(mvp[1][0], v.y, acc); acc = fma(mvp[2][0], v.z, acc); acc = acc + mvp[3][0] * v.w; clip.x = acc;
+  acc = mvp[0][1] * v.x; acc = fma(mvp[1][1], v.y, acc); acc = fma(mvp[2][1], v.z, acc); acc = acc + mvp[3][1] * v.w; clip.y = acc;
+  acc = mvp[0][2] * v.x; acc = fma(mvp[1][2], v.y, acc); acc = fma(mvp[2][2], v.z, acc); acc = acc + mvp[3][2] * v.w; clip.z = acc;
+  acc = mvp[0][3] * v.x; acc = fma(mvp[1][3], v.y, acc); acc = fma(mvp[2][3], v.z, acc); acc = acc + mvp[3][3] * v.w; clip.w = acc;
+  out.position = clip;
   out.clipPos = out.position;
   if (volumeUniforms.useCameraInsideNearClip > 0.5)
   {

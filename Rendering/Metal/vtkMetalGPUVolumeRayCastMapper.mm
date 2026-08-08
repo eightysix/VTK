@@ -68,33 +68,33 @@ static bool vtkMetalForceFullscreenCameraInside(bool useFullscreen)
   return useFullscreen;
 }
 
-#ifdef VTK_METAL_ENABLE_LOGGING
-// Shader-logging compile options for the volume ray-cast shader library.
-// Shader logging (Metal 3.2) is only available on macOS 15+ / iOS 18+; on
-// older systems this returns nil, so the library is compiled without logging
-// and the VTK_METAL_ENABLE_LOGGING shader macro stays undefined (the os_log
-// call sites in MetalShaders.metal compile out). When active, the shader
-// library is compiled with -fmetal-enable-logging (MTLCompileOptions
-// enableLogging) at the Metal 3.2 language version, and the preprocessor macro
-// lets the shader source gate its os_log calls. See TestMetalVolumeShaderLog.
+// Compile options for the volume ray-cast shader library.
+//
+// fastMathEnabled defaults to YES and is explicitly disabled here: the fast
+// path reassociates floating-point expressions and contracts mul+add into FMA,
+// producing ≤1 ULP clip/anchor differences versus the GLSL-compiled GL shaders
+// (strict IEEE, source order preserved). Compiling the whole library without
+// fast math keeps the MSL arithmetic bit-compatible with GL.
+//
+// Shader logging (Metal 3.2) is only available on macOS 15+ / iOS 18+. When
+// active, the library is additionally compiled with -fmetal-enable-logging
+// (MTLCompileOptions enableLogging) at the Metal 3.2 language version and the
+// preprocessor macro lets the shader source gate its os_log calls (which
+// otherwise compile out). See TestMetalVolumeShaderLog.
 static MTLCompileOptions* vtkMetalVolumeCompileOptions()
 {
+  MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+  options.fastMathEnabled = NO;
+#ifdef VTK_METAL_ENABLE_LOGGING
   if (@available(macOS 15.0, iOS 18.0, *))
   {
-    MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
     options.enableLogging = YES;
     options.languageVersion = MTLLanguageVersion3_2;
     options.preprocessorMacros = @{ @"VTK_METAL_ENABLE_LOGGING" : @(1) };
-    return [options autorelease];
   }
-  return nil;
-}
-#else
-static MTLCompileOptions* vtkMetalVolumeCompileOptions()
-{
-  return nil;
-}
 #endif
+  return [options autorelease];
+}
 
 // Metal constant-address-space structs align float3 to 16 bytes (size 16),
 // float4/float4x4 to 16 bytes, and float2 to 8 bytes.  This creates
