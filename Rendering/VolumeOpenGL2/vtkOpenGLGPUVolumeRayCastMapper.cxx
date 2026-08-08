@@ -277,6 +277,9 @@ public:
   bool IsGeometryUpdateRequired(vtkRenderer* ren, vtkVolume* vol, double geometry[24]);
   void RenderVolumeGeometry(
     vtkRenderer* ren, vtkShaderProgram* prog, vtkVolume* vol, double geometry[24]);
+  // TEMP DEBUG: re-draw the proxy indices as 1px points (per-vertex clip dump).
+  void RenderVolumeGeometryPoints(
+    vtkRenderer* ren, vtkShaderProgram* prog, vtkVolume* vol, double geometry[24]);
   ///@}
 
   // Update cropping params to shader
@@ -1353,6 +1356,46 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::RenderVolumeGeometry(
   glBindVertexArray(0);
   glBindBuffer(GL_ARRAY_BUFFER, 0);
   glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+}
+
+//------------------------------------------------------------------------------
+void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::RenderVolumeGeometryPoints(
+  vtkRenderer* ren, vtkShaderProgram* prog, vtkVolume* vol, double geometry[24])
+{
+  (void)ren;
+  (void)vol;
+  (void)geometry;
+  // TEMP DEBUG: GL_POINTS does not rasterize on this macOS GL implementation, so
+  // draw each cap vertex as a tiny triangle. Every vertex is duplicated 3x; the
+  // vertex shader (in_debugVertexMode=1) maps the 3 copies to a fixed 2px
+  // triangle whose position is a linear function of k=gl_VertexID/3, and passes
+  // the real clip value through ip_debugClip (constant over the triangle). The
+  // clip values are then read back from the strip of tiny triangles.
+  vtkPoints* pts = this->BBoxPolyData->GetPoints();
+  const vtkIdType n = pts->GetNumberOfPoints();
+  std::vector<float> tri(static_cast<size_t>(n) * 3 * 3);
+  for (vtkIdType k = 0; k < n; ++k)
+  {
+    double* p = pts->GetPoint(k);
+    for (int c = 0; c < 3; ++c)
+    {
+      tri[(static_cast<size_t>(k) * 3 + c) * 3 + 0] = static_cast<float>(p[0]);
+      tri[(static_cast<size_t>(k) * 3 + c) * 3 + 1] = static_cast<float>(p[1]);
+      tri[(static_cast<size_t>(k) * 3 + c) * 3 + 2] = static_cast<float>(p[2]);
+    }
+  }
+  glBindVertexArray(this->CubeVAOId);
+  glBindBuffer(GL_ARRAY_BUFFER, this->CubeVBOId);
+  glBufferData(GL_ARRAY_BUFFER,
+    static_cast<GLsizeiptr>(tri.size() * sizeof(float)), tri.data(), GL_STREAM_DRAW);
+  prog->EnableAttributeArray("in_vertexPos");
+  prog->UseAttributeArray("in_vertexPos", 0, 0, VTK_FLOAT, 3, vtkShaderProgram::NoNormalize);
+  prog->SetUniformi("in_debugVertexMode", 1);
+  prog->SetUniformi("in_debugVertexCount", static_cast<int>(n));
+  glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(n * 3));
+  prog->SetUniformi("in_debugVertexMode", 0);
+  glBindVertexArray(0);
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
 //------------------------------------------------------------------------------
@@ -2938,6 +2981,9 @@ void vtkOpenGLGPUVolumeRayCastMapper::BuildShader(vtkRenderer* ren)
     vtkShaderProgram::Substitute(
       fragSrc, "in vec3 ip_vertexPos;",
       "in vec3 ip_vertexPos;\n"
+      "in vec4 ip_debugClip;\n"
+      "flat in vec4 ip_debugClipFlat;\n"
+      "flat in int ip_vid;\n"
       "uniform vec2 in_debugPixel;\n"
       "uniform int in_debugChannel;\n"
       "uniform int in_debugSample;\n"
@@ -2981,6 +3027,41 @@ void vtkOpenGLGPUVolumeRayCastMapper::BuildShader(vtkRenderer* ren)
       "      return;\n"
       "    }\n"
       "  }\n"
+      "  if (in_debugChannel >= 100 && in_debugSample < 0)\n"
+      "  {\n"
+      "    int cf = in_debugChannel - 100;\n"
+      "    float v = (cf == 0) ? float(ip_vid) : ((cf == 1) ? ip_debugClipFlat.x :\n"
+      "      ((cf == 2) ? ip_debugClipFlat.y : ((cf == 3) ? ip_debugClipFlat.z :\n"
+      "      ((cf == 4) ? ip_debugClipFlat.w : ((cf == 5) ? ip_vertexPos.x :\n"
+      "      ((cf == 6) ? ip_vertexPos.y : ip_vertexPos.z))))));\n"
+      "    float av = abs(v);\n"
+      "    float b0 = 0.0;\n"
+      "    float b1 = 0.0;\n"
+      "    float b2 = 0.0;\n"
+      "    float b3 = 0.0;\n"
+      "    if (av != 0.0)\n"
+      "    {\n"
+      "      float e = floor(log2(av));\n"
+      "      float f = av * exp2(-e);\n"
+      "      if (f >= 2.0)\n"
+      "      {\n"
+      "        f *= 0.5;\n"
+      "        e += 1.0;\n"
+      "      }\n"
+      "      if (f < 1.0)\n"
+      "      {\n"
+      "        f *= 2.0;\n"
+      "        e -= 1.0;\n"
+      "      }\n"
+      "      float m23 = floor((f - 1.0) * 8388608.0);\n"
+      "      b0 = mod(m23, 256.0);\n"
+      "      b1 = mod(floor(m23 / 256.0), 256.0);\n"
+      "      b2 = floor(m23 / 65536.0);\n"
+      "      b3 = clamp(e + 64.0, 0.0, 127.0);\n"
+      "    }\n"
+      "    fragOutput0 = vec4(b0, b1, b2, b3) / 255.0;\n"
+      "    return;\n"
+      "  }\n"
       "  initializeRayCast();\n"
       "  if (in_debugChannel >= 0 && in_debugSample < 0)\n"
       "  {\n"
@@ -2990,6 +3071,12 @@ void vtkOpenGLGPUVolumeRayCastMapper::BuildShader(vtkRenderer* ren)
       "      vec3 base = (in_debugChannel < 3) ? g_rayOrigin : ((in_debugChannel < 6) ? g_dirStep :\n"
       "        ((in_debugChannel < 9) ? ip_vertexPos : ip_textureCoords));\n"
       "      float v = (field == 0) ? base.x : ((field == 1) ? base.y : base.z);\n"
+      "      if (in_debugChannel >= 12)\n"
+      "      {\n"
+      "        int cf = in_debugChannel - 12;\n"
+      "        v = (cf == 0) ? ip_debugClip.x : ((cf == 1) ? ip_debugClip.y :\n"
+      "          ((cf == 2) ? ip_debugClip.z : ip_debugClip.w));\n"
+      "      }\n"
       "      float av = abs(v);\n"
       "      float b0 = 0.0;\n"
       "      float b1 = 0.0;\n"
@@ -4015,6 +4102,39 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::SetCameraShaderParameters(
   prog->SetUniformMatrix("in_modelViewMatrix", modelViewMatrix);
   prog->SetUniformMatrix("in_inverseModelViewMatrix", this->InverseModelViewMat.GetPointer());
 
+  // TEMP DEBUG: dump the three clip-chain matrices as float32 raw bytes, in the
+  // same column-major layout SetUniformMatrix uploads (data[i] =
+  // Element[i/4][i%4]), for byte-compare against Metal's MTL_CLIPMAT.
+  if (getenv("VTK_GL_VERTEX_DUMP") != nullptr)
+  {
+    auto dumpMat = [](const char* tag, vtkMatrix4x4* m)
+    {
+      std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_CLIPMAT " << tag << "=";
+      for (int i = 0; i < 16; ++i)
+      {
+        float f = static_cast<float>(m->Element[i / 4][i % 4]);
+        std::cerr << std::hex << std::setfill('0') << std::setw(2)
+                  << (int)reinterpret_cast<const unsigned char*>(&f)[0]
+                  << (int)reinterpret_cast<const unsigned char*>(&f)[1]
+                  << (int)reinterpret_cast<const unsigned char*>(&f)[2]
+                  << (int)reinterpret_cast<const unsigned char*>(&f)[3];
+      }
+    };
+    dumpMat("P", projectionMatrix);
+    dumpMat("V", modelViewMatrix);
+    std::cerr << " M=";
+    for (int i = 0; i < 16; ++i)
+    {
+      float f = this->VolMatVec[0 * 16 + i];
+      std::cerr << std::hex << std::setfill('0') << std::setw(2)
+                << (int)reinterpret_cast<const unsigned char*>(&f)[0]
+                << (int)reinterpret_cast<const unsigned char*>(&f)[1]
+                << (int)reinterpret_cast<const unsigned char*>(&f)[2]
+                << (int)reinterpret_cast<const unsigned char*>(&f)[3];
+    }
+    std::cerr << std::dec << std::endl;
+  }
+
   // TEMP DEBUG: dump float32 bits of the three clip-chain matrices.
   {
     unsigned char pbits[64], vbits[64], mbits[64];
@@ -4369,9 +4489,10 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
     float step[3] = { 0.0f, 0.0f, 0.0f };
     float vpos[3] = { 0.0f, 0.0f, 0.0f };
     float tcoord[3] = { 0.0f, 0.0f, 0.0f };
+    float clip[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     float debugPixel[2] = { px, py };
 
-    for (int f = 0; f < 12; ++f)
+    for (int f = 0; f < 16; ++f)
     {
       unsigned char bytes[4] = { 0, 0, 0, 0 };
 
@@ -4390,8 +4511,15 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
         double sign = (bytes[3] & 0x80) ? -1.0 : 1.0;
         v = static_cast<float>(sign * mant * std::pow(2.0, e));
       }
-      float* dest = (f < 3) ? origin : (f < 6) ? step : (f < 9) ? vpos : tcoord;
-      dest[f % 3] = v;
+      float* dest = (f < 3) ? origin : (f < 6) ? step : (f < 9) ? vpos : (f < 12) ? tcoord : clip;
+      if (f < 12)
+      {
+        dest[f % 3] = v;
+      }
+      else
+      {
+        clip[f - 12] = v;
+      }
     }
 
     // Skip pixels that were never covered by the volume (framebuffer held the
@@ -4408,7 +4536,8 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
               << ") origin=(" << origin[0] << ", " << origin[1] << ", " << origin[2] << ") step=("
               << step[0] << ", " << step[1] << ", " << step[2] << ") vpos=(" << vpos[0] << ", "
               << vpos[1] << ", " << vpos[2] << ") tex=(" << tcoord[0] << ", " << tcoord[1] << ", "
-              << tcoord[2] << ")" << std::endl;
+              << tcoord[2] << ") clip=(" << clip[0] << ", " << clip[1] << ", " << clip[2] << ", "
+              << clip[3] << ")" << std::endl;
     std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_BOX " << std::setprecision(6);
     for (int i = 0; i < 8; ++i)
     {
@@ -4552,6 +4681,76 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
     prog->SetUniform3f("in_debugTexel", texelNone);
   }
 
+  // TEMP DEBUG: per-vertex clip-space position dump (GL vs Metal byte-compare).
+  // Renders the proxy indices as 1px points; the fragment encodes ip_vid and
+  // ip_debugClip for every point (channels 100..104). The full framebuffer is
+  // read back per channel so points at arbitrary window positions are captured.
+  // Enabled via VTK_GL_VERTEX_DUMP.
+  if (getenv("VTK_GL_VERTEX_DUMP") != nullptr)
+  {
+    GLint vp[4];
+    glGetIntegerv(GL_VIEWPORT, vp);
+    const GLsizei w = vp[2];
+    const GLsizei h = vp[3];
+    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_VERTCTX vp=(" << vp[0] << ", " << vp[1] << ", "
+              << vp[2] << ", " << vp[3] << ") err=" << glGetError() << std::endl;
+    const int nChannels = 8;
+    std::vector<std::vector<float>> vals(nChannels, std::vector<float>(w * h, 0.0f));
+    std::vector<unsigned char> buf(static_cast<size_t>(w) * h * 4);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    for (int ch = 0; ch < nChannels; ++ch)
+    {
+      prog->SetUniformi("in_debugChannel", 100 + ch);
+      glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+      this->RenderVolumeGeometryPoints(ren, prog, vol, geometry);
+      GLenum e = glGetError();
+      glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
+      size_t nonzero = 0;
+      for (size_t i = 0; i < static_cast<size_t>(w) * h * 4; ++i)
+      {
+        nonzero += (buf[i] != 0);
+      }
+      std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_VERTCHAN ch=" << ch << " nonzero=" << nonzero
+                << " err=" << e << std::endl;
+      for (GLsizei y = 0; y < h; ++y)
+      {
+        for (GLsizei x = 0; x < w; ++x)
+        {
+          const unsigned char* b = &buf[(static_cast<size_t>(y) * w + x) * 4];
+          if (b[0] != 0 || b[1] != 0 || b[2] != 0 || b[3] != 0)
+          {
+            double m23 = static_cast<double>(b[0]) + 256.0 * b[1] + 65536.0 * b[2];
+            double mant = 1.0 + m23 / 8388608.0;
+            int e2 = static_cast<int>(b[3] & 0x7F) - 64;
+            double sign = (b[3] & 0x80) ? -1.0 : 1.0;
+            vals[ch][static_cast<size_t>(y) * w + x] =
+              static_cast<float>(sign * mant * std::pow(2.0, e2));
+          }
+        }
+      }
+    }
+    for (GLsizei y = 0; y < h; ++y)
+    {
+      for (GLsizei x = 0; x < w; ++x)
+      {
+        const size_t idx = static_cast<size_t>(y) * w + x;
+        if (vals[0][idx] != 0.0f)
+        {
+          std::cerr << std::setprecision(9) << "VTK_METAL_VOLUME_LOG DEBUG GL_VERT "
+                    << static_cast<int>(vals[0][idx]) << " px=(" << x << ", " << y << ") clip=("
+                    << vals[1][idx] << ", " << vals[2][idx] << ", " << vals[3][idx] << ", "
+                    << vals[4][idx] << ") pos=(" << vals[5][idx] << ", " << vals[6][idx] << ", "
+                    << vals[7][idx] << ")" << std::endl;
+        }
+      }
+    }
+    glEnable(GL_SCISSOR_TEST);
+    glEnable(GL_DEPTH_TEST);
+    prog->SetUniformi("in_debugChannel", -1);
+  }
+
   // Restore the real composite image for the gated pixels.
   prog->SetUniformi("in_debugSample", -1);
   glEnable(GL_BLEND);
@@ -4586,6 +4785,7 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
       }
     }
   }
+
 }
 
 //------------------------------------------------------------------------------

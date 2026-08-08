@@ -2216,13 +2216,18 @@ fragment SliceSelectionFragmentOut fragment_slice_selection_main(Image2DVertexOu
 // Depth Peeling Shaders
 // ---------------------------------------------------------------------------
 struct PeelUniforms { uint mode; uint peelPass; float2 viewportSize; };
-struct FullscreenVertexOut { float4 position [[position]]; float2 texCoord; };
+struct FullscreenVertexOut {
+  float4 position [[position]];
+  float2 texCoord;
+  float4 clipPos;  // debug: clip-space position (P*V*M*v), interpolated in the fragment
+};
 
 vertex FullscreenVertexOut vertex_fullscreen_main(uint vertex_id [[vertex_id]]) {
   const float2 positions[3] = { float2(-1, -1), float2( 3, -1), float2(-1,  3) };
   const float2 texCoords[3] = { float2(0, 1), float2(2, 1), float2(0, -1) };
   FullscreenVertexOut out;
   out.position = float4(positions[vertex_id], 0, 1);
+  out.clipPos = out.position;
   out.texCoord = texCoords[vertex_id];
   return out;
 }
@@ -2867,6 +2872,9 @@ struct VolumeMapperUniforms {
   // OpenGL in_eyePosObjs[0] parity: object-space eye cast to float32 (see CPU
   // EyePosData). Used directly for normalize(anchorData - eyePosData).
   float4 eyePosData;
+  // TEMP DEBUG (anchor A/B): additive data-space anchor perturbation from
+  // VTK_METAL_ANCHOR_PERTURB, applied before the dirObj normalize.
+  float3 anchorPerturbData;
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -2894,6 +2902,7 @@ struct VolumeLightUniforms {
 struct VolumeVertexOut {
   float4 position [[position]];
   float3 localPos;
+  float4 clipPos;  // debug: exact clip-space position (P*V*M*v), interpolated in the fragment
   uint instanceID [[flat]];
 };
 
@@ -2912,6 +2921,7 @@ struct PerBlockData {
 
 vertex VolumeVertexOut vertex_volume_main(
     VolumeVertexIn in [[stage_in]],
+    uint vertexId [[vertex_id]],
     constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
     constant PerBlockData& b [[buffer(2)]]) {
   VolumeVertexOut out;
@@ -2939,6 +2949,7 @@ vertex VolumeVertexOut vertex_volume_main(
   // — bit-identical with GL.
   out.position = volumeUniforms.projectionMatrix * volumeUniforms.modelViewMatrix *
       volumeUniforms.volumeToWorld * float4(modelPos, 1.0);
+  out.clipPos = out.position;
   if (volumeUniforms.useCameraInsideNearClip > 0.5)
   {
     out.localPos = modelPos;  // data-space (interpolated in data space like GL)
@@ -2952,8 +2963,8 @@ vertex VolumeVertexOut vertex_volume_main(
   // vertices, so this stays bounded to a few messages per frame. Verified by
   // TestMetalVolumeShaderLog.
 #if defined(VTK_METAL_ENABLE_LOGGING)
-  os_log_default.log_info("VTK_METAL_VOLUME_LOG vertex_volume_main modelPos=(%f, %f, %f)",
-    modelPos.x, modelPos.y, modelPos.z);
+  os_log_default.log_info("VTK_METAL_VOLUME_LOG vertex_volume_main vid=%u modelPos=(%.9g, %.9g, %.9g) clip=(%.9g, %.9g, %.9g, %.9g)",
+    vertexId, modelPos.x, modelPos.y, modelPos.z, out.position.x, out.position.y, out.position.z, out.position.w);
 #endif
   return out;
 }
@@ -3648,6 +3659,7 @@ struct MarchParams {
     float3 texMaxGlobal;
     float2 screenPos;  // in-viewport pixel coords; (-1,-1) when unknown
     float3 localPos;   // interpolated fragment position in [0,1] volume space
+    float4 clipPos;    // debug: interpolated clip-space position (perspective-correct)
     bool   checkBounds;
     float3 anchorData; // interpolated anchor in dataset space (GL ip_vertexPos parity)
     bool   anchorIsData; // anchorData holds a data-space position (camera-inside proxy path)
@@ -3842,7 +3854,8 @@ inline float4 marchVolumeUnified(
     // OpenGL in_eyePosObjs[0] parity: GL passes the dataset-space eye as a
     // float32 uniform (computed on the CPU as invert(dataToWorld^T * modelView)
     // row 3), never reconstructs it from the normalized cameraVolumePos.
-    dirObj = normalize(p.anchorData - volumeUniforms.eyePosData.xyz);
+    dirObj = normalize((p.anchorData + volumeUniforms.anchorPerturbData.xyz) -
+                       volumeUniforms.eyePosData.xyz);
   }
   else
   {
@@ -4003,10 +4016,12 @@ inline float4 marchVolumeUnified(
   //   sampleDistanceWorld: GL in_sampleDistance (world units)
 #if defined(VTK_METAL_ENABLE_LOGGING)
     if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
-    os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG STEP px=(%d, %d) cameraVol=(%0.9e, %0.9e, %0.9e) localPos=(%0.9e, %0.9e, %0.9e) rayDir=(%0.9e, %0.9e, %0.9e) dirObj=(%0.9e, %0.9e, %0.9e) evalStep=(%0.9e, %0.9e, %0.9e) texStep=(%0.9e, %0.9e, %0.9e) boundsSize=(%0.9e, %0.9e, %0.9e) sampleDistanceWorld=%0.9e ctpScale=(%0.9e, %0.9e, %0.9e) ctpOffset=(%0.9e, %0.9e, %0.9e)",
+    os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG STEP px=(%d, %d) cameraVol=(%0.9e, %0.9e, %0.9e) localPos=(%0.9e, %0.9e, %0.9e) clip=(%0.9e, %0.9e, %0.9e, %0.9e) anchorData=(%0.9e, %0.9e, %0.9e) rayDir=(%0.9e, %0.9e, %0.9e) dirObj=(%0.9e, %0.9e, %0.9e) evalStep=(%0.9e, %0.9e, %0.9e) texStep=(%0.9e, %0.9e, %0.9e) boundsSize=(%0.9e, %0.9e, %0.9e) sampleDistanceWorld=%0.9e ctpScale=(%0.9e, %0.9e, %0.9e) ctpOffset=(%0.9e, %0.9e, %0.9e)",
         int(p.screenPos.x), int(p.screenPos.y),
         volumeUniforms.cameraVolumePos.x, volumeUniforms.cameraVolumePos.y, volumeUniforms.cameraVolumePos.z,
         p.localPos.x, p.localPos.y, p.localPos.z,
+        p.clipPos.x, p.clipPos.y, p.clipPos.z, p.clipPos.w,
+        p.anchorData.x, p.anchorData.y, p.anchorData.z,
         p.rayDir.x, p.rayDir.y, p.rayDir.z,
         dirObj.x, dirObj.y, dirObj.z,
         evalStep.x, evalStep.y, evalStep.z,
@@ -4777,6 +4792,7 @@ inline float4 marchVolume(
     float totalBoxT,
     float2 screenPos,
     float3 localPos,
+    float4 clipPos,
     float3 anchorData,
     bool anchorIsData,
     float3 initialColor,
@@ -4823,8 +4839,8 @@ inline float4 marchVolume(
     }
   }
   MarchParams p = {cameraPos, rayDir, tStart, totalBoxT, stepSize, jitter, tTerminateMax,
-      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, screenPos, localPos, true,
-      anchorData, anchorIsData};
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, screenPos, localPos, clipPos,
+      true, anchorData, anchorIsData};
   return marchVolumeUnified(p, initialColor, initialOpacity,
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
@@ -4866,7 +4882,7 @@ inline void marchSegment(
   float3 zero = float3(0.0);
   float3 one = float3(1.0);
   MarchParams p = {rayOrigin, rayDir, t0, t1, stepSize, jitter, tTerminateMax,
-      zero, one, zero, one, screenPos, rayOrigin + rayDir * t0, false,
+      zero, one, zero, one, screenPos, rayOrigin + rayDir * t0, float4(0.0, 0.0, 0.0, 1.0), false,
       rayOrigin + rayDir * t0, false};
   float4 result = marchVolumeUnified(p, accumulatedColor, accumulatedOpacity,
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
@@ -4948,7 +4964,7 @@ fragment VolumeFragmentOut fragment_volume_main(
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
-      stepSize, s.totalBoxT, in.position.xy, localPos, anchorData, cameraInsideProxy,
+      stepSize, s.totalBoxT, in.position.xy, localPos, in.clipPos, anchorData, cameraInsideProxy,
       float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -5027,7 +5043,7 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
-      stepSize, s.totalBoxT, in.position.xy, localPos, anchorData, cameraInsideProxy,
+      stepSize, s.totalBoxT, in.position.xy, localPos, in.clipPos, anchorData, cameraInsideProxy,
       float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -5098,7 +5114,7 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
-      stepSize, s.totalBoxT, in.position.xy, s.entryPoint, s.entryPoint, false,
+      stepSize, s.totalBoxT, in.position.xy, s.entryPoint, in.clipPos, s.entryPoint, false,
       float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -5155,7 +5171,7 @@ fragment VolumeSelectionOut fragment_volume_fullscreen_selection_main(
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
-      stepSize, s.totalBoxT, in.position.xy, s.entryPoint, s.entryPoint, false,
+      stepSize, s.totalBoxT, in.position.xy, s.entryPoint, in.clipPos, s.entryPoint, false,
       float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -5232,8 +5248,8 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
   float jitter = (volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) : 1.0) * stepSize;
   float tStart = parallel ? 0.0 : dot(s.entryPoint - cameraPos, rayDir);
   MarchParams p = {rayOrigin, rayDir, tStart, s.totalBoxT, stepSize, jitter, s.tTerminateMax,
-      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, in.position.xy, localPos, true,
-      anchorData, cameraInsideProxy};
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, in.position.xy, localPos,
+      in.clipPos, true, anchorData, cameraInsideProxy};
 
   float3 firstOpaquePos = float3(-1.0);
   bool searching = true;

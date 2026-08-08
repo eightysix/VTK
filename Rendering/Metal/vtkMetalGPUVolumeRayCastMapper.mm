@@ -275,11 +275,16 @@ struct VolumeMapperUniforms
   // to float32). The fragment shader consumes this directly for
   // normalize(anchorData - eyePosData) instead of re-expanding the normalized
   // cameraVolumePos through the bounds, which drifted ~1 ulp/step.
-  float EyePosData[4];              // 1840..1855 (total 1856, 16-byte aligned)
+  float EyePosData[4];              // 1840..1855
+  // TEMP DEBUG (anchor A/B): additive data-space perturbation applied to
+  // anchorData before the dirObj normalize, set from VTK_METAL_ANCHOR_PERTURB
+  // (data units, "x,y,z"). Tests whether the ~1e-5 MT-GL anchor interpolation
+  // difference drives the knife-edge flips.
+  float AnchorPerturbData[4];       // 1856..1871 (total 1872, 16-byte aligned)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1856,
-  "VolumeMapperUniforms must be 1856 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1872,
+  "VolumeMapperUniforms must be 1872 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -6691,6 +6696,21 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       uniforms.EyePosData[i] = static_cast<float>(dataToView->GetElement(3, i));
     }
     uniforms.EyePosData[3] = 1.0f;
+    uniforms.AnchorPerturbData[0] = uniforms.AnchorPerturbData[1] =
+      uniforms.AnchorPerturbData[2] = 0.0f;
+    uniforms.AnchorPerturbData[3] = 1.0f;
+    if (const char* ap = getenv("VTK_METAL_ANCHOR_PERTURB"))
+    {
+      sscanf(ap, "%f,%f,%f", &uniforms.AnchorPerturbData[0], &uniforms.AnchorPerturbData[1],
+        &uniforms.AnchorPerturbData[2]);
+    }
+    if (uniforms.AnchorPerturbData[0] != 0.0f || uniforms.AnchorPerturbData[1] != 0.0f ||
+      uniforms.AnchorPerturbData[2] != 0.0f)
+    {
+      std::cerr << "VTK_METAL_VOLUME_LOG DEBUG MTL_ANCHOR_PERTURB=("
+                << uniforms.AnchorPerturbData[0] << ", " << uniforms.AnchorPerturbData[1] << ", "
+                << uniforms.AnchorPerturbData[2] << ")" << std::endl;
+    }
     std::cerr << std::setprecision(9) << "VTK_METAL_VOLUME_LOG DEBUG MTL_EYE double=("
               << dataToView->GetElement(3, 0) << ", " << dataToView->GetElement(3, 1) << ", "
               << dataToView->GetElement(3, 2) << ") float=(" << uniforms.EyePosData[0] << ", "

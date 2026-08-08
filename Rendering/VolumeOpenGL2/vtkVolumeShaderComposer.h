@@ -86,7 +86,30 @@ inline std::string ComputeClipPositionImplementation(
     "  // p_clip = T_ProjViewModel * T_dataToWorld * p_data\n"
     "  vec4 pos = in_projectionMatrix * in_modelViewMatrix * in_volumeMatrix[0] *\n"
     "    vec4(in_vertexPos.xyz, 1.0);\n"
-    "  gl_Position = pos;\n");
+    "  gl_Position = pos;\n"
+    "  ip_debugClip = pos;\n"
+    "  ip_debugClipFlat = pos;\n"
+    "  if (in_debugVertexMode == 1)\n"
+    "  {\n"
+    "    int k = gl_VertexID / 3;\n"
+    "    int corner = gl_VertexID % 3;\n"
+    "    ip_vid = k;\n"
+    "    float baseX = -0.998 + float(k) * (5.0 / 256.0);\n"
+    "    float baseY = -0.92;\n"
+    "    float cornerX = baseX;\n"
+    "    float cornerY = baseY;\n"
+    "    if (corner == 1)\n"
+    "    {\n"
+    "      cornerX += 2.0 / 256.0;\n"
+    "    }\n"
+    "    if (corner == 2)\n"
+    "    {\n"
+    "      cornerY += 2.0 / 256.0;\n"
+    "    }\n"
+    "    gl_Position = vec4(cornerX, cornerY, 0.5, 1.0);\n"
+    "    return;\n"
+    "  }\n"
+    "  ip_vid = gl_VertexID;\n");
 }
 
 //--------------------------------------------------------------------------
