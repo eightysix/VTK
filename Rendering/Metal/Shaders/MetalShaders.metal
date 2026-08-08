@@ -3061,11 +3061,11 @@ inline float4 sampleComponentTransferFunction(
 }
 
 // 2D transfer function lookup at (primaryScalarNorm, secondScalarNorm).
-inline half4 sampleTransferFunction2D(texture2d<float> tf2DTex, float2 uv) {
+inline float4 sampleTransferFunction2D(texture2d<float> tf2DTex, float2 uv) {
   if (fc_linearInterpolation) {
-    return half4(tf2DTex.sample(sVolume, uv, level(0)));
+    return tf2DTex.sample(sVolume, uv, level(0));
   }
-  return half4(tf2DTex.sample(sNearest, uv, level(0)));
+  return tf2DTex.sample(sNearest, uv, level(0));
 }
 
 // Fetch the Y-axis scalar array (e.g. "Temp") at the same normalized volume
@@ -3339,23 +3339,23 @@ inline void computeGradientsAllComponents(
 //   r     = normalize(2*nDotL*normal + g_ldir)
 //   vDotR = dot(r, -g_vdir)
 //   specular = pow(vDotR, shininess) * in_specular * in_lightSpecularColor
-inline half3 computePhongLightingVolumeFast(half3 sampleColor, half3 normal, half3 lightDir, half3 viewDir,
-                                            half3 ambientMat, half3 diffuseMat, half3 specularMat, half shininess,
-                                            bool twoSided = false) {
-  half nDotL = dot(normal, -lightDir);
+inline float3 computePhongLightingVolumeFast(float3 sampleColor, float3 normal, float3 lightDir, float3 viewDir,
+                                             float3 ambientMat, float3 diffuseMat, float3 specularMat, float shininess,
+                                             bool twoSided = false) {
+  float nDotL = dot(normal, -lightDir);
   // Reflection vector uses the un-negated nDotL (matches OpenGL's
   // ComputeLightingDeclaration, which computes r before the two-sided flip).
   // Guard on (nDotL > 0 || twoSided): for back-facing non-twoSided samples the
   // result is discarded, so skip the normalize/dot entirely.
-  if (nDotL > 0.0h || twoSided) {
-    half3 r = normalize(normal * (2.0h * nDotL) + lightDir);
-    half vDotR = max(dot(r, -viewDir), 0.0h);
-    if (nDotL < 0.0h && twoSided) {
+  if (nDotL > 0.0f || twoSided) {
+    float3 r = normalize(normal * (2.0f * nDotL) + lightDir);
+    float vDotR = max(dot(r, -viewDir), 0.0f);
+    if (nDotL < 0.0f && twoSided) {
       nDotL = -nDotL;
     }
-    if (nDotL > 0.0h) {
-      half3 diffuse = nDotL * diffuseMat * sampleColor;
-      half3 specular = fast::pow(vDotR, shininess) * specularMat;
+    if (nDotL > 0.0f) {
+      float3 diffuse = nDotL * diffuseMat * sampleColor;
+      float3 specular = fast::pow(vDotR, shininess) * specularMat;
       return ambientMat * sampleColor + diffuse + specular;
     }
   }
@@ -3369,20 +3369,20 @@ inline half3 computePhongLightingVolumeFast(half3 sampleColor, half3 normal, hal
 // toward the scene / fragment), consistent with in_lightDirection =
 // normalize(focalPoint - position), and vDotR uses -viewDir (OpenGL's
 // dot(-viewDirection, r)).
-inline half3 computeVolumeLighting(
-    half3 sampleColor,
-    half3 normal,
-    half3 viewDir,           // normalized, pointing toward camera (data space)
-    half3 ambientMat,
-    half3 diffuseMat,
-    half3 specularMat,
-    half shininess,
+inline float3 computeVolumeLighting(
+    float3 sampleColor,
+    float3 normal,
+    float3 viewDir,           // normalized, pointing toward camera (data space)
+    float3 ambientMat,
+    float3 diffuseMat,
+    float3 specularMat,
+    float shininess,
     constant VolumeLightUniforms& lightUniforms,
     float3 fragPosVolume)    // current sample position in data space
 {
-    half3 totalAmbient  = half3(0.0h);
-    half3 totalDiffuse  = half3(0.0h);
-    half3 totalSpecular = half3(0.0h);
+    float3 totalAmbient  = float3(0.0f);
+    float3 totalDiffuse  = float3(0.0f);
+    float3 totalSpecular = float3(0.0f);
 
     int numLights = lightUniforms.lightCount;
     bool twoSided = lightUniforms.twoSidedLighting != 0;
@@ -3390,64 +3390,64 @@ inline half3 computeVolumeLighting(
     for (int i = 0; i < numLights && i < MAX_LIGHTS; ++i) {
         constant VolumeLight& L = lightUniforms.lights[i];
 
-        half3 lightAmbient  = half3(L.ambientColor.rgb);
-        half3 lightDiffuse  = half3(L.diffuseColor.rgb);
-        half3 lightSpecular = half3(L.specularColor.rgb);
+        float3 lightAmbient  = float3(L.ambientColor.rgb);
+        float3 lightDiffuse  = float3(L.diffuseColor.rgb);
+        float3 lightSpecular = float3(L.specularColor.rgb);
 
-        half3 toLight;
-        half attenuation = 1.0h;
+        float3 toLight;
+        float attenuation = 1.0f;
 
         if (L.position.w < 0.5) {
             // Directional light: direction is pre-normalized in data space and
             // points along the light's travel direction (OpenGL
             // in_lightDirection parity).
-            toLight = half3(L.direction.xyz);
+            toLight = float3(L.direction.xyz);
         } else {
             // Positional light: compute the direction the light travels
             // (light -> fragment, matching OpenGL's
             // normalize(fragWorldPos - lightPosition)).
-            half3 lightPos = half3(L.position.xyz);
-            half3 delta = half3(fragPosVolume) - lightPos;
-            half dist = length(delta);
-            toLight = dist > 0.0001h ? delta / dist : half3(0.0h, 0.0h, 1.0h);
+            float3 lightPos = float3(L.position.xyz);
+            float3 delta = float3(fragPosVolume) - lightPos;
+            float dist = length(delta);
+            toLight = dist > 0.0001f ? delta / dist : float3(0.0f, 0.0f, 1.0f);
 
             // Attenuation: 1 / (constant + linear*d + quadratic*d^2)
-            half attenDenom = half(L.attenuation.x)
-                            + half(L.attenuation.y) * dist
-                            + half(L.attenuation.z) * dist * dist;
-            attenuation = attenDenom > 0.0h ? 1.0h / attenDenom : 0.0h;
+            float attenDenom = L.attenuation.x
+                             + L.attenuation.y * dist
+                             + L.attenuation.z * dist * dist;
+            attenuation = attenDenom > 0.0f ? 1.0f / attenDenom : 0.0f;
 
             // Spot light cone check: the cone axis is L.direction (the light's
             // travel direction); a fragment is inside the cone when the
             // light->fragment direction is within the cone angle of the axis
             // (OpenGL coneDot = dot(vertLightDirection, lightDir)).
             if (L.direction.w <= 90.0) {
-                half spotCos = dot(toLight, half3(normalize(L.direction.xyz)));
-                half spotCutoff = half(cos(float(L.direction.w) * (M_PI_F / 180.0)));
+                float spotCos = dot(toLight, float3(normalize(L.direction.xyz)));
+                float spotCutoff = cos(L.direction.w * (M_PI_F / 180.0));
                 if (spotCos < spotCutoff) {
-                    attenuation = 0.0h;
+                    attenuation = 0.0f;
                 } else {
-                    attenuation *= fast::pow(spotCos, half(L.attenuation.w));
+                    attenuation *= fast::pow(spotCos, L.attenuation.w);
                 }
             }
         }
 
         // Diffuse
-        half nDotL = dot(normal, toLight);
-        if (nDotL < 0.0h && twoSided) {
+        float nDotL = dot(normal, toLight);
+        if (nDotL < 0.0f && twoSided) {
             nDotL = -nDotL;
         }
-        if (nDotL > 0.0h) {
+        if (nDotL > 0.0f) {
             totalDiffuse += nDotL * lightDiffuse * attenuation;
 
             // Phong reflection vector (matches OpenGL's ComputeLightingDeclaration
             // and computePhongLightingVolumeFast)
-            half3 r = normalize(normal * (2.0h * nDotL) - toLight);
-            half vDotR = dot(-viewDir, r);
-            if (vDotR < 0.0h && twoSided) {
+            float3 r = normalize(normal * (2.0f * nDotL) - toLight);
+            float vDotR = dot(-viewDir, r);
+            if (vDotR < 0.0f && twoSided) {
                 vDotR = -vDotR;
             }
-            if (vDotR > 0.0h) {
+            if (vDotR > 0.0f) {
                 totalSpecular += fast::pow(vDotR, shininess) * lightSpecular * attenuation;
             }
         }
@@ -3710,9 +3710,9 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
          pxOkCamOut || pxOkResid || pxOkNoJitter || pxOkAlways;
 }
 
-inline half4 marchVolumeUnified(
+inline float4 marchVolumeUnified(
     MarchParams p,
-    half3 initialColor, half initialOpacity,
+    float3 initialColor, float initialOpacity,
     constant VolumeMapperUniforms& volumeUniforms,
     constant PerBlockData& b,
     texture3d<float> volumeTexture,
@@ -3748,8 +3748,8 @@ inline half4 marchVolumeUnified(
   float scalarScale = 1.0f / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4f);
   float scalarBias  = -volumeUniforms.scalarMin * scalarScale;
 
-  half secondScale = half(volumeUniforms.transfer2DYAxisScale);
-  half secondBias  = half(volumeUniforms.transfer2DYAxisBias);
+  float secondScale = volumeUniforms.transfer2DYAxisScale;
+  float secondBias  = volumeUniforms.transfer2DYAxisBias;
 
   float gradNormFactor = max(1e-8f, volumeUniforms.gradientOpacityRange.y);
 
@@ -3801,12 +3801,12 @@ inline half4 marchVolumeUnified(
   // distorted volume frame here would bias nDotL for anisotropic bounds and fire
   // specular on surfaces where OpenGL's nDotL is <= 0.
   float3 entryVolPos = p.rayOrigin + p.rayDir * p.tStart;
-  half3 viewDirHalf  = half3(normalize((entryVolPos - volumeUniforms.cameraVolumePos.xyz) * boundsSize));
-  half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection * boundsSize));
-  half3 ambientMat   = half3(volumeUniforms.ambientColor.rgb);
-  half3 diffuseMat   = half3(volumeUniforms.diffuseColor.rgb);
-  half3 specularMat  = half3(volumeUniforms.specularColor.rgb);
-  half shininessMat  = half(volumeUniforms.shininess);
+  float3 viewDirHalf  = normalize((entryVolPos - volumeUniforms.cameraVolumePos.xyz) * boundsSize);
+  float3 lightDirHalf = normalize(volumeUniforms.lightDirection * boundsSize);
+  float3 ambientMat   = float3(volumeUniforms.ambientColor.rgb);
+  float3 diffuseMat   = float3(volumeUniforms.diffuseColor.rgb);
+  float3 specularMat  = float3(volumeUniforms.specularColor.rgb);
+  float shininessMat  = float(volumeUniforms.shininess);
 
   float maskScale = volumeUniforms.maskScale;
   float maskBias  = volumeUniforms.maskBias;
@@ -3862,18 +3862,18 @@ inline half4 marchVolumeUnified(
   // constant so composite pipelines carry no extra cost.
   float mipMaxScalar = 0.0f;    // MIP: max normalized scalar along the ray
   float minipMinScalar = 1.0f;  // MinIP: min normalized scalar along the ray
-  half avgBlendSum = 0.0h;     // AverageIP: sum(opacity * scalar) over in-range samples
+  float avgBlendSum = 0.0f;     // AverageIP: sum(opacity * scalar) over in-range samples
   int avgBlendCount = 0;       // AverageIP: number of in-range samples
-  half additiveSum = 0.0h;     // Additive: sum(opacity * scalar)
+  float additiveSum = 0.0f;    // Additive: sum(opacity * scalar)
   bool firstBlendSample = true;
 
   // Per-component accumulators for the independent multi-component path.
   // Only the active blend mode's arrays are touched.
-  half mipMaxScalarComp[4] = {0.0h, 0.0h, 0.0h, 0.0h};
-  half minipMinScalarComp[4] = {1.0h, 1.0h, 1.0h, 1.0h};
-  half avgBlendSumComp[4] = {0.0h, 0.0h, 0.0h, 0.0h};
+  float mipMaxScalarComp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float minipMinScalarComp[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+  float avgBlendSumComp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   int avgBlendCountComp[4] = {0, 0, 0, 0};
-  half additiveSumComp[4] = {0.0h, 0.0h, 0.0h, 0.0h};
+  float additiveSumComp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
   // Per-component gradients (independent path only): computed lazily at most
   // once per sample from a single six-texel batch and reused by the
@@ -4109,30 +4109,30 @@ inline half4 marchVolumeUnified(
     // Per-component normalization against each component's own scalar range
     // (OpenGL in_scalarsRange parity); defaults to the single-path norm when
     // the independent path is inactive.
-    half scalarNormComp[4] = {half(scalarNorm), half(scalarNorm), half(scalarNorm), half(scalarNorm)};
+    float scalarNormComp[4] = {scalarNorm, scalarNorm, scalarNorm, scalarNorm};
     // Per-component scalar->normalized scale/bias (OpenGL in_scalarsRange
     // parity), computed here once per sample so the density-gradient shading
     // path reuses them instead of recomputing the reciprocal per lit sample.
-    half compScale[4] = {0.0h, 0.0h, 0.0h, 0.0h};
-    half compBias[4] = {0.0h, 0.0h, 0.0h, 0.0h};
+    float compScale[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float compBias[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     if (useIndependentPath) {
       int nComp = min(4, int(volumeUniforms.numComponents));
       for (int c = 0; c < nComp; ++c) {
-        half cMin = half(volumeUniforms.scalarMinComp[c]);
-        half cRange = max(half(volumeUniforms.scalarMaxComp[c]) - cMin, 1e-4h);
-        compScale[c] = 1.0h / cRange;
+        float cMin = volumeUniforms.scalarMinComp[c];
+        float cRange = max(volumeUniforms.scalarMaxComp[c] - cMin, 1e-4f);
+        compScale[c] = 1.0f / cRange;
         compBias[c] = -cMin / cRange;
         float rawComp;
         if (c == 0) rawComp = rawScalar;
         else if (c == 1) rawComp = rawScalar4.g;
         else if (c == 2) rawComp = rawScalar4.b;
         else rawComp = rawScalar4.a;
-        scalarNormComp[c] = saturate((half(rawComp) - cMin) / cRange);
+        scalarNormComp[c] = saturate((rawComp - cMin) / cRange);
       }
     }
 
     float4 colorOpacity;
-    half maskLabel = 0.0h;
+    float maskLabel = 0.0f;
     // Gradient shared between the TF_2D gradient y-axis and shading/gradient
     // opacity so it is computed at most once per sample (computeGradientFast
     // is 6 texture fetches).
@@ -4145,7 +4145,7 @@ inline half4 marchVolumeUnified(
     bool densityGradReady = false;
 
     // Per-component transfer-function results (independent path only).
-    half4 compColor[4] = {half4(0.0h), half4(0.0h), half4(0.0h), half4(0.0h)};
+    float4 compColor[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
 
     // MIP/MinIP only track the scalar extremum; the transfer function is
     // re-sampled once at the end (matching OpenGL, whose MIP/MinIP path never
@@ -4159,14 +4159,14 @@ inline half4 marchVolumeUnified(
       if (fc_needsPerSampleOpacity) {
         int nComp = min(4, int(volumeUniforms.numComponents));
         for (int c = 0; c < nComp; ++c) {
-          compColor[c] = half4(sampleComponentTransferFunction(
+          compColor[c] = float4(sampleComponentTransferFunction(
               transferFunctionTexture, transferFunctionTexture1,
               transferFunctionTexture2, transferFunctionTexture3,
-              float2(float(scalarNormComp[c]), 0.5), c));
+              float2(scalarNormComp[c], 0.5), c));
         }
       }
     } else if (fc_needsPerSampleOpacity && doTransfer2D) {
-      half secondNorm;
+      float secondNorm;
       if (volumeUniforms.transfer2DUseGradient > 0.5) {
         // Legacy TF_2D (no Y-axis array): the second axis is the gradient
         // magnitude, using the same normalization as gradient opacity — this is
@@ -4177,17 +4177,17 @@ inline half4 marchVolumeUnified(
         secondNorm = sharedGrad.w;
       } else {
         secondNorm = saturate(
-            half(sampleSecondScalar(transfer2DYAxisTexture, evalPoint)) * secondScale + secondBias);
+            sampleSecondScalar(transfer2DYAxisTexture, evalPoint) * secondScale + secondBias);
       }
       colorOpacity = float4(sampleTransferFunction2D(
-          transferFunction2DTexture, float2(float(scalarNorm), float(secondNorm))));
+          transferFunction2DTexture, float2(scalarNorm, secondNorm)));
     } else if (fc_needsPerSampleOpacity && doMask) {
       float maskVal = rawMask * maskScale + maskBias;
       if (numLabels > 0.0) {
         float label = floor(maskVal + 0.5);
         if (label > 0.0) {
           label = clamp(label, 1.0, numLabels - 1.0);
-          maskLabel = half(label);
+          maskLabel = label;
           float labelY = (label + 0.5) / numLabels;
           colorOpacity = float4(labelMapTransferTexture.sample(sNearest, float2(float(scalarNorm), labelY), level(0)));
         } else {
@@ -4217,12 +4217,12 @@ inline half4 marchVolumeUnified(
         // range — so it is sampled at the two different coordinates.
         float4 laColor = sampleTransferFunction(
             transferFunctionTexture, float2(float(scalarNorm), 0.5));
-        half lastMin = half(volumeUniforms.scalarMinComp[1]);
-        half lastMax = half(volumeUniforms.scalarMaxComp[1]);
-        half lastNorm = saturate(
-            (half(rawScalar4.g) - lastMin) / max(lastMax - lastMin, 1e-4h));
+        float lastMin = volumeUniforms.scalarMinComp[1];
+        float lastMax = volumeUniforms.scalarMaxComp[1];
+        float lastNorm = saturate(
+            (rawScalar4.g - lastMin) / max(lastMax - lastMin, 1e-4f));
         float laOpacity = sampleTransferFunction(
-            transferFunctionTexture, float2(float(lastNorm), 0.5)).a;
+            transferFunctionTexture, float2(lastNorm, 0.5)).a;
         colorOpacity = float4(laColor.rgb, laOpacity);
       } else {
         colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
@@ -4264,11 +4264,11 @@ inline half4 marchVolumeUnified(
       }
       // Combined per-sample alpha (OpenGL totalAlpha): weighted sum of the
       // component opacities. Drives the RTT depth and the composite gate.
-      half totalAlpha = 0.0h;
+      float totalAlpha = 0.0f;
       int nComp = min(4, int(volumeUniforms.numComponents));
       for (int c = 0; c < nComp; ++c) {
         if (volumeUniforms.componentWeight[c] <= 0.0) continue;
-        totalAlpha += compColor[c].a * half(volumeUniforms.componentWeight[c]);
+        totalAlpha += compColor[c].a * volumeUniforms.componentWeight[c];
       }
       sampleOpacity = totalAlpha;
     }
@@ -4297,11 +4297,11 @@ inline half4 marchVolumeUnified(
       } else if (fc_blendMode == 3) {    // AVERAGE_INTENSITY_BLEND
         int nComp = min(4, int(volumeUniforms.numComponents));
         for (int c = 0; c < nComp; ++c) {
-          half intensityNorm =
-            half(volumeUniforms.scalarMinComp[c]) +
-            (half(volumeUniforms.scalarMaxComp[c]) - half(volumeUniforms.scalarMinComp[c])) * scalarNormComp[c];
-          if (intensityNorm >= half(volumeUniforms.averageIPRangeMin) &&
-              intensityNorm <= half(volumeUniforms.averageIPRangeMax)) {
+          float intensityNorm =
+            volumeUniforms.scalarMinComp[c] +
+            (volumeUniforms.scalarMaxComp[c] - volumeUniforms.scalarMinComp[c]) * scalarNormComp[c];
+          if (intensityNorm >= volumeUniforms.averageIPRangeMin &&
+              intensityNorm <= volumeUniforms.averageIPRangeMax) {
             avgBlendSumComp[c] += compColor[c].a * scalarNormComp[c];
             avgBlendCountComp[c]++;
           }
@@ -4325,10 +4325,10 @@ inline half4 marchVolumeUnified(
     } else if (fc_blendMode == 3) {    // AVERAGE_INTENSITY_BLEND
       // Intensity in the volume scalar range (native units pre-divided by the
       // normalization factor, matching the averageIPRangeMin/Max uniforms).
-      half intensityNorm =
+      float intensityNorm =
         volumeUniforms.scalarMin + (volumeUniforms.scalarMax - volumeUniforms.scalarMin) * scalarNorm;
-      if (intensityNorm >= half(volumeUniforms.averageIPRangeMin) &&
-          intensityNorm <= half(volumeUniforms.averageIPRangeMax)) {
+      if (intensityNorm >= volumeUniforms.averageIPRangeMin &&
+          intensityNorm <= volumeUniforms.averageIPRangeMax) {
         avgBlendSum += sampleOpacity * scalarNorm;
         avgBlendCount++;
       }
@@ -4338,7 +4338,7 @@ inline half4 marchVolumeUnified(
     // RenderToImage depth: record the world position of the first non-skipped
     // sample whose transfer-function opacity is positive (matches the OpenGL
     // backend's l_opaqueFragPos update).
-    if (haveOpaquePos != nullptr && *haveOpaquePos && sampleOpacity > 0.0h) {
+    if (haveOpaquePos != nullptr && *haveOpaquePos && sampleOpacity > 0.0f) {
       *firstOpaquePos = currentPoint;
       *haveOpaquePos = false;
     }
@@ -4348,43 +4348,43 @@ inline half4 marchVolumeUnified(
     if (useIndependentPath) {
       // OpenGL composites every sample with positive opacity (g_srcColor.a > 0.0);
       // the 0.001h gate here would drop low-opacity leading samples (border rays).
-      if (fc_blendMode == 0 && sampleOpacity > 0.0h) {
+      if (fc_blendMode == 0 && sampleOpacity > 0.0f) {
         // OpenGL composite accumulation: per-component colors are combined via
         // g_srcColor = sum(color[i] * weight[i]) and the weighted opacity sum
         // is used for the alpha accumulation (srcBlend = dstAlpha factor),
         // matching vtkVolumeShaderComposer's independent-component loop.
-        half3 tmpRGB = half3(0.0h);
-        half tmpA = 0.0h;
+        float3 tmpRGB = float3(0.0f);
+        float tmpA = 0.0f;
         int nComp = min(4, int(volumeUniforms.numComponents));
         for (int c = 0; c < nComp; ++c) {
-          half w = half(volumeUniforms.componentWeight[c]);
-          if (w <= 0.0h) continue;
-          half4 cc = compColor[c];
-          half3 ccRGB = cc.rgb;
-          if (sampleOpacity >= 0.01h && doShading) {
-            half3 normal;
+          float w = float(volumeUniforms.componentWeight[c]);
+          if (w <= 0.0f) continue;
+          float4 cc = compColor[c];
+          float3 ccRGB = cc.rgb;
+          if (sampleOpacity >= 0.01f && doShading) {
+            float3 normal;
             if (fc_computeNormalFromOpacity && volumeUniforms.useComputeNormalFromOpacity > 0.5) {
-              normal = half3(computeDensityGradientFast(volumeTexture,
+              normal = float3(computeDensityGradientFast(volumeTexture,
                   transferFunctionTexture, transferFunctionTexture1,
                   transferFunctionTexture2, transferFunctionTexture3,
                   evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture,
                   gradNormFactor, c, compScale[c], compBias[c]).xyz);
             } else if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
-              half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
-              normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
+              float4 nrmSample = float4(normalTexture.sample(sVolume, evalPoint, level(0)));
+              normal = normalize(nrmSample.xyz * 2.0f - 1.0f);
             } else {
               if (!compGradReady) {
                 computeGradientsAllComponents(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor, compGrad);
                 compGradReady = true;
               }
-              normal = half3(compGrad[c].xyz);
+              normal = float3(compGrad[c].xyz);
             }
             // Per-component material and shininess (OpenGL lightingComponent
             // index parity).
-            half3 ambC = half3(volumeUniforms.ambientColorComp[c].rgb);
-            half3 difC = half3(volumeUniforms.diffuseColorComp[c].rgb);
-            half3 speC = half3(volumeUniforms.specularColorComp[c].rgb);
-            half  shiC = half(volumeUniforms.shininessComp[c]);
+            float3 ambC = float3(volumeUniforms.ambientColorComp[c].rgb);
+            float3 difC = float3(volumeUniforms.diffuseColorComp[c].rgb);
+            float3 speC = float3(volumeUniforms.specularColorComp[c].rgb);
+            float  shiC = float(volumeUniforms.shininessComp[c]);
             if (lightUniforms != nullptr && lightUniforms->defaultLighting == 0) {
               ccRGB = computeVolumeLighting(ccRGB, normal, -viewDirHalf,
                   ambC, difC, speC, shiC,
@@ -4402,10 +4402,10 @@ inline half4 marchVolumeUnified(
           tmpA += (cc.a * cc.a) / sampleOpacity;
         }
         float weight = 1.0f - accumulatedOpacity;
-        accumulatedColor += weight * float3(tmpRGB);
+        accumulatedColor += weight * tmpRGB;
         accumulatedOpacity += weight * tmpA;
       }
-    } else if (fc_blendMode == 0 && sampleOpacity > 0.0h) {
+    } else if (fc_blendMode == 0 && sampleOpacity > 0.0f) {
       float3 sampleColor = colorOpacity.rgb;
       float weight = 1.0f - accumulatedOpacity;
 
@@ -4415,11 +4415,11 @@ inline half4 marchVolumeUnified(
       // independent of shading — OpenGL ComputeLightingSingleInput parity
       // (color.a *= computeGradientOpacity(gradient)), which fixes the
       // dependent-component path rendering flat solid color when shading is off.
-      if (doGradOp && maskLabel == 0.0h) {
+      if (doGradOp && maskLabel == 0.0f) {
         if (!sharedGradReady) {
           if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
-            half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
-            sharedGrad = float4(float3(normalize(nrmSample.xyz * 2.0h - 1.0h)), nrmSample.w);
+            float4 nrmSample = float4(normalTexture.sample(sVolume, evalPoint, level(0)));
+            sharedGrad = float4(float3(normalize(nrmSample.xyz * 2.0f - 1.0f)), nrmSample.w);
           } else if (fc_computeNormalFromOpacity && volumeUniforms.useComputeNormalFromOpacity > 0.5) {
             sharedGrad = computeScalarAndDensityGradient(volumeTexture,
                 transferFunctionTexture, transferFunctionTexture1,
@@ -4458,14 +4458,14 @@ inline half4 marchVolumeUnified(
       // 0.01 early-exit left low-gradient samples unlit (flat LUT color), which
       // diverged from OpenGL's lit color and rendered the shaded result
       // systematically brighter.
-      if (doShading && maskLabel == 0.0h && sampleOpacity > 0.0h) {
+      if (doShading && maskLabel == 0.0f && sampleOpacity > 0.0f) {
 
-        half3 normal;
+        float3 normal;
         if (fc_computeNormalFromOpacity && volumeUniforms.useComputeNormalFromOpacity > 0.5) {
           if (densityGradReady) {
-            normal = half3(cachedDensityGrad.xyz);
+            normal = float3(cachedDensityGrad.xyz);
           } else {
-            normal = half3(computeDensityGradientFast(volumeTexture,
+            normal = float3(computeDensityGradientFast(volumeTexture,
                 transferFunctionTexture, transferFunctionTexture1,
                 transferFunctionTexture2, transferFunctionTexture3,
                 evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture,
@@ -4474,20 +4474,20 @@ inline half4 marchVolumeUnified(
         } else {
           if (!sharedGradReady) {
             if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
-              half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
-              sharedGrad = float4(float3(normalize(nrmSample.xyz * 2.0h - 1.0h)), nrmSample.w);
+              float4 nrmSample = float4(normalTexture.sample(sVolume, evalPoint, level(0)));
+              sharedGrad = float4(float3(normalize(nrmSample.xyz * 2.0f - 1.0f)), nrmSample.w);
             } else {
               sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
             }
             sharedGradReady = true;
           }
-          normal = half3(sharedGrad.xyz);
+          normal = float3(sharedGrad.xyz);
         }
 
         // TEMP DEBUG: lighting per-sample values (test builds only).
 #if defined(VTK_METAL_ENABLE_LOGGING)
         if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
-          half nDotLDbg = dot(normal, viewDirHalf);
+          float nDotLDbg = dot(normal, viewDirHalf);
           os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG LIGHT px=(%d, %d) i=%d raw=%f norm=%f opIn=%f gradW=%f gradOp=%f nDotL=%f amb=(%f, %f, %f) dif=(%f, %f, %f) spe=(%f, %f, %f) colBefore=(%f, %f, %f) colAfter=(%f, %f, %f) vd=(%f, %f, %f) pos=(%f, %f, %f) nrm=(%f, %f, %f)",
               int(p.screenPos.x), int(p.screenPos.y), i,
               rawScalar, float(scalarNorm), float(sampleOpacity),
@@ -4505,16 +4505,16 @@ inline half4 marchVolumeUnified(
 #endif
 
         if (lightUniforms != nullptr && lightUniforms->defaultLighting == 0) {
-          sampleColor = float3(computeVolumeLighting(half3(sampleColor), normal, -viewDirHalf,
+          sampleColor = computeVolumeLighting(sampleColor, normal, -viewDirHalf,
               ambientMat, diffuseMat, specularMat, shininessMat,
               *lightUniforms,
-              volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize));
+              volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize);
         } else {
           bool twoSided = (lightUniforms != nullptr && lightUniforms->twoSidedLighting != 0);
           // OpenGL headlight convention: light and view directions are the per-pixel
           // ray direction toward the camera (g_ldir == g_vdir == normalize(cameraPos - vertexPos)).
-          sampleColor = float3(computePhongLightingVolumeFast(half3(sampleColor), normal, -viewDirHalf, -viewDirHalf,
-              ambientMat, diffuseMat, specularMat, shininessMat, twoSided));
+          sampleColor = computePhongLightingVolumeFast(sampleColor, normal, -viewDirHalf, -viewDirHalf,
+              ambientMat, diffuseMat, specularMat, shininessMat, twoSided);
         }
 
         // TEMP DEBUG (after lighting applied).
@@ -4563,70 +4563,70 @@ inline half4 marchVolumeUnified(
     }
   }
 
-  half4 finalColor;
+  float4 finalColor;
   if (useIndependentPath) {
     if (fc_blendMode == 1) {   // MAXIMUM_INTENSITY_BLEND
       // Per-component extremum re-sampled through each component's own table
       // and combined by weight (OpenGL ShadingExit parity).
-      half3 c = half3(0.0h);
-      half a = 0.0h;
+      float3 c = float3(0.0f);
+      float a = 0.0f;
       int nComp = min(4, int(volumeUniforms.numComponents));
       for (int i = 0; i < nComp; ++i) {
-        half4 t = half4(sampleComponentTransferFunction(
+        float4 t = float4(sampleComponentTransferFunction(
             transferFunctionTexture, transferFunctionTexture1,
             transferFunctionTexture2, transferFunctionTexture3,
-            float2(float(mipMaxScalarComp[i]), 0.5), i));
-        half w = half(volumeUniforms.componentWeight[i]);
+            float2(mipMaxScalarComp[i], 0.5), i));
+        float w = volumeUniforms.componentWeight[i];
         c += t.rgb * t.a * w;
         a += t.a * w;
       }
-      finalColor = half4(c, a);
+      finalColor = float4(c, a);
     } else if (fc_blendMode == 2) {  // MINIMUM_INTENSITY_BLEND
-      half3 c = half3(0.0h);
-      half a = 0.0h;
+      float3 c = float3(0.0f);
+      float a = 0.0f;
       int nComp = min(4, int(volumeUniforms.numComponents));
       for (int i = 0; i < nComp; ++i) {
-        half4 t = half4(sampleComponentTransferFunction(
+        float4 t = float4(sampleComponentTransferFunction(
             transferFunctionTexture, transferFunctionTexture1,
             transferFunctionTexture2, transferFunctionTexture3,
-            float2(float(minipMinScalarComp[i]), 0.5), i));
-        half w = half(volumeUniforms.componentWeight[i]);
+            float2(minipMinScalarComp[i], 0.5), i));
+        float w = volumeUniforms.componentWeight[i];
         c += t.rgb * t.a * w;
         a += t.a * w;
       }
-      finalColor = half4(c, a);
+      finalColor = float4(c, a);
     } else if (fc_blendMode == 3) {  // AVERAGE_INTENSITY_BLEND
       // Per-component in-range average combined by weight. OpenGL discards the
       // fragment when no in-range sample was found; return a fully transparent
       // fragment so the background shows through.
-      half avg = 0.0h;
+      float avg = 0.0f;
       bool anySample = false;
       int nComp = min(4, int(volumeUniforms.numComponents));
       for (int i = 0; i < nComp; ++i) {
         if (avgBlendCountComp[i] > 0) {
           anySample = true;
-          avg += saturate(avgBlendSumComp[i] / half(avgBlendCountComp[i])) *
-                 half(volumeUniforms.componentWeight[i]);
+          avg += saturate(avgBlendSumComp[i] / float(avgBlendCountComp[i])) *
+                 volumeUniforms.componentWeight[i];
         }
       }
       if (!anySample) {
-        return half4(0.0h);
+        return float4(0.0f);
       }
-      finalColor = half4(avg, avg, avg, 1.0h);
+      finalColor = float4(avg, avg, avg, 1.0f);
     } else if (fc_blendMode == 4) {  // ADDITIVE_BLEND
-      half sum = 0.0h;
+      float sum = 0.0f;
       int nComp = min(4, int(volumeUniforms.numComponents));
       for (int i = 0; i < nComp; ++i) {
-        sum += additiveSumComp[i] * half(volumeUniforms.componentWeight[i]);
+        sum += additiveSumComp[i] * volumeUniforms.componentWeight[i];
       }
       sum = saturate(sum);
-      finalColor = half4(sum, sum, sum, 1.0h);
+      finalColor = float4(sum, sum, sum, 1.0f);
     } else {
-      finalColor = half4(half3(accumulatedColor), half(accumulatedOpacity));
+      finalColor = float4(accumulatedColor, accumulatedOpacity);
     }
   } else if (fc_blendMode == 1) {   // MAXIMUM_INTENSITY_BLEND
-    half4 c = half4(sampleTransferFunction(transferFunctionTexture, float2(float(mipMaxScalar), 0.5)));
-    finalColor = half4(c.rgb * c.a, c.a);
+    float4 c = float4(sampleTransferFunction(transferFunctionTexture, float2(mipMaxScalar, 0.5)));
+    finalColor = float4(c.rgb * c.a, c.a);
 #if defined(VTK_METAL_ENABLE_LOGGING)
     if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
       os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG MIPFINAL px=(%d, %d) mip=%f c=(%f, %f, %f, %f) out=(%f, %f, %f)",
@@ -4637,27 +4637,27 @@ inline half4 marchVolumeUnified(
     }
 #endif
   } else if (fc_blendMode == 2) {  // MINIMUM_INTENSITY_BLEND
-    half4 c = half4(sampleTransferFunction(transferFunctionTexture, float2(float(minipMinScalar), 0.5)));
-    finalColor = half4(c.rgb * c.a, c.a);
+    float4 c = float4(sampleTransferFunction(transferFunctionTexture, float2(minipMinScalar, 0.5)));
+    finalColor = float4(c.rgb * c.a, c.a);
   } else if (fc_blendMode == 3) {  // AVERAGE_INTENSITY_BLEND
     // OpenGL discards the fragment when no in-range sample was found; return a
     // fully transparent fragment so the background shows through.
     if (avgBlendCount == 0) {
-      return half4(0.0h);
+      return float4(0.0f);
     }
-    half avg = saturate(avgBlendSum / half(avgBlendCount));
-    finalColor = half4(avg, avg, avg, 1.0h);
+    float avg = saturate(avgBlendSum / float(avgBlendCount));
+    finalColor = float4(avg, avg, avg, 1.0f);
   } else if (fc_blendMode == 4) {  // ADDITIVE_BLEND
-    half sum = saturate(additiveSum);
-    finalColor = half4(sum, sum, sum, 1.0h);
+    float sum = saturate(additiveSum);
+    finalColor = float4(sum, sum, sum, 1.0f);
   } else {
-    finalColor = half4(half3(accumulatedColor), half(accumulatedOpacity));
+    finalColor = float4(accumulatedColor, accumulatedOpacity);
   }
 
   // Final color window/level (matches OpenGL raycasterfs.glsl finalizeRayCast):
   //   rgb = rgb * in_scale + in_bias * alpha
-  half wlScale = half(volumeUniforms.finalColorScale);
-  half wlBias = half(volumeUniforms.finalColorBias);
+  float wlScale = volumeUniforms.finalColorScale;
+  float wlBias = volumeUniforms.finalColorBias;
   finalColor.rgb = finalColor.rgb * wlScale + wlBias * finalColor.a;
 
 #if defined(VTK_METAL_ENABLE_LOGGING)
@@ -4673,7 +4673,7 @@ inline half4 marchVolumeUnified(
   return finalColor;
 }
 
-inline half4 marchVolume(
+inline float4 marchVolume(
     float3 entryPoint,
     float3 exitPoint,
     float totalDist,
@@ -4687,8 +4687,8 @@ inline half4 marchVolume(
     float stepSize,
     float totalBoxT,
     float2 screenPos,
-    half3 initialColor,
-    half initialOpacity,
+    float3 initialColor,
+    float initialOpacity,
     constant VolumeMapperUniforms& volumeUniforms,
     constant PerBlockData& b,
     texture3d<float> volumeTexture,
@@ -4732,8 +4732,8 @@ inline void marchSegment(
     float jitter,
     float tTerminateMax,
     float2 screenPos,
-    thread half3& accumulatedColor,
-    thread half& accumulatedOpacity,
+    thread float3& accumulatedColor,
+    thread float& accumulatedOpacity,
     constant VolumeMapperUniforms& volumeUniforms,
     constant PerBlockData& b,
     texture3d<float> volumeTexture,
@@ -4756,7 +4756,7 @@ inline void marchSegment(
   float3 one = float3(1.0);
   MarchParams p = {rayOrigin, rayDir, t0, t1, stepSize, jitter, tTerminateMax,
       zero, one, zero, one, screenPos, false};
-  half4 result = marchVolumeUnified(p, accumulatedColor, accumulatedOpacity,
+  float4 result = marchVolumeUnified(p, accumulatedColor, accumulatedOpacity,
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -4820,16 +4820,16 @@ fragment VolumeFragmentOut fragment_volume_main(
   if (!s.valid) { output.color = float4(0.0); return output; }
 
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
-  half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
+  float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
       stepSize, s.totalBoxT, in.position.xy,
-      half3(0.0), 0.0h, volumeUniforms, b,
+      float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
       maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
       blankingTexture, rectCoords, &volumeLights);
-  output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
+  output.color = _marchResult;
   return output;
 }
 
@@ -4885,10 +4885,10 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
   if (!s.valid) { return output; }
 
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
-  half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
+  float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
       stepSize, s.totalBoxT, in.position.xy,
-      half3(0.0), 0.0h, volumeUniforms, b,
+      float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
@@ -4900,7 +4900,7 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
   // PickingActorPassExit parity: only fragments that accumulated a certain
   // level of opacity receive a picking id (index 0 is reserved for empty space).
   output.ids = volumeSelectionIds(s.entryPoint, float(_marchResult.w), volumeUniforms);
-  output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
+  output.color = _marchResult;
   return output;
 }
 // Reconstructs the ray from screen UV (via the precomputed ndcToVolume matrix)
@@ -4956,16 +4956,16 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
   if (!s.valid) { output.color = float4(0.0); return output; }
 
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
-  half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
+  float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
       stepSize, s.totalBoxT, in.position.xy,
-      half3(0.0), 0.0h, volumeUniforms, b,
+      float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
       maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
       blankingTexture, rectCoords, &volumeLights);
-  output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
+  output.color = _marchResult;
   return output;
 }
 
@@ -5013,10 +5013,10 @@ fragment VolumeSelectionOut fragment_volume_fullscreen_selection_main(
   if (!s.valid) { return output; }
 
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
-  half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
+  float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
       stepSize, s.totalBoxT, in.position.xy,
-      half3(0.0), 0.0h, volumeUniforms, b,
+      float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
@@ -5024,7 +5024,7 @@ fragment VolumeSelectionOut fragment_volume_fullscreen_selection_main(
       blankingTexture, rectCoords, &volumeLights);
 
   output.ids = volumeSelectionIds(s.entryPoint, float(_marchResult.w), volumeUniforms);
-  output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
+  output.color = _marchResult;
   return output;
 }
 
@@ -5086,7 +5086,7 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
     firstOpaquePos = s.entryPoint;
   }
 
-  half4 _marchResult = marchVolumeUnified(p, half3(0.0), 0.0h,
+  float4 _marchResult = marchVolumeUnified(p, float3(0.0), 0.0f,
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -5094,7 +5094,7 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
       minMaxTexture, normalTexture, blankingTexture, rectCoords, &volumeLights,
       &firstOpaquePos, &searching);
 
-  output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
+  output.color = _marchResult;
 
   // searching == false means the march recorded the first opaque sample.
   // If no sample accumulated opacity, fall back to the entry point when
@@ -5365,8 +5365,8 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
         : 1.0 * stepSize;
 
     // Grid traversal loop
-    half3 color = 0.0h;
-    half opacity = 0.0h;
+    float3 color = 0.0f;
+    float opacity = 0.0f;
 
     int3 gridDims = int3(grid.gridDimsX, grid.gridDimsY, grid.gridDimsZ);
     float tEndRel = tEnd - tStart;
