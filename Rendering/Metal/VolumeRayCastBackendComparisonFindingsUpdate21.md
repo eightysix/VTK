@@ -16,7 +16,7 @@
 5. **The far remnants re-march the entire volume from the near plane.** At (422,92) all 10 fragment invocations (5 frames × 2) share the identical first sample `tex=(0.505438, 0.506547, 0.450642)`, and 163/171 sample indices have >1 distinct tex value across fragments — the far and cap fragments march the same path but with slightly different rays (`rayDir` differs in the ~6th decimal because `rayDir = normalize(anchor − eye)` and the anchors are the cap vs far positions, per Update 20). So the far remnant is **not** a no-op: it re-composites the volume and, depending on rasterization order, overwrites the cap's color with a perturbed one.
 6. **GL never shows far fragments.** All 90 `GL_RAY` lines across the gated pixels have origin z = 0.450/0.451 (the cap); zero far origins. Caveat: the `GL_RAY` readback (`vtkOpenGLGPUVolumeRayCastMapper.cxx:4290-4339`) renders one encoded channel per 12-pass batch and reads back the **last** fragment at the pixel, so it cannot distinguish "far fragment not rasterized" from "far fragment rasterized earlier and overwritten / empty".
 7. **The structural divergence is GL's anchor-march vs Metal's recomputed entry.** GL's camera-inside fragment shader sets `g_rayOrigin = ip_textureCoords.xyz` (the interpolated anchor) then `g_rayOrigin += g_dirStep` (one full step, no-jitter test) and marches (`vtkVolumeShaderComposer.h:418,464`; `computeRayDirection() = normalize(ip_vertexPos − eyePos)` at :1716). A GL far fragment would start at `z ≈ 1.0 + step` and never enter `[0,1]³` — zero contribution. Metal's proxy fragment (`fragment_volume_main` → `setupVolumeRay`, MetalShaders.metal:3515-3550) instead recomputes the entry from the camera ray vs box + offset near plane, so far remnants re-enter at `z ≈ 0.4486` and fully re-march.
-8. **Why the winding fix should have aligned the cull sets — and the consequence.** With `MTLWindingClockwise` + cull-Back, Metal's front/back classification equals GL's `GL_CCW`/`GL_BACK` classification for the same polygons (the Metal framebuffer is the GL window y-reflected, which flips orientation for every triangle equally). So if GL genuinely back-culled the far remnants, Metal would too; the fact that Metal keeps them is *consistent with GL also rasterizing them but producing nothing* (anchor-march). This favors hypothesis H2 below over H1.
+8. **Why the winding fix should have aligned the cull sets — and the consequence.** With `MTLWindingClockwise` + cull-Back, Metal's front/back classification equals GL's `GL_CCW`/`GL_BACK` classification for the same polygons (the Metal framebuffer is the GL window y-reflected, which flips orientation for every triangle equally). So if GL genuinely back-culled the far remnants, Metal would too; the fact that Metal keeps them is *consistent with GL also rasterizing them but producing nothing* (anchor-march). This favors hypothesis H2 below over H1 — **but see sections 4.1 and update 22: the byte-identical probe that originally supported H2 was an artifact of missing test data, and update 22's clean cull-on/off re-capture (no dump instrumentation) shows the cull probe changes the image by ≤1 level, restoring H2 — GL's back/far cells are rasterized but anchor-march from z>1 and contribute nothing. Update-21 section 4.1's intermediate "H1 true" numbers (78,675 px / 118-level) were debug-instrumentation contamination.**
 
 ---
 
@@ -99,8 +99,22 @@ The cap fragments agree between backends because for them the recomputed entry �
 
 - **H1 — GL back-culls them.** Requires the frustum clip to flip the clipped polygon's window winding (GL window y-up + `GL_CCW`) while the same clip in the y-down Metal window stays front (`Clockwise`). Rejected by the reasoning in conclusion 8: a pure coordinate reflection flips orientation for every triangle equally, so a cull set that differs between backends cannot come from the winding rule alone.
 - **H2 — GL rasterizes them but they are empty (anchor-march).** The `GL_RAY` last-fragment-wins readback cannot see a far remnant that draws before the cap; even if it drew last, its zero contribution leaves the pixel unchanged. Consistent with all evidence.
-- **Decisive test (cheap, no rebuild):** temporarily toggle GL's cull off (`glCullFace(GL_NONE)` or `vtkVolumeStateRAII` no-cull) and re-capture the NoJitter test. If H1, the far-face region gains contributions (pixels near shared vertex 51 change); if H2, the image is unchanged.
+- **Decisive test (probe):** temporarily toggle GL's cull off (`vtkVolumeStateRAII` no-cull via a `VTK_GL_NO_CULL_PROBE` env gate) and re-capture the NoJitter test.
 - **Decisive test (the likely fix):** make Metal's proxy camera-inside fragment march from its interpolated anchor (`in.localPos`) with GL's jitter semantics instead of `setupVolumeRay`'s recomputed entry. Far remnants then start at z≈1.0 and contribute nothing (matching H2's GL), the per-i counts drop from 12 to 6, and the far-remnant overwrite of the cap disappears. This is the next step.
+
+### 4.1 REVISION (real-data re-capture, update 22) — the byte-identical probe result was an artifact of missing test data, and the cull-on/off numbers below were debug-instrumentation contamination
+
+**Update-22 correction:** the `78,675 px (max 118)` and `23,327 px (max 131)` numbers in this section were computed against GL frames captured **with** the `VTK_GL_SAMPLE_DUMP` debug re-renders enabled, which corrupt the captured GL frame (clean GL vs debug GL differ at 64,095 px, max 115). Re-captured **without** dump env vars, GL cull-on vs cull-off differ by **max 1/255** (both pass the Standard baseline with ImageError 0), so H2 is restored — GL's back/far cells are rasterized but anchor-march from `z≈1.0+step` and contribute nothing. See `VolumeRayCastBackendComparisonFindingsUpdate22.md` for the full evidence. What follows is the original (now-known-contaminated) section, kept for the record.
+
+The original "decisive test" (section 4, and conclusion 8) claimed cull-on vs cull-off GL images were **byte-identical**, which supported H2. That was **wrong**: the captures used `-D <output-dir>`, so `vtkTestUtilities::ExpandDataFileName` searched for `Data/headsq/quarter` there, `vtkVolume16Reader` failed (`Can't find file: .../quarter.1`), and the resampled volume was all zeros (`TEST_RESAMPLE range=(0,0)`) — every sample was `raw=0`, opacity 0, and *both* images were flat background `26/26/26` (= `SetBackground(0.1,0.1,0.1)` → 25.5 → 26). The correct data directory is `build_macos_metal/ExternalData/Testing`.
+
+Re-captured with real data (`range=(0,4370)`):
+
+- **GL cull-on vs cull-off: 78,675 pixels differ (max |Δ| = 118/255).** Un-culling genuinely adds contributions from the back-facing cells (36/37/9/0/114...) that `GL_BACK` removes. So H1 (GL's `GL_BACK` cull is effective) is true *for the back cells*, and the earlier H2 support from the byte-identical diff is retracted.
+- The kept far cells (21/22/23/29) share the cap's front class, so `GL_BACK` keeps them in both cull modes; their anchor-march contribution is unchanged by the probe (they don't appear in the diff). The probe therefore isolates the *back* cells, not the *kept* far cells.
+- **Metal (post-fix, cull-Back) vs GL (cull-Back): 23,327 pixels differ (max |Δ| = 131/255)**, concentrated in the right/center half of the frame. At the gated far-remnant pixel (422,92): GL `(216,61,76)` vs Metal `(238,192,159)` — a 131-level divergence, i.e. the far remnant's full re-march is visible in the real image. This is the observable that the anchor-march fix must remove.
+
+The fix direction (anchor-march) is unchanged and now directly validated against real images; the winding/cull facts (section 2), the mesh reproduction, and the fragment census are data-independent and unaffected.
 
 ---
 
@@ -168,8 +182,11 @@ python3 Rendering/Metal/BackendComparisonTools/compare_gl_metal_samples.py \
 | `/tmp/bc/update21/nojitter_gl.log` | GL NoJitter capture (90 `GL_RAY`, 6/frame `GL_SAMPLE` at (422,419)) |
 | `/tmp/bc/update21/nojitter_metal.log` | Metal NoJitter capture (12/frame samples at (422,92)) |
 | `/tmp/bc/update21/compare_out.txt` | per-i GL↔Metal table for (422,419)/(422,92) |
+| `/tmp/bc/update21/cullprobe/` | **real-data** re-captures (update 22): `T_cullon/`, `T_nocull/` (GL cull on/off), `T_metal/` (Metal) PNGs + `cullon.log`, `nocull.log`, `metal.log` |
 
-Capture commands: the NoJitter variant run through `vtkRenderingVolumeCxxTests` with `--vtk-factory-prefer RenderingBackend=<OpenGL|Metal>`, `MTL_LOG_*`/`VTK_GL_*` dump env vars as documented in `VolumeRayCastBackendComparisonProcedures.md` (cheatsheet section).
+**Data-dir gotcha:** `-D` is the test **data** search directory (`build_macos_metal/ExternalData/Testing`), NOT an output directory. Using an output dir silently makes `vtkVolume16Reader` fail and the resampled volume all-zero (`TEST_RESAMPLE range=(0,0)`), which renders flat background — the original section-4 probe images were worthless for that reason (see section 4.1).
+
+Capture commands: the NoJitter variant run through `vtkRenderingVolumeCxxTests` with `--vtk-factory-prefer RenderingBackend=<OpenGL|Metal>`, `-D build_macos_metal/ExternalData/Testing`, `MTL_LOG_*`/`VTK_GL_*` dump env vars as documented in `VolumeRayCastBackendComparisonProcedures.md` (cheatsheet section).
 
 ---
 
@@ -180,6 +197,6 @@ Capture commands: the NoJitter variant run through `vtkRenderingVolumeCxxTests` 
 
 Open items:
 
-1. **Confirm H2 vs H1 with the GL cull-off probe** (section 4): if the far-face region is unchanged with cull disabled, GL rasterizes empty far remnants → H2.
-2. **Implement the anchor-march proxy path in Metal** so far remnants contribute nothing (matches GL, drops per-i 12→6, removes the far-remnant overwrite). This is the intended next step after this update's commit.
+1. **Cull probe resolved (section 4.1):** with real data GL's `GL_BACK` genuinely removes the back cells (78,675 px change on un-cull); the kept far cells (21/22/23/29) stay front-class and anchor-march. H1-vs-H2 for the kept far cells is no longer the actionable question — the actionable fix is matching GL's anchor-march so Metal's far remnants stop re-marching (that is update 22).
+2. **Implement the anchor-march proxy path in Metal** so far remnants behave like GL's (start at the anchor z≈1.0, no full re-march; drops per-i 12→6, removes the far-remnant overwrite at (422,92) where Metal now reads `(238,192,159)` vs GL `(216,61,76)`). This is the intended next step.
 3. **Pass A/B identity from Update 20 is now closed**: post-fix the cap fragment is cell 122; the earlier "interior anchor" was the pre-fix cap fragment from a different (interior) triangle.

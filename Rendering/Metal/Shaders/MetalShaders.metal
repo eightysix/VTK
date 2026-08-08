@@ -4746,6 +4746,24 @@ inline float4 marchVolume(
   (void)totalDist;
   float jitter = (volumeUniforms.useJittering > 0.5 ? volume_random(screenPos) : 1.0) * stepSize;
   float tStart = dot(entryPoint - cameraPos, rayDir);
+  // OpenGL camera-inside parity (update 22): GL ignores the box/near-plane
+  // entry for camera-inside proxy fragments and marches from the interpolated
+  // anchor (g_rayOrigin = ip_textureCoords + one step), so far-face fragments
+  // start at z>1 and only composite the clamped far slab instead of re-marching
+  // the volume from the near plane. setupVolumeRay recomputes the near-plane
+  // entry for those same fragments; clamp tStart to the anchor distance whenever
+  // the anchor lies beyond the computed entry (the cap anchor coincides with the
+  // entry, so cap fragments are unchanged; the fullscreen path passes
+  // localPos == entryPoint, so this is a no-op there).
+  if (volumeUniforms.useCameraInsideNearClip > 0.5 &&
+      volumeUniforms.useParallelProjection < 0.5)
+  {
+    float tStartAnchor = dot(localPos - cameraPos, rayDir);
+    if (tStartAnchor > tStart)
+    {
+      tStart = tStartAnchor;
+    }
+  }
   MarchParams p = {cameraPos, rayDir, tStart, totalBoxT, stepSize, jitter, tTerminateMax,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, screenPos, localPos, true};
   return marchVolumeUnified(p, initialColor, initialOpacity,
