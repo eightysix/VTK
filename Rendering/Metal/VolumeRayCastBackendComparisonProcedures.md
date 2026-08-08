@@ -404,6 +404,59 @@ input/value at a specific logged sample, and a raw-scalar probe
 relative-error distribution, so logged Metal values can be compared against
 the numpy ground truth.
 
+## Verified logging invocations (cheatsheet)
+
+Both backends have per-sample dump hooks gated behind env vars. The exact,
+verified invocation for each is below; copy these verbatim — the args are easy
+to get wrong (the GL sample dump silently requires the RAY dump gate, and the
+Metal shader `os_log` messages are silently dropped without the `MTL_LOG_*`
+vars).
+
+Common bits (substitute per run):
+
+```sh
+BIN=build_macos_metal/bin/vtkRenderingVolumeCxxTests
+EXT=build_macos_metal/ExternalData/Testing
+TMP=build_macos_metal/Testing/Temporary
+BASELINE=/tmp/bc/dummy_baseline.png   # wrong baseline -> test fails and dumps its render
+# e.g. python3 -c "from PIL import Image; Image.new('RGB',(512,512),(0,0,0)).save('$BASELINE')"
+```
+
+**Metal** — per-sample MARCH/SAMPLE dump at the GL-matched pixel (422,92)
+(shader `os_log` is buffered and dropped unless all three `MTL_LOG_*` vars are
+set; see `TestMetalVolumeShaderLog.cxx`):
+
+```sh
+MTL_LOG_LEVEL=MTLLogLevelDebug \
+MTL_LOG_BUFFER_SIZE=16777216 \
+MTL_LOG_TO_STDERR=1 \
+  "$BIN" TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNoJitter \
+    --vtk-factory-prefer RenderingBackend=Metal \
+    -D "$EXT" -T "$TMP" -V "$BASELINE" 2> metal_samples.log
+# verify: rg -c 'SAMPLE px=\(422, 92\)' metal_samples.log   (expect ~1000+)
+#   MARCH: rg -c 'MARCH px=\(422, 92\)' metal_samples.log   (expect 6)
+```
+
+The per-pixel gate is `debugMarchGate` in `MetalShaders.metal`; it currently
+also dumps (422,92) unconditionally (camera-agnostic) via `pxOkAlways`.
+
+**OpenGL** — per-sample raw dump at the matched pixel. BOTH env vars are
+required (the sample dump block sits under the RAY dump gate):
+
+```sh
+VTK_GL_RAY_DUMP=1 \
+VTK_GL_SAMPLE_DUMP=1 \
+VTK_GL_SAMPLE_DUMP_PX=422,92 \
+  "$BIN" TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNoJitter \
+    --vtk-factory-prefer RenderingBackend=OpenGL \
+    -D "$EXT" -T "$TMP" -V "$BASELINE" 2> gl_samples.log
+# verify: rg -c 'GL_SAMPLE px=\(422, 92\)' gl_samples.log   (expect 175 * frames)
+```
+
+The GL dump lives in `vtkOpenGLGPUVolumeRayCastMapper.cxx` (`DoGPURender`,
+`if (getenv("VTK_GL_SAMPLE_DUMP"))`), printing every sample's channel-encoded
+scalar (16-bit float pack) for the pixel named by `VTK_GL_SAMPLE_DUMP_PX`.
+
 ## Per-sample GPU logging — regenerate `/tmp/bc/metal3.log`
 
 The `MARCH`/`SAMPLE`/`LIGHT`/`LIGHT2` call sites live in `MetalShaders.metal`,

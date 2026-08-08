@@ -4351,10 +4351,19 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
   // Channel 0 = raw, 1/2/3 = g_dataPos.x/y/z (same float encoding as the ray dump).
   if (getenv("VTK_GL_SAMPLE_DUMP") != nullptr)
   {
-    const float px = 422.5f;
-    const float py = 419.5f;
-    const GLint gx = 422;
-    const GLint gy = 419;
+    float px = 422.5f;
+    float py = 419.5f;
+    GLint gx = 422;
+    GLint gy = 419;
+    const char* dbgPx = getenv("VTK_GL_SAMPLE_DUMP_PX");
+    if (dbgPx != nullptr)
+    {
+      gx = atoi(dbgPx);
+      const char* comma = strchr(dbgPx, ',');
+      gy = (comma != nullptr) ? atoi(comma + 1) : gy;
+      px = static_cast<float>(gx) + 0.5f;
+      py = static_cast<float>(gy) + 0.5f;
+    }
     float debugPixel[2] = { px, py };
     prog->SetUniform2f("in_debugPixel", debugPixel);
     const int maxSample = getenv("VTK_GL_SAMPLE_DUMP_MAX") != nullptr
@@ -4371,6 +4380,13 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         this->RenderVolumeGeometry(ren, prog, vol, geometry);
         glReadPixels(gx, gy, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, bytes);
+        if (s < 2)
+        {
+          std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_SAMPLE_DBG s=" << s << " c=" << c
+                    << " bytes=" << static_cast<int>(bytes[0]) << "," << static_cast<int>(bytes[1])
+                    << "," << static_cast<int>(bytes[2]) << "," << static_cast<int>(bytes[3])
+                    << std::endl;
+        }
 
         float v = 0.0f;
         if (bytes[0] != 0 || bytes[1] != 0 || bytes[2] != 0 || bytes[3] != 0)
@@ -4385,7 +4401,8 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
       }
       if (chan[0] != 0.0f || chan[1] != 0.0f || chan[2] != 0.0f || chan[3] != 0.0f)
       {
-        std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_SAMPLE i=" << s << " raw=" << chan[0]
+        std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_SAMPLE px=(" << gx << ", " << gy
+                  << ") i=" << s << " raw=" << chan[0]
                   << " pos=(" << chan[1] << ", " << chan[2] << ", " << chan[3] << ")"
                   << std::endl;
       }
