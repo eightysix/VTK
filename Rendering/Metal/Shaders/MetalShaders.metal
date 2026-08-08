@@ -2903,10 +2903,30 @@ vertex VolumeVertexOut vertex_volume_main(
     constant PerBlockData& b [[buffer(2)]]) {
   VolumeVertexOut out;
 
-  // in.position is a unit cube [0,1]. Scale it to the block's model-space bounds.
-  float3 modelPos = b.volumeBoundsMin.xyz + in.position * (b.volumeBoundsMax.xyz - b.volumeBoundsMin.xyz);
+  // Camera-inside (useCameraInsideNearClip set): the vertex buffer holds
+  // data-space proxy positions (OpenGL parity: GL uploads the clipped/densified
+  // geometry in dataset space and interpolates in_vertexPos directly), so the
+  // rasterizer interpolates in data space and the interpolated anchor matches
+  // GL's ip_vertexPos to float32. Camera-outside keeps the unit-cube [0,1]
+  // convention, scaled to the block's model-space bounds.
+  float3 modelPos;
+  if (volumeUniforms.useCameraInsideNearClip > 0.5)
+  {
+    modelPos = in.position;
+  }
+  else
+  {
+    modelPos = b.volumeBoundsMin.xyz + in.position * (b.volumeBoundsMax.xyz - b.volumeBoundsMin.xyz);
+  }
   out.position = volumeUniforms.viewProjection * volumeUniforms.volumeToWorld * float4(modelPos, 1.0);
-  out.localPos = (modelPos - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  if (volumeUniforms.useCameraInsideNearClip > 0.5)
+  {
+    out.localPos = modelPos;  // data-space (interpolated in data space like GL)
+  }
+  else
+  {
+    out.localPos = (modelPos - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  }
   out.instanceID = 0;
   // Debug only (test builds): the proxy geometry has only a handful of
   // vertices, so this stays bounded to a few messages per frame. Verified by
@@ -3609,6 +3629,8 @@ struct MarchParams {
     float2 screenPos;  // in-viewport pixel coords; (-1,-1) when unknown
     float3 localPos;   // interpolated fragment position in [0,1] volume space
     bool   checkBounds;
+    float3 anchorData; // interpolated anchor in dataset space (GL ip_vertexPos parity)
+    bool   anchorIsData; // anchorData holds a data-space position (camera-inside proxy path)
 };
 
 // Debug helper (test builds): per-sample march dumps, gated to a handful of
@@ -3784,14 +3806,26 @@ inline float4 marchVolumeUnified(
   // OpenGL g_dirStep parity (bit-exact step): GL computes
   //   g_dirStep = (ip_inverseTextureDataAdjusted * normalize(vertexPos - eyePos)).xyz
   //               * in_sampleDistance
-  // with the normalize done in DATASET/OBJECT space (computeRayDirection). The
-  // previous form normalized in volume space and folded the sample distance
-  // across the SampleDistance/maxBoundsSize uniform and physicalSampleStep,
-  // which drifted ~1 ulp/step against GL. Replicate GL's float32 chain exactly:
-  // normalize the object-space direction (p.rayDir*boundsSize is the same
-  // vector GL's interpolated (vertexPos - eyePos) holds), then one mat-vec and
-  // one scalar multiply by the world-unit sample distance.
-  float3 dirObj = normalize(p.rayDir * boundsSize);
+  // with the normalize done in DATASET/OBJECT space (computeRayDirection =
+  // normalize(ip_vertexPos.xyz - in_eyePosObjs[0].xyz)). The previous form
+  // normalized in volume space and folded the sample distance across the
+  // SampleDistance/maxBoundsSize uniform and physicalSampleStep, which drifted
+  // ~1 ulp/step against GL. For the camera-inside proxy path the interpolated
+  // anchor is now carried in dataset space (anchorData, GL ip_vertexPos parity),
+  // so replicate GL's float32 chain exactly: normalize (anchorData - eyeData)
+  // once, then one mat-vec and one scalar multiply by the world-unit sample
+  // distance. The legacy paths (camera-outside box, fullscreen, grid traversal)
+  // keep the volume-space direction converted through boundsSize.
+  float3 dirObj;
+  if (p.anchorIsData && volumeUniforms.useParallelProjection < 0.5)
+  {
+    float3 cameraData = volumeUniforms.volumeBoundsMin.xyz + volumeUniforms.cameraVolumePos.xyz * boundsSize;
+    dirObj = normalize(p.anchorData - cameraData);
+  }
+  else
+  {
+    dirObj = normalize(p.rayDir * boundsSize);
+  }
   float3 evalStep = (adjustedLin * dirObj) * volumeUniforms.sampleDistanceWorld;
 
   // Lighting directions must live in the same (physical/data) space as the
@@ -4721,6 +4755,8 @@ inline float4 marchVolume(
     float totalBoxT,
     float2 screenPos,
     float3 localPos,
+    float3 anchorData,
+    bool anchorIsData,
     float3 initialColor,
     float initialOpacity,
     constant VolumeMapperUniforms& volumeUniforms,
@@ -4765,7 +4801,8 @@ inline float4 marchVolume(
     }
   }
   MarchParams p = {cameraPos, rayDir, tStart, totalBoxT, stepSize, jitter, tTerminateMax,
-      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, screenPos, localPos, true};
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, screenPos, localPos, true,
+      anchorData, anchorIsData};
   return marchVolumeUnified(p, initialColor, initialOpacity,
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
@@ -4807,7 +4844,8 @@ inline void marchSegment(
   float3 zero = float3(0.0);
   float3 one = float3(1.0);
   MarchParams p = {rayOrigin, rayDir, t0, t1, stepSize, jitter, tTerminateMax,
-      zero, one, zero, one, screenPos, rayOrigin + rayDir * t0, false};
+      zero, one, zero, one, screenPos, rayOrigin + rayDir * t0, false,
+      rayOrigin + rayDir * t0, false};
   float4 result = marchVolumeUnified(p, accumulatedColor, accumulatedOpacity,
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
@@ -4845,12 +4883,26 @@ fragment VolumeFragmentOut fragment_volume_main(
   float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
   computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
 
+  // Camera-inside proxy (useCameraInsideNearClip set): the vertex buffer holds
+  // data-space positions (GL parity) so the interpolated in.localPos is a
+  // dataset-space anchor. Everything downstream (ray direction, near-clip clamp,
+  // marching) uses volume-space [0,1] coordinates, so convert here; the raw
+  // data-space anchor is forwarded to the march for the OpenGL g_dirStep parity.
+  bool cameraInsideProxy = volumeUniforms.useCameraInsideNearClip > 0.5;
+  float3 anchorData = in.localPos;
+  float3 localPos = in.localPos;
+  if (cameraInsideProxy)
+  {
+    float3 bsz = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+    localPos = (in.localPos - volumeUniforms.volumeBoundsMin.xyz) / bsz;
+  }
+
   // Parallel projection (OpenGL in_projectionDirection parity): cast parallel
   // rays starting on the proxy box along the constant projection direction.
   // Perspective keeps the converging-ray formulation (vertexPos - cameraPos).
   bool parallel = volumeUniforms.useParallelProjection > 0.5;
-  float3 rayOrigin = parallel ? in.localPos : cameraPos;
-  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (in.localPos - cameraPos);
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
   if (!parallel)
   {
     float dirLength = length(rayDir);
@@ -4874,7 +4926,7 @@ fragment VolumeFragmentOut fragment_volume_main(
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
-      stepSize, s.totalBoxT, in.position.xy, in.localPos,
+      stepSize, s.totalBoxT, in.position.xy, localPos, anchorData, cameraInsideProxy,
       float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -4922,9 +4974,23 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
   float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
   computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
 
+  // Camera-inside proxy (useCameraInsideNearClip set): the vertex buffer holds
+  // data-space positions (GL parity) so the interpolated in.localPos is a
+  // dataset-space anchor. Everything downstream (ray direction, near-clip clamp,
+  // marching) uses volume-space [0,1] coordinates, so convert here; the raw
+  // data-space anchor is forwarded to the march for the OpenGL g_dirStep parity.
+  bool cameraInsideProxy = volumeUniforms.useCameraInsideNearClip > 0.5;
+  float3 anchorData = in.localPos;
+  float3 localPos = in.localPos;
+  if (cameraInsideProxy)
+  {
+    float3 bsz = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+    localPos = (in.localPos - volumeUniforms.volumeBoundsMin.xyz) / bsz;
+  }
+
   bool parallel = volumeUniforms.useParallelProjection > 0.5;
-  float3 rayOrigin = parallel ? in.localPos : cameraPos;
-  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (in.localPos - cameraPos);
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
   if (!parallel)
   {
     float dirLength = length(rayDir);
@@ -4939,7 +5005,7 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
-      stepSize, s.totalBoxT, in.position.xy, in.localPos,
+      stepSize, s.totalBoxT, in.position.xy, localPos, anchorData, cameraInsideProxy,
       float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -5010,7 +5076,7 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
-      stepSize, s.totalBoxT, in.position.xy, s.entryPoint,
+      stepSize, s.totalBoxT, in.position.xy, s.entryPoint, s.entryPoint, false,
       float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -5067,7 +5133,7 @@ fragment VolumeSelectionOut fragment_volume_fullscreen_selection_main(
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
-      stepSize, s.totalBoxT, in.position.xy, s.entryPoint,
+      stepSize, s.totalBoxT, in.position.xy, s.entryPoint, s.entryPoint, false,
       float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -5112,9 +5178,23 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
   float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
   computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
 
+  // Camera-inside proxy (useCameraInsideNearClip set): the vertex buffer holds
+  // data-space positions (GL parity) so the interpolated in.localPos is a
+  // dataset-space anchor. Everything downstream (ray direction, near-clip clamp,
+  // marching) uses volume-space [0,1] coordinates, so convert here; the raw
+  // data-space anchor is forwarded to the march for the OpenGL g_dirStep parity.
+  bool cameraInsideProxy = volumeUniforms.useCameraInsideNearClip > 0.5;
+  float3 anchorData = in.localPos;
+  float3 localPos = in.localPos;
+  if (cameraInsideProxy)
+  {
+    float3 bsz = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+    localPos = (in.localPos - volumeUniforms.volumeBoundsMin.xyz) / bsz;
+  }
+
   bool parallel = volumeUniforms.useParallelProjection > 0.5;
-  float3 rayOrigin = parallel ? in.localPos : cameraPos;
-  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (in.localPos - cameraPos);
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
   if (!parallel)
   {
     float dirLength = length(rayDir);
@@ -5130,7 +5210,8 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
   float jitter = (volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) : 1.0) * stepSize;
   float tStart = parallel ? 0.0 : dot(s.entryPoint - cameraPos, rayDir);
   MarchParams p = {rayOrigin, rayDir, tStart, s.totalBoxT, stepSize, jitter, s.tTerminateMax,
-      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, in.position.xy, true};
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, in.position.xy, localPos, true,
+      anchorData, cameraInsideProxy};
 
   float3 firstOpaquePos = float3(-1.0);
   bool searching = true;

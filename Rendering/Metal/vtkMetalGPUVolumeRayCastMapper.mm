@@ -5551,18 +5551,12 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         vtkPoints* points = finalPolyData->GetPoints();
         vtkCellArray* polys = finalPolyData->GetPolys();
 
-        // Normalize clipped points from model-space to [0,1] for the vertex shader
-        double bmin[3] = { this->ModelBounds[0], this->ModelBounds[2], this->ModelBounds[4] };
-        double bsize[3] = {
-          this->ModelBounds[1] - this->ModelBounds[0],
-          this->ModelBounds[3] - this->ModelBounds[2],
-          this->ModelBounds[5] - this->ModelBounds[4]
-        };
-        for (int k = 0; k < 3; ++k)
-        {
-          if (std::fabs(bsize[k]) < 1e-10) bsize[k] = 1.0;
-        }
-
+        // OpenGL parity: upload the clipped/densified vertices in dataset
+        // (model) space directly — GL feeds this polydata's positions to the
+        // vertex shader as in_vertexPos without normalization. The vertex
+        // shader detects the camera-inside path via useCameraInsideNearClip and
+        // forwards in.position unchanged, so the interpolated fragment anchor is
+        // a dataset-space position just like GL's ip_vertexPos.
         std::vector<float> vertices;
         vertices.reserve(points->GetNumberOfPoints() * 3);
 
@@ -5570,9 +5564,9 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         {
           double pt[3];
           points->GetPoint(i, pt);
-          vertices.push_back(static_cast<float>((pt[0] - bmin[0]) / bsize[0]));
-          vertices.push_back(static_cast<float>((pt[1] - bmin[1]) / bsize[1]));
-          vertices.push_back(static_cast<float>((pt[2] - bmin[2]) / bsize[2]));
+          vertices.push_back(static_cast<float>(pt[0]));
+          vertices.push_back(static_cast<float>(pt[1]));
+          vertices.push_back(static_cast<float>(pt[2]));
         }
 
         // Build the index list exactly like the OpenGL backend: the first 3
