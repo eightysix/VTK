@@ -2898,7 +2898,10 @@ void vtkOpenGLGPUVolumeRayCastMapper::BuildShader(vtkRenderer* ren)
       fragSrc, "in vec3 ip_vertexPos;",
       "in vec3 ip_vertexPos;\n"
       "uniform vec2 in_debugPixel;\n"
-      "uniform int in_debugChannel;");
+      "uniform int in_debugChannel;\n"
+      "uniform int in_debugSample;\n"
+      "int g_dbgIter = 0;\n"
+      "bool g_dbgDone = false;");
     vtkShaderProgram::Substitute(fragSrc, "//VTK::CallWorker::Impl",
       "initializeRayCast();\n"
       "  if (in_debugChannel >= 0)\n"
@@ -2942,8 +2945,58 @@ void vtkOpenGLGPUVolumeRayCastMapper::BuildShader(vtkRenderer* ren)
       "      return;\n"
       "    }\n"
       "  }\n"
+      "  g_dbgIter = 0;\n"
+      "  g_dbgDone = false;\n"
       "  castRay(-1.0, -1.0);\n"
+      "  if (g_dbgDone)\n"
+      "  {\n"
+      "    return;\n"
+      "  }\n"
       "  finalizeRayCast();");
+    vtkShaderProgram::Substitute(fragSrc, "//VTK::RenderToImage::Impl",
+      "//VTK::RenderToImage::Impl\n"
+      "  if (in_debugSample >= 0 && !g_dbgDone)\n"
+      "  {\n"
+      "    if (all(lessThan(abs(gl_FragCoord.xy - in_debugPixel), vec2(0.5))))\n"
+      "    {\n"
+      "      if (g_dbgIter == in_debugSample)\n"
+      "      {\n"
+      "        float dbgRaw = texture3D(in_volume[0], g_dataPos).r;\n"
+      "        float av = abs(dbgRaw);\n"
+      "        float b0 = 0.0;\n"
+      "        float b1 = 0.0;\n"
+      "        float b2 = 0.0;\n"
+      "        float b3 = 0.0;\n"
+      "        if (av != 0.0)\n"
+      "        {\n"
+      "          float e = floor(log2(av));\n"
+      "          float f = av * exp2(-e);\n"
+      "          if (f >= 2.0)\n"
+      "          {\n"
+      "            f *= 0.5;\n"
+      "            e += 1.0;\n"
+      "          }\n"
+      "          if (f < 1.0)\n"
+      "          {\n"
+      "            f *= 2.0;\n"
+      "            e -= 1.0;\n"
+      "          }\n"
+      "          float m23 = floor((f - 1.0) * 8388608.0);\n"
+      "          b0 = mod(m23, 256.0);\n"
+      "          b1 = mod(floor(m23 / 256.0), 256.0);\n"
+      "          b2 = floor(m23 / 65536.0);\n"
+      "          b3 = clamp(e + 64.0, 0.0, 127.0);\n"
+      "          if (dbgRaw < 0.0)\n"
+      "          {\n"
+      "            b3 += 128.0;\n"
+      "          }\n"
+      "        }\n"
+      "        fragOutput0 = vec4(b0, b1, b2, b3) / 255.0;\n"
+      "        g_dbgDone = true;\n"
+      "      }\n"
+      "    }\n"
+      "    g_dbgIter++;\n"
+      "  }\n");
     fragmentShader->SetSource(fragSrc);
 
     std::cerr << "VTK_METAL_VOLUME_LOG === FRAG SHADER ===\n" << fragSrc
@@ -4244,6 +4297,45 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
 
   // Restore the real composite image for the gated pixels.
   prog->SetUniformi("in_debugChannel", -1);
+  prog->SetUniformi("in_debugSample", -1);
+
+  // Per-sample raw dump for the (422.5, 419.5) pixel (Metal parity analysis):
+  // re-render once per sample index, capturing the volume raw value sampled at
+  // g_dataPos at that index, in the same units as the Metal backend (value/65535).
+  if (getenv("VTK_GL_SAMPLE_DUMP") != nullptr)
+  {
+    const float px = 422.5f;
+    const float py = 419.5f;
+    const GLint gx = 422;
+    const GLint gy = 419;
+    float debugPixel[2] = { px, py };
+    prog->SetUniform2f("in_debugPixel", debugPixel);
+    const int maxSample = getenv("VTK_GL_SAMPLE_DUMP_MAX") != nullptr
+      ? atoi(getenv("VTK_GL_SAMPLE_DUMP_MAX"))
+      : 175;
+    for (int s = 0; s < maxSample; ++s)
+    {
+      unsigned char bytes[4] = { 0, 0, 0, 0 };
+      prog->SetUniformi("in_debugSample", s);
+      glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+      this->RenderVolumeGeometry(ren, prog, vol, geometry);
+      glReadPixels(gx, gy, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, bytes);
+
+      float v = 0.0f;
+      if (bytes[0] != 0 || bytes[1] != 0 || bytes[2] != 0 || bytes[3] != 0)
+      {
+        double m23 = static_cast<double>(bytes[0]) + 256.0 * bytes[1] + 65536.0 * bytes[2];
+        double mant = 1.0 + m23 / 8388608.0;
+        int e = static_cast<int>(bytes[3] & 0x7F) - 64;
+        double sign = (bytes[3] & 0x80) ? -1.0 : 1.0;
+        v = static_cast<float>(sign * mant * std::pow(2.0, e));
+      }
+      std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_SAMPLE i=" << s << " raw=" << v << std::endl;
+    }
+  }
+
+  // Restore the real composite image for the gated pixels.
+  prog->SetUniformi("in_debugSample", -1);
   glEnable(GL_BLEND);
   glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
