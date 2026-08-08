@@ -5601,6 +5601,42 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
           return false;
         }
 
+        // TEMP DEBUG (probe #1): dump the uploaded cap-triangle vertex attributes
+        // and indices as float32 bits for GL byte-compare.
+        {
+          double mpos[3], mfp[3], mup[3];
+          cam->GetPosition(mpos);
+          cam->GetFocalPoint(mfp);
+          cam->GetViewUp(mup);
+          std::cerr << std::setprecision(9)
+                    << "VTK_METAL_VOLUME_LOG DEBUG MTL_CAPMESH cam=(" << mpos[0] << ", "
+                    << mpos[1] << ", " << mpos[2] << ") focal=(" << mfp[0] << ", " << mfp[1]
+                    << ", " << mfp[2] << ") viewAngle=" << cam->GetViewAngle() << " clipRange=("
+                    << cam->GetClippingRange()[0] << ", " << cam->GetClippingRange()[1] << ")"
+                    << std::endl;
+          std::cerr << "VTK_METAL_VOLUME_LOG DEBUG MTL_CAPVERTS n=" << points->GetNumberOfPoints()
+                    << " floats=" << (vertices.size() / 3) << std::endl;
+          for (size_t i = 0; i < vertices.size(); i += 3)
+          {
+            uint32_t b0, b1, b2;
+            std::memcpy(&b0, &vertices[i + 0], 4);
+            std::memcpy(&b1, &vertices[i + 1], 4);
+            std::memcpy(&b2, &vertices[i + 2], 4);
+            std::cerr << "VTK_METAL_VOLUME_LOG DEBUG MTL_CAPVERT " << (i / 3) << " 0x"
+                      << std::hex << std::setw(8) << std::setfill('0') << b0 << " 0x"
+                      << std::setw(8) << b1 << " 0x" << std::setw(8) << b2 << std::dec
+                      << std::setfill(' ') << std::endl;
+          }
+          std::cerr << "VTK_METAL_VOLUME_LOG DEBUG MTL_CAPINDICES n=" << (indices.size() / 3)
+                    << std::endl;
+          for (size_t i = 0; i < indices.size(); i += 3)
+          {
+            std::cerr << "VTK_METAL_VOLUME_LOG DEBUG MTL_CAPINDEX " << (i / 3) << " "
+                      << indices[i] << " " << indices[i + 1] << " " << indices[i + 2]
+                      << std::endl;
+          }
+        }
+
         this->IndexCount = static_cast<int>(indices.size());
 
         // Release old buffers

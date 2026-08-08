@@ -75,6 +75,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 
 #include "vtkOpenGLVolumeGradientOpacityTable.h"
 #include "vtkOpenGLVolumeMaskGradientOpacityTransferFunction2D.h"
@@ -1274,6 +1275,46 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::RenderVolumeGeometry(
     while (cells->GetNextCell(npts, pts))
     {
       polys->InsertNextTuple3(pts[indexMap[0]], pts[indexMap[1]], pts[indexMap[2]]);
+    }
+
+    // TEMP DEBUG (probe #1): dump the uploaded cap-triangle vertex attributes and
+    // indices as float32 bits for Metal byte-compare.
+    {
+      vtkCamera* cam = ren->GetActiveCamera();
+      double pos[3], fp[3], up[3];
+      cam->GetPosition(pos);
+      cam->GetFocalPoint(fp);
+      cam->GetViewUp(up);
+      std::cerr << std::setprecision(9)
+                << "VTK_METAL_VOLUME_LOG DEBUG GL_CAPMESH cam=(" << pos[0] << ", " << pos[1]
+                << ", " << pos[2] << ") focal=(" << fp[0] << ", " << fp[1] << ", " << fp[2]
+                << ") viewAngle=" << cam->GetViewAngle() << " clipRange=("
+                << cam->GetClippingRange()[0] << ", " << cam->GetClippingRange()[1] << ")"
+                << std::endl;
+      auto* fpts = vtkAOSDataArrayTemplate<float>::FastDownCast(points->GetData());
+      std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_CAPVERTS n=" << points->GetNumberOfPoints()
+                << " dt=" << points->GetData()->GetDataType() << " comp="
+                << points->GetData()->GetNumberOfComponents() << " floats=" << (fpts ? 1 : 0)
+                << std::endl;
+      for (vtkIdType i = 0; fpts && i < points->GetNumberOfPoints(); ++i)
+      {
+        const float* p = fpts->GetPointer(0) + i * 3;
+        uint32_t b0, b1, b2;
+        std::memcpy(&b0, p + 0, 4);
+        std::memcpy(&b1, p + 1, 4);
+        std::memcpy(&b2, p + 2, 4);
+        std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_CAPVERT " << i << " 0x" << std::hex
+                  << std::setw(8) << std::setfill('0') << b0 << " 0x" << std::setw(8) << b1
+                  << " 0x" << std::setw(8) << b2 << std::dec << std::setfill(' ') << std::endl;
+      }
+      std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_CAPINDICES n=" << polys->GetNumberOfTuples()
+                << std::endl;
+      for (vtkIdType i = 0; i < polys->GetNumberOfTuples(); ++i)
+      {
+        const unsigned int* t = polys->GetPointer(0) + i * 3;
+        std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_CAPINDEX " << i << " " << t[0] << " " << t[1]
+                  << " " << t[2] << std::endl;
+      }
     }
 
     // Dispose any previously created buffers
