@@ -3073,11 +3073,11 @@ inline float sampleSecondScalar(texture3d<float> yAxisTex, float3 pos) {
   return yAxisTex.sample(sNearest, pos, level(0)).r;
 }
 
-inline half sampleGradientOpacity(texture2d<float> gradTex, float value) {
+inline float sampleGradientOpacity(texture2d<float> gradTex, float value) {
   if (fc_linearInterpolation) {
-    return half(gradTex.sample(sVolume, float2(value, 0.5), level(0)).r);
+    return gradTex.sample(sVolume, float2(value, 0.5), level(0)).r;
   }
-  return half(gradTex.sample(sNearest, float2(value, 0.5), level(0)).r);
+  return gradTex.sample(sNearest, float2(value, 0.5), level(0)).r;
 }
 
 // Mirrors vtkVolumeTexture::ComputeCellToPointMatrix for point data: shifts
@@ -3745,7 +3745,7 @@ inline half4 marchVolumeUnified(
   half secondScale = half(volumeUniforms.transfer2DYAxisScale);
   half secondBias  = half(volumeUniforms.transfer2DYAxisBias);
 
-  half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
+  float gradNormFactor = max(1e-8f, volumeUniforms.gradientOpacityRange.y);
 
   float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
                         - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
