@@ -2796,6 +2796,10 @@ struct VolumeMapperUniforms {
   // vtkVolumeMapper::GetComputeNormalFromOpacity parity). Occupies what would
   // otherwise be the float4-alignment pad before ambientColorComp.
   float useComputeNormalFromOpacity;
+  // World-unit sample distance (OpenGL in_sampleDistance value, NOT divided by
+  // maxBoundsSize). marchVolumeUnified builds evalStep with GL's g_dirStep
+  // float32 chain (object-space normalize * adjustedLin * this).
+  float sampleDistanceWorld;
   // Per-component material (OpenGL in_ambient[i]/in_diffuse[i]/in_specular[i]/
   // in_shininess[i] parity). Only consulted by the independent path, which
   // shades each component against its own material and its own gradient.
@@ -3775,7 +3779,18 @@ inline half4 marchVolumeUnified(
       volumeUniforms.volumeToTexture[0].xyz * ctpScale,
       volumeUniforms.volumeToTexture[1].xyz * ctpScale,
       volumeUniforms.volumeToTexture[2].xyz * ctpScale);
-  float3 evalStep = (adjustedLin * (p.rayDir * boundsSize)) * p.stepSize;
+  // OpenGL g_dirStep parity (bit-exact step): GL computes
+  //   g_dirStep = (ip_inverseTextureDataAdjusted * normalize(vertexPos - eyePos)).xyz
+  //               * in_sampleDistance
+  // with the normalize done in DATASET/OBJECT space (computeRayDirection). The
+  // previous form normalized in volume space and folded the sample distance
+  // across the SampleDistance/maxBoundsSize uniform and physicalSampleStep,
+  // which drifted ~1 ulp/step against GL. Replicate GL's float32 chain exactly:
+  // normalize the object-space direction (p.rayDir*boundsSize is the same
+  // vector GL's interpolated (vertexPos - eyePos) holds), then one mat-vec and
+  // one scalar multiply by the world-unit sample distance.
+  float3 dirObj = normalize(p.rayDir * boundsSize);
+  float3 evalStep = (adjustedLin * dirObj) * volumeUniforms.sampleDistanceWorld;
 
   // Lighting directions must live in the same (physical/data) space as the
   // gradient normal: the normal is expressed per world-unit (the gradient is

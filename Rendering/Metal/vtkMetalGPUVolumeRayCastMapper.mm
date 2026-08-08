@@ -196,7 +196,7 @@ struct VolumeMapperUniforms
   float _padIndependent[2];        // 1228..1235
   float UseDependentRGBA;          // 1236..1239  (4-comp dependent RGBA: raw RGB color, opacity LUT on scalar.w)
   float UseComputeNormalFromOpacity; // 1240..1243  (1.0 = shade with the opacity-field gradient; OpenGL ComputeNormalFromOpacity parity)
-  float _padEnd2[1];               // 1244..1247  (trailing pad to 1248)
+  float SampleDistanceWorld;        // 1244..1247  (world-unit sample distance = OpenGL in_sampleDistance; used to build evalStep in GL's g_dirStep float32 order)
   // Per-component material (OpenGL in_ambient[4]/in_diffuse[4]/in_specular[4]/
   // in_shininess[4] parity). Indexed by component in the independent path.
   float AmbientColorComp[4][4];    // 1248..1311
@@ -6710,6 +6710,10 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   double maxBoundsSize = std::max({ vb.Size[0], vb.Size[1], vb.Size[2] });
 
   uniforms.SampleDistance = static_cast<float>(actualSampleDistance / maxBoundsSize);
+  // World-unit sample distance used by the shader to build evalStep in OpenGL's
+  // g_dirStep float32 order (normalize * matrix * in_sampleDistance), so the
+  // per-sample positions match the GL backend to the last ulp.
+  uniforms.SampleDistanceWorld = static_cast<float>(actualSampleDistance);
 
   // Opacity pre-integration is baked into the transfer function texture
   // on the CPU at TF-build time (matches OpenGL backend).
