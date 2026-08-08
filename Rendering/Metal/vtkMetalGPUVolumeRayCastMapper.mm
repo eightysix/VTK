@@ -1314,6 +1314,72 @@ static void FillTransferFunctionRGBA16FWithPreIntegration(
     width, row, factor, blendMode);
 }
 
+// Fill a RGBA32F transfer function row with the blend-mode-dependent opacity
+// correction. The OpenGL backend uploads its color and opacity tables as
+// float32 textures (vtkOpenGLVolumeRGBTable RGB32F, vtkOpenGLVolumeOpacityTable
+// R32F), so the sampled values must be stored as float32 as well: the previous
+// RGBA16Float table quantized every sampled opacity/color to half precision
+// (11-bit mantissa), shifting the accumulated color by a few LSB vs the OpenGL
+// reference. The table content replicates vtkOpenGLVolumeOpacityTable::
+// InternalUpdate byte-for-byte — GetTable writes float (the double results are
+// cast to float on store), and the composite correction is
+// (float)(1 - pow(1 - (double)a, factor)) read back through the float.
+static void FillTransferFunctionRGBA32FWithPreIntegration(
+  vtkColorTransferFunction* colorFunc,
+  vtkPiecewiseFunction* opacityFunc,
+  double colorMin,
+  double colorMax,
+  double opacityMin,
+  double opacityMax,
+  int width,
+  float* row,
+  double factor,
+  int blendMode)
+{
+  std::vector<float> rgb(static_cast<size_t>(width) * 3);
+  std::vector<float> alpha(width);
+  colorFunc->GetTable(colorMin, colorMax, width, rgb.data());
+  opacityFunc->GetTable(opacityMin, opacityMax, width, alpha.data());
+  for (int i = 0; i < width; ++i)
+  {
+    float a = alpha[i];
+    if (a > 0.0001f)
+    {
+      if (blendMode == vtkVolumeMapper::COMPOSITE_BLEND)
+      {
+        a = static_cast<float>(1.0 - std::pow(1.0 - static_cast<double>(a), factor));
+      }
+      else if (blendMode == vtkVolumeMapper::ADDITIVE_BLEND)
+      {
+        a = static_cast<float>(static_cast<double>(a) * factor);
+      }
+    }
+    row[i * 4 + 0] = rgb[i * 3 + 0];
+    row[i * 4 + 1] = rgb[i * 3 + 1];
+    row[i * 4 + 2] = rgb[i * 3 + 2];
+    row[i * 4 + 3] = a;
+  }
+}
+
+// Single-range variant used by dependent multi-component volumes (OpenGL
+// UpdateColorTransferFunction(component) / UpdateOpacityTransferFunction(
+// component) parity): the RGB channels map one scalar range (component 0) while
+// the alpha channel maps another (the last component).
+static void FillTransferFunctionRGBA32FWithPreIntegration(
+  vtkColorTransferFunction* colorFunc,
+  vtkPiecewiseFunction* opacityFunc,
+  double scalarMin,
+  double scalarMax,
+  int width,
+  float* row,
+  double factor,
+  int blendMode)
+{
+  FillTransferFunctionRGBA32FWithPreIntegration(
+    colorFunc, opacityFunc, scalarMin, scalarMax, scalarMin, scalarMax,
+    width, row, factor, blendMode);
+}
+
 // Compute the transfer function table width using the same rule as the OpenGL
 // backend (vtkOpenGLVolumeLookupTable::ComputeIdealTextureSize +
 // GetMaximumSupportedTextureWidth): the ideal width is the min-sample estimate
@@ -3518,12 +3584,12 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
     {
       id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
 
-      std::vector<uint16_t> tfData(static_cast<size_t>(tfWidth) * 4);
+      std::vector<float> tfData(static_cast<size_t>(tfWidth) * 4);
       std::cerr << "VTK_METAL_VOLUME_LOG DEBUG MTL_OPTABLE range=(" << colorRange[0] << ","
                 << colorRange[1] << ") width=" << tfWidth
                 << " sampleDist=" << actualSampleDistance << " unitDist=" << unitDist
                 << " preIntFactor=" << preIntegrationFactor << std::endl;
-      FillTransferFunctionRGBA16FWithPreIntegration(
+      FillTransferFunctionRGBA32FWithPreIntegration(
         colorFunc, opacityFunc,
         colorRange[0], colorRange[1],
         opacityRange[0], opacityRange[1],
@@ -3544,7 +3610,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
 
       id<MTLTexture> tex = NewTexture2D(
         device,
-        MTLPixelFormatRGBA16Float,
+        MTLPixelFormatRGBA32Float,
         static_cast<NSUInteger>(tfWidth), 1,
         MTLTextureUsageShaderRead,
         MTLStorageModeShared);
@@ -3559,7 +3625,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
       [tex replaceRegion:region
             mipmapLevel:0
               withBytes:tfData.data()
-            bytesPerRow:static_cast<NSUInteger>(tfWidth) * 8];
+            bytesPerRow:static_cast<NSUInteger>(tfWidth) * 16];
 
       this->LastTransferFunctionScalarRange[0] = widthRange[0];
       this->LastTransferFunctionScalarRange[1] = widthRange[1];
@@ -3634,8 +3700,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
           }
           double preIntegrationFactor = actualSampleDistance / unitDist;
 
-          std::vector<uint16_t> tfData(static_cast<size_t>(tfWidth) * 4);
-          FillTransferFunctionRGBA16FWithPreIntegration(
+          std::vector<float> tfData(static_cast<size_t>(tfWidth) * 4);
+          FillTransferFunctionRGBA32FWithPreIntegration(
             cf, of,
             this->ComponentScalarRange[c][0], this->ComponentScalarRange[c][1],
             tfWidth, tfData.data(),
@@ -3646,7 +3712,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
 
           id<MTLTexture> tex = NewTexture2D(
             device,
-            MTLPixelFormatRGBA16Float,
+            MTLPixelFormatRGBA32Float,
             static_cast<NSUInteger>(tfWidth), 1,
             MTLTextureUsageShaderRead,
             MTLStorageModeShared);
@@ -3661,7 +3727,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
           [tex replaceRegion:region
                 mipmapLevel:0
                   withBytes:tfData.data()
-                bytesPerRow:static_cast<NSUInteger>(tfWidth) * 8];
+                bytesPerRow:static_cast<NSUInteger>(tfWidth) * 16];
         }
 
         for (int c = 0; c < 4; ++c)
