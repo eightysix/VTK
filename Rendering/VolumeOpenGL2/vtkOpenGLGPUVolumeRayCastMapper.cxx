@@ -4178,12 +4178,12 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
   // Pixel centers in gl_FragCoord space (y flipped relative to Metal's screenPos).
   // Pixels are paired with the Metal debugMarchGate pixels so the two backends'
   // rays can be compared directly. Metal screenPos (x, y) == GL (x, 511 - y).
-  const float pixels[14][2] = { { 307.5f, 503.5f }, { 307.5f, 504.5f }, { 307.5f, 502.5f },
+  const float pixels[15][2] = { { 307.5f, 503.5f }, { 307.5f, 504.5f }, { 307.5f, 502.5f },
     { 480.5f, 111.5f }, { 496.5f, 23.5f }, { 93.5f, 310.5f }, { 242.5f, 181.5f },
     { 322.5f, 339.5f }, { 382.5f, 304.5f }, { 357.5f, 357.5f }, { 372.5f, 380.5f },
-    { 256.5f, 256.5f }, { 104.5f, 266.5f }, { 188.5f, 204.5f } };
+    { 256.5f, 256.5f }, { 104.5f, 266.5f }, { 188.5f, 204.5f }, { 422.5f, 419.5f } };
 
-  for (size_t p = 0; p < 14; ++p)
+  for (size_t p = 0; p < 15; ++p)
   {
     const float px = pixels[p][0];
     const float py = pixels[p][1];
