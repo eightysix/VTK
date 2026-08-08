@@ -145,4 +145,56 @@ Options if a residual of ~0.03 texel matters (it changes one sample only on data
 2. **Make Metal reproduce GL's ray construction** for the fullscreen path (interpolate the near-plane position as GL does, instead of `camera + reconstructRayDir*t`). This is the only path that can make the two backends bit-exact here, and it requires replicating GL's proxy clip arithmetic in Metal.
 3. **Align the fullscreen ray reconstruction with the proxy path** (use the same ray in both Metal paths) — internal consistency, but does not close the GL gap.
 
-The GL↔Metal step/ray/camera comparison procedure is now complete; the debug logging blocks in `MetalShaders.metal` and `vtkOpenGLGPUVolumeRayCastMapper.cxx` remain uncommitted (kept for reproduction; see the procedures doc).
+The GL↔Metal step/ray/camera comparison procedure is now complete; the debug logging blocks in `MetalShaders.metal` and `vtkOpenGLGPUVolumeRayCastMapper.cxx` are committed (see the procedures doc).
+
+---
+
+## 9. What it would take to be bit-identical (the plan)
+
+Camera, `adjustedLin`, `sampleDistanceWorld`, TF lookup, sampling and accumulation
+are already bit-identical (proven above and in earlier updates). The **only**
+remaining difference is the per-pixel ray. The two backends construct it in two
+different float32 chains:
+
+- **OpenGL (camera inside):** CPU proxy mesh — `vtkClipConvexPolyData` (near plane
+  + precision offset) → `DensifyPolyData` (2 subdivisions) → `TriangleFilter` —
+  uploaded as *object-space* float32 vertices. Vertex shader:
+  `gl_Position = P * MV * volumeMatrix * v`, `ip_vertexPos = v`.
+  Fragment: `rayDir = normalize(ip_vertexPos - in_eyePosObjs)`.
+- **Metal (camera inside, this test):** **fullscreen pass** (`UseFullscreenCameraInside
+  = true` by default) — no mesh; `rayDir = reconstructRayDir(NDC)` (inverse
+  projection) and `entryPoint = cameraPos + rayDir*t`. Same math, different
+  float32 arithmetic → the ~1e-4 rad tilt → the i=144 flip.
+
+### Step 1 — use the proxy path for camera-inside (decisive)
+
+Route this test through `fragment_volume_main` (`UseFullscreenCameraInside = false`,
+or a parity toggle), because GL uses the proxy pipeline. Metal already has a proxy
+camera-inside path that mirrors GL exactly — same 8-vertex box, same winding, same
+`GetFrustumPlanes` near plane + offset, same `DensifyPolyData(2)`, same
+`TriangleFilter` (`vtkMetalGPUVolumeRayCastMapper.mm:5438-5549` vs
+`vtkOpenGLGPUVolumeRayCastMapper.cxx:1159-1249`). With the same CPU mesh the
+near-plane origin diff should collapse from `2-5e-7` volume (fullscreen
+reconstruction) to ~1 ulp (~0.001 texel accumulated drift) — no sample flips,
+hence a pixel-identical composite.
+
+### Step 2 — if not yet bit-identical, close the ulp-level divergences
+
+1. **Vertex upload:** Metal normalizes the clipped points to `[0,1]` and rebuilds
+   `modelPos = boundsMin + u * boundsSize` in the vertex shader
+   (`MetalShaders.metal:2907-2909`); GL uploads the model-space float32 directly.
+   Upload model-space vertices instead (or prove the reconstruction bit-exact).
+2. **Clip transform:** GL multiplies `P * MV * volumeMatrix * v` in the shader
+   (float32, GLSL order); Metal precomposes `viewProjection * volumeToWorld` on
+   the CPU in double (`MetalShaders.metal:2908`). Pass the same three matrices and
+   multiply in the same order so rasterizer / interpolation weights match to the
+   last bit.
+3. **Ray formula:** already equivalent — `normalize(localPos - cameraVolumePos)`
+   vs `normalize(vposObj - eyePosObj)` differ only by the common `1/boundsSize`
+   factor (~1 ulp of normalize, 6e-8 rad — harmless, cannot flip a sample).
+
+### Step 3 — verify
+
+Rerun `compare_gl_metal_steps.py` + `compare_gl_metal_accum.py`: the near-plane
+origin diff should drop to ~1e-8 volume, the step swap-in to ~0, and the i=144
+divergence disappears.
