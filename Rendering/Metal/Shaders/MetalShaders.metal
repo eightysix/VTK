@@ -2776,10 +2776,9 @@ struct VolumeMapperUniforms {
   // Independent multi-component support (OpenGL in_scalarsRange parity).
   // scalarMinComp/scalarMaxComp are per-component scalar ranges divided by the
   // volume normalization factor, in the same [0,1] space as the raw sample.
-  half scalarMinComp[4];
-  half _padSMComp[4];
-  half scalarMaxComp[4];
-  half _padSMaxComp[4];
+  // Stored as float32 (OpenGL in_scalarsRange parity; was half + pad pairs).
+  float scalarMinComp[4];
+  float scalarMaxComp[4];
   float componentWeight[4];
   uint numComponents;
   float useIndependentComponents;

@@ -185,10 +185,10 @@ struct VolumeMapperUniforms
   float TextureToVolumeMatrix[16]; // 1040..1103
   float VolumeToTextureMatrix[16]; // 1104..1167
   // Independent multi-component support (OpenGL in_scalarsRange parity).
-  uint16_t ScalarMinCompHalf[4];   // 1168..1175  per-component scalar range / ScalarNormalizationFactor
-  uint16_t _padSMComp[4];          // 1176..1183
-  uint16_t ScalarMaxCompHalf[4];   // 1184..1191
-  uint16_t _padSMaxComp[4];        // 1192..1199
+  // Per-component scalar range / ScalarNormalizationFactor, stored as full
+  // float32 (OpenGL in_scalarsRange vec2 parity. Was half + unused pad pairs).
+  float ScalarMinComp[4];          // 1168..1183
+  float ScalarMaxComp[4];          // 1184..1199
   float ComponentWeight[4];        // 1200..1215
   uint32_t NumComponents;          // 1216..1219
   float UseIndependentComponents;  // 1220..1223
@@ -265,7 +265,8 @@ static_assert(offsetof(VolumeMapperUniforms, AverageIPRangeMax) == 1004, "");
 static_assert(offsetof(VolumeMapperUniforms, MaskType) == 1008, "");
 static_assert(offsetof(VolumeMapperUniforms, TextureToVolumeMatrix) == 1040, "");
 static_assert(offsetof(VolumeMapperUniforms, VolumeToTextureMatrix) == 1104, "");
-static_assert(offsetof(VolumeMapperUniforms, ScalarMinCompHalf) == 1168, "");
+static_assert(offsetof(VolumeMapperUniforms, ScalarMinComp) == 1168, "");
+static_assert(offsetof(VolumeMapperUniforms, ScalarMaxComp) == 1184, "");
 static_assert(offsetof(VolumeMapperUniforms, ComponentWeight) == 1200, "");
 static_assert(offsetof(VolumeMapperUniforms, NumComponents) == 1216, "");
 static_assert(offsetof(VolumeMapperUniforms, UseComputeNormalFromOpacity) == 1240, "");
@@ -6766,8 +6767,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       double cMax = (this->ComponentScalarRange[c][1] > this->ComponentScalarRange[c][0])
         ? this->ComponentScalarRange[c][1]
         : this->ComponentScalarRange[c][0] + 1.0;
-      uniforms.ScalarMinCompHalf[c] = FloatToHalf(static_cast<float>(cMin / normFactor));
-      uniforms.ScalarMaxCompHalf[c] = FloatToHalf(static_cast<float>(cMax / normFactor));
+      uniforms.ScalarMinComp[c] = static_cast<float>(cMin / normFactor);
+      uniforms.ScalarMaxComp[c] = static_cast<float>(cMax / normFactor);
     }
   }
 

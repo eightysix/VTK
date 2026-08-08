@@ -246,7 +246,7 @@ private:
   int LastVolumeNumComponents = 1;
   bool LastIndependentComponents = false;
 
-  bool PreferHalfPrecision = true;  // when true, prefer half-float (16-bit) for volume textures when the scalar range fits within [−65504, 65504]; covers native float and integer types
+  bool PreferHalfPrecision = false;  // when true, prefer half-float (16-bit) for volume textures when the scalar range fits within [−65504, 65504]; covers native float and integer types. Default false: store float32 (R32F/RG32F/RGBA32F) like the OpenGL backend for precision parity.
   // Enables a precomputed RGBA8Unorm normal texture to replace 6 gradient
   // fetches per sample with 1 normal texture fetch.  Adds ~4 bytes/voxel of
   // GPU memory and a one-time compute dispatch.  Provides a net benefit only
