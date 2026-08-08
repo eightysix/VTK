@@ -2864,6 +2864,9 @@ struct VolumeMapperUniforms {
   // match GL's (nearz=0 vs -1 only changes the Z row, irrelevant to XY/w).
   float4x4 projectionMatrix;
   float4x4 modelViewMatrix;
+  // OpenGL in_eyePosObjs[0] parity: object-space eye cast to float32 (see CPU
+  // EyePosData). Used directly for normalize(anchorData - eyePosData).
+  float4 eyePosData;
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -3836,8 +3839,10 @@ inline float4 marchVolumeUnified(
   float3 dirObj;
   if (p.anchorIsData && volumeUniforms.useParallelProjection < 0.5)
   {
-    float3 cameraData = volumeUniforms.volumeBoundsMin.xyz + volumeUniforms.cameraVolumePos.xyz * boundsSize;
-    dirObj = normalize(p.anchorData - cameraData);
+    // OpenGL in_eyePosObjs[0] parity: GL passes the dataset-space eye as a
+    // float32 uniform (computed on the CPU as invert(dataToWorld^T * modelView)
+    // row 3), never reconstructs it from the normalized cameraVolumePos.
+    dirObj = normalize(p.anchorData - volumeUniforms.eyePosData.xyz);
   }
   else
   {

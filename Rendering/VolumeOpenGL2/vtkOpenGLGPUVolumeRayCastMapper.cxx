@@ -3793,6 +3793,10 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::BindTransformations(
     eyePos[1] = dataToView->GetElement(3, 1);
     eyePos[2] = dataToView->GetElement(3, 2);
     vtkInternal::CopyVector<float, 3>(eyePos, this->EyePosVec.data(), i * 3);
+    std::cerr << std::setprecision(9) << "VTK_METAL_VOLUME_LOG DEBUG GL_EYE double=("
+              << dataToView->GetElement(3, 0) << ", " << dataToView->GetElement(3, 1) << ", "
+              << dataToView->GetElement(3, 2) << ") float=(" << eyePos[0] << ", " << eyePos[1]
+              << ", " << eyePos[2] << ")" << std::endl;
 
     vtkInternal::CopyMatrixToVector<vtkMatrix4x4, 4, 4>(
       dataToWorld.GetPointer(), this->VolMatVec.data(), vecOffset);

@@ -269,11 +269,17 @@ struct VolumeMapperUniforms
   // the GPU's by ~1 ulp. Rows 0,1,3 of ProjectionMatrix match GL's (nearz=0
   // vs -1 only changes the Z row, irrelevant to the XY/w barycentric weights).
   float ProjectionMatrix[16];       // 1712..1775
-  float ModelViewMatrix[16];        // 1776..1839 (total 1840, 16-byte aligned)
+  float ModelViewMatrix[16];        // 1776..1839
+  // OpenGL in_eyePosObjs[0] parity: the object-space eye position computed by
+  // GL's BindTransformations (invert(dataToWorld^T * modelViewMat) row 3, cast
+  // to float32). The fragment shader consumes this directly for
+  // normalize(anchorData - eyePosData) instead of re-expanding the normalized
+  // cameraVolumePos through the bounds, which drifted ~1 ulp/step.
+  float EyePosData[4];              // 1840..1855 (total 1856, 16-byte aligned)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1840,
-  "VolumeMapperUniforms must be 1840 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1856,
+  "VolumeMapperUniforms must be 1856 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -6663,6 +6669,42 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   uniforms.CameraVolumePos[1] = NormalizeToVolumeSpace(vb, 1, camPosVolume[1]);
   uniforms.CameraVolumePos[2] = NormalizeToVolumeSpace(vb, 2, camPosVolume[2]);
   uniforms.CameraVolumePos[3] = 1.0f;
+
+  // OpenGL in_eyePosObjs[0] parity: replicate GL's BindTransformations eye
+  // exactly (vtkOpenGLGPUVolumeRayCastMapper.cxx:3790) so the shader's
+  // normalize(anchorData - eyePosData) uses the identical float32 eye. GL:
+  //   dataToView = transpose(dataToWorld) * modelViewMat   (both double)
+  //   dataToView->Invert(); eyePos[i] = dataToView[3][i]   (cast to float32)
+  {
+    vtkCamera* cam = ren->GetActiveCamera();
+    vtkNew<vtkMatrix4x4> wcvc;
+    wcvc->DeepCopy(cam->GetModelViewTransformMatrix());
+    wcvc->Transpose();
+    vtkNew<vtkMatrix4x4> dataToWorldT;
+    dataToWorldT->DeepCopy(modelMatrix);
+    dataToWorldT->Transpose();
+    vtkNew<vtkMatrix4x4> dataToView;
+    vtkMatrix4x4::Multiply4x4(dataToWorldT, wcvc, dataToView);
+    dataToView->Invert();
+    for (int i = 0; i < 3; ++i)
+    {
+      uniforms.EyePosData[i] = static_cast<float>(dataToView->GetElement(3, i));
+    }
+    uniforms.EyePosData[3] = 1.0f;
+    std::cerr << std::setprecision(9) << "VTK_METAL_VOLUME_LOG DEBUG MTL_EYE double=("
+              << dataToView->GetElement(3, 0) << ", " << dataToView->GetElement(3, 1) << ", "
+              << dataToView->GetElement(3, 2) << ") float=(" << uniforms.EyePosData[0] << ", "
+              << uniforms.EyePosData[1] << ", " << uniforms.EyePosData[2] << ")" << std::endl;
+    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG MTL_EYE dbg model="
+              << modelMatrix->GetElement(0, 3) << "," << modelMatrix->GetElement(1, 3) << ","
+              << modelMatrix->GetElement(2, 3) << " wcvcT=" << wcvc->GetElement(0, 3) << ","
+              << wcvc->GetElement(1, 3) << "," << wcvc->GetElement(2, 3) << " dtv="
+              << dataToView->GetElement(0, 3) << "," << dataToView->GetElement(1, 3) << ","
+              << dataToView->GetElement(2, 3) << " camPos="
+              << ren->GetActiveCamera()->GetPosition()[0] << ","
+              << ren->GetActiveCamera()->GetPosition()[1] << ","
+              << ren->GetActiveCamera()->GetPosition()[2] << std::endl;
+  }
 
   // Camera-inside near-plane clip (OpenGL near-plane proxy-clip parity): when
   // the near frustum plane crosses the bounding box, OpenGL clips the proxy box
