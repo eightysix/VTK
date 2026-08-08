@@ -199,3 +199,39 @@ composite delta (646 px). The next measurement decides between "sharp texture
   `…NoTransformNoJitter` test.
 - `Rendering/Volume/Testing/Cxx/TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNoJitter.cxx` —
   new no-jitter camera-inside variant.
+
+## 10. ROOT CAUSE (definitive): nearest volume interpolation + backend position differences
+
+The raw-vs-position self-consistency check finally cracked it. Sampling the
+texture through the GPU's linear filter at a texel center returns the exact
+texel (proven by GL_TEX), but the per-sample captures show the volume is NOT
+trilinearly filtered at render time:
+
+- At EVERY sample on both backends, `raw == vol[floor(pos*dims)]` exactly
+  (nearest/point sampling), NOT the trilinear blend `vol[pos*dims - 0.5]`.
+- i=134 (frame 0, worst pixel): GL reads 1174 == texel [227,259,356], Metal
+  reads 1096 == texel [227,258,356]. Their positions agree to 0.012 texel but
+  straddle the y=258/259 texel boundary -> nearest picks different texels.
+- The 78/104-unit gaps, the 3+3 anti-phased frame groups (wheel-zoom moves the
+  ray across texel boundaries differently per backend), and the mismatch only
+  at bone-plateau boundaries are all consequences.
+- Offline trilinear GT never matched because the GPU never interpolates.
+
+Why nearest: vtkVolumeProperty defaults to VTK_NEAREST_INTERPOLATION
+(vtkVolumeProperty.cxx ctor) and the test never sets linear interpolation. So
+the volume texture min/mag filter = GL_NEAREST (and Metal equivalent) and the
+backend position differences (<=0.02 texel, camera-inside analytic-ray origin
+resolution, see update 11/12) get amplified to full-texel value jumps at any
+boundary.
+
+Resolution for this test: set volumeProperty->SetInterpolationTypeToLinear()
+(continuous sampling -> sub-0.02-texel position differences become ~1-4-unit
+value differences, invisible in the image). This is the fix applied in the
+next commit. It does NOT mask a filter-config mismatch: both backends honored
+the nearest setting; they differ only because nearest + tiny position deltas
+is discontinuous.
+
+This also reframes the "should the backends match exactly" question: with
+nearest they cannot be expected to match at boundaries unless positions are
+bit-identical. Linear interpolation is the right setting for a sampling-path
+parity test.

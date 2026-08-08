@@ -84,6 +84,12 @@ int TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNoJitter(i
   volumeProperty->SetScalarOpacity(pf);
   volumeProperty->SetColor(ctf);
   volumeProperty->ShadeOff();
+  // The volume texture defaults to VTK_NEAREST_INTERPOLATION; nearest sampling
+  // amplifies the <=0.02-texel position differences between the GL and Metal
+  // backends into full-texel value jumps at texel boundaries, so the image
+  // comparison can never pass. Use linear interpolation for a sampling-path
+  // parity test.
+  volumeProperty->SetInterpolationTypeToLinear();
 
   // Setup rendering context
   vtkNew<vtkRenderWindow> renWin;
