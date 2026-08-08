@@ -3798,7 +3798,7 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::BindTransformations(
     // can reproduce GL's step arithmetic exactly.
     const float* it = this->InvTexMatVec.data();
     const float* ct = this->CellToPointVec.data();
-    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_UNIFORMS nVol=" << numVolumes
+    std::cerr << std::setprecision(9) << "VTK_METAL_VOLUME_LOG DEBUG GL_UNIFORMS nVol=" << numVolumes
               << " sampleDist=" << this->ActualSampleDistance << "\n"
               << "  invTexDataset=[" << it[0] << "," << it[1] << "," << it[2] << "," << it[3]
               << "," << it[4] << "," << it[5] << "," << it[6] << "," << it[7] << "," << it[8]
@@ -4330,7 +4330,8 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
     }
 
     double* cp = ren->GetActiveCamera()->GetPosition();
-    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_RAY px=(" << static_cast<int>(px) << ", "
+    std::cerr << std::setprecision(9) << "VTK_METAL_VOLUME_LOG DEBUG GL_RAY px=("
+              << static_cast<int>(px) << ", "
               << static_cast<int>(py) << ") cam=(" << cp[0] << ", " << cp[1] << ", " << cp[2]
               << ") origin=(" << origin[0] << ", " << origin[1] << ", " << origin[2] << ") step=("
               << step[0] << ", " << step[1] << ", " << step[2] << ") vpos=(" << vpos[0] << ", "

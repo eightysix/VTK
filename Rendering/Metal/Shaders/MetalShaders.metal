@@ -3607,6 +3607,7 @@ struct MarchParams {
     float3 texMinGlobal;
     float3 texMaxGlobal;
     float2 screenPos;  // in-viewport pixel coords; (-1,-1) when unknown
+    float3 localPos;   // interpolated fragment position in [0,1] volume space
     bool   checkBounds;
 };
 
@@ -3927,6 +3928,37 @@ inline float4 marchVolumeUnified(
         float(volumeUniforms.scalarMin), float(volumeUniforms.scalarMax),
         float(texelCount.x), float(texelCount.y), float(texelCount.z),
         volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  }
+#endif
+
+  // DEBUG: full-precision step geometry (test builds only). The per-sample
+  // position fit (findings update 16) showed the Metal evalStep and the GL
+  // g_dirStep differ per-axis (x +0.03%, y +0.41%, z -0.003%), i.e. NOT a
+  // uniform scale. Dump the full float32 chain so it can be diffed against
+  // GL's GL_RAY step= / GL_UNIFORMS values at the same pixel and frame:
+  //   p.rayDir          : normalized object-space direction (in.localPos - cam)
+  //   dirObj            : normalize(p.rayDir * boundsSize) -- GL normalize is in
+  //                       object space only; the *boundsSize re-normalize can
+  //                       rotate the direction if boundsSize is non-uniform
+  //   evalStep          : (adjustedLin * dirObj) * sampleDistanceWorld
+  //   texStep           : rayDirTexLocal * p.stepSize (ray-loop tex advance)
+  //   adjustedLin       : volumeToTexture rows scaled by ctpScale
+  //   boundsSize        : volumeBoundsMax - volumeBoundsMin
+  //   sampleDistanceWorld: GL in_sampleDistance (world units)
+#if defined(VTK_METAL_ENABLE_LOGGING)
+    if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
+    os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG STEP px=(%d, %d) cameraVol=(%0.9e, %0.9e, %0.9e) localPos=(%0.9e, %0.9e, %0.9e) rayDir=(%0.9e, %0.9e, %0.9e) dirObj=(%0.9e, %0.9e, %0.9e) evalStep=(%0.9e, %0.9e, %0.9e) texStep=(%0.9e, %0.9e, %0.9e) boundsSize=(%0.9e, %0.9e, %0.9e) sampleDistanceWorld=%0.9e ctpScale=(%0.9e, %0.9e, %0.9e) ctpOffset=(%0.9e, %0.9e, %0.9e)",
+        int(p.screenPos.x), int(p.screenPos.y),
+        volumeUniforms.cameraVolumePos.x, volumeUniforms.cameraVolumePos.y, volumeUniforms.cameraVolumePos.z,
+        p.localPos.x, p.localPos.y, p.localPos.z,
+        p.rayDir.x, p.rayDir.y, p.rayDir.z,
+        dirObj.x, dirObj.y, dirObj.z,
+        evalStep.x, evalStep.y, evalStep.z,
+        texStep.x, texStep.y, texStep.z,
+        boundsSize.x, boundsSize.y, boundsSize.z,
+        volumeUniforms.sampleDistanceWorld,
+        ctpScale.x, ctpScale.y, ctpScale.z,
+        ctpOffset.x, ctpOffset.y, ctpOffset.z);
   }
 #endif
 
@@ -4688,6 +4720,7 @@ inline float4 marchVolume(
     float stepSize,
     float totalBoxT,
     float2 screenPos,
+    float3 localPos,
     float3 initialColor,
     float initialOpacity,
     constant VolumeMapperUniforms& volumeUniforms,
@@ -4714,7 +4747,7 @@ inline float4 marchVolume(
   float jitter = (volumeUniforms.useJittering > 0.5 ? volume_random(screenPos) : 1.0) * stepSize;
   float tStart = dot(entryPoint - cameraPos, rayDir);
   MarchParams p = {cameraPos, rayDir, tStart, totalBoxT, stepSize, jitter, tTerminateMax,
-      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, screenPos, true};
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, screenPos, localPos, true};
   return marchVolumeUnified(p, initialColor, initialOpacity,
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
@@ -4756,7 +4789,7 @@ inline void marchSegment(
   float3 zero = float3(0.0);
   float3 one = float3(1.0);
   MarchParams p = {rayOrigin, rayDir, t0, t1, stepSize, jitter, tTerminateMax,
-      zero, one, zero, one, screenPos, false};
+      zero, one, zero, one, screenPos, rayOrigin + rayDir * t0, false};
   float4 result = marchVolumeUnified(p, accumulatedColor, accumulatedOpacity,
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
@@ -4823,7 +4856,7 @@ fragment VolumeFragmentOut fragment_volume_main(
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
-      stepSize, s.totalBoxT, in.position.xy,
+      stepSize, s.totalBoxT, in.position.xy, in.localPos,
       float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -4883,12 +4916,12 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
 
   RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
       in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
-  if (!s.valid) { return output; }
+  if (!s.valid) { output.color = float4(0.0); return output; }
 
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
-      stepSize, s.totalBoxT, in.position.xy,
+      stepSize, s.totalBoxT, in.position.xy, in.localPos,
       float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -4959,7 +4992,7 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
-      stepSize, s.totalBoxT, in.position.xy,
+      stepSize, s.totalBoxT, in.position.xy, s.entryPoint,
       float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -5016,7 +5049,7 @@ fragment VolumeSelectionOut fragment_volume_fullscreen_selection_main(
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
-      stepSize, s.totalBoxT, in.position.xy,
+      stepSize, s.totalBoxT, in.position.xy, s.entryPoint,
       float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
