@@ -4811,8 +4811,11 @@ inline float4 marchVolumeUnified(
     }
 
     // OpenGL parity: g_opacityThreshold = 1.0 - 1.0/255.0 (vtkVolumeShaderComposer.h).
-    if (accumulatedOpacity >= 1.0f - 1.0f / 255.0f) {
-      accumulatedOpacity = 1.0f;
+    // OpenGL breaks WITHOUT clamping the accumulated opacity (TerminationImplementation
+    // in vtkVolumeShaderComposer.h: `g_fragColor.a > g_opacityThreshold`). Clamping here
+    // made 1-src.a = 0 at blend time, dropping the background blend term that GL keeps
+    // (dst*(1-a), a ~ 0.9969). Keep the raw accumulated opacity for blend parity.
+    if (accumulatedOpacity > 1.0f - 1.0f / 255.0f) {
       break;
     }
     if (firstT + float(currentT) * p.stepSize >= p.tTerminateMax) {
