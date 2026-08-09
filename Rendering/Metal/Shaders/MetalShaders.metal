@@ -3900,6 +3900,31 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
          pxOkCamOut || pxOkResid || pxOkNoJitter || pxOkAlways || pxOkKnife;
 }
 
+// TEMP DEBUG: per-fragment-only gate for the MARCH/STEP dumps (NOT the
+// per-sample SAMPLE/GRADOP/LIGHT dumps). Adds a sparse full-frame grid (every
+// 8th pixel, 64x64 = 4096 px) plus a dense 64x64 block around the
+// CameraInsideNoTransform knife edge (349,255) to debugMarchGate's pixels, so
+// the dense displacement-field experiment can back out the effective sample
+// NDC per pixel without exploding the per-sample log volume. The grid/dense
+// region applies only to the CameraInsideTransformation camera; other cameras
+// keep debugMarchGate's pixels only.
+inline bool debugStepGate(float3 camera, float2 screenPos) {
+  float3 dc = camera;
+  bool camOk = all(abs(dc - float3(0.506559, 0.506559, 0.446101)) < 1e-3);
+  if (camOk)
+  {
+    int px = int(floor(screenPos.x - 0.5));
+    int py = int(floor(screenPos.y - 0.5));
+    bool pxOkGrid = (px % 8 == 0) && (py % 8 == 0);
+    bool pxOkDense = px >= 317 && px <= 380 && py >= 223 && py <= 286;
+    if (pxOkGrid || pxOkDense)
+    {
+      return true;
+    }
+  }
+  return debugMarchGate(camera, screenPos);
+}
+
 inline float4 marchVolumeUnified(
     MarchParams p,
     float3 initialColor, float initialOpacity,
@@ -4141,7 +4166,7 @@ inline float4 marchVolumeUnified(
 
   // DEBUG: one header per gated fragment (test builds only).
 #if defined(VTK_METAL_ENABLE_LOGGING)
-    if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
+    if (p.screenPos.x > 0.0 && debugStepGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
     os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG MARCH px=(%d, %d) camera=(%f, %f, %f) rayDir=(%f, %f, %f) tStart=%f tEnd=%f useClip=%f nClip=%f p0o=(%f, %f, %f) p0n=(%f, %f, %f) p1o=(%f, %f, %f) p1n=(%f, %f, %f) stepSize=%f firstT=%f jitter=%f entry=(%f, %f, %f) scalarMin=%f scalarMax=%f texelCount=(%f, %f, %f) texelDims=(%u, %u, %u)",
         int(p.screenPos.x), int(p.screenPos.y),
         volumeUniforms.cameraVolumePos.x, volumeUniforms.cameraVolumePos.y, volumeUniforms.cameraVolumePos.z,
@@ -4177,7 +4202,7 @@ inline float4 marchVolumeUnified(
   //   boundsSize        : volumeBoundsMax - volumeBoundsMin
   //   sampleDistanceWorld: GL in_sampleDistance (world units)
 #if defined(VTK_METAL_ENABLE_LOGGING)
-    if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
+    if (p.screenPos.x > 0.0 && debugStepGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
     os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG STEP px=(%d, %d) screenPos=(%0.9e, %0.9e) flatVid=%u primId=%u cameraVol=(%0.9e, %0.9e, %0.9e) localPos=(%0.9e, %0.9e, %0.9e) clip=(%0.9e, %0.9e, %0.9e, %0.9e) anchorData=(%0.9e, %0.9e, %0.9e) rayDir=(%0.9e, %0.9e, %0.9e) dirObj=(%0.9e, %0.9e, %0.9e) evalStep=(%0.9e, %0.9e, %0.9e) texStep=(%0.9e, %0.9e, %0.9e) boundsSize=(%0.9e, %0.9e, %0.9e) sampleDistanceWorld=%0.9e ctpScale=(%0.9e, %0.9e, %0.9e) ctpOffset=(%0.9e, %0.9e, %0.9e)",
         int(p.screenPos.x), int(p.screenPos.y),
         p.screenPos.x, p.screenPos.y,

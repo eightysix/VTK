@@ -382,6 +382,17 @@ public:
   void DumpDebugRays(vtkRenderer* ren, vtkShaderProgram* prog, vtkVolume* vol, double geometry[24]);
 
   /**
+   * TEMP DEBUG: render the debug-injected shader into an RGBA32F framebuffer
+   * and write the raw per-pixel interpolated attributes for the whole frame.
+   * 3 passes: attr 0 = (ip_textureCoords.xyz, flatVid), 1 = ip_debugClip.xyzw,
+   * 2 = (ip_vertexPos.xyz, gl_PrimitiveID). Each pass appends w*h*4 float32
+   * RGBA values to the raw file (row 0 = gl_FragCoord y 0), one group per
+   * frame. Enabled via VTK_GL_ATTR_DUMP (path override VTK_GL_ATTR_DUMP_OUT).
+   */
+  void DumpDebugAttrField(
+    vtkRenderer* ren, vtkShaderProgram* prog, vtkVolume* vol, double geometry[24]);
+
+  /**
    * TEMP DEBUG: re-render the clean volume shader into an RGBA32F framebuffer
    * and write the true final fragment floats to a raw binary file (RGBA,
    * row 0 = gl_FragCoord y 0). Enabled via VTK_GL_FLOAT_DUMP (path override
@@ -3039,7 +3050,7 @@ void vtkOpenGLGPUVolumeRayCastMapper::BuildShader(vtkRenderer* ren)
       "      return;\n"
       "    }\n"
       "  }\n"
-      "  if (in_debugChannel >= 100 && in_debugSample < 0)\n"
+       "  if (in_debugChannel >= 100 && in_debugChannel < 110 && in_debugSample < 0)\n"
       "  {\n"
       "    int cf = in_debugChannel - 100;\n"
       "    float v = (cf == 0) ? float(ip_vid) : ((cf == 1) ? ip_debugClipFlat.x :\n"
@@ -3070,6 +3081,23 @@ void vtkOpenGLGPUVolumeRayCastMapper::BuildShader(vtkRenderer* ren)
       "    return;\n"
       "  }\n"
   "  initializeRayCast();\n"
+      "  if (in_debugChannel >= 200 && in_debugChannel < 203 && in_debugSample < 0)\n"
+      "  {\n"
+      "    int af = in_debugChannel - 200;\n"
+      "    if (af == 0)\n"
+      "    {\n"
+      "      fragOutput0 = vec4(ip_textureCoords.xyz, float(ip_vid));\n"
+      "    }\n"
+      "    else if (af == 1)\n"
+      "    {\n"
+      "      fragOutput0 = ip_debugClip;\n"
+      "    }\n"
+      "    else\n"
+      "    {\n"
+      "      fragOutput0 = vec4(ip_vertexPos.xyz, float(gl_PrimitiveID));\n"
+      "    }\n"
+      "    return;\n"
+      "  }\n"
   "  if (in_debugChannel >= 0 && in_debugChannel < 60 && in_debugSample < 0)\n"
   "  {\n"
       "    if (all(lessThan(abs(gl_FragCoord.xy - in_debugPixel), vec2(0.5))))\n"
@@ -4504,6 +4532,9 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::RenderSingleInput(
     // TEMP DEBUG: dump interpolated ray geometry for Metal-parity analysis.
     this->DumpDebugRays(ren, prog, vol, block->VolumeGeometry);
 
+    // TEMP DEBUG: full-framebuffer interpolated-attribute field dump.
+    this->DumpDebugAttrField(ren, prog, vol, block->VolumeGeometry);
+
     // TEMP DEBUG: re-render the clean shader into an RGBA32F FBO and write the
     // true final fragment floats (VTK_GL_FLOAT_DUMP). Independent of the
     // DebugRayDump injection above.
@@ -4946,6 +4977,126 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
     }
   }
 
+}
+
+//------------------------------------------------------------------------------
+void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugAttrField(
+  vtkRenderer* ren, vtkShaderProgram* prog, vtkVolume* vol, double geometry[24])
+{
+  // TEMP DEBUG: full-framebuffer interpolated-attribute field dump for the
+  // Metal-parity displacement analysis. Renders the debug-injected shader into
+  // an RGBA32F FBO with in_debugChannel = 200/201/202 (writes raw float4 for
+  // EVERY pixel, no pixel gate, no byte encoding; see BuildShader) and appends
+  // w*h*4 float32 RGBA values to the raw file per frame/pass. Layout of each
+  // 3-pass group (each pass = w*h*4 floats):
+  //   pass 0: (ip_textureCoords.xyz, float(flatVid))
+  //   pass 1: ip_debugClip.xyzw
+  //   pass 2: (ip_vertexPos.xyz, float(gl_PrimitiveID))
+  // Row 0 = gl_FragCoord y 0 (bottom-left, matches glReadPixels).
+  const char* env = getenv("VTK_GL_ATTR_DUMP");
+  if (env == nullptr)
+  {
+    return;
+  }
+  const char* outPath = getenv("VTK_GL_ATTR_DUMP_OUT");
+  const std::string out = (outPath != nullptr) ? outPath : "/tmp/bc/gl_attr_dump.raw";
+
+  GLint vp[4];
+  glGetIntegerv(GL_VIEWPORT, vp);
+  const GLsizei w = vp[2];
+  const GLsizei h = vp[3];
+
+  GLuint fbo = 0;
+  GLuint tex = 0;
+  GLuint rbo = 0;
+  glGenFramebuffers(1, &fbo);
+  glGenTextures(1, &tex);
+  GLint prevTex2D = 0;
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex2D);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0, GL_RGBA, GL_FLOAT, nullptr);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prevTex2D));
+  glGenRenderbuffers(1, &rbo);
+  glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+  glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+
+  GLint prevFbo = 0;
+  GLint prevDrawBuf = 0;
+  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+  glGetIntegerv(GL_DRAW_BUFFER, &prevDrawBuf);
+  GLboolean blendWasOn = glIsEnabled(GL_BLEND);
+  GLboolean depthWasOn = glIsEnabled(GL_DEPTH_TEST);
+
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rbo);
+  glDrawBuffer(GL_COLOR_ATTACHMENT0);
+  glViewport(0, 0, w, h);
+  glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+  glClearDepth(1.0);
+  glDisable(GL_BLEND);
+  glEnable(GL_DEPTH_TEST);
+
+  std::vector<float> buf(static_cast<size_t>(w) * h * 4);
+  FILE* f = fopen(out.c_str(), "ab");
+  if (!f)
+  {
+    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_ATTR_DUMP FAILED to open " << out << std::endl;
+    glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prevFbo));
+    glDrawBuffer(static_cast<GLenum>(prevDrawBuf));
+    glViewport(vp[0], vp[1], vp[2], vp[3]);
+    if (!blendWasOn)
+    {
+      glDisable(GL_BLEND);
+    }
+    if (!depthWasOn)
+    {
+      glDisable(GL_DEPTH_TEST);
+    }
+    glDeleteRenderbuffers(1, &rbo);
+    glDeleteTextures(1, &tex);
+    glDeleteFramebuffers(1, &fbo);
+    return;
+  }
+
+  prog->SetUniformi("in_debugChannel", -1);
+  prog->SetUniformi("in_debugSample", -1);
+  const float texelInit[3] = { -1.0f, -1.0f, -1.0f };
+  prog->SetUniform3f("in_debugTexel", texelInit);
+  for (int a = 0; a < 3; ++a)
+  {
+    prog->SetUniformi("in_debugChannel", 200 + a);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    this->RenderVolumeGeometry(ren, prog, vol, geometry);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_FLOAT, buf.data());
+    fwrite(buf.data(), sizeof(float), buf.size(), f);
+  }
+  prog->SetUniformi("in_debugChannel", -1);
+  prog->SetUniformi("in_debugSample", -1);
+  fclose(f);
+  std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_ATTR_DUMP w=" << w << " h=" << h
+            << " passes=3 plane0=texcoords+flatVid plane1=clip plane2=vertexPos+primId"
+            << " appended to " << out << std::endl;
+
+  // Restore state.
+  glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prevFbo));
+  glDrawBuffer(static_cast<GLenum>(prevDrawBuf));
+  glViewport(vp[0], vp[1], vp[2], vp[3]);
+  if (!blendWasOn)
+  {
+    glDisable(GL_BLEND);
+  }
+  if (!depthWasOn)
+  {
+    glDisable(GL_DEPTH_TEST);
+  }
+  glDeleteRenderbuffers(1, &rbo);
+  glDeleteTextures(1, &tex);
+  glDeleteFramebuffers(1, &fbo);
 }
 
 //------------------------------------------------------------------------------
