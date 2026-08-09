@@ -92,6 +92,16 @@ static MTLCompileOptions* vtkMetalVolumeCompileOptions()
     options.enableLogging = YES;
     options.languageVersion = MTLLanguageVersion3_2;
     options.preprocessorMacros = @{ @"VTK_METAL_ENABLE_LOGGING" : @(1) };
+    // Env-gated full-field pre-store float dump (mirror of the GL-side
+    // VTK_GL_FLOAT_DUMP): FINAL logs fire for every pixel so the CPU can
+    // reconstruct Metal's unblended gf + alpha and compare against clean GL.
+    if (getenv("VTK_METAL_FLOAT_DUMP") != nullptr)
+    {
+      NSMutableDictionary* macros =
+        [NSMutableDictionary dictionaryWithDictionary:options.preprocessorMacros];
+      macros[@"VTK_METAL_FLOAT_DUMP"] = @(1);
+      options.preprocessorMacros = macros;
+    }
   }
 #endif
   return [options autorelease];

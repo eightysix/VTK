@@ -4925,7 +4925,11 @@ inline float4 marchVolumeUnified(
 
 #if defined(VTK_METAL_ENABLE_LOGGING)
   bool gridGate = (((int(p.screenPos.x) & 31) == 16) && ((int(p.screenPos.y) & 31) == 16));
-  if (p.screenPos.x > 0.0 && (gridGate || debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos))) {
+  bool dumpAll = 0;
+#if defined(VTK_METAL_FLOAT_DUMP)
+  dumpAll = 1;
+#endif
+  if (p.screenPos.x > 0.0 && (dumpAll || gridGate || debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos))) {
     os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG FINAL px=(%d, %d) vp=(%f, %f) lastIter=%d accOp=%f accCol=(%f, %f, %f) final=(%f, %f, %f)",
         int(p.screenPos.x), int(p.screenPos.y), volumeUniforms.viewportSize.x, volumeUniforms.viewportSize.y, lastIter,
         float(accumulatedOpacity),
