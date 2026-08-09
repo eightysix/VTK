@@ -1,7 +1,7 @@
-# Applied the composite multiply-ordering fix (GL `w·(c·a)` parity): measured effect is 3 px only — the 63,691-px ±1 field is NOT the multiply ordering; bias magnitude (~3.5e-4) points to a per-sample input precision difference, volume texture ruled out (update 43)
+# Applied the composite multiply-ordering fix (GL `w·(c·a)` parity): measured effect is 3 px only — the 63,692-px ±1 field is NOT the multiply ordering; ruled out output pixel format (BGRA8Unorm direct path), volume texture (R16Unorm), and TF table precision (both backends float32) (update 43)
 
 **Date:** 2026-08-09
-**Scope:** Implement the composite-multiply ordering fix identified in [update 42](VolumeRayCastBackendComparisonFindingsUpdate42.md) (§2: GL composites `w·(c·a)` — premultiply sample color by opacity first — while Metal composites `(w·c)·a`), re-capture clean Metal, and measure. Result: the ordering difference is real and matches GL's written source semantics, but it moves only **3 pixels** (1 toward GL, 2 away) of the 63,692-px ±1 field. The bulk ±1 field has a different cause whose magnitude (~3.5e-4, ≈2^-11.5) implicates a per-sample precision source; the volume texture is ruled out (this test's USHORT data uploads as exact R16Unorm, not half).
+**Scope:** Implement the composite-multiply ordering fix identified in [update 42](VolumeRayCastBackendComparisonFindingsUpdate42.md) (§2: GL composites `w·(c·a)` — premultiply sample color by opacity first — while Metal composites `(w·c)·a`), re-capture clean Metal, and measure. Result: the ordering difference is real and matches GL's written source semantics, but it moves only **3 pixels** (1 toward GL, 2 away) of the 63,692-px ±1 field. The bulk ±1 field has a different cause whose magnitude (~3.5e-4, ≈2^-11.5) implicates a per-sample precision source; this update rules out the three remaining precision-candidate paths (output pixel format, volume texture, TF table precision).
 
 **Follows:** [Update 42](VolumeRayCastBackendComparisonFindingsUpdate42.md).
 
@@ -41,14 +41,17 @@ Notes:
 
 Observed: 69,855 flipped channels / 786,432 = 8.88% per channel, GL > Metal on 99.97%, uniform across the image ⇒ a one-directional accumulated-color offset of ~0.0888 byte ≈ **3.5e-4** (~2^-11.5) sits under the byte-quantization boundary.
 
-- **Rules out:** the multiply ordering (measured 2.9e-6, ~120× too small); random ULP accumulation (would be ±, not 99.97% one-sided); the output pixel format (camera-inside path renders to BGRA8Unorm, same 8-bit quantization as GL; no RGBA16Float involved).
-- **Consistent with half-precision somewhere per-sample:** half mantissa 10 bits ⇒ quantization ~2^-11 ≈ 4.9e-4, the right order. But the **volume texture is ruled out**: this test's scalars are USHORT 0..4370 → `vtkMetalGPUVolumeRayCastMapper.mm` uploads R16Unorm (exact, `NormalizationFactor=65535`, no half conversion). Candidate that remains: the **transfer-function table textures** (color/opacity 1D LUTs), which are sampled per sample as `half4` in Metal (`sampleTransferFunction`), vs whatever precision GL's TF table uses — a uniform ~2e-6/sample TF lookup difference would accumulate to ~3.5e-4 over 170 samples while leaving the raw-scalar match (≤1.3e-7, update-41) intact.
+- **Rules out — multiply ordering:** measured 2.9e-6, ~120× too small; random ULP accumulation (would be ±, not 99.97% one-sided).
+- **Rules out — output pixel format:** the camera-inside path renders through `FullscreenDirect` → **BGRA8Unorm** (`vtkMetalGPUVolumeRayCastMapper.mm:6332`), the same 8-bit quantization GL applies; the RGBA16Float offscreen targets (lines 1708-1771, 5822) are used only for the partitioned / RenderToImage / downsampled paths, not this test.
+- **Rules out — volume texture precision:** this test's scalars are USHORT 0..4370 → uploaded as **R16Unorm** (exact, `NormalizationFactor=65535`, no half conversion; `vtkMetalGPUVolumeRayCastMapper.mm:731-741`).
+- **Rules out — transfer-function table precision:** both backends already use full float32 tables. Metal's `ColorOpacityTexture` is built by `FillTransferFunctionRGBA32FWithPreIntegration` and uploaded as **MTLPixelFormatRGBA32Float** (`vtkMetalGPUVolumeRayCastMapper.mm:1368-1413, 3643-3667`); GL's RGB/opacity tables upload via `Create2DFromRaw(..., VTK_FLOAT, ...)` (`vtkOpenGLVolumeRGBTable.cxx:34-35`). The half `RGBA16Float` TF-table variant (which the update-43 original draft listed as the remaining candidate) was already replaced by the RGBA32F variant precisely because it "quantized every sampled opacity/color to half precision (11-bit mantissa), shifting the accumulated color by a few LSB vs the OpenGL reference" (comment at `vtkMetalGPUVolumeRayCastMapper.mm:1371-1374`). So the ~3.5e-4 bias is **not** a TF-table half-quantization.
 - The 13 hot px (worst 8 at (397,110)) are a separate, opposite-sign (GL lower) knife-edge issue; untouched by this fix.
 
 ## 4. Next steps
 
-- Compare the **transfer-function table** precision/upload between backends (Metal TF textures as half4 vs GL table format + shader LUT fetch precision). Test by uploading Metal's TF tables as full float and re-diffing the ±1 field.
-- Alternatively, re-run the per-sample accumulation-level comparison (`compare_gl_metal_accum.py`) at a representative ±1 pixel to confirm the divergence accumulates per-sample from the TF lookup rather than from the composite.
+- Re-run the per-sample **accumulation-level** comparison (`compare_gl_metal_accum.py`) at a representative ±1 pixel and at a hot pixel, comparing accumulated color/alpha per sample — pin down whether the ~3.5e-4 divergence starts at sample 0 (a per-sample input/arithmeic drift) or accumulates late (termination / last-sample weight). With the ordering, output format, volume texture, and TF table all ruled out, the remaining candidates are per-sample arithmetic differences in the march itself (position → scalar → TF coordinate → premultiply chain).
+- Re-run the same comparison at (422,92) to re-confirm the 2.9e-6 ordering replay still holds under the new composite order.
+- Diff the compiled clean-GL vs debug-GL fragment shaders (update-41 doubt 2) for the composite block — the debug-instrumented GL is still 60k px closer to Metal than clean GL is.
 
 ## Artifacts
 
