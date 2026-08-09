@@ -6908,14 +6908,26 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   {
     float normFactor = this->ScalarNormalizationFactor;
+    // OpenGL in_volume_scale parity: GL's GetScaleAndBias divides by max+1 for
+    // normalized integer formats (R8Unorm/R16Unorm -> glScale = 1/256, 1/65536),
+    // so ScalarMin/ScalarMax must be uploaded in that space for the shader's
+    // 1.0f/max(scalarMax - scalarMin, 1e-4) to reproduce GL's in_volume_scale
+    // bit-for-bit (USHORT 0..4370: max = 4370/65536 = 0.0666809 -> scale =
+    // 14.9967966 == GL's). Float data keeps /normFactor (== /1; GL glScale = 1).
+    float glDenom = normFactor;
+    if (normFactor == 255.0f || normFactor == 65535.0f)
+    {
+      glDenom = normFactor + 1.0f;
+    }
     std::cerr << "VTK_METAL_VOLUME_LOG DEBUG MTL_UNIFORM_SCALAR range=(" << this->ScalarRange[0]
-              << "," << this->ScalarRange[1] << ") normFactor=" << normFactor << std::endl;
-    uniforms.ScalarMin = static_cast<float>(this->ScalarRange[0] / normFactor);
+              << "," << this->ScalarRange[1] << ") normFactor=" << normFactor
+              << " glDenom=" << glDenom << std::endl;
+    uniforms.ScalarMin = static_cast<float>(this->ScalarRange[0] / glDenom);
     uniforms.ScalarMax = static_cast<float>(
       (this->ScalarRange[1] > this->ScalarRange[0]
          ? this->ScalarRange[1]
          : this->ScalarRange[0] + 1.0) /
-      normFactor);
+      glDenom);
   }
 
   // Independent multi-component support (OpenGL in_scalarsRange parity):
