@@ -3808,6 +3808,22 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
   //   Metal screenPos (top-left) == GL glReadPixels (422, 92). This is the worst
   //   |Metal-GL| pixel in the NoJitter render (d=199: GL dark, Metal bright).
   bool pxOkAlways = all(abs(screenPos - float2(422.5, 419.5)) < 0.5);
+  // TEMP DEBUG: u60 knife-edge pixels (largest Metal-vs-GL gf deltas).
+  bool pxOkKnife =
+      all(abs(screenPos - float2(397.5, 110.5)) < 0.5) ||
+      all(abs(screenPos - float2(360.5, 229.5)) < 0.5) ||
+      all(abs(screenPos - float2(349.5, 255.5)) < 0.5) ||
+      all(abs(screenPos - float2(405.5, 171.5)) < 0.5) ||
+      all(abs(screenPos - float2(9.5, 18.5)) < 0.5) ||
+      all(abs(screenPos - float2(293.5, 298.5)) < 0.5) ||
+      all(abs(screenPos - float2(338.5, 432.5)) < 0.5) ||
+      all(abs(screenPos - float2(350.5, 5.5)) < 0.5) ||
+      all(abs(screenPos - float2(153.5, 32.5)) < 0.5) ||
+      all(abs(screenPos - float2(482.5, 33.5)) < 0.5) ||
+      all(abs(screenPos - float2(120.5, 167.5)) < 0.5) ||
+      all(abs(screenPos - float2(470.5, 269.5)) < 0.5) ||
+      all(abs(screenPos - float2(439.5, 281.5)) < 0.5) ||
+      all(abs(screenPos - float2(469.5, 463.5)) < 0.5);
   // TEMP DEBUG: NoShade left-half comparison pixels (left side matches GL).
   bool pxOkLeft =
       all(abs(screenPos - float2(80.5, 400.5)) < 0.5) ||
@@ -3881,7 +3897,7 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
       all(abs(screenPos - float2(93.5, 201.5)) < 0.5) ||
       all(abs(screenPos - float2(242.5, 330.5)) < 0.5);
   return (camOk && pxOk) || (camOkClip && pxOkClip) || pxOkAny || pxOkContained || pxOkLeft ||
-         pxOkCamOut || pxOkResid || pxOkNoJitter || pxOkAlways;
+         pxOkCamOut || pxOkResid || pxOkNoJitter || pxOkAlways || pxOkKnife;
 }
 
 inline float4 marchVolumeUnified(
