@@ -4791,7 +4791,7 @@ inline float4 marchVolumeUnified(
         sampleColor = float3(ambientMat) * sampleColor;
       }
 
-      accumulatedColor += weight * sampleColor * sampleOpacity;
+      accumulatedColor += weight * (sampleColor * sampleOpacity);
       accumulatedOpacity += weight * sampleOpacity;
     }
 
