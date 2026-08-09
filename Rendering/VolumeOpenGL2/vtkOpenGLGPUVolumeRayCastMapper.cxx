@@ -3033,7 +3033,8 @@ void vtkOpenGLGPUVolumeRayCastMapper::BuildShader(vtkRenderer* ren)
       "    float v = (cf == 0) ? float(ip_vid) : ((cf == 1) ? ip_debugClipFlat.x :\n"
       "      ((cf == 2) ? ip_debugClipFlat.y : ((cf == 3) ? ip_debugClipFlat.z :\n"
       "      ((cf == 4) ? ip_debugClipFlat.w : ((cf == 5) ? ip_vertexPos.x :\n"
-      "      ((cf == 6) ? ip_vertexPos.y : ip_vertexPos.z))))));\n"
+      "      ((cf == 6) ? ip_vertexPos.y : ((cf == 7) ? float(gl_PrimitiveID) :\n"
+      "      ip_vertexPos.z)))))));\n"
       "    float av = abs(v);\n"
       "    float b0 = 0.0;\n"
       "    float b1 = 0.0;\n"
@@ -4514,6 +4515,42 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
       }
     }
 
+    // Channel 100: flat covering-triangle provoking-vertex index (ip_vid).
+    unsigned char vidBytes[4] = { 0, 0, 0, 0 };
+    prog->SetUniform2f("in_debugPixel", debugPixel);
+    prog->SetUniformi("in_debugChannel", 100);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    this->RenderVolumeGeometry(ren, prog, vol, geometry);
+    glReadPixels(gx, gy, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, vidBytes);
+    int flatVid = -1;
+    if (vidBytes[0] != 0 || vidBytes[1] != 0 || vidBytes[2] != 0 || vidBytes[3] != 0)
+    {
+      double m23 =
+        static_cast<double>(vidBytes[0]) + 256.0 * vidBytes[1] + 65536.0 * vidBytes[2];
+      double mant = 1.0 + m23 / 8388608.0;
+      int e = static_cast<int>(vidBytes[3] & 0x7F) - 64;
+      double sign = (vidBytes[3] & 0x80) ? -1.0 : 1.0;
+      flatVid = static_cast<int>(sign * mant * std::pow(2.0, e));
+    }
+
+    // Channel 107: covering-triangle primitive index (gl_PrimitiveID).
+    unsigned char triBytes[4] = { 0, 0, 0, 0 };
+    prog->SetUniform2f("in_debugPixel", debugPixel);
+    prog->SetUniformi("in_debugChannel", 107);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    this->RenderVolumeGeometry(ren, prog, vol, geometry);
+    glReadPixels(gx, gy, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, triBytes);
+    int glPrim = -1;
+    if (triBytes[0] != 0 || triBytes[1] != 0 || triBytes[2] != 0 || triBytes[3] != 0)
+    {
+      double m23 =
+        static_cast<double>(triBytes[0]) + 256.0 * triBytes[1] + 65536.0 * triBytes[2];
+      double mant = 1.0 + m23 / 8388608.0;
+      int e = static_cast<int>(triBytes[3] & 0x7F) - 64;
+      double sign = (triBytes[3] & 0x80) ? -1.0 : 1.0;
+      glPrim = static_cast<int>(sign * mant * std::pow(2.0, e));
+    }
+
     // Skip pixels that were never covered by the volume (framebuffer held the
     // clear color instead of an encoded value).
     if (origin[0] == 0.0f && origin[1] == 0.0f && origin[2] == 0.0f)
@@ -4529,7 +4566,7 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
               << step[0] << ", " << step[1] << ", " << step[2] << ") vpos=(" << vpos[0] << ", "
               << vpos[1] << ", " << vpos[2] << ") tex=(" << tcoord[0] << ", " << tcoord[1] << ", "
               << tcoord[2] << ") clip=(" << clip[0] << ", " << clip[1] << ", " << clip[2] << ", "
-              << clip[3] << ")" << std::endl;
+              << clip[3] << ") flatVid=" << flatVid << " primId=" << glPrim << std::endl;
     std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_BOX " << std::setprecision(6);
     for (int i = 0; i < 8; ++i)
     {

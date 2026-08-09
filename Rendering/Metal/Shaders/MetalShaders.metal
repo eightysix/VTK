@@ -2875,6 +2875,11 @@ struct VolumeMapperUniforms {
   // TEMP DEBUG (anchor A/B): additive data-space anchor perturbation from
   // VTK_METAL_ANCHOR_PERTURB, applied before the dirObj normalize.
   float3 anchorPerturbData;
+  // OpenGL ip_textureCoords parity: per-vertex cell-to-point texel adjustment
+  // (in_cellToPoint scale + offset), applied in the vertex shader so the
+  // interpolated ray anchor matches GL's per-vertex float-rounded texcoord.
+  float3 cellToPointScale;
+  float3 cellToPointOffset;
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -2904,6 +2909,8 @@ struct VolumeVertexOut {
   float3 localPos;
   float4 clipPos;  // debug: exact clip-space position (P*V*M*v), interpolated in the fragment
   uint instanceID [[flat]];
+  uint flatVid [[flat]];  // debug: provoking-vertex index (covering triangle) for GL parity
+  float3 texcoord;  // OpenGL ip_textureCoords parity: cellToPoint-adjusted per-vertex texture coord
 };
 
 struct VolumeVertexIn {
@@ -3010,6 +3017,31 @@ vertex VolumeVertexOut vertex_volume_main(
     out.localPos = (modelPos - volumeUniforms.volumeBoundsMin.xyz) / max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
   }
   out.instanceID = 0;
+  out.flatVid = vertexId;
+  // OpenGL ip_textureCoords parity: GL computes
+  //   uvx = in_inverseTextureDatasetMatrix[0] * vec4(in_vertexPos, 1.0)
+  //   ip_textureCoords = (in_cellToPoint[0] * vec4(uvx, 1.0)).xyz
+  // and the rasterizer interpolates that per-vertex float result. Replicate the
+  // exact GLSL mat4*vec4 contraction (mul, fma, fma, mul+add) so the per-vertex
+  // texcoord — hence the interpolated ray anchor — is bit-identical.
+  float3 uvx;
+  float au;
+  au = volumeUniforms.volumeToTexture[0][0] * v.x;
+  au = fma(volumeUniforms.volumeToTexture[1][0], v.y, au);
+  au = fma(volumeUniforms.volumeToTexture[2][0], v.z, au);
+  au = au + volumeUniforms.volumeToTexture[3][0] * v.w;
+  uvx.x = au;
+  au = volumeUniforms.volumeToTexture[0][1] * v.x;
+  au = fma(volumeUniforms.volumeToTexture[1][1], v.y, au);
+  au = fma(volumeUniforms.volumeToTexture[2][1], v.z, au);
+  au = au + volumeUniforms.volumeToTexture[3][1] * v.w;
+  uvx.y = au;
+  au = volumeUniforms.volumeToTexture[0][2] * v.x;
+  au = fma(volumeUniforms.volumeToTexture[1][2], v.y, au);
+  au = fma(volumeUniforms.volumeToTexture[2][2], v.z, au);
+  au = au + volumeUniforms.volumeToTexture[3][2] * v.w;
+  uvx.z = au;
+  out.texcoord = volumeUniforms.cellToPointScale * uvx + volumeUniforms.cellToPointOffset;
   // Debug only (test builds): the proxy geometry has only a handful of
   // vertices, so this stays bounded to a few messages per frame. Verified by
   // TestMetalVolumeShaderLog.
@@ -3714,6 +3746,8 @@ struct MarchParams {
     bool   checkBounds;
     float3 anchorData; // interpolated anchor in dataset space (GL ip_vertexPos parity)
     bool   anchorIsData; // anchorData holds a data-space position (camera-inside proxy path)
+    uint   flatVid;     // debug: provoking-vertex index of the covering triangle
+    uint   primId;      // debug: primitive (triangle) index of the covering triangle
 };
 
 // Debug helper (test builds): per-sample march dumps, gated to a handful of
@@ -4067,8 +4101,9 @@ inline float4 marchVolumeUnified(
   //   sampleDistanceWorld: GL in_sampleDistance (world units)
 #if defined(VTK_METAL_ENABLE_LOGGING)
     if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
-    os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG STEP px=(%d, %d) cameraVol=(%0.9e, %0.9e, %0.9e) localPos=(%0.9e, %0.9e, %0.9e) clip=(%0.9e, %0.9e, %0.9e, %0.9e) anchorData=(%0.9e, %0.9e, %0.9e) rayDir=(%0.9e, %0.9e, %0.9e) dirObj=(%0.9e, %0.9e, %0.9e) evalStep=(%0.9e, %0.9e, %0.9e) texStep=(%0.9e, %0.9e, %0.9e) boundsSize=(%0.9e, %0.9e, %0.9e) sampleDistanceWorld=%0.9e ctpScale=(%0.9e, %0.9e, %0.9e) ctpOffset=(%0.9e, %0.9e, %0.9e)",
+    os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG STEP px=(%d, %d) flatVid=%u primId=%u cameraVol=(%0.9e, %0.9e, %0.9e) localPos=(%0.9e, %0.9e, %0.9e) clip=(%0.9e, %0.9e, %0.9e, %0.9e) anchorData=(%0.9e, %0.9e, %0.9e) rayDir=(%0.9e, %0.9e, %0.9e) dirObj=(%0.9e, %0.9e, %0.9e) evalStep=(%0.9e, %0.9e, %0.9e) texStep=(%0.9e, %0.9e, %0.9e) boundsSize=(%0.9e, %0.9e, %0.9e) sampleDistanceWorld=%0.9e ctpScale=(%0.9e, %0.9e, %0.9e) ctpOffset=(%0.9e, %0.9e, %0.9e)",
         int(p.screenPos.x), int(p.screenPos.y),
+        p.flatVid, p.primId,
         volumeUniforms.cameraVolumePos.x, volumeUniforms.cameraVolumePos.y, volumeUniforms.cameraVolumePos.z,
         p.localPos.x, p.localPos.y, p.localPos.z,
         p.clipPos.x, p.clipPos.y, p.clipPos.z, p.clipPos.w,
@@ -4846,6 +4881,8 @@ inline float4 marchVolume(
     float4 clipPos,
     float3 anchorData,
     bool anchorIsData,
+    uint flatVid,
+    uint primId,
     float3 initialColor,
     float initialOpacity,
     constant VolumeMapperUniforms& volumeUniforms,
@@ -4891,7 +4928,7 @@ inline float4 marchVolume(
   }
   MarchParams p = {cameraPos, rayDir, tStart, totalBoxT, stepSize, jitter, tTerminateMax,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, screenPos, localPos, clipPos,
-      true, anchorData, anchorIsData};
+      true, anchorData, anchorIsData, flatVid, primId};
   return marchVolumeUnified(p, initialColor, initialOpacity,
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
@@ -4948,6 +4985,7 @@ inline void marchSegment(
 
 fragment VolumeFragmentOut fragment_volume_main(
     VolumeVertexOut in [[stage_in]],
+    uint primId [[primitive_id]],
     constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
     constant PerBlockData& b [[buffer(2)]],
     texture3d<float> volumeTexture [[texture(0)]],
@@ -4980,10 +5018,18 @@ fragment VolumeFragmentOut fragment_volume_main(
   bool cameraInsideProxy = volumeUniforms.useCameraInsideNearClip > 0.5;
   float3 anchorData = in.localPos;
   float3 localPos = in.localPos;
+  float3 anchorTex = in.localPos;
   if (cameraInsideProxy)
   {
     float3 bsz = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
     localPos = (in.localPos - volumeUniforms.volumeBoundsMin.xyz) / bsz;
+    // OpenGL ip_textureCoords parity: GL's vertex shader maps each proxy vertex
+    // through in_inverseTextureDatasetMatrix * pos and then the cell-to-point
+    // texel adjustment (scale + offset), and the rasterizer interpolates that
+    // per-vertex float result. Use the interpolated per-vertex texcoord so the
+    // ray anchor is bit-identical to GL (a fragment-time affine of the
+    // interpolated data position only reproduced the systematic shift).
+    anchorTex = in.texcoord;
   }
 
   // Parallel projection (OpenGL in_projectionDirection parity): cast parallel
@@ -5015,7 +5061,8 @@ fragment VolumeFragmentOut fragment_volume_main(
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
-      stepSize, s.totalBoxT, in.position.xy, localPos, in.clipPos, anchorData, cameraInsideProxy,
+      stepSize, s.totalBoxT, in.position.xy, anchorTex, in.clipPos, anchorData, cameraInsideProxy,
+      in.flatVid, primId,
       float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -5037,6 +5084,7 @@ fragment VolumeFragmentOut fragment_volume_main(
 // polygonal prop's ids untouched.
 fragment VolumeSelectionOut fragment_volume_selection_main(
     VolumeVertexOut in [[stage_in]],
+    uint primId [[primitive_id]],
     constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
     constant PerBlockData& b [[buffer(2)]],
     texture3d<float> volumeTexture [[texture(0)]],
@@ -5071,10 +5119,18 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
   bool cameraInsideProxy = volumeUniforms.useCameraInsideNearClip > 0.5;
   float3 anchorData = in.localPos;
   float3 localPos = in.localPos;
+  float3 anchorTex = in.localPos;
   if (cameraInsideProxy)
   {
     float3 bsz = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
     localPos = (in.localPos - volumeUniforms.volumeBoundsMin.xyz) / bsz;
+    // OpenGL ip_textureCoords parity: GL's vertex shader maps each proxy vertex
+    // through in_inverseTextureDatasetMatrix * pos and then the cell-to-point
+    // texel adjustment (scale + offset), and the rasterizer interpolates that
+    // per-vertex float result. Use the interpolated per-vertex texcoord so the
+    // ray anchor is bit-identical to GL (a fragment-time affine of the
+    // interpolated data position only reproduced the systematic shift).
+    anchorTex = in.texcoord;
   }
 
   bool parallel = volumeUniforms.useParallelProjection > 0.5;
@@ -5094,7 +5150,8 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
-      stepSize, s.totalBoxT, in.position.xy, localPos, in.clipPos, anchorData, cameraInsideProxy,
+      stepSize, s.totalBoxT, in.position.xy, anchorTex, in.clipPos, anchorData, cameraInsideProxy,
+      in.flatVid, primId,
       float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -5166,6 +5223,7 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
   float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
       stepSize, s.totalBoxT, in.position.xy, s.entryPoint, in.clipPos, s.entryPoint, false,
+      0, 0,
       float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -5223,6 +5281,7 @@ fragment VolumeSelectionOut fragment_volume_fullscreen_selection_main(
   float4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
       stepSize, s.totalBoxT, in.position.xy, s.entryPoint, in.clipPos, s.entryPoint, false,
+      0, 0,
       float3(0.0), 0.0f, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -5275,10 +5334,18 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
   bool cameraInsideProxy = volumeUniforms.useCameraInsideNearClip > 0.5;
   float3 anchorData = in.localPos;
   float3 localPos = in.localPos;
+  float3 anchorTex = in.localPos;
   if (cameraInsideProxy)
   {
     float3 bsz = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
     localPos = (in.localPos - volumeUniforms.volumeBoundsMin.xyz) / bsz;
+    // OpenGL ip_textureCoords parity: GL's vertex shader maps each proxy vertex
+    // through in_inverseTextureDatasetMatrix * pos and then the cell-to-point
+    // texel adjustment (scale + offset), and the rasterizer interpolates that
+    // per-vertex float result. Use the interpolated per-vertex texcoord so the
+    // ray anchor is bit-identical to GL (a fragment-time affine of the
+    // interpolated data position only reproduced the systematic shift).
+    anchorTex = in.texcoord;
   }
 
   bool parallel = volumeUniforms.useParallelProjection > 0.5;
@@ -5299,7 +5366,7 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
   float jitter = (volumeUniforms.useJittering > 0.5 ? volume_random(in.position.xy) : 1.0) * stepSize;
   float tStart = parallel ? 0.0 : dot(s.entryPoint - cameraPos, rayDir);
   MarchParams p = {rayOrigin, rayDir, tStart, s.totalBoxT, stepSize, jitter, s.tTerminateMax,
-      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, in.position.xy, localPos,
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, in.position.xy, anchorTex,
       in.clipPos, true, anchorData, cameraInsideProxy};
 
   float3 firstOpaquePos = float3(-1.0);

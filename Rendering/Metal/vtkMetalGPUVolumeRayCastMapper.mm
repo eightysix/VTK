@@ -281,10 +281,15 @@ struct VolumeMapperUniforms
   // (data units, "x,y,z"). Tests whether the ~1e-5 MT-GL anchor interpolation
   // difference drives the knife-edge flips.
   float AnchorPerturbData[4];       // 1856..1871 (total 1872, 16-byte aligned)
+  // OpenGL ip_textureCoords parity: per-vertex cell-to-point texel adjustment
+  // (in_cellToPoint scale + offset), applied in the vertex shader so the
+  // interpolated ray anchor matches GL's per-vertex float-rounded texcoord.
+  float CellToPointScale[4];        // 1872..1887
+  float CellToPointOffset[4];       // 1888..1903 (total 1904, 16-byte aligned)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1872,
-  "VolumeMapperUniforms must be 1872 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1904,
+  "VolumeMapperUniforms must be 1904 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -6630,14 +6635,26 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     }
 
     vtkNew<vtkMatrix4x4> volToTex;
-    vtkMatrix4x4::Invert(texToVol, volToTex);
+    // OpenGL in_inverseTextureDatasetMatrix parity: GL transposes the
+    // TextureToDataset matrix BEFORE inverting (vtkOpenGLGPUVolumeRayCastMapper
+    // BindTransformations), so the per-component float32 matrix fed to the
+    // shader is invert(transpose(T)). Reproduce that exact double round-trip so
+    // the vertex-shader texture coords (and all sample-space conversions) use
+    // bit-identical per-component values.
+    vtkNew<vtkMatrix4x4> texToDataT;
+    texToDataT->DeepCopy(texToVol);
+    texToDataT->Transpose();
+    vtkMatrix4x4::Invert(texToDataT, volToTex);
 
     for (int r = 0; r < 4; ++r)
     {
       for (int c = 0; c < 4; ++c)
       {
         uniforms.TextureToVolumeMatrix[c * 4 + r] = texToVol->GetElement(r, c);
-        uniforms.VolumeToTextureMatrix[c * 4 + r] = volToTex->GetElement(r, c);
+        // GL stores InvTexMatVec row-major (vec[r*4+c] = invT[j][i]) and the
+        // column-major GLSL mat4 reads M[j][i] = vec[j*4+i]. Mirror that exact
+        // layout (no transpose here; the loop maps index [c*4+r] -> [c][r]).
+        uniforms.VolumeToTextureMatrix[c * 4 + r] = volToTex->GetElement(c, r);
       }
     }
   }
@@ -6724,6 +6741,32 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
               << ren->GetActiveCamera()->GetPosition()[0] << ","
               << ren->GetActiveCamera()->GetPosition()[1] << ","
               << ren->GetActiveCamera()->GetPosition()[2] << std::endl;
+  }
+
+  // OpenGL ip_textureCoords parity: GL maps each proxy vertex through the
+  // cell-to-point matrix (vtkVolumeTexture::ComputeCellToPointMatrix, float32)
+  // and the rasterizer interpolates that per-vertex result. Reproduce the exact
+  // float32 scale (range) and offset (min) here so the interpolated ray anchor
+  // is bit-identical to GL's ip_textureCoords.
+  {
+    int dims[3];
+    input->GetDimensions(dims);
+    float delta[3] = { static_cast<float>(dims[0]), static_cast<float>(dims[1]),
+      static_cast<float>(dims[2]) };
+    for (int i = 0; i < 3; ++i)
+    {
+      float min = delta[i] > 0.0f ? 0.5f / delta[i] : 0.5f;
+      float range = (delta[i] - 0.5f) / delta[i] - min;
+      uniforms.CellToPointScale[i] = range;
+      uniforms.CellToPointOffset[i] = min;
+    }
+    uniforms.CellToPointScale[3] = 0.0f;
+    uniforms.CellToPointOffset[3] = 1.0f;
+    std::cerr << std::setprecision(9) << "VTK_METAL_VOLUME_LOG DEBUG MTL_CTP scale=("
+              << uniforms.CellToPointScale[0] << ", " << uniforms.CellToPointScale[1] << ", "
+              << uniforms.CellToPointScale[2] << ") offset=(" << uniforms.CellToPointOffset[0]
+              << ", " << uniforms.CellToPointOffset[1] << ", " << uniforms.CellToPointOffset[2]
+              << ")" << std::endl;
   }
 
   // Camera-inside near-plane clip (OpenGL near-plane proxy-clip parity): when
