@@ -285,11 +285,19 @@ struct VolumeMapperUniforms
   // (in_cellToPoint scale + offset), applied in the vertex shader so the
   // interpolated ray anchor matches GL's per-vertex float-rounded texcoord.
   float CellToPointScale[4];        // 1872..1887
-  float CellToPointOffset[4];       // 1888..1903 (total 1904, 16-byte aligned)
+  float CellToPointOffset[4];       // 1888..1903
+  // OpenGL in_inversePVM parity: CPU-composed
+  // inverseVolumeMatrix * inverseModelViewMatrix * inverseProjectionMatrix
+  // (double-precision vtk product, cast to float32). The camera-inside proxy
+  // path unprojects the fragment through the near/far planes with this matrix
+  // to build the ray direction analytically (GL computeRayDirection parity),
+  // removing the interpolated-anchor dependence that drifted evalStep from
+  // g_dirStep by ~3e-8/step.
+  float InversePVM[16];             // 1904..1967 (total 1968, 16-byte aligned)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1904,
-  "VolumeMapperUniforms must be 1904 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1968,
+  "VolumeMapperUniforms must be 1968 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -322,6 +330,7 @@ static_assert(offsetof(VolumeMapperUniforms, CameraInsideNearPlaneOrigin) == 168
 static_assert(offsetof(VolumeMapperUniforms, CameraInsideNearPlaneNormal) == 1696, "");
 static_assert(offsetof(VolumeMapperUniforms, ProjectionMatrix) == 1712, "");
 static_assert(offsetof(VolumeMapperUniforms, ModelViewMatrix) == 1776, "");
+static_assert(offsetof(VolumeMapperUniforms, InversePVM) == 1904, "");
 
 // Per-light data for volume shading — must match Metal VolumeLight struct
 // Must match Metal VolumeLight (6 x float4 = 96 bytes per light)
@@ -7373,6 +7382,68 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         uniforms.ModelViewMatrix[c * 4 + r] = static_cast<float>(V4->GetElement(r, c));
       }
     }
+  }
+
+  // OpenGL in_inversePVM parity: the CPU-composed
+  // inverseProjectionMatrix * inverseModelViewMatrix * inverseVolumeMatrix used
+  // by GL's analytic computeRayDirection (vtkVolumeShaderComposer.h) and by the
+  // Metal fragment shader's camera-inside proxy path. GL computes it with
+  // vtkMatrix4x4 double precision from the GetKeyMatrices outputs (wcvc =
+  // Transpose(GetModelViewTransformMatrix), vcdc = Transpose(
+  // GetProjectionTransformMatrix(aspect, -1, 1))), each inverted, then
+  // InverseVolumeMat = Invert(transpose(dataToWorld)), and finally
+  // InversePVMMat = (InverseProjectionMat * InverseModelViewMat) * InverseVolumeMat
+  // (vtkOpenGLGPUVolumeRayCastMapper.cxx SetCameraShaderParameters). Replicate
+  // the exact double math so the uploaded float32 bytes match GL's
+  // SetUniformMatrix upload (data[i] = Element[i/4][i%4]).
+  {
+    vtkCamera* cam = ren->GetActiveCamera();
+    const double aspect = ren->GetTiledAspectRatio();
+    vtkMatrix4x4* modelViewBase = cam->GetModelViewTransformMatrix();
+    vtkMatrix4x4* projectionBase = cam->GetProjectionTransformMatrix(aspect, -1, 1);
+
+    vtkNew<vtkMatrix4x4> wcvc;
+    wcvc->DeepCopy(modelViewBase);
+    wcvc->Transpose();
+    vtkNew<vtkMatrix4x4> vcdc;
+    vcdc->DeepCopy(projectionBase);
+    vcdc->Transpose();
+
+    vtkNew<vtkMatrix4x4> invProj;
+    invProj->DeepCopy(vcdc);
+    invProj->Invert();
+    vtkNew<vtkMatrix4x4> invMV;
+    invMV->DeepCopy(wcvc);
+    invMV->Invert();
+
+    vtkNew<vtkMatrix4x4> invVol;
+    invVol->DeepCopy(modelMatrix);
+    invVol->Transpose();
+    invVol->Invert();
+
+    vtkNew<vtkMatrix4x4> temp;
+    vtkMatrix4x4::Multiply4x4(invProj, invMV, temp);
+    vtkNew<vtkMatrix4x4> composed;
+    vtkMatrix4x4::Multiply4x4(temp, invVol, composed);
+
+    for (int i = 0; i < 16; ++i)
+    {
+      uniforms.InversePVM[i] = static_cast<float>(composed->GetData()[i]);
+    }
+
+    // TEMP DEBUG: dump float32 bits of the composed matrix for byte-compare
+    // against GL's in_inversePVM dump (GL_CLIPMAT I=).
+    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG MTL_INVPVM=";
+    for (int i = 0; i < 16; ++i)
+    {
+      const unsigned char* b =
+        reinterpret_cast<const unsigned char*>(&uniforms.InversePVM[i]);
+      for (int j = 0; j < 4; ++j)
+      {
+        std::cerr << std::hex << std::setfill('0') << std::setw(2) << (int)b[j];
+      }
+    }
+    std::cerr << std::dec << std::endl;
   }
 
   // Compute inverse view-projection matrix for depth buffer occlusion.

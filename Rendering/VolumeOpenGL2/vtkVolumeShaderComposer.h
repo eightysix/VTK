@@ -1733,10 +1733,26 @@ inline std::string ComputeRayDirectionDeclaration(vtkRenderer* ren,
 {
   if (!ren->GetActiveCamera()->GetParallelProjection())
   {
+    // Analytic pixel ray (perspective): unproject the fragment through the
+    // near/far planes with the CPU-composed in_inversePVM
+    // (inverseVolumeMatrix * inverseModelViewMatrix * inverseProjectionMatrix)
+    // and return the unit direction in dataset/object space. This replaces the
+    // interpolated normalize(ip_vertexPos - in_eyePosObjs[0]) so the direction
+    // (and therefore g_dirStep) no longer depends on the rasterizer's barycentric
+    // interpolation, which differed between the GL and Metal backends (~2.2e-5
+    // on the anchor) and accumulated ~3e-8/step drift. The Metal backend
+    // replicates this exact computation from the same matrix bytes.
     return std::string("\
+        \nuniform mat4 in_inversePVM;\
         \nvec3 computeRayDirection()\
         \n  {\
-        \n  return normalize(ip_vertexPos.xyz - in_eyePosObjs[0].xyz);\
+        \n  vec2 ndc = (gl_FragCoord.xy - in_windowLowerLeftCorner) * 2.0 *\
+        \n             in_inverseWindowSize - 1.0;\
+        \n  vec4 nearP = in_inversePVM * vec4(ndc.x, ndc.y, -1.0, 1.0);\
+        \n  nearP /= nearP.w;\
+        \n  vec4 farP = in_inversePVM * vec4(ndc.x, ndc.y, 1.0, 1.0);\
+        \n  farP /= farP.w;\
+        \n  return normalize(farP.xyz - nearP.xyz);\
         \n  }");
   }
   else

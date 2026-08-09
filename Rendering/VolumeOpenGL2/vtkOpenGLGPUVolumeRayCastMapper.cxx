@@ -484,6 +484,8 @@ public:
   vtkNew<vtkMatrix4x4> InverseProjectionMat;
   vtkNew<vtkMatrix4x4> InverseModelViewMat;
   vtkNew<vtkMatrix4x4> InverseVolumeMat;
+  vtkNew<vtkMatrix4x4> InverseViewProjectionToDataMat;
+  vtkNew<vtkMatrix4x4> InversePVMMat;
 
   vtkNew<vtkMatrix4x4> TempMatrix4x4;
 
@@ -4095,6 +4097,20 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::SetCameraShaderParameters(
   prog->SetUniformMatrix("in_modelViewMatrix", modelViewMatrix);
   prog->SetUniformMatrix("in_inverseModelViewMatrix", this->InverseModelViewMat.GetPointer());
 
+  // Composed inverse view-projection-to-dataset matrix for the analytic pixel
+  // ray: inverseProjectionMatrix * inverseModelViewMatrix * inverseVolumeMatrix
+  // (double-precision vtk product, uploaded once as float32). Both the OpenGL
+  // computeRayDirection and the Metal backend unproject the fragment with these
+  // exact bytes, so the ray direction no longer depends on the rasterizer's
+  // barycentric interpolation. Note: vtkMatrix4x4 stores row-major but GLSL/Metal
+  // read the uniform as column-major, so the row-major product is
+  // inv(P) * inv(V) * inv(M) (projection inverse applied first).
+  vtkMatrix4x4::Multiply4x4(this->InverseProjectionMat.GetPointer(),
+    this->InverseModelViewMat.GetPointer(), this->InverseViewProjectionToDataMat.GetPointer());
+  vtkMatrix4x4::Multiply4x4(this->InverseViewProjectionToDataMat.GetPointer(),
+    this->InverseVolumeMat.GetPointer(), this->InversePVMMat.GetPointer());
+  prog->SetUniformMatrix("in_inversePVM", this->InversePVMMat.GetPointer());
+
   // TEMP DEBUG: dump the three clip-chain matrices as float32 raw bytes, in the
   // same column-major layout SetUniformMatrix uploads (data[i] =
   // Element[i/4][i%4]), for byte-compare against Metal's MTL_CLIPMAT.
@@ -4125,18 +4141,21 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::SetCameraShaderParameters(
                 << (int)reinterpret_cast<const unsigned char*>(&f)[2]
                 << (int)reinterpret_cast<const unsigned char*>(&f)[3];
     }
+    dumpMat(" I", this->InversePVMMat.GetPointer());
     std::cerr << std::dec << std::endl;
   }
 
   // TEMP DEBUG: dump float32 bits of the three clip-chain matrices.
   {
-    unsigned char pbits[64], vbits[64], mbits[64];
+    unsigned char pbits[64], vbits[64], mbits[64], ibits[64];
     for (int i = 0; i < 16; ++i)
     {
       float pf = static_cast<float>(projectionMatrix->GetElement(i / 4, i % 4));
       float vf = static_cast<float>(modelViewMatrix->GetElement(i / 4, i % 4));
+      float mf = static_cast<float>(this->InversePVMMat->GetElement(i / 4, i % 4));
       memcpy(pbits + i * 4, &pf, 4);
       memcpy(vbits + i * 4, &vf, 4);
+      memcpy(ibits + i * 4, &mf, 4);
     }
     for (int i = 0; i < 16; ++i)
     {
@@ -4152,6 +4171,9 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::SetCameraShaderParameters(
     std::cerr << " M=";
     for (int i = 0; i < 64; ++i)
       std::cerr << std::hex << std::setfill('0') << std::setw(2) << (int)mbits[i];
+    std::cerr << " I=";
+    for (int i = 0; i < 64; ++i)
+      std::cerr << std::hex << std::setfill('0') << std::setw(2) << (int)ibits[i];
     std::cerr << std::dec << std::endl;
   }
 

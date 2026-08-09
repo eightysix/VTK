@@ -2880,6 +2880,14 @@ struct VolumeMapperUniforms {
   // interpolated ray anchor matches GL's per-vertex float-rounded texcoord.
   float3 cellToPointScale;
   float3 cellToPointOffset;
+  // OpenGL in_inversePVM parity: CPU-composed
+  // inverseVolumeMatrix * inverseModelViewMatrix * inverseProjectionMatrix
+  // (double-precision vtk product, cast to float32). The camera-inside proxy
+  // path unprojects the fragment through the near/far planes with this matrix
+  // to build the ray direction analytically (GL computeRayDirection parity),
+  // removing the interpolated-anchor dependence that drifted evalStep from
+  // g_dirStep by ~3e-8/step.
+  float4x4 inversePVM;
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -2956,6 +2964,31 @@ inline float4x4 matrixMulStrict(const float4x4 A, const float4x4 B)
     }
   }
   return R;
+}
+
+// Strict [0,1,2,3] mat4*vec4 matching the GLSL mat4*vec4 operator codegen
+// (first term plain multiply, middle terms fused, last term mul+add), the same
+// contraction the GL driver applies to the analytic-pixel-ray unprojection.
+inline float4 vecMulStrict(const float4x4 m, const float4 v)
+{
+  float4 r;
+  r.x = m[0][0] * v.x;
+  r.x = fma(m[1][0], v.y, r.x);
+  r.x = fma(m[2][0], v.z, r.x);
+  r.x += m[3][0] * v.w;
+  r.y = m[0][1] * v.x;
+  r.y = fma(m[1][1], v.y, r.y);
+  r.y = fma(m[2][1], v.z, r.y);
+  r.y += m[3][1] * v.w;
+  r.z = m[0][2] * v.x;
+  r.z = fma(m[1][2], v.y, r.z);
+  r.z = fma(m[2][2], v.z, r.z);
+  r.z += m[3][2] * v.w;
+  r.w = m[0][3] * v.x;
+  r.w = fma(m[1][3], v.y, r.w);
+  r.w = fma(m[2][3], v.z, r.w);
+  r.w += m[3][3] * v.w;
+  return r;
 }
 
 vertex VolumeVertexOut vertex_volume_main(
@@ -3936,11 +3969,25 @@ inline float4 marchVolumeUnified(
   float3 dirObj;
   if (p.anchorIsData && volumeUniforms.useParallelProjection < 0.5)
   {
-    // OpenGL in_eyePosObjs[0] parity: GL passes the dataset-space eye as a
-    // float32 uniform (computed on the CPU as invert(dataToWorld^T * modelView)
-    // row 3), never reconstructs it from the normalized cameraVolumePos.
-    dirObj = normalize((p.anchorData + volumeUniforms.anchorPerturbData.xyz) -
-                       volumeUniforms.eyePosData.xyz);
+    // OpenGL computeRayDirection parity (analytic pixel ray): unproject the
+    // fragment through the near/far planes with the CPU-composed inversePVM
+    // (inverseVolume * inverseModelView * inverseProjection, GL in_inversePVM
+    // bytes) and normalize the difference in dataset space. This removes the
+    // interpolated-anchor dependence (normalize(anchorData - eyePosData)) that
+    // differed between the backends by ~2.2e-5 on the anchor and accumulated
+    // ~3e-8/step in evalStep. GLSL mat4*vec4 contracts [0,1,2,3]
+    // mul,fma,fma,mul+add, so use vecMulStrict. p.screenPos is Metal's top-left
+    // window pixel center; negating ndc.y converts it to GL's bottom-up
+    // convention (gl_FragCoord.y - in_windowLowerLeftCorner). z = -1/+1 are
+    // GL's ndc near/far, matching the GL-nearz-convention inversePVM.
+    // (viewportSize == window size and windowLowerLeftCorner == (0,0) here, so
+    // (screenPos/viewportSize)*2-1 == (fragCoord - ll)*2*inverseWindowSize - 1.)
+    float2 ndc = (p.screenPos / volumeUniforms.viewportSize) * 2.0 - 1.0;
+    float4 nearP = vecMulStrict(volumeUniforms.inversePVM, float4(ndc.x, -ndc.y, -1.0, 1.0));
+    nearP /= nearP.w;
+    float4 farP = vecMulStrict(volumeUniforms.inversePVM, float4(ndc.x, -ndc.y, 1.0, 1.0));
+    farP /= farP.w;
+    dirObj = normalize(farP.xyz - nearP.xyz);
   }
   else
   {
