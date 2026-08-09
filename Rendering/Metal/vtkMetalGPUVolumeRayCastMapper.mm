@@ -94,6 +94,14 @@ static MTLCompileOptions* vtkMetalVolumeCompileOptions()
     options.preprocessorMacros = @{ @"VTK_METAL_ENABLE_LOGGING" : @(1) };
   }
 #endif
+  const char* cleanBias = getenv("VTK_METAL_CLEAN_BIAS_F");
+  if (cleanBias != nullptr)
+  {
+    NSMutableDictionary* macros =
+      [NSMutableDictionary dictionaryWithDictionary:(options.preprocessorMacros ?: @{})];
+    macros[@"VTK_METAL_CLEAN_BIAS_F"] = [NSString stringWithUTF8String:cleanBias];
+    options.preprocessorMacros = macros;
+  }
   return [options autorelease];
 }
 

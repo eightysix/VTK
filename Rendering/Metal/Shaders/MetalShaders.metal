@@ -4920,6 +4920,13 @@ inline float4 marchVolumeUnified(
   float wlBias = volumeUniforms.finalColorBias;
   finalColor.rgb = finalColor.rgb * wlScale + wlBias * finalColor.a;
 
+  // TEMP DEBUG (updates 54/55): uniform additive excess matching clean OpenGL.
+  // Enabled at runtime via VTK_METAL_CLEAN_BIAS_F (float literal injected by
+  // vtkMetalGPUVolumeRayCastMapper::vtkMetalVolumeCompileOptions).
+#if defined(VTK_METAL_CLEAN_BIAS_F)
+  finalColor.rgb += float(VTK_METAL_CLEAN_BIAS_F);
+#endif
+
 #if defined(VTK_METAL_ENABLE_LOGGING)
   bool gridGate = (((int(p.screenPos.x) & 31) == 16) && ((int(p.screenPos.y) & 31) == 16));
   if (p.screenPos.x > 0.0 && (gridGate || debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos))) {

@@ -381,6 +381,16 @@ public:
    */
   void DumpDebugRays(vtkRenderer* ren, vtkShaderProgram* prog, vtkVolume* vol, double geometry[24]);
 
+  /**
+   * TEMP DEBUG: re-render the clean volume shader into an RGBA32F framebuffer
+   * and write the true final fragment floats to a raw binary file (RGBA,
+   * row 0 = gl_FragCoord y 0). Enabled via VTK_GL_FLOAT_DUMP (path override
+   * VTK_GL_FLOAT_DUMP_OUT). Deliberately independent of DebugRayDump so the
+   * shader is NOT debug-injected and the floats are clean GL's own.
+   */
+  void DumpCleanGLFloats(
+    vtkRenderer* ren, vtkShaderProgram* prog, vtkVolume* vol, double geometry[24]);
+
   vtkMTimeType LastModifiedLightTime(vtkLightCollection* lights);
 
   inline bool ShaderRebuildNeeded(
@@ -4492,6 +4502,11 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::RenderSingleInput(
     // TEMP DEBUG: dump interpolated ray geometry for Metal-parity analysis.
     this->DumpDebugRays(ren, prog, vol, block->VolumeGeometry);
 
+    // TEMP DEBUG: re-render the clean shader into an RGBA32F FBO and write the
+    // true final fragment floats (VTK_GL_FLOAT_DUMP). Independent of the
+    // DebugRayDump injection above.
+    this->DumpCleanGLFloats(ren, prog, vol, block->VolumeGeometry);
+
     this->FinishRendering(numComp);
     block = volumeTex->GetNextBlock();
     if (this->CurrentMask)
@@ -4924,6 +4939,116 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
     }
   }
 
+}
+
+//------------------------------------------------------------------------------
+void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpCleanGLFloats(
+  vtkRenderer* ren, vtkShaderProgram* prog, vtkVolume* vol, double geometry[24])
+{
+  // Re-render the CLEAN volume shader into an RGBA32F FBO (dst = black, so the
+  // blend output is exactly g_fragColor) and write the true final floats to a
+  // raw RGBA float32 file (row 0 = gl_FragCoord y 0). Env gate is independent
+  // of VTK_GL_RAY_DUMP so the shader is not debug-injected.
+  const char* env = getenv("VTK_GL_FLOAT_DUMP");
+  if (env == nullptr)
+  {
+    return;
+  }
+  static bool dumped = false;
+  if (dumped)
+  {
+    return;
+  }
+  dumped = true;
+
+  const char* outPath = getenv("VTK_GL_FLOAT_DUMP_OUT");
+  const std::string out = (outPath != nullptr) ? outPath : "/tmp/bc/gl_float_dump.raw";
+
+  GLint vp[4];
+  glGetIntegerv(GL_VIEWPORT, vp);
+  const GLsizei w = vp[2];
+  const GLsizei h = vp[3];
+
+  GLuint fbo = 0;
+  GLuint tex = 0;
+  GLuint rbo = 0;
+  glGenFramebuffers(1, &fbo);
+  glGenTextures(1, &tex);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0, GL_RGBA, GL_FLOAT, nullptr);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glGenRenderbuffers(1, &rbo);
+  glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+  glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+
+  GLint prevFbo = 0;
+  GLint prevDrawBuf = 0;
+  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+  glGetIntegerv(GL_DRAW_BUFFER, &prevDrawBuf);
+  GLboolean blendWasOn = glIsEnabled(GL_BLEND);
+  GLboolean depthWasOn = glIsEnabled(GL_DEPTH_TEST);
+  GLint prevBlendSrc = GL_ONE;
+  GLint prevBlendDst = GL_ZERO;
+  glGetIntegerv(GL_BLEND_SRC_ALPHA, &prevBlendSrc);
+  glGetIntegerv(GL_BLEND_DST_ALPHA, &prevBlendDst);
+
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rbo);
+  glDrawBuffer(GL_COLOR_ATTACHMENT0);
+  GLenum fbStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+  std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_FLOAT_DUMP fbo_status=" << std::hex << fbStatus
+            << " err=" << std::hex << glGetError() << std::dec << std::endl;
+  glViewport(0, 0, w, h);
+  glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+  glClearDepth(1.0);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+  glDisable(GL_BLEND);
+  glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+  glEnable(GL_DEPTH_TEST);
+
+  this->RenderVolumeGeometry(ren, prog, vol, geometry);
+
+  std::vector<float> buf(static_cast<size_t>(w) * h * 4);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, buf.data());
+  std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_FLOAT_DUMP texImage err=" << std::hex << glGetError()
+            << std::dec << " sample_px422_419=(" << buf[(size_t)419 * w * 4 + 422 * 4 + 0] << ", "
+            << buf[(size_t)419 * w * 4 + 422 * 4 + 1] << ", " << buf[(size_t)419 * w * 4 + 422 * 4 + 2]
+            << ") a=" << buf[(size_t)419 * w * 4 + 422 * 4 + 3] << std::endl;
+
+  FILE* f = fopen(out.c_str(), "wb");
+  if (f)
+  {
+    fwrite(buf.data(), sizeof(float), buf.size(), f);
+    fclose(f);
+    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_FLOAT_DUMP wrote " << w << "x" << h
+              << " rgba32f to " << out << std::endl;
+  }
+  else
+  {
+    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_FLOAT_DUMP FAILED to open " << out << std::endl;
+  }
+
+  // Restore state.
+  glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prevFbo));
+  glDrawBuffer(static_cast<GLenum>(prevDrawBuf));
+  glViewport(vp[0], vp[1], vp[2], vp[3]);
+  if (!blendWasOn)
+  {
+    glDisable(GL_BLEND);
+  }
+  if (!depthWasOn)
+  {
+    glDisable(GL_DEPTH_TEST);
+  }
+  glBlendFunc(static_cast<GLenum>(prevBlendSrc), static_cast<GLenum>(prevBlendDst));
+  glDeleteRenderbuffers(1, &rbo);
+  glDeleteTextures(1, &tex);
+  glDeleteFramebuffers(1, &fbo);
 }
 
 //------------------------------------------------------------------------------
