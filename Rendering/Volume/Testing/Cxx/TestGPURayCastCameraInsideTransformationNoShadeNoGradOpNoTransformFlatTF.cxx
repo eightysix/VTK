@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 /// Description:
-/// Same contained scene as NoShadeNoGradOpNoTransform but with MAXIMUM
-/// INTENSITY blend mode on both backends. Removes opacity-weighted front-to-back
-/// compositing from the picture: if the Metal vs OpenGL residual divergence
-/// vanishes, it lives in the color/opacity accumulation path; if it persists,
-/// it lives in the scalar fetch / ray domain.
+/// Same contained NoJitter scene as NoShadeNoGradOpNoTransformNoJitter but with
+/// a CONSTANT color and opacity transfer function over the whole scalar range.
+/// With nearest TF sampling the per-sample color/opacity is then identical for
+/// every sample and every ray, so the front-to-back composite becomes a pure
+/// geometric-series accumulation of constant (rgb, opacity) over the ray's
+/// sample count: any Metal vs OpenGL difference must come from the
+/// accumulation arithmetic itself or from a differing sample count, never from
+/// the scalar/TF lookup path.
 
 #include "vtkCamera.h"
 #include "vtkColorTransferFunction.h"
@@ -27,13 +30,13 @@
 
 #include <iostream>
 
-static const char* TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformMaxIPLog =
+static const char* TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformFlatTFLog =
   "# StreamVersion 1\n"
   "EnterEvent 298 27 0 0 0 0 0\n"
   "MouseWheelForwardEvent 200 142 0 0 0 0 0\n"
   "LeaveEvent 311 71 0 0 0 0 0\n";
 
-int TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformMaxIP(int argc, char* argv[])
+int TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformFlatTF(int argc, char* argv[])
 {
   // Load data
   vtkNew<vtkVolume16Reader> reader;
@@ -52,20 +55,15 @@ int TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformMaxIP(int 
   resample->SetOutputDimensions(512, 512, 512);
   resample->Update();
 
-  // Prepare TFs
+  // Constant color and opacity over the whole data range.
   vtkNew<vtkColorTransferFunction> ctf;
-  ctf->AddRGBPoint(0, 0.0, 0.0, 0.0);
-  ctf->AddRGBPoint(500, 1.0, 0.5, 0.3);
-  ctf->AddRGBPoint(1000, 1.0, 0.5, 0.3);
-  ctf->AddRGBPoint(1150, 1.0, 1.0, 0.9);
+  ctf->AddRGBPoint(0, 0.9, 0.7, 0.5);
+  ctf->AddRGBPoint(4370, 0.9, 0.7, 0.5);
 
   vtkNew<vtkPiecewiseFunction> pf;
-  pf->AddPoint(0, 0.00);
-  pf->AddPoint(500, 0.02);
-  pf->AddPoint(1000, 0.02);
-  pf->AddPoint(1150, 0.85);
+  pf->AddPoint(0, 0.1);
+  pf->AddPoint(4370, 0.1);
 
-  vtkNew<vtkPiecewiseFunction> gf;
   vtkNew<vtkVolumeProperty> volumeProperty;
   volumeProperty->SetScalarOpacity(pf);
   volumeProperty->SetColor(ctf);
@@ -82,7 +80,6 @@ int TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformMaxIP(int 
 
   vtkNew<vtkGPUVolumeRayCastMapper> mapper;
   mapper->SetInputConnection(resample->GetOutputPort());
-  mapper->SetBlendModeToMaximumIntensity();
   mapper->SetUseJittering(false);
 
   vtkNew<vtkVolume> volume;
@@ -105,6 +102,6 @@ int TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformMaxIP(int 
   iren->Initialize();
 
   int rv = vtkTesting::InteractorEventLoop(
-    argc, argv, iren, TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformMaxIPLog);
+    argc, argv, iren, TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformFlatTFLog);
   return rv;
 }
