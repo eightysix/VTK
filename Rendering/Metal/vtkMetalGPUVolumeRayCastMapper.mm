@@ -49,6 +49,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <set>
 #include <vector>
@@ -3647,6 +3648,25 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
         tfWidth, tfData.data(),
         preIntegrationFactor, this->GetBlendMode());
 
+      if (getenv("VTK_GL_OPTABLE_DUMP"))
+      {
+        for (int i = 0; i < tfWidth; ++i)
+        {
+          char hex[33];
+          for (int c = 0; c < 4; ++c)
+          {
+            unsigned char* bp = reinterpret_cast<unsigned char*>(&tfData[i * 4 + c]);
+            for (int b = 0; b < 4; ++b)
+            {
+              std::snprintf(hex + c * 8 + b * 2, 3, "%02x", bp[b]);
+            }
+          }
+          hex[32] = '\0';
+          std::cerr << "VTK_METAL_VOLUME_LOG DEBUG MTL_OPTABLE_DUMP idx=" << i
+                    << " rgba=" << hex << std::endl;
+        }
+      }
+
       // Swap rather than rewrite: in-flight frames on the GPU may still be
       // sampling the old texture.  Metal command buffers retain a strong
       // reference to every resource encoded into them until execution
@@ -6521,10 +6541,10 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       double worldSpacing = fabs(cellSpacing[i] * sqrt(tmp2));
       minWorldSpacing = std::min(worldSpacing, minWorldSpacing);
     }
-    actualSampleDistance = minWorldSpacing;
+    actualSampleDistance = static_cast<float>(minWorldSpacing);
     if (this->ReductionFactor < 1.0 && this->ReductionFactor != 0.0)
     {
-      actualSampleDistance /= this->ReductionFactor;
+      actualSampleDistance /= static_cast<float>(this->ReductionFactor);
     }
   }
   else if (this->LockSampleDistanceToInputSpacing)

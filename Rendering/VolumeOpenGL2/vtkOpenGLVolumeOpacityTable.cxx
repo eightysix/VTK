@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "vtkOpenGLVolumeOpacityTable.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 
 #include "vtkObjectFactory.h"
@@ -61,6 +63,21 @@ void vtkOpenGLVolumeOpacityTable::InternalUpdate(
       }
       ++ptr;
       ++i;
+    }
+  }
+
+  if (getenv("VTK_GL_OPTABLE_DUMP"))
+  {
+    unsigned char* bytes = reinterpret_cast<unsigned char*>(this->Table);
+    for (int i = 0; i < this->TextureWidth; ++i)
+    {
+      char hex[9];
+      for (int b = 0; b < 4; ++b)
+      {
+        std::snprintf(hex + b * 2, 3, "%02x", bytes[i * 4 + b]);
+      }
+      std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_OPTABLE_DUMP idx=" << i << " a=" << hex
+                << std::endl;
     }
   }
 

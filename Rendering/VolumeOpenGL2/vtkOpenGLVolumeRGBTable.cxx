@@ -8,6 +8,10 @@
 #include "vtkOpenGLRenderWindow.h"
 #include "vtkTextureObject.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <iostream>
+
 VTK_ABI_NAMESPACE_BEGIN
 vtkStandardNewMacro(vtkOpenGLVolumeRGBTable);
 
@@ -27,6 +31,24 @@ void vtkOpenGLVolumeRGBTable::InternalUpdate(vtkObject* func, int vtkNotUsed(ble
     return;
   }
   scalarRGB->GetTable(this->LastRange[0], this->LastRange[1], this->TextureWidth, this->Table);
+  if (getenv("VTK_GL_OPTABLE_DUMP"))
+  {
+    unsigned char* bytes = reinterpret_cast<unsigned char*>(this->Table);
+    for (int i = 0; i < this->TextureWidth; ++i)
+    {
+      char hex[25];
+      for (int c = 0; c < 3; ++c)
+      {
+        for (int b = 0; b < 4; ++b)
+        {
+          std::snprintf(hex + c * 8 + b * 2, 3, "%02x", bytes[(i * 3 + c) * 4 + b]);
+        }
+      }
+      hex[24] = '\0';
+      std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_RGBTABLE_DUMP idx=" << i << " rgb=" << hex
+                << std::endl;
+    }
+  }
   this->TextureObject->SetWrapS(vtkTextureObject::ClampToEdge);
   this->TextureObject->SetWrapT(vtkTextureObject::ClampToEdge);
   this->TextureObject->SetMagnificationFilter(filterValue);
