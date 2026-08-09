@@ -3046,7 +3046,9 @@ void vtkOpenGLGPUVolumeRayCastMapper::BuildShader(vtkRenderer* ren)
       "      ((cf == 2) ? ip_debugClipFlat.y : ((cf == 3) ? ip_debugClipFlat.z :\n"
       "      ((cf == 4) ? ip_debugClipFlat.w : ((cf == 5) ? ip_vertexPos.x :\n"
       "      ((cf == 6) ? ip_vertexPos.y : ((cf == 7) ? float(gl_PrimitiveID) :\n"
-      "      ip_vertexPos.z)))))));\n"
+      "      ((cf == 8) ? ip_textureCoords.x : ((cf == 9) ? ip_textureCoords.y :\n"
+      "      ((cf == 10) ? ip_textureCoords.z :\n"
+      "      ip_vertexPos.z))))))))));\n"
       "    float av = abs(v);\n"
       "    float b0 = 0.0;\n"
       "    float b1 = 0.0;\n"
@@ -4851,7 +4853,7 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
     const GLsizei h = vp[3];
     std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_VERTCTX vp=(" << vp[0] << ", " << vp[1] << ", "
               << vp[2] << ", " << vp[3] << ") err=" << glGetError() << std::endl;
-    const int nChannels = 8;
+    const int nChannels = 11;
     std::vector<std::vector<float>> vals(nChannels, std::vector<float>(w * h, 0.0f));
     std::vector<unsigned char> buf(static_cast<size_t>(w) * h * 4);
     glDisable(GL_DEPTH_TEST);
@@ -4899,7 +4901,8 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
                     << static_cast<int>(vals[0][idx]) << " px=(" << x << ", " << y << ") clip=("
                     << vals[1][idx] << ", " << vals[2][idx] << ", " << vals[3][idx] << ", "
                     << vals[4][idx] << ") pos=(" << vals[5][idx] << ", " << vals[6][idx] << ", "
-                    << vals[7][idx] << ")" << std::endl;
+                    << vals[7][idx] << ") tex=(" << vals[8][idx] << ", " << vals[9][idx] << ", "
+                    << vals[10][idx] << ")" << std::endl;
         }
       }
     }

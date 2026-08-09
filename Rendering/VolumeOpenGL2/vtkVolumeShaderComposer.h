@@ -107,6 +107,12 @@ inline std::string ComputeClipPositionImplementation(
     "      cornerY += 2.0 / 256.0;\n"
     "    }\n"
     "    gl_Position = vec4(cornerX, cornerY, 0.5, 1.0);\n"
+    "    // TEMP DEBUG: also compute the real per-vertex texcoord so the vertex\n"
+    "    // dump can align per-vertex clip/pos/texcoord with the Metal vertex log\n"
+    "    // (the normal ComputeTextureCoords block runs after this early return).\n"
+    "    vec3 uvt = sign(in_cellSpacing[0]) * (in_inverseTextureDatasetMatrix[0] *\n"
+    "      vec4(in_vertexPos, 1.0)).xyz;\n"
+    "    ip_textureCoords = (in_cellToPoint[0] * vec4(uvt, 1.0)).xyz;\n"
     "    return;\n"
     "  }\n"
     "  ip_vid = gl_VertexID;\n");

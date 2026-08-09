@@ -4178,8 +4178,9 @@ inline float4 marchVolumeUnified(
   //   sampleDistanceWorld: GL in_sampleDistance (world units)
 #if defined(VTK_METAL_ENABLE_LOGGING)
     if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
-    os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG STEP px=(%d, %d) flatVid=%u primId=%u cameraVol=(%0.9e, %0.9e, %0.9e) localPos=(%0.9e, %0.9e, %0.9e) clip=(%0.9e, %0.9e, %0.9e, %0.9e) anchorData=(%0.9e, %0.9e, %0.9e) rayDir=(%0.9e, %0.9e, %0.9e) dirObj=(%0.9e, %0.9e, %0.9e) evalStep=(%0.9e, %0.9e, %0.9e) texStep=(%0.9e, %0.9e, %0.9e) boundsSize=(%0.9e, %0.9e, %0.9e) sampleDistanceWorld=%0.9e ctpScale=(%0.9e, %0.9e, %0.9e) ctpOffset=(%0.9e, %0.9e, %0.9e)",
+    os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG STEP px=(%d, %d) screenPos=(%0.9e, %0.9e) flatVid=%u primId=%u cameraVol=(%0.9e, %0.9e, %0.9e) localPos=(%0.9e, %0.9e, %0.9e) clip=(%0.9e, %0.9e, %0.9e, %0.9e) anchorData=(%0.9e, %0.9e, %0.9e) rayDir=(%0.9e, %0.9e, %0.9e) dirObj=(%0.9e, %0.9e, %0.9e) evalStep=(%0.9e, %0.9e, %0.9e) texStep=(%0.9e, %0.9e, %0.9e) boundsSize=(%0.9e, %0.9e, %0.9e) sampleDistanceWorld=%0.9e ctpScale=(%0.9e, %0.9e, %0.9e) ctpOffset=(%0.9e, %0.9e, %0.9e)",
         int(p.screenPos.x), int(p.screenPos.y),
+        p.screenPos.x, p.screenPos.y,
         p.flatVid, p.primId,
         volumeUniforms.cameraVolumePos.x, volumeUniforms.cameraVolumePos.y, volumeUniforms.cameraVolumePos.z,
         p.localPos.x, p.localPos.y, p.localPos.z,
