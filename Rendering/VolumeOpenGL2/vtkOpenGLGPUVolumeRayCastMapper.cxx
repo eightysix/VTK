@@ -4974,12 +4974,38 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpCleanGLFloats(
   GLuint rbo = 0;
   glGenFramebuffers(1, &fbo);
   glGenTextures(1, &tex);
+
+  GLint prevActiveUnit = 0;
+  GLint prevTex2D = 0;
+  glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActiveUnit);
+  glActiveTexture(static_cast<GLenum>(prevActiveUnit));
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex2D);
+
+  // Dump the texture state the volume shader samples from (all units, 2D and
+  // 3D) so we can tell whether the dump below disturbs the volume/depth/TF
+  // textures (env-gated by VTK_GL_FLOAT_DUMP_TEXTURES).
+  if (getenv("VTK_GL_FLOAT_DUMP_TEXTURES") != nullptr)
+  {
+    for (GLint u = 0; u < 16; ++u)
+    {
+      GLint b2d = 0;
+      GLint b3d = 0;
+      glActiveTexture(static_cast<GLenum>(GL_TEXTURE0 + u));
+      glGetIntegerv(GL_TEXTURE_BINDING_2D, &b2d);
+      glGetIntegerv(GL_TEXTURE_BINDING_3D, &b3d);
+      std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_FLOAT_DUMP textures unit=" << u << " tex2d=" << b2d
+                << " tex3d=" << b3d << std::endl;
+    }
+    glActiveTexture(static_cast<GLenum>(prevActiveUnit));
+  }
+
   glBindTexture(GL_TEXTURE_2D, tex);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0, GL_RGBA, GL_FLOAT, nullptr);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prevTex2D));
   glGenRenderbuffers(1, &rbo);
   glBindRenderbuffer(GL_RENDERBUFFER, rbo);
   glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
@@ -5002,6 +5028,15 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpCleanGLFloats(
   GLenum fbStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
   std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_FLOAT_DUMP fbo_status=" << std::hex << fbStatus
             << " err=" << std::hex << glGetError() << std::dec << std::endl;
+
+  GLint cm[4] = { 1, 1, 1, 1 };
+  glGetIntegerv(GL_COLOR_WRITEMASK, cm);
+  std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_FLOAT_DUMP colorwritemask_before=(" << cm[0] << ","
+            << cm[1] << "," << cm[2] << "," << cm[3] << ")" << std::endl;
+
+  std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_FLOAT_DUMP prev_active_unit=" << prevActiveUnit
+            << " prev_tex2d=" << prevTex2D << " our_tex=" << tex << std::endl;
+
   glViewport(0, 0, w, h);
   glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
   glClearDepth(1.0);
@@ -5010,15 +5045,40 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpCleanGLFloats(
   glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
   glEnable(GL_DEPTH_TEST);
 
+  // Control test: does the FBO write/read RGB at all via a colored clear?
+  {
+    std::vector<float> ctl(static_cast<size_t>(w) * h * 4, 0.0f);
+    glClearColor(0.25f, 0.5f, 0.75f, 0.25f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, ctl.data());
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prevTex2D));
+    std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_FLOAT_DUMP ctl_clear_px0=(" << ctl[0] << ","
+              << ctl[1] << "," << ctl[2] << ") a=" << ctl[3] << " err=" << std::hex
+              << glGetError() << std::dec << std::endl;
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+  }
+
+  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
   this->RenderVolumeGeometry(ren, prog, vol, geometry);
 
   std::vector<float> buf(static_cast<size_t>(w) * h * 4);
   glBindTexture(GL_TEXTURE_2D, tex);
   glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, buf.data());
+  glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prevTex2D));
   std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_FLOAT_DUMP texImage err=" << std::hex << glGetError()
             << std::dec << " sample_px422_419=(" << buf[(size_t)419 * w * 4 + 422 * 4 + 0] << ", "
             << buf[(size_t)419 * w * 4 + 422 * 4 + 1] << ", " << buf[(size_t)419 * w * 4 + 422 * 4 + 2]
             << ") a=" << buf[(size_t)419 * w * 4 + 422 * 4 + 3] << std::endl;
+  std::vector<float> rp(static_cast<size_t>(w) * h * 4);
+  glReadBuffer(GL_COLOR_ATTACHMENT0);
+  glReadPixels(0, 0, w, h, GL_RGBA, GL_FLOAT, rp.data());
+  std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_FLOAT_DUMP readpixels px422_419=("
+            << rp[(size_t)419 * w * 4 + 422 * 4 + 0] << ", "
+            << rp[(size_t)419 * w * 4 + 422 * 4 + 1] << ", " << rp[(size_t)419 * w * 4 + 422 * 4 + 2]
+            << ") a=" << rp[(size_t)419 * w * 4 + 422 * 4 + 3] << std::endl;
 
   FILE* f = fopen(out.c_str(), "wb");
   if (f)
