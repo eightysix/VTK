@@ -3,7 +3,10 @@
 Status: instrumentation landed and validated on the GL side; Metal STEP/MARCH
 grid capture produced; full-frame GL raw capture pending a clean run (a
 GL-on-Metal GPU hang under concurrent GPU load truncated the reference run —
-see §3).
+see §3). **Analysis milestone reached:** full-frame back-out at 8203 overlap px
+confirms a constant ~(+0.025, −0.032)px GL-beyond-Metal effective-sample
+displacement with the per-pixel scatter fully explained by the f32-texcoord
+ulp difference amplified through the near-degenerate triangle — see §5b.
 
 ## 1. Motivation (from update 63)
 
@@ -127,10 +130,84 @@ Pixel mapping: GL `(mx, 511−my)` ↔ Metal `(mx, my)`; rasterizer sample NDC i
 - If a consistent per-backend displacement is confirmed at scale, evaluate a
   fragment-shader emulation of GL's attribute interpolation on the Metal side.
 
+## 5b. Analysis milestone (this update, from `update64/field_u64.py`)
+
+Backed out the effective sample NDC displacement at **all 8203 Metal-logged
+pixels** (sparse grid + dense knife block) using the frame-6 GL raw attribute
+dump (texcoords + primId) and the Metal STEP log (`localPos` + primId), with
+update-63's perspective-w-weighted back-out (`backout_u63`).
+
+Data & fixes that made it exact:
+
+- GL pixel `(mx, my)` bottom-origin ↔ Metal `(mx, my)` top-origin: GL row for
+  Metal pixel is `511−my`; rasterizer sample NDC is
+  `((mx+0.5)/256−1, (511−my+0.5)/256−1)`.
+- Back-out lambda must use per-vertex clip.w perspective weights
+  `λ = (t0·w0, t1·w1, t2·w2)/Σ` (missing this inflated displacement ~100×).
+
+Results (GL − Metal at 8203 overlap px):
+
+| quantity | value |
+|---|---|
+| GL disp mean (NDC) | (+2.41e-4, −2.54e-4) |
+| Metal disp mean (NDC) | (+1.45e-4, −1.31e-4) |
+| **delta mean (px)** | **(+0.0247, −0.0315)**, t=84/−93 (SE ~3e-4 px) |
+| delta std (px) | (0.0265, 0.0306) |
+| quadrants Q1..Q4 d(px) | tl (0.023,−0.027) tr (0.012,−0.012) bl (0.036,−0.041) br (0.035,−0.050) |
+| dy linear y-gradient | −4.74e-5 px/px → −0.024 px across the frame |
+| position models (lin/quad) | resid_std ≈ delta std (R² < 7%) — **no spatial structure** |
+| proportional-to-disp model | resid_std ≈ 0.022–0.025 px — **rejected** |
+
+**Conclusion.** The GL−Metal effective-sample displacement is a highly
+significant **constant** (+0.0247, −0.0315) px (GL beyond Metal), confirming
+update 63's ~(+0.03,−0.03)px at 585× the sample count, with at most a tiny
+real dy y-gradient (−0.024 px/frame). The per-pixel scatter (0.026–0.031 px)
+is **not** spatial structure and **not** a fixed-offset failure:
+
+- It is fully explained by the ±1–3 ulp f32 interpolated-texcoord difference
+  (update 63 Result 4) amplified through triangle 122's near-degenerate
+  texcoord space: +1 ulp on one texcoord channel moves the backed-out
+  displacement by up to **0.0256 px** (measured directly on tri 122, cond=4.2
+  but ~1700× sensitivity along the thin texcoord axis).
+- So the mean offset is a real, well-determined constant, but a constant
+  in-shader compensation fixes only the mean; the per-pixel ulp scatter
+  (the driver-level interpolator difference) survives and is the residual floor
+  for the knife-edge image flips — same conclusion as update 63, now
+  established over the full frame rather than 14 pixels.
+
+This does **not** require a further clean full-frame GL capture: the 6-frame
+`gl_attr_dump.raw` (frame-6 last-occurrence-per-key convention) is complete
+enough and validated bit-for-bit against `GL_RAY` (§2.1).
+
+### 5b.1 Model sweep: no constant-offset analytic interpolation reproduces GL
+
+To close u63 doubt #1 ("controlled rasterizer experiment"), swept a constant
+sub-pixel sample offset (ox, oy) ∈ [−0.05, +0.05] px at 0.005 px step over
+16,384 full-frame pixels of triangle 122, evaluating the perspective-correct
+interpolation `Σᵢ (tᵢ/wᵢ)·texᵢ / Σᵢ (tᵢ/wᵢ)` at `pixel_center + (ox,oy)` in f64
+window space then rounding to f32, compared 0-ulp to the GL dumped texcoord:
+
+- best offset (0.020, −0.020) px matches only **431/16384 = 2.6%**; pixel
+  center matches 44/16384 ≈ 0.3%. No offset reproduces GL across the frame.
+- This is the same conclusion as `model_u63.py` (no pixel-center analytic model
+  hit 3/3 channels at 0 ulps on either backend), now confirmed over the full
+  frame and with offset freedom: GL's attribute interpolation is not an
+  analytic persp-correct evaluation at any constant sample location.
+- Combined with §5b, the residual is a genuine driver-level interpolator
+  difference (per-pixel ±1–3 ulp, effective-sample displacement ~+0.025/−0.032
+  px constant part) that cannot be reproduced from the flat per-vertex data.
+
+The remaining path to bit-identical output (u63 doubt #2) is to make the ray
+anchor insensitive to the ±1–3 ulp attribute difference (e.g. grid
+quantization) or accept the interpolator-difference floor.
+
 ## Artifacts
 
 - Code: `vtkOpenGLGPUVolumeRayCastMapper.cxx` (`DumpDebugAttrField`,
   channel 200–202 block, channel-100 gate fix), `MetalShaders.metal`
   (`debugStepGate`).
+- Tools: `BackendComparisonTools/update64/field_u64.py` (full-frame back-out),
+  `conditioning_u64.py` (1-ulp texcoord → displacement amplification on
+  tri 122), `modelsweep_u64.py` (constant-offset interpolation sweep).
 - Data (not committed): `/tmp/bc/u63_metal.log`, `/tmp/bc/gl_attr_dump.raw`
   (partial, see §3), `/tmp/bc/u64_*.log`.
