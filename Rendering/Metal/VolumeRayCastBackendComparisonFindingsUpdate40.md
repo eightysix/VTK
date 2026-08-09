@@ -53,11 +53,14 @@ Full 512² image diff (GL vs Metal, last frame):
 | max per-channel |d| | 131 (pixel (422,92)) |
 | combined RMS / normalized | 0.1481 / 0.00092 |
 
-The residual is concentrated at (422,92) (the known frame-ordering/camera-animation artifact flagged in the compare tool header at i = 30, 134, 167) plus a handful of ±1 ULP-level pixels. Both new backends sit at exactly the same residual vs the stored `u38c/gl.png` reference (combined RMS 0.1481, max 10.77) — i.e. GL and Metal are mutually consistent, and their shared residual vs the old interpolated reference is the expected analytic-vs-interpolated ray difference (direction now matches to ~1e-5 as shown above).
+The residual is concentrated at (422,92) plus a handful of ±1 ULP-level pixels. Both new backends sit at exactly the same residual vs the stored `u38c/gl.png` reference (combined RMS 0.1481, max 10.77) — i.e. GL and Metal are mutually consistent, and their shared residual vs the old interpolated reference is the expected analytic-vs-interpolated ray difference (direction now matches to ~1e-5 as shown above).
+
+> **Correction (commit after 40):** the residual at (422,92) is **not** the "frame-ordering/camera-animation artifact" this update originally guessed. All 6 logged frames are static and match per-frame (position ≤7e-7, raw ≤1.3e-7 at i=50); the earlier-looking "sum divergence" was a parsing bug (summing GL's `raw` but Metal's step index `t`). The real cause is a **march-length / step-cap parity gap**: GL logs 175 samples (i=0..174, then a −1.03e19 terminated sentinel), Metal only 170 (i=0..169). With per-step raw matching, the extra 5 GL steps shift the composited color at this knife-edge pixel (GL (216,61,76) vs Metal (238,192,159)).
 
 ## 4. Next
 
-- The remaining (422,92) hot pixel and the few ±1 pixels: confirm they are the documented frame-ordering/camera-animation artifacts (frames beyond #0 diverge only in sum/ordering, frame-0 rays are bit-consistent) before chasing further.
+- The (422,92) hot pixel: diagnose the step-count parity — GL's `maxSteps` vs Metal's `maxSteps = max(1, int(ceil((p.tEnd - firstT) / p.stepSize)))` (MetalShaders.metal:4052) and the GL termination/`rayTerminateMax` break; 175 vs 170 is a 5-step boundary difference to reconcile.
+- The ±1 ULP pixels: check composite/accumulation rounding parity (per-frame raw already ≤1.3e-7).
 - Then re-run the full accumulation test (`compare_gl_metal_accum.py`) and the other NoTransform/NoJitter variants to confirm the fix generalizes beyond the single camera pose.
 
 ## Artifacts
