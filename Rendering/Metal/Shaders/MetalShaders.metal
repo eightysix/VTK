@@ -4791,8 +4791,8 @@ inline float4 marchVolumeUnified(
         sampleColor = float3(ambientMat) * sampleColor;
       }
 
-      accumulatedColor += weight * (sampleColor * sampleOpacity);
-      accumulatedOpacity += weight * sampleOpacity;
+      accumulatedColor = fma(weight, sampleColor * sampleOpacity, accumulatedColor);
+      accumulatedOpacity = fma(weight, sampleOpacity, accumulatedOpacity);
     }
 
     currentPoint += stepVec;
