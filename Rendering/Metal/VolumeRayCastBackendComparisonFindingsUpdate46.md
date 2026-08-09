@@ -2,6 +2,7 @@
 
 **Date:** 2026-08-09
 **Scope:** After the scalarScale/`in_volume_scale` parity fix was shown to change 0 pixels (no doc written for that dead end), this update rebuilds with tests ON (enabling shader os_log), re-captures both backends, and runs update 44's prescribed diagnostic: CPU float32 replay of the written GLSL composite formula against Metal's per-sample rows.
+**Target (confirmed):** Metal output must be bit-identical to **clean GL** (`RenderingBackend=OpenGL` without debug injection). The written source formula is the *mechanism*, not the target — if clean GL's compiled GLSL diverges from the formula, Metal must reproduce clean GL's divergent output, not the formula.
 
 **Follows:** [Update 45](VolumeRayCastBackendComparisonFindingsUpdate45.md), [Update 44](VolumeRayCastBackendComparisonFindingsUpdate44.md).
 
@@ -24,13 +25,13 @@
 3. **TF tables match.** Both RGBA32F 1024-wide over (0,4370), built identically (`GetTable` + COMPOSITE pre-integration, factor = 0.270059): `MTL_OPTABLE` and `GL_OPTABLE` agree. TF sampling coordinate is `scalarNorm = raw*scalarScale` on both sides.
 4. **Metal's accumulation is faithful to the written formula.** Replaying `g_fragColor = (1.0 - fragColor.a) * g_srcColor + g_fragColor` (with `g_srcColor.rgb *= g_srcColor.a`) in float32 — float32 weight, separate inner product, outer `fma` — against Metal's `SAMPLE` rows (which turn out to log the PRE-update `accA/accC`) reproduces Metal's accumulation to log precision (residuals ≤ 1e-6, i.e. 6-decimal rounding).
 5. **The per-sample accumulation is insensitive to compiler-legal FMA orders here.** V1 (`fma(w, rgb*op, acc)` = Metal), V2 (no-fma), V3 (`fma(w*rgb, op, acc)`), V4 (`fma(w*op, rgb, acc)`) all end at `accC×255 = (247.68, 161.41, 119.39)` for pixel (0,256) — identical to all printed decimals. The ~1.4e-3/channel brightness bias is NOT reproduced by any reordering of this one composite step.
-6. **Reinforces update 44's direction:** Metal implements the written formula; the clean-GL ±1 field is a divergence introduced by the GLSL driver's compilation, not by Metal's per-sample inputs or composite step in isolation.
+6. **Reinforces update 44's direction — and now framed against the target:** Metal implements the written formula; clean GL diverges from it by the GLSL driver's compilation. Since the target is clean GL's output, the written-formula match is necessary but NOT sufficient: the divergence clean GL introduces must be identified and reproduced (or eliminated on the GL side) to close the ±1 field. The composite step in isolation is order-insensitive, so the divergence enters elsewhere (whole-loop arithmetic and/or per-sample inputs).
 
 ## 4. Current doubts / hypotheses (unresolved)
 
 - The field's **systematic** Metal-dimmer direction (63,647 vs 40) is too asymmetric for rounding noise — a ~1 LSB systematic bias exists somewhere. Since the composite step alone is order-insensitive, the bias must enter via either (a) clean-GL's compile of the *whole* loop (register reuse across samples, contraction with the `g_fragColor` accumulate chain, or fused op in the sample-position/step math), or (b) slightly different per-sample **inputs** (raw/op/rgb) between clean GL and Metal. Per update 44, clean-GL per-sample rows are untrustworthy, and positions were only ever verified against debug-GL (which tracks Metal) — so (b) cannot be ruled out yet.
 - **Nearest-interpolation implication:** with nearest volume sampling, per-sample inputs are quantized to texel values, so even a tiny ray/step divergence can flip a sample to a different texel → discrete opacity/color jumps. A sub-texel geometric divergence between clean GL and Metal could therefore produce exactly this kind of systematic field without any composite-arithmetic difference. This is now the leading hypothesis and should be tested by comparing clean-GL vs Metal sample positions/texels directly (needs a non-corrupting GL dump or a controlled CPU ray-march replay on both backends' exact uniforms/matrices).
-- Open goal question (update 44 §5): is the target clean GL's compiled output, or the written source formula (which Metal already matches bit-for-bit)? If the latter, Metal is already done for this step and the remaining work is a GL-side compiler setting (e.g. GLSL FMA-contraction off), not a Metal fix.
+- **Goal is closed; the path is not.** Target = clean GL's output. Metal matching the written formula is a checkpoint, not the destination: if the ±1 field is clean GL's compiler divergence, Metal must either reproduce that divergence (e.g. mirror the GLSL driver's contraction/reassociation in MSL) or the divergence must be eliminated on the GL side — a decision that now lives inside the work, not as an open question.
 
 ## Artifacts
 
