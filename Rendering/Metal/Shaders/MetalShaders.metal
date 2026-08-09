@@ -3046,8 +3046,8 @@ vertex VolumeVertexOut vertex_volume_main(
   // vertices, so this stays bounded to a few messages per frame. Verified by
   // TestMetalVolumeShaderLog.
 #if defined(VTK_METAL_ENABLE_LOGGING)
-  os_log_default.log_info("VTK_METAL_VOLUME_LOG vertex_volume_main vid=%u modelPos=(%.9g, %.9g, %.9g) clip=(%.9g, %.9g, %.9g, %.9g)",
-    vertexId, modelPos.x, modelPos.y, modelPos.z, out.position.x, out.position.y, out.position.z, out.position.w);
+  os_log_default.log_info("VTK_METAL_VOLUME_LOG vertex_volume_main vid=%u modelPos=(%.9g, %.9g, %.9g) clip=(%.9g, %.9g, %.9g, %.9g) uvx=(%.9g, %.9g, %.9g) texcoord=(%.9g, %.9g, %.9g)",
+    vertexId, modelPos.x, modelPos.y, modelPos.z, out.position.x, out.position.y, out.position.z, out.position.w, uvx.x, uvx.y, uvx.z, out.texcoord.x, out.texcoord.y, out.texcoord.z);
 #endif
   return out;
 }
@@ -4042,7 +4042,21 @@ inline float4 marchVolumeUnified(
   // texture space; currentPoint is in normalized volume space (the AABB).
   float3 texLocalPos = (volumeUniforms.volumeToTexture *
       float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
-  float3 evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+  // OpenGL g_rayOrigin parity (camera-inside proxy): GL anchors the march at the
+  // interpolated, cell-to-point-adjusted texture coordinate plus one (jitter-
+  // scaled) step: g_rayOrigin = ip_textureCoords + g_rayJitter with g_rayJitter =
+  // g_dirStep * jitterValue. Anchoring on the ray-box entry (texLocalPos) here
+  // reproduces a ~9.7e-5 texel offset in z (the near-plane entry differs from the
+  // interpolated anchor), which puts the fetch positions on the wrong side of
+  // tissue boundaries (the systematic knife-edge mismatch). For those paths
+  // p.localPos carries the interpolated per-vertex texcoord (in.texcoord) and
+  // evalStep already replicates g_dirStep, so the start is bit-parity with GL.
+  // Legacy paths (camera outside, grid traversal) keep the entry-anchored
+  // construction.
+  float jitterFrac = p.stepSize > 0.0 ? (p.jitter / p.stepSize) : 1.0;
+  float3 evalPoint = (p.anchorIsData && volumeUniforms.useParallelProjection < 0.5)
+      ? (p.localPos + evalStep * jitterFrac)
+      : cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
   float prefetchScalar = sampleVolumeScalar(volumeTexture,
       rectilinearSamplePosition(evalPoint, doRectilinear, rectCoords, volumeUniforms));
   float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint, level(0)).r : 0.0;
@@ -4136,7 +4150,12 @@ inline float4 marchVolumeUnified(
     if (any(texLocalPos < float3(0.0)) || any(texLocalPos > float3(1.0))) {
       if (seenInBounds) break;
       texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
-      evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+      // Keep the camera-inside proxy anchored on the interpolated texcoord (GL
+      // g_rayOrigin parity) after the out-of-bounds clamp; the counter-based
+      // rebuild is exact for the current sample index.
+      evalPoint = (p.anchorIsData && volumeUniforms.useParallelProjection < 0.5)
+          ? (p.localPos + evalStep * (jitterFrac + float(currentT)))
+          : cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
       prefetchValid = false;
     } else {
       seenInBounds = true;
@@ -4182,7 +4201,11 @@ inline float4 marchVolumeUnified(
         // Re-sync the incremental sample position after the empty-cell jump.
         texLocalPos = (volumeUniforms.volumeToTexture *
             float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
-        evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+        // Camera-inside proxy: rebuild from the integer counter so the skip
+        // stays on GL's g_rayOrigin + g_dirStep * g_currentT lattice.
+        evalPoint = (p.anchorIsData && volumeUniforms.useParallelProjection < 0.5)
+            ? (p.localPos + evalStep * (jitterFrac + float(currentT)))
+            : cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
         prefetchValid = false;
         curCell = int3(-1);
         continue;
