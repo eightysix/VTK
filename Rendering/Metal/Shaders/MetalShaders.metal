@@ -3637,8 +3637,11 @@ inline float3 reconstructRayDir(float2 screenPos, float2 viewportSize,
     constant VolumeMapperUniforms& u)
 {
     float2 ndc = (screenPos / viewportSize) * 2.0 - 1.0;
-    float4 wn = u.ndcToVolume * float4(ndc.x, -ndc.y, 0.0, 1.0); wn.xyz /= wn.w;
-    float4 wf = u.ndcToVolume * float4(ndc.x, -ndc.y, 1.0, 1.0); wf.xyz /= wf.w;
+    // OpenGL divides a vec by its w as rcp+mul (raw * (1.0/w), GLSL codegen),
+    // NOT IEEE division; replicate the rcp+mul rounding so the unprojected
+    // points are bit-identical (findings update 71 sect2.4 / update 74).
+    float4 wn = u.ndcToVolume * float4(ndc.x, -ndc.y, 0.0, 1.0); wn.xyz *= (1.0f / wn.w);
+    float4 wf = u.ndcToVolume * float4(ndc.x, -ndc.y, 1.0, 1.0); wf.xyz *= (1.0f / wf.w);
     return normalize(wf.xyz - wn.xyz);
 }
 
@@ -4060,13 +4063,21 @@ inline float4 marchVolumeUnified(
     // (screenPos/viewportSize)*2-1 == (fragCoord - ll)*2*inverseWindowSize - 1.)
     float2 ndc = (p.screenPos / volumeUniforms.viewportSize) * 2.0 - 1.0;
     float4 nearP = vecMulStrict(volumeUniforms.inversePVM, float4(ndc.x, -ndc.y, -1.0, 1.0));
-    nearP /= nearP.w;
+    // OpenGL divides by w as rcp+mul (raw * (1.0/w), GLSL codegen), not IEEE
+    // division; GL's logged nearP/farP == raw*rcp bit-for-bit, and division
+    // differs by 1 ulp in the last digits (findings update 74). Replicate.
+    nearP *= (1.0f / nearP.w);
     float4 farP = vecMulStrict(volumeUniforms.inversePVM, float4(ndc.x, -ndc.y, 1.0, 1.0));
-    farP /= farP.w;
+    farP *= (1.0f / farP.w);
     dbgNearP = nearP;
     dbgFarP = farP;
     d = farP.xyz - nearP.xyz;
-    dirObj = normalize(d);
+    // GLSL normalize compiles to dir * inversesqrt(dot(dir,dir)) where
+    // inversesqrt is the GPU's approximate reciprocal-sqrt instruction, 1 ulp
+    // above the correctly-rounded metal::rsqrt (findings update 74: GL inv=
+    // 3ba6b788 vs IEEE 3ba6b787 at d2=4716e769). Metal's normalize() uses the
+    // correctly-rounded rsqrt, so replicate GL's approximate instruction.
+    dirObj = d * fast::rsqrt(dot(d, d));
   }
   else
   {
