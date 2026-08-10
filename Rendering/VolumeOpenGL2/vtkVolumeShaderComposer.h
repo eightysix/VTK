@@ -1750,15 +1750,34 @@ inline std::string ComputeRayDirectionDeclaration(vtkRenderer* ren,
     // replicates this exact computation from the same matrix bytes.
     return std::string("\
         \nuniform mat4 in_inversePVM;\
+        \nvec3 g_dbgNearP;\
+        \nvec3 g_dbgFarP;\
+        \nvec3 g_dbgRayDir;\
+        \nvec4 g_dbgNearPRaw;\
+        \nvec4 g_dbgFarPRaw;\
+        \nvec3 g_dbgDir;\
+        \nfloat g_dbgD2;\
+        \nfloat g_dbgInv;\
+        \nvec3 g_dbgRayDir2;\
         \nvec3 computeRayDirection()\
         \n  {\
         \n  vec2 ndc = (gl_FragCoord.xy - in_windowLowerLeftCorner) * 2.0 *\
         \n             in_inverseWindowSize - 1.0;\
         \n  vec4 nearP = in_inversePVM * vec4(ndc.x, ndc.y, -1.0, 1.0);\
+        \n  g_dbgNearPRaw = nearP;\
         \n  nearP /= nearP.w;\
         \n  vec4 farP = in_inversePVM * vec4(ndc.x, ndc.y, 1.0, 1.0);\
+        \n  g_dbgFarPRaw = farP;\
         \n  farP /= farP.w;\
-        \n  return normalize(farP.xyz - nearP.xyz);\
+        \n  g_dbgNearP = nearP.xyz;\
+        \n  g_dbgFarP = farP.xyz;\
+        \n  vec3 rayDir = normalize(farP.xyz - nearP.xyz);\
+        \n  g_dbgDir = farP.xyz - nearP.xyz;\
+        \n  g_dbgD2 = dot(g_dbgDir, g_dbgDir);\
+        \n  g_dbgInv = inversesqrt(g_dbgD2);\
+        \n  g_dbgRayDir2 = g_dbgDir * g_dbgInv;\
+        \n  g_dbgRayDir = rayDir;\
+        \n  return rayDir;\
         \n  }");
   }
   else

@@ -3896,8 +3896,29 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
       all(abs(screenPos - float2(496.5, 488.5)) < 0.5) ||
       all(abs(screenPos - float2(93.5, 201.5)) < 0.5) ||
       all(abs(screenPos - float2(242.5, 330.5)) < 0.5);
+  // TEMP DEBUG: update-69 B (constant-scalar) remaining 18 residual pixels.
+  bool pxOkResid69 =
+      all(abs(screenPos - float2(140.5, 6.5)) < 0.5) ||
+      all(abs(screenPos - float2(170.5, 42.5)) < 0.5) ||
+      all(abs(screenPos - float2(181.5, 96.5)) < 0.5) ||
+      all(abs(screenPos - float2(18.5, 163.5)) < 0.5) ||
+      all(abs(screenPos - float2(312.5, 183.5)) < 0.5) ||
+      all(abs(screenPos - float2(366.5, 262.5)) < 0.5) ||
+      all(abs(screenPos - float2(249.5, 317.5)) < 0.5) ||
+      all(abs(screenPos - float2(305.5, 335.5)) < 0.5) ||
+      all(abs(screenPos - float2(268.5, 364.5)) < 0.5) ||
+      all(abs(screenPos - float2(0.5, 375.5)) < 0.5) ||
+      all(abs(screenPos - float2(197.5, 401.5)) < 0.5) ||
+      all(abs(screenPos - float2(11.5, 419.5)) < 0.5) ||
+      all(abs(screenPos - float2(70.5, 424.5)) < 0.5) ||
+      all(abs(screenPos - float2(71.5, 424.5)) < 0.5) ||
+      all(abs(screenPos - float2(74.5, 424.5)) < 0.5) ||
+      all(abs(screenPos - float2(75.5, 424.5)) < 0.5) ||
+      all(abs(screenPos - float2(229.5, 425.5)) < 0.5) ||
+      all(abs(screenPos - float2(174.5, 445.5)) < 0.5) ||
+      all(abs(screenPos - float2(435.5, 480.5)) < 0.5);
   return (camOk && pxOk) || (camOkClip && pxOkClip) || pxOkAny || pxOkContained || pxOkLeft ||
-         pxOkCamOut || pxOkResid || pxOkNoJitter || pxOkAlways || pxOkKnife;
+         pxOkCamOut || pxOkResid || pxOkNoJitter || pxOkAlways || pxOkKnife || pxOkResid69;
 }
 
 // TEMP DEBUG: per-fragment-only gate for the MARCH/STEP dumps (NOT the
@@ -4008,6 +4029,9 @@ inline float4 marchVolumeUnified(
   // distance. The legacy paths (camera-outside box, fullscreen, grid traversal)
   // keep the volume-space direction converted through boundsSize.
   float3 dirObj;
+  float4 dbgNearP = float4(0.0, 0.0, 0.0, 1.0);
+  float4 dbgFarP = float4(0.0, 0.0, 0.0, 1.0);
+  float3 d = float3(0.0, 0.0, 0.0);
   if (p.anchorIsData && volumeUniforms.useParallelProjection < 0.5)
   {
     // OpenGL computeRayDirection parity (analytic pixel ray): unproject the
@@ -4028,7 +4052,10 @@ inline float4 marchVolumeUnified(
     nearP /= nearP.w;
     float4 farP = vecMulStrict(volumeUniforms.inversePVM, float4(ndc.x, -ndc.y, 1.0, 1.0));
     farP /= farP.w;
-    dirObj = normalize(farP.xyz - nearP.xyz);
+    dbgNearP = nearP;
+    dbgFarP = farP;
+    d = farP.xyz - nearP.xyz;
+    dirObj = normalize(d);
   }
   else
   {
@@ -4209,7 +4236,7 @@ inline float4 marchVolumeUnified(
   //   sampleDistanceWorld: GL in_sampleDistance (world units)
 #if defined(VTK_METAL_ENABLE_LOGGING)
     if (p.screenPos.x > 0.0 && debugStepGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
-    os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG STEP px=(%d, %d) screenPos=(%0.9e, %0.9e) flatVid=%u primId=%u cameraVol=(%0.9e, %0.9e, %0.9e) localPos=(%0.9e, %0.9e, %0.9e) clip=(%0.9e, %0.9e, %0.9e, %0.9e) anchorData=(%0.9e, %0.9e, %0.9e) rayDir=(%0.9e, %0.9e, %0.9e) dirObj=(%0.9e, %0.9e, %0.9e) evalStep=(%0.9e, %0.9e, %0.9e) texStep=(%0.9e, %0.9e, %0.9e) boundsSize=(%0.9e, %0.9e, %0.9e) sampleDistanceWorld=%0.9e ctpScale=(%0.9e, %0.9e, %0.9e) ctpOffset=(%0.9e, %0.9e, %0.9e)",
+    os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG STEP px=(%d, %d) screenPos=(%0.9e, %0.9e) flatVid=%u primId=%u cameraVol=(%0.9e, %0.9e, %0.9e) localPos=(%0.9e, %0.9e, %0.9e) clip=(%0.9e, %0.9e, %0.9e, %0.9e) anchorData=(%0.9e, %0.9e, %0.9e) rayDir=(%0.9e, %0.9e, %0.9e) dirObj=(%0.9e, %0.9e, %0.9e) evalStep=(%0.9e, %0.9e, %0.9e) texStep=(%0.9e, %0.9e, %0.9e) boundsSize=(%0.9e, %0.9e, %0.9e) sampleDistanceWorld=%0.9e ctpScale=(%0.9e, %0.9e, %0.9e) ctpOffset=(%0.9e, %0.9e, %0.9e) dirBits=%08x%08x%08x evalStepBits=%08x%08x%08x nearBits=%08x%08x%08x farBits=%08x%08x%08x dBits=%08x%08x%08x",
         int(p.screenPos.x), int(p.screenPos.y),
         p.screenPos.x, p.screenPos.y,
         p.flatVid, p.primId,
@@ -4224,13 +4251,20 @@ inline float4 marchVolumeUnified(
         boundsSize.x, boundsSize.y, boundsSize.z,
         volumeUniforms.sampleDistanceWorld,
         ctpScale.x, ctpScale.y, ctpScale.z,
-        ctpOffset.x, ctpOffset.y, ctpOffset.z);
+        ctpOffset.x, ctpOffset.y, ctpOffset.z,
+        as_type<uint>(dirObj.x), as_type<uint>(dirObj.y), as_type<uint>(dirObj.z),
+        as_type<uint>(evalStep.x), as_type<uint>(evalStep.y), as_type<uint>(evalStep.z),
+        as_type<uint>(dbgNearP.x), as_type<uint>(dbgNearP.y), as_type<uint>(dbgNearP.z),
+        as_type<uint>(dbgFarP.x), as_type<uint>(dbgFarP.y), as_type<uint>(dbgFarP.z),
+        as_type<uint>(d.x), as_type<uint>(d.y), as_type<uint>(d.z));
   }
 #endif
 
   int lastIter = -1;
+  int breakWhy = 0;
+  float3 breakEval = float3(-2.0f);
   for (int i = 0; i < maxSteps; i++) {
-    if (!p.checkBounds && currentT >= maxSteps) break;
+    if (!p.checkBounds && currentT >= maxSteps) { breakWhy = 1; breakEval = evalPoint; break; }
 
     // The proxy box spans the axis-aligned bounds of the rotated volume, so
     // rays through its corner regions fall outside the [0,1]^3 texture cube.
@@ -4255,7 +4289,7 @@ inline float4 marchVolumeUnified(
     const float3 adjTexMax = ctpOffset + ctpScale;
     if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
         any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
-      if (seenInBounds) break;
+      if (seenInBounds) { breakWhy = 2; breakEval = evalPoint; break; }
       texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
       // Keep the camera-inside proxy anchored on the interpolated texcoord (GL
       // g_rayOrigin parity) after the out-of-bounds clamp; the counter-based
@@ -4876,16 +4910,23 @@ inline float4 marchVolumeUnified(
     // made 1-src.a = 0 at blend time, dropping the background blend term that GL keeps
     // (dst*(1-a), a ~ 0.9969). Keep the raw accumulated opacity for blend parity.
     if (accumulatedOpacity > 1.0f - 1.0f / 255.0f) {
+      breakWhy = 3; breakEval = evalPoint;
       break;
     }
     // OpenGL g_terminatePointMax parity: the counter is compared in units of
     // |g_dirStep| (== |evalStep|), not |texStep| (findings update 68).
     if (firstT + float(currentT) * length(evalStep) >= p.tTerminateMax) {
+      breakWhy = 4; breakEval = evalPoint;
       break;
     }
-    if (p.checkBounds && (any(currentPoint < p.blockMinGlobal - 1e-4) || any(currentPoint > p.blockMaxGlobal + 1e-4))) {
-      break;
-    }
+    // OpenGL has no block-bounds exit: TerminationImplementation breaks only on
+    // the CTP bounds test (g_dataPos vs in_texMin/in_texMax), the opacity
+    // threshold, and g_currentT >= g_terminatePointMax. The block-bounds check
+    // (currentPoint vs blockMinGlobal/blockMaxGlobal on the separate ray-box
+    // lattice) fired one sample BEFORE the CTP test on the evalPoint lattice,
+    // making the camera-inside proxy composite one fewer positive-opacity term
+    // than GL at exit-boundary pixels. Rely on the CTP test alone for parity.
+    // (Loop bound i < maxSteps still caps runaway rays.)
   }
 
   float4 finalColor;
@@ -4992,11 +5033,14 @@ inline float4 marchVolumeUnified(
   dumpAll = 1;
 #endif
   if (p.screenPos.x > 0.0 && (dumpAll || gridGate || debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos))) {
-    os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG FINAL px=(%d, %d) vp=(%f, %f) lastIter=%d accOp=%f accCol=(%f, %f, %f) final=(%f, %f, %f)",
+    os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG FINAL px=(%d, %d) vp=(%f, %f) lastIter=%d accOp=%f accCol=(%f, %f, %f) final=(%f, %f, %f) brkWhy=%d brkEval=(%0.9e, %0.9e, %0.9e) brkT=%d maxS=%d chkB=%d",
         int(p.screenPos.x), int(p.screenPos.y), volumeUniforms.viewportSize.x, volumeUniforms.viewportSize.y, lastIter,
         float(accumulatedOpacity),
         float(accumulatedColor.r), float(accumulatedColor.g), float(accumulatedColor.b),
-        float(finalColor.r), float(finalColor.g), float(finalColor.b));
+        float(finalColor.r), float(finalColor.g), float(finalColor.b),
+        breakWhy,
+        float(breakEval.x), float(breakEval.y), float(breakEval.z),
+        currentT, maxSteps, p.checkBounds ? 1 : 0);
   }
 #endif
   return finalColor;

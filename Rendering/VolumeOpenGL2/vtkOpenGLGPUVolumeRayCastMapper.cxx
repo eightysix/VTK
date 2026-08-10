@@ -3102,15 +3102,47 @@ void vtkOpenGLGPUVolumeRayCastMapper::BuildShader(vtkRenderer* ren)
   "  {\n"
       "    if (all(lessThan(abs(gl_FragCoord.xy - in_debugPixel), vec2(0.5))))\n"
       "    {\n"
-      "      int field = in_debugChannel % 3;\n"
+      "      int field = (in_debugChannel < 16) ? (in_debugChannel % 3) : ((in_debugChannel - 16) % 3);\n"
       "      vec3 base = (in_debugChannel < 3) ? g_rayOrigin : ((in_debugChannel < 6) ? g_dirStep :\n"
-      "        ((in_debugChannel < 9) ? ip_vertexPos : ip_textureCoords));\n"
+      "        ((in_debugChannel < 9) ? ip_vertexPos : ((in_debugChannel < 12) ? ip_textureCoords :\n"
+      "        ((in_debugChannel < 16) ? vec3(0.0) : ((in_debugChannel < 19) ? g_dbgRayDir :\n"
+      "        ((in_debugChannel < 22) ? g_dbgNearP : ((in_debugChannel < 25) ? g_dbgFarP :\n"
+      "        ((in_debugChannel < 33) ? vec3(0.0) : ((in_debugChannel < 36) ? g_dbgDir :\n"
+      "        ((in_debugChannel < 43) ? g_dbgRayDir2 : g_dbgNearP))))))))));\n"
       "      float v = (field == 0) ? base.x : ((field == 1) ? base.y : base.z);\n"
-      "      if (in_debugChannel >= 12)\n"
+      "      if (in_debugChannel >= 12 && in_debugChannel < 16)\n"
       "      {\n"
       "        int cf = in_debugChannel - 12;\n"
       "        v = (cf == 0) ? ip_debugClip.x : ((cf == 1) ? ip_debugClip.y :\n"
       "          ((cf == 2) ? ip_debugClip.z : ip_debugClip.w));\n"
+      "      }\n"
+      "      else if (in_debugChannel >= 25 && in_debugChannel < 29)\n"
+      "      {\n"
+      "        int cf = in_debugChannel - 25;\n"
+      "        v = (cf == 0) ? g_dbgNearPRaw.x : ((cf == 1) ? g_dbgNearPRaw.y :\n"
+      "          ((cf == 2) ? g_dbgNearPRaw.z : g_dbgNearPRaw.w));\n"
+      "      }\n"
+      "      else if (in_debugChannel >= 29 && in_debugChannel < 33)\n"
+      "      {\n"
+      "        int cf = in_debugChannel - 29;\n"
+      "        v = (cf == 0) ? g_dbgFarPRaw.x : ((cf == 1) ? g_dbgFarPRaw.y :\n"
+      "          ((cf == 2) ? g_dbgFarPRaw.z : g_dbgFarPRaw.w));\n"
+      "      }\n"
+      "      else if (in_debugChannel == 36)\n"
+      "      {\n"
+      "        v = g_dbgD2;\n"
+      "      }\n"
+      "      else if (in_debugChannel == 37)\n"
+      "      {\n"
+      "        v = g_dbgInv;\n"
+      "      }\n"
+      "      else if (in_debugChannel == 38)\n"
+      "      {\n"
+      "        v = g_dbgNearPRaw.w;\n"
+      "      }\n"
+      "      else if (in_debugChannel == 39)\n"
+      "      {\n"
+      "        v = g_dbgFarPRaw.w;\n"
       "      }\n"
       "      float av = abs(v);\n"
       "      float b0 = 0.0;\n"
@@ -4588,10 +4620,25 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
     { 153.5f, 479.5f }, { 482.5f, 478.5f }, { 120.5f, 344.5f }, { 470.5f, 242.5f },
     { 439.5f, 230.5f }, { 469.5f, 48.5f } };
 
-  for (size_t p = 0; p < 29; ++p)
+  // TEMP DEBUG: update-69 B residual pixels (Metal PNG coords (px, py), GL
+  // window coords (px, 511 - py)).
+  const float residPixels[19][2] = { { 140.5f, 505.5f }, { 170.5f, 469.5f }, { 181.5f, 415.5f },
+    { 18.5f, 348.5f }, { 312.5f, 328.5f }, { 366.5f, 249.5f }, { 249.5f, 194.5f },
+    { 305.5f, 176.5f }, { 268.5f, 147.5f }, { 0.5f, 136.5f }, { 197.5f, 110.5f },
+    { 11.5f, 92.5f }, { 70.5f, 87.5f }, { 71.5f, 87.5f }, { 74.5f, 87.5f }, { 75.5f, 87.5f },
+    { 229.5f, 86.5f }, { 174.5f, 66.5f }, { 435.5f, 31.5f } };
+  const float(*rayPixels)[2] = pixels;
+  size_t rayPixelCount = 29;
+  if (getenv("VTK_GL_RESID_DUMP") != nullptr)
   {
-    const float px = pixels[p][0];
-    const float py = pixels[p][1];
+    rayPixels = residPixels;
+    rayPixelCount = 19;
+  }
+
+  for (size_t p = 0; p < rayPixelCount; ++p)
+  {
+    const float px = rayPixels[p][0];
+    const float py = rayPixels[p][1];
     const GLint gx = static_cast<GLint>(px);
     const GLint gy = static_cast<GLint>(py);
 
@@ -4600,9 +4647,18 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
     float vpos[3] = { 0.0f, 0.0f, 0.0f };
     float tcoord[3] = { 0.0f, 0.0f, 0.0f };
     float clip[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float rayDir[3] = { 0.0f, 0.0f, 0.0f };
+    float nearP[3] = { 0.0f, 0.0f, 0.0f };
+    float farP[3] = { 0.0f, 0.0f, 0.0f };
+    float nearPRaw[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float farPRaw[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float dir[3] = { 0.0f, 0.0f, 0.0f };
+    float d2 = 0.0f;
+    float inv = 0.0f;
+    float rayDir2[3] = { 0.0f, 0.0f, 0.0f };
     float debugPixel[2] = { px, py };
 
-    for (int f = 0; f < 16; ++f)
+    for (int f = 0; f < 43; ++f)
     {
       unsigned char bytes[4] = { 0, 0, 0, 0 };
 
@@ -4621,14 +4677,53 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
         double sign = (bytes[3] & 0x80) ? -1.0 : 1.0;
         v = static_cast<float>(sign * mant * std::pow(2.0, e));
       }
-      float* dest = (f < 3) ? origin : (f < 6) ? step : (f < 9) ? vpos : (f < 12) ? tcoord : clip;
       if (f < 12)
       {
+        float* dest = (f < 3) ? origin : (f < 6) ? step : (f < 9) ? vpos : tcoord;
         dest[f % 3] = v;
+      }
+      else if (f < 16)
+      {
+        clip[f - 12] = v;
+      }
+      else if (f < 25)
+      {
+        float* dest = (f < 19) ? rayDir : (f < 22) ? nearP : farP;
+        dest[(f - 16) % 3] = v;
+      }
+      else if (f < 29)
+      {
+        nearPRaw[f - 25] = v;
+      }
+      else if (f < 33)
+      {
+        farPRaw[f - 29] = v;
+      }
+      else if (f < 36)
+      {
+        // shader field order for 33/34/35 is dir.z/x/y (field=(f-16)%3)
+        dir[(f == 34) ? 0 : (f == 35) ? 1 : 2] = v;
+      }
+      else if (f == 36)
+      {
+        d2 = v;
+      }
+      else if (f == 37)
+      {
+        inv = v;
+      }
+      else if (f == 38)
+      {
+        nearPRaw[3] = v;
+      }
+      else if (f == 39)
+      {
+        farPRaw[3] = v;
       }
       else
       {
-        clip[f - 12] = v;
+        // 40/41/42 = rayDir2.xyz via (f-16)%3 = 0/1/2
+        rayDir2[f - 40] = v;
       }
     }
 
@@ -4683,7 +4778,52 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
               << step[0] << ", " << step[1] << ", " << step[2] << ") vpos=(" << vpos[0] << ", "
               << vpos[1] << ", " << vpos[2] << ") tex=(" << tcoord[0] << ", " << tcoord[1] << ", "
               << tcoord[2] << ") clip=(" << clip[0] << ", " << clip[1] << ", " << clip[2] << ", "
-              << clip[3] << ") flatVid=" << flatVid << " primId=" << glPrim << std::endl;
+              << clip[3] << ") rd=(" << rayDir[0] << ", " << rayDir[1] << ", " << rayDir[2]
+              << ") nearP=(" << nearP[0] << ", " << nearP[1] << ", " << nearP[2] << ") farP=("
+              << farP[0] << ", " << farP[1] << ", " << farP[2] << ") flatVid=" << flatVid
+              << " primId=" << glPrim << "\n";
+    std::cerr << std::hex;
+    for (int i = 0; i < 3; ++i)
+    {
+      std::cerr << "  step" << i << "=" << std::setw(8) << std::setfill('0')
+                << *reinterpret_cast<const uint32_t*>(&step[i]);
+    }
+    for (int i = 0; i < 3; ++i)
+    {
+      std::cerr << "  rd" << i << "=" << std::setw(8) << std::setfill('0')
+                << *reinterpret_cast<const uint32_t*>(&rayDir[i]);
+    }
+    for (int i = 0; i < 3; ++i)
+    {
+      std::cerr << "  nearP" << i << "=" << std::setw(8) << std::setfill('0')
+                << *reinterpret_cast<const uint32_t*>(&nearP[i]);
+    }
+    for (int i = 0; i < 3; ++i)
+    {
+      std::cerr << "  farP" << i << "=" << std::setw(8) << std::setfill('0')
+                << *reinterpret_cast<const uint32_t*>(&farP[i]);
+    }
+    for (int i = 0; i < 4; ++i)
+    {
+      std::cerr << "  nearPRaw" << i << "=" << std::setw(8) << std::setfill('0')
+                << *reinterpret_cast<const uint32_t*>(&nearPRaw[i]);
+    }
+    for (int i = 0; i < 4; ++i)
+    {
+      std::cerr << "  farPRaw" << i << "=" << std::setw(8) << std::setfill('0')
+                << *reinterpret_cast<const uint32_t*>(&farPRaw[i]);
+    }
+    for (int i = 0; i < 3; ++i)
+    {
+      std::cerr << "  dir" << i << "=" << std::setw(8) << std::setfill('0')
+                << *reinterpret_cast<const uint32_t*>(&dir[i]);
+    }
+    std::cerr << "  d2=" << std::setw(8) << std::setfill('0')
+              << *reinterpret_cast<const uint32_t*>(&d2)
+              << "  inv=" << std::setw(8) << std::setfill('0')
+              << *reinterpret_cast<const uint32_t*>(&inv)
+              << "  rd2=(" << rayDir2[0] << ", " << rayDir2[1] << ", " << rayDir2[2] << ")";
+    std::cerr << std::dec << std::setfill(' ') << std::endl;
     std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_BOX " << std::setprecision(6);
     for (int i = 0; i < 8; ++i)
     {
