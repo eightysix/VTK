@@ -94,14 +94,50 @@ Make `evalStep` **bit-identical** to GL's `g_dirStep`:
   GL parity), `dirObj = normalize(farP - nearP)`,
   `evalStep = (adjustedLin * dirObj) * sampleDistanceWorld`.
 
-Verification steps: (a) dump GL `ip_inverseTextureDataAdjusted` and Metal
-`adjustedLin` word-for-word (matrix construction order — the comment admits the
-two-stage `(d-0.5)/d - 0.5/d` vs a precomputed value may differ in the last ulp);
-(b) dump the GL vertex-space normalize input vs Metal `farP - nearP`;
-(c) dump `in_sampleDistance` vs `sampleDistanceWorld`. Fix the folding order /
-ulp so `evalStep` is byte-identical, then re-run the replay: with per-sample
-evalPoints identical, i=132 (and every texel-boundary sample in the 183-px
-field) should pick the same texel and the reference test should collapse.
+### 4.1 Status check against the prior findings (read 2026-08-10)
+
+Two of the three proposed verification steps are **already answered**, so the
+remaining budget should go entirely to step (b):
+
+- **(a) `adjustedLin` vs `ip_inverseTextureDataAdjusted` — DONE, bit-identical**
+  (update 17: `adjustedLin` == GL `invTexDataset*cellToPoint` to 3.1e-12 at
+  `%.9e`). No folding-order ulp to fix in the matrix itself.
+- **(c) `sampleDistanceWorld` vs `in_sampleDistance` — DONE, bit-identical**
+  (update 17: equal to 1e-14 relative). Not a divergence source.
+- **(b) the normalize input — THE live thread.** Update 71 §2.4 already
+  quantified it: `nearP` is bit-identical at every physical pixel, but
+  `farP.x` differs by **1 ulp** (Metal 90.3353195 vs GL 90.3353271),
+  `dirObj` vs GL `rd` ≈ 1e-7 (few ulp), and `evalStep.x` ≈ 10 ulp — consistent
+  with round-off amplification of that single ulp through
+  `normalize → adjustedLin * dirObj` (update-70 §4c). So "make evalStep
+  byte-identical" reduces to: **match Metal's `farP` float32 chain to GL's**.
+
+Also relevant for the fix decision: the structural `evalStep` = GL `g_dirStep`
+chain is already in place (update 13 §3), the march loop already advances on
+`evalStep`/`g_dirStep` (update 69), and the near-plane ray-ORIGIN difference
+(Metal fullscreen `entryPoint` vs GL proxy `vpos`, ~4e-7 vol units) was
+explored via the proxy path in updates 16-20 — proxy-Metal matched GL's
+pre-flip geometry byte-for-byte (update 18), and update 20 attributed GL's
+larger response to near-eye anchor-geometry amplification of the harness W2IF
+view-angle perturbation. That origin difference is below the farP.nearP ulp
+level of update 71 and is a **separate** mechanism from the 1-ulp `farP.x`
+here.
+
+### 4.2 Concrete next experiments
+
+1. **Dump full float32 `farP`/`dirObj`/`evalStep`** on both backends at the
+   i=132 pixel of the worst pair (Metal (397,110) ↔ GL (397,401)) at `%.9e`,
+   and diff the exact chains: GL `farP` via the fragment-shader inversePVM
+   t-lambda/near-far interpolation vs Metal `unprojectPoint`
+   (MetalShaders.metal:4082-4095). If Metal's `farP` uses a different float32
+   chain than GL's `inversePVM`, reorder Metal to match; if they are already
+   chain-identical, the 1 ulp is a uniform/vertex-input difference upstream.
+2. Re-run the update-73 replay after the fix: with per-sample evalPoints
+   identical, i=132 (and every texel-boundary sample in the 183-px field)
+   should pick the same texel and the reference test should collapse.
+3. If the farP chain cannot be matched without invading GL's proxy-mesh path,
+   re-open the proxy-path routing decision from updates 16-20 §6 as the
+   alternative production route.
 
 ## 5. Artifacts / scripts
 
