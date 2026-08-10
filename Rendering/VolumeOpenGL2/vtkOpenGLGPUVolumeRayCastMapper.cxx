@@ -1305,6 +1305,7 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::RenderVolumeGeometry(
 
     // TEMP DEBUG (probe #1): dump the uploaded cap-triangle vertex attributes and
     // indices as float32 bits for Metal byte-compare.
+    if (getenv("VTK_GL_CAP_DUMP") != nullptr)
     {
       vtkCamera* cam = ren->GetActiveCamera();
       double pos[3], fp[3], up[3];
@@ -3012,6 +3013,8 @@ void vtkOpenGLGPUVolumeRayCastMapper::BuildShader(vtkRenderer* ren)
       "uniform int in_debugSample;\n"
       "uniform vec3 in_debugTexel;\n"
       "uniform vec3 in_debugTexelDims;\n"
+      "uniform float in_debugSweepA;\n"
+      "uniform float in_debugSweepB;\n"
       "int g_dbgIter = 0;\n"
       "bool g_dbgDone = false;");
     vtkShaderProgram::Substitute(fragSrc, "//VTK::CallWorker::Impl",
@@ -3028,19 +3031,19 @@ void vtkOpenGLGPUVolumeRayCastMapper::BuildShader(vtkRenderer* ren)
       "      float b3 = 0.0;\n"
       "      if (tva != 0.0)\n"
       "      {\n"
-      "        float e = floor(log2(tva));\n"
-      "        float f = tva * exp2(-e);\n"
-      "        if (f >= 2.0)\n"
+      "        float e = 0.0;\n"
+      "        float x = tva;\n"
+      "        while (x >= 2.0)\n"
       "        {\n"
-      "          f *= 0.5;\n"
+      "          x *= 0.5;\n"
       "          e += 1.0;\n"
       "        }\n"
-      "        if (f < 1.0)\n"
+      "        while (x < 1.0)\n"
       "        {\n"
-      "          f *= 2.0;\n"
+      "          x *= 2.0;\n"
       "          e -= 1.0;\n"
       "        }\n"
-      "        float m23 = floor((f - 1.0) * 8388608.0);\n"
+      "        float m23 = floor((x - 1.0) * 8388608.0);\n"
       "        b0 = mod(m23, 256.0);\n"
       "        b1 = mod(floor(m23 / 256.0), 256.0);\n"
       "        b2 = floor(m23 / 65536.0);\n"
@@ -3136,34 +3139,54 @@ void vtkOpenGLGPUVolumeRayCastMapper::BuildShader(vtkRenderer* ren)
       "      {\n"
       "        v = g_dbgInv;\n"
       "      }\n"
-      "      else if (in_debugChannel == 38)\n"
-      "      {\n"
-      "        v = g_dbgNearPRaw.w;\n"
-      "      }\n"
-      "      else if (in_debugChannel == 39)\n"
-      "      {\n"
-      "        v = g_dbgFarPRaw.w;\n"
-      "      }\n"
-      "      float av = abs(v);\n"
+       "      else if (in_debugChannel == 38)\n"
+       "      {\n"
+       "        v = g_dbgNearPRaw.w;\n"
+       "      }\n"
+       "      else if (in_debugChannel == 39)\n"
+       "      {\n"
+       "        v = g_dbgFarPRaw.w;\n"
+       "      }\n"
+       "      else if (in_debugChannel == 43)\n"
+       "      {\n"
+       "        v = g_dbgRcpNear;\n"
+       "      }\n"
+       "      else if (in_debugChannel == 44)\n"
+       "      {\n"
+       "        v = g_dbgRcpFar;\n"
+       "      }\n"
+       "      else if (in_debugChannel == 45)\n"
+       "      {\n"
+       "        v = g_dbgQ0Mul;\n"
+       "      }\n"
+       "      else if (in_debugChannel == 46)\n"
+       "      {\n"
+       "        v = 1.0 / in_debugSweepA;\n"
+       "      }\n"
+       "      else if (in_debugChannel == 47)\n"
+       "      {\n"
+       "        v = in_debugSweepA * in_debugSweepB;\n"
+       "      }\n"
+       "      float av = abs(v);\n"
       "      float b0 = 0.0;\n"
       "      float b1 = 0.0;\n"
       "      float b2 = 0.0;\n"
       "      float b3 = 0.0;\n"
       "      if (av != 0.0)\n"
       "      {\n"
-      "        float e = floor(log2(av));\n"
-      "        float f = av * exp2(-e);\n"
-      "        if (f >= 2.0)\n"
+      "        float e = 0.0;\n"
+      "        float x = av;\n"
+      "        while (x >= 2.0)\n"
       "        {\n"
-      "          f *= 0.5;\n"
+      "          x *= 0.5;\n"
       "          e += 1.0;\n"
       "        }\n"
-      "        if (f < 1.0)\n"
+      "        while (x < 1.0)\n"
       "        {\n"
-      "          f *= 2.0;\n"
+      "          x *= 2.0;\n"
       "          e -= 1.0;\n"
       "        }\n"
-      "        float m23 = floor((f - 1.0) * 8388608.0);\n"
+      "        float m23 = floor((x - 1.0) * 8388608.0);\n"
       "        b0 = mod(m23, 256.0);\n"
       "        b1 = mod(floor(m23 / 256.0), 256.0);\n"
       "        b2 = floor(m23 / 65536.0);\n"
@@ -3202,19 +3225,19 @@ void vtkOpenGLGPUVolumeRayCastMapper::BuildShader(vtkRenderer* ren)
       "      float b3 = 0.0;\n"
       "      if (av != 0.0)\n"
       "      {\n"
-      "        float e = floor(log2(av));\n"
-      "        float f = av * exp2(-e);\n"
-      "        if (f >= 2.0)\n"
+      "        float e = 0.0;\n"
+      "        float x = av;\n"
+      "        while (x >= 2.0)\n"
       "        {\n"
-      "          f *= 0.5;\n"
+      "          x *= 0.5;\n"
       "          e += 1.0;\n"
       "        }\n"
-      "        if (f < 1.0)\n"
+      "        while (x < 1.0)\n"
       "        {\n"
-      "          f *= 2.0;\n"
+      "          x *= 2.0;\n"
       "          e -= 1.0;\n"
       "        }\n"
-      "        float m23 = floor((f - 1.0) * 8388608.0);\n"
+      "        float m23 = floor((x - 1.0) * 8388608.0);\n"
       "        b0 = mod(m23, 256.0);\n"
       "        b1 = mod(floor(m23 / 256.0), 256.0);\n"
       "        b2 = floor(m23 / 65536.0);\n"
@@ -3251,19 +3274,19 @@ void vtkOpenGLGPUVolumeRayCastMapper::BuildShader(vtkRenderer* ren)
       "        float b3 = 0.0;\n"
       "        if (av != 0.0)\n"
       "        {\n"
-      "          float e = floor(log2(av));\n"
-      "          float f = av * exp2(-e);\n"
-      "          if (f >= 2.0)\n"
+      "          float e = 0.0;\n"
+      "          float x = av;\n"
+      "          while (x >= 2.0)\n"
       "          {\n"
-      "            f *= 0.5;\n"
+      "            x *= 0.5;\n"
       "            e += 1.0;\n"
       "          }\n"
-      "          if (f < 1.0)\n"
+      "          while (x < 1.0)\n"
       "          {\n"
-      "            f *= 2.0;\n"
+      "            x *= 2.0;\n"
       "            e -= 1.0;\n"
       "          }\n"
-      "          float m23 = floor((f - 1.0) * 8388608.0);\n"
+      "          float m23 = floor((x - 1.0) * 8388608.0);\n"
       "          b0 = mod(m23, 256.0);\n"
       "          b1 = mod(floor(m23 / 256.0), 256.0);\n"
       "          b2 = floor(m23 / 65536.0);\n"
@@ -4656,9 +4679,12 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
     float d2 = 0.0f;
     float inv = 0.0f;
     float rayDir2[3] = { 0.0f, 0.0f, 0.0f };
+    float rcpNear = 0.0f;
+    float rcpFar = 0.0f;
+    float q0mul = 0.0f;
     float debugPixel[2] = { px, py };
 
-    for (int f = 0; f < 43; ++f)
+    for (int f = 0; f < 46; ++f)
     {
       unsigned char bytes[4] = { 0, 0, 0, 0 };
 
@@ -4720,10 +4746,22 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
       {
         farPRaw[3] = v;
       }
-      else
+      else if (f >= 40 && f < 43)
       {
         // 40/41/42 = rayDir2.xyz via (f-16)%3 = 0/1/2
         rayDir2[f - 40] = v;
+      }
+      else if (f == 43)
+      {
+        rcpNear = v;
+      }
+      else if (f == 44)
+      {
+        rcpFar = v;
+      }
+      else if (f == 45)
+      {
+        q0mul = v;
       }
     }
 
@@ -4822,7 +4860,13 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
               << *reinterpret_cast<const uint32_t*>(&d2)
               << "  inv=" << std::setw(8) << std::setfill('0')
               << *reinterpret_cast<const uint32_t*>(&inv)
-              << "  rd2=(" << rayDir2[0] << ", " << rayDir2[1] << ", " << rayDir2[2] << ")";
+              << "  rd2=(" << rayDir2[0] << ", " << rayDir2[1] << ", " << rayDir2[2] << ")"
+              << "  rcpN=" << std::setw(8) << std::setfill('0')
+              << *reinterpret_cast<const uint32_t*>(&rcpNear)
+              << "  rcpF=" << std::setw(8) << std::setfill('0')
+              << *reinterpret_cast<const uint32_t*>(&rcpFar)
+              << "  q0mul=" << std::setw(8) << std::setfill('0')
+              << *reinterpret_cast<const uint32_t*>(&q0mul);
     std::cerr << std::dec << std::setfill(' ') << std::endl;
     std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_BOX " << std::setprecision(6);
     for (int i = 0; i < 8; ++i)
@@ -4836,6 +4880,77 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
   // Restore the real composite image for the gated pixels.
   prog->SetUniformi("in_debugChannel", -1);
   prog->SetUniformi("in_debugSample", -1);
+
+  // VTK_GL_SWEEP_DUMP: reciprocal + multiply characterization sweep. Reuses the
+  // (140, 505) gate pixel to read back GPU-computed 1.0/x (ch 46), a*b (ch 47)
+  // and fma(a,b,0) (ch 48) for a broad set of float32 operands.
+  if (getenv("VTK_GL_SWEEP_DUMP") != nullptr)
+  {
+    float debugPixel[2] = { 140.5f, 505.5f };
+    GLint gx = 140;
+    GLint gy = 505;
+    prog->SetUniform2f("in_debugPixel", debugPixel);
+    prog->SetUniformi("in_debugSample", -1);
+    prog->SetUniform3f("in_debugTexel", texelInit);
+
+    std::vector<uint32_t> xs;
+    const uint32_t mants[5] = { 0x000000, 0x000001, 0x200000, 0x600000, 0x7fffff };
+    for (int ee = 1; ee <= 254; ++ee)
+    {
+      for (uint32_t m : mants)
+      {
+        xs.push_back((uint32_t(ee) << 23) | m);
+      }
+    }
+    // duplicate a couple of the test's own w values
+    xs.push_back(0x40a64769);
+    xs.push_back(0x3baa4400);
+
+    auto readEncoded = [&](int ch) -> uint32_t {
+      unsigned char bytes[4] = { 0, 0, 0, 0 };
+      prog->SetUniformi("in_debugChannel", ch);
+      glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+      this->RenderVolumeGeometry(ren, prog, vol, geometry);
+      glReadPixels(gx, gy, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, bytes);
+      if (bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0)
+      {
+        return 0;
+      }
+      double m23 = static_cast<double>(bytes[0]) + 256.0 * bytes[1] + 65536.0 * bytes[2];
+      double mant = 1.0 + m23 / 8388608.0;
+      int e = static_cast<int>(bytes[3] & 0x7F) - 64;
+      double sign = (bytes[3] & 0x80) ? -1.0 : 1.0;
+      float v = static_cast<float>(sign * mant * std::pow(2.0, e));
+      return *reinterpret_cast<uint32_t*>(&v);
+    };
+
+    for (uint32_t x : xs)
+    {
+      float xf;
+      std::memcpy(&xf, &x, 4);
+      prog->SetUniformf("in_debugSweepA", xf);
+      uint32_t r = readEncoded(46);
+      std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_SWEEP_RCP x=0x" << std::hex << std::setw(8)
+                << std::setfill('0') << x << " rcp=0x" << std::setw(8) << r << std::dec
+                << std::setfill(' ') << std::endl;
+    }
+
+    for (size_t i = 0; i + 1 < xs.size(); ++i)
+    {
+      float af;
+      float bf;
+      std::memcpy(&af, &xs[i], 4);
+      std::memcpy(&bf, &xs[i + 1], 4);
+      prog->SetUniformf("in_debugSweepA", af);
+      prog->SetUniformf("in_debugSweepB", bf);
+      uint32_t m = readEncoded(47);
+      uint32_t f = readEncoded(48);
+      std::cerr << "VTK_METAL_VOLUME_LOG DEBUG GL_SWEEP_MUL a=0x" << std::hex << std::setw(8)
+                << std::setfill('0') << xs[i] << " b=0x" << std::setw(8) << xs[i + 1]
+                << " mul=0x" << std::setw(8) << m << " fma=0x" << std::setw(8) << f << std::dec
+                << std::setfill(' ') << std::endl;
+    }
+  }
 
   // Per-sample raw dump for the (422.5, 419.5) pixel (Metal parity analysis):
   // re-render once per sample index, capturing the volume raw value sampled at

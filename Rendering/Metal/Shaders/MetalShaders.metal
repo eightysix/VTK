@@ -3938,7 +3938,18 @@ inline bool debugStepGate(float3 camera, float2 screenPos) {
     int py = int(floor(screenPos.y - 0.5));
     bool pxOkGrid = (px % 8 == 0) && (py % 8 == 0);
     bool pxOkDense = px >= 317 && px <= 380 && py >= 223 && py <= 286;
-    if (pxOkGrid || pxOkDense)
+    // TEMP DEBUG: GL VTK_GL_RAY_DUMP gate pixels (matched pair experiment).
+    bool pxOkGlRay = false;
+    int glRayPx[][2] = {
+      {140,505},{170,469},{181,415},{18,348},{312,328},{366,249},{249,194},
+      {305,176},{268,147},{0,136},{197,110},{11,92},{70,87},{71,87},{74,87},
+      {75,87},{229,86},{174,66},{435,31}
+    };
+    for (int g = 0; g < 19; ++g)
+    {
+      if (px == glRayPx[g][0] && py == glRayPx[g][1]) { pxOkGlRay = true; break; }
+    }
+    if (pxOkGrid || pxOkDense || pxOkGlRay)
     {
       return true;
     }
@@ -4236,7 +4247,7 @@ inline float4 marchVolumeUnified(
   //   sampleDistanceWorld: GL in_sampleDistance (world units)
 #if defined(VTK_METAL_ENABLE_LOGGING)
     if (p.screenPos.x > 0.0 && debugStepGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
-    os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG STEP px=(%d, %d) screenPos=(%0.9e, %0.9e) flatVid=%u primId=%u cameraVol=(%0.9e, %0.9e, %0.9e) localPos=(%0.9e, %0.9e, %0.9e) clip=(%0.9e, %0.9e, %0.9e, %0.9e) anchorData=(%0.9e, %0.9e, %0.9e) rayDir=(%0.9e, %0.9e, %0.9e) dirObj=(%0.9e, %0.9e, %0.9e) evalStep=(%0.9e, %0.9e, %0.9e) texStep=(%0.9e, %0.9e, %0.9e) boundsSize=(%0.9e, %0.9e, %0.9e) sampleDistanceWorld=%0.9e ctpScale=(%0.9e, %0.9e, %0.9e) ctpOffset=(%0.9e, %0.9e, %0.9e) dirBits=%08x%08x%08x evalStepBits=%08x%08x%08x nearBits=%08x%08x%08x farBits=%08x%08x%08x dBits=%08x%08x%08x",
+    os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG STEP px=(%d, %d) screenPos=(%0.9e, %0.9e) flatVid=%u primId=%u cameraVol=(%0.9e, %0.9e, %0.9e) localPos=(%0.9e, %0.9e, %0.9e) clip=(%0.9e, %0.9e, %0.9e, %0.9e) anchorData=(%0.9e, %0.9e, %0.9e) rayDir=(%0.9e, %0.9e, %0.9e) dirObj=(%0.9e, %0.9e, %0.9e) evalStep=(%0.9e, %0.9e, %0.9e) texStep=(%0.9e, %0.9e, %0.9e) boundsSize=(%0.9e, %0.9e, %0.9e) sampleDistanceWorld=%0.9e ctpScale=(%0.9e, %0.9e, %0.9e) ctpOffset=(%0.9e, %0.9e, %0.9e) dirBits=%08x%08x%08x evalStepBits=%08x%08x%08x nearBits=%08x%08x%08x farBits=%08x%08x%08x dBits=%08x%08x%08x invPVMBits=%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x",
         int(p.screenPos.x), int(p.screenPos.y),
         p.screenPos.x, p.screenPos.y,
         p.flatVid, p.primId,
@@ -4256,7 +4267,15 @@ inline float4 marchVolumeUnified(
         as_type<uint>(evalStep.x), as_type<uint>(evalStep.y), as_type<uint>(evalStep.z),
         as_type<uint>(dbgNearP.x), as_type<uint>(dbgNearP.y), as_type<uint>(dbgNearP.z),
         as_type<uint>(dbgFarP.x), as_type<uint>(dbgFarP.y), as_type<uint>(dbgFarP.z),
-        as_type<uint>(d.x), as_type<uint>(d.y), as_type<uint>(d.z));
+        as_type<uint>(d.x), as_type<uint>(d.y), as_type<uint>(d.z),
+        as_type<uint>(volumeUniforms.inversePVM[0][0]), as_type<uint>(volumeUniforms.inversePVM[0][1]),
+        as_type<uint>(volumeUniforms.inversePVM[0][2]), as_type<uint>(volumeUniforms.inversePVM[0][3]),
+        as_type<uint>(volumeUniforms.inversePVM[1][0]), as_type<uint>(volumeUniforms.inversePVM[1][1]),
+        as_type<uint>(volumeUniforms.inversePVM[1][2]), as_type<uint>(volumeUniforms.inversePVM[1][3]),
+        as_type<uint>(volumeUniforms.inversePVM[2][0]), as_type<uint>(volumeUniforms.inversePVM[2][1]),
+        as_type<uint>(volumeUniforms.inversePVM[2][2]), as_type<uint>(volumeUniforms.inversePVM[2][3]),
+        as_type<uint>(volumeUniforms.inversePVM[3][0]), as_type<uint>(volumeUniforms.inversePVM[3][1]),
+        as_type<uint>(volumeUniforms.inversePVM[3][2]), as_type<uint>(volumeUniforms.inversePVM[3][3]));
   }
 #endif
 

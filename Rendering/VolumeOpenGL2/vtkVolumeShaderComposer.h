@@ -1755,20 +1755,26 @@ inline std::string ComputeRayDirectionDeclaration(vtkRenderer* ren,
         \nvec3 g_dbgRayDir;\
         \nvec4 g_dbgNearPRaw;\
         \nvec4 g_dbgFarPRaw;\
-        \nvec3 g_dbgDir;\
-        \nfloat g_dbgD2;\
-        \nfloat g_dbgInv;\
-        \nvec3 g_dbgRayDir2;\
-        \nvec3 computeRayDirection()\
-        \n  {\
-        \n  vec2 ndc = (gl_FragCoord.xy - in_windowLowerLeftCorner) * 2.0 *\
-        \n             in_inverseWindowSize - 1.0;\
-        \n  vec4 nearP = in_inversePVM * vec4(ndc.x, ndc.y, -1.0, 1.0);\
-        \n  g_dbgNearPRaw = nearP;\
-        \n  nearP /= nearP.w;\
-        \n  vec4 farP = in_inversePVM * vec4(ndc.x, ndc.y, 1.0, 1.0);\
-        \n  g_dbgFarPRaw = farP;\
-        \n  farP /= farP.w;\
+         \nvec3 g_dbgDir;\
+         \nfloat g_dbgD2;\
+         \nfloat g_dbgInv;\
+         \nvec3 g_dbgRayDir2;\
+         \nfloat g_dbgRcpNear;\
+         \nfloat g_dbgRcpFar;\
+         \nfloat g_dbgQ0Mul;\
+         \nvec3 computeRayDirection()\
+         \n  {\
+         \n  vec2 ndc = (gl_FragCoord.xy - in_windowLowerLeftCorner) * 2.0 *\
+         \n             in_inverseWindowSize - 1.0;\
+         \n  vec4 nearP = in_inversePVM * vec4(ndc.x, ndc.y, -1.0, 1.0);\
+         \n  g_dbgNearPRaw = nearP;\
+         \n  g_dbgRcpNear = 1.0 / nearP.w;\
+         \n  nearP /= nearP.w;\
+         \n  vec4 farP = in_inversePVM * vec4(ndc.x, ndc.y, 1.0, 1.0);\
+         \n  g_dbgFarPRaw = farP;\
+         \n  g_dbgRcpFar = 1.0 / farP.w;\
+         \n  farP /= farP.w;\
+         \n  g_dbgQ0Mul = g_dbgNearPRaw.x * g_dbgRcpNear;\
         \n  g_dbgNearP = nearP.xyz;\
         \n  g_dbgFarP = farP.xyz;\
         \n  vec3 rayDir = normalize(farP.xyz - nearP.xyz);\
