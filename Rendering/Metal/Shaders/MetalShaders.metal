@@ -4090,7 +4090,13 @@ inline float4 marchVolumeUnified(
   // The ray distance is recovered as firstT + currentT * p.stepSize.
   int currentT = 0;
 
-  int maxSteps = max(1, int(ceil((p.tEnd - firstT) / p.stepSize)));
+  // Step capacity uses the OpenGL g_dirStep length (evalStep), not the texStep
+  // length: GL's g_terminatePointMax = length(g_terminatePos - g_rayOrigin) /
+  // length(g_dirStep), and evalStep replicates g_dirStep bit-exactly while
+  // texStep is ~0.2% longer (constant-physical-distance step). Basing the cap
+  // on the texStep length lets the loop run out of headroom one sample earlier
+  // than GL on rays whose bounds exit fires last (findings update 68).
+  int maxSteps = max(1, int(ceil((p.tEnd - firstT) / length(evalStep))));
 
   // OpenGL composites in full float (g_fragColor is a vec4; the front-to-back
   // accumulator and weights are float). Accumulating in half caps the opacity
@@ -4236,7 +4242,19 @@ inline float4 marchVolumeUnified(
     // marching through rotated-volume corner regions; axis-aligned grazing
     // rays still terminate via the block-bounds exit below, and once the ray
     // has been inside the cube and left it, stop entirely.
-    if (any(texLocalPos < float3(0.0)) || any(texLocalPos > float3(1.0))) {
+    // OpenGL TerminationImplementation parity (vtkVolumeShaderComposer.h): the
+    // loop breaks when the g_dirStep lattice position leaves the cell-to-point
+    // adjusted bounds along any axis of travel. g_dataPos lives on the
+    // g_dirStep lattice (== evalPoint here) in adjusted texture space, so the
+    // test is a directional per-axis comparison against [ctpOffset, ctpOffset
+    // + ctpScale]. Testing the raw texStep lattice (texLocalPos vs [0,1])
+    // instead crossed the SAME exit planes but on a lattice whose step is
+    // ~0.2% longer than g_dirStep, so ~2% of rays exited one sample early and
+    // composited one fewer positive-opacity term (findings update 68).
+    const float3 adjTexMin = ctpOffset;
+    const float3 adjTexMax = ctpOffset + ctpScale;
+    if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+        any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
       if (seenInBounds) break;
       texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
       // Keep the camera-inside proxy anchored on the interpolated texcoord (GL
@@ -4860,7 +4878,9 @@ inline float4 marchVolumeUnified(
     if (accumulatedOpacity > 1.0f - 1.0f / 255.0f) {
       break;
     }
-    if (firstT + float(currentT) * p.stepSize >= p.tTerminateMax) {
+    // OpenGL g_terminatePointMax parity: the counter is compared in units of
+    // |g_dirStep| (== |evalStep|), not |texStep| (findings update 68).
+    if (firstT + float(currentT) * length(evalStep) >= p.tTerminateMax) {
       break;
     }
     if (p.checkBounds && (any(currentPoint < p.blockMinGlobal - 1e-4) || any(currentPoint > p.blockMaxGlobal + 1e-4))) {
