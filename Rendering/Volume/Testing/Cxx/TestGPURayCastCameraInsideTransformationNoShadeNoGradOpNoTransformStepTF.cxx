@@ -17,6 +17,11 @@
 ///   0 (default): both color and opacity step at the threshold
 ///   1: only color steps (opacity constant, isolates the color-lookup path)
 ///   2: only opacity steps (color constant, isolates the opacity-lookup path)
+///   3: constant color, opacity LINEAR RAMP over the full scalar range (no
+///      step). If the mode-2 divergence survives this, it is a per-sample
+///      varying-opacity value/accumulation difference, not step-crossing
+///      sensitivity; if it collapses, the divergence is isosurface-classification
+///      flips at the step boundary.
 
 #include "vtkCamera.h"
 #include "vtkColorTransferFunction.h"
@@ -63,6 +68,11 @@ int TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformStepTF(
   {
     linear = std::atoi(env);
   }
+  double rampMax = 0.02;
+  if (const char* env = std::getenv("VTK_STEP_RAMP_MAX"))
+  {
+    rampMax = std::atof(env);
+  }
 
   // Load data
   vtkNew<vtkVolume16Reader> reader;
@@ -83,7 +93,7 @@ int TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformStepTF(
 
   // Hard step in color: A below threshold, B above.
   vtkNew<vtkColorTransferFunction> ctf;
-  if (mode == 2)
+  if (mode == 2 || mode == 3)
   {
     // color constant (isolate opacity path)
     ctf->AddRGBPoint(0, 0.9, 0.7, 0.5);
@@ -105,6 +115,16 @@ int TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformStepTF(
     // opacity constant (isolate color path)
     pf->AddPoint(0, 0.1);
     pf->AddPoint(4370, 0.1);
+  }
+  else if (mode == 3)
+  {
+    // opacity LINEAR RAMP over full scalar range (no step). The default max
+    // (0.02) was chosen to avoid saturating the accumulated alpha to ~1
+    // (a saturated constant-color image is byte-identical regardless of
+    // accumulation, i.e. degenerate — see update 65). Sweep VTK_STEP_RAMP_MAX
+    // to stay in a sensitive non-saturated range.
+    pf->AddPoint(0, 0.0);
+    pf->AddPoint(4370, rampMax);
   }
   else
   {
