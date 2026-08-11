@@ -4657,6 +4657,14 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
     rayPixels = residPixels;
     rayPixelCount = 19;
   }
+  // TEMP DEBUG: StepTF m4/m2 pixels (Metal coords -> GL y = 511 - py).
+  const float stepTFPixels[6][2] = { { 290.5f, 181.5f }, { 358.5f, 158.5f },
+    { 357.5f, 157.5f }, { 503.5f, 132.5f }, { 435.5f, 31.5f }, { 380.5f, 7.5f } };
+  if (getenv("VTK_GL_STEPTF_DUMP") != nullptr)
+  {
+    rayPixels = stepTFPixels;
+    rayPixelCount = 6;
+  }
 
   for (size_t p = 0; p < rayPixelCount; ++p)
   {

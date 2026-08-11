@@ -1,4 +1,4 @@
-# Metal ↔ GL GPU Volume Raycast — Full Recap (updates 1–80)
+# Metal ↔ GL GPU Volume Raycast — Full Recap (updates 1–81)
 
 **Goal:** Metal output **bit-identical** to **clean GL** (reference, `RenderingBackend=OpenGL`, no debug injection) on `TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNoJitter` (512², camera-inside, NEAREST interpolation, 6-frame animated camera).
 
@@ -88,6 +88,16 @@ Notes:
 2. **Finetuned-test matrix residues (updates 65–70):** C (window-limited ramp) 187 px, D256 4338 px, D64 10281 px (coarse-volume, ±2 LSB), E (axis-camera) 60 px — these mostly share the same per-sample mechanism; B (constant-scalar) is 3 px, m2 21 px. Not blockers for the reference test but relevant if the suite is re-run.
 3. **Legacy paths:** camera-outside loops, label-map gradient-opacity parity, offscreen RGBA16F accumulation for downsampled/RenderToImage — out of scope for this test, structural parity only.
 
+## 4b. Update 81 — StepTF m4 1-px diff at `(290,330)`: a byte-rounding-boundary coincidence, same interpolator floor
+
+The StepTF m4 config (`VTK_STEP_MODE=4 VTK_STEP_WHEEL=1`: color linear ramp, constant opacity 0.005, raw-capture metric) leaves exactly **1 px** GL-vs-Metal diff: `(290,330)` GL=45 / Metal=44, max_d 1, reproducible (3/3 runs, dump and capture both stable). This is the same irreducible floor as the reference residual, but surfacing through a **byte-rounding boundary** instead of a nearest-texel pick:
+
+- **Inputs bit-identical:** clean-GL `VTK_GL_FLOAT_DUMP` readback at `(290,181)` = `accCol 0.106299959, accOp 0.331048012`; Metal exact `%.9g` FINAL log (precise-print rebuild) = `accCol 0.106299959` (**bit-identical**), `accOp 0.331048042` (9th significant digit only).
+- **Blend formula confirmed for BOTH backends:** the float model `src + (1−a)·26/255` reproduces each backend's *own* capture at 99.997 % (GL 7/262144, Metal 3/170633 mismatches, all 1 LSB at rounding boundaries). Ruled out as wrong models: 8-bit-quantized src/alpha blend variants (5.6k–64k mismatches). So bg `26/255` and the `ONE, ONE_MINUS_SRC_ALPHA` blend are exactly right (update 56/57 holds).
+- **The value sits on the round threshold:** model composite at `(290,330)` = **44.4992**, 0.0008 px below the 44.5 round-up byte boundary. Neighbors in the same column are brighter (`accCol` 0.106309/0.106331 → 44.5016/44.5095) and **both** backends render them 45 — `(290,330)` is a 1-px-wide accCol dip exactly at the boundary.
+- **Why the flip is not a bug:** for GL to store 45 its real composite must be ≥44.5, i.e. its real `accCol ≥ ~0.106303` (≈3e-6 = one knife-edge sample's color contribution) or its 8-bit store rounds up — while GL's own RGBA32F re-render dump reads 0.106299959. GL's real render therefore diverges from its dump re-render at this single knife-edge pixel — the same GL-internal interpolator bistability as update 78's frame-A/B ±1–2 ulp anchor spread, here translated by the composite's byte-rounding threshold. The 3e-8 `accOp` log difference is the same floor's fingerprint in the per-sample TF-opacity lookup (color accumulation still rounds to the same 0.106299959).
+- **Matrix-wide consistency:** every StepTF matrix residue has max_d = 1 (baseline table), i.e. all are 1-LSB — consistent with this rounding/knife-edge class, not a magnitude-8 texel-pick flip like the reference test's 178 px. Accept as hardware floor; the frame-aligned `VTK_STEP_RAW_CAPTURE` metric (update 79/80) already measures it.
+
 ## 5. Methodology debt / landmines (do not repeat)
 
 - **GL debug dumps corrupt the captured frame and the compiled arithmetic** — debug-GL is a *third* compile variant ≈ Metal, never a clean-GL reference (updates 22, 44, 59). Pair every GL dump with a separate clean capture.
@@ -102,7 +112,7 @@ Notes:
 
 ## 6. Instrumentation / debug scaffolding still in the tree (evaluate for cleanup)
 
-Env-gated: `VTK_GL_RAY_DUMP`/`VTK_GL_VERTEX_DUMP`/`VTK_GL_SAMPLE_DUMP`/`VTK_GL_OPTABLE_DUMP`/`VTK_GL_FINAL_DUMP`/`VTK_GL_FLOAT_DUMP`/`VTK_GL_CAP_DUMP`/`VTK_GL_SWEEP_DUMP`/`VTK_GL_RESID_DUMP`, `VTK_METAL_FLOAT_DUMP`/`VTK_METAL_CLEAN_BIAS_F`/`VTK_METAL_ANCHOR_PERTURB`/`VTK_METAL_FULLSCREEN_CAMERA_INSIDE`/`VTK_METAL_ANALYTIC_ANCHOR`/`VTK_METAL_ANCHOR_REC_DUMP`, `VTK_STEP_RAW_CAPTURE` (front-buffer frame-aligned capture), plus the `DEBUG STEP`/`vertex_volume_main`/`fragment_volume_main` os_log blocks in `MetalShaders.metal`. None affect clean output (update 72: debug Metal == clean Metal, 0 px), but they should be removed or gated behind the test-build macro before production.
+Env-gated: `VTK_GL_RAY_DUMP`/`VTK_GL_VERTEX_DUMP`/`VTK_GL_SAMPLE_DUMP`/`VTK_GL_OPTABLE_DUMP`/`VTK_GL_FINAL_DUMP`/`VTK_GL_FLOAT_DUMP`/`VTK_GL_CAP_DUMP`/`VTK_GL_SWEEP_DUMP`/`VTK_GL_RESID_DUMP`, `VTK_METAL_FLOAT_DUMP`/`VTK_METAL_CLEAN_BIAS_F`/`VTK_METAL_ANCHOR_PERTURB`/`VTK_METAL_FULLSCREEN_CAMERA_INSIDE`/`VTK_METAL_ANALYTIC_ANCHOR`/`VTK_METAL_ANCHOR_REC_DUMP`, `VTK_STEP_RAW_CAPTURE` (front-buffer frame-aligned capture), plus the `DEBUG STEP`/`vertex_volume_main`/`fragment_volume_main` os_log blocks in `MetalShaders.metal`. None affect clean output (update 72: debug Metal == clean Metal, 0 px), but they should be removed or gated behind the test-build macro before production. Update 81 also bumped the `FINAL` log's `accOp`/`accCol` from `%f` to `%0.9g` (inside `VTK_METAL_ENABLE_LOGGING` only) to make the byte-boundary analysis possible — per the recap's own `%0.8g`/os_log advice (update 35/71/75).
 
 ## 7. Test / build commands
 
@@ -114,4 +124,4 @@ Env-gated: `VTK_GL_RAY_DUMP`/`VTK_GL_VERTEX_DUMP`/`VTK_GL_SAMPLE_DUMP`/`VTK_GL_O
 
 ## 8. Chained reference (in order, read these for depth)
 
-Updates **1–19** (pipeline: gates, fp16, TF tables, half→float, NEAREST insight, W2IF) → **20–40** (proxy mesh, matrix/FMA parity, 307→130→694 px, inversePVM order) → **41–59** (composite exonerated, background-blend root cause 63,692→188 px, frame-aligned dumps, step vs anchor) → **60–64** (per-vertex bit-identity, barycentric weights ~1e-8, interpolation floor quantified) → **65–70** (finetuned matrix, sample-count lattice 5530→3) → **71–77** (ray byte-identity, rcp/rsqrt codegen, anchor +1 ulp proven, analytic-anchor audit) → **78** (analytic-anchor negative: mode-1 429 / mode-2 469 px; GL frame-A/B anchor spread) → **79** (frame-aligned raw capture refutes frame-selection: same-camera 178 px) → **80** (per-vertex texcoord z 94/94, z-input lever refuted, interpolator-model sweep negative; residual = interpolator hardware floor).
+Updates **1–19** (pipeline: gates, fp16, TF tables, half→float, NEAREST insight, W2IF) → **20–40** (proxy mesh, matrix/FMA parity, 307→130→694 px, inversePVM order) → **41–59** (composite exonerated, background-blend root cause 63,692→188 px, frame-aligned dumps, step vs anchor) → **60–64** (per-vertex bit-identity, barycentric weights ~1e-8, interpolation floor quantified) → **65–70** (finetuned matrix, sample-count lattice 5530→3) → **71–77** (ray byte-identity, rcp/rsqrt codegen, anchor +1 ulp proven, analytic-anchor audit) → **78** (analytic-anchor negative: mode-1 429 / mode-2 469 px; GL frame-A/B anchor spread) → **79** (frame-aligned raw capture refutes frame-selection: same-camera 178 px) → **80** (per-vertex texcoord z 94/94, z-input lever refuted, interpolator-model sweep negative; residual = interpolator hardware floor) → **81** (StepTF m4 1-px diff at `(290,330)` = byte-rounding-boundary coincidence at composite 44.4992; inputs/accumulation bit-identical, blend model confirmed per-backend; same interpolator floor).

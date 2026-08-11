@@ -3906,6 +3906,15 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
       all(abs(screenPos - float2(496.5, 488.5)) < 0.5) ||
       all(abs(screenPos - float2(93.5, 201.5)) < 0.5) ||
       all(abs(screenPos - float2(242.5, 330.5)) < 0.5);
+  // TEMP DEBUG: StepTF m4 (color-ramp, op=0.005) single-px diff (290,330) and
+  // StepTF m2 threshold-independent 5-px set. Camera-agnostic (m4/m2 cameras).
+  bool pxOkStepTF =
+      all(abs(screenPos - float2(290.5, 330.5)) < 0.5) ||
+      all(abs(screenPos - float2(358.5, 353.5)) < 0.5) ||
+      all(abs(screenPos - float2(357.5, 354.5)) < 0.5) ||
+      all(abs(screenPos - float2(503.5, 379.5)) < 0.5) ||
+      all(abs(screenPos - float2(435.5, 480.5)) < 0.5) ||
+      all(abs(screenPos - float2(380.5, 504.5)) < 0.5);
   // TEMP DEBUG: update-69 B (constant-scalar) remaining 18 residual pixels.
   bool pxOkResid69 =
       all(abs(screenPos - float2(140.5, 6.5)) < 0.5) ||
@@ -3928,7 +3937,8 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
       all(abs(screenPos - float2(174.5, 445.5)) < 0.5) ||
       all(abs(screenPos - float2(435.5, 480.5)) < 0.5);
   return (camOk && pxOk) || (camOkClip && pxOkClip) || pxOkAny || pxOkContained || pxOkLeft ||
-         pxOkCamOut || pxOkResid || pxOkNoJitter || pxOkAlways || pxOkKnife || pxOkResid69;
+         pxOkCamOut || pxOkResid || pxOkNoJitter || pxOkAlways || pxOkKnife || pxOkResid69 ||
+         pxOkStepTF;
 }
 
 // TEMP DEBUG: per-fragment-only gate for the MARCH/STEP dumps (NOT the
@@ -5072,7 +5082,7 @@ inline float4 marchVolumeUnified(
   dumpAll = 1;
 #endif
   if (p.screenPos.x > 0.0 && (dumpAll || gridGate || debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos))) {
-    os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG FINAL px=(%d, %d) vp=(%f, %f) lastIter=%d accOp=%f accCol=(%f, %f, %f) final=(%f, %f, %f) brkWhy=%d brkEval=(%0.9e, %0.9e, %0.9e) brkT=%d maxS=%d chkB=%d",
+    os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG FINAL px=(%d, %d) vp=(%f, %f) lastIter=%d accOp=%0.9g accCol=(%0.9g, %0.9g, %0.9g) final=(%f, %f, %f) brkWhy=%d brkEval=(%0.9e, %0.9e, %0.9e) brkT=%d maxS=%d chkB=%d",
         int(p.screenPos.x), int(p.screenPos.y), volumeUniforms.viewportSize.x, volumeUniforms.viewportSize.y, lastIter,
         float(accumulatedOpacity),
         float(accumulatedColor.r), float(accumulatedColor.g), float(accumulatedColor.b),
@@ -5306,7 +5316,10 @@ inline bool analyticPixelGate(float2 screenPos)
     (px == 70 && py == 424) || (px == 71 && py == 424) ||
     (px == 74 && py == 424) || (px == 75 && py == 424) ||
     (px == 229 && py == 425) || (px == 174 && py == 445) ||
-    (px == 435 && py == 480) || (px == 397 && py == 110);
+    (px == 435 && py == 480) || (px == 397 && py == 110) ||
+    (px == 290 && py == 330) || (px == 358 && py == 353) ||
+    (px == 357 && py == 354) || (px == 503 && py == 379) ||
+    (px == 435 && py == 480) || (px == 380 && py == 504);
 }
 
 inline bool analyticAnchorTexcoord(float2 screenPos, float3 interpTex,
