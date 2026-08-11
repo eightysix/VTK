@@ -297,6 +297,35 @@ int TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformStepTF(
     renWin->Render();
   }
 
+  if (const char* raw = std::getenv("VTK_STEP_RAW_CAPTURE"))
+  {
+    // Capture the front framebuffer of the frame that was just rendered,
+    // bypassing vtkWindowToImageFilter's camera copy (vtkWindowToImageFilter.cxx
+    // stores the view angle as float32 radians, re-deriving 30.0 -> 30.0000008,
+    // so a W2IF render is not the frame this test drew and can flip knife-edge
+    // samples ~4 ulp). The raw readback is byte-identical to the last render.
+    int* wsz = renWin->GetSize();
+    unsigned char* px = renWin->GetRGBACharPixelData(0, 0, wsz[0] - 1, wsz[1] - 1, 1);
+    if (px)
+    {
+      vtkNew<vtkImageData> img;
+      img->SetDimensions(wsz[0], wsz[1], 1);
+      img->AllocateScalars(VTK_UNSIGNED_CHAR, 3);
+      unsigned char* out = static_cast<unsigned char*>(img->GetScalarPointer());
+      for (int i = 0; i < wsz[0] * wsz[1]; ++i)
+      {
+        out[3 * i + 0] = px[4 * i + 0];
+        out[3 * i + 1] = px[4 * i + 1];
+        out[3 * i + 2] = px[4 * i + 2];
+      }
+      delete[] px;
+      vtkNew<vtkPNGWriter> png;
+      png->SetFileName(raw);
+      png->SetInputData(img);
+      png->Write();
+    }
+  }
+
   if (const char* dump = std::getenv("VTK_STEP_DUMP"))
   {
     vtkNew<vtkWindowToImageFilter> w2i;

@@ -10,6 +10,7 @@
 #include "vtkGPUVolumeRayCastMapper.h"
 #include "vtkImageData.h"
 #include "vtkImageResize.h"
+#include "vtkPNGWriter.h"
 #include "vtkPointData.h"
 #include "vtkInteractorStyleTrackballCamera.h"
 #include "vtkNew.h"
@@ -23,6 +24,7 @@
 #include "vtkVolume16Reader.h"
 #include "vtkVolumeProperty.h"
 
+#include <cstdlib>
 #include <iostream>
 
 static const char* TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNoJitterLog =
@@ -120,5 +122,34 @@ int TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNoJitter(i
 
   int rv = vtkTesting::InteractorEventLoop(
     argc, argv, iren, TestGPURayCastCameraInsideTransformationNoShadeNoGradOpNoTransformNoJitterLog);
+
+  // Raw front-buffer capture (frame-aligned backend comparison). Reads the
+  // framebuffer of the last frame rendered (the W2IF perturbed camera copy for
+  // both backends), bypassing the -V baseline PNG so backend render frames can
+  // be diffed directly without harness frame-selection noise.
+  if (const char* raw = std::getenv("VTK_STEP_RAW_CAPTURE"))
+  {
+    int* wsz = renWin->GetSize();
+    unsigned char* px = renWin->GetRGBACharPixelData(0, 0, wsz[0] - 1, wsz[1] - 1, 1);
+    if (px)
+    {
+      vtkNew<vtkImageData> img;
+      img->SetDimensions(wsz[0], wsz[1], 1);
+      img->AllocateScalars(VTK_UNSIGNED_CHAR, 3);
+      unsigned char* out = static_cast<unsigned char*>(img->GetScalarPointer());
+      for (int i = 0; i < wsz[0] * wsz[1]; ++i)
+      {
+        out[3 * i + 0] = px[4 * i + 0];
+        out[3 * i + 1] = px[4 * i + 1];
+        out[3 * i + 2] = px[4 * i + 2];
+      }
+      delete[] px;
+      vtkNew<vtkPNGWriter> png;
+      png->SetFileName(raw);
+      png->SetInputData(img);
+      png->Write();
+    }
+  }
+
   return rv;
 }

@@ -2888,6 +2888,13 @@ struct VolumeMapperUniforms {
   // removing the interpolated-anchor dependence that drifted evalStep from
   // g_dirStep by ~3e-8/step.
   float4x4 inversePVM;
+  // TEMP DEBUG (analytic-anchor experiment): when > 0.5 the camera-inside
+  // proxy fragment shader bypasses the interpolated in.texcoord anchor and
+  // reconstructs the per-fragment texcoord from pixel-center barycentrics +
+  // per-vertex clip/texcoord (triangle anchor buffer at fragment buffer(3)).
+  // 1 = float32 weights, 2 = float64 weights (update 76 sect 4 A/B).
+  float analyticAnchorMode;
+  float _padAnchor[3];
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -3932,6 +3939,8 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
 // NDC per pixel without exploding the per-sample log volume. The grid/dense
 // region applies only to the CameraInsideTransformation camera; other cameras
 // keep debugMarchGate's pixels only.
+inline bool analyticPixelGate(float2 screenPos);  // defined with the analytic helpers
+
 inline bool debugStepGate(float3 camera, float2 screenPos) {
   float3 dc = camera;
   bool camOk = all(abs(dc - float3(0.506559, 0.506559, 0.446101)) < 1e-3);
@@ -4221,7 +4230,7 @@ inline float4 marchVolumeUnified(
 
   // DEBUG: one header per gated fragment (test builds only).
 #if defined(VTK_METAL_ENABLE_LOGGING)
-    if (p.screenPos.x > 0.0 && debugStepGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
+    if (p.screenPos.x > 0.0 && (debugStepGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos) || analyticPixelGate(p.screenPos))) {
     os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG MARCH px=(%d, %d) camera=(%f, %f, %f) rayDir=(%f, %f, %f) tStart=%f tEnd=%f useClip=%f nClip=%f p0o=(%f, %f, %f) p0n=(%f, %f, %f) p1o=(%f, %f, %f) p1n=(%f, %f, %f) stepSize=%f firstT=%f jitter=%f entry=(%f, %f, %f) scalarMin=%f scalarMax=%f texelCount=(%f, %f, %f) texelDims=(%u, %u, %u)",
         int(p.screenPos.x), int(p.screenPos.y),
         volumeUniforms.cameraVolumePos.x, volumeUniforms.cameraVolumePos.y, volumeUniforms.cameraVolumePos.z,
@@ -4257,7 +4266,7 @@ inline float4 marchVolumeUnified(
   //   boundsSize        : volumeBoundsMax - volumeBoundsMin
   //   sampleDistanceWorld: GL in_sampleDistance (world units)
 #if defined(VTK_METAL_ENABLE_LOGGING)
-    if (p.screenPos.x > 0.0 && debugStepGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
+    if (p.screenPos.x > 0.0 && (debugStepGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos) || analyticPixelGate(p.screenPos))) {
     os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG STEP px=(%d, %d) screenPos=(%0.9e, %0.9e) flatVid=%u primId=%u cameraVol=(%0.9e, %0.9e, %0.9e) localPos=(%0.9e, %0.9e, %0.9e) clip=(%0.9e, %0.9e, %0.9e, %0.9e) anchorData=(%0.9e, %0.9e, %0.9e) rayDir=(%0.9e, %0.9e, %0.9e) dirObj=(%0.9e, %0.9e, %0.9e) evalStep=(%0.9e, %0.9e, %0.9e) texStep=(%0.9e, %0.9e, %0.9e) boundsSize=(%0.9e, %0.9e, %0.9e) sampleDistanceWorld=%0.9e ctpScale=(%0.9e, %0.9e, %0.9e) ctpOffset=(%0.9e, %0.9e, %0.9e) dirBits=%08x%08x%08x evalStepBits=%08x%08x%08x nearBits=%08x%08x%08x farBits=%08x%08x%08x dBits=%08x%08x%08x invPVMBits=%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x",
         int(p.screenPos.x), int(p.screenPos.y),
         p.screenPos.x, p.screenPos.y,
@@ -5196,6 +5205,235 @@ inline void marchSegment(
   accumulatedOpacity = result.w;
 }
 
+// TEMP DEBUG (analytic-anchor experiment): bypass the rasterizer's interpolated
+// in.texcoord for the camera-inside proxy anchor and reconstruct the per-fragment
+// texcoord from pixel-center barycentrics + per-vertex clip/texcoord (triangle
+// anchor buffer, fragment buffer(3)). The buffer is a float4 count header (the
+// triangle count in .x) followed by per-triangle records of 3 * 7 floats
+// (clip.xyzw, texcoord.xyz per vertex), indexed by primitive_id. Weights are
+// computed in window space (y-down, Metal top-left) from the vertex NDC
+// (clip.xy / clip.w) and the pixel-center in.position.xy, so they are
+// perspective-correct; the attribute is reconstructed as
+//   anchorTex = sum_i(l_i * tex_i / clipW_i) / sum_i(l_i / clipW_i)
+// exactly the interpolator's (attr/w, 1/w) perspective-correct weighted
+// average then divide (update 76 sect 4: the (attr*w, w) form is NOT the
+// interpolator's result and does not reproduce GL).
+// analyticAnchorMode: 1 = float32 weights, 2 = float64 weights (update 76
+// sect 4 A/B). Returns false (caller falls back to in.texcoord) when the
+// buffer is absent or primId is out of range.
+// MSL has no double type, so the mode-2 path emulates float64 with double-float
+// (two-float hi+lo, ~53-bit significand) arithmetic; these helpers compile under
+// the file-scope #pragma clang fp contract(off) so twoProd's fma is exact.
+struct DoubleFloat { float hi; float lo; };
+
+inline DoubleFloat dfFromFloat(float x) { return DoubleFloat{ x, 0.0f }; }
+
+inline DoubleFloat twoSum(float a, float b)
+{
+  float s = a + b;
+  float v = s - a;
+  float e = (a - (s - v)) + (b - v);
+  return DoubleFloat{ s, e };
+}
+
+inline DoubleFloat twoProd(float a, float b)
+{
+  float p = a * b;
+  float e = fma(a, b, -p);
+  return DoubleFloat{ p, e };
+}
+
+inline DoubleFloat dfAdd(DoubleFloat a, DoubleFloat b)
+{
+  DoubleFloat s = twoSum(a.hi, b.hi);
+  float lo = s.lo + a.lo + b.lo;
+  float hi = s.hi + lo;
+  float lo2 = lo - (hi - s.hi);
+  return DoubleFloat{ hi, lo2 };
+}
+
+inline DoubleFloat dfSub(DoubleFloat a, DoubleFloat b)
+{
+  return dfAdd(a, DoubleFloat{ -b.hi, -b.lo });
+}
+
+inline DoubleFloat dfMul(DoubleFloat a, DoubleFloat b)
+{
+  DoubleFloat p = twoProd(a.hi, b.hi);
+  float lo = fma(a.hi, b.lo, fma(a.lo, b.hi, p.lo));
+  float hi = p.hi + lo;
+  float lo2 = lo - (hi - p.hi);
+  return DoubleFloat{ hi, lo2 };
+}
+
+inline DoubleFloat dfDiv(DoubleFloat a, DoubleFloat b)
+{
+  float q = a.hi / b.hi;
+  DoubleFloat r = dfSub(a, dfMul(b, dfFromFloat(q)));
+  float q2 = q + r.hi / b.hi;
+  return dfFromFloat(q2);
+}
+
+inline float dfToFloat(DoubleFloat a) { return a.hi + a.lo; }
+
+// TEMP DEBUG: GL_RAY dump pixels (Metal coords, y = 511 - GL y) so the
+// interpolated anchor can be diffed directly against VTK_GL_RAY_DUMP.
+inline bool analyticPixelGate(float2 screenPos)
+{
+  int px = int(floor(screenPos.x - 0.5));
+  int py = int(floor(screenPos.y - 0.5));
+  return (px == 397 && py == 110) || (px == 256 && py == 256) ||
+    (px == 422 && py == 92) || (px == 372 && py == 131) ||
+    (px == 360 && py == 229) || (px == 349 && py == 255) ||
+    (px == 405 && py == 171) || (px == 9 && py == 18) ||
+    (px == 293 && py == 298) || (px == 338 && py == 432) ||
+    (px % 32 == 0 && py % 32 == 0) ||
+    (px == 307 && (py == 8 || py == 7 || py == 9)) ||
+    (px == 480 && py == 400) || (px == 496 && py == 488) ||
+    (px == 93 && py == 201) || (px == 242 && py == 330) ||
+    (px == 322 && py == 172) || (px == 382 && py == 207) ||
+    (px == 357 && py == 154) || (px == 104 && py == 245) ||
+    (px == 188 && py == 307) || (px == 350 && py == 5) ||
+    (px == 153 && py == 32) || (px == 482 && py == 33) ||
+    (px == 120 && py == 167) || (px == 470 && py == 269) ||
+    (px == 439 && py == 281) || (px == 469 && py == 463) ||
+    (px == 140 && py == 6) || (px == 170 && py == 42) ||
+    (px == 181 && py == 96) || (px == 18 && py == 163) ||
+    (px == 312 && py == 183) || (px == 366 && py == 262) ||
+    (px == 249 && py == 317) || (px == 305 && py == 335) ||
+    (px == 268 && py == 364) || (px == 0 && py == 375) ||
+    (px == 197 && py == 401) || (px == 11 && py == 419) ||
+    (px == 70 && py == 424) || (px == 71 && py == 424) ||
+    (px == 74 && py == 424) || (px == 75 && py == 424) ||
+    (px == 229 && py == 425) || (px == 174 && py == 445) ||
+    (px == 435 && py == 480) || (px == 397 && py == 110);
+}
+
+inline bool analyticAnchorTexcoord(float2 screenPos, float3 interpTex,
+    constant VolumeMapperUniforms& volumeUniforms,
+    constant float* triAnchor, uint primId, thread float3& anchorTex)
+{
+  uint triCount = uint(triAnchor[0]);
+  if (primId >= triCount) { return false; }
+  constant float* rec = triAnchor + 4 + (uint)primId * 21u;
+  float wWin = volumeUniforms.viewportSize.x;
+  float hWin = volumeUniforms.viewportSize.y;
+#if defined(VTK_METAL_ENABLE_LOGGING)
+  {
+    int px = int(floor(screenPos.x - 0.5));
+    int py = int(floor(screenPos.y - 0.5));
+    bool gate = analyticPixelGate(screenPos);
+    if (gate)
+    {
+      os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG ANALYTIC_IN px=(%d, %d) primId=%u interp=(%.9e, %.9e, %.9e) rec=[%.9e, %.9e, %.9e, %.9e, %.9e, %.9e, %.9e, %.9e, %.9e, %.9e, %.9e, %.9e, %.9e, %.9e, %.9e, %.9e, %.9e, %.9e, %.9e, %.9e, %.9e]",
+        px, py, primId,
+        interpTex.x, interpTex.y, interpTex.z,
+        rec[0], rec[1], rec[2], rec[3], rec[4], rec[5], rec[6],
+        rec[7], rec[8], rec[9], rec[10], rec[11], rec[12], rec[13],
+        rec[14], rec[15], rec[16], rec[17], rec[18], rec[19], rec[20]);
+    }
+  }
+#endif
+  if (volumeUniforms.analyticAnchorMode < 1.5)
+  {
+    float v0x = (rec[0] / rec[3] + 1.0f) * 0.5f * wWin;
+    float v0y = (1.0f - rec[1] / rec[3]) * 0.5f * hWin;
+    float v1x = (rec[7] / rec[10] + 1.0f) * 0.5f * wWin;
+    float v1y = (1.0f - rec[8] / rec[10]) * 0.5f * hWin;
+    float v2x = (rec[14] / rec[17] + 1.0f) * 0.5f * wWin;
+    float v2y = (1.0f - rec[15] / rec[17]) * 0.5f * hWin;
+    float px = screenPos.x, py = screenPos.y;
+    float det = (v1x - v0x) * (v2y - v0y) - (v1y - v0y) * (v2x - v0x);
+    float l0 = ((v1x - px) * (v2y - py) - (v1y - py) * (v2x - px)) / det;
+    float l1 = ((v2x - px) * (v0y - py) - (v2y - py) * (v0x - px)) / det;
+    float l2 = 1.0f - l0 - l1;
+    float den = l0 / rec[3] + l1 / rec[10] + l2 / rec[17];
+    anchorTex.x = (l0 * (rec[4] / rec[3]) + l1 * (rec[11] / rec[10]) + l2 * (rec[18] / rec[17])) / den;
+    anchorTex.y = (l0 * (rec[5] / rec[3]) + l1 * (rec[12] / rec[10]) + l2 * (rec[19] / rec[17])) / den;
+    anchorTex.z = (l0 * (rec[6] / rec[3]) + l1 * (rec[13] / rec[10]) + l2 * (rec[20] / rec[17])) / den;
+#if defined(VTK_METAL_ENABLE_LOGGING)
+    {
+      int opx = int(floor(screenPos.x - 0.5));
+      int opy = int(floor(screenPos.y - 0.5));
+      bool ogate = (opx == 397 && opy == 110) || (opx == 256 && opy == 256) ||
+        (opx == 422 && opy == 92) || (opx == 372 && opy == 131) ||
+        (opx == 360 && opy == 229) || (opx == 349 && opy == 255) ||
+        (opx == 405 && opy == 171) || (opx == 9 && opy == 18) ||
+        (opx == 293 && opy == 298) || (opx == 338 && opy == 432) ||
+        (opx % 32 == 0 && opy % 32 == 0);
+      if (ogate)
+      {
+        os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG ANALYTIC_OUT32 px=(%d, %d) anchor=(%.9e, %.9e, %.9e)",
+          opx, opy, anchorTex.x, anchorTex.y, anchorTex.z);
+      }
+    }
+#endif
+    return true;
+  }
+  else
+  {
+    // float64-equivalent weights (update 76 sect 4): same recipe as the float32
+    // branch but every intermediate is a double-float, so the vertex NDC divide
+    // and the barycentric weights carry no float32 rounding.
+    DoubleFloat px = dfFromFloat(screenPos.x);
+    DoubleFloat py = dfFromFloat(screenPos.y);
+    DoubleFloat hscale = dfFromFloat(0.5f);
+    DoubleFloat wWinD = dfFromFloat(wWin);
+    DoubleFloat hWinD = dfFromFloat(hWin);
+    DoubleFloat one = dfFromFloat(1.0f);
+    DoubleFloat v0x = dfMul(dfMul(dfAdd(dfDiv(dfFromFloat(rec[0]), dfFromFloat(rec[3])), one), hscale), wWinD);
+    DoubleFloat v0y = dfMul(dfMul(dfSub(one, dfDiv(dfFromFloat(rec[1]), dfFromFloat(rec[3]))), hscale), hWinD);
+    DoubleFloat v1x = dfMul(dfMul(dfAdd(dfDiv(dfFromFloat(rec[7]), dfFromFloat(rec[10])), one), hscale), wWinD);
+    DoubleFloat v1y = dfMul(dfMul(dfSub(one, dfDiv(dfFromFloat(rec[8]), dfFromFloat(rec[10]))), hscale), hWinD);
+    DoubleFloat v2x = dfMul(dfMul(dfAdd(dfDiv(dfFromFloat(rec[14]), dfFromFloat(rec[17])), one), hscale), wWinD);
+    DoubleFloat v2y = dfMul(dfMul(dfSub(one, dfDiv(dfFromFloat(rec[15]), dfFromFloat(rec[17]))), hscale), hWinD);
+    DoubleFloat det = dfSub(dfMul(dfSub(v1x, v0x), dfSub(v2y, v0y)), dfMul(dfSub(v1y, v0y), dfSub(v2x, v0x)));
+    DoubleFloat l0 = dfDiv(dfSub(dfMul(dfSub(v1x, px), dfSub(v2y, py)), dfMul(dfSub(v1y, py), dfSub(v2x, px))), det);
+    DoubleFloat l1 = dfDiv(dfSub(dfMul(dfSub(v2x, px), dfSub(v0y, py)), dfMul(dfSub(v2y, py), dfSub(v0x, px))), det);
+    DoubleFloat l2 = dfSub(dfSub(one, l0), l1);
+    DoubleFloat w0 = dfFromFloat(rec[3]);
+    DoubleFloat w1 = dfFromFloat(rec[10]);
+    DoubleFloat w2 = dfFromFloat(rec[17]);
+    DoubleFloat invW0 = dfDiv(one, w0);
+    DoubleFloat invW1 = dfDiv(one, w1);
+    DoubleFloat invW2 = dfDiv(one, w2);
+    DoubleFloat t0x = dfFromFloat(rec[4]);
+    DoubleFloat t0y = dfFromFloat(rec[5]);
+    DoubleFloat t0z = dfFromFloat(rec[6]);
+    DoubleFloat t1x = dfFromFloat(rec[11]);
+    DoubleFloat t1y = dfFromFloat(rec[12]);
+    DoubleFloat t1z = dfFromFloat(rec[13]);
+    DoubleFloat t2x = dfFromFloat(rec[18]);
+    DoubleFloat t2y = dfFromFloat(rec[19]);
+    DoubleFloat t2z = dfFromFloat(rec[20]);
+    DoubleFloat den = dfAdd(dfAdd(dfMul(l0, invW0), dfMul(l1, invW1)), dfMul(l2, invW2));
+    DoubleFloat numX = dfAdd(dfAdd(dfMul(l0, dfDiv(t0x, w0)), dfMul(l1, dfDiv(t1x, w1))), dfMul(l2, dfDiv(t2x, w2)));
+    DoubleFloat numY = dfAdd(dfAdd(dfMul(l0, dfDiv(t0y, w0)), dfMul(l1, dfDiv(t1y, w1))), dfMul(l2, dfDiv(t2y, w2)));
+    DoubleFloat numZ = dfAdd(dfAdd(dfMul(l0, dfDiv(t0z, w0)), dfMul(l1, dfDiv(t1z, w1))), dfMul(l2, dfDiv(t2z, w2)));
+    anchorTex.x = dfToFloat(dfDiv(numX, den));
+    anchorTex.y = dfToFloat(dfDiv(numY, den));
+    anchorTex.z = dfToFloat(dfDiv(numZ, den));
+#if defined(VTK_METAL_ENABLE_LOGGING)
+    {
+      int opx = int(floor(screenPos.x - 0.5));
+      int opy = int(floor(screenPos.y - 0.5));
+      bool ogate = (opx == 397 && opy == 110) || (opx == 256 && opy == 256) ||
+        (opx == 422 && opy == 92) || (opx == 372 && opy == 131) ||
+        (opx == 360 && opy == 229) || (opx == 349 && opy == 255) ||
+        (opx == 405 && opy == 171) || (opx == 9 && opy == 18) ||
+        (opx == 293 && opy == 298) || (opx == 338 && opy == 432) ||
+        (opx % 32 == 0 && opy % 32 == 0);
+      if (ogate)
+      {
+        os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG ANALYTIC_OUT64 px=(%d, %d) anchor=(%.9e, %.9e, %.9e)",
+          opx, opy, anchorTex.x, anchorTex.y, anchorTex.z);
+      }
+    }
+#endif
+    return true;
+  }
+}
+
 fragment VolumeFragmentOut fragment_volume_main(
     VolumeVertexOut in [[stage_in]],
     uint primId [[primitive_id]],
@@ -5216,7 +5454,8 @@ fragment VolumeFragmentOut fragment_volume_main(
     texture2d<float> transferFunctionTexture2 [[texture(13)]],
     texture2d<float> transferFunctionTexture3 [[texture(14)]],
     constant packed_float3* rectCoords [[buffer(5)]],
-    constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
+    constant VolumeLightUniforms& volumeLights [[buffer(4)]],
+    constant float* triAnchor [[buffer(3)]]) {
 
   VolumeFragmentOut output;
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
@@ -5242,7 +5481,20 @@ fragment VolumeFragmentOut fragment_volume_main(
     // per-vertex float result. Use the interpolated per-vertex texcoord so the
     // ray anchor is bit-identical to GL (a fragment-time affine of the
     // interpolated data position only reproduced the systematic shift).
-    anchorTex = in.texcoord;
+    // TEMP DEBUG (analytic-anchor experiment): when analyticAnchorMode is set,
+    // bypass the interpolator and reconstruct the per-fragment texcoord from
+    // pixel-center barycentrics + per-vertex clip/texcoord (buffer 3).
+    if (volumeUniforms.analyticAnchorMode > 0.5)
+    {
+      if (!analyticAnchorTexcoord(in.position.xy, in.texcoord, volumeUniforms, triAnchor, primId, anchorTex))
+      {
+        anchorTex = in.texcoord;
+      }
+    }
+    else
+    {
+      anchorTex = in.texcoord;
+    }
   }
 
   // Parallel projection (OpenGL in_projectionDirection parity): cast parallel
@@ -5315,7 +5567,8 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
     texture2d<float> transferFunctionTexture2 [[texture(13)]],
     texture2d<float> transferFunctionTexture3 [[texture(14)]],
     constant packed_float3* rectCoords [[buffer(5)]],
-    constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
+    constant VolumeLightUniforms& volumeLights [[buffer(4)]],
+    constant float* triAnchor [[buffer(3)]]) {
 
   VolumeSelectionOut output;
   output.color = float4(0.0);
@@ -5343,7 +5596,20 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
     // per-vertex float result. Use the interpolated per-vertex texcoord so the
     // ray anchor is bit-identical to GL (a fragment-time affine of the
     // interpolated data position only reproduced the systematic shift).
-    anchorTex = in.texcoord;
+    // TEMP DEBUG (analytic-anchor experiment): when analyticAnchorMode is set,
+    // bypass the interpolator and reconstruct the per-fragment texcoord from
+    // pixel-center barycentrics + per-vertex clip/texcoord (buffer 3).
+    if (volumeUniforms.analyticAnchorMode > 0.5)
+    {
+      if (!analyticAnchorTexcoord(in.position.xy, in.texcoord, volumeUniforms, triAnchor, primId, anchorTex))
+      {
+        anchorTex = in.texcoord;
+      }
+    }
+    else
+    {
+      anchorTex = in.texcoord;
+    }
   }
 
   bool parallel = volumeUniforms.useParallelProjection > 0.5;
@@ -5515,6 +5781,7 @@ fragment VolumeSelectionOut fragment_volume_fullscreen_selection_main(
 // (proxy-geometry) path.
 fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
     VolumeVertexOut in [[stage_in]],
+    uint primId [[primitive_id]],
     constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
     constant PerBlockData& b [[buffer(2)]],
     texture3d<float> volumeTexture [[texture(0)]],
@@ -5532,7 +5799,8 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
     texture2d<float> transferFunctionTexture2 [[texture(13)]],
     texture2d<float> transferFunctionTexture3 [[texture(14)]],
     constant packed_float3* rectCoords [[buffer(5)]],
-    constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
+    constant VolumeLightUniforms& volumeLights [[buffer(4)]],
+    constant float* triAnchor [[buffer(3)]]) {
 
   VolumeFragmentOutRTT output;
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
@@ -5558,7 +5826,20 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
     // per-vertex float result. Use the interpolated per-vertex texcoord so the
     // ray anchor is bit-identical to GL (a fragment-time affine of the
     // interpolated data position only reproduced the systematic shift).
-    anchorTex = in.texcoord;
+    // TEMP DEBUG (analytic-anchor experiment): when analyticAnchorMode is set,
+    // bypass the interpolator and reconstruct the per-fragment texcoord from
+    // pixel-center barycentrics + per-vertex clip/texcoord (buffer 3).
+    if (volumeUniforms.analyticAnchorMode > 0.5)
+    {
+      if (!analyticAnchorTexcoord(in.position.xy, in.texcoord, volumeUniforms, triAnchor, primId, anchorTex))
+      {
+        anchorTex = in.texcoord;
+      }
+    }
+    else
+    {
+      anchorTex = in.texcoord;
+    }
   }
 
   bool parallel = volumeUniforms.useParallelProjection > 0.5;

@@ -221,6 +221,7 @@ private:
   int IndexCount = 0;
   void* RectCoordsBuffer = nullptr;     // id<MTLBuffer> — float3 per index, rectilinear coord curves
   void* DummyRectCoordsBuffer = nullptr; // id<MTLBuffer> — zeroed fallback for non-rectilinear inputs
+  void* TriangleAnchorBuffer = nullptr; // id<MTLBuffer> — TEMP DEBUG analytic-anchor experiment: per-primitive (clip 4 + texcoord 3) floats x 3 verts, indexed by primitive_id (fragment buffer 3)
 
   // Volume state
   double ModelBounds[6] = { 0.0, 1.0, 0.0, 1.0, 0.0, 1.0 };
@@ -430,6 +431,10 @@ private:
   // needed — the fullscreen vertex shader generates positions internally.
   void DrawBlocksFullscreen(void* encoder, void* uniformBuf, vtkRenderer* ren, vtkVolume* vol,
     void* uniforms, vtkMatrix4x4* invModelMatrix, bool useDirectPipeline);
+  // TEMP DEBUG (analytic-anchor experiment): builds TriangleAnchorBuffer
+  // (fragment buffer 3) from the current vertex/index buffers with strict
+  // fma clip/texcoord parity with the vertex shader.
+  void BuildTriangleAnchorBuffer(void* device, const VolumeMapperUniforms* uniforms);
 
   // Build PerBlockData from global uniforms for single-block volumes.
   static void BuildPerBlockData(PerBlockData& pbd, const VolumeMapperUniforms* uniforms);

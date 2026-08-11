@@ -14,6 +14,7 @@
 #include "vtkObjectFactory.h"
 #include <iostream>
 #include <iomanip>
+#include <cmath>
 #include "vtkOverrideAttribute.h"
 #include "vtkPiecewiseFunction.h"
 #include "vtkPointData.h"
@@ -305,10 +306,17 @@ struct VolumeMapperUniforms
   // removing the interpolated-anchor dependence that drifted evalStep from
   // g_dirStep by ~3e-8/step.
   float InversePVM[16];             // 1904..1967 (total 1968, 16-byte aligned)
+  // TEMP DEBUG (analytic-anchor experiment): when > 0.5 the camera-inside
+  // proxy fragment shader bypasses the interpolated in.texcoord anchor and
+  // reconstructs the per-fragment texcoord from pixel-center barycentrics +
+  // per-vertex clip/texcoord (TriangleAnchorBuffer at fragment buffer 3).
+  // 1 = float32 weights, 2 = float64 weights (update 76 sect 4 A/B).
+  float AnalyticAnchorMode;         // 1968..1971
+  float _padAnalyticAnchor[3];      // 1972..1983 (total 1984, 16-byte aligned)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1968,
-  "VolumeMapperUniforms must be 1968 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1984,
+  "VolumeMapperUniforms must be 1984 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -342,6 +350,7 @@ static_assert(offsetof(VolumeMapperUniforms, CameraInsideNearPlaneNormal) == 169
 static_assert(offsetof(VolumeMapperUniforms, ProjectionMatrix) == 1712, "");
 static_assert(offsetof(VolumeMapperUniforms, ModelViewMatrix) == 1776, "");
 static_assert(offsetof(VolumeMapperUniforms, InversePVM) == 1904, "");
+static_assert(offsetof(VolumeMapperUniforms, AnalyticAnchorMode) == 1968, "");
 
 // Per-light data for volume shading — must match Metal VolumeLight struct
 // Must match Metal VolumeLight (6 x float4 = 96 bytes per light)
@@ -2564,6 +2573,7 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   ReleaseMetalObject(this->IndexBuffer);
   ReleaseMetalObject(this->RectCoordsBuffer);
   ReleaseMetalObject(this->DummyRectCoordsBuffer);
+  ReleaseMetalObject(this->TriangleAnchorBuffer);
 }
 
 //------------------------------------------------------------------------------
@@ -6154,6 +6164,15 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
                            : (__bridge id<MTLBuffer>)this->DummyRectCoordsBuffer;
   [encoder setFragmentBuffer:rectCoordsBuf offset:0 atIndex:5];
 
+  // TEMP DEBUG (analytic-anchor experiment): per-primitive clip/texcoord data
+  // for the camera-inside proxy anchor reconstruction (fragment buffer 3).
+  // Zeroed dummy when the analytic path is disabled so the pointer is always
+  // valid; the shader only dereferences it when analyticAnchorMode is set.
+  id<MTLBuffer> triAnchorBuf =
+    this->TriangleAnchorBuffer ? (__bridge id<MTLBuffer>)this->TriangleAnchorBuffer
+                               : (__bridge id<MTLBuffer>)this->DummyRectCoordsBuffer;
+  [encoder setFragmentBuffer:triAnchorBuf offset:0 atIndex:3];
+
   SetFragmentTextureOrFallback(encoder, 0, this->VolumeTexture, this->DummyVolumeTexture);
   [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->ColorOpacityTexture atIndex:1];
   SetFragmentTextureOrFallback(encoder, 2, this->DepthTextureOcclusion, this->DummyDepthTexture);
@@ -6381,6 +6400,137 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
     useDirectPipeline, &pbd, MTLCullModeBack);
 
   [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+}
+
+// TEMP DEBUG (analytic-anchor experiment): build the per-primitive anchor buffer
+// the camera-inside proxy fragment shaders consume at fragment buffer 3 when
+// analyticAnchorMode is set. Replicates the vertex shader's clip/texcoord math
+// (strict [0,1,2,3] mul+add with fma contraction, see vertex_volume_main) so
+// the per-vertex clip.xyzw and cellToPoint-adjusted texcoord.xyz stored here are
+// bit-identical to the GPU's own per-vertex outputs. Layout: a float4 count
+// header (triangle count in .x) followed by per-triangle records of 3 * 7
+// floats (clip.xyzw, texcoord.xyz per vertex), indexed by primitive_id.
+void vtkMetalGPUVolumeRayCastMapper::BuildTriangleAnchorBuffer(
+  void* deviceVoid, const VolumeMapperUniforms* uniforms)
+{
+  id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
+  ReleaseMetalObject(this->TriangleAnchorBuffer);
+  if (!this->VertexBuffer || !this->IndexBuffer || this->IndexCount <= 0)
+  {
+    return;
+  }
+  const uint32_t* idx = static_cast<const uint32_t*>(
+    [(__bridge id<MTLBuffer>)this->IndexBuffer contents]);
+  const float* verts = static_cast<const float*>(
+    [(__bridge id<MTLBuffer>)this->VertexBuffer contents]);
+  const int triCount = this->IndexCount / 3;
+  if (triCount <= 0)
+  {
+    return;
+  }
+
+  // mvp = (P*V)*W with the same strict fma order as matrixMulStrict in the
+  // vertex shader (column-major, (A*B)[c][r] = A[0][r]*B[c][0] then fma).
+  const float* P = uniforms->ProjectionMatrix;
+  const float* V = uniforms->ModelViewMatrix;
+  const float* W = uniforms->VolumeToWorldMatrix;
+  float PV[16];
+  for (int c = 0; c < 4; ++c)
+  {
+    for (int r = 0; r < 4; ++r)
+    {
+      float t = P[r] * V[c * 4 + 0];
+      t = std::fma(P[4 + r], V[c * 4 + 1], t);
+      t = std::fma(P[8 + r], V[c * 4 + 2], t);
+      t = std::fma(P[12 + r], V[c * 4 + 3], t);
+      PV[c * 4 + r] = t;
+    }
+  }
+  float mvp[16];
+  for (int c = 0; c < 4; ++c)
+  {
+    for (int r = 0; r < 4; ++r)
+    {
+      float t = PV[r] * W[c * 4 + 0];
+      t = std::fma(PV[4 + r], W[c * 4 + 1], t);
+      t = std::fma(PV[8 + r], W[c * 4 + 2], t);
+      t = std::fma(PV[12 + r], W[c * 4 + 3], t);
+      mvp[c * 4 + r] = t;
+    }
+  }
+
+  const size_t headerFloats = 4;
+  const size_t perTriFloats = 3 * 7;
+  const size_t bytes = (headerFloats + (size_t)triCount * perTriFloats) * sizeof(float);
+  id<MTLBuffer> buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+  if (!buf)
+  {
+    vtkErrorMacro("Failed to create triangle anchor buffer");
+    return;
+  }
+  AssignMetalObject(this->TriangleAnchorBuffer, buf);
+
+  float* dst = static_cast<float*>([buf contents]);
+  dst[0] = static_cast<float>(triCount);
+  dst[1] = dst[2] = dst[3] = 0.0f;
+  dst += headerFloats;
+
+  const float* vtt = uniforms->VolumeToTextureMatrix;
+  const float* ctpScale = uniforms->CellToPointScale;
+  const float* ctpOffset = uniforms->CellToPointOffset;
+
+  for (int t = 0; t < triCount; ++t)
+  {
+    for (int k = 0; k < 3; ++k)
+    {
+      const uint32_t vi = idx[t * 3 + k];
+      const float* mp = verts + (size_t)vi * 3;
+      const float v[4] = { mp[0], mp[1], mp[2], 1.0f };
+      // clip = strict mat4*vec4 (first term mul, middle fma, last mul+add).
+      float clip[4];
+      for (int r = 0; r < 4; ++r)
+      {
+        float acc = mvp[0 * 4 + r] * v[0];
+        acc = std::fma(mvp[1 * 4 + r], v[1], acc);
+        acc = std::fma(mvp[2 * 4 + r], v[2], acc);
+        acc = acc + mvp[3 * 4 + r] * v[3];
+        clip[r] = acc;
+      }
+      // uvx = strict dot on volumeToTexture (same contraction as the shader).
+      float uvx[3];
+      for (int r = 0; r < 3; ++r)
+      {
+        float au = vtt[0 * 4 + r] * v[0];
+        au = std::fma(vtt[1 * 4 + r], v[1], au);
+        au = std::fma(vtt[2 * 4 + r], v[2], au);
+        au = au + vtt[3 * 4 + r] * v[3];
+        uvx[r] = au;
+      }
+      // texcoord = cellToPointScale * uvx + cellToPointOffset, separate mul and
+      // add (the shader compiles with contract off).
+      for (int r = 0; r < 4; ++r) { *dst++ = clip[r]; }
+      for (int r = 0; r < 3; ++r)
+      {
+        *dst++ = ctpScale[r] * uvx[r] + ctpOffset[r];
+      }
+      if (getenv("VTK_METAL_ANCHOR_REC_DUMP") != nullptr && vi < 96)
+      {
+        static FILE* recFp = nullptr;
+        if (recFp == nullptr)
+        {
+          const char* p = getenv("VTK_METAL_ANCHOR_REC_DUMP");
+          recFp = fopen(p, "w");
+        }
+        if (recFp)
+        {
+          fprintf(recFp, "ANCHOR_REC vi=%u modelPos=(%.9g, %.9g, %.9g) clip=(%.9g, %.9g, %.9g, %.9g) texcoord=(%.9g, %.9g, %.9g)\n",
+            vi, mp[0], mp[1], mp[2], clip[0], clip[1], clip[2], clip[3],
+            ctpScale[0] * uvx[0] + ctpOffset[0], ctpScale[1] * uvx[1] + ctpOffset[1],
+            ctpScale[2] * uvx[2] + ctpOffset[2]);
+        }
+      }
+    }
+  }
 }
 
 //------------------------------------------------------------------------------
@@ -7551,6 +7701,25 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   uniforms.RectCoordsBias[1] = this->RectCoordsBias[1];
   uniforms.RectCoordsBias[2] = this->RectCoordsBias[2];
   uniforms.RectCoordsBias[3] = 0.0f;
+
+  // TEMP DEBUG (analytic-anchor experiment): bypass the rasterizer's
+  // interpolated in.texcoord for the camera-inside proxy anchor and
+  // reconstruct the per-fragment texcoord from pixel-center barycentrics +
+  // per-vertex clip/texcoord (TriangleAnchorBuffer at fragment buffer 3).
+  // VTK_METAL_ANALYTIC_ANCHOR: unset/0 = off, 1 = float32 weights,
+  // 2 = float64 weights (update 76 sect 4 A/B). Requires the camera-inside
+  // proxy mesh (useCameraInsideNearClip set).
+  {
+    const char* env = getenv("VTK_METAL_ANALYTIC_ANCHOR");
+    float mode = (env != nullptr) ? static_cast<float>(atof(env)) : 0.0f;
+    if (mode < 0.0f) { mode = 0.0f; }
+    if (mode > 2.0f) { mode = 2.0f; }
+    uniforms.AnalyticAnchorMode = mode;
+    if (mode > 0.5f)
+    {
+      this->BuildTriangleAnchorBuffer((__bridge void*)device, &uniforms);
+    }
+  }
 
   // Wait for the uniform buffer slot for this frame to be free
   dispatch_semaphore_wait((dispatch_semaphore_t)this->FrameSemaphore, DISPATCH_TIME_FOREVER);
