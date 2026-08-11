@@ -6,6 +6,47 @@
 
 ---
 
+## Baseline results (commit `8bb5c370b6`, 2026-08-11)
+
+Full pixel-diff suite via `BackendComparisonTools/run_pixel_diff_suite.sh` (both backends, 512², checkerboard dummy baseline so the `-V` regression always fails and dumps; frame-aligned captures via `VTK_STEP_RAW_CAPTURE`). Metrics: `diff` px = any-channel \|Δ\|≥1, `\|Δ\|≥2` = max-channel ≥2, `\|Δ\|≥5` = max-channel ≥5, `max_d` = max channel delta.
+
+| test / config | diff px | \|Δ\|≥2 | \|Δ\|≥5 | max_d |
+|---|---|---|---|---|
+| Reference (jitter on) | 178 | 14 | 1 | 8 |
+| NoJitter (acceptance test) | 178 | 14 | 1 | 8 |
+| StepTF (no env, no wheel) | 0 | 0 | 0 | 0 |
+| CamOutside | 1509 | 191 | 31 | 8 |
+| CamOutsideFixedStep | 1509 | 191 | 31 | 8 |
+| CamOutsideNoJitter | 1509 | 191 | 31 | 8 |
+| FineStep | 178 | 14 | 1 | 8 |
+| FlatTF | 0 | 0 | 0 | 0 |
+| Linear | 343 | 0 | 0 | 1 |
+| MaxIP | 6 | 6 | 4 | 14 |
+| Nearest | 178 | 14 | 1 | 8 |
+| NearPlaneTiny | 178 | 14 | 1 | 8 |
+| StepTF m0 (both-step) | 0 | 0 | 0 | 0 |
+| StepTF m1 (color-step) | 0 | 0 | 0 | 0 |
+| StepTF m2 (opacity-step) | 5 | 0 | 0 | 1 |
+| StepTF m3a (ramp 0.005) | 6 | 0 | 0 | 1 |
+| StepTF m3b (ramp 0.02) | 16 | 0 | 0 | 1 |
+| StepTF m3c (ramp 0.1) | 42 | 0 | 0 | 1 |
+| StepTF m4 (color-ramp) | 1 | 0 | 0 | 1 |
+| StepTF m5 (win-ramp) | 181 | 0 | 0 | 1 |
+| StepTF B (constant-scalar) | 3 | 0 | 0 | 1 |
+| StepTF D256 | 25 | 0 | 0 | 1 |
+| StepTF D64 (raw 64³) | 19 | 0 | 0 | 1 |
+| StepTF E (axis camera) | 16 | 0 | 0 | 1 |
+| StepTF m0+linear | 0 | 0 | 0 | 0 |
+| StepTF m2+linear | 5 | 0 | 0 | 1 |
+
+Notes:
+- The acceptance test (NoJitter) and the reference reproduce the documented **178 px / max Δ 8** exactly; all runs deterministic.
+- The `\|Δ\|≥5` column is 1 for most residual cases (the single known knife-edge worst pair) except CamOutside\* (31) and MaxIP (4, max_d 14).
+- Run twice per backend and compared byte-identical (`RUNS=2` determinism mode) for the NoJitter/FlatTF quick gate.
+- Reproduction: `WORK=/tmp/bc/pixdiff_base ./BackendComparisonTools/run_pixel_diff_suite.sh` (raw captures + `summary.txt` left in `$WORK`).
+
+---
+
 ## 1. What is bit-identical (proven closed)
 
 | Item | Evidence |
