@@ -6164,15 +6164,14 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
   }
   else if (pt == VolumePipelineType::RenderToImage)
   {
-    // Composite the volume over the cleared (white) RTT background, matching the
-    // OpenGL RenderToImage framebuffer setup.
-    pipelineDesc.colorAttachments[0].blendingEnabled = YES;
-    pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
-    pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    pipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
-    pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-    pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    pipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+    // The OpenGL RenderToImage pass is UNBLENDED: the raycast shader writes its
+    // raw (premultiplied) color over the cleared white RTT background, so no
+    // ONE/ONE_MINUS_SRC_ALPHA compositing happens on attachment 0 (see
+    // vtkOpenGLGPUVolumeRayCastMapper.cxx vtkglClearColor(1.0,1.0,1.0,0.0)).
+    // Blending here would inject (1-alpha)*255 into every RTT pixel and produce
+    // the contour-concentrated 47,878-px GL-vs-Metal residual on
+    // TestGPURayCastRenderToTexture (VolumeRayCastBackendComparisonFindingsUpdate84.md).
+    pipelineDesc.colorAttachments[0].blendingEnabled = NO;
     pipelineDesc.colorAttachments[1].blendingEnabled = NO;
   }
   else
