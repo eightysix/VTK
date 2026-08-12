@@ -8,6 +8,7 @@ set (VolumeCxxTests
   TestGPURayCastCameraInside.cxx
   TestGPURayCastCameraInsideClipping.cxx
   TestGPURayCastCameraInsideNonUniformScaleTransform.cxx
+  TestGPURayCastCameraInsideNonUniformScaleTransformKnobs.cxx
   TestGPURayCastCameraInsideSmallSpacing.cxx
   TestGPURayCastCameraInsideTransformation.cxx
   TestGPURayCastCameraInsideTransformationConstGradOp.cxx
