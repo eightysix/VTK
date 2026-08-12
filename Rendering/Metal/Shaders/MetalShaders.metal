@@ -3915,6 +3915,16 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
       all(abs(screenPos - float2(503.5, 379.5)) < 0.5) ||
       all(abs(screenPos - float2(435.5, 480.5)) < 0.5) ||
       all(abs(screenPos - float2(380.5, 504.5)) < 0.5);
+  // TEMP DEBUG: MaxIP (blend-mode 1) 6-px diff set at baseline commit 8bb5c370b6
+  // (camera inside, jitter off). All |d|>=1, max_d 14. Metal PNG row == Metal
+  // screenPos row (unflipped readback); GL dump row = 511 - png_y.
+  bool pxOkMaxIP =
+      all(abs(screenPos - float2(68.5, 229.5)) < 0.5) ||
+      all(abs(screenPos - float2(370.5, 266.5)) < 0.5) ||
+      all(abs(screenPos - float2(428.5, 270.5)) < 0.5) ||
+      all(abs(screenPos - float2(449.5, 374.5)) < 0.5) ||
+      all(abs(screenPos - float2(24.5, 392.5)) < 0.5) ||
+      all(abs(screenPos - float2(501.5, 480.5)) < 0.5);
   // TEMP DEBUG: update-69 B (constant-scalar) remaining 18 residual pixels.
   bool pxOkResid69 =
       all(abs(screenPos - float2(140.5, 6.5)) < 0.5) ||
@@ -3936,7 +3946,7 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
       all(abs(screenPos - float2(229.5, 425.5)) < 0.5) ||
       all(abs(screenPos - float2(174.5, 445.5)) < 0.5) ||
       all(abs(screenPos - float2(435.5, 480.5)) < 0.5);
-  return (camOk && pxOk) || (camOkClip && pxOkClip) || pxOkAny || pxOkContained || pxOkLeft ||
+  return (camOk && pxOk) || (camOkClip && pxOkClip) || pxOkAny || pxOkContained || pxOkLeft || pxOkMaxIP ||
          pxOkCamOut || pxOkResid || pxOkNoJitter || pxOkAlways || pxOkKnife || pxOkResid69 ||
          pxOkStepTF;
 }
@@ -4184,6 +4194,12 @@ inline float4 marchVolumeUnified(
   int avgBlendCount = 0;       // AverageIP: number of in-range samples
   float additiveSum = 0.0f;    // Additive: sum(opacity * scalar)
   bool firstBlendSample = true;
+#if defined(VTK_METAL_ENABLE_LOGGING)
+  // MIP knife-edge diagnosis: argmax eval-point + runner-up (test builds only).
+  float3 mipMaxPos = float3(0.0f);
+  float mip2Scalar = 0.0f;
+  float3 mip2Pos = float3(0.0f);
+#endif
 
   // Per-component accumulators for the independent multi-component path.
   // Only the active blend mode's arrays are touched.
@@ -4717,7 +4733,21 @@ inline float4 marchVolumeUnified(
       }
     } else if (fc_blendMode == 1) {           // MAXIMUM_INTENSITY_BLEND
       if (firstBlendSample || mipMaxScalar < scalarNorm) {
+#if defined(VTK_METAL_ENABLE_LOGGING)
+        mip2Scalar = mipMaxScalar;
+        mip2Pos = mipMaxPos;
+#endif
         mipMaxScalar = scalarNorm;
+#if defined(VTK_METAL_ENABLE_LOGGING)
+        mipMaxPos = evalPoint;
+#endif
+      } else {
+#if defined(VTK_METAL_ENABLE_LOGGING)
+        if (mip2Scalar < scalarNorm) {
+          mip2Scalar = scalarNorm;
+          mip2Pos = evalPoint;
+        }
+#endif
       }
       firstBlendSample = false;
     } else if (fc_blendMode == 2) {    // MINIMUM_INTENSITY_BLEND
@@ -5044,9 +5074,12 @@ inline float4 marchVolumeUnified(
     finalColor = float4(c.rgb * c.a, c.a);
 #if defined(VTK_METAL_ENABLE_LOGGING)
     if (p.screenPos.x > 0.0 && debugMarchGate(volumeUniforms.cameraVolumePos.xyz, p.screenPos)) {
-      os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG MIPFINAL px=(%d, %d) mip=%f c=(%f, %f, %f, %f) out=(%f, %f, %f)",
+      os_log_default.log_info("VTK_METAL_VOLUME_LOG DEBUG MIPFINAL px=(%d, %d) mip=%0.9g mipPos=(%0.9g, %0.9g, %0.9g) mip2=%0.9g mip2Pos=(%0.9g, %0.9g, %0.9g) c=(%0.9g, %0.9g, %0.9g, %0.9g) out=(%0.9g, %0.9g, %0.9g)",
           int(p.screenPos.x), int(p.screenPos.y),
           float(mipMaxScalar),
+          float(mipMaxPos.x), float(mipMaxPos.y), float(mipMaxPos.z),
+          float(mip2Scalar),
+          float(mip2Pos.x), float(mip2Pos.y), float(mip2Pos.z),
           float(c.r), float(c.g), float(c.b), float(c.a),
           float(finalColor.r), float(finalColor.g), float(finalColor.b));
     }
