@@ -5662,22 +5662,26 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
           pOrigin[i] = -fplanes[16 + 3] * fplanes[16 + i];
         }
 
-        // Transform normal to volume coordinates using inverse transpose
-        // For transforming normals from world space to object space, we need
-        // the inverse transpose of the model matrix
+        // Transform origin point to volume coordinates using inverse matrix
         vtkNew<vtkMatrix4x4> worldToData;
         vtkMatrix4x4::Invert(dataToWorld, worldToData);
-
-        // Transform origin point to volume coordinates using inverse matrix
         worldToData->MultiplyPoint(pOrigin, pOrigin);
 
-        // Transform normal using transpose of inverse (i.e., inverse transpose)
-        double* invMat = worldToData->GetData();
+        // Transform the near-plane normal to volume coordinates using the
+        // TRANSPOSE of the model matrix (not the inverse transpose), exactly
+        // like vtkOpenGLGPUVolumeRayCastMapper::RenderVolumeGeometry. For
+        // x_world = M x_obj, the plane n_world . x_world = d becomes
+        // (M^T n_world) . x_obj = d, so n_obj = M^T n_world. The inverse
+        // transpose is the correct transform for the reverse (object-to-world)
+        // direction only and diverges under a non-uniform model scale.
+        double* dmat = dataToWorld->GetData();
+        dataToWorld->Transpose();
         double pNormalV[3];
-        pNormalV[0] = pNormal[0] * invMat[0] + pNormal[1] * invMat[1] + pNormal[2] * invMat[2];
-        pNormalV[1] = pNormal[0] * invMat[4] + pNormal[1] * invMat[5] + pNormal[2] * invMat[6];
-        pNormalV[2] = pNormal[0] * invMat[8] + pNormal[1] * invMat[9] + pNormal[2] * invMat[10];
+        pNormalV[0] = pNormal[0] * dmat[0] + pNormal[1] * dmat[1] + pNormal[2] * dmat[2];
+        pNormalV[1] = pNormal[0] * dmat[4] + pNormal[1] * dmat[5] + pNormal[2] * dmat[6];
+        pNormalV[2] = pNormal[0] * dmat[8] + pNormal[1] * dmat[9] + pNormal[2] * dmat[10];
         vtkMath::Normalize(pNormalV);
+        dataToWorld->Transpose();
 
         // Apply offset to prevent hardware near-plane clipping
         double offset = (cam->GetClippingRange()[1] - cam->GetClippingRange()[0]) * 0.001;
@@ -7086,16 +7090,21 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       pOrigin[i] = -fplanes[16 + 3] * fplanes[16 + i];
     }
 
-    // Transform origin to model (data) space and the normal via the transpose of
-    // the inverse model matrix (same convention as the clipped-proxy geometry
-    // build in SetupBuffers, so the uniform clamp and the proxy-path clip agree).
+    // Transform origin to model (data) space via the inverse model matrix, and
+    // the normal via the TRANSPOSE of the model matrix (same convention as the
+    // clipped-proxy geometry build in SetupBuffers and OpenGL's
+    // RenderVolumeGeometry: for x_world = M x_obj, n_obj = M^T n_world; the
+    // inverse transpose is the reverse-direction transform and diverges under
+    // a non-uniform model scale).
     invModelMatrix->MultiplyPoint(pOrigin, pOrigin);
-    const double* invMat = invModelMatrix->GetData();
+    double* dmat = modelMatrix->GetData();
+    modelMatrix->Transpose();
     double pNormalV[3];
-    pNormalV[0] = pNormal[0] * invMat[0] + pNormal[1] * invMat[1] + pNormal[2] * invMat[2];
-    pNormalV[1] = pNormal[0] * invMat[4] + pNormal[1] * invMat[5] + pNormal[2] * invMat[6];
-    pNormalV[2] = pNormal[0] * invMat[8] + pNormal[1] * invMat[9] + pNormal[2] * invMat[10];
+    pNormalV[0] = pNormal[0] * dmat[0] + pNormal[1] * dmat[1] + pNormal[2] * dmat[2];
+    pNormalV[1] = pNormal[0] * dmat[4] + pNormal[1] * dmat[5] + pNormal[2] * dmat[6];
+    pNormalV[2] = pNormal[0] * dmat[8] + pNormal[1] * dmat[9] + pNormal[2] * dmat[10];
     vtkMath::Normalize(pNormalV);
+    modelMatrix->Transpose();
 
     // Precision offset identical to OpenGL's (and SetupBuffers'): a fraction of
     // the near-far distance, floored for very small volumes to avoid hardware
