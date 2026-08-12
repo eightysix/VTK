@@ -143,13 +143,30 @@ front-buffer capture, same explicit camera on both backends
 (`VTK_NUS_RAW_CAPTURE`; this bypasses the W2IF float32 camera perturbation, so
 the two frames are the exact same camera):
 
-| config | IGN (pre-fix, HEAD) | blue-noise + flip (post-fix) |
-|---|---|---|
-| default (jitter on, all knobs on) | 45,840 px / max_d 139 | **29 px / max_d 13** |
-| `VTK_NUS_POKE=0` (no poke matrix) | 33 px / max_d 94 | **0 px** (bit-identical) |
-| `VTK_NUS_JITTER=0` (jitter off) | — | 31 px / max_d 49 |
-| `VTK_NUS_SHADE=0` | — | 12 px / max_d 1 |
-| `VTK_NUS_GRADOP=0` | — | 8 px / max_d 19 |
+| config | IGN (pre-fix, HEAD) | blue-noise + flip (post-fix) | IGN delta contribution |
+|---|---|---|---|
+| default (jitter on, all knobs on) | 45,840 px / max_d 139 | **29 px / max_d 13** | 45,811 px (99.94 %) |
+| `VTK_NUS_POKE=0` (no poke matrix) | 33 px / max_d 94 | **0 px** (bit-identical) | 33 px |
+| `VTK_NUS_JITTER=0` (jitter off) | 31 px / max_d 49 | 31 px / max_d 49 | 0 px |
+| `VTK_NUS_SHADE=0` | 41,553 px / max_d 150 | 12 px / max_d 1 | 41,541 px |
+| `VTK_NUS_GRADOP=0` | 43,782 px / max_d 197 | 8 px / max_d 19 | 43,774 px |
+| `VTK_NUS_POKE=0` + `VTK_NUS_JITTER=0` | 0 px | 0 px | 0 px |
+| `VTK_NUS_POKE=0` + `VTK_NUS_SHADE=0` | 31 px / max_d 51 | 0 px | 31 px |
+| `VTK_NUS_POKE=0` + `VTK_NUS_GRADOP=0` | 33 px / max_d 136 | 0 px | 33 px |
+
+**IGN delta contribution = pre-fix − post-fix px**: the number of the pre-fix
+diff pixels that were *caused by the IGN noise-field mismatch* (each backend
+marched a lattice with a different per-pixel phase), as opposed to the
+interpolator floor that both noise implementations share. On the reference
+config the IGN mismatch contributed **45,811 of 45,840 px (99.94 %)** of the
+pre-fix diff — only 29 px (0.06 %) survive the noise fix, i.e. the floor.
+
+The contribution vanishes exactly when jitter is off (`nojitter`: 0 px, both
+variants bit-identical on the same pixels) and when there is nothing to be
+flipped by a phase shift (`nopoke`+`nojitter` under IGN: already 0 px). With
+jitter on, IGN contributes ~33 px (no-poke configs) to ~46 k px (poke configs);
+the poke-transform geometry spreads each noise-driven lattice-phase shift into
+far more knife-edge texel-pick flips.
 
 Key points:
 

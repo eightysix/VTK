@@ -107,13 +107,13 @@ The Metal shader's jitter used **Interleaved Gradient Noise (IGN)** while GL sam
 - **Fix:** `MetalShaders.metal` now embeds the exact 64² luminance tile in the JPEG's top-down orientation (`kBlueNoise64[4096]`, PIL/libjpeg byte order, verified equal to PIL's decode) and samples `kBlueNoise64[(floor(st.y) − H) mod 64][floor(st.x) mod 64]` in all three jitter call sites (fullscreen, RTT, grid-traversal — the last also dropped its old `+0.5` half-pixel shift). The flip formula is verified numerically to equal GL's `texture2D(in_noiseSampler, gl_FragCoord.xy/64)` at **every pixel for every viewport height** (262144/262144 @512, 4225/4225 @65, 576/576 @24, …).
 - **A/B on `TestGPURayCastCameraInsideNonUniformScaleTransformKnobs` (300², raw capture, frame-aligned):**
 
-  | config | IGN (pre-fix) | blue-noise+flip (post-fix) |
-  |---|---|---|
-  | default (jitter on) | 45,840 px / max_d 139 | **29 px / max_d 13** |
-  | VTK_NUS_POKE=0 (no poke matrix) | 33 px / max_d 94 | **0 px** (bit-identical) |
-  | VTK_NUS_JITTER=0 | — | 31 px / max_d 49 |
+  | config | IGN (pre-fix) | blue-noise+flip (post-fix) | IGN delta contribution |
+  |---|---|---|---|
+  | default (jitter on) | 45,840 px / max_d 139 | **29 px / max_d 13** | **45,811 px (99.94 %)** |
+  | VTK_NUS_POKE=0 (no poke matrix) | 33 px / max_d 94 | **0 px** (bit-identical) | 33 px |
+  | VTK_NUS_JITTER=0 | 31 px / max_d 49 | 31 px / max_d 49 | 0 px |
 
-  `nopoke → 0 px` proves that with the poke matrix removed, the whole jittered pipeline is now bit-identical — the 29-px poke residual is the same interpolator floor as the 512² reference, not noise.
+  `nopoke → 0 px` proves that with the poke matrix removed, the whole jittered pipeline is now bit-identical — the 29-px poke residual is the same interpolator floor as the 512² reference, not noise. The **IGN delta contribution** (pre-fix − post-fix px = the pixels that were caused purely by the IGN noise mismatch) is **99.94 % of the pre-fix diff** (45,811/45,840) on the reference config; only 0.06 % (29 px) is the shared interpolator floor, and the contribution is 0 px with jitter off.
 - **Framing correction:** the recap's "Reference (jitter on)" label applies to no test in the family (the only jittered test is the 300² non-uniform one); the 512² reference and NoJitter rows are both jitter-off, which is why update 83 leaves them at exactly 178/178/0.
 
 ## 5. Methodology debt / landmines (do not repeat)
