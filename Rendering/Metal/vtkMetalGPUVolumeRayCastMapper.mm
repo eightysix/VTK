@@ -312,7 +312,13 @@ struct VolumeMapperUniforms
   // per-vertex clip/texcoord (TriangleAnchorBuffer at fragment buffer 3).
   // 1 = float32 weights, 2 = float64 weights (update 76 sect 4 A/B).
   float AnalyticAnchorMode;         // 1968..1971
-  float _padAnalyticAnchor[3];      // 1972..1983 (total 1984, 16-byte aligned)
+  // OpenGL proxy-box parity: the camera-OUTSIDE proxy box is uploaded in
+  // dataset (model) space like GL's densified BBoxPolyData (unit-cube scaling
+  // in the vertex shader rounds the centroid vertices ~1 ulp off GL's double
+  // centroids, which kept the interpolated anchor ~1 ulp off). When set, the
+  // vertex shader forwards in.position unchanged (modelPos = in.position).
+  float UseDataSpaceBoxVertices;    // 1972..1975
+  float _padAnalyticAnchor[2];      // 1976..1983 (total 1984, 16-byte aligned)
 };
 
 static_assert(sizeof(VolumeMapperUniforms) == 1984,
@@ -351,6 +357,7 @@ static_assert(offsetof(VolumeMapperUniforms, ProjectionMatrix) == 1712, "");
 static_assert(offsetof(VolumeMapperUniforms, ModelViewMatrix) == 1776, "");
 static_assert(offsetof(VolumeMapperUniforms, InversePVM) == 1904, "");
 static_assert(offsetof(VolumeMapperUniforms, AnalyticAnchorMode) == 1968, "");
+static_assert(offsetof(VolumeMapperUniforms, UseDataSpaceBoxVertices) == 1972, "");
 
 // Per-light data for volume shading — must match Metal VolumeLight struct
 // Must match Metal VolumeLight (6 x float4 = 96 bytes per light)
@@ -5437,28 +5444,110 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
 
     if (needsVertexRebuild)
     {
-      // Camera outside: simple 8-vertex box (original fast path)
+      // Camera outside: densified proxy box (OpenGL parity)
       // Camera inside: clip against near plane, densify, triangulate
       if (!cameraInside)
       {
-        float vertices[24];
-        unsigned int indices[36];
+        // Camera outside: densified proxy box (OpenGL parity). GL renders the
+        // 8-corner box through vtkDensifyPolyData(2) (centroid fan, 108
+        // triangles) even when the camera is outside (see
+        // vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::RenderVolumeGeometry).
+        // The coarse 12-triangle box rounds the rasterizer's interpolated
+        // anchor up to ~28 ulps off GL's. Replicate GL's exact densified
+        // geometry (same corner order, triangle set/winding, double centroids
+        // cast to float32) so the interpolated in.texcoord matches GL's
+        // ip_textureCoords. Vertices are uploaded in dataset (model) space —
+        // GL feeds BBoxPolyData positions straight to in_vertexPos — and the
+        // vertex shader forwards them via UseDataSpaceBoxVertices.
+        vtkNew<vtkPolyData> boxSource;
+        {
+          vtkNew<vtkCellArray> cells;
+          vtkNew<vtkPoints> points;
+          points->SetDataTypeToDouble();
+          // GL's DataGeometry corner order {000,100,010,110,001,101,011,111}
+          // in model space (identical to the camera-inside boxSource corners).
+          double corners[24] = {
+            this->ModelBounds[0], this->ModelBounds[2], this->ModelBounds[4],
+            this->ModelBounds[1], this->ModelBounds[2], this->ModelBounds[4],
+            this->ModelBounds[0], this->ModelBounds[3], this->ModelBounds[4],
+            this->ModelBounds[1], this->ModelBounds[3], this->ModelBounds[4],
+            this->ModelBounds[0], this->ModelBounds[2], this->ModelBounds[5],
+            this->ModelBounds[1], this->ModelBounds[2], this->ModelBounds[5],
+            this->ModelBounds[0], this->ModelBounds[3], this->ModelBounds[5],
+            this->ModelBounds[1], this->ModelBounds[3], this->ModelBounds[5],
+          };
+          for (int i = 0; i < 8; ++i)
+          {
+            points->InsertNextPoint(corners + i * 3);
+          }
+          // 6 faces 12 triangles (GL's tris with GL's 0-2-1 winding swap)
+          int tris[36] = {
+            0, 1, 2,
+            1, 3, 2,
+            1, 5, 3,
+            5, 7, 3,
+            5, 4, 7,
+            4, 6, 7,
+            4, 0, 6,
+            0, 2, 6,
+            2, 3, 6,
+            3, 7, 6,
+            0, 4, 1,
+            1, 4, 5
+          };
+          for (int i = 0; i < 12; ++i)
+          {
+            cells->InsertNextCell(3);
+            cells->InsertCellPoint(tris[i * 3]);
+            cells->InsertCellPoint(tris[i * 3 + 2]);
+            cells->InsertCellPoint(tris[i * 3 + 1]);
+          }
+          boxSource->SetPoints(points);
+          boxSource->SetPolys(cells);
+        }
 
-        // Unit cube [0,1] — the vertex shader scales to each block's model-space bounds.
-        float unitVerts[] = {
-          0,0,0, 1,0,0, 1,1,0, 0,1,0,
-          0,0,1, 1,0,1, 1,1,1, 0,1,1
-        };
-        memcpy(vertices, unitVerts, sizeof(unitVerts));
+        vtkNew<vtkDensifyPolyData> densifyPolyData;
+        densifyPolyData->SetInputData(boxSource);
+        densifyPolyData->SetNumberOfSubdivisions(2);
+        densifyPolyData->Update();
 
-        indices[0] = 0;  indices[1] = 2;  indices[2] = 1;  indices[3] = 0;  indices[4] = 3;  indices[5] = 2;
-        indices[6] = 4;  indices[7] = 5;  indices[8] = 6;  indices[9] = 4;  indices[10] = 6; indices[11] = 7;
-        indices[12] = 0; indices[13] = 7; indices[14] = 3; indices[15] = 0; indices[16] = 4; indices[17] = 7;
-        indices[18] = 1; indices[19] = 2; indices[20] = 6; indices[21] = 1; indices[22] = 6; indices[23] = 5;
-        indices[24] = 3; indices[25] = 6; indices[26] = 2; indices[27] = 3; indices[28] = 7; indices[29] = 6;
-        indices[30] = 0; indices[31] = 1; indices[32] = 5; indices[33] = 0; indices[34] = 5; indices[35] = 4;
+        vtkPolyData* finalPolyData = densifyPolyData->GetOutput();
+        vtkPoints* points = finalPolyData->GetPoints();
+        vtkCellArray* polys = finalPolyData->GetPolys();
 
-        this->IndexCount = sizeof(indices) / sizeof(unsigned int);
+        // OpenGL parity: GL uploads the densified double points as float32
+        // (in_vertexPos). Mirror the exact float32 values here.
+        std::vector<float> vertices;
+        vertices.reserve(points->GetNumberOfPoints() * 3);
+        for (vtkIdType i = 0; i < points->GetNumberOfPoints(); ++i)
+        {
+          double pt[3];
+          points->GetPoint(i, pt);
+          vertices.push_back(static_cast<float>(pt[0]));
+          vertices.push_back(static_cast<float>(pt[1]));
+          vertices.push_back(static_cast<float>(pt[2]));
+        }
+
+        // All densified cells are triangles; emit their 3 vertex ids in order.
+        std::vector<unsigned int> indices;
+        vtkIdType npts;
+        const vtkIdType* pts;
+        polys->InitTraversal();
+        while (polys->GetNextCell(npts, pts))
+        {
+          if (npts < 3) continue;
+          indices.push_back(static_cast<unsigned int>(pts[0]));
+          indices.push_back(static_cast<unsigned int>(pts[1]));
+          indices.push_back(static_cast<unsigned int>(pts[2]));
+        }
+
+        if (indices.empty())
+        {
+          vtkErrorMacro("Densified proxy box produced no triangles");
+          return false;
+        }
+
+        this->IndexCount = static_cast<int>(indices.size());
 
         // Release old buffers
         if (this->VertexBuffer)
@@ -5471,8 +5560,8 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         }
 
         {
-          id<MTLBuffer> vbuf = [device newBufferWithBytes:vertices
-                                                  length:sizeof(vertices)
+          id<MTLBuffer> vbuf = [device newBufferWithBytes:vertices.data()
+                                                  length:vertices.size() * sizeof(float)
                                                  options:MTLResourceStorageModeShared];
           if (!vbuf)
           {
@@ -5483,8 +5572,8 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         }
 
         {
-          id<MTLBuffer> ibuf = [device newBufferWithBytes:indices
-                                                  length:sizeof(indices)
+          id<MTLBuffer> ibuf = [device newBufferWithBytes:indices.data()
+                                                  length:indices.size() * sizeof(unsigned int)
                                                  options:MTLResourceStorageModeShared];
           if (!ibuf)
           {
@@ -6968,6 +7057,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // NormalizeToVolumeSpace, normal scaled by the per-axis bounds size) so the
   // per-ray intersection distance is directly comparable to the box t-range.
   uniforms.UseCameraInsideNearClip = this->IsCameraInside(ren, vol) ? 1.0f : 0.0f;
+  uniforms.UseDataSpaceBoxVertices =
+    (uniforms.UseCameraInsideNearClip > 0.5f) ? 0.0f : 1.0f;
   uniforms.CameraInsideNearPlaneOrigin[3] = 1.0f;
   uniforms.CameraInsideNearPlaneNormal[3] = 0.0f;
   if (uniforms.UseCameraInsideNearClip > 0.5f)

@@ -2894,7 +2894,11 @@ struct VolumeMapperUniforms {
   // per-vertex clip/texcoord (triangle anchor buffer at fragment buffer(3)).
   // 1 = float32 weights, 2 = float64 weights (update 76 sect 4 A/B).
   float analyticAnchorMode;
-  float _padAnchor[3];
+  // OpenGL proxy-box parity: the camera-OUTSIDE proxy box is uploaded in
+  // dataset (model) space (like the camera-inside cap), so the vertex shader
+  // forwards in.position unchanged instead of scaling the unit cube.
+  float useDataSpaceBoxVertices;
+  float _padAnchor[2];
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -3005,14 +3009,16 @@ vertex VolumeVertexOut vertex_volume_main(
     constant PerBlockData& b [[buffer(2)]]) {
   VolumeVertexOut out;
 
-  // Camera-inside (useCameraInsideNearClip set): the vertex buffer holds
+  // Camera-inside (useCameraInsideNearClip set) and the data-space camera-
+  // outside box (useDataSpaceBoxVertices set): the vertex buffer holds
   // data-space proxy positions (OpenGL parity: GL uploads the clipped/densified
   // geometry in dataset space and interpolates in_vertexPos directly), so the
   // rasterizer interpolates in data space and the interpolated anchor matches
-  // GL's ip_vertexPos to float32. Camera-outside keeps the unit-cube [0,1]
-  // convention, scaled to the block's model-space bounds.
+  // GL's ip_vertexPos to float32. (The unit-cube convention is retired; the
+  // camera-outside box is densified and uploaded in model space too.)
   float3 modelPos;
-  if (volumeUniforms.useCameraInsideNearClip > 0.5)
+  if (volumeUniforms.useCameraInsideNearClip > 0.5 ||
+      volumeUniforms.useDataSpaceBoxVertices > 0.5)
   {
     modelPos = in.position;
   }
@@ -3946,9 +3952,34 @@ inline bool debugMarchGate(float3 camera, float2 screenPos) {
       all(abs(screenPos - float2(229.5, 425.5)) < 0.5) ||
       all(abs(screenPos - float2(174.5, 445.5)) < 0.5) ||
       all(abs(screenPos - float2(435.5, 480.5)) < 0.5);
+  // TEMP DEBUG: CamOutside 1509-px baseline diff pixels (Metal PNG == Metal
+  // screenPos rows). Camera gated to the CamOutside test's volume-space eye
+  // (~0.06245, 0.06245, 0.4469) so the reference test does not fire.
+  // cameraVolumePos is normalized against the ORIGINAL (un-resampled) headsq
+  // bounds [0,201.6]x[0,201.6]x[0,138] in these tests, so the CamOutside
+  // W2IF-frame camera reads (0.506559, 0.506559, 2.482273) here, not the
+  // 512^3-bounds value (0.06245, 0.06245, 0.4469).
+  bool camOkCamOut = all(abs(dc - float3(0.506559, 0.506559, 2.482273)) < 2e-3);
+  bool pxOkCamOutDiff =
+      all(abs(screenPos - float2(307.5, 8.5)) < 0.5) ||
+      all(abs(screenPos - float2(17.5, 484.5)) < 0.5) ||
+      all(abs(screenPos - float2(307.5, 7.5)) < 0.5) ||
+      all(abs(screenPos - float2(135.5, 483.5)) < 0.5) ||
+      all(abs(screenPos - float2(373.5, 41.5)) < 0.5) ||
+      all(abs(screenPos - float2(496.5, 489.5)) < 0.5) ||
+      all(abs(screenPos - float2(195.5, 28.5)) < 0.5) ||
+      all(abs(screenPos - float2(496.5, 488.5)) < 0.5) ||
+      all(abs(screenPos - float2(188.5, 104.5)) < 0.5) ||
+      all(abs(screenPos - float2(461.5, 488.5)) < 0.5) ||
+      all(abs(screenPos - float2(167.5, 23.5)) < 0.5) ||
+      all(abs(screenPos - float2(461.5, 489.5)) < 0.5) ||
+      all(abs(screenPos - float2(104.5, 49.5)) < 0.5) ||
+      all(abs(screenPos - float2(464.5, 508.5)) < 0.5) ||
+      all(abs(screenPos - float2(126.5, 21.5)) < 0.5) ||
+      all(abs(screenPos - float2(501.5, 510.5)) < 0.5);
   return (camOk && pxOk) || (camOkClip && pxOkClip) || pxOkAny || pxOkContained || pxOkLeft || pxOkMaxIP ||
          pxOkCamOut || pxOkResid || pxOkNoJitter || pxOkAlways || pxOkKnife || pxOkResid69 ||
-         pxOkStepTF;
+         pxOkStepTF || (camOkCamOut && pxOkCamOutDiff);
 }
 
 // TEMP DEBUG: per-fragment-only gate for the MARCH/STEP dumps (NOT the
@@ -4075,15 +4106,21 @@ inline float4 marchVolumeUnified(
   float4 dbgNearP = float4(0.0, 0.0, 0.0, 1.0);
   float4 dbgFarP = float4(0.0, 0.0, 0.0, 1.0);
   float3 d = float3(0.0, 0.0, 0.0);
-  if (p.anchorIsData && volumeUniforms.useParallelProjection < 0.5)
+  if (volumeUniforms.useParallelProjection < 0.5)
   {
-    // OpenGL computeRayDirection parity (analytic pixel ray): unproject the
-    // fragment through the near/far planes with the CPU-composed inversePVM
-    // (inverseVolume * inverseModelView * inverseProjection, GL in_inversePVM
-    // bytes) and normalize the difference in dataset space. This removes the
-    // interpolated-anchor dependence (normalize(anchorData - eyePosData)) that
-    // differed between the backends by ~2.2e-5 on the anchor and accumulated
-    // ~3e-8/step in evalStep. GLSL mat4*vec4 contracts [0,1,2,3]
+    // OpenGL computeRayDirection parity: the GL fragment shader's BaseInit calls
+    // computeRayDirection() unconditionally for perspective projection
+    // (vtkVolumeShaderComposer.h), so the CAMERA-OUTSIDE path (anchorIsData==false)
+    // must use the analytic pixel ray too. It previously kept the interpolated
+    // normalize(p.rayDir * boundsSize), which rotated every ray by the
+    // rasterizer's anchor rounding and flipped ~1509 px of knife-edge texel picks
+    // (vs 178 px camera-inside). The analytic path unprojects the fragment through
+    // the near/far planes with the CPU-composed inversePVM (inverseVolume *
+    // inverseModelView * inverseProjection, GL in_inversePVM bytes) and normalizes
+    // the difference in dataset space. This removes the interpolated-anchor
+    // dependence (normalize(anchorData - eyePosData)) that differed between the
+    // backends by ~2.2e-5 on the anchor and accumulated ~3e-8/step in evalStep.
+    // GLSL mat4*vec4 contracts [0,1,2,3]
     // mul,fma,fma,mul+add, so use vecMulStrict. p.screenPos is Metal's top-left
     // window pixel center; negating ndc.y converts it to GL's bottom-up
     // convention (gl_FragCoord.y - in_windowLowerLeftCorner). z = -1/+1 are
@@ -4220,19 +4257,20 @@ inline float4 marchVolumeUnified(
   // texture space; currentPoint is in normalized volume space (the AABB).
   float3 texLocalPos = (volumeUniforms.volumeToTexture *
       float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
-  // OpenGL g_rayOrigin parity (camera-inside proxy): GL anchors the march at the
+  // OpenGL g_rayOrigin parity (ALL proxy-box paths): GL anchors the march at the
   // interpolated, cell-to-point-adjusted texture coordinate plus one (jitter-
   // scaled) step: g_rayOrigin = ip_textureCoords + g_rayJitter with g_rayJitter =
-  // g_dirStep * jitterValue. Anchoring on the ray-box entry (texLocalPos) here
-  // reproduces a ~9.7e-5 texel offset in z (the near-plane entry differs from the
-  // interpolated anchor), which puts the fetch positions on the wrong side of
-  // tissue boundaries (the systematic knife-edge mismatch). For those paths
-  // p.localPos carries the interpolated per-vertex texcoord (in.texcoord) and
-  // evalStep already replicates g_dirStep, so the start is bit-parity with GL.
-  // Legacy paths (camera outside, grid traversal) keep the entry-anchored
-  // construction.
+  // g_dirStep * jitterValue. Anchoring on the ray-box entry (texLocalPos)
+  // reproduced a ~9.7e-5 texel offset in z (the entry differs from the
+  // interpolated anchor), which put the fetch positions on the wrong side of
+  // tissue boundaries (the systematic knife-edge mismatch). p.localPos now
+  // carries the interpolated per-vertex texcoord (in.texcoord, cellToPoint-
+  // adjusted) for the camera-outside path too (the fragments forward in.texcoord
+  // as the anchor), and evalStep already replicates g_dirStep, so the start is
+  // bit-parity with GL on every path. Only grid traversal (marchSegment) and
+  // parallel projection keep the entry-anchored construction.
   float jitterFrac = p.stepSize > 0.0 ? (p.jitter / p.stepSize) : 1.0;
-  float3 evalPoint = (p.anchorIsData && volumeUniforms.useParallelProjection < 0.5)
+  float3 evalPoint = (volumeUniforms.useParallelProjection < 0.5)
       ? (p.localPos + evalStep * jitterFrac)
       : cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
   float prefetchScalar = sampleVolumeScalar(volumeTexture,
@@ -4359,7 +4397,7 @@ inline float4 marchVolumeUnified(
       // Keep the camera-inside proxy anchored on the interpolated texcoord (GL
       // g_rayOrigin parity) after the out-of-bounds clamp; the counter-based
       // rebuild is exact for the current sample index.
-      evalPoint = (p.anchorIsData && volumeUniforms.useParallelProjection < 0.5)
+      evalPoint = (volumeUniforms.useParallelProjection < 0.5)
           ? (p.localPos + evalStep * (jitterFrac + float(currentT)))
           : cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
       prefetchValid = false;
@@ -4409,7 +4447,7 @@ inline float4 marchVolumeUnified(
             float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
         // Camera-inside proxy: rebuild from the integer counter so the skip
         // stays on GL's g_rayOrigin + g_dirStep * g_currentT lattice.
-        evalPoint = (p.anchorIsData && volumeUniforms.useParallelProjection < 0.5)
+        evalPoint = (volumeUniforms.useParallelProjection < 0.5)
             ? (p.localPos + evalStep * (jitterFrac + float(currentT)))
             : cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
         prefetchValid = false;
@@ -5516,7 +5554,14 @@ fragment VolumeFragmentOut fragment_volume_main(
   bool cameraInsideProxy = volumeUniforms.useCameraInsideNearClip > 0.5;
   float3 anchorData = in.localPos;
   float3 localPos = in.localPos;
-  float3 anchorTex = in.localPos;
+  // cellToPoint-adjusted per-vertex texcoord (GL ip_textureCoords parity): the
+  // rasterizer interpolates the SAME value GL's BaseInit uses for g_rayOrigin,
+  // for both the camera-inside proxy (near-plane cap) and the camera-outside
+  // proxy box. GL never anchors camera-outside marches on the ray-box entry; it
+  // marches from the interpolated ip_textureCoords + g_dirStep, and using the
+  // box-entry texLocalPos instead shifted every fetch by ~1e-4..1e-5 texel
+  // (the 1464-px CamOutside knife-edge mismatch vs 178-px camera-inside).
+  float3 anchorTex = in.texcoord;
   if (cameraInsideProxy)
   {
     float3 bsz = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
@@ -5631,7 +5676,14 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
   bool cameraInsideProxy = volumeUniforms.useCameraInsideNearClip > 0.5;
   float3 anchorData = in.localPos;
   float3 localPos = in.localPos;
-  float3 anchorTex = in.localPos;
+  // cellToPoint-adjusted per-vertex texcoord (GL ip_textureCoords parity): the
+  // rasterizer interpolates the SAME value GL's BaseInit uses for g_rayOrigin,
+  // for both the camera-inside proxy (near-plane cap) and the camera-outside
+  // proxy box. GL never anchors camera-outside marches on the ray-box entry; it
+  // marches from the interpolated ip_textureCoords + g_dirStep, and using the
+  // box-entry texLocalPos instead shifted every fetch by ~1e-4..1e-5 texel
+  // (the 1464-px CamOutside knife-edge mismatch vs 178-px camera-inside).
+  float3 anchorTex = in.texcoord;
   if (cameraInsideProxy)
   {
     float3 bsz = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
@@ -5861,7 +5913,14 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
   bool cameraInsideProxy = volumeUniforms.useCameraInsideNearClip > 0.5;
   float3 anchorData = in.localPos;
   float3 localPos = in.localPos;
-  float3 anchorTex = in.localPos;
+  // cellToPoint-adjusted per-vertex texcoord (GL ip_textureCoords parity): the
+  // rasterizer interpolates the SAME value GL's BaseInit uses for g_rayOrigin,
+  // for both the camera-inside proxy (near-plane cap) and the camera-outside
+  // proxy box. GL never anchors camera-outside marches on the ray-box entry; it
+  // marches from the interpolated ip_textureCoords + g_dirStep, and using the
+  // box-entry texLocalPos instead shifted every fetch by ~1e-4..1e-5 texel
+  // (the 1464-px CamOutside knife-edge mismatch vs 178-px camera-inside).
+  float3 anchorTex = in.texcoord;
   if (cameraInsideProxy)
   {
     float3 bsz = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);

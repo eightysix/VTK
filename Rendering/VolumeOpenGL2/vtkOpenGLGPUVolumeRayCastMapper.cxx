@@ -4665,6 +4665,18 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::DumpDebugRays(
     rayPixels = stepTFPixels;
     rayPixelCount = 6;
   }
+  // TEMP DEBUG: CamOutside 1509-px baseline diff pixels (Metal/PNG coords ->
+  // GL window y = 511 - py). Matches the Metal pxOkCamOutDiff gate pixels.
+  const float camOutPixels[16][2] = { { 307.5f, 503.5f }, { 17.5f, 27.5f },
+    { 307.5f, 504.5f }, { 135.5f, 28.5f }, { 373.5f, 470.5f }, { 496.5f, 22.5f },
+    { 195.5f, 483.5f }, { 496.5f, 23.5f }, { 188.5f, 407.5f }, { 461.5f, 23.5f },
+    { 167.5f, 488.5f }, { 461.5f, 22.5f }, { 104.5f, 462.5f }, { 464.5f, 3.5f },
+    { 126.5f, 490.5f }, { 501.5f, 1.5f } };
+  if (getenv("VTK_GL_CAMOUT_DUMP") != nullptr)
+  {
+    rayPixels = camOutPixels;
+    rayPixelCount = 16;
+  }
 
   for (size_t p = 0; p < rayPixelCount; ++p)
   {
