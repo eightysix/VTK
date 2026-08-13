@@ -170,3 +170,107 @@ Env-gated: `VTK_GL_RAY_DUMP`/`VTK_GL_VERTEX_DUMP`/`VTK_GL_SAMPLE_DUMP`/`VTK_GL_O
 ## 8. Chained reference (in order, read these for depth)
 
 Updates **1–19** (pipeline: gates, fp16, TF tables, half→float, NEAREST insight, W2IF) → **20–40** (proxy mesh, matrix/FMA parity, 307→130→694 px, inversePVM order) → **41–59** (composite exonerated, background-blend root cause 63,692→188 px, frame-aligned dumps, step vs anchor) → **60–64** (per-vertex bit-identity, barycentric weights ~1e-8, interpolation floor quantified) → **65–70** (finetuned matrix, sample-count lattice 5530→3) → **71–77** (ray byte-identity, rcp/rsqrt codegen, anchor +1 ulp proven, analytic-anchor audit) → **78** (analytic-anchor negative: mode-1 429 / mode-2 469 px; GL frame-A/B anchor spread) → **79** (frame-aligned raw capture refutes frame-selection: same-camera 178 px) → **80** (per-vertex texcoord z 94/94, z-input lever refuted, interpolator-model sweep negative; residual = interpolator hardware floor) → **81** (StepTF m4 1-px diff at `(290,330)` = byte-rounding-boundary coincidence at composite 44.4992; inputs/accumulation bit-identical, blend model confirmed per-backend; same interpolator floor) → **82** (CamOutside densify 1384→250: GL's vtkDensifyPolyData(2) centroid-fan geometry uploaded in dataset space) → **83** (jitter noise parity: vtkJPEGReader bottom-up decode composed with the GL/Metal y-origin flip; IGN replaced by the exact blue-noise tile; jittered 300² test 45,840→29 px, nopoke 0 px) → **84** (RenderToImage blended over the white clear while GL's RTT pass is unblended: Metal injected (1−α)·255 into every RTT pixel; disabling the blend on the RTT pipeline collapsed TestGPURayCastRenderToTexture from 47,878 px / max_d 65 to 1,471 px / max_d 1, the same interpolator floor).
+
+---
+
+## 9. Commit-by-commit changelog (`c6b8cc1fd5..HEAD`, code changes)
+
+Every non-doc commit in the range, oldest first, grouped by the recap's phases. Pure documentation commits (findings/recap markdown), the analysis-tool persistence commits (the `BackendComparisonTools/updateNN/*.py` + README landings — 7b4a788f0c, 1d1fe1562e, 4c250a654d, c75fc18c1a, 73a1b52cab, 2b7e219c8d, 7a64609682, plus 8bb5c370b6's `run_pixel_diff_suite.sh`), and config-only tweaks (df97bd5336 `opencode.json`, 6bae321a2a parser) are omitted. All listed commits touch runtime code: the Metal/GL shaders, mappers, GL volume-mapper helpers, tests, or build scripts.
+
+**Phase 0 — harness: shader logging, GL-as-reference, test scaffolding (updates 1–12)**
+
+- `b1798cd6ad` feat(Metal): test-only Metal 3.2 shader logging for volume ray-cast — env-gated `os_log` STEP/MARCH dumps in `MetalShaders.metal` behind `VTK_METAL_ENABLE_LOGGING`, `TestMetalVolumeShaderLog`, plumbing in `vtkMetalGPUVolumeRayCastMapper.mm` + CMake.
+- `f658845983` fix(OpenGL): register `RenderingBackend=OpenGL` attribute for the volume mappers (`vtkOpenGLGPUVolumeRayCastMapper`, `vtkOpenGLRayCastImageDisplayHelper`) — makes `--vtk-factory-prefer RenderingBackend=OpenGL` actually select GL, usable as the clean reference.
+- `6767cb0493` fix(Metal): report 32-bit depth size — render-window depth pixel format matches GL's depth buffer for the camera-inside near-plane parity.
+- `ec477e9df7` fix(Metal): clip the volume ray-cast march to the clipped exit point.
+- `6a3b2c6849` test(Volume): camera-inside gradient-opacity divergence tests — `ConstGradOp` / `NoGradOp` / `NoShade` isolates.
+- `b4a9087663` test(Volume): no-transform + camera-outside variants (`...NoTransform`, `...NoTransformCamOutside`).
+- `c41f975d5e` test(Volume): sampling-artifact variants + sample-distance probes (`FineStep`, `NearPlaneTiny`, `SampleDist0_25`, `SampleDist0_5`).
+- `a831b07ca2` test(Volume): fixed-step sweep probe for camera-outside (`...CamOutsideFixedStep`).
+- `f9bc0103ab` test(Volume): nearest-interpolation and MaxIP variants.
+- `fa52bf3773` fix(Metal): apply blend-mode-specific opacity correction to the TF tables, matching GL.
+- `a4415d2329` fix(Metal): apply shading to every `alpha>0` sample like OpenGL.
+- `f1ec8e6697` debug(Metal): gradient-opacity debug logging behind `VTK_METAL_ENABLE_LOGGING`.
+- `1ce3977260` fix(Metal): bounds-check `MTL_FIRSTVALS` probe indices in GPURender.
+- `bc36ecc468` test(Volume): NoShade gradient-opacity isolates + amplifier.
+- `c022b1f24a` fix(Metal): align the volume composite gate and termination with OpenGL (`alpha>0` gate, strict break/termination thresholds).
+- `e808ebe5f6` build(macos): preserve the test flag when resuming the build.
+
+**Phase 1 — float32 sweep: half → float everywhere (updates 2–15)**
+
+- `38343bdb4b` fix(Metal): accumulate the volume composite in full float (was half).
+- `e66a38ff60` fix(Metal): remove the fixed `MAX_RAY_STEPS` clamp on the march.
+- `86a45a729d` fix(Metal): build the gradient-opacity LUT as 1024×R32Float (GL parity).
+- `f7c1c814c9` fix(Metal): compute volume gradients in full float.
+- `1732d6bf25` fix(Metal): march with an integer step counter and GL `g_dirStep` arithmetic.
+- `8c50593b8d` fix(Metal): promote the sample-distance uniform to full float32 (GL step parity).
+- `6256696218` fix(Metal): compute scalar window/level normalization in full float32.
+- `71b22c376a` docs(Metal): ray-geometry parity verification + no-jitter test + OpenGL ray dump.
+- `8f308ce936` fix(Metal): promote transfer-function lookup to float32.
+- `0994a59606` fix(Metal): promote gradient-opacity sampling to float32.
+- `e82046f22e` debug(GL): extend the GL ray dump to (422,419).
+- `d42c4aa545` debug(GL): per-sample volume raw capture at the worst pixel + camera-inside no-jitter test.
+- `49ecec08b7` fix(volume): linear interpolation in the no-jitter test (root-cause probe).
+- `5ab0b12eb4` debug: GL sample-dump pixel select + Metal camera-agnostic dump gate.
+- `1efb0c56e7` fix(Metal): build `evalStep` in OpenGL `g_dirStep` float32 order (`sampleDistanceWorld`).
+- `4867687909` test(volume): NEAREST interpolation in the camera-inside no-jitter test.
+- `ccffd0095d` fix(Metal): promote the remaining half-precision lighting/interpolation sites to float32.
+- `0882a41507` fix(Metal): promote per-component scalar ranges to float32 and default volume textures to float (R32F).
+
+**Phase 2 — camera-inside proxy & analytic ray (updates 16–40)**
+
+- `f79e93a5a6` debug(volume): widen the GL per-sample dump to 8 channels (op + premultiplied rgb) + composite readback.
+- `9d9698164d` docs(Metal)+tools: step/ray/camera compare tool; update-17 findings (near-plane ray-origin root cause).
+- `be9d152fcd` debug(Metal): `VTK_METAL_FULLSCREEN_CAMERA_INSIDE` override — proxy path deterministic, matches GL pre-flip geometry.
+- `c7a10f508a` debug(Metal): print `METAL_CAM` at 9 sig figs (W2IF view-angle perturbation discovery).
+- `7c663464e0` fix(Metal): default camera-inside to the OpenGL-parity proxy path; drop the redundant `vtkTriangleFilter`.
+- `06d0619341` fix(Metal): set front-facing winding Clockwise so proxy culling matches GL's `GL_BACK`.
+- `df934c8ad2` fix(Metal): clamp the camera-inside proxy `tStart` to the anchor so far remnants stop re-marching.
+- `23e6c3d328` fix(Metal): interpolate the camera-inside proxy anchor in dataset space (GL `ip_vertexPos` parity) and compute `g_dirStep` from `normalize(anchorData-eyeData)`; also fixed a latent RTT `MarchParams` init (13 values / 14 fields).
+- `6a157e4cef` fix(Metal): in-shader `P*V*M*v` clip attempt (GL `ComputeClipPosition` parity) — unsuccessful, retracted.
+- `9d02f8b32c` fix(Metal): TEMP DEBUG cap-mesh dumps on both backends — vertex sets differ (box corner ordering).
+- `53df0dd93f` fix(Metal): reorder the camera-inside `boxSource` corners to GL `ijkCorners` order + flip proxy back-face cull CW→CCW — cap meshes now byte-identical.
+- `d75c70452c` fix(Metal): TEMP DEBUG clip-chain matrix bit dumps — P differs only in the near/far Z row.
+- `9669e703c7` fix(Metal): bit-exact eye — pass GL's object-space eye (`in_eyePosObjs[0]`) as a uniform; camera-inside ray dir now `normalize(anchorData - eyePosData)`.
+- `11b25d7a0f` docs(Metal)+debug: Metal `vertex_volume_main` vid/modelPos/clip logs + GL `GL_VERT` per-pixel + `GL_CLIPMAT` matrix dumps (update 35).
+- `029e8be510` fix(Metal): bit-exact vertex clip — hand-write `(P*V)*W` and the vector multiply in GL's `[0,1,2,3]` FMA-contracted order + disable fast math (update 36).
+- `a5809c683c` fix(Metal): per-vertex `ip_textureCoords` parity — masked residual 130 → 1 (update 38).
+- `6ef754fed7` fix(Metal): anchor `evalPoint` on the interpolated texcoord (GL `g_rayOrigin` parity) — knife-edge 115 → 1 (update 39).
+- `f597ef686c` fix(Metal): compose `in_inversePVM` as `inv(P)*inv(V)*inv(M)` in both backends (was `inv(V)*inv(P)`) — analytic rays match GL (update 40).
+
+**Phase 3 — composite & background blend (updates 42–58)**
+
+- `a5a59cb1b4` fix(Metal): composite in GL order `w*(c*a)` (update 43).
+- `8083e26aca` fix(Metal): composite via explicit `fma()` to match GLSL's compiled contraction of `(1-a)*c+frag` (update 45).
+- `970e84d6d5` fix(Metal): `in_volume_scale` parity for UCHAR/USHORT unorm — upload ScalarMin/Max divided by `(normFactor+1)` (update 46).
+- `a25e73dd15` fix(Metal)+GL: TF-table pre-integration factor float32-vs-double — cast `actualSampleDistance` to float like GL (`vtkOpenGLGPUVolumeRayCastMapper.cxx:1710`), plus the env-gated `VTK_GL_OPTABLE_DUMP` (update 52).
+- `5d7f30b333` docs+debug(GL): `VTK_GL_FINAL_DUMP` channels 60–67 — true float32 final capture at 15 gated px (update 54).
+- `dd93d95341` docs+debug: Metal `VTK_METAL_CLEAN_BIAS_F` uniform-bias probe + GL `VTK_GL_FLOAT_DUMP` RGBA32F readback (update 55).
+- `fdd7281d07` docs+debug(GL): fix the float-FBO readback RGB=0 — save/restore the active-unit 2D texture binding the bare `glBindTexture` was clobbering (update 56).
+- `8f991da45b` **fix(Metal,volume) (update 57):** remove the `accumulatedOpacity=1.0` clamp at the opacity break (`MetalShaders.metal:4814`) and make the break `>=` → strict `>` — the root cause of the whole 63,692-px ±1 field (the clamp zeroed the `dst*(1-a)` background blend term GL keeps); field collapsed 63,692 → 188 px.
+- `fea09bf24a` chore(Metal,volume): remove the now-dead `VTK_METAL_CLEAN_BIAS_F` debug bias + its compile-option injection.
+- `651e3ea4ae` docs+debug(Metal): full-field pre-store float dump `VTK_METAL_FLOAT_DUMP` (262,144-px FINAL log) for the post-blend-fix feasibility analysis (update 58).
+
+**Phase 4 — the interpolator floor (updates 59–80)**
+
+- `696bbb9be3` docs+debug: fix `DumpCleanGLFloats` to dump every frame (the frame-1-vs-frame-6 misalignment had hidden the true gf delta) + add the evalStep/anchor/clip lattice to both dump gates (update 59).
+- `8109341d27` docs+debug: extend the `VTK_GL_VERTEX_DUMP` to 11 channels incl. per-vertex texcoord (108/109/110); fix the debug-vertex branch to compute the real texcoord before its early return; Metal logs the exact screenPos pixel-center (update 60).
+- `08d00f434d` docs+debug: GL `DumpDebugAttrField` renders channels 200–202 into an RGBA32F FBO (full-frame attribute planes); FIX the channel-100 block upper bound that was silently intercepting channels 200–202; Metal `debugStepGate()` sparse 64×64 grid + dense knife-edge block → 8203 unique px/frame (update 64).
+- `0fc7e84852` docs+tests: add `Linear` and `StepTF` diagnostic tests (update 65).
+- `c6ea74d513` docs+tests: StepTF mode-3 non-saturating ramp sweep (`VTK_STEP_RAMP_MAX`) (update 66).
+- `68bac8533d` docs+tests: rewrite StepTF as a true single-still-frame + variants A–E (update 67).
+- `6032ed6015` **fix(metal,volume) (update 69):** march-loop bounds exit on the GL `g_dirStep` lattice — directional per-axis bounds test against cell-to-point adjusted bounds (TerminationImplementation parity), `maxSteps = ceil((tEnd-firstT)/length(evalStep))`, tTerminateMax in step units; B constant-scalar volume 5530 → 18 px.
+- `e40517af16` fix(metal,volume) (update 70): remove the legacy block-bounds exit (GL has none) — B 18 → 3 px.
+- `5f8f1f5629` docs+debug: STEP lines self-contained with shader inversePVM bits + GL debug channels 43–47 (`rcpNear/rcpFar/q0mul/sweepA/B`) and `VTK_GL_CAP_DUMP`/`VTK_GL_SWEEP_DUMP` guards (update 71).
+- `4def5f95c3` **fix(metal,volume) (update 74):** two GLSL-vs-MSL codegen divergences in the analytic pixel ray — GL `X/=w` compiles to multiply-by-reciprocal (`raw*(1.0/w)`) and `normalize` lowers to `d*fast::rsqrt(dot(d,d))` with the GPU's approximate rsqrt — `dirObj`/`evalStep` now byte-identical to GL `g_dirStep`; residual 183 → 178 px.
+- `8c5d361922` docs+debug: fix the GL_VERT dump channel 107 to read `ip_vertexPos.z` instead of `gl_PrimitiveID` (the near-cap z==y/vid artifact source) (update 76).
+- `2b89fc6049` **fix(metal,volume) (updates 78–80):** the decisive analytic-anchor experiment — `TriangleAnchorBuffer` (fragment buffer 3) + `BuildTriangleAnchorBuffer` strict-fma per-vertex clip/texcoord parity, `AnalyticAnchorMode` uniforms (f32/f64 A/B), and `VTK_STEP_RAW_CAPTURE` front-buffer capture hooks in three GPUVolumeRayCast tests. Result: negative (mode-1 429 px / mode-2 469 px vs the 178-px baseline); residual pinned to the rasterizer interpolator hardware floor.
+
+**Phase 5 — final fixes & the acceptance suite (updates 81–84)**
+
+- `df9191cd4f` docs+debug: bump the Metal FINAL log `accOp`/`accCol` from `%f` to `%0.9g`; add StepTF m4/m2 gate pixels + `VTK_GL_STEPTF_DUMP` debug block (recap §4b).
+- `8696d5d3ef` docs+debug: MaxIP gate `pxOkMaxIP` corrected to PNG rows + `mipMaxPos`/`mip2` tracking in `marchVolumeUnified` (update 81).
+- `2f88ec35ac` **fix(Metal):** densify the camera-outside proxy box to GL's exact `vtkDensifyPolyData(2)` centroid-fan geometry (108 tris / 56 verts, float32) and upload it in dataset space via the new `UseDataSpaceBoxVertices` uniform (forwarding `in.position` unchanged) — CamOutside 1384 → 250 px (update 82).
+- `ef4452a9bc` **fix(Metal):** camera-inside near-plane normal transform — use the transpose `M^T` of the model matrix instead of the inverse-transpose for world→data normals, bit-matching `vtkOpenGLGPUVolumeRayCastMapper::RenderVolumeGeometry`; fixes `TestGPURayCastCameraInsideNonUniformScaleTransform` (47,776 → 45,837 px; cap mesh byte-identical to GL).
+- `5371e30652` **fix(Metal) (update 83):** replace Interleaved Gradient Noise jitter with GL's exact blue-noise tile (`kBlueNoise64[4096]`, JPEG top-down byte order) sampled `(floor(st.y)−H) mod 64 / floor(st.x) mod 64` in all three jitter sites (fullscreen, RTT, grid-traversal, the last dropping its old `+0.5` half-pixel shift); adds `TestGPURayCastCameraInsideNonUniformScaleTransformKnobs` — jittered 300² test 45,840 → 29 px.
+- `fe81a78ebb` **fix(Metal) (update 84):** disable blending on the RenderToImage pipeline color attachment 0 (GL's RTT pass writes unblended over `vtkglClearColor(1.0,1.0,1.0,0.0)`) — `TestGPURayCastRenderToTexture` 47,878 px / max_d 65 → 1,471 px / max_d 1.
