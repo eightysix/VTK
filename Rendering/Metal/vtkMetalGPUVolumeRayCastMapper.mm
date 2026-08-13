@@ -28,7 +28,6 @@
 #include "vtkMath.h"
 #include "vtkClipConvexPolyData.h"
 #include "vtkDensifyPolyData.h"
-#include "vtkTriangleFilter.h"
 #include "vtkPlaneCollection.h"
 #include "vtkPlane.h"
 #include "vtkLightCollection.h"
@@ -221,11 +220,18 @@ struct VolumeMapperUniforms
   float UseCameraInsideNearClip;   // 1664
   float _padNearClip[3];           // 1668..1679
   float CameraInsideNearPlaneOrigin[4]; // 1680..1695
-  float CameraInsideNearPlaneNormal[4]; // 1696..1711 (total 1712, 16-byte aligned)
+  float CameraInsideNearPlaneNormal[4]; // 1696..1711
+  // OpenGL proxy-box parity: the camera-OUTSIDE proxy box is uploaded in
+  // dataset (model) space like GL's densified BBoxPolyData (unit-cube scaling
+  // in the vertex shader rounds the centroid vertices ~1 ulp off GL's double
+  // centroids, which kept the interpolated anchor ~1 ulp off). When set, the
+  // vertex shader forwards in.position unchanged (modelPos = in.position).
+  float UseDataSpaceBoxVertices;   // 1712
+  float _padDSBV[3];               // 1716..1727 (total 1728, 16-byte aligned)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1712,
-  "VolumeMapperUniforms must be 1712 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1728,
+  "VolumeMapperUniforms must be 1728 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -255,6 +261,7 @@ static_assert(offsetof(VolumeMapperUniforms, RectCoordsBias) == 1648, "");
 static_assert(offsetof(VolumeMapperUniforms, UseCameraInsideNearClip) == 1664, "");
 static_assert(offsetof(VolumeMapperUniforms, CameraInsideNearPlaneOrigin) == 1680, "");
 static_assert(offsetof(VolumeMapperUniforms, CameraInsideNearPlaneNormal) == 1696, "");
+static_assert(offsetof(VolumeMapperUniforms, UseDataSpaceBoxVertices) == 1712, "");
 
 // Per-light data for volume shading — must match Metal VolumeLight struct
 // Must match Metal VolumeLight (6 x float4 = 96 bytes per light)
@@ -1188,10 +1195,31 @@ static void FillTransferFunctionRGBA8(
   }
 }
 
-// Fill a RGBA8 transfer function row with CPU-side opacity pre-integration,
-// matching the OpenGL backend's approach (vtkOpenGLVolumeOpacityTable::InternalUpdate).
-// COMPOSITE blend only; additive blend would need a *= factor instead of pow.
-// preIntegrationFactor = sampleDistance / unitDistance.
+// Apply the OpenGL backend's blend-mode-specific opacity correction
+// (vtkOpenGLVolumeOpacityTable::InternalUpdate): COMPOSITE pre-integrates the
+// opacity with 1 - (1-a)^factor, ADDITIVE scales it by factor, and all other
+// blend modes (MIP/MinIP/Average) use the raw table values.
+static double ApplyOpacityBlendCorrection(double a, double factor, int blendMode)
+{
+  if (a <= 0.0001 || factor <= 0.0)
+  {
+    return a;
+  }
+  if (blendMode == vtkVolumeMapper::COMPOSITE_BLEND)
+  {
+    return 1.0 - std::pow(1.0 - a, factor);
+  }
+  if (blendMode == vtkVolumeMapper::ADDITIVE_BLEND)
+  {
+    return a * factor;
+  }
+  return a;
+}
+
+// Fill a RGBA8 transfer function row with the blend-mode-dependent opacity
+// correction, matching the OpenGL backend's approach
+// (vtkOpenGLVolumeOpacityTable::InternalUpdate). COMPOSITE pre-integrates with
+// 1 - (1-a)^factor, ADDITIVE scales by factor, all other blend modes are raw.
 static void FillTransferFunctionRGBA8WithPreIntegration(
   vtkColorTransferFunction* colorFunc,
   vtkPiecewiseFunction* opacityFunc,
@@ -1199,7 +1227,8 @@ static void FillTransferFunctionRGBA8WithPreIntegration(
   double scalarMax,
   int width,
   uint8_t* row,
-  double preIntegrationFactor)
+  double factor,
+  int blendMode)
 {
   std::vector<double> rgb(width * 3);
   std::vector<double> alpha(width);
@@ -1207,11 +1236,7 @@ static void FillTransferFunctionRGBA8WithPreIntegration(
   opacityFunc->GetTable(scalarMin, scalarMax, width, alpha.data());
   for (int i = 0; i < width; ++i)
   {
-    double a = alpha[i];
-    if (a > 0.0001 && preIntegrationFactor > 0.0)
-    {
-      a = 1.0 - std::pow(1.0 - a, preIntegrationFactor);
-    }
+    double a = ApplyOpacityBlendCorrection(alpha[i], factor, blendMode);
     row[i * 4 + 0] = ColorToByte(rgb[i * 3 + 0]);
     row[i * 4 + 1] = ColorToByte(rgb[i * 3 + 1]);
     row[i * 4 + 2] = ColorToByte(rgb[i * 3 + 2]);
@@ -1219,12 +1244,12 @@ static void FillTransferFunctionRGBA8WithPreIntegration(
   }
 }
 
-// Fill a RGBA16Float transfer function row with CPU-side opacity pre-integration,
-// matching the OpenGL backend's approach (vtkOpenGLVolumeOpacityTable::InternalUpdate).
-// Unlike the RGBA8 variant, the alpha channel retains full float precision so
-// that low-opacity transfer functions (e.g. 0.005 max opacity) do not round to
-// zero after the 8-bit quantization step. COMPOSITE blend only; additive blend
-// would need a *= factor instead of pow.
+// Fill a RGBA16Float transfer function row with the blend-mode-dependent
+// opacity correction, matching the OpenGL backend's approach
+// (vtkOpenGLVolumeOpacityTable::InternalUpdate). Unlike the RGBA8 variant, the
+// alpha channel retains full float precision so that low-opacity transfer
+// functions (e.g. 0.005 max opacity) do not round to zero after the 8-bit
+// quantization step.
 static void FillTransferFunctionRGBA16FWithPreIntegration(
   vtkColorTransferFunction* colorFunc,
   vtkPiecewiseFunction* opacityFunc,
@@ -1234,7 +1259,8 @@ static void FillTransferFunctionRGBA16FWithPreIntegration(
   double opacityMax,
   int width,
   uint16_t* row,
-  double preIntegrationFactor)
+  double factor,
+  int blendMode)
 {
   std::vector<double> rgb(width * 3);
   std::vector<double> alpha(width);
@@ -1242,11 +1268,7 @@ static void FillTransferFunctionRGBA16FWithPreIntegration(
   opacityFunc->GetTable(opacityMin, opacityMax, width, alpha.data());
   for (int i = 0; i < width; ++i)
   {
-    double a = alpha[i];
-    if (a > 0.0001 && preIntegrationFactor > 0.0)
-    {
-      a = 1.0 - std::pow(1.0 - a, preIntegrationFactor);
-    }
+    double a = ApplyOpacityBlendCorrection(alpha[i], factor, blendMode);
     row[i * 4 + 0] = FloatToHalf(static_cast<float>(std::clamp(rgb[i * 3 + 0], 0.0, 1.0)));
     row[i * 4 + 1] = FloatToHalf(static_cast<float>(std::clamp(rgb[i * 3 + 1], 0.0, 1.0)));
     row[i * 4 + 2] = FloatToHalf(static_cast<float>(std::clamp(rgb[i * 3 + 2], 0.0, 1.0)));
@@ -1266,11 +1288,12 @@ static void FillTransferFunctionRGBA16FWithPreIntegration(
   double scalarMax,
   int width,
   uint16_t* row,
-  double preIntegrationFactor)
+  double factor,
+  int blendMode)
 {
   FillTransferFunctionRGBA16FWithPreIntegration(
     colorFunc, opacityFunc, scalarMin, scalarMax, scalarMin, scalarMax,
-    width, row, preIntegrationFactor);
+    width, row, factor, blendMode);
 }
 
 // Compute the transfer function table width using the same rule as the OpenGL
@@ -3424,6 +3447,13 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
 
   bool sampleDistChanged =
     (actualSampleDistance != this->LastTransferFunctionSampleDist);
+  // The opacity correction applied at table-build time depends on the blend
+  // mode (OpenGL vtkOpenGLVolumeOpacityTable::NeedsUpdate tracks LastBlendMode):
+  // COMPOSITE pre-integrates, ADDITIVE scales, MIP/MinIP/Average stay raw. A
+  // blend-mode change must therefore rebuild the table even when the transfer
+  // functions themselves are unchanged.
+  bool blendModeChanged =
+    (this->GetBlendMode() != this->LastTransferFunctionBlendMode);
 
   // Primary change detection uses the pre-existing table range (widthRange): it
   // equals the color range for every path except dependent RGBA, where the RGB
@@ -3444,6 +3474,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
   doReload |= (opacityFunc->GetMTime() > this->TransferFunctionUploadTime.GetMTime());
   doReload |= scalarRangeChanged;
   doReload |= sampleDistChanged;
+  doReload |= blendModeChanged;
 
   if (doReload)
   {
@@ -3472,7 +3503,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
         colorRange[0], colorRange[1],
         opacityRange[0], opacityRange[1],
         tfWidth, tfData.data(),
-        preIntegrationFactor);
+        preIntegrationFactor, this->GetBlendMode());
 
       // Swap rather than rewrite: in-flight frames on the GPU may still be
       // sampling the old texture.  Metal command buffers retain a strong
@@ -3510,6 +3541,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
       this->LastTransferFunctionOpacityScalarRange[0] = opacityRange[0];
       this->LastTransferFunctionOpacityScalarRange[1] = opacityRange[1];
       this->LastTransferFunctionSampleDist = actualSampleDistance;
+      this->LastTransferFunctionBlendMode = this->GetBlendMode();
       this->TransferFunctionUploadTime.Modified();
     }
   }
@@ -3536,7 +3568,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
     }
 
     bool doCompReload = (this->ComponentTransferFunctionTexture1 == nullptr) ||
-      compChanged || compRangeChanged;
+      compChanged || compRangeChanged || blendModeChanged;
     for (int c = 1; c < std::min(4, this->VolumeNumComponents); ++c)
     {
       vtkColorTransferFunction* cf = property->GetRGBTransferFunction(c);
@@ -3582,7 +3614,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
             cf, of,
             this->ComponentScalarRange[c][0], this->ComponentScalarRange[c][1],
             tfWidth, tfData.data(),
-            preIntegrationFactor);
+            preIntegrationFactor, this->GetBlendMode());
 
           // Swap rather than rewrite — see the single-path block above.
           ReleaseMetalObject(*static_cast<void**>(compSlots[c - 1]));
@@ -5227,28 +5259,110 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
 
     if (needsVertexRebuild)
     {
-      // Camera outside: simple 8-vertex box (original fast path)
+      // Camera outside: densified proxy box (OpenGL parity)
       // Camera inside: clip against near plane, densify, triangulate
       if (!cameraInside)
       {
-        float vertices[24];
-        unsigned int indices[36];
+        // Camera outside: densified proxy box (OpenGL parity). GL renders the
+        // 8-corner box through vtkDensifyPolyData(2) (centroid fan, 108
+        // triangles) even when the camera is outside (see
+        // vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::RenderVolumeGeometry).
+        // The coarse 12-triangle box rounds the rasterizer's interpolated
+        // anchor up to ~28 ulps off GL's. Replicate GL's exact densified
+        // geometry (same corner order, triangle set/winding, double centroids
+        // cast to float32) so the interpolated in.texcoord matches GL's
+        // ip_textureCoords. Vertices are uploaded in dataset (model) space —
+        // GL feeds BBoxPolyData positions straight to in_vertexPos — and the
+        // vertex shader forwards them via UseDataSpaceBoxVertices.
+        vtkNew<vtkPolyData> boxSource;
+        {
+          vtkNew<vtkCellArray> cells;
+          vtkNew<vtkPoints> points;
+          points->SetDataTypeToDouble();
+          // GL's DataGeometry corner order {000,100,010,110,001,101,011,111}
+          // in model space (identical to the camera-inside boxSource corners).
+          double corners[24] = {
+            this->ModelBounds[0], this->ModelBounds[2], this->ModelBounds[4],
+            this->ModelBounds[1], this->ModelBounds[2], this->ModelBounds[4],
+            this->ModelBounds[0], this->ModelBounds[3], this->ModelBounds[4],
+            this->ModelBounds[1], this->ModelBounds[3], this->ModelBounds[4],
+            this->ModelBounds[0], this->ModelBounds[2], this->ModelBounds[5],
+            this->ModelBounds[1], this->ModelBounds[2], this->ModelBounds[5],
+            this->ModelBounds[0], this->ModelBounds[3], this->ModelBounds[5],
+            this->ModelBounds[1], this->ModelBounds[3], this->ModelBounds[5],
+          };
+          for (int i = 0; i < 8; ++i)
+          {
+            points->InsertNextPoint(corners + i * 3);
+          }
+          // 6 faces 12 triangles (GL's tris with GL's 0-2-1 winding swap)
+          int tris[36] = {
+            0, 1, 2,
+            1, 3, 2,
+            1, 5, 3,
+            5, 7, 3,
+            5, 4, 7,
+            4, 6, 7,
+            4, 0, 6,
+            0, 2, 6,
+            2, 3, 6,
+            3, 7, 6,
+            0, 4, 1,
+            1, 4, 5
+          };
+          for (int i = 0; i < 12; ++i)
+          {
+            cells->InsertNextCell(3);
+            cells->InsertCellPoint(tris[i * 3]);
+            cells->InsertCellPoint(tris[i * 3 + 2]);
+            cells->InsertCellPoint(tris[i * 3 + 1]);
+          }
+          boxSource->SetPoints(points);
+          boxSource->SetPolys(cells);
+        }
 
-        // Unit cube [0,1] — the vertex shader scales to each block's model-space bounds.
-        float unitVerts[] = {
-          0,0,0, 1,0,0, 1,1,0, 0,1,0,
-          0,0,1, 1,0,1, 1,1,1, 0,1,1
-        };
-        memcpy(vertices, unitVerts, sizeof(unitVerts));
+        vtkNew<vtkDensifyPolyData> densifyPolyData;
+        densifyPolyData->SetInputData(boxSource);
+        densifyPolyData->SetNumberOfSubdivisions(2);
+        densifyPolyData->Update();
 
-        indices[0] = 0;  indices[1] = 2;  indices[2] = 1;  indices[3] = 0;  indices[4] = 3;  indices[5] = 2;
-        indices[6] = 4;  indices[7] = 5;  indices[8] = 6;  indices[9] = 4;  indices[10] = 6; indices[11] = 7;
-        indices[12] = 0; indices[13] = 7; indices[14] = 3; indices[15] = 0; indices[16] = 4; indices[17] = 7;
-        indices[18] = 1; indices[19] = 2; indices[20] = 6; indices[21] = 1; indices[22] = 6; indices[23] = 5;
-        indices[24] = 3; indices[25] = 6; indices[26] = 2; indices[27] = 3; indices[28] = 7; indices[29] = 6;
-        indices[30] = 0; indices[31] = 1; indices[32] = 5; indices[33] = 0; indices[34] = 5; indices[35] = 4;
+        vtkPolyData* finalPolyData = densifyPolyData->GetOutput();
+        vtkPoints* points = finalPolyData->GetPoints();
+        vtkCellArray* polys = finalPolyData->GetPolys();
 
-        this->IndexCount = sizeof(indices) / sizeof(unsigned int);
+        // OpenGL parity: GL uploads the densified double points as float32
+        // (in_vertexPos). Mirror the exact float32 values here.
+        std::vector<float> vertices;
+        vertices.reserve(points->GetNumberOfPoints() * 3);
+        for (vtkIdType i = 0; i < points->GetNumberOfPoints(); ++i)
+        {
+          double pt[3];
+          points->GetPoint(i, pt);
+          vertices.push_back(static_cast<float>(pt[0]));
+          vertices.push_back(static_cast<float>(pt[1]));
+          vertices.push_back(static_cast<float>(pt[2]));
+        }
+
+        // All densified cells are triangles; emit their 3 vertex ids in order.
+        std::vector<unsigned int> indices;
+        vtkIdType npts;
+        const vtkIdType* pts;
+        polys->InitTraversal();
+        while (polys->GetNextCell(npts, pts))
+        {
+          if (npts < 3) continue;
+          indices.push_back(static_cast<unsigned int>(pts[0]));
+          indices.push_back(static_cast<unsigned int>(pts[1]));
+          indices.push_back(static_cast<unsigned int>(pts[2]));
+        }
+
+        if (indices.empty())
+        {
+          vtkErrorMacro("Densified proxy box produced no triangles");
+          return false;
+        }
+
+        this->IndexCount = static_cast<int>(indices.size());
 
         // Release old buffers
         if (this->VertexBuffer)
@@ -5261,8 +5375,8 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         }
 
         {
-          id<MTLBuffer> vbuf = [device newBufferWithBytes:vertices
-                                                  length:sizeof(vertices)
+          id<MTLBuffer> vbuf = [device newBufferWithBytes:vertices.data()
+                                                  length:vertices.size() * sizeof(float)
                                                  options:MTLResourceStorageModeShared];
           if (!vbuf)
           {
@@ -5273,8 +5387,8 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         }
 
         {
-          id<MTLBuffer> ibuf = [device newBufferWithBytes:indices
-                                                  length:sizeof(indices)
+          id<MTLBuffer> ibuf = [device newBufferWithBytes:indices.data()
+                                                  length:indices.size() * sizeof(unsigned int)
                                                  options:MTLResourceStorageModeShared];
           if (!ibuf)
           {
@@ -5296,15 +5410,17 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
           vtkNew<vtkPoints> points;
           points->SetDataTypeToDouble();
 
+          // Corner order matches GL's ijkCorners {000,100,010,110,001,101,011,111}
+          // so that the shared tris[36] triangulates the faces with identical diagonals.
           double geometry[24] = {
             this->ModelBounds[0], this->ModelBounds[2], this->ModelBounds[4],
             this->ModelBounds[1], this->ModelBounds[2], this->ModelBounds[4],
-            this->ModelBounds[1], this->ModelBounds[3], this->ModelBounds[4],
             this->ModelBounds[0], this->ModelBounds[3], this->ModelBounds[4],
+            this->ModelBounds[1], this->ModelBounds[3], this->ModelBounds[4],
             this->ModelBounds[0], this->ModelBounds[2], this->ModelBounds[5],
             this->ModelBounds[1], this->ModelBounds[2], this->ModelBounds[5],
-            this->ModelBounds[1], this->ModelBounds[3], this->ModelBounds[5],
             this->ModelBounds[0], this->ModelBounds[3], this->ModelBounds[5],
+            this->ModelBounds[1], this->ModelBounds[3], this->ModelBounds[5],
           };
 
           for (int i = 0; i < 8; ++i)
@@ -5361,22 +5477,26 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
           pOrigin[i] = -fplanes[16 + 3] * fplanes[16 + i];
         }
 
-        // Transform normal to volume coordinates using inverse transpose
-        // For transforming normals from world space to object space, we need
-        // the inverse transpose of the model matrix
+        // Transform origin point to volume coordinates using inverse matrix
         vtkNew<vtkMatrix4x4> worldToData;
         vtkMatrix4x4::Invert(dataToWorld, worldToData);
-
-        // Transform origin point to volume coordinates using inverse matrix
         worldToData->MultiplyPoint(pOrigin, pOrigin);
 
-        // Transform normal using transpose of inverse (i.e., inverse transpose)
-        double* invMat = worldToData->GetData();
+        // Transform the near-plane normal to volume coordinates using the
+        // TRANSPOSE of the model matrix (not the inverse transpose), exactly
+        // like vtkOpenGLGPUVolumeRayCastMapper::RenderVolumeGeometry. For
+        // x_world = M x_obj, the plane n_world . x_world = d becomes
+        // (M^T n_world) . x_obj = d, so n_obj = M^T n_world. The inverse
+        // transpose is the correct transform for the reverse (object-to-world)
+        // direction only and diverges under a non-uniform model scale.
+        double* dmat = dataToWorld->GetData();
+        dataToWorld->Transpose();
         double pNormalV[3];
-        pNormalV[0] = pNormal[0] * invMat[0] + pNormal[1] * invMat[1] + pNormal[2] * invMat[2];
-        pNormalV[1] = pNormal[0] * invMat[4] + pNormal[1] * invMat[5] + pNormal[2] * invMat[6];
-        pNormalV[2] = pNormal[0] * invMat[8] + pNormal[1] * invMat[9] + pNormal[2] * invMat[10];
+        pNormalV[0] = pNormal[0] * dmat[0] + pNormal[1] * dmat[1] + pNormal[2] * dmat[2];
+        pNormalV[1] = pNormal[0] * dmat[4] + pNormal[1] * dmat[5] + pNormal[2] * dmat[6];
+        pNormalV[2] = pNormal[0] * dmat[8] + pNormal[1] * dmat[9] + pNormal[2] * dmat[10];
         vtkMath::Normalize(pNormalV);
+        dataToWorld->Transpose();
 
         // Apply offset to prevent hardware near-plane clipping
         double offset = (cam->GetClippingRange()[1] - cam->GetClippingRange()[0]) * 0.001;
@@ -5400,31 +5520,28 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         clip->SetInputData(boxSource);
         clip->SetPlanes(planes);
 
-        // Clip, densify, then triangulate to guarantee triangle output
+        // Clip, then densify — no vtkTriangleFilter. The OpenGL backend draws
+        // the first 3 vertices of every densified cell directly (see
+        // vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::RenderVolumeGeometry),
+        // and we must replicate that exactly: the extra triangulation of the
+        // clipped cap/side polygons produces interior-spanning triangles (and
+        // misses the near-plane cap at some pixels), which breaks the
+        // fragment anchors vs GL.
         vtkNew<vtkDensifyPolyData> densifyPolyData;
         densifyPolyData->SetInputConnection(clip->GetOutputPort());
         densifyPolyData->SetNumberOfSubdivisions(2);
+        densifyPolyData->Update();
 
-        vtkNew<vtkTriangleFilter> triFilter;
-        triFilter->SetInputConnection(densifyPolyData->GetOutputPort());
-        triFilter->Update();
-
-        vtkPolyData* finalPolyData = triFilter->GetOutput();
+        vtkPolyData* finalPolyData = densifyPolyData->GetOutput();
         vtkPoints* points = finalPolyData->GetPoints();
         vtkCellArray* polys = finalPolyData->GetPolys();
 
-        // Normalize clipped points from model-space to [0,1] for the vertex shader
-        double bmin[3] = { this->ModelBounds[0], this->ModelBounds[2], this->ModelBounds[4] };
-        double bsize[3] = {
-          this->ModelBounds[1] - this->ModelBounds[0],
-          this->ModelBounds[3] - this->ModelBounds[2],
-          this->ModelBounds[5] - this->ModelBounds[4]
-        };
-        for (int k = 0; k < 3; ++k)
-        {
-          if (std::fabs(bsize[k]) < 1e-10) bsize[k] = 1.0;
-        }
-
+        // OpenGL parity: upload the clipped/densified vertices in dataset
+        // (model) space directly — GL feeds this polydata's positions to the
+        // vertex shader as in_vertexPos without normalization. The vertex
+        // shader detects the camera-inside path via useCameraInsideNearClip and
+        // forwards in.position unchanged, so the interpolated fragment anchor is
+        // a dataset-space position just like GL's ip_vertexPos.
         std::vector<float> vertices;
         vertices.reserve(points->GetNumberOfPoints() * 3);
 
@@ -5432,11 +5549,14 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         {
           double pt[3];
           points->GetPoint(i, pt);
-          vertices.push_back(static_cast<float>((pt[0] - bmin[0]) / bsize[0]));
-          vertices.push_back(static_cast<float>((pt[1] - bmin[1]) / bsize[1]));
-          vertices.push_back(static_cast<float>((pt[2] - bmin[2]) / bsize[2]));
+          vertices.push_back(static_cast<float>(pt[0]));
+          vertices.push_back(static_cast<float>(pt[1]));
+          vertices.push_back(static_cast<float>(pt[2]));
         }
 
+        // Build the index list exactly like the OpenGL backend: the first 3
+        // vertices of every cell (densified triangles plus the clipped cap/side
+        // polygons that pass through densify un-triangulated).
         std::vector<unsigned int> indices;
         vtkIdType npts;
         const vtkIdType* pts;
@@ -5444,7 +5564,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
         polys->InitTraversal();
         while (polys->GetNextCell(npts, pts))
         {
-          if (npts != 3) continue;
+          if (npts < 3) continue;
           indices.push_back(static_cast<unsigned int>(pts[0]));
           indices.push_back(static_cast<unsigned int>(pts[1]));
           indices.push_back(static_cast<unsigned int>(pts[2]));
@@ -5823,15 +5943,14 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
   }
   else if (pt == VolumePipelineType::RenderToImage)
   {
-    // Composite the volume over the cleared (white) RTT background, matching the
-    // OpenGL RenderToImage framebuffer setup.
-    pipelineDesc.colorAttachments[0].blendingEnabled = YES;
-    pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
-    pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    pipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
-    pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-    pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    pipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+    // The OpenGL RenderToImage pass is UNBLENDED: the raycast shader writes its
+    // raw (premultiplied) color over the cleared white RTT background, so no
+    // ONE/ONE_MINUS_SRC_ALPHA compositing happens on attachment 0 (see
+    // vtkOpenGLGPUVolumeRayCastMapper.cxx vtkglClearColor(1.0,1.0,1.0,0.0)).
+    // Blending here would inject (1-alpha)*255 into every RTT pixel and produce
+    // the contour-concentrated 47,878-px GL-vs-Metal residual on
+    // TestGPURayCastRenderToTexture (VolumeRayCastBackendComparisonFindingsUpdate84.md).
+    pipelineDesc.colorAttachments[0].blendingEnabled = NO;
     pipelineDesc.colorAttachments[1].blendingEnabled = NO;
   }
   else
@@ -5887,6 +6006,13 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
     pipeline = (__bridge id<MTLRenderPipelineState>)this->PipelineState;
   }
   [encoder setRenderPipelineState:pipeline];
+  // Back-face culling parity with GL (vtkVolumeStateRAII: GL_CULL_FACE +
+  // glCullFace(GL_BACK), default front face GL_CCW). Now that the boxSource
+  // corner order matches GL's ijkCorners, the clip/densify mesh is
+  // byte-identical to GL's, so the front-facing winding must be
+  // counter-clockwise like GL's — the previous MTLWindingClockwise rendered
+  // the byte-identical mesh fully culled (dark image).
+  [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
   [encoder setCullMode:MTLCullModeBack];
 
   // Only bind depth state if the pipeline uses depth testing.
@@ -6290,10 +6416,10 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       double worldSpacing = fabs(cellSpacing[i] * sqrt(tmp2));
       minWorldSpacing = std::min(worldSpacing, minWorldSpacing);
     }
-    actualSampleDistance = minWorldSpacing;
+    actualSampleDistance = static_cast<float>(minWorldSpacing);
     if (this->ReductionFactor < 1.0 && this->ReductionFactor != 0.0)
     {
-      actualSampleDistance /= this->ReductionFactor;
+      actualSampleDistance /= static_cast<float>(this->ReductionFactor);
     }
   }
   else if (this->LockSampleDistanceToInputSpacing)
@@ -6468,6 +6594,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // NormalizeToVolumeSpace, normal scaled by the per-axis bounds size) so the
   // per-ray intersection distance is directly comparable to the box t-range.
   uniforms.UseCameraInsideNearClip = this->IsCameraInside(ren, vol) ? 1.0f : 0.0f;
+  uniforms.UseDataSpaceBoxVertices =
+    (uniforms.UseCameraInsideNearClip > 0.5f) ? 0.0f : 1.0f;
   uniforms.CameraInsideNearPlaneOrigin[3] = 1.0f;
   uniforms.CameraInsideNearPlaneNormal[3] = 0.0f;
   if (uniforms.UseCameraInsideNearClip > 0.5f)
@@ -6485,16 +6613,21 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       pOrigin[i] = -fplanes[16 + 3] * fplanes[16 + i];
     }
 
-    // Transform origin to model (data) space and the normal via the transpose of
-    // the inverse model matrix (same convention as the clipped-proxy geometry
-    // build in SetupBuffers, so the uniform clamp and the proxy-path clip agree).
+    // Transform origin to model (data) space via the inverse model matrix, and
+    // the normal via the TRANSPOSE of the model matrix (same convention as the
+    // clipped-proxy geometry build in SetupBuffers and OpenGL's
+    // RenderVolumeGeometry: for x_world = M x_obj, n_obj = M^T n_world; the
+    // inverse transpose is the reverse-direction transform and diverges under
+    // a non-uniform model scale).
     invModelMatrix->MultiplyPoint(pOrigin, pOrigin);
-    const double* invMat = invModelMatrix->GetData();
+    double* dmat = modelMatrix->GetData();
+    modelMatrix->Transpose();
     double pNormalV[3];
-    pNormalV[0] = pNormal[0] * invMat[0] + pNormal[1] * invMat[1] + pNormal[2] * invMat[2];
-    pNormalV[1] = pNormal[0] * invMat[4] + pNormal[1] * invMat[5] + pNormal[2] * invMat[6];
-    pNormalV[2] = pNormal[0] * invMat[8] + pNormal[1] * invMat[9] + pNormal[2] * invMat[10];
+    pNormalV[0] = pNormal[0] * dmat[0] + pNormal[1] * dmat[1] + pNormal[2] * dmat[2];
+    pNormalV[1] = pNormal[0] * dmat[4] + pNormal[1] * dmat[5] + pNormal[2] * dmat[6];
+    pNormalV[2] = pNormal[0] * dmat[8] + pNormal[1] * dmat[9] + pNormal[2] * dmat[10];
     vtkMath::Normalize(pNormalV);
+    modelMatrix->Transpose();
 
     // Precision offset identical to OpenGL's (and SetupBuffers'): a fraction of
     // the near-far distance, floored for very small volumes to avoid hardware
@@ -6572,12 +6705,23 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   {
     float normFactor = this->ScalarNormalizationFactor;
-    uniforms.ScalarMinHalf = FloatToHalf(static_cast<float>(this->ScalarRange[0] / normFactor));
+    // OpenGL in_volume_scale parity: GL's GetScaleAndBias divides by max+1 for
+    // normalized integer formats (R8Unorm/R16Unorm -> glScale = 1/256, 1/65536),
+    // so ScalarMin/ScalarMax must be uploaded in that space for the shader's
+    // 1.0f/max(scalarMax - scalarMin, 1e-4) to reproduce GL's in_volume_scale
+    // bit-for-bit (USHORT 0..4370: max = 4370/65536 = 0.0666809 -> scale =
+    // 14.9967966 == GL's). Float data keeps /normFactor (== /1; GL glScale = 1).
+    float glDenom = normFactor;
+    if (normFactor == 255.0f || normFactor == 65535.0f)
+    {
+      glDenom = normFactor + 1.0f;
+    }
+    uniforms.ScalarMinHalf = FloatToHalf(static_cast<float>(this->ScalarRange[0] / glDenom));
     uniforms.ScalarMaxHalf = FloatToHalf(static_cast<float>(
       (this->ScalarRange[1] > this->ScalarRange[0]
          ? this->ScalarRange[1]
          : this->ScalarRange[0] + 1.0) /
-      normFactor));
+      glDenom));
   }
 
   // Independent multi-component support (OpenGL in_scalarsRange parity):

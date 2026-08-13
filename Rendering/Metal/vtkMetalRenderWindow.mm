@@ -1260,6 +1260,18 @@ int vtkMetalRenderWindow::GetColorBufferSizes(int* rgba)
 }
 
 //------------------------------------------------------------------------------
+int vtkMetalRenderWindow::GetDepthBufferSize()
+{
+  // The depth attachment (and the multisampled depth attachment) are created
+  // as Depth32Float (see RecreateDepthTexture), so the effective precision is
+  // 32 bits. Returning 0 (the vtkRenderWindow default) makes vtkRenderer use a
+  // coarser NearClippingPlaneTolerance (0.01 instead of 0.001), which pushes
+  // the near clipping plane ~10x further from the eye and shifts the
+  // camera-inside near-plane-clipped ray starts.
+  return 32;
+}
+
+//------------------------------------------------------------------------------
 int vtkMetalRenderWindow::WritePixelData(
   int x_low, int y_low, int width, int height, int ncomp, const unsigned char* data)
 {
