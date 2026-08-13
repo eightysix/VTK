@@ -4872,7 +4872,7 @@ fragment VolumeFragmentOut fragment_volume_main(
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
-      stepSize, s.totalBoxT, in.position.xy, in.localPos,
+      stepSize, s.totalBoxT, in.position.xy, localPos,
       half3(0.0), 0.0h, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -4949,7 +4949,7 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
   half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
-      stepSize, s.totalBoxT, in.position.xy, in.localPos,
+      stepSize, s.totalBoxT, in.position.xy, localPos,
       half3(0.0), 0.0h, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
