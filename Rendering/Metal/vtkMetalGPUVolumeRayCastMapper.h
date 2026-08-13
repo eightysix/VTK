@@ -152,9 +152,11 @@ public:
   bool GetUseGPUMinMax() const { return this->UseGPUMinMax; }
 
   // Phase 6: Fullscreen camera-inside path.
-  // When false (default), camera-inside rendering uses the OpenGL-parity proxy
-  // geometry (ClipConvexPolyData + DensifyPolyData, drawn like the GL backend).
-  // Set true to use a fullscreen ray-cast fragment shader instead.
+  // When true (default), camera-inside rendering uses a fullscreen ray-cast
+  // fragment shader; setupVolumeRay clamps the entry to the near plane so the
+  // eye->near-plane slab is skipped exactly like the OpenGL proxy mesh. Set
+  // false to draw the CPU proxy geometry (ClipConvexPolyData + DensifyPolyData)
+  // instead.
   void SetUseFullscreenCameraInside(bool val) { this->UseFullscreenCameraInside = val; }
   bool GetUseFullscreenCameraInside() const { return this->UseFullscreenCameraInside; }
 
@@ -262,10 +264,10 @@ private:
   void ReleaseGradientNormalTexture();
 
   // Phase 6: Enables fullscreen ray-cast path when camera is inside the volume.
-  // Defaults to false so the camera-inside path uses the OpenGL-parity proxy
-  // geometry (near-plane-clipped densified mesh, fragment_volume_main). Set to
-  // true for the fullscreen triangle.
-  bool UseFullscreenCameraInside = false;
+  // Defaults to true; setupVolumeRay clamps the entry to the near plane, so the
+  // fullscreen path reproduces the OpenGL-parity proxy start. Set to false to
+  // force the CPU proxy geometry path.
+  bool UseFullscreenCameraInside = true;
 
   // Phase 5: GPU-based min/max acceleration generation.
   // When true, UpdateMinMaxTexture uses GPU compute kernels instead of CPU
