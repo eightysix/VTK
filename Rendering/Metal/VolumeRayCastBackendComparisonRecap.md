@@ -274,3 +274,29 @@ Every non-doc commit in the range, oldest first, grouped by the recap's phases. 
 - `ef4452a9bc` **fix(Metal):** camera-inside near-plane normal transform — use the transpose `M^T` of the model matrix instead of the inverse-transpose for world→data normals, bit-matching `vtkOpenGLGPUVolumeRayCastMapper::RenderVolumeGeometry`; fixes `TestGPURayCastCameraInsideNonUniformScaleTransform` (47,776 → 45,837 px; cap mesh byte-identical to GL).
 - `5371e30652` **fix(Metal) (update 83):** replace Interleaved Gradient Noise jitter with GL's exact blue-noise tile (`kBlueNoise64[4096]`, JPEG top-down byte order) sampled `(floor(st.y)−H) mod 64 / floor(st.x) mod 64` in all three jitter sites (fullscreen, RTT, grid-traversal, the last dropping its old `+0.5` half-pixel shift); adds `TestGPURayCastCameraInsideNonUniformScaleTransformKnobs` — jittered 300² test 45,840 → 29 px.
 - `fe81a78ebb` **fix(Metal) (update 84):** disable blending on the RenderToImage pipeline color attachment 0 (GL's RTT pass writes unblended over `vtkglClearColor(1.0,1.0,1.0,0.0)`) — `TestGPURayCastRenderToTexture` 47,878 px / max_d 65 → 1,471 px / max_d 1.
+
+---
+
+## 10. Essential rendering-logic fixes (proven benefit, no debug/promotion churn)
+
+The real correctness fixes to rendering logic from §9, excluding debug/dump plumbing, half→float precision promotions, tests/tools, and retracted or bit-exact (±1 ulp) parity chases.
+
+**Proven, large impact:**
+
+- `8f991da45b` — remove the `accumulatedOpacity=1.0` clamp at the opacity break + strict `>` break (`MetalShaders.metal:4814`). Root cause of the entire ±1 field (clamp zeroed the `dst*(1-a)` background blend term GL keeps): 63,692 → 188 px.
+- `fe81a78ebb` — disable blending on the RenderToImage pipeline color attachment (GL's RTT pass is unblended): `TestGPURayCastRenderToTexture` 47,878 → 1,471 px.
+- `5371e30652` — replace IGN jitter noise with GL's exact blue-noise tile `kBlueNoise64`: 45,840 → 29 px (only with `UseJittering` on).
+- `2f88ec35ac` — densify the camera-outside proxy box to GL's `vtkDensifyPolyData(2)` centroid-fan geometry in dataset space: 1384 → 250 px.
+- `6032ed6015` + `e40517af16` — march termination on GL's `g_dirStep` lattice bounds exit; removed the non-GL block-bounds exit: 5530 → 18 → 3 px.
+- `ef4452a9bc` — camera-inside near-plane normal via model-transpose `M^T`, not inverse-transpose (real math bug; wrong only under non-uniform scale): cap mesh byte-identical to GL, `TestGPURayCastCameraInsideNonUniformScaleTransform` 47,776 → 45,837 px.
+
+**Real logic fixes (benefit not isolated to a single metric):**
+
+- `a4415d2329` — shading applied to every `alpha>0` sample like GL (was skipping samples).
+- `fa52bf3773` — blend-mode-specific opacity correction applied to TF tables.
+- `970e84d6d5` — unorm scalar normalization `/(normFactor+1)` parity.
+- `f597ef686c` — `in_inversePVM` composed `inv(P)*inv(V)*inv(M)` (was `inv(V)*inv(P)`).
+- `a5a59cb1b4` — composite in GL's order `w*(c*a)`.
+- `c022b1f24a` — composite gate/termination thresholds aligned with GL.
+- `ec477e9df7` — camera-inside march clipped to the near-plane exit point.
+- Camera-inside proxy set (`7c663464e0`, `06d0619341`, `df934c8ad2`, `23e6c3d328`, `53df0dd93f`): GL `GL_BACK` winding, dataset-space anchor + `g_dirStep`, `ijkCorners` ordering, `tStart` clamp — proxy path matches GL with byte-identical cap mesh.
