@@ -289,6 +289,7 @@ The real correctness fixes to rendering logic from §9, excluding debug/dump plu
 - `2f88ec35ac` — densify the camera-outside proxy box to GL's `vtkDensifyPolyData(2)` centroid-fan geometry in dataset space: 1384 → 250 px.
 - `6032ed6015` + `e40517af16` — march termination on GL's `g_dirStep` lattice bounds exit; removed the non-GL block-bounds exit: 5530 → 18 → 3 px.
 - `ef4452a9bc` — camera-inside near-plane normal via model-transpose `M^T`, not inverse-transpose (real math bug; wrong only under non-uniform scale): cap mesh byte-identical to GL, `TestGPURayCastCameraInsideNonUniformScaleTransform` 47,776 → 45,837 px.
+- `e66a38ff60` — remove the fixed `MAX_RAY_STEPS=8192` march clamp (GL marches unbounded): long camera-inside rays at fine fixed steps truncated at ~40% composited; NoShadeAmp step sweep mean|Δ| at step 0.008 dropped 19.13 → 6.53 and is now uniform across steps.
 
 **Real logic fixes (benefit not isolated to a single metric):**
 
@@ -299,4 +300,6 @@ The real correctness fixes to rendering logic from §9, excluding debug/dump plu
 - `a5a59cb1b4` — composite in GL's order `w*(c*a)`.
 - `c022b1f24a` — composite gate/termination thresholds aligned with GL.
 - `ec477e9df7` — camera-inside march clipped to the near-plane exit point.
+- `6767cb0493` — report `GetDepthBufferSize()` as 32 (Metal depth attachment is `Depth32Float`): `vtkRenderer::ResetCameraClippingRange` otherwise picks `NearClippingPlaneTolerance=0.01` vs GL's 0.001, placing the camera-inside near-plane clip ~10x too far from the eye. Bundled in the same commit as the `VTK_METAL_VOLUME_LOG` harness logging; the logic part is this override alone.
+- `a25e73dd15` — cast `actualSampleDistance` to float in the autoAdjust branch to match GL's cast at `vtkOpenGLGPUVolumeRayCastMapper.cxx:1710` (Metal kept the double, a ±1 ulp divergence in the TF pre-integration factor). Real but immaterial — the field was unchanged (only 9 Metal pixels moved).
 - Camera-inside proxy set (`7c663464e0`, `06d0619341`, `df934c8ad2`, `23e6c3d328`, `53df0dd93f`): GL `GL_BACK` winding, dataset-space anchor + `g_dirStep`, `ijkCorners` ordering, `tStart` clamp — proxy path matches GL with byte-identical cap mesh.
