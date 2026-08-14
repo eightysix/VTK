@@ -1,5 +1,8 @@
 #import "VTKMetalBaseViewController.h"
 
+#include "vtkAutoInit.h"
+VTK_MODULE_INIT(vtkRenderingMetal);
+
 #include "vtkCamera.h"
 #include "vtkMath.h"
 #include "vtkNew.h"
