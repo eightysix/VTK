@@ -1749,7 +1749,14 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
 
   int dataType = scalars->GetDataType();
   int numComponents = scalars->GetNumberOfComponents();
-  vtkIdType numTuples = scalars->GetNumberOfTuples();
+  // Bound the conversion by the volume's voxel count: the staging buffer below
+  // is sized from dims, but over-provisioned arrays (e.g. vtkImplicitArray in
+  // TestSmartVolumeMapperImplicitArray) report more tuples than fit the texture.
+  // The OpenGL backend reads only the block-size slice of the array
+  // (vtkVolumeTexture::LoadTexture), so clamping restores parity and avoids an
+  // out-of-bounds write into the dims-sized buffer.
+  vtkIdType numTuples = std::min(scalars->GetNumberOfTuples(),
+    static_cast<vtkIdType>(dims[0]) * dims[1] * dims[2]);
 
   VolumeFormat fmtInfo = ChooseVolumeFormat(
     dataType, numComponents, this->ScalarRange, this->PreferHalfPrecision);
@@ -2892,7 +2899,14 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
 
       int dataType = scalars->GetDataType();
       int numComponents = scalars->GetNumberOfComponents();
-      vtkIdType numTuples = scalars->GetNumberOfTuples();
+      // Bound the conversion by the volume's voxel count: the staging buffer
+      // below is sized from dims, but over-provisioned arrays (e.g.
+      // vtkImplicitArray in TestSmartVolumeMapperImplicitArray) report more
+      // tuples than fit the texture. The OpenGL backend reads only the
+      // block-size slice of the array (vtkVolumeTexture::LoadTexture), so
+      // clamping restores parity and avoids an out-of-bounds write.
+      vtkIdType numTuples = std::min(scalars->GetNumberOfTuples(),
+        static_cast<vtkIdType>(dims[0]) * dims[1] * dims[2]);
 
       if (numComponents < 1 || numComponents > 4)
       {
