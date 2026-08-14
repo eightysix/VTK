@@ -5663,3 +5663,42 @@ kernel void volume_convert_ushort_to_uchar(
 
 // NOTE: double -> half/float kernels are not provided because Metal does not
 // support 'double' in device address space. VTK_DOUBLE data falls back to CPU.
+
+// ---------------------------------------------------------------------------
+// Projected tetrahedra (Shirley & Tuchman / Wylie 2002). The CPU-side mapper
+// (vtkMetalProjectedTetrahedraMapper) packs interleaved vertices with a 24-byte
+// stride: clip-space xyz (float3), packed RGBA color (uchar4), attenuation
+// (float), depth (float). The clip-space coordinates are already divided by w
+// (NDC), matching vtkglProjectedTetrahedraVS which emits gl_Position = vertexDC.
+// ---------------------------------------------------------------------------
+struct ProjectedTetrahedraVertexOut {
+  float4 position [[position]];
+  float3 fcolor;
+  float fdepth;
+  float fattenuation;
+};
+
+vertex ProjectedTetrahedraVertexOut vertex_projected_tetrahedra_main(
+    const device float* positions [[buffer(0)]],
+    const device uchar4* colors [[buffer(1)]],
+    const device float2* attenuationDepth [[buffer(2)]],
+    uint vertex_id [[vertex_id]]) {
+  ProjectedTetrahedraVertexOut out;
+  uint base = 3 * vertex_id;
+  out.position = float4(positions[base], positions[base + 1], positions[base + 2], 1.0);
+  // GL's scalarColor attribute is VTK_UNSIGNED_CHAR with normalized=true
+  // (3 components), so convert [0,255] -> [0,1] here.
+  out.fcolor = float3(colors[vertex_id].rgb) / 255.0;
+  out.fattenuation = attenuationDepth[vertex_id].x;
+  out.fdepth = attenuationDepth[vertex_id].y;
+  return out;
+}
+
+fragment float4 fragment_projected_tetrahedra_main(
+    ProjectedTetrahedraVertexOut in [[stage_in]]) {
+  float a = 1.0 - exp(-in.fattenuation * in.fdepth);
+  if (a <= 0.0) {
+    discard_fragment();
+  }
+  return float4(in.fcolor, a);
+}

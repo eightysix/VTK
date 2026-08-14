@@ -16,6 +16,7 @@ set(classes
   vtkMetalHardwareSelector
   vtkMetalGlyph3DMapper
   vtkMetalGPUVolumeRayCastMapper
+  vtkMetalProjectedTetrahedraMapper
   vtkMetalTextActor
   vtkMetalTextActor3D
   vtkMetalTextMapper
@@ -96,6 +97,9 @@ vtk_object_factory_declare(
 vtk_object_factory_declare(
   BASE vtkGPUVolumeRayCastMapper
   OVERRIDE vtkMetalGPUVolumeRayCastMapper)
+vtk_object_factory_declare(
+  BASE vtkProjectedTetrahedraMapper
+  OVERRIDE vtkMetalProjectedTetrahedraMapper)
 vtk_object_factory_declare(
   BASE vtkTextActor
   OVERRIDE vtkMetalTextActor)
