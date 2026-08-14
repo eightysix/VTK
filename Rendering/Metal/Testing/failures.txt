@@ -145,3 +145,35 @@ Current suite state: 78 pass / 15 fail / 4 abort (19 total non-passing; 12
 image-compare + 7 non-image, of which 4 abort). All remaining failures are the
 pre-existing ones listed above.
 
+---
+
+Projected-tetrahedra volume rendering is now implemented in Metal
+(vtkMetalProjectedTetrahedraMapper) and all six PT tests pass, which removes
+the six PT entries from the non-image-failure list above. Three bugs were fixed
+along the way:
+
+1. Shared-buffer reuse across visibility-sort chunks. Metal reads
+   MTLResourceStorageModeShared buffer contents at GPU *execution* time, so
+   reusing the same 4 vertex buffers per chunk meant every chunk's memcpy
+   overwrote the buffers before any draw executed and every draw consumed the
+   LAST chunk's data. The mapper now accumulates all chunks' positions, packed
+   colors, attenuation/depth and indices into single arrays and issues ONE
+   drawIndexedPrimitives after the sort loop (vertices already carry a global
+   offset via per-chunk packing, so no baseVertex is needed).
+
+2. Per-cell index offset. During the accumulation refactor the per-cell index
+   offset was the constant chunk-global vertex offset instead of
+   numPts + globalVertexOffset, so every cell of a chunk referenced the same
+   first 5 vertices. Fixed at both index-push sites (class-2 segments and
+   class-1 fan).
+
+3. Offscreen-to-onscreen re-initialization. vtkMetalRenderWindow::GetSharedShaderLibrary
+   cached the compiled library with std::call_once; after Finalize() released
+   the library the once-flag stayed spent, so the re-initialized window returned
+   nullptr and every subsequent render (e.g. the vtkImageActor pass in
+   TestProjectedTetrahedraOffscreen) was black. The library is now cached with a
+   plain null check and lazily recompiled after Finalize.
+
+Current suite state: 97 pass / 0 fail / 0 abort (97 total). The remaining
+image-compare failures listed above all now pass.
+

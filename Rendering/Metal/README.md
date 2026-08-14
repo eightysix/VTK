@@ -16,6 +16,22 @@ environment variable) from an application that invokes
 > `vtkObjectFactory::SetPreferences()` in-process (as `vtkMetalGLVisualComparison`
 > does) when a test must select a specific backend.
 
+## Projected tetrahedra volume rendering
+
+`vtkProjectedTetrahedraMapper` is overridden by `vtkMetalProjectedTetrahedraMapper`.
+It follows the OpenGL backend's Shirley & Tuchman / Wylie 2002 algorithm
+(segment-intersection projection, per-vertex attenuation and corrected depth).
+Two implementation notes:
+
+- All visibility-sort chunks are accumulated into a single set of vertex buffers
+  and issued as one indexed draw. Reusing buffers per chunk is unsafe on Metal:
+  `MTLResourceStorageModeShared` contents are read by the GPU at execution time,
+  so later `memcpy`s would overwrite the data earlier draws still need.
+- The CPU-side clip-space z (`[-1,1]`) is remapped to `[0,1]` when packing, so
+  the written depth matches the scene's projection (nearz=0/farz=1).
+
+All six `RenderingVolumeCxx-Metal` projected-tetrahedra tests pass.
+
 ## Volume rendering: nearest-vs-linear interpolation discrepancy
 
 ### Symptom
