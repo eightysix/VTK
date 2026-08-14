@@ -139,27 +139,50 @@ void vtkMetalRenderWindow::Initialize()
 //------------------------------------------------------------------------------
 void* vtkMetalRenderWindow::GetSharedShaderLibrary()
 {
-  std::call_once(this->LibraryInitFlag, [this]() {
-    @autoreleasepool {
-      id<MTLDevice> device = (id<MTLDevice>)this->MetalDevice;
-      if (!device)
-      {
-        vtkErrorMacro(<< "Cannot compile shader library: Metal device is null");
-        return;
-      }
-      NSString* source = [NSString stringWithUTF8String:vtkMetalShaders];
-      NSError* error = nil;
-      id<MTLLibrary> lib = [device newLibraryWithSource:source options:nil error:&error];
-      if (!lib)
-      {
-        vtkErrorMacro(<< "Failed to compile shared shader library: "
-                      << [[error localizedDescription] UTF8String]);
-        return;
-      }
-      this->SharedShaderLibrary = (void*)lib;
+  @autoreleasepool
+  {
+    // Fast path (double-checked locking, lock-free): the cached library is read
+    // with an atomic acquire load. An acquire-load pairs with the release-store
+    // that publishes the library, so a library compiled by another thread is
+    // fully initialized before it is used here.
+    id<MTLLibrary> lib = (id<MTLLibrary>)this->SharedShaderLibrary.load(std::memory_order_acquire);
+    if (lib)
+    {
+      return (void*)lib;
     }
-  });
-  return this->SharedShaderLibrary;
+
+    id<MTLDevice> device = (id<MTLDevice>)this->MetalDevice;
+    if (!device)
+    {
+      vtkErrorMacro(<< "Cannot compile shader library: Metal device is null");
+      return nullptr;
+    }
+
+    // Slow path: compile under the lock (at most one thread), re-checking the
+    // cache so a library published while we waited is reused instead of
+    // overwritten (which would leak the first one). The library is released by
+    // Finalize() (device re-created on the next Initialize), so an empty cache
+    // here also means recompile after Finalize; a std::call_once flag could not
+    // be re-armed, hence the plain cache + mutex.
+    std::lock_guard<std::mutex> lock(this->ShaderLibraryMutex);
+    lib = (id<MTLLibrary>)this->SharedShaderLibrary.load(std::memory_order_relaxed);
+    if (lib)
+    {
+      return (void*)lib;
+    }
+
+    NSString* source = [NSString stringWithUTF8String:vtkMetalShaders];
+    NSError* error = nil;
+    lib = [device newLibraryWithSource:source options:nil error:&error];
+    if (!lib)
+    {
+      vtkErrorMacro(<< "Failed to compile shared shader library: "
+                    << [[error localizedDescription] UTF8String]);
+      return nullptr;
+    }
+    this->SharedShaderLibrary.store((void*)lib, std::memory_order_release);
+    return (void*)lib;
+  }
 }
 
 //------------------------------------------------------------------------------
@@ -244,10 +267,13 @@ void vtkMetalRenderWindow::Finalize()
 
   this->ReleaseBoundTextures();
 
-  if (this->SharedShaderLibrary)
+  // Exchange publishes nullptr (release) so a concurrent getter's acquire load
+  // never observes a library that is being torn down; then release the old one.
+  id<MTLLibrary> sharedLib = (id<MTLLibrary>)this->SharedShaderLibrary.exchange(
+    nullptr, std::memory_order_acq_rel);
+  if (sharedLib)
   {
-    [(id)this->SharedShaderLibrary release];
-    this->SharedShaderLibrary = nullptr;
+    [sharedLib release];
   }
 
   for (auto& kv : this->CustomShaderLibraries)

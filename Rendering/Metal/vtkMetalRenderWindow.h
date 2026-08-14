@@ -16,6 +16,7 @@
 #include "vtkRenderingMetalModule.h" // for export macro
 #include "vtkWrappingHints.h"        // for VTK_MARSHALAUTO
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -450,8 +451,14 @@ protected:
   bool ColorReadbackEnabled = true;
 
   // Shared shader library — compiled once and reused across all pipelines.
-  void* SharedShaderLibrary = nullptr;  // id<MTLLibrary>
-  std::once_flag LibraryInitFlag;
+  // Released in Finalize() and lazily recompiled on the next render. Atomic so
+  // the getter's cache-hit path is a single lock-free load (double-checked
+  // locking) with no mutex overhead.
+  std::atomic<void*> SharedShaderLibrary{nullptr};  // id<MTLLibrary>
+
+  // Serializes lazy (re)compilation of SharedShaderLibrary so concurrent
+  // callers compile at most once and never overwrite an existing library.
+  std::mutex ShaderLibraryMutex;
 
   // Custom shader libraries (id<MTLLibrary>) compiled from the shared MSL
   // source with per-actor vtkShaderProperty replacements applied, keyed by the
