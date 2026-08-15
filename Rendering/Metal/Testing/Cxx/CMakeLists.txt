@@ -27,7 +27,10 @@ vtk_module_test_executable(vtkMetalGLVisualComparison TestMetalGLVisualCompariso
 target_link_libraries(vtkMetalGLVisualComparison
   PRIVATE
     vtkRenderingOpenGL2
-    vtkRenderingVolumeOpenGL2)
+    vtkRenderingVolumeOpenGL2
+    vtkDICOM
+    vtkImagingCore
+    vtkIOImage)
 
 add_test(
   NAME VTK::RenderingMetalCxx-TestMetalGLVisualComparison

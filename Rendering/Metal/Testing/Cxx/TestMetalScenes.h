@@ -21,6 +21,10 @@
 #ifndef TestMetalScenes_h
 #define TestMetalScenes_h
 
+#include <algorithm>
+#include <iostream>
+#include <cstdlib>
+
 #include "vtkActor.h"
 #include "vtkActor2D.h"
 #include "vtkAppendPolyData.h"
@@ -34,6 +38,8 @@
 #include "vtkCompositePolyDataMapperDelegator.h"
 #include "vtkConeSource.h"
 #include "vtkCubeSource.h"
+#include "vtkDICOMDirectory.h"
+#include "vtkDICOMReader.h"
 #include "vtkElevationFilter.h"
 #include "vtkFloatArray.h"
 #include "vtkPointData.h"
@@ -42,6 +48,7 @@
 #include "vtkImageData.h"
 #include "vtkImageMapper.h"
 #include "vtkImageProperty.h"
+#include "vtkImageShiftScale.h"
 #include "vtkImageSlice.h"
 #include "vtkImageSliceMapper.h"
 #include "vtkLight.h"
@@ -70,6 +77,7 @@
 #include "vtkOpenGLTexture.h"
 #include "vtkPartitionedDataSetCollection.h"
 #include "vtkPiecewiseFunction.h"
+#include "vtkPlane.h"
 #include "vtkPlaneSource.h"
 #include "vtkPoints.h"
 #include "vtkPolyData.h"
@@ -92,6 +100,11 @@ enum class BackendKind
   Metal,
   OpenGL
 };
+
+// DICOM study directory for the DICOM CT scene, set by the harness --dicom
+// argument (defined in TestMetalGLVisualComparison.cxx). The scene builder
+// falls back to the analytic volume when no directory is provided.
+extern const char* gDicomDir;
 
 // ---- Backend class factories ---------------------------------------------
 
@@ -1214,6 +1227,154 @@ inline void BuildPeelChainScene(vtkRenderer* renderer, BackendKind b, int n)
   renderer->SetUseDepthPeeling(true);
   renderer->SetMaximumNumberOfPeels(32);
   renderer->SetOcclusionRatio(0.0);
+}
+
+// ---- DICOM CT scene ---------------------------------------------------------
+inline double TempSampleDistance()
+{
+  if (const char* v = std::getenv("VTK_METAL_TEST_SAMPLE_DISTANCE"))
+    return std::atof(v);
+  return 0.5;
+}
+inline double TempImageSampleDistance()
+{
+  if (const char* v = std::getenv("VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE"))
+    return std::atof(v);
+  return 1.0;
+}
+inline bool TempMinMax()
+{
+  if (const char* v = std::getenv("VTK_METAL_TEST_MINMAX"))
+    return std::atoi(v) != 0;
+  return true;
+}
+inline bool TempJitter()
+{
+  if (const char* v = std::getenv("VTK_METAL_TEST_JITTER"))
+    return std::atoi(v) != 0;
+  return true;
+}
+
+// Replicates the DICOMVolumeViewController pipeline
+// (Examples/GUI/iOSMetal/test-vtk-metal/DICOMVolumeViewController.mm): a
+// vtkDICOMDirectory scan of the study -> series 0 -> vtkDICOMReader ->
+// vtkImageShiftScale cast to U8 (shift 1024, scale 255/4095, clamped, exactly
+// as the app does) -> the volume mapper configured with jittering, fixed 0.5
+// sample distance and GPU minmax (Metal), a (0,0,1) clipping plane and the
+// "Airways II" preset's transfer function (the first preset the app applies,
+// its 16-bit CLUT x-values rescaled to the U8 range).
+//
+// The reader output for CT is signed short (Hounsfield units) so the U8 cast
+// is the same 1-byte-per-voxel upload the app performs. The study directory
+// comes from gDicomDir (the harness --dicom argument). If no directory is
+// available, this scene falls back to the analytic volume so the harness still
+// renders a meaningful comparison everywhere.
+inline void BuildDICOMVolumeScene(vtkRenderer* renderer, BackendKind b)
+{
+  // The U8 volume is computed once and cached so both backends (and every
+  // bench rep) render the same data without re-reading the study.
+  static vtkSmartPointer<vtkImageData> cachedU8Volume;
+  static bool tried = false;
+  if (!tried)
+  {
+    tried = true;
+    if (gDicomDir)
+    {
+      vtkNew<vtkDICOMDirectory> dicomDir;
+      dicomDir->SetDirectoryName(gDicomDir);
+      dicomDir->Update();
+      if (dicomDir->GetNumberOfSeries() > 0)
+      {
+        vtkNew<vtkDICOMReader> reader;
+        reader->SetFileNames(dicomDir->GetFileNamesForSeries(0));
+        reader->Update();
+
+        vtkNew<vtkImageShiftScale> castToU8;
+        castToU8->SetInputConnection(reader->GetOutputPort());
+        castToU8->SetShift(1024.0);
+        castToU8->SetScale(255.0 / 4095.0);
+        castToU8->SetOutputScalarTypeToUnsignedChar();
+        castToU8->ClampOverflowOn();
+        castToU8->Update();
+        cachedU8Volume = castToU8->GetOutput();
+      }
+    }
+    if (!cachedU8Volume)
+    {
+      std::cerr << "BuildDICOMVolumeScene: no DICOM series (--dicom not set or "
+                   "no series found); falling back to the analytic volume.\n";
+    }
+  }
+
+  if (!cachedU8Volume)
+  {
+    BuildVolumeSceneSized(renderer, b, 128);
+    return;
+  }
+
+  // "Airways II" preset transfer function (VRPresets/Airways II.plist),
+  // x-values rescaled by the app's rescale: (hu + 1024) * (255/4095).
+  // Opacity: (-742.1,0) (-683,0.0493) (-481,0.2497) (-333.5,0); single color
+  // (0,0.605,0.706).
+  vtkNew<vtkColorTransferFunction> color;
+  vtkNew<vtkPiecewiseFunction> opacity;
+  const double xs[4] = { -742.1, -683.0, -481.0, -333.5 };
+  const double ys[4] = { 0.0, 0.0493, 0.2497, 0.0 };
+  for (int i = 0; i < 4; ++i)
+  {
+    const double x = (xs[i] + 1024.0) * (255.0 / 4095.0);
+    opacity->AddPoint(x, ys[i]);
+    color->AddRGBPoint(x, 0.0, 0.605, 0.706);
+  }
+
+  vtkNew<vtkVolumeProperty> property;
+  property->SetColor(color);
+  property->SetScalarOpacity(opacity);
+  property->SetInterpolationTypeToLinear();
+
+  vtkSmartPointer<vtkGPUVolumeRayCastMapper> mapper = NewVolumeMapper(b);
+  mapper->SetInputData(cachedU8Volume);
+  if (TempJitter())
+  {
+    mapper->UseJitteringOn();
+  }
+  else
+  {
+    mapper->UseJitteringOff();
+  }
+  mapper->AutoAdjustSampleDistancesOff();
+  mapper->SetSampleDistance(TempSampleDistance());
+  mapper->SetImageSampleDistance(TempImageSampleDistance());
+  if (b == BackendKind::Metal)
+  {
+    if (auto* metal = vtkMetalGPUVolumeRayCastMapper::SafeDownCast(mapper))
+    {
+      metal->SetUseGPUMinMax(TempMinMax());
+    }
+  }
+
+  // Clipping plane as the app starts with: normal (0,0,1), origin at the near
+  // z bound so nothing is clipped yet (the app scrolls the plane into the
+  // volume; here it starts at the front face, matching its initial state).
+  vtkNew<vtkPlane> clipPlane;
+  clipPlane->SetNormal(0, 0, 1);
+  double bounds[6];
+  cachedU8Volume->GetBounds(bounds);
+  clipPlane->SetOrigin(0, 0, bounds[4]);
+  mapper->AddClippingPlane(clipPlane);
+
+  vtkNew<vtkVolume> volume;
+  volume->SetMapper(mapper);
+  volume->SetProperty(property);
+  renderer->AddVolume(volume);
+
+  vtkSmartPointer<vtkCamera> camera = NewCamera(b);
+  renderer->SetActiveCamera(camera);
+  renderer->ResetCamera();
+  renderer->GetActiveCamera()->Elevation(20);
+  renderer->GetActiveCamera()->Azimuth(30);
+  renderer->GetActiveCamera()->Elevation(-40);
+  renderer->GetActiveCamera()->Azimuth(-60);
 }
 
 } // namespace vtkMetalScenes
