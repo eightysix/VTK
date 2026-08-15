@@ -66,6 +66,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections import Counter, defaultdict
 
 THRESHOLD = 0.05
@@ -124,6 +125,14 @@ def suite_runlog(prefix):
         else "/tmp/metal_suite_run.log"
 
 
+def mtime_ns(path):
+    """Modification time in nanoseconds, or None if the path doesn't exist."""
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return None
+
+
 def parse_ctest_console(path, prefix):
     """Failed/aborted test names from a ctest console log.
 
@@ -152,18 +161,26 @@ def parse_ctest_console(path, prefix):
 
 
 def parse_lastlog(path, prefix):
-    """All test names, image-compare failure metrics, and comparison image paths.
+    """All test names, failures, image-compare metrics, and comparison images.
 
-    An image-compare failure is identified by the
-    "Failed Image Test ( <Test>.png ) : <metric>" line vtkTesting emits only
-    when an image comparison fails (the ImageError DartMeasurement is also
-    printed for passing comparisons and non-image failures, so it is not used
-    as the discriminator). Returns (names, imgfails, imgs) where imgfails maps
-    test name -> TIGHT_VALID metric and imgs maps test name -> {metal, baseline,
-    diff} paths when present in the log.
+    LastTest.log is rewritten by ctest on every run, so it is the one
+    non-stale artifact of the most recent run.  Each test block ends with a
+    ctest status marker ("Test Passed." / "Test Failed.", or a
+    "Test Fail Reason:" detail), which identifies every failed test
+    regardless of how it failed.  An image-compare failure is additionally
+    identified by the "Failed Image Test ( <Test>.png ) : <metric>" line
+    vtkTesting emits only when an image comparison fails (the ImageError
+    DartMeasurement is also printed for passing comparisons and non-image
+    failures, so it is not used as the discriminator).
+
+    Returns (names, imgfails, imgs, failed) where imgfails maps test name ->
+    TIGHT_VALID metric, imgs maps test name -> {metal, baseline, diff} paths
+    when present in the log, and failed is the set of test names whose block
+    carries a ctest failure marker.
     """
     fail_img = re.compile(r"Failed Image Test \( ([A-Za-z0-9_]+\.png) \) : "
                           r"([\d.eE+-]+)")
+    fail_marker = re.compile(r"^Test (?:Failed\.|Fail Reason:)", re.M)
     with open(path, errors="replace") as fh:
         log = fh.read()
     esc = re.escape(prefix)
@@ -171,6 +188,7 @@ def parse_lastlog(path, prefix):
     blocks = re.split(r"\n(?=\d+/\d+ Testing: )", log)
     imgfails = {}
     imgs = {}
+    failed = set()
     for b in blocks:
         m = re.match(r"\d+/\d+ Testing: VTK::" + esc + r"-(\S+)", b)
         if not m:
@@ -179,6 +197,9 @@ def parse_lastlog(path, prefix):
         err = fail_img.search(b)
         if err:
             imgfails[name] = float(err.group(2))
+        tail = b.split("<end of output>")[-1] if "<end of output>" in b else b
+        if fail_marker.search(tail):
+            failed.add(name)
         im = {}
         for dm in re.finditer(
                 r'<DartMeasurementFile name="(\w+)"[^>]*>([^<]+)</DartMeasurementFile>', b):
@@ -187,18 +208,7 @@ def parse_lastlog(path, prefix):
                 im[key] = dm.group(2)
         if im:
             imgs[name] = im
-    return names, imgfails, imgs
-
-
-def parse_failed_list(path, prefix):
-    """Test names from ctest's LastTestsFailed.log (all failures incl. aborts)."""
-    out = set()
-    with open(path, errors="replace") as fh:
-        for line in fh:
-            line = line.strip()
-            if line:
-                out.add(line.split(":", 1)[-1].replace("VTK::" + prefix + "-", ""))
-    return out
+    return names, imgfails, imgs, failed
 
 
 def bucket(err):
@@ -273,12 +283,16 @@ def main(argv=None):
     runlog = os.path.abspath(args.runlog or suite_runlog(args.prefix))
     lastlog = os.path.abspath(args.lastlog or os.path.join(
         build_dir, "Testing", "Temporary", "LastTest.log"))
-    failed_list = os.path.join(build_dir, "Testing", "Temporary",
-                               "LastTestsFailed.log")
 
     if not args.no_run:
         print(f"== ctest --test-dir {build_dir} -R {args.prefix} -j {args.jobs}")
+        start_ns = time.time_ns()
         run_ctest(build_dir, args.prefix, args.jobs, runlog)
+        lastlog_ns = mtime_ns(lastlog)
+        if lastlog_ns is None or lastlog_ns < start_ns:
+            sys.exit("LastTest.log was not updated by this ctest run (no "
+                     "matching tests, or ctest itself failed); refusing to "
+                     "summarize stale logs")
     else:
         print("== --no-run: analyzing/exporting the last run's artifacts")
 
@@ -292,29 +306,26 @@ def main(argv=None):
 
     if not os.path.isfile(lastlog):
         sys.exit(f"missing --lastlog: {lastlog}")
-    names, imgfails, imgs = parse_lastlog(lastlog, args.prefix)
+    names, imgfails, imgs, failed = parse_lastlog(lastlog, args.prefix)
     if not names:
         sys.exit(f"no '{args.prefix}' tests found in {lastlog}; "
                  "run the suite first")
 
-    failed_names = set()
-    if os.path.isfile(failed_list):
-        failed_names = parse_failed_list(failed_list, args.prefix)
-    if failed_names:
-        aborts &= failed_names
-        if not runlog_had:
-            aborts = set()
-        fails = failed_names - aborts
-    else:
-        fails |= aborts
-        aborts = set()
-        if fails:
-            print("NOTE: LastTestsFailed.log not found; using the ctest log "
-                  "(crash/abort split unavailable)")
-    failed_names = (failed_names | fails | aborts) & names
+    # LastTest.log is rewritten by ctest on every run, so its per-test
+    # "Test Passed."/"Test Failed." markers are the authoritative, non-stale
+    # record of this run's results.  ctest only rewrites LastTestsFailed.log
+    # when a run has failures, so it would leak stale entries from an earlier
+    # run and is no longer consulted; the ctest console log is used solely to
+    # split failures into aborts vs. regular fails.
+    failed_names = failed & names
+    aborts = failed_names & aborts
+    fails = failed_names - aborts
     non_image = sorted(failed_names - set(imgfails))
+    if failed_names and not runlog_had:
+        print("NOTE: ctest log has no failure records; crash/abort split "
+              "unavailable (all failures listed as FAIL)")
 
-    passes = names - fails - aborts
+    passes = names - failed_names
     print(f"PASS {len(passes)}  FAIL {len(fails)}  ABORT {len(aborts)}  "
           f"(total {len(names)})")
 
