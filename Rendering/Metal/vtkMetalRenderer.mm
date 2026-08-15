@@ -302,19 +302,28 @@ void vtkMetalRenderer::DeviceRender()
       }
       rpd.colorAttachments[0].storeAction = colorStore;
 
-      // IDs texture for GPU picking (skip when MSAA active)
+      // Picking IDs attachment for GPU selection (vtkHardwareSelector). The
+      // attachment stays present so the scene/2D/gradient pipelines (which
+      // declare colorAttachments[1] whenever MSAA is inactive) stay consistent
+      // with the pass, but outside a selection render nothing writes to it, so
+      // its load/store actions go DontCare: no per-frame clear + DRAM store of
+      // the window-sized RGBA32Uint texture. During selection the standard
+      // Clear (first renderer) / Load (later renderers) / Store chain is used.
       if (!msaa)
       {
         id<MTLTexture> idsTex = (__bridge id<MTLTexture>)renWin->IdsTexture;
         if (idsTex)
         {
+          const bool selecting = (this->GetSelector() != nullptr);
           rpd.colorAttachments[1].texture = idsTex;
-          rpd.colorAttachments[1].loadAction = firstRenderer ? MTLLoadActionClear : MTLLoadActionLoad;
-          if (firstRenderer)
+          rpd.colorAttachments[1].loadAction =
+            selecting ? (firstRenderer ? MTLLoadActionClear : MTLLoadActionLoad) : MTLLoadActionDontCare;
+          if (selecting && firstRenderer)
           {
             rpd.colorAttachments[1].clearColor = MTLClearColorMake(0, 0, 0, 0);
           }
-          rpd.colorAttachments[1].storeAction = MTLStoreActionStore;
+          rpd.colorAttachments[1].storeAction =
+            selecting ? MTLStoreActionStore : MTLStoreActionDontCare;
         }
       }
 
@@ -404,7 +413,15 @@ void vtkMetalRenderer::DeviceRender()
       // later renderers in a multi-viewport window would leave their regions
       // showing the first renderer's clear color. When gradient mode is off
       // the same pass paints a flat Background color (Background2 == Background).
-      if (!this->Transparent() && !currentTexturedBackground)
+      //
+      // For a single renderer with a flat (non-gradient) background the pass is
+      // redundant: the first renderer already cleared the whole attachment with
+      // the same color (Background, BackgroundAlpha), exactly like GL's plain
+      // glClear — so skip the full-screen triangle and its depth-stencil state
+      // switches.
+      const bool flatSingleRenderer =
+        (totalRenderers == 1 && !this->GetGradientBackground());
+      if (!this->Transparent() && !currentTexturedBackground && !flatSingleRenderer)
       {
         static id<MTLRenderPipelineState> gradientPipeline = nil;
         static int gradientPipelineSampleCount = 0;
@@ -806,15 +823,20 @@ void vtkMetalRenderer::DeviceRender()
 
       // Picking IDs attachment — the standard pipelines declare
       // colorAttachments[1] (RGBA32Uint), so omitting it here makes the
-      // pass/pipeline mismatch and the translucent pass draws nothing.
+      // pass/pipeline mismatch and the translucent pass draws nothing. Outside
+      // a selection render nothing writes it, so use DontCare actions (see
+      // Phase 1); during selection load the IDs the opaque pass wrote.
       if (!msaa)
       {
         id<MTLTexture> idsTex = (__bridge id<MTLTexture>)renWin->IdsTexture;
         if (idsTex)
         {
+          const bool selecting = (this->GetSelector() != nullptr);
           rpd.colorAttachments[1].texture = idsTex;
-          rpd.colorAttachments[1].loadAction = MTLLoadActionLoad; // keep opaque IDs
-          rpd.colorAttachments[1].storeAction = MTLStoreActionStore;
+          rpd.colorAttachments[1].loadAction =
+            selecting ? MTLLoadActionLoad : MTLLoadActionDontCare;
+          rpd.colorAttachments[1].storeAction =
+            selecting ? MTLStoreActionStore : MTLStoreActionDontCare;
         }
       }
 
@@ -1198,15 +1220,19 @@ void vtkMetalRenderer::DeviceRender()
       // (RGBA32Uint, mirroring the scene pipelines), and the 2D mappers write
       // the prop id there during a hardware selection render. Without it the
       // overlay draws would be discarded and 2D props (vtkTextActor,
-      // vtkPolyDataMapper2D) could never be picked.
+      // vtkPolyDataMapper2D) could never be picked. Outside a selection render
+      // nothing writes it, so use DontCare actions (see Phase 1).
       if (!msaa)
       {
         id<MTLTexture> idsTex = (__bridge id<MTLTexture>)renWin->IdsTexture;
         if (idsTex)
         {
+          const bool selecting = (this->GetSelector() != nullptr);
           rpd.colorAttachments[1].texture = idsTex;
-          rpd.colorAttachments[1].loadAction = MTLLoadActionLoad; // keep scene IDs
-          rpd.colorAttachments[1].storeAction = MTLStoreActionStore;
+          rpd.colorAttachments[1].loadAction =
+            selecting ? MTLLoadActionLoad : MTLLoadActionDontCare;
+          rpd.colorAttachments[1].storeAction =
+            selecting ? MTLStoreActionStore : MTLStoreActionDontCare;
         }
       }
 

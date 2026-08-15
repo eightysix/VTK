@@ -685,6 +685,11 @@ void vtkMetalRenderWindow::Render()
         this->RecreateDepthTexture();
       }
 
+      // The window-sized RGBA32Uint picking-ID texture stays available so the
+      // renderer can keep the pass/pipeline attachments consistent on every
+      // frame (see vtkMetalRenderer::DeviceRender). Its per-frame clear+store
+      // cost is skipped outside hardware-selection renders (DontCare actions),
+      // so it is only exercised when a vtkHardwareSelector is active.
       id<MTLTexture> idsTex = (id<MTLTexture>)this->IdsTexture;
       if (!idsTex || idsTex.width != (NSUInteger)this->Size[0] ||
           idsTex.height != (NSUInteger)this->Size[1])

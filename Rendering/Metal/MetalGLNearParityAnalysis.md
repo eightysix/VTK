@@ -92,12 +92,13 @@ CPU" pattern), batched `setVertexBuffers:`/`setFragmentBuffers:`, empty passes
 skipped (volume pass only when volumes exist), camera transforms computed once
 per frame rather than per actor. The remaining opportunities, in impact order:
 
-1. **Always-on picking-ID color attachment.** `vtkMetalRenderWindow` creates a
-   window-sized RGBA32Uint `IdsTexture` every frame and both render passes bind
-   it as `colorAttachments[1]`, clear + store it, and every fragment shader
-   writes `out.ids` — doubling fragment color-store bandwidth even when no
-   `vtkHardwareSelector` is active. GL only enables its ID target during
-   selection passes. This is a fixed per-frame cost on every scene.
+1. **Always-on picking-ID color attachment.** `vtkMetalRenderWindow` keeps a
+   window-sized RGBA32Uint `IdsTexture`, every render pass binds it as
+   `colorAttachments[1]`, and it is cleared + stored every frame — ~2.5 MB of
+   DRAM store traffic per frame at 800×800 — even when no `vtkHardwareSelector`
+   is active (GL only enables its ID target during selection passes). The
+   `out.ids` write itself is already dead-code-eliminated outside selection by
+   the `kEmitIds` function constant, but the clear/store is unconditional.
 
 2. **Flat background drawn as a full-screen triangle every frame.** For a flat
    non-gradient background the renderer still runs a full-screen gradient
@@ -134,22 +135,31 @@ per frame rather than per actor. The remaining opportunities, in impact order:
 
 All changes are confined to `Rendering/Metal`.
 
-- **Skip the picking-ID attachment when no hardware selector is active**
-  (`vtkMetalRenderWindow`, `vtkMetalRenderer`, `vtkMetalPolyDataMapper`,
-  `MetalShaders.metal`): the RGBA32Uint `IdsTexture` is only created / bound and
-  the shader's `out.ids` write only emitted during a selection pass. Non-selection
-  frames render into a single color attachment like GL. (See `feat(#1)`.)
+- **Skip the picking-ID attachment's per-frame clear+store outside selection**
+  (`vtkMetalRenderer::DeviceRender`): every render pass that binds the RGBA32Uint
+  IDs attachment now uses `MTLLoadActionDontCare` / `MTLStoreActionDontCare` when
+  no `vtkHardwareSelector` is active, and the full Clear/Load/Store chain only
+  during a selection render. The attachment stays present so the scene/2D/
+  gradient pipelines (which declare `colorAttachments[1]` whenever MSAA is off)
+  stay consistent with the pass; the fragment `out.ids` write is already
+  dead-code-eliminated by the `kEmitIds` function constant outside selection, so
+  nothing writes it. (See `feat(#1)`.)
 - **Skip the flat-background pass for single-renderer flat frames**
   (`vtkMetalRenderer::DeviceRender`): the redundant full-screen triangle is no
   longer drawn when one renderer already cleared the attachment with the same
   color. (See `feat(#2)`.)
 - **Cache the per-actor model/normal matrices** (`vtkMetalPolyDataMapper`):
-  recomputed only when the actor, camera, or VBO shift-scale changes. (See
-  `feat(#3)`.)
-- **Tighten and precompute the batched uniform-bind range**
-  (`vtkMetalPolyDataMapper::ReplayRenderBundle`): the batching tables are built
-  once per bundle rebuild and the `set*Buffers:withRange:` calls span only the
-  live indices instead of the full 0–12 range. (See `feat(#4)`.)
+  the double-precision matrix math (model transpose, view×model 3×3 multiply,
+  3×3 invert) is cached per (renderer, actor) and recomputed only when the
+  actor matrix / VBO shift-scale (model matrix) or the camera view rotation
+  (normal matrix) actually changes — compared against the view-rotation floats,
+  not a camera MTime, which bumps every frame. (See `feat(#3)`.)
+- **Precompute and tighten the batched uniform-bind range**
+  (`vtkMetalPolyDataMapper::ReplayRenderBundle` / `RebuildRenderBundle`): the
+  uniform-bind batching tables are built once when the render bundle is
+  recorded instead of rescanning the command list on every replay, and the
+  `set*Buffers:withRange:` calls span only the live uniform indices instead of
+  the full 0–12 range. (See `feat(#4)`.)
 
 ## Reproduction
 
@@ -162,3 +172,16 @@ All changes are confined to `Rendering/Metal`.
 The full-suite run verifies the visual comparison (worst thresholded error stays
 0.095, the pre-existing VolumeRayCast value) and re-measures the M/GL table; the
 isolated scene runs separate real backend differences from measurement noise.
+
+The Metal ctest image-comparison suites also verify the changes:
+`Rendering/Metal/Testing/metal_ctest_report.py` (RenderingCoreCxx-Metal) and
+`-p RenderingVolumeCxx-Metal` both stay fully green (175/175 and 97/97) with the
+implemented changes, matching the pre-change baseline.
+
+The benchmark cannot resolve the implemented savings: CpxActorHi's M/GL ratio
+swings 0.98–1.08 run-to-run (thermal/clock noise of several percent on both
+backends), which is larger than the combined ~1–2% of frame time these changes
+remove. The savings are real fixed per-frame / per-actor work (a window-sized
+RGBA32Uint clear+store, a redundant full-screen triangle, ~1024 double-precision
+matrix computations, and a per-replay command scan) but each is a small fraction
+of the ~9 µs/draw frame, so they do not move the wall clock measurably.

@@ -1117,6 +1117,30 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
     std::vector<RenderBundleDrawCommand> Commands;
     bool Valid = false;
 
+    // Precomputed uniform-bind batching tables used by ReplayRenderBundle:
+    // which shader buffer indices collapse into one setVertexBuffers: /
+    // setFragmentBuffers: call against the packed per-(renderer, actor) uniform
+    // buffer, plus the tight contiguous range covering them. The tables depend
+    // only on the recorded command list, so they are built once when the bundle
+    // is recorded instead of rescanning the commands on every replay.
+    struct BatchTable
+    {
+      static constexpr int kCount = 13; // shader buffer indices 0..12
+      int VSlotAt[kCount] = {};
+      int FSlotAt[kCount] = {};
+      bool VBatched[kCount] = {};
+      bool FBatched[kCount] = {};
+      bool VConflict[kCount] = {};
+      bool FConflict[kCount] = {};
+      bool VNonUniform[kCount] = {};
+      bool FNonUniform[kCount] = {};
+      int VRangeStart = 0;
+      int VRangeLen = 0;
+      int FRangeStart = 0;
+      int FRangeLen = 0;
+      bool AnyBatched = false;
+    } Batch;
+
     void Invalidate()
     {
       Commands.clear();
@@ -1160,6 +1184,20 @@ struct vtkMetalPolyDataMapper::vtkMetalPolyDataMapperInternals
   struct PerRendererActorUniforms
   {
     id<MTLBuffer> Buffer = nil;
+
+    // Cache of the per-(renderer, actor) scene-uniform model and normal
+    // matrices so the double-precision matrix math in RenderPiece does not run
+    // for every actor on every frame (draw-call-bound scenes pay it 1024x).
+    // The model matrix depends only on the actor's model-to-world matrix and
+    // the VBO shift/scale; the view-space normal matrix additionally depends
+    // on the camera's view rotation. Valid only while the tracked inputs match.
+    vtkMTimeType ModelMTime = 0;
+    double VBOShift[3] = { 0.0, 0.0, 0.0 };
+    double VBOScale[3] = { 1.0, 1.0, 1.0 };
+    float ModelMat[16] = {};
+    vtkMTimeType NormalMTime = 0;
+    float NormalViewRot[9] = {};
+    float NormalMat[9] = {};
 
     void Release()
     {
@@ -1623,105 +1661,44 @@ void vtkMetalPolyDataMapper::ReplayRenderBundle(
   // Batch the recorded uniform-buffer binds into one setVertexBuffers: and one
   // setFragmentBuffers: call, so each draw rebinds a single packed uniform
   // buffer (one resource, one render-state update per stage) instead of up to
-  // twelve individual set*Buffer calls. A shader index can only be batched
-  // when every recorded bind at that index maps to the same uniform slot AND
-  // the index is never used for a non-uniform (geometry) buffer: pipelines
-  // disagree on fragment buffer(4) (EdgeUniforms for the surface pipeline,
-  // VertexColorUniforms for the points pipeline), and vertex buffer(12) is
-  // PropIdBuffer in the point pipelines but ScalarCoordBuffer in the scalar
-  // pipeline. Conflicting/geometry indices stay as in-order individual binds.
-  constexpr int kShaderBufferCount = 13; // shader buffer indices 0..12
-  int vSlotAt[kShaderBufferCount] = {};
-  int fSlotAt[kShaderBufferCount] = {};
-  bool vBatched[kShaderBufferCount] = {};
-  bool fBatched[kShaderBufferCount] = {};
-  bool vConflict[kShaderBufferCount] = {};
-  bool fConflict[kShaderBufferCount] = {};
-  bool vNonUniform[kShaderBufferCount] = {};
-  bool fNonUniform[kShaderBufferCount] = {};
-  bool anyBatched = false;
-  if (packed)
+  // twelve individual set*Buffer calls. The batching tables were computed when
+  // the bundle was recorded (see RebuildRenderBundle): a shader index can only
+  // be batched when every recorded bind at that index maps to the same uniform
+  // slot AND the index is never used for a non-uniform (geometry) buffer
+  // (pipelines disagree on fragment buffer(4) and vertex buffer(12), for
+  // example). Conflicting/geometry indices stay as in-order individual binds.
+  // The batched bind spans only the live uniform indices (a tight range) rather
+  // than the full 0..12, trimming per-draw render-state update cost.
+  const auto& batch = this->Internals->Bundle.Batch;
+  if (packed && batch.AnyBatched)
   {
-    for (const auto& cmd : this->Internals->Bundle.Commands)
+    if (batch.VRangeLen > 0)
     {
-      switch (cmd.type)
+      id<MTLBuffer> vBufs[vtkMetalPolyDataMapperInternals::RenderBundle::BatchTable::kCount];
+      NSUInteger vOffs[vtkMetalPolyDataMapperInternals::RenderBundle::BatchTable::kCount];
+      for (int i = 0; i < batch.VRangeLen; ++i)
       {
-        case Cmd::SetVertexBuffer:
-        {
-          const auto& p = std::get<Cmd::SetBufferParams>(cmd.params);
-          if (p.index >= kShaderBufferCount)
-          {
-            break;
-          }
-          if (p.uniformSlot < 0)
-          {
-            vNonUniform[p.index] = true;
-          }
-          else if (!vBatched[p.index])
-          {
-            vSlotAt[p.index] = p.uniformSlot;
-            vBatched[p.index] = true;
-          }
-          else if (vSlotAt[p.index] != p.uniformSlot)
-          {
-            vConflict[p.index] = true;
-          }
-          break;
-        }
-        case Cmd::SetFragmentBuffer:
-        {
-          const auto& p = std::get<Cmd::SetBufferParams>(cmd.params);
-          if (p.index >= kShaderBufferCount)
-          {
-            break;
-          }
-          if (p.uniformSlot < 0)
-          {
-            fNonUniform[p.index] = true;
-          }
-          else if (!fBatched[p.index])
-          {
-            fSlotAt[p.index] = p.uniformSlot;
-            fBatched[p.index] = true;
-          }
-          else if (fSlotAt[p.index] != p.uniformSlot)
-          {
-            fConflict[p.index] = true;
-          }
-          break;
-        }
-        default:
-          break;
-      }
-    }
-    for (int i = 0; i < kShaderBufferCount; ++i)
-    {
-      if (vBatched[i] && !vConflict[i] && !vNonUniform[i])
-      {
-        anyBatched = true;
-      }
-      if (fBatched[i] && !fConflict[i] && !fNonUniform[i])
-      {
-        anyBatched = true;
-      }
-    }
-    if (anyBatched)
-    {
-      id<MTLBuffer> vBufs[kShaderBufferCount];
-      NSUInteger vOffs[kShaderBufferCount];
-      id<MTLBuffer> fBufs[kShaderBufferCount];
-      NSUInteger fOffs[kShaderBufferCount];
-      for (int i = 0; i < kShaderBufferCount; ++i)
-      {
-        const bool vBatch = vBatched[i] && !vConflict[i] && !vNonUniform[i];
-        const bool fBatch = fBatched[i] && !fConflict[i] && !fNonUniform[i];
+        const int idx = batch.VRangeStart + i;
+        const bool vBatch = batch.VBatched[idx] && !batch.VConflict[idx] && !batch.VNonUniform[idx];
         vBufs[i] = vBatch ? packed : nil;
-        vOffs[i] = vBatch ? this->Internals->UniformSlotOffsets[vSlotAt[i]] : 0;
-        fBufs[i] = fBatch ? packed : nil;
-        fOffs[i] = fBatch ? this->Internals->UniformSlotOffsets[fSlotAt[i]] : 0;
+        vOffs[i] = vBatch ? this->Internals->UniformSlotOffsets[batch.VSlotAt[idx]] : 0;
       }
-      [encoder setVertexBuffers:vBufs offsets:vOffs withRange:NSMakeRange(0, kShaderBufferCount)];
-      [encoder setFragmentBuffers:fBufs offsets:fOffs withRange:NSMakeRange(0, kShaderBufferCount)];
+      [encoder setVertexBuffers:vBufs offsets:vOffs
+        withRange:NSMakeRange((NSUInteger)batch.VRangeStart, (NSUInteger)batch.VRangeLen)];
+    }
+    if (batch.FRangeLen > 0)
+    {
+      id<MTLBuffer> fBufs[vtkMetalPolyDataMapperInternals::RenderBundle::BatchTable::kCount];
+      NSUInteger fOffs[vtkMetalPolyDataMapperInternals::RenderBundle::BatchTable::kCount];
+      for (int i = 0; i < batch.FRangeLen; ++i)
+      {
+        const int idx = batch.FRangeStart + i;
+        const bool fBatch = batch.FBatched[idx] && !batch.FConflict[idx] && !batch.FNonUniform[idx];
+        fBufs[i] = fBatch ? packed : nil;
+        fOffs[i] = fBatch ? this->Internals->UniformSlotOffsets[batch.FSlotAt[idx]] : 0;
+      }
+      [encoder setFragmentBuffers:fBufs offsets:fOffs
+        withRange:NSMakeRange((NSUInteger)batch.FRangeStart, (NSUInteger)batch.FRangeLen)];
     }
   }
 
@@ -1738,9 +1715,10 @@ void vtkMetalPolyDataMapper::ReplayRenderBundle(
         // Skip uniform binds already covered by the batched setVertexBuffers
         // call (the batch bound the packed buffer at the slot's offset for the
         // whole draw, so the per-command bind would be redundant).
+        constexpr int kShaderBufferCount = 13; // shader buffer indices 0..12
         if (packed && p.uniformSlot >= 0 && p.index < kShaderBufferCount &&
-          vBatched[p.index] && !vConflict[p.index] && !vNonUniform[p.index] &&
-          vSlotAt[p.index] == p.uniformSlot)
+          batch.VBatched[p.index] && !batch.VConflict[p.index] && !batch.VNonUniform[p.index] &&
+          batch.VSlotAt[p.index] == p.uniformSlot)
         {
           break;
         }
@@ -1769,9 +1747,10 @@ void vtkMetalPolyDataMapper::ReplayRenderBundle(
             (void*)act, p.uniformSlot, fb[0], fb[1], fb[2], fb[3]);
         }
         // Skip uniform binds already covered by the batched setFragmentBuffers call.
+        constexpr int kShaderBufferCount = 13; // shader buffer indices 0..12
         if (packed && p.uniformSlot >= 0 && p.index < kShaderBufferCount &&
-          fBatched[p.index] && !fConflict[p.index] && !fNonUniform[p.index] &&
-          fSlotAt[p.index] == p.uniformSlot)
+          batch.FBatched[p.index] && !batch.FConflict[p.index] && !batch.FNonUniform[p.index] &&
+          batch.FSlotAt[p.index] == p.uniformSlot)
         {
           break;
         }
@@ -3253,6 +3232,90 @@ void vtkMetalPolyDataMapper::RebuildRenderBundle(
   this->Internals->BundleLighting = act->GetProperty()->GetLighting();
   this->Internals->BundleExtraAttributesMTime = extraMTime;
   this->Internals->BundleBatchOverrideMTime = batchOverrideMTime;
+
+  // Precompute the uniform-bind batching table for replay (the scan was
+  // previously repeated on every ReplayRenderBundle call). A shader index can
+  // only be batched when every recorded bind at that index maps to the same
+  // uniform slot AND the index is never used for a non-uniform (geometry)
+  // buffer. VRangeStart/FRangeStart are kCount when nothing batches there.
+  auto& batch = this->Internals->Bundle.Batch;
+  batch = vtkMetalPolyDataMapperInternals::RenderBundle::BatchTable{};
+  {
+    constexpr int kShaderBufferCount = 13;
+    for (const auto& bcmd : this->Internals->Bundle.Commands)
+    {
+      switch (bcmd.type)
+      {
+        case Cmd::SetVertexBuffer:
+        {
+          const auto& p = std::get<Cmd::SetBufferParams>(bcmd.params);
+          if (p.index >= kShaderBufferCount)
+          {
+            break;
+          }
+          if (p.uniformSlot < 0)
+          {
+            batch.VNonUniform[p.index] = true;
+          }
+          else if (!batch.VBatched[p.index])
+          {
+            batch.VSlotAt[p.index] = p.uniformSlot;
+            batch.VBatched[p.index] = true;
+          }
+          else if (batch.VSlotAt[p.index] != p.uniformSlot)
+          {
+            batch.VConflict[p.index] = true;
+          }
+          break;
+        }
+        case Cmd::SetFragmentBuffer:
+        {
+          const auto& p = std::get<Cmd::SetBufferParams>(bcmd.params);
+          if (p.index >= kShaderBufferCount)
+          {
+            break;
+          }
+          if (p.uniformSlot < 0)
+          {
+            batch.FNonUniform[p.index] = true;
+          }
+          else if (!batch.FBatched[p.index])
+          {
+            batch.FSlotAt[p.index] = p.uniformSlot;
+            batch.FBatched[p.index] = true;
+          }
+          else if (batch.FSlotAt[p.index] != p.uniformSlot)
+          {
+            batch.FConflict[p.index] = true;
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    }
+    int vMin = kShaderBufferCount, vMax = -1;
+    int fMin = kShaderBufferCount, fMax = -1;
+    for (int i = 0; i < kShaderBufferCount; ++i)
+    {
+      if (batch.VBatched[i] && !batch.VConflict[i] && !batch.VNonUniform[i])
+      {
+        batch.AnyBatched = true;
+        vMin = std::min(vMin, i);
+        vMax = std::max(vMax, i);
+      }
+      if (batch.FBatched[i] && !batch.FConflict[i] && !batch.FNonUniform[i])
+      {
+        batch.AnyBatched = true;
+        fMin = std::min(fMin, i);
+        fMax = std::max(fMax, i);
+      }
+    }
+    batch.VRangeStart = vMin;
+    batch.VRangeLen = (vMax >= vMin) ? (vMax - vMin + 1) : 0;
+    batch.FRangeStart = fMin;
+    batch.FRangeLen = (fMax >= fMin) ? (fMax - fMin + 1) : 0;
+  }
 }
 
 //------------------------------------------------------------------------------
@@ -3843,61 +3906,123 @@ void vtkMetalPolyDataMapper::RenderPiece(vtkRenderer* ren, vtkActor* act)
       // The shader applies scene.modelMatrix to model-space vertices, so store the
       // actor's model-to-world matrix here (transposed like the camera matrices,
       // since Metal indexes matrices column-major).
+      //
+      // The model/normal matrices are cached per (renderer, actor) and recomputed
+      // only when their inputs change (actor matrix / VBO shift-scale for the
+      // model matrix, plus the camera view rotation for the normal matrix), so
+      // the double-precision math and matrix allocation do not run for every
+      // actor on every frame. The camera key cannot be an MTime: the camera is
+      // re-rendered every frame and bumps its MTime even when static, so the
+      // actual view-rotation floats are compared instead.
       {
-        // Compute the scene uniforms with stack arrays instead of heap vtkNew
-        // matrix objects: this block runs once per actor per frame, and the 6
-        // allocations/actor become ~6k allocations on a 32x32 actor grid.
-        vtkNew<vtkMatrix4x4> actorMatrix;
-        act->GetModelToWorldMatrix(actorMatrix);
+        auto* uniforms = this->Internals->GetRendererActorUniforms(ren, act);
+        const vtkMTimeType actorMTime = act->GetMTime();
+        const double* vshift = this->Internals->VBOShift;
+        const double* vscale = this->Internals->VBOScale;
 
-        // When VBO coordinates were shifted/scaled (the positions are baked as
-        // (p - shift) * scale), the model matrix must map the baked values back
-        // to model space: adjusted = actorMatrix * Translate(shift) * Scale(1/scale).
-        // With the shift-scale disabled the extra transform is the identity, so
-        // the multiply is unconditional.
-        double vboInverse[16];
-        vtkMatrix4x4::Identity(vboInverse);
-        vboInverse[0] = 1.0 / this->Internals->VBOScale[0];
-        vboInverse[5] = 1.0 / this->Internals->VBOScale[1];
-        vboInverse[10] = 1.0 / this->Internals->VBOScale[2];
-        vboInverse[3] = this->Internals->VBOShift[0];
-        vboInverse[7] = this->Internals->VBOShift[1];
-        vboInverse[11] = this->Internals->VBOShift[2];
-        double adjusted[16];
-        vtkMatrix4x4::Multiply4x4(*actorMatrix->Element, vboInverse, adjusted);
-
-        float* modelMat = reinterpret_cast<float*>(buf + 176);
-        for (int col = 0; col < 4; ++col)
+        const bool modelMatHit = (uniforms->ModelMTime == actorMTime &&
+          uniforms->VBOShift[0] == vshift[0] && uniforms->VBOShift[1] == vshift[1] &&
+          uniforms->VBOShift[2] == vshift[2] && uniforms->VBOScale[0] == vscale[0] &&
+          uniforms->VBOScale[1] == vscale[1] && uniforms->VBOScale[2] == vscale[2]);
+        if (modelMatHit)
         {
-          for (int row = 0; row < 4; ++row)
+          memcpy(buf + 176, uniforms->ModelMat, sizeof(uniforms->ModelMat));
+        }
+        else
+        {
+          vtkNew<vtkMatrix4x4> actorMatrix;
+          act->GetModelToWorldMatrix(actorMatrix);
+
+          // When VBO coordinates were shifted/scaled (the positions are baked as
+          // (p - shift) * scale), the model matrix must map the baked values back
+          // to model space: adjusted = actorMatrix * Translate(shift) * Scale(1/scale).
+          // With the shift-scale disabled the extra transform is the identity, so
+          // the multiply is unconditional.
+          double vboInverse[16];
+          vtkMatrix4x4::Identity(vboInverse);
+          vboInverse[0] = 1.0 / vscale[0];
+          vboInverse[5] = 1.0 / vscale[1];
+          vboInverse[10] = 1.0 / vscale[2];
+          vboInverse[3] = vshift[0];
+          vboInverse[7] = vshift[1];
+          vboInverse[11] = vshift[2];
+          double adjusted[16];
+          vtkMatrix4x4::Multiply4x4(*actorMatrix->Element, vboInverse, adjusted);
+
+          float* modelMat = reinterpret_cast<float*>(buf + 176);
+          for (int col = 0; col < 4; ++col)
           {
-            modelMat[col * 4 + row] = static_cast<float>(adjusted[row * 4 + col]);
+            for (int row = 0; row < 4; ++row)
+            {
+              modelMat[col * 4 + row] = static_cast<float>(adjusted[row * 4 + col]);
+            }
           }
+          memcpy(uniforms->ModelMat, modelMat, sizeof(uniforms->ModelMat));
+          uniforms->ModelMTime = actorMTime;
+          memcpy(uniforms->VBOShift, vshift, sizeof(uniforms->VBOShift));
+          memcpy(uniforms->VBOScale, vscale, sizeof(uniforms->VBOScale));
         }
 
         // Rebuild the view-space normal matrix from the combined view * model
         // rotation (the camera's cached NormalMatrix only contains the view 3x3).
         // The cached ViewMatrix is stored transposed (Metal indexes matrices
         // column-major), so element (row, col) lives at buf[col * 4 + row].
-        double viewRot[9], modelRot[9], normalMat[9], normalMatInv[9];
         const float* viewMat = reinterpret_cast<float*>(buf);
-        for (int r = 0; r < 3; ++r)
+        bool normalMatHit = (uniforms->NormalMTime == actorMTime);
+        if (normalMatHit)
         {
-          for (int c = 0; c < 3; ++c)
+          for (int i = 0; i < 9 && normalMatHit; ++i)
           {
-            viewRot[r * 3 + c] = viewMat[c * 4 + r];
-            modelRot[r * 3 + c] = actorMatrix->GetElement(r, c);
+            const int r = i / 3;
+            const int c = i % 3;
+            normalMatHit = (uniforms->NormalViewRot[i] == viewMat[c * 4 + r]);
           }
         }
-        vtkMatrix3x3::Multiply3x3(viewRot, modelRot, normalMat);
-        vtkMatrix3x3::Invert(normalMat, normalMatInv);
-        float* normalMatBuf = reinterpret_cast<float*>(buf + 128);
-        for (int i = 0; i < 3; ++i)
+        if (normalMatHit)
         {
-          for (int j = 0; j < 3; ++j)
+          // The shader reads the 3x3 as a padded (stride-4) float3x3, so
+          // scatter the cached 9 contiguous floats into that layout instead of
+          // memcpy'ing them contiguously (which would misalign columns 2+).
+          float* normalMatBuf = reinterpret_cast<float*>(buf + 128);
+          for (int i = 0; i < 3; ++i)
           {
-            normalMatBuf[i * 4 + j] = static_cast<float>(normalMatInv[i * 3 + j]);
+            for (int j = 0; j < 3; ++j)
+            {
+              normalMatBuf[i * 4 + j] = uniforms->NormalMat[i * 3 + j];
+            }
           }
+        }
+        else
+        {
+          vtkNew<vtkMatrix4x4> actorMatrix;
+          act->GetModelToWorldMatrix(actorMatrix);
+          double viewRot[9], modelRot[9], normalMat[9], normalMatInv[9];
+          for (int r = 0; r < 3; ++r)
+          {
+            for (int c = 0; c < 3; ++c)
+            {
+              viewRot[r * 3 + c] = viewMat[c * 4 + r];
+              modelRot[r * 3 + c] = actorMatrix->GetElement(r, c);
+            }
+          }
+          vtkMatrix3x3::Multiply3x3(viewRot, modelRot, normalMat);
+          vtkMatrix3x3::Invert(normalMat, normalMatInv);
+          float* normalMatBuf = reinterpret_cast<float*>(buf + 128);
+          for (int i = 0; i < 3; ++i)
+          {
+            for (int j = 0; j < 3; ++j)
+            {
+              normalMatBuf[i * 4 + j] = static_cast<float>(normalMatInv[i * 3 + j]);
+            }
+          }
+          for (int i = 0; i < 9; ++i)
+          {
+            const int r = i / 3;
+            const int c = i % 3;
+            uniforms->NormalViewRot[i] = viewMat[c * 4 + r];
+            uniforms->NormalMat[i] = normalMatBuf[(r * 4) + c];
+          }
+          uniforms->NormalMTime = actorMTime;
         }
       }
 
