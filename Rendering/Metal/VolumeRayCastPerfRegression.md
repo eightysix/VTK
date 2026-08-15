@@ -614,6 +614,16 @@ and many blocks add geometry/CPU-side costs. Re-evaluating each lever:
     - **Depth-occlusion fetch: measured negligible** (forcing `useDepthTexture`
       off changed nothing at sd 0.5 or sd 4), and the per-frame floor is
       ~1.5–4 ms (400×400, sd 8) — not worth attacking for this use case.
+    - **Deeper march prefetch: measured and rejected.** The march already rolls
+      a one-sample software prefetch (MetalShaders.metal `prefetchScalar`). A
+      two-deep variant (value consumed two loop-bodies after its fetch, warm
+      shift + cold restart) was bit-exact but only helped the narrow
+      800×800/sd-4 case (19.3 → 17.9 ms) and regressed everywhere else
+      (sd 0.5: −5%, sd 1: −9%, sd 2 @ 400×400: −19%), because every min-max
+      empty-cell skip invalidates the pipeline and the cold restart re-fetches
+      two samples — and skip-heavy air regions dominate coarse low-res frames.
+      Reverted. For the interactive sd-4 tier the practical levers are adaptive
+      DS (done) plus dropping jitter (config, −27%; quality trade-off).
     - **Precomputed normals: not useful here** — the app's presets render with
       shading off, so no gradient is computed in the hot loop anyway.
 
