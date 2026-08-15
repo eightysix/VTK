@@ -61,6 +61,7 @@ Note: single `--reps 1` runs are noisy — the GL/Metal ratio shifts run-to-run
 | `c6b8cc1fd5` | camera-inside near-plane clip for ray-cast parity | 0.85 ± 0.01 | 1178 | 0.66 |
 | **`a6bec091bb`** | **backport 22 essential GL-parity fixes** | **1.10 ± 0.01** | 911 | 0.85 |
 | `d8a31e4aad` (HEAD) | add `--no-tests` flag to build script | 1.04 ± 0.01 | 964 | 0.91 |
+| HEAD + fix (`fc_independentComponents`) | single-component pipeline specialization | **0.79 ± 0.01** | 1272 | 0.67 |
 
 GL stays essentially flat throughout (≈ 1.14–1.30 ms), so the drift is entirely
 in the Metal backend. For reference, the earlier 30-frames×3-reps runs gave
@@ -119,11 +120,24 @@ running:
   independent branches are uniform-coherent (cheap in isolation), but they force
   the register allocation above.
 
-The GL-faithful fix is to make the single-component vs independent path a
-**compile-time specialization** (e.g. a per-pipeline Metal function constant
-driven by `useIndependentComponents`) instead of a runtime uniform, so the
-single-component pipeline compiles to the pre-commit lean shader and the
-independent pipeline only pays for what it uses.
+### Fix applied
+
+The single-component vs independent path is now a **compile-time
+specialization**: the mapper derives a new `VolumeFeature_IndependentComponents`
+feature-mask bit (set only when the volume actually has independent components
+and the 2D transfer-function / label-map fallbacks are inactive) and bakes it
+into the pipeline via a new `fc_independentComponents` function constant
+(`[[function_constant(19)]]`). The shader's `useIndependentPath` is now exactly
+`fc_independentComponents`, so single-component pipelines compile the per-sample
+arrays and branches out entirely and the independent pipeline pays only for what
+it uses. Visual output is unchanged (all 97 RenderingVolumeCxx-Metal image
+tests pass identically with and without the fix; the pre-existing environment
+failures on this machine are unrelated).
+
+Measured on `VolumeRayCast` (60 frames × 5 reps): **1.04 → 0.79 ms/frame**
+(964 → 1272 fps). This recovers the independent-path register pressure in full
+and also relieves the backport's added register load, since the two commits
+compete for the same registers.
 
 ## Root cause: `a6bec091bb` — the 22 GL-parity fixes backport
 
@@ -171,13 +185,21 @@ and re-profiling each, or temporarily reverting the four suspects above.
 
 ## Recommendations
 
-1. Recover the single-component fast path by specializing the ray-cast shader
-   on the component count / independent flag (Metal function constants), which
-   addresses both culprits' register-pressure cost at once.
-2. If GL-parity output is not required for a given configuration, allow the
-   parity march (block-bounds exit, gate thresholds, densified box) to be
-   toggled off.
-3. Re-land `a6bec091bb`'s 22 fixes individually so regressions of this size can
+1. **Done:** recover the single-component fast path by specializing the
+   ray-cast shader on the independent-components flag via a Metal function
+   constant (`fc_independentComponents`). This addresses the register-pressure
+   cost shared by both culprits without changing output.
+2. The remaining ~0.19 ms/frame vs the `fd65034cf4` baseline (0.79 → 0.60) is
+   the inherent cost of the backport's *behavioural* GL-parity changes —
+   primarily shading applied to every `alpha > 0` sample (a 6-texel gradient +
+   Phong lighting per sample, `a4415d2329`), plus the tightened termination
+   threshold and the removed block-bounds exit. These change the rendered image
+   by design, so they can only be traded back for performance, not optimized
+   away. If that trade is wanted, gate them behind a parity toggle.
+3. If GL-parity output is not required for a given configuration, allow the
+   parity march (block-bounds exit, gate thresholds, densified box, per-sample
+   shading) to be toggled off.
+4. Re-land `a6bec091bb`'s 22 fixes individually so regressions of this size can
    be attributed to a single change.
 
 ## Reproduction

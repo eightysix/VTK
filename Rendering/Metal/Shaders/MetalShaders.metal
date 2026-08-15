@@ -2664,6 +2664,12 @@ constant bool fc_computeNormalFromOpacity [[function_constant(18)]];
 // 0=composite (default), 1=maximum intensity (MIP), 2=minimum intensity (MinIP),
 // 3=average intensity (AverageIP), 4=additive.
 constant int fc_blendMode [[function_constant(17)]];
+// Bakes the independent multi-component path into the pipeline (OpenGL
+// independent-components parity). Only volumes with more than one independent
+// component enable this; single-component pipelines compile the path out
+// entirely, keeping the hot march loop free of its per-sample arrays and
+// branches.
+constant bool fc_independentComponents [[function_constant(19)]];
 
 // ============================================================================
 // Volume Ray Casting Mapper
@@ -3947,10 +3953,11 @@ inline half4 marchVolumeUnified(
   // Independent multi-component path (OpenGL independent components parity):
   // each component is normalized against its own scalar range and looked up in
   // its own color/opacity table, then results are combined via component
-  // weights. The 2D transfer-function and label-map modes always use the
-  // single-component path.
-  const bool useIndependentPath = (volumeUniforms.useIndependentComponents > 0.5) &&
-    !doTransfer2D && !(doMask && numLabels > 0.0);
+  // weights. Baked into the pipeline via fc_independentComponents (set by the
+  // mapper only when the volume actually uses independent components and the
+  // 2D transfer-function / label-map fallbacks are inactive), so single-
+  // component pipelines eliminate every branch below at compile time.
+  const bool useIndependentPath = fc_independentComponents;
 
   // Blanking: the blanking texture has the same (point) dimensions as the
   // global volume, so the half-cell-step offset in normalized texel space is

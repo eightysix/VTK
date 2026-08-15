@@ -306,6 +306,21 @@ static uint32_t BlendModeToFeatureFlag(int blendMode)
   }
 }
 
+// Whether the independent multi-component shader path is active for this
+// render. Mirrors the shader's (former) runtime useIndependentPath condition:
+// independent components, without the 2D transfer-function or label-map
+// fallbacks that always take the single-component path. Baking this into the
+// pipeline lets single-component renders compile the per-sample arrays and
+// branches out entirely.
+static bool VolumeFeatureIndependentPath(
+  const VolumeMapperUniforms& uniforms, int featureMask)
+{
+  const bool maskActive = (featureMask & VolumeFeature_Mask) != 0;
+  return uniforms.UseIndependentComponents > 0.5f &&
+    uniforms.UseTransfer2D <= 0.5f &&
+    !(maskActive && uniforms.UseMask > 0.5f && uniforms.LabelMapNumLabels > 0.0f);
+}
+
 // Per-block data for volume rendering — must match Metal PerBlockData struct
 struct PerBlockData {
   float VolumeBoundsMin[4]; // 0..15
@@ -5846,6 +5861,8 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     BOOL linearInterp = (featureMask & VolumeFeature_LinearInterpolation) ? YES : NO;
     BOOL computeNormalFromOpacity =
       (featureMask & VolumeFeature_ComputeNormalFromOpacity) ? YES : NO;
+    BOOL independentComp =
+      (featureMask & VolumeFeature_IndependentComponents) ? YES : NO;
 
     [constants setConstantValue:&shading type:MTLDataTypeBool withName:@"fc_shading"];
     [constants setConstantValue:&gradOp  type:MTLDataTypeBool withName:@"fc_gradientOpacity"];
@@ -5855,6 +5872,8 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     [constants setConstantValue:&linearInterp type:MTLDataTypeBool withName:@"fc_linearInterpolation"];
     [constants setConstantValue:&computeNormalFromOpacity type:MTLDataTypeBool
                         withName:@"fc_computeNormalFromOpacity"];
+    [constants setConstantValue:&independentComp type:MTLDataTypeBool
+                        withName:@"fc_independentComponents"];
 
     // Blend mode function constant: 0=composite, 1=MIP, 2=MinIP, 3=AverageIP,
     // 4=additive (vtkVolumeMapper::BlendMode). Encoded in the feature mask so
@@ -6250,6 +6269,8 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
   if (uniforms->UseLinearVolumeInterpolation > 0.5f)
     featureMask |= VolumeFeature_LinearInterpolation;
   featureMask |= BlendModeToFeatureFlag(this->GetBlendMode());
+  if (VolumeFeatureIndependentPath(*uniforms, featureMask))
+    featureMask |= VolumeFeature_IndependentComponents;
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)
     (static_cast<vtkMetalRenderWindow*>(ren->GetRenderWindow()))->GetMetalDevice();
@@ -7057,6 +7078,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   if (uniforms.UseLinearVolumeInterpolation > 0.5f)
     featureMask |= VolumeFeature_LinearInterpolation;
   featureMask |= BlendModeToFeatureFlag(this->GetBlendMode());
+  if (VolumeFeatureIndependentPath(uniforms, featureMask))
+    featureMask |= VolumeFeature_IndependentComponents;
 
   // Hardware-selection support (vtkHardwareSelector): during a selection render
   // with CELLS field association the volume is ray-cast with the selection

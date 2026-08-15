@@ -94,6 +94,10 @@ enum VolumeShaderFeatureFlags : uint32_t
   VolumeFeature_BlendAverageIntensity = 1u << 8,
   VolumeFeature_BlendAdditive         = 1u << 9,
   VolumeFeature_ComputeNormalFromOpacity = 1u << 10,
+  // Independent multi-component volume rendering (OpenGL independent-components
+  // parity). Bakes the path into the pipeline via fc_independentComponents so
+  // single-component pipelines compile it out entirely.
+  VolumeFeature_IndependentComponents = 1u << 11,
 };
 
 VTK_ABI_NAMESPACE_BEGIN
