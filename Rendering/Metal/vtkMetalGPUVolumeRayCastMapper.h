@@ -183,6 +183,16 @@ public:
   void SetUseGPUMinMax(bool val) { this->UseGPUMinMax = val; }
   bool GetUseGPUMinMax() const { return this->UseGPUMinMax; }
 
+  // Master switch for empty-space skipping via the min-max occupancy lattice.
+  // When false, no occupancy lattice is ever built (GPU or CPU) and every
+  // sample along the ray is fetched: a true unaccelerated march. This is the
+  // apples-to-apples comparison for backends without min-max acceleration
+  // (e.g. the OpenGL volume mapper), and it also isolates the cost of the
+  // lattice machinery itself. When true (default), the lattice is built with
+  // UseGPUMinMax selecting the GPU or CPU path.
+  void SetUseMinMaxAcceleration(bool val) { this->UseMinMaxAcceleration = val; }
+  bool GetUseMinMaxAcceleration() const { return this->UseMinMaxAcceleration; }
+
   // Phase 6: Fullscreen camera-inside path.
   // When true (default), camera-inside rendering uses a fullscreen ray-cast
   // fragment shader; setupVolumeRay clamps the entry to the near plane so the
@@ -329,6 +339,9 @@ private:
   // When true, UpdateMinMaxTexture uses GPU compute kernels instead of CPU
   // vtkSMPTools to build the R8Unorm occupancy texture.
   bool UseGPUMinMax = true;
+
+  // Master switch for the min-max occupancy lattice (see SetUseMinMaxAcceleration).
+  bool UseMinMaxAcceleration = true;
 
   // Compute pipelines for GPU min-max generation.
   void* MinMaxComputePipeline = nullptr;  // id<MTLComputePipelineState> — volume_compute_minmax

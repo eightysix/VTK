@@ -1045,6 +1045,12 @@ inline bool TempMinMax()
     return std::atoi(v) != 0;
   return true;
 }
+inline bool TempMinMaxAccel()
+{
+  if (const char* v = std::getenv("VTK_METAL_TEST_ACCEL"))
+    return std::atoi(v) != 0;
+  return true;
+}
 inline bool TempJitter()
 {
   if (const char* v = std::getenv("VTK_METAL_TEST_JITTER"))
@@ -1155,6 +1161,7 @@ inline void BuildDICOMVolumeScene(vtkRenderer* renderer, BackendKind b)
       metal->SetUseIGNJitter(TempJitter());
       metal->SetJitterBlockSize(TempJitterBlock());
       metal->SetUseGPUMinMax(TempMinMax());
+      metal->SetUseMinMaxAcceleration(TempMinMaxAccel());
     }
   }
 

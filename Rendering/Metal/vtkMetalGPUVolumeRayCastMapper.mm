@@ -6455,7 +6455,25 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // upload so that UpdateBlockTextures can reuse the per-macrocell data.
   bool usePartitions = (this->Partitions[0] > 1 || this->Partitions[1] > 1 || this->Partitions[2] > 1);
 
-  if (this->UseGPUMinMax && !usePartitions)
+  if (!this->UseMinMaxAcceleration)
+  {
+    // Master switch off: no occupancy lattice is built at all, so the shader
+    // marches every sample (useMinMax == false -> raw, unaccelerated ray cast).
+    // This is the apples-to-apples comparison for backends without min-max
+    // acceleration. UpdateBlockTextures falls back to walking the voxels for
+    // per-block ranges when MacrocellScalarMin is empty.
+    this->MacrocellScalarMin.clear();
+    this->MacrocellScalarMax.clear();
+    ReleaseMetalObject(this->MinMaxTexture);
+    if (!this->UpdateVolumeTexture(mtlDevice, mtlQueue, vol))
+    {
+      return;
+    }
+    // UpdateVolumeTexture may rebuild the macrocell lattice internally for
+    // partitioned volumes; drop it again so the march stays unaccelerated.
+    ReleaseMetalObject(this->MinMaxTexture);
+  }
+  else if (this->UseGPUMinMax && !usePartitions)
   {
     // GPU min-max path: upload volume texture first, then dispatch compute.
     if (!this->UpdateVolumeTexture(mtlDevice, mtlQueue, vol))
