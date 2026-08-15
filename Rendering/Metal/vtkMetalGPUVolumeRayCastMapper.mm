@@ -5455,6 +5455,18 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
           AssignMetalObject(this->VertexBuffer, vbuf);
         }
 
+        if (getenv("VTK_METAL_TEST_DUMP_UNIFORMS") && !getenv("VTK_METAL_TEST_DUMP_VERT_DONE"))
+        {
+          setenv("VTK_METAL_TEST_DUMP_VERT_DONE", "1", 1);
+          FILE* f = fopen("/tmp/app_verts.bin", "wb");
+          fwrite(vertices.data(), 1, vertices.size() * sizeof(float), f);
+          fclose(f);
+          f = fopen("/tmp/app_idxs.bin", "wb");
+          fwrite(indices.data(), 1, indices.size() * sizeof(unsigned int), f);
+          fclose(f);
+          fprintf(stderr, "dumped %zu verts %zu idxs\n", vertices.size(), indices.size());
+        }
+
         {
           id<MTLBuffer> ibuf = [device newBufferWithBytes:indices.data()
                                                   length:indices.size() * sizeof(unsigned int)
@@ -7385,6 +7397,22 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)this->UniformBuffers[bufIdx];
   memcpy([uniformBuf contents], &uniforms, sizeof(uniforms));
 
+  if (getenv("VTK_METAL_TEST_DUMP_UNIFORMS") && !getenv("VTK_METAL_TEST_DUMP_UNIFORMS_DONE"))
+  {
+    setenv("VTK_METAL_TEST_DUMP_UNIFORMS_DONE", "1", 1);
+    FILE* f = fopen("/tmp/app_uniforms.bin", "wb");
+    fwrite(&uniforms, 1, sizeof(uniforms), f);
+    fclose(f);
+    PerBlockData pbdTmp = {};
+    BuildPerBlockData(pbdTmp, &uniforms);
+    f = fopen("/tmp/app_pbd.bin", "wb");
+    fwrite(&pbdTmp, 1, sizeof(pbdTmp), f);
+    fclose(f);
+    f = fopen("/tmp/app_light.bin", "wb");
+    fwrite(&lightUniforms, 1, sizeof(lightUniforms), f);
+    fclose(f);
+  }
+
   // Phase 6: Determine if camera is inside the volume for the fullscreen ray-cast path.
   bool cameraInside = this->UseFullscreenCameraInside && this->IsCameraInside(ren, vol);
 
@@ -7636,7 +7664,12 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 #if !__has_feature(objc_arc)
   dispatch_retain(sem);
 #endif
-  [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
+  [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+    if (getenv("VTK_METAL_TEST_PRINT_GPU_MS"))
+    {
+      const double ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+      vtkGenericWarningMacro("volume cmdbuf GPU ms=" << ms << " status=" << (int)cb.status);
+    }
     dispatch_semaphore_signal(sem);
 #if !__has_feature(objc_arc)
     dispatch_release(sem);

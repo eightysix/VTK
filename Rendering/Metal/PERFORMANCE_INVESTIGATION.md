@@ -13,6 +13,20 @@ back-end for the DICOM volume scene, and a proposed fix.
 
 ---
 
+> **Update (follow-up investigation):** after the transpose / X-march layout
+> change and the AIR-level (Metal ISA) check, the findings in sections 1-4 were
+> refined. See **section 7** for the latest numbers, the camera-dependence
+> analysis, and the final conclusion: the residual 2x gap is the Metal 3-D
+> linear filter cost, which is a single texture op at the AIR level (not a
+> compiler expansion) and is **not** emulatable from Metal shader code.
+>
+> **Update (minimal repro):** **section 8** reproduces the Metal-vs-GL linear
+> gap (~2-2.7x filter add-on) in a ~480-line standalone program with a trivial
+> raymarch shader and synthetic volume, proving it is a texture-unit property,
+> not a VTK-path artifact.
+
+---
+
 ## 1. Headline results
 
 All times are GPU times measured identically for both back-ends (GL: `glFinish`
@@ -345,3 +359,173 @@ per-frame times. GL is timed with `glFinish`, Metal with `WaitForCompletion`
 
 Note: `dicom.u8` (~470 MB) and the `/tmp/app_*.bin` capture are **not**
 committed; regenerate per section 5.
+
+---
+
+## 7. Follow-up investigation (X-march orientation, camera dependence, ISA)
+
+Later experiments marched along the volume's **longest axis** instead (the
+transposed / permute-210 layout: 1794 samples along texture-Z becomes 1794
+along texture-X), which reduced the memory-latency penalty of the long march
+for **both** back-ends. All numbers in this section share one
+camera/orientation/data set and the same sample count (~45.6 M); times are
+per-frame GPU ms.
+
+### 7.1 App-level nearest/linear isolation (X-march, 45.6 M samples)
+
+| Back-end / mode | ms | ns/sample |
+|---|---|---|
+| GL nearest | 22.15 | 0.49 |
+| GL linear | 25.55 | 0.56 |
+| Metal nearest | 26.94 | 0.59 |
+| Metal linear | 46.35 | 1.02 |
+
+Interpretation:
+
+- **Metal nearest ~= GL linear.** The entire 2x gap is the trilinear add-on:
+  **+0.43 ns/sample in Metal vs +0.07 ns/sample in GL** on the same GPU.
+- Confirmed in the probe with shader branches compiled out (fixed count):
+  nearest 25.06 ms, linear 41.97 ms -> the filter cost is intrinsic to the
+  sample operation, not a shader-branch artifact.
+
+### 7.2 The 2x gap is real (not measurement)
+
+- **GL iteration-count cap sweep** (rebuilt OpenGL2 lib per cap):
+  50 -> 3.83 ms, 100 -> 5.44 ms, 659 -> 19.86 ms, uncapped -> 24.40 ms.
+  GL genuinely iterates ~45 M samples at ~0.5-0.55 ns/sample.
+- Images are **bit-identical** between back-ends (compare error 0), so both do
+  the same samples with the same filter; the difference is purely cost/sample.
+
+### 7.3 Camera dependence
+
+Sweeping the camera azimuth (Metal X-layout vs GL Z-layout): Metal 28.1-59.9 ms,
+GL 23.7-49.7 ms. Concrete points: az -60 -> Metal 44.7 vs GL 49.7
+(Metal wins); az -120 -> Metal 53.6 vs GL 23.7 (GL wins 2.3x).
+
+- **Both back-ends are camera-dependent**, slowing when rays march along
+  texture-Z. Any reorientation (permute 210/021/120) drops Metal 101 -> ~44-51 ms
+  and GL 48.6 -> ~25 ms.
+- **No fixed layout wins for all cameras.** Orientation alone cannot deliver
+  "Metal <= GL everywhere".
+
+### 7.4 Sampler / substitute experiments at the better orientation
+
+| Strategy | ms | note |
+|---|---|---|
+| v7 linear fixedN | 41.97 | Metal 3-D linear baseline |
+| v8 nearest fixedN | 25.06 | filter add-on ~= 17 ms |
+| v12 clampZero (divergent) | 37.60 | divergent real shader, clamp_to_zero |
+| v13 2-D-array slice-lerp | 43.23 | no longer cheaper than 3-D (vs section 2.5) |
+| v11 manual 8-tap trilinear | 52.90 | worse |
+| v3 real nearest (divergent) | 32.34 | divergent nearest |
+
+- At the better orientation the 2-D-array advantage seen in section 2.5
+  disappears (43.23 vs 41.97 ms) - layout, not texture type, was the driver.
+- App-level `clamp_to_zero` gave no win (X-march 45.02 vs 44.13;
+  Z-march 101.03 vs 101.32) and was **reverted**; MetalShaders.metal is back to
+  `clamp_to_edge`. The earlier probe-level clamp_to_zero gain (72.7 -> 64.3 ms)
+  did not reproduce at app level.
+
+### 7.5 ISA / AIR evidence (answers "can we emulate GL's operation?")
+
+Compiling a minimal fragment shader with linear and nearest 3-D sampling and
+disassembling the AIR (`xcrun -sdk macosx metal-objdump`) shows **both filters
+emit the identical instruction stream: a single `air.sample_texture_3d.v4f32`
+call**. The only difference is the sampler descriptor (filter bits, 0x2000).
+
+- Metal's compiler does **not** expand the 3-D trilinear sample into multiple
+  fetches/lerps at the AIR level - that hypothesis is disproven.
+- The whole linear-vs-nearest cost is realized inside the GPU texture unit,
+  below the ISA we can inspect; it is the same silicon GL uses.
+- Combined with section 7.4 (every shader-side substitute is equal-or-worse),
+  **there is no Metal texture op or shader construct that reproduces GL's
+  cheaper trilinear.** GL's cost comes from its driver-internal texture
+  representation/filtering path, which the Metal API cannot reach.
+
+### 7.6 Updated conclusions
+
+- Metal's raw path at the bench config is **~44-51 ms** at a favorable
+  orientation vs GL's **~24-25 ms** for the identical march; the residual ~2x is
+  the Metal 3-D linear filter cost (+0.43 ns/sample vs GL's +0.07 ns/sample).
+- This cost is a hardware/texture-unit property (single op in both AIR and GL),
+  not a shader-compiler artifact, and no Metal-side emulation exists.
+- The image-exact levers that remain:
+  1. **Orientation / layout** (march along the long axis): ~2x for both
+     back-ends, but camera-robustness-limited (no fixed layout wins for all
+     cameras; section 7.3).
+  2. **Non-divergent march restructure** (section 4): recovers only the SIMT
+     divergence portion; it does not touch the per-sample filter cost.
+- The earlier 103 ms -> 72 ms divergence finding (section 3) still stands for
+  the original orientation; the follow-up shows that once the layout is fixed
+  the residual gap is the sample filter.
+
+---
+
+## 8. Self-contained minimal repro (no VTK)
+
+`Rendering/Metal/PerformanceInvestigation/minimal_repro.mm` is a ~480-line
+standalone Objective-C++ program (no VTK, no vtkModule) that recreates the
+comparison with synthetic data:
+
+- Same footprint: R8 512x512x1794 volume (470 MB) in both `GL_TEXTURE_3D` and
+  `MTLTexture3D` (`R8Unorm`, mipLevel 1, clamp-to-edge, `Shared` storage).
+- Minimal raymarch fragment shaders (GLSL 410 core / MSL) doing only the
+  volume sample loop: 400x400 frags x 604 steps = 45.68 M samples/frame, no
+  transfer function, no compositing, no divergence, no jitter.
+- Axis-lockstep march in both Z and X directions, nearest/linear x both
+  back-ends, 30 warmup + 120 timed frames, `glFinish` / `waitUntilCompleted`
+  per frame.
+
+### 8.1 Results (Apple M2, current build, 120 frames x 2 rounds)
+
+| march | gl nearest | metal nearest | gl linear | metal linear |
+|-------|-----------:|--------------:|----------:|-------------:|
+| Z     | 2.40 ms    | 2.66 ms       | 10.27 ms  | 18.96 ms     |
+| X     | 2.56 ms    | 4.10 ms       | 6.06 ms   | 13.60 ms     |
+
+Linear-vs-nearest filter add-on:
+
+| march | gl add-on | metal add-on | ratio |
+|-------|----------:|-------------:|------:|
+| Z     | +7.87 ms  | +16.30 ms    | 2.07x |
+| X     | +3.50 ms  | +9.50 ms     | 2.71x |
+
+Readbacks (~9.64M, avg px ~128) match on both back-ends for every config,
+confirming all 604 texture samples execute; results are round-stable.
+
+### 8.2 What this proves
+
+- The Metal-vs-GL linear gap is **not a VTK artifact**: it reproduces in a
+  trivial self-contained shader with perfect cache behavior, no divergence and
+  no per-iteration ALU. Metal linear is ~1.85-2.2x GL linear in the app and
+  the same in the repro; the filter add-on ratio (2.0-2.7x) matches.
+- The nearest base gap is march-dependent (Z: Metal +0.01 ns, ~parity; X:
+  Metal +0.03 ns, +60%), consistent with the app's layout-driven base gap
+  (section 7): the texture representation costs only ~0.01-0.03 ns/sample in
+  the best case, but the Metal filter adds ~2-2.7x GL's per-sample filter cost
+  regardless of layout.
+- The absolute numbers are ~5x faster than the app's same-config numbers
+  because the repro shader has none of the app's per-iteration work (TF taps,
+  compositing, bounds, minmax, jitter); the *relative* Metal/GL filter gap is
+  unchanged, so the comparison is valid for isolating the texture-unit cost.
+
+### 8.3 Build / run
+
+```
+clang++ -std=c++17 -fobjc-arc -O2 -DGL_SILENCE_DEPRECATION \
+  -framework Metal -framework OpenGL -framework Foundation \
+  minimal_repro.mm -o minimal_repro
+./minimal_repro [frames]
+```
+
+### 8.4 Notes
+
+- `replaceRegion` on a `MTLStorageModePrivate` 3-D texture with this size
+  faults inside Apple's lossless texture compressor (`AGXMetalG14G
+  ::AppleCompressionGen2::Compressor::compressMacroblock`, EXC_BAD_ACCESS).
+  VTK avoids this path by writing the volume through a compute shader
+  (vtkMetalGPUVolumeRayCastMapper.mm `CreateGlobalVolumeTexture`); the repro
+  uses `Shared` storage to stay in the simple path.
+- Timing uses host-clock per-frame with a per-frame GPU sync on both back-ends
+  (identical to the app's GL `glFinish` protocol; Metal sync cost is identical
+  across filter configs since only the sampler state differs).

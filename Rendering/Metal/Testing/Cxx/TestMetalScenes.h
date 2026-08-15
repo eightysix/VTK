@@ -47,6 +47,7 @@
 #include "vtkGPUVolumeRayCastMapper.h"
 #include "vtkImageData.h"
 #include "vtkImageMapper.h"
+#include "vtkImagePermute.h"
 #include "vtkImageProperty.h"
 #include "vtkImageShiftScale.h"
 #include "vtkImageSlice.h"
@@ -1108,6 +1109,29 @@ inline void BuildDICOMVolumeScene(vtkRenderer* renderer, BackendKind b)
         cachedU8Volume = castToU8->GetOutput();
       }
     }
+    if (cachedU8Volume)
+    {
+      // TEMP-A/B: diagnostic layout test — permute axes so the long (slice)
+      // axis is X instead of Z, keeping the same data and ray setup for both
+      // backends. Tests whether Metal's 3D texture tiling is what hurts the
+      // Z-march on the elongated study.
+      if (const char* tp = std::getenv("VTK_METAL_TEST_TRANSPOSE"); tp && std::atoi(tp) != 0)
+      {
+        vtkNew<vtkImagePermute> perm;
+        perm->SetInputData(cachedU8Volume);
+        const char* permEnv = std::getenv("VTK_METAL_TEST_PERMUTE");
+        if (permEnv)
+        {
+          perm->SetFilteredAxes(permEnv[0] - '0', permEnv[1] - '0', permEnv[2] - '0');
+        }
+        else
+        {
+          perm->SetFilteredAxes(2, 1, 0);
+        }
+        perm->Update();
+        cachedU8Volume = perm->GetOutput();
+      }
+    }
     if (!cachedU8Volume)
     {
       std::cerr << "BuildDICOMVolumeScene: no DICOM series (--dicom not set or "
@@ -1139,7 +1163,14 @@ inline void BuildDICOMVolumeScene(vtkRenderer* renderer, BackendKind b)
   vtkNew<vtkVolumeProperty> property;
   property->SetColor(color);
   property->SetScalarOpacity(opacity);
-  property->SetInterpolationTypeToLinear();
+  if (const char* gln = std::getenv("VTK_METAL_TEST_GL_NEAREST"); gln && std::atoi(gln) != 0)
+  {
+    property->SetInterpolationTypeToNearest();
+  }
+  else
+  {
+    property->SetInterpolationTypeToLinear();
+  }
 
   vtkSmartPointer<vtkGPUVolumeRayCastMapper> mapper = NewVolumeMapper(b);
   mapper->SetInputData(cachedU8Volume);
@@ -1183,10 +1214,44 @@ inline void BuildDICOMVolumeScene(vtkRenderer* renderer, BackendKind b)
   vtkSmartPointer<vtkCamera> camera = NewCamera(b);
   renderer->SetActiveCamera(camera);
   renderer->ResetCamera();
-  renderer->GetActiveCamera()->Elevation(20);
-  renderer->GetActiveCamera()->Azimuth(30);
-  renderer->GetActiveCamera()->Elevation(-40);
-  renderer->GetActiveCamera()->Azimuth(-60);
+  const char* camAxis = std::getenv("VTK_METAL_TEST_CAM_AXIS");
+  if (camAxis && camAxis[0] == 'x')
+  {
+    // Look along the volume's X axis (worst case for a long-axis-X texture).
+    double fp[3] = { 0, 0, 0 };
+    renderer->GetActiveCamera()->GetFocalPoint(fp);
+    renderer->GetActiveCamera()->SetPosition(fp[0] - 1000.0, fp[1], fp[2]);
+    renderer->GetActiveCamera()->SetViewUp(0, 0, 1);
+  }
+  else if (camAxis && camAxis[0] == 'y')
+  {
+    double fp[3] = { 0, 0, 0 };
+    renderer->GetActiveCamera()->GetFocalPoint(fp);
+    renderer->GetActiveCamera()->SetPosition(fp[0], fp[1] - 1000.0, fp[2]);
+    renderer->GetActiveCamera()->SetViewUp(0, 0, 1);
+  }
+  else if (camAxis && camAxis[0] == 'z')
+  {
+    double fp[3] = { 0, 0, 0 };
+    renderer->GetActiveCamera()->GetFocalPoint(fp);
+    renderer->GetActiveCamera()->SetPosition(fp[0], fp[1], fp[2] - 1000.0);
+    renderer->GetActiveCamera()->SetViewUp(0, 1, 0);
+  }
+  else
+  {
+    renderer->GetActiveCamera()->Elevation(20);
+    renderer->GetActiveCamera()->Azimuth(30);
+    renderer->GetActiveCamera()->Elevation(-40);
+    const char* azEnv = std::getenv("VTK_METAL_TEST_CAM_AZ");
+    if (azEnv)
+    {
+      renderer->GetActiveCamera()->Azimuth(std::atof(azEnv));
+    }
+    else
+    {
+      renderer->GetActiveCamera()->Azimuth(-60);
+    }
+  }
 }
 
 // ---- Complexity-scaling benchmark scenes ----------------------------------

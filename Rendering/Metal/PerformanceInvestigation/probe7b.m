@@ -385,6 +385,22 @@ int main(int argc, const char** argv) {
     uint8_t* host = malloc(total);
     size_t got = fread(host, 1, total, f); fclose(f);
     fprintf(stderr, "loaded %zu bytes\n", got);
+    // Optional transpose (PROBE_TRANSPOSE=1): store the volume so the long
+    // (slice) axis becomes X, reproducing the app's VTK_METAL_TEST_TRANSPOSE
+    // layout. Dump the app bins with the same transpose set so the uniforms
+    // match. Data reorder: new(x',y,z') = old(x=z', y, z=x').
+    if (getenv("PROBE_TRANSPOSE")) {
+      uint32_t TW2 = TD, TH2 = TH, TD2 = TW;
+      uint8_t* thost = malloc(total);
+      for (uint32_t xp = 0; xp < TW2; ++xp)
+        for (uint32_t yp = 0; yp < TH2; ++yp)
+          for (uint32_t zp = 0; zp < TD2; ++zp)
+            thost[((zp * TH2) + yp) * TW2 + xp] = host[((xp * TH2) + yp) * TW + zp];
+      free(host);
+      host = thost;
+      TW = TW2; TH = TH2; TD = TD2;
+      fprintf(stderr, "transposed upload dims %ux%ux%u\n", TW, TH, TD);
+    }
     id<MTLBuffer> staging = [device newBufferWithBytes:host length:total options:MTLResourceStorageModeShared];
     MTLTextureDescriptor* d = [[MTLTextureDescriptor alloc] init];
     d.textureType = MTLTextureType3D; d.pixelFormat = MTLPixelFormatR8Unorm;
