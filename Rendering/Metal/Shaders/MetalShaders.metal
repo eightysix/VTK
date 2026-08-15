@@ -2696,6 +2696,13 @@ constant bool fc_dependentLA [[function_constant(25)]];
 // Bakes the RenderToImage (depth-image export) path into the pipeline: the
 // first-opaque-sample tracking is compiled out of non-RTT pipelines.
 constant bool fc_renderToTexture [[function_constant(26)]];
+// Bakes the cropping-region path into the pipeline: non-cropping pipelines
+// compile the per-sample crop-region bitmask test out of the hot loop entirely.
+constant bool fc_cropping [[function_constant(27)]];
+// Bakes the uniform-grid blanking path into the pipeline: non-blanked pipelines
+// compile the seven per-sample blanking texture fetches (and their mode branch)
+// out of the hot loop entirely.
+constant bool fc_blanking [[function_constant(28)]];
 
 // ============================================================================
 // Volume Ray Casting Mapper
@@ -3926,12 +3933,17 @@ inline half4 marchVolumeUnified(
     thread float3* firstOpaquePos,
     thread bool*  haveOpaquePos)
 {
-  const bool doShading = fc_shading && (volumeUniforms.useGradientShading > 0.5);
-  const bool doGradOp = fc_gradientOpacity && (volumeUniforms.useGradientOpacity > 0.5);
-  const bool doCropping = volumeUniforms.useCropping > 0.5;
-  const bool doMask = fc_mask && (volumeUniforms.useMask > 0.5);
+  // Feature flags are baked into the pipeline via function constants (see
+  // VolumeShaderFeatureFlags in the mapper): each flag below is set iff the
+  // corresponding runtime uniform was on at pipeline-build time, so the
+  // redundant `uniform > 0.5` re-checks are dropped and the compiler sees pure
+  // compile-time booleans in the hot loop.
+  const bool doShading = fc_shading;
+  const bool doGradOp = fc_gradientOpacity;
+  const bool doCropping = fc_cropping;
+  const bool doMask = fc_mask;
+  const bool doBlanking = fc_blanking;
   const bool doTransfer2D = fc_transfer2D;
-  const bool doBlanking = volumeUniforms.useBlanking > 0.5;
   const bool doRectilinear = fc_rectilinear;
 
   half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
@@ -4486,13 +4498,13 @@ inline half4 marchVolumeUnified(
           half3 ccRGB = cc.rgb;
           if (sampleOpacity >= 0.01h && doShading) {
             half3 normal;
-            if (fc_computeNormalFromOpacity && volumeUniforms.useComputeNormalFromOpacity > 0.5) {
+            if (fc_computeNormalFromOpacity) {
               normal = computeDensityGradientFast(volumeTexture,
                   transferFunctionTexture, transferFunctionTexture1,
                   transferFunctionTexture2, transferFunctionTexture3,
                   evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture,
                   gradNormFactor, c, compScale[c], compBias[c]).xyz;
-            } else if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
+            } else if (fc_normalTexture) {
               half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
               normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
             } else {
@@ -4540,10 +4552,10 @@ inline half4 marchVolumeUnified(
       // dependent-component path rendering flat solid color when shading is off.
       if (doGradOp && maskLabel == 0.0h) {
         if (!sharedGradReady) {
-          if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
+          if (fc_normalTexture) {
             half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
             sharedGrad = half4(normalize(nrmSample.xyz * 2.0h - 1.0h), nrmSample.w);
-          } else if (fc_computeNormalFromOpacity && volumeUniforms.useComputeNormalFromOpacity > 0.5) {
+          } else if (fc_computeNormalFromOpacity) {
             sharedGrad = computeScalarAndDensityGradient(volumeTexture,
                 transferFunctionTexture, transferFunctionTexture1,
                 transferFunctionTexture2, transferFunctionTexture3,
@@ -4566,7 +4578,7 @@ inline half4 marchVolumeUnified(
       if (doShading && maskLabel == 0.0h && sampleOpacity > 0.0h) {
 
         half3 normal;
-        if (fc_computeNormalFromOpacity && volumeUniforms.useComputeNormalFromOpacity > 0.5) {
+        if (fc_computeNormalFromOpacity) {
           if (densityGradReady) {
             normal = cachedDensityGrad.xyz;
           } else {
@@ -4578,7 +4590,7 @@ inline half4 marchVolumeUnified(
           }
         } else {
           if (!sharedGradReady) {
-            if (fc_normalTexture && volumeUniforms.useNormalTexture > 0.5) {
+            if (fc_normalTexture) {
               half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
               sharedGrad = half4(normalize(nrmSample.xyz * 2.0h - 1.0h), nrmSample.w);
             } else {

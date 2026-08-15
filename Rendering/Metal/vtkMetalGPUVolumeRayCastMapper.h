@@ -119,6 +119,13 @@ enum VolumeShaderFeatureFlags : uint32_t
   // non-RTT pipelines compile the first-opaque-sample tracking out of the hot
   // loop.
   VolumeFeature_RenderToImage = 1u << 21,
+  // Cropping regions. Baked via fc_cropping so non-cropping pipelines compile
+  // the per-sample crop-region test out of the hot loop entirely.
+  VolumeFeature_Cropping = 1u << 22,
+  // Uniform-grid blanking (ghost arrays). Baked via fc_blanking so non-blanked
+  // pipelines compile the seven per-sample blanking texture fetches out of the
+  // hot loop entirely.
+  VolumeFeature_Blanking = 1u << 23,
 };
 
 VTK_ABI_NAMESPACE_BEGIN

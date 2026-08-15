@@ -5902,6 +5902,10 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     [constants setConstantValue:&dependentLA type:MTLDataTypeBool withName:@"fc_dependentLA"];
     [constants setConstantValue:&renderToTexture type:MTLDataTypeBool
                         withName:@"fc_renderToTexture"];
+    BOOL cropping = (featureMask & VolumeFeature_Cropping) ? YES : NO;
+    BOOL blanking = (featureMask & VolumeFeature_Blanking) ? YES : NO;
+    [constants setConstantValue:&cropping type:MTLDataTypeBool withName:@"fc_cropping"];
+    [constants setConstantValue:&blanking type:MTLDataTypeBool withName:@"fc_blanking"];
 
     // Blend mode function constant: 0=composite, 1=MIP, 2=MinIP, 3=AverageIP,
     // 4=additive (vtkVolumeMapper::BlendMode). Encoded in the feature mask so
@@ -6308,6 +6312,10 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
   if (uniforms->UseDependentLA > 0.5f)
     featureMask |= VolumeFeature_DependentLA;
   featureMask |= lightingFeatureBits;
+  if (uniforms->UseCropping > 0.5f)
+    featureMask |= VolumeFeature_Cropping;
+  if (uniforms->UseBlanking > 0.5f)
+    featureMask |= VolumeFeature_Blanking;
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)
     (static_cast<vtkMetalRenderWindow*>(ren->GetRenderWindow()))->GetMetalDevice();
@@ -7129,6 +7137,10 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   featureMask |= lightingFeatureBits;
   if (this->RenderToImage)
     featureMask |= VolumeFeature_RenderToImage;
+  if (uniforms.UseCropping > 0.5f)
+    featureMask |= VolumeFeature_Cropping;
+  if (uniforms.UseBlanking > 0.5f)
+    featureMask |= VolumeFeature_Blanking;
 
   // Hardware-selection support (vtkHardwareSelector): during a selection render
   // with CELLS field association the volume is ray-cast with the selection

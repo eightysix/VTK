@@ -62,6 +62,8 @@ Note: single `--reps 1` runs are noisy — the GL/Metal ratio shifts run-to-run
 | **`a6bec091bb`** | **backport 22 essential GL-parity fixes** | **1.10 ± 0.01** | 911 | 0.85 |
 | `d8a31e4aad` (HEAD) | add `--no-tests` flag to build script | 1.04 ± 0.01 | 964 | 0.91 |
 | HEAD + fix (`fc_independentComponents`) | single-component pipeline specialization | **0.79 ± 0.01** | 1272 | 0.67 |
+| HEAD + Fix 2 (7 feature-flag constants) | bake remaining feature-flag branches | 0.70 ± 0.02 | ~1428 | ~0.55 |
+| HEAD + Fix 3 (cropping/blanking + uniform cleanup) | bake cropping/blanking, drop redundant re-checks | 0.64 ± 0.01 | ~1545 | ~0.50 |
 
 GL stays essentially flat throughout (≈ 1.14–1.30 ms), so the drift is entirely
 in the Metal backend. For reference, the earlier 30-frames×3-reps runs gave
@@ -171,6 +173,51 @@ Measured on `VolumeRayCast` (60 frames × 5 reps): **0.79 → 0.70 ms/frame**
 GL/Metal thresholded error stays 0.095 and all 97 `RenderingVolumeCxx-Metal`
 image tests pass.
 
+## Fix 3: bake cropping and blanking, drop redundant uniform re-checks
+
+Fix 2 left two hot-loop branches that were still guarded by *runtime uniforms*
+rather than function constants, so their code stayed alive (dead but present)
+for every pipeline:
+
+- **Cropping** (`doCropping = volumeUniforms.useCropping > 0.5`): the per-sample
+  crop-region bitmask test (`computeCropRegion` + bitwise test) in the march
+  loop.
+- **Uniform-grid blanking** (`doBlanking = volumeUniforms.useBlanking > 0.5`):
+  a block containing **seven texture fetches** per sample (label/blanking
+  lookups plus the per-mode branching), all executed for every non-blanked
+  pipeline.
+
+Neither was encoded in the feature mask. Two new feature-mask bits
+(`VolumeFeature_Cropping` = 1u<<22, `VolumeFeature_Blanking` = 1u<<23) are now
+set from `uniforms.UseCropping` / `uniforms.UseBlanking` in both feature-mask
+builders (the block/direct builder in `GPURender` and the fullscreen builder in
+`DrawBlocksFullscreen`), and baked into the pipeline via two new function
+constants (`fc_cropping`(27), `fc_blanking`(28)). Non-cropping, non-blanked
+pipelines now compile those branches out entirely.
+
+While there, the redundant runtime `uniform > 0.5` re-checks that duplicated an
+already-baked feature flag were removed from the hot loop:
+`doShading`/`doGradOp`/`doMask` no longer re-test
+`useGradientShading`/`useGradientOpacity`/`useMask` (the feature bit is set iff
+the flag is on), and the shading path no longer re-tests
+`useComputeNormalFromOpacity` / `useNormalTexture` next to
+`fc_computeNormalFromOpacity` / `fc_normalTexture`. These were uniform-coherent
+branches already, so this only removes uniform loads — it cannot change output.
+
+Measured on `VolumeRayCast` (60 frames × 5 reps): **0.65 ± 0.02 → 0.64 ± 0.01
+ms/frame** (~1530 → ~1545 fps), M/GL ratio ~0.50 → ~0.50. The change is inside
+run-to-run σ (a warm-cache run spiked to 0.70 before settling), i.e. the
+remaining dead branches cost less than the independent-path bloat that
+motivated Fix 1/2 — consistent with cropping/blanking being feature-limited
+paths with modest register footprints. The win is therefore primarily
+*compile-time* (branch-free hot loop, fewer uniform loads) rather than a
+measurable frame-time change for this scene.
+Output is unchanged: the GL/Metal thresholded error stays 0.095, all 97
+`RenderingVolumeCxx-Metal` image tests pass, and the cropping
+(`TestGPURayCastCropping*`) and ghost-array blanking
+(`TestGPURayCastVolumeGhostArrays*`) Metal tests still pass with the new
+specialized pipelines.
+
 ## Root cause: `a6bec091bb` — the 22 GL-parity fixes backport
 
 This commit squashes 22 individual correctness fixes (camera-inside near-plane
@@ -225,17 +272,24 @@ and re-profiling each, or temporarily reverting the four suspects above.
    rectilinear, dependent RGBA/LA, multi-light vs headlight, light count,
    RenderToImage depth tracking) into function constants so every pipeline
    compiles only the hot-loop paths it actually uses.
-3. The remaining ~0.10 ms/frame vs the `fd65034cf4` baseline (0.70 → 0.60) is
+3. **Done (Fix 3):** bake cropping and uniform-grid blanking into function
+   constants (`fc_cropping`(27), `fc_blanking`(28)) and remove the redundant
+   runtime `uniform > 0.5` re-checks that duplicated already-baked feature
+   flags. This relieves the last dead-but-present code in the hot loop for
+   non-cropping, non-blanked pipelines. Frame time is unchanged within noise
+   (0.65 ± 0.02 → 0.64 ± 0.01 ms/frame); the value is a smaller, branch-free hot
+   loop and fewer per-sample uniform loads.
+4. The remaining ~0.04 ms/frame vs the `fd65034cf4` baseline (0.64 → 0.60) is
    the inherent cost of the backport's *behavioural* GL-parity changes —
    primarily shading applied to every `alpha > 0` sample (a 6-texel gradient +
    Phong lighting per sample, `a4415d2329`), plus the tightened termination
    threshold and the removed block-bounds exit. These change the rendered image
    by design, so they can only be traded back for performance, not optimized
    away. If that trade is wanted, gate them behind a parity toggle.
-4. If GL-parity output is not required for a given configuration, allow the
+5. If GL-parity output is not required for a given configuration, allow the
    parity march (block-bounds exit, gate thresholds, densified box, per-sample
    shading) to be toggled off.
-5. Re-land `a6bec091bb`'s 22 fixes individually so regressions of this size can
+6. Re-land `a6bec091bb`'s 22 fixes individually so regressions of this size can
    be attributed to a single change.
 
 ## Reproduction
