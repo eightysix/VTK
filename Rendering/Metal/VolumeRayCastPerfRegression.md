@@ -605,18 +605,19 @@ and many blocks add geometry/CPU-side costs. Re-evaluating each lever:
       (M/GL 0.46–0.49) because the min-max skip and the march scale better than
       GL's fixed occupancy-bound behavior. Re-sweep on the user's larger studies
       before shipping.
-    - **Jitter: made much lighter with block-coherent IGN (default, −20% at
-      sd 4).** The jitter math is trivial; the cost is that a per-fragment
+    - **Jitter: made much lighter with block-coherent IGN (−20% at sd 4,
+      opt-in).** The jitter math is trivial; the cost is that a per-fragment
       offset makes adjacent SIMD lanes take divergent min-max skip paths and
       scatter the minmax-texture reads. Sampling the IGN noise once per 2×2
-      pixel block (`SetJitterBlockSize`, default 2) restores lockstep marching
-      while keeping the stochastic anti-aliasing: 800×800 sd 4 drops 17.1 →
-      13.5 ms (−21%), 400×400 sd 4 9.2 → 8.0 ms (−13%), 400×400 sd 2
+      pixel block (`SetJitterBlockSize`, opt-in; the legacy per-pixel default
+      of 1 stays bit-identical to pre-block renders) restores lockstep
+      marching while keeping the stochastic anti-aliasing: 800×800 sd 4 drops
+      17.1 → 13.5 ms (−21%), 400×400 sd 4 9.2 → 8.0 ms (−13%), 400×400 sd 2
       14.0 → 13.0 ms (−7%), 800×800 sd 0.5 54.8 → 51.7 ms, and sd 0.5 stays
       bit-exact (err 0.000) and unchanged (sub-voxel offsets round to the same
       lattice regardless of block size). A 4×4 block is −30% but visibly
-      coarser noise (sd-4 err 0.816 → 1.409), so 2×2 is the committed default.
-      Block size 1 restores the legacy per-pixel behavior.
+      coarser noise (sd-4 err 0.816 → 1.409), so 2×2 is the recommended opt-in.
+      Block size 1 (default) restores the legacy per-pixel behavior.
     - **Jitter off is a further (quality) lever.** Turning jitter off saves 9%
       at sd 2 and 27% at sd 4 over per-pixel jitter; over the new block
       jitter the remaining gap is smaller (sd 4: 8.0 → ~7 ms at 400×400).

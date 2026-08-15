@@ -204,7 +204,8 @@ public:
   // divergence + minmax-texture cache scatter); sampling the noise once per
   // 2x2 block keeps the stochastic anti-aliasing while marching in lockstep
   // (-20% at coarse sample distances, no change at the default 0.5 spacing).
-  // 1 restores the legacy per-pixel behavior.
+  // Default 1 = legacy per-pixel behavior (bit-identical to pre-block renders);
+  // opt in to a larger block via SetJitterBlockSize(2 or 4).
   void SetJitterBlockSize(int val) { this->JitterBlockSize = std::max(1, val); }
   int GetJitterBlockSize() const { return this->JitterBlockSize; }
 
@@ -322,7 +323,7 @@ private:
   bool UseIGNJitter = false;
 
   // IGN jitter coherence block size in pixels (see SetJitterBlockSize).
-  int JitterBlockSize = 2;
+  int JitterBlockSize = 1;
 
   // Phase 5: GPU-based min/max acceleration generation.
   // When true, UpdateMinMaxTexture uses GPU compute kernels instead of CPU

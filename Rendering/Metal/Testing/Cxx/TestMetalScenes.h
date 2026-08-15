@@ -1055,7 +1055,7 @@ inline int TempJitterBlock()
 {
   if (const char* v = std::getenv("VTK_METAL_TEST_JITTER_BLOCK"))
     return std::max(1, std::atoi(v));
-  return 2;
+  return 1;
 }
 
 // Replicates the DICOMVolumeViewController pipeline

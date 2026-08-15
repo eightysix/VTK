@@ -2883,11 +2883,12 @@ struct VolumeMapperUniforms {
   // 1.0 = use Interleaved Gradient Noise (Jimenez 2014) for sample jittering
   // instead of the GL-parity blue-noise tile (kBlueNoise64).
   float useIGNJitter;
-  // Pixels per IGN-jitter coherence block (1 = legacy per-pixel). Jittering
-  // every fragment independently makes adjacent lanes take divergent min-max
-  // skip paths; a small block keeps the stochastic offset while restoring
-  // lockstep marching (measured -20% at sample distance 4, bit-identical at
-  // 0.5 where sub-voxel offsets round to the same lattice).
+  // Pixels per IGN-jitter coherence block (default 1 = legacy per-pixel).
+  // Jittering every fragment independently makes adjacent lanes take divergent
+  // min-max skip paths; a small block keeps the stochastic offset while
+  // restoring lockstep marching (measured -20% at sample distance 4, bit-identical
+  // at 0.5 where sub-voxel offsets round to the same lattice). Opt-in: the
+  // legacy per-pixel output stays the default for bit-identical renders.
   float jitterBlockSize;
   float _padDSBV[1];
 };
