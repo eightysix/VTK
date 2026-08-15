@@ -262,6 +262,107 @@ and re-profiling each, or temporarily reverting the four suspects above.
   scenes vs ≤ 0.03 for Metal), so GL/GL-ratio conclusions should always be
   drawn from `--reps > 1` runs.
 
+## Fix 4: align the fullscreen feature-mask builder with GPURender
+
+Two feature-mask builders disagreed about `VolumeFeature_NormalTexture`:
+`GPURender`'s builder sets it whenever `GradientNormalTexture` exists
+(mm:7120-7121), but `DrawBlocksFullscreen`'s builder did not (mm:6290-6318).
+Consequence: with `UsePrecomputedNormals` enabled, the block/direct path
+compiled `fc_normalTexture=true` while the camera-inside fullscreen path
+compiled `fc_normalTexture=false`, so the latter fell back to the 6-texel
+gradient even though the precomputed texture was bound (slot 7, mm:6152) and
+the fullscreen shader consumes the constant (`marchVolume`).
+
+Fix: mirror the check in `DrawBlocksFullscreen` (mm:6299-6300). Default scenes
+(`UsePrecomputedNormals=false`) have `UseNormalTexture=0`, so the mask is
+unchanged and behavior/perf is identical. Build clean; all 288 Metal tests
+pass. Commit `ce8b652cb4`.
+
+## Metal SDK and best-practices review: remaining levers and how they scale
+
+### What the benchmark path actually executes
+
+The `VolumeRayCast` scene uses all defaults, so `GPURender` dispatches to the
+**direct-to-screen** branch — no offscreen intermediate:
+
+- `RenderToImage` (RTT export) is off (mm:7337).
+- `ImageSampleDistance == 1.0` (base-class default) → `useImageSampling` off
+  (mm:7397). Offscreen-then-blit therefore only runs in the RTT and
+  image-sampling modes, not for the benchmark.
+- Camera outside, single block → `DrawBlocks` direct path (mm:7563) into the
+  renderer's active encoder (BGRA8Unorm + Depth32Float).
+
+The hot cost is per-sample: a 6-texel gradient (`computeGradientFast`,
+MetalShaders.metal:3545) plus Phong lighting for every `alpha > 0` sample.
+
+### SDK availability (macOS 15, deployment target 14.0)
+
+Verified against the installed Metal SDK headers:
+
+| Capability | Availability | Verdict for this mapper |
+|---|---|---|
+| `MTLBinaryArchive` | macOS 11+ | startup/PSO hitches only, not frame time |
+| Classic ray tracing (`MTLAccelerationStructure`) | macOS 11+ | no win — per-sample march dominates |
+| Mesh shaders (`MTLMeshRenderPipelineDescriptor`) | macOS 13+ | only for very high block counts |
+| Classic argument buffers | macOS 10.13+ | noise until CPU-bound |
+| `MTLStorageModeMemoryless` | macOS 11+ | legal on Apple Silicon Mac, but see below |
+| Metal 4 (`MTL4*` headers) | macOS 26 only | not usable on this system |
+
+### Memoryless attachments on Apple Silicon Macs (corrected)
+
+Apple Silicon Macs (M1-M4) are **TBDR** — the same tile-memory architecture as
+iOS/Vision — so `MTLStorageModeMemoryless` is fully supported on macOS. The
+earlier framing that memoryless is "iOS/Vision mostly" was wrong; the actual
+blocker here is **render-pass topology**, not GPU class:
+
+- The offscreen `ImageSampleColorTexture` (RGBA16Float, mm:1586-1591) is written
+  in one render pass (mm:7480-7510) and **read by a later blit pass**
+  (mm:7512-7513). Memoryless textures have no backing store and are only valid
+  within a single render pass, so a later pass cannot read them back.
+- The benchmark direct path has no offscreen intermediate at all, so memoryless
+  never applies to it.
+- Legal memoryless uses here: the per-pass depth attachment, or an in-pass MSAA
+  resolve. A meaningful win would require restructuring the volume + composite
+  into a single pass via tile memory (`[[color(m)]]` programmable blending),
+  which overlaps the compute/tile-march territory and forfeits the free
+  rasterizer coverage + hardware depth handling (mm:5736-5744, 6084-6088).
+
+### Lever table: benchmark (dense 33³) vs higher volume complexity
+
+Larger or partitioned volumes change the cost mix: sample count per ray grows
+with volume depth, sparse real-world data makes empty-space skipping matter,
+and many blocks add geometry/CPU-side costs. Re-evaluating each lever:
+
+| Lever | Benchmark (dense 33³) | Higher complexity | Verdict |
+|---|---|---|---|
+| Precomputed gradient normals (`UsePrecomputedNormals` / `fc_normalTexture`) | clean: no per-frame cost, ~144 KB texture, one-time build; 6→1 fetch | biggest: per-sample win scales with ray length; also relieves texture-cache pressure and register pressure | best lever; only matters when shading **or** gradient-opacity is on (`.w` carries grad magnitude, MetalShaders.metal:4555-4570); costs 4 B/voxel (512³ ≈ 512 MB) + one-time compute build (mm:2350-2354) |
+| Min-max empty-space skipping (`fc_minmax`) | overhead — dense data has nothing to skip | dominant win on sparse/real volumes; macrocell size is a tunable | already active (`UseGPUMinMax`, mm:4066-4144); tune macrocell for large extents |
+| Partitioned grid traversal | n/a (`Partitions={1,1,1}`) | essential for huge/sparse volumes; per-brick occupancy skip | already implemented (`fragment_volume_grid_traversal_main`, mm:5347) |
+| Classic ray tracing | no win | marginal for many blocks | skip — the software march still runs |
+| Compute/tile march + `[[color(m)]]` | no win | moderate at high res (occupancy, tile compositing) | forfeits coverage/depth; only if normals + min-max are insufficient |
+| Mesh shaders | no | only for thousands of blocks (CPU-side geometry generation) | low |
+| Binary archives | startup only | more PSO variants → more startup hitches | app polish, not frame time |
+| Classic argument buffers | noise | CPU-bound scenes only | low |
+| Sample distance / termination thresholds | parity trade | scales linearly with samples | gate behind a parity toggle |
+
+### Precomputed-normals cost analysis
+
+`EnsureGradientNormalTexture` (mm:2237) builds an RGBA8Unorm 3D texture via the
+`volume_compute_normals` compute kernel, cached against
+`VolumeUploadTime`/mapper MTime (mm:2257-2269). Costs:
+
+- **Per-frame: none.** The stale check is cheap MTime compares; `Modified()` only
+  fires on data upload or `SetPartitions` (mm:1499).
+- **One-time build:** a compute pass over the whole volume per data upload —
+  trivial at 33³, a real hitch at 512³+.
+- **Memory:** 4 B/voxel (RGBA8Unorm), in addition to the 2 B/voxel R16Float
+  volume — significant at 512³+.
+- **Wasted if unused:** enabling the flag with shading *and* gradient-opacity
+  both off pays build + memory for zero benefit (the gradient is never computed
+  in that config anyway).
+- **Quality:** 8-bit-quantized normals/magnitude vs the computed 6-fetch path —
+  a parity concern the `--threshold` harness must verify, not a perf one.
+
 ## Recommendations
 
 1. **Done:** recover the single-component fast path by specializing the
@@ -291,6 +392,24 @@ and re-profiling each, or temporarily reverting the four suspects above.
    shading) to be toggled off.
 6. Re-land `a6bec091bb`'s 22 fixes individually so regressions of this size can
    be attributed to a single change.
+7. **Done (Fix 4):** align the `DrawBlocksFullscreen` feature-mask builder with
+   `GPURender` so the precomputed-normal bit (`fc_normalTexture`) is set for the
+   camera-inside path too (commit `ce8b652cb4`). No behavior change with the
+   default (`UsePrecomputedNormals=false`); a latent specialization mismatch
+   fixed.
+8. **Next, the only remaining per-sample lever for the benchmark: precomputed
+   gradient normals.** Prototype `UsePrecomputedNormals=true`, verify the
+   8-bit-quantized normals/magnitude against `--threshold` (currently 0.095),
+   and measure the fps/M-gl ratio. It is the one change that edits the hot-loop
+   arithmetic (6 fetches → 1 per lit sample) and should deliver the largest
+   measurable win for this scene. For large (512³+) volumes, weigh the 4 B/voxel
+   texture memory against the gain and only enable when shading or
+   gradient-opacity is active.
+9. For higher-volume-complexity scenarios (larger/sparser extents, partitioned
+   volumes), the levers above re-rank: min-max empty-space skipping and the
+   grid-traversal path become the dominant wins (already implemented — tune the
+   macrocell size), while ray tracing, mesh shaders, and argument buffers stay
+   marginal. No additional Metal-API work is indicated.
 
 ## Reproduction
 
