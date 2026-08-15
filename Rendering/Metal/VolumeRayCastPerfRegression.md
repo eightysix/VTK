@@ -426,10 +426,27 @@ Sweep on the DICOM scene (Metal, 400×400, sd 0.5, IS 1.0):
 | 4 (old default) | 44.2 | 0.86 | 7.4 MB | 929 MB |
 | 8 | 60.9 | 1.28 | 1.8 MB | 924 MB |
 
-DS=2 is the sweet spot (−6% vs DS=4 for +49 MB GPU) and brings 800×800 to
-M/GL 1.00 parity. Larger cells lose more than they save: boundary cells spanning
+The sweep above is at the app's sd 0.5 (dense sampling). The optimum tracks the
+sample distance, because the skip advances whole macrocell cells — with coarse
+steps the skip-loop iteration count dominates, but coarser cells re-march thicker
+boundary shells. Re-sweeping at higher sd (400×400, jitter/min-max on) flips the
+winner:
+
+| sd | DS=2 | DS=4 | DS=8 |
+|---|---|---|---|
+| 0.5 | **41.6** | 42.9 | 60.9 |
+| 1 | **24.4** | 27.3 | — |
+| 2 | 14.5 | **13.1** | 20.7 |
+| 4 | 11.0 | **9.7** | 12.3 |
+
+So the mapper now picks DS adaptively from the sample distance
+(`ComputeMacrocellDownsample`: DS 2 for sd <= 1, DS 4 for sd >= 2), rebuilding
+the occupancy grid when the sd tier changes. This is still bit-exact at every
+setting (thresholded error unchanged: 0.000 at sd 0.5, 0.080 at sd 2, 0.817 at
+sd 4 — identical to the fixed-DS versions), and yields the best of both regimes.
+Larger cells than the optimum lose more than they save: boundary cells spanning
 the body/air silhouette are treated as solid, so coarser macrocells re-march the
-mixed shell.
+mixed shell (and at high sd the skip-loop granularity dominates the other way).
 
 ## Metal SDK and best-practices review: remaining levers and how they scale
 
@@ -580,10 +597,23 @@ and many blocks add geometry/CPU-side costs. Re-evaluating each lever:
       empty-space skip already buys ~9%, and a tighter clip plane or a cropped
       input shortens every ray. Scales with the ~1–1.5 GB studies the user
       targets.
-    - **Min-max macrocell tuning.** Already active (Metal-only; GL renders
-      without it). Swept on the DICOM study: DS=2 wins ~6% over the old DS=4
-      default with bit-exact output (+49 MB GPU; see the DS table above).
-      Re-sweep on the user's larger studies before shipping.
+    - **Min-max macrocell tuning.** Already active and now adaptive
+      (Metal-only; GL renders without it): DS follows the sample distance
+      (2 at sd <= 1, 4 at sd >= 2), bit-exact at every setting. At sd 0.5 it
+      wins ~6% over the old fixed DS=4 (+49 MB GPU); at sd >= 2 it wins 10–12%
+      over DS=2 (the old default). At high sd Metal pulls further ahead of GL
+      (M/GL 0.46–0.49) because the min-max skip and the march scale better than
+      GL's fixed occupancy-bound behavior. Re-sweep on the user's larger studies
+      before shipping.
+    - **Jitter is a coarse-tier lever (quality trade-off).** Turning jitter off
+      saves 9% at sd 2 and 27% at sd 4 (400×400) — it is a per-fragment
+      dependent noise fetch at march start whose cost grows as the march
+      shortens — but it removes stochastic anti-aliasing and makes the
+      comparison bit-exact only because GL also renders un-jittered. Both
+      backends pay the same cost, so it is a config decision, not a parity lever.
+    - **Depth-occlusion fetch: measured negligible** (forcing `useDepthTexture`
+      off changed nothing at sd 0.5 or sd 4), and the per-frame floor is
+      ~1.5–4 ms (400×400, sd 8) — not worth attacking for this use case.
     - **Precomputed normals: not useful here** — the app's presets render with
       shading off, so no gradient is computed in the hot loop anyway.
 

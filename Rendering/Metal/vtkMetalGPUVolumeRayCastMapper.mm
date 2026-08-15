@@ -923,6 +923,20 @@ static std::vector<uint8_t> DilateOccupancy3D(
 }
 
 //------------------------------------------------------------------------------
+// The min-max occupancy grid is a downsample of the volume by DS voxels per
+// cell. The empty-space skip advances whole macrocell cells, so the optimal
+// DS tracks the sample distance: dense sampling (small step) wants fine cells
+// to keep the re-marched boundary shell thin, while coarse sampling (large
+// step) wants coarser cells so a single skip advances several sample steps.
+// Measured on the DICOM study (Metal, 400x400): DS 2 best at sd <= 1, DS 4
+// best at sd >= 2. Every DS is output-identical (the emptiness test is exact
+// for U8 data), so this is a pure pipeline tuning knob.
+static int ComputeMacrocellDownsample(double sampleDistance)
+{
+  return (sampleDistance >= 1.5) ? 4 : 2;
+}
+
+//------------------------------------------------------------------------------
 static id<MTLTexture> CreateR8MinMaxTexture(
   id<MTLDevice> device,
   int dimX,
@@ -2075,7 +2089,7 @@ void vtkMetalGPUVolumeRayCastMapper::EnsureGridTraversalResources(
     const int mcDims1 = this->MinMaxDims[1];
     const int mcDims2 = this->MinMaxDims[2];
 
-    const int DS = 2;
+    const int DS = ComputeMacrocellDownsample(this->SampleDistance);
 
     const int fullX = fullExt[1] - fullExt[0] + 1;
     const int fullY = fullExt[3] - fullExt[2] + 1;
@@ -4567,35 +4581,40 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
   id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
   id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)mtlQueueVoid;
 
-  if (!this->VolumeTexture)
+  id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;
+  if (!volTex)
   {
     return false;
   }
+  int dims[3] = { static_cast<int>(volTex.width),
+                  static_cast<int>(volTex.height),
+                  static_cast<int>(volTex.depth) };
 
-  // Timestamp-based caching: skip recompute when nothing changed.
+  const int DS = ComputeMacrocellDownsample(this->SampleDistance);
+  int mmDims[3] = {
+    std::max(1, (dims[0] + DS - 1) / DS),
+    std::max(1, (dims[1] + DS - 1) / DS),
+    std::max(1, (dims[2] + DS - 1) / DS)
+  };
+
+  // Timestamp-based caching: skip recompute when nothing changed. The grid
+  // dims are part of the key so switching sample-distance tiers (which moves
+  // DS) rebuilds the occupancy grid for the new cell size.
   if (input && this->MinMaxTexture)
   {
     vtkVolumeProperty* property = vol ? vol->GetProperty() : nullptr;
     vtkPiecewiseFunction* opFunc = property ? property->GetScalarOpacity() : nullptr;
     if (opFunc &&
         input->GetMTime() <= this->MinMaxUploadTime.GetMTime() &&
-        opFunc->GetMTime() <= this->MinMaxUploadTime.GetMTime())
+        opFunc->GetMTime() <= this->MinMaxUploadTime.GetMTime() &&
+        this->MinMaxDims[0] == mmDims[0] &&
+        this->MinMaxDims[1] == mmDims[1] &&
+        this->MinMaxDims[2] == mmDims[2])
     {
       return true;
     }
   }
 
-  id<MTLTexture> volTex = (__bridge id<MTLTexture>)this->VolumeTexture;
-  int dims[3] = { static_cast<int>(volTex.width),
-                  static_cast<int>(volTex.height),
-                  static_cast<int>(volTex.depth) };
-
-  const int DS = 2;
-  int mmDims[3] = {
-    std::max(1, (dims[0] + DS - 1) / DS),
-    std::max(1, (dims[1] + DS - 1) / DS),
-    std::max(1, (dims[2] + DS - 1) / DS)
-  };
   this->MinMaxDims[0] = mmDims[0];
   this->MinMaxDims[1] = mmDims[1];
   this->MinMaxDims[2] = mmDims[2];
@@ -4720,6 +4739,17 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
     return false;
   }
 
+  int dims[3];
+  input->GetDimensions(dims);
+
+  // Downsample factor for the min-max occupancy grid (DS voxels per cell)
+  const int DS = ComputeMacrocellDownsample(this->SampleDistance);
+  int mmDims[3] = {
+    std::max(1, (dims[0] + DS - 1) / DS),
+    std::max(1, (dims[1] + DS - 1) / DS),
+    std::max(1, (dims[2] + DS - 1) / DS)
+  };
+
   // When skipGlobalTexture is true (partitioned mode), MinMaxTexture is
   // intentionally never created. Use MacrocellScalarMin as the validity
   // sentinel instead, so we don't re-run the full voxel scan every frame.
@@ -4734,6 +4764,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
   }
   doReload |= (input->GetMTime() > this->MinMaxUploadTime.GetMTime());
   doReload |= (opFunc->GetMTime() > this->MinMaxUploadTime.GetMTime());
+  // Sample-distance tier changes move DS and therefore the grid dims: rebuild.
+  doReload |= (this->MinMaxDims[0] != mmDims[0] ||
+               this->MinMaxDims[1] != mmDims[1] ||
+               this->MinMaxDims[2] != mmDims[2]);
 
   if (!doReload)
   {
@@ -4752,16 +4786,6 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
   {
     id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
 
-    int dims[3];
-    input->GetDimensions(dims);
-
-    // Downsample factor for the min-max occupancy grid (DS voxels per cell)
-    const int DS = 2;
-    int mmDims[3] = {
-      std::max(1, (dims[0] + DS - 1) / DS),
-      std::max(1, (dims[1] + DS - 1) / DS),
-      std::max(1, (dims[2] + DS - 1) / DS)
-    };
     this->MinMaxDims[0] = mmDims[0];
     this->MinMaxDims[1] = mmDims[1];
     this->MinMaxDims[2] = mmDims[2];
