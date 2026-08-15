@@ -7502,8 +7502,13 @@ void vtkMetalPolyDataMapper::EnsurePipelineStates(void* mtlDevice, vtkActor* act
         [vd release];
       }
       specDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-      // 8A: Skip IDs attachment when MSAA is active — render pass only has 1 color attachment
-      if (emitIds && sampleCount <= 1)
+      // 8A: Skip IDs attachment when MSAA is active — render pass only has 1 color attachment.
+      // Declare it even for the non-emit variant: the opaque/translucent/overlay passes keep
+      // the RGBA32Uint IDs texture attached whenever MSAA is inactive (see
+      // vtkMetalRenderer::DeviceRender), so every pipeline bound to those passes must declare
+      // attachment 1 or Metal validation fails. The emitIds constant only controls whether the
+      // shader writes ids, not whether the attachment is present.
+      if (sampleCount <= 1)
       {
         specDesc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Uint;  // P2-8: picking IDs
       }
