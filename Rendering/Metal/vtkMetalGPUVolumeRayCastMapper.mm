@@ -931,10 +931,13 @@ static std::vector<uint8_t> DilateOccupancy3D(
 // step) wants coarser cells so a single skip advances several sample steps.
 // Measured on the DICOM study (Metal, 400x400): DS 2 best at sd <= 1, DS 4
 // best at sd >= 2. Every DS is output-identical (the emptiness test is exact
-// for U8 data), so this is a pure pipeline tuning knob.
-static int ComputeMacrocellDownsample(double sampleDistance)
+// for U8 data), so this is a pure pipeline tuning knob. The finer DS=2 grid
+// is restricted to the GPU-computed lattice (UseGPUMinMax): there its precise
+// per-sample skip pays off. The CPU-computed lattice keeps DS=4, matching the
+// pre-adaptive baseline so the CPU path does not slow the march down.
+static int ComputeMacrocellDownsample(double sampleDistance, bool useGPUMinMax)
 {
-  return (sampleDistance >= 1.5) ? 4 : 2;
+  return (useGPUMinMax && sampleDistance < 1.5) ? 2 : 4;
 }
 
 //------------------------------------------------------------------------------
@@ -2090,7 +2093,7 @@ void vtkMetalGPUVolumeRayCastMapper::EnsureGridTraversalResources(
     const int mcDims1 = this->MinMaxDims[1];
     const int mcDims2 = this->MinMaxDims[2];
 
-    const int DS = ComputeMacrocellDownsample(this->SampleDistance);
+    const int DS = ComputeMacrocellDownsample(this->SampleDistance, this->UseGPUMinMax);
 
     const int fullX = fullExt[1] - fullExt[0] + 1;
     const int fullY = fullExt[3] - fullExt[2] + 1;
@@ -4591,7 +4594,7 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
                   static_cast<int>(volTex.height),
                   static_cast<int>(volTex.depth) };
 
-  const int DS = ComputeMacrocellDownsample(this->SampleDistance);
+  const int DS = ComputeMacrocellDownsample(this->SampleDistance, this->UseGPUMinMax);
   int mmDims[3] = {
     std::max(1, (dims[0] + DS - 1) / DS),
     std::max(1, (dims[1] + DS - 1) / DS),
@@ -4743,8 +4746,12 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
   int dims[3];
   input->GetDimensions(dims);
 
-  // Downsample factor for the min-max occupancy grid (DS voxels per cell)
-  const int DS = ComputeMacrocellDownsample(this->SampleDistance);
+  // Downsample factor for the min-max occupancy grid (DS voxels per cell).
+  // The finer DS=2 grid is only used when the lattice is computed on the GPU
+  // (UseGPUMinMax): its precise per-sample skip pays off there. The CPU path
+  // keeps DS=4 so the slower CPU-computed occupancy behaves like the
+  // pre-adaptive baseline instead of degrading the march.
+  const int DS = ComputeMacrocellDownsample(this->SampleDistance, this->UseGPUMinMax);
   int mmDims[3] = {
     std::max(1, (dims[0] + DS - 1) / DS),
     std::max(1, (dims[1] + DS - 1) / DS),
@@ -4774,14 +4781,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
   {
     if (skipGlobalTexture)
     {
-      return this->MacrocellScalarMin.empty() == false;
+      return !this->MacrocellScalarMin.empty();
     }
-  if (skipGlobalTexture)
-  {
-    return !this->MacrocellScalarMin.empty();
+    return this->MinMaxTexture != nullptr;
   }
-  return this->MinMaxTexture != nullptr;
-}
 
   @autoreleasepool
   {
@@ -6491,6 +6494,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   else
   {
     // CPU min-max path: compute from raw scalar data before volume upload.
+    // When UseGPUMinMax is false the lattice uses DS=4 (see
+    // ComputeMacrocellDownsample), matching the historical cell size so the
+    // CPU-computed occupancy skip behaves like the pre-adaptive baseline.
     this->UpdateMinMaxTexture(mtlDevice, vol, input, scalars, usePartitions);
 
     if (!this->UpdateVolumeTexture(mtlDevice, mtlQueue, vol))
