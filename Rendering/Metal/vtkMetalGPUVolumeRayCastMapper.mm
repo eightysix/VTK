@@ -6296,6 +6296,8 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
     featureMask |= VolumeFeature_Mask;
   if (uniforms->UseMinMaxAccel > 0.5f)
     featureMask |= VolumeFeature_MinMax;
+  if (uniforms->UseNormalTexture > 0.5f)
+    featureMask |= VolumeFeature_NormalTexture;
   if (uniforms->UseComputeNormalFromOpacity > 0.5f)
     featureMask |= VolumeFeature_ComputeNormalFromOpacity;
   if (uniforms->UseLinearVolumeInterpolation > 0.5f)
