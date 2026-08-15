@@ -139,6 +139,38 @@ Measured on `VolumeRayCast` (60 frames × 5 reps): **1.04 → 0.79 ms/frame**
 and also relieves the backport's added register load, since the two commits
 compete for the same registers.
 
+## Fix 2: specialize the remaining feature-flag branches via function constants
+
+The single-component fast path still carried a set of runtime-uniform branches
+in the hot march loop (dead for the benchmark configuration, but alive at
+runtime so the compiler could not eliminate them):
+
+- `doTransfer2D` / `doRectilinear` — 2D transfer-function sampling and
+  rectilinear coordinate-curve remapping in the hot loop.
+- The dependent multi-component RGBA / LA transfer-function sampling.
+- The multi-light vs headlight lighting selection
+  (`lightUniforms->defaultLighting == 0`) and the light-count loop bound.
+- The RenderToImage first-opaque-sample tracking block.
+
+All of these are now compile-time. Seven new function constants
+(`fc_transfer2D`(20), `fc_rectilinear`(21), `fc_defaultLighting`(22),
+`fc_lightCount`(23), `fc_dependentRGBA`(24), `fc_dependentLA`(25),
+`fc_renderToTexture`(26)) are baked from the feature mask, which now also
+encodes the light count (4-bit field) and the RenderToImage flag. Headlight
+pipelines compile the entire multi-light accumulation loop out; non-TF_2D,
+non-rectilinear, non-dependent, and non-RTT pipelines eliminate their
+respective hot-loop branches. The `haveOpaquePos` RTT block is guarded by
+`fc_renderToTexture`, so non-RTT pipelines drop the per-sample depth tracking.
+
+One ordering caveat surfaced in the image tests: `uniforms.UseRectilinear` is
+filled in *after* the feature mask is built, so the rectilinear bit is derived
+from `this->RectilinearInput` (set during `EnsureEffectiveInput`) instead.
+
+Measured on `VolumeRayCast` (60 frames × 5 reps): **0.79 → 0.70 ms/frame**
+(1272 → ~1428 fps), M/GL ratio 0.67 → ~0.55. Output is unchanged — the
+GL/Metal thresholded error stays 0.095 and all 97 `RenderingVolumeCxx-Metal`
+image tests pass.
+
 ## Root cause: `a6bec091bb` — the 22 GL-parity fixes backport
 
 This commit squashes 22 individual correctness fixes (camera-inside near-plane
@@ -189,17 +221,21 @@ and re-profiling each, or temporarily reverting the four suspects above.
    ray-cast shader on the independent-components flag via a Metal function
    constant (`fc_independentComponents`). This addresses the register-pressure
    cost shared by both culprits without changing output.
-2. The remaining ~0.19 ms/frame vs the `fd65034cf4` baseline (0.79 → 0.60) is
+2. **Done:** bake the remaining feature-flag branches (2D transfer function,
+   rectilinear, dependent RGBA/LA, multi-light vs headlight, light count,
+   RenderToImage depth tracking) into function constants so every pipeline
+   compiles only the hot-loop paths it actually uses.
+3. The remaining ~0.10 ms/frame vs the `fd65034cf4` baseline (0.70 → 0.60) is
    the inherent cost of the backport's *behavioural* GL-parity changes —
    primarily shading applied to every `alpha > 0` sample (a 6-texel gradient +
    Phong lighting per sample, `a4415d2329`), plus the tightened termination
    threshold and the removed block-bounds exit. These change the rendered image
    by design, so they can only be traded back for performance, not optimized
    away. If that trade is wanted, gate them behind a parity toggle.
-3. If GL-parity output is not required for a given configuration, allow the
+4. If GL-parity output is not required for a given configuration, allow the
    parity march (block-bounds exit, gate thresholds, densified box, per-sample
    shading) to be toggled off.
-4. Re-land `a6bec091bb`'s 22 fixes individually so regressions of this size can
+5. Re-land `a6bec091bb`'s 22 fixes individually so regressions of this size can
    be attributed to a single change.
 
 ## Reproduction

@@ -5218,6 +5218,17 @@ void vtkMetalGPUVolumeRayCastMapper::BuildVolumeLightUniforms(
 }
 
 //------------------------------------------------------------------------------
+uint32_t vtkMetalGPUVolumeRayCastMapper::VolumeLightingFeatureBits(
+  const VolumeLightUniforms& lights)
+{
+  uint32_t bits = 0;
+  if (lights.defaultLighting != 0)
+    bits |= VolumeFeature_DefaultLighting;
+  bits |= (static_cast<uint32_t>(lights.lightCount) & 0xFu) << VolumeFeature_LightCountShift;
+  return bits;
+}
+
+//------------------------------------------------------------------------------
 bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
   void* mtlDeviceVoid, vtkRenderer* ren, vtkVolume* vol, vtkImageData* input)
 {
@@ -5874,6 +5885,23 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
                         withName:@"fc_computeNormalFromOpacity"];
     [constants setConstantValue:&independentComp type:MTLDataTypeBool
                         withName:@"fc_independentComponents"];
+    BOOL transfer2D = (featureMask & VolumeFeature_Transfer2D) ? YES : NO;
+    BOOL rectilinear = (featureMask & VolumeFeature_Rectilinear) ? YES : NO;
+    BOOL defaultLighting = (featureMask & VolumeFeature_DefaultLighting) ? YES : NO;
+    int lightCount = (featureMask >> VolumeFeature_LightCountShift) & 0xFu;
+    BOOL dependentRGBA = (featureMask & VolumeFeature_DependentRGBA) ? YES : NO;
+    BOOL dependentLA = (featureMask & VolumeFeature_DependentLA) ? YES : NO;
+    BOOL renderToTexture = (featureMask & VolumeFeature_RenderToImage) ? YES : NO;
+
+    [constants setConstantValue:&transfer2D type:MTLDataTypeBool withName:@"fc_transfer2D"];
+    [constants setConstantValue:&rectilinear type:MTLDataTypeBool withName:@"fc_rectilinear"];
+    [constants setConstantValue:&defaultLighting type:MTLDataTypeBool
+                        withName:@"fc_defaultLighting"];
+    [constants setConstantValue:&lightCount type:MTLDataTypeInt withName:@"fc_lightCount"];
+    [constants setConstantValue:&dependentRGBA type:MTLDataTypeBool withName:@"fc_dependentRGBA"];
+    [constants setConstantValue:&dependentLA type:MTLDataTypeBool withName:@"fc_dependentLA"];
+    [constants setConstantValue:&renderToTexture type:MTLDataTypeBool
+                        withName:@"fc_renderToTexture"];
 
     // Blend mode function constant: 0=composite, 1=MIP, 2=MinIP, 3=AverageIP,
     // 4=additive (vtkVolumeMapper::BlendMode). Encoded in the feature mask so
@@ -6242,7 +6270,7 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
   void* encoderVoid, void* uniformBufVoid, vtkRenderer* ren,
   vtkVolume* vtkNotUsed(vol),
   void* uniformsVoid, vtkMatrix4x4* vtkNotUsed(invModelMatrix),
-  bool useDirectPipeline)
+  bool useDirectPipeline, uint32_t lightingFeatureBits)
 {
   id<MTLRenderCommandEncoder> encoder =
     (__bridge id<MTLRenderCommandEncoder>)encoderVoid;
@@ -6271,6 +6299,15 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
   featureMask |= BlendModeToFeatureFlag(this->GetBlendMode());
   if (VolumeFeatureIndependentPath(*uniforms, featureMask))
     featureMask |= VolumeFeature_IndependentComponents;
+  if (uniforms->UseTransfer2D > 0.5f)
+    featureMask |= VolumeFeature_Transfer2D;
+  if (uniforms->UseRectilinear > 0.5f)
+    featureMask |= VolumeFeature_Rectilinear;
+  if (uniforms->UseDependentRGBA > 0.5f)
+    featureMask |= VolumeFeature_DependentRGBA;
+  if (uniforms->UseDependentLA > 0.5f)
+    featureMask |= VolumeFeature_DependentLA;
+  featureMask |= lightingFeatureBits;
 
   id<MTLDevice> device = (__bridge id<MTLDevice>)
     (static_cast<vtkMetalRenderWindow*>(ren->GetRenderWindow()))->GetMetalDevice();
@@ -7012,6 +7049,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     };
     this->BuildVolumeLightUniforms(ren, vol, invModelMatrix, this->ModelBounds, bs, lightUniforms);
   }
+  uint32_t lightingFeatureBits = VolumeLightingFeatureBits(lightUniforms);
 
   // Capture the scene depth texture for early ray termination.
   // The depth buffer is written by opaque geometry in the earlier render pass.
@@ -7080,6 +7118,17 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   featureMask |= BlendModeToFeatureFlag(this->GetBlendMode());
   if (VolumeFeatureIndependentPath(uniforms, featureMask))
     featureMask |= VolumeFeature_IndependentComponents;
+  if (uniforms.UseTransfer2D > 0.5f)
+    featureMask |= VolumeFeature_Transfer2D;
+  if (this->RectilinearInput)
+    featureMask |= VolumeFeature_Rectilinear;
+  if (uniforms.UseDependentRGBA > 0.5f)
+    featureMask |= VolumeFeature_DependentRGBA;
+  if (uniforms.UseDependentLA > 0.5f)
+    featureMask |= VolumeFeature_DependentLA;
+  featureMask |= lightingFeatureBits;
+  if (this->RenderToImage)
+    featureMask |= VolumeFeature_RenderToImage;
 
   // Hardware-selection support (vtkHardwareSelector): during a selection render
   // with CELLS field association the volume is ray-cast with the selection
@@ -7434,7 +7483,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       if (cameraInside)
       {
         this->DrawBlocksFullscreen(offscreenEncoder, uniformBuf, ren, vol,
-          &uniforms, invModelMatrix, false);
+          &uniforms, invModelMatrix, false, lightingFeatureBits);
       }
       else
       {
@@ -7497,7 +7546,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     {
       // Fullscreen ray-cast path — no proxy geometry, no vertex/index buffers.
       this->DrawBlocksFullscreen(encoder, uniformBuf, ren, vol,
-        &uniforms, invModelMatrix, true);
+        &uniforms, invModelMatrix, true, lightingFeatureBits);
     }
     else
     {

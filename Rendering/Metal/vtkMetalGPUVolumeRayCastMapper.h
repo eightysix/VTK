@@ -98,6 +98,27 @@ enum VolumeShaderFeatureFlags : uint32_t
   // parity). Bakes the path into the pipeline via fc_independentComponents so
   // single-component pipelines compile it out entirely.
   VolumeFeature_IndependentComponents = 1u << 11,
+  // 2D transfer-function (TF_2D) path. Baked via fc_transfer2D so non-TF_2D
+  // pipelines compile the 2D lookup sampling out of the hot loop.
+  VolumeFeature_Transfer2D = 1u << 12,
+  // Rectilinear-grid path. Baked via fc_rectilinear so non-rectilinear
+  // pipelines compile the coordinate-curve remapping out of the hot loop.
+  VolumeFeature_Rectilinear = 1u << 13,
+  // Default (single headlight) lighting. Baked via fc_defaultLighting so
+  // headlight pipelines compile the multi-light loop out entirely.
+  VolumeFeature_DefaultLighting = 1u << 14,
+  // Active light count, encoded in 4 bits (values 0..8, MAX_LIGHTS). Baked via
+  // fc_lightCount; only meaningful when VolumeFeature_DefaultLighting is clear.
+  VolumeFeature_LightCountShift = 15,
+  VolumeFeature_LightCountMask  = 0xFu << VolumeFeature_LightCountShift,
+  // Dependent multi-component RGBA path. Baked via fc_dependentRGBA.
+  VolumeFeature_DependentRGBA = 1u << 19,
+  // Dependent multi-component LA path. Baked via fc_dependentLA.
+  VolumeFeature_DependentLA = 1u << 20,
+  // RenderToImage (depth-image export) path. Baked via fc_renderToTexture so
+  // non-RTT pipelines compile the first-opaque-sample tracking out of the hot
+  // loop.
+  VolumeFeature_RenderToImage = 1u << 21,
 };
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -435,7 +456,8 @@ private:
   // fragment_volume_fullscreen_main) instead of proxy geometry. No vertex/index buffers
   // needed — the fullscreen vertex shader generates positions internally.
   void DrawBlocksFullscreen(void* encoder, void* uniformBuf, vtkRenderer* ren, vtkVolume* vol,
-    void* uniforms, vtkMatrix4x4* invModelMatrix, bool useDirectPipeline);
+    void* uniforms, vtkMatrix4x4* invModelMatrix, bool useDirectPipeline,
+    uint32_t lightingFeatureBits);
 
   // Build PerBlockData from global uniforms for single-block volumes.
   static void BuildPerBlockData(PerBlockData& pbd, const VolumeMapperUniforms* uniforms);
@@ -460,6 +482,12 @@ private:
   void BuildVolumeLightUniforms(vtkRenderer* ren, vtkVolume* vol,
     vtkMatrix4x4* invModelMatrix, const double modelBounds[6],
     const double boundsSize[3], VolumeLightUniforms& out);
+
+  // Feature bits for the lighting state (fc_defaultLighting / fc_lightCount),
+  // derived from the built VolumeLightUniforms. Kept separate from the rest of
+  // the feature mask because the fullscreen pipeline path
+  // (DrawBlocksFullscreen) does not otherwise see the light uniforms.
+  static uint32_t VolumeLightingFeatureBits(const VolumeLightUniforms& lights);
 
   unsigned short Partitions[3] = { 1, 1, 1 };
 

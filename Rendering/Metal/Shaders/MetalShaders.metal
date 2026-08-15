@@ -2670,6 +2670,32 @@ constant int fc_blendMode [[function_constant(17)]];
 // entirely, keeping the hot march loop free of its per-sample arrays and
 // branches.
 constant bool fc_independentComponents [[function_constant(19)]];
+// Bakes whether the 2D transfer-function (TF_2D) path is active into the
+// pipeline: non-TF_2D pipelines compile the 2D lookup-table sampling (and its
+// second-axis fetch) out of the hot loop entirely.
+constant bool fc_transfer2D [[function_constant(20)]];
+// Bakes the rectilinear-grid path into the pipeline: non-rectilinear
+// pipelines compile the per-axis coordinate-curve remapping out of the hot
+// loop entirely.
+constant bool fc_rectilinear [[function_constant(21)]];
+// Bakes the renderer's default (single headlight) lighting state into the
+// pipeline: headlight pipelines compile the multi-light accumulation loop out
+// entirely, keeping only the fast Phong headlight path.
+constant bool fc_defaultLighting [[function_constant(22)]];
+// Bakes the active light count into the pipeline so the multi-light loop trip
+// count is compile-time. Only reached when fc_defaultLighting is false.
+constant int fc_lightCount [[function_constant(23)]];
+// Bakes the dependent multi-component RGBA path into the pipeline (OpenGL
+// 4-component dependent RGBA parity): color is the raw RGB channels and
+// opacity is the last channel mapped through the opacity LUT.
+constant bool fc_dependentRGBA [[function_constant(24)]];
+// Bakes the dependent multi-component LA path into the pipeline (OpenGL
+// 2-component dependent LA parity): color comes from the color LUT at the
+// first component and opacity from the opacity LUT at the last component.
+constant bool fc_dependentLA [[function_constant(25)]];
+// Bakes the RenderToImage (depth-image export) path into the pipeline: the
+// first-opaque-sample tracking is compiled out of non-RTT pipelines.
+constant bool fc_renderToTexture [[function_constant(26)]];
 
 // ============================================================================
 // Volume Ray Casting Mapper
@@ -3651,7 +3677,7 @@ inline half3 computeVolumeLighting(
     half3 totalDiffuse  = half3(0.0h);
     half3 totalSpecular = half3(0.0h);
 
-    int numLights = lightUniforms.lightCount;
+    int numLights = fc_lightCount;
     bool twoSided = lightUniforms.twoSidedLighting != 0;
 
     for (int i = 0; i < numLights && i < MAX_LIGHTS; ++i) {
@@ -3904,9 +3930,9 @@ inline half4 marchVolumeUnified(
   const bool doGradOp = fc_gradientOpacity && (volumeUniforms.useGradientOpacity > 0.5);
   const bool doCropping = volumeUniforms.useCropping > 0.5;
   const bool doMask = fc_mask && (volumeUniforms.useMask > 0.5);
-  const bool doTransfer2D = volumeUniforms.useTransfer2D > 0.5;
+  const bool doTransfer2D = fc_transfer2D;
   const bool doBlanking = volumeUniforms.useBlanking > 0.5;
-  const bool doRectilinear = volumeUniforms.useRectilinear > 0.5;
+  const bool doRectilinear = fc_rectilinear;
 
   half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
   half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
@@ -4123,8 +4149,7 @@ inline half4 marchVolumeUnified(
     // keep rectEvalPoint == evalPoint and the branch is a no-op.
     float3 rectEvalPoint = evalPoint;
     if (doRectilinear &&
-        (needsFetch || useIndependentPath || volumeUniforms.useDependentRGBA > 0.5 ||
-         volumeUniforms.useDependentLA > 0.5)) {
+        (needsFetch || useIndependentPath || fc_dependentRGBA || fc_dependentLA)) {
       rectEvalPoint = rectilinearSamplePosition(evalPoint, true, rectCoords, volumeUniforms);
     }
     float rawScalar = needsFetch
@@ -4141,7 +4166,7 @@ inline half4 marchVolumeUnified(
       } else {
         rawScalar4 = volumeTexture.sample(sNearest, rectEvalPoint, level(0));
       }
-    } else if (volumeUniforms.useDependentRGBA > 0.5 || volumeUniforms.useDependentLA > 0.5) {
+    } else if (fc_dependentRGBA || fc_dependentLA) {
       // 4-component dependent RGBA / 2-component dependent LA: color and
       // opacity come from the raw channels (OpenGL computeColor/computeOpacity
       // RGBA/LA parity), so the full texel is needed regardless of the
@@ -4311,7 +4336,7 @@ inline half4 marchVolumeUnified(
         colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
       }
     } else if (fc_needsPerSampleOpacity) {
-      if (volumeUniforms.useDependentRGBA > 0.5) {
+      if (fc_dependentRGBA) {
         // 4-component dependent RGBA: color is the raw RGB channels and opacity
         // comes from the 4th component mapped through the opacity LUT (OpenGL
         // computeColor/computeOpacity RGBA parity: computeColor returns
@@ -4321,7 +4346,7 @@ inline half4 marchVolumeUnified(
         half rgbaOpacity =
           sampleTransferFunction(transferFunctionTexture, float2(rawScalar4.a, 0.5)).a;
         colorOpacity = half4(half3(rawScalar4.rgb), rgbaOpacity);
-      } else if (volumeUniforms.useDependentLA > 0.5) {
+      } else if (fc_dependentLA) {
         // 2-component dependent LA: color is the color LUT at the first
         // component's normalized value (scalarNorm, RGB channels) and opacity
         // is the opacity LUT at the LAST component's normalized value (A
@@ -4436,7 +4461,7 @@ inline half4 marchVolumeUnified(
     // RenderToImage depth: record the world position of the first non-skipped
     // sample whose transfer-function opacity is positive (matches the OpenGL
     // backend's l_opaqueFragPos update).
-    if (haveOpaquePos != nullptr && *haveOpaquePos && sampleOpacity > 0.0h) {
+    if (fc_renderToTexture && haveOpaquePos != nullptr && *haveOpaquePos && sampleOpacity > 0.0h) {
       *firstOpaquePos = currentPoint;
       *haveOpaquePos = false;
     }
@@ -4483,7 +4508,7 @@ inline half4 marchVolumeUnified(
             half3 difC = half3(volumeUniforms.diffuseColorComp[c].rgb);
             half3 speC = half3(volumeUniforms.specularColorComp[c].rgb);
             half  shiC = half(volumeUniforms.shininessComp[c]);
-            if (lightUniforms != nullptr && lightUniforms->defaultLighting == 0) {
+            if (lightUniforms != nullptr && !fc_defaultLighting) {
               ccRGB = computeVolumeLighting(ccRGB, normal, -viewDirHalf,
                   ambC, difC, speC, shiC,
                   *lightUniforms,
@@ -4564,7 +4589,7 @@ inline half4 marchVolumeUnified(
           normal = sharedGrad.xyz;
         }
 
-        if (lightUniforms != nullptr && lightUniforms->defaultLighting == 0) {
+        if (lightUniforms != nullptr && !fc_defaultLighting) {
           sampleColor = computeVolumeLighting(sampleColor, normal, -viewDirHalf,
               ambientMat, diffuseMat, specularMat, shininessMat,
               *lightUniforms,
