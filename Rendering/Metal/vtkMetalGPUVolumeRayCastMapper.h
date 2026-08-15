@@ -192,6 +192,13 @@ public:
   void SetUseFullscreenCameraInside(bool val) { this->UseFullscreenCameraInside = val; }
   bool GetUseFullscreenCameraInside() const { return this->UseFullscreenCameraInside; }
 
+  // Jitter-noise mode. When true the shader jitters sample starts with the
+  // former Interleaved Gradient Noise (Jimenez 2014) instead of the GL-parity
+  // blue-noise tile (kBlueNoise64) that replaced it. Off by default so renders
+  // stay bit-identical to the OpenGL backend.
+  void SetUseIGNJitter(bool val) { this->UseIGNJitter = val; }
+  bool GetUseIGNJitter() const { return this->UseIGNJitter; }
+
   // No-op stubs: the instanced path was removed.  Kept so that any
   // external caller (test / UI) that references the setter still compiles.
   void SetDisableInstanceRendering(bool) {}
@@ -300,6 +307,10 @@ private:
   // fullscreen path reproduces the OpenGL-parity proxy start. Set to false to
   // force the CPU proxy geometry path.
   bool UseFullscreenCameraInside = true;
+
+  // When true, the shader uses Interleaved Gradient Noise (Jimenez 2014) for
+  // sample jittering instead of the GL-parity blue-noise tile. Default false.
+  bool UseIGNJitter = false;
 
   // Phase 5: GPU-based min/max acceleration generation.
   // When true, UpdateMinMaxTexture uses GPU compute kernels instead of CPU

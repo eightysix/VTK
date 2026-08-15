@@ -2880,7 +2880,10 @@ struct VolumeMapperUniforms {
   // dataset (model) space (like the camera-inside cap), so the vertex shader
   // forwards in.position unchanged instead of scaling the unit cube.
   float useDataSpaceBoxVertices;
-  float _padDSBV[3];
+  // 1.0 = use Interleaved Gradient Noise (Jimenez 2014) for sample jittering
+  // instead of the GL-parity blue-noise tile (kBlueNoise64).
+  float useIGNJitter;
+  float _padDSBV[2];
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -3281,6 +3284,14 @@ constant uchar kBlueNoise64[4096] = {
 inline float sampleJitterNoise(float2 st, float viewportH) {
   int2 t = int2(floor(st.x), floor(st.y - viewportH)) & 63;
   return float(kBlueNoise64[t.y * 64 + t.x]) / 255.0f;
+}
+
+// Interleaved Gradient Noise (Jimenez 2014), the jitter used before the GL
+// blue-noise tile landed. Smooth, low-discrepancy, deterministic per pixel,
+// no sin-hash streaks, no texture required. Selected per-render via
+// volumeUniforms.useIGNJitter; the default stays on the GL-parity blue noise.
+inline float sampleIGNJitter(float2 st) {
+  return fract(52.9829189 * fract(dot(st, float2(0.06711056, 0.00583715))));
 }
 
 
@@ -4782,7 +4793,11 @@ inline half4 marchVolume(
 {
   (void)exitPoint;
   (void)totalDist;
-  float jitter = (volumeUniforms.useJittering > 0.5 ? sampleJitterNoise(screenPos, volumeUniforms.viewportSize.y) : 1.0) * stepSize;
+  float jitter = (volumeUniforms.useJittering > 0.5
+      ? (volumeUniforms.useIGNJitter > 0.5
+            ? sampleIGNJitter(screenPos)
+            : sampleJitterNoise(screenPos, volumeUniforms.viewportSize.y))
+      : 1.0) * stepSize;
   float tStart = dot(entryPoint - cameraPos, rayDir);
   // OpenGL camera-inside parity (update 22): GL ignores the box/near-plane
   // entry for camera-inside proxy fragments and marches from the interpolated
@@ -5182,7 +5197,11 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
   if (!s.valid) { output.color = float4(0.0); output.depth = 1.0; return output; }
 
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
-  float jitter = (volumeUniforms.useJittering > 0.5 ? sampleJitterNoise(in.position.xy, volumeUniforms.viewportSize.y) : 1.0) * stepSize;
+  float jitter = (volumeUniforms.useJittering > 0.5
+      ? (volumeUniforms.useIGNJitter > 0.5
+            ? sampleIGNJitter(in.position.xy)
+            : sampleJitterNoise(in.position.xy, volumeUniforms.viewportSize.y))
+      : 1.0) * stepSize;
   float tStart = parallel ? 0.0 : dot(s.entryPoint - cameraPos, rayDir);
   MarchParams p = {rayOrigin, rayDir, tStart, s.totalBoxT, stepSize, jitter, s.tTerminateMax,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, true};
@@ -5472,7 +5491,9 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
     // from the rest and from GL's in_noiseSampler(gl_FragCoord.xy) sampling.
     float stepSize = physicalSampleStep(rayDir, volumeUniforms);
     float jitter = volumeUniforms.useJittering > 0.5
-        ? sampleJitterNoise(in.position.xy, volumeUniforms.viewportSize.y) * stepSize
+        ? (volumeUniforms.useIGNJitter > 0.5
+              ? sampleIGNJitter(in.position.xy + float2(0.5, 0.5)) * stepSize
+              : sampleJitterNoise(in.position.xy, volumeUniforms.viewportSize.y) * stepSize)
         : 1.0 * stepSize;
 
     // Grid traversal loop

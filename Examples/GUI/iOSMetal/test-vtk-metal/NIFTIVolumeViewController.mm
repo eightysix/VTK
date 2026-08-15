@@ -69,6 +69,7 @@
   vtkNew<vtkMetalGPUVolumeRayCastMapper> mapper;
   mapper->SetInputData(castToU8->GetOutput());
   mapper->UseJitteringOn();
+  mapper->SetUseIGNJitter(true);
   mapper->AutoAdjustSampleDistancesOff();
   mapper->SetSampleDistance(0.5);
   mapper->SetPartitions(1, 1, 4);
