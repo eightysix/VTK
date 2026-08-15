@@ -31,9 +31,28 @@ static int kFrames = 120;
 
 // ---------------------------------------------------------------------------
 #define DBG(...) std::fprintf(stderr, "[repro] " __VA_ARGS__), std::fflush(stderr)
-static std::vector<uint8_t> makeVolume()
+// Data mode probes whether Metal's hardware lossless texture compression is
+// what penalizes the linear filter: "random" is incompressible, "zero" and
+// "gradient" are very compressible.
+static std::vector<uint8_t> makeVolume(const char* mode)
 {
   std::vector<uint8_t> v((size_t)kVolX * kVolY * kVolZ);
+  if (std::strcmp(mode, "zero") == 0)
+  {
+    return v;
+  }
+  if (std::strcmp(mode, "gradient") == 0)
+  {
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+      const uint32_t z = (uint32_t)(i / ((size_t)kVolX * kVolY));
+      const uint32_t r = (uint32_t)(i % ((size_t)kVolX * kVolY));
+      const uint32_t y = r / kVolX;
+      const uint32_t x = r % kVolX;
+      v[i] = (uint8_t)((z * 37u + y * 11u + x * 7u) & 0xffu);
+    }
+    return v;
+  }
   uint32_t s = 12345u;
   for (size_t i = 0; i < v.size(); ++i)
   {
@@ -228,7 +247,7 @@ static NSString* kMetalSrc = @R"(
 #include <metal_stdlib>
 using namespace metal;
 struct FragIn { float4 pos [[position]]; float2 uv; };
-struct Params { int axis; int steps; };
+struct Params { int axis; int steps; int strategy; };
 vertex FragIn vsfull(const device float2* pos [[buffer(0)]], uint vid [[vertex_id]]) {
   FragIn o;
   float2 p = pos[vid];
@@ -237,15 +256,49 @@ vertex FragIn vsfull(const device float2* pos [[buffer(0)]], uint vid [[vertex_i
   return o;
 }
 fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
+                      texture2d_array<float, access::sample> arr [[texture(1)]],
                       sampler smp [[sampler(0)]],
+                      sampler smpN [[sampler(1)]],
                       constant Params& p [[buffer(0)]],
                       FragIn in [[stage_in]]) {
   float step = 1.0 / float(p.steps);
   float3 base = (p.axis == 2) ? float3(in.uv, 0.0) : float3(0.0, in.uv.x, in.uv.y);
   float3 d = (p.axis == 2) ? float3(0.0, 0.0, step) : float3(step, 0.0, 0.0);
   float acc = 0.0;
-  for (int i = 0; i < p.steps; ++i) {
-    acc += vol.sample(smp, base + float(i) * d).r;
+  // Three separate loops (branch hoisted out) - this structure is what makes
+  // the MSL compiler overlap-schedule the texture fetches. With a single bare
+  // sampling loop the 3-D linear filter costs ~0.42 ns/sample; with the loops
+  // co-compiled it drops to ~0.06 ns/sample (faster than GL). See report
+  // section 9.
+  if (p.strategy == -1) {
+    for (int i = 0; i < p.steps; ++i) {
+      acc += vol.sample(smpN, base + float(i) * d).r;
+    }
+  } else if (p.strategy == 0) {
+    for (int i = 0; i < p.steps; ++i) {
+      acc += vol.sample(smp, base + float(i) * d).r;
+    }
+  } else {
+    const float3 vdims = float3(512.0, 512.0, 1794.0);
+    const float3 vdims1 = vdims - 1.0;
+    for (int i = 0; i < p.steps; ++i) {
+      float3 tc = (base + float(i) * d) * vdims - 0.5;
+      float3 f = floor(tc);
+      float3 w = tc - f;
+      float3 f0 = clamp(f, 0.0, vdims1) / vdims;
+      float3 f1 = clamp(f + 1.0, 0.0, vdims1) / vdims;
+      float v000 = vol.sample(smpN, float3(f0.x, f0.y, f0.z)).r;
+      float v100 = vol.sample(smpN, float3(f1.x, f0.y, f0.z)).r;
+      float v010 = vol.sample(smpN, float3(f0.x, f1.y, f0.z)).r;
+      float v110 = vol.sample(smpN, float3(f1.x, f1.y, f0.z)).r;
+      float v001 = vol.sample(smpN, float3(f0.x, f0.y, f1.z)).r;
+      float v101 = vol.sample(smpN, float3(f1.x, f0.y, f1.z)).r;
+      float v011 = vol.sample(smpN, float3(f0.x, f1.y, f1.z)).r;
+      float v111 = vol.sample(smpN, float3(f1.x, f1.y, f1.z)).r;
+      float v0 = mix(mix(v000, v100, w.x), mix(v010, v110, w.x), w.y);
+      float v1 = mix(mix(v001, v101, w.x), mix(v011, v111, w.x), w.y);
+      acc += mix(v0, v1, w.z);
+    }
   }
   return float4(acc / float(p.steps));
 }
@@ -257,7 +310,7 @@ struct MetalState
   id<MTLCommandQueue> q = nil;
   id<MTLRenderPipelineState> ps = nil;
   id<MTLSamplerState> smpLinear = nil, smpNearest = nil;
-  id<MTLTexture> volTex = nil, colorTex = nil;
+  id<MTLTexture> volTex = nil, vol2d = nil, colorTex = nil;
   id<MTLBuffer> vbuf = nil;
 };
 
@@ -318,6 +371,17 @@ static bool setupMetal(MetalState& s)
   td.usage = MTLTextureUsageShaderRead;
   s.volTex = [s.dev newTextureWithDescriptor:td];
 
+  MTLTextureDescriptor* ad = [[MTLTextureDescriptor alloc] init];
+  ad.textureType = MTLTextureType2DArray;
+  ad.pixelFormat = MTLPixelFormatR8Unorm;
+  ad.width = kVolX;
+  ad.height = kVolY;
+  ad.arrayLength = kVolZ;
+  ad.mipmapLevelCount = 1;
+  ad.storageMode = MTLStorageModeShared;
+  ad.usage = MTLTextureUsageShaderRead;
+  s.vol2d = [s.dev newTextureWithDescriptor:ad];
+
   MTLTextureDescriptor* cd = [[MTLTextureDescriptor alloc] init];
   cd.textureType = MTLTextureType2D;
   cd.pixelFormat = MTLPixelFormatRGBA8Unorm;
@@ -337,15 +401,23 @@ static void uploadMetalVolume(MetalState& s, const std::vector<uint8_t>& v)
   MTLRegion reg = MTLRegionMake3D(0, 0, 0, kVolX, kVolY, kVolZ);
   [s.volTex replaceRegion:reg mipmapLevel:0 slice:0 withBytes:v.data()
       bytesPerRow:kVolX bytesPerImage:(NSUInteger)kVolX * kVolY];
+  MTLRegion r2 = MTLRegionMake2D(0, 0, kVolX, kVolY);
+  const size_t sliceBytes = (size_t)kVolX * kVolY;
+  for (NSUInteger i = 0; i < (NSUInteger)kVolZ; ++i)
+  {
+    [s.vol2d replaceRegion:r2 mipmapLevel:0 slice:i withBytes:v.data() + i * sliceBytes
+        bytesPerRow:kVolX bytesPerImage:sliceBytes];
+  }
 }
 
-static double timeMetal(MetalState& s, id<MTLSamplerState> smp, int axis)
+static double timeMetal(MetalState& s, int strategy, int axis)
 {
   struct Params
   {
     int axis;
     int steps;
-  } params = { axis, kSteps };
+    int strategy;
+  } params = { axis, kSteps, strategy };
 
   for (int i = 0; i < kWarmup; ++i)
   {
@@ -360,7 +432,9 @@ static double timeMetal(MetalState& s, id<MTLSamplerState> smp, int axis)
       [e setRenderPipelineState:s.ps];
       [e setVertexBuffer:s.vbuf offset:0 atIndex:0];
       [e setFragmentTexture:s.volTex atIndex:0];
-      [e setFragmentSamplerState:smp atIndex:0];
+      [e setFragmentTexture:s.vol2d atIndex:1];
+      [e setFragmentSamplerState:s.smpLinear atIndex:0];
+      [e setFragmentSamplerState:s.smpNearest atIndex:1];
       [e setFragmentBytes:&params length:sizeof(params) atIndex:0];
       [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
       [e endEncoding];
@@ -382,7 +456,9 @@ static double timeMetal(MetalState& s, id<MTLSamplerState> smp, int axis)
       [e setRenderPipelineState:s.ps];
       [e setVertexBuffer:s.vbuf offset:0 atIndex:0];
       [e setFragmentTexture:s.volTex atIndex:0];
-      [e setFragmentSamplerState:smp atIndex:0];
+      [e setFragmentTexture:s.vol2d atIndex:1];
+      [e setFragmentSamplerState:s.smpLinear atIndex:0];
+      [e setFragmentSamplerState:s.smpNearest atIndex:1];
       [e setFragmentBytes:&params length:sizeof(params) atIndex:0];
       [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
       [e endEncoding];
@@ -416,7 +492,12 @@ int main(int argc, char** argv)
   }
   const double samplesPerFrame = (double)kWin * kWin * kSteps;
 
-  std::vector<uint8_t> vol = makeVolume();
+  const char* dataMode = std::getenv("REPRO_DATA");
+  if (!dataMode)
+  {
+    dataMode = "random";
+  }
+  std::vector<uint8_t> vol = makeVolume(dataMode);
   std::fprintf(stderr, "volume %dx%dx%d = %.1f MB, %d frags x %d steps = %.2f M samples/frame\n",
     kVolX, kVolY, kVolZ, vol.size() / 1e6, kWin * kWin, kSteps, samplesPerFrame / 1e6);
 
@@ -444,15 +525,17 @@ int main(int argc, char** argv)
     "ns/sample", "readback");
   std::printf("--------------------------------------------------------------\n");
 
+  const char* stratEnv = std::getenv("REPRO_STRATEGY");
+  const int linStrategy = (stratEnv && std::strcmp(stratEnv, "manual") == 0) ? 1 : 0;
+
   const struct
   {
     const char* name;
-    const char* filter;
     GLenum glFilter;
-    id<MTLSamplerState> mtlSmp;
+    int mtlStrategy;
   } cfgs[] = {
-    { "nearest", "nearest", GL_NEAREST, mtl.smpNearest },
-    { "linear", "linear", GL_LINEAR, mtl.smpLinear },
+    { "nearest", GL_NEAREST, -1 },
+    { "linear", GL_LINEAR, linStrategy },
   };
 
   for (int round = 0; round < 2; ++round)
@@ -464,12 +547,14 @@ int main(int argc, char** argv)
       for (const auto& c : cfgs)
       {
         const double glMs = timeGL(gl, c.glFilter, axis);
-        const double mtMs = timeMetal(mtl, c.mtlSmp, axis);
+        const double mtMs = timeMetal(mtl, c.mtlStrategy, axis);
         const float glRb = readbackGL(gl);
         const float mtRb = readbackMetal(mtl);
+        const char* mtlName = c.mtlStrategy == -1 ? "nearest" : c.mtlStrategy == 0 ? "lin-nat" :
+                                                                                       "lin-man";
         std::printf("%-8s %-7s %-6s %10.2f %12.2f %12.0f\n", "gl", c.name, axisName, glMs,
           glMs * 1e6 / samplesPerFrame, glRb);
-        std::printf("%-8s %-7s %-6s %10.2f %12.2f %12.0f\n", "metal", c.name, axisName, mtMs,
+        std::printf("%-8s %-7s %-6s %10.2f %12.2f %12.0f\n", "metal", mtlName, axisName, mtMs,
           mtMs * 1e6 / samplesPerFrame, mtRb);
       }
     }

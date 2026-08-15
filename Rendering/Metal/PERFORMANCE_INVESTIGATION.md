@@ -24,6 +24,13 @@ back-end for the DICOM volume scene, and a proposed fix.
 > gap (~2-2.7x filter add-on) in a ~480-line standalone program with a trivial
 > raymarch shader and synthetic volume, proving it is a texture-unit property,
 > not a VTK-path artifact.
+>
+> **Update (scheduling discovery):** **section 9** shows the Z-march half of
+> that gap is a **Metal compiler scheduling artifact**, not a texture-unit
+> property: co-compiling >= 4 extra volume samples in the shader (or using
+> separate loops per filter path) drops Metal's 3-D linear Z-march from
+> ~19 ms to ~5.8 ms - **faster than GL's 10.3 ms**. The X-march gap (~1.9x)
+> is structural and not scheduling-fixable.
 
 ---
 
@@ -529,3 +536,78 @@ clang++ -std=c++17 -fobjc-arc -O2 -DGL_SILENCE_DEPRECATION \
 - Timing uses host-clock per-frame with a per-frame GPU sync on both back-ends
   (identical to the app's GL `glFinish` protocol; Metal sync cost is identical
   across filter configs since only the sampler state differs).
+
+---
+
+## 9. The 3-D linear Z-march gap was a Metal compiler scheduling artifact
+
+Follow-up on the minimal repro (section 8). The repro's Z-march (march along
+the volume's long axis) originally showed Metal 3-D linear ~2x slower than GL
+(Metal ~19 ms vs GL ~10 ms, i.e. a 0.42 ns/sample filter add-on). Sweeping the
+MSL shader structure shows this is **not** a hardware property: the same
+`vol.sample(smp, coord)` call runs 3.3x faster depending on how the loop is
+compiled.
+
+### 9.1 Results (all on the identical R8 512x512x1794 volume, 45.68 M
+samples/frame, Metal backend, Z-march linear, 120 frames)
+
+| Variant | Structure | Metal linear Z |
+|---|---|---|
+| S1/HEAD | single bare loop `acc += vol.sample(...)` | 19.3 ms (0.42 ns/sample) |
+| S6 | loop with in-loop `if strategy==-1/0` branch | 19.7 ms |
+| S9 | `#pragma unroll 4` | 19.9 ms |
+| S14 | two accumulators (even/odd) | 18.5 ms |
+| S17 | manual software-prefetch (vNext/v) | 20.6 ms |
+| S23 | `const bool linear` branch in loop | 18.8 ms |
+| S25 | + 1 extra manual tap in an else path | 20.2 ms |
+| S30_3 | + 3 extra taps in an else path | 11.2 ms (partial) |
+| S30_4 | + 4 extra taps in an else path | 5.86 ms |
+| S24 | + 8 extra taps (no lerps) in an else path | 5.8 ms |
+| S7 | full strategy chain incl. manual 8-tap path | 5.87 ms |
+| **S29** | **three separate loops, branch hoisted out** | **5.74-5.92 ms (0.06 ns/sample)** |
+
+GL linear Z in the same runs: **10.26 ms**. So with the S29 structure Metal's
+3-D linear Z-march is **~1.8x faster than GL** (gap closed and inverted).
+
+Readbacks are identical across every variant, so all 604 samples execute and
+the output is the same.
+
+### 9.2 Mechanism
+
+- The bare accumulation loop compiles to a schedule that **serializes** each
+  texture fetch (fetch latency exposed per iteration -> 0.42 ns/sample).
+- When the same function co-compiles >= 4 independent extra `vol.sample`
+  calls (another loop or a dead path), the compiler emits a schedule that
+  **overlaps** the fetches (0.06 ns/sample).
+- Not explainable by unrolling, prefetching, accumulator splitting, or
+  branch hoisting alone - it is the co-compilation of >= ~4 extra samples in
+  the same shader that flips the backend scheduling.
+- Data entropy is irrelevant: random/gradient/zero volumes measure the same
+  (section 8 follow-up), ruling out the lossless-compression hypothesis.
+- The X-march gap is **not** fixed by this: Metal linear X ~11.3 ms vs GL
+  ~6.0 ms (1.9x) in all scheduling variants. A dual-accumulator loop helps X
+  (11.7 -> 8.4 ms) but re-breaks Z (5.8 -> 22.2 ms). The X gap is structural
+  (3-D texture tiling across the XY plane), not scheduling.
+
+### 9.3 Implication for the app
+
+- The app's default camera marches roughly along the volume's long axis, the
+  analog of the repro's Z-march. If the app shader's volume-sampling loop can
+  be compiled in the fast regime, that filter component could drop from ~0.42
+  to ~0.06 ns/sample.
+- Caveat: the app's total per-sample cost is ~2.3 ns at the bench config,
+  dominated by TF lookups, compositing, divergence and min/max - not the
+  volume filter. Closing the filter component does not by itself close the
+  app gap; it must be combined with the section-4 divergence restructure.
+- The exact S29 trick (separate loop per filter path, or any co-compiled
+  multi-sample path) must be verified inside the real shader; the effect is
+  backend-scheduling-dependent and may not transfer verbatim.
+
+### 9.4 Driver bug found along the way
+
+`replaceRegion` on a `MTLStorageModePrivate` 3-D texture of this size faults
+inside Apple's lossless texture compressor
+(`AGXMetalG14G::AppleCompressionGen2::Compressor::compressMacroblock`).
+VTK never hits this because the volume is written through a compute shader
+(vtkMetalGPUVolumeRayCastMapper.mm `CreateGlobalVolumeTexture`). The repro
+uses `Shared` storage to stay on the simple path.
