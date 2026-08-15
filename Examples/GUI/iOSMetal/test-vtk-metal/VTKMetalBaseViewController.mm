@@ -143,6 +143,13 @@ VTK_MODULE_INIT(vtkRenderingMetal);
   // Initialize Metal render window
   _renWin->Initialize();
 
+  // Black background, fully opaque. SetBackground only sets the color; the
+  // default BackgroundAlpha is 0.0 and the Metal view's layer is non-opaque,
+  // so without SetBackgroundAlpha(1.0) the window's own background would show
+  // through where the clear color should be.
+  _renderer->SetBackground(0.0, 0.0, 0.0);
+  _renderer->SetBackgroundAlpha(1.0);
+
   // Let subclass set up the VTK pipeline
   [self setupVTKPipeline];
 
