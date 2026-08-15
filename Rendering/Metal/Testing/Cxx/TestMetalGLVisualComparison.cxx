@@ -88,6 +88,14 @@ extern "C" void objc_autoreleasePoolPop(void* pool);
 #include <string>
 #include <vector>
 
+// DICOM study directory for the DICOM CT scene (--dicom argument). Defined at
+// global scope so it matches the extern declaration in TestMetalScenes.h
+// (::vtkMetalScenes::gDicomDir), which BuildDICOMVolumeScene reads.
+namespace vtkMetalScenes
+{
+const char* gDicomDir = nullptr;
+}
+
 namespace
 {
 
@@ -159,6 +167,7 @@ const SceneSpec kScenes[] = {
   { "ImageSliceMapper", vtkMetalScenes::BuildImageSliceMapperScene, 300, 300 },
   { "Texture", vtkMetalScenes::BuildTextureScene, 600, 300 },
   { "VolumeRayCast", vtkMetalScenes::BuildVolumeScene, 400, 400 },
+  { "DICOMVolume", vtkMetalScenes::BuildDICOMVolumeScene, 400, 400 },
   { "CellColor", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
       vtkMetalScenes::BuildCellColorGridScene(r, b, 4, 30);
     }, 800, 800 },
@@ -528,6 +537,10 @@ int main(int argc, char* argv[])
       // Override the window size for the benchmark scenes (e.g. "400x400"),
       // used to decompose per-vertex vs per-fragment cost.
       std::sscanf(argv[++i], "%dx%d", &sizeW, &sizeH);
+    }
+    else if (arg == "--dicom" && i + 1 < argc)
+    {
+      vtkMetalScenes::gDicomDir = argv[++i];
     }
     else
     {

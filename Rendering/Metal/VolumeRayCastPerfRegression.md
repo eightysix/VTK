@@ -278,6 +278,59 @@ Fix: mirror the check in `DrawBlocksFullscreen` (mm:6299-6300). Default scenes
 unchanged and behavior/perf is identical. Build clean; all 288 Metal tests
 pass. Commit `ce8b652cb4`.
 
+## DICOM CT scene: the real-world use case
+
+The `VolumeRayCast` benchmark (dense 33³ analytic) isolates per-sample cost, but
+the user's actual workload is large DICOM CT studies rendered through the
+`test-vtk-metal` pipeline (DICOM → short-to-U8 shift/scale → GPU volume
+mapper). A new `DICOMVolume` scene replicates that pipeline exactly so the
+M/GL parity question is measured where it matters:
+
+- Reads a real CT study via `vtkDICOMDirectory`/`vtkDICOMReader`, casts to U8
+  with `vtkImageShiftScale` (shift 1024, scale 255/4095, clamp overflow), one
+  volume loaded per process and cached across both backends.
+- Applies the app's default VR preset ("Airways II" — the first preset after
+  the plists are sorted with `localizedStandardCompare`): opacity curve
+  HU (-742.1,0), (-683,0.0493), (-481,0.2497), (-333.5,0) rescaled to U8 by
+  `(HU+1024)*255/4095`, constant color (0, 0.605, 0.706), linear interpolation,
+  shading off (the app never applies the plist `useShading`).
+- Mapper: jitter on, `AutoAdjustSampleDistancesOff`, sample distance 0.5,
+  clip plane normal (0,0,1) at the near z bound (the app's initial
+  no-clip state), and — Metal only — IGN jitter + GPU min-max empty-space
+  skipping (`SetUseIGNJitter(true)`, `SetUseGPUMinMax(true)`; both have no GL
+  equivalent, so the GL side renders without them).
+- The study path comes from `--dicom <dir>`; without it the scene falls back to
+  the 128³ analytic volume with a warning, keeping the canonical bench table
+  reproducible.
+
+Measured on the user's abdomen study (512×512×1794 CT ≈ 470 MB U8, spacing
+0.834/0.4 mm; on-disk 989 MB):
+
+```
+./vtkMetalGLVisualComparison --bench --scene DICOMVolume --dicom <study> --frames 60 --reps 3 --gpu-mem --host-mem
+scene          error   thresholded error   Metal ms/f   M/GL   GPU mem
+DICOMVolume        741.133           0.000  43.05 ± 0.98  0.90   929 MB
+```
+
+- **M/GL 0.90** at 512³-class data: Metal is ~10% faster than GL on the user's
+  real workload. The small remaining gap is min-max empty-space skipping + the
+  parity march dominating the frame time, so the per-sample differences that
+  show up strongly on the 33³ benchmark (M/GL 0.47–0.50) dilute to near-parity
+  on a 470 MB CT.
+- **GPU memory 929 MB** for a 512×512×1794 U8 volume (1 B/voxel) — min-max
+  macrocells, jitter and render targets on top of the 470 MB data texture.
+- Host RSS peaks at ~1.4 GB during load (raw short data + U8 cast + render
+  buffers), then settles.
+- GL/Metal thresholded error stays 0.000: identical output within tolerance on
+  the real data.
+- The 470 MB upload happens once per process and is cached, so the timed frames
+  measure steady-state rendering, not I/O.
+
+The parity conclusion for the user's use case: **Metal already renders the CT
+at GL parity or better, with the same image.** The remaining optimization
+headroom (precomputed normals, min-max tuning) applies to both backends and
+scales with the larger CT volumes the user targets (~1–1.5 GB).
+
 ## Metal SDK and best-practices review: remaining levers and how they scale
 
 ### What the benchmark path actually executes
@@ -416,6 +469,7 @@ and many blocks add geometry/CPU-side costs. Re-evaluating each lever:
 ```
 ./macos_metal_build.sh --resume --tests          # builds the harness (tests must be ON)
 ./build_macos_metal/bin/vtkMetalGLVisualComparison --bench --scene VolumeRayCast --frames 60 --reps 5
+./build_macos_metal/bin/vtkMetalGLVisualComparison --bench --scene DICOMVolume --frames 60 --reps 3 --gpu-mem --host-mem --dicom /path/to/CT-study
 ```
 
 To re-measure an arbitrary commit: `git checkout <sha>`, rebuild
