@@ -30,11 +30,11 @@ struct SceneUniforms {
 // Scene flag bits (must match VTK_METAL_SCENE_FLAG_* in vtkMetalPolyDataMapper.mm).
 constant uint kSceneFlagParallelProjection  = 1u << 0;
 constant uint kSceneFlagVertexVisibility    = 1u << 3;
-constant uint kSceneFlagSpherePoints        = 1u << 5;
-constant uint kSceneFlagPointShape          = 1u << 7;
+[[maybe_unused]] constant uint kSceneFlagSpherePoints        = 1u << 5;
+[[maybe_unused]] constant uint kSceneFlagPointShape          = 1u << 7;
 constant uint kSceneFlagHasSurfaceColors    = 1u << 8;
 constant uint kSceneFlagHasActorTexture     = 1u << 9;
-constant uint kSceneFlagHasSurfaceAlpha     = 1u << 10;
+[[maybe_unused]] constant uint kSceneFlagHasSurfaceAlpha     = 1u << 10;
 constant uint kSceneFlagHasCellTexture      = 1u << 11;
 constant uint kSceneFlagUsePrimitiveCellIds = 1u << 12;
 constant uint kSceneFlagHasScalarLUT        = 1u << 13;
@@ -1893,7 +1893,6 @@ kernel void polygonEdgesToLines(
   // primitiveCounts holds cumulative VISIBLE edge counts; when a user
   // edge-flag attribute is present (writeEdgeFlags != 0) hidden edges are
   // skipped entirely, otherwise every polygon edge is emitted.
-  uint numEdges = primitiveCounts[gid + 1u] - primitiveCounts[gid];
   uint outputOffset = primitiveCounts[gid] * 2u;
   uint inputOffset = offsets[gid];
   uint npts = offsets[gid + 1u] - offsets[gid];
@@ -3978,7 +3977,6 @@ inline half4 marchVolumeUnified(
   // specular on surfaces where OpenGL's nDotL is <= 0.
   float3 entryVolPos = p.rayOrigin + p.rayDir * p.tStart;
   half3 viewDirHalf  = half3(normalize((entryVolPos - volumeUniforms.cameraVolumePos.xyz) * boundsSize));
-  half3 lightDirHalf = half3(normalize(volumeUniforms.lightDirection * boundsSize));
   half3 ambientMat   = half3(volumeUniforms.ambientColor.rgb);
   half3 diffuseMat   = half3(volumeUniforms.diffuseColor.rgb);
   half3 specularMat  = half3(volumeUniforms.specularColor.rgb);
