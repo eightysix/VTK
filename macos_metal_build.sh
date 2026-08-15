@@ -6,6 +6,7 @@
 #   ./macos_metal_build.sh              # macOS build (fresh)
 #   ./macos_metal_build.sh --resume     # macOS build (resume existing)
 #   ./macos_metal_build.sh --tests      # also enable the module test suites
+#   ./macos_metal_build.sh --no-tests   # disable test suites (overrides --tests)
 #
 
 set -e
@@ -19,6 +20,7 @@ for arg in "$@"; do
   case "$arg" in
     --resume) RESUME=1 ;;
     --tests) TESTS=1 ;;
+    --no-tests) TESTS=0 ;;
   esac
 done
 
