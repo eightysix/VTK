@@ -55,6 +55,7 @@
 
 #include "vtkGPUVolumeRayCastMapper.h"
 #include "vtkNew.h"                          // For vtkNew
+#include "vtkOverrideAttribute.h"
 #include "vtkRenderingVolumeOpenGL2Module.h" // For export macro
 #include "vtkShader.h"                       // For methods
 #include "vtkSmartPointer.h"                 // For smartptr
@@ -80,6 +81,7 @@ class VTKRENDERINGVOLUMEOPENGL2_EXPORT VTK_MARSHALAUTO vtkOpenGLGPUVolumeRayCast
 {
 public:
   static vtkOpenGLGPUVolumeRayCastMapper* New();
+  static vtkOverrideAttribute* CreateOverrideAttributes();
 
   enum Passes
   {
@@ -297,6 +299,9 @@ private:
   vtkOpenGLGPUVolumeRayCastMapper(const vtkOpenGLGPUVolumeRayCastMapper&) = delete;
   void operator=(const vtkOpenGLGPUVolumeRayCastMapper&) = delete;
 };
+
+#define vtkOpenGLGPUVolumeRayCastMapper_OVERRIDE_ATTRIBUTES \
+  vtkOpenGLGPUVolumeRayCastMapper::CreateOverrideAttributes()
 
 VTK_ABI_NAMESPACE_END
 #endif // vtkOpenGLGPUVolumeRayCastMapper_h
