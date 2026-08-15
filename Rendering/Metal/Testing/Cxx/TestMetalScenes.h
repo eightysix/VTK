@@ -21,6 +21,7 @@
 #ifndef TestMetalScenes_h
 #define TestMetalScenes_h
 
+#include <algorithm>
 #include <iostream>
 #include <cstdlib>
 
@@ -1050,6 +1051,12 @@ inline bool TempJitter()
     return std::atoi(v) != 0;
   return true;
 }
+inline int TempJitterBlock()
+{
+  if (const char* v = std::getenv("VTK_METAL_TEST_JITTER_BLOCK"))
+    return std::max(1, std::atoi(v));
+  return 2;
+}
 
 // Replicates the DICOMVolumeViewController pipeline
 // (Examples/GUI/iOSMetal/test-vtk-metal/DICOMVolumeViewController.mm): a
@@ -1146,6 +1153,7 @@ inline void BuildDICOMVolumeScene(vtkRenderer* renderer, BackendKind b)
     if (auto* metal = vtkMetalGPUVolumeRayCastMapper::SafeDownCast(mapper))
     {
       metal->SetUseIGNJitter(TempJitter());
+      metal->SetJitterBlockSize(TempJitterBlock());
       metal->SetUseGPUMinMax(TempMinMax());
     }
   }

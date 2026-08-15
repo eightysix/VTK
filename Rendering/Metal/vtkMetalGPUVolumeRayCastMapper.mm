@@ -228,7 +228,8 @@ struct VolumeMapperUniforms
   // vertex shader forwards in.position unchanged (modelPos = in.position).
   float UseDataSpaceBoxVertices;   // 1712
   float UseIGNJitter;              // 1716  (1.0 = Interleaved Gradient Noise jitter instead of the GL blue-noise tile)
-  float _padDSBV[2];               // 1720..1727 (total 1728, 16-byte aligned)
+  float JitterBlockSize;           // 1720  (pixels per IGN-jitter coherence block; 1 = legacy per-pixel)
+  float _padDSBV[1];               // 1724..1727 (total 1728, 16-byte aligned)
 };
 
 static_assert(sizeof(VolumeMapperUniforms) == 1728,
@@ -6872,6 +6873,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;
   uniforms.UseIGNJitter = this->GetUseIGNJitter() ? 1.0f : 0.0f;
+  uniforms.JitterBlockSize = static_cast<float>(this->GetJitterBlockSize());
 
   // Final color window/level (matches OpenGL's in_scale/in_bias, applied in the
   // shader after the ray cast as rgb * scale + bias * alpha).

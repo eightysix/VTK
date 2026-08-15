@@ -199,6 +199,15 @@ public:
   void SetUseIGNJitter(bool val) { this->UseIGNJitter = val; }
   bool GetUseIGNJitter() const { return this->UseIGNJitter; }
 
+  // Coherence block size for IGN jitter, in pixels. A per-pixel IGN offset
+  // makes adjacent fragments take divergent min-max skip paths (SIMD
+  // divergence + minmax-texture cache scatter); sampling the noise once per
+  // 2x2 block keeps the stochastic anti-aliasing while marching in lockstep
+  // (-20% at coarse sample distances, no change at the default 0.5 spacing).
+  // 1 restores the legacy per-pixel behavior.
+  void SetJitterBlockSize(int val) { this->JitterBlockSize = std::max(1, val); }
+  int GetJitterBlockSize() const { return this->JitterBlockSize; }
+
   // No-op stubs: the instanced path was removed.  Kept so that any
   // external caller (test / UI) that references the setter still compiles.
   void SetDisableInstanceRendering(bool) {}
@@ -311,6 +320,9 @@ private:
   // When true, the shader uses Interleaved Gradient Noise (Jimenez 2014) for
   // sample jittering instead of the GL-parity blue-noise tile. Default false.
   bool UseIGNJitter = false;
+
+  // IGN jitter coherence block size in pixels (see SetJitterBlockSize).
+  int JitterBlockSize = 2;
 
   // Phase 5: GPU-based min/max acceleration generation.
   // When true, UpdateMinMaxTexture uses GPU compute kernels instead of CPU
