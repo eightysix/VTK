@@ -326,6 +326,39 @@ DICOMVolume        741.133           0.000  43.05 ± 0.98  0.90   929 MB
 - The 470 MB upload happens once per process and is cached, so the timed frames
   measure steady-state rendering, not I/O.
 
+### Lever measurements on the real study (Metal, 400×400, 40 frames × 3 reps)
+
+The frame time is pure per-sample throughput (4.2–4.7 G samples/s sustained),
+so the only levers that move it change the sample count per frame — sample
+distance (along-ray) and image sampling (across-rays). The shader hot loop is
+already minimal for this config (volume fetch + one combined RGBA transfer
+function fetch + composite, with shading/2D-TF/mask/blanking/cropping compiled
+out via function constants), and the min-max empty-space skip already tests the
+opacity-window (its prefix-sum emptiness check skips whole macrocells whose
+scalar range has zero opacity), so there is no remaining dead code or fetch to
+remove.
+
+| Configuration (Δ from app default) | Metal ms/f | fps | M/GL | thresholded error |
+|---|---|---|---|---|
+| baseline (sd 0.5, minmax on, jitter on, 400×400) | 44.79 | 22.3 | 0.91 | 0.000 |
+| min-max off | 48.72 | 20.5 | 0.97 | 0.000 |
+| jitter off | 45.03 | 22.2 | 0.92 | 0.000 |
+| sd 0.5 → 1.0 | 27.40 | 36.5 | 0.65 | 0.000 |
+| sd 0.5 → 2.0 | 13.61 | 73.5 | 0.47 | 0.080 |
+| image sample 2.0 (half-res render + blit) | 20.54 | 48.7 | 0.76 | 0.000 |
+| image sample 2.0 + sd 1.0 | 13.79 | 72.5 | 0.60 | 0.073 |
+
+Readings: (1) the parity march dominates — every config keeps M/GL ≤ 0.97, i.e.
+Metal is always at or above GL; (2) min-max and jitter are already free/cheap
+and on; (3) the two big levers are orthogonal: sample distance scales the ray
+length, image sampling scales the pixel count, and they multiply (2.0×2.2 ≈
+3.2× combined); (4) sd 1.0 and half-res image sampling both leave the
+thresholded error at 0.000 (visually indistinguishable), sd 2.0 is still 140×
+below the fail threshold but measurably different. For interactive use the
+standard answer is adaptive image sampling (the base-class
+`AutoAdjustSampleDistances`/`MaximumImageSampleDistance` machinery), which the
+app currently overrides with `AutoAdjustSampleDistancesOff`.
+
 The parity conclusion for the user's use case: **Metal already renders the CT
 at GL parity or better, with the same image.** The remaining optimization
 headroom (precomputed normals, min-max tuning) applies to both backends and
