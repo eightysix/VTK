@@ -22,6 +22,7 @@
 #define TestMetalScenes_h
 
 #include <iostream>
+#include <cstdlib>
 
 #include "vtkActor.h"
 #include "vtkActor2D.h"
@@ -1025,6 +1026,31 @@ inline void BuildVolumeSceneSized(vtkRenderer* renderer, BackendKind b, int dim)
 }
 
 // ---- DICOM CT scene ---------------------------------------------------------
+inline double TempSampleDistance()
+{
+  if (const char* v = std::getenv("VTK_METAL_TEST_SAMPLE_DISTANCE"))
+    return std::atof(v);
+  return 0.5;
+}
+inline double TempImageSampleDistance()
+{
+  if (const char* v = std::getenv("VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE"))
+    return std::atof(v);
+  return 1.0;
+}
+inline bool TempMinMax()
+{
+  if (const char* v = std::getenv("VTK_METAL_TEST_MINMAX"))
+    return std::atoi(v) != 0;
+  return true;
+}
+inline bool TempJitter()
+{
+  if (const char* v = std::getenv("VTK_METAL_TEST_JITTER"))
+    return std::atoi(v) != 0;
+  return true;
+}
+
 // Replicates the DICOMVolumeViewController pipeline
 // (Examples/GUI/iOSMetal/test-vtk-metal/DICOMVolumeViewController.mm): a
 // vtkDICOMDirectory scan of the study -> series 0 -> vtkDICOMReader ->
@@ -1104,15 +1130,23 @@ inline void BuildDICOMVolumeScene(vtkRenderer* renderer, BackendKind b)
 
   vtkSmartPointer<vtkGPUVolumeRayCastMapper> mapper = NewVolumeMapper(b);
   mapper->SetInputData(cachedU8Volume);
-  mapper->UseJitteringOn();
+  if (TempJitter())
+  {
+    mapper->UseJitteringOn();
+  }
+  else
+  {
+    mapper->UseJitteringOff();
+  }
   mapper->AutoAdjustSampleDistancesOff();
-  mapper->SetSampleDistance(0.5);
+  mapper->SetSampleDistance(TempSampleDistance());
+  mapper->SetImageSampleDistance(TempImageSampleDistance());
   if (b == BackendKind::Metal)
   {
     if (auto* metal = vtkMetalGPUVolumeRayCastMapper::SafeDownCast(mapper))
     {
-      metal->SetUseIGNJitter(true);
-      metal->SetUseGPUMinMax(true);
+      metal->SetUseIGNJitter(TempJitter());
+      metal->SetUseGPUMinMax(TempMinMax());
     }
   }
 

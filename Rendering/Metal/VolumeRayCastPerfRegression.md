@@ -364,6 +364,73 @@ at GL parity or better, with the same image.** The remaining optimization
 headroom (precomputed normals, min-max tuning) applies to both backends and
 scales with the larger CT volumes the user targets (~1–1.5 GB).
 
+### Image sampling (IS < 1.0) is supersampling — the "Metal 2.8× slower" flip is a GL artifact
+
+`vtkGPUVolumeRayCastMapper::ImageSampleDistance` is inverted from intuition:
+< 1.0 emits *more* rays per pixel (0.5 → 4 rays/pixel → an 800×800 render from a
+400×400 window), while > 1.0 renders at reduced resolution (2.0 → 1 ray per 2×2
+pixels → a 200×200 render). So "IS 0.5" is a 4× **supersample**, not "half-res"
+as previously mislabeled in this doc.
+
+Both backends were verified to render a genuine 800×800 (FBO 800×800, viewport
+800×800, `in_sampleDistance` unchanged at 0.5, depth-buffer ray termination
+inactive, thresholded error 0.000 — the image is a correct 4× supersample). GL
+GPU wall time measured with `glFinish` around the volume pass:
+
+| render target | GL GPU ms/f | Metal ms/f | M/GL |
+|---|---|---|---|
+| 400×400 direct (baseline) | 52 | 44.3 | 0.88 |
+| 400×400 → IS 0.5 (800×800 FBO) | 25.5 | 61.6 | 2.7 |
+| 800×800 → IS 0.5 (1600×1600 FBO) | 39.4 | 117.5 | 3.0 |
+| 800×800 direct (no IS) | 54 | 60.5 | 1.12 |
+| 2000×2000 direct (no IS) | 156.7 | 148.3 | 0.95 |
+
+Two facts kill the "Metal regression" reading:
+
+- **GL's time is non-monotonic in resolution**: 400×400 direct 52 ms, 800×800
+  FBO **25.5 ms** (4× the pixels, half the wall time), 1600×1600 FBO 39.4 ms.
+  The GL ray-cast shader is memory-latency-bound at low occupancy, so four times
+  the concurrent fragments hide the volume-texture fetch latency and per-sample
+  throughput jumps ~8× (4.2 → 33 G samples/s). Metal shows the same effect but
+  weaker (4.7 → 13.3 G samples/s) because its 400×400 baseline is already better
+  utilized.
+- **Render-target effect on the legacy macOS GL stack**: 800×800 direct (54 ms)
+  vs 800×800 FBO (25.5 ms) isolates writing the volume pass into the image-sample
+  FBO texture as ~2× cheaper than into the Cocoa window back-buffer. At 400×400
+  the two are equal (FBO 51.7 vs direct 52 ms), so this is not a blanket FBO
+  advantage.
+
+So "M/GL 2.8" at IS 0.5 is dominated by GL's abnormally *low* 22.9 ms
+(whole-frame), not by Metal being slow: Metal's 44 → 62 → 118 ms tracks the
+sample count (209M → 836M → 3.3G) like a real sample-throughput-bound renderer.
+Direct high-resolution rendering without IS is at parity (2000×2000: M/GL 0.95).
+IS < 1.0 supersampling is the one configuration where GL appears faster, and it
+is also the one configuration never used for performance — adaptive sampling
+uses IS > 1.0 (true downsampling), where Metal is at or above parity.
+
+### Quality-neutral pipeline tuning: min-max macrocell size (DS)
+
+The only per-frame lever found that is strictly output-identical: the Metal
+min-max empty-space occupancy texture is rebuilt with a downsample factor
+`DS` (vtkMetalGPUVolumeRayCastMapper.mm, `const int DS`). The emptiness test is
+exact for U8 data (a 256-entry opacity-prefix table covers every U8 scalar;
+MetalShaders.metal:5588-5598), so any DS reproduces the GL reference bit-exactly
+(thresholded error 0.000 at 400 and 800).
+
+Sweep on the DICOM scene (Metal, 400×400, sd 0.5, IS 1.0):
+
+| DS | Metal ms/f | M/GL | occupancy tex | GPU total |
+|---|---|---|---|---|
+| 2 | **41.6** | 0.82 | 58.8 MB | 978 MB |
+| 3 | 43.3 | 0.89 | 17.5 MB | 939 MB |
+| 4 (old default) | 44.2 | 0.86 | 7.4 MB | 929 MB |
+| 8 | 60.9 | 1.28 | 1.8 MB | 924 MB |
+
+DS=2 is the sweet spot (−6% vs DS=4 for +49 MB GPU) and brings 800×800 to
+M/GL 1.00 parity. Larger cells lose more than they save: boundary cells spanning
+the body/air silhouette are treated as solid, so coarser macrocells re-march the
+mixed shell.
+
 ## Metal SDK and best-practices review: remaining levers and how they scale
 
 ### What the benchmark path actually executes
@@ -496,6 +563,29 @@ and many blocks add geometry/CPU-side costs. Re-evaluating each lever:
    grid-traversal path become the dominant wins (already implemented — tune the
    macrocell size), while ray tracing, mesh shaders, and argument buffers stay
    marginal. No additional Metal-API work is indicated.
+10. **For the DICOM use case, the remaining wins are config-level, not shader
+    level** — the frame is pure per-sample throughput (~4.2–4.7 G samples/s) and
+    the hot loop is already minimal. Ranked by ROI:
+    - **Adaptive image sampling (biggest lever).** The app pins
+      `AutoAdjustSampleDistancesOff` (DICOMVolumeViewController.mm:79). Enabling
+      the base-class `AutoAdjustSampleDistances` +
+      `MaximumImageSampleDistance` machinery yields the classic interactive
+      pattern: full quality at rest (sd 0.5, IS 1.0 → 22 fps) and IS 2.0 + sd 1.0
+      during interaction (measured 13.79 ms / 72 fps, thresholded error 0.073 —
+      140× below the fail level). Do not use IS < 1.0: it is 4× supersampling and
+      the one config where GL's latency-bound behavior makes it look faster.
+    - **Sample-distance budget.** sd 1.0 alone halves frame time with zero
+      measurable error (27.40 ms, err 0.000). Good as a fallback quality tier.
+    - **Tighter bounds / pre-crop.** The 512×1794 study is mostly air; min-max
+      empty-space skip already buys ~9%, and a tighter clip plane or a cropped
+      input shortens every ray. Scales with the ~1–1.5 GB studies the user
+      targets.
+    - **Min-max macrocell tuning.** Already active (Metal-only; GL renders
+      without it). Swept on the DICOM study: DS=2 wins ~6% over the old DS=4
+      default with bit-exact output (+49 MB GPU; see the DS table above).
+      Re-sweep on the user's larger studies before shipping.
+    - **Precomputed normals: not useful here** — the app's presets render with
+      shading off, so no gradient is computed in the hot loop anyway.
 
 ## Reproduction
 

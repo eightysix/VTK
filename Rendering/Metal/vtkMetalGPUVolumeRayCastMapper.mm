@@ -2075,7 +2075,7 @@ void vtkMetalGPUVolumeRayCastMapper::EnsureGridTraversalResources(
     const int mcDims1 = this->MinMaxDims[1];
     const int mcDims2 = this->MinMaxDims[2];
 
-    const int DS = 4;
+    const int DS = 2;
 
     const int fullX = fullExt[1] - fullExt[0] + 1;
     const int fullY = fullExt[3] - fullExt[2] + 1;
@@ -4590,7 +4590,7 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
                   static_cast<int>(volTex.height),
                   static_cast<int>(volTex.depth) };
 
-  const int DS = 4;
+  const int DS = 2;
   int mmDims[3] = {
     std::max(1, (dims[0] + DS - 1) / DS),
     std::max(1, (dims[1] + DS - 1) / DS),
@@ -4755,8 +4755,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateMinMaxTexture(
     int dims[3];
     input->GetDimensions(dims);
 
-    // Downsample factor: 4x in each dimension
-    const int DS = 4;
+    // Downsample factor for the min-max occupancy grid (DS voxels per cell)
+    const int DS = 2;
     int mmDims[3] = {
       std::max(1, (dims[0] + DS - 1) / DS),
       std::max(1, (dims[1] + DS - 1) / DS),
