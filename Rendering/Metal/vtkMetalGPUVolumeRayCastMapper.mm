@@ -342,7 +342,7 @@ static int VolumeMarchVariant()
   static const int variant = [] {
     if (const char* v = getenv("VTK_METAL_TEST_MARCH_VARIANT"))
       return std::atoi(v);
-    return 9;
+    return 0; // TEMP-REPRO: 0 = baseline march, no experiment (revert to 9)
   }();
   return variant;
 }
@@ -365,7 +365,7 @@ static int VolumeSlabCount()
   static const int count = [] {
     if (const char* v = getenv("VTK_METAL_TEST_NUM_SLABS"))
       return std::max(1, std::min(std::atoi(v), 32));
-    return 8;
+    return 1; // TEMP-REPRO: 1 = no slab tiling (revert to 8)
   }();
   return count;
 }
@@ -8000,10 +8000,23 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         static_cast<uint32_t>(sampleCount), directMask);
       this->BindEncoderResources(encoder, uniformBuf, directPso, true);
 
-      // Draw volume — handle partitioned (multi-block) and single-block cases
-      for (int s = 0; s < numSlabs; ++s)
+      // Draw volume — handle partitioned (multi-block) and single-block cases.
+      // Slabs are composited back-to-front so the (ONE, ONE_MINUS_SRC_ALPHA)
+      // blend over-composites each pass over the passes behind it (premultiplied
+      // `over` is associative only in that direction). Drawing front-to-back
+      // would multiply each pass by the transparencies of the passes behind it,
+      // which cancels only for constant-color rays (it still corrupts the color
+      // once shading varies per-sample color).
+      const int slabOnly = []() -> int {
+        if (const char* v = std::getenv("VTK_METAL_TEST_SLAB_ONLY"))
+          return std::atoi(v);
+        return -1;
+      }();
+      for (int s = numSlabs - 1; s >= 0; --s)
       {
+        if (slabOnly >= 0 && s != slabOnly) { continue; }
         this->DrawBlocks(encoder, uniformBuf, ren, vol, &uniforms, invModelMatrix, s, numSlabs);
+        if (slabOnly >= 0) { break; }
       }
     }
   }

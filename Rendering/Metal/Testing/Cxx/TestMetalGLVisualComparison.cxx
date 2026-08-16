@@ -309,6 +309,16 @@ vtkSmartPointer<vtkImageData> RenderAndCapture(
   writer->SetInputConnection(extract->GetOutputPort());
   writer->Write();
 
+  if (std::getenv("VTK_METAL_TEST_RGBA_PNG"))
+  {
+    std::string rgbaPath = path;
+    rgbaPath.replace(rgbaPath.size() - 4, 4, ".rgba.png");
+    vtkNew<vtkPNGWriter> rgbaWriter;
+    rgbaWriter->SetFileName(rgbaPath.c_str());
+    rgbaWriter->SetInputConnection(w2i->GetOutputPort());
+    rgbaWriter->Write();
+  }
+
   return extract->GetOutput();
 }
 

@@ -940,6 +940,44 @@ inline void BuildTextureScene(vtkRenderer* renderer, BackendKind b)
   renderer->GetActiveCamera()->Elevation(20);
 }
 
+// ---- scene-configuration env helpers ---------------------------------------
+inline double TempSampleDistance()
+{
+  if (const char* v = std::getenv("VTK_METAL_TEST_SAMPLE_DISTANCE"))
+    return std::atof(v);
+  return 0.5;
+}
+inline double TempImageSampleDistance()
+{
+  if (const char* v = std::getenv("VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE"))
+    return std::atof(v);
+  return 1.0;
+}
+inline bool TempMinMax()
+{
+  if (const char* v = std::getenv("VTK_METAL_TEST_MINMAX"))
+    return std::atoi(v) != 0;
+  return true;
+}
+inline bool TempMinMaxAccel()
+{
+  if (const char* v = std::getenv("VTK_METAL_TEST_ACCEL"))
+    return std::atoi(v) != 0;
+  return true;
+}
+inline bool TempJitter()
+{
+  if (const char* v = std::getenv("VTK_METAL_TEST_JITTER"))
+    return std::atoi(v) != 0;
+  return true;
+}
+inline int TempJitterBlock()
+{
+  if (const char* v = std::getenv("VTK_METAL_TEST_JITTER_BLOCK"))
+    return std::max(1, std::atoi(v));
+  return 1;
+}
+
 // TestMetalVolumeRayCast: an analytic volume rendered with the GPU volume
 // ray-cast mapper and a shaded transfer function.
 inline void BuildVolumeScene(vtkRenderer* renderer, BackendKind b)
@@ -962,13 +1000,23 @@ inline void BuildVolumeScene(vtkRenderer* renderer, BackendKind b)
   vtkNew<vtkVolumeProperty> property;
   property->SetColor(color);
   property->SetScalarOpacity(opacity);
-  property->ShadeOn();
+  if (!std::getenv("VTK_METAL_TEST_NO_SHADE"))
+  {
+    property->ShadeOn();
+  }
   property->SetAmbient(0.2);
   property->SetDiffuse(0.8);
   property->SetSpecular(0.3);
 
   vtkSmartPointer<vtkGPUVolumeRayCastMapper> mapper = NewVolumeMapper(b);
   mapper->SetInputConnection(source->GetOutputPort());
+  if (b == BackendKind::Metal)
+  {
+    if (auto* metal = vtkMetalGPUVolumeRayCastMapper::SafeDownCast(mapper))
+    {
+      metal->SetUseGPUMinMax(TempMinMax());
+    }
+  }
 
   vtkNew<vtkVolume> volume;
   volume->SetMapper(mapper);
@@ -1028,42 +1076,6 @@ inline void BuildVolumeSceneSized(vtkRenderer* renderer, BackendKind b, int dim)
 }
 
 // ---- DICOM CT scene ---------------------------------------------------------
-inline double TempSampleDistance()
-{
-  if (const char* v = std::getenv("VTK_METAL_TEST_SAMPLE_DISTANCE"))
-    return std::atof(v);
-  return 0.5;
-}
-inline double TempImageSampleDistance()
-{
-  if (const char* v = std::getenv("VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE"))
-    return std::atof(v);
-  return 1.0;
-}
-inline bool TempMinMax()
-{
-  if (const char* v = std::getenv("VTK_METAL_TEST_MINMAX"))
-    return std::atoi(v) != 0;
-  return true;
-}
-inline bool TempMinMaxAccel()
-{
-  if (const char* v = std::getenv("VTK_METAL_TEST_ACCEL"))
-    return std::atoi(v) != 0;
-  return true;
-}
-inline bool TempJitter()
-{
-  if (const char* v = std::getenv("VTK_METAL_TEST_JITTER"))
-    return std::atoi(v) != 0;
-  return true;
-}
-inline int TempJitterBlock()
-{
-  if (const char* v = std::getenv("VTK_METAL_TEST_JITTER_BLOCK"))
-    return std::max(1, std::atoi(v));
-  return 1;
-}
 
 // Replicates the DICOMVolumeViewController pipeline
 // (Examples/GUI/iOSMetal/test-vtk-metal/DICOMVolumeViewController.mm): a
@@ -1151,13 +1163,40 @@ inline void BuildDICOMVolumeScene(vtkRenderer* renderer, BackendKind b)
   // (0,0.605,0.706).
   vtkNew<vtkColorTransferFunction> color;
   vtkNew<vtkPiecewiseFunction> opacity;
-  const double xs[4] = { -742.1, -683.0, -481.0, -333.5 };
-  const double ys[4] = { 0.0, 0.0493, 0.2497, 0.0 };
-  for (int i = 0; i < 4; ++i)
+  if (const char* pr = std::getenv("VTK_METAL_TEST_PRESET"); pr &&
+      std::string(pr) == "BoneSkinII")
   {
-    const double x = (xs[i] + 1024.0) * (255.0 / 4095.0);
-    opacity->AddPoint(x, ys[i]);
-    color->AddRGBPoint(x, 0.0, 0.605, 0.706);
+    // "Bone + Skin II" preset (VRPresets/Bone + Skin II.plist): two
+    // opacity/color pairs, the first a constant pale-blue ramp over the soft
+    // tissue range, the second a dark->red->yellow->white ramp over the
+    // high-density range. Multi-color TF (and the app runs this preset with
+    // useShading == false) — a good regression case for the slab draw order.
+    const double ox0[5] = { -713.844, -653.981, -640.249, -590.335, -544.648 };
+    const double oy0[5] = { 0.0, 0.209, 0.290, 0.209, 0.209 };
+    for (int i = 0; i < 5; ++i)
+    {
+      opacity->AddPoint((ox0[i] + 1024.0) * (255.0 / 4095.0), oy0[i]);
+      color->AddRGBPoint((ox0[i] + 1024.0) * (255.0 / 4095.0), 0.0720, 0.9942, 1.0);
+    }
+    const double ox1[4] = { 66.726, 84.343, 366.834, 1585.434 };
+    const double oy1[4] = { 0.0, 0.189, 0.645, 0.789 };
+    const double cr[4][3] = { { 0, 0, 0 }, { 1, 0, 0 }, { 1, 0.9992, 0 }, { 1, 1, 1 } };
+    for (int i = 0; i < 4; ++i)
+    {
+      opacity->AddPoint((ox1[i] + 1024.0) * (255.0 / 4095.0), oy1[i]);
+      color->AddRGBPoint((ox1[i] + 1024.0) * (255.0 / 4095.0), cr[i][0], cr[i][1], cr[i][2]);
+    }
+  }
+  else
+  {
+    const double xs[4] = { -742.1, -683.0, -481.0, -333.5 };
+    const double ys[4] = { 0.0, 0.0493, 0.2497, 0.0 };
+    for (int i = 0; i < 4; ++i)
+    {
+      const double x = (xs[i] + 1024.0) * (255.0 / 4095.0);
+      opacity->AddPoint(x, ys[i]);
+      color->AddRGBPoint(x, 0.0, 0.605, 0.706);
+    }
   }
 
   vtkNew<vtkVolumeProperty> property;
@@ -1251,6 +1290,11 @@ inline void BuildDICOMVolumeScene(vtkRenderer* renderer, BackendKind b)
     {
       renderer->GetActiveCamera()->Azimuth(-60);
     }
+  }
+  if (const char* dollyEnv = std::getenv("VTK_METAL_TEST_CAM_DOLLY"))
+  {
+    renderer->GetActiveCamera()->Dolly(std::atof(dollyEnv));
+    renderer->ResetCameraClippingRange();
   }
 }
 
