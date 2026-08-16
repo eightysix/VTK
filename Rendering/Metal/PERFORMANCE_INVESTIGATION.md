@@ -1079,13 +1079,14 @@ Notes:
 ### 18.3 The port: fc_marchVariant 9 (48-wide inline batch)
 
 `MetalShaders.metal` now has, in the `fc_marchVariant >= 6` guard, an
-`if (fc_marchVariant == 9 && !fc_minmax && !fc_shading && !fc_gradientOpacity &&
+`if (fc_marchVariant == 9 && !fc_shading && !fc_gradientOpacity &&
 !fc_renderToTexture)` branch exactly like variant 8 but with `unrollN = 48` and
 inline sample addresses (`sampleVolumeScalar(volumeTexture, evalPoint + evalStep
-* k)`). Non-lean variant-9 feature combinations fall through to the
-feature-complete batch-8 consume, so correctness is preserved for all flags.
-Variant 9 was added as an A/B experiment; the default remains 8 until parity and
-reproducibility are confirmed.
+* k)`), plus a minmax lattice skip (section 19). Shading / gradient-opacity /
+render-to-texture combinations fall through to the feature-complete batch-8
+consume, so correctness is preserved for all flags. Variant 9 is the default
+(`VolumeMarchVariant()` returns 9) and now carries the minmax acceleration that
+the production app enables by default.
 
 ### 18.4 In-app measurement (DICOM app benchmark, M2 MBA, interleaved A/B)
 
@@ -1103,12 +1104,74 @@ batch composites exactly the same samples as variant 8, so parity is preserved.
 
 ### 18.5 Status and residual gap
 
-Variant 9 closes the app gap from 1.25x to **1.02-1.05x** (Metal ~50-52 ms vs GL
-~48-51 ms), i.e. parity - and occasionally Metal edges ahead. The app still
-trails the w48 probe (~37.5 ms) by ~13 ms; the gap is the production
-`fragment_volume_main` context (all feature variants compiled into one library,
-the app's smaller ~70k-ray workload offering less cross-warp latency hiding than
-the probe's 160k-ray 400x400 target, plus per-fragment plumbing). Closing the
-last ~2 ms so Metal clearly beats GL is the next target.
+Variant 9 (lean, minmax off) closed the app gap from 1.25x to ~1.0x vs GL at
+fine sample distance - see section 19 for the full 3x3 grid and the minmax +
+adaptive-cap combination that makes Metal clearly beat GL everywhere.
+
+## 19. Variant 9 + minmax acceleration: Metal clearly beats GL at every SD
+
+### 19.1 Minmax lattice skip inside the 48-wide batch
+
+The production app runs `UseMinMaxAcceleration` (occupancy lattice). Variant 9
+now handles the minmax path itself instead of falling back to the broken
+batch-8 consume (which took 150-580 ms). A fragment pre-pass walks the lattice
+cells the ray will cover in its next batch: if every cell in the walk's extent
+is empty (occupancy R8 `> 0.5`), the whole extent is skipped bit-neutrally;
+otherwise the walk stops at the first solid cell and the batch dispatches after
+it, so the first sampled voxel is always inside a solid cell. The walk extent
+is `min(48, steps - i)` and runs *before* the width dispatch - an earlier
+per-width walk over-marched past `tTerminateMax` into boundary voxels (error
+up to 2.485 @SD4); the preamble walk keeps error exactly at the shared GL/Metal
+baseline floor.
+
+Lattice geometry: `ComputeMacrocellDownsample(sd, gpuMinmax)` = 2 for `sd<1.5`
+else 4, so a cell is 2 voxels at SD 0.5 and 4 voxels at SD >= 1.5.
+
+### 19.2 Adaptive batch-width cap (new uniform `MaxBatchWidth`)
+
+A fixed 48-wide batch regressed at coarse SD: with the lattice skipping empty
+cells, the remaining solid runs are short, so 48-wide batches waste up to 47
+slots each. The CPU now sets a per-frame `MaxBatchWidth` uniform from the
+sample distance (env override `VTK_METAL_TEST_MARCH_CAP`); the shader dispatch
+chain {48, 32, 16, 8, 4, 2, 1} only allows widths at or below the cap:
+
+| sample distance | cap |
+|---|---|
+| `< 2.0` (fine, SD 0.5) | 48 |
+| `2.0 .. 3.0` | 16 |
+| `>= 3.0` (coarse, SD 4) | 8 |
+
+Sweeps (400x400, DICOM): SD 2.0 best cap 12-24 (~0.49-0.50 M/GL), SD 4.0 best
+cap 4-12 (~0.53); the mapping above picks the middle of each band. The cap is
+uniform across the warp (no lane divergence) and leaves the bit-exact output
+untouched.
+
+### 19.3 Full grid (M2 MBA, minmax ON, reps 3, ms/f and M/GL)
+
+| size | SD | GL | Metal | M/GL | prev (cap-48) |
+|---|---|---|---|---|---|
+| 400 | 0.5 | 49.7 | 24.7 | **0.50** | 0.48 |
+| 400 | 2.0 | 29.6 | 14.3 | **0.48** | 0.55 |
+| 400 | 4.0 | 19.3 | 10.2 | **0.53** | 0.77 |
+| 1024 | 0.5 | 62.9 | 51.2 | **0.81** | 0.85 |
+| 1024 | 2.0 | 44.2 | 27.9 | **0.63** | 0.75 |
+| 1024 | 4.0 | 37.7 | 21.4 | **0.57** | 0.83 |
+| 2048 | 0.5 | 161.6 | 128.7 | **0.80** | 0.77 |
+| 2048 | 2.0 | 65.8 | 54.9 | **0.83** | 0.86 |
+| 2048 | 4.0 | 53.1 | 41.1 | **0.77** | 1.02 |
+
+Metal wins GL at all nine cells (0.48-0.83); the coarse-SD regression from the
+fixed 48-wide batch (up to 1.02x at 2048/SD4) is gone. The default production
+path (no env vars) measures 0.52x @400/SD4 and 0.78x @2048/SD4.
+
+Thresholded error stays at the shared GL/Metal baseline floor: **0.000 @ SD0.5,
+0.080 @ SD2, 0.814 @ SD4** (identical for mv0 lean, mv0+minmax, and mv9+minmax;
+the coarse-SD floor is a pre-existing GL-vs-Metal divergence, not caused by the
+minmax work).
+
+Residual: at coarse SD the mv0 baseline loop (per-cell granular skip) is still
+~0.1 better than mv9 at 1024/2048 (mv0 0.45-0.68 vs mv9 0.57-0.77). The lean
+raw march (minmax off) still loses to GL at coarse SD (1.12-1.74x) - the raw
+path, unchanged; production uses minmax on.
 
 

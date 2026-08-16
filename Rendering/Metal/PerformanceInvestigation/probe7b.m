@@ -471,12 +471,19 @@ int main(int argc, const char** argv) {
     tfD.usage = MTLTextureUsageShaderRead; tfD.storageMode = MTLStorageModeShared;
     id<MTLTexture> tfTex = [device newTextureWithDescriptor:tfD];
     uint8_t tfBuf[256*2*4];
+    const bool tfOpaque = getenv("PROBE_TF_OPAQUE") != NULL;
     for (int x = 0; x < 256; ++x) {
       float v = (float)x / 255.0f;
       for (int y = 0; y < 2; ++y) {
         int i = (y*256 + x) * 4;
         tfBuf[i+0] = (uint8_t)(v*255); tfBuf[i+1] = (uint8_t)((1-v)*255);
-        tfBuf[i+2] = (uint8_t)128;     tfBuf[i+3] = 0;
+        tfBuf[i+2] = (uint8_t)128;
+        // Default TF has alpha 0 (fully transparent: rays never saturate, so
+        // every ray marches the full length - the w8/w48 probe baseline).
+        // PROBE_TF_OPAQUE makes high scalars fully opaque so rays terminate
+        // after a few samples: the worst case for wide batches, which over-march
+        // up to unrollN-1 wasted samples per terminating batch.
+        tfBuf[i+3] = tfOpaque ? (uint8_t)(v > 0.5f ? 255 : 0) : 0;
       }
     }
     [tfTex replaceRegion:MTLRegionMake2D(0,0,256,2) mipmapLevel:0 withBytes:tfBuf bytesPerRow:256*4];

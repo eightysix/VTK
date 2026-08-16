@@ -236,11 +236,14 @@ struct VolumeMapperUniforms
   // sample distance, computed per frame on the CPU) with all data-dependent
   // exits predicated instead of breaking, so SIMT lanes stay locked. 0 keeps
   // the legacy per-fragment loop bound. Occupies the former _padDSBV slot.
-  float MaxStepsFrame;             // 1724..1727 (total 1728, 16-byte aligned)
+  float MaxStepsFrame;             // 1724..1727
+  float MaxBatchWidth;             // 1728..1731 (adaptive-width march cap for
+                                   // fc_marchVariant 9, set from sample distance;
+                                   // total 1744, 16-byte aligned)
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1728,
-  "VolumeMapperUniforms must be 1728 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1732,
+  "VolumeMapperUniforms must be 1732 bytes to match Metal shader struct");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -318,24 +321,28 @@ static uint32_t BlendModeToFeatureFlag(int blendMode)
 // March-experiment selector from VTK_METAL_TEST_MARCH_VARIANT (0=none,
 // 1=manual 8-tap trilinear, 2=clamp_to_zero sampler, 3=predicated opacity exit,
 // 4=uniform frame-max loop with all exits predicated, 6=8x unrolled march,
-// 7=4x unrolled march, 8=harness-style scheduled march). Encoded into the
-// feature mask so each experiment gets its own specialized pipeline. Reads the
-// env var once per process. Only the low 4 bits are used
-// (VolumeFeature_MarchVariantMask).
+// 7=4x unrolled march, 8=harness-style scheduled march, 9=48-wide inline
+// scheduled march with minmax). Encoded into the feature mask so each
+// experiment gets its own specialized pipeline. Reads the env var once per
+// process. Only the low 4 bits are used (VolumeFeature_MarchVariantMask).
 //
-// Default is 8: the harness-style scheduled march, which ports the
-// minimal_gap/metal_gap.m 8x BuildUnrollBody scheduling into the real shader
-// (positions computed first, all volume and TF fetches issued back-to-back,
-// ONE advance per batch, ONE break check per batch, scalar tail). Measured on
-// the DICOM app benchmark: mv=6 75.9/77.2 ms vs mv=8 62.6/59.5 ms (GL 47-49
-// ms), byte-identical output (see PERFORMANCE_INVESTIGATION.md section 17).
-// Setting the env var overrides it for A/B testing.
+// Default is 9: the 48-wide inline-address scheduled march (probe w48), which
+// beats the 8-wide harness-style scheduled march (variant 8) on the DICOM app
+// benchmark: mv=9 50-53 ms vs mv=8 60-66 ms (GL 48-51 ms) with byte-identical
+// output (see PERFORMANCE_INVESTIGATION.md sections 17-18). Variant 9 also
+// carries the minmax lattice walk (fc_minmax), replacing the batch-8 consume
+// minmax path that was unstable and up to 12x slower than GL (150-580ms vs
+// 47ms on the DICOM study). With minmax enabled the same 48-wide batches are
+// issued only over non-empty macrocells: mv=9 + minmax measures ~25ms vs GL
+// 47-49ms (0.51x), thresholded error 0.000. Variants 6/7/8 fall back to the
+// batch-8 consume when a non-lean feature is active. Setting the env var
+// overrides the default for A/B testing.
 static int VolumeMarchVariant()
 {
   static const int variant = [] {
     if (const char* v = getenv("VTK_METAL_TEST_MARCH_VARIANT"))
       return std::atoi(v);
-    return 8;
+    return 9;
   }();
   return variant;
 }
@@ -7125,6 +7132,32 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         fprintf(stderr, "[march] variant=%d maxStepsFrame=%.1f maxChordMM=%.2f meanChordMM=%.2f sampleDist=%.3f\n",
           VolumeMarchVariant(), uniforms.MaxStepsFrame, maxChordMM, meanChordMM,
           actualSampleDistance);
+    }
+  }
+
+  // Adaptive-width march cap for fc_marchVariant 9. Fine sample distances keep
+  // the 48-wide batches (probe w48 beats w8 at fine SD); coarse distances cap
+  // at 8 because a 48-wide batch wastes up to 47 slots on the short solid runs
+  // that remain visible after the lattice skips (mv9+minmax 0.77x -> 0.58x GL
+  // @SD4 on the DICOM study). VTK_METAL_TEST_MARCH_CAP overrides the mapping.
+  uniforms.MaxBatchWidth = 48.0f;
+  if (VolumeMarchVariant() == 9)
+  {
+    if (const char* cap = getenv("VTK_METAL_TEST_MARCH_CAP"))
+    {
+      uniforms.MaxBatchWidth = static_cast<float>(std::max(1, std::atoi(cap)));
+    }
+    else if (actualSampleDistance < 2.0)
+    {
+      uniforms.MaxBatchWidth = 48.0f;
+    }
+    else if (actualSampleDistance < 3.0)
+    {
+      uniforms.MaxBatchWidth = 16.0f;
+    }
+    else
+    {
+      uniforms.MaxBatchWidth = 8.0f;
     }
   }
 
