@@ -39,6 +39,8 @@ struct Uniforms {
   float _pad0;
   float _pad1;
   int   maxIter;           // safety loop bound
+  float slabStart;         // slab z-bounds in normalized volume units
+  float slabEnd;
 };
 
 static int kW = 512;  // volume dims (slice-stacked, Z is the long axis)
@@ -248,6 +250,8 @@ struct Uniforms {
   float  pad1;
   float  pad2;
   int    maxIter;     // safety loop bound
+  float  slabStart;   // slab z-bounds (normalized volume units)
+  float  slabEnd;
 };
 
 fragment float4 fragment_main(VOut in [[stage_in]],
@@ -408,6 +412,8 @@ struct Uniforms {
   float  pad1;
   float  pad2;
   int    maxIter;     // safety loop bound
+  float  slabStart;   // slab z-bounds (normalized volume units)
+  float  slabEnd;
 };
 
 fragment float4 fragment_main(VOut in [[stage_in]],
@@ -482,7 +488,7 @@ static void ApplyMulAddDecls(char* buf)
   }
 }
 
-static void ApplySlabT(char* buf, int slabStart, int slabEnd, int numSlabs, bool mulAdd, bool kEndT)
+static void ApplySlabT(char* buf, int slabStart, int slabEnd, int numSlabs, bool mulAdd, bool kEndT, bool uniformSlab)
 {
   char clamp[1024];
   const bool muladdPath = mulAdd;
@@ -512,18 +518,30 @@ static void ApplySlabT(char* buf, int slabStart, int slabEnd, int numSlabs, bool
     snprintf(align, sizeof(align),
       "    float kEnd = ceil(max((thi - tStart) / stepSize, 0.0f));\n"
       "    tExit = tStart + kEnd * stepSize;\n");
-  snprintf(clamp, sizeof(clamp),
-    "float stepSize = u.sampleDistMM / max(physPerNorm, 1e-6f);\n"
-    "    float t_s = (%d.0f/%d.0f - u.eye.z) * inv.z;\n"
-    "    float t_e = (%d.0f/%d.0f - u.eye.z) * inv.z;\n"
-    "    float tlo = max(tStart, min(t_s, t_e));\n"
-    "    float thi = min(tExit, max(t_s, t_e));\n"
-    "    float kStartF = ceil(max((tlo - tStart) / stepSize, 0.0f));\n"
-    "%s"
-    "    tStart = tStart + kStartF * stepSize;\n"
-    "%s"
-    ,
-    slabStart, numSlabs, slabEnd, numSlabs, kpass, align);
+  if (uniformSlab)
+    snprintf(clamp, sizeof(clamp),
+      "float stepSize = u.sampleDistMM / max(physPerNorm, 1e-6f);\n"
+      "    float t_s = (u.slabStart - u.eye.z) * inv.z;\n"
+      "    float t_e = (u.slabEnd - u.eye.z) * inv.z;\n"
+      "    float tlo = max(tStart, min(t_s, t_e));\n"
+      "    float thi = min(tExit, max(t_s, t_e));\n"
+      "    float kStartF = ceil(max((tlo - tStart) / stepSize, 0.0f));\n"
+      "%s"
+      "    tStart = tStart + kStartF * stepSize;\n"
+      "%s",
+      kpass, align);
+  else
+    snprintf(clamp, sizeof(clamp),
+      "float stepSize = u.sampleDistMM / max(physPerNorm, 1e-6f);\n"
+      "    float t_s = (%d.0f/%d.0f - u.eye.z) * inv.z;\n"
+      "    float t_e = (%d.0f/%d.0f - u.eye.z) * inv.z;\n"
+      "    float tlo = max(tStart, min(t_s, t_e));\n"
+      "    float thi = min(tExit, max(t_s, t_e));\n"
+      "    float kStartF = ceil(max((tlo - tStart) / stepSize, 0.0f));\n"
+      "%s"
+      "    tStart = tStart + kStartF * stepSize;\n"
+      "%s",
+      slabStart, numSlabs, slabEnd, numSlabs, kpass, align);
   const char needle[] = "float stepSize = u.sampleDistMM / max(physPerNorm, 1e-6f);\n";
   char* p = buf;
   size_t clen = strlen(clamp), nlen = strlen(needle);
@@ -613,6 +631,8 @@ struct Uniforms {
   float  pad1;
   float  pad2;
   int    maxIter;     // safety loop bound
+  float  slabStart;   // slab z-bounds (normalized volume units)
+  float  slabEnd;
 };
 
 fragment float4 fragment_main(VOut in [[stage_in]],
@@ -670,6 +690,8 @@ struct Uniforms {
   float  pad1;
   float  pad2;
   int    maxIter;     // safety loop bound
+  float  slabStart;   // slab z-bounds (normalized volume units)
+  float  slabEnd;
 };
 
 kernel void compute_main(uint2 gid [[thread_position_in_grid]],
@@ -759,6 +781,7 @@ int main(int argc, const char** argv)
     int maccum = 0;
     int mulAdd = 0;
     int kEndT = 0;
+    int uniformSlab = 0;
     if (argc > 1) frames = atoi(argv[1]);
     if (argc > 2) maxIter = atoi(argv[2]);
     if (argc > 3) halfSampler = atoi(argv[3]);
@@ -780,11 +803,12 @@ int main(int argc, const char** argv)
     if (argc > 19) maccum = atoi(argv[19]);
     if (argc > 20) mulAdd = atoi(argv[20]);
     if (argc > 21) kEndT = atoi(argv[21]);
+    if (argc > 22) uniformSlab = atoi(argv[22]);
 
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     fprintf(stderr, "Metal device: %s\n", device.name.UTF8String);
-    fprintf(stderr, "volume %dx%dx%d R8, rt %dx%d, frames %d, maxIter %d, halfSampler=%d, depthMode=%d, compute=%d, lod0=%d, fastMath=%d, diag=%d, pipeline=%d, sampleDistMM=%.1f, dataMode=%d, layoutMode=%d, filterMode=%d, volDiv=%d, slab=%d/%d, slabT=%d, maccum=%d, mulAdd=%d, kEndT=%d\n",
-      kW, kH, kD, kRT, kRT, frames, maxIter, halfSampler, depthMode, compute, lod0, fastMath, diag, pipeline, sampleDistMM, dataMode, layoutMode, filterMode, volDiv, slabIndex, numSlabs, slabT, maccum, mulAdd, kEndT);
+    fprintf(stderr, "volume %dx%dx%d R8, rt %dx%d, frames %d, maxIter %d, halfSampler=%d, depthMode=%d, compute=%d, lod0=%d, fastMath=%d, diag=%d, pipeline=%d, sampleDistMM=%.1f, dataMode=%d, layoutMode=%d, filterMode=%d, volDiv=%d, slab=%d/%d, slabT=%d, maccum=%d, mulAdd=%d, kEndT=%d, uniformSlab=%d\n",
+      kW, kH, kD, kRT, kRT, frames, maxIter, halfSampler, depthMode, compute, lod0, fastMath, diag, pipeline, sampleDistMM, dataMode, layoutMode, filterMode, volDiv, slabIndex, numSlabs, slabT, maccum, mulAdd, kEndT, uniformSlab);
 
     NSError* err = nil;
     const char* filt = filterMode ? "nearest" : "linear";
@@ -803,7 +827,7 @@ int main(int argc, const char** argv)
                                   : (layoutMode ? BuildSlicedMSL(halfSampler != 0, pipeline, filt)
                                                 : BuildMSL(halfSampler != 0, lod0 != 0, pipeline, filt, mulAdd != 0)));
       if (mulAdd) ApplyMulAddDecls(msl);
-      if (numSlabs > 0) { if (slabT) ApplySlabT(msl, maccum ? si : slabIndex, maccum ? si + 1 : slabIndex + 1, numSlabs, mulAdd != 0, kEndT != 0); else ApplySlab(msl, slabIndex, slabIndex + 1, numSlabs); }
+      if (numSlabs > 0) { if (slabT) { if (uniformSlab) ApplySlabT(msl, 0, 1, 1, mulAdd != 0, kEndT != 0, 1); else ApplySlabT(msl, maccum ? si : slabIndex, maccum ? si + 1 : slabIndex + 1, numSlabs, mulAdd != 0, kEndT != 0, 0); } else ApplySlab(msl, slabIndex, slabIndex + 1, numSlabs); }
       if (maccum) ApplyAccOut(msl);
       if (si == 0) { FILE* f = fopen(numSlabs > 0 ? "/tmp/slab.msl" : "/tmp/single.msl", "w"); fputs(msl, f); fclose(f); }
       if (maccum && si == numSlabs - 1) { FILE* f = fopen("/tmp/lastslab.msl", "w"); fputs(msl, f); fclose(f); }
@@ -837,6 +861,7 @@ int main(int argc, const char** argv)
         pso = [device newRenderPipelineStateWithDescriptor:pd error:&err];
         if (!pso) { fprintf(stderr, "pso failed: %s\n", err.description.UTF8String); return 1; }
         [psoArr addObject:pso];
+        if (uniformSlab && si == 0) break;
       }
     }
 
@@ -923,6 +948,8 @@ int main(int argc, const char** argv)
     u._pad0 = 0.0f;
     u._pad1 = 0.0f;
     u.maxIter = maxIter;
+    u.slabStart = 0.0f;
+    u.slabEnd = 1.0f;
     id<MTLBuffer> ubuf = [device newBufferWithBytes:&u length:sizeof(u) options:MTLResourceStorageModeShared];
 
     if (diag) {
@@ -954,10 +981,15 @@ int main(int argc, const char** argv)
         [enc endEncoding];
       } else if (maccum) {
         for (int p = 0; p < ns; p++) {
+          if (uniformSlab) {
+            u.slabStart = (float)p / numSlabs;
+            u.slabEnd = (float)(p + 1) / numSlabs;
+          }
           MTLRenderPassDescriptor* rpd = MakeRPDAction(rt, depth, depthMode, p == 0 ? MTLLoadActionClear : MTLLoadActionLoad);
           id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
-          [enc setRenderPipelineState:[psoArr objectAtIndex:p]];
-          [enc setFragmentBuffer:ubuf offset:0 atIndex:0];
+          [enc setRenderPipelineState:[psoArr objectAtIndex:uniformSlab ? 0 : p]];
+          if (uniformSlab) [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+          else [enc setFragmentBuffer:ubuf offset:0 atIndex:0];
           [enc setFragmentTexture:volTex atIndex:0];
           [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
           [enc endEncoding];
@@ -992,10 +1024,15 @@ int main(int argc, const char** argv)
         [enc endEncoding];
       } else if (maccum) {
         for (int p = 0; p < ns; p++) {
+          if (uniformSlab) {
+            u.slabStart = (float)p / numSlabs;
+            u.slabEnd = (float)(p + 1) / numSlabs;
+          }
           MTLRenderPassDescriptor* rpd = MakeRPDAction(rt, depth, depthMode, p == 0 ? MTLLoadActionClear : MTLLoadActionLoad);
           id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
-          [enc setRenderPipelineState:[psoArr objectAtIndex:p]];
-          [enc setFragmentBuffer:ubuf offset:0 atIndex:0];
+          [enc setRenderPipelineState:[psoArr objectAtIndex:uniformSlab ? 0 : p]];
+          if (uniformSlab) [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+          else [enc setFragmentBuffer:ubuf offset:0 atIndex:0];
           [enc setFragmentTexture:volTex atIndex:0];
           [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
           [enc endEncoding];

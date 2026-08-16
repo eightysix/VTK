@@ -174,6 +174,38 @@ misconfiguration, not real errors.)
 #   instead of accumulation) - exactness then comes for free.
 ./metal_gap 30 8192 0 2 0 0 1 0 0 2048 4.0 1 0 0 1 8 0 1 1  # maccum 8-slab SD4
 
+# PHASE-2: MUL-ADD INDEXED MARCH IS PIXEL-EXACT AND FAST (2026-08)
+#   argv[20]=mulAdd: positions indexed as tStartRaw + float(kPass+i)*stepSize
+#   (fma per sample) in BOTH single-pass and slab shaders, so exactness is free
+#   when the index-set union tiles single-pass. No warmup loop (the old
+#   accumulated body re-advanced every pass's start; the warmup alone cost
+#   ~7 ms). The slab tiling is exact by construction because consecutive passes
+#   share the same ceil() on the same plane (kEnd of pass p == kPass of pass p+1):
+#     mulAdd maccum8, 2048/SD4 noise, M2: 14.5 ms (single-pass 69.9 -> 4.8x).
+#     0 / 4,194,304 pixel mismatches, max diff 0, at K=8. K sweep all exact:
+#     K=2 41.6, K=4 23.5, K=8 14.5, K=16 14.6, K=32 21.3 ms (K=8 sweet spot).
+#   argv[21]=kEndT: tExit = tStartRaw + kEnd*stepSize (value tiling, no OR-break,
+#   no kNext integer break) - equally exact (shared-ceil tiling + the raw box
+#   exit cap) and ~0.3 ms faster / simpler. Canonical scheme.
+#   argv[22]=uniformSlab: ONE PSO reading u.slabStart/u.slabEnd (set per pass via
+#   setFragmentBytes), instead of one PSO per slab. Same GPU time (15.9 vs 15.7
+#   ms, within noise) - the 8-PSO switching was never a GPU cost. This is still
+#   the right design for the app port: 1 PSO, no per-slab shader rebuild.
+#   SAME EXACT CODE ON GL (gl_gap argv[15]=maccum, argv[16]=mulAdd, GL_MAX blend):
+#     0 / 4,194,304 mismatches too, but GL is SLOWER: 22.6 ms (single-pass
+#     45.7 -> 2.0x) vs Metal 14.5 ms (4.8x). With identical tiled code Metal
+#     wins 1.56x over GL; GL's cache-locality gain is much smaller.
+#   The 8.6 ms slab baseline in the section above is NOT reproducible from
+#   committed code (it was a pre-correctness state + a camera geometry where
+#   rays spanned all z-planes; the committed tExit=thi code over-marches every
+#   pass to the box exit = 19.4 ms). The exact floor here is ~14.5 ms; the
+#   remaining cost is per-pass fixed overhead (RT load+store + setup, ~1.3 ms
+#   per pass; sampling itself is ~20x cheaper than single-pass).
+./metal_gap 30 8192 0 2 0 0 1 0 0 2048 4.0 1 0 0 1 8 0 1 1 1 0  # mulAdd m8
+./metal_gap 30 8192 0 2 0 0 1 0 0 2048 4.0 1 0 0 1 8 0 1 1 1 1  # mulAdd m8 kEndT
+./metal_gap 30 8192 0 2 0 0 1 0 0 2048 4.0 1 0 0 1 8 0 1 1 1 1 1  # mulAdd m8 uniformSlab
+./gl_gap 30 8192 0 0 0 1 2048 4.0 1 0 1 8 0 1 1 1              # GL mulAdd m8 maccum
+
 # App-shader harness: [frames] [iterMode]
 # iterMode=0: color output + frame timing
 ./gl_app_shader 30
