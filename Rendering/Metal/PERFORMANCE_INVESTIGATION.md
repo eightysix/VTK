@@ -1321,3 +1321,59 @@ FUTURE LEADS (correctness):
   - The residual absolute error (741-743, thresholded 0.000) is the fp16
     accumulator-vs-GL ordering spread; a full fp32 composite accumulator would
     close it at some throughput cost, independent of slab tiling.
+
+## 20. Slab tiling is view-dependent: adaptive slab count
+
+Composite slab tiling (`VTK_METAL_TEST_NUM_SLABS` > 1) splits each ray into N
+ray-length-fraction index ranges and composites the partials back-to-front with
+(ONE, ONE_MINUS_SRC_ALPHA) blending (bit-identical to single-pass up to fp
+rounding). Section 19-era measurements showed 8 slabs winning decisively on the
+oblique "angled" bench camera at 2048x2048 (mv0, minmax ON, accel OFF, DICOM
+512x512x1794):
+
+| view | SD | s1 ms/f | s8 ms/f | s8 vs s1 |
+|---|---|---|---|---|
+| oblique | 0.5 | 330.4 | 150.7 | **2.2x faster** |
+| oblique | 4.0 | 102.5 | 38.9 | **2.6x faster** |
+
+But the benefit is orientation-dependent: on the DICOM app's axis-aligned
+(`ResetCamera`) views the per-pass working set is already cache-friendly and
+tiling is pure pass-count overhead:
+
+| view | SD | s1 ms/f | s8 ms/f | s8 vs s1 |
+|---|---|---|---|---|
+| coronal (camAxis=y) | 0.5 | 60.7 | 68.5 | 1.13x slower |
+| coronal (camAxis=y) | 4.0 | 9.5 | 18.0 | **1.9x slower** |
+| sagittal (camAxis=x) | 0.5 | 60.1 | 67.6 | 1.12x slower |
+| sagittal (camAxis=x) | 4.0 | 9.5 | 19.2 | **2.0x slower** |
+| axial (camAxis=z) | 0.5 | 103.7 | 96.5 | ~tie (7% faster) |
+| axial (camAxis=z) | 4.0 | 19.1 | 19.4 | ~tie |
+
+The discriminator is view-to-axis alignment, not ray length (coronal SD0.5 has
+~902 max steps/ray and prefers s1; oblique SD4 has ~223 and prefers s8). Head-on
+rays sweep the texture one coherent slice at a time, so the single pass is
+cache-friendly; oblique rays fan across the texture and the depth-sliced passes
+keep the working set resident.
+
+### 20.1 Fix: adaptive slab count from the volume-space view direction
+
+`ResolveNumSlabs()` in vtkMetalGPUVolumeRayCastMapper.mm picks the count per
+frame from the max |dot| between the volume-space view direction (camera ->
+box center, in `[0,1]` volume space) and the volume axes: aligned
+(>= `VTK_METAL_TEST_SLAB_ALIGN`, default 0.95 ~ 18 deg) -> 1 slab, otherwise 8.
+An explicit `VTK_METAL_TEST_NUM_SLABS` still wins (0 = adaptive, the default).
+The choice is purely a performance trade-off: every count composites
+bit-identically, so the visual_compare thresholded error is unchanged (0).
+
+| view | SD | s1 | s8 | adaptive |
+|---|---|---|---|---|
+| oblique | 0.5 | 330.4 | 150.7 | **148.4** |
+| oblique | 4.0 | 102.5 | 38.9 | **38.1** |
+| coronal (y) | 4.0 | 9.5 | 18.0 | **9.6** |
+| sagittal (x) | 4.0 | 9.5 | 19.2 | **9.6** |
+| axial (z) | 4.0 | 19.1 | 19.4 | **19.5** |
+
+Adaptive never exceeds the best of s1/s8 beyond run noise (axial SD0.5 measures
+88.4 vs 96.5 s8 best, within the ~22 ms run-to-run sigma of that cell). The app's
+axis-aligned `ResetCamera` view now renders single-pass (no slab penalty), and
+oblique/rotated views automatically fall back to the cache-resident tiling.

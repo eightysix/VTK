@@ -358,16 +358,55 @@ static int VolumeMarchVariant()
 // M2/Apple SoC cache and Metal loses to GL by 1.3-1.8x (PERFORMANCE_INVESTIGATION
 // "raw-path coarse-SD lag"); with 8 slabs those regimes flip to Metal winning
 // (2048x2048/SD4: 88-93ms -> 44ms vs GL 50-53ms, M/GL 0.83-0.89). Reads the env
-// var once per process; clamped to [1, 32]. 1 restores the bit-identical
-// single-pass parity path.
+// var once per process; clamped to [1, 32]. 0 = unset, the count is chosen
+// adaptively per frame (see ResolveNumSlabs).
 static int VolumeSlabCount()
 {
   static const int count = [] {
     if (const char* v = getenv("VTK_METAL_TEST_NUM_SLABS"))
       return std::max(1, std::min(std::atoi(v), 32));
-    return 1; // TEMP-REPRO: 1 = no slab tiling (revert to 8)
+    return 0;
   }();
   return count;
+}
+
+// View-aligned adaptive slab count. Slab tiling only pays off when the volume
+// working set per pass exceeds the on-chip cache, which happens when rays sweep
+// the texture obliquely. For a near-axis view the single-pass working set is
+// already cache-friendly and tiling is pure pass-count overhead (measured
+// ~1.9-2x slower at 2048x2048 on coronal/sagittal DICOM views, neutral on
+// axial; oblique views are conversely 2.2-2.6x faster WITH 8 slabs — see
+// PERFORMANCE_INVESTIGATION.md section on orientation). Pick the count from the
+// max |dot| between the volume-space view direction and the volume axes:
+// aligned (>= VTK_METAL_TEST_SLAB_ALIGN, default 0.95) -> 1 slab, otherwise
+// maxSlabs. Every count composites bit-identically, so this is purely a
+// performance trade-off.
+static int AdaptiveVolumeSlabCount(const float camVolPos[3], int maxSlabs)
+{
+  double dx = 0.5 - camVolPos[0];
+  double dy = 0.5 - camVolPos[1];
+  double dz = 0.5 - camVolPos[2];
+  const double len = std::sqrt(dx * dx + dy * dy + dz * dz);
+  double align = 0.0;
+  if (len > 1e-12)
+  {
+    align = std::max({ std::abs(dx), std::abs(dy), std::abs(dz) }) / len;
+  }
+  double threshold = 0.95;
+  if (const char* v = getenv("VTK_METAL_TEST_SLAB_ALIGN"))
+  {
+    threshold = std::atof(v);
+  }
+  return (align >= threshold) ? 1 : maxSlabs;
+}
+
+// Resolve the per-frame slab count: an explicit VTK_METAL_TEST_NUM_SLABS wins,
+// otherwise the view-aligned adaptive choice (1 for near-axis views, 8
+// otherwise).
+static int ResolveNumSlabs(const float camVolPos[3])
+{
+  const int configured = VolumeSlabCount();
+  return (configured > 0) ? configured : AdaptiveVolumeSlabCount(camVolPos, 8);
 }
 
 // Fixed uniform iteration count for the variant-4 non-divergent march
@@ -6570,11 +6609,12 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
   // Composite slab tiling (VTK_METAL_TEST_NUM_SLABS): only on the blended
   // direct path (useDirectPipeline), and only for composite blending — the
   // (ONE, ONE_MINUS_SRC_ALPHA) accumulation of per-slab partial composites is
-  // exact only because front-to-back premultiplied `over` is associative.
+  // exact only because front-to-back premultiplied `over` is associative. The
+  // count is resolved per frame (adaptive to the view alignment).
   const int numSlabs =
     (useDirectPipeline && this->GetBlendMode() == vtkVolumeMapper::COMPOSITE_BLEND &&
-     VolumeSlabCount() > 1)
-      ? VolumeSlabCount()
+     ResolveNumSlabs(uniforms->CameraVolumePos) > 1)
+      ? ResolveNumSlabs(uniforms->CameraVolumePos)
       : 1;
   if (numSlabs > 1)
   {
@@ -6605,9 +6645,10 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
     this->GradientNormalTexture,
     useDirectPipeline, &pbd, MTLCullModeBack);
 
-  // Front-to-back slab passes: each composites only its ray-length-fraction
-  // index range from zero; the blend on attachment 0 accumulates them.
-  for (int s = 0; s < numSlabs; ++s)
+  // Back-to-front slab passes: each composites only its ray-length-fraction
+  // index range from zero; the (ONE, ONE_MINUS_SRC_ALPHA) blend on attachment 0
+  // accumulates them. Premultiplied `over` is associative only back-to-front.
+  for (int s = numSlabs - 1; s >= 0; --s)
   {
     pbd.SlabInfo[0] = static_cast<float>(s);
     pbd.SlabInfo[1] = static_cast<float>(numSlabs);
@@ -7982,10 +8023,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       // for composite blending because premultiplied `over` is associative.
       // The slab bit only reaches this direct pipeline's mask; offscreen/RTT/
       // grid pipelines keep their unmodified mask and stay single-pass.
+      const int resolvedSlabs = ResolveNumSlabs(uniforms.CameraVolumePos);
       const int numSlabs =
         (!selectionRender && this->GetBlendMode() == vtkVolumeMapper::COMPOSITE_BLEND &&
-         VolumeSlabCount() > 1)
-          ? VolumeSlabCount()
+         resolvedSlabs > 1)
+          ? resolvedSlabs
           : 1;
       uint32_t directMask = featureMask;
       if (numSlabs > 1)
