@@ -316,14 +316,32 @@ fragment float4 fragment_main(VOut in [[stage_in]],
 //   >=2 = N-way unroll (N even): N independent back-to-back fetches per
 //       iteration, scalar break-aware tail. N = 2/4/8 tested.
 //   3 = no break / fixed count (isolates the data-dependent break's cost)
-static char* BuildMSL(bool halfSampler, bool lod0, int pipeline, const char* filt)
+static char* BuildMSL(bool halfSampler, bool lod0, int pipeline, const char* filt, bool mulAdd)
 {
   const char* lt = halfSampler ? "half" : "float";
   const char* ls = halfSampler ? "h" : "f";
   const char* lod = lod0 ? ", level(0.0f)" : "";
   char body[8192];
 
-  if (pipeline == 1)
+  if (mulAdd)
+  {
+    // mulAdd: each sample position is computed as tStartRaw + float(kPass+i)*stepSize
+    // (one mul-add) instead of accumulated += stepSize. Slab pass and single pass
+    // then produce bit-identical positions at the same global index kPass+i, so
+    // slab rendering is pixel-exact with NO kPass warmup loop. Requires the
+    // ApplyMulAddDecls insert (tStartRaw/tExitRaw/kPass) and ApplySlabT(mulAdd).
+    snprintf(body, sizeof(body), R"MSL(
+  for (int i = 0; i < steps; i++) {
+    float currentT = tStartRaw + float(kPass + i) * stepSize;
+    if (currentT >= min(tExit, tExitRaw) - 1e-6f) break;
+    float3 texLocal = eye + rayDir * currentT;
+    float3 evalPoint = texLocal * ctpScale + ctpOffset;
+    acc = max(acc, volTex.sample(volSampler, evalPoint%s).r);
+    n += 1.0f;
+  }
+)MSL", lod);
+  }
+  else if (pipeline == 1)
   {
     snprintf(body, sizeof(body), R"MSL(
   %s cur = volTex.sample(volSampler, evalPoint%s).r;
@@ -441,27 +459,62 @@ fragment float4 fragment_main(VOut in [[stage_in]],
 
 // Diagnostic variant: writes rayDir*0.5+0.5 to RGB so the actual ray field can
 // be compared against the fp64 reference (used to explain the avgIter gap).
-static void ApplySlabT(char* buf, int slabStart, int slabEnd, int numSlabs)
+// mulAdd mode (BuildMSL mulAdd): declare tStartRaw/tExitRaw/kPass right after
+// tStart so the slab clamp's tStart realignment cannot contaminate them. Must
+// run BEFORE ApplySlabT (the clamp is inserted later in the buffer).
+static void ApplyMulAddDecls(char* buf)
+{
+  const char needle[] = "  float tStart = max(tEnter, 0.0f);\n";
+  const char decls[] = "  float tStart = max(tEnter, 0.0f);\n"
+    "  float tStartRaw = tStart;\n"
+    "  float tExitRaw = tExit;\n"
+    "  int kPass = 0;\n";
+  char* p = buf;
+  while ((p = strstr(p, needle)) != NULL)
+  {
+    memmove(p + strlen(decls), p + strlen(needle), strlen(p + strlen(needle)) + 1);
+    memcpy(p, decls, strlen(decls));
+    p += strlen(decls);
+  }
+}
+
+static void ApplySlabT(char* buf, int slabStart, int slabEnd, int numSlabs, bool mulAdd)
 {
   char clamp[1024];
-  const char* align = (slabEnd >= numSlabs)
-    ? "    tExit = thi;\n"
-    : "    float kEnd = ceil(max((thi - tStart) / stepSize, 0.0f));\n"
-      "    tExit = tStart + kEnd * stepSize;\n";
+  const char* kpass = mulAdd
+    ? "    kPass = (int)kStartF;\n"
+    : "    int kPass = (int)kStartF;\n"
+      "    float tStartRaw = tStart;\n"
+      "    float tExitRaw = tExit;\n";
+  // mulAdd interior slabs break on the NEXT slab's integer start index
+  // (kPass + i >= kNext) instead of an fp value, so consecutive ceil() calls
+  // can never disagree by an index and the index-set union tiles single-pass
+  // exactly. kNext and the (generous) tExit bound are computed from the raw
+  // base so the union is contiguous by construction.
+  char align[1024];
+  if (mulAdd)
+    snprintf(align, sizeof(align),
+      "    float tNext = max(tStartRaw, max(t_s, t_e));\n"
+      "    int kNext = (int)ceil(max((tNext - tStartRaw) / stepSize, 0.0f));\n"
+      "    tExit = tStartRaw + float(kNext + 1) * stepSize;\n");
+  else if (slabEnd >= numSlabs)
+    snprintf(align, sizeof(align), "    tExit = thi;\n");
+  else
+    snprintf(align, sizeof(align),
+      "    float kEnd = ceil(max((thi - tStart) / stepSize, 0.0f));\n"
+      "    tExit = tStart + kEnd * stepSize;\n");
   snprintf(clamp, sizeof(clamp),
     "float stepSize = u.sampleDistMM / max(physPerNorm, 1e-6f);\n"
-    "    float t_s = (%d.0f/%d.0f - u.eye.z) / rayDir.z;\n"
-    "    float t_e = (%d.0f/%d.0f - u.eye.z) / rayDir.z;\n"
+    "    float t_s = (%d.0f/%d.0f - u.eye.z) * inv.z;\n"
+    "    float t_e = (%d.0f/%d.0f - u.eye.z) * inv.z;\n"
     "    float tlo = max(tStart, min(t_s, t_e));\n"
     "    float thi = min(tExit, max(t_s, t_e));\n"
     "    float kStartF = ceil(max((tlo - tStart) / stepSize, 0.0f));\n"
-    "    int kPass = (int)kStartF;\n"
-    "    float tStartRaw = tStart;\n"
-    "    float tExitRaw = tExit;\n"
+    "%s"
     "    tStart = tStart + kStartF * stepSize;\n"
     "%s"
     ,
-    slabStart, numSlabs, slabEnd, numSlabs, align);
+    slabStart, numSlabs, slabEnd, numSlabs, kpass, align);
   const char needle[] = "float stepSize = u.sampleDistMM / max(physPerNorm, 1e-6f);\n";
   char* p = buf;
   size_t clen = strlen(clamp), nlen = strlen(needle);
@@ -471,19 +524,32 @@ static void ApplySlabT(char* buf, int slabStart, int slabEnd, int numSlabs)
     memcpy(p, clamp, clen);
     p += clen;
   }
-  const char wneedle[] = "  float currentT = tStart;\n"
-    "  float3 texLocal = eye + rayDir * currentT;\n"
-    "  float3 evalPoint = texLocal * ctpScale + ctpOffset;\n";
-  const char warmup[] = "  float currentT = tStartRaw;\n"
-    "  float3 texLocal = eye + rayDir * currentT;\n"
-    "  float3 evalPoint = texLocal * ctpScale + ctpOffset;\n"
-    "  for (int w = 0; w < kPass; w++) { currentT += stepSize; texLocal += texStep; evalPoint += evalStep; }\n";
-  p = buf;
-  while ((p = strstr(p, wneedle)) != NULL)
+  if (mulAdd)
   {
-    memmove(p + strlen(warmup), p + strlen(wneedle), strlen(p + strlen(wneedle)) + 1);
-    memcpy(p, warmup, strlen(warmup));
-    p += strlen(warmup);
+    const char ibneedle[] = "if (currentT >= min(tExit, tExitRaw) - 1e-6f) break;\n";
+    const char ibrepl[] = "if (kPass + i >= kNext || currentT >= min(tExit, tExitRaw) - 1e-6f) break;\n";
+    while ((p = strstr(buf, ibneedle)) != NULL)
+    {
+      memmove(p + strlen(ibrepl), p + strlen(ibneedle), strlen(p + strlen(ibneedle)) + 1);
+      memcpy(p, ibrepl, strlen(ibrepl));
+    }
+  }
+  if (!mulAdd)
+  {
+    const char wneedle[] = "  float currentT = tStart;\n"
+      "  float3 texLocal = eye + rayDir * currentT;\n"
+      "  float3 evalPoint = texLocal * ctpScale + ctpOffset;\n";
+    const char warmup[] = "  float currentT = tStartRaw;\n"
+      "  float3 texLocal = eye + rayDir * currentT;\n"
+      "  float3 evalPoint = texLocal * ctpScale + ctpOffset;\n"
+      "  for (int w = 0; w < kPass; w++) { currentT += stepSize; texLocal += texStep; evalPoint += evalStep; }\n";
+    p = buf;
+    while ((p = strstr(p, wneedle)) != NULL)
+    {
+      memmove(p + strlen(warmup), p + strlen(wneedle), strlen(p + strlen(wneedle)) + 1);
+      memcpy(p, warmup, strlen(warmup));
+      p += strlen(warmup);
+    }
   }
   const char mneedle[] = "int maxSteps = max(1, int(ceil((tExit - tStart) / stepSize)));";
   const char mrepl[] = "int maxSteps = max(0, int(ceil((tExit - tStart) / stepSize)));";
@@ -682,6 +748,7 @@ int main(int argc, const char** argv)
     int slabIndex = 0;
     int slabT = 0;
     int maccum = 0;
+    int mulAdd = 0;
     if (argc > 1) frames = atoi(argv[1]);
     if (argc > 2) maxIter = atoi(argv[2]);
     if (argc > 3) halfSampler = atoi(argv[3]);
@@ -701,11 +768,12 @@ int main(int argc, const char** argv)
     if (argc > 17) slabIndex = atoi(argv[17]);
     if (argc > 18) slabT = atoi(argv[18]);
     if (argc > 19) maccum = atoi(argv[19]);
+    if (argc > 20) mulAdd = atoi(argv[20]);
 
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     fprintf(stderr, "Metal device: %s\n", device.name.UTF8String);
-    fprintf(stderr, "volume %dx%dx%d R8, rt %dx%d, frames %d, maxIter %d, halfSampler=%d, depthMode=%d, compute=%d, lod0=%d, fastMath=%d, diag=%d, pipeline=%d, sampleDistMM=%.1f, dataMode=%d, layoutMode=%d, filterMode=%d, volDiv=%d, slab=%d/%d, slabT=%d, maccum=%d\n",
-      kW, kH, kD, kRT, kRT, frames, maxIter, halfSampler, depthMode, compute, lod0, fastMath, diag, pipeline, sampleDistMM, dataMode, layoutMode, filterMode, volDiv, slabIndex, numSlabs, slabT, maccum);
+    fprintf(stderr, "volume %dx%dx%d R8, rt %dx%d, frames %d, maxIter %d, halfSampler=%d, depthMode=%d, compute=%d, lod0=%d, fastMath=%d, diag=%d, pipeline=%d, sampleDistMM=%.1f, dataMode=%d, layoutMode=%d, filterMode=%d, volDiv=%d, slab=%d/%d, slabT=%d, maccum=%d, mulAdd=%d\n",
+      kW, kH, kD, kRT, kRT, frames, maxIter, halfSampler, depthMode, compute, lod0, fastMath, diag, pipeline, sampleDistMM, dataMode, layoutMode, filterMode, volDiv, slabIndex, numSlabs, slabT, maccum, mulAdd);
 
     NSError* err = nil;
     const char* filt = filterMode ? "nearest" : "linear";
@@ -722,8 +790,9 @@ int main(int argc, const char** argv)
       char* msl = diag ? BuildDiagMSL()
                        : (compute ? BuildComputeMSL(halfSampler != 0, filt)
                                   : (layoutMode ? BuildSlicedMSL(halfSampler != 0, pipeline, filt)
-                                                : BuildMSL(halfSampler != 0, lod0 != 0, pipeline, filt)));
-      if (numSlabs > 0) { if (slabT) ApplySlabT(msl, maccum ? si : slabIndex, maccum ? si + 1 : slabIndex + 1, numSlabs); else ApplySlab(msl, slabIndex, slabIndex + 1, numSlabs); }
+                                                : BuildMSL(halfSampler != 0, lod0 != 0, pipeline, filt, mulAdd != 0)));
+      if (mulAdd) ApplyMulAddDecls(msl);
+      if (numSlabs > 0) { if (slabT) ApplySlabT(msl, maccum ? si : slabIndex, maccum ? si + 1 : slabIndex + 1, numSlabs, mulAdd != 0); else ApplySlab(msl, slabIndex, slabIndex + 1, numSlabs); }
       if (maccum) ApplyAccOut(msl);
       if (si == 0) { FILE* f = fopen(numSlabs > 0 ? "/tmp/slab.msl" : "/tmp/single.msl", "w"); fputs(msl, f); fclose(f); }
       if (maccum && si == numSlabs - 1) { FILE* f = fopen("/tmp/lastslab.msl", "w"); fputs(msl, f); fclose(f); }
