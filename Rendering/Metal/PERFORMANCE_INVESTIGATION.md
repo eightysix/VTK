@@ -1204,13 +1204,33 @@ VALIDATED FIX: depth-sliced (slab) rendering.
     vs 79ms full; GL 10.6 vs 44ms. Metal slab beats GL single-pass ~5x and GL
     slab by 1.2x.
   - Multi-pass accumulation prototype (maccum in metal_gap.m): 8 passes/frame
-    into one RT, MTLBlendOperationMax, per-pass tStart aligned to the global
-    sample lattice. Correctness: pixel-exact at numSlabs=1; 0.13% of marched
-    pixels differ <=5/255 at 8 slabs (boundary lattice-epsilon artifact).
-    2048/SD4 noise: 81.5 -> 13.5ms (6.0x), vs GL 44ms = 3.3x WIN.
-    2048/SD2: 18.5ms vs GL 61ms = 3.3x WIN.
-  - unroll (pipeline=8) does NOT stack with slabs (16.3ms): the cache fix
-    subsumes it.
+    into one RT, MTLBlendOperationMax. Correctness is now essentially
+    PIXEL-EXACT (deterministic, 2048/SD4 noise): numSlabs=1 = 0 / 4,194,304
+    mismatches; 8 slabs = 1 / 4,194,304 pixel differing by exactly +-1/255.
+    Four bugs were found and fixed to get there:
+      1. MSL string buffers (64 B slack) overflowed once the slab clamp +
+         warmup text was inserted -> 8-slab SIGSEGV / infinite re-insertion
+         hang (strstr restarted from the buffer head, never advancing past
+         the insert, and the warmup contains its own needle).
+      2. Aligning tStart via tStart + kStartF*stepSize (a fused mul-add)
+         seeded the warmup ~1 ulp off the single-pass accumulated lattice ->
+         ~4.9% of marched pixels differed (max 88/255). Fixed by seeding
+         currentT/texLocal/evalPoint from the RAW tStart and reproducing the
+         exact += stepSize sequence in a kPass warmup loop.
+      3. Interior slabs' ceil-aligned tExit could overshoot the box exit and
+         sample one index past single-pass's break. Fixed by breaking on
+         min(tExit, tExitRaw); the per-slab index-set union now equals
+         single-pass exactly (verified with an fp32 CPU simulator of the
+         lattice/count/break logic).
+      4. fastMath=1 is REQUIRED: with fastMath=0 the alignment disagrees on
+         thousands of boundary rays.
+    Performance at 2048/SD4 noise: 80.5ms single-pass -> 23.8ms 8-slab
+    maccum = 3.4x, vs GL 44ms = 1.85x WIN. The kPass warmup costs ~7ms (it
+    re-advances every pass's start along the lattice). Phase-2 targets: one
+    uniform-driven PSO instead of 8 PSOs; kill the warmup by indexing
+    positions as tStart + float(i)*stepSize (mul-add) in both single-pass and
+    slab shaders, making exactness free.
+  - unroll (pipeline=8) does NOT stack with slabs: the cache fix subsumes it.
 
 APP IMPLEMENTATION NOTES (next step, not yet done):
   - vtkMetalGPUVolumeRayCastMapper renders single-pass front-to-back

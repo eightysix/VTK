@@ -298,7 +298,7 @@ fragment float4 fragment_main(VOut in [[stage_in]],
   return float4(float(nc & 255u) / 255.0f, float((nc >> 8u) & 255u) / 255.0f, float(acc), 1.0f);
 }
 )MSL";
-  char* buf = malloc(strlen(fmt) + strlen(body) + 64);
+  char* buf = malloc(strlen(fmt) + strlen(body) + 8192);
   snprintf(buf, strlen(fmt) + strlen(body) + 64, fmt, lt, lt, ls, body);
   ApplyFilter(buf, filt);
   return buf;
@@ -433,7 +433,7 @@ fragment float4 fragment_main(VOut in [[stage_in]],
   return float4(float(nc & 255u) / 255.0f, float((nc >> 8u) & 255u) / 255.0f, float(acc), 1.0f);
 }
 )MSL";
-  char* buf = malloc(strlen(fmt) + strlen(body) + 64);
+  char* buf = malloc(strlen(fmt) + strlen(body) + 8192);
   snprintf(buf, strlen(fmt) + strlen(body) + 64, fmt, lt, lt, ls, body);
   ApplyFilter(buf, filt);
   return buf;
@@ -443,17 +443,25 @@ fragment float4 fragment_main(VOut in [[stage_in]],
 // be compared against the fp64 reference (used to explain the avgIter gap).
 static void ApplySlabT(char* buf, int slabStart, int slabEnd, int numSlabs)
 {
-  char clamp[512];
+  char clamp[1024];
+  const char* align = (slabEnd >= numSlabs)
+    ? "    tExit = thi;\n"
+    : "    float kEnd = ceil(max((thi - tStart) / stepSize, 0.0f));\n"
+      "    tExit = tStart + kEnd * stepSize;\n";
   snprintf(clamp, sizeof(clamp),
     "float stepSize = u.sampleDistMM / max(physPerNorm, 1e-6f);\n"
     "    float t_s = (%d.0f/%d.0f - u.eye.z) / rayDir.z;\n"
     "    float t_e = (%d.0f/%d.0f - u.eye.z) / rayDir.z;\n"
     "    float tlo = max(tStart, min(t_s, t_e));\n"
     "    float thi = min(tExit, max(t_s, t_e));\n"
-    "    float kk = ceil(max((tlo - tStart) / stepSize, 0.0f));\n"
-    "    tStart = tStart + kk * stepSize;\n"
-    "    tExit = thi;\n",
-    slabStart, numSlabs, slabEnd, numSlabs);
+    "    float kStartF = ceil(max((tlo - tStart) / stepSize, 0.0f));\n"
+    "    int kPass = (int)kStartF;\n"
+    "    float tStartRaw = tStart;\n"
+    "    float tExitRaw = tExit;\n"
+    "    tStart = tStart + kStartF * stepSize;\n"
+    "%s"
+    ,
+    slabStart, numSlabs, slabEnd, numSlabs, align);
   const char needle[] = "float stepSize = u.sampleDistMM / max(physPerNorm, 1e-6f);\n";
   char* p = buf;
   size_t clen = strlen(clamp), nlen = strlen(needle);
@@ -462,6 +470,34 @@ static void ApplySlabT(char* buf, int slabStart, int slabEnd, int numSlabs)
     memmove(p + clen, p + nlen, strlen(p + nlen) + 1);
     memcpy(p, clamp, clen);
     p += clen;
+  }
+  const char wneedle[] = "  float currentT = tStart;\n"
+    "  float3 texLocal = eye + rayDir * currentT;\n"
+    "  float3 evalPoint = texLocal * ctpScale + ctpOffset;\n";
+  const char warmup[] = "  float currentT = tStartRaw;\n"
+    "  float3 texLocal = eye + rayDir * currentT;\n"
+    "  float3 evalPoint = texLocal * ctpScale + ctpOffset;\n"
+    "  for (int w = 0; w < kPass; w++) { currentT += stepSize; texLocal += texStep; evalPoint += evalStep; }\n";
+  p = buf;
+  while ((p = strstr(p, wneedle)) != NULL)
+  {
+    memmove(p + strlen(warmup), p + strlen(wneedle), strlen(p + strlen(wneedle)) + 1);
+    memcpy(p, warmup, strlen(warmup));
+    p += strlen(warmup);
+  }
+  const char mneedle[] = "int maxSteps = max(1, int(ceil((tExit - tStart) / stepSize)));";
+  const char mrepl[] = "int maxSteps = max(0, int(ceil((tExit - tStart) / stepSize)));";
+  while ((p = strstr(buf, mneedle)) != NULL)
+  {
+    memmove(p + strlen(mrepl), p + strlen(mneedle), strlen(p + strlen(mneedle)) + 1);
+    memcpy(p, mrepl, strlen(mrepl));
+  }
+  const char bneedle[] = "if (currentT >= tExit - 1e-6f) break;\n";
+  const char brepl[] = "if (currentT >= min(tExit, tExitRaw) - 1e-6f) break;\n";
+  while ((p = strstr(buf, bneedle)) != NULL)
+  {
+    memmove(p + strlen(brepl), p + strlen(bneedle), strlen(p + strlen(bneedle)) + 1);
+    memcpy(p, brepl, strlen(brepl));
   }
 }
 
@@ -515,7 +551,7 @@ fragment float4 fragment_main(VOut in [[stage_in]],
   return float4(rayDir * 0.5f + 0.5f, 1.0f);
 }
 )MSL";
-  char* buf = malloc(strlen(fmt) + 8);
+  char* buf = malloc(strlen(fmt) + 8192);
   strcpy(buf, fmt);
   return buf;
 }
@@ -616,7 +652,7 @@ kernel void compute_main(uint2 gid [[thread_position_in_grid]],
   outTex.write(float4(float(nc & 255u) / 255.0f, float((nc >> 8u) & 255u) / 255.0f, float(acc), 1.0f), gid);
 }
 )MSL";
-  char* buf = malloc(strlen(fmt) + 32);
+  char* buf = malloc(strlen(fmt) + 8192);
   snprintf(buf, strlen(fmt) + 32, fmt,
     halfSampler ? "half" : "float",
     halfSampler ? "half" : "float",
@@ -687,9 +723,10 @@ int main(int argc, const char** argv)
                        : (compute ? BuildComputeMSL(halfSampler != 0, filt)
                                   : (layoutMode ? BuildSlicedMSL(halfSampler != 0, pipeline, filt)
                                                 : BuildMSL(halfSampler != 0, lod0 != 0, pipeline, filt)));
-      if (numSlabs > 0) { if (slabT) ApplySlabT(msl, si, si + 1, numSlabs); else ApplySlab(msl, slabIndex, slabIndex + 1, numSlabs); }
+      if (numSlabs > 0) { if (slabT) ApplySlabT(msl, maccum ? si : slabIndex, maccum ? si + 1 : slabIndex + 1, numSlabs); else ApplySlab(msl, slabIndex, slabIndex + 1, numSlabs); }
       if (maccum) ApplyAccOut(msl);
-      if (numSlabs > 0 && !slabT && si == 0) { FILE* f = fopen("/tmp/slab.msl", "w"); fputs(msl, f); fclose(f); }
+      if (si == 0) { FILE* f = fopen(numSlabs > 0 ? "/tmp/slab.msl" : "/tmp/single.msl", "w"); fputs(msl, f); fclose(f); }
+      if (maccum && si == numSlabs - 1) { FILE* f = fopen("/tmp/lastslab.msl", "w"); fputs(msl, f); fclose(f); }
       id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:msl]
                                                  options:opts error:&err];
       free(msl);
@@ -928,8 +965,8 @@ int main(int argc, const char** argv)
     for (size_t i = 0; i < (size_t)kRT * kRT * 4; i += 4) {
       sumIter += pix[i + 2] + 256.0 * (double)pix[i + 1];
     }
-    fprintf(stderr, "METAL readback: meanB=%.3f nonzero=%d/%d avgIter=%.1f (true=%.1f)\n",
-      sumB / npix / 255.0, nz, kRT * kRT, avgN, sumIter / npix);
+    fprintf(stderr, "METAL readback: meanB=%.3f nonzero=%d/%d avgIter=%.1f (true=%.1f) sumIter=%.0f\n",
+      sumB / npix / 255.0, nz, kRT * kRT, avgN, sumIter / npix, sumIter);
     const char* ppmName = diag ? "metal_gap_diag.ppm" : "metal_gap.ppm";
     FILE* fp = fopen(ppmName, "wb");
     if (fp) {

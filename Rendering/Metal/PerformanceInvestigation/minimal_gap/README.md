@@ -142,20 +142,37 @@ misconfiguration, not real errors.)
 # MULTI-PASS ACCUMULATION PROTOTYPE (2026-08, argv[19]=maccum)
 # Renders numSlabs slabT passes per frame into ONE RT (pass 0 clears, passes
 # 1+ loadAction=Load), accumulated via MTLBlendOperationMax, one commit/frame.
-# Each pass's tStart is aligned UP to the global sample lattice (tStart + k*step,
-# k = ceil((tlo - tStart)/stepSize)) so the union of slab sample positions
-# equals the single-pass lattice exactly.
-#   Correctness: numSlabs=1 (no split, just acc-out + blend) = pixel-exact vs
-#   single-pass (0 mismatches). 8-slab split vs single-pass: 0.13% of marched
-#   pixels differ by <=5/255 (slab-boundary lattice-epsilon artifact only).
-#   2048/SD4 noise: single-pass 81.5 ms -> 8-slab maccum 13.5 ms (6.0x), and
-#   vs GL single-pass 44 ms = 3.3x WIN. 2048/SD2: 18.5 ms vs GL 61 ms = 3.3x.
-#   pipeline=8 (unroll) does NOT stack (16.3 ms): slab already fixes the cache
-#   problem, unroll's win was single-pass-only. The ~13.5ms vs 8.6ms projection
-#   gap is the lattice alignment + per-pass overhead; the app can recover it
-#   (compute the slab clamp from uniforms instead of one PSO per slab).
+#   Correctness (verified pixel-exact at 2048/SD4 noise, deterministic):
+#     numSlabs=1 (no split): 0 / 4,194,304 mismatches vs single-pass.
+#     numSlabs=8: 1 / 4,194,304 pixels differ by exactly +-1/255.
+#   Four bugs had to be fixed to reach this:
+#     1. MSL string buffers had only 64 B slack; the slab clamp + warmup text
+#        overflowed the heap (8-slab SIGSEGV / infinite re-insertion hang).
+#     2. The warmup re-insertion loop restarted strstr() from the buffer head
+#        and never advanced past the insert, so the warmup (whose text contains
+#        its own needle) was re-inserted forever.
+#     3. The alignment reassigned tStart = tStart + kStartF*stepSize (fused
+#        mul-add), seeding the warmup ~1 ulp off the single-pass accumulated
+#        lattice -> ~4.9% of marched pixels differed by <=88/255. Fixed by
+#        seeding currentT/texLocal/evalPoint from the RAW tStart and letting
+#        the kPass warmup reproduce single-pass's exact += stepSize sequence.
+#     4. Interior slabs' ceil-aligned tExit could overshoot the box exit,
+#        sampling one index past single-pass's break (24/25 residual pixels).
+#        Fixed by breaking on min(tExit, tExitRaw); the per-slab index-set
+#        union now equals single-pass exactly (verified with an fp32 CPU
+#        simulator of the lattice/count/break logic).
+#   fastMath=1 is REQUIRED: with fastMath=0 the alignment math disagrees on
+#   thousands of boundary rays (right-edge region), so the app must not
+#   disable fast-math for the slab passes.
+#   Performance at 2048/SD4 noise (30 frames, M2): single-pass 80.5 ms ->
+#   8-slab maccum 23.8 ms = 3.4x, and vs GL single-pass 44 ms = 1.85x WIN.
+#   The kPass warmup costs ~7 ms (it re-advances every pass's start along the
+#   lattice; sum of kPass across passes ~= 3.5x the sample count). Phase-2
+#   ideas: one PSO driven by slab-start/slab-end uniforms instead of 8 PSOs,
+#   and eliminating the warmup entirely by indexing positions as
+#   tStart + float(i)*stepSize in BOTH single-pass and slab shaders (mul-add
+#   instead of accumulation) - exactness then comes for free.
 ./metal_gap 30 8192 0 2 0 0 1 0 0 2048 4.0 1 0 0 1 8 0 1 1  # maccum 8-slab SD4
-./metal_gap 30 8192 0 2 0 0 1 0 8 2048 4.0 1 0 0 1 8 0 1 1  # maccum 8-slab + unroll8
 
 # App-shader harness: [frames] [iterMode]
 # iterMode=0: color output + frame timing
