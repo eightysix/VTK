@@ -97,6 +97,67 @@ static const char* kFragSrc =
   "  fragColor = vec4(float(nc & 255) / 255.0, float((nc >> 8) & 255) / 255.0, acc, 1.0);\n"
   "}\n";
 
+static const char* kFragMulAddSrc =
+  "#version 150\n"
+  "in vec2 vUV;\n"
+  "out vec4 fragColor;\n"
+  "uniform sampler3D uVol;\n"
+  "uniform vec3 uTexelCount;\n"
+  "uniform float uSlabStart;\n"
+  "uniform float uSlabEnd;\n"
+  "uniform bool uSlabT;\n"
+  "uniform vec3 uEye;\n"
+  "uniform vec3 uBoundsSize;\n"
+  "uniform mat4 uInvVP;\n"
+  "uniform float uSampleDistMM;\n"
+  "uniform int uMaxIter;\n"
+  "void main() {\n"
+  "  vec2 ndc = vUV * 2.0 - 1.0;\n"
+  "  vec4 w4 = uInvVP * vec4(ndc, 0.0, 1.0);\n"
+  "  vec3 ptPhys = w4.xyz / w4.w;\n"
+  "  vec3 rayDir = normalize(ptPhys / uBoundsSize - uEye);\n"
+  "  vec3 inv = 1.0 / rayDir;\n"
+  "  vec3 t0 = (vec3(0.0) - uEye) * inv;\n"
+  "  vec3 t1 = (vec3(1.0) - uEye) * inv;\n"
+  "  vec3 tmin3 = min(t0, t1);\n"
+  "  vec3 tmax3 = max(t0, t1);\n"
+  "  float tEnter = max(max(tmin3.x, tmin3.y), tmin3.z);\n"
+  "  float tExitRaw = min(min(tmax3.x, tmax3.y), tmax3.z);\n"
+  "  if (tExitRaw <= 0.0 || tEnter >= tExitRaw) { fragColor = vec4(0.0,0.0,0.0,1.0); return; }\n"
+  "  float tStartRaw = max(tEnter, 0.0);\n"
+  "  float tlo = tStartRaw;\n"
+  "  float thi = tExitRaw;\n"
+  "  if (uSlabT) {\n"
+  "    float t_s = (uSlabStart - uEye.z) * inv.z;\n"
+  "    float t_e = (uSlabEnd - uEye.z) * inv.z;\n"
+  "    tlo = max(tStartRaw, min(t_s, t_e));\n"
+  "    thi = min(tExitRaw, max(t_s, t_e));\n"
+  "  }\n"
+  "  float physPerNorm = length(rayDir * uBoundsSize);\n"
+  "  float stepSize = uSampleDistMM / max(physPerNorm, 1e-6);\n"
+  "  int kPass = int(ceil(max((tlo - tStartRaw) / stepSize, 0.0)));\n"
+  "  float tStart = tStartRaw + float(kPass) * stepSize;\n"
+  "  float tExit = tExitRaw;\n"
+  "  if (uSlabT) tExit = tStartRaw + float(int(ceil(max((thi - tStartRaw) / stepSize, 0.0)))) * stepSize;\n"
+  "  int maxSteps = max(0, int(ceil((tExit - tStart) / stepSize)));\n"
+  "  vec3 texelCount = uTexelCount;\n"
+  "  vec3 ctpScale = max(texelCount - 1.0, 1e-4) / texelCount;\n"
+  "  vec3 ctpOffset = 0.5 / texelCount;\n"
+  "  vec3 evalBase = ctpOffset + (uEye + rayDir * tStartRaw) * ctpScale;\n"
+  "  vec3 evalStep = rayDir * ctpScale * stepSize;\n"
+  "  float acc = 0.0;\n"
+  "  float n = 0.0;\n"
+  "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n"
+  "    float currentT = tStartRaw + float(kPass + i) * stepSize;\n"
+  "    if (currentT >= min(tExit, tExitRaw) - 1e-6) break;\n"
+  "    vec3 evalPoint = evalBase + float(kPass + i) * evalStep;\n"
+  "    acc = max(acc, texture(uVol, evalPoint).r);\n"
+  "    n += 1.0;\n"
+  "  }\n"
+  "  int nc = int(n);\n"
+  "  fragColor = vec4(float(nc & 255) / 255.0, float((nc >> 8) & 255) / 255.0, acc, 1.0);\n"
+  "}\n";
+
 static const char* kFragNoFetchSrc =
   "#version 150\n"
   "out vec4 fragColor;\n"
@@ -213,6 +274,8 @@ int main(int argc, const char** argv)
   int numSlabs = 0;
   int slabIndex = 0;
   int slabT = 0;
+  int maccum = 0;
+  int mulAdd = 0;
   if (argc > 1) frames = atoi(argv[1]);
   if (argc > 2) maxIter = atoi(argv[2]);
   if (argc > 3) noFetch = atoi(argv[3]);
@@ -227,6 +290,8 @@ int main(int argc, const char** argv)
   if (argc > 12) numSlabs = atoi(argv[12]);
   if (argc > 13) slabIndex = atoi(argv[13]);
   if (argc > 14) slabT = atoi(argv[14]);
+  if (argc > 15) maccum = atoi(argv[15]);
+  if (argc > 16) mulAdd = atoi(argv[16]);
 
   NSOpenGLPixelFormatAttribute attrs[] = {
     NSOpenGLPFAOpenGLProfile, NSOpenGLProfileVersion3_2Core,
@@ -243,12 +308,12 @@ int main(int argc, const char** argv)
   glGetIntegerv(GL_MAX_3D_TEXTURE_SIZE, &max3d);
   printf("GL_VERSION: %s\n", glGetString(GL_VERSION));
   printf("GL_MAX_3D_TEXTURE_SIZE: %d\n", (int)max3d);
-  printf("volume %dx%dx%d R8, rt %dx%d, frames %d, maxIter %d, noFetch %d, flipY %d, sampleDistMM=%.1f, dataMode=%d, filterMode=%d, volDiv=%d, slab=%d/%d, slabT=%d\n",
-    kW, kH, kD, rtSize, rtSize, frames, maxIter, noFetch, flipY, sampleDistMM, dataMode, filterMode, volDiv, slabIndex, numSlabs, slabT);
+  printf("volume %dx%dx%d R8, rt %dx%d, frames %d, maxIter %d, noFetch %d, flipY %d, sampleDistMM=%.1f, dataMode=%d, filterMode=%d, volDiv=%d, slab=%d/%d, slabT=%d, maccum=%d, mulAdd=%d\n",
+    kW, kH, kD, rtSize, rtSize, frames, maxIter, noFetch, flipY, sampleDistMM, dataMode, filterMode, volDiv, slabIndex, numSlabs, slabT, maccum, mulAdd);
 
   // Program. flipY=1 negates NDC y so the same readback row traces the same
   // ray as metal_gap (which uses Metal's top-left window convention).
-  const char* fragSrc0 = noFetch ? kFragNoFetchSrc : kFragSrc;
+  const char* fragSrc0 = mulAdd ? kFragMulAddSrc : (noFetch ? kFragNoFetchSrc : kFragSrc);
   const char* fragSrc = fragSrc0;
   char* flipped = NULL;
   if (flipY) {
@@ -378,9 +443,23 @@ int main(int argc, const char** argv)
   }
 
   // Warmup.
+  if (maccum) {
+    glEnable(GL_BLEND);
+    glBlendEquation(GL_MAX);
+    glBlendFunc(GL_ONE, GL_ONE);
+  }
   for (int f = 0; f < 10; f++) {
-    glClear(GL_COLOR_BUFFER_BIT);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+    if (maccum) {
+      glClear(GL_COLOR_BUFFER_BIT);
+      for (int p = 0; p < numSlabs; p++) {
+        glUniform1f(uSlabStart, (float)p / numSlabs);
+        glUniform1f(uSlabEnd, (float)(p + 1) / numSlabs);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+      }
+    } else {
+      glClear(GL_COLOR_BUFFER_BIT);
+      glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
     glFinish();
   }
 
@@ -388,8 +467,17 @@ int main(int argc, const char** argv)
   double acc = 0.0;
   for (int f = 0; f < frames; f++) {
     double t0 = now_sec();
-    glClear(GL_COLOR_BUFFER_BIT);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+    if (maccum) {
+      glClear(GL_COLOR_BUFFER_BIT);
+      for (int p = 0; p < numSlabs; p++) {
+        glUniform1f(uSlabStart, (float)p / numSlabs);
+        glUniform1f(uSlabEnd, (float)(p + 1) / numSlabs);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+      }
+    } else {
+      glClear(GL_COLOR_BUFFER_BIT);
+      glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
     glFinish();
     double t1 = now_sec();
     acc += t1 - t0;

@@ -330,12 +330,16 @@ static char* BuildMSL(bool halfSampler, bool lod0, int pipeline, const char* fil
     // then produce bit-identical positions at the same global index kPass+i, so
     // slab rendering is pixel-exact with NO kPass warmup loop. Requires the
     // ApplyMulAddDecls insert (tStartRaw/tExitRaw/kPass) and ApplySlabT(mulAdd).
+    // The evalPoint is folded to evalBase + float(j)*evalStep (1 fma), so the
+    // per-iteration cost is 2 fma + break + sample (no texLocal reconstruct).
     snprintf(body, sizeof(body), R"MSL(
-  for (int i = 0; i < steps; i++) {
-    float currentT = tStartRaw + float(kPass + i) * stepSize;
+  float3 evalBaseE = ctpOffset + (eye + rayDir * tStartRaw) * ctpScale;
+  float3 evalStepE = rayDir * ctpScale * stepSize;
+  int j = kPass;
+  for (int i = 0; i < steps; i++, j++) {
+    float currentT = tStartRaw + float(j) * stepSize;
     if (currentT >= min(tExit, tExitRaw) - 1e-6f) break;
-    float3 texLocal = eye + rayDir * currentT;
-    float3 evalPoint = texLocal * ctpScale + ctpOffset;
+    float3 evalPoint = evalBaseE + float(j) * evalStepE;
     acc = max(acc, volTex.sample(volSampler, evalPoint%s).r);
     n += 1.0f;
   }
@@ -478,10 +482,11 @@ static void ApplyMulAddDecls(char* buf)
   }
 }
 
-static void ApplySlabT(char* buf, int slabStart, int slabEnd, int numSlabs, bool mulAdd)
+static void ApplySlabT(char* buf, int slabStart, int slabEnd, int numSlabs, bool mulAdd, bool kEndT)
 {
   char clamp[1024];
-  const char* kpass = mulAdd
+  const bool muladdPath = mulAdd;
+  const char* kpass = muladdPath
     ? "    kPass = (int)kStartF;\n"
     : "    int kPass = (int)kStartF;\n"
       "    float tStartRaw = tStart;\n"
@@ -492,11 +497,15 @@ static void ApplySlabT(char* buf, int slabStart, int slabEnd, int numSlabs, bool
   // exactly. kNext and the (generous) tExit bound are computed from the raw
   // base so the union is contiguous by construction.
   char align[1024];
-  if (mulAdd)
+  if (muladdPath && !kEndT)
     snprintf(align, sizeof(align),
       "    float tNext = max(tStartRaw, max(t_s, t_e));\n"
       "    int kNext = (int)ceil(max((tNext - tStartRaw) / stepSize, 0.0f));\n"
       "    tExit = tStartRaw + float(kNext + 1) * stepSize;\n");
+  else if (muladdPath)
+    snprintf(align, sizeof(align),
+      "    float kEnd = ceil(max((thi - tStartRaw) / stepSize, 0.0f));\n"
+      "    tExit = tStartRaw + kEnd * stepSize;\n");
   else if (slabEnd >= numSlabs)
     snprintf(align, sizeof(align), "    tExit = thi;\n");
   else
@@ -524,7 +533,7 @@ static void ApplySlabT(char* buf, int slabStart, int slabEnd, int numSlabs, bool
     memcpy(p, clamp, clen);
     p += clen;
   }
-  if (mulAdd)
+  if (muladdPath && !kEndT)
   {
     const char ibneedle[] = "if (currentT >= min(tExit, tExitRaw) - 1e-6f) break;\n";
     const char ibrepl[] = "if (kPass + i >= kNext || currentT >= min(tExit, tExitRaw) - 1e-6f) break;\n";
@@ -534,7 +543,7 @@ static void ApplySlabT(char* buf, int slabStart, int slabEnd, int numSlabs, bool
       memcpy(p, ibrepl, strlen(ibrepl));
     }
   }
-  if (!mulAdd)
+  if (!muladdPath)
   {
     const char wneedle[] = "  float currentT = tStart;\n"
       "  float3 texLocal = eye + rayDir * currentT;\n"
@@ -749,6 +758,7 @@ int main(int argc, const char** argv)
     int slabT = 0;
     int maccum = 0;
     int mulAdd = 0;
+    int kEndT = 0;
     if (argc > 1) frames = atoi(argv[1]);
     if (argc > 2) maxIter = atoi(argv[2]);
     if (argc > 3) halfSampler = atoi(argv[3]);
@@ -769,11 +779,12 @@ int main(int argc, const char** argv)
     if (argc > 18) slabT = atoi(argv[18]);
     if (argc > 19) maccum = atoi(argv[19]);
     if (argc > 20) mulAdd = atoi(argv[20]);
+    if (argc > 21) kEndT = atoi(argv[21]);
 
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     fprintf(stderr, "Metal device: %s\n", device.name.UTF8String);
-    fprintf(stderr, "volume %dx%dx%d R8, rt %dx%d, frames %d, maxIter %d, halfSampler=%d, depthMode=%d, compute=%d, lod0=%d, fastMath=%d, diag=%d, pipeline=%d, sampleDistMM=%.1f, dataMode=%d, layoutMode=%d, filterMode=%d, volDiv=%d, slab=%d/%d, slabT=%d, maccum=%d, mulAdd=%d\n",
-      kW, kH, kD, kRT, kRT, frames, maxIter, halfSampler, depthMode, compute, lod0, fastMath, diag, pipeline, sampleDistMM, dataMode, layoutMode, filterMode, volDiv, slabIndex, numSlabs, slabT, maccum, mulAdd);
+    fprintf(stderr, "volume %dx%dx%d R8, rt %dx%d, frames %d, maxIter %d, halfSampler=%d, depthMode=%d, compute=%d, lod0=%d, fastMath=%d, diag=%d, pipeline=%d, sampleDistMM=%.1f, dataMode=%d, layoutMode=%d, filterMode=%d, volDiv=%d, slab=%d/%d, slabT=%d, maccum=%d, mulAdd=%d, kEndT=%d\n",
+      kW, kH, kD, kRT, kRT, frames, maxIter, halfSampler, depthMode, compute, lod0, fastMath, diag, pipeline, sampleDistMM, dataMode, layoutMode, filterMode, volDiv, slabIndex, numSlabs, slabT, maccum, mulAdd, kEndT);
 
     NSError* err = nil;
     const char* filt = filterMode ? "nearest" : "linear";
@@ -792,7 +803,7 @@ int main(int argc, const char** argv)
                                   : (layoutMode ? BuildSlicedMSL(halfSampler != 0, pipeline, filt)
                                                 : BuildMSL(halfSampler != 0, lod0 != 0, pipeline, filt, mulAdd != 0)));
       if (mulAdd) ApplyMulAddDecls(msl);
-      if (numSlabs > 0) { if (slabT) ApplySlabT(msl, maccum ? si : slabIndex, maccum ? si + 1 : slabIndex + 1, numSlabs, mulAdd != 0); else ApplySlab(msl, slabIndex, slabIndex + 1, numSlabs); }
+      if (numSlabs > 0) { if (slabT) ApplySlabT(msl, maccum ? si : slabIndex, maccum ? si + 1 : slabIndex + 1, numSlabs, mulAdd != 0, kEndT != 0); else ApplySlab(msl, slabIndex, slabIndex + 1, numSlabs); }
       if (maccum) ApplyAccOut(msl);
       if (si == 0) { FILE* f = fopen(numSlabs > 0 ? "/tmp/slab.msl" : "/tmp/single.msl", "w"); fputs(msl, f); fclose(f); }
       if (maccum && si == numSlabs - 1) { FILE* f = fopen("/tmp/lastslab.msl", "w"); fputs(msl, f); fclose(f); }
