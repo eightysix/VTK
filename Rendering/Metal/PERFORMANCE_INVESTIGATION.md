@@ -1035,3 +1035,80 @@ per-sample machinery that the lean harness probe does not model. With minmax
 acceleration enabled (the app's default when not forcing GL parity) the gap
 would be even smaller; the numbers above use min-max off to match GL exactly.
 
+## 18. Wider inline-address batches: probe w16/w32/w48/w64 and variant 9
+
+### 18.1 Motivation
+
+Section 17's variant 8 (8-wide batch) left the app at **1.27x** vs GL. The
+user's thesis: the app is nowhere near the harness floor, and the remaining
+deficit is fetch-latency hiding, not machinery. The harness's 16x unroll had
+regressed (45.8 -> 51.6 ms) only because it kept 16 live `float3` position
+registers alongside the results. Probe v36 tests the fix: pass each sample
+address **inline** to `sampleVolumeScalar` so the address dies at issue and only
+the 16 scalar results stay live - wider batches without the register spill.
+
+### 18.2 Probe results (512x512x1794 R8, 400x400 RT, full DVR, mode 0)
+
+Fragment functions in `probe7_extra.metal` (`fragment_march_phase_batch_w16`,
+`..._w32`, `..._w48`, `..._w64`; probe7b variants 33/34/35/36), interleaved runs:
+
+| batch width | r1 | r2 | r3 | mean |
+|---|---|---|---|---|
+| v34 w8 (sched, index 31) | 57.86 | 55.57 | 54.35 | **55.9** ms |
+| v36 w16 (index 33) | 49.99 | 47.86 | 47.68 | **48.5** ms |
+| v38 w32 (index 34) | 39.22 | 38.87 | 37.04 | **38.4** ms |
+| v39 w48 (index 35) | 38.06 | 38.71 | 35.69 | **37.5** ms |
+| v40 w64 (index 36) | 42.33 | 42.05 | 38.25 | **40.9** ms |
+
+Notes:
+
+- w16 already cuts ~7 ms off w8; w32 nearly halves the w8 time. w48 is the best
+  (35.7-38.7 ms); w64 regresses (~2.4 ms) - register pressure returns.
+- **w48's full-DVR time (37.5 ms) is below the harness's bare-fetch 8x-unroll
+  time (45.8 ms)**: with a 48-wide batch the TF fetch + composite + clamp costs
+  are fully hidden under the volume-fetch latency. This is direct evidence that
+  the app was nowhere near a structural floor.
+- A first w24 macro variant was measured but is **invalid**: the shared macro
+  fetched/composited 32 samples while advancing 24 (double-counting). It is not
+  reported here and was removed; w32/w48/w64 were written with exact sample
+  counts.
+- All w-fragments keep v34's semantics (bounds clamp-and-continue until
+  `seenInBounds`, then break; `currentT`/`tTerminateMax`/opacity exits; scalar
+  tail loop) so per-sample output is identical to w8.
+
+### 18.3 The port: fc_marchVariant 9 (48-wide inline batch)
+
+`MetalShaders.metal` now has, in the `fc_marchVariant >= 6` guard, an
+`if (fc_marchVariant == 9 && !fc_minmax && !fc_shading && !fc_gradientOpacity &&
+!fc_renderToTexture)` branch exactly like variant 8 but with `unrollN = 48` and
+inline sample addresses (`sampleVolumeScalar(volumeTexture, evalPoint + evalStep
+* k)`). Non-lean variant-9 feature combinations fall through to the
+feature-complete batch-8 consume, so correctness is preserved for all flags.
+Variant 9 was added as an A/B experiment; the default remains 8 until parity and
+reproducibility are confirmed.
+
+### 18.4 In-app measurement (DICOM app benchmark, M2 MBA, interleaved A/B)
+
+| variant | r1 | r2 | r3 | mean | M/GL |
+|---|---|---|---|---|---|
+| GL | 51.34 / 51.04 / 48.01 / 48.35 | | | **49.7** ms | |
+| 8 (harness 8-wide) | 66.20 / 65.74 / 60.22 / 60.96 | | | **63.3** ms | 1.25 |
+| 9 (**48-wide inline**) | 53.05 / 51.83 / 50.55 / 49.80 | | | **51.3** ms | **1.03** |
+
+(Each row: interleaved runs, 30 frames each. GL and Metal ms/f are from the same
+bench run per round.)
+
+Thresholded GL-vs-Metal image error stays **0.000** for variant 9 - the 48-wide
+batch composites exactly the same samples as variant 8, so parity is preserved.
+
+### 18.5 Status and residual gap
+
+Variant 9 closes the app gap from 1.25x to **1.02-1.05x** (Metal ~50-52 ms vs GL
+~48-51 ms), i.e. parity - and occasionally Metal edges ahead. The app still
+trails the w48 probe (~37.5 ms) by ~13 ms; the gap is the production
+`fragment_volume_main` context (all feature variants compiled into one library,
+the app's smaller ~70k-ray workload offering less cross-warp latency hiding than
+the probe's 160k-ray 400x400 target, plus per-fragment plumbing). Closing the
+last ~2 ms so Metal clearly beats GL is the next target.
+
+

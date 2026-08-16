@@ -4214,7 +4214,303 @@ inline half4 marchVolumeUnified(
     const int unrollN = (fc_marchVariant == 7) ? 4 : 8;
     const float3 adjTexMin = ctpOffset;
     const float3 adjTexMax = ctpOffset + ctpScale;
-    if (fc_marchVariant == 8 && !fc_minmax && !fc_shading && !fc_gradientOpacity &&
+    if (fc_marchVariant == 9 && !fc_minmax && !fc_shading && !fc_gradientOpacity &&
+        !fc_renderToTexture)
+    {
+      // fc_marchVariant 9: 48-wide harness scheduling with inline sample
+      // addresses (probe v39 fragment_march_phase_batch_w48). Same scheduling
+      // as variant 8 but the batch is 48 wide and each address dies at issue
+      // (no p0..pN float3 live registers), so far more volume fetches are in
+      // flight per warp and the issue latency is hidden even harder. The probe
+      // measured w48 35.7-38.7ms vs w8 (v34) 54.4-57.9ms and w16 47.7-50.1ms
+      // on the 512x512x1794 R8 workload. Same lean compile-time gate as
+      // variant 8; any other feature combination keeps the batch-8 consume.
+      int i = 0;
+      const int steps = maxSteps;
+      const int unrollN = 48;
+      for (; i + unrollN <= steps; i += unrollN)
+      {
+        if (currentT >= p.tEnd - 1e-6f) break;
+        if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+            any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+          if (seenInBounds) { break; }
+          texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+          evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+        } else {
+          seenInBounds = true;
+        }
+        float s0  = sampleVolumeScalar(volumeTexture, evalPoint);
+        float s1 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 1.0f);
+        float s2 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 2.0f);
+        float s3 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 3.0f);
+        float s4 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 4.0f);
+        float s5 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 5.0f);
+        float s6 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 6.0f);
+        float s7 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 7.0f);
+        float s8 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 8.0f);
+        float s9 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 9.0f);
+        float s10 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 10.0f);
+        float s11 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 11.0f);
+        float s12 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 12.0f);
+        float s13 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 13.0f);
+        float s14 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 14.0f);
+        float s15 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 15.0f);
+        float s16 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 16.0f);
+        float s17 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 17.0f);
+        float s18 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 18.0f);
+        float s19 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 19.0f);
+        float s20 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 20.0f);
+        float s21 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 21.0f);
+        float s22 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 22.0f);
+        float s23 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 23.0f);
+        float s24 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 24.0f);
+        float s25 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 25.0f);
+        float s26 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 26.0f);
+        float s27 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 27.0f);
+        float s28 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 28.0f);
+        float s29 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 29.0f);
+        float s30 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 30.0f);
+        float s31 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 31.0f);
+        float s32 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 32.0f);
+        float s33 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 33.0f);
+        float s34 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 34.0f);
+        float s35 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 35.0f);
+        float s36 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 36.0f);
+        float s37 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 37.0f);
+        float s38 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 38.0f);
+        float s39 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 39.0f);
+        float s40 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 40.0f);
+        float s41 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 41.0f);
+        float s42 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 42.0f);
+        float s43 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 43.0f);
+        float s44 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 44.0f);
+        float s45 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 45.0f);
+        float s46 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 46.0f);
+        float s47 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 47.0f);
+        half4 c0 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s0) * scalarScale + scalarBias)), 0.5));
+        half4 c1 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s1) * scalarScale + scalarBias)), 0.5));
+        half4 c2 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s2) * scalarScale + scalarBias)), 0.5));
+        half4 c3 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s3) * scalarScale + scalarBias)), 0.5));
+        half4 c4 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s4) * scalarScale + scalarBias)), 0.5));
+        half4 c5 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s5) * scalarScale + scalarBias)), 0.5));
+        half4 c6 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s6) * scalarScale + scalarBias)), 0.5));
+        half4 c7 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s7) * scalarScale + scalarBias)), 0.5));
+        half4 c8 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s8) * scalarScale + scalarBias)), 0.5));
+        half4 c9 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s9) * scalarScale + scalarBias)), 0.5));
+        half4 c10 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s10) * scalarScale + scalarBias)), 0.5));
+        half4 c11 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s11) * scalarScale + scalarBias)), 0.5));
+        half4 c12 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s12) * scalarScale + scalarBias)), 0.5));
+        half4 c13 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s13) * scalarScale + scalarBias)), 0.5));
+        half4 c14 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s14) * scalarScale + scalarBias)), 0.5));
+        half4 c15 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s15) * scalarScale + scalarBias)), 0.5));
+        half4 c16 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s16) * scalarScale + scalarBias)), 0.5));
+        half4 c17 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s17) * scalarScale + scalarBias)), 0.5));
+        half4 c18 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s18) * scalarScale + scalarBias)), 0.5));
+        half4 c19 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s19) * scalarScale + scalarBias)), 0.5));
+        half4 c20 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s20) * scalarScale + scalarBias)), 0.5));
+        half4 c21 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s21) * scalarScale + scalarBias)), 0.5));
+        half4 c22 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s22) * scalarScale + scalarBias)), 0.5));
+        half4 c23 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s23) * scalarScale + scalarBias)), 0.5));
+        half4 c24 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s24) * scalarScale + scalarBias)), 0.5));
+        half4 c25 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s25) * scalarScale + scalarBias)), 0.5));
+        half4 c26 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s26) * scalarScale + scalarBias)), 0.5));
+        half4 c27 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s27) * scalarScale + scalarBias)), 0.5));
+        half4 c28 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s28) * scalarScale + scalarBias)), 0.5));
+        half4 c29 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s29) * scalarScale + scalarBias)), 0.5));
+        half4 c30 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s30) * scalarScale + scalarBias)), 0.5));
+        half4 c31 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s31) * scalarScale + scalarBias)), 0.5));
+        half4 c32 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s32) * scalarScale + scalarBias)), 0.5));
+        half4 c33 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s33) * scalarScale + scalarBias)), 0.5));
+        half4 c34 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s34) * scalarScale + scalarBias)), 0.5));
+        half4 c35 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s35) * scalarScale + scalarBias)), 0.5));
+        half4 c36 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s36) * scalarScale + scalarBias)), 0.5));
+        half4 c37 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s37) * scalarScale + scalarBias)), 0.5));
+        half4 c38 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s38) * scalarScale + scalarBias)), 0.5));
+        half4 c39 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s39) * scalarScale + scalarBias)), 0.5));
+        half4 c40 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s40) * scalarScale + scalarBias)), 0.5));
+        half4 c41 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s41) * scalarScale + scalarBias)), 0.5));
+        half4 c42 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s42) * scalarScale + scalarBias)), 0.5));
+        half4 c43 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s43) * scalarScale + scalarBias)), 0.5));
+        half4 c44 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s44) * scalarScale + scalarBias)), 0.5));
+        half4 c45 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s45) * scalarScale + scalarBias)), 0.5));
+        half4 c46 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s46) * scalarScale + scalarBias)), 0.5));
+        half4 c47 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s47) * scalarScale + scalarBias)), 0.5));
+        half w0 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w0 * (c0.rgb * c0.a);
+        accumulatedOpacity += w0 * c0.a;
+        half w1 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w1 * (c1.rgb * c1.a);
+        accumulatedOpacity += w1 * c1.a;
+        half w2 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w2 * (c2.rgb * c2.a);
+        accumulatedOpacity += w2 * c2.a;
+        half w3 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w3 * (c3.rgb * c3.a);
+        accumulatedOpacity += w3 * c3.a;
+        half w4 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w4 * (c4.rgb * c4.a);
+        accumulatedOpacity += w4 * c4.a;
+        half w5 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w5 * (c5.rgb * c5.a);
+        accumulatedOpacity += w5 * c5.a;
+        half w6 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w6 * (c6.rgb * c6.a);
+        accumulatedOpacity += w6 * c6.a;
+        half w7 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w7 * (c7.rgb * c7.a);
+        accumulatedOpacity += w7 * c7.a;
+        half w8 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w8 * (c8.rgb * c8.a);
+        accumulatedOpacity += w8 * c8.a;
+        half w9 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w9 * (c9.rgb * c9.a);
+        accumulatedOpacity += w9 * c9.a;
+        half w10 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w10 * (c10.rgb * c10.a);
+        accumulatedOpacity += w10 * c10.a;
+        half w11 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w11 * (c11.rgb * c11.a);
+        accumulatedOpacity += w11 * c11.a;
+        half w12 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w12 * (c12.rgb * c12.a);
+        accumulatedOpacity += w12 * c12.a;
+        half w13 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w13 * (c13.rgb * c13.a);
+        accumulatedOpacity += w13 * c13.a;
+        half w14 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w14 * (c14.rgb * c14.a);
+        accumulatedOpacity += w14 * c14.a;
+        half w15 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w15 * (c15.rgb * c15.a);
+        accumulatedOpacity += w15 * c15.a;
+        half w16 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w16 * (c16.rgb * c16.a);
+        accumulatedOpacity += w16 * c16.a;
+        half w17 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w17 * (c17.rgb * c17.a);
+        accumulatedOpacity += w17 * c17.a;
+        half w18 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w18 * (c18.rgb * c18.a);
+        accumulatedOpacity += w18 * c18.a;
+        half w19 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w19 * (c19.rgb * c19.a);
+        accumulatedOpacity += w19 * c19.a;
+        half w20 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w20 * (c20.rgb * c20.a);
+        accumulatedOpacity += w20 * c20.a;
+        half w21 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w21 * (c21.rgb * c21.a);
+        accumulatedOpacity += w21 * c21.a;
+        half w22 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w22 * (c22.rgb * c22.a);
+        accumulatedOpacity += w22 * c22.a;
+        half w23 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w23 * (c23.rgb * c23.a);
+        accumulatedOpacity += w23 * c23.a;
+        half w24 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w24 * (c24.rgb * c24.a);
+        accumulatedOpacity += w24 * c24.a;
+        half w25 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w25 * (c25.rgb * c25.a);
+        accumulatedOpacity += w25 * c25.a;
+        half w26 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w26 * (c26.rgb * c26.a);
+        accumulatedOpacity += w26 * c26.a;
+        half w27 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w27 * (c27.rgb * c27.a);
+        accumulatedOpacity += w27 * c27.a;
+        half w28 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w28 * (c28.rgb * c28.a);
+        accumulatedOpacity += w28 * c28.a;
+        half w29 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w29 * (c29.rgb * c29.a);
+        accumulatedOpacity += w29 * c29.a;
+        half w30 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w30 * (c30.rgb * c30.a);
+        accumulatedOpacity += w30 * c30.a;
+        half w31 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w31 * (c31.rgb * c31.a);
+        accumulatedOpacity += w31 * c31.a;
+        half w32 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w32 * (c32.rgb * c32.a);
+        accumulatedOpacity += w32 * c32.a;
+        half w33 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w33 * (c33.rgb * c33.a);
+        accumulatedOpacity += w33 * c33.a;
+        half w34 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w34 * (c34.rgb * c34.a);
+        accumulatedOpacity += w34 * c34.a;
+        half w35 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w35 * (c35.rgb * c35.a);
+        accumulatedOpacity += w35 * c35.a;
+        half w36 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w36 * (c36.rgb * c36.a);
+        accumulatedOpacity += w36 * c36.a;
+        half w37 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w37 * (c37.rgb * c37.a);
+        accumulatedOpacity += w37 * c37.a;
+        half w38 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w38 * (c38.rgb * c38.a);
+        accumulatedOpacity += w38 * c38.a;
+        half w39 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w39 * (c39.rgb * c39.a);
+        accumulatedOpacity += w39 * c39.a;
+        half w40 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w40 * (c40.rgb * c40.a);
+        accumulatedOpacity += w40 * c40.a;
+        half w41 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w41 * (c41.rgb * c41.a);
+        accumulatedOpacity += w41 * c41.a;
+        half w42 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w42 * (c42.rgb * c42.a);
+        accumulatedOpacity += w42 * c42.a;
+        half w43 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w43 * (c43.rgb * c43.a);
+        accumulatedOpacity += w43 * c43.a;
+        half w44 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w44 * (c44.rgb * c44.a);
+        accumulatedOpacity += w44 * c44.a;
+        half w45 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w45 * (c45.rgb * c45.a);
+        accumulatedOpacity += w45 * c45.a;
+        half w46 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w46 * (c46.rgb * c46.a);
+        accumulatedOpacity += w46 * c46.a;
+        half w47 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w47 * (c47.rgb * c47.a);
+        accumulatedOpacity += w47 * c47.a;
+        currentPoint += stepVec * 48.0f;
+        currentT += p.stepSize * 48.0f;
+        texLocalPos += texStep * 48.0f;
+        evalPoint += evalStep * 48.0f;
+        if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+        if (currentT >= p.tTerminateMax) { break; }
+      }
+      for (; i < steps; i++)
+      {
+        if (currentT >= p.tEnd - 1e-6f) break;
+        if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+            any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+          if (seenInBounds) { break; }
+          texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+          evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+        } else {
+          seenInBounds = true;
+        }
+        float s = sampleVolumeScalar(volumeTexture, evalPoint);
+        half4 c = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s) * scalarScale + scalarBias)), 0.5));
+        half w = 1.0h - accumulatedOpacity;
+        accumulatedColor += w * (c.rgb * c.a);
+        accumulatedOpacity += w * c.a;
+        currentPoint += stepVec;
+        currentT += p.stepSize;
+        texLocalPos += texStep;
+        evalPoint += evalStep;
+        if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+        if (currentT >= p.tTerminateMax) { break; }
+      }
+    }
+    else if (fc_marchVariant == 8 && !fc_minmax && !fc_shading && !fc_gradientOpacity &&
         !fc_renderToTexture)
     {
       // fc_marchVariant 8: harness-style scheduling (minimal_gap/metal_gap.m

@@ -1696,6 +1696,955 @@ fragment VolumeFragmentOut fragment_march_phase_batch_sched(
   return output;
 }
 
+// v35: v34's harness scheduling minus the per-batch machinery the compiler
+// cannot DCE when the mode is a runtime buffer. Same batch-8 loop shape
+// (positions first, all volume fetches back-to-back, all TF fetches
+// back-to-back, serial composite, ONE advance per batch, scalar tail) but:
+//   - the entry bounds clamp is hoisted ONCE before the loop; the batch loop
+//     and tail loop carry NO clamp check and NO seenInBounds flag (the exit
+//     side is handled by the existing currentT >= tEnd break; the ray is a
+//     straight line, so after the entry clamp it stays in [0,1] until tEnd)
+//   - no currentPoint / texLocalPos loop-carried chains (dead after the loop;
+//     only evalPoint + currentT are advanced)
+// Gives the Metal compiler a pure fetch->TF->composite loop with nothing else
+// to serialize or spill. fc_v35mode (buffer 8):
+//   &2 = keep v34-style per-batch clamp (A/B within one shader)
+//   &4 = no TF fetch
+//   &8 = no composite
+//   &16 = no clamp at all (overrides &2)
+// ============================================================================
+fragment VolumeFragmentOut fragment_march_phase_batch_lean(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    constant int& fixedIterCount [[buffer(3)]],
+    constant int& fc_v35mode [[buffer(8)]]) {
+
+  VolumeFragmentOut output;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 localPos = in.localPos;
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
+  if (!parallel) {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
+    rayDir /= dirLength;
+  }
+
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { output.color = float4(0.0); return output; }
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  const int mode = fc_v35mode;
+  const bool noTF   = (mode & 4) != 0;
+  const bool noComp = (mode & 8) != 0;
+  const bool noClamp = (mode & 16) != 0;
+  const bool inLoopClamp = ((mode & 2) != 0) && !noClamp;
+
+  half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
+  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
+                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+
+  float tStart = dot(s.entryPoint - cameraPos, rayDir);
+  float tEnd = s.totalBoxT;
+  float tTerminateMax = s.tTerminateMax;
+
+  float currentT = stepSize;
+  int maxSteps = max(1, int(ceil((tEnd - stepSize) / stepSize)));
+
+  half3 accumulatedColor = half3(0.0h);
+  half accumulatedOpacity = 0.0h;
+
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + (rayOrigin + rayDir * (tStart + stepSize)) * boundsSize, 1.0)).xyz;
+  float3 evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+
+  const float3 adjTexMin = ctpOffset;
+  const float3 adjTexMax = ctpOffset + ctpScale;
+
+  // Entry clamp, hoisted once. Matches v34's first-batch behavior (out-of-bounds
+  // before any in-bounds sample: clamp texLocalPos to [0,1] and recompute).
+  if (!noClamp) {
+    if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+        any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+      texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+      evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+    }
+  }
+
+  const int unrollN = 8;
+  int i = 0;
+  const int steps = maxSteps;
+  for (; i + unrollN <= steps; i += unrollN)
+  {
+    if (currentT >= tEnd - 1e-6f) break;
+    if (inLoopClamp) {
+      if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+          any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+        texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+        evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+      }
+    }
+    float3 p0 = evalPoint;
+    float3 p1 = evalPoint + evalStep * 1.0f;
+    float3 p2 = evalPoint + evalStep * 2.0f;
+    float3 p3 = evalPoint + evalStep * 3.0f;
+    float3 p4 = evalPoint + evalStep * 4.0f;
+    float3 p5 = evalPoint + evalStep * 5.0f;
+    float3 p6 = evalPoint + evalStep * 6.0f;
+    float3 p7 = evalPoint + evalStep * 7.0f;
+
+    float s0 = sampleVolumeScalar(volumeTexture, p0);
+    float s1 = sampleVolumeScalar(volumeTexture, p1);
+    float s2 = sampleVolumeScalar(volumeTexture, p2);
+    float s3 = sampleVolumeScalar(volumeTexture, p3);
+    float s4 = sampleVolumeScalar(volumeTexture, p4);
+    float s5 = sampleVolumeScalar(volumeTexture, p5);
+    float s6 = sampleVolumeScalar(volumeTexture, p6);
+    float s7 = sampleVolumeScalar(volumeTexture, p7);
+
+    half4 c0 = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                    : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s0) * scalarScale + scalarBias)), 0.5));
+    half4 c1 = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                    : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s1) * scalarScale + scalarBias)), 0.5));
+    half4 c2 = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                    : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s2) * scalarScale + scalarBias)), 0.5));
+    half4 c3 = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                    : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s3) * scalarScale + scalarBias)), 0.5));
+    half4 c4 = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                    : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s4) * scalarScale + scalarBias)), 0.5));
+    half4 c5 = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                    : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s5) * scalarScale + scalarBias)), 0.5));
+    half4 c6 = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                    : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s6) * scalarScale + scalarBias)), 0.5));
+    half4 c7 = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                    : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s7) * scalarScale + scalarBias)), 0.5));
+
+    if (!noComp) {
+      half w0 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w0 * (c0.rgb * c0.a);
+      accumulatedOpacity += w0 * c0.a;
+      half w1 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w1 * (c1.rgb * c1.a);
+      accumulatedOpacity += w1 * c1.a;
+      half w2 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w2 * (c2.rgb * c2.a);
+      accumulatedOpacity += w2 * c2.a;
+      half w3 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w3 * (c3.rgb * c3.a);
+      accumulatedOpacity += w3 * c3.a;
+      half w4 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w4 * (c4.rgb * c4.a);
+      accumulatedOpacity += w4 * c4.a;
+      half w5 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w5 * (c5.rgb * c5.a);
+      accumulatedOpacity += w5 * c5.a;
+      half w6 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w6 * (c6.rgb * c6.a);
+      accumulatedOpacity += w6 * c6.a;
+      half w7 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w7 * (c7.rgb * c7.a);
+      accumulatedOpacity += w7 * c7.a;
+    }
+
+    currentT += stepSize * 8.0f;
+    evalPoint += evalStep * 8.0f;
+    if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+    if (currentT >= tTerminateMax) { break; }
+  }
+  for (; i < steps; i++)
+  {
+    if (currentT >= tEnd - 1e-6f) break;
+    if (inLoopClamp) {
+      if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+          any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+        texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+        evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+      }
+    }
+    float s = sampleVolumeScalar(volumeTexture, evalPoint);
+    half4 c = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                   : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s) * scalarScale + scalarBias)), 0.5));
+    if (!noComp) {
+      half w = 1.0h - accumulatedOpacity;
+      accumulatedColor += w * (c.rgb * c.a);
+      accumulatedOpacity += w * c.a;
+    }
+    currentT += stepSize;
+    evalPoint += evalStep;
+    if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+    if (currentT >= tTerminateMax) { break; }
+  }
+
+  output.color = float4(float3(accumulatedColor), accumulatedOpacity);
+  return output;
+}
+
+// v36: same harness scheduling as v34 but a 16-wide batch with INLINE sample
+// positions. The harness's 16x unroll regressed (45.8 -> 51.6ms) because it
+// kept 16 float3 position variables live (48 registers) alongside 16 results;
+// v36 passes the position expression directly to sampleVolumeScalar so each
+// address dies at issue and only the 16 scalar results stay live - testing
+// whether a wider batch can beat 8x in the full-DVR context (the app has only
+// ~70k rays vs the harness's 160k, so per-warp ILP matters more here).
+// fc_v36mode (buffer 8):
+//   &2 = in-loop clamp (v34-style)   &4 = no TF   &8 = no comp   &16 = no clamp
+// ============================================================================
+fragment VolumeFragmentOut fragment_march_phase_batch_w16(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    constant int& fixedIterCount [[buffer(3)]],
+    constant int& fc_v36mode [[buffer(8)]]) {
+
+  VolumeFragmentOut output;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 localPos = in.localPos;
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
+  if (!parallel) {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
+    rayDir /= dirLength;
+  }
+
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { output.color = float4(0.0); return output; }
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  const int mode = fc_v36mode;
+  const bool noTF   = (mode & 4) != 0;
+  const bool noComp = (mode & 8) != 0;
+  const bool noClamp = (mode & 16) != 0;
+  const bool inLoopClamp = ((mode & 2) != 0) && !noClamp;
+
+  half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
+  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
+                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+
+  float tStart = dot(s.entryPoint - cameraPos, rayDir);
+  float tEnd = s.totalBoxT;
+  float tTerminateMax = s.tTerminateMax;
+
+  float currentT = stepSize;
+  int maxSteps = max(1, int(ceil((tEnd - stepSize) / stepSize)));
+
+  half3 accumulatedColor = half3(0.0h);
+  half accumulatedOpacity = 0.0h;
+
+  float3 currentPoint = rayOrigin + rayDir * (tStart + stepSize);
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
+  float3 evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+  float3 stepVec = rayDir * stepSize;
+
+  const float3 adjTexMin = ctpOffset;
+  const float3 adjTexMax = ctpOffset + ctpScale;
+  bool seenInBounds = false;
+
+  const int unrollN = 16;
+  int i = 0;
+  const int steps = maxSteps;
+  for (; i + unrollN <= steps; i += unrollN)
+  {
+    if (currentT >= tEnd - 1e-6f) break;
+    if (inLoopClamp) {
+      if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+          any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+        if (seenInBounds) { break; }
+        texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+        evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+      } else {
+        seenInBounds = true;
+      }
+    }
+    float s0  = sampleVolumeScalar(volumeTexture, evalPoint);
+    float s1  = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 1.0f);
+    float s2  = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 2.0f);
+    float s3  = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 3.0f);
+    float s4  = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 4.0f);
+    float s5  = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 5.0f);
+    float s6  = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 6.0f);
+    float s7  = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 7.0f);
+    float s8  = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 8.0f);
+    float s9  = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 9.0f);
+    float s10 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 10.0f);
+    float s11 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 11.0f);
+    float s12 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 12.0f);
+    float s13 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 13.0f);
+    float s14 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 14.0f);
+    float s15 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 15.0f);
+
+#define TFETCH(k) (noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h) : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s##k) * scalarScale + scalarBias)), 0.5)))
+    half4 c0 = TFETCH(0);  half4 c1 = TFETCH(1);  half4 c2 = TFETCH(2);  half4 c3 = TFETCH(3);
+    half4 c4 = TFETCH(4);  half4 c5 = TFETCH(5);  half4 c6 = TFETCH(6);  half4 c7 = TFETCH(7);
+    half4 c8 = TFETCH(8);  half4 c9 = TFETCH(9);  half4 c10 = TFETCH(10); half4 c11 = TFETCH(11);
+    half4 c12 = TFETCH(12); half4 c13 = TFETCH(13); half4 c14 = TFETCH(14); half4 c15 = TFETCH(15);
+#undef TFETCH
+
+    if (!noComp) {
+#define COMPK(k) { half w##k = 1.0h - accumulatedOpacity; accumulatedColor += w##k * (c##k.rgb * c##k.a); accumulatedOpacity += w##k * c##k.a; }
+      COMPK(0)  COMPK(1)  COMPK(2)  COMPK(3)
+      COMPK(4)  COMPK(5)  COMPK(6)  COMPK(7)
+      COMPK(8)  COMPK(9)  COMPK(10) COMPK(11)
+      COMPK(12) COMPK(13) COMPK(14) COMPK(15)
+#undef COMPK
+    }
+
+    currentPoint += stepVec * 16.0f;
+    currentT += stepSize * 16.0f;
+    texLocalPos += texStep * 16.0f;
+    evalPoint += evalStep * 16.0f;
+    if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+    if (currentT >= tTerminateMax) { break; }
+  }
+  for (; i < steps; i++)
+  {
+    if (currentT >= tEnd - 1e-6f) break;
+    if (inLoopClamp) {
+      if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+          any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+        if (seenInBounds) { break; }
+        texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+        evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+      } else {
+        seenInBounds = true;
+      }
+    }
+    float s = sampleVolumeScalar(volumeTexture, evalPoint);
+    half4 c = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                   : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s) * scalarScale + scalarBias)), 0.5));
+    if (!noComp) {
+      half w = 1.0h - accumulatedOpacity;
+      accumulatedColor += w * (c.rgb * c.a);
+      accumulatedOpacity += w * c.a;
+    }
+    currentPoint += stepVec;
+    currentT += stepSize;
+    texLocalPos += texStep;
+    evalPoint += evalStep;
+    if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+    if (currentT >= tTerminateMax) { break; }
+  }
+
+  output.color = float4(float3(accumulatedColor), accumulatedOpacity);
+  return output;
+}
+
+// v37/v38: v36's 16-wide batch scaled to 24/32-wide (inline positions).
+// fc_v37mode / fc_v38mode (buffer 8):
+//   &2 = in-loop clamp   &4 = no TF   &8 = no comp   &16 = no clamp
+// v38/v39/v40: v36's inline-position batch scaled to 32/48/64-wide.
+// Like v36, each sample address dies at issue so only the scalar results stay
+// live; the wider the batch, the more texture fetches are in flight per warp
+// (latency hiding). fc_v38mode / fc_v39mode / fc_v40mode (buffer 8):
+//   &2 = in-loop clamp   &4 = no TF   &8 = no comp   &16 = no clamp
+// v38/v39/v40: v36's inline-position batch scaled to 32/48/64-wide.
+// Like v36, each sample address dies at issue so only the scalar results stay
+// live; the wider the batch, the more texture fetches are in flight per warp
+// (latency hiding). fc_v38mode / fc_v39mode / fc_v40mode (buffer 8):
+//   &2 = in-loop clamp   &4 = no TF   &8 = no comp   &16 = no clamp
+// v38/v39/v40: v36's inline-position batch scaled to 32/48/64-wide.
+// Like v36, each sample address dies at issue so only the scalar results stay
+// live; the wider the batch, the more texture fetches are in flight per warp
+// (latency hiding). fc_v38mode / fc_v39mode / fc_v40mode (buffer 8):
+//   &2 = in-loop clamp   &4 = no TF   &8 = no comp   &16 = no clamp
+#define TFETCHW(k) (noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h) : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s##k) * scalarScale + scalarBias)), 0.5)))
+#define COMPKW(k) { half w##k = 1.0h - accumulatedOpacity; accumulatedColor += w##k * (c##k.rgb * c##k.a); accumulatedOpacity += w##k * c##k.a; }
+
+// v38: 32-wide
+fragment VolumeFragmentOut fragment_march_phase_batch_w32(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    constant int& fixedIterCount [[buffer(3)]],
+    constant int& fc_v38mode [[buffer(8)]]) {
+
+  VolumeFragmentOut output;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 localPos = in.localPos;
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
+  if (!parallel) {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
+    rayDir /= dirLength;
+  }
+
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { output.color = float4(0.0); return output; }
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  const int mode = fc_v38mode;
+  const bool noTF   = (mode & 4) != 0;
+  const bool noComp = (mode & 8) != 0;
+  const bool noClamp = (mode & 16) != 0;
+  const bool inLoopClamp = ((mode & 2) != 0) && !noClamp;
+
+  half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
+  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
+                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+
+  float tStart = dot(s.entryPoint - cameraPos, rayDir);
+  float tEnd = s.totalBoxT;
+  float tTerminateMax = s.tTerminateMax;
+
+  float currentT = stepSize;
+  int maxSteps = max(1, int(ceil((tEnd - stepSize) / stepSize)));
+
+  half3 accumulatedColor = half3(0.0h);
+  half accumulatedOpacity = 0.0h;
+
+  float3 currentPoint = rayOrigin + rayDir * (tStart + stepSize);
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
+  float3 evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+  float3 stepVec = rayDir * stepSize;
+
+  const float3 adjTexMin = ctpOffset;
+  const float3 adjTexMax = ctpOffset + ctpScale;
+  bool seenInBounds = false;
+
+  const int unrollN = 32;
+  int i = 0;
+  const int steps = maxSteps;
+  for (; i + unrollN <= steps; i += unrollN)
+  {
+    if (currentT >= tEnd - 1e-6f) break;
+    if (inLoopClamp) {
+      if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+          any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+        if (seenInBounds) { break; }
+        texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+        evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+      } else {
+        seenInBounds = true;
+      }
+    }
+    float s0  = sampleVolumeScalar(volumeTexture, evalPoint);
+    float s1 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 1.0f);
+    float s2 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 2.0f);
+    float s3 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 3.0f);
+    float s4 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 4.0f);
+    float s5 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 5.0f);
+    float s6 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 6.0f);
+    float s7 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 7.0f);
+    float s8 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 8.0f);
+    float s9 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 9.0f);
+    float s10 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 10.0f);
+    float s11 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 11.0f);
+    float s12 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 12.0f);
+    float s13 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 13.0f);
+    float s14 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 14.0f);
+    float s15 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 15.0f);
+    float s16 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 16.0f);
+    float s17 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 17.0f);
+    float s18 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 18.0f);
+    float s19 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 19.0f);
+    float s20 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 20.0f);
+    float s21 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 21.0f);
+    float s22 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 22.0f);
+    float s23 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 23.0f);
+    float s24 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 24.0f);
+    float s25 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 25.0f);
+    float s26 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 26.0f);
+    float s27 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 27.0f);
+    float s28 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 28.0f);
+    float s29 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 29.0f);
+    float s30 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 30.0f);
+    float s31 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 31.0f);
+    half4 c0 = TFETCHW(0); half4 c1 = TFETCHW(1); half4 c2 = TFETCHW(2); half4 c3 = TFETCHW(3);
+    half4 c4 = TFETCHW(4); half4 c5 = TFETCHW(5); half4 c6 = TFETCHW(6); half4 c7 = TFETCHW(7);
+    half4 c8 = TFETCHW(8); half4 c9 = TFETCHW(9); half4 c10 = TFETCHW(10); half4 c11 = TFETCHW(11);
+    half4 c12 = TFETCHW(12); half4 c13 = TFETCHW(13); half4 c14 = TFETCHW(14); half4 c15 = TFETCHW(15);
+    half4 c16 = TFETCHW(16); half4 c17 = TFETCHW(17); half4 c18 = TFETCHW(18); half4 c19 = TFETCHW(19);
+    half4 c20 = TFETCHW(20); half4 c21 = TFETCHW(21); half4 c22 = TFETCHW(22); half4 c23 = TFETCHW(23);
+    half4 c24 = TFETCHW(24); half4 c25 = TFETCHW(25); half4 c26 = TFETCHW(26); half4 c27 = TFETCHW(27);
+    half4 c28 = TFETCHW(28); half4 c29 = TFETCHW(29); half4 c30 = TFETCHW(30); half4 c31 = TFETCHW(31);
+
+    if (!noComp) {
+      COMPKW(0) COMPKW(1) COMPKW(2) COMPKW(3) COMPKW(4) COMPKW(5) COMPKW(6) COMPKW(7)
+      COMPKW(8) COMPKW(9) COMPKW(10) COMPKW(11) COMPKW(12) COMPKW(13) COMPKW(14) COMPKW(15)
+      COMPKW(16) COMPKW(17) COMPKW(18) COMPKW(19) COMPKW(20) COMPKW(21) COMPKW(22) COMPKW(23)
+      COMPKW(24) COMPKW(25) COMPKW(26) COMPKW(27) COMPKW(28) COMPKW(29) COMPKW(30) COMPKW(31)
+    }
+    currentPoint += stepVec * 32.0f;
+    currentT += stepSize * 32.0f;
+    texLocalPos += texStep * 32.0f;
+    evalPoint += evalStep * 32.0f;
+    if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+    if (currentT >= tTerminateMax) { break; }
+  }
+  for (; i < steps; i++) {
+    if (currentT >= tEnd - 1e-6f) break;
+    if (inLoopClamp) {
+      if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+          any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+        if (seenInBounds) { break; }
+        texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+        evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+      } else {
+        seenInBounds = true;
+      }
+    }
+    float s = sampleVolumeScalar(volumeTexture, evalPoint);
+    half4 c = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+        : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s) * scalarScale + scalarBias)), 0.5));
+    if (!noComp) { half w = 1.0h - accumulatedOpacity; accumulatedColor += w * (c.rgb * c.a); accumulatedOpacity += w * c.a; }
+    currentPoint += stepVec; currentT += stepSize; texLocalPos += texStep; evalPoint += evalStep;
+    if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+    if (currentT >= tTerminateMax) { break; }
+  }
+  output.color = float4(float3(accumulatedColor), accumulatedOpacity);
+  return output;
+}
+
+// v39: 48-wide
+fragment VolumeFragmentOut fragment_march_phase_batch_w48(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    constant int& fixedIterCount [[buffer(3)]],
+    constant int& fc_v39mode [[buffer(8)]]) {
+
+  VolumeFragmentOut output;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 localPos = in.localPos;
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
+  if (!parallel) {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
+    rayDir /= dirLength;
+  }
+
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { output.color = float4(0.0); return output; }
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  const int mode = fc_v39mode;
+  const bool noTF   = (mode & 4) != 0;
+  const bool noComp = (mode & 8) != 0;
+  const bool noClamp = (mode & 16) != 0;
+  const bool inLoopClamp = ((mode & 2) != 0) && !noClamp;
+
+  half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
+  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
+                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+
+  float tStart = dot(s.entryPoint - cameraPos, rayDir);
+  float tEnd = s.totalBoxT;
+  float tTerminateMax = s.tTerminateMax;
+
+  float currentT = stepSize;
+  int maxSteps = max(1, int(ceil((tEnd - stepSize) / stepSize)));
+
+  half3 accumulatedColor = half3(0.0h);
+  half accumulatedOpacity = 0.0h;
+
+  float3 currentPoint = rayOrigin + rayDir * (tStart + stepSize);
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
+  float3 evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+  float3 stepVec = rayDir * stepSize;
+
+  const float3 adjTexMin = ctpOffset;
+  const float3 adjTexMax = ctpOffset + ctpScale;
+  bool seenInBounds = false;
+
+  const int unrollN = 48;
+  int i = 0;
+  const int steps = maxSteps;
+  for (; i + unrollN <= steps; i += unrollN)
+  {
+    if (currentT >= tEnd - 1e-6f) break;
+    if (inLoopClamp) {
+      if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+          any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+        if (seenInBounds) { break; }
+        texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+        evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+      } else {
+        seenInBounds = true;
+      }
+    }
+    float s0  = sampleVolumeScalar(volumeTexture, evalPoint);
+    float s1 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 1.0f);
+    float s2 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 2.0f);
+    float s3 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 3.0f);
+    float s4 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 4.0f);
+    float s5 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 5.0f);
+    float s6 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 6.0f);
+    float s7 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 7.0f);
+    float s8 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 8.0f);
+    float s9 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 9.0f);
+    float s10 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 10.0f);
+    float s11 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 11.0f);
+    float s12 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 12.0f);
+    float s13 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 13.0f);
+    float s14 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 14.0f);
+    float s15 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 15.0f);
+    float s16 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 16.0f);
+    float s17 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 17.0f);
+    float s18 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 18.0f);
+    float s19 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 19.0f);
+    float s20 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 20.0f);
+    float s21 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 21.0f);
+    float s22 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 22.0f);
+    float s23 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 23.0f);
+    float s24 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 24.0f);
+    float s25 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 25.0f);
+    float s26 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 26.0f);
+    float s27 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 27.0f);
+    float s28 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 28.0f);
+    float s29 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 29.0f);
+    float s30 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 30.0f);
+    float s31 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 31.0f);
+    float s32 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 32.0f);
+    float s33 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 33.0f);
+    float s34 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 34.0f);
+    float s35 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 35.0f);
+    float s36 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 36.0f);
+    float s37 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 37.0f);
+    float s38 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 38.0f);
+    float s39 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 39.0f);
+    float s40 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 40.0f);
+    float s41 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 41.0f);
+    float s42 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 42.0f);
+    float s43 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 43.0f);
+    float s44 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 44.0f);
+    float s45 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 45.0f);
+    float s46 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 46.0f);
+    float s47 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 47.0f);
+    half4 c0 = TFETCHW(0); half4 c1 = TFETCHW(1); half4 c2 = TFETCHW(2); half4 c3 = TFETCHW(3);
+    half4 c4 = TFETCHW(4); half4 c5 = TFETCHW(5); half4 c6 = TFETCHW(6); half4 c7 = TFETCHW(7);
+    half4 c8 = TFETCHW(8); half4 c9 = TFETCHW(9); half4 c10 = TFETCHW(10); half4 c11 = TFETCHW(11);
+    half4 c12 = TFETCHW(12); half4 c13 = TFETCHW(13); half4 c14 = TFETCHW(14); half4 c15 = TFETCHW(15);
+    half4 c16 = TFETCHW(16); half4 c17 = TFETCHW(17); half4 c18 = TFETCHW(18); half4 c19 = TFETCHW(19);
+    half4 c20 = TFETCHW(20); half4 c21 = TFETCHW(21); half4 c22 = TFETCHW(22); half4 c23 = TFETCHW(23);
+    half4 c24 = TFETCHW(24); half4 c25 = TFETCHW(25); half4 c26 = TFETCHW(26); half4 c27 = TFETCHW(27);
+    half4 c28 = TFETCHW(28); half4 c29 = TFETCHW(29); half4 c30 = TFETCHW(30); half4 c31 = TFETCHW(31);
+    half4 c32 = TFETCHW(32); half4 c33 = TFETCHW(33); half4 c34 = TFETCHW(34); half4 c35 = TFETCHW(35);
+    half4 c36 = TFETCHW(36); half4 c37 = TFETCHW(37); half4 c38 = TFETCHW(38); half4 c39 = TFETCHW(39);
+    half4 c40 = TFETCHW(40); half4 c41 = TFETCHW(41); half4 c42 = TFETCHW(42); half4 c43 = TFETCHW(43);
+    half4 c44 = TFETCHW(44); half4 c45 = TFETCHW(45); half4 c46 = TFETCHW(46); half4 c47 = TFETCHW(47);
+
+    if (!noComp) {
+      COMPKW(0) COMPKW(1) COMPKW(2) COMPKW(3) COMPKW(4) COMPKW(5) COMPKW(6) COMPKW(7)
+      COMPKW(8) COMPKW(9) COMPKW(10) COMPKW(11) COMPKW(12) COMPKW(13) COMPKW(14) COMPKW(15)
+      COMPKW(16) COMPKW(17) COMPKW(18) COMPKW(19) COMPKW(20) COMPKW(21) COMPKW(22) COMPKW(23)
+      COMPKW(24) COMPKW(25) COMPKW(26) COMPKW(27) COMPKW(28) COMPKW(29) COMPKW(30) COMPKW(31)
+      COMPKW(32) COMPKW(33) COMPKW(34) COMPKW(35) COMPKW(36) COMPKW(37) COMPKW(38) COMPKW(39)
+      COMPKW(40) COMPKW(41) COMPKW(42) COMPKW(43) COMPKW(44) COMPKW(45) COMPKW(46) COMPKW(47)
+    }
+    currentPoint += stepVec * 48.0f;
+    currentT += stepSize * 48.0f;
+    texLocalPos += texStep * 48.0f;
+    evalPoint += evalStep * 48.0f;
+    if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+    if (currentT >= tTerminateMax) { break; }
+  }
+  for (; i < steps; i++) {
+    if (currentT >= tEnd - 1e-6f) break;
+    if (inLoopClamp) {
+      if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+          any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+        if (seenInBounds) { break; }
+        texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+        evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+      } else {
+        seenInBounds = true;
+      }
+    }
+    float s = sampleVolumeScalar(volumeTexture, evalPoint);
+    half4 c = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+        : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s) * scalarScale + scalarBias)), 0.5));
+    if (!noComp) { half w = 1.0h - accumulatedOpacity; accumulatedColor += w * (c.rgb * c.a); accumulatedOpacity += w * c.a; }
+    currentPoint += stepVec; currentT += stepSize; texLocalPos += texStep; evalPoint += evalStep;
+    if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+    if (currentT >= tTerminateMax) { break; }
+  }
+  output.color = float4(float3(accumulatedColor), accumulatedOpacity);
+  return output;
+}
+
+// v40: 64-wide
+fragment VolumeFragmentOut fragment_march_phase_batch_w64(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    constant int& fixedIterCount [[buffer(3)]],
+    constant int& fc_v40mode [[buffer(8)]]) {
+
+  VolumeFragmentOut output;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 localPos = in.localPos;
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
+  if (!parallel) {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
+    rayDir /= dirLength;
+  }
+
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { output.color = float4(0.0); return output; }
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  const int mode = fc_v40mode;
+  const bool noTF   = (mode & 4) != 0;
+  const bool noComp = (mode & 8) != 0;
+  const bool noClamp = (mode & 16) != 0;
+  const bool inLoopClamp = ((mode & 2) != 0) && !noClamp;
+
+  half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
+  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
+                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+
+  float tStart = dot(s.entryPoint - cameraPos, rayDir);
+  float tEnd = s.totalBoxT;
+  float tTerminateMax = s.tTerminateMax;
+
+  float currentT = stepSize;
+  int maxSteps = max(1, int(ceil((tEnd - stepSize) / stepSize)));
+
+  half3 accumulatedColor = half3(0.0h);
+  half accumulatedOpacity = 0.0h;
+
+  float3 currentPoint = rayOrigin + rayDir * (tStart + stepSize);
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
+  float3 evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+  float3 stepVec = rayDir * stepSize;
+
+  const float3 adjTexMin = ctpOffset;
+  const float3 adjTexMax = ctpOffset + ctpScale;
+  bool seenInBounds = false;
+
+  const int unrollN = 64;
+  int i = 0;
+  const int steps = maxSteps;
+  for (; i + unrollN <= steps; i += unrollN)
+  {
+    if (currentT >= tEnd - 1e-6f) break;
+    if (inLoopClamp) {
+      if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+          any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+        if (seenInBounds) { break; }
+        texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+        evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+      } else {
+        seenInBounds = true;
+      }
+    }
+    float s0  = sampleVolumeScalar(volumeTexture, evalPoint);
+    float s1 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 1.0f);
+    float s2 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 2.0f);
+    float s3 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 3.0f);
+    float s4 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 4.0f);
+    float s5 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 5.0f);
+    float s6 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 6.0f);
+    float s7 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 7.0f);
+    float s8 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 8.0f);
+    float s9 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 9.0f);
+    float s10 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 10.0f);
+    float s11 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 11.0f);
+    float s12 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 12.0f);
+    float s13 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 13.0f);
+    float s14 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 14.0f);
+    float s15 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 15.0f);
+    float s16 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 16.0f);
+    float s17 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 17.0f);
+    float s18 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 18.0f);
+    float s19 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 19.0f);
+    float s20 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 20.0f);
+    float s21 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 21.0f);
+    float s22 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 22.0f);
+    float s23 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 23.0f);
+    float s24 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 24.0f);
+    float s25 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 25.0f);
+    float s26 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 26.0f);
+    float s27 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 27.0f);
+    float s28 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 28.0f);
+    float s29 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 29.0f);
+    float s30 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 30.0f);
+    float s31 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 31.0f);
+    float s32 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 32.0f);
+    float s33 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 33.0f);
+    float s34 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 34.0f);
+    float s35 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 35.0f);
+    float s36 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 36.0f);
+    float s37 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 37.0f);
+    float s38 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 38.0f);
+    float s39 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 39.0f);
+    float s40 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 40.0f);
+    float s41 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 41.0f);
+    float s42 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 42.0f);
+    float s43 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 43.0f);
+    float s44 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 44.0f);
+    float s45 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 45.0f);
+    float s46 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 46.0f);
+    float s47 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 47.0f);
+    float s48 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 48.0f);
+    float s49 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 49.0f);
+    float s50 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 50.0f);
+    float s51 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 51.0f);
+    float s52 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 52.0f);
+    float s53 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 53.0f);
+    float s54 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 54.0f);
+    float s55 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 55.0f);
+    float s56 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 56.0f);
+    float s57 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 57.0f);
+    float s58 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 58.0f);
+    float s59 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 59.0f);
+    float s60 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 60.0f);
+    float s61 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 61.0f);
+    float s62 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 62.0f);
+    float s63 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * 63.0f);
+    half4 c0 = TFETCHW(0); half4 c1 = TFETCHW(1); half4 c2 = TFETCHW(2); half4 c3 = TFETCHW(3);
+    half4 c4 = TFETCHW(4); half4 c5 = TFETCHW(5); half4 c6 = TFETCHW(6); half4 c7 = TFETCHW(7);
+    half4 c8 = TFETCHW(8); half4 c9 = TFETCHW(9); half4 c10 = TFETCHW(10); half4 c11 = TFETCHW(11);
+    half4 c12 = TFETCHW(12); half4 c13 = TFETCHW(13); half4 c14 = TFETCHW(14); half4 c15 = TFETCHW(15);
+    half4 c16 = TFETCHW(16); half4 c17 = TFETCHW(17); half4 c18 = TFETCHW(18); half4 c19 = TFETCHW(19);
+    half4 c20 = TFETCHW(20); half4 c21 = TFETCHW(21); half4 c22 = TFETCHW(22); half4 c23 = TFETCHW(23);
+    half4 c24 = TFETCHW(24); half4 c25 = TFETCHW(25); half4 c26 = TFETCHW(26); half4 c27 = TFETCHW(27);
+    half4 c28 = TFETCHW(28); half4 c29 = TFETCHW(29); half4 c30 = TFETCHW(30); half4 c31 = TFETCHW(31);
+    half4 c32 = TFETCHW(32); half4 c33 = TFETCHW(33); half4 c34 = TFETCHW(34); half4 c35 = TFETCHW(35);
+    half4 c36 = TFETCHW(36); half4 c37 = TFETCHW(37); half4 c38 = TFETCHW(38); half4 c39 = TFETCHW(39);
+    half4 c40 = TFETCHW(40); half4 c41 = TFETCHW(41); half4 c42 = TFETCHW(42); half4 c43 = TFETCHW(43);
+    half4 c44 = TFETCHW(44); half4 c45 = TFETCHW(45); half4 c46 = TFETCHW(46); half4 c47 = TFETCHW(47);
+    half4 c48 = TFETCHW(48); half4 c49 = TFETCHW(49); half4 c50 = TFETCHW(50); half4 c51 = TFETCHW(51);
+    half4 c52 = TFETCHW(52); half4 c53 = TFETCHW(53); half4 c54 = TFETCHW(54); half4 c55 = TFETCHW(55);
+    half4 c56 = TFETCHW(56); half4 c57 = TFETCHW(57); half4 c58 = TFETCHW(58); half4 c59 = TFETCHW(59);
+    half4 c60 = TFETCHW(60); half4 c61 = TFETCHW(61); half4 c62 = TFETCHW(62); half4 c63 = TFETCHW(63);
+
+    if (!noComp) {
+      COMPKW(0) COMPKW(1) COMPKW(2) COMPKW(3) COMPKW(4) COMPKW(5) COMPKW(6) COMPKW(7)
+      COMPKW(8) COMPKW(9) COMPKW(10) COMPKW(11) COMPKW(12) COMPKW(13) COMPKW(14) COMPKW(15)
+      COMPKW(16) COMPKW(17) COMPKW(18) COMPKW(19) COMPKW(20) COMPKW(21) COMPKW(22) COMPKW(23)
+      COMPKW(24) COMPKW(25) COMPKW(26) COMPKW(27) COMPKW(28) COMPKW(29) COMPKW(30) COMPKW(31)
+      COMPKW(32) COMPKW(33) COMPKW(34) COMPKW(35) COMPKW(36) COMPKW(37) COMPKW(38) COMPKW(39)
+      COMPKW(40) COMPKW(41) COMPKW(42) COMPKW(43) COMPKW(44) COMPKW(45) COMPKW(46) COMPKW(47)
+      COMPKW(48) COMPKW(49) COMPKW(50) COMPKW(51) COMPKW(52) COMPKW(53) COMPKW(54) COMPKW(55)
+      COMPKW(56) COMPKW(57) COMPKW(58) COMPKW(59) COMPKW(60) COMPKW(61) COMPKW(62) COMPKW(63)
+    }
+    currentPoint += stepVec * 64.0f;
+    currentT += stepSize * 64.0f;
+    texLocalPos += texStep * 64.0f;
+    evalPoint += evalStep * 64.0f;
+    if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+    if (currentT >= tTerminateMax) { break; }
+  }
+  for (; i < steps; i++) {
+    if (currentT >= tEnd - 1e-6f) break;
+    if (inLoopClamp) {
+      if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+          any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+        if (seenInBounds) { break; }
+        texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+        evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+      } else {
+        seenInBounds = true;
+      }
+    }
+    float s = sampleVolumeScalar(volumeTexture, evalPoint);
+    half4 c = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+        : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s) * scalarScale + scalarBias)), 0.5));
+    if (!noComp) { half w = 1.0h - accumulatedOpacity; accumulatedColor += w * (c.rgb * c.a); accumulatedOpacity += w * c.a; }
+    currentPoint += stepVec; currentT += stepSize; texLocalPos += texStep; evalPoint += evalStep;
+    if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+    if (currentT >= tTerminateMax) { break; }
+  }
+  output.color = float4(float3(accumulatedColor), accumulatedOpacity);
+  return output;
+}
+
+#undef TFETCHW
+#undef COMPKW
+
+
+
+
 // v21: clone of fragment_march_linear_fixedN (v7) but clamp the sample
 // (the sampler's clamp_to_edge slow path) are what cause the ~100ms floor.
 fragment VolumeFragmentOut fragment_march_linear_clamp(
