@@ -96,11 +96,17 @@ shaders whenever the scene/mapper config changes.
 
 ## Metal optimization experiment results (2026-08, M2 MBA, interleaved A/B)
 
-All runs: fresh, short (30 timed frames), interleaved to cancel thermal drift;
-`gl_gap` reference in the same session: **57.8 ms / 45.6 M samples**
-(659.2 avg steps x 69,861 marched pixels). Metal geometry was identical
-across every fragment variant (avgIter 287.8 over 69,861 marched pixels =
-45.6 M samples - **exactly equal to GL/fp64**, see the parity note below).
+All runs: fresh, short (30 timed frames), interleaved to cancel thermal drift.
+Metal geometry was identical across every fragment variant (avgIter 287.8 over
+69,861 marched pixels = 45.6 M samples - **exactly equal to GL/fp64**, see the
+parity note below).
+
+**Orientation-matched GL reference (`flipY=1`)**: GL's default window origin is
+bottom-left, Metal's top-left, and `gl_gap` row order matters for GL's absolute
+time (~6 ms, ~10%): flipY=0 is 62.1 ms, flipY=1 is 67.9 ms (per-pixel
+identical to Metal's orientation, 159,990/160,000 pixels). The fair
+app-normalized comparison is **GL flipY=1 ~67.9 ms vs Metal ~86.3 ms =
+~1.27x / ~18 ms**, not the ~1.4x implied by the old flipY=0 baseline.
 
 | variant | avg frame (rounds) |
 |---|---|
@@ -112,6 +118,12 @@ across every fragment variant (avgIter 287.8 over 69,861 marched pixels =
 | fragment, float, **`fastMathEnabled=NO`** | **77.8 / 78.7 / 79.4 / 79.6 / 79.9** |
 | **compute kernel**, float | 97.9 / 98.0 / 99.2 |
 | **compute kernel**, half | 95.3 / 95.8 / 96.7 |
+
+**Non-power-of-two depth test (does NOT explain the gap):** raising `kD` from
+1794 to 2048 (PoT) keeps the ratio ~identical: GL flipY=1 78.6 ms vs Metal
+100.2 ms = **1.27x**, the same 1.27x as at 1794. Both backends scale ~linearly
+with the +14% footprint (GL +16%, Metal +16%), so tiling/PoT padding is not
+the source of the ratio.
 
 Conclusions, addressing the four hypotheses:
 

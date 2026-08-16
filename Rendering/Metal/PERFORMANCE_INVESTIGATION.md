@@ -792,3 +792,33 @@ So the harnesses trace identical rays with identical step counts and identical
 fetches; the residual ~30 ms (57.8 ms GL vs 84-87 ms Metal) is pure GPU
 execution cost for the same work, and the fastMath result in section 11 is not
 a measurement artifact.
+
+## 13. Orientation-matched GL baseline and the non-PoT-depth test
+
+Two follow-up tests prompted by an external review of section 12:
+
+**GL row order matters for GL's absolute time (~10%).** `gl_gap`'s `flipY`
+only permutes which pixel traces which ray, so the ray multiset (and avgIter,
+287.8) is invariant. But the *spatial coherence* of adjacent pixels' marches
+through the 448 MB volume changes, and GL pays ~6 ms (62.1 vs 67.9 ms,
+5 interleaved rounds) when tracing Metal's row order. Per-pixel comparison
+confirms `flipY=1` reproduces Metal's exact orientation (159,990/160,000
+pixels identical; the row-flipped mapping is garbage). The fair, app-normalized
+comparison is therefore **GL `flipY=1` ~67.9 ms vs Metal ~86.3 ms = ~1.27x /
+~18 ms**, narrower than the ~1.4x implied by the old `flipY=0` baseline but
+still substantial. All Metal-side experiment conclusions in section 11 are
+unaffected (they never touch the GL reference).
+
+**Non-power-of-two depth (D=1794) is not the cause.** The harness uses the
+app's real `kD=1794`. Raising it to `kD=2048` (PoT) keeps the same-orientation
+ratio essentially unchanged: GL 78.6 ms vs Metal 100.2 ms = **1.27x**, matching
+the 1.27x at 1794. Both backends scale proportionally with the +14% footprint
+(GLM +16%, Metal +16%), so 3-D tiling / PoT padding does not explain the gap.
+
+Together with section 11's null results (half sampler, LOD, depth action,
+compute, fastMath-in-app), the remaining candidates for the fixed ~1.27x
+per-sample factor are Metal-side instruction scheduling / divergence handling
+(sections 4 and 9), not memory bandwidth: GL and Metal share the same L2 and
+Unified Memory on the M2, so a DRAM-bound workload would show identical times,
+and nearest-sampling throughput is already at parity (GL 0.97 vs Metal
+1.01 ns/sample).
