@@ -137,6 +137,14 @@ enum VolumeShaderFeatureFlags : uint32_t
   //   7 = 4x unrolled march
   VolumeFeature_MarchVariantShift = 24,
   VolumeFeature_MarchVariantMask  = 0xFu << VolumeFeature_MarchVariantShift,
+  // Composite slab tiling (VTK_METAL_TEST_NUM_SLABS > 1). Baked via fc_slabMode
+  // so non-slab pipelines compile the slab-index partition out of the hot loop.
+  // Each slab pass composites only a ray-length-fraction index range from zero
+  // and the mapper combines the partials with (ONE, ONE_MINUS_SRC_ALPHA)
+  // blending; the associative front-to-back `over` makes the result equal to a
+  // single-pass composite up to fp rounding (PERFORMANCE_INVESTIGATION /
+  // minimal_gap phase-2). Only applies to the blended direct-render paths.
+  VolumeFeature_Slab = 1u << 28,
 };
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -505,7 +513,7 @@ private:
   void BindEncoderResources(void* encoder, void* uniformBuf, void* pipelineState = nullptr,
     bool hasDepth = false);
   void DrawBlocks(void* encoder, void* uniformBuf, vtkRenderer* ren, vtkVolume* vol,
-    void* uniforms, vtkMatrix4x4* invModelMatrix);
+    void* uniforms, vtkMatrix4x4* invModelMatrix, int slabIndex = 0, int slabCount = 1);
   // Fullscreen camera-inside draw path.
   // Renders each non-empty brick using a fullscreen triangle (vertex_fullscreen_main +
   // fragment_volume_fullscreen_main) instead of proxy geometry. No vertex/index buffers

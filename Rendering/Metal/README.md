@@ -104,3 +104,34 @@ thresholded error (0.498).
   default (nearest) properties.
 - Re-generating the baseline from a nearest render would instead keep Metal and
   GL aligned with each other.
+
+## Volume rendering performance: composite slab tiling
+
+`vtkMetalGPUVolumeRayCastMapper` splits each ray into **8 front-to-back slab
+passes** by default. Each pass composites only a ray-length-fraction index
+range `[ceil(j·maxSteps/K), ceil((j+1)·maxSteps/K))` starting from transparent;
+the K partial composites are accumulated by the pipeline's existing
+`(ONE, ONE_MINUS_SRC_ALPHA)` hardware blend. Because premultiplied front-to-back
+`over` is associative, the combined result equals a single-pass composite up to
+fp rounding. The per-slab working set is small enough to stay cache-resident on
+Apple SoCs, which is decisive on the raw (minmax-off) coarse-sample-distance
+path that previously lost to OpenGL by 1.3-1.8x:
+
+- 400x400 minmax-on: 24.7 -> 15.1 ms (Metal/GL 0.30)
+- 2048x2048 SD4 minmax-off: 87.7 -> 44.2 ms (Metal/GL 1.75x loss -> 0.87x win)
+
+Controls and behavior:
+
+- `VTK_METAL_TEST_NUM_SLABS` overrides the default 8 (1 = the bit-identical
+  single-pass parity path; clamped to [1,32]).
+- Slabs apply only to the blended direct-render paths (proxy geometry and
+  camera-inside fullscreen) in composite blend mode; offscreen render-to-image,
+  grid-traversal, selection, and non-composite blend modes stay single-pass.
+- Output stays within the existing GL-vs-Metal thresholded parity (0.000); the
+  direct path's 8-bit drawable quantizes per slab, so Metal-vs-single-pass can
+  differ by up to ~19/255 on a few percent of pixels.
+
+See `PERFORMANCE_INVESTIGATION.md` ("App implementation: composite slab tiling")
+for the full measured table and future performance/correctness leads (float
+accumulation RT for byte-exactness, K scaling at high res, minmax+slab
+stacking).

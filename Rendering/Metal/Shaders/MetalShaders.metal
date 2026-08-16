@@ -2711,6 +2711,15 @@ constant bool fc_blanking [[function_constant(28)]];
 //       MSL backend overlaps the fetches; output-equivalent to sVolume sampling).
 //   2 = clamp_to_zero volume sampler (in-shader clamp preserves edge behavior).
 constant int fc_marchVariant [[function_constant(29)]];
+// Composite slab tiling (VTK_METAL_TEST_NUM_SLABS > 1): each pass composites
+// only a ray-length-fraction index range [ceil(idx*maxSteps/K), ceil((idx+1)*
+// maxSteps/K)) from zero, and the mapper combines the partials with
+// (ONE, ONE_MINUS_SRC_ALPHA) hardware blending. Front-to-back premultiplied
+// `over` is associative, so the combined result equals a single-pass composite
+// up to fp rounding (PERFORMANCE_INVESTIGATION.md / minimal_gap phase-2). The
+// block is dead-code-eliminated when the flag is clear, so non-slab pipelines
+// are bit-identical to the previous code.
+constant int fc_slabMode [[function_constant(30)]];
 
 // ============================================================================
 // Volume Ray Casting Mapper
@@ -2953,6 +2962,7 @@ struct PerBlockData {
   float4 textureBoundsMax;
   float4 gradientStep;  // xyz + pad
   float4 minMaxInfo;    // useMinMax, dimX, dimY, dimZ
+  float4 slabInfo;      // slabIndex, slabCount, pad, pad (fc_slabMode)
 };
 
 vertex VolumeVertexOut vertex_volume_main(
@@ -4135,6 +4145,31 @@ inline half4 marchVolumeUnified(
   {
     mainSteps = int(volumeUniforms.maxStepsFrame);
     maxSteps = max(maxSteps, mainSteps);
+  }
+
+  // Composite slab tiling (fc_slabMode, VTK_METAL_TEST_NUM_SLABS > 1): the
+  // ray's sample indices [0, maxSteps) are partitioned into slabCount equal
+  // index ranges via shared ceilings, so consecutive passes start on the same
+  // ceil() of the same lattice and the slab sample sets tile the full ray
+  // exactly (minimal_gap phase-2 kEndT). Each pass composites only its interval
+  // from zero; the mapper combines the partials across passes with
+  // (ONE, ONE_MINUS_SRC_ALPHA) blending. Front-to-back premultiplied `over` is
+  // associative, so the combined result equals a single-pass composite up to fp
+  // rounding. currentT is an index-offset accumulator, so re-anchoring to the
+  // slab's first sample keeps comparisons and the tEnd break consistent. Dead-
+  // code-eliminated when the flag is clear. Variants 4/5 (uniform frame-max
+  // bound) are excluded: their bound is frame-uniform, not per-fragment.
+  if (fc_slabMode && fc_marchVariant != 4 && fc_marchVariant != 5)
+  {
+    const float K = max(b.slabInfo.y, 1.0f);
+    const float idx = clamp(b.slabInfo.x, 0.0f, K - 1.0f);
+    const int kStart = int(ceil(idx * float(maxSteps) / K));
+    const int kEnd = int(ceil((idx + 1.0f) * float(maxSteps) / K));
+    firstT += float(kStart) * p.stepSize;
+    currentT = firstT;
+    currentPoint = p.rayOrigin + p.rayDir * (p.checkBounds ? p.tStart : 0.0)
+                 + p.rayDir * firstT;
+    maxSteps = max(kEnd - kStart, 0);
   }
 
   half3 accumulatedColor = initialColor;

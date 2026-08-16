@@ -1232,16 +1232,92 @@ VALIDATED FIX: depth-sliced (slab) rendering.
     slab shaders, making exactness free.
   - unroll (pipeline=8) does NOT stack with slabs: the cache fix subsumes it.
 
-APP IMPLEMENTATION NOTES (next step, not yet done):
-  - vtkMetalGPUVolumeRayCastMapper renders single-pass front-to-back
-    compositing today. Slab mode = K passes with tStart/tExit clamped per
-    slab, accumulated order-dependently (the app composites, not max-project).
-  - Implementation choices to verify in-app: per-slab PSO vs uniform-driven
-    clamp; float accumulation RT (blend) vs ping-pong textures (the minmax
-    path could reuse the same machinery).
-  - Expected win at the worst cell (raw 2048/SD4, currently 94ms in-app vs GL
-    54ms): ~3x to ~17ms, flipping the 1.75x loss into a clear Metal win.
+====================================================================
+APP IMPLEMENTATION: COMPOSITE SLAB TILING (2026-08, DONE)
+====================================================================
+The harness fix is now ported into vtkMetalGPUVolumeRayCastMapper as an
+env-gated composite-compatible tiling (the app composites front-to-back, it
+does not max-project, so the harness's max-blend maccum does not transfer).
+
+Design:
+  - Composite-compatible: premultiplied front-to-back `over` is associative, so
+    each slab pass composites only its interval starting from transparent and
+    the K passes are combined by the existing (ONE, ONE_MINUS_SRC_ALPHA)
+    hardware blend on the direct path (DirectScreen/FullscreenDirect pipelines
+    already carry exactly that blend). Result equals a single-pass composite up
+    to fp rounding, with no extra combine pass.
+  - Slab partition: per-fragment ray-length-fraction index ranges via shared
+    ceilings, kStart = ceil(j*maxSteps/K), kEnd = ceil((j+1)*maxSteps/K). The
+    union of per-slab index sets equals single-pass's [0, maxSteps) exactly
+    (no skipped/duplicated samples, no camera/axis/order math, always
+    front-to-back). The march is re-anchored to firstT + kStart*stepSize and
+    maxSteps is re-set to kEnd-kStart.
+  - Plumbing: PerBlockData gained a slabInfo float4; the march splits in a
+    fc_slabMode-gated block (function_constant 30) placed after the variant-4/5
+    overrides and dead-code-eliminated when clear (so numSlabs=1 compiles the
+    old code bit-for-bit). Mapper: VolumeFeature_Slab (bit 28) decoded into
+    fc_slabMode; static VolumeSlabCount() reads VTK_METAL_TEST_NUM_SLABS
+    (default 8, clamped [1,32]); the direct proxy-geometry and camera-inside
+    fullscreen draws loop over K slab passes. Offscreen/RTT/grid-traversal/
+    selection pipelines stay single-pass (no blend there), as do non-composite
+    blend modes (max/min/avg/additive are not `over`-associative in one RT).
+    Variants 4/5 (uniform frame-max bound) are excluded in the shader.
+
+Measured (vtkMetalGLVisualComparison --bench, DICOM IMRToraceAddome, M2):
+
+  | config                        | GL    | slabs=1 | slabs=8 | M/GL  |
+  |-------------------------------|-------|---------|---------|-------|
+  | 400x400, minmax on (default)  | 49.7  | 24.7    | 15.1    | 0.30  |
+  | 1024x1024, SD2, minmax off    | 44.4  | 68.5    | 29.6    | 0.67  |
+  | 2048x2048, SD2, minmax off    | 66.2  | 108.8   | 51.3    | 0.77  |
+  | 1024x1024, SD4, minmax off    | 35.9  | 51.8    | 25.6    | 0.71  |
+  | 2048x2048, SD4, minmax off    | 51.0  | 87.7    | 44.2    | 0.87  |
+
+  Every previously Metal-losing regime (raw path, coarse SD, high res — the
+  cache/DRAM working-set cells) flips from M/GL 1.35-1.75x to 0.67-0.89x.
+  Thresholded GL-vs-Metal image error stays 0.000 in all configs; the absolute
+  error (741-743) is unchanged, i.e. the slab output is as close to GL as the
+  single-pass output was.
+
+Correctness caveat (direct path only):
+  - The direct path renders to an 8-bit BGRA drawable, so each slab's partial
+    composite is quantized to 8-bit before the blend accumulates it. Metal-vs-
+    Metal single-pass comparison shows up to 19/255 difference on ~8% of pixels
+    (same order as the pre-existing single-pass-vs-GL spread; thresholded error
+    unchanged). numSlabs=1 remains byte-identical to the pre-change build
+    (verified 0 diff), and the harness's float-accumulation results were
+    pixel-exact (1/4,194,304 pixel at K=8), confirming the 8-bit per-slab
+    quantization — not the partition math — is the only new error source.
+
+FUTURE LEADS (performance):
+  - The harness reached ~5x (Metal slab 8.6ms vs GL single-pass 44ms) with a
+    lean fma-only shader and a float slab RT; the app currently gets 1.1-3.3x.
+    The residual gap is the full app shader machinery (TF sampling, minmax
+    walk, lighting plumbing) plus the ~6ms app/framework plumbing overhead per
+    frame (section 17.2).
+  - Float accumulation RT (offscreen RGBA16Float + blend, then one present
+    pass) would remove the per-slab 8-bit quantization (see caveat above) and
+    is the cleanest path to byte-exact single-pass parity at K>1. The offscreen
+    image-sampling path's machinery could be reused.
   - Z-position cost gradient (slab[0] fastest, slab[6] slowest, both backends)
-    is a swizzle/memory-order property; pass order should be chosen to put
-    cheap slabs first where possible (irrelevant for compositing order, which
-    is fixed front-to-back).
+    is a swizzle/memory-order property; front-to-back composite order is fixed,
+    but a max-blend/MIP slab pass could choose a cheaper slab order.
+  - Higher K: flat at 400x400 beyond 8; untested at 2048+ where the per-pass
+    working set is larger — K=16/32 may extend the win at very high res.
+  - minmax + slabs may stack further on very large volumes (the minmax walk
+    already skips empty macrocells; slabs additionally shrink the per-pass
+    working set). Not yet measured.
+  - The phase-2 harness finding that indexing sample positions as
+    tStart + float(i)*stepSize (mul-add) makes exactness free still applies;
+    variant 9 already uses mul-add-style inline sampling, so the slab re-anchor
+    is cheap (~no warmup in the app).
+
+FUTURE LEADS (correctness):
+  - Byte-exact single-pass parity at K>1 requires the float accumulation RT
+    (above); with the 8-bit direct path the only mismatch is the per-slab
+    quantization.
+  - fastMath=1 is required for lattice alignment across slab boundaries
+    (harness bug #4); the app shader already compiles with fast math enabled.
+  - The residual absolute error (741-743, thresholded 0.000) is the fp16
+    accumulator-vs-GL ordering spread; a full fp32 composite accumulator would
+    close it at some throughput cost, independent of slab tiling.

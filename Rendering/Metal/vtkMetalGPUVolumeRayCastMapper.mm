@@ -347,6 +347,29 @@ static int VolumeMarchVariant()
   return variant;
 }
 
+// Composite slab count from VTK_METAL_TEST_NUM_SLABS (default 8). N > 1 splits
+// each ray into N ray-length-fraction index ranges (ceil(j*maxSteps/N) ..
+// ceil((j+1)*maxSteps/N) for j in [0,N)) and renders N front-to-back passes
+// whose partial composites are combined by (ONE, ONE_MINUS_SRC_ALPHA) hardware
+// blending. Front-to-back premultiplied `over` is associative, so the result
+// equals a single-pass composite up to fp rounding. Depth-sliced marching keeps
+// the volume working set cache-resident, which is decisive on the raw (minmax
+// off) coarse-sample-distance path where a single full-ray pass exceeds the
+// M2/Apple SoC cache and Metal loses to GL by 1.3-1.8x (PERFORMANCE_INVESTIGATION
+// "raw-path coarse-SD lag"); with 8 slabs those regimes flip to Metal winning
+// (2048x2048/SD4: 88-93ms -> 44ms vs GL 50-53ms, M/GL 0.83-0.89). Reads the env
+// var once per process; clamped to [1, 32]. 1 restores the bit-identical
+// single-pass parity path.
+static int VolumeSlabCount()
+{
+  static const int count = [] {
+    if (const char* v = getenv("VTK_METAL_TEST_NUM_SLABS"))
+      return std::max(1, std::min(std::atoi(v), 32));
+    return 8;
+  }();
+  return count;
+}
+
 // Fixed uniform iteration count for the variant-4 non-divergent march
 // (VTK_METAL_TEST_MARCH_STEPS). 0 = compute a frame-max bound from the camera
 // instead. Reads the env var once per process.
@@ -469,10 +492,11 @@ struct PerBlockData {
   float TextureBoundsMax[4]; // 48..63
   float GradientStep[4];    // 64..79  (xyz + pad)
   float MinMaxInfo[4];      // 80..95  (useMinMax, dimX, dimY, dimZ)
+  float SlabInfo[4];        // 96..111 (slabIndex, slabCount, pad, pad)
 };
 
-static_assert(sizeof(PerBlockData) == 96,
-  "PerBlockData must be 96 bytes to match Metal shader struct");
+static_assert(sizeof(PerBlockData) == 112,
+  "PerBlockData must be 112 bytes to match Metal shader struct");
 
 // Must match Metal GridTraversalUniforms struct
 struct GridTraversalUniforms {
@@ -6103,6 +6127,12 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     [constants setConstantValue:&marchVariant type:MTLDataTypeInt
                        withName:@"fc_marchVariant"];
 
+    // Composite slab tiling (fc_slabMode): decoded from the VolumeFeature_Slab
+    // bit. When clear (numSlabs=1, the default) the shader compiles the slab
+    // index partition out entirely, so non-slab pipelines are bit-identical.
+    int slabMode = (featureMask & VolumeFeature_Slab) ? 1 : 0;
+    [constants setConstantValue:&slabMode type:MTLDataTypeInt withName:@"fc_slabMode"];
+
     // Blend mode function constant: 0=composite, 1=MIP, 2=MinIP, 3=AverageIP,
     // 4=additive (vtkVolumeMapper::BlendMode). Encoded in the feature mask so
     // each blend mode gets its own specialized pipeline.
@@ -6121,10 +6151,10 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
       fprintf(stderr,
         "[march] variant=%d blendMode=%d shading=%d gradOp=%d minmax=%d "
         "mask=%d blanking=%d crop=%d rect=%d tf2d=%d indep=%d depRGBA=%d depLA=%d "
-        "rt=%d (unrolled-activates=%d)\n",
+        "rt=%d slab=%d (unrolled-activates=%d)\n",
         marchVariant, blendMode, shading, gradOp, minmax, mask, blanking, cropping,
         rectilinear, transfer2D, independentComp, dependentRGBA, dependentLA,
-        renderToTexture,
+        renderToTexture, slabMode,
         (marchVariant >= 6 && blendMode == 0 && !cropping && !mask && !blanking &&
          !rectilinear && !transfer2D && !independentComp && !dependentRGBA && !dependentLA));
 
@@ -6455,7 +6485,8 @@ void vtkMetalGPUVolumeRayCastMapper::BuildGlobalPerBlockData(
 void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
   void* encoderVoid, void* uniformBufVoid, vtkRenderer* vtkNotUsed(ren),
   vtkVolume* vtkNotUsed(vol),
-  void* uniformsVoid, vtkMatrix4x4* vtkNotUsed(invModelMatrix))
+  void* uniformsVoid, vtkMatrix4x4* vtkNotUsed(invModelMatrix),
+  int slabIndex, int slabCount)
 {
   id<MTLRenderCommandEncoder> encoder =
     (__bridge id<MTLRenderCommandEncoder>)encoderVoid;
@@ -6465,6 +6496,8 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
 
   PerBlockData pbd = {};
   BuildPerBlockData(pbd, uniforms);
+  pbd.SlabInfo[0] = static_cast<float>(slabIndex);
+  pbd.SlabInfo[1] = static_cast<float>(slabCount);
 
   [encoder setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
   [encoder setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
@@ -6534,6 +6567,20 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
       (static_cast<uint32_t>(marchVariant) & 0xFu) << VolumeFeature_MarchVariantShift;
   }
 
+  // Composite slab tiling (VTK_METAL_TEST_NUM_SLABS): only on the blended
+  // direct path (useDirectPipeline), and only for composite blending — the
+  // (ONE, ONE_MINUS_SRC_ALPHA) accumulation of per-slab partial composites is
+  // exact only because front-to-back premultiplied `over` is associative.
+  const int numSlabs =
+    (useDirectPipeline && this->GetBlendMode() == vtkVolumeMapper::COMPOSITE_BLEND &&
+     VolumeSlabCount() > 1)
+      ? VolumeSlabCount()
+      : 1;
+  if (numSlabs > 1)
+  {
+    featureMask |= VolumeFeature_Slab;
+  }
+
   id<MTLDevice> device = (__bridge id<MTLDevice>)
     (static_cast<vtkMetalRenderWindow*>(ren->GetRenderWindow()))->GetMetalDevice();
 
@@ -6558,7 +6605,15 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
     this->GradientNormalTexture,
     useDirectPipeline, &pbd, MTLCullModeBack);
 
-  [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+  // Front-to-back slab passes: each composites only its ray-length-fraction
+  // index range from zero; the blend on attachment 0 accumulates them.
+  for (int s = 0; s < numSlabs; ++s)
+  {
+    pbd.SlabInfo[0] = static_cast<float>(s);
+    pbd.SlabInfo[1] = static_cast<float>(numSlabs);
+    [encoder setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+  }
 }
 
 //------------------------------------------------------------------------------
@@ -7921,16 +7976,35 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     }
     else
     {
+      // Composite slab tiling (VTK_METAL_TEST_NUM_SLABS): split the DirectScreen
+      // (or selection) pass into front-to-back slab passes whose partial
+      // composites accumulate via the (ONE, ONE_MINUS_SRC_ALPHA) blend, exact
+      // for composite blending because premultiplied `over` is associative.
+      // The slab bit only reaches this direct pipeline's mask; offscreen/RTT/
+      // grid pipelines keep their unmodified mask and stay single-pass.
+      const int numSlabs =
+        (!selectionRender && this->GetBlendMode() == vtkVolumeMapper::COMPOSITE_BLEND &&
+         VolumeSlabCount() > 1)
+          ? VolumeSlabCount()
+          : 1;
+      uint32_t directMask = featureMask;
+      if (numSlabs > 1)
+      {
+        directMask |= VolumeFeature_Slab;
+      }
       void* directPso = this->GetOrCreateVolumePipeline(mtlDevice,
         static_cast<uint32_t>(selectionRender
           ? VolumePipelineType::SelectionDirect
           : VolumePipelineType::DirectScreen),
         MTLPixelFormatBGRA8Unorm, MTLPixelFormatDepth32Float,
-        static_cast<uint32_t>(sampleCount), featureMask);
+        static_cast<uint32_t>(sampleCount), directMask);
       this->BindEncoderResources(encoder, uniformBuf, directPso, true);
 
       // Draw volume — handle partitioned (multi-block) and single-block cases
-      this->DrawBlocks(encoder, uniformBuf, ren, vol, &uniforms, invModelMatrix);
+      for (int s = 0; s < numSlabs; ++s)
+      {
+        this->DrawBlocks(encoder, uniformBuf, ren, vol, &uniforms, invModelMatrix, s, numSlabs);
+      }
     }
   }
 
