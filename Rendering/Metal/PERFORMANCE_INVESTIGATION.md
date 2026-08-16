@@ -822,3 +822,45 @@ per-sample factor are Metal-side instruction scheduling / divergence handling
 Unified Memory on the M2, so a DRAM-bound workload would show identical times,
 and nearest-sampling throughput is already at parity (GL 0.97 vs Metal
 1.01 ns/sample).
+
+## 14. The gap is a fetch-latency-hiding deficit: 8x unroll makes Metal 1.46x FASTER than GL
+
+New `pipeline` variants in `metal_gap.m` (argv[9]) restructure the march inner
+loop without changing its semantics. All variants are parity-exact vs the
+baseline (avgIter 287.8; the 8x-unrolled version's iteration counts differ
+from baseline on only 1,531/160,000 silhouette pixels by +/-1, sample values
+identical - the `i+n <= steps` chunk bound guarantees chunks never cross
+`tExit`, so no over-march).
+
+30-frame interleaved rounds on the M2 MBA:
+
+| variant | avg ms | ns/sample | note |
+|---|---|---|---|
+| GL flipY=1 (linear) | 67.1 | 1.47 | orientation-matched reference |
+| Metal baseline (serial fetch->max) | 90.0 | 1.97 | the historical "Metal is slower" number |
+| Metal prefetch-2 (loop-carried `cur`) | 89.7 | 1.97 | fetch-ahead-then-consume, **slower** |
+| Metal 2x unroll | 72.1 | 1.58 | |
+| Metal **4x unroll** | 58.5 | 1.28 | already faster than GL |
+| Metal **8x unroll** | **45.8** | **1.00** | **1.46x faster than GL** |
+| Metal 16x unroll | 51.6 | 1.13 | register-pressure / occupancy regression |
+
+Interpretation:
+
+1. **The harness gap was a scheduling deficit, not a hardware cost.** The
+   monotonic 1x->2x->4x->8x speedup (90 -> 45.8 ms) means the serial
+   fetch->max chain exposed the full 3-D-linear issue latency; N independent
+   in-flight fetches hide it. GL's driver compiler already pipelines its loop
+   (hence GL at 1.47 ns/sample vs Metal's exposed 1.97).
+2. **The prefetch-with-loop-carried-dependency pattern is a trap**: fetching
+   step i+1 into a register consumed next iteration keeps only one fetch in
+   flight (the carried dependency serializes it) and adds register traffic -
+   it is ~2 ms *slower* than baseline, not faster.
+3. **8x is the sweet spot on this device**; 16x regresses (register pressure
+   cuts occupancy / latency hiding).
+4. **Open question**: the app's `fragment_volume_main` has opacity-based early
+   exit (genuinely divergent), TF/shading/min-max work, and the section-4
+   divergence restructure already applied. Whether an 8x unroll transfers to
+   the full app shader is unverified; per-step early-exit conflicts with
+   chunking, and naive fetch-ahead (pattern 1) is known-slow. A real-shader
+   harness (`metal_app_shader.m`) or an env-gated edit of the app shader is the
+   next experiment.

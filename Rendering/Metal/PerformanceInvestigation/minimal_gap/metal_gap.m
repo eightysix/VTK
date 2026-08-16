@@ -47,13 +47,109 @@ static const int kRT = 400; // render target size (fragments), matches real scen
 // accumulator to FP16 so the TMU/ALU sample-return path stays in half instead
 // of forcing FP32 registers (experiment: does the GL stack's implicit 16-bit
 // fast path explain part of the gap?).
+// Builds an N-way unrolled march body: fetches samples s0..s(N-1) back-to-back
+// (independent, all in flight) before consuming any, then advances by N steps.
+// A scalar break-aware remainder handles the tail so the step count stays ~the
+// baseline (avgIter parity preserved to within the coarse break granularity).
+// n must be even. body must be >= 8192 bytes.
+static void BuildUnrollBody(char* body, size_t cap, int n, const char* lt, const char* lod)
+{
+  int off = 0;
+  off += snprintf(body + off, cap - off,
+    "\n  int i = 0;\n"
+    "  for (; i + %d <= steps; i += %d) {\n"
+    "    if (currentT >= tExit - 1e-6f) break;\n", n, n);
+  for (int k = 0; k < n; k++)
+  {
+    if (k == 0)
+      off += snprintf(body + off, cap - off, "    float3 p%d = evalPoint;\n", k);
+    else
+      off += snprintf(body + off, cap - off, "    float3 p%d = evalPoint + evalStep * %d.0f;\n", k, k);
+  }
+  for (int k = 0; k < n; k++)
+    off += snprintf(body + off, cap - off, "    %s s%d = volTex.sample(volSampler, p%d%s).r;\n", lt, k, k, lod);
+  char expr[512];
+  int eo = 0;
+  for (int k = 0; k < n; k += 2)
+  {
+    if (eo == 0)
+      eo = snprintf(expr, sizeof(expr), "max(s%d, s%d)", k, k + 1);
+    else
+    {
+      char tmp[256];
+      snprintf(tmp, sizeof(tmp), "max(%s, max(s%d, s%d))", expr, k, k + 1);
+      eo = snprintf(expr, sizeof(expr), "%s", tmp);
+    }
+  }
+  off += snprintf(body + off, cap - off, "    acc = max(acc, %s);\n", expr);
+  off += snprintf(body + off, cap - off,
+    "    currentT += stepSize * %d.0f; texLocal += texStep * %d.0f;\n"
+    "    evalPoint += evalStep * %d.0f; n += %d.0f;\n"
+    "  }\n", n, n, n, n);
+  snprintf(body + off, cap - off,
+    "  for (; i < steps; i++) {\n"
+    "    if (currentT >= tExit - 1e-6f) break;\n"
+    "    acc = max(acc, volTex.sample(volSampler, evalPoint%s).r);\n"
+    "    currentT += stepSize; texLocal += texStep; evalPoint += evalStep; n += 1.0f;\n"
+    "  }\n", lod);
+}
+
 // BuildMSL: builds the march MSL. `halfSampler` switches the volume texture
 // and the accumulator to FP16. `lod0` appends `level(0.0f)` to the sample
 // call, forcing an explicit LOD-0 fetch and (hypothesis) skipping the implicit
 // screen-space gradient/LOD computation that MSL fragment `.sample()` does per
 // iteration; GL with GL_LINEAR (no mipmaps) needs no such gradients.
-static char* BuildMSL(bool halfSampler, bool lod0)
+// `pipeline` selects the inner-loop structure (ILP / latency-hiding test):
+//   0 = baseline (break, serial fetch->max chain)
+//   1 = 2-way software-pipelined: fetch step i+1 before consuming step i,
+//       break kept per-step (semantics identical to baseline, avgIter parity)
+//   >=2 = N-way unroll (N even): N independent back-to-back fetches per
+//       iteration, scalar break-aware tail. N = 2/4/8 tested.
+//   3 = no break / fixed count (isolates the data-dependent break's cost)
+static char* BuildMSL(bool halfSampler, bool lod0, int pipeline)
 {
+  const char* lt = halfSampler ? "half" : "float";
+  const char* ls = halfSampler ? "h" : "f";
+  const char* lod = lod0 ? ", level(0.0f)" : "";
+  char body[8192];
+
+  if (pipeline == 1)
+  {
+    snprintf(body, sizeof(body), R"MSL(
+  %s cur = volTex.sample(volSampler, evalPoint%s).r;
+  currentT += stepSize; texLocal += texStep; evalPoint += evalStep; n += 1.0f;
+  for (int i = 1; i < steps; i++) {
+    if (currentT >= tExit - 1e-6f) { acc = max(acc, cur); break; }
+    %s nxt = volTex.sample(volSampler, evalPoint%s).r;
+    acc = max(acc, cur); cur = nxt;
+    currentT += stepSize; texLocal += texStep; evalPoint += evalStep; n += 1.0f;
+  }
+)MSL", lt, lod, lt, lod);
+  }
+  else if (pipeline == 3)
+  {
+    snprintf(body, sizeof(body), R"MSL(
+  for (int i = 0; i < steps; i++) {
+    acc = max(acc, volTex.sample(volSampler, evalPoint%s).r);
+    currentT += stepSize; texLocal += texStep; evalPoint += evalStep; n += 1.0f;
+  }
+)MSL", lod);
+  }
+  else if (pipeline >= 2)
+  {
+    BuildUnrollBody(body, sizeof(body), pipeline, lt, lod);
+  }
+  else
+  {
+    snprintf(body, sizeof(body), R"MSL(
+  for (int i = 0; i < steps; i++) {
+    if (currentT >= tExit - 1e-6f) break;
+    acc = max(acc, volTex.sample(volSampler, evalPoint%s).r);
+    currentT += stepSize; texLocal += texStep; evalPoint += evalStep; n += 1.0f;
+  }
+)MSL", lod);
+  }
+
   const char* fmt = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
@@ -88,17 +184,12 @@ fragment float4 fragment_main(VOut in [[stage_in]],
   constexpr sampler volSampler(filter::linear, address::clamp_to_edge);
   float2 ndc = in.uv * 2.0f - 1.0f;
 
-  // Reconstruct the pixel ray exactly like the app: unproject the fragment to
-  // a physical volume point via inverseVP, then normalize the volume-space
-  // direction from the camera through that point (OpenGL/Metal parity: the
-  // interpolated proxy-box anchor lies on the same camera ray).
   float4 w4 = u.invVP * float4(ndc, 0.0f, 1.0f);
   float3 ptPhys = w4.xyz / w4.w;
   float3 eye = u.eye.xyz;
   float3 rayDir = normalize(ptPhys / u.boundsSize.xyz - eye);
   float3 inv = 1.0f / rayDir;
 
-  // Slab intersect with the normalized [0,1]^3 box (app: intersectBox).
   float3 t0 = (float3(0.0f) - eye) * inv;
   float3 t1 = (float3(1.0f) - eye) * inv;
   float3 tmin3 = min(t0, t1);
@@ -110,13 +201,10 @@ fragment float4 fragment_main(VOut in [[stage_in]],
   }
   float tStart = max(tEnter, 0.0f);
 
-  // App's physicalSampleStep: normalized step for a constant physical sample
-  // distance along the ray (u.sampleDistance was stored as 0.5mm/maxBound).
   float physPerNorm = length(rayDir * u.boundsSize.xyz);
   float stepSize = u.sampleDistMM / max(physPerNorm, 1e-6f);
   int maxSteps = max(1, int(ceil((tExit - tStart) / stepSize)));
 
-  // Clamp-to-edge texel correction (app: ctpScale/ctpOffset).
   float3 texelCount = float3(volTex.get_width(), volTex.get_height(), volTex.get_depth());
   float3 ctpScale = max(texelCount - 1.0f, 1e-4f) / texelCount;
   float3 ctpOffset = 0.5f / texelCount;
@@ -129,25 +217,14 @@ fragment float4 fragment_main(VOut in [[stage_in]],
 
   %s acc = 0.0%s;
   float n = 0.0f;
-  for (int i = 0; i < min(u.maxIter, maxSteps); i++) {
-    if (currentT >= tExit - 1e-6f) break;
-    acc = max(acc, volTex.sample(volSampler, evalPoint%s).r);
-    currentT += stepSize;
-    texLocal += texStep;
-    evalPoint += evalStep;
-    n += 1.0f;
-  }
-  // Pack iteration count into R/G (low/high byte), sample value into B.
+  int steps = min(u.maxIter, maxSteps);
+  %s
   uint nc = uint(n);
   return float4(float(nc & 255u) / 255.0f, float((nc >> 8u) & 255u) / 255.0f, float(acc), 1.0f);
 }
 )MSL";
-  char* buf = malloc(strlen(fmt) + 32);
-  snprintf(buf, strlen(fmt) + 32, fmt,
-    halfSampler ? "half" : "float",
-    halfSampler ? "half" : "float",
-    halfSampler ? "h" : "f",
-    lod0 ? ", level(0.0f)" : "");
+  char* buf = malloc(strlen(fmt) + strlen(body) + 64);
+  snprintf(buf, strlen(fmt) + strlen(body) + 64, fmt, lt, lt, ls, body);
   return buf;
 }
 
@@ -306,6 +383,7 @@ int main(int argc, const char** argv)
     int lod0 = 0;
     int fastMath = 1;
     int diag = 0;
+    int pipeline = 0;
     if (argc > 1) frames = atoi(argv[1]);
     if (argc > 2) maxIter = atoi(argv[2]);
     if (argc > 3) halfSampler = atoi(argv[3]);
@@ -314,15 +392,16 @@ int main(int argc, const char** argv)
     if (argc > 6) lod0 = atoi(argv[6]);
     if (argc > 7) fastMath = atoi(argv[7]);
     if (argc > 8) diag = atoi(argv[8]);
+    if (argc > 9) pipeline = atoi(argv[9]);
 
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     fprintf(stderr, "Metal device: %s\n", device.name.UTF8String);
-    fprintf(stderr, "volume %dx%dx%d R8, rt %dx%d, frames %d, maxIter %d, halfSampler=%d, depthMode=%d, compute=%d, lod0=%d, fastMath=%d, diag=%d\n",
-      kW, kH, kD, kRT, kRT, frames, maxIter, halfSampler, depthMode, compute, lod0, fastMath, diag);
+    fprintf(stderr, "volume %dx%dx%d R8, rt %dx%d, frames %d, maxIter %d, halfSampler=%d, depthMode=%d, compute=%d, lod0=%d, fastMath=%d, diag=%d, pipeline=%d\n",
+      kW, kH, kD, kRT, kRT, frames, maxIter, halfSampler, depthMode, compute, lod0, fastMath, diag, pipeline);
 
     NSError* err = nil;
     char* msl = diag ? BuildDiagMSL()
-                     : (compute ? BuildComputeMSL(halfSampler != 0) : BuildMSL(halfSampler != 0, lod0 != 0));
+                     : (compute ? BuildComputeMSL(halfSampler != 0) : BuildMSL(halfSampler != 0, lod0 != 0, pipeline));
     MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
     opts.fastMathEnabled = (fastMath != 0) ? YES : NO;
     id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:msl]

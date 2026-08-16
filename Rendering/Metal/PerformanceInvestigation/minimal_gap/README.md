@@ -47,8 +47,14 @@ misconfiguration, not real errors.)
 ./metal_gap 100 8192 0 2 0 0 0 0   # fastMath=0: ~8% FASTER (78-80 vs 85-87 ms)
 ./metal_gap 1 8192 0 0 0 0 1 1     # diag=1: shader writes rayDir*0.5+0.5 ->
 #                                   #   metal_gap_diag.ppm; also prints invVP columns
-# All variants are statistically identical except fastMath=0 (~8% faster)
-# and compute (slower); see results below. diag is for ray-field parity checks.
+./metal_gap 100 8192 0 2 0 0 1 0 8 # pipeline=8 (argv[9]): 8-way unroll, 8
+#                                   #   independent in-flight fetches -> ~45.8 ms
+#                                   #   (vs 90.0 baseline), 1.46x faster than GL
+#                                   #   flipY=1 (67.1 ms); parity-exact.
+# pipeline: 0=baseline 1=prefetch(loop-carried, SLOWER) 3=no-break >=2=N-way unroll
+# All variants are statistically identical except fastMath=0 (~8% faster),
+# compute (slower), and unroll (>=2, dramatically faster); see results below.
+# diag is for ray-field parity checks.
 # NOTE: the RT is BGRA8Unorm - PPM byte0=B(acc), byte1=G(iterHigh),
 # byte2=R(iterLow). Iteration count = byte2 + 256*byte1.
 
@@ -124,6 +130,32 @@ app-normalized comparison is **GL flipY=1 ~67.9 ms vs Metal ~86.3 ms =
 100.2 ms = **1.27x**, the same 1.27x as at 1794. Both backends scale ~linearly
 with the +14% footprint (GL +16%, Metal +16%), so tiling/PoT padding is not
 the source of the ratio.
+
+**ILP / latency-hiding (the gap is a scheduling deficit — Metal wins with
+unrolling):** `pipeline` arg selects the inner-loop structure (argv[9];
+>=2 = N-way unroll). Identical per-pixel work across all variants (avgIter
+287.8; unroll8 iter differs from baseline on only 1,531/160,000 silhouette
+pixels by ±1, sample values identical). 30-frame interleaved rounds:
+
+| variant | avg ms | ns/sample |
+|---|---|---|
+| GL flipY=1 (linear) | 67.1 | 1.47 |
+| Metal baseline (0) | 90.0 | 1.97 |
+| Metal prefetch-2 (1, loop-carried) | 89.7 | 1.97 |
+| Metal 2x unroll | 72.1 | 1.58 |
+| Metal **4x unroll** | 58.5 | 1.28 |
+| Metal **8x unroll** | **45.8** | **1.00** |
+| Metal 16x unroll | 51.6 | 1.13 |
+
+The monotonic speedup to 8x (then a register-pressure regression at 16x)
+confirms the harness shader was **TPU-latency-bound, not bandwidth- or
+ALU-bound**: N independent 3-D-linear fetches in flight hide the sample issue
+latency. Metal's straight loop left the latency exposed; GL's compiler already
+software-pipelines it. The prefetch-with-loop-carried-dependency pattern
+(variant 1) is *slower* than baseline and must be avoided. 8x-unrolled Metal
+beats GL by 1.46x on identical work (1.00 vs 1.47 ns/sample). Whether this
+transfers to the full app shader (opacity early-exit, TF, shading) is the open
+question.
 
 Conclusions, addressing the four hypotheses:
 
