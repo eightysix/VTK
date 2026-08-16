@@ -13,6 +13,8 @@
 #include "vtkNew.h"
 #include "vtkObjectFactory.h"
 #include <iostream>
+#include <stdlib.h>
+#include <string.h>
 #include "vtkOverrideAttribute.h"
 #include "vtkPiecewiseFunction.h"
 #include "vtkPointData.h"
@@ -229,7 +231,12 @@ struct VolumeMapperUniforms
   float UseDataSpaceBoxVertices;   // 1712
   float UseIGNJitter;              // 1716  (1.0 = Interleaved Gradient Noise jitter instead of the GL blue-noise tile)
   float JitterBlockSize;           // 1720  (pixels per IGN-jitter coherence block; 1 = legacy per-pixel)
-  float _padDSBV[1];               // 1724..1727 (total 1728, 16-byte aligned)
+  // Non-divergent march (PERFORMANCE_INVESTIGATION.md section 4): when > 0, the
+  // fragment march runs a uniform iteration count (frame-max ray-box chord /
+  // sample distance, computed per frame on the CPU) with all data-dependent
+  // exits predicated instead of breaking, so SIMT lanes stay locked. 0 keeps
+  // the legacy per-fragment loop bound. Occupies the former _padDSBV slot.
+  float MaxStepsFrame;             // 1724..1727 (total 1728, 16-byte aligned)
 };
 
 static_assert(sizeof(VolumeMapperUniforms) == 1728,
@@ -306,6 +313,120 @@ static uint32_t BlendModeToFeatureFlag(int blendMode)
     default:
       return 0;
   }
+}
+
+// March-experiment selector from VTK_METAL_TEST_MARCH_VARIANT (0=none,
+// 1=manual 8-tap trilinear, 2=clamp_to_zero sampler, 3=predicated opacity exit,
+// 4=uniform frame-max loop with all exits predicated). Encoded into the feature
+// mask so each experiment gets its own specialized pipeline. Reads the env var
+// once per process. Only the low 4 bits are used (VolumeFeature_MarchVariantMask).
+static int VolumeMarchVariant()
+{
+  static const int variant = [] {
+    if (const char* v = getenv("VTK_METAL_TEST_MARCH_VARIANT"))
+      return std::atoi(v);
+    return 0;
+  }();
+  return variant;
+}
+
+// Fixed uniform iteration count for the variant-4 non-divergent march
+// (VTK_METAL_TEST_MARCH_STEPS). 0 = compute a frame-max bound from the camera
+// instead. Reads the env var once per process.
+static int VolumeMarchSteps()
+{
+  static const int steps = [] {
+    if (const char* v = getenv("VTK_METAL_TEST_MARCH_STEPS"))
+      return std::atoi(v);
+    return 0;
+  }();
+  return steps;
+}
+
+// Frame-max / frame-average ray-box chord in physical mm for the current camera
+// (PERFORMANCE_INVESTIGATION.md section 4.2). Replicates the shader's
+// intersectBox in [0,1] volume space: the maximum chord through the volume box
+// from the camera is bounded by the chords of the rays through the 8 box
+// corners, the 6 face centers and the box center (an over-bound that also
+// covers in-between directions), clamped to the box diagonal. For parallel
+// projection every ray shares the same direction, so the chord is exactly the
+// box width along the projection direction. Returns the max chord (used as the
+// variant-4 uniform bound) and, via meanChordMM, the mean of the sampled chords
+// (used as the variant-5 uniform main-loop bound).
+static double ComputeMaxChordMM(double s0, double s1, double s2, const float cam[3],
+  bool parallel, const float projDir[3], double sampleDistanceMM,
+  double* meanChordMM = nullptr)
+{
+  const double diagMM = std::sqrt(s0 * s0 + s1 * s1 + s2 * s2);
+  if (meanChordMM)
+    *meanChordMM = diagMM;
+
+  if (parallel)
+  {
+    // Box width along the (unit) projection direction: sum_i Size_i |d_i|.
+    const double d0 = projDir[0], d1 = projDir[1], d2 = projDir[2];
+    double widthMM = s0 * std::abs(d0) + s1 * std::abs(d1) + s2 * std::abs(d2);
+    return std::min(widthMM, diagMM);
+  }
+
+  // Rays through the 8 corners, 6 face centers and box center (volume space).
+  float pts[15][3] = {
+    {0.f, 0.f, 0.f}, {1.f, 0.f, 0.f}, {0.f, 1.f, 0.f}, {0.f, 0.f, 1.f},
+    {1.f, 1.f, 0.f}, {1.f, 0.f, 1.f}, {0.f, 1.f, 1.f}, {1.f, 1.f, 1.f},
+    {0.5f, 0.5f, 0.f}, {0.5f, 0.5f, 1.f}, {0.5f, 0.f, 0.5f}, {0.5f, 1.f, 0.5f},
+    {0.f, 0.5f, 0.5f}, {1.f, 0.5f, 0.5f}, {0.5f, 0.5f, 0.5f},
+  };
+  double maxChordMM = 0.0;
+  double sumChordMM = 0.0;
+  int nChord = 0;
+  for (int p = 0; p < 15; ++p)
+  {
+    double dx = pts[p][0] - cam[0];
+    double dy = pts[p][1] - cam[1];
+    double dz = pts[p][2] - cam[2];
+    double len = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (len < 1e-9)
+      continue;
+    dx /= len; dy /= len; dz /= len;
+
+    // intersectBox(cam, dir, 0, 1) with safeRecip (1e-20 epsilon).
+    const double eps = 1e-20;
+    double invx = (std::abs(dx) < eps) ? (dx < 0 ? -1.0 / eps : 1.0 / eps) : (1.0 / dx);
+    double invy = (std::abs(dy) < eps) ? (dy < 0 ? -1.0 / eps : 1.0 / eps) : (1.0 / dy);
+    double invz = (std::abs(dz) < eps) ? (dz < 0 ? -1.0 / eps : 1.0 / eps) : (1.0 / dz);
+    double tbotx = invx * (0.0 - cam[0]), ttopx = invx * (1.0 - cam[0]);
+    double tboty = invy * (0.0 - cam[1]), ttopy = invy * (1.0 - cam[1]);
+    double tbotz = invz * (0.0 - cam[2]), ttopz = invz * (1.0 - cam[2]);
+    double tminx = std::min(ttopx, tbotx), tmaxx = std::max(ttopx, tbotx);
+    double tminy = std::min(ttopy, tboty), tmaxy = std::max(ttopy, tboty);
+    double tminz = std::min(ttopz, tbotz), tmaxz = std::max(ttopz, tbotz);
+    double tN = std::max(std::max(tminx, tminy), tminz);
+    double tF = std::min(std::min(tmaxx, tmaxy), tmaxz);
+    if (tN > tF || tF < 0.0)
+      continue;
+    double tStart = std::max(tN, 0.0);
+    if (tStart >= tF)
+      continue;
+    double chordVol = tF - tStart;
+    // Physical chord = chordVol * physPerNorm = chordVol * |dir * boundsSize|.
+    double physPerNorm = std::sqrt((dx * s0) * (dx * s0) +
+      (dy * s1) * (dy * s1) + (dz * s2) * (dz * s2));
+    double chordMM = chordVol * physPerNorm;
+    if (chordMM > maxChordMM)
+      maxChordMM = chordMM;
+    sumChordMM += chordMM;
+    nChord++;
+    if (getenv("VTK_METAL_TEST_MARCH_DEBUG"))
+      fprintf(stderr, "  [march] pt=%d chordMM=%.2f\n", p, chordMM);
+  }
+  // Clamp to the box diagonal (absolute upper bound for any chord) and to the
+  // sample distance ratio so a degenerate camera never yields a huge frame-max.
+  maxChordMM = std::min(maxChordMM, diagMM);
+  if (sampleDistanceMM > 0.0)
+    maxChordMM = std::min(maxChordMM, diagMM);
+  if (meanChordMM)
+    *meanChordMM = (nChord > 0) ? std::min(sumChordMM / nChord, diagMM) : diagMM;
+  return maxChordMM;
 }
 
 // Whether the independent multi-component shader path is active for this
@@ -1486,7 +1607,17 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureShaderLibrary(void* mtlDeviceVoid)
     id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
     NSError* error = nil;
     NSString* shaderSource = [NSString stringWithUTF8String:vtkMetalShaders];
-    id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+    // A/B knob for the fastMathEnabled finding (metal_gap microbench: NO is
+    // ~8% faster for the bare-fetch march). Unset = historical options:nil
+    // behavior (fastMathEnabled=YES).
+    const char* fmEnv = getenv("VTK_METAL_TEST_FAST_MATH");
+    MTLCompileOptions* options = nil;
+    if (fmEnv)
+    {
+      options = [[MTLCompileOptions alloc] init];
+      options.fastMathEnabled = (strcmp(fmEnv, "0") == 0) ? NO : YES;
+    }
+    id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:options error:&error];
 
     if (!library)
     {
@@ -5948,6 +6079,13 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     [constants setConstantValue:&cropping type:MTLDataTypeBool withName:@"fc_cropping"];
     [constants setConstantValue:&blanking type:MTLDataTypeBool withName:@"fc_blanking"];
 
+    // March-experiment selector (fc_marchVariant): decoded from the feature
+    // mask bits 24-27 so each variant gets its own specialized pipeline.
+    const int marchVariant =
+      (featureMask & VolumeFeature_MarchVariantMask) >> VolumeFeature_MarchVariantShift;
+    [constants setConstantValue:&marchVariant type:MTLDataTypeInt
+                       withName:@"fc_marchVariant"];
+
     // Blend mode function constant: 0=composite, 1=MIP, 2=MinIP, 3=AverageIP,
     // 4=additive (vtkVolumeMapper::BlendMode). Encoded in the feature mask so
     // each blend mode gets its own specialized pipeline.
@@ -6360,6 +6498,14 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
   if (uniforms->UseBlanking > 0.5f)
     featureMask |= VolumeFeature_Blanking;
 
+  // March-experiment selector (VTK_METAL_TEST_MARCH_VARIANT): encoded into the
+  // feature mask so each experiment gets its own specialized pipeline.
+  if (const int marchVariant = VolumeMarchVariant(); marchVariant != 0)
+  {
+    featureMask |=
+      (static_cast<uint32_t>(marchVariant) & 0xFu) << VolumeFeature_MarchVariantShift;
+  }
+
   id<MTLDevice> device = (__bridge id<MTLDevice>)
     (static_cast<vtkMetalRenderWindow*>(ren->GetRenderWindow()))->GetMetalDevice();
 
@@ -6411,6 +6557,16 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   void* mtlDevice = metalRenderWindow->GetMetalDevice();
   void* mtlQueue = metalRenderWindow->GetMetalQueue();
+
+  if (getenv("VTK_METAL_TEST_DUMP_UNIFORMS"))
+  {
+    double* bp = this->ModelBounds;
+    vtkCamera* cam = ren->GetActiveCamera();
+    double* cpos = cam ? cam->GetPosition() : nullptr;
+    fprintf(stderr, "GPURender enter: bounds=(%.2f,%.2f,%.2f)-(%.2f,%.2f,%.2f) cam=%s\n",
+      bp[0], bp[1], bp[2], bp[3], bp[4], bp[5],
+      cpos ? "set" : "null");
+  }
 
   if (!this->EnsureEffectiveInput())
   {
@@ -6911,6 +7067,46 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   uniforms.UseIGNJitter = this->GetUseIGNJitter() ? 1.0f : 0.0f;
   uniforms.JitterBlockSize = static_cast<float>(this->GetJitterBlockSize());
 
+  // Non-divergent march: uniform per-frame iteration bound.
+  // - variant 4: VTK_METAL_TEST_MARCH_STEPS wins; otherwise a frame-max bound
+  //   (longest ray-box chord for the current camera / sample distance) so every
+  //   fragment reaches at least its own legacy per-fragment maxSteps. 0 =
+  //   legacy per-fragment loop bound (variant 4 disabled).
+  // - variant 5: hybrid uniform-main + divergent-tail. VTK_METAL_TEST_MARCH_STEPS
+  //   wins as the uniform main-loop count; otherwise the frame-average chord is
+  //   used so the uniform main phase covers the bulk of every ray with SIMT
+  //   lanes locked, and only the ~15-20 % longer rays spill into the tail.
+  uniforms.MaxStepsFrame = 0.0f;
+  if (VolumeMarchVariant() == 4 || VolumeMarchVariant() == 5)
+  {
+    const int fixedSteps = VolumeMarchSteps();
+    if (fixedSteps > 0)
+    {
+      uniforms.MaxStepsFrame = static_cast<float>(fixedSteps);
+    }
+    else
+    {
+      const float camV[3] = {
+        uniforms.CameraVolumePos[0], uniforms.CameraVolumePos[1],
+        uniforms.CameraVolumePos[2]};
+      if (getenv("VTK_METAL_TEST_MARCH_DEBUG"))
+        fprintf(stderr, "[march] camV=(%.3f,%.3f,%.3f) size=(%.1f,%.1f,%.1f)\n",
+          camV[0], camV[1], camV[2], vb.Size[0], vb.Size[1], vb.Size[2]);
+      double meanChordMM = 0.0;
+      const double maxChordMM = ComputeMaxChordMM(vb.Size[0], vb.Size[1], vb.Size[2],
+        camV, uniforms.UseParallelProjection > 0.5f, uniforms.ProjectionDirection,
+        actualSampleDistance, &meanChordMM);
+      const double boundChordMM =
+        (VolumeMarchVariant() == 5) ? meanChordMM : maxChordMM;
+      uniforms.MaxStepsFrame = static_cast<float>(std::max(
+        1.0, std::ceil(boundChordMM / std::max(actualSampleDistance, 1e-9))));
+      if (getenv("VTK_METAL_TEST_MARCH_DEBUG"))
+        fprintf(stderr, "[march] variant=%d maxStepsFrame=%.1f maxChordMM=%.2f meanChordMM=%.2f sampleDist=%.3f\n",
+          VolumeMarchVariant(), uniforms.MaxStepsFrame, maxChordMM, meanChordMM,
+          actualSampleDistance);
+    }
+  }
+
   // Final color window/level (matches OpenGL's in_scale/in_bias, applied in the
   // shader after the ray cast as rgb * scale + bias * alpha).
   if (this->FinalColorWindow != 0.0)
@@ -7208,6 +7404,14 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   if (uniforms.UseBlanking > 0.5f)
     featureMask |= VolumeFeature_Blanking;
 
+  // March-experiment selector (VTK_METAL_TEST_MARCH_VARIANT): encoded into the
+  // feature mask so each experiment gets its own specialized pipeline.
+  if (const int marchVariant = VolumeMarchVariant(); marchVariant != 0)
+  {
+    featureMask |=
+      (static_cast<uint32_t>(marchVariant) & 0xFu) << VolumeFeature_MarchVariantShift;
+  }
+
   // Hardware-selection support (vtkHardwareSelector): during a selection render
   // with CELLS field association the volume is ray-cast with the selection
   // pipeline that writes {voxelId, propId, compositeIndex} into the RGBA32Uint
@@ -7397,9 +7601,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)this->UniformBuffers[bufIdx];
   memcpy([uniformBuf contents], &uniforms, sizeof(uniforms));
 
-  if (getenv("VTK_METAL_TEST_DUMP_UNIFORMS") && !getenv("VTK_METAL_TEST_DUMP_UNIFORMS_DONE"))
+  // Investigation: dump every render (not just the first) so the last frame's
+  // uniforms — with the final camera — land in /tmp/app_uniforms.bin. The first
+  // render of a fresh window runs before the camera is fully established.
+  if (getenv("VTK_METAL_TEST_DUMP_UNIFORMS"))
   {
-    setenv("VTK_METAL_TEST_DUMP_UNIFORMS_DONE", "1", 1);
     FILE* f = fopen("/tmp/app_uniforms.bin", "wb");
     fwrite(&uniforms, 1, sizeof(uniforms), f);
     fclose(f);
@@ -7411,6 +7617,23 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     f = fopen("/tmp/app_light.bin", "wb");
     fwrite(&lightUniforms, 1, sizeof(lightUniforms), f);
     fclose(f);
+  }
+
+  if (getenv("VTK_METAL_TEST_DUMP_UNIFORMS"))
+  {
+    fprintf(stderr,
+      "UNIF cam=%.8f,%.8f,%.8f bmin=%.4f,%.4f,%.4f bmax=%.4f,%.4f,%.4f vp=%.0fx%.0f sd=%.6f\n",
+      uniforms.CameraVolumePos[0], uniforms.CameraVolumePos[1], uniforms.CameraVolumePos[2],
+      uniforms.VolumeBoundsMin[0], uniforms.VolumeBoundsMin[1], uniforms.VolumeBoundsMin[2],
+      uniforms.VolumeBoundsMax[0], uniforms.VolumeBoundsMax[1], uniforms.VolumeBoundsMax[2],
+      uniforms.ViewportSize[0], uniforms.ViewportSize[1],
+      (float)uniforms.SampleDistanceHalf / 65536.0f);
+    fprintf(stderr, "  invVP: ");
+    for (int k = 0; k < 16; ++k)
+    {
+      fprintf(stderr, "%.7g,", uniforms.InverseViewProjection[k]);
+    }
+    fprintf(stderr, "\n");
   }
 
   // Phase 6: Determine if camera is inside the volume for the fullscreen ray-cast path.

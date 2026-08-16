@@ -10,6 +10,8 @@ files = sorted(f for f in os.listdir(SRC) if os.path.isfile(os.path.join(SRC, f)
 print("files:", len(files))
 
 d0 = pydicom.dcmread(os.path.join(SRC, files[0]), force=True)
+if not d0.file_meta.get('TransferSyntaxUID'):
+    d0.file_meta.TransferSyntaxUID = '1.2.840.10008.1.2.1'
 print("ts:", d0.file_meta.TransferSyntaxUID)
 print("rows:", d0.Rows, "cols:", d0.Columns, "bits:", d0.BitsAllocated,
       "signed:", getattr(d0, 'PixelRepresentation', None))

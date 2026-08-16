@@ -156,6 +156,16 @@ bool vtkVolumeTexture::LoadVolume(
   unsigned int internalFormat =
     this->Texture->GetDefaultInternalFormat(scalarType, noOfComponents, false);
   int type = this->Texture->GetDefaultDataType(scalarType);
+  if (std::getenv("VTK_METAL_TEST_DUMP_VOLTEX"))
+  {
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+      "DBG vtkVolumeTexture::Update scalarType=%d ncomp=%d format=0x%x "
+      "internalFormat=0x%x type=%d GL_RED=0x%x GL_R8=0x%x",
+      scalarType, noOfComponents, format, internalFormat, type, (unsigned)GL_RED,
+      (unsigned)GL_R8);
+    vtkErrorMacro(<< buf);
+  }
 
   // Resolve the appropriate texture format from the array properties
   this->SelectTextureFormat(format, internalFormat, type, scalarType, noOfComponents);
@@ -356,6 +366,30 @@ bool vtkVolumeTexture::LoadTexture(int interpolation, VolumeBlock* volBlock)
     texture->SetMagnificationFilter(interpolation);
     texture->SetMinificationFilter(interpolation);
     texture->SetBorderColor(0.0f, 0.0f, 0.0f, 0.0f);
+
+    // INVESTIGATION (temporary): one-time dump of the actual volume texture
+    // format used at runtime. Revert before landing.
+    static bool dbgVolTexPrinted = false;
+    if (!dbgVolTexPrinted && std::getenv("VTK_METAL_TEST_DUMP_VOLTEX"))
+    {
+      dbgVolTexPrinted = true;
+      GLint ifmt = 0, w = 0, h = 0, d = 0, redbits = 0, greenbits = 0, alphabits = 0;
+      glGetTexLevelParameteriv(GL_TEXTURE_3D, 0, GL_TEXTURE_INTERNAL_FORMAT, &ifmt);
+      glGetTexLevelParameteriv(GL_TEXTURE_3D, 0, GL_TEXTURE_WIDTH, &w);
+      glGetTexLevelParameteriv(GL_TEXTURE_3D, 0, GL_TEXTURE_HEIGHT, &h);
+      glGetTexLevelParameteriv(GL_TEXTURE_3D, 0, GL_TEXTURE_DEPTH, &d);
+      glGetTexLevelParameteriv(GL_TEXTURE_3D, 0, GL_TEXTURE_RED_SIZE, &redbits);
+      glGetTexLevelParameteriv(GL_TEXTURE_3D, 0, GL_TEXTURE_GREEN_SIZE, &greenbits);
+      glGetTexLevelParameteriv(GL_TEXTURE_3D, 0, GL_TEXTURE_ALPHA_SIZE, &alphabits);
+      unsigned int reqFmt = texture->GetInternalFormat(
+        scalarType, noOfComponents, false);
+      char buf[512];
+      snprintf(buf, sizeof(buf),
+        "DBG volume tex: requested=0x%x realized=0x%x dims=%dx%dx%d scalarType=%d "
+        "Rbits=%d Gbits=%d Abits=%d",
+        reqFmt, ifmt, w, h, d, scalarType, redbits, greenbits, alphabits);
+      vtkErrorMacro(<< buf);
+    }
 
     if (useXStride)
     {

@@ -2345,6 +2345,16 @@ void vtkOpenGLGPUVolumeRayCastMapper::GetShaderTemplate(
     {
       shaders[vtkShader::Fragment]->SetSource(raycasterfs);
     }
+
+    // INVESTIGATION (temporary): encode the per-fragment sample count into
+    // the red channel so the app's real iteration image can be captured and
+    // compared with the standalone harness. Revert before landing.
+    if (std::getenv("VTK_METAL_TEST_GL_ITER"))
+    {
+      vtkShaderProgram::Substitute(shaders[vtkShader::Fragment],
+        "gl_FragData[0] = g_fragColor;",
+        "gl_FragData[0] = vec4(g_currentT / 4096.0, 0.0, 0.0, 1.0);");
+    }
   }
 
   if (shaders[vtkShader::Geometry])
@@ -2863,6 +2873,14 @@ void vtkOpenGLGPUVolumeRayCastMapper::BuildShader(vtkRenderer* ren)
 
   // Now compile the shader
   //--------------------------------------------------------------------------
+  // INVESTIGATION: dump the composed shader sources for offline analysis.
+  // Revert before landing.
+  {
+    FILE* f = fopen("/tmp/app_gl_frag.glsl", "w");
+    if (f) { fputs(shaders[vtkShader::Fragment]->GetSource().c_str(), f); fclose(f); }
+    f = fopen("/tmp/app_gl_vert.glsl", "w");
+    if (f) { fputs(shaders[vtkShader::Vertex]->GetSource().c_str(), f); fclose(f); }
+  }
   this->Impl->ShaderProgram = this->Impl->ShaderCache->ReadyShaderProgram(shaders);
   if (!this->Impl->ShaderProgram || !this->Impl->ShaderProgram->GetCompiled())
   {
@@ -3994,9 +4012,95 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::RenderSingleInput(
     this->SetCameraShaderParameters(prog, ren, cam);
     this->SetAdvancedShaderParameters(ren, prog, vol, block, numComp);
 
+    // INVESTIGATION (temporary): one-time dump of all active uniforms and
+    // bound sampler units so the composed shader can be reproduced in a
+    // standalone harness. Revert before landing.
+    static bool dbgUniformsPrinted = false;
+    if (!dbgUniformsPrinted && std::getenv("VTK_METAL_TEST_DUMP_UNIFORMS"))
+    {
+      dbgUniformsPrinted = true;
+      GLint nunits = 0;
+      glGetIntegerv(GL_ACTIVE_TEXTURE, &nunits);
+      FILE* f = fopen("/tmp/app_gl_uniforms.txt", "w");
+      if (f)
+      {
+        GLint nuni = 0;
+        glGetProgramiv(prog->GetHandle(), GL_ACTIVE_UNIFORMS, &nuni);
+        fprintf(f, "active_texture=0x%x\n", nunits);
+        for (GLint i = 0; i < nuni; i++)
+        {
+          char name[256];
+          GLsizei len = 0;
+          GLint size = 0;
+          GLenum type = 0;
+          glGetActiveUniform(prog->GetHandle(), (GLuint)i, sizeof(name), &len, &size, &type, name);
+          GLint loc = glGetUniformLocation(prog->GetHandle(), name);
+          fprintf(f, "%s type=%u size=%d loc=%d", name, type, size, loc);
+          switch (type)
+          {
+            case GL_FLOAT:
+            case GL_FLOAT_VEC2:
+            case GL_FLOAT_VEC3:
+            case GL_FLOAT_VEC4:
+            case GL_FLOAT_MAT3:
+            case GL_FLOAT_MAT4:
+            {
+              int nc = (type == GL_FLOAT) ? 1 : (type == GL_FLOAT_VEC2) ? 2 :
+                (type == GL_FLOAT_VEC3) ? 3 : (type == GL_FLOAT_VEC4) ? 4 :
+                (type == GL_FLOAT_MAT4) ? 16 : 9;
+              GLfloat v[16] = { 0 };
+              glGetUniformfv(prog->GetHandle(), loc, v);
+              fprintf(f, " =");
+              for (int c = 0; c < nc; c++)
+              {
+                fprintf(f, " %g", (double)v[c]);
+              }
+              break;
+            }
+            default:
+            {
+              GLint v[4] = { 0, 0, 0, 0 };
+              glGetUniformiv(prog->GetHandle(), loc, v);
+              fprintf(f, " = %d %d %d %d", v[0], v[1], v[2], v[3]);
+              break;
+            }
+          }
+          fprintf(f, "\n");
+        }
+        fclose(f);
+      }
+      fprintf(stderr, "DBG uniforms dumped to /tmp/app_gl_uniforms.txt\n");
+    }
+
     this->RenderVolumeGeometry(ren, prog, vol, block->VolumeGeometry);
 
     this->FinishRendering(numComp);
+
+    // INVESTIGATION (temporary): dump the volume pass framebuffer so the
+    // app's real iteration image can be compared with the harness. Revert
+    // before landing.
+    if (std::getenv("VTK_METAL_TEST_GL_ITER"))
+    {
+      static bool dbgIterDumped = false;
+      if (!dbgIterDumped)
+      {
+        dbgIterDumped = true;
+        GLint vp[4];
+        glGetIntegerv(GL_VIEWPORT, vp);
+        int w = vp[2], h = vp[3];
+        std::vector<unsigned char> buf((size_t)w * h * 3);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, buf.data());
+        FILE* f = fopen("/tmp/app_gl_iter.ppm", "wb");
+        if (f)
+        {
+          fprintf(f, "P6\n%d %d\n255\n", w, h);
+          fwrite(buf.data(), 1, buf.size(), f);
+          fclose(f);
+          fprintf(stderr, "DBG GL iter image -> /tmp/app_gl_iter.ppm (%dx%d)\n", w, h);
+        }
+      }
+    }
     block = volumeTex->GetNextBlock();
     if (this->CurrentMask)
     {

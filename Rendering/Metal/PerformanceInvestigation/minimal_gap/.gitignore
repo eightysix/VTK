@@ -1,0 +1,5 @@
+# Build artifacts and readback outputs (regenerable).
+gl_gap
+metal_gap
+gl_app_shader
+*.ppm

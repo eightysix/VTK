@@ -2973,12 +2973,28 @@ inline std::string ShadingSingleInput(vtkRenderer* vtkNotUsed(ren), vtkVolumeMap
     {
       if (!mask || !maskInput || maskType != vtkGPUVolumeRayCastMapper::LabelMapMaskType)
       {
-        shaderStr += std::string("\
-             \n      g_srcColor = vec4(0.0);\
-             \n      g_srcColor.a = computeOpacity(scalar);\
-             \n      if (g_srcColor.a > 0.0)\
-             \n        {\
-             \n        g_srcColor = computeColor(scalar, g_srcColor.a);");
+        // INVESTIGATION (temporary): debug gates to decompose the GL per-sample
+        // cost. VTK_METAL_TEST_GL_NOTF skips the transfer-function fetches
+        // (fixed color/opacity, volume fetch kept). Revert before landing.
+        if (std::getenv("VTK_METAL_TEST_GL_NOTF"))
+        {
+          // Constant tiny alpha keeps the loop running all iterations (no
+          // early-exit), skips the transfer-function fetches, but keeps the
+          // volume fetch alive by feeding it into the color. The g_srcColor.a
+          // branch is dropped so the exact TF-fetch cost is isolated.
+          shaderStr += std::string("\
+               \n      g_srcColor = vec4(scalar.r);\
+               \n      g_srcColor.a = 0.005;");
+        }
+        else
+        {
+          shaderStr += std::string("\
+               \n      g_srcColor = vec4(0.0);\
+               \n      g_srcColor.a = computeOpacity(scalar);\
+               \n      if (g_srcColor.a > 0.0)\
+               \n        {\
+               \n        g_srcColor = computeColor(scalar, g_srcColor.a);");
+        }
       }
 
       shaderStr += std::string("\
@@ -2997,8 +3013,11 @@ inline std::string ShadingSingleInput(vtkRenderer* vtkNotUsed(ren), vtkVolumeMap
 
       if (!mask || !maskInput || maskType != vtkGPUVolumeRayCastMapper::LabelMapMaskType)
       {
-        shaderStr += std::string("\
-             \n        }");
+        if (!std::getenv("VTK_METAL_TEST_GL_NOTF"))
+        {
+          shaderStr += std::string("\
+               \n        }");
+        }
       }
     }
   }

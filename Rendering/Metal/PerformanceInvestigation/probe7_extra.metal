@@ -942,3 +942,383 @@ fragment VolumeFragmentOut fragment_march_xdir_linear_counted(
   output.color = float4(float3(acc), 1.0);
   return output;
 }
+
+// ============================================================================
+// probe7b decomposition: mirror of the real marchVolumeUnified composite loop
+// (DICOM bench config) with fc_decomp bit gates so each per-iteration cost can
+// be stripped at compile time:
+//   &1  : no 2D transfer-function fetch (colorOpacity = const 0.6)
+//   &2  : no 3D volume fetch (rawScalar = 0.5, no prefetch)
+//   &4  : no CTP-bounds exit test
+//   &8  : no composite accumulation
+//   &16 : no exit breaks (geometric loop, all maxSteps iterations)
+// Default (0) should reproduce the app baseline (~98ms in the probe).
+// ============================================================================
+fragment VolumeFragmentOut fragment_march_real_decomp(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    constant int& fixedIterCount [[buffer(3)]],
+    constant int& fc_decomp [[buffer(7)]]) {
+
+  VolumeFragmentOut output;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 localPos = in.localPos;
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
+  if (!parallel) {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
+    rayDir /= dirLength;
+  }
+
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { output.color = float4(0.0); return output; }
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  const int decomp = fc_decomp;
+  const bool noTF   = (decomp & 1) != 0;
+  const bool noVol  = (decomp & 2) != 0;
+  const bool noCTP  = (decomp & 4) != 0;
+  const bool noComp = (decomp & 8) != 0;
+  const bool noExit = (decomp & 16) != 0;
+
+  half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
+  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
+                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+
+  float tStart = dot(s.entryPoint - cameraPos, rayDir);
+  float tEnd = s.totalBoxT;
+  float jitter = (volumeUniforms.useJittering > 0.5
+      ? (volumeUniforms.useIGNJitter > 0.5
+            ? sampleIGNJitter(in.position.xy, volumeUniforms.jitterBlockSize)
+            : sampleJitterNoise(in.position.xy, volumeUniforms.viewportSize.y))
+      : 1.0) * stepSize;
+  float firstT = jitter;
+  float3 stepVec = rayDir * stepSize;
+  float3 currentPoint = rayOrigin + rayDir * (tStart + firstT);
+  float currentT = firstT;
+
+  int maxSteps = max(1, int(ceil((tEnd - firstT) / stepSize)));
+  if (noExit) {
+    maxSteps = max(maxSteps, fixedIterCount);
+  }
+
+  half3 accumulatedColor = half3(0.0h);
+  half accumulatedOpacity = 0.0h;
+
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
+  float3 evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+  float prefetchScalar = noVol ? 0.5
+      : sampleVolumeScalar(volumeTexture, evalPoint);
+  bool prefetchValid = true;
+  bool seenInBounds = false;
+
+  const float3 adjTexMin = ctpOffset;
+  const float3 adjTexMax = ctpOffset + ctpScale;
+
+  for (int i = 0; i < maxSteps; i++) {
+    if (!noCTP) {
+      if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+          any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+        if (seenInBounds) {
+          break;
+        }
+        texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+        evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+        prefetchValid = false;
+      } else {
+        seenInBounds = true;
+      }
+    }
+
+    bool needsFetch = !prefetchValid;
+    float rawScalar = needsFetch
+        ? (noVol ? 0.5 : sampleVolumeScalar(volumeTexture, evalPoint))
+        : prefetchScalar;
+
+    half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
+
+    half4 colorOpacity = noTF
+        ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+        : sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
+    half sampleOpacity = colorOpacity.a;
+
+    if (!noComp) {
+      half3 sampleColor = colorOpacity.rgb;
+      half weight = 1.0h - accumulatedOpacity;
+      accumulatedColor += weight * (sampleColor * sampleOpacity);
+      accumulatedOpacity += weight * sampleOpacity;
+    }
+
+    currentPoint += stepVec;
+    currentT += stepSize;
+    texLocalPos += texStep;
+    evalPoint += evalStep;
+
+    if (i + 1 < maxSteps) {
+      prefetchScalar = noVol ? 0.5 : sampleVolumeScalar(volumeTexture, evalPoint);
+      prefetchValid = true;
+    }
+
+    if (!noExit) {
+      if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) {
+        break;
+      }
+      if (currentT >= s.tTerminateMax) {
+        break;
+      }
+    }
+  }
+
+  output.color = float4(float3(accumulatedColor), accumulatedOpacity);
+  return output;
+}
+
+// v21: clone of fragment_march_linear_fixedN (v7) but clamp the sample
+// coordinate to [0,1] every iteration. Tests whether out-of-range coordinates
+// (the sampler's clamp_to_edge slow path) are what cause the ~100ms floor.
+fragment VolumeFragmentOut fragment_march_linear_clamp(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    constant int& fixedIterCount [[buffer(3)]]) {
+
+  VolumeFragmentOut output;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 localPos = in.localPos;
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
+  if (!parallel) {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
+    rayDir /= dirLength;
+  }
+
+  float2 t = intersectBox(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal);
+  float tStart = max(t.x, 0.0);
+  if (tStart >= t.y) { output.color = float4(0.0); return output; }
+  float tEnd = t.y;
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+
+  float currentT = tStart;
+
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + (rayOrigin + rayDir * currentT) * boundsSize, 1.0)).xyz;
+  float3 evalPoint = texLocalPos * ctpScale + ctpOffset;
+
+  float acc = 0.0;
+  for (int i = 0; i < fixedIterCount; i++) {
+    float3 c = clamp(evalPoint, float3(0.0), float3(1.0));
+    float s = volumeTexture.sample(sVolume, c).r;
+    acc = max(acc, s);
+    currentT += stepSize;
+    texLocalPos += texStep;
+    evalPoint += evalStep;
+  }
+  output.color = float4(float3(acc), 1.0);
+  return output;
+}
+
+// v22: clone of fragment_march_nearest_fixedN (v8) but clamp the sample
+// coordinate to [0,1] every iteration. Same clamp test for the nearest path.
+fragment VolumeFragmentOut fragment_march_nearest_clamp(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    constant int& fixedIterCount [[buffer(3)]]) {
+
+  VolumeFragmentOut output;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 localPos = in.localPos;
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
+  if (!parallel) {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
+    rayDir /= dirLength;
+  }
+
+  float2 t = intersectBox(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal);
+  float tStart = max(t.x, 0.0);
+  if (tStart >= t.y) { output.color = float4(0.0); return output; }
+  float tEnd = t.y;
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+
+  float currentT = tStart;
+
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + (rayOrigin + rayDir * currentT) * boundsSize, 1.0)).xyz;
+  float3 evalPoint = texLocalPos * ctpScale + ctpOffset;
+
+  float acc = 0.0;
+  for (int i = 0; i < fixedIterCount; i++) {
+    float3 c = clamp(evalPoint, float3(0.0), float3(1.0));
+    float s = volumeTexture.sample(sNearest, c).r;
+    acc = max(acc, s);
+    currentT += stepSize;
+    texLocalPos += texStep;
+    evalPoint += evalStep;
+  }
+  output.color = float4(float3(acc), 1.0);
+  return output;
+}
+
+// v23: byte-for-byte copy of v15's loop body (double-sample + clamp) under a
+// different name, to test whether the 10x speedup is from the loop body or
+// from something about function identity/source order.
+fragment VolumeFragmentOut fragment_march_xybilinear_znearest_clone(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    constant int& fixedIterCount [[buffer(3)]]) {
+
+  VolumeFragmentOut output;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 localPos = in.localPos;
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
+  if (!parallel) {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
+    rayDir /= dirLength;
+  }
+
+  float2 t = intersectBox(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal);
+  float tStart = max(t.x, 0.0);
+  if (tStart >= t.y) { output.color = float4(0.0); return output; }
+  float tEnd = t.y;
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+
+  float currentT = tStart;
+
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + (rayOrigin + rayDir * currentT) * boundsSize, 1.0)).xyz;
+  float3 evalPoint = texLocalPos * ctpScale + ctpOffset;
+
+  float acc = 0.0;
+  for (int i = 0; i < fixedIterCount; i++) {
+    float3 c = clamp(evalPoint, float3(0.0), float3(1.0));
+    float s = 0.5 * (volumeTexture.sample(sNearest, c).r + volumeTexture.sample(sNearest, c).r);
+    acc = max(acc, s);
+    currentT += stepSize;
+    texLocalPos += texStep;
+    evalPoint += evalStep;
+  }
+  output.color = float4(float3(acc), 1.0);
+  return output;
+}
+
+// v24: v22 (clamped single nearest) but with the redundant double sample
+// restored, i.e. v22 + 0.5*(A+A). Tests whether the double-sample expression
+// is what triggers the fast path under runtime compilation.
+fragment VolumeFragmentOut fragment_march_nearest_clamp_double(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    constant int& fixedIterCount [[buffer(3)]]) {
+
+  VolumeFragmentOut output;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 localPos = in.localPos;
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
+  if (!parallel) {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
+    rayDir /= dirLength;
+  }
+
+  float2 t = intersectBox(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal);
+  float tStart = max(t.x, 0.0);
+  if (tStart >= t.y) { output.color = float4(0.0); return output; }
+  float tEnd = t.y;
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+
+  float currentT = tStart;
+
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + (rayOrigin + rayDir * currentT) * boundsSize, 1.0)).xyz;
+  float3 evalPoint = texLocalPos * ctpScale + ctpOffset;
+
+  float acc = 0.0;
+  for (int i = 0; i < fixedIterCount; i++) {
+    float3 c = clamp(evalPoint, float3(0.0), float3(1.0));
+    float s = 0.5 * (volumeTexture.sample(sNearest, c).r + volumeTexture.sample(sNearest, c).r);
+    acc = max(acc, s);
+    currentT += stepSize;
+    texLocalPos += texStep;
+    evalPoint += evalStep;
+  }
+  output.color = float4(float3(acc), 1.0);
+  return output;
+}

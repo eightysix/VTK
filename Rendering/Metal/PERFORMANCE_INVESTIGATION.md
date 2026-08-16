@@ -565,6 +565,9 @@ samples/frame, Metal backend, Z-march linear, 120 frames)
 | S24 | + 8 extra taps (no lerps) in an else path | 5.8 ms |
 | S7 | full strategy chain incl. manual 8-tap path | 5.87 ms |
 | **S29** | **three separate loops, branch hoisted out** | **5.74-5.92 ms (0.06 ns/sample)** |
+| S33 | S29 + explicit `level(0.0)` on every sample | 5.67-5.79 ms |
+| S34 | single bare loop + explicit `level(0.0)` | 18.5-18.6 ms (still slow) |
+| S35 | S29 compiled with `fastMathEnabled=NO` | 5.79-5.85 ms |
 
 GL linear Z in the same runs: **10.26 ms**. So with the S29 structure Metal's
 3-D linear Z-march is **~1.8x faster than GL** (gap closed and inverted).
@@ -584,6 +587,16 @@ the output is the same.
   the same shader that flips the backend scheduling.
 - Data entropy is irrelevant: random/gradient/zero volumes measure the same
   (section 8 follow-up), ruling out the lossless-compression hypothesis.
+- Explicit-LOD is irrelevant: adding `level(0.0)` to every `vol.sample` call
+  (S33) changes nothing. S29 linear Z stays ~5.7-5.8 ms with or without it,
+  and the **single-loop bare shader stays slow (18.5-18.6 ms) even with
+  explicit `level(0.0)`** - so the MSL spec's implicit-LOD-derivative rule for
+  fragment functions is not the trigger. The serialization is purely a
+  fetch-scheduling artifact of a lone sample loop.
+- Fast-math/reassociation is irrelevant: `fastMathEnabled=NO`
+  (`-fno-fast-math`, the spec's "safe" math mode) leaves S29 linear Z at
+  5.79-5.85 ms and the bare loop at ~18.2-18.3 ms. Only minor side-benefit:
+  Metal nearest X improves ~7% (3.2 -> 2.97 ms).
 - The X-march gap is **not** fixed by this: Metal linear X ~11.3 ms vs GL
   ~6.0 ms (1.9x) in all scheduling variants. A dual-accumulator loop helps X
   (11.7 -> 8.4 ms) but re-breaks Z (5.8 -> 22.2 ms). The X gap is structural
@@ -611,3 +624,171 @@ inside Apple's lossless texture compressor
 VTK never hits this because the volume is written through a compute shader
 (vtkMetalGPUVolumeRayCastMapper.mm `CreateGlobalVolumeTexture`). The repro
 uses `Shared` storage to stay on the simple path.
+
+---
+
+## 10. Runtime verification: app volume format, sample count, and the "GL app
+faster than the bare-fetch microbench" anomaly
+
+Instrumented the real GL app (`--scene DICOMVolume`, bench config) with an
+on-GPU iteration counter (`VTK_METAL_TEST_GL_ITER`, encoded as
+`g_currentT/4096` in the R channel of a one-time framebuffer dump) and a
+volume-texture introspection dump (`VTK_METAL_TEST_DUMP_VOLTEX`).
+
+### 10.1 The app's volume texture is plain GL_R8, not 16-bit
+
+At runtime: `scalarType=3` (unsigned char), `ncomp=1`, requested
+`internalFormat=0x8229`, realized `0x8229`, `Rbits=8`, dims 512x512x1794.
+The earlier suspicion that the app used a 16-bit / Apple-private format was a
+**print artifact**: `vtkOStreamWrapper` has no `operator<<` overload for the
+`std::hex`/`std::dec` manipulators, so they are converted to `bool` (printed
+as `"1"`) and all subsequent integers print in decimal with a spurious digit
+glued on (`0x8229` -> `0x1333211` in the log). Using `snprintf` gives clean
+`0x8229`. The app's volume is R8, identical to `gl_gap`'s microbenchmark.
+
+### 10.2 The 659 avg / ~46 M sample count is confirmed
+
+The GL_ITER bench-frame dump decodes to `avg 659.0` iterations over 69,199
+marching pixels (~46.0 M samples), matching the probe-based 46,049,650 figure
+(section 2). The earlier "avg 200" reading came from a non-bench first frame
+and was wrong. The report's per-sample figures stand.
+
+### 10.3 Standalone GL harness reproduces the app's shader cost
+
+`minimal_gap/gl_app_shader.m` runs the app's exact composed shaders + dumped
+uniforms (window 400x400, off-axis camera, R8 synthetic volume, linear filter,
+TF/compositing path enabled, low-alpha TF so the loop runs to the geometry
+limit). Results (identical measurement to the app: `glFinish` per frame):
+
+| Shader (GL, R8 volume) | avg iters | ms | ns/sample |
+|---|---|---|---|
+| **app** (real window, real CT data) | 659 x 69,199 px | 48.97 | 1.06 |
+| **harness** (app shader + uniforms, FBO, synthetic ramp) | 484 x 69,831 px | 28.7 | 0.85 |
+| **gl_gap** (bare volume fetch, same camera) | 659 x 69,861 px | 62.1 | 1.35 |
+
+`-O3` vs `-O0` host code changes nothing (GPU-bound; verified 43.07 vs
+43.39 ms on the R16 harness build). The harness confirms the app's GL
+per-sample cost (~1 ns/sample) is real and reproducible outside the app; the
+remaining app-vs-harness gap (1.06 vs 0.85) is the real CT data + onscreen
+target, not the shader.
+
+### 10.4 The "app faster than the bare-fetch microbench" anomaly is a GL-side
+shader-structure artifact
+
+The bare-fetch loop (`acc = max(acc, texture(...).r)` + a few FMAs per
+iteration, `noFetch` drops it 62 ms -> 1.44 ms, so it is ~97% fetch-bound) is
+*slower* per sample (1.35 ns) than the app's full shader (1.06 ns) or the
+harness (0.85 ns), even though the full shader does strictly more work (an
+extra 2-D opacity-TF fetch, scale/bias, compositing branch per iteration).
+This is the same effect the Metal side hit in section 9: a lone volume-sample
+loop schedules poorly on this driver (per-iteration fetch latency exposed);
+interleaving extra fetch/ALU work lets the 3-D fetches pipeline. So the GL
+microbenchmark is a *valid same-pattern GL-vs-Metal comparison* but **not** a
+valid absolute baseline for the app; the app was never magically cheap per
+sample. The 6x spread between `gl_gap` (1.35) and the section-9 repro's
+axis-aligned GL Z-march (0.22 ns/sample) is the access pattern: axis-aligned
+rays through a column of texels are fully coherent, the app's off-axis camera
+rays are not.
+
+### 10.5 Implication for the M/GL comparison
+
+- Bare-fetch raw 3-D linear sample (same pattern, same data, same camera):
+  GL 1.35 vs Metal 1.92 ns/sample (~1.4x) - but both numbers are inflated by
+  the lone-loop scheduling artifact.
+- Real app shader: GL 1.06 vs Metal 2.24 ns/sample (**2.1x**). The Metal
+  penalty over GL is concentrated in the divergent data-dependent loop +
+  TF/composite work, consistent with sections 4 and 9.
+- The app's GL side cannot be optimized further by "simpler" sampling; the
+  actionable levers remain the Metal divergence restructure (section 4) and
+  the S29-style scheduling fix verified inside the real shader (section 9.3).
+
+### 10.6 Instrumentation reference (kept in the tree for future investigations)
+
+The debug hooks below are **deliberately left in place**; see
+`minimal_gap/README.md` for the standalone harnesses that consume their
+output. All are env-gated and one-shot (first frame/load only), so they are
+inert unless the variable is set:
+
+| Env var | Location | Effect |
+|---|---|---|
+| `VTK_METAL_TEST_GL_ITER` | `vtkOpenGLGPUVolumeRayCastMapper.cxx` (GetShaderTemplate Substitute + RenderSingleInput FBO dump) | rewrites `gl_FragData[0] = g_fragColor;` to `vec4(g_currentT/4096.0, 0, 0, 1)`, dumps the first frame to `/tmp/app_gl_iter.ppm` (R channel = iterations). Decode: `R * 4096/255`. |
+| `VTK_METAL_TEST_DUMP_VOLTEX` | `vtkVolumeTexture.cxx` | one-shot runtime probe of the volume texture: requested/realized internal format, dims, scalar type, R/G/A bit sizes. |
+| `VTK_METAL_TEST_DUMP_UNIFORMS` | `vtkOpenGLGPUVolumeRayCastMapper.cxx` | dumps all active uniforms to `/tmp/app_gl_uniforms.txt` (harness's constants). |
+| `VTK_METAL_TEST_GL_NOTF` | `vtkVolumeShaderComposer.h` (BaseImplementation) | replaces the TF-fetch/computeColor path with a fixed color+alpha to isolate the TF-fetch cost. |
+| (always on) | `vtkOpenGLGPUVolumeRayCastMapper.cxx` BuildShader | dumps the composed shaders to `/tmp/app_gl_frag.glsl` + `/tmp/app_gl_vert.glsl` (harness inputs). |
+
+Caution: when printing GL enums through `vtkErrorMacro`, `std::hex` is
+silently dropped by `vtkOStreamWrapper` (no manipulator overload), producing
+corrupted hex values; use `snprintf` (see `DBG volume tex`).
+
+## 11. Metal microbenchmark optimization hypotheses: all four ruled out
+
+Four hypotheses for the Metal side of the gap were tested in `metal_gap.m`
+(interleaved A/B on the M2 MBA, fresh short runs to cancel thermal drift):
+half-precision (`texture3d<half>`) sampling, depth store-action parity,
+`fastMathEnabled`, and a compute-kernel rewrite. Full tables and run syntax
+are in `minimal_gap/README.md`.
+
+| variant | avg frame |
+|---|---|
+| fragment float depth+Store (baseline) | 84-87 ms |
+| fragment half sampler | 83-86 ms |
+| fragment float, depth DontCare / no depth | 85-87 ms |
+| compute kernel float / half | 95-99 ms |
+
+Results, per hypothesis:
+
+1. **Half sampling: no measurable effect (~1-2%, noise).** GL's 16-bit fast
+   paths are not the source of the ratio.
+2. **Depth store action: no effect.** The pass never writes depth; TBDR keeps
+   it in tile memory. The `gl_gap`(no-depth)/`metal_gap`(depth+Store)
+   asymmetry was real but measurement-irrelevant.
+3. **Compute kernel: ~13% slower**, not faster (98 vs 86 ms). On Apple TBDR
+   the fragment pipeline is a win for a fullscreen march; a compute rewrite
+   would regress the app's Metal backend.
+4. **`fastMathEnabled=NO` is reproducibly ~8% FASTER in the bare-fetch
+   harness** (78-80 ms vs 85-87 ms, five interleaved 30-frame rounds). The MSL
+   default is `YES`, and the old "no-op by construction" claim was wrong:
+   toggling the flag off changes the compiled shader and measurably helps the
+   tight fetch loop.
+   **The gain does NOT transfer to the full app shader.** The app A/B
+   (`VTK_METAL_TEST_FAST_MATH=0` env knob added to
+   `vtkMetalGPUVolumeRayCastMapper.mm:1608`, five interleaved 30-frame/3-rep
+   benches) was 99.2-102.1 ms vs 100.4-101.1 ms - within noise and slightly
+   slower on average. The ~8% is specific to the bare-fetch shader, so it is
+   **not** an app-level lever; the knob is left in place (env-gated, no
+   behavior change when unset) for future A/Bs.
+
+Concluded: the ~1.3x GL/Metal bare-fetch ratio is intrinsic to Metal's
+per-sample fetch/loop throughput on this device. The actionable Metal levers
+remain the divergence restructure (section 4) and the S29-style scheduling fix
+(section 9.3), not precision, depth, math flags, or dispatch model.
+
+## 12. Harness parity: Metal and GL are exactly 1:1
+
+The earlier avgIter comparison (Metal 701.7 vs GL/fp64 659.2, "Metal over-runs
+~4-7% per ray" and "Metal under-samples, meanB 0.210 vs 0.283") was an
+**artifact of a readback channel bug in `metal_gap.m`**, not a real harness
+difference.
+
+Cause: `metal_gap.m`'s render target is `MTLPixelFormatBGRA8Unorm`, so memory
+byte order is B,G,R,A while the shader writes `float4(R=iterLow, G=iterHigh,
+B=acc)`. The old stats loop treated byte0 as the iteration low byte (it is
+actually the `acc`/B channel), inflating the reported avgIter. GL's `RGBA8`
+readback has no such trap.
+
+Verified with the correct decode (`iter = byte2 + 256*byte1`), matching
+1-frame runs, and the `diag` mode (`metal_gap.m ... diag=1`, shader writes
+`rayDir*0.5+0.5`; note the same BGRA8 swap applies when reading the PPM):
+
+- avgIter: Metal **287.8** = GL 287.8 = fp64 287.8 (659.2 per nonzero pixel).
+- footprint: 69,861 nonzero pixels on both sides.
+- per-pixel iteration counts: **159,998 / 160,000 identical** after the
+  GL bottom-first -> Metal top-first row flip; the 2 remaining pixels differ
+  by exactly 1 (silhouette boundary).
+- per-pixel sample values on marched pixels: identical (mean |d| = 0.00).
+
+So the harnesses trace identical rays with identical step counts and identical
+fetches; the residual ~30 ms (57.8 ms GL vs 84-87 ms Metal) is pure GPU
+execution cost for the same work, and the fastMath result in section 11 is not
+a measurement artifact.

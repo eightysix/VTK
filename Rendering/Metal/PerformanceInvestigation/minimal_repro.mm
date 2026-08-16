@@ -265,18 +265,30 @@ fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
   float3 base = (p.axis == 2) ? float3(in.uv, 0.0) : float3(0.0, in.uv.x, in.uv.y);
   float3 d = (p.axis == 2) ? float3(0.0, 0.0, step) : float3(step, 0.0, 0.0);
   float acc = 0.0;
-  // Three separate loops (branch hoisted out) - this structure is what makes
-  // the MSL compiler overlap-schedule the texture fetches. With a single bare
-  // sampling loop the 3-D linear filter costs ~0.42 ns/sample; with the loops
-  // co-compiled it drops to ~0.06 ns/sample (faster than GL). See report
-  // section 9.
+  // Six branches, co-compiled in one function: nearest/linear (implicit LOD),
+  // the same with explicit level(0), and the manual 8-tap path. Co-compiling
+  // these independent sample sites is what makes the MSL backend overlap the
+  // fetches (see report section 9): a lone bare sampling loop runs ~0.42
+  // ns/sample regardless of explicit LOD (S33/S34), this co-compiled form
+  // runs ~0.06 ns/sample (faster than GL).
+  // Strategy values:
+  //   -1 nearest (implicit LOD) | 0 linear S29 (implicit LOD) | 1 manual 8-tap
+  //    2 linear S29 + explicit level(0) | 3 nearest + explicit level(0)
   if (p.strategy == -1) {
     for (int i = 0; i < p.steps; ++i) {
       acc += vol.sample(smpN, base + float(i) * d).r;
     }
+  } else if (p.strategy == 3) {
+    for (int i = 0; i < p.steps; ++i) {
+      acc += vol.sample(smpN, base + float(i) * d, level(0.0)).r;
+    }
   } else if (p.strategy == 0) {
     for (int i = 0; i < p.steps; ++i) {
       acc += vol.sample(smp, base + float(i) * d).r;
+    }
+  } else if (p.strategy == 2) {
+    for (int i = 0; i < p.steps; ++i) {
+      acc += vol.sample(smp, base + float(i) * d, level(0.0)).r;
     }
   } else {
     const float3 vdims = float3(512.0, 512.0, 1794.0);
@@ -302,13 +314,43 @@ fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
   }
   return float4(acc / float(p.steps));
 }
+// Isolated single-loop baselines: ONLY this loop is in the compiled fragment
+// function (no co-compiled siblings), so they isolate whether explicit
+// level(0) alone defeats the fetch-serialization (vs needing co-compiled
+// samples). Implicit-LOD bare loop was the ~0.42 ns/sample "slow" baseline.
+fragment float4 march_bare(texture3d<float, access::sample> vol [[texture(0)]],
+                           sampler smp [[sampler(0)]],
+                           constant Params& p [[buffer(0)]],
+                           FragIn in [[stage_in]]) {
+  float step = 1.0 / float(p.steps);
+  float3 base = (p.axis == 2) ? float3(in.uv, 0.0) : float3(0.0, in.uv.x, in.uv.y);
+  float3 d = (p.axis == 2) ? float3(0.0, 0.0, step) : float3(step, 0.0, 0.0);
+  float acc = 0.0;
+  for (int i = 0; i < p.steps; ++i) {
+    acc += vol.sample(smp, base + float(i) * d).r;
+  }
+  return float4(acc / float(p.steps));
+}
+fragment float4 march_bare_lod(texture3d<float, access::sample> vol [[texture(0)]],
+                               sampler smp [[sampler(0)]],
+                               constant Params& p [[buffer(0)]],
+                               FragIn in [[stage_in]]) {
+  float step = 1.0 / float(p.steps);
+  float3 base = (p.axis == 2) ? float3(in.uv, 0.0) : float3(0.0, in.uv.x, in.uv.y);
+  float3 d = (p.axis == 2) ? float3(0.0, 0.0, step) : float3(step, 0.0, 0.0);
+  float acc = 0.0;
+  for (int i = 0; i < p.steps; ++i) {
+    acc += vol.sample(smp, base + float(i) * d, level(0.0)).r;
+  }
+  return float4(acc / float(p.steps));
+}
 )";
 
 struct MetalState
 {
   id<MTLDevice> dev = nil;
   id<MTLCommandQueue> q = nil;
-  id<MTLRenderPipelineState> ps = nil;
+  id<MTLRenderPipelineState> ps = nil, psBare = nil, psBareLod = nil;
   id<MTLSamplerState> smpLinear = nil, smpNearest = nil;
   id<MTLTexture> volTex = nil, vol2d = nil, colorTex = nil;
   id<MTLBuffer> vbuf = nil;
@@ -325,7 +367,14 @@ static bool setupMetal(MetalState& s)
   s.q = [s.dev newCommandQueue];
 
   NSError* err = nil;
-  id<MTLLibrary> lib = [s.dev newLibraryWithSource:kMetalSrc options:nil error:&err];
+  MTLCompileOptions* copts = [[MTLCompileOptions alloc] init];
+  const char* fmEnv = std::getenv("REPRO_FASTMATH");
+  if (fmEnv && std::strcmp(fmEnv, "0") == 0)
+  {
+    copts.fastMathEnabled = NO;
+    DBG("Metal: fast math DISABLED\n");
+  }
+  id<MTLLibrary> lib = [s.dev newLibraryWithSource:kMetalSrc options:copts error:&err];
   if (!lib)
   {
     std::fprintf(stderr, "Metal: library compile failed: %s\n", err.localizedDescription.UTF8String);
@@ -342,6 +391,28 @@ static bool setupMetal(MetalState& s)
   {
     std::fprintf(stderr, "Metal: pipeline failed: %s\n", err.localizedDescription.UTF8String);
     return false;
+  }
+  for (int fi = 0; fi < 2; ++fi)
+  {
+    id<MTLFunction> bfs = [lib newFunctionWithName:(fi == 0) ? @"march_bare" : @"march_bare_lod"];
+    MTLRenderPipelineDescriptor* bpd = [[MTLRenderPipelineDescriptor alloc] init];
+    bpd.vertexFunction = vs;
+    bpd.fragmentFunction = bfs;
+    bpd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> st = [s.dev newRenderPipelineStateWithDescriptor:bpd error:&err];
+    if (!st)
+    {
+      std::fprintf(stderr, "Metal: bare pipeline failed: %s\n", err.localizedDescription.UTF8String);
+      return false;
+    }
+    if (fi == 0)
+    {
+      s.psBare = st;
+    }
+    else
+    {
+      s.psBareLod = st;
+    }
   }
 
   for (int i = 0; i < 2; ++i)
@@ -410,7 +481,7 @@ static void uploadMetalVolume(MetalState& s, const std::vector<uint8_t>& v)
   }
 }
 
-static double timeMetal(MetalState& s, int strategy, int axis)
+static double timeMetal(MetalState& s, id<MTLRenderPipelineState> ps, int strategy, int axis)
 {
   struct Params
   {
@@ -429,7 +500,7 @@ static double timeMetal(MetalState& s, int strategy, int axis)
       rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
       id<MTLCommandBuffer> cb = [s.q commandBuffer];
       id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rpd];
-      [e setRenderPipelineState:s.ps];
+      [e setRenderPipelineState:ps];
       [e setVertexBuffer:s.vbuf offset:0 atIndex:0];
       [e setFragmentTexture:s.volTex atIndex:0];
       [e setFragmentTexture:s.vol2d atIndex:1];
@@ -453,7 +524,7 @@ static double timeMetal(MetalState& s, int strategy, int axis)
       rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
       id<MTLCommandBuffer> cb = [s.q commandBuffer];
       id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rpd];
-      [e setRenderPipelineState:s.ps];
+      [e setRenderPipelineState:ps];
       [e setVertexBuffer:s.vbuf offset:0 atIndex:0];
       [e setFragmentTexture:s.volTex atIndex:0];
       [e setFragmentTexture:s.vol2d atIndex:1];
@@ -532,10 +603,15 @@ int main(int argc, char** argv)
   {
     const char* name;
     GLenum glFilter;
+    id<MTLRenderPipelineState> pipe;
     int mtlStrategy;
   } cfgs[] = {
-    { "nearest", GL_NEAREST, -1 },
-    { "linear", GL_LINEAR, linStrategy },
+    { "nearest", GL_NEAREST, mtl.ps, -1 },
+    { "nearest+lod0", GL_NEAREST, mtl.ps, 3 },
+    { "linear", GL_LINEAR, mtl.ps, linStrategy },
+    { "lin+lod0", GL_LINEAR, mtl.ps, 2 },
+    { "bare", GL_LINEAR, mtl.psBare, 0 },
+    { "bare+lod0", GL_LINEAR, mtl.psBareLod, 0 },
   };
 
   for (int round = 0; round < 2; ++round)
@@ -547,14 +623,19 @@ int main(int argc, char** argv)
       for (const auto& c : cfgs)
       {
         const double glMs = timeGL(gl, c.glFilter, axis);
-        const double mtMs = timeMetal(mtl, c.mtlStrategy, axis);
+        const double mtMs = timeMetal(mtl, c.pipe, c.mtlStrategy, axis);
         const float glRb = readbackGL(gl);
         const float mtRb = readbackMetal(mtl);
         const char* mtlName = c.mtlStrategy == -1 ? "nearest" : c.mtlStrategy == 0 ? "lin-nat" :
-                                                                                       "lin-man";
-        std::printf("%-8s %-7s %-6s %10.2f %12.2f %12.0f\n", "gl", c.name, axisName, glMs,
+                               c.mtlStrategy == 1 ? "lin-man" : c.mtlStrategy == 2 ? "lin+lod0" :
+                               c.mtlStrategy == 3 ? "nearest+lod0" : "?";
+        if (c.pipe == mtl.psBare || c.pipe == mtl.psBareLod)
+        {
+          mtlName = c.name;
+        }
+        std::printf("%-8s %-10s %-6s %10.2f %12.2f %12.0f\n", "gl", c.name, axisName, glMs,
           glMs * 1e6 / samplesPerFrame, glRb);
-        std::printf("%-8s %-7s %-6s %10.2f %12.2f %12.0f\n", "metal", mtlName, axisName, mtMs,
+        std::printf("%-8s %-10s %-6s %10.2f %12.2f %12.0f\n", "metal", mtlName, axisName, mtMs,
           mtMs * 1e6 / samplesPerFrame, mtRb);
       }
     }
