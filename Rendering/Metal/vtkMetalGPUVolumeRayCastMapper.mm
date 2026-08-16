@@ -317,15 +317,21 @@ static uint32_t BlendModeToFeatureFlag(int blendMode)
 
 // March-experiment selector from VTK_METAL_TEST_MARCH_VARIANT (0=none,
 // 1=manual 8-tap trilinear, 2=clamp_to_zero sampler, 3=predicated opacity exit,
-// 4=uniform frame-max loop with all exits predicated). Encoded into the feature
-// mask so each experiment gets its own specialized pipeline. Reads the env var
-// once per process. Only the low 4 bits are used (VolumeFeature_MarchVariantMask).
+// 4=uniform frame-max loop with all exits predicated, 6=8x unrolled march,
+// 7=4x unrolled march). Encoded into the feature mask so each experiment gets
+// its own specialized pipeline. Reads the env var once per process. Only the
+// low 4 bits are used (VolumeFeature_MarchVariantMask).
+//
+// Default is 6: the 8x unrolled march is the standard path (measured 1.29x
+// faster than the baseline loop with byte-identical output on the DICOM app
+// benchmark, see PERFORMANCE_INVESTIGATION.md section 14). Setting the env var
+// overrides it for A/B testing.
 static int VolumeMarchVariant()
 {
   static const int variant = [] {
     if (const char* v = getenv("VTK_METAL_TEST_MARCH_VARIANT"))
       return std::atoi(v);
-    return 0;
+    return 6;
   }();
   return variant;
 }
@@ -6099,6 +6105,17 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     else if (featureMask & VolumeFeature_BlendAdditive)
       blendMode = static_cast<int>(vtkVolumeMapper::ADDITIVE_BLEND);
     [constants setConstantValue:&blendMode type:MTLDataTypeInt withName:@"fc_blendMode"];
+
+    if (getenv("VTK_METAL_TEST_MARCH_DEBUG"))
+      fprintf(stderr,
+        "[march] variant=%d blendMode=%d shading=%d gradOp=%d minmax=%d "
+        "mask=%d blanking=%d crop=%d rect=%d tf2d=%d indep=%d depRGBA=%d depLA=%d "
+        "rt=%d (unrolled-activates=%d)\n",
+        marchVariant, blendMode, shading, gradOp, minmax, mask, blanking, cropping,
+        rectilinear, transfer2D, independentComp, dependentRGBA, dependentLA,
+        renderToTexture,
+        (marchVariant >= 6 && blendMode == 0 && !cropping && !mask && !blanking &&
+         !rectilinear && !transfer2D && !independentComp && !dependentRGBA && !dependentLA));
 
     fragFunc = [library newFunctionWithName:fragName
                              constantValues:constants

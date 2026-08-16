@@ -4194,12 +4194,212 @@ inline half4 marchVolumeUnified(
   // locked. Accumulation is gated on both flags; the fetch stays unconditional.
   bool marchDone = false;
 
+  // Env-gated N-way unrolled march (fc_marchVariant 6 = 8x, 7 = 4x, selected
+  // via VTK_METAL_TEST_MARCH_VARIANT). PERFORMANCE_INVESTIGATION.md section 14:
+  // the harness showed the bare-fetch march is texture-latency bound and that N
+  // independent scalar fetches issued back-to-back (before any consume) hide
+  // the issue latency, while prefetch-ahead with a loop-carried dependency does
+  // not. This branch restructures the fetch scheduling the same way: each batch
+  // issues N independent scalar fetches on the step lattice, then consumes them
+  // sequentially. All exits are latched (marchOpaque/marchDone) and accumulation
+  // is gated by suppressAccum, so batches may over-march the per-fragment bound
+  // without changing the result (variant-4 semantics); a mid-batch minmax
+  // empty-cell skip or out-of-cube clamp invalidates the remaining pre-fetched
+  // scalars and forces a refill from the moved position. The guard is fully
+  // compile-time, so any other feature combination keeps the baseline loop.
+  if (fc_marchVariant >= 6 && fc_blendMode == 0 && !doCropping && !doMask &&
+      !doBlanking && !doRectilinear && !doTransfer2D && !useIndependentPath &&
+      !fc_dependentRGBA && !fc_dependentLA)
+  {
+    const int unrollN = (fc_marchVariant == 7) ? 4 : 8;
+    const float3 adjTexMin = ctpOffset;
+    const float3 adjTexMax = ctpOffset + ctpScale;
+    int i = 0;
+    while (i < maxSteps)
+    {
+      const int nBatch = (maxSteps - i >= unrollN) ? unrollN : (maxSteps - i);
+      float bs[8];
+      if (nBatch > 0) { bs[0] = sampleVolumeScalar(volumeTexture, evalPoint); }
+      if (nBatch > 1) { bs[1] = sampleVolumeScalar(volumeTexture, evalPoint + evalStep); }
+      if (nBatch > 2) { bs[2] = sampleVolumeScalar(volumeTexture, evalPoint + 2.0 * evalStep); }
+      if (nBatch > 3) { bs[3] = sampleVolumeScalar(volumeTexture, evalPoint + 3.0 * evalStep); }
+      if (nBatch > 4) { bs[4] = sampleVolumeScalar(volumeTexture, evalPoint + 4.0 * evalStep); }
+      if (nBatch > 5) { bs[5] = sampleVolumeScalar(volumeTexture, evalPoint + 5.0 * evalStep); }
+      if (nBatch > 6) { bs[6] = sampleVolumeScalar(volumeTexture, evalPoint + 6.0 * evalStep); }
+      if (nBatch > 7) { bs[7] = sampleVolumeScalar(volumeTexture, evalPoint + 7.0 * evalStep); }
+      bool refillNeeded = false;
+#define PROC_UNROLL_SAMPLE(_j) \
+      { \
+        prefetchScalar = bs[_j]; \
+        prefetchValid = true; \
+        bool batchAbort = false; \
+        if (currentT >= p.tEnd - 1e-6) { marchDone = true; } \
+        if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) || \
+            any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) { \
+          if (seenInBounds) { marchDone = true; } \
+          texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0)); \
+          evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset); \
+          prefetchValid = false; \
+          currentPoint += stepVec; \
+          currentT += p.stepSize; \
+          texLocalPos += texStep; \
+          evalPoint += evalStep; \
+          batchAbort = true; \
+        } else { \
+          seenInBounds = true; \
+        } \
+        if (useMinMax) { \
+          float3 mmPos = clamp(evalPoint, float3(0.0), float3(1.0)); \
+          int3 newCell = min(int3(mmPos * mmDimF), int3(mmDimF) - 1); \
+          if (any(newCell != curCell)) { \
+            curCell = newCell; \
+            curCellEmpty = minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5; \
+          } \
+          if (curCellEmpty) { \
+            float3 cellCoord = mmPos * mmDimF; \
+            float3 fractCoord = fract(cellCoord); \
+            float3 distToEdge; \
+            distToEdge.x = p.rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x; \
+            distToEdge.y = p.rayDir.y > 0.0 ? (1.0 - fractCoord.y) : fractCoord.y; \
+            distToEdge.z = p.rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z; \
+            distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5)); \
+            float3 tToEdge; \
+            tToEdge.x = abs(rayDirTexLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirTexLocal.x * mmDimF.x) : 1e30; \
+            tToEdge.y = abs(rayDirTexLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirTexLocal.y * mmDimF.y) : 1e30; \
+            tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30; \
+            float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z); \
+            exactSkip += 1e-4; \
+            float skipDist = ceil(exactSkip / p.stepSize) * p.stepSize; \
+            skipDist = max(p.stepSize, skipDist); \
+            currentPoint += p.rayDir * skipDist; \
+            currentT += skipDist; \
+            if (p.checkBounds && (any(currentPoint < p.blockMinGlobal - 1e-4) || any(currentPoint > p.blockMaxGlobal + 1e-4) || currentT >= p.tEnd)) { \
+              marchDone = true; \
+            } \
+            texLocalPos = (volumeUniforms.volumeToTexture * \
+                float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz; \
+            evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset); \
+            prefetchValid = false; \
+            curCell = int3(-1); \
+            batchAbort = true; \
+          } \
+        } \
+        if (batchAbort) { \
+          refillNeeded = true; \
+        } else { \
+          bool needsFetch = !prefetchValid; \
+          float3 rectEvalPoint = evalPoint; \
+          if (doRectilinear && (needsFetch || useIndependentPath || fc_dependentRGBA || fc_dependentLA)) { \
+            rectEvalPoint = rectilinearSamplePosition(evalPoint, true, rectCoords, volumeUniforms); \
+          } \
+          float rawScalar = needsFetch ? sampleVolumeScalar(volumeTexture, rectEvalPoint) : prefetchScalar; \
+          half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias); \
+          half4 colorOpacity; \
+          half maskLabel = 0.0h; \
+          half4 sharedGrad = half4(0.0h); \
+          bool sharedGradReady = false; \
+          half4 cachedDensityGrad = half4(0.0h); \
+          bool densityGradReady = false; \
+          colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5)); \
+          half sampleOpacity = colorOpacity.a; \
+          if (fc_renderToTexture && haveOpaquePos != nullptr && *haveOpaquePos && sampleOpacity > 0.0h) { \
+            *firstOpaquePos = currentPoint; \
+            *haveOpaquePos = false; \
+          } \
+          half3 sampleColor = colorOpacity.rgb; \
+          half weight = 1.0h - accumulatedOpacity; \
+          if (doGradOp && maskLabel == 0.0h) { \
+            if (!sharedGradReady) { \
+              if (fc_normalTexture) { \
+                half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0))); \
+                sharedGrad = half4(normalize(nrmSample.xyz * 2.0h - 1.0h), nrmSample.w); \
+              } else if (fc_computeNormalFromOpacity) { \
+                sharedGrad = computeScalarAndDensityGradient(volumeTexture, \
+                    transferFunctionTexture, transferFunctionTexture1, \
+                    transferFunctionTexture2, transferFunctionTexture3, \
+                    evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, \
+                    gradNormFactor, scalarScale, scalarBias, cachedDensityGrad); \
+                densityGradReady = true; \
+              } else { \
+                sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
+              } \
+              sharedGradReady = true; \
+            } \
+            sampleOpacity *= sampleGradientOpacity(gradientOpacityTexture, float(sharedGrad.w)); \
+          } \
+          if (doShading && maskLabel == 0.0h && sampleOpacity > 0.0h) { \
+            half3 normal; \
+            if (fc_computeNormalFromOpacity) { \
+              if (densityGradReady) { \
+                normal = cachedDensityGrad.xyz; \
+              } else { \
+                normal = computeDensityGradientFast(volumeTexture, \
+                    transferFunctionTexture, transferFunctionTexture1, \
+                    transferFunctionTexture2, transferFunctionTexture3, \
+                    evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, \
+                    gradNormFactor, 0, scalarScale, scalarBias).xyz; \
+              } \
+            } else { \
+              if (!sharedGradReady) { \
+                if (fc_normalTexture) { \
+                  half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0))); \
+                  sharedGrad = half4(normalize(nrmSample.xyz * 2.0h - 1.0h), nrmSample.w); \
+                } else { \
+                  sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
+                } \
+                sharedGradReady = true; \
+              } \
+              normal = sharedGrad.xyz; \
+            } \
+            if (lightUniforms != nullptr && !fc_defaultLighting) { \
+              sampleColor = computeVolumeLighting(sampleColor, normal, -viewDirHalf, \
+                  ambientMat, diffuseMat, specularMat, shininessMat, \
+                  *lightUniforms, \
+                  volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize); \
+            } else { \
+              bool twoSided = (lightUniforms != nullptr && lightUniforms->twoSidedLighting != 0); \
+              sampleColor = computePhongLightingVolumeFast(sampleColor, normal, -viewDirHalf, -viewDirHalf, \
+                  ambientMat, diffuseMat, specularMat, shininessMat, twoSided); \
+            } \
+          } else if (doShading) { \
+            sampleColor = ambientMat * sampleColor; \
+          } \
+          const bool suppressAccum = \
+            ((fc_marchVariant >= 3 && marchOpaque) || (fc_marchVariant >= 4 && marchDone)); \
+          accumulatedColor += suppressAccum ? 0.0h : weight * (sampleColor * sampleOpacity); \
+          accumulatedOpacity += suppressAccum ? 0.0h : weight * sampleOpacity; \
+          currentPoint += stepVec; \
+          currentT += p.stepSize; \
+          texLocalPos += texStep; \
+          evalPoint += evalStep; \
+          if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { \
+            marchOpaque = true; \
+          } \
+          if (currentT >= p.tTerminateMax) { \
+            marchDone = true; \
+          } \
+        } \
+        i++; \
+      }
+      if (nBatch > 0) { PROC_UNROLL_SAMPLE(0) }
+      if (nBatch > 1 && !refillNeeded) { PROC_UNROLL_SAMPLE(1) }
+      if (nBatch > 2 && !refillNeeded) { PROC_UNROLL_SAMPLE(2) }
+      if (nBatch > 3 && !refillNeeded) { PROC_UNROLL_SAMPLE(3) }
+      if (nBatch > 4 && !refillNeeded) { PROC_UNROLL_SAMPLE(4) }
+      if (nBatch > 5 && !refillNeeded) { PROC_UNROLL_SAMPLE(5) }
+      if (nBatch > 6 && !refillNeeded) { PROC_UNROLL_SAMPLE(6) }
+      if (nBatch > 7 && !refillNeeded) { PROC_UNROLL_SAMPLE(7) }
+#undef PROC_UNROLL_SAMPLE
+    }
+  }
+  else
+  {
   for (int i = 0; i < maxSteps; i++) {
     // Variant 5 hybrid: exits are latched (not broken) during the uniform main
     // phase i < mainSteps, then the loop reverts to baseline per-fragment
     // breaks in the divergent tail so short rays exit as soon as they finish.
     const bool latchExit = (fc_marchVariant == 5) ? (i < mainSteps)
-                                                  : (fc_marchVariant == 4);
+                                                  : (fc_marchVariant >= 4);
     if (latchExit) {
       // Baseline stops accumulating at tEnd via the loop bound
       // maxSteps = ceil((tEnd - firstT)/stepSize); the uniform frame-max loop
@@ -4694,8 +4894,7 @@ inline half4 marchVolumeUnified(
         }
         half weight = 1.0h - accumulatedOpacity;
       const bool suppressAccum =
-        ((fc_marchVariant == 3 || fc_marchVariant == 4 || fc_marchVariant == 5) && marchOpaque) ||
-        (fc_marchVariant >= 4 && marchDone);
+        ((fc_marchVariant >= 3 && marchOpaque) || (fc_marchVariant >= 4 && marchDone));
         accumulatedColor += suppressAccum ? 0.0h : weight * tmpRGB;
         accumulatedOpacity += suppressAccum ? 0.0h : weight * tmpA;
       }
@@ -4777,8 +4976,7 @@ inline half4 marchVolumeUnified(
       }
 
       const bool suppressAccum =
-        ((fc_marchVariant == 3 || fc_marchVariant == 4 || fc_marchVariant == 5) && marchOpaque) ||
-        (fc_marchVariant >= 4 && marchDone);
+        ((fc_marchVariant >= 3 && marchOpaque) || (fc_marchVariant >= 4 && marchDone));
       accumulatedColor += suppressAccum ? 0.0h : weight * (sampleColor * sampleOpacity);
       accumulatedOpacity += suppressAccum ? 0.0h : weight * sampleOpacity;
     }
@@ -4797,7 +4995,7 @@ inline half4 marchVolumeUnified(
       prefetchValid = true;
     }
 
-    if (fc_marchVariant == 3 || fc_marchVariant == 4 || fc_marchVariant == 5) {
+    if (fc_marchVariant >= 3) {
       // Non-divergent march: latch the opacity threshold instead of breaking so
       // SIMT lanes stay locked (accumulation is gated above by select). The
       // next sample's fetch still happens (pipeline stays full); its
@@ -4830,6 +5028,7 @@ inline half4 marchVolumeUnified(
     // making the camera-inside proxy composite one fewer positive-opacity term
     // than GL at exit-boundary pixels. Rely on the CTP test alone for parity.
     // (Loop bound i < maxSteps still caps runaway rays.)
+  }
   }
 
   half4 finalColor;

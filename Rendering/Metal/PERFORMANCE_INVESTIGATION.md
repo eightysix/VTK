@@ -857,10 +857,55 @@ Interpretation:
    it is ~2 ms *slower* than baseline, not faster.
 3. **8x is the sweet spot on this device**; 16x regresses (register pressure
    cuts occupancy / latency hiding).
-4. **Open question**: the app's `fragment_volume_main` has opacity-based early
-   exit (genuinely divergent), TF/shading/min-max work, and the section-4
-   divergence restructure already applied. Whether an 8x unroll transfers to
-   the full app shader is unverified; per-step early-exit conflicts with
-   chunking, and naive fetch-ahead (pattern 1) is known-slow. A real-shader
-   harness (`metal_app_shader.m`) or an env-gated edit of the app shader is the
-   next experiment.
+
+## 15. The 8x unroll transfers to the app shader: variant 6 is the new default
+
+The app's `marchVolumeUnified` loop (~640 lines) is not a bare fetch: it
+already carries a loop-carried prefetch-ahead-1 (`prefetchScalar`/`prefetchMask`
+- the exact pattern the harness measured as slower) plus min-max/empty-cell
+skip, gradient ILP, TF lookup, lighting, and latched exits. A literal 8x unroll
+of the full body was therefore rejected; instead a dedicated `fc_marchVariant`
+experiment restructures the march as a chunked N-way unroll: 8 independent
+`sampleVolumeScalar` fetches per batch (all issued back-to-back, hiding 3-D-
+linear latency), latched exits, and no loop-carried dependencies.
+
+The env selector `VTK_METAL_TEST_MARCH_VARIANT` bakes the variant into the
+feature mask (bits 24-27) so each variant gets its own specialized pipeline.
+Variant 6 = 8x unroll, variant 7 = 4x unroll. The unrolled branch is guarded to
+the simplified composite config (no shading/gradient-op/min-max/cropping/mask/
+rectilinear/2D-TF/independent-path); other configs fall through to the baseline
+loop.
+
+Measured on the DICOM app benchmark (`vtkMetalGLVisualComparison --bench
+--scene DICOMVolume`, 30 frames x 3 runs x 3 interleaved rounds, M2 MBA,
+sample-distance 0.5, jitter on, min-max accel disabled for GL parity - the
+DICOM scene has no `ShadeOn`, so the timed workload is simplified composite):
+
+| variant | round 1 | round 2 | round 3 | mean |
+|---|---|---|---|---|
+| 0 (baseline loop) | 107.14 | 103.12 | 104.77 | **105.0** ms |
+| 7 (4x unroll) | 87.00 | 89.22 | 88.95 | **88.4** ms |
+| 6 (**8x unroll**) | 82.69 | 81.65 | 79.40 | **81.2** ms |
+
+Variant 6 is **1.29x faster than baseline** (105.0 -> 81.2 ms) on the app, but
+the app is *still* slower than GL: same-scene GL is 49.3 ms (48.73-49.91 across
+two interleaved rounds) vs Metal 79-81 ms - a residual **1.6x app gap** even
+after the unroll, in the opposite direction of the minimum-gap repro (where
+8x-unrolled Metal beat GL by 1.46x). GL+Metal image comparison (`--scene
+DICOMVolume` with both backends enabled, vtkTesting-style thresholded error)
+reports **0.000 for all three variants** - byte-identical output within
+tolerance (the ~741 raw `vtkImageDifference` error is the pre-existing backend
+difference, identical across variants). Note: running the comparison with
+`--backend metal` only *skips* the diff (TestMetalGLVisualComparison.cxx:599),
+so "worst thresholded error: 0" is vacuous unless both backends render.
+
+**Conclusion**: the harness's 8x-unroll win does transfer to the real app
+shader. Variant 6 is now the default (`VolumeMarchVariant()` returns 6 unless
+`VTK_METAL_TEST_MARCH_VARIANT` is set); variants remain selectable for A/B.
+The **residual app gap (Metal 1.6x slower than GL despite the harness showing
+Metal 1.46x faster)** is the next question: the minimum-gap repro (45.8 vs
+67.1 ms) models the bare-fetch march with the app's real camera/uniforms, so
+the extra ~2.3x of app-side Metal cost lives in what the harness does not model
+- pipeline/PSO setup, per-block dispatch overhead, offscreen render-target
+handling, the fullscreen quad vs the app's actual ray setup, or
+shading/min-max/2D-TF-enabled configs.

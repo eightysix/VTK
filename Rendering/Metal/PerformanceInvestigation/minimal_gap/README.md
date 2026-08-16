@@ -153,9 +153,39 @@ ALU-bound**: N independent 3-D-linear fetches in flight hide the sample issue
 latency. Metal's straight loop left the latency exposed; GL's compiler already
 software-pipelines it. The prefetch-with-loop-carried-dependency pattern
 (variant 1) is *slower* than baseline and must be avoided. 8x-unrolled Metal
-beats GL by 1.46x on identical work (1.00 vs 1.47 ns/sample). Whether this
-transfers to the full app shader (opacity early-exit, TF, shading) is the open
-question.
+beats GL by 1.46x on identical work (1.00 vs 1.47 ns/sample).
+
+### App transfer: the 8x unroll DOES transfer (PERFORMANCE_INVESTIGATION.md section 15)
+
+The app's `marchVolumeUnified` loop already carried a loop-carried
+prefetch-ahead-1 (the pattern 1 trap) plus min-max skip and gradient ILP, so a
+literal 8x unroll of the full body was rejected. Instead a dedicated
+`fc_marchVariant` 6 (8x chunked unroll: 8 independent `sampleVolumeScalar`
+fetches per batch, latched exits, no loop-carried deps) and 7 (4x) were added,
+guarded to the simplified composite config. Env `VTK_METAL_TEST_MARCH_VARIANT`
+bakes the variant into the feature mask so each experiment gets its own
+pipeline.
+
+DICOM app bench, 3 interleaved rounds (baseline/variant6/variant7 per round),
+30 frames x 3 reps, M2 MBA, min-max accel off for GL parity (DICOM scene has no
+`ShadeOn`):
+
+| variant | mean ms/f |
+|---|---|
+| 0 (baseline loop) | 105.0 |
+| 7 (4x) | 88.4 |
+| **6 (8x)** | **81.2** |
+
+8x is **1.29x faster** than baseline with **thresholded error 0.000** vs GL on
+every variant (real GL+Metal comparison - the `--backend metal`-only run skips
+the diff). Variant 6 is now the default `fc_marchVariant`; the env var still
+overrides for A/B.
+
+The app is still slower than GL though: same-scene GL is 49.3 ms vs Metal 79-81
+ms (~1.6x), even though the minimum-gap repro has Metal 1.46x faster. That
+residual app gap is the next investigation - the harness models the bare-fetch
+march, not pipeline setup / per-block dispatch / offscreen RT handling / the
+app's actual geometry path.
 
 Conclusions, addressing the four hypotheses:
 

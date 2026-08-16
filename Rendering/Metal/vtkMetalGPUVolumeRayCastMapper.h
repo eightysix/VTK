@@ -126,12 +126,15 @@ enum VolumeShaderFeatureFlags : uint32_t
   // pipelines compile the seven per-sample blanking texture fetches out of the
   // hot loop entirely.
   VolumeFeature_Blanking = 1u << 23,
-  // March-experiment selector (PERFORMANCE_INVESTIGATION.md section 9/10):
+  // March-experiment selector (PERFORMANCE_INVESTIGATION.md section 9/10/14):
   // 4 bits encoded at bits 24-27, baked via fc_marchVariant so each experiment
   // gets its own specialized pipeline. Driven by VTK_METAL_TEST_MARCH_VARIANT;
-  // 0 = current behavior. Experiments:
+  // 6 (8x unrolled march) is the default standard path. Experiments:
   //   1 = manual 8-tap trilinear (co-compiled volume samples)
   //   2 = clamp_to_zero volume sampler (in-shader clamp preserved)
+  //   3 = predicated opacity exit, 4 = uniform frame-max loop, 5 = hybrid
+  //   6 = 8x unrolled march (chunked independent fetches, latched exits)
+  //   7 = 4x unrolled march
   VolumeFeature_MarchVariantShift = 24,
   VolumeFeature_MarchVariantMask  = 0xFu << VolumeFeature_MarchVariantShift,
 };
