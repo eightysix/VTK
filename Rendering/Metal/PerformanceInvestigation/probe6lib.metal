@@ -4383,7 +4383,108 @@ inline half4 marchVolumeUnified(
         } \
         i++; \
       }
-    if (fc_probeSlim)
+    if (fc_marchVariant == 8 && !fc_minmax && !fc_shading && !fc_gradientOpacity &&
+        !fc_renderToTexture)
+    {
+      // fc_marchVariant 8: harness-style scheduling (minimal_gap/metal_gap.m
+      // BuildUnrollBody, PERFORMANCE_INVESTIGATION.md section 17). This is the
+      // production MetalShaders.metal branch mirrored for probe measurement:
+      // all positions first, all N volume fetches and all N TF fetches
+      // back-to-back, serial composite, ONE advance per batch
+      // (evalPoint += evalStep * 8), ONE break check per batch, scalar tail.
+      int i = 0;
+      const int steps = maxSteps;
+      for (; i + unrollN <= steps; i += unrollN)
+      {
+        if (currentT >= p.tEnd - 1e-6f) break;
+        if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+            any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+          if (seenInBounds) { break; }
+          texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+          evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+        } else {
+          seenInBounds = true;
+        }
+        float3 p0 = evalPoint;
+        float3 p1 = evalPoint + evalStep * 1.0f;
+        float3 p2 = evalPoint + evalStep * 2.0f;
+        float3 p3 = evalPoint + evalStep * 3.0f;
+        float3 p4 = evalPoint + evalStep * 4.0f;
+        float3 p5 = evalPoint + evalStep * 5.0f;
+        float3 p6 = evalPoint + evalStep * 6.0f;
+        float3 p7 = evalPoint + evalStep * 7.0f;
+        float s0 = sampleVolumeScalar(volumeTexture, p0);
+        float s1 = sampleVolumeScalar(volumeTexture, p1);
+        float s2 = sampleVolumeScalar(volumeTexture, p2);
+        float s3 = sampleVolumeScalar(volumeTexture, p3);
+        float s4 = sampleVolumeScalar(volumeTexture, p4);
+        float s5 = sampleVolumeScalar(volumeTexture, p5);
+        float s6 = sampleVolumeScalar(volumeTexture, p6);
+        float s7 = sampleVolumeScalar(volumeTexture, p7);
+        half4 c0 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s0) * scalarScale + scalarBias)), 0.5));
+        half4 c1 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s1) * scalarScale + scalarBias)), 0.5));
+        half4 c2 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s2) * scalarScale + scalarBias)), 0.5));
+        half4 c3 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s3) * scalarScale + scalarBias)), 0.5));
+        half4 c4 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s4) * scalarScale + scalarBias)), 0.5));
+        half4 c5 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s5) * scalarScale + scalarBias)), 0.5));
+        half4 c6 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s6) * scalarScale + scalarBias)), 0.5));
+        half4 c7 = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s7) * scalarScale + scalarBias)), 0.5));
+        half w0 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w0 * (c0.rgb * c0.a);
+        accumulatedOpacity += w0 * c0.a;
+        half w1 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w1 * (c1.rgb * c1.a);
+        accumulatedOpacity += w1 * c1.a;
+        half w2 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w2 * (c2.rgb * c2.a);
+        accumulatedOpacity += w2 * c2.a;
+        half w3 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w3 * (c3.rgb * c3.a);
+        accumulatedOpacity += w3 * c3.a;
+        half w4 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w4 * (c4.rgb * c4.a);
+        accumulatedOpacity += w4 * c4.a;
+        half w5 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w5 * (c5.rgb * c5.a);
+        accumulatedOpacity += w5 * c5.a;
+        half w6 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w6 * (c6.rgb * c6.a);
+        accumulatedOpacity += w6 * c6.a;
+        half w7 = 1.0h - accumulatedOpacity;
+        accumulatedColor += w7 * (c7.rgb * c7.a);
+        accumulatedOpacity += w7 * c7.a;
+        currentPoint += stepVec * 8.0f;
+        currentT += p.stepSize * 8.0f;
+        texLocalPos += texStep * 8.0f;
+        evalPoint += evalStep * 8.0f;
+        if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+        if (currentT >= p.tTerminateMax) { break; }
+      }
+      for (; i < steps; i++)
+      {
+        if (currentT >= p.tEnd - 1e-6f) break;
+        if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+            any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+          if (seenInBounds) { break; }
+          texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+          evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+        } else {
+          seenInBounds = true;
+        }
+        float s = sampleVolumeScalar(volumeTexture, evalPoint);
+        half4 c = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s) * scalarScale + scalarBias)), 0.5));
+        half w = 1.0h - accumulatedOpacity;
+        accumulatedColor += w * (c.rgb * c.a);
+        accumulatedOpacity += w * c.a;
+        currentPoint += stepVec;
+        currentT += p.stepSize;
+        texLocalPos += texStep;
+        evalPoint += evalStep;
+        if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+        if (currentT >= p.tTerminateMax) { break; }
+      }
+    }
+    else if (fc_probeSlim)
     {
       // PROBE-ONLY: replace the entire unrolled consume with the decomp's
       // lean loop (bounds clamp, needsFetch, TF, composite, breaks) using

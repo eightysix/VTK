@@ -1092,8 +1092,611 @@ fragment VolumeFragmentOut fragment_march_real_decomp(
   return output;
 }
 
+// v32: phase-separated batch-8. Replicates the minimal_gap harness's winning
+// pattern (metal_gap.m pipeline=8, 45.8 ms / 1.00 ns/sample vs GL 67.1 ms):
+// issue ALL N volume fetches back-to-back (independent, all in flight), then
+// issue ALL N transfer-function fetches back-to-back (independent of each
+// other, each depends only on its own scalar), THEN run the serial composite
+// chain. The production batch-8 (fc_marchVariant 6) already batches the
+// volume fetches but interleaves each sample's dependent TF fetch + composite
+// inside the consume; v32 tests whether phase-separating the TF fetch restores
+// the harness's MLP benefit in the full DVR. fc_v32mode (buffer 8):
+//   &1 = interleave TF fetch with consume (production-style control)
+//   &2 = no TF fetch (isolate volume fetch + composite)
+//   &4 = no composite (isolate volume + TF fetch)
+//   &8 = no bounds clamp (bare march, minimal_gap style)
+// ============================================================================
+fragment VolumeFragmentOut fragment_march_phase_batch(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    constant int& fixedIterCount [[buffer(3)]],
+    constant int& fc_v32mode [[buffer(8)]]) {
+
+  VolumeFragmentOut output;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 localPos = in.localPos;
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
+  if (!parallel) {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
+    rayDir /= dirLength;
+  }
+
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { output.color = float4(0.0); return output; }
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  const int mode = fc_v32mode;
+  const bool interleaveTF = (mode & 1) != 0;
+  const bool noTF   = (mode & 2) != 0;
+  const bool noComp = (mode & 4) != 0;
+  const bool noClamp = (mode & 8) != 0;
+
+  half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
+  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
+                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+  float3 stepVec = rayDir * stepSize;
+
+  float tStart = dot(s.entryPoint - cameraPos, rayDir);
+  float tEnd = s.totalBoxT;
+  float tTerminateMax = s.tTerminateMax;
+
+  float3 currentPoint = rayOrigin + rayDir * (tStart + stepSize);
+  float currentT = stepSize;
+  int maxSteps = max(1, int(ceil((tEnd - stepSize) / stepSize)));
+
+  half3 accumulatedColor = half3(0.0h);
+  half accumulatedOpacity = 0.0h;
+
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
+  float3 evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+
+  const float3 adjTexMin = ctpOffset;
+  const float3 adjTexMax = ctpOffset + ctpScale;
+  bool seenInBounds = false;
+
+  const int unrollN = 8;
+  int i = 0;
+  while (i < maxSteps)
+  {
+    const int nBatch = (maxSteps - i >= unrollN) ? unrollN : (maxSteps - i);
+    float bs[8];
+    if (nBatch > 0) { bs[0] = sampleVolumeScalar(volumeTexture, evalPoint); }
+    if (nBatch > 1) { bs[1] = sampleVolumeScalar(volumeTexture, evalPoint + evalStep); }
+    if (nBatch > 2) { bs[2] = sampleVolumeScalar(volumeTexture, evalPoint + 2.0 * evalStep); }
+    if (nBatch > 3) { bs[3] = sampleVolumeScalar(volumeTexture, evalPoint + 3.0 * evalStep); }
+    if (nBatch > 4) { bs[4] = sampleVolumeScalar(volumeTexture, evalPoint + 4.0 * evalStep); }
+    if (nBatch > 5) { bs[5] = sampleVolumeScalar(volumeTexture, evalPoint + 5.0 * evalStep); }
+    if (nBatch > 6) { bs[6] = sampleVolumeScalar(volumeTexture, evalPoint + 6.0 * evalStep); }
+    if (nBatch > 7) { bs[7] = sampleVolumeScalar(volumeTexture, evalPoint + 7.0 * evalStep); }
+
+    half4 co[8];
+    if (nBatch > 0) {
+      half scalarNorm = saturate(half(bs[0]) * scalarScale + scalarBias);
+      co[0] = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                   : sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
+    }
+    if (nBatch > 1) {
+      half scalarNorm = saturate(half(bs[1]) * scalarScale + scalarBias);
+      co[1] = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                   : sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
+    }
+    if (nBatch > 2) {
+      half scalarNorm = saturate(half(bs[2]) * scalarScale + scalarBias);
+      co[2] = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                   : sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
+    }
+    if (nBatch > 3) {
+      half scalarNorm = saturate(half(bs[3]) * scalarScale + scalarBias);
+      co[3] = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                   : sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
+    }
+    if (nBatch > 4) {
+      half scalarNorm = saturate(half(bs[4]) * scalarScale + scalarBias);
+      co[4] = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                   : sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
+    }
+    if (nBatch > 5) {
+      half scalarNorm = saturate(half(bs[5]) * scalarScale + scalarBias);
+      co[5] = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                   : sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
+    }
+    if (nBatch > 6) {
+      half scalarNorm = saturate(half(bs[6]) * scalarScale + scalarBias);
+      co[6] = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                   : sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
+    }
+    if (nBatch > 7) {
+      half scalarNorm = saturate(half(bs[7]) * scalarScale + scalarBias);
+      co[7] = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                   : sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
+    }
+
+    if (!noClamp) {
+      if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+          any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+        if (seenInBounds) { break; }
+        texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+        evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+      } else {
+        seenInBounds = true;
+      }
+    }
+
+    bool batchDone = false;
+    for (int j = 0; j < nBatch; j++) {
+      half sampleOpacity = co[j].a;
+      if (!noComp) {
+        half3 sampleColor = co[j].rgb;
+        half weight = 1.0h - accumulatedOpacity;
+        accumulatedColor += weight * (sampleColor * sampleOpacity);
+        accumulatedOpacity += weight * sampleOpacity;
+      }
+      currentPoint += stepVec;
+      currentT += stepSize;
+      texLocalPos += texStep;
+      evalPoint += evalStep;
+      if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { batchDone = true; break; }
+      if (currentT >= tTerminateMax) { batchDone = true; break; }
+    }
+    i += nBatch;
+    if (batchDone) { break; }
+  }
+
+  output.color = float4(float3(accumulatedColor), accumulatedOpacity);
+  return output;
+}
+
+// v33: phase-separated batch-8, scalar-only (no arrays). Faithful port of
+// minimal_gap's winning 8x unroll (metal_gap.m BuildUnrollBody, 45.8ms /
+// 1.00 ns/sample vs GL 67.1ms): compute all positions, issue all 8 volume
+// fetches back-to-back, then all 8 TF fetches back-to-back (each independent,
+// all in flight), then the serial composite chain, ONE break check per batch.
+// v32 (identical idea) used runtime-indexed co[]/bs[] loops which forced local
+// memory (83ms); v33 uses constant-indexed scalar variables so the compiler
+// keeps all fetches in registers like the harness. fc_v33mode (buffer 8):
+//   &1 = interleave TF fetch with composite (production-style control)
+//   &2 = skip TF fetch (constant color, isolate volume fetch + composite)
+//   &4 = skip composite (isolate volume + TF fetch)
+//   &8 = no bounds clamp (bare march, minimal_gap style)
+// ============================================================================
+fragment VolumeFragmentOut fragment_march_phase_batch_scalar(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    constant int& fixedIterCount [[buffer(3)]],
+    constant int& fc_v33mode [[buffer(8)]]) {
+
+  VolumeFragmentOut output;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 localPos = in.localPos;
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
+  if (!parallel) {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
+    rayDir /= dirLength;
+  }
+
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { output.color = float4(0.0); return output; }
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  const int mode = fc_v33mode;
+  const bool interleaveTF = (mode & 1) != 0;
+  const bool noTF   = (mode & 2) != 0;
+  const bool noComp = (mode & 4) != 0;
+  const bool noClamp = (mode & 8) != 0;
+
+  half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
+  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
+                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+  float3 stepVec = rayDir * stepSize;
+
+  float tStart = dot(s.entryPoint - cameraPos, rayDir);
+  float tEnd = s.totalBoxT;
+  float tTerminateMax = s.tTerminateMax;
+
+  float3 currentPoint = rayOrigin + rayDir * (tStart + stepSize);
+  float currentT = stepSize;
+  int maxSteps = max(1, int(ceil((tEnd - stepSize) / stepSize)));
+
+  half3 accumulatedColor = half3(0.0h);
+  half accumulatedOpacity = 0.0h;
+
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
+  float3 evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+
+  const float3 adjTexMin = ctpOffset;
+  const float3 adjTexMax = ctpOffset + ctpScale;
+  bool seenInBounds = false;
+
+  const int unrollN = 8;
+  int i = 0;
+  bool batchDone = false;
+  while (i < maxSteps)
+  {
+    const int nBatch = (maxSteps - i >= unrollN) ? unrollN : (maxSteps - i);
+    float s0, s1, s2, s3, s4, s5, s6, s7;
+    if (nBatch > 0) { s0 = sampleVolumeScalar(volumeTexture, evalPoint); }
+    if (nBatch > 1) { s1 = sampleVolumeScalar(volumeTexture, evalPoint + evalStep); }
+    if (nBatch > 2) { s2 = sampleVolumeScalar(volumeTexture, evalPoint + 2.0 * evalStep); }
+    if (nBatch > 3) { s3 = sampleVolumeScalar(volumeTexture, evalPoint + 3.0 * evalStep); }
+    if (nBatch > 4) { s4 = sampleVolumeScalar(volumeTexture, evalPoint + 4.0 * evalStep); }
+    if (nBatch > 5) { s5 = sampleVolumeScalar(volumeTexture, evalPoint + 5.0 * evalStep); }
+    if (nBatch > 6) { s6 = sampleVolumeScalar(volumeTexture, evalPoint + 6.0 * evalStep); }
+    if (nBatch > 7) { s7 = sampleVolumeScalar(volumeTexture, evalPoint + 7.0 * evalStep); }
+
+    half4 c0, c1, c2, c3, c4, c5, c6, c7;
+#define FETCHTF(_k) \
+    { half scalarNorm = saturate(half(s##_k) * scalarScale + scalarBias); \
+      c##_k = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h) \
+                   : sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5)); }
+    if (nBatch > 0) { FETCHTF(0) }
+    if (nBatch > 1) { FETCHTF(1) }
+    if (nBatch > 2) { FETCHTF(2) }
+    if (nBatch > 3) { FETCHTF(3) }
+    if (nBatch > 4) { FETCHTF(4) }
+    if (nBatch > 5) { FETCHTF(5) }
+    if (nBatch > 6) { FETCHTF(6) }
+    if (nBatch > 7) { FETCHTF(7) }
+#undef FETCHTF
+
+    if (!noClamp) {
+      if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+          any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+        if (seenInBounds) { break; }
+        texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+        evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+      } else {
+        seenInBounds = true;
+      }
+    }
+
+#define COMPOSITE(_k) \
+    { half sampleOpacity = c##_k.a; \
+      if (!noComp) { \
+        half3 sampleColor = c##_k.rgb; \
+        half weight = 1.0h - accumulatedOpacity; \
+        accumulatedColor += weight * (sampleColor * sampleOpacity); \
+        accumulatedOpacity += weight * sampleOpacity; \
+      } \
+      currentPoint += stepVec; \
+      currentT += stepSize; \
+      texLocalPos += texStep; \
+      evalPoint += evalStep; \
+      if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { batchDone = true; } \
+      if (currentT >= tTerminateMax) { batchDone = true; } }
+#define COMPOSITE_I(_k) \
+    { half4 ctf = interleaveTF ? c##_k : half4(0.0h); \
+      half scalarNorm = saturate(half(s##_k) * scalarScale + scalarBias); \
+      ctf = interleaveTF ? ctf : sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5)); \
+      half sampleOpacity = ctf.a; \
+      if (!noComp) { \
+        half3 sampleColor = ctf.rgb; \
+        half weight = 1.0h - accumulatedOpacity; \
+        accumulatedColor += weight * (sampleColor * sampleOpacity); \
+        accumulatedOpacity += weight * sampleOpacity; \
+      } \
+      currentPoint += stepVec; \
+      currentT += stepSize; \
+      texLocalPos += texStep; \
+      evalPoint += evalStep; \
+      if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { batchDone = true; } \
+      if (currentT >= tTerminateMax) { batchDone = true; } }
+    if (interleaveTF) {
+      if (nBatch > 0) { COMPOSITE_I(0) }
+      if (nBatch > 1 && !batchDone) { COMPOSITE_I(1) }
+      if (nBatch > 2 && !batchDone) { COMPOSITE_I(2) }
+      if (nBatch > 3 && !batchDone) { COMPOSITE_I(3) }
+      if (nBatch > 4 && !batchDone) { COMPOSITE_I(4) }
+      if (nBatch > 5 && !batchDone) { COMPOSITE_I(5) }
+      if (nBatch > 6 && !batchDone) { COMPOSITE_I(6) }
+      if (nBatch > 7 && !batchDone) { COMPOSITE_I(7) }
+    } else {
+      if (nBatch > 0) { COMPOSITE(0) }
+      if (nBatch > 1 && !batchDone) { COMPOSITE(1) }
+      if (nBatch > 2 && !batchDone) { COMPOSITE(2) }
+      if (nBatch > 3 && !batchDone) { COMPOSITE(3) }
+      if (nBatch > 4 && !batchDone) { COMPOSITE(4) }
+      if (nBatch > 5 && !batchDone) { COMPOSITE(5) }
+      if (nBatch > 6 && !batchDone) { COMPOSITE(6) }
+      if (nBatch > 7 && !batchDone) { COMPOSITE(7) }
+    }
+#undef COMPOSITE
+#undef COMPOSITE_I
+    i += nBatch;
+    if (batchDone) { break; }
+  }
+
+  output.color = float4(float3(accumulatedColor), accumulatedOpacity);
+  return output;
+}
+
+// v34: exact minimal_gap scheduling (BuildUnrollBody) applied to the full DVR.
+// v33 proved scalar-only phase-separated batches beat the production array
+// consume (69 vs 75ms). v34 now replicates the harness's loop shape verbatim:
+//   - batch condition `i + N <= maxSteps` (no per-batch nBatch tail inside)
+//   - ONE break check per batch at top: `if (currentT >= tEnd - 1e-6f) break;`
+//   - compute all 8 positions p0..p7 FIRST
+//   - issue all 8 volume fetches back-to-back
+//   - issue all 8 TF fetches back-to-back (independent of each other)
+//   - serial composite chain (DVR is inherently serial, unlike the harness's
+//     max-tree, but the fetches are all independent and in flight)
+//   - ONE advance per batch: evalPoint += evalStep * 8 (loop-carried chain is
+//     1-op, not 8 serial adds)
+//   - scalar break-aware tail loop (harness style)
+// Tests whether the 8-long serial advance chain in v33's consume (and the
+// per-sample tTerminateMax/opacity checks) cost the remaining 24ms vs the
+// harness's 45.8ms. fc_v34mode (buffer 8):
+//   &1 = per-sample advance inside consume (v33-style control)
+//   &2 = keep per-sample opacity/tTerminate breaks inside consume
+//   &4 = no TF fetch (constant color)
+//   &8 = no composite
+//   &16 = no bounds clamp (bare march, sampler clamp_to_edge handles exits)
+// ============================================================================
+fragment VolumeFragmentOut fragment_march_phase_batch_sched(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    constant int& fixedIterCount [[buffer(3)]],
+    constant int& fc_v34mode [[buffer(8)]]) {
+
+  VolumeFragmentOut output;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 localPos = in.localPos;
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
+  if (!parallel) {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
+    rayDir /= dirLength;
+  }
+
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { output.color = float4(0.0); return output; }
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  const int mode = fc_v34mode;
+  const bool perSampleAdvance = (mode & 1) != 0;
+  const bool perSampleBreaks = (mode & 2) != 0;
+  const bool noTF   = (mode & 4) != 0;
+  const bool noComp = (mode & 8) != 0;
+  const bool noClamp = (mode & 16) != 0;
+
+  half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
+  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
+                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+  float3 stepVec = rayDir * stepSize;
+
+  float tStart = dot(s.entryPoint - cameraPos, rayDir);
+  float tEnd = s.totalBoxT;
+  float tTerminateMax = s.tTerminateMax;
+
+  float3 currentPoint = rayOrigin + rayDir * (tStart + stepSize);
+  float currentT = stepSize;
+  int maxSteps = max(1, int(ceil((tEnd - stepSize) / stepSize)));
+
+  half3 accumulatedColor = half3(0.0h);
+  half accumulatedOpacity = 0.0h;
+
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
+  float3 evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+
+  const float3 adjTexMin = ctpOffset;
+  const float3 adjTexMax = ctpOffset + ctpScale;
+  bool seenInBounds = false;
+
+  const int unrollN = 8;
+  int i = 0;
+  const int steps = maxSteps;
+  for (; i + unrollN <= steps; i += unrollN)
+  {
+    if (currentT >= tEnd - 1e-6f) break;
+    if (!noClamp) {
+      if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+          any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+        if (seenInBounds) { break; }
+        texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+        evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+      } else {
+        seenInBounds = true;
+      }
+    }
+
+    float3 p0 = evalPoint;
+    float3 p1 = evalPoint + evalStep * 1.0f;
+    float3 p2 = evalPoint + evalStep * 2.0f;
+    float3 p3 = evalPoint + evalStep * 3.0f;
+    float3 p4 = evalPoint + evalStep * 4.0f;
+    float3 p5 = evalPoint + evalStep * 5.0f;
+    float3 p6 = evalPoint + evalStep * 6.0f;
+    float3 p7 = evalPoint + evalStep * 7.0f;
+
+    float s0 = sampleVolumeScalar(volumeTexture, p0);
+    float s1 = sampleVolumeScalar(volumeTexture, p1);
+    float s2 = sampleVolumeScalar(volumeTexture, p2);
+    float s3 = sampleVolumeScalar(volumeTexture, p3);
+    float s4 = sampleVolumeScalar(volumeTexture, p4);
+    float s5 = sampleVolumeScalar(volumeTexture, p5);
+    float s6 = sampleVolumeScalar(volumeTexture, p6);
+    float s7 = sampleVolumeScalar(volumeTexture, p7);
+
+    half4 c0 = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                    : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s0) * scalarScale + scalarBias)), 0.5));
+    half4 c1 = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                    : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s1) * scalarScale + scalarBias)), 0.5));
+    half4 c2 = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                    : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s2) * scalarScale + scalarBias)), 0.5));
+    half4 c3 = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                    : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s3) * scalarScale + scalarBias)), 0.5));
+    half4 c4 = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                    : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s4) * scalarScale + scalarBias)), 0.5));
+    half4 c5 = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                    : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s5) * scalarScale + scalarBias)), 0.5));
+    half4 c6 = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                    : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s6) * scalarScale + scalarBias)), 0.5));
+    half4 c7 = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                    : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s7) * scalarScale + scalarBias)), 0.5));
+
+    if (!noComp) {
+      half w0 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w0 * (c0.rgb * c0.a);
+      accumulatedOpacity += w0 * c0.a;
+      half w1 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w1 * (c1.rgb * c1.a);
+      accumulatedOpacity += w1 * c1.a;
+      half w2 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w2 * (c2.rgb * c2.a);
+      accumulatedOpacity += w2 * c2.a;
+      half w3 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w3 * (c3.rgb * c3.a);
+      accumulatedOpacity += w3 * c3.a;
+      half w4 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w4 * (c4.rgb * c4.a);
+      accumulatedOpacity += w4 * c4.a;
+      half w5 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w5 * (c5.rgb * c5.a);
+      accumulatedOpacity += w5 * c5.a;
+      half w6 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w6 * (c6.rgb * c6.a);
+      accumulatedOpacity += w6 * c6.a;
+      half w7 = 1.0h - accumulatedOpacity;
+      accumulatedColor += w7 * (c7.rgb * c7.a);
+      accumulatedOpacity += w7 * c7.a;
+    }
+
+    if (perSampleAdvance) {
+      currentPoint += stepVec;
+      currentT += stepSize;
+      texLocalPos += texStep;
+      evalPoint += evalStep;
+      currentPoint += stepVec;
+      currentT += stepSize;
+      texLocalPos += texStep;
+      evalPoint += evalStep;
+      currentPoint += stepVec;
+      currentT += stepSize;
+      texLocalPos += texStep;
+      evalPoint += evalStep;
+      currentPoint += stepVec;
+      currentT += stepSize;
+      texLocalPos += texStep;
+      evalPoint += evalStep;
+      currentPoint += stepVec;
+      currentT += stepSize;
+      texLocalPos += texStep;
+      evalPoint += evalStep;
+      currentPoint += stepVec;
+      currentT += stepSize;
+      texLocalPos += texStep;
+      evalPoint += evalStep;
+      currentPoint += stepVec;
+      currentT += stepSize;
+      texLocalPos += texStep;
+      evalPoint += evalStep;
+      currentPoint += stepVec;
+      currentT += stepSize;
+      texLocalPos += texStep;
+      evalPoint += evalStep;
+    } else {
+      currentPoint += stepVec * 8.0f;
+      currentT += stepSize * 8.0f;
+      texLocalPos += texStep * 8.0f;
+      evalPoint += evalStep * 8.0f;
+    }
+    if (perSampleBreaks) {
+      if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+      if (currentT >= tTerminateMax) { break; }
+    }
+  }
+  for (; i < steps; i++)
+  {
+    if (currentT >= tEnd - 1e-6f) break;
+    if (!noClamp) {
+      if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+          any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+        if (seenInBounds) { break; }
+        texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+        evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+      } else {
+        seenInBounds = true;
+      }
+    }
+    float s = sampleVolumeScalar(volumeTexture, evalPoint);
+    half4 c = noTF ? half4(0.5h, 0.5h, 0.5h, 0.6h)
+                   : sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s) * scalarScale + scalarBias)), 0.5));
+    if (!noComp) {
+      half w = 1.0h - accumulatedOpacity;
+      accumulatedColor += w * (c.rgb * c.a);
+      accumulatedOpacity += w * c.a;
+    }
+    currentPoint += stepVec;
+    currentT += stepSize;
+    texLocalPos += texStep;
+    evalPoint += evalStep;
+    if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+    if (currentT >= tTerminateMax) { break; }
+  }
+
+  output.color = float4(float3(accumulatedColor), accumulatedOpacity);
+  return output;
+}
+
 // v21: clone of fragment_march_linear_fixedN (v7) but clamp the sample
-// coordinate to [0,1] every iteration. Tests whether out-of-range coordinates
 // (the sampler's clamp_to_edge slow path) are what cause the ~100ms floor.
 fragment VolumeFragmentOut fragment_march_linear_clamp(
     VolumeVertexOut in [[stage_in]],

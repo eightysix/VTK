@@ -318,20 +318,24 @@ static uint32_t BlendModeToFeatureFlag(int blendMode)
 // March-experiment selector from VTK_METAL_TEST_MARCH_VARIANT (0=none,
 // 1=manual 8-tap trilinear, 2=clamp_to_zero sampler, 3=predicated opacity exit,
 // 4=uniform frame-max loop with all exits predicated, 6=8x unrolled march,
-// 7=4x unrolled march). Encoded into the feature mask so each experiment gets
-// its own specialized pipeline. Reads the env var once per process. Only the
-// low 4 bits are used (VolumeFeature_MarchVariantMask).
+// 7=4x unrolled march, 8=harness-style scheduled march). Encoded into the
+// feature mask so each experiment gets its own specialized pipeline. Reads the
+// env var once per process. Only the low 4 bits are used
+// (VolumeFeature_MarchVariantMask).
 //
-// Default is 6: the 8x unrolled march is the standard path (measured 1.29x
-// faster than the baseline loop with byte-identical output on the DICOM app
-// benchmark, see PERFORMANCE_INVESTIGATION.md section 14). Setting the env var
-// overrides it for A/B testing.
+// Default is 8: the harness-style scheduled march, which ports the
+// minimal_gap/metal_gap.m 8x BuildUnrollBody scheduling into the real shader
+// (positions computed first, all volume and TF fetches issued back-to-back,
+// ONE advance per batch, ONE break check per batch, scalar tail). Measured on
+// the DICOM app benchmark: mv=6 75.9/77.2 ms vs mv=8 62.6/59.5 ms (GL 47-49
+// ms), byte-identical output (see PERFORMANCE_INVESTIGATION.md section 17).
+// Setting the env var overrides it for A/B testing.
 static int VolumeMarchVariant()
 {
   static const int variant = [] {
     if (const char* v = getenv("VTK_METAL_TEST_MARCH_VARIANT"))
       return std::atoi(v);
-    return 6;
+    return 8;
   }();
   return variant;
 }

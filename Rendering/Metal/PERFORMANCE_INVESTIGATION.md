@@ -900,8 +900,10 @@ difference, identical across variants). Note: running the comparison with
 so "worst thresholded error: 0" is vacuous unless both backends render.
 
 **Conclusion**: the harness's 8x-unroll win does transfer to the real app
-shader. Variant 6 is now the default (`VolumeMarchVariant()` returns 6 unless
-`VTK_METAL_TEST_MARCH_VARIANT` is set); variants remain selectable for A/B.
+shader. Variant 6 was the default at this point (`VolumeMarchVariant()` returned
+6 unless `VTK_METAL_TEST_MARCH_VARIANT` is set); variants remain selectable for
+A/B. Variant 8 (harness-style scheduling, section 17) later superseded 6 as the
+default, cutting the gap from 1.6x to 1.27x.
 The **residual app gap (Metal 1.6x slower than GL despite the harness showing
 Metal 1.46x faster)** is the next question: the minimum-gap repro (45.8 vs
 67.1 ms) models the bare-fetch march with the app's real camera/uniforms, so
@@ -910,71 +912,126 @@ the extra ~2.3x of app-side Metal cost lives in what the harness does not model
 handling, the fullscreen quad vs the app's actual ray setup, or
 shading/min-max/2D-TF-enabled configs.
 
-## 16. The residual 1.6x gap is the shader's register/occupancy context, not the unroll
+## 16. Correction: the decomp "GL parity" was a mis-attributed MIP probe
 
-The probe harness (`probe7b`, BGRA8 direct, no plumbing) reproduces the app
-almost exactly: `fragment_volume_main` mv=6 = 74.5-75.5 ms vs app 79-81 ms
-(~6 ms plumbing), and mv=0 baseline = 99.7 ms vs app 105 ms. All further work
-below was done in the probe, then verified in-app.
+Earlier drafts claimed `fragment_march_real_decomp` (probe v22) hit GL parity
+at 44-47 ms. That was **wrong**: the 47 ms measurement belonged to probe v22 =
+`fragment_march_nearest_clamp`, a trivial *nearest-clamp MIP* probe, not the
+decomp. The real decomp (`fragment_march_real_decomp`, probe v20) runs the same
+lean prefetch-1 loop (prefetch-ahead-1, bounds-clamp+refetch, TF, composite,
+direct breaks) at **~104 ms** in the same harness - *slower* than the batch-8
+unroll, not at GL parity. The "45 ms" figure was a fragment-index mix-up between
+v20 and v22 (fragNames array positions in probe7b.m). The conclusions of the
+original section 16 (batch-8 vs decomp structural gap, fc_probeSlim context
+blocker, dead-array trap) were all built on that phantom baseline and are
+invalidated.
 
-### 16.1 The decomp fragment: GL parity is achievable
+### 16.1 Corrected measurements (probe7b, BGRA8 direct, no plumbing)
 
-`fragment_march_real_decomp` (probe v22) runs the *same* uniforms/data with a
-self-contained lean loop (prefetch-ahead-1, bounds-clamp+refetch, TF, composite,
-direct breaks) at **44-47 ms** in the same harness - i.e. essentially GL parity
-(49.3 ms app). Counts confirm it marches the same ray (`fragment_count_steps`
-v4: 69,862 marched pixels, avg 659.15 steps/pixel, 46.05M total iters).
+| probe | loop structure | time |
+|---|---|---|
+| v20 `fragment_march_real_decomp` | prefetch-1, lean consume, breaks | **104 ms** |
+| v22 `fragment_march_nearest_clamp` | trivial MIP (nearest/clamp) | **47 ms** (phantom) |
+| v25 `fragment_march_decomp_unrolled` | batch-8 + unrolled machinery | 76 ms |
+| v34 `fragment_march_phase_batch_sched` | harness-style (positions-first, all fetches back-to-back, single advance, scalar tail) | **56 ms** |
+| real mv=6 | batch-8, full `fragment_volume_main` | 75 ms |
 
-### 16.2 Decisive experiments (probe7b)
+### 16.2 What is actually true
 
-| probe | loop structure | context | time |
-|---|---|---|---|
-| v22 decomp | prefetch-1, lean consume, breaks | minimal | **45 ms** |
-| v27/v28 decomp + *dead* `float bs[8]` | prefetch-1 | minimal | **104 ms** |
-| v25 mode=0 | batch-8 + full unrolled machinery | minimal | 76 ms |
-| v25 mode=14 (breaks/no-tEnd/no-batchAbort) | batch-8, decomp-style consume | minimal | 75 ms |
-| v25 mode=1/15 (prefetch) | prefetch-1 + machinery | minimal | 85 ms |
-| real mv=6 | batch-8 | full | **75 ms** |
-| real mv=6 + fc_probeSlim (decomp's lean loop) | prefetch-1 | full | 97 ms |
-| real mv=6 + fc_probeScalars (no array) | batch-8 | full | 76 ms |
-| real mv=6 + fc_probePrefetch (no array) | prefetch-1 + machinery | full | 92 ms |
+1. **The batch-8 unrolled consume is not the problem.** v25 (batch-8, full
+   machinery) = 76 ms beats the lean prefetch-1 decomp (v20) = 104 ms. The
+   unrolled structure's ~30 ms advantage over the baseline loop is real; the
+   prefetch-1 "pipelining win" was an artifact of the mis-attributed MIP probe.
+2. **The `float bs[8]` array is not a 2.3x trap in general.** The dead-array
+   probes (v27/v28, ~104 ms) showed a penalty only in the prefetch-1 *context*
+   where the array forces local memory; in the batch-8 context the array is
+   register-scalarized (scalar batch v33 vs array batch v32: 70 vs 83 ms - the
+   array costs ~13 ms there, but the production function's register pressure
+   already scalarizes it, so replacing it gains nothing in-app).
+3. **The production fragment's context matters, but only via scheduling.** The
+   decisive win is *not* the consume body - it is the loop **scheduling**
+   harness (v34): compute all 8 positions first, issue all 8 volume fetches and
+   all 8 TF fetches back-to-back (independent, in flight), composite serially,
+   advance once per batch (`evalPoint += evalStep * 8`, a 1-op loop-carried
+   chain instead of 8 serial adds), and use a scalar tail loop. v34 = 56 ms vs
+   the batch-8 consume's 76 ms in the same shader context.
 
-Conclusions:
+### 16.3 The v34 scheduling decomposition (probe7_extra.metal)
 
-1. **The batch-8 structure is the entire unrolled-vs-decomp gap.** Stripping
-   every piece of the unrolled machinery (tEnd-latch, batchAbort refill,
-   marchOpaque/marchDone latches, suppressAccum) changes nothing: v25 mode=14
-   (decomp-style consume, batch fetches) is still 75 ms. The batch's 8
-   independent fetches + dependent TF fetches + serial composite have a
-   ~30 ms structural floor over the pipelined prefetch loop.
-2. **The unrolled consume machinery itself is free** in batch mode (mode 0 vs
-   14 differ by <1 ms); it only matters when prefetch-1 scheduling forces the
-   compiler to keep a live scalar across the consume (85 vs 45 ms).
-3. **The `float bs[8]` array is a 2.3x trap in a small shader** (dead-array
-   v27/v28: 104 vs 45 ms) - a per-thread local-memory/occupancy penalty. In the
-   big production function it is already register-scalarized (scalar batch v26
-   = 76 ms, identical) so replacing it with 8 scalars gains nothing there.
-4. **The production fragment's context is the blocker for the fast loop.** The
-   *identical* lean decomp loop inlined into `fragment_volume_main`
-   (fc_probeSlim) runs 97 ms vs 45 ms standalone; the full function's register
-   footprint (10+ texture handles, `MarchParams`, output state) stops the
-   compiler from software-pipelining the prefetch. The batch is
-   context-robust (75 ms either way) because it needs no pipelining.
+| probe | structure | time |
+|---|---|---|
+| v32 `fragment_march_phase_batch` | positions-first, but TF via runtime-indexed `co[8]` array | 83 ms |
+| v33 `fragment_march_phase_batch_scalar` | positions-first, scalar s0..s7/c0..c7, phase-separated | 70 ms |
+| v34 `fragment_march_phase_batch_sched` | v33 + single advance per batch, one break per batch, scalar tail | **56 ms** |
 
-### 16.3 Why prefetch-1 is fragile
-
-The decomp's 45 ms depends on a *clean* prefetch-ahead-1 pattern: a single
-unconditional fetch at the loop bottom, branch-light consume, no local arrays.
-Any perturbation breaks the compiler's pipelining and exposes per-iteration
-texture latency: +40 ms for the unrolled machinery (v25), +12 ms for the full
-function context (fc_probeSlim), +60 ms for a dead array (v28).
+The v32->v33 delta (~13 ms) is the runtime-indexed `co[8]` array forcing local
+memory; the v33->v34 delta (~14 ms) is the scheduling: one loop-carried advance
+per batch and one break check per batch instead of per-sample bookkeeping.
+Bounds-clamping is ~free (v34 mode 0 vs 16 within noise). Mode bits barely
+matter; the *shape* is the win.
 
 ### 16.4 Direction
 
-75 ms is essentially optimal for the current single-fragment structure. GL
-parity (~46-50 ms) requires the hot loop to live in a *minimal-register
-self-contained fragment* (the decomp shape), selected when the config is the
-simplified composite path (no shading/gradient-op/min-max/mask/cropping/
-rectilinear/2D-TF). Since the Metal backend is not a production target yet,
-section 17 below experiments with exactly that restructure.
+The production `fragment_volume_main` should adopt the v34 scheduling. Because
+minmax/shading/gradient-op/renderToTexture are `function_constant`s, the lean
+combo (all off) can compile to a dedicated harness-scheduled loop, with any
+feature-enabled config falling back to the existing batch-8 consume (which is
+correct for all flags). This is implemented as **fc_marchVariant 8** and
+documented in section 17.
+
+## 17. Variant 8: the harness-style scheduling is ported to the app shader (new default)
+
+### 17.1 The port
+
+`fc_marchVariant 8` in `MetalShaders.metal` ports probe v34's loop shape into
+`fragment_volume_main`:
+
+- `for (; i + unrollN <= steps; i += unrollN)` batch loop with **one** break
+  check at the top (`currentT >= p.tEnd - 1e-6f`).
+- All 8 positions computed first (`p0..p7 = evalPoint + evalStep*k`), all 8
+  volume fetches back-to-back, all 8 TF fetches back-to-back - independent, in
+  flight.
+- Serial composite chain (`w0..w7`, no arrays, no runtime-indexed state).
+- **One advance per batch**: `currentPoint += stepVec * 8` etc. - a 1-op
+  loop-carried chain instead of 8 serial adds.
+- Scalar tail loop for the `steps - i < unrollN` remainder.
+- Bounds clamp preserved (mode 0 semantics: clamp-and-continue on the entry
+  side, break after `seenInBounds`, matching the GL clamp-to-edge parity).
+
+The branch is gated at compile time on the lean combo (`fc_marchVariant == 8 &&
+!fc_minmax && !fc_shading && !fc_gradientOpacity && !fc_renderToTexture`); any
+other feature combination keeps the existing batch-8 consume (variant 6/7
+semantics), which is correct for all flags. So the fast path never compromises
+minmax/shading/gradient-op/renderToTexture rendering.
+
+### 17.2 In-app measurement (DICOM app benchmark, M2 MBA, interleaved A/B)
+
+`vtkMetalGLVisualComparison --bench --scene DICOMVolume --dicom ... --frames 30
+--reps 1`, sample-distance 0.5, jitter on, min-max accel disabled for GL
+parity:
+
+| variant | round 1 | round 2 | mean |
+|---|---|---|---|
+| GL | 46.97 | 48.89 | **47.9** ms |
+| 6 (batch-8 consume) | 75.93 | 77.18 | **76.6** ms |
+| 8 (**harness scheduling**) | 62.61 | 59.45 | **61.0** ms |
+
+Thresholded GL-vs-Metal image error: **0.000** (byte-identical within
+tolerance) for both variants. Variant 8 cuts the Metal-vs-GL gap from 1.60x to
+**1.27x**, matching the probe's v34 result (56 ms probe + ~6 ms app plumbing).
+
+**Note on the earlier flat result**: an initial in-app run of variant 8 showed
+no improvement because the test binary had not been relinked (only the framework
+was rebuilt with `--resume`, not `--tests`). The stale `bin/vtkMetalGLVisualComparison`
+did not contain the new shader source. Always rebuild with `--resume --tests`
+after editing `.metal` sources before benchmarking in-app.
+
+### 17.3 Status
+
+Variant 8 is now the app default (`VolumeMarchVariant()` returns 8;
+`VTK_METAL_TEST_MARCH_VARIANT` still overrides for A/B). The residual 1.27x gap
+vs GL is dominated by the app's ~6 ms plumbing plus the shader's remaining
+per-sample machinery that the lean harness probe does not model. With minmax
+acceleration enabled (the app's default when not forcing GL parity) the gap
+would be even smaller; the numbers above use min-max off to match GL exactly.
 

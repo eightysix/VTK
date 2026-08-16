@@ -335,8 +335,8 @@ int main(int argc, const char** argv) {
         "fragment_march_linear_fixedN", "fragment_march_nearest_fixedN",
         "fragment_march_linear_pipe2", "fragment_march_linear_pipe3",
         "fragment_march_manual_trilinear", "fragment_march_linear_clampZero",
-        "fragment_march_linear_2Darray", "fragment_march_linear_repeat", "fragment_fixedpoint_linear", "fragment_fixedpoint_nearest",         "fragment_march_linear_select", "fragment_march_xdir_linear", "fragment_march_xdir_linear_counted",         "fragment_march_real_decomp", "fragment_march_linear_clamp", "fragment_march_nearest_clamp", "fragment_march_xybilinear_znearest_clone", "fragment_march_nearest_clamp_double", "fragment_march_decomp_unrolled", "fragment_march_decomp_array", "fragment_march_decomp_deadarr", "fragment_march_decomp_deadarr2"};
-    if (variant < 0 || variant > 28) variant = 0;
+        "fragment_march_linear_2Darray", "fragment_march_linear_repeat", "fragment_fixedpoint_linear", "fragment_fixedpoint_nearest",         "fragment_march_linear_select", "fragment_march_xdir_linear", "fragment_march_xdir_linear_counted",         "fragment_march_real_decomp", "fragment_march_linear_clamp", "fragment_march_nearest_clamp", "fragment_march_xybilinear_znearest_clone", "fragment_march_nearest_clamp_double", "fragment_march_decomp_unrolled", "fragment_march_decomp_array", "fragment_march_decomp_deadarr", "fragment_march_decomp_deadarr2",         "fragment_march_phase_batch", "fragment_march_phase_batch_scalar", "fragment_march_phase_batch_sched"};
+    if (variant < 0 || variant > 31) variant = 0;
     NSString* fragName = [NSString stringWithUTF8String:fragNames[variant]];
     frag = [lib newFunctionWithName:fragName constantValues:cv error:&err];
     if (!frag) { fprintf(stderr, "frag func err: %s\n", err.description.UTF8String); return 1; }
@@ -526,7 +526,7 @@ int main(int argc, const char** argv) {
     const char* v25env = getenv("PROBE_V25");
     if (v25env) v25mode = atoi(v25env);
     id<MTLBuffer> v25Buf = [device newBufferWithBytes:&v25mode length:4 options:MTLResourceStorageModeShared];
-    if (variant == 25) fprintf(stderr, "fc_v25mode=%d\n", v25mode);
+    if (variant == 25 || variant == 29 || variant == 30 || variant == 31) fprintf(stderr, "fc_v25mode=%d\n", v25mode);
 
     for (int i = 0; i < 10; ++i) {
       benchGPU(device, queue, pso, rt, depthTex, volTex, tfTex, dummyVol, dummyMask, dummyMinMax,
