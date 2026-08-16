@@ -36,7 +36,7 @@ misconfiguration, not real errors.)
 ./gl_gap 100 8192 1 0 0          # noFetch (isolates fetch cost; ~1.4 ms)
 ./gl_gap 100 8192 0 0 1          # R16_SNORM variant (app does NOT use this)
 
-# Metal bare fetch: [frames] [maxIter] [halfSampler] [depthMode] [compute] [lod0] [fastMath] [diag]
+# Metal bare fetch: [frames] [maxIter] [halfSampler] [depthMode] [compute] [lod0] [fastMath] [diag] [pipeline] [rtSize] [sampleDistMM] [dataMode]
 ./metal_gap 100 8192 0 0 0 0 1 0   # baseline: float sampler, depth attached+Store
 ./metal_gap 100 8192 1 0 0 0 1 0   # halfSampler=1: texture3d<half> + half accumulator
 ./metal_gap 100 8192 0 1 0 0 1 0   # depthMode=1: depth attached, MTLStoreActionDontCare
@@ -57,6 +57,105 @@ misconfiguration, not real errors.)
 # diag is for ray-field parity checks.
 # NOTE: the RT is BGRA8Unorm - PPM byte0=B(acc), byte1=G(iterHigh),
 # byte2=R(iterLow). Iteration count = byte2 + 256*byte1.
+
+# REPRODUCING THE APP'S COARSE-SD HIGH-RES LAG (2026-08):
+# rtSize (argv[10]) + sampleDistMM (argv[11]) + dataMode (argv[12]) were added
+# to both harnesses to reproduce the app's raw-path lag at 1024/2048 px with
+# sample distances 2.0/4.0 mm. THE TRIGGER IS dataMode=1 (xorshift noise):
+# synthetic gradient data hides the problem because every 4-slice slab is
+# constant, so Metal's sampler cache stays warm. Real CT data has per-texel
+# variation, which flips the ratio:
+#   config             gradient M/GL   noise M/GL   GL degrade   Metal degrade
+#   2048 x 2048, SD4   1.01            1.63-1.72    +15%         +86%
+#   2048 x 2048, SD2   1.13            1.92         flat         +65%
+#   1024 x 1024, SD4   0.96            1.68         flat         +80%
+#   1024 x 1024, SD2   1.02            1.63         +12%         +77%
+#   400 x 400,   SD0.5 1.22            1.56         +10%         +40%
+# The 2048/SD4/noise cell (Metal ~78 ms vs GL ~45 ms = 1.72x) matches the app's
+# raw-path 2048/SD4 (M 94 vs G 54 = 1.75x) almost exactly. Conclusion: the lag
+# is a Metal 3D-texture sampling CACHE/LAYOUT deficit under coarse-stepped
+# trilinear access (breaks the sample locality real data provides at fine SD),
+# not a shader-scheduling deficit. GL barely reacts to data locality; Metal
+# degrades ~65-86%. Layout hypothesis (slice-stack vs 3D Morton) tested below
+# and REFUTED; remaining suspects: GL driver's internal 3D-texture tiling,
+# sampler MSHR/cache-slice behavior, or driver-specific LOD/filter codegen.
+./gl_gap 30 8192 0 0 0 1 2048 4.0 1     # GL: noise data, 2048 px, SD4 ~45 ms
+./metal_gap 30 8192 0 2 0 0 1 0 0 2048 4.0 1   # Metal: noise, 2048 px, SD4 ~78 ms
+
+# LAYOUT / TILING EXPERIMENT (layoutMode, argv[13] on metal_gap):
+# 0 = MTLTextureType3D (app layout), 1 = texture2d_array of 1794 slices with
+# manual Z trilinear (2 fetches + mix per sample, byte-identical rays:
+# avgIter/meanB parity confirmed at 400 px). Tested the "3D Morton swizzle is
+# cache-hostile for anisotropic NPOT volumes" hypothesis (GL may store 3D
+# textures slice-oriented while Metal uses a fully interleaved 3D Morton curve).
+# Result: REFUTED. At 2048 px noise, sliced is strictly worse than 3D:
+#   SD4: 3D best 66.3 ms (half+unroll8) vs sliced best 73.1 ms (half+unroll2)
+#   SD2: 3D best 92.1 ms (unroll8)        vs sliced best 110.7 ms (half+unroll2)
+# Sliced issues 2 fetches/sample yet lands ~at 3D time (per-fetch ~2x more
+# cache-efficient, but the doubled fetch count cancels it) -> Metal is bound by
+# fetch/L2-miss throughput on noise data, and slice-oriented storage is NOT a
+# fix. The GL-side advantage is not explainable by 3D-vs-2D-slice layout.
+./metal_gap 30 8192 0 2 0 0 1 0 2 2048 4.0 1 1   # sliced pipeline2, SD4 ~74 ms
+./metal_gap 30 8192 1 2 0 0 1 0 2 2048 4.0 1 1   # sliced half pipeline2 ~73 ms
+
+# MECHANISM PINNED: CACHE / DRAM WORKING-SET CAPACITY (2026-08)
+# Two more discriminators were run on the 2048 px noise lag cells:
+#   filterMode (argv[14]): 0 = trilinear (app default), 1 = GL_NEAREST /
+#       filter::nearest. The M/GL ratio PERSISTS with nearest (SD4 1.63x,
+#       SD2 1.84x; both backends speed up ~35% but the gap does not collapse)
+#       -> the trilinear 8-texel span is NOT the mechanism.
+#   volDiv (argv[15]): 1/2/4 -> volume 512^3x1794 (470 MB) / 256^2x897 (58.7 MB)
+#       / 128^2x448 (7.3 MB), SAME rays/SD/pixel grid (avgIter 36.2 identical,
+#       verified by readback). Result at 2048/SD4 noise, linear:
+#         volDiv=1 (470 MB): GL 44.1  Metal 78.9 (65.8 unroll8)  M/GL 1.49-1.80
+#         volDiv=2 (58.7 MB): GL 5.65 Metal 8.39 (6.10 unroll8)  M/GL 1.08-1.48
+#         volDiv=4 (7.3 MB):  GL 4.23 Metal 4.01                M/GL 0.95 (win)
+#   The same ~151M samples cost Metal 79 ms at full footprint but 4-8 ms at
+#   cache-sized footprint -> the lag is the working set exceeding the SoC's
+#   shared cache (M2 SLC ~32-64 MB); Metal's 3D-texture read path degrades
+#   ~9x as the footprint grows past capacity, GL only ~7x. NOT shader
+#   scheduling (unroll floors), NOT layout (2D-array worse), NOT compression
+#   (gap appears on incompressible noise = the opposite of compression),
+#   NOT the trilinear span (nearest keeps ~1.5x).
+#   Renderer implication: splitting the volume into cache-sized depth slabs
+#   (K passes, front-to-back composite) shrinks each pass's working set toward
+#   the volDiv=2/4 regime, which is exactly where Metal beats GL.
+./metal_gap 30 8192 0 2 0 0 1 0 8 2048 4.0 1 0 1 1   # 3D, nearest, unroll8, SD4
+./metal_gap 30 8192 0 2 0 0 1 0 0 2048 4.0 1 0 0 2   # 3D, linear, volDiv=2
+
+# SLAB RENDERING VALIDATED - THE FIX (2026-08)
+# Depth-slicing the march (argv[16]=numSlabs, argv[17]=slabIndex; argv[18]=1
+# = t-clamped slab pass, real slab-rendering model) collapses the gap:
+#   2048/SD4 noise, 8 passes, per-pass t-range = 1/8 of the depth (each pass
+#   does 1/8 of the samples; sum of per-pass avgIter 36.7 == full 36.2):
+#     Metal: 0.85/1.02/0.86/1.06/1.19/1.24/1.29/1.11 = 8.6 ms total (was 79)
+#     GL:    1.13/1.18/1.23/1.32/1.29/1.40/1.54/1.49 = 10.6 ms total (was 44)
+#   Metal slab-render wins over GL single-pass by ~5x and over GL slab by 1.2x.
+#   Once the per-pass working set fits cache, Metal is FASTER than GL. This is
+#   the mechanism (cache/DRAM working-set capacity) turned into a win: split
+#   the volume depth into cache-sized slabs, render K front-to-back passes.
+#   NOTE the Z-position effect (slab[0] fastest, slab[6] slowest for both
+#   backends - swizzle/memory-order property, not a backend difference).
+./metal_gap 30 8192 0 2 0 0 1 0 0 2048 4.0 1 0 0 1 8 0 1  # 3D slabT pass 0/8
+./gl_gap 30 8192 0 0 0 1 2048 4.0 1 0 1 8 0 1              # GL slabT pass 0/8
+
+# MULTI-PASS ACCUMULATION PROTOTYPE (2026-08, argv[19]=maccum)
+# Renders numSlabs slabT passes per frame into ONE RT (pass 0 clears, passes
+# 1+ loadAction=Load), accumulated via MTLBlendOperationMax, one commit/frame.
+# Each pass's tStart is aligned UP to the global sample lattice (tStart + k*step,
+# k = ceil((tlo - tStart)/stepSize)) so the union of slab sample positions
+# equals the single-pass lattice exactly.
+#   Correctness: numSlabs=1 (no split, just acc-out + blend) = pixel-exact vs
+#   single-pass (0 mismatches). 8-slab split vs single-pass: 0.13% of marched
+#   pixels differ by <=5/255 (slab-boundary lattice-epsilon artifact only).
+#   2048/SD4 noise: single-pass 81.5 ms -> 8-slab maccum 13.5 ms (6.0x), and
+#   vs GL single-pass 44 ms = 3.3x WIN. 2048/SD2: 18.5 ms vs GL 61 ms = 3.3x.
+#   pipeline=8 (unroll) does NOT stack (16.3 ms): slab already fixes the cache
+#   problem, unroll's win was single-pass-only. The ~13.5ms vs 8.6ms projection
+#   gap is the lattice alignment + per-pass overhead; the app can recover it
+#   (compute the slab clamp from uniforms instead of one PSO per slab).
+./metal_gap 30 8192 0 2 0 0 1 0 0 2048 4.0 1 0 0 1 8 0 1 1  # maccum 8-slab SD4
+./metal_gap 30 8192 0 2 0 0 1 0 8 2048 4.0 1 0 0 1 8 0 1 1  # maccum 8-slab + unroll8
 
 # App-shader harness: [frames] [iterMode]
 # iterMode=0: color output + frame timing

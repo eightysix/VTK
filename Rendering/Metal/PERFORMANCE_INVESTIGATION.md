@@ -1175,3 +1175,53 @@ raw march (minmax off) still loses to GL at coarse SD (1.12-1.74x) - the raw
 path, unchanged; production uses minmax on.
 
 
+
+====================================================================
+RAW-PATH COARSE-SD LAG: MECHANISM NAILED + VALIDATED FIX (2026-08)
+====================================================================
+Context: the raw (minmax off) march at high res + high sample distance loses to
+GL (2048/SD4 1.75x in-app). A standalone repro (minimal_gap/metal_gap.m +
+gl_gap.m, pixel-verified parity) reproduced the lag exactly with noise data
+(dataMode=1): 2048/SD4 Metal ~79ms vs GL ~44ms = 1.8x.
+
+MECHANISM: cache / DRAM working-set capacity.
+  Every discriminator is now tested:
+  - Trilinear 8-texel span: REFUTED. filter::nearest keeps 1.63-1.84x.
+  - Shader scheduling (gradients/unroll): REFUTED. lod0=0, half, unroll8 only
+    reach 1.41x on noise and never close it.
+  - Texture layout (3D vs 2D-array sliced): REFUTED. Sliced is strictly worse.
+  - Lossless texture compression: REFUTED. Gap appears on incompressible noise
+    (the opposite of compression); GL runs ~26 GB/s, far under DRAM bandwidth.
+  - Working set vs cache: CONFIRMED. Shrinking the volume (volDiv, same sample
+    count, avgIter 36.2 verified) collapses the gap:
+      470MB: M/GL 1.80x   ->   58.7MB: 1.08-1.48x   ->   7.3MB: 0.95x (Metal wins)
+    Same 151M samples cost Metal 79ms at full footprint but 4-8ms at
+    cache-sized footprint (M2 SoC shared cache ~32-64MB); Metal degrades ~9x
+    past capacity, GL only ~7x.
+
+VALIDATED FIX: depth-sliced (slab) rendering.
+  - Real slab model (per-pass t-range = 1/K of depth, K=8): Metal 8.6ms total
+    vs 79ms full; GL 10.6 vs 44ms. Metal slab beats GL single-pass ~5x and GL
+    slab by 1.2x.
+  - Multi-pass accumulation prototype (maccum in metal_gap.m): 8 passes/frame
+    into one RT, MTLBlendOperationMax, per-pass tStart aligned to the global
+    sample lattice. Correctness: pixel-exact at numSlabs=1; 0.13% of marched
+    pixels differ <=5/255 at 8 slabs (boundary lattice-epsilon artifact).
+    2048/SD4 noise: 81.5 -> 13.5ms (6.0x), vs GL 44ms = 3.3x WIN.
+    2048/SD2: 18.5ms vs GL 61ms = 3.3x WIN.
+  - unroll (pipeline=8) does NOT stack with slabs (16.3ms): the cache fix
+    subsumes it.
+
+APP IMPLEMENTATION NOTES (next step, not yet done):
+  - vtkMetalGPUVolumeRayCastMapper renders single-pass front-to-back
+    compositing today. Slab mode = K passes with tStart/tExit clamped per
+    slab, accumulated order-dependently (the app composites, not max-project).
+  - Implementation choices to verify in-app: per-slab PSO vs uniform-driven
+    clamp; float accumulation RT (blend) vs ping-pong textures (the minmax
+    path could reuse the same machinery).
+  - Expected win at the worst cell (raw 2048/SD4, currently 94ms in-app vs GL
+    54ms): ~3x to ~17ms, flipping the 1.75x loss into a clear Metal win.
+  - Z-position cost gradient (slab[0] fastest, slab[6] slowest, both backends)
+    is a swizzle/memory-order property; pass order should be chosen to put
+    cheap slabs first where possible (irrelevant for compositing order, which
+    is fixed front-to-back).

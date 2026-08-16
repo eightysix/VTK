@@ -1,8 +1,9 @@
 // Minimal, self-contained OpenGL microbenchmark — the exact counterpart of
 // metal_gap.m. Same synthetic 512x512x1794 R8 3D texture, same real-scene
 // divergent-ray trilinear march (identical rays via inverseVP), same 400x400
-// fragments, measured with glFinish + wall clock. Exposes the intrinsic
-// Metal-vs-GL 3D sampler gap.
+// fragments (rtSize overridable), measured with glFinish + wall clock. Exposes
+// the intrinsic Metal-vs-GL 3D sampler gap. Pass rtSize=1024/2048 +
+// sampleDistMM=2.0/4.0 to reproduce the coarse-SD high-res "lag" case.
 //
 // Build: clang -framework AppKit -framework OpenGL gl_gap.m -o gl_gap
 // Run:   ./gl_gap [frames] [iterations]
@@ -16,10 +17,9 @@
 #include <math.h>
 #include <time.h>
 
-static const int kW = 512;
-static const int kH = 512;
-static const int kD = 1794;
-static const int kRT = 400;
+static int kW = 512;
+static int kH = 512;
+static int kD = 1794;
 
 static const char* kVertSrc =
   "#version 150\n"
@@ -35,6 +35,10 @@ static const char* kFragSrc =
   "in vec2 vUV;\n"
   "out vec4 fragColor;\n"
   "uniform sampler3D uVol;\n"
+  "uniform vec3 uTexelCount;\n"
+  "uniform float uSlabStart;\n"
+  "uniform float uSlabEnd;\n"
+  "uniform bool uSlabT;\n"
   "uniform vec3 uEye;\n"          // camera pos, normalized volume space
   "uniform vec3 uBoundsSize;\n"   // physical volume size (mm)
   "uniform mat4 uInvVP;\n"        // NDC -> physical volume coords
@@ -54,10 +58,16 @@ static const char* kFragSrc =
   "  float tExit = min(min(tmax3.x, tmax3.y), tmax3.z);\n"
   "  if (tExit <= 0.0 || tEnter >= tExit) { fragColor = vec4(0.0,0.0,0.0,1.0); return; }\n"
   "  float tStart = max(tEnter, 0.0);\n"
+  "  if (uSlabT) {\n"
+  "    float t_s = (uSlabStart - uEye.z) / rayDir.z;\n"
+  "    float t_e = (uSlabEnd - uEye.z) / rayDir.z;\n"
+  "    tStart = max(tStart, min(t_s, t_e));\n"
+  "    tExit = min(tExit, max(t_s, t_e));\n"
+  "  }\n"
   "  float physPerNorm = length(rayDir * uBoundsSize);\n"
   "  float stepSize = uSampleDistMM / max(physPerNorm, 1e-6);\n"
   "  int maxSteps = max(1, int(ceil((tExit - tStart) / stepSize)));\n"
-  "  vec3 texelCount = vec3(512.0, 512.0, 1794.0);\n"
+  "  vec3 texelCount = uTexelCount;\n"
   "  vec3 ctpScale = max(texelCount - 1.0, 1e-4) / texelCount;\n"
   "  vec3 ctpOffset = 0.5 / texelCount;\n"
   "  vec3 texStep = rayDir * stepSize;\n"
@@ -65,6 +75,7 @@ static const char* kFragSrc =
   "  float currentT = tStart;\n"
   "  vec3 texLocal = uEye + rayDir * currentT;\n"
   "  vec3 evalPoint = texLocal * ctpScale + ctpOffset;\n"
+  "  evalPoint.z = clamp(evalPoint.z, uSlabStart * ctpScale.z + ctpOffset.z, uSlabEnd * ctpScale.z + ctpOffset.z);\n"
   "  float acc = 0.0;\n"
   "  float n = 0.0;\n"
   "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n"
@@ -83,6 +94,9 @@ static const char* kFragNoFetchSrc =
   "#version 150\n"
   "out vec4 fragColor;\n"
   "in vec2 vUV;\n"
+  "uniform float uSlabStart;\n"
+  "uniform float uSlabEnd;\n"
+  "uniform bool uSlabT;\n"
   "uniform vec3 uEye;\n"
   "uniform vec3 uBoundsSize;\n"
   "uniform mat4 uInvVP;\n"
@@ -102,10 +116,16 @@ static const char* kFragNoFetchSrc =
   "  float tExit = min(min(tmax3.x, tmax3.y), tmax3.z);\n"
   "  if (tExit <= 0.0 || tEnter >= tExit) { fragColor = vec4(0.0,0.0,0.0,1.0); return; }\n"
   "  float tStart = max(tEnter, 0.0);\n"
+  "  if (uSlabT) {\n"
+  "    float t_s = (uSlabStart - uEye.z) / rayDir.z;\n"
+  "    float t_e = (uSlabEnd - uEye.z) / rayDir.z;\n"
+  "    tStart = max(tStart, min(t_s, t_e));\n"
+  "    tExit = min(tExit, max(t_s, t_e));\n"
+  "  }\n"
   "  float physPerNorm = length(rayDir * uBoundsSize);\n"
   "  float stepSize = uSampleDistMM / max(physPerNorm, 1e-6);\n"
   "  int maxSteps = max(1, int(ceil((tExit - tStart) / stepSize)));\n"
-  "  vec3 texelCount = vec3(512.0, 512.0, 1794.0);\n"
+  "  vec3 texelCount = uTexelCount;\n"
   "  vec3 ctpScale = max(texelCount - 1.0, 1e-4) / texelCount;\n"
   "  vec3 ctpOffset = 0.5 / texelCount;\n"
   "  vec3 texStep = rayDir * stepSize;\n"
@@ -113,6 +133,7 @@ static const char* kFragNoFetchSrc =
   "  float currentT = tStart;\n"
   "  vec3 texLocal = uEye + rayDir * currentT;\n"
   "  vec3 evalPoint = texLocal * ctpScale + ctpOffset;\n"
+  "  evalPoint.z = clamp(evalPoint.z, uSlabStart * ctpScale.z + ctpOffset.z, uSlabEnd * ctpScale.z + ctpOffset.z);\n"
   "  float acc = 0.0;\n"
   "  float n = 0.0;\n"
   "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n"
@@ -151,12 +172,14 @@ static GLuint CompileShader(GLenum type, const char* src, const char* name)
 }
 
 // Build: clang -framework AppKit -framework OpenGL gl_gap.m -o gl_gap
-// Run:   ./gl_gap [frames] [maxIter] [noFetch] [useDepth] [fmt16] [flipY]
+// Run:   ./gl_gap [frames] [maxIter] [noFetch] [useDepth] [fmt16] [flipY] [rtSize] [sampleDistMM]
 //   flipY=1 negates NDC y. GL rasterizes with a bottom-left window origin and
 //   Metal with a top-left origin, so the two gap harnesses otherwise trace
 //   y-mirrored ray fields for the same readback row; since the DICOM scene is
 //   not y-symmetric this changes the per-pixel step counts (avgIter). Set
 //   flipY=1 on the GL side to trace the same rays row-for-row as metal_gap.
+//   rtSize: render-target size in px (default 400). Coarse-SD high-res "lag":
+//   pass 1024/2048 with sampleDistMM 2.0/4.0 to match the app's lag cases.
 // Note: the harness reads back / processes rows in framebuffer order
 // (GL bottom-first, Metal top-first).
 
@@ -168,12 +191,28 @@ int main(int argc, const char** argv)
   int useDepth = 0;
   int fmt16 = 0;
   int flipY = 0;
+  int rtSize = 400;
+  float sampleDistMM = 0.5f;
+  int dataMode = 0;
+  int filterMode = 0;
+  int volDiv = 1;
+  int numSlabs = 0;
+  int slabIndex = 0;
+  int slabT = 0;
   if (argc > 1) frames = atoi(argv[1]);
   if (argc > 2) maxIter = atoi(argv[2]);
   if (argc > 3) noFetch = atoi(argv[3]);
   if (argc > 4) useDepth = atoi(argv[4]);
   if (argc > 5) fmt16 = atoi(argv[5]);
   if (argc > 6) flipY = atoi(argv[6]);
+  if (argc > 7) rtSize = atoi(argv[7]);
+  if (argc > 8) sampleDistMM = (float)atof(argv[8]);
+  if (argc > 9) dataMode = atoi(argv[9]);
+  if (argc > 10) filterMode = atoi(argv[10]);
+  if (argc > 11) { volDiv = atoi(argv[11]); if (volDiv < 1) volDiv = 1; kW = 512 / volDiv; kH = 512 / volDiv; kD = 1794 / volDiv; }
+  if (argc > 12) numSlabs = atoi(argv[12]);
+  if (argc > 13) slabIndex = atoi(argv[13]);
+  if (argc > 14) slabT = atoi(argv[14]);
 
   NSOpenGLPixelFormatAttribute attrs[] = {
     NSOpenGLPFAOpenGLProfile, NSOpenGLProfileVersion3_2Core,
@@ -190,8 +229,8 @@ int main(int argc, const char** argv)
   glGetIntegerv(GL_MAX_3D_TEXTURE_SIZE, &max3d);
   printf("GL_VERSION: %s\n", glGetString(GL_VERSION));
   printf("GL_MAX_3D_TEXTURE_SIZE: %d\n", (int)max3d);
-  printf("volume %dx%dx%d R8, rt %dx%d, frames %d, maxIter %d, noFetch %d, flipY %d\n",
-    kW, kH, kD, kRT, kRT, frames, maxIter, noFetch, flipY);
+  printf("volume %dx%dx%d R8, rt %dx%d, frames %d, maxIter %d, noFetch %d, flipY %d, sampleDistMM=%.1f, dataMode=%d, filterMode=%d, volDiv=%d, slab=%d/%d, slabT=%d\n",
+    kW, kH, kD, rtSize, rtSize, frames, maxIter, noFetch, flipY, sampleDistMM, dataMode, filterMode, volDiv, slabIndex, numSlabs, slabT);
 
   // Program. flipY=1 negates NDC y so the same readback row traces the same
   // ray as metal_gap (which uses Metal's top-left window convention).
@@ -228,6 +267,10 @@ int main(int argc, const char** argv)
   GLint uInvVP = glGetUniformLocation(prog, "uInvVP");
   GLint uSampleDistMM = glGetUniformLocation(prog, "uSampleDistMM");
   GLint uMaxIter = glGetUniformLocation(prog, "uMaxIter");
+  GLint uTexelCount = glGetUniformLocation(prog, "uTexelCount");
+  GLint uSlabStart = glGetUniformLocation(prog, "uSlabStart");
+  GLint uSlabEnd = glGetUniformLocation(prog, "uSlabEnd");
+  GLint uSlabT = glGetUniformLocation(prog, "uSlabT");
 
   // Fullscreen triangle. NOTE: 2 floats per vertex; a stray 3rd component
   // shifts the stride and breaks the triangle into a thin sliver.
@@ -245,8 +288,8 @@ int main(int argc, const char** argv)
   GLuint tex;
   glGenTextures(1, &tex);
   glBindTexture(GL_TEXTURE_3D, tex);
-  glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, filterMode ? GL_NEAREST : GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, filterMode ? GL_NEAREST : GL_LINEAR);
   glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
@@ -260,7 +303,15 @@ int main(int argc, const char** argv)
     free(h16);
   } else {
     uint8_t* host = malloc(total);
-    for (size_t i = 0; i < total; i++) host[i] = (uint8_t)((i >> 10) & 0xff);
+    if (dataMode) {
+      uint32_t x = 0x12345678u;
+      for (size_t i = 0; i < total; i++) {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        host[i] = (uint8_t)(x >> 24);
+      }
+    } else {
+      for (size_t i = 0; i < total; i++) host[i] = (uint8_t)((i >> 10) & 0xff);
+    }
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexImage3D(GL_TEXTURE_3D, 0, GL_R8, kW, kH, kD, 0, GL_RED, GL_UNSIGNED_BYTE, host);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
@@ -280,12 +331,16 @@ int main(int argc, const char** argv)
     0.35811684f, 0.22810864f, -1.0292176f, -0.00056198676f,
     -0.12124427f, -0.03448515f, 0.8849802f, 0.00092758867f };
   glUniformMatrix4fv(uInvVP, 1, GL_FALSE, invVP);
-  glUniform1f(uSampleDistMM, 0.5f);
+  glUniform1f(uSampleDistMM, sampleDistMM);
+  glUniform3f(uTexelCount, (float)kW, (float)kH, (float)kD);
+  glUniform1f(uSlabStart, numSlabs > 0 ? (float)slabIndex / numSlabs : 0.0f);
+  glUniform1f(uSlabEnd, numSlabs > 0 ? (float)(slabIndex + 1) / numSlabs : 1.0f);
+  glUniform1i(uSlabT, slabT ? 1 : 0);
   glUniform1i(uMaxIter, maxIter);
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_3D, tex);
 
-  glViewport(0, 0, kRT, kRT);
+  glViewport(0, 0, rtSize, rtSize);
   glClearColor(0, 0, 0, 1);
 
   // Offscreen render target (windowless context has no default drawable).
@@ -294,13 +349,13 @@ int main(int argc, const char** argv)
   glBindFramebuffer(GL_FRAMEBUFFER, fbo);
   glGenRenderbuffers(1, &rbo);
   glBindRenderbuffer(GL_RENDERBUFFER, rbo);
-  glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, kRT, kRT);
+  glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, rtSize, rtSize);
   glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rbo);
   GLuint depthRbo = 0;
   if (useDepth) {
     glGenRenderbuffers(1, &depthRbo);
     glBindRenderbuffer(GL_RENDERBUFFER, depthRbo);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, kRT, kRT);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, rtSize, rtSize);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthRbo);
   }
   if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
@@ -329,26 +384,26 @@ int main(int argc, const char** argv)
 
   // Sanity readback: R/G carry the iteration count (low/high byte), B the
   // sample value; nonzero pixels are marched fragments.
-  uint8_t* pix = malloc((size_t)kRT * kRT * 4);
-  glReadPixels(0, 0, kRT, kRT, GL_RGBA, GL_UNSIGNED_BYTE, pix);
+  uint8_t* pix = malloc((size_t)rtSize * rtSize * 4);
+  glReadPixels(0, 0, rtSize, rtSize, GL_RGBA, GL_UNSIGNED_BYTE, pix);
   double sumB = 0.0;
   double lo = 0.0;
   double hi = 0.0;
   int nz = 0;
-  for (size_t i = 0; i < (size_t)kRT * kRT * 4; i += 4) {
+  for (size_t i = 0; i < (size_t)rtSize * rtSize * 4; i += 4) {
     sumB += pix[i + 2];
     lo += pix[i];
     hi += pix[i + 1];
     if (pix[i] + pix[i + 1] + pix[i + 2] > 0) nz++;
   }
-  double npix = (double)kRT * kRT;
+  double npix = (double)rtSize * rtSize;
   double avgN = (hi / npix) * 256.0 + lo / npix;
   fprintf(stderr, "GL readback: meanB=%.3f nonzero=%d/%d avgIter=%.1f\n",
-    sumB / npix / 255.0, nz, kRT * kRT, avgN);
+    sumB / npix / 255.0, nz, rtSize * rtSize, avgN);
   FILE* fp = fopen("gl_gap.ppm", "wb");
   if (fp) {
-    fprintf(fp, "P6\n%d %d\n255\n", kRT, kRT);
-    for (int i = 0; i < kRT * kRT; i++)
+    fprintf(fp, "P6\n%d %d\n255\n", rtSize, rtSize);
+    for (int i = 0; i < rtSize * rtSize; i++)
       fwrite(pix + i * 4, 1, 3, fp);
     fclose(fp);
   }
