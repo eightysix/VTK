@@ -195,7 +195,7 @@ static double benchGPU(id<MTLDevice> device, id<MTLCommandQueue> queue,
     id<MTLBuffer> ubuf, id<MTLBuffer> bbuf, id<MTLBuffer> lbuf, id<MTLBuffer> rbuf,
     id<MTLBuffer> vbuf, id<MTLBuffer> ibuf, id<MTLDepthStencilState> ds,
     uint32_t nidx, int frames, id<MTLBuffer> cbuf, id<MTLBuffer> fixedNBuf,
-    id<MTLBuffer> decompBuf, id<MTLTexture> volArrTex) {
+    id<MTLBuffer> decompBuf, id<MTLBuffer> v25Buf, id<MTLTexture> volArrTex) {
   double acc = 0;
   for (int f = 0; f < frames; ++f) {
     if (cbuf) {
@@ -227,6 +227,7 @@ static double benchGPU(id<MTLDevice> device, id<MTLCommandQueue> queue,
     [enc setFragmentBuffer:cbuf offset:0 atIndex:6];
     if (fixedNBuf) [enc setFragmentBuffer:fixedNBuf offset:0 atIndex:3];
     if (decompBuf) [enc setFragmentBuffer:decompBuf offset:0 atIndex:7];
+    if (v25Buf) [enc setFragmentBuffer:v25Buf offset:0 atIndex:8];
     [enc setFragmentTexture:volTex atIndex:0];
     [enc setFragmentTexture:tfTex atIndex:1];
     [enc setFragmentTexture:depthTex atIndex:2];
@@ -303,14 +304,39 @@ int main(int argc, const char** argv) {
     [cv setConstantValue:&bNo type:MTLDataTypeBool withName:@"fc_blanking"];
     int blendMode = 0;
     [cv setConstantValue:&blendMode type:MTLDataTypeInt withName:@"fc_blendMode"];
+    int marchVariant = 0;
+    const char* mvenv = getenv("PROBE_MARCH_VARIANT");
+    if (mvenv) marchVariant = atoi(mvenv);
+    [cv setConstantValue:&marchVariant type:MTLDataTypeInt withName:@"fc_marchVariant"];
+    fprintf(stderr, "fc_marchVariant=%d\n", marchVariant);
+    bool probeMinimal = false;
+    const char* pmenv = getenv("PROBE_MINIMAL");
+    if (pmenv) probeMinimal = atoi(pmenv) != 0;
+    [cv setConstantValue:&probeMinimal type:MTLDataTypeBool withName:@"fc_probeMinimal"];
+    if (probeMinimal) fprintf(stderr, "fc_probeMinimal=1\n");
+    bool probePrefetch = false;
+    const char* ppenv = getenv("PROBE_PREFETCH");
+    if (ppenv) probePrefetch = atoi(ppenv) != 0;
+    [cv setConstantValue:&probePrefetch type:MTLDataTypeBool withName:@"fc_probePrefetch"];
+    if (probePrefetch) fprintf(stderr, "fc_probePrefetch=1\n");
+    bool probeScalars = false;
+    const char* scenv = getenv("PROBE_SCALARS");
+    if (scenv) probeScalars = atoi(scenv) != 0;
+    [cv setConstantValue:&probeScalars type:MTLDataTypeBool withName:@"fc_probeScalars"];
+    if (probeScalars) fprintf(stderr, "fc_probeScalars=1\n");
+    bool probeSlim = false;
+    const char* slenv = getenv("PROBE_SLIM");
+    if (slenv) probeSlim = atoi(slenv) != 0;
+    [cv setConstantValue:&probeSlim type:MTLDataTypeBool withName:@"fc_probeSlim"];
+    if (probeSlim) fprintf(stderr, "fc_probeSlim=1\n");
     const char* fragNames[] = {"fragment_volume_main", "fragment_march_only",
         "fragment_march_no_fetch", "fragment_march_only_nearest", "fragment_count_steps",
         "fragment_debug_steps", "fragment_march_linear_implicit",
         "fragment_march_linear_fixedN", "fragment_march_nearest_fixedN",
         "fragment_march_linear_pipe2", "fragment_march_linear_pipe3",
         "fragment_march_manual_trilinear", "fragment_march_linear_clampZero",
-        "fragment_march_linear_2Darray", "fragment_march_linear_repeat", "fragment_fixedpoint_linear", "fragment_fixedpoint_nearest",         "fragment_march_linear_select", "fragment_march_xdir_linear", "fragment_march_xdir_linear_counted",         "fragment_march_real_decomp", "fragment_march_linear_clamp", "fragment_march_nearest_clamp", "fragment_march_xybilinear_znearest_clone", "fragment_march_nearest_clamp_double"};
-    if (variant < 0 || variant > 24) variant = 0;
+        "fragment_march_linear_2Darray", "fragment_march_linear_repeat", "fragment_fixedpoint_linear", "fragment_fixedpoint_nearest",         "fragment_march_linear_select", "fragment_march_xdir_linear", "fragment_march_xdir_linear_counted",         "fragment_march_real_decomp", "fragment_march_linear_clamp", "fragment_march_nearest_clamp", "fragment_march_xybilinear_znearest_clone", "fragment_march_nearest_clamp_double", "fragment_march_decomp_unrolled", "fragment_march_decomp_array", "fragment_march_decomp_deadarr", "fragment_march_decomp_deadarr2"};
+    if (variant < 0 || variant > 28) variant = 0;
     NSString* fragName = [NSString stringWithUTF8String:fragNames[variant]];
     frag = [lib newFunctionWithName:fragName constantValues:cv error:&err];
     if (!frag) { fprintf(stderr, "frag func err: %s\n", err.description.UTF8String); return 1; }
@@ -496,24 +522,30 @@ int main(int argc, const char** argv) {
     if (denv) decomp = atoi(denv);
     id<MTLBuffer> decompBuf = [device newBufferWithBytes:&decomp length:4 options:MTLResourceStorageModeShared];
 
+    int v25mode = 0;
+    const char* v25env = getenv("PROBE_V25");
+    if (v25env) v25mode = atoi(v25env);
+    id<MTLBuffer> v25Buf = [device newBufferWithBytes:&v25mode length:4 options:MTLResourceStorageModeShared];
+    if (variant == 25) fprintf(stderr, "fc_v25mode=%d\n", v25mode);
+
     for (int i = 0; i < 10; ++i) {
       benchGPU(device, queue, pso, rt, depthTex, volTex, tfTex, dummyVol, dummyMask, dummyMinMax,
-          ubuf, bbuf, lbuf, rbuf, vbuf, ibuf, ds, ni, 1, cbuf, fixedNBuf, decompBuf, volArrTex);
+          ubuf, bbuf, lbuf, rbuf, vbuf, ibuf, ds, ni, 1, cbuf, fixedNBuf, decompBuf, v25Buf, volArrTex);
     }
     double t = benchGPU(device, queue, pso, rt, depthTex, volTex, tfTex, dummyVol, dummyMask, dummyMinMax,
-        ubuf, bbuf, lbuf, rbuf, vbuf, ibuf, ds, ni, 100, cbuf, fixedNBuf, decompBuf, volArrTex);
+        ubuf, bbuf, lbuf, rbuf, vbuf, ibuf, ds, ni, 100, cbuf, fixedNBuf, decompBuf, v25Buf, volArrTex);
     fprintf(stderr, "variant %d: %.2f ms\n", variant, t*1e3);
 
     if (variant == 4 || variant == 19) {
       benchGPU(device, queue, pso, rt, depthTex, volTex, tfTex, dummyVol, dummyMask, dummyMinMax,
-          ubuf, bbuf, lbuf, rbuf, vbuf, ibuf, ds, ni, 1, cbuf, fixedNBuf, decompBuf, volArrTex);
+          ubuf, bbuf, lbuf, rbuf, vbuf, ibuf, ds, ni, 1, cbuf, fixedNBuf, decompBuf, v25Buf, volArrTex);
       uint32_t* c = (uint32_t*)cbuf.contents;
       double total = c[0]; double totalPx = c[1]; double marched = c[2];
       fprintf(stderr, "count: fragments=%g marched_pixels=%.0f avg_steps=%.2f total_iters=%.0f\n",
           totalPx, marched, total/marched, total);
     } else if (variant == 5) {
       benchGPU(device, queue, pso, rt, depthTex, volTex, tfTex, dummyVol, dummyMask, dummyMinMax,
-          ubuf, bbuf, lbuf, rbuf, vbuf, ibuf, ds, ni, 1, cbuf, fixedNBuf, decompBuf, volArrTex);
+          ubuf, bbuf, lbuf, rbuf, vbuf, ibuf, ds, ni, 1, cbuf, fixedNBuf, decompBuf, v25Buf, volArrTex);
       size_t rtsz = (size_t)RTW * RTH * 4;
       id<MTLBuffer> rtb = [device newBufferWithLength:rtsz options:MTLResourceStorageModeShared];
       id<MTLCommandBuffer> cb = [queue commandBuffer];

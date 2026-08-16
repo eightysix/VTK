@@ -555,7 +555,7 @@ fragment VolumeFragmentOut fragment_march_manual_trilinear(
 }
 
 // Linear march fixed-N with clamp_to_zero sampler (tests edge-clamp cost).
-constant sampler sVolumeClampZero = sampler(coord::normalized, address::clamp_to_zero, filter::linear);
+// sVolumeClampZero comes from the base MetalShaders.metal (constexpr sampler).
 fragment VolumeFragmentOut fragment_march_linear_clampZero(
     VolumeVertexOut in [[stage_in]],
     constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
@@ -1320,5 +1320,582 @@ fragment VolumeFragmentOut fragment_march_nearest_clamp_double(
     evalPoint += evalStep;
   }
   output.color = float4(float3(acc), 1.0);
+  return output;
+}
+
+// ============================================================================
+// v25: standalone clone of marchVolumeUnified's fc_marchVariant>=6 unrolled
+// branch (batch-8 fetches + PROC consume with tEnd-latch, bounds clamp+refill,
+// latch exits + suppressAccum), in the decomp fragment's self-contained
+// function context. Isolates whether the unrolled consume MACHINERY itself is
+// the ~30ms (75 vs 45.5) unrolled-vs-decomp gap, or whether it only costs that
+// much inside fragment_volume_main's register-heavy context.
+// ============================================================================
+fragment VolumeFragmentOut fragment_march_decomp_unrolled(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    constant int& fixedIterCount [[buffer(3)]],
+    constant int& fc_v25mode [[buffer(8)]]) {
+
+  VolumeFragmentOut output;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 localPos = in.localPos;
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
+  if (!parallel) {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
+    rayDir /= dirLength;
+  }
+
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { output.color = float4(0.0); return output; }
+
+  const int mode = fc_v25mode;
+  const bool usePrefetch = (mode & 1) != 0;    // prefetch-ahead-1 instead of batch-8
+  const bool noTEndLatch = (mode & 2) != 0;    // drop the tEnd-latch at consume top
+  const bool noBatchAbort = (mode & 4) != 0;   // decomp-style clamp+needsFetch instead of skip+refill
+  const bool useBreak = (mode & 8) != 0;       // direct breaks instead of latch exits
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
+  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
+                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+  float3 stepVec = rayDir * stepSize;
+
+  float tStart = dot(s.entryPoint - cameraPos, rayDir);
+  float tEnd = s.totalBoxT;
+  float tTerminateMax = s.tTerminateMax;
+
+  float3 currentPoint = rayOrigin + rayDir * (tStart + stepSize);
+  float currentT = stepSize;
+  int maxSteps = max(1, int(ceil((tEnd - stepSize) / stepSize)));
+
+  half3 accumulatedColor = half3(0.0h);
+  half accumulatedOpacity = 0.0h;
+
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
+  float3 evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+
+  const float3 adjTexMin = ctpOffset;
+  const float3 adjTexMax = ctpOffset + ctpScale;
+  bool seenInBounds = false;
+  bool marchOpaque = false;
+  bool marchDone = false;
+  float prefetchScalar = 0.0;
+  bool prefetchValid = true;
+
+  const int unrollN = 8;
+  int i = 0;
+  float bs[8];
+  bs[0] = sampleVolumeScalar(volumeTexture, evalPoint);
+  while (i < maxSteps)
+  {
+    const int nBatch = (usePrefetch ? 1 : ((maxSteps - i >= unrollN) ? unrollN : (maxSteps - i)));
+    if (!usePrefetch) {
+      if (nBatch > 0) { bs[0] = sampleVolumeScalar(volumeTexture, evalPoint); }
+      if (nBatch > 1) { bs[1] = sampleVolumeScalar(volumeTexture, evalPoint + evalStep); }
+      if (nBatch > 2) { bs[2] = sampleVolumeScalar(volumeTexture, evalPoint + 2.0 * evalStep); }
+      if (nBatch > 3) { bs[3] = sampleVolumeScalar(volumeTexture, evalPoint + 3.0 * evalStep); }
+      if (nBatch > 4) { bs[4] = sampleVolumeScalar(volumeTexture, evalPoint + 4.0 * evalStep); }
+      if (nBatch > 5) { bs[5] = sampleVolumeScalar(volumeTexture, evalPoint + 5.0 * evalStep); }
+      if (nBatch > 6) { bs[6] = sampleVolumeScalar(volumeTexture, evalPoint + 6.0 * evalStep); }
+      if (nBatch > 7) { bs[7] = sampleVolumeScalar(volumeTexture, evalPoint + 7.0 * evalStep); }
+    }
+    bool refillNeeded = false;
+#define UPROC(_j) \
+    { \
+      prefetchScalar = bs[_j]; \
+      prefetchValid = true; \
+      bool batchAbort = false; \
+      if (!noTEndLatch) { \
+        if (currentT >= tEnd - 1e-6) { marchDone = true; } \
+      } \
+      if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) || \
+          any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) { \
+        if (seenInBounds) { \
+          if (useBreak) { break; } \
+          marchDone = true; \
+        } \
+        texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0)); \
+        evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset); \
+        prefetchValid = false; \
+        if (!noBatchAbort) { \
+          currentPoint += stepVec; \
+          currentT += stepSize; \
+          texLocalPos += texStep; \
+          evalPoint += evalStep; \
+          batchAbort = true; \
+        } \
+      } else { \
+        seenInBounds = true; \
+      } \
+      if (batchAbort) { \
+        refillNeeded = true; \
+      } else { \
+        bool needsFetch = !prefetchValid; \
+        float rawScalar = needsFetch ? sampleVolumeScalar(volumeTexture, evalPoint) : prefetchScalar; \
+        half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias); \
+        half4 colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5)); \
+        half sampleOpacity = colorOpacity.a; \
+        half3 sampleColor = colorOpacity.rgb; \
+        half weight = 1.0h - accumulatedOpacity; \
+        const bool suppressAccum = useBreak ? false : (marchOpaque || marchDone); \
+        accumulatedColor += suppressAccum ? 0.0h : weight * (sampleColor * sampleOpacity); \
+        accumulatedOpacity += suppressAccum ? 0.0h : weight * sampleOpacity; \
+        currentPoint += stepVec; \
+        currentT += stepSize; \
+        texLocalPos += texStep; \
+        evalPoint += evalStep; \
+        if (useBreak) { \
+          if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; } \
+          if (currentT >= tTerminateMax) { break; } \
+        } else { \
+          if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { marchOpaque = true; } \
+          if (currentT >= tTerminateMax) { marchDone = true; } \
+        } \
+      } \
+      i++; \
+    }
+    if (nBatch > 0) { UPROC(0) }
+    if (nBatch > 1 && !refillNeeded) { UPROC(1) }
+    if (nBatch > 2 && !refillNeeded) { UPROC(2) }
+    if (nBatch > 3 && !refillNeeded) { UPROC(3) }
+    if (nBatch > 4 && !refillNeeded) { UPROC(4) }
+    if (nBatch > 5 && !refillNeeded) { UPROC(5) }
+    if (nBatch > 6 && !refillNeeded) { UPROC(6) }
+    if (nBatch > 7 && !refillNeeded) { UPROC(7) }
+#undef UPROC
+    if (usePrefetch) {
+      if (i < maxSteps) { bs[0] = sampleVolumeScalar(volumeTexture, evalPoint); }
+      if (refillNeeded) { bs[0] = sampleVolumeScalar(volumeTexture, evalPoint); }
+    }
+  }
+
+  output.color = float4(float3(accumulatedColor), accumulatedOpacity);
+  return output;
+}
+
+// ============================================================================
+// v27: verbatim copy of fragment_march_real_decomp (prefetch-ahead-1) with an
+// optional `float bs[8]` array threaded through the prefetch. Tests whether the
+// bs[8] array allocation (local memory / register pressure) is what costs the
+// ~30ms in v25 batch mode. mode&1 = array plumbing (bs[0] store/load),
+// mode&2 = variable index bs[i % 8] to force true array semantics.
+// ============================================================================
+fragment VolumeFragmentOut fragment_march_decomp_array(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    constant int& fixedIterCount [[buffer(3)]],
+    constant int& fc_v25mode [[buffer(8)]]) {
+
+  VolumeFragmentOut output;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 localPos = in.localPos;
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
+  if (!parallel) {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
+    rayDir /= dirLength;
+  }
+
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { output.color = float4(0.0); return output; }
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  const int mode = fc_v25mode;
+  const bool useArr = (mode & 1) != 0;
+  const bool varIdx = (mode & 2) != 0;
+  const bool pure = (mode & 4) != 0;
+
+  half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
+  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
+                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+
+  float tStart = dot(s.entryPoint - cameraPos, rayDir);
+  float tEnd = s.totalBoxT;
+  float jitter = (volumeUniforms.useJittering > 0.5
+      ? (volumeUniforms.useIGNJitter > 0.5
+            ? sampleIGNJitter(in.position.xy, volumeUniforms.jitterBlockSize)
+            : sampleJitterNoise(in.position.xy, volumeUniforms.viewportSize.y))
+      : 1.0) * stepSize;
+  float firstT = jitter;
+  float3 stepVec = rayDir * stepSize;
+  float3 currentPoint = rayOrigin + rayDir * (tStart + firstT);
+  float currentT = firstT;
+
+  int maxSteps = max(1, int(ceil((tEnd - firstT) / stepSize)));
+
+  half3 accumulatedColor = half3(0.0h);
+  half accumulatedOpacity = 0.0h;
+
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
+  float3 evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+  float prefetchScalar = sampleVolumeScalar(volumeTexture, evalPoint);
+  bool prefetchValid = true;
+  bool seenInBounds = false;
+
+  const float3 adjTexMin = ctpOffset;
+  const float3 adjTexMax = ctpOffset + ctpScale;
+
+  float bs[8];
+  if (useArr) {
+    bs[0] = prefetchScalar;
+  }
+  if (pure) {
+    prefetchScalar = sampleVolumeScalar(volumeTexture, evalPoint);
+    prefetchValid = true;
+  }
+
+  for (int i = 0; i < maxSteps; i++) {
+    if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+        any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+      if (seenInBounds) {
+        break;
+      }
+      texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+      evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+      prefetchValid = false;
+    } else {
+      seenInBounds = true;
+    }
+
+    if (useArr) {
+      prefetchScalar = varIdx ? bs[i % 8] : bs[0];
+      prefetchValid = true;
+    }
+    bool needsFetch = !prefetchValid;
+    float rawScalar = needsFetch
+        ? sampleVolumeScalar(volumeTexture, evalPoint)
+        : prefetchScalar;
+
+    half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
+    half4 colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
+    half sampleOpacity = colorOpacity.a;
+    half3 sampleColor = colorOpacity.rgb;
+    half weight = 1.0h - accumulatedOpacity;
+    accumulatedColor += weight * (sampleColor * sampleOpacity);
+    accumulatedOpacity += weight * sampleOpacity;
+
+    currentPoint += stepVec;
+    currentT += stepSize;
+    texLocalPos += texStep;
+    evalPoint += evalStep;
+
+    if (pure) {
+      if (i + 1 < maxSteps) {
+        prefetchScalar = sampleVolumeScalar(volumeTexture, evalPoint);
+        prefetchValid = true;
+      }
+    } else {
+      if (i + 1 < maxSteps) {
+        float v = sampleVolumeScalar(volumeTexture, evalPoint);
+        if (useArr) {
+          bs[varIdx ? (i % 8) : 0] = v;
+        } else {
+          prefetchScalar = v;
+        }
+        prefetchValid = true;
+      }
+    }
+
+    if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) {
+      break;
+    }
+    if (currentT >= s.tTerminateMax) {
+      break;
+    }
+  }
+
+  output.color = float4(float3(accumulatedColor), accumulatedOpacity);
+  return output;
+}
+
+// ============================================================================
+// v28: verbatim copy of fragment_march_real_decomp with a single addition:
+// `float bs[8];` declared at function scope and NEVER referenced. Decisive
+// occupancy test -- does the mere stack allocation of a 32-byte array halve
+// the fragment's throughput (94ms) vs the identical array-free loop (46ms)?
+// ============================================================================
+fragment VolumeFragmentOut fragment_march_decomp_deadarr(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    constant int& fixedIterCount [[buffer(3)]],
+    constant int& fc_v25mode [[buffer(8)]]) {
+
+  VolumeFragmentOut output;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 localPos = in.localPos;
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
+  if (!parallel) {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
+    rayDir /= dirLength;
+  }
+
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { output.color = float4(0.0); return output; }
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  const int mode = fc_v25mode;
+  (void)mode;
+
+  half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
+  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
+                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+
+  float tStart = dot(s.entryPoint - cameraPos, rayDir);
+  float tEnd = s.totalBoxT;
+  float jitter = (volumeUniforms.useJittering > 0.5
+      ? (volumeUniforms.useIGNJitter > 0.5
+            ? sampleIGNJitter(in.position.xy, volumeUniforms.jitterBlockSize)
+            : sampleJitterNoise(in.position.xy, volumeUniforms.viewportSize.y))
+      : 1.0) * stepSize;
+  float firstT = jitter;
+  float3 stepVec = rayDir * stepSize;
+  float3 currentPoint = rayOrigin + rayDir * (tStart + firstT);
+  float currentT = firstT;
+
+  int maxSteps = max(1, int(ceil((tEnd - firstT) / stepSize)));
+
+  float bs[8];
+
+  half3 accumulatedColor = half3(0.0h);
+  half accumulatedOpacity = 0.0h;
+
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
+  float3 evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+  float prefetchScalar = sampleVolumeScalar(volumeTexture, evalPoint);
+  bool prefetchValid = true;
+  bool seenInBounds = false;
+
+  const float3 adjTexMin = ctpOffset;
+  const float3 adjTexMax = ctpOffset + ctpScale;
+
+  for (int i = 0; i < maxSteps; i++) {
+    if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+        any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+      if (seenInBounds) {
+        break;
+      }
+      texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+      evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+      prefetchValid = false;
+    } else {
+      seenInBounds = true;
+    }
+
+    bool needsFetch = !prefetchValid;
+    float rawScalar = needsFetch
+        ? sampleVolumeScalar(volumeTexture, evalPoint)
+        : prefetchScalar;
+
+    half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
+    half4 colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
+    half sampleOpacity = colorOpacity.a;
+    half3 sampleColor = colorOpacity.rgb;
+    half weight = 1.0h - accumulatedOpacity;
+    accumulatedColor += weight * (sampleColor * sampleOpacity);
+    accumulatedOpacity += weight * sampleOpacity;
+
+    currentPoint += stepVec;
+    currentT += stepSize;
+    texLocalPos += texStep;
+    evalPoint += evalStep;
+
+    if (i + 1 < maxSteps) {
+      prefetchScalar = sampleVolumeScalar(volumeTexture, evalPoint);
+      prefetchValid = true;
+    }
+
+    if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) {
+      break;
+    }
+    if (currentT >= s.tTerminateMax) {
+      break;
+    }
+  }
+
+  output.color = float4(float3(accumulatedColor), accumulatedOpacity);
+  return output;
+}
+
+// ============================================================================
+// v29: v27 but WITHOUT the fc_v25mode buffer(8) read. Isolates whether the
+// v27 slowdown came from the dead `float bs[8]` array or from the extra
+// constant buffer read.
+// ============================================================================
+fragment VolumeFragmentOut fragment_march_decomp_deadarr2(
+    VolumeVertexOut in [[stage_in]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(0)]],
+    texture2d<float> transferFunctionTexture [[texture(1)]],
+    texture2d<float> depthTexture [[texture(2)]],
+    constant int& fixedIterCount [[buffer(3)]]) {
+
+  VolumeFragmentOut output;
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  float3 localPos = in.localPos;
+  float3 rayOrigin = parallel ? localPos : cameraPos;
+  float3 rayDir = parallel ? projectionDir(volumeUniforms) : (localPos - cameraPos);
+  if (!parallel) {
+    float dirLength = length(rayDir);
+    if (dirLength < 0.0001) { output.color = float4(0.0); return output; }
+    rayDir /= dirLength;
+  }
+
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { output.color = float4(0.0); return output; }
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+
+  half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
+  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
+                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+
+  float tStart = dot(s.entryPoint - cameraPos, rayDir);
+  float tEnd = s.totalBoxT;
+  float jitter = (volumeUniforms.useJittering > 0.5
+      ? (volumeUniforms.useIGNJitter > 0.5
+            ? sampleIGNJitter(in.position.xy, volumeUniforms.jitterBlockSize)
+            : sampleJitterNoise(in.position.xy, volumeUniforms.viewportSize.y))
+      : 1.0) * stepSize;
+  float firstT = jitter;
+  float3 stepVec = rayDir * stepSize;
+  float3 currentPoint = rayOrigin + rayDir * (tStart + firstT);
+  float currentT = firstT;
+
+  int maxSteps = max(1, int(ceil((tEnd - firstT) / stepSize)));
+
+  float bs[8];
+
+  half3 accumulatedColor = half3(0.0h);
+  half accumulatedOpacity = 0.0h;
+
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
+  float3 evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+  float prefetchScalar = sampleVolumeScalar(volumeTexture, evalPoint);
+  bool prefetchValid = true;
+  bool seenInBounds = false;
+
+  const float3 adjTexMin = ctpOffset;
+  const float3 adjTexMax = ctpOffset + ctpScale;
+
+  for (int i = 0; i < maxSteps; i++) {
+    if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+        any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+      if (seenInBounds) {
+        break;
+      }
+      texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+      evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+      prefetchValid = false;
+    } else {
+      seenInBounds = true;
+    }
+
+    bool needsFetch = !prefetchValid;
+    float rawScalar = needsFetch
+        ? sampleVolumeScalar(volumeTexture, evalPoint)
+        : prefetchScalar;
+
+    half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
+    half4 colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
+    half sampleOpacity = colorOpacity.a;
+    half3 sampleColor = colorOpacity.rgb;
+    half weight = 1.0h - accumulatedOpacity;
+    accumulatedColor += weight * (sampleColor * sampleOpacity);
+    accumulatedOpacity += weight * sampleOpacity;
+
+    currentPoint += stepVec;
+    currentT += stepSize;
+    texLocalPos += texStep;
+    evalPoint += evalStep;
+
+    if (i + 1 < maxSteps) {
+      prefetchScalar = sampleVolumeScalar(volumeTexture, evalPoint);
+      prefetchValid = true;
+    }
+
+    if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) {
+      break;
+    }
+    if (currentT >= s.tTerminateMax) {
+      break;
+    }
+  }
+
+  output.color = float4(float3(accumulatedColor), accumulatedOpacity);
   return output;
 }

@@ -909,3 +909,72 @@ the extra ~2.3x of app-side Metal cost lives in what the harness does not model
 - pipeline/PSO setup, per-block dispatch overhead, offscreen render-target
 handling, the fullscreen quad vs the app's actual ray setup, or
 shading/min-max/2D-TF-enabled configs.
+
+## 16. The residual 1.6x gap is the shader's register/occupancy context, not the unroll
+
+The probe harness (`probe7b`, BGRA8 direct, no plumbing) reproduces the app
+almost exactly: `fragment_volume_main` mv=6 = 74.5-75.5 ms vs app 79-81 ms
+(~6 ms plumbing), and mv=0 baseline = 99.7 ms vs app 105 ms. All further work
+below was done in the probe, then verified in-app.
+
+### 16.1 The decomp fragment: GL parity is achievable
+
+`fragment_march_real_decomp` (probe v22) runs the *same* uniforms/data with a
+self-contained lean loop (prefetch-ahead-1, bounds-clamp+refetch, TF, composite,
+direct breaks) at **44-47 ms** in the same harness - i.e. essentially GL parity
+(49.3 ms app). Counts confirm it marches the same ray (`fragment_count_steps`
+v4: 69,862 marched pixels, avg 659.15 steps/pixel, 46.05M total iters).
+
+### 16.2 Decisive experiments (probe7b)
+
+| probe | loop structure | context | time |
+|---|---|---|---|
+| v22 decomp | prefetch-1, lean consume, breaks | minimal | **45 ms** |
+| v27/v28 decomp + *dead* `float bs[8]` | prefetch-1 | minimal | **104 ms** |
+| v25 mode=0 | batch-8 + full unrolled machinery | minimal | 76 ms |
+| v25 mode=14 (breaks/no-tEnd/no-batchAbort) | batch-8, decomp-style consume | minimal | 75 ms |
+| v25 mode=1/15 (prefetch) | prefetch-1 + machinery | minimal | 85 ms |
+| real mv=6 | batch-8 | full | **75 ms** |
+| real mv=6 + fc_probeSlim (decomp's lean loop) | prefetch-1 | full | 97 ms |
+| real mv=6 + fc_probeScalars (no array) | batch-8 | full | 76 ms |
+| real mv=6 + fc_probePrefetch (no array) | prefetch-1 + machinery | full | 92 ms |
+
+Conclusions:
+
+1. **The batch-8 structure is the entire unrolled-vs-decomp gap.** Stripping
+   every piece of the unrolled machinery (tEnd-latch, batchAbort refill,
+   marchOpaque/marchDone latches, suppressAccum) changes nothing: v25 mode=14
+   (decomp-style consume, batch fetches) is still 75 ms. The batch's 8
+   independent fetches + dependent TF fetches + serial composite have a
+   ~30 ms structural floor over the pipelined prefetch loop.
+2. **The unrolled consume machinery itself is free** in batch mode (mode 0 vs
+   14 differ by <1 ms); it only matters when prefetch-1 scheduling forces the
+   compiler to keep a live scalar across the consume (85 vs 45 ms).
+3. **The `float bs[8]` array is a 2.3x trap in a small shader** (dead-array
+   v27/v28: 104 vs 45 ms) - a per-thread local-memory/occupancy penalty. In the
+   big production function it is already register-scalarized (scalar batch v26
+   = 76 ms, identical) so replacing it with 8 scalars gains nothing there.
+4. **The production fragment's context is the blocker for the fast loop.** The
+   *identical* lean decomp loop inlined into `fragment_volume_main`
+   (fc_probeSlim) runs 97 ms vs 45 ms standalone; the full function's register
+   footprint (10+ texture handles, `MarchParams`, output state) stops the
+   compiler from software-pipelining the prefetch. The batch is
+   context-robust (75 ms either way) because it needs no pipelining.
+
+### 16.3 Why prefetch-1 is fragile
+
+The decomp's 45 ms depends on a *clean* prefetch-ahead-1 pattern: a single
+unconditional fetch at the loop bottom, branch-light consume, no local arrays.
+Any perturbation breaks the compiler's pipelining and exposes per-iteration
+texture latency: +40 ms for the unrolled machinery (v25), +12 ms for the full
+function context (fc_probeSlim), +60 ms for a dead array (v28).
+
+### 16.4 Direction
+
+75 ms is essentially optimal for the current single-fragment structure. GL
+parity (~46-50 ms) requires the hot loop to live in a *minimal-register
+self-contained fragment* (the decomp shape), selected when the config is the
+simplified composite path (no shading/gradient-op/min-max/mask/cropping/
+rectilinear/2D-TF). Since the Metal backend is not a production target yet,
+section 17 below experiments with exactly that restructure.
+
