@@ -382,3 +382,55 @@ With the corrected decode (`iter = byte2 + 256*byte1`) and the `diag` mode
 
 The residual ~30 ms (57.8 ms GL vs 84-87 ms Metal) is pure GPU execution cost
 for identical work - no harness artifact and no algorithm difference.
+
+### Composite scene extension (named CLI, both harnesses)
+
+Both harnesses now model the DICOM reference scene's composite path on top of
+the bare-fetch march: Airways II transfer-function lookup (nearest, baked
+256-entry RGBA8 row: constant color (0, 0.605, 0.706), opacity points
+(-742.1,0)(-683,0.0493)(-481,0.2497)(-333.5,0), x = (hu+1024)*255/4095),
+front-to-back over-composite (`w = 1-acc; accColor += w*c.rgb*c.a;
+acc += w*c.a`), break when `acc > 1-1/255` (no clamp - GL parity), toggleable
+IGN-style jitter (lattice `jitterT = jitterF + ceil((tStart-jitterF)/stepSize)
+*stepSize`), a (0,0,1) near-plane clip test, and the over-blend maccum combine
+(`(ONE, ONE_MINUS_SRC_ALPHA)` instead of GL_MAX). `--preint F` applies the
+OpenGL pre-integration correction `1-(1-a)^F` to the baked opacity.
+
+Named flags (positional form still works unchanged):
+
+```
+--frames N --maxiter N --nofetch B --usedepth B --fmt16 B --flipy B
+--rt N --sd F --data N --filter N --div N --slabs N --slabindex N
+--slabt B --maccum B --muladd B --camera N --composite B --jitter B
+--jitterblock N --clip B --preint F --blend over|max
+```
+
+Example: `./gl_gap --frames 10 --maxiter 99999 --composite 1 --slabs 4
+--slabt 1 --maccum 1` (Metal: `./metal_gap --frames 10 --maxiter 99999
+--composite 1 --slabs 4 --slabt 1 --maccum 1`).
+
+Cross-harness parity, 400 px, SD 0.5, frames 10, post-warmup (M2 MBA):
+
+| variant | GL ms/f | Metal ms/f | alpha (GL/Metal) | break true iter |
+|---|---|---|---|---|
+| MIP baseline | 63.6 | 86.0 | 0.283/0.210 (byte2 decode) | 287.8 / 287.8 |
+| composite | 43.9 | 56.4 | 0.124 / 0.1238 | 211.1 / 211.1 |
+| composite+slabs4+maccum (over) | 25.5 | 24.4 | 0.1236 / 0.1237 | 4882 / 4882 (garbage, color channel) |
+| composite+mulAdd+slabs4+maccum | 25.3 | 21.3 | same | same |
+| composite+jitter+clip | 43.4 | 62.4 | 0.124 | 211 vs Metal full-march* |
+
+\* Metal composite+jitter + clip does not trigger the break for the in-window
+rays (true iter 287.8, full march) while GL breaks at 211. This is the known
+jitter-phase mismatch between the two APIs' pixel origins (Metal
+`in.position.xy+0.5`, GL `gl_FragCoord.xy`, opposite row order): each harness
+matches its own app's jitter conventions, and the sample lattice relative to
+the rays differs across harnesses. Not a correctness bug in either side;
+without jitter the composite paths are pixel-identical in alpha and break
+count (211.1 / 211.1).
+
+The composite body is identical to MetalShaders.metal's simplified composite
+(3454-3459, 4296-4307): same over-composite order, same 1-1/255 break, same TF
+table, same preint correction. The maccum over-blend matches the app's
+`overBlend` slice composition, and the slab clamp (side-entering rays clamped
+to the z=1 entry plane) matches the app's z-slab tiling - so single-pass vs
+slab alpha can differ (0.190 single-pass vs 0.123 slab) by design.
