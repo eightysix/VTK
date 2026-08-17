@@ -124,28 +124,49 @@ default march (48-wide inline); "mv0" = raw scalar march.
 Near-axis views are already cache-friendly; forced slabs8 adds 8x per-pass
 plumbing (depth attach, `setFragmentBytes`, draw setup) for zero cache gain.
 
-### 3.3 Harness: tiled vs maccum (2048, SD=4, composite)
+### 3.3 Harness: single-band probe vs full composites (2048, SD=4, composite)
 
-| camera | single | tiled `--slabs 8` | `--maccum 1 --slabs 8` |
+| camera | single | `--slabs 8` (band-0 probe) | `--maccum 1 --slabs 8` (full 8-band) |
 |---|---|---|---|
-| 0 oblique | 41.07 | 5.91 (**6.95x win**) | 50.71 (1.23x loss) |
-| 1 axial | 5.84 | 3.82 (**1.53x win**) | 32.16 (**5.5x loss**) |
-| 1 axial, `--data 1` noise | 9.95 | 4.37 (**2.27x win**) | — |
+| 0 oblique | 41.07 | 5.91 (**24.8 G/s**) | 50.71 (1.23x loss) |
+| 1 axial | 5.84 | 3.82 | 32.16 (**5.5x loss**) |
+| 1 axial, `--data 1` noise | 9.95 | 4.37 | — |
 
-- The tiled mode (the app's implementation: per-pass `kStart/kEnd` re-anchor,
-  no warmup) wins at every angle in the harness — even axial.
-- The maccum mode (per-pass lattice warmup re-advancing the march) regresses
-  everywhere, badly at axial: that warmup is per-pass overhead, the same
-  category of cost that hurts the app on axis views. The harness's tiled mode
-  does NOT reproduce the app's axial regression — the app's per-pass plumbing
-  (depth attach, per-draw bytes, PSO state) is the missing term.
+- **The non-maccum `--slabs 8` mode is NOT a composite — it is a band-0 probe.**
+  `ApplySlab` bakes `clamp(zfrac, 0/8, 1/8)` for band 0 only; the shader still
+  marches the full ray (avgIter 28.5 / sumIter 148M = the single-pass counts),
+  with the fetch's texture-z pinned into band 0. It measures the *coherence
+  ceiling* (24.8 G/s vs 3.5 G/s single-pass) on one band's worth of image
+  content — 5.91 ms is 1/8 of the composite.
+- **The full 8-band z-clamp composite (maccum) re-marches the full ray per
+  band: 8x the samples (1.18G @ 2048 oblique) → 50.71 ms, a loss vs
+  single-pass.** The z-clamp does not reduce sample count; it only makes each
+  band's fetches hot. It is also an approximation (each band samples the
+  band's z-slice along the ray's xy path, not the true ray), so it is not a
+  faithful composite at any count.
+- **The exact spatial split (`--slabt`, baked per-band constants, true short
+  marches: avgIter 3.4/band) costs 0.778 ms/band @512 and 3.76 ms/band @2048**
+  (lean harness shader) — short marches are latency-bound (~1-4 G/s), NOT
+  cache-hot-fast. 8 bands ≈ 6.2 ms @512 / 30 ms @2048 (lean): at 2048 that is
+  ~the app's current exact split; at 512 it is ~3x better (see §5).
+- The `--uniformslab` variant only updates the slab uniforms in the maccum
+  path; in the non-maccum path it silently runs the full march (41.9 ms @2048
+  = single-pass) — harness quirk, not a measurement.
 
 ### 3.4 Size scaling of the oblique slabs8 path (jitter=0, adaptive slabs8)
 
 512x512 17.27 / 1024x1024 20.40 / 2048x2048 29.81 / 4096x4096 70.06 ms — fits
-`16.4 ms + 3.19 ms/Mpx`. The 16.4 ms floor is 8 passes of per-pass overhead;
-at small sizes slabs8 is overhead-dominated (this is also why the "baseline"
-and "slabs8" runs looked identical — see 4.1).
+`16.4 ms + 3.19 ms/Mpx`.
+
+The 16.4 ms "floor" is NOT per-pass plumbing: the harness single-pass (zero
+plumbing — one draw, no depth attach, pure GPU time) shows the same floor at
+small sizes (16.29 @400, 18.42 @512), and axial has none (1.83 @512, 3.82
+@1024, 11.55 @2048 — clean linear scaling). The floor is **cold-fetch DRAM
+latency**: at small RTs the oblique rays' fetch set spans the whole 470 MB
+volume with no L2 reuse (0.5 G/s), while at 2048 the neighboring rays' wedges
+overlap enough to hit L2 (2.35 G/s) and axial rays are inherently coherent
+(8.3 G/s). Latency-bound stalls, not draw-call overhead; the app's per-draw
+CPU cost (`setFragmentBytes` + 3-vertex draw x8) is ~0.05-0.2 ms total.
 
 ## 4. Pitfalls (why earlier readings contradicted the commit notes)
 
@@ -168,20 +189,66 @@ and "slabs8" runs looked identical — see 4.1).
 6. **Battery power.** All numbers above measured on battery; ratios transfer,
    absolute ms do not (GL 52.38 here vs 51.0 in the doc's session, both
    jitter=1).
+7. **Harness readback = iteration bytes, not the image.** `meanB`/`avgIter`/
+   `true` decode the iteration counter the shader stores in the RT (B,G,R
+   bytes); `meanB` is the count's low byte, so a band-0 probe and a full
+   composite show identical readbacks as long as the march length matches.
+   `--slabs 8` non-maccum keeping avgIter 28.5 (the single-pass count) is the
+   tell that it is a 1-band probe, not a true split; `--slabt`'s avgIter 3.4
+   is the true split's short-march signature.
 
-## 5. Open question: replacing the adaptive slab count
+## 5. Problem and solution: replacing the ray-fraction slab split
 
-`AdaptiveVolumeSlabCount` (mm:384-400) avoids the near-axis regression by
-dropping to 1 slab when `align >= 0.95` — but it is a view-dependent
-compromise, not a fix (it gives up the win precisely on the cache-friendly
-views where slabs are cheap, and it still regresses if forced). The harness
-data shows the real lever: **per-pass overhead**. The tiled harness mode
-(win at every angle, incl. 1.53x axial) differs from the app only in the
-per-pass cost. Candidate directions:
+### 5.1 Problem
 
-- Cut the app's per-pass cost (depth attachment, per-draw `setFragmentBytes`,
-  PSO state) so slabs8 pays everywhere; the harness's 5.91 ms oblique floor
-  vs the app's 28.59 ms quantifies the available headroom.
-- Float accumulation RT (RGBA16Float) to also remove the per-slab 8-bit
-  quantization (correctness lead from the slab section of
-  PERFORMANCE_INVESTIGATION.md).
+The current exact split (`fc_slabMode`: per-fragment sample-index partition
+`kStart/kEnd`, mm:4162-4173) is bit-exact but its passes are **cache-cold at
+small RTs and on near-axis views**:
+
+- The per-pass fetch set is a ray-space *wedge* (each ray's z-range differs
+  across the frustum), so at 512 the passes' fetches still span the whole
+  volume → 0.54 G/s, barely better than single-pass (0.40 G/s): slabs8 17.27
+  vs single 23.35 (1.35x only, vs 2.17x at 2048).
+- The split shortens every march to ~maxSteps/8 ≈ 4 steps; short marches are
+  latency-bound (~5 G/s ceiling) → the near-axis regression (axial 11.55 ->
+  18.10, y/x 9.04/9.15 -> 17.18): axial single-pass is already coherent
+  (8.3 G/s) and the split only adds per-pass latency.
+- `AdaptiveVolumeSlabCount` (mm:384-400) papers over the regression by
+  dropping to 1 slab at align >= 0.95 — a view-dependent compromise, not a
+  fix (it gives up the win exactly where slabs are cheap).
+
+The earlier "per-pass overhead" framing (28.59 app vs 5.91 harness = ~2.8
+ms/pass) was an artifact: 5.91 is a 1-band probe (§3.3). The real per-pass
+plumbing is negligible; the real problems are fetch locality (512/1024) and
+short-march latency (axial).
+
+### 5.2 Solution: exact spatial slabs (uniform world-plane bounds)
+
+Replace the per-fragment index partition with **uniform world-z plane bounds**
+(the harness's `--slabt`/ApplySlabT scheme, exact): per pass p the fragment
+marches only `t ∈ [t_lo, t_hi]` where t_lo/t_hi are the ray-parameter
+intersections with the planes `z = zmin + (p/8)(zmax-zmin)` (normalized
+volume space), anchored with the same ceil-lattice arithmetic as the current
+split so the index union still tiles the full ray bit-exactly (the harness
+kEndT alignment: "consecutive ceil() calls can never disagree by an index").
+
+Every pass' fetch set is then a thin flat band of the volume (all rays'
+samples in the pass have z inside the same interval) → L2/L1-hot at any RT
+size, and near-axis views become the best case instead of the worst (their
+bands are the thinnest in ray terms). SlabInfo gains the plane basis (axis +
+start/end, or the 8 plane positions); single PSO + per-pass
+`setFragmentBytes` stays.
+
+Measured expectations (lean harness shader, SD=4, composite, jitter=0):
+
+| view | single-pass | current split | spatial bands (est) |
+|---|---|---|---|
+| oblique 512 | 23.35 | 17.27 | ~6-9 |
+| oblique 1024 | 37.27 | 20.40 | ~12-18 |
+| oblique 2048 | 62.97 | 28.59 | ~30 (par; short marches latency-bound) |
+| axial 2048 | 11.55 | 18.10 (regress) | ~12-16 (regression gone) |
+
+The 2048 oblique stays par with the current split (both ~28-30); the wins are
+at small RTs and the near-axis views — the exact-space ceiling is ~5 G/s for
+split marches, and the 24.8 G/s coherence ceiling belongs to the (non-exact)
+z-clamp probe, not to any faithful composite.
