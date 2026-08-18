@@ -336,17 +336,58 @@ Cuttable, in order of expected value:
    Trade-off: loses the front-to-back opacity latch, which currently makes
    oblique passes 2-7 nearly free; on axial the latch never fires (passes stay
    transparent) so this is pure win on axial, a small loss on oblique.
+   **Measured 2026-08-18 (harness `--feedback`: in-shader read of the previous
+   pass's RT on alternating textures — the app's exact ping-pong fetch +
+   combine, vs `--maccum 1`'s hardware single-RT blend; interleaved, 2048²,
+   SD 4, jitter 0, GPU throttled mid-session so absolute numbers shifted, the
+   paired deltas are the signal):**
+
+   | config | single-RT blend (maccum) | ping-pong (feedback) | delta |
+   |---|---|---|---|
+   | axial slabt8 | 15.26 / 15.22 / 15.77 | 16.42 / 16.19 / 16.88 | **+1.1 ms** |
+   | oblique slabt8 | 86.4 / 87.0 / 86.4 | 87.2 / 87.8 / 85.7 | ~0 (noise) |
+
+   The fetch itself is cheap (~1 ms axial, ~0 oblique — the RT load/store
+   traffic per pass is identical in both designs). So the §6.1 "~5 ms app
+   plumbing" (app 19.03 vs harness 13.75) is **not** the feedback fetch: it is
+   the rest of the app plumbing (per-pass uniform/viewport setup, MSAA PSO
+   switching, the box-geometry draws, depth). Swapping the app to single-RT
+   blending is worth ~1 ms of the 7.5 ms axial regression — not worth the
+   surgery on its own. (The latch-loss concern is moot: the latch is an
+   in-pass `acc` saturation break, identical in both designs — oblique
+   maccum ≈ oblique feedback within noise.)
 2. **Box geometry instead of the fullscreen quad.** The direct path
    rasterizes all 33M fragments per pass; the volume's screen footprint is
    only ~60-80%, so the out-of-footprint fragments run the full prologue and
    write 0, K times. Six back-face triangles cull them at the rasterizer.
-3. **Lean slab entry point** (skip minmax/lighting setup the slab passes
-   don't use).
+   **Measured 2026-08-18 (harness `--scissor`, footprint-probe A/B, interleaved
+   min of 2, 2048², SD 4, jitter 0): the invalid fragments were already nearly
+   free — culling them gains ~0-4%:**
 
-Ceiling: **parity with single-pass, never below** — the march sample count is
-identical to single-pass and axial memory behavior is already optimal, so the
-best case is the per-fragment overhead → 0, i.e. axial K=8 ≈ 11.56.
-Realistic estimate: 19.03 → ~13-15 ms (1.1-1.3x), after which the fixed-K
-choice (K=4 axial GL parity vs K=8 tightest band, §6) decides the remaining
-trade-off. Verification: re-run the §6 table (oblique + axial, K=8, jitter=0)
-after each change, keeping thresholded error 0.000.
+   | config | no scissor | scissor | footprint |
+   |---|---|---|---|
+   | axial single | 5.795 | 5.802 | 23.0% |
+   | axial slabt8 maccum | 12.903 | 12.644 | 23.0% |
+   | oblique single | 41.706 | 40.158 | 57.8% |
+   | oblique slabt8 maccum | 21.172 | 20.643 | 57.8% |
+
+   (Footprint rects measured by a clean single-pass probe readback, 983² at
+   +530+535 axial, 1621x1495 at +303+145 oblique — the AABB of the marched
+   pixels, which is what the box geometry would rasterize.) So this is **not**
+   the axial regression's cause: the regression is per-pass fixed work on the
+   *valid* fragments (prologue + box test + RT write × K on ~1M marched
+   pixels), which geometry culling cannot touch.
+3. **Lean slab entry point** (skip minmax/lighting setup the slab passes
+   don't use). Unmeasured in the harness (the harness has no minmax/lighting
+   to skip); the app-side delta is part of the ~5 ms non-fetch plumbing above.
+
+All three §6.1 levers are now measured (box geometry ~0-4%, single-RT ~1 ms,
+lean entry unquantified but bounded by the same plumbing analysis). Together
+they cannot close the 7.5 ms axial K=8 regression: the residual is the
+per-pass fixed fragment cost × K on the valid fragments — structural to the
+split. The design decision therefore stands on §6: **fixed K=4** (axial GL
+parity, full oblique win) or **fixed K=8** (tightest frame band); adaptive is
+rejected for frame-pacing.
+
+Verification: re-run the §6 table (oblique + axial, K=8, jitter=0) after each
+app change, keeping thresholded error 0.000.

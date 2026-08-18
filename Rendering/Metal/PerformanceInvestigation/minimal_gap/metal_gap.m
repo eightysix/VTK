@@ -41,6 +41,15 @@
 //   --jitter 0/1      IGN jitter on the sample lattice (app parity)
 //   --jitterblock N   jitter block size in px (default 1)
 //   --clip 0/1        (0,0,1) near-plane ray clip (DICOM scene parity)
+//   --scissor 0/1     clamp each draw to the volume's projected screen AABB
+//   --feedback 0/1    ping-pong: each slab pass in-shader reads the previous
+//                     pass's RT (two alternating RTs) and over-composites,
+//                     matching the app's texture(15) ping-pong fetch; the
+//                     delta vs --maccum 1 is the feedback-fetch cost
+//                     (models the app's box-geometry change; culls the
+//                     out-of-footprint fragments that run the ray prologue
+//                     and early-return — 77% of fragments on axial, 56% on
+//                     oblique at 2048)
 //   --preint F        opacity preintegration correction 1-(1-a)^F (default 1)
 //   --blend over|max  maccum RT blend (default: over when composite, else max)
 //
@@ -890,6 +899,49 @@ static void ApplyCompositeOut(char* buf)
   }
 }
 
+// Ping-pong feedback mode: each slab pass reads the PREVIOUS pass's RT
+// (alternating two textures) and over-composites in-shader, modeling the
+// app's texture(15) ping-pong fetch + combine. Runs AFTER ApplyCompositeOut
+// (the return is the premultiplied composite result). The fetch is
+// `prevRT.sample(prevSampler, in.uv)` — the same uv the output pixel maps
+// from, so the read is pixel-aligned with the previous pass's write. The
+// combine matches the maccum hardware (ONE, ONE_MINUS_SRC_ALPHA) exactly:
+// out.rgb = src.rgb + dst.rgb * (1 - src.a), out.a = src.a + dst.a *
+// (1 - src.a), both premultiplied. The only delta vs maccum is the fetch.
+static void ApplyFeedback(char* buf)
+{
+  const char sig[] = "texture2d<float> tfTex [[texture(1)]],\n";
+  const char sigR[] = "texture2d<float> tfTex [[texture(1)]],\n"
+                      "texture2d<float> prevRT [[texture(2)]],\n";
+  const char samp[] = "constexpr sampler tfSampler(filter::nearest, address::clamp_to_edge);\n";
+  const char sampR[] = "constexpr sampler tfSampler(filter::nearest, address::clamp_to_edge);\n"
+                       "constexpr sampler prevSampler(filter::linear, address::clamp_to_edge);\n";
+  const char ret[] = "return float4(accColor, acc);";
+  const char retR[] = "float4 _prev = prevRT.sample(prevSampler, in.uv);\n"
+                      "return float4(accColor + _prev.rgb * (1.0f - acc), acc + _prev.a * (1.0f - acc));";
+  char* p = buf;
+  while ((p = strstr(p, sig)) != NULL)
+  {
+    memmove(p + strlen(sigR), p + strlen(sig), strlen(p + strlen(sig)) + 1);
+    memcpy(p, sigR, strlen(sigR));
+    p += strlen(sigR);
+  }
+  p = buf;
+  while ((p = strstr(p, samp)) != NULL)
+  {
+    memmove(p + strlen(sampR), p + strlen(samp), strlen(p + strlen(samp)) + 1);
+    memcpy(p, sampR, strlen(sampR));
+    p += strlen(sampR);
+  }
+  p = buf;
+  while ((p = strstr(p, ret)) != NULL)
+  {
+    memmove(p + strlen(retR), p + strlen(ret), strlen(p + strlen(ret)) + 1);
+    memcpy(p, retR, strlen(retR));
+    p += strlen(retR);
+  }
+}
+
 // DICOM scene clip plane (0,0,1) at the near z bound (TestMetalScenes.h:
 // origin at bounds[4] = min z, normal (0,0,1)). Mirrors the app's setupVolumeRay
 // clip (MetalShaders.metal 3965-3989): the plane sits on the box front so
@@ -1203,6 +1255,7 @@ int main(int argc, const char** argv)
     int slabIndex = 0;
     int slabT = 0;
     int maccum = 0;
+    int feedback = 0;   // ping-pong: in-shader read of the previous pass's RT
     int mulAdd = 0;
     int kEndT = 0;
     int uniformSlab = 0;
@@ -1211,6 +1264,7 @@ int main(int argc, const char** argv)
     int jitter = 0;
     int jitterBlock = 1;
     int clip = 0;
+    int scissor = 0;    // clamp the draw to the volume's projected AABB
     float preint = 1.0f;
     int blendOver = -1;   // -1 = auto: over when composite else max
     if (argc > 1 && argv[1][0] == '-' && argv[1][1] == '-')
@@ -1235,6 +1289,7 @@ int main(int argc, const char** argv)
       slabIndex = IntArg(argc, argv, "--slabindex", slabIndex);
       slabT = IntArg(argc, argv, "--slabt", slabT);
       maccum = IntArg(argc, argv, "--maccum", maccum);
+      feedback = IntArg(argc, argv, "--feedback", feedback);
       mulAdd = IntArg(argc, argv, "--muladd", mulAdd);
       kEndT = IntArg(argc, argv, "--kendt", kEndT);
       uniformSlab = IntArg(argc, argv, "--uniformslab", uniformSlab);
@@ -1243,6 +1298,7 @@ int main(int argc, const char** argv)
       jitter = IntArg(argc, argv, "--jitter", jitter);
       jitterBlock = IntArg(argc, argv, "--jitterblock", jitterBlock);
       clip = IntArg(argc, argv, "--clip", clip);
+      scissor = IntArg(argc, argv, "--scissor", scissor);
       preint = FloatArg(argc, argv, "--preint", preint);
       const char* blend = StrArg(argc, argv, "--blend", NULL);
       if (blend) blendOver = strcmp(blend, "over") == 0 ? 1 : 0;
@@ -1278,12 +1334,12 @@ int main(int argc, const char** argv)
 
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     fprintf(stderr, "Metal device: %s\n", device.name.UTF8String);
-    fprintf(stderr, "volume %dx%dx%d R8, rt %dx%d, frames %d, maxIter %d, halfSampler=%d, depthMode=%d, compute=%d, lod0=%d, fastMath=%d, diag=%d, pipeline=%d, sampleDistMM=%.1f, dataMode=%d, layoutMode=%d, filterMode=%d, volDiv=%d, slab=%d/%d, slabT=%d, maccum=%d, mulAdd=%d, kEndT=%d, uniformSlab=%d, camera=%d, composite=%d, jitter=%d(jb=%d), clip=%d, preint=%.2f, blend=%s\n",
-      kW, kH, kD, kRT, kRT, frames, maxIter, halfSampler, depthMode, compute, lod0, fastMath, diag, pipeline, sampleDistMM, dataMode, layoutMode, filterMode, volDiv, slabIndex, numSlabs, slabT, maccum, mulAdd, kEndT, uniformSlab, camera, composite, jitter, jitterBlock, clip, preint, blendOver ? "over" : "max");
+    fprintf(stderr, "volume %dx%dx%d R8, rt %dx%d, frames %d, maxIter %d, halfSampler=%d, depthMode=%d, compute=%d, lod0=%d, fastMath=%d, diag=%d, pipeline=%d, sampleDistMM=%.1f, dataMode=%d, layoutMode=%d, filterMode=%d, volDiv=%d, slab=%d/%d, slabT=%d, maccum=%d, feedback=%d, mulAdd=%d, kEndT=%d, uniformSlab=%d, camera=%d, composite=%d, jitter=%d(jb=%d), clip=%d, scissor=%d, preint=%.2f, blend=%s\n",
+      kW, kH, kD, kRT, kRT, frames, maxIter, halfSampler, depthMode, compute, lod0, fastMath, diag, pipeline, sampleDistMM, dataMode, layoutMode, filterMode, volDiv, slabIndex, numSlabs, slabT, maccum, feedback, mulAdd, kEndT, uniformSlab, camera, composite, jitter, jitterBlock, clip, scissor, preint, blendOver ? "over" : "max");
 
     NSError* err = nil;
     const char* filt = filterMode ? "nearest" : "linear";
-    const int ns = (maccum && numSlabs > 0 && !compute) ? numSlabs : 1;
+    const int ns = ((maccum || feedback) && numSlabs > 0 && !compute) ? numSlabs : 1;
     MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
     opts.fastMathEnabled = (fastMath != 0) ? YES : NO;
     id<MTLFunction> vertF = nil;
@@ -1302,11 +1358,13 @@ int main(int argc, const char** argv)
       if (clip) ApplyClip(msl, compute ? discardKern : discardFrag);
       if (mulAdd) ApplyMulAddDecls(msl);
       if (jitter && !slabT) ApplyJitterDecl(msl, compute ? "float2(gid) + 0.5f" : "float2(in.position.xy) + 0.5f", mulAdd != 0);
-      if (numSlabs > 0) { if (slabT) { if (uniformSlab) ApplySlabT(msl, 0, 1, 1, mulAdd != 0, kEndT != 0, 1, jitter != 0); else ApplySlabT(msl, maccum ? si : slabIndex, maccum ? si + 1 : slabIndex + 1, numSlabs, mulAdd != 0, kEndT != 0, 0, jitter != 0); } else ApplySlab(msl, slabIndex, slabIndex + 1, numSlabs); }
+      if (numSlabs > 0) { if (slabT) { if (uniformSlab) ApplySlabT(msl, 0, 1, 1, mulAdd != 0, kEndT != 0, 1, jitter != 0); else ApplySlabT(msl, (maccum || feedback) ? si : slabIndex, (maccum || feedback) ? si + 1 : slabIndex + 1, numSlabs, mulAdd != 0, kEndT != 0, 0, jitter != 0); } else ApplySlab(msl, slabIndex, slabIndex + 1, numSlabs); }
       if (jitter && !slabT) ApplyJitterStart(msl);
       if (maccum) { if (composite) ApplyCompositeOut(msl); else ApplyAccOut(msl); }
+      else if (feedback && composite) { ApplyCompositeOut(msl); if (si > 0) ApplyFeedback(msl); }
       if (si == 0) { FILE* f = fopen(numSlabs > 0 ? "/tmp/slab.msl" : "/tmp/single.msl", "w"); fputs(msl, f); fclose(f); }
       if (maccum && si == numSlabs - 1) { FILE* f = fopen("/tmp/lastslab.msl", "w"); fputs(msl, f); fclose(f); }
+      if (feedback && si == numSlabs - 1) { FILE* f = fopen("/tmp/feedback.msl", "w"); fputs(msl, f); fclose(f); }
       id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:msl]
                                                  options:opts error:&err];
       free(msl);
@@ -1339,7 +1397,7 @@ int main(int argc, const char** argv)
             pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
             pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
             pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-          } else {
+} else {
             pd.colorAttachments[0].rgbBlendOperation = MTLBlendOperationMax;
             pd.colorAttachments[0].alphaBlendOperation = MTLBlendOperationMax;
             pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
@@ -1350,6 +1408,37 @@ int main(int argc, const char** argv)
         if (!pso) { fprintf(stderr, "pso failed: %s\n", err.description.UTF8String); return 1; }
         [psoArr addObject:pso];
         if (uniformSlab && si == 0) break;
+      }
+    }
+
+    // Pristine single-pass PSO for the --scissor probe. The per-pass PSOs
+    // above carry the slab/maccum patches, whose R byte no longer encodes the
+    // iteration counter; the footprint probe needs a clean unpatched one.
+    id<MTLRenderPipelineState> probePso = nil;
+    if (scissor)
+    {
+      char* msl = BuildMSL(halfSampler != 0, lod0 != 0, pipeline, filt, 0, composite != 0);
+      id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:msl]
+                                                 options:opts error:&err];
+      free(msl);
+      if (!lib)
+      {
+        fprintf(stderr, "probe library compile failed: %s\n", err.description.UTF8String);
+        return 1;
+      }
+      MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
+      pd.vertexFunction = [lib newFunctionWithName:@"vertex_main"];
+      pd.fragmentFunction = [lib newFunctionWithName:@"fragment_main"];
+      pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      if (depthMode != 2)
+      {
+        pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+      }
+      probePso = [device newRenderPipelineStateWithDescriptor:pd error:&err];
+      if (!probePso)
+      {
+        fprintf(stderr, "probe pso failed: %s\n", err.description.UTF8String);
+        return 1;
       }
     }
 
@@ -1432,9 +1521,10 @@ int main(int argc, const char** argv)
     rtd.textureType = MTLTextureType2D;
     rtd.pixelFormat = MTLPixelFormatBGRA8Unorm;
     rtd.width = kRT; rtd.height = kRT;
-    rtd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite;
+    rtd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
     rtd.storageMode = MTLStorageModeShared;
     id<MTLTexture> rt = [device newTextureWithDescriptor:rtd];
+    id<MTLTexture> rt2 = feedback ? [device newTextureWithDescriptor:rtd] : nil;
 
     MTLTextureDescriptor* dd = [[MTLTextureDescriptor alloc] init];
     dd.textureType = MTLTextureType2D;
@@ -1504,6 +1594,16 @@ int main(int argc, const char** argv)
 
     id<MTLBuffer> ubuf = [device newBufferWithBytes:&u length:sizeof(u) options:MTLResourceStorageModeShared];
 
+    // --scissor: clamp every draw to the volume's screen footprint. This
+    // models the app's box-geometry change (draw the volume's back faces
+    // instead of a fullscreen quad), letting the rasterizer cull the
+    // out-of-footprint fragments that currently run the ray prologue and
+    // early-return (77% of fragments on axial, 56% on oblique at 2048). The
+    // rect is measured, not projected: one probe render is read back and the
+    // marched-pixel AABB (iteration counter in the R byte) is the footprint.
+    // The footprint is identical for every slab pass, so one probe suffices.
+    MTLScissorRect scr = {0, 0, (NSUInteger)kRT, (NSUInteger)kRT};
+
     if (diag) {
       // Print what Metal actually receives for invVP (columns) so we can tell
       // whether the simd_float4x4 layout or the MSL multiply is the problem.
@@ -1545,6 +1645,27 @@ int main(int argc, const char** argv)
           else [enc setFragmentBuffer:ubuf offset:0 atIndex:0];
           [enc setFragmentTexture:volTex atIndex:0];
           [enc setFragmentTexture:tfTex atIndex:1];
+          if (scissor) [enc setScissorRect:scr];
+          [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+          [enc endEncoding];
+        }
+      } else if (feedback) {
+        for (int p = 0; p < ns; p++) {
+          if (uniformSlab) {
+            u.slabStart = (float)p / numSlabs;
+            u.slabEnd = (float)(p + 1) / numSlabs;
+          }
+          id<MTLTexture> cur = (p & 1) ? rt2 : rt;
+          id<MTLTexture> prev = (p & 1) ? rt : rt2;
+          MTLRenderPassDescriptor* rpd = MakeRPDAction(cur, depth, depthMode, p == 0 ? MTLLoadActionClear : MTLLoadActionLoad);
+          id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+          [enc setRenderPipelineState:[psoArr objectAtIndex:uniformSlab ? 0 : p]];
+          if (uniformSlab) [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+          else [enc setFragmentBuffer:ubuf offset:0 atIndex:0];
+          [enc setFragmentTexture:volTex atIndex:0];
+          [enc setFragmentTexture:tfTex atIndex:1];
+          if (p > 0) [enc setFragmentTexture:prev atIndex:2];
+          if (scissor) [enc setScissorRect:scr];
           [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
           [enc endEncoding];
         }
@@ -1555,11 +1676,54 @@ int main(int argc, const char** argv)
         [enc setFragmentBuffer:ubuf offset:0 atIndex:0];
         [enc setFragmentTexture:volTex atIndex:0];
           [enc setFragmentTexture:tfTex atIndex:1];
+        if (scissor) [enc setScissorRect:scr];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [enc endEncoding];
       }
       [cb commit];
       [cb waitUntilCompleted];
+    }
+
+    // Probe render + footprint scan for --scissor.
+    if (scissor)
+    {
+      id<MTLCommandBuffer> cb0 = [queue commandBuffer];
+      MTLRenderPassDescriptor* rpd0 = MakeRPDAction(rt, depth, depthMode, MTLLoadActionClear);
+      id<MTLRenderCommandEncoder> enc0 = [cb0 renderCommandEncoderWithDescriptor:rpd0];
+      [enc0 setRenderPipelineState:probePso];
+      [enc0 setFragmentBuffer:ubuf offset:0 atIndex:0];
+      [enc0 setFragmentTexture:volTex atIndex:0];
+      [enc0 setFragmentTexture:tfTex atIndex:1];
+      [enc0 drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [enc0 endEncoding];
+      [cb0 commit];
+      [cb0 waitUntilCompleted];
+      uint8_t* probe = malloc((size_t)kRT * kRT * 4);
+      [rt getBytes:probe bytesPerRow:kRT * 4 fromRegion:MTLRegionMake2D(0, 0, kRT, kRT) mipmapLevel:0];
+      int minX = kRT, minY = kRT, maxX = -1, maxY = -1;
+      for (int y = 0; y < kRT; y++)
+      {
+        for (int x = 0; x < kRT; x++)
+        {
+          if (probe[(size_t)(y * kRT + x) * 4 + 2] != 0)
+          {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+        }
+      }
+      free(probe);
+      if (maxX < minX)
+      {
+        minX = 0; minY = 0; maxX = kRT - 1; maxY = kRT - 1;
+      }
+      scr = (MTLScissorRect){ (NSUInteger)minX, (NSUInteger)minY,
+        (NSUInteger)(maxX - minX + 1), (NSUInteger)(maxY - minY + 1) };
+      fprintf(stderr, "scissor rect %d x %d at +%d+%d (%.1f%% of RT)\n",
+        maxX - minX + 1, maxY - minY + 1, minX, minY,
+        100.0 * (maxX - minX + 1) * (maxY - minY + 1) / ((double)kRT * kRT));
     }
 
     // Timed.
@@ -1591,6 +1755,27 @@ int main(int argc, const char** argv)
           else [enc setFragmentBuffer:ubuf offset:0 atIndex:0];
           [enc setFragmentTexture:volTex atIndex:0];
           [enc setFragmentTexture:tfTex atIndex:1];
+          if (scissor) [enc setScissorRect:scr];
+          [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+          [enc endEncoding];
+        }
+      } else if (feedback) {
+        for (int p = 0; p < ns; p++) {
+          if (uniformSlab) {
+            u.slabStart = (float)p / numSlabs;
+            u.slabEnd = (float)(p + 1) / numSlabs;
+          }
+          id<MTLTexture> cur = (p & 1) ? rt2 : rt;
+          id<MTLTexture> prev = (p & 1) ? rt : rt2;
+          MTLRenderPassDescriptor* rpd = MakeRPDAction(cur, depth, depthMode, p == 0 ? MTLLoadActionClear : MTLLoadActionLoad);
+          id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+          [enc setRenderPipelineState:[psoArr objectAtIndex:uniformSlab ? 0 : p]];
+          if (uniformSlab) [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+          else [enc setFragmentBuffer:ubuf offset:0 atIndex:0];
+          [enc setFragmentTexture:volTex atIndex:0];
+          [enc setFragmentTexture:tfTex atIndex:1];
+          if (p > 0) [enc setFragmentTexture:prev atIndex:2];
+          if (scissor) [enc setScissorRect:scr];
           [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
           [enc endEncoding];
         }
@@ -1601,6 +1786,7 @@ int main(int argc, const char** argv)
         [enc setFragmentBuffer:ubuf offset:0 atIndex:0];
         [enc setFragmentTexture:volTex atIndex:0];
           [enc setFragmentTexture:tfTex atIndex:1];
+        if (scissor) [enc setScissorRect:scr];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [enc endEncoding];
       }
@@ -1620,7 +1806,8 @@ int main(int argc, const char** argv)
     // Nonzero pixels are marched fragments. In diag mode the shader wrote
     // rayDir*0.5+0.5 instead (writes metal_gap_diag.ppm).
     uint8_t* pix = malloc((size_t)kRT * kRT * 4);
-    [rt getBytes:pix bytesPerRow:kRT * 4 fromRegion:MTLRegionMake2D(0, 0, kRT, kRT) mipmapLevel:0];
+    id<MTLTexture> fin = feedback ? (((ns - 1) & 1) ? rt2 : rt) : rt;
+    [fin getBytes:pix bytesPerRow:kRT * 4 fromRegion:MTLRegionMake2D(0, 0, kRT, kRT) mipmapLevel:0];
     double sumB = 0.0;
     double lo = 0.0;
     double hi = 0.0;
