@@ -434,3 +434,55 @@ table, same preint correction. The maccum over-blend matches the app's
 `overBlend` slice composition, and the slab clamp (side-entering rays clamped
 to the z=1 entry plane) matches the app's z-slab tiling - so single-pass vs
 slab alpha can differ (0.190 single-pass vs 0.123 slab) by design.
+
+### Composite-path app-vs-harness decomposition: the single-pass oblique loss is DATA-DEPENDENT, not app-side (2026-08-18)
+
+The app's single-pass composite loses to GL on the oblique 2048x2048 raw path
+(SLAB_BENCHMARKS.md 6: GL ~40.3 vs Metal ~61.8 ms, M/GL 1.53x). To find out how
+much of that is intrinsic vs app-side, the same case was measured in the
+harnesses — `gl_gap`/`metal_gap --camera 0 --rt 2048 --sd 4 --composite 1` —
+interleaved with the app pair in ONE session (vtkMetalGLVisualComparison, DICOM
+IMRToraceAddome, 2048x2048, SD4, JITTER=0, MINMAX=0, ACCEL=0, NUM_SLABS=1; 3
+rounds each, battery):
+
+| | GL | Metal | M/GL |
+|---|---|---|---|
+| app | 39.29 / 39.98 / 41.50 (~40.3) | 62.46 / 62.83 / 60.11 (~61.8) | 1.53x LOSS |
+| harness (same camera/RT/SD) | 42.23 / 42.79 / 42.16 (~42.4) | 41.43 / 41.84 / 41.46 (~41.6) | 0.98 — Metal ≈ GL |
+
+**But the harness default is gradient data — and the gap is DATA-DEPENDENT.**
+Reevaluated the same cells on `--data 1` (xorshift noise, the DICOM-like
+per-texel-variation regime) and on the MIP path, 3 interleaved rounds:
+
+| path | data | GL | Metal p0 | Metal unroll8 | M/GL (p0 / p8) |
+|---|---|---|---|---|---|
+| MIP | gradient | 47.3 | 42.9 | 33.0 | 0.91 / **0.70 win** |
+| MIP | noise | 47.8 | 79.8 | 65.5 | 1.67 / 1.37 loss |
+| composite | gradient | 42.4 | 41.6 | — | 0.98 parity |
+| composite | noise | 41.9 | 77.1 | — | **1.84 loss** |
+
+- On gradient data there is NO intrinsic Metal-vs-GL gap — Metal wins/parity on
+  both paths. The earlier "intrinsic ~1.27-1.3x" and "noise 1.63-1.72x" claims
+  were both real but regime-specific: the ~1.3x was the 400px bare-fetch
+  scheduling deficit (fixed by unrolling — today's p8 numbers beat GL by 1.4x
+  on gradient), and the ~1.7x noise loss is the cache/DRAM working-set deficit
+  (M2 SLC capacity vs the 470 MB volume; GL degrades ~7x as the footprint
+  exceeds cache, Metal ~9x).
+- On noise (the DICOM-like regime) Metal loses 1.67-1.84x at 2048x2048 EVEN in
+  the lean harness — the app's 1.53x is actually BETTER than the harness's
+  1.84x on the same regime. So the app's single-pass loss is NOT app plumbing
+  or march scheduling: it is the data-dependent cache deficit, and the app's
+  shader structure partially mitigates it.
+- March variants only shave it: app single-pass 2048x2048 A/B (3 rounds) —
+  mv0 60.2-62.1, mv6 58.4-59.1, mv7 57.9-61.2, mv9 59.3-60.4, **mv8 (8-wide
+  harness sched) 52.4-54.3** — best case still 1.32x vs GL 40.3-41.1. The
+  deficit is cache behavior, not loop structure; shaders cannot fix it.
+
+The only lever that inverts the noise regime is the cache-resident split: the
+slab path shrinks each pass's working set toward the volDiv=2/4 regime where
+Metal beats GL (harness maccum8 14.5 vs GL 22.6 ms; app slabs8 24.55 vs GL
+42.74 = 0.57x). Axis views have no deficit at all (coherent access: app axial
+single Metal 11.56 vs GL 15.04) — the single-pass path is fine exactly where
+fixed-K=4 uses it. "GL beats Metal on the raw oblique single-pass" is a
+driver-level cache characteristic of the per-texel-varying working set, not a
+shader or API-pipeline property we can change from our side.
