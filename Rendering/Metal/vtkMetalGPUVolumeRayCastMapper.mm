@@ -409,6 +409,38 @@ static int ResolveNumSlabs(const float camVolPos[3])
   return (configured > 0) ? configured : AdaptiveVolumeSlabCount(camVolPos, 8);
 }
 
+// Dominant view axis (0/1/2 = x/y/z) in normalized volume space: the volume
+// axis with the largest |dot| against the view direction (the same
+// approximation AdaptiveVolumeSlabCount uses for its alignment). The spatial
+// slab planes (SLAB_BENCHMARKS.md §5.2) are perpendicular to this axis, which
+// keeps every pass' fetch set a thin flat band of the volume for any view.
+// |dot| >= 1/sqrt(3) by construction, so the shader's plane intersections are
+// never degenerate.
+static int VolumeSlabAxis(const float camVolPos[3])
+{
+  double d[3] = { 0.5 - camVolPos[0], 0.5 - camVolPos[1], 0.5 - camVolPos[2] };
+  int axis = 0;
+  if (std::abs(d[1]) > std::abs(d[axis])) axis = 1;
+  if (std::abs(d[2]) > std::abs(d[axis])) axis = 2;
+  return axis;
+}
+
+// Spatial (uniform world-plane) slab tiling selector
+// (VTK_METAL_TEST_SLAB_SPATIAL, SLAB_BENCHMARKS.md §5.2): when set, the slab
+// passes split the ray by uniform planes perpendicular to the dominant view
+// axis instead of by per-fragment sample-index fractions. Reads the env var
+// once per process; unset = 0 (ray-fraction split). Non-integer values (e.g.
+// 0.6) are debug modes that also enable the spatial split.
+static float VolumeSlabSpatial()
+{
+  static const float spatial = [] {
+    if (const char* v = getenv("VTK_METAL_TEST_SLAB_SPATIAL"))
+      return (float)std::atof(v);
+    return 0.0f;
+  }();
+  return spatial;
+}
+
 // Fixed uniform iteration count for the variant-4 non-divergent march
 // (VTK_METAL_TEST_MARCH_STEPS). 0 = compute a frame-max bound from the camera
 // instead. Reads the env var once per process.
@@ -531,7 +563,7 @@ struct PerBlockData {
   float TextureBoundsMax[4]; // 48..63
   float GradientStep[4];    // 64..79  (xyz + pad)
   float MinMaxInfo[4];      // 80..95  (useMinMax, dimX, dimY, dimZ)
-  float SlabInfo[4];        // 96..111 (slabIndex, slabCount, pad, pad)
+  float SlabInfo[4];        // 96..111 (slabIndex, slabCount, slabAxis, spatialMode)
 };
 
 static_assert(sizeof(PerBlockData) == 112,
@@ -1903,6 +1935,71 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseImageSampleResources()
 }
 
 //------------------------------------------------------------------------------
+bool vtkMetalGPUVolumeRayCastMapper::EnsureSlabResources(
+  void* deviceVoid, int width, int height)
+{
+  if (this->SlabTextureA && this->SlabTextureB && this->SlabFBOWidth == width &&
+    this->SlabFBOHeight == height)
+  {
+    return true;
+  }
+
+  this->ReleaseSlabResources();
+
+  @autoreleasepool
+  {
+    id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
+
+    // Ping-pong color textures (BGRA8Unorm, matching the DirectScreen
+    // pipeline's attachment format). Private storage: only the GPU reads or
+    // writes them.
+    id<MTLTexture> texA = NewTexture2D(device, MTLPixelFormatBGRA8Unorm,
+      width, height,
+      MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead,
+      MTLStorageModePrivate);
+    id<MTLTexture> texB = NewTexture2D(device, MTLPixelFormatBGRA8Unorm,
+      width, height,
+      MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead,
+      MTLStorageModePrivate);
+    if (!texA || !texB)
+    {
+      vtkErrorMacro("Failed to create slab ping-pong textures");
+      return false;
+    }
+    AssignMetalObject(this->SlabTextureA, texA);
+    AssignMetalObject(this->SlabTextureB, texB);
+
+    // Per-pass depth attachment (the DirectScreen pipeline declares
+    // Depth32Float). Cleared per pass; only the pass's own box z-test uses it.
+    id<MTLTexture> depthTex = NewTexture2D(device, MTLPixelFormatDepth32Float,
+      width, height,
+      MTLTextureUsageRenderTarget, MTLStorageModePrivate);
+    if (!depthTex)
+    {
+      vtkErrorMacro("Failed to create slab depth texture");
+      this->ReleaseSlabResources();
+      return false;
+    }
+    AssignMetalObject(this->SlabDepthTexture, depthTex);
+
+    this->SlabFBOWidth = width;
+    this->SlabFBOHeight = height;
+  }
+
+  return true;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::ReleaseSlabResources()
+{
+  ReleaseMetalObject(this->SlabTextureA);
+  ReleaseMetalObject(this->SlabTextureB);
+  ReleaseMetalObject(this->SlabDepthTexture);
+  this->SlabFBOWidth = 0;
+  this->SlabFBOHeight = 0;
+}
+
+//------------------------------------------------------------------------------
 bool vtkMetalGPUVolumeRayCastMapper::EnsureRTTResources(
   void* deviceVoid, int width, int height, int depthScalarType)
 {
@@ -2600,6 +2697,7 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   // drained semaphore, net zero.
   this->WaitForInFlightFrames();
   this->ReleaseImageSampleResources();
+  this->ReleaseSlabResources();
   this->ReleaseRTTResources();
 
   ReleaseMetalObject(this->PipelineState);
@@ -6537,6 +6635,12 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocks(
   BuildPerBlockData(pbd, uniforms);
   pbd.SlabInfo[0] = static_cast<float>(slabIndex);
   pbd.SlabInfo[1] = static_cast<float>(slabCount);
+  const float spatial = VolumeSlabSpatial();
+  if (slabCount > 1 && spatial)
+  {
+    pbd.SlabInfo[2] = static_cast<float>(VolumeSlabAxis(uniforms->CameraVolumePos));
+    pbd.SlabInfo[3] = static_cast<float>(spatial);
+  }
 
   [encoder setVertexBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
   [encoder setFragmentBytes:&pbd length:sizeof(PerBlockData) atIndex:2];
@@ -6648,6 +6752,15 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
   // Back-to-front slab passes: each composites only its ray-length-fraction
   // index range from zero; the (ONE, ONE_MINUS_SRC_ALPHA) blend on attachment 0
   // accumulates them. Premultiplied `over` is associative only back-to-front.
+  // Spatial mode (VTK_METAL_TEST_SLAB_SPATIAL, SLAB_BENCHMARKS.md §5.2):
+  // SlabInfo[2] = dominant view axis, SlabInfo[3] = 1; the shader then splits
+  // by uniform planes perpendicular to that axis, keeping each pass' fetch set
+  // a thin flat band of the volume instead of a ray-space wedge.
+  if (numSlabs > 1 && VolumeSlabSpatial())
+  {
+    pbd.SlabInfo[2] = static_cast<float>(VolumeSlabAxis(uniforms->CameraVolumePos));
+    pbd.SlabInfo[3] = VolumeSlabSpatial();
+  }
   for (int s = numSlabs - 1; s >= 0; --s)
   {
     pbd.SlabInfo[0] = static_cast<float>(s);
@@ -8018,11 +8131,14 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     else
     {
       // Composite slab tiling (VTK_METAL_TEST_NUM_SLABS): split the DirectScreen
-      // (or selection) pass into front-to-back slab passes whose partial
-      // composites accumulate via the (ONE, ONE_MINUS_SRC_ALPHA) blend, exact
-      // for composite blending because premultiplied `over` is associative.
-      // The slab bit only reaches this direct pipeline's mask; offscreen/RTT/
-      // grid pipelines keep their unmodified mask and stay single-pass.
+      // (or selection) pass into front-to-back slab passes. Multi-pass rendering
+      // needs each pass to know the far-side composite alpha (the framebuffer
+      // [[color(0)]] fetch is unavailable here), so the passes render into two
+      // alternating private textures, each sampling the other as its near side.
+      // The final texture is exposed through the ImageSample members and blended
+      // over the drawable by the renderer's Phase 3b blit. The slab bit only
+      // reaches this direct pipeline's mask; offscreen/RTT/grid pipelines keep
+      // their unmodified mask and stay single-pass.
       const int resolvedSlabs = ResolveNumSlabs(uniforms.CameraVolumePos);
       const int numSlabs =
         (!selectionRender && this->GetBlendMode() == vtkVolumeMapper::COMPOSITE_BLEND &&
@@ -8034,31 +8150,120 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       {
         directMask |= VolumeFeature_Slab;
       }
+      // The ping-pong slab textures are single-sample (EnsureSlabResources),
+      // so the slab path must use a 1-sample pipeline regardless of the
+      // window's MSAA setting; the drawable's sample count only applies to
+      // the single-pass path and to Phase 3b's resolve blit.
+      const uint32_t psoSampleCount =
+        (numSlabs > 1) ? 1 : static_cast<uint32_t>(sampleCount);
       void* directPso = this->GetOrCreateVolumePipeline(mtlDevice,
         static_cast<uint32_t>(selectionRender
           ? VolumePipelineType::SelectionDirect
           : VolumePipelineType::DirectScreen),
         MTLPixelFormatBGRA8Unorm, MTLPixelFormatDepth32Float,
-        static_cast<uint32_t>(sampleCount), directMask);
-      this->BindEncoderResources(encoder, uniformBuf, directPso, true);
-
-      // Draw volume — handle partitioned (multi-block) and single-block cases.
-      // Slabs are composited back-to-front so the (ONE, ONE_MINUS_SRC_ALPHA)
-      // blend over-composites each pass over the passes behind it (premultiplied
-      // `over` is associative only in that direction). Drawing front-to-back
-      // would multiply each pass by the transparencies of the passes behind it,
-      // which cancels only for constant-color rays (it still corrupts the color
-      // once shading varies per-sample color).
+        psoSampleCount, directMask);
       const int slabOnly = []() -> int {
         if (const char* v = std::getenv("VTK_METAL_TEST_SLAB_ONLY"))
           return std::atoi(v);
         return -1;
       }();
-      for (int s = numSlabs - 1; s >= 0; --s)
+
+      if (numSlabs > 1)
       {
-        if (slabOnly >= 0 && s != slabOnly) { continue; }
-        this->DrawBlocks(encoder, uniformBuf, ren, vol, &uniforms, invModelMatrix, s, numSlabs);
-        if (slabOnly >= 0) { break; }
+        // Ping-pong offscreen path. End the renderer's active encoder (the
+        // image-sample path precedent; the renderer's Phase 3b re-opens a pass
+        // on the drawable for the final blit).
+        id<MTLRenderCommandEncoder> currentEncoder =
+          (__bridge id<MTLRenderCommandEncoder>)metalRenderWindow->GetCurrentRenderCommandEncoder();
+        if (currentEncoder)
+        {
+          [currentEncoder endEncoding];
+          metalRenderWindow->SetCurrentRenderCommandEncoder(nullptr);
+        }
+
+        if (!this->EnsureSlabResources(mtlDevice, renderWidth, renderHeight))
+        {
+          return;
+        }
+        id<MTLTexture> texA = (__bridge id<MTLTexture>)this->SlabTextureA;
+        id<MTLTexture> texB = (__bridge id<MTLTexture>)this->SlabTextureB;
+        id<MTLTexture> slabDepth = (__bridge id<MTLTexture>)this->SlabDepthTexture;
+
+        id<MTLTexture> finalTex = nil;
+        // Draw the slab passes in RAY order (front-to-back): each pass's
+        // feedback texture (the other ping-pong target) was written by the
+        // pass covering the ray's next-nearer range, so the inherited composite
+        // is the ray's near side — the exact state a single-pass march would
+        // have accumulated before this band, which makes the saturation latch
+        // and the per-sample weights match the single-pass march (see the
+        // slabFar init in the shader). Ray-fraction passes always run
+        // front-to-back (their index ranges are in ray space); spatial passes
+        // run in the dominant-axis direction of travel, which is +axis when
+        // the camera sits on the -axis side of the volume.
+        bool raysAscending = true;
+        if (VolumeSlabSpatial())
+        {
+          const int slabAxis = VolumeSlabAxis(uniforms.CameraVolumePos);
+          raysAscending =
+            (uniforms.CameraVolumePos[slabAxis] <
+             0.5f * (uniforms.VolumeBoundsMin[slabAxis] + uniforms.VolumeBoundsMax[slabAxis]));
+        }
+        const int slabStart = raysAscending ? 0 : numSlabs - 1;
+        const int slabStep = raysAscending ? 1 : -1;
+        for (int s = slabStart; raysAscending ? s < numSlabs : s >= 0; s += slabStep)
+        {
+          if (slabOnly >= 0 && s != slabOnly) { continue; }
+          // Alternate targets so each pass's feedback texture was written by
+          // the pass covering the ray's next-nearer range (the near-side
+          // composite).
+          id<MTLTexture> target = (s % 2) ? texA : texB;
+          id<MTLTexture> feedback = (s % 2) ? texB : texA;
+          finalTex = target;
+
+          MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+          rpd.colorAttachments[0].texture = target;
+          rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+          rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+          rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+          rpd.depthAttachment.texture = slabDepth;
+          rpd.depthAttachment.loadAction = MTLLoadActionClear;
+          rpd.depthAttachment.clearDepth = 1.0;
+          rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+
+          id<MTLRenderCommandEncoder> slabEnc =
+            [commandBuffer renderCommandEncoderWithDescriptor:rpd];
+          slabEnc.label = @"VTK Volume Slab PingPong";
+
+          MTLViewport vp;
+          vp.originX = 0; vp.originY = 0;
+          vp.width = renderWidth; vp.height = renderHeight;
+          vp.znear = 0.0; vp.zfar = 1.0;
+          [slabEnc setViewport:vp];
+
+          this->BindEncoderResources(slabEnc, uniformBuf, directPso, true);
+          [slabEnc setFragmentTexture:feedback atIndex:15];
+
+          this->DrawBlocks(slabEnc, uniformBuf, ren, vol, &uniforms, invModelMatrix, s, numSlabs);
+          [slabEnc endEncoding];
+          if (slabOnly >= 0) { break; }
+        }
+
+        // Expose the final composite to the renderer's Phase 3b blit pass,
+        // which blends it over the drawable with (ONE, ONE_MINUS_SRC_ALPHA).
+        AssignRetainedMetalObject(this->ImageSampleColorTexture, finalTex);
+        this->ImageSampleFBOWidth = renderWidth;
+        this->ImageSampleFBOHeight = renderHeight;
+      }
+      else
+      {
+        // Single-pass: draw straight into the renderer's encoder.
+        this->BindEncoderResources(encoder, uniformBuf, directPso, true);
+        for (int s = numSlabs - 1; s >= 0; --s)
+        {
+          if (slabOnly >= 0 && s != slabOnly) { continue; }
+          this->DrawBlocks(encoder, uniformBuf, ren, vol, &uniforms, invModelMatrix, s, numSlabs);
+          if (slabOnly >= 0) { break; }
+        }
       }
     }
   }

@@ -2962,7 +2962,7 @@ struct PerBlockData {
   float4 textureBoundsMax;
   float4 gradientStep;  // xyz + pad
   float4 minMaxInfo;    // useMinMax, dimX, dimY, dimZ
-  float4 slabInfo;      // slabIndex, slabCount, pad, pad (fc_slabMode)
+  float4 slabInfo;      // slabIndex, slabCount, slabAxis, spatialMode (fc_slabMode)
 };
 
 vertex VolumeVertexOut vertex_volume_main(
@@ -4021,7 +4021,7 @@ struct MarchParams {
 
 inline half4 marchVolumeUnified(
     MarchParams p,
-    half3 initialColor, half initialOpacity,
+    half3 initialColor, half initialOpacity, half4 slabFar,
     constant VolumeMapperUniforms& volumeUniforms,
     constant PerBlockData& b,
     texture3d<float> volumeTexture,
@@ -4151,29 +4151,187 @@ inline half4 marchVolumeUnified(
   // ray's sample indices [0, maxSteps) are partitioned into slabCount equal
   // index ranges via shared ceilings, so consecutive passes start on the same
   // ceil() of the same lattice and the slab sample sets tile the full ray
-  // exactly (minimal_gap phase-2 kEndT). Each pass composites only its interval
-  // from zero; the mapper combines the partials across passes with
-  // (ONE, ONE_MINUS_SRC_ALPHA) blending. Front-to-back premultiplied `over` is
-  // associative, so the combined result equals a single-pass composite up to fp
-  // rounding. currentT is an index-offset accumulator, so re-anchoring to the
-  // slab's first sample keeps comparisons and the tEnd break consistent. Dead-
-  // code-eliminated when the flag is clear. Variants 4/5 (uniform frame-max
-  // bound) are excluded: their bound is frame-uniform, not per-fragment.
+  // exactly (minimal_gap phase-2 kEndT). Each pass composites only its interval;
+  // the mapper renders the passes in RAY order (front-to-back) into two
+  // alternating private textures, each pass sampling the other as its NEAR-side
+  // composite (slabFar, premultiplied RGBA). Starting the opacity accumulator
+  // at the near-side alpha makes the per-sample weights and the saturation
+  // latch track the single-pass march's global accumulation exactly, and the
+  // over-chain's associativity makes the combined result equal to a single-pass
+  // composite up to fp rounding. currentT is an index-offset accumulator, so
+  // re-anchoring to the slab's first sample keeps comparisons and the tEnd
+  // break consistent. Dead-code-eliminated when the flag is clear. Variants 4/5
+  // (uniform frame-max bound) are excluded: their bound is frame-uniform, not
+  // per-fragment.
+  //
+  // Spatial mode (slabInfo.w == 1.0, VTK_METAL_TEST_SLAB_SPATIAL=1,
+  // SLAB_BENCHMARKS.md §5.2): the passes instead split the ray by uniform
+  // planes perpendicular to the dominant view axis (slabInfo.z = 0/1/2 for
+  // x/y/z, set per frame on the CPU), at normalized-volume positions idx/K
+  // and (idx+1)/K. All rays in a pass then fetch from the same thin flat band
+  // of the volume, which keeps the working set cache-resident at any RT size
+  // (the ray-fraction split's per-pass fetch set is a ray-space wedge that
+  // still spans the whole volume at small RTs). The index lattice stays
+  // contiguous across passes: adjacent passes share the exact same plane value
+  // and ceil arithmetic (kEnd of pass p == kStart of pass p+1), and the
+  // firstT/tEnd clamps only cut empty prefixes/suffixes, so the union still
+  // tiles [0, maxSteps) exactly and the composite stays bit-identical to
+  // single-pass up to fp rounding.
   if (fc_slabMode && fc_marchVariant != 4 && fc_marchVariant != 5)
   {
     const float K = max(b.slabInfo.y, 1.0f);
     const float idx = clamp(b.slabInfo.x, 0.0f, K - 1.0f);
-    const int kStart = int(ceil(idx * float(maxSteps) / K));
-    const int kEnd = int(ceil((idx + 1.0f) * float(maxSteps) / K));
+    // The first pass drawn this frame has no near side: its feedback texture
+    // was not written by any earlier pass, so ignore the stale content.
+    // Ray-fraction passes (spatial off) are drawn front-to-back starting at
+    // idx 0; spatial passes start at idx 0 when the rays travel the +dominant
+    // axis and at idx K-1 when they travel the -axis (the mapper's draw order
+    // follows the camera side).
+    const int slabAxis = (int)(b.slabInfo.z + 0.5f);
+    const float slabAd = (slabAxis == 0) ? p.rayDir.x
+                       : (slabAxis == 1) ? p.rayDir.y
+                                         : p.rayDir.z;
+    slabFar = ((b.slabInfo.w <= 0.5f && idx <= 0.0f) ||
+               (b.slabInfo.w > 0.5f && slabAd > 0.0f && idx <= 0.0f) ||
+               (b.slabInfo.w > 0.5f && slabAd < 0.0f && idx >= K - 1.0f))
+        ? half4(0.0h) : slabFar;
+    int kStart = 0;
+    int kEnd = 0;
+    float z0 = 0.0f;
+    float z1 = 0.0f;
+    if (b.slabInfo.w > 0.5f)
+    {
+      const int axis = slabAxis;
+      const float a0 = (axis == 0) ? p.rayOrigin.x
+                    : (axis == 1) ? p.rayOrigin.y
+                                  : p.rayOrigin.z;
+      const float ad = slabAd;
+      // The march's t is relative to the ray entry (checkBounds: firstT =
+      // jitter, tEnd = totalBoxT), so the absolute plane intersections are
+      // shifted by the camera-to-entry distance p.tStart. The crossing of a
+      // plane q that the ray never reaches must not use the analytic
+      // intersection: grazing rays that enter/exit through the band's own face
+      // keep their clamped surface samples (which sit exactly on the plane) in
+      // the band, so a plane at or beyond the entry side maps to the entry
+      // (t=0) and a plane at or beyond the exit side maps to tEnd.
+      const float z0Local = a0 + ad * p.tStart;
+      const float z1Local = a0 + ad * (p.tStart + p.tEnd);
+      z0 = z0Local;
+      z1 = z1Local;
+      const float qA = idx / K;
+      const float qB = (idx + 1.0f) / K;
+      float cA, cB;
+      if (ad >= 0.0f)
+      {
+        cA = (qA <= z0) ? 0.0f : ((qA >= z1) ? p.tEnd : (qA - z0) / ad);
+        cB = (qB <= z0) ? 0.0f : ((qB >= z1) ? p.tEnd : (qB - z0) / ad);
+      }
+      else
+      {
+        cA = (qA >= z0) ? 0.0f : ((qA <= z1) ? p.tEnd : (qA - z0) / ad);
+        cB = (qB >= z0) ? 0.0f : ((qB <= z1) ? p.tEnd : (qB - z0) / ad);
+      }
+      const float tlo = max(firstT, min(cA, cB));
+      const float thi = min(p.tEnd, max(cA, cB));
+      kStart = max(int(ceil((tlo - firstT) / p.stepSize)), 0);
+      kEnd = max(int(ceil((thi - firstT) / p.stepSize)), 0);
+      // The march guarantees at least one sample (the entry-clamped sample,
+      // max(1, ceil(...))). For grazing rays (chord shorter than the first
+      // lattice sample, p.tEnd <= firstT) every band's window ends before the
+      // first lattice sample, so the entry band — the only band whose plane
+      // range contains the entry point — must keep that sample. For longer
+      // rays the next band's window starts at the shared plane value (kEnd of
+      // pass p == kStart of pass p+1), so it already covers index 0; forcing
+      // it here too would double-composite the sample.
+      const float zEntryClamped = clamp(z0, 0.0f, 1.0f);
+      if (p.tEnd <= firstT && kEnd == 0 &&
+          zEntryClamped >= qA &&
+          (zEntryClamped < qB || qB == 1.0f))
+      {
+        kEnd = 1;
+      }
+    }
+    else
+    {
+      kStart = int(ceil(idx * float(maxSteps) / K));
+      kEnd = int(ceil((idx + 1.0f) * float(maxSteps) / K));
+    }
     firstT += float(kStart) * p.stepSize;
     currentT = firstT;
     currentPoint = p.rayOrigin + p.rayDir * (p.checkBounds ? p.tStart : 0.0)
                  + p.rayDir * firstT;
+    // The full-ray sample count before this pass's band range is applied.
+    const int maxStepsFull = maxSteps;
     maxSteps = max(kEnd - kStart, 0);
+
+    // Spatial slab debug (VTK_METAL_TEST_SLAB_SPATIAL=2): encode the pass'
+    // kStart/kEnd as fractions of the full ray (0-255) and the pass maxSteps
+    // scaled by 0.1 (raw values beyond the 8-bit range stay readable).
+    if (b.slabInfo.w > 1.5f && b.slabInfo.w < 3.0f)
+    {
+      const float invFull = (maxStepsFull > 0) ? 255.0f / float(maxStepsFull) : 0.0f;
+      return half4(float(kStart) * invFull, float(kEnd) * invFull,
+        float(maxSteps) * 0.1f, 1.0h);
+    }
+    // Spatial slab debug (VTK_METAL_TEST_SLAB_SPATIAL=0.6): ray geometry:
+    // tEnd*255/4096 (traversal time), stepSize*255/1.0, firstT/step scaled
+    // by 255/8192 (the band's first sample index).
+    if (b.slabInfo.w > 0.5f && b.slabInfo.w < 0.75f)
+    {
+      return half4(p.tEnd * (255.0f / 4096.0f), p.stepSize * 255.0f,
+        (firstT / p.stepSize) * (255.0f / 8192.0f), 1.0h);
+    }
+    // Spatial slab debug (VTK_METAL_TEST_SLAB_SPATIAL=0.8): volume bounds and
+    // camera: (bsz.z*255/2000, cameraPos.z*255/8, volumeBoundsMin.z*255/1000).
+    if (b.slabInfo.w > 0.75f && b.slabInfo.w < 0.9f)
+    {
+      const float bsz = max(volumeUniforms.volumeBoundsMax.z - volumeUniforms.volumeBoundsMin.z, 1e-6);
+      return half4(bsz * (255.0f / 5000.0f),
+        volumeUniforms.cameraVolumePos.z * (255.0f / 4000.0f),
+        volumeUniforms.volumeBoundsMin.z * (255.0f / 5000.0f), 1.0h);
+    }
+    // Spatial slab debug (any value in (0.75, 1.5) except 1.0): raw
+    // kStart/kEnd/maxStepsFull scaled by 255/8192 (values up to 8192 stay
+    // readable). w == 1.0 is the clean spatial mode and falls through to the
+    // march below.
+    if (b.slabInfo.w > 0.75f && b.slabInfo.w < 1.5f && b.slabInfo.w != 1.0f)
+    {
+      return half4(float(maxStepsFull) * (255.0f / 8192.0f),
+        float(kEnd) * (255.0f / 8192.0f), float(kStart) * (255.0f / 8192.0f), 1.0h);
+    }
+    if (b.slabInfo.w < 0.0f)
+    {
+      return half4(float(kStart), float(kEnd), float(maxSteps), 1.0h);
+    }
+    if (b.slabInfo.w > 3.5f)
+    {
+      return half4(z0 * 255.0f, z1 * 255.0f,
+        (firstT / p.stepSize) * 255.0f, 1.0h);
+    }
+    if (b.slabInfo.w > 3.0f && b.slabInfo.w < 3.5f)
+    {
+      return half4(slabFar.a * 255.0f, slabFar.g * 255.0f, slabFar.b * 255.0f, 1.0h);
+    }
   }
 
   half3 accumulatedColor = initialColor;
-  half accumulatedOpacity = initialOpacity;
+  // Slab passes (fc_slabMode) inherit the NEAR-side composite (slabFar, the
+  // premultiplied RGBA of the ray-order-earlier passes, sampled by
+  // fragment_volume_main from the ping-pong feedback texture) so the
+  // opacity-saturation latch tracks the GLOBAL accumulation exactly like the
+  // single-pass march: a single pass latches after the ray-earlier samples have
+  // accumulated past the threshold, which for a slab pass is exactly the
+  // inherited near-side alpha plus the pass's own accumulation. The per-sample
+  // color weights then match the true over-chain (each sample attenuated by the
+  // ray-earlier samples: near-side alpha first, then the pass's own earlier
+  // samples). The first pass drawn has no near side; its feedback texture
+  // content is stale (it is never read as feedback again within the frame).
+  half accumulatedOpacity =
+      initialOpacity + (fc_slabMode ? slabFar.a * (1.0h - initialOpacity) : 0.0h);
+  // Note: accumulatedOpacity is the GLOBAL over-chain alpha (the near-side
+  // slabFar combined with the pass's own samples), so the final composite
+  // alpha below is exactly accumulatedOpacity — no separate "own alpha"
+  // accumulator is needed (the over-chain alpha is symmetric).
 
   // Non-composite blend-mode accumulators. Only the active mode's accumulator
   // is ever touched; dead branches are eliminated via the fc_blendMode function
@@ -4313,6 +4471,11 @@ inline half4 marchVolumeUnified(
       const int batchCap = max(1, int(volumeUniforms.maxBatchWidth));
       while (i < steps)
       {
+        // A slab pass whose inherited near-side alpha already exceeds the
+        // saturation threshold must contribute nothing (the single-pass march
+        // would have latched before its first sample). Checked before the
+        // batch dispatch so the first batch is gated too.
+        if (fc_slabMode && accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
         if (currentT >= p.tEnd - 1e-6f) break;
         if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
             any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
@@ -4637,6 +4800,7 @@ inline half4 marchVolumeUnified(
       const int steps = maxSteps;
       for (; i + unrollN <= steps; i += unrollN)
       {
+        if (fc_slabMode && accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
         if (currentT >= p.tEnd - 1e-6f) break;
         if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
             any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
@@ -4703,6 +4867,7 @@ inline half4 marchVolumeUnified(
       }
       for (; i < steps; i++)
       {
+        if (fc_slabMode && accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
         if (currentT >= p.tEnd - 1e-6f) break;
         if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
             any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
@@ -4730,6 +4895,14 @@ inline half4 marchVolumeUnified(
     int i = 0;
     while (i < maxSteps)
     {
+      // A slab pass whose inherited near-side alpha already exceeds the
+      // saturation threshold contributes nothing; latch instead of breaking so
+      // the unrolled samples stay gated by suppressAccum (the first sample of
+      // the first batch included).
+      if (fc_slabMode && accumulatedOpacity > 1.0h - 1.0h / 255.0h)
+      {
+        marchOpaque = true;
+      }
       const int nBatch = (maxSteps - i >= unrollN) ? unrollN : (maxSteps - i);
       float bs[8];
       if (nBatch > 0) { bs[0] = sampleVolumeScalar(volumeTexture, evalPoint); }
@@ -4909,6 +5082,21 @@ inline half4 marchVolumeUnified(
   else
   {
   for (int i = 0; i < maxSteps; i++) {
+    // A slab pass whose inherited near-side alpha already exceeds the
+    // saturation threshold must contribute nothing (the single-pass march
+    // would have latched before its first sample). Latch for the non-divergent
+    // variants, break for the baseline's divergent march.
+    if (fc_slabMode && accumulatedOpacity > 1.0h - 1.0h / 255.0h)
+    {
+      if (fc_marchVariant >= 3)
+      {
+        marchOpaque = true;
+      }
+      else
+      {
+        break;
+      }
+    }
     // Variant 5 hybrid: exits are latched (not broken) during the uniform main
     // phase i < mainSteps, then the loop reverts to baseline per-fragment
     // breaks in the divergent tail so short rays exit as soon as they finish.
@@ -5605,6 +5793,15 @@ inline half4 marchVolumeUnified(
       finalColor = half4(sum, sum, sum, 1.0h);
     } else {
       finalColor = half4(accumulatedColor, accumulatedOpacity);
+      if (fc_slabMode)
+      {
+        // The near-side composite (slabFar) lies behind this pass's samples:
+        // it is added unattenuated; the pass's samples already carry the
+        // (1 - nearAlpha) weight via the accumulatedOpacity init above, and
+        // accumulatedOpacity is the global over-chain alpha of (slabFar over
+        // this pass), so it is exactly the composite's alpha.
+        finalColor.rgb += slabFar.rgb;
+      }
     }
   } else if (fc_blendMode == 1) {   // MAXIMUM_INTENSITY_BLEND
     half4 c = sampleTransferFunction(transferFunctionTexture, float2(float(mipMaxScalar), 0.5));
@@ -5625,6 +5822,10 @@ inline half4 marchVolumeUnified(
     finalColor = half4(sum, sum, sum, 1.0h);
   } else {
     finalColor = half4(accumulatedColor, accumulatedOpacity);
+    if (fc_slabMode)
+    {
+      finalColor.rgb += slabFar.rgb;
+    }
   }
 
   // Final color window/level (matches OpenGL raycasterfs.glsl finalizeRayCast):
@@ -5652,6 +5853,7 @@ inline half4 marchVolume(
     float3 localPos,
     half3 initialColor,
     half initialOpacity,
+    half4 slabFar,
     constant VolumeMapperUniforms& volumeUniforms,
     constant PerBlockData& b,
     texture3d<float> volumeTexture,
@@ -5699,7 +5901,7 @@ inline half4 marchVolume(
   }
   MarchParams p = {cameraPos, rayDir, tStart, totalBoxT, stepSize, jitter, tTerminateMax,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, true};
-  return marchVolumeUnified(p, initialColor, initialOpacity,
+  return marchVolumeUnified(p, initialColor, initialOpacity, slabFar,
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -5740,7 +5942,7 @@ inline void marchSegment(
   float3 one = float3(1.0);
   MarchParams p = {rayOrigin, rayDir, t0, t1, stepSize, jitter, tTerminateMax,
       zero, one, zero, one, false};
-  half4 result = marchVolumeUnified(p, accumulatedColor, accumulatedOpacity,
+  half4 result = marchVolumeUnified(p, accumulatedColor, accumulatedOpacity, half4(0.0h),
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
@@ -5770,7 +5972,8 @@ fragment VolumeFragmentOut fragment_volume_main(
     texture2d<float> transferFunctionTexture2 [[texture(13)]],
     texture2d<float> transferFunctionTexture3 [[texture(14)]],
     constant packed_float3* rectCoords [[buffer(5)]],
-    constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
+    constant VolumeLightUniforms& volumeLights [[buffer(4)]],
+    texture2d<float> slabFeedbackTexture [[texture(15)]]) {
 
   VolumeFragmentOut output;
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
@@ -5807,10 +6010,19 @@ fragment VolumeFragmentOut fragment_volume_main(
   if (!s.valid) { output.color = float4(0.0); return output; }
 
   float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  // Slab passes sample the ping-pong feedback texture (the composite of all
+  // previous passes, premultiplied RGBA) at this fragment's screen position.
+  // Non-slab pipelines (fc_slabMode == 0) never sample it.
+  half4 slabFar = half4(0.0h);
+  if (fc_slabMode)
+  {
+    slabFar = half4(slabFeedbackTexture.sample(sNearest,
+        in.position.xy / volumeUniforms.viewportSize));
+  }
   half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
       stepSize, s.totalBoxT, in.position.xy, localPos,
-      half3(0.0), 0.0h, volumeUniforms, b,
+      half3(0.0), 0.0h, slabFar, volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
@@ -5887,7 +6099,7 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
   half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
       stepSize, s.totalBoxT, in.position.xy, localPos,
-      half3(0.0), 0.0h, volumeUniforms, b,
+      half3(0.0), 0.0h, half4(0.0h), volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
@@ -5949,7 +6161,7 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
   half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
       stepSize, s.totalBoxT, in.position.xy, s.entryPoint,
-      half3(0.0), 0.0h, volumeUniforms, b,
+      half3(0.0), 0.0h, half4(0.0h), volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
@@ -6006,7 +6218,7 @@ fragment VolumeSelectionOut fragment_volume_fullscreen_selection_main(
   half4 _marchResult = marchVolume(s.entryPoint, s.exitPoint, s.totalDist, s.tTerminateMax, rayDir,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, rayOrigin,
       stepSize, s.totalBoxT, in.position.xy, s.entryPoint,
-      half3(0.0), 0.0h, volumeUniforms, b,
+      half3(0.0), 0.0h, half4(0.0h), volumeUniforms, b,
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
@@ -6092,7 +6304,7 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
     firstOpaquePos = s.entryPoint;
   }
 
-  half4 _marchResult = marchVolumeUnified(p, half3(0.0), 0.0h,
+  half4 _marchResult = marchVolumeUnified(p, half3(0.0), 0.0h, half4(0.0h),
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,

@@ -424,6 +424,18 @@ private:
   bool EnsureImageSampleResources(void* device, int width, int height);
   void ReleaseImageSampleResources();
 
+  // Composite-slab ping-pong (VTK_METAL_TEST_NUM_SLABS > 1): two full-size
+  // BGRA8 textures the slab passes alternate writing into, each pass sampling
+  // the other texture as the far-side composite. The final texture is exposed
+  // to the renderer's Phase 3b blit via the ImageSample members.
+  void* SlabTextureA = nullptr;       // id<MTLTexture> — ping-pong target A
+  void* SlabTextureB = nullptr;       // id<MTLTexture> — ping-pong target B
+  void* SlabDepthTexture = nullptr;   // id<MTLTexture> — Depth32Float, cleared per pass
+  int SlabFBOWidth = 0;
+  int SlabFBOHeight = 0;
+  bool EnsureSlabResources(void* device, int width, int height);
+  void ReleaseSlabResources();
+
   // RenderToImage (color/depth texture export, vtkGPUVolumeRayCastMapper RTT mode)
   void* RTTColorTexture = nullptr;   // id<MTLTexture> — window-sized RGBA8Unorm color
   void* RTTDepthTexture = nullptr;   // id<MTLTexture> — window-sized R32Float depth image

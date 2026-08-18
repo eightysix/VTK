@@ -152,6 +152,13 @@ plumbing (depth attach, `setFragmentBytes`, draw setup) for zero cache gain.
 - The `--uniformslab` variant only updates the slab uniforms in the maccum
   path; in the non-maccum path it silently runs the full march (41.9 ms @2048
   = single-pass) — harness quirk, not a measurement.
+- The axial exact split (`--slabt 1 --slabs 8 --maccum 1`, measured
+  2026-08-18) is 13.75 ms vs 6.21 single = **2.2x loss** — the §5.2 "regression
+  gone" estimate (12-16) is falsified in the lean harness: on axial the
+  single-pass fetch set is already coherent (8.3 G/s), so the split only adds
+  short-march latency and per-pass fragment overhead, which are invariant to
+  the split geometry. The app reproduces it (spatial slabs8 axial 19.58 vs
+  single 11.56).
 
 ### 3.4 Size scaling of the oblique slabs8 path (jitter=0, adaptive slabs8)
 
@@ -196,6 +203,12 @@ CPU cost (`setFragmentBytes` + 3-vertex draw x8) is ~0.05-0.2 ms total.
    `--slabs 8` non-maccum keeping avgIter 28.5 (the single-pass count) is the
    tell that it is a 1-band probe, not a true split; `--slabt`'s avgIter 3.4
    is the true split's short-march signature.
+8. **Visual diff requires `JITTER=0`.** GL and Metal draw independent
+   per-pixel jitter phases, so with jitter on the thresholded GL-vs-Metal
+   error is ~0.82 regardless of the composite's correctness; with jitter off
+   every slab config (ray-fraction and spatial) measures 0.000. The
+   "thresholded error stays 0.000 in all configs" claims in
+   PERFORMANCE_INVESTIGATION.md §19 hold for jitter-free runs.
 
 ## 5. Problem and solution: replacing the ray-fraction slab split
 
@@ -248,7 +261,64 @@ Measured expectations (lean harness shader, SD=4, composite, jitter=0):
 | oblique 2048 | 62.97 | 28.59 | ~30 (par; short marches latency-bound) |
 | axial 2048 | 11.55 | 18.10 (regress) | ~12-16 (regression gone) |
 
+**The axial estimate was falsified (2026-08-18).** The app's spatial split on
+axial 2048 measures 19.58 ms vs 11.56 single-pass (0.58x), and the lean
+harness's exact split is 13.75 vs 6.21 (2.2x loss, §3.3): short-march latency
+and per-pass fragment overhead are invariant to the split geometry, and on
+near-axis views single-pass fetch locality is already perfect — there is no
+cache win to harvest. No K>1 keeps axial at single-pass speed (the penalty is
+monotonic in K: 1.13x@2, 1.34x@4, 1.65x@8 in the app, §6). The spatial mode's
+remaining promise — the oblique small-RT win (512/1024) — is unverified:
+only the 2048 oblique ray-fraction and axial spatial cases have been run.
+
 The 2048 oblique stays par with the current split (both ~28-30); the wins are
 at small RTs and the near-axis views — the exact-space ceiling is ~5 G/s for
 split marches, and the 24.8 G/s coherence ceiling belongs to the (non-exact)
 z-clamp probe, not to any faithful composite.
+
+## 6. Correctness fix and fixed-K design (2026-08-18)
+
+The ping-pong slab path had a composite-alpha bug: `accumulatedOpacityOwn`
+was only accumulated in the baseline march loop, so the default v9 (and
+v8/v6/v7) paths emitted `finalColor.a = slabFar.a` (or 0 on fullscreen
+passes) — the pass's own opacity was dropped and Phase 3b's over-blend left
+the background un-attenuated (washed-out image). Fixed by using the global
+over-chain alpha (`accumulatedOpacity`) as the composite alpha. Also fixed:
+`slabInfo.w == 1.0` (the documented spatial selector) fell into a debug
+return — every value in (0.5, 4] was a debug encoding, so the clean spatial
+split was unreachable; w == 1.0 now falls through to the march. The spatial
+entry guard now fires only for genuinely grazing rays (`tEnd <= firstT`),
+removing a double-composite of sample 0 at band boundaries, and the slab path
+uses a 1-sample pipeline independent of window MSAA.
+
+Re-measurement (same session, 2048x2048, SD4, minmax off, accel off;
+thresholded GL-vs-Metal error 0.000 in every row — jitter must be 0 for the
+visual diff, pitfall §4.8):
+
+| config | GL | single | slabs=2 | slabs=4 | slabs=8 | slabs=16 |
+|---|---|---|---|---|---|---|
+| oblique (adaptive = 8) | 42.74 | 60.92 | 37.27 | 25.25 | 24.55 | 31.29 |
+| axial z (forced) | 15.04 | 11.56 | 13.11 | 15.53 | 19.03 | — |
+| oblique, jitter=1 | 57.81 | — | — | — | 30.88 | — |
+
+Design conclusions:
+
+- **Oblique bottoms at K=8; K=16 regresses** (per-pass overhead exceeds the
+  locality gain once the working set is L2-resident). **K=4 captures the full
+  oblique win** (25.25 vs 24.55, within noise).
+- **The axial penalty is monotonic in K** (1.13x@2, 1.34x@4, 1.65x@8): no
+  fixed K>1 keeps axial at single-pass speed. **K=4 puts axial at GL parity**
+  (15.53 vs 15.04) while keeping the oblique win — the best "never loses to
+  GL" fixed point. K=8 has the tightest all-orientation frame band
+  (19.0-24.6, 1.3x spread) — the most pacing-constant choice.
+- **Adaptive slab count (align >= 0.95 -> 1 slab) removes the axial
+  regression but creates a frame-time discontinuity at the threshold during
+  rotation** (24.6 <-> 11.6 ms jumps). A fixed K trades the axial cost for
+  constant pacing; the choice is K=4 (axial GL parity) vs K=8 (tightest
+  band).
+- The app pays ~5 ms/frame of fixed plumbing vs the lean harness (the delta
+  is the same at K=1 and K=8); recoverable via a back-to-front single-RT slab
+  path (no ping-pong feedback fetch) and box geometry instead of a fullscreen
+  quad (kills out-of-footprint fragments). Estimated axial K=8 19 -> ~13-15,
+  i.e. near single-pass parity; below parity is impossible (sample count and
+  fetch behavior are unchanged by splitting on axial).
