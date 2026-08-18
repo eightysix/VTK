@@ -316,9 +316,37 @@ Design conclusions:
   rotation** (24.6 <-> 11.6 ms jumps). A fixed K trades the axial cost for
   constant pacing; the choice is K=4 (axial GL parity) vs K=8 (tightest
   band).
-- The app pays ~5 ms/frame of fixed plumbing vs the lean harness (the delta
-  is the same at K=1 and K=8); recoverable via a back-to-front single-RT slab
-  path (no ping-pong feedback fetch) and box geometry instead of a fullscreen
-  quad (kills out-of-footprint fragments). Estimated axial K=8 19 -> ~13-15,
-  i.e. near single-pass parity; below parity is impossible (sample count and
-  fetch behavior are unchanged by splitting on axial).
+### 6.1 Next steps: cutting the axial per-fragment cost
+
+Why axial slabs8 is slow (19.03 vs 11.56): splitting does not change the
+total sample count (identical marches, 1.25 samples/pass at K=8) and axial
+fetch locality is already perfect (8.3 G/s single-pass), so slabs add only
+per-pass fragment overhead. Each slab fragment pays, per pass: ray-setup
+prologue (arithmetic), a **ping-pong feedback texture fetch** (DRAM-latency
+round trip — the 16.8 MB RT exceeds L2), the short latency-bound march, and
+depth test + RT write. The lean harness (13.75 ms, no ping-pong at all) shows
+~5 ms of this is app plumbing.
+
+Cuttable, in order of expected value:
+
+1. **Back-to-front single-RT blending instead of ping-pong.** Draw far-to-near
+   with `(ONE, ONE_MINUS_SRC_ALPHA)` over-blend into one cleared offscreen RT
+   (the harness and the pre-ping-pong `DrawBlocksFullscreen` design; the blend
+   unit does the composite, no `texture(15)` fetch, half the texture traffic).
+   Trade-off: loses the front-to-back opacity latch, which currently makes
+   oblique passes 2-7 nearly free; on axial the latch never fires (passes stay
+   transparent) so this is pure win on axial, a small loss on oblique.
+2. **Box geometry instead of the fullscreen quad.** The direct path
+   rasterizes all 33M fragments per pass; the volume's screen footprint is
+   only ~60-80%, so the out-of-footprint fragments run the full prologue and
+   write 0, K times. Six back-face triangles cull them at the rasterizer.
+3. **Lean slab entry point** (skip minmax/lighting setup the slab passes
+   don't use).
+
+Ceiling: **parity with single-pass, never below** — the march sample count is
+identical to single-pass and axial memory behavior is already optimal, so the
+best case is the per-fragment overhead → 0, i.e. axial K=8 ≈ 11.56.
+Realistic estimate: 19.03 → ~13-15 ms (1.1-1.3x), after which the fixed-K
+choice (K=4 axial GL parity vs K=8 tightest band, §6) decides the remaining
+trade-off. Verification: re-run the §6 table (oblique + axial, K=8, jitter=0)
+after each change, keeping thresholded error 0.000.
