@@ -347,6 +347,24 @@ static int VolumeMarchVariant()
   return variant;
 }
 
+// Volume texture upload layout (lag_repro root cause, 2026-08-18): the GPU's
+// lossless optimized swizzle (MTLTextureDescriptor.allowGPUOptimizedContents,
+// default YES) taxes incompressible per-texel-varying payloads (DICOM/CT-like
+// noise) ~1.3-1.8x on the 3D read path; with the flag NO Metal matches or beats
+// GL (lag_repro: noise 79.5 -> 44.2 ms; metal_gap --noopt: sd0.5 noise 310 ->
+// 92 ms, 3.4x; GL parity 11/13 harness cells). Default NO for volume data per
+// the lag_repro rule (keep YES only for compressible data); set
+// VTK_METAL_TEST_GPU_OPTIMIZED_CONTENTS=1 to restore the legacy YES for A/B.
+static bool VolumeGPUOptimizedContents()
+{
+  static const bool opt = [] {
+    if (const char* v = getenv("VTK_METAL_TEST_GPU_OPTIMIZED_CONTENTS"))
+      return std::atoi(v) != 0;
+    return false; // NO: uncompressed layout (the root-cause fix)
+  }();
+  return opt;
+}
+
 // Composite slab count from VTK_METAL_TEST_NUM_SLABS (default 8). N > 1 splits
 // each ray into N ray-length-fraction index ranges (ceil(j*maxSteps/N) ..
 // ceil((j+1)*maxSteps/N) for j in [0,N)) and renders N front-to-back passes
@@ -1015,7 +1033,8 @@ static id<MTLTexture> NewTexture3D(
   NSUInteger height,
   NSUInteger depth,
   MTLTextureUsage usage,
-  MTLStorageMode storage)
+  MTLStorageMode storage,
+  bool allowGPUOptimizedContents = true)
 {
   MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
   desc.textureType = MTLTextureType3D;
@@ -1026,6 +1045,7 @@ static id<MTLTexture> NewTexture3D(
   desc.mipmapLevelCount = 1;
   desc.usage = usage;
   desc.storageMode = storage;
+  desc.allowGPUOptimizedContents = allowGPUOptimizedContents;
   id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
   [desc release];
   return tex;
@@ -2161,7 +2181,8 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
         static_cast<NSUInteger>(dims[1]),
         static_cast<NSUInteger>(dims[2]),
         MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead,
-        MTLStorageModePrivate);
+        MTLStorageModePrivate,
+        VolumeGPUOptimizedContents());
       if (!tex)
       {
         vtkErrorMacro("Failed to create 3D volume texture for GPU conversion");
@@ -2291,7 +2312,8 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
         static_cast<NSUInteger>(dims[1]),
         static_cast<NSUInteger>(dims[2]),
         MTLTextureUsageShaderRead,
-        MTLStorageModePrivate);
+        MTLStorageModePrivate,
+        VolumeGPUOptimizedContents());
       if (!tex)
       {
         vtkErrorMacro("Failed to create 3D volume texture");
@@ -3344,7 +3366,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
             static_cast<NSUInteger>(dims[1]),
             static_cast<NSUInteger>(dims[2]),
             MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead,
-            MTLStorageModePrivate);
+            MTLStorageModePrivate,
+            VolumeGPUOptimizedContents());
           if (!tex)
           {
             vtkErrorMacro("Failed to create 3D volume texture for GPU conversion");
@@ -3471,7 +3494,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           static_cast<NSUInteger>(dims[1]),
           static_cast<NSUInteger>(dims[2]),
           MTLTextureUsageShaderRead,
-          MTLStorageModePrivate);
+          MTLStorageModePrivate,
+          VolumeGPUOptimizedContents());
         if (!tex)
         {
           vtkErrorMacro("Failed to create 3D volume texture");

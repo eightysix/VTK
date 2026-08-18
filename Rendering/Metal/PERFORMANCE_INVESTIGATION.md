@@ -1377,3 +1377,69 @@ Adaptive never exceeds the best of s1/s8 beyond run noise (axial SD0.5 measures
 88.4 vs 96.5 s8 best, within the ~22 ms run-to-run sigma of that cell). The app's
 axis-aligned `ResetCamera` view now renders single-pass (no slab penalty), and
 oblique/rotated views automatically fall back to the cache-resident tiling.
+
+## 21. Fair raw matrix and the one remaining loss (2026-08-18)
+
+### 21.1 GL has no minmax — the fair comparison is raw vs raw
+
+The harness env vars only reach the Metal backend (TestMetalScenes.h:1233-1234),
+and `Rendering/OpenGL2` contains **no** `UseMinMaxAcceleration` at all — the GL
+backend has no min-max skipping, period. So minmax must be excluded from any
+fair A/B: the comparison is raw march vs raw march, and minmax is a Metal-only
+advantage (when it is on, Metal wins 0.62-0.79x at 2048/SD0.5 and 0.37-0.49x at
+400 — §19).
+
+### 21.2 Final raw matrix (DICOM app, 30 frames, battery, opt off, ACCEL=0/MINMAX=0, NUM_SLABS=1, jitter=1, single run)
+
+| cell | GL | mv0 | mv9 |
+|---|---|---|---|
+| 2048, SD0.5 | 160.2 | 119.1 (0.74x) | **90.4 (0.56x win)** |
+| 2048, SD4 | 53.1 | 69.8 (1.31x) | 72.8 (1.37x) |
+| 400, SD0.5 | 50.7 | 60.5 (1.19x) | **30.4 (0.60x win)** |
+| 400, SD4 | 19.0 | 21.6 (1.13x) | **17.8 (0.93x)** |
+
+With the layout flag off (allowGPUOptimizedContents = NO, §20-era lag_repro
+root cause), the fair raw regime is: **Metal wins or ties 3 of 4 cells under
+the production mv9 march; the single residual loss is 2048/SD4 with jitter=1
+(1.31-1.37x)**.
+
+### 21.3 Where the residual 2048/SD4+jitter loss comes from
+
+- Not the layout flag (opt-off throughout): jitter=0 same cells are parity
+  (GL 41.7 vs mv0 43.9 / mv9 46.5 — §7-era numbers).
+- Jitter cost is asymmetric: GL +27% (41.7 -> 53.1), Metal +57-59% (43.9 ->
+  69.8, 46.5 -> 72.8) at this exact cell. Jitter randomizes per-pixel march
+  phases, scattering each warp's fetch addresses across the 470 MB volume and
+  multiplying the effective working set past the M2 SLC (~32-64 MB); past
+  capacity Metal's 3D read path degrades ~9x vs GL's ~7x (volDiv discriminator,
+  minimal_gap README). At jitter=0 the fetch set is warp-coherent and
+  cache-friendly, so parity returns.
+- Confirmed shader-side impossible: unroll, layout (2D-array worse), filter
+  (nearest keeps it), compression (incompressible noise), ISA (identical) all
+  ruled out. Same conclusion as lag_repro: driver-internal texture-read-path
+  behavior.
+- Recovery options (both excluded from the fair raw comparison by the user's
+  constraint or by design): slabs (restore per-pass cache residency — §20) and
+  minmax (Metal-only, skips empty lattice cells — §19).
+
+### 21.4 Harness confirmation of the port
+
+`metal_gap --camera 0 --rt 2048 --sd 4 --composite 1 --data 1`, 3 rounds,
+interleaved with GL (composite-path parity cell of §0-era, now with `--noopt`):
+
+| | GL | Metal opt-on | Metal --noopt |
+|---|---|---|---|
+| 2048/SD4 composite noise | 41.8 / 44.0 / 41.8 (~42.5) | 76.7 / 76.2 / 77.4 (~76.7) | 42.9 / 43.5 / 42.2 (~42.9) |
+
+M/GL 1.80x -> **1.01x**, readback byte-identical (meanB 0.142, sumIter
+151697660 in all three Metal runs). The harness loss was the layout flag, and
+the port removes it in both the harness and the app.
+
+### 21.5 Low-res recheck (why §19-era 400px numbers showed a win)
+
+The 400x400 raw cell is a **win under mv9** (0.60-0.93x, above) and only a loss
+under the temporary mv0 default (1.13-1.24x) — mv0's serial loop exposes the
+DRAM-latency floor at small RTs, mv9's 48-wide in-flight batches hide it. The
+documented §19.3 grid (400/SD0.5 minmax-on Metal 24.7 vs GL 49.7 = 0.50x) and
+the §7.3 az-60 row (Metal 44.7 vs GL 49.7) are consistent with this: Metal is
+not slower at 400x400 when the march is mv9.

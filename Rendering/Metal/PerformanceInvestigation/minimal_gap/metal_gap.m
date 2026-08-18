@@ -18,6 +18,11 @@
 //   --compute         replace the fragment pass with a compute kernel
 //   --lod0            explicit level(0.0f) sample, no implicit LOD gradient
 //   --fastmath 0/1    MTLCompileOptions.fastMathEnabled
+//   --noopt 0/1       volume MTLTextureDescriptor.allowGPUOptimizedContents=NO
+//                     (lag_repro root cause: the default YES lets the GPU
+//                     losslessly recompress private 3D textures, which taxes
+//                     incompressible noise payloads ~1.8x; GL-parity on noise
+//                     data requires the flag off)
 //   --diag            ray-field diagnostic shader
 //   --pipeline N      0 = serial, 2 = serial unroll, 3+ = latch unroll group N
 //   --rt N            render-target size in px (default 400)
@@ -1244,6 +1249,7 @@ int main(int argc, const char** argv)
     int compute = 0;
     int lod0 = 0;
     int fastMath = 1;
+    int noopt = 0;
     int diag = 0;
     int pipeline = 0;
     float sampleDistMM = 0.5f;
@@ -1276,6 +1282,7 @@ int main(int argc, const char** argv)
       compute = IntArg(argc, argv, "--compute", compute);
       lod0 = IntArg(argc, argv, "--lod0", lod0);
       fastMath = IntArg(argc, argv, "--fastmath", fastMath);
+      noopt = IntArg(argc, argv, "--noopt", noopt);
       diag = IntArg(argc, argv, "--diag", diag);
       pipeline = IntArg(argc, argv, "--pipeline", pipeline);
       kRT = IntArg(argc, argv, "--rt", kRT);
@@ -1334,8 +1341,8 @@ int main(int argc, const char** argv)
 
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     fprintf(stderr, "Metal device: %s\n", device.name.UTF8String);
-    fprintf(stderr, "volume %dx%dx%d R8, rt %dx%d, frames %d, maxIter %d, halfSampler=%d, depthMode=%d, compute=%d, lod0=%d, fastMath=%d, diag=%d, pipeline=%d, sampleDistMM=%.1f, dataMode=%d, layoutMode=%d, filterMode=%d, volDiv=%d, slab=%d/%d, slabT=%d, maccum=%d, feedback=%d, mulAdd=%d, kEndT=%d, uniformSlab=%d, camera=%d, composite=%d, jitter=%d(jb=%d), clip=%d, scissor=%d, preint=%.2f, blend=%s\n",
-      kW, kH, kD, kRT, kRT, frames, maxIter, halfSampler, depthMode, compute, lod0, fastMath, diag, pipeline, sampleDistMM, dataMode, layoutMode, filterMode, volDiv, slabIndex, numSlabs, slabT, maccum, feedback, mulAdd, kEndT, uniformSlab, camera, composite, jitter, jitterBlock, clip, scissor, preint, blendOver ? "over" : "max");
+    fprintf(stderr, "volume %dx%dx%d R8, rt %dx%d, frames %d, maxIter %d, halfSampler=%d, depthMode=%d, compute=%d, lod0=%d, fastMath=%d, noopt=%d, diag=%d, pipeline=%d, sampleDistMM=%.1f, dataMode=%d, layoutMode=%d, filterMode=%d, volDiv=%d, slab=%d/%d, slabT=%d, maccum=%d, feedback=%d, mulAdd=%d, kEndT=%d, uniformSlab=%d, camera=%d, composite=%d, jitter=%d(jb=%d), clip=%d, scissor=%d, preint=%.2f, blend=%s\n",
+      kW, kH, kD, kRT, kRT, frames, maxIter, halfSampler, depthMode, compute, lod0, fastMath, noopt, diag, pipeline, sampleDistMM, dataMode, layoutMode, filterMode, volDiv, slabIndex, numSlabs, slabT, maccum, feedback, mulAdd, kEndT, uniformSlab, camera, composite, jitter, jitterBlock, clip, scissor, preint, blendOver ? "over" : "max");
 
     NSError* err = nil;
     const char* filt = filterMode ? "nearest" : "linear";
@@ -1471,6 +1478,7 @@ int main(int argc, const char** argv)
     vd.mipmapLevelCount = 1;
     vd.usage = MTLTextureUsageShaderRead;
     vd.storageMode = MTLStorageModePrivate;
+    if (noopt) vd.allowGPUOptimizedContents = NO;
     id<MTLTexture> volTex = [device newTextureWithDescriptor:vd];
 
     id<MTLCommandQueue> queue = [device newCommandQueue];

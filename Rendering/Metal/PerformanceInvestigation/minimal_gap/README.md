@@ -401,8 +401,8 @@ Named flags (positional form still works unchanged):
 ```
 --frames N --maxiter N --nofetch B --usedepth B --fmt16 B --flipy B
 --rt N --sd F --data N --filter N --div N --slabs N --slabindex N
---slabt B --maccum B --muladd B --camera N --composite B --jitter B
---jitterblock N --clip B --preint F --blend over|max
+--slabt B --maccum B --muladd B --noopt B --camera N --composite B
+--jitter B --jitterblock N --clip B --preint F --blend over|max
 ```
 
 Example: `./gl_gap --frames 10 --maxiter 99999 --composite 1 --slabs 4
@@ -486,3 +486,21 @@ single Metal 11.56 vs GL 15.04) — the single-pass path is fine exactly where
 fixed-K=4 uses it. "GL beats Metal on the raw oblique single-pass" is a
 driver-level cache characteristic of the per-texel-varying working set, not a
 shader or API-pipeline property we can change from our side.
+
+### Composite-path root cause found: `allowGPUOptimizedContents` (2026-08-18)
+
+The harness loss above (composite noise 1.80x) was the volume texture's
+`MTLTextureDescriptor.allowGPUOptimizedContents` (default YES — the GPU's
+lossless re-swizzle of private 3D textures taxes incompressible per-texel
+data). `metal_gap --noopt 1` sets it to NO; `lag_repro/` pinned the mechanism.
+Same cell (`--camera 0 --rt 2048 --sd 4 --composite 1 --data 1`), 3
+interleaved rounds:
+
+| | GL | opt-on | --noopt |
+|---|---|---|---|
+| 2048/SD4 composite noise | 41.8 / 44.0 / 41.8 (~42.5) | 76.7 / 76.2 / 77.4 (~76.7) | 42.9 / 43.5 / 42.2 (~42.9) |
+
+M/GL 1.80x -> **1.01x (parity)**, readback byte-identical across all Metal
+runs (meanB 0.142, sumIter 151697660). The single-pass noise deficit was the
+layout flag; the app port is SLAB_BENCHMARKS.md §7, in-app A/B
+PERFORMANCE_INVESTIGATION.md §21.2.

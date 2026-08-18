@@ -62,6 +62,7 @@ build_macos_metal/bin/vtkMetalGLVisualComparison \
 | `CAM_AXIS` | unset | `x`/`y`/`z` look along that world axis; unset = oblique preset |
 | `CAM_AZ` | -60 | extra azimuth for the oblique preset |
 | `CAM_DOLLY` | unset | camera dolly factor |
+| `GPU_OPTIMIZED_CONTENTS` | 0 | volume `MTLTextureDescriptor.allowGPUOptimizedContents` (0 = NO = the lag_repro root-cause fix, default; 1 = legacy YES) |
 
 CLI: `--bench --frames N --reps N --warmup N --size WxH --scene DICOMVolume
 --backend gl|metal --dicom DIR --perframe --gpu-mem --host-mem`.
@@ -391,3 +392,80 @@ rejected for frame-pacing.
 
 Verification: re-run the §6 table (oblique + axial, K=8, jitter=0) after each
 app change, keeping thresholded error 0.000.
+
+## 7. The single-pass root cause, ported to the app: `allowGPUOptimizedContents = NO` (2026-08-18)
+
+`lag_repro` pinned the raw single-pass lag to the volume texture's
+`MTLTextureDescriptor.allowGPUOptimizedContents` (default YES: the GPU's
+lossless re-swizzle of private 3D textures taxes incompressible per-texel data
+~1.8x; NO = uncompressed layout, GL parity — see `lag_repro/README.md`). The
+mapper now sets **NO by default** on the volume texture
+(`VolumeGPUOptimizedContents()`, all four creation sites in
+`CreateGlobalVolumeTexture`/`UpdateVolumeTexture`), with
+`VTK_METAL_TEST_GPU_OPTIMIZED_CONTENTS=1` restoring the legacy YES for A/B.
+
+In-app A/B (DICOM IMRToraceAddome, 2048x2048, battery, interleaved; opt1 =
+legacy YES, opt0 = default NO). NOTE: the code default march variant is
+**mv0** (raw scalar march) right now — `VolumeMarchVariant()` returns 0 with a
+TEMP-REPRO comment (revert to 9); unset `MARCH_VARIANT` rows below are mv0,
+and the mv9 row is pinned explicitly. The flag's effect is march-independent:
+
+| config | march | GL | opt1 | opt0 | gain | M/GL opt0 |
+|---|---|---|---|---|---|---|
+| single oblique, SD4 (jitter=0) | mv0 | 41.66 | 61.5 | **43.9** | **1.40x** | 1.05x |
+| single oblique, SD4 (jitter=0) | mv9 | 41.66 | 60.8 | **46.5** | **1.31x** | 1.12x |
+| single oblique, SD0.5 (jitter=0) | mv0 | 154.77 | 294.8 | **115.2** | **2.56x** | **0.74x win** |
+| single axial, SD4 (jitter=0) | mv0 | 15.75 | 11.4 | 11.0 | 1.04x | 0.70x |
+| slabs8 adaptive, SD4 (jitter=0) | mv0 | 39.31 | 24.4 | 25.2 | ~neutral | 0.64x |
+| production defaults (SD0.5/jitter=1/minmax=1) | mv0 | 161.33 | 194.5 | 187.6 | 1.035x | 1.16x |
+| 400x400 SD0.5 (jitter=0) | mv0 | — | 39.01 | 23.16 | 1.68x | — |
+
+- The flag is the single-pass root cause in-app too: SD4 1.40x, SD0.5 2.56x —
+  matching the harness `--noopt` matrix (noise sd4 1.8x, sd0.5 2.9x on the
+  lean shader; the app's minmax/slab plumbing shaves some of the headroom).
+- With the flag off, the oblique single-pass raw path goes from 1.47x loss to
+  **1.05x parity at SD4 and a 0.74x win at SD0.5** — the deficit is gone
+  without slabs.
+- The flag is **neutral where the working set is already small**: axial
+  (coherent single-pass, ~4%) and the slabs8 path (per-pass sets are
+  cache-resident; within noise, opt1 slightly ahead by ~2-3%). It is the
+  single-pass/large-footprint lever, not a general one.
+- The production path (minmax + jitter + adaptive slabs at SD0.5) gains only
+  ~3.5%: the slab tiling already keeps the working set resident, and minmax
+  skips cut the samples — the layout tax applies to the full-footprint
+  passes only.
+- Visual parity: GL-vs-Metal thresholded error is byte-identical before and
+  after the flag change (16.033 @400/SD0.5 — a pre-existing baseline
+  divergence of the current slab/ping-pong path, unchanged by the layout;
+  the flag itself is lossless).
+- The layout flag is the right default for CT/DICOM data (incompressible).
+  `VTK_METAL_TEST_GPU_OPTIMIZED_CONTENTS=1` keeps the legacy swizzle for
+  compressible payloads (smooth atlases, distance fields) where the YES tax
+  does not exist.
+
+### 7.1 Low-res recheck: the 400x400 "gap" was a march-variant artifact (2026-08-18)
+
+The 400x400 raw cell looks like a loss under the current mv0 default, but is a
+**win under the production mv9 march** — the earlier "1.19-1.24x loss" readings
+were the TEMP-REPRO mv0 pin, not Metal. 400x400 raw (ACCEL=0/MINMAX=0,
+SD0.5, jitter=1, opt off, slabs off, 3 interleaved rounds):
+
+| march | Metal | vs GL ~49.4 |
+|---|---|---|
+| mv0 (temporary default) | ~61.1 | 1.24x loss |
+| mv9 (production 48-wide) | ~30.9 | **0.63x win** |
+
+mv0's serial fetch→consume loop exposes the DRAM-latency floor at small RTs;
+mv9's 48-wide in-flight batches hide it (~2x at this cell). At 2048 the roles
+invert slightly (mv0 raw SD4 43.9 vs mv9 46.5, jitter=0). Same story at 400/SD4:
+mv9 17.8 vs GL 19.0 (0.93x) vs mv0 21.6 (1.13x).
+
+### 7.2 Jitter costs Metal ~2x what it costs GL
+
+Jitter=1 inflates the 2048/SD4 single-pass raw cell asymmetrically (same run
+session): GL +27% (41.7 -> 53.1), Metal +57-59% (mv0 43.9 -> 69.8, mv9 46.5 ->
+72.8). Jitter scatters per-warp fetch addresses, multiplying the effective
+working set past SLC capacity; Metal's read path degrades more than GL's
+driver-internal tiling. Hence parity (jitter=0) vs 1.31-1.37x (jitter=1) at
+that cell, and why the visual diff and the harness parity cells are jitter=0.
+Full fair matrix: PERFORMANCE_INVESTIGATION.md §21.
