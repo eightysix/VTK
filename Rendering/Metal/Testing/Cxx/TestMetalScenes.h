@@ -1228,7 +1228,17 @@ inline void BuildDICOMVolumeScene(vtkRenderer* renderer, BackendKind b)
   {
     if (auto* metal = vtkMetalGPUVolumeRayCastMapper::SafeDownCast(mapper))
     {
-      metal->SetUseIGNJitter(TempJitter());
+      // Explicit IGN override: VTK_METAL_TEST_JITTER=1 forces IGN on Metal
+      // (the benchmark's A/B choice); VTK_METAL_TEST_IGN_JITTER=0/1 overrides
+      // it to A/B blue-noise (kBlueNoise64, the app default) vs IGN jitter.
+      if (const char* ign = std::getenv("VTK_METAL_TEST_IGN_JITTER"))
+      {
+        metal->SetUseIGNJitter(std::atoi(ign) != 0);
+      }
+      else
+      {
+        metal->SetUseIGNJitter(TempJitter());
+      }
       metal->SetJitterBlockSize(TempJitterBlock());
       metal->SetUseGPUMinMax(TempMinMax());
       metal->SetUseMinMaxAcceleration(TempMinMaxAccel());

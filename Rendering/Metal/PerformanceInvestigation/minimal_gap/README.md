@@ -504,3 +504,25 @@ M/GL 1.80x -> **1.01x (parity)**, readback byte-identical across all Metal
 runs (meanB 0.142, sumIter 151697660). The single-pass noise deficit was the
 layout flag; the app port is SLAB_BENCHMARKS.md §7, in-app A/B
 PERFORMANCE_INVESTIGATION.md §21.2.
+
+### Equal-jitter harness parity vs the app asymmetry (2026-08-18)
+
+The app's jitter cost is asymmetric: GL +27% vs Metal +57-60% at 2048/SD4 j1
+(§21.2). Both harnesses implement the same IGN ceil-lattice jitter (`--jitter`,
+the app-Metal math); 2048 composite noise, noopt, interleaved:
+
+| | GL | Metal | M/GL |
+|---|---|---|---|
+| SD4 j1 | 73.5 / 71.9 / 70.8 (~72.1) | 68.6 / 68.9 / 68.7 (~68.7) | 0.95x |
+| SD0.5 j1 | 106.5 / 106.9 (~106.7) | 107.4 / 106.2 (~106.8) | 1.00x |
+
+Equal jitter => parity in the harness (both backends pay ~+60%). The app
+asymmetry is therefore app-side, not a fundamental read-path property. The
+confound: the harness GL's jitter is the lattice style, but the app GL jitters
+by origin shift (`g_rayOrigin += g_dirStep * noise`), which costs only +27%
+there. `METAL_GAP_JITTER_SHIFT=1` (jitterT = tStart + jitterF, the origin-shift
+semantics) measures identically to the lattice style on harness Metal (67.8 vs
+67.4 ms) — per-pixel the two mechanisms produce the same sample set, so the
+style is not the differentiator; the app-GL full-composite shader's driver
+codegen absorbs scatter where the lean harness does not. Full analysis:
+PERFORMANCE_INVESTIGATION.md §22.

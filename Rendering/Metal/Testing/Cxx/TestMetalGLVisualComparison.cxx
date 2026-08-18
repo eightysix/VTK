@@ -635,8 +635,14 @@ int main(int argc, char* argv[])
     diffWriter->Write();
   };
 
-  for (const SceneSpec& spec : kScenes)
+  for (const SceneSpec& base : kScenes)
   {
+    SceneSpec spec = base;
+    if (sizeW > 0 && sizeH > 0)
+    {
+      spec.Width = sizeW;
+      spec.Height = sizeH;
+    }
     void* arPool = objc_autoreleasePoolPush();
     captureAndDiff(spec);
     objc_autoreleasePoolPop(arPool);

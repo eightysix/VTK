@@ -3319,7 +3319,12 @@ constant uchar kBlueNoise64[4096] = {
 // JPEG row (63 - py_gl) mod 64 = (py_mt - H) mod 64. (For H a multiple of 64,
 // e.g. the 512x512 reference, this collapses to py_mt mod 64.) Verified against
 // vtkJPEGReader's actual decode of the embedded BlueNoiseTexture64x64 bytes.
-inline float sampleJitterNoise(float2 st, float viewportH) {
+inline float sampleJitterNoise(float2 st, float viewportH, float blockSize) {
+  // Block-coherent sampling (2026-08-18): quantize the pixel coordinate to
+  // the jitter block cell so adjacent pixels march in lockstep (per-pixel
+  // jitter scatters warps and costs ~+57% on the raw path; block4 brings it
+  // to GL's +27% level). blockSize 1 = legacy per-pixel (bit-identical).
+  st = floor(st / blockSize) * blockSize + 0.5f * blockSize;
   int2 t = int2(floor(st.x), floor(st.y - viewportH)) & 63;
   return float(kBlueNoise64[t.y * 64 + t.x]) / 255.0f;
 }
@@ -5878,7 +5883,7 @@ inline half4 marchVolume(
   float jitter = (volumeUniforms.useJittering > 0.5
       ? (volumeUniforms.useIGNJitter > 0.5
             ? sampleIGNJitter(screenPos, volumeUniforms.jitterBlockSize)
-            : sampleJitterNoise(screenPos, volumeUniforms.viewportSize.y))
+            : sampleJitterNoise(screenPos, volumeUniforms.viewportSize.y, volumeUniforms.jitterBlockSize))
       : 1.0) * stepSize;
   float tStart = dot(entryPoint - cameraPos, rayDir);
   // OpenGL camera-inside parity (update 22): GL ignores the box/near-plane
@@ -6292,7 +6297,7 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
   float jitter = (volumeUniforms.useJittering > 0.5
       ? (volumeUniforms.useIGNJitter > 0.5
             ? sampleIGNJitter(in.position.xy, volumeUniforms.jitterBlockSize)
-            : sampleJitterNoise(in.position.xy, volumeUniforms.viewportSize.y))
+            : sampleJitterNoise(in.position.xy, volumeUniforms.viewportSize.y, volumeUniforms.jitterBlockSize))
       : 1.0) * stepSize;
   float tStart = parallel ? 0.0 : dot(s.entryPoint - cameraPos, rayDir);
   MarchParams p = {rayOrigin, rayDir, tStart, s.totalBoxT, stepSize, jitter, s.tTerminateMax,
@@ -6585,7 +6590,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
     float jitter = volumeUniforms.useJittering > 0.5
         ? (volumeUniforms.useIGNJitter > 0.5
               ? sampleIGNJitter(in.position.xy + float2(0.5, 0.5), volumeUniforms.jitterBlockSize) * stepSize
-              : sampleJitterNoise(in.position.xy, volumeUniforms.viewportSize.y) * stepSize)
+              : sampleJitterNoise(in.position.xy, volumeUniforms.viewportSize.y, volumeUniforms.jitterBlockSize) * stepSize)
         : 1.0 * stepSize;
 
     // Grid traversal loop

@@ -998,11 +998,20 @@ static void ApplyClip(char* buf, const char* discard)
 // compute).
 static void ApplyJitterDecl(char* buf, const char* coord, bool mulAdd)
 {
+  // GL-parity origin-shift jitter (METAL_GAP_JITTER_SHIFT=1): GL jitters with
+  // g_rayOrigin += g_dirStep * noise (no ceil alignment); the app's Metal uses
+  // the ceil-aligned lattice jitterT = jitterF + ceil(...). The lattice jitter
+  // costs ~+60-63% on BOTH backends vs GL's origin-shift ~+27% (app A/B
+  // 2026-08-18) - this gate measures the mechanism on Metal.
+  bool shift = false;
+  const char* shv = getenv("METAL_GAP_JITTER_SHIFT");
+  if (shv)
+    shift = shv[0] != '\0' && shv[0] != '0';
   char jit[1536];
   snprintf(jit, sizeof(jit),
     "float stepSize = u.sampleDistMM / max(physPerNorm, 1e-6f);\n"
     "  float jitterF = u.useJittering > 0.5f ? fract(52.9829189f * fract(dot(floor((%s) / float(u.jitterBlock)) * float(u.jitterBlock) + 0.5f * float(u.jitterBlock), float2(0.06711056f, 0.00583715f)))) * stepSize : 0.0f;\n"
-    "  float jitterT = jitterF + ceil((tStart - jitterF) / stepSize) * stepSize;\n", coord);
+    "  float jitterT = %s;\n", coord, shift ? "tStart + jitterF" : "jitterF + ceil((tStart - jitterF) / stepSize) * stepSize");
   const char needle[] = "float stepSize = u.sampleDistMM / max(physPerNorm, 1e-6f);\n";
   char* p = buf;
   size_t clen = strlen(jit), nlen = strlen(needle);
