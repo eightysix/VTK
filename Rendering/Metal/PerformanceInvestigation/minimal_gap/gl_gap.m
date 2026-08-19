@@ -69,6 +69,8 @@ static const char* kFragSrc =
   "in vec2 vUV;\n"
   "out vec4 fragColor;\n"
   "uniform sampler3D uVol;\n"
+  "uniform sampler2D uNoise;\n"
+  "uniform sampler2D uNoise;\n"
   "uniform vec3 uTexelCount;\n"
   "uniform float uSlabStart;\n"
   "uniform float uSlabEnd;\n"
@@ -136,6 +138,7 @@ static const char* kFragMulAddSrc =
   "in vec2 vUV;\n"
   "out vec4 fragColor;\n"
   "uniform sampler3D uVol;\n"
+  "uniform sampler2D uNoise;\n"
   "uniform vec3 uTexelCount;\n"
   "uniform float uSlabStart;\n"
   "uniform float uSlabEnd;\n"
@@ -204,6 +207,7 @@ static const char* kFragCompositeSrc =
   "in vec2 vUV;\n"
   "out vec4 fragColor;\n"
   "uniform sampler3D uVol;\n"
+  "uniform sampler2D uNoise;\n"
   "uniform sampler2D uTF;\n"
   "uniform vec3 uTexelCount;\n"
   "uniform float uSlabStart;\n"
@@ -302,6 +306,7 @@ static const char* kFragMulAddCompositeSrc =
   "in vec2 vUV;\n"
   "out vec4 fragColor;\n"
   "uniform sampler3D uVol;\n"
+  "uniform sampler2D uNoise;\n"
   "uniform sampler2D uTF;\n"
   "uniform vec3 uTexelCount;\n"
   "uniform float uSlabStart;\n"
@@ -469,6 +474,8 @@ static GLuint CompileShader(GLenum type, const char* src, const char* name)
   GLint ok = 0;
   glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
   if (!ok) {
+    FILE* dbg = fopen("/tmp/frag_dbg.glsl", "w");
+    if (dbg) { fwrite(src, 1, strlen(src), dbg); fclose(dbg); }
     char log[4096];
     glGetShaderInfoLog(s, sizeof(log), NULL, log);
     fprintf(stderr, "%s shader compile failed:\n%s\n", name, log);
@@ -509,6 +516,21 @@ static void BakeTFTable(uint8_t* row, double preint)
     row[i * 4 + 2] = (uint8_t)(0.706 * 255.0 + 0.5);
     row[i * 4 + 3] = (uint8_t)(a * 255.0 + 0.5);
   }
+}
+
+// App-GL origin-shift jitter semantics: entry moves by noise*step (no lattice
+// alignment). Enabled with GL_GAP_JITTER_SHIFT=1 (harness mirror of the app's
+// g_rayOrigin += g_dirStep * jitterValue path).
+static char* ReplaceOnce(const char* src, const char* needle, const char* rep)
+{
+  char* p = strstr((char*)src, needle);
+  if (!p) { fprintf(stderr, "ReplaceOnce: pattern not found: %s\n", needle); return NULL; }
+  size_t off = (size_t)(p - src);
+  char* out = malloc(strlen(src) - strlen(needle) + strlen(rep) + 1);
+  memcpy(out, src, off);
+  strcpy(out + off, rep);
+  strcat(out + off + strlen(rep), src + off + strlen(needle));
+  return out;
 }
 
 static int IntArg(int argc, const char** argv, const char* name, int def)
@@ -641,6 +663,111 @@ int main(int argc, const char** argv)
     strcat(flipped + off + strlen(needle), (fragSrc0 + off + strlen(needle)));
     fragSrc = flipped;
   }
+  if (getenv("GL_GAP_JITTER_SHIFT")) {
+    const char* n1 = "float jitterT = jitterF + ceil((tStart - jitterF) / stepSize) * stepSize;";
+    const char* n2 = "float jitterT = jitterF + ceil((tStartRaw - jitterF) / stepSize) * stepSize;";
+    char* s1 = ReplaceOnce(fragSrc, n1, "float jitterT = tStart + jitterF;");
+    char* s2 = s1 ? ReplaceOnce(s1, n2, "float jitterT = tStartRaw + jitterF;") : NULL;
+    if (!s2) { fprintf(stderr, "GL_GAP_JITTER_SHIFT: replacement failed\n"); return 1; }
+    if (fragSrc != fragSrc0) free((void*)fragSrc);
+    if (s1 != fragSrc) free(s1);
+    fragSrc = s2;
+  }
+  if (getenv("GL_GAP_WHILELOOP")) {
+    const char* head =
+      "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n"
+      "    if (currentT >= tExit - 1e-6) break;\n"
+      "    float s = texture(uVol, evalPoint).r;\n";
+    const char* rephead =
+      "  int i = 0;\n"
+      "  while (true) {\n"
+      "    if (i >= min(uMaxIter, maxSteps) || currentT >= tExit - 1e-6) break;\n"
+      "    float s = texture(uVol, evalPoint).r;\n";
+    char* s1 = ReplaceOnce(fragSrc, head, rephead);
+    if (!s1) { fprintf(stderr, "GL_GAP_WHILELOOP: head replace failed\n"); return 1; }
+    const char* tail =
+      "    currentT += stepSize;\n"
+      "    texLocal += texStep;\n"
+      "    evalPoint += evalStep;\n"
+      "  }\n";
+    const char* reptail =
+      "    currentT += stepSize;\n"
+      "    texLocal += texStep;\n"
+      "    evalPoint += evalStep;\n"
+      "    i++;\n"
+      "    if (currentT >= tExit - 1e-6 || acc > 1.0 - 1.0/255.0) break;\n"
+      "  }\n";
+    char* s2 = ReplaceOnce(s1, tail, reptail);
+    if (!s2) { fprintf(stderr, "GL_GAP_WHILELOOP: tail replace failed\n"); return 1; }
+    const char* brk =
+      "    if (acc > 1.0 - 1.0/255.0) break;\n";
+    char* s3 = ReplaceOnce(s2, brk, "");
+    if (!s3) { fprintf(stderr, "GL_GAP_WHILELOOP: brk remove failed\n"); return 1; }
+    if (fragSrc != fragSrc0) free((void*)fragSrc);
+    free(s1);
+    if (s2 != s1) free(s2);
+    fragSrc = s3;
+  }
+  if (getenv("GL_GAP_DUALFETCH")) {
+    const char* needle =
+      "    float s = texture(uVol, evalPoint).r;\n"
+      "    n += 1.0;\n";
+    const char* rep =
+      "    float s = texture(uVol, evalPoint).r;\n"
+      "    float s2 = texture(uVol, evalPoint + evalStep).r;\n"
+      "    n += 1.0 + s2 * 1e-9;\n";
+    char* s1 = ReplaceOnce(fragSrc, needle, rep);
+    if (!s1) { fprintf(stderr, "GL_GAP_DUALFETCH: replace failed\n"); return 1; }
+    if (fragSrc != fragSrc0) free((void*)fragSrc);
+    fragSrc = s1;
+  }
+  if (getenv("GL_GAP_TEXNOISE")) {
+    const char* n1 = "float jitterF = uUseJittering > 0 ? fract(52.9829189 * fract(dot(floor(gl_FragCoord.xy / float(max(uJitterBlock, 1))) * float(max(uJitterBlock, 1)) + 0.5 * float(max(uJitterBlock, 1)), vec2(0.06711056, 0.00583715)))) * stepSize : 0.0;";
+    int tile = getenv("GL_GAP_TEXNOISE_TILE") ? atoi(getenv("GL_GAP_TEXNOISE_TILE")) : 128;
+    char rep[256];
+    snprintf(rep, sizeof(rep), "float jitterF = uUseJittering > 0 ? texture(uNoise, gl_FragCoord.xy / vec2(%d.0)).x * stepSize : 0.0;", tile);
+    char* s1 = ReplaceOnce(fragSrc, n1, rep);
+    if (!s1) { fprintf(stderr, "GL_GAP_TEXNOISE: replace failed\n"); return 1; }
+    if (fragSrc != fragSrc0) free((void*)fragSrc);
+    fragSrc = s1;
+  }
+  if (getenv("GL_GAP_PREFETCH")) {
+    const char* needle =
+      "    if (currentT >= tExit - 1e-6) break;\n"
+      "    float s = texture(uVol, evalPoint).r;\n"
+      "    n += 1.0;\n";
+    const char* rep =
+      "    if (currentT >= tExit - 1e-6) break;\n"
+      "    n += 1.0;\n";
+    char* s1 = ReplaceOnce(fragSrc, needle, rep);
+    if (!s1) { fprintf(stderr, "GL_GAP_PREFETCH: loop-head replace failed\n"); return 1; }
+    const char* tail =
+      "    currentT += stepSize;\n"
+      "    texLocal += texStep;\n"
+      "    evalPoint += evalStep;\n"
+      "  }\n";
+    const char* rep2 =
+      "    currentT += stepSize;\n"
+      "    texLocal += texStep;\n"
+      "    evalPoint += evalStep;\n"
+      "    s = texture(uVol, evalPoint).r;\n"
+      "  }\n";
+    char* s2 = ReplaceOnce(s1, tail, rep2);
+    if (!s2) { fprintf(stderr, "GL_GAP_PREFETCH: loop-tail replace failed\n"); return 1; }
+    const char* pre =
+      "  vec3 accColor = vec3(0.0);\n"
+      "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n";
+    const char* rep3 =
+      "  vec3 accColor = vec3(0.0);\n"
+      "  float s = texture(uVol, evalPoint).r;\n"
+      "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n";
+    char* s3 = ReplaceOnce(s2, pre, rep3);
+    if (!s3) { fprintf(stderr, "GL_GAP_PREFETCH: pre-loop replace failed\n"); return 1; }
+    if (fragSrc != fragSrc0) free((void*)fragSrc);
+    free(s1);
+    if (s2 != s1) free(s2);
+    fragSrc = s3;
+  }
   GLuint vs = CompileShader(GL_VERTEX_SHADER, kVertSrc, "vertex");
   GLuint fs = CompileShader(GL_FRAGMENT_SHADER, fragSrc, "fragment");
   if (flipped) free(flipped);
@@ -668,6 +795,7 @@ int main(int argc, const char** argv)
   GLint uJitterBlock = glGetUniformLocation(prog, "uJitterBlock");
   GLint uClip = glGetUniformLocation(prog, "uClip");
   GLint uMaccum = glGetUniformLocation(prog, "uMaccum");
+  GLint uNoise = glGetUniformLocation(prog, "uNoise");
 
   // Fullscreen triangle. NOTE: 2 floats per vertex; a stray 3rd component
   // shifts the stride and breaks the triangle into a thin sliver.
@@ -735,6 +863,41 @@ int main(int argc, const char** argv)
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, tfTex);
     glUniform1i(uTF, 1);
+    glActiveTexture(GL_TEXTURE0);
+  }
+
+  // Noise texture (app in_noiseSampler analog): unit 2, only used by
+  // GL_GAP_TEXNOISE. Default: 128x128 R8 linear ramp (smooth field). With
+  // GL_GAP_TEXNOISE_TILE=64: the app's exact 64x64 blue-noise float tile
+  // (nearest, repeat) from /tmp/bluenoise64.bin; GL_GAP_TEXNOISE_NEAREST=1
+  // forces nearest filtering.
+  {
+    int tile = getenv("GL_GAP_TEXNOISE_TILE") ? atoi(getenv("GL_GAP_TEXNOISE_TILE")) : 128;
+    int nearest = getenv("GL_GAP_TEXNOISE_NEAREST") ? atoi(getenv("GL_GAP_TEXNOISE_NEAREST")) : 0;
+    GLuint noiseTex;
+    glGenTextures(1, &noiseTex);
+    glBindTexture(GL_TEXTURE_2D, noiseTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, nearest ? GL_NEAREST : GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, nearest ? GL_NEAREST : GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    if (tile == 64) {
+      FILE* f = fopen("/tmp/bluenoise64.bin", "rb");
+      if (!f) { fprintf(stderr, "missing /tmp/bluenoise64.bin\n"); return 1; }
+      float* bn = malloc(64 * 64 * sizeof(float));
+      fread(bn, sizeof(float), 64 * 64, f);
+      fclose(f);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, 64, 64, 0, GL_RED, GL_FLOAT, bn);
+      free(bn);
+    } else {
+      uint8_t* noise = malloc(128 * 128);
+      for (int i = 0; i < 128 * 128; i++) noise[i] = (uint8_t)(i * 13 % 256);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, 128, 128, 0, GL_RED, GL_UNSIGNED_BYTE, noise);
+      free(noise);
+    }
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, noiseTex);
+    glUniform1i(uNoise, 2);
     glActiveTexture(GL_TEXTURE0);
   }
 

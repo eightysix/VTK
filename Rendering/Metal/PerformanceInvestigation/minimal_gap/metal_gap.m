@@ -1007,11 +1007,41 @@ static void ApplyJitterDecl(char* buf, const char* coord, bool mulAdd)
   const char* shv = getenv("METAL_GAP_JITTER_SHIFT");
   if (shv)
     shift = shv[0] != '\0' && shv[0] != '0';
-  char jit[1536];
+  const char* blue = getenv("METAL_GAP_BLUE");
+  const char* smooth = getenv("METAL_GAP_SMOOTH");
+  char jit[4096];
+  char noiseDecl[512];
+  char noiseBuf[2048];
+  noiseDecl[0] = '\0';
+  const char* noiseExpr;
+  if (smooth)
+  {
+    snprintf(noiseDecl, sizeof(noiseDecl),
+      "  float2 _ncoord = (%s) / 64.0f;\n"
+      "  int2 _nbase = (int2)(int(floor(_ncoord.x)) %% 64, int(floor(_ncoord.y)) %% 64);\n"
+      "  float2 _nf = fract(_ncoord);\n"
+      "  float _nt00 = (float)(kBlue64[(_nbase.y %% 64) * 64 + (_nbase.x %% 64)]);\n"
+      "  float _nt10 = (float)(kBlue64[(_nbase.y %% 64) * 64 + ((_nbase.x + 1) %% 64)]);\n"
+      "  float _nt01 = (float)(kBlue64[((_nbase.y + 1) %% 64) * 64 + (_nbase.x %% 64)]);\n"
+      "  float _nt11 = (float)(kBlue64[((_nbase.y + 1) %% 64) * 64 + ((_nbase.x + 1) %% 64)]);\n",
+      coord);
+    noiseExpr =
+      "u.useJittering > 0.5f ? (_nt00 * (1.0f - _nf.x) * (1.0f - _nf.y) + _nt10 * _nf.x * (1.0f - _nf.y) + _nt01 * (1.0f - _nf.x) * _nf.y + _nt11 * _nf.x * _nf.y) / 255.0f * stepSize : 0.0f";
+  }
+  else if (blue)
+    noiseExpr = "u.useJittering > 0.5f ? (float(kBlue64[((int(in.position.y) % 64) * 64 + (int(in.position.x) % 64))]) / 255.0f) * stepSize : 0.0f";
+  else
+  {
+    snprintf(noiseBuf, sizeof(noiseBuf),
+      "u.useJittering > 0.5f ? fract(52.9829189f * fract(dot(floor((%s) / float(u.jitterBlock)) * float(u.jitterBlock) + 0.5f * float(u.jitterBlock), float2(0.06711056f, 0.00583715f)))) * stepSize : 0.0f",
+      coord);
+    noiseExpr = noiseBuf;
+  }
   snprintf(jit, sizeof(jit),
     "float stepSize = u.sampleDistMM / max(physPerNorm, 1e-6f);\n"
-    "  float jitterF = u.useJittering > 0.5f ? fract(52.9829189f * fract(dot(floor((%s) / float(u.jitterBlock)) * float(u.jitterBlock) + 0.5f * float(u.jitterBlock), float2(0.06711056f, 0.00583715f)))) * stepSize : 0.0f;\n"
-    "  float jitterT = %s;\n", coord, shift ? "tStart + jitterF" : "jitterF + ceil((tStart - jitterF) / stepSize) * stepSize");
+    "%s"
+    "  float jitterF = %s;\n"
+    "  float jitterT = %s;\n", noiseDecl, noiseExpr, shift ? "tStart + jitterF" : "jitterF + ceil((tStart - jitterF) / stepSize) * stepSize");
   const char needle[] = "float stepSize = u.sampleDistMM / max(physPerNorm, 1e-6f);\n";
   char* p = buf;
   size_t clen = strlen(jit), nlen = strlen(needle);
@@ -1366,6 +1396,10 @@ int main(int argc, const char** argv)
     NSMutableArray* psoArr = [NSMutableArray arrayWithCapacity:(NSUInteger)ns];
     const char* discardFrag = "return float4(0.0f, 0.0f, 0.0f, 1.0f);";
     const char* discardKern = "outTex.write(float4(0.0f, 0.0f, 0.0f, 1.0f), gid); return;";
+    const char* blueEnv = getenv("METAL_GAP_BLUE");
+    const char* smoothEnv = getenv("METAL_GAP_SMOOTH");
+    int blue = blueEnv && blueEnv[0] != '\0' && blueEnv[0] != '0';
+    int smooth = smoothEnv && smoothEnv[0] != '\0' && smoothEnv[0] != '0';
     for (int si = 0; si < ns; si++) {
       char* msl = diag ? BuildDiagMSL()
                        : (compute ? BuildComputeMSL(halfSampler != 0, filt, composite != 0)
@@ -1373,6 +1407,28 @@ int main(int argc, const char** argv)
                                                 : BuildMSL(halfSampler != 0, lod0 != 0, pipeline, filt, mulAdd != 0, composite != 0)));
       if (clip) ApplyClip(msl, compute ? discardKern : discardFrag);
       if (mulAdd) ApplyMulAddDecls(msl);
+      if (blue || smooth) {
+        FILE* f = fopen("kBlue64vals.txt", "rb");
+        if (!f) { fprintf(stderr, "missing kBlue64vals.txt\n"); return 1; }
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        char* tile = malloc((size_t)sz + 64);
+        size_t rd = fread(tile, 1, (size_t)sz, f);
+        fclose(f);
+        tile[rd] = 0;
+        char* b = strstr(msl, "kernel void");
+        if (!b) b = strstr(msl, "fragment float4");
+        size_t off = (size_t)(b - msl);
+        char* nmsl = malloc(strlen(msl) + rd + 64);
+        memcpy(nmsl, msl, off);
+        char* p = nmsl + off;
+        p += sprintf(p, "constant uchar kBlue64[4096] = {\n%s};\n", tile);
+        strcpy(p, msl + off);
+        free(tile);
+        free(msl);
+        msl = nmsl;
+      }
       if (jitter && !slabT) ApplyJitterDecl(msl, compute ? "float2(gid) + 0.5f" : "float2(in.position.xy) + 0.5f", mulAdd != 0);
       if (numSlabs > 0) { if (slabT) { if (uniformSlab) ApplySlabT(msl, 0, 1, 1, mulAdd != 0, kEndT != 0, 1, jitter != 0); else ApplySlabT(msl, (maccum || feedback) ? si : slabIndex, (maccum || feedback) ? si + 1 : slabIndex + 1, numSlabs, mulAdd != 0, kEndT != 0, 0, jitter != 0); } else ApplySlab(msl, slabIndex, slabIndex + 1, numSlabs); }
       if (jitter && !slabT) ApplyJitterStart(msl);

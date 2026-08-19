@@ -65,8 +65,18 @@ int main(int argc, const char** argv)
 {
   int frames = 60;
   int iterMode = 0;
+  int rt = kRT;
+  float sd = 0.5f;
+  int dataMode = 0;
+  int noiseMode = 0;
   if (argc > 1) frames = atoi(argv[1]);
   if (argc > 2) iterMode = atoi(argv[2]);
+  for (int i = 2; i < argc; i++) {
+    if (strcmp(argv[i - 1], "--rt") == 0) rt = atoi(argv[i]);
+    if (strcmp(argv[i - 1], "--sd") == 0) sd = (float)atof(argv[i]);
+    if (strcmp(argv[i - 1], "--data") == 0) dataMode = atoi(argv[i]);
+    if (strcmp(argv[i - 1], "--noise") == 0) noiseMode = atoi(argv[i]);
+  }
 
   // Load the app's exact composed shaders.
   size_t vlen = 0, flen = 0;
@@ -181,24 +191,47 @@ int main(int argc, const char** argv)
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, white);
 
-  // Unit 1: in_noiseSampler 128x128 R8.
-  unsigned char* noise = malloc(128 * 128);
-  for (int i = 0; i < 128 * 128; i++) noise[i] = (unsigned char)(i * 13 % 256);
+  // Unit 1: in_noiseSampler. 0 = 128x128 R8 ramp (LINEAR), 1 = app's exact
+  // 64x64 R32F blue-noise tile (NEAREST), 2 = same tile (LINEAR).
   GLuint noiseTex;
   glGenTextures(1, &noiseTex);
   glBindTexture(GL_TEXTURE_2D, noiseTex);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, 128, 128, 0, GL_RED, GL_UNSIGNED_BYTE, noise);
-  free(noise);
+  if (noiseMode) {
+    FILE* nf = fopen("/tmp/bluenoise64.bin", "rb");
+    if (!nf) { fprintf(stderr, "missing /tmp/bluenoise64.bin\n"); return 1; }
+    float* nf32 = malloc(64 * 64 * sizeof(float));
+    size_t nrd = fread(nf32, sizeof(float), 64 * 64, nf);
+    fclose(nf);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, noiseMode == 1 ? GL_NEAREST : GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, noiseMode == 1 ? GL_NEAREST : GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, 64, 64, 0, GL_RED, GL_FLOAT, nf32);
+    free(nf32);
+  } else {
+    unsigned char* noise = malloc(128 * 128);
+    for (int i = 0; i < 128 * 128; i++) noise[i] = (unsigned char)(i * 13 % 256);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, 128, 128, 0, GL_RED, GL_UNSIGNED_BYTE, noise);
+    free(noise);
+  }
 
   // Unit 2: volume R8 512x512x1794 (matches the app's 8-bit texture).
   size_t vtotal = (size_t)KW * KH * KD;
   unsigned char* vol = malloc(vtotal);
-  for (size_t i = 0; i < vtotal; i++) {
-    vol[i] = (unsigned char)((i >> 10) & 0xff);
+  if (dataMode) {
+    uint32_t x = 0x12345678u;
+    for (size_t i = 0; i < vtotal; i++) {
+      x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+      vol[i] = (uint8_t)(x >> 24);
+    }
+  } else {
+    for (size_t i = 0; i < vtotal; i++) {
+      vol[i] = (unsigned char)((i >> 10) & 0xff);
+    }
   }
   GLuint volTex;
   glGenTextures(1, &volTex);
@@ -292,9 +325,9 @@ int main(int argc, const char** argv)
   glUniform4f(glGetUniformLocation(prog, "in_volume_scale[0]"), 1.00392f, 1.0f, 1.0f, 1.0f);
   glUniform4f(glGetUniformLocation(prog, "in_volume_bias[0]"), 0.0f, 0.0f, 0.0f, 0.0f);
   glUniform2f(glGetUniformLocation(prog, "in_windowLowerLeftCorner"), 0.0f, 0.0f);
-  glUniform2f(glGetUniformLocation(prog, "in_inverseWindowSize"), 0.0025f, 0.0025f);
-  glUniform2f(glGetUniformLocation(prog, "in_inverseOriginalWindowSize"), 0.0025f, 0.0025f);
-  glUniform1f(glGetUniformLocation(prog, "in_sampleDistance"), 0.5f);
+  glUniform2f(glGetUniformLocation(prog, "in_inverseWindowSize"), 1.0f / rt, 1.0f / rt);
+  glUniform2f(glGetUniformLocation(prog, "in_inverseOriginalWindowSize"), 1.0f / rt, 1.0f / rt);
+  glUniform1f(glGetUniformLocation(prog, "in_sampleDistance"), sd);
   glUniform1f(glGetUniformLocation(prog, "in_scale"), 1.0f);
   glUniform1f(glGetUniformLocation(prog, "in_bias"), 0.0f);
   float clip[49] = { 0 };
@@ -302,14 +335,14 @@ int main(int argc, const char** argv)
   glUniform1fv(glGetUniformLocation(prog, "in_clippingPlanes[0]"), 49, clip);
 
   // Offscreen render target.
-  glViewport(0, 0, kRT, kRT);
+  glViewport(0, 0, rt, rt);
   glClearColor(0, 0, 0, 1);
   GLuint fbo, rbo;
   glGenFramebuffers(1, &fbo);
   glBindFramebuffer(GL_FRAMEBUFFER, fbo);
   glGenRenderbuffers(1, &rbo);
   glBindRenderbuffer(GL_RENDERBUFFER, rbo);
-  glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, kRT, kRT);
+  glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, rt, rt);
   glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rbo);
   if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
     fprintf(stderr, "FBO incomplete\n");
@@ -337,31 +370,31 @@ int main(int argc, const char** argv)
 
   // Sanity readback: nonzero fraction + average sample value (or iteration
   // count when iterMode).
-  unsigned char* pix = malloc((size_t)kRT * kRT * 4);
-  glReadPixels(0, 0, kRT, kRT, GL_RGBA, GL_UNSIGNED_BYTE, pix);
+  unsigned char* pix = malloc((size_t)rt * rt * 4);
+  glReadPixels(0, 0, rt, rt, GL_RGBA, GL_UNSIGNED_BYTE, pix);
   int nz = 0;
   double sum = 0;
   double lo = 0, hi = 0;
-  for (size_t i = 0; i < (size_t)kRT * kRT * 4; i += 4) {
+  for (size_t i = 0; i < (size_t)rt * rt * 4; i += 4) {
     if (pix[i] + pix[i + 1] + pix[i + 2] > 0) nz++;
     sum += pix[i + 2];
     lo += pix[i];
     hi += pix[i + 1];
   }
   if (iterMode) {
-    double npix = (double)kRT * kRT;
+    double npix = (double)rt * rt;
     double avgIter = (lo / npix) * 4096.0 / 255.0;
     double avgTerm = (hi / npix) * 2048.0 / 255.0;
-    fprintf(stderr, "readback: nonzero=%d/%d avgIter=%.1f avgTerm=%.1f\n", nz, kRT * kRT, avgIter, avgTerm);
+    fprintf(stderr, "readback: nonzero=%d/%d avgIter=%.1f avgTerm=%.1f\n", nz, rt * rt, avgIter, avgTerm);
     FILE* fp = fopen("gl_app_shader_iter.ppm", "wb");
     if (fp) {
-      fprintf(fp, "P6\n%d %d\n255\n", kRT, kRT);
-      for (int i = 0; i < kRT * kRT; i++)
+      fprintf(fp, "P6\n%d %d\n255\n", rt, rt);
+      for (int i = 0; i < rt * rt; i++)
         fwrite(pix + i * 4, 1, 3, fp);
       fclose(fp);
     }
   } else {
-    fprintf(stderr, "readback: nonzero=%d/%d meanB=%.3f\n", nz, kRT * kRT, sum / ((double)kRT * kRT * 255.0));
+    fprintf(stderr, "readback: nonzero=%d/%d meanB=%.3f\n", nz, rt * rt, sum / ((double)rt * rt * 255.0));
   }
   free(pix);
 

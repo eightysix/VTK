@@ -1503,45 +1503,63 @@ structure, and block4's 4px-grain is clearly worse than GL's per-pixel grain
 (user evaluation, 2048/SD4 PNG set in `visual_compare/jitterblocks/`). Quality
 is the binding constraint; block coherence is not a solution.
 
-### 22.5 Why harness parity does not transfer to the app (confound, now closed)
+### 22.5 The harness CAN reproduce the app GL's cheap jitter (2026-08-19)
 
-The harness GL's `--jitter` is the ceil-lattice IGN math (mirroring app-Metal),
-and the harness GL pays the same +60% as harness Metal — the "parity" was both
-sides at the expensive mechanism. The app GL's jitter is origin-shift
-(`g_rayOrigin += g_dirStep * noise`, vtkVolumeShaderComposer.h) and costs only
-+27%. Two discriminator experiments closed the confound:
+`minimal_gap/gl_app_shader.m` runs the app's exact dumped GL composite shader
+(fragment dump from the VolumeRayCast GL scene, `inverseOriginalWindowSize`,
+`glReadPixels` and the PPM header fixed to the actual rt). At 2048/SD4
+composite-noise data, interleaved rounds:
 
-1. Harness Metal with origin-shift semantics (`METAL_GAP_JITTER_SHIFT`,
-   jitterT = tStart + jitterF): identical to the lattice style (+58% both).
-2. App GL with lattice semantics (env gate `VTK_METAL_TEST_GL_LATTICE_JITTER`,
-   entry shifted post-intersection by jitter + ceil(tStartSteps - jitter) -
-   tStartSteps steps): **identical to origin-shift in-app** (54.4 / 54.2 /
-   52.2 ~54.2 vs 53.6 / 53.2 / 53.1 ~53.3, 3 interleaved rounds — +28% vs
-   +27%, within noise).
+| shader | j0 | j1 | jitter cost |
+|---|---|---|---|
+| app GL shader (exact), ramp-128 LINEAR noise | ~40.6 | ~47.0 | +16% |
+| app GL shader, **app's real 64x64 blue tile, NEAREST** | ~41.3 | ~44.0 | **+6.5%** |
+| app GL shader, same tile LINEAR | ~43.2 | ~44.4 | +3% |
+| lean harness GL (gl_gap), same tile NEAREST | ~43.4 | ~69.7 | +61% |
+| lean harness GL, IGN hash | ~45.2 | ~69.8 | +54% |
 
-Final matrix (jitter cost over j0 at 2048/SD4, per-pixel, noise source
-irrelevant on both backends):
+The 2026-08-18 "unreachable from the shader side" conclusion was wrong: the
+app GL shader's cheap jitter is a *shader structure* property, reproducible
+in the harness (the earlier harness runs used the lean gl_gap shader, which
+never carried the app's body).
 
-| jitter style | app GL | app Metal | harness GL | harness Metal |
-|---|---|---|---|---|
-| origin-shift | +27% | — | — | +58% |
-| lattice | +28% | +57-60% | +63% | +58% |
+### 22.6 The mechanism: SIMT divergence from uncorrelated per-pixel jitter
 
-The style is irrelevant on BOTH backends; the asymmetry is purely the driver
-read-path: the full app-GL composite shader's compiled code absorbs per-pixel
-phase scatter at +27-30%, while Metal's read path pays +57-60% on the same
-semantics. The harness "equal-jitter parity" (§22.2) was the lean harness GL
-paying the same +60% as Metal — the harness never reproduced the app GL's
-cheap jitter either, so it was never a reachable Metal target.
+The jitter cost is NOT march length and NOT extra instructions — every
+variant marches the same total samples: j0 sumIter 151697660 vs j1
+(sharp, smooth, blue, IGN all) 150781xxx (~0.6% less — the ±1 lattice step
+variation). The +55-64% appears only when the per-pixel jitter values are
+*uncorrelated* between adjacent lanes. Evidence (2048/SD4 composite noise):
 
-### 22.6 Status
+| jitter field | harness GL | harness Metal |
+|---|---|---|
+| IGN hash (sharp, uncorrelated) | +54% | +63% |
+| blue tile NEAREST (sharp, uncorrelated) | +61% | +64-66% |
+| bilinear blue tile (smooth, correlated) | +61% | **+2-4%** |
+| linear-ramp 128 texture (smooth) | +22% | — |
 
-Raw single-pass 2048/SD4 j1 stays 1.31-1.37x (documented residual of the fair
-matrix, §21). The experiment matrix is closed: noise source, lattice style,
-and block coherence (rejected visually, §22.4) exhaust the shader-side space;
-the cost differential is a driver-codegen property of the app GL composite
-shader that Metal cannot replicate from our side. Metal jitter defaults are
-unaffected: blue-noise tile per-pixel (default), IGN only via env
-(`VTK_METAL_TEST_JITTER=1` + `VTK_METAL_TEST_IGN_JITTER` override); the visual
-parity of the default jitter is near-exact (blue-noise Metal vs GL: mean abs
+Metal distinguishes the fields: a correlated (smooth) field keeps SIMT lanes
+in lockstep and jitter becomes ~free (+2-4%). GL's lean body is saturated —
+it pays ~+60% even for the smooth field (the +22% ramp shows GL *can* react
+to very low-frequency fields). App-shader bisects (gradient removal, box-exit
+removal, alpha-break removal, noise source, origin-shift vs lattice) never
+broke the app GL shader's robustness (+6.5-13% throughout): its heavier body
+hides the lane divergence — no single feature is the absorber. The app GL's
+DICOM cost (+27% vs the noise cell's +6.5%) is the real-scene divergence
+(alpha-breaks scatter lane exits more than uniform noise).
+
+### 22.7 Status
+
+Raw single-pass 2048/SD4 j1 stays 1.31-1.37x. The mechanism is now understood
+as per-pixel jitter lane divergence, and the only verified lever that makes
+Metal's jitter ~free is a correlated (smooth) jitter field (+2-4% harness,
+Metal-side change). The quality question is open: bilinear 64x64 blue noise
+has no hard blocks (unlike the rejected block coherence, §22.4) but softens
+the grain; the GL app keeps the sharp tile, so a Metal-only switch changes
+cross-backend visual parity. Per the user's direction (2026-08-19) the
+mechanism hunt continues (minimal repro in progress); no Metal code changed.
+Metal jitter defaults are unaffected: blue-noise tile per-pixel (default),
+IGN only via env (`VTK_METAL_TEST_JITTER=1` + `VTK_METAL_TEST_IGN_JITTER`
+override); the visual parity of the default jitter is near-exact (blue-noise
+Metal vs GL: mean abs
 diff 0.064 @2048, the kBlueNoise64 parity work).
