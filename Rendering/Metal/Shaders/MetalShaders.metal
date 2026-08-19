@@ -3320,11 +3320,33 @@ constant uchar kBlueNoise64[4096] = {
 // e.g. the 512x512 reference, this collapses to py_mt mod 64.) Verified against
 // vtkJPEGReader's actual decode of the embedded BlueNoiseTexture64x64 bytes.
 inline float sampleJitterNoise(float2 st, float viewportH, float blockSize) {
+  // GL-parity block sampling (2026-08-19): GL samples the 64x64 tile at
+  // gl_FragCoord.xy/64 with NEAREST, i.e. the jitter is constant over
+  // texel-sized blocks (viewportH/64 px). The per-pixel form scatters SIMT
+  // lanes (~+60% harness at 2048/SD4) while the GL-parity block form is
+  // ~free (+4-5%) and reproduces GL's field exactly. Selected by the CPU
+  // with nSize = 0 (VTK_METAL_TEST_JITTER_PARITY).
+  if (blockSize < 0.5f)
+  {
+    // GL-parity block sampling (2026-08-19): GL samples the 64x64 tile at
+    // gl_FragCoord.xy/64 with NEAREST, i.e. the jitter is constant over
+    // texel-sized blocks (viewportH/64 px). The per-pixel form scatters SIMT
+    // lanes (~+60% harness at 2048/SD4) while the GL-parity block form is
+    // ~free (+4-5%) and reproduces GL's field exactly. Selected by the CPU
+    // with nSize = 0 (VTK_METAL_TEST_JITTER_PARITY).
+    float texel = viewportH / 64.0f;
+    int2 t = int2(floor(st.x / texel), floor((st.y - viewportH) / texel)) & 63;
+    return float(kBlueNoise64[t.y * 64 + t.x]) / 255.0f;
+  }
   // Block-coherent sampling (2026-08-18): quantize the pixel coordinate to
   // the jitter block cell so adjacent pixels march in lockstep (per-pixel
   // jitter scatters warps and costs ~+57% on the raw path; block4 brings it
   // to GL's +27% level). blockSize 1 = legacy per-pixel (bit-identical).
-  st = floor(st / blockSize) * blockSize + 0.5f * blockSize;
+  // NOTE: never divide by the raw blockSize — nSize 0 (GL-parity above)
+  // would make this div-by-zero NaN and trap the shader under fast-math
+  // speculation (the black-render bug, 2026-08-19).
+  float bs = max(blockSize, 1.0f);
+  st = floor(st / bs) * bs + 0.5f * bs;
   int2 t = int2(floor(st.x), floor(st.y - viewportH)) & 63;
   return float(kBlueNoise64[t.y * 64 + t.x]) / 255.0f;
 }
@@ -3334,6 +3356,9 @@ inline float sampleJitterNoise(float2 st, float viewportH, float blockSize) {
 // no sin-hash streaks, no texture required. Selected per-render via
 // volumeUniforms.useIGNJitter; the default stays on the GL-parity blue noise.
 inline float sampleIGNJitter(float2 st, float blockSize) {
+  // Never divide by the raw blockSize: nSize 0 (GL-parity) would make this
+  // div-by-zero NaN (fast-math) and kill the march (2026-08-19).
+  blockSize = max(blockSize, 1.0f);
   float2 blockCenter = floor(st / blockSize) * blockSize + 0.5f * blockSize;
   return fract(52.9829189 * fract(dot(blockCenter, float2(0.06711056, 0.00583715))));
 }

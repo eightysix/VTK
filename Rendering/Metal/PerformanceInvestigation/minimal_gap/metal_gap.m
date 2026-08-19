@@ -1029,7 +1029,26 @@ static void ApplyJitterDecl(char* buf, const char* coord, bool mulAdd)
       "u.useJittering > 0.5f ? (_nt00 * (1.0f - _nf.x) * (1.0f - _nf.y) + _nt10 * _nf.x * (1.0f - _nf.y) + _nt01 * (1.0f - _nf.x) * _nf.y + _nt11 * _nf.x * _nf.y) / 255.0f * stepSize : 0.0f";
   }
   else if (blue)
-    noiseExpr = "u.useJittering > 0.5f ? (float(kBlue64[((int(in.position.y) % 64) * 64 + (int(in.position.x) % 64))]) / 255.0f) * stepSize : 0.0f";
+  {
+    int blk = 1;
+    const char* blkEnv = getenv("METAL_GAP_BLUE_BLOCK");
+    if (blkEnv) blk = atoi(blkEnv);
+    if (getenv("METAL_GAP_BLUE_PARITY"))
+    {
+      // EXACT app parity index (MetalShaders.metal sampleJitterNoise,
+      // blockSize<0.5): texel = rt/64, index = floor((st.y-rt)/texel) & 63
+      snprintf(noiseBuf, sizeof(noiseBuf),
+        "u.useJittering > 0.5f ? (float(kBlue64[((int(floor((in.position.y - %d.0f) / %d.0f)) & 63) * 64 + (int(floor(in.position.x / %d.0f)) & 63))]) / 255.0f) * stepSize : 0.0f",
+        kRT, kRT / 64, kRT / 64);
+    }
+    else if (blk > 1)
+      snprintf(noiseBuf, sizeof(noiseBuf),
+        "u.useJittering > 0.5f ? (float(kBlue64[((int(floor(in.position.y / %d.0f)) %% 64) * 64 + (int(floor(in.position.x / %d.0f)) %% 64))]) / 255.0f) * stepSize : 0.0f", blk, blk);
+    else
+      snprintf(noiseBuf, sizeof(noiseBuf),
+        "u.useJittering > 0.5f ? (float(kBlue64[((int(in.position.y) %% 64) * 64 + (int(in.position.x) %% 64))]) / 255.0f) * stepSize : 0.0f");
+    noiseExpr = noiseBuf;
+  }
   else
   {
     snprintf(noiseBuf, sizeof(noiseBuf),

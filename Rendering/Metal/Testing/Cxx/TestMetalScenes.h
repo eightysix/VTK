@@ -1017,6 +1017,14 @@ inline void BuildVolumeScene(vtkRenderer* renderer, BackendKind b)
       metal->SetUseGPUMinMax(TempMinMax());
     }
   }
+  if (TempJitter())
+  {
+    mapper->UseJitteringOn();
+  }
+  else
+  {
+    mapper->UseJitteringOff();
+  }
 
   vtkNew<vtkVolume> volume;
   volume->SetMapper(mapper);

@@ -7327,6 +7327,16 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;
   uniforms.UseIGNJitter = this->GetUseIGNJitter() ? 1.0f : 0.0f;
   uniforms.JitterBlockSize = static_cast<float>(this->GetJitterBlockSize());
+  // GL-parity jitter (VTK_METAL_TEST_JITTER_PARITY=1): sample the blue-noise
+  // tile at gl_FragCoord.xy/64 like GL (block = viewport/64 px) instead of
+  // per-pixel. Reproduces GL's jitter field exactly and keeps SIMT lanes in
+  // lockstep (~+4-5% harness at 2048/SD4 vs +60% per-pixel). nSize 0 selects
+  // the shader's parity branch (MetalShaders.metal sampleJitterNoise).
+  if (const char* parity = std::getenv("VTK_METAL_TEST_JITTER_PARITY"); parity && std::atoi(parity) != 0)
+  {
+    const char* bsEnv = std::getenv("VTK_METAL_TEST_JITTER_BLOCK_SIZE");
+    uniforms.JitterBlockSize = bsEnv ? static_cast<float>(std::atof(bsEnv)) : 0.0f;
+  }
 
   // Non-divergent march: uniform per-frame iteration bound.
   // - variant 4: VTK_METAL_TEST_MARCH_STEPS wins; otherwise a frame-max bound

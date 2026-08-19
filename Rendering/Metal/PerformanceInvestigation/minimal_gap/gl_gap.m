@@ -121,7 +121,8 @@ static const char* kFragSrc =
   "  evalPoint.z = clamp(evalPoint.z, uSlabStart * ctpScale.z + ctpOffset.z, uSlabEnd * ctpScale.z + ctpOffset.z);\n"
   "  float acc = 0.0;\n"
   "  float n = 0.0;\n"
-  "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n"
+  "  uUnbounded > 0 ? (void)0 : (void)0;\n"
+  "  if (uUnbounded > 0) { while (true) {\n"
   "    if (currentT >= tExit - 1e-6) break;\n"
   "    acc = max(acc, texture(uVol, evalPoint).r);\n"
   "    currentT += stepSize;\n"
@@ -222,6 +223,9 @@ static const char* kFragCompositeSrc =
   "uniform int uJitterBlock;\n"
   "uniform int uClip;\n"
   "uniform int uMaccum;\n"
+  "uniform int uGate;\n"
+  "uniform int uColorTF;\n"
+  "uniform int uUnbounded;\n"
   "void main() {\n"
   "  vec2 ndc = vUV * 2.0 - 1.0;\n"
   "  vec4 w4 = uInvVP * vec4(ndc, 0.0, 1.0);\n"
@@ -278,19 +282,23 @@ static const char* kFragCompositeSrc =
   "  float acc = 0.0;\n"
   "  float n = 0.0;\n"
   "  vec3 accColor = vec3(0.0);\n"
-  "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n"
+  "  uUnbounded > 0 ? (void)0 : (void)0;\n"
+  "  if (uUnbounded > 0) { while (true) {\n"
   "    if (currentT >= tExit - 1e-6) break;\n"
   "    float s = texture(uVol, evalPoint).r;\n"
   "    n += 1.0;\n"
   "    vec4 c = texture(uTF, vec2(clamp(s, 0.0, 1.0), 0.5)).rgba;\n"
-  "    float w = 1.0 - acc;\n"
-  "    accColor += w * c.rgb * c.a;\n"
-  "    acc = acc + w * c.a;\n"
+  "    vec4 c2 = uColorTF > 0 ? texture(uTF, vec2(clamp(s, 0.0, 1.0), 0.0)).rgba : c;\n"
+  "    if (uGate <= 0 || c.a > 0.0) {\n"
+  "      float w = 1.0 - acc;\n"
+  "      accColor += w * c2.rgb * c.a;\n"
+  "      acc = acc + w * c.a;\n"
+  "    }\n"
   "    if (acc > 1.0 - 1.0/255.0) break;\n"
   "    currentT += stepSize;\n"
   "    texLocal += texStep;\n"
   "    evalPoint += evalStep;\n"
-  "  }\n"
+  "  } break; }\n"
   "  int nc = int(n);\n"
   "  if (uMaccum > 0) fragColor = vec4(accColor, acc);\n"
   "  else fragColor = vec4(float(nc & 255) / 255.0, float((nc >> 8) & 255) / 255.0, acc, 1.0);\n"
@@ -321,6 +329,9 @@ static const char* kFragMulAddCompositeSrc =
   "uniform int uJitterBlock;\n"
   "uniform int uClip;\n"
   "uniform int uMaccum;\n"
+  "uniform int uGate;\n"
+  "uniform int uColorTF;\n"
+  "uniform int uUnbounded;\n"
   "void main() {\n"
   "  vec2 ndc = vUV * 2.0 - 1.0;\n"
   "  vec4 w4 = uInvVP * vec4(ndc, 0.0, 1.0);\n"
@@ -447,7 +458,8 @@ static const char* kFragNoFetchSrc =
   "  evalPoint.z = clamp(evalPoint.z, uSlabStart * ctpScale.z + ctpOffset.z, uSlabEnd * ctpScale.z + ctpOffset.z);\n"
   "  float acc = 0.0;\n"
   "  float n = 0.0;\n"
-  "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n"
+  "  uUnbounded > 0 ? (void)0 : (void)0;\n"
+  "  if (uUnbounded > 0) { while (true) {\n"
   "    if (currentT >= tExit - 1e-6) break;\n"
   "    acc = max(acc, evalPoint.x * 0.001 + 0.5);\n"
   "    currentT += stepSize;\n"
@@ -796,6 +808,15 @@ int main(int argc, const char** argv)
   GLint uClip = glGetUniformLocation(prog, "uClip");
   GLint uMaccum = glGetUniformLocation(prog, "uMaccum");
   GLint uNoise = glGetUniformLocation(prog, "uNoise");
+  int gate = getenv("GL_GAP_GATE") ? atoi(getenv("GL_GAP_GATE")) : 0;
+  int colortf = getenv("GL_GAP_COLORTF") ? atoi(getenv("GL_GAP_COLORTF")) : 0;
+  GLint uGate = glGetUniformLocation(prog, "uGate");
+  glUniform1i(uGate, gate);
+  GLint uColorTF = glGetUniformLocation(prog, "uColorTF");
+  glUniform1i(uColorTF, colortf);
+  int unbounded = getenv("GL_GAP_UNBOUNDED") ? atoi(getenv("GL_GAP_UNBOUNDED")) : 0;
+  GLint uUnbounded = glGetUniformLocation(prog, "uUnbounded");
+  glUniform1i(uUnbounded, unbounded);
 
   // Fullscreen triangle. NOTE: 2 floats per vertex; a stray 3rd component
   // shifts the stride and breaks the triangle into a thin sliver.

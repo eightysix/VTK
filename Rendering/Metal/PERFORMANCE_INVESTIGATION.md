@@ -1548,18 +1548,51 @@ hides the lane divergence — no single feature is the absorber. The app GL's
 DICOM cost (+27% vs the noise cell's +6.5%) is the real-scene divergence
 (alpha-breaks scatter lane exits more than uniform noise).
 
-### 22.7 Status
+### 22.7 GL-parity jitter is implemented, correct, and NOT the DICOM lever (2026-08-19)
 
-Raw single-pass 2048/SD4 j1 stays 1.31-1.37x. The mechanism is now understood
-as per-pixel jitter lane divergence, and the only verified lever that makes
-Metal's jitter ~free is a correlated (smooth) jitter field (+2-4% harness,
-Metal-side change). The quality question is open: bilinear 64x64 blue noise
-has no hard blocks (unlike the rejected block coherence, §22.4) but softens
-the grain; the GL app keeps the sharp tile, so a Metal-only switch changes
-cross-backend visual parity. Per the user's direction (2026-08-19) the
-mechanism hunt continues (minimal repro in progress); no Metal code changed.
-Metal jitter defaults are unaffected: blue-noise tile per-pixel (default),
-IGN only via env (`VTK_METAL_TEST_JITTER=1` + `VTK_METAL_TEST_IGN_JITTER`
-override); the visual parity of the default jitter is near-exact (blue-noise
-Metal vs GL: mean abs
-diff 0.064 @2048, the kBlueNoise64 parity work).
+The 2026-08-18 harness finding that GL's jitter is *block-coherent* (GL samples
+the 64x64 tile at `gl_FragCoord.xy/64` with NEAREST → texel-sized blocks,
+32 px @2048, 8 px @512 — not per-pixel) led to a GL-exact parity mode:
+`sampleJitterNoise` gains a `blockSize < 0.5` branch (texel = viewportH/64,
+index = `floor(st/texel) & 63`), selected by the CPU via
+`VTK_METAL_TEST_JITTER_PARITY=1` → `uniforms.JitterBlockSize = 0` (the mapper
+env hook also accepts `VTK_METAL_TEST_JITTER_BLOCK_SIZE` for any block size).
+The parity field is GL-exact by construction (same tile, same blocks, same
+flips).
+
+Harness (gradient data, 2048/SD4): block32 ≈ per-pixel (+51% vs +52% — the
+2026-08-18 +4-5% was noise-data only). App (DICOM, 2048/SD4, raw single-pass,
+interleaved rounds): j0 45.9 ms, j1 per-pixel 74.1, parity 74.6 — the parity
+field costs the same +62% as per-pixel. The jitter gap on real data is NOT
+lane divergence from the noise values: block-constant fields keep warps in
+lockstep yet still cost +60%. The remaining common factor is the lattice shift
+itself (first-sample phase → alpha-gate termination spread → warp-length
+divergence); even the predicated fixed-iteration march (`MARCH_STEPS` 32/64)
+keeps the +60%. On the cache-hostile noise cell parity stays ~free (+4-5%),
+so the lever is data-dependent — a dead end for the DICOM gap (M/GL 1.36-1.42x
+at 2048/SD4 j1, vs 1.03-1.08x at j0).
+
+Two real bugs fixed while wiring this (both live in the committed shader):
+
+1. `sampleIGNJitter` divided by the raw blockSize → with nSize 0 the
+   fast-math-speculated arm produced NaN and **blacked the whole render**
+   (1.2 ms background-only frames, silent). Now clamps `blockSize` to ≥ 1.
+2. `sampleJitterNoise`'s block path had the same div-by-zero shape; both now
+   use `max(blockSize, 1.0f)`.
+
+`TestMetalScenes.h` `BuildVolumeScene` now honors `TempJitter()` like the DICOM
+builder (jitter on by default for the noise scenes; was always off — the
+in-app A/B used DICOM only). `metal_gap` gained `METAL_GAP_BLUE_PARITY` (the
+exact app parity index, for harness A/B).
+
+### 22.8 Status
+
+Raw single-pass 2048/SD4 j1 stays 1.36-1.42x (j0 1.03-1.08x). Mechanism
+refined: the DICOM jitter cost is the lattice-shift termination spread (data-
+dependent; the noise-cell cost is pure lane divergence and is fully cured by
+the GL-parity field). Per the user's direction (2026-08-19) the hunt
+continues; the parity lever, the predicated march (`MARCH_STEPS`), and the
+smooth-field lever all fail on DICOM. The only verified way to soften the
+DICOM jitter cost remains the slab path (+34% on slabs8 vs +62% single) and
+the minmax path. Metal jitter defaults are unaffected: blue-noise tile
+per-pixel (default), GL-parity only via `VTK_METAL_TEST_JITTER_PARITY=1`.
