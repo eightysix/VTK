@@ -1596,3 +1596,40 @@ smooth-field lever all fail on DICOM. The only verified way to soften the
 DICOM jitter cost remains the slab path (+34% on slabs8 vs +62% single) and
 the minmax path. Metal jitter defaults are unaffected: blue-noise tile
 per-pixel (default), GL-parity only via `VTK_METAL_TEST_JITTER_PARITY=1`.
+
+### 22.9 The GL-vs-Metal gap is now reproducible in the minimal harness (2026-08-19)
+
+The user's question: how to reproduce the app's GL-vs-Metal jitter gap in the
+minimal repro. Two findings:
+
+1. **The gradient harness cell reproduces the *absolute* jitter cost but not
+   the backend gap** — with the sharp per-pixel hash, GL jitter costs
+   +40-55% (65-67 vs 42-44), nearly as much as Metal (+58-66%): the
+   hand-rolled harness GL shader was *not* app-like.
+2. **The app GL's jitter is cheap because it uses the bilinear-filtered noise
+   texture (smooth correlated field)** — the same reason Metal's
+   "correlated smooth" mode is ~free. With `GL_GAP_TEXNOISE=1` (now the
+   default; `GL_GAP_SHARPHASH=1` restores the sharp hash), the harness GL
+   jitter drops to +9-22% and the pair reproduces the app gap:
+
+   | round | GL j0 | GL j1 (smooth) | Metal j0 | Metal j1 | M/GL j1 |
+   |-------|-------|----------------|----------|----------|---------|
+   | 1     | 40.7  | 48.7  (+19%)   | 41.3     | 65.1 (+58%) | 1.34x |
+   | 2     | 40.1  | 47.4  (+18%)   | 41.6     | 66.8 (+61%) | 1.41x |
+   | 3     | 45.8  | 50.0  (+9%)    | 41.5     | 68.9 (+66%) | 1.38x |
+
+   App reference: GL +28%, Metal +62%, M/GL 1.36-1.42x. Recipe:
+   `./gl_gap --camera 0 --rt 2048 --sd 4 --composite 1 --jitter 1` vs
+   `./metal_gap` same flags (interleave; battery drift).
+
+   Reproduces the DICOM finding: the Metal *lattice-shift* cost (gradient
+   data) is backend-specific; GL's filtered noise field doesn't pay it.
+
+While repairing `gl_gap.m` for the default flip, the committed source was
+found broken (the 07:23 binary predated the corruption; the committed
+`uUnbounded` experiment replaced the bounded march with a gated `while(true)`
+that (a) never runs when `uUnbounded=0`, (b) is unbalanced in two variants,
+(c) uses a GLSL-invalid `?: (void)0` ternary; plus a duplicated
+`uniform sampler2D uNoise;` in `kFragSrc`). All three march variants restored
+to the canonical `for (i < min(uMaxIter, maxSteps))` loop; `GL_GAP_UNBOUNDED`
+is now a no-op.

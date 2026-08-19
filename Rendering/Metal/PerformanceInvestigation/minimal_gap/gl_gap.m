@@ -31,7 +31,12 @@
 //                   ramp + constant color (0, 0.605, 0.706), break at
 //                   acc > 1 - 1/255; --maccum switches the output to the
 //                   premultiplied float4(accColor, acc) form)
-//   --jitter 0/1    IGN jitter on the sample lattice (app parity)
+//   --jitter 0/1    jitter on the sample lattice. Default uses the app-like
+//                   bilinear-filtered noise texture (GL_GAP_TEXNOISE path):
+//                   smooth correlated field -> jitter cost ~+2-14% (app GL
+//                   parity). Set GL_GAP_SHARPHASH=1 to use the per-pixel IGN
+//                   hash instead (sharp field, jitter cost ~+48%, metal_gap
+//                   parity) so the harness reproduces the app GL-vs-Metal gap.
 //   --jitterblock N jitter block size in px (default 1)
 //   --clip 0/1      (0,0,1) near-plane ray clip (DICOM scene parity)
 //   --preint F      opacity preintegration correction 1-(1-a)^F (default 1)
@@ -69,7 +74,6 @@ static const char* kFragSrc =
   "in vec2 vUV;\n"
   "out vec4 fragColor;\n"
   "uniform sampler3D uVol;\n"
-  "uniform sampler2D uNoise;\n"
   "uniform sampler2D uNoise;\n"
   "uniform vec3 uTexelCount;\n"
   "uniform float uSlabStart;\n"
@@ -121,8 +125,7 @@ static const char* kFragSrc =
   "  evalPoint.z = clamp(evalPoint.z, uSlabStart * ctpScale.z + ctpOffset.z, uSlabEnd * ctpScale.z + ctpOffset.z);\n"
   "  float acc = 0.0;\n"
   "  float n = 0.0;\n"
-  "  uUnbounded > 0 ? (void)0 : (void)0;\n"
-  "  if (uUnbounded > 0) { while (true) {\n"
+  "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n"
   "    if (currentT >= tExit - 1e-6) break;\n"
   "    acc = max(acc, texture(uVol, evalPoint).r);\n"
   "    currentT += stepSize;\n"
@@ -282,8 +285,7 @@ static const char* kFragCompositeSrc =
   "  float acc = 0.0;\n"
   "  float n = 0.0;\n"
   "  vec3 accColor = vec3(0.0);\n"
-  "  uUnbounded > 0 ? (void)0 : (void)0;\n"
-  "  if (uUnbounded > 0) { while (true) {\n"
+  "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n"
   "    if (currentT >= tExit - 1e-6) break;\n"
   "    float s = texture(uVol, evalPoint).r;\n"
   "    n += 1.0;\n"
@@ -298,7 +300,7 @@ static const char* kFragCompositeSrc =
   "    currentT += stepSize;\n"
   "    texLocal += texStep;\n"
   "    evalPoint += evalStep;\n"
-  "  } break; }\n"
+  "  }\n"
   "  int nc = int(n);\n"
   "  if (uMaccum > 0) fragColor = vec4(accColor, acc);\n"
   "  else fragColor = vec4(float(nc & 255) / 255.0, float((nc >> 8) & 255) / 255.0, acc, 1.0);\n"
@@ -458,8 +460,7 @@ static const char* kFragNoFetchSrc =
   "  evalPoint.z = clamp(evalPoint.z, uSlabStart * ctpScale.z + ctpOffset.z, uSlabEnd * ctpScale.z + ctpOffset.z);\n"
   "  float acc = 0.0;\n"
   "  float n = 0.0;\n"
-  "  uUnbounded > 0 ? (void)0 : (void)0;\n"
-  "  if (uUnbounded > 0) { while (true) {\n"
+  "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n"
   "    if (currentT >= tExit - 1e-6) break;\n"
   "    acc = max(acc, evalPoint.x * 0.001 + 0.5);\n"
   "    currentT += stepSize;\n"
@@ -733,7 +734,7 @@ int main(int argc, const char** argv)
     if (fragSrc != fragSrc0) free((void*)fragSrc);
     fragSrc = s1;
   }
-  if (getenv("GL_GAP_TEXNOISE")) {
+  if (!getenv("GL_GAP_SHARPHASH")) {
     const char* n1 = "float jitterF = uUseJittering > 0 ? fract(52.9829189 * fract(dot(floor(gl_FragCoord.xy / float(max(uJitterBlock, 1))) * float(max(uJitterBlock, 1)) + 0.5 * float(max(uJitterBlock, 1)), vec2(0.06711056, 0.00583715)))) * stepSize : 0.0;";
     int tile = getenv("GL_GAP_TEXNOISE_TILE") ? atoi(getenv("GL_GAP_TEXNOISE_TILE")) : 128;
     char rep[256];

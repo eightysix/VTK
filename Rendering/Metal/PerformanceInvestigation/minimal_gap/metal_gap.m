@@ -1041,6 +1041,13 @@ static void ApplyJitterDecl(char* buf, const char* coord, bool mulAdd)
         "u.useJittering > 0.5f ? (float(kBlue64[((int(floor((in.position.y - %d.0f) / %d.0f)) & 63) * 64 + (int(floor(in.position.x / %d.0f)) & 63))]) / 255.0f) * stepSize : 0.0f",
         kRT, kRT / 64, kRT / 64);
     }
+    else if (getenv("METAL_GAP_BLUE_REV"))
+    {
+      // positive-int reversed-row variant (same block partition, % 64)
+      snprintf(noiseBuf, sizeof(noiseBuf),
+        "u.useJittering > 0.5f ? (float(kBlue64[((int(floor((%d.0f - in.position.y) / %d.0f)) %% 64) * 64 + (int(floor(in.position.x / %d.0f)) %% 64))]) / 255.0f) * stepSize : 0.0f",
+        kRT, kRT / 64, kRT / 64);
+    }
     else if (blk > 1)
       snprintf(noiseBuf, sizeof(noiseBuf),
         "u.useJittering > 0.5f ? (float(kBlue64[((int(floor(in.position.y / %d.0f)) %% 64) * 64 + (int(floor(in.position.x / %d.0f)) %% 64))]) / 255.0f) * stepSize : 0.0f", blk, blk);
