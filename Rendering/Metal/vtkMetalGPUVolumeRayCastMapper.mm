@@ -7352,15 +7352,20 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   //   wins as the uniform main-loop count; otherwise the frame-average chord is
   //   used so the uniform main phase covers the bulk of every ray with SIMT
   //   lanes locked, and only the ~15-20 % longer rays spill into the tail.
+  // - any other variant: MARCH_STEPS still caps the per-fragment bound (the
+  //   fixed-steps probe; MaxStepsFrame is 0 in production so the shader's
+  //   baseline loop bound is untouched).
   uniforms.MaxStepsFrame = 0.0f;
-  if (VolumeMarchVariant() == 4 || VolumeMarchVariant() == 5)
   {
     const int fixedSteps = VolumeMarchSteps();
     if (fixedSteps > 0)
     {
       uniforms.MaxStepsFrame = static_cast<float>(fixedSteps);
+      if (getenv("VTK_METAL_TEST_MARCH_DEBUG"))
+        fprintf(stderr, "[march] MARCH_STEPS fixedSteps=%d -> maxStepsFrame=%.1f\n",
+          fixedSteps, uniforms.MaxStepsFrame);
     }
-    else
+    else if (VolumeMarchVariant() == 4 || VolumeMarchVariant() == 5)
     {
       const float camV[3] = {
         uniforms.CameraVolumePos[0], uniforms.CameraVolumePos[1],

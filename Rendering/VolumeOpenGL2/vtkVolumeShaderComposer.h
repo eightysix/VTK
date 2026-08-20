@@ -3349,6 +3349,16 @@ inline std::string TerminationInit(
       \n                        length(g_dirStep);\
       \n  g_currentT = 0.0;");
 
+  // INVESTIGATION (temporary): cap the march at a fixed iteration count
+  // (VTK_METAL_TEST_GL_STEPS=N) so the j0/j1 cost decomposes into envelope vs
+  // per-sample, mirroring the Metal backend's VTK_METAL_TEST_MARCH_STEPS.
+  // Revert before landing.
+  if (const char* glSteps = std::getenv("VTK_METAL_TEST_GL_STEPS"))
+  {
+    shaderStr += std::string("g_terminatePointMax = min(g_terminatePointMax, ") +
+      glSteps + std::string(".0);\n");
+  }
+
   return shaderStr;
 }
 
@@ -3369,13 +3379,21 @@ inline std::string TerminationImplementation(
       \n      }\
       \n");
   }
+  std::string termMaxExpr = "g_terminatePointMax";
+  // INVESTIGATION (temporary): clamp the march exit so VTK_METAL_TEST_GL_STEPS
+  // holds even when a later init block (e.g. clipping) re-assigns
+  // g_terminatePointMax. Revert before landing.
+  if (const char* glSteps = std::getenv("VTK_METAL_TEST_GL_STEPS"))
+  {
+    termMaxExpr = std::string("min(g_terminatePointMax, ") + glSteps + ".0)";
+  }
   shaderStr += std::string("\
       \n    // Early ray termination\
       \n    // if the currently composited colour alpha is already fully saturated\
       \n    // we terminated the loop or if we have hit an obstacle in the\
       \n    // direction of they ray (using depth buffer) we terminate as well.\
       \n    if((g_fragColor.a > g_opacityThreshold) || \
-      \n       g_currentT >= g_terminatePointMax)\
+      \n       g_currentT >= ") + termMaxExpr + std::string(")\
       \n      {\
       \n      break;\
       \n      }\

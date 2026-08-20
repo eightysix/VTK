@@ -4176,6 +4176,14 @@ inline half4 marchVolumeUnified(
     mainSteps = int(volumeUniforms.maxStepsFrame);
     maxSteps = max(maxSteps, mainSteps);
   }
+  else if (volumeUniforms.maxStepsFrame > 0.5)
+  {
+    // Fixed-steps probe (VTK_METAL_TEST_MARCH_STEPS, any march variant): cap
+    // the baseline divergent march at a uniform iteration count so j0/j1 cost
+    // decomposes into envelope vs per-sample. Only nonzero when the probe env
+    // var is set (variants 0/6-9 never set maxStepsFrame in production).
+    maxSteps = min(maxSteps, int(volumeUniforms.maxStepsFrame));
+  }
 
   // Composite slab tiling (fc_slabMode, VTK_METAL_TEST_NUM_SLABS > 1): the
   // ray's sample indices [0, maxSteps) are partitioned into slabCount equal
