@@ -1,0 +1,133 @@
+================================================================================
+JITTER INVESTIGATION — Interleaved j1 + Sample-Count PPMs
+Date: 2026-08-20
+Config: SD4, minmax=0, accel=0, slabs=1, IGN_JITTER=0 (blue noise parity)
+================================================================================
+
+§1. INTERLEAVED j1 (8 rounds, GL↔Metal alternating)
+================================================================================
+Method: Same as j0 interleaving — alternate backends per round to equalize
+thermal state. 30 frames, reps=1.
+
+--- 1024x1024 (headline cell: j0 tied) ---
+
+Round  GL j1 (ms)  Metal j1 (ms)
+  1      39.34        45.83
+  2      40.00        46.15
+  3      36.62        46.35
+  4      40.25        46.30
+  5      36.61        46.21
+  6      37.51        45.96
+  7      36.11        46.22
+  8      37.10        46.07
+
+  GL  j1: 37.94 ± 1.66 ms
+  Mtl j1: 46.14 ± 0.18 ms  (Metal 9× more stable than GL)
+
+  Using interleaved j0 from §1 of J0 dump:
+    GL  j0: 26.94 ± 0.83 ms
+    Mtl j0: 27.65 ± 0.47 ms
+
+  Jitter deltas:
+    GL  Δ: 11.00 ± 2.02 ms
+    Mtl Δ: 18.49 ± 0.55 ms
+    Mtl/GL Δ ratio: 1.68×
+
+  Ratios:
+    M/GL j0: 1.026 (tied)
+    M/GL j1: 1.216
+    spread:  0.190
+
+  Paired (Mtl Δ − GL Δ): 7.49 ± 1.77 ms
+
+--- 2048x2048 ---
+
+Round  GL j1 (ms)  Metal j1 (ms)
+  1      50.22        69.20
+  2      54.47        69.29
+  3      51.42        68.85
+  4      50.14        69.11
+  5      51.86        68.77
+  6      54.32        69.61
+  7      52.37        69.04
+  8      50.91        68.92
+
+  GL  j1: 51.96 ± 1.68 ms
+  Mtl j1: 69.10 ± 0.27 ms  (Metal 6× more stable)
+
+  Using interleaved j0:
+    GL  j0: 41.69 ± 1.17 ms
+    Mtl j0: 43.57 ± 0.11 ms
+
+  Jitter deltas:
+    GL  Δ: 10.27 ± 1.60 ms
+    Mtl Δ: 25.53 ± 0.35 ms
+    Mtl/GL Δ ratio: 2.48×
+
+  Ratios:
+    M/GL j0: 1.045 (~+1.9 ms, not the story)
+    M/GL j1: 1.330
+    spread:  0.285
+
+  Paired (Mtl Δ − GL Δ): 15.26 ± 1.57 ms
+
+§2. SAMPLE-COUNT PPMs — App GL @ 1024
+================================================================================
+Method: VTK_METAL_TEST_GL_ITER=1 dumps g_currentT/4096 to red channel.
+Iteration = red × 4096 / 255. 5 frames, first frame captured.
+
+                  Covered     % total   Mean iter  Median  P95
+App GL j0         421,828     40.2%     86.5       80.3    192.8
+App GL j1         423,564     40.4%     86.7       80.3    192.8
+
+  Raw red values: min=1  max=14  mean=5.39-5.40
+  Top 5 red: [1:55k, 2:51k, 3:47k, 4:44k, 5:40k]  (smooth geometric decay)
+
+KEY FINDING: j0 and j1 iteration counts are IDENTICAL.
+  - Mean: 86.5 vs 86.7 (noise)
+  - Coverage: 421,828 vs 423,564 (noise)
+  - Distribution: identical shape
+
+This means jitter does NOT add iterations. The +11 ms jitter cost on GL is
+entirely a per-sample cost change (divergent memory access, cache behavior,
+phase interaction with early-exit), NOT a trip-count change.
+
+§3. MARCH_STEPS CAP VERIFICATION
+================================================================================
+VTK_METAL_TEST_MARCH_STEPS=1 + GL_ITER: mean iterations = 86.5 (not 1).
+The cap did NOT bite. MARCH_STEPS is dead on GL — the env var is read but
+does not constrain the march loop. The fixed-steps probe data in J0 dump
+§3 is therefore uninterpretable for per-sample cost.
+
+§4. HARNESS GL vs APP GL (the §2 discrepancy)
+================================================================================
+Harness GL (from HARNESS doc, single-run 2048/SD4):
+  j0: 50.30 ± 4.97 ms  j1: 75.49 ± 5.99 ms  Δ: +25.19 ms
+
+App GL (interleaved 1024):
+  j0: 26.94 ± 0.83 ms  j1: 37.94 ± 1.66 ms  Δ: +11.00 ms
+
+Harness GL Δ (+25.2) ≈ 2× App GL Δ (+11.0). The harness over-charges
+GL jitter. This was the original §2 finding of the HARNESS doc. The harness
+GL march is heavier than the app GL march (more per-step work = more
+divergence penalty from jitter), or the harness GL semantics differ.
+
+Harness GL PPMs not available — harness jitter_gap_repro.mm does not have
+GL_ITER support (only GL_DUMP_PPM for color output).
+
+§5. SUMMARY
+================================================================================
+Frozen jitter metrics (interleaved, 8 rounds):
+
+  Cell    GL Δ (ms)      Mtl Δ (ms)     Ratio   spread
+  1024    11.00 ± 2.02   18.49 ± 0.55   1.68×   0.190
+  2048    10.27 ± 1.60   25.53 ± 0.35   2.48×   0.285
+
+App GL iteration counts: j0 ≈ j1 (mean ~86.5, coverage ~40%).
+Jitter cost is per-sample, not per-iteration.
+
+The 2× jitter penalty lives entirely in the per-sample cost, not the
+trip count. Metal's per-sample cost under jitter is 1.7-2.5× GL's.
+
+Next: why does Metal's per-pixel phase cost ~half of GL's in the
+800-2048 window? (H4/H7 — inner-loop shape, $/divergent sample.)

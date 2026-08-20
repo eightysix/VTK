@@ -282,23 +282,29 @@ eliminate thermal ordering bias.
 also slower at j1, and vice versa. The "jitter gap" is not purely a jitter
 phenomenon — it is two stacked effects:
 
-1. **Envelope tax (j0 gap).** At 2048, interleaved 8-round M/GL j0 = 1.046 ±
-   0.029 (~4ms fixed overhead). Proved to be an envelope cost (not march) by
-   the fixed-steps probe (§8): Metal time is constant (~44.5ms) from steps=1
-   to steps=1000. The gap survives a near-zero-march probe → submit/RT/timer,
-   not the shader. See `J0_GAP_DUMP.txt` for full data.
+1. **j0 gap (small).** At 2048, interleaved 8-round M/GL j0 = 1.046 ± 0.029
+   (~+1.9 ms). At 1024, M/GL j0 = 1.027 ± 0.025 (tied). The old 1.10 / +4 ms
+   was a sequential thermal artifact (GL 40.3 vs interleaved 41.7; Metal barely
+   moved). The +1.9 ms is unlabeled — envelope vs coherent-path vs noise. It
+   is not large enough to manufacture Metal Δ = 2× GL Δ.
 
 2. **Jitter asymmetry (spread).** The spread (j1 ratio − j0 ratio) isolates
    the pure jitter effect. It peaks at +0.30 (1024x1024) and is +0.18 at
    2048. Metal's jitter costs ~2x GL's in absolute ms at these resolutions.
 
-Decomposition at the pathologic cell (2048, M/GL j1 ≈ 1.28):
-- ~0.05 from envelope tax (j0 gap, ~4ms fixed)
-- ~0.18 from jitter asymmetry (spread)
-- Total ≈ 1.28
+**Frozen metrics (replaces earlier decomposition):**
 
-The envelope tax cancels out in jitter deltas (Metal Δ = Metal j1 − Metal j0
-removes the fixed overhead), so the 2× jitter penalty is purely a j1 problem.
+```
+M/GL j0  1024: 1.03 ± 0.03   (tied — headline cell)
+M/J j0  2048: 1.05 ± 0.03   (~+1.9 ms; do not re-litigate; do not subtract)
+
+Jitter metrics (only):
+  GL Δ ms, Metal Δ ms
+  spread = (M/GL j1) − (M/GL j0)
+```
+
+An additive j0 gap cancels in Δ (j1−j0) by algebra. The 2× jitter penalty
+is purely a j1 problem regardless of what the +1.9 ms is.
 
 **Scaling regime boundaries (confirmed interleaved at 4096/8192):**
 - **≤400:** Negligible gap. Both backends are lightweight; jitter costs are
@@ -315,34 +321,76 @@ removes the fixed overhead), so the 2× jitter penalty is purely a j1 problem.
 drops to +21 (4096) and +11 (8192). At extreme resolutions the per-pixel
 jitter divergence is amortized by other fixed costs in the pipeline.
 
-## 8. j0 gap: envelope, not march (2026-08-20)
+## 8. j0 gap: small, not the 2× story (2026-08-20)
 
-Interleaved 8-round j0 at 2048: M/GL = 1.046 ± 0.029 (real but small).
+Interleaved 8-round j0 at 2048: M/GL = 1.046 ± 0.029 (~+1.9 ms).
 1024 j0: M/GL = 1.027 ± 0.025 (tied within noise).
 
-Fixed-steps probe at 2048 (forcing `VTK_METAL_TEST_MARCH_STEPS`):
+The old 1.10 was a sequential thermal artifact: GL ran hotter in sequential
+ordering (40.3 ms) than interleaved (41.7 ms); Metal barely moved (43.6 ms).
+The +1.9 ms leftover is real but small — not large enough to explain the 2×
+jitter gap. Left unlabeled (envelope vs coherent-path vs noise). Do not
+re-litigate.
 
-| Steps | GL (ms) | Metal (ms) | M/GL |
-|---|---|---|---|
-| 1 | 40.19 | 44.48 | 1.107 |
-| 5 | 39.55 | 44.26 | 1.119 |
-| 50 | 43.34 | 46.06 | 1.063 |
-| 100 | 43.38 | 44.23 | 1.020 |
-| 400 | 41.12 | 44.47 | 1.082 |
-| 1000 | 42.83 | 44.72 | 1.044 |
+**MARCH_STEPS probe — status unknown.** The fixed-steps data showed Metal
+constant at ~44.5ms from steps=1 to 1000, which is internally contradictory:
+unconstrained Metal Δ (j1−j0) is ~+25 ms, so the march MUST add measurable
+time. Likely the cap did not bite (wrong uniform, pipeline not rebuilt, or
+forced steps already below the computed cap). Needs verification via GL_ITER
+PPM (red×4096 at steps=1: if still hundreds, cap never entered the loop).
+Do not interpret the table until the PPM confirms the cap works.
 
-Metal time is constant (~44.5ms) from steps=1 to 1000. The march loop
-adds ~0.2ms total — per-sample cost ≈ 0.2μs, negligible. At steps=1
-(near-zero march), Metal is STILL 10.7% slower. The ~4ms gap is a fixed
-envelope cost (render pass setup, command buffer encoding, offscreen RT),
-not a per-sample or trip-count issue. Freezes as **State C** per the
-investigation plan: subtract envelope from both j0 and j1; spread
-(M/GL j1 − M/GL j0) isolates the pure jitter asymmetry.
+Full data in `J0_GAP_DUMP.txt` (note: §3 interpretation is provisional).
 
-Full data in `J0_GAP_DUMP.txt`.
+## 9. Jitter investigation: interleaved j1 + sample-count PPMs (2026-08-20)
+
+### 9.1 Interleaved j1 (8 rounds, GL↔Metal, JITTER=1, IGN_JITTER=0)
+
+| Cell | GL Δ (ms) | Mtl Δ (ms) | Mtl/GL Δ | spread |
+|---|---|---|---|---|
+| 1024 | 11.00 ± 2.02 | 18.49 ± 0.55 | 1.68× | 0.190 |
+| 2048 | 10.27 ± 1.60 | 25.53 ± 0.35 | 2.48× | 0.285 |
+
+Metal jitter is 6-9× more stable than GL (stdev 0.18-0.55 vs 1.6-2.0 ms).
+The 2× penalty scales with resolution: 1.68× at 1024, 2.48× at 2048.
+
+### 9.2 App GL sample-count PPMs (GL_ITER at 1024)
+
+| | Covered px | % total | Mean iter | Median | P95 |
+|---|---|---|---|---|---|
+| GL j0 | 421,828 | 40.2% | 86.5 | 80.3 | 192.8 |
+| GL j1 | 423,564 | 40.4% | 86.7 | 80.3 | 192.8 |
+
+**Iteration counts are identical between j0 and j1.** Jitter does NOT add
+iterations — the +11 ms jitter cost is entirely a per-sample cost change
+(divergent memory access, cache behavior, phase interaction with early-exit).
+
+### 9.3 MARCH_STEPS cap verification
+
+`VTK_METAL_TEST_MARCH_STEPS=1` + GL_ITER: mean iterations = 86.5 (not 1).
+The cap did not bite — MARCH_STEPS is dead on GL. The fixed-steps data in
+§8/J0 dump is uninterpretable for per-sample cost.
+
+### 9.4 Key findings
+
+1. **Jitter cost is per-sample, not per-iteration.** Same trip count, different
+   $/sample. The 2× penalty is entirely in the inner-loop cost under phase
+   scatter.
+
+2. **The 2× lives in the 800-2048 window.** At 1024 (j0 tied), Metal pays
+   1.68× GL's jitter. At 2048, 2.48×. Next question: why does Metal's
+   per-pixel phase cost ~half of GL's? (H4/H7 — inner-loop shape, $/divergent
+   sample.)
+
+3. **Harness GL over-charges jitter.** Harness GL Δ ≈ +25 ms vs app GL Δ ≈
+   +11 ms. The harness march is heavier per-step, so jitter divergence costs
+   more. Harness GL PPMs not available (no GL_ITER in harness).
+
+Full data in `JITTER_DUMP.txt`.
 
 ## 5. Files
 
+- `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
 - `J0_GAP_DUMP.txt` — j0 investigation dump (interleaved rounds, fixed-steps, timer audit).
 - `jitter_gap_repro/` — harness + `RESULTS.md` (build/run/knobs, verdicts).
 - `jitter_gap_repro/RESULTS.md` — full experiment record.
