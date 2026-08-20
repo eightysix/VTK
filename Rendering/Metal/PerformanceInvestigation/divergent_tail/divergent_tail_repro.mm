@@ -86,6 +86,10 @@ static int kFixedOverride = 0;        // 0 = use geometric mean as cap, else ove
 static BOOL kOptContents = NO;        // allowGPUOptimizedContents on the volume texture
 static int kMaxConstant = 288;        // compile-time ceiling for variant 4 (must be > max geomSteps)
 static int kHarness = 0;              // 0 = GPU timestamps + DontCare (fair), 1 = wall clock + Clear (old)
+static int kChunk = 256;              // V6 persistent kernel chunk size (multiple of tgSize)
+static int kComputeTG = 256;          // V6 threadgroup size
+static int kTile = 32;                 // V10 tile size (square)
+static int kComputeGroups = 0;        // V6 threadgroup count (0 = maxThreadsPerThreadgroup.width*8/tg)
 
 #define DBG(...) std::fprintf(stderr, "[repro] " __VA_ARGS__), std::fflush(stderr)
 
@@ -436,7 +440,9 @@ static NSString* kMetalSrc = @R"(
 #include <metal_stdlib>
 using namespace metal;
 struct FragIn { float4 pos [[position]]; float2 uv; };
-struct Params { int mode; int fixedSteps; float step; float alphaMul; };
+struct Params { int mode; int fixedSteps; float step; float alphaMul;
+                int width; int height; int nPixels; int tileW; int tileH;
+                float deadFlag; int bucketLo; int bucketHi; int bucketCap; };
 constant int kMax [[function_constant(0)]]; // compile-time ceiling (variant 4)
 vertex FragIn vsfull(const device float2* pos [[buffer(0)]], uint vid [[vertex_id]]) {
   FragIn o;
@@ -445,10 +451,19 @@ vertex FragIn vsfull(const device float2* pos [[buffer(0)]], uint vid [[vertex_i
   o.uv = p * 0.5 + 0.5;
   return o;
 }
+#if MARCH_VARIANT == 12
+struct MarchOut { float4 c [[color(0)]]; float h [[color(1)]]; };
+fragment MarchOut march(texture3d<float, access::sample> vol [[texture(0)]],
+                        texture2d<float, access::read> histTex [[texture(1)]],
+                        sampler smp [[sampler(0)]],
+                        constant Params& p [[buffer(0)]],
+                        FragIn in [[stage_in]]) {
+#else
 fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
                       sampler smp [[sampler(0)]],
                       constant Params& p [[buffer(0)]],
                       FragIn in [[stage_in]]) {
+#endif
   float2 ndc = in.uv * 2.0 - 1.0;
   float3 eye = float3(0.5, 0.5, -0.35);
   float3 dir = normalize(float3(ndc * 2.5, 1.0));
@@ -460,7 +475,11 @@ fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
   float tEnter = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
   float tExit  = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
   if (tExit <= 0.0 || tEnter >= tExit) {
+#if MARCH_VARIANT == 12
+    return MarchOut{ float4(0.0, 0.0, 0.0, 0.0), 0.0 };
+#else
     return float4(0.0, 0.0, 0.0, 0.0);
+#endif
   }
   int geomSteps = max(1, int(ceil((tExit - tEnter) / p.step)));
   int steps = (p.mode == 1) ? min(geomSteps, p.fixedSteps) : geomSteps;
@@ -481,9 +500,11 @@ fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
     done = i + 1;
     if (alpha > 0.9) break;
   }
-#elif MARCH_VARIANT == 1
+#elif MARCH_VARIANT == 1 || MARCH_VARIANT == 6
   // V1: step A — explicit level(0.0). Same loop shape, same work, but no
   // implicit gradient/quad machinery. Should be strictly cheaper than V0.
+  // (V6 compiles this same fragment for library-shape parity; the compute
+  // kernel below is what actually runs for variant 6.)
   for (int i = 0; i < steps; ++i) {
     float s = vol.sample(smp, base + float(i) * d, level(0.0)).r;
     float o = s * p.alphaMul;
@@ -571,8 +592,729 @@ fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
     if (!anyAlive) break;
     (void)lastDone;
   }
+#elif MARCH_VARIANT == 8 || MARCH_VARIANT == 9 || MARCH_VARIANT == 10 || MARCH_VARIANT == 11
+  // V13-V16: v34 exact shape with batch width BATCH_N (8/16/32/48).
+  // ONE break check per batch (MV9_ADVANCE), all positions computed first,
+  // all fetches back-to-back, BRANCH-FREE serial composite chain with a
+  // select-gated opacity latch (app MV9_COMPOSITE semantics, exact parity:
+  // acc/alpha/done freeze the moment alpha crosses 0.9).
+  // NOTE: unused lanes MUST be compiled out per variant (#if); the MSL
+  // compiler does not DCE texture samples referenced by runtime guards.
+#if MARCH_VARIANT == 8
+  const int BATCH_N = 8;
+#elif MARCH_VARIANT == 9
+  const int BATCH_N = 16;
+#elif MARCH_VARIANT == 10
+  const int BATCH_N = 32;
+#else
+  const int BATCH_N = 48;
 #endif
+  int i = 0;
+  const int stepsB = steps;
+  bool opaque = false;
+  for (; i + BATCH_N <= stepsB; i += BATCH_N)
+  {
+    float3 p0 = base + float(i + 0) * d;
+    float3 p1 = base + float(i + 1) * d;
+    float3 p2 = base + float(i + 2) * d;
+    float3 p3 = base + float(i + 3) * d;
+    float3 p4 = base + float(i + 4) * d;
+    float3 p5 = base + float(i + 5) * d;
+    float3 p6 = base + float(i + 6) * d;
+    float3 p7 = base + float(i + 7) * d;
+#if MARCH_VARIANT >= 9
+    float3 p8 = base + float(i + 8) * d;
+    float3 p9 = base + float(i + 9) * d;
+    float3 p10 = base + float(i + 10) * d;
+    float3 p11 = base + float(i + 11) * d;
+    float3 p12 = base + float(i + 12) * d;
+    float3 p13 = base + float(i + 13) * d;
+    float3 p14 = base + float(i + 14) * d;
+    float3 p15 = base + float(i + 15) * d;
+#endif
+#if MARCH_VARIANT >= 10
+    float3 p16 = base + float(i + 16) * d;
+    float3 p17 = base + float(i + 17) * d;
+    float3 p18 = base + float(i + 18) * d;
+    float3 p19 = base + float(i + 19) * d;
+    float3 p20 = base + float(i + 20) * d;
+    float3 p21 = base + float(i + 21) * d;
+    float3 p22 = base + float(i + 22) * d;
+    float3 p23 = base + float(i + 23) * d;
+    float3 p24 = base + float(i + 24) * d;
+    float3 p25 = base + float(i + 25) * d;
+    float3 p26 = base + float(i + 26) * d;
+    float3 p27 = base + float(i + 27) * d;
+    float3 p28 = base + float(i + 28) * d;
+    float3 p29 = base + float(i + 29) * d;
+    float3 p30 = base + float(i + 30) * d;
+    float3 p31 = base + float(i + 31) * d;
+#endif
+#if MARCH_VARIANT >= 11
+    float3 p32 = base + float(i + 32) * d;
+    float3 p33 = base + float(i + 33) * d;
+    float3 p34 = base + float(i + 34) * d;
+    float3 p35 = base + float(i + 35) * d;
+    float3 p36 = base + float(i + 36) * d;
+    float3 p37 = base + float(i + 37) * d;
+    float3 p38 = base + float(i + 38) * d;
+    float3 p39 = base + float(i + 39) * d;
+    float3 p40 = base + float(i + 40) * d;
+    float3 p41 = base + float(i + 41) * d;
+    float3 p42 = base + float(i + 42) * d;
+    float3 p43 = base + float(i + 43) * d;
+    float3 p44 = base + float(i + 44) * d;
+    float3 p45 = base + float(i + 45) * d;
+    float3 p46 = base + float(i + 46) * d;
+    float3 p47 = base + float(i + 47) * d;
+#endif
+    float s0 = vol.sample(smp, p0, level(0.0)).r;
+    float s1 = vol.sample(smp, p1, level(0.0)).r;
+    float s2 = vol.sample(smp, p2, level(0.0)).r;
+    float s3 = vol.sample(smp, p3, level(0.0)).r;
+    float s4 = vol.sample(smp, p4, level(0.0)).r;
+    float s5 = vol.sample(smp, p5, level(0.0)).r;
+    float s6 = vol.sample(smp, p6, level(0.0)).r;
+    float s7 = vol.sample(smp, p7, level(0.0)).r;
+#if MARCH_VARIANT >= 9
+    float s8 = vol.sample(smp, p8, level(0.0)).r;
+    float s9 = vol.sample(smp, p9, level(0.0)).r;
+    float s10 = vol.sample(smp, p10, level(0.0)).r;
+    float s11 = vol.sample(smp, p11, level(0.0)).r;
+    float s12 = vol.sample(smp, p12, level(0.0)).r;
+    float s13 = vol.sample(smp, p13, level(0.0)).r;
+    float s14 = vol.sample(smp, p14, level(0.0)).r;
+    float s15 = vol.sample(smp, p15, level(0.0)).r;
+#endif
+#if MARCH_VARIANT >= 10
+    float s16 = vol.sample(smp, p16, level(0.0)).r;
+    float s17 = vol.sample(smp, p17, level(0.0)).r;
+    float s18 = vol.sample(smp, p18, level(0.0)).r;
+    float s19 = vol.sample(smp, p19, level(0.0)).r;
+    float s20 = vol.sample(smp, p20, level(0.0)).r;
+    float s21 = vol.sample(smp, p21, level(0.0)).r;
+    float s22 = vol.sample(smp, p22, level(0.0)).r;
+    float s23 = vol.sample(smp, p23, level(0.0)).r;
+    float s24 = vol.sample(smp, p24, level(0.0)).r;
+    float s25 = vol.sample(smp, p25, level(0.0)).r;
+    float s26 = vol.sample(smp, p26, level(0.0)).r;
+    float s27 = vol.sample(smp, p27, level(0.0)).r;
+    float s28 = vol.sample(smp, p28, level(0.0)).r;
+    float s29 = vol.sample(smp, p29, level(0.0)).r;
+    float s30 = vol.sample(smp, p30, level(0.0)).r;
+    float s31 = vol.sample(smp, p31, level(0.0)).r;
+#endif
+#if MARCH_VARIANT >= 11
+    float s32 = vol.sample(smp, p32, level(0.0)).r;
+    float s33 = vol.sample(smp, p33, level(0.0)).r;
+    float s34 = vol.sample(smp, p34, level(0.0)).r;
+    float s35 = vol.sample(smp, p35, level(0.0)).r;
+    float s36 = vol.sample(smp, p36, level(0.0)).r;
+    float s37 = vol.sample(smp, p37, level(0.0)).r;
+    float s38 = vol.sample(smp, p38, level(0.0)).r;
+    float s39 = vol.sample(smp, p39, level(0.0)).r;
+    float s40 = vol.sample(smp, p40, level(0.0)).r;
+    float s41 = vol.sample(smp, p41, level(0.0)).r;
+    float s42 = vol.sample(smp, p42, level(0.0)).r;
+    float s43 = vol.sample(smp, p43, level(0.0)).r;
+    float s44 = vol.sample(smp, p44, level(0.0)).r;
+    float s45 = vol.sample(smp, p45, level(0.0)).r;
+    float s46 = vol.sample(smp, p46, level(0.0)).r;
+    float s47 = vol.sample(smp, p47, level(0.0)).r;
+#endif
+    float o0 = s0 * p.alphaMul;
+    float g0 = opaque ? 0.0 : 1.0;
+    float w0 = 1.0 - alpha;
+    acc += g0 * w0 * o0;
+    alpha += g0 * w0 * o0;
+    done = opaque ? done : (i + 1);
+    opaque = (alpha > 0.9);
+    float o1 = s1 * p.alphaMul;
+    float g1 = opaque ? 0.0 : 1.0;
+    float w1 = 1.0 - alpha;
+    acc += g1 * w1 * o1;
+    alpha += g1 * w1 * o1;
+    done = opaque ? done : (i + 2);
+    opaque = (alpha > 0.9);
+    float o2 = s2 * p.alphaMul;
+    float g2 = opaque ? 0.0 : 1.0;
+    float w2 = 1.0 - alpha;
+    acc += g2 * w2 * o2;
+    alpha += g2 * w2 * o2;
+    done = opaque ? done : (i + 3);
+    opaque = (alpha > 0.9);
+    float o3 = s3 * p.alphaMul;
+    float g3 = opaque ? 0.0 : 1.0;
+    float w3 = 1.0 - alpha;
+    acc += g3 * w3 * o3;
+    alpha += g3 * w3 * o3;
+    done = opaque ? done : (i + 4);
+    opaque = (alpha > 0.9);
+    float o4 = s4 * p.alphaMul;
+    float g4 = opaque ? 0.0 : 1.0;
+    float w4 = 1.0 - alpha;
+    acc += g4 * w4 * o4;
+    alpha += g4 * w4 * o4;
+    done = opaque ? done : (i + 5);
+    opaque = (alpha > 0.9);
+    float o5 = s5 * p.alphaMul;
+    float g5 = opaque ? 0.0 : 1.0;
+    float w5 = 1.0 - alpha;
+    acc += g5 * w5 * o5;
+    alpha += g5 * w5 * o5;
+    done = opaque ? done : (i + 6);
+    opaque = (alpha > 0.9);
+    float o6 = s6 * p.alphaMul;
+    float g6 = opaque ? 0.0 : 1.0;
+    float w6 = 1.0 - alpha;
+    acc += g6 * w6 * o6;
+    alpha += g6 * w6 * o6;
+    done = opaque ? done : (i + 7);
+    opaque = (alpha > 0.9);
+    float o7 = s7 * p.alphaMul;
+    float g7 = opaque ? 0.0 : 1.0;
+    float w7 = 1.0 - alpha;
+    acc += g7 * w7 * o7;
+    alpha += g7 * w7 * o7;
+    done = opaque ? done : (i + 8);
+    opaque = (alpha > 0.9);
+#if MARCH_VARIANT >= 9
+    float o8 = s8 * p.alphaMul;
+    float g8 = opaque ? 0.0 : 1.0;
+    float w8 = 1.0 - alpha;
+    acc += g8 * w8 * o8;
+    alpha += g8 * w8 * o8;
+    done = opaque ? done : (i + 9);
+    opaque = (alpha > 0.9);
+    float o9 = s9 * p.alphaMul;
+    float g9 = opaque ? 0.0 : 1.0;
+    float w9 = 1.0 - alpha;
+    acc += g9 * w9 * o9;
+    alpha += g9 * w9 * o9;
+    done = opaque ? done : (i + 10);
+    opaque = (alpha > 0.9);
+    float o10 = s10 * p.alphaMul;
+    float g10 = opaque ? 0.0 : 1.0;
+    float w10 = 1.0 - alpha;
+    acc += g10 * w10 * o10;
+    alpha += g10 * w10 * o10;
+    done = opaque ? done : (i + 11);
+    opaque = (alpha > 0.9);
+    float o11 = s11 * p.alphaMul;
+    float g11 = opaque ? 0.0 : 1.0;
+    float w11 = 1.0 - alpha;
+    acc += g11 * w11 * o11;
+    alpha += g11 * w11 * o11;
+    done = opaque ? done : (i + 12);
+    opaque = (alpha > 0.9);
+    float o12 = s12 * p.alphaMul;
+    float g12 = opaque ? 0.0 : 1.0;
+    float w12 = 1.0 - alpha;
+    acc += g12 * w12 * o12;
+    alpha += g12 * w12 * o12;
+    done = opaque ? done : (i + 13);
+    opaque = (alpha > 0.9);
+    float o13 = s13 * p.alphaMul;
+    float g13 = opaque ? 0.0 : 1.0;
+    float w13 = 1.0 - alpha;
+    acc += g13 * w13 * o13;
+    alpha += g13 * w13 * o13;
+    done = opaque ? done : (i + 14);
+    opaque = (alpha > 0.9);
+    float o14 = s14 * p.alphaMul;
+    float g14 = opaque ? 0.0 : 1.0;
+    float w14 = 1.0 - alpha;
+    acc += g14 * w14 * o14;
+    alpha += g14 * w14 * o14;
+    done = opaque ? done : (i + 15);
+    opaque = (alpha > 0.9);
+    float o15 = s15 * p.alphaMul;
+    float g15 = opaque ? 0.0 : 1.0;
+    float w15 = 1.0 - alpha;
+    acc += g15 * w15 * o15;
+    alpha += g15 * w15 * o15;
+    done = opaque ? done : (i + 16);
+    opaque = (alpha > 0.9);
+#endif
+#if MARCH_VARIANT >= 10
+    float o16 = s16 * p.alphaMul;
+    float g16 = opaque ? 0.0 : 1.0;
+    float w16 = 1.0 - alpha;
+    acc += g16 * w16 * o16;
+    alpha += g16 * w16 * o16;
+    done = opaque ? done : (i + 17);
+    opaque = (alpha > 0.9);
+    float o17 = s17 * p.alphaMul;
+    float g17 = opaque ? 0.0 : 1.0;
+    float w17 = 1.0 - alpha;
+    acc += g17 * w17 * o17;
+    alpha += g17 * w17 * o17;
+    done = opaque ? done : (i + 18);
+    opaque = (alpha > 0.9);
+    float o18 = s18 * p.alphaMul;
+    float g18 = opaque ? 0.0 : 1.0;
+    float w18 = 1.0 - alpha;
+    acc += g18 * w18 * o18;
+    alpha += g18 * w18 * o18;
+    done = opaque ? done : (i + 19);
+    opaque = (alpha > 0.9);
+    float o19 = s19 * p.alphaMul;
+    float g19 = opaque ? 0.0 : 1.0;
+    float w19 = 1.0 - alpha;
+    acc += g19 * w19 * o19;
+    alpha += g19 * w19 * o19;
+    done = opaque ? done : (i + 20);
+    opaque = (alpha > 0.9);
+    float o20 = s20 * p.alphaMul;
+    float g20 = opaque ? 0.0 : 1.0;
+    float w20 = 1.0 - alpha;
+    acc += g20 * w20 * o20;
+    alpha += g20 * w20 * o20;
+    done = opaque ? done : (i + 21);
+    opaque = (alpha > 0.9);
+    float o21 = s21 * p.alphaMul;
+    float g21 = opaque ? 0.0 : 1.0;
+    float w21 = 1.0 - alpha;
+    acc += g21 * w21 * o21;
+    alpha += g21 * w21 * o21;
+    done = opaque ? done : (i + 22);
+    opaque = (alpha > 0.9);
+    float o22 = s22 * p.alphaMul;
+    float g22 = opaque ? 0.0 : 1.0;
+    float w22 = 1.0 - alpha;
+    acc += g22 * w22 * o22;
+    alpha += g22 * w22 * o22;
+    done = opaque ? done : (i + 23);
+    opaque = (alpha > 0.9);
+    float o23 = s23 * p.alphaMul;
+    float g23 = opaque ? 0.0 : 1.0;
+    float w23 = 1.0 - alpha;
+    acc += g23 * w23 * o23;
+    alpha += g23 * w23 * o23;
+    done = opaque ? done : (i + 24);
+    opaque = (alpha > 0.9);
+    float o24 = s24 * p.alphaMul;
+    float g24 = opaque ? 0.0 : 1.0;
+    float w24 = 1.0 - alpha;
+    acc += g24 * w24 * o24;
+    alpha += g24 * w24 * o24;
+    done = opaque ? done : (i + 25);
+    opaque = (alpha > 0.9);
+    float o25 = s25 * p.alphaMul;
+    float g25 = opaque ? 0.0 : 1.0;
+    float w25 = 1.0 - alpha;
+    acc += g25 * w25 * o25;
+    alpha += g25 * w25 * o25;
+    done = opaque ? done : (i + 26);
+    opaque = (alpha > 0.9);
+    float o26 = s26 * p.alphaMul;
+    float g26 = opaque ? 0.0 : 1.0;
+    float w26 = 1.0 - alpha;
+    acc += g26 * w26 * o26;
+    alpha += g26 * w26 * o26;
+    done = opaque ? done : (i + 27);
+    opaque = (alpha > 0.9);
+    float o27 = s27 * p.alphaMul;
+    float g27 = opaque ? 0.0 : 1.0;
+    float w27 = 1.0 - alpha;
+    acc += g27 * w27 * o27;
+    alpha += g27 * w27 * o27;
+    done = opaque ? done : (i + 28);
+    opaque = (alpha > 0.9);
+    float o28 = s28 * p.alphaMul;
+    float g28 = opaque ? 0.0 : 1.0;
+    float w28 = 1.0 - alpha;
+    acc += g28 * w28 * o28;
+    alpha += g28 * w28 * o28;
+    done = opaque ? done : (i + 29);
+    opaque = (alpha > 0.9);
+    float o29 = s29 * p.alphaMul;
+    float g29 = opaque ? 0.0 : 1.0;
+    float w29 = 1.0 - alpha;
+    acc += g29 * w29 * o29;
+    alpha += g29 * w29 * o29;
+    done = opaque ? done : (i + 30);
+    opaque = (alpha > 0.9);
+    float o30 = s30 * p.alphaMul;
+    float g30 = opaque ? 0.0 : 1.0;
+    float w30 = 1.0 - alpha;
+    acc += g30 * w30 * o30;
+    alpha += g30 * w30 * o30;
+    done = opaque ? done : (i + 31);
+    opaque = (alpha > 0.9);
+    float o31 = s31 * p.alphaMul;
+    float g31 = opaque ? 0.0 : 1.0;
+    float w31 = 1.0 - alpha;
+    acc += g31 * w31 * o31;
+    alpha += g31 * w31 * o31;
+    done = opaque ? done : (i + 32);
+    opaque = (alpha > 0.9);
+#endif
+#if MARCH_VARIANT >= 11
+    float o32 = s32 * p.alphaMul;
+    float g32 = opaque ? 0.0 : 1.0;
+    float w32 = 1.0 - alpha;
+    acc += g32 * w32 * o32;
+    alpha += g32 * w32 * o32;
+    done = opaque ? done : (i + 33);
+    opaque = (alpha > 0.9);
+    float o33 = s33 * p.alphaMul;
+    float g33 = opaque ? 0.0 : 1.0;
+    float w33 = 1.0 - alpha;
+    acc += g33 * w33 * o33;
+    alpha += g33 * w33 * o33;
+    done = opaque ? done : (i + 34);
+    opaque = (alpha > 0.9);
+    float o34 = s34 * p.alphaMul;
+    float g34 = opaque ? 0.0 : 1.0;
+    float w34 = 1.0 - alpha;
+    acc += g34 * w34 * o34;
+    alpha += g34 * w34 * o34;
+    done = opaque ? done : (i + 35);
+    opaque = (alpha > 0.9);
+    float o35 = s35 * p.alphaMul;
+    float g35 = opaque ? 0.0 : 1.0;
+    float w35 = 1.0 - alpha;
+    acc += g35 * w35 * o35;
+    alpha += g35 * w35 * o35;
+    done = opaque ? done : (i + 36);
+    opaque = (alpha > 0.9);
+    float o36 = s36 * p.alphaMul;
+    float g36 = opaque ? 0.0 : 1.0;
+    float w36 = 1.0 - alpha;
+    acc += g36 * w36 * o36;
+    alpha += g36 * w36 * o36;
+    done = opaque ? done : (i + 37);
+    opaque = (alpha > 0.9);
+    float o37 = s37 * p.alphaMul;
+    float g37 = opaque ? 0.0 : 1.0;
+    float w37 = 1.0 - alpha;
+    acc += g37 * w37 * o37;
+    alpha += g37 * w37 * o37;
+    done = opaque ? done : (i + 38);
+    opaque = (alpha > 0.9);
+    float o38 = s38 * p.alphaMul;
+    float g38 = opaque ? 0.0 : 1.0;
+    float w38 = 1.0 - alpha;
+    acc += g38 * w38 * o38;
+    alpha += g38 * w38 * o38;
+    done = opaque ? done : (i + 39);
+    opaque = (alpha > 0.9);
+    float o39 = s39 * p.alphaMul;
+    float g39 = opaque ? 0.0 : 1.0;
+    float w39 = 1.0 - alpha;
+    acc += g39 * w39 * o39;
+    alpha += g39 * w39 * o39;
+    done = opaque ? done : (i + 40);
+    opaque = (alpha > 0.9);
+    float o40 = s40 * p.alphaMul;
+    float g40 = opaque ? 0.0 : 1.0;
+    float w40 = 1.0 - alpha;
+    acc += g40 * w40 * o40;
+    alpha += g40 * w40 * o40;
+    done = opaque ? done : (i + 41);
+    opaque = (alpha > 0.9);
+    float o41 = s41 * p.alphaMul;
+    float g41 = opaque ? 0.0 : 1.0;
+    float w41 = 1.0 - alpha;
+    acc += g41 * w41 * o41;
+    alpha += g41 * w41 * o41;
+    done = opaque ? done : (i + 42);
+    opaque = (alpha > 0.9);
+    float o42 = s42 * p.alphaMul;
+    float g42 = opaque ? 0.0 : 1.0;
+    float w42 = 1.0 - alpha;
+    acc += g42 * w42 * o42;
+    alpha += g42 * w42 * o42;
+    done = opaque ? done : (i + 43);
+    opaque = (alpha > 0.9);
+    float o43 = s43 * p.alphaMul;
+    float g43 = opaque ? 0.0 : 1.0;
+    float w43 = 1.0 - alpha;
+    acc += g43 * w43 * o43;
+    alpha += g43 * w43 * o43;
+    done = opaque ? done : (i + 44);
+    opaque = (alpha > 0.9);
+    float o44 = s44 * p.alphaMul;
+    float g44 = opaque ? 0.0 : 1.0;
+    float w44 = 1.0 - alpha;
+    acc += g44 * w44 * o44;
+    alpha += g44 * w44 * o44;
+    done = opaque ? done : (i + 45);
+    opaque = (alpha > 0.9);
+    float o45 = s45 * p.alphaMul;
+    float g45 = opaque ? 0.0 : 1.0;
+    float w45 = 1.0 - alpha;
+    acc += g45 * w45 * o45;
+    alpha += g45 * w45 * o45;
+    done = opaque ? done : (i + 46);
+    opaque = (alpha > 0.9);
+    float o46 = s46 * p.alphaMul;
+    float g46 = opaque ? 0.0 : 1.0;
+    float w46 = 1.0 - alpha;
+    acc += g46 * w46 * o46;
+    alpha += g46 * w46 * o46;
+    done = opaque ? done : (i + 47);
+    opaque = (alpha > 0.9);
+    float o47 = s47 * p.alphaMul;
+    float g47 = opaque ? 0.0 : 1.0;
+    float w47 = 1.0 - alpha;
+    acc += g47 * w47 * o47;
+    alpha += g47 * w47 * o47;
+    done = opaque ? done : (i + 48);
+    opaque = (alpha > 0.9);
+#endif
+    if (opaque) break;
+  }
+  // Scalar break-aware tail (harness style: per-sample breaks).
+  for (; i < stepsB; ++i) {
+    float s = vol.sample(smp, base + float(i) * d, level(0.0)).r;
+    float o = s * p.alphaMul;
+    float w = 1.0 - alpha;
+    acc += w * o;
+    alpha += w * o;
+    done = i + 1;
+    if (alpha > 0.9) break;
+  }
+#elif MARCH_VARIANT == 7
+  // V12: S29-style scheduling fix (PERFORMANCE_INVESTIGATION.md section 9).
+  // The bare single-loop march compiles to a schedule that serializes each
+  // 3-D linear fetch (0.42 ns/sample). Co-compiling >= 4 extra vol.sample
+  // calls in the same shader flips the backend to an overlapped schedule
+  // (0.06 ns/sample) without changing executed work. The dead path never runs
+  // (deadFlag is always 0), but the samples co-compile with the hot loop.
+  // S30_4 style: extra taps in an else path INSIDE the loop (the doc's
+  // "4 extra taps in an else path" structure that measured 5.86 ms).
+  for (int i = 0; i < steps; ++i) {
+    float s = vol.sample(smp, base + float(i) * d, level(0.0)).r;
+    float o = s * p.alphaMul;
+    float w = 1.0 - alpha;
+    acc += w * o;
+    alpha += w * o;
+    done = i + 1;
+    if (p.deadFlag != 0.0) {
+      float4 t0 = vol.sample(smp, base + float(i + 0) * d, level(0.0));
+      float4 t1 = vol.sample(smp, base + float(i + 1) * d, level(0.0));
+      float4 t2 = vol.sample(smp, base + float(i + 2) * d, level(0.0));
+      float4 t3 = vol.sample(smp, base + float(i + 3) * d, level(0.0));
+      acc += (t0.r + t1.r + t2.r + t3.r) * p.deadFlag;
+    }
+    if (alpha > 0.9) break;
+  }
+#elif MARCH_VARIANT == 12
+  // V17: binned-pass march (Experiment C). Four per-frame passes, each
+  // covering pixels whose previous-frame done is in (bucketLo, bucketHi]; all
+  // other pixels discard instantly. In-bucket pixels march exactly like V0 but
+  // capped at bucketCap (>= their true done in a static scene, so results are
+  // identical). Each pass also writes done to histTex (color(1), R16Unorm) so
+  // the bucket assignment refreshes every frame.
+  {
+    uint2 px = uint2(clamp(uint(in.uv.x * float(p.width)), 0u, uint(p.width) - 1u),
+                     clamp(uint(in.uv.y * float(p.height)), 0u, uint(p.height) - 1u));
+    float prevF = histTex.read(px).r;
+    int prevDone = int(prevF * 65535.0 + 0.5);
+    if (prevDone <= p.bucketLo || prevDone > p.bucketHi)
+    {
+      discard_fragment();
+      return MarchOut{ float4(0.0, 0.0, 0.0, 0.0), 0.0 };
+    }
+    const int capSteps = min(steps, p.bucketCap);
+    for (int i = 0; i < capSteps; ++i) {
+      float s = vol.sample(smp, base + float(i) * d).r;
+      float o = s * p.alphaMul;
+      float w = 1.0 - alpha;
+      acc += w * o;
+      alpha += w * o;
+      done = i + 1;
+      if (alpha > 0.9) break;
+    }
+    return MarchOut{ float4(acc / float(steps), float(done) / 255.0, 0.0, 1.0),
+                     float(done) / 65535.0 };
+  }
+#endif
+#if MARCH_VARIANT == 12
+  return MarchOut{ float4(acc / float(steps), float(done) / 255.0, 0.0, 1.0),
+                   float(done) / 65535.0 };
+#else
   return float4(acc / float(steps), float(done) / 255.0, 0.0, 1.0);
+#endif
+}
+
+// Shared march body used by the persistent compute kernel (V6). Identical
+// per-pixel work to V1: explicit level(0.0), divergent per-lane bound, opacity
+// early-exit.
+static float4 marchRay(texture3d<float, access::sample> vol,
+                       sampler smp,
+                       uint2 uv,
+                       constant Params& p) {
+  float2 fuv = float2(uv) / float2(p.width, p.height);
+  float2 ndc = fuv * 2.0 - 1.0;
+  float3 eye = float3(0.5, 0.5, -0.35);
+  float3 dir = normalize(float3(ndc * 2.5, 1.0));
+  float ca = cos(0.35), sa = sin(0.35);
+  dir = float3(ca * dir.x + sa * dir.z, dir.y, -sa * dir.x + ca * dir.z);
+  float3 inv = 1.0 / dir;
+  float3 t0 = (float3(0.0) - eye) * inv;
+  float3 t1 = (float3(1.0) - eye) * inv;
+  float tEnter = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
+  float tExit  = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
+  if (tExit <= 0.0 || tEnter >= tExit) {
+    return float4(0.0, 0.0, 0.0, 0.0);
+  }
+  int geomSteps = max(1, int(ceil((tExit - tEnter) / p.step)));
+  int steps = (p.mode == 1) ? min(geomSteps, p.fixedSteps) : geomSteps;
+  float3 base = eye + dir * (tEnter + 0.5 * p.step);
+  float3 d = dir * p.step;
+  float acc = 0.0;
+  float alpha = 0.0;
+  int done = 0;
+  for (int i = 0; i < steps; ++i) {
+    float s = vol.sample(smp, base + float(i) * d, level(0.0)).r;
+    float o = s * p.alphaMul;
+    float w = 1.0 - alpha;
+    acc += w * o;
+    alpha += w * o;
+    done = i + 1;
+    if (alpha > 0.9) break;
+  }
+  return float4(acc / float(steps), float(done) / 255.0, 0.0, 1.0);
+}
+
+// V6: persistent-threads kernel (Aila et al.). A fixed pool of threads pulls
+// CHUNK-sized work items off an atomic counter instead of one thread per
+// pixel. A ray that dies at step 10 immediately takes the next pixel instead
+// of padding to 283 — the SIMD divergence tax becomes idle-free work.
+// CHUNK is a function constant (default 256) so the harness can sweep it; it
+// MUST be a multiple of the threadgroup size so no thread idles in a chunk.
+constant uint kChunk [[function_constant(1)]];
+kernel void dvrPersistent(texture3d<float, access::sample> vol [[texture(0)]],
+                          texture2d<float, access::write> color [[texture(1)]],
+                          sampler smp [[sampler(0)]],
+                          device atomic_uint& nextWork [[buffer(0)]],
+                          constant Params& p [[buffer(1)]],
+                          uint tid [[thread_index_in_threadgroup]],
+                          uint tgSize [[threads_per_threadgroup]]) {
+  const uint CHUNK = kChunk;
+  threadgroup uint base;
+  while (true) {
+    if (tid == 0) {
+      base = atomic_fetch_add_explicit(&nextWork, CHUNK, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint b = base;
+    if (b >= (uint)p.nPixels) return;
+    for (uint i = tid; i < CHUNK; i += tgSize) {
+      uint pix = b + i;
+      if (pix >= (uint)p.nPixels) continue;
+      uint2 uv = uint2(pix % (uint)p.width, pix / (uint)p.width);
+      color.write(marchRay(vol, smp, uv, p), uv);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
+// V7 diagnostic: plain one-pixel-per-thread compute march, no atomics, no
+// persistent loop. Isolates whether compute texture marching itself is slow
+// or whether the persistent/atomic structure is the cost.
+kernel void dvrOneShot(texture3d<float, access::sample> vol [[texture(0)]],
+                       texture2d<float, access::write> color [[texture(1)]],
+                       sampler smp [[sampler(0)]],
+                       constant Params& p [[buffer(1)]],
+                       uint gid [[thread_position_in_grid]]) {
+  if (gid >= (uint)p.nPixels) return;
+  uint2 uv = uint2(gid % (uint)p.width, gid / (uint)p.width);
+  color.write(marchRay(vol, smp, uv, p), uv);
+}
+
+// V8 diagnostic: write-only one-shot, no texture reads at all. Floor cost of
+// compute dispatch + color.write at this resolution.
+kernel void dvrWriteOnly(texture2d<float, access::write> color [[texture(1)]],
+                         constant Params& p [[buffer(1)]],
+                         uint gid [[thread_position_in_grid]]) {
+  if (gid >= (uint)p.nPixels) return;
+  uint2 uv = uint2(gid % (uint)p.width, gid / (uint)p.width);
+  color.write(float4((float)gid / (float)p.nPixels, 0.5, 0.5, 1.0), uv);
+}
+
+// V10 diagnostic: tiled one-shot. One threadgroup per WxH screen tile (like
+// the tile-based fragment renderer), thread (i,j) covers the tile pixel. Tests
+// whether compute's 1D row mapping destroys volume L2 locality.
+kernel void dvrTiled(texture3d<float, access::sample> vol [[texture(0)]],
+                     texture2d<float, access::write> color [[texture(1)]],
+                     sampler smp [[sampler(0)]],
+                     constant Params& p [[buffer(1)]],
+                     uint2 tgid [[threadgroup_position_in_grid]],
+                     uint2 gtid [[thread_position_in_threadgroup]]) {
+  uint2 uv = uint2(tgid.x * (uint)p.tileW + gtid.x,
+                   tgid.y * (uint)p.tileH + gtid.y);
+  if (uv.x >= (uint)p.width || uv.y >= (uint)p.height) return;
+  color.write(marchRay(vol, smp, uv, p), uv);
+}
+
+// V11: tiled persistent-threads. One threadgroup per kTile x kTile screen
+// tile (volume L2 locality preserved), but the threadgroup has only
+// kComputeTG threads (1D). Threads steal work from a per-tile atomic counter,
+// so a thread whose ray dies at step 10 immediately grabs the next pixel in
+// the tile instead of padding to 283 -- the divergence waste (max/mean within
+// a SIMD group) is recovered while keeping texture access local.
+kernel void dvrTiledPersist(texture3d<float, access::sample> vol [[texture(0)]],
+                            texture2d<float, access::write> color [[texture(1)]],
+                            sampler smp [[sampler(0)]],
+                            constant Params& p [[buffer(1)]],
+                            uint2 tgid [[threadgroup_position_in_grid]],
+                            uint2 gtid [[thread_position_in_threadgroup]]) {
+  threadgroup atomic_uint base;
+  if (gtid.x == 0 && gtid.y == 0)
+    atomic_store_explicit(&base, 0, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint tileW = (uint)p.tileW, tileH = (uint)p.tileH;
+  const uint tileSize = tileW * tileH;
+  const uint2 origin = uint2(tgid.x * tileW, tgid.y * tileH);
+  while (true) {
+    const uint b = atomic_fetch_add_explicit(&base, 1, memory_order_relaxed);
+    if (b >= tileSize) return;
+    const uint2 uv = uint2(origin.x + b % tileW, origin.y + b / tileW);
+    if (uv.x >= (uint)p.width || uv.y >= (uint)p.height) continue;
+    color.write(marchRay(vol, smp, uv, p), uv);
+  }
+}
+
+// V9 diagnostic: march with the sample replaced by a constant (no texture
+// traffic). Isolates the texture-read cost from the loop/ALU cost.
+kernel void dvrNoTex(texture2d<float, access::write> color [[texture(1)]],
+                     constant Params& p [[buffer(1)]],
+                     uint gid [[thread_position_in_grid]]) {
+  if (gid >= (uint)p.nPixels) return;
+  uint2 uv = uint2(gid % (uint)p.width, gid / (uint)p.width);
+  float2 fuv = float2(uv) / float2(p.width, p.height);
+  float2 ndc = fuv * 2.0 - 1.0;
+  float3 eye = float3(0.5, 0.5, -0.35);
+  float3 dir = normalize(float3(ndc * 2.5, 1.0));
+  float ca = cos(0.35), sa = sin(0.35);
+  dir = float3(ca * dir.x + sa * dir.z, dir.y, -sa * dir.x + ca * dir.z);
+  float3 inv = 1.0 / dir;
+  float3 t0 = (float3(0.0) - eye) * inv;
+  float3 t1 = (float3(1.0) - eye) * inv;
+  float tEnter = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
+  float tExit  = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
+  int geomSteps = (tExit > 0.0 && tEnter < tExit)
+    ? max(1, int(ceil((tExit - tEnter) / p.step))) : 1;
+  int steps = (p.mode == 1) ? min(geomSteps, p.fixedSteps) : geomSteps;
+  float3 base = eye + dir * (tEnter + 0.5 * p.step);
+  float3 d = dir * p.step;
+  float acc = 0.0;
+  float alpha = 0.0;
+  int done = 0;
+  for (int i = 0; i < steps; ++i) {
+    float s = 0.5; // constant instead of vol.sample
+    float o = s * p.alphaMul;
+    float w = 1.0 - alpha;
+    acc += w * o;
+    alpha += w * o;
+    done = i + 1;
+    if (alpha > 0.9) break;
+  }
+  color.write(float4(acc / float(steps), float(done) / 255.0, 0.0, 1.0), uv);
 }
 )";
 
@@ -581,9 +1323,15 @@ struct MetalState
   id<MTLDevice> dev = nil;
   id<MTLCommandQueue> q = nil;
   std::vector<id<MTLRenderPipelineState>> ps; // one per march variant (0..4)
+  id<MTLComputePipelineState> cps = nil;      // persistent kernel (variant 5)
+  id<MTLComputePipelineState> cpsOneShot = nil; // diagnostic one-shot kernel
+  id<MTLComputePipelineState> cpsWriteOnly = nil; // no-read floor diagnostic
+  id<MTLComputePipelineState> cpsNoTex = nil; // march-without-texture diagnostic
+  id<MTLComputePipelineState> cpsTiled = nil; // tiled one-shot diagnostic
+  id<MTLComputePipelineState> cpsTiledPersist = nil; // tiled persistent-threads
   id<MTLSamplerState> smp = nil;
-  id<MTLTexture> volTex = nil, colorTex = nil;
-  id<MTLBuffer> vbuf = nil;
+  id<MTLTexture> volTex = nil, colorTex = nil, histTex[2] = {nil, nil};
+  id<MTLBuffer> vbuf = nil, workBuf = nil;    // atomic work counter (compute)
 };
 
 static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol, int kMax)
@@ -598,7 +1346,7 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol, int kMax)
 
   // One library per variant: MARCH_VARIANT is baked in as a preprocessor macro
   // so each PSO gets the exact code shape we want to measure.
-  const int nVariants = 6;
+  const int nVariants = 13;
   for (int v = 0; v < nVariants; ++v)
   {
     NSError* err = nil;
@@ -633,6 +1381,10 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol, int kMax)
     pd.vertexFunction = vs;
     pd.fragmentFunction = fs;
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    if (v == 12)
+    {
+      pd.colorAttachments[1].pixelFormat = MTLPixelFormatR16Unorm;
+    }
     id<MTLRenderPipelineState> p = [s.dev newRenderPipelineStateWithDescriptor:pd error:&err];
     if (!p)
     {
@@ -641,6 +1393,71 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol, int kMax)
       return false;
     }
     s.ps.push_back(p);
+  }
+
+  // Compute pipeline for the persistent-threads variant (built from the
+  // variant-5 library, which still contains the kernel).
+  {
+    NSError* err = nil;
+    MTLCompileOptions* copts = [[MTLCompileOptions alloc] init];
+    copts.preprocessorMacros = @{ @"MARCH_VARIANT" : @(5) };
+    id<MTLLibrary> lib = [s.dev newLibraryWithSource:kMetalSrc options:copts error:&err];
+    if (!lib)
+    {
+      std::fprintf(stderr, "Metal: library compile failed for compute: %s\n",
+        err.localizedDescription.UTF8String);
+      return false;
+    }
+    id<MTLFunction> kf = nil;
+    {
+      MTLFunctionConstantValues* cv = [[MTLFunctionConstantValues alloc] init];
+      int c = kChunk;
+      [cv setConstantValue:&c type:MTLDataTypeUInt atIndex:1];
+      kf = [lib newFunctionWithName:@"dvrPersistent" constantValues:cv error:&err];
+    }
+    if (!kf)
+    {
+      std::fprintf(stderr, "Metal: no dvrPersistent kernel: %s\n",
+        err.localizedDescription.UTF8String);
+      return false;
+    }
+    s.cps = [s.dev newComputePipelineStateWithFunction:kf error:&err];
+    if (!s.cps)
+    {
+      std::fprintf(stderr, "Metal: compute pipeline failed: %s\n",
+        err.localizedDescription.UTF8String);
+      return false;
+    }
+    id<MTLFunction> kf2 = [lib newFunctionWithName:@"dvrOneShot"];
+    if (!kf2)
+    {
+      std::fprintf(stderr, "Metal: no dvrOneShot kernel\n");
+      return false;
+    }
+    s.cpsOneShot = [s.dev newComputePipelineStateWithFunction:kf2 error:&err];
+    if (!s.cpsOneShot)
+    {
+      std::fprintf(stderr, "Metal: one-shot pipeline failed: %s\n",
+        err.localizedDescription.UTF8String);
+      return false;
+    }
+    for (const char* name : { "dvrWriteOnly", "dvrNoTex", "dvrTiled", "dvrTiledPersist" })
+    {
+      NSString* nsName = [NSString stringWithUTF8String:name];
+      id<MTLFunction> kf3 = [lib newFunctionWithName:nsName];
+      id<MTLComputePipelineState> p3 =
+        [s.dev newComputePipelineStateWithFunction:kf3 error:&err];
+      if (!p3)
+      {
+        std::fprintf(stderr, "Metal: %s pipeline failed: %s\n", name,
+          err.localizedDescription.UTF8String);
+        return false;
+      }
+      if (strcmp(name, "dvrWriteOnly") == 0) s.cpsWriteOnly = p3;
+      else if (strcmp(name, "dvrNoTex") == 0) s.cpsNoTex = p3;
+      else if (strcmp(name, "dvrTiled") == 0) s.cpsTiled = p3;
+      else s.cpsTiledPersist = p3;
+    }
   }
 
   MTLSamplerDescriptor* sd = [[MTLSamplerDescriptor alloc] init];
@@ -666,10 +1483,24 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol, int kMax)
     [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
       width:kRT height:kRT mipmapped:NO];
   rt.storageMode = MTLStorageModePrivate;
+  rt.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite;
   s.colorTex = [s.dev newTextureWithDescriptor:rt];
+  // Per-frame done history for the binned-pass variant (V17): R16Unorm, exact
+  // done values (0..283) read via texture.read in the binned fragment.
+  MTLTextureDescriptor* ht =
+    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Unorm
+      width:kRT height:kRT mipmapped:NO];
+  ht.storageMode = MTLStorageModePrivate;
+  ht.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+  s.histTex[0] = [s.dev newTextureWithDescriptor:ht];
+  s.histTex[1] = [s.dev newTextureWithDescriptor:ht];
 
   const float tri[] = { -1.f, -1.f, 3.f, -1.f, -1.f, 3.f };
   s.vbuf = [s.dev newBufferWithBytes:tri length:sizeof(tri) options:MTLResourceStorageModeShared];
+
+  // Atomic work counter for the persistent kernel. Initialized to 0.
+  s.workBuf = [s.dev newBufferWithLength:4 options:MTLResourceStorageModeShared];
+  memset(s.workBuf.contents, 0, 4);
 
   id<MTLBuffer> upload = [s.dev newBufferWithBytes:vol.data()
     length:(NSUInteger)(vol.size()) options:MTLResourceStorageModeShared];
@@ -688,6 +1519,357 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol, int kMax)
 
 static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
 {
+  struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; } params =
+    { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, -1, 0 };
+  if (variant == 17)
+  {
+    // V17: binned-pass march (Experiment C). Per-frame 4 passes, each covering
+    // pixels whose previous-frame done fell in (bucketLo, bucketHi]; the march
+    // is capped at bucketCap (>= the true done, so results are identical to the
+    // single-pass baseline). Bucket caps are quartiles of the done histogram,
+    // computed once per mode from a full-cap bucket-build frame readback.
+    static int bCaps[2][3] = {{0, 0, 0}, {0, 0, 0}};
+    static bool bReady[2] = {false, false};
+    const int m = (mode == 1) ? 1 : 0;
+    if (!bReady[m])
+    {
+      // Bucket-build frame: one full-cap binned pass (cap 1e6, covers every
+      // pixel, identical output to the baseline) that also fills histTex[0].
+      struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; } bp =
+        { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, 100000, 100000 };
+      MTLRenderPassDescriptor* rb = [[MTLRenderPassDescriptor alloc] init];
+      rb.colorAttachments[0].texture = s.colorTex;
+      rb.colorAttachments[0].loadAction = MTLLoadActionClear;
+      rb.colorAttachments[0].storeAction = MTLStoreActionStore;
+      rb.colorAttachments[1].texture = s.histTex[0];
+      rb.colorAttachments[1].loadAction = MTLLoadActionClear;
+      rb.colorAttachments[1].storeAction = MTLStoreActionStore;
+      id<MTLCommandBuffer> cbb = [s.q commandBuffer];
+      id<MTLRenderCommandEncoder> eb = [cbb renderCommandEncoderWithDescriptor:rb];
+      [eb setRenderPipelineState:s.ps[12]];
+      [eb setVertexBuffer:s.vbuf offset:0 atIndex:0];
+      [eb setFragmentTexture:s.volTex atIndex:0];
+      [eb setFragmentTexture:s.histTex[0] atIndex:1];
+      [eb setFragmentSamplerState:s.smp atIndex:0];
+      [eb setFragmentBytes:&bp length:sizeof(bp) atIndex:0];
+      [eb drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [eb endEncoding];
+      [cbb commit];
+      [cbb waitUntilCompleted];
+      // Read back histTex[0] (R16Unorm): exact done per covered pixel.
+      id<MTLBuffer> staging =
+        [s.dev newBufferWithLength:(NSUInteger)kRT * kRT * 2 options:MTLResourceStorageModeShared];
+      id<MTLCommandBuffer> cbh = [s.q commandBuffer];
+      id<MTLBlitCommandEncoder> blh = [cbh blitCommandEncoder];
+      [blh copyFromTexture:s.histTex[0] sourceSlice:0 sourceLevel:0
+        sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(kRT, kRT, 1)
+        toBuffer:staging destinationOffset:0 destinationBytesPerRow:(NSUInteger)kRT * 2
+        destinationBytesPerImage:(NSUInteger)kRT * kRT * 2];
+      [blh endEncoding];
+      [cbh commit];
+      [cbh waitUntilCompleted];
+      const unsigned char* px = (const unsigned char*)staging.contents;
+      uint64_t hist[512] = {0};
+      long long cov = 0;
+      for (size_t i = 0; i < (size_t)kRT * kRT * 2; i += 2)
+      {
+        uint16_t v = (uint16_t)(px[i] | (px[i + 1] << 8));
+        int done = (int)((double)v * 65535.0 / 65535.0 + 0.5);
+        if (v > 0) { ++cov; if (done < 512) ++hist[done]; }
+      }
+      int caps[3];
+      for (int q = 0; q < 3; ++q)
+      {
+        const uint64_t target = (uint64_t)((double)cov * (double)(q + 1) / 4.0);
+        uint64_t acc = 0;
+        int d = 1;
+        for (; d < 512; ++d)
+        {
+          acc += hist[d];
+          if (acc >= target) break;
+        }
+        caps[q] = (d < 512) ? d : 512;
+      }
+      bCaps[m][0] = caps[0];
+      bCaps[m][1] = caps[1];
+      bCaps[m][2] = caps[2];
+      bReady[m] = true;
+      fprintf(stderr, "V17 mode=%d bucket caps %d %d %d (cov %lld)\n",
+        mode, caps[0], caps[1], caps[2], cov);
+    }
+    // Binning only pays when the done histogram is strongly bimodal: the 25th
+    // percentile cap must be <= half the 75th percentile (so the short buckets
+    // actually truncate warps), and the uncapped long bucket must not absorb
+    // most of the pixels. Otherwise (fine SD, uniform-ish marches) fall back to
+    // a single baseline pass — binning would only add pass overhead.
+    const bool useBinned = (mode == 0) &&
+      (bCaps[m][0] <= bCaps[m][2] / 2) && (bCaps[m][2] - bCaps[m][0] >= 16);
+    if (!useBinned)
+    {
+      struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; } bp =
+        { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, -1, 0 };
+      MTLRenderPassDescriptor* rps = [[MTLRenderPassDescriptor alloc] init];
+      rps.colorAttachments[0].texture = s.colorTex;
+      rps.colorAttachments[0].loadAction = (kHarness == 1) ? MTLLoadActionClear : MTLLoadActionDontCare;
+      rps.colorAttachments[0].storeAction = MTLStoreActionStore;
+      auto runSingle = [&]() {
+        id<MTLCommandBuffer> cb = [s.q commandBuffer];
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rps];
+        [enc setRenderPipelineState:s.ps[0]];
+        [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
+        [enc setFragmentTexture:s.volTex atIndex:0];
+        [enc setFragmentSamplerState:s.smp atIndex:0];
+        [enc setFragmentBytes:&bp length:sizeof(bp) atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+      };
+      for (int i = 0; i < kWarmup; ++i)
+      {
+        runSingle();
+      }
+      if (kHarness == 1)
+      {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < kFrames; ++i)
+        {
+          runSingle();
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(t1 - t0).count() / kFrames;
+      }
+      double total = 0;
+      for (int i = 0; i < kFrames; ++i)
+      {
+        id<MTLCommandBuffer> cb = [s.q commandBuffer];
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rps];
+        [enc setRenderPipelineState:s.ps[0]];
+        [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
+        [enc setFragmentTexture:s.volTex atIndex:0];
+        [enc setFragmentSamplerState:s.smp atIndex:0];
+        [enc setFragmentBytes:&bp length:sizeof(bp) atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        total += cb.GPUEndTime - cb.GPUStartTime;
+      }
+      return total / kFrames * 1000.0;
+    }
+    // Four passes per frame. Pass p covers prevDone in (lo_p, hi_p], cap_p.
+    struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; }
+      passP[4] = {
+        { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, bCaps[m][0], bCaps[m][0] },
+        { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][0], bCaps[m][1], bCaps[m][1] },
+        { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][1], bCaps[m][2], bCaps[m][2] },
+        { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][2], 100000, 100000 },
+      };
+    // histTex is double-buffered: each frame reads the previous frame's done
+    // (readTex) while writing its own (writeTex); no read/write hazard.
+    id<MTLTexture> readTex = s.histTex[0];
+    id<MTLTexture> writeTex = s.histTex[1];
+    auto runBinned = [&]() {
+      for (int p = 0; p < 4; ++p)
+      {
+        MTLRenderPassDescriptor* rpb = [[MTLRenderPassDescriptor alloc] init];
+        rpb.colorAttachments[0].texture = s.colorTex;
+        rpb.colorAttachments[0].loadAction = (p == 0) ? MTLLoadActionClear : MTLLoadActionLoad;
+        rpb.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rpb.colorAttachments[1].texture = writeTex;
+        rpb.colorAttachments[1].loadAction = (p == 0) ? MTLLoadActionClear : MTLLoadActionLoad;
+        rpb.colorAttachments[1].storeAction = MTLStoreActionStore;
+        id<MTLCommandBuffer> cb = [s.q commandBuffer];
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpb];
+        [enc setRenderPipelineState:s.ps[12]];
+        [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
+        [enc setFragmentTexture:s.volTex atIndex:0];
+        [enc setFragmentTexture:readTex atIndex:1];
+        [enc setFragmentSamplerState:s.smp atIndex:0];
+        [enc setFragmentBytes:&passP[p] length:sizeof(passP[p]) atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+      }
+      id<MTLTexture> t = readTex;
+      readTex = writeTex;
+      writeTex = t;
+    };
+    for (int i = 0; i < kWarmup; ++i)
+    {
+      runBinned();
+    }
+    if (kHarness == 1)
+    {
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < kFrames; ++i)
+      {
+        runBinned();
+      }
+      const auto t1 = std::chrono::steady_clock::now();
+      return std::chrono::duration<double, std::milli>(t1 - t0).count() / kFrames;
+    }
+    // Per-frame GPU timestamps: time the 4-pass command buffer chain.
+    double gtotal = 0;
+    for (int i = 0; i < kFrames; ++i)
+    {
+      id<MTLCommandBuffer> cb = [s.q commandBuffer];
+      for (int p = 0; p < 4; ++p)
+      {
+        MTLRenderPassDescriptor* rpb = [[MTLRenderPassDescriptor alloc] init];
+        rpb.colorAttachments[0].texture = s.colorTex;
+        rpb.colorAttachments[0].loadAction = (p == 0) ? MTLLoadActionClear : MTLLoadActionLoad;
+        rpb.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rpb.colorAttachments[1].texture = writeTex;
+        rpb.colorAttachments[1].loadAction = (p == 0) ? MTLLoadActionClear : MTLLoadActionLoad;
+        rpb.colorAttachments[1].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpb];
+        [enc setRenderPipelineState:s.ps[12]];
+        [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
+        [enc setFragmentTexture:s.volTex atIndex:0];
+        [enc setFragmentTexture:readTex atIndex:1];
+        [enc setFragmentSamplerState:s.smp atIndex:0];
+        [enc setFragmentBytes:&passP[p] length:sizeof(passP[p]) atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding];
+      }
+      [cb commit];
+      [cb waitUntilCompleted];
+      gtotal += cb.GPUEndTime - cb.GPUStartTime;
+      id<MTLTexture> t = readTex;
+      readTex = writeTex;
+      writeTex = t;
+    }
+    return gtotal / kFrames * 1000.0;
+  }
+  if (variant >= 6 && variant <= 11)
+  {
+    // Compute dispatches:
+    //  V6 persistent-threads over global atomic chunks
+    //  V7 one-shot: one thread per pixel, full march (texture)
+    //  V8 write-only: floor cost of dispatch + color.write
+    //  V9 no-tex march: ALU/loop cost without texture traffic
+    //  V10 tiled one-shot: 32x32 threadgroup tiles, tests volume L2 locality
+    //  V11 tiled persistent: tile-locality + per-tile work stealing
+    id<MTLComputePipelineState> cps = nil;
+    switch (variant)
+    {
+      case 6: cps = s.cps; break;
+      case 7: cps = s.cpsOneShot; break;
+      case 8: cps = s.cpsWriteOnly; break;
+      case 9: cps = s.cpsNoTex; break;
+      case 10: cps = s.cpsTiled; break;
+      case 11: cps = s.cpsTiledPersist; break;
+    }
+    const bool persistent = (variant == 6);
+    const bool tiled = (variant == 10 || variant == 11);
+    const bool tiledPersist = (variant == 11);
+    const NSUInteger tileW = (NSUInteger)kTile, tileH = (NSUInteger)kTile;
+    auto run = [&]() {
+      memset(s.workBuf.contents, 0, 4);
+      id<MTLCommandBuffer> cb = [s.q commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:cps];
+      [enc setTexture:s.volTex atIndex:0];
+      [enc setTexture:s.colorTex atIndex:1];
+      [enc setSamplerState:s.smp atIndex:0];
+      [enc setBytes:&params length:sizeof(params) atIndex:1];
+      [enc setBuffer:s.workBuf offset:0 atIndex:0];
+      if (persistent)
+      {
+        // Persistent: fill the GPU with a fixed pool, each looping on chunks.
+        const NSUInteger tgSize = (NSUInteger)kComputeTG;
+        const NSUInteger tgs = kComputeGroups > 0 ? (NSUInteger)kComputeGroups : s.dev.maxThreadsPerThreadgroup.width * 8 / tgSize;
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+      }
+      else if (tiled)
+      {
+        // One threadgroup per screen tile. V10: thread (i,j) covers tile pixel
+        // (threadgroup = tile x tile). V11: kComputeTG threads (1D) steal work
+        // from a per-tile atomic counter.
+        const NSUInteger gx = ((NSUInteger)kRT + tileW - 1) / tileW;
+        const NSUInteger gy = ((NSUInteger)kRT + tileH - 1) / tileH;
+        if (tiledPersist)
+          [enc dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
+            threadsPerThreadgroup:MTLSizeMake((NSUInteger)kComputeTG, 1, 1)];
+        else
+          [enc dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
+            threadsPerThreadgroup:MTLSizeMake(tileW, tileH, 1)];
+      }
+      else
+      {
+        // Full grid: one thread per pixel.
+        const NSUInteger tgSize = (NSUInteger)kComputeTG;
+        const NSUInteger threads = (NSUInteger)kRT * kRT;
+        const NSUInteger tgs = (threads + tgSize - 1) / tgSize;
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+      }
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+    };
+    for (int i = 0; i < kWarmup; ++i)
+    {
+      run();
+    }
+    if (kHarness == 1)
+    {
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < kFrames; ++i)
+      {
+        run();
+      }
+      const auto t1 = std::chrono::steady_clock::now();
+      return std::chrono::duration<double, std::milli>(t1 - t0).count() / kFrames;
+    }
+    double total = 0;
+    for (int i = 0; i < kFrames; ++i)
+    {
+      id<MTLCommandBuffer> cb = [s.q commandBuffer];
+      memset(s.workBuf.contents, 0, 4);
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:cps];
+      [enc setTexture:s.volTex atIndex:0];
+      [enc setTexture:s.colorTex atIndex:1];
+      [enc setSamplerState:s.smp atIndex:0];
+      [enc setBytes:&params length:sizeof(params) atIndex:1];
+      [enc setBuffer:s.workBuf offset:0 atIndex:0];
+      if (persistent)
+      {
+        const NSUInteger tgSize = (NSUInteger)kComputeTG;
+        const NSUInteger tgs = kComputeGroups > 0 ? (NSUInteger)kComputeGroups : s.dev.maxThreadsPerThreadgroup.width * 8 / tgSize;
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+      }
+      else if (tiled)
+      {
+        const NSUInteger gx = ((NSUInteger)kRT + tileW - 1) / tileW;
+        const NSUInteger gy = ((NSUInteger)kRT + tileH - 1) / tileH;
+        if (tiledPersist)
+          [enc dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
+            threadsPerThreadgroup:MTLSizeMake((NSUInteger)kComputeTG, 1, 1)];
+        else
+          [enc dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
+            threadsPerThreadgroup:MTLSizeMake(tileW, tileH, 1)];
+      }
+      else
+      {
+        const NSUInteger tgSize = (NSUInteger)kComputeTG;
+        const NSUInteger threads = (NSUInteger)kRT * kRT;
+        const NSUInteger tgs = (threads + tgSize - 1) / tgSize;
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+      }
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      total += cb.GPUEndTime - cb.GPUStartTime;
+    }
+    return total / kFrames * 1000.0;
+  }
   MTLRenderPassDescriptor* rpd = [[MTLRenderPassDescriptor alloc] init];
   rpd.colorAttachments[0].texture = s.colorTex;
   // DontCare, not Clear, in the fair harness: the shader writes every pixel
@@ -696,11 +1878,10 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
   rpd.colorAttachments[0].loadAction = (kHarness == 1) ? MTLLoadActionClear : MTLLoadActionDontCare;
   rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
 
-  struct { int mode, fixedSteps; float step, alphaMul; } params = { mode, fixedSteps, kStep, kAlphaMul };
   auto run = [&]() {
     id<MTLCommandBuffer> cb = [s.q commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
-    [enc setRenderPipelineState:s.ps[variant]];
+    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : variant]];
     [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
     [enc setFragmentTexture:s.volTex atIndex:0];
     [enc setFragmentSamplerState:s.smp atIndex:0];
@@ -731,7 +1912,7 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
   {
     id<MTLCommandBuffer> cb = [s.q commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
-    [enc setRenderPipelineState:s.ps[variant]];
+    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : variant]];
     [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
     [enc setFragmentTexture:s.volTex atIndex:0];
     [enc setFragmentSamplerState:s.smp atIndex:0];
@@ -785,6 +1966,10 @@ int main(int argc, char** argv)
   if (argc > 8) kOptContents = (BOOL)std::atoi(argv[8]);
   if (argc > 9) kMaxConstant = std::atoi(argv[9]);
   if (argc > 10) kHarness = std::atoi(argv[10]);
+  if (argc > 11) kChunk = std::atoi(argv[11]);
+  if (argc > 12) kComputeTG = std::atoi(argv[12]);
+  if (argc > 13) kComputeGroups = std::atoi(argv[13]);
+  if (argc > 14) kTile = std::atoi(argv[14]);
 
   // CPU-simulate the same geometry to get the frame-mean step count (the
   // "fixed" mode runs every hit pixel at this count, so total work matches the
@@ -836,8 +2021,20 @@ int main(int argc, char** argv)
     "V3 +group exit    ",
     "V4 kMax=288 const ",
     "V5 chunked reconv  ",
+    "V6 persistent comp ",
+    "V7 one-shot diag  ",
+    "V8 write-only    ",
+    "V9 no-tex march  ",
+    "V10 tiled one-shot",
+    "V11 tiled persist ",
+    "V12 S29 sched fix ",
+    "V13 mv9 batch-8  ",
+    "V14 batch-16     ",
+    "V15 batch-32     ",
+    "V16 batch-48     ",
+    "V17 binned-4pass ",
   };
-  for (int v = 0; v < 6; ++v)
+  for (int v = 0; v < 18; ++v)
   {
     const int useLod = (v >= 1) ? 1 : 0; // GL: implicit until V1, explicit after
     // Interleave the two modes within each backend to cancel drift, and the two

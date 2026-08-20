@@ -66,6 +66,13 @@ parity is exact across every variant):
 | V3      | V2 + `if (!simd_any(alive)) break` whole-group exit |
 | V4      | compile-time ceiling `kMax=288` function constant, `[[unroll(1)]]` |
 | V5      | 32-step chunks, per-chunk `simd_max` bound + group exit |
+| V6      | persistent-threads compute kernel (falsified, disabled) |
+| V7      | discard-fragment dead-ray head (S29, disabled)       |
+| V8-11   | v34-exact batched march, 1 break per batch, batch 8/16/32/48 (latch-guarded consume) |
+| V12     | S29 dead-path (disabled)                             |
+| V13     | batch-8 (renumbered V8)                              |
+| V14-16  | batch-16/32/48 (renumbered V9-11)                    |
+| V17     | **binned-4pass**: 4 capped passes over last-frame done quartiles |
 
 GL is compared honestly: two separately compiled fragment programs (implicit
 `texture()` for V0, baked-in `textureLod(...,0.0)` for V1-V5) so the fetch
@@ -116,9 +123,85 @@ Findings:
    tracks the per-lane trip-count distribution (mean 83.4, max 283) and
    resolution, exactly as the app's decomposition found.
 
+## Evaluation (batch sweep V8-11, v34-exact batched march)
+
+Rewriting the march to the app's mv9 shape (all 8 positions computed first,
+8 back-to-back fetches, ONE `break` per batch, strict `i+8<=steps` batches,
+scalar break-aware tail) does NOT close the gap at the reference cell and
+regresses at 2048:
+
+```
+                    divergent GL  Metal  M/GL   |  fixed GL  Metal  M/GL
+V0  baseline          17.33  20.03  1.16  |   4.04   4.75  1.18   (1024)
+V13 batch-8           17.23  18.48  1.07  |   4.51   4.93  1.09   (1024)
+V14 batch-16          17.25  19.23  1.11  |   4.69   5.31  1.13   (1024)
+V15 batch-32          17.33  20.20  1.17  |   4.74   5.75  1.21   (1024)
+V16 batch-48          17.27  21.24  1.23  |   4.82   6.16  1.28   (1024)
+V0  baseline          28.99  30.88  1.07  |   5.47   5.82  1.06   (2048)
+V13 batch-8           27.16  31.68  1.17  |   5.47   6.27  1.15   (2048)
+V14 batch-16          27.16  33.44  1.23  |   5.47   6.66  1.22   (2048)
+V15 batch-32          27.16  34.41  1.27  |   5.47   7.41  1.36   (2048)
+V16 batch-48          27.16  35.23  1.30  |   5.47   8.16  1.49   (2048)
+```
+
+Wider batches are monotonically worse at 2048 (the harness is already
+latency/bandwidth-bound there: ~0.19 ns/sample Metal vs ~0.17 GL, versus
+~2 ns/sample in the low-occupancy 400x400 metal_gap case where the 8x
+unroll wins 1.46x). Batch-8 helps a bit at 1024 (1.07) but loses at 2048
+(1.17). Branch-free select-gated consumes do not change this: batching
+itself, not branchiness, is the problem at high occupancy. At fine SD
+(0.0005, 2048) batch-8 wins 1.05 vs baseline 1.13 — mirroring the app's
+fine-SD mv9 wins — so batching helps only where warps are NOT already
+latency-bound.
+
+MSL gotcha discovered during the sweep: unused batch lanes are NOT
+dead-code-eliminated when their samples are guarded by runtime uniforms —
+all 48 lanes stayed live and time scaled as 48/width (92.8/46.3/23.5/21.2
+ms for batch 8/16/32/48). Batch variants must be compiled with `#if`
+per width.
+
+## V17: binned passes FIX the divergent gap (M/GL 0.64-0.65)
+
+The structural fix (Experiment C): a frame-hint binned march. One
+"bucket-build" frame renders a full-cap pass (MARCH_VARIANT 12) with two
+MRT attachments — color + an R16Unorm "done histogram" texture — then a
+CPU readback splits the done histogram into quartile caps (e.g. 41/65/114
+at SD4). Each subsequent frame renders 4 passes; pass p keeps only pixels
+whose previous-frame done fell in bucket p (`discard_fragment()` for the
+rest) and caps its march at the bucket's quartile (`min(steps, cap)` —
+never binds, so output is bit-identical; the win is SIMT grouping: every
+lane in a pass terminates at or before the same cap). The histogram
+texture is double-buffered (read prev frame, write cur frame) to avoid the
+render-target/read hazard.
+
+```
+                    divergent GL  Metal  M/GL   |  fixed GL  Metal  M/GL
+V0  baseline          17.33  20.03  1.16  |   4.04   4.75  1.18   (1024)
+V17 binned-4pass      17.22  11.21  0.65  |   4.06   4.57  1.13   (1024)
+V0  baseline          28.99  30.88  1.07  |   5.47   5.82  1.06   (2048)
+V17 binned-4pass      27.17  17.54  0.65  |   5.46   5.83  1.07   (2048)
+```
+
+Parity stays exact (cov 1912652/83.4 GL vs 1912192/83.5 Metal, fixed
+60.0/60.1). This is the first harness variant that beats GL on the
+divergent (app-reflecting) cell — Metal 35% faster. The binning is gated
+adaptively: it only engages when the done histogram is strongly bimodal
+(25th-percentile cap <= half the 75th, spread >= 16). At fine SD the
+distribution is broad (caps 321/512/512 at SD0.5) and the fallback runs
+the single baseline pass (SD0.5 divergent 1.15 vs baseline 1.13, no
+regression).
+
+Caveat: the pass union requires discarded pixels to leave the target
+untouched — writing `{0,0,0,0}` instead of `discard_fragment()` clobbers
+other passes' pixels (caught by the parity readback: cov dropped to ~1/4).
+The binned variant is a harness-level result; transferring it to the app
+is the next step.
+
 ## Key controls
 
 - **alphaMul**: opacity-curve steepness; sets where the data-dependent
+  break fires. Keep it high enough that some rays break early and others
+  run the full geometric length.
   break fires. Keep it high enough that some rays break early and others
   run the full geometric length.
 - **fixedOverride**: cap for the fixed mode. 0 = frame geometric mean
