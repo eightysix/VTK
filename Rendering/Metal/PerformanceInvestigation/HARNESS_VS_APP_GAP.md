@@ -388,6 +388,69 @@ The cap did not bite — MARCH_STEPS is dead on GL. The fixed-steps data in
 
 Full data in `JITTER_DUMP.txt`.
 
+## 10. App Metal sample-count PPMs — real mapper, not harness (2026-08-20)
+
+The harness Metal iter PPM (§9.5-style, `jitter_gap_repro` `GL_ITER`) showed
+the same trip counts as GL, but that only proves the *harness* shader. To
+answer "does the real Metal mapper march more samples?" the production shader
+was instrumented:
+
+- `MetalShaders.metal`: `marchIter` counter in `fragment_volume_main` (variant-0
+  march), captured at the loop's end; when the `_padCropFlags[0]` uniform flag
+  is set (`METAL_ITER=1` env → `vtkMetalGPUVolumeRayCastMapper.mm:7055`), the
+  fragment returns `half4(marchIter/256, 0, 0, 1)` instead of the final color.
+  One int add per iteration in all pipelines; output gated by the flag.
+- `xcrun -sdk macosx metal -c` compiles the edited shader clean.
+- App command (same target config as §6.5, `JITTER=0|1`):
+
+```
+VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 \
+VTK_METAL_TEST_MINMAX=0 VTK_METAL_TEST_ACCEL=0 VTK_METAL_TEST_NUM_SLABS=1 \
+VTK_METAL_TEST_JITTER=0|1 VTK_METAL_TEST_IGN_JITTER=0 \
+METAL_ITER=1 build_macos_metal/bin/vtkMetalGLVisualComparison \
+  --bench --backend metal --scene DICOMVolume \
+  --dicom /Users/macair/Public/IMR/CTIMR/IMRToraceAddome \
+  --frames 5 --reps 1 --size 1024x1024
+```
+
+(GL side: same invocation with `--backend gl` + `VTK_METAL_TEST_GL_ITER=1`,
+writes `/tmp/app_gl_iter.ppm`.)
+
+### 10.1 Results (1024x1024, SD4, minmax/accel off, slabs=1)
+
+| | Covered px | % total | Mean iter | Median | P95 | Max |
+|---|---|---|---|---|---|---|
+| App GL j0 | 421,828 | 40.2% | 86.5 | 80.3 | 192.8 | 225 |
+| App GL j1 | 423,564 | 40.4% | 86.7 | 80.3 | 192.8 | — |
+| App Metal j0 | 457,876 | 43.7% | **81.1** | **72.3** | 187.7 | 222 |
+| App Metal j1 | 457,876 | 43.7% | 81.6 | 72.3 | 187.7 | 223 |
+
+### 10.2 Findings
+
+1. **Metal does NOT march more samples than GL — it marches fewer.** Mean 81.1
+   vs 86.5 (−5.4), median 72.3 vs 80.3 (−8). The 1.68-2.48x jitter Δ gap is
+   NOT a trip-count difference in the real mapper either. Per-sample cost is
+   the whole story (consistent with §9.4 on GL; now proven on Metal directly).
+
+2. **Jitter does not change Metal's trip count** (j0/j1 identical, same as GL
+   §9.2). j1 mean 81.6 vs j0 81.1 — the phase scatter costs $/sample, not
+   iterations.
+
+3. **Metal renders ~36K extra pixels GL discards** (43.7% vs 40.2% coverage).
+   All in the 0-16 iter bin (57,128 px vs 0): grazing rays through proxy
+   corners/edges with 1-16 samples. GL's ray-box setup rejects these
+   (discard/early-out); Metal's variant-0 march runs them. Negligible time
+   (short rays) but a real geometric divergence — worth checking if
+   `tEnter >= tExit` handling or the proxy-box CTP test differs (H1/H4 side
+   effect, not the jitter story).
+
+4. **Harness verdict holds in-app**: the harness's "same trip count" was not a
+   harness artifact. The equal-field harness correctly predicted the app's
+   per-sample jitter cost model; its GL-side over-charge (§2) remains the only
+   discrepancy.
+
+Full data: `JITTER_DUMP.txt` (app GL), this section (app Metal).
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).

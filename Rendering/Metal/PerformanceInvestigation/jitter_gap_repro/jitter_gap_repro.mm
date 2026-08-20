@@ -204,6 +204,7 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
     "uniform int uMaxIter;\n"
     "uniform int uJitter;\n"
     "uniform int uProbeRast;\n"
+    "uniform int uDebugIter;\n"
     "void main() {\n"
     "  if (uProbeRast > 0) { fragColor = vec4(1.0,1.0,1.0,1.0); return; }\n"
     "  vec2 ndc = gl_FragCoord.xy / uRT * 2.0 - 1.0;\n"
@@ -252,6 +253,7 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
     "  vec3 evalStep = rayDir * ctpScale * stepSize;\n"
     "  vec3 accColor = vec3(0.0);\n"
     "  float accOp = 0.0;\n"
+    "  int iterCount = 0;\n"
     "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n"
     "    float currentT = tStart + float(i) * stepSize;\n"
     "    if (currentT >= tExit - 1e-6) break;\n"
@@ -261,9 +263,14 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
     "    float w = 1.0 - accOp;\n"
     "    accColor += w * vec3(tfv.rgb * tfv.a);\n"
     "    accOp += w * tfv.a;\n"
+    "    iterCount = i + 1;\n"
     "    if (accOp > 0.996) break;\n"
     "  }\n"
-    "  fragColor = vec4(accColor, accOp);\n"
+    "  if (uDebugIter > 0) {\n"
+    "    fragColor = vec4(float(iterCount) / 4096.0, 0.0, 0.0, 1.0);\n"
+    "  } else {\n"
+    "    fragColor = vec4(accColor, accOp);\n"
+    "  }\n"
     "}\n";
 
   GLuint prog = glCreateProgram();
@@ -287,6 +294,7 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
   glUniform1i(glGetUniformLocation(prog, "uMaxIter"), 8192);
   glUniform1i(glGetUniformLocation(prog, "uJitter"), jitter);
   glUniform1i(glGetUniformLocation(prog, "uProbeRast"), getenv("PROBE_RAST") ? 1 : 0);
+  glUniform1i(glGetUniformLocation(prog, "uDebugIter"), getenv("GL_ITER") ? 1 : 0);
 
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_3D, volTex);
@@ -419,7 +427,7 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
     msl = full;
   }
   const char* msl2 =
-    "struct Uniforms { float4 eye; float4 boundsSize; float4x4 invVP; float4x4 vp; float sampleDistMM; int jitter; int maxIter; float rtSize; int probeRast; int probeFS; int ndcCorners; int probeTexNoise; };\n"
+    "struct Uniforms { float4 eye; float4 boundsSize; float4x4 invVP; float4x4 vp; float sampleDistMM; int jitter; int maxIter; float rtSize; int probeRast; int probeFS; int ndcCorners; int probeTexNoise; int debugIter; };\n"
 "struct VOut { float4 position [[position]]; float tid [[user(tid0)]]; float4 cvt [[user(cvt0)]]; };\n"
      "vertex VOut vertex_main(uint vid [[vertex_id]],\n"
      "                        constant packed_float3* corners [[buffer(1)]],\n"
@@ -486,6 +494,7 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
      "  constexpr sampler tfSampler(filter::linear, address::clamp_to_edge);\n"
     "  float3 accColor = float3(0.0f);\n"
     "  float accOp = 0.0f;\n"
+    "  int iterCount = 0;\n"
     "  for (int i = 0; i < min(u.maxIter, maxSteps); i++) {\n"
     "    float currentT = tStart + float(i) * stepSize;\n"
     "    if (currentT >= tExit - 1e-6f) break;\n"
@@ -495,8 +504,10 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
     "    float w = 1.0f - accOp;\n"
     "    accColor += w * (tfv.rgb * tfv.a);\n"
     "    accOp += w * tfv.a;\n"
+    "    iterCount = i + 1;\n"
     "    if (accOp > 0.996f) break;\n"
     "  }\n"
+    "  if (u.debugIter > 0) return float4(float(iterCount) / 256.0f, 0.0f, 0.0f, 1.0f);\n"
     "  return float4(accColor, accOp);\n"
     "}\n";
   NSError* err = nil;
@@ -516,14 +527,14 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
     float sampleDistMM;
     int jitter, maxIter;
     float rtSize;
-    int probeRast, probeFS, ndcCorners, probeTexNoise;
+    int probeRast, probeFS, ndcCorners, probeTexNoise, debugIter;
   } u;
   u.eye = (simd_float4){ kEye[0], kEye[1], kEye[2], 0.0f };
   u.boundsSize = (simd_float4){ kBounds[0], kBounds[1], kBounds[2], 0.0f };
   memcpy(&u.invVP, kInvVP, 16 * sizeof(float));
   memcpy(&u.vp, kVP, 16 * sizeof(float));
   u.sampleDistMM = sdMM; u.jitter = jitter; u.maxIter = 8192;
-  u.rtSize = (float)rt; u.probeRast = getenv("PROBE_RAST") ? 1 : 0; u.probeFS = getenv("PROBE_FULLSCREEN") ? 1 : 0; u.ndcCorners = getenv("NDC_CORNERS") ? 1 : 0; u.probeTexNoise = getenv("NOISE_TEX") ? 1 : 0;
+  u.rtSize = (float)rt; u.probeRast = getenv("PROBE_RAST") ? 1 : 0; u.probeFS = getenv("PROBE_FULLSCREEN") ? 1 : 0; u.ndcCorners = getenv("NDC_CORNERS") ? 1 : 0; u.probeTexNoise = getenv("NOISE_TEX") ? 1 : 0; u.debugIter = getenv("GL_ITER") ? 1 : 0;
   id<MTLBuffer> ubuf = [device newBufferWithBytes:&u length:sizeof(u) options:MTLResourceStorageModeShared];
   id<MTLBuffer> corners = [device newBufferWithBytes:kBoxCorners length:sizeof(kBoxCorners) options:MTLResourceStorageModeShared];
   float fsq[9] = { -1,-1,0.5,  3,-1,0.5,  -1,3,0.5 };

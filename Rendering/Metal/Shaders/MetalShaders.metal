@@ -4373,6 +4373,9 @@ inline half4 marchVolumeUnified(
   half additiveSum = 0.0h;     // Additive: sum(opacity * scalar)
   bool firstBlendSample = true;
 
+  // Debug iter counter (enabled by _padCropFlags[0] > 0.5 uniform flag).
+  int marchIter = 0;
+
   // Per-component accumulators for the independent multi-component path.
   // Only the active blend mode's arrays are touched.
   half mipMaxScalarComp[4] = {0.0h, 0.0h, 0.0h, 0.0h};
@@ -5760,6 +5763,7 @@ inline half4 marchVolumeUnified(
     // making the camera-inside proxy composite one fewer positive-opacity term
     // than GL at exit-boundary pixels. Rely on the CTP test alone for parity.
     // (Loop bound i < maxSteps still caps runaway rays.)
+    marchIter = i + 1;
   }
   }
 
@@ -5863,6 +5867,11 @@ inline half4 marchVolumeUnified(
   half wlScale = half(volumeUniforms.finalColorScale);
   half wlBias = half(volumeUniforms.finalColorBias);
   finalColor.rgb = finalColor.rgb * wlScale + wlBias * finalColor.a;
+  if (volumeUniforms._padCropFlags[0] > 0.5f) {
+    // Encode iter count directly: red_channel/255 = marchIter/256, so
+    // uint8 red ≈ marchIter. Max representable = 255 iterations.
+    return half4(half(float(marchIter) / 256.0f), 0.0h, 0.0h, 1.0h);
+  }
   return finalColor;
 }
 

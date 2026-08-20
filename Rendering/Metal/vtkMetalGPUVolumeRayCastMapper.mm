@@ -7049,6 +7049,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // Update uniforms
   VolumeMapperUniforms uniforms = {};
 
+  // Debug iter PPM: repurpose _padCropFlags[0] as a flag. When set, the shader
+  // outputs iteration count / 256 in the red channel instead of the normal
+  // color, so a PNG/PPM readback gives the iter distribution.
+  uniforms._padCropFlags[0] = getenv("METAL_ITER") ? 1.0f : 0.0f;
+
   vtkNew<vtkMatrix4x4> modelMatrix;
   vol->GetModelToWorldMatrix(modelMatrix);
 
