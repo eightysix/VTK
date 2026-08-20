@@ -2355,6 +2355,16 @@ void vtkOpenGLGPUVolumeRayCastMapper::GetShaderTemplate(
         "gl_FragData[0] = g_fragColor;",
         "gl_FragData[0] = vec4(g_currentT / 4096.0, 0.0, 0.0, 1.0);");
     }
+    // INVESTIGATION (temporary): dump the first-sample texcoord (mode 1) or
+    // the march step in texels (mode 2) for the same-rays A/B (§11).
+    if (std::getenv("VTK_METAL_TEST_GL_RAYS"))
+    {
+      const char* out = (strcmp(std::getenv("VTK_METAL_TEST_GL_RAYS"), "2") == 0)
+        ? "gl_FragData[0] = vec4(g_dirStep * vec3(textureSize(in_volume[0], 0)) / 16.0, 1.0);"
+        : "gl_FragData[0] = vec4(g_rayOrigin, 1.0);";
+      vtkShaderProgram::Substitute(shaders[vtkShader::Fragment],
+        "gl_FragData[0] = g_fragColor;", out);
+    }
   }
 
   if (shaders[vtkShader::Geometry])
@@ -4152,6 +4162,30 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::RenderSingleInput(
           fwrite(buf.data(), 1, buf.size(), f);
           fclose(f);
           fprintf(stderr, "DBG GL iter image -> /tmp/app_gl_iter.ppm (%dx%d)\n", w, h);
+        }
+      }
+    }
+    if (std::getenv("VTK_METAL_TEST_GL_RAYS"))
+    {
+      static bool dbgRaysDumped = false;
+      if (!dbgRaysDumped)
+      {
+        dbgRaysDumped = true;
+        GLint vp[4];
+        glGetIntegerv(GL_VIEWPORT, vp);
+        int w = vp[2], h = vp[3];
+        std::vector<unsigned char> buf((size_t)w * h * 3);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, buf.data());
+        const char* mode = std::getenv("VTK_METAL_TEST_GL_RAYS");
+        FILE* f = fopen(strcmp(mode, "2") == 0 ? "/tmp/app_gl_step.ppm" : "/tmp/app_gl_firsthit.ppm", "wb");
+        if (f)
+        {
+          fprintf(f, "P6\n%d %d\n255\n", w, h);
+          fwrite(buf.data(), 1, buf.size(), f);
+          fclose(f);
+          fprintf(stderr, "DBG GL rays image -> %s (%dx%d)\n",
+            strcmp(mode, "2") == 0 ? "/tmp/app_gl_step.ppm" : "/tmp/app_gl_firsthit.ppm", w, h);
         }
       }
     }

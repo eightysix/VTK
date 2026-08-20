@@ -451,6 +451,114 @@ writes `/tmp/app_gl_iter.ppm`.)
 
 Full data: `JITTER_DUMP.txt` (app GL), this section (app Metal).
 
+## 11. Harness GL A/B knob results (2026-08-20)
+
+Goal: find which app-GL shader structure makes its jitter Δ cheap (~11 ms
+interleaved) vs the harness's ~22 ms. All knobs in `jitter_gap_repro.mm`
+(compile-time shader-string switches), 3 interleaved rounds each at 1024,
+mean Δ = j1−j0.
+
+| knob | GL Δ (ms) | Metal Δ (ms) | samples |
+|---|---|---|---|
+| baseline (current shader) | 22.3 | 20.0 | 88 / 81 |
+| A: `LOD=1` textureLod (H8: kill implicit dFdx/dFdy) | 20.5 | 20.8 | same |
+| B: `SPLIT_TF=1` separate color/opacity LUT + a>0 gate (H4) | **18.2** | 21.2 | same |
+| C: `WHILE=1` + box-exit + accumulated evalPoint (H4 compiler shape) | 19.1 | 18.8 | same (11 px fewer, box no-op) |
+
+App-side check — `VTK_METAL_TEST_GL_NOTF=1` (skip TF fetches, fixed alpha
+0.005, keeps volume fetch + full loop), interleaved pairs at 1024:
+
+| app GL config | j0 (ms) | j1 (ms) | Δ (ms) |
+|---|---|---|---|
+| baseline (no NOTF) | 27.2 | 37.2 | **10.0** |
+| NOTF | 30.2 | 43.5 | **13.3** |
+
+### 11.1 Findings
+
+1. **H8 refuted** — removing the implicit gradient (textureLod) does not move
+   the harness GL Δ (20.5 vs 22.3, within noise). The dFdx/dFdy on the
+   per-pixel-jittered evalPoint is not the cost.
+2. **H4 (split TF) gives only a partial move** — Knob B: 22.3 → 18.2 ms
+   (borderline vs noise; B's spread 15.8-20.2 overlaps baseline's 20.6-24.8).
+   Knob C (while+box-exit, the app's loop shape) adds nothing (19.1). The
+   harness GL cannot be made as cheap as the app's ~11 ms with any loop/TF
+   structure.
+3. **NOTF does NOT help the app GL** — removing the TF fetches *worsens* Δ
+   (10.0 → 13.3). The TF-fetch path is not what makes app GL jitter cheap.
+4. **Volume-texture upload path is identical** — GL GL_R8 512x512x1794 vs
+   Metal MTLPixelFormatR8Unorm same dims (VTK_METAL_TEST_DUMP_VOLTEX).
+   Texture-format A/B is moot.
+5. **Net**: the cheap app-GL jitter is not explained by loop shape, TF shape,
+   gradient mode, or texture format. The harness over-charge persists (~2x
+   app GL Δ) with identical rays, counts, and field; remaining candidates are
+   harness-level (CGL context/swap behavior, FBO vs drawable, driver state)
+   rather than shader structure.
+
+## 12. Same-rays + app-strip + pass A/B (2026-08-20, continuation of §11)
+
+All knobs env-gated (default-off), 1024, j0/j1 interleaved pairs. Success metric
+is Δ = j1−j0 with mean samples logged (must stay ~86–88 or the run is discarded).
+
+### 12.1 §1 — same rays? (can invalidate every A/B so far)
+
+Dumped once each, 1024, j0: first-hit texcoord PPM (app `g_rayOrigin` vs harness
+`evalBase`) and step-in-texels PPM (app `g_dirStep*textureSize` vs harness
+`evalStep*uTexelCount`). Camera constants verified identical against the app's
+`VTK_METAL_TEST_DUMP_UNIFORMS` dump (`in_eyePosObjs`/bounds, `in_sampleDistance`=4,
+`in_cellSpacing` (0.834,0.834,0.4), `in_cellToPoint` = harness ctpScale/ctpOffset).
+
+| measure | app GL | harness GL | Δ |
+|---|---|---|---|
+| first-hit mean XYZ (texcoord) | .3158 .3827 .7754 | .3156 .3826 .7768 | 0.0002/0.0001/0.0013 |
+| step mean XYZ (texels) | 2.305 1.698 (Z clamped, −dir) | 2.305 1.699 (Z clamped, −dir) | ~0 |
+| first-hit per-pixel | 454,204 covered | 457,875 covered | — |
+
+After correcting the harness PPM's Y-flip: mean |Δ| = 1.0/0.9/3.6 texels,
+std ≈ mean → **within 8-bit PPM quantization (1 LSB = 2 texels XY, 7 texels Z)**.
+Both march −Z (step Z clamps to 0 in both). **Verdict: rays match.** Same line
+through the anisotropic brick; the "identical march" claim survives.
+
+### 12.2 §2 — strip the app toward the harness (invert the A/B)
+
+| app GL config | j0 (ms) | j1 (ms) | Δ (ms) | mean samples |
+|---|---|---|---|---|
+| baseline | 28.2±1.0 | 39.3±0.5 | 11.0±1.5 | 86.5 |
+| `GL_NODEPTH` (no depth fetch/discard, AABB term) | 27.4 | 37.7 | **10.3** | 86.5 |
+| `GL_NOCLIP` (skip AdjustSampleRangeForClipping) | 32.5 | 47.8 | 15.3 | 86.5 |
+| `GL_NOBOX` (drop 6-way texMin/Max break) | — | — | — | 183 (**discarded**) |
+| `GL_MINIMAL` (all three + NOTF) | — | — | — | 288 (**discarded**) |
+| `GL_NOTF` (TF fetches → fixed alpha) | 30.2 | 43.5 | 13.3 | 87.6 |
+
+1. **NODEPTH does not move Δ** (~10.3 vs baseline 11.0). The depth-sampler
+   fetch / discard / pass split is **not** the hiding factor.
+2. **NOCLIP makes it worse** (Δ 15.3, j0 base +4 ms at constant 86.5 samples):
+   removing the clip prologue changes the composer codegen/occupancy, and the
+   jitter tax rises toward the Metal plateau — but not to it.
+3. **NOTF keeps samples** (87.6 vs 86.5) — the +3.3 ms is a real H4 effect
+   (removing TF fetches raises jitter cost), bounded at ~3 ms, consistent with
+   harness split-TF (22→18).
+4. **NOBOX/MINIMAL break terminate** (samples 183/288, ray walks past the box
+   exit to the far plane) — discarded per protocol.
+
+### 12.3 §3 — pass / FBO structure on the harness
+
+| harness GL config | GL Δ (ms) | Metal Δ (ms) | samples |
+|---|---|---|---|
+| baseline (this session) | 31.3 | 20.0 | 88 |
+| `DEPTH=1` (depth FBO attachment + dummy depth fetch at FS start) | 28.8 | 20.0 | 88 |
+
+The dummy depth texture fetch + depth attachment does not collapse harness GL
+Δ toward the app's ~10 ms. Pass structure is **not** the hiding factor either.
+
+### 12.4 Net
+
+With §1 confirming identical rays, and every shader-structure/pass knob
+(LOD, split-TF, while+box, NODEPTH, NOCLIP, DEPTH, NOTF) failing to move app GL
+below ~10 ms or harness GL toward it, the residual ~8–12 ms gap is **not encoded
+in the loop text, TF shape, gradient mode, texture format, or pass structure**.
+Per the plan, the next step is GL texture/FBO *state* (wrap/filter/immutable/
+swizzle/max-level/compare) or occupancy profiling (Instruments) — not more GLSL.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).

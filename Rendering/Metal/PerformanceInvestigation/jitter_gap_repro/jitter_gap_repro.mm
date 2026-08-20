@@ -172,13 +172,63 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, tf);
 
-  GLuint rtTex = 0, fbo = 0;
+  // Split-TF knob (SPLIT_TF=1, H4 A/B): app-shaped color/opacity LUTs built
+  // from the same tf data (color = rgb + a=255, opacity = a + 0 r/g/b).
+  GLuint colorTex = 0, opTex = 0;
+  if (getenv("SPLIT_TF"))
+  {
+    uint8_t* colorLut = (uint8_t*)malloc(256 * 4);
+    uint8_t* opLut = (uint8_t*)malloc(256 * 4);
+    for (int i = 0; i < 256; i++)
+    {
+      colorLut[i * 4 + 0] = tf[i * 4 + 0];
+      colorLut[i * 4 + 1] = tf[i * 4 + 1];
+      colorLut[i * 4 + 2] = tf[i * 4 + 2];
+      colorLut[i * 4 + 3] = 255;
+      opLut[i * 4 + 0] = opLut[i * 4 + 1] = opLut[i * 4 + 2] = tf[i * 4 + 3];
+      opLut[i * 4 + 3] = tf[i * 4 + 3];
+    }
+    glGenTextures(1, &colorTex);
+    glBindTexture(GL_TEXTURE_2D, colorTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, colorLut);
+    glGenTextures(1, &opTex);
+    glBindTexture(GL_TEXTURE_2D, opTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, opLut);
+    free(colorLut);
+    free(opLut);
+  }
+
+  GLuint rtTex = 0, fbo = 0, depthRbo = 0;
   glGenTextures(1, &rtTex);
   glBindTexture(GL_TEXTURE_2D, rtTex);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, rt, rt, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
   glGenFramebuffers(1, &fbo);
   glBindFramebuffer(GL_FRAMEBUFFER, fbo);
   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rtTex, 0);
+  // DEPTH knob (DEPTH=1, H4 A/B §3): attach a depth RBO so the pass carries
+  // the same depth attachment as the app, and bind a dummy depth texture
+  // fetched at FS start (pass split / TBDR structure without changing march).
+  GLuint depthTex = 0;
+  if (getenv("DEPTH"))
+  {
+    glGenTextures(1, &depthTex);
+    glBindTexture(GL_TEXTURE_2D, depthTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, rt, rt, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, NULL);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depthTex, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+  }
   if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) { fprintf(stderr, "FBO incomplete\n"); exit(1); }
 
   const char* vs = "#version 150\n"
@@ -190,11 +240,75 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
     "}\n";
   // GL jitter = the app's reference: pure origin shift, no lattice
   // re-alignment (g_rayOrigin += g_dirStep * jitterValue).
-  const char* fs = "#version 150\n"
+  // VOL_FETCH knob (LOD=1): textureLod kills the implicit dFdx/dFdy gradient
+  // on the per-pixel-jittered evalPoint (H8 A/B, HARNESS_VS_APP_GAP.md §11).
+  // STEP_BODY knob (SPLIT_TF=1): app-shaped step — separate color/opacity LUTs
+  // with an a>0 gate (H4 A/B). The app's texture3D fetch stays texture() for
+  // this knob unless LOD=1 is also set.
+  // LOOP_SHAPE knob (WHILE=1, H4 A/B): the app's while loop with accumulated
+  // evalPoint/currentT (loop-carried dependent chain) and a 6-way box-exit
+  // test on the eval lattice — compiler/occupancy shape, not algorithm.
+  const char* loopShape = getenv("WHILE")
+    ? "  float currentT = tStart;\n"
+      "  vec3 evalPoint = evalBase;\n"
+      "  int i = 0;\n"
+      "  while (i < min(uMaxIter, maxSteps)) {\n"
+      "    if (currentT >= tExit - 1e-6) break;\n"
+      "    if (evalPoint.x < 0.0 || evalPoint.x > 1.0 ||\n"
+      "        evalPoint.y < 0.0 || evalPoint.y > 1.0 ||\n"
+      "        evalPoint.z < 0.0 || evalPoint.z > 1.0) break;\n"
+      "    float s = VOL_FETCH;\n"
+      "    %s"
+      "    iterCount = i + 1;\n"
+      "    if (accOp > 0.996) break;\n"
+      "    evalPoint += evalStep;\n"
+      "    currentT += stepSize;\n"
+      "    i++;\n"
+      "  }\n"
+    : "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n"
+      "    float currentT = tStart + float(i) * stepSize;\n"
+      "    if (currentT >= tExit - 1e-6) break;\n"
+      "    vec3 evalPoint = evalBase + float(i) * evalStep;\n"
+      "    float s = VOL_FETCH;\n"
+      "    %s"
+      "    iterCount = i + 1;\n"
+      "    if (accOp > 0.996) break;\n"
+      "  }\n";
+  const char* fetchDef = getenv("LOD")
+    ? "#define VOL_FETCH textureLod(uVol, evalPoint, 0.0).r\n"
+    : "#define VOL_FETCH texture(uVol, evalPoint).r\n";
+  const char* stepBody = getenv("SPLIT_TF")
+    ? "    float a = texture(uOpacityTF, vec2(s, 0.5)).r;\n"
+      "    if (a > 0.0) {\n"
+      "      vec3 c = texture(uColorTF, vec2(s, 0.5)).rgb;\n"
+      "      float w = 1.0 - accOp;\n"
+      "      accColor += w * (c * a);\n"
+      "      accOp += w * a;\n"
+      "    }\n"
+    : "    vec4 tfv = texture(uTF, vec2(s, 0.5));\n"
+      "    float w = 1.0 - accOp;\n"
+      "    accColor += w * vec3(tfv.rgb * tfv.a);\n"
+      "    accOp += w * tfv.a;\n";
+  // DEPTH knob (DEPTH=1, H4 A/B §3): dummy depth-texture fetch at FS start
+  // (NEAREST, full-res) fed into the composite with a tiny weight — tests the
+  // pass split / TBDR structure without changing the march (the value is
+  // ~0 on the volume interior since the FBO depth is cleared to 1.0).
+  const char* depthFetch = getenv("DEPTH")
+    ? "  float dummyDepth = texture(uDepth, gl_FragCoord.xy / uRT).r;\n"
+    : "  float dummyDepth = 0.0;\n";
+  char* fsBuf = (char*)malloc(16384);
+  char* loopBuf = (char*)malloc(4096);
+  snprintf(loopBuf, 4096, loopShape, stepBody);
+  snprintf(fsBuf, 16384,
+    "#version 150\n"
+    "%s"
     "out vec4 fragColor;\n"
     "uniform sampler3D uVol;\n"
     "uniform sampler2D uNoise;\n"
     "uniform sampler2D uTF;\n"
+    "uniform sampler2D uColorTF;\n"
+    "uniform sampler2D uOpacityTF;\n"
+    "uniform sampler2D uDepth;\n"
     "uniform vec3 uTexelCount;\n"
     "uniform vec3 uEye;\n"
     "uniform vec3 uBoundsSize;\n"
@@ -205,8 +319,10 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
     "uniform int uJitter;\n"
     "uniform int uProbeRast;\n"
     "uniform int uDebugIter;\n"
+    "uniform int uRayDump;\n"
     "void main() {\n"
     "  if (uProbeRast > 0) { fragColor = vec4(1.0,1.0,1.0,1.0); return; }\n"
+    "  %s"
     "  vec2 ndc = gl_FragCoord.xy / uRT * 2.0 - 1.0;\n"
     "  vec4 w4 = uInvVP * vec4(ndc, 0.0, 1.0);\n"
     "  vec3 ptPhys = w4.xyz / w4.w;\n"
@@ -254,24 +370,18 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
     "  vec3 accColor = vec3(0.0);\n"
     "  float accOp = 0.0;\n"
     "  int iterCount = 0;\n"
-    "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n"
-    "    float currentT = tStart + float(i) * stepSize;\n"
-    "    if (currentT >= tExit - 1e-6) break;\n"
-    "    vec3 evalPoint = evalBase + float(i) * evalStep;\n"
-    "    float s = texture(uVol, evalPoint).r;\n"
-    "    vec4 tfv = texture(uTF, vec2(s, 0.5));\n"
-    "    float w = 1.0 - accOp;\n"
-    "    accColor += w * vec3(tfv.rgb * tfv.a);\n"
-    "    accOp += w * tfv.a;\n"
-    "    iterCount = i + 1;\n"
-    "    if (accOp > 0.996) break;\n"
-    "  }\n"
+    "  %s"
     "  if (uDebugIter > 0) {\n"
     "    fragColor = vec4(float(iterCount) / 4096.0, 0.0, 0.0, 1.0);\n"
+    "  } else if (uRayDump == 1) {\n"
+    "    fragColor = vec4(evalBase, 1.0);\n"
+    "  } else if (uRayDump == 2) {\n"
+    "    fragColor = vec4(evalStep * uTexelCount / 16.0, 1.0);\n"
     "  } else {\n"
-    "    fragColor = vec4(accColor, accOp);\n"
+    "    fragColor = vec4(accColor + dummyDepth * 1e-4, accOp);\n"
     "  }\n"
-    "}\n";
+    "}\n", fetchDef, depthFetch, loopBuf);
+  const char* fs = fsBuf;
 
   GLuint prog = glCreateProgram();
   GLuint vsh = glCreateShader(GL_VERTEX_SHADER), fsh = glCreateShader(GL_FRAGMENT_SHADER);
@@ -279,6 +389,8 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
   glShaderSource(fsh, 1, &fs, NULL); glCompileShader(fsh);
   GLint ok = 0; glGetShaderiv(fsh, GL_COMPILE_STATUS, &ok);
   if (!ok) { char log[4096]; glGetShaderInfoLog(fsh, sizeof(log), NULL, log); fprintf(stderr, "fragment compile failed:\n%s\n", log); exit(1); }
+  free(fsBuf);
+  free(loopBuf);
   glAttachShader(prog, vsh); glAttachShader(prog, fsh); glLinkProgram(prog);
   glUseProgram(prog);
   glUniform1i(glGetUniformLocation(prog, "uVol"), 0);
@@ -295,6 +407,10 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
   glUniform1i(glGetUniformLocation(prog, "uJitter"), jitter);
   glUniform1i(glGetUniformLocation(prog, "uProbeRast"), getenv("PROBE_RAST") ? 1 : 0);
   glUniform1i(glGetUniformLocation(prog, "uDebugIter"), getenv("GL_ITER") ? 1 : 0);
+  glUniform1i(glGetUniformLocation(prog, "uRayDump"), getenv("RAYS") ? atoi(getenv("RAYS")) : 0);
+  glUniform1i(glGetUniformLocation(prog, "uColorTF"), 3);
+  glUniform1i(glGetUniformLocation(prog, "uOpacityTF"), 4);
+  glUniform1i(glGetUniformLocation(prog, "uDepth"), 5);
 
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_3D, volTex);
@@ -302,6 +418,12 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
   glBindTexture(GL_TEXTURE_2D, noiseTex);
   glActiveTexture(GL_TEXTURE2);
   glBindTexture(GL_TEXTURE_2D, tfTex);
+  glActiveTexture(GL_TEXTURE3);
+  glBindTexture(GL_TEXTURE_2D, colorTex);
+  glActiveTexture(GL_TEXTURE4);
+  glBindTexture(GL_TEXTURE_2D, opTex);
+  glActiveTexture(GL_TEXTURE5);
+  glBindTexture(GL_TEXTURE_2D, depthTex);
 
   glViewport(0, 0, rt, rt);
   GLuint vao = 0;
@@ -322,7 +444,8 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
   }
   double t0 = NowMs();
   for (int f = 0; f < frames; f++) {
-    glClear(GL_COLOR_BUFFER_BIT);
+    if (getenv("DEPTH")) glClear(GL_DEPTH_BUFFER_BIT | GL_COLOR_BUFFER_BIT);
+    else glClear(GL_COLOR_BUFFER_BIT);
     glDrawArrays(GL_TRIANGLES, 0, 36);
     glFinish();
   }
@@ -336,7 +459,10 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
       if (pix[i] | pix[i + 1] | pix[i + 2]) nonzero++;
     if (getenv("GL_DUMP_PPM"))
     {
-      FILE* pp = fopen("/tmp/jgr.ppm", "wb");
+      const char* outPath = getenv("RAYS")
+        ? (atoi(getenv("RAYS")) == 2 ? "/tmp/harness_step.ppm" : "/tmp/harness_firsthit.ppm")
+        : "/tmp/jgr.ppm";
+      FILE* pp = fopen(outPath, "wb");
       if (pp)
       {
         fprintf(pp, "P6\n%d %d\n255\n", rt, rt);

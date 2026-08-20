@@ -3261,14 +3261,33 @@ inline std::string TerminationInit(
       \n  bool stop = false;\
       \n\
       \n  g_terminatePointMax = 0.0;\
-      \n\
+      \n");
+
+  // INVESTIGATION (temporary): GL_NODEPTH strips the depth-sampler fetch and
+  // the discard, replacing ray termination with the AABB box exit. This
+  // isolates the cost of the depth pass (pass split / TBDR) from the march
+  // body. Revert before landing.
+  if (!std::getenv("VTK_METAL_TEST_GL_NODEPTH"))
+  {
+    shaderStr += std::string("\
       \n  vec4 l_depthValue = texture2D(in_depthSampler, fragTexCoord);\
       \n  // Depth test\
       \n  if(gl_FragCoord.z >= l_depthValue.x)\
       \n    {\
       \n    discard;\
       \n    }\
-      \n\
+      \n");
+  }
+  else
+  {
+    // Far plane: march to the AABB exit (box-exit in TerminationImplementation
+    // still applies). Keeps l_depthValue defined for the code below.
+    shaderStr += std::string("\
+      \n  vec4 l_depthValue = vec4(1.0, 1.0, 1.0, 1.0);\
+      \n");
+  }
+
+  shaderStr += std::string("\
       \n  // color buffer or max scalar buffer have a reduced size.\
       \n  fragTexCoord = (gl_FragCoord.xy - in_windowLowerLeftCorner) *\
       \n                 in_inverseOriginalWindowSize;\
@@ -3337,13 +3356,20 @@ inline std::string TerminationInit(
 inline std::string TerminationImplementation(
   vtkRenderer* vtkNotUsed(ren), vtkVolumeMapper* vtkNotUsed(mapper), vtkVolume* vtkNotUsed(vol))
 {
-  return std::string("\
+  std::string shaderStr;
+  // INVESTIGATION (temporary): GL_NOBOX drops the 6-way in_texMin/Max break,
+  // keeping the opacity and terminate-point checks. Revert before landing.
+  if (!std::getenv("VTK_METAL_TEST_GL_NOBOX"))
+  {
+    shaderStr += std::string("\
       \n    if(any(greaterThan(max(g_dirStep, vec3(0.0))*(g_dataPos - in_texMax[0]),vec3(0.0))) ||\
       \n      any(greaterThan(min(g_dirStep, vec3(0.0))*(g_dataPos - in_texMin[0]),vec3(0.0))))\
       \n      {\
       \n      break;\
       \n      }\
-      \n\
+      \n");
+  }
+  shaderStr += std::string("\
       \n    // Early ray termination\
       \n    // if the currently composited colour alpha is already fully saturated\
       \n    // we terminated the loop or if we have hit an obstacle in the\
@@ -3354,6 +3380,8 @@ inline std::string TerminationImplementation(
       \n      break;\
       \n      }\
       \n    ++g_currentT;");
+
+  return shaderStr;
 }
 
 //--------------------------------------------------------------------------
@@ -3648,14 +3676,23 @@ inline std::string ClippingInit(
       \n  clip_numPlanes = int(in_clippingPlanes[0]);\
       \n  clip_texToObjMat = in_volumeMatrix[0] * inverse(ip_inverseTextureDataAdjusted);\
       \n  clip_objToTexMat = ip_inverseTextureDataAdjusted * in_inverseVolumeMatrix[0];\
-      \n\
+      \n");
+
+  // INVESTIGATION (temporary): GL_NOCLIP skips the clipping range adjustment
+  // (ray goes through the full box instead of the clipped segment). Revert
+  // before landing.
+  if (!std::getenv("VTK_METAL_TEST_GL_NOCLIP"))
+  {
+    shaderStr += std::string("\
       \n  // Adjust for clipping.\
       \n  if (!AdjustSampleRangeForClipping(g_rayOrigin, g_rayTermination))\
       \n  { // entire ray is clipped.\
       \n    discard;\
       \n  }\
-      \n\
-      \n  // Update the segment post-clip:\
+      \n");
+  }
+
+  shaderStr += std::string("\
       \n  g_dataPos = g_rayOrigin;\
       \n  g_terminatePos = g_rayTermination;\
       \n  g_terminatePointMax = length(g_terminatePos.xyz - g_dataPos.xyz) /\
