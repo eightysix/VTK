@@ -106,10 +106,48 @@ Metal's fixed cost is lower and its per-sample cost matches GL; the j0 gap is a
 threadgroup-level loop bound) that only shows up when rays exit at different
 lengths and at high resolution.
 
+## 6. Cross-variant sweep: does the march variant close the gap?
+
+The divergent-tail hypothesis predicts that scheduling variants (unrolled
+fetches 6/7/8/9, latched exits 3, uniform frame-max 4) might change the tail
+cost. Ran the same j0 sweep (2048, uncapped + fixed steps 1/16/64) for every
+march variant via `VTK_METAL_TEST_MARCH_VARIANT`. GL reference repeated per
+loop (GL itself has no variants).
+
+| variant | uncapped | M/GL | steps=1 | M/GL | steps=16 | M/GL | steps=64 | M/GL |
+|---|---|---|---|---|---|---|---|---|
+| 0 (baseline divergent) | 43.22 | 1.05 | 2.00 | 0.49 | 4.52 | 0.68 | 16.95 | 0.91 |
+| 3 (latch exits) | 43.62 | 1.09 | 1.41 | 0.36 | 4.57 | 0.64 | 17.10 | 0.92 |
+| 4 (uniform frame-max) | 43.65 | 1.07 | 1.75 | 0.42 | 4.59 | 0.67 | 18.30 | 0.97 |
+| 5 (hybrid uniform+tail) | 43.54 | 1.09 | 43.90* | 9.56 | 44.15* | 6.21 | 46.12* | 2.44 |
+| 6 (8x unroll) | 43.42 | 1.08 | 1.54 | 0.35 | 4.73 | 0.72 | 17.21 | 0.91 |
+| 7 (4x unroll) | 43.65 | 1.11 | 1.46 | 0.36 | 4.73 | 0.72 | 17.65 | 0.96 |
+| 8 (harness w48 schedule) | 43.56 | 1.10 | 1.40 | 0.37 | 3.46 | 0.49 | 15.07 | 0.81 |
+| 9 (adaptive-width w48) | 43.50 | 1.06 | 2.22 | 0.53 | 4.25 | 0.64 | 15.80 | 0.83 |
+
+\* Variant 5's `MARCH_STEPS` is a **floor**, not a cap: the shader computes
+`maxSteps = max(per-fragment, mainSteps)`, so a 1-step/16-step bound still
+marches the full per-fragment length (~43.9 ms). The fixed-steps rows for
+variant 5 are therefore uncapped (expected; variant 5 is the hybrid).
+
+### 6.1 Interpretation
+
+1. **No variant fixes the uncapped deficit.** Every variant lands uncapped at
+   ~43.2-43.7 ms, M/GL 1.05-1.11. The gap is not scheduling, unrolling, fetch
+   latency, or latch policy — all of those are already ruled out.
+2. **Variant 8/9 (the production harness-scheduled march) is the best at high
+   fixed steps** (steps=64: 15.07/15.80 vs 16.95-18.30 for others) but the
+   uncapped time is identical to baseline — the scheduling helps only when the
+   step count is uniform, i.e. it does not attack the divergent tail.
+3. The deficit is therefore insensitive to *how* the march is scheduled. It
+   tracks the **distribution of ray lengths** (mean 81, max ~222 at 2048) and
+   the resolution (1024 ties, 2048 loses) — pointing at threadgroup/occupancy
+   effects (long-ray lanes pinning threadgroups) rather than the loop body.
+
 ### Next step
 
-Attack the divergent-tail cost in the Metal march: examine how the per-fragment
-loop bound / threadgroup dispatch handles the distribution of ray lengths
-(mean 81, max ~222 at 2048), vs GL's warp behavior. Candidate levers: batch the
-march by frame-max bound with predicated exits (variant 4 machinery, currently
-variant-4-only), or investigate threadgroup/tile dispatch granularity.
+Attack the divergent-tail cost at the threadgroup level: investigate how long
+rays (up to ~222 steps vs mean 81) pin Metal threadgroups / SIMD groups while
+GL warps drain earlier, and whether re-packing rays by length (or a frame-max
+uniform bound with latched exits, variant-4 semantics at the *threadgroup*
+level rather than per-fragment) drains the tail earlier.
