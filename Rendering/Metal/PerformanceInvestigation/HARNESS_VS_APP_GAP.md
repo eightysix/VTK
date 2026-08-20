@@ -235,6 +235,81 @@ ray-parameter coordinate differences. Instrument the harness GL with the app's
 `g_currentT`-to-red iteration encoding (`VTK_METAL_TEST_GL_ITER=1`) and compare
 iteration distributions.
 
+## 7. Resolution scaling (2026-08-20)
+
+Single-run, 30 frames, SD4, minmax/accel off, slabs=1. Metal side uses
+per-pixel blue noise (`IGN_JITTER=0`), matching GL's field.
+
+### 7.1 Raw timing (ms/frame)
+
+400-2048: single-run, sequential. 4096/8192: interleaved GL/Metal to
+eliminate thermal ordering bias.
+
+| Resolution | GL j0 | GL j1 | Metal j0 | Metal j1 |
+|---|---|---|---|---|
+| 400x400 | 14.98 | 19.80 | 13.91 | 19.18 |
+| 800x800 | 21.75 | 31.58 | 23.62 | 38.84 |
+| 1024x1024 | 27.24 | 36.63 | 27.41 | 47.85 |
+| 2048x2048 | 40.32 | 54.14 | 44.15 | 69.48 |
+| 4096x4096 | 75.65 | 90.16 | 65.01 | 85.91 |
+| 8192x8192 | 232.66 | 264.37 | 188.65 | 199.84 |
+
+### 7.2 Jitter delta (j1 − j0)
+
+| Resolution | GL Δ ms | GL Δ % | Metal Δ ms | Metal Δ % | Metal/GL Δ ratio |
+|---|---|---|---|---|---|
+| 400x400 | +4.82 | +32.2% | +5.27 | +37.9% | 1.09 |
+| 800x800 | +9.83 | +45.2% | +15.22 | +64.4% | 1.55 |
+| 1024x1024 | +9.39 | +34.5% | +20.44 | +74.6% | 2.18 |
+| 2048x2048 | +13.82 | +34.3% | +25.33 | +57.4% | 1.83 |
+| 4096x4096 | +14.51 | +19.2% | +20.90 | +32.1% | 1.44 |
+| 8192x8192 | +31.71 | +13.6% | +11.19 | +5.9% | 0.35 |
+
+### 7.3 Backend ratios
+
+| Resolution | M/GL j0 | M/GL j1 | j1−j0 spread |
+|---|---|---|---|
+| 400x400 | 0.93 | 0.97 | +0.04 |
+| 800x800 | 1.09 | 1.23 | +0.14 |
+| 1024x1024 | 1.01 | 1.31 | +0.30 |
+| 2048x2048 | 1.10 | 1.28 | +0.18 |
+| 4096x4096 | 0.86 | 0.95 | +0.09 |
+| 8192x8192 | 0.81 | 0.76 | −0.05 |
+
+### 7.4 Analysis
+
+**M/GL j1 tracks M/GL j0.** Every resolution where Metal is slower at j0 is
+also slower at j1, and vice versa. The "jitter gap" is not purely a jitter
+phenomenon — it is two stacked effects:
+
+1. **Base overhead (j0 gap).** At 1024-2048, Metal j0 is ~1.01-1.10x GL j0.
+   This baseline carries through to j1 arithmetically: adding the same
+   absolute jitter to a larger base inflates the ratio.
+
+2. **Jitter asymmetry (spread).** The spread (j1 ratio − j0 ratio) isolates
+   the pure jitter effect. It peaks at +0.30 (1024x1024) and is +0.18 at
+   2048. Metal's jitter costs ~2x GL's in absolute ms at these resolutions.
+
+Decomposition at the pathologic cell (2048, M/GL j1 ≈ 1.28):
+- ~0.10 from base Metal overhead (j0 gap)
+- ~0.18 from jitter asymmetry (spread)
+- Total ≈ 1.28
+
+**Scaling regime boundaries (confirmed interleaved at 4096/8192):**
+- **≤400:** Negligible gap. Both backends are lightweight; jitter costs are
+  small in absolute ms, Metal slightly faster overall.
+- **800-2048:** Gap regime. Metal j0 ≈ GL j0, but Metal jitter Δ is 1.5-2.2x
+  GL's. This is the production rendering range and where the gap is real.
+- **≥4096:** Inversion. Metal becomes faster than GL at both j0 and j1. At
+  8192, M/GL j0 = 0.81, M/GL j1 = 0.76. The crossover is real (not a
+  thermal artifact — confirmed with interleaved back-to-back runs on the same
+  machine). At extreme pixel counts, Metal's pipeline handles the load more
+  efficiently; GL degrades faster as resolution grows.
+
+**Metal jitter Δ scales sub-linearly.** Goes +5 → +15 → +20 → +25 ms then
+drops to +21 (4096) and +11 (8192). At extreme resolutions the per-pixel
+jitter divergence is amortized by other fixed costs in the pipeline.
+
 ## 5. Files
 
 - `jitter_gap_repro/` — harness + `RESULTS.md` (build/run/knobs, verdicts).
