@@ -230,15 +230,21 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
     "  if (uJitter == 2) {\n"
     "    jitterF = 0.5 * stepSize;\n"
     "  }\n"
-    "  // FETCH-ONLY DEBUG: uJitter == 3 fetches the noise (same cache behavior)\n"
-    "  // but uses a constant half step — isolates fetch vs divergence cost.\n"
-    "  if (uJitter == 3) {\n"
-    "    jitterF = 0.5 * stepSize;\n"
-    "  }\n"
-    "  // GL parity: jitter OFF still shifts the origin by one full step\n"
-    "  // (g_rayJitter = g_dirStep, vtkVolumeShaderComposer.h); jitter ON\n"
-    "  // shifts by the per-pixel phase.\n"
-    "  tStart += uJitter > 0 ? jitterF : stepSize;\n"
+"  // FETCH-ONLY DEBUG: uJitter == 3 fetches the noise (same cache behavior)\n"
+     "  // but uses a constant half step — isolates fetch vs divergence cost.\n"
+     "  if (uJitter == 3) {\n"
+     "    jitterF = 0.5 * stepSize;\n"
+     "  }\n"
+     "  // LATTICE DEBUG: uJitter == 4 keeps the per-pixel phase but re-aligns\n"
+     "  // to the lattice (the app's Metal semantics) — phase-quantized march.\n"
+     "  if (uJitter == 4) {\n"
+     "    tStart = jitterF + ceil((tStart - jitterF) / stepSize) * stepSize;\n"
+     "  } else {\n"
+     "    // GL parity: jitter OFF still shifts the origin by one full step\n"
+     "    // (g_rayJitter = g_dirStep, vtkVolumeShaderComposer.h); jitter ON\n"
+     "    // shifts by the per-pixel phase.\n"
+     "    tStart += uJitter > 0 ? jitterF : stepSize;\n"
+     "  }\n"
     "  int maxSteps = max(0, int(ceil((tExit - tStart) / stepSize)));\n"
     "  vec3 ctpScale = max(uTexelCount - 1.0, 1e-4) / uTexelCount;\n"
     "  vec3 ctpOffset = 0.5 / uTexelCount;\n"
@@ -364,7 +370,7 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
   vd.mipmapLevelCount = 1;
   vd.usage = MTLTextureUsageShaderRead;
   vd.storageMode = MTLStorageModePrivate;
-  vd.allowGPUOptimizedContents = NO;  // app parity: lag_repro root cause (2026-08-18)
+  vd.allowGPUOptimizedContents = NO;  // app parity: lag_repro root cause (2026-08-18); YES measured ~50% slower on both j0/j1 (2026-08-20)
   id<MTLTexture> volTex = [device newTextureWithDescriptor:vd];
   id<MTLCommandQueue> queue = [device newCommandQueue];
   id<MTLCommandBuffer> cb0 = [queue commandBuffer];
@@ -413,7 +419,7 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
     msl = full;
   }
   const char* msl2 =
-    "struct Uniforms { float4 eye; float4 boundsSize; float4x4 invVP; float4x4 vp; float sampleDistMM; int jitter; int maxIter; float rtSize; int probeRast; int probeFS; int ndcCorners; };\n"
+    "struct Uniforms { float4 eye; float4 boundsSize; float4x4 invVP; float4x4 vp; float sampleDistMM; int jitter; int maxIter; float rtSize; int probeRast; int probeFS; int ndcCorners; int probeTexNoise; };\n"
 "struct VOut { float4 position [[position]]; float tid [[user(tid0)]]; float4 cvt [[user(cvt0)]]; };\n"
      "vertex VOut vertex_main(uint vid [[vertex_id]],\n"
      "                        constant packed_float3* corners [[buffer(1)]],\n"
@@ -426,10 +432,12 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
       "  if (u.ndcCorners > 0) { float t = float(vid / 3); float v = float(vid % 3); float tx = float(int(t) % 4) * 0.5f - 1.0f; float ty = floor(t / 4.0f) * 0.5f - 1.0f; o.position = float4(tx + (v == 0.0f ? 0.0f : (v == 1.0f ? 0.5f : 0.0f)), ty + (v == 0.0f ? 0.0f : (v == 1.0f ? 0.0f : 0.5f)), 0.5f, 1.0f); return o; }\n"
      "  o.position = u.vp * float4(c * u.boundsSize.xyz, 1.0f); return o;\n"
      "}\n"
-    "fragment float4 fragment_main(VOut in [[stage_in]],\n"
-    "                              texture3d<float> volTex [[texture(0)]],\n"
-    "                              texture2d<float> tfTex [[texture(1)]],\n"
-    "                              constant Uniforms& u [[buffer(0)]]) {\n"
+"fragment float4 fragment_main(VOut in [[stage_in]],\n"
+     "                              texture3d<float> volTex [[texture(0)]],\n"
+     "                              texture2d<float> tfTex [[texture(1)]],\n"
+     "                              texture2d<float> noiseTex [[texture(2)]],\n"
+     "                              constant Uniforms& u [[buffer(0)]]) {\n"
+     "  constexpr sampler noiseSampler(filter::nearest, address::repeat);\n"
     "  if (u.probeRast > 0) return float4(in.cvt.x, in.cvt.y, in.cvt.z, 1.0f);\n"
     "  // GL gl_FragCoord is y-up; Metal fragment position is y-down, so flip\n"
     "  // y to match GL's ray field exactly.\n"
@@ -450,22 +458,32 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
     "  float tStart = max(tEnter, 0.0f);\n"
     "  float physPerNorm = length(rayDir * u.boundsSize.xyz);\n"
     "  float stepSize = u.sampleDistMM / max(physPerNorm, 1e-6f);\n"
-    "  if (u.jitter > 0) {\n"
-    "    // GL reference field and semantics: kBlueNoise64 per-pixel, pure\n"
-    "    // origin shift (the app's parity branch + GL's tStart += jitter).\n"
-    "    float2 fid = floor(in.position.xy);\n"
-    "    int2 t = int2(int(fid.x) & 63, int(u.rtSize - fid.y) & 63);\n"
-    "    float jitterF = (kBlue64[t.y * 64 + t.x] / 255.0f) * stepSize;\n"
-    "    tStart += jitterF;\n"
-    "  }\n"
+    "  if (u.jitter == 2) {\n"
+     "    // CONSTANT-PHASE DEBUG (Metal): fixed half-step, no per-pixel phase,\n"
+     "    // no noise fetch — isolates incoherence vs noise-tap cost.\n"
+     "    tStart += 0.5f * stepSize;\n"
+"  } else if (u.jitter > 0) {\n"
+     "    // GL reference field and semantics: kBlueNoise64 per-pixel, pure\n"
+     "    // origin shift (the app's parity branch + GL's tStart += jitter).\n"
+     "    float2 fid = floor(in.position.xy);\n"
+     "    float jitterF;\n"
+     "    if (u.probeTexNoise > 0) {\n"
+     "      jitterF = noiseTex.sample(noiseSampler, float2(fid.x, u.rtSize - fid.y) / 64.0f).x * stepSize;\n"
+     "    } else {\n"
+     "      int2 t = int2(int(fid.x) & 63, int(u.rtSize - fid.y) & 63);\n"
+     "      jitterF = (kBlue64[t.y * 64 + t.x] / 255.0f) * stepSize;\n"
+     "    }\n"
+     "    if (u.jitter == 4) tStart = jitterF + ceil((tStart - jitterF) / stepSize) * stepSize;\n"
+     "    else tStart += jitterF;\n"
+     "  }\n"
     "  int maxSteps = max(0, int(ceil((tExit - tStart) / stepSize)));\n"
     "  float3 texelCount = float3(volTex.get_width(), volTex.get_height(), volTex.get_depth());\n"
     "  float3 ctpScale = max(texelCount - 1.0f, 1e-4f) / texelCount;\n"
     "  float3 ctpOffset = 0.5f / texelCount;\n"
     "  float3 evalBase = ctpOffset + (eye + rayDir * tStart) * ctpScale;\n"
     "  float3 evalStep = rayDir * ctpScale * stepSize;\n"
-    "  constexpr sampler volSampler(filter::linear, address::clamp_to_edge);\n"
-    "  constexpr sampler tfSampler(filter::linear, address::clamp_to_edge);\n"
+"  constexpr sampler volSampler(filter::linear, address::clamp_to_edge);\n"
+     "  constexpr sampler tfSampler(filter::linear, address::clamp_to_edge);\n"
     "  float3 accColor = float3(0.0f);\n"
     "  float accOp = 0.0f;\n"
     "  for (int i = 0; i < min(u.maxIter, maxSteps); i++) {\n"
@@ -498,18 +516,26 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
     float sampleDistMM;
     int jitter, maxIter;
     float rtSize;
-    int probeRast, probeFS, ndcCorners;
+    int probeRast, probeFS, ndcCorners, probeTexNoise;
   } u;
   u.eye = (simd_float4){ kEye[0], kEye[1], kEye[2], 0.0f };
   u.boundsSize = (simd_float4){ kBounds[0], kBounds[1], kBounds[2], 0.0f };
   memcpy(&u.invVP, kInvVP, 16 * sizeof(float));
   memcpy(&u.vp, kVP, 16 * sizeof(float));
   u.sampleDistMM = sdMM; u.jitter = jitter; u.maxIter = 8192;
-  u.rtSize = (float)rt; u.probeRast = getenv("PROBE_RAST") ? 1 : 0; u.probeFS = getenv("PROBE_FULLSCREEN") ? 1 : 0; u.ndcCorners = getenv("NDC_CORNERS") ? 1 : 0;
+  u.rtSize = (float)rt; u.probeRast = getenv("PROBE_RAST") ? 1 : 0; u.probeFS = getenv("PROBE_FULLSCREEN") ? 1 : 0; u.ndcCorners = getenv("NDC_CORNERS") ? 1 : 0; u.probeTexNoise = getenv("NOISE_TEX") ? 1 : 0;
   id<MTLBuffer> ubuf = [device newBufferWithBytes:&u length:sizeof(u) options:MTLResourceStorageModeShared];
   id<MTLBuffer> corners = [device newBufferWithBytes:kBoxCorners length:sizeof(kBoxCorners) options:MTLResourceStorageModeShared];
   float fsq[9] = { -1,-1,0.5,  3,-1,0.5,  -1,3,0.5 };
   id<MTLBuffer> fsqBuf = [device newBufferWithBytes:fsq length:sizeof(fsq) options:MTLResourceStorageModeShared];
+
+  // NOISE_TEX A/B: 64x64 R8Unorm blue-noise tile (GL's field) for the
+  // texture2d variant of the jitter tap — vs the in-shader kBlue64 constant.
+  MTLTextureDescriptor* ntd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:64 height:64 mipmapped:NO];
+  ntd.usage = MTLTextureUsageShaderRead;
+  ntd.storageMode = MTLStorageModeShared;
+  id<MTLTexture> noiseTex = [device newTextureWithDescriptor:ntd];
+  [noiseTex replaceRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0 withBytes:kBlue64 bytesPerRow:64];
 
   for (int f = 0; f < 5; f++) {          // warm-up
     MTLRenderPassDescriptor* rpd = [[MTLRenderPassDescriptor alloc] init];
@@ -526,6 +552,7 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
     [wenc setCullMode:cm ? (strcmp(cm,"front")==0 ? MTLCullModeFront : strcmp(cm,"back")==0 ? MTLCullModeBack : MTLCullModeNone) : MTLCullModeNone];
     [wenc setFragmentTexture:volTex atIndex:0];
     [wenc setFragmentTexture:tfTex atIndex:1];
+    [wenc setFragmentTexture:noiseTex atIndex:2];
     [wenc setFragmentBuffer:ubuf offset:0 atIndex:0];
     [wenc setVertexBuffer:ubuf offset:0 atIndex:0];
     [wenc setVertexBuffer:(getenv("PROBE_FULLSCREEN") ? fsqBuf : corners) offset:0 atIndex:1];
@@ -553,6 +580,7 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
     [enc setCullMode:cm2 ? (strcmp(cm2,"front")==0 ? MTLCullModeFront : strcmp(cm2,"back")==0 ? MTLCullModeBack : MTLCullModeNone) : MTLCullModeNone];
     [enc setFragmentTexture:volTex atIndex:0];
     [enc setFragmentTexture:tfTex atIndex:1];
+    [enc setFragmentTexture:noiseTex atIndex:2];
     [enc setFragmentBuffer:ubuf offset:0 atIndex:0];
     [enc setVertexBuffer:ubuf offset:0 atIndex:0];
     [enc setVertexBuffer:(getenv("PROBE_FULLSCREEN") ? fsqBuf : corners) offset:0 atIndex:1];
@@ -627,10 +655,11 @@ int main(int argc, const char** argv)
     int j1mode = 1;
     if (argc > 5 && strcmp(argv[5], "constphase") == 0) j1mode = 2;
     if (argc > 5 && strcmp(argv[5], "fetchonly") == 0) j1mode = 3;
+    if (argc > 5 && strcmp(argv[5], "lattice") == 0) j1mode = 4;
     double g0 = RunGL(rt, sd, frames, vol, tf, 0);
     double g1 = RunGL(rt, sd, frames, vol, tf, j1mode);
     double m0 = RunMetal(rt, sd, frames, vol, tf, 0);
-    double m1 = RunMetal(rt, sd, frames, vol, tf, j1mode == 2 ? 0 : 1);
+    double m1 = RunMetal(rt, sd, frames, vol, tf, j1mode);
 
     fprintf(stderr, "\nGL    j0 %8.3f   j1 %8.3f   jitter %+6.1f%%\n", g0, g1, (g1 / g0 - 1.0) * 100.0);
     fprintf(stderr, "METAL j0 %8.3f   j1 %8.3f   jitter %+6.1f%%\n", m0, m1, (m1 / m0 - 1.0) * 100.0);
