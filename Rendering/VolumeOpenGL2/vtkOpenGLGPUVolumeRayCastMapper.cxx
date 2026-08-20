@@ -3740,6 +3740,25 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::SetCameraShaderParameters(
   prog->SetUniformMatrix("in_projectionMatrix", projectionMatrix);
   prog->SetUniformMatrix("in_inverseProjectionMatrix", this->InverseProjectionMat.GetPointer());
 
+  // INVESTIGATION (TEMP): dump the real camera matrices — revert before landing.
+  {
+    FILE* dm = fopen("/tmp/app_matrices.txt", "w");
+    if (dm)
+    {
+      fprintf(dm, "projection:\n");
+      for (int r = 0; r < 4; r++)
+        fprintf(dm, "  %12.8g %12.8g %12.8g %12.8g\n", projectionMatrix->GetElement(r, 0), projectionMatrix->GetElement(r, 1), projectionMatrix->GetElement(r, 2), projectionMatrix->GetElement(r, 3));
+      fprintf(dm, "modelview:\n");
+      for (int r = 0; r < 4; r++)
+        fprintf(dm, "  %12.8g %12.8g %12.8g %12.8g\n", modelViewMatrix->GetElement(r, 0), modelViewMatrix->GetElement(r, 1), modelViewMatrix->GetElement(r, 2), modelViewMatrix->GetElement(r, 3));
+      double epos[3], fp[3], vu[3];
+      cam->GetPosition(epos); cam->GetFocalPoint(fp); cam->GetViewUp(vu);
+      fprintf(dm, "eye: %12.8g %12.8g %12.8g\nfocal: %12.8g %12.8g %12.8g\nviewup: %12.8g %12.8g %12.8g\n",
+              epos[0], epos[1], epos[2], fp[0], fp[1], fp[2], vu[0], vu[1], vu[2]);
+      fclose(dm);
+    }
+  }
+
   this->InverseModelViewMat->DeepCopy(modelViewMatrix);
   this->InverseModelViewMat->Invert();
   prog->SetUniformMatrix("in_modelViewMatrix", modelViewMatrix);
@@ -4069,12 +4088,47 @@ void vtkOpenGLGPUVolumeRayCastMapper::vtkInternal::RenderSingleInput(
         }
         fclose(f);
       }
+      glActiveTexture(GL_TEXTURE0);
       fprintf(stderr, "DBG uniforms dumped to /tmp/app_gl_uniforms.txt\n");
     }
 
     this->RenderVolumeGeometry(ren, prog, vol, block->VolumeGeometry);
 
     this->FinishRendering(numComp);
+
+    // INVESTIGATION (temporary): dump the bound TF textures so the harness
+    // can reproduce the exact tables. Revert before landing.
+    static bool dbgTfDumped = false;
+    if (!dbgTfDumped && std::getenv("VTK_METAL_TEST_DUMP_UNIFORMS"))
+    {
+      dbgTfDumped = true;
+      auto& input = this->Parent->AssembledInputs[0];
+      auto* opTab = input.OpacityTables->GetTable(0);
+      auto* rgbTab = input.RGBTables->GetTable(0);
+      opTab->Activate();
+      GLint w = 0;
+      glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+      if (w > 0)
+      {
+        std::vector<float> tbl((size_t)w * 4);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, tbl.data());
+        FILE* f2 = fopen("/tmp/app_gl_tfopacity.bin", "wb");
+        if (f2) { fwrite(tbl.data(), sizeof(float), (size_t)w * 4, f2); fclose(f2); }
+        fprintf(stderr, "DBG opacity TF %dx1 -> /tmp/app_gl_tfopacity.bin\n", w);
+      }
+      opTab->Deactivate();
+      rgbTab->Activate();
+      glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+      if (w > 0)
+      {
+        std::vector<float> tbl((size_t)w * 4);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, tbl.data());
+        FILE* f2 = fopen("/tmp/app_gl_tfcolor.bin", "wb");
+        if (f2) { fwrite(tbl.data(), sizeof(float), (size_t)w * 4, f2); fclose(f2); }
+        fprintf(stderr, "DBG color TF %dx1 -> /tmp/app_gl_tfcolor.bin\n", w);
+      }
+      rgbTab->Deactivate();
+    }
 
     // INVESTIGATION (temporary): dump the volume pass framebuffer so the
     // app's real iteration image can be compared with the harness. Revert

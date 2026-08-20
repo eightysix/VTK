@@ -126,6 +126,10 @@ equalized the field; the app may not be equalized. This would explain Metal's
 in-app penalty with zero harness discrepancy. Check which branch
 `MetalShaders.metal` actually compiles for the current pipeline.
 
+> RESOLVED (2026-08-20 evening session): refuted as the *cause* of the app gap.
+> Both backends are per-pixel fields in the target config (below); the gap
+> survives the field match. Details in §6.
+
 ## 4. Plan
 
 1. **Dump the app's composed GL fragment source** (TEMP hook in
@@ -143,6 +147,93 @@ in-app penalty with zero harness discrepancy. Check which branch
    Metal read path under the app's exact field (sharp vs tile) with the
    harness's A/B knobs (`lattice`, `NOISE_TEX`, `constphase`) — the
    explanation space is prepared in `jitter_gap_repro/RESULTS.md`.
+
+## 6. Update (2026-08-20 evening session)
+
+Phase-1 checks executed. New facts that change the picture:
+
+### 6.1 Field mapping corrected: GL's noise sampling is per-pixel, not block-constant
+
+`gl_FragCoord.xy / vec2(textureSize(in_noiseSampler, 0))` with NEAREST maps
+`texel = floor(gl_FragCoord.xy / 64 * 64) = integer pixel coords mod 64` —
+**each pixel gets its own noise value, tiled every 64 px** (app GL,
+`vtkVolumeShaderComposer.h`; harness GL identical). The harness's earlier
+"block-constant 32 px" reading was an arithmetic slip.
+
+`VTK_METAL_TEST_JITTER_PARITY=1` does **NOT** reproduce GL's field: it
+quantizes the noise to `viewportH/64`-px blocks (32 px at 2048), a *different*
+field that renders with gross 32-px banding GL never shows. The flag is a
+timing-parity hack, not visual parity. **Do not use it for A/B.**
+
+### 6.2 The app benchmark A/B is field-mismatched on Metal by default
+
+`TestMetalScenes.h:1242-1249`: with `VTK_METAL_TEST_JITTER=1` and no
+`VTK_METAL_TEST_IGN_JITTER`, the Metal mapper is set to `UseIGNJitter = true`
+→ Metal jitters with per-pixel Interleaved Gradient Noise, GL with per-pixel
+blue noise. Both are per-pixel scattered, so the IGN-vs-blue choice is
+cost-neutral — but it is NOT the config that matches GL's field.
+
+### 6.3 Measured this session (back-to-back, 2048/SD4, 30 frames)
+
+| config | j0 | j1 | jitter Δ | M/GL j1 |
+|---|---|---|---|---|
+| GL (per-pixel blue noise, app native) | 48.78 | 60.67 (52.64 rerun) | +12.0 ms / +24% | — |
+| Metal per-pixel blue noise (`IGN_JITTER=0`) | 43.96 | 68.35 | +24.4 ms / +55% | 1.30 |
+| Metal per-pixel IGN (bench default) | 43.96 | 69.87 | +25.9 ms / +59% | 1.30 |
+| Metal GL-parity 32-px block (`JITTER_PARITY=1`) | 43.96 | 44.34 | +0.4 ms / +1% | 0.84 |
+
+Visual parity (GL vs Metal per-pixel blue noise): mean abs diff 0.064/255,
+9.5% of pixels differ, max 122 — the renders are equivalent.
+
+### 6.4 What survives
+
+- The app Metal jitter penalty (+24-26 ms) matches the harness Metal
+  (+24.7 ms) on a per-pixel field — the harness is faithful on Metal.
+- The app GL jitter penalty (+12 ms) is ~2x cheaper than the harness GL
+  (+25.2 ms) on an identical per-pixel field. The harness over-charges GL —
+  §2's conclusion stands, and it is NOT a field-shape effect.
+- The app M/GL j1 ~1.29-1.30 persists with matched per-pixel fields on both
+  backends. The asymmetry is real, sits on the GL side (app GL jitter is
+  anomalously cheap, or the harness GL march is heavy), and the harness's
+  equalized field cannot reproduce it.
+
+### 6.5 Target configuration for reproduction (visual parity to GL)
+
+The config that renders identically to GL is the **per-pixel blue-noise**
+field on both backends:
+
+```
+# GL side (app native): per-pixel 64-tile blue noise
+VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 \
+VTK_METAL_TEST_MINMAX=0 VTK_METAL_TEST_ACCEL=0 VTK_METAL_TEST_NUM_SLABS=1 \
+VTK_METAL_TEST_JITTER=1 build_macos_metal/bin/vtkMetalGLVisualComparison \
+  --bench --backend gl --scene DICOMVolume \
+  --dicom /Users/macair/Public/IMR/CTIMR/IMRToraceAddome \
+  --frames 30 --reps 1 --size 2048x2048
+
+# Metal side (app default blue-noise, IGN off — NOT the bench default)
+VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 \
+VTK_METAL_TEST_MINMAX=0 VTK_METAL_TEST_ACCEL=0 VTK_METAL_TEST_NUM_SLABS=1 \
+VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_IGN_JITTER=0 \
+  build_macos_metal/bin/vtkMetalGLVisualComparison \
+  --bench --backend metal --scene DICOMVolume \
+  --dicom /Users/macair/Public/IMR/CTIMR/IMRToraceAddome \
+  --frames 30 --reps 1 --size 2048x2048
+```
+
+Do NOT set `VTK_METAL_TEST_JITTER_PARITY` (block-quantized; gross, not
+GL-parity). Do NOT leave `IGN_JITTER` unset (forces IGN).
+
+### 6.6 Next
+
+The remaining open question is the GL side: why is app GL jitter ~+12 ms while
+harness GL (same field, same march semantics, same TF, same early-exit) is
+~+25 ms? Candidates: GL thermal variance is huge (±15% run-to-run; j1 measured
+60.67 vs 52.64 in the same session), the app's depth-buffer-driven
+`g_terminatePointMax`/discard path, or the per-step texture-space vs
+ray-parameter coordinate differences. Instrument the harness GL with the app's
+`g_currentT`-to-red iteration encoding (`VTK_METAL_TEST_GL_ITER=1`) and compare
+iteration distributions.
 
 ## 5. Files
 
