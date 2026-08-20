@@ -1,0 +1,514 @@
+================================================================================
+JITTER PENALTY — METAL vs GL: VERBATIM EVIDENCE EXPORT
+================================================================================
+Generated 2026-08-19 from the working tree at Rendering/Metal.
+
+Layout:
+  A. Metal backend — jitter path in shader and mapper
+  B. GL backend — jitter path in shader composer and render window
+  C. Test environment — recipes, env table, measured results
+
+================================================================================
+A. METAL BACKEND
+================================================================================
+
+--------------------------------------------------------------------------------
+A1. VolumeMapperUniforms jitter fields
+    Rendering/Metal/Shaders/MetalShaders.metal:2901-2917 (verbatim)
+--------------------------------------------------------------------------------
+  float useIGNJitter;
+  // 1.0 = sample the 64x64 blue-noise tile through a LINEAR+REPEAT sampler
+  // (correlated jitter field, production default) instead of point-sampling
+  // kBlueNoise64. Bilinear filtering keeps adjacent SIMT lanes near lockstep
+  // (jitter_lag_repro: +4% at 2048/SD4 vs +24% point / +60% per-pixel) and
+  // softens the tile's high-frequency amplitude instead of quantizing it to
+  // viewport/64 px blocks like GL's NEAREST sampling.
+  float useTextureJitter;
+  // Pixels per IGN-jitter coherence block (default 1 = legacy per-pixel).
+  // Jittering every fragment independently makes adjacent lanes take divergent
+  // min-max skip paths; a small block keeps the stochastic offset while
+  // restoring lockstep marching (measured -20% at sample distance 4, bit-identical
+  // at 0.5 where sub-voxel offsets round to the same lattice). Opt-in: the
+  // legacy per-pixel output stays the default for bit-identical renders.
+  float jitterBlockSize;
+
+--------------------------------------------------------------------------------
+A2. sampleJitterNoise / sampleIGNJitter
+    Rendering/Metal/Shaders/MetalShaders.metal:3329-3380 (verbatim)
+--------------------------------------------------------------------------------
+inline float sampleJitterNoise(float2 st, float viewportH, float blockSize,
+    texture2d<float> noiseTexture, float useTextureJitter) {
+  if (useTextureJitter > 0.5f)
+  {
+    // Correlated noise-texture sampling (production default, 2026-08-19):
+    // sample the 64x64 blue-noise tile with LINEAR + REPEAT at position.xy/64,
+    // y-flipped for Metal's flipped texture origin vs GL. Bilinear filtering
+    // correlates the jitter field spatially so adjacent SIMT lanes stay near
+    // lockstep — jitter_lag_repro measured +24% j1 at 2048/SD4 vs +58% for
+    // per-pixel point sampling (the legacy path below), closing the M/GL gap
+    // from 1.33x to 1.04x. The filter also lowers the tile's high-frequency
+    // amplitude (anti-banding) instead of quantizing it to viewport/64 px
+    // blocks like GL's NEAREST sampling.
+    constexpr sampler noiseSampler(filter::linear, address::repeat);
+    return noiseTexture.sample(noiseSampler, float2(st.x, viewportH - st.y) / 64.0f).r;
+  }
+  // GL-parity per-pixel sampling (2026-08-19): GL samples the 64x64 tile at
+  // gl_FragCoord.xy/64 with NEAREST + REPEAT, i.e. texel = pixel mod 64 —
+  // PER-PIXEL (the tile repeats every 64px), which is why GL's jitter is fine
+  // grain, not 32px blocks. The earlier block-division form (floor(x/texel))
+  // produced visible 32px ripple blocks and was rejected. The correct GL
+  // field: kBlueNoise64[(pixel.y mod 64) * 64 + (pixel.x mod 64)] with GL's
+  // bottom-up y.
+  if (blockSize < 0.5f)
+  {
+    int2 t = int2(int(st.x) & 63, int(viewportH - st.y) & 63);
+    return float(kBlueNoise64[t.y * 64 + t.x]) / 255.0f;
+  }
+  // Block-coherent sampling (2026-08-18): quantize the pixel coordinate to
+  // the jitter block cell so adjacent pixels march in lockstep (per-pixel
+  // jitter scatters warps and costs ~+57% on the raw path; block4 brings it
+  // to GL's +27% level). blockSize 1 = legacy per-pixel (bit-identical).
+  // NOTE: never divide by the raw blockSize — nSize 0 (GL-parity above)
+  // would make this div-by-zero NaN and trap the shader under fast-math
+  // speculation (the black-render bug, 2026-08-19).
+  float bs = max(blockSize, 1.0f);
+  st = floor(st / bs) * bs + 0.5f * bs;
+  int2 t = int2(floor(st.x), floor(st.y - viewportH)) & 63;
+  return float(kBlueNoise64[t.y * 64 + t.x]) / 255.0f;
+}
+
+// Interleaved Gradient Noise (Jimenez 2014), the jitter used before the GL
+// blue-noise tile landed. Smooth, low-discrepancy, deterministic per pixel,
+// no sin-hash streaks, no texture required. Selected per-render via
+// volumeUniforms.useIGNJitter; the default stays on the GL-parity blue noise.
+inline float sampleIGNJitter(float2 st, float blockSize) {
+  // Never divide by the raw blockSize: nSize 0 (GL-parity) would make this
+  // div-by-zero NaN (fast-math) and kill the march (2026-08-19).
+  blockSize = max(blockSize, 1.0f);
+  float2 blockCenter = floor(st / blockSize) * blockSize + 0.5f * blockSize;
+  return fract(52.9829189 * fract(dot(blockCenter, float2(0.06711056, 0.00583715))));
+}
+
+--------------------------------------------------------------------------------
+A3. sampleVolumeScalar — the in-loop volume fetch
+    Rendering/Metal/Shaders/MetalShaders.metal:3452-3462 (verbatim)
+--------------------------------------------------------------------------------
+inline float sampleVolumeScalar(texture3d<float> volTex, float3 pos) {
+  if (fc_marchVariant == 1)  // manual 8-tap trilinear (see above)
+  {
+      return volTex.sample(sVolumeClampZero, pos, level(0)).r;
+  }
+  if (fc_linearInterpolation > 0.5)
+    return volTex.sample(sVolume, pos, level(0)).r;
+  return volTex.sample(sNearest, pos, level(0)).r;
+}
+
+--------------------------------------------------------------------------------
+A4. MarchParams struct + firstT
+    Rendering/Metal/Shaders/MetalShaders.metal:4053-4066 and 4170-4176
+    (verbatim)
+--------------------------------------------------------------------------------
+struct MarchParams {
+    float3 rayOrigin;
+    float3 rayDir;
+    float  tStart;
+    float  tEnd;
+    float  stepSize;
+    float  jitter;
+    float  tTerminateMax;
+    float3 blockMinGlobal;
+    float3 blockMaxGlobal;
+    float3 texMinGlobal;
+    float3 texMaxGlobal;
+    bool   checkBounds;
+};
+
+  float firstT = p.checkBounds
+      ? p.jitter
+      : p.jitter + ceil((p.tStart - p.jitter) / p.stepSize) * p.stepSize;
+  float3 stepVec = p.rayDir * p.stepSize;
+  float3 currentPoint = p.rayOrigin + p.rayDir * (p.checkBounds ? p.tStart : 0.0)
+                      + p.rayDir * firstT;
+  float currentT = firstT;
+
+--------------------------------------------------------------------------------
+A5. Fragment entry (fullscreen path)
+    Rendering/Metal/Shaders/MetalShaders.metal:5923-5958 (verbatim)
+--------------------------------------------------------------------------------
+  (void)exitPoint;
+  (void)totalDist;
+  float jitter = (volumeUniforms.useJittering > 0.5
+      ? (volumeUniforms.useIGNJitter > 0.5
+            ? sampleIGNJitter(screenPos, volumeUniforms.jitterBlockSize)
+            : sampleJitterNoise(screenPos, volumeUniforms.viewportSize.y, volumeUniforms.jitterBlockSize,
+                  noiseTexture, volumeUniforms.useTextureJitter))
+      : 1.0) * stepSize;
+  float tStart = dot(entryPoint - cameraPos, rayDir);
+  // OpenGL camera-inside parity (update 22): GL ignores the box/near-plane
+  // entry for camera-inside proxy fragments and marches from the interpolated
+  // anchor (g_rayOrigin = ip_textureCoords + one step), so far-face fragments
+  // start at z>1 and only composite the clamped far slab instead of re-marching
+  // the volume from the near plane. setupVolumeRay recomputes the near-plane
+  // entry for those same fragments; clamp tStart to the anchor distance whenever
+  // the anchor lies beyond the computed entry (the cap anchor coincides with the
+  // entry, so cap fragments are unchanged; the fullscreen path passes
+  // localPos == entryPoint, so this is a no-op there).
+  if (volumeUniforms.useCameraInsideNearClip > 0.5 &&
+      volumeUniforms.useParallelProjection < 0.5)
+  {
+    float tStartAnchor = dot(localPos - cameraPos, rayDir);
+    if (tStartAnchor > tStart)
+    {
+      tStart = tStartAnchor;
+    }
+  }
+  MarchParams p = {cameraPos, rayDir, tStart, totalBoxT, stepSize, jitter, tTerminateMax,
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, true};
+  return marchVolumeUnified(p, initialColor, initialOpacity, slabFar,
+      volumeUniforms, b, volumeTexture, transferFunctionTexture,
+      transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
+      transferFunction2DTexture, transfer2DYAxisTexture,
+      gradientOpacityTexture, maskTexture, labelMapTransferTexture,
+      minMaxTexture, normalTexture, blankingTexture, rectCoords, lightUniforms,
+      nullptr, nullptr);
+
+--------------------------------------------------------------------------------
+A6. Fragment entry (render-to-texture path)
+    Rendering/Metal/Shaders/MetalShaders.metal:6340-6353 (verbatim)
+--------------------------------------------------------------------------------
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal, blockMaxGlobal,
+      in.position.xy, volumeUniforms.viewportSize, volumeUniforms, depthTexture);
+  if (!s.valid) { output.color = float4(0.0); output.depth = 1.0; return output; }
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+  float jitter = (volumeUniforms.useJittering > 0.5
+      ? (volumeUniforms.useIGNJitter > 0.5
+            ? sampleIGNJitter(in.position.xy, volumeUniforms.jitterBlockSize)
+            : sampleJitterNoise(in.position.xy, volumeUniforms.viewportSize.y, volumeUniforms.jitterBlockSize,
+                  noiseTexture, volumeUniforms.useTextureJitter))
+      : 1.0) * stepSize;
+  float tStart = parallel ? 0.0 : dot(s.entryPoint - cameraPos, rayDir);
+  MarchParams p = {rayOrigin, rayDir, tStart, s.totalBoxT, stepSize, jitter, s.tTerminateMax,
+      blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, true};
+
+--------------------------------------------------------------------------------
+A7. Fragment entry (grid-traversal path)
+    Rendering/Metal/Shaders/MetalShaders.metal:6634-6645 (verbatim)
+--------------------------------------------------------------------------------
+    // Global sample schedule. Jitter must use the same per-pixel coordinate as
+    // the fullscreen/RTT passes (in.position.xy == GL gl_FragCoord.xy) so the
+    // sample lattice has the same phase in grid traversal and the composite
+    // passes; the previous +0.5 half-pixel shift desynchronized the grid pass
+    // from the rest and from GL's in_noiseSampler(gl_FragCoord.xy) sampling.
+    float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+    float jitter = volumeUniforms.useJittering > 0.5
+        ? (volumeUniforms.useIGNJitter > 0.5
+              ? sampleIGNJitter(in.position.xy + float2(0.5, 0.5), volumeUniforms.jitterBlockSize) * stepSize
+              : sampleJitterNoise(in.position.xy, volumeUniforms.viewportSize.y, volumeUniforms.jitterBlockSize,
+                    noiseTexture, volumeUniforms.useTextureJitter) * stepSize)
+        : 1.0 * stepSize;
+
+--------------------------------------------------------------------------------
+A8. Mapper: noise tile creation
+    Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.mm:6096-6114 (verbatim)
+--------------------------------------------------------------------------------
+    // Correlated-jitter noise tile (production default): 64x64 R8Unorm blue
+    // noise sampled at position.xy/64 with LINEAR+REPEAT (see sampleJitterNoise
+    // in MetalShaders.metal). Shared across all volume passes; texture(16).
+    if (!this->NoiseTexture)
+    {
+      id<MTLTexture> noiseTex = NewTexture2D(
+        device,
+        MTLPixelFormatR8Unorm,
+        64, 64,
+        MTLTextureUsageShaderRead,
+        MTLStorageModeShared);
+      if (noiseTex)
+      {
+        MTLRegion region = MTLRegionMake2D(0, 0, 64, 64);
+        [noiseTex replaceRegion:region mipmapLevel:0
+          withBytes:vtkBlueNoise64 bytesPerRow:64];
+        AssignMetalObject(this->NoiseTexture, noiseTex);
+      }
+    }
+
+--------------------------------------------------------------------------------
+A9. Mapper: jitter uniform defaults + env overrides
+    Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.mm:7357-7382 (verbatim)
+--------------------------------------------------------------------------------
+  uniforms.UseJittering = this->GetUseJittering() ? 1.0f : 0.0f;
+  // Production default (2026-08-19): the GL-parity block field — kBlueNoise64
+  // indexed at int2(floor(x/texel), floor((y-rt)/texel)) & 63, i.e. the jitter
+  // is constant over viewportH/64 px blocks, EXACTLY GL's field (GL samples
+  // the 64x64 tile at gl_FragCoord.xy/64 with NEAREST). Measured ~free on the
+  // pathological DICOM cell: Metal j1-parity 44.6ms vs j0 43.9ms (+2%), vs
+  // +59% for per-pixel and +57% for the bilinear tile. Block-constant keeps
+  // SIMD lanes in lockstep; bilinear filtering does NOT (continuous phase
+  // field) — the earlier bilinear-tile production default is retired.
+  uniforms.UseIGNJitter = 0.0f;
+  uniforms.UseTextureJitter = 0.0f;
+  uniforms.JitterBlockSize = 0.0f;
+  // Env overrides for A/B comparison. Nothing else may enable IGN or clobber
+  // the production block-field default.
+  if (const char* ign = std::getenv("VTK_METAL_TEST_JITTER_IGN"); ign && std::atoi(ign) != 0)
+  {
+    uniforms.UseIGNJitter = 1.0f;
+  }
+  else if (const char* sharp = std::getenv("VTK_METAL_TEST_JITTER_SHARP"); sharp && std::atoi(sharp) != 0)
+  {
+    uniforms.JitterBlockSize = 1.0f;  // per-pixel kBlueNoise64 (point-sampled)
+  }
+  else if (const char* tex = std::getenv("VTK_METAL_TEST_JITTER_TEXTURE"); tex && std::atoi(tex) != 0)
+  {
+    uniforms.UseTextureJitter = 1.0f;  // bilinear tile (measured = sharp, kept for study)
+  }
+
+================================================================================
+B. GL BACKEND
+================================================================================
+
+--------------------------------------------------------------------------------
+B1. Shader-composer jitter
+    Rendering/VolumeOpenGL2/vtkVolumeShaderComposer.h:442-466 (verbatim)
+--------------------------------------------------------------------------------
+  shaderStr << "\
+          \n float jitterValue = 0.0;\
+          \n";
+
+  if (glMapper->GetBlendMode() != vtkVolumeMapper::SLICE_BLEND)
+  {
+    // Intersection is computed with g_rayOrigin, so we should not modify it with Slice mode
+    if (glMapper->GetUseJittering())
+    {
+      shaderStr << "\
+          \n    jitterValue = texture2D(in_noiseSampler, gl_FragCoord.xy /\
+                                              vec2(textureSize(in_noiseSampler, 0))).x;\
+          \n    g_rayJitter = g_dirStep * jitterValue;\
+          \n";
+    }
+    else
+    {
+      shaderStr << "\
+        \n    g_rayJitter = g_dirStep;\
+        \n";
+    }
+    shaderStr << "\
+        \n  g_rayOrigin += g_rayJitter;\
+        \n";
+  }
+
+--------------------------------------------------------------------------------
+B2. GL shadow-pass jitter usage
+    Rendering/VolumeOpenGL2/vtkVolumeShaderComposer.h:2342-2352 (verbatim)
+--------------------------------------------------------------------------------
+  resStr += functionSignature + "{\n" + declarations + rayInit +
+    R"***(
+  float current_dist = 0.0;
+  float current_step = g_lengthStep;
+  float clamped_step = 0.0;
+  while(current_dist < maxdist)
+  {
+    clamped_step = min(maxdist - current_dist, current_step);
+    sampled_dist = current_dist + clamped_step * g_jitterValue;
+    sampled_point = sample_position + sampled_dist * norm_dir;
+    )***" +
+
+--------------------------------------------------------------------------------
+B3. GL noise texture creation
+    Rendering/OpenGL2/vtkOpenGLRenderWindow.cxx:3045-3090 (verbatim)
+--------------------------------------------------------------------------------
+int vtkOpenGLRenderWindow::GetNoiseTextureUnit()
+{
+  if (!this->NoiseTextureObject)
+  {
+    this->NoiseTextureObject = vtkTextureObject::New();
+    this->NoiseTextureObject->SetContext(this);
+  }
+
+  if (this->NoiseTextureObject->GetHandle() == 0)
+  {
+    vtkNew<vtkJPEGReader> textureReader;
+    textureReader->SetFileName("BlueNoiseTexture64x64.jpg");
+    textureReader->Update();
+
+    vtkImageData* image = textureReader->GetOutput();
+    int* dims = image->GetDimensions();
+    int bufferSize = dims[0] * dims[1];
+    float* noiseTextureData = new float[bufferSize];
+
+    for (int i = 0; i < bufferSize; i++)
+    {
+      noiseTextureData[i] = textureReader->GetScalarComponentAsFloat(0, 0, 0, 0) / 255.0f;
+    }
+
+    this->NoiseTextureObject->Create2DFromRaw(64, 64, 1, VTK_FLOAT, noiseTextureData);
+    this->NoiseTextureObject->SetWrapS(vtkTextureObject::Repeat);
+    this->NoiseTextureObject->SetWrapT(vtkTextureObject::Repeat);
+    this->NoiseTextureObject->SetMagnificationFilter(vtkTextureObject::Nearest);
+    this->NoiseTextureObject->SetMinificationFilter(vtkTextureObject::Nearest);
+    delete[] noiseTextureData;
+  }
+
+  int result = this->GetTextureUnitForTexture(this->NoiseTextureObject);
+  this->NoiseTextureObject->Activate();
+  return this->GetTextureUnitForTexture(this->NoiseTextureObject);
+}
+
+--------------------------------------------------------------------------------
+B4. GL shader globals
+    Rendering/VolumeOpenGL2/shaders/raycasterfs.glsl:48 and 262 (verbatim)
+--------------------------------------------------------------------------------
+float g_jitterValue = 0.0;
+
+  g_jitterValue = jitterValue;
+
+--------------------------------------------------------------------------------
+B5. GL noise sampler binding
+    Rendering/OpenGL2/vtkOpenGLGPUVolumeRayCastMapper.cxx:3687 (verbatim)
+--------------------------------------------------------------------------------
+    prog->SetUniformi("in_noiseSampler", win->GetNoiseTextureUnit());
+
+================================================================================
+C. TEST ENVIRONMENT
+================================================================================
+
+--------------------------------------------------------------------------------
+C1. App benchmark recipes
+    Rendering/Metal/PerformanceInvestigation/SLAB_BENCHMARKS.md §1.1-1.2
+    (verbatim)
+--------------------------------------------------------------------------------
+### 1.1 Canonical recipe (PERFORMANCE_INVESTIGATION.md §5.4)
+
+```sh
+./macos_metal_build.sh --resume --tests     # MUST relink the test binary after
+                                            # .metal edits (stale-binary trap, §17.2)
+
+VTK_METAL_TEST_SAMPLE_DISTANCE=0.5 VTK_METAL_TEST_JITTER=1 \
+VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_MINMAX=1 \
+VTK_METAL_TEST_ACCEL=0 \
+build_macos_metal/bin/vtkMetalGLVisualComparison \
+  --bench --backend gl --scene DICOMVolume \
+  --dicom /Users/macair/Public/IMR/CTIMR/IMRToraceAddome \
+  --frames 30 --reps 1
+```
+
+Swap `--backend gl` for `--backend metal`. GL is timed with `glFinish`, Metal
+with `WaitForCompletion`, so numbers are comparable (GPU time).
+
+### 1.2 Raw-path (minmax off) / slab-era recipe
+
+The slab investigation measures the raw march with min-max acceleration off:
+
+```sh
+VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_JITTER=1 \
+VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_MINMAX=0 \
+VTK_METAL_TEST_ACCEL=0 \
+[VTK_METAL_TEST_NUM_SLABS=1]          # 1 = true single pass; 8 = forced 8 slabs
+[VTK_METAL_TEST_MARCH_VARIANT=0]      # 0 = raw scalar march; unset = 9 (default)
+[VTK_METAL_TEST_CAM_AXIS=z]           # axis views; unset = oblique preset
+build_macos_metal/bin/vtkMetalGLVisualComparison \
+  --bench --backend metal --scene DICOMVolume \
+  --dicom /Users/macair/Public/IMR/CTIMR/IMRToraceAddome \
+  --frames 30 --reps 1 --size 2048x2048
+```
+
+--------------------------------------------------------------------------------
+C2. Environment reference (all VTK_METAL_TEST_*)
+    Rendering/Metal/PerformanceInvestigation/SLAB_BENCHMARKS.md §1.3 (verbatim)
+--------------------------------------------------------------------------------
+| var | default | effect |
+|---|---|---|
+| `SAMPLE_DISTANCE` | 0.5 | mm per march step (4 = coarse SD cell) |
+| `IMAGE_SAMPLE_DISTANCE` | 1.0 | image-space downsampling (1.0 = off) |
+| `MINMAX` | 1 | min-max occupancy lattice skip (0 = raw path) |
+| `ACCEL` | 1 | master switch for the above |
+| `JITTER` | 1 | per-pixel ray phase jitter (0 = coherent rays) |
+| `JITTER_BLOCK` | 1 | block-coherent jitter block size |
+| `MARCH_VARIANT` | 9 | 0=raw scalar, 6=8x unroll, 7=4x, 8=8-wide harness sched, 9=48-wide inline |
+| `MARCH_STEPS` | 0 | fixed iteration count (0 = frame-max bound) |
+| `MARCH_CAP` | SD-based | max batch width {48,16,8} by {<2, 2-3, >=3} |
+| `NUM_SLABS` | 0 | 0 = adaptive (see 3.4); else forced count, clamped [1,32] |
+| `SLAB_ALIGN` | 0.95 | adaptive threshold (max\|axis dot\| >= t -> 1 slab) |
+| `CAM_AXIS` | unset | `x`/`y`/`z` look along that world axis; unset = oblique preset |
+| `CAM_AZ` | -60 | extra azimuth for the oblique preset |
+| `CAM_DOLLY` | unset | camera dolly factor |
+| `GPU_OPTIMIZED_CONTENTS` | 0 | volume `MTLTextureDescriptor.allowGPUOptimizedContents` (0 = NO = the lag_repro root-cause fix, default; 1 = legacy YES) |
+
+--------------------------------------------------------------------------------
+C3. Measured rows: oblique-view jitter A/B
+    Rendering/Metal/PerformanceInvestigation/SLAB_BENCHMARKS.md §3.1 (verbatim)
+--------------------------------------------------------------------------------
+| env | GL | Metal single (slabs=1) | Metal slabs=8 | M/GL single | M/GL slabs8 |
+|---|---|---|---|---|---|
+| JITTER=1 | 52.38 | 102.08 (v9) | 38.40 (v9) | 1.95x loss | **0.73x win** |
+| JITTER=1 | 52.38 | 101.31 (mv0) | 38.17 (mv0) | 1.93x loss | **0.73x win** |
+| JITTER=0 | 40.60 | 62.09 (v9) | 28.59 (v9) | 1.53x loss | **0.70x win** |
+
+--------------------------------------------------------------------------------
+C4. Measured rows: jitter inflation, single-pass raw path
+    Rendering/Metal/PerformanceInvestigation/SLAB_BENCHMARKS.md §7.2 (verbatim)
+--------------------------------------------------------------------------------
+Jitter=1 inflates the 2048/SD4 single-pass raw cell asymmetrically (same run
+session): GL +27% (41.7 -> 53.1), Metal +57-59% (mv0 43.9 -> 69.8, mv9 46.5 ->
+72.8). Full fair matrix: PERFORMANCE_INVESTIGATION.md §21.
+
+--------------------------------------------------------------------------------
+C5. Measured rows: fixed-count vs divergent march
+    Rendering/Metal/PERFORMANCE_INVESTIGATION.md §2.4 (verbatim)
+--------------------------------------------------------------------------------
+### 2.4 Divergence isolation (probe)
+
+The real shader's loop (`marchVolumeUnified`) breaks at a per-fragment,
+data-dependent iteration (per-fragment `maxSteps`, CTP-bounds exit,
+`tTerminateMax`, opacity threshold). A probe variant that runs a **fixed,
+uniform** iteration count for all fragments (no break) drops the march from
+~103 ms (divergent) to ~72.7 ms (fixed). A variant that keeps the uniform count
+but uses predication (`select`) instead of a break - so the result is
+image-correct and the fetch stays unconditional - measures **72.2 ms**.
+
+--------------------------------------------------------------------------------
+C6. Measured rows: harness iteration parity
+    Rendering/Metal/PERFORMANCE_INVESTIGATION.md §12 (verbatim)
+--------------------------------------------------------------------------------
+- avgIter: Metal **287.8** = GL 287.8 = fp64 287.8 (659.2 per nonzero pixel).
+- footprint: 69,861 nonzero pixels on both sides.
+- per-pixel iteration counts: **159,998 / 160,000 identical** after the
+  GL bottom-first -> Metal top-first row flip; the 2 remaining pixels differ
+  by exactly 1 (silhouette boundary).
+- per-pixel sample values on marched pixels: identical (mean |d| = 0.00).
+
+--------------------------------------------------------------------------------
+C7. Volume format (runtime introspection)
+    Rendering/Metal/PERFORMANCE_INVESTIGATION.md §10.1 (verbatim)
+--------------------------------------------------------------------------------
+### 10.1 The app's volume texture is plain GL_R8, not 16-bit
+
+At runtime: `scalarType=3` (unsigned char), `ncomp=1`, requested
+`internalFormat=0x8229`, realized `0x8229`, `Rbits=8`, dims 512x512x1794.
+
+================================================================================
+D. INDEX MAP — every section above to its source file:line
+================================================================================
+
+A1  MetalShaders.metal:2901-2917
+A2  MetalShaders.metal:3329-3380
+A3  MetalShaders.metal:3452-3462
+A4  MetalShaders.metal:4053-4066, 4170-4176
+A5  MetalShaders.metal:5923-5958
+A6  MetalShaders.metal:6340-6353
+A7  MetalShaders.metal:6634-6645
+A8  vtkMetalGPUVolumeRayCastMapper.mm:6096-6114
+A9  vtkMetalGPUVolumeRayCastMapper.mm:7357-7382
+B1  vtkVolumeShaderComposer.h:442-466
+B2  vtkVolumeShaderComposer.h:2342-2352
+B3  vtkOpenGLRenderWindow.cxx:3045-3090
+B4  raycasterfs.glsl:48, 262
+B5  vtkOpenGLGPUVolumeRayCastMapper.cxx:3687
+C1  SLAB_BENCHMARKS.md:11-45
+C2  SLAB_BENCHMARKS.md:47-68
+C3  SLAB_BENCHMARKS.md:100-104
+C4  SLAB_BENCHMARKS.md:465-470
+C5  PERFORMANCE_INVESTIGATION.md:111-124
+C6  PERFORMANCE_INVESTIGATION.md:784-792
+C7  PERFORMANCE_INVESTIGATION.md:638-647
+================================================================================

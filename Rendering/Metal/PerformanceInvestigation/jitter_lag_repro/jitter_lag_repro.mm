@@ -30,17 +30,28 @@
 //
 // The jitter semantics are the app's: jitterF in [0, stepSize) shifts the ray
 // start to the lattice phase jitterF (tStart' = jitterF + ceil((tStart -
-// jitterF)/stepSize)*stepSize). GL noise: 128x128 R8 sawtooth, LINEAR + REPEAT
-// (the app in_noiseSampler analog) — spatially correlated, adjacent fragments
-// keep nearby lattice phases. Metal noise source is selectable:
+// jitterF)/stepSize)*stepSize). GL noise: the app's exact field — the 64x64
+// blue-noise tile sampled at gl_FragCoord.xy/64 with NEAREST + REPEAT
+// (vtkVolumeShaderComposer.h g_noiseSampler), block-constant over 32px at
+// 2048. Metal noise source is selectable:
 //   sharp   per-pixel IGN hash (the app's blue-noise tile class: independent
 //           per fragment — harness A/B verified +57-63% either way)
-//   point   Fix 1: point-sampled analog of the GL sawtooth (same 128-wide
-//           tile, same 13-step, no texture)
-//   texture Fix 2: the GL tile itself via texture2d, LINEAR + REPEAT, with
-//           the GL y-flip — bit-identical jitter field to GL
+//   point   Fix 1: point-sampled sawtooth analog (128-wide tile, 13-step,
+//           no texture)
+//   texture Fix 2: the GL sawtooth tile via texture2d, LINEAR + REPEAT, with
+//           the GL y-flip — bit-identical jitter field to old GL
+//   blue    production proposal: the app's 64x64 blue-noise tile via texture2d
+//           LINEAR + REPEAT at position.xy/64 — bilinear-correlated version
+//           of the GL field (GL uses NEAREST)
+//   parity  same field as GL, no texture: kBlue64 indexed at
+//           int2(floor(x/texel), floor((y-rt)/texel)) & 63 (the app's parity
+//           branch) — isolates the read path from the field shape
 // Verified against minimal_gap: sharp measures GL j1 ~48-52 vs Metal j1
 // ~65-69 on this volume; point/texture should collapse M/GL j1 to ~1.0.
+// Representative check (2026-08-19): GL j1 must now cost the app's +27%
+// (block-constant blue field); if Metal parity (same field) stays ~1.3x vs
+// GL, the correlated-field fix is dead on this march — the read-path gap is
+// not the field shape.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -62,6 +73,12 @@ static const float kInvVP[16] = {
   -0.12124427f, -0.03448515f, 0.8849802f, 0.00092758867f };
 
 static const int kNoiseTile = 128;  // GL jitter noise field size (px of RT)
+
+// App Metal blue-noise tile (the kBlueNoise64 array from MetalShaders.metal):
+// 64x64 luminance, top-down JPEG orientation (tile row y = JPEG row y).
+static const uint8_t kBlue64[4096] = {
+#include "bluenoise64.inc"
+};
 
 static uint8_t* MakeVolume(void)
 {
@@ -97,22 +114,17 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, int jitt
   glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
   glTexImage3D(GL_TEXTURE_3D, 0, GL_R8, kVolW, kVolH, kVolD, 0, GL_RED, GL_UNSIGNED_BYTE, vol);
 
-  // Jitter noise field (app in_noiseSampler analog): sawtooth ramp, bilinear
-  // + repeat — smooth correlated, adjacent fragments share nearly the same
-  // ray-start phase.
+  // Jitter noise field: the app's exact GL field — the 64x64 blue-noise tile
+  // at gl_FragCoord.xy/64, NEAREST + REPEAT (vtkVolumeShaderComposer.h
+  // g_noiseSampler). Block-constant over 32px blocks at 2048.
   GLuint noiseTex = 0;
   glGenTextures(1, &noiseTex);
   glBindTexture(GL_TEXTURE_2D, noiseTex);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-  {
-    uint8_t* noise = (uint8_t*)malloc(kNoiseTile * kNoiseTile);
-    for (int i = 0; i < kNoiseTile * kNoiseTile; i++) noise[i] = (uint8_t)(i * 13 % 256);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, kNoiseTile, kNoiseTile, 0, GL_RED, GL_UNSIGNED_BYTE, noise);
-    free(noise);
-  }
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, 64, 64, 0, GL_RED, GL_UNSIGNED_BYTE, kBlue64);
 
   GLuint rtTex = 0, fbo = 0;
   glGenTextures(1, &rtTex);
@@ -159,7 +171,7 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, int jitt
     "  float physPerNorm = length(rayDir * uBoundsSize);\n"
     "  float stepSize = uSampleDistMM / max(physPerNorm, 1e-6);\n"
     "  if (uJitter > 0) {\n"
-    "    float jitterF = texture(uNoise, gl_FragCoord.xy / " "128.0" ").x * stepSize;\n"
+    "    float jitterF = texture(uNoise, gl_FragCoord.xy / " "64.0" ").x * stepSize;\n"
     "    tStart = jitterF + ceil((tStart - jitterF) / stepSize) * stepSize;\n"
     "  }\n"
     "  int maxSteps = max(0, int(ceil((tExit - tStart) / stepSize)));\n"
@@ -242,7 +254,9 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, int jitt
 
 // -------------------------------------------------------------- Metal backend
 // mode: 0 = sharp per-pixel IGN (app blue-noise class), 1 = point-sampled GL
-// sawtooth analog (Fix 1), 2 = the GL tile via texture2d LINEAR+REPEAT (Fix 2).
+// sawtooth analog (Fix 1), 2 = the GL tile via texture2d LINEAR+REPEAT (Fix 2),
+// 3 = app blue tile via texture2d LINEAR (production proposal), 4 = parity:
+// the app's exact GL field (kBlue64 indexed, NEAREST semantics, no texture).
 static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, int jitter, int mode)
 {
   id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -255,6 +269,7 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, int j
   vd.mipmapLevelCount = 1;
   vd.usage = MTLTextureUsageShaderRead;
   vd.storageMode = MTLStorageModePrivate;
+  vd.allowGPUOptimizedContents = NO;  // app parity: lag_repro root cause (2026-08-18)
   id<MTLTexture> volTex = [device newTextureWithDescriptor:vd];
   id<MTLCommandQueue> queue = [device newCommandQueue];
   id<MTLCommandBuffer> cb0 = [queue commandBuffer];
@@ -268,25 +283,29 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, int j
   [cb0 commit];
   [cb0 waitUntilCompleted];
 
-  // Jitter noise tile for Fix 2 (mode 2): the exact GL tile, shared storage,
-  // LINEAR + REPEAT on the sampler side.
+  // Jitter noise tile for the texture modes (2 = GL sawtooth, 3 = app blue
+  // noise), shared storage, LINEAR + REPEAT on the sampler side.
   id<MTLTexture> noiseTex = nil;
-  if (mode == 2) {
+  if (mode == 2 || mode == 3) {
+    int tile = mode == 3 ? 64 : kNoiseTile;
     MTLTextureDescriptor* nd =
       [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
-                                                         width:kNoiseTile
-                                                        height:kNoiseTile
+                                                         width:tile
+                                                        height:tile
                                                      mipmapped:NO];
     nd.usage = MTLTextureUsageShaderRead;
     nd.storageMode = MTLStorageModeShared;
     noiseTex = [device newTextureWithDescriptor:nd];
-    uint8_t* noise = (uint8_t*)malloc(kNoiseTile * kNoiseTile);
-    for (int i = 0; i < kNoiseTile * kNoiseTile; i++)
-      noise[i] = (uint8_t)(i * 13 % 256);
-    [noiseTex replaceRegion:MTLRegionMake2D(0, 0, kNoiseTile, kNoiseTile)
+    uint8_t* noise = (uint8_t*)malloc((size_t)tile * tile);
+    if (mode == 3) {
+      memcpy(noise, kBlue64, sizeof(kBlue64));
+    } else {
+      for (int i = 0; i < tile * tile; i++) noise[i] = (uint8_t)(i * 13 % 256);
+    }
+    [noiseTex replaceRegion:MTLRegionMake2D(0, 0, tile, tile)
                 mipmapLevel:0
                   withBytes:noise
-                bytesPerRow:kNoiseTile];
+                bytesPerRow:tile];
     free(noise);
   }
 
@@ -300,6 +319,22 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, int j
 
   const char* msl =
     "#include <metal_stdlib>\nusing namespace metal;\n"
+    "constant unsigned char kBlue64[4096] = { ";
+  {
+    char buf[64];
+    char* p = (char*)malloc(4096 * 8 + 64);
+    size_t n = 0;
+    for (int i = 0; i < 4096; i++) { int l = snprintf(buf, sizeof(buf), "%u,", kBlue64[i]); memcpy(p + n, buf, l); n += l; }
+    memcpy(p + n, " };\n", 5); n += 5;
+    size_t mslLen = strlen(msl) + n + 1;
+    char* full = (char*)malloc(mslLen);
+    strcpy(full, msl);
+    memcpy(full + strlen(msl), p, n);
+    full[strlen(msl) + n] = 0;
+    free(p);
+    msl = full;
+  }
+  const char* msl2 =
     "struct VOut { float4 position [[position]]; float2 uv; };\n"
     "vertex VOut vertex_main(uint vid [[vertex_id]]) {\n"
     "  float2 p = float2(float(vid & 1u) * 4.0f - 1.0f, float((vid >> 1u) & 1u) * 2.0f - 1.0f);\n"
@@ -330,10 +365,13 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, int j
     "  if (u.jitter > 0) {\n"
     "    float2 fid = floor(in.position.xy);\n"
     "    float jitterF;\n"
-    "    if (u.jitterMode == 2) {\n"
+    "    if (u.jitterMode == 2 || u.jitterMode == 3) {\n"
     "      constexpr sampler noiseSampler(filter::linear, address::repeat);\n"
-    "      float2 nuv = float2(fid.x, u.rtSize - fid.y) / 128.0f;\n"
+    "      float2 nuv = float2(fid.x, u.rtSize - fid.y) / float(u.jitterMode == 3 ? 64 : 128);\n"
     "      jitterF = noiseTex.sample(noiseSampler, nuv).r * stepSize;\n"
+    "    } else if (u.jitterMode == 4) {\n"
+    "      int2 t = int2(int(fid.x) & 63, int(u.rtSize - fid.y) & 63);\n"
+    "      jitterF = (kBlue64[t.y * 64 + t.x] / 255.0f) * stepSize;\n"
     "    } else if (u.jitterMode == 1) {\n"
     "      float n = fmod(fid.x * 13.0f + fid.y * 128.0f, 256.0f) * (1.0f / 255.0f);\n"
     "      jitterF = n * stepSize;\n"
@@ -362,7 +400,7 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, int j
     "  return float4(float(nc & 255) / 255.0f, float((nc >> 8) & 255) / 255.0f, acc, 1.0f);\n"
     "}\n";
   NSError* err = nil;
-  id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:msl] options:nil error:&err];
+  id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithFormat:@"%s%s", msl, msl2] options:nil error:&err];
   if (!lib) { fprintf(stderr, "MSL compile failed: %s\n", err.description.UTF8String); exit(1); }
   id<MTLFunction> vf = [lib newFunctionWithName:@"vertex_main"];
   id<MTLFunction> ff = [lib newFunctionWithName:@"fragment_main"];
@@ -453,6 +491,11 @@ int main(int argc, const char** argv)
     int frames = argc > 3 ? atoi(argv[3]) : 30;
     const char* modeArg = argc > 4 ? argv[4] : "all";
     int all = !strcmp(modeArg, "all");
+    int wantSharp = all || !strcmp(modeArg, "sharp");
+    int wantPoint = all || !strcmp(modeArg, "point");
+    int wantTexture = all || !strcmp(modeArg, "texture");
+    int wantBlue = all || !strcmp(modeArg, "blue");
+    int wantParity = all || !strcmp(modeArg, "parity");
     fprintf(stderr, "volume %dx%dx%d R8 (%d MB), rt %dx%d, sd %.1f mm, frames %d, gradient data, metal jitter mode %s\n",
             kVolW, kVolH, kVolD, (int)((size_t)kVolW * kVolH * kVolD >> 20), rt, rt, sd, frames, modeArg);
     uint8_t* vol = MakeVolume();
@@ -462,28 +505,40 @@ int main(int argc, const char** argv)
     double g0 = RunGL(rt, sd, frames, vol, 0);
     double g1 = RunGL(rt, sd, frames, vol, 1);
     double m0 = RunMetal(rt, sd, frames, vol, 0, 0);
-    double m1s = RunMetal(rt, sd, frames, vol, 1, 0);
-    double m1p = RunMetal(rt, sd, frames, vol, 1, 1);
-    double m1t = RunMetal(rt, sd, frames, vol, 1, 2);
+    double m1s = wantSharp ? RunMetal(rt, sd, frames, vol, 1, 0) : 0.0;
+    double m1p = wantPoint ? RunMetal(rt, sd, frames, vol, 1, 1) : 0.0;
+    double m1t = wantTexture ? RunMetal(rt, sd, frames, vol, 1, 2) : 0.0;
+    double m1b = wantBlue ? RunMetal(rt, sd, frames, vol, 1, 3) : 0.0;
+    double m1r = wantParity ? RunMetal(rt, sd, frames, vol, 1, 4) : 0.0;
 
     fprintf(stderr, "\nGL    j0 %8.3f   j1 %8.3f   jitter %+6.1f%%\n", g0, g1, (g1 / g0 - 1.0) * 100.0);
-    if (all || !strcmp(modeArg, "sharp"))
+    if (wantSharp)
       fprintf(stderr, "METAL j0 %8.3f   j1(sharp) %8.3f   jitter %+6.1f%%\n", m0, m1s, (m1s / m0 - 1.0) * 100.0);
-    if (all || !strcmp(modeArg, "point"))
+    if (wantPoint)
       fprintf(stderr, "METAL j0 %8.3f   j1(point) %8.3f   jitter %+6.1f%%\n", m0, m1p, (m1p / m0 - 1.0) * 100.0);
-    if (all || !strcmp(modeArg, "texture"))
+    if (wantTexture)
       fprintf(stderr, "METAL j0 %8.3f   j1(texture) %8.3f   jitter %+6.1f%%\n", m0, m1t, (m1t / m0 - 1.0) * 100.0);
+    if (wantBlue)
+      fprintf(stderr, "METAL j0 %8.3f   j1(blue) %8.3f   jitter %+6.1f%%\n", m0, m1b, (m1b / m0 - 1.0) * 100.0);
+    if (wantParity)
+      fprintf(stderr, "METAL j0 %8.3f   j1(parity) %8.3f   jitter %+6.1f%%\n", m0, m1r, (m1r / m0 - 1.0) * 100.0);
     fprintf(stderr, "M/GL  j0 %8.2f", m0 / g0);
-    if (all || !strcmp(modeArg, "sharp"))
-      fprintf(stderr, "   sharp %5.2f", m1s / g1);
-    if (all || !strcmp(modeArg, "point"))
-      fprintf(stderr, "   point %5.2f", m1p / g1);
-    if (all || !strcmp(modeArg, "texture"))
-      fprintf(stderr, "   texture %5.2f", m1t / g1);
+    if (wantSharp) fprintf(stderr, "   sharp %5.2f", m1s / g1);
+    if (wantPoint) fprintf(stderr, "   point %5.2f", m1p / g1);
+    if (wantTexture) fprintf(stderr, "   texture %5.2f", m1t / g1);
+    if (wantBlue) fprintf(stderr, "   blue %5.2f", m1b / g1);
+    if (wantParity) fprintf(stderr, "   parity %5.2f", m1r / g1);
     fprintf(stderr, "\n");
     if (all) {
-      if (m1s / g1 > 1.25f && m1p / g1 < 1.05f && m1t / g1 < 1.05f)
-        fprintf(stderr, "RESULT: sharp reproduces the gap (+%.0f%%), point/texture CLOSE it (M/GL <= 1.05) -> the jitter field, not the march, is the gap\n",
+      // Representative check: GL j1 carries the app's block-constant blue
+      // field (~+27%); parity is the same field in Metal. If parity stays
+      // ~1.3x (field-independent read-path gap), the correlated-field fixes
+      // are dead on this march and the gap must be attacked elsewhere.
+      if (m1s / g1 > 1.25f && (m1r / g1 > 1.2f || m1b / g1 > 1.2f))
+        fprintf(stderr, "RESULT: sharp reproduces the gap (+%.0f%%); same-field parity still +%.0f%% -> correlated-field fix DEAD on this march\n",
+                (m1s / g1 - 1.0) * 100.0, (m1r / g1 - 1.0) * 100.0);
+      else if (m1s / g1 > 1.25f && m1r / g1 < 1.1f)
+        fprintf(stderr, "RESULT: sharp reproduces the gap (+%.0f%%), parity (same field) CLOSES it -> field shape is the gap\n",
                 (m1s / g1 - 1.0) * 100.0);
       else
         fprintf(stderr, "RESULT: unexpected shape (check thermal state; rerun interleaved)\n");
