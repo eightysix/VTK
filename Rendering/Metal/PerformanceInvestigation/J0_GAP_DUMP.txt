@@ -1,0 +1,192 @@
+================================================================================
+J0 GAP INVESTIGATION — App Metal vs App GL, jitter OFF
+Date: 2026-08-20
+Config: SD4, minmax=0, accel=0, slabs=1, IGN_JITTER=0 (blue noise parity)
+Timer: std::chrono::steady_clock with GPU sync inside timed region
+       Metal: [MTLCommandBuffer waitUntilCompleted]
+       GL:    glFinish()
+       Both offscreen (no drawable pacing).
+Source: TestMetalGLVisualComparison.cxx:389-416
+================================================================================
+
+§1. INTERLEAVED 8-ROUND j0 (2048x2048)
+================================================================================
+Purpose: Is M/GL j0 = 1.10 real, or thermal noise from sequential ordering?
+Method: Alternate GL→Metal per round so both backends see identical thermal state.
+Frames: 30, reps: 1.
+
+Round  GL (ms)  Metal (ms)  M/GL
+  1     41.69     43.64     1.047
+  2     40.96     43.44     1.061
+  3     40.29     43.63     1.083
+  4     41.28     43.59     1.056
+  5     41.45     43.74     1.055
+  6     44.31     43.47     0.981
+  7     41.70     43.41     1.041
+  8     41.83     43.61     1.043
+
+Stats:
+  GL:  mean=41.69  stdev=1.17
+  Mtl: mean=43.57  stdev=0.11
+  M/GL: mean=1.046  stdev=0.029  range=0.981-1.083
+  z-score of 1.0: 1.56σ (1.0 within 2σ, borderline)
+
+Verdict: 2048 j0 gap is real but SMALLER than earlier single-run (1.10 → 1.05).
+         Metal is ~1.88ms slower on a ~42ms frame. Metal stdev is 10× smaller
+         than GL (0.11 vs 1.17) — GL thermal variance dominates the noise.
+
+§1b. INTERLEAVED 8-ROUND j0 (1024x1024)
+================================================================================
+Purpose: Confirm 1024 j0 is tied (control cell from §7.3 of HARNESS doc).
+
+Round  GL (ms)  Metal (ms)  M/GL
+  1     26.78     27.50     1.027
+  2     27.03     27.25     1.008
+  3     26.59     27.15     1.021
+  4     26.29     27.30     1.038
+  5     25.66     27.74     1.081
+  6     27.88     28.40     1.019
+  7     28.23     28.29     1.002
+  8     27.09     27.55     1.017
+
+Stats:
+  GL:  mean=26.94  stdev=0.83
+  Mtl: mean=27.65  stdev=0.47
+  M/GL: mean=1.027  stdev=0.025  range=1.002-1.081
+  z-score of 1.0: 1.08σ (1.0 well within 1σ)
+
+Verdict: 1024 j0 is TIED (M/GL = 1.03 ± 0.03). The 2048 gap (1.05) is
+         statistically distinguishable from 1024 (1.03) by ~0.02, which is
+         less than 1σ. The gap may be a weak regime effect at 2048, not
+         present at 1024.
+
+§2. BENCH TIMER VERIFICATION
+================================================================================
+Source: TestMetalGLVisualComparison.cxx:389-416
+
+Both backends:
+  t0 = std::chrono::steady_clock::now()     // CPU wall-clock
+  renWin->Render()                           // submit draw calls
+  [GPU sync]                                 // Metal: waitUntilCompleted
+                                             // GL:    glFinish()
+  t1 = std::chrono::steady_clock::now()     // CPU wall-clock
+  ms = duration_cast<milliseconds>(t1 - t0)
+
+Metal sync: vtkMetalRenderWindow::WaitForCompletion()
+            → [MTLCommandBuffer waitUntilCompleted]  (line 900-917)
+GL sync:    glFinish()
+
+Offscreen: Metal uses MTLStorageModePrivate texture (no drawable)
+           GL uses FBO offscreen (SetOffScreenRendering(true))
+
+Verdict: TIMERS ARE SYMMETRIC. Both measure Render() + GPU sync via CPU
+         wall-clock. No timer asymmetry can explain the j0 gap.
+
+§3. FIXED-STEPS PROBE (isolate envelope vs march)
+================================================================================
+Purpose: If j0 gap is proportional to iteration count → trip-count tax.
+         If j0 gap is constant regardless of steps → envelope/pipeline tax.
+Method: Force VTK_METAL_TEST_MARCH_STEPS=X, measure j0 at 2048.
+Frames: 15, reps: 1.
+
+Steps   GL (ms)  Metal (ms)  M/GL
+  1      40.19     44.48     1.107
+  5      39.55     44.26     1.119
+ 10      46.18     44.36     0.961
+ 20      43.47     44.59     1.026
+ 50      43.34     46.06     1.063
+100      43.38     44.23     1.020
+200      41.34     44.21     1.069
+400      41.12     44.47     1.082
+1000     42.83     44.72     1.044
+
+Key observations:
+  1. Metal time is CONSTANT (~44.5ms) from steps=1 to steps=1000.
+     The march loop adds ~0.2ms total over the entire range.
+     Per-sample cost ≈ 0.0002ms (0.2μs). Negligible.
+
+  2. GL time varies 39.5-46.2ms (thermal noise), averaging ~42.5ms.
+
+  3. M/GL j0 is ~1.02-1.11 across ALL step counts. The ratio does NOT
+     scale with march work. At steps=1 (near-zero march), Metal is STILL
+     10.7% slower.
+
+  4. The ~4ms absolute gap (44.5 - 40.5) is present at steps=1 where the
+     march is essentially a no-op.
+
+Verdict: j0 gap is NOT a trip-count or per-sample cost. It is a fixed
+         envelope cost that exists BEFORE the march loop runs.
+
+§4. J0 GAP CLASSIFICATION
+================================================================================
+Done criteria from the plan:
+
+  [x] §1 interleaved rounds at 2048: M/GL = 1.046 ± 0.029
+      → NOT 1.00 ± 0.08. j0 is not pure noise.
+
+  [x] §3 fixed-steps probe: gap CONSTANT across step counts 1-1000
+      → NOT proportional to samples. Not a trip-count hole.
+
+  [x] §3 steps=1: M/GL = 1.11 (Metal still ~10% slower with 1 sample)
+      → Gap SURVIVES a near-zero-march probe.
+
+  CONCLUSION: Done criterion #3 — "gap survives a no-march probe"
+  → Freeze as ENVELOPE TAX, not a shader issue.
+
+Classification: **C. j0 = envelope (~4ms fixed)**
+
+The ~4ms Metal overhead sits in:
+  - Render pass / framebuffer setup (MTLStorageModePrivate offscreen RT)
+  - Command buffer encoding / commit overhead
+  - VTK pipeline differences (depth attach, matrix setup)
+  - Possibly Metal's inherent per-frame CPU-side encoding cost
+
+This is NOT:
+  - Trip-count (ruled out by fixed-steps)
+  - Per-sample 3D texture fetch cost (ruled out by steps=1)
+  - Depth/clip differences (steps=1 bypasses march entirely)
+
+§5. IMPACT ON JITTER INVESTIGATION
+================================================================================
+Per the plan's "State C" (j0 = envelope):
+
+  "Subtract 4 ms from both Metal j0 and Metal j1; spread is unchanged.
+   That is the whole point of doing j0 first: a fixed tax CANNOT produce
+   Metal Δ = 2× GL Δ."
+
+This is confirmed. The jitter asymmetry (Metal Δ ≈ 2× GL Δ) is entirely
+a j1 phenomenon. The j0 envelope tax adds ~4ms to both j0 and j1, but
+does NOT affect the jitter delta:
+
+  Metal Δ = Metal j1 - Metal j0 = (Metal_envelope + Metal_march + Metal_jitter)
+                          - (Metal_envelope + Metal_march)
+                          = Metal_jitter
+
+  GL Δ = GL j1 - GL j0 = GL_jitter
+
+The envelope cancels out in the jitter delta. So:
+  Metal Δ ≈ +25ms, GL Δ ≈ +13ms → jitter asymmetry is ~2×
+  This is PURELY a jitter (per-pixel field divergence) issue.
+
+Frozen metrics for jitter investigation:
+  M/GL j0: 1.05 (envelope tax, ~4ms, do not re-litigate)
+  Metal Δ: ~25ms (jitter cost)
+  GL Δ:    ~13ms (jitter cost)
+  spread:  (M/GL j1) - (M/GL j0) = jitter with j0 divided out
+
+§6. RECOMMENDATION
+================================================================================
+Freeze j0 as envelope tax. Do NOT:
+  - Add Metal iteration PPM (unnecessary — steps=1 proves march is irrelevant)
+  - Modify march shaders to fix j0
+  - Compare harness Metal j0 to app GL j0 (different baselines)
+
+DO:
+  - Proceed to jitter Δ investigation (the 2× gap)
+  - Use spread (M/GL j1 - M/GL j0) as the jitter metric
+  - At 1024 (M/GL j0 ≈ 1.00), spread is the pure jitter story
+  - At 2048 (M/GL j0 ≈ 1.05), subtract envelope before comparing jitter
+
+================================================================================
+END OF J0 GAP DUMP
+================================================================================

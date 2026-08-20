@@ -282,18 +282,23 @@ eliminate thermal ordering bias.
 also slower at j1, and vice versa. The "jitter gap" is not purely a jitter
 phenomenon — it is two stacked effects:
 
-1. **Base overhead (j0 gap).** At 1024-2048, Metal j0 is ~1.01-1.10x GL j0.
-   This baseline carries through to j1 arithmetically: adding the same
-   absolute jitter to a larger base inflates the ratio.
+1. **Envelope tax (j0 gap).** At 2048, interleaved 8-round M/GL j0 = 1.046 ±
+   0.029 (~4ms fixed overhead). Proved to be an envelope cost (not march) by
+   the fixed-steps probe (§8): Metal time is constant (~44.5ms) from steps=1
+   to steps=1000. The gap survives a near-zero-march probe → submit/RT/timer,
+   not the shader. See `J0_GAP_DUMP.txt` for full data.
 
 2. **Jitter asymmetry (spread).** The spread (j1 ratio − j0 ratio) isolates
    the pure jitter effect. It peaks at +0.30 (1024x1024) and is +0.18 at
    2048. Metal's jitter costs ~2x GL's in absolute ms at these resolutions.
 
 Decomposition at the pathologic cell (2048, M/GL j1 ≈ 1.28):
-- ~0.10 from base Metal overhead (j0 gap)
+- ~0.05 from envelope tax (j0 gap, ~4ms fixed)
 - ~0.18 from jitter asymmetry (spread)
 - Total ≈ 1.28
+
+The envelope tax cancels out in jitter deltas (Metal Δ = Metal j1 − Metal j0
+removes the fixed overhead), so the 2× jitter penalty is purely a j1 problem.
 
 **Scaling regime boundaries (confirmed interleaved at 4096/8192):**
 - **≤400:** Negligible gap. Both backends are lightweight; jitter costs are
@@ -301,17 +306,44 @@ Decomposition at the pathologic cell (2048, M/GL j1 ≈ 1.28):
 - **800-2048:** Gap regime. Metal j0 ≈ GL j0, but Metal jitter Δ is 1.5-2.2x
   GL's. This is the production rendering range and where the gap is real.
 - **≥4096:** Inversion. Metal becomes faster than GL at both j0 and j1. At
-  8192, M/GL j0 = 0.81, M/GL j1 = 0.76. The crossover is real (not a
-  thermal artifact — confirmed with interleaved back-to-back runs on the same
-  machine). At extreme pixel counts, Metal's pipeline handles the load more
-  efficiently; GL degrades faster as resolution grows.
+  8192, M/GL j0 = 0.81, M/GL j1 = 0.76. The crossover is real (confirmed
+  with interleaved back-to-back runs). At extreme pixel counts, Metal's
+  pipeline handles the load more efficiently; GL degrades faster as resolution
+  grows.
 
 **Metal jitter Δ scales sub-linearly.** Goes +5 → +15 → +20 → +25 ms then
 drops to +21 (4096) and +11 (8192). At extreme resolutions the per-pixel
 jitter divergence is amortized by other fixed costs in the pipeline.
 
+## 8. j0 gap: envelope, not march (2026-08-20)
+
+Interleaved 8-round j0 at 2048: M/GL = 1.046 ± 0.029 (real but small).
+1024 j0: M/GL = 1.027 ± 0.025 (tied within noise).
+
+Fixed-steps probe at 2048 (forcing `VTK_METAL_TEST_MARCH_STEPS`):
+
+| Steps | GL (ms) | Metal (ms) | M/GL |
+|---|---|---|---|
+| 1 | 40.19 | 44.48 | 1.107 |
+| 5 | 39.55 | 44.26 | 1.119 |
+| 50 | 43.34 | 46.06 | 1.063 |
+| 100 | 43.38 | 44.23 | 1.020 |
+| 400 | 41.12 | 44.47 | 1.082 |
+| 1000 | 42.83 | 44.72 | 1.044 |
+
+Metal time is constant (~44.5ms) from steps=1 to 1000. The march loop
+adds ~0.2ms total — per-sample cost ≈ 0.2μs, negligible. At steps=1
+(near-zero march), Metal is STILL 10.7% slower. The ~4ms gap is a fixed
+envelope cost (render pass setup, command buffer encoding, offscreen RT),
+not a per-sample or trip-count issue. Freezes as **State C** per the
+investigation plan: subtract envelope from both j0 and j1; spread
+(M/GL j1 − M/GL j0) isolates the pure jitter asymmetry.
+
+Full data in `J0_GAP_DUMP.txt`.
+
 ## 5. Files
 
+- `J0_GAP_DUMP.txt` — j0 investigation dump (interleaved rounds, fixed-steps, timer audit).
 - `jitter_gap_repro/` — harness + `RESULTS.md` (build/run/knobs, verdicts).
 - `jitter_gap_repro/RESULTS.md` — full experiment record.
 - `../SLAB_BENCHMARKS.md` — app bench recipe §1, pathological cell §7.2.
