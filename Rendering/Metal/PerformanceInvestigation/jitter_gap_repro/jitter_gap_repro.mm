@@ -123,14 +123,21 @@ static void MakeTF(uint8_t* lut)
 }
 
 static double NowMs(void) { return CACurrentMediaTime() * 1000.0; }
+extern "C" void glTexStorage3D(unsigned target, int levels, unsigned internalformat, int w, int h, int d);
 
 // ---------------------------------------------------------------- GL backend
 static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const uint8_t* tf, int jitter)
 {
+  // GL41=1: request the 4.1 core profile (the app's VTK context class)
+  // instead of 3.2 core — different driver entry may pick different texture
+  // tiling/sampling paths under phase-scattered trilinear.
+  const char* profEnv = getenv("GL41");
+  int glProfile = (int)(profEnv ? kCGLOGLPVersion_GL4_Core : kCGLOGLPVersion_3_2_Core);
   CGLPixelFormatAttribute attrs[] = {
-    kCGLPFAAccelerated, kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)kCGLOGLPVersion_3_2_Core, (CGLPixelFormatAttribute)0 };
+    kCGLPFAAccelerated, kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)glProfile, (CGLPixelFormatAttribute)0 };
   CGLPixelFormatObj pf = NULL; GLint npf = 0;
-  if (CGLChoosePixelFormat(attrs, &pf, &npf) != kCGLNoError || !pf) { fprintf(stderr, "no GL 3.2 core pixel format\n"); exit(1); }
+  if (CGLChoosePixelFormat(attrs, &pf, &npf) != kCGLNoError || !pf) { fprintf(stderr, "no GL core pixel format (profile %d)\n", (int)glProfile); exit(1); }
+  fprintf(stderr, "[glnob] profile=%s\n", profEnv ? "4.1-core" : "3.2-core");
   CGLContextObj ctx = NULL;
   if (CGLCreateContext(pf, NULL, &ctx) != kCGLNoError || !ctx) { fprintf(stderr, "no GL context\n"); exit(1); }
   CGLSetCurrentContext(ctx);
@@ -144,7 +151,20 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
   glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-  glTexImage3D(GL_TEXTURE_3D, 0, GL_R8, kVolW, kVolH, kVolD, 0, GL_RED, GL_UNSIGNED_BYTE, vol);
+  // GLSTORAGE=1: immutable storage (glTexStorage3D, the app/VTK upload
+  // class) instead of mutable glTexImage3D — lets the driver commit to its
+  // optimal tiling up front. A/B for the phase-scattered trilinear tax.
+  if (getenv("GLSTORAGE"))
+  {
+    glTexStorage3D(GL_TEXTURE_3D, 1, GL_R8, kVolW, kVolH, kVolD);
+    glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, kVolW, kVolH, kVolD, GL_RED, GL_UNSIGNED_BYTE, vol);
+    fprintf(stderr, "[glnob] storage=immutable\n");
+  }
+  else
+  {
+    glTexImage3D(GL_TEXTURE_3D, 0, GL_R8, kVolW, kVolH, kVolD, 0, GL_RED, GL_UNSIGNED_BYTE, vol);
+    fprintf(stderr, "[glnob] storage=mutable\n");
+  }
 
   // Jitter noise field: the app's GL field — the 64x64 blue-noise tile at
   // gl_FragCoord.xy/64, NEAREST + REPEAT (vtkVolumeShaderComposer.h). The app

@@ -2720,6 +2720,16 @@ constant int fc_marchVariant [[function_constant(29)]];
 // block is dead-code-eliminated when the flag is clear, so non-slab pipelines
 // are bit-identical to the previous code.
 constant int fc_slabMode [[function_constant(30)]];
+// V31 back-edge exit experiment (VTK_METAL_TEST_DOEXIT=1): reshapes the
+// baseline divergent march into a do-while with all exit conditions folded
+// into the loop back-edge (divergent_tail_repro V31 root-cause fix). Dead-code
+// eliminated when clear, so default pipelines are bit-identical.
+constant bool fc_doExit [[function_constant(31)]];
+// RG8 pair-packed slices experiment (VTK_METAL_TEST_RG8=1): the volume
+// texture stores R=slice 2z / G=slice 2z+1 over a halved-depth RG8 grid; the
+// march's trilinear z-blend is reconstructed in-shader (divergent_tail
+// V24/V32). Dead-code eliminated when clear.
+constant bool fc_volRg8 [[function_constant(32)]];
 
 // ============================================================================
 // Volume Ray Casting Mapper
@@ -3433,6 +3443,41 @@ inline float sampleVolumeLinear8Tap(texture3d<float> volTex, float3 pos) {
   return mix(v0, v1, w.z);
 }
 
+// RG8 pair-packed slice fetch (fc_volRg8): texel z of the halved-depth RG8
+// volume holds R=slice 2z, G=slice 2z+1. The trilinear z-blend over the
+// unpacked layout becomes one XY-bilinear tap when floor(z) is even (both
+// slices live in one texel) and two taps when odd; the z mix runs in
+// registers. Algebraically identical to hardware trilinear, ±fp ulp.
+inline float sampleVolumeScalarRG8Pair(texture3d<float> volTex, float3 pos) {
+  float pairs = float(volTex.get_depth());
+  float slices = 2.0f * pairs;
+  float zf = saturate(pos.z) * slices - 0.5f;
+  float k = floor(zf);
+  float fz = zf - k;
+  if (zf < 0.0f) { k = 0.0f; fz = 0.0f; } // hardware clamps the first slice
+  int kp = int(clamp(k, 0.0f, slices - 1.0f));
+  // Pair-center z: add the texel-unit nudge AFTER the division. At magnitude
+  // ~pairs an fp32 ulp is ~6e-5 TEXEL units (pairs=897), so a nudge baked
+  // into the numerator rounds away; a post-divide +1e-3/pairs shift is 18x
+  // above ulp and guarantees floor() selects pair p. Cost: the tap blends
+  // 0.1% of the NEXT pair's channels (<=0.25 LSB on 8-bit data).
+  if ((kp & 1) == 0) {
+    float zp = (float(kp >> 1) + 0.5f) / pairs + (1e-3f / pairs);
+    float2 t = volTex.sample(sVolume, float3(pos.x, pos.y, zp), level(0)).rg;
+    return mix(t.x, t.y, fz);
+  }
+  int pa = (kp - 1) >> 1;
+  float za = (float(pa) + 0.5f) / pairs + (1e-3f / pairs);
+  float2 ta = volTex.sample(sVolume, float3(pos.x, pos.y, za), level(0)).rg;
+  if (kp + 1 <= int(slices) - 1) {
+    float zb = (float(pa + 1) + 0.5f) / pairs + (1e-3f / pairs);
+    float2 tb = volTex.sample(sVolume, float3(pos.x, pos.y, zb), level(0)).rg;
+    return mix(ta.y, tb.x, fz);
+  }
+  // Last slice is odd: hardware clamp-to-edge repeats it for z+1.
+  return ta.y;
+}
+
 inline float sampleVolumeScalar(texture3d<float> volTex, float3 pos) {
   if (fc_linearInterpolation) {
     if (fc_marchVariant == 1) {
@@ -3440,6 +3485,9 @@ inline float sampleVolumeScalar(texture3d<float> volTex, float3 pos) {
     }
     if (fc_marchVariant == 2) {
       return volTex.sample(sVolumeClampZero, pos, level(0)).r;
+    }
+    if (fc_volRg8) {
+      return sampleVolumeScalarRG8Pair(volTex, pos);
     }
     return volTex.sample(sVolume, pos, level(0)).r;
   }
@@ -4102,7 +4150,11 @@ inline half4 marchVolumeUnified(
   float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(p.rayDir * boundsSize, 0.0)).xyz;
   float3 texStep = rayDirTexLocal * p.stepSize;
   // Cell-to-point conversion factors, computed once (texel centers at (i+0.5)/dims).
-  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), volumeTexture.get_depth());
+  // RG8 pair-pack (fc_volRg8): the texture's z extent is the PAIR count
+  // (original slices / 2), so restore the original slice count here — every
+  // CTP-adjusted z phase and step below is expressed over it.
+  float texelCountZ = volumeTexture.get_depth() * (fc_volRg8 ? 2.0f : 1.0f);
+  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), texelCountZ);
   float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
   float3 ctpOffset  = 0.5 / texelCount;
   float3 evalStep = texStep * ctpScale;
@@ -4404,10 +4456,22 @@ inline half4 marchVolumeUnified(
   float3 texLocalPos = (volumeUniforms.volumeToTexture *
       float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
   float3 evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
-  float prefetchScalar = sampleVolumeScalar(volumeTexture,
-      rectilinearSamplePosition(evalPoint, doRectilinear, rectCoords, volumeUniforms));
+  // NOPREFETCH probe (_padCropFlags[2], env VTK_METAL_TEST_NOPREFETCH): the
+  // OpenGL loop issues ONE volume fetch per iteration and consumes it
+  // immediately; this march additionally keeps sample i+1 in flight. Under a
+  // per-pixel-jittered field that doubles the distinct cache lines each warp
+  // holds, which measurably amplifies the phase-scatter tax. When set, drop
+  // the prefetch-ahead pipeline and fetch directly per iteration (GL fetch
+  // discipline). Default 0 keeps legacy behavior.
+  float prefetchScalar = 0.0;
+  bool prefetchValid = false;
+  if (volumeUniforms._padCropFlags[2] < 0.5f)
+  {
+    prefetchScalar = sampleVolumeScalar(volumeTexture,
+        rectilinearSamplePosition(evalPoint, doRectilinear, rectCoords, volumeUniforms));
+    prefetchValid = true;
+  }
   float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint, level(0)).r : 0.0;
-  bool prefetchValid = true;
   int3  curCell     = int3(-1);
   bool  curCellEmpty = false;
   float3 mmDimF     = b.minMaxInfo.yzw;
@@ -4435,6 +4499,528 @@ inline half4 marchVolumeUnified(
   // locked. Accumulation is gated on both flags; the fetch stays unconditional.
   bool marchDone = false;
 
+  // ------------------------------------------------------------------------
+  // V31 back-edge exit port of the baseline divergent march
+  // (VTK_METAL_TEST_DOEXIT=1 -> VolumeFeature_MarchDoExit -> fc_doExit).
+  //
+  // divergent_tail_repro root cause: the MSL->Air compiler loses 4-12% to
+  // GLSL->Air on DRAM-resident volumes when the march carries data-dependent
+  // trip counts in a mid-body-exit CFG (for(...) { fetch; if (a>thr) break; }
+  // — the sampler sandwiched between a header branch and a mid-body exit
+  // branch). Folding all exit conditions into the loop BACK-EDGE (one branch
+  // per iteration, do-while) restores Air quality to GL parity
+  // (divergent_tail V31/V32; full RT x SD matrix 0.93-1.04). The
+  // jitter_gap_repro DOEXIT port measured neutral because that harness march
+  // differs from the production one; this applies the identical transformation
+  // to the production march.
+  //
+  // Semantics vs the baseline loop further below:
+  // - the for-header's first test becomes an explicit maxSteps > 0 entry
+  //   guard (an unguarded do-while composites one bogus sample on zero-step
+  //   corner-grazer rays — jitter_gap_repro lesson);
+  // - every mid-body break becomes a marchStop latch; latched iterations
+  //   still perform exactly the state updates the baseline performs around
+  //   each break site (clamp fixup, advance, prefetch) and exit at the
+  //   back-edge without compositing further;
+  // - the slab-inheritance saturation check stays at the top of the body like
+  //   the baseline (the continue-skip paths bypass the bottom latches, so the
+  //   top check is what terminates post-skip iterations);
+  // - marchIter keeps the baseline's update quirk (the final, stopping
+  //   iteration does not touch it) so METAL_ITER PPMs stay comparable;
+  // - latchExit/suppressAccum machinery is omitted: it is dead at variant 0
+  //   (fc_marchVariant 0 never sets marchOpaque/marchDone).
+  if (fc_doExit && fc_blendMode == 0 && !doCropping && !doMask && !doBlanking &&
+      !doRectilinear && !doTransfer2D && !useIndependentPath &&
+      !fc_dependentRGBA && !fc_dependentLA)
+  {
+    int i = 0;
+    bool marchStop = maxSteps <= 0;
+    do {
+      // A slab pass whose inherited near-side alpha already exceeds the
+      // saturation threshold contributes nothing; camera-inside rays
+      // (checkBounds == false) additionally stop at tEnd (the bounded rays'
+      // stop-at-tEnd comes from maxSteps).
+      if ((fc_slabMode && accumulatedOpacity > 1.0h - 1.0h / 255.0h) ||
+          (!p.checkBounds && currentT >= p.tEnd - 1e-6))
+      {
+        marchStop = true;
+      }
+
+      const float3 adjTexMin = ctpOffset;
+      const float3 adjTexMax = ctpOffset + ctpScale;
+      if (!marchStop)
+      {
+        // The proxy box spans the axis-aligned bounds of the rotated volume,
+        // so rays through its corner regions fall outside the [0,1]^3 texture
+        // cube. Clamp-and-sample the boundary slab until the ray has been
+        // inside once and left (seenInBounds); that is the baseline's
+        // directional per-axis CTP bounds break (OpenGL
+        // TerminationImplementation parity).
+        if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+            any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f)))
+        {
+          if (seenInBounds)
+          {
+            marchStop = true; // baseline breaks here
+          }
+          texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+          evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+          prefetchValid = false;
+        }
+        else
+        {
+          seenInBounds = true;
+        }
+      }
+
+      if (!marchStop)
+      {
+        if (useMinMax) {
+          float3 mmPos = clamp(evalPoint, float3(0.0), float3(1.0));
+          int3 newCell = min(int3(mmPos * mmDimF), int3(mmDimF) - 1);
+          if (any(newCell != curCell)) {
+            curCell      = newCell;
+            curCellEmpty = minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5;
+          }
+
+          if (curCellEmpty) {
+            float3 cellCoord = mmPos * mmDimF;
+            float3 fractCoord = fract(cellCoord);
+
+            float3 distToEdge;
+            distToEdge.x = p.rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x;
+            distToEdge.y = p.rayDir.y > 0.0 ? (1.0 - fractCoord.y) : fractCoord.y;
+            distToEdge.z = p.rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
+            distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
+
+            float3 tToEdge;
+            tToEdge.x = abs(rayDirTexLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirTexLocal.x * mmDimF.x) : 1e30;
+            tToEdge.y = abs(rayDirTexLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirTexLocal.y * mmDimF.y) : 1e30;
+            tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
+
+            float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
+            exactSkip += 1e-4;
+            float skipDist = ceil(exactSkip / p.stepSize) * p.stepSize;
+            skipDist = max(p.stepSize, skipDist);
+
+            currentPoint += p.rayDir * skipDist;
+            currentT += skipDist;
+
+            if (p.checkBounds && (any(currentPoint < p.blockMinGlobal - 1e-4) || any(currentPoint > p.blockMaxGlobal + 1e-4) || currentT >= p.tEnd)) {
+              marchStop = true; // baseline breaks here
+            }
+
+            // Re-sync the incremental sample position after the empty-cell jump.
+            texLocalPos = (volumeUniforms.volumeToTexture *
+                float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
+            evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+            prefetchValid = false;
+            curCell = int3(-1);
+            continue;
+          }
+        }
+
+        bool needsFetch = !prefetchValid;
+        float3 rectEvalPoint = evalPoint;
+        if (doRectilinear &&
+            (needsFetch || useIndependentPath || fc_dependentRGBA || fc_dependentLA)) {
+          rectEvalPoint = rectilinearSamplePosition(evalPoint, true, rectCoords, volumeUniforms);
+        }
+        float rawScalar = needsFetch
+          ? sampleVolumeScalar(volumeTexture, rectEvalPoint)
+          : prefetchScalar;
+        float4 rawScalar4 = float4(rawScalar, 0.0, 0.0, 0.0);
+        if (useIndependentPath) {
+          if (fc_linearInterpolation) {
+            rawScalar4 = volumeTexture.sample(sVolume, rectEvalPoint, level(0));
+          } else {
+            rawScalar4 = volumeTexture.sample(sNearest, rectEvalPoint, level(0));
+          }
+        } else if (fc_dependentRGBA || fc_dependentLA) {
+          rawScalar4 = sampleVolumeTexel(volumeTexture, rectEvalPoint);
+        }
+        float rawMask = (doMask && needsFetch)
+          ? maskTexture.sample(sNearest, evalPoint, level(0)).r
+          : prefetchMask;
+
+        if (doCropping && ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, evalPoint))) == 0u)) {
+          currentPoint += stepVec;
+          currentT += p.stepSize;
+          texLocalPos += texStep;
+          evalPoint += evalStep;
+          prefetchValid = false;
+          continue;
+        }
+
+        if (doMask && volumeUniforms.maskType > 0.5) {
+          float binMask = rawMask * maskScale + maskBias;
+          if (binMask <= 0.0) {
+            currentPoint += stepVec;
+            currentT += p.stepSize;
+            texLocalPos += texStep;
+            evalPoint += evalStep;
+            prefetchValid = false;
+            continue;
+          }
+        }
+
+        if (doBlanking) {
+          float4 bCur = blankingTexture.sample(sNearest, evalPoint, level(0));
+          float4 bXP = blankingTexture.sample(sNearest, evalPoint + float3(blankHalfStep.x, 0.0, 0.0), level(0));
+          float4 bXN = blankingTexture.sample(sNearest, evalPoint - float3(blankHalfStep.x, 0.0, 0.0), level(0));
+          float4 bYP = blankingTexture.sample(sNearest, evalPoint + float3(0.0, blankHalfStep.y, 0.0), level(0));
+          float4 bYN = blankingTexture.sample(sNearest, evalPoint - float3(0.0, blankHalfStep.y, 0.0), level(0));
+          float4 bZP = blankingTexture.sample(sNearest, evalPoint + float3(0.0, 0.0, blankHalfStep.z), level(0));
+          float4 bZN = blankingTexture.sample(sNearest, evalPoint - float3(0.0, 0.0, blankHalfStep.z), level(0));
+
+          const bool anyPoint = (bCur.x > 0.0 || bXP.x > 0.0 || bXN.x > 0.0 ||
+                                 bYP.x > 0.0 || bYN.x > 0.0 || bZP.x > 0.0 ||
+                                 bZN.x > 0.0);
+          const bool anyCell  = (bCur.y > 0.0 || bXP.y > 0.0 || bXN.y > 0.0 ||
+                                 bYP.y > 0.0 || bYN.y > 0.0 || bZP.y > 0.0 ||
+                                 bZN.y > 0.0);
+
+          bool blanked = false;
+          if (volumeUniforms.blankingMode == 1.0) {
+            blanked = anyCell;
+          } else if (volumeUniforms.blankingMode == 2.0) {
+            blanked = anyPoint;
+          } else {
+            blanked = (anyCell || anyPoint);
+          }
+          if (blanked) {
+            currentPoint += stepVec;
+            currentT += p.stepSize;
+            texLocalPos += texStep;
+            evalPoint += evalStep;
+            prefetchValid = false;
+            continue;
+          }
+        }
+
+        half scalarNorm = saturate(half(rawScalar) * scalarScale + scalarBias);
+
+        half scalarNormComp[4] = {scalarNorm, scalarNorm, scalarNorm, scalarNorm};
+        half compScale[4] = {0.0h, 0.0h, 0.0h, 0.0h};
+        half compBias[4] = {0.0h, 0.0h, 0.0h, 0.0h};
+        if (useIndependentPath) {
+          int nComp = min(4, int(volumeUniforms.numComponents));
+          for (int c = 0; c < nComp; ++c) {
+            half cMin = half(volumeUniforms.scalarMinComp[c]);
+            half cRange = max(half(volumeUniforms.scalarMaxComp[c]) - cMin, 1e-4h);
+            compScale[c] = 1.0h / cRange;
+            compBias[c] = -cMin / cRange;
+            float rawComp;
+            if (c == 0) rawComp = rawScalar;
+            else if (c == 1) rawComp = rawScalar4.g;
+            else if (c == 2) rawComp = rawScalar4.b;
+            else rawComp = rawScalar4.a;
+            scalarNormComp[c] = saturate((half(rawComp) - cMin) / cRange);
+          }
+        }
+
+        half4 colorOpacity;
+        half maskLabel = 0.0h;
+        half4 sharedGrad = half4(0.0h);
+        bool sharedGradReady = false;
+        half4 cachedDensityGrad = half4(0.0h);
+        bool densityGradReady = false;
+
+        half4 compColor[4] = {half4(0.0h), half4(0.0h), half4(0.0h), half4(0.0h)};
+
+        const bool fc_needsPerSampleOpacity =
+          (fc_blendMode == 0 || fc_blendMode == 3 || fc_blendMode == 4);
+        if (useIndependentPath) {
+          if (fc_needsPerSampleOpacity) {
+            int nComp = min(4, int(volumeUniforms.numComponents));
+            for (int c = 0; c < nComp; ++c) {
+              compColor[c] = sampleComponentTransferFunction(
+                  transferFunctionTexture, transferFunctionTexture1,
+                  transferFunctionTexture2, transferFunctionTexture3,
+                  float2(float(scalarNormComp[c]), 0.5), c);
+            }
+          }
+        } else if (fc_needsPerSampleOpacity && doTransfer2D) {
+          half secondNorm;
+          if (volumeUniforms.transfer2DUseGradient > 0.5) {
+            sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
+            sharedGradReady = true;
+            secondNorm = sharedGrad.w;
+          } else {
+            secondNorm = saturate(
+                half(sampleSecondScalar(transfer2DYAxisTexture, evalPoint)) * secondScale + secondBias);
+          }
+          colorOpacity = sampleTransferFunction2D(
+              transferFunction2DTexture, float2(float(scalarNorm), float(secondNorm)));
+        } else if (fc_needsPerSampleOpacity && doMask) {
+          float maskVal = rawMask * maskScale + maskBias;
+          if (numLabels > 0.0) {
+            float label = floor(maskVal + 0.5);
+            if (label > 0.0) {
+              label = clamp(label, 1.0, numLabels - 1.0);
+              maskLabel = half(label);
+              float labelY = (label + 0.5) / numLabels;
+              colorOpacity = half4(labelMapTransferTexture.sample(sNearest, float2(float(scalarNorm), labelY), level(0)));
+            } else {
+              colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
+            }
+          } else {
+            colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
+          }
+        } else if (fc_needsPerSampleOpacity) {
+          if (fc_dependentRGBA) {
+            half rgbaOpacity =
+              sampleTransferFunction(transferFunctionTexture, float2(rawScalar4.a, 0.5)).a;
+            colorOpacity = half4(half3(rawScalar4.rgb), rgbaOpacity);
+          } else if (fc_dependentLA) {
+            half4 laColor = sampleTransferFunction(
+                transferFunctionTexture, float2(float(scalarNorm), 0.5));
+            half lastMin = half(volumeUniforms.scalarMinComp[1]);
+            half lastMax = half(volumeUniforms.scalarMaxComp[1]);
+            half lastNorm = saturate(
+                (half(rawScalar4.g) - lastMin) / max(lastMax - lastMin, 1e-4h));
+            half laOpacity = sampleTransferFunction(
+                transferFunctionTexture, float2(float(lastNorm), 0.5)).a;
+            colorOpacity = half4(laColor.rgb, laOpacity);
+          } else {
+            colorOpacity = sampleTransferFunction(transferFunctionTexture, float2(float(scalarNorm), 0.5));
+          }
+        } else {
+          colorOpacity = half4(0.0h);
+        }
+
+        half sampleOpacity = colorOpacity.a;
+
+        if (useIndependentPath) {
+          if (fc_needsPerSampleOpacity && doGradOp) {
+            if (!compGradReady) {
+              computeGradientsAllComponents(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor, compGrad);
+              compGradReady = true;
+            }
+            int nComp = min(4, int(volumeUniforms.numComponents));
+            for (int c = 0; c < nComp; ++c) {
+              compColor[c].a *= sampleGradientOpacity(gradientOpacityTexture, float(compGrad[c].w));
+            }
+          }
+          half totalAlpha = 0.0h;
+          int nComp = min(4, int(volumeUniforms.numComponents));
+          for (int c = 0; c < nComp; ++c) {
+            if (volumeUniforms.componentWeight[c] <= 0.0) continue;
+            totalAlpha += compColor[c].a * half(volumeUniforms.componentWeight[c]);
+          }
+          sampleOpacity = totalAlpha;
+        }
+
+        if (useIndependentPath) {
+          if (fc_blendMode == 1) {           // MAXIMUM_INTENSITY_BLEND
+            int nComp = min(4, int(volumeUniforms.numComponents));
+            for (int c = 0; c < nComp; ++c) {
+              if (firstBlendSample || mipMaxScalarComp[c] < scalarNormComp[c]) {
+                mipMaxScalarComp[c] = scalarNormComp[c];
+              }
+            }
+            firstBlendSample = false;
+          } else if (fc_blendMode == 2) {    // MINIMUM_INTENSITY_BLEND
+            int nComp = min(4, int(volumeUniforms.numComponents));
+            for (int c = 0; c < nComp; ++c) {
+              if (firstBlendSample || minipMinScalarComp[c] > scalarNormComp[c]) {
+                minipMinScalarComp[c] = scalarNormComp[c];
+              }
+            }
+            firstBlendSample = false;
+          } else if (fc_blendMode == 3) {    // AVERAGE_INTENSITY_BLEND
+            int nComp = min(4, int(volumeUniforms.numComponents));
+            for (int c = 0; c < nComp; ++c) {
+              half intensityNorm =
+                half(volumeUniforms.scalarMinComp[c]) +
+                (half(volumeUniforms.scalarMaxComp[c]) - half(volumeUniforms.scalarMinComp[c])) * scalarNormComp[c];
+              if (intensityNorm >= half(volumeUniforms.averageIPRangeMin) &&
+                  intensityNorm <= half(volumeUniforms.averageIPRangeMax)) {
+                avgBlendSumComp[c] += compColor[c].a * scalarNormComp[c];
+                avgBlendCountComp[c]++;
+              }
+            }
+          } else if (fc_blendMode == 4) {    // ADDITIVE_BLEND
+            int nComp = min(4, int(volumeUniforms.numComponents));
+            for (int c = 0; c < nComp; ++c) {
+              additiveSumComp[c] += compColor[c].a * scalarNormComp[c];
+            }
+          }
+        } else if (fc_blendMode == 1) {           // MAXIMUM_INTENSITY_BLEND
+          if (firstBlendSample || mipMaxScalar < scalarNorm) {
+            mipMaxScalar = scalarNorm;
+          }
+          firstBlendSample = false;
+        } else if (fc_blendMode == 2) {    // MINIMUM_INTENSITY_BLEND
+          if (firstBlendSample || minipMinScalar > scalarNorm) {
+            minipMinScalar = scalarNorm;
+          }
+          firstBlendSample = false;
+        } else if (fc_blendMode == 3) {    // AVERAGE_INTENSITY_BLEND
+          half intensityNorm =
+            volumeUniforms.scalarMin + (volumeUniforms.scalarMax - volumeUniforms.scalarMin) * scalarNorm;
+          if (intensityNorm >= half(volumeUniforms.averageIPRangeMin) &&
+              intensityNorm <= half(volumeUniforms.averageIPRangeMax)) {
+            avgBlendSum += sampleOpacity * scalarNorm;
+            avgBlendCount++;
+          }
+        } else if (fc_blendMode == 4) {    // ADDITIVE_BLEND
+          additiveSum += sampleOpacity * scalarNorm;
+        }
+        if (fc_renderToTexture && haveOpaquePos != nullptr && *haveOpaquePos && sampleOpacity > 0.0h) {
+          *firstOpaquePos = currentPoint;
+          *haveOpaquePos = false;
+        }
+
+        if (useIndependentPath) {
+          if (fc_blendMode == 0 && sampleOpacity > 0.0h) {
+            half3 tmpRGB = half3(0.0h);
+            half tmpA = 0.0h;
+            int nComp = min(4, int(volumeUniforms.numComponents));
+            for (int c = 0; c < nComp; ++c) {
+              half w = half(volumeUniforms.componentWeight[c]);
+              if (w <= 0.0h) continue;
+              half4 cc = compColor[c];
+              half3 ccRGB = cc.rgb;
+              if (sampleOpacity >= 0.01h && doShading) {
+                half3 normal;
+                if (fc_computeNormalFromOpacity) {
+                  normal = computeDensityGradientFast(volumeTexture,
+                      transferFunctionTexture, transferFunctionTexture1,
+                      transferFunctionTexture2, transferFunctionTexture3,
+                      evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture,
+                      gradNormFactor, c, compScale[c], compBias[c]).xyz;
+                } else if (fc_normalTexture) {
+                  half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
+                  normal = normalize(nrmSample.xyz * 2.0h - 1.0h);
+                } else {
+                  if (!compGradReady) {
+                    computeGradientsAllComponents(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor, compGrad);
+                    compGradReady = true;
+                  }
+                  normal = compGrad[c].xyz;
+                }
+                half3 ambC = half3(volumeUniforms.ambientColorComp[c].rgb);
+                half3 difC = half3(volumeUniforms.diffuseColorComp[c].rgb);
+                half3 speC = half3(volumeUniforms.specularColorComp[c].rgb);
+                half  shiC = half(volumeUniforms.shininessComp[c]);
+                if (lightUniforms != nullptr && !fc_defaultLighting) {
+                  ccRGB = computeVolumeLighting(ccRGB, normal, -viewDirHalf,
+                      ambC, difC, speC, shiC,
+                      *lightUniforms,
+                      volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize);
+                } else {
+                  bool twoSided = (lightUniforms != nullptr && lightUniforms->twoSidedLighting != 0);
+                  ccRGB = computePhongLightingVolumeFast(ccRGB, normal, -viewDirHalf, -viewDirHalf,
+                      ambC, difC, speC, shiC, twoSided);
+                }
+              }
+              tmpRGB += ccRGB * cc.a * w;
+              tmpA += (cc.a * cc.a) / sampleOpacity;
+            }
+            half weight = 1.0h - accumulatedOpacity;
+            accumulatedColor += weight * tmpRGB;
+            accumulatedOpacity += weight * tmpA;
+          }
+        } else if (fc_blendMode == 0 && sampleOpacity > 0.0h) {
+          half3 sampleColor = colorOpacity.rgb;
+          half weight = 1.0h - accumulatedOpacity;
+
+          if (doGradOp && maskLabel == 0.0h) {
+            if (!sharedGradReady) {
+              if (fc_normalTexture) {
+                half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
+                sharedGrad = half4(normalize(nrmSample.xyz * 2.0h - 1.0h), nrmSample.w);
+              } else if (fc_computeNormalFromOpacity) {
+                sharedGrad = computeScalarAndDensityGradient(volumeTexture,
+                    transferFunctionTexture, transferFunctionTexture1,
+                    transferFunctionTexture2, transferFunctionTexture3,
+                    evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture,
+                    gradNormFactor, scalarScale, scalarBias, cachedDensityGrad);
+                densityGradReady = true;
+              } else {
+                sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
+              }
+              sharedGradReady = true;
+            }
+            sampleOpacity *= sampleGradientOpacity(gradientOpacityTexture, float(sharedGrad.w));
+          }
+
+          if (doShading && maskLabel == 0.0h && sampleOpacity > 0.0h) {
+
+            half3 normal;
+            if (fc_computeNormalFromOpacity) {
+              if (densityGradReady) {
+                normal = cachedDensityGrad.xyz;
+              } else {
+                normal = computeDensityGradientFast(volumeTexture,
+                    transferFunctionTexture, transferFunctionTexture1,
+                    transferFunctionTexture2, transferFunctionTexture3,
+                    evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture,
+                    gradNormFactor, 0, scalarScale, scalarBias).xyz;
+              }
+            } else {
+              if (!sharedGradReady) {
+                if (fc_normalTexture) {
+                  half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
+                  sharedGrad = half4(normalize(nrmSample.xyz * 2.0h - 1.0h), nrmSample.w);
+                } else {
+                  sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
+                }
+                sharedGradReady = true;
+              }
+              normal = sharedGrad.xyz;
+            }
+
+            if (lightUniforms != nullptr && !fc_defaultLighting) {
+              sampleColor = computeVolumeLighting(sampleColor, normal, -viewDirHalf,
+                  ambientMat, diffuseMat, specularMat, shininessMat,
+                  *lightUniforms,
+                  volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize);
+            } else {
+              bool twoSided = (lightUniforms != nullptr && lightUniforms->twoSidedLighting != 0);
+              sampleColor = computePhongLightingVolumeFast(sampleColor, normal, -viewDirHalf, -viewDirHalf,
+                  ambientMat, diffuseMat, specularMat, shininessMat, twoSided);
+            }
+          } else if (doShading) {
+            sampleColor = ambientMat * sampleColor;
+          }
+
+          accumulatedColor += weight * (sampleColor * sampleOpacity);
+          accumulatedOpacity += weight * sampleOpacity;
+        }
+
+        currentPoint += stepVec;
+        currentT += p.stepSize;
+        texLocalPos += texStep;
+        evalPoint += evalStep;
+
+        if (volumeUniforms._padCropFlags[2] < 0.5f && i + 1 < maxSteps) {
+          prefetchScalar = sampleVolumeScalar(volumeTexture,
+              rectilinearSamplePosition(evalPoint, doRectilinear, rectCoords, volumeUniforms));
+          if (doMask) {
+            prefetchMask = maskTexture.sample(sNearest, evalPoint, level(0)).r;
+          }
+          prefetchValid = true;
+        }
+
+        // Bottom latches (the baseline breaks here): OpenGL-parity threshold
+        // g_opacityThreshold = 1 - 1/255 evaluated WITHOUT clamping the
+        // accumulated opacity, then the terminate-plane distance.
+        if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) {
+          marchStop = true;
+        }
+        if (currentT >= p.tTerminateMax) {
+          marchStop = true;
+        }
+      }
+
+      // Baseline sets marchIter only on completed (non-breaking) iterations.
+      if (!marchStop) {
+        marchIter = i + 1;
+      }
+    } while (++i < maxSteps && !marchStop);
+  }
   // Env-gated N-way unrolled march (fc_marchVariant 6 = 8x, 7 = 4x, selected
   // via VTK_METAL_TEST_MARCH_VARIANT). PERFORMANCE_INVESTIGATION.md section 14:
   // the harness showed the bare-fetch march is texture-latency bound and that N
@@ -4448,7 +5034,7 @@ inline half4 marchVolumeUnified(
   // empty-cell skip or out-of-cube clamp invalidates the remaining pre-fetched
   // scalars and forces a refill from the moved position. The guard is fully
   // compile-time, so any other feature combination keeps the baseline loop.
-  if (fc_marchVariant >= 6 && fc_blendMode == 0 && !doCropping && !doMask &&
+  else if (fc_marchVariant >= 6 && fc_blendMode == 0 && !doCropping && !doMask &&
       !doBlanking && !doRectilinear && !doTransfer2D && !useIndependentPath &&
       !fc_dependentRGBA && !fc_dependentLA)
   {
@@ -5729,7 +6315,7 @@ inline half4 marchVolumeUnified(
     texLocalPos += texStep;
     evalPoint += evalStep;
 
-    if (i + 1 < maxSteps) {
+    if (volumeUniforms._padCropFlags[2] < 0.5f && i + 1 < maxSteps) {
       prefetchScalar = sampleVolumeScalar(volumeTexture,
           rectilinearSamplePosition(evalPoint, doRectilinear, rectCoords, volumeUniforms));
       if (doMask) {
@@ -5878,7 +6464,14 @@ inline half4 marchVolumeUnified(
   if (volumeUniforms._padCropFlags[0] > 0.5f) {
     // Encode iter count directly: red_channel/255 = marchIter/256, so
     // uint8 red ≈ marchIter. Max representable = 255 iterations.
-    return half4(half(float(marchIter) / 256.0f), 0.0h, 0.0h, 1.0h);
+    // TEMP RG8 debug: green = fract(zf) i.e. fz weight within the slice
+    // interval, blue = floor(z) parity * 255 (pair-class tag).
+    float zfDbg = saturate(evalPoint.z) * float(volumeTexture.get_depth() * 2) - 0.5f;
+    float fzDbg = max(zfDbg - floor(zfDbg), 0.0f);
+    float parDbg = (int(clamp(floor(zfDbg), 0.0f, float(volumeTexture.get_depth() * 2 - 1))) & 1) != 0 ? 1.0f : 0.0f;
+    return half4(half(float(marchIter) / 256.0f),
+                 half(fzDbg),
+                 half(parDbg), 1.0h);
   }
   return finalColor;
 }
@@ -5922,11 +6515,19 @@ inline half4 marchVolume(
 {
   (void)exitPoint;
   (void)totalDist;
-  float jitter = (volumeUniforms.useJittering > 0.5
+  float jSel = (volumeUniforms.useJittering > 0.5
       ? (volumeUniforms.useIGNJitter > 0.5
             ? sampleIGNJitter(screenPos, volumeUniforms.jitterBlockSize)
             : sampleJitterNoise(screenPos, volumeUniforms.viewportSize.y, volumeUniforms.jitterBlockSize))
-      : 1.0) * stepSize;
+      : 1.0f);
+  // JSCALE probe (_padCropFlags[1], env VTK_METAL_TEST_JSCALE): shrink the
+  // per-pixel phase spread toward the coherent j0 lattice via
+  // 1 + s*(noise-1), keeping the noise tap/ALU and trip counts identical.
+  // s=1 -> native j1; s=0 -> coherent j0-equivalent start phase. The CPU fill
+  // always writes this slot (default 1.0); out-of-range values read as 1.0.
+  float jScale = volumeUniforms._padCropFlags[1];
+  jScale = (jScale >= 0.0f && jScale <= 1.0f) ? jScale : 1.0f;
+  float jitter = mix(1.0f, jSel, jScale) * stepSize;
   float tStart = dot(entryPoint - cameraPos, rayDir);
   // OpenGL camera-inside parity (update 22): GL ignores the box/near-plane
   // entry for camera-inside proxy fragments and marches from the interpolated
@@ -6023,6 +6624,20 @@ fragment VolumeFragmentOut fragment_volume_main(
     texture2d<float> slabFeedbackTexture [[texture(15)]]) {
 
   VolumeFragmentOut output;
+  // TEMP PROBE (VTK_METAL_TEST_NOPREFETCH doubles as probe toggle when
+  // combined with VTK_METAL_TEST_RG8): render sampleVolumeScalar at fixed
+  // z=0.5 over screen UV to validate the volume path decoupled from the
+  // march. Investigation-only.
+  if (volumeUniforms._padCropFlags[2] > 0.5f)
+  {
+    float2 uv = (in.position.xy + 0.5) / volumeUniforms.viewportSize;
+    float pz = volumeUniforms._padCropFlags[3];
+    if (pz <= 0.0f) pz = 0.5f;
+    float v = fc_volRg8 ? sampleVolumeScalarRG8Pair(volumeTexture, float3(uv, pz))
+                        : sampleVolumeScalar(volumeTexture, float3(uv, pz));
+    output.color = float4(float3(v), 1.0);
+    return output;
+  }
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
   float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
   computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);
@@ -6188,6 +6803,20 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
     constant VolumeLightUniforms& volumeLights [[buffer(4)]]) {
 
   VolumeFragmentOut output;
+  // TEMP PROBE (VTK_METAL_TEST_NOPREFETCH doubles as probe toggle when
+  // combined with VTK_METAL_TEST_RG8): render sampleVolumeScalar at fixed
+  // z=0.5 over screen UV to validate the volume path decoupled from the
+  // march. Investigation-only.
+  if (volumeUniforms._padCropFlags[2] > 0.5f)
+  {
+    float2 uv = (in.position.xy + 0.5) / volumeUniforms.viewportSize;
+    float pz = volumeUniforms._padCropFlags[3];
+    if (pz <= 0.0f) pz = 0.5f;
+    float v = fc_volRg8 ? sampleVolumeScalarRG8Pair(volumeTexture, float3(uv, pz))
+                        : sampleVolumeScalar(volumeTexture, float3(uv, pz));
+    output.color = float4(float3(v), 1.0);
+    return output;
+  }
   float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
   float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
   computeVolumeBounds(b, volumeUniforms, blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal);

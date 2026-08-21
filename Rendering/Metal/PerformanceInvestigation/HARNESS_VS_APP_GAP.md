@@ -559,14 +559,261 @@ in the loop text, TF shape, gradient mode, texture format, or pass structure**.
 Per the plan, the next step is GL texture/FBO *state* (wrap/filter/immutable/
 swizzle/max-level/compare) or occupancy profiling (Instruments) — not more GLSL.
 
+## 13. V31 back-edge exit ported to the app — NEUTRAL (2026-08-21)
+
+The divergent_tail root cause (MSL mid-body-exit CFG loses to GLSL->Air under
+data-dependent trip counts) was ported to the production march as
+`VTK_METAL_TEST_DOEXIT=1` → `VolumeFeature_MarchDoExit` (1u<<29) →
+`fc_doExit` (function_constant 31): the baseline loop reshaped into a do-while
+with every exit folded into the back-edge, `maxSteps > 0` entry guard, gated to
+the lean composite config (blendMode 0, no crop/mask/blanking/rect/tf2d/
+independent/RGBA/LA), baseline text untouched (separate `else if` branch).
+
+Parity: `METAL_ITER` dumps byte-identical AND color renders byte-identical vs
+baseline at the 1024 bench config.
+
+| paired j0 Δ (DOEXIT−base) | value | verdict |
+|---|---|---|
+| oblique 2048 | +0.88 ± 0.94 ms | neutral |
+| 1024 | +0.27 ± 0.45 ms | neutral |
+| 800 | −0.25 ± 0.12 ms | neutral |
+| j1 probe 2048 (JITTER=1, IGN=0) | −0.37 ± 0.18 ms on ~70 ms | neutral |
+
+Baseline M/GL j0 reproduced the frozen metric exactly (1.054 ± 0.034 at 2048).
+Verdict: same as the jitter_gap_repro port — the repro's codegen deficit does
+not transfer to the production march's instruction mix (interleaved TF taps +
+prefetch-ahead). Baseline j0 at 1024/800 measured ~1.05 this session (doc had
+1024 "tied"); session-sensitive.
+
+## 14. Jitter dose-response: the tax ∝ phase-diversity magnitude (JSCALE)
+
+New probe `_padCropFlags[1]` (`VTK_METAL_TEST_JSCALE=s`): the per-pixel phase
+offset becomes `mix(1, noise, s)`, shrinking lane spread toward the coherent
+j0 lattice while keeping the noise tap, ALU and trip counts identical.
+Validated: s=1 byte-identical to native j1; s=0 byte-identical color AND
+per-pixel traversal to real j0 (`JITTER=0`).
+
+2048/SD4 raw, interleaved order-alternated:
+
+| config | Metal jitter Δ |
+|---|---|
+| native (s=1) | +23.74 ± 1.44 ms |
+| s=0.5 | +13.50 ± 0.17 ms |
+| s=0.25 | +6.82 ± 0.41 ms |
+| GL reference | +11.27 ± 0.65 ms |
+
+**Metal's tax scales near-linearly with phase-spread magnitude; GL sits on
+Metal's own curve at s≈0.45.** The noise tap/ALU contribute ~nothing (s→0 ≡
+j0 cost). `optContents=YES` refuted as a fix: Δ doubles (+50.8 ± 1.1 ms;
+lag_repro's swizzle read-tax amplified by scatter). Quality: any s<1 converges
+toward the no-jitter image (mean|d| ~4.4/255 vs GL j1 — same magnitude as
+turning jitter off), so JSCALE is diagnostic-only, never shippable.
+
+## 15. NOPREFETCH refuted; NEAREST convergence pins trilinear-z
+
+- **NOPREFETCH** (`_padCropFlags[2]`, drop the prefetch-ahead pipeline so the
+  march issues one fetch per iteration like GL's composed loop): j0 neutral,
+  Δ +22.48 vs +23.23 ms — refuted.
+- **NEAREST interpolation both backends** (`VTK_METAL_TEST_GL_NEAREST=1`,
+  1 texel/sample): GL Δ +13.83, Metal Δ +17.69 → **M/GL j1 = 1.02, tied**
+  (Metal faster at nearest-j0: 30.3 vs 33.3). Linear: +9.90 vs +23.23 (1.29).
+
+**The entire pre-RG8 2× lives in hardware trilinear-z handling under
+cross-lane phase scatter.** Not trip counts, not loop CFG, not TF structure,
+not pass structure, not prefetch, not derivatives (`level(0)` already),
+not layout flag (§14). Counter-intuitively GL's nearest Δ *exceeds* its linear Δ
+(+13.8 vs +9.9): more taps made GL cheaper — the sampler feeds z-pairs from
+storage differently than Metal's uncompressed private layout does.
+
+## 16. Production configuration: Metal already wins everywhere measured
+
+With minmax acceleration ON (the app default path), 2048/SD4/slabs=1:
+
+| config | j0 | j1 | jitter Δ |
+|---|---|---|---|
+| GL | 39.62 ± 0.32 | 51.25 ± 0.42 | +11.63 |
+| Metal mv9 + minmax | 24.79 ± 0.06 | 28.92 ± 0.15 | +4.12 |
+| **Metal mv0 + minmax** | **25.12 ± 0.11** | **26.60 ± 0.12** | **+1.48** |
+
+M/GL j0 0.63, j1 0.52–0.56. The acceleration removes exactly the scattered
+samples the tax feeds on. Note for the planned TEMP-REPRO revert: **mv0+minmax
+ties mv9 at j0 and wins at j1 on this study** — do not blindly revert to 9.
+
+## 17. RG8 pair-packed slices ported to the app — flips the sign (RG8 knob)
+
+`VTK_METAL_TEST_RG8=1`: volume repacked R=slice 2z / G=slice 2z+1 over a
+halved-depth RG8Unorm texture (both upload functions patched; the live one is
+`UpdateVolumeTexture`), shader reconstructs trilinear-z from ~1.25 XY-bilinear
+pair-taps (`sampleVolumeScalarRG8Pair`, function_constant 32, feature bit
+1u<<30). Two bugs found and fixed en route:
+
+1. **fp32 ulp swallows numerator-baked nudges**: at pairs=897 one ulp is
+   ~6e-5 texels; a center offset baked into `(p+0.500002)/pairs` rounds away
+   and floor() flips to the neighboring pair at full weight. Fix: post-divide
+   nudge `(p+0.5)/pairs + 1e-3/pairs` (18× above ulp, bleeds 0.1% of the
+   adjacent pair).
+2. **`ctpScale`/`ctpOffset` derive from `volumeTexture.get_depth()`** — after
+   repack that is the PAIR count, silently re-basing every ray's z lattice
+   (found via a fixed-coordinate probe that proved the sampler exact while
+   the march diverged). Fix: `texelCountZ = depth × 2` under fc_volRg8.
+
+Image parity after both fixes (j0, 512²): mean|d|=0.0178/255, >1LSB 0.0065%
+of pixels, max Δ2. Probe sweep z=0.05..0.95 (both parities, all fz):
+base ≡ RG8 exactly.
+
+2048/SD4 oblique final matrix (interleaved, order-alternated):
+
+| config | j0 | j1 | jitter Δ |
+|---|---|---|---|
+| GL | 40.10 ± 0.36 | 52.83 ± 1.40 | +12.73 |
+| Metal 3D trilinear | 43.26 ± 0.07 | 66.28 ± 0.18 | +23.02 ± 0.20 |
+| **Metal RG8 pair-tap** | **33.20 ± 0.39** | **43.07 ± 0.75** | **+9.87 ± 0.49** |
+
+M/GL j1 **0.82** — Metal beats GL by 18% on the cell where it previously lost
+1.29×. Visual exports indistinguishable (/tmp/vis_*, /tmp/vis2k_*; GL-vs-RG8
+mean|d|=0.066/255 ≈ GL-vs-native 0.064).
+
+## 18. RG8 regression matrix — NOT shippable as default
+
+Same protocol swept across sampling density and orientation:
+
+| cell (2048²) | base j0 | RG8 j0 | RG8-vs-base j0/j1 |
+|---|---|---|---|
+| oblique SD4 | 43.31 | 33.56 | **−22.5% / −34.3%** ✅ |
+| oblique SD0.5 | 118.03 | 159.50 | **+35.1% / +36.3%** ❌ |
+| axial z SD4 | 11.43 | 15.54 | +36.1% / +4.7% ❌ |
+| coronal y SD4 | 9.54 | 14.02 | +46.9% / +47.2% ❌ |
+| sagittal x SD4 | 9.65 | 14.00 | +45.1% / +45.2% ❌ |
+
+Plain 3D Metal already beats GL in all those cells (M/GL j0 0.69–0.76, j1
+0.68–0.82; SD0.5 matches SLAB_BENCHMARKS §7's 0.74×). The pair-tap pays only
+where the march is DRAM-bandwidth-bound under heavy scatter; issue/latency-bound
+cells eat the extra ALU and dual taps as pure overhead — matching
+divergent_tail's small-frame warning. Decision: **keep `VTK_METAL_TEST_RG8`
+as a documented opt-in knob; do not default it.**
+
+## 19. Azimuth sweep: the pre-RG8 lag is a continuum (2026-08-21)
+
+CAM_AZ orbits the camera around world-Y over the fixed oblique base
+(2048/SD4/raw/jitter, blue-noise):
+
+| AZ | GL Δ | Metal Δ | M/GL j0 | M/GL j1 |
+|---|---|---|---|---|
+| 0° | +9.6 | +18.3 | 0.90 | 1.08 |
+| 45° | +2.8 | +2.8 | 0.91 | **0.92** |
+| 90° | +4.9 | +7.1 | 1.06 | 1.11 |
+| 135° | +23.6 | **+43.8** | 0.95 | **1.32** |
+| 180° | +10.2 | +19.3 | 0.93 | 1.13 |
+| 225° | +2.9 | +2.5 | 0.95 | **0.94** |
+| 270° | +6.5 | +7.1 | 1.14 | 1.14 |
+| 315° | +23.3 | **+43.8** | 0.89 | **1.28** |
+
+No oblique view escapes the tax (best case ties at 0.92); peaks come in
+opposite pairs (135/315 slow, 45/225 fast) — sign-independent, axis-dependent:
+the slow azimuths are the ones where rays cross slice planes steepest,
+matching the distinct-z-pair-per-warp model of §14/§15.
+
+## 20. Harness GL knobs: context profile + immutable storage — refuted
+
+Chasing why harness-GL pays +22–26 ms while app-GL pays +10–12 ms on proven-
+identical rays (§12), two remaining state candidates were tested in
+`jitter_gap_repro.mm` (new env knobs `GL41`, `GLSTORAGE`; single runs,
+2048/SD4):
+
+| harness config | GL j0 | GL j1 | GL Δ |
+|---|---|---|---|
+| baseline (3.2-core, mutable) | 47.63 | 71.22 | +23.60 |
+| GL **4.1 core** profile | 43.42 | 70.23 | +26.82 |
+| **immutable** storage (`glTexStorage3D`) | 45.70 | 71.08 | +25.38 |
+| both | 60.96 | 98.86 | +37.90 (worse) |
+
+Both refuted (Metal inert throughout ✓). The app-GL cheapness now survives:
+loop text, TF layout, gradient mode, LOD, split-TF, NODEPTH, NOCLIP, NOTF,
+depth/FBO pass structure, context profile, storage class. Remaining candidates
+are surface/drawable presence (NSOpenGLView vs headless CGL+FBO), blending
+state, uniform plumbing (UBO vs glUniform), or driver-internal caching keyed
+on something we have not enumerated. See HANDOFF (§22).
+
+## 21. Mechanism synthesis (2026-08-21)
+
+Proven: the tax is per-sample cost inflation under cross-lane phase diversity
+(identical trip counts; ∝ spread via JSCALE); it lives in trilinear z-slice-
+pair handling (NEAREST ties; RG8 pair-tap beats GL); it is view-angle
+dependent via slice-crossing rate; absent in every accelerated config measured.
+
+Inferred (strongly constrained): GL's opaque 3D tiling keeps warp footprints
+line-coherent under sub-voxel scatter; Metal's uncompressed layout doesn't and
+its swizzled alternative taxes reads of CT data. Same sampler silicon, different
+feeds.
+
+Unknowable from source: which driver layer owns the difference — that requires
+Apple. NOTE: `jitter_gap_repro` alone cannot be the report exhibit (there
+Metal WINS, 0.89×); the gap claim needs the app binary at CAM_AZ 135/315
+(1.28–1.32×) with matched fields, plus the harness as mechanism exhibit
+(dose-response, NEAREST convergence, RG8 flip).
+
+## 22. HANDOFF — next work: replicate app-GL performance in the harness
+
+Goal: make harness-GL's jitter Δ reach app-GL's ~+11 ms (it sits at +22–26 ms
+on identical rays/field/trip counts, §12.1). Success would (a) yield the
+missing minimal Apple-report repro boundary, (b) prove the tax is driver-state,
+not physics, and possibly (c) hint at an MSL-reachable equivalent.
+
+Refuted so far (do NOT retry): loop shape (LOD/split-TF/while+box individually),
+NODEPTH, NOCLIP, DEPTH attach, NOTF, NOBOX/MINIMAL (break terminate — discard),
+context profile 3.2↔4.1, mutable↔immutable storage, optContents, prefetch
+removal, DOEXIT CFG, JSCALE<1 (changes the image).
+
+Untested candidates, ranked:
+
+1. **Drawable/window-backed rendering instead of headless CGL+FBO.** The app
+   renders into an NSOpenGLContext with a real surface; the harness is pure
+   offscreen FBO. Test: build a minimal NSWindow+NSOpenGLView variant of the
+   harness (hidden window is fine) or CGL with `kCGLPFAWindow` + surface
+   attachment; rerun the standard interleaved pairs.
+2. **Blending state**: the app composites with `GL_BLEND (ONE,
+   ONE_MINUS_SRC_ALPHA)` enabled during the volume pass (read-modify-write
+   keeps the RT in tile memory); the harness writes opaque. One-line knob:
+   enable blend around the timed draw.
+3. **Combined structural knobs**: §11 tested SPLIT_TF (22.3→18.2) and WHILE
+   (19.1) separately; the COMBINATION was never run. Try `SPLIT_TF=1 WHILE=1`
+   together, then + BLEND.
+4. **Uniform plumbing**: VTK may use UBOs/incremental glUniform patterns vs
+   the harness's per-draw glUniform* — low prior but free to A/B once the FS
+   is instrumented.
+5. **Occupancy shaping**: the app FS is much larger (lower occupancy, more
+   independent loads in flight per thread — consistent with NOTF making app-GL
+   WORSE and split-TF helping harness). If 1–4 fail, try padding the harness
+   FS with dead-but-unremovable independent work (uniform-fed ALU chains +
+   dummy bound-texture reads outside the hot path) to emulate app register
+   pressure, and see if Δ falls toward +11.
+6. **Instruments/GPU counters on both contexts** at AZ 315: DRAM read
+   amplification would confirm/refute the line-coalescing model directly.
+
+Protocol reminders: interleaved order-alternated j0/j1 pairs, mean samples
+must stay ~86–88 (discard otherwise), same-session GL references, battery
+state affects absolute ms only. Raw logs this session: /tmp/appv31, /tmp/jsmat,
+/tmp/matrix, /tmp/azsweep, /tmp/rg8t, /tmp/np, /tmp/near, /tmp/pzsweep.
+
+TEMP debug edits still in the tree when this section was written (flagged
+TEMP in comments; revert before landing anything production-facing):
+METAL_ITER return encodes fzDebug/parity into G/B channels; probe early-return
+in fragment_volume_main gated on _padCropFlags[2] (reuses NOPREFETCH env);
+`[march] fc_doExit/fc_volRg8` and `[RG8]` stderr lines (env-gated).
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
 - `J0_GAP_DUMP.txt` — j0 investigation dump (interleaved rounds, fixed-steps, timer audit).
-- `jitter_gap_repro/` — harness + `RESULTS.md` (build/run/knobs, verdicts).
+- `jitter_gap_repro/` — harness + `RESULTS.md` (build/run/knobs, verdicts; now also GL41/GLSTORAGE knobs).
 - `jitter_gap_repro/RESULTS.md` — full experiment record.
 - `../SLAB_BENCHMARKS.md` — app bench recipe §1, pathological cell §7.2.
 - `../jitter_lag_repro/` — sharp-field (IGN) vs tile-field A/B harness.
+- `../divergent_tail/README.md` — V31/V24/V32 root-cause record (source of DOEXIT/RG8 ports).
+- Session 2026-08-21 logs: `/tmp/appv31` (DOEXIT j0 A/B), `/tmp/jsmat` (JSCALE dose matrix),
+  `/tmp/np`, `/tmp/near`, `/tmp/pzsweep`, `/tmp/azsweep` (orientation/azimuth sweeps),
+  `/tmp/matrix` (RG8 regression matrix + GL knob tests), `/tmp/rg8t` (final oblique matrix),
+  `/tmp/vis_*`, `/tmp/vis2k_*` (visual exports), `/tmp/vis2k_diff_heat.png`.
 - App: `Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.mm`,
   `Rendering/Metal/Shaders/MetalShaders.metal`,
   `Rendering/VolumeOpenGL2/vtkOpenGLGPUVolumeRayCastMapper.cxx`.

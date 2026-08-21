@@ -160,3 +160,23 @@ The divergent_tail codegen deficit does not transfer to this march: the
 interleaved TF-LUT taps change the instruction mix, and this repro's Metal
 was already well ahead of GL (0.73-0.84). Knob kept for future A/B;
 default output is unchanged.
+
+## GL context knobs: profile + storage class — refuted (2026-08-21)
+
+New env knobs on the GL side (`jitter_gap_repro.mm`): `GL41=1` requests the
+4.1 core pixel format instead of 3.2 core; `GLSTORAGE=1` uploads the volume via
+immutable `glTexStorage3D`+`glTexSubImage3D` instead of mutable
+`glTexImage3D`. Both are hypotheses for why harness-GL pays +22–26 ms of
+jitter tax while app-GL pays +10–12 ms on identical rays (HARNESS_VS_APP_GAP
+§12). Single runs, 2048/SD4:
+
+| config | GL j0 | GL j1 | GL Δ |
+|---|---|---|---|
+| baseline (3.2-core, mutable) | 47.63 | 71.22 | +23.60 |
+| `GL41=1` | 43.42 | 70.23 | +26.82 |
+| `GLSTORAGE=1` | 45.70 | 71.08 | +25.38 |
+| both | 60.96 | 98.86 | +37.90 |
+
+Both refuted (Metal inert throughout, Δ +21.6–24.5 ✓). Remaining candidates:
+drawable/window-backed surface vs headless FBO, blending state, uniform
+plumbing, occupancy shaping — see HARNESS_VS_APP_GAP §22 HANDOFF.

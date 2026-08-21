@@ -347,6 +347,18 @@ static int VolumeMarchVariant()
   return variant;
 }
 
+// V31 back-edge exit experiment (VTK_METAL_TEST_DOEXIT=1): reshapes the
+// baseline divergent march into a do-while with all exit conditions folded
+// into the back-edge (divergent_tail_repro V31 root-cause fix: MSL codegen for
+// the mid-body-exit CFG loses to GLSL->Air on data-dependent trip counts).
+// Encoded as its own feature bit so it gets a specialized pipeline
+// independent of fc_marchVariant. Reads the env var once per process.
+static bool VolumeMarchDoExit()
+{
+  static const bool doExit = getenv("VTK_METAL_TEST_DOEXIT") != nullptr;
+  return doExit;
+}
+
 // Volume texture upload layout (lag_repro root cause, 2026-08-18): the GPU's
 // lossless optimized swizzle (MTLTextureDescriptor.allowGPUOptimizedContents,
 // default YES) taxes incompressible per-texel-varying payloads (DICOM/CT-like
@@ -363,6 +375,25 @@ static bool VolumeGPUOptimizedContents()
     return false; // NO: uncompressed layout (the root-cause fix)
   }();
   return opt;
+}
+
+// RG8 pair-packed slice representation (VTK_METAL_TEST_RG8=1,
+// divergent_tail_repro V24/V32): store R=slice 2z / G=slice 2z+1 in each
+// texel of a halved-depth RG8 volume so a trilinear z-blend needs ONE
+// XY-bilinear tap when floor(z) is even and two when odd (~1.25 average vs
+// the 3D trilinear's two z-slice accesses). Image-exact reconstruction of
+// the hardware trilinear result; targets the phase-scatter sampler tax that
+// scales with z-slice-pair traffic. Single-component 8-bit direct-upload
+// volumes only (no conversion pipeline, no shading/gradient paths — those
+// read the volume raw and would need their own port).
+static bool VolumeRg8PairActive()
+{
+  static const bool rg8 = [] {
+    if (const char* v = getenv("VTK_METAL_TEST_RG8"))
+      return std::atoi(v) != 0;
+    return false;
+  }();
+  return rg8;
 }
 
 // Composite slab count from VTK_METAL_TEST_NUM_SLABS (default 8). N > 1 splits
@@ -2219,10 +2250,47 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
     }
   }
 
+  // RG8 pair-pack repack (see VolumeRg8PairActive): interleave adjacent
+  // slices into RG texel pairs over a halved-depth texture.
+  bool rg8Pair = false;
+  int upDims[3] = { dims[0], dims[1], dims[2] };
+  MTLPixelFormat upFormat = fmtInfo.Format;
+  NSUInteger upBytesPerRow = bytesPerRow;
+  NSUInteger upBytesPerImage = bytesPerImage;
+  std::vector<uint8_t> rg8Storage;
+  if (!gpuConversionUsed && VolumeRg8PairActive() && !fmtInfo.NeedsConversion &&
+      dataType == VTK_UNSIGNED_CHAR && numComponents == 1)
+  {
+    rg8Pair = true;
+    upDims[2] = (dims[2] + 1) / 2;
+    upFormat = MTLPixelFormatRG8Unorm;
+    upBytesPerRow = static_cast<NSUInteger>(dims[0]) * 2;
+    upBytesPerImage = upBytesPerRow * static_cast<NSUInteger>(dims[1]);
+    const size_t sliceTexels = static_cast<size_t>(dims[0]) * dims[1];
+    rg8Storage.resize(sliceTexels * static_cast<size_t>(upDims[2]) * 2);
+    const uint8_t* in = static_cast<const uint8_t*>(scalars->GetVoidPointer(0));
+    for (int p = 0; p < upDims[2]; ++p)
+    {
+      uint8_t* dst = rg8Storage.data() + sliceTexels * 2 * static_cast<size_t>(p);
+      const uint8_t* sa = in + sliceTexels * static_cast<size_t>(2 * p);
+      const uint8_t* sb = (2 * p + 1 < dims[2]) ? sa + sliceTexels : sa;
+      for (size_t i = 0; i < sliceTexels; ++i)
+      {
+        dst[2 * i + 0] = sa[i];
+        dst[2 * i + 1] = sb[i];
+      }
+    }
+  }
+
   if (!gpuConversionUsed)
   {
-    id<MTLBuffer> stagingBuf = [device newBufferWithLength:totalBytes
-                                                   options:MTLResourceStorageModeShared];
+    if (VolumeRg8PairActive())
+      fprintf(stderr, "[RG8] direct path: rg8Pair=%d dims %dx%dx%d -> upDims %dx%dx%d fmt=%d staging=%zu\n",
+        rg8Pair, dims[0], dims[1], dims[2], upDims[0], upDims[1], upDims[2],
+        (int)upFormat, rg8Pair ? rg8Storage.size() : (size_t)totalBytes);
+    id<MTLBuffer> stagingBuf =
+      [device newBufferWithLength:(rg8Pair ? rg8Storage.size() : totalBytes)
+                          options:MTLResourceStorageModeShared];
     if (!stagingBuf)
     {
       vtkErrorMacro("Failed to create volume staging buffer");
@@ -2287,17 +2355,24 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
     }
     else
     {
-      std::memcpy(uploadPointer, scalars->GetVoidPointer(0), totalBytes);
+      if (rg8Pair)
+      {
+        std::memcpy(uploadPointer, rg8Storage.data(), rg8Storage.size());
+      }
+      else
+      {
+        std::memcpy(uploadPointer, scalars->GetVoidPointer(0), totalBytes);
+      }
     }
 
     id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->VolumeTexture;
     id<MTLTexture> tex = nil;
 
     if (oldTex &&
-        oldTex.width == static_cast<NSUInteger>(dims[0]) &&
-        oldTex.height == static_cast<NSUInteger>(dims[1]) &&
-        oldTex.depth == static_cast<NSUInteger>(dims[2]) &&
-        oldTex.pixelFormat == fmtInfo.Format)
+        oldTex.width == static_cast<NSUInteger>(upDims[0]) &&
+        oldTex.height == static_cast<NSUInteger>(upDims[1]) &&
+        oldTex.depth == static_cast<NSUInteger>(upDims[2]) &&
+        oldTex.pixelFormat == upFormat)
     {
       tex = oldTex;
     }
@@ -2307,10 +2382,10 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
 
       tex = NewTexture3D(
         device,
-        fmtInfo.Format,
-        static_cast<NSUInteger>(dims[0]),
-        static_cast<NSUInteger>(dims[1]),
-        static_cast<NSUInteger>(dims[2]),
+        upFormat,
+        static_cast<NSUInteger>(upDims[0]),
+        static_cast<NSUInteger>(upDims[1]),
+        static_cast<NSUInteger>(upDims[2]),
         MTLTextureUsageShaderRead,
         MTLStorageModePrivate,
         VolumeGPUOptimizedContents());
@@ -2327,9 +2402,9 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
     id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
     [blit copyFromBuffer:stagingBuf
             sourceOffset:0
-     sourceBytesPerRow:bytesPerRow
-   sourceBytesPerImage:bytesPerImage
-            sourceSize:MTLSizeMake(dims[0], dims[1], dims[2])
+     sourceBytesPerRow:(rg8Pair ? upBytesPerRow : bytesPerRow)
+   sourceBytesPerImage:(rg8Pair ? upBytesPerImage : bytesPerImage)
+            sourceSize:MTLSizeMake(upDims[0], upDims[1], upDims[2])
              toTexture:tex
       destinationSlice:0
       destinationLevel:0
@@ -3404,9 +3479,45 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           gpuConversionUsed = true;
         }
       }
-      if (!gpuConversionUsed)
-      {
-        id<MTLBuffer> stagingBuf = [device newBufferWithLength:totalBytes
+       // RG8 pair-pack repack (see VolumeRg8PairActive): interleave adjacent
+       // slices into RG texel pairs over a halved-depth texture.
+       bool rg8Pair = false;
+       int upDims[3] = { dims[0], dims[1], dims[2] };
+       MTLPixelFormat upFormat = fmtInfo.Format;
+       NSUInteger upBytesPerRow = bytesPerRow;
+       NSUInteger upBytesPerImage = bytesPerImage;
+       std::vector<uint8_t> rg8Storage;
+       if (!gpuConversionUsed && VolumeRg8PairActive() && !fmtInfo.NeedsConversion &&
+           dataType == VTK_UNSIGNED_CHAR && numComponents == 1)
+       {
+         rg8Pair = true;
+         upDims[2] = (dims[2] + 1) / 2;
+         upFormat = MTLPixelFormatRG8Unorm;
+         upBytesPerRow = static_cast<NSUInteger>(dims[0]) * 2;
+         upBytesPerImage = upBytesPerRow * static_cast<NSUInteger>(dims[1]);
+         const size_t sliceTexels = static_cast<size_t>(dims[0]) * dims[1];
+         rg8Storage.resize(sliceTexels * static_cast<size_t>(upDims[2]) * 2);
+         const uint8_t* in = static_cast<const uint8_t*>(scalars->GetVoidPointer(0));
+         for (int p = 0; p < upDims[2]; ++p)
+         {
+           uint8_t* dst = rg8Storage.data() + sliceTexels * 2 * static_cast<size_t>(p);
+           const uint8_t* sa = in + sliceTexels * static_cast<size_t>(2 * p);
+           const uint8_t* sb = (2 * p + 1 < dims[2]) ? sa + sliceTexels : sa;
+           for (size_t i = 0; i < sliceTexels; ++i)
+           {
+             dst[2 * i + 0] = sa[i];
+             dst[2 * i + 1] = sb[i];
+           }
+         }
+       }
+
+       if (!gpuConversionUsed)
+       {
+         if (VolumeRg8PairActive())
+           fprintf(stderr, "[RG8] UpdateVolumeTexture: rg8Pair=%d dims %dx%dx%d -> upDims %dx%dx%d staging=%zu\n",
+             rg8Pair, dims[0], dims[1], dims[2], upDims[0], upDims[1], upDims[2],
+             rg8Pair ? rg8Storage.size() : (size_t)totalBytes);
+         id<MTLBuffer> stagingBuf = [device newBufferWithLength:(rg8Pair ? rg8Storage.size() : totalBytes)
                                                        options:MTLResourceStorageModeShared];
         if (!stagingBuf)
         {
@@ -3469,17 +3580,24 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
         }
         else
         {
-          std::memcpy(uploadPointer, scalars->GetVoidPointer(0), totalBytes);
+          if (rg8Pair)
+          {
+            std::memcpy(uploadPointer, rg8Storage.data(), rg8Storage.size());
+          }
+          else
+          {
+            std::memcpy(uploadPointer, scalars->GetVoidPointer(0), totalBytes);
+          }
         }
 
       id<MTLTexture> oldTex = (__bridge id<MTLTexture>)this->VolumeTexture;
       id<MTLTexture> tex = nil;
 
       if (oldTex &&
-          oldTex.width == static_cast<NSUInteger>(dims[0]) &&
-          oldTex.height == static_cast<NSUInteger>(dims[1]) &&
-          oldTex.depth == static_cast<NSUInteger>(dims[2]) &&
-          oldTex.pixelFormat == fmtInfo.Format)
+          oldTex.width == static_cast<NSUInteger>(upDims[0]) &&
+          oldTex.height == static_cast<NSUInteger>(upDims[1]) &&
+          oldTex.depth == static_cast<NSUInteger>(upDims[2]) &&
+          oldTex.pixelFormat == upFormat)
       {
         tex = oldTex;
       }
@@ -3489,10 +3607,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
 
         tex = NewTexture3D(
           device,
-          fmtInfo.Format,
-          static_cast<NSUInteger>(dims[0]),
-          static_cast<NSUInteger>(dims[1]),
-          static_cast<NSUInteger>(dims[2]),
+          upFormat,
+          static_cast<NSUInteger>(upDims[0]),
+          static_cast<NSUInteger>(upDims[1]),
+          static_cast<NSUInteger>(upDims[2]),
           MTLTextureUsageShaderRead,
           MTLStorageModePrivate,
           VolumeGPUOptimizedContents());
@@ -3508,9 +3626,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
       [blit copyFromBuffer:stagingBuf
               sourceOffset:0
-       sourceBytesPerRow:bytesPerRow
-     sourceBytesPerImage:bytesPerImage
-              sourceSize:MTLSizeMake(dims[0], dims[1], dims[2])
+       sourceBytesPerRow:(rg8Pair ? upBytesPerRow : bytesPerRow)
+     sourceBytesPerImage:(rg8Pair ? upBytesPerImage : bytesPerImage)
+              sourceSize:MTLSizeMake(upDims[0], upDims[1], upDims[2])
                toTexture:tex
         destinationSlice:0
         destinationLevel:0
@@ -6294,6 +6412,17 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     int slabMode = (featureMask & VolumeFeature_Slab) ? 1 : 0;
     [constants setConstantValue:&slabMode type:MTLDataTypeInt withName:@"fc_slabMode"];
 
+    // V31 back-edge exit experiment (fc_doExit): decoded from the dedicated
+    // feature bit so the do-while reshaped march gets its own pipeline.
+    BOOL marchDoExit = (featureMask & VolumeFeature_MarchDoExit) ? YES : NO;
+    [constants setConstantValue:&marchDoExit type:MTLDataTypeBool
+                       withName:@"fc_doExit"];
+
+    // RG8 pair-packed slices experiment (fc_volRg8): pair-tap sampler.
+    BOOL volRg8 = (featureMask & VolumeFeature_VolRg8) ? YES : NO;
+    [constants setConstantValue:&volRg8 type:MTLDataTypeBool
+                       withName:@"fc_volRg8"];
+
     // Blend mode function constant: 0=composite, 1=MIP, 2=MinIP, 3=AverageIP,
     // 4=additive (vtkVolumeMapper::BlendMode). Encoded in the feature mask so
     // each blend mode gets its own specialized pipeline.
@@ -6318,6 +6447,8 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
         renderToTexture, slabMode,
         (marchVariant >= 6 && blendMode == 0 && !cropping && !mask && !blanking &&
          !rectilinear && !transfer2D && !independentComp && !dependentRGBA && !dependentLA));
+    fprintf(stderr, "[march] fc_doExit=%d fc_volRg8=%d\n", marchDoExit ? 1 : 0,
+      volRg8 ? 1 : 0);
 
     fragFunc = [library newFunctionWithName:fragName
                              constantValues:constants
@@ -6734,6 +6865,20 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
       (static_cast<uint32_t>(marchVariant) & 0xFu) << VolumeFeature_MarchVariantShift;
   }
 
+  // V31 back-edge exit experiment (VTK_METAL_TEST_DOEXIT): dedicated feature
+  // bit so the reshaped march gets its own specialized pipeline.
+  if (VolumeMarchDoExit())
+  {
+    featureMask |= VolumeFeature_MarchDoExit;
+  }
+
+  // RG8 pair-packed slice representation experiment (VTK_METAL_TEST_RG8):
+  // dedicated feature bit so the pair-tap sampler gets its own pipeline.
+  if (VolumeRg8PairActive())
+  {
+    featureMask |= VolumeFeature_VolRg8;
+  }
+
   // Composite slab tiling (VTK_METAL_TEST_NUM_SLABS): only on the blended
   // direct path (useDirectPipeline), and only for composite blending — the
   // (ONE, ONE_MINUS_SRC_ALPHA) accumulation of per-slab partial composites is
@@ -7053,6 +7198,26 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // outputs iteration count / 256 in the red channel instead of the normal
   // color, so a PNG/PPM readback gives the iter distribution.
   uniforms._padCropFlags[0] = getenv("METAL_ITER") ? 1.0f : 0.0f;
+
+  // JSCALE probe (_padCropFlags[1], VTK_METAL_TEST_JSCALE): scales the
+  // per-pixel jitter phase spread toward the coherent j0 lattice
+  // (1 + s*(noise-1)); always written so the shader sees a valid [0,1]
+  // scale (default 1.0 = native j1; 0 = coherent j0-equivalent phase).
+  uniforms._padCropFlags[1] = 1.0f;
+  if (const char* js = getenv("VTK_METAL_TEST_JSCALE"))
+  {
+    const float v = static_cast<float>(std::atof(js));
+    if (v >= 0.0f && v <= 1.0f) uniforms._padCropFlags[1] = v;
+  }
+
+  // NOPREFETCH probe (_padCropFlags[2], VTK_METAL_TEST_NOPREFETCH): drop the
+  // prefetch-ahead pipeline so the march issues one volume fetch per
+  // iteration like OpenGL's composed loop.
+  if (getenv("VTK_METAL_TEST_NOPREFETCH")) uniforms._padCropFlags[2] = 1.0f;
+
+  // TEMP probe z (_padCropFlags[3], VTK_METAL_TEST_PROBE_Z).
+  if (const char* pzv = getenv("VTK_METAL_TEST_PROBE_Z"))
+    uniforms._padCropFlags[3] = static_cast<float>(std::atof(pzv));
 
   vtkNew<vtkMatrix4x4> modelMatrix;
   vol->GetModelToWorldMatrix(modelMatrix);
@@ -7717,6 +7882,20 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   {
     featureMask |=
       (static_cast<uint32_t>(marchVariant) & 0xFu) << VolumeFeature_MarchVariantShift;
+  }
+
+  // V31 back-edge exit experiment (VTK_METAL_TEST_DOEXIT): dedicated feature
+  // bit so the reshaped march gets its own specialized pipeline.
+  if (VolumeMarchDoExit())
+  {
+    featureMask |= VolumeFeature_MarchDoExit;
+  }
+
+  // RG8 pair-packed slice representation experiment (VTK_METAL_TEST_RG8):
+  // dedicated feature bit so the pair-tap sampler gets its own pipeline.
+  if (VolumeRg8PairActive())
+  {
+    featureMask |= VolumeFeature_VolRg8;
   }
 
   // Hardware-selection support (vtkHardwareSelector): during a selection render

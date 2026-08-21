@@ -145,6 +145,16 @@ enum VolumeShaderFeatureFlags : uint32_t
   // single-pass composite up to fp rounding (PERFORMANCE_INVESTIGATION /
   // minimal_gap phase-2). Only applies to the blended direct-render paths.
   VolumeFeature_Slab = 1u << 28,
+  // V31 back-edge exit experiment (VTK_METAL_TEST_DOEXIT=1): baseline march
+  // reshaped into a do-while with all exits folded into the back-edge
+  // (divergent_tail_repro V31). Baked via fc_doExit so the reshaped loop gets
+  // its own specialized pipeline; clear by default.
+  VolumeFeature_MarchDoExit = 1u << 29,
+  // RG8 pair-packed slice representation experiment (VTK_METAL_TEST_RG8=1):
+  // R=slice 2z / G=slice 2z+1 over a halved-depth RG8 texture; the march's
+  // trilinear z-blend is reconstructed in-shader from ~1.25 XY-bilinear taps
+  // (divergent_tail V24/V32). Baked via fc_volRg8; clear by default.
+  VolumeFeature_VolRg8 = 1u << 30,
 };
 
 VTK_ABI_NAMESPACE_BEGIN
