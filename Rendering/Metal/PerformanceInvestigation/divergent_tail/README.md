@@ -49,10 +49,10 @@ clang++ -std=c++17 -fobjc-arc -O2 -framework Metal -framework OpenGL \
                  [optContents=0] [kMax=288] [harness=0]
 ```
 
-M/GL > 1 means Metal loses. At 2048, divergent is ~1.10-1.15 (Metal loses)
-and fixed is ~0.75-0.98 (Metal wins). At 1024 the gap shrinks but does not
-fully tie (divergent ~1.09 vs the app's 0.97); the synthetic bimodal
-distribution is more extreme than the real DICOM data.
+M/GL > 1 means Metal loses. At 2048, divergent is ~1.07-1.15 (Metal loses)
+and fixed is ~1.04-1.07 (near-tie; see "Why fixed(87) flipped" below — the
+early 0.88 reading was a GL-side measurement artifact). At 1024 divergent
+is ~1.14-1.16.
 
 The binary runs a 6-variant sweep on the Metal side (each is a separately
 compiled PSO, all producing bit-identical pixel coverage and mean steps —
@@ -194,8 +194,48 @@ regression).
 Caveat: the pass union requires discarded pixels to leave the target
 untouched — writing `{0,0,0,0}` instead of `discard_fragment()` clobbers
 other passes' pixels (caught by the parity readback: cov dropped to ~1/4).
-The binned variant is a harness-level result; transferring it to the app
-is the next step.
+
+Why binning cannot pay at fine SD: caps never bind below a lane's own
+done (parity requires bit-identical output), so the only mechanism is
+warp homogeneity — and a smooth broad distribution leaves every bucket
+internally divergent (bucket 1 alone spans 0-321) with >50% of pixels in
+the uncapped top bucket. The SD0.5 residual (V0 ~1.13) is a different
+regime: long dependent sample chains (mean ~229, up to ~1132 geometric
+steps) make the march latency-bound, and the tool that works there is
+batching, not binning — V13 batch-8 reaches 1.05 at SD0.5 (64.81 vs
+70.91 ms) while every unbatched shape stays ~1.13. The app shows the
+same split: its batched mv9 WINS fine SD (0.56x at 2048/SD0.5) and loses
+coarse SD (1.31x j1 / 1.11x j0), exactly the complement of binning.
+Stacking both (batched march inside binned passes) is the obvious
+follow-up.
+
+## Why fixed(87) flipped from 0.88 (Metal wins) to ~1.05
+
+The first published repro table showed fixed(87) at 6.92 GL / 6.11 Metal
+(0.88). Two separate effects, neither a timing-methodology change:
+
+1. **Honest-A/B correction (code change, before the sweep commit).** Early
+   builds selected the fetch mode with a runtime `uUseLod` uniform +
+   ternary inside ONE GL program. That dynamic branch cost GL ~2.3 ms
+   divergent / ~1.3 ms fixed while Metal (separately compiled PSOs) paid
+   nothing. Baking two GL programs (implicit `texture()` for V0,
+   `textureLod(...,0.0)` otherwise) restored GL fixed to ~5.9 ms — most
+   of the original "Metal wins fixed" margin was this GL handicap.
+2. **Session drift (no code change).** The variant-sweep session read GL
+   fixed 6.96 / Metal 5.77 (0.83) with byte-identical GL code to today's
+   5.47-5.60 / 5.82-5.96 (1.04-1.07). Rebuilding the old commit's binary
+   and running both back-to-back in one session ties them (old 5.60/5.85
+   = 1.04, new 5.59/5.96 = 1.07), so the remaining shift is machine/
+   driver state (clocks, shader cache), not code. Treat sub-10%
+   fixed-mode ratios as session-sensitive; A/B in the same session.
+
+**Timing is symmetric**: both backends are GPU-timed around the identical
+single fullscreen draw (Metal `GPUStartTime/GPUEndTime` per command
+buffer, GL `GL_TIME_ELAPSED` per frame), neither timed region contains a
+clear or load, parity readback is outside timing for both, and the
+wall-clock+Clear harness (`harness=1`) produces the same ratios. The
+remaining asymmetry is the thing under test: legacy GLSL driver vs Metal
+on the same GPU.
 
 ## Key controls
 
