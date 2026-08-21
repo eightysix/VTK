@@ -1,2 +1,5 @@
-probe7b
-*.air
+*.o
+issue_tax_repro
+jitter_gap_repro
+appgl_parity
+divergent_tail
