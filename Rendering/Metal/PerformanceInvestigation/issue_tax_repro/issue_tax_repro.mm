@@ -15,6 +15,13 @@
 // Fair timing: wall clock with per-frame drain on BOTH sides (glFinish /
 // waitUntilCompleted). GPU-timestamp modes are biased here — GL's
 // GL_TIME_ELAPSED ends before its tile-store drains.
+//
+// Follow-up bisection (see README): pairs l1_ce / l1_near / l1_ce_near /
+// l1_read / l1_x2 / l1_rep / l1_pix ablate sampler specialization, filter
+// mode, address mode, coordinate space and the raw-load path. Result: the
+// tax is the sampler front-end's fixed per-tap rate (both APIs agree within
+// 3%); Metal's read() escape hatch runs the same warp-uniform L1-resident
+// traffic ~4x faster but cannot help a real march.
 
 #include <Metal/Metal.h>
 #include <OpenGL/gl3.h>
@@ -30,7 +37,8 @@
 static int kRT = 1024;
 static int kFrames = 15;
 static float kStep = 0.0005f; // SD 0.5 — the pathological regime
-static int kWarmup = 10;
+static int kWarmup = 30; // 10 was insufficient: GL's driver keeps re-JITting
+                         // fresh programs into the first timed blocks (see README)
 static int useKnobs = 1;             // argv[4]: 1 = 3.2+fastMath (main-harness options)
 static const int kVolX = 512, kVolY = 512, kVolZ = 1794;
 
@@ -68,7 +76,9 @@ static const char* kGLFragSrc = R"(#version 410 core
 in vec2 vUV;
 out vec4 outColor;
 uniform sampler3D volumeTex;
+uniform sampler2DArray volumeArr;
 uniform float uStep;
+uniform vec3 uDims;
 void main() {
   vec2 ndc = vUV * 2.0 - 1.0;
   vec3 eye = vec3(0.5, 0.5, -0.35);
@@ -87,13 +97,69 @@ void main() {
   float acc = 0.0;
   float alpha = 0.0;
   int done = 0;
-#ifdef L1FETCH
+#ifdef L1ARR
+  // Frozen coordinate on the slice-array twin (single bilinear tap).
+  for (int i = 0; i < steps; ++i) {
+    acc += textureLod(volumeArr, vec3(base.xy, float(int(uDims.z) / 2)), 0.0).r;
+    done = i + 1;
+  }
+#elif defined(MARCH2TA)
+  // V23-shape: two-tap slice-array march, do-while back-edge exit —
+  // identical math to the Metal variant.
+  int i = 0;
+  do {
+    vec3 c = base + float(i) * d;
+    float g = clamp(c.z, 0.0, 1.0) * uDims.z - 0.5;
+    float flr = floor(g);
+    float bl = max(flr, 0.0);
+    int l0 = int(min(bl, uDims.z - 1.0));
+    int l1 = min(l0 + 1, int(uDims.z) - 1);
+    float fz = clamp(g - bl, 0.0, 1.0);
+    float s0 = textureLod(volumeArr, vec3(c.xy, float(l0)), 0.0).r;
+    float s1 = textureLod(volumeArr, vec3(c.xy, float(l1)), 0.0).r;
+    float s = mix(s0, s1, fz);
+    float o = s * 1.0;
+    float w = 1.0 - alpha;
+    acc += w * o;
+    alpha += w * o;
+    ++i;
+    done = i;
+  } while (i < steps && alpha <= 0.9);
+#elif defined(MARCHT)
+  // transmittance form — identical arithmetic to the Metal variant 13/14
+  int i = 0;
+  float T = 1.0;
+  do {
+    float s = textureLod(volumeTex, base + float(i) * d, 0.0).r;
+    float o = s * 1.0;
+    acc += T * o;
+    T -= T * o;
+    ++i;
+    done = i;
+  } while (i < steps && T > 0.1);
+#elif defined(L1FETCH)
   // Frozen coordinate: every tap hits the same L1-resident texel — pure
   // sampler issue rate, zero DRAM streaming.
   for (int i = 0; i < steps; ++i) {
     acc += textureLod(volumeTex, base, 0.0).r;
     done = i + 1;
   }
+#elif defined(L1READ)
+  // Frozen coordinate via texelFetch — load path with no sampler unit.
+  for (int i = 0; i < steps; ++i) {
+    acc += texelFetch(volumeTex, ivec3(base * uDims), 0).r;
+    done = i + 1;
+  }
+#elif defined(L1X2)
+  // Two independent taps per iteration (quarter-texel offset).
+  float acc0 = 0.0, acc1 = 0.0;
+  float ox = 0.25 / uDims.x;
+  for (int i = 0; i < steps; ++i) {
+    acc0 += textureLod(volumeTex, base, 0.0).r;
+    acc1 += textureLod(volumeTex, base + vec3(ox, 0.0, 0.0), 0.0).r;
+    done = i + 1;
+  }
+  acc = acc0 + acc1;
 #else
   // The shipped fix: back-edge exit (do-while). This is the shape that
   // reaches GL parity everywhere else; the residual lives HERE.
@@ -115,16 +181,25 @@ void main() {
 struct GLState
 {
   CGLContextObj ctx = nullptr;
-  GLuint fbo = 0, colorTex = 0, vao = 0, vbo = 0, volTex = 0;
-  GLuint progMarch = 0, progL1 = 0;
+  GLuint fbo = 0, colorTex = 0, vao = 0, vbo = 0, volTex = 0, volArrTex = 0;
+  GLuint progMarch = 0, progL1 = 0, progL1Read = 0, progL1X2 = 0;
+  GLuint progL1Arr = 0, progM2TA = 0, progMARCHT = 0;
 };
 
-static bool compileGL(GLState& s, GLuint* prog, bool l1fetch)
+// variant ids shared with the pair table in main():
+// 0 march31, 1 l1fetch, 2 l1_ce (GL twin == 1), 3 l1_near (twin == 1, NEAREST
+// state), 4 l1_ce_near (twin == 3), 5 l1read (texelFetch), 6 l1x2.
+static bool compileGL(GLState& s, GLuint* prog, int variant)
 {
   const char* versionEnd = strstr(kGLFragSrc, "\n");
   std::string src;
   src.append(kGLFragSrc, versionEnd - kGLFragSrc + 1);
-  src += l1fetch ? "#define L1FETCH 1\n" : "";
+  if (variant == 1 || variant == 2 || variant == 3 || variant == 4) src += "#define L1FETCH 1\n";
+  if (variant == 5) src += "#define L1READ 1\n";
+  if (variant == 6) src += "#define L1X2 1\n";
+  if (variant == 11) src += "#define L1ARR 1\n";
+  if (variant == 12) src += "#define MARCH2TA 1\n";
+  if (variant == 13 || variant == 14) src += "#define MARCHT 1\n";
   src += versionEnd + 1;
   GLuint vs = glCreateShader(GL_VERTEX_SHADER);
   glShaderSource(vs, 1, &kGLVertSrc, nullptr);
@@ -172,7 +247,10 @@ static bool setupGL(GLState& s, const std::vector<uint8_t>& vol)
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s.colorTex, 0);
-  if (!compileGL(s, &s.progMarch, false) || !compileGL(s, &s.progL1, true)) return false;
+  if (!compileGL(s, &s.progMarch, 0) || !compileGL(s, &s.progL1, 1) ||
+      !compileGL(s, &s.progL1Read, 5) || !compileGL(s, &s.progL1X2, 6) ||
+      !compileGL(s, &s.progL1Arr, 11) || !compileGL(s, &s.progM2TA, 12) ||
+      !compileGL(s, &s.progMARCHT, 13)) return false;
   glGenVertexArrays(1, &s.vao);
   glBindVertexArray(s.vao);
   glGenBuffers(1, &s.vbo);
@@ -190,17 +268,60 @@ static bool setupGL(GLState& s, const std::vector<uint8_t>& vol)
   glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
   glTexImage3D(GL_TEXTURE_3D, 0, GL_R8, kVolX, kVolY, kVolZ, 0, GL_RED,
     GL_UNSIGNED_BYTE, vol.data());
+  glGenTextures(1, &s.volArrTex);
+  glBindTexture(GL_TEXTURE_2D_ARRAY, s.volArrTex);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_R8, kVolX, kVolY, kVolZ, 0, GL_RED,
+    GL_UNSIGNED_BYTE, vol.data());
   return true;
 }
 
-static double timeGL(GLState& s, bool l1fetch)
+static GLuint glProgFor(GLState& s, int gv)
 {
+  switch (gv)
+  {
+    case 0: return s.progMarch;
+    case 5: return s.progL1Read;
+    case 6: return s.progL1X2;
+    case 11: return s.progL1Arr;
+    case 12: return s.progM2TA;
+    case 13:
+    case 14: return s.progMARCHT;
+    default: return s.progL1; // 1/2/3/4/9
+  }
+}
+
+static double timeGL(GLState& s, int variant, bool nearestFilter)
+{
+  GLuint prog = glProgFor(s, variant);
   glBindFramebuffer(GL_FRAMEBUFFER, s.fbo);
   glViewport(0, 0, kRT, kRT);
-  glUseProgram(l1fetch ? s.progL1 : s.progMarch);
+  glUseProgram(prog);
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_3D, s.volTex);
-  glUniform1f(glGetUniformLocation(l1fetch ? s.progL1 : s.progMarch, "uStep"), kStep);
+  if (variant == 11 || variant == 12)
+  {
+    glBindTexture(GL_TEXTURE_2D_ARRAY, s.volArrTex);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER,
+      nearestFilter ? GL_NEAREST : GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER,
+      nearestFilter ? GL_NEAREST : GL_LINEAR);
+    GLint uArr = glGetUniformLocation(prog, "volumeArr");
+    if (uArr >= 0) glUniform1i(uArr, 0);
+  }
+  else
+  {
+    glBindTexture(GL_TEXTURE_3D, s.volTex);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER,
+      nearestFilter ? GL_NEAREST : GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER,
+      nearestFilter ? GL_NEAREST : GL_LINEAR);
+  }
+  glUniform1f(glGetUniformLocation(prog, "uStep"), kStep);
+  GLint uDims = glGetUniformLocation(prog, "uDims");
+  if (uDims >= 0) glUniform3f(uDims, (float)kVolX, (float)kVolY, (float)kVolZ);
   glBindVertexArray(s.vao);
   for (int i = 0; i < kWarmup; ++i) { glDrawArrays(GL_TRIANGLES, 0, 3); }
   glFinish();
@@ -232,17 +353,22 @@ struct MetalState
 {
   id<MTLDevice> dev = nil;
   id<MTLCommandQueue> q = nil;
-  id<MTLTexture> volTex = nil, colorTex = nil;
+  id<MTLTexture> volTex = nil, colorTex = nil, arrTex = nil;
   id<MTLBuffer> vbuf = nil;
-  id<MTLSamplerState> smp = nil;
-  id<MTLRenderPipelineState> psMarch = nil, psL1 = nil;
+  id<MTLSamplerState> smp = nil, smpNear = nil;
+  id<MTLRenderPipelineState> ps[18] = { nil };
 };
 
 static NSString* kMetalSrc = @R"(
 #include <metal_stdlib>
 using namespace metal;
 struct FragIn { float4 pos [[position]]; float2 uv; };
-struct Params { float step; };
+struct Params { float step; float4 dims; };
+constexpr sampler ce_lin(filter::linear, address::clamp_to_edge);
+constexpr sampler ce_near(filter::nearest, address::clamp_to_edge);
+constexpr sampler ce_rep(filter::linear, address::repeat);
+constexpr sampler ce_pix(filter::linear, address::clamp_to_edge, coord::pixel);
+constexpr sampler ce_nolod(filter::linear, address::clamp_to_edge, mip_filter::none);
 vertex FragIn vsfull(const device float2* pos [[buffer(0)]], uint vid [[vertex_id]]) {
   FragIn o;
   float2 p = pos[vid];
@@ -251,7 +377,8 @@ vertex FragIn vsfull(const device float2* pos [[buffer(0)]], uint vid [[vertex_i
   return o;
 }
 fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
-                      sampler smp [[sampler(0)]],
+                      texture2d_array<float, access::sample> arr [[texture(1)]],
+                      sampler rsmp [[sampler(0)]],
                       constant Params& p [[buffer(0)]],
                       FragIn in [[stage_in]]) {
   float2 ndc = in.uv * 2.0 - 1.0;
@@ -271,15 +398,11 @@ fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
   float acc = 0.0;
   float alpha = 0.0;
   int done = 0;
-#if L1FETCH
-  for (int i = 0; i < steps; ++i) {
-    acc += vol.sample(smp, base, level(0.0)).r;
-    done = i + 1;
-  }
-#else
+#if MARCH_VARIANT == 0
+  // shipped do-while march, RUNTIME sampler
   int i = 0;
   do {
-    float s = vol.sample(smp, base + float(i) * d).r;
+    float s = vol.sample(rsmp, base + float(i) * d).r;
     float o = s * 1.0;
     float w = 1.0 - alpha;
     acc += w * o;
@@ -287,6 +410,169 @@ fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
     ++i;
     done = i;
   } while (i < steps && alpha <= 0.9);
+#elif MARCH_VARIANT == 1 || MARCH_VARIANT == 3
+  // frozen coordinate, runtime sampler (lin vs near chosen at bind time)
+  for (int i = 0; i < steps; ++i) {
+    acc += vol.sample(rsmp, base, level(0)).r;
+    done = i + 1;
+  }
+#elif MARCH_VARIANT == 2
+  // frozen coordinate, CONSTEXPR linear sampler — the shipped sVolume shape
+  for (int i = 0; i < steps; ++i) {
+    acc += vol.sample(ce_lin, base, level(0)).r;
+    done = i + 1;
+  }
+#elif MARCH_VARIANT == 4
+  // frozen coordinate, CONSTEXPR nearest sampler
+  for (int i = 0; i < steps; ++i) {
+    acc += vol.sample(ce_near, base, level(0)).r;
+    done = i + 1;
+  }
+#elif MARCH_VARIANT == 5
+  // frozen single texel via read() — no sampler unit at all
+  uint3 tc = uint3(base * p.dims.xyz);
+  for (int i = 0; i < steps; ++i) {
+    acc += vol.read(tc).r;
+    done = i + 1;
+  }
+#elif MARCH_VARIANT == 6
+  // two independent taps per iteration (quarter-texel offset), runtime sampler:
+  // marginal per-tap issue cost under ILP
+  float acc0 = 0.0, acc1 = 0.0;
+  float ox = 0.25 / p.dims.x;
+  for (int i = 0; i < steps; ++i) {
+    acc0 += vol.sample(rsmp, base, level(0)).r;
+    acc1 += vol.sample(rsmp, base + float3(ox, 0.0, 0.0), level(0)).r;
+    done = i + 1;
+  }
+  acc = acc0 + acc1;
+#elif MARCH_VARIANT == 7
+  // frozen coordinate, CONSTEXPR linear, REPEAT addressing: probes whether
+  // clamp-to-edge handling inside the sampler front-end is the issue cost
+  for (int i = 0; i < steps; ++i) {
+    acc += vol.sample(ce_rep, base, level(0)).r;
+    done = i + 1;
+  }
+#elif MARCH_VARIANT == 8
+  // frozen coordinate, CONSTEXPR linear, PIXEL coordinates: moves the
+  // normalized->texel transform out of the sampler into shader ALU
+  float3 pc = base * p.dims.xyz;
+  for (int i = 0; i < steps; ++i) {
+    acc += vol.sample(ce_pix, pc, level(0)).r;
+    done = i + 1;
+  }
+#elif MARCH_VARIANT == 9
+  // frozen coordinate, CONSTEXPR sampler with mip_filter::none and NO level
+  // operand — leanest possible tap spelling
+  for (int i = 0; i < steps; ++i) {
+    acc += vol.sample(ce_nolod, base).r;
+    done = i + 1;
+  }
+#elif MARCH_VARIANT == 10
+  // shipped do-while march through the no-level-op spelling
+  int i = 0;
+  do {
+    float s = vol.sample(ce_nolod, base + float(i) * d).r;
+    float o = s * 1.0;
+    float w = 1.0 - alpha;
+    acc += w * o;
+    alpha += w * o;
+    ++i;
+    done = i;
+  } while (i < steps && alpha <= 0.9);
+#elif MARCH_VARIANT == 11
+  // frozen coordinate on the SLICE-ARRAY twin (single bilinear tap):
+  // measures Metal's 2D-array sampler rate against its own 3D rate
+  uint layerC = uint(p.dims.z) / 2u;
+  for (int i = 0; i < steps; ++i) {
+    acc += arr.sample(rsmp, base.xy, layerC, level(0)).r;
+    done = i + 1;
+  }
+#elif MARCH_VARIANT == 12
+  // V23-shape: two-tap slice-array march (bilinear x2 layers, z lerp in ALU),
+  // do-while back-edge exit
+  int i = 0;
+  do {
+    float3 c = base + float(i) * d;
+    float g = clamp(c.z, 0.0, 1.0) * p.dims.z - 0.5;
+    float flr = floor(g);
+    float bl = max(flr, 0.0);
+    int l0 = int(min(bl, p.dims.z - 1.0));
+    int l1 = min(l0 + 1, int(p.dims.z) - 1);
+    float fz = clamp(g - bl, 0.0, 1.0);
+    float s0 = arr.sample(rsmp, c.xy, l0, level(0)).r;
+    float s1 = arr.sample(rsmp, c.xy, l1, level(0)).r;
+    float s = mix(s0, s1, fz);
+    float o = s * 1.0;
+    float w = 1.0 - alpha;
+    acc += w * o;
+    alpha += w * o;
+    ++i;
+    done = i;
+  } while (i < steps && alpha <= 0.9);
+#elif MARCH_VARIANT == 13
+  // transmittance form of the shipped do-while march: T = 1 - alpha,
+  // acc += T*o; T -= T*o — IDENTICAL arithmetic sequence, exit on T > 0.1.
+  // Gives the backend a single-register latch candidate.
+  int i = 0;
+  float T = 1.0;
+  do {
+    float s = vol.sample(rsmp, base + float(i) * d).r;
+    float o = s * 1.0;
+    acc += T * o;
+    T -= T * o;
+    ++i;
+    done = i;
+  } while (i < steps && T > 0.1);
+#elif MARCH_VARIANT == 14
+  // transmittance + no-level-op constexpr sampler + condition reordered
+  // (data-dependent term first): the leanest exit spelling available
+  int i = 0;
+  float T = 1.0;
+  do {
+    float s = vol.sample(ce_nolod, base + float(i) * d).r;
+    float o = s * 1.0;
+    acc += T * o;
+    T -= T * o;
+    ++i;
+    done = i;
+  } while (T > 0.1 && i < steps);
+#elif MARCH_VARIANT == 15
+  // ISOLATION: T-form + RUNTIME sampler + swapped order
+  int i = 0;
+  float T = 1.0;
+  do {
+    float s = vol.sample(rsmp, base + float(i) * d).r;
+    float o = s * 1.0;
+    acc += T * o;
+    T -= T * o;
+    ++i;
+    done = i;
+  } while (T > 0.1 && i < steps);
+#elif MARCH_VARIANT == 16
+  // ISOLATION: T-form + nolod sampler + ORIGINAL order
+  int i = 0;
+  float T = 1.0;
+  do {
+    float s = vol.sample(ce_nolod, base + float(i) * d).r;
+    float o = s * 1.0;
+    acc += T * o;
+    T -= T * o;
+    ++i;
+    done = i;
+  } while (i < steps && T > 0.1);
+#elif MARCH_VARIANT == 17
+  // ISOLATION: ALPHA-form + nolod sampler + swapped order
+  int i = 0;
+  do {
+    float s = vol.sample(ce_nolod, base + float(i) * d).r;
+    float o = s * 1.0;
+    float w = 1.0 - alpha;
+    acc += w * o;
+    alpha += w * o;
+    ++i;
+    done = i;
+  } while (alpha <= 0.9 && i < steps);
 #endif
   return float4(acc / float(steps), float(done) / 255.0, 0.0, 1.0);
 }
@@ -297,16 +583,21 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol)
   s.dev = MTLCreateSystemDefaultDevice();
   s.q = [s.dev newCommandQueue];
   NSError* err = nil;
-  for (int v = 0; v < 2; ++v)
+  for (int v = 0; v < 18; ++v)
   {
     MTLCompileOptions* copts = [[MTLCompileOptions alloc] init];
-    copts.preprocessorMacros = @{ @"L1FETCH" : (v == 1 ? @"1" : @"0") };
+    copts.preprocessorMacros = @{ @"MARCH_VARIANT" : [NSString stringWithFormat:@"%d", v] };
     if (useKnobs) {
       copts.languageVersion = MTLLanguageVersion3_2;
       copts.mathMode = MTLMathModeFast;
     }
     id<MTLLibrary> lib = [s.dev newLibraryWithSource:kMetalSrc options:copts error:&err];
-    if (!lib) return false;
+    if (!lib)
+    {
+      std::fprintf(stderr, "MSL variant %d error: %s\n", v,
+        err.localizedDescription.UTF8String);
+      return false;
+    }
     id<MTLFunction> fs = [lib newFunctionWithName:@"march"];
     id<MTLFunction> vs = [lib newFunctionWithName:@"vsfull"];
     MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
@@ -315,7 +606,7 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol)
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
     id<MTLRenderPipelineState> p = [s.dev newRenderPipelineStateWithDescriptor:pd error:&err];
     if (!p) return false;
-    if (v == 0) s.psMarch = p; else s.psL1 = p;
+    s.ps[v] = p;
   }
   MTLTextureDescriptor* td = [[MTLTextureDescriptor alloc] init];
   td.textureType = MTLTextureType3D;
@@ -326,6 +617,15 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol)
   td.storageMode = MTLStorageModePrivate;
   td.allowGPUOptimizedContents = NO; // app constraint
   s.volTex = [s.dev newTextureWithDescriptor:td];
+  MTLTextureDescriptor* ad = [[MTLTextureDescriptor alloc] init];
+  ad.textureType = MTLTextureType2DArray;
+  ad.pixelFormat = MTLPixelFormatR8Unorm;
+  ad.width = kVolX; ad.height = kVolY; ad.arrayLength = kVolZ;
+  ad.mipmapLevelCount = 1;
+  ad.usage = MTLTextureUsageShaderRead;
+  ad.storageMode = MTLStorageModePrivate;
+  ad.allowGPUOptimizedContents = NO; // app constraint
+  s.arrTex = [s.dev newTextureWithDescriptor:ad];
   MTLTextureDescriptor* rt =
     [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
       width:kRT height:kRT mipmapped:NO];
@@ -341,6 +641,12 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol)
     sourceSize:MTLSizeMake(kVolX, kVolY, kVolZ)
     toTexture:s.volTex destinationSlice:0 destinationLevel:0
     destinationOrigin:MTLOriginMake(0, 0, 0)];
+  // slice-array twin: same bytes, one layer per z slice (depth maps to slices)
+  [blit copyFromBuffer:upload sourceOffset:0 sourceBytesPerRow:kVolX
+    sourceBytesPerImage:(NSUInteger)kVolX * kVolY
+    sourceSize:MTLSizeMake(kVolX, kVolY, kVolZ)
+    toTexture:s.arrTex destinationSlice:0 destinationLevel:0
+    destinationOrigin:MTLOriginMake(0, 0, 0)];
   [blit endEncoding];
   [cb commit];
   [cb waitUntilCompleted];
@@ -351,24 +657,37 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol)
   sd.magFilter = MTLSamplerMinMagFilterLinear;
   sd.sAddressMode = sd.tAddressMode = sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
   s.smp = [s.dev newSamplerStateWithDescriptor:sd];
+  sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
+  s.smpNear = [s.dev newSamplerStateWithDescriptor:sd];
   return true;
 }
 
-static double timeMetal(MetalState& s, bool l1fetch)
+struct alignas(16) MParams { float step; uint32_t pad[3]; float dims[4]; };
+static_assert(sizeof(MParams) == 32, "MSL constant-struct layout");
+
+// Metal variant -> sampler binding (constexpr variants ignore the bound sampler)
+static id<MTLSamplerState> mSmpFor(MetalState& s, int mv)
 {
-  struct { float step; } params = { kStep };
+  return (mv == 3) ? s.smpNear : s.smp;
+}
+
+static double timeMetal(MetalState& s, int variant)
+{
+  MParams params = { kStep, { 0, 0, 0 }, { (float)kVolX, (float)kVolY, (float)kVolZ, 0.0f } };
   MTLRenderPassDescriptor* rpd = [[MTLRenderPassDescriptor alloc] init];
   rpd.colorAttachments[0].texture = s.colorTex;
   rpd.colorAttachments[0].loadAction = MTLLoadActionDontCare;
   rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
-  id<MTLRenderPipelineState> ps = l1fetch ? s.psL1 : s.psMarch;
+  id<MTLRenderPipelineState> ps = s.ps[variant];
+  id<MTLSamplerState> msmp = mSmpFor(s, variant);
   auto run = [&]() {
     id<MTLCommandBuffer> cb = [s.q commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
     [enc setRenderPipelineState:ps];
     [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
     [enc setFragmentTexture:s.volTex atIndex:0];
-    [enc setFragmentSamplerState:s.smp atIndex:0];
+    [enc setFragmentTexture:s.arrTex atIndex:1];
+    [enc setFragmentSamplerState:msmp atIndex:0];
     [enc setFragmentBytes:&params length:sizeof(params) atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [enc endEncoding];
@@ -411,30 +730,59 @@ int main(int argc, char** argv)
   if (argc > 2) kFrames = std::atoi(argv[2]);
   if (argc > 3) kStep = std::atof(argv[3]);
   if (argc > 4) useKnobs = std::atoi(argv[4]); // 0 = default MSL compile options
-  const std::vector<uint8_t> vol = makeVolume();
+  std::vector<uint8_t> vol = makeVolume();
   GLState gl;
   if (!setupGL(gl, vol)) { std::fprintf(stderr, "GL setup failed\n"); return 1; }
   MetalState m;
   if (!setupMetal(m, vol)) { std::fprintf(stderr, "Metal setup failed\n"); return 1; }
+  vol.clear();
+  vol.shrink_to_fit();
   std::printf("rt=%d frames=%d step=%.5f knobs=%d\n", kRT, kFrames, kStep, useKnobs);
-  std::printf("%-22s %10s %11s %7s\n", "pair", "GL ms/f", "Metal ms/f", "M/GL");
+  std::printf("%-24s %10s %11s %7s\n", "pair", "GL ms/f", "Metal ms/f", "M/GL");
+  struct Pair { const char* name; int gv; bool glnear; int mv; };
+  static const Pair pairs[] = {
+    { "march31 (residual)",   0, false, 0 },
+    { "l1fetch (issue tax)",  1, false, 1 },
+    { "l1_ce (constexpr)",    1, false, 2 },
+    { "l1_near (nearest)",    1, true,  3 },
+    { "l1_ce_near",           1, true,  4 },
+    { "l1_read (no sampler)", 5, false, 5 },
+    { "l1_x2 (2 taps/iter)",  6, false, 6 },
+    { "l1_rep (addr repeat)", 1, false, 7 },
+    { "l1_pix (coord pixel)", 1, false, 8 },
+    { "l1_nolod (no level)",  1, false, 9 },
+    { "march_nolod",          0, false, 10 },
+    { "l1_arr (2D-array)",    11, false, 11 },
+    { "march_2ta (arr march)",12, false, 12 },
+    { "march_T (transmit)",   13, false, 13 },
+    { "march_T_nl (leanest)", 13, false, 14 },
+    { "march_T_rsmp_sw",      13, false, 15 },
+    { "march_T_nolod_orig",   13, false, 16 },
+    { "march_a_nolod_sw",     0, false, 17 },
+  };
+  static const int nPairs = (int)(sizeof(pairs) / sizeof(pairs[0]));
+  double gms[nPairs] = { 0 }, mms[nPairs] = { 0 };
+  long long gCov[nPairs] = { 0 }, mCov[nPairs] = { 0 };
+  double gMean[nPairs] = { 0 }, mMean[nPairs] = { 0 };
   // Interleaved rounds cancel machine drift (same protocol as the main harness).
-  double gMarch = 0, mMarch = 0,gL1 = 0, mL1 = 0;
-  long long gcM = 0, mcM = 0;
-  double gmM = 0, mmM = 0;
   for (int r = 0; r < 3; ++r)
   {
-    gMarch += timeGL(gl, false);
-    mMarch += timeMetal(m, false);
-    if (r == 0) readbackGL(gl, &gcM, &gmM);
-    if (r == 0) readbackMetal(m, &mcM, &mmM);
-    gL1 += timeGL(gl, true);
-    mL1 += timeMetal(m, true);
+    for (int pi = 0; pi < nPairs; ++pi)
+    {
+      gms[pi] += timeGL(gl, pairs[pi].gv, pairs[pi].glnear);
+      mms[pi] += timeMetal(m, pairs[pi].mv);
+      if (r == 0)
+      {
+        readbackGL(gl, &gCov[pi], &gMean[pi]);
+        readbackMetal(m, &mCov[pi], &mMean[pi]);
+      }
+    }
   }
-  gMarch /= 3; mMarch /= 3; gL1 /= 3; mL1 /= 3;
-  std::printf("%-22s %10.2f %11.2f %7.2f   parity %lld/%.1f vs %lld/%.1f\n",
-    "march31 (residual)", gMarch, mMarch, mMarch / gMarch, gcM, gmM, mcM, mmM);
-  std::printf("%-22s %10.2f %11.2f %7.2f\n",
-    "l1fetch (issue tax)", gL1, mL1, mL1 / gL1);
+  for (int pi = 0; pi < nPairs; ++pi)
+  {
+    std::printf("%-24s %10.2f %11.2f %7.2f   parity %lld/%.1f vs %lld/%.1f\n",
+      pairs[pi].name, gms[pi] / 3.0, mms[pi] / 3.0, mms[pi] / gms[pi],
+      gCov[pi], gMean[pi], mCov[pi], mMean[pi]);
+  }
   return 0;
 }
