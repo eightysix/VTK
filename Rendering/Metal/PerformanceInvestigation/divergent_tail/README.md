@@ -361,6 +361,33 @@ Remaining >1 cells are the small-frame regime (<=768 fixed, 256): the
 per-draw floor tax (+0.11 ms at 2048-scale tile store) that no march
 change can touch, plus ordinary noise at 1-4 ms frame times.
 
+## The floor tax was (mostly) a measurement artifact
+
+Chasing the V26 floor (0.08 GL vs 0.19 Metal on an empty fragment pass):
+
+1. `storeAction = DontCare` probe: Metal's floor collapses to **0.07 ms**
+   — the required RGBA8 store of the 16.7 MB target is ~0.12 ms of the
+   reported floor. BGRA8Unorm (native format) does not change it.
+2. Wall-clock measurement (`harness=1`, full drain on both sides): the
+   floor is at **PARITY** (GL 0.43 / Metal 0.41 = 0.96). GL's
+   `GL_TIME_ELAPSED` query ends before its tile-store fully drains;
+   Metal's `GPUEndTime` honestly includes pass teardown.
+
+So the "floor tax" is mostly GL under-reporting its store, not Metal
+over-spending. Corrected end-to-end small-frame numbers:
+
+| RT | best divergent | best fixed |
+|----|----------------|------------|
+| 512 | **0.99** (V23) | **1.01** (V31/V33) |
+| 768 | **0.96** (V33) | **1.02** (V31) |
+| 1024 | 1.01-1.02 (V23/V31) | **1.00** (V24/V32) |
+| 2048/SD4 | **0.91-0.92** (V32) | **0.83-0.84** (V32) |
+
+Every cell at every resolution is now at or within noise of parity, with
+Metal decisively faster at the app's operating point and at fine SD.
+The two real fixes: back-edge exit codegen (V31) and RG8 pair-packed
+representation (V24/V32).
+
 ## Root cause history (superseded conclusions kept for the record)
 
 V30 (lockstep march: frame-uniform 288-iteration bound, dead lanes refetch
