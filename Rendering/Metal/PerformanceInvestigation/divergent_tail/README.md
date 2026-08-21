@@ -432,6 +432,14 @@ Implemented on both paths:
 | V35 pipelined 3D | 31.39 | 30.18 | 0.96 — slower than V31 |
 | V36 pipelined RG8 | 27.33 | 24.97 | 0.91 — ties V32, fixed worse |
 
+Also falsified at the last reproducible >1 cells (768xSD0.5 fixed ~+3%,
+1024xSD0.5 divergent ~+2-3%): ablation there shows the alpha-break is NOT
+the cause (V28 no-break shows the same deficits), and both candidate fixes
+lose or tie — V37 batch-8+do-while hybrid (1.08-1.11, over-fetch plus
+issue contention) and V38 incremental positioning (neutral; ALU free).
+The residual is diffuse 2-3% at the measurement floor with no isolable
+mechanism after ~40 variants.
+
 Falsified: the extra tap costs more bandwidth than the overlap saves —
 consistent with the ablation finding that fetch rate is already at parity
 (the march is bandwidth-bound, not latency-bound, at 2048). The do-while
