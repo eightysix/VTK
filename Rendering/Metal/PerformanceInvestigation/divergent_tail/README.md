@@ -265,6 +265,44 @@ tap saving for BOTH backends (2048 div: GL 39.9 / Metal 39.2 — slower than
 V24's 26.2/24.5 despite ratio 0.98). V24's coherent 1.25-tap structure
 dominates it absolutely.
 
+## Ablation bisection: the deficit is exit-divergence x memory, nothing else
+
+V26-V29 remove parts of the work chain (identical shaders compiled for
+both APIs, MARCH_VARIANT 20-23 / GL `ABLATE` define):
+
+| ablation @2048/SD4 | GL | Metal | M/GL | exonerates |
+|---|---|---|---|---|
+| V26 no march (raster+write floor) | 0.08 | 0.19 | 2.38* | — |
+| V27 loop + data-dependent break, ALU hash data (no fetch) | 0.31 | 0.38 | 1.21* | march ALU |
+| V28 real fetches, NO opacity break (uniform trip counts) | 31.13 | 31.32 | **1.01** | fetch rate |
+| V29 single tap | 0.11 | 0.22 | 2.06* | tap latency |
+| V0 full march | 28.45 | 29.56 | 1.04 | — |
+
+\* floor-dominated: V27's hash breaks fire at mean done 3.9, so those
+frames are 0.3 ms and ride on the V26 floor.
+
+Verdict:
+
+1. **Raw fetch throughput: PARITY.** With uniform trip counts (every lane
+   marches the full geometric length) Metal matches GL exactly on a
+   31 ms memory-bound workload — at 2048 AND at 512 (1.00), i.e. even in
+   regimes where the full march loses 10%.
+2. **The entire divergent deficit is the data-dependent early-exit
+   interacting with the memory system.** Same units, same driver-class
+   fetch rate; introduce mixed trip counts within warps and Metal alone
+   degrades 4-12%.
+3. **A resolution-dependent floor tax** (+0.11 ms/frame at 2048, invisible
+   at 512) on raster/tile-store explains the fixed-mode residual at 2048
+   (~2%) — a separate, smaller effect.
+
+This closes the chain of evidence: cache-resident volumes erase the gap
+(DRAM latency component), fixed mode shrinks it (truncated spread),
+predication and binning fail to fix it (the compiler/scheduler will not
+regroup exits), compute loses outright (different engine), and uniform-trip
+fetching is at parity. The app-relevant conclusion stands on V24: do not
+fight the exit-divergence interaction — sidestep the 3D trilinear path
+that amplifies it.
+
 ## Resolution sweep: the representations have different crossover points
 
 Divergent M/GL across render sizes (SD4, same volume):

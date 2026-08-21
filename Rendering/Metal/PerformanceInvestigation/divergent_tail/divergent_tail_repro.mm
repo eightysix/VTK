@@ -241,6 +241,89 @@ float fetchArr(vec3 c) {
 #define FETCH(coord) texture(volumeTex, (coord)).r
 #endif
 void main() {
+#if ABLATE == 20
+  outColor = vec4(0.0);
+  return;
+#elif ABLATE == 21
+  vec2 ndcA = vUV * 2.0 - 1.0;
+  vec3 eyeA = vec3(0.5, 0.5, -0.35);
+  vec3 dirA = normalize(vec3(ndcA * 2.5, 1.0));
+  float caA = cos(0.35), saA = sin(0.35);
+  dirA = vec3(caA * dirA.x + saA * dirA.z, dirA.y, -saA * dirA.x + caA * dirA.z);
+  if (uTranspose != 0) {
+    eyeA = (uTranspose == 1) ? eyeA.xzy : eyeA.zyx;
+    dirA = (uTranspose == 1) ? dirA.xzy : dirA.zyx;
+  }
+  vec3 invA = 1.0 / dirA;
+  vec3 t0A = (vec3(0.0) - eyeA) * invA;
+  vec3 t1A = (vec3(1.0) - eyeA) * invA;
+  float tEA = max(max(min(t0A.x, t1A.x), min(t0A.y, t1A.y)), min(t0A.z, t1A.z));
+  float tXA = min(min(max(t0A.x, t1A.x), max(t0A.y, t1A.y)), max(t0A.z, t1A.z));
+  if (tXA <= 0.0 || tEA >= tXA) { outColor = vec4(0.0); return; }
+  int gsA = max(1, int(ceil((tXA - tEA) / uStep)));
+  int stA = (uMode == 1) ? min(gsA, uFixedSteps) : gsA;
+  vec3 baseA = eyeA + dirA * (tEA + 0.5 * uStep);
+  vec3 dA = dirA * uStep;
+  float accA = 0.0;
+  float alphaA = 0.0;
+  int doneA = 0;
+  for (int i = 0; i < stA; ++i) {
+    float sA = fract((baseA.x + float(i) * dA.x) * 37.0 + baseA.y * 17.0);
+    float oA = sA * uAlphaMul;
+    float wA = 1.0 - alphaA;
+    accA += wA * oA;
+    alphaA += wA * oA;
+    doneA = i + 1;
+    if (alphaA > 0.9) break;
+  }
+  outColor = vec4(accA / float(stA), float(doneA) / 255.0, 0.0, 1.0);
+  return;
+#elif ABLATE == 22
+  vec2 ndcB = vUV * 2.0 - 1.0;
+  vec3 eyeB = vec3(0.5, 0.5, -0.35);
+  vec3 dirB = normalize(vec3(ndcB * 2.5, 1.0));
+  float caB = cos(0.35), saB = sin(0.35);
+  dirB = vec3(caB * dirB.x + saB * dirB.z, dirB.y, -saB * dirB.x + caB * dirB.z);
+  if (uTranspose != 0) {
+    eyeB = (uTranspose == 1) ? eyeB.xzy : eyeB.zyx;
+    dirB = (uTranspose == 1) ? dirB.xzy : dirB.zyx;
+  }
+  vec3 invB = 1.0 / dirB;
+  vec3 t0B = (vec3(0.0) - eyeB) * invB;
+  vec3 t1B = (vec3(1.0) - eyeB) * invB;
+  float tEB = max(max(min(t0B.x, t1B.x), min(t0B.y, t1B.y)), min(t0B.z, t1B.z));
+  float tXB = min(min(max(t0B.x, t1B.x), max(t0B.y, t1B.y)), max(t0B.z, t1B.z));
+  if (tXB <= 0.0 || tEB >= tXB) { outColor = vec4(0.0); return; }
+  int gsB = max(1, int(ceil((tXB - tEB) / uStep)));
+  int stB = (uMode == 1) ? min(gsB, uFixedSteps) : gsB;
+  vec3 baseB = eyeB + dirB * (tEB + 0.5 * uStep);
+  vec3 dB = dirB * uStep;
+  float accB = 0.0;
+  for (int i = 0; i < stB; ++i) {
+    accB += FETCH(baseB + float(i) * dB);
+  }
+  outColor = vec4(accB / float(stB), float(stB) / 255.0, 0.0, 1.0);
+  return;
+#elif ABLATE == 23
+  vec2 ndcC = vUV * 2.0 - 1.0;
+  vec3 eyeC = vec3(0.5, 0.5, -0.35);
+  vec3 dirC = normalize(vec3(ndcC * 2.5, 1.0));
+  float caC = cos(0.35), saC = sin(0.35);
+  dirC = vec3(caC * dirC.x + saC * dirC.z, dirC.y, -saC * dirC.x + caC * dirC.z);
+  if (uTranspose != 0) {
+    eyeC = (uTranspose == 1) ? eyeC.xzy : eyeC.zyx;
+    dirC = (uTranspose == 1) ? dirC.xzy : dirC.zyx;
+  }
+  vec3 invC = 1.0 / dirC;
+  vec3 t0C = (vec3(0.0) - eyeC) * invC;
+  vec3 t1C = (vec3(1.0) - eyeC) * invC;
+  float tEC = max(max(min(t0C.x, t1C.x), min(t0C.y, t1C.y)), min(t0C.z, t1C.z));
+  float tXC = min(min(max(t0C.x, t1C.x), max(t0C.y, t1C.y)), max(t0C.z, t1C.z));
+  if (tXC <= 0.0 || tEC >= tXC) { outColor = vec4(0.0); return; }
+  vec3 baseC = eyeC + dirC * (tEC + 0.5 * uStep);
+  outColor = vec4(FETCH(baseC), 0.0, 0.0, 1.0);
+  return;
+#endif
   vec2 ndc = vUV * 2.0 - 1.0;
   vec3 eye = vec3(0.5, 0.5, -0.35);
   vec3 dir = normalize(vec3(ndc * 2.5, 1.0));
@@ -302,6 +385,7 @@ struct GLState
   GLuint progArr = 0;                   // V23 2D-array two-tap march
   GLuint progRG = 0;                    // V24 RG8 pair-tap march
   GLuint progO = 0;                     // V25 overlapping-pair march
+  GLuint progAb[4] = {0, 0, 0, 0};      // V26-29 ablation programs
   GLuint volArrTex = 0;                 // GL_TEXTURE_2D_ARRAY volume
   GLuint volRGTex = 0;                  // GL_RG8 pair-packed slices
   GLuint volOTex = 0;                   // GL_RG8 overlapping pairs
@@ -311,7 +395,7 @@ struct GLState
 };
 
 static bool compileGLProgram(GLState& s, GLuint* prog, bool useLod, bool useArr = false,
-  bool useRG = false, bool useO = false)
+  bool useRG = false, bool useO = false, int ablate = 0)
 {
   // USE_LOD must come AFTER the #version line, so splice it in rather than
   // prepending.
@@ -323,6 +407,7 @@ static bool compileGLProgram(GLState& s, GLuint* prog, bool useLod, bool useArr 
   src += useArr ? "#define USE_ARR 1\n" : "";
   src += useRG ? "#define USE_RG8 1\n" : "";
   src += useO ? "#define USE_O 1\n" : "";
+  src += "#define ABLATE " + std::to_string(ablate > 0 ? ablate : 0) + "\n";
   src += versionEnd + 1;
   GLuint vs = glCreateShader(GL_VERTEX_SHADER);
   glShaderSource(vs, 1, &kGLVertSrc, nullptr);
@@ -405,6 +490,13 @@ static bool setupGL(GLState& s)
       !compileGLProgram(s, &s.progO, false, false, false, true))
   {
     return false;
+  }
+  for (int a = 0; a < 4; ++a)
+  {
+    if (!compileGLProgram(s, &s.progAb[a], false, false, false, false, 20 + a))
+    {
+      return false;
+    }
   }
 
   glGenVertexArrays(1, &s.vao);
@@ -502,7 +594,9 @@ static double timeGL(GLState& s, int mode, int fixedSteps, int useLod, int speci
   glViewport(0, 0, kRT, kRT);
   const GLuint prog = (special == 2) ? s.progArr :
     (special == 3) ? s.progRG :
-    (special == 4) ? s.progO : (useLod ? s.progLod : s.progImplicit);
+    (special == 4) ? s.progO :
+    (special >= 5 && special <= 8) ? s.progAb[special - 5] :
+    (useLod ? s.progLod : s.progImplicit);
   glUseProgram(prog);
   glActiveTexture(GL_TEXTURE0);
   if (special == 2)
@@ -1447,6 +1541,32 @@ fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
     done = i + 1;
     if (alpha > 0.9) break;
   }
+#elif MARCH_VARIANT == 20
+  // V26 ablation: no march at all — floor cost of raster + target write.
+  return float4(0.0, 0.0, 0.0, 0.0);
+#elif MARCH_VARIANT == 21
+  // V27 ablation: identical loop shape with a data-dependent break, but the
+  // data is an ALU hash instead of a texture fetch — memory path removed.
+  for (int i = 0; i < steps; ++i) {
+    float s = fract((base.x + float(i) * d.x) * 37.0 + base.y * 17.0);
+    float o = s * p.alphaMul;
+    float w = 1.0 - alpha;
+    acc += w * o;
+    alpha += w * o;
+    done = i + 1;
+    if (alpha > 0.9) break;
+  }
+#elif MARCH_VARIANT == 22
+  // V28 ablation: fetch every sample, no opacity break — uniform trip count,
+  // isolates fetch rate from divergence.
+  for (int i = 0; i < steps; ++i) {
+    acc += vol.sample(smp, base + float(i) * d).r;
+    done = i + 1;
+  }
+#elif MARCH_VARIANT == 23
+  // V29 ablation: single tap, no loop — pure sampler throughput probe.
+  acc = vol.sample(smp, base).r;
+  done = 1;
 #elif MARCH_VARIANT == 15
   // V20: binned steady-state pass — same bucket discard + cap as V17 but with
   // NO history write. In a static scene the done histogram never changes, so
@@ -1714,7 +1834,7 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol, int kMax)
 
   // One library per variant: MARCH_VARIANT is baked in as a preprocessor macro
   // so each PSO gets the exact code shape we want to measure.
-  const int nVariants = 20;
+  const int nVariants = 24;
   for (int v = 0; v < nVariants; ++v)
   {
     NSError* err = nil;
@@ -2855,7 +2975,7 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
   auto run = [&]() {
     id<MTLCommandBuffer> cb = [s.q commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
-    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : (variant == 21) ? 16 : (variant == 23) ? 17 : (variant == 24) ? 18 : (variant == 25) ? 19 : variant]];
+    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : (variant == 21) ? 16 : (variant == 23) ? 17 : (variant == 24) ? 18 : (variant == 25) ? 19 : (variant >= 26 && variant <= 29) ? (variant - 6) : variant]];
     [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
     [enc setFragmentTexture:s.volTex atIndex:0];
     [enc setFragmentSamplerState:s.smp atIndex:0];
@@ -2891,7 +3011,7 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
   {
     id<MTLCommandBuffer> cb = [s.q commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
-    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : (variant == 21) ? 16 : (variant == 23) ? 17 : (variant == 24) ? 18 : (variant == 25) ? 19 : variant]];
+    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : (variant == 21) ? 16 : (variant == 23) ? 17 : (variant == 24) ? 18 : (variant == 25) ? 19 : (variant >= 26 && variant <= 29) ? (variant - 6) : variant]];
     [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
     [enc setFragmentTexture:s.volTex atIndex:0];
     [enc setFragmentSamplerState:s.smp atIndex:0];
@@ -3053,8 +3173,12 @@ int main(int argc, char** argv)
     "V23 arr-2dtap    ",
     "V24 rg8-pairtap  ",
     "V25 rg8-overlap  ",
+    "V26 ablate-none  ",
+    "V27 ablate-nofet ",
+    "V28 ablate-nobrk ",
+    "V29 ablate-1tap  ",
   };
-  for (int v = 0; v < 26; ++v)
+  for (int v = 0; v < 30; ++v)
   {
     const int useLod = (v >= 1) ? 1 : 0; // GL: implicit until V1, explicit after
     // Interleave the two modes within each backend to cancel drift, and the two
@@ -3066,11 +3190,11 @@ int main(int argc, char** argv)
     const int rounds = 3;
     for (int r = 0; r < rounds; ++r)
     {
-      glDiv += timeGL(gl, 0, fixedSteps, useLod, (v == 21) ? 1 : (v == 23) ? 2 : (v == 24) ? 3 : (v == 25) ? 4 : 0);
+      glDiv += timeGL(gl, 0, fixedSteps, useLod, (v == 21) ? 1 : (v == 23) ? 2 : (v == 24) ? 3 : (v == 25) ? 4 : (v >= 26 && v <= 29) ? 5 + (v - 26) : 0);
       if (r == 0) readbackGL(gl, &glDivCov, &glDivMean);
       mDiv += timeMetal(m, 0, fixedSteps, v);
       if (r == 0) readbackMetal(m, &mDivCov, &mDivMean);
-      glFix += timeGL(gl, 1, fixedSteps, useLod, (v == 21) ? 1 : (v == 23) ? 2 : (v == 24) ? 3 : (v == 25) ? 4 : 0);
+      glFix += timeGL(gl, 1, fixedSteps, useLod, (v == 21) ? 1 : (v == 23) ? 2 : (v == 24) ? 3 : (v == 25) ? 4 : (v >= 26 && v <= 29) ? 5 + (v - 26) : 0);
       if (r == 0) readbackGL(gl, &glFixCov, &glFixMean);
       mFix += timeMetal(m, 1, fixedSteps, v);
       if (r == 0) readbackMetal(m, &mFixCov, &mFixMean);
