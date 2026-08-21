@@ -176,6 +176,7 @@ in vec2 vUV;
 out vec4 outColor;
 uniform sampler3D volumeTex;
 uniform int uTranspose;
+uniform int uLockLimit;
 uniform int uMode;      // 0 = divergent (per-fragment ray-box bound), 1 = fixed
 uniform int uFixedSteps;
 uniform float uStep;
@@ -241,6 +242,46 @@ float fetchArr(vec3 c) {
 #define FETCH(coord) texture(volumeTex, (coord)).r
 #endif
 void main() {
+#ifdef USE_LOCKSTEP
+  // V30 GL twin: lockstep march, frame-uniform iteration bound (uLockLimit),
+  // dead lanes refetch their frozen coordinate — never skips an issue.
+  vec2 ndcL = vUV * 2.0 - 1.0;
+  vec3 eyeL = vec3(0.5, 0.5, -0.35);
+  vec3 dirL = normalize(vec3(ndcL * 2.5, 1.0));
+  float caL = cos(0.35), saL = sin(0.35);
+  dirL = vec3(caL * dirL.x + saL * dirL.z, dirL.y, -saL * dirL.x + caL * dirL.z);
+  if (uTranspose != 0) {
+    eyeL = (uTranspose == 1) ? eyeL.xzy : eyeL.zyx;
+    dirL = (uTranspose == 1) ? dirL.xzy : dirL.zyx;
+  }
+  vec3 invL = 1.0 / dirL;
+  vec3 t0L = (vec3(0.0) - eyeL) * invL;
+  vec3 t1L = (vec3(1.0) - eyeL) * invL;
+  float tEL = max(max(min(t0L.x, t1L.x), min(t0L.y, t1L.y)), min(t0L.z, t1L.z));
+  float tXL = min(min(max(t0L.x, t1L.x), max(t0L.y, t1L.y)), max(t0L.z, t1L.z));
+  if (tXL <= 0.0 || tEL >= tXL) { outColor = vec4(0.0); return; }
+  int gsL = max(1, int(ceil((tXL - tEL) / uStep)));
+  int stL = (uMode == 1) ? min(gsL, uFixedSteps) : gsL;
+  vec3 baseL = eyeL + dirL * (tEL + 0.5 * uStep);
+  vec3 dL = dirL * uStep;
+  float accL = 0.0;
+  float alphaL = 0.0;
+  int doneL = 0;
+  vec3 ciL = baseL;
+  bool aliveL = true;
+  for (int i = 0; i < uLockLimit; ++i) {
+    ciL = aliveL ? (baseL + float(i) * dL) : ciL;
+    float sL = FETCH(ciL);
+    float oL = aliveL ? sL * uAlphaMul : 0.0;
+    float wL = 1.0 - alphaL;
+    accL += wL * oL;
+    alphaL += wL * oL;
+    doneL = aliveL ? i + 1 : doneL;
+    aliveL = aliveL && (i + 1 < stL) && (alphaL <= 0.9);
+  }
+  outColor = vec4(accL / float(stL), float(doneL) / 255.0, 0.0, 1.0);
+  return;
+#endif
 #if ABLATE == 20
   outColor = vec4(0.0);
   return;
@@ -386,6 +427,7 @@ struct GLState
   GLuint progRG = 0;                    // V24 RG8 pair-tap march
   GLuint progO = 0;                     // V25 overlapping-pair march
   GLuint progAb[4] = {0, 0, 0, 0};      // V26-29 ablation programs
+  GLuint progLS = 0;                    // V30 lockstep march
   GLuint volArrTex = 0;                 // GL_TEXTURE_2D_ARRAY volume
   GLuint volRGTex = 0;                  // GL_RG8 pair-packed slices
   GLuint volOTex = 0;                   // GL_RG8 overlapping pairs
@@ -395,7 +437,7 @@ struct GLState
 };
 
 static bool compileGLProgram(GLState& s, GLuint* prog, bool useLod, bool useArr = false,
-  bool useRG = false, bool useO = false, int ablate = 0)
+  bool useRG = false, bool useO = false, int ablate = 0, bool lockstep = false)
 {
   // USE_LOD must come AFTER the #version line, so splice it in rather than
   // prepending.
@@ -408,6 +450,7 @@ static bool compileGLProgram(GLState& s, GLuint* prog, bool useLod, bool useArr 
   src += useRG ? "#define USE_RG8 1\n" : "";
   src += useO ? "#define USE_O 1\n" : "";
   src += "#define ABLATE " + std::to_string(ablate > 0 ? ablate : 0) + "\n";
+  src += lockstep ? "#define USE_LOCKSTEP 1\n" : "";
   src += versionEnd + 1;
   GLuint vs = glCreateShader(GL_VERTEX_SHADER);
   glShaderSource(vs, 1, &kGLVertSrc, nullptr);
@@ -497,6 +540,10 @@ static bool setupGL(GLState& s)
     {
       return false;
     }
+  }
+  if (!compileGLProgram(s, &s.progLS, false, false, false, false, 0, true))
+  {
+    return false;
   }
 
   glGenVertexArrays(1, &s.vao);
@@ -596,6 +643,7 @@ static double timeGL(GLState& s, int mode, int fixedSteps, int useLod, int speci
     (special == 3) ? s.progRG :
     (special == 4) ? s.progO :
     (special >= 5 && special <= 8) ? s.progAb[special - 5] :
+    (special == 9) ? s.progLS :
     (useLod ? s.progLod : s.progImplicit);
   glUseProgram(prog);
   glActiveTexture(GL_TEXTURE0);
@@ -613,6 +661,11 @@ static double timeGL(GLState& s, int mode, int fixedSteps, int useLod, int speci
   {
     glBindTexture(GL_TEXTURE_2D_ARRAY, s.volOTex);
     glUniform1f(glGetUniformLocation(prog, "uDepthO"), (float)kVolZ);
+  }
+  else if (special == 9)
+  {
+    glBindTexture(GL_TEXTURE_3D, s.volTex);
+    glUniform1i(glGetUniformLocation(prog, "uLockLimit"), kMaxConstant);
   }
   else
   {
@@ -1541,6 +1594,26 @@ fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
     done = i + 1;
     if (alpha > 0.9) break;
   }
+#elif MARCH_VARIANT == 24
+  // V30: lockstep march — the warp NEVER skips an issue. Dead lanes keep
+  // fetching their frozen (cache-hot) coordinate via select(); compositing is
+  // branchless select() too. The memory stream stays full-width exactly like
+  // the uniform-trip ablation (V28) that measured parity, while per-lane
+  // output stays bit-identical to V0. Iteration bound is frame-uniform
+  // (kMax, passed via bucketCap).
+  const int limit = p.bucketCap;
+  float3 ci = base;
+  bool alive = true;
+  for (int i = 0; i < limit; ++i) {
+    ci = select(ci, base + float(i) * d, alive);
+    float s = vol.sample(smp, ci).r;
+    float o = select(0.0f, s * p.alphaMul, alive);
+    float w = 1.0 - alpha;
+    acc += w * o;
+    alpha += w * o;
+    done = select(done, i + 1, alive);
+    alive = alive && (i + 1 < steps) && (alpha <= 0.9);
+  }
 #elif MARCH_VARIANT == 20
   // V26 ablation: no march at all — floor cost of raster + target write.
   return float4(0.0, 0.0, 0.0, 0.0);
@@ -1834,7 +1907,7 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol, int kMax)
 
   // One library per variant: MARCH_VARIANT is baked in as a preprocessor macro
   // so each PSO gets the exact code shape we want to measure.
-  const int nVariants = 24;
+  const int nVariants = 25;
   for (int v = 0; v < nVariants; ++v)
   {
     NSError* err = nil;
@@ -2240,6 +2313,10 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
 {
   struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; int transpose; } params =
     { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, -1, 0, kTranspose };
+  if (variant == 30)
+  {
+    params.bucketCap = kMaxConstant; // V30 lockstep iteration bound
+  }
   if (variant == 21)
   {
     // V21: done-sorted tile quads (see initSortedTiles). Per-frame clear on
@@ -2975,7 +3052,7 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
   auto run = [&]() {
     id<MTLCommandBuffer> cb = [s.q commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
-    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : (variant == 21) ? 16 : (variant == 23) ? 17 : (variant == 24) ? 18 : (variant == 25) ? 19 : (variant >= 26 && variant <= 29) ? (variant - 6) : variant]];
+    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : (variant == 21) ? 16 : (variant == 23) ? 17 : (variant == 24) ? 18 : (variant == 25) ? 19 : (variant >= 26 && variant <= 29) ? (variant - 6) : (variant == 30) ? 24 : variant]];
     [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
     [enc setFragmentTexture:s.volTex atIndex:0];
     [enc setFragmentSamplerState:s.smp atIndex:0];
@@ -3011,7 +3088,7 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
   {
     id<MTLCommandBuffer> cb = [s.q commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
-    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : (variant == 21) ? 16 : (variant == 23) ? 17 : (variant == 24) ? 18 : (variant == 25) ? 19 : (variant >= 26 && variant <= 29) ? (variant - 6) : variant]];
+    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : (variant == 21) ? 16 : (variant == 23) ? 17 : (variant == 24) ? 18 : (variant == 25) ? 19 : (variant >= 26 && variant <= 29) ? (variant - 6) : (variant == 30) ? 24 : variant]];
     [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
     [enc setFragmentTexture:s.volTex atIndex:0];
     [enc setFragmentSamplerState:s.smp atIndex:0];
@@ -3177,8 +3254,9 @@ int main(int argc, char** argv)
     "V27 ablate-nofet ",
     "V28 ablate-nobrk ",
     "V29 ablate-1tap  ",
+    "V30 lockstep     ",
   };
-  for (int v = 0; v < 30; ++v)
+  for (int v = 0; v < 31; ++v)
   {
     const int useLod = (v >= 1) ? 1 : 0; // GL: implicit until V1, explicit after
     // Interleave the two modes within each backend to cancel drift, and the two
@@ -3190,11 +3268,11 @@ int main(int argc, char** argv)
     const int rounds = 3;
     for (int r = 0; r < rounds; ++r)
     {
-      glDiv += timeGL(gl, 0, fixedSteps, useLod, (v == 21) ? 1 : (v == 23) ? 2 : (v == 24) ? 3 : (v == 25) ? 4 : (v >= 26 && v <= 29) ? 5 + (v - 26) : 0);
+      glDiv += timeGL(gl, 0, fixedSteps, useLod, (v == 21) ? 1 : (v == 23) ? 2 : (v == 24) ? 3 : (v == 25) ? 4 : (v >= 26 && v <= 29) ? 5 + (v - 26) : (v == 30) ? 9 : 0);
       if (r == 0) readbackGL(gl, &glDivCov, &glDivMean);
       mDiv += timeMetal(m, 0, fixedSteps, v);
       if (r == 0) readbackMetal(m, &mDivCov, &mDivMean);
-      glFix += timeGL(gl, 1, fixedSteps, useLod, (v == 21) ? 1 : (v == 23) ? 2 : (v == 24) ? 3 : (v == 25) ? 4 : (v >= 26 && v <= 29) ? 5 + (v - 26) : 0);
+      glFix += timeGL(gl, 1, fixedSteps, useLod, (v == 21) ? 1 : (v == 23) ? 2 : (v == 24) ? 3 : (v == 25) ? 4 : (v >= 26 && v <= 29) ? 5 + (v - 26) : (v == 30) ? 9 : 0);
       if (r == 0) readbackGL(gl, &glFixCov, &glFixMean);
       mFix += timeMetal(m, 1, fixedSteps, v);
       if (r == 0) readbackMetal(m, &mFixCov, &mFixMean);

@@ -303,6 +303,33 @@ fetching is at parity. The app-relevant conclusion stands on V24: do not
 fight the exit-divergence interaction — sidestep the 3D trilinear path
 that amplifies it.
 
+## Root cause, final form: unrealized early-exit savings (low-occupancy tail)
+
+V30 (lockstep march: frame-uniform 288-iteration bound, dead lanes refetch
+their frozen cache-hot coordinate via `select()`, never skipping an issue)
+tested the "partial-width memory requests after exits" hypothesis directly.
+Parity exact, but SLOWER (36.8/39.7 ms) — the cache-hot spins consume issue
+slots. Disproving that hypothesis exposed the correct mechanism:
+
+Compare V0 (with opacity break) against V28 (identical fetches, no break).
+They do nearly the SAME memory work — the break only trims mean samples
+from 86.4 to 83.5 in this scene — yet the break saves GL 3.07 ms (-9.9%)
+and Metal just 1.76 ms (-5.6%). Divergence is not a tax on either backend;
+EARLY EXIT IS A BONUS, and Metal realizes less of it. Mechanism: as short
+rays drain, occupancy falls and the march tail runs at degraded throughput
+— the V17 per-pass spans showed exactly this curve on Metal (short-bucket
+passes ~22 Gsample/s down to 3.5 Gsample/s for the long-ray pass). GL's
+scheduler degrades less in the same tail.
+
+Both root causes are therefore scheduler/driver properties:
+1. Tail-occupancy efficiency (the 4-12% divergent gap), and
+2. the per-frame floor tax (+0.11 ms at 2048, the small-frame regime).
+Neither is reachable from app/shader level — occupancy is not a programmable
+resource on any GPU API. Which is why every structural rewrite failed and
+the representation change (V24) is the correct engineering answer: cheaper
+taps shrink the tail's absolute cost regardless of how the scheduler
+handles it.
+
 ## Resolution sweep: the representations have different crossover points
 
 Divergent M/GL across render sizes (SD4, same volume):
