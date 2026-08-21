@@ -91,7 +91,8 @@ static int kHarness = 0;              // 0 = GPU timestamps + DontCare (fair), 1
 static int kChunk = 256;              // V6 persistent kernel chunk size (multiple of tgSize)
 static int kComputeTG = 256;          // V6 threadgroup size
 static int kTile = 32;
-static int kTranspose = 0;           // argv[15]: 0 none, 1 y<->z, 2 x<->z                 // V10 tile size (square)
+static int kTranspose = 0;           // argv[15]: 0 none, 1 y<->z, 2 x<->z
+static int kOnlyVariant = -1;        // argv[16]: run a single variant (-1 = full sweep)                 // V10 tile size (square)
 static int kComputeGroups = 0;        // V6 threadgroup count (0 = maxThreadsPerThreadgroup.width*8/tg)
 
 #define DBG(...) std::fprintf(stderr, "[repro] " __VA_ARGS__), std::fflush(stderr)
@@ -3509,6 +3510,7 @@ int main(int argc, char** argv)
   if (argc > 8) kOptContents = (BOOL)std::atoi(argv[8]);
   if (argc > 9) kMaxConstant = std::atoi(argv[9]);
   if (argc > 15) kTranspose = std::atoi(argv[15]);
+  if (argc > 16) kOnlyVariant = std::atoi(argv[16]);
   if (argc > 10) kHarness = std::atoi(argv[10]);
   if (argc > 11) kChunk = std::atoi(argv[11]);
   if (argc > 12) kComputeTG = std::atoi(argv[12]);
@@ -3632,6 +3634,7 @@ int main(int argc, char** argv)
   for (int v = 0; v < 37; ++v)
   {
     if (v == 34) continue; // number unused (V34 skipped during development)
+    if (kOnlyVariant >= 0 && v != kOnlyVariant) continue;
     const int useLod = (v >= 1) ? 1 : 0; // GL: implicit until V1, explicit after
     // Interleave the two modes within each backend to cancel drift, and the two
     // backends across modes: divergent GL, divergent Metal, fixed GL, fixed

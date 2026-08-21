@@ -389,6 +389,30 @@ Metal decisively faster at the app's operating point and at fine SD.
 The two real fixes: back-edge exit codegen (V31) and RG8 pair-packed
 representation (V24/V32).
 
+## V31 full resolution x SD matrix (fair wall-clock timing, argv[16] single-variant runs)
+
+| RT x SD | divergent GL/Metal M/GL | fixed GL/Metal M/GL |
+|---------|--------------------------|----------------------|
+| 256 x SD4   | 4.68 / 4.69  1.00 | 1.78 / 1.77  0.99 |
+| 256 x SD0.5 | 15.20 / 15.16 1.00 | 5.09 / 5.04  0.99 |
+| 512 x SD4   | 9.78 / 9.96  1.02 | 2.96 / 3.00  1.01 |
+| 512 x SD0.5 | 27.20 / 27.47 1.01 | 7.70 / 7.79  1.01 |
+| 768 x SD4   | 15.25 / 15.24 1.00 | 3.94 / 4.00  1.02 |
+| 768 x SD0.5 | 35.42 / 35.60 1.00 | 8.83 / 9.31  1.05 |
+| 1024 x SD4  | 18.55 / 18.44 0.99 | 4.56 / 4.62  1.01 |
+| 1024 x SD0.5| 40.52 / 42.24 1.04 | 10.67 / 10.95 1.03 |
+| 2048 x SD4  | 27.73 / 26.99 0.97 | 6.08 / 5.99  0.99 |
+| 2048 x SD0.5| 65.03 / 63.31 0.97 | 25.16 / 23.47 0.93 |
+| 4096 x SD4  | 40.19 / 39.81 0.99 | 12.93 / 12.41 0.96 |
+| 4096 x SD0.5| 142.04 / 140.18 0.99 | 88.07 / 87.88 1.00 |
+| 8192 x SD4  | 70.68 / 70.35 1.00 | 46.24 / 45.74 0.99 |
+| 8192 x SD0.5| 488.25 / 486.82 1.00 | 342.00 / 342.48 1.00 |
+
+All 14 cells within 0.93-1.04; parity exact from 30k to 30.6M covered
+pixels (0.07 ms to 488 ms frames). 8192 scales sublinearly vs 4096
+(1.76x time for 4x pixels) — denser rays share volume-cache lines better.
+The do-while fix is scale-invariant.
+
 Note on 256: V32's RG8 advantage INVERTS there (div 1.05-1.10) — the
 odd/even branch overhead outweighs tap savings on 1-4 ms frames; plain
 3D + do-while (V31) is the correct pick at tiny sizes (wall-clock
