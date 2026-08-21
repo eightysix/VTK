@@ -265,6 +265,38 @@ tap saving for BOTH backends (2048 div: GL 39.9 / Metal 39.2 — slower than
 V24's 26.2/24.5 despite ratio 0.98). V24's coherent 1.25-tap structure
 dominates it absolutely.
 
+## Resolution sweep: the representations have different crossover points
+
+Divergent M/GL across render sizes (SD4, same volume):
+
+| RT   | V0 3D       | V23 two-tap   | V24 rg8-pair  |
+|------|-------------|---------------|---------------|
+| 256  | 1.04        | 1.04          | 1.09          |
+| 512  | 1.10        | **0.92-0.94** | 1.06-1.14     |
+| 768  | 1.09        | 1.07          | 1.08          |
+| 1024 | 1.07        | **1.01**      | 1.04          |
+| 2048 | 1.04-1.12   | 0.98-1.00     | **0.93-0.96** |
+
+Fixed M/GL:
+
+| RT   | V0   | V23  | V24  |
+|------|------|------|------|
+| 256  | 1.10 | 1.17 | 1.16 |
+| 512  | 1.16 | 1.11 | 1.14 |
+| 768  | 1.17 | 1.11 | 1.13 |
+| 1024 | 1.14 | 1.08 | **1.00** |
+| 2048 | 1.02 | 0.94 | **0.85** |
+
+The RG8 coherent single-tap wins where frames are long enough to saturate
+throughput (>=1024); the plain two-tap array wins at ~512 where the branch
+overhead weighs more; both tie with 3D at 256 where 1-4 ms frames sit in
+the small-frame scheduling regime that no representation has moved (fixed
+mode at <=768 loses ~11-17% in EVERY variant ever measured — a per-draw
+tax, not a march property). Practical rule for the app: pick the
+representation by canvas size — two-tap array below ~1024, RG8 pair-tap
+at or above it (runtime switch = different texture binding + PSO; both
+are image-exact and parity-safe).
+
 ## V23: 2D-array two-tap march — parity with GL, same image
 
 Replacing the single 3D trilinear tap with TWO explicit bilinear taps into
