@@ -180,17 +180,56 @@ uniform int uMode;      // 0 = divergent (per-fragment ray-box bound), 1 = fixed
 uniform int uFixedSteps;
 uniform float uStep;
 uniform float uAlphaMul;
-#ifdef USE_ARR
+#if defined(USE_O)
+// V25: overlapping RG8 pairs — layer k holds R=slice k, G=slice k+1; every
+// sample is one branchless tap. Exact trilinear-z; identical math to
+// MARCH_VARIANT 19.
+uniform sampler2DArray volumeO;
+uniform float uDepthO;
+float fetchO(vec3 c) {
+  float g = c.z * uDepthO - 0.5;
+  int k = clamp(int(floor(g)), 0, int(uDepthO) - 2);
+  float fz = clamp(g - float(k), 0.0, 1.0);
+  vec2 ss = textureLod(volumeO, vec3(c.xy, float(k)), 0.0).rg;
+  return mix(ss.r, ss.g, fz);
+}
+#define FETCH(coord) fetchO(coord)
+#elif defined(USE_RG8)
+// V24: slices packed as RG pairs (layer p: R=slice 2p, G=slice 2p+1). Even
+// z0 taps once (both channels same layer); odd z0 taps two layers. Exact
+// reconstruction of the two-tap blend; identical math to MARCH_VARIANT 18.
+uniform sampler2DArray volumeRG;
+uniform float uDepth;
+float fetchRG(vec3 c) {
+  float g = c.z * uDepth - 0.5;
+  int z0 = clamp(int(floor(g)), 0, int(uDepth) - 1);
+  int z1 = min(z0 + 1, int(uDepth) - 1);
+  float fz = g - float(z0);
+  float s;
+  if ((z0 & 1) == 0) {
+    vec2 ss = textureLod(volumeRG, vec3(c.xy, float(z0 >> 1)), 0.0).rg;
+    s = mix(ss.r, ss.g, fz);
+  } else if (z1 == z0) {
+    s = textureLod(volumeRG, vec3(c.xy, float(z0 >> 1)), 0.0).g;
+  } else {
+    float sa = textureLod(volumeRG, vec3(c.xy, float(z0 >> 1)), 0.0).g;
+    float sb = textureLod(volumeRG, vec3(c.xy, float(z1 >> 1)), 0.0).r;
+    s = mix(sa, sb, fz);
+  }
+  return s;
+}
+#define FETCH(coord) fetchRG(coord)
+#elif defined(USE_ARR)
 // V23: two bilinear 2D-array taps + register lerp per sample. Identical math
 // order to the Metal MARCH_VARIANT 17 body.
 uniform sampler2DArray volumeArr;
-uniform float uDepth;
+uniform float uDepthArr;
 float fetchArr(vec3 c) {
-  float g = c.z * uDepth - 0.5;
+  float g = c.z * uDepthArr - 0.5;
   int z0 = int(floor(g));
   float fz = g - float(z0);
-  int za = clamp(z0, 0, int(uDepth) - 1);
-  int zb = clamp(z0 + 1, 0, int(uDepth) - 1);
+  int za = clamp(z0, 0, int(uDepthArr) - 1);
+  int zb = clamp(z0 + 1, 0, int(uDepthArr) - 1);
   float s0 = textureLod(volumeArr, vec3(c.xy, float(za)), 0.0).r;
   float s1 = textureLod(volumeArr, vec3(c.xy, float(zb)), 0.0).r;
   return mix(s0, s1, fz);
@@ -261,13 +300,18 @@ struct GLState
   GLuint fbo = 0, colorTex = 0, vao = 0, vbo = 0, volTex = 0;
   GLuint progImplicit = 0, progLod = 0; // 0 = texture(), 1 = textureLod()
   GLuint progArr = 0;                   // V23 2D-array two-tap march
+  GLuint progRG = 0;                    // V24 RG8 pair-tap march
+  GLuint progO = 0;                     // V25 overlapping-pair march
   GLuint volArrTex = 0;                 // GL_TEXTURE_2D_ARRAY volume
+  GLuint volRGTex = 0;                  // GL_RG8 pair-packed slices
+  GLuint volOTex = 0;                   // GL_RG8 overlapping pairs
   GLuint vaoFc[2] = {0, 0}, vboFc[2] = {0, 0};
   GLint nVertsFc[2] = {0, 0};
   GLint uMode = -1, uFixedSteps = -1, uStep = -1, uAlphaMul = -1;
 };
 
-static bool compileGLProgram(GLState& s, GLuint* prog, bool useLod, bool useArr = false)
+static bool compileGLProgram(GLState& s, GLuint* prog, bool useLod, bool useArr = false,
+  bool useRG = false, bool useO = false)
 {
   // USE_LOD must come AFTER the #version line, so splice it in rather than
   // prepending.
@@ -277,6 +321,8 @@ static bool compileGLProgram(GLState& s, GLuint* prog, bool useLod, bool useArr 
   src.append(kGLFragSrc, versionEnd - kGLFragSrc + 1);
   src += useLod ? "#define USE_LOD 1\n" : "";
   src += useArr ? "#define USE_ARR 1\n" : "";
+  src += useRG ? "#define USE_RG8 1\n" : "";
+  src += useO ? "#define USE_O 1\n" : "";
   src += versionEnd + 1;
   GLuint vs = glCreateShader(GL_VERTEX_SHADER);
   glShaderSource(vs, 1, &kGLVertSrc, nullptr);
@@ -354,7 +400,9 @@ static bool setupGL(GLState& s)
   // shader.
   if (!compileGLProgram(s, &s.progImplicit, false) ||
       !compileGLProgram(s, &s.progLod, true) ||
-      !compileGLProgram(s, &s.progArr, true, true))
+      !compileGLProgram(s, &s.progArr, true, true) ||
+      !compileGLProgram(s, &s.progRG, false, false, true) ||
+      !compileGLProgram(s, &s.progO, false, false, false, true))
   {
     return false;
   }
@@ -399,17 +447,78 @@ static void setupGLVolumeArray(GLState& s, const std::vector<uint8_t>& v)
     GL_UNSIGNED_BYTE, v.data());
 }
 
+// V25: overlapping RG8 pairs — layer k holds (R=slice k, G=slice k+1).
+static void setupGLVolumeO(GLState& s, const std::vector<uint8_t>& v)
+{
+  const size_t wh = (size_t)kVolX * kVolY;
+  const int L = kVolZ - 1;
+  std::vector<uint8_t> o(wh * (size_t)L * 2);
+  for (int k = 0; k < L; ++k)
+  {
+    for (size_t i = 0; i < wh; ++i)
+    {
+      o[((size_t)k * wh + i) * 2 + 0] = v[(size_t)k * wh + i];
+      o[((size_t)k * wh + i) * 2 + 1] = v[(size_t)(k + 1) * wh + i];
+    }
+  }
+  glGenTextures(1, &s.volOTex);
+  glBindTexture(GL_TEXTURE_2D_ARRAY, s.volOTex);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RG8, kVolX, kVolY, L, 0, GL_RG,
+    GL_UNSIGNED_BYTE, o.data());
+}
+
+// V24: RG8 pair-packed slices — layer p holds (R=slice 2p, G=slice 2p+1).
+static void setupGLVolumeRG(GLState& s, const std::vector<uint8_t>& v)
+{
+  const size_t wh = (size_t)kVolX * kVolY;
+  const int L = (kVolZ + 1) / 2;
+  std::vector<uint8_t> rg(wh * (size_t)L * 2);
+  for (int p = 0; p < L; ++p)
+  {
+    for (size_t i = 0; i < wh; ++i)
+    {
+      rg[((size_t)p * wh + i) * 2 + 0] = v[(size_t)(2 * p) * wh + i];
+      rg[((size_t)p * wh + i) * 2 + 1] =
+        (2 * p + 1 < kVolZ) ? v[(size_t)(2 * p + 1) * wh + i] : 0;
+    }
+  }
+  glGenTextures(1, &s.volRGTex);
+  glBindTexture(GL_TEXTURE_2D_ARRAY, s.volRGTex);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RG8, kVolX, kVolY, L, 0, GL_RG,
+    GL_UNSIGNED_BYTE, rg.data());
+}
+
 static double timeGL(GLState& s, int mode, int fixedSteps, int useLod, int special = 0)
 {
   glBindFramebuffer(GL_FRAMEBUFFER, s.fbo);
   glViewport(0, 0, kRT, kRT);
-  const GLuint prog = (special == 2) ? s.progArr : (useLod ? s.progLod : s.progImplicit);
+  const GLuint prog = (special == 2) ? s.progArr :
+    (special == 3) ? s.progRG :
+    (special == 4) ? s.progO : (useLod ? s.progLod : s.progImplicit);
   glUseProgram(prog);
   glActiveTexture(GL_TEXTURE0);
   if (special == 2)
   {
     glBindTexture(GL_TEXTURE_2D_ARRAY, s.volArrTex);
+    glUniform1f(glGetUniformLocation(prog, "uDepthArr"), (float)kVolZ);
+  }
+  else if (special == 3)
+  {
+    glBindTexture(GL_TEXTURE_2D_ARRAY, s.volRGTex);
     glUniform1f(glGetUniformLocation(prog, "uDepth"), (float)kVolZ);
+  }
+  else if (special == 4)
+  {
+    glBindTexture(GL_TEXTURE_2D_ARRAY, s.volOTex);
+    glUniform1f(glGetUniformLocation(prog, "uDepthO"), (float)kVolZ);
   }
   else
   {
@@ -526,6 +635,25 @@ fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
 // trilinear tap. Same 8 texels, same math order on GL and Metal.
 fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
                       texture2d_array<float, access::sample> volArr [[texture(1)]],
+                      sampler smp [[sampler(0)]],
+                      constant Params& p [[buffer(0)]],
+                      FragIn in [[stage_in]]) {
+#elif MARCH_VARIANT == 18
+// V24: RG8 pair-packed slices — layer p holds R=slice 2p, G=slice 2p+1. Even
+// z0 taps once (both channels in one layer); odd z0 taps two layers. Exact
+// reconstruction of the two-tap blend with ~1.25 average taps; identical
+// math order on GL and Metal.
+fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
+                      texture2d_array<float, access::sample> volRG [[texture(1)]],
+                      sampler smp [[sampler(0)]],
+                      constant Params& p [[buffer(0)]],
+                      FragIn in [[stage_in]]) {
+#elif MARCH_VARIANT == 19
+// V25: OVERLAPPING RG8 pairs — layer k holds R=slice k, G=slice k+1 for every
+// k, so every sample is exactly ONE branchless tap (r,g = S[k], S[k+1]).
+// Exact trilinear-z reconstruction; 2x memory; identical math on GL/Metal.
+fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
+                      texture2d_array<float, access::sample> volO [[texture(1)]],
                       sampler smp [[sampler(0)]],
                       constant Params& p [[buffer(0)]],
                       FragIn in [[stage_in]]) {
@@ -1277,6 +1405,48 @@ fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
     done = i + 1;
     if (alpha > 0.9) break;
   }
+#elif MARCH_VARIANT == 18
+  const int rgDepth = (int)volRG.get_array_size() * 2;
+  for (int i = 0; i < steps; ++i) {
+    float3 c = base + float(i) * d;
+    float g = c.z * (float)rgDepth - 0.5;
+    int z0 = clamp((int)floor(g), 0, rgDepth - 1);
+    int z1 = min(z0 + 1, rgDepth - 1);
+    float fz = g - (float)z0;
+    float s;
+    if ((z0 & 1) == 0) {
+      float2 ss = volRG.sample(smp, c.xy, (uint)(z0 >> 1), level(0.0)).rg;
+      s = mix(ss.r, ss.g, fz);
+    } else if (z1 == z0) {
+      s = volRG.sample(smp, c.xy, (uint)(z0 >> 1), level(0.0)).g;
+    } else {
+      float sa = volRG.sample(smp, c.xy, (uint)(z0 >> 1), level(0.0)).g;
+      float sb = volRG.sample(smp, c.xy, (uint)(z1 >> 1), level(0.0)).r;
+      s = mix(sa, sb, fz);
+    }
+    float o = s * p.alphaMul;
+    float w = 1.0 - alpha;
+    acc += w * o;
+    alpha += w * o;
+    done = i + 1;
+    if (alpha > 0.9) break;
+  }
+#elif MARCH_VARIANT == 19
+  const int oDepth = (int)volO.get_array_size() + 1;
+  for (int i = 0; i < steps; ++i) {
+    float3 c = base + float(i) * d;
+    float g = c.z * (float)oDepth - 0.5;
+    int k = clamp((int)floor(g), 0, oDepth - 2);
+    float fz = clamp(g - (float)k, 0.0, 1.0);
+    float2 ss = volO.sample(smp, c.xy, (uint)k, level(0.0)).rg;
+    float s = mix(ss.r, ss.g, fz);
+    float o = s * p.alphaMul;
+    float w = 1.0 - alpha;
+    acc += w * o;
+    alpha += w * o;
+    done = i + 1;
+    if (alpha > 0.9) break;
+  }
 #elif MARCH_VARIANT == 15
   // V20: binned steady-state pass — same bucket discard + cap as V17 but with
   // NO history write. In a static scene the done histogram never changes, so
@@ -1522,6 +1692,8 @@ struct MetalState
   id<MTLSamplerState> smp = nil;
   id<MTLTexture> volTex = nil, colorTex = nil, histTex[3] = {nil, nil, nil};
   id<MTLTexture> volArrTex = nil; // V23: same volume as texture2D_array
+  id<MTLTexture> volRGTex = nil;  // V24: RG8 pair-packed slices
+  id<MTLTexture> volOTex = nil;   // V25: overlapping RG8 pairs
   id<MTLBuffer> vbufFc[2] = {nil, nil}; // V21 sorted-tile quads, per mode
   int nVertsFc[2] = {0, 0};
   id<MTLComputePipelineState> cpsSorted = nil; // V22 sorted-index compute march
@@ -1542,7 +1714,7 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol, int kMax)
 
   // One library per variant: MARCH_VARIANT is baked in as a preprocessor macro
   // so each PSO gets the exact code shape we want to measure.
-  const int nVariants = 18;
+  const int nVariants = 20;
   for (int v = 0; v < nVariants; ++v)
   {
     NSError* err = nil;
@@ -1702,6 +1874,30 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol, int kMax)
   ad.storageMode = MTLStorageModePrivate;
   ad.allowGPUOptimizedContents = kOptContents;
   s.volArrTex = [s.dev newTextureWithDescriptor:ad];
+  // V24: RG8 pair-packed slices.
+  MTLTextureDescriptor* rd = [[MTLTextureDescriptor alloc] init];
+  rd.textureType = MTLTextureType2DArray;
+  rd.pixelFormat = MTLPixelFormatRG8Unorm;
+  rd.width = kVolX;
+  rd.height = kVolY;
+  rd.arrayLength = (kVolZ + 1) / 2;
+  rd.mipmapLevelCount = 1;
+  rd.usage = MTLTextureUsageShaderRead;
+  rd.storageMode = MTLStorageModePrivate;
+  rd.allowGPUOptimizedContents = kOptContents;
+  s.volRGTex = [s.dev newTextureWithDescriptor:rd];
+  // V25: overlapping pairs — layer k = (R=slice k, G=slice k+1).
+  MTLTextureDescriptor* od = [[MTLTextureDescriptor alloc] init];
+  od.textureType = MTLTextureType2DArray;
+  od.pixelFormat = MTLPixelFormatRG8Unorm;
+  od.width = kVolX;
+  od.height = kVolY;
+  od.arrayLength = kVolZ - 1;
+  od.mipmapLevelCount = 1;
+  od.usage = MTLTextureUsageShaderRead;
+  od.storageMode = MTLStorageModePrivate;
+  od.allowGPUOptimizedContents = kOptContents;
+  s.volOTex = [s.dev newTextureWithDescriptor:od];
   MTLTextureDescriptor* rt =
     [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
       width:kRT height:kRT mipmapped:NO];
@@ -1744,6 +1940,59 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol, int kMax)
       sourceSize:MTLSizeMake(kVolX, kVolY, 1)
       toTexture:s.volArrTex destinationSlice:z destinationLevel:0
       destinationOrigin:MTLOriginMake(0, 0, 0)];
+  }
+  // V24 RG8: interleave slice pairs into a staging buffer, blit per layer.
+  {
+    const size_t wh = (size_t)kVolX * kVolY;
+    const int L = (kVolZ + 1) / 2;
+    std::vector<uint8_t> rg(wh * (size_t)L * 2);
+    for (int p = 0; p < L; ++p)
+    {
+      for (size_t i = 0; i < wh; ++i)
+      {
+        rg[((size_t)p * wh + i) * 2 + 0] = vol[(size_t)(2 * p) * wh + i];
+        rg[((size_t)p * wh + i) * 2 + 1] =
+          (2 * p + 1 < kVolZ) ? vol[(size_t)(2 * p + 1) * wh + i] : 0;
+      }
+    }
+    id<MTLBuffer> upRG = [s.dev newBufferWithBytes:rg.data()
+      length:rg.size() options:MTLResourceStorageModeShared];
+    for (int p = 0; p < L; ++p)
+    {
+      [blit copyFromBuffer:upRG
+        sourceOffset:(NSUInteger)p * wh * 2
+        sourceBytesPerRow:(NSUInteger)kVolX * 2
+        sourceBytesPerImage:(NSUInteger)kVolX * kVolY * 2
+        sourceSize:MTLSizeMake(kVolX, kVolY, 1)
+        toTexture:s.volRGTex destinationSlice:p destinationLevel:0
+        destinationOrigin:MTLOriginMake(0, 0, 0)];
+    }
+  }
+  // V25 overlapping pairs upload.
+  {
+    const size_t wh = (size_t)kVolX * kVolY;
+    const int L = kVolZ - 1;
+    std::vector<uint8_t> o(wh * (size_t)L * 2);
+    for (int k = 0; k < L; ++k)
+    {
+      for (size_t i = 0; i < wh; ++i)
+      {
+        o[((size_t)k * wh + i) * 2 + 0] = vol[(size_t)k * wh + i];
+        o[((size_t)k * wh + i) * 2 + 1] = vol[(size_t)(k + 1) * wh + i];
+      }
+    }
+    id<MTLBuffer> upO = [s.dev newBufferWithBytes:o.data()
+      length:o.size() options:MTLResourceStorageModeShared];
+    for (int k = 0; k < L; ++k)
+    {
+      [blit copyFromBuffer:upO
+        sourceOffset:(NSUInteger)k * wh * 2
+        sourceBytesPerRow:(NSUInteger)kVolX * 2
+        sourceBytesPerImage:(NSUInteger)kVolX * kVolY * 2
+        sourceSize:MTLSizeMake(kVolX, kVolY, 1)
+        toTexture:s.volOTex destinationSlice:k destinationLevel:0
+        destinationOrigin:MTLOriginMake(0, 0, 0)];
+    }
   }
   [blit endEncoding];
   [cb commit];
@@ -2029,6 +2278,114 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
       [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
       [enc setFragmentTexture:s.volTex atIndex:0];
       [enc setFragmentTexture:s.volArrTex atIndex:1];
+      [enc setFragmentSamplerState:s.smp atIndex:0];
+      [enc setFragmentBytes:&params length:sizeof(params) atIndex:0];
+      [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      total += cb.GPUEndTime - cb.GPUStartTime;
+    }
+    return total / kFrames * 1000.0;
+  }
+  if (variant == 24)
+  {
+    // V24: fullscreen pass over RG8 pair-packed slices (~1.25 taps/sample).
+    MTLRenderPassDescriptor* rpd24 = [[MTLRenderPassDescriptor alloc] init];
+    rpd24.colorAttachments[0].texture = s.colorTex;
+    rpd24.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rpd24.colorAttachments[0].storeAction = MTLStoreActionStore;
+    auto run24 = [&]() {
+      id<MTLCommandBuffer> cb = [s.q commandBuffer];
+      id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd24];
+      [enc setRenderPipelineState:s.ps[18]];
+      [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
+      [enc setFragmentTexture:s.volTex atIndex:0];
+      [enc setFragmentTexture:s.volRGTex atIndex:1];
+      [enc setFragmentSamplerState:s.smp atIndex:0];
+      [enc setFragmentBytes:&params length:sizeof(params) atIndex:0];
+      [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+    };
+    for (int i = 0; i < kWarmup; ++i)
+    {
+      run24();
+    }
+    if (kHarness == 1)
+    {
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < kFrames; ++i)
+      {
+        run24();
+      }
+      const auto t1 = std::chrono::steady_clock::now();
+      return std::chrono::duration<double, std::milli>(t1 - t0).count() / kFrames;
+    }
+    double total = 0;
+    for (int i = 0; i < kFrames; ++i)
+    {
+      id<MTLCommandBuffer> cb = [s.q commandBuffer];
+      id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd24];
+      [enc setRenderPipelineState:s.ps[18]];
+      [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
+      [enc setFragmentTexture:s.volTex atIndex:0];
+      [enc setFragmentTexture:s.volRGTex atIndex:1];
+      [enc setFragmentSamplerState:s.smp atIndex:0];
+      [enc setFragmentBytes:&params length:sizeof(params) atIndex:0];
+      [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      total += cb.GPUEndTime - cb.GPUStartTime;
+    }
+    return total / kFrames * 1000.0;
+  }
+  if (variant == 25)
+  {
+    // V25: fullscreen pass over overlapping RG8 pairs — one tap per sample.
+    MTLRenderPassDescriptor* rpd25 = [[MTLRenderPassDescriptor alloc] init];
+    rpd25.colorAttachments[0].texture = s.colorTex;
+    rpd25.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rpd25.colorAttachments[0].storeAction = MTLStoreActionStore;
+    auto run25 = [&]() {
+      id<MTLCommandBuffer> cb = [s.q commandBuffer];
+      id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd25];
+      [enc setRenderPipelineState:s.ps[19]];
+      [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
+      [enc setFragmentTexture:s.volTex atIndex:0];
+      [enc setFragmentTexture:s.volOTex atIndex:1];
+      [enc setFragmentSamplerState:s.smp atIndex:0];
+      [enc setFragmentBytes:&params length:sizeof(params) atIndex:0];
+      [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+    };
+    for (int i = 0; i < kWarmup; ++i)
+    {
+      run25();
+    }
+    if (kHarness == 1)
+    {
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < kFrames; ++i)
+      {
+        run25();
+      }
+      const auto t1 = std::chrono::steady_clock::now();
+      return std::chrono::duration<double, std::milli>(t1 - t0).count() / kFrames;
+    }
+    double total = 0;
+    for (int i = 0; i < kFrames; ++i)
+    {
+      id<MTLCommandBuffer> cb = [s.q commandBuffer];
+      id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd25];
+      [enc setRenderPipelineState:s.ps[19]];
+      [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
+      [enc setFragmentTexture:s.volTex atIndex:0];
+      [enc setFragmentTexture:s.volOTex atIndex:1];
       [enc setFragmentSamplerState:s.smp atIndex:0];
       [enc setFragmentBytes:&params length:sizeof(params) atIndex:0];
       [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -2498,7 +2855,7 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
   auto run = [&]() {
     id<MTLCommandBuffer> cb = [s.q commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
-    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : (variant == 21) ? 16 : (variant == 23) ? 17 : variant]];
+    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : (variant == 21) ? 16 : (variant == 23) ? 17 : (variant == 24) ? 18 : (variant == 25) ? 19 : variant]];
     [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
     [enc setFragmentTexture:s.volTex atIndex:0];
     [enc setFragmentSamplerState:s.smp atIndex:0];
@@ -2534,7 +2891,7 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
   {
     id<MTLCommandBuffer> cb = [s.q commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
-    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : (variant == 21) ? 16 : (variant == 23) ? 17 : variant]];
+    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : (variant == 21) ? 16 : (variant == 23) ? 17 : (variant == 24) ? 18 : (variant == 25) ? 19 : variant]];
     [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
     [enc setFragmentTexture:s.volTex atIndex:0];
     [enc setFragmentSamplerState:s.smp atIndex:0];
@@ -2655,6 +3012,8 @@ int main(int argc, char** argv)
   }
   uploadGLVolume(gl, volEff);
   setupGLVolumeArray(gl, volEff);
+  setupGLVolumeRG(gl, volEff);
+  setupGLVolumeO(gl, volEff);
   MetalState m;
   if (!setupMetal(m, volEff, kMaxConstant))
   {
@@ -2692,8 +3051,10 @@ int main(int argc, char** argv)
     "V21 sorted-tiles ",
     "V22 comp-sorted  ",
     "V23 arr-2dtap    ",
+    "V24 rg8-pairtap  ",
+    "V25 rg8-overlap  ",
   };
-  for (int v = 0; v < 24; ++v)
+  for (int v = 0; v < 26; ++v)
   {
     const int useLod = (v >= 1) ? 1 : 0; // GL: implicit until V1, explicit after
     // Interleave the two modes within each backend to cancel drift, and the two
@@ -2705,11 +3066,11 @@ int main(int argc, char** argv)
     const int rounds = 3;
     for (int r = 0; r < rounds; ++r)
     {
-      glDiv += timeGL(gl, 0, fixedSteps, useLod, (v == 21) ? 1 : (v == 23) ? 2 : 0);
+      glDiv += timeGL(gl, 0, fixedSteps, useLod, (v == 21) ? 1 : (v == 23) ? 2 : (v == 24) ? 3 : (v == 25) ? 4 : 0);
       if (r == 0) readbackGL(gl, &glDivCov, &glDivMean);
       mDiv += timeMetal(m, 0, fixedSteps, v);
       if (r == 0) readbackMetal(m, &mDivCov, &mDivMean);
-      glFix += timeGL(gl, 1, fixedSteps, useLod, (v == 21) ? 1 : (v == 23) ? 2 : 0);
+      glFix += timeGL(gl, 1, fixedSteps, useLod, (v == 21) ? 1 : (v == 23) ? 2 : (v == 24) ? 3 : (v == 25) ? 4 : 0);
       if (r == 0) readbackGL(gl, &glFixCov, &glFixMean);
       mFix += timeMetal(m, 1, fixedSteps, v);
       if (r == 0) readbackMetal(m, &mFixCov, &mFixMean);

@@ -225,6 +225,46 @@ efficiency difference that no legal MSL rewrite has moved. GL samples its
 own internally-tiled storage; Metal with allowGPUOptimizedContents=NO
 marches an uncompressed private layout.
 
+## V24: RG8 pair-packed slices — Metal BEATS GL, both faster than their own 3D
+
+The winning representation. Layer p of an RG8 `texture2D_array` stores
+R=slice 2p, G=slice 2p+1. A sample reads ONE tap when its z0 is even (both
+channels live in the same layer) and two taps when odd — lanes share
+z-progress so the branch is warp-coherent (~1.25 taps average). Exact
+reconstruction of the trilinear-z blend; identical math compiled for GL
+(`USE_RG8`) and Metal (MARCH_VARIANT 18); same bytes of storage.
+
+```
+                    divergent GL  Metal  M/GL   |  fixed GL  Metal  M/GL
+V0  3D trilinear      28.45  29.56  1.04  |   5.59   5.67  1.02   (2048/SD4)
+V24 rg8-pairtap       26.21  25.05  0.96  |   7.95   6.79  0.85   (2048/SD4)
+V24 rg8-pairtap       25.86  24.68  0.95  |   7.95   6.79  0.85   (2048/SD4, rerun)
+V0  3D trilinear      63.55  73.20  1.15  |  23.61  22.73  0.96   (2048/SD0.5)
+V24 rg8-pairtap       87.48  70.85  0.81  |  57.02  38.63  0.68   (2048/SD0.5)
+V0  3D trilinear      18.13  19.41  1.07  |   4.07   4.66  1.14   (1024/SD4)
+V24 rg8-pairtap       16.46  17.08  1.04  |   4.07   4.11  1.01   (1024/SD4)
+```
+
+This is an ABSOLUTE win, not a converge-by-slowing-GL trick: Metal-RG8
+(24.5-25.1 ms) beats GL's BEST representation (3D, 28.45 ms) by ~12%, and
+beats Metal's own 3D path by 15%. GL also gets faster with RG8 than its
+own 3D path at fine SD (87.5 -> 70.9 vs Metal's 70.9 — tie) and both
+backends beat their 3D numbers at 1024. Parity is exact in every cell
+(cov/mean match the 3D signature).
+
+Remaining >1: 1024/SD4 divergent only — 1.04 fresh-session, drifting to
+~1.15 under sustained load while GL drifts FASTER (the two backends'
+clocks respond oppositely to sustained load on this battery MacBook).
+Every representation measured shows this small-frame regime effect;
+sub-10% ratios here are session-sensitive (see the fixed-mode section).
+
+Falsified on the way: V25 overlapping pairs (layer k = R=slice k,
+G=slice k+1 — single branchless tap per sample, exact) removes the second
+tap entirely but doubles storage to 940 MB; the footprint cost exceeds the
+tap saving for BOTH backends (2048 div: GL 39.9 / Metal 39.2 — slower than
+V24's 26.2/24.5 despite ratio 0.98). V24's coherent 1.25-tap structure
+dominates it absolutely.
+
 ## V23: 2D-array two-tap march — parity with GL, same image
 
 Replacing the single 3D trilinear tap with TWO explicit bilinear taps into
