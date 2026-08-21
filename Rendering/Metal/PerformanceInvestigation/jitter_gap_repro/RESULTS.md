@@ -137,3 +137,26 @@ NOISE_TEX=1 /tmp/jitter_gap_repro 2048 4 10 dicom.u8  # texture2d noise tap
 PROBE_RAST=1 MTL_DUMP_PPM=1 /tmp/jitter_gap_repro 2048 4 1 dicom.u8
 TRI_SEL=8 T_PER_TRI=1 PROBE_RAST=1 MTL_DUMP_PPM=1 /tmp/jitter_gap_repro 2048 4 1 dicom.u8
 ```
+
+
+## V31 port: back-edge exit (`DOEXIT=1`, 2026-08-21)
+
+Ported the divergent_tail V31 fix (all exit conditions moved into the loop
+BACK-EDGE — one branch per iteration instead of two around the fetch) to
+both the GL and Metal marches via `DOEXIT=1`. Entry is guarded on
+`maxSteps > 0` (an unguarded do-while composited one bogus sample on
+~33 corner-grazer rays — caught by the GL footprint counter before it
+could poison timings). Guarded footprints match the baseline exactly
+(795455 / 796419), i.e. bit-identical traversal.
+
+Result on the fair recipe (rt 2048, sd 4, real DICOM): NEUTRAL.
+
+| | GL j0/j1 | Metal j0/j1 | M/GL |
+|---|---|---|---|
+| baseline | 51.4 / 91.7 | 42.9 / 66.7 | 0.84 / 0.73 |
+| DOEXIT=1 | 50.5 / 92.5 | 40.8 / 67.5 | 0.81 / 0.73 |
+
+The divergent_tail codegen deficit does not transfer to this march: the
+interleaved TF-LUT taps change the instruction mix, and this repro's Metal
+was already well ahead of GL (0.73-0.84). Knob kept for future A/B;
+default output is unchanged.

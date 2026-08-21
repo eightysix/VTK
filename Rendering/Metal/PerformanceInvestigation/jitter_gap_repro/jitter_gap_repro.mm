@@ -34,6 +34,7 @@
 #import <simd/simd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 
 static const int kVolW = 512, kVolH = 512, kVolD = 1794;  // the app's DICOM volume
 // App DICOMVolume camera dump (normalized volume space / physical mm):
@@ -248,7 +249,25 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
   // LOOP_SHAPE knob (WHILE=1, H4 A/B): the app's while loop with accumulated
   // evalPoint/currentT (loop-carried dependent chain) and a 6-way box-exit
   // test on the eval lattice — compiler/occupancy shape, not algorithm.
-  const char* loopShape = getenv("WHILE")
+  // DOEXIT knob (V31 port): all exit conditions moved into the loop
+  // BACK-EDGE (do-while) — one branch per iteration instead of two around
+  // the fetch. Bit-exact per-iteration values; the shape that closed the
+  // MSL codegen deficit in divergent_tail.
+  const char* loopShape = getenv("DOEXIT")
+    ? "  int i = 0;\n"
+      "  if (i < min(uMaxIter, maxSteps)) {\n"
+      "  do {\n"
+      "    float currentT = tStart + float(i) * stepSize;\n"
+      "    vec3 evalPoint = evalBase + float(i) * evalStep;\n"
+      "    float s = VOL_FETCH;\n"
+      "    %s"
+      "    iterCount = i + 1;\n"
+      "    ++i;\n"
+      "  } while (i < min(uMaxIter, maxSteps)\n"
+      "        && tStart + float(i) * stepSize < tExit - 1e-6\n"
+      "        && accOp <= 0.996);\n"
+      "  }\n"
+    : getenv("WHILE")
     ? "  float currentT = tStart;\n"
       "  vec3 evalPoint = evalBase;\n"
       "  int i = 0;\n"
@@ -636,8 +655,45 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
     "  if (u.debugIter > 0) return float4(float(iterCount) / 256.0f, 0.0f, 0.0f, 1.0f);\n"
     "  return float4(accColor, accOp);\n"
     "}\n";
+  // DOEXIT knob (V31 port): back-edge exit for the Metal march too.
+  std::string msl2s = msl2;
+  if (getenv("DOEXIT")) {
+    const char* oldLoop =
+      "  for (int i = 0; i < min(u.maxIter, maxSteps); i++) {\n"
+      "    float currentT = tStart + float(i) * stepSize;\n"
+      "    if (currentT >= tExit - 1e-6f) break;\n"
+      "    float3 evalPoint = evalBase + float(i) * evalStep;\n"
+      "    float s = volTex.sample(volSampler, evalPoint).r;\n"
+      "    float4 tfv = tfTex.sample(tfSampler, float2(s, 0.5f));\n"
+      "    float w = 1.0f - accOp;\n"
+      "    accColor += w * (tfv.rgb * tfv.a);\n"
+      "    accOp += w * tfv.a;\n"
+      "    iterCount = i + 1;\n"
+      "    if (accOp > 0.996f) break;\n"
+      "  }\n";
+    const char* newLoop =
+      "  int i = 0;\n"
+      "  if (i < min(u.maxIter, maxSteps)) {\n"
+      "  do {\n"
+      "    float currentT = tStart + float(i) * stepSize;\n"
+      "    float3 evalPoint = evalBase + float(i) * evalStep;\n"
+      "    float s = volTex.sample(volSampler, evalPoint).r;\n"
+      "    float4 tfv = tfTex.sample(tfSampler, float2(s, 0.5f));\n"
+      "    float w = 1.0f - accOp;\n"
+      "    accColor += w * (tfv.rgb * tfv.a);\n"
+      "    accOp += w * tfv.a;\n"
+      "    iterCount = i + 1;\n"
+      "    ++i;\n"
+      "  } while (i < min(u.maxIter, maxSteps)\n"
+      "        && tStart + float(i) * stepSize < tExit - 1e-6f\n"
+      "        && accOp <= 0.996f);\n"
+      "  }\n";
+    size_t pos = msl2s.find(oldLoop);
+    if (pos == std::string::npos) { fprintf(stderr, "DOEXIT: Metal loop pattern not found\n"); exit(1); }
+    msl2s.replace(pos, strlen(oldLoop), newLoop);
+  }
   NSError* err = nil;
-  id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithFormat:@"%s%s", msl, msl2] options:nil error:&err];
+  id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithFormat:@"%s%s", msl, msl2s.c_str()] options:nil error:&err];
   if (!lib) { fprintf(stderr, "MSL compile failed: %s\n", err.description.UTF8String); exit(1); }
   id<MTLFunction> vf = [lib newFunctionWithName:@"vertex_main"];
   id<MTLFunction> ff = [lib newFunctionWithName:@"fragment_main"];
