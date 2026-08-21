@@ -378,6 +378,7 @@ over-spending. Corrected end-to-end small-frame numbers:
 
 | RT | best divergent | best fixed |
 |----|----------------|------------|
+| 256 | **1.01** (V31, wall-clock) | **1.00** (V31, wall-clock) |
 | 512 | **0.99** (V23) | **1.01** (V31/V33) |
 | 768 | **0.96** (V33) | **1.02** (V31) |
 | 1024 | 1.01-1.02 (V23/V31) | **1.00** (V24/V32) |
@@ -387,6 +388,12 @@ Every cell at every resolution is now at or within noise of parity, with
 Metal decisively faster at the app's operating point and at fine SD.
 The two real fixes: back-edge exit codegen (V31) and RG8 pair-packed
 representation (V24/V32).
+
+Note on 256: V32's RG8 advantage INVERTS there (div 1.05-1.10) — the
+odd/even branch overhead outweighs tap savings on 1-4 ms frames; plain
+3D + do-while (V31) is the correct pick at tiny sizes (wall-clock
+1.01/1.00). Adaptive rule: 3D+do-while below ~512, two-tap or RG8+do-
+while above, RG8 mandatory at 2048-class resolutions.
 
 ## Root cause history (superseded conclusions kept for the record)
 
