@@ -31,6 +31,7 @@ static int kRT = 1024;
 static int kFrames = 15;
 static float kStep = 0.0005f; // SD 0.5 — the pathological regime
 static int kWarmup = 10;
+static int useKnobs = 1;             // argv[4]: 1 = 3.2+fastMath (main-harness options)
 static const int kVolX = 512, kVolY = 512, kVolZ = 1794;
 
 static std::vector<uint8_t> makeVolume()
@@ -300,8 +301,10 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol)
   {
     MTLCompileOptions* copts = [[MTLCompileOptions alloc] init];
     copts.preprocessorMacros = @{ @"L1FETCH" : (v == 1 ? @"1" : @"0") };
-    copts.languageVersion = MTLLanguageVersion3_2;
-    copts.mathMode = MTLMathModeFast;
+    if (useKnobs) {
+      copts.languageVersion = MTLLanguageVersion3_2;
+      copts.mathMode = MTLMathModeFast;
+    }
     id<MTLLibrary> lib = [s.dev newLibraryWithSource:kMetalSrc options:copts error:&err];
     if (!lib) return false;
     id<MTLFunction> fs = [lib newFunctionWithName:@"march"];
@@ -407,12 +410,13 @@ int main(int argc, char** argv)
   if (argc > 1) kRT = std::atoi(argv[1]);
   if (argc > 2) kFrames = std::atoi(argv[2]);
   if (argc > 3) kStep = std::atof(argv[3]);
+  if (argc > 4) useKnobs = std::atoi(argv[4]); // 0 = default MSL compile options
   const std::vector<uint8_t> vol = makeVolume();
   GLState gl;
   if (!setupGL(gl, vol)) { std::fprintf(stderr, "GL setup failed\n"); return 1; }
   MetalState m;
   if (!setupMetal(m, vol)) { std::fprintf(stderr, "Metal setup failed\n"); return 1; }
-  std::printf("rt=%d frames=%d step=%.5f\n", kRT, kFrames, kStep);
+  std::printf("rt=%d frames=%d step=%.5f knobs=%d\n", kRT, kFrames, kStep, useKnobs);
   std::printf("%-22s %10s %11s %7s\n", "pair", "GL ms/f", "Metal ms/f", "M/GL");
   // Interleaved rounds cancel machine drift (same protocol as the main harness).
   double gMarch = 0, mMarch = 0,gL1 = 0, mL1 = 0;

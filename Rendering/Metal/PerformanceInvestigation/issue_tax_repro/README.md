@@ -47,7 +47,19 @@ march31 (residual)          40.72       40.99    1.01   parity 477960/229.4 vs 4
 l1fetch (issue tax)          8.51        8.83    1.04
 ```
 
-Parity is exact (cov/mean match across backends). Note: compile options
-matter for reproduction — the main harness uses
-`MTLLanguageVersion3_2 + MTLMathModeFast`; defaults measure the same
-within noise but single-shot runs can drift ±3% between sessions.
+Parity is exact (cov/mean match across backends).
+
+## Repeatability
+
+argv[4] toggles the main harness's compile options
+(`MTLLanguageVersion3_2 + MTLMathModeFast`) to A/B them. Three
+interleaved-round repetitions per setting:
+
+| setting | march31 M/GL | l1fetch M/GL |
+|---------|--------------|--------------|
+| knobs off | 1.00 / 1.00 / 0.98 | 1.04 / 1.03 / 1.04 |
+| knobs on  | 0.99 / 1.02 / 1.00 | 1.03 / 1.03 / 1.04 |
+
+Compile options have no measurable effect. An earlier single-shot run
+that read 0.96 did not reproduce (fluke). The l1fetch issue tax is the
+stable signal: +3-4% in every run regardless of settings.
