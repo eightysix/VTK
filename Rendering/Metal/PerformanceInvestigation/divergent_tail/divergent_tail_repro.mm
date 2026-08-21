@@ -2405,8 +2405,6 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol, int kMax)
     NSError* err = nil;
     MTLCompileOptions* copts = [[MTLCompileOptions alloc] init];
     copts.preprocessorMacros = @{ @"MARCH_VARIANT" : @(v) };
-    copts.languageVersion = MTLLanguageVersion3_2;
-    copts.mathMode = MTLMathModeFast;
     id<MTLLibrary> lib = [s.dev newLibraryWithSource:kMetalSrc options:copts error:&err];
     if (!lib)
     {

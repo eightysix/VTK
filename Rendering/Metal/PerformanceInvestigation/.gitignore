@@ -1,5 +1,8 @@
+/appgl_parity
+/issue_tax_repro
+/jitter_gap_repro/jitter_gap_repro
+/jitter_gap_repro/appgl_parity
+/divergent_tail/divergent_tail
+/minimal_gap/minimal_gap
+/lag_repro/lag_repro
 *.o
-issue_tax_repro
-jitter_gap_repro
-appgl_parity
-divergent_tail
