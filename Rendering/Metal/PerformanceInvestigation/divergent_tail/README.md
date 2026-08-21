@@ -395,6 +395,26 @@ odd/even branch overhead outweighs tap savings on 1-4 ms frames; plain
 1.01/1.00). Adaptive rule: 3D+do-while below ~512, two-tap or RG8+do-
 while above, RG8 mandatory at 2048-class resolutions.
 
+## Microoptimization chase: software pipelining falsified (V35/V36)
+
+Following the codegen lead, the last structural idea: software-pipeline
+the fetch — issue sample i+1's tap BEFORE compositing sample i, keeping
+one fetch in flight across the back-edge (+1 discarded tail tap per ray).
+Implemented on both paths:
+
+| | GL | Metal | M/GL |
+|---|---|---|---|
+| V31 do-while 3D (reference) | 27.30 | 27.41 | 1.00 |
+| V35 pipelined 3D | 31.39 | 30.18 | 0.96 — slower than V31 |
+| V36 pipelined RG8 | 27.33 | 24.97 | 0.91 — ties V32, fixed worse |
+
+Falsified: the extra tap costs more bandwidth than the overlap saves —
+consistent with the ablation finding that fetch rate is already at parity
+(the march is bandwidth-bound, not latency-bound, at 2048). The do-while
+back-edge was the single large codegen win; warp-coherent handling of the
+RG8 odd/even branch is already automatic (branches are warp-synchronous),
+leaving no known source-level lever remaining.
+
 ## Root cause history (superseded conclusions kept for the record)
 
 V30 (lockstep march: frame-uniform 288-iteration bound, dead lanes refetch
