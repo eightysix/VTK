@@ -520,15 +520,15 @@ Fixed M/GL:
 | 1024 | 1.14 | 1.08 | **1.00** |
 | 2048 | 1.02 | 0.94 | **0.85** |
 
-The RG8 coherent single-tap wins where frames are long enough to saturate
-throughput (>=1024); the plain two-tap array wins at ~512 where the branch
-overhead weighs more; both tie with 3D at 256 where 1-4 ms frames sit in
-the small-frame scheduling regime that no representation has moved (fixed
-mode at <=768 loses ~11-17% in EVERY variant ever measured — a per-draw
-tax, not a march property). Practical rule for the app: pick the
-representation by canvas size — two-tap array below ~1024, RG8 pair-tap
-at or above it (runtime switch = different texture binding + PSO; both
-are image-exact and parity-safe).
+RECOMMENDATION (revised): ship ONE configuration — plain 3D + do-while
+exit (V31) — everywhere. Under fair wall-clock timing its full matrix
+(256 -> 8192, SD4 and SD0.5) spans 0.93-1.04 with a single reproducible
++2-3% cell (1024xSD0.5 divergent, the sampler issue-tax residual). The
+RG8 pair-packed variant wins big at >=1024 (0.91/0.83 at 2048) but
+REGRESSES at SD4 small frames (1.11-1.19 at 256-512 wall-clock: the
+odd/even branch overhead outweighs tap savings there), so it should be a
+compile-time choice for high-resolution-only targets, not a runtime or
+universal default.
 
 ## V23: 2D-array two-tap march — parity with GL, same image
 
