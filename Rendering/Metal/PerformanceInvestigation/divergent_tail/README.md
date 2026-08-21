@@ -440,17 +440,29 @@ issue contention) and V38 incremental positioning (neutral; ALU free).
 The residual is diffuse 2-3% at the measurement floor with no isolable
 mechanism after ~40 variants.
 
-Final ablation round at the pathological cells (1024xSD0.5): splitting the
-march into ALU-only (V40) and L1-resident-fetch (V41) loops exposed a
-methodological limit — GL compiles these ARTIFICIAL shapes catastrophically
-badly (hash loop 41.3 ms vs Metal 4.2; single-texel refetch loop 39.9 vs
-8.7) while handling the natural streaming march at parity. Synthetic-shape
-ablation therefore injects 10x compiler noise into a 3% signal and cannot
-bisect further. The reproducible residuals (768xSD0.5 fix ~+3%,
-1024xSD0.5 div ~+2-3%) stand as measured on natural shaders; with exit
-divergence, floor, batching, pipelining, positioning, and representation
-all exonerated or exhausted, they mark the resolution limit of source-level
-A/B on this driver pair.
+CORRECTED ablation round at the pathological cells (1024xSD0.5). NOTE: an
+earlier version of this section reported "GL compiles artificial shapes
+4-10x badly" — that data was INVALID because the GL twins for V40/V41 had
+never been wired (GL silently ran the full standard march). With proper
+twins:
+
+| ablation @1024xSD0.5 | GL | Metal | M/GL |
+|---|---|---|---|
+| V40 ALU-only loop (no fetch) | 4.99 | 4.21 | **0.84** |
+| V41 L1-resident fetches, uniform trips | 8.57 | 8.84 | **1.03** |
+| V28 streaming fetches, uniform trips | ~46-49 | ~47 | ~1.00 |
+| V31 full march | 40.52 | 42.24 | 1.02-1.03 |
+
+Corrected verdict: Metal's ALU codegen is FINE (faster than GL); the
+residual deficit is a ~3% PER-TAP SAMPLER ISSUE TAX, visible even when
+every tap hits one L1-resident texel, and partially hidden under DRAM
+latency in the full march. This independently re-validates RG8 pair-
+packing (halving tap count halves the issue tax). V25 overlapping pairs
+(single tap, exact) were retested at these cells hoping the footprint
+penalty would shrink: ratio reaches 1.00 but absolute times stay well
+above V31 for both backends — no win. The residual is the sampler issue
+path itself; with taps already minimized on the shipped representations,
+it marks the honest floor of source-level optimization.
 
 Falsified: the extra tap costs more bandwidth than the overlap saves —
 consistent with the ablation finding that fetch rate is already at parity

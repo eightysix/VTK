@@ -243,6 +243,72 @@ float fetchArr(vec3 c) {
 #define FETCH(coord) texture(volumeTex, (coord)).r
 #endif
 void main() {
+#ifdef USE_ALULONG
+  // V40 GL twin: full composite chain over ALU-hash data, NO fetch, uniform
+  // trip counts (see MARCH_VARIANT 33).
+  vec2 ndcAL = vUV * 2.0 - 1.0;
+  vec3 eyeAL = vec3(0.5, 0.5, -0.35);
+  vec3 dirAL = normalize(vec3(ndcAL * 2.5, 1.0));
+  float caAL = cos(0.35), saAL = sin(0.35);
+  dirAL = vec3(caAL * dirAL.x + saAL * dirAL.z, dirAL.y, -saAL * dirAL.x + caAL * dirAL.z);
+  if (uTranspose != 0) {
+    eyeAL = (uTranspose == 1) ? eyeAL.xzy : eyeAL.zyx;
+    dirAL = (uTranspose == 1) ? dirAL.xzy : dirAL.zyx;
+  }
+  vec3 invAL = 1.0 / dirAL;
+  vec3 t0AL = (vec3(0.0) - eyeAL) * invAL;
+  vec3 t1AL = (vec3(1.0) - eyeAL) * invAL;
+  float tEAL = max(max(min(t0AL.x, t1AL.x), min(t0AL.y, t1AL.y)), min(t0AL.z, t1AL.z));
+  float tXAL = min(min(max(t0AL.x, t1AL.x), max(t0AL.y, t1AL.y)), max(t0AL.z, t1AL.z));
+  if (tXAL <= 0.0 || tEAL >= tXAL) { outColor = vec4(0.0); return; }
+  int gsAL = max(1, int(ceil((tXAL - tEAL) / uStep)));
+  int stAL = (uMode == 1) ? min(gsAL, uFixedSteps) : gsAL;
+  vec3 baseAL = eyeAL + dirAL * (tEAL + 0.5 * uStep);
+  vec3 dAL = dirAL * uStep;
+  float accAL = 0.0;
+  float alphaAL = 0.0;
+  int doneAL = 0;
+  for (int iAL = 0; iAL < stAL; ++iAL) {
+    float sAL = fract((baseAL.x + float(iAL) * dAL.x) * 37.0 + baseAL.y * 17.0);
+    float oAL = sAL * uAlphaMul;
+    float wAL = 1.0 - alphaAL;
+    accAL += wAL * oAL;
+    alphaAL += wAL * oAL;
+    doneAL = iAL + 1;
+  }
+  outColor = vec4(accAL / float(stAL), float(doneAL) / 255.0, 0.0, 1.0);
+  return;
+#endif
+#ifdef USE_L1FETCH
+  // V41 GL twin: real fetches, FROZEN coordinate (same texel every iteration,
+  // see MARCH_VARIANT 34).
+  vec2 ndcL1 = vUV * 2.0 - 1.0;
+  vec3 eyeL1 = vec3(0.5, 0.5, -0.35);
+  vec3 dirL1 = normalize(vec3(ndcL1 * 2.5, 1.0));
+  float caL1 = cos(0.35), saL1 = sin(0.35);
+  dirL1 = vec3(caL1 * dirL1.x + saL1 * dirL1.z, dirL1.y, -saL1 * dirL1.x + caL1 * dirL1.z);
+  if (uTranspose != 0) {
+    eyeL1 = (uTranspose == 1) ? eyeL1.xzy : eyeL1.zyx;
+    dirL1 = (uTranspose == 1) ? dirL1.xzy : dirL1.zyx;
+  }
+  vec3 invL1 = 1.0 / dirL1;
+  vec3 t0L1 = (vec3(0.0) - eyeL1) * invL1;
+  vec3 t1L1 = (vec3(1.0) - eyeL1) * invL1;
+  float tEL1 = max(max(min(t0L1.x, t1L1.x), min(t0L1.y, t1L1.y)), min(t0L1.z, t1L1.z));
+  float tXL1 = min(min(max(t0L1.x, t1L1.x), max(t0L1.y, t1L1.y)), max(t0L1.z, t1L1.z));
+  if (tXL1 <= 0.0 || tEL1 >= tXL1) { outColor = vec4(0.0); return; }
+  int gsL1 = max(1, int(ceil((tXL1 - tEL1) / uStep)));
+  int stL1 = (uMode == 1) ? min(gsL1, uFixedSteps) : gsL1;
+  vec3 baseL1 = eyeL1 + dirL1 * (tEL1 + 0.5 * uStep);
+  float accL1 = 0.0;
+  int doneL1 = 0;
+  for (int iL1 = 0; iL1 < stL1; ++iL1) {
+    accL1 += FETCH(baseL1);
+    doneL1 = iL1 + 1;
+  }
+  outColor = vec4(accL1 / float(stL1), float(doneL1) / 255.0, 0.0, 1.0);
+  return;
+#endif
 #ifdef USE_BATCH8
   // V37 GL twin: batch-8 fetch groups + back-edge exit (see MARCH_VARIANT 31).
   vec2 ndcB8 = vUV * 2.0 - 1.0;
@@ -599,6 +665,8 @@ struct GLState
   GLuint progPipeRG = 0;                // V36 pipelined RG8 march
   GLuint progBatch8 = 0;                // V37 batch-8 + back-edge
   GLuint progIncr = 0;                  // V38 incremental position
+  GLuint progALuLong = 0;               // V40 ALU-only long-loop ablation
+  GLuint progL1Fetch = 0;               // V41 L1-fetch ablation
   GLuint progARDW = 0;                  // V33 two-tap array + do-while
   GLuint volArrTex = 0;                 // GL_TEXTURE_2D_ARRAY volume
   GLuint volRGTex = 0;                  // GL_RG8 pair-packed slices
@@ -610,7 +678,8 @@ struct GLState
 
 static bool compileGLProgram(GLState& s, GLuint* prog, bool useLod, bool useArr = false,
   bool useRG = false, bool useO = false, int ablate = 0, bool lockstep = false,
-  bool dowhile = false, bool pipe = false, bool batch8 = false, bool incr = false)
+  bool dowhile = false, bool pipe = false, bool batch8 = false, bool incr = false,
+  bool alulong = false, bool l1fetch = false)
 {
   // USE_LOD must come AFTER the #version line, so splice it in rather than
   // prepending.
@@ -628,6 +697,8 @@ static bool compileGLProgram(GLState& s, GLuint* prog, bool useLod, bool useArr 
   src += pipe ? "#define USE_PIPE 1\n" : "";
   src += batch8 ? "#define USE_BATCH8 1\n" : "";
   src += incr ? "#define USE_INCR 1\n" : "";
+  src += alulong ? "#define USE_ALULONG 1\n" : "";
+  src += l1fetch ? "#define USE_L1FETCH 1\n" : "";
   src += versionEnd + 1;
   GLuint vs = glCreateShader(GL_VERTEX_SHADER);
   glShaderSource(vs, 1, &kGLVertSrc, nullptr);
@@ -750,6 +821,14 @@ static bool setupGL(GLState& s)
   {
     return false;
   }
+  if (!compileGLProgram(s, &s.progALuLong, false, false, false, false, 0, false, false, false, false, false, true))
+  {
+    return false;
+  }
+  if (!compileGLProgram(s, &s.progL1Fetch, false, false, false, false, 0, false, false, false, false, false, false, true))
+  {
+    return false;
+  }
 
   glGenVertexArrays(1, &s.vao);
   glBindVertexArray(s.vao);
@@ -856,6 +935,8 @@ static double timeGL(GLState& s, int mode, int fixedSteps, int useLod, int speci
     (special == 14) ? s.progPipeRG :
     (special == 15) ? s.progBatch8 :
     (special == 16) ? s.progIncr :
+    (special == 17) ? s.progALuLong :
+    (special == 18) ? s.progL1Fetch :
     (useLod ? s.progLod : s.progImplicit);
   glUseProgram(prog);
   glActiveTexture(GL_TEXTURE0);
@@ -3809,11 +3890,11 @@ int main(int argc, char** argv)
     const int rounds = 3;
     for (int r = 0; r < rounds; ++r)
     {
-      glDiv += timeGL(gl, 0, fixedSteps, useLod, (v == 21) ? 1 : (v == 23) ? 2 : (v == 24) ? 3 : (v == 25) ? 4 : (v >= 26 && v <= 29) ? 5 + (v - 26) : (v == 30) ? 9 : (v == 31) ? 10 : (v == 32) ? 11 : (v == 33) ? 12 : (v == 35) ? 13 : (v == 36) ? 14 : (v == 37) ? 15 : (v == 38) ? 16 : 0);
+      glDiv += timeGL(gl, 0, fixedSteps, useLod, (v == 21) ? 1 : (v == 23) ? 2 : (v == 24) ? 3 : (v == 25) ? 4 : (v >= 26 && v <= 29) ? 5 + (v - 26) : (v == 30) ? 9 : (v == 31) ? 10 : (v == 32) ? 11 : (v == 33) ? 12 : (v == 35) ? 13 : (v == 36) ? 14 : (v == 37) ? 15 : (v == 38) ? 16 : (v == 40) ? 17 : (v == 41) ? 18 : 0);
       if (r == 0) readbackGL(gl, &glDivCov, &glDivMean);
       mDiv += timeMetal(m, 0, fixedSteps, v);
       if (r == 0) readbackMetal(m, &mDivCov, &mDivMean);
-      glFix += timeGL(gl, 1, fixedSteps, useLod, (v == 21) ? 1 : (v == 23) ? 2 : (v == 24) ? 3 : (v == 25) ? 4 : (v >= 26 && v <= 29) ? 5 + (v - 26) : (v == 30) ? 9 : (v == 31) ? 10 : (v == 32) ? 11 : (v == 33) ? 12 : (v == 35) ? 13 : (v == 36) ? 14 : (v == 37) ? 15 : (v == 38) ? 16 : 0);
+      glFix += timeGL(gl, 1, fixedSteps, useLod, (v == 21) ? 1 : (v == 23) ? 2 : (v == 24) ? 3 : (v == 25) ? 4 : (v >= 26 && v <= 29) ? 5 + (v - 26) : (v == 30) ? 9 : (v == 31) ? 10 : (v == 32) ? 11 : (v == 33) ? 12 : (v == 35) ? 13 : (v == 36) ? 14 : (v == 37) ? 15 : (v == 38) ? 16 : (v == 40) ? 17 : (v == 41) ? 18 : 0);
       if (r == 0) readbackGL(gl, &glFixCov, &glFixMean);
       mFix += timeMetal(m, 1, fixedSteps, v);
       if (r == 0) readbackMetal(m, &mFixCov, &mFixMean);
