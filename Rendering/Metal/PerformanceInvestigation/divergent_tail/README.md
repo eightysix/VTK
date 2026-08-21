@@ -210,7 +210,11 @@ shader-level lever has now been measured:
 | binned passes, MRT + static variants (V17/V20) | no effect (warp physics above) |
 | manual trilinear via read() (V18) | 2.5x WORSE — sampler path is optimal |
 | half-precision composite (V19) | no change |
-| persistent-threads compute | falsified earlier |
+| done-sorted tile quads, same order both APIs (V21) | +17% vertex/small-primitive tax, ratio unmoved — submission order does not steer warp composition |
+| compute march over done-sorted indices, warp-homogeneous by construction (V22) | 2.8x WORSE — Apple's fragment/sampler engine crushes raw compute for this workload even with perfect grouping |
+| NPOT depth 1794 vs 2048/1024 | ratio unchanged |
+| axis permutation (march along x/y/z, argv[15]) | ratio unchanged — deficit is axis-independent |
+| MSL languageVersion 3.2 + fast math | no change |
 
 Two localization facts pin the residual: (a) with an 8 MB cache-resident
 volume the DIVERGENT gap vanishes (Metal wins 0.95 at 2048, 0.79 at 1024)
@@ -219,10 +223,35 @@ structure; (b) the FIXED deficit persists cache-resident (~1.04) and grows
 as RT shrinks (1.13 at 512, 1.18 at 1024) — a small per-sample/scheduling
 efficiency difference that no legal MSL rewrite has moved. GL samples its
 own internally-tiled storage; Metal with allowGPUOptimizedContents=NO
-marches an uncompressed private layout. On this evidence the remaining
-gap is the price of that layout constraint, payable only by changing the
-data path (layout flag, algorithmic acceleration like the app's minmax)
-rather than the shader.
+marches an uncompressed private layout.
+
+## V23: 2D-array two-tap march — parity with GL, same image
+
+Replacing the single 3D trilinear tap with TWO explicit bilinear taps into
+a `texture2D_array` (neighboring z slices, lerped in registers — identical
+math order compiled for both APIs) removes whatever advantage GL's 3D
+sampler path held:
+
+```
+                    divergent GL  Metal  M/GL   |  fixed GL  Metal  M/GL
+V0  3D trilinear      28.25  29.60  1.05  |   5.60   5.68  1.01   (2048/SD4)
+V23 arr two-tap       31.71  31.76  1.00  |   6.75   6.35  0.94   (2048/SD4)
+V0  3D trilinear      18.13  19.41  1.07  |   4.07   4.66  1.14   (1024/SD4)
+V23 arr two-tap       20.59  20.75  1.01  |   4.47   4.83  1.08   (1024/SD4)
+V0  3D trilinear      63.55  73.20  1.15  |  23.61  22.73  0.96   (2048/SD0.5)
+V23 arr two-tap       80.23  77.46  0.97  |  34.91  29.43  0.84   (2048/SD0.5)
+```
+
+Parity is exact in every cell (cov/mean match the 3D signature: GL-array
+reads 1912652/83.4 — bit-identical to GL-3D — so the representation is
+image-neutral, not a quality reduction).
+
+The honest caveat: the array path is slower in ABSOLUTE terms for both
+backends (GL +13%, Metal +7% at 2048/SD4). It satisfies M/GL <= 1 with
+equal algorithms and equal data, but it converges partly by costing GL
+more than Metal. Remaining >1 cells: 1024 fixed (1.08) and 1024 divergent
+(1.01) — the small-frame scheduling tax documented above, which no
+variant has ever moved.
 
 ## Why fixed(87) flipped from 0.88 (Metal wins) to ~1.05
 

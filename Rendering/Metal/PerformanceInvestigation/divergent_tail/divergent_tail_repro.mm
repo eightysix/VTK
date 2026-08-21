@@ -73,6 +73,8 @@
 #include <chrono>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <cmath>
 
 static int kVolX = 512;           // volume dims (app: 512x512x1794 = 470 MB)
 static int kVolY = 512;
@@ -88,7 +90,8 @@ static int kMaxConstant = 288;        // compile-time ceiling for variant 4 (mus
 static int kHarness = 0;              // 0 = GPU timestamps + DontCare (fair), 1 = wall clock + Clear (old)
 static int kChunk = 256;              // V6 persistent kernel chunk size (multiple of tgSize)
 static int kComputeTG = 256;          // V6 threadgroup size
-static int kTile = 32;                 // V10 tile size (square)
+static int kTile = 32;
+static int kTranspose = 0;           // argv[15]: 0 none, 1 y<->z, 2 x<->z                 // V10 tile size (square)
 static int kComputeGroups = 0;        // V6 threadgroup count (0 = maxThreadsPerThreadgroup.width*8/tg)
 
 #define DBG(...) std::fprintf(stderr, "[repro] " __VA_ARGS__), std::fflush(stderr)
@@ -172,11 +175,28 @@ static const char* kGLFragSrc = R"(#version 410 core
 in vec2 vUV;
 out vec4 outColor;
 uniform sampler3D volumeTex;
+uniform int uTranspose;
 uniform int uMode;      // 0 = divergent (per-fragment ray-box bound), 1 = fixed
 uniform int uFixedSteps;
 uniform float uStep;
 uniform float uAlphaMul;
-#ifdef USE_LOD
+#ifdef USE_ARR
+// V23: two bilinear 2D-array taps + register lerp per sample. Identical math
+// order to the Metal MARCH_VARIANT 17 body.
+uniform sampler2DArray volumeArr;
+uniform float uDepth;
+float fetchArr(vec3 c) {
+  float g = c.z * uDepth - 0.5;
+  int z0 = int(floor(g));
+  float fz = g - float(z0);
+  int za = clamp(z0, 0, int(uDepth) - 1);
+  int zb = clamp(z0 + 1, 0, int(uDepth) - 1);
+  float s0 = textureLod(volumeArr, vec3(c.xy, float(za)), 0.0).r;
+  float s1 = textureLod(volumeArr, vec3(c.xy, float(zb)), 0.0).r;
+  return mix(s0, s1, fz);
+}
+#define FETCH(coord) fetchArr(coord)
+#elif defined(USE_LOD)
 #define FETCH(coord) textureLod(volumeTex, (coord), 0.0).r
 #else
 #define FETCH(coord) texture(volumeTex, (coord)).r
@@ -191,6 +211,10 @@ void main() {
   // oblique rays scatter accesses across the whole volume (the app's regime).
   float ca = cos(0.35), sa = sin(0.35);
   dir = vec3(ca * dir.x + sa * dir.z, dir.y, -sa * dir.x + ca * dir.z);
+  if (uTranspose != 0) {
+    eye = (uTranspose == 1) ? eye.xzy : eye.zyx;
+    dir = (uTranspose == 1) ? dir.xzy : dir.zyx;
+  }
   vec3 inv = 1.0 / dir;
   vec3 t0 = (vec3(0.0) - eye) * inv;
   vec3 t1 = (vec3(1.0) - eye) * inv;
@@ -236,10 +260,14 @@ struct GLState
   CGLContextObj ctx = nullptr;
   GLuint fbo = 0, colorTex = 0, vao = 0, vbo = 0, volTex = 0;
   GLuint progImplicit = 0, progLod = 0; // 0 = texture(), 1 = textureLod()
+  GLuint progArr = 0;                   // V23 2D-array two-tap march
+  GLuint volArrTex = 0;                 // GL_TEXTURE_2D_ARRAY volume
+  GLuint vaoFc[2] = {0, 0}, vboFc[2] = {0, 0};
+  GLint nVertsFc[2] = {0, 0};
   GLint uMode = -1, uFixedSteps = -1, uStep = -1, uAlphaMul = -1;
 };
 
-static bool compileGLProgram(GLState& s, GLuint* prog, bool useLod)
+static bool compileGLProgram(GLState& s, GLuint* prog, bool useLod, bool useArr = false)
 {
   // USE_LOD must come AFTER the #version line, so splice it in rather than
   // prepending.
@@ -248,6 +276,7 @@ static bool compileGLProgram(GLState& s, GLuint* prog, bool useLod)
   src.reserve(strlen(kGLFragSrc) + 32);
   src.append(kGLFragSrc, versionEnd - kGLFragSrc + 1);
   src += useLod ? "#define USE_LOD 1\n" : "";
+  src += useArr ? "#define USE_ARR 1\n" : "";
   src += versionEnd + 1;
   GLuint vs = glCreateShader(GL_VERTEX_SHADER);
   glShaderSource(vs, 1, &kGLVertSrc, nullptr);
@@ -324,7 +353,8 @@ static bool setupGL(GLState& s)
   // not polluted by a runtime uniform branch. Each compiles its own vertex
   // shader.
   if (!compileGLProgram(s, &s.progImplicit, false) ||
-      !compileGLProgram(s, &s.progLod, true))
+      !compileGLProgram(s, &s.progLod, true) ||
+      !compileGLProgram(s, &s.progArr, true, true))
   {
     return false;
   }
@@ -357,25 +387,49 @@ static void uploadGLVolume(GLState& s, const std::vector<uint8_t>& v)
     v.data());
 }
 
-static double timeGL(GLState& s, int mode, int fixedSteps, int useLod)
+static void setupGLVolumeArray(GLState& s, const std::vector<uint8_t>& v)
+{
+  glGenTextures(1, &s.volArrTex);
+  glBindTexture(GL_TEXTURE_2D_ARRAY, s.volArrTex);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_R8, kVolX, kVolY, kVolZ, 0, GL_RED,
+    GL_UNSIGNED_BYTE, v.data());
+}
+
+static double timeGL(GLState& s, int mode, int fixedSteps, int useLod, int special = 0)
 {
   glBindFramebuffer(GL_FRAMEBUFFER, s.fbo);
   glViewport(0, 0, kRT, kRT);
-  glUseProgram(useLod ? s.progLod : s.progImplicit);
+  const GLuint prog = (special == 2) ? s.progArr : (useLod ? s.progLod : s.progImplicit);
+  glUseProgram(prog);
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_3D, s.volTex);
-  GLint uMode = glGetUniformLocation(useLod ? s.progLod : s.progImplicit, "uMode");
-  GLint uFixedSteps = glGetUniformLocation(useLod ? s.progLod : s.progImplicit, "uFixedSteps");
-  GLint uStep = glGetUniformLocation(useLod ? s.progLod : s.progImplicit, "uStep");
-  GLint uAlphaMul = glGetUniformLocation(useLod ? s.progLod : s.progImplicit, "uAlphaMul");
+  if (special == 2)
+  {
+    glBindTexture(GL_TEXTURE_2D_ARRAY, s.volArrTex);
+    glUniform1f(glGetUniformLocation(prog, "uDepth"), (float)kVolZ);
+  }
+  else
+  {
+    glBindTexture(GL_TEXTURE_3D, s.volTex);
+  }
+  GLint uMode = glGetUniformLocation(prog, "uMode");
+  GLint uFixedSteps = glGetUniformLocation(prog, "uFixedSteps");
+  GLint uStep = glGetUniformLocation(prog, "uStep");
+  GLint uAlphaMul = glGetUniformLocation(prog, "uAlphaMul");
   glUniform1i(uMode, mode);
   glUniform1i(uFixedSteps, fixedSteps);
   glUniform1f(uStep, kStep);
   glUniform1f(uAlphaMul, kAlphaMul);
-  glBindVertexArray(s.vao);
+  glUniform1i(glGetUniformLocation(prog, "uTranspose"), kTranspose);
+  const GLint drawCount = (special == 1) ? s.nVertsFc[mode] : 3;
+  glBindVertexArray((special == 1) ? s.vaoFc[mode] : s.vao);
   for (int i = 0; i < kWarmup; ++i)
   {
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+    if (special == 1) glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLES, 0, drawCount);
   }
   glFinish();
   if (kHarness == 1)
@@ -383,7 +437,8 @@ static double timeGL(GLState& s, int mode, int fixedSteps, int useLod)
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < kFrames; ++i)
     {
-      glDrawArrays(GL_TRIANGLES, 0, 3);
+      if (special == 1) glClear(GL_COLOR_BUFFER_BIT);
+      glDrawArrays(GL_TRIANGLES, 0, drawCount);
       glFinish();
     }
     const auto t1 = std::chrono::steady_clock::now();
@@ -399,7 +454,8 @@ static double timeGL(GLState& s, int mode, int fixedSteps, int useLod)
   for (int i = 0; i < kFrames; ++i)
   {
     glBeginQuery(GL_TIME_ELAPSED, qids[i]);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+    if (special == 1) glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLES, 0, drawCount);
     glEndQuery(GL_TIME_ELAPSED);
   }
   glFinish();
@@ -442,7 +498,7 @@ using namespace metal;
 struct FragIn { float4 pos [[position]]; float2 uv; };
 struct Params { int mode; int fixedSteps; float step; float alphaMul;
                 int width; int height; int nPixels; int tileW; int tileH;
-                float deadFlag; int bucketLo; int bucketHi; int bucketCap; };
+                float deadFlag; int bucketLo; int bucketHi; int bucketCap; int transpose; };
 constant int kMax [[function_constant(0)]]; // compile-time ceiling (variant 4)
 vertex FragIn vsfull(const device float2* pos [[buffer(0)]], uint vid [[vertex_id]]) {
   FragIn o;
@@ -464,6 +520,15 @@ fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
                       sampler smp [[sampler(0)]],
                       constant Params& p [[buffer(0)]],
                       FragIn in [[stage_in]]) {
+#elif MARCH_VARIANT == 17
+// V23: volume stored as a 2D texture array — each sample is two explicit
+// bilinear taps (neighboring z slices) lerped in registers, replacing the 3D
+// trilinear tap. Same 8 texels, same math order on GL and Metal.
+fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
+                      texture2d_array<float, access::sample> volArr [[texture(1)]],
+                      sampler smp [[sampler(0)]],
+                      constant Params& p [[buffer(0)]],
+                      FragIn in [[stage_in]]) {
 #else
 fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
                       sampler smp [[sampler(0)]],
@@ -475,6 +540,11 @@ fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
   float3 dir = normalize(float3(ndc * 2.5, 1.0));
   float ca = cos(0.35), sa = sin(0.35);
   dir = float3(ca * dir.x + sa * dir.z, dir.y, -sa * dir.x + ca * dir.z);
+  // Axis-permutation experiment: identical sampled values, storage order changed.
+  if (p.transpose != 0) {
+    eye = (p.transpose == 1) ? eye.xzy : eye.zyx;
+    dir = (p.transpose == 1) ? dir.xzy : dir.zyx;
+  }
   float3 inv = 1.0 / dir;
   float3 t0 = (float3(0.0) - eye) * inv;
   float3 t1 = (float3(1.0) - eye) * inv;
@@ -494,9 +564,11 @@ fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
   float acc = 0.0;
   float alpha = 0.0;
   int done = 0;
-#if MARCH_VARIANT == 0
+#if MARCH_VARIANT == 0 || MARCH_VARIANT == 16
   // V0: baseline — implicit sample gradients, divergent per-lane for bound.
   // This is the mode that loses at 2048 (M/GL ~1.13).
+  // V16 (harness variant 21) compiles this same body: done-sorted tile quads
+  // feed it identical interpolated uv via the shared vertex shader.
   for (int i = 0; i < steps; ++i) {
     float s = vol.sample(smp, base + float(i) * d).r;
     float o = s * p.alphaMul;
@@ -1184,6 +1256,27 @@ fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
   }
   acc = float(accH);
   alpha = float(alphaH);
+#elif MARCH_VARIANT == 17
+  // V23: two bilinear 2D-array taps + register lerp per sample (see signature
+  // note). Identical math order to the GL USE_ARR path.
+  const int arrDepth = (int)volArr.get_array_size();
+  for (int i = 0; i < steps; ++i) {
+    float3 c = base + float(i) * d;
+    float g = c.z * (float)arrDepth - 0.5;
+    int z0 = (int)floor(g);
+    float fz = g - (float)z0;
+    int za = clamp(z0, 0, arrDepth - 1);
+    int zb = clamp(z0 + 1, 0, arrDepth - 1);
+    float s0 = volArr.sample(smp, c.xy, (uint)za, level(0.0)).r;
+    float s1 = volArr.sample(smp, c.xy, (uint)zb, level(0.0)).r;
+    float s = mix(s0, s1, fz);
+    float o = s * p.alphaMul;
+    float w = 1.0 - alpha;
+    acc += w * o;
+    alpha += w * o;
+    done = i + 1;
+    if (alpha > 0.9) break;
+  }
 #elif MARCH_VARIANT == 15
   // V20: binned steady-state pass — same bucket discard + cap as V17 but with
   // NO history write. In a static scene the done histogram never changes, so
@@ -1225,7 +1318,8 @@ static float4 marchRay(texture3d<float, access::sample> vol,
                        sampler smp,
                        uint2 uv,
                        constant Params& p) {
-  float2 fuv = float2(uv) / float2(p.width, p.height);
+  // Pixel-center uv — matches the fragment path's interpolated values.
+  float2 fuv = (float2(uv) + 0.5) / float2(p.width, p.height);
   float2 ndc = fuv * 2.0 - 1.0;
   float3 eye = float3(0.5, 0.5, -0.35);
   float3 dir = normalize(float3(ndc * 2.5, 1.0));
@@ -1301,6 +1395,24 @@ kernel void dvrOneShot(texture3d<float, access::sample> vol [[texture(0)]],
                        uint gid [[thread_position_in_grid]]) {
   if (gid >= (uint)p.nPixels) return;
   uint2 uv = uint2(gid % (uint)p.width, gid / (uint)p.width);
+  color.write(marchRay(vol, smp, uv, p), uv);
+}
+
+// V22: one-thread-per-covered-pixel compute march over a done-sorted index
+// list. Thread i processes indices[i], so warp k holds exactly sorted pixels
+// 32k..32k+31 — homogeneous trip counts by construction, which pass-based
+// binning could not achieve (discarded lanes keep their warp slots). Same
+// per-sample work as the fragment path; only the grouping changes.
+kernel void dvrSorted(texture3d<float, access::sample> vol [[texture(0)]],
+                      texture2d<float, access::write> color [[texture(1)]],
+                      sampler smp [[sampler(0)]],
+                      constant Params& p [[buffer(1)]],
+                      device const uint* indices [[buffer(2)]],
+                      constant uint& count [[buffer(3)]],
+                      uint gid [[thread_position_in_grid]]) {
+  if (gid >= count) return;
+  uint idx = indices[gid];
+  uint2 uv = uint2(idx % (uint)p.width, idx / (uint)p.width);
   color.write(marchRay(vol, smp, uv, p), uv);
 }
 
@@ -1409,6 +1521,12 @@ struct MetalState
   id<MTLComputePipelineState> cpsTiledPersist = nil; // tiled persistent-threads
   id<MTLSamplerState> smp = nil;
   id<MTLTexture> volTex = nil, colorTex = nil, histTex[3] = {nil, nil, nil};
+  id<MTLTexture> volArrTex = nil; // V23: same volume as texture2D_array
+  id<MTLBuffer> vbufFc[2] = {nil, nil}; // V21 sorted-tile quads, per mode
+  int nVertsFc[2] = {0, 0};
+  id<MTLComputePipelineState> cpsSorted = nil; // V22 sorted-index compute march
+  id<MTLBuffer> idxBuf[2] = {nil, nil};        // done-sorted covered-pixel ids
+  int nCovered[2] = {0, 0};
   id<MTLBuffer> vbuf = nil, workBuf = nil;    // atomic work counter (compute)
 };
 
@@ -1424,12 +1542,14 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol, int kMax)
 
   // One library per variant: MARCH_VARIANT is baked in as a preprocessor macro
   // so each PSO gets the exact code shape we want to measure.
-  const int nVariants = 16;
+  const int nVariants = 18;
   for (int v = 0; v < nVariants; ++v)
   {
     NSError* err = nil;
     MTLCompileOptions* copts = [[MTLCompileOptions alloc] init];
     copts.preprocessorMacros = @{ @"MARCH_VARIANT" : @(v) };
+    copts.languageVersion = MTLLanguageVersion3_2;
+    copts.mathMode = MTLMathModeFast;
     id<MTLLibrary> lib = [s.dev newLibraryWithSource:kMetalSrc options:copts error:&err];
     if (!lib)
     {
@@ -1519,6 +1639,19 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol, int kMax)
         err.localizedDescription.UTF8String);
       return false;
     }
+    id<MTLFunction> kfS = [lib newFunctionWithName:@"dvrSorted"];
+    if (!kfS)
+    {
+      std::fprintf(stderr, "Metal: no dvrSorted kernel\n");
+      return false;
+    }
+    s.cpsSorted = [s.dev newComputePipelineStateWithFunction:kfS error:&err];
+    if (!s.cpsSorted)
+    {
+      std::fprintf(stderr, "Metal: sorted pipeline failed: %s\n",
+        err.localizedDescription.UTF8String);
+      return false;
+    }
     for (const char* name : { "dvrWriteOnly", "dvrNoTex", "dvrTiled", "dvrTiledPersist" })
     {
       NSString* nsName = [NSString stringWithUTF8String:name];
@@ -1557,6 +1690,18 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol, int kMax)
   td.storageMode = MTLStorageModePrivate;
   td.allowGPUOptimizedContents = kOptContents; // NO matches the app's volume layout
   s.volTex = [s.dev newTextureWithDescriptor:td];
+  // V23: same volume as a 2D array (identical layout constraint).
+  MTLTextureDescriptor* ad = [[MTLTextureDescriptor alloc] init];
+  ad.textureType = MTLTextureType2DArray;
+  ad.pixelFormat = MTLPixelFormatR8Unorm;
+  ad.width = kVolX;
+  ad.height = kVolY;
+  ad.arrayLength = kVolZ;
+  ad.mipmapLevelCount = 1;
+  ad.usage = MTLTextureUsageShaderRead;
+  ad.storageMode = MTLStorageModePrivate;
+  ad.allowGPUOptimizedContents = kOptContents;
+  s.volArrTex = [s.dev newTextureWithDescriptor:ad];
   MTLTextureDescriptor* rt =
     [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
       width:kRT height:kRT mipmapped:NO];
@@ -1590,16 +1735,310 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol, int kMax)
     sourceSize:MTLSizeMake(kVolX, kVolY, kVolZ)
     toTexture:s.volTex destinationSlice:0 destinationLevel:0
     destinationOrigin:MTLOriginMake(0, 0, 0)];
+  // V23 array texture: slice z of the array = z slice of the volume.
+  for (int z = 0; z < kVolZ; ++z)
+  {
+    [blit copyFromBuffer:upload
+      sourceOffset:(NSUInteger)z * kVolX * kVolY
+      sourceBytesPerRow:kVolX sourceBytesPerImage:kVolX * kVolY
+      sourceSize:MTLSizeMake(kVolX, kVolY, 1)
+      toTexture:s.volArrTex destinationSlice:z destinationLevel:0
+      destinationOrigin:MTLOriginMake(0, 0, 0)];
+  }
   [blit endEncoding];
   [cb commit];
   [cb waitUntilCompleted];
   return true;
 }
 
+// V21: build done-sorted 8x8-tile quad lists, shared by BOTH backends. One
+// full-cap bucket-build pass per mode (MARCH_VARIANT 12 MRT) gives the exact
+// per-pixel done; tiles are ordered by ascending max-done so concurrently
+// shaded warps hold lanes with similar trip counts. Same vertex data, same
+// submission order, same shader math on GL and Metal — equal footing.
+static void initSortedTiles(MetalState& ms, GLState& gs, int fixedSteps)
+{
+  const int TS = 8;
+  const int nTX = kRT / TS, nTY = kRT / TS;
+  for (int mode = 0; mode < 2; ++mode)
+  {
+    struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; int transpose; } bp =
+      { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, 100000, 100000, kTranspose };
+    MTLRenderPassDescriptor* rb = [[MTLRenderPassDescriptor alloc] init];
+    rb.colorAttachments[0].texture = ms.colorTex;
+    rb.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rb.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rb.colorAttachments[1].texture = ms.histTex[2];
+    rb.colorAttachments[1].loadAction = MTLLoadActionClear;
+    rb.colorAttachments[1].storeAction = MTLStoreActionStore;
+    id<MTLCommandBuffer> cbb = [ms.q commandBuffer];
+    id<MTLRenderCommandEncoder> eb = [cbb renderCommandEncoderWithDescriptor:rb];
+    [eb setRenderPipelineState:ms.ps[12]];
+    [eb setVertexBuffer:ms.vbuf offset:0 atIndex:0];
+    [eb setFragmentTexture:ms.volTex atIndex:0];
+    [eb setFragmentTexture:ms.histTex[2] atIndex:1];
+    [eb setFragmentSamplerState:ms.smp atIndex:0];
+    [eb setFragmentBytes:&bp length:sizeof(bp) atIndex:0];
+    [eb drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [eb endEncoding];
+    [cbb commit];
+    [cbb waitUntilCompleted];
+    id<MTLBuffer> staging =
+      [ms.dev newBufferWithLength:(NSUInteger)kRT * kRT * 2 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cbh = [ms.q commandBuffer];
+    id<MTLBlitCommandEncoder> blh = [cbh blitCommandEncoder];
+    [blh copyFromTexture:ms.histTex[2] sourceSlice:0 sourceLevel:0
+      sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(kRT, kRT, 1)
+      toBuffer:staging destinationOffset:0 destinationBytesPerRow:(NSUInteger)kRT * 2
+      destinationBytesPerImage:(NSUInteger)kRT * kRT * 2];
+    [blh endEncoding];
+    [cbh commit];
+    [cbh waitUntilCompleted];
+    const unsigned char* px = (const unsigned char*)staging.contents;
+    std::vector<int> tileMax((size_t)nTX * nTY, 0);
+    std::vector<std::pair<int, uint32_t>> covered; // (done, pixel id)
+    for (int y = 0; y < kRT; ++y)
+    {
+      for (int x = 0; x < kRT; ++x)
+      {
+        size_t i = ((size_t)y * kRT + x) * 2;
+        uint16_t v = (uint16_t)(px[i] | (px[i + 1] << 8));
+        if (v > 0)
+        {
+          int t = (y / TS) * nTX + (x / TS);
+          if ((int)v > tileMax[t]) tileMax[t] = v;
+          covered.push_back({v, (uint32_t)(y * kRT + x)});
+        }
+      }
+    }
+    // V22 index list: covered pixels ascending by done (ties by position).
+    std::sort(covered.begin(), covered.end());
+    std::vector<uint32_t> idxList;
+    idxList.reserve(covered.size());
+    for (const auto& c : covered) idxList.push_back(c.second);
+    ms.nCovered[mode] = (int)idxList.size();
+    ms.idxBuf[mode] = [ms.dev newBufferWithBytes:idxList.data()
+      length:idxList.size() * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    std::vector<int> tiles;
+    for (int t = 0; t < nTX * nTY; ++t)
+    {
+      if (tileMax[t] > 0) tiles.push_back(t);
+    }
+    std::sort(tiles.begin(), tiles.end(),
+      [&](int a, int b) { return tileMax[a] != tileMax[b] ? tileMax[a] < tileMax[b] : a < b; });
+    std::vector<float> verts;
+    verts.reserve(tiles.size() * 12);
+    for (int t : tiles)
+    {
+      const float x0 = (float)(t % nTX) * TS, y0 = (float)(t / nTX) * TS;
+      const float x1 = x0 + TS, y1 = y0 + TS;
+      const float x0n = x0 / kRT * 2.0f - 1.0f, x1n = x1 / kRT * 2.0f - 1.0f;
+      const float y0n = y0 / kRT * 2.0f - 1.0f, y1n = y1 / kRT * 2.0f - 1.0f;
+      const float q[12] = { x0n, y0n, x1n, y0n, x0n, y1n,  x0n, y1n, x1n, y0n, x1n, y1n };
+      verts.insert(verts.end(), q, q + 12);
+    }
+    ms.nVertsFc[mode] = (int)(verts.size() / 2);
+    ms.vbufFc[mode] = [ms.dev newBufferWithBytes:verts.data()
+      length:verts.size() * sizeof(float) options:MTLResourceStorageModeShared];
+    CGLSetCurrentContext(gs.ctx);
+    glGenVertexArrays(1, &gs.vaoFc[mode]);
+    glBindVertexArray(gs.vaoFc[mode]);
+    glGenBuffers(1, &gs.vboFc[mode]);
+    glBindBuffer(GL_ARRAY_BUFFER, gs.vboFc[mode]);
+    glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(float), verts.data(), GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+    glBindVertexArray(0);
+    gs.nVertsFc[mode] = (int)(verts.size() / 2);
+  }
+  // One untimed clear of the color target: the sorted path only draws covered
+  // tiles, uncovered pixels must read as 0 in the parity readback.
+  MTLRenderPassDescriptor* rc = [[MTLRenderPassDescriptor alloc] init];
+  rc.colorAttachments[0].texture = ms.colorTex;
+  rc.colorAttachments[0].loadAction = MTLLoadActionClear;
+  rc.colorAttachments[0].storeAction = MTLStoreActionStore;
+  id<MTLCommandBuffer> cbc = [ms.q commandBuffer];
+  id<MTLRenderCommandEncoder> ecc = [cbc renderCommandEncoderWithDescriptor:rc];
+  [ecc endEncoding];
+  [cbc commit];
+  [cbc waitUntilCompleted];
+  CGLSetCurrentContext(gs.ctx);
+  glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+  glClear(GL_COLOR_BUFFER_BIT);
+}
+
 static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
 {
-  struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; } params =
-    { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, -1, 0 };
+  struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; int transpose; } params =
+    { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, -1, 0, kTranspose };
+  if (variant == 21)
+  {
+    // V21: done-sorted tile quads (see initSortedTiles). Per-frame clear on
+    // both backends (only covered tiles are drawn).
+    MTLRenderPassDescriptor* rpd21 = [[MTLRenderPassDescriptor alloc] init];
+    rpd21.colorAttachments[0].texture = s.colorTex;
+    rpd21.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rpd21.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+    rpd21.colorAttachments[0].storeAction = MTLStoreActionStore;
+    auto run21 = [&]() {
+      id<MTLCommandBuffer> cb = [s.q commandBuffer];
+      id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd21];
+      [enc setRenderPipelineState:s.ps[16]];
+      [enc setVertexBuffer:s.vbufFc[mode] offset:0 atIndex:0];
+      [enc setFragmentTexture:s.volTex atIndex:0];
+      [enc setFragmentSamplerState:s.smp atIndex:0];
+      [enc setFragmentBytes:&params length:sizeof(params) atIndex:0];
+      [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:s.nVertsFc[mode]];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+    };
+    for (int i = 0; i < kWarmup; ++i)
+    {
+      run21();
+    }
+    if (kHarness == 1)
+    {
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < kFrames; ++i)
+      {
+        run21();
+      }
+      const auto t1 = std::chrono::steady_clock::now();
+      return std::chrono::duration<double, std::milli>(t1 - t0).count() / kFrames;
+    }
+    double total = 0;
+    for (int i = 0; i < kFrames; ++i)
+    {
+      id<MTLCommandBuffer> cb = [s.q commandBuffer];
+      id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd21];
+      [enc setRenderPipelineState:s.ps[16]];
+      [enc setVertexBuffer:s.vbufFc[mode] offset:0 atIndex:0];
+      [enc setFragmentTexture:s.volTex atIndex:0];
+      [enc setFragmentSamplerState:s.smp atIndex:0];
+      [enc setFragmentBytes:&params length:sizeof(params) atIndex:0];
+      [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:s.nVertsFc[mode]];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      total += cb.GPUEndTime - cb.GPUStartTime;
+    }
+    return total / kFrames * 1000.0;
+  }
+  if (variant == 22)
+  {
+    // V22: compute march over done-sorted pixel indices — explicit warp
+    // composition (warp k = sorted pixels 32k..32k+31). GL 4.1 core has no
+    // compute; the comparator stays the fullscreen GL baseline doing the
+    // identical per-sample work. Uncovered pixels keep the init clear.
+    const uint32_t nCov = (uint32_t)s.nCovered[mode];
+    const MTLSize tg = MTLSizeMake(32, 1, 1);
+    const MTLSize groups = MTLSizeMake((nCov + 31) / 32, 1, 1);
+    auto run22 = [&]() {
+      id<MTLCommandBuffer> cb = [s.q commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:s.cpsSorted];
+      [enc setTexture:s.volTex atIndex:0];
+      [enc setTexture:s.colorTex atIndex:1];
+      [enc setSamplerState:s.smp atIndex:0];
+      [enc setBytes:&params length:sizeof(params) atIndex:1];
+      [enc setBuffer:s.idxBuf[mode] offset:0 atIndex:2];
+      [enc setBytes:&nCov length:sizeof(nCov) atIndex:3];
+      [enc dispatchThreadgroups:groups threadsPerThreadgroup:tg];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+    };
+    for (int i = 0; i < kWarmup; ++i)
+    {
+      run22();
+    }
+    if (kHarness == 1)
+    {
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < kFrames; ++i)
+      {
+        run22();
+      }
+      const auto t1 = std::chrono::steady_clock::now();
+      return std::chrono::duration<double, std::milli>(t1 - t0).count() / kFrames;
+    }
+    double total = 0;
+    for (int i = 0; i < kFrames; ++i)
+    {
+      id<MTLCommandBuffer> cb = [s.q commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+      [enc setComputePipelineState:s.cpsSorted];
+      [enc setTexture:s.volTex atIndex:0];
+      [enc setTexture:s.colorTex atIndex:1];
+      [enc setSamplerState:s.smp atIndex:0];
+      [enc setBytes:&params length:sizeof(params) atIndex:1];
+      [enc setBuffer:s.idxBuf[mode] offset:0 atIndex:2];
+      [enc setBytes:&nCov length:sizeof(nCov) atIndex:3];
+      [enc dispatchThreadgroups:groups threadsPerThreadgroup:tg];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      total += cb.GPUEndTime - cb.GPUStartTime;
+    }
+    return total / kFrames * 1000.0;
+  }
+  if (variant == 23)
+  {
+    // V23: fullscreen pass, volume sampled as a 2D array with two explicit
+    // bilinear taps per sample (see MARCH_VARIANT 17). GL runs the identical
+    // algorithm through progArr.
+    MTLRenderPassDescriptor* rpd23 = [[MTLRenderPassDescriptor alloc] init];
+    rpd23.colorAttachments[0].texture = s.colorTex;
+    rpd23.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rpd23.colorAttachments[0].storeAction = MTLStoreActionStore;
+    auto run23 = [&]() {
+      id<MTLCommandBuffer> cb = [s.q commandBuffer];
+      id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd23];
+      [enc setRenderPipelineState:s.ps[17]];
+      [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
+      [enc setFragmentTexture:s.volTex atIndex:0];
+      [enc setFragmentTexture:s.volArrTex atIndex:1];
+      [enc setFragmentSamplerState:s.smp atIndex:0];
+      [enc setFragmentBytes:&params length:sizeof(params) atIndex:0];
+      [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+    };
+    for (int i = 0; i < kWarmup; ++i)
+    {
+      run23();
+    }
+    if (kHarness == 1)
+    {
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < kFrames; ++i)
+      {
+        run23();
+      }
+      const auto t1 = std::chrono::steady_clock::now();
+      return std::chrono::duration<double, std::milli>(t1 - t0).count() / kFrames;
+    }
+    double total = 0;
+    for (int i = 0; i < kFrames; ++i)
+    {
+      id<MTLCommandBuffer> cb = [s.q commandBuffer];
+      id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd23];
+      [enc setRenderPipelineState:s.ps[17]];
+      [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
+      [enc setFragmentTexture:s.volTex atIndex:0];
+      [enc setFragmentTexture:s.volArrTex atIndex:1];
+      [enc setFragmentSamplerState:s.smp atIndex:0];
+      [enc setFragmentBytes:&params length:sizeof(params) atIndex:0];
+      [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [enc endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      total += cb.GPUEndTime - cb.GPUStartTime;
+    }
+    return total / kFrames * 1000.0;
+  }
   if (variant == 17 || variant == 20)
   {
     // V17: binned-pass march (Experiment C). Per-frame 4 passes, each covering
@@ -1624,8 +2063,8 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
     {
       // Bucket-build frame: one full-cap binned pass (cap 1e6, covers every
       // pixel, identical output to the baseline) that also fills histTex.
-      struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; } bp =
-        { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, 100000, 100000 };
+      struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; int transpose; } bp =
+        { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, 100000, 100000, kTranspose };
       id<MTLTexture> buildTex = (variant == 20) ? s.histTex[2] : s.histTex[0];
       MTLRenderPassDescriptor* rb = [[MTLRenderPassDescriptor alloc] init];
       rb.colorAttachments[0].texture = s.colorTex;
@@ -1699,8 +2138,8 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
       (bCaps[m][0] <= bCaps[m][2] / 2) && (bCaps[m][2] - bCaps[m][0] >= 16);
     if (!useBinned)
     {
-      struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; } bp =
-        { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, -1, 0 };
+      struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; int transpose; } bp =
+        { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, -1, 0, kTranspose };
       MTLRenderPassDescriptor* rps = [[MTLRenderPassDescriptor alloc] init];
       rps.colorAttachments[0].texture = s.colorTex;
       rps.colorAttachments[0].loadAction = (kHarness == 1) ? MTLLoadActionClear : MTLLoadActionDontCare;
@@ -1758,17 +2197,17 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
       // fixed mode uses a median 2-pass split (its top quartile bucket is
       // empty since done <= fixedSteps always).
       const int nPasses = (mode == 0) ? 4 : 2;
-      struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; }
+      struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; int transpose; }
         passP[4] = {
-          { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, bCaps[m][0], bCaps[m][0] },
-          { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][0], bCaps[m][1], bCaps[m][1] },
-          { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][1], bCaps[m][2], bCaps[m][2] },
-          { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][2], 100000, 100000 },
+          { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, bCaps[m][0], bCaps[m][0], kTranspose },
+          { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][0], bCaps[m][1], bCaps[m][1], kTranspose },
+          { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][1], bCaps[m][2], bCaps[m][2], kTranspose },
+          { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][2], 100000, 100000, kTranspose },
         };
       if (mode == 1)
       {
-        passP[0] = { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, bCaps[m][1], bCaps[m][1] };
-        passP[1] = { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][1], 100000, 100000 };
+        passP[0] = { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, bCaps[m][1], bCaps[m][1], kTranspose };
+        passP[1] = { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][1], 100000, 100000, kTranspose };
       }
       MTLRenderPassDescriptor* rp0 = [[MTLRenderPassDescriptor alloc] init];
       rp0.colorAttachments[0].texture = s.colorTex;
@@ -1834,12 +2273,12 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
       return gtotal / kFrames * 1000.0;
     }
     // Four passes per frame. Pass p covers prevDone in (lo_p, hi_p], cap_p.
-    struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; }
+    struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; int transpose; }
       passP[4] = {
-        { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, bCaps[m][0], bCaps[m][0] },
-        { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][0], bCaps[m][1], bCaps[m][1] },
-        { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][1], bCaps[m][2], bCaps[m][2] },
-        { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][2], 100000, 100000 },
+        { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, bCaps[m][0], bCaps[m][0], kTranspose },
+        { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][0], bCaps[m][1], bCaps[m][1], kTranspose },
+        { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][1], bCaps[m][2], bCaps[m][2], kTranspose },
+        { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][2], 100000, 100000, kTranspose },
       };
     // histTex is double-buffered: each frame reads the previous frame's done
     // (readTex) while writing its own (writeTex); no read/write hazard.
@@ -2059,7 +2498,7 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
   auto run = [&]() {
     id<MTLCommandBuffer> cb = [s.q commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
-    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : variant]];
+    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : (variant == 21) ? 16 : (variant == 23) ? 17 : variant]];
     [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
     [enc setFragmentTexture:s.volTex atIndex:0];
     [enc setFragmentSamplerState:s.smp atIndex:0];
@@ -2095,7 +2534,7 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
   {
     id<MTLCommandBuffer> cb = [s.q commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
-    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : variant]];
+    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : (variant == 21) ? 16 : (variant == 23) ? 17 : variant]];
     [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
     [enc setFragmentTexture:s.volTex atIndex:0];
     [enc setFragmentSamplerState:s.smp atIndex:0];
@@ -2148,6 +2587,7 @@ int main(int argc, char** argv)
   if (argc > 7) kFixedOverride = std::atoi(argv[7]);
   if (argc > 8) kOptContents = (BOOL)std::atoi(argv[8]);
   if (argc > 9) kMaxConstant = std::atoi(argv[9]);
+  if (argc > 15) kTranspose = std::atoi(argv[15]);
   if (argc > 10) kHarness = std::atoi(argv[10]);
   if (argc > 11) kChunk = std::atoi(argv[11]);
   if (argc > 12) kComputeTG = std::atoi(argv[12]);
@@ -2180,17 +2620,47 @@ int main(int argc, char** argv)
   std::printf("config                GL ms/f   Metal ms/f   M/GL\n");
 
   const std::vector<uint8_t> vol = makeVolume();
+  // Axis-permutation experiment: permute the volume storage and swap the
+  // global dims so uploads stay consistent. The shader head permutes eye/dir
+  // to match, so every ray samples the same values — only the on-chip storage
+  // order changes.
+  std::vector<uint8_t> volP;
+  if (kTranspose == 1)
+  { // y <-> z: new dims (X, oldZ, oldY)
+    const int ox = kVolX, oy = kVolY, oz = kVolZ;
+    std::swap(kVolY, kVolZ);
+    volP.resize(vol.size());
+    for (int z = 0; z < kVolZ; ++z)
+      for (int y = 0; y < kVolY; ++y)
+        for (int x = 0; x < kVolX; ++x)
+          volP[(size_t)x + (size_t)y * kVolX + (size_t)z * kVolX * kVolY] =
+            vol[(size_t)x + (size_t)z * ox + (size_t)y * ox * oy];
+  }
+  else if (kTranspose == 2)
+  { // x <-> z: new dims (oldZ, Y, oldX)
+    const int ox = kVolX, oy = kVolY, oz = kVolZ;
+    std::swap(kVolX, kVolZ);
+    volP.resize(vol.size());
+    for (int z = 0; z < kVolZ; ++z)
+      for (int y = 0; y < kVolY; ++y)
+        for (int x = 0; x < kVolX; ++x)
+          volP[(size_t)x + (size_t)y * kVolX + (size_t)z * kVolX * kVolY] =
+            vol[(size_t)z + (size_t)y * ox + (size_t)x * ox * oy];
+  }
+  const std::vector<uint8_t>& volEff = volP.empty() ? vol : volP;
   GLState gl;
   if (!setupGL(gl))
   {
     return 1;
   }
-  uploadGLVolume(gl, vol);
+  uploadGLVolume(gl, volEff);
+  setupGLVolumeArray(gl, volEff);
   MetalState m;
-  if (!setupMetal(m, vol, kMaxConstant))
+  if (!setupMetal(m, volEff, kMaxConstant))
   {
     return 1;
   }
+  initSortedTiles(m, gl, fixedSteps);
 
   // Variant sweep. V0 = baseline (the losing 1.13 config), V1 = explicit LOD
   // only, V2 = uniform header (simd_max), V3 = +whole-group exit, V4 =
@@ -2219,8 +2689,11 @@ int main(int argc, char** argv)
     "V18 read-trilin  ",
     "V19 half compos  ",
     "V20 binned-static",
+    "V21 sorted-tiles ",
+    "V22 comp-sorted  ",
+    "V23 arr-2dtap    ",
   };
-  for (int v = 0; v < 21; ++v)
+  for (int v = 0; v < 24; ++v)
   {
     const int useLod = (v >= 1) ? 1 : 0; // GL: implicit until V1, explicit after
     // Interleave the two modes within each backend to cancel drift, and the two
@@ -2232,11 +2705,11 @@ int main(int argc, char** argv)
     const int rounds = 3;
     for (int r = 0; r < rounds; ++r)
     {
-      glDiv += timeGL(gl, 0, fixedSteps, useLod);
+      glDiv += timeGL(gl, 0, fixedSteps, useLod, (v == 21) ? 1 : (v == 23) ? 2 : 0);
       if (r == 0) readbackGL(gl, &glDivCov, &glDivMean);
       mDiv += timeMetal(m, 0, fixedSteps, v);
       if (r == 0) readbackMetal(m, &mDivCov, &mDivMean);
-      glFix += timeGL(gl, 1, fixedSteps, useLod);
+      glFix += timeGL(gl, 1, fixedSteps, useLod, (v == 21) ? 1 : (v == 23) ? 2 : 0);
       if (r == 0) readbackGL(gl, &glFixCov, &glFixMean);
       mFix += timeMetal(m, 1, fixedSteps, v);
       if (r == 0) readbackMetal(m, &mFixCov, &mFixMean);
