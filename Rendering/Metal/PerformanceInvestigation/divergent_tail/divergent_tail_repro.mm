@@ -2006,6 +2006,25 @@ fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
     done = i38;
     pos += d;
   } while (i38 < steps && alpha <= 0.9);
+#elif MARCH_VARIANT == 33
+  // V40 ablation: full composite chain over ALU-hash data, NO fetch, uniform
+  // trip counts — isolates loop + ALU at long-march length.
+  for (int i33 = 0; i33 < steps; ++i33) {
+    float s = fract((base.x + float(i33) * d.x) * 37.0 + base.y * 17.0);
+    float o = s * p.alphaMul;
+    float w = 1.0 - alpha;
+    acc += w * o;
+    alpha += w * o;
+    done = i33 + 1;
+  }
+#elif MARCH_VARIANT == 34
+  // V41 ablation: real fetches but FROZEN coordinate — every tap hits the
+  // same L1-resident texel, so sampler issue rate is tested without DRAM
+  // streaming. Uniform trip counts.
+  for (int i34 = 0; i34 < steps; ++i34) {
+    acc += vol.sample(smp, base).r;
+    done = i34 + 1;
+  }
 #elif MARCH_VARIANT == 20
   // V26 ablation: no march at all — floor cost of raster + target write.
   return float4(0.0, 0.0, 0.0, 0.0);
@@ -2299,7 +2318,7 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol, int kMax)
 
   // One library per variant: MARCH_VARIANT is baked in as a preprocessor macro
   // so each PSO gets the exact code shape we want to measure.
-  const int nVariants = 33;
+  const int nVariants = 35;
   for (int v = 0; v < nVariants; ++v)
   {
     NSError* err = nil;
@@ -3552,7 +3571,7 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
   auto run = [&]() {
     id<MTLCommandBuffer> cb = [s.q commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
-    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : (variant == 21) ? 16 : (variant == 23) ? 17 : (variant == 24) ? 18 : (variant == 25) ? 19 : (variant >= 26 && variant <= 29) ? (variant - 6) : (variant == 30) ? 24 : (variant == 31) ? 25 : (variant == 32) ? 26 : (variant == 33) ? 27 : (variant == 35) ? 29 : (variant == 36) ? 30 : (variant == 37) ? 31 : (variant == 38) ? 32 : variant]];
+    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : (variant == 21) ? 16 : (variant == 23) ? 17 : (variant == 24) ? 18 : (variant == 25) ? 19 : (variant >= 26 && variant <= 29) ? (variant - 6) : (variant == 30) ? 24 : (variant == 31) ? 25 : (variant == 32) ? 26 : (variant == 33) ? 27 : (variant == 35) ? 29 : (variant == 36) ? 30 : (variant == 37) ? 31 : (variant == 38) ? 32 : (variant == 40) ? 33 : (variant == 41) ? 34 : variant]];
     [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
     [enc setFragmentTexture:s.volTex atIndex:0];
     if (variant == 35 || variant == 36) {
@@ -3592,7 +3611,7 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
   {
     id<MTLCommandBuffer> cb = [s.q commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
-    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : (variant == 21) ? 16 : (variant == 23) ? 17 : (variant == 24) ? 18 : (variant == 25) ? 19 : (variant >= 26 && variant <= 29) ? (variant - 6) : (variant == 30) ? 24 : (variant == 31) ? 25 : (variant == 32) ? 26 : (variant == 33) ? 27 : (variant == 35) ? 29 : (variant == 36) ? 30 : (variant == 37) ? 31 : (variant == 38) ? 32 : variant]];
+    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : (variant == 21) ? 16 : (variant == 23) ? 17 : (variant == 24) ? 18 : (variant == 25) ? 19 : (variant >= 26 && variant <= 29) ? (variant - 6) : (variant == 30) ? 24 : (variant == 31) ? 25 : (variant == 32) ? 26 : (variant == 33) ? 27 : (variant == 35) ? 29 : (variant == 36) ? 30 : (variant == 37) ? 31 : (variant == 38) ? 32 : (variant == 40) ? 33 : (variant == 41) ? 34 : variant]];
     [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
     [enc setFragmentTexture:s.volTex atIndex:0];
     if (variant == 35 || variant == 36) {
@@ -3772,10 +3791,13 @@ int main(int argc, char** argv)
     "V36 pipe-rg8     ",
     "V37 batch8+dowh  ",
     "V38 incr-pos     ",
+    "(unused)         ",
+    "V40 abl-alu-long ",
+    "V41 abl-l1fetch  ",
   };
-  for (int v = 0; v < 39; ++v)
+  for (int v = 0; v < 42; ++v)
   {
-    if (v == 34) continue; // number unused (V34 skipped during development)
+    if (v == 34 || v == 39) continue; // unused numbers
     if (kOnlyVariant >= 0 && v != kOnlyVariant) continue;
     const int useLod = (v >= 1) ? 1 : 0; // GL: implicit until V1, explicit after
     // Interleave the two modes within each backend to cancel drift, and the two

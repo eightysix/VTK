@@ -440,6 +440,18 @@ issue contention) and V38 incremental positioning (neutral; ALU free).
 The residual is diffuse 2-3% at the measurement floor with no isolable
 mechanism after ~40 variants.
 
+Final ablation round at the pathological cells (1024xSD0.5): splitting the
+march into ALU-only (V40) and L1-resident-fetch (V41) loops exposed a
+methodological limit — GL compiles these ARTIFICIAL shapes catastrophically
+badly (hash loop 41.3 ms vs Metal 4.2; single-texel refetch loop 39.9 vs
+8.7) while handling the natural streaming march at parity. Synthetic-shape
+ablation therefore injects 10x compiler noise into a 3% signal and cannot
+bisect further. The reproducible residuals (768xSD0.5 fix ~+3%,
+1024xSD0.5 div ~+2-3%) stand as measured on natural shaders; with exit
+divergence, floor, batching, pipelining, positioning, and representation
+all exonerated or exhausted, they mark the resolution limit of source-level
+A/B on this driver pair.
+
 Falsified: the extra tap costs more bandwidth than the overlap saves —
 consistent with the ablation finding that fetch rate is already at parity
 (the march is bandwidth-bound, not latency-bound, at 2048). The do-while
