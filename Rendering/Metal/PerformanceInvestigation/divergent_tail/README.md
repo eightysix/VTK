@@ -303,7 +303,65 @@ fetching is at parity. The app-relevant conclusion stands on V24: do not
 fight the exit-divergence interaction — sidestep the 3D trilinear path
 that amplifies it.
 
-## Root cause, final form: unrealized early-exit savings (low-occupancy tail)
+## ROOT CAUSE FOUND: MSL codegen for the mid-body exit (fixed in V31)
+
+The "low-occupancy tail efficiency" conclusion above was WRONG. The clue
+that overturned it: OpenGL on Apple silicon IS Metal underneath — one GPU,
+one scheduler, one memory system — so a backend delta can only be CODEGEN
+(the GLSL->Air compiler structuring the loop differently than MSL->Air).
+Codegen is addressable.
+
+Every variant V0-V30 kept the same CFG: `for (...) { ...; if (alpha > 0.9)
+break; }` — the sampler sandwiched between a header branch and a mid-body
+exit branch. Moving the exit into the loop BACK-EDGE:
+
+```
+int i = 0;
+do {
+  float s = vol.sample(smp, base + float(i) * d).r;
+  ... composite ...
+  ++i; done = i;
+} while (i < steps && alpha <= 0.9);
+```
+
+— one branch per iteration instead of two around the fetch — made the
+Metal compiler produce Air at GL quality on the PLAIN 3D path (V31):
+2048/SD4 divergent 27.73/27.40 = **1.00**, fixed **1.00**, parity exact.
+No layout change, no tricks: the entire "deficit" was the CFG shape MSL
+was given. (V30's lockstep experiment, built to test the partial-width
+hypothesis, had already disproven it; its reframing to "scheduler
+efficiency" was itself wrong.)
+
+The fix STACKS with the representation win. V32 = RG8 pair-taps +
+back-edge exit:
+
+```
+                    divergent GL  Metal  M/GL   |  fixed GL  Metal  M/GL
+V0  3D for/break      28.06  29.60  1.05  |   5.64   5.76  1.02   (2048/SD4)
+V31 3D do-while       27.20  27.49  1.01  |   5.64   5.67  1.01   (2048/SD4)
+V32 rg8 + do-while    26.09  23.82  0.91  |   7.95   6.66  0.84   (2048/SD4)
+V32 rg8 + do-while    88.67  68.33  0.77  |  56.80  37.54  0.66   (2048/SD0.5)
+V33 arr2 + do-while   17.24  16.60  0.96  |   3.86   4.14  1.07   (768/SD4)
+```
+
+Metal is now 14% FASTER than GL's best path at the app's operating point,
+and both backends are faster than where this investigation started.
+Best-per-cell across representations+CFG (all image-exact, parity-safe):
+
+| RT | divergent best | fixed best |
+|----|----------------|------------|
+| 2048/SD4 | **0.91** (V32) | **0.84** (V32) |
+| 2048/SD0.5 | **0.77** (V32) | **0.66** (V32) |
+| 1024/SD4 | 1.01-1.02 (V23/V31) | **1.00** (V24/V32) |
+| 768/SD4 | **0.96** (V33) | 1.07 (all) |
+| 512/SD4 | **0.92** (V23) | 1.11 (V23) |
+| 256/SD4 | 1.04 (all) | 1.10-1.17 |
+
+Remaining >1 cells are the small-frame regime (<=768 fixed, 256): the
+per-draw floor tax (+0.11 ms at 2048-scale tile store) that no march
+change can touch, plus ordinary noise at 1-4 ms frame times.
+
+## Root cause history (superseded conclusions kept for the record)
 
 V30 (lockstep march: frame-uniform 288-iteration bound, dead lanes refetch
 their frozen cache-hot coordinate via `select()`, never skipping an issue)
