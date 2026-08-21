@@ -72,7 +72,10 @@ parity is exact across every variant):
 | V12     | S29 dead-path (disabled)                             |
 | V13     | batch-8 (renumbered V8)                              |
 | V14-16  | batch-16/32/48 (renumbered V9-11)                    |
-| V17     | **binned-4pass**: 4 capped passes over last-frame done quartiles |
+| V17     | binned-4pass: 4 capped passes over last-frame done quartiles |
+| V18     | manual trilinear via 8x `read()` (diagnostic)        |
+| V19     | half-precision composite (diagnostic)                |
+| V20     | binned-static: no history write, median split for fixed |
 
 GL is compared honestly: two separately compiled fragment programs (implicit
 `texture()` for V0, baked-in `textureLod(...,0.0)` for V1-V5) so the fetch
@@ -160,54 +163,66 @@ all 48 lanes stayed live and time scaled as 48/width (92.8/46.3/23.5/21.2
 ms for batch 8/16/32/48). Batch variants must be compiled with `#if`
 per width.
 
-## V17: binned passes FIX the divergent gap (M/GL 0.64-0.65)
+## RETRACTION: the binned-pass "win" was a measurement artifact
 
-The structural fix (Experiment C): a frame-hint binned march. One
-"bucket-build" frame renders a full-cap pass (MARCH_VARIANT 12) with two
-MRT attachments — color + an R16Unorm "done histogram" texture — then a
-CPU readback splits the done histogram into quartile caps (e.g. 41/65/114
-at SD4). Each subsequent frame renders 4 passes; pass p keeps only pixels
-whose previous-frame done fell in bucket p (`discard_fragment()` for the
-rest) and caps its march at the bucket's quartile (`min(steps, cap)` —
-never binds, so output is bit-identical; the win is SIMT grouping: every
-lane in a pass terminates at or before the same cap). The histogram
-texture is double-buffered (read prev frame, write cur frame) to avoid the
-render-target/read hazard.
+An earlier version of this section claimed V17 fixed the divergent gap at
+M/GL 0.64-0.65. That claim was WRONG and is retracted. Two defects conspired:
 
-```
-                    divergent GL  Metal  M/GL   |  fixed GL  Metal  M/GL
-V0  baseline          17.33  20.03  1.16  |   4.04   4.75  1.18   (1024)
-V17 binned-4pass      17.22  11.21  0.65  |   4.06   4.57  1.13   (1024)
-V0  baseline          28.99  30.88  1.07  |   5.47   5.82  1.06   (2048)
-V17 binned-4pass      27.17  17.54  0.65  |   5.46   5.83  1.07   (2048)
-```
+1. **Cross-mode bin contamination.** The harness alternates divergent/fixed
+   rounds within one variant. The fixed call's bucket-build overwrote the
+   done-history texture, so later divergent rounds assigned buckets from
+   FIXED-mode dones (all <= 87): a pixel with true done 283 stored as 60 was
+   capped at 65 and kept reporting 65 — truncated marches, ~3x less work, and
+   the per-variant average mixed one clean round (~31 ms) with contaminated
+   ones (~10 ms) to produce the fake 17.5 ms. Parity was only read back in
+   round 0, so it stayed green while timing was garbage. Worse, the warmup
+   cannot be trusted to heal stale bins: each frame writes its own (already
+   capped) done, so truncation is self-sustaining. The fix — rebuild bins on
+   every mode switch, verified by dumping bin populations pre-timing — is in
+   the code now.
+2. **The corrected result kills the idea anyway.** With clean bins the
+   binned variants measure: V17 divergent 31.09 (1.15), V20 30.29 (1.12),
+   vs baseline 31.18 (1.11). Per-pass GPU spans explain why: pass0
+   (done<=41) 0.66 ms, pass1 1.15, pass2 2.37, pass3 (done>114, uncapped)
+   **26.9 ms alone**. `discard_fragment()` frees nothing — discarded lanes
+   occupy their warp slots until the warp retires, and long-ray pixels are
+   scattered across the screen, so nearly every 32-lane warp in the uncapped
+   pass still contains one and runs the full ~283 steps. Binning partitions
+   work but cannot re-GROUP it; the scattered tail sets the cost of every
+   pass it touches. Beating it would require physically reordering fragments
+   by trip count (sorted index buffers + indirect draws), not pass caps.
 
-Parity stays exact (cov 1912652/83.4 GL vs 1912192/83.5 Metal, fixed
-60.0/60.1). This is the first harness variant that beats GL on the
-divergent (app-reflecting) cell — Metal 35% faster. The binning is gated
-adaptively: it only engages when the done histogram is strongly bimodal
-(25th-percentile cap <= half the 75th, spread >= 16). At fine SD the
-distribution is broad (caps 321/512/512 at SD0.5) and the fallback runs
-the single baseline pass (SD0.5 divergent 1.15 vs baseline 1.13, no
-regression).
+What survives: V20's fixed-mode median split ties GL (5.55 vs 5.53,
+M/GL 1.00) because fixed mode has no long tail to scatter. The honest
+harness state at 2048/SD4 remains: divergent M/GL ~1.11-1.15, fixed
+~1.03-1.05.
 
-Caveat: the pass union requires discarded pixels to leave the target
-untouched — writing `{0,0,0,0}` instead of `discard_fragment()` clobbers
-other passes' pixels (caught by the parity readback: cov dropped to ~1/4).
+## Why GL stays ahead, and what was falsified trying
 
-Why binning cannot pay at fine SD: caps never bind below a lane's own
-done (parity requires bit-identical output), so the only mechanism is
-warp homogeneity — and a smooth broad distribution leaves every bucket
-internally divergent (bucket 1 alone spans 0-321) with >50% of pixels in
-the uncapped top bucket. The SD0.5 residual (V0 ~1.13) is a different
-regime: long dependent sample chains (mean ~229, up to ~1132 geometric
-steps) make the march latency-bound, and the tool that works there is
-batching, not binning — V13 batch-8 reaches 1.05 at SD0.5 (64.81 vs
-70.91 ms) while every unbatched shape stays ~1.13. The app shows the
-same split: its batched mv9 WINS fine SD (0.56x at 2048/SD0.5) and loses
-coarse SD (1.31x j1 / 1.11x j0), exactly the complement of binning.
-Stacking both (batched march inside binned passes) is the obvious
-follow-up.
+With optContents=YES forbidden (a tax on incompressible data per
+`../lag_repro/README.md`, and an app image-accuracy constraint), every
+shader-level lever has now been measured:
+
+| lever | result |
+|---|---|
+| loop shapes V0-V5 (uniform header, group exit, kMax const, chunks) | identical timing |
+| batched march 8/16/32/48 (V13-16) | monotonically worse at 2048 |
+| binned passes, MRT + static variants (V17/V20) | no effect (warp physics above) |
+| manual trilinear via read() (V18) | 2.5x WORSE — sampler path is optimal |
+| half-precision composite (V19) | no change |
+| persistent-threads compute | falsified earlier |
+
+Two localization facts pin the residual: (a) with an 8 MB cache-resident
+volume the DIVERGENT gap vanishes (Metal wins 0.95 at 2048, 0.79 at 1024)
+— the divergent deficit is DRAM-path behavior under divergence, not loop
+structure; (b) the FIXED deficit persists cache-resident (~1.04) and grows
+as RT shrinks (1.13 at 512, 1.18 at 1024) — a small per-sample/scheduling
+efficiency difference that no legal MSL rewrite has moved. GL samples its
+own internally-tiled storage; Metal with allowGPUOptimizedContents=NO
+marches an uncompressed private layout. On this evidence the remaining
+gap is the price of that layout constraint, payable only by changing the
+data path (layout flag, algorithmic acceleration like the app's minmax)
+rather than the shader.
 
 ## Why fixed(87) flipped from 0.88 (Metal wins) to ~1.05
 
@@ -240,8 +255,6 @@ on the same GPU.
 ## Key controls
 
 - **alphaMul**: opacity-curve steepness; sets where the data-dependent
-  break fires. Keep it high enough that some rays break early and others
-  run the full geometric length.
   break fires. Keep it high enough that some rays break early and others
   run the full geometric length.
 - **fixedOverride**: cap for the fixed mode. 0 = frame geometric mean

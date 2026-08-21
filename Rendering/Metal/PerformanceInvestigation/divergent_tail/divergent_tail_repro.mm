@@ -458,6 +458,12 @@ fragment MarchOut march(texture3d<float, access::sample> vol [[texture(0)]],
                         sampler smp [[sampler(0)]],
                         constant Params& p [[buffer(0)]],
                         FragIn in [[stage_in]]) {
+#elif MARCH_VARIANT == 15
+fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
+                      texture2d<float, access::read> histTex [[texture(1)]],
+                      sampler smp [[sampler(0)]],
+                      constant Params& p [[buffer(0)]],
+                      FragIn in [[stage_in]]) {
 #else
 fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
                       sampler smp [[sampler(0)]],
@@ -1131,6 +1137,78 @@ fragment float4 march(texture3d<float, access::sample> vol [[texture(0)]],
     return MarchOut{ float4(acc / float(steps), float(done) / 255.0, 0.0, 1.0),
                      float(done) / 65535.0 };
   }
+#elif MARCH_VARIANT == 13
+  // V18: manual trilinear through the load unit — 8x texture read() + fp32
+  // lerp instead of the sampler filter path. Isolates how much of the per-tap
+  // deficit on an uncompressed private layout is the sampler itself.
+  const int3 dim3 = int3(vol.get_width(), vol.get_height(), vol.get_depth());
+  for (int i = 0; i < steps; ++i) {
+    float3 g = (base + float(i) * d) * float3(dim3) - 0.5;
+    int3 i0 = int3(floor(g));
+    float3 fr = g - float3(i0);
+    uint3 a = uint3(clamp(i0, int3(0), dim3 - 1));
+    uint3 b = uint3(clamp(i0 + 1, int3(0), dim3 - 1));
+    float v000 = vol.read(uint3(a.x, a.y, a.z)).r;
+    float v100 = vol.read(uint3(b.x, a.y, a.z)).r;
+    float v010 = vol.read(uint3(a.x, b.y, a.z)).r;
+    float v110 = vol.read(uint3(b.x, b.y, a.z)).r;
+    float v001 = vol.read(uint3(a.x, a.y, b.z)).r;
+    float v101 = vol.read(uint3(b.x, a.y, b.z)).r;
+    float v011 = vol.read(uint3(a.x, b.y, b.z)).r;
+    float v111 = vol.read(uint3(b.x, b.y, b.z)).r;
+    float c00 = mix(v000, v100, fr.x);
+    float c10 = mix(v010, v110, fr.x);
+    float c01 = mix(v001, v101, fr.x);
+    float c11 = mix(v011, v111, fr.x);
+    float s = mix(mix(c00, c10, fr.y), mix(c01, c11, fr.y), fr.z);
+    float o = s * p.alphaMul;
+    float w = 1.0 - alpha;
+    acc += w * o;
+    alpha += w * o;
+    done = i + 1;
+    if (alpha > 0.9) break;
+  }
+#elif MARCH_VARIANT == 14
+  // V19: V0 shape with half-precision composite accumulators — tests whether
+  // fp32 ALU / register pressure contributes to the per-tap deficit.
+  half accH = 0.0h;
+  half alphaH = 0.0h;
+  for (int i = 0; i < steps; ++i) {
+    float s = vol.sample(smp, base + float(i) * d).r;
+    half o = half(s * p.alphaMul);
+    half w = 1.0h - alphaH;
+    accH += w * o;
+    alphaH += w * o;
+    done = i + 1;
+    if (alphaH > 0.9h) break;
+  }
+  acc = float(accH);
+  alpha = float(alphaH);
+#elif MARCH_VARIANT == 15
+  // V20: binned steady-state pass — same bucket discard + cap as V17 but with
+  // NO history write. In a static scene the done histogram never changes, so
+  // only the bucket-build frame (MARCH_VARIANT 12) writes histTex; steady
+  // passes render to a single attachment. Out-of-bucket pixels must not
+  // touch the target (other passes own those pixels).
+  uint2 px = uint2(clamp(uint(in.uv.x * float(p.width)), 0u, uint(p.width) - 1u),
+                   clamp(uint(in.uv.y * float(p.height)), 0u, uint(p.height) - 1u));
+  float prevF = histTex.read(px).r;
+  int prevDone = int(prevF * 65535.0 + 0.5);
+  if (prevDone <= p.bucketLo || prevDone > p.bucketHi)
+  {
+    discard_fragment();
+    return float4(0.0, 0.0, 0.0, 0.0);
+  }
+  const int capSteps15 = min(steps, p.bucketCap);
+  for (int i = 0; i < capSteps15; ++i) {
+    float s = vol.sample(smp, base + float(i) * d).r;
+    float o = s * p.alphaMul;
+    float w = 1.0 - alpha;
+    acc += w * o;
+    alpha += w * o;
+    done = i + 1;
+    if (alpha > 0.9) break;
+  }
 #endif
 #if MARCH_VARIANT == 12
   return MarchOut{ float4(acc / float(steps), float(done) / 255.0, 0.0, 1.0),
@@ -1330,7 +1408,7 @@ struct MetalState
   id<MTLComputePipelineState> cpsTiled = nil; // tiled one-shot diagnostic
   id<MTLComputePipelineState> cpsTiledPersist = nil; // tiled persistent-threads
   id<MTLSamplerState> smp = nil;
-  id<MTLTexture> volTex = nil, colorTex = nil, histTex[2] = {nil, nil};
+  id<MTLTexture> volTex = nil, colorTex = nil, histTex[3] = {nil, nil, nil};
   id<MTLBuffer> vbuf = nil, workBuf = nil;    // atomic work counter (compute)
 };
 
@@ -1346,7 +1424,7 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol, int kMax)
 
   // One library per variant: MARCH_VARIANT is baked in as a preprocessor macro
   // so each PSO gets the exact code shape we want to measure.
-  const int nVariants = 13;
+  const int nVariants = 16;
   for (int v = 0; v < nVariants; ++v)
   {
     NSError* err = nil;
@@ -1494,6 +1572,7 @@ static bool setupMetal(MetalState& s, const std::vector<uint8_t>& vol, int kMax)
   ht.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
   s.histTex[0] = [s.dev newTextureWithDescriptor:ht];
   s.histTex[1] = [s.dev newTextureWithDescriptor:ht];
+  s.histTex[2] = [s.dev newTextureWithDescriptor:ht];
 
   const float tri[] = { -1.f, -1.f, 3.f, -1.f, -1.f, 3.f };
   s.vbuf = [s.dev newBufferWithBytes:tri length:sizeof(tri) options:MTLResourceStorageModeShared];
@@ -1521,7 +1600,7 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
 {
   struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; } params =
     { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, -1, 0 };
-  if (variant == 17)
+  if (variant == 17 || variant == 20)
   {
     // V17: binned-pass march (Experiment C). Per-frame 4 passes, each covering
     // pixels whose previous-frame done fell in (bucketLo, bucketHi]; the march
@@ -1531,17 +1610,28 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
     static int bCaps[2][3] = {{0, 0, 0}, {0, 0, 0}};
     static bool bReady[2] = {false, false};
     const int m = (mode == 1) ? 1 : 0;
-    if (!bReady[m])
+    // The two modes alternate within one variant sweep and each mode's done
+    // histogram differs. Stale bins from the other mode silently truncate
+    // marches (a pixel with true done 283 stored as 60 gets capped at 65 and
+    // KEEPS reporting 65), corrupting both output and timing — and the warmup
+    // cannot be trusted to heal because each frame's written done is itself
+    // capped. Rebuild on every mode switch (untimed — before warmup).
+    static int lastBinMode[3] = {-1, -1, -1}; // indexed by variant slot
+    const int vslot = (variant == 17) ? 1 : 2;
+    const bool needBuild = !bReady[m] || lastBinMode[vslot] != mode;
+    const bool firstBuild = !bReady[m];
+    if (needBuild)
     {
       // Bucket-build frame: one full-cap binned pass (cap 1e6, covers every
-      // pixel, identical output to the baseline) that also fills histTex[0].
+      // pixel, identical output to the baseline) that also fills histTex.
       struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; } bp =
         { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, 100000, 100000 };
+      id<MTLTexture> buildTex = (variant == 20) ? s.histTex[2] : s.histTex[0];
       MTLRenderPassDescriptor* rb = [[MTLRenderPassDescriptor alloc] init];
       rb.colorAttachments[0].texture = s.colorTex;
       rb.colorAttachments[0].loadAction = MTLLoadActionClear;
       rb.colorAttachments[0].storeAction = MTLStoreActionStore;
-      rb.colorAttachments[1].texture = s.histTex[0];
+      rb.colorAttachments[1].texture = buildTex;
       rb.colorAttachments[1].loadAction = MTLLoadActionClear;
       rb.colorAttachments[1].storeAction = MTLStoreActionStore;
       id<MTLCommandBuffer> cbb = [s.q commandBuffer];
@@ -1549,7 +1639,7 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
       [eb setRenderPipelineState:s.ps[12]];
       [eb setVertexBuffer:s.vbuf offset:0 atIndex:0];
       [eb setFragmentTexture:s.volTex atIndex:0];
-      [eb setFragmentTexture:s.histTex[0] atIndex:1];
+      [eb setFragmentTexture:buildTex atIndex:1];
       [eb setFragmentSamplerState:s.smp atIndex:0];
       [eb setFragmentBytes:&bp length:sizeof(bp) atIndex:0];
       [eb drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -1561,7 +1651,7 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
         [s.dev newBufferWithLength:(NSUInteger)kRT * kRT * 2 options:MTLResourceStorageModeShared];
       id<MTLCommandBuffer> cbh = [s.q commandBuffer];
       id<MTLBlitCommandEncoder> blh = [cbh blitCommandEncoder];
-      [blh copyFromTexture:s.histTex[0] sourceSlice:0 sourceLevel:0
+      [blh copyFromTexture:buildTex sourceSlice:0 sourceLevel:0
         sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(kRT, kRT, 1)
         toBuffer:staging destinationOffset:0 destinationBytesPerRow:(NSUInteger)kRT * 2
         destinationBytesPerImage:(NSUInteger)kRT * kRT * 2];
@@ -1594,15 +1684,18 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
       bCaps[m][1] = caps[1];
       bCaps[m][2] = caps[2];
       bReady[m] = true;
-      fprintf(stderr, "V17 mode=%d bucket caps %d %d %d (cov %lld)\n",
-        mode, caps[0], caps[1], caps[2], cov);
+      lastBinMode[vslot] = mode;
+      if (firstBuild)
+      fprintf(stderr, "V%d mode=%d bucket caps %d %d %d (cov %lld)\n",
+        variant, mode, caps[0], caps[1], caps[2], cov);
     }
     // Binning only pays when the done histogram is strongly bimodal: the 25th
     // percentile cap must be <= half the 75th percentile (so the short buckets
     // actually truncate warps), and the uncapped long bucket must not absorb
     // most of the pixels. Otherwise (fine SD, uniform-ish marches) fall back to
-    // a single baseline pass — binning would only add pass overhead.
-    const bool useBinned = (mode == 0) &&
+    // a single baseline pass — binning would only add pass overhead. V17 gates
+    // to divergent only; V20 also tries fixed mode (2-pass median split).
+    const bool useBinned = ((variant == 17) ? (mode == 0) : true) &&
       (bCaps[m][0] <= bCaps[m][2] / 2) && (bCaps[m][2] - bCaps[m][0] >= 16);
     if (!useBinned)
     {
@@ -1656,6 +1749,89 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
         total += cb.GPUEndTime - cb.GPUStartTime;
       }
       return total / kFrames * 1000.0;
+    }
+    if (variant == 20)
+    {
+      // V20 steady passes: static bins (nothing writes histTex after the
+      // bucket-build), MARCH_VARIANT 15 fragment, single attachment — no
+      // per-pass history store. Divergent keeps the quartile 4-pass split;
+      // fixed mode uses a median 2-pass split (its top quartile bucket is
+      // empty since done <= fixedSteps always).
+      const int nPasses = (mode == 0) ? 4 : 2;
+      struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; }
+        passP[4] = {
+          { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, bCaps[m][0], bCaps[m][0] },
+          { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][0], bCaps[m][1], bCaps[m][1] },
+          { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][1], bCaps[m][2], bCaps[m][2] },
+          { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][2], 100000, 100000 },
+        };
+      if (mode == 1)
+      {
+        passP[0] = { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, -1, bCaps[m][1], bCaps[m][1] };
+        passP[1] = { mode, fixedSteps, kStep, kAlphaMul, kRT, kRT, kRT * kRT, kTile, kTile, 0.0f, bCaps[m][1], 100000, 100000 };
+      }
+      MTLRenderPassDescriptor* rp0 = [[MTLRenderPassDescriptor alloc] init];
+      rp0.colorAttachments[0].texture = s.colorTex;
+      rp0.colorAttachments[0].loadAction = MTLLoadActionClear;
+      rp0.colorAttachments[0].storeAction = MTLStoreActionStore;
+      MTLRenderPassDescriptor* rpN = [[MTLRenderPassDescriptor alloc] init];
+      rpN.colorAttachments[0].texture = s.colorTex;
+      rpN.colorAttachments[0].loadAction = MTLLoadActionLoad;
+      rpN.colorAttachments[0].storeAction = MTLStoreActionStore;
+      auto runStatic = [&]() {
+        for (int p = 0; p < nPasses; ++p)
+        {
+          id<MTLCommandBuffer> cb = [s.q commandBuffer];
+          id<MTLRenderCommandEncoder> enc =
+            [cb renderCommandEncoderWithDescriptor:(p == 0) ? rp0 : rpN];
+          [enc setRenderPipelineState:s.ps[15]];
+          [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
+          [enc setFragmentTexture:s.volTex atIndex:0];
+          [enc setFragmentTexture:s.histTex[2] atIndex:1];
+          [enc setFragmentSamplerState:s.smp atIndex:0];
+          [enc setFragmentBytes:&passP[p] length:sizeof(passP[p]) atIndex:0];
+          [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+          [enc endEncoding];
+          [cb commit];
+          [cb waitUntilCompleted];
+        }
+      };
+      for (int i = 0; i < kWarmup; ++i)
+      {
+        runStatic();
+      }
+      if (kHarness == 1)
+      {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < kFrames; ++i)
+        {
+          runStatic();
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(t1 - t0).count() / kFrames;
+      }
+      double gtotal = 0;
+      for (int i = 0; i < kFrames; ++i)
+      {
+        id<MTLCommandBuffer> cb = [s.q commandBuffer];
+        for (int p = 0; p < nPasses; ++p)
+        {
+          id<MTLRenderCommandEncoder> enc =
+            [cb renderCommandEncoderWithDescriptor:(p == 0) ? rp0 : rpN];
+          [enc setRenderPipelineState:s.ps[15]];
+          [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
+          [enc setFragmentTexture:s.volTex atIndex:0];
+          [enc setFragmentTexture:s.histTex[2] atIndex:1];
+          [enc setFragmentSamplerState:s.smp atIndex:0];
+          [enc setFragmentBytes:&passP[p] length:sizeof(passP[p]) atIndex:0];
+          [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+          [enc endEncoding];
+        }
+        [cb commit];
+        [cb waitUntilCompleted];
+        gtotal += cb.GPUEndTime - cb.GPUStartTime;
+      }
+      return gtotal / kFrames * 1000.0;
     }
     // Four passes per frame. Pass p covers prevDone in (lo_p, hi_p], cap_p.
     struct { int mode, fixedSteps; float step, alphaMul; int width, height, nPixels, tileW, tileH; float deadFlag; int bucketLo, bucketHi, bucketCap; }
@@ -1711,6 +1887,8 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
       return std::chrono::duration<double, std::milli>(t1 - t0).count() / kFrames;
     }
     // Per-frame GPU timestamps: time the 4-pass command buffer chain.
+    // Drained per frame (see the generic-path note: in-flight buffers report
+    // a shared GPUStartTime, so per-buffer spans require draining).
     double gtotal = 0;
     for (int i = 0; i < kFrames; ++i)
     {
@@ -1881,7 +2059,7 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
   auto run = [&]() {
     id<MTLCommandBuffer> cb = [s.q commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
-    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : variant]];
+    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : variant]];
     [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
     [enc setFragmentTexture:s.volTex atIndex:0];
     [enc setFragmentSamplerState:s.smp atIndex:0];
@@ -1907,12 +2085,17 @@ static double timeMetal(MetalState& s, int mode, int fixedSteps, int variant)
   }
   // GPU timestamps, not host wall time: GPUStartTime/GPUEndTime measure the
   // actual device execution of the render pass, comparable to GL_TIME_ELAPSED.
+  // NOTE: buffers MUST be drained per frame — with >1 buffer in flight every
+  // buffer reports the same GPUStartTime (batch start), so spans are
+  // meaningless. Verified: per-frame deltas in a pipelined stream equal the
+  // drained span (29.9-30.7ms vs 30.5ms), so draining measures the true
+  // sustained rate and does not depress GPU clocks.
   double total = 0;
   for (int i = 0; i < kFrames; ++i)
   {
     id<MTLCommandBuffer> cb = [s.q commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
-    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : variant]];
+    [enc setRenderPipelineState:s.ps[(variant == 12) ? 7 : (variant == 13) ? 8 : (variant == 14) ? 9 : (variant == 15) ? 10 : (variant == 16) ? 11 : (variant == 17) ? 12 : (variant == 18) ? 13 : (variant == 19) ? 14 : (variant == 20) ? 15 : variant]];
     [enc setVertexBuffer:s.vbuf offset:0 atIndex:0];
     [enc setFragmentTexture:s.volTex atIndex:0];
     [enc setFragmentSamplerState:s.smp atIndex:0];
@@ -2033,8 +2216,11 @@ int main(int argc, char** argv)
     "V15 batch-32     ",
     "V16 batch-48     ",
     "V17 binned-4pass ",
+    "V18 read-trilin  ",
+    "V19 half compos  ",
+    "V20 binned-static",
   };
-  for (int v = 0; v < 18; ++v)
+  for (int v = 0; v < 21; ++v)
   {
     const int useLod = (v >= 1) ? 1 : 0; // GL: implicit until V1, explicit after
     // Interleave the two modes within each backend to cancel drift, and the two
