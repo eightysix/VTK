@@ -801,6 +801,88 @@ METAL_ITER return encodes fzDebug/parity into G/B channels; probe early-return
 in fragment_volume_main gated on _padCropFlags[2] (reuses NOPREFETCH env);
 `[march] fc_doExit/fc_volRg8` and `[RG8]` stderr lines (env-gated).
 
+## 23. HANDOFF ablation complete (2026-08-22): all state candidates refuted; protocol upgraded
+
+§22's ranked candidates were implemented as env knobs in `jitter_gap_repro`
+and ablated at 1024/SD4 under a tightened protocol (`WARMUP=30` default,
+`ROUNDS` order-alternated interleaved rounds with mean±sd, `SELECT`/`ONLYGL`
+per-cell fresh-process runs, full table in jitter_gap_repro/RESULTS.md):
+
+| candidate | verdict |
+|---|---|
+| 1. drawable/window-backed context (`SURFACE=1`) | refuted (+24.5±4.9) |
+| 2. blending ONE/1−SRC_ALPHA (`BLEND=1`) | REFUTED, worse (+38.3) |
+| 3. combined structural knobs (`SPLIT_TF=1 WHILE=1`) | no stacking (+17.2) |
+| 4. uniform plumbing via UBO (`UBO=1`) | refuted (+23.4) |
+| 5. occupancy shaping (`PAD=1`) | refuted (+24.6) |
+| clip-prologue port (`CLIP=1`, byte-identical image) | refuted (+20.1) |
+| duty cycle / DVFS (`GAPMS`, fresh-process per cell) | refuted (+18.7 in-process; +20.6±1.0 fresh-process) |
+| per-frame camera orbit (`AZSTEP=0.1`, app bench does this) | +11.2±1.5 BUT confounded by ~47% sample shedding across the sweep; coverage-preserving doses show nothing. NOT evidence. |
+| **warm-up contamination (from issue_tax R3, commit 8dd24927a5)** | **CONFIRMED & FIXED**: WARMUP 5→30 halves Δ (+25.9±10.7 → +18.2±2.8) and cuts variance 4x |
+
+Live re-anchor same hour: app binary j0 29.32 / j1 37.98 → Δ +8.66 @1024;
+fresh-process harness j0 35.5±0.1 / j1 55.9±1.1 → Δ +20.6±1.0. The
+harness now measures GL as reproducibly as Metal — the residual is real,
+structural, and NOT: JIT/warm-up, surface, blending, uniforms, storage,
+profile, pass/depth structure, loop/TF shape, clip prologue, occupancy
+padding, thermal/duty cycle.
+
+Also root-caused this session: `appgl_parity`'s march truncates to ~1
+sample/ray (dirStep oversized ~4x → terminatePointMax median 21 iters);
+its earlier "Δ +1.5 ms" was an artifact of a shortened march and is
+retracted. Fix its matrix chain before using it as a composition probe.
+
+Next steps, in order:
+1. Fix appgl_parity's VS/object-space chain until coverage ≈40% and
+   meanIter ≈86; then its verbatim composed FS is the valid test of
+   whether shader composition alone carries the cheapness.
+2. If composition is exonerated: inverse-transplant — render the lean
+   harness FS inside the app process (TEMP bench mode in
+   TestMetalGLVisualComparison). +11 there ⇒ process-level driver state
+   (Metal coexistence is the leading suspect); +20 ⇒ mapper internals.
+3. Instruments GPU counters on both contexts (DRAM read amplification
+   would settle the line-coalescing model of §21 directly).
+
+## 24. RESOLVED (2026-08-22 night): the composed shader carries the cheap jitter
+
+The "next steps" of §23 completed within hours:
+
+1. `appgl_parity` root-caused and FIXED: its `kInvProj[11]` constant was
+   transcribed as 0 instead of -1 (verified against a fresh
+   glGetUniformfv dump via VTK_METAL_TEST_DUMP_UNIFORMS). The broken
+   inverse-projection w-row collapsed g_rayTermination near each ray's
+   entry, capping every march at g_terminatePointMax ~21 samples (vs
+   ~86-225 real). All earlier timings from that tool were artifacts.
+2. With the fix, appgl_parity — the VERBATIM composed FS in the identical
+   headless CGL+FBO harness context — now reads:
+
+| @1024/SD4 | GL j0 | GL j1 | jitter Δ |
+|---|---|---|---|
+| app binary (live) | 29.32 | 37.98 | +8.66 |
+| fixed appgl_parity | 25.53±1.7 | 33.24±0.9 | **+7.71 ±2.1** |
+| lean harness FS (WARMUP=30) | 35.5 | 55.9 | **+20.6** |
+
+Absolutes reconcile: live frame total minus parity GPU-only ≈ 3.8 ms of
+VTK CPU overhead on both j0 and j1.
+
+**CONCLUSION: §22 is resolved.** The app-vs-harness GL difference was in
+the shader composition all along; every context/state/duty-cycle knob had
+to be refuted first only because no one had ever run the composed shader
+in the harness with a correct march. The §21 "driver-state" suspicion is
+dead: two shaders, one context, one geometry, 13 ms of jitter delta.
+
+§21's inferred mechanism needs revision: it is not GL-vs-Metal tiling
+mystique — the LEAN GL shader pays the full tax while the COMPOSED GL
+shader does not, so the tax is a property of the per-sample instruction
+mix under phase scatter, on both APIs (Metal pays an analogous premium:
+lean-harness Metal Δ ~+20 vs app Metal Δ ~+18.5 at 1024).
+
+Remaining refinement (optional): bisect which ingredient(s) of the
+composed FS transfer the cheapness into the lean FS (conditional color
+fetch, R32F opacity LUT shape, scale/bias, sign-gated OOB test,
+currentT/tPM break form, or their combination). INCR=1 (incremental
+position accumulation alone) already refuted (+22.8).
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).

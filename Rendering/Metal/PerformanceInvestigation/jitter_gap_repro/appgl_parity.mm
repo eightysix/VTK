@@ -7,6 +7,23 @@
 // Usage: ./appgl_parity <rt> <sd> <frames> <dicom.u8> [j0|j1]
 //
 // THE JITTER IS GL'S, ON BOTH BACKENDS (the reference).
+//
+// TIMINGS VALID as of 2026-08-22 (kInvProj[11] transcription fixed; see
+// RESULTS.md): interleaved pairs at 1024/SD4 WARMUP=30 give
+//   j0 25.5 / j1 33.2 / jitter D +7.7 ms
+// reconciling with the live app binary (+8.66 incl ~3.8 ms VTK CPU/frame)
+// while the lean jitter_gap_repro FS pays +20.6 in the identical context.
+// The composed shader text carries the app's cheap jitter.
+//
+// Debug probes (env APPGL_DBG=n + APPGL_DUMP_PPM=1):
+//   14 entry position, 21 last-sampled position, 22 terminatePointMax,
+//   23 |g_dirStep| x64, 25 per-pixel final iteration count, 26 raw
+//   g_rayTermination ((pos*0.25+0.5) encoded).
+// TF_FACTOR: composite correction baked into the opacity LUT (live value 4).
+//
+// History: before the kInvProj fix this tool truncated every march at
+// g_terminatePointMax ~21 samples (vs ~86 real) and reported a bogus
+// j0 6.9 ms / jitter D +1.5 ms.
 
 #import <OpenGL/gl3.h>
 #import <OpenGL/OpenGL.h>
@@ -34,9 +51,14 @@ static const float kModelView[16] = {
   0.5f, 0.296198f, 0.813798f, 0.0f,
   -363.835f, -270.01f, -1928.61f, 1.0f };
 static const float kInvProj[16] = {
+  // VERBATIM from the live program (glGetUniformfv via
+  // VTK_METAL_TEST_DUMP_UNIFORMS, 2026-08-22). The previous transcription
+  // had [11]=0 instead of -1: the inverse-projection's w-row lost its
+  // -z_eye term, g_terminatePointMax collapsed to ~21 samples and every
+  // timing this tool produced was a truncated-march artifact.
   0.267949f, 0.0f, 0.0f, 0.0f,
   0.0f, 0.267949f, 0.0f, 0.0f,
-  0.0f, 0.0f, -0.000280993f, 0.0f,
+  0.0f, 0.0f, -0.000280993f, -1.0f,
   0.0f, 0.0f, -1.0f, 0.000646595f };
 static const float kInvModelView[16] = {
   0.866025f, -3.03887e-18f, 0.5f, 0.0f,
@@ -132,7 +154,12 @@ int main(int argc, const char** argv)
     float v0 = 71 * 255.0f / 1023.0f, v1 = 172 * 255.0f / 1023.0f;
     const float xs[4] = { 17.55f, 21.24f, 33.80f, 43.01f };
     const float ys[4] = { 0.0f, 0.0493f, 0.2497f, 0.0f };
-    const float factor = 4.0f; // sampleDistance / unitDistance
+    // TF_FACTOR: the composite correction sampleDistance/unitDistance baked
+    // into the app's opacity LUT (dumped value: 4). factor=1 disables it.
+    // NOTE (2026-08-22): factor=4 saturates rays early (short marches,
+    // coverage 10% vs the march's 19%) — invalid for timing comparisons
+    // unless the march stats are matched first.
+    const float factor = getenv("TF_FACTOR") ? (float)atof(getenv("TF_FACTOR")) : 4.0f;
     for (int i = 71; i <= 172; i++)
     {
       float v = i * 255.0f / 1023.0f;
@@ -301,6 +328,9 @@ float dbgMax = 0.0;
 float dbgSum = 0.0;
 vec3 dbgPos = vec3(0.0);
 float dbgAlpha = 0.0;
+vec3 g_lastPos = vec3(0.0);  // uDbg==21: last-sampled position (march exit probe)
+float g_dbgTPM = 0.0;        // uDbg==22: g_terminatePointMax probe
+float g_dbgDir = 0.0;        // uDbg==23: |g_dirStep| probe
 uniform sampler3D in_volume[1];
 uniform vec4 in_volume_scale[1];
 uniform vec4 in_volume_bias[1];
@@ -506,6 +536,8 @@ void initializeRayCast()
   g_terminatePos = g_rayTermination;
   g_terminatePointMax = length(g_terminatePos.xyz - g_dataPos.xyz) / length(g_dirStep);
   g_currentT = 0.0;
+  g_dbgTPM = g_terminatePointMax;
+  g_dbgDir = length(g_dirStep);
   vec4 tempClip = in_volumeMatrix[0] * vec4(rayDir, 0.0);
   if (tempClip.w != 0.0)
   {
@@ -532,6 +564,7 @@ vec4 castRay(const float zStart, const float zEnd)
     g_skip = false;
     if (!g_skip)
     {
+      g_lastPos = g_dataPos;
       vec4 scalar;
       scalar = texture3D(in_volume[0], g_dataPos);
       if (uDbg == 10) { g_fragColor = vec4(texture3D(in_volume[0], vec3(0.5, 0.5, 0.5)).r, texture3D(in_volume[0], vec3(0.25, 0.5, 0.5)).r, 0.0, 1.0); break; }
@@ -580,6 +613,11 @@ void finalizeRayCast()
   if (uDbg == 14) { fragColor = g_fragColor; return; }
   if (uDbg == 15) { fragColor = g_fragColor; return; }
   if (uDbg == 16) { g_fragColor = vec4(dbgPos.x, dbgPos.y, dbgPos.z, 1.0); fragColor = g_fragColor; return; }
+  if (uDbg == 21) { g_fragColor = vec4(g_lastPos.x, g_lastPos.y, g_lastPos.z, 1.0); fragColor = g_fragColor; return; }
+  if (uDbg == 22) { g_fragColor = vec4(clamp(g_dbgTPM, 0.0, 255.0) / 255.0, 0.0, 0.0, 1.0); fragColor = g_fragColor; return; }
+  if (uDbg == 23) { g_fragColor = vec4(clamp(g_dbgDir * 64.0, 0.0, 1.0), 0.0, 0.0, 1.0); fragColor = g_fragColor; return; }
+  if (uDbg == 25) { g_fragColor = vec4(clamp(g_currentT, 0.0, 255.0) / 255.0, 0.0, 0.0, 1.0); fragColor = g_fragColor; return; }
+  if (uDbg == 26) { g_fragColor = vec4(clamp(g_rayTermination * 0.25 + 0.5, 0.0, 1.0), 1.0); fragColor = g_fragColor; return; }
   if (uDbg == 19) { fragColor = g_fragColor; return; }
   if (uDbg == 7) { g_fragColor = vec4(dbgMax, dbgMax, dbgMax, 1.0); fragColor = g_fragColor; return; }
   if (uDbg == 8) { fragColor = g_fragColor; return; }
@@ -648,10 +686,54 @@ void main()
   // ---- uniforms
   glUniformMatrix4fv(glGetUniformLocation(prog, "uInvTexDataAdjusted"), 1, GL_FALSE, invtex);
   float ident[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+  // The k* constants are VTK-memory (row-major) listings; the live program's
+  // GLSL-visible matrices are their TRANSPOSES (verified against
+  // glGetUniformfv on 2026-08-22). Upload with GL_TRUE so the shader sees
+  // exactly what the app sees. With GL_FALSE the non-symmetric projection/
+  // modelview chains were garbage: g_terminatePointMax collapsed to ~21
+  // iterations and every ray truncated ~4x early (the source of all bogus
+  // fast timings from this tool before 2026-08-22).
   glUniformMatrix4fv(glGetUniformLocation(prog, "in_projectionMatrix"), 1, GL_FALSE, kProj);
   glUniformMatrix4fv(glGetUniformLocation(prog, "in_inverseProjectionMatrix"), 1, GL_FALSE, kInvProj);
   glUniformMatrix4fv(glGetUniformLocation(prog, "in_modelViewMatrix"), 1, GL_FALSE, kModelView);
   glUniformMatrix4fv(glGetUniformLocation(prog, "in_inverseModelViewMatrix"), 1, GL_FALSE, kInvModelView);
+
+  // UNIFORM_DUMP: introspect the linked program exactly like the mapper's
+  // VTK_METAL_TEST_DUMP_UNIFORMS hook so runtime state can be diffed
+  // against /tmp/app_gl_uniforms.txt mechanically.
+  {
+    FILE* uf = fopen("/tmp/parity_gl_uniforms.txt", "w");
+    if (uf)
+    {
+      GLint nuni = 0;
+      glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &nuni);
+      for (GLint i = 0; i < nuni; i++)
+      {
+        char uname[256]; GLsizei ulen = 0; GLint usize = 0; GLenum utype = 0;
+        glGetActiveUniform(prog, (GLuint)i, sizeof(uname), &ulen, &usize, &utype, uname);
+        GLint uloc = glGetUniformLocation(prog, uname);
+        fprintf(uf, "%s type=%u size=%d loc=%d", uname, utype, usize, uloc);
+        int nc = (utype == GL_FLOAT) ? 1 : (utype == GL_FLOAT_VEC2) ? 2 :
+          (utype == GL_FLOAT_VEC3) ? 3 : (utype == GL_FLOAT_VEC4) ? 4 :
+          (utype == GL_FLOAT_MAT4) ? 16 : (utype == GL_FLOAT_MAT3) ? 9 : 0;
+        if (nc > 0)
+        {
+          GLfloat uv[16] = { 0 };
+          glGetUniformfv(prog, uloc, uv);
+          fprintf(uf, " =");
+          for (int c = 0; c < nc; c++) fprintf(uf, " %g", (double)uv[c]);
+        }
+        else
+        {
+          GLint uv[4] = { 0 };
+          glGetUniformiv(prog, uloc, uv);
+          fprintf(uf, " = %d %d %d %d", uv[0], uv[1], uv[2], uv[3]);
+        }
+        fprintf(uf, "\n");
+      }
+      fclose(uf);
+    }
+  }
   glUniformMatrix4fv(glGetUniformLocation(prog, "in_volumeMatrix"), 1, GL_FALSE, ident);
   glUniformMatrix4fv(glGetUniformLocation(prog, "in_inverseVolumeMatrix"), 1, GL_FALSE, ident);
   glUniformMatrix4fv(glGetUniformLocation(prog, "in_textureDatasetMatrix"), 1, GL_FALSE, ident);
@@ -714,7 +796,8 @@ void main()
   glDisable(GL_DEPTH_TEST);
 
   glClearColor(0, 0, 0, 1);
-  for (int f = 0; f < 5; f++)
+  int warmupN = getenv("WARMUP") ? atoi(getenv("WARMUP")) : 30;  // issue_tax R3
+  for (int f = 0; f < warmupN; f++)
   {
     glClear(GL_COLOR_BUFFER_BIT);
     glDrawArrays(GL_TRIANGLES, 0, 36);

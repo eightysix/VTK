@@ -180,3 +180,112 @@ jitter tax while app-GL pays +10–12 ms on identical rays (HARNESS_VS_APP_GAP
 Both refuted (Metal inert throughout, Δ +21.6–24.5 ✓). Remaining candidates:
 drawable/window-backed surface vs headless FBO, blending state, uniform
 plumbing, occupancy shaping — see HARNESS_VS_APP_GAP §22 HANDOFF.
+
+## HANDOFF ablation complete + protocol upgrade (2026-08-22 session)
+
+Every remaining §22 HANDOFF candidate was implemented as an env knob in
+`jitter_gap_repro.mm` and measured at 1024/SD4, ROUNDS=2-4, WARMUP=30.
+New knobs: `WARMUP`, `ROUNDS` (order-alternated interleaved rounds,
+mean±sd), `SURFACE=1` (NSWindow+NSOpenGLView drawable context),
+`BLEND=1` (ONE, ONE_MINUS_SRC_ALPHA), `UBO=1` (std140 uniform block),
+`PAD=1` (dead-but-unremovable prologue ALU chains), `AZSTEP=d`
+(per-frame camera orbit replicating the app bench's `Azimuth(0.1)`),
+`CLIP=1` (the composer's AdjustSampleRangeForClipping prologue ported,
+plane a no-op exactly like the DICOMVolume scene's), `GAPMS=n` (idle
+before each block), `SELECT=g0,g1,m0,m1` / `ONLYGL=1` (per-cell runs).
+
+### Verdicts
+
+| knob | GL jitter Δ (ms) |
+|---|---|
+| legacy (WARMUP=5) | +25.87 ± 10.71 |
+| **WARMUP=30** (default now) | **+18.24 ± 2.81** |
+| SPLIT_TF=1 WHILE=1 combo | +17.17 ± 2.75 |
+| BLEND=1 | +38.31 ± 4.64 — REFUTED, worse |
+| SURFACE=1 | +24.47 ± 4.91 — refuted |
+| UBO=1 | +23.43 ± 3.22 — refuted |
+| PAD=1 | +24.63 ± 10.01 — refuted |
+| CLIP=1 | +20.05 ± 7.73 — refuted (image byte-identical ✓) |
+| AZSTEP=0.1 | +11.18 ± 1.49 — CONFOUNDED, see below |
+| GAPMS=2000 in-process | +18.67 ± 8.10 — refuted |
+| fresh-process per cell (`SELECT=g0` / `SELECT=g1`) | **+20.6 ± 1.0** (j0 35.5±0.1 / j1 55.9±1.1) |
+| app binary (live, same machine/hour) | **+8.66** (j0 29.32 / j1 37.98) |
+
+Key findings:
+
+1. **The warm-up fix from issue_tax_repro R3 transfers** (commit
+   8dd24927a5): Apple's GL driver keeps re-JITting freshly linked complex
+   programs past 10 draws; the harness's old 5-frame warm-up left JIT
+   residue inflating GL blocks and dominating variance. WARMUP=30 halves
+   the measured Δ and cuts its spread 4x. All historical single-shot
+   harness numbers carry this contamination.
+
+2. **Duty cycle / thermal state is NOT the mechanism**: the app-shaped
+   protocol (fresh process per jitter value, seconds of idle, 30-frame
+   bursts) is rock-stable and still pays +20.6 vs the app's +8.7 measured
+   minutes earlier.
+
+3. **AZSTEP (rotation) is not admissible evidence**: at the dose that
+   reaches app-level Δ (+11), coverage falls 198k→92k px across the sweep
+   (meanIter on the last frame: 113.7 over 177k px vs static 88.0 over
+   427k → ~47% fewer total samples). At coverage-preserving doses
+   (AZSTEP≤0.02) there is no improvement (+21.4±10.8). The app bench does
+   rotate its camera, but our orbit sheds grazing rays much faster than
+   the app's documented coverage; do not use rotation to claim parity.
+
+4. **appgl_parity timing is INVALID** — root-caused: its march terminates
+   after ~1 sample/ray (new probes uDbg==21 lastPos, ==22
+   terminatePointMax [median 21 iters, should be ~86-200], ==23 dirStep
+   [oversized ≥8 texels vs harness 2.9]). Its j0 6.9 ms / Δ +1.5 ms
+   reflect a ~5x-shortened march (stride bug in the matrix chain feeding
+   g_dirStep/g_terminatePointMax), NOT shader composition. Do not cite
+   them. The TF_FACTOR knob added there is secondary.
+
+5. Net: with rays/trip counts/field/uniforms proven identical (§12.1)
+   and every context/state/duty-cycle candidate now refuted under tight
+   protocols, the remaining harness-vs-app GL difference (~+12 ms of
+   jitter Δ; also j0 absolute: harness 35.5 pure-GPU vs app 29.3
+   including VTK CPU work) lives inside the app mapper's shader/mapper
+   execution itself. Next steps: fix appgl_parity's matrix chain until
+   its march stats match (coverage ~40%, meanIter ~86), then its verbatim
+   FS becomes the valid composition probe; or inverse-transplant the
+   lean harness FS into the app process to test process-level driver
+   state (e.g., Metal coexistence).
+
+## RESOLVED (same session, later): appgl_parity fixed — the composed shader carries the cheap jitter
+
+The truncation root-caused above was ONE mis-transcribed constant:
+`kInvProj[11]` held 0 instead of -1 (the inverse-projection w-row lost its
+-z_eye term, so g_rayTermination collapsed near the ray entry and every
+march stopped at min(tPM~21, saturation)). After correcting [11] to -1
+(verbatim from today's glGetUniformfv dump):
+
+| measurement @1024/SD4 | GL j0 | GL j1 | jitter D |
+|---|---|---|---|
+| app binary (live, incl VTK CPU) | 29.32 | 37.98 | **+8.66** |
+| **fixed appgl_parity** (3 interleave pairs) | 25.53 | 33.24 | **+7.71 +-2.1** |
+| lean jitter_gap_repro FS (WARMUP=30) | 35.5 | 55.9 | +20.6 |
+
+- Iteration stats now match the live app: covered 43%, meanIters ~81+
+  (was 21 before the fix).
+- Absolutes reconcile: app frame total - parity GPU-only ~= 3.8 ms of
+  VTK per-frame CPU overhead, consistent across j0/j1.
+
+CONCLUSION: the app's cheap jitter lives in the COMPOSED SHADER TEXT ITSELF.
+In the identical headless CGL+FBO harness context, the verbatim composed FS
+pays +7.7 ms where the lean reconstruction pays +20.6 ms on proven-identical
+rays/trip counts/field. All context/state/duty-cycle knobs were refuted
+first because they were not the mechanism. The earlier §11/§12 conclusion
+("not encoded in loop text") failed because individual knobs never
+reproduced the composition as a whole.
+
+New knob: `INCR=1` ports the composer's incremental position accumulation
+(g_dataPos += g_dirStep) into the lean loop — byte-identical image, NO
+effect on D (+22.8+-9.5): refuted as the single ingredient.
+
+Remaining (optional) work: bisect WHICH compositional ingredient(s)
+transfer the cheapness — candidates: conditional color fetch gated on
+opacity, 1024xR32F opacity LUT shape, per-sample scale/bias, sign-gated
+texMax OOB test, currentT/tPM break form, or simply their combination.
+For the Apple-report purpose the boundary is established: two shaders,
+one context, one geometry, 13 ms of jitter-delta difference.

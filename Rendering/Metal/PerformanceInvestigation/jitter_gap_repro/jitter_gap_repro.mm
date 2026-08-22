@@ -26,6 +26,7 @@
 //   M/GL  j0 <x>    j1 <x>
 //   RESULT: gap reproduced (j1 > 1.2) | closed (j1 < 1.05) | unexpected
 
+#import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <OpenGL/gl3.h>
@@ -34,7 +35,25 @@
 #import <simd/simd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+#include <unistd.h>
 #include <string>
+#include <vector>
+
+// Knob summary (HARNESS_VS_APP_GAP.md §22 HANDOFF + issue_tax_repro R3):
+//   WARMUP=n   warm-up draws per timed block (default 30; the historical 5 is
+//              proven contaminated — Apple's driver re-JITs fresh complex
+//              programs far past 10 draws; first block ran +32% hot).
+//   ROUNDS=n   order-alternated interleaved j0/j1 rounds (default 1), mean±sd
+//              reported; round 1 shows any residual warm-in transient.
+//   SURFACE=1  window-backed NSOpenGLView context (drawable attached) instead
+//              of headless CGL+FBO — HANDOFF candidate 1.
+//   BLEND=1    GL_BLEND (ONE, ONE_MINUS_SRC_ALPHA) during the timed draw (the
+//              app composites through it) — HANDOFF candidate 2.
+//   UBO=1      FS uniforms via std140 UBO instead of per-draw glUniform* —
+//              HANDOFF candidate 4.
+//   PAD=1      dead-but-unremovable prologue work (texture-seeded ALU chains)
+//              to emulate app register pressure — HANDOFF candidate 5.
 
 static const int kVolW = 512, kVolH = 512, kVolD = 1794;  // the app's DICOM volume
 // App DICOMVolume camera dump (normalized volume space / physical mm):
@@ -126,22 +145,83 @@ static double NowMs(void) { return CACurrentMediaTime() * 1000.0; }
 extern "C" void glTexStorage3D(unsigned target, int levels, unsigned internalformat, int w, int h, int d);
 
 // ---------------------------------------------------------------- GL backend
+static const int kWarmupDefault = 30;  // issue_tax_repro R3: 10 insufficient
+// Process-lifetime surface objects: a scoped NSWindow would deallocate while
+// its NSOpenGLContext survives, crashing the next drawable-backed run.
+static NSWindow* sWin = nil;
+static NSOpenGLView* sView = nil;
+
 static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const uint8_t* tf, int jitter)
 {
+  const int warmupN = getenv("WARMUP") ? atoi(getenv("WARMUP")) : kWarmupDefault;
+  const bool surfMode = getenv("SURFACE") != NULL;
+  const bool blendMode = getenv("BLEND") != NULL;
+  const bool uboMode = getenv("UBO") != NULL;
+  const bool padMode = getenv("PAD") != NULL;
+  // AZSTEP=deg: per-frame camera orbit about world-Y through the volume
+  // center — replicates the app bench, which calls camera->Azimuth(0.1)
+  // INSIDE its timed loop so rays change every frame (TestMetalGLVisualComparison.cxx).
+  const float azStep = getenv("AZSTEP") ? (float)atof(getenv("AZSTEP")) : 0.0f;
   // GL41=1: request the 4.1 core profile (the app's VTK context class)
   // instead of 3.2 core — different driver entry may pick different texture
   // tiling/sampling paths under phase-scattered trilinear.
   const char* profEnv = getenv("GL41");
   int glProfile = (int)(profEnv ? kCGLOGLPVersion_GL4_Core : kCGLOGLPVersion_3_2_Core);
-  CGLPixelFormatAttribute attrs[] = {
-    kCGLPFAAccelerated, kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)glProfile, (CGLPixelFormatAttribute)0 };
-  CGLPixelFormatObj pf = NULL; GLint npf = 0;
-  if (CGLChoosePixelFormat(attrs, &pf, &npf) != kCGLNoError || !pf) { fprintf(stderr, "no GL core pixel format (profile %d)\n", (int)glProfile); exit(1); }
-  fprintf(stderr, "[glnob] profile=%s\n", profEnv ? "4.1-core" : "3.2-core");
+  NSOpenGLContext* viewCtx = nil;
   CGLContextObj ctx = NULL;
-  if (CGLCreateContext(pf, NULL, &ctx) != kCGLNoError || !ctx) { fprintf(stderr, "no GL context\n"); exit(1); }
-  CGLSetCurrentContext(ctx);
-  CGLDestroyPixelFormat(pf);
+  if (surfMode)
+  {
+    // SURFACE=1 (HANDOFF candidate 1): window-backed NSOpenGLView — the app
+    // renders through an NSOpenGLContext with a real drawable surface; the
+    // old harness was pure offscreen CGL+FBO.
+    [NSApplication sharedApplication];
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    NSRect frame = NSMakeRect(40, 40, rt, rt);
+    NSOpenGLPixelFormatAttribute vattrs[] = {
+      NSOpenGLPFADoubleBuffer,
+      NSOpenGLPFANoRecovery,
+      NSOpenGLPFAAccelerated,
+      NSOpenGLPFAOpenGLProfile,
+      (NSOpenGLPixelFormatAttribute)(profEnv ? NSOpenGLProfileVersion4_1Core : NSOpenGLProfileVersion3_2Core),
+      (NSOpenGLPixelFormatAttribute)0 };
+    NSOpenGLPixelFormat* vpf = [[NSOpenGLPixelFormat alloc] initWithAttributes:vattrs];
+    if (!vpf) { fprintf(stderr, "no NSOpenGL pixel format\n"); exit(1); }
+    NSOpenGLView* view = [[NSOpenGLView alloc] initWithFrame:frame pixelFormat:vpf];
+    view.wantsBestResolutionOpenGLSurface = NO;  // backing store == points == rt
+    // defer:NO — a deferred borderless window never creates its native
+    // surface until moved onscreen, leaving FB0 incomplete.
+    NSWindow* win = [[NSWindow alloc] initWithContentRect:frame
+        styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
+    win.contentView = view;
+    win.title = @"jgr";
+    win.releasedWhenClosed = NO;
+    [win orderFrontRegardless];  // attach the surface without stealing focus
+    sWin = win;
+    sView = view;
+    viewCtx = view.openGLContext;
+    [viewCtx setView:view];
+    [viewCtx update];
+    [viewCtx makeCurrentContext];
+    ctx = viewCtx.CGLContextObj;
+    fprintf(stderr, "[glnob] profile=%s surface=drawable %ux%u\n",
+            profEnv ? "4.1-core" : "3.2-core",
+            (unsigned)view.bounds.size.width, (unsigned)view.bounds.size.height);
+  }
+  else
+  {
+    CGLPixelFormatAttribute attrs[] = {
+      kCGLPFAAccelerated, kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)glProfile, (CGLPixelFormatAttribute)0 };
+    CGLPixelFormatObj pf = NULL; GLint npf = 0;
+    if (CGLChoosePixelFormat(attrs, &pf, &npf) != kCGLNoError || !pf) { fprintf(stderr, "no GL core pixel format (profile %d)\n", (int)glProfile); exit(1); }
+    fprintf(stderr, "[glnob] profile=%s surface=headless-FBO\n", profEnv ? "4.1-core" : "3.2-core");
+    if (CGLCreateContext(pf, NULL, &ctx) != kCGLNoError || !ctx) { fprintf(stderr, "no GL context\n"); exit(1); }
+    CGLSetCurrentContext(ctx);
+    CGLDestroyPixelFormat(pf);
+  }
+  fprintf(stderr, "[glnob] warmup=%d%s%s%s%s%s%s\n", warmupN,
+          surfMode ? " SURFACE" : "", blendMode ? " BLEND" : "",
+          uboMode ? " UBO" : "", padMode ? " PAD" : "",
+          azStep != 0.0f ? " AZSTEP" : "", getenv("CLIP") ? " CLIP" : "");
 
   GLuint volTex = 0;
   glGenTextures(1, &volTex);
@@ -228,12 +308,19 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
   }
 
   GLuint rtTex = 0, fbo = 0, depthRbo = 0;
-  glGenTextures(1, &rtTex);
-  glBindTexture(GL_TEXTURE_2D, rtTex);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, rt, rt, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-  glGenFramebuffers(1, &fbo);
-  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rtTex, 0);
+  if (!surfMode)
+  {
+    glGenTextures(1, &rtTex);
+    glBindTexture(GL_TEXTURE_2D, rtTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, rt, rt, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rtTex, 0);
+  }
+  else
+  {
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);  // the drawable's back buffer
+  }
   // DEPTH knob (DEPTH=1, H4 A/B §3): attach a depth RBO so the pass carries
   // the same depth attachment as the app, and bind a dummy depth texture
   // fetched at FS start (pass split / TBDR structure without changing march).
@@ -287,6 +374,17 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
       "        && tStart + float(i) * stepSize < tExit - 1e-6\n"
       "        && accOp <= 0.996);\n"
       "  }\n"
+    : getenv("INCR")
+    ? // INCR=1: the composer's incremental position accumulation
+      // (g_dataPos += g_dirStep) instead of analytic index-based positions.
+      "  vec3 evalPoint = evalBase;\n"
+      "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n"
+      "    float s = VOL_FETCH;\n"
+      "    %s"
+      "    iterCount = i + 1;\n"
+      "    if (accOp > 0.996) break;\n"
+      "    evalPoint += evalStep;\n"
+      "  }\n"
     : getenv("WHILE")
     ? "  float currentT = tStart;\n"
       "  vec3 evalPoint = evalBase;\n"
@@ -335,10 +433,111 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
   const char* depthFetch = getenv("DEPTH")
     ? "  float dummyDepth = texture(uDepth, gl_FragCoord.xy / uRT).r;\n"
     : "  float dummyDepth = 0.0;\n";
-  char* fsBuf = (char*)malloc(16384);
+  // UBO=1 (HANDOFF candidate 4): move the FS value uniforms into a std140
+  // uniform block fed by a buffer object instead of per-draw glUniform*.
+  std::string uniDecl;
+  if (!uboMode)
+  {
+    uniDecl =
+      "uniform vec3 uTexelCount;\n"
+      "uniform vec3 uEye;\n"
+      "uniform vec3 uBoundsSize;\n"
+      "uniform mat4 uInvVP;\n"
+      "uniform float uSampleDistMM;\n"
+      "uniform float uRT;\n"
+      "uniform int uMaxIter;\n"
+      "uniform int uJitter;\n"
+      "uniform int uProbeRast;\n"
+      "uniform int uDebugIter;\n"
+      "uniform int uRayDump;\n"
+      "uniform mat4 uAz;\n"
+      "uniform vec3 uEyeAz;\n"
+      "uniform int uClip;\n"
+      "uniform mat4 uClipT2O;\n"
+      "uniform mat4 uClipO2T;\n"
+      "uniform vec3 uClipOrigin;\n"
+      "uniform vec3 uClipNormal;\n";
+  }
+  else
+  {
+    uniDecl =
+      "layout(std140) uniform UBlock {\n"
+      "  vec3 uTexelCount; vec3 uEye; vec3 uBoundsSize; mat4 uInvVP;\n"
+      "  float uSampleDistMM; float uRT; int uMaxIter; int uJitter;\n"
+      "  int uProbeRast; int uDebugIter; int uRayDump;\n"
+      "};\n"
+      "uniform mat4 uAz;\n"
+      "uniform vec3 uEyeAz;\n"
+      "uniform int uClip;\n"
+      "uniform mat4 uClipT2O;\n"
+      "uniform mat4 uClipO2T;\n"
+      "uniform vec3 uClipOrigin;\n"
+      "uniform vec3 uClipNormal;\n";  }
+  // PAD=1 (HANDOFF candidate 5): dead-but-unremovable prologue work — texture-
+  // seeded ALU chains kept live ACROSS the march loop by a 1e-9-weighted
+  // consume in the output — emulates the app FS's register pressure.
+  const char* padCode = padMode ?
+    "  vec4 padA = texture(uNoise, gl_FragCoord.xy / vec2(textureSize(uNoise, 0)) + vec2(0.25)).xyzw;\n"
+    "  vec4 padB = padA * 91.17 + vec4(uRT * 0.173);\n"
+    "  vec4 padC = padA.yzxw * 47451.31 - vec4(uSampleDistMM);\n"
+    "  vec4 padD = padB * padC + padA.wzyx;\n"
+    "  padD = padD * 1.13 + padC * 0.97;\n"
+    : "";
+  const char* padConsume = padMode ? " + dot(padD, vec4(1e-9))" : "";
+  // CLIP=1: the app's AdjustSampleRangeForClipping prologue, ported with the
+  // same instruction shape (tex->obj mat4, uniform-fed plane loop, obj->tex
+  // mat4, texMin/texMax validity test). The scene's plane (normal +Z at the
+  // min-Z face) clips NOTHING geometrically — like the app bench config, the
+  // work runs every fragment while the march stays bit-identical.
+  const char* clipCode = getenv("CLIP") ?
+    "  if (uClip > 0) {\n"
+    "    vec3 ctpS = max(uTexelCount - 1.0, 1e-4) / uTexelCount;\n"
+    "    vec3 ctpO = 0.5 / uTexelCount;\n"
+    "    vec3 startTex = ctpO + (eyeN + rayDir * tStart) * ctpS;\n"
+    "    vec3 stopTex = ctpO + (eyeN + rayDir * tExit) * ctpS;\n"
+    "    vec3 latOff = rayDir * (ctpS * jitterF);\n"
+    "    vec4 startPosObj = uClipT2O * vec4(startTex - latOff, 1.0);\n"
+    "    startPosObj = startPosObj / startPosObj.w;\n"
+    "    vec4 stopPosObj = uClipT2O * vec4(stopTex, 1.0);\n"
+    "    stopPosObj = stopPosObj / stopPosObj.w;\n"
+    "    vec3 dirObj = normalize(rayDir * uBoundsSize);\n"
+    "    float startDistance = dot(uClipNormal, uClipOrigin - startPosObj.xyz);\n"
+    "    float stopDistance = dot(uClipNormal, uClipOrigin - stopPosObj.xyz);\n"
+    "    bool startClipped = startDistance > 0.0;\n"
+    "    bool stopClipped = stopDistance > 0.0;\n"
+    "    if (!(startClipped && stopClipped)) {\n"
+    "      float rayDotNormal = dot(dirObj, uClipNormal);\n"
+    "      bool frontFace = rayDotNormal > 0.0;\n"
+    "      if (frontFace && startClipped) {\n"
+    "        float rayScaledDist = startDistance / rayDotNormal;\n"
+    "        startPosObj = vec4(startPosObj.xyz + rayScaledDist * dirObj, 1.0);\n"
+    "        vec4 nsp = uClipO2T * startPosObj;\n"
+    "        nsp /= nsp.w;\n"
+    "        vec3 q = (nsp.xyz + latOff - ctpO) / ctpS - eyeN;\n"
+    "        tStart = dot(q, rayDir) / max(dot(rayDir, rayDir), 1e-12);\n"
+    "      }\n"
+    "      if (!frontFace && stopClipped) {\n"
+    "        float rayScaledDist = stopDistance / rayDotNormal;\n"
+    "        stopPosObj = vec4(stopPosObj.xyz + rayScaledDist * dirObj, 1.0);\n"
+    "        vec4 nsp = uClipO2T * stopPosObj;\n"
+    "        nsp /= nsp.w;\n"
+    "        vec3 q2 = (nsp.xyz - ctpO) / ctpS - eyeN;\n"
+    "        tExit = dot(q2, rayDir) / max(dot(rayDir, rayDir), 1e-12);\n"
+    "      }\n"
+    "      if (any(greaterThan(startTex, uTexelCount)) ||\n"
+    "          any(lessThan(startTex, vec3(0.0)))) {\n"
+    "        fragColor = vec4(0.0);\n"
+    "        return;\n"
+    "      }\n"
+    "      int maxStepsC = max(0, int(ceil((tExit - tStart) / stepSize)));\n"
+    "      maxSteps = min(maxSteps, maxStepsC);\n"
+    "    }\n"
+    "  }\n"
+    : "";
+  char* fsBuf = (char*)malloc(24576);
   char* loopBuf = (char*)malloc(4096);
   snprintf(loopBuf, 4096, loopShape, stepBody);
-  snprintf(fsBuf, 16384,
+  snprintf(fsBuf, 24576,
     "#version 150\n"
     "%s"
     "out vec4 fragColor;\n"
@@ -348,27 +547,21 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
     "uniform sampler2D uColorTF;\n"
     "uniform sampler2D uOpacityTF;\n"
     "uniform sampler2D uDepth;\n"
-    "uniform vec3 uTexelCount;\n"
-    "uniform vec3 uEye;\n"
-    "uniform vec3 uBoundsSize;\n"
-    "uniform mat4 uInvVP;\n"
-    "uniform float uSampleDistMM;\n"
-    "uniform float uRT;\n"
-    "uniform int uMaxIter;\n"
-    "uniform int uJitter;\n"
-    "uniform int uProbeRast;\n"
-    "uniform int uDebugIter;\n"
-    "uniform int uRayDump;\n"
+    "%s"
     "void main() {\n"
     "  if (uProbeRast > 0) { fragColor = vec4(1.0,1.0,1.0,1.0); return; }\n"
     "  %s"
+    "  %s"
     "  vec2 ndc = gl_FragCoord.xy / uRT * 2.0 - 1.0;\n"
     "  vec4 w4 = uInvVP * vec4(ndc, 0.0, 1.0);\n"
-    "  vec3 ptPhys = w4.xyz / w4.w;\n"
-    "  vec3 rayDir = normalize(ptPhys / uBoundsSize - uEye);\n"
+    "  // AZSTEP: orbit the camera about world-Y through the volume center\n"
+    "  // (the app bench's per-frame Azimuth(0.1)); identity when disabled.\n"
+    "  vec3 ptPhys = (uAz * vec4(w4.xyz / w4.w, 1.0)).xyz;\n"
+    "  vec3 eyeN = uEyeAz;\n"
+    "  vec3 rayDir = normalize(ptPhys / uBoundsSize - eyeN);\n"
     "  vec3 inv = 1.0 / rayDir;\n"
-    "  vec3 t0 = (vec3(0.0) - uEye) * inv;\n"
-    "  vec3 t1 = (vec3(1.0) - uEye) * inv;\n"
+    "  vec3 t0 = (vec3(0.0) - eyeN) * inv;\n"
+    "  vec3 t1 = (vec3(1.0) - eyeN) * inv;\n"
     "  vec3 tmin3 = min(t0, t1);\n"
     "  vec3 tmax3 = max(t0, t1);\n"
     "  float tEnter = max(max(tmin3.x, tmin3.y), tmin3.z);\n"
@@ -402,9 +595,10 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
      "    tStart += uJitter > 0 ? jitterF : stepSize;\n"
      "  }\n"
     "  int maxSteps = max(0, int(ceil((tExit - tStart) / stepSize)));\n"
+    "  %s"
     "  vec3 ctpScale = max(uTexelCount - 1.0, 1e-4) / uTexelCount;\n"
     "  vec3 ctpOffset = 0.5 / uTexelCount;\n"
-    "  vec3 evalBase = ctpOffset + (uEye + rayDir * tStart) * ctpScale;\n"
+    "  vec3 evalBase = ctpOffset + (eyeN + rayDir * tStart) * ctpScale;\n"
     "  vec3 evalStep = rayDir * ctpScale * stepSize;\n"
     "  vec3 accColor = vec3(0.0);\n"
     "  float accOp = 0.0;\n"
@@ -417,9 +611,9 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
     "  } else if (uRayDump == 2) {\n"
     "    fragColor = vec4(evalStep * uTexelCount / 16.0, 1.0);\n"
     "  } else {\n"
-    "    fragColor = vec4(accColor + dummyDepth * 1e-4, accOp);\n"
+    "    fragColor = vec4(accColor + dummyDepth * 1e-4%s, accOp);\n"
     "  }\n"
-    "}\n", fetchDef, depthFetch, loopBuf);
+    "}\n", fetchDef, uniDecl.c_str(), depthFetch, padCode, clipCode, loopBuf, padConsume);
   const char* fs = fsBuf;
 
   GLuint prog = glCreateProgram();
@@ -451,6 +645,43 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
   glUniform1i(glGetUniformLocation(prog, "uOpacityTF"), 4);
   glUniform1i(glGetUniformLocation(prog, "uDepth"), 5);
 
+  if (uboMode)
+  {
+    // Mirrors layout(std140) UBlock (offsets 0/16/32/48, scalars from 112).
+    struct UBOData {
+      float texelCount[4], eye[4], boundsSize[4], invVP[16];
+      float sampleDistMM, rt; int maxIter, jitter;
+      int probeRast, debugIter, rayDump, endPad;
+    } ub;
+    memset(&ub, 0, sizeof(ub));
+    ub.texelCount[0] = kVolW; ub.texelCount[1] = kVolH; ub.texelCount[2] = kVolD;
+    ub.eye[0] = kEye[0]; ub.eye[1] = kEye[1]; ub.eye[2] = kEye[2];
+    ub.boundsSize[0] = kBounds[0]; ub.boundsSize[1] = kBounds[1]; ub.boundsSize[2] = kBounds[2];
+    memcpy(ub.invVP, kInvVP, sizeof(ub.invVP));
+    ub.sampleDistMM = sdMM; ub.rt = (float)rt; ub.maxIter = 8192; ub.jitter = jitter;
+    ub.probeRast = getenv("PROBE_RAST") ? 1 : 0;
+    ub.debugIter = getenv("GL_ITER") ? 1 : 0;
+    ub.rayDump = getenv("RAYS") ? atoi(getenv("RAYS")) : 0;
+    GLuint uboBuf = 0;
+    glGenBuffers(1, &uboBuf);
+    glBindBuffer(GL_UNIFORM_BUFFER, uboBuf);
+    glBufferData(GL_UNIFORM_BUFFER, sizeof(ub), &ub, GL_STATIC_DRAW);
+    GLuint bi = glGetUniformBlockIndex(prog, "UBlock");
+    glUniformBlockBinding(prog, bi, 7);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 7, uboBuf);
+    fprintf(stderr, "[glnob] UBO bound (block idx %u, %zu bytes)\n", bi, sizeof(ub));
+  }
+
+  if (blendMode)
+  {
+    // BLEND=1 (HANDOFF candidate 2): the app composites the volume pass
+    // through premultiplied-over blending; read-modify-write keeps the RT in
+    // tile memory. Output image on the cleared black target is ~unchanged.
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    fprintf(stderr, "[glnob] blend ONE/ONE_MINUS_SRC_ALPHA\n");
+  }
+
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_3D, volTex);
   glActiveTexture(GL_TEXTURE1);
@@ -464,6 +695,59 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
   glActiveTexture(GL_TEXTURE5);
   glBindTexture(GL_TEXTURE_2D, depthTex);
 
+  glUniform1i(glGetUniformLocation(prog, "uClip"), getenv("CLIP") ? 1 : 0);
+  {
+    // tex->obj / obj->tex: obj_mm = (tex - offset)/scale * bounds (the
+    // composer's clip_texToObjMat/clip_objToTexMat pair).
+    float t2o[16] = {0}, o2t[16] = {0};
+    const float sc[3] = { (kVolW - 1.0f) / kVolW, (kVolH - 1.0f) / kVolH, (kVolD - 1.0f) / kVolD };
+    const float of[3] = { 0.5f / kVolW, 0.5f / kVolH, 0.5f / kVolD };
+    for (int a = 0; a < 3; a++)
+    {
+      t2o[a * 4 + a] = kBounds[a] / sc[a];       // column a, row a
+      t2o[12 + a] = -of[a] * kBounds[a] / sc[a]; // column 3, row a
+      o2t[a * 4 + a] = sc[a] / kBounds[a];
+      o2t[12 + a] = of[a];
+    }
+    t2o[15] = o2t[15] = 1.0f;
+    glUniformMatrix4fv(glGetUniformLocation(prog, "uClipT2O"), 1, GL_FALSE, t2o);
+    glUniformMatrix4fv(glGetUniformLocation(prog, "uClipO2T"), 1, GL_FALSE, o2t);
+    // the DICOMVolume scene's plane: normal +Z at the min-Z face — clips nothing
+    glUniform3f(glGetUniformLocation(prog, "uClipOrigin"), 0.0f, 0.0f, 0.0f);
+    glUniform3f(glGetUniformLocation(prog, "uClipNormal"), 0.0f, 0.0f, 1.0f);
+  }
+
+  GLint azLoc = glGetUniformLocation(prog, "uAz");
+  GLint eyeAzLoc = glGetUniformLocation(prog, "uEyeAz");
+  {
+    float ident[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+    glUniformMatrix4fv(azLoc, 1, GL_FALSE, ident);
+    glUniform3f(eyeAzLoc, kEye[0], kEye[1], kEye[2]);
+  }
+  double azCur = 0.0;
+  auto AdvanceAzimuth = [&]()
+  {
+    if (azStep == 0.0f) return;
+    azCur += azStep;
+    const double th = azCur * M_PI / 180.0;
+    const double cth = cos(th), sth = sin(th);
+    // p' = c + R*(p - c) in physical mm; column-major mat4 for glUniform.
+    const float cx = kBounds[0] * 0.5f, cyv = kBounds[1] * 0.5f, cz = kBounds[2] * 0.5f;
+    float m[16] = { 0 };
+    m[0] = (float)cth;  m[2] = (float)sth;
+    m[5] = 1.0f;
+    m[8] = (float)-sth; m[10] = (float)cth;
+    m[12] = (float)(cx - cth * cx - sth * cz);
+    m[13] = 0.0f;
+    m[14] = (float)(cz + sth * cx - cth * cz);
+    m[15] = 1.0f;
+    glUniformMatrix4fv(azLoc, 1, GL_FALSE, m);
+    const double ex = kEye[0] * kBounds[0], ez = kEye[2] * kBounds[2];
+    const double rx = cth * (ex - cx) + sth * (ez - cz) + cx;
+    const double rz = -sth * (ex - cx) + cth * (ez - cz) + cz;
+    glUniform3f(eyeAzLoc, (float)(rx / kBounds[0]), kEye[1], (float)(rz / kBounds[2]));
+  };
+
   glViewport(0, 0, rt, rt);
   GLuint vao = 0;
   glGenVertexArrays(1, &vao);
@@ -476,22 +760,34 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
   glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, NULL);
 
   glClearColor(0, 0, 0, 1);
-  for (int f = 0; f < 5; f++) {          // warm-up (cold-start skews GL badly)
+  // WARMUP knob (issue_tax_repro R3): fresh complex programs keep re-JITting
+  // far past a handful of draws — first timed block ran +32% hot with <10
+  // warm-up frames. Default raised 5 -> 30; legacy runs: WARMUP=5.
+  for (int f = 0; f < warmupN; f++) {
+    AdvanceAzimuth();
     glClear(GL_COLOR_BUFFER_BIT);
     glDrawArrays(GL_TRIANGLES, 0, 36);
     glFinish();
+    if (surfMode) [viewCtx flushBuffer];
   }
   double t0 = NowMs();
   for (int f = 0; f < frames; f++) {
+    AdvanceAzimuth();
     if (getenv("DEPTH")) glClear(GL_DEPTH_BUFFER_BIT | GL_COLOR_BUFFER_BIT);
     else glClear(GL_COLOR_BUFFER_BIT);
     glDrawArrays(GL_TRIANGLES, 0, 36);
     glFinish();
+    if (surfMode) [viewCtx flushBuffer];
   }
   double dt = NowMs() - t0;
 
   int nonzero = 0;
   {
+    // Untimed complete draw so the readable buffer holds a full image
+    // (SURFACE back buffers are swapped by flushBuffer above).
+    glClear(getenv("DEPTH") ? (GL_DEPTH_BUFFER_BIT | GL_COLOR_BUFFER_BIT) : GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLES, 0, 36);
+    glFinish();
     uint8_t* pix = (uint8_t*)malloc((size_t)rt * rt * 4);
     glReadPixels(0, 0, rt, rt, GL_RGBA, GL_UNSIGNED_BYTE, pix);
     for (size_t i = 0; i < (size_t)rt * rt * 4; i += 4)
@@ -527,6 +823,7 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
           jitter, dt / frames, nonzero, rt * rt);
   CGLSetCurrentContext(NULL);
   CGLDestroyContext(ctx);
+  viewCtx = nil;  // releases the view/window drawable
   return dt / frames;
 }
 
@@ -863,20 +1160,86 @@ int main(int argc, const char** argv)
     uint8_t tf[256 * 4];
     MakeTF(tf);
 
-    // Interleaved A/B: j0 pair then j1 pair (battery drift is between pairs,
-    // the deltas are measured back-to-back in the same thermal window).
+    // Interleaved order-alternated A/B (the doc's standing protocol): each
+    // round runs the full matrix; odd rounds run the exact reverse order so
+    // warm-in/thermal bias cancels across rounds instead of loading the first
+    // cell. ROUNDS=1 reproduces the historical single pass.
     int j1mode = 1;
     if (argc > 5 && strcmp(argv[5], "constphase") == 0) j1mode = 2;
     if (argc > 5 && strcmp(argv[5], "fetchonly") == 0) j1mode = 3;
     if (argc > 5 && strcmp(argv[5], "lattice") == 0) j1mode = 4;
-    double g0 = RunGL(rt, sd, frames, vol, tf, 0);
-    double g1 = RunGL(rt, sd, frames, vol, tf, j1mode);
-    double m0 = RunMetal(rt, sd, frames, vol, tf, 0);
-    double m1 = RunMetal(rt, sd, frames, vol, tf, j1mode);
+    int rounds = getenv("ROUNDS") ? atoi(getenv("ROUNDS")) : 1;
+    if (rounds < 1) rounds = 1;
+    if (rounds > 8) rounds = 8;
+    // GAPMS=n: idle before EVERY timed block. The app protocol measures
+    // cool-start bursts (fresh process per jitter value; seconds of startup
+    // idle between them) while the old harness marched blocks back-to-back,
+    // soaking the GPU — a duty-cycle difference, not a shader/state one.
+    const int gapMs = getenv("GAPMS") ? atoi(getenv("GAPMS")) : 0;
+    // SELECT=g0,g1,m0,m1: run only the listed cells (default all). ONLYGL=1
+    // drops the Metal cells so each invocation mirrors one app bench run.
+    bool sel[4] = { true, true, true, true };
+    if (const char* s = getenv("SELECT"))
+    {
+      sel[0] = sel[1] = sel[2] = sel[3] = false;
+      if (strstr(s, "g0")) sel[0] = true;
+      if (strstr(s, "g1")) sel[1] = true;
+      if (strstr(s, "m0")) sel[2] = true;
+      if (strstr(s, "m1")) sel[3] = true;
+    }
+    if (getenv("ONLYGL")) { sel[2] = sel[3] = false; }
+    fprintf(stderr, "[proto] rounds=%d frames/run=%d gapMs=%d\n", rounds, frames, gapMs);
+    double G0[8] = {0}, G1[8] = {0}, M0[8] = {0}, M1[8] = {0};
+    for (int r = 0; r < rounds; r++)
+    {
+      const bool flip = (r & 1) != 0;
+      if (!flip)
+      {
+        if (sel[0]) { if (gapMs) usleep(gapMs * 1000); G0[r] = RunGL(rt, sd, frames, vol, tf, 0); }
+        if (sel[1]) { if (gapMs) usleep(gapMs * 1000); G1[r] = RunGL(rt, sd, frames, vol, tf, j1mode); }
+        if (sel[2]) { if (gapMs) usleep(gapMs * 1000); M0[r] = RunMetal(rt, sd, frames, vol, tf, 0); }
+        if (sel[3]) { if (gapMs) usleep(gapMs * 1000); M1[r] = RunMetal(rt, sd, frames, vol, tf, j1mode); }
+      }
+      else
+      {
+        if (sel[3]) { if (gapMs) usleep(gapMs * 1000); M1[r] = RunMetal(rt, sd, frames, vol, tf, j1mode); }
+        if (sel[2]) { if (gapMs) usleep(gapMs * 1000); M0[r] = RunMetal(rt, sd, frames, vol, tf, 0); }
+        if (sel[1]) { if (gapMs) usleep(gapMs * 1000); G1[r] = RunGL(rt, sd, frames, vol, tf, j1mode); }
+        if (sel[0]) { if (gapMs) usleep(gapMs * 1000); G0[r] = RunGL(rt, sd, frames, vol, tf, 0); }
+      }
+      fprintf(stderr, "[round %d] GL dJit %+.3f ms | METAL dJit %+.3f ms\n",
+              r, G1[r] - G0[r], M1[r] - M0[r]);
+    }
+    auto meanOf = [](const double* v, int n) { double s = 0; for (int i = 0; i < n; i++) s += v[i]; return s / n; };
+    auto sdOf = [](const double* v, int n) {
+      if (n < 2) return 0.0;
+      double m = 0; for (int i = 0; i < n; i++) m += v[i]; m /= n;
+      double s = 0; for (int i = 0; i < n; i++) s += (v[i] - m) * (v[i] - m);
+      return sqrt(s / (n - 1));
+    };
+    double g0 = meanOf(G0, rounds), g1 = meanOf(G1, rounds);
+    double m0 = meanOf(M0, rounds), m1 = meanOf(M1, rounds);
+    if (!sel[0]) g0 = 0;
+    if (!sel[1]) g1 = 0;
+    if (!sel[2]) m0 = 0;
+    if (!sel[3]) m1 = 0;
+    double gd[8], md[8];
+    for (int r = 0; r < rounds; r++) { gd[r] = G1[r] - G0[r]; md[r] = M1[r] - M0[r]; }
 
-    fprintf(stderr, "\nGL    j0 %8.3f   j1 %8.3f   jitter %+6.1f%%\n", g0, g1, (g1 / g0 - 1.0) * 100.0);
-    fprintf(stderr, "METAL j0 %8.3f   j1 %8.3f   jitter %+6.1f%%\n", m0, m1, (m1 / m0 - 1.0) * 100.0);
-    fprintf(stderr, "M/GL  j0 %8.2f   j1 %8.2f\n", m0 / g0, m1 / g1);
+    if (sel[0] && sel[1])
+      fprintf(stderr, "\nGL    j0 %8.3f+-%.3f   j1 %8.3f+-%.3f   jitter %+6.1f%%\n",
+              g0, sdOf(G0, rounds), g1, sdOf(G1, rounds), (g1 / g0 - 1.0) * 100.0);
+    if (sel[2] && sel[3])
+      fprintf(stderr, "METAL j0 %8.3f+-%.3f   j1 %8.3f+-%.3f   jitter %+6.1f%%\n",
+              m0, sdOf(M0, rounds), m1, sdOf(M1, rounds), (m1 / m0 - 1.0) * 100.0);
+    if (g0 > 0 && g1 > 0 && m0 > 0 && m1 > 0)
+      fprintf(stderr, "M/GL  j0 %8.2f   j1 %8.2f\n", m0 / g0, m1 / g1);
+    if (sel[0] && sel[1])
+      fprintf(stderr, "dJit  GL %+.2f+-%.2f ms%s",
+              g1 - g0, sdOf(gd, rounds), sel[2] && sel[3] ? "   " : "\n");
+    if (sel[2] && sel[3])
+      fprintf(stderr, "METAL %+.2f+-%.2f ms\n", m1 - m0, sdOf(md, rounds));
+    if (!(g0 > 0 && g1 > 0 && m0 > 0 && m1 > 0)) { free(vol); return 0; }
     double r1 = m1 / g1;
     if (r1 > 1.2f)
       fprintf(stderr, "RESULT: GAP REPRODUCED (M/GL j1 %.2f) — same jitter field, read path diverges\n", r1);
