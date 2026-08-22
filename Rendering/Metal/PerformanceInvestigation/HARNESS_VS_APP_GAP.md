@@ -1458,6 +1458,301 @@ Verdict: §26.6 item 1's scope caveat is answered for orientation; VOLTRANSPOSE
 is safe-by-construction across volume shapes now, not just across the
 datasets that happen to be Z-longest.
 
+## 31. Session 2026-08-22 night: mv0/mv9 recheck on post-transpose code + NEW ISSUE — tr×mm catastrophe at fine SD
+
+Context: HEAD `d1724e10de` plus `3e352942ff` (mapper `VolumeMarchVariant()`
+now reads `VTK_METAL_TEST_MARCH_VARIANT` LIVE per feature-mask build instead of
+once-per-process, and test-vtk-metal's macOS Rendering menu gained an mv9
+toggle, ⌘⌥V — same setenv+rebuild pattern as the transpose toggle). All runs:
+battery-powered (absolute ms carry session drift; relative pairs measured
+back-to-back), single 30-frame rounds per cell with interleaved
+order-alternated / combo-rotated arms; verification passes replicated key
+cells within ~2–5%. Logs: `/tmp/mvmatrix/`, `/tmp/mvmatrix_az/`,
+`/tmp/recheck_tr_mm/`. Sanity canaries matched frozen anchors (2048 oblique j1
+21.0–24.0 vs §30.2's 23.0; MARCH_DEBUG mask prints confirmed engaged config).
+
+### 31.1 mv0(default) vs mv9, MINMAX=0/ACCEL=0, blue-noise field
+
+**Resolution × SD × axis grid (96 cells @800/1024/2048):**
+
+Oblique is a dead tie everywhere (mv9/def 0.97–1.03) at both SDs and both
+jitters; jitter Δ ≈ 0 for BOTH variants (±0.7 ms) — VOLTRANSPOSE has erased
+the old interactive-path tax entirely.
+
+Axis views SD4 (def/mv9): x-march = the ONLY losing class anywhere (mv9 wins
+j0 −7…−13% but LOSES j1 +3…+14%; ≤~2 ms); y/z mv9 wins −11…−32%. SD0.5 axes:
+mv9 wins every cell by 33–45% (z@2048 j0 342→189). Jitter Δ ≈ 0 on y/z/x at
+SD0.5; x@SD4 still carries the relocated tax (+5–13 ms, BOTH variants).
+
+**Azimuth compass @1024 SD4** (`CAM_AZ` = offset over base Azimuth 30°; NOTE
+the bench-default oblique takes the else branch = net −30°, so it is NOT AZ0):
+
+| AZ | j0 def/mv9 | j1 def/mv9 | Δj def/mv9 |
+|---|---|---|---|
+| 0° | 19.31/**14.01** | 22.66/**14.81** | +3.4/+0.8 |
+| 45° | 8.44/8.43 | 18.47/**17.99** | +10.0/+9.6 |
+| 90° | 10.97/10.66 | 18.58/**16.81** | +7.6/+6.2 |
+| 135° | 18.09/**10.78** | 21.02/**11.82** | +2.9/+1.0 |
+| 180° | 19.62/**13.96** | 22.34/**14.92** | +2.7/+1.0 |
+| 225° | 8.54/8.35 | 18.75/18.60 | +10.2/+10.3 |
+| 270° | 10.66/10.37 | 18.44/**16.88** | +7.8/+6.5 |
+| 315° | 17.24/**10.52** | 20.01/**11.31** | +2.8/+0.8 |
+
+Two regimes matching §26's relocated-tax model (opposite-phase pairs): cheap
+class (0/135/180/315) — def pays +2.7–3.4 ms jitter, mv9 only +0.8–1.0 → mv9
+wins 25–43% on j0 AND j1; expensive class (45/225 worst, 90/270 mid) — both
+pay the full tax → ties. mv9 never loses a compass cell. SD0.5 compass: mv9
+wins every azimuth ~34–40%.
+
+**Verdict**: reverting TEMP-REPRO to 9 is net-positive on the raw path —
+neutral where it used to be contested (oblique), large wins elsewhere; sole
+regression is jittered sagittal views (+3–14% j1). §16's "do not blindly
+revert" caution was written pre-transpose against minmax-on numbers and does
+not extend to today's code. The earlier "oblique tie" was a single-camera
+artifact (net −30° sits in the cheap class near a variant-neutral spot).
+
+### 31.2 NEW ISSUE — tr×mm interaction @2048² SD0.5 (default variant)
+
+48 runs: VOLTRANSPOSE{0,1} × MINMAX/ACCEL{0,1} × jitter{0,1} × orientations
+(oblique default, CAM_AZ 45/135, CAM_AXIS x/y/z). ms/f below = mean(j0,j1);
+**jitter Δ ≤ 2 ms in ALL 24 cells** (jitter is free at SD0.5 post-transpose):
+
+| view | tr0+mm0 | tr0+mm1 | tr1+mm0 | tr1+mm1 |
+|---|---|---|---|---|
+| oblique def | 120.4 | 128.5 | **101.6** | 122.3 |
+| AZ45 | 108.3 | **99.2** | 99.3 | ☠️ 172.2 (+74%) |
+| AZ135 | 122.9 | 134.9 | 104.3 | **99.5** |
+| axis x | 229.4 | **213.4** | 231.9 | ☠️ **421.4 (+97%)** |
+| axis y | 224.6 | **213.9** | 227.3 | 220.3 |
+| axis z | 329.3 | 416.1 | 315.7 | **238.0** |
+
+Findings:
+
+1. **Transpose alone (mm0)**: −15% oblique/AZ135, −4% z, neutral x/y.
+   Consistent with §26.5/§30 anchors at this SD.
+2. **Minmax alone is NOT safe at fine SD**: +8–11% WORSE on oblique/AZ135,
+   +26% worse on axial-z (lattice-walk overhead exceeds skipping gains when
+   marches are dense), while helping az45/x/y by 4–10%. Prior minmax
+   validation (§16, §27.1) was SD4-only and never re-checked post-VOLTRANSPOSE.
+3. **The tr×mm INTERACTION is view-class-dependent and sometimes
+   catastrophic**: combined ON is best-in-row at z (238 vs tr1mm0's 316, −25%)
+   and AZ135 (99.5), but catastrophic at axis-x (+82% vs tr1mm0) and AZ45
+   (+73%). The pathological views are those whose rays travel along / cross
+   steeply the transposed depth' axis — prime suspect: the swizzled minmax
+   kernel/lattice path (§26.3 code-reviewed only) or lattice-walk fetches
+   scattering along the disfavored axis at fine SD.
+4. **Robustness ranking @SD0.5**: `tr1+mm0` never loses >~9% anywhere and wins
+   the interactive oblique path; the current production default (`tr1+mm1`)
+   can hit 170–420 ms frames where 100–240 is achievable in the same cells.
+
+### 31.3 HANDOFF — next work
+
+1. **Root-cause the tr×mm catastrophe** (axis-x / AZ45 @SD0.5):
+   - Isolate build vs walk: force the minmax lattice to be built from the
+     UNTRANSPOSED data (CPU path or kernel-swizzle off) while keeping the
+     transposed volume upload, and vice versa. Whichever arm collapses the
+     172/421 ms cells owns the bug.
+   - METAL_ITER-style PPM of samples-skipped per pixel per view: confirm the
+     walk visits/skips the same macrocells as tr0+mm1 (thrash vs geometry).
+   - Instruments GPU counters on the two pathological cells (still-open §22
+     item 6): DRAM read amplification would settle scattered-lattice-fetch
+     directly.
+2. **Map the SD-dependence**: rerun the 24-cell grid at SD4 (expect clean per
+   §16/§27) and SD1/SD2 to find whether a threshold exists. If yes: gate
+   `SetUseMinMaxAcceleration` off below it (mirroring mv9's MaxBatchWidth SD
+   mapping) — a STATIC quality-based gate, NOT runtime view gating (§25.5
+   reasoning applies).
+3. **mv9 under mm1 at SD0.5** (this sweep ran the default variant only):
+   mv9 carries its own fc_minmax lattice walk — does the catastrophe compound,
+   transfer, or vanish?
+4. **TEMP-REPRO revert decision**: supported for the raw path by §31.1;
+   before flipping the default, repeat the compass/axis A/B UNDER the
+   minmax-on production config, since §31.2 shows mm changes view-class
+   behavior.
+5. Protocol unchanged (§29/§25.7): eval-env wrappers, MARCH_DEBUG mask sanity,
+   fresh-pair A/Bs, same-session references, verify march stats before
+   trusting deltas.
+
+### 31.4 Reproduction (commit ref + verbatim scripts)
+
+**Code state**: results were measured on `d1724e10de` plus the working-tree
+mapper change (live `MARCH_VARIANT` env read) minutes later committed as
+**`3e352942ff`** — checkout ≥ `3e352942ff`. The live-read edit is timing-inert
+for these sweeps (each process sets the env once at launch), so any later
+commit without march/minmax/transpose changes reproduces too. Build:
+
+```
+./macos_metal_build.sh --resume     # produces build_macos_metal/bin/vtkMetalGLVisualComparison
+```
+
+Dataset: `/Users/macair/Public/IMR/CTIMR/IMRToraceAddome` (CT U8 512×512×1794).
+Extraction convention (§29): Metal ms/f is `$4` of the `DICOMVolume` row.
+The three generator scripts below are embedded verbatim (they lived in
+`/tmp/opencode/*.zsh`, which is volatile); save each as a file and invoke as
+shown. Battery vs AC changes absolute ms (~±5–10%), never the A/B ordering.
+
+**Script A — mv0-vs-mv9 resolution × SD × axis grid (§31.1, 96 cells).**
+Usage: `RESLIST="800 1024 2048" SEEDN=0 zsh mvmatrix.zsh` (one shot) or per-
+resolution chunks `RESLIST=800 SEEDN=0`, then `1024 SEEDN=16`, `2048 SEEDN=32`.
+
+```zsh
+#!/bin/zsh
+emulate -L zsh
+BIN="/Users/macair/Public/VTK-Source/mine/VTK/build_macos_metal/bin/vtkMetalGLVisualComparison"
+DICOM="/Users/macair/Public/IMR/CTIMR/IMRToraceAddome"
+OUT="/tmp/mvmatrix"; mkdir -p "$OUT"; RES_FILE="$OUT/results.txt"
+[[ -f "$RES_FILE" ]] || touch "$RES_FILE"
+
+bench() {
+  local R=$1 SD=$2 AX=$3 J=$4 V=$5
+  local extra=""
+  [[ "$V" == "mv9" ]] && extra="VTK_METAL_TEST_MARCH_VARIANT=9 "
+  [[ -n "$AX" ]] && extra="${extra}VTK_METAL_TEST_CAM_AXIS=$AX "
+  local C="VTK_METAL_TEST_SAMPLE_DISTANCE=$SD VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_MINMAX=0 VTK_METAL_TEST_ACCEL=0 VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=$J $extra"
+  local tag="r${R}_sd${SD}_${AX:-obl}_j${J}_${V}"
+  local log="$OUT/$tag.log"
+  eval "env $C $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 30 --reps 1 --size ${R}x${R}" >"$log" 2>&1
+  local ms=$(grep DICOMVolume "$log" | awk '{print $4}')
+  [[ -z "$ms" ]] && ms="PARSE_FAIL"
+  printf "%s %s\n" "$tag" "$ms" >> "$RES_FILE"
+  echo "$tag $ms"
+}
+cell() {
+  local R=$1 SD=$2 AX=$3 J=$4
+  CELLN=$((CELLN+1))
+  if (( CELLN % 2 )); then bench $R $SD $AX $J def; bench $R $SD $AX $J mv9
+  else bench $R $SD $AX $J mv9; bench $R $SD $AX $J def; fi
+}
+CELLN=${SEEDN:-0}
+for R in ${RESLIST:-800 1024 2048}; do
+  for SD in 4 0.5; do
+    for AX in "" x y z; do
+      for J in 0 1; do cell $R $SD "$AX" $J; done
+    done
+  done
+done
+echo "DONE CELLN=$CELLN"
+```
+
+**Script B — azimuth compass @1024 SD{4,0.5} × jitter × variant (§31.1).**
+Usage: `SEEDN=0 zsh azmatrix.zsh` (64 runs; §31.1 table quotes the SD4 rows).
+
+```zsh
+#!/bin/zsh
+emulate -L zsh
+BIN="/Users/macair/Public/VTK-Source/mine/VTK/build_macos_metal/bin/vtkMetalGLVisualComparison"
+DICOM="/Users/macair/Public/IMR/CTIMR/IMRToraceAddome"
+OUT="/tmp/mvmatrix_az"; mkdir -p "$OUT"; RES_FILE="$OUT/results.txt"
+[[ -f "$RES_FILE" ]] || touch "$RES_FILE"
+
+bench() {
+  local R=$1 SD=$2 AZ=$3 J=$4 V=$5
+  local extra="VTK_METAL_TEST_CAM_AZ=$AZ "
+  [[ "$V" == "mv9" ]] && extra="${extra}VTK_METAL_TEST_MARCH_VARIANT=9 "
+  local C="VTK_METAL_TEST_SAMPLE_DISTANCE=$SD VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_MINMAX=0 VTK_METAL_TEST_ACCEL=0 VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=$J $extra"
+  local tag="r${R}_az${AZ}_sd${SD}_j${J}_${V}"
+  local log="$OUT/$tag.log"
+  eval "env $C $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 30 --reps 1 --size ${R}x${R}" >"$log" 2>&1
+  local ms=$(grep DICOMVolume "$log" | awk '{print $4}')
+  [[ -z "$ms" ]] && ms="PARSE_FAIL"
+  printf "%s %s\n" "$tag" "$ms" >> "$RES_FILE"
+  echo "$tag $ms"
+}
+cell() {
+  local R=$1 SD=$2 AZ=$3 J=$4
+  CELLN=$((CELLN+1))
+  if (( CELLN % 2 )); then bench $R $SD $AZ $J def; bench $R $SD $AZ $J mv9
+  else bench $R $SD $AZ $J mv9; bench $R $SD $AZ $J def; fi
+}
+CELLN=${SEEDN:-0}
+for AZ in 0 45 90 135 180 225 270 315; do
+  for SD in 4 0.5; do
+    for J in 0 1; do cell 1024 $SD $AZ $J; done
+  done
+done
+echo "DONE CELLN=$CELLN"
+```
+
+**Script C — tr×mm × orientation grid @2048 SD0.5 (§31.2, 48 runs).**
+Chunks as run: `ORIENTS=":: :45: :135:" SEEDN=0`, `ORIENTS="x::" SEEDN=3`,
+`ORIENTS="y:: z::" SEEDN=5` (SEEDN only sets combo-rotation parity — thermal
+ordering, not results; any values work).
+
+```zsh
+#!/bin/zsh
+emulate -L zsh
+BIN="/Users/macair/Public/VTK-Source/mine/VTK/build_macos_metal/bin/vtkMetalGLVisualComparison"
+DICOM="/Users/macair/Public/IMR/CTIMR/IMRToraceAddome"
+OUT="/tmp/recheck_tr_mm"; mkdir -p "$OUT"; RES_FILE="$OUT/results.txt"
+[[ -f "$RES_FILE" ]] || touch "$RES_FILE"
+
+bench() {
+  local AX=$1 AZ=$2 TR=$3 MM=$4 J=$5
+  local extra=""
+  [[ -n "$AX" ]] && extra="${extra}VTK_METAL_TEST_CAM_AXIS=$AX "
+  [[ -n "$AZ" ]] && extra="${extra}VTK_METAL_TEST_CAM_AZ=$AZ "
+  local C="VTK_METAL_TEST_SAMPLE_DISTANCE=0.5 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 \
+VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 \
+VTK_METAL_TEST_MINMAX=$MM VTK_METAL_TEST_ACCEL=$MM \
+VTK_METAL_TEST_VOLTRANSPOSE=$TR VTK_METAL_TEST_GPU_TRANSPOSE=$TR \
+VTK_METAL_TEST_JITTER=$J $extra"
+  local tag="${AX:-${AZ:+az$AZ}-obl}"
+  tag="sd05_2048_${tag}_tr$TR\_mm$MM\_j$J"
+  local log="$OUT/$tag.log"
+  eval "env $C $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 30 --reps 1 --size 2048x2048" >"$log" 2>&1
+  local ms=$(grep DICOMVolume "$log" | awk '{print $4}')
+  [[ -z "$ms" ]] && ms="PARSE_FAIL"
+  printf "%s %s\n" "$tag" "$ms" >> "$RES_FILE"
+  echo "$tag $ms"
+}
+orient() {
+  local AX=$1 AZ=$2
+  local combos=("0 0" "0 1" "1 0" "1 1")
+  if (( CELLN % 2 )); then combos=("1 1" "1 0" "0 1" "0 0"); fi
+  for J in 0 1; do
+    for c in $combos; do
+      set -- $=c
+      bench "$AX" "$AZ" $1 $2 $J
+    done
+  done
+  CELLN=$((CELLN+1))
+}
+CELLN=${SEEDN:-0}
+for spec in ${ORIENTS:-"::" ":45:" ":135:" "x::" "y::" "z::"}; do
+  IFS=':' read -r AX AZ _ <<< "$spec"
+  orient "$AX" "$AZ"
+done
+echo "DONE CELLN=$CELLN"
+```
+
+**Spot-check canaries** (single cells, expect ±5% battery permitting):
+
+```
+B="build_macos_metal/bin/vtkMetalGLVisualComparison --bench --backend metal \
+--scene DICOMVolume --dicom /Users/macair/Public/IMR/CTIMR/IMRToraceAddome \
+--frames 30 --reps 1 --size 2048x2048"
+
+# oblique best cell ~101 ms (§31.2): transposed, minmax OFF:
+eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=0.5 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 \
+VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_MINMAX=0 \
+VTK_METAL_TEST_ACCEL=0 VTK_METAL_TEST_VOLTRANSPOSE=1 VTK_METAL_TEST_GPU_TRANSPOSE=1 \
+VTK_METAL_TEST_JITTER=0 $B"
+
+# catastrophe canary ~420 ms (§31.2 axis-x tr1+mm1): add VTK_METAL_TEST_CAM_AXIS=x,
+# MINMAX=1 ACCEL=1:
+eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=0.5 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 \
+VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_MINMAX=1 \
+VTK_METAL_TEST_ACCEL=1 VTK_METAL_TEST_VOLTRANSPOSE=1 VTK_METAL_TEST_GPU_TRANSPOSE=1 \
+VTK_METAL_TEST_JITTER=0 VTK_METAL_TEST_CAM_AXIS=x $B"
+
+# compass cheap-class canary ~11.8 ms j1 (§31.1 az135 mv9): @1024, MINMAX off,
+# JITTER=1, CAM_AZ=135, MARCH_VARIANT=9
+```
+
+If the axial-z identity-layout baseline reads ~75–80 instead of ~315–330, or
+oblique reads layout-insensitive ~24–33, your env did not reach the app
+(§29 failure signature).
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
@@ -1471,6 +1766,9 @@ datasets that happen to be Z-longest.
   `/tmp/np`, `/tmp/near`, `/tmp/pzsweep`, `/tmp/azsweep` (orientation/azimuth sweeps),
   `/tmp/matrix` (RG8 regression matrix + GL knob tests), `/tmp/rg8t` (final oblique matrix),
   `/tmp/vis_*`, `/tmp/vis2k_*` (visual exports), `/tmp/vis2k_diff_heat.png`.
+- Session 2026-08-22 night logs (§31): `/tmp/mvmatrix/` (mv0-vs-mv9 grid),
+  `/tmp/mvmatrix_az/` (azimuth compass), `/tmp/recheck_tr_mm/` (tr×mm SD0.5
+  grid); generator scripts embedded verbatim in §31.4.
 - App: `Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.mm`,
   `Rendering/Metal/Shaders/MetalShaders.metal`,
   `Rendering/VolumeOpenGL2/vtkOpenGLGPUVolumeRayCastMapper.cxx`.
