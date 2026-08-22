@@ -5584,9 +5584,41 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
   {
     return false;
   }
+  // The occupancy lattice AND its consumer (the fragment-shader walk via
+  // BuildGlobalPerBlockData's MinMaxInfo) live in DATA space: the march's
+  // evalPoint and ctpScale/ctpOffset stay original-volume coords under
+  // VOLTRANSPOSE (only volume fetches swizzle inside sampleVolumeScalar).
+  // volume_compute_minmax likewise expects u.volDim* in data space — it
+  // computes pos from them and applies the data->texture swizzle itself.
+  // So derive DATA dims here, NOT the (axis-swapped) texture extents:
+  // X-depth texture holds (D,H,W), Y-depth holds (W,D,H).
   int dims[3] = { static_cast<int>(volTex.width),
                   static_cast<int>(volTex.height),
                   static_cast<int>(volTex.depth) };
+  if (this->VolumeTextureAxisDepth == 1)
+  {
+    std::swap(dims[0], dims[2]);
+  }
+  else if (this->VolumeTextureAxisDepth == 2)
+  {
+    std::swap(dims[1], dims[2]);
+  }
+  // (RG8 pair-packing also keeps axisDepth==0 but halves texture depth; its
+  // lattice conventions were never defined for minmax — keep its pre-existing
+  // texture-dims behavior untouched.)
+  if (input && !VolumeRg8PairActive())
+  {
+    int inDims[3];
+    input->GetDimensions(inDims);
+    if (inDims[0] != dims[0] || inDims[1] != dims[1] || inDims[2] != dims[2])
+    {
+      vtkErrorMacro("ComputeMinMaxGPU: data-dims mismatch input="
+                    << inDims[0] << "x" << inDims[1] << "x" << inDims[2]
+                    << " recovered=" << dims[0] << "x" << dims[1] << "x"
+                    << dims[2] << " axisDepth=" << this->VolumeTextureAxisDepth);
+      std::copy(inDims, inDims + 3, dims);
+    }
+  }
 
   const int DS = ComputeMacrocellDownsample(this->SampleDistance, this->UseGPUMinMax);
   int mmDims[3] = {
@@ -5594,10 +5626,31 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     std::max(1, (dims[1] + DS - 1) / DS),
     std::max(1, (dims[2] + DS - 1) / DS)
   };
+  if (getenv("VTK_METAL_TEST_TR_DUMP") || getenv("VTK_METAL_TEST_TR_BENCH"))
+  {
+    fprintf(stderr,
+      "[TRMM] gpu minmax lattice: axis=%d dataDims %dx%dx%d mmDims %dx%dx%d (DS=%d)\n",
+      this->VolumeTextureAxisDepth, dims[0], dims[1], dims[2],
+      mmDims[0], mmDims[1], mmDims[2], DS);
+  }
 
   // Timestamp-based caching: skip recompute when nothing changed. The grid
   // dims are part of the key so switching sample-distance tiers (which moves
   // DS) rebuilds the occupancy grid for the new cell size.
+  if (getenv("VTK_METAL_TEST_TR_DUMP") || getenv("VTK_METAL_TEST_TR_BENCH"))
+  {
+    vtkVolumeProperty* propDbg = vol ? vol->GetProperty() : nullptr;
+    vtkPiecewiseFunction* opFuncDbg = propDbg ? propDbg->GetScalarOpacity() : nullptr;
+    fprintf(stderr,
+      "[TRMMCACHE] tex=%d input=%d opFunc=%d inMT=%llu upMT=%llu opMT=%llu "
+      "cachedDims %dx%dx%d want %dx%dx%d\n",
+      this->MinMaxTexture ? 1 : 0, input ? 1 : 0, opFuncDbg ? 1 : 0,
+      static_cast<unsigned long long>(input ? input->GetMTime() : 0),
+      static_cast<unsigned long long>(this->MinMaxUploadTime.GetMTime()),
+      static_cast<unsigned long long>(opFuncDbg ? opFuncDbg->GetMTime() : 0),
+      this->MinMaxDims[0], this->MinMaxDims[1], this->MinMaxDims[2],
+      mmDims[0], mmDims[1], mmDims[2]);
+  }
   if (input && this->MinMaxTexture)
   {
     vtkVolumeProperty* property = vol ? vol->GetProperty() : nullptr;
