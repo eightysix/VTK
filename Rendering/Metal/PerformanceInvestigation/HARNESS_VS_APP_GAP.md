@@ -1547,6 +1547,12 @@ Findings:
 
 ### 31.3 HANDOFF — next work
 
+> STATUS (2026-08-22 late night): items 1 and 2 superseded by §32 — the tr×mm
+> catastrophe was a build-side dims bug in `ComputeMinMaxGPU` (lattice built
+> from texture extents instead of data dims) and is FIXED; §31.2's
+> "minmax helps" cells (AZ45-adjacent az135/z) were corrupted-lattice artifacts.
+> The fine-SD minmax penalty itself is real and layout-independent (§32.3).
+
 1. **Root-cause the tr×mm catastrophe** (axis-x / AZ45 @SD0.5):
    - Isolate build vs walk: force the minmax lattice to be built from the
      UNTRANSPOSED data (CPU path or kernel-swizzle off) while keeping the
@@ -1753,6 +1759,145 @@ If the axial-z identity-layout baseline reads ~75–80 instead of ~315–330, or
 oblique reads layout-insensitive ~24–33, your env did not reach the app
 (§29 failure signature).
 
+## 32. RESOLVED (2026-08-22 late night): tr×mm catastrophe root-caused and fixed — GPU minmax lattice was built in the wrong coordinate space
+
+### 32.1 Root cause
+
+`ComputeMinMaxGPU` derived its lattice dimensions from the **volume TEXTURE
+extents** (`volTex.width/height/depth`). Under VOLTRANSPOSE those are the
+axis-SWAPPED extents, while both other ends of the pipeline live in DATA space:
+
+- `volume_compute_minmax` expects `u.volDim*` in data dims — it computes
+  `pos = (voxel+0.5)/volDims` and applies the data→texture swizzle
+  (`.zyx`/`.xzy`) itself. Fed texture dims, the normalized→texel conversion
+  rescales by mismatched extents (512↔1794 ⇒ ~3.5×), so every cell's min/max
+  came from scattered wrong voxels, and occupancy was written on a swapped
+  grid.
+- The fragment walk (`mmPos * mmDimF`, sample at `mmPos`) and the
+  `MinMaxInfo` uniform (`BuildGlobalPerBlockData` ← `MinMaxDims`) consume the
+  lattice in DATA space.
+
+Net under transpose: scrambled occupancy + grid geometry stretched ~3.5×/0.29×
+per axis. Skipping decisions became view-dependent garbage: catastrophic at
+fine SD where marches are dense (axis-x +97%, AZ45 +74% — §31.2), mildly
+wrong elsewhere. Identity layout masked everything (texture dims == data
+dims). The CPU minmax path (`UpdateMinMaxTexture`) always used input dims and
+was never affected.
+
+### 32.2 Fix
+
+In `ComputeMinMaxGPU`: recover DATA dims by inverse-swapping the texture
+extents per `VolumeTextureAxisDepth` (1=X-depth: swap[0]<->[2];
+2=Y-depth: swap[1]<->[2]), cross-checked against `input->GetDimensions()`
+(vtkErrorMacro + fallback on mismatch). mmDims, uniforms, `MinMaxDims`
+member, lattice texture creation and dispatch all become data-space; kernel
+and walk untouched. The crosscheck is skipped under `VolumeRg8PairActive()`
+(RG8 keeps axisDepth==0 but halves texture depth; its minmax conventions were
+never defined — pre-fix behavior preserved verbatim there). New env-gated
+diagnostics: `[TRMM]` (lattice geometry per build) and `[TRMMCACHE]`
+(cache-check inputs) on `VTK_METAL_TEST_TR_DUMP`/`TR_BENCH`.
+
+### 32.2.1 Safety sweep (final build)
+
+- **Byte-parity tr-mm ≡ identity-mm**: max Δ=0 at az135 SD0.5, oblique SD4,
+  AND axial-z SD0.5 (4.2M px each) — same lattice semantics regardless of
+  layout, the fix's core claim.
+- **Timing anchors** (final build vs earlier-today/session references):
+  SD4 tr+mm j0/j1 24.94/25.75 (ref 23.94/24.67, battery drift);
+  catastrophe canaries 229.6 axis-x / 107.3 AZ45 (pre-fix 421/172; raw arms
+  227/97).
+- **Identity layout untouched**: code path identical when axisDepth==0;
+  today's ABBA id-arm timings reproduced §31.2-class values.
+- **RG8 guard**: RG8=1 MINMAX=1 runs clean, lattice over pair dims exactly
+  as HEAD (no error spam); RG8×minmax remains semantically undefined but
+  unchanged.
+
+### 32.3 Results (@2048² SD0.5 raw-class config unless noted)
+
+Catastrophes eliminated (fixed build, verified twice):
+
+| view | pre-fix tr+mm | post-fix tr+mm | post-fix tr+raw |
+|---|---|---|---|
+| axis-x | ☠️ 421.4 | **212.8** | 227 |
+| AZ45 | ☠️ 172.2 | **98.6** | 96.6 |
+
+SD4 production anchor unchanged: tr mv0+minmax j0/j1 = 23.65/24.49 (§26.1
+reference 23.94/24.67).
+
+**New parity proof**: post-fix, tr+mm vs identity-mm renders are
+BYTE-IDENTICAL at az135 SD0.5 (max Δ=0, 4.2M px) — same data-space lattice ⇒
+same skipping decisions regardless of layout. Pre-fix this comparison could
+not even be formulated.
+
+ABBA-balanced minmax deltas at SD0.5 (order-alternated rounds; drift-immune):
+
+| view / layout | raw | +minmax | Δ |
+|---|---|---|---|
+| oblique, transposed | ~99.5 | ~123.2 | +24 ms (+24%) |
+| az135, transposed | ~102 | ~129 | +27 ms (+26%) |
+| axial-z, transposed | ~360–385ᵈ | ~470ᵈ | ~+90 ms |
+| az135, identity | ~122.9 | ~134.7 | +12 ms |
+| axial-z, identity | ~356 | ~460 | ~+100 ms |
+
+Post-fix there is NO residual transpose-specific interaction: minmax at fine
+SD costs about the same in both layouts (§31.2 finding #2 is the whole
+remaining story — poor skip efficiency when marching is DRAM-bound; DS=2
+cells over CT fine structure stay mostly non-empty after dilation).
+
+### 32.4 The pre-fix "minmax helps" cells were corrupted-lattice artifacts
+
+The §31.2 cells where tr+mm looked GOOD (az135 99.5, z 238) were re-measured
+by building HEAD and fixed binaries side-by-side (/tmp/vtkPreFixMM,
+/tmp/vtkFixedMM) and running interleaved order-alternated pairs:
+
+- The pre-fix binary reproduced §31.2's numbers exactly (az135 96.7–97.2,
+  z 232–234) in BOTH round orderings — binary identity, not thermal position.
+- Its images are still near-identical to correct renders (pre vs raw:
+  mean|d|=0.029, 0.18% px >1LSB, max 36): the scrambled field marked many
+  low-opacity-content cells empty, skipping near-invisible contributors —
+  accidentally fast because wrong. Not shippable behavior; the fix removes
+  the speedup along with the catastrophes.
+
+### 32.5 Protocol additions (§29-class traps hit today)
+
+- **Stale-binary trap**: after `git stash → build → stash pop`, the build dir
+  still held the PRE-FIX binary while sources were fixed; a full matrix ran
+  against it before the discrepancy surfaced. Verify a code marker whenever
+  binaries are swapped/stash-danced: `strings -a BIN | grep MARKER` plus
+  `cmp` against saved copies. Saved reference binaries caught it in one step.
+- **Arm-ordering bias**: the first sweep ran mm0 before mm1 in every view;
+  several "+cost" readings needed ABBA confirmation. axz additionally drifted
+  317→386 ms within one sweep — paired within-round deltas stayed valid,
+  absolutes did not.
+
+### 32.6 HANDOFF status after this session
+
+§31.3 item 1 (root-cause tr×mm) DONE — build/walk isolation resolved it as a
+build-side dims bug; no Instruments needed. Remaining:
+
+1. **Fine-SD minmax gate**: minmax hurts at SD≤~0.5 in BOTH layouts now
+   (+12..+100 ms by view). Map SD-dependence at SD1/SD2 (item 2 of §31.3)
+   and consider a STATIC sample-distance gate for
+   `SetUseMinMaxAcceleration` — layout-independent decision now.
+2. **mv9-under-mm1 at SD0.5** (§31.3 item 3) still untested.
+3. TEMP-REPRO revert decision (§31.3 item 4): mm behavior is now
+   layout-independent, so compass/axis A/Bs under mm-on reduce to the raw
+   ones plus the known fine-SD penalty; repeat once under the production
+   config before flipping defaults.
+4. Latent same-class bug noted: `volume_compute_normals` +
+   `EnsureGradientNormalTexture` also mix texture dims with data-space math
+   (mapper:2926 region) — currently DEAD CODE (`UsePrecomputedNormals=false`,
+   no setter calls anywhere); fix before ever enabling precomputed normals
+   under transpose.
+5. Partitioned-volume path (`usePartitions` + GPU minmax) reuses the same
+   kernel with per-block uniforms — audit its dim conventions too if
+   partitions+transpose ever combine.
+
+Logs: /tmp/trmm_fix/ (first matrix, ordering-biased — superseded),
+/tmp/trmm_ab/ (binary A/B), /tmp/trmm_abba/ + /tmp/trmm_abba_tr/ (clean ABBA),
+/tmp/trmmimg*/ (parity PNGs). Reference binaries: /tmp/vtkPreFixMM,
+/tmp/vtkFixedMM.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
@@ -1769,6 +1914,11 @@ oblique reads layout-insensitive ~24–33, your env did not reach the app
 - Session 2026-08-22 night logs (§31): `/tmp/mvmatrix/` (mv0-vs-mv9 grid),
   `/tmp/mvmatrix_az/` (azimuth compass), `/tmp/recheck_tr_mm/` (tr×mm SD0.5
   grid); generator scripts embedded verbatim in §31.4.
+- Session 2026-08-22 late-night logs (§32): `/tmp/trmm_fix/`, `/tmp/trmm_ab/`,
+  `/tmp/trmm_abba/`, `/tmp/trmm_abba_tr/` (timing matrices), `/tmp/trmmimg/`,
+  `/tmp/trmmimg2/` (parity PNG exports); reference binaries
+  `/tmp/vtkPreFixMM` + `/tmp/vtkFixedMM` (volatile — rebuild per §32.2 to
+  reproduce).
 - App: `Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.mm`,
   `Rendering/Metal/Shaders/MetalShaders.metal`,
   `Rendering/VolumeOpenGL2/vtkOpenGLGPUVolumeRayCastMapper.cxx`.
