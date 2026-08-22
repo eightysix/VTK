@@ -992,6 +992,10 @@ measurement (±1 ms); always verify march stats (covered ≈40%, meanIter
 affects absolute ms only. TEMP debug edits still in tree (METAL_ITER G/B
 encoding, probe early-return gated on `_padCropFlags[2]`, `[march]`/
 `[RG8]` stderr lines) — revert before any production-facing landing.
+INVOCATION: app-bench wrappers MUST use `eval "env $C ... $B"`-style
+expansion — zsh does not word-split unquoted `$VARS` and silent
+default-config runs fake "convergence"; see §29 for the verbatim recipe
+and canary numbers.
 
 ## 26. RESOLVED (2026-08-22 night): transposed volume upload kills the Metal jitter tax — root cause found, production port byte-parity
 
@@ -1321,6 +1325,57 @@ are settled — GPU transpose removes the only remaining runtime cost of the
 transposed representation (seconds → tens of ms at load), so
 `VOLTRANSPOSE` + `GPU_TRANSPOSE` together have no load-time penalty worth
 gating on.
+
+## 29. Benchmark invocation guide (2026-08-22): the zsh word-splitting trap
+
+A full afternoon was lost to phantom "regressions" caused purely by shell
+quoting: **zsh does not word-split unquoted `$VARS`**. An invocation like
+`env $C ... $B` (with `C`/`B` config strings) passes the ENTIRE string as ONE
+argv element, so `env` sets a single garbage variable whose NAME contains
+spaces and the app silently runs with DEFAULTS — minmax/accel ON, default
+sample distance, adaptive slabs. Those runs look plausible (~24-33 ms
+oblique j0) and layout-insensitive (baseline ≈ transposed in every cell,
+jitter Δ ≈ 0 or even negative), i.e. exactly a "convergence" that does not
+exist. The doc's frozen numbers only reproduce when the config string is
+re-parsed by the shell (`eval`) or written out literally.
+
+Rules for any wrapper around this bench:
+
+1. Build the command with `eval "env $C ... $B"` (re-splits correctly in zsh
+   AND bash), or write every VAR=VAL literally on the command line.
+2. `env` consumes leading `-`-prefixed args as ITS OWN options — every app
+   flag must come AFTER the binary path ("env: --backend: No such file or
+   directory" means you got this wrong).
+3. Sanity-check the engaged config at least once per session:
+   `VTK_METAL_TEST_MARCH_DEBUG=1` prints `[march] mask=0x…` per pipeline
+   (VolTransposed = bit 31 = 0x80000000; slab = bit 28), and METAL_ITER/GL_ITER
+   march stats must read meanIter ≈ 81-86 @1024 before trusting any delta.
+4. Extraction: the bench row is `scene GLms GLfps Metalms Metalfps M/GL` —
+   GL ms/f is `$2`, Metal ms/f is `$4`.
+
+Verbatim, fully working example (repository root, zsh/bash; pathological
+cell @2048/SD4 raw oblique, blue-noise jitter, slabs=1):
+
+```
+C="VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 \
+VTK_METAL_TEST_MINMAX=0 VTK_METAL_TEST_ACCEL=0 VTK_METAL_TEST_NUM_SLABS=1 \
+VTK_METAL_TEST_IGN_JITTER=0"
+B="build_macos_metal/bin/vtkMetalGLVisualComparison --bench --backend metal \
+--scene DICOMVolume --dicom /Users/macair/Public/IMR/CTIMR/IMRToraceAddome \
+--frames 30 --reps 1 --size 2048x2048"
+
+# untransposed baseline (explicit — VOLTRANSPOSE defaults ON since §29 era):
+eval "env $C VTK_METAL_TEST_JITTER=0 VTK_METAL_TEST_VOLTRANSPOSE=0 $B"
+eval "env $C VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_VOLTRANSPOSE=0 $B"
+# transposed (GPU kernel is also default-ON; =0 forces the CPU repack):
+eval "env $C VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_VOLTRANSPOSE=1 $B"
+```
+
+Expected @2048/SD4 raw oblique (§26.5 anchor): baseline j0/j1 ≈ 43/66
+(Δ +22 ms), transposed ≈ 20/22 (Δ +2 ms). Axis cells via
+`VTK_METAL_TEST_CAM_AXIS=x|y|z` inside the same eval pattern (axial-z
+baseline j1 ≈ 103 is the canary — if it reads ~75-80 with baseline ≈
+transposed everywhere, your env vars did not reach the app).
 
 ## 5. Files
 

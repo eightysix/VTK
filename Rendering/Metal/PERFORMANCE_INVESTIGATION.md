@@ -1257,7 +1257,8 @@ Design:
     overrides and dead-code-eliminated when clear (so numSlabs=1 compiles the
     old code bit-for-bit). Mapper: VolumeFeature_Slab (bit 28) decoded into
     fc_slabMode; static VolumeSlabCount() reads VTK_METAL_TEST_NUM_SLABS
-    (default 8, clamped [1,32]); the direct proxy-geometry and camera-inside
+    (originally default 8, clamped [1,32]; now default-off — unset = 1); the
+    direct proxy-geometry and camera-inside
     fullscreen draws loop over K slab passes. Offscreen/RTT/grid-traversal/
     selection pipelines stay single-pass (no blend there), as do non-composite
     blend modes (max/min/avg/additive are not `over`-associative in one RT).
@@ -1361,7 +1362,8 @@ keep the working set resident.
 frame from the max |dot| between the volume-space view direction (camera ->
 box center, in `[0,1]` volume space) and the volume axes: aligned
 (>= `VTK_METAL_TEST_SLAB_ALIGN`, default 0.95 ~ 18 deg) -> 1 slab, otherwise 8.
-An explicit `VTK_METAL_TEST_NUM_SLABS` still wins (0 = adaptive, the default).
+An explicit `VTK_METAL_TEST_NUM_SLABS` still wins (0 = adaptive; adaptive is
+no longer the default — unset now means 1, slab tiling off).
 The choice is purely a performance trade-off: every count composites
 bit-identically, so the visual_compare thresholded error is unchanged (0).
 

@@ -122,8 +122,10 @@ path that previously lost to OpenGL by 1.3-1.8x:
 
 Controls and behavior:
 
-- `VTK_METAL_TEST_NUM_SLABS` overrides the default 8 (1 = the bit-identical
-  single-pass parity path; clamped to [1,32]).
+- Slab tiling is disabled by default (single pass, bit-identical to the
+  pre-slab build). `VTK_METAL_TEST_NUM_SLABS=N` (N >= 2) enables N slabs;
+  `VTK_METAL_TEST_NUM_SLABS=0` re-enables the view-aligned adaptive choice
+  (1 for near-axis views, 8 otherwise).
 - Slabs apply only to the blended direct-render paths (proxy geometry and
   camera-inside fullscreen) in composite blend mode; offscreen render-to-image,
   grid-traversal, selection, and non-composite blend modes stay single-pass.
