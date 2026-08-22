@@ -55,12 +55,17 @@ struct VolumePipelineKey
   uint32_t depthFormat;
   uint32_t sampleCount;
   uint32_t featureMask;
+  // §29 transposed-orientation code (0=identity, 1=X-depth, 2=Y-depth); the
+  // featureMask's VolumeFeature_VolTransposed bit only says "any transpose",
+  // so the axis choice needs its own key component to get a specialized PSO.
+  uint32_t featureMaskExtra;
 
   bool operator==(const VolumePipelineKey& other) const
   {
     return type == other.type && colorFormat == other.colorFormat &&
       depthFormat == other.depthFormat && sampleCount == other.sampleCount &&
-      featureMask == other.featureMask;
+      featureMask == other.featureMask &&
+      featureMaskExtra == other.featureMaskExtra;
   }
 };
 
@@ -73,6 +78,7 @@ struct VolumePipelineKeyHash
     h ^= std::hash<uint32_t>()(k.depthFormat) + 0x9e3779b9 + (h << 6) + (h >> 2);
     h ^= std::hash<uint32_t>()(k.sampleCount) + 0x9e3779b9 + (h << 6) + (h >> 2);
     h ^= std::hash<uint32_t>()(k.featureMask) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<uint32_t>()(k.featureMaskExtra) + 0x9e3779b9 + (h << 6) + (h >> 2);
     return h;
   }
 };
@@ -483,11 +489,19 @@ private:
 
   // Cache/timestamps
   vtkTimeStamp VolumeUploadTime;
-  // True while the uploaded VolumeTexture holds the x<->z transposed
-  // representation (VTK_METAL_TEST_VOLTRANSPOSE). Compute kernels that sample
-  // the volume in data space (min-max lattice, normals) read this to swizzle
-  // their texture coordinates.
+  // True while the uploaded VolumeTexture holds a transposed representation
+  // (VTK_METAL_TEST_VOLTRANSPOSE). Compute kernels that sample the volume in
+  // data space (min-max lattice, normals) read this to swizzle their texture
+  // coordinates.
   bool VolumeTextureTransposed = false;
+  // §29 orientation of the transposed representation: which ORIGINAL axis the
+  // texture's DEPTH extent holds. 0 = identity (not transposed), 1 = X-depth
+  // (texture holds z,y,x; fetch coords map via .zyx), 2 = Y-depth (texture
+  // holds x,z,y; fetch coords map via .xzy). Chosen per upload by the argmin-
+  // extent policy (shortest array dim to depth, ties prefer identity then x)
+  // or forced via VTK_METAL_TEST_VOLTRANSPOSE_AXIS=x|y|z. Drives fc_volTransposedY
+  // and the compute-kernel uniform code alongside VolumeTextureTransposed.
+  int VolumeTextureAxisDepth = 0;
   vtkTimeStamp TransferFunctionUploadTime;
   vtkTimeStamp GradientOpacityUploadTime;
   vtkTimeStamp VertexBufferUploadTime;

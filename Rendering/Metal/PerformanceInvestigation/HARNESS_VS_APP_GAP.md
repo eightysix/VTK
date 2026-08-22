@@ -1377,6 +1377,87 @@ Expected @2048/SD4 raw oblique (§26.5 anchor): baseline j0/j1 ≈ 43/66
 baseline j1 ≈ 103 is the canary — if it reads ~75-80 with baseline ≈
 transposed everywhere, your env vars did not reach the app).
 
+## 30. Orientation-general VOLTRANSPOSE: argmin-dims depth selection (2026-08-22 night)
+
+Closes the anisotropy-assumption hole in the unconditional x<->z swap: on a
+volume whose long axis is NOT Z, blind swapping would put the long extent
+into texture DEPTH and recreate the catastrophe class (measured here: oblique
+j1 64.7 ms/f and axial-z 102.5 @2048 raw on the standard study rendered
+identity-layout — exactly what a long-axis-X dataset would suffer).
+
+### 30.1 Design
+
+`VolumeTransposedAxisDepth(dims)` policy: transpose iff Z is strictly greater
+than an in-plane extent; the SHORTER in-plane axis becomes texture depth
+(ties prefer X, matching every §26.5/§27 cell); Z already shortest → identity
+upload, no repack at all. `VTK_METAL_TEST_VOLTRANSPOSE_AXIS=x|y|z` forces the
+orientation for A/B. Y-depth support end-to-end:
+
+- Shader: `fc_volTransposedY [[function_constant(34)]]` +
+  `volumeFetchSwizzle()` (.xzy for Y-depth); texelCount un-swizzle 3-way;
+  rawScalar4 sites via the helper; minmax/normals kernels take an axis CODE
+  (0/1/2) in the existing `volTransposed` uniform; `volume_transpose_xz`
+  kernel takes a mode constant (buffer 3) and writes `(z,y,x)` or `(x,z,y)`.
+- Mapper: per-axis upDims/strides/CPU-repack formulas at both upload sites;
+  `VolumeTextureAxisDepth` member; PSO key extended with
+  `featureMaskExtra` (= axis code — the featureMask bit alone cannot
+  distinguish orientations); `fc_volTransposedY` bound from the member.
+  Feature-mask gates now read the POLICY result recorded by this frame's
+  upload, not the raw env (a policy no-op must NOT select swizzled pipelines).
+- RG8 mutual exclusion unchanged.
+
+### 30.2 Validation
+
+Byte parity @1024 oblique jittered vs the long-standing X-depth reference:
+X-depth and Z-identity **byte-identical**; auto policy picks X on this
+dataset and matches. Y-depth: ±1 LSB on 29 of 1,048,576 px (max Δ1) —
+hardware trilinear depth-split rounding order differs when original-Y plays
+the depth role; visually nil, documented as near-exact.
+
+Orientation × view matrix (@2048/SD4 raw j1 ms/f):
+
+| view | depth=x | depth=y | depth=z (identity) |
+|---|---|---|---|
+| oblique | **23.0** | 24.5 | 64.7 ☠️ |
+| cam-x march | 36.4 | **34.6** | 33.1 |
+| cam-y march | **32.7** | 36.3 | 32.9 |
+| cam-z march | 45.5 | **43.7** | **102.5 ☠️** |
+
+The tax relocates symmetrically with the chosen depth axis (cam-x pays under
+X-depth, cam-y under Y-depth, bounded +1–3.5 ms) while both transposed
+orientations kill the catastrophic identity-layout cells (−41 ms oblique,
+−57–59 ms axial). Argmin picks X here → optimal interactive cell.
+
+Production config (minmax+accel+shade): fresh runs are **byte-identical** to
+the morning's pre-generalization references on BOTH arms; transposed-vs-base
+residual stays at §26.5's minmax edge-rounding (8 px >1LSB, max 7); GL
+cross-check mean|d|=0.0498 (§6.3 equivalence class).
+
+### 30.3 Debug post-mortem (two session traps, one real bug)
+
+The AXIS=z A/B initially appeared nondeterministic ("sometimes honored,
+sometimes transposes as axis-x"). Root cause was MY SITE-2 BUG, not shell
+quoting: the UpdateVolumeTexture branch set `volTransposed = true`
+unconditionally and its if/else treated orientation code 0 as X-depth — so a
+policy no-op still built an X-transposed texture while the feature gates
+(correctly reading the 0) compiled UNSWIZZLED pipelines against it = garbage.
+The [TRPOLICY] print (env-gated) settled it in one run: `axis env 'z' -> 0`
+followed by a transpose print. Site 1 had the guard; site 2 didn't. Lesson:
+when a decision function gains a third outcome, audit EVERY consumer's
+assumption that it returns the old domain.
+
+§29's zsh traps bit twice more en route (unsplit `$CFG` in a for-loop →
+"Unknown argument"; a missing `SAMPLE_DISTANCE` in one hand-built invocation
+made SD default 0.5 and faked a 2.4-ms-mean render "regression" — caught by
+re-running both arms fresh and diffing against same-day references before
+believing any delta). The §29 protocol (eval-env wrappers + fresh-pair A/B +
+same-session references) converted a would-be wild-goose chase into a
+10-minute bisection.
+
+Verdict: §26.6 item 1's scope caveat is answered for orientation; VOLTRANSPOSE
+is safe-by-construction across volume shapes now, not just across the
+datasets that happen to be Z-longest.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).

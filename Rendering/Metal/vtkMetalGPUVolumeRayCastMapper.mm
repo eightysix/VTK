@@ -415,6 +415,43 @@ static bool VolumeTransposedActive()
   return true;
 }
 
+// §29 orientation policy for the transposed representation. Returns which
+// ORIGINAL axis the texture's DEPTH extent should hold: 0 = identity (no
+// transpose), 1 = X-depth, 2 = Y-depth.
+//
+// Rationale (HARNESS_VS_APP_GAP §26/§29): Metal's private 3D tiling taxes
+// trilinear depth-pair fetches under jitter phase scatter, and the tax
+// scales with the extent marched inside texture depth (long-axis-in-depth
+// measured +60.9 ms jitter delta @2048 vs +5.2 ms short-axis-in-depth on
+// identical data). So the shortest array dimension goes to depth; when the
+// original Z is already (tied-)shortest, keep the identity layout and skip
+// the repack entirely; ties between X and Y prefer X (matches every cell
+// validated in §26.5/§27).
+//
+// VTK_METAL_TEST_VOLTRANSPOSE_AXIS=x|y|z forces the orientation for A/B and
+// diagnostics regardless of dims.
+static int VolumeTransposedAxisDepth(const int dims[3])
+{
+  if (!VolumeTransposedActive())
+    return 0;
+  if (const char* a = getenv("VTK_METAL_TEST_VOLTRANSPOSE_AXIS"))
+  {
+    if (getenv("VTK_METAL_TEST_TR_DUMP") || getenv("VTK_METAL_TEST_TR_BENCH"))
+      fprintf(stderr, "[TRPOLICY] axis env '%s' dims %dx%dx%d -> %d\n", a,
+        dims[0], dims[1], dims[2],
+        a[0] == 'x' || a[0] == 'X' ? 1 : (a[0] == 'y' || a[0] == 'Y' ? 2 : 0));
+    switch (a[0])
+    {
+      case 'x': case 'X': return 1;
+      case 'y': case 'Y': return 2;
+      default:            return 0;
+    }
+  }
+  if (dims[2] <= dims[0] && dims[2] <= dims[1])
+    return 0;                          // z already (tied-)shortest: no-op
+  return (dims[0] <= dims[1]) ? 1 : 2; // else the shorter in-plane axis
+}
+
 // §28 GPU transpose pass (VTK_METAL_TEST_GPU_TRANSPOSE): when the transposed
 // representation is active, skip the CPU blocked x<->z repack (seconds at load
 // for ~450 MB volumes) and instead upload the ORIGINAL-layout staging and run
@@ -2325,65 +2362,99 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
     }
   }
 
-  // Transposed repack (see VolumeTransposedActive): upload the volume
-  // x<->z transposed so the slice axis occupies the texture's x extent.
-  // Metal's private 3D tiling is axis-biased; with the slice axis as texture
-  // depth, trilinear z-pair fetches under per-pixel jitter phase scatter pay
-  // a large DRAM tax (2026-08-22 root cause). The shader maps coordinates
-  // back via .zyx (fc_volTransposed).
+  // Transposed repack (see VolumeTransposedActive / VolumeTransposedAxisDepth):
+  // upload the volume with the chosen orientation so the SHORTEST array
+  // dimension occupies texture depth. Metal's private 3D tiling is axis-biased;
+  // with a long extent as texture depth, trilinear depth-pair fetches under
+  // per-pixel jitter phase scatter pay a large DRAM tax (2026-08-22 root
+  // cause). X-depth maps fetch coords via .zyx, Y-depth via .xzy
+  // (fc_volTransposed / fc_volTransposedY).
   bool volTransposed = false;
+  int volAxisDepth = 0;
   bool volTransposedGPU = false;
   std::vector<uint8_t> transStorage;
   if (!gpuConversionUsed && !rg8Pair && VolumeTransposedActive() &&
       dataType == VTK_UNSIGNED_CHAR && numComponents == 1)
   {
-    volTransposed = true;
-    upDims[0] = dims[2];
-    upDims[2] = dims[0];
-    const NSUInteger elemSize = static_cast<NSUInteger>(fmtInfo.BytesPerComponent) *
-      actualComponents;
-    upBytesPerRow = static_cast<NSUInteger>(dims[2]) * elemSize;
-    upBytesPerImage = upBytesPerRow * static_cast<NSUInteger>(dims[1]);
-    volTransposedGPU = VolumeTransposeGPU();
-    if (volTransposedGPU)
+    const int trAxis = VolumeTransposedAxisDepth(dims);
+    if (trAxis != 0)
     {
-      // §28: staging stays in ORIGINAL layout; the compute kernel writes the
-      // swapped-dims texture directly from it (no transStorage, no blit).
-      fprintf(stderr, "[TR] direct path: transposed dims %dx%dx%d -> %dx%dx%d (GPU kernel)\n",
-        dims[0], dims[1], dims[2], upDims[0], upDims[1], upDims[2]);
-    }
-    else
-    {
-    transStorage.resize(totalBytes);
-    // new(x'=z, y, z'=x): T[((x*D + y)*W + z)] = V[((z*H + y)*W + x)]
-    const int BS = 32;
-    const uint8_t* in = static_cast<const uint8_t*>(scalars->GetVoidPointer(0));
-    uint8_t* out = transStorage.data();
-    std::chrono::steady_clock::time_point trT0;
-    if (getenv("VTK_METAL_TEST_TR_BENCH")) trT0 = std::chrono::steady_clock::now();
-    for (int xb = 0; xb < dims[0]; xb += BS)
-      for (int zb = 0; zb < dims[2]; zb += BS)
-        for (int yb = 0; yb < dims[1]; yb += BS)
-        {
-          const int xe = std::min(xb + BS, dims[0]);
-          const int ze = std::min(zb + BS, dims[2]);
-          const int ye = std::min(yb + BS, dims[1]);
-          for (int x = xb; x < xe; ++x)
-            for (int z = zb; z < ze; ++z)
-              for (int y = yb; y < ye; ++y)
-                std::memcpy(
-                  out + (((static_cast<size_t>(x) * dims[1] + y) * dims[2]) + z) * elemSize,
-                  in + (((static_cast<size_t>(z) * dims[1] + y) * dims[0]) + x) * elemSize,
-                  elemSize);
-        }
-    if (getenv("VTK_METAL_TEST_TR_BENCH"))
-      fprintf(stderr, "[TRBENCH] cpu blocked transpose: %.1f ms (%zu bytes)\n",
-        std::chrono::duration<double, std::milli>(
-          std::chrono::steady_clock::now() - trT0).count(),
-        transStorage.size());
+      volTransposed = true;
+      volAxisDepth = trAxis;
+      const NSUInteger elemSize = static_cast<NSUInteger>(fmtInfo.BytesPerComponent) *
+        actualComponents;
+      if (trAxis == 2)
+      {
+        // Y-depth: texture holds (W,D,H); original Y moves into depth.
+        upDims[1] = dims[2];
+        upDims[2] = dims[1];
+        upBytesPerRow = static_cast<NSUInteger>(dims[0]) * elemSize;
+        upBytesPerImage = upBytesPerRow * static_cast<NSUInteger>(dims[2]);
+      }
+      else
+      {
+        // X-depth: texture holds (D,H,W); the slice axis becomes the width.
+        upDims[0] = dims[2];
+        upDims[2] = dims[0];
+        upBytesPerRow = static_cast<NSUInteger>(dims[2]) * elemSize;
+        upBytesPerImage = upBytesPerRow * static_cast<NSUInteger>(dims[1]);
+      }
+      volTransposedGPU = VolumeTransposeGPU();
+      if (volTransposedGPU)
+      {
+        // §28: staging stays in ORIGINAL layout; the compute kernel writes the
+        // swapped-dims texture directly from it (no transStorage, no blit).
+        fprintf(stderr, "[TR] direct path: transposed (axis %c) dims %dx%dx%d -> %dx%dx%d (GPU kernel)\n",
+          trAxis == 2 ? 'y' : 'x', dims[0], dims[1], dims[2],
+          upDims[0], upDims[1], upDims[2]);
+      }
+      else
+      {
+      transStorage.resize(totalBytes);
+      const int BS = 32;
+      const uint8_t* in = static_cast<const uint8_t*>(scalars->GetVoidPointer(0));
+      uint8_t* out = transStorage.data();
+      std::chrono::steady_clock::time_point trT0;
+      if (getenv("VTK_METAL_TEST_TR_BENCH")) trT0 = std::chrono::steady_clock::now();
+      for (int xb = 0; xb < dims[0]; xb += BS)
+        for (int zb = 0; zb < dims[2]; zb += BS)
+          for (int yb = 0; yb < dims[1]; yb += BS)
+          {
+            const int xe = std::min(xb + BS, dims[0]);
+            const int ze = std::min(zb + BS, dims[2]);
+            const int ye = std::min(yb + BS, dims[1]);
+            for (int x = xb; x < xe; ++x)
+              for (int z = zb; z < ze; ++z)
+                for (int y = yb; y < ye; ++y)
+                {
+                  const size_t srcOff =
+                    (((static_cast<size_t>(z) * dims[1] + y) * dims[0]) + x) * elemSize;
+                  size_t dstOff;
+                  if (trAxis == 2)
+                  {
+                    // T(u=x, v=z, w=y): dst[(y*Z + z)*X + x]
+                    dstOff =
+                      ((static_cast<size_t>(y) * dims[2] + z) * dims[0] + x) * elemSize;
+                  }
+                  else
+                  {
+                    // T(u=z, v=y, w=x): dst[(x*H + y)*Z + z]
+                    dstOff =
+                      ((static_cast<size_t>(x) * dims[1] + y) * dims[2] + z) * elemSize;
+                  }
+                  std::memcpy(out + dstOff, in + srcOff, elemSize);
+                }
+          }
+      if (getenv("VTK_METAL_TEST_TR_BENCH"))
+        fprintf(stderr, "[TRBENCH] cpu blocked transpose: %.1f ms (%zu bytes)\n",
+          std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - trT0).count(),
+          transStorage.size());
+      }
     }
   }
   this->VolumeTextureTransposed = volTransposed;
+  this->VolumeTextureAxisDepth = volAxisDepth;
 
   if (!gpuConversionUsed)
   {
@@ -2559,6 +2630,9 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
         static_cast<uint32_t>(dims[0]), static_cast<uint32_t>(dims[1]),
         static_cast<uint32_t>(dims[2]), 0 };
       [enc setBytes:&srcDims length:sizeof(srcDims) atIndex:2];
+      // Orientation code for volume_transpose_xz: 1=X-depth, 2=Y-depth.
+      uint32_t trMode = static_cast<uint32_t>(volAxisDepth);
+      [enc setBytes:&trMode length:sizeof(trMode) atIndex:3];
       [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
       [enc endEncoding];
       [uploadCmdBuf commit];
@@ -2941,7 +3015,9 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureGradientNormalTexture(
       (fabs(cellSpacing[0]) + fabs(cellSpacing[1]) + fabs(cellSpacing[2])) / 3.0;
     NormalComputeUniforms u = MakeNormalComputeUniforms(
       dims, this->ScalarRange, this->ScalarNormalizationFactor, vb.Size, avgSpacing);
-    u.volTransposed = this->VolumeTextureTransposed ? 1 : 0;
+    // Orientation code for the data-space sampling kernels: 0=identity,
+    // 1=X-depth (.zyx), 2=Y-depth (.xzy).
+    u.volTransposed = this->VolumeTextureAxisDepth;
 
     id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
     cmdBuf.label = @"VTK Volume Normal Compute";
@@ -3698,37 +3774,56 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
          }
        }
 
-       // Transposed repack (see VolumeTransposedActive): upload the volume
-       // x<->z transposed so the slice axis occupies the texture's x extent.
-       // Metal's private 3D tiling is axis-biased; with the slice axis as
-       // texture depth, trilinear z-pair fetches under per-pixel jitter
-       // phase scatter pay a large DRAM tax (2026-08-22 root cause). The
-       // shader maps coordinates back via .zyx (fc_volTransposed).
+       // Transposed repack (see VolumeTransposedActiveDepth policy): upload
+       // the volume with the SHORTEST array dimension in texture depth.
+       // Metal's private 3D tiling is axis-biased; with a long extent as
+       // texture depth, trilinear depth-pair fetches under per-pixel jitter
+       // phase scatter pay a large DRAM tax (2026-08-22 root cause). X-depth
+       // maps fetch coords via .zyx, Y-depth via .xzy.
         bool volTransposed = false;
+        int volAxisDepth = 0;
         bool volTransposedGPU = false;
         std::vector<uint8_t> transStorage;
         if (!gpuConversionUsed && !rg8Pair && VolumeTransposedActive() &&
             dataType == VTK_UNSIGNED_CHAR && numComponents == 1)
         {
+          const int trAxis = VolumeTransposedAxisDepth(dims);
+          if (trAxis != 0)
+          {
           volTransposed = true;
-          upDims[0] = dims[2];
-          upDims[2] = dims[0];
+          volAxisDepth = trAxis;
           const NSUInteger elemSize = static_cast<NSUInteger>(fmtInfo.BytesPerComponent) *
             actualComponents;
-          upBytesPerRow = static_cast<NSUInteger>(dims[2]) * elemSize;
-          upBytesPerImage = upBytesPerRow * static_cast<NSUInteger>(dims[1]);
+          if (trAxis == 2)
+          {
+            // Y-depth: texture holds (W,D,H); original Y moves into depth.
+            upDims[1] = dims[2];
+            upDims[2] = dims[1];
+            upBytesPerRow = static_cast<NSUInteger>(dims[0]) * elemSize;
+            upBytesPerImage = upBytesPerRow * static_cast<NSUInteger>(dims[2]);
+          }
+          else
+          {
+            // X-depth: texture holds (D,H,W); the slice axis becomes the width.
+            upDims[0] = dims[2];
+            upDims[2] = dims[0];
+            upBytesPerRow = static_cast<NSUInteger>(dims[2]) * elemSize;
+            upBytesPerImage = upBytesPerRow * static_cast<NSUInteger>(dims[1]);
+          }
           volTransposedGPU = VolumeTransposeGPU();
           if (volTransposedGPU)
           {
             // §28: staging stays in ORIGINAL layout; the compute kernel writes
             // the swapped-dims texture directly from it.
-            fprintf(stderr, "[TR] UpdateVolumeTexture: transposed dims %dx%dx%d -> %dx%dx%d (GPU kernel)\n",
-              dims[0], dims[1], dims[2], upDims[0], upDims[1], upDims[2]);
+            fprintf(stderr, "[TR] UpdateVolumeTexture: transposed (axis %c) dims %dx%dx%d -> %dx%dx%d (GPU kernel)\n",
+              trAxis == 2 ? 'y' : 'x', dims[0], dims[1], dims[2],
+              upDims[0], upDims[1], upDims[2]);
           }
           else
           {
           transStorage.resize(totalBytes);
-          // new(x'=z, y, z'=x): T[((x*D + y)*W + z)] = V[((z*H + y)*W + x)]
+          // X-depth: T(u=z, v=y, w=x): dst[(x*H + y)*Z + z] = V[(z*H + y)*W + x]
+          // Y-depth: T(u=x, v=z, w=y): dst[(y*Z + z)*W + x] = V[(z*H + y)*W + x]
           // (element indices; element size elemSize bytes)
           const int BS = 32;
           const uint8_t* in = static_cast<const uint8_t*>(scalars->GetVoidPointer(0));
@@ -3745,18 +3840,27 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
                 for (int x = xb; x < xe; ++x)
                   for (int z = zb; z < ze; ++z)
                     for (int y = yb; y < ye; ++y)
-                      std::memcpy(
-                        out + (((static_cast<size_t>(x) * dims[1] + y) * dims[2]) + z) * elemSize,
-                        in + (((static_cast<size_t>(z) * dims[1] + y) * dims[0]) + x) * elemSize,
-                        elemSize);
+                    {
+                      const size_t srcOff =
+                        (((static_cast<size_t>(z) * dims[1] + y) * dims[0]) + x) * elemSize;
+                      size_t dstOff;
+                      if (trAxis == 2)
+                        dstOff =
+                          ((static_cast<size_t>(y) * dims[2] + z) * dims[0] + x) * elemSize;
+                      else
+                        dstOff =
+                          ((static_cast<size_t>(x) * dims[1] + y) * dims[2] + z) * elemSize;
+                      std::memcpy(out + dstOff, in + srcOff, elemSize);
+                    }
               }
           if (getenv("VTK_METAL_TEST_TR_BENCH"))
             fprintf(stderr, "[TRBENCH] cpu blocked transpose: %.1f ms (%zu bytes)\n",
               std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - trT0).count(),
               transStorage.size());
-          fprintf(stderr, "[TR] UpdateVolumeTexture: transposed dims %dx%dx%d -> %dx%dx%d\n",
-            dims[0], dims[1], dims[2], upDims[0], upDims[1], upDims[2]);
+          fprintf(stderr, "[TR] UpdateVolumeTexture: transposed (axis %c) dims %dx%dx%d -> %dx%dx%d\n",
+            trAxis == 2 ? 'y' : 'x', dims[0], dims[1], dims[2],
+            upDims[0], upDims[1], upDims[2]);
          // TEMP-DIAG (VTK_METAL_TEST_TR_DUMP): verify repacked bytes. Under
          // the mapping T(i,j,k) = V(k, j, i), T's width-i slice at i=D/2 must
          // equal V's axial slice D/2 exactly.
@@ -3795,8 +3899,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
               (unsigned long long)h);
            }
            }
+          } // end if (trAxis != 0)
          }
          this->VolumeTextureTransposed = volTransposed;
+        this->VolumeTextureAxisDepth = volAxisDepth;
 
         if (!gpuConversionUsed)
        {
@@ -3977,6 +4083,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           static_cast<uint32_t>(dims[0]), static_cast<uint32_t>(dims[1]),
           static_cast<uint32_t>(dims[2]), 0 };
         [enc setBytes:&srcDims length:sizeof(srcDims) atIndex:2];
+        // Orientation code for volume_transpose_xz: 1=X-depth, 2=Y-depth.
+        uint32_t trMode = static_cast<uint32_t>(volAxisDepth);
+        [enc setBytes:&trMode length:sizeof(trMode) atIndex:3];
         [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
         [enc endEncoding];
         [uploadCmdBuf commit];
@@ -5558,7 +5667,9 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     u.scalarMin = static_cast<float>(this->ScalarRange[0] / normFactor);
     u.scalarScale = static_cast<float>(255.0 * normFactor / scalarRange);
     u._pad = 0.0f;
-    u.volTransposed = this->VolumeTextureTransposed ? 1 : 0;
+    // Orientation code for the data-space sampling kernels: 0=identity,
+    // 1=X-depth (.zyx), 2=Y-depth (.xzy).
+    u.volTransposed = this->VolumeTextureAxisDepth;
     memcpy(u.opacityPrefix, opacityPrefix, sizeof(opacityPrefix));
 
     // --- Reuse or create persistent MinMax texture ---
@@ -6717,7 +6828,8 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
   void* mtlDeviceVoid, uint32_t type, uint32_t colorFormat,
   uint32_t depthFormat, uint32_t sampleCount, uint32_t featureMask)
 {
-  VolumePipelineKey key = { type, colorFormat, depthFormat, sampleCount, featureMask };
+  VolumePipelineKey key = { type, colorFormat, depthFormat, sampleCount, featureMask,
+    static_cast<uint32_t>(this->VolumeTextureAxisDepth) };
   auto it = this->PipelineCache.find(key);
   if (it != this->PipelineCache.end())
   {
@@ -6863,9 +6975,14 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     // texture stores x<->z transposed; scalar fetches map coords via .zyx.
     BOOL volTransposed = (featureMask & VolumeFeature_VolTransposed) ? YES : NO;
     if (getenv("VTK_METAL_TEST_MARCH_DEBUG"))
-      fprintf(stderr, "[march] mask=0x%08x\n", featureMask);
+      fprintf(stderr, "[march] mask=0x%08x axis=%d\n", featureMask,
+        this->VolumeTextureAxisDepth);
     [constants setConstantValue:&volTransposed type:MTLDataTypeBool
                        withName:@"fc_volTransposed"];
+    // §29 orientation companion: X-depth (.zyx) vs Y-depth (.xzy) fetch maps.
+    BOOL volTransposedY = (this->VolumeTextureAxisDepth == 2) ? YES : NO;
+    [constants setConstantValue:&volTransposedY type:MTLDataTypeBool
+                       withName:@"fc_volTransposedY"];
 
     // Blend mode function constant: 0=composite, 1=MIP, 2=MinIP, 3=AverageIP,
     // 4=additive (vtkVolumeMapper::BlendMode). Encoded in the feature mask so
@@ -7323,9 +7440,13 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
     featureMask |= VolumeFeature_VolRg8;
   }
 
-  // Transposed volume representation experiment (VTK_METAL_TEST_TRANSPOSE):
+  // Transposed volume representation (VTK_METAL_TEST_VOLTRANSPOSE):
   // dedicated feature bit so the swizzled-fetch march gets its own pipeline.
-  if (VolumeTransposedActive())
+  // Gated on the POLICY result recorded by this frame's volume upload (not
+  // the raw env): when dims make depth already shortest the upload stays
+  // identity and the swizzled pipeline must NOT be selected. The orientation
+  // itself rides the key's featureMaskExtra (fc_volTransposedY).
+  if (this->VolumeTextureAxisDepth != 0)
   {
     featureMask |= VolumeFeature_VolTransposed;
   }
@@ -8354,9 +8475,13 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     featureMask |= VolumeFeature_VolRg8;
   }
 
-  // Transposed volume representation experiment (VTK_METAL_TEST_TRANSPOSE):
+  // Transposed volume representation (VTK_METAL_TEST_VOLTRANSPOSE):
   // dedicated feature bit so the swizzled-fetch march gets its own pipeline.
-  if (VolumeTransposedActive())
+  // Gated on the POLICY result recorded by this frame's volume upload (not
+  // the raw env): when dims make depth already shortest the upload stays
+  // identity and the swizzled pipeline must NOT be selected. The orientation
+  // itself rides the key's featureMaskExtra (fc_volTransposedY).
+  if (this->VolumeTextureAxisDepth != 0)
   {
     featureMask |= VolumeFeature_VolTransposed;
   }

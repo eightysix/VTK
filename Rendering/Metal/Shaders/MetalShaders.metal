@@ -1943,7 +1943,11 @@ kernel void volume_compute_normals(
     float3 pos = (float3(gid) + 0.5) / float3(dims);
     float3 gs = float3(u.gsX, u.gsY, u.gsZ);
 
-    // Central differences (6 texel fetches — same as computeGradientFast)
+    // Central differences (6 texel fetches — same as computeGradientFast).
+    // volTransposed carries the orientation code: 0=identity, 1=X-depth
+    // (tex holds z,y,x), 2=Y-depth (tex holds x,z,y). The mapping is linear,
+    // so every neighbor position (base ± axis offset) goes through the SAME
+    // swizzle — the data-space gradient components stay in original axes.
     bool vtr = u.volTransposed != 0;
     float3 pPX = pos + float3(gs.x, 0, 0);
     float3 pNX = pos - float3(gs.x, 0, 0);
@@ -1951,12 +1955,12 @@ kernel void volume_compute_normals(
     float3 pNY = pos - float3(0, gs.y, 0);
     float3 pPZ = pos + float3(0, 0, gs.z);
     float3 pNZ = pos - float3(0, 0, gs.z);
-    float sPX = volume.sample(sVolume, vtr ? pPX.zyx : pPX, level(0)).r;
-    float sNX = volume.sample(sVolume, vtr ? pNX.zyx : pNX, level(0)).r;
-    float sPY = volume.sample(sVolume, vtr ? pPY.zyx : pPY, level(0)).r;
-    float sNY = volume.sample(sVolume, vtr ? pNY.zyx : pNY, level(0)).r;
-    float sPZ = volume.sample(sVolume, vtr ? pPZ.zyx : pPZ, level(0)).r;
-    float sNZ = volume.sample(sVolume, vtr ? pNZ.zyx : pNZ, level(0)).r;
+    float sPX = volume.sample(sVolume, (u.volTransposed == 2) ? pPX.xzy : (vtr ? pPX.zyx : pPX), level(0)).r;
+    float sNX = volume.sample(sVolume, (u.volTransposed == 2) ? pNX.xzy : (vtr ? pNX.zyx : pNX), level(0)).r;
+    float sPY = volume.sample(sVolume, (u.volTransposed == 2) ? pPY.xzy : (vtr ? pPY.zyx : pPY), level(0)).r;
+    float sNY = volume.sample(sVolume, (u.volTransposed == 2) ? pNY.xzy : (vtr ? pNY.zyx : pNY), level(0)).r;
+    float sPZ = volume.sample(sVolume, (u.volTransposed == 2) ? pPZ.xzy : (vtr ? pPZ.zyx : pPZ), level(0)).r;
+    float sNZ = volume.sample(sVolume, (u.volTransposed == 2) ? pNZ.xzy : (vtr ? pNZ.zyx : pNZ), level(0)).r;
 
     float3 rawGrad = float3(sPX - sNX, sPY - sNY, sPZ - sNZ);
     float3 dimsF = float3(float(u.dimX), float(u.dimY), float(u.dimZ));
@@ -2751,6 +2755,20 @@ constant bool fc_volRg8 [[function_constant(32)]];
 // Mutually exclusive with fc_volRg8 (mapper refuses the combination).
 constant bool fc_volTransposed [[function_constant(33)]];
 
+// §29 orientation companion to fc_volTransposed: when set, the upload moved the
+// original Y axis into texture depth instead of X (texture holds (W,D,H),
+// fetch coords map through .xzy). Compile-time specialized per pipeline so the
+// hot fetch path keeps its hard-coded swizzle.
+constant bool fc_volTransposedY [[function_constant(34)]];
+
+// Map an original-orientation sample position into texture space for the live
+// transposed representation (no-op when clear).
+inline float3 volumeFetchSwizzle(float3 pos) {
+  if (fc_volTransposedY) return pos.xzy;
+  if (fc_volTransposed)  return pos.zyx;
+  return pos;
+}
+
 // ============================================================================
 // Volume Ray Casting Mapper
 // ============================================================================
@@ -3500,12 +3518,12 @@ inline float sampleVolumeScalarRG8Pair(texture3d<float> volTex, float3 pos) {
 
 inline float sampleVolumeScalar(texture3d<float> volTex, float3 pos) {
   if (fc_volTransposed) {
-    // TRANSPOSE upload: the slice axis lives in the texture's x extent;
-    // original-orientation (x,y,z) maps to texture (z,y,x). The mv1 8-tap
-    // helper below is self-consistent in whatever space it receives (its
-    // dims come from the live texture), so a single entry-point swizzle
-    // covers every interpolation variant.
-    pos = pos.zyx;
+    // TRANSPOSE upload: the slice axis lives out of texture depth; original-
+    // orientation (x,y,z) maps to texture (z,y,x) for X-depth or (x,z,y) for
+    // Y-depth. The mv1 8-tap helper below is self-consistent in whatever
+    // space it receives (its dims come from the live texture), so a single
+    // entry-point swizzle covers every interpolation variant.
+    pos = volumeFetchSwizzle(pos);
   }
   if (fc_linearInterpolation) {
     if (fc_marchVariant == 1) {
@@ -4181,14 +4199,18 @@ inline half4 marchVolumeUnified(
   // RG8 pair-pack (fc_volRg8): the texture's z extent is the PAIR count
   // (original slices / 2), so restore the original slice count here — every
   // CTP-adjusted z phase and step below is expressed over it.
-  // TRANSPOSE (fc_volTransposed): texture extents hold (D,H,W); un-swizzle to
-  // the ORIGINAL dims so every CTP factor below keeps its data-space meaning.
+  // TRANSPOSE (fc_volTransposed): texture extents hold (D,H,W) for X-depth or
+  // (W,D,H) for Y-depth; un-swizzle to the ORIGINAL dims so every CTP factor
+  // below keeps its data-space meaning.
   float texelCountZ = volumeTexture.get_depth() *
     ((fc_volRg8 && !fc_volTransposed) ? 2.0f : 1.0f);
-  float3 texelCount = fc_volTransposed
-    ? float3(volumeTexture.get_depth(), volumeTexture.get_height(),
-             volumeTexture.get_width())
-    : float3(volumeTexture.get_width(), volumeTexture.get_height(), texelCountZ);
+  float3 texelCount = fc_volTransposedY
+    ? float3(volumeTexture.get_width(), volumeTexture.get_depth(),
+             volumeTexture.get_height())
+    : fc_volTransposed
+      ? float3(volumeTexture.get_depth(), volumeTexture.get_height(),
+               volumeTexture.get_width())
+      : float3(volumeTexture.get_width(), volumeTexture.get_height(), texelCountZ);
   float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
   float3 ctpOffset  = 0.5 / texelCount;
   float3 evalStep = texStep * ctpScale;
@@ -4667,10 +4689,10 @@ inline half4 marchVolumeUnified(
         if (useIndependentPath) {
           if (fc_linearInterpolation) {
             rawScalar4 = volumeTexture.sample(sVolume,
-          fc_volTransposed ? rectEvalPoint.zyx : rectEvalPoint, level(0));
+          volumeFetchSwizzle(rectEvalPoint), level(0));
           } else {
             rawScalar4 = volumeTexture.sample(sNearest,
-          fc_volTransposed ? rectEvalPoint.zyx : rectEvalPoint, level(0));
+          volumeFetchSwizzle(rectEvalPoint), level(0));
           }
         } else if (fc_dependentRGBA || fc_dependentLA) {
           rawScalar4 = sampleVolumeTexel(volumeTexture, rectEvalPoint);
@@ -5896,10 +5918,10 @@ inline half4 marchVolumeUnified(
     if (useIndependentPath) {
       if (fc_linearInterpolation) {
         rawScalar4 = volumeTexture.sample(sVolume,
-          fc_volTransposed ? rectEvalPoint.zyx : rectEvalPoint, level(0));
+          volumeFetchSwizzle(rectEvalPoint), level(0));
       } else {
         rawScalar4 = volumeTexture.sample(sNearest,
-          fc_volTransposed ? rectEvalPoint.zyx : rectEvalPoint, level(0));
+          volumeFetchSwizzle(rectEvalPoint), level(0));
       }
     } else if (fc_dependentRGBA || fc_dependentLA) {
       // 4-component dependent RGBA / 2-component dependent LA: color and
@@ -7405,7 +7427,11 @@ kernel void volume_compute_minmax(
     for (uint y = start.y; y < end.y; y++) {
       for (uint x = start.x; x < end.x; x++) {
         float3 pos = (float3(x, y, z) + 0.5) / volDims;
-        float3 tpos = (u.volTransposed != 0) ? pos.zyx : pos;
+        // volTransposed carries the orientation code: 0=identity, 1=X-depth
+        // (tex holds z,y,x), 2=Y-depth (tex holds x,z,y).
+        float3 tpos = pos;
+        if (u.volTransposed == 1)      tpos = pos.zyx;
+        else if (u.volTransposed == 2) tpos = pos.xzy;
         float v = volume.sample(sNearest, tpos, level(0)).r;
         cellMin = min(cellMin, v);
         cellMax = max(cellMax, v);
@@ -7454,24 +7480,32 @@ kernel void volume_dilate_minmax(
 }
 
 // ---------------------------------------------------------------------------
-// §28 GPU x<->z volume transpose (VTK_METAL_TEST_GPU_TRANSPOSE): replaces the
+// §28/§29 GPU volume transpose (VTK_METAL_TEST_GPU_TRANSPOSE): replaces the
 // CPU blocked repack for the transposed-volume upload. One thread per SOURCE
 // texel; reads coalesce along source-x from the staging buffer and writes land
-// at the transposed coordinate (z,y,x) in the swapped-dims destination
-// texture. R8Unorm round-trip is byte-exact (b/255*255 rounds back to b).
+// at the transposed coordinate in the swapped-dims destination texture.
+// trMode selects the orientation: 1 = X-depth (dst(z,y,x), texture (D,H,W)),
+// 2 = Y-depth (dst(x,z,y), texture (W,D,H)). R8Unorm round-trip is byte-exact
+// (b/255*255 rounds back to b).
 kernel void volume_transpose_xz(
     device const unsigned char* src [[buffer(0)]],
     texture3d<float, access::write> dst [[texture(1)]],
     constant uint4& srcDimsPad [[buffer(2)]],   // (W,H,D,0) as uint4
+    constant uint& trMode [[buffer(3)]],
     uint3 gid [[thread_position_in_grid]])
 {
   uint3 srcDims = srcDimsPad.xyz;
   if (any(gid >= srcDims)) return;
   size_t idx = (static_cast<size_t>(gid.z) * srcDims.y + gid.y) * srcDims.x + gid.x;
   float v = static_cast<float>(src[idx]) / 255.0f;
-  // T(x'=z, y'=y, z'=x) = V(x,y,z): the destination's width extent holds the
-  // original slice axis (matches the CPU repack layout byte-for-byte).
-  dst.write(float4(v, 0.0f, 0.0f, 1.0f), uint3(gid.z, gid.y, gid.x));
+  if (trMode == 2) {
+    // Y-depth: T(u=x, v=z, w=y) = V(x,y,z)
+    dst.write(float4(v, 0.0f, 0.0f, 1.0f), uint3(gid.x, gid.z, gid.y));
+  } else {
+    // X-depth: T(x'=z, y'=y, z'=x) = V(x,y,z); the destination's width extent
+    // holds the original slice axis.
+    dst.write(float4(v, 0.0f, 0.0f, 1.0f), uint3(gid.z, gid.y, gid.x));
+  }
 }
 
 fragment float4 fragment_image_sample_blit(
