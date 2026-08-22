@@ -883,6 +883,109 @@ fetch, R32F opacity LUT shape, scale/bias, sign-gated OOB test,
 currentT/tPM break form, or their combination). INCR=1 (incremental
 position accumulation alone) already refuted (+22.8).
 
+## 25. HANDOFF — next session: port the composed-shader cheapness to Metal (2026-08-22 night)
+
+### 25.1 State
+
+Replication target met on the GL side (§24): fixed `appgl_parity` =
+verbatim composed FS in a headless CGL+FBO harness reads jitter Δ
+**+7.71 ±2.1** @1024/SD4 vs live app **+8.66** (which includes ~3.8 ms of
+VTK CPU/frame); the lean reconstruction FS pays **+20.6** in the identical
+context. Mechanism (revised §21): per-sample instruction mix under
+cross-lane phase scatter, living in trilinear z-slice-pair handling
+(NEAREST ties M/GL 1.02 §15), ∝ phase spread (JSCALE §14), modulated by
+slice-crossing rate (azimuth §19).
+
+Tooling ready: `appgl_parity` (valid reference, probes uDbg 14/21/22/23/
+25/26), `jitter_gap_repro` knob harness (WARMUP/ROUNDS/SELECT protocol,
+fresh-process runs repeatable to ±1 ms), in-app `METAL_ITER`/`GL_ITER`
+PPM instrumentation, `VTK_METAL_TEST_RG8`/`DOEXIT` feature bits.
+
+### 25.2 Corrections to carry forward (do not cite stale claims)
+
+1. **§16 is not a fair backend win**: GL has no minmax implementation.
+   "Metal already wins in production" means Metal has an algorithmic
+   acceleration GL lacks. The fair comparison is raw-march vs raw-march:
+   composed-GL Δ ≈ +8–12 ms vs Metal raw Δ ≈ +18–25 ms at 800–2048 px →
+   the Metal deficit is REAL and still open on equal footing.
+2. **RG8 is not a general answer (§18)**: −22.5%/−34.3% ONLY on oblique
+   SD4; +35% at SD0.5, +36–47% on axial/coronal/sagittal SD4. Opt-in
+   only; do not propose it as a global default again.
+
+### 25.3 Goal
+
+Make Metal's raw-march jitter Δ reach composed-GL level (~+9–12 ms at
+the 800–2048 oblique cells) by identifying the compositional
+ingredient(s) that kill the tax and mirroring them in
+`MetalShaders.metal`.
+
+### 25.4 Plan A — ingredient bisection (GL harness first, then MSL)
+
+Each probe = one env knob in `jitter_gap_repro.mm`
+(`loopShape`/`stepBody` string variants), measured against fixed
+appgl_parity's +7.7 reference at 1024/SD4, ROUNDS≥2:
+
+1. **OPACITY-GATED COLOR FETCH**: skip the color LUT tap when a≈0
+   (composer behavior). Prior: SPLIT_TF moved 22.3→18.2 (§11) — right
+   family, partial alone; expect stacking.
+2. **TF LUT SHAPE**: separate R32F 1024-wide opacity table (+ RGB32F
+   color table) instead of one RGBA8 256 fetch.
+3. **SCALAR FLOW**: per-sample scale/bias (`in_volume_scale`) +
+   vec4 swizzle path around the sample.
+4. **BREAK-FORM COMBO**: sign-gated texMax/texMin OOB test +
+   `g_currentT >= g_terminatePointMax` break pair INSIDE the loop
+   (CLIP=1 prologue alone was inert; the in-loop break form was never
+   isolated).
+5. **COMBINATIONS** of whatever moves (§22 lesson: singles understate
+   stacking).
+
+Success criteria per probe: GL Δ falls materially below ~18 toward ≤10;
+mean samples stay 86–88; image byte-identical to baseline (footprint +
+optional RAYS=1 dump diff). Discard runs violating sample counts.
+
+Then port the winning structure to `MetalShaders.metal` behind a
+function_constant (patterns: `fc_doExit` bit 1u<<29, `fc_volRg8`
+bit 1u<<30): byte-parity via METAL_ITER dumps + color renders, then
+interleaved j0/j1 pairs at 1024 & 2048 oblique PLUS the §18 regression
+cells (axis views, SD0.5).
+
+Expectation calibration: full success closes the gap to composed-GL
+level (~Δ+11–13 at these cells); it does NOT make jitter free. If an
+ingredient transfers on GL but not MSL, that itself localizes the
+remaining true API difference (sampler feed, §15/§21) — record it.
+
+### 25.5 Plan B (parallel or fallback) — conditional RG8 gating
+
+§19 gives the gate for free: the slow azimuths (135°/315°, M/GL j1
+1.28–1.32) are exactly where rays cross slice planes steepest — which is
+also where RG8's z-pair trick pays (DRAM-bound scatter cells, §18).
+
+- Gate `fc_volRg8` engagement on ray-vs-slice-plane geometry (class of
+  |dot(rayDirObj, sliceNormal)| / slice-crossing rate), not globally.
+- REQUIRED validation before shipping: re-sweep the §18 matrix across
+  CAM_AZ (not just base oblique) × {SD4, SD0.5} × axis views with the
+  gate engaged/disengaged; the gate must never engage in a regressing
+  cell. Keep `VTK_METAL_TEST_RG8` as manual override.
+
+### 25.6 Refuted — do NOT retry
+
+Everything in §22/§23 tables, plus: INCR=1 (+22.8), BLEND=1 (+38),
+SURFACE=1, UBO=1, PAD=1, CLIP-prologue alone, GAPMS/duty-cycle,
+AZSTEP-as-evidence (~47% sample shedding confound), optContents,
+JSCALE<1 (changes the image), NOPREFETCH, DOEXIT-on-production (neutral),
+NOBOX/MINIMAL (breaks termination), kInvProj-era appgl_parity timings
+(retracted).
+
+### 25.7 Protocol reminders
+
+WARMUP=30 now default-baked; ROUNDS≥2 order-alternated;
+`SELECT=g0`/`SELECT=g1` fresh-process runs are the tightest GL
+measurement (±1 ms); always verify march stats (covered ≈40%, meanIter
+≈86) before trusting any delta; same-session references; battery state
+affects absolute ms only. TEMP debug edits still in tree (METAL_ITER G/B
+encoding, probe early-return gated on `_padCropFlags[2]`, `[march]`/
+`[RG8]` stderr lines) — revert before any production-facing landing.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
