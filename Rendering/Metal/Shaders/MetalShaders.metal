@@ -7453,6 +7453,27 @@ kernel void volume_dilate_minmax(
   dst.write(solid ? 0.0 : 1.0, gid);
 }
 
+// ---------------------------------------------------------------------------
+// §28 GPU x<->z volume transpose (VTK_METAL_TEST_GPU_TRANSPOSE): replaces the
+// CPU blocked repack for the transposed-volume upload. One thread per SOURCE
+// texel; reads coalesce along source-x from the staging buffer and writes land
+// at the transposed coordinate (z,y,x) in the swapped-dims destination
+// texture. R8Unorm round-trip is byte-exact (b/255*255 rounds back to b).
+kernel void volume_transpose_xz(
+    device const unsigned char* src [[buffer(0)]],
+    texture3d<float, access::write> dst [[texture(1)]],
+    constant uint4& srcDimsPad [[buffer(2)]],   // (W,H,D,0) as uint4
+    uint3 gid [[thread_position_in_grid]])
+{
+  uint3 srcDims = srcDimsPad.xyz;
+  if (any(gid >= srcDims)) return;
+  size_t idx = (static_cast<size_t>(gid.z) * srcDims.y + gid.y) * srcDims.x + gid.x;
+  float v = static_cast<float>(src[idx]) / 255.0f;
+  // T(x'=z, y'=y, z'=x) = V(x,y,z): the destination's width extent holds the
+  // original slice axis (matches the CPU repack layout byte-for-byte).
+  dst.write(float4(v, 0.0f, 0.0f, 1.0f), uint3(gid.z, gid.y, gid.x));
+}
+
 fragment float4 fragment_image_sample_blit(
     FullscreenVertexOut in [[stage_in]],
     texture2d<float> offscreenColor [[texture(0)]]) {

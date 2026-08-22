@@ -1253,6 +1253,75 @@ Remaining §26.6 items unchanged: GPU transpose pass (load-time CPU cost),
 sagittal residual accept/document (now replicated on a second dataset),
 RG8 retirement consideration, TEMP inventory sweep, Apple-report exhibit.
 
+## 28. §26.6 item 4 done (2026-08-22): GPU transpose pass — 13× faster load, byte-identical
+
+### 28.1 Implementation
+
+`VTK_METAL_TEST_GPU_TRANSPOSE=1` (env-gated; CPU repack remains the default
+until wider validation): skips the CPU blocked x<->z transpose entirely.
+Staging keeps the ORIGINAL layout (plain memcpy of scalars); a one-pass
+compute kernel `volume_transpose_xz` (MetalShaders.metal) reads the staging
+bytes (`device const uchar*`, coalesced along source-x) and writes the
+swapped-dims volume texture directly at `(z,y,x)` — no transStorage
+allocation, no blit, no intermediate texture. One `MTLComputeCommandEncoder`
+on the usual upload command buffer; same queue ordering as the blit it
+replaces. R8Unorm round-trip is byte-exact. Pipeline cached in
+`TransposeComputePipeline` (header member); texture created with
+`ShaderRead|ShaderWrite` under the knob. Threadgroup 8³ (4³ fallback via
+`maxTotalThreadsPerThreadgroup`).
+
+### 28.2 Measured (IMRToraceAddome 512×512×1794, 470 MB)
+
+| stage | CPU repack | GPU kernel |
+|---|---|---|
+| transpose itself | 1049–1087 ms ×2 uploads | **73–86 ms** per upload |
+| wall-clock speedup | 1× | **~13×** |
+
+Frame times identical to the CPU-repack path in every cell re-measured:
+oblique @2048 raw j1 21.99 ms/f (= §27's 21.98 reference), axial z @2048
+42.53, production minmax+accel+shade @1024 9.18 (vs 9.93 CPU-repack arm).
+
+### 28.3 Verification ladder
+
+1. Full-volume FNV-1a of the uploaded texture (TR_DUMP + TR_GPU shared
+   storage readback) ≡ CPU `transStorage` hash byte-for-byte
+   (`5082437852801311472` both paths). Staging hash ≡ dicom.u8 ground truth.
+2. Render parity: jittered raw @1024 PNG **byte-identical** to CPU-repack;
+   production minmax+accel+shade PNG **byte-identical**.
+3. Occupancy scan along the transposed axis (TEMP-DIAG) uniform ~0.87 as
+   expected from source content.
+
+### 28.4 Debug war story (for future Metal compute work)
+
+The first working version produced partially-corrupted output whose root
+cause cost most of a session to isolate: **the kernel declared
+`dst [[texture(1)]]` while the dispatch bound `[enc setTexture:tex
+atIndex:0]`** — writes to an unbound slot are silently discarded and the
+command buffer still reports Completed/error=0. Symptoms were actively
+misleading: the readback showed *banded partial data* (~87% occupancy in
+[x',512..1024)+[1664,1794) slabs, zeros elsewhere) that did NOT change when
+the kernel body was swapped for a position-encoded constant writer — i.e.,
+the visible content was unrelated to anything the kernel wrote. Lessons:
+(a) always cross-check binding indices against the [[texture(n)]]/
+[[buffer(n)]] attributes; (b) an unbound write target fails silently, not
+with a validation error; (c) MSL printf never emitted here, so "no printf"
+was NOT evidence of non-execution; (d) the legacy getBytes selector on this
+runtime is `getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:
+slice:` — the modern `from:` variant raises unrecognized-selector on
+AGXG14GFamilyTexture.
+
+Also fixed en route: the pre-existing TR_GPU probe's `fromRegion:` call had
+the same latent selector bug (never exercised before); TR_DUMP now prints a
+full-volume FNV-1a for both CPU and GPU paths plus a per-slab occupancy
+profile (all env-gated TEMP-DIAG).
+
+Verdict: §26.6 item 4 closed. The knob is ready to fold into the
+default-enable decision once dataset coverage questions (§27.3 caveats)
+are settled — GPU transpose removes the only remaining runtime cost of the
+transposed representation (seconds → tens of ms at load), so
+`VOLTRANSPOSE` + `GPU_TRANSPOSE` together have no load-time penalty worth
+gating on.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).

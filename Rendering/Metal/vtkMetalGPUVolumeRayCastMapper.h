@@ -388,6 +388,11 @@ private:
   void* MinMaxComputePipeline = nullptr;  // id<MTLComputePipelineState> — volume_compute_minmax
   void* DilateComputePipeline = nullptr;  // id<MTLComputePipelineState> — volume_dilate_minmax
 
+  // §28 GPU x<->z volume transpose (VTK_METAL_TEST_GPU_TRANSPOSE): one-pass
+  // compute replacement for the CPU blocked repack in the transposed-volume
+  // upload. volume_transpose_xz.
+  void* TransposeComputePipeline = nullptr;
+
   // Ensure the two compute pipelines exist.
   bool EnsureMinMaxComputePipelines(void* mtlDevice);
 

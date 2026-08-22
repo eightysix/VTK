@@ -52,6 +52,7 @@
 #include <cstddef>
 #include <set>
 #include <vector>
+#include <chrono>
 #include <dispatch/dispatch.h>
 
 // Metal constant-address-space structs align float3 to 16 bytes (size 16),
@@ -412,6 +413,19 @@ static bool VolumeTransposedActive()
     return false;
   }();
   return tr;
+}
+
+// §28 GPU transpose pass (VTK_METAL_TEST_GPU_TRANSPOSE): when the transposed
+// representation is active, skip the CPU blocked x<->z repack (seconds at load
+// for ~450 MB volumes) and instead upload the ORIGINAL-layout staging and run
+// a one-pass compute kernel that writes the swapped-dims volume texture
+// directly from the staging bytes. Same command-queue ordering as the blit it
+// replaces, so downstream renders stay correct; the final texture contents are
+// byte-identical to the CPU repack path.
+static bool VolumeTransposeGPU()
+{
+  static const bool gpu = getenv("VTK_METAL_TEST_GPU_TRANSPOSE") != nullptr;
+  return gpu;
 }
 
 // Composite slab count from VTK_METAL_TEST_NUM_SLABS (default 8). N > 1 splits
@@ -2312,6 +2326,7 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
   // a large DRAM tax (2026-08-22 root cause). The shader maps coordinates
   // back via .zyx (fc_volTransposed).
   bool volTransposed = false;
+  bool volTransposedGPU = false;
   std::vector<uint8_t> transStorage;
   if (!gpuConversionUsed && !rg8Pair && VolumeTransposedActive() &&
       dataType == VTK_UNSIGNED_CHAR && numComponents == 1)
@@ -2323,11 +2338,23 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
       actualComponents;
     upBytesPerRow = static_cast<NSUInteger>(dims[2]) * elemSize;
     upBytesPerImage = upBytesPerRow * static_cast<NSUInteger>(dims[1]);
+    volTransposedGPU = VolumeTransposeGPU();
+    if (volTransposedGPU)
+    {
+      // §28: staging stays in ORIGINAL layout; the compute kernel writes the
+      // swapped-dims texture directly from it (no transStorage, no blit).
+      fprintf(stderr, "[TR] direct path: transposed dims %dx%dx%d -> %dx%dx%d (GPU kernel)\n",
+        dims[0], dims[1], dims[2], upDims[0], upDims[1], upDims[2]);
+    }
+    else
+    {
     transStorage.resize(totalBytes);
     // new(x'=z, y, z'=x): T[((x*D + y)*W + z)] = V[((z*H + y)*W + x)]
     const int BS = 32;
     const uint8_t* in = static_cast<const uint8_t*>(scalars->GetVoidPointer(0));
     uint8_t* out = transStorage.data();
+    std::chrono::steady_clock::time_point trT0;
+    if (getenv("VTK_METAL_TEST_TR_BENCH")) trT0 = std::chrono::steady_clock::now();
     for (int xb = 0; xb < dims[0]; xb += BS)
       for (int zb = 0; zb < dims[2]; zb += BS)
         for (int yb = 0; yb < dims[1]; yb += BS)
@@ -2343,8 +2370,12 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
                   in + (((static_cast<size_t>(z) * dims[1] + y) * dims[0]) + x) * elemSize,
                   elemSize);
         }
-    fprintf(stderr, "[TR] direct path: transposed dims %dx%dx%d -> %dx%dx%d\n",
-      dims[0], dims[1], dims[2], upDims[0], upDims[1], upDims[2]);
+    if (getenv("VTK_METAL_TEST_TR_BENCH"))
+      fprintf(stderr, "[TRBENCH] cpu blocked transpose: %.1f ms (%zu bytes)\n",
+        std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - trT0).count(),
+        transStorage.size());
+    }
   }
   this->VolumeTextureTransposed = volTransposed;
 
@@ -2425,7 +2456,7 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
       {
         std::memcpy(uploadPointer, rg8Storage.data(), rg8Storage.size());
       }
-      else if (volTransposed)
+      else if (volTransposed && !volTransposedGPU)
       {
         std::memcpy(uploadPointer, transStorage.data(), transStorage.size());
       }
@@ -2456,7 +2487,8 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
         static_cast<NSUInteger>(upDims[0]),
         static_cast<NSUInteger>(upDims[1]),
         static_cast<NSUInteger>(upDims[2]),
-        MTLTextureUsageShaderRead,
+        volTransposedGPU ? MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite
+                         : MTLTextureUsageShaderRead,
         MTLStorageModePrivate,
         VolumeGPUOptimizedContents());
       if (!tex)
@@ -2469,6 +2501,72 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
     }
 
     id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
+    if (volTransposedGPU)
+    {
+      // §28 GPU transpose: no blit. One compute pass writes the swapped-dims
+      // volume texture directly from the ORIGINAL-layout staging buffer.
+      if (!this->EnsureShaderLibrary((__bridge void*)device))
+      {
+        vtkErrorMacro("GPU transpose: no shader library");
+        [stagingBuf release];
+        return false;
+      }
+      if (!this->TransposeComputePipeline)
+      {
+        id<MTLLibrary> library =
+          (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
+        id<MTLFunction> func =
+          [library newFunctionWithName:@"volume_transpose_xz"];
+        NSError* error = nil;
+        id<MTLComputePipelineState> pso = func
+          ? [device newComputePipelineStateWithFunction:func error:&error]
+          : nil;
+        if (func) [func release];
+        if (!pso)
+        {
+          vtkErrorMacro(<< "Failed to create transpose compute pipeline: "
+                        << (error ? [[error localizedDescription] UTF8String]
+                                  : "unknown"));
+          [stagingBuf release];
+          return false;
+        }
+        AssignMetalObject(this->TransposeComputePipeline, pso);
+      }
+      id<MTLComputePipelineState> pso =
+        (__bridge id<MTLComputePipelineState>)this->TransposeComputePipeline;
+      NSUInteger mtt = [pso maxTotalThreadsPerThreadgroup];
+      MTLSize tg = mtt >= 512 ? MTLSizeMake(8, 8, 8) : MTLSizeMake(4, 4, 4);
+      MTLSize grid = MTLSizeMake(
+        (static_cast<NSUInteger>(dims[0]) + tg.width - 1) / tg.width,
+        (static_cast<NSUInteger>(dims[1]) + tg.height - 1) / tg.height,
+        (static_cast<NSUInteger>(dims[2]) + tg.depth - 1) / tg.depth);
+      std::chrono::steady_clock::time_point trT0;
+      bool trBench = getenv("VTK_METAL_TEST_TR_BENCH") != nullptr;
+      if (trBench) trT0 = std::chrono::steady_clock::now();
+      id<MTLComputeCommandEncoder> enc = [uploadCmdBuf computeCommandEncoder];
+      [enc setComputePipelineState:pso];
+      [enc setBuffer:stagingBuf offset:0 atIndex:0];
+      // dst is [[texture(1)]] in volume_transpose_xz.
+      [enc setTexture:tex atIndex:1];
+      // MSL uint3 occupies 16 bytes in the constant address space.
+      struct { uint32_t x, y, z, pad; } srcDims = {
+        static_cast<uint32_t>(dims[0]), static_cast<uint32_t>(dims[1]),
+        static_cast<uint32_t>(dims[2]), 0 };
+      [enc setBytes:&srcDims length:sizeof(srcDims) atIndex:2];
+      [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+      [enc endEncoding];
+      [uploadCmdBuf commit];
+      if (trBench)
+      {
+        [uploadCmdBuf waitUntilCompleted];
+        fprintf(stderr,
+          "[TRBENCH] gpu transpose (staging copy excluded): %.1f ms\n",
+          std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - trT0).count());
+      }
+      [stagingBuf release];
+      return true;
+    }
     id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
       [blit copyFromBuffer:stagingBuf
               sourceOffset:0
@@ -3588,41 +3686,59 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
        // texture depth, trilinear z-pair fetches under per-pixel jitter
        // phase scatter pay a large DRAM tax (2026-08-22 root cause). The
        // shader maps coordinates back via .zyx (fc_volTransposed).
-       bool volTransposed = false;
-       std::vector<uint8_t> transStorage;
-       if (!gpuConversionUsed && !rg8Pair && VolumeTransposedActive() &&
-           dataType == VTK_UNSIGNED_CHAR && numComponents == 1)
-       {
-         volTransposed = true;
-         upDims[0] = dims[2];
-         upDims[2] = dims[0];
-         const NSUInteger elemSize = static_cast<NSUInteger>(fmtInfo.BytesPerComponent) *
-           actualComponents;
-         upBytesPerRow = static_cast<NSUInteger>(dims[2]) * elemSize;
-         upBytesPerImage = upBytesPerRow * static_cast<NSUInteger>(dims[1]);
-         transStorage.resize(totalBytes);
-         // new(x'=z, y, z'=x): T[((x*D + y)*W + z)] = V[((z*H + y)*W + x)]
-         // (element indices; element size elemSize bytes)
-         const int BS = 32;
-         const uint8_t* in = static_cast<const uint8_t*>(scalars->GetVoidPointer(0));
-         uint8_t* out = transStorage.data();
-         for (int xb = 0; xb < dims[0]; xb += BS)
-           for (int zb = 0; zb < dims[2]; zb += BS)
-             for (int yb = 0; yb < dims[1]; yb += BS)
-             {
-               const int xe = std::min(xb + BS, dims[0]);
-               const int ze = std::min(zb + BS, dims[2]);
-               const int ye = std::min(yb + BS, dims[1]);
-               for (int x = xb; x < xe; ++x)
-                 for (int z = zb; z < ze; ++z)
-                   for (int y = yb; y < ye; ++y)
-                     std::memcpy(
-                       out + (((static_cast<size_t>(x) * dims[1] + y) * dims[2]) + z) * elemSize,
-                       in + (((static_cast<size_t>(z) * dims[1] + y) * dims[0]) + x) * elemSize,
-                       elemSize);
-             }
-         fprintf(stderr, "[TR] UpdateVolumeTexture: transposed dims %dx%dx%d -> %dx%dx%d\n",
-           dims[0], dims[1], dims[2], upDims[0], upDims[1], upDims[2]);
+        bool volTransposed = false;
+        bool volTransposedGPU = false;
+        std::vector<uint8_t> transStorage;
+        if (!gpuConversionUsed && !rg8Pair && VolumeTransposedActive() &&
+            dataType == VTK_UNSIGNED_CHAR && numComponents == 1)
+        {
+          volTransposed = true;
+          upDims[0] = dims[2];
+          upDims[2] = dims[0];
+          const NSUInteger elemSize = static_cast<NSUInteger>(fmtInfo.BytesPerComponent) *
+            actualComponents;
+          upBytesPerRow = static_cast<NSUInteger>(dims[2]) * elemSize;
+          upBytesPerImage = upBytesPerRow * static_cast<NSUInteger>(dims[1]);
+          volTransposedGPU = VolumeTransposeGPU();
+          if (volTransposedGPU)
+          {
+            // §28: staging stays in ORIGINAL layout; the compute kernel writes
+            // the swapped-dims texture directly from it.
+            fprintf(stderr, "[TR] UpdateVolumeTexture: transposed dims %dx%dx%d -> %dx%dx%d (GPU kernel)\n",
+              dims[0], dims[1], dims[2], upDims[0], upDims[1], upDims[2]);
+          }
+          else
+          {
+          transStorage.resize(totalBytes);
+          // new(x'=z, y, z'=x): T[((x*D + y)*W + z)] = V[((z*H + y)*W + x)]
+          // (element indices; element size elemSize bytes)
+          const int BS = 32;
+          const uint8_t* in = static_cast<const uint8_t*>(scalars->GetVoidPointer(0));
+          uint8_t* out = transStorage.data();
+          std::chrono::steady_clock::time_point trT0;
+          if (getenv("VTK_METAL_TEST_TR_BENCH")) trT0 = std::chrono::steady_clock::now();
+          for (int xb = 0; xb < dims[0]; xb += BS)
+            for (int zb = 0; zb < dims[2]; zb += BS)
+              for (int yb = 0; yb < dims[1]; yb += BS)
+              {
+                const int xe = std::min(xb + BS, dims[0]);
+                const int ze = std::min(zb + BS, dims[2]);
+                const int ye = std::min(yb + BS, dims[1]);
+                for (int x = xb; x < xe; ++x)
+                  for (int z = zb; z < ze; ++z)
+                    for (int y = yb; y < ye; ++y)
+                      std::memcpy(
+                        out + (((static_cast<size_t>(x) * dims[1] + y) * dims[2]) + z) * elemSize,
+                        in + (((static_cast<size_t>(z) * dims[1] + y) * dims[0]) + x) * elemSize,
+                        elemSize);
+              }
+          if (getenv("VTK_METAL_TEST_TR_BENCH"))
+            fprintf(stderr, "[TRBENCH] cpu blocked transpose: %.1f ms (%zu bytes)\n",
+              std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - trT0).count(),
+              transStorage.size());
+          fprintf(stderr, "[TR] UpdateVolumeTexture: transposed dims %dx%dx%d -> %dx%dx%d\n",
+            dims[0], dims[1], dims[2], upDims[0], upDims[1], upDims[2]);
          // TEMP-DIAG (VTK_METAL_TEST_TR_DUMP): verify repacked bytes. Under
          // the mapping T(i,j,k) = V(k, j, i), T's width-i slice at i=D/2 must
          // equal V's axial slice D/2 exactly.
@@ -3648,13 +3764,21 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
                  fwrite(pa, 1, 3, f1);
                  fwrite(pb, 1, 3, f2);
                }
-             fprintf(stderr, "[TR] dumped /tmp/tr_orig_slice.ppm /tmp/tr_tran_slice.ppm\n");
+              fprintf(stderr, "[TR] dumped /tmp/tr_orig_slice.ppm /tmp/tr_tran_slice.ppm\n");
+            }
+             if (f1) fclose(f1);
+             if (f2) fclose(f2);
+            // Full-volume FNV-1a of the repacked bytes (reference for the
+            // GPU-kernel checksum printed after upload).
+            uint64_t h = 1469598103934665603ULL;
+            for (size_t i = 0; i < transStorage.size(); ++i)
+              h = (h ^ transStorage[i]) * 1099511628211ULL;
+            fprintf(stderr, "[TR] transStorage fnv1a %llu\n",
+              (unsigned long long)h);
            }
-           if (f1) fclose(f1);
-           if (f2) fclose(f2);
+           }
          }
-       }
-       this->VolumeTextureTransposed = volTransposed;
+         this->VolumeTextureTransposed = volTransposed;
 
         if (!gpuConversionUsed)
        {
@@ -3729,7 +3853,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           {
             std::memcpy(uploadPointer, rg8Storage.data(), rg8Storage.size());
           }
-          else if (volTransposed)
+          else if (volTransposed && !volTransposedGPU)
           {
             std::memcpy(uploadPointer, transStorage.data(), transStorage.size());
           }
@@ -3760,7 +3884,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           static_cast<NSUInteger>(upDims[0]),
           static_cast<NSUInteger>(upDims[1]),
           static_cast<NSUInteger>(upDims[2]),
-          MTLTextureUsageShaderRead,
+          volTransposedGPU ? MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite
+                           : MTLTextureUsageShaderRead,
           getenv("VTK_METAL_TEST_TR_GPU") ? MTLStorageModeShared
                                           : MTLStorageModePrivate,
           VolumeGPUOptimizedContents());
@@ -3773,6 +3898,86 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       }
 
       id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
+      if (volTransposedGPU)
+      {
+        // §28 GPU transpose: no blit. One compute pass writes the swapped-dims
+        // volume texture directly from the ORIGINAL-layout staging buffer.
+        if (!this->EnsureShaderLibrary((__bridge void*)device))
+        {
+          vtkErrorMacro("GPU transpose: no shader library");
+          [stagingBuf release];
+          return false;
+        }
+        if (!this->TransposeComputePipeline)
+        {
+          id<MTLLibrary> library =
+            (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
+          id<MTLFunction> func =
+            [library newFunctionWithName:@"volume_transpose_xz"];
+          NSError* error = nil;
+          id<MTLComputePipelineState> pso = func
+            ? [device newComputePipelineStateWithFunction:func error:&error]
+            : nil;
+          if (func) [func release];
+          if (!pso)
+          {
+            vtkErrorMacro(<< "Failed to create transpose compute pipeline: "
+                          << (error ? [[error localizedDescription] UTF8String]
+                                    : "unknown"));
+            [stagingBuf release];
+            return false;
+          }
+          AssignMetalObject(this->TransposeComputePipeline, pso);
+        }
+        id<MTLComputePipelineState> pso =
+          (__bridge id<MTLComputePipelineState>)this->TransposeComputePipeline;
+        NSUInteger mtt = [pso maxTotalThreadsPerThreadgroup];
+        MTLSize tg = mtt >= 512 ? MTLSizeMake(8, 8, 8) : MTLSizeMake(4, 4, 4);
+        MTLSize grid = MTLSizeMake(
+          (static_cast<NSUInteger>(dims[0]) + tg.width - 1) / tg.width,
+          (static_cast<NSUInteger>(dims[1]) + tg.height - 1) / tg.height,
+          (static_cast<NSUInteger>(dims[2]) + tg.depth - 1) / tg.depth);
+        std::chrono::steady_clock::time_point trT0;
+        bool trBench = getenv("VTK_METAL_TEST_TR_BENCH") != nullptr;
+        if (trBench || getenv("VTK_METAL_TEST_TR_DUMP"))
+        {
+          // Verify the staging bytes the kernel will read.
+          const uint8_t* sb = static_cast<const uint8_t*>([stagingBuf contents]);
+          uint64_t h = 1469598103934665603ULL;
+          for (size_t i = 0; i < totalBytes; ++i)
+            h = (h ^ sb[i]) * 1099511628211ULL;
+          fprintf(stderr, "[TR] staging fnv1a %llu\n", (unsigned long long)h);
+        }
+        if (trBench) trT0 = std::chrono::steady_clock::now();
+        id<MTLComputeCommandEncoder> enc = [uploadCmdBuf computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:stagingBuf offset:0 atIndex:0];
+        // dst is [[texture(1)]] in volume_transpose_xz.
+        [enc setTexture:tex atIndex:1];
+        // MSL uint3 occupies 16 bytes in the constant address space.
+        struct { uint32_t x, y, z, pad; } srcDims = {
+          static_cast<uint32_t>(dims[0]), static_cast<uint32_t>(dims[1]),
+          static_cast<uint32_t>(dims[2]), 0 };
+        [enc setBytes:&srcDims length:sizeof(srcDims) atIndex:2];
+        [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+        [enc endEncoding];
+        [uploadCmdBuf commit];
+        if (trBench || getenv("VTK_METAL_TEST_TR_DUMP"))
+        {
+          [uploadCmdBuf waitUntilCompleted];
+          fprintf(stderr, "[TR] cmd status %ld error %ld\n",
+            (long)[uploadCmdBuf status], (long)[uploadCmdBuf error].code);
+        }
+        if (trBench)
+        {
+          fprintf(stderr,
+            "[TRBENCH] gpu transpose (staging copy excluded): %.1f ms\n",
+            std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - trT0).count());
+        }
+      }
+      else
+      {
       id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
       [blit copyFromBuffer:stagingBuf
               sourceOffset:0
@@ -3785,34 +3990,66 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
        destinationOrigin:MTLOriginMake(0, 0, 0)];
       [blit endEncoding];
       [uploadCmdBuf commit];
+      } // end else (CPU blit path)
       if (getenv("VTK_METAL_TEST_TR_DUMP") && volTransposed)
       {
-        // TEMP-DIAG: read the GPU texture back (Shared storage) and dump its
-        // mid-width plane for comparison against /tmp/tr_orig_slice.ppm.
+        // TEMP-DIAG: read the GPU texture back (Shared storage — run with
+        // VTK_METAL_TEST_TR_GPU=1) and checksum the FULL volume against the
+        // CPU repack's [TR] transStorage fnv1a.
         [uploadCmdBuf waitUntilCompleted];
-        const int W = dims[0], H = dims[1];
-        const int dslice = upDims[0] / 2;
-        std::vector<uint8_t> gpu(totalBytes);
-        [( __bridge id<MTLTexture>)this->VolumeTexture
-            getBytes:gpu.data() bytesPerRow:upBytesPerRow
-        bytesPerImage:upBytesPerImage
-            fromRegion:MTLRegionMake3D(0, 0, 0, upDims[0], upDims[1], upDims[2])
-            mipmapLevel:0];
-        FILE* f3 = fopen("/tmp/tr_gpu_slice.ppm", "wb");
-        if (f3)
+        id<MTLTexture> texR = (__bridge id<MTLTexture>)this->VolumeTexture;
+        if (texR.storageMode == MTLStorageModeShared)
         {
-          fprintf(f3, "P6\n%d %d\n255\n", W, H);
-          for (int y = 0; y < H; ++y)
-            for (int x = 0; x < W; ++x)
-            {
-              size_t off = static_cast<size_t>(x) * upBytesPerImage +
-                           static_cast<size_t>(y) * upBytesPerRow + dslice;
-              uint8_t v = gpu[off];
-              uint8_t pv[3] = { v, v, v };
-              fwrite(pv, 1, 3, f3);
-            }
-          fclose(f3);
-          fprintf(stderr, "[TR] dumped /tmp/tr_gpu_slice.ppm\n");
+          std::vector<uint8_t> gpu(totalBytes);
+          [texR getBytes:gpu.data() bytesPerRow:upBytesPerRow
+           bytesPerImage:upBytesPerImage
+              fromRegion:MTLRegionMake3D(0, 0, 0, upDims[0], upDims[1], upDims[2])
+             mipmapLevel:0 slice:0];
+          uint64_t h = 1469598103934665603ULL;
+          for (size_t i = 0; i < gpu.size(); ++i)
+            h = (h ^ gpu[i]) * 1099511628211ULL;
+          fprintf(stderr, "[TR] gpu texture fnv1a %llu\n", (unsigned long long)h);
+          const int W = dims[0], H = dims[1];
+          const int dslice = upDims[0] / 2;
+          FILE* f3 = fopen("/tmp/tr_gpu_slice.ppm", "wb");
+          if (f3)
+          {
+            fprintf(f3, "P6\n%d %d\n255\n", W, H);
+            for (int y = 0; y < H; ++y)
+              for (int x = 0; x < W; ++x)
+              {
+                size_t off = static_cast<size_t>(x) * upBytesPerImage +
+                             static_cast<size_t>(y) * upBytesPerRow + dslice;
+                uint8_t v = gpu[off];
+                uint8_t pv[3] = { v, v, v };
+                fwrite(pv, 1, 3, f3);
+              }
+            fclose(f3);
+            fprintf(stderr, "[TR] dumped /tmp/tr_gpu_slice.ppm\n");
+          }
+          // Occupancy profile along the destination x' extent (the transposed
+          // slice axis): nonzero fraction over a sampled (y,z) grid per plane.
+          fprintf(stderr, "[TR] occupancy along x':");
+          for (int xp = 0; xp < static_cast<int>(upDims[0]); xp += 128)
+          {
+            int nz = 0, tot = 0;
+            for (int z = 0; z < static_cast<int>(upDims[2]); z += 8)
+              for (int y = 0; y < static_cast<int>(upDims[1]); y += 8)
+              {
+                ++tot;
+                if (gpu[static_cast<size_t>(xp) * upBytesPerImage +
+                        static_cast<size_t>(y) * upBytesPerRow + z] != 0)
+                  ++nz;
+              }
+            fprintf(stderr, " %d:%.2f", xp,
+              tot ? static_cast<double>(nz) / tot : 0.0);
+          }
+          fprintf(stderr, "\n");
+        }
+        else
+        {
+          fprintf(stderr,
+            "[TR] TR_DUMP readback needs shared storage (set VTK_METAL_TEST_TR_GPU=1)\n");
         }
       }
       // Release our reference to the staging buffer. Metal keeps the buffer
