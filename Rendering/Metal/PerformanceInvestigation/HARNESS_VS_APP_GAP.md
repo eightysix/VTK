@@ -1189,6 +1189,70 @@ enabled-by-default after wider dataset coverage; Apple-report exhibit is
 now trivial
 (two uploads, one bit-identical render, 10× jitter delta difference).
 
+## 27. §26.6 items 1+3 complete (2026-08-22): variant/config + dataset coverage validated
+
+### 27.1 Variant/config coverage (§26.6 item 3) — all pass
+
+All @1024 or as noted, oblique, JITTER=1, IGN_JITTER=0, IMRToraceAddome:
+
+| config | baseline | transposed | parity |
+|---|---|---|---|
+| mv9 raw (`VTK_METAL_TEST_MARCH_VARIANT=9`, MINMAX off) j1 | 43.20±0.48 | **13.13±0.24** (3.3×) | **byte-identical** |
+| mv9+minmax+accel @2048 j1 | 27.18 (§26.1 mv0 base) | 21.73±0.01 | (mv0-tr ref 24.67; mv9 faster) |
+| SHADE=1 raw (normals kernel) j1 | 45.08 | **19.52** (2.3×) | **byte-identical** |
+| production minmax+accel+SHADE j1 | 13.82 | **9.63** (1.4×) | near-identical: mean|d|=0.0004, 8/1048576 px >1LSB, max 7 (= §26.5's known minmax macrocell edge-rounding, NOT the swizzle) |
+
+The normals-kernel `volTransposed` swizzle (NormalComputeUniforms /
+MinMaxComputeUniforms paths) is now image-verified, closing §26.6 item 3's
+"code-reviewed, not yet image-diffed" gap. mv9's lean march fetches through
+`sampleVolumeScalar` (MetalShaders.metal MV9_FETCH), so it inherits the entry
+swizzle — confirmed by byte parity.
+
+New TEMP-DIAG env: `VTK_METAL_TEST_SHADE` in TestMetalScenes.h
+(BuildDICOMVolumeScene; ShadeOn + 0.2/0.8/0.3 ADS). The DICOM scene previously
+had no shading coverage at all. Env-gated, default off.
+
+### 27.2 Dataset coverage (§26.6 item 1)
+
+Available-study survey (`VTK_METAL_TEST_TR_DUMP` texture dims): of 16 study
+dirs under /Users/macair/Public/IMR, only 4 are real 3D volumes — the rest
+are 1–3-slice degenerate stacks or unreadable series. Valid set (all CT U8,
+512² in-plane, deep slice axis — same anisotropy class):
+
+| dataset @2048/SD4 raw oblique | base j0/j1 (Δ) | transposed j0/j1 (Δ) |
+|---|---|---|
+| IMRToraceAddome ×1794 (§26.5 ref) | 43.3/66.1 (+22.8) | 20.2/22.2 (+2.0) |
+| **IMRTA4** ×1714 | 44.41/66.35 (+21.9) | 19.34/21.98 (+2.6) |
+| **FGFegatoIMR** ×1084 | 19.17/32.89 (+13.7) | 13.54/15.33 (+1.8) |
+| **ACOvaioIMR** ×1654 | 36.00/49.34 (+13.3) | 15.04/18.58 (+3.5) |
+
+Jittered-render parity: pixel-identical on all three new studies
+(mean|d|=0, max 0).
+
+Axis cells replicate the §26.5 pattern (IMRTA4 @1024 j1, renders identical):
+x/sagittal 15.86→19.12 (**+20%**, the relocated tax); y/coronal
+15.59→11.83 (−24%); z/axial 69.58→15.95 (**−77%**). Net worst case +3.3 ms
+on x-only views against −54 ms axial and −14 to −45 ms oblique.
+
+TF diversity: BoneSkinII preset (multi-color TF, app runs it shadeless)
+@1024 on IMRTA4: 16.91→6.40 (2.6×), render pixel-identical.
+
+### 27.3 Verdict
+
+§26.6 items 1 and 3 are done. VOLTRANSPOSE is correct and strictly faster on
+every 3D dataset available (4/4 studies), every orientation except the
+documented bounded x-march tax, both TF presets, shading on/off, minmax
+on/off, mv0/mv9. Nothing regresses beyond the known sagittal pattern.
+Scope caveat for any default-enable decision: validation remains
+single-modality (CT U8), single in-plane size class (512²), one GPU
+(M1-class Apple Silicon). Multi-component/independent (RGBA/LA) inputs and
+16-bit uploads route through different upload functions — code-reviewed but
+not exercised here.
+
+Remaining §26.6 items unchanged: GPU transpose pass (load-time CPU cost),
+sagittal residual accept/document (now replicated on a second dataset),
+RG8 retirement consideration, TEMP inventory sweep, Apple-report exhibit.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).

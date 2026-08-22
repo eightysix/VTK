@@ -1210,6 +1210,15 @@ inline void BuildDICOMVolumeScene(vtkRenderer* renderer, BackendKind b)
   vtkNew<vtkVolumeProperty> property;
   property->SetColor(color);
   property->SetScalarOpacity(opacity);
+  if (const char* sh = std::getenv("VTK_METAL_TEST_SHADE"); sh && std::atoi(sh) != 0)
+  {
+    // TEMP-DIAG (HARNESS_VS_APP_GAP.md §26.6 item 3): shading-on exercises the
+    // volume_compute_normals kernel + its fc_volTransposed coord swizzle.
+    property->ShadeOn();
+    property->SetAmbient(0.2);
+    property->SetDiffuse(0.8);
+    property->SetSpecular(0.3);
+  }
   if (const char* gln = std::getenv("VTK_METAL_TEST_GL_NEAREST"); gln && std::atoi(gln) != 0)
   {
     property->SetInterpolationTypeToNearest();
