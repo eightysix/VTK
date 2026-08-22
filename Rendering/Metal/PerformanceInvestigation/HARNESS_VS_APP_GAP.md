@@ -954,18 +954,25 @@ level (~Δ+11–13 at these cells); it does NOT make jitter free. If an
 ingredient transfers on GL but not MSL, that itself localizes the
 remaining true API difference (sampler feed, §15/§21) — record it.
 
-### 25.5 Plan B (parallel or fallback) — conditional RG8 gating
+### 25.5 DEPRIORITIZED — conditional RG8 gating (wrong shape for interactive use)
 
-§19 gives the gate for free: the slow azimuths (135°/315°, M/GL j1
-1.28–1.32) are exactly where rays cross slice planes steepest — which is
-also where RG8's z-pair trick pays (DRAM-bound scatter cells, §18).
+An earlier draft proposed gating `fc_volRg8` on ray-vs-slice-plane
+geometry (the slow azimuths 135°/315° are where RG8 pays, §19).
+Deprioritized: the product target is INTERACTIVE rendering, and a
+representation flip driven by live camera geometry is exactly the wrong
+shape for that —
 
-- Gate `fc_volRg8` engagement on ray-vs-slice-plane geometry (class of
-  |dot(rayDirObj, sliceNormal)| / slice-crossing rate), not globally.
-- REQUIRED validation before shipping: re-sweep the §18 matrix across
-  CAM_AZ (not just base oblique) × {SD4, SD0.5} × axis views with the
-  gate engaged/disengaged; the gate must never engage in a regressing
-  cell. Keep `VTK_METAL_TEST_RG8` as manual override.
+- engaging RG8 means REPACKING the volume texture into halved-depth
+  RG8Unorm (a ~450 MB blit); toggling it mid-orbit stalls frames;
+- function-constant flips rebuild PSOs at the worst moment;
+- frame cost that swings with view angle yields unpredictable frame
+  budgets precisely while the user is interacting — worse than a uniform
+  moderate cost.
+
+Status: keep `VTK_METAL_TEST_RG8` as a manual opt-in knob only. Any
+future revival needs a STATIC per-dataset/per-deployment justification
+(a dataset class where plain 3D loses in every orientation), never a
+runtime gate. Plan A (§25.4) is the only active path.
 
 ### 25.6 Refuted — do NOT retry
 
