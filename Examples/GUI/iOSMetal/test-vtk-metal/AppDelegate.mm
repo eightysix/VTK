@@ -6,6 +6,9 @@
 #import "NIFTIVolumeViewController.h"
 #import "VTKMetalBaseViewController.h"
 #import "VTKInteractionMode.h"
+#include <cstdlib>
+#include "vtkMetalGPUVolumeRayCastMapper.h"
+#include "vtkRenderWindow.h"
 #if TARGET_OS_OSX
 #import <Cocoa/Cocoa.h>
 #else
@@ -14,6 +17,12 @@
 
 @interface AppDelegate ()
 @property (nonatomic, readwrite) BOOL benchmarkAutoStarted;
+// Runtime render-config toggles (Rendering menu). Defaults mirror the
+// mapper/env defaults: transpose on, minmax accel on, IGN (not blue-noise)
+// jitter.
+@property (nonatomic) BOOL volumeTransposeEnabled;
+@property (nonatomic) BOOL minMaxAccelerationEnabled;
+@property (nonatomic) BOOL blueNoiseJitterEnabled;
 @end
 
 static NSArray<NSDictionary*>* ViewCommandDefs(void)
@@ -41,6 +50,12 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
 
 - (void)applicationDidFinishLaunching:(NSNotification*)notification
 {
+  self.volumeTransposeEnabled = YES;
+  if (const char* v = std::getenv("VTK_METAL_TEST_VOLTRANSPOSE"))
+    self.volumeTransposeEnabled = std::atoi(v) != 0;
+  self.minMaxAccelerationEnabled = YES;
+  self.blueNoiseJitterEnabled = NO;
+
   NSRect contentRect = NSMakeRect(0, 0, 1100, 800);
   NSWindowStyleMask styleMask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
     NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
@@ -183,6 +198,25 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
      modifiers:NSEventModifierFlagControl | NSEventModifierFlagOption
          target:self
          toMenu:renderingMenu];
+  [renderingMenu addItem:[NSMenuItem separatorItem]];
+  [self addItem:@"Volume Transpose (x<->z)"
+         action:@selector(toggleVolumeTranspose:)
+           key:@"t"
+     modifiers:NSEventModifierFlagCommand | NSEventModifierFlagOption
+         target:self
+         toMenu:renderingMenu];
+  [self addItem:@"MinMax Acceleration"
+         action:@selector(toggleMinMaxAcceleration:)
+           key:@"m"
+     modifiers:NSEventModifierFlagCommand | NSEventModifierFlagOption
+         target:self
+         toMenu:renderingMenu];
+  [self addItem:@"Blue-Noise Jitter (non-IGN)"
+         action:@selector(toggleBlueNoiseJitter:)
+           key:@"n"
+     modifiers:NSEventModifierFlagCommand | NSEventModifierFlagOption
+         target:self
+         toMenu:renderingMenu];
   [self addSubmenu:renderingMenu titled:@"Rendering" toMenu:vtkMenu];
 
   // File submenu
@@ -316,6 +350,26 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
     return [[self findMetalViewController] isKindOfClass:[FileVolumeViewController class]];
   }
 
+  if (action == @selector(toggleVolumeTranspose:))
+  {
+    menuItem.state = self.volumeTransposeEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+    return YES;
+  }
+
+  if (action == @selector(toggleMinMaxAcceleration:) ||
+      action == @selector(toggleBlueNoiseJitter:))
+  {
+    BOOL isVolumeVC = [[self findMetalViewController] isKindOfClass:[BaseVolumeViewController class]];
+    menuItem.enabled = isVolumeVC;
+    if (!isVolumeVC)
+      return NO;
+    if (action == @selector(toggleMinMaxAcceleration:))
+      menuItem.state = self.minMaxAccelerationEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+    else
+      menuItem.state = self.blueNoiseJitterEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+    return YES;
+  }
+
   return YES;
 }
 
@@ -361,6 +415,73 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
   if ([vc isKindOfClass:[FileVolumeViewController class]])
   {
     [vc loadFile:sender];
+  }
+}
+
+#pragma mark - Render Config Toggles
+
+- (vtkMetalGPUVolumeRayCastMapper*)currentVolumeMapper
+{
+  VTKMetalBaseViewController* vc = [self findMetalViewController];
+  if ([vc isKindOfClass:[BaseVolumeViewController class]])
+  {
+    return ((BaseVolumeViewController*)vc).mapper;
+  }
+  return nil;
+}
+
+- (void)renderCurrentWindow
+{
+  VTKMetalBaseViewController* vc = [self findMetalViewController];
+  if (vc.renderWindow)
+  {
+    static_cast<vtkRenderWindow*>(vc.renderWindow)->Render();
+  }
+}
+
+// Transpose changes the uploaded texture layout and the shader fetch path, so
+// the volume must re-upload; ForceResourceReupload does that in place, keeping
+// the loaded dataset (unlike recreating the view controller, which would drop
+// it). Both env knobs flip together: GPU transpose is just the fast repack for
+// the transposed representation.
+- (void)toggleVolumeTranspose:(id)sender
+{
+  self.volumeTransposeEnabled = !self.volumeTransposeEnabled;
+  setenv("VTK_METAL_TEST_VOLTRANSPOSE", self.volumeTransposeEnabled ? "1" : "0", 1);
+  setenv("VTK_METAL_TEST_GPU_TRANSPOSE", self.volumeTransposeEnabled ? "1" : "0", 1);
+  if (vtkMetalGPUVolumeRayCastMapper* mapper = [self currentVolumeMapper])
+  {
+    mapper->ForceResourceReupload();
+    [self renderCurrentWindow];
+  }
+}
+
+- (void)toggleMinMaxAcceleration:(id)sender
+{
+  self.minMaxAccelerationEnabled = !self.minMaxAccelerationEnabled;
+  if (vtkMetalGPUVolumeRayCastMapper* mapper = [self currentVolumeMapper])
+  {
+    // Both switches together: UseGPUMinMax selects the compute-kernel lattice
+    // builder, UseMinMaxAcceleration gates empty-space skipping in the march.
+    // Re-upload too — the lattice cell size differs between the GPU and CPU
+    // builders, and a stale/nil min-max texture would desync the shader.
+    mapper->SetUseGPUMinMax(self.minMaxAccelerationEnabled);
+    mapper->SetUseMinMaxAcceleration(self.minMaxAccelerationEnabled);
+    mapper->ForceResourceReupload();
+    [self renderCurrentWindow];
+  }
+}
+
+// Pure shader-constant flip (IGN vs blue-noise tile); the pipeline rebuilds
+// from the changed feature mask on the next frame.
+- (void)toggleBlueNoiseJitter:(id)sender
+{
+  self.blueNoiseJitterEnabled = !self.blueNoiseJitterEnabled;
+  if (vtkMetalGPUVolumeRayCastMapper* mapper = [self currentVolumeMapper])
+  {
+    // NO => blue-noise tile; YES => Interleaved Gradient Noise.
+    mapper->SetUseIGNJitter(!self.blueNoiseJitterEnabled);
+    [self renderCurrentWindow];
   }
 }
 

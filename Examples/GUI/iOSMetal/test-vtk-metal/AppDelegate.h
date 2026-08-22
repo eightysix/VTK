@@ -30,5 +30,8 @@
 - (void)increaseSampleDistance:(id)sender;
 - (void)decreaseSampleDistance:(id)sender;
 - (void)loadFile:(id)sender;
+- (void)toggleVolumeTranspose:(id)sender;
+- (void)toggleMinMaxAcceleration:(id)sender;
+- (void)toggleBlueNoiseJitter:(id)sender;
 #endif
 @end

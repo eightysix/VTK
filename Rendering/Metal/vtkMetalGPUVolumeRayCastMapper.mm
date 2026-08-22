@@ -398,21 +398,21 @@ static bool VolumeRg8PairActive()
 }
 
 // Transposed volume representation from VTK_METAL_TEST_VOLTRANSPOSE (see the
-// VolumeFeature_VolTransposed docs). Single-component 8-bit direct-upload
-// volumes only — the same constraint class as the RG8 repack (no conversion
-// pipeline, no multi-component expansion may run before the transpose).
+// VolumeFeature_VolTransposed docs). ON by default; set to 0 to opt out.
+// Single-component 8-bit direct-upload volumes only — the same constraint
+// class as the RG8 repack (no conversion pipeline, no multi-component
+// expansion may run before the transpose).
 static bool VolumeTransposedActive()
 {
   // NOTE: distinct from TestMetalScenes' older scene-level
   // VTK_METAL_TEST_TRANSPOSE diagnostic (vtkImagePermute at data load).
   // This one transposes INSIDE the upload and swizzles fetches in-shader,
   // so world-space rendering stays identical (byte parity).
-  static const bool tr = [] {
-    if (const char* v = getenv("VTK_METAL_TEST_VOLTRANSPOSE"))
-      return std::atoi(v) != 0;
-    return false;
-  }();
-  return tr;
+  // Re-read per call (called only at volume upload / pipeline build, never
+  // per frame) so test-app runtime toggles take effect on the next reload.
+  if (const char* v = getenv("VTK_METAL_TEST_VOLTRANSPOSE"))
+    return std::atoi(v) != 0;
+  return true;
 }
 
 // §28 GPU transpose pass (VTK_METAL_TEST_GPU_TRANSPOSE): when the transposed
@@ -421,14 +421,17 @@ static bool VolumeTransposedActive()
 // a one-pass compute kernel that writes the swapped-dims volume texture
 // directly from the staging bytes. Same command-queue ordering as the blit it
 // replaces, so downstream renders stay correct; the final texture contents are
-// byte-identical to the CPU repack path.
+// byte-identical to the CPU repack path. ON by default; set to 0 to force the
+// CPU repack. Re-read per call like VolumeTransposedActive().
 static bool VolumeTransposeGPU()
 {
-  static const bool gpu = getenv("VTK_METAL_TEST_GPU_TRANSPOSE") != nullptr;
-  return gpu;
+  if (const char* v = getenv("VTK_METAL_TEST_GPU_TRANSPOSE"))
+    return std::atoi(v) != 0;
+  return true;
 }
 
-// Composite slab count from VTK_METAL_TEST_NUM_SLABS (default 8). N > 1 splits
+// Composite slab count from VTK_METAL_TEST_NUM_SLABS. Slab tiling is DISABLED
+// by default (count 1 = the bit-identical single-pass path). N > 1 splits
 // each ray into N ray-length-fraction index ranges (ceil(j*maxSteps/N) ..
 // ceil((j+1)*maxSteps/N) for j in [0,N)) and renders N front-to-back passes
 // whose partial composites are combined by (ONE, ONE_MINUS_SRC_ALPHA) hardware
@@ -439,14 +442,17 @@ static bool VolumeTransposeGPU()
 // M2/Apple SoC cache and Metal loses to GL by 1.3-1.8x (PERFORMANCE_INVESTIGATION
 // "raw-path coarse-SD lag"); with 8 slabs those regimes flip to Metal winning
 // (2048x2048/SD4: 88-93ms -> 44ms vs GL 50-53ms, M/GL 0.83-0.89). Reads the env
-// var once per process; clamped to [1, 32]. 0 = unset, the count is chosen
-// adaptively per frame (see ResolveNumSlabs).
+// var once per process; clamped to [1, 32]. 0 = adaptive, the count is chosen
+// per frame (see ResolveNumSlabs). Unset = 1 (single pass).
 static int VolumeSlabCount()
 {
   static const int count = [] {
     if (const char* v = getenv("VTK_METAL_TEST_NUM_SLABS"))
-      return std::max(1, std::min(std::atoi(v), 32));
-    return 0;
+    {
+      const int n = std::atoi(v);
+      return (n <= 0) ? 0 : std::min(n, 32);
+    }
+    return 1;
   }();
   return count;
 }
@@ -481,9 +487,9 @@ static int AdaptiveVolumeSlabCount(const float camVolPos[3], int maxSlabs)
   return (align >= threshold) ? 1 : maxSlabs;
 }
 
-// Resolve the per-frame slab count: an explicit VTK_METAL_TEST_NUM_SLABS wins,
-// otherwise the view-aligned adaptive choice (1 for near-axis views, 8
-// otherwise).
+// Resolve the per-frame slab count: an explicit VTK_METAL_TEST_NUM_SLABS wins
+// (0 re-enables the view-aligned adaptive choice); unset defaults to 1, i.e.
+// slab tiling disabled (single pass).
 static int ResolveNumSlabs(const float camVolPos[3])
 {
   const int configured = VolumeSlabCount();
@@ -3392,6 +3398,18 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureEffectiveInput()
 }
 
 //------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::ForceResourceReupload()
+{
+  // Null the derived GPU resources; every consumer re-creates them on demand
+  // (UpdateVolumeTexture reloads when VolumeTexture is null, the min-max
+  // paths recompute when MinMaxTexture is null, EnsureGradientNormalTexture
+  // runs per frame, and the grid traversal rebuilds from the valid flag).
+  ReleaseMetalObject(this->VolumeTexture);
+  ReleaseMetalObject(this->MinMaxTexture);
+  this->ReleaseGradientNormalTexture();
+  this->GridTraversalResourcesValid = false;
+}
+
 bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
   void* mtlDeviceVoid, void* mtlQueueVoid, vtkVolume* vol)
 {

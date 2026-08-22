@@ -155,15 +155,16 @@ enum VolumeShaderFeatureFlags : uint32_t
   // trilinear z-blend is reconstructed in-shader from ~1.25 XY-bilinear taps
   // (divergent_tail V24/V32). Baked via fc_volRg8; clear by default.
   VolumeFeature_VolRg8 = 1u << 30,
-  // Transposed volume representation experiment (VTK_METAL_TEST_VOLTRANSPOSE=1):
-  // the volume uploads x<->z transposed (the slice axis moves to the
+  // Transposed volume representation (VTK_METAL_TEST_VOLTRANSPOSE, on by
+  // default; =0 opts out): the volume uploads x<->z transposed (the slice axis
+  // moves to the
   // texture's x extent) and every scalar fetch maps original-orientation
   // coordinates through .zyx. Root cause (2026-08-22): Metal's private 3D
   // tiling is strongly axis-biased — with the slice axis as texture depth,
   // trilinear z-pair fetches under per-pixel jitter phase scatter pay a huge
   // DRAM tax (jitter delta +23 ms vs GL +12 @2048 oblique); transposing
   // collapses it to +5 ms with byte-identical renders and halves j0.
-  // Baked via fc_volTransposed; clear by default. Mutually exclusive with
+  // Baked via fc_volTransposed; set by default. Mutually exclusive with
   // VolumeFeature_VolRg8 (pair indexing assumes the untransposed layout).
   VolumeFeature_VolTransposed = 1u << 31,
 };
@@ -232,6 +233,13 @@ public:
   // UseGPUMinMax selecting the GPU or CPU path.
   void SetUseMinMaxAcceleration(bool val) { this->UseMinMaxAcceleration = val; }
   bool GetUseMinMaxAcceleration() const { return this->UseMinMaxAcceleration; }
+
+  // Drop the uploaded volume/min-max/gradient textures and derived grid
+  // resources so the next render re-uploads them under the CURRENT layout and
+  // feature settings (env-gated knobs like VTK_METAL_TEST_VOLTRANSPOSE are
+  // re-read at upload time). The input dataset and all other mapper state are
+  // untouched. Used by the test apps' runtime render-config toggles.
+  void ForceResourceReupload();
 
   // Phase 6: Fullscreen camera-inside path.
   // When true (default), camera-inside rendering uses a fullscreen ray-cast
@@ -388,9 +396,9 @@ private:
   void* MinMaxComputePipeline = nullptr;  // id<MTLComputePipelineState> — volume_compute_minmax
   void* DilateComputePipeline = nullptr;  // id<MTLComputePipelineState> — volume_dilate_minmax
 
-  // §28 GPU x<->z volume transpose (VTK_METAL_TEST_GPU_TRANSPOSE): one-pass
-  // compute replacement for the CPU blocked repack in the transposed-volume
-  // upload. volume_transpose_xz.
+  // §28 GPU x<->z volume transpose (VTK_METAL_TEST_GPU_TRANSPOSE, on by
+  // default; =0 forces the CPU repack): one-pass compute replacement for the
+  // CPU blocked repack in the transposed-volume upload. volume_transpose_xz.
   void* TransposeComputePipeline = nullptr;
 
   // Ensure the two compute pipelines exist.
