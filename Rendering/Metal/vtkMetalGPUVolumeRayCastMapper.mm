@@ -1299,7 +1299,45 @@ static std::vector<uint8_t> DilateOccupancy3D(
 // pre-adaptive baseline so the CPU path does not slow the march down.
 static int ComputeMacrocellDownsample(double sampleDistance, bool useGPUMinMax)
 {
+  // TEMP-DIAG (VTK_METAL_TEST_MM_DS): force the macrocell downsample factor
+  // to A/B the DS=2-vs-4 crossover at fine sample distance post-transpose
+  // (HARNESS_VS_APP_GAP §33). Investigation-only.
+  if (const char* e = getenv("VTK_METAL_TEST_MM_DS"))
+    return std::atoi(e);
   return (useGPUMinMax && sampleDistance < 1.5) ? 2 : 4;
+}
+
+// Two-level occupancy summary (VTK_METAL_TEST_MM_BLOCKS, HARNESS_VS_APP_GAP
+// §33): builds a coarse R8 texture marking whole-block all-empty regions of
+// the DILATED macrocell lattice so the fragment walk leaps multiple cells per
+// lattice fetch. Output stays byte-identical: block emptiness is derived from
+// the exact per-cell semantics, so skipped samples are exactly the ones the
+// per-cell walk would skip too.
+static bool VolumeMinMaxBlocksActive()
+{
+  if (const char* v = getenv("VTK_METAL_TEST_MM_BLOCKS"))
+    return std::atoi(v) != 0;
+  return false;
+}
+
+// Block edge in fine-lattice cells. FIXED at 8: the fragment walk derives
+// block indices from cell indices via an integer divide by 8 (matching the
+// reduce kernel's tiling), so other sizes would need shader changes too.
+static int VolumeMinMaxBlockSize()
+{
+  return 8;
+}
+
+// Unified gate for the two-level occupancy summary. Blocks pay off when
+// marches are dense (fine sample distance, the DS=2 macrocell tier): there
+// they collapse the per-cell skip grind into whole-block leaps. At coarse SD
+// the per-crossing bookkeeping costs more than the leaps save (~+1 ms on the
+// SD4 obliques) and the coarser DS=4 lattice makes the +-1-step landing
+// quantization more visible, so the feature stays off there and the SD>=1.5
+// path keeps byte-identical HEAD behavior.
+static bool VolumeMinMaxBlocksWanted(bool gpuMinMax, double sampleDistance)
+{
+  return VolumeMinMaxBlocksActive() && gpuMinMax && sampleDistance < 1.5;
 }
 
 //------------------------------------------------------------------------------
@@ -3061,6 +3099,7 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   this->Transfer2DUseGradient = false;
   ReleaseMetalObject(this->MinMaxTexture);
   ReleaseMetalObject(this->MinMaxScratchTexture);
+  ReleaseMetalObject(this->MinMaxBlockTexture);
   this->ReleaseGradientNormalTexture();
 
   this->ReleaseMaskResources();
@@ -3072,6 +3111,7 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   // Phase 5: Release GPU min-max compute pipelines
   ReleaseMetalObject(this->MinMaxComputePipeline);
   ReleaseMetalObject(this->DilateComputePipeline);
+  ReleaseMetalObject(this->BlockReduceComputePipeline);
 
   // Phase 7: Release GPU data-type conversion compute pipelines
   ReleaseMetalObject(this->ConvertShortToHalfPipeline);
@@ -5515,6 +5555,27 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureMinMaxComputePipelines(void* mtlDevic
       }
       AssignMetalObject(this->DilateComputePipeline, pso);
     }
+
+    if (!this->BlockReduceComputePipeline)
+    {
+      id<MTLFunction> func = [library newFunctionWithName:@"volume_reduce_minmax_blocks"];
+      if (!func)
+      {
+        vtkErrorMacro("Failed to find volume_reduce_minmax_blocks kernel");
+        return false;
+      }
+      NSError* error = nil;
+      id<MTLComputePipelineState> pso =
+        [dev newComputePipelineStateWithFunction:func error:&error];
+      [func release];
+      if (!pso)
+      {
+        vtkErrorMacro(<< "Failed to create minmax block-reduce pipeline: "
+                      << [[error localizedDescription] UTF8String]);
+        return false;
+      }
+      AssignMetalObject(this->BlockReduceComputePipeline, pso);
+    }
   }
 
   return true;
@@ -5634,6 +5695,17 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
       mmDims[0], mmDims[1], mmDims[2], DS);
   }
 
+  // Two-level summary wish (VTK_METAL_TEST_MM_BLOCKS): part of the cache key
+  // below so enabling it mid-process (test-app reload) rebuilds the lattice.
+  const bool wantBlocks =
+    VolumeMinMaxBlocksWanted(this->UseGPUMinMax, this->SampleDistance);
+  const int blockSize = VolumeMinMaxBlockSize();
+  const int blkDims[3] = {
+    std::max(1, (mmDims[0] + blockSize - 1) / blockSize),
+    std::max(1, (mmDims[1] + blockSize - 1) / blockSize),
+    std::max(1, (mmDims[2] + blockSize - 1) / blockSize)
+  };
+
   // Timestamp-based caching: skip recompute when nothing changed. The grid
   // dims are part of the key so switching sample-distance tiers (which moves
   // DS) rebuilds the occupancy grid for the new cell size.
@@ -5660,7 +5732,13 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
         opFunc->GetMTime() <= this->MinMaxUploadTime.GetMTime() &&
         this->MinMaxDims[0] == mmDims[0] &&
         this->MinMaxDims[1] == mmDims[1] &&
-        this->MinMaxDims[2] == mmDims[2])
+        this->MinMaxDims[2] == mmDims[2] &&
+        (!wantBlocks ||
+         (this->MinMaxBlockTexture != nullptr &&
+          this->MinMaxBlockSize == blockSize &&
+          this->MinMaxBlockDims[0] == blkDims[0] &&
+          this->MinMaxBlockDims[1] == blkDims[1] &&
+          this->MinMaxBlockDims[2] == blkDims[2])))
     {
       return true;
     }
@@ -5765,8 +5843,149 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
       (__bridge id<MTLComputePipelineState>)this->MinMaxComputePipeline,
       (__bridge id<MTLComputePipelineState>)this->DilateComputePipeline);
 
+    // Two-level summary (VTK_METAL_TEST_MM_BLOCKS): reduce the DILATED fine
+    // lattice into whole-block all-empty marks. Runs on the same encoder right
+    // after dilation so ordering is implicit.
+    if (wantBlocks)
+    {
+      id<MTLTexture> blockTex = (__bridge id<MTLTexture>)this->MinMaxBlockTexture;
+      if (!blockTex ||
+          blockTex.width != static_cast<NSUInteger>(blkDims[0]) ||
+          blockTex.height != static_cast<NSUInteger>(blkDims[1]) ||
+          blockTex.depth != static_cast<NSUInteger>(blkDims[2]) ||
+          blockTex.pixelFormat != MTLPixelFormatR8Unorm)
+      {
+        blockTex = CreateR8MinMaxTexture(
+          device,
+          blkDims[0],
+          blkDims[1],
+          blkDims[2],
+          MTLStorageModePrivate,
+          MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+        if (!blockTex)
+        {
+          vtkErrorMacro("Failed to create minmax block-summary texture");
+          return false;
+        }
+        AssignMetalObject(this->MinMaxBlockTexture, blockTex);
+      }
+      this->MinMaxBlockDims[0] = blkDims[0];
+      this->MinMaxBlockDims[1] = blkDims[1];
+      this->MinMaxBlockDims[2] = blkDims[2];
+      this->MinMaxBlockSize = blockSize;
+
+      [mmEnc setComputePipelineState:
+        (__bridge id<MTLComputePipelineState>)this->BlockReduceComputePipeline];
+      [mmEnc setTexture:permTex atIndex:0];
+      [mmEnc setTexture:blockTex atIndex:1];
+      [mmEnc setBytes:&blockSize length:sizeof(blockSize) atIndex:0];
+      MTLSize blkGrid = MTLSizeMake(
+        static_cast<NSUInteger>(blkDims[0]),
+        static_cast<NSUInteger>(blkDims[1]),
+        static_cast<NSUInteger>(blkDims[2]));
+      NSUInteger blkTg = 8;
+      MTLSize blkThreadgroup = MTLSizeMake(
+        std::min(blkTg, static_cast<NSUInteger>(blkDims[0])),
+        std::min(blkTg, static_cast<NSUInteger>(blkDims[1])),
+        std::min(blkTg, static_cast<NSUInteger>(blkDims[2])));
+      [mmEnc dispatchThreads:blkGrid threadsPerThreadgroup:blkThreadgroup];
+      if (getenv("VTK_METAL_TEST_TR_DUMP") || getenv("VTK_METAL_TEST_TR_BENCH"))
+      {
+        fprintf(stderr, "[TRMM] block summary %dx%dx%d (block=%d cells)\n",
+          blkDims[0], blkDims[1], blkDims[2], blockSize);
+      }
+    }
+    else if (this->MinMaxBlockTexture)
+    {
+      // Feature turned off (or GPU path disabled): drop the summary so the
+      // cache key above stays honest.
+      ReleaseMetalObject(this->MinMaxBlockTexture);
+      this->MinMaxBlockSize = 0;
+    }
+
     [mmEnc endEncoding];
     [cmdBuf commit];
+
+    // TEMP-DIAG (VTK_METAL_TEST_TR_DUMP): verify block-summary consistency —
+    // every block marked empty must cover only empty fine cells. Copies both
+    // lattices to shared staging and checks on the CPU.
+    if (wantBlocks &&
+        (getenv("VTK_METAL_TEST_TR_DUMP") || getenv("VTK_METAL_TEST_TR_BENCH")))
+    {
+      [cmdBuf waitUntilCompleted];
+      id<MTLTexture> fineSrc = (__bridge id<MTLTexture>)this->MinMaxTexture;
+      id<MTLTexture> blkSrc = (__bridge id<MTLTexture>)this->MinMaxBlockTexture;
+      id<MTLTexture> fineStg = CreateR8MinMaxTexture(device,
+        static_cast<int>(fineSrc.width), static_cast<int>(fineSrc.height),
+        static_cast<int>(fineSrc.depth), MTLStorageModeShared,
+        MTLTextureUsageShaderRead);
+      id<MTLTexture> blkStg = CreateR8MinMaxTexture(device,
+        static_cast<int>(blkSrc.width), static_cast<int>(blkSrc.height),
+        static_cast<int>(blkSrc.depth), MTLStorageModeShared,
+        MTLTextureUsageShaderRead);
+      id<MTLCommandBuffer> cpBuf = [queue commandBuffer];
+      id<MTLBlitCommandEncoder> blit = [cpBuf blitCommandEncoder];
+      [blit copyFromTexture:fineSrc toTexture:fineStg];
+      [blit copyFromTexture:blkSrc toTexture:blkStg];
+      [blit endEncoding];
+      [cpBuf commit];
+      [cpBuf waitUntilCompleted];
+
+      const int fd[3] = { static_cast<int>(fineSrc.width),
+                          static_cast<int>(fineSrc.height),
+                          static_cast<int>(fineSrc.depth) };
+      const int bd[3] = { static_cast<int>(blkSrc.width),
+                          static_cast<int>(blkSrc.height),
+                          static_cast<int>(blkSrc.depth) };
+      std::vector<uint8_t> fbytes(
+        static_cast<size_t>(fd[0]) * fd[1] * fd[2]);
+      std::vector<uint8_t> bbytes(
+        static_cast<size_t>(bd[0]) * bd[1] * bd[2]);
+      [fineStg getBytes:fbytes.data()
+          bytesPerRow:static_cast<NSUInteger>(fd[0])
+          bytesPerImage:static_cast<NSUInteger>(fd[0]) * fd[1]
+          fromRegion:MTLRegionMake3D(0, 0, 0,
+            static_cast<NSUInteger>(fd[0]), static_cast<NSUInteger>(fd[1]),
+            static_cast<NSUInteger>(fd[2]))
+          mipmapLevel:0 slice:0];
+      [blkStg getBytes:bbytes.data()
+          bytesPerRow:static_cast<NSUInteger>(bd[0])
+          bytesPerImage:static_cast<NSUInteger>(bd[0]) * bd[1]
+          fromRegion:MTLRegionMake3D(0, 0, 0,
+            static_cast<NSUInteger>(bd[0]), static_cast<NSUInteger>(bd[1]),
+            static_cast<NSUInteger>(bd[2]))
+          mipmapLevel:0 slice:0];
+      long violations = 0;
+      int bsZ = VolumeMinMaxBlockSize();
+      for (int bz = 0; bz < bd[2]; ++bz)
+        for (int by = 0; by < bd[1]; ++by)
+          for (int bx = 0; bx < bd[0]; ++bx)
+          {
+            if (bbytes[(static_cast<size_t>(bz) * bd[1] + by) * bd[0] + bx] < 128)
+              continue; // solid block
+            const int x0 = bx * blockSize, y0 = by * blockSize, z0 = bz * blockSize;
+            const int x1 = std::min(x0 + blockSize, fd[0]);
+            const int y1 = std::min(y0 + blockSize, fd[1]);
+            const int z1 = std::min(z0 + blockSize, fd[2]);
+            for (int z = z0; z < z1 && violations < 32; ++z)
+              for (int y = y0; y < y1 && violations < 32; ++y)
+                for (int x = x0; x < x1 && violations < 32; ++x)
+                {
+                  if (fbytes[(static_cast<size_t>(z) * fd[1] + y) * fd[0] + x] < 128)
+                  {
+                    ++violations;
+                    fprintf(stderr,
+                      "[TRMM] VIOLATION block(%d,%d,%d) empty covers fine "
+                      "SOLID cell (%d,%d,%d)\n", bx, by, bz, x, y, z);
+                  }
+                }
+          }
+      fprintf(stderr,
+        "[TRMM] block-consistency: %ld violations (fine %dx%dx%d blocks %dx%dx%d bs=%d)\n",
+        violations, fd[0], fd[1], fd[2], bd[0], bd[1], bd[2], blockSize);
+      [fineStg release];
+      [blkStg release];
+    }
 
     this->MinMaxUploadTime.Modified();
   }
@@ -6881,7 +7100,12 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
   uint32_t depthFormat, uint32_t sampleCount, uint32_t featureMask)
 {
   VolumePipelineKey key = { type, colorFormat, depthFormat, sampleCount, featureMask,
-    static_cast<uint32_t>(this->VolumeTextureAxisDepth) };
+    // featureMaskExtra: low bits carry the volume orientation code
+    // (VolumeTextureAxisDepth 0/1/2), bit 2 the block-summary walk gate —
+    // fc_mmBlocks pipelines must not be shared with non-block ones.
+    static_cast<uint32_t>(this->VolumeTextureAxisDepth) |
+      ((VolumeMinMaxBlocksWanted(this->UseGPUMinMax, this->SampleDistance) &&
+        this->MinMaxBlockTexture != nullptr) ? 4u : 0u) };
   auto it = this->PipelineCache.find(key);
   if (it != this->PipelineCache.end())
   {
@@ -7035,6 +7259,15 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     BOOL volTransposedY = (this->VolumeTextureAxisDepth == 2) ? YES : NO;
     [constants setConstantValue:&volTransposedY type:MTLDataTypeBool
                        withName:@"fc_volTransposedY"];
+    // Two-level occupancy summary (VTK_METAL_TEST_MM_BLOCKS): compile-time
+    // gate for the block-summary walk. Requires the summary texture to exist;
+    // the shader additionally requires real (>1³) dims so dummy-bound
+    // pipelines stay inert.
+    BOOL mmBlocks = (VolumeMinMaxBlocksWanted(this->UseGPUMinMax,
+                         this->SampleDistance) &&
+                     this->MinMaxBlockTexture != nullptr) ? YES : NO;
+    [constants setConstantValue:&mmBlocks type:MTLDataTypeBool
+                       withName:@"fc_mmBlocks"];
 
     // Blend mode function constant: 0=composite, 1=MIP, 2=MinIP, 3=AverageIP,
     // 4=additive (vtkVolumeMapper::BlendMode). Encoded in the feature mask so
@@ -7249,6 +7482,7 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
   SetFragmentTextureOrFallback(encoder, 4, this->MaskTexture, this->DummyMaskTexture);
   SetFragmentTextureOrFallback(encoder, 5, this->LabelMapTransferTexture, this->ColorOpacityTexture);
   SetFragmentTextureOrFallback(encoder, 6, this->MinMaxTexture, this->DummyMinMaxTexture);
+  SetFragmentTextureOrFallback(encoder, 16, this->MinMaxBlockTexture, this->DummyMinMaxTexture);
   SetFragmentTextureOrFallback(encoder, 7, this->GradientNormalTexture, this->DummyVolumeTexture);
   SetFragmentTextureOrFallback(encoder, 9, this->Transfer2DTexture, this->ColorOpacityTexture);
   SetFragmentTextureOrFallback(encoder, 10, this->Transfer2DYAxisTexture, this->DummyVolumeTexture);
@@ -7291,6 +7525,9 @@ void vtkMetalGPUVolumeRayCastMapper::BindFullscreenTextures(
   SetFragmentTextureOrFallback(encoder, 4, this->MaskTexture, this->DummyMaskTexture);
   SetFragmentTextureOrFallback(encoder, 5, this->LabelMapTransferTexture, this->ColorOpacityTexture);
   SetFragmentTextureOrFallback(encoder, 6, minMaxTexVoid, this->DummyMinMaxTexture);
+  // Block summary only exists for the global (non-partitioned) lattice; the
+  // per-partition path binds the dummy (walk falls back to per-cell fetches).
+  SetFragmentTextureOrFallback(encoder, 16, this->MinMaxBlockTexture, this->DummyMinMaxTexture);
   SetFragmentTextureOrFallback(encoder, 7, normalTexVoid, this->DummyVolumeTexture);
   SetFragmentTextureOrFallback(encoder, 9, this->Transfer2DTexture, this->ColorOpacityTexture);
   SetFragmentTextureOrFallback(encoder, 10, this->Transfer2DYAxisTexture, this->DummyVolumeTexture);
@@ -7847,6 +8084,11 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     if (getenv("VTK_METAL_TEST_PROBE_RAW"))
       uniforms._padCropFlags[3] = -uniforms._padCropFlags[3];
   }
+
+  // TEMP-DIAG minmax walk probe (_padCropFlags[4], MM_PROBE): with METAL_ITER,
+  // the debug exit returns the baseline march's visits/crossings/skipped-steps
+  // instead of marchIter (R*64/G*16/B*64 decode). Investigation-only.
+  if (getenv("MM_PROBE")) uniforms._padCropFlags[4] = 1.0f;
 
   vtkNew<vtkMatrix4x4> modelMatrix;
   vol->GetModelToWorldMatrix(modelMatrix);

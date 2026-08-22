@@ -1984,6 +1984,119 @@ on the fixed build: oblique SD4 tr+mm j1 ≈ 24–26; catastrophe cells axis-x
 when VOLTRANSPOSE=0. [TRMM]/[TRMMCACHE] diagnostics gate on TR_DUMP/TR_BENCH.
 
 
+## 34. RESOLVED (2026-08-23): fine-SD minmax penalty fixed — two-level occupancy summary (block leaps)
+
+§33's plan executed. The penalty is gone: minmax+blocks now BEATS raw at
+SD0.5 in 4/6 view classes and ties the other two, while SD>=1.5 stays
+byte-identical HEAD.
+
+### 34.1 Probe first — §33.1's mechanism model was half wrong
+
+MM_PROBE probe (_padCropFlags[4] + METAL_ITER; R*32=visits, G*8=lattice
+crossings, B*32=skipped steps; encode = count/(scale*255) — the first
+attempt divided by the scale alone and saturated at 64 counts, costing two
+matrix reruns): at SD0.5 oblique the walk SKIPS 569 of 665 raw samples
+(85% yield — NOT "poor skip yield" as §33.1 assumed) yet costs +24 ms,
+because crossings/ray ~= 395 ~= 0.92/iteration: DS=2 cells turn empty-space
+traversal into a per-cell grind of R8 fetches + skip math + full main-loop
+iterations (CTP tests, resync) per ~1.7-step hop. Overhead, not yield.
+
+### 34.2 DS retune (cheap lever, tested first)
+
+VTK_METAL_TEST_MM_DS forced the macrocell downsample at fine SD:
+DS=4 cut the penalty to +3..-45 by view; DS=8 flipped most cells to
+winning (axz -74). But no single static DS dominated (axx/axy preferred 4,
+obl/az135/axz preferred 8) — leap granularity vs skip yield tradeoff.
+Superseded by 34.3, which decouples them.
+
+### 34.3 Two-level occupancy summary (the fix)
+
+`VTK_METAL_TEST_MM_BLOCKS=1`: a coarse R8 texture marks whole 8³-cell
+blocks of the DILATED fine lattice whose cells are ALL empty
+(`volume_reduce_minmax_blocks` kernel, dispatched after dilation on the same
+encoder). The baseline walk then derives its block from the CELL index
+(`newCell/8`, clamped), fetches the block texel at its CENTER once per
+block change, short-circuits the fine fetch while block-empty, and LEAPS to
+the block's true boundary plane instead of hopping cell edges. Output is
+unchanged by construction (block-empty => every covered cell empty => the
+composited sample set is identical); landing points stay on the step lattice.
+
+Three bugs found on the way, each caught by bisects the protocol made cheap:
+
+1. **Block index from mmPos product** (`floor(mmPos*blkDim)`): agrees with
+   `cellIndex/8` only when fineDim/blockSize is an exact integer. On z
+   (897/8=112.125) the mappings disagree almost everywhere -> blocks marked
+   empty covered solid cells (12,129 px of runtime disagreements measured
+   with a counter probe; CPU-side texture consistency check read 0
+   violations because the TEXTURES were consistent — the WALK's mapping was
+   wrong). Fix: integer-divide the cell index. Lesson: when a coarse grid
+   tiles a fine grid, derive coarse indices FROM fine indices, never from
+   independent normalized-coordinate products.
+2. **Leap target in block-fraction space**: `fract(mmPos*blockDimF)` assumes
+   uniform block width 1/blockDim — same non-integer drift (~3.5 voxels
+   mid-range on z). Fix: target `min((b+1)*8,fineDim)/fineDim` directly.
+3. Residual ±1-step landing differences vs the per-cell chain are inherent
+   fp-order effects (accumulated ceils + 1e-4 fudges cannot be replicated
+   by a single hop). NOT fixable without simulating the chain; accepted as
+   bounded quantization (34.5).
+
+fc_mmBlocks [[function_constant(35)]] specializes pipelines (featureMaskExtra
+bit 2): non-block pipelines keep byte-identical HEAD codegen; runtime-uniform
+gating cost ~+30..+90 ms in an intermediate build (hot-path branch defeated
+codegen) — compile-time gating is mandatory for march-loop features.
+
+### 34.4 Results (@2048², 30-frame bench, eval-env ABBA-rotated arms)
+
+minmax+blocks vs HEAD minmax (same binary, fc-specialized):
+
+| view | SD0.5 j0/j1 | SD4 j0/j1 |
+|---|---|---|
+| obl | −32/−34 | +1.2/+1.4 |
+| AZ45 | −20/−21 | −0.7/−0.3 |
+| AZ135 | −34/−34 | +1.4/+0.8 |
+| axx | −43/−44 | −5.4/−3.9 |
+| axy | −50/−51 | −4.5/−3.7 |
+| axz | **−145/−148** | −2.0/+0.2 |
+
+vs RAW (mm off): az45 −11, axx −46..−48, axy −48..−50, axz −29..−32 WIN;
+obl +0.7..+2.5, az135 +4.5/+5.2 tie-class. @1024 SD0.5 blk beats raw in all
+six views. Production config spot checks: SHADE+mm1 @1024 44.7→36.8 (−18%);
+mv9 unaffected (its preamble walk has no block path; separate PSOs).
+
+### 34.5 Fine-SD gate + image deltas
+
+Blocks are gated to sampleDistance < 1.5 (the DS=2 tier;
+VolumeMinMaxBlocksWanted unifies build/fc/PSO-key gates): at SD4 the
+bookkeeping cost more than leaps saved (+~1 ms obliques) and the coarser
+lattice widened quantization, so SD>=1.5 is byte-identical HEAD again
+(verified: max Δ=0 at SD4 az135/axz, timings tied).
+
+Residual blocks-vs-HEAD image delta at fine SD (skip-landing quantization,
+same perceptual class as §26.5's accepted macrocell rounding): 2.5–11% of
+px differ by exactly 1 LSB; >1LSB px 4–155 of 1M @1024 / up to 9.8K of 4.2M
+@2048 (worst axy SD4-class cells before the gate); max Δ <= 19 observed at
+fine SD; mean|d| <= 0.041. mm-off paths byte-untouched (walk dead-code-
+eliminated; raw-arm anchors matched §26.5 within battery drift).
+
+### 34.6 HANDOFF status
+
+§33 items done: probe decomposition (34.1), DS retune data (34.2),
+mechanism fix (34.3). Remaining:
+
+1. mv9 preamble walk could adopt block leaps too (mv9 wins many raw cells;
+   its inline walk still fetches per step).
+2. ε-contribution emptiness tier (§33.2 item 2) remains open — orthogonal
+   to blocks; would multiply skippable volume (fat/air near-zero-alpha).
+3. TEMP inventory: MM_PROBE counters + [TRMM] block-consistency readback are
+   env-gated diagnostics (keep-or-revert decision before any production
+   default flip of MM_BLOCKS/VOLTRANSPOSE).
+4. Default-enable decision for MM_BLOCKS needs multi-dataset coverage
+   (single IMRToraceAddome so far, like §26.6 item 1's original caveat).
+
+Logs: /tmp/mmprobe (probe matrix), /tmp/mmds (DS sweep), /tmp/mmblk +
+/tmp/final (timing matrices), /tmp/blkpar+/tmp/blkfix+/tmp/blkfix2+/tmp/fc3
+(parity ladder), /tmp/vtkBlkLeap (reference binary).
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).

@@ -304,6 +304,14 @@ private:
   void* MinMaxScratchTexture = nullptr;  // id<MTLTexture> — reusable scratch occupancy (R8Unorm 3D)
   int MinMaxDims[3] = {};               // dimensions of the min-max texture
   vtkTimeStamp MinMaxUploadTime;
+  // Two-level occupancy summary (VTK_METAL_TEST_MM_BLOCKS): coarse R8 texture
+  // marking whole-block all-empty regions of the dilated MinMaxTexture, so the
+  // fragment walk leaps multiple macrocells per lattice fetch. Byte-identical
+  // output (block emptiness derives from the exact per-cell semantics).
+  void* MinMaxBlockTexture = nullptr;    // id<MTLTexture> (3D R8Unorm)
+  int MinMaxBlockDims[3] = {};          // block-summary grid dims
+  int MinMaxBlockSize = 0;              // block edge in fine-lattice cells (cache key)
+  void* BlockReduceComputePipeline = nullptr; // id<MTLComputePipelineState> — volume_reduce_minmax_blocks
   void* DepthStencilState = nullptr;     // id<MTLDepthStencilState>
   void* DepthTextureOcclusion = nullptr; // id<MTLTexture> — scene depth for early ray termination
   void* DummyDepthTexture = nullptr;     // id<MTLTexture> — 1x1 R32Float(1.0) fallback when no depth available

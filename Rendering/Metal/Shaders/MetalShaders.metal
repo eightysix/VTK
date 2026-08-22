@@ -2761,6 +2761,12 @@ constant bool fc_volTransposed [[function_constant(33)]];
 // hot fetch path keeps its hard-coded swizzle.
 constant bool fc_volTransposedY [[function_constant(34)]];
 
+// Two-level occupancy summary (VTK_METAL_TEST_MM_BLOCKS): compile-time gate
+// for the block-summary fast path in the minmax lattice walk. Specialized per
+// pipeline so non-block pipelines keep byte-identical codegen to HEAD and
+// block pipelines fold every gate away.
+constant bool fc_mmBlocks [[function_constant(35)]];
+
 // Map an original-orientation sample position into texture space for the live
 // transposed representation (no-op when clear).
 inline float3 volumeFetchSwizzle(float3 pos) {
@@ -4159,6 +4165,7 @@ inline half4 marchVolumeUnified(
     texture3d<float> maskTexture,
     texture2d<float> labelMapTransferTexture,
     texture3d<float> minMaxTexture,
+    texture3d<float> minMaxBlockTexture,
     texture3d<float> normalTexture,
     texture3d<float> blankingTexture,
     constant packed_float3* rectCoords,
@@ -4492,6 +4499,15 @@ inline half4 marchVolumeUnified(
   // Debug iter counter (enabled by _padCropFlags[0] > 0.5 uniform flag).
   int marchIter = 0;
 
+  // TEMP-DIAG minmax walk probe (MM_PROBE env -> _padCropFlags[4]): counts
+  // loop iterations walked, lattice cell crossings (= R8 fetches) and sample
+  // steps consumed by empty-cell jumps in the baseline march. With METAL_ITER
+  // set, the debug exit returns them instead of marchIter
+  // (R = visits/64, G = crossings/16, B = skippedSteps/64).
+  int mmVisits = 0;
+  int mmCross  = 0;
+  int mmSkipped = 0;
+
   // Per-component accumulators for the independent multi-component path.
   // Only the active blend mode's arrays are touched.
   half mipMaxScalarComp[4] = {0.0h, 0.0h, 0.0h, 0.0h};
@@ -4530,6 +4546,8 @@ inline half4 marchVolumeUnified(
   float prefetchMask = doMask ? maskTexture.sample(sNearest, evalPoint, level(0)).r : 0.0;
   int3  curCell     = int3(-1);
   bool  curCellEmpty = false;
+  int3  curBlock    = int3(-1);
+  bool  curBlockEmpty = false;
   float3 mmDimF     = b.minMaxInfo.yzw;
   const bool useMinMax = fc_minmax &&
     !useIndependentPath &&
@@ -4537,6 +4555,18 @@ inline half4 marchVolumeUnified(
     b.minMaxInfo.y > 0.5 &&
     b.minMaxInfo.z > 0.5 &&
     b.minMaxInfo.w > 0.5;
+  // Two-level occupancy summary (VTK_METAL_TEST_MM_BLOCKS -> fc_mmBlocks):
+  // a coarser R8 texture marks whole-block regions of the DILATED fine lattice
+  // whose cells are ALL empty. When on, the walks leap to block edges with one
+  // summary fetch instead of grinding per cell. Block emptiness is derived
+  // from the exact per-cell semantics, so the set of composited samples (and
+  // therefore the rendered bytes) is unchanged — only jump granularity differs.
+  // The bound texture is a 1x1x1 dummy when the feature is off; mmBlkDimF.x > 1
+  // gates it off in that case.
+  float3 mmBlkDimF = float3(minMaxBlockTexture.get_width(),
+                            minMaxBlockTexture.get_height(),
+                            minMaxBlockTexture.get_depth());
+  const bool useMinMaxBlocks = useMinMax && fc_mmBlocks && mmBlkDimF.x > 1.0f;
   // True once any sample inside [0,1]^3 texture space has been reached. The
   // texture cube is axis-aligned and the ray is a straight line in texture
   // space, so a ray's in-bounds samples form a single contiguous interval:
@@ -4650,9 +4680,9 @@ inline half4 marchVolumeUnified(
             distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
 
             float3 tToEdge;
-            tToEdge.x = abs(rayDirTexLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirTexLocal.x * mmDimF.x) : 1e30;
-            tToEdge.y = abs(rayDirTexLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirTexLocal.y * mmDimF.y) : 1e30;
-            tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
+            tToEdge.x = abs(p.rayDir.x) > 1e-5 ? distToEdge.x / (abs(p.rayDir.x) * mmDimF.x) : 1e30;
+            tToEdge.y = abs(p.rayDir.y) > 1e-5 ? distToEdge.y / (abs(p.rayDir.y) * mmDimF.y) : 1e30;
+            tToEdge.z = abs(p.rayDir.z) > 1e-5 ? distToEdge.z / (abs(p.rayDir.z) * mmDimF.z) : 1e30;
 
             float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
             exactSkip += 1e-4;
@@ -5186,9 +5216,9 @@ inline half4 marchVolumeUnified(
             distToEdge.z = p.rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
             distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
             float3 tToEdge;
-            tToEdge.x = abs(rayDirTexLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirTexLocal.x * mmDimF.x) : 1e30;
-            tToEdge.y = abs(rayDirTexLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirTexLocal.y * mmDimF.y) : 1e30;
-            tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
+            tToEdge.x = abs(p.rayDir.x) > 1e-5 ? distToEdge.x / (abs(p.rayDir.x) * mmDimF.x) : 1e30;
+            tToEdge.y = abs(p.rayDir.y) > 1e-5 ? distToEdge.y / (abs(p.rayDir.y) * mmDimF.y) : 1e30;
+            tToEdge.z = abs(p.rayDir.z) > 1e-5 ? distToEdge.z / (abs(p.rayDir.z) * mmDimF.z) : 1e30;
             float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z) + 1e-4;
             int cellSteps = (int)ceil(exactSkip / p.stepSize);
             if (cellSteps < 1) cellSteps = 1;
@@ -5635,9 +5665,9 @@ inline half4 marchVolumeUnified(
             distToEdge.z = p.rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z; \
             distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5)); \
             float3 tToEdge; \
-            tToEdge.x = abs(rayDirTexLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirTexLocal.x * mmDimF.x) : 1e30; \
-            tToEdge.y = abs(rayDirTexLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirTexLocal.y * mmDimF.y) : 1e30; \
-            tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30; \
+            tToEdge.x = abs(p.rayDir.x) > 1e-5 ? distToEdge.x / (abs(p.rayDir.x) * mmDimF.x) : 1e30; \
+            tToEdge.y = abs(p.rayDir.y) > 1e-5 ? distToEdge.y / (abs(p.rayDir.y) * mmDimF.y) : 1e30; \
+            tToEdge.z = abs(p.rayDir.z) > 1e-5 ? distToEdge.z / (abs(p.rayDir.z) * mmDimF.z) : 1e30; \
             float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z); \
             exactSkip += 1e-4; \
             float skipDist = ceil(exactSkip / p.stepSize) * p.stepSize; \
@@ -5767,6 +5797,7 @@ inline half4 marchVolumeUnified(
   else
   {
   for (int i = 0; i < maxSteps; i++) {
+    mmVisits++;
     // A slab pass whose inherited near-side alpha already exceeds the
     // saturation threshold must contribute nothing (the single-pass march
     // would have latched before its first sample). Latch for the non-divergent
@@ -5850,11 +5881,42 @@ inline half4 marchVolumeUnified(
       int3 newCell = min(int3(mmPos * mmDimF), int3(mmDimF) - 1);
       if (any(newCell != curCell)) {
         curCell      = newCell;
-        curCellEmpty = minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5;
+        if (useMinMaxBlocks) {
+          // Two-level lookup: one coarse summary fetch first; the fine
+          // per-cell fetch runs only inside non-empty blocks. Block emptiness
+          // is derived from the DILATED fine lattice, so block-empty implies
+          // cell-empty and the composited sample set is unchanged.
+          // IMPORTANT: derive the block index from the CELL index (integer
+          // divide, matching the reduce kernel's tiling) — never from an
+          // independent mmPos*blockDims product: when fineDim/8 is not an
+          // exact integer (e.g. 897/8) the two mappings disagree almost
+          // everywhere along that axis.
+          int3 newBlock = min(newCell / 8, int3(mmBlkDimF) - 1);
+          if (any(newBlock != curBlock)) {
+            curBlock      = newBlock;
+            // Sample the block texel at its CENTER: fetching at raw mmPos can
+            // let the sampler's normalized->texel rounding pick the neighbor
+            // block right at boundaries, wrongly clearing cells whose own
+            // block is solid.
+            curBlockEmpty = minMaxBlockTexture.sample(sNearest,
+                (float3(curBlock) + 0.5) / mmBlkDimF, level(0)).r > 0.5;
+          }
+          // Block-empty ⇒ every covered fine cell is empty (reduce kernel
+          // tiles by CELL indices; see newBlock above): skip the fine fetch.
+          curCellEmpty = curBlockEmpty ||
+            (minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5);
+        } else {
+          curCellEmpty = minMaxTexture.sample(sNearest, mmPos, level(0)).r > 0.5;
+        }
+        mmCross++;
       }
 
       if (curCellEmpty) {
-        float3 cellCoord = mmPos * mmDimF;
+        // Leap to the edge of the current empty CELL — or of the whole empty
+        // BLOCK when the summary says every cell in it is empty. Both landings
+        // stay on the step lattice and stop at the same first-solid sample.
+        float3 skipDims = mmDimF;
+        float3 cellCoord = mmPos * skipDims;
         float3 fractCoord = fract(cellCoord);
 
         float3 distToEdge;
@@ -5864,14 +5926,34 @@ inline half4 marchVolumeUnified(
         distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
 
         float3 tToEdge;
-        tToEdge.x = abs(rayDirTexLocal.x) > 1e-5 ? distToEdge.x / abs(rayDirTexLocal.x * mmDimF.x) : 1e30;
-        tToEdge.y = abs(rayDirTexLocal.y) > 1e-5 ? distToEdge.y / abs(rayDirTexLocal.y * mmDimF.y) : 1e30;
-        tToEdge.z = abs(rayDirTexLocal.z) > 1e-5 ? distToEdge.z / abs(rayDirTexLocal.z * mmDimF.z) : 1e30;
+        tToEdge.x = abs(p.rayDir.x) > 1e-5 ? distToEdge.x / (abs(p.rayDir.x) * skipDims.x) : 1e30;
+        tToEdge.y = abs(p.rayDir.y) > 1e-5 ? distToEdge.y / (abs(p.rayDir.y) * skipDims.y) : 1e30;
+        tToEdge.z = abs(p.rayDir.z) > 1e-5 ? distToEdge.z / (abs(p.rayDir.z) * skipDims.z) : 1e30;
+
+        if (useMinMaxBlocks && curBlockEmpty) {
+          // Block leap: target the block boundary at its TRUE normalized
+          // position in fine-cell units — blocks tile cells [8k, 8k+8), so
+          // their edges sit at 8k/fineDim, NOT at k/blockDim. The fraction
+          // space drifts whenever fineDim/blockSize is not an integer
+          // (897 cells -> 113 blocks), skipping across thin solid cells.
+          int3 blkLo = curBlock * 8;
+          float3 loN = float3(blkLo) / mmDimF;
+          float3 hiN = float3(min(blkLo + 8, int3(mmDimF))) / mmDimF;
+          float3 rem;
+          rem.x = p.rayDir.x > 0.0 ? (hiN.x - mmPos.x) : (mmPos.x - loN.x);
+          rem.y = p.rayDir.y > 0.0 ? (hiN.y - mmPos.y) : (mmPos.y - loN.y);
+          rem.z = p.rayDir.z > 0.0 ? (hiN.z - mmPos.z) : (mmPos.z - loN.z);
+          rem = max(rem, float3(0.0));
+          tToEdge.x = abs(p.rayDir.x) > 1e-5 ? rem.x / abs(p.rayDir.x) : 1e30;
+          tToEdge.y = abs(p.rayDir.y) > 1e-5 ? rem.y / abs(p.rayDir.y) : 1e30;
+          tToEdge.z = abs(p.rayDir.z) > 1e-5 ? rem.z / abs(p.rayDir.z) : 1e30;
+        }
 
         float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z);
         exactSkip += 1e-4;
         float skipDist = ceil(exactSkip / p.stepSize) * p.stepSize;
         skipDist = max(p.stepSize, skipDist);
+        mmSkipped += max(1, (int)(skipDist / p.stepSize + 0.5f));
 
         currentPoint += p.rayDir * skipDist;
         currentT += skipDist;
@@ -6522,6 +6604,16 @@ inline half4 marchVolumeUnified(
   half wlBias = half(volumeUniforms.finalColorBias);
   finalColor.rgb = finalColor.rgb * wlScale + wlBias * finalColor.a;
   if (volumeUniforms._padCropFlags[0] > 0.5f) {
+    // TEMP-DIAG minmax walk probe (MM_PROBE -> _padCropFlags[4]): return the
+    // baseline-march counters instead of marchIter. Encodes store byte =
+    // count/scale (value = count/(scale*255)): visits = R*32, crossings =
+    // G*8, skippedSteps = B*32. Caps: 8160 / 2040 / 8160.
+    if (volumeUniforms._padCropFlags[4] > 0.5f) {
+      return half4(
+          half(min(float(mmVisits) * (1.0f / (32.0f * 255.0f)), 1.0f)),
+          half(min(float(mmCross) * (1.0f / (8.0f * 255.0f)), 1.0f)),
+          half(min(float(mmSkipped) * (1.0f / (32.0f * 255.0f)), 1.0f)), 1.0h);
+    }
     // Encode iter count directly: red_channel/255 = marchIter/256, so
     // uint8 red ≈ marchIter. Max representable = 255 iterations.
     // TEMP RG8 debug: green = fract(zf) i.e. fz weight within the slice
@@ -6568,6 +6660,7 @@ inline half4 marchVolume(
     texture3d<float> maskTexture,
     texture2d<float> labelMapTransferTexture,
     texture3d<float> minMaxTexture,
+    texture3d<float> minMaxBlockTexture,
     texture3d<float> normalTexture,
     texture3d<float> blankingTexture,
     constant packed_float3* rectCoords,
@@ -6614,7 +6707,7 @@ inline half4 marchVolume(
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       gradientOpacityTexture, maskTexture, labelMapTransferTexture,
-      minMaxTexture, normalTexture, blankingTexture, rectCoords, lightUniforms,
+      minMaxTexture, minMaxBlockTexture, normalTexture, blankingTexture, rectCoords, lightUniforms,
       nullptr, nullptr);
 }
 
@@ -6641,6 +6734,7 @@ inline void marchSegment(
     texture3d<float> maskTexture,
     texture2d<float> labelMapTransferTexture,
     texture3d<float> minMaxTexture,
+    texture3d<float> minMaxBlockTexture,
     texture3d<float> normalTexture,
     texture3d<float> blankingTexture,
     constant packed_float3* rectCoords,
@@ -6655,7 +6749,7 @@ inline void marchSegment(
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       gradientOpacityTexture, maskTexture, labelMapTransferTexture,
-      minMaxTexture, normalTexture, blankingTexture, rectCoords, lightUniforms,
+      minMaxTexture, minMaxBlockTexture, normalTexture, blankingTexture, rectCoords, lightUniforms,
       nullptr, nullptr);
   accumulatedColor = result.xyz;
   accumulatedOpacity = result.w;
@@ -6672,6 +6766,7 @@ fragment VolumeFragmentOut fragment_volume_main(
     texture3d<float> maskTexture [[texture(4)]],
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
+    texture3d<float> minMaxBlockTexture [[texture(16)]],
     texture3d<float> normalTexture [[texture(7)]],
     texture2d<float> transferFunction2DTexture [[texture(9)]],
     texture3d<float> transfer2DYAxisTexture [[texture(10)]],
@@ -6758,7 +6853,7 @@ fragment VolumeFragmentOut fragment_volume_main(
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
-      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
+      maskTexture, labelMapTransferTexture, minMaxTexture, minMaxBlockTexture, normalTexture,
       blankingTexture, rectCoords, &volumeLights);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
@@ -6784,6 +6879,7 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
     texture3d<float> maskTexture [[texture(4)]],
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
+    texture3d<float> minMaxBlockTexture [[texture(16)]],
     texture3d<float> normalTexture [[texture(7)]],
     texture2d<float> transferFunction2DTexture [[texture(9)]],
     texture3d<float> transfer2DYAxisTexture [[texture(10)]],
@@ -6835,7 +6931,7 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
-      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
+      maskTexture, labelMapTransferTexture, minMaxTexture, minMaxBlockTexture, normalTexture,
       blankingTexture, rectCoords, &volumeLights);
 
   // PickingActorPassExit parity: only fragments that accumulated a certain
@@ -6862,6 +6958,7 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
     texture3d<float> maskTexture [[texture(4)]],
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
+    texture3d<float> minMaxBlockTexture [[texture(16)]],
     texture3d<float> normalTexture [[texture(7)]],
     texture2d<float> transferFunction2DTexture [[texture(9)]],
     texture3d<float> transfer2DYAxisTexture [[texture(10)]],
@@ -6921,7 +7018,7 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
-      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
+      maskTexture, labelMapTransferTexture, minMaxTexture, minMaxBlockTexture, normalTexture,
       blankingTexture, rectCoords, &volumeLights);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
@@ -6941,6 +7038,7 @@ fragment VolumeSelectionOut fragment_volume_fullscreen_selection_main(
     texture3d<float> maskTexture [[texture(4)]],
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
+    texture3d<float> minMaxBlockTexture [[texture(16)]],
     texture3d<float> normalTexture [[texture(7)]],
     texture2d<float> transferFunction2DTexture [[texture(9)]],
     texture3d<float> transfer2DYAxisTexture [[texture(10)]],
@@ -6978,7 +7076,7 @@ fragment VolumeSelectionOut fragment_volume_fullscreen_selection_main(
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
-      maskTexture, labelMapTransferTexture, minMaxTexture, normalTexture,
+      maskTexture, labelMapTransferTexture, minMaxTexture, minMaxBlockTexture, normalTexture,
       blankingTexture, rectCoords, &volumeLights);
 
   output.ids = volumeSelectionIds(s.entryPoint, float(_marchResult.w), volumeUniforms);
@@ -7003,6 +7101,7 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
     texture3d<float> maskTexture [[texture(4)]],
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
+    texture3d<float> minMaxBlockTexture [[texture(16)]],
     texture3d<float> normalTexture [[texture(7)]],
     texture2d<float> transferFunction2DTexture [[texture(9)]],
     texture3d<float> transfer2DYAxisTexture [[texture(10)]],
@@ -7065,7 +7164,7 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       gradientOpacityTexture, maskTexture, labelMapTransferTexture,
-      minMaxTexture, normalTexture, blankingTexture, rectCoords, &volumeLights,
+      minMaxTexture, minMaxBlockTexture, normalTexture, blankingTexture, rectCoords, &volumeLights,
       &firstOpaquePos, &searching);
 
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
@@ -7221,6 +7320,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
     texture3d<float> maskTexture [[texture(4)]],
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
+    texture3d<float> minMaxBlockTexture [[texture(16)]],
     texture3d<float> normalTexture [[texture(7)]],
     texture3d<float> brickOccupancy [[texture(8)]],
     texture2d<float> transferFunction2DTexture [[texture(9)]],
@@ -7377,7 +7477,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
                     transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
                     transferFunction2DTexture, transfer2DYAxisTexture,
                     gradientOpacityTexture, maskTexture, labelMapTransferTexture,
-                    minMaxTexture, normalTexture, blankingTexture, rectCoords,
+                    minMaxTexture, minMaxBlockTexture, normalTexture, blankingTexture, rectCoords,
                     &volumeLights);
             }
         }
@@ -7477,6 +7577,37 @@ kernel void volume_dilate_minmax(
   }
 
   dst.write(solid ? 0.0 : 1.0, gid);
+}
+
+// Two-level occupancy summary (VTK_METAL_TEST_MM_BLOCKS): one thread per
+// block texel of the DILATED fine lattice; writes 1.0 iff every covered fine
+// texel is 1.0 (all cells empty). blockSize arrives as a single uint. The
+// fragment walk uses this to leap whole empty blocks per lattice fetch.
+kernel void volume_reduce_minmax_blocks(
+    texture3d<float, access::read> fine [[texture(0)]],
+    texture3d<float, access::write> blocks [[texture(1)]],
+    constant uint& blockSize [[buffer(0)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  uint3 bdims = uint3(blocks.get_width(), blocks.get_height(), blocks.get_depth());
+  if (any(gid >= bdims)) return;
+
+  uint3 fdims = uint3(fine.get_width(), fine.get_height(), fine.get_depth());
+  uint3 start = gid * blockSize;
+  uint3 end = min(start + blockSize, fdims);
+
+  bool allEmpty = true;
+  for (uint z = start.z; z < end.z && allEmpty; z++) {
+    for (uint y = start.y; y < end.y && allEmpty; y++) {
+      for (uint x = start.x; x < end.x && allEmpty; x++) {
+        if (fine.read(uint3(x, y, z)).r < 0.5) {
+          allEmpty = false;
+        }
+      }
+    }
+  }
+
+  blocks.write(allEmpty ? 1.0 : 0.0, gid);
 }
 
 // ---------------------------------------------------------------------------
