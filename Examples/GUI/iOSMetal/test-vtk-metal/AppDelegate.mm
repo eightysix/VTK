@@ -23,6 +23,11 @@
 @property (nonatomic) BOOL volumeTransposeEnabled;
 @property (nonatomic) BOOL minMaxAccelerationEnabled;
 @property (nonatomic) BOOL blueNoiseJitterEnabled;
+// March-variant toggle (mv9 = 48-wide inline scheduled march vs mv0 baseline).
+// marchVariantEnvAtLaunch preserves a custom VTK_METAL_TEST_MARCH_VARIANT set
+// at launch so toggling off restores it, not just the 0 default.
+@property (nonatomic) BOOL marchVariant9Enabled;
+@property (nonatomic, copy) NSString* marchVariantEnvAtLaunch;
 @end
 
 static NSArray<NSDictionary*>* ViewCommandDefs(void)
@@ -55,6 +60,13 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
     self.volumeTransposeEnabled = std::atoi(v) != 0;
   self.minMaxAccelerationEnabled = YES;
   self.blueNoiseJitterEnabled = NO;
+
+  self.marchVariantEnvAtLaunch = @"0";
+  if (const char* v = std::getenv("VTK_METAL_TEST_MARCH_VARIANT"))
+  {
+    self.marchVariantEnvAtLaunch = [NSString stringWithUTF8String:v];
+    self.marchVariant9Enabled = std::atoi(v) == 9;
+  }
 
   NSRect contentRect = NSMakeRect(0, 0, 1100, 800);
   NSWindowStyleMask styleMask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
@@ -217,6 +229,12 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
      modifiers:NSEventModifierFlagCommand | NSEventModifierFlagOption
          target:self
          toMenu:renderingMenu];
+  [self addItem:@"March Variant 9 (48-wide Scheduled)"
+         action:@selector(toggleMarchVariant9:)
+           key:@"v"
+      modifiers:NSEventModifierFlagCommand | NSEventModifierFlagOption
+          target:self
+          toMenu:renderingMenu];
   [self addSubmenu:renderingMenu titled:@"Rendering" toMenu:vtkMenu];
 
   // File submenu
@@ -370,6 +388,16 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
     return YES;
   }
 
+  if (action == @selector(toggleMarchVariant9:))
+  {
+    BOOL isVolumeVC = [[self findMetalViewController] isKindOfClass:[BaseVolumeViewController class]];
+    menuItem.enabled = isVolumeVC;
+    if (!isVolumeVC)
+      return NO;
+    menuItem.state = self.marchVariant9Enabled ? NSControlStateValueOn : NSControlStateValueOff;
+    return YES;
+  }
+
   return YES;
 }
 
@@ -483,6 +511,21 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
     mapper->SetUseIGNJitter(!self.blueNoiseJitterEnabled);
     [self renderCurrentWindow];
   }
+}
+
+// The march variant rides the feature mask (bits 24-27), so flipping the env
+// rebuilds the specialized pipeline on the next frame — no resource re-upload
+// needed. The mapper reads VTK_METAL_TEST_MARCH_VARIANT live (per feature-mask
+// build), matching the transpose toggle's setenv pattern; toggling off
+// restores whatever the process was launched with.
+- (void)toggleMarchVariant9:(id)sender
+{
+  self.marchVariant9Enabled = !self.marchVariant9Enabled;
+  const char* value = self.marchVariant9Enabled
+    ? "9"
+    : self.marchVariantEnvAtLaunch.UTF8String;
+  setenv("VTK_METAL_TEST_MARCH_VARIANT", value, 1);
+  [self renderCurrentWindow];
 }
 
 #else

@@ -324,28 +324,27 @@ static uint32_t BlendModeToFeatureFlag(int blendMode)
 // 4=uniform frame-max loop with all exits predicated, 6=8x unrolled march,
 // 7=4x unrolled march, 8=harness-style scheduled march, 9=48-wide inline
 // scheduled march with minmax). Encoded into the feature mask so each
-// experiment gets its own specialized pipeline. Reads the env var once per
-// process. Only the low 4 bits are used (VolumeFeature_MarchVariantMask).
+// experiment gets its own specialized pipeline.
 //
-// Default is 9: the 48-wide inline-address scheduled march (probe w48), which
-// beats the 8-wide harness-style scheduled march (variant 8) on the DICOM app
-// benchmark: mv=9 50-53 ms vs mv=8 60-66 ms (GL 48-51 ms) with byte-identical
-// output (see PERFORMANCE_INVESTIGATION.md sections 17-18). Variant 9 also
-// carries the minmax lattice walk (fc_minmax), replacing the batch-8 consume
-// minmax path that was unstable and up to 12x slower than GL (150-580ms vs
-// 47ms on the DICOM study). With minmax enabled the same 48-wide batches are
-// issued only over non-empty macrocells: mv=9 + minmax measures ~25ms vs GL
-// 47-49ms (0.51x), thresholded error 0.000. Variants 6/7/8 fall back to the
-// batch-8 consume when a non-lean feature is active. Setting the env var
-// overrides the default for A/B testing.
+// Read LIVE (not cached) so GUI toggles can flip it between pipelines: every
+// consumer runs during per-frame feature-mask/uniform setup, so an env change
+// rebuilds the specialized PSO on the next render — same mechanism as any
+// function-constant flip. Default is 9: the 48-wide inline-address scheduled
+// march (probe w48), which beats the 8-wide harness-style scheduled march
+// (variant 8) on the DICOM app benchmark: mv=9 50-53 ms vs mv=8 60-66 ms (GL
+// 48-51 ms) with byte-identical output (see PERFORMANCE_INVESTIGATION.md
+// sections 17-18). Variant 9 also carries the minmax lattice walk (fc_minmax),
+// replacing the batch-8 consume minmax path that was unstable and up to 12x
+// slower than GL (150-580ms vs 47ms on the DICOM study). With minmax enabled
+// the same 48-wide batches are issued only over non-empty macrocells: mv=9 +
+// minmax measures ~25ms vs GL 47-49ms (0.51x), thresholded error 0.000.
+// Variants 6/7/8 fall back to the batch-8 consume when a non-lean feature is
+// active. Setting the env var overrides the default for A/B testing.
 static int VolumeMarchVariant()
 {
-  static const int variant = [] {
-    if (const char* v = getenv("VTK_METAL_TEST_MARCH_VARIANT"))
-      return std::atoi(v);
-    return 0; // TEMP-REPRO: 0 = baseline march, no experiment (revert to 9)
-  }();
-  return variant;
+  if (const char* v = getenv("VTK_METAL_TEST_MARCH_VARIANT"))
+    return std::atoi(v);
+  return 0; // TEMP-REPRO: 0 = baseline march, no experiment (revert to 9)
 }
 
 // V31 back-edge exit experiment (VTK_METAL_TEST_DOEXIT=1): reshapes the
