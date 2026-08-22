@@ -1898,6 +1898,92 @@ Logs: /tmp/trmm_fix/ (first matrix, ordering-biased — superseded),
 /tmp/trmmimg*/ (parity PNGs). Reference binaries: /tmp/vtkPreFixMM,
 /tmp/vtkFixedMM.
 
+## 33. HANDOFF — next work: attack the minmax penalty at fine sample distance (2026-08-22 late night)
+
+Decision: pursue the MECHANISM (make the walk cheap or skipping smarter)
+before falling back to a static SD-gate. This section scopes that work.
+
+### 33.1 State of knowledge (all post-§32-fix, layout-independent)
+
+Penalty being attacked (@2048² SD0.5, tr layout, ABBA): +24 ms oblique,
++27 az135, ~+90 axial-z (identity: +12 az135, ~+100 axial-z). At SD4 minmax
+WINS everywhere (§16/§26/§27). The lattice is now provably correct
+(tr-mm ≡ id-mm byte-identical, §32.2.1).
+
+Mechanism model to falsify: per-sample walk overhead × poor skip yield.
+- Walk cost per sample: clamp + `int3(mmPos*mmDimF)` + cell-change compare;
+  on crossing, one R8 lattice fetch; when empty, the overshoot skip math.
+- Yield: DS=2 cells (GPU path, sd<1.5) over CT fine structure stay mostly
+  non-empty after dilation ⇒ few skips ⇒ pure tax. Axial-z hurts most because
+  its rays traverse the full 1794-slice depth = longest marches = most
+  samples taxed.
+
+Headroom exists: the corrupted-lattice accident (§32.4) skipped
+near-zero-alpha contributors with ≤0.18% px >1LSB image change and up to
+40% time savings (az135/z) — an upper bound on what smarter emptiness could
+harvest legitimately.
+
+### 33.2 Plan, ranked
+
+1. **Decompose before building** (METAL_ITER-style probe, ~1 session):
+   extend the march instrumentation to count per pixel: samples visited,
+   cell crossings, lattice fetches, empty-cell skips taken; dump PPMs for
+   mm1 vs raw trip counts at SD{0.5,1,2,4} × {oblique, AZ45, axis-z}.
+   Splits the penalty into walk-overhead vs missed-skip-opportunity and
+   picks which of 3/4 matters. Uniform channel: `_padCropFlags[3]` is free
+   ([0]=METAL_ITER, [1]=JSCALE, [2]=probe); feature bits 1u<<28..31 taken.
+2. **ε-contribution emptiness tier** (the principled accident):
+   today a cell is empty iff NO scalar in [cellMin,cellMax] has nonzero
+   opacity — one barely-opaque voxel pins it solid. Change build-time
+   semantics to "max achievable per-cell alpha < ε ⇒ skippable":
+   `volume_compute_minmax` already has cellMin/cellMax; iterate the TF table
+   range [idxMin,idxMax] (≤256 entries, GPU-cheap) for the max opacity and
+   encode it (second channel RG8, or 3-state in R8). Walk test unchanged.
+   ε calibration protocol: sweep ε; per view record Δ(ms) AND image diff vs
+   mm0 reference; find the knee where image stays sub-visible while Δ→≤0.
+   MUST be env-gated (`VTK_METAL_TEST_MM_EPS=s`) + feature bit; document as
+   an approximation (today's U8 emptiness is exact); never default without
+   the visual matrix incl. §18-style cells.
+3. **Cheaper walk** (image must stay byte-identical):
+   - Amortized DDA cell stepper (Amanatides–Woo t-next-axis) replacing
+     per-sample position→cell conversion. Unknown: MSL/Air codegen behavior
+     — inspect disassembly first (divergent_tail precedent).
+   - Two-level lattice: coarsened summary texture (one fetch covers 8³
+     cells) for early-out deep in uniform regions; tiny extra memory/build.
+   - Verify codegen isn't hoisting the empty-cell skip math into the hot
+     path when curCellEmpty is false — read Air before blaming the algorithm.
+4. **DS retune at fine SD**: DS=2 was tuned @400px pre-transpose ("DS 2 best
+   at sd<=1" comment at ComputeMacrocellDownsample). Re-validate DS 2 vs 4
+   at 2048 post-transpose at SD0.5/1 — fewer cell crossings vs coarser
+   skips; env-gate the function temporarily for the A/B.
+5. **Fallback**: static SD-gate for SetUseMinMaxAcceleration if mechanism
+   work stalls — but only after item 1 quantifies the crossover (SD1/SD2
+   cells are still unmeasured).
+
+### 33.3 Success criteria
+
+mm1 ≤ mm0 (Δ ≤ 0 ± noise, ABBA) at every view class at SD0.5 AND no SD4
+regression; byte-identical images for walk-shape fixes; for the ε tier, the
+calibrated bound documented with the same rigor as §17's parity ladder.
+Mean march stats sanity (§29) before trusting any delta.
+
+### 33.4 Refuted / do NOT retry
+
+Runtime or view-dependent gating of representations (§25.5 reasoning);
+JSCALE<1-class phase shrinking (changes the image); citing §31.2's
+"minmax helps" rows as evidence (corrupted-lattice artifacts, §32.4);
+sequential-run deltas (§32.5); RG8×minmax as a baseline (semantically
+undefined, §32.2 guard note).
+
+### 33.5 Reproduction anchors
+
+Scripts A/B/C of §31.4 remain valid patterns (eval-env wrappers mandatory);
+ABBA order-alternation required for any mm0-vs-mm1 claim (§32.5). Canaries
+on the fixed build: oblique SD4 tr+mm j1 ≈ 24–26; catastrophe cells axis-x
+≈ 213–230 / AZ45 ≈ 98–107 (raw arms 227/97); identity-layout code inert
+when VOLTRANSPOSE=0. [TRMM]/[TRMMCACHE] diagnostics gate on TR_DUMP/TR_BENCH.
+
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
