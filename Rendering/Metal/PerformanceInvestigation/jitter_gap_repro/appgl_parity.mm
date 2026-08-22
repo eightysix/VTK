@@ -650,6 +650,135 @@ void main()
     if (p == std::string::npos) { fprintf(stderr, "marker not found\n"); return 1; }
     fsSrc.replace(p, marker.size(), patch);
   }
+  // Ablation knobs (Plan-A inverse direction, 2026-08-22): start from the
+  // FULL composed FS (proven +7.7..+8.0 jitter D in this exact context) and
+  // remove one compositional ingredient at a time. The removal that restores
+  // the lean-harness tax (~+20) identifies the carrier of the cheap jitter.
+  if (getenv("PAR_NOGATE"))
+  {
+    std::string anchor =
+      "      if (g_srcColor.a > 0.0)\n"
+      "      {\n"
+      "        g_srcColor = computeColor(scalar, g_srcColor.a);";
+    size_t p = fsSrc.find(anchor);
+    if (p == std::string::npos) { fprintf(stderr, "PAR_NOGATE: anchor not found\n"); return 1; }
+    fsSrc.replace(p, strlen("      if (g_srcColor.a > 0.0)\n"), "      if (1.0 > 0.0)\n");
+    fprintf(stderr, "[parity] PAR_NOGATE: color fetch unconditional (byte-safe)\n");
+  }
+  if (getenv("PAR_NOSCALE"))
+  {
+    std::string anchor = "      scalar.r = scalar.r * in_volume_scale[0].r + in_volume_bias[0].r;\n";
+    size_t p = fsSrc.find(anchor);
+    if (p == std::string::npos) { fprintf(stderr, "PAR_NOSCALE: anchor not found\n"); return 1; }
+    fsSrc.erase(p, anchor.size());
+    fprintf(stderr, "[parity] PAR_NOSCALE: per-sample scale/bias removed (LSB drift)\n");
+  }
+  if (getenv("PAR_NOINCR"))
+  {
+    std::string anchor = "    g_dataPos += g_dirStep;\n";
+    size_t p = fsSrc.find(anchor);
+    if (p == std::string::npos) { fprintf(stderr, "PAR_NOINCR: anchor not found\n"); return 1; }
+    fsSrc.replace(p, anchor.size(),
+                  "    g_dataPos = g_rayOrigin + (g_currentT + 1.0) * g_dirStep;\n");
+    fprintf(stderr, "[parity] PAR_NOINCR: analytic position recompute (LSB drift)\n");
+  }
+  if (getenv("PAR_LEANLOOP"))
+  {
+    // Replace ONLY the castRay body with the lean-harness loop mechanics
+    // (analytic positions, pre-sample exit test, int bound) while keeping
+    // the composed prologue, uniforms, TF functions and textures verbatim.
+    // Delta jumps to ~+20 => the carrier is loop-mechanical; stays ~+8 =>
+    // the cheapness is program-level (prologue / compile-unit effect).
+    std::string leanLoop;
+    {
+    // Sub-ablations INSIDE the lean-style body (compose with env):
+    const bool lnNoGate   = getenv("PAR_LN_NOGATE") != NULL;
+    const bool lnNoScale  = getenv("PAR_LN_NOSCALE") != NULL;
+    const bool lnOneTap   = getenv("PAR_LN_ONETAP") != NULL || getenv("PAR_LN_FULL") != NULL;
+    if (lnOneTap)
+    {
+      size_t dp = fsSrc.find("uniform sampler2D in_depthSampler;");
+      if (dp == std::string::npos) { fprintf(stderr, "PAR_LN_ONETAP: decl anchor missing\n"); return 1; }
+      fsSrc.replace(dp, strlen("uniform sampler2D in_depthSampler;"),
+                    "uniform sampler2D uTF;\nuniform sampler2D in_depthSampler;");
+    }
+      const std::string gateOpen  = (lnNoGate || lnOneTap) ? "" : "    if (g_srcColor.a > 0.0)\n    {\n";
+      const std::string gateClose = (lnNoGate || lnOneTap) ? "" : "    }\n";
+      std::string scaleLine = lnNoScale
+        ? ""
+        : "    scalar.r = scalar.r * in_volume_scale[0].r + in_volume_bias[0].r;\n";
+      std::string tfSection = lnOneTap
+        ? "      vec4 tfv = texture(uTF, vec2(scalar.r, 0.5));\n"
+          "      float w = 1.0 - g_fragColor.a;\n"
+          "      g_fragColor.rgb += w * vec3(tfv.rgb * tfv.a);\n"
+          "      g_fragColor.a += w * tfv.a;\n"
+        : "      g_srcColor = vec4(0.0);\n"
+          "      g_srcColor.a = computeOpacity(scalar);\n"
+          "      g_srcColor = computeColor(scalar, g_srcColor.a);\n"  // placeholder line, rebuilt below
+        ;
+      if (!lnOneTap)
+      {
+        tfSection =
+          "      g_srcColor = vec4(0.0);\n"
+          "      g_srcColor.a = computeOpacity(scalar);\n"
+          "      " + gateOpen +
+          "      g_srcColor = computeColor(scalar, g_srcColor.a);\n"
+          "      g_srcColor.rgb *= g_srcColor.a;\n"
+          "      g_fragColor = (1.0 - g_fragColor.a) * g_srcColor + g_fragColor;\n"
+          "      " + gateClose;
+      }
+      const std::string tfDecl = lnOneTap ? "uniform sampler2D uTF;\n" : "";
+      if (getenv("PAR_LN_FULL"))
+      {
+        // FULL lean body: pure-local state, analytic positions, w-weighted
+        // single-tap composite — the jitter_gap_repro loop verbatim inside
+        // the composed program (same prologue/uniforms/textures otherwise).
+        leanLoop =
+          "void castRay(const float zStart, const float zEnd)\n"
+          "{\n"
+          "  int maxStepsL = int(ceil(g_terminatePointMax));\n"
+          "  vec3 accColor = vec3(0.0);\n"
+          "  float accOp = 0.0;\n"
+          "  for (int i = 0; i < maxStepsL; ++i)\n"
+          "  {\n"
+          "    if (float(i) >= g_terminatePointMax - 1e-6) break;\n"
+          "    vec3 evalPoint = g_rayOrigin + float(i) * g_dirStep;\n"
+          "    float s = texture3D(in_volume[0], evalPoint).r;\n"
+          "    s = s * in_volume_scale[0].r + in_volume_bias[0].r;\n"
+          "    vec4 tfv = texture(uTF, vec2(s, 0.5));\n"
+          "    float w = 1.0 - accOp;\n"
+          "    accColor += w * vec3(tfv.rgb * tfv.a);\n"
+          "    accOp += w * tfv.a;\n"
+          "    if (accOp > g_opacityThreshold) break;\n"
+          "  }\n"
+          "  g_fragColor = vec4(accColor, accOp);\n"
+          "}\n";
+      }
+      else
+      leanLoop =
+        "void castRay(const float zStart, const float zEnd)\n"
+        "{\n"
+        "  int maxStepsL = int(ceil(g_terminatePointMax));\n"
+        "  for (int i = 0; i < maxStepsL; ++i)\n"
+        "  {\n"
+        "    if (float(i) >= g_terminatePointMax - 1e-6) break;\n"
+        "    g_dataPos = g_rayOrigin + float(i) * g_dirStep;\n"
+        "    vec4 scalar;\n"
+        "    scalar = texture3D(in_volume[0], g_dataPos);\n" +
+        scaleLine +
+        "    scalar = vec4(scalar.r);\n" +
+        tfSection +
+        "    if (g_fragColor.a > g_opacityThreshold) break;\n"
+        "  }\n"
+        "}\n";
+    }
+    size_t p0 = fsSrc.find("vec4 castRay(const float zStart, const float zEnd)");
+    size_t p1 = fsSrc.find("void finalizeRayCast()");
+    if (p0 == std::string::npos || p1 == std::string::npos || p1 <= p0)
+    { fprintf(stderr, "PAR_LEANLOOP: anchors not found\n"); return 1; }
+    fsSrc.replace(p0, p1 - p0, leanLoop);
+    fprintf(stderr, "[parity] PAR_LEANLOOP: castRay body -> lean-style loop\n");
+  }
   GLint glMajor = 0, glMinor = 0;
   glGetIntegerv(GL_MAJOR_VERSION, &glMajor);
   glGetIntegerv(GL_MINOR_VERSION, &glMinor);
@@ -788,6 +917,89 @@ void main()
   glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, depthTex);
   glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, tfCTex);
   glActiveTexture(GL_TEXTURE4); glBindTexture(GL_TEXTURE_2D, tfOTex);
+
+  if (getenv("PAR_LEANTF"))
+  {
+    // PAR_LEANTF: swap BOTH float tables to the lean-harness LUT CLASS
+    // (256x1 RGBA8 UNORM): opacity table = raw ramp in R (computeOpacity
+    // reads .r), color table = constant color (computeColor reads .xyz).
+    // Shader text untouched — only the sampled resource class changes.
+    static uint8_t lutO[256 * 4], lutC[256 * 4];
+    const float xs[4] = { 17.55f, 21.24f, 33.80f, 43.01f };
+    const float ys[4] = { 0.0f, 0.0493f, 0.2497f, 0.0f };
+    for (int i = 0; i < 256; i++)
+    {
+      float v = (float)i;
+      float op = 0.0f;
+      if (v > xs[0] && v < xs[3])
+        for (int k = 0; k < 3; k++)
+          if (v >= xs[k] && v <= xs[k + 1])
+          {
+            float t = (v - xs[k]) / (xs[k + 1] - xs[k]);
+            op = ys[k] + t * (ys[k + 1] - ys[k]);
+            break;
+          }
+      lutO[i * 4 + 0] = (uint8_t)(op * 255.0f + 0.5f);
+      lutO[i * 4 + 1] = 0; lutO[i * 4 + 2] = 0; lutO[i * 4 + 3] = 255;
+      lutC[i * 4 + 0] = 0; lutC[i * 4 + 1] = 154; lutC[i * 4 + 2] = 180; lutC[i * 4 + 3] = 255;
+    }
+    GLuint lo = 0, lc = 0;
+    glGenTextures(1, &lo);
+    glBindTexture(GL_TEXTURE_2D, lo);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, lutO);
+    glGenTextures(1, &lc);
+    glBindTexture(GL_TEXTURE_2D, lc);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, lutC);
+    glActiveTexture(GL_TEXTURE4); glBindTexture(GL_TEXTURE_2D, lo);
+    glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, lc);
+    fprintf(stderr, "[parity] PAR_LEANTF: opacity/color -> 256x1 RGBA8 UNORM\n");
+  }
+
+  if (getenv("PAR_LN_ONETAP") || getenv("PAR_LN_FULL"))
+  {
+    // LN_ONETAP: bind a merged 256x1 RGBA8 LUT (lean class, premultiplied
+    // rgb like MakeTF) to unit 5 for the injected uTF sampler.
+    static uint8_t lut[256 * 4];
+    const float xs[4] = { 17.55f, 21.24f, 33.80f, 43.01f };
+    const float ys[4] = { 0.0f, 0.0493f, 0.2497f, 0.0f };
+    for (int i = 0; i < 256; i++)
+    {
+      float v = (float)i;
+      float op = 0.0f;
+      if (v > xs[0] && v < xs[3])
+        for (int k = 0; k < 3; k++)
+          if (v >= xs[k] && v <= xs[k + 1])
+          {
+            float t = (v - xs[k]) / (xs[k + 1] - xs[k]);
+            op = ys[k] + t * (ys[k + 1] - ys[k]);
+            break;
+          }
+      lut[i * 4 + 0] = (uint8_t)(0 * op + 0.5f);
+      lut[i * 4 + 1] = (uint8_t)(154.0f * op / 255.0f * 255.0f + 0.5f);
+      lut[i * 4 + 2] = (uint8_t)(180.0f * op / 255.0f * 255.0f + 0.5f);
+      lut[i * 4 + 3] = (uint8_t)(op * 255.0f + 0.5f);
+    }
+    GLuint lt = 0;
+    glGenTextures(1, &lt);
+    glBindTexture(GL_TEXTURE_2D, lt);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, lut);
+    glUniform1i(glGetUniformLocation(prog, "uTF"), 5);
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_2D, lt);
+    fprintf(stderr, "[parity] PAR_LN_ONETAP: single merged RGBA8 LUT on unit 5\n");
+  }
 
   glViewport(0, 0, rt, rt);
   glDisable(GL_CULL_FACE);

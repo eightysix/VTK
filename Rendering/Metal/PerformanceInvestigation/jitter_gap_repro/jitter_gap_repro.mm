@@ -158,6 +158,19 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
   const bool blendMode = getenv("BLEND") != NULL;
   const bool uboMode = getenv("UBO") != NULL;
   const bool padMode = getenv("PAD") != NULL;
+  // Plan A probes (HARNESS_VS_APP_GAP §25.4): compositional ingredients of
+  // the composed FS, each env-gated and composable.
+  //   TFSHAPE=1    app TF LUT shapes: 1024 R32F opacity + 1024 RGB32F color
+  //   GATE=1       opacity-gated color fetch (implies split LUTs; with
+  //                TFSHAPE gates the float-table path)
+  //   SCALARFLOW=1 per-sample uniform scale/bias + vec4 splat + .w swizzle
+  //                (scale=1/bias=0 -> byte-identical numerics)
+  //   EXITAPP=1    app break-pair FORM added as never-firing duplicates
+  //                (padded box, uTermMax=1e30) — instruction mix only
+  //   EXITAPP=2    app break-pair SEMANTICS replace the baseline exits
+  //                (post-sample OOB vs exact ctp box + i+1 >= termMax)
+  const char* exitApp = getenv("EXITAPP");
+  const bool scalarFlow = getenv("SCALARFLOW") != NULL;
   // AZSTEP=deg: per-frame camera orbit about world-Y through the volume
   // center — replicates the app bench, which calls camera->Azimuth(0.1)
   // INSIDE its timed loop so rays change every frame (TestMetalGLVisualComparison.cxx).
@@ -218,10 +231,12 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
     CGLSetCurrentContext(ctx);
     CGLDestroyPixelFormat(pf);
   }
-  fprintf(stderr, "[glnob] warmup=%d%s%s%s%s%s%s\n", warmupN,
+  fprintf(stderr, "[glnob] warmup=%d%s%s%s%s%s%s%s%s%s%s\n", warmupN,
           surfMode ? " SURFACE" : "", blendMode ? " BLEND" : "",
           uboMode ? " UBO" : "", padMode ? " PAD" : "",
-          azStep != 0.0f ? " AZSTEP" : "", getenv("CLIP") ? " CLIP" : "");
+          azStep != 0.0f ? " AZSTEP" : "", getenv("CLIP") ? " CLIP" : "",
+          getenv("TFSHAPE") ? " TFSHAPE" : "", getenv("GATE") ? " GATE" : "",
+          scalarFlow ? " SCALARFLOW" : "", exitApp ? (exitApp[0] == '2' ? " EXITAPP2" : " EXITAPP1") : "");
 
   GLuint volTex = 0;
   glGenTextures(1, &volTex);
@@ -275,8 +290,57 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
 
   // Split-TF knob (SPLIT_TF=1, H4 A/B): app-shaped color/opacity LUTs built
   // from the same tf data (color = rgb + a=255, opacity = a + 0 r/g/b).
+  // TFSHAPE=1 (Plan A probe 2): the app's TF LUT SHAPES — 1024x1 R32F opacity
+  // table + 1024x1 RGB32F constant-color table (the composer's
+  // computeOpacity/computeColor textures), content upsampled from the SAME
+  // Airways-II ramp as MakeTF so the effective alpha curve matches the
+  // baseline single-LUT. Float interpolation vs unorm8 differs at LSB level.
   GLuint colorTex = 0, opTex = 0;
-  if (getenv("SPLIT_TF"))
+  if (getenv("TFSHAPE"))
+  {
+    const int tw = 1024;
+    float* opLut = (float*)malloc(tw * sizeof(float));
+    float* cLut = (float*)malloc((size_t)tw * 3 * sizeof(float));
+    const float xs[4] = { 17.55f, 21.24f, 33.80f, 43.01f };
+    const float ys[4] = { 0.0f, 0.0493f, 0.2497f, 0.0f };
+    const float cr = 0.0f, cg = 154.0f / 255.0f, cb = 180.0f / 255.0f;
+    for (int i = 0; i < tw; i++)
+    {
+      float v = (float)i * 255.0f / (float)(tw - 1);
+      float op = 0.0f;
+      if (v > xs[0] && v < xs[3])
+      {
+        for (int k = 0; k < 3; k++)
+        {
+          if (v >= xs[k] && v <= xs[k + 1])
+          {
+            float t = (v - xs[k]) / (xs[k + 1] - xs[k]);
+            op = ys[k] + t * (ys[k + 1] - ys[k]);
+            break;
+          }
+        }
+      }
+      opLut[i] = op;
+      cLut[i * 3 + 0] = cr; cLut[i * 3 + 1] = cg; cLut[i * 3 + 2] = cb;
+    }
+    glGenTextures(1, &colorTex);
+    glBindTexture(GL_TEXTURE_2D, colorTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, tw, 1, 0, GL_RGB, GL_FLOAT, cLut);
+    glGenTextures(1, &opTex);
+    glBindTexture(GL_TEXTURE_2D, opTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, tw, 1, 0, GL_RED, GL_FLOAT, opLut);
+    free(opLut);
+    free(cLut);
+  }
+  else if (getenv("SPLIT_TF") || getenv("GATE"))
   {
     uint8_t* colorLut = (uint8_t*)malloc(256 * 4);
     uint8_t* opLut = (uint8_t*)malloc(256 * 4);
@@ -366,7 +430,6 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
       "  do {\n"
       "    float currentT = tStart + float(i) * stepSize;\n"
       "    vec3 evalPoint = evalBase + float(i) * evalStep;\n"
-      "    float s = VOL_FETCH;\n"
       "    %s"
       "    iterCount = i + 1;\n"
       "    ++i;\n"
@@ -379,7 +442,6 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
       // (g_dataPos += g_dirStep) instead of analytic index-based positions.
       "  vec3 evalPoint = evalBase;\n"
       "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n"
-      "    float s = VOL_FETCH;\n"
       "    %s"
       "    iterCount = i + 1;\n"
       "    if (accOp > 0.996) break;\n"
@@ -394,7 +456,6 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
       "    if (evalPoint.x < 0.0 || evalPoint.x > 1.0 ||\n"
       "        evalPoint.y < 0.0 || evalPoint.y > 1.0 ||\n"
       "        evalPoint.z < 0.0 || evalPoint.z > 1.0) break;\n"
-      "    float s = VOL_FETCH;\n"
       "    %s"
       "    iterCount = i + 1;\n"
       "    if (accOp > 0.996) break;\n"
@@ -402,11 +463,39 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
       "    currentT += stepSize;\n"
       "    i++;\n"
       "  }\n"
+    : exitApp && exitApp[0] == '2'
+    ? // EXITAPP=2: app break-pair SEMANTICS — post-sample OOB test against
+      // the exact ctp box + iteration-count vs terminatePointMax; baseline
+      // pre-sample tExit check removed (the app has none).
+      "  float termMax = (tExit - tStart) / stepSize;\n"
+      "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n"
+      "    vec3 evalPoint = evalBase + float(i) * evalStep;\n"
+      "    %s"
+      "    iterCount = i + 1;\n"
+      "    vec3 nextPos = evalBase + float(i + 1) * evalStep;\n"
+      "    if (any(greaterThan(max(evalStep, vec3(0.0)) * (nextPos - uTexMax), vec3(0.0))) ||\n"
+      "        any(greaterThan(min(evalStep, vec3(0.0)) * (nextPos - uTexMin), vec3(0.0)))) break;\n"
+      "    if ((accOp > 0.996) || float(i + 1) >= termMax) break;\n"
+      "  }\n"
+    : exitApp && exitApp[0] == '1'
+    ? // EXITAPP=1: app break-pair FORM as never-firing duplicates (padded
+      // box, uTermMax=1e30); every baseline condition kept — instruction
+      // mix changes, traversal provably identical.
+      "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n"
+      "    float currentT = tStart + float(i) * stepSize;\n"
+      "    if (currentT >= tExit - 1e-6) break;\n"
+      "    vec3 evalPoint = evalBase + float(i) * evalStep;\n"
+      "    %s"
+      "    iterCount = i + 1;\n"
+      "    vec3 nextPos = evalBase + float(i + 1) * evalStep;\n"
+      "    if (any(greaterThan(max(evalStep, vec3(0.0)) * (nextPos - uTexMax), vec3(0.0))) ||\n"
+      "        any(greaterThan(min(evalStep, vec3(0.0)) * (nextPos - uTexMin), vec3(0.0)))) break;\n"
+      "    if ((accOp > 0.996) || tStart + float(i + 1) * stepSize >= uTermMax) break;\n"
+      "  }\n"
     : "  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {\n"
       "    float currentT = tStart + float(i) * stepSize;\n"
       "    if (currentT >= tExit - 1e-6) break;\n"
       "    vec3 evalPoint = evalBase + float(i) * evalStep;\n"
-      "    float s = VOL_FETCH;\n"
       "    %s"
       "    iterCount = i + 1;\n"
       "    if (accOp > 0.996) break;\n"
@@ -414,18 +503,54 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
   const char* fetchDef = getenv("LOD")
     ? "#define VOL_FETCH textureLod(uVol, evalPoint, 0.0).r\n"
     : "#define VOL_FETCH texture(uVol, evalPoint).r\n";
-  const char* stepBody = getenv("SPLIT_TF")
-    ? "    float a = texture(uOpacityTF, vec2(s, 0.5)).r;\n"
-      "    if (a > 0.0) {\n"
-      "      vec3 c = texture(uColorTF, vec2(s, 0.5)).rgb;\n"
-      "      float w = 1.0 - accOp;\n"
-      "      accColor += w * (c * a);\n"
-      "      accOp += w * a;\n"
-      "    }\n"
-    : "    vec4 tfv = texture(uTF, vec2(s, 0.5));\n"
-      "    float w = 1.0 - accOp;\n"
-      "    accColor += w * vec3(tfv.rgb * tfv.a);\n"
-      "    accOp += w * tfv.a;\n";
+  // Step body assembly (Plan A): fetch line + TF path, composable.
+  const bool tfShape = getenv("TFSHAPE") != NULL;
+  const bool splitTf = getenv("SPLIT_TF") != NULL || getenv("GATE") != NULL;
+  std::string stepBody;
+  {
+    const char* SW = scalarFlow ? "scalar.w" : "s";
+    if (scalarFlow)
+      stepBody += std::string()
+        + "    float sv = VOL_FETCH;\n"
+          "    sv = sv * uVolScale.x + uVolBias.x;\n"
+          "    vec4 scalar = vec4(sv);\n";
+    else
+      stepBody += "    float s = VOL_FETCH;\n";
+    if (tfShape)
+    {
+      stepBody += std::string()
+        + "    float a = texture(uOpacityTF, vec2(" + SW + ", 0.0)).r;\n";
+      if (getenv("GATE"))
+        stepBody += std::string()
+          + "    if (a > 0.0) {\n"
+            "      vec3 c = texture(uColorTF, vec2(" + SW + ", 0.0)).rgb;\n"
+            "      float w = 1.0 - accOp;\n"
+            "      accColor += w * ((c * a) * a);\n"
+            "      accOp += w * a;\n"
+            "    }\n";
+      else
+        stepBody += std::string()
+          + "    vec3 c = texture(uColorTF, vec2(" + SW + ", 0.0)).rgb;\n"
+            "    float w = 1.0 - accOp;\n"
+            "    accColor += w * ((c * a) * a);\n"
+            "    accOp += w * a;\n";
+    }
+    else if (splitTf)
+      stepBody += std::string()
+        + "    float a = texture(uOpacityTF, vec2(" + SW + ", 0.5)).r;\n"
+          "    if (a > 0.0) {\n"
+          "      vec3 c = texture(uColorTF, vec2(" + SW + ", 0.5)).rgb;\n"
+          "      float w = 1.0 - accOp;\n"
+          "      accColor += w * (c * a);\n"
+          "      accOp += w * a;\n"
+          "    }\n";
+    else
+      stepBody += std::string()
+        + "    vec4 tfv = texture(uTF, vec2(" + SW + ", 0.5));\n"
+          "    float w = 1.0 - accOp;\n"
+          "    accColor += w * vec3(tfv.rgb * tfv.a);\n"
+          "    accOp += w * tfv.a;\n";
+  }
   // DEPTH knob (DEPTH=1, H4 A/B §3): dummy depth-texture fetch at FS start
   // (NEAREST, full-res) fed into the composite with a tiny weight — tests the
   // pass split / TBDR structure without changing the march (the value is
@@ -473,6 +598,12 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
       "uniform mat4 uClipO2T;\n"
       "uniform vec3 uClipOrigin;\n"
       "uniform vec3 uClipNormal;\n";  }
+  // Plan A probe uniforms (declared only when a knob uses them so the
+  // default shader text stays byte-identical to pre-Plan-A runs).
+  if (scalarFlow)
+    uniDecl += "uniform vec4 uVolScale;\nuniform vec4 uVolBias;\n";
+  if (exitApp)
+    uniDecl += "uniform vec3 uTexMin;\nuniform vec3 uTexMax;\nuniform float uTermMax;\n";
   // PAD=1 (HANDOFF candidate 5): dead-but-unremovable prologue work — texture-
   // seeded ALU chains kept live ACROSS the march loop by a 1e-9-weighted
   // consume in the output — emulates the app FS's register pressure.
@@ -536,7 +667,7 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
     : "";
   char* fsBuf = (char*)malloc(24576);
   char* loopBuf = (char*)malloc(4096);
-  snprintf(loopBuf, 4096, loopShape, stepBody);
+  snprintf(loopBuf, 4096, loopShape, stepBody.c_str());
   snprintf(fsBuf, 24576,
     "#version 150\n"
     "%s"
@@ -615,6 +746,12 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
     "  }\n"
     "}\n", fetchDef, uniDecl.c_str(), depthFetch, padCode, clipCode, loopBuf, padConsume);
   const char* fs = fsBuf;
+  if (getenv("FSDUMP"))
+  {
+    FILE* fd = fopen("/tmp/jgr_fs.glsl", "w");
+    if (fd) { fputs(fs, fd); fclose(fd); }
+    fprintf(stderr, "[glnob] fs dumped (%zu bytes)\n", strlen(fs));
+  }
 
   GLuint prog = glCreateProgram();
   GLuint vsh = glCreateShader(GL_VERTEX_SHADER), fsh = glCreateShader(GL_FRAGMENT_SHADER);
@@ -644,6 +781,25 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
   glUniform1i(glGetUniformLocation(prog, "uColorTF"), 3);
   glUniform1i(glGetUniformLocation(prog, "uOpacityTF"), 4);
   glUniform1i(glGetUniformLocation(prog, "uDepth"), 5);
+  if (scalarFlow)
+  {
+    // identity scale/bias: the app's per-sample dataflow shape, unchanged
+    // numerics (byte-identical image required).
+    glUniform4f(glGetUniformLocation(prog, "uVolScale"), 1.0f, 0.0f, 0.0f, 0.0f);
+    glUniform4f(glGetUniformLocation(prog, "uVolBias"), 0.0f, 0.0f, 0.0f, 0.0f);
+  }
+  if (exitApp)
+  {
+    // EXITAPP=1: padded box (march range ⊂ [ctpOffset, ctpOffset+ctpScale]
+    // ⊂ padded) + huge termMax -> the app-form tests never fire.
+    // EXITAPP=2: exact ctp box; termMax computed in-shader (uniform inert).
+    float pad = exitApp[0] == '1' ? 0.02f : 0.0f;
+    const float sc[3] = { (kVolW - 1.0f) / kVolW, (kVolH - 1.0f) / kVolH, (kVolD - 1.0f) / kVolD };
+    const float of[3] = { 0.5f / kVolW, 0.5f / kVolH, 0.5f / kVolD };
+    glUniform3f(glGetUniformLocation(prog, "uTexMin"), of[0] - pad, of[1] - pad, of[2] - pad);
+    glUniform3f(glGetUniformLocation(prog, "uTexMax"), of[0] + sc[0] + pad, of[1] + sc[1] + pad, of[2] + sc[2] + pad);
+    glUniform1f(glGetUniformLocation(prog, "uTermMax"), 1e30f);
+  }
 
   if (uboMode)
   {
@@ -724,10 +880,12 @@ static double RunGL(int rt, float sdMM, int frames, const uint8_t* vol, const ui
     glUniformMatrix4fv(azLoc, 1, GL_FALSE, ident);
     glUniform3f(eyeAzLoc, kEye[0], kEye[1], kEye[2]);
   }
-  double azCur = 0.0;
+  double azCur = getenv("AZ0") ? atof(getenv("AZ0")) : 0.0;
   auto AdvanceAzimuth = [&]()
   {
-    if (azStep == 0.0f) return;
+    // AZ0=deg sets a STATIC camera azimuth (applied on every call,
+    // idempotent); AZSTEP advances it per-frame as before.
+    if (azStep == 0.0f && !getenv("AZ0")) return;
     azCur += azStep;
     const double th = azCur * M_PI / 180.0;
     const double cth = cos(th), sth = sin(th);
@@ -836,7 +994,15 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
   MTLTextureDescriptor* vd = [[MTLTextureDescriptor alloc] init];
   vd.textureType = MTLTextureType3D;
   vd.pixelFormat = MTLPixelFormatR8Unorm;
-  vd.width = kVolW; vd.height = kVolH; vd.depth = kVolD;
+  // TRANSPOSE=1: upload the volume x<->z transposed (slice axis moves to
+  // the texture's x extent) and swizzle sample coords in-shader. The jitter
+  // tax is axis-dependent (azimuth sweep, HARNESS_VS_APP_GAP §19) and the
+  // RG8 result (§17/§18) says the lever is MEMORY LAYOUT, not request
+  // shape — this tests Metal's 3D tiling axis bias without repacking.
+  const bool transposeMode = getenv("TRANSPOSE") != NULL;
+  const int tw2 = transposeMode ? kVolD : kVolW;
+  const int td2 = transposeMode ? kVolW : kVolD;
+  vd.width = tw2; vd.height = kVolH; vd.depth = td2;
   vd.mipmapLevelCount = 1;
   vd.usage = MTLTextureUsageShaderRead;
   vd.storageMode = MTLStorageModePrivate;
@@ -846,9 +1012,30 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
   id<MTLCommandBuffer> cb0 = [queue commandBuffer];
   id<MTLBlitCommandEncoder> blit = [cb0 blitCommandEncoder];
   size_t total = (size_t)kVolW * kVolH * kVolD;
-  id<MTLBuffer> stage = [device newBufferWithBytes:vol length:total options:MTLResourceStorageModeShared];
-  [blit copyFromBuffer:stage sourceOffset:0 sourceBytesPerRow:kVolW sourceBytesPerImage:kVolW * kVolH
-          sourceSize:MTLSizeMake(kVolW, kVolH, kVolD) toTexture:volTex
+  uint8_t* Tbuf = NULL;
+  if (transposeMode)
+  {
+    // blocked scalar transpose, new(x'=z,y,z'=x): T[(x*H+y)*D+z] = V[(z*H+y)*W+x]
+    Tbuf = (uint8_t*)malloc(total);
+    const int BS = 32;
+    for (int xb = 0; xb < kVolW; xb += BS)
+      for (int zb = 0; zb < kVolD; zb += BS)
+        for (int yb = 0; yb < kVolH; yb += BS)
+        {
+          const int xe = xb + BS < kVolW ? xb + BS : kVolW;
+          const int ze = zb + BS < kVolD ? zb + BS : kVolD;
+          const int ye = yb + BS < kVolH ? yb + BS : kVolH;
+          for (int x = xb; x < xe; ++x)
+            for (int z = zb; z < ze; ++z)
+              for (int y = yb; y < ye; ++y)
+                Tbuf[((size_t)x * kVolH + y) * kVolD + z] = vol[((size_t)z * kVolH + y) * kVolW + x];
+        }
+    fprintf(stderr, "[mtl] TRANSPOSE: volume uploaded x<->z transposed\n");
+  }
+  const uint8_t* upBytes = transposeMode ? Tbuf : vol;
+  id<MTLBuffer> stage = [device newBufferWithBytes:upBytes length:total options:MTLResourceStorageModeShared];
+  [blit copyFromBuffer:stage sourceOffset:0 sourceBytesPerRow:tw2 sourceBytesPerImage:tw2 * kVolH
+          sourceSize:MTLSizeMake(tw2, kVolH, td2) toTexture:volTex
           destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
   [blit endEncoding];
   [cb0 commit];
@@ -860,6 +1047,62 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
   tfd.storageMode = MTLStorageModeShared;
   id<MTLTexture> tfTex = [device newTextureWithDescriptor:tfd];
   [tfTex replaceRegion:MTLRegionMake2D(0, 0, 256, 1) mipmapLevel:0 withBytes:tf bytesPerRow:256 * 4];
+
+  // APSTEP=1 (composed-style march on Metal): app-shaped float TF tables —
+  // 1024x1 R32F opacity (raw Airways-II ramp) + 1024x1 RGBA32F constant
+  // color — bound at indices 3/4. Without the knob: tiny dummies so the
+  // always-declared MSL texture params stay validly bound.
+  const bool apStep = getenv("APSTEP") != NULL;
+  id<MTLTexture> opTex = nil, colTex = nil;
+  {
+    if (apStep)
+    {
+      const int tw = 1024;
+      float* opLut = (float*)malloc(tw * sizeof(float));
+      float* cLut = (float*)malloc((size_t)tw * 4 * sizeof(float));
+      const float xs[4] = { 17.55f, 21.24f, 33.80f, 43.01f };
+      const float ys[4] = { 0.0f, 0.0493f, 0.2497f, 0.0f };
+      for (int i = 0; i < tw; i++)
+      {
+        float v = (float)i * 255.0f / (float)(tw - 1);
+        float op = 0.0f;
+        if (v > xs[0] && v < xs[3])
+          for (int k = 0; k < 3; k++)
+            if (v >= xs[k] && v <= xs[k + 1])
+            {
+              float t = (v - xs[k]) / (xs[k + 1] - xs[k]);
+              op = ys[k] + t * (ys[k + 1] - ys[k]);
+              break;
+            }
+        opLut[i] = op;
+        cLut[i * 4 + 0] = 0.0f; cLut[i * 4 + 1] = 154.0f / 255.0f;
+        cLut[i * 4 + 2] = 180.0f / 255.0f; cLut[i * 4 + 3] = 1.0f;
+      }
+      MTLTextureDescriptor* od = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                                                                    width:tw height:1 mipmapped:NO];
+      od.usage = MTLTextureUsageShaderRead;
+      od.storageMode = MTLStorageModeShared;
+      opTex = [device newTextureWithDescriptor:od];
+      [opTex replaceRegion:MTLRegionMake2D(0, 0, tw, 1) mipmapLevel:0 withBytes:opLut bytesPerRow:tw * sizeof(float)];
+      MTLTextureDescriptor* cd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+                                                                                    width:tw height:1 mipmapped:NO];
+      cd.usage = MTLTextureUsageShaderRead;
+      cd.storageMode = MTLStorageModeShared;
+      colTex = [device newTextureWithDescriptor:cd];
+      [colTex replaceRegion:MTLRegionMake2D(0, 0, tw, 1) mipmapLevel:0 withBytes:cLut bytesPerRow:tw * 4 * sizeof(float)];
+      free(opLut);
+      free(cLut);
+    }
+    else
+    {
+      MTLTextureDescriptor* od = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+                                                                                    width:4 height:4 mipmapped:NO];
+      od.usage = MTLTextureUsageShaderRead;
+      od.storageMode = MTLStorageModeShared;
+      opTex = [device newTextureWithDescriptor:od];
+      colTex = [device newTextureWithDescriptor:od];
+    }
+  }
 
   MTLTextureDescriptor* rtd = [[MTLTextureDescriptor alloc] init];
   rtd.textureType = MTLTextureType2D;
@@ -889,7 +1132,7 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
     msl = full;
   }
   const char* msl2 =
-    "struct Uniforms { float4 eye; float4 boundsSize; float4x4 invVP; float4x4 vp; float sampleDistMM; int jitter; int maxIter; float rtSize; int probeRast; int probeFS; int ndcCorners; int probeTexNoise; int debugIter; };\n"
+    "struct Uniforms { float4 eye; float4 boundsSize; float4x4 invVP; float4x4 vp; float sampleDistMM; int jitter; int maxIter; float rtSize; int probeRast; int probeFS; int ndcCorners; int probeTexNoise; int debugIter; int transpose; float4x4 az; float4 eyeAz; };\n"
 "struct VOut { float4 position [[position]]; float tid [[user(tid0)]]; float4 cvt [[user(cvt0)]]; };\n"
      "vertex VOut vertex_main(uint vid [[vertex_id]],\n"
      "                        constant packed_float3* corners [[buffer(1)]],\n"
@@ -902,10 +1145,12 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
       "  if (u.ndcCorners > 0) { float t = float(vid / 3); float v = float(vid % 3); float tx = float(int(t) % 4) * 0.5f - 1.0f; float ty = floor(t / 4.0f) * 0.5f - 1.0f; o.position = float4(tx + (v == 0.0f ? 0.0f : (v == 1.0f ? 0.5f : 0.0f)), ty + (v == 0.0f ? 0.0f : (v == 1.0f ? 0.0f : 0.5f)), 0.5f, 1.0f); return o; }\n"
      "  o.position = u.vp * float4(c * u.boundsSize.xyz, 1.0f); return o;\n"
      "}\n"
-"fragment float4 fragment_main(VOut in [[stage_in]],\n"
+ "fragment float4 fragment_main(VOut in [[stage_in]],\n"
      "                              texture3d<float> volTex [[texture(0)]],\n"
      "                              texture2d<float> tfTex [[texture(1)]],\n"
      "                              texture2d<float> noiseTex [[texture(2)]],\n"
+     "                              texture2d<float> opLut [[texture(3)]],\n"
+     "                              texture2d<float> colLut [[texture(4)]],\n"
      "                              constant Uniforms& u [[buffer(0)]]) {\n"
      "  constexpr sampler noiseSampler(filter::nearest, address::repeat);\n"
     "  if (u.probeRast > 0) return float4(in.cvt.x, in.cvt.y, in.cvt.z, 1.0f);\n"
@@ -914,8 +1159,8 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
     "  float2 ndc = float2(in.position.x / u.rtSize * 2.0f - 1.0f,\n"
     "                      (u.rtSize - in.position.y) / u.rtSize * 2.0f - 1.0f);\n"
     "  float4 w4 = u.invVP * float4(ndc, 0.0f, 1.0f);\n"
-    "  float3 ptPhys = w4.xyz / w4.w;\n"
-    "  float3 eye = u.eye.xyz;\n"
+    "  float3 ptPhys = (u.az * float4(w4.xyz / w4.w, 1.0f)).xyz;\n"
+    "  float3 eye = u.eyeAz.xyz;\n"
     "  float3 rayDir = normalize(ptPhys / u.boundsSize.xyz - eye);\n"
     "  float3 inv = 1.0f / rayDir;\n"
     "  float3 t0 = (float3(0.0f) - eye) * inv;\n"
@@ -947,13 +1192,15 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
      "    else tStart += jitterF;\n"
      "  }\n"
     "  int maxSteps = max(0, int(ceil((tExit - tStart) / stepSize)));\n"
-    "  float3 texelCount = float3(volTex.get_width(), volTex.get_height(), volTex.get_depth());\n"
+    "  float3 texelCountRaw = float3(volTex.get_width(), volTex.get_height(), volTex.get_depth());\n"
+    "  float3 texelCount = (u.transpose != 0) ? texelCountRaw.zyx : texelCountRaw;\n"
     "  float3 ctpScale = max(texelCount - 1.0f, 1e-4f) / texelCount;\n"
     "  float3 ctpOffset = 0.5f / texelCount;\n"
     "  float3 evalBase = ctpOffset + (eye + rayDir * tStart) * ctpScale;\n"
     "  float3 evalStep = rayDir * ctpScale * stepSize;\n"
-"  constexpr sampler volSampler(filter::linear, address::clamp_to_edge);\n"
+ "  constexpr sampler volSampler(filter::linear, address::clamp_to_edge);\n"
      "  constexpr sampler tfSampler(filter::linear, address::clamp_to_edge);\n"
+     "  constexpr sampler lutSampler(filter::linear, address::clamp_to_edge);\n"
     "  float3 accColor = float3(0.0f);\n"
     "  float accOp = 0.0f;\n"
     "  int iterCount = 0;\n"
@@ -961,7 +1208,8 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
     "    float currentT = tStart + float(i) * stepSize;\n"
     "    if (currentT >= tExit - 1e-6f) break;\n"
     "    float3 evalPoint = evalBase + float(i) * evalStep;\n"
-    "    float s = volTex.sample(volSampler, evalPoint).r;\n"
+    "    float3 spT = (u.transpose != 0) ? evalPoint.zyx : evalPoint;\n"
+    "    float s = volTex.sample(volSampler, spT).r;\n"
     "    float4 tfv = tfTex.sample(tfSampler, float2(s, 0.5f));\n"
     "    float w = 1.0f - accOp;\n"
     "    accColor += w * (tfv.rgb * tfv.a);\n"
@@ -974,7 +1222,60 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
     "}\n";
   // DOEXIT knob (V31 port): back-edge exit for the Metal march too.
   std::string msl2s = msl2;
-  if (getenv("DOEXIT")) {
+  if (getenv("APSTEP"))
+  {
+    // APSTEP=1: the COMPOSED march structure (appgl_parity verbatim class)
+    // on Metal — two-tap float LUTs (opacity first, gated color), vec4
+    // splat flow, incremental positions, post-sample OOB sign-form +
+    // currentT>=terminatePointMax break pair replacing the pre-sample
+    // tExit check. The structure whose GL-side presence pays +7.8 jitter D
+    // while its absence (lean loop) pays ~+16-20 in the same context.
+    const char* oldLoop =
+      "  for (int i = 0; i < min(u.maxIter, maxSteps); i++) {\n"
+      "    float currentT = tStart + float(i) * stepSize;\n"
+      "    if (currentT >= tExit - 1e-6f) break;\n"
+      "    float3 evalPoint = evalBase + float(i) * evalStep;\n"
+      "    float s = volTex.sample(volSampler, evalPoint).r;\n"
+      "    float4 tfv = tfTex.sample(tfSampler, float2(s, 0.5f));\n"
+      "    float w = 1.0f - accOp;\n"
+      "    accColor += w * (tfv.rgb * tfv.a);\n"
+      "    accOp += w * tfv.a;\n"
+      "    iterCount = i + 1;\n"
+      "    if (accOp > 0.996f) break;\n"
+      "  }\n";
+    const char* apLoop =
+      "  float3 dataPos = evalBase;\n"
+      "  float4 fragC = float4(accColor, accOp);\n"
+      "  float curT = 0.0f;\n"
+      "  float termMax = (tExit - tStart) / stepSize;\n"
+      "  float3 texMinL = ctpOffset;\n"
+      "  float3 texMaxL = ctpOffset + ctpScale;\n"
+      "  for (int i = 0; i < min(u.maxIter, maxSteps); i++) {\n"
+      "    float4 scalar = volTex.sample(volSampler, dataPos);\n"
+      "    scalar = float4(scalar.r);\n"
+      "    float a = opLut.sample(lutSampler, float2(scalar.w, 0.0f)).r;\n"
+      "    if (a > 0.0f) {\n"
+      "      float3 c = colLut.sample(lutSampler, float2(scalar.w, 0.0f)).rgb;\n"
+      "      c *= a;\n"
+      "      float w = 1.0f - fragC.a;\n"
+      "      fragC.rgb += w * c;\n"
+      "      fragC.a += w * a;\n"
+      "    }\n"
+      "    iterCount = i + 1;\n"
+      "    dataPos += evalStep;\n"
+      "    if (any((max(evalStep, float3(0.0f)) * (dataPos - texMaxL)) > float3(0.0f)) ||\n"
+      "        any((min(evalStep, float3(0.0f)) * (dataPos - texMinL)) > float3(0.0f))) break;\n"
+      "    if ((fragC.a > 0.99608f) || (curT >= termMax)) break;\n"
+      "    curT += 1.0f;\n"
+      "  }\n"
+      "  accColor = fragC.rgb;\n"
+      "  accOp = fragC.a;\n";
+    size_t pos = msl2s.find(oldLoop);
+    if (pos == std::string::npos) { fprintf(stderr, "APSTEP: Metal loop pattern not found\n"); exit(1); }
+    msl2s.replace(pos, strlen(oldLoop), apLoop);
+    fprintf(stderr, "[mtl] APSTEP: composed-style loop installed\n");
+  }
+  else if (getenv("DOEXIT")) {
     const char* oldLoop =
       "  for (int i = 0; i < min(u.maxIter, maxSteps); i++) {\n"
       "    float currentT = tStart + float(i) * stepSize;\n"
@@ -1009,6 +1310,28 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
     if (pos == std::string::npos) { fprintf(stderr, "DOEXIT: Metal loop pattern not found\n"); exit(1); }
     msl2s.replace(pos, strlen(oldLoop), newLoop);
   }
+  if (getenv("MANTRI"))
+  {
+    // MANTRI=1: manual z-split trilinear — replace the single hardware
+    // trilinear fetch with TWO explicit XY-bilinear fetches at the exact
+    // slice centers bracketing the sample, lerped in-shader. Same texel
+    // footprint and march length; only the sampler REQUEST SHAPE changes
+    // (per-lane requests stay within one z-slice each). Tests whether
+    // Metal's jitter tax is about what the 3D sampler is asked to do.
+    const char* oldFetch =
+      "    float s = volTex.sample(volSampler, evalPoint).r;\n";
+    const char* mantriFetch =
+      "    float zT = evalPoint.z * volTex.get_depth() - 0.5f;\n"
+      "    float zF0 = floor(zT);\n"
+      "    float fzw = zT - zF0;\n"
+      "    float vA = volTex.sample(volSampler, float3(evalPoint.xy, clamp((zF0 + 0.5f) / volTex.get_depth(), 0.0f, 1.0f))).r;\n"
+      "    float vB = volTex.sample(volSampler, float3(evalPoint.xy, clamp((zF0 + 1.5f) / volTex.get_depth(), 0.0f, 1.0f))).r;\n"
+      "    float s = mix(vA, vB, fzw);\n";
+    size_t fpos = msl2s.find(oldFetch);
+    if (fpos == std::string::npos) { fprintf(stderr, "MANTRI: fetch pattern not found\n"); exit(1); }
+    msl2s.replace(fpos, strlen(oldFetch), mantriFetch);
+    fprintf(stderr, "[mtl] MANTRI: z-split trilinear installed\n");
+  }
   NSError* err = nil;
   id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithFormat:@"%s%s", msl, msl2s.c_str()] options:nil error:&err];
   if (!lib) { fprintf(stderr, "MSL compile failed: %s\n", err.description.UTF8String); exit(1); }
@@ -1027,6 +1350,9 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
     int jitter, maxIter;
     float rtSize;
     int probeRast, probeFS, ndcCorners, probeTexNoise, debugIter;
+    int transpose;
+    simd_float4x4 az;
+    simd_float4 eyeAz;
   } u;
   u.eye = (simd_float4){ kEye[0], kEye[1], kEye[2], 0.0f };
   u.boundsSize = (simd_float4){ kBounds[0], kBounds[1], kBounds[2], 0.0f };
@@ -1034,6 +1360,35 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
   memcpy(&u.vp, kVP, 16 * sizeof(float));
   u.sampleDistMM = sdMM; u.jitter = jitter; u.maxIter = 8192;
   u.rtSize = (float)rt; u.probeRast = getenv("PROBE_RAST") ? 1 : 0; u.probeFS = getenv("PROBE_FULLSCREEN") ? 1 : 0; u.ndcCorners = getenv("NDC_CORNERS") ? 1 : 0; u.probeTexNoise = getenv("NOISE_TEX") ? 1 : 0; u.debugIter = getenv("GL_ITER") ? 1 : 0;
+  u.transpose = transposeMode ? 1 : 0;
+  {
+    // AZ0/AZSTEP camera-orbit state (mirrors the GL side's AdvanceAzimuth)
+    matrix_float4x4 ident = (matrix_float4x4){{
+      {1,0,0,0},{0,1,0,0},{0,0,1,0},{0,0,0,1}}};
+    u.az = ident;
+    u.eyeAz = simd_make_float4(kEye[0], kEye[1], kEye[2], 0.0f);
+  }
+  double mtlAzCur = getenv("AZ0") ? atof(getenv("AZ0")) : 0.0;
+  auto MtlAdvanceAzimuth = [&]()
+  {
+    if ((getenv("AZSTEP") ? (float)atof(getenv("AZSTEP")) : 0.0f) == 0.0f && !getenv("AZ0")) return;
+    const float azStepM = getenv("AZSTEP") ? (float)atof(getenv("AZSTEP")) : 0.0f;
+    if (azStepM != 0.0f) mtlAzCur += azStepM;
+    const double th = mtlAzCur * M_PI / 180.0;
+    const double cth = cos(th), sth = sin(th);
+    const float cx = kBounds[0] * 0.5f, cyv = kBounds[1] * 0.5f, cz = kBounds[2] * 0.5f;
+    simd_float4x4 m;
+    m.columns[0] = simd_make_float4((float)cth, 0, (float)sth, 0);
+    m.columns[1] = simd_make_float4(0, 1, 0, 0);
+    m.columns[2] = simd_make_float4((float)-sth, 0, (float)cth, 0);
+    m.columns[3] = simd_make_float4((float)(cx - cth * cx - sth * cz), 0,
+                                    (float)(cz + sth * cx - cth * cz), 1);
+    u.az = m;
+    const double ex = kEye[0] * kBounds[0], ez = kEye[2] * kBounds[2];
+    const double rx = cth * (ex - cx) + sth * (ez - cz) + cx;
+    const double rz = -sth * (ex - cx) + cth * (ez - cz) + cz;
+    u.eyeAz = simd_make_float4((float)(rx / kBounds[0]), kEye[1], (float)(rz / kBounds[2]), 0);
+  };
   id<MTLBuffer> ubuf = [device newBufferWithBytes:&u length:sizeof(u) options:MTLResourceStorageModeShared];
   id<MTLBuffer> corners = [device newBufferWithBytes:kBoxCorners length:sizeof(kBoxCorners) options:MTLResourceStorageModeShared];
   float fsq[9] = { -1,-1,0.5,  3,-1,0.5,  -1,3,0.5 };
@@ -1048,6 +1403,8 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
   [noiseTex replaceRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0 withBytes:kBlue64 bytesPerRow:64];
 
   for (int f = 0; f < 5; f++) {          // warm-up
+    MtlAdvanceAzimuth();
+    memcpy([ubuf contents], &u, sizeof(u));
     MTLRenderPassDescriptor* rpd = [[MTLRenderPassDescriptor alloc] init];
     rpd.colorAttachments[0].texture = rtTex;
     rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -1063,6 +1420,8 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
     [wenc setFragmentTexture:volTex atIndex:0];
     [wenc setFragmentTexture:tfTex atIndex:1];
     [wenc setFragmentTexture:noiseTex atIndex:2];
+    [wenc setFragmentTexture:opTex atIndex:3];
+    [wenc setFragmentTexture:colTex atIndex:4];
     [wenc setFragmentBuffer:ubuf offset:0 atIndex:0];
     [wenc setVertexBuffer:ubuf offset:0 atIndex:0];
     [wenc setVertexBuffer:(getenv("PROBE_FULLSCREEN") ? fsqBuf : corners) offset:0 atIndex:1];
@@ -1076,6 +1435,8 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
   double t0 = NowMs();
   id<MTLCommandBuffer> lastCB = nil;
   for (int f = 0; f < frames; f++) {
+    MtlAdvanceAzimuth();
+    memcpy([ubuf contents], &u, sizeof(u));
     MTLRenderPassDescriptor* rpd = [[MTLRenderPassDescriptor alloc] init];
     rpd.colorAttachments[0].texture = rtTex;
     rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -1091,6 +1452,8 @@ static double RunMetal(int rt, float sdMM, int frames, const uint8_t* vol, const
     [enc setFragmentTexture:volTex atIndex:0];
     [enc setFragmentTexture:tfTex atIndex:1];
     [enc setFragmentTexture:noiseTex atIndex:2];
+    [enc setFragmentTexture:opTex atIndex:3];
+    [enc setFragmentTexture:colTex atIndex:4];
     [enc setFragmentBuffer:ubuf offset:0 atIndex:0];
     [enc setVertexBuffer:ubuf offset:0 atIndex:0];
     [enc setVertexBuffer:(getenv("PROBE_FULLSCREEN") ? fsqBuf : corners) offset:0 atIndex:1];

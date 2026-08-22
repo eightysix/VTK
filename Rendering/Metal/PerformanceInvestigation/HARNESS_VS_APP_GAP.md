@@ -993,6 +993,202 @@ affects absolute ms only. TEMP debug edits still in tree (METAL_ITER G/B
 encoding, probe early-return gated on `_padCropFlags[2]`, `[march]`/
 `[RG8]` stderr lines) — revert before any production-facing landing.
 
+## 26. RESOLVED (2026-08-22 night): transposed volume upload kills the Metal jitter tax — root cause found, production port byte-parity
+
+### 26.1 Root cause
+
+**Metal's private 3D texture tiling is strongly axis-biased.** With the slice
+axis (the 1794-deep extent) as texture DEPTH, trilinear z-pair fetches under
+per-pixel jitter phase scatter pay a huge DRAM tax; uploading the volume
+x<->z TRANSPOSED (slice axis in the texture's x extent) collapses it. This
+is the mechanism §21 could only infer: not GL-vs-Metal "tiling mystique"
+(revised §24), not request shape — pure memory layout.
+
+Proof ladder (all same-day, interleaved, order-alternated):
+
+1. `jitter_gap_repro` new knob `TRANSPOSE=1` (CPU transpose + coord swizzle,
+   byte-identical renders): Metal @1024/SD4 j0 29.7→16.7, **jitter Δ
+   +22.28±1.12 → +1.78±0.18 ms**. Also @2048/SD4 (+23.06→+5.23), SD0.5
+   (+7.27→+0.98), SD8 (wins). NO cell regresses.
+2. Request-shape restructuring does NOT reach it: `APSTEP` (composed-loop
+   port to MSL: two-tap float LUTs + gate + incremental pos + OOB/tPM
+   exits) only −2.7 ms; `MANTRI` (manual z-split trilinear: two XY-bilinear
+   taps at slice centers + lerp, image max Δ=0 vs baseline) only −1.6 ms.
+   MSL is structure-insensitive where GLSL swings 2× (see 26.3).
+3. Production port (`VTK_METAL_TEST_VOLTRANSPOSE=1`, fc_volTransposed):
+   byte-identical renders (j0 AND j1, max Δ=0) and:
+
+| production config (@2048/SD4 oblique) | j0 | j1 | jitter Δ |
+|---|---|---|---|
+| baseline mv0 raw | 43.3 | 66.1 | +22.8 |
+| **transposed raw** | **20.2** | **22.2** | **+2.0** |
+| §17 GL reference (raw) | 40.10 | 52.83 | +12.73 |
+| baseline mv0+minmax | 25.14 | 27.18 | +2.04 |
+| **transposed mv0+minmax** | **23.94** | **24.67** | **+0.73** |
+
+M/GL j1 on the pathological cell goes from ~1.29 to **~0.42** — Metal beats
+GL by 2.4× absolutely, with bit-identical output.
+
+4. Full compass sweep (CAM_AZ 0..315, @1024 raw): transposed beats baseline
+   ABSOLUTELY at every azimuth (tr-j1/base-j1 = 0.41–0.62). The tax
+   redistributes (worst transposed Δ +9.6 at AZ45/225 — the azimuths that
+   were previously cheapest) but every absolute frame time improves.
+5. SD0.5 @1024: Δ+0.18, absolutes 71/78 → 38.8/39.0 (1.8× faster).
+
+### 26.2 The GL-side composition hunt (Plan A) — results
+
+The §25.4 bisection ran first and REFUTED the "port the composed structure"
+path, which forced the layout experiment:
+
+- Lean-harness singles all cluster ~Δ+17–21 (target ~+8): SPLIT_TF +19.9,
+  SCALARFLOW +17.4 (byte-exact), EXITAPP=1 +19.2, TFSHAPE +19.4,
+  TFSHAPE+GATE +19.7. Nothing approaches appgl_parity's +7.8.
+- Inverse direction (appgl_parity ablations, PAR_* knobs): NOGATE +6.6,
+  NOSCALE +8.2, NOINCR +7.2 — gate/scale/incremental-position are inert.
+  LEANLOOP (swap loop body for lean mechanics) jumps to +12.6±0.2 — the
+  exit/break structure carries real weight ON GL — but ONETAP/FULL variants
+  were march-length-confounded (TF_FACTOR=4 in parity's LUT saturates rays:
+  meanIter 81.3 vs harness 86.5). Treat those numbers as upper bounds.
+- **MSL non-transfer**: the composed structure barely moves Metal
+  (APSTEP +19.6, MANTRI +20.7 vs lean +22.3) while GL swings +7.8↔+15.6
+  inside one program. The cheapness is substantially a GLSL-codegen
+  phenomenon plus a layout effect GL gets for free from its opaque tiling.
+  This is the §25.4 expectation-calibration outcome ("if an ingredient
+  transfers on GL but not MSL...") — recorded.
+
+NOTE: divergent_tail's earlier "axis permutation: ratio unchanged" (argv[15])
+was a CONTROL (volume AND eye/dir permuted together = relabeling); today's
+experiment moves DATA while fixing the camera — no contradiction.
+
+Also fixed en route: env collision with TestMetalScenes' pre-existing scene-
+level `VTK_METAL_TEST_TRANSPOSE` vtkImagePermute hook → production knob is
+`VTK_METAL_TEST_VOLTRANSPOSE`. The two must not be combined.
+
+### 26.3 Implementation (production)
+
+- `vtkMetalGPUVolumeRayCastMapper.h`: `VolumeFeature_VolTransposed = 1u<<31`,
+  member `VolumeTextureTransposed`.
+- Mapper: CPU blocked x<->z transpose of the U8 single-component staging
+  bytes (both upload paths), swapped upDims/upBytesPerRow/upBytesPerImage,
+  blit strides keyed on `(rg8Pair || volTransposed)`; featureMask bit at both
+  builder sites; `fc_volTransposed` constant; minmax/normals kernel uniforms
+  carry `volTransposed` and swizzle their data-space sample coords.
+- `MetalShaders.metal`: `fc_volTransposed [[function_constant(33)]]`;
+  `sampleVolumeScalar` pre-swizzles `pos=pos.zyx` (covers all interpolation
+  variants incl mv1 8-tap; RG8Pair excluded — mutual with transpose);
+  texelCount un-swizzled so ctpScale/ctpOffset/evalStep stay original-space;
+  rawScalar4 sites swizzle; minmax/normals kernels swizzle via uniform flag.
+- Mutually exclusive with `VTK_METAL_TEST_RG8` (pair indexing assumes
+  untransposed depth). Upload cost: one blocked CPU transpose (~seconds,
+  upload-time only).
+
+TEMP debug instrumentation added (env-gated, inert by default; revert before
+any production-facing landing per §25.7): `[TR]`/`[TEXCRE]` stderr prints,
+TR_DUMP/TR_GPU slice-dump probes (CPU + GPU readback), PROBE_RAW raw-plane
+probe branch, mask hex print in GetOrCreateVolumePipeline.
+
+New harness knobs this session: `TRANSPOSE`, `AZ0` (static camera azimuth;
+GL+Metal), `APSTEP`, `MANTRI`, `TFSHAPE`, `GATE`, `SCALARFLOW`, `EXITAPP`,
+`FSDUMP`; appgl_parity `PAR_NOGATE/PAR_NOSCALE/PAR_NOINCR/PAR_LEANTF/
+PAR_LEANLOOP/PAR_LN_*/PAR_LN_FULL`.
+
+### 26.5 Regression matrix completed (2026-08-22 late night): ONE repeatable regression found
+
+All cells @2048/SD4 raw (MINMAX=0/ACCEL=0/slabs=1/IGN_JITTER=0), interleaved
+order-alternated pairs, same camera both arms:
+
+| cell | baseline j0/j1 (Δ) | transposed j0/j1 (Δ) | verdict |
+|---|---|---|---|
+| oblique SD4 | 43.3/66.1 (+22.8) | 20.2/22.2 (+2.0) | ✅ wins big |
+| oblique SD0.5 | 118.4/122.6 (+4.2) | 102.1/102.4 (+0.25) | ✅ wins (RG8 paid +35% here) |
+| 4096² SD4 | 66.7/84.8 (+18.1) | 51.7/54.1 (+2.4) | ✅ wins |
+| axial z (CAM_AXIS) | 42.1/103.0 (**+60.9**) | 42.7/43.7 (+1.1) | ✅ kills hidden catastrophic tax (2.35× faster j1) |
+| coronal y (CAM_AXIS) | 31.4/33.1 (+1.7) | 31.3/32.0 (+0.7) | ✅ tie/better |
+| **sagittal x (CAM_AXIS)** | 31.9/32.8 (+0.9) | 30.9/36.2 (**+5.2**) | ❌ **j1 +10%, repeatable** |
+
+The sagittal regression is the predicted tax relocation: marching along
+original-X now runs along texture-depth' (512 extent), the disfavored
+direction post-transpose — same mechanism as the AZ45/225 redistribution.
+Net user-visible cost at worst case: +3.4 ms/frame on x-only views, against
+−60 ms on axial and −44 ms on the oblique interactive path. Note also the
+baseline's own hidden axial tax (+61 ms!) that no prior benchmark table had
+caught (§18's "axial z 11.43 ms" used a different geometry convention).
+
+New env: `VTK_METAL_TEST_CAM_AXIS=x|y|z` (TEMP-DIAG in TestMetalScenes.h,
+exact axis-aligned views for §18-style cells).
+
+GL references for the same cells (@2048/SD4 raw, --backend gl, 2 rounds each;
+GL has no VOLTRANSPOSE equivalent):
+
+| axis | GL j0 | GL j1 | GL Δ |
+|---|---|---|---|
+| axial z | 51.47 | 95.41 | **+43.94** |
+| coronal y | 41.57 | 44.11 | +2.54 |
+| sagittal x | 42.39 | 44.99 | +2.60 |
+
+Three-way j1 standing per axis cell:
+
+| axis | GL | base Metal | tr Metal |
+|---|---|---|---|
+| axial z | 95.4 | 103.0 (**M/GL 1.08** — was losing!) | **43.8 (0.46)** |
+| coronal y | 44.1 | 33.1 (0.75) | **32.0 (0.73)** |
+| sagittal x | 45.0 | 32.8 (0.73) | 36.2 (**0.80**, despite regression) |
+
+Even at the sagittal worst case transposed stays 20% under GL; on axial it
+converts a LOSING cell into a 2.2× win.
+
+Visual verification (12 exports @2048² jittered, /tmp/png_review/ sheets):
+M-transposed ≡ M-baseline pixel-identical at all four views (max Δ=0);
+GL-vs-Metal residuals unchanged vs pre-port (oblique mean|d|=0.064 ==
+§6.3's exact value). Minmax-ON render parity: near-identical (mean|d|=0.0005,
+nine >1LSB px of 480K, max Δ9 — macrocell edge-rounding).
+
+### 26.6 HANDOFF — next work
+
+1. **Default-enable decision**: `VTK_METAL_TEST_VOLTRANSPOSE` needs wider
+   dataset coverage before becoming default (other studies/orientations/
+   presets). Validation so far is single-dataset IMRToraceAddome U8.
+2. **Sagittal/x-march residual (+10% j1)**: root cause = march along
+   original-X runs along texture-depth' post-transpose (relocated tax).
+   Options: accept+document (+3.4 ms worst case vs −60 ms axial gain);
+   Instruments DRAM counters to confirm directly (§22 item 6, still open);
+   ask Apple about depth-extent tiling. Do NOT runtime-gate representations
+   (§25.5 reasoning applies).
+3. **Variant/config coverage**: all validation ran on mv0 (the TEMP-REPRO
+   pin). Other march variants route through `sampleVolumeScalar` so they
+   should inherit the fix, but smoke-run mv9 + shading-on configs before
+   defaulting. Shading-on exercises the normals-kernel swizzle path
+   (code-reviewed, not yet image-diffed).
+4. **GPU transpose pass**: the CPU blocked transpose costs seconds at load
+   for ~450 MB volumes; a compute-kernel transpose would remove it (nice
+   for large datasets / reloads).
+5. **RG8 interplay**: mutual exclusion documented (pair indexing assumes
+   untransposed depth). With transpose winning obliquely AND axially, RG8's
+   original use case is superseded; keep opt-in or consider retirement.
+6. **TEMP instrumentation inventory** (env-gated, revert before any
+   production-facing landing): `[TR]`/`[TEXCRE]` prints, TR_DUMP/TR_GPU
+   slice probes, PROBE_RAW branch + mapper negation, MARCH_DEBUG mask print,
+   CAM_AXIS env (useful diagnostics — decide keep vs revert).
+7. **Apple-report exhibit**: two uploads, bit-identical renders, 10×
+   jitter-delta difference + the axial hidden-tax discovery. The §25 Plan-A
+   composition hunt is superseded/moot (kept in git history).
+
+
+### 26.4 Verdict
+
+The task is closed on equal footing: with matched bytes and matched march,
+Metal's raw-march jitter Δ drops from +22.8 to +2.0 ms @2048 oblique —
+BELOW composed-GL (+12.7) — and wins or ties every measured cell absolutely
+EXCEPT one: sagittal/x-axis views pay a repeatable ~+10% j1 regression
+(§26.5) — the relocated tax, bounded at +3.4 ms/frame against −60 ms on
+axial and −44 ms on the oblique interactive path. The interactive deficit
+was never shader physics: it was a texture-layout choice. Remaining
+follow-ups (optional): GPU-side transpose pass instead of CPU; axis-view
+(pitch) bench cells; decide whether VOLTRANSPOSE should ship
+enabled-by-default after wider dataset coverage; Apple-report exhibit is
+now trivial
+(two uploads, one bit-identical render, 10× jitter delta difference).
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).

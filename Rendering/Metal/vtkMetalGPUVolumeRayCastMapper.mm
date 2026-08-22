@@ -396,6 +396,24 @@ static bool VolumeRg8PairActive()
   return rg8;
 }
 
+// Transposed volume representation from VTK_METAL_TEST_VOLTRANSPOSE (see the
+// VolumeFeature_VolTransposed docs). Single-component 8-bit direct-upload
+// volumes only — the same constraint class as the RG8 repack (no conversion
+// pipeline, no multi-component expansion may run before the transpose).
+static bool VolumeTransposedActive()
+{
+  // NOTE: distinct from TestMetalScenes' older scene-level
+  // VTK_METAL_TEST_TRANSPOSE diagnostic (vtkImagePermute at data load).
+  // This one transposes INSIDE the upload and swizzles fetches in-shader,
+  // so world-space rendering stays identical (byte parity).
+  static const bool tr = [] {
+    if (const char* v = getenv("VTK_METAL_TEST_VOLTRANSPOSE"))
+      return std::atoi(v) != 0;
+    return false;
+  }();
+  return tr;
+}
+
 // Composite slab count from VTK_METAL_TEST_NUM_SLABS (default 8). N > 1 splits
 // each ray into N ray-length-fraction index ranges (ceil(j*maxSteps/N) ..
 // ceil((j+1)*maxSteps/N) for j in [0,N)) and renders N front-to-back passes
@@ -646,9 +664,10 @@ struct MinMaxComputeUniforms {
   float scalarScale;
   float _pad;
   uint32_t opacityPrefix[257];
+  int32_t volTransposed;
 };
 
-static_assert(sizeof(MinMaxComputeUniforms) == 4*6 + 4 + 4 + 4 + 4 + 257*4,
+static_assert(sizeof(MinMaxComputeUniforms) == 4*6 + 4 + 4 + 4 + 4 + 257*4 + 4,
   "MinMaxComputeUniforms size must match Metal struct");
 
 namespace
@@ -1078,6 +1097,9 @@ static id<MTLTexture> NewTexture3D(
   desc.storageMode = storage;
   desc.allowGPUOptimizedContents = allowGPUOptimizedContents;
   id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+  if (getenv("VTK_METAL_TEST_TR_DUMP"))
+    fprintf(stderr, "[TEXCRE] %dx%dx%d fmt=%u usage=%u\n",
+      (int)width, (int)height, (int)depth, (unsigned)format, (unsigned)usage);
   [desc release];
   return tex;
 }
@@ -1327,10 +1349,11 @@ struct NormalComputeUniforms
   float scalarBias;
   float gradNormFactor;
   float invBoundsX, invBoundsY, invBoundsZ;
+  int32_t volTransposed;
 };
 
-static_assert(sizeof(NormalComputeUniforms) == 48,
-  "NormalComputeUniforms must match Metal struct (48 bytes)");
+static_assert(sizeof(NormalComputeUniforms) == 52,
+  "NormalComputeUniforms must match Metal struct (52 bytes)");
 
 static NormalComputeUniforms MakeNormalComputeUniforms(
   const int dims[3],
@@ -2282,6 +2305,49 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
     }
   }
 
+  // Transposed repack (see VolumeTransposedActive): upload the volume
+  // x<->z transposed so the slice axis occupies the texture's x extent.
+  // Metal's private 3D tiling is axis-biased; with the slice axis as texture
+  // depth, trilinear z-pair fetches under per-pixel jitter phase scatter pay
+  // a large DRAM tax (2026-08-22 root cause). The shader maps coordinates
+  // back via .zyx (fc_volTransposed).
+  bool volTransposed = false;
+  std::vector<uint8_t> transStorage;
+  if (!gpuConversionUsed && !rg8Pair && VolumeTransposedActive() &&
+      dataType == VTK_UNSIGNED_CHAR && numComponents == 1)
+  {
+    volTransposed = true;
+    upDims[0] = dims[2];
+    upDims[2] = dims[0];
+    const NSUInteger elemSize = static_cast<NSUInteger>(fmtInfo.BytesPerComponent) *
+      actualComponents;
+    upBytesPerRow = static_cast<NSUInteger>(dims[2]) * elemSize;
+    upBytesPerImage = upBytesPerRow * static_cast<NSUInteger>(dims[1]);
+    transStorage.resize(totalBytes);
+    // new(x'=z, y, z'=x): T[((x*D + y)*W + z)] = V[((z*H + y)*W + x)]
+    const int BS = 32;
+    const uint8_t* in = static_cast<const uint8_t*>(scalars->GetVoidPointer(0));
+    uint8_t* out = transStorage.data();
+    for (int xb = 0; xb < dims[0]; xb += BS)
+      for (int zb = 0; zb < dims[2]; zb += BS)
+        for (int yb = 0; yb < dims[1]; yb += BS)
+        {
+          const int xe = std::min(xb + BS, dims[0]);
+          const int ze = std::min(zb + BS, dims[2]);
+          const int ye = std::min(yb + BS, dims[1]);
+          for (int x = xb; x < xe; ++x)
+            for (int z = zb; z < ze; ++z)
+              for (int y = yb; y < ye; ++y)
+                std::memcpy(
+                  out + (((static_cast<size_t>(x) * dims[1] + y) * dims[2]) + z) * elemSize,
+                  in + (((static_cast<size_t>(z) * dims[1] + y) * dims[0]) + x) * elemSize,
+                  elemSize);
+        }
+    fprintf(stderr, "[TR] direct path: transposed dims %dx%dx%d -> %dx%dx%d\n",
+      dims[0], dims[1], dims[2], upDims[0], upDims[1], upDims[2]);
+  }
+  this->VolumeTextureTransposed = volTransposed;
+
   if (!gpuConversionUsed)
   {
     if (VolumeRg8PairActive())
@@ -2359,6 +2425,10 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
       {
         std::memcpy(uploadPointer, rg8Storage.data(), rg8Storage.size());
       }
+      else if (volTransposed)
+      {
+        std::memcpy(uploadPointer, transStorage.data(), transStorage.size());
+      }
       else
       {
         std::memcpy(uploadPointer, scalars->GetVoidPointer(0), totalBytes);
@@ -2400,11 +2470,11 @@ bool vtkMetalGPUVolumeRayCastMapper::CreateGlobalVolumeTexture(
 
     id<MTLCommandBuffer> uploadCmdBuf = [queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
-    [blit copyFromBuffer:stagingBuf
-            sourceOffset:0
-     sourceBytesPerRow:(rg8Pair ? upBytesPerRow : bytesPerRow)
-   sourceBytesPerImage:(rg8Pair ? upBytesPerImage : bytesPerImage)
-            sourceSize:MTLSizeMake(upDims[0], upDims[1], upDims[2])
+      [blit copyFromBuffer:stagingBuf
+              sourceOffset:0
+       sourceBytesPerRow:(rg8Pair || volTransposed ? upBytesPerRow : bytesPerRow)
+     sourceBytesPerImage:(rg8Pair || volTransposed ? upBytesPerImage : bytesPerImage)
+               sourceSize:MTLSizeMake(upDims[0], upDims[1], upDims[2])
              toTexture:tex
       destinationSlice:0
       destinationLevel:0
@@ -2767,6 +2837,7 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureGradientNormalTexture(
       (fabs(cellSpacing[0]) + fabs(cellSpacing[1]) + fabs(cellSpacing[2])) / 3.0;
     NormalComputeUniforms u = MakeNormalComputeUniforms(
       dims, this->ScalarRange, this->ScalarNormalizationFactor, vb.Size, avgSpacing);
+    u.volTransposed = this->VolumeTextureTransposed ? 1 : 0;
 
     id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
     cmdBuf.label = @"VTK Volume Normal Compute";
@@ -3511,7 +3582,81 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
          }
        }
 
-       if (!gpuConversionUsed)
+       // Transposed repack (see VolumeTransposedActive): upload the volume
+       // x<->z transposed so the slice axis occupies the texture's x extent.
+       // Metal's private 3D tiling is axis-biased; with the slice axis as
+       // texture depth, trilinear z-pair fetches under per-pixel jitter
+       // phase scatter pay a large DRAM tax (2026-08-22 root cause). The
+       // shader maps coordinates back via .zyx (fc_volTransposed).
+       bool volTransposed = false;
+       std::vector<uint8_t> transStorage;
+       if (!gpuConversionUsed && !rg8Pair && VolumeTransposedActive() &&
+           dataType == VTK_UNSIGNED_CHAR && numComponents == 1)
+       {
+         volTransposed = true;
+         upDims[0] = dims[2];
+         upDims[2] = dims[0];
+         const NSUInteger elemSize = static_cast<NSUInteger>(fmtInfo.BytesPerComponent) *
+           actualComponents;
+         upBytesPerRow = static_cast<NSUInteger>(dims[2]) * elemSize;
+         upBytesPerImage = upBytesPerRow * static_cast<NSUInteger>(dims[1]);
+         transStorage.resize(totalBytes);
+         // new(x'=z, y, z'=x): T[((x*D + y)*W + z)] = V[((z*H + y)*W + x)]
+         // (element indices; element size elemSize bytes)
+         const int BS = 32;
+         const uint8_t* in = static_cast<const uint8_t*>(scalars->GetVoidPointer(0));
+         uint8_t* out = transStorage.data();
+         for (int xb = 0; xb < dims[0]; xb += BS)
+           for (int zb = 0; zb < dims[2]; zb += BS)
+             for (int yb = 0; yb < dims[1]; yb += BS)
+             {
+               const int xe = std::min(xb + BS, dims[0]);
+               const int ze = std::min(zb + BS, dims[2]);
+               const int ye = std::min(yb + BS, dims[1]);
+               for (int x = xb; x < xe; ++x)
+                 for (int z = zb; z < ze; ++z)
+                   for (int y = yb; y < ye; ++y)
+                     std::memcpy(
+                       out + (((static_cast<size_t>(x) * dims[1] + y) * dims[2]) + z) * elemSize,
+                       in + (((static_cast<size_t>(z) * dims[1] + y) * dims[0]) + x) * elemSize,
+                       elemSize);
+             }
+         fprintf(stderr, "[TR] UpdateVolumeTexture: transposed dims %dx%dx%d -> %dx%dx%d\n",
+           dims[0], dims[1], dims[2], upDims[0], upDims[1], upDims[2]);
+         // TEMP-DIAG (VTK_METAL_TEST_TR_DUMP): verify repacked bytes. Under
+         // the mapping T(i,j,k) = V(k, j, i), T's width-i slice at i=D/2 must
+         // equal V's axial slice D/2 exactly.
+         if (getenv("VTK_METAL_TEST_TR_DUMP"))
+         {
+           const int W = dims[0], H = dims[1], D = dims[2];
+           const uint8_t* vin = static_cast<const uint8_t*>(scalars->GetVoidPointer(0));
+           const int dslice = D / 2;
+           FILE* f1 = fopen("/tmp/tr_orig_slice.ppm", "wb");
+           FILE* f2 = fopen("/tmp/tr_tran_slice.ppm", "wb");
+           if (f1 && f2)
+           {
+             fprintf(f1, "P6\n%d %d\n255\n", W, H);
+             fprintf(f2, "P6\n%d %d\n255\n", W, H);
+             for (int y = 0; y < H; ++y)
+               for (int x = 0; x < W; ++x)
+               {
+                 uint8_t a = vin[((static_cast<size_t>(dslice) * H) + y) * W + x];
+                 uint8_t b = transStorage[static_cast<size_t>(x) * upBytesPerImage +
+                                          static_cast<size_t>(y) * upBytesPerRow + dslice];
+                 uint8_t pa[3] = { a, a, a };
+                 uint8_t pb[3] = { b, b, b };
+                 fwrite(pa, 1, 3, f1);
+                 fwrite(pb, 1, 3, f2);
+               }
+             fprintf(stderr, "[TR] dumped /tmp/tr_orig_slice.ppm /tmp/tr_tran_slice.ppm\n");
+           }
+           if (f1) fclose(f1);
+           if (f2) fclose(f2);
+         }
+       }
+       this->VolumeTextureTransposed = volTransposed;
+
+        if (!gpuConversionUsed)
        {
          if (VolumeRg8PairActive())
            fprintf(stderr, "[RG8] UpdateVolumeTexture: rg8Pair=%d dims %dx%dx%d -> upDims %dx%dx%d staging=%zu\n",
@@ -3584,6 +3729,10 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           {
             std::memcpy(uploadPointer, rg8Storage.data(), rg8Storage.size());
           }
+          else if (volTransposed)
+          {
+            std::memcpy(uploadPointer, transStorage.data(), transStorage.size());
+          }
           else
           {
             std::memcpy(uploadPointer, scalars->GetVoidPointer(0), totalBytes);
@@ -3612,7 +3761,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
           static_cast<NSUInteger>(upDims[1]),
           static_cast<NSUInteger>(upDims[2]),
           MTLTextureUsageShaderRead,
-          MTLStorageModePrivate,
+          getenv("VTK_METAL_TEST_TR_GPU") ? MTLStorageModeShared
+                                          : MTLStorageModePrivate,
           VolumeGPUOptimizedContents());
         if (!tex)
         {
@@ -3626,8 +3776,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
       id<MTLBlitCommandEncoder> blit = [uploadCmdBuf blitCommandEncoder];
       [blit copyFromBuffer:stagingBuf
               sourceOffset:0
-       sourceBytesPerRow:(rg8Pair ? upBytesPerRow : bytesPerRow)
-     sourceBytesPerImage:(rg8Pair ? upBytesPerImage : bytesPerImage)
+       sourceBytesPerRow:(rg8Pair || volTransposed ? upBytesPerRow : bytesPerRow)
+     sourceBytesPerImage:(rg8Pair || volTransposed ? upBytesPerImage : bytesPerImage)
               sourceSize:MTLSizeMake(upDims[0], upDims[1], upDims[2])
                toTexture:tex
         destinationSlice:0
@@ -3635,6 +3785,36 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateVolumeTexture(
        destinationOrigin:MTLOriginMake(0, 0, 0)];
       [blit endEncoding];
       [uploadCmdBuf commit];
+      if (getenv("VTK_METAL_TEST_TR_DUMP") && volTransposed)
+      {
+        // TEMP-DIAG: read the GPU texture back (Shared storage) and dump its
+        // mid-width plane for comparison against /tmp/tr_orig_slice.ppm.
+        [uploadCmdBuf waitUntilCompleted];
+        const int W = dims[0], H = dims[1];
+        const int dslice = upDims[0] / 2;
+        std::vector<uint8_t> gpu(totalBytes);
+        [( __bridge id<MTLTexture>)this->VolumeTexture
+            getBytes:gpu.data() bytesPerRow:upBytesPerRow
+        bytesPerImage:upBytesPerImage
+            fromRegion:MTLRegionMake3D(0, 0, 0, upDims[0], upDims[1], upDims[2])
+            mipmapLevel:0];
+        FILE* f3 = fopen("/tmp/tr_gpu_slice.ppm", "wb");
+        if (f3)
+        {
+          fprintf(f3, "P6\n%d %d\n255\n", W, H);
+          for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+            {
+              size_t off = static_cast<size_t>(x) * upBytesPerImage +
+                           static_cast<size_t>(y) * upBytesPerRow + dslice;
+              uint8_t v = gpu[off];
+              uint8_t pv[3] = { v, v, v };
+              fwrite(pv, 1, 3, f3);
+            }
+          fclose(f3);
+          fprintf(stderr, "[TR] dumped /tmp/tr_gpu_slice.ppm\n");
+        }
+      }
       // Release our reference to the staging buffer. Metal keeps the buffer
       // alive internally until the command buffer completes.
       [stagingBuf release];
@@ -5123,6 +5303,7 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     u.scalarMin = static_cast<float>(this->ScalarRange[0] / normFactor);
     u.scalarScale = static_cast<float>(255.0 * normFactor / scalarRange);
     u._pad = 0.0f;
+    u.volTransposed = this->VolumeTextureTransposed ? 1 : 0;
     memcpy(u.opacityPrefix, opacityPrefix, sizeof(opacityPrefix));
 
     // --- Reuse or create persistent MinMax texture ---
@@ -6423,6 +6604,14 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     [constants setConstantValue:&volRg8 type:MTLDataTypeBool
                        withName:@"fc_volRg8"];
 
+    // Transposed volume representation experiment (fc_volTransposed): the
+    // texture stores x<->z transposed; scalar fetches map coords via .zyx.
+    BOOL volTransposed = (featureMask & VolumeFeature_VolTransposed) ? YES : NO;
+    if (getenv("VTK_METAL_TEST_MARCH_DEBUG"))
+      fprintf(stderr, "[march] mask=0x%08x\n", featureMask);
+    [constants setConstantValue:&volTransposed type:MTLDataTypeBool
+                       withName:@"fc_volTransposed"];
+
     // Blend mode function constant: 0=composite, 1=MIP, 2=MinIP, 3=AverageIP,
     // 4=additive (vtkVolumeMapper::BlendMode). Encoded in the feature mask so
     // each blend mode gets its own specialized pipeline.
@@ -6447,8 +6636,8 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
         renderToTexture, slabMode,
         (marchVariant >= 6 && blendMode == 0 && !cropping && !mask && !blanking &&
          !rectilinear && !transfer2D && !independentComp && !dependentRGBA && !dependentLA));
-    fprintf(stderr, "[march] fc_doExit=%d fc_volRg8=%d\n", marchDoExit ? 1 : 0,
-      volRg8 ? 1 : 0);
+    fprintf(stderr, "[march] fc_doExit=%d fc_volRg8=%d fc_volTransposed=%d\n",
+      marchDoExit ? 1 : 0, volRg8 ? 1 : 0, volTransposed ? 1 : 0);
 
     fragFunc = [library newFunctionWithName:fragName
                              constantValues:constants
@@ -6879,6 +7068,13 @@ void vtkMetalGPUVolumeRayCastMapper::DrawBlocksFullscreen(
     featureMask |= VolumeFeature_VolRg8;
   }
 
+  // Transposed volume representation experiment (VTK_METAL_TEST_TRANSPOSE):
+  // dedicated feature bit so the swizzled-fetch march gets its own pipeline.
+  if (VolumeTransposedActive())
+  {
+    featureMask |= VolumeFeature_VolTransposed;
+  }
+
   // Composite slab tiling (VTK_METAL_TEST_NUM_SLABS): only on the blended
   // direct path (useDirectPipeline), and only for composite blending — the
   // (ONE, ONE_MINUS_SRC_ALPHA) accumulation of per-slab partial composites is
@@ -7216,8 +7412,13 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   if (getenv("VTK_METAL_TEST_NOPREFETCH")) uniforms._padCropFlags[2] = 1.0f;
 
   // TEMP probe z (_padCropFlags[3], VTK_METAL_TEST_PROBE_Z).
+  // VTK_METAL_TEST_PROBE_RAW=1 negates the value -> raw texture-plane probe.
   if (const char* pzv = getenv("VTK_METAL_TEST_PROBE_Z"))
+  {
     uniforms._padCropFlags[3] = static_cast<float>(std::atof(pzv));
+    if (getenv("VTK_METAL_TEST_PROBE_RAW"))
+      uniforms._padCropFlags[3] = -uniforms._padCropFlags[3];
+  }
 
   vtkNew<vtkMatrix4x4> modelMatrix;
   vol->GetModelToWorldMatrix(modelMatrix);
@@ -7896,6 +8097,13 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   if (VolumeRg8PairActive())
   {
     featureMask |= VolumeFeature_VolRg8;
+  }
+
+  // Transposed volume representation experiment (VTK_METAL_TEST_TRANSPOSE):
+  // dedicated feature bit so the swizzled-fetch march gets its own pipeline.
+  if (VolumeTransposedActive())
+  {
+    featureMask |= VolumeFeature_VolTransposed;
   }
 
   // Hardware-selection support (vtkHardwareSelector): during a selection render

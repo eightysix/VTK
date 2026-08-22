@@ -1314,6 +1314,35 @@ inline void BuildDICOMVolumeScene(vtkRenderer* renderer, BackendKind b)
     renderer->GetActiveCamera()->Dolly(std::atof(dollyEnv));
     renderer->ResetCameraClippingRange();
   }
+  // TEMP-DIAG (VTK_METAL_TEST_CAM_AXIS=x|y|z): exact axis-aligned view
+  // (sagittal / coronal / axial) — the §18 RG8 regression-matrix geometry.
+  // Places the camera on the named world axis through the focal point.
+  if (const char* axEnv = std::getenv("VTK_METAL_TEST_CAM_AXIS"))
+  {
+    vtkCamera* cam = renderer->GetActiveCamera();
+    double f[3];
+    cam->GetFocalPoint(f);
+    double p[3];
+    cam->GetPosition(p);
+    double dir[3] = { p[0] - f[0], p[1] - f[1], p[2] - f[2] };
+    double dist = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+    switch (axEnv[0])
+    {
+      case 'x':
+        cam->SetPosition(f[0] + dist, f[1], f[2]);
+        cam->SetViewUp(0, 0, 1);
+        break;
+      case 'y':
+        cam->SetPosition(f[0], f[1] + dist, f[2]);
+        cam->SetViewUp(0, 0, 1);
+        break;
+      case 'z':
+        cam->SetPosition(f[0], f[1], f[2] + dist);
+        cam->SetViewUp(0, 1, 0);
+        break;
+    }
+    renderer->ResetCameraClippingRange();
+  }
 }
 
 // ---- Complexity-scaling benchmark scenes ----------------------------------

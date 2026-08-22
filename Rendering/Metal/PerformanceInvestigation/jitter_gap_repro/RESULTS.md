@@ -289,3 +289,66 @@ opacity, 1024xR32F opacity LUT shape, per-sample scale/bias, sign-gated
 texMax OOB test, currentT/tPM break form, or simply their combination.
 For the Apple-report purpose the boundary is established: two shaders,
 one context, one geometry, 13 ms of jitter-delta difference.
+
+## 2026-08-22 (night): TRANSPOSED UPLOAD KILLS THE TAX — root cause + production port
+
+Plan-A bisection first REFUTED the composition-port path:
+
+| GL probe (@1024/SD4, WARMUP=30, SELECT=g0g1, ROUNDS=3) | GL jitter Δ |
+|---|---|
+| lean baseline (this session) | +24.8±3.3 / later rounds ~+18–20 |
+| SPLIT_TF (probe 1: opacity-gated color fetch) | +19.91±2.51 |
+| SCALARFLOW=1 (per-sample uniform scale/bias + vec4 splat, byte-exact) | **+17.43±2.15** |
+| EXITAPP=1 (app break-pair form as never-firing dups) | +19.18±4.30 |
+| TFSHAPE=1 (1024 R32F opacity + RGB32F color, float tables) | +19.40±5.66 |
+| TFSHAPE=1 GATE=1 | +19.74±1.64 |
+
+Inverse ablations on fixed appgl_parity (+7.7..8.2 default): PAR_NOGATE +6.6,
+PAR_NOSCALE +8.2, PAR_NOINCR +7.2 — inert. PAR_LEANLOOP (lean body inside
+composed program) jumps to +12.6±0.2 — exit structure matters ON GL — but
+ONETAP/FULL variants are march-length-confounded (TF_FACTOR=4 saturates rays:
+parity meanIter 81.3 vs harness 86.5; covered 43% vs 40.6%). Caveat recorded;
+treat those as upper bounds.
+
+MSL non-transfer: APSTEP=1 (verbatim composed-style loop on Metal — two-tap
+float LUTs, gate, incremental pos, post-sample OOB/tPM exits; march stats
+preserved) only −2.7 ms; MANTRI=1 (manual z-split trilinear via two
+XY-bilinear taps at slice centers + lerp; image max Δ=0) −1.6 ms. Metal is
+structure-insensitive where GL swings 2× ⇒ layout experiment.
+
+**TRANSPOSE=1** (CPU x<->z transpose at upload + pos.zyx swizzle in MSL;
+renders byte-identical, max Δ=0):
+
+| cell | Metal baseline j0/j1/Δ | transposed j0/j1/Δ |
+|---|---|---|
+| 1024/SD4 | 29.5/51.9/+22.28±1.12 | **16.74/18.52/+1.78±0.18** |
+| 2048/SD4 | 41.91/64.97/+23.06±1.90 | **14.28/19.51/+5.23±0.13** |
+| 1024/SD0.5 | 83.72/90.99/+7.27 | **36.17/37.15/+0.98±0.10** |
+| 1024/SD8 | — | 8.17/12.43/+4.26 |
+
+No regressing cell found. Mechanism: Metal's private 3D tiling is axis-biased
+— slices-as-depth pays trilinear-z-pair DRAM tax under phase scatter;
+slices-as-width collapses it. Explains §15 NEAREST tie, §17 RG8 flip,
+§19 azimuth dependence simultaneously.
+
+Production port shipped behind `VTK_METAL_TEST_VOLTRANSPOSE=1`
+(fc_volTransposed): byte-identical renders (j0 and j1), raw-march @2048/SD4
+j0 43.3→20.2, j1 66.1→22.2, Δ +22.8→+2.0 (M/GL j1 ~0.42 vs composed-GL
++12.7); minmax-on path improves too (Δ+0.73). Full CAM_AZ compass @1024:
+transposed beats baseline absolutely at every azimuth (j1 ratio 0.41–0.62).
+Mutually exclusive with VTK_METAL_TEST_RG8 and with TestMetalScenes' older
+scene-level VTK_METAL_TEST_TRANSPOSE permute hook.
+
+New knobs: jitter_gap_repro TRANSPOSE/AZ0/APSTEP/MANTRI/TFSHAPE/GATE/
+SCALARFLOW/EXITAPP/FSDUMP; appgl_parity PAR_NOGATE/PAR_NOSCALE/PAR_NOINCR/
+PAR_LEANTF/PAR_LEANLOOP/PAR_LN_NOGATE/PAR_LN_NOSCALE/PAR_LN_ONETAP/
+PAR_LN_FULL.
+
+Addendum (same night): axis-view cells via app `VTK_METAL_TEST_CAM_AXIS`,
+GL references, and 2048² PNG exports — full three-way matrix in
+HARNESS_VS_APP_GAP.md §26.5. Headline: transposed beats baseline absolutely
+at SD0.5@2048 (+4.2→+0.25), 4096² (+18.1→+2.4), axial z (kills hidden +61ms
+tax; M/GL j1 1.08→0.46); ONE repeatable regression at sagittal x
+(j1 +10%, relocated depth'-march tax; still 0.80× vs GL). M-transposed ≡
+M-baseline pixel-identical on all 12 exported renders (max Δ=0); minmax-on
+parity near-identical (9 px >1LSB of 480K). Handoff in §26.6.

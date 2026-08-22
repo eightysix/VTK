@@ -1924,8 +1924,9 @@ struct NormalComputeUniforms {
     float scalarBias;
     float gradNormFactor;
     float invBoundsX, invBoundsY, invBoundsZ;
+    int volTransposed;
 };
-static_assert(sizeof(NormalComputeUniforms) == 48, "NormalComputeUniforms must be 48 bytes");
+static_assert(sizeof(NormalComputeUniforms) == 52, "NormalComputeUniforms must be 52 bytes");
 
 // Each thread computes one voxel's gradient from 6 neighbors in the volume
 // texture (linear clamp, safe at borders) and stores encoded normal + magnitude.
@@ -1943,12 +1944,19 @@ kernel void volume_compute_normals(
     float3 gs = float3(u.gsX, u.gsY, u.gsZ);
 
     // Central differences (6 texel fetches — same as computeGradientFast)
-    float sPX = volume.sample(sVolume, pos + float3(gs.x, 0, 0), level(0)).r;
-    float sNX = volume.sample(sVolume, pos - float3(gs.x, 0, 0), level(0)).r;
-    float sPY = volume.sample(sVolume, pos + float3(0, gs.y, 0), level(0)).r;
-    float sNY = volume.sample(sVolume, pos - float3(0, gs.y, 0), level(0)).r;
-    float sPZ = volume.sample(sVolume, pos + float3(0, 0, gs.z), level(0)).r;
-    float sNZ = volume.sample(sVolume, pos - float3(0, 0, gs.z), level(0)).r;
+    bool vtr = u.volTransposed != 0;
+    float3 pPX = pos + float3(gs.x, 0, 0);
+    float3 pNX = pos - float3(gs.x, 0, 0);
+    float3 pPY = pos + float3(0, gs.y, 0);
+    float3 pNY = pos - float3(0, gs.y, 0);
+    float3 pPZ = pos + float3(0, 0, gs.z);
+    float3 pNZ = pos - float3(0, 0, gs.z);
+    float sPX = volume.sample(sVolume, vtr ? pPX.zyx : pPX, level(0)).r;
+    float sNX = volume.sample(sVolume, vtr ? pNX.zyx : pNX, level(0)).r;
+    float sPY = volume.sample(sVolume, vtr ? pPY.zyx : pPY, level(0)).r;
+    float sNY = volume.sample(sVolume, vtr ? pNY.zyx : pNY, level(0)).r;
+    float sPZ = volume.sample(sVolume, vtr ? pPZ.zyx : pPZ, level(0)).r;
+    float sNZ = volume.sample(sVolume, vtr ? pNZ.zyx : pNZ, level(0)).r;
 
     float3 rawGrad = float3(sPX - sNX, sPY - sNY, sPZ - sNZ);
     float3 dimsF = float3(float(u.dimX), float(u.dimY), float(u.dimZ));
@@ -2730,6 +2738,18 @@ constant bool fc_doExit [[function_constant(31)]];
 // march's trilinear z-blend is reconstructed in-shader (divergent_tail
 // V24/V32). Dead-code eliminated when clear.
 constant bool fc_volRg8 [[function_constant(32)]];
+// Transposed volume representation experiment (VTK_METAL_TEST_TRANSPOSE=1):
+// the texture uploads x<->z transposed — the slice axis occupies the
+// texture's x extent. Every scalar fetch maps original-orientation coords
+// through .zyx and texelCount un-swizzles below; ctpScale/ctpOffset/evalStep
+// stay expressed over ORIGINAL dims so ray setup is untouched.
+// Root cause (2026-08-22, jitter_gap_repro): Metal's private 3D tiling is
+// axis-biased — with the slice axis as texture depth, trilinear z-pair
+// fetches under per-pixel jitter phase scatter pay a huge DRAM tax
+// (+23 ms jitter delta vs GL's +12 @2048 oblique); transposing collapses it
+// to +5 ms with byte-identical renders. Dead-code eliminated when clear.
+// Mutually exclusive with fc_volRg8 (mapper refuses the combination).
+constant bool fc_volTransposed [[function_constant(33)]];
 
 // ============================================================================
 // Volume Ray Casting Mapper
@@ -3479,6 +3499,14 @@ inline float sampleVolumeScalarRG8Pair(texture3d<float> volTex, float3 pos) {
 }
 
 inline float sampleVolumeScalar(texture3d<float> volTex, float3 pos) {
+  if (fc_volTransposed) {
+    // TRANSPOSE upload: the slice axis lives in the texture's x extent;
+    // original-orientation (x,y,z) maps to texture (z,y,x). The mv1 8-tap
+    // helper below is self-consistent in whatever space it receives (its
+    // dims come from the live texture), so a single entry-point swizzle
+    // covers every interpolation variant.
+    pos = pos.zyx;
+  }
   if (fc_linearInterpolation) {
     if (fc_marchVariant == 1) {
       return sampleVolumeLinear8Tap(volTex, pos);
@@ -4153,8 +4181,14 @@ inline half4 marchVolumeUnified(
   // RG8 pair-pack (fc_volRg8): the texture's z extent is the PAIR count
   // (original slices / 2), so restore the original slice count here — every
   // CTP-adjusted z phase and step below is expressed over it.
-  float texelCountZ = volumeTexture.get_depth() * (fc_volRg8 ? 2.0f : 1.0f);
-  float3 texelCount = float3(volumeTexture.get_width(), volumeTexture.get_height(), texelCountZ);
+  // TRANSPOSE (fc_volTransposed): texture extents hold (D,H,W); un-swizzle to
+  // the ORIGINAL dims so every CTP factor below keeps its data-space meaning.
+  float texelCountZ = volumeTexture.get_depth() *
+    ((fc_volRg8 && !fc_volTransposed) ? 2.0f : 1.0f);
+  float3 texelCount = fc_volTransposed
+    ? float3(volumeTexture.get_depth(), volumeTexture.get_height(),
+             volumeTexture.get_width())
+    : float3(volumeTexture.get_width(), volumeTexture.get_height(), texelCountZ);
   float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
   float3 ctpOffset  = 0.5 / texelCount;
   float3 evalStep = texStep * ctpScale;
@@ -4632,9 +4666,11 @@ inline half4 marchVolumeUnified(
         float4 rawScalar4 = float4(rawScalar, 0.0, 0.0, 0.0);
         if (useIndependentPath) {
           if (fc_linearInterpolation) {
-            rawScalar4 = volumeTexture.sample(sVolume, rectEvalPoint, level(0));
+            rawScalar4 = volumeTexture.sample(sVolume,
+          fc_volTransposed ? rectEvalPoint.zyx : rectEvalPoint, level(0));
           } else {
-            rawScalar4 = volumeTexture.sample(sNearest, rectEvalPoint, level(0));
+            rawScalar4 = volumeTexture.sample(sNearest,
+          fc_volTransposed ? rectEvalPoint.zyx : rectEvalPoint, level(0));
           }
         } else if (fc_dependentRGBA || fc_dependentLA) {
           rawScalar4 = sampleVolumeTexel(volumeTexture, rectEvalPoint);
@@ -5859,9 +5895,11 @@ inline half4 marchVolumeUnified(
     float4 rawScalar4 = float4(rawScalar, 0.0, 0.0, 0.0);
     if (useIndependentPath) {
       if (fc_linearInterpolation) {
-        rawScalar4 = volumeTexture.sample(sVolume, rectEvalPoint, level(0));
+        rawScalar4 = volumeTexture.sample(sVolume,
+          fc_volTransposed ? rectEvalPoint.zyx : rectEvalPoint, level(0));
       } else {
-        rawScalar4 = volumeTexture.sample(sNearest, rectEvalPoint, level(0));
+        rawScalar4 = volumeTexture.sample(sNearest,
+          fc_volTransposed ? rectEvalPoint.zyx : rectEvalPoint, level(0));
       }
     } else if (fc_dependentRGBA || fc_dependentLA) {
       // 4-component dependent RGBA / 2-component dependent LA: color and
@@ -6632,6 +6670,16 @@ fragment VolumeFragmentOut fragment_volume_main(
   {
     float2 uv = (in.position.xy + 0.5) / volumeUniforms.viewportSize;
     float pz = volumeUniforms._padCropFlags[3];
+    // TEMP-DIAG (VTK_METAL_TEST_PROBE_RAW): flags[3] < 0 renders the RAW
+    // texture plane i=|pz| directly — shows what the GPU texture holds,
+    // independent of any swizzle logic.
+    if (pz < -0.25f)
+    {
+      float v = volumeTexture.sample(
+        sVolume, float3(0.5f, uv.y, uv.x), level(0)).r;
+      output.color = float4(float3(v), 1.0);
+      return output;
+    }
     if (pz <= 0.0f) pz = 0.5f;
     float v = fc_volRg8 ? sampleVolumeScalarRG8Pair(volumeTexture, float3(uv, pz))
                         : sampleVolumeScalar(volumeTexture, float3(uv, pz));
@@ -6811,6 +6859,16 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
   {
     float2 uv = (in.position.xy + 0.5) / volumeUniforms.viewportSize;
     float pz = volumeUniforms._padCropFlags[3];
+    // TEMP-DIAG (VTK_METAL_TEST_PROBE_RAW): flags[3] < 0 renders the RAW
+    // texture plane i=|pz| directly — shows what the GPU texture holds,
+    // independent of any swizzle logic.
+    if (pz < -0.25f)
+    {
+      float v = volumeTexture.sample(
+        sVolume, float3(0.5f, uv.y, uv.x), level(0)).r;
+      output.color = float4(float3(v), 1.0);
+      return output;
+    }
     if (pz <= 0.0f) pz = 0.5f;
     float v = fc_volRg8 ? sampleVolumeScalarRG8Pair(volumeTexture, float3(uv, pz))
                         : sampleVolumeScalar(volumeTexture, float3(uv, pz));
@@ -7324,6 +7382,7 @@ struct MinMaxComputeUniforms {
   float scalarScale;              // 255.0 / (ScalarRange[1] - ScalarRange[0])
   float _pad;
   uint  opacityPrefix[257];       // prefix sum: opacityPrefix[i] = count of non-zero opacity entries for indices < i
+  int volTransposed;              // VTK_METAL_TEST_TRANSPOSE: sample coords map via .zyx
 };
 
 kernel void volume_compute_minmax(
@@ -7346,7 +7405,8 @@ kernel void volume_compute_minmax(
     for (uint y = start.y; y < end.y; y++) {
       for (uint x = start.x; x < end.x; x++) {
         float3 pos = (float3(x, y, z) + 0.5) / volDims;
-        float v = volume.sample(sNearest, pos, level(0)).r;
+        float3 tpos = (u.volTransposed != 0) ? pos.zyx : pos;
+        float v = volume.sample(sNearest, tpos, level(0)).r;
         cellMin = min(cellMin, v);
         cellMax = max(cellMax, v);
       }

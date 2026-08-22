@@ -155,6 +155,17 @@ enum VolumeShaderFeatureFlags : uint32_t
   // trilinear z-blend is reconstructed in-shader from ~1.25 XY-bilinear taps
   // (divergent_tail V24/V32). Baked via fc_volRg8; clear by default.
   VolumeFeature_VolRg8 = 1u << 30,
+  // Transposed volume representation experiment (VTK_METAL_TEST_VOLTRANSPOSE=1):
+  // the volume uploads x<->z transposed (the slice axis moves to the
+  // texture's x extent) and every scalar fetch maps original-orientation
+  // coordinates through .zyx. Root cause (2026-08-22): Metal's private 3D
+  // tiling is strongly axis-biased — with the slice axis as texture depth,
+  // trilinear z-pair fetches under per-pixel jitter phase scatter pay a huge
+  // DRAM tax (jitter delta +23 ms vs GL +12 @2048 oblique); transposing
+  // collapses it to +5 ms with byte-identical renders and halves j0.
+  // Baked via fc_volTransposed; clear by default. Mutually exclusive with
+  // VolumeFeature_VolRg8 (pair indexing assumes the untransposed layout).
+  VolumeFeature_VolTransposed = 1u << 31,
 };
 
 VTK_ABI_NAMESPACE_BEGIN
@@ -459,6 +470,11 @@ private:
 
   // Cache/timestamps
   vtkTimeStamp VolumeUploadTime;
+  // True while the uploaded VolumeTexture holds the x<->z transposed
+  // representation (VTK_METAL_TEST_VOLTRANSPOSE). Compute kernels that sample
+  // the volume in data space (min-max lattice, normals) read this to swizzle
+  // their texture coordinates.
+  bool VolumeTextureTransposed = false;
   vtkTimeStamp TransferFunctionUploadTime;
   vtkTimeStamp GradientOpacityUploadTime;
   vtkTimeStamp VertexBufferUploadTime;
