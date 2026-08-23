@@ -3160,6 +3160,51 @@ documented mixed behavior. The ungate stays; the "minmax always pays"
 assumption does not return — it remains false on obliques and true-only
 on axis views of empty-heavy datasets at coarse SD.
 
+### 37.10 RESOLVED same night: batch-cap retune makes minmax beat TRUE raw
+on EVERY view at SD4 — the penalty was an artifact of cap=8 (2026-08-23)
+
+Idea ranked from the corrected constraint set: P1 (§37.2) proved the walk/
+consume tax scales with OUTER-ITERATION count; at SD4 the shipped coarse-
+tier cap is 8, so solid terrain pays loop-top overhead every ~8 steps.
+Raising MARCH_CAP attacks exactly that term. Full grid measured tonight
+(AC power, blocks-on default, SD4 mv9 j1 @2048², --warmup 8; TRUE raw refs:
+z 39.0 / y 28.9 / x 36.2 / obl 21.1 / az45 ~22.3):
+
+| config | axis-z | axis-y | axis-x | obl | az45 |
+|---|---|---|---|---|---|
+| TRUE raw | 39.0 | 28.9 | 36.2 | 21.1 | ~22.3 |
+| shipped default (DS4 cap8) | 47.4 | 31.6 | 34.9 | 19.2 | 19.2 |
+| DS8 cap16 | 35.2 | 27.1 | 30.9 | 18.1 | 20.8 |
+| DS16 cap16 | 50.5 | 29.8 | 35.0 | 21.1 | — |
+| **DS4 cap16** | 38.5 | 26.2 | 28.8 | 16.6 | 17.2 |
+| **DS4 cap32** | **35.1** | **25.1** | **27.6** | **16.0** | **17.1** |
+
+Findings:
+
+1. **DS4+cap32 beats TRUE raw on all five views**: z −10%, y −13%,
+   x −24%, obl −24%, az45 −23%. The §35.10 "+40% axis-z penalty" is fully
+   recovered and inverted. Coarsening the lattice (DS8/16/32) helps ONLY
+   axis-z and REGRESSES az45/obl — certification granularity is fine where
+   skipping already wins; keep DS4.
+2. Mechanism consistent with P1: wider batches cut outer iterations 4×,
+   and mv9's wide-fetch design gets more loads in flight per dispatch.
+   Over-fetch past terrain edges evidently costs little once block leaps
+   handle the empty spans.
+3. Parity: cap8→cap16 PNG diff = 0.95% of pixels, max 4 LSB, mean 1.02 —
+   sub-LSB latch-granularity class (wider batches check the opacity/tEnd
+   latches less often). Not byte-identical; same accepted class as blocks.
+4. j0 spot (z, DS8c16): 33.1 — jitter-independent.
+5. Zero code was needed for the measurement: VTK_METAL_TEST_MARCH_CAP and
+   MM_DS already exist.
+
+Proposed production change (pending sign-off): coarse-tier batch cap
+8 -> 32 in the VolumeMarchVariant()==9 mapping (fine tier keeps 48;
+ComputeMacrocellDownsample untouched). One-line static SD-tier change,
+§25.5-compliant. Ideas kept in reserve if some future dataset still
+regresses: per-ray walk bail-out after N fruitless crossings (bounds
+worst case at raw+epsilon), and revisiting seg-consume under the now-
+lower iteration counts.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
