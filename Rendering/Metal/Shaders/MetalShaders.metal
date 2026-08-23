@@ -5204,11 +5204,53 @@ inline half4 marchVolumeUnified(
         {
           int w = 0;
           const int extent = min(48, steps - i);
+          // Block-summary state for this preamble pass (fc_mmBlocks): one
+          // coarse fetch per changed block, then a single leap to that
+          // block's boundary plane instead of per-cell hops. Same invariants
+          // as the baseline walk: block indices derive from CELL indices
+          // (integer divide — an mmPos*blockDim product disagrees wherever
+          // fineDim/8 is not integer), leap targets are the TRUE normalized
+          // planes 8k/fineDim in fine-cell units, and the texel is sampled
+          // at its center. Disabling fc_mmBlocks eliminates every line of it.
+          const float3 invMMDimF = 1.0f / mmDimF;
+          int3 blk = int3(-1);
+          bool blkEmpty = false;
           while (w < extent)
           {
             float3 mmPos = clamp(evalPoint + evalStep * (float)w, float3(0.0), float3(1.0));
-            if (minMaxTexture.sample(sNearest, mmPos, level(0)).r <= 0.5) break;
             float3 cellCoord = mmPos * mmDimF;
+            if (useMinMaxBlocks)
+            {
+              int3 newBlk = min(int3(cellCoord) / 8, int3(mmBlkDimF) - 1);
+              if (any(newBlk != blk))
+              {
+                blk = newBlk;
+                blkEmpty = minMaxBlockTexture.sample(sNearest,
+                    (float3(blk) + 0.5f) / mmBlkDimF, level(0)).r > 0.5;
+              }
+              if (blkEmpty)
+              {
+                // Whole block empty: leap to its far boundary along the ray.
+                int3 blkLo = blk * 8;
+                float3 loN = float3(blkLo) * invMMDimF;
+                float3 hiN = float3(min(blkLo + 8, int3(mmDimF))) * invMMDimF;
+                float3 rem;
+                rem.x = p.rayDir.x > 0.0 ? (hiN.x - mmPos.x) : (mmPos.x - loN.x);
+                rem.y = p.rayDir.y > 0.0 ? (hiN.y - mmPos.y) : (mmPos.y - loN.y);
+                rem.z = p.rayDir.z > 0.0 ? (hiN.z - mmPos.z) : (mmPos.z - loN.z);
+                rem = max(rem, float3(0.0f));
+                float3 tToFace;
+                tToFace.x = abs(p.rayDir.x) > 1e-5 ? rem.x / abs(p.rayDir.x) : 1e30;
+                tToFace.y = abs(p.rayDir.y) > 1e-5 ? rem.y / abs(p.rayDir.y) : 1e30;
+                tToFace.z = abs(p.rayDir.z) > 1e-5 ? rem.z / abs(p.rayDir.z) : 1e30;
+                float exactSkip = min(min(tToFace.x, tToFace.y), tToFace.z) + 1e-4;
+                int leapSteps = (int)ceil(exactSkip / p.stepSize);
+                if (leapSteps < 1) leapSteps = 1;
+                w += leapSteps;
+                continue;
+              }
+            }
+            if (minMaxTexture.sample(sNearest, mmPos, level(0)).r <= 0.5) break;
             float3 fractCoord = fract(cellCoord);
             float3 distToEdge;
             distToEdge.x = p.rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x;

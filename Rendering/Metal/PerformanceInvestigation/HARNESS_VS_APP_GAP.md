@@ -2078,19 +2078,39 @@ px differ by exactly 1 LSB; >1LSB px 4–155 of 1M @1024 / up to 9.8K of 4.2M
 fine SD; mean|d| <= 0.041. mm-off paths byte-untouched (walk dead-code-
 eliminated; raw-arm anchors matched §26.5 within battery drift).
 
-### 34.6 HANDOFF status
+### 34.6 mv9 preamble adopts block leaps (2026-08-23)
+
+§33 item "mv9 preamble walk could adopt block leaps" DONE. The variant-9
+preamble walk now carries the same two-level fast path (cell-derived block
+index, center-texel fetch, true fine-cell-unit boundary planes, per-pass
+block state cache, reciprocal-multiplied planes); fc_mmBlocks eliminates it
+entirely for non-block pipelines.
+
+Results (@2048² SD0.5, order-balanced pairs):
+
+| view | mv9 raw | mv9 mm HEAD | mv9 mm +BLOCKS |
+|---|---|---|---|
+| oblique | 97.0 / 95.8 | 132.5 / 131.7 | **95.5 / 95.4** |
+| axial-z | 307.3 / 307.2 | 426.0 / 424.9 | **276.5 / 276.7** |
+
+mv9+mm flips from a +36/+118 ms penalty to **−1.5/−31 ms vs mv9-raw** —
+minmax is now strictly worth running under mv9 at fine SD. The quantization
+class is TIGHTER than the baseline's (max Δ=1, ZERO px >1LSB on obl+axz:
+the step-parametrized leap avoids the baseline's matrix-resync drift), and
+blocks-off mv9 output is byte-identical to the pre-change binary while the
+fine-SD gate keeps SD4 byte-identical too (19.2/19.5 ms tied).
+
+### 34.7 HANDOFF status
 
 §33 items done: probe decomposition (34.1), DS retune data (34.2),
-mechanism fix (34.3). Remaining:
+mechanism fix (34.3), mv9 preamble adoption (34.6). Remaining:
 
-1. mv9 preamble walk could adopt block leaps too (mv9 wins many raw cells;
-   its inline walk still fetches per step).
-2. ε-contribution emptiness tier (§33.2 item 2) remains open — orthogonal
+1. ε-contribution emptiness tier (§33.2 item 2) remains open — orthogonal
    to blocks; would multiply skippable volume (fat/air near-zero-alpha).
-3. TEMP inventory: MM_PROBE counters + [TRMM] block-consistency readback are
+2. TEMP inventory: MM_PROBE counters + [TRMM] block-consistency readback are
    env-gated diagnostics (keep-or-revert decision before any production
    default flip of MM_BLOCKS/VOLTRANSPOSE).
-4. Default-enable decision for MM_BLOCKS needs multi-dataset coverage
+3. Default-enable decision for MM_BLOCKS needs multi-dataset coverage
    (single IMRToraceAddome so far, like §26.6 item 1's original caveat).
 
 Logs: /tmp/mmprobe (probe matrix), /tmp/mmds (DS sweep), /tmp/mmblk +
