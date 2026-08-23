@@ -2463,6 +2463,45 @@ remaining scope caveats for a policy flip: other datasets have only
 obl+axz interleaved-less cells, SDs beyond {0.5, 4-obl} unswept, single
 GPU/dataset-modality class (§27.3 caveats apply verbatim).
 
+### 35.9 Y-depth × sample distance (2026-08-23): the win is FINE-SD specific
+
+§35.8's remaining caveat closed with an ABBA sweep @2048² SD4 mv9 j1
+(6 views × {raw, mm} — note blocks are gated OFF at SD>=1.5, so "mm" here
+is minmax-without-blocks), plus an SD1 disambiguation pass:
+
+SD4 means (X / Y / Y-delta):
+
+| view | raw | mm |
+|---|---|---|
+| obl | 21.63 / 19.90 (−8.0%) | 20.41 / 20.10 (−1.5%) |
+| az45 | 24.69 / 16.38 (**−33.7%**) | 20.00 / 18.68 (−6.6%) |
+| az135 | 18.61 / 20.43 (+9.8% X) | 21.28 / 21.39 (+0.5% ≈tie) |
+| axis-x | 37.02 / 28.64 (**−22.6%**) | 40.53 / 38.86 (−4.1%) |
+| axis-y | 28.90 / 35.82 (**+23.9% X**) | 36.57 / 37.81 (+3.4% X) |
+| axis-z | 38.92 / 38.14 (−2.0%) | 54.39 / 54.46 (±0) |
+
+SD1 (inside the blocks/fine-SD tier): Y wins uniformly again —
+obl 33.73→30.07 (−10.9%), az135 34.26→31.32 (−8.6%), axy 56.82→52.87
+(−7.0%) — including exactly the views that preferred X at SD4.
+
+Conclusions:
+
+1. The Y advantage is a property of the FINE-SD regime (DS=2 lattice
+   tier, dense marches), not universal: at SD4 the ranking is view-
+   dependent with large swings both ways (az45 −34% vs axy +24% raw),
+   and under SD4-mm it collapses to ±0–7% noise.
+2. Policy consequence: do NOT flip the global tie-break. If adopted,
+   gate Y on the SAME static fine-SD tier the blocks feature already uses
+   (sampleDistance < 1.5 in VolumeMinMaxBlocksWanted terms) — a static
+   quality-based decision (§25.5-compliant: no runtime/view gating).
+   Implementation would extend VolumeTransposedAxisDepth's policy input
+   with SampleDistance; breadth caveats of §35.8 still apply before any
+   default change.
+3. §30.2's SD4-era "X wins oblique" was measured pre-mv9-pin; today's
+   mv9 oblique reads slightly Y-favoring while az135/axy favor X — the
+   coarse-SD ranking remains pipeline-dependent and is best left to the
+   existing policy/env.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
