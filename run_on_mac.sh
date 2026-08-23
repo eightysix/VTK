@@ -43,7 +43,5 @@ if [[ ! -d "$MAC_APP" ]]; then
     exit 1
 fi
 
-echo "Launching app..."
-open "$MAC_APP"
-
-echo "Done!"
+echo "Launching app (Ctrl+C to quit)..."
+exec "$MAC_APP/Contents/MacOS/$SCHEME"
