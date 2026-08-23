@@ -28,6 +28,10 @@
 // at launch so toggling off restores it, not just the 0 default.
 @property (nonatomic) BOOL marchVariant9Enabled;
 @property (nonatomic, copy) NSString* marchVariantEnvAtLaunch;
+// Two-level occupancy summary (HARNESS_VS_APP_GAP §34): 8³-cell all-empty
+// block summary of the dilated macrocell lattice; the minmax walk leaps whole
+// empty blocks. Mapper-gated to the fine-SD tier (sampleDistance < 1.5).
+@property (nonatomic) BOOL minMaxBlocksEnabled;
 @end
 
 static NSArray<NSDictionary*>* ViewCommandDefs(void)
@@ -67,6 +71,11 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
     self.marchVariantEnvAtLaunch = [NSString stringWithUTF8String:v];
     self.marchVariant9Enabled = std::atoi(v) == 9;
   }
+
+  // Mirrors the mapper env default: block summary off unless opted in.
+  self.minMaxBlocksEnabled = NO;
+  if (const char* v = std::getenv("VTK_METAL_TEST_MM_BLOCKS"))
+    self.minMaxBlocksEnabled = std::atoi(v) != 0;
 
   NSRect contentRect = NSMakeRect(0, 0, 1100, 800);
   NSWindowStyleMask styleMask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
@@ -235,6 +244,12 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
       modifiers:NSEventModifierFlagCommand | NSEventModifierFlagOption
           target:self
           toMenu:renderingMenu];
+  [self addItem:@"MinMax Block Summary (fine SD)"
+         action:@selector(toggleMinMaxBlocks:)
+           key:@"l"
+      modifiers:NSEventModifierFlagCommand | NSEventModifierFlagOption
+          target:self
+          toMenu:renderingMenu];
   [self addSubmenu:renderingMenu titled:@"Rendering" toMenu:vtkMenu];
 
   // File submenu
@@ -398,6 +413,16 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
     return YES;
   }
 
+  if (action == @selector(toggleMinMaxBlocks:))
+  {
+    BOOL isVolumeVC = [[self findMetalViewController] isKindOfClass:[BaseVolumeViewController class]];
+    menuItem.enabled = isVolumeVC;
+    if (!isVolumeVC)
+      return NO;
+    menuItem.state = self.minMaxBlocksEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+    return YES;
+  }
+
   return YES;
 }
 
@@ -525,6 +550,20 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
     ? "9"
     : self.marchVariantEnvAtLaunch.UTF8String;
   setenv("VTK_METAL_TEST_MARCH_VARIANT", value, 1);
+  [self renderCurrentWindow];
+}
+
+// Two-level occupancy summary (HARNESS_VS_APP_GAP §34): the mapper re-reads
+// VTK_METAL_TEST_MM_BLOCKS per lattice build and pipeline specialization, and
+// the lattice cache key carries the block wish — so flipping the env rebuilds
+// (or drops) the summary texture on the next frame and respecializes the
+// march pipelines via their featureMaskExtra bit. No resource re-upload is
+// needed. The mapper additionally gates the feature to the fine-SD tier
+// (sampleDistance < 1.5), where the block leaps pay.
+- (void)toggleMinMaxBlocks:(id)sender
+{
+  self.minMaxBlocksEnabled = !self.minMaxBlocksEnabled;
+  setenv("VTK_METAL_TEST_MM_BLOCKS", self.minMaxBlocksEnabled ? "1" : "0", 1);
   [self renderCurrentWindow];
 }
 
