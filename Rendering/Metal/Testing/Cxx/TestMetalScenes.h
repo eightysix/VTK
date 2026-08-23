@@ -1171,8 +1171,89 @@ inline void BuildDICOMVolumeScene(vtkRenderer* renderer, BackendKind b)
   // (0,0.605,0.706).
   vtkNew<vtkColorTransferFunction> color;
   vtkNew<vtkPiecewiseFunction> opacity;
-  if (const char* pr = std::getenv("VTK_METAL_TEST_PRESET"); pr &&
-      std::string(pr) == "BoneSkinII")
+  const char* presetEnv = std::getenv("VTK_METAL_TEST_PRESET");
+  const std::string preset = presetEnv ? std::string(presetEnv) : std::string();
+  auto rescaleHU = [](double hu) { return (hu + 1024.0) * (255.0 / 4095.0); };
+  if (preset == "DarkBone")
+  {
+    // "Dark Bone" preset (VRPresets/Dark Bone.plist): a black->white->gray
+    // ramp over the high-density range and a constant yellow pair over the
+    // soft-tissue range. useShading == false.
+    const double xs0[3] = { 46.733612060546875, 134.97621154785156,
+                            244.72689819335938 };
+    const double ys0[3] = { 0.0, 0.25999999046325684, 0.5300024151802063 };
+    const double cr0[3][3] = { { 0, 0, 0 }, { 1, 1, 1 },
+                               { 0.20000000298023224, 0.20000000298023224,
+                                 0.20000000298023224 } };
+    for (int i = 0; i < 3; ++i)
+    {
+      opacity->AddPoint(rescaleHU(xs0[i]), ys0[i]);
+      color->AddRGBPoint(rescaleHU(xs0[i]), cr0[i][0], cr0[i][1], cr0[i][2]);
+    }
+    const double xs1[4] = { -812.04962158203125, -622.0498046875,
+                            -420.04998779296875, -262.84738159179688 };
+    const double ys1[4] = { 0.0, 0.1643165796995163, 0.36469146609306335, 0.0 };
+    for (int i = 0; i < 4; ++i)
+    {
+      opacity->AddPoint(rescaleHU(xs1[i]), ys1[i]);
+      color->AddRGBPoint(rescaleHU(xs1[i]), 0.0, 1.0, 1.0);
+    }
+  }
+  else if (preset == "SkinOnBlue")
+  {
+    // "Skin On Blue" preset (VRPresets/Skin On Blue.plist): a constant pale
+    // pair over skin and a black->red->yellow->white ramp over bone. The
+    // plist sets useShading == true; this bench keeps shading env-gated
+    // (VTK_METAL_TEST_SHADE) so A/B arms stay comparable.
+    const double xs0[4] = { -923.2498779296875, -733.2503662109375,
+                            -531.25048828125, -372.8206787109375 };
+    const double ys0[4] = { 0.0, 0.086646988987922668, 0.27084481716156006,
+                            0.0 };
+    for (int i = 0; i < 4; ++i)
+    {
+      opacity->AddPoint(rescaleHU(xs0[i]), ys0[i]);
+      color->AddRGBPoint(rescaleHU(xs0[i]), 0.98785382509231567, 1.0, 1.0);
+    }
+    const double xs1[4] = { 142.259033203125, 332.25927734375, 534.2587890625,
+                            679.2587890625 };
+    const double ys1[4] = { 0.0, 0.3633459210395813, 0.56372088193893433,
+                            0.96987384557723999 };
+    const double cr1[4][3] = { { 0, 0, 0 }, { 1, 0, 0 },
+                               { 1, 0.99920654296875, 0 }, { 1, 1, 1 } };
+    for (int i = 0; i < 4; ++i)
+    {
+      opacity->AddPoint(rescaleHU(xs1[i]), ys1[i]);
+      color->AddRGBPoint(rescaleHU(xs1[i]), cr1[i][0], cr1[i][1], cr1[i][2]);
+    }
+  }
+  else if (preset == "BoneSkin")
+  {
+    // "Bone + Skin" preset (VRPresets/Bone + Skin.plist): the same green skin
+    // pair as Bone + Skin II but its bone ramp tops out at HU 333 with lower
+    // opacity (0.334 vs 0.789). useShading == false.
+    const double xs0[5] = { -713.843994140625, -653.980712890625,
+                            -640.249267578125, -590.3348388671875,
+                            -544.6475830078125 };
+    const double ys0[5] = { 0.0, 0.20899984240531921, 0.28999966382980347,
+                            0.20899984240531921, 0.20899984240531921 };
+    for (int i = 0; i < 5; ++i)
+    {
+      opacity->AddPoint(rescaleHU(xs0[i]), ys0[i]);
+      color->AddRGBPoint(rescaleHU(xs0[i]), 0.0, 0.42801555991172791, 0.0);
+    }
+    const double xs1[4] = { 72.294891357421875, 164.57276916503906,
+                            262.6788330078125, 333.10153198242188 };
+    const double ys1[4] = { 0.0, 0.33399978280067444, 0.33399978280067444,
+                            0.33399978280067444 };
+    const double cr1[4][3] = { { 0, 0, 0 }, { 1, 0, 0 },
+                               { 1, 0.99920654296875, 0 }, { 1, 1, 1 } };
+    for (int i = 0; i < 4; ++i)
+    {
+      opacity->AddPoint(rescaleHU(xs1[i]), ys1[i]);
+      color->AddRGBPoint(rescaleHU(xs1[i]), cr1[i][0], cr1[i][1], cr1[i][2]);
+    }
+  }
+  else if (preset == "BoneSkinII")
   {
     // "Bone + Skin II" preset (VRPresets/Bone + Skin II.plist): two
     // opacity/color pairs, the first a constant pale-blue ramp over the soft
