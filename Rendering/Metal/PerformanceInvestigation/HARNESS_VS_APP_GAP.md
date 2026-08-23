@@ -3428,6 +3428,46 @@ cost probe (ACCEL=1 MINMAX=0) just re-measured mm-with-CPU-lattice
 (z 46.96 ≈ old §35 numbers). Any future flat-build-cost isolation needs a
 code change (e.g., env-gated builder skip), not an env permutation.
 
+### 37.16 Thermal-contamination event closes the session; MMBO=2 inert-mode
+attempt reverted; standing solution status (2026-08-23 night end)
+
+Follow-up investigation of the structural residual hit a measurement-
+integrity wall:
+
+1. Lattice build cost ruled out FIRST by code reading: ComputeMinMaxGPU
+   timestamp-caches (input/opacity MTime + dims key) — not rebuilt per
+   frame, so the residual was always march-side. No build-cost attack
+   needed.
+2. MMBO=2 inert mode attempted (walk fully disabled, mm state live) to
+   split static preamble/codegen cost from leap dynamics. Implemented as
+   an `if (...)` WRAP around the walk loop -> REVERTED: restructuring
+   shared straight-line code changed codegen for the DEFAULT arm too
+   (z-full measured 47.9 vs its own leaps-only sibling 43.5 — mechanically
+   impossible pre-edit). LESSON: diagnostic modes must gate INSIDE the
+   existing control structure, never restructure it; verify the untouched
+   default arm against its historical anchor after every shader edit.
+3. Contamination signature (fanless Air, hours of sustained GPU load;
+   began right after the seg-consume oblique run wedged ~20 min before
+   kill): progressive cross-batch inflation (z-traw 30.4 -> 35.3 -> 35.8,
+   obl-full 16.1 -> 17.7) PLUS intra-batch order violations (full-walk
+   slower than leaps-only; leaps-only slower than raw on obl). 10-min
+   idle cooldown did NOT recover anchors (+23%/+12%/+6% vs clean values
+   at session end); deltas distorted non-uniformly between arms. All post-
+   wedge numbers void; §37.15's matrix (pre-wedge) remains authoritative.
+   PROTOCOL ADDITION: after any GPU wedge/overload, require anchor
+   recovery (re-run two known anchors within ±3% of their clean values)
+   BEFORE trusting any new batch; treat intra-batch order violations as
+   an immediate abort signal.
+4. Standing solution status for the axis-chord deficit (z +4.8 ms /
+   y +1.7 ms vs raw at cap parity, all CLUTs): cell-tier removal refuted
+   (§37.15); duty-cycle/bail-out moot; seg-consume catastrophic; lattice
+   coarsening regresses other views; build cost nil. Remaining directions
+   need design work, not knob turns: warp-uniform hop schedules or leap
+   quantization (attack divergence directly), a register-footprint diet
+   for the mv9 march state, or formally accepting the trade — current
+   default wins −5..−13 ms on obl/az45/x/SD0.5 across every CLUT versus
+   losing ≤5 ms on two axis views of one geometry class.
+
 ### 37.14 Reproduction recipe for all §37 benchmarks
 
 Commits: measurements taken on `1896bf38bd` code (single-tier cap32;
