@@ -32,6 +32,12 @@
 // block summary of the dilated macrocell lattice; the minmax walk leaps whole
 // empty blocks. Mapper-gated to the fine-SD tier (sampleDistance < 1.5).
 @property (nonatomic) BOOL minMaxBlocksEnabled;
+// Transposed depth-axis choice (HARNESS_VS_APP_GAP §35.5/§35.8): which short
+// in-plane extent plays texture depth under VOLTRANSPOSE. Y measures -8..-14%
+// vs the policy's X tie-break under mm+blocks at fine SD. OFF restores x (the
+// argmin-dims tie-break); ON forces VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y.
+// Inert while Volume Transpose is off.
+@property (nonatomic) BOOL volumeTransposeAxisYEnabled;
 @end
 
 static NSArray<NSDictionary*>* ViewCommandDefs(void)
@@ -76,6 +82,12 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
   self.minMaxBlocksEnabled = NO;
   if (const char* v = std::getenv("VTK_METAL_TEST_MM_BLOCKS"))
     self.minMaxBlocksEnabled = std::atoi(v) != 0;
+
+  // Depth-axis override state; unset env means the argmin-dims policy (which
+  // prefers X on ties), so OFF matches the effective default on Z-long studies.
+  self.volumeTransposeAxisYEnabled = NO;
+  if (const char* v = std::getenv("VTK_METAL_TEST_VOLTRANSPOSE_AXIS"))
+    self.volumeTransposeAxisYEnabled = (v[0] == 'y' || v[0] == 'Y');
 
   NSRect contentRect = NSMakeRect(0, 0, 1100, 800);
   NSWindowStyleMask styleMask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
@@ -223,6 +235,12 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
   [self addItem:@"Volume Transpose (x<->z)"
          action:@selector(toggleVolumeTranspose:)
            key:@"t"
+     modifiers:NSEventModifierFlagCommand | NSEventModifierFlagOption
+         target:self
+         toMenu:renderingMenu];
+  [self addItem:@"Transposed Depth Axis = Y (vs X)"
+         action:@selector(toggleVolumeTransposeAxisY:)
+           key:@"z"
      modifiers:NSEventModifierFlagCommand | NSEventModifierFlagOption
          target:self
          toMenu:renderingMenu];
@@ -389,6 +407,12 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
     return YES;
   }
 
+  if (action == @selector(toggleVolumeTransposeAxisY:))
+  {
+    menuItem.state = self.volumeTransposeAxisYEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+    return YES;
+  }
+
   if (action == @selector(toggleMinMaxAcceleration:) ||
       action == @selector(toggleBlueNoiseJitter:))
   {
@@ -502,6 +526,24 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
   self.volumeTransposeEnabled = !self.volumeTransposeEnabled;
   setenv("VTK_METAL_TEST_VOLTRANSPOSE", self.volumeTransposeEnabled ? "1" : "0", 1);
   setenv("VTK_METAL_TEST_GPU_TRANSPOSE", self.volumeTransposeEnabled ? "1" : "0", 1);
+  if (vtkMetalGPUVolumeRayCastMapper* mapper = [self currentVolumeMapper])
+  {
+    mapper->ForceResourceReupload();
+    [self renderCurrentWindow];
+  }
+}
+
+// Depth-axis flip changes which physical 3D texture layout gets uploaded
+// (same data, swapped extents), so like Volume Transpose it needs a resource
+// re-upload. The mapper reads VTK_METAL_TEST_VOLTRANSPOSE_AXIS live inside
+// VolumeTransposedAxisDepth at each upload; OFF restores x — matching the
+// argmin-dims policy's tie-break on Z-long studies. Inert while transpose is
+// off (the axis code is only consulted for the transposed representation).
+- (void)toggleVolumeTransposeAxisY:(id)sender
+{
+  self.volumeTransposeAxisYEnabled = !self.volumeTransposeAxisYEnabled;
+  setenv("VTK_METAL_TEST_VOLTRANSPOSE_AXIS",
+         self.volumeTransposeAxisYEnabled ? "y" : "x", 1);
   if (vtkMetalGPUVolumeRayCastMapper* mapper = [self currentVolumeMapper])
   {
     mapper->ForceResourceReupload();
