@@ -2741,6 +2741,173 @@ Findings:
    always, dummies when inactive) because the direct-path march runs
    through one; RTT branch carries the same pre-pass for completeness.
 
+## 36. PLAN — restructuring mv9 to close the residual coarse-SD minmax gap (2026-08-23)
+
+Design section distilled from §35.9–35.14. No code written yet; every path
+below carries its own gate, parity bar, and kill criteria.
+
+### 36.1 Constraint set (what the measurements force)
+
+The target: at SD4 @2048² the accelerated march still pays ~+10 ms vs raw on
+axis views through lung (mm-ds8 axz 51.4 / blocks-anySD 47.4 vs raw ~40.8),
+while oblique already wins (19.85 / 19.57 vs 21.3). Fine SD is solved by
+blocks (§34). The fix must live inside these proven bounds:
+
+1. **Walk work must leave the fragment** — §35.12 (NOWALK ≈ raw: the tax is
+   walk execution), §35.13 (in-fragment pre-walk 2×), §35.14 (compute builder
+   ≈ free).
+2. **The march must gain zero persistent state** — §35.14's consume pipeline
+   cost +51 ms from ~6 loop-carried scalars + two device params, even with
+   the preamble compiled out and zero hops executed ("occupancy-cliff law",
+   fourth and finest instance).
+3. **Skipping itself is free** — hops == no-hops timing; empty samples
+   composite as exact zeros (verified by the occupancy prefix table), so any
+   superset of HEAD's skipped set is output-safe up to the accepted ±1-step
+   fp-landing class.
+4. **Bench protocol**: --warmup ≥ 5 always (§35.14 tooling lesson); ABBA
+   order-alternated; anchors drift ±5% with battery.
+
+Rejected up front (do not revisit): warp-cooperative pre-passes (divergence
+tax + complexity, same in-fragment state problem); DDA-only traversal
+(constant-factor shrink of a walk we can already make free; loses byte-exact
+landings on a path currently held exact); async overlap with other passes
+(nothing to overlap within this renderer's serial frame).
+
+### 36.2 Path P — de-risking probes (~half day, run first)
+
+Two cheap A/Bs that determine which resource actually cliffs, and therefore
+how much headroom any in-march design has:
+
+- **P1 ladder shrink.** Rebuild mv9's width dispatch with {16,8,4,2,1}
+  instead of {48,32,16,8,4,2,1} (48-wide only pays at fine SD where blocks
+  already win; coarse SD caps at 8 anyway). Env-gate as
+  `VTK_METAL_TEST_MARCH_LADDER=16` decoded next to `maxBatchWidth`
+  (`VolumeShaderFeatureFlags`-free: uniform-driven like maxBatchWidth, no new
+  fc). If the §35.14 consume penalty shrinks materially under the small
+  ladder, the cliff is code-size/I-cache rather than registers — mv9 has
+  unaccounted headroom, and Design A gets riskier while Design B less
+  urgent.
+- **P2 pointer-vs-index.** Rerun the §35.14 consume with the two
+  `device uint*` params folded into ONE pointer (map+pool in a single
+  buffer; fragment still pre-offsets). If +51 ms collapses, the culprit is
+  device-pointer parameter handling (scalarization/address-space setup), not
+  register count — then even the existing segment design may be salvageable,
+  or consumable via an R32UI texture instead of buffers.
+
+Both probes are measurement-only; nothing lands.
+
+### 36.3 Design A — "tap-and-leap": delete the walk AND its state (recommended)
+
+Invert the skipping philosophy. Today's preamble walks forward maintaining
+cached summaries (mv9Blk/mv9BlkState/mv9Sb/mv9SbEmpty/solidRun — many
+loop-carried registers) and re-walks between batches. Instead, certify large
+empty spans with AT MOST one or two transient taps per batch, and otherwise
+just march: compositing empties is free-and-exact (constraint 3).
+
+Per outer iteration, before the width dispatch:
+
+```
+// all values transient — die at issue like MV9_FETCH addresses
+superCell = cellCoord at batch far end (clamp(ep + es*(float)min(i+W,steps)-ε))
+ssv = minMaxSuperTexture.sample(sNearest, (sbIdx+0.5)/mmSbDimF, level(0)).r
+if (ssv > 0.5f && entryCellEmpty)          // whole span certified empty
+    leap to super far face along the ray   // existing distToEdge/tToEdge/
+                                           // exactSkip(+1e-4)/ceil math
+else if (block tap affordable)             // optional second level
+    ... block-summary variant, 8³ cells ...
+else
+    dispatch the batch unchanged           // empties composite as zeros
+```
+
+Why it satisfies the constraint set:
+
+- **Zero persistent state.** Nothing survives the iteration; the leap math
+  is the preamble's own formulas reused inline. Net registers go NEGATIVE:
+  mv9Blk/mv9BlkState/mv9Sb/mv9SbEmpty/solidRun are deleted outright.
+- **Worst case benign.** Mixed terrain ⇒ one/two R8 taps per batch (~56/ray)
+  plus normal batches ⇒ degenerates toward raw + ε, i.e. strictly better
+  than today's mm on the views where mm currently loses.
+- **Best case is the whole prize.** Chest supers tile 64³ fine cells;
+  airway/lung regions leap entire supers per tap.
+- **Output class**: skipped set ⊆ HEAD's skipped set (only certified-empty
+  spans leap). Accumulation stays bit-exact where we composite zeros that
+  HEAD leaped; positions advance linearly (raw-canonical) instead of HEAD's
+  leap arithmetic ⇒ ±1LSB-class vs HEAD-mm, identical to the accepted
+  blocks class.
+
+Implementation sketch:
+
+- Shader: replace the `else if (useMinMax)` preamble block in the mv9 branch
+  (MetalShaders.metal, marchVolumeUnified, variant-9 sub-branch) with the
+  tap-leap block above. Keep the legacy preamble compiled behind the SAME
+  function constants for A/B (fc_mmBlocks/fc_mmSuper stay; add
+  `fc_mmTap [[function_constant(38)]]`).
+- Mapper: `VTK_METAL_TEST_MM_TAP=1` → featureMaskExtra bit 32u (next free
+  after seg's 16u) in `GetOrCreateVolumePipeline`; requires
+  MinMaxSuperTexture present (same readiness pattern as mmSuper).
+- Mostly-solid gate: reuse the EXISTING signal — BuildPerBlockData already
+  clears the walk-enable flag via MinMaxEmptyBlockFraction when skipping
+  cannot pay. Extend it: when empty-fraction < threshold, tap-leap compiles
+  to plain batches so solid views keep today's ds8 win exactly.
+- Optional refinement: adaptive tap depth (super → block → give up) chosen
+  by ONE static per-frame constant from the CPU (empty-fraction buckets),
+  never per-ray branching.
+
+Expected outcomes / kill criteria:
+
+| view | today | expected | verdict bar |
+|---|---|---|---|
+| axz | 51.4 | 42–46 | must beat 47.4 (blocks-anySD) |
+| obl | 19.85 | 19.5–21 | within ±1 ms of ds8 |
+| az45 | 18.0 | ~unchanged | no regression |
+| SD0.5 obl/axz | blocks win | gated off or complementary | no regression |
+
+Kill criteria: if taps alone can't beat blocks-anySD at axz, combine
+(tap-leap for spans + blocks retained for mixed terrain) before abandoning.
+Parity bar: snapshot diff vs HEAD-mm ≤ ±1LSB class quantified per view
+(expect far fewer differing pixels than blocks, since fewer skips occur).
+
+Effort: ~1 day including ABBA sweep + parity snapshots.
+
+### 36.4 Design B — full compute marcher (the definitive restructure)
+
+§35.14 quietly built two-thirds of this. The atlas already yields per-pixel
+evalPoint/evalStep/rayDir/steps bit-exactly (rasterized varyings); the blit
+handoff is measured (+3 ms floor); the builder proves compute occupancy is
+generous enough to run the full walk for free. Move the ENTIRE mv9 batch
+scheduler into a compute kernel:
+
+- Kernel = one thread/pixel: read atlas planes, rebuild the few remaining
+  setup quantities (texStep/ctp already derivable; add plane C.w =
+  s.tTerminateMax from setupVolumeRay so scene-depth early-out survives),
+  run MV9_FETCH/MV9_COMPOSITE + width ladder verbatim (registers free!),
+  write half4 into an RGBA16Float target, Phase-3b blit (exists).
+- Compute kernels sample 3D textures with constexpr samplers today
+  (volume_compute_minmax et al.) — TF/gradient/shading bindings port
+  directly.
+- Hybrid strategy: keep the raster path for hybrid polygonal scenes
+  (depth-composite correctness) and hardware selection; route volume-only
+  interactive frames through compute (mapper-level decision, static per
+  scene).
+- Payoff: every occupancy-cliff instance (§34.7, §35.12, §35.13, §35.14)
+  becomes structurally impossible; unlocks DDA, wavefront scheduling, and
+  non-composite blend modes without fragment-path fear. Expected landing:
+  near-raw on ALL views with acceleration intact.
+- Effort/risk: multi-day; plumbing breadth (lighting uniforms, mask/blanking
+  variants) is the cost, not the march itself.
+- Decision criterion: build ONLY if (a) Design A leaves >5 ms on the table
+  at axz, or (b) the wavefront/DDA roadmap justifies the platform anyway.
+  Otherwise it is over-engineering for the residual 10 ms.
+
+### 36.5 Execution order
+
+1. P1 + P2 probes (half day) — they price Design A's risk.
+2. Design A tap-and-leap behind VTK_METAL_TEST_MM_TAP (1 day): parity
+   snapshots + ABBA {axz,axy,az45,obl} × {raw, mm-ds8, tap} + fine-SD spot.
+3. Decide Design B on §36.4's criterion with A's measured numbers.
+4. Whatever lands: doc section here, default-off env gate, warmup ≥ 5
+   protocol, anchors table updated.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
