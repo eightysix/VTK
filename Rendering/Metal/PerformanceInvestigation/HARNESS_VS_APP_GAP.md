@@ -3371,6 +3371,63 @@ against raw+c32 and mm+c32 on {z, y, obl, az45} × {AirwaysII, DarkBone},
 then decide vs #2. Success bar: axis-z within ~3% of raw while obliques
 keep ≥ half of current win.
 
+### 37.15 Block-or-nothing implemented and REFUTED as the axis-chord fix;
+seg-consume re-priced to catastrophic; residual deficit is structural
+(2026-08-23 late night)
+
+Implemented §37.13 fix #1 exactly as specified: `MmBlocksOnly` uniform
+(offset 1732; C++ struct now 1736 B / buffer still 1744) fed from
+VTK_METAL_TEST_MM_BLOCKSONLY; the mv9 preamble breaks out of the walk
+before the per-cell tier whenever set (super/block leaps stay live).
+Verified: (a) byte-identical output vs the default walk on {z, obl} SD4 —
+as predicted, dropped skips cover provably-zero samples at unchanged
+positions; (b) knob is LIVE via the discriminator `MM_BLOCKS=0` ±
+`BLOCKSONLY=1` (obl cells-only 17.25 vs no-skip-at-all 21.49 ≈ raw).
+
+ABBA matrix (SD4 @2048² j1 c32, ms):
+
+| cell | TRAW | MM | MMBO |
+|---|---|---|---|
+| Airways obl | 21.17 | **16.06** | 16.24 |
+| Airways z | **30.39** | 35.28 | 35.24 |
+| Airways y | **23.37** | 25.21 | 25.13 |
+| Airways az45 | 24.92 | 17.52 | **17.08** |
+| DarkBone obl | 11.16 | **10.21** | 10.27 |
+| DarkBone z | **19.48** | 21.77 | 21.78 |
+| DarkBone y | **17.54** | 18.43 | 18.31 |
+| DarkBone az45 | 16.17 | 12.36 | **12.34** |
+
+**Verdict: refuted.** Suppressing the per-cell tier changes NOTHING on
+axis chords (z 35.28 -> 35.24). The §37.13 mechanism was wrong: the cell
+walk was NOT the tax — on fragmented chords it exits/advances cheaply and
+its removal recovers ~0 ms. Blocks-only keeps every win (az45 even −2.5%)
+but buys nothing where it hurts, so it stays opt-in (knob kept for
+diagnostics; default OFF).
+
+What remains after removing ALL walking (MMBO vs TRAW): z +4.8 ms,
+y +1.7 ms, obl −5.0, az45 −7.8. The z/y residual is structural: per-
+outer-iteration preamble machinery + hop-count divergence across lanes in
+the lockstep batch dispatch — not addressable by any preamble variant,
+since the preamble already costs ~nothing there. A fix would need
+warp-uniform hop schedules or a redesigned march; out of scope.
+
+Fix #2/#3 (duty-cycling, bail-out) are MOOT by the same measurement: with
+the cell tier suppressed the preamble is already down to one cached block
+tap per few iterations — nothing left to duty-cycle worth >1 ms.
+
+Fix #4 seg-consume re-price at cap32: CATASTROPHIC — z 97.63 ms, y 70.24
+(vs mm 35.3/25.2), obl wedged past a 20-min timeout (killed). Far worse
+than its §35.14 +48 ms pricing at cap-8 era iteration counts. The seg
+path regressed somewhere between 83cc5e3731 and HEAD (ungated blocks?
+new uniforms?) — permanently dead as a solution; do not revisit without
+a dedicated debugging session.
+
+Protocol note (recurring trap): "lattice built but never walked" has NO
+env combo — ACCEL=1 keeps fc_minmax on, so an attempted fake-raw build-
+cost probe (ACCEL=1 MINMAX=0) just re-measured mm-with-CPU-lattice
+(z 46.96 ≈ old §35 numbers). Any future flat-build-cost isolation needs a
+code change (e.g., env-gated builder skip), not an env permutation.
+
 ### 37.14 Reproduction recipe for all §37 benchmarks
 
 Commits: measurements taken on `1896bf38bd` code (single-tier cap32;

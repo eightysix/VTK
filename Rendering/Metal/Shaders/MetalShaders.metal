@@ -2988,6 +2988,12 @@ struct VolumeMapperUniforms {
   // SD0.5-4, 400^2-4096^2). The unrolled ladder tops out at 48; caps >= 48
   // dispatch identically. VTK_METAL_TEST_MARCH_CAP overrides.
   float maxBatchWidth;
+  // §37.15 block-or-nothing (VTK_METAL_TEST_MM_BLOCKSONLY): > 0.5 disables
+  // the per-cell tier of the march preamble — super/block leaps stay active,
+  // mixed blocks dispatch their batch un-walked. Byte-identical output to the
+  // default walk (dropped skips cover provably-zero samples at unchanged
+  // positions).
+  float mmBlocksOnly;
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -5398,6 +5404,14 @@ inline half4 marchVolumeUnified(
                 break;
               }
             }
+            // §37.15 block-or-nothing (mmBlocksOnly): a mixed block dispatches
+            // its batch un-walked. On fragmented axis chords the per-cell walk
+            // below pays serialized lattice-tap + boundary-solve work per step
+            // for near-zero yield (blocks rarely certify empty there), while
+            // raw composites empties branch-free. Dropped skips cover
+            // provably-zero samples at unchanged positions, so output is
+            // byte-identical to running this walk.
+            if (volumeUniforms.mmBlocksOnly > 0.5f) { break; }
             if (minMaxTexture.sample(sNearest, mmPos, level(0)).r <= 0.5) break;
             float3 fractCoord = fract(cellCoord);
             float3 distToEdge;

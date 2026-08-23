@@ -241,10 +241,18 @@ struct VolumeMapperUniforms
   float MaxBatchWidth;             // 1728..1731 (adaptive-width march cap for
                                    // fc_marchVariant 9, set from sample distance;
                                    // total 1744, 16-byte aligned)
+  // §37.15 block-or-nothing (VTK_METAL_TEST_MM_BLOCKSONLY): when > 0.5 the
+  // fragment-march preamble consults ONLY the super/block occupancy levels;
+  // a mixed block dispatches its batch un-walked instead of running the
+  // per-cell lattice walk. Targets the axis-chord pathology (§37.13): on
+  // fragmented terrain the cell walk pays serialized per-step work for
+  // near-zero skip yield. Output-safe: dropped skips cover provably-zero
+  // samples only (identical sample positions, zero-opacity contributions).
+  float MmBlocksOnly;              // 1732..1735
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1732,
-  "VolumeMapperUniforms must be 1732 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1736,
+  "VolumeMapperUniforms must be 1736 bytes to match Metal shader struct");
 
 // MSL rounds the shader-side struct up to its 16-byte alignment (float4/float3
 // members), so the pipeline expects round_up(1732,16)=1744 and Metal's
@@ -8801,6 +8809,15 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     {
       uniforms.MaxBatchWidth = static_cast<float>(std::max(1, std::atoi(cap)));
     }
+  }
+  // §37.15 block-or-nothing preamble mode: skip the per-cell lattice walk;
+  // trust only super/block certification. Opt-in via env for A/B; output is
+  // byte-identical to the default walk (dropped skips cover provably-zero
+  // samples at unchanged positions).
+  uniforms.MmBlocksOnly = 0.0f;
+  if (const char* bo = getenv("VTK_METAL_TEST_MM_BLOCKSONLY"))
+  {
+    uniforms.MmBlocksOnly = std::atof(bo) != 0.0 ? 1.0f : 0.0f;
   }
 
   // Final color window/level (matches OpenGL's in_scale/in_bias, applied in the
