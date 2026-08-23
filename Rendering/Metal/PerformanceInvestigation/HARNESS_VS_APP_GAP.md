@@ -3371,6 +3371,49 @@ against raw+c32 and mm+c32 on {z, y, obl, az45} × {AirwaysII, DarkBone},
 then decide vs #2. Success bar: axis-z within ~3% of raw while obliques
 keep ≥ half of current win.
 
+### 37.14 Reproduction recipe for all §37 benchmarks
+
+Commits: measurements taken on `1896bf38bd` code (single-tier cap32;
+identical shader/mapper at doc-HEAD `8f16b801d9`). Stage history:
+`83cc5e3731` seg pre-pass -> `0db5760b5c` §37 matrix -> `03dd74b048`
+blocks ungate -> `baa1b00ccf` §37.10 grid (pre-landing) -> `1896bf38bd`
+landing. Build: `./macos_metal_build.sh --resume`.
+
+```sh
+# Template (zsh — MUST go through eval, see §25.7 word-splitting note)
+B="build_macos_metal/bin/vtkMetalGLVisualComparison --bench --backend metal \
+   --scene DICOMVolume --dicom /Users/macair/Public/IMR/CTIMR/IMRToraceAddome \
+   --frames 25 --reps 1 --size 2048x2048 --warmup 8"          # warmup >=5 MANDATORY
+BASE="VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 \
+      VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_IGN_JITTER=0"
+MM="VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1 VTK_METAL_TEST_MARCH_VARIANT=9"
+TRAW="VTK_METAL_TEST_MINMAX=0 VTK_METAL_TEST_ACCEL=0 VTK_METAL_TEST_MARCH_VARIANT=9"
+# ^ BOTH flags: ACCEL is the master switch (fc_minmax keys off UseMinMaxAccel
+#   alone) — MINMAX=0 alone leaves a CPU-lattice walk running = FAKE RAW (§37.9)
+
+# views:  obl=""   axis-z|y|x = VTK_METAL_TEST_CAM_AXIS=z|y|x   az45 = VTK_METAL_TEST_CAM_AZ=45
+# caps:   none (landed 32) or VTK_METAL_TEST_MARCH_CAP={8,16,32,48}
+# presets: none (=Airways II) or VTK_METAL_TEST_PRESET={DarkBone,SkinOnBlue,BoneSkin,BoneSkinII}
+
+eval "env $BASE $MM VTK_METAL_TEST_MARCH_CAP=32 VTK_METAL_TEST_CAM_AXIS=z $B" 2>/dev/null \
+  | grep "^DICOMVolume" | awk '{print $4}'     # ms/frame = field 4
+```
+
+Variants used per table: SD sweeps swap SAMPLE_DISTANCE ({4, 2.5, 0.5};
+SD0.5 rows use JITTER=0); resolution swaps --size {400x400..4096x4096};
+preset grids append PRESET env; DS probes append MM_DS={8,16,32}; seg-era
+rows added MM_SEG=1 (+MARCH_CAP for P1). Parity snapshots: drop --bench,
+add `--out <dir>`, byte-compare/PIL-diff the DICOMVolume.metal.png files.
+
+Protocol (hard rules, all learned the hard way): --warmup >= 5 always
+(PSO compile amortizes into short windows otherwise); ABBA order-
+alternated passes, discard runs whose mean samples move; record
+battery/AC state + top background processes with every anchor table;
+never compare absolutes across sessions — re-measure both arms
+interleaved; mm-vs-raw verdicts ONLY at equal MARCH_CAP (cross-cap
+comparisons fake verdicts, §37.11); do not set JITTER_PARITY (banned,
+§6.1); leaving IGN_JITTER unset forces IGN (state it explicitly).
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
