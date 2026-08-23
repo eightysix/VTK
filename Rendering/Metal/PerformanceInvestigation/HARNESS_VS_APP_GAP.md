@@ -3025,6 +3025,50 @@ change therefore alters output everywhere within this accepted class; no
 tier is byte-exact anymore. Kill switch (MM_BLOCKS=0) restores bit-exact
 legacy output for byte-diff regression tests.
 
+### 37.7 Same-binary re-measurement resolves the §35.10/§35.11 conflict —
+those findings were machine-state artifacts too (2026-08-23 night)
+
+Challenge from the conflicting doc record: §35.10/§35.11 (this same day,
+morning) measured mm LOSING to raw at SD4 on axis cameras (axis-z raw
+39.05 / mm 54.42, +40%; axis-y +27%) and concluded a "residual structural
+gap untunable by lattice shape". §37.1 (evening) measured mm winning
+everywhere. Settled by re-running the §35.10 cells on the ACTUAL
+9c91995253 binary (=1e0660cf, docs-only delta) checked out and rebuilt
+tonight, back-to-back with HEAD:
+
+| cam-axis z, SD4 mv9 j1 | RAW | plain mm | verdict |
+|---|---|---|---|
+| 9c91995253, morning (doc) | 39.05 | 54.42 | mm +40% LOSS |
+| **9c91995253, tonight** | **61.77** | **58.38** | mm −5.5% WIN |
+| HEAD tonight (blocks off via MM_BLOCKS=0) | 61.92 | 58.48 | identical |
+| HEAD tonight (default = blocks on) | 61.92 | 51.06 | −17% vs raw |
+
+cam-axis x confirms (old binary tonight): raw 44.3 / mm 43.6 — where the
+morning doc had mm losing +9% (§35.9).
+
+Findings:
+
+1. **The §35.10 ordering flip does not survive its own binary.** Same
+   code, same protocol, same day: mm loses +40% in the morning session,
+   wins −5.5% at night. The "mm loses at SD4 axes" family (§35.10's
+   penalty table, §35.11's "residual structural gap", policy option
+   "(a) keep mm off at SD>=1.5") is machine-state artifact, refuted.
+2. Old-binary and HEAD timings agree within noise tonight — none of the
+   code deltas between 9c91995253 and HEAD moved the raw/mm arms; only
+   the blocks ungate (03dd74b048) improves them further (−12% more on
+   axis-z).
+3. Machine state swung absolute numbers ±30–60% WITHIN one day (raw-z
+   39→62), large enough to invert relative orderings when two configs
+   sit within ~10% of each other. Protocol upgrade, mandatory:
+   **record battery/thermal state with every anchor table; never compare
+   anchors across sessions for verdicts — re-measure both arms
+   interleaved in the SAME session, order-alternated.**
+4. Standing results that DO hold across all sessions regardless of
+   machine state: blocks beat plain mm wherever both were measured
+   together (morning §35.10 forced-blocks AND tonight §37); VOLTRANSPOSE;
+   the occupancy-cliff law's existence (though §37.2 re-priced its
+   ladder dependence); §35.14's seg consume pipeline cost.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
