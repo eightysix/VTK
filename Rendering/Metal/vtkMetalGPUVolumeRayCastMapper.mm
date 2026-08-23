@@ -246,6 +246,15 @@ struct VolumeMapperUniforms
 static_assert(sizeof(VolumeMapperUniforms) == 1732,
   "VolumeMapperUniforms must be 1732 bytes to match Metal shader struct");
 
+// MSL rounds the shader-side struct up to its 16-byte alignment (float4/float3
+// members), so the pipeline expects round_up(1732,16)=1744 and Metal's
+// validation layer asserts when the bound buffer is smaller (Xcode/Debug
+// launches). All FIELD offsets are identical on both sides — only trailing
+// padding differs — so allocating the rounded size is purely a validation fix.
+static constexpr NSUInteger VolumeUniformBufferSize =
+  (static_cast<NSUInteger>(sizeof(VolumeMapperUniforms)) + 15) & ~NSUInteger(15);
+static_assert(VolumeUniformBufferSize == 1744, "rounded uniform size");
+
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
 static_assert(offsetof(VolumeMapperUniforms, NumClippingPlanes) == 648, "");
@@ -1339,6 +1348,7 @@ static bool VolumeMinMaxBlocksWanted(bool gpuMinMax, double sampleDistance)
 {
   return VolumeMinMaxBlocksActive() && gpuMinMax && sampleDistance < 1.5;
 }
+
 
 //------------------------------------------------------------------------------
 static id<MTLTexture> CreateR8MinMaxTexture(
@@ -3100,6 +3110,7 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   ReleaseMetalObject(this->MinMaxTexture);
   ReleaseMetalObject(this->MinMaxScratchTexture);
   ReleaseMetalObject(this->MinMaxBlockTexture);
+  ReleaseMetalObject(this->MinMaxCountBuffer);
   this->ReleaseGradientNormalTexture();
 
   this->ReleaseMaskResources();
@@ -5874,11 +5885,32 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
       this->MinMaxBlockDims[2] = blkDims[2];
       this->MinMaxBlockSize = blockSize;
 
+      // Empty-block counter (shared uint): zeroed on the CPU before the
+      // dispatch reads it; the command buffer's completion handler converts
+      // it into MinMaxEmptyBlockFraction without stalling the frame.
+      if (!this->MinMaxCountBuffer)
+      {
+        id<MTLBuffer> cntBuf = [device newBufferWithLength:sizeof(uint32_t)
+                                                   options:MTLResourceStorageModeShared];
+        if (!cntBuf)
+        {
+          vtkErrorMacro("Failed to create minmax counter buffer");
+          return false;
+        }
+        AssignMetalObject(this->MinMaxCountBuffer, cntBuf);
+      }
+      const NSUInteger totalBlocks =
+        static_cast<NSUInteger>(blkDims[0]) * blkDims[1] * blkDims[2];
+      id<MTLBuffer> cntBuf = (__bridge id<MTLBuffer>)this->MinMaxCountBuffer;
+      memset(cntBuf.contents, 0, sizeof(uint32_t));
+
       [mmEnc setComputePipelineState:
         (__bridge id<MTLComputePipelineState>)this->BlockReduceComputePipeline];
       [mmEnc setTexture:permTex atIndex:0];
       [mmEnc setTexture:blockTex atIndex:1];
       [mmEnc setBytes:&blockSize length:sizeof(blockSize) atIndex:0];
+      [mmEnc setBuffer:(__bridge id<MTLBuffer>)this->MinMaxCountBuffer
+                offset:0 atIndex:1];
       MTLSize blkGrid = MTLSizeMake(
         static_cast<NSUInteger>(blkDims[0]),
         static_cast<NSUInteger>(blkDims[1]),
@@ -5889,6 +5921,24 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
         std::min(blkTg, static_cast<NSUInteger>(blkDims[1])),
         std::min(blkTg, static_cast<NSUInteger>(blkDims[2])));
       [mmEnc dispatchThreads:blkGrid threadsPerThreadgroup:blkThreadgroup];
+      this->MinMaxEmptyBlockTotal = totalBlocks;
+      __weak vtkMetalGPUVolumeRayCastMapper* weakThis = this;
+      id<MTLBuffer> handlerBuf = cntBuf;
+      [cmdBuf addCompletedHandler:^(id<MTLCommandBuffer>) {
+        vtkMetalGPUVolumeRayCastMapper* m = weakThis;
+        if (!m) return;
+        const uint32_t empties =
+          *static_cast<const uint32_t*>(handlerBuf.contents);
+        const float frac = (totalBlocks > 0 && empties <= totalBlocks)
+          ? static_cast<float>(empties) / static_cast<float>(totalBlocks)
+          : 1.0f;
+        m->MinMaxEmptyBlockFraction.store(frac, std::memory_order_relaxed);
+        if (getenv("VTK_METAL_TEST_TR_DUMP") || getenv("VTK_METAL_TEST_TR_BENCH"))
+        {
+          fprintf(stderr, "[TRMM] empty-block fraction %.4f (%u/%zu)\n",
+            frac, empties, static_cast<size_t>(totalBlocks));
+        }
+      }];
       if (getenv("VTK_METAL_TEST_TR_DUMP") || getenv("VTK_METAL_TEST_TR_BENCH"))
       {
         fprintf(stderr, "[TRMM] block summary %dx%dx%d (block=%d cells)\n",
@@ -6538,7 +6588,7 @@ bool vtkMetalGPUVolumeRayCastMapper::SetupBuffers(
     {
       for (int i = 0; i < 3; ++i)
       {
-        id<MTLBuffer> buf = [device newBufferWithLength:sizeof(VolumeMapperUniforms)
+        id<MTLBuffer> buf = [device newBufferWithLength:VolumeUniformBufferSize
                                                 options:MTLResourceStorageModeShared];
         if (!buf)
         {

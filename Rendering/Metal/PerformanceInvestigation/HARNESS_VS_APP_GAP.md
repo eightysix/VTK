@@ -2100,7 +2100,44 @@ the step-parametrized leap avoids the baseline's matrix-resync drift), and
 blocks-off mv9 output is byte-identical to the pre-change binary while the
 fine-SD gate keeps SD4 byte-identical too (19.2/19.5 ms tied).
 
-### 34.7 HANDOFF status
+### 34.7 Dense-TF counterattack: mv9 three-state WIN, baseline codegen cliff, gate refuted (2026-08-23)
+
+App testing flagged two issues; both chased to ground:
+
+1. **Xcode-Debug launch crashed** (`volumeUniforms ... has space for 1732
+   bytes, but argument has a length(1744)`): MSL rounds the uniform struct to
+   its 16-byte alignment (float3/float4 members) while C++ sizeof stays 1732.
+   All FIELD offsets verified identical on both sides (runtime-offset kernel
+   vs C++ offsetof table) — pure trailing padding, silently tolerated in
+   Release, fatal under Metal validation. Fix: allocate uniform buffers at
+   round16(1732)=1744 (`VolumeUniformBufferSize`); `MTL_DEBUG_LAYER=1` bench
+   runs now pass assertion-free.
+2. **Dense presets (Bone + Skin II) still slower than mm-off at 2048**
+   (+7 ms): tried a three-state block summary (all-SOLID blocks suspend
+   per-cell lattice work). Results split by pipeline:
+   - **mv9 preamble: huge win** — all-solid state lets batches composite
+     dense terrain with near-zero preamble cost: mv9+mm+blocks 49.7–51.0 ms
+     @2048 SD0.5 j1 = 2x under mv9-raw (~97) on Airways too.
+   - **Baseline walk: CODEGEN CLIFF** — any added live state (solidRun/
+     curBlockSolid), however minimal (even fetch-gating only), regresses the
+     whole walk ~96→116-120 ms, losing more than solid-handling gains.
+     Reverted to the proven two-state form; byte-output verified identical
+     via framework-snapshot A/B (see protocol note).
+3. **Static empty-fraction gate REFUTED**: fractions measured Airways 0.67 /
+   BoneSkinII 0.46, but the benefit flips with RESOLUTION, not just TF:
+   BoneSkinII mm+blocks WINS at 800 (−7.8%) and 1024 (−3.5%) SD0.5 and LOSES
+   at 2048 SD{0.5→+12%, SD1 +39%}. A resolution-blind threshold would throw
+   away real wins, so the BuildPerBlockData gate was removed; the fraction
+   remains as a [TRMM] diagnostic. Residual dense-TF cost at 2048 stands at
+   ~+7 ms over raw (still −18 vs HEAD-mm); at <=1024 minmax+blocks wins.
+
+PROTOCOL LESSON (§32.5 extension): saved EXECUTABLE copies do not pin behavior
+— the shader source + mapper live in vtk.framework, so A/B across versions
+must snapshot `build_macos_metal/frameworks/vtk.framework/Versions/A/vtk`
+alongside the binary (git-stash rebuild cycles otherwise compare identical
+code).
+
+### 34.8 HANDOFF status
 
 §33 items done: probe decomposition (34.1), DS retune data (34.2),
 mechanism fix (34.3), mv9 preamble adoption (34.6). Remaining:

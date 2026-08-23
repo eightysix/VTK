@@ -18,6 +18,7 @@
 #include <array>        // For std::array
 #include <vector>       // For std::vector
 #include <string>       // For std::string
+#include <atomic>       // For std::atomic (MinMaxEmptyBlockFraction)
 #include <unordered_map> // For pipeline cache
 #include <functional>    // For std::hash
 
@@ -312,6 +313,14 @@ private:
   int MinMaxBlockDims[3] = {};          // block-summary grid dims
   int MinMaxBlockSize = 0;              // block edge in fine-lattice cells (cache key)
   void* BlockReduceComputePipeline = nullptr; // id<MTLComputePipelineState> — volume_reduce_minmax_blocks
+  // Fraction of all-empty blocks in the last block-summary build, written by
+  // the reduce dispatch's completion handler. When skipping cannot pay on a
+  // transfer function (mostly-solid lattice), BuildPerBlockData clears the
+  // walk-enable flag so the march matches raw cost instead of paying the
+  // lattice walk for nothing.
+  std::atomic<float> MinMaxEmptyBlockFraction{1.0f};
+  std::size_t MinMaxEmptyBlockTotal = 0;  // blocks per build (denominator)
+  void* MinMaxCountBuffer = nullptr;     // id<MTLBuffer> shared uint atomic counter
   void* DepthStencilState = nullptr;     // id<MTLDepthStencilState>
   void* DepthTextureOcclusion = nullptr; // id<MTLTexture> — scene depth for early ray termination
   void* DummyDepthTexture = nullptr;     // id<MTLTexture> — 1x1 R32Float(1.0) fallback when no depth available

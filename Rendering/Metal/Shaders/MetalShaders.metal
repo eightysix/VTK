@@ -4548,6 +4548,12 @@ inline half4 marchVolumeUnified(
   bool  curCellEmpty = false;
   int3  curBlock    = int3(-1);
   bool  curBlockEmpty = false;
+  // Three-state block summary (empty / mixed / all-solid): while the current
+  // block is all-solid, per-cell lattice work is suspended for solidRun more
+  // iterations (skips cannot occur in solid terrain, so one step is consumed
+  // per iteration); exhaustion forces a summary refetch at the boundary.
+  bool  curBlockSolid = false;
+  int   solidRun     = 0;
   float3 mmDimF     = b.minMaxInfo.yzw;
   const bool useMinMax = fc_minmax &&
     !useIndependentPath &&
@@ -5184,6 +5190,13 @@ inline half4 marchVolumeUnified(
       // Largest dispatchable batch width, set per-frame on the CPU from the
       // sample distance (fine SD keeps 48-wide batches, coarse SD caps at 8).
       const int batchCap = max(1, int(volumeUniforms.maxBatchWidth));
+      // Block-summary cache (fc_mmBlocks): persists across batches — position
+      // advances only along the ray, so a block-index compare detects every
+      // change. State: 0 mixed (per-cell work), 1 all-empty (leap), 2
+      // all-solid (batches composite normally; preamble just stops early).
+      const float3 invMMDimF9 = 1.0f / mmDimF;
+      int3 mv9Blk = int3(-1);
+      int mv9BlkState = -1;
       while (i < steps)
       {
         // A slab pass whose inherited near-side alpha already exceeds the
@@ -5204,36 +5217,32 @@ inline half4 marchVolumeUnified(
         {
           int w = 0;
           const int extent = min(48, steps - i);
-          // Block-summary state for this preamble pass (fc_mmBlocks): one
-          // coarse fetch per changed block, then a single leap to that
-          // block's boundary plane instead of per-cell hops. Same invariants
-          // as the baseline walk: block indices derive from CELL indices
-          // (integer divide — an mmPos*blockDim product disagrees wherever
-          // fineDim/8 is not integer), leap targets are the TRUE normalized
-          // planes 8k/fineDim in fine-cell units, and the texel is sampled
-          // at its center. Disabling fc_mmBlocks eliminates every line of it.
-          const float3 invMMDimF = 1.0f / mmDimF;
-          int3 blk = int3(-1);
-          bool blkEmpty = false;
+          // Block-summary state is cached across batches (mv9Blk above).
           while (w < extent)
           {
             float3 mmPos = clamp(evalPoint + evalStep * (float)w, float3(0.0), float3(1.0));
             float3 cellCoord = mmPos * mmDimF;
             if (useMinMaxBlocks)
             {
+              // Three-state block summary; indices derive from CELL indices
+              // (integer divide — an mmPos*blockDim product disagrees with
+              // the kernel tiling wherever fineDim/8 is not integer), and the
+              // texel is sampled at its center.
               int3 newBlk = min(int3(cellCoord) / 8, int3(mmBlkDimF) - 1);
-              if (any(newBlk != blk))
+              if (any(newBlk != mv9Blk))
               {
-                blk = newBlk;
-                blkEmpty = minMaxBlockTexture.sample(sNearest,
-                    (float3(blk) + 0.5f) / mmBlkDimF, level(0)).r > 0.5;
+                mv9Blk = newBlk;
+                float bsv = minMaxBlockTexture.sample(sNearest,
+                    (float3(mv9Blk) + 0.5f) / mmBlkDimF, level(0)).r;
+                mv9BlkState = bsv > 0.75 ? 1 : (bsv < 0.25 ? 2 : 0);
               }
-              if (blkEmpty)
+              if (mv9BlkState == 1)
               {
-                // Whole block empty: leap to its far boundary along the ray.
-                int3 blkLo = blk * 8;
-                float3 loN = float3(blkLo) * invMMDimF;
-                float3 hiN = float3(min(blkLo + 8, int3(mmDimF))) * invMMDimF;
+                // All-empty block: leap to its far boundary along the ray in
+                // fine-cell units (blocks tile cells [8k,8k+8)).
+                int3 blkLo = mv9Blk * 8;
+                float3 loN = float3(blkLo) * invMMDimF9;
+                float3 hiN = float3(min(blkLo + 8, int3(mmDimF))) * invMMDimF9;
                 float3 rem;
                 rem.x = p.rayDir.x > 0.0 ? (hiN.x - mmPos.x) : (mmPos.x - loN.x);
                 rem.y = p.rayDir.y > 0.0 ? (hiN.y - mmPos.y) : (mmPos.y - loN.y);
@@ -5248,6 +5257,14 @@ inline half4 marchVolumeUnified(
                 if (leapSteps < 1) leapSteps = 1;
                 w += leapSteps;
                 continue;
+              }
+              if (mv9BlkState == 2)
+              {
+                // All-solid block: every fine fetch inside would end the skip
+                // loop anyway — stop preamble skipping and let the batches
+                // composite these steps normally. The cached state makes the
+                // re-check after each batch nearly free.
+                break;
               }
             }
             if (minMaxTexture.sample(sNearest, mmPos, level(0)).r <= 0.5) break;
@@ -5914,6 +5931,8 @@ inline half4 marchVolumeUnified(
       texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
       evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
       prefetchValid = false;
+      // Position discontinuity: any cached solid-run countdown is invalid.
+      solidRun = 0;
     } else {
       seenInBounds = true;
     }
@@ -5940,8 +5959,10 @@ inline half4 marchVolumeUnified(
             // let the sampler's normalized->texel rounding pick the neighbor
             // block right at boundaries, wrongly clearing cells whose own
             // block is solid.
-            curBlockEmpty = minMaxBlockTexture.sample(sNearest,
-                (float3(curBlock) + 0.5) / mmBlkDimF, level(0)).r > 0.5;
+            float bsv = minMaxBlockTexture.sample(sNearest,
+                (float3(curBlock) + 0.5) / mmBlkDimF, level(0)).r;
+            curBlockEmpty = bsv > 0.75;
+            curBlockSolid = bsv < 0.25;
           }
           // Block-empty ⇒ every covered fine cell is empty (reduce kernel
           // tiles by CELL indices; see newBlock above): skip the fine fetch.
@@ -7622,13 +7643,18 @@ kernel void volume_dilate_minmax(
 }
 
 // Two-level occupancy summary (VTK_METAL_TEST_MM_BLOCKS): one thread per
-// block texel of the DILATED fine lattice; writes 1.0 iff every covered fine
-// texel is 1.0 (all cells empty). blockSize arrives as a single uint. The
-// fragment walk uses this to leap whole empty blocks per lattice fetch.
+// block texel of the DILATED fine lattice; writes a three-state mark per
+// block — 1.0 all-empty (leap through it), 0.0 mixed (per-cell walk),
+// 0.5 all-solid (no cell can be skipped: suspend per-cell checking until the
+// block boundary). blockSize arrives as a single uint. emptyCount accumulates
+// the number of all-empty blocks so the CPU can gate the walk off for
+// transfer functions whose lattices are too solid for skipping to pay (a
+// static per-TF decision, resolved once per rebuild).
 kernel void volume_reduce_minmax_blocks(
     texture3d<float, access::read> fine [[texture(0)]],
     texture3d<float, access::write> blocks [[texture(1)]],
     constant uint& blockSize [[buffer(0)]],
+    device atomic_uint* emptyCount [[buffer(1)]],
     uint3 gid [[thread_position_in_grid]])
 {
   uint3 bdims = uint3(blocks.get_width(), blocks.get_height(), blocks.get_depth());
@@ -7639,17 +7665,23 @@ kernel void volume_reduce_minmax_blocks(
   uint3 end = min(start + blockSize, fdims);
 
   bool allEmpty = true;
-  for (uint z = start.z; z < end.z && allEmpty; z++) {
-    for (uint y = start.y; y < end.y && allEmpty; y++) {
-      for (uint x = start.x; x < end.x && allEmpty; x++) {
+  bool allSolid = true;
+  for (uint z = start.z; z < end.z && (allEmpty || allSolid); z++) {
+    for (uint y = start.y; y < end.y && (allEmpty || allSolid); y++) {
+      for (uint x = start.x; x < end.x && (allEmpty || allSolid); x++) {
         if (fine.read(uint3(x, y, z)).r < 0.5) {
           allEmpty = false;
+        } else {
+          allSolid = false;
         }
       }
     }
   }
 
-  blocks.write(allEmpty ? 1.0 : 0.0, gid);
+  blocks.write(allEmpty ? 1.0 : (allSolid ? 0.5 : 0.0), gid);
+  if (allEmpty) {
+    atomic_fetch_add_explicit(emptyCount, 1u, memory_order_relaxed);
+  }
 }
 
 // ---------------------------------------------------------------------------
