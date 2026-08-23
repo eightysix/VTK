@@ -3104,6 +3104,62 @@ top background processes with every anchor table; when a cross-session
 absolute discrepancy exceeds ~10%, re-run BOTH arms interleaved before
 interpreting anything.
 
+### 37.9 RETRACTION of §37.1/§37.7-37.8: the night "raw" arms were FAKE —
+missing VTK_METAL_TEST_ACCEL=0; §35.10/§35.11 stand exactly as written
+(2026-08-23 late night)
+
+User caught it: disabling minmax requires BOTH VTK_METAL_TEST_MINMAX=0 AND
+VTK_METAL_TEST_ACCEL=0. In the mapper, `UseMinMaxAcceleration` is the master
+switch (off => no lattice at all => true raw), while `fc_minmax` — the
+march's preamble-walk gate — keys off `UseMinMaxAccel` ALONE
+(vtkMetalGPUVolumeRayCastMapper.mm, feature-mask site `UseMinMaxAccel >
+0.5f -> VolumeFeature_MinMax`). With MINMAX=0 but ACCEL unset (default
+true!), the march still walks a CPU-computed DS=4 lattice: a fake raw that
+pays the exact preamble-walk tax under investigation.
+
+Every "RAW9" arm in §37.1, §37.7 and the evening matrices was fake raw.
+That manufactured the entire "no penalty exists" conclusion: both arms
+walked (fake-raw CPU-lattice 58.0 vs GPU-lattice mm 54.4 on axis-z), so of
+course mm showed no penalty against it. It also poisoned the §37.7
+"machine-state artifact" refutation and §37.8's DVFS mechanism story.
+Battery-vs-AC was real but minor (~5-8%, uniform).
+
+Corrected matrix (HEAD tonight, AC power, cam-axis views, SD4 mv9 j1,
+TRUE raw = MINMAX=0 ACCEL=0):
+
+| view | TRUE raw | plain mm | mm+blocks (new default) | §35.10 morning ref |
+|---|---|---|---|---|
+| axis-z | **39.0** | 54.4 | 47.4 | raw 39.05 / mm 54.42 / blk 47.40 |
+| axis-x | 36.2 | — | 34.9 | raw 37.02 |
+| axis-y | **28.9** | — | 31.6 | raw 29.13 / blk 31.58 |
+| obl | 21.1 | 20.5 | 19.2 | raw 21.79 / mm 20.75 / blk 19.57 |
+| SD0.5 axz j0 | 130.9 | — | **91.1** | (fine-SD tier) |
+
+Morning reproduces EXACTLY with correct flags — §35.10/§35.11's findings
+stand verbatim: at SD4, plain mm loses to true raw on axis cameras (+40%
+z), forced blocks recover most but not all (+21% z, +9% y), and mm wins
+obliques/az45. There IS a real minmax-vs-raw penalty at coarse SD; it is
+view-dependent.
+
+What survives today's work unchanged:
+- P1 ladder verdict (§37.2) — mm-arm comparison, unaffected.
+- Blocks <= plain mm EVERYWHERE (both eras, now fully confirmed): the
+  ungate (03dd74b048) remains a strict improvement over the previous
+  plain-mm default at every measured cell. Kill switch intact.
+- Parity quantifications (§37.3/§37.6) — mm-vs-blocks comparisons, valid;
+  SD0.5 blocks also beat TRUE raw by -30% (91.1 vs 130.9).
+- Seg-consume cost measurements (§35.14, §37.2) — mm-based, unaffected.
+
+REOPENED by the correction: §35.11 policy option (a) — at coarse SD the
+BEST skipping config still loses to no-skipping on axis views of this
+dataset (+21% z, +9% y with blocks), while winning obliques (-9%). A
+static SD-tier switch cannot express view-dependence; candidates for a
+future session: per-frame empty-fraction-driven walk bail-out (runtime
+signal already computed: MinMaxEmptyBlockFraction), or accepting the
+documented mixed behavior. The ungate stays; the "minmax always pays"
+assumption does not return — it remains false on obliques and true-only
+on axis views of empty-heavy datasets at coarse SD.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
