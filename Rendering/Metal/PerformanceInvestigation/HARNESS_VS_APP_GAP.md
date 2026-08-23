@@ -2401,6 +2401,38 @@ floor for this pipeline; the validated remaining headroom is the Y-depth
 orientation policy (§35.5) and anything outside the walk (batch width,
 axis-z specifics). §33's plan is fully dispositioned.
 
+### 35.7 Why is Y-depth faster? Mechanism probe (2026-08-23)
+
+Discriminating experiment: re-run X-vs-Y under GL_NEAREST (kills the
+depth'-pair fetch whose handling owned every prior layout effect,
+§15/§26). @2048² SD0.5 mv9 oblique j1, order-alternated:
+
+| arm | X-depth | Y-depth | Δ |
+|---|---|---|---|
+| NEAREST raw | 58.25 | 60.26 | +3.5% |
+| NEAREST blocks | 48.77 | 44.26 | **−9.2%** |
+
+The Y win SURVIVES NEAREST undiminished → the trilinear-z-pair
+locality model (which explained the pre-transpose tax) does NOT explain
+this one. Additional evidence against role-based models: under Y-depth
+the axy cell (marching along Y-depth's OWN depth' axis) reads 83.0 ms vs
+X-depth's 89.3 — if depth'-axis marches were intrinsically disfavored
+(the §26.5 sagittal story), Y should LOSE that cell; it wins.
+
+Refined conclusion: the effect is (a) tied to the BLOCKS regime
+(scattered post-leap composite bursts; raw streams are neutral), (b)
+governed by the PHYSICAL placement of the long 1794 extent in the
+tiler's dimension order (texture width 1794×h512×d512 vs w512×h1794×d512),
+not by which logical axis plays depth', and (c) a point-fetch locality
+property of burst access patterns, not interpolation semantics. Walk
+work is provably identical between orientations (data-space math,
+byte-identical outputs), so the delta lives entirely in volume-texture
+fetch behavior during composite bursts. Which tiling rule produces it is
+hardware/driver knowledge — settling it needs Instruments GPU counters
+(DRAM read amplification, §22 item 6, still open) or Apple input.
+Practically: the finding stands on its own measurements — validate
+breadth (§27-class) and consider flipping the tie-break policy.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
