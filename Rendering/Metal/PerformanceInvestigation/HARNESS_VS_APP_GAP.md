@@ -2154,6 +2154,149 @@ Logs: /tmp/mmprobe (probe matrix), /tmp/mmds (DS sweep), /tmp/mmblk +
 /tmp/final (timing matrices), /tmp/blkpar+/tmp/blkfix+/tmp/blkfix2+/tmp/fc3
 (parity ladder), /tmp/vtkBlkLeap (reference binary).
 
+## 35. Preset × orientation matrix: mv9+mm+blocks vs mv9-raw @2048 SD0.5 (2026-08-23)
+
+Follow-up to §34.6/§34.7 (which covered only oblique + axial-z on Airways II
+and spot checks): full matrix of **mv9-raw** (`MINMAX=0 ACCEL=0`) vs
+**mv9+mm+blocks** (`MINMAX=1 ACCEL=1 MM_BLOCKS=1`), both
+`MARCH_VARIANT=9`, @2048², SD0.5, blue-noise jitter, slabs=1, VOLTRANSPOSE +
+GPU_TRANSPOSE default-on, IMRToraceAddome. Four orientations (oblique,
+CAM_AXIS x/y/z) × five TF presets — Airways II (default) plus the four app
+presets newly wired into the bench: `VTK_METAL_TEST_PRESET=DarkBone`,
+`SkinOnBlue`, `BoneSkin`, `BoneSkinII` (verbatim from VRPresets/*.plist,
+rescaled like BoneSkinII was; bench stays shadeless per harness convention —
+note Skin On Blue's plist sets useShading=true, untested here).
+
+Protocol: ABBA order-alternated arm order per cell, 30-frame rounds,
+j0/j1 both measured. Battery 100%, no thermal flags.
+
+### 35.1 Results — mean(j0,j1) ms/frame, Δ = blocks vs raw
+
+| preset | oblique | axis-x | axis-y | axis-z |
+|---|---|---|---|---|
+| Airways II | 64.4 → 50.4 (**−21.7%**) | 133.3 → 91.5 (**−31.3%**) | 130.5 → 89.3 (**−31.6%**) | 173.7 → 133.1 (**−23.4%**) |
+| Dark Bone | 64.2 → 51.1 (**−20.4%**) | 132.6 → 92.3 (**−30.4%**) | 129.5 → 89.2 (**−31.2%**) | 175.5 → 133.9 (**−23.8%**) |
+| Skin On Blue | 64.5 → 51.3 (**−20.5%**) | 131.6 → 91.9 (**−30.2%**) | 129.5 → 89.2 (**−31.1%**) | 174.8 → 133.9 (**−23.4%**) |
+| Bone + Skin | 64.7 → 50.7 (**−21.6%**) | 131.4 → 91.5 (**−30.3%**) | 131.0 → 89.8 (**−31.4%**) | 173.1 → 132.8 (**−23.3%**) |
+| Bone + Skin II | 63.7 → 50.5 (**−20.7%**) | 131.8 → 92.1 (**−30.1%**) | 128.7 → 88.9 (**−30.9%**) | 174.3 → 133.2 (**−23.6%**) |
+
+Raw per-arm numbers (j0/j1) in `/tmp/preset_matrix/results.txt`; generator
+script preserved at `/var/folders/.../T/opencode/preset_matrix.zsh`
+(eval-env wrapper pattern, §29-compliant).
+
+### 35.2 Findings
+
+1. **mv9+mm+blocks wins every one of the 20 cells**, by a view-class margin
+   that is TF-independent: oblique −20..−22%, axis-x −30..−31%, axis-y
+   −31%, axis-z −23..−24%. The three-state mv9 block summary
+   (`44abc454f1`) has erased §34.7's dense-TF residual: Bone + Skin II no
+   longer pays "+7 ms over raw" in this protocol — it is −13 ms UNDER raw
+   at oblique (50.5/51.3 vs 63.4/64.0). The earlier +7 reading did not
+   reproduce (different session/camera state; not re-litigated).
+2. **TF choice is cost-neutral here**: all five presets land within ~1–2%
+   of each other in every cell/arm (raw oblique spans 63.4–64.9 across
+   presets). Verified the preset knob actually engages: 512² Metal renders
+   of all five presets are visually distinct with distinct hashes
+   (/tmp/preset_matrix/presets_png/). At SD0.5 frame cost is dominated by
+   traversal-to-saturation, which these CT presets reach at similar depth
+   despite different opacity ramps.
+3. **Jitter is free at SD0.5 in every cell and both arms** (|Δ| ≤ ~2 ms,
+   one +4 outlier) — replicates §31.2's post-transpose finding, now across
+   presets and all four orientations.
+4. Orientation profile matches §31.1/§26.5: raw-arm z-march is the most
+   expensive (~175), x/y ~130; blocks compresses the spread
+   (~89 y / ~92 x / ~134 z). The x-vs-y asymmetry (91.5 vs 89.3 blocks;
+   X-depth layout) is present in every preset identically.
+5. Cross-check: an earlier same-day run (broken arg-passing, axis cells
+   only) replicated these axis values within 1–3%; obliques were
+   re-measured under the fixed protocol.
+
+Session-drift caveat: absolute raw-oblique reads ~64 ms today vs §34.6's
+~97 anchor (same binary family; battery healthy). Relative A/B within
+session is the deliverable, per protocol.
+
+### 35.3 Reconciliation with the §34-era invocation: those "mv9" rows were mv0 (2026-08-23)
+
+The §34.6/§34.7-era spot-check script omits `MARCH_VARIANT`, and
+`VolumeMarchVariant()` defaults to **0** (the TEMP-REPRO pin) — so its
+"raw"/"blk" rows measure **mv0**, only its trailing "mv9 blk" row is really
+mv9. Verbatim re-run of that script on today's build (same session as
+§35.1):
+
+| cell | §34-era ref | repro | true variant |
+|---|---|---|---|
+| Airways sd0.5 raw | 96.63 | 101.53 | mv0 raw |
+| Airways sd0.5 blk | 96.22 | 95.83 | mv0 + mm+blocks |
+| BoneSkinII sd0.5 raw | 59.75 | 58.79 | mv0 raw |
+| BoneSkinII sd0.5 blk | 67.08 | 65.45 | mv0 + mm+blocks |
+| "mv9 blk" | 51.01 | 50.79 | mv9 + mm+blocks (env set here) |
+| MTL_DEBUG_LAYER 1024² | exit 0, 0 assertions | exit 0, 0 assertions | uniform-buffer fix holds |
+
+Blk cells reproduce within ±0.4–2.4%; Airways-raw ±5% (that arm is the
+noisiest — see below). Consequences:
+
+1. **The mv0 picture differs sharply from mv9**: mv0-raw is strongly
+   TF-dependent (Airways II ~97–102 — its 0.25-max-opacity ramp never
+   saturates rays, so marches run the full volume; Bone + Skin II ~59 —
+   dense ramp saturates fast), and mm+blocks on mv0 ties Airways (−5%)
+   but LOSES +11% on the dense preset — §34.7's "+7 ms" dense-TF
+   counterattack is real **on mv0 only**. Under mv9 both arms flatten
+   (~64 raw / ~51 blk on every preset) and blocks win everywhere (§35.1).
+2. **§34.6's oblique table rows labeled "mv9 ..." carry mv0-class values**
+   (97.0/95.8/95.5 ≈ today's mv0 101.5/95.8; explicit mv9 measures 64/50),
+   i.e. that session's A/B arms most likely also ran without
+   `MARCH_VARIANT`. Its axz triple (307/426/276) likewise matches the
+   §31.2 mv0-class z column. Treat §34.6's table as an **mv0** result.
+3. Net: "minmax+blocks worth it under mv9 at fine SD" (§34.6 verdict)
+   stands and extends to all presets/orientations (§35.1); the dense-TF
+   regression applies only to the baseline-variant walk, whose own
+   codegen cliff (§34.7 item 2) already blocks adding state there.
+4. Any future A/B MUST print or set `VTK_METAL_TEST_MARCH_VARIANT`
+   explicitly — the TEMP-REPRO default silently switches the variant
+   class being measured.
+
+### 35.4 Azimuth × preset compass on mv9 (2026-08-23): refines §35.2 finding 2
+
+§35.1 tested one fixed oblique camera; this compass sweeps CAM_AZ
+0..315 over the same base (@2048 SD0.5, explicit `MARCH_VARIANT=9`, ABBA
+order-alternated, j0/j1 both measured, 5 presets × 8 azimuths ×
+{raw, mm+blocks}). Full data `/tmp/preset_az/results.txt`.
+
+Blocks-vs-raw Δ% by azimuth (mean(j0,j1)) — per-preset columns show the A/B
+is azimuth-shaped but preset-independent (per-AZ spread across presets
+≤ ~1.5%):
+
+| AZ | Airways | DarkBone | SkinOnBlue | BoneSkin | BoneSkinII |
+|---|---|---|---|---|---|
+| 0° | 68.4/52.8 (−22.8%) | 64.8/51.0 (−21.3%) | 64.5/50.9 (−21.1%) | 65.5/51.9 (−20.9%) | 64.9/50.9 (−21.7%) |
+| 45° | 61.9/45.8 (−26.0%) | 60.7/43.9 (−27.7%) | 60.3/43.8 (−27.4%) | 61.0/44.3 (−27.3%) | 61.6/43.9 (−28.7%) |
+| 90° | 64.9/49.5 (−23.7%) | 63.0/48.6 (−22.8%) | 62.5/48.0 (−23.2%) | 63.3/48.4 (−23.5%) | 63.0/48.7 (−22.7%) |
+| 135° | 67.2/57.1 (−15.0%) | 64.2/53.9 (−16.0%) | 63.8/53.0 (−16.9%) | 64.2/53.4 (−16.9%) | 64.3/53.9 (−16.2%) |
+| 180° | 66.3/53.7 (−19.1%) | 64.6/51.6 (−20.1%) | 64.5/52.1 (−19.3%) | 64.6/52.1 (−19.4%) | 65.4/52.3 (−20.1%) |
+| 225° | 63.2/46.2 (−26.9%) | 61.1/44.3 (−27.5%) | 60.3/44.3 (−26.6%) | 61.1/45.2 (−26.1%) | 61.9/44.9 (−27.4%) |
+| 270° | 65.5/48.2 (−26.4%) | 62.7/46.9 (−25.2%) | 62.8/47.0 (−25.1%) | 62.8/46.9 (−25.4%) | 62.9/47.0 (−25.4%) |
+| 315° | 65.5/53.6 (−18.2%) | 63.5/51.0 (−19.7%) | 63.5/50.7 (−20.2%) | 63.9/51.1 (−20.0%) | 63.9/51.1 (−20.0%) |
+
+(cells = raw-mean/blocks-mean ms/f; note this fine-SD transposed azimuth
+profile differs from §31.1's SD4 compass regime: here az45/225 are the
+CHEAPEST cells and az135 the most expensive.)
+
+Findings (refining §35.2):
+
+1. **DarkBone / SkinOnBlue / BoneSkin / BoneSkinII are mutually
+   cost-neutral at every azimuth** (cluster spread ≤ ~1.5% both arms) —
+   §35.2's "TF choice is cost-neutral" holds across the full compass for
+   these four, not just the one camera.
+2. **Airways II is NOT free, though**: it sits +1.7..+6.6% above the
+   four-preset cluster in BOTH arms at every azimuth (largest at
+   az135/315/0). Mechanism: its opacity tops out at 0.25, so rays never
+   reach the 0.996 early-exit threshold and march the full volume; the
+   other presets saturate and trim ray length. The TF lever that matters
+   on mv9 is SATURATION DEPTH (march length), not ramp content/color.
+3. The minmax+blocks win therefore generalizes: −15..−17% (az135) to
+   −26..−29% (az45/225) with negligible preset interaction. Jitter stays
+   free (|Δ| ≤ ~2 ms, one +3 outlier at az135-blk).
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
