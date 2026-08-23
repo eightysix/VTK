@@ -5235,8 +5235,14 @@ inline half4 marchVolumeUnified(
       const float3 invMMDimF9 = 1.0f / mmDimF;
       // §37.18 block size in fine cells (default 8); supers remain fixed
       // 64-cell tiles, so blocks-per-super-line derives from it.
+      // §37.20: the per-iteration integer DIVIDES this used to cost real time
+      // on walk-heavy chords (+13% axis-z); hoisted here as EXACT fp
+      // reciprocals — every legal block size is a power of two, so x*invBs is
+      // bit-exact against x/bsI and truncation still matches division.
       const int bsI = max(int(volumeUniforms.mmBlockSizeCells), 1);
       const int bpsI = 64 / bsI;
+      const float invBs = 1.0f / float(bsI);
+      const float invBps = 1.0f / float(bpsI);
       int3 mv9Blk = int3(-1);
       int mv9BlkState = -1;
       // §35.5 (VTK_METAL_TEST_MM_SUPER -> fc_mmSuper): third occupancy level.
@@ -5399,7 +5405,7 @@ inline half4 marchVolumeUnified(
               // (integer divide — an mmPos*blockDim product disagrees with
               // the kernel tiling wherever fineDim/8 is not integer), and the
               // texel is sampled at its center.
-              int3 newBlk = min(int3(cellCoord) / bsI, int3(mmBlkDimF) - 1);
+              int3 newBlk = min(int3(cellCoord * invBs), int3(mmBlkDimF) - 1);
               if (any(newBlk != mv9Blk))
               {
                 mv9Blk = newBlk;
@@ -5409,7 +5415,7 @@ inline half4 marchVolumeUnified(
               }
               if (useMinMaxSuper)
               {
-                int3 newSb = min(mv9Blk / bpsI, int3(mmSbDimF) - 1);
+                int3 newSb = min(int3(float3(mv9Blk) * invBps), int3(mmSbDimF) - 1);
                 if (any(newSb != mv9Sb))
                 {
                   mv9Sb = newSb;

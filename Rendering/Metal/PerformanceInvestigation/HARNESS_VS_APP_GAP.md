@@ -3627,6 +3627,64 @@ serving all geometries. Every mechanism-level alternative has now been
 built or derived and refuted by measurement. The single live action is
 the BS16 default-flip after clean-machine confirmation (§37.18 protocol).
 
+### 37.20 BS16 default-flip ATTEMPTED AND REVERTED — numbers not
+reproducible across sessions; divide-regression found and fixed; deciding
+protocol defined (2026-08-24 night)
+
+Rerun of the §37.11 validation suite with MM_BLOCKSIZE=16 surfaced three
+findings, one regression fix, and one honest retreat:
+
+1. ENV AUDIT (requested): command expansion printed verbatim and knob
+   plumbing proven end-to-end via built-in dumps — both arms compile the
+   identical mv9 pipeline (mask 0x89004028, variant=9, minmax=1); TRAW arm
+   carries MINMAX=0 ACCEL=0; only delta between arms is MM_BLOCKSIZE
+   (block summary 16x16x57 bs=8 vs 8x8x29 bs=16). Flags equal to the
+   §37.14 reference recipe.
+
+2. CALIBRATION, not degradation: anchors read +16-20% vs §37.11/37.15-era
+   absolutes. Protocol-change hypothesis (frames 25->100) REFUTED (f25
+   reproduces the elevated values). Same-binary A/B settled it: the exact
+   §37.15 binary re-measured TONIGHT reads z_TRaw 36.06 / obl_MM 19.39
+   where it read 30.39 / 16.06 last night. Identical code, identical
+   recipe -> last night's window ran fast (post-analytical-break boost
+   clocks); cross-session absolute comparison is void in BOTH directions.
+   Within-batch ratios remain valid.
+
+3. REGRESSION FOUND & FIXED: interleaved old-vs-new binaries exposed a
+   real +12.7% mm-arm cost on axis-z from §37.18's per-iteration integer
+   divides (`cellCoord/bsI` replaced compile-time shifts). Fix: hoist to
+   per-fragment EXACT fp reciprocals (`invBs = 1/bs`; every legal size is
+   pow2 so x*invBs ≡ x/bs bit-exactly; truncation still matches integer
+   division). Byte-parity 0.000%; interleaved z_MM_BS8 after fix
+   40.45/39.35 vs old binary 40.32 — parity restored. Landed.
+
+4. BS16-vs-BS8 VERDICT: NOT REPRODUCIBLE. Tonight's 3-round interleaved
+   medians: z BS16 **35.81** < TRAW 36.34 (BS16 beat raw in ALL THREE
+   rounds — first config ever to do so) while BS8 loses (+9.7%);
+   BUT obl says BS8 wins (17.25 vs 19.36) — contradicting yesterday's
+   frames=100 pass where BS16 won obl by ~4%. y flipped sign between
+   batches. The default flip to 16 was applied and then REVERTED: two
+   windows disagree on the oblique sign, no BS16 number has ever been
+   reproduced against b56f7738e4 reference conditions, and the incumbent
+   stays until evidence clears the bar. Suspected root of the
+   non-portability: skip-heavy and fetch-heavy paths scale DIFFERENTLY
+   with clock residency, making single-session view verdicts
+   environment-conditioned.
+
+DECIDING PROTOCOL (next clean window, before any default change):
+- Anchor gate first: z_TRaw and obl_MM within ±3% of a FRESH same-session
+  baseline (not historical tables — those are calibration-dependent).
+- Triple-arm {env-BS8 (= b56f7738e4 behavior, byte-proven), BS16} ×
+  {z, y, obl, az45, x} × >=5 order-alternated rounds at frames>=60;
+  report medians + round-level spreads; require non-overlapping
+  distributions to declare a winner per view.
+- ADD orbit-integrated metric: mean frame time over a CAM_AZ 0..315 sweep
+  per block size — integrates all view classes into the number users
+  actually experience and dilutes single-view noise.
+- Only if BS16 wins or ties the orbit metric with non-overlapping spread:
+  flip default; otherwise document BS8 as incumbent with BS16 as the
+  documented axis-chord remedy via VTK_METAL_TEST_MM_BLOCKSIZE=16.
+
 ### 37.14 Reproduction recipe for all §37 benchmarks
 
 Commits: measurements taken on `1896bf38bd` code (single-tier cap32;
