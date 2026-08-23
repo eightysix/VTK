@@ -3258,6 +3258,119 @@ bail-out (§37.10 reserve list). Do not re-derive the cap map without
 re-reading this section: both arms' optima moved when blocks went
 default-on, and cross-cap comparisons silently fake verdicts.
 
+### 37.12 Cross-preset validation: cap32 optimal for all five VR CLUTs; the
+minmax penalty/advantage is VIEW-dominated, not transfer-function-dominated
+(2026-08-23 night)
+
+The DICOM scene carries five presets behind VTK_METAL_TEST_PRESET
+(Airways II = default, DarkBone, SkinOnBlue, BoneSkin, BoneSkinII),
+spanning mostly-empty (airways/lung) to mostly-opaque (bone+soft-tissue)
+opacity classes. SD4 @2048² j1, equal-cap parity (both arms cap32),
+blocks-on default:
+
+| preset | obl raw_c32 | obl mm_c32 | Δ | z raw_c32 | z mm_c32 | Δ |
+|---|---|---|---|---|---|---|
+| AirwaysII | 21.56 | **16.40** | −24% | **31.09** | 35.50 | +14% |
+| DarkBone | 11.69 | **10.48** | −10% | **19.80** | 22.13 | +12% |
+| SkinOnBlue | 14.51 | **13.39** | −8% | **24.26** | 27.45 | +13% |
+| BoneSkin | 11.40 | **10.22** | −10% | **18.61** | 21.05 | +13% |
+| BoneSkinII | 10.43 | **9.64** | −8% | **17.30** | 19.58 | +13% |
+
+Verdicts:
+
+1. **cap32 is optimal for every CLUT** (mm obl c8->c32: −13..−17% each;
+   e.g. Airways 19.58->16.40, BoneSkinII 11.25->9.64). The landed tier is
+   not an airways-tuned artifact.
+2. **The mm-vs-raw sign pattern is set by chord geometry, not opacity
+   class**: oblique wins −8..−24% on ALL presets (even mostly-opaque ones
+   keep large skippable background-air spans); axis-z loses a uniform
+   +12..14% on ALL presets. Airways' lung empties buy a bigger oblique
+   win, nothing more.
+3. Consequence: the per-ray walk bail-out (§37.10 reserve) targets the ONE
+   remaining deficit class (straight axis chords) generally — it would fix
+   DarkBone's axis-z exactly like Airways'. No per-preset policy needed,
+   ever.
+
+Extension (same night): full {c48 vs c32} x {obl, z} x {SD4 j1, SD0.5 j0}
+mm-arm grid, all five presets (ms, c48 -> c32):
+
+| preset | obl SD4 | z SD4 | obl SD0.5 | z SD0.5 |
+|---|---|---|---|---|
+| AirwaysII | 16.34 -> 16.37 | 37.51 -> **35.54** | 51.35 -> **50.37** | 134.53 -> **132.23** |
+| DarkBone | 11.23 -> **10.65** | 23.98 -> **22.01** | 30.56 -> **29.42** | 81.28 -> **79.64** |
+| SkinOnBlue | 13.86 -> **13.40** | 29.14 -> **27.43** | 40.92 -> **39.96** | 105.18 -> **102.21** |
+| BoneSkin | 10.88 -> **10.02** | 22.55 -> **20.95** | 33.19 -> **31.70** | 78.96 -> **78.28** |
+| BoneSkinII | 10.50 -> **9.64** | 21.28 -> **19.53** | 30.23 -> **29.42** | 72.71 -> **71.04** |
+
+cap32 >= cap48 in all 40 cells: clear wins on axis views and bone presets
+at SD4 (-5..-9%), tie-ish obliques at SD4 (Airways), consistent -1..-4.5%
+at SD0.5. The single-tier landed value survives every preset, both
+march densities, and both view classes. (Protocol note: an earlier attempt
+at this grid used a `[ $v == Z ]` test that zsh rejects inside eval — the
+view env silently stayed empty and every row rendered oblique; duplicate-
+pair outputs are the tell. Verify view labels when run-generator output
+looks suspiciously uniform.)
+
+### 37.13 Reassessment: the remaining pathological cells are exactly
+{straight axis chords} x {any CLUT}, +6..14% at cap parity — mechanism and
+ranked fixes (2026-08-23 night)
+
+Deficit inventory after today's landings (equal-cap parity, cap32, blocks
+default, SD4 @2048² j1): axis-z +13..14%, axis-y +6%, across ALL five
+CLUTs (§37.12) — while axis-x −10%, obl −8..−26%, az45 −33%, SD0.5 −30%
+everywhere. The pathology is one class: long straight chords through
+fine-grained interleaved terrain (vessels in lung parenchyma, bronchi,
+trabeculae).
+
+Mechanism (constrained by P1 + §35.x): on such chords the block/super
+summaries rarely certify all-empty at 32³-voxel granularity, so each batch
+falls into the PER-CELL preamble walk — whose certification granularity
+(DS=4 cell ≈ 1 step along z) matches the sampling step. The walk then does
+lattice-tap + boundary-solve + ceil work per step that raw simply doesn't
+do, and it SERIALIZES ahead of the batch (critical-path extension), while
+raw's empty samples pipeline branch-free through fetch+TF+zero-composite.
+Skipping yield ≈ 0 ⇒ pure tax. Coarsening the lattice can't fix it (DS8/16
+regressed az45/obl, §37.10); wider caps already applied.
+
+Ranked candidate fixes:
+
+1. **Block-or-nothing coarse tier** (spatial selectivity — recommended
+   first). At sd >= 1.5, delete the per-cell tier of the preamble: trust
+   only super/block certification; a mixed block dispatches the batch
+   immediately (empties inside composite as exact zeros — output stays in
+   the accepted ±1-step class). Fragmented axis chords then behave ≈ raw +
+   cached-block-tap overhead (taps amortize via mv9Blk state), while
+   airways/lungs/background keep their block/super leaps — oblique wins
+   should survive nearly intact since their skips ARE block-granular.
+   Surgery: gate the cell-walk section behind an sd-tier uniform/fc;
+   env-gate as MM_BLOCKSONLY first. Risk: fine-SD tier untouched by
+   construction; coarse-oblique could lose small cell-level hops — measure.
+2. **Duty-cycled walking** (temporal selectivity — cheapest). One loop-
+   carried counter: walk the preamble only every M-th outer iteration
+   (M≈4 static first pass); between walks, batches composite straight
+   through empties at raw cost. Smoothly blends mm<->raw per ray with zero
+   hysteresis problems (no irreversible decisions like a bail-out flag);
+   asymptotically bounds worst case near raw for ANY future dataset.
+   Registers: +1 int (cliff risk small but real — measure against §35.14
+   law).
+3. **Per-ray bail-out flag** (cruder #2): disable walking entirely after N
+   low-yield iterations. Simpler than #2 but irreversible per ray — a ray
+   entering spine-first then hitting lung loses its later skips. Prefer #2
+   unless #2's counter itself cliffs.
+4. **Seg-consume under cap32** (parked): iteration counts dropped 4× since
+   §35.14 priced its +48 ms; if #1/#2 leave >5 ms on axis-z, re-price
+   before writing it off.
+
+Not solutions (re-confirmed tonight): lattice coarsening (DS8/16 regress
+az45/obl), frame-level MinMaxEmptyBlockFraction gating (volume-wide signal
+cannot see per-view chord geometry), per-preset/per-view policies (§25.5
+anti-pattern).
+
+Next session: implement #1 behind VTK_METAL_TEST_MM_BLOCKSONLY, ABBA
+against raw+c32 and mm+c32 on {z, y, obl, az45} × {AirwaysII, DarkBone},
+then decide vs #2. Success bar: axis-z within ~3% of raw while obliques
+keep ≥ half of current win.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
