@@ -1276,6 +1276,21 @@ inline void BuildDICOMVolumeScene(vtkRenderer* renderer, BackendKind b)
       color->AddRGBPoint((ox1[i] + 1024.0) * (255.0 / 4095.0), cr[i][0], cr[i][1], cr[i][2]);
     }
   }
+  else if (preset == "SolidFlat")
+  {
+    // §37.17 divergence-isolation probe: constant low opacity across the
+    // FULL scalar range -> every occupancy cell certifies non-empty -> no
+    // block/super/cell skip can ever fire. The mm arm then differs from raw
+    // by preamble machinery alone (zero leaps, zero lane scatter), so the
+    // axis-chord deficit on this preset bounds the static cost; the deficit
+    // on real presets minus this bound estimates the leap-scatter share.
+    const double lo = (-1024.0 + 1024.0) * (255.0 / 4095.0);
+    const double hi = (3071.0 + 1024.0) * (255.0 / 4095.0);
+    opacity->AddPoint(lo, 0.04);
+    opacity->AddPoint(hi, 0.04);
+    color->AddRGBPoint(lo, 1.0, 1.0, 1.0);
+    color->AddRGBPoint(hi, 1.0, 1.0, 1.0);
+  }
   else
   {
     const double xs[4] = { -742.1, -683.0, -481.0, -333.5 };

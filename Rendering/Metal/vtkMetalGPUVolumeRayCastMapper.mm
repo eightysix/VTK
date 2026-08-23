@@ -249,9 +249,13 @@ struct VolumeMapperUniforms
   // near-zero skip yield. Output-safe: dropped skips cover provably-zero
   // samples only (identical sample positions, zero-opacity contributions).
   float MmBlocksOnly;              // 1732..1735
+  // §37.17 leap-granularity selector (VTK_METAL_TEST_MM_LEAPLEVEL): 2 =
+  // super+block leaps (default/landed behavior), 1 = super leaps only
+  // (coherence probe: 8x fewer leap events), <=0 = no occupancy leaps.
+  float MmLeapLevel;               // 1736..1739
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1736,
+static_assert(sizeof(VolumeMapperUniforms) == 1740,
   "VolumeMapperUniforms must be 1736 bytes to match Metal shader struct");
 
 // MSL rounds the shader-side struct up to its 16-byte alignment (float4/float3
@@ -8818,6 +8822,12 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   if (const char* bo = getenv("VTK_METAL_TEST_MM_BLOCKSONLY"))
   {
     uniforms.MmBlocksOnly = std::atof(bo) != 0.0 ? 1.0f : 0.0f;
+  }
+  // §37.17 leap-granularity: 2 (default) = super+block leaps.
+  uniforms.MmLeapLevel = 2.0f;
+  if (const char* ll = getenv("VTK_METAL_TEST_MM_LEAPLEVEL"))
+  {
+    uniforms.MmLeapLevel = static_cast<float>(std::atoi(ll));
   }
 
   // Final color window/level (matches OpenGL's in_scale/in_bias, applied in the

@@ -3468,6 +3468,72 @@ integrity wall:
    default wins −5..−13 ms on obl/az45/x/SD0.5 across every CLUT versus
    losing ≤5 ms on two axis views of one geometry class.
 
+### 37.17 THE MECHANISM FOUND: the axis-chord deficit is 100% leap dynamics
+— static cost is provably ~zero; blocks carry all yield; supers never fire
+(2026-08-24)
+
+Three probes settled what §37.13-37.16 could only conjecture. Environment
+caveat: anchors remained +19% over clean values all night (thermal residue;
+opencode itself holds ~75% of one CPU core, competing for SoC power), so
+only within-batch comparisons are quoted — each batch interleaved its arms.
+
+Probe 1 — SolidFlat preset (NEW, VTK_METAL_TEST_PRESET=SolidFlat): constant
+0.04 opacity across the full scalar range -> every occupancy cell certifies
+non-empty -> NO skip can ever fire. Result: mm arm ≈ raw arm EVERYWHERE
+(z 16.52 vs 16.42 = +0.6%; obl 9.75 vs 9.76 = ±0%). The entire preamble
+machinery, mm state registers, lattice bindings and runtime gates cost
+~nothing when idle. STATIC-COST THEORY DEAD.
+
+Probe 2 — fc-flag plumbing audit: fc_mmBlocks/fc_mmSuper/fc_segHop are
+MSL FUNCTION CONSTANTS ([[function_constant(35/36/37)]]) — PSOs are
+specialized per feature set, so dead paths were never in the compiled code
+to begin with. Consistent with Probe 1; also kills any future "strip dead
+code" proposal by construction.
+
+Probe 3 — leap-granularity sweep (NEW knob VTK_METAL_TEST_MM_LEAPLEVEL:
+2 = super+block leaps [default, byte-identical parity verified], 1 =
+super-only, 0 = none; Airways, SD4 @2048² c32):
+
+| view | LL2 all leaps | LL1 super-only | LL0 none |
+|---|---|---|---|
+| obl | **17.75** | 27.93 | 27.84 |
+| z | **40.96** | 75.40 | 77.84 |
+
+Reading: block-level leaps (32-voxel granularity) do essentially ALL the
+skipping work — removing them while keeping supers changes nothing vs
+removing skips entirely, because supers (~64³-voxel all-empty regions)
+essentially never certify on real anatomy. And the cell tier alone is
+WORSE than raw (LL0 77.8 vs raw-z ~36 in-batch): fine-grained hops pay
+full scatter without meaningful sample savings. Combined with §37.15
+(removing cells while keeping blocks: neutral), the architecture is now
+fully mapped:
+
+- BLOCK leaps: all the yield. Net −5..−8 ms on obl/az45/x; net +2..5 ms
+  on z/y.
+- CELL tier: free insurance (§37.15); catastrophic as the only skipper
+  (this probe).
+- SUPER tier: decorative on anatomical data.
+- Machinery: free when idle (SolidFlat).
+
+Mechanism (final form): both arms share the same unrolled composite
+ladder; the preamble only pre-advances positions. On straight axis chords
+raw marches with perfect cross-lane slice-lockstep (all lanes sample the
+same few tiles together) — that coherence is WHY raw-z is disproportionately
+fast. Divergent leap lengths scatter lanes across many slices, forfeiting
+exactly that advantage; the deficit is leap-scatter cost minus skipped-
+sample savings, positive only where lockstep was strongest (z/y).
+
+Remaining unswept axis: BLOCK SIZE (hardcoded 8 cells,
+VolumeMinMaxBlockSize; builder kernels + shader /8 *8 index math all
+assume it). 16-cell blocks would halve scatter events per saved sample
+but miss medium empties — sign unknown, requires builder+shader surgery
+and a full-clock machine; queued as the last cheap-ish experiment.
+
+Otherwise the honest conclusion stands strengthened: one code path cannot
+beat raw's coherence on straight chords while beating it everywhere else;
+accepting the documented trade (or a future warp-coherent skip design)
+is the decision left.
+
 ### 37.14 Reproduction recipe for all §37 benchmarks
 
 Commits: measurements taken on `1896bf38bd` code (single-tier cap32;

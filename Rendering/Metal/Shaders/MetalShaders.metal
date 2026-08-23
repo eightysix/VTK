@@ -2994,6 +2994,11 @@ struct VolumeMapperUniforms {
   // default walk (dropped skips cover provably-zero samples at unchanged
   // positions).
   float mmBlocksOnly;
+  // §37.17 leap-granularity selector (VTK_METAL_TEST_MM_LEAPLEVEL): 2 =
+  // super+block leaps (default), 1 = super only, <=0 = none. Coherence
+  // probe for the axis-chord deficit (SolidFlat proved the deficit is
+  // 100% leap dynamics; fewer/larger leaps cut lane-scatter events).
+  float mmLeapLevel;
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -5349,7 +5354,7 @@ inline half4 marchVolumeUnified(
                       (float3(mv9Sb) + 0.5f) / mmSbDimF, level(0)).r;
                   mv9SbEmpty = ssv > 0.5f;
                 }
-                if (mv9SbEmpty)
+                if (mv9SbEmpty && volumeUniforms.mmLeapLevel > 0.5f)
                 {
                   // All-empty super-block: every covered cell is empty, so
                   // leap to its far boundary along the ray in fine-cell units
@@ -5373,7 +5378,7 @@ inline half4 marchVolumeUnified(
                   continue;
                 }
               }
-              if (mv9BlkState == 1)
+              if (mv9BlkState == 1 && volumeUniforms.mmLeapLevel > 1.5f)
               {
                 // All-empty block: leap to its far boundary along the ray in
                 // fine-cell units (blocks tile cells [8k,8k+8)).
