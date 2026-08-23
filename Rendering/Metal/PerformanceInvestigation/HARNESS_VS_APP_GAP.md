@@ -2433,6 +2433,36 @@ hardware/driver knowledge — settling it needs Instruments GPU counters
 Practically: the finding stands on its own measurements — validate
 breadth (§27-class) and consider flipping the tie-break policy.
 
+### 35.8 Y-depth confirmation sweep (2026-08-23): wins 11/11 views
+
+Full ABBA per cell (x,y,y,x order-alternated by cell parity), @2048²
+SD0.5 mv9 mm+blocks j1, IMRToraceAddome. Closes §35.5's coverage gaps:
+the whole azimuth compass plus all three axes now measured interleaved
+(previously only obl/az45/az135/axz were ABBA'd; axx/axy were single-run).
+
+| view | X mean | Y mean | Δ |
+|---|---|---|---|
+| az0° | 52.55 | 46.84 | −10.9% |
+| az45° | 45.36 | 40.14 | −11.5% |
+| az90° | 49.68 | 43.98 | −11.5% |
+| az135° | 56.44 | 49.72 | −11.9% |
+| az180° | 53.57 | 47.61 | −11.1% |
+| az225° | 47.41 | 40.70 | −14.2% |
+| az270° | 47.85 | 43.00 | −10.1% |
+| az315° | 52.71 | 47.25 | −10.4% |
+| axis-x | 94.48 | 83.85 | −11.2% |
+| axis-y | 91.28 | 84.66 | −7.3% |
+| axis-z | 136.02 | 124.44 | −8.5% |
+
+Within-arm replicates ≤ ±0.7 ms (worst: az135-x 55.69–57.19). Verdict:
+Y-depth is uniformly −7..−14% under mm+blocks at this config across every
+oblique angle and all axis views — no view class escapes or inverts it.
+Combined with §35.5's second/third-dataset cells and render parity
+(§35.5: zero px >1LSB), the finding is breadth-confirmed on this dataset;
+remaining scope caveats for a policy flip: other datasets have only
+obl+axz interleaved-less cells, SDs beyond {0.5, 4-obl} unswept, single
+GPU/dataset-modality class (§27.3 caveats apply verbatim).
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
