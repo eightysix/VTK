@@ -2908,6 +2908,98 @@ scheduler into a compute kernel:
 4. Whatever lands: doc section here, default-off env gate, warmup ≥ 5
    protocol, anchors table updated.
 
+## 37. EXECUTED (2026-08-23 afternoon): the §36 premise collapsed — no minmax
+penalty exists on a healthy machine; 2-level blocks win EVERYWHERE and are
+the real fix (2026-08-23)
+
+§36's execution order was followed until the measurements invalidated its
+target. Full matrix, 2048² SD4 mv9, --warmup 8 frames 30, order-alternated
+passes agreeing within ±2%:
+
+### 37.1 The penalty did not reproduce
+
+| view | jitter | RAW9 | MM8 (HEAD preamble) | BLK anySD | BLK+SUPER | SEG c8 |
+|---|---|---|---|---|---|---|
+| axz | j0 | 39.0 | 38.3 | **32.3** | — | 70.4 |
+| axz | j1 | 45.0 | 43.6 | **35.0** | 42.5 | 91.6 |
+| axy | j0 | 36.1 | 35.7 | **31.8** | — | — |
+| axy | j1 | 37.7 | 36.6 | **31.3** | — | — |
+| az45 | j1 | 22.3 | 21.3 | **19.8** | — | — |
+| obl | j0 | 21.7 | 20.0 | **18.7** | — | — |
+| obl | j1 | 22.4 | 21.0 | **19.7** | — | 47.8 |
+
+**mm beats raw on every view at both jitter settings today.** The historical
+"+10 ms mm-vs-raw at SD4 axes" anchor (51.4 vs 40.8) does not exist on the
+current machine state; §35.x-session absolutes (55.08 mm-axz etc.) were
+measured adjacent to the system-overload incident and are degraded-machine
+artifacts. Relative orderings were stable then and now; absolutes shift up
+to ±20% with machine state. All future anchors must record battery/thermal
+state.
+
+### 37.2 P1 ladder sweep — code-size cliff REFUTED, direction inverted
+
+VTK_METAL_TEST_MARCH_CAP sweep on the §35.14 seg-consume path (which carries
+the +48 ms pipeline penalty), axz j0: cap 8 → 70.4, cap 4 → 83.1, cap 2 →
+118.6, cap 1 → 171.1. MM without seg shows the same direction (cap 4 → 47.1
+vs cap 8 → 38.3). **The consume penalty GROWS as the batch width shrinks**
+(≈ ∝ outer-iteration count), so it is per-iteration interaction, not
+code-size/I-cache. §36.2's "smaller ladder frees headroom" hypothesis is
+dead; keep cap ≥ 8 at coarse SD.
+
+### 37.3 Blocks-anySD: uniformly fastest, but NOT byte-identical at DS=4
+
+With VTK_METAL_TEST_MM_BLOCKS=1 VTK_METAL_TEST_MM_BLOCKS_ANY_SD=1 (2-level;
+the SD<1.5 gate lifted by the probe env), blocks beat plain mm by 6-20% on
+EVERY view and both jitters — including the obliques whose "~+1 ms" loss was
+the original reason for the coarse-SD gate (§33). That rationale is refuted
+on current machine state.
+
+Parity vs HEAD-mm at SD4 (PNG pixel diff, j0):
+- axz: 0.44% of pixels differ, mean |d| 1.03 LSB on differing px, max 21
+- obl: 0.14% differ, mean 1.06 LSB, max 73 (2 px > 8)
+
+This is the accepted ±1-step fp-landing class, NOT byte-identical: §33's
+"byte-identical" claim holds only for the fine-SD DS=2 lattice where cell-
+and block-boundary arithmetic coincide. At DS=4 the block-leap landing
+arithmetic differs from the cell-walk's (+1e-4-per-cell chain), producing
+rare single-pixel outliers on silhouettes.
+
+BLK+SUPER (3-level) is WORSE than 2-level at coarse SD (axz j1: 42.5 vs
+35.0) — super taps add per-batch work without payoff when block leaps
+already cover the empty spans. Keep super off at coarse SD.
+
+### 37.4 §36 path statuses after execution
+
+- **P1**: done (env-only, no code needed — MARCH_CAP already existed).
+  Refuted code-size cliff; §37.2.
+- **P2 (pointer-vs-index)**: MOOTED. Its purpose was pricing Design A; the
+  target vanished (§37.1) and P1 showed the residual seg-penalty is
+  iteration-driven rather than fixed-cost, which P2's fixed-param swap would
+  not have resolved anyway.
+- **Design A (tap-and-leap)**: PREMISE DEAD. Its justification was
+  "persistent state always cliffs" — but BLK adds cached block-state on top
+  of mm and wins everywhere on this machine state. And its success bar is
+  now BLK's 35.0/19.7, which transient taps (≥1 tap/batch, no caching)
+  cannot beat against amortized <1 tap/batch cached lookups.
+- **Design B (compute marcher)**: trigger unmet (>5 ms left on the table —
+  there isn't, relative to BLK).
+
+The seg pre-pass (§35.14) stays default-off investigation code; its consume
+pipeline remains ~+32-48 ms and is now understood to be iteration-count-
+driven, not register/code-size — do not resurrect it for skipping.
+
+### 37.5 Recommendation (pending sign-off — image-class tradeoff)
+
+Make the 2-level block summary the DEFAULT whenever GPU minmax is active,
+for ALL sample distances (delete both the env requirement and the SD<1.5
+gate; keep VTK_METAL_TEST_MM_SUPER opt-in off at coarse SD). Expected:
+6-20% frame-time win over shipped mm on every view class at SD4, larger in
+empty-heavy scenes; cost: sub-LSB-class deltas on <0.5% of pixels with rare
+single-pixel outliers at coarse SD (fine SD stays byte-identical per §33).
+If byte-exactness at coarse SD is non-negotiable, the alternative is gating
+default-on to sampleDistance < 1.5 only (status quo ante) — but then SD4
+keeps paying ~15% vs achievable.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
