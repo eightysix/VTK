@@ -1350,7 +1350,14 @@ static int VolumeMinMaxBlockSize()
 // path keeps byte-identical HEAD behavior.
 static bool VolumeMinMaxBlocksWanted(bool gpuMinMax, double sampleDistance)
 {
-  return VolumeMinMaxBlocksActive() && gpuMinMax && sampleDistance < 1.5;
+  if (!VolumeMinMaxBlocksActive() || !gpuMinMax)
+    return false;
+  // §35.10 probe (VTK_METAL_TEST_MM_BLOCKS_ANY_SD): lift the fine-SD gate so
+  // blocks can be A/B'd at coarse SD, where mm-without-blocks now measures
+  // SLOWER than raw on axis views. Investigation-only.
+  if (getenv("VTK_METAL_TEST_MM_BLOCKS_ANY_SD"))
+    return true;
+  return sampleDistance < 1.5;
 }
 
 // §35.5 headroom A/B (VTK_METAL_TEST_MM_SUPER): third occupancy level —

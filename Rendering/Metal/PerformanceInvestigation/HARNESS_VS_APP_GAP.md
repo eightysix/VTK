@@ -2502,6 +2502,48 @@ Conclusions:
    coarse-SD ranking remains pipeline-dependent and is best left to the
    existing policy/env.
 
+### 35.10 NEW FINDING + blocks-at-SD4 probe (2026-08-23): mm LOSES to raw at SD4 on axes; blocks recover most of it
+
+Interleaved raw-vs-mm pairs @2048² SD4 mv9 X-depth j1 (first time mm-on
+is A/B'd against mm-off on current code — §16's "minmax wins at SD4"
+compared against GL, which has no minmax; §25.2's caveat finally bit):
+
+| view | raw | mm | mm penalty |
+|---|---|---|---|
+| obl | 21.3 | 20.7 | none (mm −2%) |
+| axis-y | 29.0 | 36.7 | **+27%** |
+| axis-z | 39.0 | 54.6 | **+40%** |
+
+Confirmed by a second interleaved pass. The "minmax wins at SD4"
+standing assumption is dead on transposed+mv9 code: at SD4 the lattice
+walk taxes more than skipping pays except on obliques. Blocks probe
+(`VTK_METAL_TEST_MM_BLOCKS_ANY_SD=1`, env-gated lift of the <1.5 gate;
+three-arm ABBA rotation, X-depth):
+
+| view | raw | mm | mm+blocks (forced) |
+|---|---|---|---|
+| obl | 21.79 | 20.75 | **19.57** (−10% vs raw, best) |
+| az135 | 18.38 | 21.18 | 18.79 (≈raw) |
+| axis-y | 29.13 | 36.71 | 31.58 (+8% vs raw) |
+| axis-z | 39.05 | 54.42 | 47.40 (+21% vs raw) |
+
+Verdicts:
+
+1. Blocks at SD4 make minmax SAFE (mm+blk <= mm everywhere, often <),
+   but on axis views mm+blocks still loses to plain RAW — the walk's
+   fixed per-crossing cost exceeds skip yield for short coarse-SD
+   marches. Raw remains the best SD4 config on axes; mm+blocks wins
+   only the oblique class.
+2. Image caveat for any SD4-blocks default: DS=4 lattice => 32-voxel
+   leaps => the wider ±1-step quantization class §34.5 gated away (up to
+   ~10K px >1LSB @2048 in the worst pre-gate cells). Not byte-clean.
+3. Unexplored: DS interplay at SD4 (MM_DS=2 with blocks — finer cells
+   might improve axz skip yield further; §34.2's DS data was fine-SD).
+4. Policy options for SD>=1.5: (a) keep mm off (best on axes, −10% on
+   oblique vs mm+blk), or (b) mm+blocks everywhere (uniform behavior,
+   +21% worst case). Either is a static SD-tier decision; (a) is
+   currently the performance-optimal read on this dataset.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
