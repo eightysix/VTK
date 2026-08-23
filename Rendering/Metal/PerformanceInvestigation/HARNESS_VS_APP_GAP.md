@@ -2590,10 +2590,44 @@ Findings:
    shape; candidate future fix is an early walk bail-out after N
    fruitless crossings (runtime-adaptive — needs §25.5 review) or
    simply keeping minmax off at coarse SD (policy (a)).
-4. Refined policy read for SD>=1.5: if minmax stays on there, retune
+ 4. Refined policy read for SD>=1.5: if minmax stays on there, retune
    ComputeMacrocellDownsample to return 8 in the coarse tier
    (`useGPUMinMax && sd >= 1.5 ? 8 : ...`); if it goes off, DS is moot.
    Either way blocks stay fine-SD-only.
+
+### 35.12 Residual walk-tax decomposition: three fixes attempted, all refuted; tax localized (2026-08-23)
+
+Goal: close the +18..40% mm-vs-raw gap at SD4 axis views. All experiments
+@2048² mv9 X-depth j1, ABBA/rotation-balanced, reverted after refutation
+(HEAD binary re-verified: axz-ds4 56.6 ≈ pre-experiment).
+
+1. **Pipeline cost is ZERO** — new diagnostic `VTK_METAL_TEST_MM_NOWALK`
+   (runs the fc_minmax pipeline, lattice built+bound, walk skipped):
+   axz 38.4 vs raw 40.8 vs mm 56.7; axy 28.7 / 30.4 / 38.2. The entire
+   residual tax lives in WALK EXECUTION. (Diagnostic reverted with the
+   rest; re-add if this line of work resumes.)
+2. **Walk-window clamp REFUTED**: preamble look-ahead was hardcoded 48
+   steps while the batch dispatch consumes maxBatchWidth=8 at SD4 (cap
+   added later — integration gap). Clamping the window after a
+   compositing batch changed nothing (axz clamp 56.0 / full48 55.7;
+   az45 20.7 / 20.7): leap count within the consumed span is invariant.
+3. **Cell-solid memoization REFUTED (codegen cliff #2)**: caching the last
+   sampled cell index + verdict to skip re-samples made things WORSE:
+   memo axz-ds4 75.1 / nomemo 69.1 / pre-change HEAD 54.4 (+38% absolute).
+   Matches §34.7's baseline-walk lesson: ANY added live state on the
+   serial preamble path costs more than saved work. Reverted.
+4. **Tax localized by elimination**: not pipeline structure (1), not
+   iteration count (2), not sample count alone (2,3) — it is the
+   per-empty-cell LEAP MATH (fract/div/ceil boundary solve) plus branch/
+   state overhead on a serially-dependent chain that stalls each batch's
+   volume-fetch flight. Consistent with blocks helping most (one leap per
+   block, cached state) and with DS8 > DS4 (fewer cells = fewer solves).
+5. Remaining options, in ascending cost: accept policy (a)/DS8 retune
+   (§35.11); DDA-style incremental traversal (adds/comparisons instead of
+   div+ceil — NOT byte-clean: ulp drift changes skip landings, same class
+   as blocks' accepted drift but on a path currently held byte-exact);
+   warp-cooperative or async-compute segment pre-passes (structural,
+   out of scope for quick A/B). No default changes made.
 
 ## 5. Files
 
