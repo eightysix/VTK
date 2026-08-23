@@ -8785,29 +8785,21 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     }
   }
 
-  // Adaptive-width march cap for fc_marchVariant 9. Fine sample distances keep
-  // the 48-wide batches (probe w48 beats w8 at fine SD); coarse distances cap
-  // at 8 because a 48-wide batch wastes up to 47 slots on the short solid runs
-  // that remain visible after the lattice skips (mv9+minmax 0.77x -> 0.58x GL
-  // @SD4 on the DICOM study). VTK_METAL_TEST_MARCH_CAP overrides the mapping.
-  uniforms.MaxBatchWidth = 48.0f;
+  // Adaptive-width march cap for fc_marchVariant 9: SINGLE-TIER 32 for all
+  // sample distances (HARNESS_VS_APP_GAP §37.11, 2026-08-23). The old SD-tier
+  // map {<2:48, <3:16, else:8} predates the block-summary leaps; with blocks
+  // default-on the solid runs between skips are long enough that wide batches
+  // no longer waste slots, and 32 measured fastest in EVERY cell probed —
+  // mm and raw arms alike, SD0.5/2.5/4, 400²..4096² (raw@cap-parity also
+  // refuted the fine-tier 48 rationale). The ladder tops out at 48 unrolled
+  // fetches; caps >= 48 dispatch identically. VTK_METAL_TEST_MARCH_CAP
+  // overrides for A/B.
+  uniforms.MaxBatchWidth = 32.0f;
   if (VolumeMarchVariant() == 9)
   {
     if (const char* cap = getenv("VTK_METAL_TEST_MARCH_CAP"))
     {
       uniforms.MaxBatchWidth = static_cast<float>(std::max(1, std::atoi(cap)));
-    }
-    else if (actualSampleDistance < 2.0)
-    {
-      uniforms.MaxBatchWidth = 48.0f;
-    }
-    else if (actualSampleDistance < 3.0)
-    {
-      uniforms.MaxBatchWidth = 16.0f;
-    }
-    else
-    {
-      uniforms.MaxBatchWidth = 8.0f;
     }
   }
 

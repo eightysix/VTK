@@ -3205,6 +3205,59 @@ regresses: per-ray walk bail-out after N fruitless crossings (bounds
 worst case at raw+epsilon), and revisiting seg-consume under the now-
 lower iteration counts.
 
+### 37.11 LANDED: SINGLE-TIER cap=32 for all sample distances — plus two
+corrections to §37.10's "beats TRUE raw" claim (2026-08-23 late night)
+
+Landing was preceded by three extensions, all env-only on the then-current
+binary:
+
+1. **Resolution sweep** (axis-z SD4 j1): 400² prefers cap8 (5.38 vs 5.60;
+   obl 4.58 vs 5.18 — sub-ms absolute), every size from 800² up prefers
+   cap32 (800²: 8.28 vs 10.36; 1024²: 11.42 vs 14.70; 4096²: c8 172.5 /
+   c16 142.6 / **c32 130.8** / c48 137.6). Since maxBatchWidth is a plain
+   uniform, a viewport-aware policy would be free — but optimizing
+   thumbnail viewports by ~0.5 ms fails the complexity bar; not done.
+2. **The ladder has no 64 rung**: caps >= 48 dispatch identically (c64 ==
+   c48 within noise at 4096², both views).
+3. **Raw-arm control (ACCEL=0) refutes the fine-tier 48 AND corrects
+   §37.10**: cap32 beats cap48 in EVERY raw cell too (SD4 @2048 z: 31.0 vs
+   34.1; SD0.5 @2048: 159.6 vs 174.4; SD0.5 @4096: 604 vs 647; SD4 @4096:
+   108.5 vs 121.2) — the historical "fine SD wants 48" is dead on current
+   code. BUT the same control exposed that §37.10's "beats TRUE raw on all
+   five views" compared mm@cap32 against raw anchors at DEFAULT cap8. At
+   equal batching the honest matrix is (SD4 @2048, all cap32):
+
+   | | TRUE raw | mm+blocks | verdict |
+   |---|---|---|---|
+   | axis-z | **31.0** | 35.1 | mm +13% ✗ |
+   | axis-y | **23.8** | 25.1 | mm +6% ✗ |
+   | axis-x | 30.8 | **27.6** | −10% ✓ |
+   | obl | 21.8 | **16.0** | −26% ✓ |
+   | az45 | 25.4 | **17.1** | −33% ✓ |
+
+   So the §35.10 axis-chord penalty shrinks from +40% to +13% at modern
+   batching — real, not inverted. Interesting asymmetry: raw HATES wide
+   batches on az45 (22.3@c8 -> 25.4@c32) while mm loves them; the walk
+   changes the optimal dispatch shape per arm.
+
+**Landed change** (this commit): `uniforms.MaxBatchWidth = 32.0f` for ALL
+sample distances (tier map deleted; VTK_METAL_TEST_MARCH_CAP still
+overrides; struct comment updated). Verification from the landed binary,
+no env caps:
+
+- SD4 j1 @2048: z 36.3 / y 25.6 / x 28.1 / az45 17.1 / obl 16.6
+  (shipped-default yesterday: 47.4 / 31.6 / 34.9 / 19.2 / 19.2)
+- SD0.5 axz j0: 86.5 (was 90.5)
+- Parity: SD4 z new-vs-old-default 0.95% px, max 4 LSB, mean 1.02;
+  SD0.5 obl new-vs-old 0.46% px, max 1 LSB, mean 1.00 — sub-LSB latch
+  class everywhere (wider batches check opacity/tEnd latches less often).
+
+Residual known gap: equal-cap axis-z/y chords of this dataset remain
++13%/+6% over raw; the designated future closer stays the per-ray walk
+bail-out (§37.10 reserve list). Do not re-derive the cap map without
+re-reading this section: both arms' optima moved when blocks went
+default-on, and cross-cap comparisons silently fake verdicts.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).

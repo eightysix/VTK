@@ -2982,11 +2982,11 @@ struct VolumeMapperUniforms {
   // the legacy per-fragment loop bound. Occupies the former _padDSBV slot.
   float maxStepsFrame;
   // Adaptive-width march cap (fc_marchVariant 9): the largest batch width the
-  // shader may dispatch. Set on the CPU from the sample distance: fine sampling
-  // (SD < 2) keeps 48-wide batches (probe w48 beats w8 at fine SD), while
-  // coarse sampling caps at 8 so batches stop wasting slots on short solid runs
-  // inside cells the lattice marks solid (mv9+minmax 14.9ms -> 11.4ms @SD4,
-  // 0.77x -> 0.58x GL on the DICOM study). VTK_METAL_TEST_MARCH_CAP overrides.
+  // shader may dispatch. SINGLE-TIER 32 at all sample distances (HARNESS_VS_APP_GAP
+  // §37.11): with the block-summary leaps default-on, wide batches no longer
+  // waste slots, and 32 measured fastest in every cell probed (mm and raw arms,
+  // SD0.5-4, 400^2-4096^2). The unrolled ladder tops out at 48; caps >= 48
+  // dispatch identically. VTK_METAL_TEST_MARCH_CAP overrides.
   float maxBatchWidth;
 };
 
