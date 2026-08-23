@@ -253,9 +253,13 @@ struct VolumeMapperUniforms
   // super+block leaps (default/landed behavior), 1 = super leaps only
   // (coherence probe: 8x fewer leap events), <=0 = no occupancy leaps.
   float MmLeapLevel;               // 1736..1739
+  // §37.18 block-summary edge in fine cells ({4,8,16,32}, default 8); must
+  // match VolumeMinMaxBlockSize() used to build minMaxBlockTexture. Supers
+  // remain fixed 64-cell tiles (blocks-per-super = 64 / this).
+  float MmBlockSizeCells;          // 1740..1743
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1740,
+static_assert(sizeof(VolumeMapperUniforms) == 1744,
   "VolumeMapperUniforms must be 1736 bytes to match Metal shader struct");
 
 // MSL rounds the shader-side struct up to its 16-byte alignment (float4/float3
@@ -1343,6 +1347,15 @@ static int ComputeMacrocellDownsample(double sampleDistance, bool useGPUMinMax)
 // VTK_METAL_TEST_MM_BLOCKS=0 opts back out.
 static int VolumeMinMaxBlockSize()
 {
+  // §37.18 (VTK_METAL_TEST_MM_BLOCKSIZE): block-summary edge in fine cells.
+  // 16 halves leap events per saved sample (scatter is the proven axis-chord
+  // deficit mechanism); supers stay fixed at 64-cell tiles. Power-of-two
+  // values only so shader index math stays exact; anything else -> default.
+  if (const char* e = getenv("VTK_METAL_TEST_MM_BLOCKSIZE"))
+  {
+    const int v = std::atoi(e);
+    if (v == 4 || v == 8 || v == 16 || v == 32) return v;
+  }
   return 8;
 }
 
@@ -5903,10 +5916,12 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     std::max(1, (mmDims[1] + blockSize - 1) / blockSize),
     std::max(1, (mmDims[2] + blockSize - 1) / blockSize)
   };
+  // Supers stay fixed at 64-cell tiles regardless of block size.
+  const int blocksPerSuper = std::max(1, 64 / blockSize);
   const int sbDims[3] = {
-    std::max(1, (blkDims[0] + 7) / 8),
-    std::max(1, (blkDims[1] + 7) / 8),
-    std::max(1, (blkDims[2] + 7) / 8)
+    std::max(1, (blkDims[0] + blocksPerSuper - 1) / blocksPerSuper),
+    std::max(1, (blkDims[1] + blocksPerSuper - 1) / blocksPerSuper),
+    std::max(1, (blkDims[2] + blocksPerSuper - 1) / blocksPerSuper)
   };
 
   // Timestamp-based caching: skip recompute when nothing changed. The grid
@@ -6185,6 +6200,7 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
           (__bridge id<MTLComputePipelineState>)this->SuperReduceComputePipeline];
         [mmEnc setTexture:blockTex atIndex:0];
         [mmEnc setTexture:superTex atIndex:1];
+        [mmEnc setBytes:&blocksPerSuper length:sizeof(blocksPerSuper) atIndex:0];
         MTLSize sbGrid = MTLSizeMake(
           static_cast<NSUInteger>(sbDims[0]),
           static_cast<NSUInteger>(sbDims[1]),
@@ -8829,6 +8845,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   {
     uniforms.MmLeapLevel = static_cast<float>(std::atoi(ll));
   }
+  // §37.18: keep the shader's index math in sync with the built texture.
+  uniforms.MmBlockSizeCells = static_cast<float>(VolumeMinMaxBlockSize());
 
   // Final color window/level (matches OpenGL's in_scale/in_bias, applied in the
   // shader after the ray cast as rgb * scale + bias * alpha).

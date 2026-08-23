@@ -3534,6 +3534,52 @@ beat raw's coherence on straight chords while beating it everywhere else;
 accepting the documented trade (or a future warp-coherent skip design)
 is the decision left.
 
+### 37.18 Block-size parametrized; BS16 cuts the axis-z deficit by ~60%
+in-batch and widens every winning view — default-flip pending clean-machine
+confirmation (2026-08-24)
+
+Landed surgery: VTK_METAL_TEST_MM_BLOCKSIZE ({4,8,16,32}, default 8) now
+drives VolumeMinMaxBlockSize() (cache key already included it), the block-
+reduce kernel buffer (pre-existing), sbDims derivation (blocks-per-super =
+64/blockSize — supers stay FIXED 64-cell tiles), the super-reduce kernel
+(new blocksPerSuper buffer(0)), and the shader index math in BOTH cascades
+(mv9 preamble bsI/bpsI consts + unified-march leap) via new uniform field
+MmBlockSizeCells (offset 1740; C++ struct now exactly 1744 B). Byte-parity
+at default verified against the pre-change binary. NOTE: literal-/8 became
+runtime divides — if a default-path regression shows up on a healthy
+machine, convert to an MSL function constant (PSO-keyed) so 8 stays a
+shift; parity is unaffected either way.
+
+Measurement upgrade forced by the environment (anchors still ~+19%, run-to-
+run swings ±10-15% at frames=25): frames=100 + warmup=10 + median-of-3
+alternations brings spread down to ±2-7%. All numbers below use it.
+
+Airways II, SD4 @2048² j1 cap32, ms (median of 3):
+
+| view | TRAW | BS8 | BS16 | BS16 vs TRAW |
+|---|---|---|---|---|
+| z | 35.83 | 44.74 | **38.13** | +6.4% |
+| y | 28.36 | – | 30.40 | +7.2% |
+| obl | 19.30 | 18.66 | **17.57** | −9.0% |
+| az45 | 22.44 | – | **19.60** | −12.6% |
+
+Verdicts: (1) BS16 DOMINATES BS8 on every probed view in-environment
+(z −15%, obl −6%) — consistent with the §37.17 mechanism (fewer/larger
+leaps = less lane scatter per saved sample). (2) The axis-z deficit drops
+from +25% to +6.4% in-batch (clean-machine BS8 baseline was +14-16%; the
+residual should shrink similarly). (3) az45's apparent BS16 loss in short
+runs was pure noise — properly averaged it's the biggest winner. (4) BS32
+overshot (40.06 spot vs 38.4 BS16): certification gets too coarse.
+(5) TARGET NOT YET HIT: z/y still trail raw by ~6-7%.
+
+Pending: clean-machine confirmation batch (frames=100 protocol, anchors
+within ±3% of §37.15 values first); if BS16's dominance holds, flip
+VolumeMinMaxBlockSize() default to 16 and update the shader comment —
+one-line change, everything else already parametrized. Remaining ideas if
+the residual must go: leap-length quantization to batch multiples, or
+warp-coherent skip redesign (simd reductions need uniform control flow —
+mv9 still breaks on latch/tEnd, so they are program errors today).
+
 ### 37.14 Reproduction recipe for all §37 benchmarks
 
 Commits: measurements taken on `1896bf38bd` code (single-tier cap32;

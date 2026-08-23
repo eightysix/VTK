@@ -2999,6 +2999,11 @@ struct VolumeMapperUniforms {
   // probe for the axis-chord deficit (SolidFlat proved the deficit is
   // 100% leap dynamics; fewer/larger leaps cut lane-scatter events).
   float mmLeapLevel;
+  // §37.18 block-summary size in fine cells (VTK_METAL_TEST_MM_BLOCKSIZE,
+  // {4,8,16,32}, default 8). Must match the CPU VolumeMinMaxBlockSize() that
+  // sizes/builds minMaxBlockTexture; supers stay fixed at 64-cell tiles, so
+  // blocks-per-super = 64 / mmBlockSizeCells.
+  float mmBlockSizeCells;
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -5222,6 +5227,10 @@ inline half4 marchVolumeUnified(
       // change. State: 0 mixed (per-cell work), 1 all-empty (leap), 2
       // all-solid (batches composite normally; preamble just stops early).
       const float3 invMMDimF9 = 1.0f / mmDimF;
+      // §37.18 block size in fine cells (default 8); supers remain fixed
+      // 64-cell tiles, so blocks-per-super-line derives from it.
+      const int bsI = max(int(volumeUniforms.mmBlockSizeCells), 1);
+      const int bpsI = 64 / bsI;
       int3 mv9Blk = int3(-1);
       int mv9BlkState = -1;
       // §35.5 (VTK_METAL_TEST_MM_SUPER -> fc_mmSuper): third occupancy level.
@@ -5336,7 +5345,7 @@ inline half4 marchVolumeUnified(
               // (integer divide — an mmPos*blockDim product disagrees with
               // the kernel tiling wherever fineDim/8 is not integer), and the
               // texel is sampled at its center.
-              int3 newBlk = min(int3(cellCoord) / 8, int3(mmBlkDimF) - 1);
+              int3 newBlk = min(int3(cellCoord) / bsI, int3(mmBlkDimF) - 1);
               if (any(newBlk != mv9Blk))
               {
                 mv9Blk = newBlk;
@@ -5346,7 +5355,7 @@ inline half4 marchVolumeUnified(
               }
               if (useMinMaxSuper)
               {
-                int3 newSb = min(mv9Blk / 8, int3(mmSbDimF) - 1);
+                int3 newSb = min(mv9Blk / bpsI, int3(mmSbDimF) - 1);
                 if (any(newSb != mv9Sb))
                 {
                   mv9Sb = newSb;
@@ -5382,9 +5391,9 @@ inline half4 marchVolumeUnified(
               {
                 // All-empty block: leap to its far boundary along the ray in
                 // fine-cell units (blocks tile cells [8k,8k+8)).
-                int3 blkLo = mv9Blk * 8;
+                int3 blkLo = mv9Blk * bsI;
                 float3 loN = float3(blkLo) * invMMDimF9;
-                float3 hiN = float3(min(blkLo + 8, int3(mmDimF))) * invMMDimF9;
+                float3 hiN = float3(min(blkLo + bsI, int3(mmDimF))) * invMMDimF9;
                 float3 rem;
                 rem.x = p.rayDir.x > 0.0 ? (hiN.x - mmPos.x) : (mmPos.x - loN.x);
                 rem.y = p.rayDir.y > 0.0 ? (hiN.y - mmPos.y) : (mmPos.y - loN.y);
@@ -6149,9 +6158,10 @@ inline half4 marchVolumeUnified(
           // their edges sit at 8k/fineDim, NOT at k/blockDim. The fraction
           // space drifts whenever fineDim/blockSize is not an integer
           // (897 cells -> 113 blocks), skipping across thin solid cells.
-          int3 blkLo = curBlock * 8;
+          const int bsU = max(int(volumeUniforms.mmBlockSizeCells), 1);
+          int3 blkLo = curBlock * bsU;
           float3 loN = float3(blkLo) / mmDimF;
-          float3 hiN = float3(min(blkLo + 8, int3(mmDimF))) / mmDimF;
+          float3 hiN = float3(min(blkLo + bsU, int3(mmDimF))) / mmDimF;
           float3 rem;
           rem.x = p.rayDir.x > 0.0 ? (hiN.x - mmPos.x) : (mmPos.x - loN.x);
           rem.y = p.rayDir.y > 0.0 ? (hiN.y - mmPos.y) : (mmPos.y - loN.y);
@@ -8150,14 +8160,16 @@ kernel void volume_reduce_minmax_blocks(
 kernel void volume_reduce_minmax_superblocks(
     texture3d<float, access::read> blocks [[texture(0)]],
     texture3d<float, access::write> supers [[texture(1)]],
+    constant uint& blocksPerSuper [[buffer(0)]],
     uint3 gid [[thread_position_in_grid]])
 {
   uint3 sdims = uint3(supers.get_width(), supers.get_height(), supers.get_depth());
   if (any(gid >= sdims)) return;
 
   uint3 bdims = uint3(blocks.get_width(), blocks.get_height(), blocks.get_depth());
-  uint3 start = gid * 8;
-  uint3 end = min(start + 8, bdims);
+  const uint bps = max(blocksPerSuper, 1u);
+  uint3 start = gid * bps;
+  uint3 end = min(start + bps, bdims);
 
   bool allEmpty = true;
   for (uint z = start.z; z < end.z && allEmpty; z++) {
