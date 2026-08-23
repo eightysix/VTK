@@ -241,10 +241,34 @@ struct VolumeMapperUniforms
   float MaxBatchWidth;             // 1728..1731 (adaptive-width march cap for
                                    // fc_marchVariant 9, set from sample distance;
                                    // total 1744, 16-byte aligned)
+  // §37.15 block-or-nothing (VTK_METAL_TEST_MM_BLOCKSONLY): when > 0.5 the
+  // fragment-march preamble consults ONLY the super/block occupancy levels;
+  // a mixed block dispatches its batch un-walked instead of running the
+  // per-cell lattice walk. Targets the axis-chord pathology (§37.13): on
+  // fragmented terrain the cell walk pays serialized per-step work for
+  // near-zero skip yield. Output-safe: dropped skips cover provably-zero
+  // samples only (identical sample positions, zero-opacity contributions).
+  float MmBlocksOnly;              // 1732..1735
+  // §37.17 leap-granularity selector (VTK_METAL_TEST_MM_LEAPLEVEL): 2 =
+  // super+block leaps (default/landed behavior), 1 = super leaps only
+  // (coherence probe: 8x fewer leap events), <=0 = no occupancy leaps.
+  float MmLeapLevel;               // 1736..1739
+  // §37.18 block-summary edge in fine cells ({4,8,16,32}, default 8); must
+  // match VolumeMinMaxBlockSize() used to build minMaxBlockTexture. Supers
+  // remain fixed 64-cell tiles (blocks-per-super = 64 / this).
+  float MmBlockSizeCells;          // 1740..1743
+  // §37.19 warp-coherent skipping (VTK_METAL_TEST_MM_WARPMIN): when > 0.5,
+  // each outer march iteration probes the block summary once per lane and
+  // advances the whole SIMD-group by the warp-minimum leap (all-empty-block
+  // distance), preserving cross-lane slice-lockstep on straight chords.
+  // Any dissenting lane (mixed/solid block) zeroes the warp leap and the
+  // march falls back to the legacy per-lane walk, leaving oblique-path
+  // skipping fully intact.
+  float MmWarpMin;                 // 1744..1747
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1732,
-  "VolumeMapperUniforms must be 1732 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1748,
+  "VolumeMapperUniforms must be 1736 bytes to match Metal shader struct");
 
 // MSL rounds the shader-side struct up to its 16-byte alignment (float4/float3
 // members), so the pipeline expects round_up(1732,16)=1744 and Metal's
@@ -253,7 +277,7 @@ static_assert(sizeof(VolumeMapperUniforms) == 1732,
 // padding differs — so allocating the rounded size is purely a validation fix.
 static constexpr NSUInteger VolumeUniformBufferSize =
   (static_cast<NSUInteger>(sizeof(VolumeMapperUniforms)) + 15) & ~NSUInteger(15);
-static_assert(VolumeUniformBufferSize == 1744, "rounded uniform size");
+static_assert(VolumeUniformBufferSize == 1760, "rounded uniform size");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -1331,6 +1355,15 @@ static int ComputeMacrocellDownsample(double sampleDistance, bool useGPUMinMax)
 // VTK_METAL_TEST_MM_BLOCKS=0 opts back out.
 static int VolumeMinMaxBlockSize()
 {
+  // §37.18 (VTK_METAL_TEST_MM_BLOCKSIZE): block-summary edge in fine cells.
+  // 16 halves leap events per saved sample (scatter is the proven axis-chord
+  // deficit mechanism); supers stay fixed at 64-cell tiles. Power-of-two
+  // values only so shader index math stays exact; anything else -> default.
+  if (const char* e = getenv("VTK_METAL_TEST_MM_BLOCKSIZE"))
+  {
+    const int v = std::atoi(e);
+    if (v == 4 || v == 8 || v == 16 || v == 32) return v;
+  }
   return 8;
 }
 
@@ -5891,10 +5924,12 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     std::max(1, (mmDims[1] + blockSize - 1) / blockSize),
     std::max(1, (mmDims[2] + blockSize - 1) / blockSize)
   };
+  // Supers stay fixed at 64-cell tiles regardless of block size.
+  const int blocksPerSuper = std::max(1, 64 / blockSize);
   const int sbDims[3] = {
-    std::max(1, (blkDims[0] + 7) / 8),
-    std::max(1, (blkDims[1] + 7) / 8),
-    std::max(1, (blkDims[2] + 7) / 8)
+    std::max(1, (blkDims[0] + blocksPerSuper - 1) / blocksPerSuper),
+    std::max(1, (blkDims[1] + blocksPerSuper - 1) / blocksPerSuper),
+    std::max(1, (blkDims[2] + blocksPerSuper - 1) / blocksPerSuper)
   };
 
   // Timestamp-based caching: skip recompute when nothing changed. The grid
@@ -6173,6 +6208,7 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
           (__bridge id<MTLComputePipelineState>)this->SuperReduceComputePipeline];
         [mmEnc setTexture:blockTex atIndex:0];
         [mmEnc setTexture:superTex atIndex:1];
+        [mmEnc setBytes:&blocksPerSuper length:sizeof(blocksPerSuper) atIndex:0];
         MTLSize sbGrid = MTLSizeMake(
           static_cast<NSUInteger>(sbDims[0]),
           static_cast<NSUInteger>(sbDims[1]),
@@ -8801,6 +8837,31 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     {
       uniforms.MaxBatchWidth = static_cast<float>(std::max(1, std::atoi(cap)));
     }
+  }
+  // §37.15 block-or-nothing preamble mode: skip the per-cell lattice walk;
+  // trust only super/block certification. Opt-in via env for A/B; output is
+  // byte-identical to the default walk (dropped skips cover provably-zero
+  // samples at unchanged positions).
+  uniforms.MmBlocksOnly = 0.0f;
+  if (const char* bo = getenv("VTK_METAL_TEST_MM_BLOCKSONLY"))
+  {
+    uniforms.MmBlocksOnly = std::atof(bo) != 0.0 ? 1.0f : 0.0f;
+  }
+  // §37.17 leap-granularity: 2 (default) = super+block leaps.
+  uniforms.MmLeapLevel = 2.0f;
+  if (const char* ll = getenv("VTK_METAL_TEST_MM_LEAPLEVEL"))
+  {
+    uniforms.MmLeapLevel = static_cast<float>(std::atoi(ll));
+  }
+  // §37.18: keep the shader's index math in sync with the built texture.
+  uniforms.MmBlockSizeCells = static_cast<float>(VolumeMinMaxBlockSize());
+  // §37.19 warp-coherent skip probe: opt-in A/B.
+  uniforms.MmWarpMin = 0.0f;
+  if (const char* wm = getenv("VTK_METAL_TEST_MM_WARPMIN"))
+  {
+    // Value doubles as the minimum warp-wide leap worth acting on
+    // (0/absent = feature off; e.g. MM_WARPMIN=4 skips unless >=4).
+    uniforms.MmWarpMin = static_cast<float>(std::atoi(wm));
   }
 
   // Final color window/level (matches OpenGL's in_scale/in_bias, applied in the
