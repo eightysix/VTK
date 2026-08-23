@@ -2534,15 +2534,66 @@ Verdicts:
    fixed per-crossing cost exceeds skip yield for short coarse-SD
    marches. Raw remains the best SD4 config on axes; mm+blocks wins
    only the oblique class.
-2. Image caveat for any SD4-blocks default: DS=4 lattice => 32-voxel
-   leaps => the wider ±1-step quantization class §34.5 gated away (up to
-   ~10K px >1LSB @2048 in the worst pre-gate cells). Not byte-clean.
-3. Unexplored: DS interplay at SD4 (MM_DS=2 with blocks — finer cells
-   might improve axz skip yield further; §34.2's DS data was fine-SD).
-4. Policy options for SD>=1.5: (a) keep mm off (best on axes, −10% on
-   oblique vs mm+blk), or (b) mm+blocks everywhere (uniform behavior,
-   +21% worst case). Either is a static SD-tier decision; (a) is
-   currently the performance-optimal read on this dataset.
+2. Image caveat for any SD4-blocks default: block leaps introduce the
+   ±1-step fp-drift quantization class (§34.5: up to ~10K px >1LSB
+   @2048 in the worst pre-gate cells). NOT a DS effect — the emptiness
+   test is exact for U8, so plain-lattice DS changes are output-
+   identical (correction of the first draft, which blamed DS=4).
+ 3. Unexplored: DS interplay at SD4 (MM_DS=2 with blocks — finer cells
+    might improve axz skip yield further; §34.2's DS data was fine-SD).
+ 4. Policy options for SD>=1.5: (a) keep mm off (best on axes, −10% on
+    oblique vs mm+blk), or (b) mm+blocks everywhere (uniform behavior,
+    +21% worst case). Either is a static SD-tier decision; (a) is
+    currently the performance-optimal read on this dataset.
+
+### 35.11 Why mm loses at SD4 — history resolved + DS grid: COARSER lattice is the coarse-SD win (2026-08-23)
+
+Q: "previous reports said minmax was faster at SD4?" A: it never was,
+Metal-vs-Metal. The belief came from two unfair comparisons:
+(i) §16 compared Metal-mm vs GL, which has no minmax implementation
+(§25.2's caveat); (ii) the pre-transpose mv0 era looked like a −40% mm
+win (baseline raw 43.3/66.1 vs baseline+mm 25.1/27.2 @2048 SD4) but that
+raw arm was paying the axis-bias tiling tax transpose later removed.
+§26.1's own table already contained the flip unremarked — transposed
+mv0-RAW 20.2/22.2 vs transposed mv0+mm 23.94/24.67 — i.e. mm was ~10-15%
+SLOWER at SD4 oblique the day transpose landed. mv0-vs-mv9 is NOT the
+cause: the flip predates mv9. mm didn't regress; the raw march improved
+out from under it, and the walk became net tax except where skip yield
+is high (az45-x still −19% for mm at SD4).
+
+Improvement A/B — DS × blocks grid at SD4 (@2048² mv9 X-depth j1, ABBA;
+DS forced via VTK_METAL_TEST_MM_DS, blocks via MM_BLOCKS_ANY_SD):
+
+| view | raw | mm DS4 (default) | mm DS8 | blk DS8 | mm DS2 | blk DS2 |
+|---|---|---|---|---|---|---|
+| axz | **39.0** | 54.4 | 51.4 | 46.0 | 61.9 | 66.1 |
+| obl | 21.8 | 20.75 | **19.85** | 20.3 | 23.9 | 23.9 |
+| az45 | 24.7 | 20.0 | **18.0** | 21.6* | 21.1 | 20.1 |
+(*b2/b8 shown where run; blk-DS4 from §35.10: obl 19.57, axz 47.40)
+
+Findings:
+
+1. At SD4 the OPTIMAL DS flips to COARSE (DS=8), matching the
+   ComputeMacrocellDownsample comment's own rule ("coarse sampling wants
+   coarser cells so one skip advances several steps") — the mirror of
+   §34.2's fine-SD result. mm-DS8 beats today's default mm-DS4 by −4%
+   (obl) / −10% (az45) and trims axz to +32%-over-raw (from +40%).
+   Blocks add nothing once DS is right at SD4 (b8 ≈ ds8 obl; worse
+   az45) — the fine-SD gate stays correct.
+2. Output parity: plain-lattice DS changes are pixel-exact (exact U8
+   emptiness test per ComputeMacrocellDownsample comment; §34.5 verified
+   gated-SD4 renders max Δ=0). DS8-at-SD4 would be a byte-clean pure
+   timing change; formal snapshot spot-check listed as follow-up.
+3. Residual structural gap: even best-mm config loses to raw by ~18% on
+   axis views at SD4 — the per-crossing walk cost exceeds skip yield on
+   body-interior rays regardless of granularity. Untunable by lattice
+   shape; candidate future fix is an early walk bail-out after N
+   fruitless crossings (runtime-adaptive — needs §25.5 review) or
+   simply keeping minmax off at coarse SD (policy (a)).
+4. Refined policy read for SD>=1.5: if minmax stays on there, retune
+   ComputeMacrocellDownsample to return 8 in the coarse tier
+   (`useGPUMinMax && sd >= 1.5 ? 8 : ...`); if it goes off, DS is moot.
+   Either way blocks stay fine-SD-only.
 
 ## 5. Files
 
