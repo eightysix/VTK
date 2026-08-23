@@ -2297,6 +2297,44 @@ Findings (refining §35.2):
    −26..−29% (az45/225) with negligible preset interaction. Jitter stays
    free (|Δ| ≤ ~2 ms, one +3 outlier at az135-blk).
 
+### 35.5 Headroom A/B round 1 (2026-08-23): forced Y-depth wins under blocks; DS retune dead
+
+Quick env-only variants @2048² mv9 (single 30-frame runs unless noted;
+ABBA where stated). Logs `/tmp/headroom/`.
+
+1. **`VOLTRANSPOSE_AXIS=y` beats the auto-X tie-break under mm+blocks**,
+   everywhere measured (jittered, mm1+blk1):
+   ToraceAddome obl 50.5→45.0 (−11%), az45 44.6→39.3 (−12%), az135
+   54.0→48.5 (−10%), axz 134.1→122.4 (−9%) [ABBA-confirmed, replicates
+   ±0.5]; FGFegatoIMR obl 43.2→39.1 (−9.5%), axz 59.8→54.6 (−8.6%);
+   IMRTA4 obl 51.0→45.1 (−11.7%), axz 126.3→115.6 (−8.4%). RAW arms are
+   neutral (±2%). Render parity X-vs-Y under blocks @512²: ZERO px >1LSB,
+   max Δ=1 (same class as §30.2's near-exact rounding note).
+   Caveat: §30.2's SD4/mv0-era matrix ranked X first on oblique
+   (23.0 vs 24.5); today mv9 ranks Y first at SD4 too (raw 19.8 vs 22.1,
+   blk 20.1 vs 20.4). The ranking is pipeline-dependent → do NOT
+   blind-flip the tie-break; give it §27-class breadth first. The env
+   knob makes it deployable per-deployment today.
+2. **MM_DS retune under blocks: refuted** — ds2/ds4/ds8 within 0.7% of
+   each other on obl/az45/az135/axz (blocks already decouple leap
+   granularity from cell size; §34.2's tradeoff is gone).
+3. **Crossing probe (baseline walk, MM_PROBE) post-blocks**: mean
+   visits/crossings per covered ray drop from 428/394 → 205/172 (obl),
+   318/269 → 167/118 (az45), 663/617 → 296/251 (axz). Residual crossings
+   are the remaining walk-overhead pool; a third summary level
+   ("super-blocks", all-empty runs of blocks) is the next byte-exact
+   mechanism candidate — bounded by these counts, likely ~5–15% of frame
+   if it halves crossings again. Not built yet; mv9's three-state
+   preamble (§34.7) would absorb it more safely than the baseline walk
+   (codegen-cliff history).
+4. ε-contribution emptiness tier (§33.2 item 2) remains the largest
+   theoretical lever (~40% in the §32.4 accident) but changes the image —
+   still open, needs its calibration protocol.
+
+Verdict: the immediate, already-validated headroom is the Y-depth
+orientation under blocks (−8..−12%, three datasets, image-equivalent);
+everything else needs either breadth validation or new code.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
