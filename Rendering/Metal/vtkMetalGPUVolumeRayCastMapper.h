@@ -321,6 +321,11 @@ private:
   std::atomic<float> MinMaxEmptyBlockFraction{1.0f};
   std::size_t MinMaxEmptyBlockTotal = 0;  // blocks per build (denominator)
   void* MinMaxCountBuffer = nullptr;     // id<MTLBuffer> shared uint atomic counter
+  // §35.5 headroom A/B (VTK_METAL_TEST_MM_SUPER): third occupancy level —
+  // whole 8³-block groups of the block summary that are all-empty.
+  void* MinMaxSuperTexture = nullptr;    // id<MTLTexture> (3D R8Unorm)
+  int MinMaxSuperDims[3] = {};           // super-summary grid dims
+  void* SuperReduceComputePipeline = nullptr; // volume_reduce_minmax_superblocks
   void* DepthStencilState = nullptr;     // id<MTLDepthStencilState>
   void* DepthTextureOcclusion = nullptr; // id<MTLTexture> — scene depth for early ray termination
   void* DummyDepthTexture = nullptr;     // id<MTLTexture> — 1x1 R32Float(1.0) fallback when no depth available

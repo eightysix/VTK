@@ -2335,6 +2335,72 @@ Verdict: the immediate, already-validated headroom is the Y-depth
 orientation under blocks (−8..−12%, three datasets, image-equivalent);
 everything else needs either breadth validation or new code.
 
+### 35.6 Headroom round 2 (2026-08-23): ε-tier and super-blocks BOTH REFUTED
+
+§33.2 items 2 and the §35.5 item-3 follow-up implemented behind env knobs
+and A/B'd (`VTK_METAL_TEST_MM_EPS=<f>`, `VTK_METAL_TEST_MM_SUPER=1`;
+both default-off, byte-inert when unset — verified: new binary renders
+BYTE-IDENTICAL to the pre-change binary at eps=0).
+
+Implementation notes (for future work in this area):
+- ε tier: MinMaxComputeUniforms carries the 256-entry opacity LUT +
+  threshold; `volume_compute_minmax` marks a cell empty when
+  max achievable opacity in [idxMin,idxMax] <= eps (eps=0 keeps exact
+  prefix-sum semantics). Walk untouched — zero codegen risk.
+- Super level: `volume_reduce_minmax_superblocks` reduces the BLOCK
+  summary into all-empty 8³-block groups (fc_mmSuper, function_constant
+  36, featureMaskExtra bit 3, fragment texture slot 17);
+  `marchVolumeUnified`/`marchVolume`/`marchSegment` thread the texture;
+  the mv9 preamble derives super indices from BLOCK indices (integer
+  divide), caches state, and leaps to true fine-cell-unit boundaries.
+  Shader plumbing lesson RE-LEARNED: the march lives in inline helpers
+  with forwarded texture params — entry-point signature edits alone fail
+  at RUNTIME library compile ("undeclared identifier"), and duplicated
+  parameters fail with "redefinition" (black frames either way; stderr
+  names the line).
+
+Results (@2048² SD0.5 mv9 mm+blocks, j1; same-session references):
+
+| variant | obl | az45 | axz |
+|---|---|---|---|
+| blocks-only reference | 50.6 | 45.1 | 134.6 |
+| +SUPER | 61.5 (**+21.6%**) | 53.2 (**+17.8%**) | 165.0 (**+22.6%**) |
+| EPS 0.005 | 50.6 (±0) | 44.7 (−1.0%) | 134.5 (±0) |
+| EPS 0.01 | 50.8 (+0.5%) | 44.6 (−1.2%) | 135.6 (+0.7%) |
+| EPS 0.02 | 50.3 (−0.6%) | 44.6 (−1.2%) | 134.9 (±0) |
+| EPS 0.05 | 51.9 (+2.6%) | 44.7 (−0.9%) | 136.4 (+1.3%) |
+
+Image parity ladder (@512², jittered): old-binary≡new-binary eps0
+(max Δ=0); blk≡blk+SUPER (max Δ=0 — leaps land on identical samples);
+eps 0.005/0.01 inert, 0.02 max Δ=1, 0.05 → 5 px >1LSB of 262K, max Δ=15.
+
+Findings:
+
+1. **Super-blocks REFUTED**: +18–23% REGRESSION despite byte-identical
+   output. The probe-predicted residual crossings (§35.5: 118–251/ray)
+   live in MIXED block territory, so the third level pays 2 summary
+   fetches + index math per block change and almost never fires; the air
+   gaps that motivated it were already consumed wholesale by block leaps.
+   Two levels capture the lattice's real structure. Do NOT retry a third
+   level on this pipeline shape.
+2. **ε-tier REFUTED as a perf lever** on this dataset/TF class: timing
+   flat within ±1% across 0.005–0.05, worse at 0.05 on obl/axz. The
+   exact-emptiness + dilation + blocks stack already harvests everything
+   reachable: near-zero-opacity cells form thin boundary slivers that are
+   off the critical path. This also retro-explains §32.4: the corrupted
+   lattice's "40%" came from SCATTERED min/max wrongly emptying dense
+   interior cells — not replicable by legitimate ε semantics. Keep MM_EPS
+   as a diagnostic knob; never default.
+3. Protocol: the §29 zsh trap bit AGAIN (`for ARM in $ORD` does not
+   word-split — only the second arm ran; caught because blk rows were
+   missing from output and sup timings looked anomalous vs anchors).
+   Use `${=ORD}` or arrays.
+
+Net after rounds 1+2: the minmax+blocks stack is at its architectural
+floor for this pipeline; the validated remaining headroom is the Y-depth
+orientation policy (§35.5) and anything outside the walk (batch width,
+axis-z specifics). §33's plan is fully dispositioned.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).

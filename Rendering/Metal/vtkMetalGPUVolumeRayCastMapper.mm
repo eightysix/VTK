@@ -730,9 +730,13 @@ struct MinMaxComputeUniforms {
   float _pad;
   uint32_t opacityPrefix[257];
   int32_t volTransposed;
+  float opacityLut[256];   // §33.2 item 2 (VTK_METAL_TEST_MM_EPS)
+  float mmEps;             // emptiness threshold (0 = exact semantics)
+  uint32_t _pad2[3];
 };
 
-static_assert(sizeof(MinMaxComputeUniforms) == 4*6 + 4 + 4 + 4 + 4 + 257*4 + 4,
+static_assert(sizeof(MinMaxComputeUniforms) ==
+    4*6 + 4 + 4 + 4 + 4 + 257*4 + 4 + 256*4 + 4 + 3*4,
   "MinMaxComputeUniforms size must match Metal struct");
 
 namespace
@@ -1347,6 +1351,27 @@ static int VolumeMinMaxBlockSize()
 static bool VolumeMinMaxBlocksWanted(bool gpuMinMax, double sampleDistance)
 {
   return VolumeMinMaxBlocksActive() && gpuMinMax && sampleDistance < 1.5;
+}
+
+// §35.5 headroom A/B (VTK_METAL_TEST_MM_SUPER): third occupancy level —
+// whole 8³-block groups of the block summary that are all-empty. Requires the
+// blocks level to be active; investigation-only.
+static bool VolumeMinMaxSuperWanted(bool gpuMinMax, double sampleDistance)
+{
+  if (const char* v = getenv("VTK_METAL_TEST_MM_SUPER"))
+    return std::atoi(v) != 0 && VolumeMinMaxBlocksWanted(gpuMinMax, sampleDistance);
+  return false;
+}
+
+// §33.2 item 2 (VTK_METAL_TEST_MM_EPS): emptiness threshold for the GPU
+// minmax build — cells whose max achievable opacity is <= eps are marked
+// empty so the walk skips them. 0 (default) keeps the exact zero-opacity
+// semantics. Approximate by design; image deltas must be quantified per eps.
+static float VolumeMinMaxEps()
+{
+  if (const char* v = getenv("VTK_METAL_TEST_MM_EPS"))
+    return static_cast<float>(std::atof(v));
+  return 0.0f;
 }
 
 
@@ -3110,6 +3135,7 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   ReleaseMetalObject(this->MinMaxTexture);
   ReleaseMetalObject(this->MinMaxScratchTexture);
   ReleaseMetalObject(this->MinMaxBlockTexture);
+  ReleaseMetalObject(this->MinMaxSuperTexture);
   ReleaseMetalObject(this->MinMaxCountBuffer);
   this->ReleaseGradientNormalTexture();
 
@@ -5587,6 +5613,28 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureMinMaxComputePipelines(void* mtlDevic
       }
       AssignMetalObject(this->BlockReduceComputePipeline, pso);
     }
+
+    if (!this->SuperReduceComputePipeline)
+    {
+      id<MTLFunction> func =
+        [library newFunctionWithName:@"volume_reduce_minmax_superblocks"];
+      if (!func)
+      {
+        vtkErrorMacro("Failed to find volume_reduce_minmax_superblocks kernel");
+        return false;
+      }
+      NSError* error = nil;
+      id<MTLComputePipelineState> pso =
+        [dev newComputePipelineStateWithFunction:func error:&error];
+      [func release];
+      if (!pso)
+      {
+        vtkErrorMacro(<< "Failed to create minmax super-reduce pipeline: "
+                      << [[error localizedDescription] UTF8String]);
+        return false;
+      }
+      AssignMetalObject(this->SuperReduceComputePipeline, pso);
+    }
   }
 
   return true;
@@ -5710,11 +5758,19 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
   // below so enabling it mid-process (test-app reload) rebuilds the lattice.
   const bool wantBlocks =
     VolumeMinMaxBlocksWanted(this->UseGPUMinMax, this->SampleDistance);
+  // §35.5 (VTK_METAL_TEST_MM_SUPER): third level; requires the blocks level.
+  const bool wantSuper =
+    VolumeMinMaxSuperWanted(this->UseGPUMinMax, this->SampleDistance);
   const int blockSize = VolumeMinMaxBlockSize();
   const int blkDims[3] = {
     std::max(1, (mmDims[0] + blockSize - 1) / blockSize),
     std::max(1, (mmDims[1] + blockSize - 1) / blockSize),
     std::max(1, (mmDims[2] + blockSize - 1) / blockSize)
+  };
+  const int sbDims[3] = {
+    std::max(1, (blkDims[0] + 7) / 8),
+    std::max(1, (blkDims[1] + 7) / 8),
+    std::max(1, (blkDims[2] + 7) / 8)
   };
 
   // Timestamp-based caching: skip recompute when nothing changed. The grid
@@ -5749,7 +5805,12 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
           this->MinMaxBlockSize == blockSize &&
           this->MinMaxBlockDims[0] == blkDims[0] &&
           this->MinMaxBlockDims[1] == blkDims[1] &&
-          this->MinMaxBlockDims[2] == blkDims[2])))
+          this->MinMaxBlockDims[2] == blkDims[2])) &&
+        (!wantSuper ||
+         (this->MinMaxSuperTexture != nullptr &&
+          this->MinMaxSuperDims[0] == sbDims[0] &&
+          this->MinMaxSuperDims[1] == sbDims[1] &&
+          this->MinMaxSuperDims[2] == sbDims[2])))
     {
       return true;
     }
@@ -5812,6 +5873,15 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
     // 1=X-depth (.zyx), 2=Y-depth (.xzy).
     u.volTransposed = this->VolumeTextureAxisDepth;
     memcpy(u.opacityPrefix, opacityPrefix, sizeof(opacityPrefix));
+    // §33.2 item 2 (VTK_METAL_TEST_MM_EPS): ship the TF opacity table so the
+    // kernel can threshold max achievable opacity (mmEps=0 keeps exact
+    // prefix-sum semantics). Same table the prefix was built from.
+    for (int i = 0; i < 256; ++i)
+    {
+      u.opacityLut[i] = static_cast<float>(std::max(0.0, opacityTable[i]));
+    }
+    u.mmEps = VolumeMinMaxEps();
+    u._pad2[0] = u._pad2[1] = u._pad2[2] = 0u;
 
     // --- Reuse or create persistent MinMax texture ---
     id<MTLTexture> permTex = (__bridge id<MTLTexture>)this->MinMaxTexture;
@@ -5944,13 +6014,69 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
         fprintf(stderr, "[TRMM] block summary %dx%dx%d (block=%d cells)\n",
           blkDims[0], blkDims[1], blkDims[2], blockSize);
       }
+
+      // §35.5 (VTK_METAL_TEST_MM_SUPER): reduce the BLOCK summary into
+      // all-empty 8³-block groups. Same encoder, so ordering after the block
+      // reduce is implicit.
+      if (wantSuper)
+      {
+        id<MTLTexture> superTex = (__bridge id<MTLTexture>)this->MinMaxSuperTexture;
+        if (!superTex ||
+            superTex.width != static_cast<NSUInteger>(sbDims[0]) ||
+            superTex.height != static_cast<NSUInteger>(sbDims[1]) ||
+            superTex.depth != static_cast<NSUInteger>(sbDims[2]) ||
+            superTex.pixelFormat != MTLPixelFormatR8Unorm)
+        {
+          superTex = CreateR8MinMaxTexture(
+            device,
+            sbDims[0],
+            sbDims[1],
+            sbDims[2],
+            MTLStorageModePrivate,
+            MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+          if (!superTex)
+          {
+            vtkErrorMacro("Failed to create minmax super-summary texture");
+            return false;
+          }
+          AssignMetalObject(this->MinMaxSuperTexture, superTex);
+        }
+        this->MinMaxSuperDims[0] = sbDims[0];
+        this->MinMaxSuperDims[1] = sbDims[1];
+        this->MinMaxSuperDims[2] = sbDims[2];
+
+        [mmEnc setComputePipelineState:
+          (__bridge id<MTLComputePipelineState>)this->SuperReduceComputePipeline];
+        [mmEnc setTexture:blockTex atIndex:0];
+        [mmEnc setTexture:superTex atIndex:1];
+        MTLSize sbGrid = MTLSizeMake(
+          static_cast<NSUInteger>(sbDims[0]),
+          static_cast<NSUInteger>(sbDims[1]),
+          static_cast<NSUInteger>(sbDims[2]));
+        NSUInteger sbTg = 8;
+        MTLSize sbThreadgroup = MTLSizeMake(
+          std::min(sbTg, static_cast<NSUInteger>(sbDims[0])),
+          std::min(sbTg, static_cast<NSUInteger>(sbDims[1])),
+          std::min(sbTg, static_cast<NSUInteger>(sbDims[2])));
+        [mmEnc dispatchThreads:sbGrid threadsPerThreadgroup:sbThreadgroup];
+        if (getenv("VTK_METAL_TEST_TR_DUMP") || getenv("VTK_METAL_TEST_TR_BENCH"))
+        {
+          fprintf(stderr, "[TRMM] super summary %dx%dx%d (8 blocks/group)\n",
+            sbDims[0], sbDims[1], sbDims[2]);
+        }
+      }
+      else
+      {
+        ReleaseMetalObject(this->MinMaxSuperTexture);
+      }
     }
-    else if (this->MinMaxBlockTexture)
+    else if (this->MinMaxBlockTexture || this->MinMaxSuperTexture)
     {
-      // Feature turned off (or GPU path disabled): drop the summary so the
+      // Feature turned off (or GPU path disabled): drop the summaries so the
       // cache key above stays honest.
       ReleaseMetalObject(this->MinMaxBlockTexture);
       this->MinMaxBlockSize = 0;
+      ReleaseMetalObject(this->MinMaxSuperTexture);
     }
 
     [mmEnc endEncoding];
@@ -7152,10 +7278,13 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
   VolumePipelineKey key = { type, colorFormat, depthFormat, sampleCount, featureMask,
     // featureMaskExtra: low bits carry the volume orientation code
     // (VolumeTextureAxisDepth 0/1/2), bit 2 the block-summary walk gate —
-    // fc_mmBlocks pipelines must not be shared with non-block ones.
+    // fc_mmBlocks pipelines must not be shared with non-block ones — and
+    // bit 3 the super-summary gate (fc_mmSuper).
     static_cast<uint32_t>(this->VolumeTextureAxisDepth) |
       ((VolumeMinMaxBlocksWanted(this->UseGPUMinMax, this->SampleDistance) &&
-        this->MinMaxBlockTexture != nullptr) ? 4u : 0u) };
+        this->MinMaxBlockTexture != nullptr) ? 4u : 0u) |
+      ((VolumeMinMaxSuperWanted(this->UseGPUMinMax, this->SampleDistance) &&
+        this->MinMaxSuperTexture != nullptr) ? 8u : 0u) };
   auto it = this->PipelineCache.find(key);
   if (it != this->PipelineCache.end())
   {
@@ -7318,6 +7447,11 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
                      this->MinMaxBlockTexture != nullptr) ? YES : NO;
     [constants setConstantValue:&mmBlocks type:MTLDataTypeBool
                        withName:@"fc_mmBlocks"];
+    BOOL mmSuper = (VolumeMinMaxSuperWanted(this->UseGPUMinMax,
+                        this->SampleDistance) &&
+                    this->MinMaxSuperTexture != nullptr) ? YES : NO;
+    [constants setConstantValue:&mmSuper type:MTLDataTypeBool
+                       withName:@"fc_mmSuper"];
 
     // Blend mode function constant: 0=composite, 1=MIP, 2=MinIP, 3=AverageIP,
     // 4=additive (vtkVolumeMapper::BlendMode). Encoded in the feature mask so
@@ -7533,6 +7667,7 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
   SetFragmentTextureOrFallback(encoder, 5, this->LabelMapTransferTexture, this->ColorOpacityTexture);
   SetFragmentTextureOrFallback(encoder, 6, this->MinMaxTexture, this->DummyMinMaxTexture);
   SetFragmentTextureOrFallback(encoder, 16, this->MinMaxBlockTexture, this->DummyMinMaxTexture);
+  SetFragmentTextureOrFallback(encoder, 17, this->MinMaxSuperTexture, this->DummyMinMaxTexture);
   SetFragmentTextureOrFallback(encoder, 7, this->GradientNormalTexture, this->DummyVolumeTexture);
   SetFragmentTextureOrFallback(encoder, 9, this->Transfer2DTexture, this->ColorOpacityTexture);
   SetFragmentTextureOrFallback(encoder, 10, this->Transfer2DYAxisTexture, this->DummyVolumeTexture);
@@ -7578,6 +7713,7 @@ void vtkMetalGPUVolumeRayCastMapper::BindFullscreenTextures(
   // Block summary only exists for the global (non-partitioned) lattice; the
   // per-partition path binds the dummy (walk falls back to per-cell fetches).
   SetFragmentTextureOrFallback(encoder, 16, this->MinMaxBlockTexture, this->DummyMinMaxTexture);
+  SetFragmentTextureOrFallback(encoder, 17, this->MinMaxSuperTexture, this->DummyMinMaxTexture);
   SetFragmentTextureOrFallback(encoder, 7, normalTexVoid, this->DummyVolumeTexture);
   SetFragmentTextureOrFallback(encoder, 9, this->Transfer2DTexture, this->ColorOpacityTexture);
   SetFragmentTextureOrFallback(encoder, 10, this->Transfer2DYAxisTexture, this->DummyVolumeTexture);

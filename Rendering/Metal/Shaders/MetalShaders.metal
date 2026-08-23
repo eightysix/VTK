@@ -2766,6 +2766,12 @@ constant bool fc_volTransposedY [[function_constant(34)]];
 // pipeline so non-block pipelines keep byte-identical codegen to HEAD and
 // block pipelines fold every gate away.
 constant bool fc_mmBlocks [[function_constant(35)]];
+// §35.5 headroom A/B (VTK_METAL_TEST_MM_SUPER): third occupancy level — an
+// R8 texture marking whole 8³-block groups of the block summary that are ALL
+// empty, letting the walk leap 64 fine cells per fetch. Output-equivalent by
+// construction (super-empty => every covered block empty => every cell empty);
+// landings stay on the step lattice like the block leaps.
+constant bool fc_mmSuper [[function_constant(36)]];
 
 // Map an original-orientation sample position into texture space for the live
 // transposed representation (no-op when clear).
@@ -4166,6 +4172,7 @@ inline half4 marchVolumeUnified(
     texture2d<float> labelMapTransferTexture,
     texture3d<float> minMaxTexture,
     texture3d<float> minMaxBlockTexture,
+    texture3d<float> minMaxSuperTexture,
     texture3d<float> normalTexture,
     texture3d<float> blankingTexture,
     constant packed_float3* rectCoords,
@@ -5197,6 +5204,18 @@ inline half4 marchVolumeUnified(
       const float3 invMMDimF9 = 1.0f / mmDimF;
       int3 mv9Blk = int3(-1);
       int mv9BlkState = -1;
+      // §35.5 (VTK_METAL_TEST_MM_SUPER -> fc_mmSuper): third occupancy level.
+      // Super indices derive from BLOCK indices via integer divide (same
+      // lesson as the block level: never from normalized-coordinate
+      // products); the texel is sampled at its center; supers tile fine
+      // cells [64k, 64k+64) = blocks [8k, 8k+8).
+      const float3 mmSbDimF = float3(minMaxSuperTexture.get_width(),
+                                     minMaxSuperTexture.get_height(),
+                                     minMaxSuperTexture.get_depth());
+      const bool useMinMaxSuper = useMinMaxBlocks && fc_mmSuper &&
+                                  mmSbDimF.x > 1.0f;
+      int3 mv9Sb = int3(-1);
+      bool mv9SbEmpty = false;
       while (i < steps)
       {
         // A slab pass whose inherited near-side alpha already exceeds the
@@ -5235,6 +5254,40 @@ inline half4 marchVolumeUnified(
                 float bsv = minMaxBlockTexture.sample(sNearest,
                     (float3(mv9Blk) + 0.5f) / mmBlkDimF, level(0)).r;
                 mv9BlkState = bsv > 0.75 ? 1 : (bsv < 0.25 ? 2 : 0);
+              }
+              if (useMinMaxSuper)
+              {
+                int3 newSb = min(mv9Blk / 8, int3(mmSbDimF) - 1);
+                if (any(newSb != mv9Sb))
+                {
+                  mv9Sb = newSb;
+                  float ssv = minMaxSuperTexture.sample(sNearest,
+                      (float3(mv9Sb) + 0.5f) / mmSbDimF, level(0)).r;
+                  mv9SbEmpty = ssv > 0.5f;
+                }
+                if (mv9SbEmpty)
+                {
+                  // All-empty super-block: every covered cell is empty, so
+                  // leap to its far boundary along the ray in fine-cell units
+                  // (supers tile cells [64k, 64k+64)).
+                  int3 sbLo = mv9Sb * 64;
+                  float3 loN = float3(sbLo) * invMMDimF9;
+                  float3 hiN = float3(min(sbLo + 64, int3(mmDimF))) * invMMDimF9;
+                  float3 rem;
+                  rem.x = p.rayDir.x > 0.0 ? (hiN.x - mmPos.x) : (mmPos.x - loN.x);
+                  rem.y = p.rayDir.y > 0.0 ? (hiN.y - mmPos.y) : (mmPos.y - loN.y);
+                  rem.z = p.rayDir.z > 0.0 ? (hiN.z - mmPos.z) : (mmPos.z - loN.z);
+                  rem = max(rem, float3(0.0f));
+                  float3 tToFace;
+                  tToFace.x = abs(p.rayDir.x) > 1e-5 ? rem.x / abs(p.rayDir.x) : 1e30;
+                  tToFace.y = abs(p.rayDir.y) > 1e-5 ? rem.y / abs(p.rayDir.y) : 1e30;
+                  tToFace.z = abs(p.rayDir.z) > 1e-5 ? rem.z / abs(p.rayDir.z) : 1e30;
+                  float exactSkip = min(min(tToFace.x, tToFace.y), tToFace.z) + 1e-4;
+                  int leapSteps = (int)ceil(exactSkip / p.stepSize);
+                  if (leapSteps < 1) leapSteps = 1;
+                  w += leapSteps;
+                  continue;
+                }
               }
               if (mv9BlkState == 1)
               {
@@ -6724,6 +6777,7 @@ inline half4 marchVolume(
     texture2d<float> labelMapTransferTexture,
     texture3d<float> minMaxTexture,
     texture3d<float> minMaxBlockTexture,
+    texture3d<float> minMaxSuperTexture,
     texture3d<float> normalTexture,
     texture3d<float> blankingTexture,
     constant packed_float3* rectCoords,
@@ -6770,7 +6824,7 @@ inline half4 marchVolume(
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       gradientOpacityTexture, maskTexture, labelMapTransferTexture,
-      minMaxTexture, minMaxBlockTexture, normalTexture, blankingTexture, rectCoords, lightUniforms,
+      minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, normalTexture, blankingTexture, rectCoords, lightUniforms,
       nullptr, nullptr);
 }
 
@@ -6798,6 +6852,7 @@ inline void marchSegment(
     texture2d<float> labelMapTransferTexture,
     texture3d<float> minMaxTexture,
     texture3d<float> minMaxBlockTexture,
+    texture3d<float> minMaxSuperTexture,
     texture3d<float> normalTexture,
     texture3d<float> blankingTexture,
     constant packed_float3* rectCoords,
@@ -6812,7 +6867,7 @@ inline void marchSegment(
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       gradientOpacityTexture, maskTexture, labelMapTransferTexture,
-      minMaxTexture, minMaxBlockTexture, normalTexture, blankingTexture, rectCoords, lightUniforms,
+      minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, normalTexture, blankingTexture, rectCoords, lightUniforms,
       nullptr, nullptr);
   accumulatedColor = result.xyz;
   accumulatedOpacity = result.w;
@@ -6830,6 +6885,7 @@ fragment VolumeFragmentOut fragment_volume_main(
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
     texture3d<float> minMaxBlockTexture [[texture(16)]],
+    texture3d<float> minMaxSuperTexture [[texture(17)]],
     texture3d<float> normalTexture [[texture(7)]],
     texture2d<float> transferFunction2DTexture [[texture(9)]],
     texture3d<float> transfer2DYAxisTexture [[texture(10)]],
@@ -6916,7 +6972,7 @@ fragment VolumeFragmentOut fragment_volume_main(
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
-      maskTexture, labelMapTransferTexture, minMaxTexture, minMaxBlockTexture, normalTexture,
+      maskTexture, labelMapTransferTexture, minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, normalTexture,
       blankingTexture, rectCoords, &volumeLights);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
@@ -6943,6 +6999,7 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
     texture3d<float> minMaxBlockTexture [[texture(16)]],
+    texture3d<float> minMaxSuperTexture [[texture(17)]],
     texture3d<float> normalTexture [[texture(7)]],
     texture2d<float> transferFunction2DTexture [[texture(9)]],
     texture3d<float> transfer2DYAxisTexture [[texture(10)]],
@@ -6994,7 +7051,7 @@ fragment VolumeSelectionOut fragment_volume_selection_main(
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
-      maskTexture, labelMapTransferTexture, minMaxTexture, minMaxBlockTexture, normalTexture,
+      maskTexture, labelMapTransferTexture, minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, normalTexture,
       blankingTexture, rectCoords, &volumeLights);
 
   // PickingActorPassExit parity: only fragments that accumulated a certain
@@ -7022,6 +7079,7 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
     texture3d<float> minMaxBlockTexture [[texture(16)]],
+    texture3d<float> minMaxSuperTexture [[texture(17)]],
     texture3d<float> normalTexture [[texture(7)]],
     texture2d<float> transferFunction2DTexture [[texture(9)]],
     texture3d<float> transfer2DYAxisTexture [[texture(10)]],
@@ -7081,7 +7139,7 @@ fragment VolumeFragmentOut fragment_volume_fullscreen_main(
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
-      maskTexture, labelMapTransferTexture, minMaxTexture, minMaxBlockTexture, normalTexture,
+      maskTexture, labelMapTransferTexture, minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, normalTexture,
       blankingTexture, rectCoords, &volumeLights);
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
   return output;
@@ -7102,6 +7160,7 @@ fragment VolumeSelectionOut fragment_volume_fullscreen_selection_main(
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
     texture3d<float> minMaxBlockTexture [[texture(16)]],
+    texture3d<float> minMaxSuperTexture [[texture(17)]],
     texture3d<float> normalTexture [[texture(7)]],
     texture2d<float> transferFunction2DTexture [[texture(9)]],
     texture3d<float> transfer2DYAxisTexture [[texture(10)]],
@@ -7139,7 +7198,7 @@ fragment VolumeSelectionOut fragment_volume_fullscreen_selection_main(
       volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       depthTexture, gradientOpacityTexture,
-      maskTexture, labelMapTransferTexture, minMaxTexture, minMaxBlockTexture, normalTexture,
+      maskTexture, labelMapTransferTexture, minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, normalTexture,
       blankingTexture, rectCoords, &volumeLights);
 
   output.ids = volumeSelectionIds(s.entryPoint, float(_marchResult.w), volumeUniforms);
@@ -7165,6 +7224,7 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
     texture3d<float> minMaxBlockTexture [[texture(16)]],
+    texture3d<float> minMaxSuperTexture [[texture(17)]],
     texture3d<float> normalTexture [[texture(7)]],
     texture2d<float> transferFunction2DTexture [[texture(9)]],
     texture3d<float> transfer2DYAxisTexture [[texture(10)]],
@@ -7227,7 +7287,7 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
       transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
       transferFunction2DTexture, transfer2DYAxisTexture,
       gradientOpacityTexture, maskTexture, labelMapTransferTexture,
-      minMaxTexture, minMaxBlockTexture, normalTexture, blankingTexture, rectCoords, &volumeLights,
+      minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, normalTexture, blankingTexture, rectCoords, &volumeLights,
       &firstOpaquePos, &searching);
 
   output.color = float4(float3(_marchResult.xyz), float(_marchResult.w));
@@ -7384,6 +7444,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
     texture2d<float> labelMapTransferTexture [[texture(5)]],
     texture3d<float> minMaxTexture [[texture(6)]],
     texture3d<float> minMaxBlockTexture [[texture(16)]],
+    texture3d<float> minMaxSuperTexture [[texture(17)]],
     texture3d<float> normalTexture [[texture(7)]],
     texture3d<float> brickOccupancy [[texture(8)]],
     texture2d<float> transferFunction2DTexture [[texture(9)]],
@@ -7540,7 +7601,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
                     transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
                     transferFunction2DTexture, transfer2DYAxisTexture,
                     gradientOpacityTexture, maskTexture, labelMapTransferTexture,
-                    minMaxTexture, minMaxBlockTexture, normalTexture, blankingTexture, rectCoords,
+                    minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, normalTexture, blankingTexture, rectCoords,
                     &volumeLights);
             }
         }
@@ -7568,6 +7629,11 @@ struct MinMaxComputeUniforms {
   float _pad;
   uint  opacityPrefix[257];       // prefix sum: opacityPrefix[i] = count of non-zero opacity entries for indices < i
   int volTransposed;              // VTK_METAL_TEST_TRANSPOSE: sample coords map via .zyx
+  float opacityLut[256];          // §33.2 item 2 (VTK_METAL_TEST_MM_EPS): the TF
+                                  // opacity table so emptiness can use a max-
+                                  // achievable-opacity threshold instead of exact zero
+  float mmEps;                    // emptiness threshold (0 = exact prefix semantics)
+  uint  _pad2[3];
 };
 
 kernel void volume_compute_minmax(
@@ -7602,13 +7668,26 @@ kernel void volume_compute_minmax(
     }
   }
 
-  // Check emptiness via opacity prefix table
+  // Check emptiness via opacity prefix table. VTK_METAL_TEST_MM_EPS (§33.2
+  // item 2): when mmEps > 0 the predicate becomes "max achievable opacity in
+  // [idxMin,idxMax] <= eps" — an approximation that marks barely-visible
+  // cells empty so the walk can skip them. eps == 0 reduces to the exact
+  // zero-opacity semantics of the prefix sum.
   if (cellMin <= cellMax) {
     int iMin = int(floor((cellMin - u.scalarMin) * u.scalarScale));
     int iMax = int(floor((cellMax - u.scalarMin) * u.scalarScale));
     uint idxMin = uint(clamp(iMin, 0, 255));
     uint idxMax = uint(clamp(iMax, 0, 255));
-    bool empty = (u.opacityPrefix[idxMax + 1] == u.opacityPrefix[idxMin]);
+    bool empty = false;
+    if (u.mmEps > 0.0) {
+      float maxOp = 0.0;
+      for (uint i = idxMin; i <= idxMax; ++i) {
+        maxOp = max(maxOp, u.opacityLut[i]);
+      }
+      empty = (maxOp <= u.mmEps);
+    } else {
+      empty = (u.opacityPrefix[idxMax + 1] == u.opacityPrefix[idxMin]);
+    }
     occupancy.write(empty ? 1.0 : 0.0, gid);
   } else {
     occupancy.write(1.0, gid);
@@ -7682,6 +7761,37 @@ kernel void volume_reduce_minmax_blocks(
   if (allEmpty) {
     atomic_fetch_add_explicit(emptyCount, 1u, memory_order_relaxed);
   }
+}
+
+// §35.5 headroom A/B (VTK_METAL_TEST_MM_SUPER): third occupancy level — one
+// thread per super-block texel of the BLOCK summary; writes 1.0 when every
+// covered block is all-empty (leap through the whole group), else 0.0.
+// Derived from the block semantics, so the composited sample set is unchanged;
+// only jump granularity differs (same argument as the blocks level).
+kernel void volume_reduce_minmax_superblocks(
+    texture3d<float, access::read> blocks [[texture(0)]],
+    texture3d<float, access::write> supers [[texture(1)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  uint3 sdims = uint3(supers.get_width(), supers.get_height(), supers.get_depth());
+  if (any(gid >= sdims)) return;
+
+  uint3 bdims = uint3(blocks.get_width(), blocks.get_height(), blocks.get_depth());
+  uint3 start = gid * 8;
+  uint3 end = min(start + 8, bdims);
+
+  bool allEmpty = true;
+  for (uint z = start.z; z < end.z && allEmpty; z++) {
+    for (uint y = start.y; y < end.y && allEmpty; y++) {
+      for (uint x = start.x; x < end.x && allEmpty; x++) {
+        if (blocks.read(uint3(x, y, z)).r < 0.75) {
+          allEmpty = false;
+        }
+      }
+    }
+  }
+
+  supers.write(allEmpty ? 1.0 : 0.0, gid);
 }
 
 // ---------------------------------------------------------------------------
