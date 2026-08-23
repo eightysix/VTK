@@ -3069,6 +3069,41 @@ Findings:
    the occupancy-cliff law's existence (though §37.2 re-priced its
    ladder dependence); §35.14's seg consume pipeline cost.
 
+### 37.8 Invocation audit: how do we KNOW tonight's 62 vs morning's 39 is
+machine state, not a protocol difference? (2026-08-23 night)
+
+Challenge: raw cam-axis-z went 38.9 (§35.9/§35.10 morning) -> 62 (tonight)
+on the "same" config — a uniform slowdown cannot explain that while
+obliques move only +3%. Every invocation ingredient was therefore audited
+and where possible tested causally tonight:
+
+| candidate | check | result |
+|---|---|---|
+| scene/camera code drift | git diff 9c91995253..HEAD on TestMetalScenes.h + harness | empty |
+| transpose LAYOUT mismatch ("X-depth" forced then, auto now) | VolumeTransposedAxisDepth identical both commits; auto argmin returns axis-x for 512x512x1794; live [TR] dump confirms `transposed (axis x) 1794x512x512` | identical |
+| layout forcing causal test | VOLTRANSPOSE_AXIS=z -> 72.5, y -> 62.8, auto/x -> 62.7 (cam-z raw) | x is optimal tonight; no setting reproduces 39 |
+| jitter field (IGN vs blue-noise) | IGN_JITTER unset vs =0, cam-z raw | 61.6 vs 63.1 — neutral |
+| Low Power Mode | pmset -g | lowpowermode 0 |
+| background load | ps | **IINA video playing (12.6% CPU + VTDecoderXPCService)**, WindowServer compositing |
+
+Plus two internal-consistency facts: tonight repeats are stable to +-1%,
+and the rebuilt 9c91995253 binary matches HEAD within noise on identical
+cells — so tonight's state is steady and code-free.
+
+The remaining variable is hardware power state: the machine is ON BATTERY,
+discharging (69%), with video playback active. The inflation gradient by
+view — obl +3%, axis-x +20%, axis-y +28%, axis-z +59%, i.e. monotonically
+worse for longer chords / higher per-ray throughput — is the signature of
+a DVFS/memory-bandwidth cap hitting DRAM-throughput-bound configs hardest
+while latency-bound short-chord obliques barely notice. Falsifiable
+prediction: plugged in (and ideally with video stopped), tonight's binary
+should read cam-z raw near ~39-45 and obl unchanged ~22.
+
+Protocol additions (extends §37.7 rule 3): record battery/AC state and
+top background processes with every anchor table; when a cross-session
+absolute discrepancy exceeds ~10%, re-run BOTH arms interleaved before
+interpreting anything.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
