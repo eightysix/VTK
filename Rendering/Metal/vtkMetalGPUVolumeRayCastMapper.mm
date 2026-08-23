@@ -1320,44 +1320,33 @@ static int ComputeMacrocellDownsample(double sampleDistance, bool useGPUMinMax)
   return (useGPUMinMax && sampleDistance < 1.5) ? 2 : 4;
 }
 
-// Two-level occupancy summary (VTK_METAL_TEST_MM_BLOCKS, HARNESS_VS_APP_GAP
-// §33): builds a coarse R8 texture marking whole-block all-empty regions of
-// the DILATED macrocell lattice so the fragment walk leaps multiple cells per
-// lattice fetch. Output stays byte-identical: block emptiness is derived from
-// the exact per-cell semantics, so skipped samples are exactly the ones the
-// per-cell walk would skip too.
-static bool VolumeMinMaxBlocksActive()
-{
-  if (const char* v = getenv("VTK_METAL_TEST_MM_BLOCKS"))
-    return std::atoi(v) != 0;
-  return false;
-}
-
-// Block edge in fine-lattice cells. FIXED at 8: the fragment walk derives
-// block indices from cell indices via an integer divide by 8 (matching the
-// reduce kernel's tiling), so other sizes would need shader changes too.
+// Two-level occupancy summary, DEFAULT-ON whenever the GPU minmax lattice is
+// active (HARNESS_VS_APP_GAP §37.5). Builds a coarse R8 texture marking
+// whole-block all-empty regions of the DILATED macrocell lattice so the
+// fragment walk leaps multiple cells per lattice fetch. Block-leap landings
+// differ from the per-cell walk chain into the accepted +-1-step fp-landing
+// class at EVERY DS tier — the earlier "byte-identical" claim did not survive
+// pixel measurement (§37.6: ~0.2% of pixels, mean ~1 LSB, rare outliers) —
+// in exchange for -13% frame time at SD4 and -28% at SD0.5 (axz). 
+// VTK_METAL_TEST_MM_BLOCKS=0 opts back out.
 static int VolumeMinMaxBlockSize()
 {
   return 8;
 }
 
-// Unified gate for the two-level occupancy summary. Blocks pay off when
-// marches are dense (fine sample distance, the DS=2 macrocell tier): there
-// they collapse the per-cell skip grind into whole-block leaps. At coarse SD
-// the per-crossing bookkeeping costs more than the leaps save (~+1 ms on the
-// SD4 obliques) and the coarser DS=4 lattice makes the +-1-step landing
-// quantization more visible, so the feature stays off there and the SD>=1.5
-// path keeps byte-identical HEAD behavior.
+// Unified gate for the two-level occupancy summary. The former fine-SD-only
+// gate (sampleDistance < 1.5) was removed: its rationale — "~+1 ms on the SD4
+// obliques" — was refuted when re-measured on a healthy machine (§37.1/§37.3,
+// 2026-08-23): blocks win or tie everywhere at both jitter settings. The
+// sampleDistance parameter is kept for call-site stability.
 static bool VolumeMinMaxBlocksWanted(bool gpuMinMax, double sampleDistance)
 {
-  if (!VolumeMinMaxBlocksActive() || !gpuMinMax)
+  (void)sampleDistance;
+  if (!gpuMinMax)
     return false;
-  // §35.10 probe (VTK_METAL_TEST_MM_BLOCKS_ANY_SD): lift the fine-SD gate so
-  // blocks can be A/B'd at coarse SD, where mm-without-blocks now measures
-  // SLOWER than raw on axis views. Investigation-only.
-  if (getenv("VTK_METAL_TEST_MM_BLOCKS_ANY_SD"))
-    return true;
-  return sampleDistance < 1.5;
+  if (const char* v = getenv("VTK_METAL_TEST_MM_BLOCKS"))
+    return std::atoi(v) != 0;
+  return true;
 }
 
 // §35.5 headroom A/B (VTK_METAL_TEST_MM_SUPER): third occupancy level —

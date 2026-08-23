@@ -3000,6 +3000,31 @@ If byte-exactness at coarse SD is non-negotiable, the alternative is gating
 default-on to sampleDistance < 1.5 only (status quo ante) — but then SD4
 keeps paying ~15% vs achievable.
 
+### 37.6 EXECUTED same day: blocks ungated as recommended — and the
+"byte-identical at fine SD" claim is also FALSE (2026-08-23 evening)
+
+VolumeMinMaxBlocksWanted now returns true whenever the GPU minmax lattice is
+active, all SDs (env requirement + SD<1.5 gate deleted;
+VTK_METAL_TEST_MM_BLOCKS=0 is the kill switch; MM_BLOCKS_ANY_SD removed;
+VTK_METAL_TEST_MM_SUPER stays opt-in). Verification:
+
+| cell | blocks-off | default (blocks) |
+|---|---|---|
+| SD4 axz j1 | 41.4 ms | **36.0 ms (−13%)** |
+| SD0.5 axz j0 | 135.6 ms | **98.2 ms (−28%)** |
+
+Default renders are byte-identical to the explicit-probe-env renders (SD4
+axz/obl), so §37.3's parity quantification carries over.
+
+**Correction**: the §33 "byte-identical" claim fails at the FINE tier too.
+SD0.5 axz j0, default vs MM_BLOCKS=0: 8276 px differ (0.20%), mean 1.26 LSB,
+max 22, 128 px >8LSB — the same ±1-step landing class as DS=4, not zero.
+Block emptiness is exact per-cell; what differs is the LANDING arithmetic of
+block leaps vs the cell-walk's +1e-4-per-cell chain, at every DS tier. The
+change therefore alters output everywhere within this accepted class; no
+tier is byte-exact anymore. Kill switch (MM_BLOCKS=0) restores bit-exact
+legacy output for byte-diff regression tests.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
