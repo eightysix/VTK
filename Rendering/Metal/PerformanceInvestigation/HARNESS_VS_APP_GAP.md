@@ -2629,6 +2629,46 @@ Goal: close the +18..40% mm-vs-raw gap at SD4 axis views. All experiments
    warp-cooperative or async-compute segment pre-passes (structural,
    out of scope for quick A/B). No default changes made.
 
+### 35.13 In-fragment segment pre-walk implemented and REFUTED; occupancy-cliff law generalized (2026-08-23)
+
+Implemented the cheap variant of the async-segment design: run the walk
+ONCE per fragment before the march (same thread => bit-identical math),
+record skipped-step gaps, consume with integer tests between batches.
+Full plumbing: VolumeFeature_MMSegments (1u<<27), fc_marchSeg
+(function_constant 37), PSO-key bit, VTK_METAL_TEST_MM_SEG gate.
+Three storage encodings A/B'd at SD4 @2048² (obl / axz, legacy = HEAD):
+
+| encoding | mm legacy | mm+seg |
+|---|---|---|
+| function-scope int arrays [24] | (decls alone regressed legacy 22→44!) | ~45 / ~112 |
+| int arrays [4] | 21.85 / 55.9 | 45.2 / 116.6 |
+| packed ulong registers (K=8) | 22.0 / 56.3 | **49.1 / 124.0** |
+
+Findings:
+
+1. **Occupancy-cliff law (third instance, now generalized)**: ANY
+   meaningful added state or upfront work in this fragment — arrays
+   (even fc-dead: decls alone 2×'d legacy via scratch), tiny live arrays,
+   or ~10 extra live registers + a serial probe chain — costs ~2× frame
+   time. §34.7 (baseline-walk cliff), §35.12 (memo cliff), §35.13 (this):
+   the mv9 fragment sits exactly at the register/occupancy edge; there is
+   NO headroom for in-shader structural additions. Future designs MUST
+   move work into separate passes, not the march shader.
+2. The upfront build's serial probe chain does not overlap batch fetch
+   flights (unlike HEAD's interleaved per-batch probes, whose latency
+   partially hides behind compositing ALU of the previous batch).
+3. Tooling gotchas fixed en route: `getenv("X")` treats `X=0` as ON
+   (VolumeMMSegWanted added); function-scope array decls are NOT free
+   even when dead.
+4. Verdict: the true async pre-pass must be a separate GPU pass (ray-atlas
+   raster pre-pass writing origin/dir/t-range from the REAL interpolated
+   varyings — kernels cannot reproduce them bit-exactly — then compute
+   kernel builds segments, main pass consumes). Multi-day infrastructure
+   project; patch archived at
+   PerformanceInvestigation/mm_segment_prewalk_refuted.patch (195 lines,
+   applies to 621cc2f3d8). Tree reverted; HEAD re-verified
+   (axz-ds4 57.0 ≈ anchor).
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).

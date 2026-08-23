@@ -1,0 +1,195 @@
+diff --git a/Rendering/Metal/Shaders/MetalShaders.metal b/Rendering/Metal/Shaders/MetalShaders.metal
+index 9aa7796184..88c11d76d1 100644
+--- a/Rendering/Metal/Shaders/MetalShaders.metal
++++ b/Rendering/Metal/Shaders/MetalShaders.metal
+@@ -2772,6 +2772,13 @@ constant bool fc_mmBlocks [[function_constant(35)]];
+ // construction (super-empty => every covered block empty => every cell empty);
+ // landings stay on the step lattice like the block leaps.
+ constant bool fc_mmSuper [[function_constant(36)]];
++// §35.13 (VTK_METAL_TEST_MM_SEG -> VolumeFeature_MMSegments): one-shot
++// segment pre-walk. The full-ray lattice walk runs ONCE before the march and
++// records skipped-step gaps as integer ranges; the outer loop then hops gaps
++// with O(1) integer tests instead of re-running the serial preamble walk
++// between batches (the dominant residual minmax cost at coarse SD, §35.12).
++// Replaces the per-batch preamble AND the block/super summaries when on.
++constant bool fc_marchSeg [[function_constant(37)]];
+ 
+ // Map an original-orientation sample position into texture space for the live
+ // transposed representation (no-op when clear).
+@@ -5216,6 +5223,74 @@ inline half4 marchVolumeUnified(
+                                   mmSbDimF.x > 1.0f;
+       int3 mv9Sb = int3(-1);
+       bool mv9SbEmpty = false;
++      // Overflow past 8 gaps composites the remainder without skips: safe
++      // (empty samples contribute zero), ±1-step class. Storage is FOUR
++      // ulong registers (NOT arrays): function-scope arrays — even tiny,
++      // even fc-dead — force per-thread scratch and halved occupancy on
++      // this GPU (measured 2x frame cost); named scalars stay in registers.
++      // Each pair packs (start<<16 | end) in 16-bit step units.
++      ulong segP0 = 0, segP1 = 0, segP2 = 0, segP3 = 0;
++      int segCount = 0;
++      int segIdx = 0;
++      if (useMinMax && fc_marchSeg)
++      {
++        int w = 0;
++        while (w < steps && segCount < 8)
++        {
++          float3 sp = clamp(evalPoint + evalStep * (float)w, float3(0.0), float3(1.0));
++          if (minMaxTexture.sample(sNearest, sp, level(0)).r > 0.5f)
++          {
++            // Empty run: leap exactly like the preamble until a solid cell.
++            const int gs = w;
++            while (w < steps)
++            {
++              float3 mp = clamp(evalPoint + evalStep * (float)w, float3(0.0), float3(1.0));
++              if (minMaxTexture.sample(sNearest, mp, level(0)).r <= 0.5f) break;
++              float3 cc = mp * mmDimF;
++              float3 frc = fract(cc);
++              float3 distToEdge;
++              distToEdge.x = p.rayDir.x > 0.0 ? (1.0 - frc.x) : frc.x;
++              distToEdge.y = p.rayDir.y > 0.0 ? (1.0 - frc.y) : frc.y;
++              distToEdge.z = p.rayDir.z > 0.0 ? (1.0 - frc.z) : frc.z;
++              distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
++              float3 tToEdge;
++              tToEdge.x = abs(p.rayDir.x) > 1e-5 ? distToEdge.x / (abs(p.rayDir.x) * mmDimF.x) : 1e30;
++              tToEdge.y = abs(p.rayDir.y) > 1e-5 ? distToEdge.y / (abs(p.rayDir.y) * mmDimF.y) : 1e30;
++              tToEdge.z = abs(p.rayDir.z) > 1e-5 ? distToEdge.z / (abs(p.rayDir.z) * mmDimF.z) : 1e30;
++              float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z) + 1e-4;
++              int cellSteps = (int)ceil(exactSkip / p.stepSize);
++              if (cellSteps < 1) cellSteps = 1;
++              w += cellSteps;
++            }
++            ulong pr = ((ulong)(ushort)gs << 16) | (ulong)(ushort)min(w, steps);
++            if (segCount < 2)       segP0 |= pr << (uint)(32 * segCount);
++            else if (segCount < 4)  segP1 |= pr << (uint)(32 * (segCount - 2));
++            else if (segCount < 6)  segP2 |= pr << (uint)(32 * (segCount - 4));
++            else                    segP3 |= pr << (uint)(32 * (segCount - 6));
++            ++segCount;
++          }
++          else
++          {
++            // Solid cell: jump probes to the next cell face along the ray.
++            // The lattice is constant per cell, so one probe per cell is
++            // exact — build cost stays proportional to CELLS CROSSED.
++            float3 cc = sp * mmDimF;
++            float3 frc = fract(cc);
++            float3 distToEdge;
++            distToEdge.x = p.rayDir.x > 0.0 ? (1.0 - frc.x) : frc.x;
++            distToEdge.y = p.rayDir.y > 0.0 ? (1.0 - frc.y) : frc.y;
++            distToEdge.z = p.rayDir.z > 0.0 ? (1.0 - frc.z) : frc.z;
++            distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
++            float3 tToEdge;
++            tToEdge.x = abs(p.rayDir.x) > 1e-5 ? distToEdge.x / (abs(p.rayDir.x) * mmDimF.x) : 1e30;
++            tToEdge.y = abs(p.rayDir.y) > 1e-5 ? distToEdge.y / (abs(p.rayDir.y) * mmDimF.y) : 1e30;
++            tToEdge.z = abs(p.rayDir.z) > 1e-5 ? distToEdge.z / (abs(p.rayDir.z) * mmDimF.z) : 1e30;
++            float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z) + 1e-4;
++            int adv = (int)ceil(exactSkip / p.stepSize);
++            w += max(1, adv);
++          }
++        }
++      }
+       while (i < steps)
+       {
+         // A slab pass whose inherited near-side alpha already exceeds the
+@@ -5232,7 +5307,34 @@ inline half4 marchVolumeUnified(
+         } else {
+           seenInBounds = true;
+         }
+-        if (useMinMax)
++        if (useMinMax && fc_marchSeg)
++        {
++          // §35.13 consume: O(1) integer tests against the pre-walk gaps.
++          // Loop so several consecutive gaps/solids within one batch span
++          // resolve before dispatch.
++          for (;;)
++          {
++            if (segIdx >= segCount) { break; }
++            ulong pr;
++            if (segIdx < 2)      pr = (segIdx == 0) ? segP0 : (segP0 >> 32);
++            else if (segIdx < 4) pr = (segIdx == 2) ? segP1 : (segP1 >> 32);
++            else if (segIdx < 6) pr = (segIdx == 4) ? segP2 : (segP2 >> 32);
++            else                 pr = (segIdx == 6) ? segP3 : (segP3 >> 32);
++            const int gStart = (int)((pr >> 16) & 0xFFFFu);
++            const int gEnd   = (int)(pr & 0xFFFFu);
++            if (i >= gEnd)           { ++segIdx; continue; }
++            if (i < gStart)          { break; }
++            const int hopW = gEnd - i;
++            currentPoint += stepVec * (float)hopW;
++            currentT += p.stepSize * (float)hopW;
++            texLocalPos += texStep * (float)hopW;
++            evalPoint += evalStep * (float)hopW;
++            i += hopW;
++            ++segIdx;
++            continue;
++          }
++        }
++        else if (useMinMax)
+         {
+           int w = 0;
+           const int extent = min(48, steps - i);
+diff --git a/Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.h b/Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.h
+index d283d1f087..a3723a50df 100644
+--- a/Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.h
++++ b/Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.h
+@@ -174,6 +174,12 @@ enum VolumeShaderFeatureFlags : uint32_t
+   // Baked via fc_volTransposed; set by default. Mutually exclusive with
+   // VolumeFeature_VolRg8 (pair indexing assumes the untransposed layout).
+   VolumeFeature_VolTransposed = 1u << 31,
++  // §35.13 one-shot segment pre-walk (VTK_METAL_TEST_MM_SEG=1): the full-ray
++  // minmax lattice walk runs once before the march and records skipped-step
++  // gaps; the outer loop hops them with integer tests instead of re-running
++  // the serial preamble walk between batches. Baked via fc_marchSeg; clear by
++  // default. Replaces the per-batch preamble and the block/super summaries.
++  VolumeFeature_MMSegments = 1u << 27,
+ };
+ 
+ VTK_ABI_NAMESPACE_BEGIN
+diff --git a/Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.mm b/Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.mm
+index b18d4989ef..186cc0d450 100644
+--- a/Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.mm
++++ b/Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.mm
+@@ -1348,6 +1348,16 @@ static int VolumeMinMaxBlockSize()
+ // SD4 obliques) and the coarser DS=4 lattice makes the +-1-step landing
+ // quantization more visible, so the feature stays off there and the SD>=1.5
+ // path keeps byte-identical HEAD behavior.
++
++// §35.13 one-shot segment pre-walk gate (VTK_METAL_TEST_MM_SEG=1 enables;
++// presence-with-0 must stay OFF, unlike the bare-getenv diagnostics).
++static bool VolumeMMSegWanted()
++{
++  if (const char* v = getenv("VTK_METAL_TEST_MM_SEG"))
++    return std::atoi(v) != 0;
++  return false;
++}
++
+ static bool VolumeMinMaxBlocksWanted(bool gpuMinMax, double sampleDistance)
+ {
+   if (!VolumeMinMaxBlocksActive() || !gpuMinMax)
+@@ -7286,12 +7296,14 @@ const double vtkNotUsed(modelBounds)[6], const double vtkNotUsed(boundsSize)[3],
+     // featureMaskExtra: low bits carry the volume orientation code
+     // (VolumeTextureAxisDepth 0/1/2), bit 2 the block-summary walk gate —
+     // fc_mmBlocks pipelines must not be shared with non-block ones — and
+-    // bit 3 the super-summary gate (fc_mmSuper).
++    // bit 3 the super-summary gate (fc_mmSuper), bit 4 the one-shot segment
++    // pre-walk (fc_marchSeg).
+     static_cast<uint32_t>(this->VolumeTextureAxisDepth) |
+       ((VolumeMinMaxBlocksWanted(this->UseGPUMinMax, this->SampleDistance) &&
+         this->MinMaxBlockTexture != nullptr) ? 4u : 0u) |
+       ((VolumeMinMaxSuperWanted(this->UseGPUMinMax, this->SampleDistance) &&
+-        this->MinMaxSuperTexture != nullptr) ? 8u : 0u) };
++        this->MinMaxSuperTexture != nullptr) ? 8u : 0u) |
++      (VolumeMMSegWanted() ? 16u : 0u) };
+   auto it = this->PipelineCache.find(key);
+   if (it != this->PipelineCache.end())
+   {
+@@ -7459,6 +7471,10 @@ const double vtkNotUsed(modelBounds)[6], const double vtkNotUsed(boundsSize)[3],
+                     this->MinMaxSuperTexture != nullptr) ? YES : NO;
+     [constants setConstantValue:&mmSuper type:MTLDataTypeBool
+                        withName:@"fc_mmSuper"];
++    // §35.13 one-shot segment pre-walk (VTK_METAL_TEST_MM_SEG)
++    BOOL mmSeg = VolumeMMSegWanted() ? YES : NO;
++    [constants setConstantValue:&mmSeg type:MTLDataTypeBool
++                       withName:@"fc_marchSeg"];
+ 
+     // Blend mode function constant: 0=composite, 1=MIP, 2=MinIP, 3=AverageIP,
+     // 4=additive (vtkVolumeMapper::BlendMode). Encoded in the feature mask so
