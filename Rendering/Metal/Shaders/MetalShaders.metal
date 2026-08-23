@@ -3004,6 +3004,12 @@ struct VolumeMapperUniforms {
   // sizes/builds minMaxBlockTexture; supers stay fixed at 64-cell tiles, so
   // blocks-per-super = 64 / mmBlockSizeCells.
   float mmBlockSizeCells;
+  // §37.19 warp-coherent skipping (VTK_METAL_TEST_MM_WARPMIN): > 0.5 makes
+  // each outer iteration probe the current block and advance the whole
+  // SIMD-group by the simd-min leap; zero (any dissent) falls back to the
+  // legacy per-lane walk. Skipped samples are provably-zero at unchanged
+  // positions, so output stays byte-identical to the default walk.
+  float mmWarpMin;
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -5332,6 +5338,54 @@ inline half4 marchVolumeUnified(
         }
         else if (useMinMax)
         {
+          // §37.19 warp-coherent skip: probe the CURRENT block once per lane;
+          // advance all lanes by the warp-minimum leap so straight chords keep
+          // their cross-lane slice-lockstep (raw's cache-coalescing advantage).
+          // A single dissenting lane zeroes the leap -> legacy walk below.
+          // simd_min is called from potentially non-converged active sets
+          // (latch/tEnd breaks); inactive-lane contributions only risk
+          // disabling a skip (garbage <= 0 falls through), never corrupting
+          // output — verified by byte-compare when the feature is on.
+          if (volumeUniforms.mmWarpMin > 0.5f && bsI > 0)
+          {
+            const float3 wp = clamp(evalPoint, float3(0.0), float3(1.0));
+            const int3 wb = min(int3(wp * mmDimF) / bsI, int3(mmBlkDimF) - 1);
+            const float wv = minMaxBlockTexture.sample(sNearest,
+                (float3(wb) + 0.5f) / mmBlkDimF, level(0)).r;
+            int myLeap = 0;
+            if (wv > 0.75f)
+            {
+              // All-empty block ahead: distance to its far face along the ray.
+              const int3 wLo = wb * bsI;
+              const float3 wLoN = float3(wLo) * invMMDimF9;
+              const float3 wHiN = float3(min(wLo + bsI, int3(mmDimF))) * invMMDimF9;
+              float3 wRem;
+              wRem.x = p.rayDir.x > 0.0 ? (wHiN.x - wp.x) : (wp.x - wLoN.x);
+              wRem.y = p.rayDir.y > 0.0 ? (wHiN.y - wp.y) : (wp.y - wLoN.y);
+              wRem.z = p.rayDir.z > 0.0 ? (wHiN.z - wp.z) : (wp.z - wLoN.z);
+              wRem = max(wRem, float3(0.0f));
+              float3 wT;
+              wT.x = abs(p.rayDir.x) > 1e-5 ? wRem.x / abs(p.rayDir.x) : 1e30;
+              wT.y = abs(p.rayDir.y) > 1e-5 ? wRem.y / abs(p.rayDir.y) : 1e30;
+              wT.z = abs(p.rayDir.z) > 1e-5 ? wRem.z / abs(p.rayDir.z) : 1e30;
+              float wSkip = min(min(wT.x, wT.y), wT.z) + 1e-4;
+              myLeap = max(1, (int)ceil(wSkip / p.stepSize));
+            }
+            const int warpLeap = simd_min(myLeap);
+            // §37.19 refinement: acting on tiny mins makes the warp crawl
+            // one sample at a time (probe cost per sample >> saved work);
+            // require a substantial warp-wide leap, else legacy walk.
+            if (warpLeap >= int(volumeUniforms.mmWarpMin))
+            {
+              const int adv = min(warpLeap, steps - i);
+              currentPoint += stepVec * (float)adv;
+              currentT += p.stepSize * (float)adv;
+              texLocalPos += texStep * (float)adv;
+              evalPoint += evalStep * (float)adv;
+              i += adv;
+              continue;
+            }
+          }
           int w = 0;
           const int extent = min(48, steps - i);
           // Block-summary state is cached across batches (mv9Blk above).

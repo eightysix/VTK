@@ -257,9 +257,17 @@ struct VolumeMapperUniforms
   // match VolumeMinMaxBlockSize() used to build minMaxBlockTexture. Supers
   // remain fixed 64-cell tiles (blocks-per-super = 64 / this).
   float MmBlockSizeCells;          // 1740..1743
+  // §37.19 warp-coherent skipping (VTK_METAL_TEST_MM_WARPMIN): when > 0.5,
+  // each outer march iteration probes the block summary once per lane and
+  // advances the whole SIMD-group by the warp-minimum leap (all-empty-block
+  // distance), preserving cross-lane slice-lockstep on straight chords.
+  // Any dissenting lane (mixed/solid block) zeroes the warp leap and the
+  // march falls back to the legacy per-lane walk, leaving oblique-path
+  // skipping fully intact.
+  float MmWarpMin;                 // 1744..1747
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1744,
+static_assert(sizeof(VolumeMapperUniforms) == 1748,
   "VolumeMapperUniforms must be 1736 bytes to match Metal shader struct");
 
 // MSL rounds the shader-side struct up to its 16-byte alignment (float4/float3
@@ -269,7 +277,7 @@ static_assert(sizeof(VolumeMapperUniforms) == 1744,
 // padding differs — so allocating the rounded size is purely a validation fix.
 static constexpr NSUInteger VolumeUniformBufferSize =
   (static_cast<NSUInteger>(sizeof(VolumeMapperUniforms)) + 15) & ~NSUInteger(15);
-static_assert(VolumeUniformBufferSize == 1744, "rounded uniform size");
+static_assert(VolumeUniformBufferSize == 1760, "rounded uniform size");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -8847,6 +8855,14 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   }
   // §37.18: keep the shader's index math in sync with the built texture.
   uniforms.MmBlockSizeCells = static_cast<float>(VolumeMinMaxBlockSize());
+  // §37.19 warp-coherent skip probe: opt-in A/B.
+  uniforms.MmWarpMin = 0.0f;
+  if (const char* wm = getenv("VTK_METAL_TEST_MM_WARPMIN"))
+  {
+    // Value doubles as the minimum warp-wide leap worth acting on
+    // (0/absent = feature off; e.g. MM_WARPMIN=4 skips unless >=4).
+    uniforms.MmWarpMin = static_cast<float>(std::atoi(wm));
+  }
 
   // Final color window/level (matches OpenGL's in_scale/in_bias, applied in the
   // shader after the ray cast as rgb * scale + bias * alpha).

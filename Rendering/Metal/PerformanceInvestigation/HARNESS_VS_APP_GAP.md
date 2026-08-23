@@ -3580,6 +3580,53 @@ the residual must go: leap-length quantization to batch multiples, or
 warp-coherent skip redesign (simd reductions need uniform control flow —
 mv9 still breaks on latch/tEnd, so they are program errors today).
 
+### 37.19 Warp-coherent skipping implemented and REFUTED at every threshold;
+the invasive-redesign space is now closed by measurement (2026-08-24 night)
+
+Implemented the only remaining mechanism-level candidate end-to-end:
+VTK_METAL_TEST_MM_WARPMIN probes the current block once per lane each
+outer iteration, computes the all-empty-block leap distance per lane, and
+advances the whole SIMD-group by simd_min(leap) — preserving exactly the
+cross-lane slice-lockstep that makes raw axis chords fast; any dissenting
+lane zeroes the warp leap and the legacy per-lane walk runs untouched
+(oblique wins structurally preserved). Uniform MmWarpMin field (offset
+1744; buffer now rounds to 1760). Validated: default-off byte-identical;
+WARPMIN=1 output in the accepted ±1-step class (0.12% px, max 2 LSB) —
+which also proves simd_min behaves correctly from non-converged active
+sets on this compiler/HW (corruption would have been visible).
+
+Perf (frames=100 medians, Airways SD4 @2048² c32): CATASTROPHIC.
+z 69.5-71.3 ms (vs TRAW 35.8-36.9, BS8 44.7); obl 26.5 (vs BS8 18.7).
+Refinement pass — value doubles as an act-threshold (act only when
+warpLeap >= T, else straight to legacy walk): T=4/T=8 -> z 51.8-52.2.
+Still far above doing nothing.
+
+Why it loses (mechanism, consistent with §37.17): (1) the unconditional
+probe+reduction taxes EVERY outer iteration of EVERY ray, including solid-
+terrain runs where the legacy preamble is provably ~free (SolidFlat);
+(2) min-aggregation paces the warp at its least-fortunate lane — lanes
+straddle vessels at 3mm lateral spread, so someone dissents constantly,
+and when a lane sits at a block edge the whole warp crawls 1 sample at a
+time (threshold gating trims the crawl but keeps the tax); (3) the
+coherence dividend only exists where lanes were already near-converged,
+i.e., exactly the chords where block certifications are rarest.
+
+Also closed analytically/measured tonight:
+- Leap quantization to batch multiples: does NOT reconverge lanes (phase
+  differences survive quantization) — no mechanism, not pursued further.
+- Full-predication lockstep redesign (uniform trip count makes simd ops
+  legal and cheap): circular by construction — a fully-predicated coherent
+  mm IS raw plus probe overhead >= raw. The prize cannot exceed its cost.
+- Frame-level per-view PSO selection (fc_minmax off for axis-dominant
+  frames): dead by our own data — x-axis chords WIN with mm while y/z
+  lose; one geometric class, opposite signs, no separating rule.
+
+Standing conclusion after §37.13-37.19: the axis-chord residual (~+6-7%
+at BS16 in-batch; expected smaller clean) is the price of one code path
+serving all geometries. Every mechanism-level alternative has now been
+built or derived and refuted by measurement. The single live action is
+the BS16 default-flip after clean-machine confirmation (§37.18 protocol).
+
 ### 37.14 Reproduction recipe for all §37 benchmarks
 
 Commits: measurements taken on `1896bf38bd` code (single-tier cap32;
