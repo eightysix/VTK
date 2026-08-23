@@ -2988,28 +2988,6 @@ struct VolumeMapperUniforms {
   // SD0.5-4, 400^2-4096^2). The unrolled ladder tops out at 48; caps >= 48
   // dispatch identically. VTK_METAL_TEST_MARCH_CAP overrides.
   float maxBatchWidth;
-  // §37.15 block-or-nothing (VTK_METAL_TEST_MM_BLOCKSONLY): > 0.5 disables
-  // the per-cell tier of the march preamble — super/block leaps stay active,
-  // mixed blocks dispatch their batch un-walked. Byte-identical output to the
-  // default walk (dropped skips cover provably-zero samples at unchanged
-  // positions).
-  float mmBlocksOnly;
-  // §37.17 leap-granularity selector (VTK_METAL_TEST_MM_LEAPLEVEL): 2 =
-  // super+block leaps (default), 1 = super only, <=0 = none. Coherence
-  // probe for the axis-chord deficit (SolidFlat proved the deficit is
-  // 100% leap dynamics; fewer/larger leaps cut lane-scatter events).
-  float mmLeapLevel;
-  // §37.18 block-summary size in fine cells (VTK_METAL_TEST_MM_BLOCKSIZE,
-  // {4,8,16,32}, default 8). Must match the CPU VolumeMinMaxBlockSize() that
-  // sizes/builds minMaxBlockTexture; supers stay fixed at 64-cell tiles, so
-  // blocks-per-super = 64 / mmBlockSizeCells.
-  float mmBlockSizeCells;
-  // §37.19 warp-coherent skipping (VTK_METAL_TEST_MM_WARPMIN): > 0.5 makes
-  // each outer iteration probe the current block and advance the whole
-  // SIMD-group by the simd-min leap; zero (any dissent) falls back to the
-  // legacy per-lane walk. Skipped samples are provably-zero at unchanged
-  // positions, so output stays byte-identical to the default walk.
-  float mmWarpMin;
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -5233,16 +5211,6 @@ inline half4 marchVolumeUnified(
       // change. State: 0 mixed (per-cell work), 1 all-empty (leap), 2
       // all-solid (batches composite normally; preamble just stops early).
       const float3 invMMDimF9 = 1.0f / mmDimF;
-      // §37.18 block size in fine cells (default 8); supers remain fixed
-      // 64-cell tiles, so blocks-per-super-line derives from it.
-      // §37.20: the per-iteration integer DIVIDES this used to cost real time
-      // on walk-heavy chords (+13% axis-z); hoisted here as EXACT fp
-      // reciprocals — every legal block size is a power of two, so x*invBs is
-      // bit-exact against x/bsI and truncation still matches division.
-      const int bsI = max(int(volumeUniforms.mmBlockSizeCells), 1);
-      const int bpsI = 64 / bsI;
-      const float invBs = 1.0f / float(bsI);
-      const float invBps = 1.0f / float(bpsI);
       int3 mv9Blk = int3(-1);
       int mv9BlkState = -1;
       // §35.5 (VTK_METAL_TEST_MM_SUPER -> fc_mmSuper): third occupancy level.
@@ -5344,54 +5312,6 @@ inline half4 marchVolumeUnified(
         }
         else if (useMinMax)
         {
-          // §37.19 warp-coherent skip: probe the CURRENT block once per lane;
-          // advance all lanes by the warp-minimum leap so straight chords keep
-          // their cross-lane slice-lockstep (raw's cache-coalescing advantage).
-          // A single dissenting lane zeroes the leap -> legacy walk below.
-          // simd_min is called from potentially non-converged active sets
-          // (latch/tEnd breaks); inactive-lane contributions only risk
-          // disabling a skip (garbage <= 0 falls through), never corrupting
-          // output — verified by byte-compare when the feature is on.
-          if (volumeUniforms.mmWarpMin > 0.5f && bsI > 0)
-          {
-            const float3 wp = clamp(evalPoint, float3(0.0), float3(1.0));
-            const int3 wb = min(int3(wp * mmDimF) / bsI, int3(mmBlkDimF) - 1);
-            const float wv = minMaxBlockTexture.sample(sNearest,
-                (float3(wb) + 0.5f) / mmBlkDimF, level(0)).r;
-            int myLeap = 0;
-            if (wv > 0.75f)
-            {
-              // All-empty block ahead: distance to its far face along the ray.
-              const int3 wLo = wb * bsI;
-              const float3 wLoN = float3(wLo) * invMMDimF9;
-              const float3 wHiN = float3(min(wLo + bsI, int3(mmDimF))) * invMMDimF9;
-              float3 wRem;
-              wRem.x = p.rayDir.x > 0.0 ? (wHiN.x - wp.x) : (wp.x - wLoN.x);
-              wRem.y = p.rayDir.y > 0.0 ? (wHiN.y - wp.y) : (wp.y - wLoN.y);
-              wRem.z = p.rayDir.z > 0.0 ? (wHiN.z - wp.z) : (wp.z - wLoN.z);
-              wRem = max(wRem, float3(0.0f));
-              float3 wT;
-              wT.x = abs(p.rayDir.x) > 1e-5 ? wRem.x / abs(p.rayDir.x) : 1e30;
-              wT.y = abs(p.rayDir.y) > 1e-5 ? wRem.y / abs(p.rayDir.y) : 1e30;
-              wT.z = abs(p.rayDir.z) > 1e-5 ? wRem.z / abs(p.rayDir.z) : 1e30;
-              float wSkip = min(min(wT.x, wT.y), wT.z) + 1e-4;
-              myLeap = max(1, (int)ceil(wSkip / p.stepSize));
-            }
-            const int warpLeap = simd_min(myLeap);
-            // §37.19 refinement: acting on tiny mins makes the warp crawl
-            // one sample at a time (probe cost per sample >> saved work);
-            // require a substantial warp-wide leap, else legacy walk.
-            if (warpLeap >= int(volumeUniforms.mmWarpMin))
-            {
-              const int adv = min(warpLeap, steps - i);
-              currentPoint += stepVec * (float)adv;
-              currentT += p.stepSize * (float)adv;
-              texLocalPos += texStep * (float)adv;
-              evalPoint += evalStep * (float)adv;
-              i += adv;
-              continue;
-            }
-          }
           int w = 0;
           const int extent = min(48, steps - i);
           // Block-summary state is cached across batches (mv9Blk above).
@@ -5405,7 +5325,7 @@ inline half4 marchVolumeUnified(
               // (integer divide — an mmPos*blockDim product disagrees with
               // the kernel tiling wherever fineDim/8 is not integer), and the
               // texel is sampled at its center.
-              int3 newBlk = min(int3(cellCoord * invBs), int3(mmBlkDimF) - 1);
+              int3 newBlk = min(int3(cellCoord) / 8, int3(mmBlkDimF) - 1);
               if (any(newBlk != mv9Blk))
               {
                 mv9Blk = newBlk;
@@ -5415,7 +5335,7 @@ inline half4 marchVolumeUnified(
               }
               if (useMinMaxSuper)
               {
-                int3 newSb = min(int3(float3(mv9Blk) * invBps), int3(mmSbDimF) - 1);
+                int3 newSb = min(mv9Blk / 8, int3(mmSbDimF) - 1);
                 if (any(newSb != mv9Sb))
                 {
                   mv9Sb = newSb;
@@ -5423,7 +5343,7 @@ inline half4 marchVolumeUnified(
                       (float3(mv9Sb) + 0.5f) / mmSbDimF, level(0)).r;
                   mv9SbEmpty = ssv > 0.5f;
                 }
-                if (mv9SbEmpty && volumeUniforms.mmLeapLevel > 0.5f)
+                if (mv9SbEmpty)
                 {
                   // All-empty super-block: every covered cell is empty, so
                   // leap to its far boundary along the ray in fine-cell units
@@ -5447,13 +5367,13 @@ inline half4 marchVolumeUnified(
                   continue;
                 }
               }
-              if (mv9BlkState == 1 && volumeUniforms.mmLeapLevel > 1.5f)
+              if (mv9BlkState == 1)
               {
                 // All-empty block: leap to its far boundary along the ray in
                 // fine-cell units (blocks tile cells [8k,8k+8)).
-                int3 blkLo = mv9Blk * bsI;
+                int3 blkLo = mv9Blk * 8;
                 float3 loN = float3(blkLo) * invMMDimF9;
-                float3 hiN = float3(min(blkLo + bsI, int3(mmDimF))) * invMMDimF9;
+                float3 hiN = float3(min(blkLo + 8, int3(mmDimF))) * invMMDimF9;
                 float3 rem;
                 rem.x = p.rayDir.x > 0.0 ? (hiN.x - mmPos.x) : (mmPos.x - loN.x);
                 rem.y = p.rayDir.y > 0.0 ? (hiN.y - mmPos.y) : (mmPos.y - loN.y);
@@ -5478,14 +5398,6 @@ inline half4 marchVolumeUnified(
                 break;
               }
             }
-            // §37.15 block-or-nothing (mmBlocksOnly): a mixed block dispatches
-            // its batch un-walked. On fragmented axis chords the per-cell walk
-            // below pays serialized lattice-tap + boundary-solve work per step
-            // for near-zero yield (blocks rarely certify empty there), while
-            // raw composites empties branch-free. Dropped skips cover
-            // provably-zero samples at unchanged positions, so output is
-            // byte-identical to running this walk.
-            if (volumeUniforms.mmBlocksOnly > 0.5f) { break; }
             if (minMaxTexture.sample(sNearest, mmPos, level(0)).r <= 0.5) break;
             float3 fractCoord = fract(cellCoord);
             float3 distToEdge;
@@ -6218,10 +6130,9 @@ inline half4 marchVolumeUnified(
           // their edges sit at 8k/fineDim, NOT at k/blockDim. The fraction
           // space drifts whenever fineDim/blockSize is not an integer
           // (897 cells -> 113 blocks), skipping across thin solid cells.
-          const int bsU = max(int(volumeUniforms.mmBlockSizeCells), 1);
-          int3 blkLo = curBlock * bsU;
+          int3 blkLo = curBlock * 8;
           float3 loN = float3(blkLo) / mmDimF;
-          float3 hiN = float3(min(blkLo + bsU, int3(mmDimF))) / mmDimF;
+          float3 hiN = float3(min(blkLo + 8, int3(mmDimF))) / mmDimF;
           float3 rem;
           rem.x = p.rayDir.x > 0.0 ? (hiN.x - mmPos.x) : (mmPos.x - loN.x);
           rem.y = p.rayDir.y > 0.0 ? (hiN.y - mmPos.y) : (mmPos.y - loN.y);
@@ -8220,16 +8131,14 @@ kernel void volume_reduce_minmax_blocks(
 kernel void volume_reduce_minmax_superblocks(
     texture3d<float, access::read> blocks [[texture(0)]],
     texture3d<float, access::write> supers [[texture(1)]],
-    constant uint& blocksPerSuper [[buffer(0)]],
     uint3 gid [[thread_position_in_grid]])
 {
   uint3 sdims = uint3(supers.get_width(), supers.get_height(), supers.get_depth());
   if (any(gid >= sdims)) return;
 
   uint3 bdims = uint3(blocks.get_width(), blocks.get_height(), blocks.get_depth());
-  const uint bps = max(blocksPerSuper, 1u);
-  uint3 start = gid * bps;
-  uint3 end = min(start + bps, bdims);
+  uint3 start = gid * 8;
+  uint3 end = min(start + 8, bdims);
 
   bool allEmpty = true;
   for (uint z = start.z; z < end.z && allEmpty; z++) {

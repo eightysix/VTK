@@ -3685,6 +3685,38 @@ DECIDING PROTOCOL (next clean window, before any default change):
   flip default; otherwise document BS8 as incumbent with BS16 as the
   documented axis-chord remedy via VTK_METAL_TEST_MM_BLOCKSIZE=16.
 
+### 37.21 REPRODUCIBILITY VERDICT (2026-08-24): b56f7738e4 checked out and
+rerun — its own §37.11-era numbers do NOT reproduce; HEAD fully exonerated
+
+The requested discriminating experiment, executed exactly: checked out
+b56f7738e4's shader+mapper (pristine pre-knob reference code), rebuilt,
+ran the verbatim §37.14 recipe (frames=25 warmup=8) twice per cell:
+
+| cell | §37.11 published | b56f7738e4 binary TODAY | Δ |
+|---|---|---|---|
+| z TRUE raw | 31.0 | 35.81 / 36.34 | +16% |
+| z mm | 36.3 | 40.67 / 39.96 | +11% |
+| obl mm | 16.6 | 17.80 / 17.25 | +5% |
+
+The reference code does not reproduce its own published absolutes on any
+arm — including pure raw, which none of the §37.15-37.20 changes touch.
+Conclusions, now airtight:
+
+1. The §37.11/§37.12/§37.13 tables are session-conditioned (fast-window
+   boost clocks). Cross-session comparison against them is void in both
+   directions; only within-batch ratios carry meaning.
+2. HEAD carries NO hidden regression vs the reference: tonight's
+   interleaved cells match b56f7738e4 within noise (z-mm medians 39.9 vs
+   40.3; obl-mm 17.25 vs 17.25). The §37.18 divide-regression was real
+   but is fixed (§37.20); everything else measures at parity.
+3. Therefore ALL relative verdicts drawn tonight within single batches
+   stand (SolidFlat mechanism split, LL sweep, BS16-vs-BS8 z result,
+   warpmin refutation), while any absolute ms quoted across sessions must
+   be re-derived under the §37.20 deciding protocol before use.
+
+Protocol amendment: anchor gates must compare against a FRESH same-session
+baseline of the REFERENCE configuration, never against historical tables.
+
 ### 37.14 Reproduction recipe for all §37 benchmarks
 
 Commits: measurements taken on `1896bf38bd` code (single-tier cap32;
