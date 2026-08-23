@@ -1370,6 +1370,23 @@ static bool VolumeMinMaxSuperWanted(bool gpuMinMax, double sampleDistance)
   return false;
 }
 
+// §35.14 async segment pre-pass gate (VTK_METAL_TEST_MM_SEG): value-parsed so
+// "0" stays OFF (bare-getenv diagnostics treat presence as ON). Requires the
+// GPU minmax lattice; per-frame readiness is checked at the encode sites.
+static bool VolumeSegWanted()
+{
+  if (const char* v = getenv("VTK_METAL_TEST_MM_SEG"))
+    return std::atoi(v) != 0;
+  return false;
+}
+// TEMP-DIAG \u00a735.14: run the full pre-pass machinery but keep the march on
+// the legacy-preamble pipeline (fc_segHop=false) \u2014 isolates the cost of the
+// consume code path from the atlas/build/offscreen/blit machinery.
+static bool VolumeSegConsumeSuppressed()
+{
+  return getenv("VTK_METAL_TEST_MM_SEG_NOCONSUME") != nullptr;
+}
+
 // §33.2 item 2 (VTK_METAL_TEST_MM_EPS): emptiness threshold for the GPU
 // minmax build — cells whose max achievable opacity is <= eps are marked
 // empty so the walk skips them. 0 (default) keeps the exact zero-opacity
@@ -2267,6 +2284,117 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseRTTResources()
   this->RTTWidth = 0;
   this->RTTHeight = 0;
   this->RTTDepthScalarType = -1;
+}
+
+//------------------------------------------------------------------------------
+// §35.14 segment pre-pass resources: three RGBA32Float ray-atlas planes, the
+// per-pixel u32 offset map, the compacted gap pool and its claim counter, and
+// the volume_segment_build compute pipeline. Cached by atlas size.
+bool vtkMetalGPUVolumeRayCastMapper::EnsureSegResources(
+  void* deviceVoid, void* mtlQueueVoid, int width, int height)
+{
+  (void)mtlQueueVoid;
+  if (this->SegAtlasATexture && this->SegBuildComputePipeline &&
+      this->SegMarchTexture &&
+      this->SegAtlasWidth == width && this->SegAtlasHeight == height)
+  {
+    return true;
+  }
+
+  ReleaseMetalObject(this->SegAtlasATexture);
+  ReleaseMetalObject(this->SegAtlasBTexture);
+  ReleaseMetalObject(this->SegAtlasCTexture);
+  ReleaseMetalObject(this->SegIndexBuffer);
+  ReleaseMetalObject(this->SegPoolBuffer);
+  ReleaseMetalObject(this->SegPoolCounterBuffer);
+  ReleaseMetalObject(this->SegMarchTexture);
+
+  @autoreleasepool
+  {
+    id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
+
+    MTLTextureDescriptor* td =
+      [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+                                                         width:width height:height
+                                                     mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> texA = [device newTextureWithDescriptor:td];
+    id<MTLTexture> texB = [device newTextureWithDescriptor:td];
+    id<MTLTexture> texC = [device newTextureWithDescriptor:td];
+    if (!texA || !texB || !texC)
+    {
+      vtkErrorMacro("Failed to create segment ray-atlas textures");
+      return false;
+    }
+    AssignMetalObject(this->SegAtlasATexture, texA);
+    AssignMetalObject(this->SegAtlasBTexture, texB);
+    AssignMetalObject(this->SegAtlasCTexture, texC);
+
+    id<MTLBuffer> idxBuf = [device newBufferWithLength:(NSUInteger)width * height * 4
+                                               options:MTLResourceStorageModePrivate];
+    // Claim counter: shared so the CPU can zero it each frame.
+    id<MTLBuffer> cntBuf = [device newBufferWithLength:4
+                                               options:MTLResourceStorageModeShared];
+    // Gap pool: cap at 192 MiB (48M words) or the device maximum. Overflowed
+    // rays fall back to compositing every sample.
+    const NSUInteger maxLen = [device maxBufferLength];
+    const NSUInteger poolBytes = std::min<NSUInteger>((64u << 20), maxLen);
+    id<MTLBuffer> poolBuf = [device newBufferWithLength:poolBytes
+                                                options:MTLResourceStorageModePrivate];
+    if (!idxBuf || !cntBuf || !poolBuf)
+    {
+      vtkErrorMacro("Failed to create segment buffers");
+      return false;
+    }
+    AssignMetalObject(this->SegIndexBuffer, idxBuf);
+    AssignMetalObject(this->SegPoolCounterBuffer, cntBuf);
+    AssignMetalObject(this->SegPoolBuffer, poolBuf);
+    this->SegPoolCapWords = poolBytes / 4;
+
+    // Offscreen march target: RGBA16Float to MATCH the OffscreenLayer
+    // pipeline's declared color format exactly.
+    id<MTLTexture> marchTex = NewTexture2D(device, MTLPixelFormatRGBA16Float,
+      width, height, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead,
+      MTLStorageModePrivate);
+    if (!marchTex)
+    {
+      vtkErrorMacro("Failed to create segment march texture");
+      return false;
+    }
+    AssignMetalObject(this->SegMarchTexture, marchTex);
+
+    if (!this->SegBuildComputePipeline)
+    {
+      id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
+      if (!library)
+      {
+        vtkErrorMacro("Segment build: shader library missing");
+        return false;
+      }
+      NSError* err = nil;
+      id<MTLFunction> fn = [library newFunctionWithName:@"volume_segment_build"];
+      if (!fn)
+      {
+        vtkErrorMacro("Failed to find volume_segment_build");
+        return false;
+      }
+      id<MTLComputePipelineState> cps =
+        [device newComputePipelineStateWithFunction:fn error:&err];
+      [fn release];
+      if (!cps)
+      {
+        vtkErrorMacro(<< "Segment build pipeline failed: "
+                      << [[err localizedDescription] UTF8String]);
+        return false;
+      }
+      AssignMetalObject(this->SegBuildComputePipeline, cps);
+    }
+
+    this->SegAtlasWidth = width;
+    this->SegAtlasHeight = height;
+  }
+  return true;
 }
 
 //------------------------------------------------------------------------------
@@ -7291,7 +7419,15 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
       ((VolumeMinMaxBlocksWanted(this->UseGPUMinMax, this->SampleDistance) &&
         this->MinMaxBlockTexture != nullptr) ? 4u : 0u) |
       ((VolumeMinMaxSuperWanted(this->UseGPUMinMax, this->SampleDistance) &&
-        this->MinMaxSuperTexture != nullptr) ? 8u : 0u) };
+        this->MinMaxSuperTexture != nullptr) ? 8u : 0u) |
+      // §35.14 segment consume gate — bit 16, RTT-family pipelines only (the
+      // fullscreen/selection binders do not bind the segment buffer slots).
+      (((type == static_cast<uint32_t>(VolumePipelineType::RenderToImage) ||
+         type == static_cast<uint32_t>(VolumePipelineType::RayAtlas) ||
+         type == static_cast<uint32_t>(VolumePipelineType::OffscreenLayer)) &&
+        VolumeSegWanted() && !VolumeSegConsumeSuppressed() &&
+        this->SegBuildComputePipeline != nullptr &&
+        this->SegAtlasATexture != nullptr) ? 16u : 0u) };
   auto it = this->PipelineCache.find(key);
   if (it != this->PipelineCache.end())
   {
@@ -7345,6 +7481,13 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
       fragName = @"fragment_volume_fullscreen_selection_main";
       useVolumeVertex = false;
       break;
+    case VolumePipelineType::RayAtlas:
+      // §35.14 ray-atlas pre-pass: same proxy geometry + vertex function as
+      // the main volume pass; the fragment writes the march setup instead of
+      // marching.
+      fragName = @"fragment_volume_ray_atlas";
+      useVolumeVertex = true;
+      break;
   }
 
   // Create function constants for shader specialization.
@@ -7360,7 +7503,8 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     pt == VolumePipelineType::GridTraversalOffscreen ||
     pt == VolumePipelineType::RenderToImage ||
     pt == VolumePipelineType::SelectionDirect ||
-    pt == VolumePipelineType::SelectionFullscreen);
+    pt == VolumePipelineType::SelectionFullscreen ||
+    pt == VolumePipelineType::RayAtlas);
 
   if (hasFeatureConstants)
   {
@@ -7459,6 +7603,14 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
                     this->MinMaxSuperTexture != nullptr) ? YES : NO;
     [constants setConstantValue:&mmSuper type:MTLDataTypeBool
                        withName:@"fc_mmSuper"];
+    // §35.14 async segment pre-pass consume (fc_segHop, featureMaskExtra bit
+    // 16): compile-time switch between the legacy preamble walk and the
+    // streaming gap consume fed by volume_segment_build.
+    BOOL segHop = ((VolumeSegWanted() && !VolumeSegConsumeSuppressed() &&
+                    this->SegBuildComputePipeline != nullptr &&
+                    this->SegAtlasATexture != nullptr)) ? YES : NO;
+    [constants setConstantValue:&segHop type:MTLDataTypeBool
+                       withName:@"fc_segHop"];
 
     // Blend mode function constant: 0=composite, 1=MIP, 2=MinIP, 3=AverageIP,
     // 4=additive (vtkVolumeMapper::BlendMode). Encoded in the feature mask so
@@ -7545,6 +7697,15 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
   if (pt == VolumePipelineType::RenderToImage)
   {
     pipelineDesc.colorAttachments[1].pixelFormat = MTLPixelFormatR32Float;
+  }
+
+  // §35.14 ray-atlas pipeline: three RGBA32Float setup planes.
+  if (pt == VolumePipelineType::RayAtlas)
+  {
+    pipelineDesc.colorAttachments[1].pixelFormat = MTLPixelFormatRGBA32Float;
+    pipelineDesc.colorAttachments[2].pixelFormat = MTLPixelFormatRGBA32Float;
+    pipelineDesc.colorAttachments[1].blendingEnabled = NO;
+    pipelineDesc.colorAttachments[2].blendingEnabled = NO;
   }
 
   // The selection pipelines additionally write the picking IDs
@@ -7665,6 +7826,24 @@ void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
     this->RectCoordsBuffer ? (__bridge id<MTLBuffer>)this->RectCoordsBuffer
                            : (__bridge id<MTLBuffer>)this->DummyRectCoordsBuffer;
   [encoder setFragmentBuffer:rectCoordsBuf offset:0 atIndex:5];
+
+  // §35.14 segment pre-pass buffers ([[buffer(6)]] index map pre-offset is
+  // applied in-shader; [[buffer(7)]] gap pool). Slots are always bound so the
+  // declared fragment parameters stay valid even when the feature is off.
+  if (!this->SegDummyBuffer)
+  {
+    AssignRetainedMetalObject(this->SegDummyBuffer,
+      [[encoder device] newBufferWithLength:16
+                                    options:MTLResourceStorageModeShared]);
+  }
+  id<MTLBuffer> segIdxBuf = (this->SegActiveThisFrame && this->SegIndexBuffer)
+    ? (__bridge id<MTLBuffer>)this->SegIndexBuffer
+    : (__bridge id<MTLBuffer>)this->SegDummyBuffer;
+  id<MTLBuffer> segPoolBuf = (this->SegActiveThisFrame && this->SegPoolBuffer)
+    ? (__bridge id<MTLBuffer>)this->SegPoolBuffer
+    : (__bridge id<MTLBuffer>)this->SegDummyBuffer;
+  [encoder setFragmentBuffer:segIdxBuf offset:0 atIndex:6];
+  [encoder setFragmentBuffer:segPoolBuf offset:0 atIndex:7];
 
   SetFragmentTextureOrFallback(encoder, 0, this->VolumeTexture, this->DummyVolumeTexture);
   [encoder setFragmentTexture:(__bridge id<MTLTexture>)this->ColorOpacityTexture atIndex:1];
@@ -9223,6 +9402,104 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       metalRenderWindow->SetCurrentRenderCommandEncoder(nullptr);
     }
 
+    // ---- §35.14 segment pre-pass (VTK_METAL_TEST_MM_SEG=1) ----
+    // Stage 1 rasterizes a per-pixel ray-atlas through the SAME proxy geometry
+    // and vertex function as the pass below; stage 2 walks the occupancy
+    // lattice once per ray in a compute kernel and records skip gaps; the RTT
+    // march consumes them with integer tests (fc_segHop pipelines). Encoded on
+    // the same command buffer ahead of the RTT encoder; inter-encoder order is
+    // preserved.
+    this->SegActiveThisFrame = false;
+    const bool segWanted = VolumeSegWanted() &&
+        this->UseMinMaxAcceleration && this->UseGPUMinMax && !usePartitions &&
+        this->MinMaxTexture != nullptr;
+    if (getenv("VTK_METAL_TEST_MM_SEG_DEBUG"))
+      fprintf(stderr, "[seg] wanted=%d accel=%d gpuMM=%d partitions=%d mmTex=%p\n",
+        (int)VolumeSegWanted(), (int)this->UseMinMaxAcceleration,
+        (int)this->UseGPUMinMax, (int)usePartitions, (void*)this->MinMaxTexture);
+    if (segWanted &&
+        this->EnsureSegResources(mtlDevice, mtlQueue, rttWidth, rttHeight))
+    {
+      id<MTLBuffer> segCntBuf =
+        (__bridge id<MTLBuffer>)this->SegPoolCounterBuffer;
+      *(uint32_t*)segCntBuf.contents = 0;
+      [segCntBuf didModifyRange:NSMakeRange(0, 4)];
+
+      id<MTLTexture> atlasA = (__bridge id<MTLTexture>)this->SegAtlasATexture;
+      id<MTLTexture> atlasB = (__bridge id<MTLTexture>)this->SegAtlasBTexture;
+      id<MTLTexture> atlasC = (__bridge id<MTLTexture>)this->SegAtlasCTexture;
+
+      // -- stage 1: ray-atlas raster --
+      MTLRenderPassDescriptor* arpd =
+        [MTLRenderPassDescriptor renderPassDescriptor];
+      arpd.colorAttachments[0].texture = atlasA;
+      arpd.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+      arpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+      arpd.colorAttachments[1].texture = atlasB;
+      arpd.colorAttachments[1].loadAction = MTLLoadActionDontCare;
+      arpd.colorAttachments[1].storeAction = MTLStoreActionStore;
+      arpd.colorAttachments[2].texture = atlasC;
+      arpd.colorAttachments[2].loadAction = MTLLoadActionDontCare;
+      arpd.colorAttachments[2].storeAction = MTLStoreActionStore;
+
+      id<MTLRenderCommandEncoder> atlasEnc =
+        [commandBuffer renderCommandEncoderWithDescriptor:arpd];
+      atlasEnc.label = @"VTK Volume Segment RayAtlas";
+      MTLViewport amvp;
+      amvp.originX = 0; amvp.originY = 0;
+      amvp.width = rttWidth; amvp.height = rttHeight;
+      amvp.znear = 0.0; amvp.zfar = 1.0;
+      [atlasEnc setViewport:amvp];
+
+      void* atlasPso = this->GetOrCreateVolumePipeline(mtlDevice,
+        static_cast<uint32_t>(VolumePipelineType::RayAtlas),
+        MTLPixelFormatRGBA32Float, MTLPixelFormatInvalid, 1, featureMask);
+      if (!atlasPso)
+      {
+        [atlasEnc endEncoding];
+      }
+      else
+      {
+        this->BindEncoderResources(atlasEnc, uniformBuf, atlasPso, false);
+        this->DrawBlocks(atlasEnc, uniformBuf, ren, vol, &uniforms,
+          invModelMatrix);
+        [atlasEnc endEncoding];
+
+        // -- stage 2: segment builder --
+        PerBlockData segPbd;
+        this->BuildPerBlockData(segPbd, &uniforms);
+        // x=width y=height z=poolCapWords w=maxGaps (< shader's gaps[64])
+        uint32_t segMeta[4] = { static_cast<uint32_t>(rttWidth),
+                                static_cast<uint32_t>(rttHeight),
+                                static_cast<uint32_t>(this->SegPoolCapWords),
+                                16u };  // maxGaps == builder register capacity
+        id<MTLComputeCommandEncoder> segEnc =
+          [commandBuffer computeCommandEncoder];
+        [segEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)
+          this->SegBuildComputePipeline];
+        [segEnc setTexture:atlasA atIndex:0];
+        [segEnc setTexture:atlasB atIndex:1];
+        [segEnc setTexture:(__bridge id<MTLTexture>)this->MinMaxTexture
+                   atIndex:2];
+        [segEnc setTexture:atlasC atIndex:3];
+        [segEnc setBuffer:(__bridge id<MTLBuffer>)this->SegIndexBuffer
+                   offset:0 atIndex:0];
+        [segEnc setBuffer:segCntBuf offset:0 atIndex:1];
+        [segEnc setBuffer:(__bridge id<MTLBuffer>)this->SegPoolBuffer
+                   offset:0 atIndex:2];
+        [segEnc setBytes:&segMeta length:sizeof(segMeta) atIndex:3];
+        [segEnc setBytes:&segPbd length:sizeof(segPbd) atIndex:4];
+        MTLSize segTg = MTLSizeMake(8, 8, 1);
+        MTLSize segGroups = MTLSizeMake((rttWidth + 7) / 8, (rttHeight + 7) / 8, 1);
+        [segEnc dispatchThreadgroups:segGroups threadsPerThreadgroup:segTg];
+        [segEnc endEncoding];
+
+        this->SegActiveThisFrame = true;
+        if (getenv("VTK_METAL_TEST_MM_SEG_DEBUG"))
+          fprintf(stderr, "[seg] pre-pass encoded %dx%d\n", rttWidth, rttHeight);
+      }
+    }
+
     id<MTLTexture> rttColor = (__bridge id<MTLTexture>)this->RTTColorTexture;
     id<MTLTexture> rttDepth = (__bridge id<MTLTexture>)this->RTTDepthTexture;
 
@@ -9551,6 +9828,180 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         AssignRetainedMetalObject(this->ImageSampleColorTexture, finalTex);
         this->ImageSampleFBOWidth = renderWidth;
         this->ImageSampleFBOHeight = renderHeight;
+      }
+      else if (!selectionRender &&
+               this->GetBlendMode() == vtkVolumeMapper::COMPOSITE_BLEND &&
+               VolumeSegWanted() && this->UseMinMaxAcceleration &&
+               this->UseGPUMinMax && !usePartitions &&
+               this->MinMaxTexture != nullptr)
+      {
+        // §35.14 segment pre-pass on the standard direct path (VTK_METAL_TEST_MM_SEG=1).
+        // The drawable encoder is already open, so follow the slab ping-pong
+        // precedent: end it, encode the ray-atlas raster + segment-builder
+        // compute, march the volume into an offscreen RGBA16Float target with a
+        // segment-consuming pipeline, then expose the result through the
+        // ImageSample members so the renderer's Phase 3b blit composites it.
+        id<MTLRenderCommandEncoder> curEnc =
+          (__bridge id<MTLRenderCommandEncoder>)
+            metalRenderWindow->GetCurrentRenderCommandEncoder();
+        if (curEnc)
+        {
+          [curEnc endEncoding];
+          metalRenderWindow->SetCurrentRenderCommandEncoder(nullptr);
+        }
+
+        if (!this->EnsureSegResources(mtlDevice, mtlQueue,
+              renderWidth, renderHeight))
+        {
+          return;
+        }
+
+        id<MTLBuffer> segCntBuf =
+          (__bridge id<MTLBuffer>)this->SegPoolCounterBuffer;
+        // TEMP-DIAG §35.14: last frame's final claim count (buffer completed
+        // behind the frame semaphore before we get here).
+        this->SegLastClaimWords.store(
+          *static_cast<uint32_t*>(segCntBuf.contents));
+        if (getenv("VTK_METAL_TEST_MM_SEG_DEBUG") &&
+            this->SegLastClaimWords.load() > 0)
+          fprintf(stderr, "[seg] prev claims: %u words (%.1f MB)\n",
+            this->SegLastClaimWords.load(),
+            4.0 * this->SegLastClaimWords.load() / (1024.0 * 1024.0));
+        *(uint32_t*)segCntBuf.contents = 0;
+        [segCntBuf didModifyRange:NSMakeRange(0, 4)];
+
+        id<MTLTexture> atlasA = (__bridge id<MTLTexture>)this->SegAtlasATexture;
+        id<MTLTexture> atlasB = (__bridge id<MTLTexture>)this->SegAtlasBTexture;
+        id<MTLTexture> atlasC = (__bridge id<MTLTexture>)this->SegAtlasCTexture;
+
+        // -- stage 1: ray-atlas raster (same proxy geometry + vertex fn) --
+        static const bool segSkipAtlas =
+          getenv("VTK_METAL_TEST_MM_SEG_SKIP_ATLAS") != nullptr;
+        static const bool segAtlasNoDraw =
+          getenv("VTK_METAL_TEST_MM_SEG_ATLAS_NODRAW") != nullptr;
+        if (!segSkipAtlas)
+        {
+        MTLRenderPassDescriptor* arpd =
+          [MTLRenderPassDescriptor renderPassDescriptor];
+        arpd.colorAttachments[0].texture = atlasA;
+        arpd.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        arpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+        arpd.colorAttachments[1].texture = atlasB;
+        arpd.colorAttachments[1].loadAction = MTLLoadActionDontCare;
+        arpd.colorAttachments[1].storeAction = MTLStoreActionStore;
+        arpd.colorAttachments[2].texture = atlasC;
+        arpd.colorAttachments[2].loadAction = MTLLoadActionDontCare;
+        arpd.colorAttachments[2].storeAction = MTLStoreActionStore;
+
+        if (segAtlasNoDraw)
+        {
+          // TEMP-DIAG §35.14: pass + barriers only, no geometry, no PSO.
+          id<MTLRenderCommandEncoder> emptyEnc =
+            [commandBuffer renderCommandEncoderWithDescriptor:arpd];
+          [emptyEnc endEncoding];
+        }
+        else
+        {
+        id<MTLRenderCommandEncoder> atlasEnc =
+          [commandBuffer renderCommandEncoderWithDescriptor:arpd];
+        atlasEnc.label = @"VTK Volume Segment RayAtlas";
+        MTLViewport amvp;
+        amvp.originX = 0; amvp.originY = 0;
+        amvp.width = renderWidth; amvp.height = renderHeight;
+        amvp.znear = 0.0; amvp.zfar = 1.0;
+        [atlasEnc setViewport:amvp];
+
+        void* atlasPso = this->GetOrCreateVolumePipeline(mtlDevice,
+          static_cast<uint32_t>(VolumePipelineType::RayAtlas),
+          MTLPixelFormatRGBA32Float, MTLPixelFormatInvalid, 1, featureMask);
+        if (!atlasPso)
+        {
+          [atlasEnc endEncoding];
+          return;
+        }
+        this->BindEncoderResources(atlasEnc, uniformBuf, atlasPso, false);
+        this->DrawBlocks(atlasEnc, uniformBuf, ren, vol, &uniforms,
+          invModelMatrix);
+        [atlasEnc endEncoding];
+        } // segAtlasNoDraw
+        } // segSkipAtlas
+
+        // -- stage 2: segment builder --
+        PerBlockData segPbd;
+        this->BuildPerBlockData(segPbd, &uniforms);
+        // x=width y=height z=poolCapWords w=maxGaps (< shader's gaps[64])
+        uint32_t segMeta[4] = { static_cast<uint32_t>(renderWidth),
+                                static_cast<uint32_t>(renderHeight),
+                                static_cast<uint32_t>(this->SegPoolCapWords),
+                                16u };  // maxGaps == builder register capacity
+        id<MTLComputeCommandEncoder> segEnc =
+          [commandBuffer computeCommandEncoder];
+        [segEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)
+          this->SegBuildComputePipeline];
+        [segEnc setTexture:atlasA atIndex:0];
+        [segEnc setTexture:atlasB atIndex:1];
+        [segEnc setTexture:(__bridge id<MTLTexture>)this->MinMaxTexture
+                   atIndex:2];
+        [segEnc setTexture:atlasC atIndex:3];
+        [segEnc setBuffer:(__bridge id<MTLBuffer>)this->SegIndexBuffer
+                   offset:0 atIndex:0];
+        [segEnc setBuffer:segCntBuf offset:0 atIndex:1];
+        [segEnc setBuffer:(__bridge id<MTLBuffer>)this->SegPoolBuffer
+                   offset:0 atIndex:2];
+        [segEnc setBytes:&segMeta length:sizeof(segMeta) atIndex:3];
+        [segEnc setBytes:&segPbd length:sizeof(segPbd) atIndex:4];
+        MTLSize segTg = MTLSizeMake(8, 8, 1);
+        MTLSize segGroups = MTLSizeMake((renderWidth + 7) / 8,
+          (renderHeight + 7) / 8, 1);
+        [segEnc dispatchThreadgroups:segGroups threadsPerThreadgroup:segTg];
+        [segEnc endEncoding];
+
+        this->SegActiveThisFrame = true;
+
+        // -- stage 3: offscreen march with the consuming pipeline --
+        static const bool segSkipMarch =
+          getenv("VTK_METAL_TEST_MM_SEG_SKIP_MARCH") != nullptr;
+        if (!segSkipMarch)
+        {
+        id<MTLTexture> target = (__bridge id<MTLTexture>)this->SegMarchTexture;
+
+        MTLRenderPassDescriptor* mrpd =
+          [MTLRenderPassDescriptor renderPassDescriptor];
+        mrpd.colorAttachments[0].texture = target;
+        mrpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+        mrpd.colorAttachments[0].clearColor =
+          MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+        mrpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+        id<MTLRenderCommandEncoder> marchEnc =
+          [commandBuffer renderCommandEncoderWithDescriptor:mrpd];
+        marchEnc.label = @"VTK Volume SegmentMarch";
+        MTLViewport mmvp;
+        mmvp.originX = 0; mmvp.originY = 0;
+        mmvp.width = renderWidth; mmvp.height = renderHeight;
+        mmvp.znear = 0.0; mmvp.zfar = 1.0;
+        [marchEnc setViewport:mmvp];
+
+        void* offPso = this->GetOrCreateVolumePipeline(mtlDevice,
+          static_cast<uint32_t>(VolumePipelineType::OffscreenLayer),
+          MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid, 1, featureMask);
+        if (!offPso)
+        {
+          [marchEnc endEncoding];
+          return;
+        }
+        [marchEnc setFragmentBytes:&lightUniforms
+                            length:sizeof(lightUniforms) atIndex:4];
+        this->BindEncoderResources(marchEnc, uniformBuf, offPso, false);
+        this->DrawBlocks(marchEnc, uniformBuf, ren, vol, &uniforms,
+          invModelMatrix);
+        [marchEnc endEncoding];
+
+        // Phase 3b blits this over the drawable.
+        AssignRetainedMetalObject(this->ImageSampleColorTexture, target);
+        this->ImageSampleFBOWidth = renderWidth;
+        this->ImageSampleFBOHeight = renderHeight;
+        } // segSkipMarch
       }
       else
       {

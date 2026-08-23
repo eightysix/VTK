@@ -2669,6 +2669,78 @@ Findings:
    applies to 621cc2f3d8). Tree reverted; HEAD re-verified
    (axz-ds4 57.0 ≈ anchor).
 
+### 35.14 TRUE multi-pass segment pre-pass BUILT and verified pixel-exact — walk cost eliminated; the wall is now the consume pipeline itself (2026-08-23)
+
+Implemented §35.13's "true design" end-to-end, default-off
+(VTK_METAL_TEST_MM_SEG=1, value-parsed so =0 stays OFF):
+
+- **Stage 1 — ray atlas** (`fragment_volume_ray_atlas`, new
+  VolumePipelineType::RayAtlas=10, three RGBA32Float attachments):
+  replicates the fragment_volume_main prologue + marchVolume jitter/tStart
+  + marchVolumeUnified setup head VERBATIM on the same interpolated
+  varyings and writes A=(evalPoint.xyz, steps), B=(evalStep.xyz,
+  stepSize), C=(rayDir.xyz). Same geometry/vertex fn as the main pass ⇒
+  bit-identical inputs.
+- **Stage 2 — builder** (`volume_segment_build` compute, one thread/pixel):
+  walks the lattice ONCE per ray (preamble leap chain verbatim: same
+  clamp, boundary solve, +1e-4, ceil), records skipped-step gaps as u16
+  (start,end) pairs into an ATOMICALLY COMPACTED pool (word0=count, then
+  pairs; segIndexMap[pixel]=offset or UINT_MAX on overflow → composite-
+  all fallback). Gap storage = packed uint4 registers (16 gaps) appended
+  via static select chains — a dynamically indexed local array spills to
+  device memory per append. Guard valve bounds the walk (8192 iters).
+- **Stage 3 — consume**: mv9 preamble compiles OUT under fc_segHop
+  (function_constant(37), featureMaskExtra bit 16); the loop streams the
+  gap list with integer tests, holding only (recOff,cnt,idx,gS,gE) and
+  pulling the next pair from the pool on gap crossing. Direct path follows
+  the slab ping-pong precedent (end drawable encoder → pre-passes →
+  offscreen RGBA16Float march → Phase 3b blit).
+
+Results @2048² SD4 mv9 X-depth j1 (warmup-clean, see tooling note):
+
+| view | mm HEAD (direct) | seg full |
+|---|---|---|
+| axz | 55.08 | 112.44 |
+| obl | 20.66 | 47.82 |
+
+Decomposition (axz): offscreen+blit floor 58.29 (= direct + ~3 ms blit);
+builder kernel ≈ FREE (~0 ms measurable at 14.7M claimed pool words);
+atlas pass floor 1.7 ms (empty body) / ~2.7 ms full; **the consume
+pipeline costs ≈ +51 ms EVEN WHEN IT HOPS NOTHING** (SKIP_BUILD run:
+112.72 ≈ full 112.44) — i.e. pure pipeline overhead from ~6 live scalars
++ two device-buffer params, with the legacy preamble compiled out.
+
+Findings:
+
+1. **The async walk SUCCEEDED**: the entire preamble-walk tax moved out
+   of the fragment for free, and output is PIXEL-EXACT vs HEAD-mm
+   (0 bytes differ @axz 2048² after the fixes below).
+2. **Occupancy-cliff law, finest instance yet (fourth)**: the mv9
+   fragment rejects not just added WORK (§35.12/§35.13) but ~6 registers
+   of added STATE even when equal work is REMOVED (preamble dead).
+   Skipping itself is free (hops == no-hops timing); hosting the skip
+   list is not. Any future fix must keep the march's register budget
+   byte-identical — e.g. consuming segments in a SEPARATE lightweight
+   pass that writes a pruned sample-interval texture the march reads via
+   its EXISTING bindings, or restructuring the march entirely.
+3. **Tooling lesson that poisoned hours of measurements**: bench defaults
+   to --warmup 0, so every NEW pipeline variant paid seconds of PSO
+   compilation amortized into short --frames windows (fake 2× slowdowns;
+   contradictory stage attributions like "atlas costs 60ms"). Baselines
+   looked stable only because Metal's persistent shader cache had their
+   variants warm. ALWAYS bench with --warmup >= 5.
+4. Crash mitigation after a system overload during early testing:
+   meta.w maxGaps now EQUALS the 16-slot register capacity (48 silently
+   corrupted gaps 17..48 into shared lanes), pool capped 64 MiB
+   (overflow → safe composite-all), builder guard valve guarantees
+   termination.
+5. Investigation controls kept (all env-gated, default-off):
+   VTK_METAL_TEST_MM_SEG_SKIP_ATLAS / _SKIP_BUILD / _SKIP_MARCH /
+   _NOCONSUME (+ MM_SEG_DEBUG claims telemetry). Robustness notes:
+   OffscreenLayer pipelines are in the seg key-bit gate (bind slots 6/7
+   always, dummies when inactive) because the direct-path march runs
+   through one; RTT branch carries the same pre-pass for completeness.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).

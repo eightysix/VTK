@@ -46,7 +46,9 @@ enum class VolumePipelineType : uint32_t
   GridTraversalOffscreen = 6, // Single-pass grid traversal fullscreen (RGBA16Float, no depth)
   RenderToImage = 7,          // RenderToImage (RGBA16Float color + R32Float depth export)
   SelectionDirect = 8,        // Hardware-selection ray-cast (BGRA8Unorm + depth + RGBA32Uint ids)
-  SelectionFullscreen = 9     // Hardware-selection fullscreen ray-cast, camera inside (BGRA8Unorm + depth + RGBA32Uint ids)
+  SelectionFullscreen = 9,    // Hardware-selection fullscreen ray-cast, camera inside (BGRA8Unorm + depth + RGBA32Uint ids)
+  RayAtlas = 10               // §35.14 segment pre-pass: rasterizes per-pixel ray setup into 2x RGBA32Float
+
 };
 
 struct VolumePipelineKey
@@ -326,6 +328,24 @@ private:
   void* MinMaxSuperTexture = nullptr;    // id<MTLTexture> (3D R8Unorm)
   int MinMaxSuperDims[3] = {};           // super-summary grid dims
   void* SuperReduceComputePipeline = nullptr; // volume_reduce_minmax_superblocks
+
+  // §35.14 async segment pre-pass (VTK_METAL_TEST_MM_SEG=1): raster ray-atlas
+  // + compute segment builder + fragment streaming consume. Default-off.
+  void* SegAtlasATexture = nullptr;      // id<MTLTexture> 2D RGBA32Float: (evalPoint.xyz, steps)
+  void* SegAtlasBTexture = nullptr;      // id<MTLTexture> 2D RGBA32Float: (evalStep.xyz, stepSize)
+  void* SegAtlasCTexture = nullptr;      // id<MTLTexture> 2D RGBA32Float: (rayDir.xyz)
+  void* SegIndexBuffer = nullptr;        // id<MTLBuffer> u32 per-pixel pool offset (UINT_MAX = none)
+  void* SegPoolBuffer = nullptr;         // id<MTLBuffer> compacted gap records (word0=count, then (start<<16|end) u16 pairs)
+  void* SegPoolCounterBuffer = nullptr;  // id<MTLBuffer> shared u32 atomic claim counter (CPU-zeroed per frame)
+  void* SegDummyBuffer = nullptr;        // id<MTLBuffer> 16B zeros bound at slots 6/7 when disabled
+  void* SegMarchTexture = nullptr;       // id<MTLTexture> 2D RGBA16Float offscreen march target
+  void* SegBuildComputePipeline = nullptr; // id<MTLComputePipelineState> — volume_segment_build
+  int SegAtlasWidth = 0;
+  int SegAtlasHeight = 0;
+  std::atomic<uint32_t> SegLastClaimWords{0}; // TEMP-DIAG §35.14
+  std::size_t SegPoolCapWords = 0;
+  bool SegActiveThisFrame = false;
+
   void* DepthStencilState = nullptr;     // id<MTLDepthStencilState>
   void* DepthTextureOcclusion = nullptr; // id<MTLTexture> — scene depth for early ray termination
   void* DummyDepthTexture = nullptr;     // id<MTLTexture> — 1x1 R32Float(1.0) fallback when no depth available
@@ -506,6 +526,9 @@ private:
   int RTTHeight = 0;
   int RTTDepthScalarType = -1;       // cached DepthImageScalarType to detect changes
   bool EnsureRTTResources(void* device, int width, int height, int depthScalarType);
+  // §35.14 segment pre-pass resources (atlas textures + index/pool buffers +
+  // compute pipeline), cached by size.
+  bool EnsureSegResources(void* device, void* mtlQueue, int width, int height);
   void ReleaseRTTResources();
 
 
