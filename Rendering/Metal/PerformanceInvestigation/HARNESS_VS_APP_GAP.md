@@ -3860,6 +3860,145 @@ interleaved; mm-vs-raw verdicts ONLY at equal MARCH_CAP (cross-cap
 comparisons fake verdicts, §37.11); do not set JITTER_PARITY (banned,
 §6.1); leaving IGN_JITTER unset forces IGN (state it explicitly).
 
+## 38. Structural A/B round: slabs, depth-axis policy, TF-adaptive exit (2026-08-24)
+
+Session goal: A/B the remaining structural improvement candidates from the
+§37.17-§37.24 mechanism map, under the §37 hardened protocol. Machine state:
+AC power, charged, no LPM; anchor gate PASSED pre-experiment (SD4 z_TRAW
+30.25/30.33, obl_MM 15.97/16.08, SD0.5 axz_MM 121.0/121.7 — all within ±3%
+of the §37.22 post-reboot healthy refs, round spread ≤0.7%). Binary =
+`4ec296888b` + changes documented in §38.4; new-vs-new render determinism
+check: byte-identical. All runs frames=60 warmup=10 @2048² ABBA
+order-alternated unless noted; `MARCH_VARIANT=9` explicit everywhere.
+
+### 38.1 Slab count as a lockstep restorer (`VTK_METAL_TEST_NUM_SLABS {1,2,4}`) — REFUTED
+
+Hypothesis: slab boundaries force periodic lane reconvergence and shorten
+marches, attacking the §37.17 leap-scatter mechanism. Measured (ms/f, both
+rounds agreed ≤1.5%):
+
+| view | mm s1→s2→s4 | raw s1→s2→s4 |
+|---|---|---|
+| axis-z | 34.7 → 47.6 → 65.0 | 30.9 → 39.8 → 54.0 |
+| axis-y | 24.9 → 36.9 → 58.9 | 23.4 → 33.8 → 46.1 |
+| oblique | 15.7 → 19.1 → 26.5 | 20.5 → 17.8 → 22.2 |
+
+Monotone regression nearly everywhere; cost grows ~linearly with pass count
+(per-slab prologue/walk/bind overhead swamps any coherence dividend). One
+non-monotone curiosity: raw-oblique s2 −13% vs s1 — not chased; mm s1 beats
+it outright (15.7 vs 17.8). Slab renders verified sane (s1-vs-s4 diff:
+15 px >1LSB of 262K, max Δ2 — fp-association class only). Verdict: refuted;
+slabs stay pinned at 1 for this pipeline.
+
+### 38.2 Y-depth fine tier re-validation under BS16+cap32 — replicates
+
+§35.8's uniform fine-SD Y win re-measured on current code (SD0.5 j0,
+mm+blocks tiered BS16): obl 44.4→39.6 (−11%), az45 40.0→35.9 (−10%), axz
+119.6→109.4 (−8.5%), axy 85.9→78.8 (−8.3%), axx 88.8→80.1 (−9.7%). Every
+view, tight pairs.
+
+### 38.3 Coarse-tier depth-axis matrix: NOT a uniform winner — policy stays argmin-X
+
+Full 12-cell A/B (`VOLTRANSPOSE_AXIS=x` vs `=y`, SD4 j1, both mm+blocks and
+TRUE raw):
+
+| view | MM X→Y | RAW X→Y |
+|---|---|---|
+| obl | −6.3% | −7.0% |
+| az45 | −32.8% | **−44.6%** |
+| az135 | −7.6% | −6.3% |
+| axis-x | −20.5% | −22.3% |
+| **axis-y** | **+2.7% X** | **+26.9% X** |
+| axis-z | −9.6% | −3.9% |
+
+Y wins 10/12 cells — including raw az45 −45%, far larger than §35.9's
+cap8-era reading — but raw axis-y +27% breaks uniformity. Decision rule
+(adopted this session): a representation tie-break flips ONLY on a uniform
+win; otherwise status quo ante. The tiered compromise (fine-Y / coarse-X)
+was implemented, measured (§38.2), then REVERTED per the no-tiers
+preference — `VolumeTransposedAxisDepth(dims)` is back to its exact §30
+form; Y-depth remains available opt-in via `VOLTRANSPOSE_AXIS=y`
+(fine-SD/axis-dominant workloads). Byte-parity of the reverted build
+verified against the pre-session binary on both tiers (sd4 default ≡ old
+default; sd0.5 default ≡ old forced-X). Note for history: §35.9's coarse
+rankings are stale (pre-cap32/ungated-blocks); today's table supersedes.
+
+### 38.4 TF-adaptive exit threshold (`VTK_METAL_TEST_EXIT_THETA`) — implemented; opt-in only
+
+Mechanism target: §35.4's saturation-depth finding (Airways II tops at
+0.25/sample opacity, rays never reach the 1−1/255 latch). Implementation:
+`fc_exitTheta [[function_constant(38)]]` + `VolumeMapperUniforms::ExitAlpha`
+(offset 1748; buffer still 1760 via round16) + featureMaskExtra bit 64 +
+env value-parse (`absent/0/invalid = OFF`). The 13 `accumulatedOpacity >
+1−1/255` sites in marchVolumeUnified now compare against one hoisted
+`kExitAcc` const; fc=false folds to the exact legacy literal.
+
+Validation: fc-OFF renders byte-identical to the pre-knob binary; fc-ON at
+the legacy value (0.99607843) is pixel-exact vs fc-OFF (max Δ=0); anchors
+timing-neutral after the struct change (z_raw 30.75-31.30, obl_mm
+15.94-16.00).
+
+Dose-response (Airways II, SD4 j1, mm+blocks; medians of ABBA pairs;
+Δ vs OFF):
+
+| θ | obl | az45 | axis-z |
+|---|---|---|---|
+| OFF | 15.86 | 16.86 | 34.77 |
+| 0.98 | −0.3% | ±0 | −0.9% |
+| 0.95 | −2.5% | −0.5% | −2.7% |
+| 0.90 | −4.4% | −0.6% | −5.0% |
+| 0.80 | −6.6% | −2.9% | −8.9% |
+
+Image knee (@512², jittered, px >1LSB / max Δ): obl θ0.98 0.12%/2, θ0.95
+1.0%/5, θ0.90 2.4%/11, θ0.80 4.4%/22. Axis-z is ~3x more sensitive: θ0.98
+0.52%/3, θ0.95 3.4%/6, θ0.90 7.4%/12, θ0.80 13.4%/23. Dense-preset control
+(DarkBone axis-z): θ0.80 saves −16% time BUT costs max Δ48 / 15.9% px —
+NOT free; raw-arm spot (axis-z θ0.90): only −4.4%.
+
+Verdict: knob is correct, byte-inert by default, monotone — but no dose is
+simultaneously sub-visible and material (θ≈0.98 buys −1..−6% for ≤0.5% px).
+Stays a documented diagnostic/opt-in (`EXIT_THETA`), never a default; a
+per-TF α_max-derived threshold remains possible future polish but the
+measured ceiling does not justify preset-coupled complexity.
+
+### 38.5 Instruments GPU counters — still blocked
+
+`xcrun xctrace list templates` exposes no GPU-counter template on this
+machine/Xcode (Metal System Trace only = encoder/pipeline timings, not DRAM
+read amplification). §22 item 6 remains open pending tooling or Apple input.
+
+### 38.6 Parked with rationale: compute marcher / ray-binned marching
+
+Not built this session; the trigger moved rather than fired. The axis-chord
+residual it would target shrank to +13%→+6.4% post-BS16 (bounded, view-
+specific), while the required infrastructure (atlas consume rewrite + binned
+dispatch + parity ladder across blend modes/masks/slabs) is a multi-day
+project whose §36.4 decision criterion ("Design A leaves >5 ms on the
+table") is no longer clearly met. Re-open if (a) the residual grows on other
+dataset classes, or (b) any future fragment-side feature dies against the
+occupancy-cliff law again — compute remains the only structurally
+register-free path.
+
+### 38.7 Session protocol traps (additions)
+
+1. benchlib-style shared runners: create `$OUTDIR` inside the bench function,
+   not at source time (script-level overrides land too late).
+2. `${(ps.:.)var}` splits on ':' — passing dot-separated "cfg.view" pairs
+   silently yields an EMPTY view field; CAM_AXIS=<invalid> then falls back to
+   the default oblique camera WITHOUT error. Caught because axz-class numbers
+   matched oblique (~44) instead of the 121 anchor — always cross-check cell
+   identity against anchors when a number looks plausible-but-wrong.
+   (Extends §37.12's "verify view labels" note.)
+
+Tree state after this session: `VTK_METAL_TEST_EXIT_THETA` knob landed
+(default-OFF, byte-inert); VOLTRANSPOSE policy comments updated with the
+§38.3 matrix; everything else reverted clean (byte-parity verified). New
+env-gated diagnostics inventory addition: EXIT_THETA. Logs:
+/tmp/opencode/struct_ab/{anchor,slabs,ydepth,ycoarse,theta,theta_img,
+db_img,detctrl,refpre,refpost*}.
+
+
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).

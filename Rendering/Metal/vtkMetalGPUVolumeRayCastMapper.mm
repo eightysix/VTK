@@ -265,10 +265,14 @@ struct VolumeMapperUniforms
   // march falls back to the legacy per-lane walk, leaving oblique-path
   // skipping fully intact.
   float MmWarpMin;                 // 1744..1747
+  // §38 TF-adaptive opacity-saturation exit (VTK_METAL_TEST_EXIT_THETA):
+  // accumulated-opacity value that terminates the march when fc_exitTheta
+  // specializes the pipeline in; legacy latch value (1 - 1/255) otherwise.
+  float ExitAlpha;                 // 1748..1751
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1748,
-  "VolumeMapperUniforms must be 1736 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1752,
+  "VolumeMapperUniforms must be 1752 bytes to match Metal shader struct");
 
 // MSL rounds the shader-side struct up to its 16-byte alignment (float4/float3
 // members), so the pipeline expects round_up(1732,16)=1744 and Metal's
@@ -459,6 +463,14 @@ static bool VolumeTransposedActive()
 // original Z is already (tied-)shortest, keep the identity layout and skip
 // the repack entirely; ties between X and Y prefer X (matches every cell
 // validated in §26.5/§27).
+//
+// Y-on-ties was A/B'd across all 12 coarse-tier view classes (doc §38,
+// 2026-08-24, cap32/blocks-default code): Y won 10/12 (raw az45 -45%, mm
+// az45 -33%, axx ~-21%) but LOST raw axis-y +27% (mm +2.7%) — not a uniform
+// winner, so the X tie-break stays (a per-view gate is an anti-pattern,
+// §25.5). Y-depth remains available as an opt-in for axis-dominant static
+// workloads via VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y; in the fine-SD tier
+// (sd < 1.5) it won EVERY view measured (-8..-11%, §35.8 + doc §38).
 //
 // VTK_METAL_TEST_VOLTRANSPOSE_AXIS=x|y|z forces the orientation for A/B and
 // diagnostics regardless of dims.
@@ -1406,6 +1418,22 @@ static bool VolumeSegWanted()
   if (const char* v = getenv("VTK_METAL_TEST_MM_SEG"))
     return std::atoi(v) != 0;
   return false;
+}
+
+// §38 TF-adaptive opacity-saturation exit (VTK_METAL_TEST_EXIT_THETA): value-
+// parsed like MM_SEG — absent/0/invalid = OFF (legacy 8-bit latch threshold);
+// a value in (0,1] terminates the march at that accumulated opacity via
+// fc_exitTheta specialization. Static per-frame constant: no per-ray or
+// per-view branching (§25.5). Diagnostic/investigation knob, default OFF.
+static float VolumeExitTheta()
+{
+  if (const char* v = getenv("VTK_METAL_TEST_EXIT_THETA"))
+  {
+    const float f = static_cast<float>(std::atof(v));
+    if (f > 0.0f && f <= 1.0f)
+      return f;
+  }
+  return 0.0f;
 }
 // TEMP-DIAG \u00a735.14: run the full pre-pass machinery but keep the march on
 // the legacy-preamble pipeline (fc_segHop=false) \u2014 isolates the cost of the
@@ -7458,7 +7486,11 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
          type == static_cast<uint32_t>(VolumePipelineType::OffscreenLayer)) &&
         VolumeSegWanted() && !VolumeSegConsumeSuppressed() &&
         this->SegBuildComputePipeline != nullptr &&
-        this->SegAtlasATexture != nullptr) ? 16u : 0u) };
+        this->SegAtlasATexture != nullptr) ? 16u : 0u) |
+      // §38 TF-adaptive exit threshold — bit 64 (fc_exitTheta): pipelines
+      // with a uniform-supplied saturation exit must not share with the
+      // legacy-latch ones.
+      ((VolumeExitTheta() > 0.0f) ? 64u : 0u) };
   auto it = this->PipelineCache.find(key);
   if (it != this->PipelineCache.end())
   {
@@ -7642,6 +7674,12 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
                     this->SegAtlasATexture != nullptr)) ? YES : NO;
     [constants setConstantValue:&segHop type:MTLDataTypeBool
                        withName:@"fc_segHop"];
+    // §38 TF-adaptive exit threshold (fc_exitTheta, key bit 64): compile-time
+    // switch between the legacy 8-bit latch exit and the uniform-supplied
+    // accumulated-opacity threshold.
+    BOOL exitTheta = (VolumeExitTheta() > 0.0f) ? YES : NO;
+    [constants setConstantValue:&exitTheta type:MTLDataTypeBool
+                       withName:@"fc_exitTheta"];
 
     // Blend mode function constant: 0=composite, 1=MIP, 2=MinIP, 3=AverageIP,
     // 4=additive (vtkVolumeMapper::BlendMode). Encoded in the feature mask so
@@ -8861,6 +8899,12 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   }
   // §37.18: keep the shader's index math in sync with the built texture.
   uniforms.MmBlockSizeCells = static_cast<float>(VolumeMinMaxBlockSize(this->SampleDistance));
+  // §38 TF-adaptive exit: legacy 8-bit latch value unless EXIT_THETA is set
+  // (the value only drives comparisons when the fc_exitTheta pipeline is
+  // selected, but keep the field always valid).
+  uniforms.ExitAlpha = VolumeExitTheta() > 0.0f
+    ? VolumeExitTheta()
+    : static_cast<float>(1.0 - 1.0 / 255.0);
   // §37.19 warp-coherent skip probe: opt-in A/B.
   uniforms.MmWarpMin = 0.0f;
   if (const char* wm = getenv("VTK_METAL_TEST_MM_WARPMIN"))

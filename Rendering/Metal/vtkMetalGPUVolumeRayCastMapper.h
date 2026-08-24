@@ -543,9 +543,11 @@ private:
   // texture's DEPTH extent holds. 0 = identity (not transposed), 1 = X-depth
   // (texture holds z,y,x; fetch coords map via .zyx), 2 = Y-depth (texture
   // holds x,z,y; fetch coords map via .xzy). Chosen per upload by the argmin-
-  // extent policy (shortest array dim to depth, ties prefer identity then x)
-  // or forced via VTK_METAL_TEST_VOLTRANSPOSE_AXIS=x|y|z. Drives fc_volTransposedY
-  // and the compute-kernel uniform code alongside VolumeTextureTransposed.
+  // extent policy (shortest array dim to depth, ties prefer x — a 12-cell
+  // Y-on-ties A/B lost raw axis-y +27%, doc §38) or forced via
+  // VTK_METAL_TEST_VOLTRANSPOSE_AXIS=x|y|z (y is the fine-SD/axis-chord
+  // opt-in: wins every sd<1.5 view, doc §38). Drives fc_volTransposedY and
+  // the compute-kernel uniform code alongside VolumeTextureTransposed.
   int VolumeTextureAxisDepth = 0;
   vtkTimeStamp TransferFunctionUploadTime;
   vtkTimeStamp GradientOpacityUploadTime;

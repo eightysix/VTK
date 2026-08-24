@@ -2780,6 +2780,14 @@ constant bool fc_mmSuper [[function_constant(36)]];
 // preamble is retained under fc_segHop=false so pipelines stay comparable.
 constant bool fc_segHop [[function_constant(37)]];
 
+// §38 TF-adaptive opacity-saturation exit (VTK_METAL_TEST_EXIT_THETA ->
+// VolumeMapperUniforms::exitAlpha): compile-time switch between the legacy
+// 8-bit latch threshold (1 - 1/255) and a uniform-supplied accumulated-
+// opacity exit. fc=false folds to the exact legacy literal; fc=true reads
+// the uniform once per fragment. Motivated by low-max-opacity CLUTs
+// (Airways II tops at 0.25/sample, doc §35.4) whose rays never latch.
+constant bool fc_exitTheta [[function_constant(38)]];
+
 // Map an original-orientation sample position into texture space for the live
 // transposed representation (no-op when clear).
 inline float3 volumeFetchSwizzle(float3 pos) {
@@ -3010,6 +3018,10 @@ struct VolumeMapperUniforms {
   // legacy per-lane walk. Skipped samples are provably-zero at unchanged
   // positions, so output stays byte-identical to the default walk.
   float mmWarpMin;
+  // §38 TF-adaptive exit threshold (fc_exitTheta): accumulated-opacity value
+  // that terminates the march, replacing the legacy 8-bit latch (1 - 1/255).
+  // Read once per fragment; only meaningful when fc_exitTheta is true.
+  float exitAlpha;
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -4506,6 +4518,11 @@ inline half4 marchVolumeUnified(
   }
 
   half3 accumulatedColor = initialColor;
+  // §38 opacity-saturation exit threshold: the legacy 8-bit latch value, or
+  // the uniform-supplied TF-adaptive value when fc_exitTheta specializes in.
+  // Hoisted once; every exit site below compares against this single const.
+  half kExitAcc =
+      fc_exitTheta ? half(volumeUniforms.exitAlpha) : (1.0h - 1.0h / 255.0h);
   // Slab passes (fc_slabMode) inherit the NEAR-side composite (slabFar, the
   // premultiplied RGBA of the ray-order-earlier passes, sampled by
   // fragment_volume_main from the ping-pong feedback texture) so the
@@ -4670,7 +4687,7 @@ inline half4 marchVolumeUnified(
       // saturation threshold contributes nothing; camera-inside rays
       // (checkBounds == false) additionally stop at tEnd (the bounded rays'
       // stop-at-tEnd comes from maxSteps).
-      if ((fc_slabMode && accumulatedOpacity > 1.0h - 1.0h / 255.0h) ||
+      if ((fc_slabMode && accumulatedOpacity > kExitAcc) ||
           (!p.checkBounds && currentT >= p.tEnd - 1e-6))
       {
         marchStop = true;
@@ -5139,7 +5156,7 @@ inline half4 marchVolumeUnified(
         // Bottom latches (the baseline breaks here): OpenGL-parity threshold
         // g_opacityThreshold = 1 - 1/255 evaluated WITHOUT clamping the
         // accumulated opacity, then the terminate-plane distance.
-        if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) {
+        if (accumulatedOpacity > kExitAcc) {
           marchStop = true;
         }
         if (currentT >= p.tTerminateMax) {
@@ -5221,7 +5238,7 @@ inline half4 marchVolumeUnified(
   texLocalPos += texStep * (float)_W; \
   evalPoint += evalStep * (float)_W; \
   i += _W; \
-  if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; } \
+  if (accumulatedOpacity > kExitAcc) { break; } \
   if (currentT >= p.tTerminateMax) { break; }
       int i = 0;
       const int steps = maxSteps;
@@ -5291,7 +5308,7 @@ inline half4 marchVolumeUnified(
         // saturation threshold must contribute nothing (the single-pass march
         // would have latched before its first sample). Checked before the
         // batch dispatch so the first batch is gated too.
-        if (fc_slabMode && accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+        if (fc_slabMode && accumulatedOpacity > kExitAcc) { break; }
         if (currentT >= p.tEnd - 1e-6f) break;
         if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
             any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
@@ -5793,7 +5810,7 @@ inline half4 marchVolumeUnified(
       const int steps = maxSteps;
       for (; i + unrollN <= steps; i += unrollN)
       {
-        if (fc_slabMode && accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+        if (fc_slabMode && accumulatedOpacity > kExitAcc) { break; }
         if (currentT >= p.tEnd - 1e-6f) break;
         if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
             any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
@@ -5855,12 +5872,12 @@ inline half4 marchVolumeUnified(
         currentT += p.stepSize * 8.0f;
         texLocalPos += texStep * 8.0f;
         evalPoint += evalStep * 8.0f;
-        if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+        if (accumulatedOpacity > kExitAcc) { break; }
         if (currentT >= p.tTerminateMax) { break; }
       }
       for (; i < steps; i++)
       {
-        if (fc_slabMode && accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+        if (fc_slabMode && accumulatedOpacity > kExitAcc) { break; }
         if (currentT >= p.tEnd - 1e-6f) break;
         if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
             any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
@@ -5879,7 +5896,7 @@ inline half4 marchVolumeUnified(
         currentT += p.stepSize;
         texLocalPos += texStep;
         evalPoint += evalStep;
-        if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { break; }
+        if (accumulatedOpacity > kExitAcc) { break; }
         if (currentT >= p.tTerminateMax) { break; }
       }
     }
@@ -5892,7 +5909,7 @@ inline half4 marchVolumeUnified(
       // saturation threshold contributes nothing; latch instead of breaking so
       // the unrolled samples stay gated by suppressAccum (the first sample of
       // the first batch included).
-      if (fc_slabMode && accumulatedOpacity > 1.0h - 1.0h / 255.0h)
+      if (fc_slabMode && accumulatedOpacity > kExitAcc)
       {
         marchOpaque = true;
       }
@@ -6051,7 +6068,7 @@ inline half4 marchVolumeUnified(
           currentT += p.stepSize; \
           texLocalPos += texStep; \
           evalPoint += evalStep; \
-          if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) { \
+          if (accumulatedOpacity > kExitAcc) { \
             marchOpaque = true; \
           } \
           if (currentT >= p.tTerminateMax) { \
@@ -6080,7 +6097,7 @@ inline half4 marchVolumeUnified(
     // saturation threshold must contribute nothing (the single-pass march
     // would have latched before its first sample). Latch for the non-divergent
     // variants, break for the baseline's divergent march.
-    if (fc_slabMode && accumulatedOpacity > 1.0h - 1.0h / 255.0h)
+    if (fc_slabMode && accumulatedOpacity > kExitAcc)
     {
       if (fc_marchVariant >= 3)
       {
@@ -6754,7 +6771,7 @@ inline half4 marchVolumeUnified(
       // SIMT lanes stay locked (accumulation is gated above by select). The
       // next sample's fetch still happens (pipeline stays full); its
       // accumulation is skipped, which matches the baseline's post-break state.
-      if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) {
+      if (accumulatedOpacity > kExitAcc) {
         marchOpaque = true;
       }
     } else {
@@ -6763,7 +6780,7 @@ inline half4 marchVolumeUnified(
       // in vtkVolumeShaderComposer.h: `g_fragColor.a > g_opacityThreshold`). Clamping here
       // made 1-src.a = 0 at blend time, dropping the background blend term that GL keeps
       // (dst*(1-a), a ~ 0.9969). Keep the raw accumulated opacity for blend parity.
-      if (accumulatedOpacity > 1.0h - 1.0h / 255.0h) {
+      if (accumulatedOpacity > kExitAcc) {
         break;
       }
     }
