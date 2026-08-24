@@ -4421,6 +4421,110 @@ batchOverride` (mapper+MSL structs now 4×uint), `VTK_METAL_TEST_CM_BATCH`,
 (gate/tgsweep/binned/bintg/decomp/qwait/batch/finalmatrix/sd generators),
 /tmp/cmbp/* (parity captures).
 
+### 38.11 Lead exhaustion round: warp-uniform schedules and ray binning
+refuted BY MEASUREMENT; every tuning dimension at local optimum
+(2026-08-24 night, continues §38.10)
+
+All runs same environment/protocol as §38.10; compute arm =
+synth-B16 unless stated.
+
+#### 38.11.1 The skip-yield probe — the number that decides two designs
+
+MM_LEAPLEVEL dose on compute-B16 @2048² (LL2 = super+block leaps [default],
+LL0 = no skips; §37.17 knob):
+
+| view | LL2 | LL0 | skip yield |
+|---|---|---|---|
+| axis-z | 29.38 | 52.96 | **−44%** |
+| obl | 14.92 | 21.57 | **−31%** |
+| axis-y | 19.87 | 36.47 | **−45%** |
+
+Block-leap skips are worth 31-45% in compute-B16 — a PURE win on every
+view including straight axis chords, where the FRAGMENT marcher pays a
+leap-scatter deficit (§37.17). Combined with §38.10.1 probe 1 (TG shape /
+ray-direction diversity: null) and §38.10.4 (the most length-divergent
+views az45/az135 show the LARGEST compute-vs-fragment wins), the mechanism
+map is unambiguous:
+
+**Post-occupancy-fix, intra-warp divergence is not a binding constraint of
+the compute marcher.** With occupancy raised from 37% to ~56-63%, scattered
+fetches are latency-hidden; the fragment-era lockstep economics (why raw-z
+beat mm-z there, §37.17) do not transfer to the register-dieted compute
+regime.
+
+#### 38.11.2 Warp-uniform hop schedules (§38.9.4a) — refuted without building
+
+The design's entire premise was "keep blocks' skip yield WITHOUT forfeiting
+lockstep" (§38.9.4a). That prize is already banked: compute-B16 has BOTH
+the full 31-45% skip yield AND the speedup — there is nothing left for
+warp-uniform negotiation to add on these workloads. What it would cost is
+known from §37.19's fragment implementation: unconditional per-batch
+reductions tax every iteration (SolidFlat proved preamble machinery is
+free only when IDLE — reductions are not), min-aggregation paces the group
+at its least-fortunate lane, and threadgroup barriers/shared-memory would
+cut straight back into the occupancy we just bought. The TG-cooperative
+megakernel restructure is multi-day, high-risk (barrier deadlock class),
+and its target mechanism shows zero measurable sensitivity in three
+independent probes. VERDICT: refuted by prior evidence; do not build.
+Re-open ONLY if a future workload shows divergence-bound behavior in the
+B16 regime (diagnostic: run MM_LEAPLEVEL 2 vs 0 — if the gap narrows or
+inverts while absolute times stay high, lockstep economics have returned).
+
+#### 38.11.3 Real ray binning (§38.9.4b) — dead on this architecture
+
+Answering the standing question directly. As implemented: measured 2.1-2.5x
+WORSE than plain atlas (§38.10.1 probe 2) — index indirection serializes a
+device-memory load before any texture work, scattered uv reads defeat tile
+prefetch, 4×binCap dead-thread dispatch wastes launch width, and every
+thread hammers one counter cacheline. Could engineering fix those?
+Partially (GPU indirect dispatch sized by counts, fused classify) — but
+the VALUE PROPOSITION is void: binning buys length-homogeneous warps, i.e.
+divergence reduction, which §38.11.1 shows is not binding. Meanwhile
+binning structurally REQUIRES the atlas raster (+0.95 ms render→compute
+dependency) that CM_SYNTH eliminated — it would reintroduce Design B's
+original sin to chase a phantom. VERDICT: dead. Re-open under the same
+trigger as §38.11.2 plus "atlas dependency must be <0.5 ms".
+
+#### 38.11.4 Remaining tuning dimensions — all confirmed at optimum
+
+| knob (compute arm) | result |
+|---|---|
+| MM_BLOCKSONLY=1 (drop cell-lattice walk) | neutral ±0.3% (axz/obl/axy) — walk is free in compute too |
+| CM_TG @B16 {16x8, 8x16, 4x8} vs 8x8 | 8x8 stays optimal (obl 16x8 +8%; others noise/worse) |
+| CM_BATCH {18, 20} vs 16 | noise (axz 29.39-29.46 vs 29.40) — B16 stands |
+| EXIT_THETA 0.98 / 0.95 | −0.8..−1.6% / −2.1..−3.3% — same opt-in-only class as §38.4; image-changing, never default |
+| MM_DS {16, 32} coarser lattice | obl +20/+23% — certification coarsening hurts compute like fragment (§37.24); DS default stands |
+| atlas-B16 vs synth-B16 @axz | synth 29.4 vs atlas 30.3 — synthesis still strictly better |
+
+#### 38.11.5 Parked with quantified ceilings (not built)
+
+- **Direct-to-drawable march** (kill Phase 3b): ceiling ≈ the 0.51 ms blit
+  ≈ −3.4% obl / −1.7% axz on today's numbers. Requires renderer surgery
+  (drawable ShaderWrite usage, sRGB encode in-kernel — compute writes skip
+  the ROP's automatic conversion, background compositing semantics,
+  geometry-blend correctness beyond the bench scene). Poor risk/reward
+  while compute already wins every cell; revisit only if the floor itself
+  becomes the binding constraint (e.g., after future march gains).
+- **Stride-decoupled checkpoints** (fetch width ≠ exit/preamble cadence)
+  for byte-parity to legacy B0 output: reasoned away — B0 is itself an
+  env-gated experimental path, not a production reference; the production
+  comparison (vs mv9-Metal) already reads mean|d|=0.023 / 0.56% px >1LSB,
+  inside the cross-backend tolerance production accepts (GL↔Metal 9.5%).
+  B16≡B24 determinism documented; if compute ever ships, B16 IS the output
+  definition.
+- **Persistent threads / work compaction**: no mechanism at 4M threads vs
+  ~10k resident (scheduler already load-balances); tail effect bounded by
+  spatial clustering which bins (dead, §38.11.3) were the only remedy for.
+
+#### 38.11.6 Session closing state
+
+Compute marcher final config: `VTK_METAL_TEST_COMPUTE_MARCH=1
+VTK_METAL_TEST_CM_SYNTH=1 VTK_METAL_TEST_CM_BATCH=16` — wins 18/18
+measured cells across views × resolutions × sampling densities, parity
+within tolerance class, deterministic. Defaults untouched (all TEMP-DIAG).
+Production landing checklist unchanged from §38.10.4. Anchors re-verified
+at session end via matrix frag arms (15.74-15.75 / 35.01-35.04).
+
 Tree state after this session: `VTK_METAL_TEST_EXIT_THETA` knob landed
 (default-OFF, byte-inert); VOLTRANSPOSE policy comments updated with the
 §38.3 matrix; everything else reverted clean (byte-parity verified). New
