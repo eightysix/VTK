@@ -3767,6 +3767,32 @@ VERDICTS:
    with a known, bounded, workload-dependent exception on straight axis
    chords of fragmented volumes.
 
+### 37.23 LANDED: tiered block size {fine 16, coarse 8} — SD0.5 matrix flips
+the fine-tier story (2026-08-24 late night)
+
+SD0.5 healthy-state matrix (DS=2 lattice, j0, frames=20 x2 rounds, ±0.5 ms):
+
+| view | TRUE raw | BS8 | BS16 |
+|---|---|---|---|
+| axz | 156.2 | 126.8 (−18.8%) | **120.4 (−22.9%)** |
+| obl | 56.7 | 48.2 (−15.0%) | **44.6 (−21.3%)** |
+
+At half-voxel steps each ray crosses ~2x the blocks per chord, so halving
+the leap-event count pays on EVERY view — BS16 wins both, reversing its
+coarse-tier pattern. Combined with §37.22's coarse table the optimal
+policy is tiered exactly like ComputeMacrocellDownsample:
+
+**LANDED**: VolumeMinMaxBlockSize(sampleDistance) -> {sd<1.5: 16,
+sd>=1.5: 8}; env VTK_METAL_TEST_MM_BLOCKSIZE overrides both tiers.
+Cache key already carried blockSize (tier switch rebuilds); shader gets
+the value via MmBlockSizeCells as before. Verified: TR_DUMP shows
+block=8 @SD4 and block=16 @SD0.5; tiered-default SD4 render byte-identical
+to env-BS8 (coarse behavior untouched); SD0.5 default measures 122.14 ==
+BS16-env reference (120.4).
+
+Net effect vs the pre-§37.18 single-tier BS8 baseline: fine tier improves
+by an extra ~4-6 points of win on every view; coarse tier unchanged.
+
 ### 37.14 Reproduction recipe for all §37 benchmarks
 
 Commits: measurements taken on `1896bf38bd` code (single-tier cap32;

@@ -1353,18 +1353,24 @@ static int ComputeMacrocellDownsample(double sampleDistance, bool useGPUMinMax)
 // pixel measurement (§37.6: ~0.2% of pixels, mean ~1 LSB, rare outliers) —
 // in exchange for -13% frame time at SD4 and -28% at SD0.5 (axz). 
 // VTK_METAL_TEST_MM_BLOCKS=0 opts back out.
-static int VolumeMinMaxBlockSize()
+static int VolumeMinMaxBlockSize(double sampleDistance)
 {
-  // §37.18 (VTK_METAL_TEST_MM_BLOCKSIZE): block-summary edge in fine cells.
-  // 16 halves leap events per saved sample (scatter is the proven axis-chord
-  // deficit mechanism); supers stay fixed at 64-cell tiles. Power-of-two
-  // values only so shader index math stays exact; anything else -> default.
+  // §37.18/§37.23 (VTK_METAL_TEST_MM_BLOCKSIZE): block-summary edge in fine
+  // cells, TIERED like the lattice downsample itself:
+  //   fine tier (sd < 1.5, DS=2 lattice): 16 — at half-voxel steps each ray
+  //     crosses ~2x the blocks, so halving the leap-event count wins on every
+  //     view measured (-22.9% axz / -21.3% obl vs raw; BS8 -18.8/-15.0).
+  //   coarse tier (sd >= 1.5, DS=4 lattice): 8 — larger oblique/az45 wins
+  //     outweigh BS16's axis-z relief (orbit-integrated -6.4% vs -3.6%,
+  //     §37.22 table); BS16 remains the documented axis-chord remedy here.
+  // Explicit env overrides both tiers ({4,8,16,32}; powers of two only so
+  // the shader's exact fp-reciprocal index math stays exact).
   if (const char* e = getenv("VTK_METAL_TEST_MM_BLOCKSIZE"))
   {
     const int v = std::atoi(e);
     if (v == 4 || v == 8 || v == 16 || v == 32) return v;
   }
-  return 8;
+  return sampleDistance < 1.5 ? 16 : 8;
 }
 
 // Unified gate for the two-level occupancy summary. The former fine-SD-only
@@ -5918,7 +5924,7 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
   // §35.5 (VTK_METAL_TEST_MM_SUPER): third level; requires the blocks level.
   const bool wantSuper =
     VolumeMinMaxSuperWanted(this->UseGPUMinMax, this->SampleDistance);
-  const int blockSize = VolumeMinMaxBlockSize();
+  const int blockSize = VolumeMinMaxBlockSize(this->SampleDistance);
   const int blkDims[3] = {
     std::max(1, (mmDims[0] + blockSize - 1) / blockSize),
     std::max(1, (mmDims[1] + blockSize - 1) / blockSize),
@@ -6292,7 +6298,7 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeMinMaxGPU(
             static_cast<NSUInteger>(bd[2]))
           mipmapLevel:0 slice:0];
       long violations = 0;
-      int bsZ = VolumeMinMaxBlockSize();
+      int bsZ = VolumeMinMaxBlockSize(this->SampleDistance);
       for (int bz = 0; bz < bd[2]; ++bz)
         for (int by = 0; by < bd[1]; ++by)
           for (int bx = 0; bx < bd[0]; ++bx)
@@ -8854,7 +8860,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     uniforms.MmLeapLevel = static_cast<float>(std::atoi(ll));
   }
   // §37.18: keep the shader's index math in sync with the built texture.
-  uniforms.MmBlockSizeCells = static_cast<float>(VolumeMinMaxBlockSize());
+  uniforms.MmBlockSizeCells = static_cast<float>(VolumeMinMaxBlockSize(this->SampleDistance));
   // §37.19 warp-coherent skip probe: opt-in A/B.
   uniforms.MmWarpMin = 0.0f;
   if (const char* wm = getenv("VTK_METAL_TEST_MM_WARPMIN"))
