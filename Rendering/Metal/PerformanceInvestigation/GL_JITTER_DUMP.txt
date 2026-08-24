@@ -1,0 +1,1120 @@
+================================================================================
+GL JITTER PATH DUMP — app GL vs harness GL vs app Metal
+2026-08-20. Purpose: pin why app GL jitter is ~+12 ms while harness GL is ~+25 ms
+(Metal already matches at ~+25 ms). Target config (visual parity): per-pixel
+blue noise on both backends (app GL native; Metal with VTK_METAL_TEST_IGN_JITTER=0,
+NO VTK_METAL_TEST_JITTER_PARITY).
+
+Sections:
+  1. Harness GL fragment shader  (jitter_gap_repro/jitter_gap_repro.mm)
+  2. App composed GL fragment shader (dump hook -> /tmp/app_gl_frag.glsl)
+  3. App GL composer + mapper source (vtkVolumeShaderComposer.h, vtkOpenGLGPUVolumeRayCastMapper.cxx)
+  4. App Metal jitter path (MetalShaders.metal, vtkMetalGPUVolumeRayCastMapper.mm, TestMetalScenes.h)
+  5. Noise tile build (vtkOpenGLRenderWindow.cxx)
+  6. Iteration instrumentation (VTK_METAL_TEST_GL_ITER)
+  7. jitter_gap_repro/RESULTS.md (ground truth / refuted hypotheses)
+
+================================================================================
+1. HARNESS GL FRAGMENT SHADER
+File: Rendering/Metal/PerformanceInvestigation/jitter_gap_repro/jitter_gap_repro.mm
+The FS string is assembled in RunGL() (lines 184-267). March is in ray-parameter
+t space (normalized volume space). Vertex shader: gl_Position = uVP * vec4(aCorner * uBoundsSize, 1.0).
+Noise texture: 64x64 R32F, GL_NEAREST + GL_REPEAT, values = kBlue64[i]/255 (lines 151-163).
+TF: 256x1 RGBA8, GL_LINEAR (lines 166-173).  Volume: 512x512x1794 R8, GL_LINEAR, CLAMP (lines 138-146).
+
+--- harness GL FS (verbatim, lines 193-267) ---
+#version 150
+out vec4 fragColor;
+uniform sampler3D uVol;
+uniform sampler2D uNoise;
+uniform sampler2D uTF;
+uniform vec3 uTexelCount;
+uniform vec3 uEye;
+uniform vec3 uBoundsSize;
+uniform mat4 uInvVP;
+uniform float uSampleDistMM;
+uniform float uRT;
+uniform int uMaxIter;
+uniform int uJitter;
+uniform int uProbeRast;
+void main() {
+  if (uProbeRast > 0) { fragColor = vec4(1.0,1.0,1.0,1.0); return; }
+  vec2 ndc = gl_FragCoord.xy / uRT * 2.0 - 1.0;
+  vec4 w4 = uInvVP * vec4(ndc, 0.0, 1.0);
+  vec3 ptPhys = w4.xyz / w4.w;
+  vec3 rayDir = normalize(ptPhys / uBoundsSize - uEye);
+  vec3 inv = 1.0 / rayDir;
+  vec3 t0 = (vec3(0.0) - uEye) * inv;
+  vec3 t1 = (vec3(1.0) - uEye) * inv;
+  vec3 tmin3 = min(t0, t1);
+  vec3 tmax3 = max(t0, t1);
+  float tEnter = max(max(tmin3.x, tmin3.y), tmin3.z);
+  float tExit = min(min(tmax3.x, tmax3.y), tmax3.z);
+  if (tExit <= 0.0 || tEnter >= tExit) { fragColor = vec4(0.0,0.0,0.0,1.0); return; }
+  float tStart = max(tEnter, 0.0);
+  float physPerNorm = length(rayDir * uBoundsSize);
+  float stepSize = uSampleDistMM / max(physPerNorm, 1e-6);
+  float jitterF = 0.0;
+  if (uJitter > 0) {
+    jitterF = texture(uNoise, gl_FragCoord.xy / vec2(textureSize(uNoise, 0))).x * stepSize;
+  }
+  // CONSTANT-PHASE DEBUG: uJitter == 2 shifts by a fixed half step,
+  // no per-pixel divergence, no noise fetch.
+  if (uJitter == 2) {
+    jitterF = 0.5 * stepSize;
+  }
+  // FETCH-ONLY DEBUG: uJitter == 3 fetches the noise (same cache behavior)
+  // but uses a constant half step.
+  if (uJitter == 3) {
+    jitterF = 0.5 * stepSize;
+  }
+  // LATTICE DEBUG: uJitter == 4 keeps the per-pixel phase but re-aligns
+  // to the lattice (the app's Metal semantics) — phase-quantized march.
+  if (uJitter == 4) {
+    tStart = jitterF + ceil((tStart - jitterF) / stepSize) * stepSize;
+  } else {
+    // GL parity: jitter OFF still shifts the origin by one full step
+    // (g_rayJitter = g_dirStep); jitter ON shifts by the per-pixel phase.
+    tStart += uJitter > 0 ? jitterF : stepSize;
+  }
+  int maxSteps = max(0, int(ceil((tExit - tStart) / stepSize)));
+  vec3 ctpScale = max(uTexelCount - 1.0, 1e-4) / uTexelCount;
+  vec3 ctpOffset = 0.5 / uTexelCount;
+  vec3 evalBase = ctpOffset + (uEye + rayDir * tStart) * ctpScale;
+  vec3 evalStep = rayDir * ctpScale * stepSize;
+  vec3 accColor = vec3(0.0);
+  float accOp = 0.0;
+  for (int i = 0; i < min(uMaxIter, maxSteps); i++) {
+    float currentT = tStart + float(i) * stepSize;
+    if (currentT >= tExit - 1e-6) break;
+    vec3 evalPoint = evalBase + float(i) * evalStep;
+    float s = texture(uVol, evalPoint).r;
+    vec4 tfv = texture(uTF, vec2(s, 0.5));
+    float w = 1.0 - accOp;
+    accColor += w * vec3(tfv.rgb * tfv.a);
+    accOp += w * tfv.a;
+    if (accOp > 0.996) break;
+  }
+  fragColor = vec4(accColor, accOp);
+}
+
+--- harness GL noise field key facts ---
+- textureSize(uNoise,0) = (64,64). coord = gl_FragCoord.xy/64.
+  texel = floor(coord*64) = floor(gl_FragCoord.xy) = INTEGER PIXEL COORDS mod 64
+  -> PER-PIXEL field, tiled every 64 px (NOT block-constant; corrected 2026-08-20).
+- j0 (uJitter=0): tStart += stepSize (full-step shift, g_rayJitter=g_dirStep parity).
+- j1 (uJitter=1): tStart += noise*stepSize. noise sampled ONLY on j1 path.
+- Early-exit: accOp > 0.996. maxSteps = ceil((tExit - tStart)/stepSize).
+- uMaxIter = 8192 (line 287). uSampleDistMM = sd (4.0). Coverage 1,831,193 px (Metal) vs
+  GL 1,831,510 px (of 4,194,304).
+
+--- harness Metal fragment (verbatim excerpts, lines 421-501) ---
+Uniforms: eye,boundsSize,invVP,vp,sampleDistMM,jitter,maxIter,rtSize,probeRast,probeFS,ndcCorners,probeTexNoise.
+fragment float4 fragment_main(... texture3d volTex[0], tfTex[1], noiseTex[2] ...) {
+  constexpr sampler noiseSampler(filter::nearest, address::repeat);
+  if (u.probeRast > 0) return float4(in.cvt, 1.0);
+  float2 ndc = float2(in.position.x / u.rtSize * 2.0 - 1.0,
+                      (u.rtSize - in.position.y) / u.rtSize * 2.0 - 1.0); // y-flip
+  float4 w4 = u.invVP * float4(ndc, 0.0, 1.0);
+  float3 ptPhys = w4.xyz / w4.w;
+  float3 rayDir = normalize(ptPhys / u.boundsSize.xyz - eye);
+  ... box slab intersection identical to GL ...
+  float tStart = max(tEnter, 0.0);
+  float physPerNorm = length(rayDir * u.boundsSize.xyz);
+  float stepSize = u.sampleDistMM / max(physPerNorm, 1e-6);
+  if (u.jitter == 2) { tStart += 0.5f * stepSize; }          // constphase
+  else if (u.jitter > 0) {
+    float2 fid = floor(in.position.xy);
+    float jitterF;
+    if (u.probeTexNoise > 0) {
+      jitterF = noiseTex.sample(noiseSampler, float2(fid.x, u.rtSize - fid.y) / 64.0f).x * stepSize;
+    } else {
+      int2 t = int2(int(fid.x) & 63, int(u.rtSize - fid.y) & 63);   // PER-PIXEL kBlue64
+      jitterF = (kBlue64[t.y * 64 + t.x] / 255.0f) * stepSize;
+    }
+    if (u.jitter == 4) tStart = jitterF + ceil((tStart - jitterF) / stepSize) * stepSize;
+    else tStart += jitterF;
+  }
+  // NOTE: harness Metal j0 (u.jitter=0) does NOT shift at all (Metal j0 adds
+  // nothing; app Metal j0 shifts a full step).
+  int maxSteps = max(0, int(ceil((tExit - tStart) / stepSize)));
+  float3 texelCount = float3(volTex.get_width(), volTex.get_height(), volTex.get_depth());
+  float3 ctpScale = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset = 0.5 / texelCount;
+  float3 evalBase = ctpOffset + (eye + rayDir * tStart) * ctpScale;
+  float3 evalStep = rayDir * ctpScale * stepSize;
+  constexpr sampler volSampler(filter::linear, address::clamp_to_edge);
+  constexpr sampler tfSampler(filter::linear, address::clamp_to_edge);
+  float3 accColor = float3(0.0); float accOp = 0.0;
+  for (int i = 0; i < min(u.maxIter, maxSteps); i++) {
+    float currentT = tStart + float(i) * stepSize;
+    if (currentT >= tExit - 1e-6f) break;
+    float3 evalPoint = evalBase + float(i) * evalStep;
+    float s = volTex.sample(volSampler, evalPoint).r;
+    float4 tfv = tfTex.sample(tfSampler, float2(s, 0.5f));
+    float w = 1.0f - accOp;
+    accColor += w * (tfv.rgb * tfv.a);
+    accOp += w * tfv.a;
+    if (accOp > 0.996f) break;
+  }
+  return float4(accColor, accOp);
+}
+(Volume uploaded R8Unorm via blit, allowGPUOptimizedContents=NO (line 373).
+ Noise texture 64x64 R8Unorm replaceRegion (lines 534-538). TF 256x1 RGBA8Unorm shared (lines 387-392).
+ Metal j0/j1 timing uses rtTex RGBA8Unorm Shared, waitUntilCompleted per frame (lines 566-593).
+ Coverage probe: samples every 37th px (lines 595-601).)
+
+================================================================================
+2. APP COMPOSED GL FRAGMENT SHADER
+Source of dump: vtkOpenGLGPUVolumeRayCastMapper.cxx lines 2876-2883 (always-on TEMP hook
+writes /tmp/app_gl_frag.glsl + /tmp/app_gl_vert.glsl). Dump captured 2026-08-20 with
+VTK_METAL_TEST_JITTER=1 (jitter ON, so the texture2D noise fetch is compiled in).
+
+--- key prologue (lines 412-528 of the dump) ---
+void initializeRayCast() {
+  g_fragColor = vec4(0.0); g_dirStep = vec3(0.0); g_srcColor = vec4(0.0); g_exit = false;
+  g_rayOrigin = ip_textureCoords.xyz;              // interpolated vertex texcoord (texture space)
+  vec3 rayDir = computeRayDirection();             // normalize(ip_vertexPos - in_eyePosObjs[0])
+  vec2 fragTexCoord = (gl_FragCoord.xy - in_windowLowerLeftCorner) * in_inverseWindowSize;
+  g_dirStep = (ip_inverseTextureDataAdjusted * vec4(rayDir, 0.0)).xyz * in_sampleDistance; // TEXTURE-space step
+  g_lengthStep = length(g_dirStep);
+  float jitterValue = 0.0;
+  // (JITTER=1 branch compiled in:)
+  jitterValue = texture2D(in_noiseSampler, gl_FragCoord.xy / vec2(textureSize(in_noiseSampler, 0))).x;
+  g_rayJitter = g_dirStep * jitterValue;
+  // (JITTER=0 branch instead emits:  g_rayJitter = g_dirStep;)
+  g_rayOrigin += g_rayJitter;                       // ORIGIN SHIFT, texture space
+  g_skip = false;
+  bool stop = false;
+  g_terminatePointMax = 0.0;
+  vec4 l_depthValue = texture2D(in_depthSampler, fragTexCoord);
+  if (gl_FragCoord.z >= l_depthValue.x) { discard; }   // depth-based discard (per fragment)
+  fragTexCoord = (gl_FragCoord.xy - in_windowLowerLeftCorner) * in_inverseOriginalWindowSize;
+  vec4 rayTermination = WindowToNDC(gl_FragCoord.x, gl_FragCoord.y, l_depthValue.x);
+  rayTermination = ip_inverseTextureDataAdjusted * in_inverseVolumeMatrix[0] *
+                   in_inverseModelViewMatrix * in_inverseProjectionMatrix * rayTermination;
+  g_rayTermination = rayTermination.xyz / rayTermination.w;
+  g_dataPos = g_rayOrigin;
+  g_terminatePos = g_rayTermination;
+  g_terminatePointMax = length(g_terminatePos.xyz - g_dataPos.xyz) / length(g_dirStep);
+  g_currentT = 0.0;
+  // clipping setup (clip_numPlanes = in_clippingPlanes[0]; 1 plane active, at front face, normal +z)
+  // AdjustSampleRangeForClipping(g_rayOrigin, g_rayTermination) -> may shift startPosTex += g_rayJitter
+  g_dataPos = g_rayOrigin; g_terminatePos = g_rayTermination;
+  g_terminatePointMax = length(g_terminatePos - g_dataPos) / length(g_dirStep);
+  g_jitterValue = jitterValue;
+}
+
+--- key loop (lines 538-620 of the dump) ---
+vec4 castRay(float zStart, float zEnd) {
+  while (!g_exit) {
+    g_skip = false;
+    if (!g_skip) {
+      vec4 scalar;
+      scalar = texture3D(in_volume[0], g_dataPos);                 // volume fetch (trilinear)
+      scalar.r = scalar.r * in_volume_scale[0].r + in_volume_bias[0].r;  // scale/bias
+      scalar = vec4(scalar.r);
+      g_srcColor = vec4(0.0);
+      g_srcColor.a = computeOpacity(scalar);        // texture2D(in_opacityTransferFunc_0[0], vec2(scalar.w,0)).r
+      if (g_srcColor.a > 0.0) {
+        g_srcColor = computeColor(scalar, g_srcColor.a);  // texture2D(in_colorTransferFunc_0[0],...).xyz * opacity
+        g_srcColor.rgb *= g_srcColor.a;
+        g_fragColor = (1.0f - g_fragColor.a) * g_srcColor + g_fragColor;  // front-to-back
+      }
+    }
+    g_dataPos += g_dirStep;                                        // advance
+    if (any(greaterThan(max(g_dirStep,vec3(0.0))*(g_dataPos - in_texMax[0]),vec3(0.0))) ||
+        any(greaterThan(min(g_dirStep,vec3(0.0))*(g_dataPos - in_texMin[0]),vec3(0.0)))) break; // box-exit
+    if ((g_fragColor.a > g_opacityThreshold) || (g_currentT >= g_terminatePointMax)) break;   // 0.996 or depth-terminate
+    ++g_currentT;
+  }
+  return g_fragColor;
+}
+
+finalizeRayCast: g_fragColor.rgb = g_fragColor.rgb * in_scale + in_bias * g_fragColor.a; gl_FragData[0] = g_fragColor.
+
+--- key facts ---
+- j0 (JITTER=0): g_rayJitter = g_dirStep -> origin shift by ONE FULL TEXTURE step. Noise NOT sampled.
+- j1 (JITTER=1): g_rayJitter = g_dirStep * jitterValue; jitterValue = 64x64 tile at gl_FragCoord.xy/64
+  NEAREST+REPEAT -> PER-PIXEL (texel = integer pixel coords mod 64). Origin shift by (0..1)*step.
+- Loop: while(!g_exit) with per-sample volume + opacity-TF + color-TF fetches, box-exit break,
+  opacity-threshold (0.996) early-exit, and g_currentT >= g_terminatePointMax (depth-driven).
+- TEXTURE-space march: g_dataPos and g_dirStep in texture coords; step count =
+  length(term - start)/length(dirStep) = physicalLength/4mm.
+- Depth texture: in_depthSampler bound to DepthTextureObject (line 3682); filled only if depth pass on.
+  Without depth pass, l_depthValue.x is stale/1.0 -> no discard, termination at far plane; box-exit break
+  bounds the march.
+- TF: separate in_opacityTransferFunc_0 (R) + in_colorTransferFunc_0 (RGB) textures, 256x1, linear.
+- computeLighting is a no-op for this scene (returns color unchanged; lines 283-293).
+
+================================================================================
+3. APP GL COMPOSER + MAPPER SOURCE
+File: Rendering/VolumeOpenGL2/vtkVolumeShaderComposer.h
+
+--- jitter macros (BaseInit, lines 442-466) ---
+  float jitterValue = 0.0;
+  if (GetBlendMode() != SLICE_BLEND) {              // (lines 446-466)
+    if (glMapper->GetUseJittering()) {
+      jitterValue = texture2D(in_noiseSampler, gl_FragCoord.xy / vec2(textureSize(in_noiseSampler, 0))).x;
+      g_rayJitter = g_dirStep * jitterValue;
+    } else {
+      g_rayJitter = g_dirStep;
+    }
+    g_rayOrigin += g_rayJitter;
+  }
+
+--- g_dirStep (BaseInit, lines 437-441) ---
+  g_dirStep = (ip_inverseTextureDataAdjusted * vec4(rayDir, 0.0)).xyz * in_sampleDistance;
+  g_lengthStep = length(g_dirStep);
+
+--- TerminationDeclaration (line 3242-3243) ---
+  const float g_opacityThreshold = 1.0 - 1.0 / 255.0;   // 0.996
+
+--- TerminationInit (lines 3255-3334) ---
+  bool stop = false;
+  g_terminatePointMax = 0.0;
+  vec4 l_depthValue = texture2D(in_depthSampler, fragTexCoord);
+  if (gl_FragCoord.z >= l_depthValue.x) { discard; }     // <-- depth discard
+  fragTexCoord = (gl_FragCoord.xy - in_windowLowerLeftCorner) * in_inverseOriginalWindowSize;
+  ... rayTermination via WindowToNDC + inverse matrices ...
+  g_rayTermination = rayTermination.xyz / rayTermination.w;
+  g_dataPos = g_rayOrigin;
+  g_terminatePos = g_rayTermination;
+  g_terminatePointMax = length(g_terminatePos - g_dataPos) / length(g_dirStep);
+  g_currentT = 0.0;
+
+--- TerminationImplementation (lines 3334-3357) ---
+  if (any(greaterThan(max(g_dirStep,vec3(0.0))*(g_dataPos - in_texMax[0]),vec3(0.0))) ||
+      any(greaterThan(min(g_dirStep,vec3(0.0))*(g_dataPos - in_texMin[0]),vec3(0.0)))) break;  // box exit
+  if ((g_fragColor.a > g_opacityThreshold) || (g_currentT >= g_terminatePointMax)) break;
+  ++g_currentT;
+
+--- composite blend (BaseImplementation COMPOSITE_BLEND, lines 2972-3017) ---
+  g_srcColor = vec4(0.0);
+  g_srcColor.a = computeOpacity(scalar);                 // opacity TF fetch
+  if (g_srcColor.a > 0.0) {
+    g_srcColor = computeColor(scalar, g_srcColor.a);     // color TF fetch
+    g_srcColor.rgb *= g_srcColor.a;
+    g_fragColor = (1.0f - g_fragColor.a) * g_srcColor + g_fragColor;
+  }
+
+--- debug gates (lines 2976-3017, TEMP, revert before landing) ---
+  if (getenv("VTK_METAL_TEST_GL_NOTF")) { g_srcColor = vec4(scalar.r); g_srcColor.a = 0.005; }
+  else { ... normal TF path above ... }
+
+File: Rendering/VolumeOpenGL2/vtkOpenGLGPUVolumeRayCastMapper.cxx
+
+--- shader dump hook (lines 2876-2883, TEMP) ---
+  FILE* f = fopen("/tmp/app_gl_frag.glsl","w"); fputs(Fragment source, f);
+  f = fopen("/tmp/app_gl_vert.glsl","w"); fputs(Vertex source, f);
+
+--- GL_ITER hook (lines 2349-2357, TEMP) ---
+  if (getenv("VTK_METAL_TEST_GL_ITER")) {
+    Substitute("gl_FragData[0] = g_fragColor;", "gl_FragData[0] = vec4(g_currentT / 4096.0, 0.0, 0.0, 1.0);");
+  }
+
+--- GL_ITER framebuffer dump (lines 4133-4157, TEMP) ---
+  if (getenv("VTK_METAL_TEST_GL_ITER")) { read GL_RGB viewport -> /tmp/app_gl_iter.ppm (2048x2048) }
+
+--- noise sampler binding (line 3687) ---
+  prog->SetUniformi("in_noiseSampler", win->GetNoiseTextureUnit());
+--- depth sampler binding (line 3682) ---
+  prog->SetUniformi("in_depthSampler", this->DepthTextureObject->GetTextureUnit());
+--- depth texture alloc (lines 788-851) ---
+  DepthTextureObject AllocateDepth(WindowSize) when depth pass on; shared/None otherwise.
+--- camera matrix dump (line 3743, TEMP) + uniforms dump (lines 4034-4131, TEMP) ---
+  dumps app camera matrices + active uniforms + TF textures to /tmp/app_gl_*.txt/.bin under VTK_METAL_TEST_DUMP_UNIFORMS.
+
+================================================================================
+4. APP METAL JITTER PATH
+File: Rendering/Metal/Shaders/MetalShaders.metal
+
+--- jitter selection (VolumeMapperUniforms, lines 2741/2901-2910) ---
+  float useJittering;   float useIGNJitter;   float jitterBlockSize;
+
+--- sampleJitterNoise (lines 3322-3352) ---
+inline float sampleJitterNoise(float2 st, float viewportH, float blockSize) {
+  if (blockSize < 0.5f) {
+    // GL-parity block sampling: jitter constant over viewportH/64 px blocks
+    // (selected by CPU via VTK_METAL_TEST_JITTER_PARITY; NOTE this is NOT what
+    // GL does — GL is per-pixel; the block field is a different (gross) look).
+    float texel = viewportH / 64.0f;                       // 32 px at 2048
+    int2 t = int2(floor(st.x / texel), floor((st.y - viewportH) / texel)) & 63;
+    return float(kBlueNoise64[t.y * 64 + t.x]) / 255.0f;
+  }
+  // Block-coherent: blockSize 1 = legacy per-pixel (bit-identical values, scattered).
+  float bs = max(blockSize, 1.0f);
+  st = floor(st / bs) * bs + 0.5f * bs;
+  int2 t = int2(floor(st.x), floor(st.y - viewportH)) & 63;
+  return float(kBlueNoise64[t.y * 64 + t.x]) / 255.0f;
+}
+// kBlueNoise64 = 64x64 U8 tile (lines 3052+), JPEG top-down; row math per comments
+// (lines 3034-3051) makes the default per-pixel path sample the exact texel GL
+// samples for each physical pixel (visual parity confirmed: mean abs diff 0.064/255).
+
+--- sampleIGNJitter (lines 3358-3364) ---
+inline float sampleIGNJitter(float2 st, float blockSize) {
+  blockSize = max(blockSize, 1.0f);
+  float2 blockCenter = floor(st / blockSize) * blockSize + 0.5f * blockSize;
+  return fract(52.9829189 * fract(dot(blockCenter, float2(0.06711056, 0.00583715))));  // per-pixel hash
+}
+
+--- march entry (fragment_volume_main -> marchVolume -> marchVolumeUnified) ---
+  float jitter = (volumeUniforms.useJittering > 0.5
+      ? (volumeUniforms.useIGNJitter > 0.5
+            ? sampleIGNJitter(screenPos, volumeUniforms.jitterBlockSize)
+            : sampleJitterNoise(screenPos, volumeUniforms.viewportSize.y, volumeUniforms.jitterBlockSize))
+      : 1.0) * stepSize;                                  // (lines 5908-5912)
+  // NOTE: j0 (useJittering=0) -> jitter = 1.0*stepSize = FULL-STEP shift (GL parity).
+  MarchParams p = {..., tStart, totalBoxT, stepSize, jitter, ...};   // checkBounds=true
+
+--- firstT / lattice semantics (marchVolumeUnified, lines 4154-4160) ---
+  float firstT = p.checkBounds
+      ? p.jitter                                        // checkBounds=true: pure origin shift
+      : p.jitter + ceil((p.tStart - p.jitter) / p.stepSize) * p.stepSize;   // lattice (slab path)
+  float3 currentPoint = p.rayOrigin + p.rayDir * (p.checkBounds ? p.tStart : 0.0) + p.rayDir * firstT;
+  float currentT = firstT;
+  int maxSteps = max(1, int(ceil((p.tEnd - firstT) / p.stepSize)));
+
+--- loop (marchVolumeUnified, continues past line 4247) ---
+  per-sample: sampleVolumeScalar(volumeTexture, ...) [fc_marchVariant 0/1/2], TF fetch,
+  composite, early-exit accOp > 0.996, currentT advance.
+  (fc_marchVariant pinned to 0 for the bench via VTK_METAL_TEST_MARCH_VARIANT default;
+   TEMP-REPRO in VolumeMarchVariant(); revert to 9 before landing.)
+
+--- RenderToImage (RTT) path equivalent (lines 6322-6329) ---
+  same jitter selection + MarchParams checkBounds=true.
+
+--- slab/global-schedule path (lines 6609-6647) ---
+  jitter = (useJittering ? noise : 1.0)...  // noise*stepSize; marchSegment checkBounds=false -> lattice.
+
+File: Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.mm
+
+--- uniforms (lines 7327-7339) ---
+  uniforms.UseJittering  = GetUseJittering() ? 1.0f : 0.0f;
+  uniforms.UseIGNJitter  = GetUseIGNJitter() ? 1.0f : 0.0f;
+  uniforms.JitterBlockSize = GetJitterBlockSize();   // default 1 (per-pixel)
+  if (getenv("VTK_METAL_TEST_JITTER_PARITY"))        // -> 0.0f (block field) or JITTER_BLOCK_SIZE
+    uniforms.JitterBlockSize = ...;
+--- defaults (vtkMetalGPUVolumeRayCastMapper.h lines 353-356) ---
+  bool UseIGNJitter = false;  int JitterBlockSize = 1;   // default = per-pixel blue noise
+
+File: Rendering/Metal/Testing/Cxx/TestMetalScenes.h (lines 1224-1253) — bench config
+
+--- CRITICAL (lines 1242-1249): bench default FORCES IGN on Metal ---
+  mapper->UseJitteringOn() when VTK_METAL_TEST_JITTER (lines 1224-1231)
+  if (Metal mapper) {
+    if (getenv("VTK_METAL_TEST_IGN_JITTER")) metal->SetUseIGNJitter(atoi != 0);
+    else metal->SetUseIGNJitter(TempJitter());   // = VTK_METAL_TEST_JITTER=1 -> IGN ON
+    metal->SetJitterBlockSize(TempJitterBlock()); // default 1
+  }
+  => App bench A/B (JITTER=1, no IGN override) compares GL per-pixel blue-noise
+     vs Metal per-pixel IGN. Both per-pixel scattered -> same cost class.
+  => Target config for visual parity: VTK_METAL_TEST_IGN_JITTER=0 (Metal per-pixel
+     blue noise), NO VTK_METAL_TEST_JITTER_PARITY.
+
+================================================================================
+5. NOISE TILE BUILD
+File: Rendering/OpenGL2/vtkOpenGLRenderWindow.cxx (lines 3045-3091)
+
+--- GetNoiseTextureUnit() ---
+  vtkJPEGReader reads embedded BlueNoiseTexture64x64.jpg (64x64).
+  for i: noiseTextureData[i] = GetScalarComponentAsFloat(x,y,0,0) / 255.0f;  // R32F
+  Create2DFromRaw(64, 64, 1, VTK_FLOAT, noiseTextureData);
+  WrapS/T = Repeat; Mag/Min filter = Nearest.  // NEAREST + REPEAT
+Harness GL: identical (R32F 64x64, GL_NEAREST+REPEAT, kBlue64[i]/255, lines 151-163).
+Harness/Metal: kBlueNoise64 U8 constant (MetalShaders.metal line 3052) / kBlue64 include
+(jitter_gap_repro.mm line 79, bluenoise64.inc). Claimed bit-identical to the JPEG decode
+(verified against vtkJPEGReader; shader comments lines 3034-3051).
+
+================================================================================
+6. ITERATION INSTRUMENTATION
+App GL: VTK_METAL_TEST_GL_ITER=1 -> substitutes gl_FragData[0] = vec4(g_currentT/4096,0,0,1)
+  and dumps /tmp/app_gl_iter.ppm (2048x2048) (vtkOpenGLGPUVolumeRayCastMapper.cxx 2349-2357,
+  4133-4157). Red channel *4096 = per-fragment sample count (0 for discarded).
+Harness GL: no iteration dump; nearest is its timing + coverage footprint only.
+Harness Metal: coverage probe samples every 37th px (lines 595-601).
+
+================================================================================
+7. jitter_gap_repro/RESULTS.md (ground truth / refuted)
+- Absolute jitter cost (ms) is equal on both backends in the harness (MetalD - GLD = -0.45+-3.04).
+- rt x sd matrix: M/GL j1 0.70-1.04, Metal never behind with identical fields.
+- constphase (+1.8% Metal, -9.7% GL vs +50-65% real per-pixel field) -> cost is per-pixel phase
+  divergence, not the tap. allowGPUOptimizedContents=YES ~50% slower (refuted). Lattice re-alignment
+  refuted (same cost class). kBlue64 4KiB constant vs texture2D timing-identical (refuted).
+  Metal j0 adds nothing in harness (GL j0 adds full step) -> Metal j0 is a shorter march.
+- Conclusion: harness gap CLOSED (M/GL j1 <= ~1.0) — but that is on the harness GL whose jitter
+  increment is +25 ms (per-pixel field), whereas app GL (also per-pixel field) is +12 ms.
+
+================================================================================
+SESSION MEASUREMENTS (2026-08-20, battery, 2048/SD4, 30 frames)
+  GL  j0 48.78  j1 60.67 (rerun 52.64)   jitter +11.9 ms (+24%) [GL run-to-run ~+/-15%]
+  MTL j0 43.96  j1 IGN-per-pixel 69.87   jitter +25.9 ms (+59%)
+  MTL j1 blue-per-pixel (IGN=0) 68.35    jitter +24.4 ms (+55%)
+  MTL j1 GL-parity 32px block 44.34      jitter +0.4 ms (+1%)  [NOT visually GL; gross banding]
+  M/GL j1: 1.30 (per-pixel blue/IGN both), 0.84 (32px block)
+  Visual parity GL vs MTL per-pixel blue: mean abs diff 0.064/255, 9.5% px differ, max 122.
+================================================================================
+
+================================================================================
+2b. FULL APP COMPOSED GL FRAGMENT SHADER (verbatim /tmp/app_gl_frag.glsl, 658 lines)
+Captured 2026-08-20 with VTK_METAL_TEST_JITTER=1 (jitter branch compiled in).
+================================================================================
+//VTK::System::Dec
+
+// SPDX-FileCopyrightText: Copyright (c) Ken Martin, Will Schroeder, Bill Lorensen
+// SPDX-License-Identifier: BSD-3-Clause
+
+//////////////////////////////////////////////////////////////////////////////
+///
+/// Inputs
+///
+//////////////////////////////////////////////////////////////////////////////
+
+/// 3D texture coordinates form vertex shader
+in vec3 ip_textureCoords;
+in vec3 ip_vertexPos;
+
+//////////////////////////////////////////////////////////////////////////////
+///
+/// Outputs
+///
+//////////////////////////////////////////////////////////////////////////////
+
+vec4 g_fragColor = vec4(0.0);
+
+//////////////////////////////////////////////////////////////////////////////
+///
+/// Uniforms, attributes, and globals
+///
+//////////////////////////////////////////////////////////////////////////////
+vec3 g_dirStep;
+float g_lengthStep = 0.0;
+vec4 g_srcColor;
+vec4 g_eyePosObj;
+bool g_exit;
+bool g_skip;
+float g_currentT;
+float g_terminatePointMax;
+
+// These describe the entire ray for this scene, not just the current depth
+// peeling segment. These are texture coordinates.
+vec3 g_rayOrigin; // Entry point of volume or clip point
+vec3 g_rayTermination; // Termination point (depth, clip, etc)
+
+// These describe the current segment. If not peeling, they are initialized to
+// the ray endpoints.
+vec3 g_dataPos;
+vec3 g_terminatePos;
+
+float g_jitterValue = 0.0;
+
+
+
+//VTK::Output::Dec
+
+uniform sampler3D in_volume[1];
+uniform vec4 in_volume_scale[1];
+uniform vec4 in_volume_bias[1];
+uniform int in_noOfComponents;
+
+uniform sampler2D in_depthSampler;
+uniform sampler2D in_noiseSampler;
+uniform mat4 in_volumeMatrix[1];
+uniform mat4 in_inverseVolumeMatrix[1];
+uniform mat4 in_textureDatasetMatrix[1];
+uniform mat4 in_inverseTextureDatasetMatrix[1];
+uniform mat4 in_textureToEye[1];
+uniform vec3 in_texMin[1];
+uniform vec3 in_texMax[1];
+// Eye position in dataset space
+uniform vec3 in_eyePosObjs[1];
+uniform mat4 in_cellToPoint[1];
+// view and model matrices
+uniform mat4 in_projectionMatrix;
+uniform mat4 in_inverseProjectionMatrix;
+uniform mat4 in_modelViewMatrix;
+uniform mat4 in_inverseModelViewMatrix;
+in mat4 ip_inverseTextureDataAdjusted;
+
+// Ray step size
+uniform vec3 in_cellStep[1];
+uniform vec2 in_scalarsRange[4];
+uniform vec3 in_cellSpacing[1];
+
+// Sample distance
+uniform float in_sampleDistance;
+
+// Scales
+uniform vec2 in_windowLowerLeftCorner;
+uniform vec2 in_inverseOriginalWindowSize;
+uniform vec2 in_inverseWindowSize;
+uniform vec3 in_textureExtentsMax;
+uniform vec3 in_textureExtentsMin;
+
+// Material and lighting
+uniform vec3 in_diffuse[4];
+uniform vec3 in_ambient[4];
+uniform vec3 in_specular[4];
+uniform float in_shininess[4];
+
+// Others
+vec3 g_rayJitter = vec3(0.0);
+
+uniform vec2 in_averageIPRange;
+
+
+      
+ const float g_opacityThreshold = 1.0 - 1.0 / 255.0;
+
+
+
+      
+ /// We support only 8 clipping planes for now      
+ /// The first value is the size of the data array for clipping      
+ /// planes (origin, normal)      
+ uniform float in_clippingPlanes[49];      
+ uniform float in_clippedVoxelIntensity;      
+      
+ int clip_numPlanes;      
+ vec3 clip_rayDirObj;      
+ mat4 clip_texToObjMat;      
+ mat4 clip_objToTexMat;      
+      
+// Tighten the sample range as needed to account for clip planes.       
+// Arguments are in texture coordinates.       
+// Returns true if the range is at all valid after clipping. If not,       
+// the fragment should be discarded.       
+bool AdjustSampleRangeForClipping(inout vec3 startPosTex, inout vec3 stopPosTex)       
+{       
+  vec4 startPosObj = vec4(0.0);      
+  {      
+    startPosObj = clip_texToObjMat * vec4(startPosTex - g_rayJitter, 1.0);      
+    startPosObj = startPosObj / startPosObj.w;      
+    startPosObj.w = 1.0;      
+  }      
+      
+  vec4 stopPosObj = vec4(0.0);      
+  {      
+    stopPosObj = clip_texToObjMat * vec4(stopPosTex, 1.0);      
+    stopPosObj = stopPosObj / stopPosObj.w;      
+    stopPosObj.w = 1.0;      
+  }      
+      
+  for (int i = 0; i < clip_numPlanes; i = i + 6)      
+  {      
+    vec3 planeOrigin = vec3(in_clippingPlanes[i + 1],      
+                            in_clippingPlanes[i + 2],      
+                            in_clippingPlanes[i + 3]);      
+    vec3 planeNormal = normalize(vec3(in_clippingPlanes[i + 4],      
+                                      in_clippingPlanes[i + 5],      
+                                      in_clippingPlanes[i + 6]));      
+      
+    // Abort if the entire segment is clipped:      
+    // (We can do this before adjusting the term point, since it'll       
+    // only move further into the clipped area)      
+    float startDistance = dot(planeNormal, planeOrigin - startPosObj.xyz);      
+    float stopDistance = dot(planeNormal, planeOrigin - stopPosObj.xyz);      
+    bool startClipped = startDistance > 0.0;      
+    bool stopClipped = stopDistance > 0.0;      
+    if (startClipped && stopClipped)      
+    {      
+      return false;      
+    }      
+      
+    float rayDotNormal = dot(clip_rayDirObj, planeNormal);      
+    bool frontFace = rayDotNormal > 0.0;      
+      
+    // Move the start position further from the eye if needed:      
+    if (frontFace && // Observing from the clipped side (plane's front face)      
+        startDistance > 0.0) // Ray-entry lies on the clipped side.      
+    {      
+      // Scale the point-plane distance to the ray direction and update the      
+      // entry point.      
+      float rayScaledDist = startDistance / rayDotNormal;      
+      startPosObj = vec4(startPosObj.xyz + rayScaledDist * clip_rayDirObj, 1.0);      
+      vec4 newStartPosTex = clip_objToTexMat * vec4(startPosObj.xyz, 1.0);      
+      newStartPosTex /= newStartPosTex.w;      
+      startPosTex = newStartPosTex.xyz;      
+      startPosTex += g_rayJitter;      
+    }      
+      
+    // Move the end position closer to the eye if needed:      
+    if (!frontFace && // Observing from the unclipped side (plane's back face)      
+        stopDistance > 0.0) // Ray-entry lies on the unclipped side.      
+    {      
+      // Scale the point-plane distance to the ray direction and update the      
+      // termination point.      
+      float rayScaledDist = stopDistance / rayDotNormal;      
+      stopPosObj = vec4(stopPosObj.xyz + rayScaledDist * clip_rayDirObj, 1.0);      
+      vec4 newStopPosTex = clip_objToTexMat * vec4(stopPosObj.xyz, 1.0);      
+      newStopPosTex /= newStopPosTex.w;      
+      stopPosTex = newStopPosTex.xyz;      
+    }      
+  }      
+      
+  if (any(greaterThan(startPosTex, in_texMax[0])) ||      
+      any(lessThan(startPosTex, in_texMin[0])))      
+  {      
+    return false;      
+  }      
+      
+  return true;      
+}      
+
+
+#define EPSILON 0.001
+
+// Computes the intersection between a ray and a box
+// The box should be axis aligned so we only give two arguments
+struct Hit
+{
+  float tmin;
+  float tmax;
+};
+
+struct Ray
+{
+  vec3 origin;
+  vec3 dir;
+  vec3 invDir;
+};
+
+bool BBoxIntersect(const vec3 boxMin, const vec3 boxMax, const Ray r, out Hit hit)
+{
+  vec3 tbot = r.invDir * (boxMin - r.origin);
+  vec3 ttop = r.invDir * (boxMax - r.origin);
+  vec3 tmin = min(ttop, tbot);
+  vec3 tmax = max(ttop, tbot);
+  vec2 t = max(tmin.xx, tmin.yz);
+  float t0 = max(t.x, t.y);
+  t = min(tmax.xx, tmax.yz);
+  float t1 = min(t.x, t.y);
+  hit.tmin = t0;
+  hit.tmax = t1;
+  return t1 > max(t0, 0.0);
+}
+
+// As BBoxIntersect requires the inverse of the ray coords,
+// this function is used to avoid numerical issues
+void safe_0_vector(inout Ray ray)
+{
+  if(abs(ray.dir.x) < EPSILON) ray.dir.x = sign(ray.dir.x) * EPSILON;
+  if(abs(ray.dir.y) < EPSILON) ray.dir.y = sign(ray.dir.y) * EPSILON;
+  if(abs(ray.dir.z) < EPSILON) ray.dir.z = sign(ray.dir.z) * EPSILON;
+}
+
+// the phase function should be normalized to 4pi for compatibility with surface rendering
+//VTK::PhaseFunction::Dec
+
+uniform sampler2D in_colorTransferFunc_0[1];
+
+
+
+
+
+
+
+
+//VTK::GradientCache::Dec
+
+//VTK::Transfer2D::Dec
+
+
+
+uniform sampler2D in_opacityTransferFunc_0[1];
+        
+float computeOpacity(vec4 scalar)        
+{        
+  return texture2D(in_opacityTransferFunc_0[0], vec2(scalar.w, 0)).r;        
+}
+
+//VTK::ComputeRGBA2DWithGradient::Dec
+
+vec4 computeGradient(in vec3 texPos, in int c, in sampler3D volume, in int index)
+{
+  return vec4(0.0);
+}
+
+
+//VTK::ComputeDensityGradient::Dec
+
+//VTK::ComputeVolumetricShadow::Dec
+
+      
+vec4 computeLighting(vec4 color, int component, float label)      
+{      
+  vec4 finalColor = vec4(0.0);
+
+  int lightingComponent=component;
+
+  finalColor = vec4(color.rgb, 0.0);      
+  finalColor.a = color.a;      
+  //VTK::ComputeLighting::Exit      
+  return finalColor;      
+  }
+
+          
+vec4 computeColor(vec4 scalar, float opacity)          
+  {          
+  return clamp(computeLighting(vec4(texture2D(in_colorTransferFunc_0[0],          
+                         vec2(scalar.w, 0.0)).xyz, opacity), 0, 0.0), 0.0, 1.0);          
+  }
+
+        
+vec3 computeRayDirection()        
+  {        
+  return normalize(ip_vertexPos.xyz - in_eyePosObjs[0].xyz);        
+  }
+
+//VTK::Picking::Dec
+
+//VTK::RenderToImage::Dec
+
+//VTK::DepthPeeling::Dec
+
+uniform float in_scale;
+uniform float in_bias;
+
+//////////////////////////////////////////////////////////////////////////////
+///
+/// Helper functions
+///
+//////////////////////////////////////////////////////////////////////////////
+
+/**
+ * Transform window coordinate to NDC.
+ */
+vec4 WindowToNDC(const float xCoord, const float yCoord, const float zCoord)
+{
+  vec4 NDCCoord = vec4(0.0, 0.0, 0.0, 1.0);
+
+  NDCCoord.x = (xCoord - in_windowLowerLeftCorner.x) * 2.0 *
+    in_inverseWindowSize.x - 1.0;
+  NDCCoord.y = (yCoord - in_windowLowerLeftCorner.y) * 2.0 *
+    in_inverseWindowSize.y - 1.0;
+  NDCCoord.z = (2.0 * zCoord - (gl_DepthRange.near + gl_DepthRange.far)) /
+    gl_DepthRange.diff;
+
+  return NDCCoord;
+}
+
+/**
+ * Transform NDC coordinate to window coordinates.
+ */
+vec4 NDCToWindow(const float xNDC, const float yNDC, const float zNDC)
+{
+  vec4 WinCoord = vec4(0.0, 0.0, 0.0, 1.0);
+
+  WinCoord.x = (xNDC + 1.f) / (2.f * in_inverseWindowSize.x) +
+    in_windowLowerLeftCorner.x;
+  WinCoord.y = (yNDC + 1.f) / (2.f * in_inverseWindowSize.y) +
+    in_windowLowerLeftCorner.y;
+  WinCoord.z = (zNDC * gl_DepthRange.diff +
+    (gl_DepthRange.near + gl_DepthRange.far)) / 2.f;
+
+  return WinCoord;
+}
+
+/**
+ * Clamps the texture coordinate vector @a pos to a new position in the set
+ * { start + i * step }, where i is an integer. If @a ceiling
+ * is true, the sample located further in the direction of @a step is used,
+ * otherwise the sample location closer to the eye is used.
+ * This function assumes both start and pos already have jittering applied.
+ */
+vec3 ClampToSampleLocation(vec3 start, vec3 step, vec3 pos, bool ceiling)
+{
+  vec3 offset = pos - start;
+  float stepLength = length(step);
+
+  // Scalar projection of offset on step:
+  float dist = dot(offset, step / stepLength);
+  if (dist < 0.) // Don't move before the start position:
+  {
+    return start;
+  }
+
+  // Number of steps
+  float steps = dist / stepLength;
+
+  // If we're reeaaaaallly close, just round -- it's likely just numerical noise
+  // and the value should be considered exact.
+  if (abs(mod(steps, 1.)) > 1e-5)
+  {
+    if (ceiling)
+    {
+      steps = ceil(steps);
+    }
+    else
+    {
+      steps = floor(steps);
+    }
+  }
+  else
+  {
+    steps = floor(steps + 0.5);
+  }
+
+  return start + steps * step;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+///
+/// Ray-casting
+///
+//////////////////////////////////////////////////////////////////////////////
+
+/**
+ * Global initialization. This method should only be called once per shader
+ * invocation regardless of whether castRay() is called several times (e.g.
+ * vtkDualDepthPeelingPass). Any castRay() specific initialization should be
+ * placed within that function.
+ */
+void initializeRayCast()
+{
+  /// Initialize g_fragColor (output) to 0
+  g_fragColor = vec4(0.0);
+  g_dirStep = vec3(0.0);
+  g_srcColor = vec4(0.0);
+  g_exit = false;
+
+          
+  // Get the 3D texture coordinates for lookup into the in_volume dataset        
+  g_rayOrigin = ip_textureCoords.xyz;
+      
+  // Getting the ray marching direction (in dataset space)      
+  vec3 rayDir = computeRayDirection();      
+      
+  // 2D Texture fragment coordinates [0,1] from fragment coordinates.      
+  // The frame buffer texture has the size of the plain buffer but       
+  // we use a fraction of it. The texture coordinate is less than 1 if      
+  // the reduction factor is less than 1.      
+  // Device coordinates are between -1 and 1. We need texture      
+  // coordinates between 0 and 1. The in_depthSampler      
+  // buffer has the original size buffer.      
+  vec2 fragTexCoord = (gl_FragCoord.xy - in_windowLowerLeftCorner) *      
+                      in_inverseWindowSize;      
+      
+  // Multiply the raymarching direction with the step size to get the      
+  // sub-step size we need to take at each raymarching step      
+  g_dirStep = (ip_inverseTextureDataAdjusted *      
+              vec4(rayDir, 0.0)).xyz * in_sampleDistance;      
+  g_lengthStep = length(g_dirStep);      
+          
+ float jitterValue = 0.0;          
+          
+    jitterValue = texture2D(in_noiseSampler, gl_FragCoord.xy /                                              vec2(textureSize(in_noiseSampler, 0))).x;          
+    g_rayJitter = g_dirStep * jitterValue;          
+        
+  g_rayOrigin += g_rayJitter;        
+      
+  // Flag to determine if voxel should be considered for the rendering      
+  g_skip = false;
+
+  
+
+        
+  // Flag to indicate if the raymarch loop should terminate       
+  bool stop = false;      
+      
+  g_terminatePointMax = 0.0;      
+      
+  vec4 l_depthValue = texture2D(in_depthSampler, fragTexCoord);      
+  // Depth test      
+  if(gl_FragCoord.z >= l_depthValue.x)      
+    {      
+    discard;      
+    }      
+      
+  // color buffer or max scalar buffer have a reduced size.      
+  fragTexCoord = (gl_FragCoord.xy - in_windowLowerLeftCorner) *      
+                 in_inverseOriginalWindowSize;      
+      
+  // Compute max number of iterations it will take before we hit      
+  // the termination point      
+      
+  // Abscissa of the point on the depth buffer along the ray.      
+  // point in texture coordinates      
+  vec4 rayTermination = WindowToNDC(gl_FragCoord.x, gl_FragCoord.y, l_depthValue.x);      
+      
+  // From normalized device coordinates to eye coordinates.      
+  // in_projectionMatrix is inversed because of way VT      
+  // From eye coordinates to texture coordinates      
+  rayTermination = ip_inverseTextureDataAdjusted *      
+                    in_inverseVolumeMatrix[0] *      
+                    in_inverseModelViewMatrix *      
+                    in_inverseProjectionMatrix *      
+                    rayTermination;      
+  g_rayTermination = rayTermination.xyz / rayTermination.w;      
+      
+  // Setup the current segment:      
+  g_dataPos = g_rayOrigin;      
+  g_terminatePos = g_rayTermination;      
+      
+  g_terminatePointMax = length(g_terminatePos.xyz - g_dataPos.xyz) /      
+                        length(g_dirStep);      
+  g_currentT = 0.0;
+
+          
+  vec4 tempClip = in_volumeMatrix[0] * vec4(rayDir, 0.0);        
+  if (tempClip.w != 0.0)        
+  {        
+    tempClip = tempClip/tempClip.w;        
+    tempClip.w = 1.0;        
+  }        
+  clip_rayDirObj = normalize(tempClip.xyz);      
+  clip_numPlanes = int(in_clippingPlanes[0]);      
+  clip_texToObjMat = in_volumeMatrix[0] * inverse(ip_inverseTextureDataAdjusted);      
+  clip_objToTexMat = ip_inverseTextureDataAdjusted * in_inverseVolumeMatrix[0];      
+      
+  // Adjust for clipping.      
+  if (!AdjustSampleRangeForClipping(g_rayOrigin, g_rayTermination))      
+  { // entire ray is clipped.      
+    discard;      
+  }      
+      
+  // Update the segment post-clip:      
+  g_dataPos = g_rayOrigin;      
+  g_terminatePos = g_rayTermination;      
+  g_terminatePointMax = length(g_terminatePos.xyz - g_dataPos.xyz) /      
+                        length(g_dirStep);      
+
+
+  //VTK::RenderToImage::Init
+
+  //VTK::DepthPass::Init
+
+  //VTK::Matrices::Init
+
+  g_jitterValue = jitterValue;
+}
+
+/**
+ * March along the ray direction sampling the volume texture.  This function
+ * takes a start and end point as arguments but it is up to the specific render
+ * pass implementation to use these values (e.g. vtkDualDepthPeelingPass). The
+ * mapper does not use these values by default, instead it uses the number of
+ * steps defined by g_terminatePointMax.
+ */
+vec4 castRay(const float zStart, const float zEnd)
+{
+  //VTK::DepthPeeling::Ray::Init
+
+  
+
+  //VTK::DepthPeeling::Ray::PathCheck
+
+  
+
+  /// For all samples along the ray
+  while (!g_exit)
+  {
+          
+    g_skip = false;
+
+    
+
+    
+
+    
+
+    //VTK::PreComputeGradients::Impl
+
+          
+    if (!g_skip)      
+      {      
+      vec4 scalar;      
+      
+      scalar = texture3D(in_volume[0], g_dataPos);      
+        
+      scalar.r = scalar.r * in_volume_scale[0].r + in_volume_bias[0].r;        
+      scalar = vec4(scalar.r);               
+      g_srcColor = vec4(0.0);               
+      g_srcColor.a = computeOpacity(scalar);               
+      if (g_srcColor.a > 0.0)               
+        {               
+        g_srcColor = computeColor(scalar, g_srcColor.a);           
+        // Opacity calculation using compositing:           
+        // Here we use front to back compositing scheme whereby           
+        // the current sample value is multiplied to the           
+        // currently accumulated alpha and then this product           
+        // is subtracted from the sample value to get the           
+        // alpha from the previous steps. Next, this alpha is           
+        // multiplied with the current sample colour           
+        // and accumulated to the composited colour. The alpha           
+        // value from the previous steps is then accumulated           
+        // to the composited colour alpha.           
+        g_srcColor.rgb *= g_srcColor.a;           
+        g_fragColor = (1.0f - g_fragColor.a) * g_srcColor + g_fragColor;               
+        }      
+      }
+
+    //VTK::RenderToImage::Impl
+
+    //VTK::DepthPass::Impl
+
+    /// Advance ray
+    g_dataPos += g_dirStep;
+
+          
+    if(any(greaterThan(max(g_dirStep, vec3(0.0))*(g_dataPos - in_texMax[0]),vec3(0.0))) ||      
+      any(greaterThan(min(g_dirStep, vec3(0.0))*(g_dataPos - in_texMin[0]),vec3(0.0))))      
+      {      
+      break;      
+      }      
+      
+    // Early ray termination      
+    // if the currently composited colour alpha is already fully saturated      
+    // we terminated the loop or if we have hit an obstacle in the      
+    // direction of they ray (using depth buffer) we terminate as well.      
+    if((g_fragColor.a > g_opacityThreshold) ||       
+       g_currentT >= g_terminatePointMax)      
+      {      
+      break;      
+      }      
+    ++g_currentT;
+  }
+
+  
+
+  return g_fragColor;
+}
+
+/**
+ * Finalize specific modes and set output data.
+ */
+void finalizeRayCast()
+{
+  
+
+  
+
+  
+
+  
+
+  //VTK::Picking::Exit
+
+  g_fragColor.r = g_fragColor.r * in_scale + in_bias * g_fragColor.a;
+  g_fragColor.g = g_fragColor.g * in_scale + in_bias * g_fragColor.a;
+  g_fragColor.b = g_fragColor.b * in_scale + in_bias * g_fragColor.a;
+  gl_FragData[0] = g_fragColor;
+
+  //VTK::RenderToImage::Exit
+
+  //VTK::DepthPass::Exit
+}
+
+//////////////////////////////////////////////////////////////////////////////
+///
+/// Main
+///
+//////////////////////////////////////////////////////////////////////////////
+void main()
+{
+      
+  initializeRayCast();    
+  castRay(-1.0, -1.0);    
+  finalizeRayCast();
+}

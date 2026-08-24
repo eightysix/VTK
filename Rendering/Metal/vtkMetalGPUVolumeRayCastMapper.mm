@@ -1460,8 +1460,14 @@ static bool VolumeRayBinnedWanted()
 
 // §38.6 compute-march probes (TEMP-DIAG): dispatch floor + forced march
 // length + threadgroup shape. All default-off / no-op.
-// Must match the MSL layout exactly: struct ComputeMarchControl { uint; uint; uint; }.
-struct ComputeMarchControl { uint32_t floorMode; uint32_t stepCap; uint32_t synthMode; };
+// Must match the MSL layout exactly: struct ComputeMarchControl { uint x4 }.
+struct ComputeMarchControl
+{
+  uint32_t floorMode;
+  uint32_t stepCap;
+  uint32_t synthMode;
+  uint32_t batchOverride;
+};
 static bool VolumeComputeMarchFloor()
 {
   return getenv("VTK_METAL_TEST_CM_FLOOR") != nullptr;
@@ -1478,6 +1484,15 @@ static bool VolumeComputeMarchSynth()
 static int VolumeComputeMarchStepCap()
 {
   if (const char* v = getenv("VTK_METAL_TEST_CM_FSTEPS"))
+    return std::atoi(v);
+  return 0;
+}
+
+// TEMP-DIAG: compute-only unroll-batch override (register-pressure probe;
+// fragment ladder keeps its own MaxBatchWidth).
+static int VolumeComputeMarchBatch()
+{
+  if (const char* v = getenv("VTK_METAL_TEST_CM_BATCH"))
     return std::atoi(v);
   return 0;
 }
@@ -8074,6 +8089,12 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateComputeMarchPipeline(
   key.sampleCount = 1;
   key.featureMask = featureMask;
   key.featureMaskExtra = this->VolumeTextureAxisDepth;
+  // fc_cmBatch specialization (register-pressure diet): bake the env value
+  // into the cache key so each width compiles its own PSO.
+  int cmBatchFcKey = 0;
+  if (const char* v = getenv("VTK_METAL_TEST_CM_BATCH"))
+    cmBatchFcKey = std::max(0, std::min(48, std::atoi(v)));
+  key.sampleCount = static_cast<uint32_t>(cmBatchFcKey) + 1;
 
   auto& cache = binned ? this->ComputeMarchBinnedPipelineCache : this->ComputeMarchPipelineCache;
   auto it = cache.find(key);
@@ -8139,6 +8160,13 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateComputeMarchPipeline(
     (featureMask & VolumeFeature_MarchVariantMask) >> VolumeFeature_MarchVariantShift;
   [constants setConstantValue:&marchVariant type:MTLDataTypeInt
                      withName:@"fc_marchVariant"];
+
+  // §38.10: compile-time compute-march ladder width (0 = runtime-driven).
+  int cmBatchFc = 0;
+  if (const char* v = getenv("VTK_METAL_TEST_CM_BATCH"))
+    cmBatchFc = std::max(0, std::min(48, std::atoi(v)));
+  [constants setConstantValue:&cmBatchFc type:MTLDataTypeInt
+                     withName:@"fc_cmBatch"];
 
   int slabMode = (featureMask & VolumeFeature_Slab) ? 1 : 0;
   [constants setConstantValue:&slabMode type:MTLDataTypeInt withName:@"fc_slabMode"];
@@ -8207,6 +8235,13 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateComputeMarchPipeline(
                   << [[err localizedDescription] UTF8String]);
     return nullptr;
   }
+
+  // TEMP-DIAG §38.10: occupancy stats (register pressure shows up as a low
+  // maxTotalThreadsPerThreadgroup vs the ~1024 a trivial kernel gets).
+  fprintf(stderr, "[cmpso] %s binned=%d: maxThreadsPerTG=%lu execWidth=%lu\n",
+    [funcName UTF8String], (int)binned,
+    (unsigned long)cps.maxTotalThreadsPerThreadgroup,
+    (unsigned long)cps.threadExecutionWidth);
 
   void* res = (__bridge void*)cps;
   cache[key] = res;
@@ -10478,15 +10513,30 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
             [marchEnc setBytes:&lightUniforms length:sizeof(lightUniforms) atIndex:4];
 
             ComputeMarchControl cmc{ VolumeComputeMarchFloor() ? 1u : 0u,
-                                     static_cast<uint32_t>(VolumeComputeMarchStepCap()) };
+                                     static_cast<uint32_t>(VolumeComputeMarchStepCap()),
+                                     0u,
+                                     static_cast<uint32_t>(VolumeComputeMarchBatch()) };
             [marchEnc setBytes:&cmc length:sizeof(cmc) atIndex:7];
             for (uint32_t bIdx = 0; bIdx < numBins; ++bIdx)
             {
               uint32_t binnedMeta[2] = { binCap, bIdx * binCap };
               [marchEnc setBytes:&binnedMeta length:sizeof(binnedMeta) atIndex:6];
 
-              MTLSize tg = MTLSizeMake(32, 1, 1);
-              MTLSize groups = MTLSizeMake((binCap + 31) / 32, 1, 1);
+              // TEMP-DIAG: TG width for the flat binned dispatch. Default 64
+              // (8x8-equivalent); 32x1 reproduced the §38.8 occupancy-cliff
+              // class on first healthy measurement (44 vs 18 ms obl).
+              int binTgW = 64;
+              if (const char* v = getenv("VTK_METAL_TEST_CM_BIN_TG"))
+              {
+                int n = atoi(v);
+                if (n >= 32 && n <= 1024 &&
+                    (n & (n - 1)) == 0)
+                {
+                  binTgW = n;
+                }
+              }
+              MTLSize tg = MTLSizeMake(binTgW, 1, 1);
+              MTLSize groups = MTLSizeMake((binCap + binTgW - 1) / binTgW, 1, 1);
               [marchEnc dispatchThreadgroups:groups threadsPerThreadgroup:tg];
             }
             [marchEnc endEncoding];
@@ -10524,7 +10574,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
             ComputeMarchControl cmc{ VolumeComputeMarchFloor() ? 1u : 0u,
                                      static_cast<uint32_t>(VolumeComputeMarchStepCap()),
-                                     VolumeComputeMarchSynth() ? 1u : 0u };
+                                     VolumeComputeMarchSynth() ? 1u : 0u,
+                                     static_cast<uint32_t>(VolumeComputeMarchBatch()) };
             [marchEnc setBytes:&cmc length:sizeof(cmc) atIndex:7];
             // Scene-depth early-out source for CM_SYNTH (setupVolumeRay).
             [marchEnc setTexture:(__bridge id<MTLTexture>)(this->DepthTextureOcclusion

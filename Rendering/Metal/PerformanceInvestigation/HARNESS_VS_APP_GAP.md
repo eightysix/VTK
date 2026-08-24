@@ -4287,6 +4287,140 @@ Expected: unjittered mean|d|=0.000 (0.0008% px >1LSB vs fragment arm);
 jittered matched-field mean|d|<=0.08 (better than the historical GL↔Metal
 residual class).
 
+### 38.10 COMPUTE MARCHER WINS: register-pressure root cause found and fixed
+— fc-specialized ladder width flips ALL 12 production cells (2026-08-24
+late night, same session as §38.9)
+
+Proceeding from the §38.9.4 handoff on the healthy machine. This section
+SUPERSEDES §38.9.3/§38.9.4's verdicts. Environment: AC power, charged,
+anchor gate PASS (frag obl 15.78/15.79, axz 35.03/35.10 — within ±0.6% of
+the post-reboot refs); all runs frames=100 warmup=20 @2048² SD4 jittered c32
+unless noted; ABBA order-alternated.
+
+#### 38.10.1 Null results first (all cheap knobs exhausted)
+
+1. TG-shape sweep on the LOSING views (never swept there before;
+   CM_TG ∈ {default, 4x4, 8x8, 16x8, 8x16, 32x2, 2x32}): all within noise
+   (best az135 8x16 −3.4%, still losing). Shape does not flip cells.
+2. RAY_BINNED fair test (first healthy measurement): CATASTROPHIC —
+   obl 44.3 / axz 77.1 / az135 37.7 vs plain atlas 18.2/37.5/15.6.
+   Not a TG artifact (new CM_BIN_TG knob {64,128,256} all ~2.1-2.5x worse
+   than atlas). **CM_BIN_TG=512 TRAP**: reads an impossible 4.67 ms obl —
+   parity capture showed error 16273 (march never ran): 512 threads exceeds
+   maxTotalThreadsPerThreadgroup for this PSO and the dispatch silently
+   no-ops. ALWAYS parity-check any "too good to be true" compute timing.
+   Verdict: binning refuted — index indirection + scatter + 4×binCap
+   dead-thread dispatch costs multiples of any length-divergence saving,
+   and divergence is not this marcher's binding constraint (see 38.10.2).
+3. Queue-wait bubble hypothesis refuted: synth via private queue +
+   commit/waitUntilCompleted vs window commandBuffer (CM_QUEUEPROBE=0):
+   ±0.2 ms noise across obl/axz/az135.
+
+#### 38.10.2 The deficit relocated: synthesis free, dependency small,
+MARCH BODY carries everything
+
+Healthy-machine decomposition @2048 obl:
+
+| probe | ms |
+|---|---|
+| frame + Phase3b blit (setup-only floor) | 0.89 |
+| atlas raster + render→compute dependency | 0.95 |
+| synth setup-only (full synthesis, zero-write) | **0.89 (= floor)** |
+
+The §38.8-era "+7.4 ms atlas dependency" and "synthesis ALU ≈5%/sample"
+claims were poisoned-window/cross-mode artifacts. Synthesis costs nothing
+measurable. Even the varyings-fed atlas march (identical inputs to
+fragment!) trails fragment marching by ~1 ms — the deficit is INSIDE the
+march body, and it is not occupancy-shape-sensitive (probe 1), not
+divergence-sensitive (probe 2), not sync-sensitive (probe 3).
+
+#### 38.10.3 ROOT CAUSE: register pressure from the worst-case unrolled ladder
+
+`[cmpso]` PSO diagnostic (TEMP-DIAG in GetOrCreateComputeMarchPipeline):
+`volume_compute_march` reports **maxTotalThreadsPerThreadgroup = 384**
+(execWidth 32) vs ~1024 for trivial kernels — heavy static register
+allocation caps occupancy at ~37%. Key insight: because batchCap arrives
+via a runtime buffer, the compiler must allocate registers for the full
+32-wide fetch/composite ladder REGARDLESS of runtime value — a runtime
+override cannot shed registers (verified: no change). Fix: compile-time
+specialization.
+
+Landed (TEMP-DIAG, default-inert):
+- `fc_cmBatch [[function_constant(39)]]` in MetalShaders.metal; when >0 it
+  replaces the runtime batch width in all three march kernels and lets the
+  compiler eliminate dead ladder rungs.
+- Mapper: `VTK_METAL_TEST_CM_BATCH=<n>` sets the FC; value baked into the
+  PSO cache key (sampleCount field reuse) so each width compiles its own
+  pipeline; `ComputeMarchControl.batchOverride` (+1 field) remains as the
+  runtime fallback probe. fc_cmBatch=0 → byte-identical legacy behavior.
+- Occupancy response confirmed: B=0→384, B=16→576, B=8→640 threads/TG.
+
+Perf dose-response (@2048 synth): obl 18.01 / 14.94 / 14.98 / 15.47 /
+15.28 and axz 39.41 / 29.41 / **29.40** / 32.77 / 32.88 for
+B = {0, 24, 16, 12, 8}. Sweet spot 16-24; B=12/8 overshoot (ladder
+re-entry overhead overtakes occupancy gain). B16 ≡ B24 byte-identical.
+
+Mechanism of the win, and why fragment cannot host it: narrower compile-
+time ladders re-enter the mm-preamble more often (more leap opportunities)
+and check exits more frequently, while the freed registers raise thread-
+level parallelism ~50-67%. Fragment mv9 keeps MaxBatchWidth=32 at runtime
+(§37.24 swept ladder widths for the FS and 32 won THERE — different
+register/scheduling regime); the FS has no mechanism to specialize this
+per-dispatch without PSO explosion.
+
+Parity (compute-B16 vs mv9-Metal, 512² Airways): unjittered AND jittered
+mean|d|=0.023, max Δ84, 0.56%/0.52% px >1LSB — the ±1-step-class drift
+expected from checkpoint-frequency changes; well inside the historical
+GL↔Metal residual class (mean 0.064, max 122, 9.5% px) that production
+already tolerates across backends. Deterministic (B16≡B24 exactly).
+
+#### 38.10.4 THE FLIPPED TABLE — compute wins every cell
+
+frames=100 warmup=20, interleaved ABBA, spreads ≤0.75 ms:
+
+| view | 2048 frag | 2048 synth-B16 | Δ | 1024 frag | 1024 synth-B16 | Δ |
+|---|---|---|---|---|---|---|
+| obl | 15.75 | 14.95 | **−5.1%** | 9.22 | 8.85 | **−4.0%** |
+| az45 | 16.88 | 14.64 | **−13.3%** | 11.67 | 9.53 | **−18.4%** |
+| az135 | 13.70 | 12.66 | **−7.6%** | 7.31 | 7.06 | **−3.4%** |
+| axis-x | 28.09 | 22.24 | **−20.8%** | 13.76 | 10.12 | **−26.5%** |
+| axis-y | 25.06 | 19.83 | **−20.9%** | 7.98 | 7.19 | **−10.0%** |
+| axis-z | 35.03 | 29.54 | **−15.7%** | 11.36 | 10.33 | **−9.1%** |
+
+Robustness (SD sweeps, obl+axz, ABBA): SD2.5 −9.0%/−17.1%; SD0.5
+−13.1%/−13.9%. Compute-synth-B16 wins EVERY view × resolution × sampling
+density measured (18/18 cells).
+
+Verdict: the §36.4 Design B premise is realized. Recommended config:
+`VTK_METAL_TEST_COMPUTE_MARCH=1 VTK_METAL_TEST_CM_SYNTH=1
+VTK_METAL_TEST_CM_BATCH=16`. Remaining before any production landing:
+TEMP-DIAG revert-before-landing pass (§25.7 list incl. new [cmpso]/[cmqueue]
+prints), default-off policy decision, blend-mode/mask/slab coverage beyond
+the bench composite config, and a clean-boot re-validation batch.
+
+#### 38.10.5 Reproduction
+
+```sh
+./macos_metal_build.sh --resume
+# anchors (must be ±3% of 15.8/35.1 @2048):
+eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 \
+  VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 \
+  VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1 \
+  build_macos_metal/bin/vtkMetalGLVisualComparison --bench --backend metal \
+  --scene DICOMVolume --dicom /Users/macair/Public/IMR/CTIMR/IMRToraceAddome \
+  --frames 100 --reps 1 --size 2048x2048 --warmup 20" | grep '^DICOMVolume'
+# compute arm: add VTK_METAL_TEST_COMPUTE_MARCH=1 VTK_METAL_TEST_CM_SYNTH=1 \
+#              VTK_METAL_TEST_CM_BATCH=16
+# PSO stats: grep '\[cmpso\]' stderr -> expect maxThreadsPerTG=576 @B16
+```
+
+Tree additions this section: `fc_cmBatch` FC(39) + `ComputeMarchControl.
+batchOverride` (mapper+MSL structs now 4×uint), `VTK_METAL_TEST_CM_BATCH`,
+`VTK_METAL_TEST_CM_BIN_TG`, `[cmpso]` PSO-stats print. Logs:
+/tmp/cm_matrix2/results.txt (flipped table raw), /tmp/opencode/cm*.zsh
+(gate/tgsweep/binned/bintg/decomp/qwait/batch/finalmatrix/sd generators),
+/tmp/cmbp/* (parity captures).
+
 Tree state after this session: `VTK_METAL_TEST_EXIT_THETA` knob landed
 (default-OFF, byte-inert); VOLTRANSPOSE policy comments updated with the
 §38.3 matrix; everything else reverted clean (byte-parity verified). New

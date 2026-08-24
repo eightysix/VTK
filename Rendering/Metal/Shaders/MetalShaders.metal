@@ -2788,6 +2788,14 @@ constant bool fc_segHop [[function_constant(37)]];
 // (Airways II tops at 0.25/sample, doc §35.4) whose rays never latch.
 constant bool fc_exitTheta [[function_constant(38)]];
 
+// §38.10 compute-march unroll-batch specialization (VTK_METAL_TEST_CM_BATCH):
+// compile-time ladder width for marchRayFromAtlasCore. Unlike the runtime
+// batchOverride probe, a function constant lets the compiler eliminate dead
+// rungs of the 48-wide fetch/composite ladder, shrinking register allocation
+// (occupancy) — the FS path keeps its own runtime MaxBatchWidth.
+// 0 = unset -> fall back to the uniform-driven runtime value.
+constant int fc_cmBatch [[function_constant(39)]];
+
 // Map an original-orientation sample position into texture space for the live
 // transposed representation (no-op when clear).
 inline float3 volumeFetchSwizzle(float3 pos) {
@@ -8131,7 +8139,8 @@ inline half4 marchRayFromAtlasCore(
     texture3d<float> normalTexture,
     texture3d<float> blankingTexture,
     constant packed_float3* rectCoords,
-    constant VolumeLightUniforms* lightUniforms)
+    constant VolumeLightUniforms* lightUniforms,
+    int batchCapIn)
 {
   const bool doShading = fc_shading;
   const bool doGradOp = fc_gradientOpacity;
@@ -8211,7 +8220,7 @@ inline half4 marchRayFromAtlasCore(
   bool seenInBounds = false;
   int i = 0;
   const int steps = maxSteps;
-  const int batchCap = max(1, int(volumeUniforms.maxBatchWidth));
+  const int batchCap = batchCapIn;
 
 #define MV9_C_FETCH(_j) \
   float s##_j = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * (float)_j);
@@ -8456,7 +8465,14 @@ inline half4 marchRayFromAtlasCore(
 // synthMode rebuilds the atlas planes in-kernel from uniforms + analytic
 // ray-box entry (CM_SYNTH) — removes the render->compute atlas dependency,
 // which measured as the dominant cost (~7.4 ms @1024² of ~8.6 total).
-struct ComputeMarchControl { uint floorMode; uint stepCap; uint synthMode; };
+struct ComputeMarchControl {
+  uint floorMode; uint stepCap; uint synthMode;
+  // TEMP-DIAG: if nonzero, overrides volumeUniforms.maxBatchWidth for THIS
+  // dispatch only (register-pressure/occupancy probe; fragment unaffected).
+  // Accumulation order is unchanged (sequential over j); only checkpoint
+  // frequency of the exit tests changes => <=1LSB-class output drift.
+  uint batchOverride;
+};
 
 struct SynthRay {
   float3 evalPoint;
@@ -8612,6 +8628,11 @@ kernel void volume_compute_march(
       return;
     }
     steps = min(max(so.steps, 0), cmc.stepCap ? (int)cmc.stepCap : (1 << 20));
+    const int effBatch =
+      (fc_cmBatch > 0) ? fc_cmBatch
+        : (cmc.batchOverride >= 1 && cmc.batchOverride <= 48)
+          ? int(cmc.batchOverride)
+          : max(1, int(volumeUniforms.maxBatchWidth));
     half4 color = marchRayFromAtlasCore(so.evalPoint, steps, so.evalStep,
         so.stepSize, so.rayDir, so.tTerminateMax,
         volumeUniforms, b, volumeTexture, transferFunctionTexture,
@@ -8619,7 +8640,7 @@ kernel void volume_compute_march(
         transferFunction2DTexture, transfer2DYAxisTexture,
         gradientOpacityTexture, maskTexture, labelMapTransferTexture,
         minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, normalTexture, blankingTexture,
-        rectCoords, &volumeLights);
+        rectCoords, &volumeLights, effBatch);
     outColorTexture.write(color, gid);
     return;
   }
@@ -8636,6 +8657,11 @@ kernel void volume_compute_march(
     outColorTexture.write(half4(0.0h), gid);
     return;
   }
+  const int effBatch =
+    (fc_cmBatch > 0) ? fc_cmBatch
+      : (cmc.batchOverride >= 1 && cmc.batchOverride <= 48)
+        ? int(cmc.batchOverride)
+        : max(1, int(volumeUniforms.maxBatchWidth));
 
   half4 color = marchRayFromAtlasCore(A.xyz, steps, B.xyz, B.w, C.xyz, C.w,
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
@@ -8643,7 +8669,7 @@ kernel void volume_compute_march(
       transferFunction2DTexture, transfer2DYAxisTexture,
       gradientOpacityTexture, maskTexture, labelMapTransferTexture,
       minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, normalTexture, blankingTexture,
-      rectCoords, &volumeLights);
+      rectCoords, &volumeLights, effBatch);
 
   outColorTexture.write(color, gid);
 }
@@ -8725,6 +8751,11 @@ kernel void volume_compute_march_binned(
   if (cmc.floorMode) return;
   int steps = min(max(int(A.w), 0), cmc.stepCap ? (int)cmc.stepCap : (1 << 20));
   if (steps <= 0) return;
+  const int effBatch =
+    (fc_cmBatch > 0) ? fc_cmBatch
+      : (cmc.batchOverride >= 1 && cmc.batchOverride <= 48)
+        ? int(cmc.batchOverride)
+        : max(1, int(volumeUniforms.maxBatchWidth));
 
   half4 color = marchRayFromAtlasCore(A.xyz, steps, B.xyz, B.w, C.xyz, C.w,
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
@@ -8732,7 +8763,7 @@ kernel void volume_compute_march_binned(
       transferFunction2DTexture, transfer2DYAxisTexture,
       gradientOpacityTexture, maskTexture, labelMapTransferTexture,
       minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, normalTexture, blankingTexture,
-      rectCoords, &volumeLights);
+      rectCoords, &volumeLights, effBatch);
 
   outColorTexture.write(color, uv);
 }
