@@ -3717,6 +3717,56 @@ Conclusions, now airtight:
 Protocol amendment: anchor gates must compare against a FRESH same-session
 baseline of the REFERENCE configuration, never against historical tables.
 
+### 37.22 ROOT CAUSE CONFIRMED BY REBOOT; healthy-state deciding matrix run;
+BS8 stays default on orbit-integrated evidence (2026-08-24 late night)
+
+Cold-state test first refuted the boost-window theory definitively (fully
+cooled first run: z_TRaw 35.44, nowhere near 31). Boot-timeline inspection
+then localized the boundary: yesterday's fast reference numbers AND today's
+slow ones sit on ONE boot (up 13h), with the §37.19 seg-consume GPU wedge
+(~20 min hang at 100%, then kill) exactly between them. REBOOT TEST:
+anchors instantly restored — z_TRaw 30.60/30.51/31.35 (published 31.0),
+z_MM 35.66 (36.3), obl_MM 16.67 (16.6).
+
+**ROOT CAUSE CONFIRMED: killing the wedged command buffer left persistent
+degraded GPU scheduler state — survives process restarts and idle/thermal
+cooldown, invisible to pmset/therm/memory-pressure, cleared only by
+reboot. Inflation was differential by bandwidth sensitivity (raw +16% >
+mm-z +11% > mm-obl +5%).**
+
+NEW PROTOCOL RULE (hard): after ANY GPU wedge/hang/kill, anchors are VOID
+until reboot. Cooldown does not recover them. All within-batch ratios
+measured in a damaged window remain internally valid; nothing absolute
+crosses the boundary.
+
+Healthy-state deciding matrix (§37.20 protocol, frames=60 warmup=10,
+two interleaved rounds, rounds agreed within ±0.5 ms — medians, ms):
+
+| view | TRUE raw | BS8 | BS16 | BS8 Δ | BS16 Δ |
+|---|---|---|---|---|---|
+| z | 30.46 | 35.00 | 32.53 | +14.9% | +6.8% |
+| y | 23.32 | 25.11 | 26.25 | +7.7% | +12.5% |
+| x | 30.28 | 28.09 | 29.27 | −7.2% | −3.3% |
+| obl | 20.57 | 16.14 | 17.38 | −21.5% | −15.5% |
+| az45 | 24.92 | 16.86 | 19.43 | −32.4% | −22.0% |
+| Σ orbit | 129.6 | **121.2** | 124.9 | **−6.4%** | −3.6% |
+
+VERDICTS:
+1. Both prior findings replicate cleanly in healthy state: BS16 halves the
+   axis-z deficit; BS8's oblique/az45 wins are larger. Neither size
+   dominates per-view.
+2. **BS8 stays DEFAULT**: it wins the orbit-integrated metric (−6.4% vs
+   −3.6% over raw; net ~3.6 ms per five-view set). BS16 trades broad
+   oblique/az45 wins for one narrower axis-z deficit — wrong direction
+   for interactive orbits.
+3. BS16 remains the documented axis-chord remedy via
+   VTK_METAL_TEST_MM_BLOCKSIZE=16 for axis-dominant static workloads.
+4. Headline for the record: the acceleration beats TRUE raw across a full
+   orbit in BOTH configurations (−6.4% / −3.6%), on top of the large
+   per-view wins — the blocks feature is net-positive everywhere measured,
+   with a known, bounded, workload-dependent exception on straight axis
+   chords of fragmented volumes.
+
 ### 37.14 Reproduction recipe for all §37 benchmarks
 
 Commits: measurements taken on `1896bf38bd` code (single-tier cap32;
