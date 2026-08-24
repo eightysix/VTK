@@ -8090,11 +8090,15 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateComputeMarchPipeline(
   key.featureMask = featureMask;
   key.featureMaskExtra = this->VolumeTextureAxisDepth;
   // fc_cmBatch specialization (register-pressure diet): bake the env value
-  // into the cache key so each width compiles its own PSO.
+  // into the cache key so each width compiles its own PSO. The stride-split
+  // flag rides in bit 16 (TEMP-DIAG key encoding).
   int cmBatchFcKey = 0;
+  bool cmSplitKey = false;
   if (const char* v = getenv("VTK_METAL_TEST_CM_BATCH"))
     cmBatchFcKey = std::max(0, std::min(48, std::atoi(v)));
-  key.sampleCount = static_cast<uint32_t>(cmBatchFcKey) + 1;
+  cmSplitKey = getenv("VTK_METAL_TEST_CM_SPLIT") != nullptr;
+  key.sampleCount = static_cast<uint32_t>(cmBatchFcKey) + 1 |
+                    (cmSplitKey ? (1u << 16) : 0u);
 
   auto& cache = binned ? this->ComputeMarchBinnedPipelineCache : this->ComputeMarchPipelineCache;
   auto it = cache.find(key);
@@ -8167,6 +8171,11 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateComputeMarchPipeline(
     cmBatchFc = std::max(0, std::min(48, std::atoi(v)));
   [constants setConstantValue:&cmBatchFc type:MTLDataTypeInt
                      withName:@"fc_cmBatch"];
+
+  // §38.12: stride-parity split of the main 32-rung body.
+  BOOL cmSplitFc = getenv("VTK_METAL_TEST_CM_SPLIT") != nullptr ? YES : NO;
+  [constants setConstantValue:&cmSplitFc type:MTLDataTypeBool
+                     withName:@"fc_cmSplit"];
 
   int slabMode = (featureMask & VolumeFeature_Slab) ? 1 : 0;
   [constants setConstantValue:&slabMode type:MTLDataTypeInt withName:@"fc_slabMode"];

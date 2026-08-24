@@ -4525,6 +4525,133 @@ within tolerance class, deterministic. Defaults untouched (all TEMP-DIAG).
 Production landing checklist unchanged from §38.10.4. Anchors re-verified
 at session end via matrix frag arms (15.74-15.75 / 35.01-35.04).
 
+### 38.12 SINGLE-BEST CONFIG DETERMINATION: axis-Y flips the landscape;
+compute's optimal block size differs from fragment's; stride-split verdict
+(2026-08-25)
+
+Goal (user directive): one static best config per engine — NO adaptive
+policies — prioritizing 4096². Protocol: phased scripts, ABBA order-
+alternated within every cell, anchor-gated, /tmp/cm_matrix3.txt raw log.
+CAVEAT: phases ran over ~2h; cross-phase absolute comparisons carry ~±1%
+window drift (observed); all verdicts below rest on within-phase
+interleaved pairs. Parity gates before perf: comp-mm-Y AND comp-raw-Y AND
+comp-mm-BS16-Y renders each match their fragment counterparts at the usual
+mean|d|=0.0235 / 0.52% px >1LSB class — no skip corruption under any
+representation/config combination.
+
+#### 38.12.1 Axis depth (the user's remembered "mv9+y" lead — confirmed,
+now for BOTH engines)
+
+X-vs-Y sweep @j1 mm (means of 2 rounds):
+
+| view | frag-X | frag-Y | comp-X | comp-Y |
+|---|---|---|---|---|
+| **2048** | | | | |
+| obl | 15.72 | 14.95 | 15.05 | 12.28 |
+| az45 | 16.84 | 11.48 | 14.28 | 10.77 |
+| az135 | 13.65 | 14.65 | 12.64 | 11.90 |
+| axx | 27.92 | 22.17 | 22.16 | 19.31 |
+| axy | 25.06 | 25.64 | 19.85 | 21.70 |
+| axz | 35.02 | 31.49 | 29.41 | 28.17 |
+| Σ orbit | 134.21 | 120.38 | 113.39 | 104.13 |
+| **4096** | | | | |
+| obl | 47.28 | 42.37 | 41.17 | 39.73 |
+| az45 | 44.41 | 37.69 | 38.62 | 35.42 |
+| az135 | 43.37 | 40.64 | 38.98 | 38.88 |
+| axx | 97.02 | 79.93 | 79.21 | 69.29 |
+| axy | 92.41 | 92.38 | 70.96 | 79.27 |
+| axz | 127.45 | 114.68 | 106.25 | 104.19 |
+| Σ orbit | 451.94 | 407.69 | 375.19 | 366.78 |
+
+Y wins the orbit for BOTH engines at BOTH resolutions (fragment −10%/−10%,
+compute −8%/−2%); Y loses exactly one view per engine (fragment
+az135/axy small; compute axy +9-12%) — the §38.3 signature, now measured
+for compute too. Note compute-X already beat fragment-Y on most 4096 rows:
+mode choice dominates representation choice.
+
+#### 38.12.2 THE RESOLUTION-DEPENDENT MM CROSSOVER (compute, under Y) —
+and its BS16 rescue
+
+Interleaved mm-vs-raw in compute-Y revealed an inversion that does NOT
+exist under X (§38.11.1: skips worth 31-45% there): block-leap scatter on
+straight chords under Y-rep makes the acceleration a NET LOSS at scale:
+
+| view | 2048 mm | 2048 raw | 4096 mm | 4096 raw |
+|---|---|---|---|---|
+| obl | 12.19 ✅ | 13.39 | 39.01 ❌ | 37.20 |
+| az45 | 10.69 ✅ | 12.16 | 34.98 ✅ | 35.73 |
+| az135 | 11.75 ✅ | 13.26 | 38.22 ❌ | 37.78 |
+| axx | 19.00 ❌ | 18.40 | 68.02 ❌ | 65.03 |
+| axy | 21.37 ✅ | 24.58 | 77.84 ✅ | 89.46 |
+| axz | 27.72 ❌ | 23.70 | 102.58 ❌ | 87.00 |
+| Σ | **102.75 ✅** | 105.49 | 357.65 ❌ | **342.20** |
+
+mm wins @2048 (−2.6%), LOSES @4096 (+4.3%) — at the priority resolution.
+Parity gates prove this is economics, not corruption. Rescue attempt via
+§37.18's mechanism (BS16 halves leap-scatter events):
+MM_BLOCKSIZE=16 in compute-Y fixes most chords AND speeds obliques:
+
+| view | 4096 BS8 | 4096 BS16 | 2048 BS8 | 2048 BS16 |
+|---|---|---|---|---|
+| axz | 102.27 | **89.75** (−12%) | 27.82 | **24.38** |
+| axy | 77.92 | 79.83 (+2.5%) | 21.34 | 22.05 |
+| obl | 39.02 | **36.38** (−7%) | 12.17 | 12.10 |
+| az45 | 34.78 | 34.43 | 10.68 | 10.93 |
+| az135 | 38.22 | **35.65** (−7%) | 11.75 | **11.49** |
+| axx | 68.02 | 68.25 (tie) | 19.00 | 19.04 |
+| Σ | 360.23 | **344.29** | 102.75 | **100.0** |
+
+**Compute orbit winner at BOTH resolutions: mm+BLOCKSIZE16+Y**
+(@4096 −4.6% vs raw, −4.4% vs BS8; @2048 −5.2% vs raw). NOTE: this flips
+§37.22's BS8-default finding for the COMPUTE regime — different engine,
+different representation, different optimum. Fragment under Y keeps BS8
+(its own BS16 test: obl +10%).
+
+#### 38.12.3 FINAL HEAD-TO-HEAD: best-fragment vs best-compute
+
+frag-best = mv9+minmax/blocks(BS8)+axisY; comp-best =
+compute-synth-B16+minmax/blocks(BS16)+axisY. Single interleaved batch:
+
+@2048 j1: obl 14.98→12.10 (−19%), az45 11.39→10.93 (−4%), az135
+14.46→11.49 (−21%), axx 21.99→19.04 (−13%), axy 25.60→22.05 (−14%), axz
+31.03→24.38 (−21%). @4096 j1: obl 41.41→36.38 (−12%), az45 36.95→34.43
+(−7%), az135 39.95→35.65 (−11%), axx 79.89→68.25 (−15%), axy
+92.63→79.83 (−14%), axz 114.68→89.75 (−22%). **Compute wins all 12.**
+
+Jitter dimension (j0 blue-noise off, mm-BS8-era arms @both res): compute
+wins all 24 cells by −4..−17%; j0 helps both engines ~5-12% uniformly
+(config ranking invariant).
+
+Raw (minmax-off) comparison: compute-raw beats fragment-raw everywhere
+measured (@2048 −10..−33%; @4096 spots −10..−15%); fragment-raw never
+beats fragment-mm except its own axz chord cell.
+
+#### 38.12.4 VERDICTS (single static config per mode)
+
+- **FRAGMENT**: `mv9 + MINMAX/ACCEL on + blocks(BS8 default) +
+  VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y` (+cap32). Orbit −10% vs current
+  X-default at both resolutions; only loss class is the known chord cells.
+  Requires flipping VolumeTransposedAxisDepth policy or dataset-class
+  default to make static — NOT flipped yet (user directive).
+- **COMPUTE**: `COMPUTE_MARCH=1 CM_SYNTH=1 CM_BATCH=16 + MINMAX/ACCEL on +
+  MM_BLOCKSIZE=16 + VOLTRANSPOSE_AXIS=y`. Beats best-fragment on all 12
+  production cells (−4..−22%); orbit −15.1% @4096, −17.0% @2048.
+
+#### 38.12.5 Stride-split final word + parked-item accounting
+
+CM_SPLIT implemented and verified byte-transparent (B0≡SPLIT max Δ=0,
+j0/j1) but the AGX scheduler re-interleaves the halves back to full
+32-wide register liveness ([cmpso] 384 either way) — parity and speed
+cannot cohabit via source-level chunking. Perf read 17.33 @2048 obl
+(−4% vs B0, still +16% behind B16). B16's ±1-step drift stays the
+accepted class. Direct-to-drawable NOT code-attempted this session; its
+ceiling shrank further anyway (blit ≈0.5ms @2048 ≈0.5% of orbit; ~2ms
+@4096 ≈0.6%) — demoted to cosmetic-priority.
+
+Reproduction: scripts /var/folders/f2/wxp2wsd95dg_pkpzyxs8vqxr0000gn/T/opencode/mx_p*.zsh
+(phases 1-10), raw log /tmp/cm_matrix3.txt, parity captures /tmp/cmy/.
+Env knobs used: existing only (no new knobs this section beyond §38.10's).
+
 Tree state after this session: `VTK_METAL_TEST_EXIT_THETA` knob landed
 (default-OFF, byte-inert); VOLTRANSPOSE policy comments updated with the
 §38.3 matrix; everything else reverted clean (byte-parity verified). New

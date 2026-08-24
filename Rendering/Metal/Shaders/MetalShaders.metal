@@ -2796,6 +2796,14 @@ constant bool fc_exitTheta [[function_constant(38)]];
 // 0 = unset -> fall back to the uniform-driven runtime value.
 constant int fc_cmBatch [[function_constant(39)]];
 
+// §38.12 stride-parity split: when true, the MAIN 32-wide rung body is
+// executed as two independent fetch/composite halves with NO exit test
+// between them. Mathematically transparent (same per-sample ops in the
+// same sequential order; ADVANCE(32) still tests once), but peak register
+// liveness halves IF the scheduler keeps the halves ordered — restoring
+// legacy-batch output semantics at reduced register pressure.
+constant bool fc_cmSplit [[function_constant(40)]];
+
 // Map an original-orientation sample position into texture space for the live
 // transposed representation (no-op when clear).
 inline float3 volumeFetchSwizzle(float3 pos) {
@@ -8389,6 +8397,34 @@ inline half4 marchRayFromAtlasCore(
       MV9_C_COMPOSITE(40) MV9_C_COMPOSITE(41) MV9_C_COMPOSITE(42) MV9_C_COMPOSITE(43)
       MV9_C_COMPOSITE(44) MV9_C_COMPOSITE(45) MV9_C_COMPOSITE(46) MV9_C_COMPOSITE(47)
       MV9_C_ADVANCE(48)
+    }
+    // §38.12 stride-parity split: legacy 32-rung cadence (tests/preamble
+    // every 32 samples exactly as batchCap=32) with the rung body split into
+    // two independent 16-halves — identical fp op sequence, lower peak
+    // register liveness when fc_cmBatch <= 16.
+    else if (fc_cmSplit && batchCap >= 32 && i + 32 <= steps)
+    {
+      {
+        MV9_C_FETCH(0) MV9_C_FETCH(1) MV9_C_FETCH(2) MV9_C_FETCH(3)
+        MV9_C_FETCH(4) MV9_C_FETCH(5) MV9_C_FETCH(6) MV9_C_FETCH(7)
+        MV9_C_FETCH(8) MV9_C_FETCH(9) MV9_C_FETCH(10) MV9_C_FETCH(11)
+        MV9_C_FETCH(12) MV9_C_FETCH(13) MV9_C_FETCH(14) MV9_C_FETCH(15)
+        MV9_C_COMPOSITE(0) MV9_C_COMPOSITE(1) MV9_C_COMPOSITE(2) MV9_C_COMPOSITE(3)
+        MV9_C_COMPOSITE(4) MV9_C_COMPOSITE(5) MV9_C_COMPOSITE(6) MV9_C_COMPOSITE(7)
+        MV9_C_COMPOSITE(8) MV9_C_COMPOSITE(9) MV9_C_COMPOSITE(10) MV9_C_COMPOSITE(11)
+        MV9_C_COMPOSITE(12) MV9_C_COMPOSITE(13) MV9_C_COMPOSITE(14) MV9_C_COMPOSITE(15)
+      }
+      {
+        MV9_C_FETCH(16) MV9_C_FETCH(17) MV9_C_FETCH(18) MV9_C_FETCH(19)
+        MV9_C_FETCH(20) MV9_C_FETCH(21) MV9_C_FETCH(22) MV9_C_FETCH(23)
+        MV9_C_FETCH(24) MV9_C_FETCH(25) MV9_C_FETCH(26) MV9_C_FETCH(27)
+        MV9_C_FETCH(28) MV9_C_FETCH(29) MV9_C_FETCH(30) MV9_C_FETCH(31)
+        MV9_C_COMPOSITE(16) MV9_C_COMPOSITE(17) MV9_C_COMPOSITE(18) MV9_C_COMPOSITE(19)
+        MV9_C_COMPOSITE(20) MV9_C_COMPOSITE(21) MV9_C_COMPOSITE(22) MV9_C_COMPOSITE(23)
+        MV9_C_COMPOSITE(24) MV9_C_COMPOSITE(25) MV9_C_COMPOSITE(26) MV9_C_COMPOSITE(27)
+        MV9_C_COMPOSITE(28) MV9_C_COMPOSITE(29) MV9_C_COMPOSITE(30) MV9_C_COMPOSITE(31)
+      }
+      MV9_C_ADVANCE(32)
     }
     else if (batchCap >= 32 && i + 32 <= steps)
     {
