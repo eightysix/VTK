@@ -3793,6 +3793,30 @@ BS16-env reference (120.4).
 Net effect vs the pre-§37.18 single-tier BS8 baseline: fine tier improves
 by an extra ~4-6 points of win on every view; coarse tier unchanged.
 
+### 37.24 Tuning-validation sweep in healthy state: landed config is the
+local optimum across all three dimensions (2026-08-24 late night)
+
+With trustworthy measurements finally available (post-reboot), the three
+tunable dimensions of the acceleration were re-swept to confirm the landed
+values and hunt regressions:
+
+1. FINE-TIER BLOCK SIZE @SD0.5 (axz/obl ms): BS4 176.1/67.2, BS8
+   127.0/48.9, **BS16 120.5/44.8**, BS32 135.8/49.4 — clean unimodal curve,
+   landed 16 confirmed optimal.
+2. COARSE-TIER COMPLETION @SD4: BS4 47.6/18.3 (z/obl), BS32 34.6/19.2.
+   With §37.22's rows: BS8 keeps the orbit (obl prefers 8 by >1 ms;
+   BS32's marginal z gain does not offset its oblique loss).
+3. MARCH CAP under the new leap dynamics, BOTH tiers: fine axz cap16/32/48
+   = 141.7/**120.6**/126.3; coarse z 38.2/**35.0**/36.3; coarse obl
+   16.7/16.0/16.0 — cap32 remains optimal or tied everywhere.
+
+No regressions detected in any cell; SD4 default renders byte-identical to
+the pre-tier binary (coarse behavior untouched). The configuration
+{tiered BS {16|8}, single-tier cap 32} stands as the measured local
+optimum. Remaining knobs are either output-changing (MM_EPS approximation),
+refuted (supers, warpmin, seg-consume), or affect only the opt-in IGN
+jitter path (jitterBlockSize) — no further tunable surface identified.
+
 ### 37.14 Reproduction recipe for all §37 benchmarks
 
 Commits: measurements taken on `1896bf38bd` code (single-tier cap32;
