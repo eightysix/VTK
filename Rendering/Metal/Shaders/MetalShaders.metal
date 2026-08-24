@@ -7962,10 +7962,10 @@ fragment VolumeAtlasOut fragment_volume_ray_atlas(
     b.minMaxInfo.w > 0.5;
   // Slab passes re-partition [0,maxSteps) per pass — unsupported by the v1
   // segment design; the sentinel makes the builder emit a no-gap record.
-  const float stepsOut = (!useMinMax || fc_slabMode) ? 0.0f : (float)maxSteps;
+  const float stepsOut = (fc_slabMode) ? 0.0f : (float)maxSteps;
   output.setupA = float4(evalPoint, stepsOut);
   output.setupB = float4(evalStep, p.stepSize);
-  output.setupC = float4(p.rayDir, 0.0f);
+  output.setupC = float4(p.rayDir, s.tTerminateMax);
   return output;
 }
 
@@ -8100,6 +8100,641 @@ kernel void volume_segment_build(
   if (cnt > 14u) pool[base + 15u] = segR3.z;
   if (cnt > 15u) pool[base + 16u] = segR3.w;
   segIndexMap[fpid] = base;
+}
+
+// =============================================================================
+// §38.6 / §36.4 Design B — Compute Marcher & Ray-Binned Marching
+// =============================================================================
+
+inline half4 marchRayFromAtlasCore(
+    float3 evalPointIn,
+    int maxSteps,
+    float3 evalStepIn,
+    float stepSize,
+    float3 rayDir,
+    float tTerminateMax,
+    constant VolumeMapperUniforms& volumeUniforms,
+    constant PerBlockData& b,
+    texture3d<float> volumeTexture,
+    texture2d<float> transferFunctionTexture,
+    texture2d<float> transferFunctionTexture1,
+    texture2d<float> transferFunctionTexture2,
+    texture2d<float> transferFunctionTexture3,
+    texture2d<float> transferFunction2DTexture,
+    texture3d<float> transfer2DYAxisTexture,
+    texture2d<float> gradientOpacityTexture,
+    texture3d<float> maskTexture,
+    texture2d<float> labelMapTransferTexture,
+    texture3d<float> minMaxTexture,
+    texture3d<float> minMaxBlockTexture,
+    texture3d<float> minMaxSuperTexture,
+    texture3d<float> normalTexture,
+    texture3d<float> blankingTexture,
+    constant packed_float3* rectCoords,
+    constant VolumeLightUniforms* lightUniforms)
+{
+  const bool doShading = fc_shading;
+  const bool doGradOp = fc_gradientOpacity;
+  const bool doCropping = fc_cropping;
+  const bool doMask = fc_mask;
+  const bool doBlanking = fc_blanking;
+  const bool doTransfer2D = fc_transfer2D;
+  const bool doRectilinear = fc_rectilinear;
+
+  half scalarScale = half(1.0 / max((volumeUniforms.scalarMax - volumeUniforms.scalarMin), 1e-4h));
+  half scalarBias  = half(-volumeUniforms.scalarMin) * scalarScale;
+
+  half gradNormFactor = half(max(1e-8f, volumeUniforms.gradientOpacityRange.y));
+
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
+                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal = (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+
+  float texelCountZ = volumeTexture.get_depth() *
+    ((fc_volRg8 && !fc_volTransposed) ? 2.0f : 1.0f);
+  float3 texelCount = fc_volTransposedY
+    ? float3(volumeTexture.get_width(), volumeTexture.get_depth(),
+             volumeTexture.get_height())
+    : fc_volTransposed
+      ? float3(volumeTexture.get_depth(), volumeTexture.get_height(),
+               volumeTexture.get_width())
+      : float3(volumeTexture.get_width(), volumeTexture.get_height(), texelCountZ);
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+  float3 evalPoint = evalPointIn;
+
+  half3 viewDirHalf  = half3(normalize(-rayDir * boundsSize));
+  half3 ambientMat   = half3(volumeUniforms.ambientColor.rgb);
+  half3 diffuseMat   = half3(volumeUniforms.diffuseColor.rgb);
+  half3 specularMat  = half3(volumeUniforms.specularColor.rgb);
+  half shininessMat  = half(volumeUniforms.shininess);
+
+  float3 stepVec = rayDir * stepSize;
+  float3 currentPoint = float3(0.0);
+  float currentT = 0.0f;
+  float3 texLocalPos = evalPoint;
+
+  const float kExitAcc = fc_exitTheta ? volumeUniforms.exitAlpha : 0.99607843137f;
+
+  const bool useMinMax = fc_minmax &&
+    b.minMaxInfo.x > 0.5 &&
+    b.minMaxInfo.y > 0.5 &&
+    b.minMaxInfo.z > 0.5 &&
+    b.minMaxInfo.w > 0.5;
+  const float3 mmDimF = b.minMaxInfo.yzw;
+  const float3 mmBlkDimF = float3(minMaxBlockTexture.get_width(),
+                                 minMaxBlockTexture.get_height(),
+                                 minMaxBlockTexture.get_depth());
+  const bool useMinMaxBlocks = useMinMax && fc_mmBlocks && mmBlkDimF.x > 1.0f;
+  const float3 invMMDimF9 = 1.0f / mmDimF;
+  const int bsI = max(int(volumeUniforms.mmBlockSizeCells), 1);
+  const int bpsI = 64 / bsI;
+  const float invBs = 1.0f / float(bsI);
+  const float invBps = 1.0f / float(bpsI);
+  int3 mv9Blk = int3(-1);
+  int mv9BlkState = -1;
+  const float3 mmSbDimF = float3(minMaxSuperTexture.get_width(),
+                                 minMaxSuperTexture.get_height(),
+                                 minMaxSuperTexture.get_depth());
+  const bool useMinMaxSuper = useMinMaxBlocks && fc_mmSuper &&
+                              mmSbDimF.x > 1.0f;
+  int3 mv9Sb = int3(-1);
+  bool mv9SbEmpty = false;
+
+  half3 accumulatedColor = half3(0.0h);
+  half accumulatedOpacity = 0.0h;
+
+  const float3 adjTexMin = ctpOffset;
+  const float3 adjTexMax = ctpOffset + ctpScale;
+  bool seenInBounds = false;
+  int i = 0;
+  const int steps = maxSteps;
+  const int batchCap = max(1, int(volumeUniforms.maxBatchWidth));
+
+#define MV9_C_FETCH(_j) \
+  float s##_j = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * (float)_j);
+#define MV9_C_COMPOSITE(_j) \
+  half4 c##_j = sampleTransferFunction(transferFunctionTexture, \
+      float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), 0.5)); \
+  half w##_j = 1.0h - accumulatedOpacity; \
+  accumulatedColor += w##_j * (c##_j.rgb * c##_j.a); \
+  accumulatedOpacity += w##_j * c##_j.a;
+#define MV9_C_ADVANCE(_W) \
+  currentPoint += stepVec * (float)_W; \
+  currentT += stepSize * (float)_W; \
+  texLocalPos += texStep * (float)_W; \
+  evalPoint += evalStep * (float)_W; \
+  i += _W; \
+  if (accumulatedOpacity > kExitAcc) { break; } \
+  if (currentT >= tTerminateMax) { break; }
+
+  while (i < steps)
+  {
+    if (accumulatedOpacity > kExitAcc) break;
+    if (currentT >= tTerminateMax) break;
+    if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
+        any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
+      if (seenInBounds) { break; }
+      texLocalPos = clamp(texLocalPos, float3(0.0), float3(1.0));
+      evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+    } else {
+      seenInBounds = true;
+    }
+
+    if (useMinMax)
+    {
+      int w = 0;
+      const int extent = min(48, steps - i);
+      while (w < extent)
+      {
+        float3 mmPos = clamp(evalPoint + evalStep * (float)w, float3(0.0), float3(1.0));
+        float3 cellCoord = mmPos * mmDimF;
+        if (useMinMaxBlocks)
+        {
+          int3 newBlk = min(int3(cellCoord * invBs), int3(mmBlkDimF) - 1);
+          if (any(newBlk != mv9Blk))
+          {
+            mv9Blk = newBlk;
+            float bsv = minMaxBlockTexture.sample(sNearest,
+                (float3(mv9Blk) + 0.5f) / mmBlkDimF, level(0)).r;
+            mv9BlkState = bsv > 0.75 ? 1 : (bsv < 0.25 ? 2 : 0);
+          }
+          if (useMinMaxSuper)
+          {
+            int3 newSb = min(int3(float3(mv9Blk) * invBps), int3(mmSbDimF) - 1);
+            if (any(newSb != mv9Sb))
+            {
+              mv9Sb = newSb;
+              float ssv = minMaxSuperTexture.sample(sNearest,
+                  (float3(mv9Sb) + 0.5f) / mmSbDimF, level(0)).r;
+              mv9SbEmpty = ssv > 0.5f;
+            }
+            if (mv9SbEmpty && volumeUniforms.mmLeapLevel > 0.5f)
+            {
+              int3 sbLo = mv9Sb * 64;
+              float3 loN = float3(sbLo) * invMMDimF9;
+              float3 hiN = float3(min(sbLo + 64, int3(mmDimF))) * invMMDimF9;
+              float3 rem;
+              rem.x = rayDir.x > 0.0 ? (hiN.x - mmPos.x) : (mmPos.x - loN.x);
+              rem.y = rayDir.y > 0.0 ? (hiN.y - mmPos.y) : (mmPos.y - loN.y);
+              rem.z = rayDir.z > 0.0 ? (hiN.z - mmPos.z) : (mmPos.z - loN.z);
+              rem = max(rem, float3(0.0f));
+              float3 tToFace;
+              tToFace.x = abs(rayDir.x) > 1e-5 ? rem.x / abs(rayDir.x) : 1e30;
+              tToFace.y = abs(rayDir.y) > 1e-5 ? rem.y / abs(rayDir.y) : 1e30;
+              tToFace.z = abs(rayDir.z) > 1e-5 ? rem.z / abs(rayDir.z) : 1e30;
+              float exactSkip = min(min(tToFace.x, tToFace.y), tToFace.z) + 1e-4;
+              int leapSteps = (int)ceil(exactSkip / stepSize);
+              if (leapSteps < 1) leapSteps = 1;
+              w += leapSteps;
+              continue;
+            }
+          }
+          if (mv9BlkState == 1 && volumeUniforms.mmLeapLevel > 1.5f)
+          {
+            int3 blkLo = mv9Blk * bsI;
+            float3 loN = float3(blkLo) * invMMDimF9;
+            float3 hiN = float3(min(blkLo + bsI, int3(mmDimF))) * invMMDimF9;
+            float3 rem;
+            rem.x = rayDir.x > 0.0 ? (hiN.x - mmPos.x) : (mmPos.x - loN.x);
+            rem.y = rayDir.y > 0.0 ? (hiN.y - mmPos.y) : (mmPos.y - loN.y);
+            rem.z = rayDir.z > 0.0 ? (hiN.z - mmPos.z) : (mmPos.z - loN.z);
+            rem = max(rem, float3(0.0f));
+            float3 tToFace;
+            tToFace.x = abs(rayDir.x) > 1e-5 ? rem.x / abs(rayDir.x) : 1e30;
+            tToFace.y = abs(rayDir.y) > 1e-5 ? rem.y / abs(rayDir.y) : 1e30;
+            tToFace.z = abs(rayDir.z) > 1e-5 ? rem.z / abs(rayDir.z) : 1e30;
+            float exactSkip = min(min(tToFace.x, tToFace.y), tToFace.z) + 1e-4;
+            int leapSteps = (int)ceil(exactSkip / stepSize);
+            if (leapSteps < 1) leapSteps = 1;
+            w += leapSteps;
+            continue;
+          }
+          if (mv9BlkState == 2)
+          {
+            break;
+          }
+        }
+        if (volumeUniforms.mmBlocksOnly > 0.5f) { break; }
+        if (minMaxTexture.sample(sNearest, mmPos, level(0)).r <= 0.5) break;
+        float3 fractCoord = fract(cellCoord);
+        float3 distToEdge;
+        distToEdge.x = rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x;
+        distToEdge.y = rayDir.y > 0.0 ? (1.0 - fractCoord.y) : fractCoord.y;
+        distToEdge.z = rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
+        distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
+        float3 tToEdge;
+        tToEdge.x = abs(rayDir.x) > 1e-5 ? distToEdge.x / (abs(rayDir.x) * mmDimF.x) : 1e30;
+        tToEdge.y = abs(rayDir.y) > 1e-5 ? distToEdge.y / (abs(rayDir.y) * mmDimF.y) : 1e30;
+        tToEdge.z = abs(rayDir.z) > 1e-5 ? distToEdge.z / (abs(rayDir.z) * mmDimF.z) : 1e30;
+        float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z) + 1e-4;
+        int cellSteps = (int)ceil(exactSkip / stepSize);
+        if (cellSteps < 1) cellSteps = 1;
+        w += cellSteps;
+      }
+      if (w >= extent)
+      {
+        currentPoint += stepVec * (float)extent;
+        currentT += stepSize * (float)extent;
+        texLocalPos += texStep * (float)extent;
+        evalPoint += evalStep * (float)extent;
+        i += extent;
+        continue;
+      }
+      if (w > 0)
+      {
+        currentPoint += stepVec * (float)w;
+        currentT += stepSize * (float)w;
+        texLocalPos += texStep * (float)w;
+        evalPoint += evalStep * (float)w;
+        i += w;
+      }
+    }
+
+    if (batchCap >= 48 && i + 48 <= steps)
+    {
+      MV9_C_FETCH(0) MV9_C_FETCH(1) MV9_C_FETCH(2) MV9_C_FETCH(3)
+      MV9_C_FETCH(4) MV9_C_FETCH(5) MV9_C_FETCH(6) MV9_C_FETCH(7)
+      MV9_C_FETCH(8) MV9_C_FETCH(9) MV9_C_FETCH(10) MV9_C_FETCH(11)
+      MV9_C_FETCH(12) MV9_C_FETCH(13) MV9_C_FETCH(14) MV9_C_FETCH(15)
+      MV9_C_FETCH(16) MV9_C_FETCH(17) MV9_C_FETCH(18) MV9_C_FETCH(19)
+      MV9_C_FETCH(20) MV9_C_FETCH(21) MV9_C_FETCH(22) MV9_C_FETCH(23)
+      MV9_C_FETCH(24) MV9_C_FETCH(25) MV9_C_FETCH(26) MV9_C_FETCH(27)
+      MV9_C_FETCH(28) MV9_C_FETCH(29) MV9_C_FETCH(30) MV9_C_FETCH(31)
+      MV9_C_FETCH(32) MV9_C_FETCH(33) MV9_C_FETCH(34) MV9_C_FETCH(35)
+      MV9_C_FETCH(36) MV9_C_FETCH(37) MV9_C_FETCH(38) MV9_C_FETCH(39)
+      MV9_C_FETCH(40) MV9_C_FETCH(41) MV9_C_FETCH(42) MV9_C_FETCH(43)
+      MV9_C_FETCH(44) MV9_C_FETCH(45) MV9_C_FETCH(46) MV9_C_FETCH(47)
+      MV9_C_COMPOSITE(0) MV9_C_COMPOSITE(1) MV9_C_COMPOSITE(2) MV9_C_COMPOSITE(3)
+      MV9_C_COMPOSITE(4) MV9_C_COMPOSITE(5) MV9_C_COMPOSITE(6) MV9_C_COMPOSITE(7)
+      MV9_C_COMPOSITE(8) MV9_C_COMPOSITE(9) MV9_C_COMPOSITE(10) MV9_C_COMPOSITE(11)
+      MV9_C_COMPOSITE(12) MV9_C_COMPOSITE(13) MV9_C_COMPOSITE(14) MV9_C_COMPOSITE(15)
+      MV9_C_COMPOSITE(16) MV9_C_COMPOSITE(17) MV9_C_COMPOSITE(18) MV9_C_COMPOSITE(19)
+      MV9_C_COMPOSITE(20) MV9_C_COMPOSITE(21) MV9_C_COMPOSITE(22) MV9_C_COMPOSITE(23)
+      MV9_C_COMPOSITE(24) MV9_C_COMPOSITE(25) MV9_C_COMPOSITE(26) MV9_C_COMPOSITE(27)
+      MV9_C_COMPOSITE(28) MV9_C_COMPOSITE(29) MV9_C_COMPOSITE(30) MV9_C_COMPOSITE(31)
+      MV9_C_COMPOSITE(32) MV9_C_COMPOSITE(33) MV9_C_COMPOSITE(34) MV9_C_COMPOSITE(35)
+      MV9_C_COMPOSITE(36) MV9_C_COMPOSITE(37) MV9_C_COMPOSITE(38) MV9_C_COMPOSITE(39)
+      MV9_C_COMPOSITE(40) MV9_C_COMPOSITE(41) MV9_C_COMPOSITE(42) MV9_C_COMPOSITE(43)
+      MV9_C_COMPOSITE(44) MV9_C_COMPOSITE(45) MV9_C_COMPOSITE(46) MV9_C_COMPOSITE(47)
+      MV9_C_ADVANCE(48)
+    }
+    else if (batchCap >= 32 && i + 32 <= steps)
+    {
+      MV9_C_FETCH(0) MV9_C_FETCH(1) MV9_C_FETCH(2) MV9_C_FETCH(3)
+      MV9_C_FETCH(4) MV9_C_FETCH(5) MV9_C_FETCH(6) MV9_C_FETCH(7)
+      MV9_C_FETCH(8) MV9_C_FETCH(9) MV9_C_FETCH(10) MV9_C_FETCH(11)
+      MV9_C_FETCH(12) MV9_C_FETCH(13) MV9_C_FETCH(14) MV9_C_FETCH(15)
+      MV9_C_FETCH(16) MV9_C_FETCH(17) MV9_C_FETCH(18) MV9_C_FETCH(19)
+      MV9_C_FETCH(20) MV9_C_FETCH(21) MV9_C_FETCH(22) MV9_C_FETCH(23)
+      MV9_C_FETCH(24) MV9_C_FETCH(25) MV9_C_FETCH(26) MV9_C_FETCH(27)
+      MV9_C_FETCH(28) MV9_C_FETCH(29) MV9_C_FETCH(30) MV9_C_FETCH(31)
+      MV9_C_COMPOSITE(0) MV9_C_COMPOSITE(1) MV9_C_COMPOSITE(2) MV9_C_COMPOSITE(3)
+      MV9_C_COMPOSITE(4) MV9_C_COMPOSITE(5) MV9_C_COMPOSITE(6) MV9_C_COMPOSITE(7)
+      MV9_C_COMPOSITE(8) MV9_C_COMPOSITE(9) MV9_C_COMPOSITE(10) MV9_C_COMPOSITE(11)
+      MV9_C_COMPOSITE(12) MV9_C_COMPOSITE(13) MV9_C_COMPOSITE(14) MV9_C_COMPOSITE(15)
+      MV9_C_COMPOSITE(16) MV9_C_COMPOSITE(17) MV9_C_COMPOSITE(18) MV9_C_COMPOSITE(19)
+      MV9_C_COMPOSITE(20) MV9_C_COMPOSITE(21) MV9_C_COMPOSITE(22) MV9_C_COMPOSITE(23)
+      MV9_C_COMPOSITE(24) MV9_C_COMPOSITE(25) MV9_C_COMPOSITE(26) MV9_C_COMPOSITE(27)
+      MV9_C_COMPOSITE(28) MV9_C_COMPOSITE(29) MV9_C_COMPOSITE(30) MV9_C_COMPOSITE(31)
+      MV9_C_ADVANCE(32)
+    }
+    else if (batchCap >= 16 && i + 16 <= steps)
+    {
+      MV9_C_FETCH(0) MV9_C_FETCH(1) MV9_C_FETCH(2) MV9_C_FETCH(3)
+      MV9_C_FETCH(4) MV9_C_FETCH(5) MV9_C_FETCH(6) MV9_C_FETCH(7)
+      MV9_C_FETCH(8) MV9_C_FETCH(9) MV9_C_FETCH(10) MV9_C_FETCH(11)
+      MV9_C_FETCH(12) MV9_C_FETCH(13) MV9_C_FETCH(14) MV9_C_FETCH(15)
+      MV9_C_COMPOSITE(0) MV9_C_COMPOSITE(1) MV9_C_COMPOSITE(2) MV9_C_COMPOSITE(3)
+      MV9_C_COMPOSITE(4) MV9_C_COMPOSITE(5) MV9_C_COMPOSITE(6) MV9_C_COMPOSITE(7)
+      MV9_C_COMPOSITE(8) MV9_C_COMPOSITE(9) MV9_C_COMPOSITE(10) MV9_C_COMPOSITE(11)
+      MV9_C_COMPOSITE(12) MV9_C_COMPOSITE(13) MV9_C_COMPOSITE(14) MV9_C_COMPOSITE(15)
+      MV9_C_ADVANCE(16)
+    }
+    else if (batchCap >= 8 && i + 8 <= steps)
+    {
+      MV9_C_FETCH(0) MV9_C_FETCH(1) MV9_C_FETCH(2) MV9_C_FETCH(3)
+      MV9_C_FETCH(4) MV9_C_FETCH(5) MV9_C_FETCH(6) MV9_C_FETCH(7)
+      MV9_C_COMPOSITE(0) MV9_C_COMPOSITE(1) MV9_C_COMPOSITE(2) MV9_C_COMPOSITE(3)
+      MV9_C_COMPOSITE(4) MV9_C_COMPOSITE(5) MV9_C_COMPOSITE(6) MV9_C_COMPOSITE(7)
+      MV9_C_ADVANCE(8)
+    }
+    else if (batchCap >= 4 && i + 4 <= steps)
+    {
+      MV9_C_FETCH(0) MV9_C_FETCH(1) MV9_C_FETCH(2) MV9_C_FETCH(3)
+      MV9_C_COMPOSITE(0) MV9_C_COMPOSITE(1) MV9_C_COMPOSITE(2) MV9_C_COMPOSITE(3)
+      MV9_C_ADVANCE(4)
+    }
+    else if (batchCap >= 2 && i + 2 <= steps)
+    {
+      MV9_C_FETCH(0) MV9_C_FETCH(1)
+      MV9_C_COMPOSITE(0) MV9_C_COMPOSITE(1)
+      MV9_C_ADVANCE(2)
+    }
+    else
+    {
+      MV9_C_FETCH(0)
+      MV9_C_COMPOSITE(0)
+      MV9_C_ADVANCE(1)
+    }
+  }
+
+#undef MV9_C_FETCH
+#undef MV9_C_COMPOSITE
+#undef MV9_C_ADVANCE
+
+  accumulatedColor = clamp(accumulatedColor, half3(0.0h), half3(1.0h));
+  accumulatedOpacity = clamp(accumulatedOpacity, 0.0h, 1.0h);
+  return half4(accumulatedColor, accumulatedOpacity);
+}
+
+// §38.6 compute-march probes (TEMP-DIAG, env-gated from the mapper):
+// floorMode skips the march body to expose the dispatch+atlas+blit floor;
+// stepCap forces a maximum march length (per-length slope decomposition).
+// synthMode rebuilds the atlas planes in-kernel from uniforms + analytic
+// ray-box entry (CM_SYNTH) — removes the render->compute atlas dependency,
+// which measured as the dominant cost (~7.4 ms @1024² of ~8.6 total).
+struct ComputeMarchControl { uint floorMode; uint stepCap; uint synthMode; };
+
+struct SynthRay {
+  float3 evalPoint;
+  float3 evalStep;
+  float  stepSize;
+  float3 rayDir;
+  float  tTerminateMax;
+  int    steps;
+};
+
+inline bool synthesizeAtlasRay(
+    uint2 gid,
+    constant VolumeMapperUniforms& volumeUniforms,
+    constant PerBlockData& b,
+    texture3d<float> volumeTexture,
+    texture2d<float> depthTexture,
+    thread SynthRay& o)
+{
+  const float2 screenPos = float2(gid) + 0.5;
+
+  // ---- fragment_volume_main prologue (verbatim, minus interpolated
+  // localPos — reconstructed analytically below; box faces are planar so the
+  // difference vs rasterizer interpolation is ulp-class) ----
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  // Camera-inside normalization relies on the rasterized surface point;
+  // unsupported by synthesis v1 (bench cameras are outside-proxy).
+  if (volumeUniforms.useCameraInsideNearClip > 0.5) return false;
+
+  float3 rayOrigin, rayDir;
+  if (parallel)
+  {
+    rayDir = projectionDir(volumeUniforms);
+    rayOrigin = parallelRayOrigin(screenPos, volumeUniforms.viewportSize,
+                                  volumeUniforms);
+  }
+  else
+  {
+    rayOrigin = cameraPos;
+    rayDir = reconstructRayDir(screenPos, volumeUniforms.viewportSize,
+                               volumeUniforms);
+  }
+
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal,
+                      blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal,
+      blockMaxGlobal, screenPos, volumeUniforms.viewportSize, volumeUniforms,
+      depthTexture);
+  if (!s.valid) return false;
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+
+  // ---- marchVolume wrapper body up to MarchParams (verbatim) ----
+  float jSel = (volumeUniforms.useJittering > 0.5
+      ? (volumeUniforms.useIGNJitter > 0.5
+            ? sampleIGNJitter(screenPos, volumeUniforms.jitterBlockSize)
+            : sampleJitterNoise(screenPos, volumeUniforms.viewportSize.y,
+                                volumeUniforms.jitterBlockSize))
+      : 1.0f);
+  float jScale = volumeUniforms._padCropFlags[1];
+  jScale = (jScale >= 0.0f && jScale <= 1.0f) ? jScale : 1.0f;
+  float jitter = mix(1.0f, jSel, jScale) * stepSize;
+  float tStart = dot(s.entryPoint - cameraPos, rayDir);
+
+  // ---- marchVolumeUnified setup head (verbatim) ----
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
+                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal =
+    (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+  float texelCountZ = volumeTexture.get_depth() *
+    ((fc_volRg8 && !fc_volTransposed) ? 2.0f : 1.0f);
+  float3 texelCount = fc_volTransposedY
+    ? float3(volumeTexture.get_width(), volumeTexture.get_depth(),
+             volumeTexture.get_height())
+    : fc_volTransposed
+      ? float3(volumeTexture.get_depth(), volumeTexture.get_height(),
+               volumeTexture.get_width())
+      : float3(volumeTexture.get_width(), volumeTexture.get_height(),
+               texelCountZ);
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+
+  float firstT = jitter;   // checkBounds=true branch
+  float3 currentPoint = rayOrigin + rayDir * tStart + rayDir * firstT;
+  int maxSteps = max(1, int(ceil((s.totalBoxT - firstT) / stepSize)));
+  if (volumeUniforms.maxStepsFrame > 0.5)
+  {
+    maxSteps = min(maxSteps, int(volumeUniforms.maxStepsFrame));
+  }
+
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize,
+             1.0)).xyz;
+  o.evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+  o.evalStep = evalStep;
+  o.stepSize = stepSize;
+  o.rayDir = rayDir;
+  o.tTerminateMax = s.tTerminateMax;
+  o.steps = maxSteps;
+  return true;
+}
+
+kernel void volume_compute_march(
+    texture2d<float, access::read> segAtlasA [[texture(0)]],
+    texture2d<float, access::read> segAtlasB [[texture(1)]],
+    texture2d<float, access::read> segAtlasC [[texture(3)]],
+    texture2d<half, access::write> outColorTexture [[texture(4)]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(5)]],
+    texture2d<float> transferFunctionTexture [[texture(6)]],
+    texture2d<float> transferFunctionTexture1 [[texture(7)]],
+    texture2d<float> transferFunctionTexture2 [[texture(8)]],
+    texture2d<float> transferFunctionTexture3 [[texture(9)]],
+    texture2d<float> transferFunction2DTexture [[texture(10)]],
+    texture3d<float> transfer2DYAxisTexture [[texture(11)]],
+    texture2d<float> gradientOpacityTexture [[texture(12)]],
+    texture3d<float> maskTexture [[texture(13)]],
+    texture2d<float> labelMapTransferTexture [[texture(14)]],
+    texture3d<float> minMaxTexture [[texture(15)]],
+    texture3d<float> minMaxBlockTexture [[texture(16)]],
+    texture3d<float> minMaxSuperTexture [[texture(17)]],
+    texture3d<float> normalTexture [[texture(18)]],
+    texture3d<float> blankingTexture [[texture(19)]],
+    constant packed_float3* rectCoords [[buffer(3)]],
+    constant VolumeLightUniforms& volumeLights [[buffer(4)]],
+    constant ComputeMarchControl& cmc [[buffer(7)]],
+    texture2d<float> depthSynthTexture [[texture(20)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  if (gid.x >= (uint)volumeUniforms.viewportSize.x ||
+      gid.y >= (uint)volumeUniforms.viewportSize.y) return;
+
+  if (cmc.floorMode)
+  {
+    outColorTexture.write(half4(0.0h), gid);
+    return;
+  }
+
+  float4 A, B, C;
+  int steps;
+  if (cmc.synthMode)
+  {
+    SynthRay so;
+    if (!synthesizeAtlasRay(gid, volumeUniforms, b, volumeTexture,
+                            depthSynthTexture, so))
+    {
+      outColorTexture.write(half4(0.0h), gid);
+      return;
+    }
+    steps = min(max(so.steps, 0), cmc.stepCap ? (int)cmc.stepCap : (1 << 20));
+    half4 color = marchRayFromAtlasCore(so.evalPoint, steps, so.evalStep,
+        so.stepSize, so.rayDir, so.tTerminateMax,
+        volumeUniforms, b, volumeTexture, transferFunctionTexture,
+        transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
+        transferFunction2DTexture, transfer2DYAxisTexture,
+        gradientOpacityTexture, maskTexture, labelMapTransferTexture,
+        minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, normalTexture, blankingTexture,
+        rectCoords, &volumeLights);
+    outColorTexture.write(color, gid);
+    return;
+  }
+
+  A = segAtlasA.read(gid);
+  B = segAtlasB.read(gid);
+  C = segAtlasC.read(gid);
+  // Garbage-guard (mirrors volume_segment_build's guard valve): the atlas is
+  // cleared outside the proxy footprint, but clamp anyway so no pathological
+  // A.w can ever wedge the command buffer inside waitUntilCompleted.
+  steps = min(max(int(A.w), 0), cmc.stepCap ? (int)cmc.stepCap : (1 << 20));
+  if (steps <= 0)
+  {
+    outColorTexture.write(half4(0.0h), gid);
+    return;
+  }
+
+  half4 color = marchRayFromAtlasCore(A.xyz, steps, B.xyz, B.w, C.xyz, C.w,
+      volumeUniforms, b, volumeTexture, transferFunctionTexture,
+      transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
+      transferFunction2DTexture, transfer2DYAxisTexture,
+      gradientOpacityTexture, maskTexture, labelMapTransferTexture,
+      minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, normalTexture, blankingTexture,
+      rectCoords, &volumeLights);
+
+  outColorTexture.write(color, gid);
+}
+
+kernel void volume_ray_bin_classify(
+    texture2d<float, access::read> segAtlasA [[texture(0)]],
+    device atomic_uint* binCounters [[buffer(0)]],
+    device uint* binRayIndices [[buffer(1)]],
+    constant uint4& binMeta [[buffer(2)]], // x=width, y=height, z=binCapacity, w=numBins
+    uint2 gid [[thread_position_in_grid]])
+{
+  if (gid.x >= binMeta.x || gid.y >= binMeta.y) return;
+  float4 A = segAtlasA.read(gid);
+  int steps = int(A.w);
+  if (steps <= 0) return;
+
+  uint numBins = binMeta.w;
+  uint binIdx = 0;
+  if (numBins > 1)
+  {
+    if (steps <= 32) binIdx = 0;
+    else if (steps <= 128) binIdx = 1;
+    else if (steps <= 512) binIdx = 2;
+    else binIdx = 3;
+    if (binIdx >= numBins) binIdx = numBins - 1;
+  }
+
+  uint slot = atomic_fetch_add_explicit(&binCounters[binIdx], 1, memory_order_relaxed);
+  uint binCap = binMeta.z;
+  if (slot < binCap)
+  {
+    uint packedUv = (gid.y << 16u) | (gid.x & 0xFFFFu);
+    binRayIndices[binIdx * binCap + slot] = packedUv;
+  }
+}
+
+kernel void volume_compute_march_binned(
+    texture2d<float, access::read> segAtlasA [[texture(0)]],
+    texture2d<float, access::read> segAtlasB [[texture(1)]],
+    texture2d<float, access::read> segAtlasC [[texture(3)]],
+    texture2d<half, access::write> outColorTexture [[texture(4)]],
+    device const uint* binRayIndices [[buffer(0)]],
+    constant uint2& binnedMeta [[buffer(6)]], // x=binCapacity, y=binOffset
+    device atomic_uint* binCounters [[buffer(5)]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    constant ComputeMarchControl& cmc [[buffer(7)]],
+    texture3d<float> volumeTexture [[texture(5)]],
+    texture2d<float> transferFunctionTexture [[texture(6)]],
+    texture2d<float> transferFunctionTexture1 [[texture(7)]],
+    texture2d<float> transferFunctionTexture2 [[texture(8)]],
+    texture2d<float> transferFunctionTexture3 [[texture(9)]],
+    texture2d<float> transferFunction2DTexture [[texture(10)]],
+    texture3d<float> transfer2DYAxisTexture [[texture(11)]],
+    texture2d<float> gradientOpacityTexture [[texture(12)]],
+    texture3d<float> maskTexture [[texture(13)]],
+    texture2d<float> labelMapTransferTexture [[texture(14)]],
+    texture3d<float> minMaxTexture [[texture(15)]],
+    texture3d<float> minMaxBlockTexture [[texture(16)]],
+    texture3d<float> minMaxSuperTexture [[texture(17)]],
+    texture3d<float> normalTexture [[texture(18)]],
+    texture3d<float> blankingTexture [[texture(19)]],
+    constant packed_float3* rectCoords [[buffer(3)]],
+    constant VolumeLightUniforms& volumeLights [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+  // Threads beyond this frame's live count for this bin exit without
+  // marching: unwritten index slots hold stale UVs from previous frames.
+  const uint binIdx = binnedMeta.y / binnedMeta.x;
+  const uint liveCount = atomic_load_explicit(&binCounters[binIdx],
+                                              memory_order_relaxed);
+  if (gid >= min(liveCount, binnedMeta.x)) return;
+  uint packedUv = binRayIndices[binnedMeta.y + gid];
+  uint2 uv = uint2(packedUv & 0xFFFFu, packedUv >> 16u);
+
+  float4 A = segAtlasA.read(uv);
+  float4 B = segAtlasB.read(uv);
+  float4 C = segAtlasC.read(uv);
+  if (cmc.floorMode) return;
+  int steps = min(max(int(A.w), 0), cmc.stepCap ? (int)cmc.stepCap : (1 << 20));
+  if (steps <= 0) return;
+
+  half4 color = marchRayFromAtlasCore(A.xyz, steps, B.xyz, B.w, C.xyz, C.w,
+      volumeUniforms, b, volumeTexture, transferFunctionTexture,
+      transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3,
+      transferFunction2DTexture, transfer2DYAxisTexture,
+      gradientOpacityTexture, maskTexture, labelMapTransferTexture,
+      minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, normalTexture, blankingTexture,
+      rectCoords, &volumeLights);
+
+  outColorTexture.write(color, uv);
 }
 
 kernel void volume_compute_minmax(

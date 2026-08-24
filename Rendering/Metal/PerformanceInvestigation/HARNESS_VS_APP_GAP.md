@@ -3990,6 +3990,303 @@ register-free path.
    identity against anchors when a number looks plausible-but-wrong.
    (Extends §37.12's "verify view labels" note.)
 
+### 38.8 Compute marcher (Design B v1): built, correct, and blocked by a
+launch-bimodal platform mode (2026-08-24 night)
+
+§38.6 unparked early: implemented the §36.4 Design B skeleton end-to-end,
+default-off behind `VTK_METAL_TEST_COMPUTE_MARCH` (+`_RAY_BINNED`). Three
+stages: existing RayAtlas raster (shared with seg), optional ray-bin
+classify kernel, and `volume_compute_march[_binned]` kernels running a
+verbatim port of the mv9 walk + unrolled composite ladder into compute.
+Fixes landed during bring-up (see review notes): atlas loadAction
+DontCare->CLEAR (garbage A.w/NaN inputs marched forever => command-buffer
+wedge inside waitUntilCompleted; the seg builder's 8192 guard-valve lesson
+did NOT carry), steps clamp, binned count-gate + stale-slot protection +
+target clear.
+
+Correctness: compute-vs-frag mean|d|=0.000 (0.0008% px >1LSB @512² SD4);
+RAY_BINNED byte-identical to the 2D variant. CM_SYNTH (in-kernel analytic
+ray-box setup replacing the atlas raster entirely; ulp-class drift vs
+interpolated varyings, camera-inside-proxy unsupported) reads 0.197% px
+>1LSB — accepted fp-landing class.
+
+Performance decomposition @1024² SD4 mm+blocks (frames=60 warmup=10):
+
+| probe | ms/f |
+|---|---|
+| bare frame + Phase-3b blit (CM_NOATLAS+FLOOR) | 0.57 |
+| atlas raster alone / compute-dispatch-with-reads alone | +0.2 / +0.03 |
+| atlas render THEN compute reads (the dependency) | **+7.4** |
+| full compute mm+blocks (atlas path) | 8.63–9.07 |
+| TRUE raw compute (walk liveness proof) | 70.0 |
+
+Findings: (1) the render→compute atlas dependency is the dominant cost
+(tile-memory flush/decompression class); (2) the compute march BODY costs
+~0.6 ms with blocks skipping vs the fragment path's whole-frame budget —
+the Design-B premise (compute marching much cheaper than fragment) is REAL;
+(3) extreme threadgroup-shape sensitivity (8x8 best; 32x4 = 85 ms — an
+occupancy cliff exists in compute too); MARCH_CAP=16 explodes (45 ms) —
+narrower ladders re-run the walk per outer iteration.
+
+vs mv9 (the §38.6 target question): **compute-synth beats fragment mv9 on
+the production cells under steered interleaved A/B** — @2048² SD4 jittered
+oblique 22.06-22.37 vs 23.90-24.77 (−6..−11%, 3/3 rounds); @2048 axis-z
+54.3-54.6 vs 64.8+ (2/2). At 1024 compute still LOSES ~7% (9.0 vs 8.4) —
+fixed overheads dominate small frames. CORRECTION of an intermediate claim:
+"march body ≈ 0.6 ms" was a cross-mode comparison artifact (floor and full
+runs landed in opposite bimodal phases); true compute marching costs about
+parity with fragment marching — the win comes from killing the atlas pass +
+blit-free direct dispatch structure, NOT from a cheaper march.
+
+The launch-bimodal platform mode — ROOT-CAUSED (same session): a minimal
+standalone Metal repro (`minimtl.mm`, no VTK/window) reproduces it exactly,
+alternating 0.33 / 7.0 ms per LAUNCH for a trivial full-screen compute write
+while render-pass and blit-only launches are always fast (~0.38). Mechanism,
+pinned by discriminating probes:
+
+1. The ~7 ms sits entirely between commit and waitUntilCompleted (commit
+   returns in 0.01 ms) — GPU/firmware completion latency, not CPU submit.
+2. Work-independent: an EMPTY kernel with ONE thread pays it; render and
+   blit encoders never do.
+3. It is a GLOBAL TWO-SLOT ROUND-ROBIN over MTLCommandQueue creation: a
+   dual-queue process shows strict per-frame alternation fast/slow (its two
+   queues hold one slot each), four queues map g,b,g,b by creation order,
+   slots stick per queue for life, two concurrent processes split one-good/
+   one-bad, and QoS/priority knobs have no effect.
+4. Throughput impact is real, not just latency: 64 pipelined buffers cost
+   12 ms total on the good slot vs 217-225 ms on the bad (~3.4 ms/buffer).
+5. Why one slot is degraded remains open (wedge-poisoning from this
+   session's kill -9s vs by-design firmware channel behavior) — REBOOT TEST
+   still discriminates; recoveryCount reads 0 either way.
+
+### 38.9 POST-REBOOT RESOLUTION + HANDOFF (2026-08-24 late night)
+
+#### 38.9.1 Root cause of the launch bimodality — CLOSED
+
+Post-reboot discriminator: 8/8 standalone compute launches read 0.35-0.38 ms
+— **the slow slot does not exist on a clean boot**. Verdict: the two-slot
+rotation is normal platform behavior; slot B had been POISONED by killing
+wedged command buffers (the §37.22 phenomenon, now reproduced and localized
+to queue-slot granularity). Practical rules:
+
+- Never `kill -9` a wedged Metal process on this machine without planning a
+  reboot before the next benchmark session.
+- The probe-and-select queue (38.9.2) is defensive insurance against any
+  future poisoning, not a steady-state necessity; both slots are equivalent
+  on healthy boots.
+
+#### 38.9.2 Workaround status (landed, default-on for CM_SYNTH)
+
+`ProbeAndSelectFastQueue` creates 3 candidate queues, times one trivial
+compute submission each, keeps the fastest (`VTK_METAL_TEST_CM_QUEUEPROBE=0`
+disables); the SYNTH march commits/waits on that private queue — safe
+ordering because nothing precedes it on the window queue and Phase 3b runs
+later. During the poisoned window this converted alternating 18 ↔ 48 ms/f
+into stable 18.11-18.60 @2048² SD4 jittered across six unsteered launches.
+Caveats: slots assumed lifetime-stable (verified within sessions; re-probe
+if intra-process flips reappear); probe costs ~3 trivial submissions once.
+
+#### 38.9.3 Healthy-machine extended comparison vs mv9 (the honest table)
+
+frames=100 warmup=20, interleaved ABBA, round spreads <=0.6 ms (cleanest
+data of the investigation). NOTE: the same-day earlier "synth wins" tables
+were measured while fragment arms were inflated by the poisoned slot —
+cross-machine-state comparison, the recurring §37.7 trap.
+
+| view | 2048 frag | 2048 synth | delta | 1024 frag | 1024 synth | delta |
+|---|---|---|---|---|---|---|
+| obl | 15.87 | 17.95 | +13.1% | 9.12 | 9.05 | −0.8% |
+| az45 | 16.84 | 17.27 | +2.5% | 11.89 | 10.12 | **−14.9%** |
+| az135 | 13.69 | 15.90 | +16.2% | 7.52 | 7.82 | +4.1% |
+| axis-x | 27.91 | 29.81 | +6.8% | 13.61 | 11.04 | **−18.8%** |
+| axis-y | 25.09 | 28.62 | +14.1% | 7.96 | 8.94 | +12.3% |
+| axis-z | 35.08 | 38.86 | +10.8% | 11.36 | 12.52 | +10.2% |
+
+**mv9 fragment wins every 2048 cell; compute wins two 1024 cells
+(az45/axx) and ties obl.** Floor decomposition @2048 healthy: bare frame
+0.38 + Phase3b blit 0.51 + compute dispatch/write 0.59 = **1.48 ms
+structural floor**; march+synthesis ≈ 16.3 vs fragment's effective ≈
+15.4-15.5 — march bodies are at PARITY (same algorithm ported); the entire
+deficit is the offscreen structure plus ~5% per-sample overhead (synthesis
+ALU + firstT drift ≈ one extra step/ray).
+
+Refuted en route: CM_RGBA8 (BGRA8Unorm target at mv9-equal precision —
+bandwidth not binding, ±0.5%); RAY_BINNED×SYNTH was an INVALID combo
+(classify reads an atlas that synth never allocates — now gated off;
+binned requires atlas mode). New TEMP-DIAG knobs: CM_NOBLIT, CM_RGBA8.
+
+#### 38.9.4 HANDOFF — remaining headroom, ranked (next work)
+
+Target for all items: beat mv9 at 2048² where it currently wins by ~10-16%;
+success bar = synth <= frag on {obl, az135, axy, axz} with the standard
+protocol (§37.14 recipe + queue-probe active).
+
+(a) **Warp-uniform hop schedules** (highest ceiling, multi-day). simd
+    reductions are legal only under uniform control flow — impossible in
+    the fragment march (latch/tEnd breaks make lanes diverge; §37.19), but
+    structurally available in compute where WE own the threadgroup shape.
+    Mechanism target: leap-scatter on fragmented chords (§37.17) — the one
+    mechanism-class fragment cannot host. First steps: (i) threadgroup-wide
+    step-count negotiation via shared-memory or simd_min at batch
+    boundaries, advancing the WHOLE group to min(next boundary); (ii)
+    threadgroup = 32 linear threads mapped to a 32x1 pixel strip so lanes
+    share chord direction classes; (iii) parity bar: ±1-step class vs
+    current synth output. Expected payoff: axz/axy are the cells where raw
+    beats mm today — warp-uniform skipping should let compute keep blocks'
+    skip yield WITHOUT forfeiting lockstep, i.e. below BOTH current arms.
+(b) **Real ray binning** (atlas mode repaired; medium). The classify/
+    consume kernels exist but were only valid in atlas mode (now enforced).
+    Sort rays by length class into bins so threadgroups stop mixing
+    20-step background rays with 200-step chords; dispatch per bin with
+    sized grids instead of full-screen x numBins. Requires the count-
+    readback or GPU-side indirect dispatch to size launches correctly
+    (current fixed binCap dispatches waste 4x threads). Expected payoff:
+    divergent-view cells (az45/az135 class) at both resolutions.
+(c) **MTLSharedEvent pipelining** (small, latency-only). Replace the
+    commit+CPU-wait on the private queue with event handshake so the CPU
+    can run ahead; bench totals unchanged (harness waits per frame), but
+    interactive frame latency drops by up to the march time. Do together
+    with (a)/(b) integration, not standalone.
+(d) **Static low-res tier** (policy, not code): compute already wins/ties
+    the scattered-view class at 1024. A viewport-size static switch would
+    harvest that today but fails the complexity bar (§37.11 precedent:
+    optimizing thumbnail viewports rejected); revisit only if (a) lands
+    and changes the crossover.
+(e) **Apple engagement**: the two-slot rotation + kill-poisoning behavior
+    (§38.9.1) is report-grade on its own — minimal repro exists
+    (minimtl.mm pattern: trivial compute encoder, waitUntilCompleted,
+    alternation per launch after a wedged-buffer kill).
+
+#### 38.9.5 Inventory for the next session
+
+TEMP-DIAG env added this session (all default-off/inert unless noted):
+VTK_METAL_TEST_COMPUTE_MARCH, _RAY_BINNED, _CM_SYNTH, _CM_FLOOR,
+_CM_FSTEPS=<n>, _CM_TG=<WxH>, _CM_NOATLAS, _CM_NOMARCH, _CM_NOBLIT,
+_CM_RGBA8, _CM_QUEUEPROBE (=0 disables the default-on fast-queue selection).
+Shader additions: volume_compute_march[_binned], volume_ray_bin_classify,
+marchRayFromAtlasCore, synthesizeAtlasRay, ComputeMarchControl struct.
+Mapper additions: EnsureComputeMarchResources, GetOrCreateComputeMarchPipeline,
+BindComputeMarchTextures, ProbeAndSelectFastQueue, ComputeMarchQueue member.
+Pre-existing TEMP leftovers still in tree (§25.7 revert-before-landing):
+unconditional `[march] fc_doExit=` print (mapper ~line 7799), METAL_ITER G/B
+encoding, [TR]/[TRMM] family prints.
+Logs/scripts: /tmp/cm_matrix/results.txt (extended comparison raw),
+/tmp/opencode/cm*.zsh (all generators incl. cmfinal/cmvsfrag/cmfix),
+/tmp/opencode/minimtl.mm (+binary) — the standalone repro; recreate freely,
+it is self-contained. Binary marker: ComputeMarchControl struct in mapper+MSL.
+
+#### 38.9.6 Reproduction instructions (38.9.x benchmarks)
+
+Build: `./macos_metal_build.sh --resume` →
+`build_macos_metal/bin/vtkMetalGLVisualComparison`. Dataset:
+`/Users/macair/Public/IMR/CTIMR/IMRToraceAddome`. All wrappers MUST go
+through `eval "env $CFG ... $BIN"` (zsh word-splitting, §25.7); --warmup>=5
+mandatory (§35.14); record battery/AC + background load with every table;
+never compare absolutes across machine-state windows (§37.7) — interleave
+arms within rounds. Post-reboot healthy anchors: frag obl 15.87-15.95 /
+axz 35.0-35.2 @2048² SD4 jittered c32.
+
+**(1) Slot-poisoning discriminator** (`minimtl.mm`, self-contained, no VTK):
+
+```sh
+clang++ -std=c++17 -fobjc-arc -framework Metal -framework Foundation \
+    minimtl.mm -o minimtl
+for i in 1 2 3 4 5 6 7 8; do ./minimtl c 200; done   # compute: expect ALL ~0.35 ms healthy
+./minimtl r 200                                       # render control: always ~0.4 ms
+```
+
+Source (trivial full-screen compute write, waitUntilCompleted per frame):
+kernel `k` writes `float4(0.5)` via `texture2d<float, access::write>`
+(1024² RGBA32Float private), dispatch 8x8 threadgroups, `MTLCreateSystem-
+DefaultDevice` → `newLibraryWithSource` → PSO → per-frame
+commandBuffer/computeCommandEncoder/commit/wait timed with steady_clock.
+Bad-slot signature pre-reboot was strict per-launch alternation
+~0.33/~7.0 avg with min >=0.9 in bad launches; healthy boot = flat.
+To RE-POISON for testing: wedge a compute command buffer (e.g. MM_SEG
+oblique run past timeout, §37.16) and `kill -9` it mid-wait; slots then
+alternate until reboot.
+
+**(2) Extended comparison matrix (§38.9.3 table)** — generator, run from
+repo root (~25 min, 48 launches):
+
+```zsh
+#!/bin/zsh
+emulate -L zsh
+BIN="$PWD/build_macos_metal/bin/vtkMetalGLVisualComparison"
+DICOM="/Users/macair/Public/IMR/CTIMR/IMRToraceAddome"
+OUT="/tmp/cm_matrix"; mkdir -p $OUT; RES="$OUT/results.txt"; : > $RES
+BASE="VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 \
+VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 \
+VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1"
+run() {
+  local R=$1 VIEW=$2 ARM=$3 PAR=$4 extra="" cm=""
+  [[ "$VIEW" == az* ]] && extra="VTK_METAL_TEST_CAM_AZ=${VIEW#az} "
+  [[ "$VIEW" == ax* ]] && extra="VTK_METAL_TEST_CAM_AXIS=${VIEW#ax} "
+  [[ "$ARM" == synth ]] && cm="VTK_METAL_TEST_COMPUTE_MARCH=1 VTK_METAL_TEST_CM_SYNTH=1"
+  local ms=$(eval "env $BASE $extra $cm $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 100 --reps 1 --size ${R}x${R} --warmup 20" 2>/dev/null | grep "^DICOMVolume" | awk '{print $4}')
+  echo "$R $VIEW $ARM $PAR $ms" >> $RES; echo "$R $VIEW $ARM r$PAR: $ms"
+}
+for R in 2048 1024; do
+  CELLN=0
+  for VIEW in obl az45 az135 axx axy axz; do
+    if (( CELLN % 2 )); then
+      run $R $VIEW frag 1; run $R $VIEW synth 1; run $R $VIEW synth 2; run $R $VIEW frag 2
+    else
+      run $R $VIEW synth 1; run $R $VIEW frag 1; run $R $VIEW frag 2; run $R $VIEW synth 2
+    fi
+    ((CELLN++))
+  done
+done
+echo DONE
+```
+
+Extraction: Metal ms/f = field 4 of the `DICOMVolume` bench row (§29).
+Per-cell verdict = mean of each arm's two interleaved rounds; round spreads
+must stay <~1 ms or discard (machine-state window shifted mid-cell).
+
+**(3) Queue-probe validation (unsteered stability)**:
+
+```zsh
+B="--frames 100 --reps 1 --size 2048x2048 --warmup 20"
+for i in 1 2 3 4 5 6; do
+  eval "env $BASE VTK_METAL_TEST_COMPUTE_MARCH=1 VTK_METAL_TEST_CM_SYNTH=1 \
+    $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM $B" \
+    2>/tmp/cm_q.log | grep "^DICOMVolume" | awk '{print $4}'
+  grep "\[cmqueue\] selected" /tmp/cm_q.log     # probe latencies per mapper instance
+done
+```
+
+Healthy expectation: six runs within ±0.5 ms of each other regardless of
+launch parity; probe prints ~0.2-0.6 ms selections (a 3-4 ms first-candidate
+print means the probe correctly rejected a slow slot).
+
+**(4) Floor decomposition + headroom probes @2048²**:
+
+```zsh
+CM="VTK_METAL_TEST_COMPUTE_MARCH=1 VTK_METAL_TEST_CM_SYNTH=1"
+# floor ladder:  bare frame -> +blit -> +dispatch/write -> full march
+eval "env $BASE $CM VTK_METAL_TEST_CM_NOATLAS=1 VTK_METAL_TEST_CM_NOMARCH=1 $BIN ..."
+eval "env $BASE $CM VTK_METAL_TEST_CM_NOATLAS=1 VTK_METAL_TEST_CM_NOMARCH=1 \
+      VTK_METAL_TEST_CM_NOBLIT=1 $BIN ..."
+eval "env $BASE $CM $BIN ..."                       # full synth (~17.9 healthy)
+eval "env $BASE $CM VTK_METAL_TEST_CM_RGBA8=1 $BIN ..."   # refuted knob
+eval "env $BASE $CM VTK_METAL_TEST_CM_TG=32x4 $BIN ..."   # occupancy-cliff canary (~85 pre-fix class)
+```
+
+**(5) Render parity** (matched noise fields MANDATORY — leave IGN_JITTER
+unset only if IGN intended on BOTH sides, §6.5):
+
+```sh
+eval "env $BASE VTK_METAL_TEST_COMPUTE_MARCH=1 VTK_METAL_TEST_CM_SYNTH=1 \
+  $BIN --scene DICOMVolume --dicom $DICOM --frames 3 --size 512x512 --warmup 2 \
+  --out /tmp/cm_img/q"
+python3 PIL-diff /tmp/cm_img/q/DICOMVolume.gl.png vs .metal.png
+```
+
+Expected: unjittered mean|d|=0.000 (0.0008% px >1LSB vs fragment arm);
+jittered matched-field mean|d|<=0.08 (better than the historical GL↔Metal
+residual class).
+
 Tree state after this session: `VTK_METAL_TEST_EXIT_THETA` knob landed
 (default-OFF, byte-inert); VOLTRANSPOSE policy comments updated with the
 §38.3 matrix; everything else reverted clean (byte-parity verified). New

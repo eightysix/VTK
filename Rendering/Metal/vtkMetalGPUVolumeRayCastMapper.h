@@ -346,6 +346,17 @@ private:
   std::size_t SegPoolCapWords = 0;
   bool SegActiveThisFrame = false;
 
+  // §38.6 / §36.4 Design B — Compute Marcher & Ray-Binned Marching
+  void* ComputeMarchPipeline = nullptr; // id<MTLComputePipelineState> — volume_compute_march
+  void* RayBinClassifyPipeline = nullptr; // id<MTLComputePipelineState> — volume_ray_bin_classify
+  void* ComputeMarchBinnedPipeline = nullptr; // id<MTLComputePipelineState> — volume_compute_march_binned
+  void* RayBinIndicesBuffer = nullptr; // id<MTLBuffer> uint32 packed UVs per bin
+  void* RayBinCountersBuffer = nullptr; // id<MTLBuffer> uint32 atomic counters (CPU-zeroed per frame)
+  size_t RayBinIndicesCapBytes = 0;
+  std::unordered_map<VolumePipelineKey, void*, VolumePipelineKeyHash> ComputeMarchPipelineCache;
+  std::unordered_map<VolumePipelineKey, void*, VolumePipelineKeyHash> ComputeMarchBinnedPipelineCache;
+  void* ComputeMarchQueue = nullptr; // probe-selected fast-slot queue (§38.8)
+
   void* DepthStencilState = nullptr;     // id<MTLDepthStencilState>
   void* DepthTextureOcclusion = nullptr; // id<MTLTexture> — scene depth for early ray termination
   void* DummyDepthTexture = nullptr;     // id<MTLTexture> — 1x1 R32Float(1.0) fallback when no depth available
@@ -596,6 +607,9 @@ private:
   void* GetOrCreateVolumePipeline(void* mtlDevice, uint32_t type,
     uint32_t colorFormat, uint32_t depthFormat, uint32_t sampleCount,
     uint32_t featureMask);
+  bool EnsureComputeMarchResources(void* device, void* mtlQueue, int width, int height);
+  void* GetOrCreateComputeMarchPipeline(void* mtlDevice, uint32_t featureMask, bool binned);
+  void BindComputeMarchTextures(void* encoder, void* atlasA, void* atlasB, void* atlasC, void* outColor);
 
   // Mask / label map helpers
   bool UpdateMaskTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);

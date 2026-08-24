@@ -1435,12 +1435,124 @@ static float VolumeExitTheta()
   }
   return 0.0f;
 }
-// TEMP-DIAG \u00a735.14: run the full pre-pass machinery but keep the march on
-// the legacy-preamble pipeline (fc_segHop=false) \u2014 isolates the cost of the
+// TEMP-DIAG §35.14: run the full pre-pass machinery but keep the march on
+// the legacy-preamble pipeline (fc_segHop=false) — isolates the cost of the
 // consume code path from the atlas/build/offscreen/blit machinery.
 static bool VolumeSegConsumeSuppressed()
 {
   return getenv("VTK_METAL_TEST_MM_SEG_NOCONSUME") != nullptr;
+}
+
+// §38.6 / §36.4 Design B — Compute Marcher & Ray-Binned Marching gates
+static bool VolumeComputeMarchWanted()
+{
+  if (const char* v = getenv("VTK_METAL_TEST_COMPUTE_MARCH"))
+    return std::atoi(v) != 0;
+  return false;
+}
+
+static bool VolumeRayBinnedWanted()
+{
+  if (const char* v = getenv("VTK_METAL_TEST_RAY_BINNED"))
+    return std::atoi(v) != 0;
+  return false;
+}
+
+// §38.6 compute-march probes (TEMP-DIAG): dispatch floor + forced march
+// length + threadgroup shape. All default-off / no-op.
+// Must match the MSL layout exactly: struct ComputeMarchControl { uint; uint; uint; }.
+struct ComputeMarchControl { uint32_t floorMode; uint32_t stepCap; uint32_t synthMode; };
+static bool VolumeComputeMarchFloor()
+{
+  return getenv("VTK_METAL_TEST_CM_FLOOR") != nullptr;
+}
+
+// CM_SYNTH: rebuild ray setup in-kernel (no atlas raster pass at all).
+static bool VolumeComputeMarchSynth()
+{
+  if (const char* v = getenv("VTK_METAL_TEST_CM_SYNTH"))
+    return std::atoi(v) != 0;
+  return false;
+}
+
+static int VolumeComputeMarchStepCap()
+{
+  if (const char* v = getenv("VTK_METAL_TEST_CM_FSTEPS"))
+    return std::atoi(v);
+  return 0;
+}
+
+static void VolumeComputeMarchTG(int& tgw, int& tgh)
+{
+  tgw = 8; tgh = 8;
+  if (const char* v = getenv("VTK_METAL_TEST_CM_TG"))
+    sscanf(v, "%dx%d", &tgw, &tgh);
+}
+
+// Floor decomposition: skip the atlas raster pass and/or the march encoder.
+static bool VolumeComputeMarchNoAtlas()
+{
+  return getenv("VTK_METAL_TEST_CM_NOATLAS") != nullptr;
+}
+static bool VolumeComputeMarchNoMarch()
+{
+  return getenv("VTK_METAL_TEST_CM_NOMARCH") != nullptr;
+}
+// TEMP-DIAG: skip exposing the result to Phase 3b entirely (isolates blit
+// share of the frame floor). Leaves the volume uncomposited — timing only.
+static bool VolumeComputeMarchNoBlit()
+{
+  return getenv("VTK_METAL_TEST_CM_NOBLIT") != nullptr;
+}
+
+//------------------------------------------------------------------------------
+// Root-caused platform hazard (see HARNESS_VS_APP_GAP.md §38.8): Metal command
+// queues are handed out round-robin from two global firmware slots; one slot
+// adds a fixed ~7 ms completion latency (≈3.4 ms pipelined throughput cost)
+// to COMPUTE command buffers for the queue's entire lifetime. Render/blit
+// submissions are unaffected. Slots stick per queue, so probing candidates at
+// startup and keeping a fast one makes the compute march immune.
+static id<MTLCommandQueue> ProbeAndSelectFastQueue(id<MTLDevice> device,
+  int candidates)
+{
+  // Trivial kernel source compiled once here; independent of shader library.
+  NSString* src = @R"(#include <metal_stdlib>
+using namespace metal;
+kernel void vtk_queue_probe() {
+}
+)";
+  NSError* err = nil;
+  id<MTLLibrary> srcLib = [device newLibraryWithSource:src options:nil error:&err];
+  if (!srcLib) return nil;
+  id<MTLFunction> fn = [srcLib newFunctionWithName:@"vtk_queue_probe"];
+  if (!fn) return nil;
+  id<MTLComputePipelineState> ps =
+    [device newComputePipelineStateWithFunction:fn error:&err];
+  if (!ps) return nil;
+
+  id<MTLCommandQueue> bestQ = nil;
+  double bestMs = 1e9;
+  for (int i = 0; i < candidates; ++i)
+  {
+    id<MTLCommandQueue> qq = [device newCommandQueue];
+    if (!qq) continue;
+    id<MTLCommandBuffer> cb = [qq commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc dispatchThreadgroups:MTLSizeMake(1,1,1)
+        threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+    [enc endEncoding];
+    auto t0 = std::chrono::steady_clock::now();
+    [cb commit];
+    [cb waitUntilCompleted];
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    fprintf(stderr, "[cmqueue] probe queue %d: %.3f ms\n", i, ms);
+    if (ms < bestMs) { bestMs = ms; bestQ = qq; }
+  }
+  fprintf(stderr, "[cmqueue] selected queue with %.3f ms probe latency\n",
+    bestMs);
+  return bestQ;
 }
 
 // §33.2 item 2 (VTK_METAL_TEST_MM_EPS): emptiness threshold for the GPU
@@ -1915,6 +2027,21 @@ static inline void SetFragmentTextureOrFallback(
     ? (__bridge id<MTLTexture>)texture
     : (__bridge id<MTLTexture>)fallback;
   [encoder setFragmentTexture:tex atIndex:index];
+}
+
+static inline void SetComputeTextureOrFallback(
+  id<MTLComputeCommandEncoder> encoder,
+  NSUInteger index,
+  void* texture,
+  void* fallback)
+{
+  id<MTLTexture> tex = texture
+    ? (__bridge id<MTLTexture>)texture
+    : (__bridge id<MTLTexture>)fallback;
+  if (tex)
+  {
+    [encoder setTexture:tex atIndex:index];
+  }
 }
 
 }
@@ -2411,7 +2538,8 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureSegResources(
     // Offscreen march target: RGBA16Float to MATCH the OffscreenLayer
     // pipeline's declared color format exactly.
     id<MTLTexture> marchTex = NewTexture2D(device, MTLPixelFormatRGBA16Float,
-      width, height, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead,
+      width, height,
+      MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
       MTLStorageModePrivate);
     if (!marchTex)
     {
@@ -2450,6 +2578,73 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureSegResources(
     this->SegAtlasWidth = width;
     this->SegAtlasHeight = height;
   }
+  return true;
+}
+
+//------------------------------------------------------------------------------
+// §38.6 / §36.4 Design B — Ensure resources for compute marcher and ray binning
+bool vtkMetalGPUVolumeRayCastMapper::EnsureComputeMarchResources(
+  void* deviceVoid, void* mtlQueueVoid, int width, int height)
+{
+  // CM_SYNTH never reads the atlas planes — skip their allocation entirely
+  // (3x RGBA32F fullscreen: ~50 MB @2048² of untouched private memory).
+  const bool synthLayout = VolumeComputeMarchSynth();
+  if (!synthLayout &&
+      !this->EnsureSegResources(deviceVoid, mtlQueueVoid, width, height))
+  {
+    return false;
+  }
+
+  id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
+  if (!this->SegMarchTexture)
+  {
+    // Offscreen march target. Default RGBA16Float matches the OffscreenLayer
+    // pipeline's declared color format; CM_RGBA8 switches to BGRA8Unorm —
+    // the SAME precision class as the fragment DirectScreen path (which
+    // renders into the 8-bit drawable), halving march-write + blit bytes.
+    const bool rgba8 = getenv("VTK_METAL_TEST_CM_RGBA8") != nullptr;
+    id<MTLTexture> marchTex = NewTexture2D(device,
+      rgba8 ? MTLPixelFormatBGRA8Unorm : MTLPixelFormatRGBA16Float,
+      width, height,
+      MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
+        MTLTextureUsageShaderWrite,
+      MTLStorageModePrivate);
+    if (!marchTex)
+    {
+      vtkErrorMacro("Failed to create compute march target");
+      return false;
+    }
+    AssignMetalObject(this->SegMarchTexture, marchTex);
+  }
+
+  // 4 bins × width × height packed UVs
+  const size_t neededBytes = static_cast<size_t>(width) * height * sizeof(uint32_t) * 4;
+  if (!this->RayBinIndicesBuffer || this->RayBinIndicesCapBytes < neededBytes)
+  {
+    ReleaseMetalObject(this->RayBinIndicesBuffer);
+    id<MTLBuffer> binBuf = [device newBufferWithLength:neededBytes
+                                               options:MTLResourceStorageModePrivate];
+    if (!binBuf)
+    {
+      vtkErrorMacro("Failed to allocate RayBinIndicesBuffer");
+      return false;
+    }
+    AssignMetalObject(this->RayBinIndicesBuffer, binBuf);
+    this->RayBinIndicesCapBytes = neededBytes;
+  }
+
+  if (!this->RayBinCountersBuffer)
+  {
+    id<MTLBuffer> cntBuf = [device newBufferWithLength:16 * sizeof(uint32_t)
+                                               options:MTLResourceStorageModeShared];
+    if (!cntBuf)
+    {
+      vtkErrorMacro("Failed to allocate RayBinCountersBuffer");
+      return false;
+    }
+    AssignMetalObject(this->RayBinCountersBuffer, cntBuf);
+  }
+
   return true;
 }
 
@@ -3368,6 +3563,25 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
     [(__bridge id)entry.second release];
   }
   this->PipelineCache.clear();
+
+  // §38.6 / §36.4 Design B: Clear compute march pipelines and buffers
+  ReleaseMetalObject(this->ComputeMarchPipeline);
+  ReleaseMetalObject(this->RayBinClassifyPipeline);
+  ReleaseMetalObject(this->ComputeMarchBinnedPipeline);
+  ReleaseMetalObject(this->RayBinIndicesBuffer);
+  ReleaseMetalObject(this->RayBinCountersBuffer);
+  ReleaseMetalObject(this->ComputeMarchQueue);
+  this->RayBinIndicesCapBytes = 0;
+  for (auto& entry : this->ComputeMarchPipelineCache)
+  {
+    [(__bridge id)entry.second release];
+  }
+  this->ComputeMarchPipelineCache.clear();
+  for (auto& entry : this->ComputeMarchBinnedPipelineCache)
+  {
+    [(__bridge id)entry.second release];
+  }
+  this->ComputeMarchBinnedPipelineCache.clear();
 
   for (int i = 0; i < 3; ++i)
   {
@@ -7849,6 +8063,188 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
 }
 
 //------------------------------------------------------------------------------
+// §38.6 / §36.4 Design B — Get or create specialized compute marcher pipeline
+void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateComputeMarchPipeline(
+  void* mtlDeviceVoid, uint32_t featureMask, bool binned)
+{
+  VolumePipelineKey key;
+  key.type = binned ? 100u : 101u;
+  key.colorFormat = static_cast<uint32_t>(MTLPixelFormatRGBA16Float);
+  key.depthFormat = static_cast<uint32_t>(MTLPixelFormatInvalid);
+  key.sampleCount = 1;
+  key.featureMask = featureMask;
+  key.featureMaskExtra = this->VolumeTextureAxisDepth;
+
+  auto& cache = binned ? this->ComputeMarchBinnedPipelineCache : this->ComputeMarchPipelineCache;
+  auto it = cache.find(key);
+  if (it != cache.end())
+  {
+    return it->second;
+  }
+
+  id<MTLDevice> mtlDevice = (__bridge id<MTLDevice>)mtlDeviceVoid;
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
+  if (!library)
+  {
+    vtkErrorMacro("Compute march pipeline: shader library missing");
+    return nullptr;
+  }
+
+  MTLFunctionConstantValues* constants = [[MTLFunctionConstantValues alloc] init];
+
+  BOOL shading = (featureMask & VolumeFeature_Shading) ? YES : NO;
+  BOOL gradOp  = (featureMask & VolumeFeature_GradientOpacity) ? YES : NO;
+  BOOL mask    = (featureMask & VolumeFeature_Mask) ? YES : NO;
+  BOOL minmax  = (featureMask & VolumeFeature_MinMax) ? YES : NO;
+  BOOL normalTex = (featureMask & VolumeFeature_NormalTexture) ? YES : NO;
+  BOOL linearInterp = (featureMask & VolumeFeature_LinearInterpolation) ? YES : NO;
+  BOOL computeNormalFromOpacity =
+    (featureMask & VolumeFeature_ComputeNormalFromOpacity) ? YES : NO;
+  BOOL independentComp =
+    (featureMask & VolumeFeature_IndependentComponents) ? YES : NO;
+
+  [constants setConstantValue:&shading type:MTLDataTypeBool withName:@"fc_shading"];
+  [constants setConstantValue:&gradOp  type:MTLDataTypeBool withName:@"fc_gradientOpacity"];
+  [constants setConstantValue:&mask    type:MTLDataTypeBool withName:@"fc_mask"];
+  [constants setConstantValue:&minmax  type:MTLDataTypeBool withName:@"fc_minmax"];
+  [constants setConstantValue:&normalTex type:MTLDataTypeBool withName:@"fc_normalTexture"];
+  [constants setConstantValue:&linearInterp type:MTLDataTypeBool withName:@"fc_linearInterpolation"];
+  [constants setConstantValue:&computeNormalFromOpacity type:MTLDataTypeBool
+                      withName:@"fc_computeNormalFromOpacity"];
+  [constants setConstantValue:&independentComp type:MTLDataTypeBool
+                      withName:@"fc_independentComponents"];
+  BOOL transfer2D = (featureMask & VolumeFeature_Transfer2D) ? YES : NO;
+  BOOL rectilinear = (featureMask & VolumeFeature_Rectilinear) ? YES : NO;
+  BOOL defaultLighting = (featureMask & VolumeFeature_DefaultLighting) ? YES : NO;
+  int lightCount = (featureMask >> VolumeFeature_LightCountShift) & 0xFu;
+  BOOL dependentRGBA = (featureMask & VolumeFeature_DependentRGBA) ? YES : NO;
+  BOOL dependentLA = (featureMask & VolumeFeature_DependentLA) ? YES : NO;
+  BOOL renderToTexture = (featureMask & VolumeFeature_RenderToImage) ? YES : NO;
+
+  [constants setConstantValue:&transfer2D type:MTLDataTypeBool withName:@"fc_transfer2D"];
+  [constants setConstantValue:&rectilinear type:MTLDataTypeBool withName:@"fc_rectilinear"];
+  [constants setConstantValue:&defaultLighting type:MTLDataTypeBool
+                      withName:@"fc_defaultLighting"];
+  [constants setConstantValue:&lightCount type:MTLDataTypeInt withName:@"fc_lightCount"];
+  [constants setConstantValue:&dependentRGBA type:MTLDataTypeBool withName:@"fc_dependentRGBA"];
+  [constants setConstantValue:&dependentLA type:MTLDataTypeBool withName:@"fc_dependentLA"];
+  [constants setConstantValue:&renderToTexture type:MTLDataTypeBool
+                      withName:@"fc_renderToTexture"];
+  BOOL cropping = (featureMask & VolumeFeature_Cropping) ? YES : NO;
+  BOOL blanking = (featureMask & VolumeFeature_Blanking) ? YES : NO;
+  [constants setConstantValue:&cropping type:MTLDataTypeBool withName:@"fc_cropping"];
+  [constants setConstantValue:&blanking type:MTLDataTypeBool withName:@"fc_blanking"];
+
+  const int marchVariant =
+    (featureMask & VolumeFeature_MarchVariantMask) >> VolumeFeature_MarchVariantShift;
+  [constants setConstantValue:&marchVariant type:MTLDataTypeInt
+                     withName:@"fc_marchVariant"];
+
+  int slabMode = (featureMask & VolumeFeature_Slab) ? 1 : 0;
+  [constants setConstantValue:&slabMode type:MTLDataTypeInt withName:@"fc_slabMode"];
+
+  BOOL marchDoExit = (featureMask & VolumeFeature_MarchDoExit) ? YES : NO;
+  [constants setConstantValue:&marchDoExit type:MTLDataTypeBool
+                     withName:@"fc_doExit"];
+
+  BOOL volRg8 = (featureMask & VolumeFeature_VolRg8) ? YES : NO;
+  [constants setConstantValue:&volRg8 type:MTLDataTypeBool
+                     withName:@"fc_volRg8"];
+
+  BOOL volTransposed = (featureMask & VolumeFeature_VolTransposed) ? YES : NO;
+  [constants setConstantValue:&volTransposed type:MTLDataTypeBool
+                     withName:@"fc_volTransposed"];
+  BOOL volTransposedY = (this->VolumeTextureAxisDepth == 2) ? YES : NO;
+  [constants setConstantValue:&volTransposedY type:MTLDataTypeBool
+                     withName:@"fc_volTransposedY"];
+
+  BOOL mmBlocks = (VolumeMinMaxBlocksWanted(this->UseGPUMinMax,
+                       this->SampleDistance) &&
+                   this->MinMaxBlockTexture != nullptr) ? YES : NO;
+  [constants setConstantValue:&mmBlocks type:MTLDataTypeBool
+                     withName:@"fc_mmBlocks"];
+  BOOL mmSuper = (VolumeMinMaxSuperWanted(this->UseGPUMinMax,
+                      this->SampleDistance) &&
+                  this->MinMaxSuperTexture != nullptr) ? YES : NO;
+  [constants setConstantValue:&mmSuper type:MTLDataTypeBool
+                     withName:@"fc_mmSuper"];
+
+  BOOL segHop = NO;
+  [constants setConstantValue:&segHop type:MTLDataTypeBool
+                     withName:@"fc_segHop"];
+
+  BOOL exitTheta = (VolumeExitTheta() > 0.0f) ? YES : NO;
+  [constants setConstantValue:&exitTheta type:MTLDataTypeBool
+                     withName:@"fc_exitTheta"];
+
+  int blendMode = 0;
+  if (featureMask & VolumeFeature_BlendMaximumIntensity)
+    blendMode = static_cast<int>(vtkVolumeMapper::MAXIMUM_INTENSITY_BLEND);
+  else if (featureMask & VolumeFeature_BlendMinimumIntensity)
+    blendMode = static_cast<int>(vtkVolumeMapper::MINIMUM_INTENSITY_BLEND);
+  else if (featureMask & VolumeFeature_BlendAverageIntensity)
+    blendMode = static_cast<int>(vtkVolumeMapper::AVERAGE_INTENSITY_BLEND);
+  else if (featureMask & VolumeFeature_BlendAdditive)
+    blendMode = static_cast<int>(vtkVolumeMapper::ADDITIVE_BLEND);
+  [constants setConstantValue:&blendMode type:MTLDataTypeInt withName:@"fc_blendMode"];
+
+  NSError* err = nil;
+  NSString* funcName = binned ? @"volume_compute_march_binned" : @"volume_compute_march";
+  id<MTLFunction> fn = [library newFunctionWithName:funcName constantValues:constants error:&err];
+  [constants release];
+  if (!fn)
+  {
+    vtkErrorMacro("Failed to specialize " << [funcName UTF8String] << ": "
+                  << [[err localizedDescription] UTF8String]);
+    return nullptr;
+  }
+
+  id<MTLComputePipelineState> cps = [mtlDevice newComputePipelineStateWithFunction:fn error:&err];
+  [fn release];
+  if (!cps)
+  {
+    vtkErrorMacro("Failed to create compute pipeline for " << [funcName UTF8String] << ": "
+                  << [[err localizedDescription] UTF8String]);
+    return nullptr;
+  }
+
+  void* res = (__bridge void*)cps;
+  cache[key] = res;
+  return res;
+}
+
+//------------------------------------------------------------------------------
+void vtkMetalGPUVolumeRayCastMapper::BindComputeMarchTextures(
+  void* encoderVoid, void* atlasAVoid, void* atlasBVoid, void* atlasCVoid, void* outColorVoid)
+{
+  id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoderVoid;
+  id<MTLTexture> atlasA = (__bridge id<MTLTexture>)atlasAVoid;
+  id<MTLTexture> atlasB = (__bridge id<MTLTexture>)atlasBVoid;
+  id<MTLTexture> atlasC = (__bridge id<MTLTexture>)atlasCVoid;
+  id<MTLTexture> outColor = (__bridge id<MTLTexture>)outColorVoid;
+
+  [enc setTexture:atlasA atIndex:0];
+  [enc setTexture:atlasB atIndex:1];
+  [enc setTexture:atlasC atIndex:3];
+  [enc setTexture:outColor atIndex:4];
+  SetComputeTextureOrFallback(enc, 5, this->VolumeTexture, this->DummyVolumeTexture);
+  [enc setTexture:(__bridge id<MTLTexture>)this->ColorOpacityTexture atIndex:6];
+  SetComputeTextureOrFallback(enc, 7, this->ComponentTransferFunctionTexture1, this->ColorOpacityTexture);
+  SetComputeTextureOrFallback(enc, 8, this->ComponentTransferFunctionTexture2, this->ColorOpacityTexture);
+  SetComputeTextureOrFallback(enc, 9, this->ComponentTransferFunctionTexture3, this->ColorOpacityTexture);
+  SetComputeTextureOrFallback(enc, 10, this->Transfer2DTexture, this->ColorOpacityTexture);
+  SetComputeTextureOrFallback(enc, 11, this->Transfer2DYAxisTexture, this->DummyVolumeTexture);
+  SetComputeTextureOrFallback(enc, 12, this->GradientOpacityTexture, this->ColorOpacityTexture);
+  SetComputeTextureOrFallback(enc, 13, this->MaskTexture, this->DummyMaskTexture);
+  SetComputeTextureOrFallback(enc, 14, this->LabelMapTransferTexture, this->ColorOpacityTexture);
+  SetComputeTextureOrFallback(enc, 15, this->MinMaxTexture, this->DummyMinMaxTexture);
+  SetComputeTextureOrFallback(enc, 16, this->MinMaxBlockTexture, this->DummyMinMaxTexture);
+  SetComputeTextureOrFallback(enc, 17, this->MinMaxSuperTexture, this->DummyMinMaxTexture);
+  SetComputeTextureOrFallback(enc, 18, this->GradientNormalTexture, this->DummyVolumeTexture);
+  SetComputeTextureOrFallback(enc, 19, this->BlankingTexture, this->DummyVolumeTexture);
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
   void* encoderVoid, void* uniformBufVoid, void* pipelineStateVoid, bool hasDepth)
 {
@@ -9920,6 +10316,245 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         AssignRetainedMetalObject(this->ImageSampleColorTexture, finalTex);
         this->ImageSampleFBOWidth = renderWidth;
         this->ImageSampleFBOHeight = renderHeight;
+      }
+      else if (!selectionRender &&
+               this->GetBlendMode() == vtkVolumeMapper::COMPOSITE_BLEND &&
+               VolumeComputeMarchWanted() && !usePartitions)
+      {
+        // §38.6 / §36.4 Design B — Compute Marcher / Ray-Binned Marching
+        id<MTLRenderCommandEncoder> curEnc =
+          (__bridge id<MTLRenderCommandEncoder>)
+            metalRenderWindow->GetCurrentRenderCommandEncoder();
+        if (curEnc)
+        {
+          [curEnc endEncoding];
+          metalRenderWindow->SetCurrentRenderCommandEncoder(nullptr);
+        }
+
+        if (!this->EnsureComputeMarchResources(mtlDevice, mtlQueue,
+              renderWidth, renderHeight))
+        {
+          return;
+        }
+
+        id<MTLTexture> atlasA = (__bridge id<MTLTexture>)this->SegAtlasATexture;
+        id<MTLTexture> atlasB = (__bridge id<MTLTexture>)this->SegAtlasBTexture;
+        id<MTLTexture> atlasC = (__bridge id<MTLTexture>)this->SegAtlasCTexture;
+        id<MTLTexture> target = (__bridge id<MTLTexture>)this->SegMarchTexture;
+
+        // -- stage 1: ray-atlas raster through volume proxy geometry --
+        // CLEAR, not DontCare: the compute marcher runs one thread per screen
+        // pixel and trusts the atlas blindly. Texels outside the proxy
+        // footprint must read back as zeros (steps<=0 => immediate exit) or a
+        // garbage A.w / NaN evalStep combination marches forever and wedges
+        // the command buffer (waitUntilCompleted never returns).
+        if (!(VolumeComputeMarchNoAtlas() || VolumeComputeMarchSynth()))
+        {
+        MTLRenderPassDescriptor* arpd =
+          [MTLRenderPassDescriptor renderPassDescriptor];
+        arpd.colorAttachments[0].texture = atlasA;
+        arpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+        arpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+        arpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+        arpd.colorAttachments[1].texture = atlasB;
+        arpd.colorAttachments[1].loadAction = MTLLoadActionClear;
+        arpd.colorAttachments[1].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+        arpd.colorAttachments[1].storeAction = MTLStoreActionStore;
+        arpd.colorAttachments[2].texture = atlasC;
+        arpd.colorAttachments[2].loadAction = MTLLoadActionClear;
+        arpd.colorAttachments[2].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+        arpd.colorAttachments[2].storeAction = MTLStoreActionStore;
+
+        id<MTLRenderCommandEncoder> atlasEnc =
+          [commandBuffer renderCommandEncoderWithDescriptor:arpd];
+        atlasEnc.label = @"VTK Volume Compute RayAtlas";
+        MTLViewport amvp;
+        amvp.originX = 0; amvp.originY = 0;
+        amvp.width = renderWidth; amvp.height = renderHeight;
+        amvp.znear = 0.0; amvp.zfar = 1.0;
+        [atlasEnc setViewport:amvp];
+
+        void* atlasPso = this->GetOrCreateVolumePipeline(mtlDevice,
+          static_cast<uint32_t>(VolumePipelineType::RayAtlas),
+          MTLPixelFormatRGBA32Float, MTLPixelFormatInvalid, 1, featureMask);
+        if (!atlasPso)
+        {
+          [atlasEnc endEncoding];
+          return;
+        }
+        this->BindEncoderResources(atlasEnc, uniformBuf, atlasPso, false);
+        this->DrawBlocks(atlasEnc, uniformBuf, ren, vol, &uniforms,
+          invModelMatrix);
+        [atlasEnc endEncoding];
+        } // !VolumeComputeMarchNoAtlas
+
+        PerBlockData compPbd;
+        this->BuildPerBlockData(compPbd, &uniforms);
+
+        id<MTLBuffer> rectCoordsBuf =
+          this->RectCoordsBuffer ? (__bridge id<MTLBuffer>)this->RectCoordsBuffer
+                                 : (__bridge id<MTLBuffer>)this->DummyRectCoordsBuffer;
+
+        // RAY_BINNED requires the atlas raster (classify reads atlasA);
+        // synth mode has no atlas, so binning falls back to the 2D marcher.
+        const bool binned = VolumeRayBinnedWanted() && !VolumeComputeMarchSynth();
+        if (binned && !VolumeComputeMarchNoMarch())
+        {
+          // -- stage 2a: ray bin classification --
+          id<MTLBuffer> binCntBuf = (__bridge id<MTLBuffer>)this->RayBinCountersBuffer;
+          std::memset(binCntBuf.contents, 0, 16 * sizeof(uint32_t));
+          [binCntBuf didModifyRange:NSMakeRange(0, 16 * sizeof(uint32_t))];
+
+          const uint32_t numBins = 4u;
+          const uint32_t binCap = static_cast<uint32_t>(renderWidth * renderHeight);
+          uint32_t binMeta[4] = { static_cast<uint32_t>(renderWidth),
+                                  static_cast<uint32_t>(renderHeight),
+                                  binCap,
+                                  numBins };
+
+          if (!this->RayBinClassifyPipeline)
+          {
+            id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
+            id<MTLFunction> fn = [library newFunctionWithName:@"volume_ray_bin_classify"];
+            if (fn)
+            {
+              NSError* err = nil;
+              id<MTLComputePipelineState> cps = [mtlDevice newComputePipelineStateWithFunction:fn error:&err];
+              [fn release];
+              if (cps)
+              {
+                AssignMetalObject(this->RayBinClassifyPipeline, cps);
+              }
+            }
+          }
+
+          if (this->RayBinClassifyPipeline)
+          {
+            id<MTLComputeCommandEncoder> classEnc = [commandBuffer computeCommandEncoder];
+            classEnc.label = @"VTK Volume RayBin Classify";
+            [classEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)this->RayBinClassifyPipeline];
+            [classEnc setTexture:atlasA atIndex:0];
+            [classEnc setBuffer:binCntBuf offset:0 atIndex:0];
+            [classEnc setBuffer:(__bridge id<MTLBuffer>)this->RayBinIndicesBuffer offset:0 atIndex:1];
+            [classEnc setBytes:&binMeta length:sizeof(binMeta) atIndex:2];
+            MTLSize classTg = MTLSizeMake(16, 16, 1);
+            MTLSize classGroups = MTLSizeMake((renderWidth + 15) / 16, (renderHeight + 15) / 16, 1);
+            [classEnc dispatchThreadgroups:classGroups threadsPerThreadgroup:classTg];
+            [classEnc endEncoding];
+          }
+
+          // -- stage 2b: binned compute marcher --
+          void* marchBinnedPso = this->GetOrCreateComputeMarchPipeline(mtlDevice, featureMask, true);
+          if (marchBinnedPso)
+          {
+            // Only classified rays are written back, so define the rest of
+            // the target first (its contents persist across frames).
+            MTLRenderPassDescriptor* crpd =
+              [MTLRenderPassDescriptor renderPassDescriptor];
+            crpd.colorAttachments[0].texture = target;
+            crpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+            crpd.colorAttachments[0].clearColor =
+              MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+            crpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> clearEnc =
+              [commandBuffer renderCommandEncoderWithDescriptor:crpd];
+            [clearEnc endEncoding];
+
+            id<MTLComputeCommandEncoder> marchEnc = [commandBuffer computeCommandEncoder];
+            marchEnc.label = @"VTK Volume ComputeMarch Binned";
+            [marchEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)marchBinnedPso];
+
+            this->BindComputeMarchTextures((__bridge void*)marchEnc, (__bridge void*)atlasA,
+              (__bridge void*)atlasB, (__bridge void*)atlasC, (__bridge void*)target);
+
+            [marchEnc setBuffer:(__bridge id<MTLBuffer>)this->RayBinIndicesBuffer offset:0 atIndex:0];
+            // Live per-bin counts (buffer 5): threads beyond this frame's
+            // count must exit without marching — unwritten index slots hold
+            // stale UVs from previous frames (private storage persists).
+            [marchEnc setBuffer:binCntBuf offset:0 atIndex:5];
+            [marchEnc setBuffer:(__bridge id<MTLBuffer>)uniformBuf offset:0 atIndex:1];
+            [marchEnc setBytes:&compPbd length:sizeof(compPbd) atIndex:2];
+            [marchEnc setBuffer:rectCoordsBuf offset:0 atIndex:3];
+            [marchEnc setBytes:&lightUniforms length:sizeof(lightUniforms) atIndex:4];
+
+            ComputeMarchControl cmc{ VolumeComputeMarchFloor() ? 1u : 0u,
+                                     static_cast<uint32_t>(VolumeComputeMarchStepCap()) };
+            [marchEnc setBytes:&cmc length:sizeof(cmc) atIndex:7];
+            for (uint32_t bIdx = 0; bIdx < numBins; ++bIdx)
+            {
+              uint32_t binnedMeta[2] = { binCap, bIdx * binCap };
+              [marchEnc setBytes:&binnedMeta length:sizeof(binnedMeta) atIndex:6];
+
+              MTLSize tg = MTLSizeMake(32, 1, 1);
+              MTLSize groups = MTLSizeMake((binCap + 31) / 32, 1, 1);
+              [marchEnc dispatchThreadgroups:groups threadsPerThreadgroup:tg];
+            }
+            [marchEnc endEncoding];
+          }
+        }
+        else if (!VolumeComputeMarchNoMarch())
+        {
+          // -- stage 2: 2D compute marcher --
+          void* marchPso = this->GetOrCreateComputeMarchPipeline(mtlDevice, featureMask, false);
+          if (marchPso)
+          {
+            id<MTLCommandQueue> marchQ = (__bridge id<MTLCommandQueue>)this->ComputeMarchQueue;
+            if (!marchQ && VolumeComputeMarchSynth() &&
+                getenv("VTK_METAL_TEST_CM_QUEUEPROBE") == nullptr)
+            {
+              // SYNTH needs nothing from the window queue before marching, so
+              // the march can run on a probe-selected fast-slot queue; the CPU
+              // wait below keeps Phase-3b ordering trivially correct.
+              marchQ = ProbeAndSelectFastQueue((__bridge id<MTLDevice>)mtlDevice, 3);
+              this->ComputeMarchQueue = (__bridge void*)marchQ;
+              [(__bridge id)marchQ retain];
+            }
+            id<MTLCommandBuffer> cbUse = marchQ ? [marchQ commandBuffer] : commandBuffer;
+            id<MTLComputeCommandEncoder> marchEnc = [cbUse computeCommandEncoder];
+            marchEnc.label = @"VTK Volume ComputeMarch 2D";
+            [marchEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)marchPso];
+
+            this->BindComputeMarchTextures((__bridge void*)marchEnc, (__bridge void*)atlasA,
+              (__bridge void*)atlasB, (__bridge void*)atlasC, (__bridge void*)target);
+
+            [marchEnc setBuffer:(__bridge id<MTLBuffer>)uniformBuf offset:0 atIndex:1];
+            [marchEnc setBytes:&compPbd length:sizeof(compPbd) atIndex:2];
+            [marchEnc setBuffer:rectCoordsBuf offset:0 atIndex:3];
+            [marchEnc setBytes:&lightUniforms length:sizeof(lightUniforms) atIndex:4];
+
+            ComputeMarchControl cmc{ VolumeComputeMarchFloor() ? 1u : 0u,
+                                     static_cast<uint32_t>(VolumeComputeMarchStepCap()),
+                                     VolumeComputeMarchSynth() ? 1u : 0u };
+            [marchEnc setBytes:&cmc length:sizeof(cmc) atIndex:7];
+            // Scene-depth early-out source for CM_SYNTH (setupVolumeRay).
+            [marchEnc setTexture:(__bridge id<MTLTexture>)(this->DepthTextureOcclusion
+                ? this->DepthTextureOcclusion : this->DummyDepthTexture)
+                        atIndex:20];
+
+            int tgw = 8, tgh = 8;
+            VolumeComputeMarchTG(tgw, tgh);
+            MTLSize tg = MTLSizeMake(tgw, tgh, 1);
+            MTLSize groups = MTLSizeMake((renderWidth + tgw - 1) / tgw,
+                                         (renderHeight + tgh - 1) / tgh, 1);
+            [marchEnc dispatchThreadgroups:groups threadsPerThreadgroup:tg];
+            [marchEnc endEncoding];
+            if (cbUse != commandBuffer)
+            {
+              // Private-queue march: commit + CPU-wait so the result is
+              // ordered before Phase 3b samples it from the window queue.
+              [cbUse commit];
+              [cbUse waitUntilCompleted];
+            }
+          }
+        }
+
+        // Phase 3b blits this over the drawable.
+        if (!VolumeComputeMarchNoBlit())
+        {
+          AssignRetainedMetalObject(this->ImageSampleColorTexture, target);
+          this->ImageSampleFBOWidth = renderWidth;
+          this->ImageSampleFBOHeight = renderHeight;
+        }
       }
       else if (!selectionRender &&
                this->GetBlendMode() == vtkVolumeMapper::COMPOSITE_BLEND &&
