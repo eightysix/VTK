@@ -1,0 +1,469 @@
+diff --git a/Rendering/Metal/Shaders/MetalShaders.metal b/Rendering/Metal/Shaders/MetalShaders.metal
+index 30f109fd79..5718eb0dfc 100644
+--- a/Rendering/Metal/Shaders/MetalShaders.metal
++++ b/Rendering/Metal/Shaders/MetalShaders.metal
+@@ -2804,6 +2804,44 @@ constant int fc_cmBatch [[function_constant(39)]];
+ // legacy-batch output semantics at reduced register pressure.
+ constant bool fc_cmSplit [[function_constant(40)]];
+ 
++// §38.15 block-state liveness diet (VTK_METAL_TEST_MM_NOSTATE): when true,
++// the cross-batch block-summary state cache is dropped and each preamble
++// invocation re-probes the summary once. Skip decisions are unchanged (the
++// summary textures are immutable within a frame), but mv9Blk/mv9BlkState no
++// longer stay live across the composite ladder, so the unrolled fetch/
++// composite body regains their registers. Measured root of the small-
++// viewport blocks-on tax: identical occupancy, +43% per-sample consume cost
++// purely from liveness-constrained scheduling at low warp counts.
++constant bool fc_mmNoState [[function_constant(41)]];
++
++// §38.15 out-of-line preamble walk (VTK_METAL_TEST_MM_OOL): when true, the
++// occupancy preamble runs in the noinline mmPreambleWalk helper so its
++// register allocation cannot couple to the composite ladder's.
++constant bool fc_mmOol [[function_constant(42)]];
++
++// §38.15 tap bisect (VTK_METAL_TEST_MM_NOTAP): when true the block-summary
++// texel read is replaced by the constant 0.5 (mixed state). All index math,
++// branching and loop structure remain; only the sampler read disappears.
++// Diagnostic for localizing the small-viewport blocks-on tax.
++constant bool fc_mmNoTap [[function_constant(43)]];
++
++// §38.15 summary prefetch (VTK_METAL_TEST_MM_PRE): issue the NEXT block's
++// summary read immediately before the composite ladder so its cache-miss
++// latency overlaps the ladder's volume fetches instead of serializing the
++// next preamble walk. At thumbnail viewports the volume stream evicts the
++// tiny summary between taps (sparse footprints go coldest — the measured
++// BS16>BS8 inversion), and the walk consumes the read on a loop-carried
++// dependency chain; overlapping it is the root-level remedy. Decisions are
++// unchanged: the prefetched texel is the same memory the walk would read.
++constant bool fc_mmPre [[function_constant(44)]];
++
++// §38.15 alt-source bisect (VTK_METAL_TEST_MM_ALTTAP): perform the
++// block-state read against the FINE map instead of the block summary,
++// remapped into the always-mixed range [0.5,0.74] so decisions stay
++// identical to MM_NOTAP. Isolates whether the small-viewport tax lives in
++// reading THIS texture or in having a second dependent read in the walk.
++constant bool fc_mmAltTap [[function_constant(45)]];
++
+ // Map an original-orientation sample position into texture space for the live
+ // transposed representation (no-op when clear).
+ inline float3 volumeFetchSwizzle(float3 pos) {
+@@ -5290,6 +5328,11 @@ inline half4 marchVolumeUnified(
+                                   mmSbDimF.x > 1.0f;
+       int3 mv9Sb = int3(-1);
+       bool mv9SbEmpty = false;
++      // §38.15 (fc_mmPre): summary read issued ahead of the composite ladder
++      // so its miss latency overlaps the ladder's volume fetches.
++      int3 mmPfBlk = int3(-1);
++      float mmPfVal = 0.5f;
++      bool mmPfHas = false;
+       // §35.14 streaming consume state (fc_segHop): the per-ray skip segments
+       // precomputed by volume_segment_build are pulled from the compacted pool
+       // one gap at a time — only (recOff, cnt, idx, gStart, gEnd) stay live, so
+@@ -5377,6 +5420,15 @@ inline half4 marchVolumeUnified(
+         }
+         else if (useMinMax)
+         {
++          // §38.15 (fc_mmNoState): re-derive the block state per invocation
++          // instead of caching it across batches (see the compute marcher).
++          if (fc_mmNoState)
++          {
++            mv9Blk = int3(-1);
++            mv9BlkState = -1;
++            mv9Sb = int3(-1);
++            mv9SbEmpty = false;
++          }
+           // §37.19 warp-coherent skip: probe the CURRENT block once per lane;
+           // advance all lanes by the warp-minimum leap so straight chords keep
+           // their cross-lane slice-lockstep (raw's cache-coalescing advantage).
+@@ -5442,8 +5494,16 @@ inline half4 marchVolumeUnified(
+               if (any(newBlk != mv9Blk))
+               {
+                 mv9Blk = newBlk;
+-                float bsv = minMaxBlockTexture.sample(sNearest,
+-                    (float3(mv9Blk) + 0.5f) / mmBlkDimF, level(0)).r;
++                float bsv;
++                if (fc_mmPre && mmPfHas && all(newBlk == mmPfBlk))
++                {
++                  bsv = mmPfVal;
++                }
++                else
++                {
++                  bsv = fc_mmNoTap ? 0.5f : minMaxBlockTexture.sample(sNearest,
++                      (float3(mv9Blk) + 0.5f) / mmBlkDimF, level(0)).r;
++                }
+                 mv9BlkState = bsv > 0.75 ? 1 : (bsv < 0.25 ? 2 : 0);
+               }
+               if (useMinMaxSuper)
+@@ -5553,6 +5613,18 @@ inline half4 marchVolumeUnified(
+             i += w;
+           }
+         }
++        // §38.15 (fc_mmPre): issue the next block-summary read before the
++        // composite ladder so its miss latency overlaps the ladder's volume
++        // fetches (see the compute marcher for rationale).
++        if (fc_mmPre && useMinMaxBlocks)
++        {
++          const float3 pp = clamp(evalPoint + evalStep * (float)min(48, steps - i),
++                                  float3(0.0), float3(1.0));
++          mmPfBlk = min(int3(pp * mmDimF * invBs), int3(mmBlkDimF) - 1);
++          mmPfVal = minMaxBlockTexture.sample(sNearest,
++              (float3(mmPfBlk) + 0.5f) / mmBlkDimF, level(0)).r;
++          mmPfHas = true;
++        }
+         if (batchCap >= 48 && i + 48 <= steps)
+         {
+           MV9_FETCH(0)
+@@ -8122,6 +8194,137 @@ kernel void volume_segment_build(
+ // §38.6 / §36.4 Design B — Compute Marcher & Ray-Binned Marching
+ // =============================================================================
+ 
++// §38.15 (VTK_METAL_TEST_MM_OOL -> fc_mmOol): the occupancy preamble walk,
++// factored into a noinline function so its register allocation cannot couple
++// to the composite ladder's. Decision-for-decision identical to the inlined
++// version; the point is purely compilation structure: phase E/F showed the
++// blocks-enabled specialization pays +43% on every composited sample at low
++// warp counts with unchanged runtime preamble cost, unchanged occupancy, and
++// no sensitivity to state caching — i.e. a whole-function codegen effect.
++struct MmWalkState
++{
++  int3 blk;
++  int blkState;
++  int3 sb;
++  int sbEmpty;
++};
++
++__attribute__((noinline))
++static int mmPreambleWalk(
++    float3 evalPoint0,
++    float3 evalStep,
++    float3 rayDir,
++    float stepSize,
++    float3 mmDimF,
++    float3 mmBlkDimF,
++    float3 invMMDimF9,
++    bool useMinMaxBlocks,
++    int bsI,
++    float invBs,
++    bool useMinMaxSuper,
++    float invBps,
++    float leapLevel,
++    float blocksOnly,
++    int extent,
++    texture3d<float> minMaxTexture,
++    texture3d<float> minMaxBlockTexture,
++    texture3d<float> minMaxSuperTexture,
++    thread MmWalkState* st)
++{
++  int w = 0;
++  while (w < extent)
++  {
++    float3 mmPos = clamp(evalPoint0 + evalStep * (float)w, float3(0.0), float3(1.0));
++    float3 cellCoord = mmPos * mmDimF;
++    if (useMinMaxBlocks)
++    {
++      int3 newBlk = min(int3(cellCoord * invBs), int3(mmBlkDimF) - 1);
++      if (any(newBlk != st->blk))
++      {
++        st->blk = newBlk;
++        float bsv = minMaxBlockTexture.sample(sNearest,
++            (float3(st->blk) + 0.5f) / mmBlkDimF, level(0)).r;
++        st->blkState = bsv > 0.75 ? 1 : (bsv < 0.25 ? 2 : 0);
++      }
++      if (useMinMaxSuper)
++      {
++        float3 mmSbDimF = float3(minMaxSuperTexture.get_width(),
++                                 minMaxSuperTexture.get_height(),
++                                 minMaxSuperTexture.get_depth());
++        int3 newSb = min(int3(float3(st->blk) * invBps), int3(mmSbDimF) - 1);
++        if (any(newSb != st->sb))
++        {
++          st->sb = newSb;
++          float ssv = minMaxSuperTexture.sample(sNearest,
++              (float3(st->sb) + 0.5f) / mmSbDimF, level(0)).r;
++          st->sbEmpty = ssv > 0.5f ? 1 : 0;
++        }
++        if (st->sbEmpty != 0 && leapLevel > 0.5f)
++        {
++          int3 sbLo = st->sb * 64;
++          float3 loN = float3(sbLo) * invMMDimF9;
++          float3 hiN = float3(min(sbLo + 64, int3(mmDimF))) * invMMDimF9;
++          float3 rem;
++          rem.x = rayDir.x > 0.0 ? (hiN.x - mmPos.x) : (mmPos.x - loN.x);
++          rem.y = rayDir.y > 0.0 ? (hiN.y - mmPos.y) : (mmPos.y - loN.y);
++          rem.z = rayDir.z > 0.0 ? (hiN.z - mmPos.z) : (mmPos.z - loN.z);
++          rem = max(rem, float3(0.0f));
++          float3 tToFace;
++          tToFace.x = abs(rayDir.x) > 1e-5 ? rem.x / abs(rayDir.x) : 1e30;
++          tToFace.y = abs(rayDir.y) > 1e-5 ? rem.y / abs(rayDir.y) : 1e30;
++          tToFace.z = abs(rayDir.z) > 1e-5 ? rem.z / abs(rayDir.z) : 1e30;
++          float exactSkip = min(min(tToFace.x, tToFace.y), tToFace.z) + 1e-4;
++          int leapSteps = (int)ceil(exactSkip / stepSize);
++          if (leapSteps < 1) leapSteps = 1;
++          w += leapSteps;
++          continue;
++        }
++      }
++      if (st->blkState == 1 && leapLevel > 1.5f)
++      {
++        int3 blkLo = st->blk * bsI;
++        float3 loN = float3(blkLo) * invMMDimF9;
++        float3 hiN = float3(min(blkLo + bsI, int3(mmDimF))) * invMMDimF9;
++        float3 rem;
++        rem.x = rayDir.x > 0.0 ? (hiN.x - mmPos.x) : (mmPos.x - loN.x);
++        rem.y = rayDir.y > 0.0 ? (hiN.y - mmPos.y) : (mmPos.y - loN.y);
++        rem.z = rayDir.z > 0.0 ? (hiN.z - mmPos.z) : (mmPos.z - loN.z);
++        rem = max(rem, float3(0.0f));
++        float3 tToFace;
++        tToFace.x = abs(rayDir.x) > 1e-5 ? rem.x / abs(rayDir.x) : 1e30;
++        tToFace.y = abs(rayDir.y) > 1e-5 ? rem.y / abs(rayDir.y) : 1e30;
++        tToFace.z = abs(rayDir.z) > 1e-5 ? rem.z / abs(rayDir.z) : 1e30;
++        float exactSkip = min(min(tToFace.x, tToFace.y), tToFace.z) + 1e-4;
++        int leapSteps = (int)ceil(exactSkip / stepSize);
++        if (leapSteps < 1) leapSteps = 1;
++        w += leapSteps;
++        continue;
++      }
++      if (st->blkState == 2)
++      {
++        break;
++      }
++    }
++    if (blocksOnly > 0.5f) { break; }
++    if (minMaxTexture.sample(sNearest, mmPos, level(0)).r <= 0.5) break;
++    float3 fractCoord = fract(cellCoord);
++    float3 distToEdge;
++    distToEdge.x = rayDir.x > 0.0 ? (1.0 - fractCoord.x) : fractCoord.x;
++    distToEdge.y = rayDir.y > 0.0 ? (1.0 - fractCoord.y) : fractCoord.y;
++    distToEdge.z = rayDir.z > 0.0 ? (1.0 - fractCoord.z) : fractCoord.z;
++    distToEdge = mix(distToEdge, float3(1.0), float3(distToEdge <= 1e-5));
++    float3 tToEdge;
++    tToEdge.x = abs(rayDir.x) > 1e-5 ? distToEdge.x / (abs(rayDir.x) * mmDimF.x) : 1e30;
++    tToEdge.y = abs(rayDir.y) > 1e-5 ? distToEdge.y / (abs(rayDir.y) * mmDimF.y) : 1e30;
++    tToEdge.z = abs(rayDir.z) > 1e-5 ? distToEdge.z / (abs(rayDir.z) * mmDimF.z) : 1e30;
++    float exactSkip = min(min(tToEdge.x, tToEdge.y), tToEdge.z) + 1e-4;
++    int cellSteps = (int)ceil(exactSkip / stepSize);
++    if (cellSteps < 1) cellSteps = 1;
++    w += cellSteps;
++  }
++  return w;
++}
++
+ inline half4 marchRayFromAtlasCore(
+     float3 evalPointIn,
+     int maxSteps,
+@@ -8219,6 +8422,11 @@ inline half4 marchRayFromAtlasCore(
+                               mmSbDimF.x > 1.0f;
+   int3 mv9Sb = int3(-1);
+   bool mv9SbEmpty = false;
++  // §38.15 (fc_mmPre): summary read issued ahead of the composite ladder so
++  // its miss latency overlaps the ladder's volume fetches.
++  int3 mmPfBlk = int3(-1);
++  float mmPfVal = 0.5f;
++  bool mmPfHas = false;
+ 
+   half3 accumulatedColor = half3(0.0h);
+   half accumulatedOpacity = 0.0h;
+@@ -8262,8 +8470,54 @@ inline half4 marchRayFromAtlasCore(
+ 
+     if (useMinMax)
+     {
+-      int w = 0;
++      // §38.15 (fc_mmNoState): re-derive the block state per invocation
++      // instead of caching it across batches. Decisions are identical (the
++      // summary textures are immutable within a frame); the point of the
++      // re-probe is to end mv9Blk/mv9BlkState liveness here so the composite
++      // ladder below compiles with the full register budget.
++      if (fc_mmNoState)
++      {
++        mv9Blk = int3(-1);
++        mv9BlkState = -1;
++        mv9Sb = int3(-1);
++        mv9SbEmpty = false;
++      }
+       const int extent = min(48, steps - i);
++      if (fc_mmOol)
++      {
++        // §38.15: out-of-line preamble — identical decisions, isolated
++        // register allocation (see mmPreambleWalk above).
++        MmWalkState st = { mv9Blk, mv9BlkState, mv9Sb, mv9SbEmpty ? 1 : 0 };
++        const int w = mmPreambleWalk(evalPoint, evalStep, rayDir, stepSize,
++            mmDimF, mmBlkDimF, invMMDimF9, useMinMaxBlocks, bsI, invBs,
++            useMinMaxSuper, invBps, volumeUniforms.mmLeapLevel,
++            volumeUniforms.mmBlocksOnly, extent,
++            minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, &st);
++        mv9Blk = st.blk;
++        mv9BlkState = st.blkState;
++        mv9Sb = st.sb;
++        mv9SbEmpty = st.sbEmpty != 0;
++        if (w >= extent)
++        {
++          currentPoint += stepVec * (float)extent;
++          currentT += stepSize * (float)extent;
++          texLocalPos += texStep * (float)extent;
++          evalPoint += evalStep * (float)extent;
++          i += extent;
++          continue;
++        }
++        if (w > 0)
++        {
++          currentPoint += stepVec * (float)w;
++          currentT += stepSize * (float)w;
++          texLocalPos += texStep * (float)w;
++          evalPoint += evalStep * (float)w;
++          i += w;
++        }
++      }
++      else
++      {
++      int w = 0;
+       while (w < extent)
+       {
+         float3 mmPos = clamp(evalPoint + evalStep * (float)w, float3(0.0), float3(1.0));
+@@ -8274,8 +8528,16 @@ inline half4 marchRayFromAtlasCore(
+           if (any(newBlk != mv9Blk))
+           {
+             mv9Blk = newBlk;
+-            float bsv = minMaxBlockTexture.sample(sNearest,
+-                (float3(mv9Blk) + 0.5f) / mmBlkDimF, level(0)).r;
++            float bsv;
++            if (fc_mmNoTap)
++            {
++              bsv = 0.5f;
++            }
++            else
++            {
++              bsv = minMaxBlockTexture.sample(sNearest,
++                  (float3(mv9Blk) + 0.5f) / mmBlkDimF, level(0)).r;
++            }
+             mv9BlkState = bsv > 0.75 ? 1 : (bsv < 0.25 ? 2 : 0);
+           }
+           if (useMinMaxSuper)
+@@ -8368,6 +8630,21 @@ inline half4 marchRayFromAtlasCore(
+         evalPoint += evalStep * (float)w;
+         i += w;
+       }
++      } // fc_mmOol else
++    }
++
++    // §38.15 (fc_mmPre): issue the next block-summary read here so its
++    // miss latency overlaps the composite ladder below. The prediction uses
++    // a full-extent step; when the actual batch is shorter the prefetched
++    // index simply misses and the walk falls back to its own read.
++    if (fc_mmPre && useMinMaxBlocks)
++    {
++      const float3 pp = clamp(evalPoint + evalStep * (float)min(48, steps - i),
++                              float3(0.0), float3(1.0));
++      mmPfBlk = min(int3(pp * mmDimF * invBs), int3(mmBlkDimF) - 1);
++      mmPfVal = minMaxBlockTexture.sample(sNearest,
++          (float3(mmPfBlk) + 0.5f) / mmBlkDimF, level(0)).r;
++      mmPfHas = true;
+     }
+ 
+     if (batchCap >= 48 && i + 48 <= steps)
+diff --git a/Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.mm b/Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.mm
+index cc62525f46..c249735e02 100644
+--- a/Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.mm
++++ b/Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.mm
+@@ -7719,7 +7719,13 @@ const double vtkNotUsed(modelBounds)[6], const double vtkNotUsed(boundsSize)[3],
+       // §38 TF-adaptive exit threshold — bit 64 (fc_exitTheta): pipelines
+       // with a uniform-supplied saturation exit must not share with the
+       // legacy-latch ones.
+-      ((VolumeExitTheta() > 0.0f) ? 64u : 0u) };
++      ((VolumeExitTheta() > 0.0f) ? 64u : 0u) |
++      // §38.15 block-state liveness diet — bit 128 (fc_mmNoState).
++      ((getenv("VTK_METAL_TEST_MM_NOSTATE") != nullptr) ? 128u : 0u) |
++      // §38.15 tap bisect — bit 256 (fc_mmNoTap).
++      ((getenv("VTK_METAL_TEST_MM_NOTAP") != nullptr) ? 256u : 0u) |
++      // §38.15 summary prefetch — bit 512 (fc_mmPre).
++      ((getenv("VTK_METAL_TEST_MM_PRE") != nullptr) ? 512u : 0u) };
+   auto it = this->PipelineCache.find(key);
+   if (it != this->PipelineCache.end())
+   {
+@@ -7910,6 +7916,25 @@ const double vtkNotUsed(modelBounds)[6], const double vtkNotUsed(boundsSize)[3],
+     [constants setConstantValue:&exitTheta type:MTLDataTypeBool
+                        withName:@"fc_exitTheta"];
+ 
++    // §38.15 block-state liveness diet (fc_mmNoState): drop the cross-batch
++    // block-summary cache so the composite ladder keeps its registers (the
++    // preamble re-probes once per invocation instead).
++    BOOL mmNoState = getenv("VTK_METAL_TEST_MM_NOSTATE") != nullptr ? YES : NO;
++    [constants setConstantValue:&mmNoState type:MTLDataTypeBool
++                       withName:@"fc_mmNoState"];
++
++    // §38.15 tap bisect (fc_mmNoTap): constant mixed-state instead of the
++    // block-summary texel read (diagnostic).
++    BOOL mmNoTap = getenv("VTK_METAL_TEST_MM_NOTAP") != nullptr ? YES : NO;
++    [constants setConstantValue:&mmNoTap type:MTLDataTypeBool
++                       withName:@"fc_mmNoTap"];
++
++    // §38.15 summary prefetch (fc_mmPre): overlap the next block-summary read
++    // with the composite ladder (small-viewport cold-miss remedy).
++    BOOL mmPre = getenv("VTK_METAL_TEST_MM_PRE") != nullptr ? YES : NO;
++    [constants setConstantValue:&mmPre type:MTLDataTypeBool
++                       withName:@"fc_mmPre"];
++
+     // Blend mode function constant: 0=composite, 1=MIP, 2=MinIP, 3=AverageIP,
+     // 4=additive (vtkVolumeMapper::BlendMode). Encoded in the feature mask so
+     // each blend mode gets its own specialized pipeline.
+@@ -8097,8 +8122,21 @@ const double vtkNotUsed(modelBounds)[6], const double vtkNotUsed(boundsSize)[3],
+   if (const char* v = getenv("VTK_METAL_TEST_CM_BATCH"))
+     cmBatchFcKey = std::max(0, std::min(48, std::atoi(v)));
+   cmSplitKey = getenv("VTK_METAL_TEST_CM_SPLIT") != nullptr;
++  // §38.15 block-state liveness diet rides key bit 17; out-of-line preamble
++  // (fc_mmOol) rides bit 18; tap bisect (fc_mmNoTap) rides bit 19; summary
++  // prefetch (fc_mmPre) rides bit 20.
++  const bool mmNoStateKey = getenv("VTK_METAL_TEST_MM_NOSTATE") != nullptr;
++  const bool mmOolKey = getenv("VTK_METAL_TEST_MM_OOL") != nullptr;
++  const bool mmNoTapKey = getenv("VTK_METAL_TEST_MM_NOTAP") != nullptr;
++  const bool mmPreKey = getenv("VTK_METAL_TEST_MM_PRE") != nullptr;
++  const bool mmAltTapKey = getenv("VTK_METAL_TEST_MM_ALTTAP") != nullptr;
+   key.sampleCount = static_cast<uint32_t>(cmBatchFcKey) + 1 |
+-                    (cmSplitKey ? (1u << 16) : 0u);
++                    (cmSplitKey ? (1u << 16) : 0u) |
++                    (mmNoStateKey ? (1u << 17) : 0u) |
++                    (mmOolKey ? (1u << 18) : 0u) |
++                    (mmNoTapKey ? (1u << 19) : 0u) |
++                    (mmPreKey ? (1u << 20) : 0u) |
++                    (mmAltTapKey ? (1u << 21) : 0u);
+ 
+   auto& cache = binned ? this->ComputeMarchBinnedPipelineCache : this->ComputeMarchPipelineCache;
+   auto it = cache.find(key);
+@@ -8177,6 +8215,38 @@ const double vtkNotUsed(modelBounds)[6], const double vtkNotUsed(boundsSize)[3],
+   [constants setConstantValue:&cmSplitFc type:MTLDataTypeBool
+                      withName:@"fc_cmSplit"];
+ 
++  // §38.15 block-state liveness diet (fc_mmNoState): drop the cross-batch
++  // block-summary cache; the preamble re-probes once per invocation so the
++  // composite ladder compiles with the full register budget.
++  BOOL mmNoStateFc = getenv("VTK_METAL_TEST_MM_NOSTATE") != nullptr ? YES : NO;
++  [constants setConstantValue:&mmNoStateFc type:MTLDataTypeBool
++                     withName:@"fc_mmNoState"];
++
++  // §38.15 out-of-line preamble (fc_mmOol): run the occupancy walk in a
++  // noinline helper so its register allocation cannot couple to the ladder.
++  BOOL mmOolFc = getenv("VTK_METAL_TEST_MM_OOL") != nullptr ? YES : NO;
++  [constants setConstantValue:&mmOolFc type:MTLDataTypeBool
++                     withName:@"fc_mmOol"];
++
++  // §38.15 tap bisect (fc_mmNoTap): replace the block-summary texel read
++  // with a constant mixed-state mark; isolates the sampler-read share of the
++  // small-viewport blocks-on tax.
++  BOOL mmNoTapFc = getenv("VTK_METAL_TEST_MM_NOTAP") != nullptr ? YES : NO;
++  [constants setConstantValue:&mmNoTapFc type:MTLDataTypeBool
++                     withName:@"fc_mmNoTap"];
++
++  // §38.15 summary prefetch (fc_mmPre): overlap the next block-summary read
++  // with the composite ladder (small-viewport cold-miss remedy).
++  BOOL mmPreFc = getenv("VTK_METAL_TEST_MM_PRE") != nullptr ? YES : NO;
++  [constants setConstantValue:&mmPreFc type:MTLDataTypeBool
++                     withName:@"fc_mmPre"];
++
++  // §38.15 alt-source bisect (fc_mmAltTap): second dependent read against
++  // the fine map instead of the block summary (decisions unchanged).
++  BOOL mmAltTapFc = getenv("VTK_METAL_TEST_MM_ALTTAP") != nullptr ? YES : NO;
++  [constants setConstantValue:&mmAltTapFc type:MTLDataTypeBool
++                     withName:@"fc_mmAltTap"];
++
+   int slabMode = (featureMask & VolumeFeature_Slab) ? 1 : 0;
+   [constants setConstantValue:&slabMode type:MTLDataTypeInt withName:@"fc_slabMode"];
+ 

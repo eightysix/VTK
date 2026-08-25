@@ -4783,6 +4783,122 @@ config ranking invariant.
 Phases 17-19 logs appended to /tmp/cm_matrix3.txt; generators mx_p17*.zsh,
 mx_p18*.zsh, mx_p19*.zsh alongside.
 
+### 38.15 BS16-at-small-res penalty root hunt: the tax is the block-summary
+TEXEL READ itself, not leaps, not locality, not occupancy (2026-08-25)
+
+Re-opened §38.14's "no shader-side fix exists" closure with a full
+attribution campaign on the compute marcher (Y+synth-B16, qoff; ABBA ×2
+rounds every cell; default bench camera — NOTE: the historical mx_p*
+generators never actually pass a view argument, so all "per-view" labels
+in those scripts are cosmetic; one fixed camera is measured consistently).
+Raw log appended to /tmp/cm_matrix3.txt (phases A-H); generators
+mx_a1..mx_h1.zsh in the session temp dir.
+
+#### 38.15.1 Attribution matrix (what was refuted, in order)
+
+(A) LEAP DYNAMICS REFUTED: `MM_LEAPLEVEL` ablation @400² — the +0.6 ms
+BS16-vs-BS8 gap persists UNCHANGED at LL=1 and LL=0 where NO block leaps
+fire. Block-level leaps HELP both sizes at 400² (BS8: LL2 3.84 < LL1/LL0
+~4.05). At 2048² with leaps off, BS16 BEATS BS8 by −12% (16.66 vs 18.94)
+— inverted vs LL2 where they tie at ~12.0. No leap-length story survives.
+
+(B) OCCUPANCY REFUTED: `[cmpso]` reports IDENTICAL maxThreadsPerTG=576 /
+execWidth=32 for the fc_mmBlocks on/off PSOs; CM_BATCH ∈ {4,8,16} moves
+all arms ~equally (−5% at B8) and leaves the blocks-on-vs-off gap
+invariant (~1.0 ms). Not thread-supply, not ladder-width registers.
+
+(C) CERTIFICATION GRANULARITY / WALK-WORK MODELS REFUTED: `MM_BLOCKS=0`
+(fine-map cell walk only) is the FASTEST arm at 400² (2.81 vs BS8 3.92,
+BS16 4.73, BS32 5.52 — monotone in block size!) despite doing strictly
+MORE preamble iterations than any block config. Fine-map taps are free.
+
+(D) BUILD/SYNTH/LAYOUT EXONERATED: summary builds are timestamp-cached
+(not per-frame); synthesizeAtlasRay never touches the block texture;
+size-sweep monotonicity rules out allocator-placement luck.
+
+(E) LOCALIZATION ALONG THE MARCH (CM_FSTEPS ladder @400²): deltas vs
+blocks-off are ≈0 at stepCap=1 (+0.04), +0.09..0.19 @8, +0.62..1.08 @64,
++1.2..2.0 full — the tax lives in deep-march terrain crossings, not ray
+setup or per-batch overhead (per-batch model is off by ~10x).
+
+(F) THE SMOKING GUN — `MM_NOTAP` (replace ONLY the block-summary texel
+read with constant mixed-state; all index math, branching, loop structure
+kept): @400² BS16 5.17→3.00 (−42%), BS8 4.22→3.00 (−29%) — i.e. the
+ENTIRE blocks-on flat tax is the sampler READ of minMaxBlockTexture.
+NOTAP@2048 collapses to pure-cell-walk behavior (15.2-16.3 ≈ blocks-off),
+confirming the knob does what it claims. Combined with (C): block-summary
+texel reads cost orders of magnitude more than fine-map texel reads at
+thumbnail viewports, and their cost INCREASES with block size even though
+larger blocks mean FEWER taps — consistent with eviction-driven cold
+misses on the walk's serialized dependency chain (sparse tap footprints
+go coldest under volume-stream cache pressure), amortized away at ≥2048²
+where tap density keeps the summary hot.
+
+(G) REMEDIES ATTEMPTED, ALL REFUTED: cross-batch state-cache removal
+(`MM_NOSTATE`) — null everywhere (liveness is not the mechanism);
+out-of-line noinline preamble walk (`MM_OOL`) — WORSE (occupancy 576→448,
++11%); next-block prefetch issued before the composite ladder
+(`MM_PRE`, exact-texel prediction so parity holds) — neutral @400²,
+−7..−14% at 2048/4096 (extra reads steal bandwidth where taps were hot).
+
+#### 38.15.2 The codegen-cliff caveat (reproducibility warning)
+
+After (F), adding CONSTANT-DEAD diagnostic branches (unused fc_mmPre/
+fc_mmAltTap paths) to the same function made NOTAP's recovery DISAPPEAR
+(NOTAP ≈ fat baseline again) while blocks-off stayed fast — and reverting
+to the byte-identical phase-G expression did NOT restore it. The tax is
+therefore exquisitely sensitive to unrelated source perturbations around
+this loop: a compiler allocation/scheduling cliff, not a stable algorithmic
+cost. Consequences: (1) any surgical micro-fix in this loop is one
+unrelated edit away from silently unworking — it must be validated per
+build, not assumed; (2) §38.14's "physical limit" framing was wrong about
+mechanism but right about difficulty: the fix lever lives in compiler
+behavior we do not control from MSL.
+
+#### 38.15.3 Standing conclusions
+
+- Root LOCATED: block-summary texel reads on the walk chain, priced by a
+  fragile codegen cliff, resolution-coupled via cache-residency economics.
+- Single-static-config consequence unchanged (BS16 still wins ≥2048²,
+  BS8 ≤1024², documented remedies stand), but the §38.14.1 mechanism text
+  ("sampler cache starved by sparse rays", "longer leaps degrade
+  locality") is superseded: leaps exonerated by (A); the read itself is
+  the taxed object.
+- Open root-level directions for a future session, in priority order
+  (none attempted):
+  1. Re-establish the (F) recovery on a CLEAN tree first: apply only the
+     fc_mmNoTap hunks from mm_blocktap_tax_investigation.patch to HEAD,
+     rebuild, confirm −42% @400² reproduces. Given 38.15.2's cliff, no
+     fix attempt is meaningful until the diagnostic effect is stable
+     under a minimal known-good source state.
+  2. `read()` vs `sample()` on the block summary (cheapest lever): texel
+     fetch bypasses sampler-state/LOD machinery; if the tax is
+     sampler-pipe interference with volume streaming this alone may
+     recover most of it. One line per marcher site.
+  3. Derive block certification from the SAME texture object as the fine
+     map (mip chain of the dilated lattice, level() sampling — removes
+     the second descriptor from the hot loop). Caveats: mip reduction
+     must reproduce the three-state all-empty/all-solid semantics
+     (min/max reduction, likely an explicit gen kernel, not native
+     blit), and dilation padding at mip boundaries must stay
+     conservative.
+  4. Buffer-backed summary consumed via LSU loads instead of the sampler
+     pipe (fallback if 2-3 fail; new binding across both marchers'
+     bind sites + stride encoding).
+  Each step must re-validate the (F) effect per build given 38.15.2.
+  Only if ALL shader-side routes fail should the two-knob remedy stand
+  as final — 38.15.1(F) shows the penalty is an artifact, not physics,
+  so "no shader-side fix exists" must not be treated as closed.
+
+Tree state: all experimental knobs reverted (byte-clean vs HEAD); the full
+knob diff preserved as
+`PerformanceInvestigation/mm_blocktap_tax_investigation.patch`
+(function constants 41-45: MM_NOSTATE/MM_OOL/MM_NOTAP/MM_PRE/MM_ALTTAP,
+mapper key bits 17-21 fragment 128/256/512). Parity gates run during the
+session: NOSTATE byte-identical (max|d|=0 @512²/1024², both sizes); OOL
+thresholded-error 0. Logs /tmp/cm_matrix3.txt; generators mx_a1.zsh ..
+mx_h1.zsh alongside.
+
 Tree state after this session: `VTK_METAL_TEST_EXIT_THETA` knob landed
 (default-OFF, byte-inert); VOLTRANSPOSE policy comments updated with the
 §38.3 matrix; everything else reverted clean (byte-parity verified). New
