@@ -4722,6 +4722,67 @@ same shape as §37.22's precedent. Frag = mv9+mm+Y as §38.12.4.
 Phases 11-16 logs appended to /tmp/cm_matrix3.txt; generators
 mx_p11*.zsh .. mx_p16*.zsh alongside.
 
+### 38.14 Single-config unification attempt closed (physical limit); CLUT
+generalization: compute wins all 20 preset cells (2026-08-25)
+
+#### 38.14.1 Why ONE block size cannot own all resolutions — mechanism found
+
+Floor ladder @400² (qoff): FLOOR(write-zero) 0.37/0.39, FSTEPS=1 0.46/0.48,
+FSTEPS=8 0.69/0.76, full ≈4.0(BS8)/4.86(BS16) for BS8/BS16. Findings:
+(1) setup/lattice side exonerated (NOMARCH 0.31 vs 0.32); (2) the BS16
+penalty scales LINEARLY WITH STEPS MARCHED — it is per-sample work, not
+per-dispatch overhead; (3) BOTH block sizes sit ~8x above pixel-linear
+per-sample cost at 400² (0.27 ns/sample vs 0.033 at 2048²) and read
+view-FLAT there. Mechanism: at thumbnail viewports too few rays traverse
+each volume region to feed the sampler cache — per-sample cost goes
+DRAM-latency-bound on sparse rays, and longer BS16 leaps degrade locality
+exactly then while paying off at density. No shader-side fix exists under
+the single-static rule (the fix would be a resolution-tier policy —
+banned per user directive).
+
+Crossover placed per-view (BS8-vs-BS16, qoff): axz flips at ~1024²
+(BS16 −5.5%, then −18% @1536); obl/az45 not until ~2048² (below that BS8
+wins −6..−18%). Since BS8's loss lands on the heaviest view at scale
+(axz −12..18% ≥1536²) and BS16's low-res cost is bounded (~13-18% on two
+views <1024²), **Y+BS16 remains THE single static choice** for the
+high-res priority. Remedy for sub-1024px workloads: `MM_BLOCKSIZE=8`
+(same shape as §37.22's precedent). With qoff+BS8 compute WINS the 400²
+orbit vs best-fragment outright (−11..−23%), so nothing is lost at the
+bottom end by switching one knob there.
+
+Landing package recommendation updated: window-queue default (=0 probe
+opt-in) + Y + B16-synth + tiered-BS default {fine 16/coarse 8} unchanged;
+documented remedies: sub-1024px -> BLOCKSIZE=8; axis-dominant static ->
+BLOCKSIZE=16 under X-rep (§37.22).
+
+#### 38.14.2 CLUT generalization: best-compute vs best-fragment across all
+doc presets
+
+{AirwaysII(default), DarkBone, SkinOnBlue, BoneSkin, BoneSkinII} ×
+{obl, axz} × {2048², 4096²}, ABBA pairs, comp arm = final config + qoff.
+Means (ms):
+
+| preset | 2048 obl f→c | 2048 axz f→c | 4096 obl f→c | 4096 axz f→c |
+|---|---|---|---|---|
+| AirwaysII | 15.17→12.25 −19% | 31.60→24.71 −22% | 41.61→36.88 −11% | 116.84→91.74 −21% |
+| DarkBone | 9.26→8.05 −13% | 19.85→15.61 −21% | 28.55→25.73 −10% | 74.80→57.20 −24% |
+| SkinOnBlue | 12.06→9.80 −19% | 24.22→19.32 −20% | 33.94→30.29 −11% | 89.86→71.33 −21% |
+| BoneSkin | 8.99→8.16 −9% | 26.4?→14.80 | 38.14→30.95 −19% | 92.80→67.44 −27% |
+| BoneSkinII | 8.78→7.76 −12% | 20.00→15.15 −24% | 29.59→25.80 −13% | 77.93→58.16 −25% |
+
+**Compute wins ALL 20 cells (−9..−27%).** The §38.12 verdict generalizes
+across every transfer function in the inventory; relative wins are LARGEST
+on the dense presets' heavy views (bone-class axz −21..−27%) — dense TFs
+shorten marches where compute's fixed costs would matter most, so its
+march-level advantage dominates. Caveat: the BoneSkin 2048-axz cell had a
+mid-cell machine-state shift (frag rounds 18.62/34.09) — direction
+consistent across both rounds, magnitude unreliable for that cell alone.
+Absolute times vary ~2x across presets (dense = fast via early exit);
+config ranking invariant.
+
+Phases 17-19 logs appended to /tmp/cm_matrix3.txt; generators mx_p17*.zsh,
+mx_p18*.zsh, mx_p19*.zsh alongside.
+
 Tree state after this session: `VTK_METAL_TEST_EXIT_THETA` knob landed
 (default-OFF, byte-inert); VOLTRANSPOSE policy comments updated with the
 §38.3 matrix; everything else reverted clean (byte-parity verified). New
