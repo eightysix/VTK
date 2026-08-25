@@ -4652,6 +4652,76 @@ Reproduction: scripts /var/folders/f2/wxp2wsd95dg_pkpzyxs8vqxr0000gn/T/opencode/
 (phases 1-10), raw log /tmp/cm_matrix3.txt, parity captures /tmp/cmy/.
 Env knobs used: existing only (no new knobs this section beyond §38.10's).
 
+### 38.13 Chord-issue anatomy in compute; low-res regime closed; queue-wait
+default recommendation (2026-08-25, continues §38.12)
+
+#### 38.13.1 Is the chord issue present in compute? Representation-coupled
+
+(a) X-rep chord check (never measured before — gap closed): mm-BS16 vs
+TRUE raw in compute-X: axz 26.63/26.54 vs raw 27.11 @2048 (mm −1.8%);
+94.35 vs 95.10 @4096 (−0.8%); axx 22.99 vs 24.91 (−7.7%), 82.67 vs 89.48
+(−7.6%). **Under X-rep compute has NO chord deficit — skips win everywhere,
+even on straight chords.**
+
+(b) Y-rep: the deficit persists post-BS16-rescue (raw +2.8%/+3.1% over
+mm-BS16 on axz @2048/@4096).
+
+(c) WHERE it lives — SolidFlat discriminator (constant opacity => zero
+skips ever fire, machinery fully armed): mm-BS16-SF == raw-SF to 0.01 ms
+(10.58 == 10.58 @2048; 37.92/37.98 @4096). **Static preamble/machinery
+cost is provably ZERO; the entire Y-chord penalty is skip dynamics**
+(leap-scatter breaking cross-lane slice-lockstep along the deep-axis-
+parallel chord classes).
+
+Can compute solve it? The remaining prize after BS16 is ~3% of ONE view
+(axz-Y) ≈ 0.7% of the 4096 orbit. Warp-uniform hop schedules target
+exactly this mechanism, but: multi-day invasive restructure (barrier/
+pacing risks, §37.19's failure modes were hardware-level), and the same
+residual exists in fragment in worse form. NOT pursued under the
+single-static-config directive; re-open trigger unchanged (§38.11.2),
+now sharpened: only if a workload class makes Y-rep + long-chord
+dominant AND the 3% matters.
+
+#### 38.13.2 Config space closure: X+BS16 cannot beat Y+BS16
+
+X+BS16 full grid completed (last open cells): @2048 Σ 115.06 vs Y+BS16
+100.0; @4096 Σ 361.24 vs 344.29. Y+BS16 confirmed champion; X keeps only
+axy-class cells (−12/−13%).
+
+#### 38.13.3 Low-res regime: compute LOSES at 400² with the §38.12 config —
+both causes found and fixed
+
+Best-vs-best sweep (frag-mm-Y-BS8 vs comp-mm-Y-BS16) found compute behind
+at small viewports: 400² +5..13%, az45 anomalous through 1024². Two
+independent causes, both cheap:
+
+1. **Per-frame commit/waitUntilCompleted serialization** (private fast-slot
+   queue from §38.9.2): invisible when GPU-bound (@2048+ neutral, §38.11.4)
+   but pure added latency when frames go sub-millisecond.
+   `CM_QUEUEPROBE=0` (window queue, no CPU wait) recovers −2..−5% at
+   ≤1024² on every view, neutral above. RECOMMENDATION: make window-queue
+   the synth default at production landing; keep the probe as opt-in
+   insurance (poisoning scenario is self-inflicted workflow, cleared by
+   reboot).
+2. **BS16 carries a FLAT +0.85 ms penalty at 400² on every view**
+   (3.93-4.06 vs 4.76-4.83 — view-independent!). Mechanism unknown
+   (lattice/builder interaction suspected; not investigated — zero effect
+   at ≥2048 where BS16 wins). Documented anomaly.
+
+With both applied (qoff + BS8), compute WINS the 400² orbit against
+best-fragment: obl 3.94 vs 4.61 (−15%), az45 3.96 vs 4.43 (−11%), axz
+3.97 vs 5.13 (−23%). Block size optimum is resolution-coupled for
+compute-Y: BS8 wins ≤~800², BS16 wins ≥2048² orbits (1024² mixed:
+BS16 6.36 vs BS8 6.67 on az45; BS8 better elsewhere-untested).
+
+FINAL SINGLE-STATIC answer (high-res priority, unchanged): **comp =
+Y+BS16+B16-synth+mm; window-queue default recommended at landing;
+sub-800px workloads take the documented `MM_BLOCKSIZE=8` remedy** —
+same shape as §37.22's precedent. Frag = mv9+mm+Y as §38.12.4.
+
+Phases 11-16 logs appended to /tmp/cm_matrix3.txt; generators
+mx_p11*.zsh .. mx_p16*.zsh alongside.
+
 Tree state after this session: `VTK_METAL_TEST_EXIT_THETA` knob landed
 (default-OFF, byte-inert); VOLTRANSPOSE policy comments updated with the
 §38.3 matrix; everything else reverted clean (byte-parity verified). New
