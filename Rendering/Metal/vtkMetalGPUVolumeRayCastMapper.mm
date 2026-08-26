@@ -7853,10 +7853,7 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
       ((VolumeExitTheta() > 0.0f) ? 64u : 0u) |
       // §38.15/38.16 block-summary tap bisects — bit 256 (fc_mmNoTap),
       // bit 1024 (fc_mmRead), bit 2048 (fc_mmAltTap).
-      ((getenv("VTK_METAL_TEST_MM_NOTAP") != nullptr) ? 256u : 0u) |
-      ((getenv("VTK_METAL_TEST_MM_READ") != nullptr) ? 1024u : 0u) |
-      ((getenv("VTK_METAL_TEST_MM_ALTTAP") != nullptr) ? 2048u : 0u) |
-      ((getenv("VTK_METAL_TEST_MM_MIP") != nullptr) ? 8192u : 0u) };
+      0u };
   auto it = this->PipelineCache.find(key);
   if (it != this->PipelineCache.end())
   {
@@ -8048,18 +8045,7 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
                        withName:@"fc_exitTheta"];
 
     // §38.15/38.16 block-summary tap bisects (fc_mmNoTap / fc_mmRead).
-    BOOL mmNoTap = getenv("VTK_METAL_TEST_MM_NOTAP") != nullptr ? YES : NO;
-    [constants setConstantValue:&mmNoTap type:MTLDataTypeBool
-                       withName:@"fc_mmNoTap"];
-    BOOL mmRead = getenv("VTK_METAL_TEST_MM_READ") != nullptr ? YES : NO;
-    [constants setConstantValue:&mmRead type:MTLDataTypeBool
-                       withName:@"fc_mmRead"];
-    BOOL mmAltTap = getenv("VTK_METAL_TEST_MM_ALTTAP") != nullptr ? YES : NO;
-    [constants setConstantValue:&mmAltTap type:MTLDataTypeBool
-                       withName:@"fc_mmAltTap"];
-    BOOL mmMip = getenv("VTK_METAL_TEST_MM_MIP") != nullptr ? YES : NO;
-    [constants setConstantValue:&mmMip type:MTLDataTypeBool
-                       withName:@"fc_mmMip"];
+
 
     // Blend mode function constant: 0=composite, 1=MIP, 2=MinIP, 3=AverageIP,
     // 4=additive (vtkVolumeMapper::BlendMode). Encoded in the feature mask so
@@ -8248,21 +8234,10 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateComputeMarchPipeline(
   if (const char* v = getenv("VTK_METAL_TEST_CM_BATCH"))
     cmBatchFcKey = std::max(0, std::min(48, std::atoi(v)));
   cmSplitKey = getenv("VTK_METAL_TEST_CM_SPLIT") != nullptr;
-  // §38.15/38.16 block-summary tap bisects: NOTAP rides bit 19, READ bit 22,
-  // ALTTAP bit 21, PRE-v2 bit 20, ALTSLOT bit 24.
-  const bool mmNoTapKey = getenv("VTK_METAL_TEST_MM_NOTAP") != nullptr;
-  const bool mmReadKey = getenv("VTK_METAL_TEST_MM_READ") != nullptr;
-  const bool mmAltTapKey = getenv("VTK_METAL_TEST_MM_ALTTAP") != nullptr;
-  const bool mmPreKey = getenv("VTK_METAL_TEST_MM_PRE") != nullptr;
-  const bool mmAltSlotKey = getenv("VTK_METAL_TEST_MM_ALTSLOT") != nullptr;
+
   key.sampleCount = static_cast<uint32_t>(cmBatchFcKey) + 1 |
                     (cmSplitKey ? (1u << 16) : 0u) |
-                    (mmNoTapKey ? (1u << 19) : 0u) |
-                    (mmAltTapKey ? (1u << 21) : 0u) |
-                    (mmPreKey ? (1u << 20) : 0u) |
-                    (mmReadKey ? (1u << 22) : 0u) |
-                    (mmAltSlotKey ? (1u << 24) : 0u) |
-                    (getenv("VTK_METAL_TEST_MM_MIP") ? (1u << 25) : 0u) |
+
                     // §38.17 segment consume for the compute marcher.
                     ((getenv("VTK_METAL_TEST_MM_SEG") != nullptr &&
                       getenv("VTK_METAL_TEST_MM_SEG_NOCONSUME") == nullptr)
@@ -8346,27 +8321,7 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateComputeMarchPipeline(
                      withName:@"fc_cmSplit"];
 
   // §38.15/38.16 block-summary tap bisects (fc_mmNoTap / fc_mmRead).
-  BOOL mmNoTapFc = getenv("VTK_METAL_TEST_MM_NOTAP") != nullptr ? YES : NO;
-  [constants setConstantValue:&mmNoTapFc type:MTLDataTypeBool
-                     withName:@"fc_mmNoTap"];
-  BOOL mmReadFc = getenv("VTK_METAL_TEST_MM_READ") != nullptr ? YES : NO;
-  [constants setConstantValue:&mmReadFc type:MTLDataTypeBool
-                     withName:@"fc_mmRead"];
-  BOOL mmAltTapFc = getenv("VTK_METAL_TEST_MM_ALTTAP") != nullptr ? YES : NO;
-  [constants setConstantValue:&mmAltTapFc type:MTLDataTypeBool
-                     withName:@"fc_mmAltTap"];
-  // §38.16 PRE-v2 (fc_mmPre): overlap the next batch's summary read with the
-  // composite ladder; exact batchCap-based prediction.
-  BOOL mmPreFc = getenv("VTK_METAL_TEST_MM_PRE") != nullptr ? YES : NO;
-  [constants setConstantValue:&mmPreFc type:MTLDataTypeBool
-                     withName:@"fc_mmPre"];
-  // §38.16 alt-slot bisect (fc_mmAltSlot): same bytes through slot 17.
-  BOOL mmAltSlotFc = getenv("VTK_METAL_TEST_MM_ALTSLOT") != nullptr ? YES : NO;
-  [constants setConstantValue:&mmAltSlotFc type:MTLDataTypeBool
-                     withName:@"fc_mmAltSlot"];
-  BOOL mmMipFc = getenv("VTK_METAL_TEST_MM_MIP") != nullptr ? YES : NO;
-  [constants setConstantValue:&mmMipFc type:MTLDataTypeBool
-                     withName:@"fc_mmMip"];
+
   // §38.17 segment consume for the compute marcher.
   BOOL cmSegHopFc =
     (getenv("VTK_METAL_TEST_MM_SEG") != nullptr &&

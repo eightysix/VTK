@@ -2804,40 +2804,7 @@ constant int fc_cmBatch [[function_constant(39)]];
 // legacy-batch output semantics at reduced register pressure.
 constant bool fc_cmSplit [[function_constant(40)]];
 
-// §38.15/38.16 block-summary tap bisects (VTK_METAL_TEST_MM_NOTAP /
-// VTK_METAL_TEST_MM_READ). NOTAP: when true the walk's block-summary texel
-// read is replaced by the constant 0.5 (mixed state); all index math,
-// branching and loop structure remain — only the sampler read disappears.
-// Diagnostic for localizing the small-viewport blocks-on tax (§38.15.1(F):
-// recovered the ENTIRE flat tax @400²). READ: replace the normalized-coord
-// sample() with an integer-coord texel fetch (.read) on the same texture —
-// candidate root fix if the tax lives in the sampler path rather than the
-// memory itself (values are bit-identical: nearest, level(0), texel center).
-constant bool fc_mmNoTap [[function_constant(43)]];
-constant bool fc_mmRead [[function_constant(46)]];
-
-// §38.16 PRE-v2 (VTK_METAL_TEST_MM_PRE): issue the next batch's first
-// block-summary read right before the composite ladder so its miss latency
-// overlaps the ladder's volume fetches. v1 predicted at a fixed min(48,·)
-// extent and missed whenever CM_BATCH<48; v2 predicts at the exact
-// batchCap-based next-batch start.
-constant bool fc_mmPre [[function_constant(44)]];
-
-// §38.16 alt-slot bisect (VTK_METAL_TEST_MM_ALTSLOT): read the SAME
-// block-summary bytes through the slot-17 binding (super-block slot, which
-// carries a dummy texture whenever MM_SUPER is off — the mapper re-points it
-// at MinMaxBlockTexture under this knob). Fast ⇒ the small-viewport tax
-// tracks the BINDING INDEX, not the resource; fat ⇒ the resource itself.
-constant bool fc_mmAltSlot [[function_constant(48)]];
-
-// §38.16 mip-fusion fix (VTK_METAL_TEST_MM_MIP): the block summary lives in
-// mip level log2(blockSize) of the fine lattice (see
-// volume_reduce_minmax_mipblocks); the walk's block tap reads it from THAT
-// resource via an integer-coord mip read — bit-identical values to the
-// standalone texture, none of its access tax.
-constant bool fc_mmMip [[function_constant(49)]];
-
-// §38.17 segment consume for the COMPUTE marcher (VTK_METAL_TEST_MM_SEG):
+ // §38.17 segment consume for the COMPUTE marcher (VTK_METAL_TEST_MM_SEG):
 // mirrors the fragment engine's fc_segHop — per-ray skip gaps precomputed by
 // volume_segment_build replace the march-time preamble walk entirely, moving
 // the summary probes off the serialized dependency chain into the
@@ -2845,15 +2812,6 @@ constant bool fc_mmMip [[function_constant(49)]];
 // low frame parallelism). Gaps are fine-lattice granular; decisions are the
 // builder's own walk, not the preamble's.
 constant bool fc_cmSegHop [[function_constant(50)]];
-
-// §38.16 alt-source bisect (VTK_METAL_TEST_MM_ALTTAP): perform the walk's
-// block-state read against the FINE map instead of the block summary,
-// remapped into the always-mixed range [0.5,0.74] so decisions stay
-// identical to MM_NOTAP. Decisive split (run only in builds where NOTAP
-// reproduces — cf. §38.15.2): ALT fast ⇒ the tax is specific to the
-// blockTex resource/binding; ALT fat ⇒ any second dependent read here
-// taxes regardless of source resource.
-constant bool fc_mmAltTap [[function_constant(45)]];
 
 // Map an original-orientation sample position into texture space for the live
 // transposed representation (no-op when clear).
@@ -5327,8 +5285,6 @@ inline half4 marchVolumeUnified(
       const int bpsI = 64 / bsI;
       const float invBs = 1.0f / float(bsI);
       const float invBps = 1.0f / float(bpsI);
-      // §38.16 (fc_mmMip): mip level holding the block summary.
-      const uint mmBsLod = (uint)clamp(round(log2(1.0f / invBs)), 0.0f, 5.0f);
       int3 mv9Blk = int3(-1);
       int mv9BlkState = -1;
       // §35.5 (VTK_METAL_TEST_MM_SUPER -> fc_mmSuper): third occupancy level.
@@ -5495,32 +5451,8 @@ inline half4 marchVolumeUnified(
               if (any(newBlk != mv9Blk))
               {
                 mv9Blk = newBlk;
-                float bsv;
-                if (fc_mmNoTap)
-                {
-                  bsv = 0.5f;
-                }
-                else if (fc_mmAltTap)
-                {
-                  // §38.16 v2: RAW fine value — spans the full [0,1] range so
-                  // the state mapping cannot be const-folded (v1's [0.5,0.74]
-                  // remap provably yielded mixed-state, letting the compiler
-                  // delete the read; perf-only probe, output will differ).
-                  bsv = minMaxTexture.sample(sNearest, clamp(evalPoint + evalStep * (float)w, float3(0.0), float3(1.0)), level(0)).r;
-                }
-                else if (fc_mmRead)
-                {
-                  bsv = minMaxBlockTexture.read(uint3(mv9Blk)).r;
-                }
-                else if (fc_mmMip)
-                {
-                  bsv = minMaxTexture.read(uint3(mv9Blk), mmBsLod).r;
-                }
-                else
-                {
-                  bsv = minMaxBlockTexture.sample(sNearest,
-                      (float3(mv9Blk) + 0.5f) / mmBlkDimF, level(0)).r;
-                }
+                float bsv = minMaxBlockTexture.sample(sNearest,
+                    (float3(mv9Blk) + 0.5f) / mmBlkDimF, level(0)).r;
                 mv9BlkState = bsv > 0.75 ? 1 : (bsv < 0.25 ? 2 : 0);
               }
               if (useMinMaxSuper)
@@ -8549,9 +8481,6 @@ inline half4 marchRayFromAtlasCore(
   const int bpsI = 64 / bsI;
   const float invBs = 1.0f / float(bsI);
   const float invBps = 1.0f / float(bpsI);
-  // §38.16 (fc_mmMip): mip level holding the block summary inside the fine
-  // lattice (log2 of the block size in cells).
-  const uint mmBsLod = (uint)clamp(round(log2(1.0f / invBs)), 0.0f, 5.0f);
   int3 mv9Blk = int3(-1);
   int mv9BlkState = -1;
   const float3 mmSbDimF = float3(minMaxSuperTexture.get_width(),
@@ -8561,14 +8490,6 @@ inline half4 marchRayFromAtlasCore(
                               mmSbDimF.x > 1.0f;
   int3 mv9Sb = int3(-1);
   bool mv9SbEmpty = false;
-  // §38.16 PRE-v2 (fc_mmPre): summary read issued ahead of the composite
-  // ladder so its miss latency overlaps the ladder's volume fetches. v1
-  // predicted at a fixed min(48,·) extent and missed whenever CM_BATCH<48
-  // (bench runs 16) — the walk then paid BOTH reads. v2 predicts at the
-  // exact next-batch start: evalPoint + evalStep*min(batchCap, steps-i).
-  int3 mmPfBlk = int3(-1);
-  float mmPfVal = 0.5f;
-  bool mmPfHas = false;
 
   half3 accumulatedColor = half3(0.0h);
   half accumulatedOpacity = 0.0h;
@@ -8694,38 +8615,8 @@ inline half4 marchRayFromAtlasCore(
           if (any(newBlk != mv9Blk))
           {
             mv9Blk = newBlk;
-            float bsv;
-            if (fc_mmNoTap)
-            {
-              bsv = 0.5f;
-            }
-            else if (fc_mmAltTap)
-            {
-              // §38.16 v2: RAW fine value (see fragment site comment).
-              bsv = minMaxTexture.sample(sNearest, clamp(evalPoint + evalStep * (float)w, float3(0.0), float3(1.0)), level(0)).r;
-            }
-            else if (fc_mmPre && mmPfHas && all(newBlk == mmPfBlk))
-            {
-              bsv = mmPfVal;
-            }
-            else if (fc_mmAltSlot)
-            {
-              // Same resource, different binding index (slot 17).
-              bsv = minMaxSuperTexture.read(uint3(mv9Blk)).r;
-            }
-            else if (fc_mmMip)
-            {
-              bsv = minMaxTexture.read(uint3(mv9Blk), mmBsLod).r;
-            }
-            else if (fc_mmRead)
-            {
-              bsv = minMaxBlockTexture.read(uint3(mv9Blk)).r;
-            }
-            else
-            {
-              bsv = minMaxBlockTexture.sample(sNearest,
-                  (float3(mv9Blk) + 0.5f) / mmBlkDimF, level(0)).r;
-            }
+            float bsv = minMaxBlockTexture.sample(sNearest,
+                (float3(mv9Blk) + 0.5f) / mmBlkDimF, level(0)).r;
             mv9BlkState = bsv > 0.75 ? 1 : (bsv < 0.25 ? 2 : 0);
           }
           if (useMinMaxSuper)
@@ -8823,18 +8714,6 @@ inline half4 marchRayFromAtlasCore(
     // §38.16 PRE-v2: issue the next batch's first block-summary read here so
     // its miss latency overlaps the composite ladder below. Prediction uses
     // the exact batch extent (batchCap), unlike v1's fixed min(48,·) which
-    // missed whenever CM_BATCH < 48. A wrong prediction is harmless: the walk
-    // falls back to its own read and mmPfBlk simply never matches.
-    if (fc_mmPre && useMinMaxBlocks)
-    {
-      const float3 pp = clamp(evalPoint + evalStep * (float)min(batchCap, steps - i),
-                              float3(0.0), float3(1.0));
-      mmPfBlk = min(int3(pp * mmDimF * invBs), int3(mmBlkDimF) - 1);
-      mmPfVal = minMaxBlockTexture.sample(sNearest,
-          (float3(mmPfBlk) + 0.5f) / mmBlkDimF, level(0)).r;
-      mmPfHas = true;
-    }
-
     if (batchCap >= 48 && i + 48 <= steps)
     {
       MV9_C_FETCH(0) MV9_C_FETCH(1) MV9_C_FETCH(2) MV9_C_FETCH(3)
