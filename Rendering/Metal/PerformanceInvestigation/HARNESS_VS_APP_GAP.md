@@ -5353,6 +5353,30 @@ env $BASE VTK_METAL_TEST_SHADE=1 build_macos_metal/bin/vtkMetalGLVisualCompariso
 env $BASE VTK_METAL_TEST_SHADE=1 VTK_METAL_TEST_FRAG_BATCH=16 build_macos_metal/bin/vtkMetalGLVisualComparison --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 60 --size 2048x2048 --warmup 10 2>&1 | grep ^DICOMVolume
 ```
 
+### 39.6 Extending `mv9` to the remaining feature gates — no lean regression (2026-08-26)
+
+Remaining `mv9` blockers `5216` were `fc_blendMode!=0` (`MIP/MinIP/Average` `340`), `fc_cropping` `2716`, `fc_mask` `2668`, `fc_blanking` `2719`, `fc_rectilinear` `2695`, `fc_transfer2D` `2691`, `useIndependentPath`/`fc_independent` `2687`, `fc_dependentRGBA/LA` `2706/2710`, `fc_renderToTexture` `2713`. Outer bulkhead lifted from
+
+```metal
+else if(fc_marchVariant>=6 && fc_blendMode==0 && !doCropping && !doMask …)
+```
+
+to
+
+```metal
+else if(fc_marchVariant>=6 && fc_blendMode==0 && !fc_renderToTexture
+        && !useIndependentPath && !fc_dependentRGBA && !fc_dependentLA)
+```
+
+and `MV9_FETCH`/`MV9_COMPOSITE` `5257` threaded `fc_rectilinear` (`rectilinearSamplePosition` `3796`), `fc_cropping` (`computeCropRegion` `4804`, `cropBitmask` `512`), `fc_mask` (`maskTexture` `4631`, `maskScale/Bias` `936`, `labelMapTransferTexture`), `fc_blanking` (`blankingTexture` `1020`), `fc_transfer2D` (`transfer2DYAxisTexture` `988`, `sampleTransferFunction2D` `4932`) and the `independent/dependent` paths remain `baseline` fallback for now (rare multi-component). Each `if(fc_*){…}` is a `function_constant` branch – `fc_*==false` PSOs dead-strip the `half3 n`/`sampler` temporaries exactly as `fc_shading` did `§39.5`; `lean` (`fc_*==false` for all `7`) keeps `576` `maxThreadsPerTG`, no `I-cache` bloat.
+
+Measured lean `@2048 SD4 Y mm`, `60f/10w`, same `BASE` as `§39.3` (no `SHADE`):
+
+* before lift `§39.3` `frag0 16.32`, `frag16 14.35`
+* after full lift `frag0 16.20`, `frag16 14.12` – `±1%` noise, **no regression**.
+
+`blendMode`/`renderToTexture`/`independent` still use scalar `do{ //4900 }while` – `MIP` etc. would need `mipMaxScalar` tracking inside the `48-wide` batch (different accumulation), `RTT` needs `firstOpaquePos` `5049`; both are the next `fc_*` templates per `featureMask` `340/2713`, not a runtime cost. Binary `93M` `22:56`, `MARCH_DEBUG` gated `[fragpso]`, default `VTK_METAL_TEST_FRAG_BATCH=0`.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).

@@ -5213,9 +5213,8 @@ inline half4 marchVolumeUnified(
   // empty-cell skip or out-of-cube clamp invalidates the remaining pre-fetched
   // scalars and forces a refill from the moved position. The guard is fully
   // compile-time, so any other feature combination keeps the baseline loop.
-  else if (fc_marchVariant >= 6 && fc_blendMode == 0 && !doCropping && !doMask &&
-      !doBlanking && !doRectilinear && !doTransfer2D && !useIndependentPath &&
-      !fc_dependentRGBA && !fc_dependentLA)
+  else if (fc_marchVariant >= 6 && fc_blendMode == 0 && !fc_renderToTexture
+           && !useIndependentPath && !fc_dependentRGBA && !fc_dependentLA)
   {
     const int unrollN = (fc_marchVariant == 7) ? 4 : 8;
     const float3 adjTexMin = ctpOffset;
@@ -5255,28 +5254,79 @@ inline half4 marchVolumeUnified(
       // pre-minmax code and the walk is dead-code-eliminated. Any other
       // feature combination keeps the batch-8 consume.
 #define MV9_FETCH(_j) \
-  float s##_j = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * (float)_j);
+  float3 pos##_j = evalPoint + evalStep * (float)_j; \
+  float3 rPos##_j = fc_rectilinear ? rectilinearSamplePosition(pos##_j, true, rectCoords, volumeUniforms) : pos##_j; \
+  float s##_j = sampleVolumeScalar(volumeTexture, rPos##_j);
 #define MV9_COMPOSITE(_j) \
-  half4 c##_j = sampleTransferFunction(transferFunctionTexture, \
-      float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), 0.5)); \
-  half3 col##_j = c##_j.rgb; \
-  half  opa##_j = c##_j.a; \
-  if (fc_gradientOpacity) { \
+  float3 posC##_j = evalPoint + evalStep * (float)_j; \
+  float3 rPosC##_j = fc_rectilinear ? rectilinearSamplePosition(posC##_j, true, rectCoords, volumeUniforms) : posC##_j; \
+  bool skip##_j = false; \
+  if (fc_cropping) { \
+    if ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, rPosC##_j))) == 0u) skip##_j = true; \
+  } \
+  if (!skip##_j && fc_blanking) { \
+    float3 bPos##_j = rPosC##_j + blankHalfStep * (volumeUniforms.blankingMode > 1.5 ? 1.0f : 0.0f); \
+    float bVal##_j = blankingTexture.sample(sNearest, rPosC##_j, level(0)).r; \
+    if (bVal##_j < 0.5f) skip##_j = true; \
+    if (!skip##_j && volumeUniforms.blankingMode > 0.5f) { \
+      float bVal2##_j = blankingTexture.sample(sNearest, bPos##_j, level(0)).r; \
+      if (bVal2##_j < 0.5f) skip##_j = true; \
+    } \
+  } \
+  half4 c##_j = half4(0.0h); \
+  half3 col##_j = half3(0.0h); \
+  half  opa##_j = 0.0h; \
+  if (!skip##_j) { \
+    if (fc_transfer2D) { \
+      half secondNorm##_j; \
+      if (volumeUniforms.transfer2DUseGradient > 0.5) { \
+        half4 g2##_j = computeGradientFast(volumeTexture, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
+        secondNorm##_j = g2##_j.w; \
+      } else { \
+        secondNorm##_j = half(sampleSecondScalar(transfer2DYAxisTexture, rPosC##_j) * secondScale + secondBias); \
+      } \
+      c##_j = sampleTransferFunction2D(transferFunction2DTexture, float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), float(secondNorm##_j))); \
+    } else if (fc_mask) { \
+      float rawMask##_j = maskTexture.sample(sNearest, rPosC##_j, level(0)).r; \
+      float maskVal##_j = rawMask##_j * maskScale + maskBias; \
+      if (volumeUniforms.maskType > 0.5) { \
+        if (maskVal##_j <= 0.0) { skip##_j = true; } \
+        else { c##_j = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), 0.5)); } \
+      } else { \
+        if (numLabels > 0.0) { \
+          float label##_j = floor(maskVal##_j + 0.5); \
+          if (label##_j > 0.0) { \
+            label##_j = clamp(label##_j, 1.0, numLabels - 1.0); \
+            float labelY##_j = (label##_j + 0.5) / numLabels; \
+            c##_j = half4(labelMapTransferTexture.sample(sNearest, float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), labelY##_j), level(0))); \
+          } else { \
+            c##_j = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), 0.5)); \
+          } \
+        } else { \
+          c##_j = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), 0.5)); \
+        } \
+      } \
+    } else { \
+      c##_j = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), 0.5)); \
+    } \
+    if (!skip##_j) { col##_j = c##_j.rgb; opa##_j = c##_j.a; } \
+  } \
+  if (!skip##_j && fc_gradientOpacity) { \
     if (opa##_j > 0.0h) { \
-      half4 gTmp##_j = computeGradientFast(volumeTexture, evalPoint + evalStep * (float)_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
+      half4 gTmp##_j = computeGradientFast(volumeTexture, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
       opa##_j *= sampleGradientOpacity(gradientOpacityTexture, float(gTmp##_j.w)); \
     } \
   } \
-  if (fc_shading) { \
+  if (!skip##_j && fc_shading) { \
     if (opa##_j > 0.0h) { \
       half3 n##_j; \
       if (fc_normalTexture) { \
-        half4 ns##_j = half4(normalTexture.sample(sVolume, evalPoint + evalStep * (float)_j, level(0))); \
+        half4 ns##_j = half4(normalTexture.sample(sVolume, rPosC##_j, level(0))); \
         n##_j = normalize(ns##_j.xyz * 2.0h - 1.0h); \
       } else if (fc_computeNormalFromOpacity) { \
-        n##_j = computeDensityGradientFast(volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3, evalPoint + evalStep * (float)_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor, 0, scalarScale, scalarBias).xyz; \
+        n##_j = computeDensityGradientFast(volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor, 0, scalarScale, scalarBias).xyz; \
       } else { \
-        n##_j = computeGradientFast(volumeTexture, evalPoint + evalStep * (float)_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor).xyz; \
+        n##_j = computeGradientFast(volumeTexture, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor).xyz; \
       } \
       if (lightUniforms != nullptr && !fc_defaultLighting) { \
         col##_j = computeVolumeLighting(col##_j, n##_j, -viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat, *lightUniforms, volumeUniforms.volumeBoundsMin.xyz + (currentPoint + stepVec * (float)_j) * boundsSize); \
