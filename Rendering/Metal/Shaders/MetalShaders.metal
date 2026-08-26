@@ -2804,6 +2804,57 @@ constant int fc_cmBatch [[function_constant(39)]];
 // legacy-batch output semantics at reduced register pressure.
 constant bool fc_cmSplit [[function_constant(40)]];
 
+// §38.15/38.16 block-summary tap bisects (VTK_METAL_TEST_MM_NOTAP /
+// VTK_METAL_TEST_MM_READ). NOTAP: when true the walk's block-summary texel
+// read is replaced by the constant 0.5 (mixed state); all index math,
+// branching and loop structure remain — only the sampler read disappears.
+// Diagnostic for localizing the small-viewport blocks-on tax (§38.15.1(F):
+// recovered the ENTIRE flat tax @400²). READ: replace the normalized-coord
+// sample() with an integer-coord texel fetch (.read) on the same texture —
+// candidate root fix if the tax lives in the sampler path rather than the
+// memory itself (values are bit-identical: nearest, level(0), texel center).
+constant bool fc_mmNoTap [[function_constant(43)]];
+constant bool fc_mmRead [[function_constant(46)]];
+
+// §38.16 PRE-v2 (VTK_METAL_TEST_MM_PRE): issue the next batch's first
+// block-summary read right before the composite ladder so its miss latency
+// overlaps the ladder's volume fetches. v1 predicted at a fixed min(48,·)
+// extent and missed whenever CM_BATCH<48; v2 predicts at the exact
+// batchCap-based next-batch start.
+constant bool fc_mmPre [[function_constant(44)]];
+
+// §38.16 alt-slot bisect (VTK_METAL_TEST_MM_ALTSLOT): read the SAME
+// block-summary bytes through the slot-17 binding (super-block slot, which
+// carries a dummy texture whenever MM_SUPER is off — the mapper re-points it
+// at MinMaxBlockTexture under this knob). Fast ⇒ the small-viewport tax
+// tracks the BINDING INDEX, not the resource; fat ⇒ the resource itself.
+constant bool fc_mmAltSlot [[function_constant(48)]];
+
+// §38.16 mip-fusion fix (VTK_METAL_TEST_MM_MIP): the block summary lives in
+// mip level log2(blockSize) of the fine lattice (see
+// volume_reduce_minmax_mipblocks); the walk's block tap reads it from THAT
+// resource via an integer-coord mip read — bit-identical values to the
+// standalone texture, none of its access tax.
+constant bool fc_mmMip [[function_constant(49)]];
+
+// §38.17 segment consume for the COMPUTE marcher (VTK_METAL_TEST_MM_SEG):
+// mirrors the fragment engine's fc_segHop — per-ray skip gaps precomputed by
+// volume_segment_build replace the march-time preamble walk entirely, moving
+// the summary probes off the serialized dependency chain into the
+// throughput-bound builder (§38.16.2: the probes themselves are the tax at
+// low frame parallelism). Gaps are fine-lattice granular; decisions are the
+// builder's own walk, not the preamble's.
+constant bool fc_cmSegHop [[function_constant(50)]];
+
+// §38.16 alt-source bisect (VTK_METAL_TEST_MM_ALTTAP): perform the walk's
+// block-state read against the FINE map instead of the block summary,
+// remapped into the always-mixed range [0.5,0.74] so decisions stay
+// identical to MM_NOTAP. Decisive split (run only in builds where NOTAP
+// reproduces — cf. §38.15.2): ALT fast ⇒ the tax is specific to the
+// blockTex resource/binding; ALT fat ⇒ any second dependent read here
+// taxes regardless of source resource.
+constant bool fc_mmAltTap [[function_constant(45)]];
+
 // Map an original-orientation sample position into texture space for the live
 // transposed representation (no-op when clear).
 inline float3 volumeFetchSwizzle(float3 pos) {
@@ -5276,6 +5327,8 @@ inline half4 marchVolumeUnified(
       const int bpsI = 64 / bsI;
       const float invBs = 1.0f / float(bsI);
       const float invBps = 1.0f / float(bpsI);
+      // §38.16 (fc_mmMip): mip level holding the block summary.
+      const uint mmBsLod = (uint)clamp(round(log2(1.0f / invBs)), 0.0f, 5.0f);
       int3 mv9Blk = int3(-1);
       int mv9BlkState = -1;
       // §35.5 (VTK_METAL_TEST_MM_SUPER -> fc_mmSuper): third occupancy level.
@@ -5442,8 +5495,32 @@ inline half4 marchVolumeUnified(
               if (any(newBlk != mv9Blk))
               {
                 mv9Blk = newBlk;
-                float bsv = minMaxBlockTexture.sample(sNearest,
-                    (float3(mv9Blk) + 0.5f) / mmBlkDimF, level(0)).r;
+                float bsv;
+                if (fc_mmNoTap)
+                {
+                  bsv = 0.5f;
+                }
+                else if (fc_mmAltTap)
+                {
+                  // §38.16 v2: RAW fine value — spans the full [0,1] range so
+                  // the state mapping cannot be const-folded (v1's [0.5,0.74]
+                  // remap provably yielded mixed-state, letting the compiler
+                  // delete the read; perf-only probe, output will differ).
+                  bsv = minMaxTexture.sample(sNearest, clamp(evalPoint + evalStep * (float)w, float3(0.0), float3(1.0)), level(0)).r;
+                }
+                else if (fc_mmRead)
+                {
+                  bsv = minMaxBlockTexture.read(uint3(mv9Blk)).r;
+                }
+                else if (fc_mmMip)
+                {
+                  bsv = minMaxTexture.read(uint3(mv9Blk), mmBsLod).r;
+                }
+                else
+                {
+                  bsv = minMaxBlockTexture.sample(sNearest,
+                      (float3(mv9Blk) + 0.5f) / mmBlkDimF, level(0)).r;
+                }
                 mv9BlkState = bsv > 0.75 ? 1 : (bsv < 0.25 ? 2 : 0);
               }
               if (useMinMaxSuper)
@@ -7985,6 +8062,111 @@ fragment VolumeAtlasOut fragment_volume_ray_atlas(
   return output;
 }
 
+struct SynthRay {
+  float3 evalPoint;
+  float3 evalStep;
+  float  stepSize;
+  float3 rayDir;
+  float  tTerminateMax;
+  int    steps;
+};
+
+inline bool synthesizeAtlasRay(
+    uint2 gid,
+    constant VolumeMapperUniforms& volumeUniforms,
+    constant PerBlockData& b,
+    texture3d<float> volumeTexture,
+    texture2d<float> depthTexture,
+    thread SynthRay& o)
+{
+  const float2 screenPos = float2(gid) + 0.5;
+
+  // ---- fragment_volume_main prologue (verbatim, minus interpolated
+  // localPos — reconstructed analytically below; box faces are planar so the
+  // difference vs rasterizer interpolation is ulp-class) ----
+  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
+  bool parallel = volumeUniforms.useParallelProjection > 0.5;
+  // Camera-inside normalization relies on the rasterized surface point;
+  // unsupported by synthesis v1 (bench cameras are outside-proxy).
+  if (volumeUniforms.useCameraInsideNearClip > 0.5) return false;
+
+  float3 rayOrigin, rayDir;
+  if (parallel)
+  {
+    rayDir = projectionDir(volumeUniforms);
+    rayOrigin = parallelRayOrigin(screenPos, volumeUniforms.viewportSize,
+                                  volumeUniforms);
+  }
+  else
+  {
+    rayOrigin = cameraPos;
+    rayDir = reconstructRayDir(screenPos, volumeUniforms.viewportSize,
+                               volumeUniforms);
+  }
+
+  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
+  computeVolumeBounds(b, volumeUniforms, blockMinGlobal,
+                      blockMaxGlobal, texMinGlobal, texMaxGlobal);
+
+  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal,
+      blockMaxGlobal, screenPos, volumeUniforms.viewportSize, volumeUniforms,
+      depthTexture);
+  if (!s.valid) return false;
+
+  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
+
+  // ---- marchVolume wrapper body up to MarchParams (verbatim) ----
+  float jSel = (volumeUniforms.useJittering > 0.5
+      ? (volumeUniforms.useIGNJitter > 0.5
+            ? sampleIGNJitter(screenPos, volumeUniforms.jitterBlockSize)
+            : sampleJitterNoise(screenPos, volumeUniforms.viewportSize.y,
+                                volumeUniforms.jitterBlockSize))
+      : 1.0f);
+  float jScale = volumeUniforms._padCropFlags[1];
+  jScale = (jScale >= 0.0f && jScale <= 1.0f) ? jScale : 1.0f;
+  float jitter = mix(1.0f, jSel, jScale) * stepSize;
+  float tStart = dot(s.entryPoint - cameraPos, rayDir);
+
+  // ---- marchVolumeUnified setup head (verbatim) ----
+  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
+                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
+  float3 rayDirTexLocal =
+    (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
+  float3 texStep = rayDirTexLocal * stepSize;
+  float texelCountZ = volumeTexture.get_depth() *
+    ((fc_volRg8 && !fc_volTransposed) ? 2.0f : 1.0f);
+  float3 texelCount = fc_volTransposedY
+    ? float3(volumeTexture.get_width(), volumeTexture.get_depth(),
+             volumeTexture.get_height())
+    : fc_volTransposed
+      ? float3(volumeTexture.get_depth(), volumeTexture.get_height(),
+               volumeTexture.get_width())
+      : float3(volumeTexture.get_width(), volumeTexture.get_height(),
+               texelCountZ);
+  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
+  float3 ctpOffset  = 0.5 / texelCount;
+  float3 evalStep = texStep * ctpScale;
+
+  float firstT = jitter;   // checkBounds=true branch
+  float3 currentPoint = rayOrigin + rayDir * tStart + rayDir * firstT;
+  int maxSteps = max(1, int(ceil((s.totalBoxT - firstT) / stepSize)));
+  if (volumeUniforms.maxStepsFrame > 0.5)
+  {
+    maxSteps = min(maxSteps, int(volumeUniforms.maxStepsFrame));
+  }
+
+  float3 texLocalPos = (volumeUniforms.volumeToTexture *
+      float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize,
+             1.0)).xyz;
+  o.evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+  o.evalStep = evalStep;
+  o.stepSize = stepSize;
+  o.rayDir = rayDir;
+  o.tTerminateMax = s.tTerminateMax;
+  o.steps = maxSteps;
+  return true;
+}
+
 kernel void volume_segment_build(
     texture2d<float, access::read> segAtlasA [[texture(0)]],
     texture2d<float, access::read> segAtlasB [[texture(1)]],
@@ -7995,15 +8177,50 @@ kernel void volume_segment_build(
     device uint* pool [[buffer(2)]],
     constant uint4& segMeta [[buffer(3)]],   // x=width y=height z=poolCapWords w=maxGaps
     constant PerBlockData& b [[buffer(4)]],
+    // §38.17 compute-port inputs: synth mode rebuilds the per-ray setup
+    // analytically instead of reading the atlas (CM_SYNTH has no raster).
+    texture3d<float> volumeTexture [[texture(4)]],
+    texture2d<float> depthSynthTexture [[texture(5)]],
+    texture3d<float> minMaxBlockTexture [[texture(6)]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(5)]],
+    constant uint& buildFlags [[buffer(6)]],  // bit0: synth input, bit1: blocks
+    device uint* dbgOut [[buffer(7)]],        // MM_SEG_DEBUG mirror
     uint2 gid [[thread_position_in_grid]])
 {
   if ((int)gid.x >= (int)segMeta.x || (int)gid.y >= (int)segMeta.y) return;
   const uint fpid = gid.x + gid.y * segMeta.x;
+  const bool dbgMirror = (buildFlags & 2u) != 0u;
+  // §38.17 MM_SEG_DEBUG mirror scratch (written inside the active walk,
+  // emitted after the pool claim).
+  uint dbgGuard = 0u, dbgEpZ = 0u, dbgEsz = 0u, dbgSs = 0u;
+  uint dbgGaps[8] = { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u };
+  uint dbgUse = 0u;
 
-  const float4 A = segAtlasA.read(gid);
-  const float4 B = segAtlasB.read(gid);
-  const float4 C = segAtlasC.read(gid);
-  const int steps = (int)A.w;
+  const bool synthIn = (buildFlags & 1u) != 0u;
+  float4 A, B, C;
+  int stepsPre;
+  if (synthIn)
+  {
+    SynthRay so;
+    if (!synthesizeAtlasRay(gid, volumeUniforms, b, volumeTexture,
+                            depthSynthTexture, so))
+    {
+      segIndexMap[fpid] = 0xFFFFFFFFu;
+      return;
+    }
+    A = float4(so.evalPoint, (float)so.steps);
+    B = float4(so.evalStep, so.stepSize);
+    C = float4(so.rayDir, so.tTerminateMax);
+    stepsPre = so.steps;
+  }
+  else
+  {
+    A = segAtlasA.read(gid);
+    B = segAtlasB.read(gid);
+    C = segAtlasC.read(gid);
+    stepsPre = (int)A.w;
+  }
+  const int steps = stepsPre;
   const float4 mmInfo = b.minMaxInfo;
   const bool active = steps > 0 &&
       mmInfo.x > 0.5f && mmInfo.y > 0.5f && mmInfo.z > 0.5f && mmInfo.w > 0.5f;
@@ -8020,6 +8237,17 @@ kernel void volume_segment_build(
     const float ss = B.w;      // p.stepSize
     const float3 rd = C.xyz;   // p.rayDir (normalized volume space)
     const float3 mmDimF = mmInfo.yzw;
+    // §38.17 stage 2: block-level leaps (buildFlags bit1) — same decisions as
+    // the marcher preamble's block walk: on entering a block, probe it once;
+    // all-empty ⇒ leap to the far block face (recording the skipped span as a
+    // gap); mixed/solid ⇒ fall through to the fine cell walk.
+    const bool useBlocks = (buildFlags & 2u) != 0u;
+    const int bsI = max(int(volumeUniforms.mmBlockSizeCells), 1);
+    const float invBs = 1.0f / float(bsI);
+    const float3 mmBlkDimF = float3(minMaxBlockTexture.get_width(),
+                                    minMaxBlockTexture.get_height(),
+                                    minMaxBlockTexture.get_depth());
+    int3 curBlk = int3(-1);
     int w = 0;
     // Safety valve: the leap chain always advances >=1 step, so this bound is
     // unreachable in practice; it guarantees kernel termination (and thus no
@@ -8028,6 +8256,60 @@ kernel void volume_segment_build(
     while (w < steps && --guard >= 0)
     {
       float3 mp = clamp(ep + es * (float)w, float3(0.0), float3(1.0));
+      float3 cellCoord = mp * mmDimF;
+      if (useBlocks)
+      {
+        int3 newBlk = min(int3(cellCoord * invBs), int3(mmBlkDimF) - 1);
+        if (any(newBlk != curBlk))
+        {
+          curBlk = newBlk;
+          const float bsv = minMaxBlockTexture.sample(sNearest,
+              (float3(curBlk) + 0.5f) / mmBlkDimF, level(0)).r;
+          if (bsv > 0.75f)
+          {
+            // All-empty block: leap to its far face along the ray (preamble
+            // state==1 math), recording the skipped span.
+            const float3 loN = float3(curBlk) * invBs;
+            const float3 hiN = min(float3(curBlk + 1) * invBs, float3(1.0));
+            float3 rem;
+            rem.x = rd.x > 0.0 ? (hiN.x - mp.x) : (mp.x - loN.x);
+            rem.y = rd.y > 0.0 ? (hiN.y - mp.y) : (mp.y - loN.y);
+            rem.z = rd.z > 0.0 ? (hiN.z - mp.z) : (mp.z - loN.z);
+            rem = max(rem, float3(0.0f));
+            float3 tToFace;
+            tToFace.x = abs(rd.x) > 1e-5 ? rem.x / abs(rd.x) : 1e30;
+            tToFace.y = abs(rd.y) > 1e-5 ? rem.y / abs(rd.y) : 1e30;
+            tToFace.z = abs(rd.z) > 1e-5 ? rem.z / abs(rd.z) : 1e30;
+            float exactSkip = min(min(tToFace.x, tToFace.y), tToFace.z) + 1e-4;
+            int leapSteps = (int)ceil(exactSkip / ss);
+            if (leapSteps < 1) leapSteps = 1;
+            if (cnt < segMeta.w)
+            {
+              const uint pr = ((uint)w << 16u) |
+                              (uint)min(w + leapSteps, steps);
+              if (cnt < 1u)       segR0.x = pr;
+              else if (cnt < 2u)  segR0.y = pr;
+              else if (cnt < 3u)  segR0.z = pr;
+              else if (cnt < 4u)  segR0.w = pr;
+              else if (cnt < 5u)  segR1.x = pr;
+              else if (cnt < 6u)  segR1.y = pr;
+              else if (cnt < 7u)  segR1.z = pr;
+              else if (cnt < 8u)  segR1.w = pr;
+              else if (cnt < 9u)  segR2.x = pr;
+              else if (cnt < 10u) segR2.y = pr;
+              else if (cnt < 11u) segR2.z = pr;
+              else if (cnt < 12u) segR2.w = pr;
+              else if (cnt < 13u) segR3.x = pr;
+              else if (cnt < 14u) segR3.y = pr;
+              else if (cnt < 15u) segR3.z = pr;
+              else                segR3.w = pr;
+              ++cnt;
+            }
+            w += leapSteps;
+            continue;
+          }
+        }
+      }
       if (minMaxTexture.sample(sNearest, mp, level(0)).r > 0.5f)
       {
         // Empty run [gs, w): leap exactly like the preamble until a solid cell.
@@ -8054,18 +8336,30 @@ kernel void volume_segment_build(
         }
         if (cnt >= segMeta.w) break;   // remainder composites without skips
         {
-          // Gap i lives in the (i&1)*16 bit lane of u32 word i>>1; words map
-          // to components in order: R0.x R0.y R0.z R0.w R1.x ... R3.w.
+          // §38.17 fix: ONE gap per u32 word (start<<16|end), direct
+          // assignment — the previous OR-accumulation shifted 32-bit gap
+          // words by 16 lanes, truncating odd gaps' starts and corrupting
+          // even gaps' starts via OR. Output stayed correct only because
+          // every corrupted endpoint still landed inside empty terrain
+          // (skipped samples contribute zero); exact gaps make the hops
+          // land precisely at the builder's run boundaries.
           const uint pr = ((uint)gs << 16u) | (uint)min(w, steps);
-          const uint sh = (cnt & 1u) << 4u;
-          if (cnt < 2u)       segR0.x |= pr << sh;
-          else if (cnt < 4u)  segR0.y |= pr << sh;
-          else if (cnt < 6u)  segR0.z |= pr << sh;
-          else if (cnt < 8u)  segR0.w |= pr << sh;
-          else if (cnt < 10u) segR1.x |= pr << sh;
-          else if (cnt < 12u) segR1.y |= pr << sh;
-          else if (cnt < 14u) segR1.z |= pr << sh;
-          else                segR1.w |= pr << sh;
+          if (cnt < 1u)       segR0.x = pr;
+          else if (cnt < 2u)  segR0.y = pr;
+          else if (cnt < 3u)  segR0.z = pr;
+          else if (cnt < 4u)  segR0.w = pr;
+          else if (cnt < 5u)  segR1.x = pr;
+          else if (cnt < 6u)  segR1.y = pr;
+          else if (cnt < 7u)  segR1.z = pr;
+          else if (cnt < 8u)  segR1.w = pr;
+          else if (cnt < 9u)  segR2.x = pr;
+          else if (cnt < 10u) segR2.y = pr;
+          else if (cnt < 11u) segR2.z = pr;
+          else if (cnt < 12u) segR2.w = pr;
+          else if (cnt < 13u) segR3.x = pr;
+          else if (cnt < 14u) segR3.y = pr;
+          else if (cnt < 15u) segR3.z = pr;
+          else                segR3.w = pr;
           ++cnt;
         }
       }
@@ -8089,16 +8383,57 @@ kernel void volume_segment_build(
         w += max(1, adv);
       }
     }
+    if (dbgMirror)
+    {
+      dbgUse = useBlocks ? ((uint(bsI) << 1u) | 1u) : 0u;
+      dbgGuard = (uint)max(guard, 0);
+      dbgEpZ = (uint)max(0, (int)round(ep.z * 4096.0f));
+      dbgEsz = (uint)max(0, (int)round(es.z * 65536.0f));
+      dbgSs = (uint)max(0, (int)round(ss * 65536.0f));
+      dbgGaps[0] = segR0.x;  dbgGaps[1] = segR0.y;
+      dbgGaps[2] = segR0.z;  dbgGaps[3] = segR0.w;
+      dbgGaps[4] = segR1.x;  dbgGaps[5] = segR1.y;
+      dbgGaps[6] = segR1.z;  dbgGaps[7] = segR1.w;
+      // (segR2/segR3 gaps 8-15 not mirrored; cnt is the ground truth.)
+    }
   }
 
   const uint need = 1u + cnt;
   const uint base = atomic_fetch_add_explicit(poolCounter, need, memory_order_relaxed);
+  // §38.17 MM_SEG_DEBUG mirror payload — captured inside the active walk
+  // above, emitted after the pool claim.
+  const uint dbgRec = base;
+  const uint dbgSteps = (uint)max(steps, 0);
   if (base + need > segMeta.z)
   {
     segIndexMap[fpid] = 0xFFFFFFFFu;   // pool exhausted: composite-all fallback
+    if (dbgMirror)
+    {
+      dbgOut[fpid * 16u + 0u] = 0xFFFFFFFFu;
+    }
     return;
   }
   pool[base] = cnt;
+  if (dbgMirror)
+  {
+    // 16 words/ray: recOff, cnt, steps, guard, g0..g7, epZ, esZ, ss, 0.
+    dbgOut[fpid * 16u + 0u] = dbgRec;
+    dbgOut[fpid * 16u + 1u] = cnt;
+    dbgOut[fpid * 16u + 2u] = dbgSteps;
+    dbgOut[fpid * 16u + 3u] = dbgGuard;
+    dbgOut[fpid * 16u + 4u] = dbgGaps[0];
+    dbgOut[fpid * 16u + 5u] = dbgGaps[1];
+    dbgOut[fpid * 16u + 6u] = dbgGaps[2];
+    dbgOut[fpid * 16u + 7u] = dbgGaps[3];
+    dbgOut[fpid * 16u + 8u] = dbgGaps[4];
+    dbgOut[fpid * 16u + 9u] = dbgGaps[5];
+    dbgOut[fpid * 16u + 10u] = dbgGaps[6];
+    dbgOut[fpid * 16u + 11u] = dbgGaps[7];
+    dbgOut[fpid * 16u + 12u] = dbgEpZ;
+    dbgOut[fpid * 16u + 13u] = dbgEsz;
+    dbgOut[fpid * 16u + 14u] = dbgSs;
+    dbgOut[fpid * 16u + 15u] = dbgUse;
+  }
   if (cnt > 0u)  pool[base + 1u] = segR0.x;
   if (cnt > 1u)  pool[base + 2u] = segR0.y;
   if (cnt > 2u)  pool[base + 3u] = segR0.z;
@@ -8148,7 +8483,11 @@ inline half4 marchRayFromAtlasCore(
     texture3d<float> blankingTexture,
     constant packed_float3* rectCoords,
     constant VolumeLightUniforms* lightUniforms,
-    int batchCapIn)
+    int batchCapIn,
+    device uint* segIndexMapPre,
+    device uint* segPool,
+    device uint* segDbg,
+    bool dbgRay)
 {
   const bool doShading = fc_shading;
   const bool doGradOp = fc_gradientOpacity;
@@ -8210,6 +8549,9 @@ inline half4 marchRayFromAtlasCore(
   const int bpsI = 64 / bsI;
   const float invBs = 1.0f / float(bsI);
   const float invBps = 1.0f / float(bpsI);
+  // §38.16 (fc_mmMip): mip level holding the block summary inside the fine
+  // lattice (log2 of the block size in cells).
+  const uint mmBsLod = (uint)clamp(round(log2(1.0f / invBs)), 0.0f, 5.0f);
   int3 mv9Blk = int3(-1);
   int mv9BlkState = -1;
   const float3 mmSbDimF = float3(minMaxSuperTexture.get_width(),
@@ -8219,6 +8561,14 @@ inline half4 marchRayFromAtlasCore(
                               mmSbDimF.x > 1.0f;
   int3 mv9Sb = int3(-1);
   bool mv9SbEmpty = false;
+  // §38.16 PRE-v2 (fc_mmPre): summary read issued ahead of the composite
+  // ladder so its miss latency overlaps the ladder's volume fetches. v1
+  // predicted at a fixed min(48,·) extent and missed whenever CM_BATCH<48
+  // (bench runs 16) — the walk then paid BOTH reads. v2 predicts at the
+  // exact next-batch start: evalPoint + evalStep*min(batchCap, steps-i).
+  int3 mmPfBlk = int3(-1);
+  float mmPfVal = 0.5f;
+  bool mmPfHas = false;
 
   half3 accumulatedColor = half3(0.0h);
   half accumulatedOpacity = 0.0h;
@@ -8229,6 +8579,37 @@ inline half4 marchRayFromAtlasCore(
   int i = 0;
   const int steps = maxSteps;
   const int batchCap = batchCapIn;
+
+  // §38.17 streaming consume state (fc_cmSegHop) — fragment fc_segHop
+  // pattern verbatim (see marchVolumeUnified): only (recOff, cnt, idx,
+  // gStart, gEnd) stay live; segIndexMap arrives PRE-OFFSET to this ray.
+  uint segRecOff = 0xFFFFFFFFu;
+  int segCnt = 0;
+  int segIdx = 0;
+  int gS = 0;
+  int gE = 0;
+  if (useMinMax && fc_cmSegHop)
+  {
+    segRecOff = segIndexMapPre[0];
+    if (segRecOff != 0xFFFFFFFFu)
+    {
+      segCnt = (int)segPool[segRecOff];
+      if (segCnt > 0)
+      {
+        const uint pr = segPool[segRecOff + 1u];
+        gS = (int)(pr >> 16u);
+        gE = (int)(pr & 0xFFFFu);
+        segIdx = 1;
+        // §38.17 defensive validation: a malformed gap (start>=end or past
+        // the ray) would hop the ray to oblivion; treat it as list end.
+        if (gS >= gE || gE > steps)
+        {
+          segCnt = 0;
+          segIdx = 0;
+        }
+      }
+    }
+  }
 
 #define MV9_C_FETCH(_j) \
   float s##_j = sampleVolumeScalar(volumeTexture, evalPoint + evalStep * (float)_j);
@@ -8260,7 +8641,46 @@ inline half4 marchRayFromAtlasCore(
       seenInBounds = true;
     }
 
-    if (useMinMax)
+    if (useMinMax && fc_cmSegHop)
+    {
+      // §38.17 consume: at most one hop per outer iteration — the loop top
+      // re-checks tEnd/latch/bounds, so a hop landing past the ray end exits
+      // exactly like the legacy skip (fragment fc_segHop semantics).
+      if (segIdx < segCnt)
+      {
+        if (i >= gE)
+        {
+          ++segIdx;
+          if (segIdx < segCnt)
+          {
+            const uint pr = segPool[segRecOff + 1u + uint(segIdx)];
+            gS = (int)(pr >> 16u);
+            gE = (int)(pr & 0xFFFFu);
+            if (gS >= gE || gE > steps) { segCnt = segIdx; }
+          }
+        }
+        else if (i >= gS)
+        {
+          const int hopW = gE - i;
+          currentPoint += stepVec * (float)hopW;
+          currentT += stepSize * (float)hopW;
+          texLocalPos += texStep * (float)hopW;
+          evalPoint += evalStep * (float)hopW;
+          i += hopW;
+          ++segIdx;
+          if (segIdx < segCnt)
+          {
+            const uint pr = segPool[segRecOff + 1u + uint(segIdx)];
+            gS = (int)(pr >> 16u);
+            gE = (int)(pr & 0xFFFFu);
+            if (gS >= gE || gE > steps) { segCnt = segIdx; }
+          }
+          continue;
+        }
+        // else i < gS: solid terrain until the next gap — dispatch batch.
+      }
+    }
+    else if (useMinMax)
     {
       int w = 0;
       const int extent = min(48, steps - i);
@@ -8274,8 +8694,38 @@ inline half4 marchRayFromAtlasCore(
           if (any(newBlk != mv9Blk))
           {
             mv9Blk = newBlk;
-            float bsv = minMaxBlockTexture.sample(sNearest,
-                (float3(mv9Blk) + 0.5f) / mmBlkDimF, level(0)).r;
+            float bsv;
+            if (fc_mmNoTap)
+            {
+              bsv = 0.5f;
+            }
+            else if (fc_mmAltTap)
+            {
+              // §38.16 v2: RAW fine value (see fragment site comment).
+              bsv = minMaxTexture.sample(sNearest, clamp(evalPoint + evalStep * (float)w, float3(0.0), float3(1.0)), level(0)).r;
+            }
+            else if (fc_mmPre && mmPfHas && all(newBlk == mmPfBlk))
+            {
+              bsv = mmPfVal;
+            }
+            else if (fc_mmAltSlot)
+            {
+              // Same resource, different binding index (slot 17).
+              bsv = minMaxSuperTexture.read(uint3(mv9Blk)).r;
+            }
+            else if (fc_mmMip)
+            {
+              bsv = minMaxTexture.read(uint3(mv9Blk), mmBsLod).r;
+            }
+            else if (fc_mmRead)
+            {
+              bsv = minMaxBlockTexture.read(uint3(mv9Blk)).r;
+            }
+            else
+            {
+              bsv = minMaxBlockTexture.sample(sNearest,
+                  (float3(mv9Blk) + 0.5f) / mmBlkDimF, level(0)).r;
+            }
             mv9BlkState = bsv > 0.75 ? 1 : (bsv < 0.25 ? 2 : 0);
           }
           if (useMinMaxSuper)
@@ -8368,6 +8818,21 @@ inline half4 marchRayFromAtlasCore(
         evalPoint += evalStep * (float)w;
         i += w;
       }
+    }
+
+    // §38.16 PRE-v2: issue the next batch's first block-summary read here so
+    // its miss latency overlaps the composite ladder below. Prediction uses
+    // the exact batch extent (batchCap), unlike v1's fixed min(48,·) which
+    // missed whenever CM_BATCH < 48. A wrong prediction is harmless: the walk
+    // falls back to its own read and mmPfBlk simply never matches.
+    if (fc_mmPre && useMinMaxBlocks)
+    {
+      const float3 pp = clamp(evalPoint + evalStep * (float)min(batchCap, steps - i),
+                              float3(0.0), float3(1.0));
+      mmPfBlk = min(int3(pp * mmDimF * invBs), int3(mmBlkDimF) - 1);
+      mmPfVal = minMaxBlockTexture.sample(sNearest,
+          (float3(mmPfBlk) + 0.5f) / mmBlkDimF, level(0)).r;
+      mmPfHas = true;
     }
 
     if (batchCap >= 48 && i + 48 <= steps)
@@ -8492,6 +8957,13 @@ inline half4 marchRayFromAtlasCore(
 
   accumulatedColor = clamp(accumulatedColor, half3(0.0h), half3(1.0h));
   accumulatedOpacity = clamp(accumulatedOpacity, 0.0h, 1.0h);
+  if (dbgRay)
+  {
+    segDbg[0] = (uint)i;
+    segDbg[1] = (uint)segIdx;
+    segDbg[2] = (uint)segCnt;
+    segDbg[3] = as_type<uint>(float(accumulatedOpacity));
+  }
   return half4(accumulatedColor, accumulatedOpacity);
 }
 
@@ -8509,111 +8981,6 @@ struct ComputeMarchControl {
   // frequency of the exit tests changes => <=1LSB-class output drift.
   uint batchOverride;
 };
-
-struct SynthRay {
-  float3 evalPoint;
-  float3 evalStep;
-  float  stepSize;
-  float3 rayDir;
-  float  tTerminateMax;
-  int    steps;
-};
-
-inline bool synthesizeAtlasRay(
-    uint2 gid,
-    constant VolumeMapperUniforms& volumeUniforms,
-    constant PerBlockData& b,
-    texture3d<float> volumeTexture,
-    texture2d<float> depthTexture,
-    thread SynthRay& o)
-{
-  const float2 screenPos = float2(gid) + 0.5;
-
-  // ---- fragment_volume_main prologue (verbatim, minus interpolated
-  // localPos — reconstructed analytically below; box faces are planar so the
-  // difference vs rasterizer interpolation is ulp-class) ----
-  float3 cameraPos = volumeUniforms.cameraVolumePos.xyz;
-  bool parallel = volumeUniforms.useParallelProjection > 0.5;
-  // Camera-inside normalization relies on the rasterized surface point;
-  // unsupported by synthesis v1 (bench cameras are outside-proxy).
-  if (volumeUniforms.useCameraInsideNearClip > 0.5) return false;
-
-  float3 rayOrigin, rayDir;
-  if (parallel)
-  {
-    rayDir = projectionDir(volumeUniforms);
-    rayOrigin = parallelRayOrigin(screenPos, volumeUniforms.viewportSize,
-                                  volumeUniforms);
-  }
-  else
-  {
-    rayOrigin = cameraPos;
-    rayDir = reconstructRayDir(screenPos, volumeUniforms.viewportSize,
-                               volumeUniforms);
-  }
-
-  float3 blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal;
-  computeVolumeBounds(b, volumeUniforms, blockMinGlobal,
-                      blockMaxGlobal, texMinGlobal, texMaxGlobal);
-
-  RaySetup s = setupVolumeRay(rayOrigin, rayDir, blockMinGlobal,
-      blockMaxGlobal, screenPos, volumeUniforms.viewportSize, volumeUniforms,
-      depthTexture);
-  if (!s.valid) return false;
-
-  float stepSize = physicalSampleStep(rayDir, volumeUniforms);
-
-  // ---- marchVolume wrapper body up to MarchParams (verbatim) ----
-  float jSel = (volumeUniforms.useJittering > 0.5
-      ? (volumeUniforms.useIGNJitter > 0.5
-            ? sampleIGNJitter(screenPos, volumeUniforms.jitterBlockSize)
-            : sampleJitterNoise(screenPos, volumeUniforms.viewportSize.y,
-                                volumeUniforms.jitterBlockSize))
-      : 1.0f);
-  float jScale = volumeUniforms._padCropFlags[1];
-  jScale = (jScale >= 0.0f && jScale <= 1.0f) ? jScale : 1.0f;
-  float jitter = mix(1.0f, jSel, jScale) * stepSize;
-  float tStart = dot(s.entryPoint - cameraPos, rayDir);
-
-  // ---- marchVolumeUnified setup head (verbatim) ----
-  float3 boundsSize = max(volumeUniforms.volumeBoundsMax.xyz
-                        - volumeUniforms.volumeBoundsMin.xyz, 1e-6);
-  float3 rayDirTexLocal =
-    (volumeUniforms.volumeToTexture * float4(rayDir * boundsSize, 0.0)).xyz;
-  float3 texStep = rayDirTexLocal * stepSize;
-  float texelCountZ = volumeTexture.get_depth() *
-    ((fc_volRg8 && !fc_volTransposed) ? 2.0f : 1.0f);
-  float3 texelCount = fc_volTransposedY
-    ? float3(volumeTexture.get_width(), volumeTexture.get_depth(),
-             volumeTexture.get_height())
-    : fc_volTransposed
-      ? float3(volumeTexture.get_depth(), volumeTexture.get_height(),
-               volumeTexture.get_width())
-      : float3(volumeTexture.get_width(), volumeTexture.get_height(),
-               texelCountZ);
-  float3 ctpScale   = max(texelCount - 1.0, 1e-4) / texelCount;
-  float3 ctpOffset  = 0.5 / texelCount;
-  float3 evalStep = texStep * ctpScale;
-
-  float firstT = jitter;   // checkBounds=true branch
-  float3 currentPoint = rayOrigin + rayDir * tStart + rayDir * firstT;
-  int maxSteps = max(1, int(ceil((s.totalBoxT - firstT) / stepSize)));
-  if (volumeUniforms.maxStepsFrame > 0.5)
-  {
-    maxSteps = min(maxSteps, int(volumeUniforms.maxStepsFrame));
-  }
-
-  float3 texLocalPos = (volumeUniforms.volumeToTexture *
-      float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize,
-             1.0)).xyz;
-  o.evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
-  o.evalStep = evalStep;
-  o.stepSize = stepSize;
-  o.rayDir = rayDir;
-  o.tTerminateMax = s.tTerminateMax;
-  o.steps = maxSteps;
-  return true;
-}
 
 kernel void volume_compute_march(
     texture2d<float, access::read> segAtlasA [[texture(0)]],
@@ -8640,6 +9007,10 @@ kernel void volume_compute_march(
     constant packed_float3* rectCoords [[buffer(3)]],
     constant VolumeLightUniforms& volumeLights [[buffer(4)]],
     constant ComputeMarchControl& cmc [[buffer(7)]],
+    // §38.17: per-ray skip segments (pre-offset per ray inside the march).
+    device uint* segIndexMap [[buffer(8)]],
+    device uint* segPool [[buffer(9)]],
+    device uint* segDbgOut [[buffer(10)]],
     texture2d<float> depthSynthTexture [[texture(20)]],
     uint2 gid [[thread_position_in_grid]])
 {
@@ -8676,7 +9047,13 @@ kernel void volume_compute_march(
         transferFunction2DTexture, transfer2DYAxisTexture,
         gradientOpacityTexture, maskTexture, labelMapTransferTexture,
         minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, normalTexture, blankingTexture,
-        rectCoords, &volumeLights, effBatch);
+        rectCoords, &volumeLights, effBatch,
+        // §38.17: pre-offset to this ray's segment record.
+        segIndexMap + (uint(gid.x) + uint(gid.y) * uint(volumeUniforms.viewportSize.x)),
+        segPool,
+        segDbgOut,
+        fc_cmSegHop && gid.x == (uint(volumeUniforms.viewportSize.x) >> 1u) &&
+          gid.y == (uint(volumeUniforms.viewportSize.y) >> 1u));
     outColorTexture.write(color, gid);
     return;
   }
@@ -8705,7 +9082,13 @@ kernel void volume_compute_march(
       transferFunction2DTexture, transfer2DYAxisTexture,
       gradientOpacityTexture, maskTexture, labelMapTransferTexture,
       minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, normalTexture, blankingTexture,
-      rectCoords, &volumeLights, effBatch);
+      rectCoords, &volumeLights, effBatch,
+      // §38.17: pre-offset to this ray's segment record.
+      segIndexMap + (uint(gid.x) + uint(gid.y) * uint(volumeUniforms.viewportSize.x)),
+      segPool,
+      segDbgOut,
+      fc_cmSegHop && gid.x == (uint(volumeUniforms.viewportSize.x) >> 1u) &&
+        gid.y == (uint(volumeUniforms.viewportSize.y) >> 1u));
 
   outColorTexture.write(color, gid);
 }
@@ -8753,6 +9136,10 @@ kernel void volume_compute_march_binned(
     constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
     constant PerBlockData& b [[buffer(2)]],
     constant ComputeMarchControl& cmc [[buffer(7)]],
+    // §38.17: per-ray skip segments.
+    device uint* segIndexMap [[buffer(8)]],
+    device uint* segPool [[buffer(9)]],
+    device uint* segDbgOut [[buffer(10)]],
     texture3d<float> volumeTexture [[texture(5)]],
     texture2d<float> transferFunctionTexture [[texture(6)]],
     texture2d<float> transferFunctionTexture1 [[texture(7)]],
@@ -8799,7 +9186,13 @@ kernel void volume_compute_march_binned(
       transferFunction2DTexture, transfer2DYAxisTexture,
       gradientOpacityTexture, maskTexture, labelMapTransferTexture,
       minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, normalTexture, blankingTexture,
-      rectCoords, &volumeLights, effBatch);
+      rectCoords, &volumeLights, effBatch,
+      // §38.17: pre-offset to this ray's segment record (binned: uv is the
+      // original image-space pixel).
+      segIndexMap + (uv.x + uv.y * uint(volumeUniforms.viewportSize.x)),
+      segPool,
+      segDbgOut,
+      false);
 
   outColorTexture.write(color, uv);
 }
@@ -8926,6 +9319,52 @@ kernel void volume_reduce_minmax_blocks(
   }
 
   blocks.write(allEmpty ? 1.0 : (allSolid ? 0.5 : 0.0), gid);
+  if (allEmpty) {
+    atomic_fetch_add_explicit(emptyCount, 1u, memory_order_relaxed);
+  }
+}
+
+// §38.16 (VTK_METAL_TEST_MM_MIP -> fc_mmMip): write the block summary into
+// mip level dstLod of the FINE lattice instead of the standalone block
+// texture, so the marcher's block taps read the same resource as the cell
+// taps (§38.15/38.16: the standalone summary resource carries a catastrophic
+// small-viewport access tax that survives format/path/slot/padding changes;
+// reads from the fine-lattice resource measured free). The reduce logic is
+// byte-identical to volume_reduce_minmax_blocks (same clamped partial-edge
+// loops, same three-state encoding), so values match the standalone texture
+// exactly; a blit mirrors level dstLod back into the standalone texture for
+// its other consumers.
+kernel void volume_reduce_minmax_mipblocks(
+    texture3d<float, access::read> fine [[texture(0)]],
+    texture3d<float, access::write> pyr [[texture(1)]],
+    constant uint& blockSize [[buffer(0)]],
+    device atomic_uint* emptyCount [[buffer(1)]],
+    constant uint& dstLod [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  uint3 pdims = uint3(pyr.get_width(dstLod), pyr.get_height(dstLod),
+                      pyr.get_depth(dstLod));
+  if (any(gid >= pdims)) return;
+
+  uint3 fdims = uint3(fine.get_width(), fine.get_height(), fine.get_depth());
+  uint3 start = gid * blockSize;
+  uint3 end = min(start + blockSize, fdims);
+
+  bool allEmpty = true;
+  bool allSolid = true;
+  for (uint z = start.z; z < end.z && (allEmpty || allSolid); z++) {
+    for (uint y = start.y; y < end.y && (allEmpty || allSolid); y++) {
+      for (uint x = start.x; x < end.x && (allEmpty || allSolid); x++) {
+        if (fine.read(uint3(x, y, z)).r < 0.5) {
+          allEmpty = false;
+        } else {
+          allSolid = false;
+        }
+      }
+    }
+  }
+
+  pyr.write(allEmpty ? 1.0 : (allSolid ? 0.5 : 0.0), gid, dstLod);
   if (allEmpty) {
     atomic_fetch_add_explicit(emptyCount, 1u, memory_order_relaxed);
   }

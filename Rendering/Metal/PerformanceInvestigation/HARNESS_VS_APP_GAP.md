@@ -4906,6 +4906,177 @@ env-gated diagnostics inventory addition: EXIT_THETA. Logs:
 /tmp/opencode/struct_ab/{anchor,slabs,ydepth,ycoarse,theta,theta_img,
 db_img,detctrl,refpre,refpost*}.
 
+### 38.16 Block-tap tax hunt II: the resource is innocent — the tax is the
+SERIALIZED PER-CROSSING PROBE exposed by low frame parallelism (2026-08-25)
+
+Continued from 77778041cc with the §38.15.3 program. All arms default-off
+env knobs, ABBA ×2 per cell, raw log /tmp/cm_matrix3.txt (mx_r1..r8.zsh).
+Baseline apparatus re-verified first: MM_NOTAP reproduces its full
+recovery in every build this session (BS16 @400² 4.85 → 2.85 ms).
+
+#### 38.16.1 Elimination record (each row an independent ABBA measurement)
+
+| knob | mechanism tested | result @400² |
+|---|---|---|
+| MM_READ (.read texel fetch) | sampler pipe vs LSU | fat — access path irrelevant |
+| MM_PADTEX (64³ alloc) | tiny-allocation placement | fat — size class irrelevant |
+| MM_ALTTAP v1 | alt-source read | UNSOUND: [0.5,0.74] remap let the compiler prove mv9BlkState constant and delete the read (compiled into NOTAP). Methodology lesson: bisect reads must be non-foldable |
+| MM_ALTTAP v2 (raw fv) | non-foldable fine-map source | FAST (2.6-2.7) but ILLEGAL: cell-granular state leaps 16 cells across mixed blocks — fake speedup via wrong output; proves nothing about read cost |
+| MM_PRE v2 (exact batchCap prediction) | latency overlap | null (v1's failure explained: predicted min(48,·) while CM_BATCH=16 ⇒ always missed) |
+| MM_ALTSLOT (same bytes via slot 17; parity max=0) | binding index | fat — slot index exonerated |
+| MM_MIP (summary fused into fine-lattice mip level log2(bsI)) | resource identity itself | FAT (5.05 ≈ baseline; −0.2 ms regression even @2048). Kills the standalone-texture theory definitively |
+| MM_SEG on compute marcher | precomputed skip segments | no-op: fc_segHop consume exists ONLY in the fragment marcher (§35.14 was never ported) |
+| CM_BATCH=48 | fewer preamble rounds | WORSE everywhere @400² (blocks0 2.9→3.8); B16 stays optimal |
+
+Parity gates: READ/ALTSLOT byte-clean (max=0); MIP 2 px at ±1/255
+(half-precision accumulation boundary flip from instruction rescheduling;
+decisions identical; app thresholded-error gate 0 both arms). Base-vs-base
+verified bit-deterministic. Pre-existing curiosity parked: the [TRMM]
+VIOLATION counter fires 32× IDENTICALLY in baseline and MIP (empty-marked
+blocks covering solid fine cells — checker/reducer stage mismatch or a
+real subtle reduce bug; needs its own session).
+
+#### 38.16.2 Synthesis (supersedes §38.15.1(F)'s resource framing)
+
+Every CORRECT block-state probe costs ~+2 ms/frame @400² regardless of
+source texture, access path, binding slot, allocation size, mip fusion,
+or prefetching. NOTAP (probes removed, decisions constant-mixed) equals
+blocks0 exactly — the preamble walk itself is free. Meanwhile the SAME
+probes are net-PROFITABLE at 2048² (BS16 beats blocks0 by −24%): ~26× the
+ray count supplies enough concurrent threadgroups to hide the probe
+latency entirely, and true skipping saves real compositing work.
+
+⇒ Mechanism: the walk consumes each summary read on a loop-carried
+dependency chain (crossing k+1's address depends on crossing k's value).
+At thumbnail viewports too little other work is in flight to hide those
+stalls; they serialize onto the critical path. It was never the blockTex
+"resource" — MM_MIP proved even the fine lattice's own bytes tax
+identically when probed this way. §38.14's physical-limit framing and
+§38.15's resource-curse framing were both wrong about mechanism; the
+correct statement is a PARALLELISM condition on serialized probes.
+
+#### 38.16.3 Standing remedy
+
+Move occupancy decisions off the march-time dependency chain: port the
+§35.14 segment pre-pass (build per-ray skip segments in a throughput-bound
+kernel at full parallelism; march consumes segments probe-free) to the
+compute marcher. fc_segHop plumbing, segment pool bindings and the build
+kernel already exist fragment-side; the compute port is well-defined but
+sizable (consume loop replacing the preamble in marchRayFromAtlasCore +
+the binned variant + key bits). Single-static-config compatible: helps
+exactly where probes currently hurt, neutral elsewhere. All §38.16 knobs
+land default-off as diagnostics for that work.
+
+Tree state after this session: shader fc slots 43-49 (NOTAP/READ/ALTTAP/
+PRE/ALTSLOT/MIP) + mip reduce kernel volume_reduce_minmax_mipblocks;
+mapper env knobs VTK_METAL_TEST_MM_{NOTAP,READ,ALTTAP,PRE,ALTSLOT,MIP,
+PADTEX} with PSO key bits 19-22,24,25 (compute) / 256,1024,2048,8192
+(fragment); NewTexture3D/CreateR8MinMaxTexture gained mipmapLevels
+params. Builds green; everything default-off = HEAD-equivalent output.
+Session incident for the record: one intermediate build referenced
+fc_mmPre without declaring it — library compile failed per frame and the
+app degraded to ~594 ms/f fallback with CORRECT output; any uniform
+~100× slowdown across all arms incl. raw means "check stderr for Failed
+to compile", not "machine broken".
+
+
+
+### 38.17 Segment pre-pass ported to the compute marcher: plumbing complete,
+parity clean (stage 1) — but the economics are structurally negative (2026-08-26)
+
+Continued from §38.16.3's standing remedy: the §35.14 segment pre-pass now
+runs end-to-end for the compute marcher. All default-off behind
+VTK_METAL_TEST_MM_SEG (value-parsed); raw log /tmp/cm_matrix3.txt
+(mx_s1.zsh and the mx_r* series).
+
+#### 38.17.1 What landed
+
+- Builder (volume_segment_build) gained synth-input mode (buildFlags bit0):
+  CM_SYNTH has no atlas raster, so the builder reconstructs per-ray setup
+  via synthesizeAtlasRay (moved above the builder; VolumeTexture/depth/
+  uniforms bindings added). The builder PSO is now created via
+  newFunctionWithName:constantValues: — synth pulls in fc_volRg8/
+  fc_volTransposed/fc_volTransposedY; unspecialized creation asserts.
+  Specialization values mirror the march pipeline's feature-mask policy.
+- Compute-path build dispatch (encoder before the march, same CB), consume
+  in marchRayFromAtlasCore (fc_cmSegHop, slot 50; fragment fc_segHop
+  pattern verbatim), buffer slots 8/9 (+10 debug) on both compute march
+  kernels; binned variant passes uv-derived fpid.
+- Defensive gap validation in the consume (start>=end or end>steps ⇒
+  list end) — cheap insurance for the u16-packed records.
+- MM_SEG_DEBUG apparatus: builder mirror (16 words/ray shared), consume
+  outlet (center-ray final i/segIdx/segCnt/opacity), target readback.
+  This apparatus found every bug below — keep it.
+
+#### 38.17.2 Bugs found on the way (all fixed, all instructive)
+
+1. LATENT §35.14 PACKING BUG (fixed in HEAD's fragment path too): gaps
+   were OR-accumulated as 32-bit words shifted by (cnt&1)*16 lanes — odd
+   gaps lost their start bits and OR-corrupted even gaps' starts. The
+   fragment engine never noticed because every corrupted endpoint still
+   landed inside empty terrain (skipped samples contribute zero) — output-
+   benign corruption. Now: one gap per u32 word, direct assignment, 16
+   slots (segR0..R3).
+2. EnsureSegResources recreates SegMarchTexture; the compute path captured
+   `target` BEFORE that call — frame 1 bound a texture WITHOUT
+   MTLTextureUsageShaderWrite (validation: "writes texture whose usage
+   doesn't specify MTLTextureUsageShaderWrite") ⇒ compute writes undefined
+   ⇒ black frames, flaky by build/cache state. Fix: capture target after
+   the build block. (Found only via MTL_DEBUG_LAYER — run validation when
+   anything "mysteriously black".)
+3. didModifyRange on Shared storage asserts under validation (pre-existing
+   pattern copied into the new site) — removed.
+4. Debug-mirror scope/stride mismatches caused several false leads
+   (out-of-scope vars, 4-word reads of a 16-word layout, blits clobbering
+   the mirror, readback offset inside the mirror region). Lesson: debug
+   plumbing needs the same review rigor as production code.
+5. FIRST-RUN-OF-A-FRESH-BINARY captures can be black (Metal compile stall
+   in the single-shot --out path) — warm the binary before parity captures.
+
+#### 38.17.3 Results
+
+Stage 1 (fine-only builder — cell-granular gaps, the §35.14 walk):
+- Parity: 360 px @ ±2/255 vs baseline (hop-landing fp drift class);
+  NOCONSUME byte-clean. Fragment engine + fixed packing: 238 px (was
+  output-benign-corrupt before the packing fix).
+- Performance: structurally NEGATIVE. @400²: bs16+seg 7.2 ms vs bs16
+  4.8 (preamble) — the builder duplicates the whole occupancy walk per
+  ray per frame (cell-granular: ~220 fine taps/ray), and the marcher then
+  re-walks cheaply. @2048²: 38.9 vs 12.1 (3.2x) — same duplication at
+  4M rays.
+
+Stage 2 (builder block leaps, VTK_METAL_TEST_MM_SEG_LEAPS, default OFF):
+parity DIVERGES (162k px @512², brighter output at 1024²) despite the
+leap math mirroring the preamble's state==1 branch; the 16-slot select
+fix (gaps 8-15 previously overwrote slot 7 — real bug, fixed) did not
+close the gap. Root cause unresolved — next session needs a CPU gap-diff
+harness (dump full gap lists for a ray sample, compare against a CPU
+reference walk of the preamble) instead of endpoint-only probes.
+
+#### 38.17.4 Economics verdict and the remaining path
+
+The segment architecture pays the occupancy walk TWICE (builder + the
+marcher's ladder-replacement). It can only win where the preamble's
+serialized probes are expensive (small viewports, §38.16.2) and must not
+lose where they are free (large viewports) — but the builder runs at ALL
+resolutions. Even a perfect stage-2 builder (≈ preamble cost, throughput-
+paid) is ~parity at 2048² and a ~1-2 ms regression during camera motion.
+
+The remaining viable shape: CACHE SEGMENTS PER CAMERA POSE (keyed on
+view/camera/TF/summary timestamp — the summary cache already exists).
+Static inspection (the dominant diagnostic use-case, and the bench)
+amortizes the builder to zero: @400² converges to the NOTAP-class ~2.9 ms
+(−40% vs 4.8), @2048² stays ~12 ms (parity). Orbiting pays one builder
+pass per frame. That is a single-static-config-compatible win and is the
+recommended next session item, AFTER the stage-2 gap-diff harness.
+
+Tree state: all §38.17 code default-off (MM_SEG absent ⇒ HEAD-equivalent
+output; NOCONSUME byte-clean). Shader: fc_cmSegHop slot 50, synth-capable
+builder, fixed gap packing (16 slots), block-leap builder behind
+MM_SEG_LEAPS. Mapper: compute build dispatch, consume binds 8/9/10,
+PSO bit 26, debug apparatus (MM_SEG_DEBUG), SegConsumeDbgBuffer.
+Logs /tmp/cm_matrix3.txt; generators mx_s1.zsh, mx_r1..r8.zsh.
+
 
 
 ## 5. Files

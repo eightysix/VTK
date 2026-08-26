@@ -315,6 +315,14 @@ private:
   int MinMaxBlockDims[3] = {};          // block-summary grid dims
   int MinMaxBlockSize = 0;              // block edge in fine-lattice cells (cache key)
   void* BlockReduceComputePipeline = nullptr; // id<MTLComputePipelineState> — volume_reduce_minmax_blocks
+  // §38.16 (VTK_METAL_TEST_MM_MIP): same reduce writing into mip level
+  // log2(blockSize) of the fine lattice (volume_reduce_minmax_mipblocks).
+  void* MipBlockReduceComputePipeline = nullptr;
+  // §38.17 MM_SEG_DEBUG staging (shared) for CPU-side pool/index dumps.
+  void* SegDebugStageBuffer = nullptr;
+  // §38.17 consume-state debug outlet (16 words shared, center ray).
+  void* SegConsumeDbgBuffer = nullptr;
+  size_t SegDebugStageBytes = 0;
   // Fraction of all-empty blocks in the last block-summary build, written by
   // the reduce dispatch's completion handler. When skipping cannot pay on a
   // transfer function (mostly-solid lattice), BuildPerBlockData clears the
