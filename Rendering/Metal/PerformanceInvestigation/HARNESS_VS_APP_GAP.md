@@ -5104,6 +5104,27 @@ Tree state: cache members `SegCacheValid/Width/Height/UniformBytes/
 PbdBytes/PoolCapWords/MinMaxTime` default-off; `MM_SEG` absent ⇒ HEAD-
 equivalent.
 
+#### 38.18.1 Clog without private queue — reboot-only `Private` heaps and `PSO` cache (2026-08-26)
+
+`400 +214.9%` / `4096 +57.1%` on `77778041cc` clean `HEAD` reproduced with
+`qoff` (`BASE` `CM_QUEUEPROBE=0` → `cbUse = commandBuffer`
+`vtkMetalGPUVolumeRayCastMapper.mm:10942` `segLive ? commandBuffer : ...`,
+no `ComputeMarchQueue` `commit`/`waitUntilCompleted`), fixed only by reboot
+without cooldown — so not `DVFS`. `qoff` avoids the `3-slot`
+`Private` `SegPool`/`RayBin` `commit`/`wait` serialization (`§38.9.2`
+`ProbeAndSelectFastQueue` `mm:10883` `§38.13.3` `1.`), but the **global**
+`MTLDevice` `Private` heaps (`SegPool` `64 MB` `mm:2536` `Private`,
+`RayBin` `4×W×H` `Private`) and `ComputeMarchPipelineCache` (`mm:364`
+`MTLComputePipelineState` `+` `SegBuildComputePipeline` `256 MB`) are
+per-`mapper` and never purged until `ReleaseGraphicsResources` / `MTLDevice`
+teardown. First `qoff` run after reboot is clean.
+
+**Proposed fix (no reboot):** `PurgeCaches()` — `ComputeMarchPipelineCache.
+clear()` + `SegBuildComputePipeline`/`SegPool`/`RayBin`/`SegCacheValid=false`
+`ReleaseMetalObject`, callable from `ReleaseGraphicsResources` and on
+`VTK_METAL_TEST_PURGE=1` or `SegPoolCapWords` thrash. `qoff` default plus
+this purge is the `reboot without reboot`.
+
 
 
 ## 5. Files
