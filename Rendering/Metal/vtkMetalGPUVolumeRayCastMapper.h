@@ -250,6 +250,14 @@ public:
   // untouched. Used by the test apps' runtime render-config toggles.
   void ForceResourceReupload();
 
+  // §38.18.1: purge heavyweight Private-heap / PSO caches (SegPool 64 MB +
+  // RayBin 4×W×H + ComputeMarchPipelineCache + SegBuild) that are otherwise
+  // retained until ReleaseGraphicsResources/MTLDevice teardown. This is the
+  // "reboot without reboot" — callable from ReleaseGraphicsResources and on
+  // VTK_METAL_TEST_PURGE=1. qoff (window CB) default plus this purge removes
+  // the reboot-only clog without cooldown (not DVFS).
+  void PurgeCaches();
+
   // Phase 6: Fullscreen camera-inside path.
   // When true (default), camera-inside rendering uses a fullscreen ray-cast
   // fragment shader; setupVolumeRay clamps the entry to the near plane so the
@@ -628,6 +636,10 @@ private:
   bool EnsureComputeMarchResources(void* device, void* mtlQueue, int width, int height);
   void* GetOrCreateComputeMarchPipeline(void* mtlDevice, uint32_t featureMask, bool binned);
   void BindComputeMarchTextures(void* encoder, void* atlasA, void* atlasB, void* atlasC, void* outColor);
+  // §38.18.1: helper that releases all segment-pre-pass Private heaps and
+  // invalidates the per-camera seg cache (called by PurgeCaches and
+  // ReleaseGraphicsResources).
+  void ReleaseSegmentResources();
 
   // Mask / label map helpers
   bool UpdateMaskTexture(void* mtlDevice, void* mtlQueue, vtkVolume* vol);

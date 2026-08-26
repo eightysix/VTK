@@ -1582,6 +1582,33 @@ static float VolumeMinMaxEps()
   return 0.0f;
 }
 
+// §38.18.1: private-queue gating — qoff (window CB) is now the default.
+// The fast private queue adds 3-slot Private SegPool/RayBin commit/wait
+// serialization and a poisoned-slot hazard (§38.9.2). It is only used when
+// explicitly opted in via VTK_METAL_TEST_CM_FASTQUEUE=1 (preferred) or the
+// legacy VTK_METAL_TEST_CM_QUEUEPROBE=1. Absence or 0 → window CB (qoff).
+static bool VolumeComputeMarchUseFastQueue()
+{
+  if (const char* v = getenv("VTK_METAL_TEST_CM_FASTQUEUE"))
+    return std::atoi(v) != 0;
+  if (const char* v = getenv("VTK_METAL_TEST_CM_QUEUEPROBE"))
+    return std::atoi(v) != 0;
+  return false; // qoff default
+}
+
+// §38.18.1: purge request via VTK_METAL_TEST_PURGE=1 (also accepts
+// VTK_METAL_TEST_METAL_PURGE for foragability). Returns true once per
+// GPURender when the flag is set so PurgeCaches can be triggered without
+// a full ReleaseGraphicsResources cycle.
+static bool VolumePurgeRequested()
+{
+  if (const char* v = getenv("VTK_METAL_TEST_PURGE"))
+    return std::atoi(v) != 0;
+  if (const char* v = getenv("VTK_METAL_TEST_METAL_PURGE"))
+    return std::atoi(v) != 0;
+  return false;
+}
+
 
 //------------------------------------------------------------------------------
 static id<MTLTexture> CreateR8MinMaxTexture(
@@ -3546,6 +3573,90 @@ bool vtkMetalGPUVolumeRayCastMapper::EnsureGradientNormalTexture(
 }
 
 //------------------------------------------------------------------------------
+// §38.18.1: release all segment-pre-pass Private heaps and invalidate the
+// per-camera cache. This is the heavyweight half of PurgeCaches and is also
+// called directly by ReleaseGraphicsResources so destructors do not leak the
+// 64 MB SegPool / RayBin Private heaps that otherwise survive until
+// MTLDevice teardown (reboot-only clog, not DVFS).
+void vtkMetalGPUVolumeRayCastMapper::ReleaseSegmentResources()
+{
+  ReleaseMetalObject(this->SegAtlasATexture);
+  ReleaseMetalObject(this->SegAtlasBTexture);
+  ReleaseMetalObject(this->SegAtlasCTexture);
+  ReleaseMetalObject(this->SegIndexBuffer);
+  ReleaseMetalObject(this->SegPoolBuffer);
+  ReleaseMetalObject(this->SegPoolCounterBuffer);
+  ReleaseMetalObject(this->SegMarchTexture);
+  ReleaseMetalObject(this->SegBuildComputePipeline);
+  ReleaseMetalObject(this->SegConsumeDbgBuffer);
+  ReleaseMetalObject(this->SegDebugStageBuffer);
+  // SegDummyBuffer is a tiny Shared fallback kept across purges to avoid
+  // re-allocating per frame; do not release it here.
+  this->SegAtlasWidth = 0;
+  this->SegAtlasHeight = 0;
+  this->SegPoolCapWords = 0;
+  this->SegCacheValid = false;
+  this->SegCacheWidth = 0;
+  this->SegCacheHeight = 0;
+  this->SegCachePoolCapWords = 0;
+  this->SegCacheUniformBytes.clear();
+  this->SegCacheUniformBytes.shrink_to_fit();
+  this->SegCachePbdBytes.clear();
+  this->SegCachePbdBytes.shrink_to_fit();
+  this->SegCacheMinMaxTime.Modified();
+  this->SegActiveThisFrame = false;
+  this->SegDebugStageBytes = 0;
+  this->SegLastClaimWords.store(0);
+}
+
+// §38.18.1: "reboot without reboot" — drains in-flight frames, releases
+// Private-heap SegPool/RayBin (64 MB + 4×W×H) and the Compile-time PSO caches
+// (ComputeMarchPipelineCache + SegBuild) that otherwise survive until
+// ReleaseGraphicsResources/MTLDevice teardown. Callable from
+// ReleaseGraphicsResources and on VTK_METAL_TEST_PURGE=1 or pool-cap thrash.
+// Better alternatives evaluated (see header docs):
+//  • Shared-storage fallback for RayBin/SegPool (avoids Private-heap pressure
+//    entirely but costs GPU atomic bandwidth);
+//  • MTLHeap + setPurgeableState / currentAllocatedSize vs
+//    recommendedMaxWorkingSetSize auto-purge (lets the OS reclaim under pressure
+//    without explicit PurgeCaches);
+//  • LRU cap on PSO cache (e.g. 4 entries, ~256 MB observed) instead of
+//    unbounded grow. The explicit purge is the minimal correctness fix; the
+//    heap/purgeable and LRU options remain as follow-ups if the clog recurs.
+void vtkMetalGPUVolumeRayCastMapper::PurgeCaches()
+{
+  // Drain GPU work that may reference the heaps/PSOs before releasing.
+  this->WaitForInFlightFrames();
+
+  // Compute PSO caches (256 MB observed with many feature-mask variants).
+  for (auto& entry : this->ComputeMarchPipelineCache)
+  {
+    [(__bridge id)entry.second release];
+  }
+  this->ComputeMarchPipelineCache.clear();
+  for (auto& entry : this->ComputeMarchBinnedPipelineCache)
+  {
+    [(__bridge id)entry.second release];
+  }
+  this->ComputeMarchBinnedPipelineCache.clear();
+  ReleaseMetalObject(this->ComputeMarchPipeline);
+  ReleaseMetalObject(this->RayBinClassifyPipeline);
+  ReleaseMetalObject(this->ComputeMarchBinnedPipeline);
+  ReleaseMetalObject(this->RayBinIndicesBuffer);
+  ReleaseMetalObject(this->RayBinCountersBuffer);
+  ReleaseMetalObject(this->ComputeMarchQueue);
+  this->RayBinIndicesCapBytes = 0;
+
+  // Segment heaps + per-camera cache.
+  this->ReleaseSegmentResources();
+
+  if (getenv("VTK_METAL_TEST_PURGE") || getenv("VTK_METAL_TEST_METAL_PURGE"))
+  {
+    fprintf(stderr, "[purge] vtkMetalGPUVolumeRayCastMapper::PurgeCaches completed\n");
+  }
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotUsed(window))
 {
   // Drain in-flight frames before releasing any resources they may reference.
@@ -3589,7 +3700,8 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   ReleaseMetalObject(this->DilateComputePipeline);
   ReleaseMetalObject(this->BlockReduceComputePipeline);
   ReleaseMetalObject(this->MipBlockReduceComputePipeline);
-  ReleaseMetalObject(this->SegDebugStageBuffer);
+  // SegDebugStageBuffer is owned by segment resources; released via
+  // ReleaseSegmentResources below to keep Private-heap purge centralized.
 
   // Phase 7: Release GPU data-type conversion compute pipelines
   ReleaseMetalObject(this->ConvertShortToHalfPipeline);
@@ -3620,6 +3732,8 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   this->PipelineCache.clear();
 
   // §38.6 / §36.4 Design B: Clear compute march pipelines and buffers
+  // (also covered by PurgeCaches — keep inline here to avoid an extra
+  // WaitForInFlightFrames when called from ReleaseGraphicsResources itself).
   ReleaseMetalObject(this->ComputeMarchPipeline);
   ReleaseMetalObject(this->RayBinClassifyPipeline);
   ReleaseMetalObject(this->ComputeMarchBinnedPipeline);
@@ -3637,6 +3751,11 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
     [(__bridge id)entry.second release];
   }
   this->ComputeMarchBinnedPipelineCache.clear();
+
+  // §38.18.1: release segment Private heaps (SegPool 64 MB etc.) that were
+  // previously leaked across ReleaseGraphicsResources — the reboot-only clog
+  // root cause.
+  this->ReleaseSegmentResources();
 
   for (int i = 0; i < 3; ++i)
   {
@@ -8865,6 +8984,16 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   void* mtlDevice = metalRenderWindow->GetMetalDevice();
   void* mtlQueue = metalRenderWindow->GetMetalQueue();
 
+  // §38.18.1: "reboot without reboot" — if the env flag is set, purge the
+  // Private-heap SegPool/RayBin (64 MB + 4×W×H) and the PSO caches that are
+  // otherwise retained until ReleaseGraphicsResources/MTLDevice teardown.
+  // Must run BEFORE the per-frame semaphore wait at 10136 so the 3-slot
+  // drain inside PurgeCaches cannot deadlock against the held slot.
+  if (VolumePurgeRequested())
+  {
+    this->PurgeCaches();
+  }
+
   if (getenv("VTK_METAL_TEST_DUMP_UNIFORMS"))
   {
     double* bp = this->ModelBounds;
@@ -10981,11 +11110,15 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
           {
             id<MTLCommandQueue> marchQ = (__bridge id<MTLCommandQueue>)this->ComputeMarchQueue;
             if (!marchQ && VolumeComputeMarchSynth() &&
-                getenv("VTK_METAL_TEST_CM_QUEUEPROBE") == nullptr)
+                VolumeComputeMarchUseFastQueue())
             {
               // SYNTH needs nothing from the window queue before marching, so
               // the march can run on a probe-selected fast-slot queue; the CPU
-              // wait below keeps Phase-3b ordering trivially correct.
+              // wait below keeps Phase-3b ordering trivially correct. qoff
+              // (window CB) is now the default (§38.18.1) — fast queue is
+              // opt-in via VTK_METAL_TEST_CM_FASTQUEUE=1 (or legacy
+              // VTK_METAL_TEST_CM_QUEUEPROBE=1) to avoid the 3-slot
+              // Private-heap serialization and poisoned-slot hazard.
               marchQ = ProbeAndSelectFastQueue((__bridge id<MTLDevice>)mtlDevice, 3);
               this->ComputeMarchQueue = (__bridge void*)marchQ;
               [(__bridge id)marchQ retain];
