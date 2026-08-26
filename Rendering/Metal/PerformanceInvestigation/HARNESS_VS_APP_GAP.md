@@ -5377,6 +5377,76 @@ Measured lean `@2048 SD4 Y mm`, `60f/10w`, same `BASE` as `§39.3` (no `SHADE`):
 
 `blendMode`/`renderToTexture`/`independent` still use scalar `do{ //4900 }while` – `MIP` etc. would need `mipMaxScalar` tracking inside the `48-wide` batch (different accumulation), `RTT` needs `firstOpaquePos` `5049`; both are the next `fc_*` templates per `featureMask` `340/2713`, not a runtime cost. Binary `93M` `22:56`, `MARCH_DEBUG` gated `[fragpso]`, default `VTK_METAL_TEST_FRAG_BATCH=0`.
 
+## 40. `mv9` feature coverage — current state, gaps, and how to verify (2026-08-26)
+
+`MetalShaders.metal:5223` (`marchVolumeUnified`) is the dispatch. After `§39.5/§39.6`, one `PSO` per `featureMask`/`Extra` (`fc_*`) — `fc_*==false` dead-strips.
+
+### 40.1 Coverage matrix (what `mv9 48-wide` handles today)
+
+| feature | `fc_*` | `mv9` (`5223` + `5257`) | fallback | interactive relevance |
+|---|---|---|---|---|
+| `composite` `blendMode==0` | `fc_blendMode` `2666` | **yes** – `MV9_COMPOSITE` `w*col*opa` | – | default volume rendering |
+| `MIP/MinIP/Average/Additive` `1-4` | `fc_blendMode` `1-4` | **no** – outer `5216` needs `==0` | scalar `do{ //4900-5048 }` `mipMaxScalar/mipMin/avgBlendSum/additiveSum` | `MIP` for CT bone |
+| `shading` + `gradientOpacity` | `fc_shading` `2666` `fc_gradientOpacity` `2667` (`+fc_normalTexture` `fc_computeNormalFromOpacity`/`fc_defaultLighting`) | **yes** `§39.5` – `if(fc_shading){ n=computeGradientFast/…; col=computeVolumeLighting }` `5259` | – | `SHADE=1` lit volumes |
+| `cropping` | `fc_cropping` `2716` (`UseCropping` `640`, `computeCropRegion` `4804`) | **yes** `§39.6` – `if(fc_cropping) skip` | – | `vtkVolumeMapper::SetCropping` |
+| `mask` (binary/label) | `fc_mask` `2668` (`maskTexture` `4631`) | **yes** `§39.6` – `maskTexture.sample` + `labelMapTransferTexture` | – | segmentation |
+| `blanking` (ghost) | `fc_blanking` `2719` (`blankingTexture` `1020`) | **yes** `§39.6` | – | AMR / ghost arrays |
+| `rectilinear` | `fc_rectilinear` `2695` (`rectilinearSamplePosition` `3796`) | **yes** `§39.6` – `rPos` in `MV9_FETCH` | – | `vtkRectilinearGrid` |
+| `transfer2D` | `fc_transfer2D` `2691` (`transfer2DYAxisTexture` `988`) | **yes** `§39.6` – `sampleTransferFunction2D` | – | `vtkVolumeProperty::SetTransferFunction2D` |
+| `independent` `2-4` comps | `fc_independentComponents` `2687` (`useIndependentPath` `3324`) | **no** – outer `5216` keeps `!useIndependentPath` | scalar `useIndependentPath` `4912-5004` `compColor[4]` | `RGBA/LA` volumes |
+| `dependent` `LA/RGBA` | `fc_dependentLA` `2710` `fc_dependentRGBA` `2706` | **no** | scalar `4950-4966` | dependent TF |
+| `renderToTexture` (`RTT`) | `fc_renderToTexture` `2713` (`UseRenderToImage` `976`) | **no** – `!fc_renderToTexture` | scalar `firstOpaquePos` `5049` + `RTT` `112` | `vtkWindowToImageFilter` depth |
+| `slabs>1` (`SlabCount>1`) | `fc_slabMode` `2734` (`SlabInfo` `96`) | **yes** – `if(fc_slabMode && accumulatedOpacity>kExitAcc) break` `5338` + `PerBlockData` | – | `SLAB_BENCHMARKS.md` cache tiling |
+| `selection` (`HardwareSelector`) | `fc_renderToTexture` path `1456` | n/a – separate `fragment_volume_selection_main` PSO | – | picking |
+
+`independent/dependent/blendMode!=0/rtt` still scalar – the `N PSOs` cost is the same template per `featureMask` bit, not a `fps` cost after `PipelineCache` `7961`.
+
+### 40.2 Next to close (ranked by interactive hit)
+
+1. **`independent` / `dependent`** – multi-component `RGBA` is the next `fps` lever after `shading`. Lift `5216 !useIndependentPath && !fc_dependent…` and thread per-component `scalarScale/compScale` `4269` + `sampleComponentTransferFunction` `4916` + `computeGradientsAllComponents` `3932` through `MV9_COMPOSITE` as `if(fc_independentComponents){ for c in 0..nComp … col+=… }` (like `§39.5` shading). Expect `shaded` sized `PSO` bloat but `lean` stays `576`.
+2. **`blendMode!=0`** – needs different `w` accumulation (`mipMaxScalar` vs `col*opa`) inside the `48-wide` batch. Add `if(fc_blendMode==1){ mipMaxScalar = max(mipMaxScalar, scalarNorm) }` etc. `§39.6` scaffolding already has `kExitAcc`/`tTerminateMax` latches per batch.
+3. **`renderToTexture`** – `firstOpaquePos` `1456` write inside `MV9_COMPOSITE` when `fc_renderToTexture && sampleOpacity>0 && haveOpaquePos`.
+
+`cropping/mask/blanking/rectilinear/transfer2D` are already `mv9` – keep `baseline` only for the `3` rows above.
+
+### 40.3 How to verify (per feature, same protocol as `§39`)
+
+Lean must stay `±1%` after each lift (`60f/10w @2048 SD4 Y mm`, `BASE` `§39.3`). For the feature under test, run **parity + perf** `512` + `2048` `ABBA` (`warmup≥10`, `thresholded error 0`):
+
+```sh
+BIN=build_macos_metal/bin/vtkMetalGLVisualComparison
+DICOM=/Users/macair/Public/IMR/CTIMR/IMRToraceAddome
+BASE="VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=0 VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1"
+
+# 1) Lean parity (must stay 0.0004/0.001% class, §39.3)
+OUT1=/tmp/lean0; OUT2=/tmp/lean16; rm -rf $OUT1 $OUT2; mkdir -p $OUT1 $OUT2
+env $BASE $BIN --scene DICOMVolume --dicom $DICOM --frames 1 --size 512x512 --warmup 2 --out $OUT1 > /dev/null 2>&1
+env $BASE VTK_METAL_TEST_FRAG_BATCH=16 $BIN --scene DICOMVolume --dicom $DICOM --frames 1 --size 512x512 --warmup 2 --out $OUT2 > /dev/null 2>&1
+python3 -c "from PIL import Image;import numpy as np,os;a=np.array(Image.open(os.path.join('$OUT1','DICOMVolume.metal.png')));b=np.array(Image.open(os.path.join('$OUT2','DICOMVolume.metal.png')));d=np.abs(a.astype(int)-b.astype(int));print(f'lean mean {d.mean():.4f} max {d.max()} >1LSB {100*(d>1).mean():.3f}%')"
+
+# 2) Feature parity (example: independent via 4-component dataset, or shading already done §39.5)
+# For shading (done):
+OUTS0=/tmp/shade0; OUTS16=/tmp/shade16; rm -rf $OUTS0 $OUTS16; mkdir -p $OUTS0 $OUTS16
+env $BASE VTK_METAL_TEST_SHADE=1 $BIN --scene DICOMVolume --dicom $DICOM --frames 1 --size 512x512 --warmup 2 --out $OUTS0 > /dev/null 2>&1
+env $BASE VTK_METAL_TEST_SHADE=1 VTK_METAL_TEST_FRAG_BATCH=16 $BIN --scene DICOMVolume --dicom $DICOM --frames 1 --size 512x512 --warmup 2 --out $OUTS16 > /dev/null 2>&1
+python3 -c "from PIL import Image;import numpy as np,os;a=np.array(Image.open(os.path.join('$OUTS0','DICOMVolume.metal.png')));b=np.array(Image.open(os.path.join('$OUTS16','DICOMVolume.metal.png')));d=np.abs(a.astype(int)-b.astype(int));print(f'shaded mean {d.mean():.4f} max {d.max()}')"
+
+# 3) Feature perf (ABBA per view, §39.3 shape – add VIEW="VTK_METAL_TEST_CAM_AXIS=z" etc.)
+for VIEW in "" "VTK_METAL_TEST_CAM_AXIS=z" "VTK_METAL_TEST_CAM_AZ=135"; do
+  for CFG in "$BASE" "$BASE VTK_METAL_TEST_FRAG_BATCH=16" "$BASE VTK_METAL_TEST_SHADE=1" "$BASE VTK_METAL_TEST_SHADE=1 VTK_METAL_TEST_FRAG_BATCH=16"; do
+    eval "env $CFG $VIEW $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 60 --size 2048x2048 --warmup 10 2>&1 | grep ^DICOMVolume"
+  done
+done
+# For independent: use a 4-component volume (e.g. RGBA) and check UseIndependentComponents path;
+# for MIP: set volume property BlendMode via TestMetalScenes preset or VTK_METAL_TEST_BLEND env if added;
+# for RTT: --scene with selection pass.
+
+# 4) Build check – shader must compile for every new fc_* combo:
+#    look for "[fragpso]" with VTK_METAL_TEST_MARCH_DEBUG=1 and no "Failed to compile" in stderr.
+```
+
+Pass bars: lean `mean 0.0004 max2` unchanged, feature `mean<0.04 max<25` `±1-step` class (`26.5` macrocell rounding), `thresholded error 0`, `60f` `ABBA` `±1%` per view. `N PSOs` only first-frame `~200ms` hitch, `fps` after `PipelineCache` `7961`.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
