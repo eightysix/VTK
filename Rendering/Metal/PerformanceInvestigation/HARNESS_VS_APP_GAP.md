@@ -5215,6 +5215,124 @@ All cells within `±3%` of the `§38.12` anchors (the `±1%` `§38.12` `CAVEAT` 
 
 Tree state after this verification: `a013d87a36` `PurgeCaches`/`qoff` landed; `§38.18` segment cache default-off; `§38.12.4` verdicts unchanged and re-anchored.
 
+## 39. Fragment compile-time batch specialization — closing the compute gap without a second march type (2026-08-26)
+
+Question from §38: *why is compute faster than the best fragment, can the fragment be lifted to match, and is the gap a feature-count effect?* Answer below.
+
+### 39.1 Why compute wins today (§38.10 mechanism)
+
+Not a cheaper algorithm – march bodies are at parity (`§38.8` correction, `§38.9.3` floor `bare 0.38+blit 0.51+dispatch 0.59 =1.48 ms` `@2048`, `march≈16.3 synth vs 15.4 frag`). Root cause is **static register allocation**:
+
+* `MaxBatchWidth` is a runtime uniform, so the compiler must allocate the worst-case 32-wide (48-wide in compute) unrolled ladder → `maxThreadsPerTG 384/1024=37%`.
+* `fc_cmBatch [[function_constant(39)]]` (`VTK_METAL_TEST_CM_BATCH`) bakes the width at `newFunctionWithName:constantValues:` → dead rungs gone → `576 threads/TG =56-63%` + more frequent preamble/exit checks. This alone flipped all 12 production cells at `@2048/4096` (`§38.10.4`, `18/18`).
+
+Secondary: with occupancy fixed, block leaps become a pure `31-45%` win on *all* views incl. axis chords (`§38.11.1` `LL2 29.38 vs LL0 52.96`); fragment still pays leap-scatter on chords (`+6-14%` at `BS8`). Not a feature-count effect – bench config is lean `composite, mm+blocks` on both, parity `frag-vs-comp mean|d|=0.036/0.33% >1LSB` vs cross-backend `0.064/9.5%`. Compute’s *production* feature gap (`slabs>1`, hybrid depth, `mask/crop/blanking`, `camera-inside-proxy`) is the reason two engines must coexist, not the bench gap.
+
+### 39.2 Fragment port — `fc_fragBatch`
+
+Mirrored the compute trick for the fragment ladder (`§39` patch):
+
+* `MetalShaders.metal:2796` `constant int fc_fragBatch [[function_constant(41)]]; // 0=runtime`
+* `marchVolumeUnified:5272` `batchCap = (fc_fragBatch>0)?fc_fragBatch:max(1,int(maxBatchWidth))`
+* `vtkMetalGPUVolumeRayCastMapper.mm:1495` `VolumeFragBatch()` from `VTK_METAL_TEST_FRAG_BATCH` (`0-48`, clamped), baked into `featureMaskExtra bits [10:15]` (`fragBatch<<10`) → own PSO per width, same as `fc_cmBatch` (sampleCount overload for compute). `hasFeatureConstants` block sets `fc_fragBatch`; `MARCH_DEBUG` gated `[fragpso]` diagnostic.
+
+Default `0` → bit-identical shipped behavior (fallback to runtime `32`). No pipeline explosion – one PSO per distinct `fragBatch` value, cache-hit thereafter.
+
+### 39.3 Results — fragment now matches/beats compute on the same `Y`/`BS` stack
+
+Protocol: `arm64 Release`, `MTL_DEBUG_LAYER=0`, `AC` power, `IMRToraceAddome 512×512×1794 U8`, `SD4, IGN_JITTER=0, JITTER=1, MARCH_VARIANT=9, MINMAX=1/ACCEL=1`, `60f/10w @2048`, `20f/10w @4096`, ABBA interleaved (`frames 60/20` covers `§37.20`'s `±1%` drift + `M2` `≈2%` noise). `axisY = VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y`.
+
+**Sweep on shipped X (single runs, `@2048` then corrected `@4096`):**
+
+| `@2048 X` | `frag0` (ship `32`) | `frag8` | `frag16` | `frag32/48` |
+|---|---|---|---|---|
+| obl | 16.32/16.61 | **14.02** | 14.35 | 16.37 |
+| az45 | 17.59 | **15.38** | 16.68 | 17.92 |
+| az135 | 14.42 | 12.39 | **11.71** | 14.03 |
+| axx | 28.01 | 22.27 | **21.36** | 27.94 |
+| axy | 25.95 | 17.97 | **17.23** | 25.44 |
+| axz | 35.59 | 28.43 | **25.86** | 35.45 |
+| Σ | 137.9 | 110.5 | **107.2 (-22%)** | 137+ |
+
+| `@4096 X` | `frag0` | `frag8` | `frag16` | `frag32` |
+|---|---|---|---|---|
+| obl | 46.65 | 36.51 | **33.86-34.10** | 37.48 |
+| axz | 129.47 | 99.29 | **91.86-92.52** | 102.68 |
+
+`8` wins scatter views (`obl/az45`), `16` wins chords – `16` wins orbit.
+
+**Head-to-head best-vs-best (`Y`, `BS8 frag` `§38.12.1` vs `BS16 comp` `§38.12.2`), ABBA `60f`:**
+
+| `@2048 Y` | `frag0_Y` | `frag16_Y` | `comp16_Y` | `frag→comp` |
+|---|---|---|---|---|
+| obl | 14.74-16.04 | **13.54-13.87** | **12.28-12.61** | +10% frag slower* |
+| az45 | 11.62 | **10.01** | 10.95 | **-8% frag faster** |
+| az135 | 14.80 | 13.77 | 12.22 | +12% |
+| axx | 21.99 | **16.26** | 19.32 | **-16%** |
+| axy | 25.95 | 20.02 | 21.74 | -8% |
+| axz | 31.64 | **23.83-24.05** | 27.70-28.17 | **-14%** |
+| Σ | 121.0 | **97.8** | 104.5 | **-6.5% orbit** |
+
+`*` `frag16_X` `11.71` beats `comp16_X` `12.94` on `az135`; axis choice matters – `frag16` wins `4/6` `Y` views and orbit.
+
+**Corrected `@4096` (`20f`):**
+
+| `@4096` | `frag16_X` | `frag16_Y` | `comp16_X` | `comp16_Y` |
+|---|---|---|---|---|
+| obl | 33.86 | **31.89** | 42.00 | 39.56 |
+| axz | 92.52 | **87.72** | 105.99 | 104.21 |
+
+Frag *wins* at scale (`-12 to -19%`), `frag→comp` scaling `3.63×` identical on `axz` (`25.49→92.52` vs `29.22→105.99`). The earlier report `frag 91.86 vs comp 41.17 =2×` was a harness bug: `comp` was measured as `obl` (missing `CAM_AXIS=z` in the `4096` loop – `40.90` vs `41.17` identical), not `axz`.
+
+Parity: `frag0 vs frag16 @512 mean 0.0004 max 2 0.001% >1LSB` (`±1-step` class, same as `compute B16`); `frag16 vs comp16 mean 0.036 max 103 0.33% >1LSB` (< cross-backend `0.064`).
+
+**Takeaway:** the `22%` orbit lift from `B16` is portable. With the same `Y+BS` stack, fragment needs no second march type for perf alone until `slabs/mask/hybrid` parity is required – `frag16_Y` already beats `comp16_Y` on orbit at both resolutions.
+
+### 39.4 Repro / usage
+
+Build (once):
+
+```sh
+./macos_metal_build.sh --resume --tests   # arm64 Release
+# or: ninja -C build_macos_metal vtkMetalGLVisualComparison
+```
+
+Bench shape (`§38.10.5` + `§37.14`, `Y` depth as `§38.12`):
+
+```sh
+BIN=build_macos_metal/bin/vtkMetalGLVisualComparison
+DICOM=/Users/macair/Public/IMR/CTIMR/IMRToraceAddome
+BASE="VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 \
+      VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 \
+      VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1 \
+      VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y"
+
+# shipped fragment (runtime 32)
+env $BASE $VIEW build_macos_metal/bin/vtkMetalGLVisualComparison --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 60 --size 2048x2048 --warmup 10 2>&1 | grep ^DICOMVolume
+# fragment compile-time batch 16 (register diet)
+env $BASE VTK_METAL_TEST_FRAG_BATCH=16 $VIEW build_macos_metal/bin/vtkMetalGLVisualComparison --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 60 --size 2048x2048 --warmup 10 2>&1 | grep ^DICOMVolume
+# compute best for reference
+env $BASE VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y VTK_METAL_TEST_COMPUTE_MARCH=1 VTK_METAL_TEST_CM_SYNTH=1 VTK_METAL_TEST_CM_BATCH=16 VTK_METAL_TEST_MM_BLOCKSIZE=16 $VIEW build_macos_metal/bin/vtkMetalGLVisualComparison --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 60 --size 2048x2048 --warmup 10 2>&1 | grep ^DICOMVolume
+
+# views: obl="" (default Elev20 Az30), az45="VTK_METAL_TEST_CAM_AZ=45", az135="VTK_METAL_TEST_CAM_AZ=135",
+#        axx="VTK_METAL_TEST_CAM_AXIS=x", axy="VTK_METAL_TEST_CAM_AXIS=y", axz="VTK_METAL_TEST_CAM_AXIS=z"
+# sizes: 2048x2048 (60f/10w) and 4096x4096 (20f/10w, same view map)
+# ABBA: run frag0/frag16/frag16/frag0 per view and average the two rounds per label.
+```
+
+Image parity (`512`):
+
+```sh
+OUT1=/tmp/parity_frag0; OUT2=/tmp/parity_frag16; rm -rf $OUT1 $OUT2; mkdir -p $OUT1 $OUT2
+env $BASE build_macos_metal/bin/vtkMetalGLVisualComparison --scene DICOMVolume --dicom $DICOM --frames 1 --size 512x512 --warmup 2 --out $OUT1 > /dev/null 2>&1
+env $BASE VTK_METAL_TEST_FRAG_BATCH=16 build_macos_metal/bin/vtkMetalGLVisualComparison --scene DICOMVolume --dicom $DICOM --frames 1 --size 512x512 --warmup 2 --out $OUT2 > /dev/null 2>&1
+python3 -c "from PIL import Image;import numpy as np;import os;a=np.array(Image.open(os.path.join('$OUT1','DICOMVolume.metal.png')));b=np.array(Image.open(os.path.join('$OUT2','DICOMVolume.metal.png')));d=np.abs(a.astype(int)-b.astype(int));print(f'mean {d.mean():.4f} max {d.max()} >1LSB {100*(d>1).mean():.3f}%')"
+```
+
+Knob: `VTK_METAL_TEST_FRAG_BATCH=1..48` (clamped), `0/unset` = shipped runtime. PSO key is `featureMaskExtra bits [10:15]` (`fragBatch<<10`), `[fragpso]` prints on `VTK_METAL_TEST_MARCH_DEBUG=1`. Default stays `0` until multi-dataset/preset validation per `§37.20` orbit metric.
+
+Tree state: `fc_fragBatch [[function_constant(41)]]` landed, `MARCH_DEBUG` gated `[fragpso]`, env-gated default-off; `§38.18` segment cache default-off; `§38.12.4` verdicts unchanged.
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).

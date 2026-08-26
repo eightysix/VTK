@@ -1489,6 +1489,16 @@ static int VolumeComputeMarchStepCap()
   return 0;
 }
 
+// Fragment compile-time batch (VTK_METAL_TEST_FRAG_BATCH): mirrors the
+// compute fc_cmBatch trick — compile the ladder at a fixed width so dead
+// rungs and their registers are removed at PSO creation. 0 = runtime path.
+static int VolumeFragBatch()
+{
+  if (const char* v = getenv("VTK_METAL_TEST_FRAG_BATCH"))
+    return std::max(0, std::min(48, std::atoi(v)));
+  return 0;
+}
+
 // TEMP-DIAG: compute-only unroll-batch override (register-pressure probe;
 // fragment ladder keeps its own MaxBatchWidth).
 static int VolumeComputeMarchBatch()
@@ -7948,6 +7958,8 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
   void* mtlDeviceVoid, uint32_t type, uint32_t colorFormat,
   uint32_t depthFormat, uint32_t sampleCount, uint32_t featureMask)
 {
+  if (getenv("VTK_METAL_TEST_MARCH_DEBUG"))
+    fprintf(stderr, "[FRAG-ENTER] type=%u feat=0x%x extraPending=%d\n", type, featureMask, VolumeFragBatch());
   VolumePipelineKey key = { type, colorFormat, depthFormat, sampleCount, featureMask,
     // featureMaskExtra: low bits carry the volume orientation code
     // (VolumeTextureAxisDepth 0/1/2), bit 2 the block-summary walk gate —
@@ -7970,6 +7982,10 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
       // with a uniform-supplied saturation exit must not share with the
       // legacy-latch ones.
       ((VolumeExitTheta() > 0.0f) ? 64u : 0u) |
+      // Fragment compile-time batch specialization — encode width in
+      // featureMaskExtra bits [10:15] so each compile-time width gets its
+      // own PSO (occupancy probe, mirrors fc_cmBatch trick for compute).
+      (static_cast<uint32_t>(VolumeFragBatch()) << 10) |
       // §38.15/38.16 block-summary tap bisects — bit 256 (fc_mmNoTap),
       // bit 1024 (fc_mmRead), bit 2048 (fc_mmAltTap).
       0u };
@@ -8162,6 +8178,10 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     BOOL exitTheta = (VolumeExitTheta() > 0.0f) ? YES : NO;
     [constants setConstantValue:&exitTheta type:MTLDataTypeBool
                        withName:@"fc_exitTheta"];
+    // Fragment compile-time batch specialization (VTK_METAL_TEST_FRAG_BATCH):
+    int fragBatchFc = VolumeFragBatch();
+    [constants setConstantValue:&fragBatchFc type:MTLDataTypeInt
+                       withName:@"fc_fragBatch"];
 
     // §38.15/38.16 block-summary tap bisects (fc_mmNoTap / fc_mmRead).
 
@@ -8323,6 +8343,13 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     vtkErrorMacro(<< "Pipeline creation failed for type " << type << ": "
                   << [[error localizedDescription] UTF8String]);
     return nullptr;
+  }
+  // TEMP-DIAG fragment batch occupancy stats (register pressure probe).
+  if (getenv("VTK_METAL_TEST_MARCH_DEBUG"))
+  {
+    int fragBatchFcDbg = VolumeFragBatch();
+    fprintf(stderr, "[fragpso] type=%u mask=0x%x extra=0x%x fragBatch=%d\n",
+      type, featureMask, key.featureMaskExtra, fragBatchFcDbg);
   }
 
   // Cache and return.

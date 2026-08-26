@@ -2804,7 +2804,12 @@ constant int fc_cmBatch [[function_constant(39)]];
 // legacy-batch output semantics at reduced register pressure.
 constant bool fc_cmSplit [[function_constant(40)]];
 
- // §38.17 segment consume for the COMPUTE marcher (VTK_METAL_TEST_MM_SEG):
+// Fragment compile-time batch specialization (VTK_METAL_TEST_FRAG_BATCH):
+// mirrors fc_cmBatch but for the fragment march ladder. 0 = unset -> runtime
+// MaxBatchWidth. Lets the compiler shed dead ladder rungs to cut registers.
+constant int fc_fragBatch [[function_constant(41)]];
+
+  // §38.17 segment consume for the COMPUTE marcher (VTK_METAL_TEST_MM_SEG):
 // mirrors the fragment engine's fc_segHop — per-ray skip gaps precomputed by
 // volume_segment_build replace the march-time preamble walk entirely, moving
 // the summary probes off the serialized dependency chain into the
@@ -5267,9 +5272,12 @@ inline half4 marchVolumeUnified(
   if (currentT >= p.tTerminateMax) { break; }
       int i = 0;
       const int steps = maxSteps;
-      // Largest dispatchable batch width, set per-frame on the CPU from the
-      // sample distance (fine SD keeps 48-wide batches, coarse SD caps at 8).
-      const int batchCap = max(1, int(volumeUniforms.maxBatchWidth));
+      // Largest dispatchable batch width: compile-time fc_fragBatch (register
+      // diet) overrides the runtime MaxBatchWidth when set. Dials in §38.10
+      // compute trick for the fragment ladder — narrow compile-time widths
+      // should shed registers / raise occupancy.
+      const int batchCap = (fc_fragBatch > 0) ? fc_fragBatch
+                                              : max(1, int(volumeUniforms.maxBatchWidth));
       // Block-summary cache (fc_mmBlocks): persists across batches — position
       // advances only along the ray, so a block-index compare detects every
       // change. State: 0 mixed (per-cell work), 1 all-empty (leap), 2
