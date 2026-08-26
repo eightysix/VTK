@@ -5220,7 +5220,7 @@ inline half4 marchVolumeUnified(
     const int unrollN = (fc_marchVariant == 7) ? 4 : 8;
     const float3 adjTexMin = ctpOffset;
     const float3 adjTexMax = ctpOffset + ctpScale;
-    if (fc_marchVariant == 9 && !fc_shading && !fc_gradientOpacity && !fc_renderToTexture)
+    if (fc_marchVariant == 9 && !fc_renderToTexture)
     {
       // fc_marchVariant 9: adaptive-width harness scheduling with inline sample
       // addresses (probe v39 fragment_march_phase_batch_w48). Same scheduling
@@ -5259,9 +5259,36 @@ inline half4 marchVolumeUnified(
 #define MV9_COMPOSITE(_j) \
   half4 c##_j = sampleTransferFunction(transferFunctionTexture, \
       float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), 0.5)); \
+  half3 col##_j = c##_j.rgb; \
+  half  opa##_j = c##_j.a; \
+  if (fc_gradientOpacity) { \
+    if (opa##_j > 0.0h) { \
+      half4 gTmp##_j = computeGradientFast(volumeTexture, evalPoint + evalStep * (float)_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
+      opa##_j *= sampleGradientOpacity(gradientOpacityTexture, float(gTmp##_j.w)); \
+    } \
+  } \
+  if (fc_shading) { \
+    if (opa##_j > 0.0h) { \
+      half3 n##_j; \
+      if (fc_normalTexture) { \
+        half4 ns##_j = half4(normalTexture.sample(sVolume, evalPoint + evalStep * (float)_j, level(0))); \
+        n##_j = normalize(ns##_j.xyz * 2.0h - 1.0h); \
+      } else if (fc_computeNormalFromOpacity) { \
+        n##_j = computeDensityGradientFast(volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3, evalPoint + evalStep * (float)_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor, 0, scalarScale, scalarBias).xyz; \
+      } else { \
+        n##_j = computeGradientFast(volumeTexture, evalPoint + evalStep * (float)_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor).xyz; \
+      } \
+      if (lightUniforms != nullptr && !fc_defaultLighting) { \
+        col##_j = computeVolumeLighting(col##_j, n##_j, -viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat, *lightUniforms, volumeUniforms.volumeBoundsMin.xyz + (currentPoint + stepVec * (float)_j) * boundsSize); \
+      } else { \
+        bool twoSided##_j = (lightUniforms != nullptr && lightUniforms->twoSidedLighting != 0); \
+        col##_j = computePhongLightingVolumeFast(col##_j, n##_j, -viewDirHalf, -viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat, twoSided##_j); \
+      } \
+    } \
+  } \
   half w##_j = 1.0h - accumulatedOpacity; \
-  accumulatedColor += w##_j * (c##_j.rgb * c##_j.a); \
-  accumulatedOpacity += w##_j * c##_j.a;
+  accumulatedColor += w##_j * (col##_j * opa##_j); \
+  accumulatedOpacity += w##_j * opa##_j;
 #define MV9_ADVANCE(_W) \
   currentPoint += stepVec * (float)_W; \
   currentT += p.stepSize * (float)_W; \

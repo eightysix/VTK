@@ -5333,6 +5333,26 @@ Knob: `VTK_METAL_TEST_FRAG_BATCH=1..48` (clamped), `0/unset` = shipped runtime. 
 
 Tree state: `fc_fragBatch [[function_constant(41)]]` landed, `MARCH_DEBUG` gated `[fragpso]`, env-gated default-off; `§38.18` segment cache default-off; `§38.12.4` verdicts unchanged.
 
+### 39.5 Shaded `mv9` via PSO specialization — same register diet, no lean penalty (2026-08-26)
+
+`mv9` fast path `MetalShaders.metal:5223` was `if(fc_marchVariant==9 && !fc_shading && !fc_gradientOpacity && !fc_renderToTexture)` – lean-only, everything else fell back to scalar `do{ //4900 }while` (`150-580ms` vs `47ms` DICOM). Extended to `if(fc_marchVariant==9 && !fc_renderToTexture)` and threaded `fc_shading/fc_gradientOpacity` through `MV9_COMPOSITE` `5259` as compile-time `if(fc_shading){ half3 n=computeGradientFast(...); col=computeVolumeLighting(...) }` `if(fc_gradientOpacity){ opa*=sampleGradientOpacity(...) }` (`fc_normalTexture/fc_computeNormalFromOpacity/fc_defaultLighting` also). `fc_shading==false` PSOs dead-strip the `half3 n`/`lightUniforms` path → `maxThreadsPerTG` stays `576`, lean keeps `§39.3` orbit.
+
+Measured `@2048 SD4 Y mm`, `VTK_METAL_TEST_SHADE=1` `TestMetalScenes.h` (`60f/10w`):
+
+|  | lean `JITTER=1` | shaded | shaded `+FRAG_BATCH=16` |
+|---|---|---|---|
+| `DICOMVolume` | `16.05` | `42.80` | `24.97 (-42%)` |
+
+Parity `shade0 vs shade16 @512 mean 0.0004 max2 0.0003% >1LSB` – same `±1-step` class as lean. Lean `16.05` vs pre-patch lean `16.61` – `±3%` noise, no regression. `N` PSOs = `N×compile` hitch only (`newFunctionWithName:constantValues:` `8196` + `newRenderPipelineState` `8333`), after `PipelineCache` hit `7961` → `setRenderPipelineState` pointer swap, interactive `fps` unaffected. Same pattern already used for `fc_fragBatch` and `fc_cmBatch` – extending `5223` to `mask/crop/blanking` would be the same `fc_*` template per `featureMask` bit, not a runtime-branch cost.
+
+Repro for shaded:
+
+```sh
+BASE="VTK_METAL_TEST_SAMPLE_DISTANCE=4 ... VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 ..."
+env $BASE VTK_METAL_TEST_SHADE=1 build_macos_metal/bin/vtkMetalGLVisualComparison --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 60 --size 2048x2048 --warmup 10 2>&1 | grep ^DICOMVolume
+env $BASE VTK_METAL_TEST_SHADE=1 VTK_METAL_TEST_FRAG_BATCH=16 build_macos_metal/bin/vtkMetalGLVisualComparison --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 60 --size 2048x2048 --warmup 10 2>&1 | grep ^DICOMVolume
+```
+
 ## 5. Files
 
 - `JITTER_DUMP.txt` — jitter investigation dump (interleaved j1, sample-count PPMs).
