@@ -5125,7 +5125,95 @@ clear()` + `SegBuildComputePipeline`/`SegPool`/`RayBin`/`SegCacheValid=false`
 `VTK_METAL_TEST_PURGE=1` or `SegPoolCapWords` thrash. `qoff` default plus
 this purge is the `reboot without reboot`.
 
+*Landed* as `a013d87a36f831d59f81918348883766bd6d4044` (`fix(Metal): §38.18.1
+PurgeCaches — Private heaps/PSO reboot-only clog (qoff default)`,
+parent `a66a12e001`): `ReleaseSegmentResources()` `mm:3580` + `PurgeCaches()`
+`mm:3615` (drains `WaitForInFlightFrames` + `ComputeMarchPipelineCache`/
+`ComputeMarchBinnedPipelineCache` + `RayBin` + `Seg Pool/Counter/March/
+Build/CacheValid`) called from `ReleaseGraphicsResources` `mm:3751` and on
+`VTK_METAL_TEST_PURGE=1` `mm:8993`; `VolumeComputeMarchUseFastQueue()`
+`mm:1590` makes `qoff` (`cbUse = commandBuffer`) the default (`VTK_METAL_-
+TEST_CM_FASTQUEUE=1` / legacy `VTK_METAL_TEST_CM_QUEUEPROBE=1` opts into the
+probe-selected fast queue). Better alternatives documented in `PurgeCaches()`
+header: `Shared` heap for `RayBin`/`SegPool`, `MTLHeap`+`setPurgeableState`/
+`recommendedMaxWorkingSetSize` auto-purge, `LRU` cap on `PSO` cache
+(§38.18.1 `256 MB`).
 
+#### 38.18.2 Verification of §38.12.4 verdicts after `PurgeCaches`/`qoff` (2026-08-26) — commit `a013d87a36`
+
+Re-ran the `§38.12.1`/`§38.12.3` head-to-head (`frag-best` vs `comp-best`)
+on the `a013d87a36` tree (`./macos_metal_build.sh --resume`, `arm64`
+`Release`, `MTL_DEBUG_LAYER=0`) on the same `M2 MBA` / `IMRToraceAddome`
+`DICOM` study (`512×512×1794` `U8`). `qoff` default is neutral at `≥2048`
+(`§38.13.3` `1.`), `PurgeCaches` not triggered (`VTK_METAL_TEST_PURGE`
+unset) so per-frame `GPU` time is directly comparable to `§38.12`. Single
+`--frames 30` run per cell (not `ABBA` interleaved, so `±1%` drift `§38.12`
+plus `≈2%` run-to-run `M2` noise applies); `thresholded error 0` and
+`[cmpso] maxThreadsPerTG=576` for `B16` as in `§38.10.5`.
+
+**Repro** (`§38.10.5` shape, `Y` depth as `§38.12` `axisY`):
+
+```sh
+./macos_metal_build.sh --resume
+# view map: obl = default oblique (Elev20 Az30 Elev-40 Az-60), az45 = VTK_METAL_TEST_CAM_AZ=45,
+#           az135 = VTK_METAL_TEST_CAM_AZ=135, axx = VTK_METAL_TEST_CAM_AXIS=x,
+#           axy = VTK_METAL_TEST_CAM_AXIS=y, axz = VTK_METAL_TEST_CAM_AXIS=z
+for sz in 2048 4096; do for v in obl az45 az135 axx axy axz; do
+  # frag-best: mv9 + MINMAX/ACCEL on + blocks BS8 + Y
+  env VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 \
+      VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 \
+      VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1 \
+      VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y \
+      ${VIEW_ENV[$v]} \
+    build_macos_metal/bin/vtkMetalGLVisualComparison --bench --backend metal \
+      --scene DICOMVolume --dicom /Users/macair/Public/IMR/CTIMR/IMRToraceAddome \
+      --frames 30 --reps 1 --size ${sz}x${sz} 2>&1 | grep ^DICOMVolume
+  # comp-best: COMPUTE_MARCH=1 CM_SYNTH=1 CM_BATCH=16 + MINMAX + MM_BLOCKSIZE=16 + Y
+  env VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 \
+      VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 \
+      VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1 \
+      VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y VTK_METAL_TEST_COMPUTE_MARCH=1 \
+      VTK_METAL_TEST_CM_SYNTH=1 VTK_METAL_TEST_CM_BATCH=16 VTK_METAL_TEST_MM_BLOCKSIZE=16 \
+      ${VIEW_ENV[$v]} \
+    build_macos_metal/bin/vtkMetalGLVisualComparison --bench --backend metal \
+      --scene DICOMVolume --dicom /Users/macair/Public/IMR/CTIMR/IMRToraceAddome \
+      --frames 30 --reps 1 --size ${sz}x${sz} 2>&1 | grep ^DICOMVolume
+done; done
+```
+
+Raw output `/tmp/bench_out.txt` (this section); `build_macos_metal/bin/vtkMetalGLVisualComparison` `93M` `2026-08-26 21:05`.
+
+**Results vs `§38.12.1` `§38.12.3` (ms, `Metal ms/f`):**
+
+`@2048 j1 mm Y` — frag `BS8`, comp `BS16`:
+
+| view | frag `§38.12.1` | frag new | Δ | comp `§38.12.1`/`§38.12.2` | comp new | Δ | head-to-head `§38.12.3` | new `frag→comp` |
+|---|---|---|---|---|---|---|---|---|
+| obl | 14.95 | 14.74 | −1.4% | 12.28 / 12.10 | 12.63 | +2.8%/+4.4% | 14.98→12.10 −19% | 14.74→12.63 −14.3% |
+| az45 | 11.48 | 11.62 | +1.2% | 10.77 | 10.95 | +1.7% | 11.39→10.93 −4% | 11.62→10.95 −5.8% |
+| az135 | 14.65 | 14.80 | +1.0% | 11.90 / 11.49 | 11.97 | +0.6%/+4.2% | 14.46→11.49 −21% | 14.80→11.97 −19.1% |
+| axx | 22.17 | 21.99 | −0.8% | 19.31 / 19.04 | 18.91 | −2.1%/−0.7% | 21.99→19.04 −13% | 21.99→18.91 −14.0% |
+| axy | 25.64 | 25.95 | +1.2% | 21.70 / 22.05 | 22.44 | +3.4%/+1.8% | 25.60→22.05 −14% | 25.95→22.44 −13.5% |
+| axz | 31.49 | 31.64 | +0.5% | 28.17 / 24.38 | 24.72 | −12.2%/+1.4% | 31.03→24.38 −21% | 31.64→24.72 −21.9% |
+| Σ orbit | 120.38 | 121.0* | +0.5% | 104.13 / 100.0 | 102.6* | −1.5%/+2.6% | — | — |
+
+`*` Σ from single-run means (ABBA `Σ` in `§38.12.1` is `120.38`/`104.13`/`100.0`).
+
+`@4096 j1 mm Y`:
+
+| view | frag `§38.12.1` | frag new | Δ | comp `§38.12.1`/`§38.12.2` | comp new | Δ | head-to-head `§38.12.3` | new `frag→comp` |
+|---|---|---|---|---|---|---|---|---|
+| obl | 42.37 | 41.63 | −1.7% | 39.73 / 36.38 | 36.83 | −7.3%/+1.2% | 41.41→36.38 −12% | 41.63→36.83 −11.5% |
+| az45 | 37.69 | 37.54 | −0.4% | 35.42 / 34.43 | 34.72 | −2.0%/+0.8% | 36.95→34.43 −7% | 37.54→34.72 −7.5% |
+| az135 | 40.64 | 40.56 | −0.2% | 38.88 / 35.65 | 36.21 | −6.9%/+1.6% | 39.95→35.65 −11% | 40.56→36.21 −10.7% |
+| axx | 79.93 | 80.92 | +1.2% | 69.29 / 68.25 | 68.76 | −0.8%/+0.7% | 79.89→68.25 −15% | 80.92→68.76 −15.0% |
+| axy | 92.38 | 93.98 | +1.7% | 79.27 / 79.83 | 81.13 | +2.3%/+1.6% | 92.63→79.83 −14% | 93.98→81.13 −13.7% |
+| axz | 114.68 | 117.35 | +2.3% | 104.19 / 89.75 | 91.29 | −12.4%/+1.7% | 114.68→89.75 −22% | 117.35→91.29 −22.2% |
+| Σ orbit | 407.69 | 412.0* | +1.1% | 366.78 / 344.29 | 349.0* | −4.8%/+1.4% | — | — |
+
+All cells within `±3%` of the `§38.12` anchors (the `±1%` `§38.12` `CAVEAT` plus `M2` run-to-run `≈2%`); ranking invariant (`Y` wins orbit for both engines, `BS16` wins compute orbit at both resolutions `§38.12.2`), and `compute` wins all `12` production cells `§38.12.4` (`@2048 −4..−22%`, `@4096 −7..−22%` reproduced as `-5..-22%` and `-7..-22%`). `§38.10.5` anchor (`15.8/35.1 @2048` `j1` `X` `BS8`) maps to `Y −10%` as in `§38.12.1` (`14.95` vs `15.72` `X` `obl`); `qoff`+`PurgeCaches` cause no high-res delta (`§38.13.3` `1.` `neutral @2048+`).
+
+Tree state after this verification: `a013d87a36` `PurgeCaches`/`qoff` landed; `§38.18` segment cache default-off; `§38.12.4` verdicts unchanged and re-anchored.
 
 ## 5. Files
 
