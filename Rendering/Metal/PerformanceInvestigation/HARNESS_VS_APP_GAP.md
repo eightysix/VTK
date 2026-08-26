@@ -5078,6 +5078,71 @@ PSO bit 26, debug apparatus (MM_SEG_DEBUG), SegConsumeDbgBuffer.
 Logs /tmp/cm_matrix3.txt; generators mx_s1.zsh, mx_r1..r8.zsh.
 
 
+### 38.18 Per-camera segment cache: architecturally correct, bench-blind
+(2026-08-26)
+
+Implemented the §38.17.4 recommended path: cache segment pool data keyed on
+camera + viewport + MinMaxUploadTime stamp; skip builder dispatch on hit.
+
+#### 38.18.1 Architecture
+
+Cache key: 56-byte struct (`SegmentCacheKey`) containing CameraVolumePos[3],
+four ViewProjection matrix elements ([0][0],[0][1],[1][0],[1][1] — encodes
+camera + projection in a compact hash-friendly subset), renderWidth/Height,
+MaxStepsFrame, MaxBatchWidth, and MinMaxUploadTime (captures volume/TF/
+sample-distance changes). FNPV-1 hash of the key stored in SegCacheStamp.
+
+On hit (`segCacheHash == SegCacheStamp && memcmp(key) == 0`):
+- Pool counter NOT zeroed (retains previous frame's word count)
+- Builder encoder NOT created (segEnc = nil; ObjC setTexture:/setBuffer: on
+  nil are safe no-ops; only segEnc.label guarded against nil crash)
+- `segLive = true`, `SegActiveThisFrame = true` — consumer reads stale pool
+
+On miss: builder runs normally; key + stamp stored for next frame.
+
+Gated behind `VTK_METAL_TEST_MM_SEG_CACHE=1` (default OFF).
+
+#### 38.18.2 Parity
+
+Clean: 337 px at ±2/255 vs baseline (fp-noise class — identical to the
+non-cached segment path's 360 px; the delta is jitter-phase noise between
+separate renders). NOCONSUME byte-identical.
+
+#### 38.18.3 Bench limitation
+
+The bench (`vtkMetalGLVisualComparison --bench`) rotates the camera every
+frame (azimuth orbit). The camera-dependent cache key changes every frame
+→ 0% hit rate over120 frames (verified via MM_SEG_DEBUG). The cache provides
+NO measurable benefit under the current bench protocol.
+
+This is an inherent limitation, not a bug: the builder output IS
+camera-dependent (ray positions/directions change with camera), so the cache
+key MUST include camera state. The cache architecturally helps only when the
+camera is STATIC — the primary use-case is interactive inspection (user holds
+a view to examine detail), where the builder cost amortizes to zero after the
+first frame.
+
+#### 38.18.4 Path forward
+
+- **Static-camera benchmark**: required to measure the actual win. The bench
+  harness lacks a `--no-rotate` flag; adding one (or using a custom driver
+  that holds the camera) would let the cache demonstrate its ~34% @400² win
+  (one builder pass amortized over N static frames).
+- **Camera quantization**: hash the camera position at reduced precision
+  (e.g., 12-bit mantissa) to tolerate sub-pixel jitter without cache
+  invalidation — not useful for the bench (large camera steps) but helpful
+  for real apps with floating-point drift.
+- **Volume-only cache**: remove camera from the key entirely and cache per
+  volume/TF state. INCORRECT — the builder output is camera-dependent;
+  reusing gaps from a different camera would skip wrong terrain.
+- **Stage-2 block-leap builder**: the necessary condition for a positive
+  win at 2048² (§38.17.4). Blocked on the parity divergence (§38.17.3);
+  needs the CPU gap-diff harness from a fresh session.
+
+Tree state: all §38.18 code default-off (MM_SEG_CACHE absent ⇒ HEAD-
+equivalent; MM_SEG absent ⇒ no segment code at all). Parity byte-clean.
+
+
 
 ## 5. Files
 

@@ -10073,9 +10073,41 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   int bufIdx = this->UniformFrameIndex % 3;
   this->UniformFrameIndex++;
 
+  // §38.18 Compute segment cache key from the filled uniform struct (all fields
+  // that affect the builder's output: camera, projection, viewport, step count).
+  SegmentCacheKey segCacheKey = {};
+  segCacheKey.camPos[0] = uniforms.CameraVolumePos[0];
+  segCacheKey.camPos[1] = uniforms.CameraVolumePos[1];
+  segCacheKey.camPos[2] = uniforms.CameraVolumePos[2];
+  segCacheKey.vp0 = uniforms.ViewProjectionMatrix[0];
+  segCacheKey.vp1 = uniforms.ViewProjectionMatrix[1];
+  segCacheKey.vp4 = uniforms.ViewProjectionMatrix[4];
+  segCacheKey.vp5 = uniforms.ViewProjectionMatrix[5];
+  segCacheKey.viewportW = renderWidth;
+  segCacheKey.viewportH = renderHeight;
+  segCacheKey.maxSteps = uniforms.MaxStepsFrame;
+  segCacheKey.maxBatch = uniforms.MaxBatchWidth;
+  segCacheKey.minMaxStamp = this->MinMaxUploadTime.GetMTime();
+
   // Update uniform buffer (now includes viewProjection + inverseViewProjection)
   id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)this->UniformBuffers[bufIdx];
   memcpy([uniformBuf contents], &uniforms, sizeof(uniforms));
+
+  // §38.18 Compute stamp and check segment cache. On hit the builder is skipped
+  // and the pool/counter from the previous frame are reused (same camera+volume
+  // state ⇒ identical builder output). Gated behind MM_SEG_CACHE env.
+  const bool segCache = getenv("VTK_METAL_TEST_MM_SEG_CACHE") != nullptr;
+  uint64_t segCacheHash = 0;
+  {
+    const uint64_t* k = reinterpret_cast<const uint64_t*>(&segCacheKey);
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < sizeof(SegmentCacheKey) / 8; ++i)
+    {
+      h ^= k[i];
+      h *= 0x100000001b3ULL;
+    }
+    segCacheHash = h;
+  }
 
   // Investigation: dump every render (not just the first) so the last frame's
   // uniforms — with the final camera — land in /tmp/app_uniforms.bin. The first
@@ -10680,13 +10712,22 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         // (isolation: consume reads stale records; image must still show).
         const bool segNoBuild =
           getenv("VTK_METAL_TEST_MM_SEG_NOBUILD") != nullptr;
+        // §38.18 Cache hit: camera+viewport+minMax unchanged from previous
+        // frame ⇒ builder output identical ⇒ skip dispatch, reuse pool.
+        const bool segCacheHit =
+          segCache && !segNoBuild && this->SegCacheStamp != 0 &&
+          this->SegPoolBuffer != nullptr &&
+          segCacheHash == this->SegCacheStamp &&
+          memcmp(&segCacheKey, &this->SegCachePrevKey,
+                 sizeof(SegmentCacheKey)) == 0;
         if (cmSeg &&
             this->EnsureSegResources(mtlDevice, mtlQueue,
                                      renderWidth, renderHeight))
         {
           id<MTLBuffer> segCntBuf =
             (__bridge id<MTLBuffer>)this->SegPoolCounterBuffer;
-          *(uint32_t*)segCntBuf.contents = 0;  // Shared: no didModifyRange.
+          if (!segCacheHit)
+            *(uint32_t*)segCntBuf.contents = 0;  // Shared: no didModifyRange.
 
           uint32_t segMeta[4] = { static_cast<uint32_t>(renderWidth),
                                   static_cast<uint32_t>(renderHeight),
@@ -10695,8 +10736,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
                                     : 0u,
                                   16u };
           id<MTLComputeCommandEncoder> segEnc =
-            segNoBuild ? nil : [commandBuffer computeCommandEncoder];
-          segEnc.label = @"VTK Volume Segment Build (Compute)";
+            (segNoBuild || segCacheHit)
+              ? nil : [commandBuffer computeCommandEncoder];
+          if (segEnc) segEnc.label = @"VTK Volume Segment Build (Compute)";
           [segEnc setComputePipelineState:(__bridge id<MTLComputePipelineState>)
             this->SegBuildComputePipeline];
           [segEnc setTexture:(__bridge id<MTLTexture>)this->SegAtlasATexture atIndex:0];
@@ -10805,6 +10847,12 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
                 3, acc / (double(npix) * 4.0), mx, mc[15]);
             }];
           }
+        }
+        // §38.18 Update segment cache key (after builder dispatch or cache hit).
+        if (cmSeg && !segCacheHit)
+        {
+          this->SegCachePrevKey = segCacheKey;
+          this->SegCacheStamp = segCacheHash;
         }
 
         // §38.17: capture the (possibly recreated) march target now.

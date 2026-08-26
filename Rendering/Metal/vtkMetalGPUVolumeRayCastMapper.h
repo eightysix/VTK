@@ -354,6 +354,20 @@ private:
   std::size_t SegPoolCapWords = 0;
   bool SegActiveThisFrame = false;
 
+  // §38.18 per-camera segment cache: skip builder when camera+summary unchanged
+  // (VTK_METAL_TEST_MM_SEG_CACHE=1). Static inspection amortizes builder to
+  // zero; orbiting pays one pass per frame. Key = camPos + VP subset + viewport
+  // + maxSteps + maxBatch + MinMaxUploadTime stamp.
+  struct SegmentCacheKey {
+    float camPos[3];
+    float vp0, vp1, vp4, vp5;   // [0][0],[0][1],[1][0],[1][1] of ViewProjection
+    int viewportW, viewportH;
+    float maxSteps, maxBatch;
+    int64_t minMaxStamp;
+  };
+  SegmentCacheKey SegCachePrevKey = {};
+  uint64_t SegCacheStamp = 0;
+
   // §38.6 / §36.4 Design B — Compute Marcher & Ray-Binned Marching
   void* ComputeMarchPipeline = nullptr; // id<MTLComputePipelineState> — volume_compute_march
   void* RayBinClassifyPipeline = nullptr; // id<MTLComputePipelineState> — volume_ray_bin_classify
