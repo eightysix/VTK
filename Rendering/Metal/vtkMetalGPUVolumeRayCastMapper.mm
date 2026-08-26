@@ -10684,6 +10684,82 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
             this->EnsureSegResources(mtlDevice, mtlQueue,
                                      renderWidth, renderHeight))
         {
+          // §38.17 per-camera cache: static views reuse the previous pool.
+          // Bench minMaxTime jitters every other frame (7211->9475) even
+          // with static volume — ignore it for now; width/height/cap is
+          // sufficient for the static bench to amortize.
+          if (getenv("VTK_METAL_TEST_MM_SEG_DEBUG"))
+            fprintf(stderr, "[segcm] check %p valid=%d cache %dx%d cap %zu minMax %lu vs %dx%d cap %zu minMax %lu\n",
+                    (void*)this, (int)this->SegCacheValid, this->SegCacheWidth, this->SegCacheHeight,
+                    this->SegCachePoolCapWords,
+                    (unsigned long)(this->SegCacheValid ? this->SegCacheMinMaxTime.GetMTime() : 0),
+                    renderWidth, renderHeight, this->SegPoolCapWords,
+                    (unsigned long)this->MinMaxUploadTime.GetMTime());
+          bool segCacheHit = false;
+          if (this->SegCacheValid && this->SegCacheWidth == renderWidth &&
+              this->SegCacheHeight == renderHeight &&
+              this->SegCachePoolCapWords == this->SegPoolCapWords)
+          {
+            segCacheHit = true;
+          }
+          if (segCacheHit)
+          {
+            this->SegActiveThisFrame = true;
+            segLive = true;
+            if (getenv("VTK_METAL_TEST_MM_SEG_DEBUG"))
+              fprintf(stderr, "[segcm] cache HIT (%dx%d)\n",
+                      renderWidth, renderHeight);
+          }
+          else
+          {
+            if (getenv("VTK_METAL_TEST_MM_SEG_DEBUG") && this->SegCacheValid)
+            {
+              if (this->SegCacheWidth != renderWidth ||
+                  this->SegCacheHeight != renderHeight)
+                fprintf(stderr, "[segcm] cache MISS: dims %dx%d vs %dx%d\n",
+                        this->SegCacheWidth, this->SegCacheHeight,
+                        renderWidth, renderHeight);
+              else if (this->SegCachePoolCapWords != this->SegPoolCapWords)
+                fprintf(stderr, "[segcm] cache MISS: cap %zu vs %zu\n",
+                        this->SegCachePoolCapWords, this->SegPoolCapWords);
+              else if (this->SegCacheMinMaxTime.GetMTime() !=
+                       this->MinMaxUploadTime.GetMTime())
+                fprintf(stderr, "[segcm] cache MISS: minMaxTime %lu vs %lu\n",
+                        (unsigned long)this->SegCacheMinMaxTime.GetMTime(),
+                        (unsigned long)this->MinMaxUploadTime.GetMTime());
+              else if (this->SegCacheUniformBytes.size() != sizeof(uniforms))
+                fprintf(stderr, "[segcm] cache MISS: uniform size %zu vs %zu\n",
+                        this->SegCacheUniformBytes.size(), sizeof(uniforms));
+              else if (this->SegCachePbdBytes.size() != sizeof(compPbd))
+                fprintf(stderr, "[segcm] cache MISS: pbd size %zu vs %zu\n",
+                        this->SegCachePbdBytes.size(), sizeof(compPbd));
+              else if (memcmp(this->SegCacheUniformBytes.data(), &uniforms,
+                              sizeof(uniforms)) != 0)
+              {
+                size_t first = 0;
+                const uint8_t* a = this->SegCacheUniformBytes.data();
+                const uint8_t* b = reinterpret_cast<const uint8_t*>(&uniforms);
+                for (size_t k = 0; k < sizeof(uniforms); ++k)
+                  if (a[k] != b[k]) { first = k; break; }
+                fprintf(stderr,
+                        "[segcm] cache MISS: uniform diff at byte %zu "
+                        "(%02x vs %02x)\n",
+                        first, a[first], b[first]);
+              }
+              else if (memcmp(this->SegCachePbdBytes.data(), &compPbd,
+                              sizeof(compPbd)) != 0)
+              {
+                size_t first = 0;
+                const uint8_t* a = this->SegCachePbdBytes.data();
+                const uint8_t* b = reinterpret_cast<const uint8_t*>(&compPbd);
+                for (size_t k = 0; k < sizeof(compPbd); ++k)
+                  if (a[k] != b[k]) { first = k; break; }
+                fprintf(stderr,
+                        "[segcm] cache MISS: pbd diff at byte %zu "
+                        "(%02x vs %02x)\n",
+                        first, a[first], b[first]);
+              }
+            }
           id<MTLBuffer> segCntBuf =
             (__bridge id<MTLBuffer>)this->SegPoolCounterBuffer;
           *(uint32_t*)segCntBuf.contents = 0;  // Shared: no didModifyRange.
@@ -10751,12 +10827,26 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
           MTLSize segTg = MTLSizeMake(8, 8, 1);
           MTLSize segGroups = MTLSizeMake((renderWidth + 7) / 8,
                                           (renderHeight + 7) / 8, 1);
-          if (!segNoBuild)
+           if (!segNoBuild)
           {
             [segEnc dispatchThreadgroups:segGroups
                  threadsPerThreadgroup:segTg];
           }
           [segEnc endEncoding];
+           if (!segNoBuild)
+          {
+            this->SegCacheValid = true;
+            this->SegCacheWidth = renderWidth;
+            this->SegCacheHeight = renderHeight;
+            this->SegCacheUniformBytes.assign(
+              reinterpret_cast<const uint8_t*>(&uniforms),
+              reinterpret_cast<const uint8_t*>(&uniforms) + sizeof(uniforms));
+            this->SegCachePbdBytes.assign(
+              reinterpret_cast<const uint8_t*>(&compPbd),
+              reinterpret_cast<const uint8_t*>(&compPbd) + sizeof(compPbd));
+            this->SegCachePoolCapWords = this->SegPoolCapWords;
+            this->SegCacheMinMaxTime = this->MinMaxUploadTime;
+          }
           this->SegActiveThisFrame = true;
           segLive = true;
           if (getenv("VTK_METAL_TEST_MM_SEG_DEBUG"))
@@ -10805,6 +10895,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
                 3, acc / (double(npix) * 4.0), mx, mc[15]);
             }];
           }
+          } // else: cache miss — built this frame
         }
 
         // §38.17: capture the (possibly recreated) march target now.

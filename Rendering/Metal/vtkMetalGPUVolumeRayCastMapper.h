@@ -354,6 +354,16 @@ private:
   std::size_t SegPoolCapWords = 0;
   bool SegActiveThisFrame = false;
 
+  // §38.17 per-camera segment cache: builder runs once per camera pose;
+  // static views amortize to zero, orbiting pays one build per frame.
+  bool SegCacheValid = false;
+  int SegCacheWidth = 0;
+  int SegCacheHeight = 0;
+  std::vector<uint8_t> SegCacheUniformBytes;
+  std::vector<uint8_t> SegCachePbdBytes;
+  size_t SegCachePoolCapWords = 0;
+  vtkTimeStamp SegCacheMinMaxTime;
+
   // §38.6 / §36.4 Design B — Compute Marcher & Ray-Binned Marching
   void* ComputeMarchPipeline = nullptr; // id<MTLComputePipelineState> — volume_compute_march
   void* RayBinClassifyPipeline = nullptr; // id<MTLComputePipelineState> — volume_ray_bin_classify

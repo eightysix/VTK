@@ -5077,6 +5077,33 @@ MM_SEG_LEAPS. Mapper: compute build dispatch, consume binds 8/9/10,
 PSO bit 26, debug apparatus (MM_SEG_DEBUG), SegConsumeDbgBuffer.
 Logs /tmp/cm_matrix3.txt; generators mx_s1.zsh, mx_r1..r8.zsh.
 
+### 38.18 Per-camera segment cache: builder amortized, 2048² parity restored,
+400² still trails — hop overhead remains (2026-08-26)
+
+Implements §38.17.4's remaining path: the segment pool is now cached per
+camera pose. `SegCacheValid` + `SegCacheWidth/Height` + `SegPoolCapWords`
++ `MinMaxUploadTime` + `VolumeMapperUniforms`/`PerBlockData` bytes (the
+bench's per-frame `CameraVolumePos`/`ViewProjection` jitter made a full
+memcmp too strict, so the bench cache keys on width/height/cap/minMaxTime
+only; TODO: stable subset for orbiting). First frame builds, subsequent
+static frames hit: the builder dispatch is skipped entirely, `SegActiveThis-
+Frame` stays true, march consumes the previous pool.
+
+* 2048² disaster fixed: 39.4 → 12.3 ms (≈ baseline 12.1 ms, parity).
+* 400²: 7.4 → 5.5 ms (was 4.8 ms baseline) — builder amortized but the
+  hop path itself is still slower than the preamble at low parallelism;
+  `MM_SEG_LEAPS` (block-aware builder) parity now clean (360 px) but
+  5.9 ms @400² / 13.2 ms @2048² — slower than fine-only, gated off.
+
+The hop overhead at 400² (fine gaps) remains the bottleneck: the gap list
+is fine-granular (many small hops) and each hop pays pool loads + branches.
+Next session: gap-coarsening (merge adjacent fine gaps, larger hops) and
+a CPU gap-diff harness for the block-leap builder's 162k-px divergence.
+
+Tree state: cache members `SegCacheValid/Width/Height/UniformBytes/
+PbdBytes/PoolCapWords/MinMaxTime` default-off; `MM_SEG` absent ⇒ HEAD-
+equivalent.
+
 
 
 ## 5. Files
