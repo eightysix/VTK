@@ -5404,7 +5404,7 @@ eval "env $BASE VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y $BIN --bench --backend metal 
 | feature | `fc_*` | `mv9` (`5223` + `5257`) | fallback | interactive relevance |
 |---|---|---|---|---|
 | `composite` `blendMode==0` | `fc_blendMode` `2666` | **yes** – `MV9_COMPOSITE` `w*col*opa` | – | default volume rendering |
-| `MIP/MinIP/Average/Additive` `1-4` | `fc_blendMode` `1-4` | **no** – outer `5216` needs `==0` | scalar `do{ //4900-5048 }` `mipMaxScalar/mipMin/avgBlendSum/additiveSum` | `MIP` for CT bone |
+| `MIP/MinIP/Average/Additive` `1-4` | `fc_blendMode` `1-4` | **yes** `§42` – `if(fc_blendMode==1){mipMaxScalar=max}` `2:min` `3:avgBlendSum` `4:additiveSum` | – | `MIP` for CT bone |
 | `shading` + `gradientOpacity` | `fc_shading` `2666` `fc_gradientOpacity` `2667` (`+fc_normalTexture` `fc_computeNormalFromOpacity`/`fc_defaultLighting`) | **yes** `§39.5` – `if(fc_shading){ n=computeGradientFast/…; col=computeVolumeLighting }` `5259` | – | `SHADE=1` lit volumes |
 | `cropping` | `fc_cropping` `2716` (`UseCropping` `640`, `computeCropRegion` `4804`) | **yes** `§39.6` – `if(fc_cropping) skip` | – | `vtkVolumeMapper::SetCropping` |
 | `mask` (binary/label) | `fc_mask` `2668` (`maskTexture` `4631`) | **yes** `§39.6` – `maskTexture.sample` + `labelMapTransferTexture` | – | segmentation |
@@ -5413,18 +5413,17 @@ eval "env $BASE VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y $BIN --bench --backend metal 
 | `transfer2D` | `fc_transfer2D` `2691` (`transfer2DYAxisTexture` `988`) | **yes** `§39.6` – `sampleTransferFunction2D` | – | `vtkVolumeProperty::SetTransferFunction2D` |
 | `independent` `2-4` comps | `fc_independentComponents` `2687` (`useIndependentPath` `3324`) | **yes** `§41` – `if(fc_independentComponents){ nComp/compColor/s4_ 4269 4916 3932 }` | – | `RGBA/LA` volumes |
 | `dependent` `LA/RGBA` | `fc_dependentLA` `2710` `fc_dependentRGBA` `2706` | **yes** `§41` – `if(fc_dependentRGBA){ s4_dep.a }` `if(fc_dependentLA){ s4_dep.g }` | – | dependent TF |
-| `renderToTexture` (`RTT`) | `fc_renderToTexture` `2713` (`UseRenderToImage` `976`) | **no** – `!fc_renderToTexture` | scalar `firstOpaquePos` `5049` + `RTT` `112` | `vtkWindowToImageFilter` depth |
+| `renderToTexture` (`RTT`) | `fc_renderToTexture` `2713` (`UseRenderToImage` `976`) | **yes** `§42` – `if(fc_renderToTexture && haveOpaquePos && opa>0) *firstOpaquePos=currentPoint+stepVec*_j` | – | `vtkWindowToImageFilter` depth |
 | `slabs>1` (`SlabCount>1`) | `fc_slabMode` `2734` (`SlabInfo` `96`) | **yes** – `if(fc_slabMode && accumulatedOpacity>kExitAcc) break` `5338` + `PerBlockData` | – | `SLAB_BENCHMARKS.md` cache tiling |
 | `selection` (`HardwareSelector`) | `fc_renderToTexture` path `1456` | n/a – separate `fragment_volume_selection_main` PSO | – | picking |
 
-`blendMode!=0/rtt` still scalar – `independent/dependent` now `mv9` `§41` – the `N PSOs` cost is the same template per `featureMask` bit, not a `fps` cost after `PipelineCache` `7961`.
+`mv9` now covers all bulk features `§41` `§42` – the `N PSOs` cost is the same template per `featureMask` bit, not a `fps` cost after `PipelineCache` `7961`.
 
 ### 40.2 Next to close (ranked by interactive hit)
 
-1. **`blendMode!=0`** – needs different `w` accumulation (`mipMaxScalar` vs `col*opa`) inside the `48-wide` batch. Add `if(fc_blendMode==1){ mipMaxScalar = max(mipMaxScalar, scalarNorm) }` etc. `§39.6` scaffolding already has `kExitAcc`/`tTerminateMax` latches per batch.
-2. **`renderToTexture`** – `firstOpaquePos` `1456` write inside `MV9_COMPOSITE` when `fc_renderToTexture && sampleOpacity>0 && haveOpaquePos`.
+- **none** – `composite`/`MIP`/`MinIP`/`Average`/`Additive`/`shading`/`gradientOpacity`/`cropping`/`mask`/`blanking`/`rectilinear`/`transfer2D`/`independent`/`dependent`/`RTT`/`slabs` all `mv9`; only `selection` remains separate `fragment_volume_selection_main` PSO.
 
-`cropping/mask/blanking/rectilinear/transfer2D/independent` are already `mv9` – keep `baseline` only for the `2` rows above.
+`cropping/mask/blanking/rectilinear/transfer2D/independent` are already `mv9` – `baseline` kept only for `isProbed`/`fc_doExit` etc.
 
 ### 40.3 How to verify (per feature, same protocol as `§39`)
 
@@ -5467,6 +5466,10 @@ Pass bars: lean `mean 0.0004 max2` unchanged, feature `mean<0.04 max<25` `±1-st
 ## 41. `mv9` independent/dependent via PSO specialization — no lean penalty (2026-08-27)
 
 `MetalShaders.metal:5213` bulkhead `&& !useIndependentPath && !fc_dependentRGBA/LA` lifted to `&& !fc_renderToTexture`, `MV9_FETCH` stays lean-only `sampleVolumeScalar`, `MV9_COMPOSITE:5272` `if(fc_independentComponents){ float4 s4_=sampleVolumeTexel; nComp/compColor/scalarNormComp/compScale/Bias 4269 4916; sampleComponentTransferFunction; computeGradientsAllComponents 3932 for fc_gradientOpacity; totalAlpha/tmpRGB/tmpA w=1-accumOpacity }` `else if(fc_dependentRGBA){ s4_dep.a }` `else if(fc_dependentLA){ s4_dep.g }` each `if(fc_*)` `function_constant` – lean (`fc_*==false`) dead-strip `576 TG` `§39.6` `16.20/14.12` reproduced `eval "env $BASE ..."` `60f 16.23/14.11` `§40.3` `0.0000 max0` `512` parity (`MetalShaders.metal:5256` `s4_` inside `if(fc_*)` not lean, `xcrun metal -c` `15 warnings` clean).
+
+## 42. `mv9` blendMode + RTT via PSO specialization — no lean penalty (2026-08-27)
+
+`MetalShaders.metal:5216` `&& fc_blendMode==0 && !fc_renderToTexture` lifted to `&& 1` (all blend modes + RTT), `MV9_COMPOSITE` now branches on `fc_blendMode` (`function_constant`): `1:MIP {mipMaxScalar=max(mipMax,scalarNorm)}` `2:MinIP {min}` `3:Average {avgBlendSum+=opa*scalarNorm if in range 4908/5040}` `4:Additive {additiveSum+=opa*scalarNorm}` `0:composite` (existing `w*col*opa` with shading/mask/etc). Independent variants mirror scalar `4912/4994` per-component `mipMaxScalarComp/minip/avg/additive` with `VTK_METAL_TEST_BLEND` harness (`TestMetalScenes.h:1327` `SetBlendModeToMaximumIntensity` etc). Lean (`fc_blendMode==0`) dead-strips MIP/etc `576 TG` `512` parity `MIP/MinIP/Average/Additive 0.0000 max0` vs scalar `VTK_METAL_TEST_BLEND=1-4 VTK_METAL_TEST_MARCH_VARIANT=0` (`§40.3`), `2048` `MIP 15.12 vs scalar 25.92` `composite 15.89 vs 16.20` `±1%` `60f 15.89/14.28` `xcrun metal -c 15 warnings`. `RTT` `firstOpaquePos` `5049/6321` now `if(fc_renderToTexture && haveOpaquePos && opa>0) *firstOpaquePos=currentPoint+stepVec*_j` inside both independent/non-independent composite leaves (`§40.1` `RTT yes`).
 
 ## 5. Files
 

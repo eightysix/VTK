@@ -1326,6 +1326,15 @@ inline void BuildDICOMVolumeScene(vtkRenderer* renderer, BackendKind b)
 
   vtkSmartPointer<vtkGPUVolumeRayCastMapper> mapper = NewVolumeMapper(b);
   mapper->SetInputData(cachedU8Volume);
+  if (const char* bm = std::getenv("VTK_METAL_TEST_BLEND"))
+  {
+    int m = std::atoi(bm);
+    if (m == 1) mapper->SetBlendModeToMaximumIntensity();
+    else if (m == 2) mapper->SetBlendModeToMinimumIntensity();
+    else if (m == 3) mapper->SetBlendModeToAverageIntensity();
+    else if (m == 4) mapper->SetBlendModeToAdditive();
+    else mapper->SetBlendModeToComposite();
+  }
   if (TempJitter())
   {
     mapper->UseJitteringOn();
