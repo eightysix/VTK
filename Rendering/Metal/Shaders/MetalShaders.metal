@@ -5213,8 +5213,7 @@ inline half4 marchVolumeUnified(
   // empty-cell skip or out-of-cube clamp invalidates the remaining pre-fetched
   // scalars and forces a refill from the moved position. The guard is fully
   // compile-time, so any other feature combination keeps the baseline loop.
-  else if (fc_marchVariant >= 6 && fc_blendMode == 0 && !fc_renderToTexture
-           && !useIndependentPath && !fc_dependentRGBA && !fc_dependentLA)
+  else if (fc_marchVariant >= 6 && fc_blendMode == 0 && !fc_renderToTexture)
   {
     const int unrollN = (fc_marchVariant == 7) ? 4 : 8;
     const float3 adjTexMin = ctpOffset;
@@ -5273,72 +5272,166 @@ inline half4 marchVolumeUnified(
       if (bVal2##_j < 0.5f) skip##_j = true; \
     } \
   } \
-  half4 c##_j = half4(0.0h); \
-  half3 col##_j = half3(0.0h); \
-  half  opa##_j = 0.0h; \
-  if (!skip##_j) { \
-    if (fc_transfer2D) { \
-      half secondNorm##_j; \
-      if (volumeUniforms.transfer2DUseGradient > 0.5) { \
-        half4 g2##_j = computeGradientFast(volumeTexture, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
-        secondNorm##_j = g2##_j.w; \
-      } else { \
-        secondNorm##_j = half(sampleSecondScalar(transfer2DYAxisTexture, rPosC##_j) * secondScale + secondBias); \
+  if (fc_independentComponents) { \
+    if (!skip##_j) { \
+      float4 s4_##_j = sampleVolumeTexel(volumeTexture, rPosC##_j); \
+      int nComp##_j = min(4, int(volumeUniforms.numComponents)); \
+      half4 compColor##_j[4] = {half4(0.0h), half4(0.0h), half4(0.0h), half4(0.0h)}; \
+      half scalarNormComp##_j[4] = {half(0.0h), half(0.0h), half(0.0h), half(0.0h)}; \
+      half compScale##_j[4] = {0.0h, 0.0h, 0.0h, 0.0h}; \
+      half compBias##_j[4] = {0.0h, 0.0h, 0.0h, 0.0h}; \
+      for (int c = 0; c < nComp##_j; ++c) { \
+        half cMin = half(volumeUniforms.scalarMinComp[c]); \
+        half cRange = max(half(volumeUniforms.scalarMaxComp[c]) - cMin, 1e-4h); \
+        compScale##_j[c] = 1.0h / cRange; \
+        compBias##_j[c] = -cMin / cRange; \
+        float rawComp = (c == 0 ? s4_##_j.r : (c == 1 ? s4_##_j.g : (c == 2 ? s4_##_j.b : s4_##_j.a))); \
+        scalarNormComp##_j[c] = saturate((half(rawComp) - cMin) / cRange); \
       } \
-      c##_j = sampleTransferFunction2D(transferFunction2DTexture, float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), float(secondNorm##_j))); \
-    } else if (fc_mask) { \
-      float rawMask##_j = maskTexture.sample(sNearest, rPosC##_j, level(0)).r; \
-      float maskVal##_j = rawMask##_j * maskScale + maskBias; \
-      if (volumeUniforms.maskType > 0.5) { \
-        if (maskVal##_j <= 0.0) { skip##_j = true; } \
-        else { c##_j = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), 0.5)); } \
-      } else { \
-        if (numLabels > 0.0) { \
-          float label##_j = floor(maskVal##_j + 0.5); \
-          if (label##_j > 0.0) { \
-            label##_j = clamp(label##_j, 1.0, numLabels - 1.0); \
-            float labelY##_j = (label##_j + 0.5) / numLabels; \
-            c##_j = half4(labelMapTransferTexture.sample(sNearest, float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), labelY##_j), level(0))); \
+      for (int c = 0; c < nComp##_j; ++c) { \
+        compColor##_j[c] = sampleComponentTransferFunction(transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3, float2(float(scalarNormComp##_j[c]), 0.5), c); \
+      } \
+      half totalAlpha##_j = 0.0h; \
+      half4 compGrad##_j[4] = {half4(0.0h), half4(0.0h), half4(0.0h), half4(0.0h)}; \
+      bool compGradReady##_j = false; \
+      if (fc_gradientOpacity) { \
+        computeGradientsAllComponents(volumeTexture, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor, compGrad##_j); \
+        compGradReady##_j = true; \
+        for (int c = 0; c < nComp##_j; ++c) { \
+          compColor##_j[c].a *= sampleGradientOpacity(gradientOpacityTexture, float(compGrad##_j[c].w)); \
+        } \
+      } \
+      for (int c = 0; c < nComp##_j; ++c) { \
+        if (volumeUniforms.componentWeight[c] <= 0.0) continue; \
+        totalAlpha##_j += compColor##_j[c].a * half(volumeUniforms.componentWeight[c]); \
+      } \
+      if (totalAlpha##_j > 0.0h) { \
+        half3 tmpRGB##_j = half3(0.0h); \
+        half tmpA##_j = 0.0h; \
+        for (int c = 0; c < nComp##_j; ++c) { \
+          half wC = half(volumeUniforms.componentWeight[c]); \
+          if (wC <= 0.0h) continue; \
+          half4 cc = compColor##_j[c]; \
+          half3 ccRGB = cc.rgb; \
+          if (fc_shading && totalAlpha##_j >= 0.01h) { \
+            half3 nTmp##_j; \
+            if (fc_computeNormalFromOpacity) { \
+              nTmp##_j = computeDensityGradientFast(volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor, c, compScale##_j[c], compBias##_j[c]).xyz; \
+            } else if (fc_normalTexture) { \
+              half4 nsTmp##_j = half4(normalTexture.sample(sVolume, rPosC##_j, level(0))); \
+              nTmp##_j = normalize(nsTmp##_j.xyz * 2.0h - 1.0h); \
+            } else { \
+              if (!compGradReady##_j) { computeGradientsAllComponents(volumeTexture, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor, compGrad##_j); compGradReady##_j = true; } \
+              nTmp##_j = compGrad##_j[c].xyz; \
+            } \
+            half3 ambC = half3(volumeUniforms.ambientColorComp[c].rgb); \
+            half3 difC = half3(volumeUniforms.diffuseColorComp[c].rgb); \
+            half3 speC = half3(volumeUniforms.specularColorComp[c].rgb); \
+            half shiC = half(volumeUniforms.shininessComp[c]); \
+            if (lightUniforms != nullptr && !fc_defaultLighting) { \
+              ccRGB = computeVolumeLighting(ccRGB, nTmp##_j, -viewDirHalf, ambC, difC, speC, shiC, *lightUniforms, volumeUniforms.volumeBoundsMin.xyz + (currentPoint + stepVec * (float)_j) * boundsSize); \
+            } else { \
+              bool twoSidedTmp##_j = (lightUniforms != nullptr && lightUniforms->twoSidedLighting != 0); \
+              ccRGB = computePhongLightingVolumeFast(ccRGB, nTmp##_j, -viewDirHalf, -viewDirHalf, ambC, difC, speC, shiC, twoSidedTmp##_j); \
+            } \
+          } \
+          tmpRGB##_j += ccRGB * cc.a * wC; \
+          tmpA##_j += (cc.a * cc.a) / totalAlpha##_j; \
+        } \
+        half w##_j = 1.0h - accumulatedOpacity; \
+        accumulatedColor += w##_j * tmpRGB##_j; \
+        accumulatedOpacity += w##_j * tmpA##_j; \
+      } \
+    } \
+  } else { \
+    half4 c##_j = half4(0.0h); \
+    half3 col##_j = half3(0.0h); \
+    half opa##_j = 0.0h; \
+    half maskLabel##_j = 0.0h; \
+    if (!skip##_j) { \
+      if (fc_transfer2D) { \
+        half secondNorm##_j; \
+        if (volumeUniforms.transfer2DUseGradient > 0.5) { \
+          half4 g2##_j = computeGradientFast(volumeTexture, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
+          secondNorm##_j = g2##_j.w; \
+        } else { \
+          secondNorm##_j = half(sampleSecondScalar(transfer2DYAxisTexture, rPosC##_j) * secondScale + secondBias); \
+        } \
+        c##_j = sampleTransferFunction2D(transferFunction2DTexture, float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), float(secondNorm##_j))); \
+      } else if (fc_mask) { \
+        float rawMask##_j = maskTexture.sample(sNearest, rPosC##_j, level(0)).r; \
+        float maskVal##_j = rawMask##_j * maskScale + maskBias; \
+        if (volumeUniforms.maskType > 0.5) { \
+          if (maskVal##_j <= 0.0) { skip##_j = true; } \
+          else { c##_j = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), 0.5)); } \
+        } else { \
+          if (numLabels > 0.0) { \
+            float label##_j = floor(maskVal##_j + 0.5); \
+            if (label##_j > 0.0) { \
+              label##_j = clamp(label##_j, 1.0, numLabels - 1.0); \
+              float labelY##_j = (label##_j + 0.5) / numLabels; \
+              c##_j = half4(labelMapTransferTexture.sample(sNearest, float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), labelY##_j), level(0))); \
+            } else { \
+              c##_j = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), 0.5)); \
+            } \
           } else { \
             c##_j = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), 0.5)); \
           } \
+        } \
+      } else if (fc_dependentRGBA) { \
+        float4 s4_dep_##_j = sampleVolumeTexel(volumeTexture, rPosC##_j); \
+        half rgbaOpacity##_j = sampleTransferFunction(transferFunctionTexture, float2(s4_dep_##_j.a, 0.5)).a; \
+        c##_j = half4(half3(s4_dep_##_j.rgb), rgbaOpacity##_j); \
+      } else if (fc_dependentLA) { \
+        float4 s4_dep_##_j = sampleVolumeTexel(volumeTexture, rPosC##_j); \
+        half4 laColor##_j = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), 0.5)); \
+        half lastMin##_j = half(volumeUniforms.scalarMinComp[1]); \
+        half lastMax##_j = half(volumeUniforms.scalarMaxComp[1]); \
+        half lastNorm##_j = saturate((half(s4_dep_##_j.g) - lastMin##_j) / max(lastMax##_j - lastMin##_j, 1e-4h)); \
+        half laOpacity##_j = sampleTransferFunction(transferFunctionTexture, float2(float(lastNorm##_j), 0.5)).a; \
+        c##_j = half4(laColor##_j.rgb, laOpacity##_j); \
+      } else { \
+        c##_j = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), 0.5)); \
+      } \
+      if (!skip##_j) { col##_j = c##_j.rgb; opa##_j = c##_j.a; maskLabel##_j = 0.0h; } \
+    } \
+    if (!skip##_j && fc_gradientOpacity) { \
+      if (opa##_j > 0.0h && maskLabel##_j == 0.0h) { \
+        half4 gTmp##_j = computeGradientFast(volumeTexture, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
+        if (fc_computeNormalFromOpacity) { \
+          half4 cached##_j = half4(0.0h); \
+          half4 gTmp2##_j = computeScalarAndDensityGradient(volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor, scalarScale, scalarBias, cached##_j); \
+          opa##_j *= sampleGradientOpacity(gradientOpacityTexture, float(gTmp2##_j.w)); \
         } else { \
-          c##_j = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), 0.5)); \
+          opa##_j *= sampleGradientOpacity(gradientOpacityTexture, float(gTmp##_j.w)); \
         } \
       } \
-    } else { \
-      c##_j = sampleTransferFunction(transferFunctionTexture, float2(float(saturate(half(s##_j) * scalarScale + scalarBias)), 0.5)); \
     } \
-    if (!skip##_j) { col##_j = c##_j.rgb; opa##_j = c##_j.a; } \
-  } \
-  if (!skip##_j && fc_gradientOpacity) { \
-    if (opa##_j > 0.0h) { \
-      half4 gTmp##_j = computeGradientFast(volumeTexture, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
-      opa##_j *= sampleGradientOpacity(gradientOpacityTexture, float(gTmp##_j.w)); \
-    } \
-  } \
-  if (!skip##_j && fc_shading) { \
-    if (opa##_j > 0.0h) { \
-      half3 n##_j; \
-      if (fc_normalTexture) { \
-        half4 ns##_j = half4(normalTexture.sample(sVolume, rPosC##_j, level(0))); \
-        n##_j = normalize(ns##_j.xyz * 2.0h - 1.0h); \
-      } else if (fc_computeNormalFromOpacity) { \
-        n##_j = computeDensityGradientFast(volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor, 0, scalarScale, scalarBias).xyz; \
-      } else { \
-        n##_j = computeGradientFast(volumeTexture, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor).xyz; \
-      } \
-      if (lightUniforms != nullptr && !fc_defaultLighting) { \
-        col##_j = computeVolumeLighting(col##_j, n##_j, -viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat, *lightUniforms, volumeUniforms.volumeBoundsMin.xyz + (currentPoint + stepVec * (float)_j) * boundsSize); \
-      } else { \
-        bool twoSided##_j = (lightUniforms != nullptr && lightUniforms->twoSidedLighting != 0); \
-        col##_j = computePhongLightingVolumeFast(col##_j, n##_j, -viewDirHalf, -viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat, twoSided##_j); \
+    if (!skip##_j && fc_shading) { \
+      if (opa##_j > 0.0h && maskLabel##_j == 0.0h) { \
+        half3 n##_j; \
+        if (fc_normalTexture) { \
+          half4 ns##_j = half4(normalTexture.sample(sVolume, rPosC##_j, level(0))); \
+          n##_j = normalize(ns##_j.xyz * 2.0h - 1.0h); \
+        } else if (fc_computeNormalFromOpacity) { \
+          n##_j = computeDensityGradientFast(volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor, 0, scalarScale, scalarBias).xyz; \
+        } else { \
+          n##_j = computeGradientFast(volumeTexture, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor).xyz; \
+        } \
+        if (lightUniforms != nullptr && !fc_defaultLighting) { \
+          col##_j = computeVolumeLighting(col##_j, n##_j, -viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat, *lightUniforms, volumeUniforms.volumeBoundsMin.xyz + (currentPoint + stepVec * (float)_j) * boundsSize); \
+        } else { \
+          bool twoSided##_j = (lightUniforms != nullptr && lightUniforms->twoSidedLighting != 0); \
+          col##_j = computePhongLightingVolumeFast(col##_j, n##_j, -viewDirHalf, -viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat, twoSided##_j); \
+        } \
+      } else if (maskLabel##_j != 0.0h) { \
+        col##_j = ambientMat * col##_j; \
       } \
     } \
-  } \
-  half w##_j = 1.0h - accumulatedOpacity; \
-  accumulatedColor += w##_j * (col##_j * opa##_j); \
-  accumulatedOpacity += w##_j * opa##_j;
+    half w##_j = 1.0h - accumulatedOpacity; \
+    accumulatedColor += w##_j * (col##_j * opa##_j); \
+    accumulatedOpacity += w##_j * opa##_j; \
+  }
 #define MV9_ADVANCE(_W) \
   currentPoint += stepVec * (float)_W; \
   currentT += p.stepSize * (float)_W; \

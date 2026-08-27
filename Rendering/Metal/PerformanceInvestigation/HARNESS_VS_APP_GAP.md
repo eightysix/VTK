@@ -5375,6 +5375,24 @@ Measured lean `@2048 SD4 Y mm`, `60f/10w`, same `BASE` as `§39.3` (no `SHADE`):
 * before lift `§39.3` `frag0 16.32`, `frag16 14.35`
 * after full lift `frag0 16.20`, `frag16 14.12` – `±1%` noise, **no regression**.
 
+Repro (exact, `2026-08-27` `M2 MBA` `arm64 Release` `DICOM 512×512×1794 U8`):
+
+```sh
+BIN=build_macos_metal/bin/vtkMetalGLVisualComparison
+DICOM=/Users/macair/Public/IMR/CTIMR/IMRToraceAddome
+BASE="VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1"
+# 60f/10w ABBA (§39.3 shape, default oblique X – doc §39.6 Y mm is 14.7/14.8 on this host, X is 16.2)
+eval "env $BASE $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 60 --size 2048x2048 --warmup 10" 2>&1 | grep ^DICOMVolume # frag0 16.23/16.07
+eval "env $BASE VTK_METAL_TEST_FRAG_BATCH=16 $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 60 --size 2048x2048 --warmup 10" 2>&1 | grep ^DICOMVolume # frag16 14.11/14.12
+# single-run 20f quick check (used in review):
+eval "env $BASE $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 20 --reps 1 --size 2048x2048 --warmup 10" 2>&1 | grep -E "DICOM|Failed|Error" | head -n 20 # frag0 16.20
+eval "env $BASE VTK_METAL_TEST_FRAG_BATCH=16 $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 20 --reps 1 --size 2048x2048 --warmup 10" 2>&1 | grep -E "DICOM|Failed|Error" | head -n 20 # frag16 15.02/14.88
+# Y variant (explicit, §38.12.1 Y wins orbit on doc host, here −9%):
+eval "env $BASE VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 60 --size 2048x2048 --warmup 10" 2>&1 | grep ^DICOMVolume # Y frag0 14.83
+```
+
+> `zsh` `eval` required: `env $BASE $BIN ...` without `eval "env $BASE ..."` does **not** word-split `BASE` (`zsh` `§25.7` `995` `INVOCATION: app-bench wrappers MUST use eval "env $C ... $B"`) → `VTK_METAL_TEST_MARCH_VARIANT=9` etc. unset → silent `mv0` default `27.44` `X` `27.12` `Y` `30.57` `z` (no transpose) vs correct `16.20` `X` `14.71` `Y` (`for AX in unset x y z; do env $BASE $ENV $BIN ...` `27 ms` loop vs `eval "env $BASE $ENV $BIN ..."` `16 ms`).
+
 `blendMode`/`renderToTexture`/`independent` still use scalar `do{ //4900 }while` – `MIP` etc. would need `mipMaxScalar` tracking inside the `48-wide` batch (different accumulation), `RTT` needs `firstOpaquePos` `5049`; both are the next `fc_*` templates per `featureMask` `340/2713`, not a runtime cost. Binary `93M` `22:56`, `MARCH_DEBUG` gated `[fragpso]`, default `VTK_METAL_TEST_FRAG_BATCH=0`.
 
 ## 40. `mv9` feature coverage — current state, gaps, and how to verify (2026-08-26)
@@ -5393,21 +5411,20 @@ Measured lean `@2048 SD4 Y mm`, `60f/10w`, same `BASE` as `§39.3` (no `SHADE`):
 | `blanking` (ghost) | `fc_blanking` `2719` (`blankingTexture` `1020`) | **yes** `§39.6` | – | AMR / ghost arrays |
 | `rectilinear` | `fc_rectilinear` `2695` (`rectilinearSamplePosition` `3796`) | **yes** `§39.6` – `rPos` in `MV9_FETCH` | – | `vtkRectilinearGrid` |
 | `transfer2D` | `fc_transfer2D` `2691` (`transfer2DYAxisTexture` `988`) | **yes** `§39.6` – `sampleTransferFunction2D` | – | `vtkVolumeProperty::SetTransferFunction2D` |
-| `independent` `2-4` comps | `fc_independentComponents` `2687` (`useIndependentPath` `3324`) | **no** – outer `5216` keeps `!useIndependentPath` | scalar `useIndependentPath` `4912-5004` `compColor[4]` | `RGBA/LA` volumes |
-| `dependent` `LA/RGBA` | `fc_dependentLA` `2710` `fc_dependentRGBA` `2706` | **no** | scalar `4950-4966` | dependent TF |
+| `independent` `2-4` comps | `fc_independentComponents` `2687` (`useIndependentPath` `3324`) | **yes** `§41` – `if(fc_independentComponents){ nComp/compColor/s4_ 4269 4916 3932 }` | – | `RGBA/LA` volumes |
+| `dependent` `LA/RGBA` | `fc_dependentLA` `2710` `fc_dependentRGBA` `2706` | **yes** `§41` – `if(fc_dependentRGBA){ s4_dep.a }` `if(fc_dependentLA){ s4_dep.g }` | – | dependent TF |
 | `renderToTexture` (`RTT`) | `fc_renderToTexture` `2713` (`UseRenderToImage` `976`) | **no** – `!fc_renderToTexture` | scalar `firstOpaquePos` `5049` + `RTT` `112` | `vtkWindowToImageFilter` depth |
 | `slabs>1` (`SlabCount>1`) | `fc_slabMode` `2734` (`SlabInfo` `96`) | **yes** – `if(fc_slabMode && accumulatedOpacity>kExitAcc) break` `5338` + `PerBlockData` | – | `SLAB_BENCHMARKS.md` cache tiling |
 | `selection` (`HardwareSelector`) | `fc_renderToTexture` path `1456` | n/a – separate `fragment_volume_selection_main` PSO | – | picking |
 
-`independent/dependent/blendMode!=0/rtt` still scalar – the `N PSOs` cost is the same template per `featureMask` bit, not a `fps` cost after `PipelineCache` `7961`.
+`blendMode!=0/rtt` still scalar – `independent/dependent` now `mv9` `§41` – the `N PSOs` cost is the same template per `featureMask` bit, not a `fps` cost after `PipelineCache` `7961`.
 
 ### 40.2 Next to close (ranked by interactive hit)
 
-1. **`independent` / `dependent`** – multi-component `RGBA` is the next `fps` lever after `shading`. Lift `5216 !useIndependentPath && !fc_dependent…` and thread per-component `scalarScale/compScale` `4269` + `sampleComponentTransferFunction` `4916` + `computeGradientsAllComponents` `3932` through `MV9_COMPOSITE` as `if(fc_independentComponents){ for c in 0..nComp … col+=… }` (like `§39.5` shading). Expect `shaded` sized `PSO` bloat but `lean` stays `576`.
-2. **`blendMode!=0`** – needs different `w` accumulation (`mipMaxScalar` vs `col*opa`) inside the `48-wide` batch. Add `if(fc_blendMode==1){ mipMaxScalar = max(mipMaxScalar, scalarNorm) }` etc. `§39.6` scaffolding already has `kExitAcc`/`tTerminateMax` latches per batch.
-3. **`renderToTexture`** – `firstOpaquePos` `1456` write inside `MV9_COMPOSITE` when `fc_renderToTexture && sampleOpacity>0 && haveOpaquePos`.
+1. **`blendMode!=0`** – needs different `w` accumulation (`mipMaxScalar` vs `col*opa`) inside the `48-wide` batch. Add `if(fc_blendMode==1){ mipMaxScalar = max(mipMaxScalar, scalarNorm) }` etc. `§39.6` scaffolding already has `kExitAcc`/`tTerminateMax` latches per batch.
+2. **`renderToTexture`** – `firstOpaquePos` `1456` write inside `MV9_COMPOSITE` when `fc_renderToTexture && sampleOpacity>0 && haveOpaquePos`.
 
-`cropping/mask/blanking/rectilinear/transfer2D` are already `mv9` – keep `baseline` only for the `3` rows above.
+`cropping/mask/blanking/rectilinear/transfer2D/independent` are already `mv9` – keep `baseline` only for the `2` rows above.
 
 ### 40.3 How to verify (per feature, same protocol as `§39`)
 
@@ -5446,6 +5463,10 @@ done
 ```
 
 Pass bars: lean `mean 0.0004 max2` unchanged, feature `mean<0.04 max<25` `±1-step` class (`26.5` macrocell rounding), `thresholded error 0`, `60f` `ABBA` `±1%` per view. `N PSOs` only first-frame `~200ms` hitch, `fps` after `PipelineCache` `7961`.
+
+## 41. `mv9` independent/dependent via PSO specialization — no lean penalty (2026-08-27)
+
+`MetalShaders.metal:5213` bulkhead `&& !useIndependentPath && !fc_dependentRGBA/LA` lifted to `&& !fc_renderToTexture`, `MV9_FETCH` stays lean-only `sampleVolumeScalar`, `MV9_COMPOSITE:5272` `if(fc_independentComponents){ float4 s4_=sampleVolumeTexel; nComp/compColor/scalarNormComp/compScale/Bias 4269 4916; sampleComponentTransferFunction; computeGradientsAllComponents 3932 for fc_gradientOpacity; totalAlpha/tmpRGB/tmpA w=1-accumOpacity }` `else if(fc_dependentRGBA){ s4_dep.a }` `else if(fc_dependentLA){ s4_dep.g }` each `if(fc_*)` `function_constant` – lean (`fc_*==false`) dead-strip `576 TG` `§39.6` `16.20/14.12` reproduced `eval "env $BASE ..."` `60f 16.23/14.11` `§40.3` `0.0000 max0` `512` parity (`MetalShaders.metal:5256` `s4_` inside `if(fc_*)` not lean, `xcrun metal -c` `15 warnings` clean).
 
 ## 5. Files
 
