@@ -6,6 +6,8 @@
 #import "NIFTIVolumeViewController.h"
 #import "VTKMetalBaseViewController.h"
 #import "VTKInteractionMode.h"
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include "vtkMetalGPUVolumeRayCastMapper.h"
 #include "vtkRenderWindow.h"
@@ -32,6 +34,10 @@
 // block summary of the dilated macrocell lattice; the minmax walk leaps whole
 // empty blocks. Mapper-gated to the fine-SD tier (sampleDistance < 1.5).
 @property (nonatomic) BOOL minMaxBlocksEnabled;
+// Fragment compile-time batch specialization (HARNESS_VS_APP_GAP §39):
+// fc_fragBatch [[function_constant(41)]] - 0=shipped runtime 32 heavy,
+// 8/16/32=light (16 orbit-best). Baked into featureMaskExtra bits [10:15].
+@property (nonatomic) int fragBatchValue;
 // Transposed depth-axis choice (HARNESS_VS_APP_GAP §35.5/§35.8): which short
 // in-plane extent plays texture depth under VOLTRANSPOSE. Y measures -8..-14%
 // vs the policy's X tie-break under mm+blocks at fine SD. OFF restores x (the
@@ -88,6 +94,11 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
   self.volumeTransposeAxisYEnabled = NO;
   if (const char* v = std::getenv("VTK_METAL_TEST_VOLTRANSPOSE_AXIS"))
     self.volumeTransposeAxisYEnabled = (v[0] == 'y' || v[0] == 'Y');
+
+  // Fragment batch specialization (§39): 0=shipped runtime 32, 8/16/32=light.
+  self.fragBatchValue = 0;
+  if (const char* v = std::getenv("VTK_METAL_TEST_FRAG_BATCH"))
+    self.fragBatchValue = std::max(0, std::min(48, std::atoi(v)));
 
   NSRect contentRect = NSMakeRect(0, 0, 1100, 800);
   NSWindowStyleMask styleMask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
@@ -268,6 +279,15 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
       modifiers:NSEventModifierFlagCommand | NSEventModifierFlagOption
           target:self
           toMenu:renderingMenu];
+  [renderingMenu addItem:[NSMenuItem separatorItem]];
+  // Fragment Batch (§39) - compile-time register diet. 0=shipped runtime 32
+  // heavy, 8/16/32=light. 16 is orbit-best on IMRToraceAddome SD4.
+  NSMenu* fragBatchMenu = [[NSMenu alloc] initWithTitle:@"Fragment Batch"];
+  [self addFragBatchItem:@"Shipped (32 heavy) [0]" batch:0 key:@"0" toMenu:fragBatchMenu];
+  [self addFragBatchItem:@"8  (light, scatter-best)" batch:8 key:@"8" toMenu:fragBatchMenu];
+  [self addFragBatchItem:@"16 (light, orbit-best)" batch:16 key:@"9" toMenu:fragBatchMenu];
+  [self addFragBatchItem:@"32 (light)" batch:32 key:@"7" toMenu:fragBatchMenu];
+  [self addSubmenu:fragBatchMenu titled:@"Fragment Batch" toMenu:renderingMenu];
   [self addSubmenu:renderingMenu titled:@"Rendering" toMenu:vtkMenu];
 
   // File submenu
@@ -313,6 +333,15 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
 {
   NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:title action:nil keyEquivalent:@""];
   item.submenu = submenu;
+  [menu addItem:item];
+}
+
+- (void)addFragBatchItem:(NSString*)title batch:(int)batch key:(NSString*)key toMenu:(NSMenu*)menu
+{
+  NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:title action:@selector(setFragBatch:) keyEquivalent:key];
+  item.target = self;
+  item.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+  item.tag = batch;
   [menu addItem:item];
 }
 
@@ -444,6 +473,16 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
     if (!isVolumeVC)
       return NO;
     menuItem.state = self.minMaxBlocksEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+    return YES;
+  }
+
+  if (action == @selector(setFragBatch:))
+  {
+    BOOL isVolumeVC = [[self findMetalViewController] isKindOfClass:[BaseVolumeViewController class]];
+    menuItem.enabled = isVolumeVC;
+    if (!isVolumeVC)
+      return NO;
+    menuItem.state = (menuItem.tag == self.fragBatchValue) ? NSControlStateValueOn : NSControlStateValueOff;
     return YES;
   }
 
@@ -609,6 +648,23 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
   [self renderCurrentWindow];
 }
 
+// Fragment Batch (§39): compile-time register diet. Baked into
+// featureMaskExtra bits [10:15] (fragBatch<<10) -> own PSO per width.
+// Mirrors fc_cmBatch trick for compute (HARNESS_VS_APP_GAP §38.10).
+- (void)setFragBatch:(id)sender
+{
+  NSInteger batch = 0;
+  if ([sender respondsToSelector:@selector(tag)])
+    batch = [sender tag];
+  else if ([sender isKindOfClass:[NSNumber class]])
+    batch = [sender integerValue];
+  self.fragBatchValue = (int)batch;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d", self.fragBatchValue);
+  setenv("VTK_METAL_TEST_FRAG_BATCH", buf, 1);
+  [self renderCurrentWindow];
+}
+
 #else
 
 #pragma mark - Application Lifecycle (iOS)
@@ -622,6 +678,12 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
     VTKMetalBaseViewController* vc = [self findMetalViewController];
     return [vc isKindOfClass:[DICOMVolumeViewController class]] ||
            [vc isKindOfClass:[NIFTIVolumeViewController class]];
+  }
+  if (action == @selector(setFragBatch:))
+  {
+    // Enable only on volume view controllers; state handled in validateCommand for UIMenu.
+    VTKMetalBaseViewController* vc = [self findMetalViewController];
+    return [vc isKindOfClass:[BaseVolumeViewController class]];
   }
   return YES;
 }
@@ -679,12 +741,29 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
       command.attributes = UIMenuElementAttributesDisabled;
       command.state = UIMenuElementStateOn;
     }
+    return;
+  }
+
+  if (cmdAction == @selector(setFragBatch:))
+  {
+    VTKMetalBaseViewController* vc = [self findMetalViewController];
+    BOOL isVolumeVC = [vc isKindOfClass:[BaseVolumeViewController class]];
+    if (!isVolumeVC)
+    {
+      command.attributes = UIMenuElementAttributesDisabled;
+      return;
+    }
+    NSInteger batch = [command.propertyList integerValue];
+    command.state = (batch == self.fragBatchValue) ? UIMenuElementStateOn : UIMenuElementStateOff;
   }
 }
 
 - (BOOL)application:(UIApplication*)application
 didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
 {
+  self.fragBatchValue = 0;
+  if (const char* v = std::getenv("VTK_METAL_TEST_FRAG_BATCH"))
+    self.fragBatchValue = std::max(0, std::min(48, std::atoi(v)));
   self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
   ViewController* vc = [[ViewController alloc] init];
   self.window.rootViewController = vc;
@@ -815,15 +894,39 @@ didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
   decSampleCmd.discoverabilityTitle = @"Decrease sample distance by 0.5";
 
   UIKeyCommand* dynSampleCmd = [UIKeyCommand
-                                keyCommandWithInput:@"y"
-                                modifierFlags:UIKeyModifierCommand | UIKeyModifierAlternate
-                                action:@selector(toggleDynamicSampleRate:)];
+                                 keyCommandWithInput:@"y"
+                                 modifierFlags:UIKeyModifierCommand | UIKeyModifierAlternate
+                                 action:@selector(toggleDynamicSampleRate:)];
   dynSampleCmd.title = @"Toggle Dynamic Sample Rate";
   dynSampleCmd.discoverabilityTitle = @"Toggle automatic sample rate adjustment during interaction";
 
+  // Fragment Batch (§39) - compile-time register diet submenu
+  UICommand* frag0Cmd = [UICommand commandWithTitle:@"Fragment Batch: Shipped (32 heavy) [0]"
+                                              image:nil
+                                             action:@selector(setFragBatch:)
+                                       propertyList:@(0)];
+  frag0Cmd.discoverabilityTitle = @"Shipped runtime 32";
+  UICommand* frag8Cmd = [UICommand commandWithTitle:@"Fragment Batch: 8 (light, scatter-best)"
+                                              image:nil
+                                             action:@selector(setFragBatch:)
+                                       propertyList:@(8)];
+  frag8Cmd.discoverabilityTitle = @"Fragment batch 8";
+  UICommand* frag16Cmd = [UICommand commandWithTitle:@"Fragment Batch: 16 (light, orbit-best)"
+                                               image:nil
+                                              action:@selector(setFragBatch:)
+                                        propertyList:@(16)];
+  frag16Cmd.discoverabilityTitle = @"Fragment batch 16";
+  UICommand* frag32Cmd = [UICommand commandWithTitle:@"Fragment Batch: 32 (light)"
+                                               image:nil
+                                              action:@selector(setFragBatch:)
+                                        propertyList:@(32)];
+  frag32Cmd.discoverabilityTitle = @"Fragment batch 32";
+  UIMenu* fragBatchMenu = [UIMenu menuWithTitle:@"Fragment Batch"
+                                           children:@[ frag0Cmd, frag8Cmd, frag16Cmd, frag32Cmd ]];
+
   UIMenu* renderingMenu = [UIMenu
                            menuWithTitle:@"Rendering"
-                           children:@[ nextPresetCmd, prevPresetCmd, benchmarkCmd, dynSampleCmd, incSampleCmd, decSampleCmd ]];
+                           children:@[ nextPresetCmd, prevPresetCmd, benchmarkCmd, dynSampleCmd, incSampleCmd, decSampleCmd, fragBatchMenu ]];
 
   // File submenu
   UIKeyCommand* loadFileCmd = [UIKeyCommand
@@ -839,6 +942,27 @@ didFinishLaunchingWithOptions:(NSDictionary*)launchOptions
   UIMenu* vtkMenu = [UIMenu menuWithTitle:@"VTK"
                                    children:@[ viewsMenu, interactionMenu, cameraMenu, renderingMenu, fileMenu ]];
   [builder insertSiblingMenu:vtkMenu afterMenuForIdentifier:UIMenuApplication];
+}
+
+- (void)setFragBatch:(id)sender
+{
+  NSInteger batch = 0;
+  if ([sender respondsToSelector:@selector(tag)])
+    batch = [sender tag];
+  else if ([sender isKindOfClass:[NSNumber class]])
+    batch = [sender integerValue];
+  // UIMenu case: propertyList holds the batch value
+  if ([sender isKindOfClass:[UICommand class]])
+  {
+    UICommand* cmd = (UICommand*)sender;
+    if (cmd.propertyList)
+      batch = [cmd.propertyList integerValue];
+  }
+  self.fragBatchValue = (int)batch;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d", self.fragBatchValue);
+  setenv("VTK_METAL_TEST_FRAG_BATCH", buf, 1);
+  [self renderCurrentWindow];
 }
 
 #endif

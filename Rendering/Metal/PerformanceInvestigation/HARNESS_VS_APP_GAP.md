@@ -5329,7 +5329,7 @@ env $BASE VTK_METAL_TEST_FRAG_BATCH=16 build_macos_metal/bin/vtkMetalGLVisualCom
 python3 -c "from PIL import Image;import numpy as np;import os;a=np.array(Image.open(os.path.join('$OUT1','DICOMVolume.metal.png')));b=np.array(Image.open(os.path.join('$OUT2','DICOMVolume.metal.png')));d=np.abs(a.astype(int)-b.astype(int));print(f'mean {d.mean():.4f} max {d.max()} >1LSB {100*(d>1).mean():.3f}%')"
 ```
 
-Knob: `VTK_METAL_TEST_FRAG_BATCH=1..48` (clamped), `0/unset` = shipped runtime. PSO key is `featureMaskExtra bits [10:15]` (`fragBatch<<10`), `[fragpso]` prints on `VTK_METAL_TEST_MARCH_DEBUG=1`. Default stays `0` until multi-dataset/preset validation per `§37.20` orbit metric.
+Knob: `VTK_METAL_TEST_FRAG_BATCH=1..48` (clamped), `0/unset` = shipped runtime. PSO key is `featureMaskExtra bits [10:15]` (`fragBatch<<10`), `[fragpso]` prints on `VTK_METAL_TEST_MARCH_DEBUG=1`. Default stays `0` until multi-dataset/preset validation per `§37.20` orbit metric. For practical reliable perf results `VTK_METAL_TEST_MARCH_CAP` / `MaxBatchWidth` (`Shaders/MetalShaders.metal:3027` `uniform float maxBatchWidth`, `vtkMetalGPUVolumeRayCastMapper.mm:9632`) is effectively **superseded**: it is runtime-only (`Shaders/MetalShaders.metal:5568` `batchCap = max(1,int(maxBatchWidth))`), retains the heavy `32`-wide allocation (`37%` occupancy `§39.1`) and misleads optimum to `32` (`§37.11` `c32 130.8` vs `c16 142.6 @4096 z`); `FRAG_BATCH` (`Shaders/MetalShaders.metal:2810` `[[function_constant(41)]]`) is the `light`-shader knob (`56%` occupancy) and finds the true optimum `16` (`§39.3`/`§39.7`).
 
 Tree state: `fc_fragBatch [[function_constant(41)]]` landed, `MARCH_DEBUG` gated `[fragpso]`, env-gated default-off; `§38.18` segment cache default-off; `§38.12.4` verdicts unchanged.
 
@@ -5394,6 +5394,38 @@ eval "env $BASE VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y $BIN --bench --backend metal 
 > `zsh` `eval` required: `env $BASE $BIN ...` without `eval "env $BASE ..."` does **not** word-split `BASE` (`zsh` `§25.7` `995` `INVOCATION: app-bench wrappers MUST use eval "env $C ... $B"`) → `VTK_METAL_TEST_MARCH_VARIANT=9` etc. unset → silent `mv0` default `27.44` `X` `27.12` `Y` `30.57` `z` (no transpose) vs correct `16.20` `X` `14.71` `Y` (`for AX in unset x y z; do env $BASE $ENV $BIN ...` `27 ms` loop vs `eval "env $BASE $ENV $BIN ..."` `16 ms`).
 
 `blendMode`/`renderToTexture`/`independent` still use scalar `do{ //4900 }while` – `MIP` etc. would need `mipMaxScalar` tracking inside the `48-wide` batch (different accumulation), `RTT` needs `firstOpaquePos` `5049`; both are the next `fc_*` templates per `featureMask` `340/2713`, not a runtime cost. Binary `93M` `22:56`, `MARCH_DEBUG` gated `[fragpso]`, default `VTK_METAL_TEST_FRAG_BATCH=0`.
+
+### 39.7 `frag32` pitched vs `frag0`/`frag16` — `32` is between, `16` remains optimal (2026-08-27)
+
+`§39.3` `X` sweep already had `frag32/48 ~137` `≈frag0` (single-run `orb Σ`), but `Y` `ABBA` head-to-head only pitched `frag0_Y` vs `frag16_Y`. Pitched `frag32` explicitly on the `2026-08-27` `M2 MBA` `arm64 Release` `DICOM 512×512×1794 U8` `BASE` as `§39.6` (`SD4, JITTER=1, mv9, mm, 60f/10w @2048`), `zsh` `eval` invocation (§39.6 caveat) — single-run per label (not `ABBA` averaged, `±1%` drift + `M2` `≈2%` noise):
+
+| `2048 obl` | `frag0` (`0`→`32` heavy) | `frag16` (`16` light) | `frag32` (`32` light) | verdict |
+|---|---|---|---|---|
+| `X` (default `Elev20 Az30`) | `16.49` | **`14.22`** `-13.8%` | `15.25` `-7.5%` vs `0`, `+7.2%` vs `16` | `16 < 32 < 0` |
+| `Y` (`AXIS=y`) | `15.09` | **`13.50`** `-10.5%` | `14.47` `-4.1%` vs `0`, `+7.2%` vs `16` | `16 < 32 < 0` |
+
+`frag32 light` beats shipped `frag0 heavy` (`-4..-7%`) — same `32`-wide dispatch `MetalShaders.metal:5962` but `light` vs `heavy` is noise-class — but loses to `frag16` (`+7.2%` both `X`/`Y`). Confirms `§39.3` `orb` verdict: `16` is the `light`-shader optimum on this host/dataset (`8` wins `obl/az45` scatter, `16` wins chords/orbit; `32` wins none). Same `±1-step` parity class (`frag0 vs frag32` identical dispatch).
+
+Repro (exact, `zsh` `eval` required — `env $BASE $BIN` without `eval` does not word-split `BASE`, falls back to `mv0` `~27ms`):
+
+```sh
+BIN=build_macos_metal/bin/vtkMetalGLVisualComparison
+DICOM=/Users/macair/Public/IMR/CTIMR/IMRToraceAddome
+BASE="VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1"
+# X (default)
+eval "env $BASE $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 60 --size 2048x2048 --warmup 10" 2>&1 | grep ^DICOMVolume # frag0 16.49
+eval "env $BASE VTK_METAL_TEST_FRAG_BATCH=16 $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 60 --size 2048x2048 --warmup 10" 2>&1 | grep ^DICOMVolume # frag16 14.22
+eval "env $BASE VTK_METAL_TEST_FRAG_BATCH=32 $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 60 --size 2048x2048 --warmup 10" 2>&1 | grep ^DICOMVolume # frag32 15.25
+# Y (axisY as §38.12.1, −9% orbit on doc host)
+eval "env $BASE VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 60 --size 2048x2048 --warmup 10" 2>&1 | grep ^DICOMVolume # Y frag0 15.09
+eval "env $BASE VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y VTK_METAL_TEST_FRAG_BATCH=16 $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 60 --size 2048x2048 --warmup 10" 2>&1 | grep ^DICOMVolume # Y frag16 13.50
+eval "env $BASE VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y VTK_METAL_TEST_FRAG_BATCH=32 $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 60 --size 2048x2048 --warmup 10" 2>&1 | grep ^DICOMVolume # Y frag32 14.47
+# app GUI knob mirrors the env: Rendering -> Fragment Batch -> 0/8/16/32 (sets VTK_METAL_TEST_FRAG_BATCH, PSO bits [10:15])
+```
+
+Practical note: for reliable perf tuning `VTK_METAL_TEST_MARCH_CAP` is superseded by `VTK_METAL_TEST_FRAG_BATCH` — `MARCH_CAP` is runtime-only heavy (`§39.1` `37%` occupancy, optimum `32` in `§37.11`) while `FRAG_BATCH` is light (`56%`) and finds the true optimum `16` (`§39.7` `16 < 32 < 0`); use `FRAG_BATCH` (or app `Rendering -> Fragment Batch`) for any `cap` sweep.
+
+Tree state unchanged: `fc_fragBatch [[function_constant(41)]]` `0` default, `§39.6` lift intact (`93M`).
 
 ## 40. `mv9` feature coverage — current state, gaps, and how to verify (2026-08-26)
 
