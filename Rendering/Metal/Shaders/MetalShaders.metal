@@ -3873,6 +3873,17 @@ inline half4 computeGradientFast(texture3d<float> volTex, float3 pos,
   return normalizedGradient(gradTex, volumeToTexture, gradNormFactor);
 }
 
+inline half4 computeGradientFastWithCenter(texture3d<float> volTex, float3 pos, half sC,
+                                 float3 gradStep, float4x4 volumeToTexture, half gradNormFactor) {
+  // 3 fetches: reuse center scalar already fetched for TF (saves 1 fetch vs 4, 50% vs 6)
+  half sPX = half(sampleVolumeScalar(volTex, pos + float3(gradStep.x, 0, 0)));
+  half sPY = half(sampleVolumeScalar(volTex, pos + float3(0, gradStep.y, 0)));
+  half sPZ = half(sampleVolumeScalar(volTex, pos + float3(0, 0, gradStep.z)));
+  half3 rawGrad = half3(sPX - sC, sPY - sC, sPZ - sC);
+  float3 gradTex = float3(rawGrad) / max(gradStep, 1e-8);
+  return normalizedGradient(gradTex, volumeToTexture, gradNormFactor);
+}
+
 inline half4 computeDensityGradientFast(
     texture3d<float> volTex,
     texture2d<float> tf0, texture2d<float> tf1,
@@ -4923,7 +4934,7 @@ inline half4 marchVolumeUnified(
         } else if (fc_needsPerSampleOpacity && doTransfer2D) {
           half secondNorm;
           if (volumeUniforms.transfer2DUseGradient > 0.5) {
-            sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
+            sharedGrad = computeGradientFastWithCenter(volumeTexture, evalPoint, half(rawScalar), b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
             sharedGradReady = true;
             secondNorm = sharedGrad.w;
           } else {
@@ -5119,7 +5130,7 @@ inline half4 marchVolumeUnified(
                     gradNormFactor, scalarScale, scalarBias, cachedDensityGrad);
                 densityGradReady = true;
               } else {
-                sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
+                sharedGrad = computeGradientFastWithCenter(volumeTexture, evalPoint, half(rawScalar), b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
               }
               sharedGradReady = true;
             }
@@ -5145,7 +5156,7 @@ inline half4 marchVolumeUnified(
                   half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
                   sharedGrad = half4(normalize(nrmSample.xyz * 2.0h - 1.0h), nrmSample.w);
                 } else {
-                  sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
+                  sharedGrad = computeGradientFastWithCenter(volumeTexture, evalPoint, half(rawScalar), b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
                 }
                 sharedGradReady = true;
               }
@@ -5379,7 +5390,7 @@ inline half4 marchVolumeUnified(
         if (fc_transfer2D) { \
           half secondNorm##_j; \
           if (volumeUniforms.transfer2DUseGradient > 0.5) { \
-            half4 g2##_j = computeGradientFast(volumeTexture, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
+            half4 g2##_j = computeGradientFastWithCenter(volumeTexture, rPosC##_j, half(s##_j), b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
             secondNorm##_j = g2##_j.w; \
           } else { \
             secondNorm##_j = half(sampleSecondScalar(transfer2DYAxisTexture, rPosC##_j) * secondScale + secondBias); \
@@ -5424,7 +5435,7 @@ inline half4 marchVolumeUnified(
         if (fc_transfer2D) { \
           half secondNorm##_j; \
           if (volumeUniforms.transfer2DUseGradient > 0.5) { \
-            half4 g2##_j = computeGradientFast(volumeTexture, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
+            half4 g2##_j = computeGradientFastWithCenter(volumeTexture, rPosC##_j, half(s##_j), b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
             secondNorm##_j = g2##_j.w; \
           } else { \
             secondNorm##_j = half(sampleSecondScalar(transfer2DYAxisTexture, rPosC##_j) * secondScale + secondBias); \
@@ -5469,7 +5480,7 @@ inline half4 marchVolumeUnified(
         if (fc_transfer2D) { \
           half secondNorm##_j; \
           if (volumeUniforms.transfer2DUseGradient > 0.5) { \
-            half4 g2##_j = computeGradientFast(volumeTexture, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
+            half4 g2##_j = computeGradientFastWithCenter(volumeTexture, rPosC##_j, half(s##_j), b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
             secondNorm##_j = g2##_j.w; \
           } else { \
             secondNorm##_j = half(sampleSecondScalar(transfer2DYAxisTexture, rPosC##_j) * secondScale + secondBias); \
@@ -5514,7 +5525,7 @@ inline half4 marchVolumeUnified(
       } \
       if (!skip##_j && fc_gradientOpacity) { \
         if (opa##_j > 0.0h && maskLabel##_j == 0.0h) { \
-          half4 gTmp##_j = computeGradientFast(volumeTexture, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
+          half4 gTmp##_j = computeGradientFastWithCenter(volumeTexture, rPosC##_j, half(s##_j), b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
           if (fc_computeNormalFromOpacity) { \
             half4 cached##_j = half4(0.0h); \
             half4 gTmp2##_j = computeScalarAndDensityGradient(volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor, scalarScale, scalarBias, cached##_j); \
@@ -5533,7 +5544,7 @@ inline half4 marchVolumeUnified(
           } else if (fc_computeNormalFromOpacity) { \
             n##_j = computeDensityGradientFast(volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor, 0, scalarScale, scalarBias).xyz; \
           } else { \
-            n##_j = computeGradientFast(volumeTexture, rPosC##_j, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor).xyz; \
+            n##_j = computeGradientFastWithCenter(volumeTexture, rPosC##_j, half(s##_j), b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor).xyz; \
           } \
           if (lightUniforms != nullptr && !fc_defaultLighting) { \
             col##_j = computeVolumeLighting(col##_j, n##_j, -viewDirHalf, ambientMat, diffuseMat, specularMat, shininessMat, *lightUniforms, volumeUniforms.volumeBoundsMin.xyz + (currentPoint + stepVec * (float)_j) * boundsSize); \
@@ -6340,7 +6351,7 @@ inline half4 marchVolumeUnified(
                     gradNormFactor, scalarScale, scalarBias, cachedDensityGrad); \
                 densityGradReady = true; \
               } else { \
-                sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
+                sharedGrad = computeGradientFastWithCenter(volumeTexture, evalPoint, half(rawScalar), b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
               } \
               sharedGradReady = true; \
             } \
@@ -6364,7 +6375,7 @@ inline half4 marchVolumeUnified(
                   half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0))); \
                   sharedGrad = half4(normalize(nrmSample.xyz * 2.0h - 1.0h), nrmSample.w); \
                 } else { \
-                  sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
+                  sharedGrad = computeGradientFastWithCenter(volumeTexture, evalPoint, half(rawScalar), b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor); \
                 } \
                 sharedGradReady = true; \
               } \
@@ -6773,7 +6784,7 @@ inline half4 marchVolumeUnified(
         // magnitude, using the same normalization as gradient opacity — this is
         // the OpenGL backend's grad.w, which it feeds to both the gradient
         // opacity table and the 2D transfer function y-coordinate.
-        sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
+        sharedGrad = computeGradientFastWithCenter(volumeTexture, evalPoint, half(rawScalar), b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
         sharedGradReady = true;
         secondNorm = sharedGrad.w;
       } else {
@@ -7015,7 +7026,7 @@ inline half4 marchVolumeUnified(
                 gradNormFactor, scalarScale, scalarBias, cachedDensityGrad);
             densityGradReady = true;
           } else {
-            sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
+            sharedGrad = computeGradientFastWithCenter(volumeTexture, evalPoint, half(rawScalar), b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
           }
           sharedGradReady = true;
         }
@@ -7046,7 +7057,7 @@ inline half4 marchVolumeUnified(
               half4 nrmSample = half4(normalTexture.sample(sVolume, evalPoint, level(0)));
               sharedGrad = half4(normalize(nrmSample.xyz * 2.0h - 1.0h), nrmSample.w);
             } else {
-              sharedGrad = computeGradientFast(volumeTexture, evalPoint, b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
+              sharedGrad = computeGradientFastWithCenter(volumeTexture, evalPoint, half(rawScalar), b.gradientStep.xyz, volumeUniforms.volumeToTexture, gradNormFactor);
             }
             sharedGradReady = true;
           }
