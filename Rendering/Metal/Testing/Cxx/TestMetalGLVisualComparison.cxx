@@ -91,9 +91,11 @@ extern "C" void objc_autoreleasePoolPop(void* pool);
 // DICOM study directory for the DICOM CT scene (--dicom argument). Defined at
 // global scope so it matches the extern declaration in TestMetalScenes.h
 // (::vtkMetalScenes::gDicomDir), which BuildDICOMVolumeScene reads.
+// NIFTI single file for the NIFTI MRI scene (--nifti argument) mirrors it.
 namespace vtkMetalScenes
 {
 const char* gDicomDir = nullptr;
+const char* gNiftiPath = nullptr;
 }
 
 namespace
@@ -168,6 +170,7 @@ const SceneSpec kScenes[] = {
   { "Texture", vtkMetalScenes::BuildTextureScene, 600, 300 },
   { "VolumeRayCast", vtkMetalScenes::BuildVolumeScene, 400, 400 },
   { "DICOMVolume", vtkMetalScenes::BuildDICOMVolumeScene, 400, 400 },
+  { "NIFTIVolume", vtkMetalScenes::BuildNIFTIVolumeScene, 400, 400 },
   { "CellColor", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
       vtkMetalScenes::BuildCellColorGridScene(r, b, 4, 30);
     }, 800, 800 },
@@ -551,6 +554,10 @@ int main(int argc, char* argv[])
     else if (arg == "--dicom" && i + 1 < argc)
     {
       vtkMetalScenes::gDicomDir = argv[++i];
+    }
+    else if (arg == "--nifti" && i + 1 < argc)
+    {
+      vtkMetalScenes::gNiftiPath = argv[++i];
     }
     else
     {

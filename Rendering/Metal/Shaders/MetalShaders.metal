@@ -3860,14 +3860,15 @@ inline half4 densityGradientFromNeighbors(
 
 inline half4 computeGradientFast(texture3d<float> volTex, float3 pos,
                                  float3 gradStep, float4x4 volumeToTexture, half gradNormFactor) {
+  // OPTIMIZED: forward differences (4 fetches: center + 3 neighbors) vs 6 fetches central.
+  // Central: (s+dx - s-dx)/dx, Forward: (s+dx - s)/dx — direction similar, magnitude
+  // normalized away in normalizedGradient. Saves 33% fetch for dense shading (NIFTI brain).
+  half sC = half(sampleVolumeScalar(volTex, pos));
   half sPX = half(sampleVolumeScalar(volTex, pos + float3(gradStep.x, 0, 0)));
-  half sNX = half(sampleVolumeScalar(volTex, pos - float3(gradStep.x, 0, 0)));
   half sPY = half(sampleVolumeScalar(volTex, pos + float3(0, gradStep.y, 0)));
-  half sNY = half(sampleVolumeScalar(volTex, pos - float3(0, gradStep.y, 0)));
   half sPZ = half(sampleVolumeScalar(volTex, pos + float3(0, 0, gradStep.z)));
-  half sNZ = half(sampleVolumeScalar(volTex, pos - float3(0, 0, gradStep.z)));
 
-  half3 rawGrad = half3(sPX - sNX, sPY - sNY, sPZ - sNZ);
+  half3 rawGrad = half3(sPX - sC, sPY - sC, sPZ - sC);
   float3 gradTex = float3(rawGrad) / max(gradStep, 1e-8);
   return normalizedGradient(gradTex, volumeToTexture, gradNormFactor);
 }

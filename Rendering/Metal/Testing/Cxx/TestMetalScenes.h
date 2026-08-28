@@ -41,6 +41,7 @@
 #include "vtkDICOMDirectory.h"
 #include "vtkDICOMReader.h"
 #include "vtkElevationFilter.h"
+#include "vtkNIFTIImageReader.h"
 #include "vtkFloatArray.h"
 #include "vtkPointData.h"
 #include "vtkGlyph3DMapper.h"
@@ -106,6 +107,11 @@ enum class BackendKind
 // argument (defined in TestMetalGLVisualComparison.cxx). The scene builder
 // falls back to the analytic volume when no directory is provided.
 extern const char* gDicomDir;
+
+// NIFTI file for the NIFTI MRI scene, set by the harness --nifti argument
+// (defined in TestMetalGLVisualComparison.cxx). Mirrors DICOMVolume's pattern
+// but for a single-file MRI dataset; falls back to analytic when absent.
+extern const char* gNiftiPath;
 
 // ---- Backend class factories ---------------------------------------------
 
@@ -1431,6 +1437,284 @@ inline void BuildDICOMVolumeScene(vtkRenderer* renderer, BackendKind b)
   // TEMP-DIAG (VTK_METAL_TEST_CAM_AXIS=x|y|z): exact axis-aligned view
   // (sagittal / coronal / axial) — the §18 RG8 regression-matrix geometry.
   // Places the camera on the named world axis through the focal point.
+  if (const char* axEnv = std::getenv("VTK_METAL_TEST_CAM_AXIS"))
+  {
+    vtkCamera* cam = renderer->GetActiveCamera();
+    double f[3];
+    cam->GetFocalPoint(f);
+    double p[3];
+    cam->GetPosition(p);
+    double dir[3] = { p[0] - f[0], p[1] - f[1], p[2] - f[2] };
+    double dist = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+    switch (axEnv[0])
+    {
+      case 'x':
+        cam->SetPosition(f[0] + dist, f[1], f[2]);
+        cam->SetViewUp(0, 0, 1);
+        break;
+      case 'y':
+        cam->SetPosition(f[0], f[1] + dist, f[2]);
+        cam->SetViewUp(0, 0, 1);
+        break;
+      case 'z':
+        cam->SetPosition(f[0], f[1], f[2] + dist);
+        cam->SetViewUp(0, 1, 0);
+        break;
+    }
+    renderer->ResetCameraClippingRange();
+  }
+}
+
+// ---- NIFTI MRI scene --------------------------------------------------------
+//
+// Replicates the NIFTIVolumeViewController pipeline
+// (Examples/GUI/iOSMetal/test-vtk-metal/NIFTIVolumeViewController.mm): a
+// vtkNIFTIImageReader of the single-file dataset -> scalar-range-based
+// vtkImageShiftScale cast to U8 (shift -dataMin, scale 255/range, clamped) ->
+// the volume mapper configured with jittering, fixed 0.5 sample distance, IGN
+// jitter, partitions 1,1,4 and DisableInstanceRendering (Metal) plus a (0,0,1)
+// clipping plane and the "Brain MRI 7T FLASH25" preset's transfer function
+// (VRPresets/Brain MRI 7T FLASH25.plist) rescaled to the U8 range.
+//
+// The study file comes from gNiftiPath (the harness --nifti argument). If no
+// file is available, this scene falls back to the analytic volume so the
+// harness still renders a meaningful comparison everywhere.
+inline void BuildNIFTIVolumeScene(vtkRenderer* renderer, BackendKind b)
+{
+  static vtkSmartPointer<vtkImageData> cachedU8Volume;
+  static double cachedDataMin = 0.0;
+  static double cachedDataRange = 1.0;
+  static bool tried = false;
+  if (!tried)
+  {
+    tried = true;
+    if (gNiftiPath)
+    {
+      vtkNew<vtkNIFTIImageReader> reader;
+      reader->SetFileName(gNiftiPath);
+      reader->Update();
+      double scalarRange[2];
+      reader->GetOutput()->GetScalarRange(scalarRange);
+      cachedDataMin = scalarRange[0];
+      double dataMax = scalarRange[1];
+      cachedDataRange = dataMax - cachedDataMin;
+      if (cachedDataRange == 0.0)
+      {
+        cachedDataRange = 1.0;
+      }
+
+      vtkNew<vtkImageShiftScale> castToU8;
+      castToU8->SetInputConnection(reader->GetOutputPort());
+      castToU8->SetShift(-cachedDataMin);
+      castToU8->SetScale(255.0 / cachedDataRange);
+      castToU8->SetOutputScalarTypeToUnsignedChar();
+      castToU8->ClampOverflowOn();
+      castToU8->Update();
+      cachedU8Volume = castToU8->GetOutput();
+    }
+    if (cachedU8Volume)
+    {
+      if (const char* tp = std::getenv("VTK_METAL_TEST_TRANSPOSE"); tp && std::atoi(tp) != 0)
+      {
+        vtkNew<vtkImagePermute> perm;
+        perm->SetInputData(cachedU8Volume);
+        const char* permEnv = std::getenv("VTK_METAL_TEST_PERMUTE");
+        if (permEnv)
+        {
+          perm->SetFilteredAxes(permEnv[0] - '0', permEnv[1] - '0', permEnv[2] - '0');
+        }
+        else
+        {
+          perm->SetFilteredAxes(2, 1, 0);
+        }
+        perm->Update();
+        cachedU8Volume = perm->GetOutput();
+      }
+    }
+    if (!cachedU8Volume)
+    {
+      std::cerr << "BuildNIFTIVolumeScene: no NIFTI file (--nifti not set or "
+                   "load failed); falling back to the analytic volume.\n";
+    }
+    else
+    {
+      std::cerr << "BuildNIFTIVolumeScene: loaded " << gNiftiPath << " min=" << cachedDataMin
+                << " max=" << (cachedDataMin + cachedDataRange) << " range=" << cachedDataRange
+                << " dims=" << cachedU8Volume->GetDimensions()[0] << "x"
+                << cachedU8Volume->GetDimensions()[1] << "x"
+                << cachedU8Volume->GetDimensions()[2] << "\n";
+    }
+  }
+
+  if (!cachedU8Volume)
+  {
+    BuildVolumeSceneSized(renderer, b, 128);
+    return;
+  }
+
+  // "Brain MRI 7T FLASH25" preset (VRPresets/Brain MRI 7T FLASH25.plist):
+  // 16bitClutCurves x: 6.5 10 13.5 17 21 26.5 33 45  -> opacity y: 0 0.015 0.07
+  // 0.28 0.58 0.82 0.96 1.0
+  // 16bitClutColors r: 0.06 0.18 0.48 0.71 0.90 0.98 1.0 1.0
+  //               g: 0.08 0.18 0.38 0.62 0.84 0.95 1.0 0.93
+  //               b: 0.22 0.30 0.42 0.58 0.80 0.90 1.0 0.78
+  // x-values are in the NIFTI data's native intensity space; FileVolumeViewController
+  // rescales via (x - dataMin)/range*255 for NIFTI, exactly replicated here.
+  vtkNew<vtkColorTransferFunction> color;
+  vtkNew<vtkPiecewiseFunction> opacity;
+  auto rescale = [&](double x) { return (x - cachedDataMin) / cachedDataRange * 255.0; };
+  const double xs[8] = { 6.5, 10.0, 13.5, 17.0, 21.0, 26.5, 33.0, 45.0 };
+  const double ys[8] = { 0.0, 0.015, 0.07, 0.28, 0.58, 0.82, 0.96, 1.0 };
+  const double rs[8] = { 0.06, 0.18, 0.48, 0.71, 0.90, 0.98, 1.0, 1.0 };
+  const double gs[8] = { 0.08, 0.18, 0.38, 0.62, 0.84, 0.95, 1.0, 0.93 };
+  const double bs[8] = { 0.22, 0.30, 0.42, 0.58, 0.80, 0.90, 1.0, 0.78 };
+  for (int i = 0; i < 8; ++i)
+  {
+    double x = rescale(xs[i]);
+    opacity->AddPoint(x, ys[i]);
+    color->AddRGBPoint(x, rs[i], gs[i], bs[i]);
+  }
+
+  vtkNew<vtkVolumeProperty> property;
+  property->SetColor(color);
+  property->SetScalarOpacity(opacity);
+  property->SetInterpolationTypeToLinear();
+  // Preset useShading == true; honor env overrides so A/B stays comparable.
+  bool useShading = true;
+  if (const char* sh = std::getenv("VTK_METAL_TEST_NIFTI_SHADE"))
+  {
+    useShading = std::atoi(sh) != 0;
+  }
+  else if (const char* sh2 = std::getenv("VTK_METAL_TEST_SHADE"))
+  {
+    useShading = std::atoi(sh2) != 0;
+  }
+  if (useShading)
+  {
+    property->ShadeOn();
+    property->SetAmbient(0.15);
+    property->SetDiffuse(0.85);
+    property->SetSpecular(0.3);
+    property->SetSpecularPower(20.0);
+  }
+  else
+  {
+    property->ShadeOff();
+    property->SetAmbient(1.0);
+    property->SetDiffuse(0.0);
+    property->SetSpecular(0.0);
+  }
+  if (const char* gln = std::getenv("VTK_METAL_TEST_GL_NEAREST"); gln && std::atoi(gln) != 0)
+  {
+    property->SetInterpolationTypeToNearest();
+  }
+
+  vtkSmartPointer<vtkGPUVolumeRayCastMapper> mapper = NewVolumeMapper(b);
+  mapper->SetInputData(cachedU8Volume);
+  if (const char* bm = std::getenv("VTK_METAL_TEST_BLEND"))
+  {
+    int m = std::atoi(bm);
+    if (m == 1)
+      mapper->SetBlendModeToMaximumIntensity();
+    else if (m == 2)
+      mapper->SetBlendModeToMinimumIntensity();
+    else if (m == 3)
+      mapper->SetBlendModeToAverageIntensity();
+    else if (m == 4)
+      mapper->SetBlendModeToAdditive();
+    else
+      mapper->SetBlendModeToComposite();
+  }
+  if (TempJitter())
+  {
+    mapper->UseJitteringOn();
+  }
+  else
+  {
+    mapper->UseJitteringOff();
+  }
+  mapper->AutoAdjustSampleDistancesOff();
+  mapper->SetSampleDistance(TempSampleDistance());
+  mapper->SetImageSampleDistance(TempImageSampleDistance());
+  if (b == BackendKind::Metal)
+  {
+    if (auto* metal = vtkMetalGPUVolumeRayCastMapper::SafeDownCast(mapper))
+    {
+      if (const char* ign = std::getenv("VTK_METAL_TEST_IGN_JITTER"))
+      {
+        metal->SetUseIGNJitter(std::atoi(ign) != 0);
+      }
+      else
+      {
+        metal->SetUseIGNJitter(TempJitter());
+      }
+      metal->SetJitterBlockSize(TempJitterBlock());
+      metal->SetUseGPUMinMax(TempMinMax());
+      metal->SetUseMinMaxAcceleration(TempMinMaxAccel());
+      metal->SetPartitions(1, 1, 4);
+      metal->SetDisableInstanceRendering(true);
+    }
+  }
+
+  vtkNew<vtkPlane> clipPlane;
+  clipPlane->SetNormal(0, 0, 1);
+  double bounds[6];
+  cachedU8Volume->GetBounds(bounds);
+  clipPlane->SetOrigin(0, 0, bounds[4]);
+  mapper->AddClippingPlane(clipPlane);
+
+  vtkNew<vtkVolume> volume;
+  volume->SetMapper(mapper);
+  volume->SetProperty(property);
+  renderer->AddVolume(volume);
+
+  renderer->SetBackground(0.0, 0.0, 0.0);
+
+  vtkSmartPointer<vtkCamera> camera = NewCamera(b);
+  renderer->SetActiveCamera(camera);
+  renderer->ResetCamera();
+  const char* camAxis = std::getenv("VTK_METAL_TEST_CAM_AXIS");
+  if (camAxis && camAxis[0] == 'x')
+  {
+    double fp[3] = { 0, 0, 0 };
+    renderer->GetActiveCamera()->GetFocalPoint(fp);
+    renderer->GetActiveCamera()->SetPosition(fp[0] - 1000.0, fp[1], fp[2]);
+    renderer->GetActiveCamera()->SetViewUp(0, 0, 1);
+  }
+  else if (camAxis && camAxis[0] == 'y')
+  {
+    double fp[3] = { 0, 0, 0 };
+    renderer->GetActiveCamera()->GetFocalPoint(fp);
+    renderer->GetActiveCamera()->SetPosition(fp[0], fp[1] - 1000.0, fp[2]);
+    renderer->GetActiveCamera()->SetViewUp(0, 0, 1);
+  }
+  else if (camAxis && camAxis[0] == 'z')
+  {
+    double fp[3] = { 0, 0, 0 };
+    renderer->GetActiveCamera()->GetFocalPoint(fp);
+    renderer->GetActiveCamera()->SetPosition(fp[0], fp[1], fp[2] - 1000.0);
+    renderer->GetActiveCamera()->SetViewUp(0, 1, 0);
+  }
+  else
+  {
+    renderer->GetActiveCamera()->Elevation(20);
+    renderer->GetActiveCamera()->Azimuth(30);
+    renderer->GetActiveCamera()->Elevation(-40);
+    const char* azEnv = std::getenv("VTK_METAL_TEST_CAM_AZ");
+    if (azEnv)
+    {
+      renderer->GetActiveCamera()->Azimuth(std::atof(azEnv));
+    }
+    else
+    {
+      renderer->GetActiveCamera()->Azimuth(-60);
+    }
+  }
+  if (const char* dollyEnv = std::getenv("VTK_METAL_TEST_CAM_DOLLY"))
+  {
+    renderer->GetActiveCamera()->Dolly(std::atof(dollyEnv));
+    renderer->ResetCameraClippingRange();
+  }
   if (const char* axEnv = std::getenv("VTK_METAL_TEST_CAM_AXIS"))
   {
     vtkCamera* cam = renderer->GetActiveCamera();
