@@ -131,6 +131,22 @@
   property->SetColor(colorFunc);
   property->SetScalarOpacity(opacityFunc);
   property->SetInterpolationTypeToLinear();
+  // Honor preset shading flag on the mapper end — previously ignored (see vtkVolumeProperty::SetShade).
+  // Needed because vtkMetalGPUVolumeRayCastMapper respects vtkVolumeProperty::GetShade() for shading.
+  if (preset && preset.useShading) {
+    property->ShadeOn();
+    // Tuned for brain MRI T1: low ambient, high diffuse for soft tissue contrast.
+    property->SetAmbient(0.15);
+    property->SetDiffuse(0.85);
+    property->SetSpecular(0.3);
+    property->SetSpecularPower(20.0);
+  } else {
+    property->ShadeOff();
+    // When shading off, use unlit composite (ambient=1, diffuse/specular=0) to avoid darkening.
+    property->SetAmbient(1.0);
+    property->SetDiffuse(0.0);
+    property->SetSpecular(0.0);
+  }
 
   static_cast<vtkRenderWindow *>([self renderWindow])->Render();
 }
