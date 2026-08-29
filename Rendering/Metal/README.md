@@ -105,6 +105,10 @@ thresholded error (0.498).
 - Re-generating the baseline from a nearest render would instead keep Metal and
   GL aligned with each other.
 
+## Metal volume ray-cast guide
+
+See [`METAL_VOLUME_RAYCAST_GUIDE.md`](METAL_VOLUME_RAYCAST_GUIDE.md) for mapper + shader general guide (uniforms, textures, PSO specialization, march variants `Rendering/Metal/Shaders/MetalShaders.metal:2725` `5634`, perf knobs).
+
 ## Volume rendering performance: composite slab tiling
 
 `vtkMetalGPUVolumeRayCastMapper` splits each ray into **8 front-to-back slab
