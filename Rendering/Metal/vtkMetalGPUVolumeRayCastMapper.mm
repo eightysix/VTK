@@ -269,10 +269,30 @@ struct VolumeMapperUniforms
   // accumulated-opacity value that terminates the march when fc_exitTheta
   // specializes the pipeline in; legacy latch value (1 - 1/255) otherwise.
   float ExitAlpha;                 // 1748..1751
+  // Cinematic rendering — shaded DVR cinematic (wax AO+SSS, front-to-back
+  // over, first-surface AO/SSS, HG phase on headlight). Added at struct tail
+  // to preserve all prior offsets (bit-identical for non-cinematic renders).
+  // Reserved: CinematicSamples / MaxBounces / MajorantSigma are staging for
+  // future delta-tracking but unused at 1 spp: the current march is DVR, not
+  // Woodcock.
+  uint32_t CinematicSamples;       // 1752..1755 (64 brain default)
+  uint32_t CinematicMaxBounces;    // 1756..1759 (4)
+  float CinematicScatteringAnisotropy; // 1760..1763 g Hengyey-Greenstein
+  float CinematicReach;            // 1764..1767 GlobalIlluminationReach
+  float CinematicBlend;            // 1768..1771 VolumetricScatteringBlending
+  float CinematicDenoise;          // 1772..1775 0..1 guided filter weight
+  float SubsurfaceColor[3];        // 1776..1787 warm pink 0.89/0.73/0.68
+  float SubsurfaceStrength;        // 1788..1791 0..1
+  uint32_t CinematicFrameSeed;     // 1792..1795 temporal jitter seed
+  uint32_t CinematicAccumCount;    // 1796..1799 progressive count
+  float CinematicMajorantSigma;    // 1800..1803 Woodcock majorant sigma_t
+  float _padCinematic;             // 1804..1807 pad
+  float CinematicEnabled;          // 1808..1811 1.0 when cinematic active
+  float _padCinematicEnd[3];       // 1812..1823 tail pad to 1824
 };
 
-static_assert(sizeof(VolumeMapperUniforms) == 1752,
-  "VolumeMapperUniforms must be 1752 bytes to match Metal shader struct");
+static_assert(sizeof(VolumeMapperUniforms) == 1824,
+  "VolumeMapperUniforms must be 1824 bytes to match Metal shader struct");
 
 // MSL rounds the shader-side struct up to its 16-byte alignment (float4/float3
 // members), so the pipeline expects round_up(1732,16)=1744 and Metal's
@@ -281,7 +301,7 @@ static_assert(sizeof(VolumeMapperUniforms) == 1752,
 // padding differs — so allocating the rounded size is purely a validation fix.
 static constexpr NSUInteger VolumeUniformBufferSize =
   (static_cast<NSUInteger>(sizeof(VolumeMapperUniforms)) + 15) & ~NSUInteger(15);
-static_assert(VolumeUniformBufferSize == 1760, "rounded uniform size");
+static_assert(VolumeUniformBufferSize == 1824, "rounded uniform size");
 
 static_assert(offsetof(VolumeMapperUniforms, UseCropping) == 640, "");
 static_assert(offsetof(VolumeMapperUniforms, UseClipping) == 644, "");
@@ -3657,6 +3677,9 @@ void vtkMetalGPUVolumeRayCastMapper::PurgeCaches()
   ReleaseMetalObject(this->ComputeMarchQueue);
   this->RayBinIndicesCapBytes = 0;
 
+  // Cinematic heaps + PSO caches (optimal compute variant).
+  this->ReleaseCinematicResources();
+
   // Segment heaps + per-camera cache.
   this->ReleaseSegmentResources();
 
@@ -3761,6 +3784,9 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
     [(__bridge id)entry.second release];
   }
   this->ComputeMarchBinnedPipelineCache.clear();
+
+  // Cinematic variant resources (optimal compute).
+  this->ReleaseCinematicResources();
 
   // §38.18.1: release segment Private heaps (SegPool 64 MB etc.) that were
   // previously leaked across ReleaseGraphicsResources — the reboot-only clog
@@ -8626,6 +8652,280 @@ void vtkMetalGPUVolumeRayCastMapper::BindComputeMarchTextures(
 }
 
 //------------------------------------------------------------------------------
+// Cinematic rendering — optimal compute variant helpers
+bool vtkMetalGPUVolumeRayCastMapper::EnsureCinematicResources(void* deviceVoid, int width, int height)
+{
+  if (this->CinematicAccumTextureA && this->CinematicAccumTextureB &&
+      this->CinematicAccumWidth == width && this->CinematicAccumHeight == height)
+  {
+    return true;
+  }
+  ReleaseMetalObject(this->CinematicAccumTextureA);
+  ReleaseMetalObject(this->CinematicAccumTextureB);
+  ReleaseMetalObject(this->CinematicDenoiseTexture);
+  @autoreleasepool {
+    id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
+    // Ping-pong accumulation — RGBA16Float, coherent 8x8 tiles, shared ColorOpacity fetch
+    id<MTLTexture> texA = NewTexture2D(device, MTLPixelFormatRGBA16Float, width, height,
+      MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget, MTLStorageModePrivate);
+    id<MTLTexture> texB = NewTexture2D(device, MTLPixelFormatRGBA16Float, width, height,
+      MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget, MTLStorageModePrivate);
+    id<MTLTexture> denoiseTex = NewTexture2D(device, MTLPixelFormatRGBA16Float, width, height,
+      MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, MTLStorageModePrivate);
+    if (!texA || !texB) return false;
+    AssignMetalObject(this->CinematicAccumTextureA, texA);
+    AssignMetalObject(this->CinematicAccumTextureB, texB);
+    if (denoiseTex) AssignMetalObject(this->CinematicDenoiseTexture, denoiseTex);
+    this->CinematicAccumWidth = width;
+    this->CinematicAccumHeight = height;
+    this->CinematicAccumCount = 0;
+    this->CinematicAccumValid = false;
+  }
+  return true;
+}
+
+void vtkMetalGPUVolumeRayCastMapper::ReleaseCinematicResources()
+{
+  ReleaseMetalObject(this->CinematicAccumTextureA);
+  ReleaseMetalObject(this->CinematicAccumTextureB);
+  ReleaseMetalObject(this->CinematicDenoiseTexture);
+  ReleaseMetalObject(this->CinematicDenoisePipeline);
+  ReleaseMetalObject(this->CinematicComputePipeline);
+  ReleaseMetalObject(this->CinematicComputeBinnedPipeline);
+  for (auto &e : this->CinematicComputePipelineCache) [(__bridge id)e.second release];
+  this->CinematicComputePipelineCache.clear();
+  for (auto &e : this->CinematicComputeBinnedPipelineCache) [(__bridge id)e.second release];
+  this->CinematicComputeBinnedPipelineCache.clear();
+  this->CinematicAccumWidth = 0;
+  this->CinematicAccumHeight = 0;
+  this->CinematicAccumCount = 0;
+  this->CinematicAccumValid = false;
+}
+
+void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateCinematicComputePipeline(void* mtlDeviceVoid, uint32_t featureMask, bool binned)
+{
+  VolumePipelineKey key;
+  key.type = binned ? 102u : 103u;
+  key.colorFormat = static_cast<uint32_t>(MTLPixelFormatRGBA16Float);
+  key.depthFormat = static_cast<uint32_t>(MTLPixelFormatInvalid);
+  key.sampleCount = 1;
+  key.featureMask = featureMask;
+  key.featureMaskExtra = this->VolumeTextureAxisDepth |
+    ((this->CinematicDenoise > 0.0f) ? (1u << 23) : 0u);
+  auto &cache = binned ? this->CinematicComputeBinnedPipelineCache : this->CinematicComputePipelineCache;
+  auto it = cache.find(key);
+  if (it != cache.end()) return it->second;
+  id<MTLDevice> mtlDevice = (__bridge id<MTLDevice>)mtlDeviceVoid;
+  id<MTLLibrary> library = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
+  if (!library) return nullptr;
+  MTLFunctionConstantValues* constants = [[MTLFunctionConstantValues alloc] init];
+  BOOL shading = (featureMask & VolumeFeature_Shading) ? YES : NO;
+  BOOL gradOp = (featureMask & VolumeFeature_GradientOpacity) ? YES : NO;
+  BOOL mask = (featureMask & VolumeFeature_Mask) ? YES : NO;
+  BOOL minmax = (featureMask & VolumeFeature_MinMax) ? YES : NO;
+  BOOL normalTex = (featureMask & VolumeFeature_NormalTexture) ? YES : NO;
+   BOOL linearInterp = YES;
+   BOOL computeNormalFromOpacity = (featureMask & VolumeFeature_ComputeNormalFromOpacity) ? YES : NO;
+   BOOL independentComp = (featureMask & VolumeFeature_IndependentComponents) ? YES : NO;
+   [constants setConstantValue:&shading type:MTLDataTypeBool withName:@"fc_shading"];
+   [constants setConstantValue:&gradOp type:MTLDataTypeBool withName:@"fc_gradientOpacity"];
+   [constants setConstantValue:&mask type:MTLDataTypeBool withName:@"fc_mask"];
+   [constants setConstantValue:&minmax type:MTLDataTypeBool withName:@"fc_minmax"];
+   [constants setConstantValue:&normalTex type:MTLDataTypeBool withName:@"fc_normalTexture"];
+   [constants setConstantValue:&linearInterp type:MTLDataTypeBool withName:@"fc_linearInterpolation"];
+   [constants setConstantValue:&computeNormalFromOpacity type:MTLDataTypeBool withName:@"fc_computeNormalFromOpacity"];
+   [constants setConstantValue:&independentComp type:MTLDataTypeBool withName:@"fc_independentComponents"];
+   BOOL transfer2D = (featureMask & VolumeFeature_Transfer2D) ? YES : NO;
+   BOOL rectilinear = (featureMask & VolumeFeature_Rectilinear) ? YES : NO;
+   BOOL defaultLighting = (featureMask & VolumeFeature_DefaultLighting) ? YES : NO;
+   int lightCount = (featureMask >> VolumeFeature_LightCountShift) & 0xFu;
+   BOOL dependentRGBA = (featureMask & VolumeFeature_DependentRGBA) ? YES : NO;
+   BOOL dependentLA = (featureMask & VolumeFeature_DependentLA) ? YES : NO;
+   BOOL renderToTexture = (featureMask & VolumeFeature_RenderToImage) ? YES : NO;
+   [constants setConstantValue:&transfer2D type:MTLDataTypeBool withName:@"fc_transfer2D"];
+   [constants setConstantValue:&rectilinear type:MTLDataTypeBool withName:@"fc_rectilinear"];
+   [constants setConstantValue:&defaultLighting type:MTLDataTypeBool withName:@"fc_defaultLighting"];
+   [constants setConstantValue:&lightCount type:MTLDataTypeInt withName:@"fc_lightCount"];
+   [constants setConstantValue:&dependentRGBA type:MTLDataTypeBool withName:@"fc_dependentRGBA"];
+   [constants setConstantValue:&dependentLA type:MTLDataTypeBool withName:@"fc_dependentLA"];
+   [constants setConstantValue:&renderToTexture type:MTLDataTypeBool withName:@"fc_renderToTexture"];
+   BOOL cropping = (featureMask & VolumeFeature_Cropping) ? YES : NO;
+   BOOL blanking = (featureMask & VolumeFeature_Blanking) ? YES : NO;
+   [constants setConstantValue:&cropping type:MTLDataTypeBool withName:@"fc_cropping"];
+   [constants setConstantValue:&blanking type:MTLDataTypeBool withName:@"fc_blanking"];
+   const int marchVariant = (featureMask & VolumeFeature_MarchVariantMask) >> VolumeFeature_MarchVariantShift;
+   [constants setConstantValue:&marchVariant type:MTLDataTypeInt withName:@"fc_marchVariant"];
+   int slabMode = (featureMask & VolumeFeature_Slab) ? 1 : 0;
+   [constants setConstantValue:&slabMode type:MTLDataTypeInt withName:@"fc_slabMode"];
+   BOOL marchDoExit = (featureMask & VolumeFeature_MarchDoExit) ? YES : NO;
+   [constants setConstantValue:&marchDoExit type:MTLDataTypeBool withName:@"fc_doExit"];
+   BOOL volRg8 = (featureMask & VolumeFeature_VolRg8) ? YES : NO;
+   [constants setConstantValue:&volRg8 type:MTLDataTypeBool withName:@"fc_volRg8"];
+   BOOL volTransposed = (featureMask & VolumeFeature_VolTransposed) ? YES : NO;
+   [constants setConstantValue:&volTransposed type:MTLDataTypeBool withName:@"fc_volTransposed"];
+   BOOL volTransposedY = (this->VolumeTextureAxisDepth == 2) ? YES : NO;
+   [constants setConstantValue:&volTransposedY type:MTLDataTypeBool withName:@"fc_volTransposedY"];
+   BOOL mmBlocks = (VolumeMinMaxBlocksWanted(this->UseGPUMinMax, this->SampleDistance) && this->MinMaxBlockTexture != nullptr) ? YES : NO;
+   [constants setConstantValue:&mmBlocks type:MTLDataTypeBool withName:@"fc_mmBlocks"];
+   BOOL mmSuper = (VolumeMinMaxSuperWanted(this->UseGPUMinMax, this->SampleDistance) && this->MinMaxSuperTexture != nullptr) ? YES : NO;
+   [constants setConstantValue:&mmSuper type:MTLDataTypeBool withName:@"fc_mmSuper"];
+   BOOL segHop = NO;
+   [constants setConstantValue:&segHop type:MTLDataTypeBool withName:@"fc_segHop"];
+   BOOL exitTheta = (VolumeExitTheta() > 0.0f) ? YES : NO;
+   [constants setConstantValue:&exitTheta type:MTLDataTypeBool withName:@"fc_exitTheta"];
+   // Cinematic specialization — optimal compute variant always on for this pipeline
+   BOOL cinematic = YES;
+   BOOL denoise = (this->CinematicDenoise > 0.0f) ? YES : NO;
+   [constants setConstantValue:&cinematic type:MTLDataTypeBool withName:@"fc_cinematic"];
+   [constants setConstantValue:&denoise type:MTLDataTypeBool withName:@"fc_denoise"];
+  // Unused FV constants keep default NO
+  BOOL useDepthTexture = NO, useCameraInside = NO, dense = NO, volNearestCoarse = NO, quadGrad = NO, grad4 = NO, gradNearest = NO, fineSD = NO, gradFloat = NO;
+  int fragBatchFc = 0, cmBatchFc = 0; BOOL cmSplitFc = NO, cmSegHopFc = NO;
+  [constants setConstantValue:&grad4 type:MTLDataTypeBool withName:@"fc_grad4"];
+  [constants setConstantValue:&gradFloat type:MTLDataTypeBool withName:@"fc_gradFloat"];
+  [constants setConstantValue:&fineSD type:MTLDataTypeBool withName:@"fc_fineSD"];
+  [constants setConstantValue:&gradNearest type:MTLDataTypeBool withName:@"fc_gradNearest"];
+  [constants setConstantValue:&useDepthTexture type:MTLDataTypeBool withName:@"fc_useDepthTexture"];
+  [constants setConstantValue:&useCameraInside type:MTLDataTypeBool withName:@"fc_useCameraInside"];
+  [constants setConstantValue:&dense type:MTLDataTypeBool withName:@"fc_dense"];
+  [constants setConstantValue:&volNearestCoarse type:MTLDataTypeBool withName:@"fc_volumeNearestCoarse"];
+  [constants setConstantValue:&quadGrad type:MTLDataTypeBool withName:@"fc_quadGrad"];
+  [constants setConstantValue:&fragBatchFc type:MTLDataTypeInt withName:@"fc_fragBatch"];
+  [constants setConstantValue:&cmBatchFc type:MTLDataTypeInt withName:@"fc_cmBatch"];
+  [constants setConstantValue:&cmSplitFc type:MTLDataTypeBool withName:@"fc_cmSplit"];
+  [constants setConstantValue:&cmSegHopFc type:MTLDataTypeBool withName:@"fc_cmSegHop"];
+  int blendMode = 0;
+  if (featureMask & VolumeFeature_BlendMaximumIntensity) blendMode = static_cast<int>(vtkVolumeMapper::MAXIMUM_INTENSITY_BLEND);
+  else if (featureMask & VolumeFeature_BlendMinimumIntensity) blendMode = static_cast<int>(vtkVolumeMapper::MINIMUM_INTENSITY_BLEND);
+  else if (featureMask & VolumeFeature_BlendAverageIntensity) blendMode = static_cast<int>(vtkVolumeMapper::AVERAGE_INTENSITY_BLEND);
+  else if (featureMask & VolumeFeature_BlendAdditive) blendMode = static_cast<int>(vtkVolumeMapper::ADDITIVE_BLEND);
+  [constants setConstantValue:&blendMode type:MTLDataTypeInt withName:@"fc_blendMode"];
+  NSError* err = nil;
+  NSString* funcName = binned ? @"volume_compute_march_cinematic_binned" : @"volume_compute_march_cinematic";
+  id<MTLFunction> fn = [library newFunctionWithName:funcName constantValues:constants error:&err];
+  [constants release];
+  if (!fn) { vtkErrorMacro("Failed to specialize " << [funcName UTF8String] << ": " << [[err localizedDescription] UTF8String]); return nullptr; }
+  id<MTLComputePipelineState> cps = [mtlDevice newComputePipelineStateWithFunction:fn error:&err];
+  [fn release];
+  if (!cps) { vtkErrorMacro("Failed to create cinematic pipeline " << [funcName UTF8String] << ": " << [[err localizedDescription] UTF8String]); return nullptr; }
+#if __has_feature(objc_arc)
+  void* res = (__bridge_retained void*)cps;
+#else
+  void* res = (__bridge void*)cps;
+#endif
+  cache[key] = res;
+  return res;
+}
+
+bool vtkMetalGPUVolumeRayCastMapper::DispatchCinematicCompute(void* deviceVoid, void* queueVoid, void* cmdBufVoid, vtkRenderer* ren, vtkVolume* vol, void* uniformBufVoid, const void* pbdVoid, const void* lightUniformsVoid, int width, int height)
+{
+  @autoreleasepool {
+    id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
+    id<MTLCommandBuffer> commandBuffer = (__bridge id<MTLCommandBuffer>)cmdBufVoid;
+    if (!this->EnsureCinematicResources(deviceVoid, width, height)) return false;
+    // Build feature mask for cinematic (reuse same mask as fragment but cinematic bit implied)
+    VolumeMapperUniforms* uniforms = static_cast<VolumeMapperUniforms*>(uniformBufVoid);
+    uint32_t featureMask = 0;
+    if (uniforms->UseGradientShading > 0.5f) featureMask |= VolumeFeature_Shading;
+    if (uniforms->UseGradientOpacity > 0.5f) featureMask |= VolumeFeature_GradientOpacity;
+    if (uniforms->UseMask > 0.5f) featureMask |= VolumeFeature_Mask;
+    if (uniforms->UseMinMaxAccel > 0.5f) featureMask |= VolumeFeature_MinMax;
+    if (uniforms->UseNormalTexture > 0.5f) featureMask |= VolumeFeature_NormalTexture;
+    if (uniforms->UseLinearVolumeInterpolation > 0.5f) featureMask |= VolumeFeature_LinearInterpolation;
+    const VolumeLightUniforms* __lightsTmp = static_cast<const VolumeLightUniforms*>(lightUniformsVoid);
+    if (__lightsTmp) {
+      if (__lightsTmp->defaultLighting) featureMask |= VolumeFeature_DefaultLighting;
+      featureMask |= (static_cast<uint32_t>(__lightsTmp->lightCount) & 0xFu) << VolumeFeature_LightCountShift;
+      if (__lightsTmp->lightCount==0) featureMask |= VolumeFeature_DefaultLighting; // headlight fallback
+    }
+    if (uniforms->UseCropping > 0.5f) featureMask |= VolumeFeature_Cropping;
+    if (uniforms->UseBlanking > 0.5f) featureMask |= VolumeFeature_Blanking;
+    featureMask |= BlendModeToFeatureFlag(this->GetBlendMode());
+    // Cinematic is direct 8x8 dispatch (synthetic rays, no atlas/binned).
+    // Binned Woodcock path deleted — at 1 spp it is speckle; shaded DVR is the product.
+    bool useB = (this->CinematicAccumCount % 2) == 1;
+    id<MTLTexture> accumCurr = (__bridge id<MTLTexture>)(useB ? this->CinematicAccumTextureB : this->CinematicAccumTextureA);
+    id<MTLTexture> accumPrev = (__bridge id<MTLTexture>)(useB ? this->CinematicAccumTextureA : this->CinematicAccumTextureB);
+    void* pso = this->GetOrCreateCinematicComputePipeline(deviceVoid, featureMask, false);
+    if (!pso) return false;
+    PerBlockData pbd = *static_cast<const PerBlockData*>(pbdVoid);
+    id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)uniformBufVoid;
+    id<MTLBuffer> rectBuf = this->RectCoordsBuffer ? (__bridge id<MTLBuffer>)this->RectCoordsBuffer : (__bridge id<MTLBuffer>)this->DummyRectCoordsBuffer;
+    const VolumeLightUniforms* lights = static_cast<const VolumeLightUniforms*>(lightUniformsVoid);
+    {
+      id<MTLComputeCommandEncoder> enc = [commandBuffer computeCommandEncoder];
+      enc.label = @"VTK Cinematic";
+      [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)pso];
+      [enc setTexture:accumCurr atIndex:4];
+      SetComputeTextureOrFallback(enc, 5, this->VolumeTexture, this->DummyVolumeTexture);
+      [enc setTexture:(__bridge id<MTLTexture>)this->ColorOpacityTexture atIndex:6];
+      SetComputeTextureOrFallback(enc, 7, this->ComponentTransferFunctionTexture1, this->ColorOpacityTexture);
+      SetComputeTextureOrFallback(enc, 8, this->ComponentTransferFunctionTexture2, this->ColorOpacityTexture);
+      SetComputeTextureOrFallback(enc, 9, this->ComponentTransferFunctionTexture3, this->ColorOpacityTexture);
+      SetComputeTextureOrFallback(enc, 10, this->Transfer2DTexture, this->ColorOpacityTexture);
+      SetComputeTextureOrFallback(enc, 11, this->Transfer2DYAxisTexture, this->DummyVolumeTexture);
+      SetComputeTextureOrFallback(enc, 12, this->GradientOpacityTexture, this->ColorOpacityTexture);
+      SetComputeTextureOrFallback(enc, 13, this->MaskTexture, this->DummyMaskTexture);
+      SetComputeTextureOrFallback(enc, 14, this->LabelMapTransferTexture, this->ColorOpacityTexture);
+      SetComputeTextureOrFallback(enc, 15, this->MinMaxTexture, this->DummyMinMaxTexture);
+      SetComputeTextureOrFallback(enc, 16, this->MinMaxBlockTexture, this->DummyMinMaxTexture);
+      SetComputeTextureOrFallback(enc, 17, this->MinMaxSuperTexture, this->DummyMinMaxTexture);
+      SetComputeTextureOrFallback(enc, 18, this->GradientNormalTexture, this->DummyVolumeTexture);
+      SetComputeTextureOrFallback(enc, 19, this->BlankingTexture, this->DummyVolumeTexture);
+      [enc setTexture:(__bridge id<MTLTexture>)(this->DepthTextureOcclusion?this->DepthTextureOcclusion:this->DummyDepthTexture) atIndex:20];
+      [enc setTexture:accumPrev atIndex:21];
+      [enc setBuffer:uniformBuf offset:0 atIndex:1];
+      [enc setBytes:&pbd length:sizeof(pbd) atIndex:2];
+      [enc setBuffer:rectBuf offset:0 atIndex:3];
+      [enc setBytes:lights length:sizeof(VolumeLightUniforms) atIndex:4];
+      MTLSize tg=MTLSizeMake(8,8,1);
+      MTLSize groups=MTLSizeMake((width+7)/8,(height+7)/8,1);
+      [enc dispatchThreadgroups:groups threadsPerThreadgroup:tg];
+      [enc endEncoding];
+    }
+    // Optional denoise — cached PSO (was recreated every frame; hitch)
+    if (this->CinematicDenoise > 0.01f && this->CinematicDenoiseTexture) {
+      id<MTLTexture> denoiseTex = (__bridge id<MTLTexture>)this->CinematicDenoiseTexture;
+      if (!this->CinematicDenoisePipeline) {
+        id<MTLLibrary> lib = (__bridge id<MTLLibrary>)this->CachedShaderLibrary;
+        id<MTLFunction> denoiseFn = [lib newFunctionWithName:@"volume_cinematic_denoise"];
+        if (denoiseFn) {
+          NSError* e=nil;
+          id<MTLComputePipelineState> dps=[device newComputePipelineStateWithFunction:denoiseFn error:&e];
+          [denoiseFn release];
+          if (dps) AssignMetalObject(this->CinematicDenoisePipeline, dps);
+          if (e) vtkErrorMacro("Denoise PSO: " << [[e localizedDescription] UTF8String]);
+        }
+      }
+      id<MTLComputePipelineState> dps = (__bridge id<MTLComputePipelineState>)this->CinematicDenoisePipeline;
+      if (dps) {
+        id<MTLComputeCommandEncoder> denEnc=[commandBuffer computeCommandEncoder];
+        denEnc.label=@"VTK Cinematic Denoise";
+        [denEnc setComputePipelineState:dps];
+        [denEnc setTexture:accumCurr atIndex:0];
+        [denEnc setTexture:denoiseTex atIndex:1];
+        float w = this->CinematicDenoise;
+        // 8-tap AO is stable at 1 spp; bilateral at 0.35 smears gyri into clay — 0 for single-frame stills
+        if (this->CinematicAccumCount < 4) w = 0.0f;
+        else w = std::min(w, 0.22f);
+        [denEnc setBytes:&w length:sizeof(w) atIndex:0];
+        MTLSize tg=MTLSizeMake(8,8,1);
+        MTLSize groups=MTLSizeMake((width+7)/8,(height+7)/8,1);
+        [denEnc dispatchThreadgroups:groups threadsPerThreadgroup:tg];
+        [denEnc endEncoding];
+        accumCurr = denoiseTex;
+      }
+    }
+    // Expose to Phase 3b blit
+    AssignRetainedMetalObject(this->ImageSampleColorTexture, accumCurr);
+    this->ImageSampleFBOWidth = width;
+    this->ImageSampleFBOHeight = height;
+    this->CinematicAccumValid = true;
+    return true;
+  }
+}
+
+//------------------------------------------------------------------------------
 void vtkMetalGPUVolumeRayCastMapper::BindEncoderResources(
   void* encoderVoid, void* uniformBufVoid, void* pipelineStateVoid, bool hasDepth)
 {
@@ -10072,8 +10372,10 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // Image-space downsampling requires offscreen rendering at reduced resolution.
   // Partitioned volumes no longer force offscreen rendering because grid traversal
   // composites correctly in a single pass.
+  // Cinematic writes ImageSampleColorTexture; Phase 3b only composites when useImageSampling is true,
+  // so ISD must be honored for cinematic as well (was && !CinematicRendering — made ISD 0.5 a no-op).
   const float imageSampleDist = this->ImageSampleDistance;
-  const bool useImageSampling = (imageSampleDist != 1.0f);
+  const bool useImageSampling = (imageSampleDist != 1.0f) || this->CinematicRendering;
 
   // Viewport size for depth texture UV computation in the shader. This must be
   // the tile-cropped renderer rect (GetTiledSizeAndOrigin, matching
@@ -10199,6 +10501,54 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   uniforms.RectCoordsBias[1] = this->RectCoordsBias[1];
   uniforms.RectCoordsBias[2] = this->RectCoordsBias[2];
   uniforms.RectCoordsBias[3] = 0.0f;
+
+  // Cinematic rendering uniforms (optimal compute variant — Woodcock/HG/NEE)
+  {
+    vtkVolumeProperty* cprop = vol->GetProperty();
+    uniforms.CinematicEnabled = this->CinematicRendering ? 1.0f : 0.0f;
+    uniforms.CinematicSamples = static_cast<uint32_t>(std::clamp(this->CinematicSamples, 1, 1024));
+    uniforms.CinematicMaxBounces = static_cast<uint32_t>(std::clamp(this->CinematicMaxBounces, 1, 8));
+    uniforms.CinematicScatteringAnisotropy = cprop ? cprop->GetScatteringAnisotropy() : 0.0f;
+    uniforms.CinematicReach = this->GlobalIlluminationReach;
+    uniforms.CinematicBlend = this->VolumetricScatteringBlending;
+    uniforms.CinematicDenoise = this->CinematicDenoise;
+    if (cprop) {
+      float sc[3]; cprop->GetSubsurfaceColor(sc);
+      uniforms.SubsurfaceColor[0]=sc[0]; uniforms.SubsurfaceColor[1]=sc[1]; uniforms.SubsurfaceColor[2]=sc[2];
+      uniforms.SubsurfaceStrength = cprop->GetSubsurfaceStrength();
+    } else {
+      uniforms.SubsurfaceColor[0]=1.0f; uniforms.SubsurfaceColor[1]=1.0f; uniforms.SubsurfaceColor[2]=1.0f;
+      uniforms.SubsurfaceStrength=0.0f;
+    }
+    // CinematicMajorantSigma reserved for future Woodcock path (1 spp DVR does not use it)
+    // Previous 256-bin histogram every frame was unread in shader (shader uses blend as sigma).
+    uniforms.CinematicMajorantSigma = 1e-4f;
+    bool cineReset = false;
+    double camMTime = ren->GetActiveCamera()->GetMTime();
+    double tfMTime = cprop ? cprop->GetMTime() : 0;
+    if (camMTime != this->CinematicLastCameraMTime) cineReset=true;
+    if (tfMTime != this->CinematicLastTransferMTime) cineReset=true;
+    if (this->VolumeUploadTime.GetMTime() != this->CinematicLastVolumeTime.GetMTime()) cineReset=true;
+    if (!this->CinematicRendering) cineReset=true;
+    if (cineReset) {
+      this->CinematicAccumCount = 0;
+      this->CinematicAccumValid = false;
+      this->CinematicLastCameraMTime = camMTime;
+      this->CinematicLastTransferMTime = tfMTime;
+      this->CinematicLastVolumeTime = this->VolumeUploadTime;
+    }
+    if (this->CinematicRendering) {
+      this->CinematicAccumCount = std::min<uint32_t>(this->CinematicAccumCount + 1, static_cast<uint32_t>(this->CinematicSamples));
+      uniforms.CinematicAccumCount = this->CinematicAccumCount;
+      uniforms.CinematicFrameSeed = this->CinematicFrameSeed++;
+    } else {
+      uniforms.CinematicAccumCount = 0;
+      uniforms.CinematicFrameSeed = 0;
+    }
+    uniforms._padCinematic = 0.0f;
+    uniforms._padCinematicEnd[0]=0.0f; uniforms._padCinematicEnd[1]=0.0f; uniforms._padCinematicEnd[2]=0.0f;
+    // Do not override user CinematicBlend — shader uses it as AO sigma (max(blend,1.0)).
+  }
 
   // Wait for the uniform buffer slot for this frame to be free
   dispatch_semaphore_wait((dispatch_semaphore_t)this->FrameSemaphore, DISPATCH_TIME_FOREVER);
@@ -10429,7 +10779,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     this->DrawBlocks(rttEnc, uniformBuf, ren, vol, &uniforms, invModelMatrix);
     [rttEnc endEncoding];
   }
-  else if (useImageSampling)
+  else if (useImageSampling && !this->CinematicRendering)
   {
     // Image-space downsampling: render to offscreen texture at reduced resolution,
     // then blit to screen. This cuts fragment count by up to 4x at 0.5x scale.
@@ -10635,7 +10985,20 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         return -1;
       }();
 
-      if (numSlabs > 1)
+      // Cinematic rendering — optimal compute variant (binned Woodcock/HG/NEE + temporal/denoise)
+        if (this->CinematicRendering && !selectionRender && !usePartitions && !cameraInside) {
+          // End current encoder for compute dispatch (same precedent as slab/compute paths)
+          id<MTLRenderCommandEncoder> curEnc = (__bridge id<MTLRenderCommandEncoder>)metalRenderWindow->GetCurrentRenderCommandEncoder();
+          if (curEnc) { [curEnc endEncoding]; metalRenderWindow->SetCurrentRenderCommandEncoder(nullptr); }
+          PerBlockData cinePbd; this->BuildPerBlockData(cinePbd, &uniforms);
+          if (!this->DispatchCinematicCompute((__bridge void*)device, (__bridge void*)queue, (__bridge void*)commandBuffer,
+                ren, vol, (__bridge void*)uniformBuf, &cinePbd, &lightUniforms, renderWidth, renderHeight)) {
+            // Fallback to single-pass fragment if cinematic dispatch fails
+            this->BindEncoderResources(encoder, uniformBuf, directPso, true);
+            for (int s = numSlabs - 1; s >= 0; --s) { this->DrawBlocks(encoder, uniformBuf, ren, vol, &uniforms, invModelMatrix, s, numSlabs); }
+          }
+          return;
+        } else if (numSlabs > 1)
       {
         // Ping-pong offscreen path. End the renderer's active encoder (the
         // image-sample path precedent; the renderer's Phase 3b re-opens a pass

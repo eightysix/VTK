@@ -289,6 +289,26 @@ public:
 
   ///@{
   /**
+   * Cinematic rendering — shaded DVR (wax) variant, 1 spp front-to-back
+   * over with first-surface AO (outward +N) and thickness (inward -N),
+   * subtle SSS and premul over black. Default off. Samples/Bounces/
+   * Denoise are reserved for a future path-traced variant and do not
+   * affect the current DVR integrator (cine_accum mixes toward 1 spp;
+   * Denoise is disabled at <4 spp).
+   */
+  vtkSetMacro(CinematicRendering, bool);
+  vtkGetMacro(CinematicRendering, bool);
+  vtkBooleanMacro(CinematicRendering, bool);
+  vtkSetClampMacro(CinematicSamples, int, 1, 1024);
+  vtkGetMacro(CinematicSamples, int);
+  vtkSetClampMacro(CinematicMaxBounces, int, 1, 8);
+  vtkGetMacro(CinematicMaxBounces, int);
+  vtkSetClampMacro(CinematicDenoise, float, 0.0f, 1.0f);
+  vtkGetMacro(CinematicDenoise, float);
+  ///@}
+
+  ///@{
+  /**
    * Enable or disable setting output of volume rendering to be
    * color and depth textures. By default this is set to 0 (off).
    * It should be noted that it is possible that underlying API specific
@@ -547,6 +567,12 @@ protected:
   float GlobalIlluminationReach = 0.0;
 
   float VolumetricScatteringBlending = 0.0;
+
+  // Cinematic — shaded DVR 1 spp (see above); Samples/Bounces/Denoise reserved
+  bool CinematicRendering = false;
+  int CinematicSamples = 64;
+  int CinematicMaxBounces = 4;
+  float CinematicDenoise = 0.0f;
 
   // Enable / disable two pass rendering
   vtkTypeBool UseDepthPass;

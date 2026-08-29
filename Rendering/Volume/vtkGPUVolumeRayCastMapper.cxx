@@ -612,6 +612,10 @@ void vtkGPUVolumeRayCastMapper::PrintSelf(ostream& os, vtkIndent indent)
   os << indent << "MaxMemoryInBytes: " << this->MaxMemoryInBytes << endl;
   os << indent << "MaxMemoryFraction: " << this->MaxMemoryFraction << endl;
   os << indent << "ReportProgress: " << this->ReportProgress << endl;
+  os << indent << "CinematicRendering: " << this->CinematicRendering << endl;
+  os << indent << "CinematicSamples: " << this->CinematicSamples << endl;
+  os << indent << "CinematicMaxBounces: " << this->CinematicMaxBounces << endl;
+  os << indent << "CinematicDenoise: " << this->CinematicDenoise << endl;
 }
 
 //------------------------------------------------------------------------------

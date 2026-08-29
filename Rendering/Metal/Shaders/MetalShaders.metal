@@ -2826,6 +2826,9 @@ constant bool fc_dense [[function_constant(48)]];
 constant bool fc_volumeNearestCoarse [[function_constant(49)]];
 // Quad-coop grad §13.5: 4 sC share 24->4 fetches via quad_shuffle, ~30% SD0.5 thr0 if pos+dx coherence
 constant bool fc_quadGrad [[function_constant(51)]];
+// Cinematic rendering — optimal compute variant (Woodcock/HG/NEE + binned + temporal)
+constant bool fc_cinematic [[function_constant(52)]];
+constant bool fc_denoise [[function_constant(53)]];
 
   // §38.17 segment consume for the COMPUTE marcher (VTK_METAL_TEST_MM_SEG):
 // mirrors the fragment engine's fc_segHop — per-ray skip gaps precomputed by
@@ -3070,6 +3073,23 @@ struct VolumeMapperUniforms {
   // that terminates the march, replacing the legacy 8-bit latch (1 - 1/255).
   // Read once per fragment; only meaningful when fc_exitTheta is true.
   float exitAlpha;
+  // Cinematic rendering (optimal compute) — must match C++ VolumeMapperUniforms tail
+  uint cinematicSamples;
+  uint cinematicMaxBounces;
+  float cinematicScatteringAnisotropy;
+  float cinematicReach;
+  float cinematicBlend;
+  float cinematicDenoise;
+  float subsurfaceColorR;
+  float subsurfaceColorG;
+  float subsurfaceColorB;
+  float subsurfaceStrength;
+  uint cinematicFrameSeed;
+  uint cinematicAccumCount;
+  float cinematicMajorantSigma;
+  float _padCinematic;
+  float cinematicEnabled;
+  float _padCinematicEnd[3];
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -9480,6 +9500,265 @@ kernel void volume_compute_march_binned(
       false);
 
   outColorTexture.write(color, uv);
+}
+
+// =============================================================================
+// Cinematic rendering — shaded DVR cinematic (wax AO+SSS, front-to-back over)
+// First-surface wrap/AO/SSS + premul over black, HG phase on headlight.
+// Reserved: cinematicSamples / cinematicMaxBounces / cinematicMajorantSigma
+// (majorant/bounces unused at 1 spp). No delta-tracking at 1 spp.
+// =============================================================================
+// Hash-based RNG (xorshift) — cheap, no texture fetch, coherent in 8x8 tiles.
+inline uint cinematic_hash(uint x) {
+  x ^= x >> 16; x *= 0x7feb352d;
+  x ^= x >> 15; x *= 0x846ca68b;
+  x ^= x >> 16;
+  return x;
+}
+inline float cinematic_rand(thread uint &s) {
+  s = cinematic_hash(s);
+  return float(s & 0x00FFFFFF) / 16777216.0;
+}
+inline float sample_opacity(texture3d<float> vol, texture2d<float> tf, float3 p, half scale, half bias) {
+  if (any(p < 0.0) || any(p > 1.0)) return 0.0;
+  float s = sampleVolumeScalar(vol, p);
+  half n = saturate(half(s) * scale + bias);
+  return float(sampleTransferFunction(tf, float2(float(n), 0.5)).a);
+}
+inline float optical_depth(texture3d<float> vol, texture2d<float> tf, float3 origin, float3 dir, float maxT, int nSteps, half scale, half bias, float sigmaScale) {
+  float dt = maxT / float(nSteps);
+  float tau = 0.0;
+  float3 p = origin + dir * (0.5 * dt);
+  for (int i=0;i<nSteps;++i) {
+    float a = sample_opacity(vol, tf, p, scale, bias);
+    tau += a * dt * sigmaScale;
+    if (tau > 6.0) break;
+    p += dir * dt;
+  }
+  return tau;
+}
+inline float3 cinematic_onb_n(float3 n, float phi, float cosT)
+{
+  float sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
+  float3 up = fabs(n.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
+  float3 t = normalize(cross(up, n));
+  float3 b = cross(n, t);
+  return normalize(t * cos(phi) * sinT + b * sin(phi) * sinT + n * cosT);
+}
+inline half4 cine_accum(half4 curr, half4 prev, uint n) {
+  if (n <= 1) return curr;
+  float a = 1.0 / float(min(n, 16u));
+  if (curr.a < 0.01h && prev.a > 0.01h) return prev;
+  return mix(prev, curr, half(a));
+}
+inline half4 cinematic_march_core(
+    float3 evalPoint, int maxSteps, float3 evalStep, float stepSize, float3 rayDir,
+    float tTerminateMax,
+    constant VolumeMapperUniforms& u, constant PerBlockData& b,
+    texture3d<float> volumeTexture, texture2d<float> transferFunctionTexture,
+    texture2d<float> transferFunctionTexture1, texture2d<float> transferFunctionTexture2,
+    texture2d<float> transferFunctionTexture3, texture2d<float> transferFunction2DTexture,
+    texture3d<float> transfer2DYAxisTexture, texture2d<float> gradientOpacityTexture,
+    texture3d<float> maskTexture, texture2d<float> labelMapTransferTexture,
+    texture3d<float> minMaxTexture, texture3d<float> minMaxBlockTexture,
+    texture3d<float> minMaxSuperTexture, texture3d<float> normalTexture,
+    texture3d<float> blankingTexture, constant packed_float3* rectCoords,
+    constant VolumeLightUniforms* lightUniforms, uint frameSeed, uint2 gid)
+{
+  if (u.cinematicEnabled < 0.5) {
+    return marchRayFromAtlasCore(evalPoint, maxSteps, evalStep, stepSize, rayDir, tTerminateMax,
+      u, b, volumeTexture, transferFunctionTexture, transferFunctionTexture1,
+      transferFunctionTexture2, transferFunctionTexture3, transferFunction2DTexture,
+      transfer2DYAxisTexture, gradientOpacityTexture, maskTexture, labelMapTransferTexture,
+      minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, normalTexture, blankingTexture,
+      rectCoords, lightUniforms, 16, nullptr, nullptr, nullptr, false);
+  }
+
+  half scalarScale = half(1.0 / max((u.scalarMax - u.scalarMin), 1e-4h));
+  half scalarBias  = half(-u.scalarMin) * scalarScale;
+  float ss = clamp(u.subsurfaceStrength, 0.0, 1.0);
+  float3 ssColor = saturate(float3(u.subsurfaceColorR, u.subsurfaceColorG, u.subsurfaceColorB));
+  float reach = clamp(u.cinematicReach, 0.0, 1.0);
+
+  // View-space key ~40° off view, fill opposite dim — flash (L=V) made every facing gyrus same value
+  float3 V = -normalize(rayDir);
+  float3 L     = cinematic_onb_n(V, 0.40, 0.72);
+  float3 Lfill = cinematic_onb_n(V, 3.70, 0.48);
+
+  float3 gs = b.gradientStep.xyz * 1.5; // 1.0 grain, 2.0 melts sulci
+
+  // Hoisted voxel units (was rebuilt inside hit test every ray)
+  float voxel  = max(length(b.gradientStep.xyz), 1e-4);
+  float aoDist = mix(2.5, 8.0, reach) * voxel;   // 2.5–8 voxels
+  float sigma  = max(u.cinematicBlend, 1.0);
+  float k      = 1.0 / voxel; // UV → voxel: one voxel ≈ a*sigma
+
+  uint seed = cinematic_hash(gid.x * 1973u + gid.y * 9277u + frameSeed);
+  float j = (u.cinematicAccumCount <= 1) ? 0.35 : 1.0; // stills: 0.35 grain, temporal: 1.0
+  float3 cur = evalPoint + evalStep * (cinematic_rand(seed) * j);
+
+  float aAccum = 0.0;
+  float3 colAccum = float3(0.0);
+  int steps = min(maxSteps, 1024);
+
+  bool haveSurface = false;
+  float ao = 1.0;
+  float thick = 1.0;
+
+  for (int i = 0; i < steps; ++i) {
+    if (any(cur < 0.0 || cur > 1.0)) break;
+
+    float s = sampleVolumeScalar(volumeTexture, cur);
+    half nrm = saturate(half(s) * scalarScale + scalarBias);
+    half4 tf = sampleTransferFunction(transferFunctionTexture, float2(float(nrm), 0.5));
+    float a = float(tf.a);
+    if (a < 0.035) { cur += evalStep; continue; }
+
+    float3 grad = float3(
+      sampleVolumeScalar(volumeTexture, cur + float3(gs.x, 0, 0)) -
+      sampleVolumeScalar(volumeTexture, cur - float3(gs.x, 0, 0)),
+      sampleVolumeScalar(volumeTexture, cur + float3(0, gs.y, 0)) -
+      sampleVolumeScalar(volumeTexture, cur - float3(0, gs.y, 0)),
+      sampleVolumeScalar(volumeTexture, cur + float3(0, 0, gs.z)) -
+      sampleVolumeScalar(volumeTexture, cur - float3(0, 0, gs.z)));
+    float glen = length(grad);
+    float gmag = saturate((glen - 0.018) * 5.5);
+    // Do not shade samples that never became a surface (cheaper than bilateral)
+    if (!haveSurface && gmag < 0.22) { cur += evalStep; continue; }
+    if (gmag < 0.14 && a < 0.20) { cur += evalStep; continue; } // MRI air
+
+    float3 N = (glen > 1e-6) ? normalize(-grad) : V;
+    if (dot(N, V) < 0.0) N = -N;
+
+    // First surface: AO outward (+N = cavity), SSS inward (-N = thickness) — start one voxel off surface
+    if (!haveSurface && aAccum + a > 0.18 && gmag > 0.15) {
+      float tauAO = optical_depth(volumeTexture, transferFunctionTexture,
+                                  cur + N * voxel, N,  aoDist,       6, scalarScale, scalarBias, sigma);
+      float tauSS = optical_depth(volumeTexture, transferFunctionTexture,
+                                  cur - N * voxel, -N, aoDist * 1.8, 6, scalarScale, scalarBias, sigma);
+      ao    = saturate(exp(-tauAO * k * 0.55));
+      thick = saturate(exp(-tauSS * k * 0.35));   // 1 = thin leaf, 0 = deep tissue
+      haveSurface = true;
+    }
+
+    float ndl  = dot(N, L);
+    float ndlF = dot(N, Lfill);
+    float wrap = pow(saturate((ndl  + 0.22) / 1.22), 1.20); // less wrap = dark side from geometry
+    float fill = pow(saturate((ndlF + 0.50) / 1.50), 1.10) * 0.18;
+    float shade = mix(0.10, saturate(wrap + fill), gmag) * mix(0.42, 1.0, ao);
+
+    // Pigment: TF owns value, ssColor owns SSS only — 0.72 peak on white TF, not rust
+    float3 albedo = float3(tf.rgb) * 0.72;
+    albedo *= mix(0.88, 1.0, gmag);                 // interior dull
+
+    float side    = saturate(1.0 - abs(ndl));
+    float wrapSSS = pow(saturate((-ndl + 0.45) / 1.45), 1.3);
+    float3 sss = ssColor * ss * gmag
+               * (0.14 * side + 0.40 * wrapSSS)
+               * mix(0.15, 1.0, thick);                // warm thin only
+
+    float3 H = normalize(L + V);
+    float ndh  = saturate(dot(N, H));
+    float spec = pow(ndh, 64.0) * gmag * gmag * 0.035; // sheen, off-view with offset L
+    spec *= mix(0.15, 1.0, ao);                        // no sparkle in cavities
+    if (!haveSurface) spec = 0.0;
+
+    // Wire ambient/diffuse if available, else fixed wax 0.16/0.84 (AO provides dark, not ambient)
+    float amb  = 0.16;
+    float diff = 0.84;
+    float3 sCol = saturate(albedo * (amb + diff * shade) + sss + spec);
+
+    float w = (1.0 - aAccum) * a;
+    colAccum += sCol * w;
+    aAccum   += w;
+    if (aAccum > 0.97) break;
+    cur += evalStep;
+  }
+
+  if (aAccum < 0.035) return half4(0.0h);
+  // Premul over black. No Reinhard — wax already sits under 1 (peak ~0.6-0.7). Delete shoulder.
+  return half4(half3(clamp(colAccum, 0.0, 1.0)), half(saturate(aAccum)));
+}
+
+kernel void volume_compute_march_cinematic(
+    texture2d<half, access::write> outColorTexture [[texture(4)]],
+    constant VolumeMapperUniforms& volumeUniforms [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(5)]],
+    texture2d<float> transferFunctionTexture [[texture(6)]],
+    texture2d<float> transferFunctionTexture1 [[texture(7)]],
+    texture2d<float> transferFunctionTexture2 [[texture(8)]],
+    texture2d<float> transferFunctionTexture3 [[texture(9)]],
+    texture2d<float> transferFunction2DTexture [[texture(10)]],
+    texture3d<float> transfer2DYAxisTexture [[texture(11)]],
+    texture2d<float> gradientOpacityTexture [[texture(12)]],
+    texture3d<float> maskTexture [[texture(13)]],
+    texture2d<float> labelMapTransferTexture [[texture(14)]],
+    texture3d<float> minMaxTexture [[texture(15)]],
+    texture3d<float> minMaxBlockTexture [[texture(16)]],
+    texture3d<float> minMaxSuperTexture [[texture(17)]],
+    texture3d<float> normalTexture [[texture(18)]],
+    texture3d<float> blankingTexture [[texture(19)]],
+    constant packed_float3* rectCoords [[buffer(3)]],
+    constant VolumeLightUniforms& volumeLights [[buffer(4)]],
+    texture2d<float> depthSynthTexture [[texture(20)]],
+    texture2d<half, access::read> accumPrevTexture [[texture(21)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  if (gid.x >= uint(volumeUniforms.viewportSize.x) || gid.y >= uint(volumeUniforms.viewportSize.y)) return;
+  if (volumeUniforms.cinematicEnabled < 0.5) { outColorTexture.write(half4(0.0h), gid); return; }
+  SynthRay so;
+  if (!synthesizeAtlasRay(gid, volumeUniforms, b, volumeTexture, depthSynthTexture, so)) {
+    half4 prev = half4(0.0h);
+    if (volumeUniforms.cinematicAccumCount > 1) prev = accumPrevTexture.read(gid);
+    half4 curr = half4(0.0h,0.0h,0.0h,0.0h);
+    outColorTexture.write(cine_accum(curr, prev, volumeUniforms.cinematicAccumCount), gid);
+    return;
+  }
+  half4 curr = cinematic_march_core(so.evalPoint, so.steps, so.evalStep, so.stepSize, so.rayDir, so.tTerminateMax,
+    volumeUniforms, b, volumeTexture, transferFunctionTexture, transferFunctionTexture1, transferFunctionTexture2, transferFunctionTexture3, transferFunction2DTexture, transfer2DYAxisTexture, gradientOpacityTexture, maskTexture, labelMapTransferTexture, minMaxTexture, minMaxBlockTexture, minMaxSuperTexture, normalTexture, blankingTexture, rectCoords, &volumeLights, volumeUniforms.cinematicFrameSeed, gid);
+  half4 prev = half4(0.0h);
+  if (volumeUniforms.cinematicAccumCount > 1) prev = accumPrevTexture.read(gid);
+  outColorTexture.write(cine_accum(curr, prev, volumeUniforms.cinematicAccumCount), gid);
+}
+
+// Edge-aware 5x5 bilateral denoise for cinematic (removes Image1 grain while keeping sulci edges).
+kernel void volume_cinematic_denoise(
+    texture2d<half, access::read> inTexture [[texture(0)]],
+    texture2d<half, access::write> outTexture [[texture(1)]],
+    constant float& denoiseWeight [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  if (gid.x >= inTexture.get_width() || gid.y >= inTexture.get_height()) return;
+  half4 c0 = inTexture.read(gid);
+  // Transparent background stays transparent
+  if (c0.a < 0.01h) { outTexture.write(c0, gid); return; }
+  half4 sum = c0;
+  float sumW = 1.0;
+  // 5x5 window, skip center
+  for (int dy=-2; dy<=2; ++dy) {
+    for (int dx=-2; dx<=2; ++dx) {
+      if (dx==0 && dy==0) continue;
+      int2 p = int2(gid) + int2(dx,dy);
+      if (p.x <0 || p.y<0 || p.x >= int(inTexture.get_width()) || p.y >= int(inTexture.get_height())) continue;
+      half4 n = inTexture.read(uint2(p));
+      float colorDist = length(float3(n.rgb - c0.rgb));
+      // Bilateral: color sigma ~0.25 (exp -dist*4), spatial weight by radius
+      float spatialW = (abs(dx)+abs(dy) <=1) ? 1.0 : (abs(dx)<=1 && abs(dy)<=1 ? 0.55 : 0.30);
+      float w = exp(-colorDist * 4.0) * spatialW;
+      // Don't blur across strong opacity edges (keep sulci crisp)
+      float alphaDist = fabs(float(n.a - c0.a));
+      w *= exp(-alphaDist * 6.0);
+      sum += n * half(w);
+      sumW += w;
+    }
+  }
+  half4 blurred = sum / half(sumW);
+  half t = half(clamp(denoiseWeight, 0.0, 1.0));
+  half4 out = mix(c0, blurred, t);
+  // Preserve solid alpha
+  out.a = c0.a;
+  outTexture.write(out, gid);
 }
 
 kernel void volume_compute_minmax(

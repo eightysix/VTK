@@ -439,6 +439,18 @@ public:
   vtkGetMacro(ScatteringAnisotropy, float);
   ///@}
 
+  ///@{
+  /**
+   * Subsurface scattering tint and strength for cinematic rendering.
+   * SubsurfaceColor tints forward-scattered light; strength blends
+   * between surface and volumetric scattering. Default 0 disables.
+   */
+  vtkSetVector3Macro(SubsurfaceColor, float);
+  vtkGetVectorMacro(SubsurfaceColor, float, 3);
+  vtkSetClampMacro(SubsurfaceStrength, float, 0.0f, 1.0f);
+  vtkGetMacro(SubsurfaceStrength, float);
+  ///@}
+
   /**
    * WARNING: INTERNAL METHOD - NOT INTENDED FOR GENERAL USE
    * UpdateMTimes performs a Modified() on all TimeStamps.
@@ -578,6 +590,11 @@ protected:
   int InterpolationType;
 
   float ScatteringAnisotropy = 0.0;
+
+  // Cinematic SSS — neutral default (1,1,1) so every volume is not brain-tinted.
+  // Tests set the wax pink 0.89/0.73/0.68 explicitly.
+  float SubsurfaceColor[3] = { 1.0f, 1.0f, 1.0f };
+  float SubsurfaceStrength = 0.0f;
 
   int ColorChannels[VTK_MAX_VRCOMP];
 

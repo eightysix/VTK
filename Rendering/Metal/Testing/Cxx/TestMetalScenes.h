@@ -1652,6 +1652,45 @@ inline void BuildNIFTIVolumeScene(vtkRenderer* renderer, BackendKind b)
       metal->SetUseGPUMinMax(TempMinMax());
       metal->SetUseMinMaxAcceleration(TempMinMaxAccel());
       metal->SetDisableInstanceRendering(true);
+      // Cinematic — shaded DVR (wax AO+SSS, front-to-back over, 1 spp). No Woodcock at 1 spp.
+      // Enabled via VTK_METAL_TEST_CINEMATIC=1 for visual review.
+      // This block overrides sampling so the default env (SD0.5/ISD1.0) grain/stripes go away.
+      if (const char* cine = std::getenv("VTK_METAL_TEST_CINEMATIC"))
+      {
+        if (std::atoi(cine) != 0)
+        {
+          metal->SetCinematicRendering(true);
+          metal->SetCinematicSamples(1);
+          metal->SetCinematicMaxBounces(1);
+          metal->SetCinematicDenoise(0.0f);
+          metal->SetGlobalIlluminationReach(0.45f);
+          metal->SetVolumetricScatteringBlending(1.15f); // AO sigma via max(blend,1.0)
+          metal->SetPreferHalfPrecision(false);
+          property->SetScatteringAnisotropy(0.0f); // g=0 until real light; headlight HG only brightens facing voxels
+          property->SetSubsurfaceColor(0.86, 0.52, 0.45);
+          property->SetSubsurfaceStrength(0.45f);
+          // Ambient/Diffuse/Specular are no-ops in cinematic shaded DVR (shader uses fixed wax terms; AO does dark)
+          property->SetAmbient(0.12);
+          property->SetDiffuse(0.60);
+          property->SetSpecular(0.05);
+          property->SetSpecularPower(48.0);
+          mapper->SetSampleDistance(0.28);
+          mapper->SetImageSampleDistance(1.0);
+          metal->SetUseIGNJitter(false);
+          metal->SetJitterBlockSize(1);
+          metal->SetUseGPUMinMax(true);
+          metal->SetUseMinMaxAcceleration(true);
+          opacity->RemoveAllPoints();
+          opacity->AddPoint(rescale(12.0), 0.0);
+          opacity->AddPoint(rescale(16.0), 0.0);
+          opacity->AddPoint(rescale(20.0), 0.10);
+          opacity->AddPoint(rescale(26.0), 0.55);
+          opacity->AddPoint(rescale(34.0), 0.95);
+          opacity->AddPoint(rescale(45.0), 1.0);
+          property->SetInterpolationTypeToLinear();
+          // Warmer cortex already in color TF (1.0/1.0/0.78 at top), keep it
+        }
+      }
     }
   }
 

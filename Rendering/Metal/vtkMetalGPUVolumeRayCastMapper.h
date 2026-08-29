@@ -89,6 +89,8 @@ struct VolumePipelineKeyHash
 // Feature flags for volume shader specialization via function constants.
 // Each flag enables a corresponding [[function_constant(n)]] in the Metal
 // shader, allowing the compiler to eliminate dead code paths.
+// Cinematic: VolumeFeature_Cinematic=1u<<30 (fc_cinematic 52) VolumeFeature_Denoise=1u<<29 (fc_denoise 53) — stored in featureMaskExtra bits 22/23 (all 32 featureMask bits used by VolRg8/Transposed).
+// CinematicUniforms {uint samples,bounces; float g,reach,blend; float3 subsurface;} extends VolumeMapperUniforms:35/PerBlockData:34 (WAX brain g 0.42, Reach 0.85, Blend 1.4, 64spp, 4 bounces, denoise)
 enum VolumeShaderFeatureFlags : uint32_t
 {
   VolumeFeature_Shading        = 1u << 0,
@@ -177,6 +179,13 @@ enum VolumeShaderFeatureFlags : uint32_t
   // VolumeFeature_VolRg8 (pair indexing assumes the untransposed layout).
   VolumeFeature_VolTransposed = 1u << 31,
 };
+
+// Cinematic aliases for plan parity (real PSO bits are featureMaskExtra 22/23 -> fc_cinematic 52 / fc_denoise 53)
+static constexpr uint32_t VolumeFeature_Cinematic_PlanAlias = 1u << 30; // fc_cinematic
+static constexpr uint32_t VolumeFeature_Denoise_PlanAlias = 1u << 29; // fc_denoise
+// Real compute-coherent bits (optimal variant: binned 8x8, shared TF, MinMaxSuper skip, temporal 64spp)
+static constexpr uint32_t CinematicFeatureMaskExtra_Cinematic = 1u << 22;
+static constexpr uint32_t CinematicFeatureMaskExtra_Denoise = 1u << 23;
 
 VTK_ABI_NAMESPACE_BEGIN
 
@@ -382,6 +391,27 @@ private:
   std::unordered_map<VolumePipelineKey, void*, VolumePipelineKeyHash> ComputeMarchPipelineCache;
   std::unordered_map<VolumePipelineKey, void*, VolumePipelineKeyHash> ComputeMarchBinnedPipelineCache;
   void* ComputeMarchQueue = nullptr; // probe-selected fast-slot queue (§38.8)
+
+  // Cinematic — shaded DVR (wax AO/SSS, front-to-back over, 1 spp)
+  // Single compute variant; binned majorant path deleted (speckle at 1 spp).
+  // Reserved: CinematicComputeBinnedPipeline kept for ABI, unused (binned=false).
+  void* CinematicComputePipeline = nullptr; // volume_compute_march_cinematic
+  void* CinematicComputeBinnedPipeline = nullptr; // volume_compute_march_cinematic_binned (unused, binned=false)
+  std::unordered_map<VolumePipelineKey, void*, VolumePipelineKeyHash> CinematicComputePipelineCache;
+  std::unordered_map<VolumePipelineKey, void*, VolumePipelineKeyHash> CinematicComputeBinnedPipelineCache;
+  void* CinematicAccumTextureA = nullptr; // RGBA16Float ping-pong accumulation
+  void* CinematicAccumTextureB = nullptr;
+  int CinematicAccumWidth = 0;
+  int CinematicAccumHeight = 0;
+  uint32_t CinematicFrameSeed = 0;
+  uint32_t CinematicAccumCount = 0;
+  bool CinematicAccumValid = false;
+  double CinematicLastCameraMTime = 0;
+  double CinematicLastTransferMTime = 0;
+  vtkTimeStamp CinematicLastVolumeTime;
+  // Denoise via MPS (guided filter) when CinematicDenoise > 0
+  void* CinematicDenoiseTexture = nullptr; // intermediate for MPS
+  void* CinematicDenoisePipeline = nullptr; // cached pipeline for volume_cinematic_denoise
 
   void* DepthStencilState = nullptr;     // id<MTLDepthStencilState>
   void* DepthTextureOcclusion = nullptr; // id<MTLTexture> — scene depth for early ray termination
@@ -636,6 +666,13 @@ private:
   bool EnsureComputeMarchResources(void* device, void* mtlQueue, int width, int height);
   void* GetOrCreateComputeMarchPipeline(void* mtlDevice, uint32_t featureMask, bool binned);
   void BindComputeMarchTextures(void* encoder, void* atlasA, void* atlasB, void* atlasC, void* outColor);
+  // Cinematic — shaded DVR (wax AO/SSS, single 8x8, temporal, bilateral disabled at <4 spp)
+  bool EnsureCinematicResources(void* device, int width, int height);
+  void* GetOrCreateCinematicComputePipeline(void* mtlDevice, uint32_t featureMask, bool binned); // binned always false
+  void ReleaseCinematicResources();
+  bool DispatchCinematicCompute(void* device, void* queue, void* cmdBuf,
+    vtkRenderer* ren, vtkVolume* vol, void* uniformBuf, const void* pbd,
+    const void* lightUniforms, int width, int height);
   // §38.18.1: helper that releases all segment-pre-pass Private heaps and
   // invalidates the per-camera seg cache (called by PurgeCaches and
   // ReleaseGraphicsResources).

@@ -126,6 +126,12 @@ void vtkVolumeProperty::DeepCopy(vtkVolumeProperty* p)
   this->SetUseClippedVoxelIntensity(p->GetUseClippedVoxelIntensity());
   this->SetClippedVoxelIntensity(p->GetClippedVoxelIntensity());
 
+  this->SetScatteringAnisotropy(p->GetScatteringAnisotropy());
+  float sc[3];
+  p->GetSubsurfaceColor(sc);
+  this->SetSubsurfaceColor(sc);
+  this->SetSubsurfaceStrength(p->GetSubsurfaceStrength());
+
   for (int i = 0; i < VTK_MAX_VRCOMP; i++)
   {
     this->SetComponentWeight(i, p->GetComponentWeight(i));
@@ -916,6 +922,10 @@ void vtkVolumeProperty::PrintSelf(ostream& os, vtkIndent indent)
   os << indent
      << "Use Clipped Voxel Intensity: " << (this->UseClippedVoxelIntensity ? "On\n" : "Off\n");
   os << indent << "Clipped Voxel Intensity: " << this->GetClippedVoxelIntensity() << "\n";
+  os << indent << "ScatteringAnisotropy: " << this->ScatteringAnisotropy << "\n";
+  os << indent << "SubsurfaceColor: " << this->SubsurfaceColor[0] << " " << this->SubsurfaceColor[1]
+     << " " << this->SubsurfaceColor[2] << "\n";
+  os << indent << "SubsurfaceStrength: " << this->SubsurfaceStrength << "\n";
 
   for (int i = 0; i < VTK_MAX_VRCOMP; i++)
   {
