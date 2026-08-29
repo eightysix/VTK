@@ -164,3 +164,13 @@ Attempts on `e05a147fb5` `6-fetch` (checkouts, not resets):
 * `+0.5*stepSize` inside `ceil` `→` `2.83` worse than `+1`.
 
 `mv9` `48-wide` `tail 41%41` vs `DICOM 400` `16=2+9` spill remains. `mv0` `0.15` is the `6-fetch` scalar reference. Keep `6` `e05a147fb5` and document as open `mv9` far-edge `n>2` penalty, not `shade` `6→4`.
+
+```sh
+# repro for far edge missing sliver (mv9 only) at 512 y on e05a147fb5 6-fetch
+BIN=build_macos_metal/bin/vtkMetalGLVisualComparison
+BASE="VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1 VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y"
+eval "env $BASE $BIN --scene VolumeRayCast --frames 1 --size 512x512 --warmup 2 --out /tmp/vol_orig2 2>&1 | grep -E 'VolumeRayCast|worst'"
+# wth e05a147fb5 6-fetch: VolumeRayCast 512 y thr 3.32 vs mv0 thr 0.15 (no y 0.15), DICOM 0.000, NIFTI 2.93
+# 8a8052494b +1: 2.26, per-sample t check still 3.32, +0.5*stepSize 2.83 — all checkouts, not resets
+# blue cube bottom/right thin strip missing in MTL vs GL as in your two images
+```
