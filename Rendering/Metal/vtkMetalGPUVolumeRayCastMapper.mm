@@ -7978,6 +7978,11 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
         VolumeSegWanted() && !VolumeSegConsumeSuppressed() &&
         this->SegBuildComputePipeline != nullptr &&
         this->SegAtlasATexture != nullptr) ? 16u : 0u) |
+      // SD-aware batch cap — bit 32 (fc_fineSD): fine SD <1.5 → shade cap 2 vs 4
+      ((this->SampleDistance < 1.5f) ? 32u : 0u) |
+      // Grad variants — bit 128 (fc_grad4) and 512 (fc_gradNearest)
+      ((std::getenv("VTK_METAL_TEST_GRAD4") != nullptr) ? 128u : 0u) |
+      ((std::getenv("VTK_METAL_TEST_GRAD_NEAREST") != nullptr) ? 512u : 0u) |
       // §38 TF-adaptive exit threshold — bit 64 (fc_exitTheta): pipelines
       // with a uniform-supplied saturation exit must not share with the
       // legacy-latch ones.
@@ -8186,6 +8191,12 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     [constants setConstantValue:&grad4 type:MTLDataTypeBool withName:@"fc_grad4"];
     BOOL gradFloat = (std::getenv("VTK_METAL_TEST_GRAD_FLOAT") != nullptr) ? YES : NO;
     [constants setConstantValue:&gradFloat type:MTLDataTypeBool withName:@"fc_gradFloat"];
+    // SD-aware batch cap / grad: fine SD <0.75 world units → shade cap 2 vs 4 and 4-fetch grad
+    // Threshold 0.75 separates fine (0.5) from coarse (4) and excludes default VolumeRayCast (1.0) to keep thr 0.18
+    BOOL fineSD = (this->SampleDistance < 0.75f) ? YES : NO;
+    [constants setConstantValue:&fineSD type:MTLDataTypeBool withName:@"fc_fineSD"];
+    BOOL gradNearest = (std::getenv("VTK_METAL_TEST_GRAD_NEAREST") != nullptr) ? YES : NO;
+    [constants setConstantValue:&gradNearest type:MTLDataTypeBool withName:@"fc_gradNearest"];
 
     // §38.15/38.16 block-summary tap bisects (fc_mmNoTap / fc_mmRead).
 

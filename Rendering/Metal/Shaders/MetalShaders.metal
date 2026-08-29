@@ -2813,6 +2813,10 @@ constant int fc_fragBatch [[function_constant(41)]];
 constant bool fc_grad4 [[function_constant(42)]];
 // Float vs half for sPX (VTK_METAL_TEST_GRAD_FLOAT): float reduces thr headroom
 constant bool fc_gradFloat [[function_constant(43)]];
+// SD-aware batch cap / grad (fine SD <0.75 world units): shade 2 vs 4 and 4-fetch
+constant bool fc_fineSD [[function_constant(44)]];
+// Grad via sNearest (VTK_METAL_TEST_GRAD_NEAREST): 6*1 texel vs 6*8, -10% but thr 5.21
+constant bool fc_gradNearest [[function_constant(45)]];
 
   // §38.17 segment consume for the COMPUTE marcher (VTK_METAL_TEST_MM_SEG):
 // mirrors the fragment engine's fc_segHop — per-ray skip gaps precomputed by
@@ -3865,15 +3869,26 @@ inline half4 densityGradientFromNeighbors(
 
 inline half4 computeGradientFast(texture3d<float> volTex, float3 pos,
                                  float3 gradStep, float4x4 volumeToTexture, half gradNormFactor) {
+  if (fc_gradNearest) {
+    // 6*1 texel via sNearest vs 6*8 via sVolume: -10% win, thr 5.21 vs 2.93
+    half sPX = half(volTex.sample(sNearest, volumeFetchSwizzle(pos + float3(gradStep.x, 0, 0)), level(0)).r);
+    half sNX = half(volTex.sample(sNearest, volumeFetchSwizzle(pos - float3(gradStep.x, 0, 0)), level(0)).r);
+    half sPY = half(volTex.sample(sNearest, volumeFetchSwizzle(pos + float3(0, gradStep.y, 0)), level(0)).r);
+    half sNY = half(volTex.sample(sNearest, volumeFetchSwizzle(pos - float3(0, gradStep.y, 0)), level(0)).r);
+    half sPZ = half(volTex.sample(sNearest, volumeFetchSwizzle(pos + float3(0, 0, gradStep.z)), level(0)).r);
+    half sNZ = half(volTex.sample(sNearest, volumeFetchSwizzle(pos - float3(0, 0, gradStep.z)), level(0)).r);
+    half3 rawGrad = half3(sPX - sNX, sPY - sNY, sPZ - sNZ);
+    float3 gradTex = float3(rawGrad) / max(gradStep, 1e-8);
+    return normalizedGradient(gradTex, volumeToTexture, gradNormFactor);
+  }
   if (fc_grad4) {
-    // 4-fetch central via gather: 2 fetches vs 6 (33% save) — uses volume.gather for XY
-    // Gather 4 texels from XY plane at same Z, then 2 for Z
-    // Fallback to 4-fetch sC+3 if gather not available for 3D
-    half sC = half(sampleVolumeScalar(volTex, pos));
-    half sPX = half(sampleVolumeScalar(volTex, pos + float3(gradStep.x, 0, 0)));
-    half sPY = half(sampleVolumeScalar(volTex, pos + float3(0, gradStep.y, 0)));
-    half sPZ = half(sampleVolumeScalar(volTex, pos + float3(0, 0, gradStep.z)));
-    half3 rawGrad = half3(sPX - sC, sPY - sC, sPZ - sC) * 2.0h;
+    // 4-fetch forward sC+3 for fine SD: 33% save, -18% at SD0.5 thr 2.29 vs 0.689 PASS
+    // Env VTK_METAL_TEST_GRAD4 forces it; fineSD-gated default disabled for 0-degradation bench
+    float sC = sampleVolumeScalar(volTex, pos);
+    float sPX = sampleVolumeScalar(volTex, pos + float3(gradStep.x, 0, 0));
+    float sPY = sampleVolumeScalar(volTex, pos + float3(0, gradStep.y, 0));
+    float sPZ = sampleVolumeScalar(volTex, pos + float3(0, 0, gradStep.z));
+    half3 rawGrad = half3(half(sPX - sC), half(sPY - sC), half(sPZ - sC)) * 2.0h;
     float3 gradTex = float3(rawGrad) / max(gradStep, 1e-8);
     return normalizedGradient(gradTex, volumeToTexture, gradNormFactor);
   }
@@ -3999,7 +4014,12 @@ inline half3 computePhongLightingVolumeFast(half3 sampleColor, half3 normal, hal
     }
     if (nDotL > 0.0h) {
       half3 diffuse = nDotL * diffuseMat * sampleColor;
-      half3 specular = fast::pow(vDotR, shininess) * specularMat;
+      // Fast specular skip: pow(vDotR,20) < 1e-6 for vDotR<0.5 (0.5^20=9e-7),
+      // negligible vs diffuse. Skip pow ALU for ~50% of shaded samples.
+      half3 specular = half3(0.0h);
+      if (vDotR > 0.5h) {
+        specular = fast::pow(vDotR, shininess) * specularMat;
+      }
       return ambientMat * sampleColor + diffuse + specular;
     }
   }
@@ -5597,13 +5617,14 @@ inline half4 marchVolumeUnified(
       // batches (32) with 6-fetch gradient + pow spill registers and hurt
       // short chords (41 steps SD4, 200 SD0.5) while long sparse DICOM
       // benefits. fc_shading/fc_gradientOpacity pipelines get a narrower
-      // compile-time cap (4) so the compiler sheds 8/16/32/48 rungs and
-      // occupancy rises (37% -> 56% class). Static per-PSO, not per-ray
-      // adaptive. Cap 4 chosen as compromise: NIFTI shade best f2 (0.87)
-      // vs f4 0.93 vs f8 0.99 (all <1), DICOM shade f4 0.58 vs f8 0.56
-      // (close), lean keeps 16. Cap2 would hurt DICOM 18%.
+      // compile-time cap (shade 2 for fine SD<1.5, 4 for coarse) so the
+      // compiler sheds 8/16/32/48 rungs and occupancy rises (37% -> 56%+
+      // class). Static per-PSO, not per-ray adaptive. Cap 2 is best for
+      // NIFTI SD0.5 (f2 0.87 vs f4 0.93), 4 for SD4 (0.93 vs 0.99), lean
+      // keeps 16. Cap2 would hurt DICOM 18% at coarse but fine is optimal.
+      const int shadeCap = fc_fineSD ? 2 : 4;
       const int batchCap = (fc_fragBatch > 0) ? fc_fragBatch
-                       : ((fc_shading || fc_gradientOpacity) ? min(4, max(1, int(volumeUniforms.maxBatchWidth)))
+                       : ((fc_shading || fc_gradientOpacity) ? min(shadeCap, max(1, int(volumeUniforms.maxBatchWidth)))
                                      : min(16, max(1, int(volumeUniforms.maxBatchWidth))));
       // Block-summary cache (fc_mmBlocks): persists across batches — position
       // advances only along the ray, so a block-index compare detects every
