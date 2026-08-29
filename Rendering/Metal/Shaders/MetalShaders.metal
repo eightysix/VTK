@@ -2826,9 +2826,8 @@ constant bool fc_dense [[function_constant(48)]];
 constant bool fc_volumeNearestCoarse [[function_constant(49)]];
 // Quad-coop grad §13.5: 4 sC share 24->4 fetches via quad_shuffle, ~30% SD0.5 thr0 if pos+dx coherence
 constant bool fc_quadGrad [[function_constant(51)]];
-// Cinematic rendering — optimal compute variant (Woodcock/HG/NEE + binned + temporal)
-constant bool fc_cinematic [[function_constant(52)]];
-constant bool fc_denoise [[function_constant(53)]];
+// Cinematic — shaded DVR (wax AO/SSS, single 8x8, no Woodcock/HG/NEE)
+// fc_cinematic/fc_denoise removed — reads u.cinematicEnabled, denoise via separate kernel
 
   // §38.17 segment consume for the COMPUTE marcher (VTK_METAL_TEST_MM_SEG):
 // mirrors the fragment engine's fc_segHop — per-ray skip gaps precomputed by
@@ -9618,8 +9617,17 @@ inline half4 cinematic_march_core(
     if (u.useNormalTexture > 0.5) {
       float4 nt = normalTexture.sample(sVolume, cur);
       N = normalize(nt.xyz * 2.0 - 1.0);
-      gmag = saturate(nt.w);
       if (dot(N, V) < 0.0) N = -N;
+      // magnitude: 2-tap, not nt.w (often unused/1)
+      float3 gs1 = b.gradientStep.xyz;
+      float3 g2 = float3(
+        sampleVolumeScalar(volumeTexture, cur + float3(gs1.x,0,0)) -
+        sampleVolumeScalar(volumeTexture, cur - float3(gs1.x,0,0)),
+        sampleVolumeScalar(volumeTexture, cur + float3(0,gs1.y,0)) -
+        sampleVolumeScalar(volumeTexture, cur - float3(0,gs1.y,0)),
+        sampleVolumeScalar(volumeTexture, cur + float3(0,0,gs1.z)) -
+        sampleVolumeScalar(volumeTexture, cur - float3(0,0,gs1.z)));
+      gmag = saturate((length(g2) - 0.018) * 5.5);
     } else {
       float3 grad = float3(
         sampleVolumeScalar(volumeTexture, cur + float3(gs.x, 0, 0)) -
@@ -9638,10 +9646,7 @@ inline half4 cinematic_march_core(
     if (gmag < 0.12 && a < 0.20) { cur += evalStep; continue; }
 
     if (!haveSurface) {
-      // Fold edge (high gmag) or real tissue (a past 0.10 shelf) — homogeneous 0.10 shell with no gradient = haze → skip
-      bool fold   = (gmag > 0.22 && a > 0.08);
-      bool tissue = (a > 0.28);
-      if (!fold && !tissue) { cur += evalStep; continue; }
+      if (gmag < 0.16 || a < 0.08) { cur += evalStep; continue; }
       float tauAO = optical_depth(volumeTexture, transferFunctionTexture,
                                   cur + N * voxel,  N, aoDist,       6, scalarScale, scalarBias, sigma);
       float tauSS = optical_depth(volumeTexture, transferFunctionTexture,

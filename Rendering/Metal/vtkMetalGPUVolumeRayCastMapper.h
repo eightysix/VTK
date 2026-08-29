@@ -90,7 +90,7 @@ struct VolumePipelineKeyHash
 // Each flag enables a corresponding [[function_constant(n)]] in the Metal
 // shader, allowing the compiler to eliminate dead code paths.
 // Cinematic: VolumeFeature_Cinematic=1u<<30 (fc_cinematic 52) VolumeFeature_Denoise=1u<<29 (fc_denoise 53) — stored in featureMaskExtra bits 22/23 (all 32 featureMask bits used by VolRg8/Transposed).
-// CinematicUniforms {uint samples,bounces; float g,reach,blend; float3 subsurface;} extends VolumeMapperUniforms:35/PerBlockData:34 (WAX brain g 0.42, Reach 0.85, Blend 1.4, 64spp, 4 bounces, denoise)
+// CinematicUniforms {uint samples,bounces; float g,reach,blend; float3 subsurface;} extends VolumeMapperUniforms:35/PerBlockData:34 (WAX g 0, Reach 0.45, Blend 1.15, 1 spp, denoise 0)
 enum VolumeShaderFeatureFlags : uint32_t
 {
   VolumeFeature_Shading        = 1u << 0,
