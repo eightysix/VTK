@@ -238,26 +238,30 @@ f2 14.50/18.42 0.79 (-11% vs linear 0.89) f8 16.47/18.16 0.91 (-8%) f16 19.63/18
 ```
 `8x` texel reduction (`6*8→6*1`) is `10%` and still `>1` at `f16`; image cost `2.93→5.21` exceeds accepted `±1-step` class. `sNearest` env `VTK_METAL_TEST_GRAD_NEAREST=1` `fc_gradNearest:45` now keeps `thr 2.55 at SD0.5 PASS` with `pow skip` but `5.21 at SD4 FAIL`, so gated to `fineSD` would be needed. Not a standalone fix. `read` vs `sample` and `precomputed normals` (`UsePrecomputedNormals` `RGBA8Unorm 632x826x574 → 1.2GB` `+900MB` §3, currently dead `mapper:2926`) were considered — `1 fetch` `8→2` `75%` cut but memory heavy; kept `6` default for coarse.
 
-### 8.2 Per-feature compile-time batch cap — `batchCap:5568` `fc_shading||fc_gradientOpacity` + `fc_fineSD<0.75`
+### 8.2 Per-feature compile-time batch cap — `batchCap:5568` `fc_shading||fc_gradientOpacity` + `fc_fineSD<0.75` (re-swept `§14.1` after `1,1,4→1,1,1`)
 
 `fc_fragBatch` already gives `light` `56%` vs `heavy` `37%` (`§39.1`). Shipped `maxBatchWidth=32` `heavy` is pessimal for NIFTI shade ON. Static per-PSO specialization (no per-ray branch):
 
 ```metal
-const int shadeCap = fc_fineSD ? 2 : 4;
+// before partitions 1,1,4: shadeCap = fc_fineSD ? 2 : 4  (fine 2 best, coarse 4 best)
+// after  1,1,1 (2026-08-29 re-sweep §14.1): shadeCap = fc_fineSD ? 4 : 2  (fine 4 best, coarse 2 best)
+const int shadeCap = fc_fineSD ? 4 : 2;
 const int batchCap = (fc_fragBatch>0) ? fc_fragBatch
                  : ((fc_shading||fc_gradientOpacity) ? min(shadeCap, max(1,int(maxBatchWidth)))
                                                      : min(16, max(1,int(maxBatchWidth))));
 ```
 
-`fc_shading`/`fc_gradientOpacity` `2666/2667` `fc_fineSD` `44` `Mapper:8181` `SampleDistance<0.75` (`0.5 fine vs 4 coarse` and `1.0 VolumeRayCast` stays `6-fetch`). `shadeCap 2` best for `NIFTI SD0.5` (`f2 0.86 vs f4 0.93 -7%`), `4` for `SD4` (`0.93 vs 0.99 -6%`), `lean16` `0.48 vs 0.50` close; `cap1` hurts `DICOM 18%`.
+`fc_shading`/`fc_gradientOpacity` `2666/2667` `fc_fineSD` `44` `Mapper:8181` `SampleDistance<0.75` (`0.5 fine vs 4 coarse` and `1.0 VolumeRayCast` stays `6-fetch`). **Pre-partition `1,1,4`:** `shadeCap 2` best for `NIFTI SD0.5` (`f2 0.86 vs f4 0.93 -7%`), `4` for `SD4` (`0.93 vs 0.99 -6%`). **Post-partition `1,1,1` `§14.1` re-sweep:** `f4 16.34 vs f2 17.52 -7%` at `SD0.5` (`fine 4 best`), `f2 6.97 vs f4 7.26 -4%` at `SD4` (`coarse 2 best`) — short `41-step` coarse rays prefer narrow, long `200-step` fine prefer wide, opposite to `1,1,4` where brick seams made coarse prefer wide. `lean16` `0.48 vs 0.50` close; `cap1` hurts `DICOM 18%`.
 
-Measured `M/GL` `1024` `MINMAX=1` `ACCEL=1` `30f/10w`:
+Measured `M/GL` `1024` `MINMAX=1` `ACCEL=1` `30f/10w` **pre-partition `1,1,4`:**
 ```
 Before (heavy32 y): NIFTI shade ON f16 1.18 FAIL, f2 0.87 PASS
 After (shade4/lean16 y + pow skip): NIFTI SD4 6.03/8.62 0.70 SD0.5 13.64/18.13 0.75 -12% fine, all <1
 After (fineSD 2/4 + 4-fetch at fine): NIFTI SD0.5 10.97/17.64 0.62 -18% extra at fine, thr 0.54->2.29 still <5 (see §9)
 Parity 512 y: NIFTI SD4 3780 thr 2.98 (was 2.93) mean 0.008 max8, SD0.5 3589 thr 0.54 (6-fetch) or 3729 thr 2.29 (4-fetch fine) - both <5, DICOM 0.000, VolumeRayCast 0.182 keep.
 ```
+
+**Post-partition `1,1,1` `§14.1` (swap `2/4→4/2`):** `1024 identity: NIFTI SD4 6.97/9.27 0.75 (f2) vs default 7.64 0.86` `— narrow wins coarse`, `SD0.5 16.34/17.75 0.92 (f4) vs default 17.48 0.98` `— wide wins fine`; `2048 SD4 10.84/12.39 0.87 (f2)`, `SD0.5 49.08/53.53 0.92 (f4)`. Default `shadeCap 4:2` (fine 4 coarse 2) is within `1-3%` of `f1/f2/f4` optimum across `default/y/az45` views (`§14.1`).
 
 `Heavy32 → light2` is `-47%` on `NIFTI shade 1024 axy` (`27.93→14.67`).
 
@@ -414,7 +418,7 @@ eval "env $BASE VTK_METAL_TEST_GRAD4=1 $BIN --scene NIFTIVolume --nifti $NIFTI -
 | Area | File `:` line | Symbol |
 |------|---------------|--------|
 | mv9 tEnd gate fix | `Rendering/Metal/Shaders/MetalShaders.metal:5634` | `while(i<steps) if(i>0 && currentT>=p.tEnd-1e-6)` |
-| batchCap SD-aware | `Rendering/Metal/Shaders/MetalShaders.metal:5568` | `shadeCap=fc_fineSD?2:4; batchCap=(fc_fragBatch>0)?fragBatch:((fc_shading\|\|fc_gradientOpacity)?min(shadeCap,MaxBatchWidth):min(16,MaxBatchWidth))` `featureMaskExtra 32u fineSD` `Mapper:7963` `SampleDistance<0.75` |
+| batchCap SD-aware | `Rendering/Metal/Shaders/MetalShaders.metal:5568` | `shadeCap=fc_fineSD?4:2; batchCap=(fc_fragBatch>0)?fragBatch:((fc_shading\|\|fc_gradientOpacity)?min(shadeCap,MaxBatchWidth):min(16,MaxBatchWidth))` `featureMaskExtra 32u fineSD` `Mapper:7963` `SampleDistance<0.75` re-swept `§14.1` after `1,1,1` |
 | maxSteps calc | `Rendering/Metal/Shaders/MetalShaders.metal:4363` `8256` `8381` | `max(1,ceil((p.tEnd-firstT)/stepSize))` |
 | mv0 baseline loop | `Rendering/Metal/Shaders/MetalShaders.metal:6416` | `for(i<maxSteps)` `latchExit` |
 | mv9 ladder | `Rendering/Metal/Shaders/MetalShaders.metal:5568` `5627` `5862` `6030` `6106` | `batchCap` `MV9_FETCH/COMPOSITE/ADVANCE` |
@@ -592,9 +596,34 @@ eval "env $BASE $BIN --scene NIFTIVolume --nifti $NIFTI --frames 1 --size 512x51
 # expect NIFTI 2987 thr 0.000 (visual_compare NIFTI 2987 vs DICOM 1122 VRC 1150 all thr 0.000/0.18)
 ```
 
-## 15. Updated next leads for NIFTI (post-partition, `thr 0.000` headroom)
+## 14.1 Re-sweep optimal batch cap after partition removal (`1,1,4→1,1,1`, `30f/10w @1024` `15f/5w @2048`)
 
-Landed `shadeCap 2/4` `pow skip` `argmin` `partitions 1,1,1` fixes `1024` all `<1` and `512 y thr 0.000` with `0` parity loss. Remaining `M/GL` is `1024 SD4 0.68-0.86` `SD0.5 0.72` `2048 SD4 0.91` `SD0.5 0.82` — all `<1` but `2048 SD4` near `1` (frontend bound). Ranked `thr`-aware unlocks to keep `<5` and `DICOM 0.000` no-regress, now with `5.7%` total budget:
+`§8.2` predicted `shadeCap 2` (fine) `4` (coarse) from `1,1,4` sweeps; with `1,1,1` the optimum flips — short `41-step` coarse rays prefer narrow, long `200-step` fine prefer wide. `arm64 Release` `BASE` `eval` as `§1`:
+
+```
+1024 SD4 (30f/10w): f1 7.04/9.27 0.76 f2 7.12/9.27 0.77 f4 7.60/9.27 0.82 f8 8.56/9.27 0.92 f16 11.97/9.27 1.29 FAIL
+                    default (shadeCap 4:2, fine 4 coarse 2) 6.97/9.27 0.75 — now matches f2 within 2% (was 7.64 0.82 +9% with old 2:4)
+1024 SD0.5:          f1 21.95/18.39 1.19 FAIL f2 17.98/18.39 0.98 f4 16.71/18.39 0.91 best f8 17.60/18.39 0.96
+                    default 4:2 15.94/18.39 0.87 — now beats f2 by 11% (was 17.48 0.98 with old 2:4)
+2048 SD4 (15f/5w):  f1 12.29/12.39 0.99 f2 10.84/12.39 0.87 best f4 11.27/12.39 0.91 f8 13.84/12.39 1.12
+                    default 4:2 10.97/12.39 0.88 — matches f2
+2048 SD0.5:          f1 67.39/53.53 1.26 FAIL f2 52.58/53.53 0.98 f4 49.08/53.53 0.92 best f8 53.38/53.53 1.00
+                    default 4:2 52.77/53.53 0.99 — within 7% of f4
+
+Views 1024 @15f/3w: default vs f2/f4
+  SD4 default 7.64 vs f2 6.97 (f2 -9% better) before swap; after swap default 6.97 matches f2
+      y 3.39 vs f2 3.27 (-3% f2) / az45 4.85 vs f2 5.03 (default -3% better) — all <1
+  SD0.5 default 17.48 vs f4 16.34 (-7% f4) before; after default 15.94 vs f4 16.45 (default -3% better) / y 6.78 vs f4 6.57 (f4 -3%) / az45 16.29 vs f4 16.72 (default -2%)
+  → `shadeCap 4:2` (fine 4 coarse 2) is within `1-3%` of `f1/f2/f4` optimum across `default/y/az45`; old `2:4` was `+7-9%` off.
+
+512 y thr: `2986 thr 0.000 SD4` / `2894 thr 0.069 SD0.5` with `4:2` — unchanged `<5`.
+```
+
+**Fix landed:** `MetalShaders.metal:5625` `shadeCap = fc_fineSD ? 4 : 2` (was `2 : 4`). Comment updated with re-sweep numbers. `DICOM y` `lean16` unaffected (`shadeCap` only for `fc_shading||fc_gradientOpacity`).
+
+## 15. Updated next leads for NIFTI (post-partition + re-sweep, `thr 0.000` headroom)
+
+Landed `shadeCap 4:2` (`fine 4` `coarse 2`) `pow skip` `argmin` `partitions 1,1,1` fixes `1024` all `<1` and `512 y thr 0.000` with `0` parity loss. Remaining `M/GL` is `1024 SD4 0.75` `SD0.5 0.87-0.92` `2048 SD4 0.88` `SD0.5 0.99` — all `<1` (new re-sweep `30f/10w` `15f/5w`) but `2048 SD4` near `1` (frontend bound). Ranked `thr`-aware unlocks to keep `<5` and `DICOM 0.000` no-regress, now with `5.7%` total budget:
 
 1. **`SD-aware 4-fetch` `VTK_METAL_TEST_GRAD4=1` or `fc_grad4` `Rendering/Metal/Shaders/MetalShaders.metal:3861` `fc_grad4:42` `float` `*2.0h`** `sC+3` forward `4 fetches` `33%` texel saving `-18%` `NIFTI SD0.5` `13.64->10.97` `thr 0.69->2.54` still `<5` (`+1.85%`), `SD4` gated to `6-fetch` `0.000` keep. With new `0.000` baseline, `2.54 <5` leaves `2.46%` budget before fail. `gap 4 texels in 1 fetch` (2 fetches for 6 samples vs 6) would keep `thr` near `0.5%` with `-33%` fetches.
 

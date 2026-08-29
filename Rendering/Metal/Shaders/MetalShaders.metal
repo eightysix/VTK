@@ -5617,12 +5617,14 @@ inline half4 marchVolumeUnified(
       // batches (32) with 6-fetch gradient + pow spill registers and hurt
       // short chords (41 steps SD4, 200 SD0.5) while long sparse DICOM
       // benefits. fc_shading/fc_gradientOpacity pipelines get a narrower
-      // compile-time cap (shade 2 for fine SD<1.5, 4 for coarse) so the
+      // compile-time cap (shade 4 for fine SD<1.5, 2 for coarse) so the
       // compiler sheds 8/16/32/48 rungs and occupancy rises (37% -> 56%+
-      // class). Static per-PSO, not per-ray adaptive. Cap 2 is best for
-      // NIFTI SD0.5 (f2 0.87 vs f4 0.93), 4 for SD4 (0.93 vs 0.99), lean
-      // keeps 16. Cap2 would hurt DICOM 18% at coarse but fine is optimal.
-      const int shadeCap = fc_fineSD ? 2 : 4;
+      // class). Static per-PSO, not per-ray adaptive. After partition removal
+      // (1,1,4→1,1,1) 2026-08-29 re-sweep: NIFTI SD0.5 best f4 (16.34 vs 17.52 f2),
+      // SD4 best f2 (6.97 vs 7.26 f4) — short coarse rays prefer narrow, long fine
+      // prefer wide, opposite to pre-partition 1,1,4 where 1,1,4 brick seams made
+      // coarse prefer 4. Lean keeps 16. Swapped vs pre-partition.
+      const int shadeCap = fc_fineSD ? 4 : 2;
       const int batchCap = (fc_fragBatch > 0) ? fc_fragBatch
                        : ((fc_shading || fc_gradientOpacity) ? min(shadeCap, max(1, int(volumeUniforms.maxBatchWidth)))
                                      : min(16, max(1, int(volumeUniforms.maxBatchWidth))));
