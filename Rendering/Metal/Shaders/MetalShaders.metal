@@ -5631,7 +5631,7 @@ inline half4 marchVolumeUnified(
         // would have latched before its first sample). Checked before the
         // batch dispatch so the first batch is gated too.
         if (fc_slabMode && accumulatedOpacity > kExitAcc) { break; }
-        if (currentT >= p.tEnd - 1e-6f) break;
+        if (i > 0 && currentT >= p.tEnd - 1e-6f) break;
         if (any(max(evalStep, float3(0.0f)) * (evalPoint - adjTexMax) > float3(0.0f)) ||
             any(min(evalStep, float3(0.0f)) * (evalPoint - adjTexMin) > float3(0.0f))) {
           if (seenInBounds) { break; }
