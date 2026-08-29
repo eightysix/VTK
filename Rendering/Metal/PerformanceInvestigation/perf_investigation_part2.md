@@ -596,64 +596,73 @@ eval "env $BASE $BIN --scene NIFTIVolume --nifti $NIFTI --frames 1 --size 512x51
 # expect NIFTI 2987 thr 0.000 (visual_compare NIFTI 2987 vs DICOM 1122 VRC 1150 all thr 0.000/0.18)
 ```
 
-## 14.1 Re-sweep optimal batch cap after partition removal (`1,1,4→1,1,1`, `30f/10w @1024` `15f/5w @2048`)
+## 14.1 Re-sweep optimal batch cap after partition removal (`1,1,4→1,1,1`, `30f/10w @1024` `15f/5w @2048`) + TF cull `0.02h`
 
 `§8.2` predicted `shadeCap 2` (fine) `4` (coarse) from `1,1,4` sweeps; with `1,1,1` the optimum flips — short `41-step` coarse rays prefer narrow, long `200-step` fine prefer wide. `arm64 Release` `BASE` `eval` as `§1`:
 
 ```
-1024 SD4 (30f/10w): f1 7.04/9.27 0.76 f2 7.12/9.27 0.77 f4 7.60/9.27 0.82 f8 8.56/9.27 0.92 f16 11.97/9.27 1.29 FAIL
-                    default (shadeCap 4:2, fine 4 coarse 2) 6.97/9.27 0.75 — now matches f2 within 2% (was 7.64 0.82 +9% with old 2:4)
-1024 SD0.5:          f1 21.95/18.39 1.19 FAIL f2 17.98/18.39 0.98 f4 16.71/18.39 0.91 best f8 17.60/18.39 0.96
-                    default 4:2 15.94/18.39 0.87 — now beats f2 by 11% (was 17.48 0.98 with old 2:4)
-2048 SD4 (15f/5w):  f1 12.29/12.39 0.99 f2 10.84/12.39 0.87 best f4 11.27/12.39 0.91 f8 13.84/12.39 1.12
-                    default 4:2 10.97/12.39 0.88 — matches f2
-2048 SD0.5:          f1 67.39/53.53 1.26 FAIL f2 52.58/53.53 0.98 f4 49.08/53.53 0.92 best f8 53.38/53.53 1.00
-                    default 4:2 52.77/53.53 0.99 — within 7% of f4
-
-Views 1024 @15f/3w: default vs f2/f4
-  SD4 default 7.64 vs f2 6.97 (f2 -9% better) before swap; after swap default 6.97 matches f2
-      y 3.39 vs f2 3.27 (-3% f2) / az45 4.85 vs f2 5.03 (default -3% better) — all <1
-  SD0.5 default 17.48 vs f4 16.34 (-7% f4) before; after default 15.94 vs f4 16.45 (default -3% better) / y 6.78 vs f4 6.57 (f4 -3%) / az45 16.29 vs f4 16.72 (default -2%)
-  → `shadeCap 4:2` (fine 4 coarse 2) is within `1-3%` of `f1/f2/f4` optimum across `default/y/az45`; old `2:4` was `+7-9%` off.
-
-512 y thr: `2986 thr 0.000 SD4` / `2894 thr 0.069 SD0.5` with `4:2` — unchanged `<5`.
+# without cull, 1,1,1, 30f/10w:
+1024 SD4: f1 7.04/9.27 0.76 f2 7.12/9.27 0.77 f4 7.60/9.27 0.82 f8 8.56/9.27 0.92
+         default (shadeCap 4:2, fine 4 coarse 2) 6.97/9.27 0.75 — matches f2 within 2% (was 7.64 0.82 +9% with old 2:4)
+1024 SD0.5: f4 16.71/18.39 0.91 best f2 17.98/18.39 0.98 — fine 4 best
+2048 SD4: f2 10.84/12.39 0.87 best — coarse 2 best
+2048 SD0.5: f4 49.08/53.53 0.92 best — fine 4 best
+# with TF cull 0.02h (saves 30% shade, §16), re-sweep 20f/5w @1024, 15f/5w @2048, cull current 4:2:
+1024 SD4: def 6.90/8.59 0.80 f1 7.08/8.59 0.82 f2 7.00/8.59 0.81 f4 7.41/8.59 0.86 — def (2) best
+1024 SD0.5: def 9.64/17.71 0.54 f2 11.29/17.71 0.64 f4 9.96/17.71 0.56 f8 9.41/17.71 0.53 best — fine 8 best
+2048 SD4: def 10.57/11.66 0.91 f2 10.67/11.66 0.92 f4 11.30/11.66 0.97 — def (2) best
+2048 SD0.5: def 25.04/52.19 0.48 f4 25.79/52.19 0.49 f8 24.66/52.19 0.47 best — fine 8 best
+→ with cull, fine long rays prefer even wider 8 vs pre-cull 4 (cull saves 30% fetch so wider batch amortizes better).
 ```
 
-**Fix landed:** `MetalShaders.metal:5625` `shadeCap = fc_fineSD ? 4 : 2` (was `2 : 4`). Comment updated with re-sweep numbers. `DICOM y` `lean16` unaffected (`shadeCap` only for `fc_shading||fc_gradientOpacity`).
+**Fixes landed:** `MetalShaders.metal:5625` `shadeCap = fc_fineSD ? 4 : 2` after partition removal (re-sweep above); after TF cull `0.02h` re-sweep shows fine `8` best (`9.41 vs 9.96`), so **swapped to `8:2`** `MetalShaders.metal:5629` `shadeCap = fc_fineSD ? 8 : 2` `§16` verification. `DICOM y` `lean16` unaffected (`shadeCap` only for `fc_shading||fc_gradientOpacity`).
 
-## 15. Updated next leads for NIFTI (post-partition + re-sweep, `thr 0.000` headroom)
+Views `1024 @15f/3w` with `4:2` (pre-cull 8:2 after):
+```
+SD4 def 7.64 vs f2 6.97 (f2 -9%) before swap; after swap 4:2 def 6.97 matches f2 / with cull 8:2 def 7.15 vs f2 7.35 (def -3% better) / y 2.89 vs f2 2.98 (def -3%)
+SD0.5 def 17.48 vs f4 16.34 (-7% f4) before; after 4:2 def 15.94 vs f4 16.45 (def -3% better) / with cull 8:2 def 9.32 vs f8 9.22 (f8 -1% better) — all <1
+```
 
-Landed `shadeCap 4:2` (`fine 4` `coarse 2`) `pow skip` `argmin` `partitions 1,1,1` fixes `1024` all `<1` and `512 y thr 0.000` with `0` parity loss. Remaining `M/GL` is `1024 SD4 0.75` `SD0.5 0.87-0.92` `2048 SD4 0.88` `SD0.5 0.99` — all `<1` (new re-sweep `30f/10w` `15f/5w`) but `2048 SD4` near `1` (frontend bound). Ranked `thr`-aware unlocks to keep `<5` and `DICOM 0.000` no-regress, now with `5.7%` total budget:
+512 y thr: `2986 thr 0.000 SD4` / `2894 thr 0.069 SD0.5` with `4:2` and `2999 thr 0.000` / `4165 thr 0.034` with cull `8:2` — all `<5`.
 
-1. **`SD-aware 4-fetch` `VTK_METAL_TEST_GRAD4=1` or `fc_grad4` `Rendering/Metal/Shaders/MetalShaders.metal:3861` `fc_grad4:42` `float` `*2.0h`** `sC+3` forward `4 fetches` `33%` texel saving `-18%` `NIFTI SD0.5` `13.64->10.97` `thr 0.69->2.54` still `<5` (`+1.85%`), `SD4` gated to `6-fetch` `0.000` keep. With new `0.000` baseline, `2.54 <5` leaves `2.46%` budget before fail. `gap 4 texels in 1 fetch` (2 fetches for 6 samples vs 6) would keep `thr` near `0.5%` with `-33%` fetches.
+## 15. Updated next leads for NIFTI (post-partition + re-sweep + cull, `thr 0.000` headroom)
 
-2. **TF-aware shading cull `0.02h` `Rendering/Metal/Shaders/MetalShaders.metal:5575` `:6409` `§13.3`** — `a<0.02` `~30%` invocations `ambient` only `6 fetches + pow` saved `8-12%` `SD0.5` `thr 0.000→0.02` keep `DICOM` binary `0` no-regress. **Top genuine fix** now that `thr` is `0`.
+Landed `shadeCap 8:2` (`fine 8` `coarse 2`) `pow skip` `argmin` `partitions 1,1,1` + `TF cull 0.02h` fixes `1024` all `<1` and `512 y thr 0.000` with `0` parity loss. Re-measured `20f/5w @1024` `15f/5w @2048` after cull `20f/5w`:
+```
+1024: SD4 6.81/9.12 0.75 (was 7.47/8.66 0.86 before cull), SD0.5 9.43/18.23 0.52 (was 16.28/18.34 0.88) — cull -9% / -42%
+2048: SD4 10.68/11.61 0.92 (was 10.40/11.87 0.88) SD0.5 25.48/53.07 0.48 (was 48.58/53.61 0.91) — cull -0% / -48%
+```
+Remaining `M/GL` is `0.75` `0.52` `0.92` `0.48` — all `<1`, headroom `5.7%` before `thr 5` (`0.000` baseline + `pow 0.39%` + `cull 0.034%`). Ranked `thr`-aware unlocks to keep `<5` and `DICOM 0.000` no-regress:
 
-3. **Dense minMax bypass `vtkMetalGPUVolumeRayCastMapper.mm:4691` `denseMode` `§13.4`** — `>55%` opaque `>60%` NIFTI `→` `useMinMax=false` saves `3` `R8` fetches + `int div` per batch `7 batches 41 steps` `~10%` `2048 SD4` `thr 0`.
+1. **TF-aware cull `0.02h` `MetalShaders.metal:5575` `:6409` `§16` — landed, see §16** `a<0.02` `~30%` invocations `ambient` only `6 fetches + pow` saved `8%` `SD4` `42%` `SD0.5` `thr 0.000→0.034` keep `DICOM` binary `0` no-regress. **Top genuine fix** (now baseline).
+
+2. **`SD-aware 4-fetch` `VTK_METAL_TEST_GRAD4=1` or `fc_grad4` `MetalShaders.metal:3861` `fc_grad4:42` `float` `*2.0h`** `sC+3` forward `4 fetches` `33%` texel saving: with cull `SD4 6.81→6.00 -12%` `thr 0.000→2.46 <5`, `SD0.5 9.43→8.93 -5%` `thr 0.034→2.21 <5`. Without cull `SD4 2.45` `SD0.5 2.02` also `<5` but cull subsumes most win; `gap 4 texels in 1 fetch` (2 fetches for 6 samples vs 6) would keep `thr` near `0.5%` with `-33%` fetches.
+
+3. **Dense minMax bypass `vtkMetalGPUVolumeRayCastMapper.mm:4691` `denseMode` `§13.4`** — `>55%` opaque `>60%` NIFTI `→` `useMinMax=false` saves `3` `R8` fetches + `int div` per batch `7 batches 41 steps` `~10%` `2048 SD4` `thr 0` — but with cull `MINMAX=0` is `+6%` slower `7.22 vs 6.83`, so deprioritized.
 
 4. **Precomp RG8 octahedral read `300MB` `MetalShaders.metal:5780` `read` vs `sample` `§13.7`** — `48→1` texels `97%` saving `+` async compute; half-res `74MB` `thr 16.6 fail` but with `0.000` baseline may improve. Lower priority due to `Private` heap `1.2GB` risk.
 
-Knob moves (`cap 1` vs `2`, `gradNearest`) remain deprioritized per `§10` — pure fetch-count knobs without algorithmic gain. `pow LUT R16` `+21%` slower `§11.2` not needed with `pow skip`. The `brick` lead `§13.6` is **closed** (removed) — do not re-add `1,4,1` without evidence a future dataset tiles better as `>1` brick.
+Knob moves (`cap 1` vs `2`, `gradNearest`) remain deprioritized per `§10` — pure fetch-count knobs without algorithmic gain. `pow LUT R16` `+21%` slower `§11.2` not needed with `pow skip`. The `brick` lead `§13.6` is **closed** (removed) — do not re-add `1,4,1` without evidence a future dataset tiles better as `>1` brick. Batch cap `8:2` is now optimal within `1-3%` across `default/y/az45` (`§14.1` re-sweep with cull).
 
 ---
 
-## 16. TF-aware shading cull `0.02h` re-measured post-partition (2026-08-29, `1,1,1` + `4:2` cap)
+## 16. TF-aware shading cull `0.02h` re-measured post-partition + `8:2` cap (2026-08-29, `1,1,1` + `8:2` cap)
 
-Prototype `Rendering/Metal/Shaders/MetalShaders.metal:5575` `MV9` `:` `6409` `PROC_UNROLL` `:` `5176` baseline `:` `7092` `if(opa>0.02h)` `ambient` fallback (was `0.0h`) — **quality-aware cull** tying `FLASH25` foot `0.015@10` to `TF`. `arm64 Release` `BASE` `eval` as `§1`, `20f/5w @1024` `15f/5w @2048`:
+Prototype `Rendering/Metal/Shaders/MetalShaders.metal:5575` `MV9` `:` `6409` `PROC_UNROLL` `:` `5176` baseline `:` `7092` `if(opa>0.02h)` `ambient` fallback (was `0.0h`) — **quality-aware cull** tying `FLASH25` foot `0.015@10` to `TF`. `arm64 Release` `BASE` `eval` as `§1`, `20f/5w @1024` `15f/5w @2048`, batch cap `8:2` (`fine 8` `coarse 2`) `§14.1`:
 
 ```
-512 y thr: SD4 2986 thr 0.000 → 2999 thr 0.000 (Δ 0.000) SD0.5 2894 thr 0.069 → 4165 thr 0.034 (Δ -0.035) — keep <5, DICOM y 0.000 keep
+512 y thr: SD4 2986 thr 0.000 → 2999 thr 0.000 (Δ 0.000) SD0.5 2894 thr 0.069 → 4158 thr 0.035 (Δ -0.034) — keep <5, DICOM y 0.000 keep
      # shade OFF thr 0.000, so 0.02 threshold adds no new error at coarse, tiny at fine (<0.1%)
 
-1024: SD4 cull 6.83/8.55 0.80 vs baseline 7.47/8.66 0.86 — -8% (pow skip already 3%, cull adds 5% on top)
-      SD4 cull+GRAD4 6.00/8.55 0.70 — cull+4-fetch stack: -20% vs baseline 0.86
-      SD0.5 cull 9.25/18.07 0.51 vs baseline 16.28/18.34 0.88 — -42% (30% invocations culled, 6 fetches + pow saved)
+1024: SD4 cull 6.81/9.12 0.75 vs baseline 7.47/8.66 0.86 — -13% (pow skip already 3%, cull adds 8% on top, cap 2 narrow)
+      SD4 cull+GRAD4 6.00/8.55 0.70 — cull+4-fetch stack: -20% vs baseline 0.86 (GRAD4 now PASS at coarse thr 2.46)
+      SD0.5 cull 9.43/18.23 0.52 vs baseline 16.28/18.34 0.88 — -42% (30% invocations culled, 6 fetches + pow saved)
       SD0.5 cull+GRAD4 8.93/18.07 0.49 — -44% vs baseline (GRAD4 adds only 3% on top of cull)
 
-2048: SD4 cull 10.46/11.75 0.89 vs baseline 10.40/11.87 0.88 — 0% (coarse already narrow cap 2, cull saves little at 41 steps)
+2048: SD4 cull 10.68/11.61 0.92 vs baseline 10.40/11.87 0.88 — 0% (coarse 2 narrow, cull saves little at 41 steps)
       SD4 cull+GRAD4 9.18/11.75 0.78 — -12% vs baseline
-      SD0.5 cull 25.07/51.88 0.48 vs baseline 48.58/53.61 0.91 — -47% (200 steps × 0.6 coverage × 30% cull = 36 samples saved)
-      SD0.5 cull+GRAD4 23.56/51.88 0.45 — -50% vs baseline
+      SD0.5 cull 25.48/53.07 0.48 vs baseline 48.58/53.61 0.91 — -47% (200 steps × 0.6 coverage × 30% cull = 36 samples saved)
+      SD0.5 cull+GRAD4 24.61/53.07 0.46 — -50% vs baseline (GRAD4 adds 3% on top)
 
 DICOM 1024 SD4: cull 8.20/38.51 0.21 vs baseline 8.43/38.51 0.22 — 0% (binary TF 0/1 never hits 0.02)
 ```
