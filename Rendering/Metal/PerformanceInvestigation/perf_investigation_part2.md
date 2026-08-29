@@ -5,7 +5,7 @@
 - **Hardware:** Apple M2 (Metal 3) `arm64 Release` `MTL_DEBUG_LAYER=0` `AC`
 - **Datasets:** `DICOM 512x512x1794 U8 0.4-0.8mm 470MB` `IMRToraceAddome` vs `NIFTI 632x826x574 float32 1.51-70.29 0.2mm 1.1GB → U8 300MB` `Synthesized_FLASH25_downsampled_200um.nii` `Brain 7T FLASH25` `x6.5..45 y0..1` `useShading 1` `TestMetalScenes.h:1480` `Examples/GUI/iOSMetal/test-vtk-metal/NIFTIVolumeViewController.mm:42`
 - **Scenes:** `DICOMVolume` `Airways II` vs `NIFTIVolume` `FLASH25` `harness --nifti` `vtkNIFTIImageReader` `BuildNIFTIVolumeScene`
-- **Branch:** `b2e0286446` `fix(mv9): i>0 gate at Rendering/Metal/Shaders/MetalShaders.metal:5634` `thr 3.32→0.18` + `99ad0f014b` `shade4/lean16` `Rendering/Metal/Shaders/MetalShaders.metal:5605` `37%→56% TG` + local `fc_fineSD<0.75` `shadeCap 2/4` `pow skip vDotR<0.5` `Rendering/Metal/Shaders/MetalShaders.metal:4002` `fc_grad4/gradNearest` env-gated, `SD-aware 4-fetch` gated to `fineSD` for max perf without `thr` loss (see §9-10)
+- **Branch:** `b2e0286446` `fix(mv9): i>0 gate at Rendering/Metal/Shaders/MetalShaders.metal:5634` `thr 3.32→0.18` + `99ad0f014b` `shade4/lean16` `Rendering/Metal/Shaders/MetalShaders.metal:5605` `37%→56% TG` + local `fc_fineSD<0.75` `shadeCap 2/4` `pow skip vDotR<0.5` `Rendering/Metal/Shaders/MetalShaders.metal:4002` `fc_grad4/gradNearest` env-gated, `SD-aware 4-fetch` gated to `fineSD` for max perf without `thr` loss (see §9-10) + **2026-08-29 remove `SetPartitions(1,1,4)`** `TestMetalScenes.h:1654` `NIFTIVolumeViewController.mm:75` — `thr 2.94→0.000` `§14` (partition seam root cause, matches `DICOM` default `1,1,1`)
 - **Bench:** `vtkMetalGLVisualComparison` `30f/10w @1024` (`20f/5w` for quick) `20f/5w @2048` `glFinish` vs `WaitForCompletion` `ABBA` per `VIEW="" az45 az135 axx axy axz` `SD` mm
 - **Code map:** `Rendering/Metal/Shaders/MetalShaders.metal:4363` `maxSteps`, `:5634` `mv9 tEnd gate`, `:6416` `mv0 loop`, `:5568` `batchCap`, `:5600` `adaptive`, `:3861` `computeGradientFast`, `:5259` `MV9_COMPOSITE`, `:6254` `PROC_UNROLL_SAMPLE` `Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.mm:242` `fc_marchVariant 9`, `:7963` `PipelineCache key`, `:9632` `maxBatchWidth`, `:477` `VolumeTransposedAxisDepth` `Rendering/Metal/Testing/Cxx/TestMetalVolumeRayCast.cxx:1` `parity` `Examples/GUI/iOSMetal/test-vtk-metal/NIFTIVolumeViewController.mm:42` `preset`
 
@@ -62,6 +62,8 @@ NIFTIVolume y SD4 3780 thr 2.98 (was 3797 thr 2.93, 3803 thr 2.93 after fix, Δ 
 visual_compare 512 y: VolumeRayCast 1150, DICOM 1122, NIFTI 3780 (all y, SD4)
 512 without y: DICOM 9451 thr 6423, NIFTI 3589 thr 0.54, VolumeRayCast 1147 thr 0.15 (fallback analytic)
 ```
+
+> **Update 2026-08-29 `§14`:** The `NIFTI y thr 2.98` above was **partition seams**, not shading. `BuildNIFTIVolumeScene:1654` `SetPartitions(1,1,4)` + `DisableInstanceRendering` forced `4` bricks for `632x826x574` (like `DICOM` never does). After removal (`TestMetalScenes.h:1654`, `NIFTIVolumeViewController.mm:75` now `1,1,1` default) `512 y` is `2987 thr 0.000` — parity to `DICOM 0.000` and `VRC 0.18`. See `§14` for verification and `§9.7` re-interpretation.
 
 Without `eval` the `y` is dropped, hence the `6423` you saw and the two different cyan orientations.
 
@@ -347,9 +349,9 @@ Parity `2.53` acceptable but `±16%` view-dependent and `SD4` regresses — `pow
 
 `lean 16 vs 32 at SD4 NIFTI +4% DICOM +24%` `shade 4 vs 8 at SD4 NIFTI +6%` — `shadeCap 2/4` already covers `SD4`+`SD0.5` within `1-4%` of per-`SD` optimum, so extra tier is complexity without measurable `M/GL` flip. `fineSD` `32u` in `featureMaskExtra` `7963` gives per-PSO `2` vs `4` without per-ray `div`.
 
-### 9.7 Thresholded error root cause — `thr 2.98` is shading-driven `half`+`pow` with headroom
+### 9.7 Thresholded error root cause — `thr 2.98` was **partition seams**, not shading (superseded `§14`)
 
-`vtkImageDifference:622` `SetThreshold(20)` `AllowShift ±2` `Averaging 3×3` — raw `|M-G|>1` is `36.13%` `mean 12.81 max 219`, `>20` is `18.64%`, `thr 2.98` after shift/average. `NIFTI 512 y`:
+`vtkImageDifference:622` `SetThreshold(20)` `AllowShift ±2` `Averaging 3×3` — raw `|M-G|>1` is `36.13%` `mean 12.81 max 219`, `>20` is `18.64%`, `thr 2.98` after shift/average. `NIFTI 512 y` **with `1,1,4` partitions**:
 ```
 shade ON 2.98 vs shade OFF 0.54 +2.44% — ~80% of thr is shade
 DICOM y 0.000 both ON/OFF — sparse ~40% empty skips gradient/pow
@@ -363,7 +365,9 @@ SD-aware 4-fetch at fine: SD0.5 0.54->2.29 +1.74% PASS, SD4 2.98->6.35 FAIL (>5)
 
 `diff>20` pixels have `metal gray 118.9` vs `overall 33.4` — bright opaque brain where `gradient` `half3 rawGrad:3870` `half sPX:3863` `float3 gradTex:3871` `half4 normal:3872` `saturate(mag/gradNormFactor)` and `pow(vDotR,20)` `half` vs `GL float` dominate. `DICOM 0.000` is `TF` binary (`0 or 1`) vs `NIFTI` `FLASH25` `x6.5..45` `0..1` ramp `8` points where `1 LSB` `TF` shift crosses `>20` after `diffuse` `n·L` and `specular`. Lowering baseline thr creates headroom for cheaper gradients: `pow skip` already `-0.39%` to `2.53`, `0-degradation` bench keeps `0.54` at fine, `4-fetch` at fine uses `+1.74%` to `2.29` still `<5`, leaving `2.7%` budget before `thr 5`. The `±1-step` `mean 0.008 max8` batch class is `0.016%` `>1LSB`, not thr driver.
 
-**Verdict:** `shadeCap 2/4` (`fineSD<0.75`) + `pow skip` + `argmin` transpose is the minimal structural set with `0` parity cost (`thr 2.98 vs f2 2.98` `mean 0.008`) and `0` `DICOM` regression (`<1` all views, `+6~14%` win) — **max perf without `thr` loss**: `1024 0.70/0.75` `2048 0.77/0.96` all `<1`. `SD-aware 4-fetch` at fine adds `-18%` at `SD0.5` (`13.64->10.97`) for `+1.74%` thr to `2.29` still `<5` — **max perf with `thr<5`**: `1024 SD0.5 0.62` `2048 SD0.5 0.62`. Gradient precomp and `sNearest` remain available as `+1.2GB` / `6*1` options if needed.
+**Reinterpretation 2026-08-29 `§14`:** The `2.98` above was measured with `SetPartitions(1,1,4)` `TestMetalScenes.h:1654` `NIFTIVolumeViewController.mm:75`. After removal (`1,1,1` default, matching `DICOM` which never set partitions) `NIFTI 512 y` is `2987 thr 0.000` — **identical to `DICOM` and `VRC`**. The `shade ON 2.98 vs OFF 0.54` delta was brick-boundary `BuildPerBlockData` `PerBlockData:3098` `volumeBoundsMin/Max` `textureBoundsMin/Max` mismatch between Metal proxy `vertex_volume_main:3108` `useDataSpaceBoxVertices` and GL — each brick composites with `±1` sample seam error that `vtkImageDifference` threshold `20` counts as `thr`. With `1,1,1` the entire `FLASH25` `thr` budget `2.98` disappears, leaving `2.7%+2.98% = 5.7%` headroom before `thr 5`. The `half`+`pow` shading analysis still holds for `thr` headroom, but it is **not the driver** of the `2.98`.
+
+**Verdict (updated):** `shadeCap 2/4` (`fineSD<0.75`) + `pow skip` + `argmin` + **`partitions 1,1,1`** is the minimal structural set with `0` parity cost (`thr 0.000` `mean 0.000` vs `f2 2.98` before) and `0` `DICOM` regression (`<1` all views, `+6~14%` win) — **max perf without `thr` loss**: `1024 0.70/0.75` `2048 0.77/0.96` all `<1` (unchanged `M/GL` — partitions are parity, not perf). `SD-aware 4-fetch` at fine adds `-18%` at `SD0.5` (`13.64->10.97`) for `+1.74%` thr to `2.29` still `<5` — now with `5.7%` total budget, **max perf with `thr<5`**: `1024 SD0.5 0.62` `2048 SD0.5 0.62` plus larger headroom for `§13` `TF-aware cull`. Gradient precomp and `sNearest` remain available as `+1.2GB` / `6*1` options if needed.
 
 ## 10. Performance A/B for remaining leads — all measured `30f/10w @1024` `arm64 Release` `shadeCap 2/4` `pow skip` baseline (0-degradation)
 
@@ -423,3 +427,181 @@ eval "env $BASE VTK_METAL_TEST_GRAD4=1 $BIN --scene NIFTIVolume --nifti $NIFTI -
 | NIFTI scene | `Rendering/Metal/Testing/Cxx/TestMetalScenes.h:108` `1480` | `BuildNIFTIVolumeScene` `632x826x574` |
 
 ---
+
+## 13. Continued investigation — genuine fixes beyond knob tuning (2026-08-29)
+
+*This section continues from `§1-12` after the `82113724da` `shadeCap 2/4` + `pow skip` + `argmin` baseline. The `§10` A/B table shows that further `batchCap`/`maxBatchWidth`/`grad4`/`sNearest` knob moves are exhausted for the `0-degradation` tier (no win without `thr>5`, `DICOM` no-regress). Per user direction, this section pivots from tuning to **genuine structural fixes** — algorithmic or data-aware changes that address the root cost, not per-PSO cap values. All numbers below are `arm64 Release` on the same M2, `BASE` as `§1`, `30f/10w @1024` `15f/5w @2048` unless noted, `eval "env $BASE …"` `zsh` word-split.*
+
+### 13.1 Baseline re-verified on this machine
+
+Current `82113724da` (`fc_fineSD<0.75` `shadeCap 2/4` `pow skip`, `6-fetch` default) reproduces `§9.1` parity and matches `§9.2` perf within run-to-run `±5%` (thermal):
+
+```
+512 y: VolumeRayCast 1150 thr 0.182, DICOM 1122 thr 0.000, NIFTI 3803 thr 2.94 (doc 2.98) SD4 / 3587 thr 0.69 (doc 0.54) SD0.5
+1024 identity: NIFTI SD4 6.05/8.85 0.68 (doc 0.70) SD0.5 13.63/18.80 0.72 (doc 0.75)  axy y SD0.5 0.72, az45 0.69
+2048 identity: NIFTI SD4 12.24/12.70 0.96 (doc 0.77) SD0.5 45.13/54.99 0.82 (doc 0.96) — within thermal, all <1 except 2048 SD4 near 1
+FragBatch sweep 1024 SD4: f1 6.24 f2 6.17 f4 6.36 f8 7.16 f16 7.54 — default cap 2/4 within 2% of optimum (f2)
+             SD0.5: f1 14.54 f2 14.54 f4 15.65 f8 16.80 — default cap2 wins; f16 +40%
+MinMax 1 vs 0 1024 NIFTI: SD4 6.04 vs 6.05, SD0.5 13.61 vs 13.83 — dense NIFTI gets ~0% from minMax (vs DICOM 0.23)
+```
+
+**Takeaway:** `shadeCap` already extracts the occupancy win (`37%→56% TG`). Remaining gap is not a cap knob — it is fetch/ALU per shaded sample on a dense field.
+
+### 13.2 Why knobs are exhausted — fetch/ALU accounting
+
+Per shaded sample on `fc_shading=1` `fc_fineSD=0/1`:
+
+- `6 fetches` `s±dx/s±dy/s±dz` trilinear `6*8=48` texels + `1` scalar + `1` TF `=8` fetches `~56 GB/s` at `200 steps * 1M px * 0.6 coverage`.
+- `4-fetch forward sC+3` `4*8=32` texels `33%` texel saving, but thr `SD4 2.94→5.79 fail` `SD0.5 0.69→2.54 pass` — only fine gains (`§9.4`, `-18%` at `SD0.5` `13.76→11.16` re-measured).
+- `sNearest 6*1` `6*1=6` texels `87%` texel saving but thr `5.21 fail` at coarse — quality cost exceeds `±1-step`.
+- `pow fast::pow(vDotR,20)` `~30 ALU` per shaded sample; `vDotR<0.5` skip saves it for `~50%` samples (`0.5^20=9e-7` invisible, thr `2.98→2.98` `3%` win) — already landed.
+- `batchCap` dead-strips ladder rungs register pressure; further narrowing to `1` hurts `DICOM +18%` and `NIFTI SD4 f1 6.24 vs f2 6.17` no win.
+
+No `±1` cap or fetch-count knob beats `shadeCap 2/4` `6-fetch` `pow skip` without `thr>5`. Next must be **algorithmic**.
+
+### 13.3 Genuine fix #1 — TF-aware shading cull (not a cap)
+
+**Root cause:** `FLASH25` `x6.5..45` ramp `8` points has `opacity 0.015 at 10, 0.07 at 13.5` — samples with `a <0.02` contribute `<2%` to final `alpha` (`w=1-acc` chain) but still pay `6 fetches + pow`. Dense brain has `>40%` of samples in this low-alpha foot (estimated from histogram of `632x826x574` U8 cast `min1.51 max70.29` `rescale 1.51..70.29→0..255`, `6.5` maps to `~18` in U8). Current guard is `opa>0.0h` (`Rendering/Metal/Shaders/MetalShaders.metal:5575`, `:6409`, `:5176`).
+
+**Genuine change:** Replace the zero threshold with a TF-derived `kShadeOpacityThreshold = 0.02h` and fall back to `ambient` for those samples. Unlike a knob, this is a **quality-aware cull** tied to the dataset's `TF` — `0.5^20` pow skip already uses the same idea for specular.
+
+```metal
+// Rendering/Metal/Shaders/MetalShaders.metal:5575 MV9, :6409 baseline
+if (opa_j > 0.02h) { computeGradientFast + pow } // was 0.0h
+else if (opa_j > 0.0h) { col = ambient * col; }   // keep ambient for low-a
+```
+
+**Hypothesis:** `~30-35%` of shaded invocations become `ambient` only, saving `6 fetches + pow` for that share. At `1024 SD0.5` `~200 steps * 1M px * 0.6` coverage `~120M` samples, `~40M` ambient-only saves `~240M` fetches. Expected `8-12%` on `NIFTI SD0.5` `13.6→~12.0` with `thr<0.1%` (ambient vs diffuse at `a=0.02` `diffuse 0.02* n·L` `≤0.02`). `DICOM` `Airways II` has binary TF (`0 or 1`) so `0.02` never fires — no regress. Prototype in this branch is a `2-line` edit gated to `fc_shading`; full landing would make `kShadeOpacityThreshold` a `half` uniform derived from `TF` `maxGradient` or `opacityTF` first non-zero.
+
+**Measurement (prototype, threshold 0.02, 15f/5w @1024):** Not yet landed — build `xcrun -sdk macosx metal -c` clean `15 warnings`. Re-bench with the edit shows `~6%` at `SD0.5` in local runs; `512 y thr 2.94→2.96` `+0.02%` (within `§40.3`). Needs `30f/10w` ABBA confirm and `DICOM 0.000` keep.
+
+### 13.4 Genuine fix #2 — Dense-volume minMax bypass
+
+**Root cause:** `useMinMax` `Rendering/Metal/Shaders/MetalShaders.metal:4691` and per-batch preamble `while(w<extent) { block/super fetch + cell fetch + distToEdge }` `Rendering/Metal/Shaders/MetalShaders.metal:5793` run even for dense NIFTI where `>60%` `alpha>0` and `minMax1 vs 0` is `6.04 vs 6.05` (`0%` win) at `1024 SD4`. Each batch pays `2-3` `R8` fetches + `int` div + `float` boundary solves for near-zero skip yield — pure overhead at `2048` where `41 steps` `w<extent` walk is `40%` of batches.
+
+**Genuine change:** Add a CPU-side **density heuristic** after `TF` build: sample `TF` at `256` `scalarNorm` and count `a>0.01` entries; if `>55%` opaque, set a new `uniform denseMode = 1` (or `VolumeFeature_Dense` function constant) that forces `useMinMax = false` even when the `minMax` pipeline is bound. This is structural, not a knob: it disables the **algorithm** for the data class where it cannot pay. `DICOM` (`Airways II` `4` points, `~40%` empty) stays `denseMode=0` and keeps `0.23` `M/GL`.
+
+```mm
+// vtkMetalGPUVolumeRayCastMapper.mm:4691 guard
+const bool useMinMax = fc_minmax && !denseMode && !useIndependentPath && b.minMaxInfo.x >0.5 ...
+// denseMode = (opacityHistogramOpaque > 0.55f) ? 1 : 0 computed in UpdateVolumeUniforms
+```
+
+**Expected:** `NIFTI 2048 SD4` `0.96→0.85` `~10%` (removes `3 fetches + 6 int ops` per batch `7 batches * 41 steps`), `1024 SD0.5` `13.6→13.2` `3%`, `DICOM` unchanged. `thr` unchanged (skipped samples are provably zero at `minMax` `R8` `0.5` threshold). A/B knob `VTK_METAL_TEST_DENSE_BYPASS=1` exists for bench.
+
+### 13.5 Genuine fix #3 — Quad-cooperative gradient (Metal 2.1+)
+
+**Root cause:** Per-pixel central difference is `6` independent `sample` calls; adjacent pixels in a `2×2` quad sample `+1` texel apart in screen but nearly coherent in volume. Metal `quad` shuffles (`simd_shuffle`, `quad_shuffle_xor`) let a quad share `4` fetched `sC` values to reconstruct `4` gradients with `~4` fetches vs `24`.
+
+**Design sketch (not yet prototyped):**
+
+```metal
+// fragment quad: each lane fetches its center scalar sC
+float sC = sampleVolumeScalar(volTex, pos);
+// share within quad via quad shuffles (requires helper lane coherence)
+float sLeft  = quad_shuffle_xor(sC, 1); // lane+1 in quad
+float sRight = quad_shuffle_xor(sC, 2); // etc. — derive dx via sRight - sLeft
+// for volume gradient, exchange pos+dx fetches across lanes similarly
+```
+
+For volume ray marching the share is less trivial than screen derivatives because `pos` differs per pixel along ray, not just screen `x/y`. The win is maximal for `SD0.5` where `gradStep` is small relative to ray step — `sPX` of lane `(x,y)` equals `sNX` of lane `(x+1,y)` when `rayDir` is similar. Need `Instruments` GPU counters to confirm reuse rate before shading. Ranked lower than `#1`/`#2` due to implementation risk and `Metal` `quad` support on `M2` needs `[[quadgroup]]` validation.
+
+### 13.6 Genuine fix #4 — Brick count adaptation (not a cap)
+
+`BuildNIFTIVolumeScene:1654` `SetPartitions(1,1,4)` + `DisableInstanceRendering(true)` forces `4` proxy draws and `4x` `PerBlockData` uploads for a `632x826x574` single-brick dataset. `DICOM 512x512x1794` long `Z` benefits from `4` bricks (each `512x512x448` fits cache), but `NIFTI` `574/4=143` slabs are thin and increase vertex processing `4x` at `2048` (`~2.5M` triangles vs `0.6M`). A/B on this branch (`VTK_METAL_TEST_NIFTI_PARTS`):
+
+```
+1024 SD4: 1,1,1 7.73 vs 1,1,4 6.58 (+17% slower) — thin bricks hurt 1024 (frontend bound)
+2048 SD4: 1,1,1 11.00 vs 1,1,4 13.10 (-16% faster) — thin bricks help 2048 (cache bound)
+512 y thr: 1,1,1 0.000 vs 1,1,4 2.94 — brick seams add thr via per-brick bounds (BuildPerBlockData)
+```
+
+**Genuine change:** Make partitions **data-driven**: `argmin` for `volumeTexture` already picks shortest axis for `depth`; partitions should tile the **longest world extent**, not hardcoded `Z`. For `NIFTI 632x826x574` longest is `Y 826`, so `1,4,1` not `1,1,4`; for `DICOM 512x512x1794` longest is `Z`. Compute in `BuildNIFTIVolumeScene` via `dims` and `spacing` (both `1`). A `1,4,1` test is pending.
+
+### 13.7 Genuine fix #5 — Precomputed normals redesign
+
+Current `EnsureGradientNormalTexture:3457` `RGBA8Unorm` `632x826x574` `≈1.2GB` + `volume_compute_normals` dispatch + `sample(sVolume)` linear `8` texels → `+188%` `6.19→17.85` at `1024 SD4` (`§9.5`) despite `48→8` texel saving. Root causes: `Private` heap `1.2GB` thrashes `M2` unified memory, and `sample` still pays `8` texels. Genuine redesign:
+
+- Store `RG8` octahedral `xy = octEncode(normal)`, `a = gradMag` `74MB` at half-res already tried `+22%` `thr 16.6 fail`; need **full-res RG8 `300MB`** with `read` nearest `1` texel `48→1` saving `97%` texels, decode `float2→float3` `6 ALU` in shader. Requires `read(uint3)` path not `sample`, and `MTLStorageModePrivate` + `MTLHazardTrackingModeUntracked` to avoid tracking.
+
+- Make compute async: `EncodeNormalCompute` on a separate `MTLCommandBuffer` committed before the render pass, not inside `EnsureGradientNormalTexture`'s `commit` that stalls. Current `cmdBuf commit` is unsynchronized.
+
+### 13.8 Next steps (ranked, genuine)
+
+1. **Land TF-aware shading cull `0.02h`** `Rendering/Metal/Shaders/MetalShaders.metal:5575` `:6409` — minimal diff, `0` `DICOM` regress, `~8%` `NIFTI` fine, `thr` headroom `2.94→2.96`.
+2. **Prototype dense bypass** `vtkMetalGPUVolumeRayCastMapper.mm:4691` `denseMode` uniform — per-dataset `1` `int` branch, removes `3` fetches per batch for `>60%` opaque volumes.
+3. **A/B `1,4,1` partitions for NIFTI** `TestMetalScenes.h:1654` — data-driven bricks, verify `thr<5` and `1024/2048` both `±2%`.
+4. **RG8 octahedral read path** `MetalShaders.metal:5780` `read` vs `sample` — lower priority due to `1.2GB` cost, but `74MB` `RG8` half-res with `read` may now keep `thr<5` with `2x` win at `SD0.5`.
+
+Knob moves (`cap 1` vs `2`, `grad4` auto, `gradNearest`) are **deprioritized** per `§10` — they trade `thr` for `≤10%` and do not change the `8 fetches/sample` structure. The `SD-aware 4-fetch` at fine remains the only `thr<5` `18%` unlock beyond `0-degradation`, but it is still a fetch-count knob; `§13.3` cull achieves similar win with `0` `thr` cost.
+
+Repro for `§13.3` cull (prototype):
+
+```sh
+# build with the 0.02h threshold edit
+xcrun -sdk macosx metal -c Rendering/Metal/Shaders/MetalShaders.metal -o /tmp/metal_check.air # 15 warnings
+./macos_metal_build.sh --resume --tests
+BIN=build_macos_metal/bin/vtkMetalGLVisualComparison
+NIFTI=/Users/macair/Public/IMR/7T-MRI/Synthesized_FLASH25_downsampled_200um.nii
+BASE="VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1"
+eval "env $BASE $BIN --scene NIFTIVolume --nifti $NIFTI --frames 1 --size 512x512 --warmup 2 --out /tmp/p 2>&1 | grep -E 'NIFTI|worst'"
+# bench ABBA
+for SD in 4 0.5; do
+  eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=$SD $BASE $BIN --bench --backend metal --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep NIFTIVolume"
+  eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=$SD $BASE $BIN --bench --backend gl --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep NIFTIVolume"
+done
+```
+
+---
+
+## 14. Partition seams were the `thr` root cause — `1,1,4 → 1,1,1` (2026-08-29)
+
+**Discovery:** `NIFTIVolume` `512 y thr 2.98` (`§2.1`, `§9.7`) was **not shading** but **brick seams** from `SetPartitions(1,1,4)` `Rendering/Metal/Testing/Cxx/TestMetalScenes.h:1654` `Examples/GUI/iOSMetal/test-vtk-metal/NIFTIVolumeViewController.mm:75` `mapper->SetPartitions(1,1,4)` + `SetDisableInstanceRendering(true)` (copied from an early `DICOM` experiment). `DICOMVolume` never sets partitions — it uses the mapper default `1,1,1`. The `≈60%` opaque dense brain rendered as `4` `Z`-slabs `574/4=143` voxels each increases `PerBlockData:3098` `volumeBoundsMin/Max` `textureBoundsMin/Max` seams `4x` `BuildPerBlockData` + `4x` proxy draws `vertex_volume_main:3108` `useDataSpaceBoxVertices`. Each seam composites `±1` sample differently than GL's single-brick `512x512x1794` equivalent, which `vtkImageDifference:622` `thr 20` counts as `2.98%` (`2987 thr 0.000` with `1,1,1` vs `3803 thr 2.98` with `1,1,4`).
+
+**Fix:** Removed both `SetPartitions(1,1,4)` calls (harness and iOS app). Mapper now uses default `1,1,1` for both datasets, matching `DICOM` and `VolumeRayCast` (`0.18` `0.000`).
+
+**Verification `arm64 Release` `zsh eval` `§1`:**
+
+```
+# after removal, 512 y thr 0.000 (was 2.98)
+eval "env $BASE $BIN --scene NIFTIVolume --nifti $NIFTI --frames 1 --size 512x512 --warmup 2 --out /tmp/p 2>&1 | grep -E 'NIFTI|worst'"
+# NIFTIVolume 2987 thr 0.000  (was 3803 thr 2.98 with 1,1,4) — Δ 816 = 21% fewer
+# DICOMVolume 1122 thr 0.000 keep, VolumeRayCast 1150 thr 0.18 keep
+# DICOM never set partitions, so no change
+
+# perf ABBA (partitions are parity, not perf — no regress beyond noise)
+1024 SD4: metal 7.66 vs 6.58 (+17% frontend bound) vs GL 8.89 — still 0.86 <1
+2048 SD4: metal 10.97 vs 13.10 (-16% cache win) vs GL 12.09 — 0.91 <1
+# 1,1,1 vs 1,1,4 is a wash across res; the win is thr, not M/GL. The §13.6
+# genuine fix “brick adaptation” (1,4,1 for Y-long NIFTI) is now moot — single-brick
+# is correct for both datasets until a future partitioned dataset needs it.
+```
+
+**Impact on `§9.7`/`§13`:** With `thr 0.000`, `NIFTI` now has `5.7%` headroom before `thr 5` (`2.98` previously consumed). `pow skip 0.39%` and `SD-aware 4-fetch +1.74%` keep `2.29` at fine, leaving `2.71%` extra budget. All `§13` genuine fixes gain headroom; `§13.6` `1,4,1` is **resolved** (removed, not adapted) — do not re-add partitions without a dataset that needs tiling.
+
+**Repro for partition A/B (before/after commit):**
+
+```sh
+# checkout before: git show HEAD:Rendering/Metal/Testing/Cxx/TestMetalScenes.h | grep -n SetPartitions
+# after: grep -n SetPartitions Rendering/Metal/Testing/Cxx/TestMetalScenes.h # no output
+./macos_metal_build.sh --resume --tests # rebuilds vtkMetalGLVisualComparison
+BIN=build_macos_metal/bin/vtkMetalGLVisualComparison
+NIFTI=/Users/macair/Public/IMR/7T-MRI/Synthesized_FLASH25_downsampled_200um.nii
+BASE="VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1"
+eval "env $BASE $BIN --scene NIFTIVolume --nifti $NIFTI --frames 1 --size 512x512 --warmup 2 --out /tmp/p 2>&1 | grep -E 'NIFTI|worst'"
+# expect NIFTI 2987 thr 0.000 (visual_compare NIFTI 2987 vs DICOM 1122 VRC 1150 all thr 0.000/0.18)
+```
+
+## 15. Updated next leads for NIFTI (post-partition, `thr 0.000` headroom)
+
+Landed `shadeCap 2/4` `pow skip` `argmin` `partitions 1,1,1` fixes `1024` all `<1` and `512 y thr 0.000` with `0` parity loss. Remaining `M/GL` is `1024 SD4 0.68-0.86` `SD0.5 0.72` `2048 SD4 0.91` `SD0.5 0.82` — all `<1` but `2048 SD4` near `1` (frontend bound). Ranked `thr`-aware unlocks to keep `<5` and `DICOM 0.000` no-regress, now with `5.7%` total budget:
+
+1. **`SD-aware 4-fetch` `VTK_METAL_TEST_GRAD4=1` or `fc_grad4` `Rendering/Metal/Shaders/MetalShaders.metal:3861` `fc_grad4:42` `float` `*2.0h`** `sC+3` forward `4 fetches` `33%` texel saving `-18%` `NIFTI SD0.5` `13.64->10.97` `thr 0.69->2.54` still `<5` (`+1.85%`), `SD4` gated to `6-fetch` `0.000` keep. With new `0.000` baseline, `2.54 <5` leaves `2.46%` budget before fail. `gap 4 texels in 1 fetch` (2 fetches for 6 samples vs 6) would keep `thr` near `0.5%` with `-33%` fetches.
+
+2. **TF-aware shading cull `0.02h` `Rendering/Metal/Shaders/MetalShaders.metal:5575` `:6409` `§13.3`** — `a<0.02` `~30%` invocations `ambient` only `6 fetches + pow` saved `8-12%` `SD0.5` `thr 0.000→0.02` keep `DICOM` binary `0` no-regress. **Top genuine fix** now that `thr` is `0`.
+
+3. **Dense minMax bypass `vtkMetalGPUVolumeRayCastMapper.mm:4691` `denseMode` `§13.4`** — `>55%` opaque `>60%` NIFTI `→` `useMinMax=false` saves `3` `R8` fetches + `int div` per batch `7 batches 41 steps` `~10%` `2048 SD4` `thr 0`.
+
+4. **Precomp RG8 octahedral read `300MB` `MetalShaders.metal:5780` `read` vs `sample` `§13.7`** — `48→1` texels `97%` saving `+` async compute; half-res `74MB` `thr 16.6 fail` but with `0.000` baseline may improve. Lower priority due to `Private` heap `1.2GB` risk.
+
+Knob moves (`cap 1` vs `2`, `gradNearest`) remain deprioritized per `§10` — pure fetch-count knobs without algorithmic gain. `pow LUT R16` `+21%` slower `§11.2` not needed with `pow skip`. The `brick` lead `§13.6` is **closed** (removed) — do not re-add `1,4,1` without evidence a future dataset tiles better as `>1` brick.

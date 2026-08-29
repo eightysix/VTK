@@ -72,7 +72,6 @@
   mapper->SetUseIGNJitter(true);
   mapper->AutoAdjustSampleDistancesOff();
   mapper->SetSampleDistance(0.5);
-  mapper->SetPartitions(1, 1, 4);
   mapper->SetDisableInstanceRendering(true);
 
   _volumeData = castToU8->GetOutput();

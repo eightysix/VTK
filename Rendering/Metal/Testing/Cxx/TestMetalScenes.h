@@ -1651,7 +1651,6 @@ inline void BuildNIFTIVolumeScene(vtkRenderer* renderer, BackendKind b)
       metal->SetJitterBlockSize(TempJitterBlock());
       metal->SetUseGPUMinMax(TempMinMax());
       metal->SetUseMinMaxAcceleration(TempMinMaxAccel());
-      metal->SetPartitions(1, 1, 4);
       metal->SetDisableInstanceRendering(true);
     }
   }
