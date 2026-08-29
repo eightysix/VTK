@@ -4360,7 +4360,7 @@ inline half4 marchVolumeUnified(
   //   with all exits latched, then a divergent tail loop up to the per-fragment
   //   bound. The per-fragment bound is floored at mainSteps so short rays keep
   //   SIMT lanes locked through the uniform phase.
-  int maxSteps = max(1, int(ceil((p.tEnd - firstT) / p.stepSize)) + 1);
+  int maxSteps = max(1, int(ceil((p.tEnd - firstT) / p.stepSize)));
   int mainSteps = 0;
   if (fc_marchVariant == 4 && volumeUniforms.maxStepsFrame > 0.5)
   {
@@ -8257,7 +8257,7 @@ fragment VolumeAtlasOut fragment_volume_ray_atlas(
                       + p.rayDir * firstT;
   float currentT = firstT;
 
-  int maxSteps = max(1, int(ceil((p.tEnd - firstT) / p.stepSize)) + 1);
+  int maxSteps = max(1, int(ceil((p.tEnd - firstT) / p.stepSize)));
   int mainSteps = 0;
   if (fc_marchVariant == 4 && volumeUniforms.maxStepsFrame > 0.5)
   {
@@ -8378,7 +8378,7 @@ inline bool synthesizeAtlasRay(
 
   float firstT = jitter;   // checkBounds=true branch
   float3 currentPoint = rayOrigin + rayDir * tStart + rayDir * firstT;
-  int maxSteps = max(1, int(ceil((s.totalBoxT - firstT) / stepSize)) + 1);
+  int maxSteps = max(1, int(ceil((s.totalBoxT - firstT) / stepSize)));
   if (volumeUniforms.maxStepsFrame > 0.5)
   {
     maxSteps = min(maxSteps, int(volumeUniforms.maxStepsFrame));
