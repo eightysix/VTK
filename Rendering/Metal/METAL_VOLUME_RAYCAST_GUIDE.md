@@ -1,6 +1,6 @@
 # Metal Volume Ray-Cast Mapper & Shader — General Guide
 
-*Onboarding guide for `vtkMetalGPUVolumeRayCastMapper` + `MetalShaders.metal`. For NIFTI/DICOM perf deep-dives see `PerformanceInvestigation/perf_investigation_part2.md` and `PERFORMANCE_INVESTIGATION.md`.*
+*Onboarding guide for `vtkMetalGPUVolumeRayCastMapper` + `MetalShaders.metal`. For perf deep-dives see `PerformanceInvestigation/perf_investigation_part2.md`, `PERFORMANCE_INVESTIGATION.md` and `PerformanceInvestigation/HARNESS_VS_APP_GAP.md` (previous jitter-gap investigation, `PerformanceInvestigation/HARNESS_VS_APP_GAP.md:1` harness vs app, now superseded by `METAL_VOLUME_RAYCAST_GUIDE.md` + `perf_investigation_part2.md:7` M>GL).*
 
 ## 1. Overview
 
@@ -111,4 +111,4 @@ All volume flags are `function_constant` (`[[function_constant(N)]]`) baked at p
 * Far-edge sliver `b2e0286446` `Shaders/MetalShaders.metal:5634` `if(i>0 && currentT>=p.tEnd-1e-6)` — grazing `firstT>tEnd` `maxSteps=1` now composites clamped boundary; before `0` samples `2024` pixels `512²`.
 * `M>GL` slowdown `NIFTI SD0.5 f≥8` `§7` — short dense chord, wide fetch array `n*7` + `pow` + `I$` spill; fix `batchCap=min(fragBatch,maxSteps/4)` `Shaders/MetalShaders.metal:5600`.
 
-See `CINEMATIC_METAL_PLAN.md` for cinematic, `VolumeRayCastPerfRegression.md` for history.
+See `CINEMATIC_METAL_PLAN.md` for cinematic, `VolumeRayCastPerfRegression.md` for history, `PerformanceInvestigation/HARNESS_VS_APP_GAP.md:1` for previous harness-vs-app jitter gap (refuted, `perf_investigation_part2.md:7` now canonical for M>GL).
