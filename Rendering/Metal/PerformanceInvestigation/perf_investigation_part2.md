@@ -704,3 +704,54 @@ eval "env $BASE VTK_METAL_TEST_SAMPLE_DISTANCE=0.5 $BIN --scene NIFTIVolume --ni
 eval "env $BASE VTK_METAL_TEST_SAMPLE_DISTANCE=0.5 $BIN --bench --backend metal --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep NIFTIVolume" # 9.25 vs 16.28
 eval "env $BASE $BIN --bench --backend gl --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep NIFTIVolume" # 18.07
 ```
+
+---
+
+## 17. SD4 vs SD0.5 — why coarse is less competitive and how to close it (2026-08-29, `1,1,1` + `8:2` + cull)
+
+**Current gap with cull `0.02h` + `8:2` cap `1,1,1` (`20f/5w @1024` `15f/5w @2048`):**
+
+```
+1024: SD4 cull 6.81/9.12 0.75 vs SD0.5 cull 9.43/18.23 0.52 — SD4 0.23 less competitive
+2048: SD4 cull 10.68/11.61 0.92 vs SD0.5 cull 25.48/53.07 0.48 — SD4 0.44 less competitive
+      # without cull: 7.47/8.66 0.86 vs 16.28/18.34 0.88 gap 0.02 — cull widened gap
+```
+
+**Root cause — fixed vs variable cost:**
+
+- **Sample count:** `SD4` `≈41` steps (`200` at `SD0.5`) `×0.6` coverage `24M` vs `120M` samples `@1024`. `TF cull` saves `30%` → `7M` vs `36M` samples (`42M` vs `216M` fetches `6 fetches+pow` each). `GL` time scales `9.12→18.23 2.0×` `11.61→53.07 4.5×` for `4.8×` more steps; `Metal` `6.81→9.43 1.38×` `10.68→25.48 2.38×` — `Metal` scales better, so `SD0.5` looks more competitive.
+
+- **Fixed overhead:** `setupVolumeRay:4180` `intersectBox`, `MarchParams:4262` `firstT/maxSteps`, `useMinMax:4691` preamble `while(w<extent)` `2-3 R8` `block/super` fetches + `int div` per batch) is per-batch. `SD4` with `cap 2` `→20` batches vs `SD0.5` with `cap 8` `→25` batches — per-batch overhead is `~30%` of `7 ms` `SD4` but `~8%` of `25 ms` `SD0.5`.
+
+- **Batch efficiency:** `SD4` `41=20*2+1` tail `1` with `cap 2` narrow; `SD0.5` `200=25*8` no tail with `cap 8` wide `§14.1`. Narrow `2` cannot hide fetch latency as well as `8`.
+
+- **Cache:** `SD4` jumps `4×` world units per step → `4×` texel stride, lower spatial reuse; `SD0.5` stays more coherent. Not `jitter` — `VTK_METAL_TEST_JITTER_BLOCK` trades `thr 0.000→3.74` at `blk2` for `-10%` but degrades quality per user, so **not used**.
+
+**Genuine fixes tested for SD4 (with cull `0.02h`, `1,1,1`, `20f/5w @1024`):**
+
+```
+SD4 1024: baseline cull 7.05/8.76 0.80 (thr 0.000)
+         +GRAD4 4-fetch `VTK_METAL_TEST_GRAD4=1` 6.45/8.76 0.74 thr 2.46 -8% vs cull alone
+         +GRAD_NEAREST 6*1 `VTK_METAL_TEST_GRAD_NEAREST=1` 5.85/8.76 0.67 thr 1.89 -17% vs cull (best)
+         +MINMAX=0 7.21/8.76 0.82 thr 0.000 +2% slower — minMax still helps
+         +GRAD4 at coarse now PASS thr 2.46 <5 (was fail with 1,1,4 partitions thr 5.79) — headroom from 1,1,1
+
+SD0.5 1024: baseline cull 9.43/18.07 0.52 thr 0.034
+           +GRAD4 8.60/18.07 0.48 thr 2.22 -9% vs cull
+           +GRAD_NEAREST 8.81/18.07 0.49 thr 2.47 -7% vs cull
+```
+
+With `1,1,1` `thr 0.000` headroom, `GRAD4`/`GRAD_NEAREST` are **PASS at both SD** (`2.46/1.89` at `SD4`, `2.22/2.47` at `SD0.5`). `GRAD_NEAREST` `6*1` `87%` texel saving (`6*8→6*1`) is `17%` at `SD4` `7%` at `SD0.5` vs cull alone, better than `GRAD4` `33%` saving at coarse. `2048 SD4` cull+GRAD4 `9.27/11.71 0.79` vs cull `10.61/11.71 0.91` — `-13%`.
+
+**Recommendation:** `SD4` disadvantage is **expected** (fewer steps → less cull benefit, more fixed overhead) and already within `<1` (`0.75/0.92`); to close it further without touching `jitter` (quality), **enable `GRAD4` or `GRAD_NEAREST` at all SD** when `cull` is enabled — `GRAD_NEAREST` `6*1` gives `SD4 0.67` (`7.05→5.85` `-17%` `thr 1.89`) and `SD0.5 0.49` (`9.43→8.81` `-7%` `thr 2.47`), both `<5`. `GRAD_NEAREST` is slightly better than `GRAD4` at coarse and similar at fine, with no `DICOM` regress (`8.20→8.55` `+4%` noise). Keep `jitter` at `1` (per-pixel blue noise) — `JITTER_BLOCK` not used per user.
+
+Repro for SD4 GRAD_NEAREST:
+
+```sh
+BIN=build_macos_metal/bin/vtkMetalGLVisualComparison
+NIFTI=/Users/macair/Public/IMR/7T-MRI/Synthesized_FLASH25_downsampled_200um.nii
+BASE="VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1"
+eval "env $BASE VTK_METAL_TEST_GRAD_NEAREST=1 $BIN --scene NIFTIVolume --nifti $NIFTI --frames 1 --size 512x512 --warmup 2 --out /tmp/p 2>&1 | grep -E 'NIFTI|worst'" # thr 1.89 <5
+eval "env $BASE VTK_METAL_TEST_GRAD_NEAREST=1 $BIN --bench --backend metal --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep NIFTIVolume" # 5.85 vs 7.05
+eval "env $BASE $BIN --bench --backend gl --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep NIFTIVolume" # 8.76
+```
