@@ -634,3 +634,64 @@ Landed `shadeCap 4:2` (`fine 4` `coarse 2`) `pow skip` `argmin` `partitions 1,1,
 4. **Precomp RG8 octahedral read `300MB` `MetalShaders.metal:5780` `read` vs `sample` `§13.7`** — `48→1` texels `97%` saving `+` async compute; half-res `74MB` `thr 16.6 fail` but with `0.000` baseline may improve. Lower priority due to `Private` heap `1.2GB` risk.
 
 Knob moves (`cap 1` vs `2`, `gradNearest`) remain deprioritized per `§10` — pure fetch-count knobs without algorithmic gain. `pow LUT R16` `+21%` slower `§11.2` not needed with `pow skip`. The `brick` lead `§13.6` is **closed** (removed) — do not re-add `1,4,1` without evidence a future dataset tiles better as `>1` brick.
+
+---
+
+## 16. TF-aware shading cull `0.02h` re-measured post-partition (2026-08-29, `1,1,1` + `4:2` cap)
+
+Prototype `Rendering/Metal/Shaders/MetalShaders.metal:5575` `MV9` `:` `6409` `PROC_UNROLL` `:` `5176` baseline `:` `7092` `if(opa>0.02h)` `ambient` fallback (was `0.0h`) — **quality-aware cull** tying `FLASH25` foot `0.015@10` to `TF`. `arm64 Release` `BASE` `eval` as `§1`, `20f/5w @1024` `15f/5w @2048`:
+
+```
+512 y thr: SD4 2986 thr 0.000 → 2999 thr 0.000 (Δ 0.000) SD0.5 2894 thr 0.069 → 4165 thr 0.034 (Δ -0.035) — keep <5, DICOM y 0.000 keep
+     # shade OFF thr 0.000, so 0.02 threshold adds no new error at coarse, tiny at fine (<0.1%)
+
+1024: SD4 cull 6.83/8.55 0.80 vs baseline 7.47/8.66 0.86 — -8% (pow skip already 3%, cull adds 5% on top)
+      SD4 cull+GRAD4 6.00/8.55 0.70 — cull+4-fetch stack: -20% vs baseline 0.86
+      SD0.5 cull 9.25/18.07 0.51 vs baseline 16.28/18.34 0.88 — -42% (30% invocations culled, 6 fetches + pow saved)
+      SD0.5 cull+GRAD4 8.93/18.07 0.49 — -44% vs baseline (GRAD4 adds only 3% on top of cull)
+
+2048: SD4 cull 10.46/11.75 0.89 vs baseline 10.40/11.87 0.88 — 0% (coarse already narrow cap 2, cull saves little at 41 steps)
+      SD4 cull+GRAD4 9.18/11.75 0.78 — -12% vs baseline
+      SD0.5 cull 25.07/51.88 0.48 vs baseline 48.58/53.61 0.91 — -47% (200 steps × 0.6 coverage × 30% cull = 36 samples saved)
+      SD0.5 cull+GRAD4 23.56/51.88 0.45 — -50% vs baseline
+
+DICOM 1024 SD4: cull 8.20/38.51 0.21 vs baseline 8.43/38.51 0.22 — 0% (binary TF 0/1 never hits 0.02)
+```
+
+**Why cull wins now more:** With `1,1,1` partitions `thr 0.000` headroom, `~40%` of `FLASH25` samples sit at `a<0.02` (histogram `U8 18→45` ramp). Previously `1,1,4` brick seams forced `+2.98 thr` and made `cull` look `+0.02 thr`; now it is `0.000→0.000`. The per-sample cost is `6 fetches + pow 30 ALU`; culling `30%` of `120M` samples at `1024 SD0.5` saves `~216M` fetches + `36M` `pow`.
+
+**Post-cull re-sweep of other leads (`§15`):**
+
+```
+GRAD4 4-fetch `VTK_METAL_TEST_GRAD4=1` with cull: SD4 thr 2.46 <5 (was 2.45 without cull) — now PASS at coarse (was fail with 1,1,4), SD0.5 thr 2.21 <5 (was 2.02) — PASS at both. Perf cull+GRAD4 vs cull alone: SD4 -12% (6.83→6.00), SD0.5 -3% (9.25→8.93). GRAD4 adds 3-12% on top of cull, still thr<5.
+
+GRAD_NEAREST 6*1 `VTK_METAL_TEST_GRAD_NEAREST=1` with cull: thr 1.88 SD4 / 1.48 SD0.5 <5 (was 1.88/1.48 without cull) — PASS at both, perf 6.23/14.33 (0.65/0.75) similar to GRAD4.
+
+MINMAX=0 with cull: 1024 SD4 7.22 vs cull 6.83 (+6% slower) — minMax still helps even dense (block/super leaps save ~0.4 ms), so dense bypass not win with cull.
+
+Precomp full-res with cull: not re-measured — still 1.2GB Private heap + compute dispatch, expected still +188% vs 6-fetch.
+```
+
+**Verdict:** TF-aware cull `0.02h` is the **largest genuine win** post-partition: `1024 SD0.5 0.88→0.51` `2048 SD0.5 0.91→0.48` `~40-47%` with `thr 0.034` `<5`, `DICOM 0`. It subsumes most of `GRAD4`'s win (cull saves 6 fetches fully, GRAD4 saves 2). Landing order:
+
+1. **Land cull `0.02h`** `MetalShaders.metal:5575` `:6409` `:5176` `:7092` — `0` `DICOM` regress, `thr 0.000`, `~40%` at fine, `8%` at coarse. Already prototyped, `xcrun metal -c` `15 warn` clean.
+
+2. **Enable `GRAD4` at all SD** `VTK_METAL_TEST_GRAD4=1` or `fc_grad4` default — now `thr 2.46` at coarse `<5` (was fail before 1,1,1), adds `12%` at coarse `3%` at fine on top of cull. Can be `SD-aware` gated to fine only to keep coarse `0.000`, but with `0.000` headroom coarse `2.46` is still safe.
+
+3. **Dense bypass** deprioritized — with cull, `MINMAX=0` is `+6%` slower, so no.
+
+**Repro for cull (current prototype):**
+
+```sh
+# current branch has cull 0.02h in MetalShaders.metal:5575 etc. — rebuild
+./macos_metal_build.sh --resume --tests
+BIN=build_macos_metal/bin/vtkMetalGLVisualComparison
+NIFTI=/Users/macair/Public/IMR/7T-MRI/Synthesized_FLASH25_downsampled_200um.nii
+BASE="VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1"
+eval "env $BASE $BIN --scene NIFTIVolume --nifti $NIFTI --frames 1 --size 512x512 --warmup 2 --out /tmp/p 2>&1 | grep -E 'NIFTI|worst'"
+# thr 0.000 SD4 / 0.034 SD0.5
+eval "env $BASE VTK_METAL_TEST_SAMPLE_DISTANCE=0.5 $BIN --scene NIFTIVolume --nifti $NIFTI --frames 1 --size 512x512 --warmup 2 --out /tmp/p05 2>&1 | grep -E 'NIFTI|worst'"
+# bench
+eval "env $BASE VTK_METAL_TEST_SAMPLE_DISTANCE=0.5 $BIN --bench --backend metal --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep NIFTIVolume" # 9.25 vs 16.28
+eval "env $BASE $BIN --bench --backend gl --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep NIFTIVolume" # 18.07
+```
