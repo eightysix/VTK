@@ -9613,25 +9613,35 @@ inline half4 cinematic_march_core(
     float a = float(tf.a);
     if (a < 0.04) { cur += evalStep; continue; }
 
-    float3 grad = float3(
-      sampleVolumeScalar(volumeTexture, cur + float3(gs.x, 0, 0)) -
-      sampleVolumeScalar(volumeTexture, cur - float3(gs.x, 0, 0)),
-      sampleVolumeScalar(volumeTexture, cur + float3(0, gs.y, 0)) -
-      sampleVolumeScalar(volumeTexture, cur - float3(0, gs.y, 0)),
-      sampleVolumeScalar(volumeTexture, cur + float3(0, 0, gs.z)) -
-      sampleVolumeScalar(volumeTexture, cur - float3(0, 0, gs.z)));
-    float glen = length(grad);
-    float gmag = saturate((glen - 0.018) * 5.5);
+    float3 N;
+    float gmag;
+    if (u.useNormalTexture > 0.5) {
+      float4 nt = normalTexture.sample(sVolume, cur);
+      N = normalize(nt.xyz * 2.0 - 1.0);
+      gmag = saturate(nt.w);
+      if (dot(N, V) < 0.0) N = -N;
+    } else {
+      float3 grad = float3(
+        sampleVolumeScalar(volumeTexture, cur + float3(gs.x, 0, 0)) -
+        sampleVolumeScalar(volumeTexture, cur - float3(gs.x, 0, 0)),
+        sampleVolumeScalar(volumeTexture, cur + float3(0, gs.y, 0)) -
+        sampleVolumeScalar(volumeTexture, cur - float3(0, gs.y, 0)),
+        sampleVolumeScalar(volumeTexture, cur + float3(0, 0, gs.z)) -
+        sampleVolumeScalar(volumeTexture, cur - float3(0, 0, gs.z)));
+      float glen = length(grad);
+      gmag = saturate((glen - 0.018) * 5.5);
+      N = (glen > 1e-6) ? normalize(-grad) : V;
+      if (dot(N, V) < 0.0) N = -N;
+    }
     // Dust only: low a AND low gmag. Never a < 0.12 alone — that is the cortex.
     if (!haveSurface && gmag < 0.20 && a < 0.08) { cur += evalStep; continue; }
     if (gmag < 0.12 && a < 0.20) { cur += evalStep; continue; }
 
-    float3 N = (glen > 1e-6) ? normalize(-grad) : V;
-    if (dot(N, V) < 0.0) N = -N;
-
     if (!haveSurface) {
-      // First real interface. No aAccum gate — grazing never reaches 0.18.
-      if (gmag < 0.16 || a < 0.08) { cur += evalStep; continue; }
+      // Fold edge (high gmag) or real tissue (a past 0.10 shelf) — homogeneous 0.10 shell with no gradient = haze → skip
+      bool fold   = (gmag > 0.22 && a > 0.08);
+      bool tissue = (a > 0.28);
+      if (!fold && !tissue) { cur += evalStep; continue; }
       float tauAO = optical_depth(volumeTexture, transferFunctionTexture,
                                   cur + N * voxel,  N, aoDist,       6, scalarScale, scalarBias, sigma);
       float tauSS = optical_depth(volumeTexture, transferFunctionTexture,
@@ -9648,11 +9658,8 @@ inline half4 cinematic_march_core(
     float shade = mix(0.16, saturate(wrap + fill), gmag);
     shade *= mix(0.55, 1.0, ao);   // cavities crushed were at 0.48
 
-    float3 albedo = float3(tf.rgb);
-    float lum = dot(albedo, float3(0.30, 0.59, 0.11));
-    albedo = mix(albedo, float3(lum), 0.40);          // kill TF yellow (1,1,0.78) → cream cap
-    albedo *= 0.82;
-    albedo *= mix(float3(1.0), ssColor, 0.10 * ss);
+    float3 albedo = float3(tf.rgb) * 0.90;
+    albedo *= mix(float3(1.0), ssColor, 0.08 * ss); // SSS stain only, pigment in TF
     albedo *= mix(0.90, 1.0, gmag);
 
     float side    = saturate(1.0 - abs(ndl));

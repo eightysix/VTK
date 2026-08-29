@@ -1684,8 +1684,13 @@ inline void BuildNIFTIVolumeScene(vtkRenderer* renderer, BackendKind b)
           opacity->AddPoint(rescale(26.0), 0.55);
           opacity->AddPoint(rescale(34.0), 0.95);
           opacity->AddPoint(rescale(45.0), 1.0);
+          // Wax color TF — pigment in TF, not lum hack in marcher (was 1,1,0.78 lemon)
+          color->RemoveAllPoints();
+          color->AddRGBPoint(rescale(12.0), 0.00, 0.00, 0.00);
+          color->AddRGBPoint(rescale(20.0), 0.55, 0.42, 0.36);
+          color->AddRGBPoint(rescale(34.0), 0.86, 0.68, 0.58);
+          color->AddRGBPoint(rescale(45.0), 0.92, 0.78, 0.68);
           property->SetInterpolationTypeToLinear();
-          // Warmer cortex already in color TF (1.0/1.0/0.78 at top), keep it
         }
       }
     }

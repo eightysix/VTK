@@ -285,7 +285,7 @@ struct VolumeMapperUniforms
   float SubsurfaceStrength;        // 1788..1791 0..1
   uint32_t CinematicFrameSeed;     // 1792..1795 temporal jitter seed
   uint32_t CinematicAccumCount;    // 1796..1799 progressive count
-  float CinematicMajorantSigma;    // 1800..1803 Woodcock majorant sigma_t
+  float CinematicMajorantSigma;    // 1800..1803 reserved (Woodcock majorant, unused at 1 spp DVR)
   float _padCinematic;             // 1804..1807 pad
   float CinematicEnabled;          // 1808..1811 1.0 when cinematic active
   float _padCinematicEnd[3];       // 1812..1823 tail pad to 1824
@@ -3677,7 +3677,7 @@ void vtkMetalGPUVolumeRayCastMapper::PurgeCaches()
   ReleaseMetalObject(this->ComputeMarchQueue);
   this->RayBinIndicesCapBytes = 0;
 
-  // Cinematic heaps + PSO caches (optimal compute variant).
+  // Cinematic heaps + PSO caches (shaded DVR single variant).
   this->ReleaseCinematicResources();
 
   // Segment heaps + per-camera cache.
@@ -3785,7 +3785,7 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseGraphicsResources(vtkWindow* vtkNotU
   }
   this->ComputeMarchBinnedPipelineCache.clear();
 
-  // Cinematic variant resources (optimal compute).
+  // Cinematic variant resources (shaded DVR single).
   this->ReleaseCinematicResources();
 
   // §38.18.1: release segment Private heaps (SegPool 64 MB etc.) that were
@@ -8652,7 +8652,7 @@ void vtkMetalGPUVolumeRayCastMapper::BindComputeMarchTextures(
 }
 
 //------------------------------------------------------------------------------
-// Cinematic rendering — optimal compute variant helpers
+// Cinematic — shaded DVR helpers (single 8x8, wax AO/SSS, no Woodcock)
 bool vtkMetalGPUVolumeRayCastMapper::EnsureCinematicResources(void* deviceVoid, int width, int height)
 {
   if (this->CinematicAccumTextureA && this->CinematicAccumTextureB &&
@@ -8770,11 +8770,7 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateCinematicComputePipeline(void* 
    [constants setConstantValue:&segHop type:MTLDataTypeBool withName:@"fc_segHop"];
    BOOL exitTheta = (VolumeExitTheta() > 0.0f) ? YES : NO;
    [constants setConstantValue:&exitTheta type:MTLDataTypeBool withName:@"fc_exitTheta"];
-   // Cinematic specialization — optimal compute variant always on for this pipeline
-   BOOL cinematic = YES;
-   BOOL denoise = (this->CinematicDenoise > 0.0f) ? YES : NO;
-   [constants setConstantValue:&cinematic type:MTLDataTypeBool withName:@"fc_cinematic"];
-   [constants setConstantValue:&denoise type:MTLDataTypeBool withName:@"fc_denoise"];
+    // Cinematic — no fc_cinematic/fc_denoise (reads u.cinematicEnabled)
   // Unused FV constants keep default NO
   BOOL useDepthTexture = NO, useCameraInside = NO, dense = NO, volNearestCoarse = NO, quadGrad = NO, grad4 = NO, gradNearest = NO, fineSD = NO, gradFloat = NO;
   int fragBatchFc = 0, cmBatchFc = 0; BOOL cmSplitFc = NO, cmSegHopFc = NO;
@@ -10499,7 +10495,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   uniforms.RectCoordsBias[2] = this->RectCoordsBias[2];
   uniforms.RectCoordsBias[3] = 0.0f;
 
-  // Cinematic rendering uniforms (optimal compute variant — Woodcock/HG/NEE)
+  // Cinematic uniforms — shaded DVR 1 spp (Samples/Bounces/Denoise reserved, blend is AO sigma)
   {
     vtkVolumeProperty* cprop = vol->GetProperty();
     uniforms.CinematicEnabled = this->CinematicRendering ? 1.0f : 0.0f;
@@ -10982,7 +10978,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         return -1;
       }();
 
-      // Cinematic rendering — optimal compute variant (binned Woodcock/HG/NEE + temporal/denoise)
+      // Cinematic — shaded DVR 1 spp (single 8x8, no binned, cine_accum is 1 spp fade)
         if (this->CinematicRendering && !selectionRender && !usePartitions && !cameraInside) {
           // End current encoder for compute dispatch (same precedent as slab/compute paths)
           id<MTLRenderCommandEncoder> curEnc = (__bridge id<MTLRenderCommandEncoder>)metalRenderWindow->GetCurrentRenderCommandEncoder();
