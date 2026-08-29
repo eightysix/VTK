@@ -393,12 +393,9 @@ private:
   void* ComputeMarchQueue = nullptr; // probe-selected fast-slot queue (§38.8)
 
   // Cinematic — shaded DVR (wax AO/SSS, front-to-back over, 1 spp)
-  // Single compute variant; binned majorant path deleted (speckle at 1 spp).
-  // Reserved: CinematicComputeBinnedPipeline kept for ABI, unused (binned=false).
+  // Single compute variant; binned majorant path deleted (speckle at 1 spp, kernel removed).
   void* CinematicComputePipeline = nullptr; // volume_compute_march_cinematic
-  void* CinematicComputeBinnedPipeline = nullptr; // volume_compute_march_cinematic_binned (unused, binned=false)
   std::unordered_map<VolumePipelineKey, void*, VolumePipelineKeyHash> CinematicComputePipelineCache;
-  std::unordered_map<VolumePipelineKey, void*, VolumePipelineKeyHash> CinematicComputeBinnedPipelineCache;
   void* CinematicAccumTextureA = nullptr; // RGBA16Float ping-pong accumulation
   void* CinematicAccumTextureB = nullptr;
   int CinematicAccumWidth = 0;
@@ -668,7 +665,7 @@ private:
   void BindComputeMarchTextures(void* encoder, void* atlasA, void* atlasB, void* atlasC, void* outColor);
   // Cinematic — shaded DVR (wax AO/SSS, single 8x8, temporal, bilateral disabled at <4 spp)
   bool EnsureCinematicResources(void* device, int width, int height);
-  void* GetOrCreateCinematicComputePipeline(void* mtlDevice, uint32_t featureMask, bool binned); // binned always false
+  void* GetOrCreateCinematicComputePipeline(void* mtlDevice, uint32_t featureMask);
   void ReleaseCinematicResources();
   bool DispatchCinematicCompute(void* device, void* queue, void* cmdBuf,
     vtkRenderer* ren, vtkVolume* vol, void* uniformBuf, const void* pbd,

@@ -9622,15 +9622,16 @@ inline half4 cinematic_march_core(
       sampleVolumeScalar(volumeTexture, cur - float3(0, 0, gs.z)));
     float glen = length(grad);
     float gmag = saturate((glen - 0.018) * 5.5);
-    // Noise is not a surface. Isolated grains die here.
-    if (!haveSurface && (gmag < 0.28 || a < 0.12)) { cur += evalStep; continue; }
-    if (gmag < 0.14 && a < 0.22) { cur += evalStep; continue; }
+    // Dust only: low a AND low gmag. Never a < 0.12 alone — that is the cortex.
+    if (!haveSurface && gmag < 0.20 && a < 0.08) { cur += evalStep; continue; }
+    if (gmag < 0.12 && a < 0.20) { cur += evalStep; continue; }
 
     float3 N = (glen > 1e-6) ? normalize(-grad) : V;
     if (dot(N, V) < 0.0) N = -N;
 
     if (!haveSurface) {
-      if (aAccum + a < 0.18 || gmag < 0.18) { cur += evalStep; continue; }
+      // First real interface. No aAccum gate — grazing never reaches 0.18.
+      if (gmag < 0.16 || a < 0.08) { cur += evalStep; continue; }
       float tauAO = optical_depth(volumeTexture, transferFunctionTexture,
                                   cur + N * voxel,  N, aoDist,       6, scalarScale, scalarBias, sigma);
       float tauSS = optical_depth(volumeTexture, transferFunctionTexture,
@@ -9643,13 +9644,15 @@ inline half4 cinematic_march_core(
     float ndl  = dot(N, L);
     float ndlF = dot(N, Lfill);
     float wrap = pow(saturate((ndl  + 0.22) / 1.22), 1.20);
-    float fill = pow(saturate((ndlF + 0.50) / 1.50), 1.10) * 0.16;
-    // shade is the whole lighting. No second amb/diff wrap.
-    float shade = mix(0.11, saturate(wrap + fill), gmag);
-    shade *= mix(0.48, 1.0, ao);
+    float fill = pow(saturate((ndlF + 0.50) / 1.50), 1.10) * 0.22;
+    float shade = mix(0.16, saturate(wrap + fill), gmag);
+    shade *= mix(0.55, 1.0, ao);   // cavities crushed were at 0.48
 
-    float3 albedo = float3(tf.rgb) * 0.78;          // peak ~0.78 on white TF
-    albedo *= mix(float3(1.0), ssColor, 0.10 * ss); // ~4% wax, not rust
+    float3 albedo = float3(tf.rgb);
+    float lum = dot(albedo, float3(0.30, 0.59, 0.11));
+    albedo = mix(albedo, float3(lum), 0.40);          // kill TF yellow (1,1,0.78) → cream cap
+    albedo *= 0.82;
+    albedo *= mix(float3(1.0), ssColor, 0.10 * ss);
     albedo *= mix(0.90, 1.0, gmag);
 
     float side    = saturate(1.0 - abs(ndl));

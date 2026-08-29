@@ -8691,28 +8691,25 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseCinematicResources()
   ReleaseMetalObject(this->CinematicDenoiseTexture);
   ReleaseMetalObject(this->CinematicDenoisePipeline);
   ReleaseMetalObject(this->CinematicComputePipeline);
-  ReleaseMetalObject(this->CinematicComputeBinnedPipeline);
   for (auto &e : this->CinematicComputePipelineCache) [(__bridge id)e.second release];
   this->CinematicComputePipelineCache.clear();
-  for (auto &e : this->CinematicComputeBinnedPipelineCache) [(__bridge id)e.second release];
-  this->CinematicComputeBinnedPipelineCache.clear();
   this->CinematicAccumWidth = 0;
   this->CinematicAccumHeight = 0;
   this->CinematicAccumCount = 0;
   this->CinematicAccumValid = false;
 }
 
-void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateCinematicComputePipeline(void* mtlDeviceVoid, uint32_t featureMask, bool binned)
+void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateCinematicComputePipeline(void* mtlDeviceVoid, uint32_t featureMask)
 {
   VolumePipelineKey key;
-  key.type = binned ? 102u : 103u;
+  key.type = 103u;
   key.colorFormat = static_cast<uint32_t>(MTLPixelFormatRGBA16Float);
   key.depthFormat = static_cast<uint32_t>(MTLPixelFormatInvalid);
   key.sampleCount = 1;
   key.featureMask = featureMask;
   key.featureMaskExtra = this->VolumeTextureAxisDepth |
     ((this->CinematicDenoise > 0.0f) ? (1u << 23) : 0u);
-  auto &cache = binned ? this->CinematicComputeBinnedPipelineCache : this->CinematicComputePipelineCache;
+  auto &cache = this->CinematicComputePipelineCache;
   auto it = cache.find(key);
   if (it != cache.end()) return it->second;
   id<MTLDevice> mtlDevice = (__bridge id<MTLDevice>)mtlDeviceVoid;
@@ -8801,7 +8798,7 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateCinematicComputePipeline(void* 
   else if (featureMask & VolumeFeature_BlendAdditive) blendMode = static_cast<int>(vtkVolumeMapper::ADDITIVE_BLEND);
   [constants setConstantValue:&blendMode type:MTLDataTypeInt withName:@"fc_blendMode"];
   NSError* err = nil;
-  NSString* funcName = binned ? @"volume_compute_march_cinematic_binned" : @"volume_compute_march_cinematic";
+  NSString* funcName = @"volume_compute_march_cinematic";
   id<MTLFunction> fn = [library newFunctionWithName:funcName constantValues:constants error:&err];
   [constants release];
   if (!fn) { vtkErrorMacro("Failed to specialize " << [funcName UTF8String] << ": " << [[err localizedDescription] UTF8String]); return nullptr; }
@@ -8846,7 +8843,7 @@ bool vtkMetalGPUVolumeRayCastMapper::DispatchCinematicCompute(void* deviceVoid, 
     bool useB = (this->CinematicAccumCount % 2) == 1;
     id<MTLTexture> accumCurr = (__bridge id<MTLTexture>)(useB ? this->CinematicAccumTextureB : this->CinematicAccumTextureA);
     id<MTLTexture> accumPrev = (__bridge id<MTLTexture>)(useB ? this->CinematicAccumTextureA : this->CinematicAccumTextureB);
-    void* pso = this->GetOrCreateCinematicComputePipeline(deviceVoid, featureMask, false);
+    void* pso = this->GetOrCreateCinematicComputePipeline(deviceVoid, featureMask);
     if (!pso) return false;
     PerBlockData pbd = *static_cast<const PerBlockData*>(pbdVoid);
     id<MTLBuffer> uniformBuf = (__bridge id<MTLBuffer>)uniformBufVoid;
