@@ -9580,14 +9580,13 @@ inline half4 cinematic_march_core(
   float3 ssColor = saturate(float3(u.subsurfaceColorR, u.subsurfaceColorG, u.subsurfaceColorB));
   float reach = clamp(u.cinematicReach, 0.0, 1.0);
 
-  // View-space key ~40° off view, fill opposite dim — flash (L=V) made every facing gyrus same value
-  float3 V = -normalize(rayDir);
-  float3 L     = cinematic_onb_n(V, 0.40, 0.72);
-  float3 Lfill = cinematic_onb_n(V, 3.70, 0.48);
+  // ~57° key — 0.72 was still a headlight. Fill opposite, dim.
+  float3 V     = -normalize(rayDir);
+  float3 L     = cinematic_onb_n(V, 0.55, 0.55);
+  float3 Lfill = cinematic_onb_n(V, 3.70, 0.42);
 
   float3 gs = b.gradientStep.xyz * 1.5; // 1.0 grain, 2.0 melts sulci
 
-  // Hoisted voxel units (was rebuilt inside hit test every ray)
   float voxel  = max(length(b.gradientStep.xyz), 1e-4);
   float aoDist = mix(2.5, 8.0, reach) * voxel;   // 2.5–8 voxels
   float sigma  = max(u.cinematicBlend, 1.0);
@@ -9612,7 +9611,7 @@ inline half4 cinematic_march_core(
     half nrm = saturate(half(s) * scalarScale + scalarBias);
     half4 tf = sampleTransferFunction(transferFunctionTexture, float2(float(nrm), 0.5));
     float a = float(tf.a);
-    if (a < 0.035) { cur += evalStep; continue; }
+    if (a < 0.04) { cur += evalStep; continue; }
 
     float3 grad = float3(
       sampleVolumeScalar(volumeTexture, cur + float3(gs.x, 0, 0)) -
@@ -9623,50 +9622,47 @@ inline half4 cinematic_march_core(
       sampleVolumeScalar(volumeTexture, cur - float3(0, 0, gs.z)));
     float glen = length(grad);
     float gmag = saturate((glen - 0.018) * 5.5);
-    // Do not shade samples that never became a surface (cheaper than bilateral)
-    if (!haveSurface && gmag < 0.22) { cur += evalStep; continue; }
-    if (gmag < 0.14 && a < 0.20) { cur += evalStep; continue; } // MRI air
+    // Noise is not a surface. Isolated grains die here.
+    if (!haveSurface && (gmag < 0.28 || a < 0.12)) { cur += evalStep; continue; }
+    if (gmag < 0.14 && a < 0.22) { cur += evalStep; continue; }
 
     float3 N = (glen > 1e-6) ? normalize(-grad) : V;
     if (dot(N, V) < 0.0) N = -N;
 
-    // First surface: AO outward (+N = cavity), SSS inward (-N = thickness) — start one voxel off surface
-    if (!haveSurface && aAccum + a > 0.18 && gmag > 0.15) {
+    if (!haveSurface) {
+      if (aAccum + a < 0.18 || gmag < 0.18) { cur += evalStep; continue; }
       float tauAO = optical_depth(volumeTexture, transferFunctionTexture,
-                                  cur + N * voxel, N,  aoDist,       6, scalarScale, scalarBias, sigma);
+                                  cur + N * voxel,  N, aoDist,       6, scalarScale, scalarBias, sigma);
       float tauSS = optical_depth(volumeTexture, transferFunctionTexture,
                                   cur - N * voxel, -N, aoDist * 1.8, 6, scalarScale, scalarBias, sigma);
       ao    = saturate(exp(-tauAO * k * 0.55));
-      thick = saturate(exp(-tauSS * k * 0.35));   // 1 = thin leaf, 0 = deep tissue
+      thick = saturate(exp(-tauSS * k * 0.35));
       haveSurface = true;
     }
 
     float ndl  = dot(N, L);
     float ndlF = dot(N, Lfill);
-    float wrap = pow(saturate((ndl  + 0.22) / 1.22), 1.20); // less wrap = dark side from geometry
-    float fill = pow(saturate((ndlF + 0.50) / 1.50), 1.10) * 0.18;
-    float shade = mix(0.10, saturate(wrap + fill), gmag) * mix(0.42, 1.0, ao);
+    float wrap = pow(saturate((ndl  + 0.22) / 1.22), 1.20);
+    float fill = pow(saturate((ndlF + 0.50) / 1.50), 1.10) * 0.16;
+    // shade is the whole lighting. No second amb/diff wrap.
+    float shade = mix(0.11, saturate(wrap + fill), gmag);
+    shade *= mix(0.48, 1.0, ao);
 
-    // Pigment: TF owns value, ssColor owns SSS only — 0.72 peak on white TF, not rust
-    float3 albedo = float3(tf.rgb) * 0.72;
-    albedo *= mix(0.88, 1.0, gmag);                 // interior dull
+    float3 albedo = float3(tf.rgb) * 0.78;          // peak ~0.78 on white TF
+    albedo *= mix(float3(1.0), ssColor, 0.10 * ss); // ~4% wax, not rust
+    albedo *= mix(0.90, 1.0, gmag);
 
     float side    = saturate(1.0 - abs(ndl));
     float wrapSSS = pow(saturate((-ndl + 0.45) / 1.45), 1.3);
     float3 sss = ssColor * ss * gmag
-               * (0.14 * side + 0.40 * wrapSSS)
-               * mix(0.15, 1.0, thick);                // warm thin only
+               * (0.12 * side + 0.38 * wrapSSS)
+               * mix(0.12, 1.0, thick);
 
-    float3 H = normalize(L + V);
-    float ndh  = saturate(dot(N, H));
-    float spec = pow(ndh, 64.0) * gmag * gmag * 0.035; // sheen, off-view with offset L
-    spec *= mix(0.15, 1.0, ao);                        // no sparkle in cavities
-    if (!haveSurface) spec = 0.0;
+    float3 H   = normalize(L + V);
+    float spec = pow(saturate(dot(N, H)), 72.0) * gmag * gmag * 0.025;
+    spec *= mix(0.10, 1.0, ao);
 
-    // Wire ambient/diffuse if available, else fixed wax 0.16/0.84 (AO provides dark, not ambient)
-    float amb  = 0.16;
-    float diff = 0.84;
-    float3 sCol = saturate(albedo * (amb + diff * shade) + sss + spec);
+    float3 sCol = saturate(albedo * shade + sss + spec);
 
     float w = (1.0 - aAccum) * a;
     colAccum += sCol * w;
@@ -9676,7 +9672,7 @@ inline half4 cinematic_march_core(
   }
 
   if (aAccum < 0.035) return half4(0.0h);
-  // Premul over black. No Reinhard — wax already sits under 1 (peak ~0.6-0.7). Delete shoulder.
+  // Premul over black. No Reinhard — wax already sits under 1.
   return half4(half3(clamp(colAccum, 0.0, 1.0)), half(saturate(aAccum)));
 }
 

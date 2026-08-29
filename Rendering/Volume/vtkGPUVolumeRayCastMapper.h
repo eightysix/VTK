@@ -568,10 +568,10 @@ protected:
 
   float VolumetricScatteringBlending = 0.0;
 
-  // Cinematic — shaded DVR 1 spp (see above); Samples/Bounces/Denoise reserved
+  // Cinematic — shaded DVR 1 spp (see above); Samples/Bounces/Denoise reserved (do not set 64)
   bool CinematicRendering = false;
-  int CinematicSamples = 64;
-  int CinematicMaxBounces = 4;
+  int CinematicSamples = 1;
+  int CinematicMaxBounces = 1;
   float CinematicDenoise = 0.0f;
 
   // Enable / disable two pass rendering

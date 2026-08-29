@@ -1669,11 +1669,8 @@ inline void BuildNIFTIVolumeScene(vtkRenderer* renderer, BackendKind b)
           property->SetScatteringAnisotropy(0.0f); // g=0 until real light; headlight HG only brightens facing voxels
           property->SetSubsurfaceColor(0.86, 0.52, 0.45);
           property->SetSubsurfaceStrength(0.45f);
-          // Ambient/Diffuse/Specular are no-ops in cinematic shaded DVR (shader uses fixed wax terms; AO does dark)
-          property->SetAmbient(0.12);
-          property->SetDiffuse(0.60);
-          property->SetSpecular(0.05);
-          property->SetSpecularPower(48.0);
+          // Ambient/Diffuse/Specular are no-ops in cinematic shaded DVR (shader shade is whole lighting)
+          // Dropped until VolumeMapperUniforms wires them (currently shader uses fixed wax)
           mapper->SetSampleDistance(0.28);
           mapper->SetImageSampleDistance(1.0);
           metal->SetUseIGNJitter(false);
