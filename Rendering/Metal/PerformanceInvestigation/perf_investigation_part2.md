@@ -150,3 +150,17 @@ for S in 0 1; do for F in 1 2 4 8 16 32; do eval "env VTK_METAL_TEST_SHADE=$S VT
 ```
 
 Tree: `metal-volume-parity-essential e05a147fb5` `6-fetch` `light` `56%` `visual_compare 512 y thr 0.000 DICOM 124k, 2.93 NIFTI 288k at 08:27` is the up-to-date `§40.3` reference. `branch` not reset since `95045c5a3d`, only `checkout` as requested. `NIFTI 2048 axy y f2 11.03/12.94 0.86 PASS` vs `f16 1.14`.
+
+---
+
+## 6. Far edge missing sliver (mv9 only) — unsuccessful attempts (`8a8052494b` reverted)
+
+`VolumeRayCast 512 y mv9 thr 3.32 vs mv0 0.15` `DICOMVolume 512 y 0.000` `NIFTI 512 y 2.93` — `MTL` missing thin `far edge` strip (blue cube bottom/right vs `GL` as in your two images, `VolumeRayCast` checker `32` analytic). `/tmp/vol_orig2` still has issue.
+
+Attempts on `e05a147fb5` `6-fetch` (checkouts, not resets):
+
+* `8a8052494b` `maxSteps+1` `MetalShaders.metal:4363 8260 8381` `ceil((tEnd-firstT)/stepSize)+1` `→` `VolumeRayCast 512 y 3.32→2.26 -32%` `DICOM 0.000 keep` `NIFTI 2.93→2.95` `±1%` — not fix, `c7a1259118` revert.
+* Per-sample `tEnd` `if (currentT + float(_j)*stepSize >= p.tEnd -1e-6)` `§6254` `PROC_UNROLL_SAMPLE` `→` still `3.32`.
+* `+0.5*stepSize` inside `ceil` `→` `2.83` worse than `+1`.
+
+`mv9` `48-wide` `tail 41%41` vs `DICOM 400` `16=2+9` spill remains. `mv0` `0.15` is the `6-fetch` scalar reference. Keep `6` `e05a147fb5` and document as open `mv9` far-edge `n>2` penalty, not `shade` `6→4`.
