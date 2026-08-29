@@ -8182,6 +8182,10 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     int fragBatchFc = VolumeFragBatch();
     [constants setConstantValue:&fragBatchFc type:MTLDataTypeInt
                        withName:@"fc_fragBatch"];
+    BOOL grad4 = (std::getenv("VTK_METAL_TEST_GRAD4") != nullptr) ? YES : NO;
+    [constants setConstantValue:&grad4 type:MTLDataTypeBool withName:@"fc_grad4"];
+    BOOL gradFloat = (std::getenv("VTK_METAL_TEST_GRAD_FLOAT") != nullptr) ? YES : NO;
+    [constants setConstantValue:&gradFloat type:MTLDataTypeBool withName:@"fc_gradFloat"];
 
     // §38.15/38.16 block-summary tap bisects (fc_mmNoTap / fc_mmRead).
 

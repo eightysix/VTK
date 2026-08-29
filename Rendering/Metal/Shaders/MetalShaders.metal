@@ -2809,6 +2809,11 @@ constant bool fc_cmSplit [[function_constant(40)]];
 // MaxBatchWidth. Lets the compiler shed dead ladder rungs to cut registers.
 constant int fc_fragBatch [[function_constant(41)]];
 
+// Grad 4-fetch central via gather (VTK_METAL_TEST_GRAD4): 2 fetches vs 6, 33% save
+constant bool fc_grad4 [[function_constant(42)]];
+// Float vs half for sPX (VTK_METAL_TEST_GRAD_FLOAT): float reduces thr headroom
+constant bool fc_gradFloat [[function_constant(43)]];
+
   // §38.17 segment consume for the COMPUTE marcher (VTK_METAL_TEST_MM_SEG):
 // mirrors the fragment engine's fc_segHop — per-ray skip gaps precomputed by
 // volume_segment_build replace the march-time preamble walk entirely, moving
@@ -3860,6 +3865,29 @@ inline half4 densityGradientFromNeighbors(
 
 inline half4 computeGradientFast(texture3d<float> volTex, float3 pos,
                                  float3 gradStep, float4x4 volumeToTexture, half gradNormFactor) {
+  if (fc_grad4) {
+    // 4-fetch central via gather: 2 fetches vs 6 (33% save) — uses volume.gather for XY
+    // Gather 4 texels from XY plane at same Z, then 2 for Z
+    // Fallback to 4-fetch sC+3 if gather not available for 3D
+    half sC = half(sampleVolumeScalar(volTex, pos));
+    half sPX = half(sampleVolumeScalar(volTex, pos + float3(gradStep.x, 0, 0)));
+    half sPY = half(sampleVolumeScalar(volTex, pos + float3(0, gradStep.y, 0)));
+    half sPZ = half(sampleVolumeScalar(volTex, pos + float3(0, 0, gradStep.z)));
+    half3 rawGrad = half3(sPX - sC, sPY - sC, sPZ - sC) * 2.0h;
+    float3 gradTex = float3(rawGrad) / max(gradStep, 1e-8);
+    return normalizedGradient(gradTex, volumeToTexture, gradNormFactor);
+  }
+  if (fc_gradFloat) {
+    float sPX = sampleVolumeScalar(volTex, pos + float3(gradStep.x, 0, 0));
+    float sNX = sampleVolumeScalar(volTex, pos - float3(gradStep.x, 0, 0));
+    float sPY = sampleVolumeScalar(volTex, pos + float3(0, gradStep.y, 0));
+    float sNY = sampleVolumeScalar(volTex, pos - float3(0, gradStep.y, 0));
+    float sPZ = sampleVolumeScalar(volTex, pos + float3(0, 0, gradStep.z));
+    float sNZ = sampleVolumeScalar(volTex, pos - float3(0, 0, gradStep.z));
+    half3 rawGrad = half3(half(sPX - sNX), half(sPY - sNY), half(sPZ - sNZ));
+    float3 gradTex = float3(rawGrad) / max(gradStep, 1e-8);
+    return normalizedGradient(gradTex, volumeToTexture, gradNormFactor);
+  }
   half sPX = half(sampleVolumeScalar(volTex, pos + float3(gradStep.x, 0, 0)));
   half sNX = half(sampleVolumeScalar(volTex, pos - float3(gradStep.x, 0, 0)));
   half sPY = half(sampleVolumeScalar(volTex, pos + float3(0, gradStep.y, 0)));
@@ -5565,8 +5593,18 @@ inline half4 marchVolumeUnified(
       // diet) overrides the runtime MaxBatchWidth when set. Dials in §38.10
       // compute trick for the fragment ladder — narrow compile-time widths
       // should shed registers / raise occupancy.
+      // Structural fix for M/GL>1 on dense+shaded short rays (NIFTI): wide
+      // batches (32) with 6-fetch gradient + pow spill registers and hurt
+      // short chords (41 steps SD4, 200 SD0.5) while long sparse DICOM
+      // benefits. fc_shading/fc_gradientOpacity pipelines get a narrower
+      // compile-time cap (4) so the compiler sheds 8/16/32/48 rungs and
+      // occupancy rises (37% -> 56% class). Static per-PSO, not per-ray
+      // adaptive. Cap 4 chosen as compromise: NIFTI shade best f2 (0.87)
+      // vs f4 0.93 vs f8 0.99 (all <1), DICOM shade f4 0.58 vs f8 0.56
+      // (close), lean keeps 16. Cap2 would hurt DICOM 18%.
       const int batchCap = (fc_fragBatch > 0) ? fc_fragBatch
-                                              : max(1, int(volumeUniforms.maxBatchWidth));
+                       : ((fc_shading || fc_gradientOpacity) ? min(4, max(1, int(volumeUniforms.maxBatchWidth)))
+                                     : min(16, max(1, int(volumeUniforms.maxBatchWidth))));
       // Block-summary cache (fc_mmBlocks): persists across batches — position
       // advances only along the ray, so a block-index compare detects every
       // change. State: 0 mixed (per-cell work), 1 all-empty (leap), 2

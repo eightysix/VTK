@@ -223,7 +223,36 @@ Next: §4 `batchCap=min(fragBatch,maxSteps/4)` adaptive `Rendering/Metal/Shaders
 
 ---
 
-## 8. Code reference map (fast lookup)
+## 9. Next to improve `NIFTI` `+ shade` `M/GL` (structural, keep `thr<5`)
+
+`thr 2.93` baseline (`6-fetch` `half` `pow`) leaves `2.07%` budget before `5`. Shading is `60%` of `thr` (`shade OFF 1.22` vs `ON 2.93` `512 y`, `pow diet 2.53` `-0.39%`), `diff>20` pixels are bright brain `118` vs `33` (`18.6%` `>20` raw, `36%` `>1`).
+
+Landed `shade4/lean16` `Rendering/Metal/Shaders/MetalShaders.metal:5568` (`fc_shading?min(4,32):min(16,32)` `37%→56%`) + `argmin` `VolumeTransposedAxisDepth:477` `0` identity for `632x826x574` fixes `1024` all `<1` (`0.66/0.85`) and `2048` `SD0.5` all `<1` (`0.94`), only `2048 SD4 obl 1.05 +0.58ms` (`f1 0.83` wins that `41-step` chord) remains.
+
+Ranked structural unlocks to bring `thr` headroom and `-15-30%` `shade` win `16.46→11.54` class while staying `<5` and `DICOM y 0.21` no-regress:
+
+1. **`pow LUT 256-entry R16Float`** `sampleSpecularPow:3706` like `gradientOpacityTexture:3661` `VTK_METAL_TEST_POW_LUT` `UpdateSpecularPowTexture:5517` `NewTexture2D R16Float 256x1` `pow(x, shininess)` `shininess 20` `R8 64` quantizes `0.5^20=9e-7→0` `thr 26829`, `R16 256` `thr 2.99` keep `+21%` slower (`18.59 vs 15.34 SD0.5`) — needs `dummy` `R32Float 1x1` fallback (`width==1` → `pow`) fixed `mapper:8753` `dummy type` bug. `thr -0.39%` to `2.53` gives `0.4%` headroom, `±16%` `SD0.5 -16% SD4 +8%` view-dependent; `LUT` adds `1` fetch vs `pow` ALU.
+
+2. **`4-fetch central + gather + half→float`** `computeGradientFast:3861` `fc_grad4:42` `fc_gradFloat:43` `VTK_METAL_TEST_GRAD4/FLOAT` `Mapper:8184` `fn const`. `sC+3` forward `4 fetches` `33%` save `13.17 vs 15.34 -14%` `NIFTI SD0.5` but `thr 5.70 +2.7%` just `>5`; `sNearest 6*1` `-10%` `thr 5.21`; `float sPX` `thr 2.90 -0.03%` `+1.5%` `SD0.5`. `gather` `4 texels` in `1 fetch` (`2 fetches` for `6` samples vs `6`) would make `+2.7%` → `+1.5%` and stay `<5` with `-33%` fetches when combined with `pow` headroom `0.4%` + `shade OFF` `1.7%` = `2.1%` budget.
+
+3. **`precomp half-res RG8 octahedral 74MB`** `EnsureGradientNormalTexture:3457` `316x413x287` vs `1.2GB` full-res `+188% SD4` `thr 2.90` keep, `half-res -51% SD0.5` but `thr 16.6` fail `+22% SD4` not win everywhere — `±1-step` vs `trilinear` downsample.
+
+4. **Per-frame `maxBatchWidth` `SD`-aware** `mm:9632` `32→16/8` `SD<1.5` fine vs `SD>=1.5` coarse: `lean 16 vs 32 +4% NIFTI +24% DICOM` `shade 4 vs 8 +6% NIFTI` — `shade4/lean16` already within `1-4%` of per-`SD` optimum, extra tier not needed.
+
+Repro for `pow LUT` + `grad4` `xcrun -sdk macosx metal -c` `15 warnings` clean, `512 y thr` `§40.3` `5%` gate, `DICOM y 0.21` keep:
+
+```sh
+# pow LUT R16 256 (env-gated, default off)
+eval "env $BASE VTK_METAL_TEST_POW_LUT=1 $BIN --scene NIFTIVolume --nifti $NIFTI --frames 1 --size 512x512 --warmup 2 --out /tmp/pow 2>&1 | grep -E 'NIFTIVolume|worst'"
+# grad 4-fetch central + float
+eval "env $BASE VTK_METAL_TEST_GRAD4=1 $BIN --scene NIFTIVolume --nifti $NIFTI --frames 1 --size 512x512 --warmup 2 --out /tmp/g4 2>&1 | grep -E 'NIFTIVolume|worst'"
+eval "env $BASE VTK_METAL_TEST_GRAD_FLOAT=1 $BIN --scene NIFTIVolume --nifti $NIFTI --frames 1 --size 512x512 --warmup 2 --out /tmp/gf 2>&1 | grep -E 'NIFTIVolume|worst'"
+# combined headroom thr ~2.53+1.5=4.0 <5 with -33% fetches
+```
+
+Tree after this doc: `b2e0286446` + `5568` `shade4/lean16` + `pow LUT`/`grad4` env-gated `xcrun` clean `ARCHIVE` `perf_investigation_part2_structural.md:9.7` `10`.
+
+## 10. Code reference map (fast lookup)
 
 | Area | File `:` line | Symbol |
 |------|---------------|--------|
