@@ -1,6 +1,6 @@
 # Metal Volume Rendering — NIFTI Brain Investigation (Part 2)
 
-*Follow-up to `PERFORMANCE_INVESTIGATION.md` and `HARNESS_VS_APP_GAP.md:39-40` for the new `NIFTI` scene (`TestMetalScenes.h:108 gNiftiPath`, `BuildNIFTIVolumeScene`).*
+*Follow-up to `PERFORMANCE_INVESTIGATION.md` and `HARNESS_VS_APP_GAP.md` (comprehensive 42-section perf investigation — jitter gap `§1-6`, resolution `§7`, transposition `§26`, RG8 `§17`, compute marcher `§38`, fragment batch `§39`, mv9 coverage `§40` etc., `HARNESS_VS_APP_GAP.md:39-40` for `NIFTI` precursor) for the new `NIFTI` scene (`TestMetalScenes.h:108 gNiftiPath`, `BuildNIFTIVolumeScene`). See `Rendering/Metal/METAL_VOLUME_RAYCAST_GUIDE.md:1` for general mapper+shader guide.*
 
 - **Hardware:** Apple M2 (Metal 3) `arm64 Release` `MTL_DEBUG_LAYER=0` `AC`
 - **Datasets:** `DICOM 512x512x1794 U8 0.4-0.8mm 470MB` `IMRToraceAddome` vs `NIFTI 632x826x574 float32 1.51-70.29 0.2mm 1.1GB → U8 300MB` `Synthesized_FLASH25_downsampled_200um.nii` `Brain 7T FLASH25` `x6.5..45 y0..1` `useShading 1` `TestMetalScenes.h:1480` `Examples/GUI/iOSMetal/test-vtk-metal/NIFTIVolumeViewController.mm:42`
