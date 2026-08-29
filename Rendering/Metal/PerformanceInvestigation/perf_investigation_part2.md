@@ -755,3 +755,45 @@ eval "env $BASE VTK_METAL_TEST_GRAD_NEAREST=1 $BIN --scene NIFTIVolume --nifti $
 eval "env $BASE VTK_METAL_TEST_GRAD_NEAREST=1 $BIN --bench --backend metal --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep NIFTIVolume" # 5.85 vs 7.05
 eval "env $BASE $BIN --bench --backend gl --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep NIFTIVolume" # 8.76
 ```
+
+---
+
+## 18. Current diff — `SD4` fixed overhead specializations without `thr` loss (2026-08-29, `1,1,1` `8:2` `0.02h` baseline)
+
+This section documents the diff from `aa49a2b565` to the working tree at `HEAD` (`xcrun metal -c` `15` warnings clean `1643KB` `AIR`). All numbers `arm64 Release` `M2` `BASE` as `§1` `20f/5w@1024` `15f/5w@2048` `eval "env $BASE ..."` `zsh` `§14` `512 y` `2999 thr 0.000` `SD4` `4158 thr 0.035` `SD0.5` `DICOM y 0.000` `VRC 0.182` `§40.3 <5`.
+
+At `SD4` a NIFTI ray is `41` steps `20*2+1` with `shadeCap 2` `MetalShaders.metal:5628` `8:2` `§14.1`. At `SD0.5` it is `200` steps `25*8`. Fixed work therefore hurts `SD4` four times more: the `20` per-batch `R8` preamble `while(w<extent)` `MetalShaders.metal:4698` `block/super` `distToEdge/tToEdge` `20*600k=12M` fetches, the `6` way ladder `48/32/16/8/4/2/1` `MetalShaders.metal:5955` `48-wide 37% TG` `§39.1` `I$` `120` branches `*20`, and per fragment `setupVolumeRay:4185` `intersectBox` `safeRecip` `cameraInside tNear dot` `clipping` `1` plane `normalize dot` and `depth` `ndcToVolume*vec` `sample(sNearest)` `~30%` of `7 ms` `SD4` vs `~8%` of `25 ms` `SD0.5`. `4x` world stride `texStep=rayDirTex*stepSize` `MetalShaders.metal:4347` `physicalSampleStep:3544` makes `SD4` cache `4x` worse than `SD0.5`.
+
+Three `thr 0.000` `§40.3` fixes are now in the diff, all `M/GL<1` keep `DICOM y 0.000` `VRC 0.182`:
+
+* **Ladder dead-strip for coarse** `MetalShaders.metal:5955` `if(fc_fineSD || (!fc_shading && !fc_gradientOpacity))` `fc_fineSD:44` `SampleDistance<0.75` `0.5` fine `4` coarse. Before `SD4` `shadeCap 2` still compiled all seven rungs and tested `batchCap>=48` etc. at run time even though `batchCap` is `2` for `SD4`, costing `I$` and registers `37%` spill. Now `fine` `200` keeps `48/32/16/8/4/2/1`, `coarse shade` `NIFTI` `41` keeps only `2/1` and the `48/32/16/8/4` `32` unrolled bodies are not compiled into the coarse `PSO` `56%` occupancy. `xcrun metal -c` clean `1643KB`. `1024 SD4 6.99/8.30 0.84 -> 6.71/8.33 0.805 -4%` `thr 0.000` `SD0.5 8.98->9.34 +1%` inside `±5%` thermal `N=3` `9.48 9.73 9.10` `2048 SD4 10.29->10.19 -1%` `0.86` keep. With `VTK_METAL_TEST_DENSE=1` `6.71->6.30 -6%` `6.99->6.30 -10%` `thr 0.000`.
+
+* **`setupVolumeRay` dead-strip** `MetalShaders.metal:4185` `if(fc_useCameraInside && volumeUniforms.useCameraInsideNearClip>0.5)` `fc_useCameraInside:47` `1<<17` and `if(fc_useDepthTexture && volumeUniforms.useDepthTexture>0.5)` `fc_useDepthTexture:46` `1<<16` `vtkMetalGPUVolumeRayCastMapper.mm:7988` `8198` `PipelineCache` `featureMaskExtra`. Outside view, no depth `NIFTI` `~2%` `7.13->6.99` `thr 0`.
+
+* **`dense` coarse bypass** `MetalShaders.metal:4698` `const bool useMinMax=fc_minmax && !(fc_dense && !fc_fineSD) && ...` `fc_dense:48` `1<<18` `VTK_METAL_TEST_DENSE=1` `vtkMetalGPUVolumeRayCastMapper.mm:7988` `8198`. `NIFTI` `>60%` `alpha>0` vs `DICOM` `~40%` empty `§9` `dense` skips the `while(w<extent)` `R8` `20` `12M` only for `!fc_fineSD` coarse. `1024 SD4 6.71->6.30 -6%` `6.99->6.30 -10%` `thr 0.000` `2048 SD4 10.19->8.72 -15%` `0.86->0.73` `SD0.5` keeps `minMax` `9.17` `+2%` noise `DICOM 0.23` sparse not `dense`.
+
+Together `baseline 6.99/8.30 0.84` `SD4` `thr 0.000` becomes `6.30/8.33 0.75` `thr 0.000` with `DENSE=1` and the ladder, `-10%` without a single `R8` texel value changed `M/GL<1` `2048 SD4 0.73`.
+
+Two `thr<5` `§40.3` options remain env-gated `1` line `MetalShaders.metal:3616` `return sNearest` and keep `0.000` by default:
+
+* `fc_volumeNearestCoarse:49` `1<<19` `VTK_METAL_TEST_VOLUME_NEAREST=1` `MetalShaders.metal:3616` `if(fc_volumeNearestCoarse && fc_linearInterpolation && !fc_volRg8 ...)` `sample(sNearest,pos)` `1` vs `8` texels `SD4 6.30->6.34` `6.99->6.34 -9%` `thr 2.022` `2048 0.75` `<5` `SD0.5` `linear` keep `0.035`.
+
+* `fc_gradNearest:45` `512` `6*1 sNearest` `6*8` `MetalShaders.metal:3870` `6.05 thr 1.89 -13%` `SD4` `1024` `M/GL 0.72` `DENSE+GRAD_NEAREST 5.45 thr 1.89 -22%` `SD4` `1024` `0.66` `SD0.5 8.90 thr 2.47` `<5` `1` `sample` `6*1` `83%` `R8` `M/GL<1` already `0.67`.
+
+`Quad` cooperative `fc_quadGrad:51` `1<<20` `MetalShaders.metal:3920` `computeGradientFast` `6*8=48` `sPX-sNX` `half3 rawGrad/gradStep` `normalizedGradient:3826` was tried as `dfdx(sC)/dfdx(texPos)` `12` vs `24` `50%` `R8` `SD4 6.32 thr 69.2` `SD0.5 8.62 thr 180.5` `512 y 33990 thr 26829` `>>5` `pos+dx 0.0015` `dPos 0.0006` `1.6x` off `SD0.5` `evalStep 0.38` `4x` `SD4 1.52` `miss` `rayDir` spread `axis-chord +27%` `§37.13` `VolumeTransposedAxisDepth:477` `0` `574` `Y-depth 1.73` `quad_shuffle(sC,0..3)` `lane&3` `s0..s3` `thread_index_in_quadgroup` `[[quadgroup]]` `100` lines `Instruments` `Texture BW` `Quad Active` `4*64` `hit 40% SD0.5 10% SD4` not `thr0` `DENSE -7.5%` `thr0` `M/GL<1` `0.67` `+quad 0.66` `1%` `R8` `VOL_NEAREST 10%` `thr 2.02` already. Kept behind `VTK_METAL_TEST_QUAD_GRAD=1` as fallback `6-fetch` `thr 0.000` `2999` to keep `xcrun` clean while `1` `env` `A/B` remains for `Instruments` `4*64` `hit`.
+
+Precompute `boundsSize/maxBound*sampleDist` `texelCount/ctpScale/ctpOffset` `VolumeMapperUniforms:62` `1752->1840` `float4` `16` pad `1760` `+80B` `Uniforms` `physicalSampleStep:3544` `marchVolumeUnified:4347` `3` `get_width` `6` `div` `600k*5 3M` `<<1%` `R8` `1.1B` `±2%` noise `§17` `doc` `1760` `1840` not shipped, note only.
+
+Repro `thr0` `DENSE+ladder` `M/GL<1` `0.75` `0.73` `SD4` `thr 0.000`:
+
+```sh
+BIN=build_macos_metal/bin/vtkMetalGLVisualComparison
+NIFTI=/Users/macair/Public/IMR/7T-MRI/Synthesized_FLASH25_downsampled_200um.nii
+BASE="VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1"
+eval "env $BASE $BIN --scene NIFTIVolume --nifti $NIFTI --frames 1 --size 512x512 --warmup 2 --out /tmp/p 2>&1 | grep -E 'NIFTI|worst'" # 2999 0.000 / 4158 0.035
+eval "env $BASE VTK_METAL_TEST_DENSE=1 $BIN --bench --backend metal --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep NIFTIVolume" # 6.30
+eval "env $BASE $BIN --bench --backend gl --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep NIFTIVolume" # 8.33
+eval "env $BASE VTK_METAL_TEST_VOLUME_NEAREST=1 $BIN --scene NIFTIVolume --nifti $NIFTI --frames 1 --size 512x512 --warmup 2 --out /tmp/p 2>&1 | grep -E 'NIFTI|worst'" # 2.02 <5
+eval "env $BASE VTK_METAL_TEST_GRAD_NEAREST=1 $BIN --scene NIFTIVolume --nifti $NIFTI --frames 1 --size 512x512 --warmup 2 --out /tmp/p 2>&1 | grep -E 'NIFTI|worst'" # 1.89 <5
+xcrun -sdk macosx metal -c Rendering/Metal/Shaders/MetalShaders.metal -o /tmp/metal_check.air # 15 warnings clean 1643KB
+```

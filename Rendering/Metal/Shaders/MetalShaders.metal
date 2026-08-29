@@ -2817,6 +2817,15 @@ constant bool fc_gradFloat [[function_constant(43)]];
 constant bool fc_fineSD [[function_constant(44)]];
 // Grad via sNearest (VTK_METAL_TEST_GRAD_NEAREST): 6*1 texel vs 6*8, -10% but thr 5.21
 constant bool fc_gradNearest [[function_constant(45)]];
+// SetupVolumeRay specializations for fixed per-fragment overhead (§17 SD4 30% vs 8%): depth/cameraInside dead-strip
+constant bool fc_useDepthTexture [[function_constant(46)]];
+constant bool fc_useCameraInside [[function_constant(47)]];
+// Dense coarse bypass for per-batch minMax preamble (§17 20*2+1): dense volumes skip R8 fetches
+constant bool fc_dense [[function_constant(48)]];
+// Volume scalar nearest for coarse SD4 4x stride (§17 world stride): 1 vs 8 texels, -10% thr 2.02
+constant bool fc_volumeNearestCoarse [[function_constant(49)]];
+// Quad-coop grad §13.5: 4 sC share 24->4 fetches via quad_shuffle, ~30% SD0.5 thr0 if pos+dx coherence
+constant bool fc_quadGrad [[function_constant(51)]];
 
   // §38.17 segment consume for the COMPUTE marcher (VTK_METAL_TEST_MM_SEG):
 // mirrors the fragment engine's fc_segHop — per-ray skip gaps precomputed by
@@ -3527,7 +3536,7 @@ inline float2 intersectBox(float3 orig, float3 dir, float3 boxMin, float3 boxMax
 // maxBound selects the largest axis (always >= 1). The tiny clamp on degenerate axes
 // ensures physPerNorm stays non-zero for the division.
 inline float physicalSampleStep(float3 rayDirNormSpace,
-                                constant VolumeMapperUniforms& u)
+                                 constant VolumeMapperUniforms& u)
 {
   float3 boundsSize = max(u.volumeBoundsMax.xyz - u.volumeBoundsMin.xyz, 1e-6);
   float  maxBound   = max(boundsSize.x, max(boundsSize.y, boundsSize.z));
@@ -3616,6 +3625,11 @@ inline float sampleVolumeScalar(texture3d<float> volTex, float3 pos) {
     // space it receives (its dims come from the live texture), so a single
     // entry-point swizzle covers every interpolation variant.
     pos = volumeFetchSwizzle(pos);
+  }
+  // Specialization §17: coarse SD4 4x stride with sNearest (1 texel vs 8) saves ~30% bandwidth for dense 41-step rays
+  // Env-gated via fc_volumeNearestCoarse (VTK_METAL_TEST_VOLUME_NEAREST) to keep thr 0.000 by default; thr 2.02 <5 when enabled, -9% at 1024 SD4 6.42 vs 7.09
+  if (fc_volumeNearestCoarse && fc_linearInterpolation && !fc_volRg8 && fc_marchVariant != 1 && fc_marchVariant != 2) {
+    return volTex.sample(sNearest, pos, level(0)).r;
   }
   if (fc_linearInterpolation) {
     if (fc_marchVariant == 1) {
@@ -3900,6 +3914,19 @@ inline half4 computeGradientFast(texture3d<float> volTex, float3 pos,
     float sPZ = sampleVolumeScalar(volTex, pos + float3(0, 0, gradStep.z));
     float sNZ = sampleVolumeScalar(volTex, pos - float3(0, 0, gradStep.z));
     half3 rawGrad = half3(half(sPX - sNX), half(sPY - sNY), half(sPZ - sNZ));
+    float3 gradTex = float3(rawGrad) / max(gradStep, 1e-8);
+    return normalizedGradient(gradTex, volumeToTexture, gradNormFactor);
+  }
+  if (fc_quadGrad) {
+    // Quad-coop §13.5 prototype disabled: dfdx/quad_shuffle gave thr 69/26829 >>5 for NIFTI SD4/SD0.5, not thr0
+    // Keep fallback to 6-fetch to keep thr 0 and compile clean; use VTK_METAL_TEST_QUAD_GRAD=1 for A/B but no win yet
+    half sPX = half(sampleVolumeScalar(volTex, pos + float3(gradStep.x, 0, 0)));
+    half sNX = half(sampleVolumeScalar(volTex, pos - float3(gradStep.x, 0, 0)));
+    half sPY = half(sampleVolumeScalar(volTex, pos + float3(0, gradStep.y, 0)));
+    half sNY = half(sampleVolumeScalar(volTex, pos - float3(0, gradStep.y, 0)));
+    half sPZ = half(sampleVolumeScalar(volTex, pos + float3(0, 0, gradStep.z)));
+    half sNZ = half(sampleVolumeScalar(volTex, pos - float3(0, 0, gradStep.z)));
+    half3 rawGrad = half3(sPX - sNX, sPY - sNY, sPZ - sNZ);
     float3 gradTex = float3(rawGrad) / max(gradStep, 1e-8);
     return normalizedGradient(gradTex, volumeToTexture, gradNormFactor);
   }
@@ -4202,7 +4229,8 @@ inline RaySetup setupVolumeRay(
     // same plane to reproduce the OpenGL sample comb. The plane intersection
     // distance varies per ray (off-axis rays meet the plane further out), so the
     // plane is passed as origin+normal rather than a single scalar.
-    if (volumeUniforms.useCameraInsideNearClip > 0.5) {
+    // Specialization §17: fc_useCameraInside dead-strips this block for outside views (NIFTI SD4 30% fixed overhead)
+    if (fc_useCameraInside && volumeUniforms.useCameraInsideNearClip > 0.5) {
         float denom = dot(rayDir, volumeUniforms.cameraInsideNearPlaneNormal.xyz);
         if (abs(denom) > 1e-6) {
             float tNear = dot(volumeUniforms.cameraInsideNearPlaneOrigin.xyz - cameraPos,
@@ -4244,7 +4272,8 @@ inline RaySetup setupVolumeRay(
     }
 
     s.tTerminateMax = 1e30;
-    if (volumeUniforms.useDepthTexture > 0.5) {
+    // Specialization §17: fc_useDepthTexture dead-strips depth sample for NIFTI w/o depth (saves matrix*vec + sample per fragment)
+    if (fc_useDepthTexture && volumeUniforms.useDepthTexture > 0.5) {
         float depthSample = depthTexture.sample(sNearest, screenPos / viewportSize).r;
         if (depthSample < 1.0) {
             float2 ndcXY = (screenPos / viewportSize) * 2.0 - 1.0;
@@ -4688,7 +4717,9 @@ inline half4 marchVolumeUnified(
   bool  curBlockSolid = false;
   int   solidRun     = 0;
   float3 mmDimF     = b.minMaxInfo.yzw;
-  const bool useMinMax = fc_minmax &&
+  // Specialization §17: fc_dense bypasses per-batch R8 preamble for dense coarse volumes (SD4 30% fixed overhead, tail 41=20*2+1, 4x stride)
+  // Dense && !fineSD => coarse dense bypass; fine dense keeps minMax (SD0.5 still benefits from leaps)
+  const bool useMinMax = fc_minmax && !(fc_dense && !fc_fineSD) &&
     !useIndependentPath &&
     b.minMaxInfo.x > 0.5 &&
     b.minMaxInfo.y > 0.5 &&
@@ -5921,255 +5952,274 @@ inline half4 marchVolumeUnified(
             i += w;
           }
         }
-        if (batchCap >= 48 && i + 48 <= steps)
-        {
-          MV9_FETCH(0)
-          MV9_FETCH(1)
-          MV9_FETCH(2)
-          MV9_FETCH(3)
-          MV9_FETCH(4)
-          MV9_FETCH(5)
-          MV9_FETCH(6)
-          MV9_FETCH(7)
-          MV9_FETCH(8)
-          MV9_FETCH(9)
-          MV9_FETCH(10)
-          MV9_FETCH(11)
-          MV9_FETCH(12)
-          MV9_FETCH(13)
-          MV9_FETCH(14)
-          MV9_FETCH(15)
-          MV9_FETCH(16)
-          MV9_FETCH(17)
-          MV9_FETCH(18)
-          MV9_FETCH(19)
-          MV9_FETCH(20)
-          MV9_FETCH(21)
-          MV9_FETCH(22)
-          MV9_FETCH(23)
-          MV9_FETCH(24)
-          MV9_FETCH(25)
-          MV9_FETCH(26)
-          MV9_FETCH(27)
-          MV9_FETCH(28)
-          MV9_FETCH(29)
-          MV9_FETCH(30)
-          MV9_FETCH(31)
-          MV9_FETCH(32)
-          MV9_FETCH(33)
-          MV9_FETCH(34)
-          MV9_FETCH(35)
-          MV9_FETCH(36)
-          MV9_FETCH(37)
-          MV9_FETCH(38)
-          MV9_FETCH(39)
-          MV9_FETCH(40)
-          MV9_FETCH(41)
-          MV9_FETCH(42)
-          MV9_FETCH(43)
-          MV9_FETCH(44)
-          MV9_FETCH(45)
-          MV9_FETCH(46)
-          MV9_FETCH(47)
-          MV9_COMPOSITE(0)
-          MV9_COMPOSITE(1)
-          MV9_COMPOSITE(2)
-          MV9_COMPOSITE(3)
-          MV9_COMPOSITE(4)
-          MV9_COMPOSITE(5)
-          MV9_COMPOSITE(6)
-          MV9_COMPOSITE(7)
-          MV9_COMPOSITE(8)
-          MV9_COMPOSITE(9)
-          MV9_COMPOSITE(10)
-          MV9_COMPOSITE(11)
-          MV9_COMPOSITE(12)
-          MV9_COMPOSITE(13)
-          MV9_COMPOSITE(14)
-          MV9_COMPOSITE(15)
-          MV9_COMPOSITE(16)
-          MV9_COMPOSITE(17)
-          MV9_COMPOSITE(18)
-          MV9_COMPOSITE(19)
-          MV9_COMPOSITE(20)
-          MV9_COMPOSITE(21)
-          MV9_COMPOSITE(22)
-          MV9_COMPOSITE(23)
-          MV9_COMPOSITE(24)
-          MV9_COMPOSITE(25)
-          MV9_COMPOSITE(26)
-          MV9_COMPOSITE(27)
-          MV9_COMPOSITE(28)
-          MV9_COMPOSITE(29)
-          MV9_COMPOSITE(30)
-          MV9_COMPOSITE(31)
-          MV9_COMPOSITE(32)
-          MV9_COMPOSITE(33)
-          MV9_COMPOSITE(34)
-          MV9_COMPOSITE(35)
-          MV9_COMPOSITE(36)
-          MV9_COMPOSITE(37)
-          MV9_COMPOSITE(38)
-          MV9_COMPOSITE(39)
-          MV9_COMPOSITE(40)
-          MV9_COMPOSITE(41)
-          MV9_COMPOSITE(42)
-          MV9_COMPOSITE(43)
-          MV9_COMPOSITE(44)
-          MV9_COMPOSITE(45)
-          MV9_COMPOSITE(46)
-          MV9_COMPOSITE(47)
-          MV9_ADVANCE(48)
-        }
-        else if (batchCap >= 32 && i + 32 <= steps)
-        {
-          MV9_FETCH(0)
-          MV9_FETCH(1)
-          MV9_FETCH(2)
-          MV9_FETCH(3)
-          MV9_FETCH(4)
-          MV9_FETCH(5)
-          MV9_FETCH(6)
-          MV9_FETCH(7)
-          MV9_FETCH(8)
-          MV9_FETCH(9)
-          MV9_FETCH(10)
-          MV9_FETCH(11)
-          MV9_FETCH(12)
-          MV9_FETCH(13)
-          MV9_FETCH(14)
-          MV9_FETCH(15)
-          MV9_FETCH(16)
-          MV9_FETCH(17)
-          MV9_FETCH(18)
-          MV9_FETCH(19)
-          MV9_FETCH(20)
-          MV9_FETCH(21)
-          MV9_FETCH(22)
-          MV9_FETCH(23)
-          MV9_FETCH(24)
-          MV9_FETCH(25)
-          MV9_FETCH(26)
-          MV9_FETCH(27)
-          MV9_FETCH(28)
-          MV9_FETCH(29)
-          MV9_FETCH(30)
-          MV9_FETCH(31)
-          MV9_COMPOSITE(0)
-          MV9_COMPOSITE(1)
-          MV9_COMPOSITE(2)
-          MV9_COMPOSITE(3)
-          MV9_COMPOSITE(4)
-          MV9_COMPOSITE(5)
-          MV9_COMPOSITE(6)
-          MV9_COMPOSITE(7)
-          MV9_COMPOSITE(8)
-          MV9_COMPOSITE(9)
-          MV9_COMPOSITE(10)
-          MV9_COMPOSITE(11)
-          MV9_COMPOSITE(12)
-          MV9_COMPOSITE(13)
-          MV9_COMPOSITE(14)
-          MV9_COMPOSITE(15)
-          MV9_COMPOSITE(16)
-          MV9_COMPOSITE(17)
-          MV9_COMPOSITE(18)
-          MV9_COMPOSITE(19)
-          MV9_COMPOSITE(20)
-          MV9_COMPOSITE(21)
-          MV9_COMPOSITE(22)
-          MV9_COMPOSITE(23)
-          MV9_COMPOSITE(24)
-          MV9_COMPOSITE(25)
-          MV9_COMPOSITE(26)
-          MV9_COMPOSITE(27)
-          MV9_COMPOSITE(28)
-          MV9_COMPOSITE(29)
-          MV9_COMPOSITE(30)
-          MV9_COMPOSITE(31)
-          MV9_ADVANCE(32)
-        }
-        else if (batchCap >= 16 && i + 16 <= steps)
-        {
-          MV9_FETCH(0)
-          MV9_FETCH(1)
-          MV9_FETCH(2)
-          MV9_FETCH(3)
-          MV9_FETCH(4)
-          MV9_FETCH(5)
-          MV9_FETCH(6)
-          MV9_FETCH(7)
-          MV9_FETCH(8)
-          MV9_FETCH(9)
-          MV9_FETCH(10)
-          MV9_FETCH(11)
-          MV9_FETCH(12)
-          MV9_FETCH(13)
-          MV9_FETCH(14)
-          MV9_FETCH(15)
-          MV9_COMPOSITE(0)
-          MV9_COMPOSITE(1)
-          MV9_COMPOSITE(2)
-          MV9_COMPOSITE(3)
-          MV9_COMPOSITE(4)
-          MV9_COMPOSITE(5)
-          MV9_COMPOSITE(6)
-          MV9_COMPOSITE(7)
-          MV9_COMPOSITE(8)
-          MV9_COMPOSITE(9)
-          MV9_COMPOSITE(10)
-          MV9_COMPOSITE(11)
-          MV9_COMPOSITE(12)
-          MV9_COMPOSITE(13)
-          MV9_COMPOSITE(14)
-          MV9_COMPOSITE(15)
-          MV9_ADVANCE(16)
-        }
-        else if (batchCap >= 8 && i + 8 <= steps)
-        {
-          MV9_FETCH(0)
-          MV9_FETCH(1)
-          MV9_FETCH(2)
-          MV9_FETCH(3)
-          MV9_FETCH(4)
-          MV9_FETCH(5)
-          MV9_FETCH(6)
-          MV9_FETCH(7)
-          MV9_COMPOSITE(0)
-          MV9_COMPOSITE(1)
-          MV9_COMPOSITE(2)
-          MV9_COMPOSITE(3)
-          MV9_COMPOSITE(4)
-          MV9_COMPOSITE(5)
-          MV9_COMPOSITE(6)
-          MV9_COMPOSITE(7)
-          MV9_ADVANCE(8)
-        }
-        else if (batchCap >= 4 && i + 4 <= steps)
-        {
-          MV9_FETCH(0)
-          MV9_FETCH(1)
-          MV9_FETCH(2)
-          MV9_FETCH(3)
-          MV9_COMPOSITE(0)
-          MV9_COMPOSITE(1)
-          MV9_COMPOSITE(2)
-          MV9_COMPOSITE(3)
-          MV9_ADVANCE(4)
-        }
-        else if (batchCap >= 2 && i + 2 <= steps)
-        {
-          MV9_FETCH(0)
-          MV9_FETCH(1)
-          MV9_COMPOSITE(0)
-          MV9_COMPOSITE(1)
-          MV9_ADVANCE(2)
-        }
-        else if (i + 1 <= steps)
-        {
-          MV9_FETCH(0)
-          MV9_COMPOSITE(0)
-          MV9_ADVANCE(1)
+        if (fc_fineSD || (!fc_shading && !fc_gradientOpacity)) {
+          // fine SD0.5 or coarse lean (DICOM 16) keep 48..2/1, coarse shade (NIFTI 2) only 2/1 dead-strip 48/32/16/8/4 thr0
+          if (batchCap >= 48 && i + 48 <= steps)
+          {
+            MV9_FETCH(0)
+            MV9_FETCH(1)
+            MV9_FETCH(2)
+            MV9_FETCH(3)
+            MV9_FETCH(4)
+            MV9_FETCH(5)
+            MV9_FETCH(6)
+            MV9_FETCH(7)
+            MV9_FETCH(8)
+            MV9_FETCH(9)
+            MV9_FETCH(10)
+            MV9_FETCH(11)
+            MV9_FETCH(12)
+            MV9_FETCH(13)
+            MV9_FETCH(14)
+            MV9_FETCH(15)
+            MV9_FETCH(16)
+            MV9_FETCH(17)
+            MV9_FETCH(18)
+            MV9_FETCH(19)
+            MV9_FETCH(20)
+            MV9_FETCH(21)
+            MV9_FETCH(22)
+            MV9_FETCH(23)
+            MV9_FETCH(24)
+            MV9_FETCH(25)
+            MV9_FETCH(26)
+            MV9_FETCH(27)
+            MV9_FETCH(28)
+            MV9_FETCH(29)
+            MV9_FETCH(30)
+            MV9_FETCH(31)
+            MV9_FETCH(32)
+            MV9_FETCH(33)
+            MV9_FETCH(34)
+            MV9_FETCH(35)
+            MV9_FETCH(36)
+            MV9_FETCH(37)
+            MV9_FETCH(38)
+            MV9_FETCH(39)
+            MV9_FETCH(40)
+            MV9_FETCH(41)
+            MV9_FETCH(42)
+            MV9_FETCH(43)
+            MV9_FETCH(44)
+            MV9_FETCH(45)
+            MV9_FETCH(46)
+            MV9_FETCH(47)
+            MV9_COMPOSITE(0)
+            MV9_COMPOSITE(1)
+            MV9_COMPOSITE(2)
+            MV9_COMPOSITE(3)
+            MV9_COMPOSITE(4)
+            MV9_COMPOSITE(5)
+            MV9_COMPOSITE(6)
+            MV9_COMPOSITE(7)
+            MV9_COMPOSITE(8)
+            MV9_COMPOSITE(9)
+            MV9_COMPOSITE(10)
+            MV9_COMPOSITE(11)
+            MV9_COMPOSITE(12)
+            MV9_COMPOSITE(13)
+            MV9_COMPOSITE(14)
+            MV9_COMPOSITE(15)
+            MV9_COMPOSITE(16)
+            MV9_COMPOSITE(17)
+            MV9_COMPOSITE(18)
+            MV9_COMPOSITE(19)
+            MV9_COMPOSITE(20)
+            MV9_COMPOSITE(21)
+            MV9_COMPOSITE(22)
+            MV9_COMPOSITE(23)
+            MV9_COMPOSITE(24)
+            MV9_COMPOSITE(25)
+            MV9_COMPOSITE(26)
+            MV9_COMPOSITE(27)
+            MV9_COMPOSITE(28)
+            MV9_COMPOSITE(29)
+            MV9_COMPOSITE(30)
+            MV9_COMPOSITE(31)
+            MV9_COMPOSITE(32)
+            MV9_COMPOSITE(33)
+            MV9_COMPOSITE(34)
+            MV9_COMPOSITE(35)
+            MV9_COMPOSITE(36)
+            MV9_COMPOSITE(37)
+            MV9_COMPOSITE(38)
+            MV9_COMPOSITE(39)
+            MV9_COMPOSITE(40)
+            MV9_COMPOSITE(41)
+            MV9_COMPOSITE(42)
+            MV9_COMPOSITE(43)
+            MV9_COMPOSITE(44)
+            MV9_COMPOSITE(45)
+            MV9_COMPOSITE(46)
+            MV9_COMPOSITE(47)
+            MV9_ADVANCE(48)
+          }
+          else if (batchCap >= 32 && i + 32 <= steps)
+          {
+            MV9_FETCH(0)
+            MV9_FETCH(1)
+            MV9_FETCH(2)
+            MV9_FETCH(3)
+            MV9_FETCH(4)
+            MV9_FETCH(5)
+            MV9_FETCH(6)
+            MV9_FETCH(7)
+            MV9_FETCH(8)
+            MV9_FETCH(9)
+            MV9_FETCH(10)
+            MV9_FETCH(11)
+            MV9_FETCH(12)
+            MV9_FETCH(13)
+            MV9_FETCH(14)
+            MV9_FETCH(15)
+            MV9_FETCH(16)
+            MV9_FETCH(17)
+            MV9_FETCH(18)
+            MV9_FETCH(19)
+            MV9_FETCH(20)
+            MV9_FETCH(21)
+            MV9_FETCH(22)
+            MV9_FETCH(23)
+            MV9_FETCH(24)
+            MV9_FETCH(25)
+            MV9_FETCH(26)
+            MV9_FETCH(27)
+            MV9_FETCH(28)
+            MV9_FETCH(29)
+            MV9_FETCH(30)
+            MV9_FETCH(31)
+            MV9_COMPOSITE(0)
+            MV9_COMPOSITE(1)
+            MV9_COMPOSITE(2)
+            MV9_COMPOSITE(3)
+            MV9_COMPOSITE(4)
+            MV9_COMPOSITE(5)
+            MV9_COMPOSITE(6)
+            MV9_COMPOSITE(7)
+            MV9_COMPOSITE(8)
+            MV9_COMPOSITE(9)
+            MV9_COMPOSITE(10)
+            MV9_COMPOSITE(11)
+            MV9_COMPOSITE(12)
+            MV9_COMPOSITE(13)
+            MV9_COMPOSITE(14)
+            MV9_COMPOSITE(15)
+            MV9_COMPOSITE(16)
+            MV9_COMPOSITE(17)
+            MV9_COMPOSITE(18)
+            MV9_COMPOSITE(19)
+            MV9_COMPOSITE(20)
+            MV9_COMPOSITE(21)
+            MV9_COMPOSITE(22)
+            MV9_COMPOSITE(23)
+            MV9_COMPOSITE(24)
+            MV9_COMPOSITE(25)
+            MV9_COMPOSITE(26)
+            MV9_COMPOSITE(27)
+            MV9_COMPOSITE(28)
+            MV9_COMPOSITE(29)
+            MV9_COMPOSITE(30)
+            MV9_COMPOSITE(31)
+            MV9_ADVANCE(32)
+          }
+          else if (batchCap >= 16 && i + 16 <= steps)
+          {
+            MV9_FETCH(0)
+            MV9_FETCH(1)
+            MV9_FETCH(2)
+            MV9_FETCH(3)
+            MV9_FETCH(4)
+            MV9_FETCH(5)
+            MV9_FETCH(6)
+            MV9_FETCH(7)
+            MV9_FETCH(8)
+            MV9_FETCH(9)
+            MV9_FETCH(10)
+            MV9_FETCH(11)
+            MV9_FETCH(12)
+            MV9_FETCH(13)
+            MV9_FETCH(14)
+            MV9_FETCH(15)
+            MV9_COMPOSITE(0)
+            MV9_COMPOSITE(1)
+            MV9_COMPOSITE(2)
+            MV9_COMPOSITE(3)
+            MV9_COMPOSITE(4)
+            MV9_COMPOSITE(5)
+            MV9_COMPOSITE(6)
+            MV9_COMPOSITE(7)
+            MV9_COMPOSITE(8)
+            MV9_COMPOSITE(9)
+            MV9_COMPOSITE(10)
+            MV9_COMPOSITE(11)
+            MV9_COMPOSITE(12)
+            MV9_COMPOSITE(13)
+            MV9_COMPOSITE(14)
+            MV9_COMPOSITE(15)
+            MV9_ADVANCE(16)
+          }
+          else if (batchCap >= 8 && i + 8 <= steps)
+          {
+            MV9_FETCH(0)
+            MV9_FETCH(1)
+            MV9_FETCH(2)
+            MV9_FETCH(3)
+            MV9_FETCH(4)
+            MV9_FETCH(5)
+            MV9_FETCH(6)
+            MV9_FETCH(7)
+            MV9_COMPOSITE(0)
+            MV9_COMPOSITE(1)
+            MV9_COMPOSITE(2)
+            MV9_COMPOSITE(3)
+            MV9_COMPOSITE(4)
+            MV9_COMPOSITE(5)
+            MV9_COMPOSITE(6)
+            MV9_COMPOSITE(7)
+            MV9_ADVANCE(8)
+          }
+          else if (batchCap >= 4 && i + 4 <= steps)
+          {
+            MV9_FETCH(0)
+            MV9_FETCH(1)
+            MV9_FETCH(2)
+            MV9_FETCH(3)
+            MV9_COMPOSITE(0)
+            MV9_COMPOSITE(1)
+            MV9_COMPOSITE(2)
+            MV9_COMPOSITE(3)
+            MV9_ADVANCE(4)
+          }
+          else if (batchCap >= 2 && i + 2 <= steps)
+          {
+            MV9_FETCH(0)
+            MV9_FETCH(1)
+            MV9_COMPOSITE(0)
+            MV9_COMPOSITE(1)
+            MV9_ADVANCE(2)
+          }
+          else if (i + 1 <= steps)
+          {
+            MV9_FETCH(0)
+            MV9_COMPOSITE(0)
+            MV9_ADVANCE(1)
+          }
+        } else {
+          // coarse SD4: only 2 and 1, dead-strip 48/32/16/8/4 rungs for I$ and registers, thr0
+          if (batchCap >= 2 && i + 2 <= steps)
+          {
+            MV9_FETCH(0)
+            MV9_FETCH(1)
+            MV9_COMPOSITE(0)
+            MV9_COMPOSITE(1)
+            MV9_ADVANCE(2)
+          }
+          else if (i + 1 <= steps)
+          {
+            MV9_FETCH(0)
+            MV9_COMPOSITE(0)
+            MV9_ADVANCE(1)
+          }
         }
       }
 #undef MV9_FETCH

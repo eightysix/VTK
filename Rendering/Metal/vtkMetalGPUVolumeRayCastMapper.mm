@@ -7987,6 +7987,12 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
       // with a uniform-supplied saturation exit must not share with the
       // legacy-latch ones.
       ((VolumeExitTheta() > 0.0f) ? 64u : 0u) |
+      // §17 SD4 fixed overhead specializations: depth/cameraInside/dense bypass + volume nearest coarse + quadGrad
+      ((std::getenv("VTK_METAL_TEST_DEPTH") != nullptr) ? (1u<<16) : 0u) |
+      ((std::getenv("VTK_METAL_TEST_CAMERA_INSIDE") != nullptr) ? (1u<<17) : 0u) |
+      ((std::getenv("VTK_METAL_TEST_DENSE") != nullptr) ? (1u<<18) : 0u) |
+      ((std::getenv("VTK_METAL_TEST_VOLUME_NEAREST") != nullptr) ? (1u<<19) : 0u) |
+      ((std::getenv("VTK_METAL_TEST_QUAD_GRAD") != nullptr) ? (1u<<20) : 0u) |
       // Fragment compile-time batch specialization — encode width in
       // featureMaskExtra bits [10:15] so each compile-time width gets its
       // own PSO (occupancy probe, mirrors fc_cmBatch trick for compute).
@@ -8197,6 +8203,17 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     [constants setConstantValue:&fineSD type:MTLDataTypeBool withName:@"fc_fineSD"];
     BOOL gradNearest = (std::getenv("VTK_METAL_TEST_GRAD_NEAREST") != nullptr) ? YES : NO;
     [constants setConstantValue:&gradNearest type:MTLDataTypeBool withName:@"fc_gradNearest"];
+    // §17 SD4 fixed overhead specializations: depth/cameraInside dead-strip, dense coarse bypass, volume nearest coarse
+    BOOL useDepthTexture = (std::getenv("VTK_METAL_TEST_DEPTH") != nullptr) ? YES : NO;
+    [constants setConstantValue:&useDepthTexture type:MTLDataTypeBool withName:@"fc_useDepthTexture"];
+    BOOL useCameraInside = (std::getenv("VTK_METAL_TEST_CAMERA_INSIDE") != nullptr) ? YES : NO;
+    [constants setConstantValue:&useCameraInside type:MTLDataTypeBool withName:@"fc_useCameraInside"];
+    BOOL dense = (std::getenv("VTK_METAL_TEST_DENSE") != nullptr) ? YES : NO;
+    [constants setConstantValue:&dense type:MTLDataTypeBool withName:@"fc_dense"];
+    BOOL volumeNearestCoarse = (std::getenv("VTK_METAL_TEST_VOLUME_NEAREST") != nullptr) ? YES : NO;
+    [constants setConstantValue:&volumeNearestCoarse type:MTLDataTypeBool withName:@"fc_volumeNearestCoarse"];
+    BOOL quadGrad = (std::getenv("VTK_METAL_TEST_QUAD_GRAD") != nullptr) ? YES : NO;
+    [constants setConstantValue:&quadGrad type:MTLDataTypeBool withName:@"fc_quadGrad"];
 
     // §38.15/38.16 block-summary tap bisects (fc_mmNoTap / fc_mmRead).
 
@@ -9683,7 +9700,6 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     // (0/absent = feature off; e.g. MM_WARPMIN=4 skips unless >=4).
     uniforms.MmWarpMin = static_cast<float>(std::atoi(wm));
   }
-
   // Final color window/level (matches OpenGL's in_scale/in_bias, applied in the
   // shader after the ray cast as rgb * scale + bias * alpha).
   if (this->FinalColorWindow != 0.0)
