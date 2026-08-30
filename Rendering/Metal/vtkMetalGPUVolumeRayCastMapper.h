@@ -251,8 +251,8 @@ public:
   void ForceResourceReupload();
 
   // §38.18.1: purge heavyweight Private-heap / PSO caches (SegPool 64 MB +
-  // RayBin 4×W×H + ComputeMarchPipelineCache + SegBuild) that are otherwise
-  // retained until ReleaseGraphicsResources/MTLDevice teardown. This is the
+  // + SegBuild) that are otherwise retained until
+  // ReleaseGraphicsResources/MTLDevice teardown. This is the
   // "reboot without reboot" — callable from ReleaseGraphicsResources and on
   // VTK_METAL_TEST_PURGE=1. qoff (window CB) default plus this purge removes
   // the reboot-only clog without cooldown (not DVFS).
@@ -371,17 +371,6 @@ private:
   std::vector<uint8_t> SegCachePbdBytes;
   size_t SegCachePoolCapWords = 0;
   vtkTimeStamp SegCacheMinMaxTime;
-
-  // §38.6 / §36.4 Design B — Compute Marcher & Ray-Binned Marching
-  void* ComputeMarchPipeline = nullptr; // id<MTLComputePipelineState> — volume_compute_march
-  void* RayBinClassifyPipeline = nullptr; // id<MTLComputePipelineState> — volume_ray_bin_classify
-  void* ComputeMarchBinnedPipeline = nullptr; // id<MTLComputePipelineState> — volume_compute_march_binned
-  void* RayBinIndicesBuffer = nullptr; // id<MTLBuffer> uint32 packed UVs per bin
-  void* RayBinCountersBuffer = nullptr; // id<MTLBuffer> uint32 atomic counters (CPU-zeroed per frame)
-  size_t RayBinIndicesCapBytes = 0;
-  std::unordered_map<VolumePipelineKey, void*, VolumePipelineKeyHash> ComputeMarchPipelineCache;
-  std::unordered_map<VolumePipelineKey, void*, VolumePipelineKeyHash> ComputeMarchBinnedPipelineCache;
-  void* ComputeMarchQueue = nullptr; // probe-selected fast-slot queue (§38.8)
 
   void* DepthStencilState = nullptr;     // id<MTLDepthStencilState>
   void* DepthTextureOcclusion = nullptr; // id<MTLTexture> — scene depth for early ray termination
@@ -633,9 +622,6 @@ private:
   void* GetOrCreateVolumePipeline(void* mtlDevice, uint32_t type,
     uint32_t colorFormat, uint32_t depthFormat, uint32_t sampleCount,
     uint32_t featureMask);
-  bool EnsureComputeMarchResources(void* device, void* mtlQueue, int width, int height);
-  void* GetOrCreateComputeMarchPipeline(void* mtlDevice, uint32_t featureMask, bool binned);
-  void BindComputeMarchTextures(void* encoder, void* atlasA, void* atlasB, void* atlasC, void* outColor);
   // §38.18.1: helper that releases all segment-pre-pass Private heaps and
   // invalidates the per-camera seg cache (called by PurgeCaches and
   // ReleaseGraphicsResources).
