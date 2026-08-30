@@ -9555,7 +9555,7 @@ inline float3 cinematic_onb_n(float3 n, float phi, float cosT)
   float3 b = cross(n, t);
   return normalize(t * cos(phi) * sinT + b * sin(phi) * sinT + n * cosT);
 }
-inline half4 cine_accum(half4 curr, half4 prev, uint n) {
+inline half4 cine_accum(half4 curr, half4 prev, uint n) { // fade, not spp: mixes 1 spp frames
   if (n <= 1) return curr;
   float a = 1.0 / float(min(n, 16u));
   if (curr.a < 0.01h && prev.a > 0.01h) return prev;

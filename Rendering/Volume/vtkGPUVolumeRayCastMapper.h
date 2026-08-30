@@ -293,8 +293,8 @@ public:
    * over with first-surface AO (outward +N) and thickness (inward -N),
    * subtle SSS and premul over black. Default off. Samples/Bounces/
    * Denoise are reserved for a future path-traced variant and do not
-   * affect the current DVR integrator (cine_accum mixes toward 1 spp;
-   * Denoise is disabled at <4 spp).
+   * affect the current DVR integrator (cine_accum is a 1 spp fade,
+    * not spp; Denoise is a 5x5 bilateral disabled at <4 spp).
    */
   vtkSetMacro(CinematicRendering, bool);
   vtkGetMacro(CinematicRendering, bool);

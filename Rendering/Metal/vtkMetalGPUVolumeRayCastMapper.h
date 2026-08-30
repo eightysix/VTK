@@ -89,7 +89,7 @@ struct VolumePipelineKeyHash
 // Feature flags for volume shader specialization via function constants.
 // Each flag enables a corresponding [[function_constant(n)]] in the Metal
 // shader, allowing the compiler to eliminate dead code paths.
-// Cinematic: VolumeFeature_Cinematic=1u<<30 (fc_cinematic 52) VolumeFeature_Denoise=1u<<29 (fc_denoise 53) — stored in featureMaskExtra bits 22/23 (all 32 featureMask bits used by VolRg8/Transposed).
+// Cinematic: no fc_cinematic/fc_denoise — reads u.cinematicEnabled (shaded DVR skin, 8 hits, j0); denoise via separate kernel. featureMaskExtra 22/23 reserved, all 32 featureMask bits remain for VolRg8/Transposed.
 // CinematicUniforms {uint samples,bounces; float g,reach,blend; float3 subsurface;} extends VolumeMapperUniforms:35/PerBlockData:34 (WAX g 0, Reach 0.45, Blend 1.15, 1 spp, denoise 0)
 enum VolumeShaderFeatureFlags : uint32_t
 {
@@ -180,10 +180,10 @@ enum VolumeShaderFeatureFlags : uint32_t
   VolumeFeature_VolTransposed = 1u << 31,
 };
 
-// Cinematic aliases for plan parity (real PSO bits are featureMaskExtra 22/23 -> fc_cinematic 52 / fc_denoise 53)
-static constexpr uint32_t VolumeFeature_Cinematic_PlanAlias = 1u << 30; // fc_cinematic
-static constexpr uint32_t VolumeFeature_Denoise_PlanAlias = 1u << 29; // fc_denoise
-// Real compute-coherent bits (optimal variant: binned 8x8, shared TF, MinMaxSuper skip, temporal 64spp)
+// Cinematic: no PSO fc_cinematic — single compute kernel volume_compute_march_cinematic reads u.cinematicEnabled.
+// Plan aliases kept for doc parity; real bits are featureMaskExtra 22/23 (binned 8x8 variant removed, shaded skin is product).
+static constexpr uint32_t VolumeFeature_Cinematic_PlanAlias = 1u << 30; // alias only, not a PSO
+static constexpr uint32_t VolumeFeature_Denoise_PlanAlias = 1u << 29; // alias only
 static constexpr uint32_t CinematicFeatureMaskExtra_Cinematic = 1u << 22;
 static constexpr uint32_t CinematicFeatureMaskExtra_Denoise = 1u << 23;
 

@@ -8691,7 +8691,13 @@ void vtkMetalGPUVolumeRayCastMapper::ReleaseCinematicResources()
   ReleaseMetalObject(this->CinematicDenoiseTexture);
   ReleaseMetalObject(this->CinematicDenoisePipeline);
   ReleaseMetalObject(this->CinematicComputePipeline);
-  for (auto &e : this->CinematicComputePipelineCache) [(__bridge id)e.second release];
+  for (auto &e : this->CinematicComputePipelineCache) {
+#if __has_feature(objc_arc)
+    CFRelease(e.second);
+#else
+    [(__bridge id)e.second release];
+#endif
+  }
   this->CinematicComputePipelineCache.clear();
   this->CinematicAccumWidth = 0;
   this->CinematicAccumHeight = 0;
@@ -8802,9 +8808,9 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateCinematicComputePipeline(void* 
   [fn release];
   if (!cps) { vtkErrorMacro("Failed to create cinematic pipeline " << [funcName UTF8String] << ": " << [[err localizedDescription] UTF8String]); return nullptr; }
 #if __has_feature(objc_arc)
-  void* res = (__bridge_retained void*)cps;
+  void* res = (__bridge_retained void*)cps; // +1, released via CFRelease above
 #else
-  void* res = (__bridge void*)cps;
+  void* res = (__bridge void*)cps; // non-ARC: no retain, no CFRelease
 #endif
   cache[key] = res;
   return res;
@@ -8860,6 +8866,7 @@ bool vtkMetalGPUVolumeRayCastMapper::DispatchCinematicCompute(void* deviceVoid, 
       SetComputeTextureOrFallback(enc, 12, this->GradientOpacityTexture, this->ColorOpacityTexture);
       SetComputeTextureOrFallback(enc, 13, this->MaskTexture, this->DummyMaskTexture);
       SetComputeTextureOrFallback(enc, 14, this->LabelMapTransferTexture, this->ColorOpacityTexture);
+      // MinMax unused for skin (1 spp, latch 0.08, no skipping) — bound as dummy
       SetComputeTextureOrFallback(enc, 15, this->MinMaxTexture, this->DummyMinMaxTexture);
       SetComputeTextureOrFallback(enc, 16, this->MinMaxBlockTexture, this->DummyMinMaxTexture);
       SetComputeTextureOrFallback(enc, 17, this->MinMaxSuperTexture, this->DummyMinMaxTexture);
@@ -10978,7 +10985,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
         return -1;
       }();
 
-      // Cinematic — shaded DVR 1 spp (single 8x8, no binned, cine_accum is 1 spp fade)
+      // Cinematic — shaded DVR skin 1 spp (single 8x8, no binned, cine_accum fade) — writes ImageSampleColorTexture for Phase 3b blit
         if (this->CinematicRendering && !selectionRender && !usePartitions && !cameraInside) {
           // End current encoder for compute dispatch (same precedent as slab/compute paths)
           id<MTLRenderCommandEncoder> curEnc = (__bridge id<MTLRenderCommandEncoder>)metalRenderWindow->GetCurrentRenderCommandEncoder();
@@ -10990,7 +10997,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
             this->BindEncoderResources(encoder, uniformBuf, directPso, true);
             for (int s = numSlabs - 1; s >= 0; --s) { this->DrawBlocks(encoder, uniformBuf, ren, vol, &uniforms, invModelMatrix, s, numSlabs); }
           }
-          return;
+          return; // ImageSampleColorTexture already set for Phase 3b blit
         } else if (numSlabs > 1)
       {
         // Ping-pong offscreen path. End the renderer's active encoder (the
