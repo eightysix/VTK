@@ -9902,12 +9902,12 @@ kernel void volume_path_trace(
     uint maxBounces = max(u.cinematicMaxBounces, 1u);
     float3 curO = o;
     float3 curD = d;
-    bool scattered = false; bool addedEnv = false;
+    bool scattered = false;
     for (uint bounce = 0; bounce < maxBounces; ++bounce) {
       float3 o2 = curO + curD * 1e-4;
       float2 tBox = intersectBox(o2, curD, float3(0.0), float3(1.0));
       float tExit = tBox.y;
-      if (tExit <= 1e-6) { if (scattered) { L += beta * env; addedEnv = true; } break; }
+      if (tExit <= 1e-6) { if (scattered) L += beta * env; break; }
       float t = 0.0;
       float3 hitPos = float3(0.0);
       bool realHit = false;
@@ -9927,7 +9927,7 @@ kernel void volume_path_trace(
         if (xi2 * sigma_maj < sigma) { hitPos = x; realHit = true; break; }
       }
       if (hitCap) break;
-      if (!realHit) { if (scattered) { L += beta * env; addedEnv = true; } break; }
+      if (!realHit) { if (scattered) L += beta * env; break; }
       float sHit = sampleVolumeScalar(volumeTexture, hitPos);
       float3 albedo = clamp(sampleMediumAlbedo(mediumTable, sHit, sMin, sMax), 0.0, 0.99);
       float avgA = clamp((albedo.r + albedo.g + albedo.b) / 3.0, 0.0, 0.99);
