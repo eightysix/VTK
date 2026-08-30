@@ -9848,6 +9848,49 @@ inline float sampleMediumSigma(device float4 *table, float s, float sMin, float 
   uint idx = min(uint(u * 1023.0 + 0.5), 1023u);
   return table[idx].x; // sigma_t
 }
+inline float woodcock_ratio_T(
+    float3 o, float3 wi, float tExit, float sigma_maj,
+    texture3d<float> volumeTexture, device float4 *table,
+    float sMin, float sMax, thread uint &rng) {
+  float T = 1.0;
+  float tt = 0.0;
+  int iter = 0;
+  while (tt < tExit) {
+    if (iter >= 1024) return 0.0;
+    ++iter;
+    tt += -log(max(1.0 - pt_rand(rng), 1e-6)) / sigma_maj;
+    if (tt >= tExit) break;
+    float3 x = o + wi * tt;
+    if (any(x < 0.0) || any(x > 1.0)) break;
+    float s = sampleVolumeScalar(volumeTexture, x);
+    float sig = sampleMediumSigma(table, s, sMin, sMax);
+    sig = min(sig, sigma_maj);
+    T *= max(1.0 - sig / sigma_maj, 0.0);
+    if (T < 1e-5) return 0.0;
+  }
+  return T;
+}
+struct WoodcockHit { bool hit; bool hitCap; float t; float3 x; };
+inline WoodcockHit woodcock_delta(
+    float3 o, float3 d, float tExit, float sigma_maj,
+    texture3d<float> volumeTexture, device float4 *table,
+    float sMin, float sMax, thread uint &rng) {
+  WoodcockHit h; h.hit=false; h.hitCap=false; h.t=0.0; h.x=float3(0.0);
+  float tt = 0.0;
+  int iter = 0;
+  while (tt < tExit) {
+    if (iter >= 1024) { h.hitCap=true; break; }
+    ++iter;
+    tt += -log(max(1.0 - pt_rand(rng), 1e-6)) / sigma_maj;
+    if (tt >= tExit) break;
+    float3 x = o + d * tt;
+    if (any(x < 0.0) || any(x > 1.0)) break;
+    float s = sampleVolumeScalar(volumeTexture, x);
+    float sig = sampleMediumSigma(table, s, sMin, sMax);
+    if (pt_rand(rng) * sigma_maj < sig) { h.hit=true; h.t=tt; h.x=x; break; }
+  }
+  return h;
+}
 
 // Step 0: grey running-mean test — proves PT accum/blit/reset without volume logic.
 // Writes constant grey into HDR sum (RGBA32F) via ping-pong running mean.
@@ -9908,26 +9951,11 @@ kernel void volume_path_trace(
       float2 tBox = intersectBox(o2, curD, float3(0.0), float3(1.0));
       float tExit = tBox.y;
       if (tExit <= 1e-6) { if (scattered) L += beta * env; break; }
-      float t = 0.0;
-      float3 hitPos = float3(0.0);
-      bool realHit = false;
-      int iter = 0; bool hitCap = false;
-      while (t < tExit) {
-        if (iter >= 1024) { hitCap = true; break; }
-        ++iter;
-        float xi = pt_rand(rng);
-        float dt = -log(max(1.0 - xi, 1e-6)) / sigma_maj;
-        t += dt;
-        if (t >= tExit) break;
-        float3 x = o2 + curD * t;
-        if (any(x < 0.0) || any(x > 1.0)) break;
-        float s = sampleVolumeScalar(volumeTexture, x);
-        float sigma = sampleMediumSigma(mediumTable, s, sMin, sMax);
-        float xi2 = pt_rand(rng);
-        if (xi2 * sigma_maj < sigma) { hitPos = x; realHit = true; break; }
-      }
-      if (hitCap) break;
-      if (!realHit) { if (scattered) L += beta * env; break; }
+      WoodcockHit wh = woodcock_delta(o2, curD, tExit, sigma_maj, volumeTexture, mediumTable, sMin, sMax, rng);
+      if (wh.hitCap) break;
+      if (!wh.hit) { if (scattered) L += beta * env; break; }
+      float3 hitPos = wh.x;
+      bool realHit = true;
       float sHit = sampleVolumeScalar(volumeTexture, hitPos);
       float3 albedo = clamp(sampleMediumAlbedo(mediumTable, sHit, sMin, sMax), 0.0, 0.99);
       float avgA = clamp((albedo.r + albedo.g + albedo.b) / 3.0, 0.0, 0.99);
@@ -9981,28 +10009,9 @@ kernel void volume_path_trace(
               if (cosLight > 1e-4 && cosSurf > 1e-4) {
                 float pdfA = 1.0 / (M_PI_F * lightRadius * lightRadius);
                 float G = cosLight / (dist*dist);
-                float T = 1.0;
                 float3 oS = hitPos + N * 1e-4;
-                float tS = 0.0;
                 float tExitS = dist - 2e-4;
-                bool blocked = false;
-                int sIter = 0; bool sHitCap = false;
-                while (tS < tExitS) {
-                  if (sIter >= 1024) { sHitCap = true; break; }
-                  ++sIter;
-                  float xiS = pt_rand(rng);
-                  float dtS = -log(max(1.0 - xiS, 1e-6)) / sigma_maj;
-                  tS += dtS;
-                  if (tS >= tExitS) break;
-                  float3 xs = oS + wi * tS;
-                  if (any(xs < 0.0) || any(xs > 1.0)) break;
-                  float sS = sampleVolumeScalar(volumeTexture, xs);
-                  float sigmaS = sampleMediumSigma(mediumTable, sS, sMin, sMax);
-                  float xiS2 = pt_rand(rng);
-                  if (xiS2 * sigma_maj < sigmaS) { blocked = true; break; }
-                }
-                if (sHitCap) blocked = true;
-                if (blocked) T = 0.0;
+                float T = woodcock_ratio_T(oS, wi, tExitS, sigma_maj, volumeTexture, mediumTable, sMin, sMax, rng);
                 float3 brdf = albedo / M_PI_F;
                 L += beta * lightRadiance * brdf * cosSurf * T * G / pdfA;
               }
@@ -10050,28 +10059,9 @@ kernel void volume_path_trace(
               if (cosLight > 1e-4) {
                 float pdfA = 1.0 / (M_PI_F * lightRadius * lightRadius);
                 float G = cosLight / (dist*dist);
-                float T = 1.0;
                 float3 oS = hitPos + wi * 1e-4;
-                float tS = 0.0;
                 float tExitS = dist - 2e-4;
-                bool blocked = false;
-                int sIter = 0; bool sHitCap = false;
-                while (tS < tExitS) {
-                  if (sIter >= 1024) { sHitCap = true; break; }
-                  ++sIter;
-                  float xiS = pt_rand(rng);
-                  float dtS = -log(max(1.0 - xiS, 1e-6)) / sigma_maj;
-                  tS += dtS;
-                  if (tS >= tExitS) break;
-                  float3 xs = oS + wi * tS;
-                  if (any(xs < 0.0) || any(xs > 1.0)) break;
-                  float sS = sampleVolumeScalar(volumeTexture, xs);
-                  float sigmaS = sampleMediumSigma(mediumTable, sS, sMin, sMax);
-                  float xiS2 = pt_rand(rng);
-                  if (xiS2 * sigma_maj < sigmaS) { blocked = true; break; }
-                }
-                if (sHitCap) blocked = true;
-                if (blocked) T = 0.0;
+                float T = woodcock_ratio_T(oS, wi, tExitS, sigma_maj, volumeTexture, mediumTable, sMin, sMax, rng);
                 float p_hg = hg_phase_pt(dot(wi, -curD), g);
                 L += beta * lightRadiance * p_hg * T * G / pdfA;
               }
