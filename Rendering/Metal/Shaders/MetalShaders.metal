@@ -9665,36 +9665,38 @@ inline half4 cinematic_march_core(
                                 cur - N * voxel, -N, aoDist * 1.8, 12, scalarScale, scalarBias, sigma);
     float ao    = saturate(exp(-tauAO * k * 0.55));
     float thick = saturate(exp(-tauSS * k * 0.35));
+    ao = max(ao, 0.40); // fissure cannot go to [2,1,1]
     ao = mix(1.0, ao, saturate(gmag * 1.8)); // cuts: weak gradient -> no cave-AO
+
+    float edge = smoothstep(0.06, 0.22, gmag); // binary-ish, not salt
 
     float ndl  = dot(N, L);
     float ndlF = dot(N, Lfill);
     float wrap = pow(saturate((ndl  + 0.22) / 1.22), 1.20);
     float fill = pow(saturate((ndlF + 0.50) / 1.50), 1.10) * 0.22;
-    float rim  = pow(saturate(dot(N, Lrim)), 2.0) * 0.18 * gmag; // silver edge only
-    float shade = mix(0.16, saturate(wrap + fill), gmag);
+    float rim  = pow(saturate(dot(N, Lrim)), 2.0) * 0.18 * edge; // silver edge only
+    float shade = saturate(wrap + fill); // no mix(..., gmag)
     shade *= mix(0.55, 1.0, ao);
 
     float3 albedo = float3(tf.rgb) * 0.90;
     albedo *= mix(float3(1.0), ssColor, 0.08 * ss);
-    albedo *= mix(0.90, 1.0, gmag);
+    // no albedo *= mix(0.90, 1.0, gmag)
 
     float side    = saturate(1.0 - abs(ndl));
     float wrapSSS = pow(saturate((-ndl + 0.45) / 1.45), 1.3);
-    float3 sss = ssColor * ss * gmag
+    float3 sss = ssColor * ss * edge
                * (0.12 * side + 0.38 * wrapSSS)
                * mix(0.12, 1.0, thick);
 
     float3 H   = normalize(L + V);
-    float spec = pow(saturate(dot(N, H)), 72.0) * gmag * gmag * 0.025;
+    float spec = pow(saturate(dot(N, H)), 72.0) * edge * 0.025;
     spec *= mix(0.10, 1.0, ao);
 
     float3 sCol = saturate(albedo * shade + sss + spec + albedo * rim);
 
-    float cov = smoothstep(0.08, 0.55, a); // coverage, not DVR weight
-    float3 c = saturate(sCol); // SSS already inside sCol
-    if (cov < 0.02) { cur += evalStep; continue; }
-    return half4(half3(c * cov), half(cov)); // premul surface over black
+    float cov = smoothstep(0.08, 0.22, a); // AA only; a>=0.22 -> opaque
+    float3 c = saturate(sCol);
+    return half4(half3(c * cov), half(cov)); // premul surface over black, no cov continue
   }
 
   return half4(0.0h);
