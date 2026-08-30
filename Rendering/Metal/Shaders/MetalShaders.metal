@@ -9590,16 +9590,17 @@ inline half4 cinematic_march_core(
   float3 ssColor = saturate(float3(u.subsurfaceColorR, u.subsurfaceColorG, u.subsurfaceColorB));
   float reach = clamp(u.cinematicReach, 0.0, 1.0);
 
-  // ~57° key — 0.72 was still a headlight. Fill opposite, dim.
+  // Studio: 57° key + dim fill + rim (specimen, not flashlight)
   float3 V     = -normalize(rayDir);
   float3 L     = cinematic_onb_n(V, 0.55, 0.55);
-  float3 Lfill = cinematic_onb_n(V, 3.70, 0.42);
+  float3 Lfill = cinematic_onb_n(V, 3.70, 0.45);
+  float3 Lrim  = cinematic_onb_n(V, 3.0, -0.25); // behind, toward camera
 
   float3 gs = b.gradientStep.xyz * 2.2; // blurred N: 1.5 grain, 2.2 smooth folia (specimen instead of sand)
   float3 gsBlur = b.gradientStep.xyz; // 1 voxel blur kernel
 
   float voxel  = max(length(b.gradientStep.xyz), 1e-4);
-  float aoDist = mix(2.5, 8.0, reach) * voxel;   // 2.5–8 voxels
+  float aoDist = mix(4.0, 14.0, reach) * voxel;  // 12-step cavity, not 6-step kink
   float sigma  = max(u.cinematicBlend, 1.0);
   float k      = 1.0 / voxel; // UV → voxel: one voxel ≈ a*sigma
 
@@ -9658,9 +9659,9 @@ inline half4 cinematic_march_core(
     if (!haveSurface) {
       if (a < 0.08) { cur += evalStep; continue; }
       float tauAO = optical_depth(volumeTexture, transferFunctionTexture,
-                                  cur + N * voxel,  N, aoDist,       6, scalarScale, scalarBias, sigma);
+                                  cur + N * voxel,  N, aoDist,      12, scalarScale, scalarBias, sigma);
       float tauSS = optical_depth(volumeTexture, transferFunctionTexture,
-                                  cur - N * voxel, -N, aoDist * 1.8, 6, scalarScale, scalarBias, sigma);
+                                  cur - N * voxel, -N, aoDist * 1.8, 12, scalarScale, scalarBias, sigma);
       ao    = saturate(exp(-tauAO * k * 0.55));
       thick = saturate(exp(-tauSS * k * 0.35));
       haveSurface = true;
@@ -9673,6 +9674,7 @@ inline half4 cinematic_march_core(
     float ndlF = dot(N, Lfill);
     float wrap = pow(saturate((ndl  + 0.22) / 1.22), 1.20);
     float fill = pow(saturate((ndlF + 0.50) / 1.50), 1.10) * 0.22;
+    float rim  = pow(saturate(dot(N, Lrim)), 2.0) * 0.18 * gmag; // silver edge only
     float shade = mix(0.16, saturate(wrap + fill), gmag);
     shade *= mix(0.55, 1.0, ao);
 
@@ -9690,7 +9692,7 @@ inline half4 cinematic_march_core(
     float spec = pow(saturate(dot(N, H)), 72.0) * gmag * gmag * 0.025;
     spec *= mix(0.10, 1.0, ao);
 
-    float3 sCol = saturate(albedo * shade + sss + spec);
+    float3 sCol = saturate(albedo * shade + sss + spec + albedo * rim);
 
     float w = (1.0 - aAccum) * a;
     colAccum = sCol * w;
