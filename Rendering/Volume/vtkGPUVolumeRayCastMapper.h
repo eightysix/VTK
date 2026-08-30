@@ -17,7 +17,6 @@
  */
 #ifndef vtkGPUVolumeRayCastMapper_h
 #define vtkGPUVolumeRayCastMapper_h
-#include <algorithm>     // For std::clamp
 #include <unordered_map> // For std::unordered_map
 #include <vector>        // For std::vector
 
@@ -324,7 +323,7 @@ public:
   // Use manual accessors to avoid member/type name clash (member is CinematicQualityValue)
   void SetCinematicQuality(int v)
   {
-    v = std::clamp(v, 0, 1);
+    v = v < 0 ? 0 : (v > 1 ? 1 : v);
     if (this->CinematicQualityValue != v)
     {
       this->CinematicQualityValue = v;

@@ -8798,7 +8798,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateCinematicMediumTable(void* deviceVoid
   float maj = maxSigma * 1.05f;
   if (maj < 1e-4f) maj = 1e-4f;
   this->CinematicMajorantSigma = maj;
-  fprintf(stderr, "[PT] worldPerUV %.2f unit %.2f maxSigma %.2f maj %.2f sMin %.2f sMax %.2f\n", worldPerUV, unit, maxSigma, maj, sMin, sMax);
+  if (getenv("VTK_METAL_TEST_PT_DEBUG")) fprintf(stderr, "[PT] worldPerUV %.2f unit %.2f maxSigma %.2f maj %.2f sMin %.2f sMax %.2f\n", worldPerUV, unit, maxSigma, maj, sMin, sMax);
   id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
   NSUInteger bytes = N * 4 * sizeof(float);
   id<MTLBuffer> buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
@@ -8987,11 +8987,7 @@ bool vtkMetalGPUVolumeRayCastMapper::DispatchCinematicPathTrace(void* deviceVoid
     // Ensure medium table is ready (needed for future Woodcock; step 0 uses dummy)
     this->UpdateCinematicMediumTable(deviceVoid, vol);
     id<MTLBuffer> mediumBuf = (__bridge id<MTLBuffer>)this->CinematicMediumTableBuffer;
-    if (!mediumBuf) {
-      // dummy 1-element buffer
-      static float dummy[4] = {1e-4f,1,1,1};
-      mediumBuf = [(__bridge id<MTLDevice>)deviceVoid newBufferWithBytes:dummy length:sizeof(dummy) options:MTLResourceStorageModeShared];
-    }
+    if (!mediumBuf) return false;
     // Encode path trace
     {
       id<MTLComputeCommandEncoder> enc = [commandBuffer computeCommandEncoder];

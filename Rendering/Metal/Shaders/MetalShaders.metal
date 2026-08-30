@@ -9895,15 +9895,11 @@ kernel void volume_path_trace(
     float sMin = float(u.scalarMin);
     float sMax = float(u.scalarMax);
     float g = clamp(u.cinematicScatteringAnisotropy, -0.9, 0.9);
-    float reach = clamp(u.cinematicReach, 0.0, 1.0);
     float env = u.cinematicEnv;
-    float maxT = mix(0.5, 4.0, reach);
     float3 o = so.evalPoint;
     float3 d = normalize(so.rayDir);
     float3 beta = float3(1.0);
     uint maxBounces = max(u.cinematicMaxBounces, 1u);
-    // Handle grey-box env override for step 0 test if needed: keep woodcock for real
-    // Delta-track loop
     float3 curO = o;
     float3 curD = d;
     bool scattered = false; bool addedEnv = false;
@@ -9911,7 +9907,6 @@ kernel void volume_path_trace(
       float3 o2 = curO + curD * 1e-4;
       float2 tBox = intersectBox(o2, curD, float3(0.0), float3(1.0));
       float tExit = tBox.y;
-      tExit = min(tExit, maxT);
       if (tExit <= 1e-6) { if (scattered) { L += beta * env; addedEnv = true; } break; }
       float t = 0.0;
       float3 hitPos = float3(0.0);
@@ -9930,10 +9925,12 @@ kernel void volume_path_trace(
       }
       if (!realHit) { if (scattered) { L += beta * env; addedEnv = true; } break; }
       float sHit = sampleVolumeScalar(volumeTexture, hitPos);
-      float3 albedo = sampleMediumAlbedo(mediumTable, sHit, sMin, sMax);
-      float lum = dot(albedo, float3(0.2126, 0.7152, 0.0722));
+      float3 albedo = clamp(sampleMediumAlbedo(mediumTable, sHit, sMin, sMax), 0.0, 0.99);
+      float avgA = (albedo.r + albedo.g + albedo.b) / 3.0;
+      avgA = clamp(avgA, 0.0, 0.99);
       float xiAbs = pt_rand(rng);
-      if (xiAbs > lum) break;
+      if (xiAbs > avgA) break;
+      // Will weight beta below after surface/volume branch
       // Surface mix: filtered N at 2.2x + raw gmag at 1.5x
       float3 Nsurf = float3(0,0,1);
       float gmagSurf = 0.0;
@@ -10021,7 +10018,7 @@ kernel void volume_path_trace(
         scattered = true;
         // If bounce goes into medium (dot <0) continue Woodcock, else reflect (rare)
       } else {
-        beta *= albedo;
+        beta *= albedo / max(avgA, 1e-4);
         scattered = true;
         // Volume NEE (HG)
         {
@@ -10083,7 +10080,7 @@ kernel void volume_path_trace(
     if (scattered && !addedEnv && env > 1e-6) {
       float3 oF = curO + curD * 1e-4;
       float2 tBoxF = intersectBox(oF, curD, float3(0.0), float3(1.0));
-      float tExitF = min(tBoxF.y, maxT);
+      float tExitF = tBoxF.y;
       bool hitF = false;
       float tF = 0.0;
       for (int iter = 0; iter < 256 && tF < tExitF; ++iter) {
