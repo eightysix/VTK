@@ -9911,9 +9911,10 @@ kernel void volume_path_trace(
       float t = 0.0;
       float3 hitPos = float3(0.0);
       bool realHit = false;
-      int iter = 0;
-      bool truncated = false;
-      while (t < tExit && iter++ < 1024) {
+      int iter = 0; bool hitCap = false;
+      while (t < tExit) {
+        if (iter >= 1024) { hitCap = true; break; }
+        ++iter;
         float xi = pt_rand(rng);
         float dt = -log(max(1.0 - xi, 1e-6)) / sigma_maj;
         t += dt;
@@ -9925,8 +9926,7 @@ kernel void volume_path_trace(
         float xi2 = pt_rand(rng);
         if (xi2 * sigma_maj < sigma) { hitPos = x; realHit = true; break; }
       }
-      if (iter >= 1024 && t < tExit && !realHit) truncated = true;
-      if (truncated) break;
+      if (hitCap) break;
       if (!realHit) { if (scattered) { L += beta * env; addedEnv = true; } break; }
       float sHit = sampleVolumeScalar(volumeTexture, hitPos);
       float3 albedo = clamp(sampleMediumAlbedo(mediumTable, sHit, sMin, sMax), 0.0, 0.99);
@@ -9986,7 +9986,10 @@ kernel void volume_path_trace(
                 float tS = 0.0;
                 float tExitS = dist - 2e-4;
                 bool blocked = false;
-                int sIter=0; while (tS < tExitS && sIter++ < 1024) {
+                int sIter = 0; bool sHitCap = false;
+                while (tS < tExitS) {
+                  if (sIter >= 1024) { sHitCap = true; break; }
+                  ++sIter;
                   float xiS = pt_rand(rng);
                   float dtS = -log(max(1.0 - xiS, 1e-6)) / sigma_maj;
                   tS += dtS;
@@ -9998,7 +10001,7 @@ kernel void volume_path_trace(
                   float xiS2 = pt_rand(rng);
                   if (xiS2 * sigma_maj < sigmaS) { blocked = true; break; }
                 }
-                if (sIter >= 1024 && tS < tExitS && !blocked) blocked = true;
+                if (sHitCap) blocked = true;
                 if (blocked) T = 0.0;
                 float3 brdf = albedo / M_PI_F;
                 L += beta * lightRadiance * brdf * cosSurf * T * G / pdfA;
@@ -10052,7 +10055,10 @@ kernel void volume_path_trace(
                 float tS = 0.0;
                 float tExitS = dist - 2e-4;
                 bool blocked = false;
-                int sIter=0; while (tS < tExitS && sIter++ < 1024) {
+                int sIter = 0; bool sHitCap = false;
+                while (tS < tExitS) {
+                  if (sIter >= 1024) { sHitCap = true; break; }
+                  ++sIter;
                   float xiS = pt_rand(rng);
                   float dtS = -log(max(1.0 - xiS, 1e-6)) / sigma_maj;
                   tS += dtS;
@@ -10064,7 +10070,7 @@ kernel void volume_path_trace(
                   float xiS2 = pt_rand(rng);
                   if (xiS2 * sigma_maj < sigmaS) { blocked = true; break; }
                 }
-                if (sIter >= 1024 && tS < tExitS && !blocked) blocked = true;
+                if (sHitCap) blocked = true;
                 if (blocked) T = 0.0;
                 float p_hg = hg_phase_pt(dot(wi, -curD), g);
                 L += beta * lightRadiance * p_hg * T * G / pdfA;
@@ -10080,28 +10086,6 @@ kernel void volume_path_trace(
         if (xiRR > 0.5) break;
         beta /= 0.5;
       }
-    }
-    // If we scattered but ran out of bounces, still need to connect to env (faint brain silhouette)
-    if (scattered && !addedEnv && env > 1e-6) {
-      float3 oF = curO + curD * 1e-4;
-      float2 tBoxF = intersectBox(oF, curD, float3(0.0), float3(1.0));
-      float tExitF = tBoxF.y;
-      bool hitF = false;
-      float tF = 0.0;
-      int fIter=0; while (tF < tExitF && fIter++ < 1024) {
-        float xiF = pt_rand(rng);
-        float dtF = -log(max(1.0 - xiF, 1e-6)) / sigma_maj;
-        tF += dtF;
-        if (tF >= tExitF) break;
-        float3 xF = oF + curD * tF;
-        if (any(xF < 0.0) || any(xF > 1.0)) break;
-        float sF = sampleVolumeScalar(volumeTexture, xF);
-        float sigmaF = sampleMediumSigma(mediumTable, sF, sMin, sMax);
-        float xiF2 = pt_rand(rng);
-        if (xiF2 * sigma_maj < sigmaF) { hitF = true; break; }
-      }
-      if (fIter >= 1024 && tF < tExitF && !hitF) hitF = true;
-      if (!hitF) L += beta * env;
     }
   } else {
     L = float3(0.0);

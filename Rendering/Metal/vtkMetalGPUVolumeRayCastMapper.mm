@@ -10550,7 +10550,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     };
     this->BuildVolumeLightUniforms(ren, vol, invModelMatrix, this->ModelBounds, bs, lightUniforms);
   }
-  // PT: disk light for NEE — 57° key via onb(V) (spec: center = onb(V,0.55,0.55)*distance)
+  // PT: disk light for NEE — onb key is product, top is test harness via PT_LIGHT_TOP
   if (this->CinematicRendering && this->GetCinematicQuality() == vtkGPUVolumeRayCastMapper::PathTraced) {
     bool neeOff = getenv("VTK_METAL_TEST_PT_NEE") && std::atoi(getenv("VTK_METAL_TEST_PT_NEE"))==0;
     if (neeOff) {
@@ -10558,39 +10558,43 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       lightUniforms.lights[0].attenuation[0]=0;
       lightUniforms.lightCount = 0;
     } else {
-      // Compute V = normalize(CameraVolumePos - 0.5) (view direction from center to camera)
-      float vx = uniforms.CameraVolumePos[0]-0.5f;
-      float vy = uniforms.CameraVolumePos[1]-0.5f;
-      float vz = uniforms.CameraVolumePos[2]-0.5f;
-      float vlen = std::sqrt(vx*vx+vy*vy+vz*vz);
-      if (vlen < 1e-6) { vx=0; vy=0; vz=1; vlen=1; }
-      vx/=vlen; vy/=vlen; vz/=vlen;
-      // onb
-      float phi=0.55f, cosT=0.55f;
-      float sinT = std::sqrt(std::max(0.0f, 1.0f - cosT*cosT));
-      float upx=0, upy=0, upz=1;
-      if (std::fabs(vz) >= 0.999f) { upx=1; upy=0; upz=0; }
-      float tx = upy*vz - upz*vy;
-      float ty = upz*vx - upx*vz;
-      float tz = upx*vy - upy*vx;
-      float tlen = std::sqrt(tx*tx+ty*ty+tz*tz);
-      if (tlen>1e-6){ tx/=tlen; ty/=tlen; tz/=tlen; } else { tx=1; ty=0; tz=0; }
-      float bx = vy*tz - vz*ty;
-      float by = vz*tx - vx*tz;
-      float bz = vx*ty - vy*tx;
-      float lx = tx*std::cos(phi)*sinT + bx*std::sin(phi)*sinT + vx*cosT;
-      float ly = ty*std::cos(phi)*sinT + by*std::sin(phi)*sinT + vy*cosT;
-      float lz = tz*std::cos(phi)*sinT + bz*std::sin(phi)*sinT + vz*cosT;
-      float llen = std::sqrt(lx*lx+ly*ly+lz*lz);
-      if (llen>1e-6){ lx/=llen; ly/=llen; lz/=llen; }
-      float dist = 1.0f;
-      float cx = 0.5f + lx*dist;
-      float cy = 0.5f + ly*dist;
-      float cz = 0.5f + lz*dist;
-      // Normal points toward volume center
-      float nx = 0.5f - cx, ny = 0.5f - cy, nz = 0.5f - cz;
-      float nlen2 = std::sqrt(nx*nx+ny*ny+nz*nz);
-      if (nlen2>1e-6){ nx/=nlen2; ny/=nlen2; nz/=nlen2; } else { nx=0; ny=0; nz=-1; }
+      bool useTop = getenv("VTK_METAL_TEST_PT_LIGHT_TOP") != nullptr;
+      float cx, cy, cz, nx, ny, nz;
+      if (useTop) {
+        cx=0.5f; cy=0.5f; cz=1.5f;
+        nx=0; ny=0; nz=-1;
+      } else {
+        float vx = uniforms.CameraVolumePos[0]-0.5f;
+        float vy = uniforms.CameraVolumePos[1]-0.5f;
+        float vz = uniforms.CameraVolumePos[2]-0.5f;
+        float vlen = std::sqrt(vx*vx+vy*vy+vz*vz);
+        if (vlen < 1e-6) { vx=0; vy=0; vz=1; vlen=1; }
+        vx/=vlen; vy/=vlen; vz/=vlen;
+        float phi=0.55f, cosT=0.55f;
+        float sinT = std::sqrt(std::max(0.0f, 1.0f - cosT*cosT));
+        float upx=0, upy=0, upz=1;
+        if (std::fabs(vz) >= 0.999f) { upx=1; upy=0; upz=0; }
+        float tx = upy*vz - upz*vy;
+        float ty = upz*vx - upx*vz;
+        float tz = upx*vy - upy*vx;
+        float tlen = std::sqrt(tx*tx+ty*ty+tz*tz);
+        if (tlen>1e-6){ tx/=tlen; ty/=tlen; tz/=tlen; } else { tx=1; ty=0; tz=0; }
+        float bx = vy*tz - vz*ty;
+        float by = vz*tx - vx*tz;
+        float bz = vx*ty - vy*tx;
+        float lx = tx*std::cos(phi)*sinT + bx*std::sin(phi)*sinT + vx*cosT;
+        float ly = ty*std::cos(phi)*sinT + by*std::sin(phi)*sinT + vy*cosT;
+        float lz = tz*std::cos(phi)*sinT + bz*std::sin(phi)*sinT + vz*cosT;
+        float llen = std::sqrt(lx*lx+ly*ly+lz*lz);
+        if (llen>1e-6){ lx/=llen; ly/=llen; lz/=llen; }
+        float dist = 1.0f;
+        cx = 0.5f + lx*dist;
+        cy = 0.5f + ly*dist;
+        cz = 0.5f + lz*dist;
+        nx = 0.5f - cx; ny = 0.5f - cy; nz = 0.5f - cz;
+        float nlen2 = std::sqrt(nx*nx+ny*ny+nz*nz);
+        if (nlen2>1e-6){ nx/=nlen2; ny/=nlen2; nz/=nlen2; } else { nx=0; ny=0; nz=-1; }
+      }
       lightUniforms.lights[0].position[0]=cx; lightUniforms.lights[0].position[1]=cy; lightUniforms.lights[0].position[2]=cz; lightUniforms.lights[0].position[3]=1.0f;
       lightUniforms.lights[0].direction[0]=nx; lightUniforms.lights[0].direction[1]=ny; lightUniforms.lights[0].direction[2]=nz; lightUniforms.lights[0].direction[3]=0.0f;
       float rad = 30.0f;
