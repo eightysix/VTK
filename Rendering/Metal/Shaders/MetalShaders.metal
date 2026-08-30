@@ -9697,6 +9697,7 @@ inline half4 cinematic_march_core(
     // Thin lit skin: latch at 0.08 keeps dim edge, composite 8 lit samples
     // with same shade/N. Left a~0.11 ×8 -> opaque wax; right a~0.82 ×1 -> one hit.
     // No cov(a), no unlit tail, no second gradient.
+    // sCol locked at hit 0: same shade/N, only a changes. Stops TF grain.
     float aAccum = 0.0;
     float3 colAccum = float3(0.0);
     float3 p = cur;
@@ -9709,10 +9710,8 @@ inline half4 cinematic_march_core(
         half4 tf2 = sampleTransferFunction(transferFunctionTexture, float2(float(n2), 0.5));
         float a2 = float(tf2.a);
         if (a2 < 0.04) continue;
+        if (a2 < 0.08) break; // left interface: air/CSF, don't composite noise
         a = a2;
-        float3 albedo2 = float3(tf2.rgb) * 0.90;
-        albedo2 *= mix(float3(1.0), ssColor, 0.08 * ss);
-        sCol = saturate(albedo2 * shade + sss + spec + albedo2 * rim); // reuse shade/N
       }
       float w = (1.0 - aAccum) * a;
       colAccum += sCol * w;
