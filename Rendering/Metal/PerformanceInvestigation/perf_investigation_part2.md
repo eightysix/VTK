@@ -988,3 +988,31 @@ for SD in 4 0.5; do for FLAG in "PROD" "VTK_METAL_TEST_DENSE=1" "VTK_METAL_TEST_
 eval "env $BASE $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep ^DICOMVolume" # 9.86 PROD
 eval "env $BASE VTK_METAL_TEST_MM_BLOCKS=1 $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep ^DICOMVolume" # 9.46 tie
 ```
+
+---
+
+## 23. Suggested next steps (2026-08-30, `b725fd89a4` `26-view` `SD` `DENSE`/`FRAG` `§19-§22`)
+
+Ranked by `thr0` `§40.3` `M/GL<1` keep, `DICOM` `0.000` `VRC 0.18` `NIFTI 0.000`, `AC` `M2` `60f/10w @2048` `20f/10w @4096` `eval` `§1`:
+
+1. **Density+resolution aware batch - cheapest structural win.** Current `8:2` `MetalShaders.metal:5634` `shadeCap=fc_fineSD?8:2` already `7-28%` vs forced `16` on `NIFTI` fine `§22` `9.26 vs 10.98` `25.82 vs 33.06`, lean `16` already optimal for sparse `DICOM`. Remaining split is `8` at `1024/2048` vs `16` at `4096` `§21` `13.93 vs 14.19` `X` `37.18 vs 33.60` `-10%`. Make `batchCap` also see `viewport` `VolumeMapperUniforms:62` `ViewportSize` `mm:9622` or `dense` `fc_dense:48`: `sparse 4096` `16`, `dense fine` `8`, `dense coarse` `2`. One uniform `+` one `min` `~3` lines, `PROD` keeps `9.86` `14.20` `§20`, `NIFTI` `4096` `90.40` stays `90.40` `§21`, `DICOM` `4096` `33.60` best `§22`.
+
+2. **Auto dense via histogram, not manual `DENSE`.** `NIFTI` coarse wins `7.14->6.60 -7.6%` `1024` `10.60->8.81 -16.9%` `2048` `§22` dense skips `while(w<extent)` `R8 20 fetches` `MetalShaders.metal:4698` `§18`, `DICOM` sparse regresses `+46-48%` `§20` `9.86->14.46`. Add CPU histogram `TF a>0.02` `>55%` opaque `-> denseMode` uniform `mm:4691` `denseMode` `~10` lines, `NIFTI` coarse auto wins, `DICOM` stays `9.86` `14.20`.
+
+3. **Keep `MM_BLOCKS` off by default.** `AppDelegate.mm:88` `NO` `mm:1399` `<1.5` `mm:7924` `2%` tie `§22` `9.64->9.46 -1.8%` `SD4` gated off `§34`, `NIFTI` `4096` `87.24->87.03` `cull+ladder` `§16 §18` already leapt. Opt-in `VTK_METAL_TEST_MM_BLOCKS=1` `BLOCKSIZE=16` for `4096` `NIFTI` `§38.12` only.
+
+4. **`SD-aware 4-fetch` `VTK_METAL_TEST_GRAD4=1` `MetalShaders.metal:3861` `fc_grad4:42` `float` `*2.0h` `sC+3` `4*8=32` texels `33%` save.** Already `thr<5` `SD4 2.02` `SD0.5 1.89` `§18` `M/GL<1` `0.66` `§21`, `NIFTI` fine `9.26` `->` `7.11` `-18%` `§9` with `thr<5`, `DICOM` tie `±2%`. Keep env-gated `fineSD` only, not default, `+` `pow skip` `MetalShaders.metal:4002` `0.5^20=9e-7` `3%` already landed.
+
+No new `TF`/`precomp`/`quad` work - `precomp 1.2GB` `+188%` `§9`, `quad thr69` `§18` remain `thr<5` fail. Next `Instruments` `Texture BW` `Quad Active` `4*64` `hit 40% SD0.5 10% SD4` `§18` only if `viewport` batch shows `>5%` `4096` win.
+
+Repro `§23`:
+
+```sh
+# 1. density+viewport batch A/B (add ViewportSize uniform, shadeCap = dense ? (fine?8:2) : (ViewportSize.x>3000?16:8))
+BIN=build_macos_metal/bin/vtkMetalGLVisualComparison
+DICOM=/Users/macair/Public/IMR/CTIMR/IMRToraceAddome
+NIFTI=/Users/macair/Public/IMR/7T-MRI/Synthesized_FLASH25_downsampled_200um.nii
+BASE="VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1 VTK_METAL_TEST_VOLTRANSPOSE=1 VTK_METAL_TEST_GPU_TRANSPOSE=1"
+for RES in 1024x1024 2048x2048 4096x4096; do for SD in 4 0.5; do eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=$SD $BASE $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 20 --size $RES --warmup 5 2>&1 | grep ^DICOMVolume"; eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=$SD $BASE $BIN --bench --backend metal --scene NIFTIVolume --nifti $NIFTI --frames 20 --size $RES --warmup 5 2>&1 | grep ^NIFTIVolume"; done; done
+# expect DICOM 1024 9.86 2048 14.20 4096 33.60, NIFTI 1024 SD4 6.60 SD0.5 9.26 2048 8.81 25.82 §22
+```
