@@ -9536,6 +9536,17 @@ inline float optical_depth(texture3d<float> vol, texture2d<float> tf, float3 ori
   }
   return tau;
 }
+inline float sample_blur(texture3d<float> vol, float3 p, float3 gs) {
+  float s = 0.0;
+  s += sampleVolumeScalar(vol, p);
+  s += sampleVolumeScalar(vol, p + float3(gs.x, 0, 0));
+  s += sampleVolumeScalar(vol, p - float3(gs.x, 0, 0));
+  s += sampleVolumeScalar(vol, p + float3(0, gs.y, 0));
+  s += sampleVolumeScalar(vol, p - float3(0, gs.y, 0));
+  s += sampleVolumeScalar(vol, p + float3(0, 0, gs.z));
+  s += sampleVolumeScalar(vol, p - float3(0, 0, gs.z));
+  return s / 7.0;
+}
 inline float3 cinematic_onb_n(float3 n, float phi, float cosT)
 {
   float sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
@@ -9584,7 +9595,8 @@ inline half4 cinematic_march_core(
   float3 L     = cinematic_onb_n(V, 0.55, 0.55);
   float3 Lfill = cinematic_onb_n(V, 3.70, 0.42);
 
-  float3 gs = b.gradientStep.xyz * 1.5; // 1.0 grain, 2.0 melts sulci
+  float3 gs = b.gradientStep.xyz * 2.2; // blurred N: 1.5 grain, 2.2 smooth folia (specimen instead of sand)
+  float3 gsBlur = b.gradientStep.xyz; // 1 voxel blur kernel
 
   float voxel  = max(length(b.gradientStep.xyz), 1e-4);
   float aoDist = mix(2.5, 8.0, reach) * voxel;   // 2.5–8 voxels
@@ -9629,13 +9641,15 @@ inline half4 cinematic_march_core(
         sampleVolumeScalar(volumeTexture, cur - float3(0,0,gs1.z)));
       gmag = saturate((length(g2) - 0.018) * 5.5);
     } else {
+      // Blurred gradient for N: 7-tap blur of scalar, then central diff at 2.2x
+      // One surface sample per ray, so 7*6 fetches is fine. Sand -> folia.
       float3 grad = float3(
-        sampleVolumeScalar(volumeTexture, cur + float3(gs.x, 0, 0)) -
-        sampleVolumeScalar(volumeTexture, cur - float3(gs.x, 0, 0)),
-        sampleVolumeScalar(volumeTexture, cur + float3(0, gs.y, 0)) -
-        sampleVolumeScalar(volumeTexture, cur - float3(0, gs.y, 0)),
-        sampleVolumeScalar(volumeTexture, cur + float3(0, 0, gs.z)) -
-        sampleVolumeScalar(volumeTexture, cur - float3(0, 0, gs.z)));
+        sample_blur(volumeTexture, cur + float3(gs.x, 0, 0), gsBlur) -
+        sample_blur(volumeTexture, cur - float3(gs.x, 0, 0), gsBlur),
+        sample_blur(volumeTexture, cur + float3(0, gs.y, 0), gsBlur) -
+        sample_blur(volumeTexture, cur - float3(0, gs.y, 0), gsBlur),
+        sample_blur(volumeTexture, cur + float3(0, 0, gs.z), gsBlur) -
+        sample_blur(volumeTexture, cur - float3(0, 0, gs.z), gsBlur));
       float glen = length(grad);
       gmag = saturate((glen - 0.018) * 5.5);
       N = (glen > 1e-6) ? normalize(-grad) : V;
@@ -9651,8 +9665,6 @@ inline half4 cinematic_march_core(
       thick = saturate(exp(-tauSS * k * 0.35));
       haveSurface = true;
     } else {
-      // First-hit only: no sandy interior shading — would need blurred N.
-      // Interior MRI 6-tap every sample is the gyri/cerebellar sand.
       cur += evalStep;
       continue;
     }
