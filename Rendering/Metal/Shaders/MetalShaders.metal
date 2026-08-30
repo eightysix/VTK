@@ -9925,14 +9925,12 @@ kernel void volume_path_trace(
         float xi2 = pt_rand(rng);
         if (xi2 * sigma_maj < sigma) { hitPos = x; realHit = true; break; }
       }
-      if (t < tExit && !realHit) truncated = true;
+      if (iter >= 1024 && t < tExit && !realHit) truncated = true;
       if (truncated) break;
       if (!realHit) { if (scattered) { L += beta * env; addedEnv = true; } break; }
       float sHit = sampleVolumeScalar(volumeTexture, hitPos);
       float3 albedo = clamp(sampleMediumAlbedo(mediumTable, sHit, sMin, sMax), 0.0, 0.99);
-      float lum = dot(albedo, float3(0.2126, 0.7152, 0.0722));
-      float xiAbs = pt_rand(rng);
-      if (xiAbs > lum) break;
+      float avgA = clamp((albedo.r + albedo.g + albedo.b) / 3.0, 0.0, 0.99);
       // Surface mix: filtered N at 2.2x + raw gmag at 1.5x (volume kill inside branch)
       // Surface mix: filtered N at 2.2x + raw gmag at 1.5x
       float3 Nsurf = float3(0,0,1);
@@ -10000,7 +9998,7 @@ kernel void volume_path_trace(
                   float xiS2 = pt_rand(rng);
                   if (xiS2 * sigma_maj < sigmaS) { blocked = true; break; }
                 }
-                if (tS < tExitS && !blocked) blocked = true;
+                if (sIter >= 1024 && tS < tExitS && !blocked) blocked = true;
                 if (blocked) T = 0.0;
                 float3 brdf = albedo / M_PI_F;
                 L += beta * lightRadiance * brdf * cosSurf * T * G / pdfA;
@@ -10022,7 +10020,9 @@ kernel void volume_path_trace(
         scattered = true;
         // If bounce goes into medium (dot <0) continue Woodcock, else reflect (rare)
       } else {
-        beta *= albedo;
+        float xiAbsV = pt_rand(rng);
+        if (xiAbsV > avgA) break;
+        beta *= albedo / max(avgA, 1e-4);
         scattered = true;
         // Volume NEE (HG)
         {
@@ -10064,7 +10064,7 @@ kernel void volume_path_trace(
                   float xiS2 = pt_rand(rng);
                   if (xiS2 * sigma_maj < sigmaS) { blocked = true; break; }
                 }
-                if (tS < tExitS && !blocked) blocked = true;
+                if (sIter >= 1024 && tS < tExitS && !blocked) blocked = true;
                 if (blocked) T = 0.0;
                 float p_hg = hg_phase_pt(dot(wi, -curD), g);
                 L += beta * lightRadiance * p_hg * T * G / pdfA;
@@ -10100,7 +10100,7 @@ kernel void volume_path_trace(
         float xiF2 = pt_rand(rng);
         if (xiF2 * sigma_maj < sigmaF) { hitF = true; break; }
       }
-      if (tF < tExitF && !hitF) hitF = true;
+      if (fIter >= 1024 && tF < tExitF && !hitF) hitF = true;
       if (!hitF) L += beta * env;
     }
   } else {
