@@ -1677,6 +1677,22 @@ inline void BuildNIFTIVolumeScene(vtkRenderer* renderer, BackendKind b)
             // allow env override for stills: VTK_METAL_TEST_CINEMATIC_SAMPLES
             if (const char* s = std::getenv("VTK_METAL_TEST_CINEMATIC_SAMPLES")) metal->SetCinematicSamples(std::atoi(s));
             if (const char* b = std::getenv("VTK_METAL_TEST_CINEMATIC_BOUNCES")) metal->SetCinematicMaxBounces(std::atoi(b));
+            // PT ivars from env (harness owns test lighting, mapper no longer getenv)
+            if (const char* e = std::getenv("VTK_METAL_TEST_PT_ENV")) metal->SetCinematicEnv(float(std::atof(e)));
+            else metal->SetCinematicEnv(0.04f);
+            if (const char* ne = std::getenv("VTK_METAL_TEST_PT_NEE")) metal->SetCinematicNEE(std::atoi(ne)!=0);
+            else metal->SetCinematicNEE(true);
+            if (std::getenv("VTK_METAL_TEST_PT_LIGHT_TOP")) metal->SetCinematicLightTop(true);
+            else metal->SetCinematicLightTop(false);
+            if (const char* rad = std::getenv("VTK_METAL_TEST_PT_LIGHT_RAD")) metal->SetCinematicLightIntensity(float(std::atof(rad)));
+            else metal->SetCinematicLightIntensity(30.0f);
+            if (const char* rr = std::getenv("VTK_METAL_TEST_PT_LIGHT_RADIUS")) metal->SetCinematicLightRadius(float(std::atof(rr)));
+            else metal->SetCinematicLightRadius(0.15f);
+            if (const char* d = std::getenv("VTK_METAL_TEST_PT_DENSITY")) metal->SetCinematicDensity(float(std::atof(d)));
+            else metal->SetCinematicDensity(1.0f);
+            if (const char* ex = std::getenv("VTK_METAL_TEST_PT_EXPOSURE")) metal->SetCinematicExposure(float(std::atof(ex)));
+            else metal->SetCinematicExposure(1.0f);
+            if (const char* bl = std::getenv("VTK_METAL_TEST_PT_BLEND")) metal->SetVolumetricScatteringBlending(float(std::atof(bl)));
           } else {
             metal->SetCinematicQuality(vtkGPUVolumeRayCastMapper::Preview);
             metal->SetCinematicSamples(1);

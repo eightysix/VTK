@@ -305,6 +305,22 @@ public:
   vtkGetMacro(CinematicMaxBounces, int);
   vtkSetClampMacro(CinematicDenoise, float, 0.0f, 1.0f);
   vtkGetMacro(CinematicDenoise, float);
+  vtkSetMacro(CinematicExposure, float);
+  vtkGetMacro(CinematicExposure, float);
+  vtkSetMacro(CinematicEnv, float);
+  vtkGetMacro(CinematicEnv, float);
+  vtkSetMacro(CinematicNEE, bool);
+  vtkGetMacro(CinematicNEE, bool);
+  vtkBooleanMacro(CinematicNEE, bool);
+  vtkSetMacro(CinematicLightTop, bool);
+  vtkGetMacro(CinematicLightTop, bool);
+  vtkBooleanMacro(CinematicLightTop, bool);
+  vtkSetMacro(CinematicLightIntensity, float);
+  vtkGetMacro(CinematicLightIntensity, float);
+  vtkSetMacro(CinematicLightRadius, float);
+  vtkGetMacro(CinematicLightRadius, float);
+  vtkSetMacro(CinematicDensity, float);
+  vtkGetMacro(CinematicDensity, float);
   ///@}
 
   ///@{
@@ -602,6 +618,13 @@ protected:
   int CinematicMaxBounces = 1;
   float CinematicDenoise = 0.0f;
   int CinematicQualityValue = 0; // Preview
+  float CinematicExposure = 1.0f; // tonemap exposure (1.0 default, was 1.5)
+  float CinematicEnv = 0.04f; // PT env radiance
+  bool CinematicNEE = true; // PT NEE on/off
+  bool CinematicLightTop = false; // false=onb key, true=top disk
+  float CinematicLightIntensity = 30.0f; // Le
+  float CinematicLightRadius = 0.15f; // disk radius
+  float CinematicDensity = 1.0f; // worldPerUV scale
 
   // Enable / disable two pass rendering
   vtkTypeBool UseDepthPass;

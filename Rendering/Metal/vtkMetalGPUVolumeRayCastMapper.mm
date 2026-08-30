@@ -289,7 +289,8 @@ struct VolumeMapperUniforms
   uint32_t CinematicQuality;       // 1804..1807 0=Preview (DVR) 1=PathTraced
   float CinematicEnabled;          // 1808..1811 0 off, 1 preview, 2 path-traced (compat)
   float CinematicEnv;              // 1812..1815 env radiance for PT (0=black test, 0.2 silhouette)
-  float _padCinematicEnd[2];       // 1816..1823 tail pad to 1824
+  float CinematicExposure;         // 1816..1819 ACES exposure (1.0 default, was 1.5)
+  float _padCinematicEnd[1];       // 1820..1823 tail pad to 1824
 };
 
 static_assert(sizeof(VolumeMapperUniforms) == 1824,
@@ -8775,7 +8776,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateCinematicMediumTable(void* deviceVoid
   if (worldPerUV < 1e-6) worldPerUV = 1.0;
   double unit = prop->GetScalarOpacityUnitDistance();
   if (unit <= 0) unit = 1.0;
-  if (const char* d = getenv("VTK_METAL_TEST_PT_DENSITY")) worldPerUV *= std::atof(d);
+  worldPerUV *= this->CinematicDensity;
   // Build table on CPU
   std::vector<float> table(4 * N);
   float maxSigma = 0.0f;
@@ -8798,7 +8799,9 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateCinematicMediumTable(void* deviceVoid
   float maj = maxSigma * 1.05f;
   if (maj < 1e-4f) maj = 1e-4f;
   this->CinematicMajorantSigma = maj;
-  if (getenv("VTK_METAL_TEST_PT_DEBUG")) fprintf(stderr, "[PT] worldPerUV %.2f unit %.2f maxSigma %.2f maj %.2f sMin %.2f sMax %.2f\n", worldPerUV, unit, maxSigma, maj, sMin, sMax);
+#ifndef NDEBUG
+  fprintf(stderr, "[PT] worldPerUV %.2f unit %.2f maxSigma %.2f maj %.2f sMin %.2f sMax %.2f\n", worldPerUV, unit, maxSigma, maj, sMin, sMax);
+#endif
   id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
   NSUInteger bytes = N * 4 * sizeof(float);
   id<MTLBuffer> buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
@@ -10552,13 +10555,13 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   }
   // PT: disk light for NEE — onb key is product, top is test harness via PT_LIGHT_TOP
   if (this->CinematicRendering && this->GetCinematicQuality() == vtkGPUVolumeRayCastMapper::PathTraced) {
-    bool neeOff = getenv("VTK_METAL_TEST_PT_NEE") && std::atoi(getenv("VTK_METAL_TEST_PT_NEE"))==0;
+    bool neeOff = !this->CinematicNEE;
     if (neeOff) {
       lightUniforms.lights[0].diffuseColor[0]=0; lightUniforms.lights[0].diffuseColor[1]=0; lightUniforms.lights[0].diffuseColor[2]=0;
       lightUniforms.lights[0].attenuation[0]=0;
       lightUniforms.lightCount = 0;
     } else {
-      bool useTop = getenv("VTK_METAL_TEST_PT_LIGHT_TOP") != nullptr;
+      bool useTop = this->CinematicLightTop;
       float cx, cy, cz, nx, ny, nz;
       if (useTop) {
         cx=0.5f; cy=0.5f; cz=1.5f;
@@ -10597,11 +10600,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       }
       lightUniforms.lights[0].position[0]=cx; lightUniforms.lights[0].position[1]=cy; lightUniforms.lights[0].position[2]=cz; lightUniforms.lights[0].position[3]=1.0f;
       lightUniforms.lights[0].direction[0]=nx; lightUniforms.lights[0].direction[1]=ny; lightUniforms.lights[0].direction[2]=nz; lightUniforms.lights[0].direction[3]=0.0f;
-      float rad = 30.0f;
-      if (const char* r = getenv("VTK_METAL_TEST_PT_LIGHT_RAD")) rad = float(atof(r));
+      float rad = this->CinematicLightIntensity;
       lightUniforms.lights[0].diffuseColor[0]=rad; lightUniforms.lights[0].diffuseColor[1]=rad; lightUniforms.lights[0].diffuseColor[2]=rad; lightUniforms.lights[0].diffuseColor[3]=1.0f;
-      float radius = 0.15f;
-      if (const char* rr = getenv("VTK_METAL_TEST_PT_LIGHT_RADIUS")) radius = float(atof(rr));
+      float radius = this->CinematicLightRadius;
       lightUniforms.lights[0].attenuation[0]=radius;
       lightUniforms.lightCount = 1;
       lightUniforms.defaultLighting = 0;
@@ -10910,7 +10911,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     uniforms.CinematicScatteringAnisotropy = cprop ? cprop->GetScatteringAnisotropy() : 0.0f;
     uniforms.CinematicReach = this->GlobalIlluminationReach;
     uniforms.CinematicBlend = this->VolumetricScatteringBlending;
-    if (isPT && getenv("VTK_METAL_TEST_PT_BLEND")) uniforms.CinematicBlend = float(atof(getenv("VTK_METAL_TEST_PT_BLEND")));
+    // CinematicBlend set via vtkGPUVolumeRayCastMapper::SetCinematicBlend (harness may set)
     uniforms.CinematicDenoise = this->CinematicDenoise;
     if (cprop) {
       float sc[3]; cprop->GetSubsurfaceColor(sc);
@@ -10961,8 +10962,9 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       uniforms.CinematicFrameSeed = 0;
       this->CinematicAccumCount = 0;
     }
-    uniforms.CinematicEnv = isPT ? (getenv("VTK_METAL_TEST_PT_ENV") ? float(atof(getenv("VTK_METAL_TEST_PT_ENV"))) : 0.04f) : 0.0f;
-    uniforms._padCinematicEnd[0]=0.0f; uniforms._padCinematicEnd[1]=0.0f;
+    uniforms.CinematicEnv = isPT ? this->CinematicEnv : 0.0f;
+    uniforms.CinematicExposure = isPT ? this->CinematicExposure : 1.0f;
+    uniforms._padCinematicEnd[0]=0.0f;
   }
 
   // Wait for the uniform buffer slot for this frame to be free

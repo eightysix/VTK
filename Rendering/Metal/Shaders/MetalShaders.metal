@@ -3089,7 +3089,8 @@ struct VolumeMapperUniforms {
   uint cinematicQuality; // 0 Preview, 1 PathTraced
   float cinematicEnabled; // 0 off, 1 preview, 2 PT
   float cinematicEnv; // env radiance for PT (0 black, 0.2 silhouette)
-  float _padCinematicEnd[2];
+  float cinematicExposure; // ACES exposure (1.0 default, was 1.5)
+  float _padCinematicEnd[1];
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -10109,10 +10110,10 @@ kernel void volume_cinematic_tonemap(
   float4 sum = accum.read(gid);
   float spp = max(sum.a, 1.0);
   if (sum.a < 0.5) spp = float(max(u.cinematicAccumCount, 1u));
-  float3 hdr = sum.rgb / spp;
-  float3 mapped = aces_tonemap(hdr * 1.5); // exposure 1.5 for wax
+  float3 hdr = sum.rgb / max(spp, 1.0);
+  float3 mapped = aces_tonemap(hdr * u.cinematicExposure);
   float3 srgb = linear_to_srgb_pt(mapped);
-  float alpha = length(hdr) > 1e-4 ? 1.0 : 0.0; // opaque where we scattered, transparent background
+  float alpha = length(hdr) > 1e-3 ? 1.0 : 0.0; // opaque where we scattered, transparent background
   if (u.cinematicQuality != 1) alpha = 1.0; // preview keep opaque
   outDisplay.write(half4(half3(srgb), half(alpha)), gid);
 }
