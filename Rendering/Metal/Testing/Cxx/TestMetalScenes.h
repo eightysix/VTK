@@ -1434,6 +1434,27 @@ inline void BuildDICOMVolumeScene(vtkRenderer* renderer, BackendKind b)
     renderer->GetActiveCamera()->Dolly(std::atof(dollyEnv));
     renderer->ResetCameraClippingRange();
   }
+  // Uniform 26-view equal comparison (VTK_METAL_TEST_CAM_DIR=x,y,z): direction vector
+  // through focal point, normalized, distance preserved. For 26-view cubemap
+  // (6 faces +12 edges +8 corners) set dir to e.g. "1,0,0" or "1,1,1".
+  if (const char* dirEnv = std::getenv("VTK_METAL_TEST_CAM_DIR"))
+  {
+    vtkCamera* cam = renderer->GetActiveCamera();
+    double f[3]; cam->GetFocalPoint(f);
+    double p[3]; cam->GetPosition(p);
+    double dir[3] = { p[0]-f[0], p[1]-f[1], p[2]-f[2] };
+    double dist = std::sqrt(dir[0]*dir[0]+dir[1]*dir[1]+dir[2]*dir[2]);
+    double nd[3] = {0,0,1};
+    if (std::sscanf(dirEnv, "%lf,%lf,%lf", &nd[0], &nd[1], &nd[2])==3)
+    {
+      double n = std::sqrt(nd[0]*nd[0]+nd[1]*nd[1]+nd[2]*nd[2]);
+      if (n>1e-9) { nd[0]/=n; nd[1]/=n; nd[2]/=n; }
+      cam->SetPosition(f[0]+nd[0]*dist, f[1]+nd[1]*dist, f[2]+nd[2]*dist);
+      // keep viewUp stable: use (0,0,1) unless dir || Z (0,0,±1)
+      if (std::fabs(nd[2])<0.9) cam->SetViewUp(0,0,1); else cam->SetViewUp(0,1,0);
+      renderer->ResetCameraClippingRange();
+    }
+  }
   // TEMP-DIAG (VTK_METAL_TEST_CAM_AXIS=x|y|z): exact axis-aligned view
   // (sagittal / coronal / axial) — the §18 RG8 regression-matrix geometry.
   // Places the camera on the named world axis through the focal point.

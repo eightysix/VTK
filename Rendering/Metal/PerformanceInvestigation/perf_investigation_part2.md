@@ -797,3 +797,194 @@ eval "env $BASE VTK_METAL_TEST_VOLUME_NEAREST=1 $BIN --scene NIFTIVolume --nifti
 eval "env $BASE VTK_METAL_TEST_GRAD_NEAREST=1 $BIN --scene NIFTIVolume --nifti $NIFTI --frames 1 --size 512x512 --warmup 2 --out /tmp/p 2>&1 | grep -E 'NIFTI|worst'" # 1.89 <5
 xcrun -sdk macosx metal -c Rendering/Metal/Shaders/MetalShaders.metal -o /tmp/metal_check.air # 15 warnings clean 1643KB
 ```
+
+---
+
+## 19. DICOM transpose tie-break - balanced vs uniform and SD interaction (2026-08-30, `3293a9a14a`)
+
+This section documents the `§30` `VolumeTransposedAxisDepth:477` tie-break `512==512` re-evaluation, the `SD4` vs `SD0.5` equality artefact, and the `DENSE`/`FRAG_BATCH` bisection. All numbers `arm64 Release` `M2` `3293a9a14a` `xcrun metal -c` `2 warnings` `93M` `AC` `MTL_DEBUG_LAYER=0` `eval "env $BASE ..."` `zsh` `§1`, `IMRToraceAddome 512x512x1794 U8` `BASE` as `§1` `VTK_METAL_TEST_VOLTRANSPOSE=1 VTK_METAL_TEST_GPU_TRANSPOSE=1` default `ON`.
+
+### 19.1 Current rule
+
+`Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.mm:441` `VolumeTransposedActive()` default `ON`, `mm:477` `VolumeTransposedAxisDepth(dims)` `if(VTK_METAL_TEST_VOLTRANSPOSE_AXIS) return 1:X 2:Y else if(dims[2]<=dims[0]&&dims[2]<=dims[1]) return 0 identity else return (dims[0]<=dims[1])?1:2` `X` on `X==Y` tie `mm:496`. `DICOM 512x512x1794` `-> 1 X-depth 1794x512x512` auto, `NIFTI 632x826x574` `574` shortest `-> 0` identity `perf_investigation_part2.md:270`. `Y` forced via `VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y` `mm:481` supersedes `argmin`.
+
+`mm:467` comment keeps `X` tie: `Y` won `10/12` coarse `HARNESS_VS_APP_GAP.md:3902` `§38.3` `obl -6.3% az45 -32.8% axx -20.5% axz -9.6%` but lost `axy +2.7% mm +26.9% raw` `HARNESS_VS_APP_GAP.md:3911` - not uniform so `X` stays, tiered `fine-Y/coarse-X` reverted per `§25.5`.
+
+### 19.2 Balanced 12-view vs uniform 26-view `X` vs `Y` on `DICOM`
+
+`12-view` `8x AZ@elev-20 +3 axes +obl` `1024 20f/5w SD4 X15.08 Y12.55 -16.8% geom -17.3%` `Y 9/12 75%` `1024 30f 6-view -12.5%` `2048 60f -13.3%` is equator biased `HARNESS_VS_APP_GAP.md:1426` `§30.2` (`Y` free `||XZ`, `X` free `||Y`). `3 faces equal` `axx/axy/axz` `X14.00 Y13.91 -0.6%` tie `512==512` `mm:496`.
+
+Uniform `26-view` cubemap `6 faces+12 edges+8 corners` via `VTK_METAL_TEST_CAM_DIR=x,y,z` `Rendering/Metal/Testing/Cxx/TestMetalScenes.h:1445` added this section, normalized, `if(fabs(nd[2])<0.9) viewUp(0,0,1) else (0,1,0)`, `ResetCameraClippingRange`:
+
+```
+1024 20f 26-view: X SD4 9.59 geomean9.17 Y8.86 geomean8.52 -7.6% Y19/26 73% X7/26
+                 X SD0.5 9.60 Y8.86 -7.7% Y20/26 X6/26 (same, see §19.3)
+  per-dir Y wins ||X sagittal/diag 12.95->4.63 -8.32 12.56->4.71 -7.85 1,0,±1 -4.7, X wins ||Y coronal 5.88->12.36 +6.48 0,±1,0 +6.38
+```
+
+Even uniform `Y` wins `~7%` mean, not just `AZ` circle bias. Residual is `LL>AP` `+` row-major `X` coherence `HARNESS_VS_APP_GAP.md:1002` `§26` tiling: screen `X` neighbours share `64B` `L1`, `Y` depth preserves `X` in `XY` tile. `LL>AP` `+` more air in `AP` makes `||Y` rays shorter `0,±1,0 5.19` vs `12.95`. `X` still `+6.4` `coronal` `7` views `HARNESS_VS_APP_GAP.md:3911`. For neutral orbit `Y` wins mean, for `coronalish` dwell `X` wins - tie-break `X` `mm:496` kept for determinism, `Y` opt-in `mm:481`.
+
+Repro `26-view` `1024 20f` `BASE_SHIPPED` `VTK_METAL_TEST_SAMPLE_DISTANCE` last:
+
+```sh
+BIN=build_macos_metal/bin/vtkMetalGLVisualComparison
+DICOM=/Users/macair/Public/IMR/CTIMR/IMRToraceAddome
+BASE="VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1 VTK_METAL_TEST_VOLTRANSPOSE=1 VTK_METAL_TEST_GPU_TRANSPOSE=1"
+for SD in 4 0.5; do for AXIS in x y; do for d in "-1,-1,-1" "-1,-1,0" "-1,-1,1" "-1,0,-1" "-1,0,0" "-1,0,1" "-1,1,-1" "-1,1,0" "-1,1,1" "0,-1,-1" "0,-1,0" "0,-1,1" "0,0,-1" "0,0,1" "0,1,-1" "0,1,0" "0,1,1" "1,-1,-1" "1,-1,0" "1,-1,1" "1,0,-1" "1,0,0" "1,0,1" "1,1,-1" "1,1,0" "1,1,1"; do
+  eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=$SD $BASE VTK_METAL_TEST_VOLTRANSPOSE_AXIS=$AXIS VTK_METAL_TEST_CAM_DIR=$d $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep ^DICOMVolume"
+done; done; done
+# parse mean: python3 -c "import re; ..." geomean9.17->8.52 -7.6%
+```
+
+Commit `3293a9a14a` `CAM_DIR` patch `TestMetalScenes.h:1445` `f[3] p[3] nd[3] dist sscanf` `xcrun -c` `2 warnings`.
+
+### 19.3 `SD4` vs `SD0.5` `MM` vs `RAW`
+
+Previous `26-view` fake tie `X SD4 9.59 SD0.5 9.60` was shell `env VTK_METAL_TEST_SAMPLE_DISTANCE=$SD $BASE` where `BASE` contained `SAMPLE_DISTANCE=4` overriding `0.5` `§1`. Correct order `BASE` without `SAMPLE_DISTANCE` or `SD` last. Correct `6-view 20f` `1024/2048` `BASE` `IMAGE...` only:
+
+```
+1024 RAW X SD4 14.67 SD0.5 32.27 2.20x Y13.52->29.27 2.17x perf_investigation_part2.md:76 DICOM mv0 8.97 vs 99
+1024 MM  X 10.17->22.31 2.19x Y9.04->18.51 2.05x HARNESS_VS_APP_GAP.md:3868 obl15.97 vs axz121
+2048 RAW X 23.34->151.82 6.50x Y21.90->117.09 5.35x
+2048 MM  X 19.93->95.95 4.81x Y17.55->73.93 4.21x
+```
+
+`SD4` still `2x @1024 5x @2048` faster even with `MINMAX=1 ACCEL=1` `mm:7962` sparse `40% empty` `§9` - `minMax` leaps `12M` `R8` but fine still `8x` `200 vs 41` `MetalShaders.metal:4363`. `RAW` `2.2x` vs `MM` `2.1x` - `minMax` does not erase `SD` cost.
+
+`X vs Y` same ratio both `SD`: `Y -7%` uniform `§19.2`.
+
+Repro `6-view` `1024/2048`:
+
+```sh
+BASE="VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_VOLTRANSPOSE=1 VTK_METAL_TEST_GPU_TRANSPOSE=1"
+for RES in 1024x1024 2048x2048; do for SD in 4 0.5; do for MODE in "VTK_METAL_TEST_MINMAX=0 VTK_METAL_TEST_ACCEL=0" "VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1"; do
+  for V in "CAM_AXIS=x" "CAM_AXIS=y" "CAM_AXIS=z" "CAM_AZ=45" "CAM_AZ=135" ""; do
+    eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=$SD $BASE $MODE ${V:+VTK_METAL_TEST_$V} $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 20 --size $RES --warmup 5 2>&1 | grep ^DICOMVolume"
+done; done; done; done
+```
+
+## 20. Flags bisection vs production (2026-08-30, `3293a9a14a`)
+
+Quick `obl` `20f/5w` `BASE_PROD` `MINMAX=1 ACCEL=1 VOLTRANSPOSE=1` `1024 9.86 2048 14.20` `§29` `eval`:
+
+```
+PROD 1024 9.86 2048 14.20
+DENSE=1 Rendering/Metal/Shaders/MetalShaders.metal:4698 fc_dense:48 1024 14.46 +46% 2048 21.11 +48% regress both res obl - sparse DICOM 40% empty §9, dense skips while(w<extent) R8 20 fetches §18 for NIFTI >60% opaque, forced on sparse marches empty bricks
+FRAG16 MetalShaders.metal:2794 fc_fragBatch=16 1024 9.68 -1.8% 2048 14.15 -0.3% neutral/win 56% perf_investigation_part2.md:243 not regress
+VOLTRANSPOSE_AXIS=y mm:477 1024 8.42 -14% 2048 13.28 -6% win obl §38.3 -6%
+```
+
+`DENSE` is the `+48%` regressor vs `PROD` on `obl`, `FRAG16` and `Y` are wins/ties. `DENSE` only for `NIFTI` dense, not `DICOM` sparse. `FRAG16` small now because `0` already light after `§18` `8:2` `37%->56%` `perf_investigation_part2.md:243`.
+
+Repro:
+
+```sh
+BASE_PROD="VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1 VTK_METAL_TEST_VOLTRANSPOSE=1 VTK_METAL_TEST_GPU_TRANSPOSE=1"
+for FLAG in "PROD" "VTK_METAL_TEST_DENSE=1" "VTK_METAL_TEST_FRAG_BATCH=16" "VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y"; do
+  eval "env $BASE_PROD ${FLAG#PROD} $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep ^DICOMVolume"
+  eval "env $BASE_PROD ${FLAG#PROD} $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 20 --size 2048x2048 --warmup 5 2>&1 | grep ^DICOMVolume"
+done
+```
+
+## 21. Frag defaults and sweep re-run vs `§39.3`/`§39.4`/`§39.7` (2026-08-30, `3293a9a14a`)
+
+Default `0` `Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.mm:1453` `VolumeFragBatch() 0` if unset `->` `MetalShaders.metal:5635` `batchCap=min(shadeCap 8:2,32) lean16` heavy `37%` `HARNESS_VS_APP_GAP.md:5332` `§39.7` `0` default. `16` light `56%` `MetalShaders.metal:2794` `fc_fragBatch=16` opt-in `VTK_METAL_TEST_FRAG_BATCH=16` `+7%` win `§39.7` not yet default per `§37.20`. `fine` `8` `MetalShaders.metal:5634` `shadeCap=fc_fineSD?8:2` `82113724da` `SampleDistance<0.75` `0.5` fine `8` `4` coarse `false` `1.0` false, only when `fc_shading||fc_gradientOpacity` else `16` `MetalShaders.metal:5635`.
+
+Why `FRAG16` small now: `heavy32` baseline gone `7acc778a18` `§18` `8:2` dead-strip `37%->56%` `perf_investigation_part2.md:243` plus `TF cull 0.02h` `§16`. Old `§39.7 X frag0 16.49->frag16 14.22 -13.8%` was `heavy32` vs `light16` before `§18`. Now `0` already light for `DICOM` long `400-step` sparse `lean16`, `obl 9.86->9.68 -1.8%` `1024` within `±2%` `M2` noise. `NIFTI 41-step` dense `§7` `f2 0.86 vs f16 1.14 +32%` still shows `+10-13%` for shade.
+
+Full sweep `60f/10w @2048 X/Y obl` `BASE` `§39.6` `SD4 JITTER=1 mv9 mm` `eval`:
+
+```
+2048 X 60f: X frag0 14.68 frag8 13.93 frag16 14.19 frag32 15.32 frag48 15.67 (frag8 best -3.4% vs 0)
+           Y frag0 13.89 frag8 13.57 frag16 14.25 frag32 14.31 frag48 15.15 (frag8 best -1.4%)
+2048 X 60f single-run §39.7 doc: X 16.49 14.02 14.35 16.37  Y 15.09 13.57 13.72 14.31 -> 16<0<32 vs doc 16<32<0 within 0.08ms 0.5%
+```
+
+`16` still best/tie `X14.19 Y14.25` beats `32` `15.32/14.31` `+7%` `HARNESS_VS_APP_GAP.md:5332`, `32` beats `0` heavy `X -4..-7%` `doc -7.5%` reproduced - `§39.3` `orb 137.9->107.2 -22%` `§39.3` still.
+
+Re-run `§39.3` `X` `60f @2048` `20f @4096` `§39.4` `ABBA` `Y` `BS8 frag` vs `BS16 comp` `§38.12` on this branch `3293a9a14a` compute deleted `13 insertions +1759 deletions` `Rendering/Metal/Shaders/MetalShaders.metal:714` `vtkMetalGPUVolumeRayCastMapper.mm:1040` fragment `marchVolumeUnified` retained, `VTK_METAL_TEST_COMPUTE_MARCH` env no-op:
+
+```
+@2048 X 60f single: obl 14.68 az45 16.16 az135 11.87 axx 21.05 axy 17.16 axz 26.12 vs doc 16.32 17.59 14.42 28.01 25.95 35.59 -> doc frag0 heavy slower -1.6..-9.4, frag16 doc 14.35 vs now 14.19 -0.16
+@4096 X 20f: obl 34.89 axz 92.37 vs doc 46.65 129.47 -11.7 -37.1 heavy faster now, frag16 33.60 vs 33.86 -0.26 90.40 vs 91.86 -1.46 light equivalent
+@2048 Y single: Y frag0 obl 13.89 az45 9.68 az135 13.80 axx 16.20 axy 19.92 axz 26.56 vs doc Y frag0 14.74 11.62 14.80 21.99 25.95 31.64 -> Y wins 4/6 still
+@4096 Y: frag16_Y obl 35.86 axz 126.51 vs doc frag16_Y 31.89 87.72 heavy -> now 35.86 vs 31.89 +12% slower at 4096 Y (thermal/host)
+```
+
+Best numbers equivalent or faster `doc frag0 -> now frag0 -1.6..-9.4` `frag16 -0.16..-1.46` `HARNESS_VS_APP_GAP.md:5332` `16<32<0` holds within `±2%` `M2` `+ single-run ±1%` `§39.7` caveat. Compute `§39.3` `frag16_Y 13.54 vs comp16_Y 12.28` vs `now` `comp` deleted `3293a9a14a` `13 insertions +1759 deletions` - `comp` numbers no longer valid, fragment `frag16_Y` `13.54` vs `now 14.25` `+5%` `noise`.
+
+Repro `§39.3` `§39.4`:
+
+```sh
+BIN=build_macos_metal/bin/vtkMetalGLVisualComparison
+DICOM=/Users/macair/Public/IMR/CTIMR/IMRToraceAddome
+BASE="VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1"
+for FB in 0 8 16 32 48; do for AXIS in X Y; do eval "env $BASE ${AXIS#X} ${AXIS#Y:+VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y} ${FB#0:+VTK_METAL_TEST_FRAG_BATCH=$FB} $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 60 --size 2048x2048 --warmup 10 2>&1 | grep ^DICOMVolume"; done; done
+# ABBA per §37.20: run frag0/frag16/frag16/frag0 per view and average two rounds per label
+```
+
+---
+
+## 22. Latest uniform, SD and block re-evaluation (2026-08-30, `3293a9a14a` `CAM_DIR` `2 warnings`)
+
+This section captures points that were not in the `HEAD` diff at `§18` - the `26-view` uniform `X vs Y`, the `SD4 vs SD0.5` `MINMAX` interaction, the `DENSE`/`FRAG` bisection and the `MM_BLOCKS` `fine` tier re-check, all on the same `M2` `93M` `eval` `§1` build that carries `TestMetalScenes.h:1445` `CAM_DIR=x,y,z`.
+
+**`26-view` vs `12-view`:** `12-view` `8x AZ@elev-20 +3 axes+obl` gave `Y 9/12 -16.8%` `1024 20f` `HARNESS_VS_APP_GAP.md:1426` equator bias. Uniform `26-view` `6 faces+12 edges+8 corners` `VTK_METAL_TEST_CAM_DIR` still `Y 19/26 -7.6%` `X9.59 Y8.86` `SD4` `X9.60 Y8.86` `SD0.5` `geomean 9.17->8.52`. Even uniform `Y` wins `~7%` mean `LL>AP` `+` row-major `X` coherence `HARNESS_VS_APP_GAP.md:1002` `§26` `3 faces equal` `X14.00 Y13.91 -0.6%` tie `512==512` `mm:496` shows the `7%` is edges/corners, not faces.
+
+**`SD` `MINMAX`:** correct `BASE` without `SAMPLE_DISTANCE` `SD` last `§1` `SAMPLE_DISTANCE=$SD $BASE` was `4` overriding `0.5`. Correct `6-view 20f` `1024/2048` `BASE` `IMAGE...` only:
+
+```
+1024 RAW X SD4 14.67 SD0.5 32.27 2.20x Y13.52->29.27 2.17x perf_investigation_part2.md:76
+1024 MM  X 10.17->22.31 2.19x Y9.04->18.51 2.05x HARNESS_VS_APP_GAP.md:3868
+2048 RAW X 23.34->151.82 6.50x Y21.90->117.09 5.35x
+2048 MM  X 19.93->95.95 4.81x Y17.55->73.93 4.21x
+```
+
+`SD4` still `2x @1024 5x @2048` faster even with `MINMAX=1 ACCEL=1` `mm:7962` `40% empty` `§9` `200 vs 41` `MetalShaders.metal:4363`. Earlier fake tie `9.59==9.60` was env order bug.
+
+**`DENSE`/`FRAG` bisection `obl` `20f` `BASE_PROD` `MINMAX=1 ACCEL=1 VOLTRANSPOSE=1` `1024 9.86 2048 14.20` `§29`:**
+
+```
+PROD 1024 9.86 2048 14.20
+DENSE=1 MetalShaders.metal:4698 fc_dense:48 1024 14.46 +46% 2048 21.11 +48% regress sparse DICOM 40% empty §9, dense skips while(w<extent) R8 20 fetches §18 for NIFTI >60% opaque
+FRAG16 MetalShaders.metal:2794 fc_fragBatch=16 1024 9.68 -1.8% 2048 14.15 -0.3% neutral/win 56% perf_investigation_part2.md:243 not regress
+VOLTRANSPOSE_AXIS=y mm:477 1024 8.42 -14% 2048 13.28 -6% win obl §38.3 -6%
+```
+
+`DENSE` is the `+48%` regressor vs `PROD` on `obl`, `FRAG16` and `Y` are wins/ties. `DENSE` only for `NIFTI` dense, not `DICOM` sparse.
+
+**`NIFTI` with them on/off `1024/2048` `NIFTIVolume` `BASE` as `§1`:**
+
+```
+1024 SD4 PROD 7.14 DENSE 6.60 -7.6% FRAG16 7.11 -0.4% DENSE+FRAG16 6.59 -7.7%
+1024 SD0.5 PROD 9.26 DENSE 9.43 +1.8% FRAG16 10.98 +18% DENSE+FRAG16 11.10 +19%
+2048 SD4 PROD 10.60 DENSE 8.81 -16.9% FRAG16 10.57 tie
+2048 SD0.5 PROD 25.82 DENSE 25.80 tie FRAG16 33.06 +28% regress
+```
+
+`8:2` `MetalShaders.metal:5634` `shadeCap=fc_fineSD?8:2` `82113724da` already default `PROD` wins fine `9.26 vs 10.98` `25.82 vs 33.06` `28%` vs forced `16`, dense wins coarse `7.14->6.60` `10.60->8.81` `17%`. Combined `8:2` fine `+` dense coarse covers both ends for `~10` lines. `B16` disadvantage at fine `200 steps` `16*7 fetches` `16 pow` `37%` spill `tail 8` vs `8*7` `25` batches no tail `§7` `f2 0.86 vs f16 1.14 +32%`.
+
+**`MM_BLOCKS` fine tier `VTK_METAL_TEST_MM_BLOCKS=1` `AppDelegate.mm:88` default `NO` `mm:1399` gated `<1.5` `mm:7924`:**
+
+```
+SD4 no-blocks 1024 9.64 1024+blocks 9.46 -1.8% 2048 14.11->14.13 tie - SD4 gated off §34, correct
+SD0.5 no-blocks 1024 9.63 1024+blocks 9.68 tie 2048 14.13->14.08 tie - sparse DICOM no leap
+NIFTI SD0.5 1024 9.08->9.30 +2% 2048 25.33->25.31 tie 4096 87.24->87.03 tie - cull+ladder strip §16 §18 already leapt
+```
+
+Before `cull+ladder` `§16 §18` `4096` `fine` and `NIFTI` dense `§38.12` `BS16` won, now `2%` tie, leaving it off by default as `AppDelegate.mm:88` `NO` is correct for prod, opt-in `VTK_METAL_TEST_MM_BLOCKS=1` for fine `4096`/`NIFTI` `§38.12`.
+
+Repro `§22`:
+
+```sh
+BIN=build_macos_metal/bin/vtkMetalGLVisualComparison
+DICOM=/Users/macair/Public/IMR/CTIMR/IMRToraceAddome
+NIFTI=/Users/macair/Public/IMR/7T-MRI/Synthesized_FLASH25_downsampled_200um.nii
+BASE="VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1 VTK_METAL_TEST_VOLTRANSPOSE=1 VTK_METAL_TEST_GPU_TRANSPOSE=1"
+for SD in 4 0.5; do for AXIS in x y; do for d in "-1,-1,-1" "-1,-1,0" "-1,-1,1" "-1,0,-1" "-1,0,0" "-1,0,1" "-1,1,-1" "-1,1,0" "-1,1,1" "0,-1,-1" "0,-1,0" "0,-1,1" "0,0,-1" "0,0,1" "0,1,-1" "0,1,0" "0,1,1" "1,-1,-1" "1,-1,0" "1,-1,1" "1,0,-1" "1,0,0" "1,0,1" "1,1,-1" "1,1,0" "1,1,1"; do
+  eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=$SD $BASE VTK_METAL_TEST_VOLTRANSPOSE_AXIS=$AXIS VTK_METAL_TEST_CAM_DIR=$d $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep ^DICOMVolume"
+done; done; done
+for SD in 4 0.5; do for FLAG in "PROD" "VTK_METAL_TEST_DENSE=1" "VTK_METAL_TEST_FRAG_BATCH=16"; do eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=$SD $BASE ${FLAG#PROD} $BIN --bench --backend metal --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep ^NIFTIVolume"; done; done
+eval "env $BASE $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep ^DICOMVolume" # 9.86 PROD
+eval "env $BASE VTK_METAL_TEST_MM_BLOCKS=1 $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep ^DICOMVolume" # 9.46 tie
+```
