@@ -9887,6 +9887,7 @@ inline WoodcockHit woodcock_delta(
     if (any(x < 0.0) || any(x > 1.0)) break;
     float s = sampleVolumeScalar(volumeTexture, x);
     float sig = sampleMediumSigma(table, s, sMin, sMax);
+    sig = min(sig, sigma_maj);
     if (pt_rand(rng) * sigma_maj < sig) { h.hit=true; h.t=tt; h.x=x; break; }
   }
   return h;
@@ -9955,7 +9956,6 @@ kernel void volume_path_trace(
       if (wh.hitCap) break;
       if (!wh.hit) { if (scattered) L += beta * env; break; }
       float3 hitPos = wh.x;
-      bool realHit = true;
       float sHit = sampleVolumeScalar(volumeTexture, hitPos);
       float3 albedo = clamp(sampleMediumAlbedo(mediumTable, sHit, sMin, sMax), 0.0, 0.99);
       float avgA = clamp((albedo.r + albedo.g + albedo.b) / 3.0, 0.0, 0.99);
@@ -10011,9 +10011,11 @@ kernel void volume_path_trace(
                 float G = cosLight / (dist*dist);
                 float3 oS = hitPos + N * 1e-4;
                 float tExitS = dist - 2e-4;
-                float T = woodcock_ratio_T(oS, wi, tExitS, sigma_maj, volumeTexture, mediumTable, sMin, sMax, rng);
-                float3 brdf = albedo / M_PI_F;
-                L += beta * lightRadiance * brdf * cosSurf * T * G / pdfA;
+                if (tExitS > 1e-6) {
+                  float T = woodcock_ratio_T(oS, wi, tExitS, sigma_maj, volumeTexture, mediumTable, sMin, sMax, rng);
+                  float3 brdf = albedo / M_PI_F;
+                  L += beta * lightRadiance * brdf * cosSurf * T * G / pdfA;
+                }
               }
             }
           }
@@ -10061,9 +10063,11 @@ kernel void volume_path_trace(
                 float G = cosLight / (dist*dist);
                 float3 oS = hitPos + wi * 1e-4;
                 float tExitS = dist - 2e-4;
-                float T = woodcock_ratio_T(oS, wi, tExitS, sigma_maj, volumeTexture, mediumTable, sMin, sMax, rng);
-                float p_hg = hg_phase_pt(dot(wi, -curD), g);
-                L += beta * lightRadiance * p_hg * T * G / pdfA;
+                if (tExitS > 1e-6) {
+                  float T = woodcock_ratio_T(oS, wi, tExitS, sigma_maj, volumeTexture, mediumTable, sMin, sMax, rng);
+                  float p_hg = hg_phase_pt(dot(wi, -curD), g);
+                  L += beta * lightRadiance * p_hg * T * G / pdfA;
+                }
               }
             }
           }
