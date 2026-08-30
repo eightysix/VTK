@@ -9592,7 +9592,7 @@ inline half4 cinematic_march_core(
   float k      = 1.0 / voxel; // UV → voxel: one voxel ≈ a*sigma
 
   uint seed = cinematic_hash(gid.x * 1973u + gid.y * 9277u + frameSeed);
-  float j = (u.cinematicAccumCount <= 1) ? 0.35 : 1.0; // stills: 0.35 grain, temporal: 1.0
+  float j = (u.cinematicAccumCount <= 1) ? 0.0 : 1.0; // stills: 0 (no sparkle), temporal: 1.0
   float3 cur = evalPoint + evalStep * (cinematic_rand(seed) * j);
 
   float aAccum = 0.0;
@@ -9650,6 +9650,11 @@ inline half4 cinematic_march_core(
       ao    = saturate(exp(-tauAO * k * 0.55));
       thick = saturate(exp(-tauSS * k * 0.35));
       haveSurface = true;
+    } else {
+      // First-hit only: no sandy interior shading — would need blurred N.
+      // Interior MRI 6-tap every sample is the gyri/cerebellar sand.
+      cur += evalStep;
+      continue;
     }
 
     float ndl  = dot(N, L);
@@ -9657,10 +9662,10 @@ inline half4 cinematic_march_core(
     float wrap = pow(saturate((ndl  + 0.22) / 1.22), 1.20);
     float fill = pow(saturate((ndlF + 0.50) / 1.50), 1.10) * 0.22;
     float shade = mix(0.16, saturate(wrap + fill), gmag);
-    shade *= mix(0.55, 1.0, ao);   // cavities crushed were at 0.48
+    shade *= mix(0.55, 1.0, ao);
 
     float3 albedo = float3(tf.rgb) * 0.90;
-    albedo *= mix(float3(1.0), ssColor, 0.08 * ss); // SSS stain only, pigment in TF
+    albedo *= mix(float3(1.0), ssColor, 0.08 * ss);
     albedo *= mix(0.90, 1.0, gmag);
 
     float side    = saturate(1.0 - abs(ndl));
@@ -9676,15 +9681,27 @@ inline half4 cinematic_march_core(
     float3 sCol = saturate(albedo * shade + sss + spec);
 
     float w = (1.0 - aAccum) * a;
-    colAccum += sCol * w;
-    aAccum   += w;
-    if (aAccum > 0.97) break;
-    cur += evalStep;
+    colAccum = sCol * w;
+    aAccum   = w;
+
+    // SSS tail: 6 steps inward, albedo only, reuse thick/sss, no new N/spec.
+    float3 p = cur;
+    for (int k = 0; k < 6 && aAccum < 0.97; ++k) {
+      p += evalStep;
+      if (any(p < 0.0 || p > 1.0)) break;
+      float s2 = sampleVolumeScalar(volumeTexture, p);
+      half n2 = saturate(half(s2) * scalarScale + scalarBias);
+      float a2 = float(sampleTransferFunction(transferFunctionTexture, float2(float(n2), 0.5)).a);
+      if (a2 < 0.04) continue;
+      float w2 = (1.0 - aAccum) * a2;
+      colAccum += (albedo * mix(0.25, 0.55, thick) + sss) * w2;
+      aAccum   += w2;
+    }
+    if (aAccum < 0.035) return half4(0.0h);
+    return half4(half3(clamp(colAccum, 0.0, 1.0)), half(saturate(aAccum)));
   }
 
-  if (aAccum < 0.035) return half4(0.0h);
-  // Premul over black. No Reinhard — wax already sits under 1.
-  return half4(half3(clamp(colAccum, 0.0, 1.0)), half(saturate(aAccum)));
+  return half4(0.0h);
 }
 
 kernel void volume_compute_march_cinematic(

@@ -1681,10 +1681,9 @@ inline void BuildNIFTIVolumeScene(vtkRenderer* renderer, BackendKind b)
           opacity->RemoveAllPoints();
           opacity->AddPoint(rescale(12.0), 0.0);
           opacity->AddPoint(rescale(16.0), 0.0);
-          opacity->AddPoint(rescale(20.0), 0.10);
-          opacity->AddPoint(rescale(26.0), 0.55);
-          opacity->AddPoint(rescale(34.0), 0.95);
-          opacity->AddPoint(rescale(45.0), 1.0);
+          opacity->AddPoint(rescale(22.0), 0.55);
+          opacity->AddPoint(rescale(28.0), 0.92);
+          opacity->AddPoint(rescale(34.0), 1.0);
           // Wax color TF — pigment in TF, not lum hack in marcher (was 1,1,0.78 lemon)
           color->RemoveAllPoints();
           color->AddRGBPoint(rescale(12.0), 0.00, 0.00, 0.00);
