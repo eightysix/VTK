@@ -9641,11 +9641,8 @@ inline half4 cinematic_march_core(
       N = (glen > 1e-6) ? normalize(-grad) : V;
       if (dot(N, V) < 0.0) N = -N;
     }
-    // Dust only: low a AND low gmag. Never a < 0.12 alone — that is the cortex.
-    if (!haveSurface && gmag < 0.20 && a < 0.08) { cur += evalStep; continue; }
-    if (gmag < 0.12 && a < 0.20) { cur += evalStep; continue; }
-
     if (!haveSurface) {
+      if (gmag < 0.12 && a < 0.20) { cur += evalStep; continue; }
       if (a < 0.08) { cur += evalStep; continue; }   // gmag already filtered
       float tauAO = optical_depth(volumeTexture, transferFunctionTexture,
                                   cur + N * voxel,  N, aoDist,       6, scalarScale, scalarBias, sigma);

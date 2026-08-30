@@ -1677,7 +1677,7 @@ inline void BuildNIFTIVolumeScene(vtkRenderer* renderer, BackendKind b)
           metal->SetJitterBlockSize(1);
           metal->SetUseGPUMinMax(true);
           metal->SetUseMinMaxAcceleration(true);
-          metal->SetUsePrecomputedNormals(true);
+          metal->SetUsePrecomputedNormals(false);
           opacity->RemoveAllPoints();
           opacity->AddPoint(rescale(12.0), 0.0);
           opacity->AddPoint(rescale(16.0), 0.0);
