@@ -282,17 +282,39 @@ vtkSmartPointer<vtkImageData> RenderAndCapture(
     }
   }
 
-  renWin->Render();
-  if (backend == vtkMetalScenes::BackendKind::Metal)
-  {
-    vtkCocoaMetalRenderWindow* metalWin = vtkCocoaMetalRenderWindow::SafeDownCast(renWin);
-    if (!metalWin)
-    {
-      std::cerr << spec.Name << ": Metal window is not a vtkCocoaMetalRenderWindow"
-                << std::endl;
-      return nullptr;
+  // PT still: loop CinematicSamples frames with frozen camera, running-mean accum
+  int ptSamples = 0;
+  if (backend == vtkMetalScenes::BackendKind::Metal) {
+    if (const char* cine = std::getenv("VTK_METAL_TEST_CINEMATIC")) {
+      bool isPT = (cine[0]=='p' || cine[0]=='P' || std::atoi(cine)==2);
+      if (isPT) {
+        if (const char* s = std::getenv("VTK_METAL_TEST_CINEMATIC_SAMPLES")) ptSamples = std::atoi(s);
+        else ptSamples = 256;
+        if (ptSamples < 1) ptSamples = 1;
+      }
     }
-    metalWin->WaitForCompletion();
+  }
+  if (ptSamples > 1) {
+    for (int s = 0; s < ptSamples; ++s) {
+      renWin->Render();
+      if (backend == vtkMetalScenes::BackendKind::Metal) {
+        vtkCocoaMetalRenderWindow* metalWin = vtkCocoaMetalRenderWindow::SafeDownCast(renWin);
+        if (metalWin) metalWin->WaitForCompletion();
+      } else { glFinish(); }
+    }
+  } else {
+    renWin->Render();
+    if (backend == vtkMetalScenes::BackendKind::Metal)
+    {
+      vtkCocoaMetalRenderWindow* metalWin = vtkCocoaMetalRenderWindow::SafeDownCast(renWin);
+      if (!metalWin)
+      {
+        std::cerr << spec.Name << ": Metal window is not a vtkCocoaMetalRenderWindow"
+                  << std::endl;
+        return nullptr;
+      }
+      metalWin->WaitForCompletion();
+    }
   }
 
   vtkNew<vtkWindowToImageFilter> w2i;

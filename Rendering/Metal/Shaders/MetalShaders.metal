@@ -3086,9 +3086,10 @@ struct VolumeMapperUniforms {
   uint cinematicFrameSeed;
   uint cinematicAccumCount;
   float cinematicMajorantSigma;
-  float _padCinematic;
-  float cinematicEnabled;
-  float _padCinematicEnd[3];
+  uint cinematicQuality; // 0 Preview, 1 PathTraced
+  float cinematicEnabled; // 0 off, 1 preview, 2 PT
+  float cinematicEnv; // env radiance for PT (0 black, 0.2 silhouette)
+  float _padCinematicEnd[2];
 };
 
 inline float3 projectionDir(constant VolumeMapperUniforms& u) {
@@ -9802,6 +9803,337 @@ kernel void volume_cinematic_denoise(
   // Preserve solid alpha
   out.a = c0.a;
   outTexture.write(out, gid);
+}
+
+// ============================================================================
+// PathTraced helpers — unbiased Woodcock volume path tracer (steps 1-6)
+// Preview DVR uses cinematic_march_core; PT stills use volume_path_trace.
+// ============================================================================
+inline float halton_pt(uint idx, int base) {
+  float f = 1.0; float r = 0.0;
+  float b = float(base);
+  while (idx > 0) { f /= b; r += f * float(idx % uint(base)); idx /= uint(base); }
+  return r;
+}
+inline uint pt_pcg_hash(uint x) { x ^= x >> 16; x *= 0x7feb352d; x ^= x >> 15; x *= 0x846ca68b; x ^= x >> 16; return x; }
+inline float pt_rand(thread uint &s) { s = pt_pcg_hash(s); return float(s & 0x00FFFFFF) / 16777216.0; }
+inline float hg_phase_pt(float cosTheta, float g) {
+  float g2 = g*g;
+  float denom = 1.0 + g2 - 2.0 * g * cosTheta;
+  return (1.0 - g2) / (4.0 * M_PI_F * denom * sqrt(max(denom, 1e-6)));
+}
+inline float3 hg_sample_dir_pt(float3 wo, float g, thread uint &rng) {
+  float xi1 = pt_rand(rng); float xi2 = pt_rand(rng);
+  float cosTheta;
+  if (abs(g) < 1e-3) cosTheta = 1.0 - 2.0 * xi1;
+  else {
+    float sq = (1.0 - g*g) / (1.0 - g + 2.0 * g * xi1);
+    cosTheta = (1.0 + g*g - sq*sq) / (2.0 * g);
+    cosTheta = clamp(cosTheta, -1.0, 1.0);
+  }
+  float sinTheta = sqrt(max(0.0, 1.0 - cosTheta*cosTheta));
+  float phi = 2.0 * M_PI_F * xi2;
+  float3 up = fabs(wo.z) < 0.999 ? float3(0,0,1) : float3(1,0,0);
+  float3 t = normalize(cross(up, wo));
+  float3 b = cross(wo, t);
+  return normalize(t * cos(phi) * sinTheta + b * sin(phi) * sinTheta + wo * cosTheta);
+}
+inline float3 sampleMediumAlbedo(device float4 *table, float s, float sMin, float sMax) {
+  float u = saturate((s - sMin) / max(sMax - sMin, 1e-6));
+  uint idx = min(uint(u * 1023.0 + 0.5), 1023u);
+  return table[idx].yzw; // yzw = albedo
+}
+inline float sampleMediumSigma(device float4 *table, float s, float sMin, float sMax) {
+  float u = saturate((s - sMin) / max(sMax - sMin, 1e-6));
+  uint idx = min(uint(u * 1023.0 + 0.5), 1023u);
+  return table[idx].x; // sigma_t
+}
+
+// Step 0: grey running-mean test — proves PT accum/blit/reset without volume logic.
+// Writes constant grey into HDR sum (RGBA32F) via ping-pong running mean.
+// spp = cinematicAccumCount (1..cap). sum.rgb = prev.rgb + L, sum.a = spp
+kernel void volume_path_trace(
+    texture2d<float, access::write> accumCurr [[texture(4)]],
+    texture2d<float, access::read> accumPrev [[texture(21)]],
+    texture2d<float> depthSynth [[texture(20)]],
+    constant VolumeMapperUniforms& u [[buffer(1)]],
+    constant PerBlockData& b [[buffer(2)]],
+    texture3d<float> volumeTexture [[texture(5)]],
+    texture2d<float> transferFunctionTexture [[texture(6)]],
+    texture2d<float> transferFunctionTexture1 [[texture(7)]],
+    texture2d<float> transferFunctionTexture2 [[texture(8)]],
+    texture2d<float> transferFunctionTexture3 [[texture(9)]],
+    texture2d<float> transferFunction2DTexture [[texture(10)]],
+    texture3d<float> transfer2DYAxisTexture [[texture(11)]],
+    texture2d<float> gradientOpacityTexture [[texture(12)]],
+    texture3d<float> maskTexture [[texture(13)]],
+    texture2d<float> labelMapTransferTexture [[texture(14)]],
+    texture3d<float> minMaxTexture [[texture(15)]],
+    texture3d<float> minMaxBlockTexture [[texture(16)]],
+    texture3d<float> minMaxSuperTexture [[texture(17)]],
+    texture3d<float> normalTexture [[texture(18)]],
+    texture3d<float> blankingTexture [[texture(19)]],
+    constant packed_float3* rectCoords [[buffer(3)]],
+    constant VolumeLightUniforms& volumeLights [[buffer(4)]],
+    device float4 *mediumTable [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  if (gid.x >= uint(u.viewportSize.x) || gid.y >= uint(u.viewportSize.y)) return;
+  if (u.cinematicEnabled < 0.5 || u.cinematicQuality != 1) { accumCurr.write(float4(0.0), gid); return; }
+  uint spp = max(u.cinematicAccumCount, 1u);
+  float4 prev = float4(0.0);
+  if (spp > 1) prev = accumPrev.read(gid);
+  // Woodcock delta-tracking volume path tracer (steps 1-3)
+  // For step 3 black test: env=0 => black; env=0.2 => silhouette; with bounces/g
+  SynthRay so;
+  float3 L = float3(0.0);
+  if (synthesizeAtlasRay(gid, u, b, volumeTexture, depthSynth, so)) {
+    uint rng = pt_pcg_hash(gid.x * 1973u + gid.y * 9277u + u.cinematicFrameSeed * 104729u + 17u);
+    float2 hv = float2(halton_pt(spp, 2), halton_pt(spp, 3));
+    // Jitter inside pixel is already handled by atlas? Keep Halton for future.
+    float sigma_maj = max(u.cinematicMajorantSigma, 1e-4);
+    float sMin = float(u.scalarMin);
+    float sMax = float(u.scalarMax);
+    float g = clamp(u.cinematicScatteringAnisotropy, -0.9, 0.9);
+    float reach = clamp(u.cinematicReach, 0.0, 1.0);
+    float env = u.cinematicEnv;
+    float maxT = mix(0.5, 4.0, reach);
+    float3 o = so.evalPoint;
+    float3 d = normalize(so.rayDir);
+    float3 beta = float3(1.0);
+    uint maxBounces = max(u.cinematicMaxBounces, 1u);
+    // Handle grey-box env override for step 0 test if needed: keep woodcock for real
+    // Delta-track loop
+    float3 curO = o;
+    float3 curD = d;
+    bool scattered = false;
+    for (uint bounce = 0; bounce < maxBounces; ++bounce) {
+      float3 o2 = curO + curD * 1e-4;
+      float2 tBox = intersectBox(o2, curD, float3(0.0), float3(1.0));
+      float tExit = tBox.y;
+      tExit = min(tExit, maxT);
+      if (tExit <= 1e-6) { if (scattered) L += beta * env; break; }
+      float t = 0.0;
+      float3 hitPos = float3(0.0);
+      bool realHit = false;
+      for (int iter = 0; iter < 64; ++iter) {
+        float xi = pt_rand(rng);
+        float dt = -log(max(1.0 - xi, 1e-6)) / sigma_maj;
+        t += dt;
+        if (t >= tExit) break;
+        float3 x = o2 + curD * t;
+        if (any(x < 0.0) || any(x > 1.0)) break;
+        float s = sampleVolumeScalar(volumeTexture, x);
+        float sigma = sampleMediumSigma(mediumTable, s, sMin, sMax);
+        float xi2 = pt_rand(rng);
+        if (xi2 * sigma_maj < sigma) { hitPos = x; realHit = true; break; }
+      }
+      if (!realHit) { if (scattered) L += beta * env; break; }
+      float sHit = sampleVolumeScalar(volumeTexture, hitPos);
+      float3 albedo = sampleMediumAlbedo(mediumTable, sHit, sMin, sMax);
+      float lum = dot(albedo, float3(0.2126, 0.7152, 0.0722));
+      float xiAbs = pt_rand(rng);
+      if (xiAbs > lum) break;
+      // Surface mix: filtered N at 2.2x + raw gmag at 1.5x
+      float3 Nsurf = float3(0,0,1);
+      float gmagSurf = 0.0;
+      {
+        float3 gsN = b.gradientStep.xyz * 2.2;
+        float3 gsBlur = b.gradientStep.xyz;
+        float3 gsMag = b.gradientStep.xyz * 1.5;
+        float3 gradN = float3(
+          sample_blur(volumeTexture, hitPos + float3(gsN.x,0,0), gsBlur) - sample_blur(volumeTexture, hitPos - float3(gsN.x,0,0), gsBlur),
+          sample_blur(volumeTexture, hitPos + float3(0,gsN.y,0), gsBlur) - sample_blur(volumeTexture, hitPos - float3(0,gsN.y,0), gsBlur),
+          sample_blur(volumeTexture, hitPos + float3(0,0,gsN.z), gsBlur) - sample_blur(volumeTexture, hitPos - float3(0,0,gsN.z), gsBlur));
+        float3 gradM = float3(
+          sampleVolumeScalar(volumeTexture, hitPos + float3(gsMag.x,0,0)) - sampleVolumeScalar(volumeTexture, hitPos - float3(gsMag.x,0,0)),
+          sampleVolumeScalar(volumeTexture, hitPos + float3(0,gsMag.y,0)) - sampleVolumeScalar(volumeTexture, hitPos - float3(0,gsMag.y,0)),
+          sampleVolumeScalar(volumeTexture, hitPos + float3(0,0,gsMag.z)) - sampleVolumeScalar(volumeTexture, hitPos - float3(0,0,gsMag.z)));
+        float glenN = length(gradN);
+        gmagSurf = saturate((length(gradM) - 0.018) * 5.5);
+        Nsurf = (glenN > 1e-6) ? normalize(-gradN) : -curD;
+        if (dot(Nsurf, -curD) < 0.0) Nsurf = -Nsurf;
+      }
+      float w_surf = smoothstep(0.06, 0.22, gmagSurf) * saturate(u.cinematicBlend);
+      float xiSurf = pt_rand(rng);
+      if (xiSurf < w_surf) {
+        // Surface event: Lambert diffuse + NEE with cosine, then cosine hemisphere bounce
+        float3 N = Nsurf;
+        // NEE for surface: Lambert BRDF = albedo/pi
+        {
+          float3 lightCenter = volumeLights.lights[0].position.xyz;
+          float lightRadius = volumeLights.lights[0].attenuation.x;
+          float3 lightRadiance = volumeLights.lights[0].diffuseColor.xyz;
+          float3 Nlight = volumeLights.lights[0].direction.xyz;
+          float nlen = length(Nlight);
+          if (nlen < 1e-3) Nlight = float3(0,0,-1); else Nlight /= nlen;
+          if (lightRadius > 1e-4 && dot(lightRadiance, lightRadiance) > 1e-6) {
+            float r = sqrt(pt_rand(rng));
+            float theta = 2.0 * M_PI_F * pt_rand(rng);
+            float3 up = fabs(Nlight.z) < 0.999 ? float3(0,0,1) : float3(1,0,0);
+            float3 tangent = normalize(cross(up, Nlight));
+            float3 bitangent = cross(Nlight, tangent);
+            float3 y = lightCenter + (tangent * cos(theta) + bitangent * sin(theta)) * r * lightRadius;
+            float3 wi = y - hitPos;
+            float dist = length(wi);
+            if (dist > 1e-4) {
+              wi /= dist;
+              float cosLight = saturate(dot(Nlight, -wi));
+              float cosSurf = saturate(dot(N, wi));
+              if (cosLight > 1e-4 && cosSurf > 1e-4) {
+                float pdfA = 1.0 / (M_PI_F * lightRadius * lightRadius);
+                float G = cosLight / (dist*dist);
+                float T = 1.0;
+                float3 oS = hitPos + N * 1e-4;
+                float tS = 0.0;
+                float tExitS = dist - 2e-4;
+                bool blocked = false;
+                for (int sIter = 0; sIter < 32 && tS < tExitS; ++sIter) {
+                  float xiS = pt_rand(rng);
+                  float dtS = -log(max(1.0 - xiS, 1e-6)) / sigma_maj;
+                  tS += dtS;
+                  if (tS >= tExitS) break;
+                  float3 xs = oS + wi * tS;
+                  if (any(xs < 0.0) || any(xs > 1.0)) break;
+                  float sS = sampleVolumeScalar(volumeTexture, xs);
+                  float sigmaS = sampleMediumSigma(mediumTable, sS, sMin, sMax);
+                  float xiS2 = pt_rand(rng);
+                  if (xiS2 * sigma_maj < sigmaS) { blocked = true; break; }
+                }
+                if (blocked) T = 0.0;
+                float3 brdf = albedo / M_PI_F;
+                L += beta * lightRadiance * brdf * cosSurf * T * G / pdfA;
+              }
+            }
+          }
+        }
+        // Cosine hemisphere bounce (diffuse)
+        float r1 = pt_rand(rng); float r2 = pt_rand(rng);
+        float phi = 2.0 * M_PI_F * r1;
+        float cosTheta = sqrt(max(1.0 - r2, 0.0));
+        float sinTheta = sqrt(r2);
+        float3 up2 = fabs(N.z) < 0.999 ? float3(0,0,1) : float3(1,0,0);
+        float3 tangent2 = normalize(cross(up2, N));
+        float3 bitangent2 = cross(N, tangent2);
+        curD = normalize(tangent2 * cos(phi) * sinTheta + bitangent2 * sin(phi) * sinTheta + N * cosTheta);
+        curO = hitPos + N * 1e-4;
+        beta *= albedo; // brdf/pdf = albedo
+        scattered = true;
+        // If bounce goes into medium (dot <0) continue Woodcock, else reflect (rare)
+      } else {
+        beta *= albedo;
+        scattered = true;
+        // Volume NEE (HG)
+        {
+          float3 lightCenter = volumeLights.lights[0].position.xyz;
+          float lightRadius = volumeLights.lights[0].attenuation.x;
+          float3 lightRadiance = volumeLights.lights[0].diffuseColor.xyz;
+          float3 Nlight = volumeLights.lights[0].direction.xyz;
+          float nlen = length(Nlight);
+          if (nlen < 1e-3) Nlight = float3(0,0,-1); else Nlight /= nlen;
+          if (lightRadius > 1e-4 && dot(lightRadiance, lightRadiance) > 1e-6) {
+            float r = sqrt(pt_rand(rng));
+            float theta = 2.0 * M_PI_F * pt_rand(rng);
+            float3 up = fabs(Nlight.z) < 0.999 ? float3(0,0,1) : float3(1,0,0);
+            float3 tangent = normalize(cross(up, Nlight));
+            float3 bitangent = cross(Nlight, tangent);
+            float3 y = lightCenter + (tangent * cos(theta) + bitangent * sin(theta)) * r * lightRadius;
+            float3 wi = y - hitPos;
+            float dist = length(wi);
+            if (dist > 1e-4) {
+              wi /= dist;
+              float cosLight = saturate(dot(Nlight, -wi));
+              if (cosLight > 1e-4) {
+                float pdfA = 1.0 / (M_PI_F * lightRadius * lightRadius);
+                float G = cosLight / (dist*dist);
+                float T = 1.0;
+                float3 oS = hitPos + wi * 1e-4;
+                float tS = 0.0;
+                float tExitS = dist - 2e-4;
+                bool blocked = false;
+                for (int sIter = 0; sIter < 32 && tS < tExitS; ++sIter) {
+                  float xiS = pt_rand(rng);
+                  float dtS = -log(max(1.0 - xiS, 1e-6)) / sigma_maj;
+                  tS += dtS;
+                  if (tS >= tExitS) break;
+                  float3 xs = oS + wi * tS;
+                  if (any(xs < 0.0) || any(xs > 1.0)) break;
+                  float sS = sampleVolumeScalar(volumeTexture, xs);
+                  float sigmaS = sampleMediumSigma(mediumTable, sS, sMin, sMax);
+                  float xiS2 = pt_rand(rng);
+                  if (xiS2 * sigma_maj < sigmaS) { blocked = true; break; }
+                }
+                if (blocked) T = 0.0;
+                float p_hg = hg_phase_pt(dot(wi, -curD), g);
+                L += beta * lightRadiance * p_hg * T * G / pdfA;
+              }
+            }
+          }
+        }
+        curO = hitPos;
+        curD = hg_sample_dir_pt(-curD, g, rng);
+      }
+      if (bounce >= 2) {
+        float xiRR = pt_rand(rng);
+        if (xiRR > 0.5) break;
+        beta /= 0.5;
+      }
+    }
+    // If we scattered but ran out of bounces, still need to connect to env (faint brain silhouette)
+    if (scattered && length(L) < 1e-6 && env > 1e-6) {
+      float3 oF = curO + curD * 1e-4;
+      float2 tBoxF = intersectBox(oF, curD, float3(0.0), float3(1.0));
+      float tExitF = min(tBoxF.y, maxT);
+      bool hitF = false;
+      float tF = 0.0;
+      for (int iter = 0; iter < 32 && tF < tExitF; ++iter) {
+        float xiF = pt_rand(rng);
+        float dtF = -log(max(1.0 - xiF, 1e-6)) / sigma_maj;
+        tF += dtF;
+        if (tF >= tExitF) break;
+        float3 xF = oF + curD * tF;
+        if (any(xF < 0.0) || any(xF > 1.0)) break;
+        float sF = sampleVolumeScalar(volumeTexture, xF);
+        float sigmaF = sampleMediumSigma(mediumTable, sF, sMin, sMax);
+        float xiF2 = pt_rand(rng);
+        if (xiF2 * sigma_maj < sigmaF) { hitF = true; break; }
+      }
+      if (!hitF) L += beta * env;
+    }
+  } else {
+    L = float3(0.0);
+  }
+  float4 sum;
+  sum.rgb = prev.rgb + L;
+  sum.a = float(spp);
+  accumCurr.write(sum, gid);
+}
+
+inline float3 aces_tonemap(float3 x) {
+  // ACES fitted (Narkowicz)
+  float3 a = x * (2.51 * x + 0.03);
+  float3 b = x * (2.43 * x + 0.59) + 0.14;
+  return saturate(a / b);
+}
+inline float3 linear_to_srgb_pt(float3 c) {
+  return pow(saturate(c), float3(1.0/2.2));
+}
+kernel void volume_cinematic_tonemap(
+    texture2d<float, access::read> accum [[texture(0)]],
+    texture2d<half, access::write> outDisplay [[texture(1)]],
+    constant VolumeMapperUniforms& u [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  if (gid.x >= uint(u.viewportSize.x) || gid.y >= uint(u.viewportSize.y)) return;
+  float4 sum = accum.read(gid);
+  float spp = max(sum.a, 1.0);
+  if (sum.a < 0.5) spp = float(max(u.cinematicAccumCount, 1u));
+  float3 hdr = sum.rgb / spp;
+  float3 mapped = aces_tonemap(hdr * 1.5); // exposure 1.5 for wax
+  float3 srgb = linear_to_srgb_pt(mapped);
+  float alpha = length(hdr) > 1e-4 ? 1.0 : 0.0; // opaque where we scattered, transparent background
+  if (u.cinematicQuality != 1) alpha = 1.0; // preview keep opaque
+  outDisplay.write(half4(half3(srgb), half(alpha)), gid);
 }
 
 kernel void volume_compute_minmax(

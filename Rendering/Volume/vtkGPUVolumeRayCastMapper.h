@@ -17,6 +17,7 @@
  */
 #ifndef vtkGPUVolumeRayCastMapper_h
 #define vtkGPUVolumeRayCastMapper_h
+#include <algorithm>     // For std::clamp
 #include <unordered_map> // For std::unordered_map
 #include <vector>        // For std::vector
 
@@ -294,7 +295,7 @@ public:
    * subtle SSS and premul over black. Default off. Samples/Bounces/
    * Denoise are reserved for a future path-traced variant and do not
    * affect the current DVR integrator (cine_accum is a 1 spp fade,
-    * not spp; Denoise is a 5x5 bilateral disabled at <4 spp).
+   * not spp; Denoise is a 5x5 bilateral disabled at <4 spp).
    */
   vtkSetMacro(CinematicRendering, bool);
   vtkGetMacro(CinematicRendering, bool);
@@ -305,6 +306,34 @@ public:
   vtkGetMacro(CinematicMaxBounces, int);
   vtkSetClampMacro(CinematicDenoise, float, 0.0f, 1.0f);
   vtkGetMacro(CinematicDenoise, float);
+  ///@}
+
+  ///@{
+  /**
+   * CinematicQuality — Preview (shaded DVR, frozen) vs PathTraced (unbiased Woodcock).
+   * Preview is the 1 spp wax skin (uses cine_accum fade, denominator 16).
+   * PathTraced is the running-mean volumetric path tracer (accum.rgb += L; spp = min(spp+1,cap);
+   * display = accum.rgb / spp) with Halton jitter and no denoise. Preview stays for interactive,
+   * PathTraced is for 64-256 spp stills. Default Preview.
+   */
+  enum CinematicQuality
+  {
+    Preview = 0,
+    PathTraced = 1
+  };
+  // Use manual accessors to avoid member/type name clash (member is CinematicQualityValue)
+  void SetCinematicQuality(int v)
+  {
+    v = std::clamp(v, 0, 1);
+    if (this->CinematicQualityValue != v)
+    {
+      this->CinematicQualityValue = v;
+      this->Modified();
+    }
+  }
+  int GetCinematicQuality() const { return this->CinematicQualityValue; }
+  void SetCinematicQualityToPreview() { this->SetCinematicQuality(Preview); }
+  void SetCinematicQualityToPathTraced() { this->SetCinematicQuality(PathTraced); }
   ///@}
 
   ///@{
@@ -573,6 +602,7 @@ protected:
   int CinematicSamples = 1;
   int CinematicMaxBounces = 1;
   float CinematicDenoise = 0.0f;
+  int CinematicQualityValue = 0; // Preview
 
   // Enable / disable two pass rendering
   vtkTypeBool UseDepthPass;

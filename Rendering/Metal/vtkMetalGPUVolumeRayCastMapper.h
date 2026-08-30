@@ -392,12 +392,28 @@ private:
   std::unordered_map<VolumePipelineKey, void*, VolumePipelineKeyHash> ComputeMarchBinnedPipelineCache;
   void* ComputeMarchQueue = nullptr; // probe-selected fast-slot queue (§38.8)
 
-  // Cinematic — shaded DVR (wax AO/SSS, front-to-back over, 1 spp)
-  // Single compute variant; binned majorant path deleted (speckle at 1 spp, kernel removed).
-  void* CinematicComputePipeline = nullptr; // volume_compute_march_cinematic
+  // Cinematic — Preview (shaded DVR wax, 1 spp cine_accum) + PathTraced (Woodcock, running mean)
+  // Preview: single compute volume_compute_march_cinematic (binned deleted, speckle)
+  void* CinematicComputePipeline = nullptr; // preview
   std::unordered_map<VolumePipelineKey, void*, VolumePipelineKeyHash> CinematicComputePipelineCache;
-  void* CinematicAccumTextureA = nullptr; // RGBA16Float ping-pong accumulation
+  // PathTraced — unbiased Woodcock + NEE + surface mix, 64-256 spp
+  void* CinematicPathTracePipeline = nullptr; // volume_path_trace
+  std::unordered_map<VolumePipelineKey, void*, VolumePipelineKeyHash> CinematicPathTracePipelineCache;
+  void* CinematicTonemapPipeline = nullptr; // volume_cinematic_tonemap (ACES)
+  // Medium table: float4 x 1024 (sigma_t, albedo.rgb), maj = max*1.05
+  void* CinematicMediumTableBuffer = nullptr; // MTLBuffer
+  int CinematicMediumTableSize = 0;
+  float CinematicMajorantSigma = 0.0f;
+  vtkTimeStamp CinematicMediumTableTime;
+  vtkMTimeType CinematicMediumTableTFMTime = 0;
+  // Gradient atlas: blurred + Sobel normal for w_surf (RGBA16Float xyz=N w=gmag)
+  void* CinematicGradientAtlasTexture = nullptr;
+  int CinematicGradientAtlasDims[3] = {};
+  void* CinematicGradientAtlasPipeline = nullptr;
+  // Accum: Preview RGBA16Float ping-pong with cine_accum fade; PT RGBA32Float HDR sum running mean
+  void* CinematicAccumTextureA = nullptr;
   void* CinematicAccumTextureB = nullptr;
+  void* CinematicPTDisplayTexture = nullptr; // PT tonemapped display (RGBA16Float) for Phase 3b
   int CinematicAccumWidth = 0;
   int CinematicAccumHeight = 0;
   uint32_t CinematicFrameSeed = 0;
@@ -406,7 +422,9 @@ private:
   double CinematicLastCameraMTime = 0;
   double CinematicLastTransferMTime = 0;
   vtkTimeStamp CinematicLastVolumeTime;
-  // Denoise via MPS (guided filter) when CinematicDenoise > 0
+  double CinematicLastLightMTime = 0;
+  int CinematicLastQuality = -1;
+  // Denoise via MPS (guided filter) when CinematicDenoise > 0 (preview only)
   void* CinematicDenoiseTexture = nullptr; // intermediate for MPS
   void* CinematicDenoisePipeline = nullptr; // cached pipeline for volume_cinematic_denoise
 
@@ -668,6 +686,16 @@ private:
   void* GetOrCreateCinematicComputePipeline(void* mtlDevice, uint32_t featureMask);
   void ReleaseCinematicResources();
   bool DispatchCinematicCompute(void* device, void* queue, void* cmdBuf,
+    vtkRenderer* ren, vtkVolume* vol, void* uniformBuf, const void* pbd,
+    const void* lightUniforms, int width, int height);
+  // PathTraced — unbiased Woodcock (Preview vs PathTraced quality split)
+  bool EnsureCinematicPTResources(void* device, int width, int height);
+  void* GetOrCreatePathTracePipeline(void* device, uint32_t featureMask);
+  void* GetOrCreateTonemapPipeline(void* device);
+  bool UpdateCinematicMediumTable(void* device, vtkVolume* vol);
+  bool EnsureCinematicGradientAtlas(void* device, void* queue, vtkVolume* vol);
+  void ReleaseCinematicGradientAtlas();
+  bool DispatchCinematicPathTrace(void* device, void* queue, void* cmdBuf,
     vtkRenderer* ren, vtkVolume* vol, void* uniformBuf, const void* pbd,
     const void* lightUniforms, int width, int height);
   // §38.18.1: helper that releases all segment-pre-pass Private heaps and

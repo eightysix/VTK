@@ -1657,23 +1657,40 @@ inline void BuildNIFTIVolumeScene(vtkRenderer* renderer, BackendKind b)
       // This block overrides sampling so the default env (SD0.5/ISD1.0) grain/stripes go away.
       if (const char* cine = std::getenv("VTK_METAL_TEST_CINEMATIC"))
       {
-        if (std::atoi(cine) != 0)
+        bool isPT = (cine[0]=='p' || cine[0]=='P' || std::atoi(cine)==2);
+        bool isPreview = (std::atoi(cine)==1);
+        if (isPT || isPreview)
         {
           metal->SetCinematicRendering(true);
-          metal->SetCinematicSamples(1);
-          metal->SetCinematicMaxBounces(1);
-          metal->SetCinematicDenoise(0.0f);
-          metal->SetGlobalIlluminationReach(0.45f);
-          metal->SetVolumetricScatteringBlending(1.15f); // AO sigma via max(blend,1.0)
+          if (isPT) {
+            metal->SetCinematicQuality(vtkGPUVolumeRayCastMapper::PathTraced);
+            metal->SetCinematicSamples(256);
+            metal->SetCinematicMaxBounces(3);
+            metal->SetCinematicDenoise(0.0f);
+            metal->SetGlobalIlluminationReach(0.45f);
+            metal->SetVolumetricScatteringBlending(0.65f);
+            property->SetScatteringAnisotropy(0.35f);
+            // PT uses Halton jitter, not IGN
+            metal->SetUseIGNJitter(false);
+            property->SetSubsurfaceColor(0.86, 0.52, 0.45);
+            property->SetSubsurfaceStrength(0.45f);
+            // allow env override for stills: VTK_METAL_TEST_CINEMATIC_SAMPLES
+            if (const char* s = std::getenv("VTK_METAL_TEST_CINEMATIC_SAMPLES")) metal->SetCinematicSamples(std::atoi(s));
+            if (const char* b = std::getenv("VTK_METAL_TEST_CINEMATIC_BOUNCES")) metal->SetCinematicMaxBounces(std::atoi(b));
+          } else {
+            metal->SetCinematicQuality(vtkGPUVolumeRayCastMapper::Preview);
+            metal->SetCinematicSamples(1);
+            metal->SetCinematicMaxBounces(1);
+            metal->SetCinematicDenoise(0.0f);
+            metal->SetGlobalIlluminationReach(0.45f);
+            metal->SetVolumetricScatteringBlending(1.15f);
+            property->SetScatteringAnisotropy(0.0f);
+            property->SetSubsurfaceColor(0.86, 0.52, 0.45);
+            property->SetSubsurfaceStrength(0.45f);
+          }
           metal->SetPreferHalfPrecision(false);
-          property->SetScatteringAnisotropy(0.0f); // g=0 until real light; headlight HG only brightens facing voxels
-          property->SetSubsurfaceColor(0.86, 0.52, 0.45);
-          property->SetSubsurfaceStrength(0.45f);
-          // Ambient/Diffuse/Specular are no-ops in cinematic shaded DVR (shader shade is whole lighting)
-          // Dropped until VolumeMapperUniforms wires them (currently shader uses fixed wax)
           mapper->SetSampleDistance(0.28);
           mapper->SetImageSampleDistance(1.0);
-          metal->SetUseIGNJitter(false);
           metal->SetJitterBlockSize(1);
           metal->SetUseGPUMinMax(true);
           metal->SetUseMinMaxAcceleration(true);
@@ -1684,7 +1701,6 @@ inline void BuildNIFTIVolumeScene(vtkRenderer* renderer, BackendKind b)
           opacity->AddPoint(rescale(22.0), 0.55);
           opacity->AddPoint(rescale(28.0), 0.92);
           opacity->AddPoint(rescale(34.0), 1.0);
-          // Wax color TF — pigment in TF, not lum hack in marcher (was 1,1,0.78 lemon)
           color->RemoveAllPoints();
           color->AddRGBPoint(rescale(12.0), 0.00, 0.00, 0.00);
           color->AddRGBPoint(rescale(20.0), 0.55, 0.42, 0.36);
