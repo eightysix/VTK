@@ -9596,9 +9596,6 @@ inline half4 cinematic_march_core(
   float3 Lfill = cinematic_onb_n(V, 3.70, 0.45);
   float3 Lrim  = cinematic_onb_n(V, 3.0, -0.25); // behind, toward camera
 
-  float3 gs = b.gradientStep.xyz * 2.2; // blurred N: 1.5 grain, 2.2 smooth folia (specimen instead of sand)
-  float3 gsBlur = b.gradientStep.xyz; // 1 voxel blur kernel
-
   float voxel  = max(length(b.gradientStep.xyz), 1e-4);
   float aoDist = mix(4.0, 14.0, reach) * voxel;  // 12-step cavity, not 6-step kink
   float sigma  = max(u.cinematicBlend, 1.0);
@@ -9608,13 +9605,7 @@ inline half4 cinematic_march_core(
   float j = (u.cinematicAccumCount <= 1) ? 0.0 : 1.0; // stills: 0 (no sparkle), temporal: 1.0
   float3 cur = evalPoint + evalStep * (cinematic_rand(seed) * j);
 
-  float aAccum = 0.0;
-  float3 colAccum = float3(0.0);
   int steps = min(maxSteps, 1024);
-
-  bool haveSurface = false;
-  float ao = 1.0;
-  float thick = 1.0;
 
   for (int i = 0; i < steps; ++i) {
     if (any(cur < 0.0 || cur > 1.0)) break;
@@ -9642,33 +9633,39 @@ inline half4 cinematic_march_core(
         sampleVolumeScalar(volumeTexture, cur - float3(0,0,gs1.z)));
       gmag = saturate((length(g2) - 0.018) * 5.5);
     } else {
-      // Blurred gradient for N: 7-tap blur of scalar, then central diff at 2.2x
-      // One surface sample per ray, so 7*6 fetches is fine. Sand -> folia.
-      float3 grad = float3(
-        sample_blur(volumeTexture, cur + float3(gs.x, 0, 0), gsBlur) -
-        sample_blur(volumeTexture, cur - float3(gs.x, 0, 0), gsBlur),
-        sample_blur(volumeTexture, cur + float3(0, gs.y, 0), gsBlur) -
-        sample_blur(volumeTexture, cur - float3(0, gs.y, 0), gsBlur),
-        sample_blur(volumeTexture, cur + float3(0, 0, gs.z), gsBlur) -
-        sample_blur(volumeTexture, cur - float3(0, 0, gs.z), gsBlur));
-      float glen = length(grad);
-      gmag = saturate((glen - 0.018) * 5.5);
-      N = (glen > 1e-6) ? normalize(-grad) : V;
+      // Two magnitudes: filtered N (smooth), raw gmag (edge)
+      // Blurred N at 2.2x gives folia; raw gmag at 1.5x keeps rim/SSS/shade alive
+      float3 gsN    = b.gradientStep.xyz * 2.2;
+      float3 gsBlur = b.gradientStep.xyz;
+      float3 gsMag  = b.gradientStep.xyz * 1.5;
+      float3 gradN = float3(
+        sample_blur(volumeTexture, cur + float3(gsN.x, 0, 0), gsBlur) -
+        sample_blur(volumeTexture, cur - float3(gsN.x, 0, 0), gsBlur),
+        sample_blur(volumeTexture, cur + float3(0, gsN.y, 0), gsBlur) -
+        sample_blur(volumeTexture, cur - float3(0, gsN.y, 0), gsBlur),
+        sample_blur(volumeTexture, cur + float3(0, 0, gsN.z), gsBlur) -
+        sample_blur(volumeTexture, cur - float3(0, 0, gsN.z), gsBlur));
+      float3 gradM = float3(
+        sampleVolumeScalar(volumeTexture, cur + float3(gsMag.x,0,0)) -
+        sampleVolumeScalar(volumeTexture, cur - float3(gsMag.x,0,0)),
+        sampleVolumeScalar(volumeTexture, cur + float3(0,gsMag.y,0)) -
+        sampleVolumeScalar(volumeTexture, cur - float3(0,gsMag.y,0)),
+        sampleVolumeScalar(volumeTexture, cur + float3(0,0,gsMag.z)) -
+        sampleVolumeScalar(volumeTexture, cur - float3(0,0,gsMag.z)));
+      float glenN = length(gradN);
+      gmag = saturate((length(gradM) - 0.018) * 5.5);
+      N = (glenN > 1e-6) ? normalize(-gradN) : V;
       if (dot(N, V) < 0.0) N = -N;
     }
-    if (!haveSurface) {
-      if (a < 0.08) { cur += evalStep; continue; }
-      float tauAO = optical_depth(volumeTexture, transferFunctionTexture,
-                                  cur + N * voxel,  N, aoDist,      12, scalarScale, scalarBias, sigma);
-      float tauSS = optical_depth(volumeTexture, transferFunctionTexture,
-                                  cur - N * voxel, -N, aoDist * 1.8, 12, scalarScale, scalarBias, sigma);
-      ao    = saturate(exp(-tauAO * k * 0.55));
-      thick = saturate(exp(-tauSS * k * 0.35));
-      haveSurface = true;
-    } else {
-      cur += evalStep;
-      continue;
-    }
+    if (a < 0.08) { cur += evalStep; continue; }
+
+    float tauAO = optical_depth(volumeTexture, transferFunctionTexture,
+                                cur + N * voxel,  N, aoDist,      12, scalarScale, scalarBias, sigma);
+    float tauSS = optical_depth(volumeTexture, transferFunctionTexture,
+                                cur - N * voxel, -N, aoDist * 1.8, 12, scalarScale, scalarBias, sigma);
+    float ao    = saturate(exp(-tauAO * k * 0.55));
+    float thick = saturate(exp(-tauSS * k * 0.35));
+    ao = mix(1.0, ao, saturate(gmag * 1.8)); // cuts: weak gradient -> no cave-AO
 
     float ndl  = dot(N, L);
     float ndlF = dot(N, Lfill);
@@ -9694,25 +9691,10 @@ inline half4 cinematic_march_core(
 
     float3 sCol = saturate(albedo * shade + sss + spec + albedo * rim);
 
-    float w = (1.0 - aAccum) * a;
-    colAccum = sCol * w;
-    aAccum   = w;
-
-    // SSS tail: 6 steps inward, albedo only, reuse thick/sss, no new N/spec.
-    float3 p = cur;
-    for (int k = 0; k < 6 && aAccum < 0.97; ++k) {
-      p += evalStep;
-      if (any(p < 0.0 || p > 1.0)) break;
-      float s2 = sampleVolumeScalar(volumeTexture, p);
-      half n2 = saturate(half(s2) * scalarScale + scalarBias);
-      float a2 = float(sampleTransferFunction(transferFunctionTexture, float2(float(n2), 0.5)).a);
-      if (a2 < 0.04) continue;
-      float w2 = (1.0 - aAccum) * a2;
-      colAccum += (albedo * mix(0.25, 0.55, thick) + sss) * w2;
-      aAccum   += w2;
-    }
-    if (aAccum < 0.035) return half4(0.0h);
-    return half4(half3(clamp(colAccum, 0.0, 1.0)), half(saturate(aAccum)));
+    float cov = smoothstep(0.08, 0.55, a); // coverage, not DVR weight
+    float3 c = saturate(sCol); // SSS already inside sCol
+    if (cov < 0.02) { cur += evalStep; continue; }
+    return half4(half3(c * cov), half(cov)); // premul surface over black
   }
 
   return half4(0.0h);
