@@ -9694,9 +9694,31 @@ inline half4 cinematic_march_core(
 
     float3 sCol = saturate(albedo * shade + sss + spec + albedo * rim);
 
-    float cov = smoothstep(0.08, 0.22, a); // AA only; a>=0.22 -> opaque
-    float3 c = saturate(sCol);
-    return half4(half3(c * cov), half(cov)); // premul surface over black, no cov continue
+    // Thin lit skin: latch at 0.08 keeps dim edge, composite 8 lit samples
+    // with same shade/N. Left a~0.11 ×8 -> opaque wax; right a~0.82 ×1 -> one hit.
+    // No cov(a), no unlit tail, no second gradient.
+    float aAccum = 0.0;
+    float3 colAccum = float3(0.0);
+    float3 p = cur;
+    for (int k = 0; k < 8 && aAccum < 0.95; ++k) {
+      if (k > 0) {
+        p += evalStep;
+        if (any(p < 0.0 || p > 1.0)) break;
+        float s2 = sampleVolumeScalar(volumeTexture, p);
+        half n2 = saturate(half(s2) * scalarScale + scalarBias);
+        half4 tf2 = sampleTransferFunction(transferFunctionTexture, float2(float(n2), 0.5));
+        float a2 = float(tf2.a);
+        if (a2 < 0.04) continue;
+        a = a2;
+        float3 albedo2 = float3(tf2.rgb) * 0.90;
+        albedo2 *= mix(float3(1.0), ssColor, 0.08 * ss);
+        sCol = saturate(albedo2 * shade + sss + spec + albedo2 * rim); // reuse shade/N
+      }
+      float w = (1.0 - aAccum) * a;
+      colAccum += sCol * w;
+      aAccum   += w;
+    }
+    return half4(half3(clamp(colAccum, 0.0, 1.0)), half(saturate(aAccum)));
   }
 
   return half4(0.0h);
