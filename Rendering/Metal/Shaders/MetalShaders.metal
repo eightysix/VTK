@@ -9642,8 +9642,7 @@ inline half4 cinematic_march_core(
       if (dot(N, V) < 0.0) N = -N;
     }
     if (!haveSurface) {
-      if (gmag < 0.12 && a < 0.20) { cur += evalStep; continue; }
-      if (a < 0.08) { cur += evalStep; continue; }   // gmag already filtered
+      if (a < 0.08) { cur += evalStep; continue; }
       float tauAO = optical_depth(volumeTexture, transferFunctionTexture,
                                   cur + N * voxel,  N, aoDist,       6, scalarScale, scalarBias, sigma);
       float tauSS = optical_depth(volumeTexture, transferFunctionTexture,
