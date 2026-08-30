@@ -8764,7 +8764,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateCinematicMediumTable(void* deviceVoid
   if (!opacity) { this->CinematicMajorantSigma = 1e-4f; return false; }
   vtkMTimeType tfMTime = opacity->GetMTime();
   if (color) tfMTime = std::max(tfMTime, color->GetMTime());
-  if (this->CinematicMediumTableBuffer && this->CinematicMediumTableTFMTime == tfMTime && this->CinematicMediumTableSize == 1024) {
+  if (this->CinematicMediumTableBuffer && this->CinematicMediumTableTFMTime == tfMTime && this->CinematicMediumTableSize == 1024 &&
+      this->CinematicMediumTableDensity == this->CinematicDensity) {
     return true;
   }
   const int N = 1024;
@@ -8799,9 +8800,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateCinematicMediumTable(void* deviceVoid
   float maj = maxSigma * 1.05f;
   if (maj < 1e-4f) maj = 1e-4f;
   this->CinematicMajorantSigma = maj;
-#ifndef NDEBUG
-  fprintf(stderr, "[PT] worldPerUV %.2f unit %.2f maxSigma %.2f maj %.2f sMin %.2f sMax %.2f\n", worldPerUV, unit, maxSigma, maj, sMin, sMax);
-#endif
+  vtkDebugMacro(<< "[PT] worldPerUV " << worldPerUV << " unit " << unit << " maxSigma " << maxSigma << " maj " << maj << " sMin " << sMin << " sMax " << sMax);
   id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
   NSUInteger bytes = N * 4 * sizeof(float);
   id<MTLBuffer> buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
@@ -8813,6 +8812,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateCinematicMediumTable(void* deviceVoid
   this->CinematicMediumTableSize = N;
   this->CinematicMediumTableTime.Modified();
   this->CinematicMediumTableTFMTime = tfMTime;
+  this->CinematicMediumTableDensity = this->CinematicDensity;
   return true;
 }
 
@@ -10911,7 +10911,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     uniforms.CinematicScatteringAnisotropy = cprop ? cprop->GetScatteringAnisotropy() : 0.0f;
     uniforms.CinematicReach = this->GlobalIlluminationReach;
     uniforms.CinematicBlend = this->VolumetricScatteringBlending;
-    // CinematicBlend set via vtkGPUVolumeRayCastMapper::SetCinematicBlend (harness may set)
+    // CinematicBlend set via vtkGPUVolumeRayCastMapper::SetVolumetricScatteringBlending (harness may set)
     uniforms.CinematicDenoise = this->CinematicDenoise;
     if (cprop) {
       float sc[3]; cprop->GetSubsurfaceColor(sc);
@@ -10934,6 +10934,8 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     double tfMTime = cprop ? cprop->GetMTime() : 0;
     double lightMTime = cprop ? cprop->GetMTime() : 0;
     if (ren->GetLights()) lightMTime = std::max(lightMTime, (double)ren->GetLights()->GetMTime());
+    vtkMTimeType mapperMTime = this->GetMTime();
+    if (mapperMTime != this->CinematicLastMapperMTime) cineReset=true;
     if (camMTime != this->CinematicLastCameraMTime) cineReset=true;
     if (tfMTime != this->CinematicLastTransferMTime) cineReset=true;
     if (this->VolumeUploadTime.GetMTime() != this->CinematicLastVolumeTime.GetMTime()) cineReset=true;
@@ -10943,6 +10945,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     if (cineReset) {
       this->CinematicAccumCount = 0;
       this->CinematicAccumValid = false;
+      this->CinematicLastMapperMTime = mapperMTime;
       this->CinematicLastCameraMTime = camMTime;
       this->CinematicLastTransferMTime = tfMTime;
       this->CinematicLastVolumeTime = this->VolumeUploadTime;

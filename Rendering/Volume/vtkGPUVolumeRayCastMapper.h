@@ -305,7 +305,13 @@ public:
   vtkGetMacro(CinematicMaxBounces, int);
   vtkSetClampMacro(CinematicDenoise, float, 0.0f, 1.0f);
   vtkGetMacro(CinematicDenoise, float);
-  vtkSetMacro(CinematicExposure, float);
+  /**
+   * Experimental PT cinematic knobs — only consulted when
+   * CinematicRendering=true and CinematicQuality=PathTraced.
+   * Visible to GL (ignored there) so the same still description
+   * works across backends. Prefer mapper MTime reset over TL.
+   */
+  vtkSetClampMacro(CinematicExposure, float, 0.0f, 10.0f);
   vtkGetMacro(CinematicExposure, float);
   vtkSetMacro(CinematicEnv, float);
   vtkGetMacro(CinematicEnv, float);
@@ -315,11 +321,11 @@ public:
   vtkSetMacro(CinematicLightTop, bool);
   vtkGetMacro(CinematicLightTop, bool);
   vtkBooleanMacro(CinematicLightTop, bool);
-  vtkSetMacro(CinematicLightIntensity, float);
+  vtkSetClampMacro(CinematicLightIntensity, float, 0.0f, 1e6f);
   vtkGetMacro(CinematicLightIntensity, float);
-  vtkSetMacro(CinematicLightRadius, float);
+  vtkSetClampMacro(CinematicLightRadius, float, 1e-4f, 1e3f);
   vtkGetMacro(CinematicLightRadius, float);
-  vtkSetMacro(CinematicDensity, float);
+  vtkSetClampMacro(CinematicDensity, float, 0.0f, 10.0f);
   vtkGetMacro(CinematicDensity, float);
   ///@}
 

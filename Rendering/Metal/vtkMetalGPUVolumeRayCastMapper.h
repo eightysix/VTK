@@ -406,6 +406,7 @@ private:
   float CinematicMajorantSigma = 0.0f;
   vtkTimeStamp CinematicMediumTableTime;
   vtkMTimeType CinematicMediumTableTFMTime = 0;
+  float CinematicMediumTableDensity = -1.0f;
   // Gradient atlas: blurred + Sobel normal for w_surf (RGBA16Float xyz=N w=gmag)
   void* CinematicGradientAtlasTexture = nullptr;
   int CinematicGradientAtlasDims[3] = {};
@@ -424,6 +425,7 @@ private:
   vtkTimeStamp CinematicLastVolumeTime;
   double CinematicLastLightMTime = 0;
   int CinematicLastQuality = -1;
+  vtkMTimeType CinematicLastMapperMTime = 0;
   // Denoise via MPS (guided filter) when CinematicDenoise > 0 (preview only)
   void* CinematicDenoiseTexture = nullptr; // intermediate for MPS
   void* CinematicDenoisePipeline = nullptr; // cached pipeline for volume_cinematic_denoise
