@@ -8798,6 +8798,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateCinematicMediumTable(void* deviceVoid
   float maj = maxSigma * 1.05f;
   if (maj < 1e-4f) maj = 1e-4f;
   this->CinematicMajorantSigma = maj;
+  fprintf(stderr, "[PT] worldPerUV %.2f unit %.2f maxSigma %.2f maj %.2f sMin %.2f sMax %.2f\n", worldPerUV, unit, maxSigma, maj, sMin, sMax);
   id<MTLDevice> device = (__bridge id<MTLDevice>)deviceVoid;
   NSUInteger bytes = N * 4 * sizeof(float);
   id<MTLBuffer> buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
@@ -10960,7 +10961,7 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       uniforms.CinematicFrameSeed = 0;
       this->CinematicAccumCount = 0;
     }
-    uniforms.CinematicEnv = isPT ? (getenv("VTK_METAL_TEST_PT_ENV") ? float(atof(getenv("VTK_METAL_TEST_PT_ENV"))) : 0.0f) : 0.0f;
+    uniforms.CinematicEnv = isPT ? (getenv("VTK_METAL_TEST_PT_ENV") ? float(atof(getenv("VTK_METAL_TEST_PT_ENV"))) : 0.04f) : 0.0f;
     uniforms._padCinematicEnd[0]=0.0f; uniforms._padCinematicEnd[1]=0.0f;
   }
 

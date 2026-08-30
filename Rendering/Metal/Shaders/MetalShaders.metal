@@ -9906,17 +9906,17 @@ kernel void volume_path_trace(
     // Delta-track loop
     float3 curO = o;
     float3 curD = d;
-    bool scattered = false;
+    bool scattered = false; bool addedEnv = false;
     for (uint bounce = 0; bounce < maxBounces; ++bounce) {
       float3 o2 = curO + curD * 1e-4;
       float2 tBox = intersectBox(o2, curD, float3(0.0), float3(1.0));
       float tExit = tBox.y;
       tExit = min(tExit, maxT);
-      if (tExit <= 1e-6) { if (scattered) L += beta * env; break; }
+      if (tExit <= 1e-6) { if (scattered) { L += beta * env; addedEnv = true; } break; }
       float t = 0.0;
       float3 hitPos = float3(0.0);
       bool realHit = false;
-      for (int iter = 0; iter < 64; ++iter) {
+      for (int iter = 0; iter < 256; ++iter) {
         float xi = pt_rand(rng);
         float dt = -log(max(1.0 - xi, 1e-6)) / sigma_maj;
         t += dt;
@@ -9928,7 +9928,7 @@ kernel void volume_path_trace(
         float xi2 = pt_rand(rng);
         if (xi2 * sigma_maj < sigma) { hitPos = x; realHit = true; break; }
       }
-      if (!realHit) { if (scattered) L += beta * env; break; }
+      if (!realHit) { if (scattered) { L += beta * env; addedEnv = true; } break; }
       float sHit = sampleVolumeScalar(volumeTexture, hitPos);
       float3 albedo = sampleMediumAlbedo(mediumTable, sHit, sMin, sMax);
       float lum = dot(albedo, float3(0.2126, 0.7152, 0.0722));
@@ -9988,7 +9988,7 @@ kernel void volume_path_trace(
                 float tS = 0.0;
                 float tExitS = dist - 2e-4;
                 bool blocked = false;
-                for (int sIter = 0; sIter < 32 && tS < tExitS; ++sIter) {
+                for (int sIter = 0; sIter < 256 && tS < tExitS; ++sIter) {
                   float xiS = pt_rand(rng);
                   float dtS = -log(max(1.0 - xiS, 1e-6)) / sigma_maj;
                   tS += dtS;
@@ -10051,7 +10051,7 @@ kernel void volume_path_trace(
                 float tS = 0.0;
                 float tExitS = dist - 2e-4;
                 bool blocked = false;
-                for (int sIter = 0; sIter < 32 && tS < tExitS; ++sIter) {
+                for (int sIter = 0; sIter < 256 && tS < tExitS; ++sIter) {
                   float xiS = pt_rand(rng);
                   float dtS = -log(max(1.0 - xiS, 1e-6)) / sigma_maj;
                   tS += dtS;
@@ -10080,13 +10080,13 @@ kernel void volume_path_trace(
       }
     }
     // If we scattered but ran out of bounces, still need to connect to env (faint brain silhouette)
-    if (scattered && length(L) < 1e-6 && env > 1e-6) {
+    if (scattered && !addedEnv && env > 1e-6) {
       float3 oF = curO + curD * 1e-4;
       float2 tBoxF = intersectBox(oF, curD, float3(0.0), float3(1.0));
       float tExitF = min(tBoxF.y, maxT);
       bool hitF = false;
       float tF = 0.0;
-      for (int iter = 0; iter < 32 && tF < tExitF; ++iter) {
+      for (int iter = 0; iter < 256 && tF < tExitF; ++iter) {
         float xiF = pt_rand(rng);
         float dtF = -log(max(1.0 - xiF, 1e-6)) / sigma_maj;
         tF += dtF;
