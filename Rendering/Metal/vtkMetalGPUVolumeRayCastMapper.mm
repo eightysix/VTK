@@ -493,7 +493,21 @@ static int VolumeTransposedAxisDepth(const int dims[3])
   }
   if (dims[2] <= dims[0] && dims[2] <= dims[1])
     return 0;                          // z already (tied-)shortest: no-op
-  return (dims[0] <= dims[1]) ? 1 : 2; // else the shorter in-plane axis
+  // Tie-break toggle for 512x512 (LL vs AP): VTK_METAL_TEST_VOLTRANSPOSE_Y_TIE=1
+  // prefers Y on X==Y ties (dims[0]==dims[1]), e.g. DICOM 512x512x1794. Default
+  // keeps X (mm:496) per HARNESS_VS_APP_GAP §38.3 uniform win caveat, Y available
+  // via VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y for A/B. This toggle only flips the
+  // tie, not the general argmin.
+  if (const char* yt = getenv("VTK_METAL_TEST_VOLTRANSPOSE_Y_TIE"))
+  {
+    if (std::atoi(yt) != 0)
+    {
+      if (getenv("VTK_METAL_TEST_TR_DUMP") || getenv("VTK_METAL_TEST_TR_BENCH"))
+        fprintf(stderr, "[TRPOLICY] Y-tie dims %dx%dx%d -> %d\n", dims[0], dims[1], dims[2], (dims[0] < dims[1]) ? 1 : 2);
+      return (dims[0] < dims[1]) ? 1 : 2; // Y on tie (512==512 -> 2)
+    }
+  }
+  return (dims[0] <= dims[1]) ? 1 : 2; // else the shorter in-plane axis, X on tie
 }
 
 // §28 GPU transpose pass (VTK_METAL_TEST_GPU_TRANSPOSE): when the transposed

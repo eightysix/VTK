@@ -44,6 +44,9 @@
 // argmin-dims tie-break); ON forces VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y.
 // Inert while Volume Transpose is off.
 @property (nonatomic) BOOL volumeTransposeAxisYEnabled;
+// Tie-break toggle for 512x512 (LL vs AP): when ON, X==Y ties prefer Y
+// (VTK_METAL_TEST_VOLTRANSPOSE_Y_TIE=1) e.g. DICOM 512x512x1794. Default X.
+@property (nonatomic) BOOL volumeTransposeYTieEnabled;
 @end
 
 static NSArray<NSDictionary*>* ViewCommandDefs(void)
@@ -94,6 +97,11 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
   self.volumeTransposeAxisYEnabled = NO;
   if (const char* v = std::getenv("VTK_METAL_TEST_VOLTRANSPOSE_AXIS"))
     self.volumeTransposeAxisYEnabled = (v[0] == 'y' || v[0] == 'Y');
+  // Tie-break toggle for 512x512 X==Y (LL vs AP): OFF X tie (mm:496), ON Y tie
+  // (VTK_METAL_TEST_VOLTRANSPOSE_Y_TIE=1) e.g. DICOM 512x512x1794.
+  self.volumeTransposeYTieEnabled = NO;
+  if (const char* v = std::getenv("VTK_METAL_TEST_VOLTRANSPOSE_Y_TIE"))
+    self.volumeTransposeYTieEnabled = std::atoi(v) != 0;
 
   // Fragment batch specialization (§39): 0=shipped runtime 32, 8/16/32=light.
   self.fragBatchValue = 0;
@@ -253,6 +261,12 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
          action:@selector(toggleVolumeTransposeAxisY:)
            key:@"z"
      modifiers:NSEventModifierFlagCommand | NSEventModifierFlagOption
+         target:self
+         toMenu:renderingMenu];
+  [self addItem:@"Transpose Y-Tie (512x512 X==Y -> Y)"
+         action:@selector(toggleVolumeTransposeYTie:)
+           key:@"y"
+     modifiers:NSEventModifierFlagCommand | NSEventModifierFlagShift
          target:self
          toMenu:renderingMenu];
   [self addItem:@"MinMax Acceleration"
@@ -442,6 +456,12 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
     return YES;
   }
 
+  if (action == @selector(toggleVolumeTransposeYTie:))
+  {
+    menuItem.state = self.volumeTransposeYTieEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+    return YES;
+  }
+
   if (action == @selector(toggleMinMaxAcceleration:) ||
       action == @selector(toggleBlueNoiseJitter:))
   {
@@ -583,6 +603,17 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
   self.volumeTransposeAxisYEnabled = !self.volumeTransposeAxisYEnabled;
   setenv("VTK_METAL_TEST_VOLTRANSPOSE_AXIS",
          self.volumeTransposeAxisYEnabled ? "y" : "x", 1);
+  if (vtkMetalGPUVolumeRayCastMapper* mapper = [self currentVolumeMapper])
+  {
+    mapper->ForceResourceReupload();
+    [self renderCurrentWindow];
+  }
+}
+
+- (void)toggleVolumeTransposeYTie:(id)sender
+{
+  self.volumeTransposeYTieEnabled = !self.volumeTransposeYTieEnabled;
+  setenv("VTK_METAL_TEST_VOLTRANSPOSE_Y_TIE", self.volumeTransposeYTieEnabled ? "1" : "0", 1);
   if (vtkMetalGPUVolumeRayCastMapper* mapper = [self currentVolumeMapper])
   {
     mapper->ForceResourceReupload();

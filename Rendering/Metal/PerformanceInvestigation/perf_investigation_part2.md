@@ -806,7 +806,7 @@ This section documents the `§30` `VolumeTransposedAxisDepth:477` tie-break `512
 
 ### 19.1 Current rule
 
-`Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.mm:441` `VolumeTransposedActive()` default `ON`, `mm:477` `VolumeTransposedAxisDepth(dims)` `if(VTK_METAL_TEST_VOLTRANSPOSE_AXIS) return 1:X 2:Y else if(dims[2]<=dims[0]&&dims[2]<=dims[1]) return 0 identity else return (dims[0]<=dims[1])?1:2` `X` on `X==Y` tie `mm:496`. `DICOM 512x512x1794` `-> 1 X-depth 1794x512x512` auto, `NIFTI 632x826x574` `574` shortest `-> 0` identity `perf_investigation_part2.md:270`. `Y` forced via `VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y` `mm:481` supersedes `argmin`.
+`Rendering/Metal/vtkMetalGPUVolumeRayCastMapper.mm:441` `VolumeTransposedActive()` default `ON`, `mm:477` `VolumeTransposedAxisDepth(dims)` `if(VTK_METAL_TEST_VOLTRANSPOSE_AXIS) return 1:X 2:Y else if(dims[2]<=dims[0]&&dims[2]<=dims[1]) return 0 identity else return (dims[0]<=dims[1])?1:2` `X` on `X==Y` tie `mm:496`. `DICOM 512x512x1794` `-> 1 X-depth 1794x512x512` auto, `NIFTI 632x826x574` `574` shortest `-> 0` identity `perf_investigation_part2.md:270`. `Y` forced via `VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y` `mm:481` supersedes `argmin`, `Y-tie` toggle `VTK_METAL_TEST_VOLTRANSPOSE_Y_TIE=1` `mm:496` flips tie `512==512 -> Y` `X` `<=` vs `Y` `<` `HARNESS_VS_APP_GAP §38.3`, app `Rendering -> Transpose Y-Tie` `AppDelegate.mm:264` `VTK_METAL_TEST_VOLTRANSPOSE_Y_TIE`, inert when `VOLTRANSPOSE=0`.
 
 `mm:467` comment keeps `X` tie: `Y` won `10/12` coarse `HARNESS_VS_APP_GAP.md:3902` `§38.3` `obl -6.3% az45 -32.8% axx -20.5% axz -9.6%` but lost `axy +2.7% mm +26.9% raw` `HARNESS_VS_APP_GAP.md:3911` - not uniform so `X` stays, tiered `fine-Y/coarse-X` reverted per `§25.5`.
 
