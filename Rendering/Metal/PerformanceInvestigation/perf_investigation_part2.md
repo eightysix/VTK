@@ -1016,3 +1016,20 @@ BASE="VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_NUM_SLABS=1 VTK_ME
 for RES in 1024x1024 2048x2048 4096x4096; do for SD in 4 0.5; do eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=$SD $BASE $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 20 --size $RES --warmup 5 2>&1 | grep ^DICOMVolume"; eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=$SD $BASE $BIN --bench --backend metal --scene NIFTIVolume --nifti $NIFTI --frames 20 --size $RES --warmup 5 2>&1 | grep ^NIFTIVolume"; done; done
 # expect DICOM 1024 9.86 2048 14.20 4096 33.60, NIFTI 1024 SD4 6.60 SD0.5 9.26 2048 8.81 25.82 §22
 ```
+
+---
+
+## 24. Lower res and angle where `2` wide wins (2026-08-30, `9a16208eb7` `CAM_DIR` `§19`)
+
+`NIFTI` `SD4` `41 steps` `6.93-7.14` `§21` `f1 7.07 f2 7.08 f4 7.03 f8 6.97 f16 6.96 f32 6.93` `30f` `1024` tie `±2%` now, historic `f2 6.97 vs f4 7.26 -4%` `§14.1` `1,1,1` before `cull` `8:2`. Lower `512` `5.22 f1 vs 5.39 f2` `1` wins `-3%` `400` `4.64 vs 4.68` `1` tie, `1024` `CAM_AXIS=x 2.92 f8 vs 2.96 f2` `8` wins `+0.04` `CAM_AXIS=y 2.96 f2 vs 3.08 f8` `2` wins `+0.12` `az45 4.67 f16 vs 4.68 f4` `16` wins. `2` wide peak is `1024` `obl` `1,1,4` era, now with `1,1,1` `cull` `8:2` `§18` flat `±0.14ms`, `8` covers both ends `§22` `9.18 f8 vs 11.11 f16` `fine` `18%` `1024` `24.89 vs 31.95` `2048` `fine`.
+
+Repro `512` `1` wins:
+
+```sh
+BIN=build_macos_metal/bin/vtkMetalGLVisualComparison
+NIFTI=/Users/macair/Public/IMR/7T-MRI/Synthesized_FLASH25_downsampled_200um.nii
+BASE="VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1 VTK_METAL_TEST_VOLTRANSPOSE=1 VTK_METAL_TEST_GPU_TRANSPOSE=1"
+for RES in 512x512 400x400; do for FB in 1 2 4 8 16 32; do eval "env $BASE VTK_METAL_TEST_FRAG_BATCH=$FB VTK_METAL_TEST_SAMPLE_DISTANCE=4 $BIN --bench --backend metal --scene NIFTIVolume --nifti $NIFTI --frames 20 --size $RES --warmup 5 2>&1 | grep ^NIFTIVolume"; done; done
+for V in "CAM_AXIS=x" "CAM_AXIS=y" "CAM_AZ=45"; do for FB in 1 2 4 8 16; do eval "env $BASE VTK_METAL_TEST_FRAG_BATCH=$FB VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_$V $BIN --bench --backend metal --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep ^NIFTIVolume"; done; done
+# expect 512 f1 5.22 vs f2 5.39 -3% f1 wins, 400 4.64 vs 4.68 tie, 1024 CAM_AXIS=y f2 2.96 vs f8 3.08 f2 wins 0.12ms §22
+```
