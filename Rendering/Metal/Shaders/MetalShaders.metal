@@ -6597,7 +6597,7 @@ inline half4 marchVolumeUnified(
           // independent mmPos*blockDims product: when fineDim/8 is not an
           // exact integer (e.g. 897/8) the two mappings disagree almost
           // everywhere along that axis.
-          int3 newBlock = min(newCell / 8, int3(mmBlkDimF) - 1);
+          int3 newBlock = min(newCell / max(int(volumeUniforms.mmBlockSizeCells), 1), int3(mmBlkDimF) - 1);
           if (any(newBlock != curBlock)) {
             curBlock      = newBlock;
             // Sample the block texel at its CENTER: fetching at raw mmPos can
