@@ -670,8 +670,11 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
 // the lattice cache key carries the block wish — so flipping the env rebuilds
 // (or drops) the summary texture on the next frame and respecializes the
 // march pipelines via their featureMaskExtra bit. No resource re-upload is
-// needed. The mapper additionally gates the feature to the fine-SD tier
-// (sampleDistance < 1.5), where the block leaps pay.
+// needed. Since 2026-08-23 VolumeMinMaxBlocksWanted() no longer gates to
+// fine-SD (sampleDistance <1.5) — it returns true whenever gpuMinMax is on
+// (sampleDistance kept for call-site stability) mm:1403; re-add
+// if(sampleDistance>=1.5) return false; to restore fine-only and avoid the
+// 1024 SD4 dense +10% 6.52->7.23 §22.
 - (void)toggleMinMaxBlocks:(id)sender
 {
   self.minMaxBlocksEnabled = !self.minMaxBlocksEnabled;

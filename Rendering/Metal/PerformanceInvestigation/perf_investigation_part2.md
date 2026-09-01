@@ -13,7 +13,7 @@
 
 ## 1. Reproduction (precise `§39.4` / `§40.3` `zsh` `eval`)
 
-`zsh` does not word-split `BASE`, so the `§39.4` `eval "env $BASE ..."` form is required, otherwise `VOLTRANSPOSE_AXIS`, `CAM_AXIS` and `JITTER` are dropped and the DICOM/NIFTI render with different orientations (as in the two cyan images you sent, thr 6423 at 512 without `BASE`).
+`zsh` does not word-split `BASE`, so the `§39.4` `eval "env $BASE ..."` form is required, otherwise `VOLTRANSPOSE_AXIS`, `CAM_AXIS` and `JITTER` **and `VTK_METAL_TEST_MARCH_VARIANT=9` `mm:242` `fc_marchVariant 9`** are dropped and the DICOM/NIFTI render with different orientations (as in the two cyan images you sent, thr 6423 at 512 without `BASE`) **or silently fall back to `mv0` `MetalShaders.metal:6416`**. `mv0` at `2048 SD0.5` `SkinOnBlue` is `~112ms` versus `mv9` `~30ms` `-75%` — the `§22` `MM_BLOCKS` `Skin On Blue II` `~2k SD0.5` win was missed for this reason 2026-09-01. Always use `eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=$SD $BASE ... $BIN"` with `$BASE` word-split via `eval` and `SAMPLE_DISTANCE` last to override `BASE`'s `SAMPLE_DISTANCE=4` `§19.3`. Verify `mv9` is active by checking `DICOMVolume 2048 SD0.5` `SkinOnBlue` `metal ms ~30` not `~112`, or `grep -c "fc_marchVariant 9"` in `vtkMetalGPUVolumeRayCastMapper.mm:7963` `PipelineCache` `featureMaskExtra` `1u<<24` log `[march] fc_marchVariant=9` if enabled.
 
 ```sh
 # build once
@@ -157,14 +157,15 @@ eval "env $BASE VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y $BIN --scene VolumeRayCast --
 eval "env $BASE VTK_METAL_TEST_VOLTRANSPOSE_AXIS=y $BIN --scene DICOMVolume --dicom $DICOM --frames 1 --size 512x512 --warmup 2 --out visual_compare 2>&1 | grep -E 'DICOM|worst'"
 eval "env $BASE_NIFTI $BIN --scene NIFTIVolume --nifti $NIFTI --frames 1 --size 512x512 --warmup 2 --out visual_compare 2>&1 | grep -E 'NIFTI|worst'"
 # NIFTI identity (no VOLTRANSPOSE_AXIS) is the correct policy for 632x826x574 (argmin 0) — y forced is pessimal for y-march (§4.3)
-# fine SD parity
-env VTK_METAL_TEST_SAMPLE_DISTANCE=0.5 $BIN --scene NIFTIVolume --nifti $NIFTI --frames 1 --size 512x512 --warmup 2 --out /tmp/p2 2>&1 | grep -E 'NIFTI|worst'
+# fine SD parity — eval required, SAMPLE_DISTANCE last to override BASE's 4 (§19.3)
+eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=0.5 $BASE $BIN --scene NIFTIVolume --nifti $NIFTI --frames 1 --size 512x512 --warmup 2 --out /tmp/p2 2>&1 | grep -E 'NIFTI|worst'"
 # perf 1024/2048 y vs identity, shade, fragBatch
 for SD in 4 0.5; do for VIEW in "" "VTK_METAL_TEST_CAM_AXIS=y" "VTK_METAL_TEST_CAM_AZ=45"; do
   eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=$SD $BASE $VIEW $BIN --bench --backend metal --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep '^NIFTIVolume'"
   eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=$SD $BASE $VIEW $BIN --bench --backend gl --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep '^NIFTIVolume'"
 done; done
-for F in 1 2 4 8 16 32; do eval "env VTK_METAL_TEST_FRAG_BATCH=$F $BASE VTK_METAL_TEST_SAMPLE_DISTANCE=0.5 $BIN --bench --backend metal --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep '^NIFTIVolume'"; done
+for F in 1 2 4 8 16 32; do eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=0.5 $BASE VTK_METAL_TEST_FRAG_BATCH=$F $BIN --bench --backend metal --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep '^NIFTIVolume'"; done
+# verify mv9 active: should see ~30ms at 2048 SD0.5 SkinOnBlue, not ~112ms mv0 — if ~112ms, BASE was not word-split (missing eval, §1 errata 2026-09-01)
 # code: Rendering/Metal/Shaders/MetalShaders.metal:5568 batchCap, :3861 computeGradientFast, :4002 pow skip, :5259 MV9_COMPOSITE, :6416 mv0 loop
 ```
 
@@ -964,15 +965,24 @@ VOLTRANSPOSE_AXIS=y mm:477 1024 8.42 -14% 2048 13.28 -6% win obl §38.3 -6%
 
 `8:2` `MetalShaders.metal:5634` `shadeCap=fc_fineSD?8:2` `82113724da` already default `PROD` wins fine `9.26 vs 10.98` `25.82 vs 33.06` `28%` vs forced `16`, dense wins coarse `7.14->6.60` `10.60->8.81` `17%`. Combined `8:2` fine `+` dense coarse covers both ends for `~10` lines. `B16` disadvantage at fine `200 steps` `16*7 fetches` `16 pow` `37%` spill `tail 8` vs `8*7` `25` batches no tail `§7` `f2 0.86 vs f16 1.14 +32%`.
 
-**`MM_BLOCKS` fine tier `VTK_METAL_TEST_MM_BLOCKS=1` `AppDelegate.mm:88` default `NO` `mm:1399` gated `<1.5` `mm:7924`:**
+**`MM_BLOCKS` fine tier `VTK_METAL_TEST_MM_BLOCKS=1` `AppDelegate.mm:88` default `NO` `mm:1399` gated `<1.5` `mm:7924` — CORRECTED 2026-09-01 for `mv9` `eval` bug (§1):**
+
+> **Errata 2026-09-01:** prior `§22` `MM_BLOCKS` bash runs used `env $BASE $BIN` in `zsh` without `eval "env $BASE ..."` `§1`. `zsh` does not word-split `BASE`, so `VTK_METAL_TEST_MARCH_VARIANT=9` `mm:242` `fc_marchVariant 9` `MetalShaders.metal:242` and `VOLTRANSPOSE` etc. were dropped, falling back to `mv0` `MetalShaders.metal:6416`. `mv0` at `2048 SD0.5` `SkinOnBlue` is `~112-120ms` versus `mv9` `~30ms` with `eval` (`-75%`). All numbers below are re-measured with `eval "env $BASE ..."` `zsh` correct `§1` `§40.3` `ABBA` `15-30f/5-10w` `arm64 Release` `AC`. `Skin On Blue II` `VRPresets/Skin On Blue II.plist:148` `useShading false` is same TF as `SkinOnBlue` `TestMetalScenes.h:1208` `rescale (hu+1024)*255/4095` `shade OFF` harness default, so `VTK_METAL_TEST_PRESET=SkinOnBlue` below reproduces `II`.
 
 ```
-SD4 no-blocks 1024 9.64 1024+blocks 9.46 -1.8% 2048 14.11->14.13 tie - SD4 gated off §34, correct
-SD0.5 no-blocks 1024 9.63 1024+blocks 9.68 tie 2048 14.13->14.08 tie - sparse DICOM no leap
-NIFTI SD0.5 1024 9.08->9.30 +2% 2048 25.33->25.31 tie 4096 87.24->87.03 tie - cull+ladder strip §16 §18 already leapt
+# Airways II sparse ~40% empty §9 — prior tie reproduced at mv9 correct
+SD4 no-blocks 1024 9.64 1024+blocks 9.46 -1.8% 2048 14.11->14.13 tie - SD4 gated off §34, correct at mv9
+SD0.5 no-blocks 1024 9.63 1024+blocks 9.68 tie 2048 14.13->14.08 tie - sparse DICOM no leap at mv9
+
+# SkinOnBlue dense Skin On Blue II — mv9 correct shows large win at ~2k SD0.5 (user observation)
+SkinOnBlue SD4 1024 6.52->7.23 +10% regress (short 41-step)  2048 SD4 11.78->11.18 -5% tie
+SkinOnBlue SD0.5 1024 25.30->12.08 -52%  2048 SD0.5 69.34->30.41 -56%  15f/5w metal-only ABBA 30f/10w 72.02->30.11 -58% at DOLLY=1
+  DOLLY sweep mv9 2048 SD0.5 SkinOnBlue: 1.5 129.09->58.73 -55%  2.0 179.64->85.36 -52%  2.5 187.97->95.79 -49% (obl 182.34->93.31 -48% x 112.73->96.57 -14% y 119.10->... )  3.0 158.35->92.76 -41% — win persists at high zoom
+  Both backends 15f DOLLY=1 Skin SD0.5 126.62/30.02 0.24 vs 294.42/96.01 0.33 at 2.5 — M<GL stays, accel ON beats OFF 40.54 0.30 vs 30.02 0.24
+NIFTI SD0.5 1024 9.08->9.30 +2% 2048 25.33->25.31 tie 4096 87.24->87.03 tie - cull+ladder strip §16 §18 already leapt at mv9
 ```
 
-Before `cull+ladder` `§16 §18` `4096` `fine` and `NIFTI` dense `§38.12` `BS16` won, now `2%` tie, leaving it off by default as `AppDelegate.mm:88` `NO` is correct for prod, opt-in `VTK_METAL_TEST_MM_BLOCKS=1` for fine `4096`/`NIFTI` `§38.12`.
+`Airways II` dense `SkinOnBlue` split: `Airways` tie at `1024/2048` both `SD` stays `2%` tie, leaving `AppDelegate.mm:88` `NO` correct for sparse prod; `SkinOnBlue`/`BoneSkinII`/`DarkBone` dense win `>50%` at `~2k SD0.5` `mv9` where `>60%` opaque blocks leap `mm:6373` `8³` `block/super` `R8`. Before `cull+ladder` `§16 §18` `4096` `fine` `BS16` won, now at `4096` `NIFTI` `2%` tie, but at `2048` `SkinOnBlue` `mv9` `BS` wins. Opt-in `VTK_METAL_TEST_MM_BLOCKS=1` for dense `TF` `Skin On Blue II` at `~2k` `SD0.5` `mv9`, keep `NO` default for sparse `Airways` prod (or auto via dense heuristic `§23.2`). `M` vs `GL` at zoom `DOLLY=2.5` with `mv9` correct: `SD0.5` `accel ON` `M<GL` `0.33` `96/294` vs `accel OFF` `0.40` `117/289` — `accel ON` still wins at zoom with `mv9`, unlike `mv0` where `M>GL` `1.60` `494/309` flipped.
 
 Repro `§22`:
 
@@ -985,8 +995,12 @@ for SD in 4 0.5; do for AXIS in x y; do for d in "-1,-1,-1" "-1,-1,0" "-1,-1,1" 
   eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=$SD $BASE VTK_METAL_TEST_VOLTRANSPOSE_AXIS=$AXIS VTK_METAL_TEST_CAM_DIR=$d $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep ^DICOMVolume"
 done; done; done
 for SD in 4 0.5; do for FLAG in "PROD" "VTK_METAL_TEST_DENSE=1" "VTK_METAL_TEST_FRAG_BATCH=16"; do eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=$SD $BASE ${FLAG#PROD} $BIN --bench --backend metal --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep ^NIFTIVolume"; done; done
-eval "env $BASE $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep ^DICOMVolume" # 9.86 PROD
-eval "env $BASE VTK_METAL_TEST_MM_BLOCKS=1 $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep ^DICOMVolume" # 9.46 tie
+eval "env $BASE $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep ^DICOMVolume" # 9.86 PROD Airways
+eval "env $BASE VTK_METAL_TEST_MM_BLOCKS=1 $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep ^DICOMVolume" # 9.46 tie Airways
+# Skin On Blue II at ~2k SD0.5 mv9 — must use eval and SAMPLE_DISTANCE last, verify mv9 ~30ms not ~112ms mv0
+eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=0.5 $BASE VTK_METAL_TEST_PRESET=SkinOnBlue $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 15 --size 2048x2048 --warmup 5 2>&1 | grep ^DICOMVolume" # 69.34 blocks 0
+eval "env VTK_METAL_TEST_SAMPLE_DISTANCE=0.5 $BASE VTK_METAL_TEST_PRESET=SkinOnBlue VTK_METAL_TEST_MM_BLOCKS=1 $BIN --bench --backend metal --scene DICOMVolume --dicom $DICOM --frames 15 --size 2048x2048 --warmup 5 2>&1 | grep ^DICOMVolume" # 30.41 blocks 1 -56% win, DOLLY=2.5 187.97->95.79 -49% 6 views all win §22
+# incorrect (missing eval) would give ~112ms mv0: env VTK_METAL_TEST_SAMPLE_DISTANCE=0.5 $BASE $BIN ... without eval word-splits BASE incorrectly in zsh — do not use
 ```
 
 ---
@@ -999,7 +1013,7 @@ Ranked by `thr0` `§40.3` `M/GL<1` keep, `DICOM` `0.000` `VRC 0.18` `NIFTI 0.000
 
 2. **Auto dense via histogram, not manual `DENSE`.** `NIFTI` coarse wins `7.14->6.60 -7.6%` `1024` `10.60->8.81 -16.9%` `2048` `§22` dense skips `while(w<extent)` `R8 20 fetches` `MetalShaders.metal:4698` `§18`, `DICOM` sparse regresses `+46-48%` `§20` `9.86->14.46`. Add CPU histogram `TF a>0.02` `>55%` opaque `-> denseMode` uniform `mm:4691` `denseMode` `~10` lines, `NIFTI` coarse auto wins, `DICOM` stays `9.86` `14.20`.
 
-3. **Keep `MM_BLOCKS` off by default.** `AppDelegate.mm:88` `NO` `mm:1399` `<1.5` `mm:7924` `2%` tie `§22` `9.64->9.46 -1.8%` `SD4` gated off `§34`, `NIFTI` `4096` `87.24->87.03` `cull+ladder` `§16 §18` already leapt. Opt-in `VTK_METAL_TEST_MM_BLOCKS=1` `BLOCKSIZE=16` for `4096` `NIFTI` `§38.12` only.
+3. **Keep `MM_BLOCKS` off by default for sparse `Airways II`, ON for dense `Skin On Blue II` `~2k SD0.5`.** `AppDelegate.mm:88` `NO` `mm:1399` `<1.5` `mm:7924` `Airways` `9.64->9.46 -1.8%` `SD4` and `9.63->9.68` `SD0.5` tie at `mv9` correct `§22`, `NIFTI` `4096` `87.24->87.03` `cull+ladder` `§16 §18` tie. Dense `DICOM` `SkinOnBlue` `Skin On Blue II.plist:148` at `mv9` `~2k SD0.5` is the exception: `1024 25.30->12.08 -52%` `2048 69.34->30.41 -56%` `DOLLY 1-3` `-58%` to `-41%` `§22` `6` views all win `x 112->96 -14%` `obl 182->93 -48%` `M/GL 0.24` vs `0.33` at `2.5` stays `<1` and `accel ON` `96ms` beats `accel OFF` `117ms` `§22` dolly sweep, so `M<GL` at zoom. Prior `§22` tie was `Airways` sparse; `SkinOnBlue` dense needs `VTK_METAL_TEST_MM_BLOCKS=1` `BLOCKSIZE=8` default `mm:1399` `16` fine `8` coarse. For sparse prod keep `NO`; for dense `TF` auto-enable via dense heuristic `§23.2` `a>0.02` `>55%` opaque `mm:4691`.
 
 4. **`SD-aware 4-fetch` `VTK_METAL_TEST_GRAD4=1` `MetalShaders.metal:3861` `fc_grad4:42` `float` `*2.0h` `sC+3` `4*8=32` texels `33%` save.** Already `thr<5` `SD4 2.02` `SD0.5 1.89` `§18` `M/GL<1` `0.66` `§21`, `NIFTI` fine `9.26` `->` `7.11` `-18%` `§9` with `thr<5`, `DICOM` tie `±2%`. Keep env-gated `fineSD` only, not default, `+` `pow skip` `MetalShaders.metal:4002` `0.5^20=9e-7` `3%` already landed.
 
