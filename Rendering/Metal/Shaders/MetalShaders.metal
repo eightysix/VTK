@@ -5748,7 +5748,6 @@ inline half4 marchVolumeUnified(
           if (fc_fragBatch==1)
           {
             // w1 lean: per-cell walk only, no warp/super/block state (incremental mmPos)
-            // + post-advance re-sync matching mv0's matrix-anchored lattice
             int w = 0;
             const int extent = min(48, steps - i);
             float3 curMMPos = clamp(evalPoint, float3(0.0), float3(1.0));
@@ -5762,10 +5761,8 @@ inline half4 marchVolumeUnified(
             {
               currentPoint += stepVec * (float)extent;
               currentT += p.stepSize * (float)extent;
-              // Re-sync like mv0 post-leap: kills incremental evalPoint
-              // drift across long empty runs (cuts >1 px class ~22%)
-              texLocalPos = (volumeUniforms.volumeToTexture * float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
-              evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+              texLocalPos += texStep * (float)extent;
+              evalPoint += evalStep * (float)extent;
               i += extent;
               continue;
             }
@@ -5773,9 +5770,8 @@ inline half4 marchVolumeUnified(
             {
               currentPoint += stepVec * (float)w;
               currentT += p.stepSize * (float)w;
-              // Re-sync like mv0 post-leap
-              texLocalPos = (volumeUniforms.volumeToTexture * float4(volumeUniforms.volumeBoundsMin.xyz + currentPoint * boundsSize, 1.0)).xyz;
-              evalPoint = cellToPointTextureCoord(texLocalPos, ctpScale, ctpOffset);
+              texLocalPos += texStep * (float)w;
+              evalPoint += evalStep * (float)w;
               i += w;
             }
           }
