@@ -1047,3 +1047,43 @@ for RES in 512x512 400x400; do for FB in 1 2 4 8 16 32; do eval "env $BASE VTK_M
 for V in "CAM_AXIS=x" "CAM_AXIS=y" "CAM_AZ=45"; do for FB in 1 2 4 8 16; do eval "env $BASE VTK_METAL_TEST_FRAG_BATCH=$FB VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_$V $BIN --bench --backend metal --scene NIFTIVolume --nifti $NIFTI --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep ^NIFTIVolume"; done; done
 # expect 512 f1 5.22 vs f2 5.39 -3% f1 wins, 400 4.64 vs 4.68 tie, 1024 CAM_AXIS=y f2 2.96 vs f8 3.08 f2 wins 0.12ms §22
 ```
+
+---
+
+## 25. mv9 width-1 vs mv0 — closing the `+11%` gap and parity bisect (`metal-cleanup-1`)
+
+Goal: decide whether `mv9` with `VTK_METAL_TEST_FRAG_BATCH=1` (`w1`) is functionally equivalent to `mv0`, so `mv0` can be deleted. Baseline `arm64 Release` `M2` `BASE` as `§1` + `SAMPLE_DISTANCE=4` (`20f/5w` quick, `15f/5w @2048`, `eval "env $BASE ..."` `zsh` `§1`): `w1 11.2-11.9 vs mv0 10.0-10.5 +9-12% @1024 DICOM` (`13.00 vs 9.99 +30%` at `15f` pre-lean), `2048 w1 26.8 vs mv0 31.8 -15%`, `ACCEL=0 19.5 tie`, `thr0` `512 VRC byte-identical` / `DICOM mean 0.015 max6`.
+
+**Gap root cause:** the `48`-wide lookahead `while(w<extent)` did `fract/distToEdge/tToEdge/cellSteps` math per empty cell + `warp/super/block` state + `minMaxBlock/Super` fetches + `i+1` fetch guard — all dead for `w1`, since `SD4 step>cell` makes `cellSteps==1` anyway. Tried and reverted: `extent 8 +20%` worse, `w1` block-leap `+15%`, `mv0`-in-`mv9` fast path `30.6 vs 10.5 3x` (register spill), redirect `else if(fc_marchVariant>=6 && !(9 && w1))` to `mv0` (`1577344 AIR`) as cheating.
+
+**Landed `57f07ab781` `MetalShaders.metal:5748` `if(fc_fragBatch==1)` lean branch:** `48` per-cell incremental `curMMPos+=evalStep` `w++`, no `fract` math; `mv9Blk/mv9Sb` declarations moved inside heavy `else` (`&& fc_fragBatch!=1`, `w1` `PSO` sheds registers); `fetch1` without guard. `AIR 1612528->1602000`. `ABBA @1024 DICOM w1 9.49/9.33/9.15 avg 9.32 vs mv0 10.40/10.79/9.91 avg 10.37 ~-10%`; `2048 w1 16.15-16.36 vs mv0 31.75-32.10 ~-50%` (`w48 16.62 w16 15.06 w8 13.96` — the `2x` is the `mv9` harness win `§14`, inherited even at width `1`); `NIFTI 7.35/6.98 vs 7.71/7.40 -5%`; `VRC 1.64 vs 1.69`; `ACCEL=0 19.61 vs 19.95 tie`; `thr0` everywhere. Dropped hunks bisection (`fc_walkBatch:50` dead, `segHop/warp/block/super &&!=1` redundant inside `else`, fetch guard `0.03ms`): none beat keep-alone (`9.53 vs 9.08 +0.45ms` all-disables).
+
+**Parity `w1` vs `mv0` `512` (not byte-identical, `thr0` pass):** `DICOM mean 0.015375 max4 >0 1.5133% >1 0.0223%` (122 px mag 2-4, all interior rows 150-378, 0% border); `NIFTI mean 0.010618 max4 >1 0.0017%`; `VRC mean 0 max0` identical. No knob is identical: `ACCEL=0 mean 0.012352 max3 >1 0.0013%` (closest), `MINMAX=0 mean 0.017119 max6`, `both0` = `ACCEL=0`.
+
+**Cause experiments (all `512 DICOM` `w1` vs `mv0`):**
+
+```
+Exp1 post-walk tEnd/bounds re-check before fetch (mv0 :6703 clone): bit-identical to baseline — not over-fetch, reverted
+Exp2A diag no-walk (composite everything): mean 0.017816 max32 >1 0.0449% 2x worse — walk is CORRECT (minmax-empties are not bit-zero under linear bleed), reverted
+Exp3 matrix re-sync after walk advance (mv0 :6711-6714 clone): mean 0.014654 -5%, >1 0.0174% -22% (58->45px), max still 4 — committed 0797692a7d then reverted 5e1e6966f1: parity-by-mimicry (~30 roundings agreeing with mv0 vs 2 independent), no threshold crossed, keep lean
+Exp4 recomputed (non-incremental) classify positions: bit-identical to Exp3 — in-walk drift ruled out, reverted
+```
+
+**Residual attribution (`mean 0.0147 max4 ~45px`):** landing *choices*, not positions — mv0's `+1e-4` ceil fudge + edge guard (`:6667`) vs fudge-free counting (±1 step at cell edges), mv0's block consults + texel-center sampling (`:6636-6643`) vs `w1` ignoring blocks, and the no-skip floor both skeletons share (`:5688` top-`tEnd` break present in `mv9` but absent in bounded `mv0` `:6569`, prefetch order, FMA contraction). Closing it means giving `w1` mv0's leap math, i.e. un-leaning the fast path.
+
+**State:** `metal-cleanup-1` = `57f07ab781` (keep lean) + `5e1e6966f1` (revert resync); full `77`-line variant saved at `/tmp/metal_w1lean.metal` + `/tmp/full.diff`. `w1` faster than `mv0` everywhere measured, `thr0`, `VRC` identical — equivalence argument is `thr`-parity + `2048` win, not byte-identity.
+
+Repro:
+
+```sh
+BIN=build_macos_metal/bin/vtkMetalGLVisualComparison
+DICOM=/Users/macair/Public/IMR/CTIMR/IMRToraceAddome/UZOZWT24/TQHNCPFG
+BASE="VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 VTK_METAL_TEST_NUM_SLABS=1 VTK_METAL_TEST_IGN_JITTER=0 VTK_METAL_TEST_JITTER=1 VTK_METAL_TEST_MINMAX=1 VTK_METAL_TEST_ACCEL=1"
+eval "env $BASE VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_FRAG_BATCH=1 $BIN --bench --scene DICOMVolume --dicom $DICOM --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep ^DICOMVolume" # w1 ~9.3
+eval "env $BASE VTK_METAL_TEST_MARCH_VARIANT=0 $BIN --bench --scene DICOMVolume --dicom $DICOM --frames 20 --size 1024x1024 --warmup 5 2>&1 | grep ^DICOMVolume" # mv0 ~10.4
+rm -rf /tmp/p_w1 /tmp/p_v0
+eval "env $BASE VTK_METAL_TEST_MARCH_VARIANT=9 VTK_METAL_TEST_FRAG_BATCH=1 $BIN --scene DICOMVolume --dicom $DICOM --frames 1 --size 512x512 --warmup 2 --out /tmp/p_w1 2>&1 | grep -E 'DICOM|worst'"
+eval "env $BASE VTK_METAL_TEST_MARCH_VARIANT=0 $BIN --scene DICOMVolume --dicom $DICOM --frames 1 --size 512x512 --warmup 2 --out /tmp/p_v0 2>&1 | grep -E 'DICOM|worst'"
+python3 -c "from PIL import Image;import numpy as np,pathlib;a=np.array(Image.open(list(pathlib.Path('/tmp/p_w1').glob('*.metal.png'))[0])).astype(int);b=np.array(Image.open(list(pathlib.Path('/tmp/p_v0').glob('*.metal.png'))[0])).astype(int);d=np.abs(a-b);print(f'mean {d.mean():.6f} max {d.max()} >0 {100*(d>0).mean():.4f}% >1 {100*(d>1).mean():.4f}%')"
+# expect mean ~0.015 max4 >0 ~1.5% >1 ~0.02% thr0
+```
