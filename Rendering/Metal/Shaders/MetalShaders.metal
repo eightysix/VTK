@@ -5650,20 +5650,6 @@ inline half4 marchVolumeUnified(
       const int bpsI = 64 / bsI;
       const float invBs = 1.0f / float(bsI);
       const float invBps = 1.0f / float(bpsI);
-      int3 mv9Blk = int3(-1);
-      int mv9BlkState = -1;
-      // §35.5 (VTK_METAL_TEST_MM_SUPER -> fc_mmSuper): third occupancy level.
-      // Super indices derive from BLOCK indices via integer divide (same
-      // lesson as the block level: never from normalized-coordinate
-      // products); the texel is sampled at its center; supers tile fine
-      // cells [64k, 64k+64) = blocks [8k, 8k+8).
-      const float3 mmSbDimF = float3(minMaxSuperTexture.get_width(),
-                                     minMaxSuperTexture.get_height(),
-                                     minMaxSuperTexture.get_depth());
-      const bool useMinMaxSuper = useMinMaxBlocks && fc_mmSuper &&
-                                  mmSbDimF.x > 1.0f;
-      int3 mv9Sb = int3(-1);
-      bool mv9SbEmpty = false;
       // §35.14 streaming consume state (fc_segHop): the per-ray skip segments
       // precomputed by volume_segment_build are pulled from the compacted pool
       // one gap at a time — only (recOff, cnt, idx, gStart, gEnd) stay live, so
@@ -5759,7 +5745,39 @@ inline half4 marchVolumeUnified(
           // (latch/tEnd breaks); inactive-lane contributions only risk
           // disabling a skip (garbage <= 0 falls through), never corrupting
           // output — verified by byte-compare when the feature is on.
-          if (volumeUniforms.mmWarpMin > 0.5f && bsI > 0)
+          if (fc_fragBatch==1)
+          {
+            // w1 lean: per-cell walk only, no warp/super/block state (incremental mmPos)
+            int w = 0;
+            const int extent = min(48, steps - i);
+            float3 curMMPos = clamp(evalPoint, float3(0.0), float3(1.0));
+            while (w < extent)
+            {
+              if (minMaxTexture.sample(sNearest, curMMPos, level(0)).r <= 0.5) break;
+              w++;
+              curMMPos = clamp(curMMPos + evalStep, float3(0.0), float3(1.0));
+            }
+            if (w >= extent)
+            {
+              currentPoint += stepVec * (float)extent;
+              currentT += p.stepSize * (float)extent;
+              texLocalPos += texStep * (float)extent;
+              evalPoint += evalStep * (float)extent;
+              i += extent;
+              continue;
+            }
+            if (w > 0)
+            {
+              currentPoint += stepVec * (float)w;
+              currentT += p.stepSize * (float)w;
+              texLocalPos += texStep * (float)w;
+              evalPoint += evalStep * (float)w;
+              i += w;
+            }
+          }
+          else
+          {
+          if (volumeUniforms.mmWarpMin > 0.5f && bsI > 0 && fc_fragBatch!=1)
           {
             const float3 wp = clamp(evalPoint, float3(0.0), float3(1.0));
             const int3 wb = min(int3(wp * mmDimF) / bsI, int3(mmBlkDimF) - 1);
@@ -5799,6 +5817,16 @@ inline half4 marchVolumeUnified(
               continue;
             }
           }
+          // Block-summary cache for 48 walk (only 48 walk, not lean w1)
+          int3 mv9Blk = int3(-1);
+          int mv9BlkState = -1;
+          const float3 mmSbDimF = float3(minMaxSuperTexture.get_width(),
+                                         minMaxSuperTexture.get_height(),
+                                         minMaxSuperTexture.get_depth());
+          const bool useMinMaxSuper = useMinMaxBlocks && fc_mmSuper &&
+                                       mmSbDimF.x > 1.0f && fc_fragBatch!=1;
+          int3 mv9Sb = int3(-1);
+          bool mv9SbEmpty = false;
           int w = 0;
           const int extent = min(48, steps - i);
           // Block-summary state is cached across batches (mv9Blk above).
@@ -5926,8 +5954,13 @@ inline half4 marchVolumeUnified(
             evalPoint += evalStep * (float)w;
             i += w;
           }
+          }
         }
-        if (fc_fineSD || (!fc_shading && !fc_gradientOpacity)) {
+        if (fc_fragBatch==1) {
+            MV9_FETCH(0)
+            MV9_COMPOSITE(0)
+            MV9_ADVANCE(1)
+        } else if (fc_fineSD || (!fc_shading && !fc_gradientOpacity)) {
           // fine SD0.5 or coarse lean (DICOM 16) keep 48..2/1, coarse shade (NIFTI 2) only 2/1 dead-strip 48/32/16/8/4 thr0
           if (batchCap >= 48 && i + 48 <= steps)
           {
