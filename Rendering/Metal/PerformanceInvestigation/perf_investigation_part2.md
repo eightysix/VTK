@@ -1207,3 +1207,9 @@ Parity: NIFTI SD4 byte-max 0 (preambles land identically), SD0.5 thr 0.035 keep,
 
 At coarse steps the warp/block/super consults cost more than they yield (blocks-0 cell-walk already beat blocks-on `7.65 vs 10.23`); at fine the leaps are everything. Env-landed; default candidate (wins everywhere coarse, neutral fine, parities clean) pending app-side validation — `VRC`/axis views done, `4096`/app TFs open.
 
+### 26.11 Extent scaling redirected; dense bypass pays at fine too (2026-09-03)
+
+Extent `48→smaller` (as first sketched) is backwards: smaller extent re-runs warp probe + setup per chunk in long empties (strictly more work); larger (`48→96`) only halves warp probes while walk taps stay constant (`~1%` at best, fine-sparse only) — skipped with reason, not worth a cycle.
+
+Instead, temp-edit `useMinMax = fc_minmax && !fc_dense` (reverted after; committed state keeps `&& !fc_fineSD`) to test the `:4699` claim ("fine dense keeps minMax, still benefits from leaps") for dense-fine: `NIFTI 1024 SD0.5 DENSE 9.13 -> 8.12 -11.1% ABBA`, `thr 0.035` keep. Refuted — at fine-dense the leaps never fire and `25` batches/ray of preamble is pure overhead, so full bypass beats even `W1PRE`-fine (`-1.7%`). Consequence for `§13.4`/`#2` auto-dense: cover **all** `SD`, not just coarse (projected `NIFTI SD0.5 ~9.0->~8.1` with `thr0`, on top of coarse `-7-17%`). `W1PRE`-dense-gating (`|| fc_dense`) rejected meanwhile: with manual `DENSE` it would arm `w1` for sparse-fine accidents (`+120%` class) — only safe under auto-dense.
+
