@@ -429,6 +429,26 @@ private:
   int LastVolumeNumComponents = 1;
   bool LastIndependentComponents = false;
 
+  // §27.1 auto-dense: volume-occupancy bypass for the min-max preamble.
+  // Manual DENSE=1 wins coarse -7-17% and fine -11-15% (§26.11, §28) but
+  // regresses sparse DICOM +46-48%, so the flag must derive from VOLUME
+  // occupancy (subsampled voxels through the opacity TF with the same >0.0
+  // predicate as the occupancy lattice), never from TF shape alone —
+  // TF-entry fraction misfires on SkinOnBlue (dense TF, background air where
+  // blocks win -56%). Computed in GPURender before SetupPipeline; the result
+  // feeds the fc_dense PSO key bit (1<<18) so dense/sparse get separate PSOs.
+  // VTK_METAL_TEST_DENSE overrides when set: empty/bare presence or nonzero
+  // forces ON (legacy), "0" forces OFF; unset selects auto.
+  bool CachedDenseBypass = false;
+  bool DenseBypassCacheValid = false;
+  unsigned long LastDenseInputMTime = 0;
+  unsigned long LastDenseScalarsMTime = 0;
+  unsigned long LastDenseOpacityMTime = 0;
+  double LastDenseScalarRange[2] = { 0.0, 1.0 };
+  int LastDenseDims[3] = { 0, 0, 0 };
+  bool GetDenseBypassActive() const;
+  bool ComputeDenseBypass(vtkVolume* vol, vtkImageData* input, vtkDataArray* scalars);
+
   bool PreferHalfPrecision = true;  // when true, prefer half-float (16-bit) for volume textures when the scalar range fits within [−65504, 65504]; covers native float and integer types
   // Enables a precomputed RGBA8Unorm normal texture to replace 6 gradient
   // fetches per sample with 1 normal texture fetch.  Adds ~4 bytes/voxel of

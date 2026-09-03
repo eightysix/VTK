@@ -4695,9 +4695,13 @@ inline half4 marchVolumeUnified(
   bool  curBlockSolid = false;
   int   solidRun     = 0;
   float3 mmDimF     = b.minMaxInfo.yzw;
-  // Specialization §17: fc_dense bypasses per-batch R8 preamble for dense coarse volumes (SD4 30% fixed overhead, tail 41=20*2+1, 4x stride)
-  // Dense && !fineSD => coarse dense bypass; fine dense keeps minMax (SD0.5 still benefits from leaps)
-  const bool useMinMax = fc_minmax && !(fc_dense && !fc_fineSD) &&
+  // §27.1 auto-dense (all SD): fc_dense bypasses the per-batch R8 preamble
+  // for dense volumes (§17 coarse 30% fixed overhead; §26.11 fine-dense
+  // -11.1% — leaps never fire there, 25 batches/ray of preamble is pure
+  // overhead). fc_dense is volume-occupancy auto (mapper subsample, >55%
+  // voxels touch opacity under the lattice >0.0 predicate) with
+  // VTK_METAL_TEST_DENSE as force override; sparse stays exact.
+  const bool useMinMax = fc_minmax && !fc_dense &&
     !useIndependentPath &&
     b.minMaxInfo.x > 0.5 &&
     b.minMaxInfo.y > 0.5 &&

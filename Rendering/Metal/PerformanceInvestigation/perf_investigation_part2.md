@@ -1237,3 +1237,20 @@ Landed this session (`metal-cleanup-1`): `half s_j`, rolled `16/8` shade loops, 
 - `MV9_COMPOSITE_LOOP` is a de-suffixed twin of `MV9_COMPOSITE` — keep in sync; long-term graduate the loop form to all shade rungs or generate one from the other.
 - `fc_w1preamble:50` / `1u<<21` / `VTK_METAL_TEST_W1PRE` reserved; `39/40/52+` still free (`§26.10`).
 
+---
+
+## 28. Auto-dense landed (2026-09-03, `§27.1 #1` done)
+
+`fc_dense` is now automatic volume occupancy with `VTK_METAL_TEST_DENSE` as force override (`""`-or-nonzero → ON legacy, `"0"` → OFF, unset → auto). `ComputeDenseBypass` (`vtkMetalGPUVolumeRayCastMapper.mm`, called in `GPURender` before volume-upload pre-warm so the `1u<<18` PSO key is stable): every-16th-voxel-per-axis subsample (`~1/4096`, halved until `>=1024` samples for small volumes), component-0 opacity `TF` via the `256`-entry `GetTable`, cached on input/scalars/opacity `MTimes` + range + dims (steady-state cost a few integer compares). Shader `:4700` widened to `!fc_dense` (all `SD`, per `§26.11`).
+
+Predicate refinement vs the `§27.1` sketch (`>0.01`, `>55%`): measured `NIFTI` bench occupancy is `>0: 95.6%` / `>0.01: 46.9%` / `>0.02: 44.9%` (`35114/74880`), so `>0.01` at `55%` would leave the canonical dense case on the table. Landed predicate is **`>0.0` at `>0.55`** — exactly the occupancy-lattice predicate (`UpdateMinMaxTexture`/`ComputeMinMaxGPU` mark occupied at `opacityTable[i] > 0.0`), so dense fires exactly when the lattice is too full for leaps to pay (`55%` voxels ⇒ `~100%` of `4³` cells occupied). `DICOM` measures `2.2%` (`2490/115712`), `20×+` margin below threshold — `DICOM`-safe by construction holds. `MARCH_DEBUG` prints the `>0/>0.01/>0.02` distribution (`[dense]` line) for app-`TF` validation. `SkinOnBlue` occupancy unmeasured here (no harness dataset) — stays on the validation list with `4096`/app-`TFs` before any `W1PRE`-dense combo.
+
+```
+NIFTI 1024 ABBA 15f/5w (AUTO vs DENSE=0): SD4 7.72/7.72 vs 8.11/8.33 -6.1% | SD0.5 8.11/8.22 vs 9.25/9.50 -12.9%
+DICOM 1024 ABBA (AUTO vs DENSE=0): SD4 8.83/8.50 vs 8.44/8.65 +1.4% tie | SD0.5 14.20/14.01 vs 14.07/14.08 +0.2% tie
+Parity 512: NIFTI SD4 2999 thr 0.000 (DENSE=0 2999 thr 0.000, byte-identical class) | NIFTI SD0.5 thr 0.035 both, metal-metal mean 0.0001 max 1LSB 0.01% | DICOM 1122 thr 0.000 exact
+Classify: NIFTI 95.6% DENSE, DICOM 2.2% sparse
+```
+
+`§27.1` status after this: `#1` landed (this section); `#2` `W1PRE`-to-default and `#3` `GRAD_NEAREST` unchanged, still pending `4096` + app-`TF` validation (now joined by auto-dense app-`TF` validation, esp. `SkinOnBlue`-class dense-`TF`/sparse-volume shapes).
+

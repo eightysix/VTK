@@ -8,6 +8,7 @@
 #include "vtkMetalCamera.h"
 #include "vtkMetalShaders.h"
 #include "vtkColorTransferFunction.h"
+#include "vtkDataArray.h"
 #include "vtkDataSet.h"
 #include "vtkImageData.h"
 #include "vtkNew.h"
@@ -1486,6 +1487,18 @@ static float VolumeMinMaxEps()
   return 0.0f;
 }
 
+// §27.1 auto-dense env override: VTK_METAL_TEST_DENSE set forces the bypass
+// (bare presence or nonzero → ON, "0" → OFF); unset selects the automatic
+// volume-occupancy heuristic in ComputeDenseBypass. Returns -1 for auto.
+static int VolumeDenseEnvOverride()
+{
+  const char* e = std::getenv("VTK_METAL_TEST_DENSE");
+  if (!e)
+    return -1;
+  if (e[0] == '\0')
+    return 1; // legacy bare presence means ON
+  return (std::atoi(e) != 0) ? 1 : 0;
+}
 
 
 // §38.18.1: purge request via VTK_METAL_TEST_PURGE=1 (also accepts
@@ -1992,6 +2005,217 @@ vtkStandardNewMacro(vtkMetalGPUVolumeRayCastMapper);
 vtkOverrideAttribute* vtkMetalGPUVolumeRayCastMapper::CreateOverrideAttributes()
 {
   return vtkOverrideAttribute::CreateAttributeChain("RenderingBackend", "Metal", nullptr);
+}
+
+//------------------------------------------------------------------------------
+// §27.1 auto-dense accessors. The env override lives in the anonymous-namespace
+// helper above; the cached auto value is computed in GPURender via
+// ComputeDenseBypass before SetupPipeline so the fc_dense PSO key is stable.
+bool vtkMetalGPUVolumeRayCastMapper::GetDenseBypassActive() const
+{
+  int ov = VolumeDenseEnvOverride();
+  if (ov >= 0)
+    return ov != 0;
+  return this->CachedDenseBypass;
+}
+
+//------------------------------------------------------------------------------
+// §27.1 auto-dense: subsample the volume (every 16th voxel per axis, refined
+// for small volumes to keep >=1024 samples), push each sample through the
+// component-0 opacity TF, and count the opaque fraction with the SAME >0.0
+// predicate as the occupancy lattice (UpdateMinMaxTexture/ComputeMinMaxGPU).
+// Dense when >55% opaque: at that voxel rate ~every 4³ cell is occupied, so
+// leaps cannot fire and the preamble is pure overhead. Volume occupancy —
+// not TF shape — so SkinOnBlue (dense TF over background air, where blocks
+// win -56%) stays sparse and DICOM stays sparse by construction. Cached on
+// input/scalars/opacity MTimes + range + dims.
+bool vtkMetalGPUVolumeRayCastMapper::ComputeDenseBypass(
+  vtkVolume* vol, vtkImageData* input, vtkDataArray* scalars)
+{
+  int ov = VolumeDenseEnvOverride();
+  if (ov >= 0)
+    return ov != 0;
+  if (!vol || !input || !scalars)
+    return false;
+  vtkVolumeProperty* property = vol->GetProperty();
+  vtkPiecewiseFunction* opFunc = property ? property->GetScalarOpacity() : nullptr;
+  if (!opFunc)
+    return false;
+
+  int extents[6];
+  input->GetExtent(extents);
+  const int dx = extents[1] - extents[0] + 1;
+  const int dy = extents[3] - extents[2] + 1;
+  const int dz = extents[5] - extents[4] + 1;
+  if (dx <= 0 || dy <= 0 || dz <= 0)
+    return false;
+
+  const unsigned long inMT = input->GetMTime();
+  const unsigned long scMT = scalars->GetMTime();
+  const unsigned long opMT = opFunc->GetMTime();
+  if (this->DenseBypassCacheValid && inMT == this->LastDenseInputMTime &&
+    scMT == this->LastDenseScalarsMTime && opMT == this->LastDenseOpacityMTime &&
+    this->LastDenseScalarRange[0] == this->ScalarRange[0] &&
+    this->LastDenseScalarRange[1] == this->ScalarRange[1] &&
+    this->LastDenseDims[0] == dx && this->LastDenseDims[1] == dy &&
+    this->LastDenseDims[2] == dz)
+  {
+    return this->CachedDenseBypass;
+  }
+
+  double opacityTable[256];
+  opFunc->GetTable(this->ScalarRange[0], this->ScalarRange[1], 256, opacityTable);
+  const double scalarRange = this->ScalarRange[1] - this->ScalarRange[0];
+  const double rangeRecip = (scalarRange > 0.0) ? (255.0 / scalarRange) : 1.0;
+  const double rangeMin = this->ScalarRange[0];
+
+  // Step 16 per axis (≈1/4096 voxels); halve until >=1024 samples so small
+  // volumes still get a stable fraction estimate.
+  int step = 16;
+  while (step > 1)
+  {
+    const long nx = (dx + step - 1) / step;
+    const long ny = (dy + step - 1) / step;
+    const long nz = (dz + step - 1) / step;
+    if (nx * ny * nz >= 1024)
+      break;
+    step /= 2;
+  }
+
+  vtkIdType inc[3];
+  input->GetIncrements(inc);
+  const int dataType = scalars->GetDataType();
+  const void* dataPtr = scalars->GetVoidPointer(0);
+
+  long total = 0;
+  long opaque = 0;    // opacity > 0.0 — same predicate as the occupancy lattice
+  long opaque01 = 0;  // TEMP-DIAG §28: opacity > 0.01 distribution probe
+  long opaque02 = 0;  // TEMP-DIAG §28: opacity > 0.02 distribution probe
+  if (dataPtr && inc[0] != 0)
+  {
+    for (int z = 0; z < dz; z += step)
+    {
+      for (int y = 0; y < dy; y += step)
+      {
+        for (int x = 0; x < dx; x += step)
+        {
+          float v = 0.0f;
+          bool viaComponent = false;
+          const vtkIdType off = static_cast<vtkIdType>(z) * inc[2] +
+            static_cast<vtkIdType>(y) * inc[1] + static_cast<vtkIdType>(x) * inc[0];
+          switch (dataType)
+          {
+            case VTK_FLOAT:
+              v = static_cast<const float*>(dataPtr)[off];
+              break;
+            case VTK_DOUBLE:
+              v = static_cast<float>(static_cast<const double*>(dataPtr)[off]);
+              break;
+            case VTK_UNSIGNED_CHAR:
+              v = static_cast<const unsigned char*>(dataPtr)[off];
+              break;
+            case VTK_UNSIGNED_SHORT:
+              v = static_cast<const unsigned short*>(dataPtr)[off];
+              break;
+            case VTK_SHORT:
+              v = static_cast<const short*>(dataPtr)[off];
+              break;
+            case VTK_INT:
+              v = static_cast<const int*>(dataPtr)[off];
+              break;
+            case VTK_UNSIGNED_INT:
+              v = static_cast<const unsigned int*>(dataPtr)[off];
+              break;
+            default:
+              viaComponent = true;
+              break;
+          }
+          int idx;
+          if (viaComponent)
+          {
+            const vtkIdType tupleIdx = (static_cast<vtkIdType>(z) * dy + y) * dx + x;
+            v = static_cast<float>(scalars->GetComponent(tupleIdx, 0));
+            idx = static_cast<int>((v - rangeMin) * rangeRecip);
+          }
+          else
+          {
+            idx = static_cast<int>((v - rangeMin) * rangeRecip);
+          }
+          if (idx < 0)
+            idx = 0;
+          else if (idx > 255)
+            idx = 255;
+          ++total;
+          // Decision predicate matches the occupancy lattice exactly
+          // (UpdateMinMaxTexture/ComputeMinMaxGPU: opacityTable[i] > 0.0), so
+          // dense fires exactly when the lattice is too full for leaps to pay.
+          if (opacityTable[idx] > 0.0)
+            ++opaque;
+          if (opacityTable[idx] > 0.01)
+            ++opaque01;
+          if (opacityTable[idx] > 0.02)
+            ++opaque02;
+        }
+      }
+    }
+  }
+  else
+  {
+    // No raw pointer (e.g. mapped array): fall back to GetComponent on a
+    // coarser stride to bound virtual-call cost.
+    const int coarseStep = step * 2;
+    for (int z = 0; z < dz; z += coarseStep)
+    {
+      for (int y = 0; y < dy; y += coarseStep)
+      {
+        for (int x = 0; x < dx; x += coarseStep)
+        {
+          const vtkIdType tupleIdx =
+            (static_cast<vtkIdType>(z) * dy + y) * dx + x;
+          const float v = static_cast<float>(scalars->GetComponent(tupleIdx, 0));
+          int idx = static_cast<int>((v - rangeMin) * rangeRecip);
+          if (idx < 0)
+            idx = 0;
+          else if (idx > 255)
+            idx = 255;
+          ++total;
+          // Decision predicate matches the occupancy lattice exactly
+          // (UpdateMinMaxTexture/ComputeMinMaxGPU: opacityTable[i] > 0.0), so
+          // dense fires exactly when the lattice is too full for leaps to pay.
+          if (opacityTable[idx] > 0.0)
+            ++opaque;
+          if (opacityTable[idx] > 0.01)
+            ++opaque01;
+          if (opacityTable[idx] > 0.02)
+            ++opaque02;
+        }
+      }
+    }
+  }
+
+  const double frac = (total > 0) ? (static_cast<double>(opaque) / total) : 0.0;
+  const bool dense = (total > 0) && (frac > 0.55);
+
+  this->CachedDenseBypass = dense;
+  this->DenseBypassCacheValid = true;
+  this->LastDenseInputMTime = inMT;
+  this->LastDenseScalarsMTime = scMT;
+  this->LastDenseOpacityMTime = opMT;
+  this->LastDenseScalarRange[0] = this->ScalarRange[0];
+  this->LastDenseScalarRange[1] = this->ScalarRange[1];
+  this->LastDenseDims[0] = dx;
+  this->LastDenseDims[1] = dy;
+  this->LastDenseDims[2] = dz;
+
+  if (std::getenv("VTK_METAL_TEST_MARCH_DEBUG"))
+  {
+    fprintf(stderr, "[dense] opaque=%ld/%ld frac=%.3f step=%d -> %s "
+      "(>0.01:%ld %.3f />0.02:%ld %.3f)\n",
+      opaque, total, frac, step, dense ? "DENSE" : "sparse",
+      opaque01, (total > 0) ? (static_cast<double>(opaque01) / total) : 0.0,
+      opaque02, (total > 0) ? (static_cast<double>(opaque02) / total) : 0.0);
+  }
+  return dense;
 }
 
 //------------------------------------------------------------------------------
@@ -7761,10 +7985,11 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
       // with a uniform-supplied saturation exit must not share with the
       // legacy-latch ones.
       ((VolumeExitTheta() > 0.0f) ? 64u : 0u) |
-      // §17 SD4 fixed overhead specializations: depth/cameraInside/dense bypass + volume nearest coarse + quadGrad
+      // §17 dense bypass + volume nearest coarse + quadGrad; dense is §27.1
+      // auto (volume occupancy) with VTK_METAL_TEST_DENSE as force override.
       ((std::getenv("VTK_METAL_TEST_DEPTH") != nullptr) ? (1u<<16) : 0u) |
       ((std::getenv("VTK_METAL_TEST_CAMERA_INSIDE") != nullptr) ? (1u<<17) : 0u) |
-      ((std::getenv("VTK_METAL_TEST_DENSE") != nullptr) ? (1u<<18) : 0u) |
+      ((this->GetDenseBypassActive()) ? (1u<<18) : 0u) |
       ((std::getenv("VTK_METAL_TEST_VOLUME_NEAREST") != nullptr) ? (1u<<19) : 0u) |
       ((std::getenv("VTK_METAL_TEST_QUAD_GRAD") != nullptr) ? (1u<<20) : 0u) |
       // w1-lean preamble decoupled from dispatch width (§26.10)
@@ -7979,12 +8204,13 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     [constants setConstantValue:&fineSD type:MTLDataTypeBool withName:@"fc_fineSD"];
     BOOL gradNearest = (std::getenv("VTK_METAL_TEST_GRAD_NEAREST") != nullptr) ? YES : NO;
     [constants setConstantValue:&gradNearest type:MTLDataTypeBool withName:@"fc_gradNearest"];
-    // §17 SD4 fixed overhead specializations: depth/cameraInside dead-strip, dense coarse bypass, volume nearest coarse
+    // §17 specializations: depth/cameraInside dead-strip, §27.1 auto-dense
+    // bypass (all SD), volume nearest coarse
     BOOL useDepthTexture = (std::getenv("VTK_METAL_TEST_DEPTH") != nullptr) ? YES : NO;
     [constants setConstantValue:&useDepthTexture type:MTLDataTypeBool withName:@"fc_useDepthTexture"];
     BOOL useCameraInside = (std::getenv("VTK_METAL_TEST_CAMERA_INSIDE") != nullptr) ? YES : NO;
     [constants setConstantValue:&useCameraInside type:MTLDataTypeBool withName:@"fc_useCameraInside"];
-    BOOL dense = (std::getenv("VTK_METAL_TEST_DENSE") != nullptr) ? YES : NO;
+    BOOL dense = this->GetDenseBypassActive() ? YES : NO;
     [constants setConstantValue:&dense type:MTLDataTypeBool withName:@"fc_dense"];
     BOOL volumeNearestCoarse = (std::getenv("VTK_METAL_TEST_VOLUME_NEAREST") != nullptr) ? YES : NO;
     [constants setConstantValue:&volumeNearestCoarse type:MTLDataTypeBool withName:@"fc_volumeNearestCoarse"];
@@ -8657,6 +8883,12 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
       this->ComponentScalarRange[c][1] = 1.0;
     }
   }
+
+  // §27.1 auto-dense: classify volume occupancy here (before volume-upload
+  // pre-warm and SetupPipeline) so the fc_dense PSO key (1<<18) is stable
+  // for this frame's TF + data. Cached on MTimes, so steady-state cost is
+  // a few integer compares per frame.
+  this->ComputeDenseBypass(vol, input, scalars);
 
   // Phase 5: GPU-accelerated min-max generation.
   // For single-block volumes with UseGPUMinMax, we must upload the volume
