@@ -1501,6 +1501,20 @@ static int VolumeDenseEnvOverride()
 }
 
 
+// §29 W1PRE-to-default (was opt-in §26.10): the w1-lean preamble is ON by
+// default at coarse SD (shader gate `fc_w1preamble && !fc_fineSD` keeps fine
+// on the warp/block/super walk). `VTK_METAL_TEST_W1PRE=0` opts back out to
+// the legacy 48-walk preamble; any other value (incl. bare presence) keeps
+// the new default ON.
+static bool VolumeW1PreambleWanted()
+{
+  const char* e = std::getenv("VTK_METAL_TEST_W1PRE");
+  if (!e || e[0] == '\0')
+    return true;
+  return std::atoi(e) != 0;
+}
+
+
 // §38.18.1: purge request via VTK_METAL_TEST_PURGE=1 (also accepts
 // VTK_METAL_TEST_METAL_PURGE for foragability). Returns true once per
 // GPURender when the flag is set so PurgeCaches can be triggered without
@@ -7992,8 +8006,9 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
       ((this->GetDenseBypassActive()) ? (1u<<18) : 0u) |
       ((std::getenv("VTK_METAL_TEST_VOLUME_NEAREST") != nullptr) ? (1u<<19) : 0u) |
       ((std::getenv("VTK_METAL_TEST_QUAD_GRAD") != nullptr) ? (1u<<20) : 0u) |
-      // w1-lean preamble decoupled from dispatch width (§26.10)
-      ((std::getenv("VTK_METAL_TEST_W1PRE") != nullptr) ? (1u<<21) : 0u) |
+      // w1-lean preamble decoupled from dispatch width (§26.10, default-ON §29;
+      // VTK_METAL_TEST_W1PRE=0 opts out)
+      (VolumeW1PreambleWanted() ? (1u<<21) : 0u) |
       // Fragment compile-time batch specialization — encode width in
       // featureMaskExtra bits [10:15] so each compile-time width gets its
       // own PSO (occupancy probe for register pressure).
@@ -8216,7 +8231,7 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     [constants setConstantValue:&volumeNearestCoarse type:MTLDataTypeBool withName:@"fc_volumeNearestCoarse"];
     BOOL quadGrad = (std::getenv("VTK_METAL_TEST_QUAD_GRAD") != nullptr) ? YES : NO;
     [constants setConstantValue:&quadGrad type:MTLDataTypeBool withName:@"fc_quadGrad"];
-    BOOL w1preamble = (std::getenv("VTK_METAL_TEST_W1PRE") != nullptr) ? YES : NO;
+    BOOL w1preamble = VolumeW1PreambleWanted() ? YES : NO;
     [constants setConstantValue:&w1preamble type:MTLDataTypeBool withName:@"fc_w1preamble"];
 
     // §38.15/38.16 block-summary tap bisects (fc_mmNoTap / fc_mmRead).

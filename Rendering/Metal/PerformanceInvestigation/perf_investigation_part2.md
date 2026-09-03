@@ -1254,3 +1254,21 @@ Classify: NIFTI 95.6% DENSE, DICOM 2.2% sparse
 
 `§27.1` status after this: `#1` landed (this section); `#2` `W1PRE`-to-default and `#3` `GRAD_NEAREST` unchanged, still pending `4096` + app-`TF` validation (now joined by auto-dense app-`TF` validation, esp. `SkinOnBlue`-class dense-`TF`/sparse-volume shapes).
 
+---
+
+## 29. `W1PRE` to default, coarse-gated (2026-09-03, `§27.1 #2` done)
+
+Flip of the `§26.10` opt-in: `VolumeW1PreambleWanted()` (`vtkMetalGPUVolumeRayCastMapper.mm`) defaults `fc_w1preamble` ON, `VTK_METAL_TEST_W1PRE=0` opts back out to the legacy 48-walk preamble (bare presence keeps ON, same migration as `DENSE` in `§28`). Shader gate untouched (`fc_w1preamble && !fc_fineSD`, `:6054`), so fine stays on the warp/block/super walk by construction. Only files touched: mapper key/`fc` sites + one shader comment line — no march math changed, visual-output-neutral by design.
+
+Interaction with `§28` auto-dense, measured: `NIFTI` is auto-dense (`useMinMax=false`), so the preamble branch is unreachable there and `W1PRE` is moot — the `§26.11` `W1PRE`-dense-gating idea (`|| fc_dense`) dissolves as a no-op by construction (`fc_dense=true` ⇒ branch skipped; `false` ⇒ the disjunct adds nothing). Nothing further to implement on that thread. `W1PRE`'s remaining beneficiaries are sparse-coarse volumes.
+
+```
+DICOM 1024 SD4 ABBA 15f/5w DEF vs W1PRE=0: 5.92/6.02 vs 9.17/8.15 -31% | SD0.5: 14.24/14.21 vs 14.15/14.39 tie +0.3% (gate holds)
+DICOM 2048 SD4: 10.74 vs 13.16 -18% | 4096 SD4: 27.77 vs 33.95 -18% | axis-x: 5.79 vs 5.89 tie | axis-z: 8.67 vs 10.17 -15%
+NIFTI neutral everywhere (preamble moot under bypass): 1024 SD4 ABBA tie -1.2% order-swapped, SD0.5 -2.3% tie | 2048 ABBA 9.25 vs 9.10 tie +1.7% | 4096 28.81 vs 28.52 tie +1.0% | axis-x ABBAx3 3.12 vs 3.11 tie (earlier 2.81 single was a legacy-arm fast outlier, same resolution as the §26.10 axy scare)
+Presets on DICOM (app-TF validation): SkinOnBlue 5.53 vs 6.17 -10% class sparse-11.9% | DarkBone 3.51 vs 4.24 -17% class sparse-15.8% — dense TFs on sparse volume stay sparse, the §27.1 metric requirement holds on app TFs
+Parity 512 thr-exact: VRC 1150/0.182, DICOM 1122/0.000, NIFTI 2999/0.000 (== §28 pre-flip to 4 decimals) | DICOM SD0.5 DEF-vs-legacy metal-metal max 0 (bit-identical, gate proven) | presets thr 0.000 both arms, inter-arm sub-threshold only (mean 0.006 max 4-6LSB <0.7%px, accepted fp-landing class)
+```
+
+`§27.1` status after this: `#1` ✅, `#2` ✅, `#3` `GRAD_NEAREST` open but visual-altering (`thr 0.000→~1.9`, spends the thr budget) — deliberately not taken on this visual-neutral pass.
+

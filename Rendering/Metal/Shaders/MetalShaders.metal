@@ -6054,7 +6054,7 @@ inline half4 marchVolumeUnified(
           if (fc_fragBatch==1 || (fc_w1preamble && !fc_fineSD))
           {
             // w1 lean: per-cell walk only, no warp/super/block state (incremental mmPos)
-            // (fc_w1preamble gated to coarse: at fine the per-cell crawl loses
+            // (default-ON §29, gated to coarse: at fine the per-cell crawl loses
             // block leaps, +120% DICOM SD0.5; forced w1 stays ungated)
             int w = 0;
             const int extent = min(48, steps - i);
