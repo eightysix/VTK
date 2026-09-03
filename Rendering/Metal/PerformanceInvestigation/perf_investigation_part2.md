@@ -1330,3 +1330,5 @@ Parity 512: NIFTI 2999.400/0.000 identical to pre-fix, SD0.5 0.031 keep (probe a
 
 `§27.1` ledger closed: `#1` ✅ `#2` ✅, `#3` altering (out). `mv9`-default flip (`§31`) now has no known perf cost anywhere measured — sole remaining items on that decision are the sub-threshold pixel shifts, `iOS` data, and unmeasured paths.
 
+Other-paths survey (gate stays `LOOP`-form only): baseline loop (`:5189`) and per-sample fallthrough (`:7404`/`:7482`, variants `0-5`) break per-sample (overshoot ≤1); pasted `MV9_COMPOSITE` (`:5588`, coarse-2 + tails) overshoots ≤1-2; variant-8 region (`:6804`) and batch-8 consume serve unshaded/harness-only variants (`6/7/8`). The rolled `16/8` rungs are the only place batching + full shading + early saturation coincide, so the only place the gate pays. No cross-path consistency action either: the output contract is per-config vs `GL` (all hold), and pixel-identity across paths was never a property (caps already differ by path).
+
