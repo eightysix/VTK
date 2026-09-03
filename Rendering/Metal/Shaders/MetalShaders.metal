@@ -5923,16 +5923,17 @@ inline half4 marchVolumeUnified(
       // batches (32) with 6-fetch gradient + pow spill registers and hurt
       // short chords (41 steps SD4, 200 SD0.5) while long sparse DICOM
       // benefits. fc_shading/fc_gradientOpacity pipelines get a narrower
-      // compile-time cap (shade 8 for fine SD<1.5, 2 for coarse) so the
-      // compiler sheds 8/16/32/48 rungs and occupancy rises (37% -> 56%+
-      // class). Static per-PSO, not per-ray adaptive. After TF cull 0.02h
-      // 2026-08-29 re-sweep: NIFTI SD0.5 best f8 (9.22 vs 9.91 f4, 3.21 vs 3.76 y),
-      // SD4 best f2/def (6.90 vs 7.08 f1) — cull saves 30% shade work so fine
-      // long rays now prefer even wider 8 vs pre-cull 4. Lean keeps 16.
-      const int shadeCap = fc_fineSD ? 8 : 2;
+      // compile-time cap (shade 16 for fine SD<1.5, 2 for coarse; lean 16
+      // fine, 8 coarse) so the compiler sheds unused rungs and occupancy
+      // rises (37% -> 56%+ class). Static per-PSO, not per-ray adaptive.
+      // 2026-09-03 re-sweep with rolled 8/16 loops: fine shade f16 -4.4%
+      // vs f8 ABBA (was tie pre-roll), lean coarse f8 -11.6% vs f16 ABBA;
+      // coarse shade keeps 2 (f4/f8 +1.5%), lean fine keeps 16 (-13% vs 8).
+      const int shadeCap = fc_fineSD ? 16 : 2;
+      const int leanCap = fc_fineSD ? 16 : 8;
       const int batchCap = (fc_fragBatch > 0) ? fc_fragBatch
                        : ((fc_shading || fc_gradientOpacity) ? min(shadeCap, max(1, int(volumeUniforms.maxBatchWidth)))
-                                     : min(16, max(1, int(volumeUniforms.maxBatchWidth))));
+                                     : min(leanCap, max(1, int(volumeUniforms.maxBatchWidth))));
       // Block-summary cache (fc_mmBlocks): persists across batches — position
       // advances only along the ray, so a block-index compare detects every
       // change. State: 0 mixed (per-cell work), 1 all-empty (leap), 2

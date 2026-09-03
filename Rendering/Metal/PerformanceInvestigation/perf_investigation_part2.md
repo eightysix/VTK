@@ -1163,3 +1163,25 @@ Bigger win at `2048` than `1024` fits `I$` contention scaling with thread count.
 
 **Coarse `2`-cap re-check — keep it (`ABBA`, cool):** `1024 SD4 DEF(2) 6.99 F1 6.71 -4.0% F2 6.97 -0.3% F4 7.11 +1.7% F8 7.09 +1.4%`; `2048 SD4 DEF 10.26 F1 9.92 -3.3% F4 10.25 tie`. Widening never wins — the narrow cap stays as the upper bound. The `F1` signal is a *preamble* effect, not width: forced-`F1` takes the `w1`-lean preamble (`fc_fragBatch==1`, no warp/block/super consults) while a hypothetical `cap-1` default would keep the `48`-walk preamble with `1`-dispatch — an unmeasured combo, so do not conflate into a cap change. Follow-up if wanted: decouple preamble selection from dispatch width (`w1`-preamble + `2`-dispatch).
 
+### 26.8 Full width re-sweep with rolled loops — single cap dead, splits move (2026-09-03)
+
+Past "big loss" verdicts predate rolled loops (one already flipped: fine-16 `+18%`→tie). Full forced sweep, current tree (`20f/5w @1024`, cool):
+
+```
+NIFTI 1024 SD4:  F1 6.73 F2 6.81 F4 6.97 F8 7.02 F16 7.03 (monotonic widening penalty)
+NIFTI 1024 SD0.5: F1 11.25 F2 11.19 F4 9.64 F8 9.52 F16 9.11 (F16 best, -4.3% vs F8)
+NIFTI 2048 SD4:  F2 10.17 F8 9.98 -1.9% F16 10.31 +1.4% (flat ±2%)
+NIFTI 2048 SD0.5: F2 30.58 F8 23.04 F16 21.78 -5.5% (F16 ran warmest — conservative)
+DICOM 1024 SD4: F8 8.87 vs F16 9.99 / ABBA F8 8.59 vs F16 9.72 -11.6% (lean-8 wins coarse)
+DICOM 1024 SD0.5: F8 17.05 vs F16 14.76 (F16 ran warmer — solid; lean-16 wins fine)
+DICOM 2048 SD4:  F8 14.02 vs F16 14.50 +3.4% (F8 cooler — weak, ABBA not repeated)
+```
+
+No single cap is within `2-3%` everywhere (coarse wants `1-2`, fine wants `16`; lean splits the same way) — **unification fails its own bar**, past verdicts reproduce. But both splits move: **`shadeCap 8:2 → 16:2`** (`F16 -4.4% ABBA` at fine, coarse keeps `2`) and **lean flat-`16` → `16:8`** (`F8 -11.6% ABBA` at coarse, fine keeps `16`). Landed (`:5932-5935`); per-`PSO` fold keeps the `I$` diet (coarse-lean sheds `16/32/48`, fine-shade sheds `32/48`).
+
+```
+After (defaults): NIFTI 1024 SD0.5 DEF(16) 9.25/8.74/9.04 avg 9.01 (vs forced-F16 8.90 tie, vs old DEF(8) 9.31 -3.2%)
+                  DICOM 1024 SD4 DEF(8) 8.64/8.32/8.73 avg 8.56 (vs forced-F8 8.59 tie, vs old DEF(16) ~9.72 -12%)
+                  NIFTI SD4 DEF 7.04 keep, DICOM SD0.5 DEF 14.96 keep (lean-16 path), parity byte-max 0
+```
+
