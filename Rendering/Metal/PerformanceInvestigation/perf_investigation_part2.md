@@ -1132,3 +1132,17 @@ DICOM 1024 SD4 F16 10.63 -> 10.08 -5% (half carry); F8 9.27 -> 9.04 tie; SD0.5 D
 
 Absolutes run `~+5%` (short runs) to `+8-14%` (long fine runs: `NIFTI 2048 SD0.5 27.44 vs 25.82`, `4096 95.42 vs 87.24`) over doc after `~150` back-to-back benches; ratios/percentages reproduce exactly. To rule out a real regression hiding in the offset, `§26.6` rechecks key cells on a cold machine at `3293a9a14a` vs this commit.
 
+### 26.6 Cold-machine recheck — no regression, `F16` win confirmed (2026-09-03)
+
+Checked out `3293a9a14a`, rebuilt (`~8min` cooldown), benched cool; back to this commit, rebuilt, benched cool before heat buildup. Same protocol `20f/5w @1024` `15f/5w @2048`:
+
+```
+cell                  doc    old-cool  HEAD-cool  HEAD-hot   verdict
+NIFTI 1024 SD0.5 DEF  9.26   9.43      9.47       10.0-10.1  +0.4% identical (untouched path)
+NIFTI 1024 SD0.5 F16  10.98  11.05     9.35       9.88       -15.4% win, bigger cold
+NIFTI 2048 SD0.5 DEF  25.82  25.86     25.47      27.4-27.8  -1.5% neutral
+DICOM obl 1024 PROD   9.86   9.69      9.51       10.36      -1.9% neutral
+```
+
+Old-cool reproduces doc to `<1%` (`Skin OFF 69.40 vs 69.34`, `ON 29.52 vs 30.41` likewise) — machine/harness/protocol chain validated, so the earlier `+6-8%` is quantified sustained-bench throttling, not code. `DEF` neutrality holds cold; `F16` win is thermal-proof (beats old-cool even warm). Bonus findings from the checkout: blocks default-ON already works at `3293a9a14a` (`Airways 2048 SD0.5` unset≈ON `36.06/35.99`, OFF `95.13`) — plain cell-walk never leapt at fine in either era, and doc's `14.13/14.08` matches neither, corroborating `§26.4` mislabel verdict.
+
