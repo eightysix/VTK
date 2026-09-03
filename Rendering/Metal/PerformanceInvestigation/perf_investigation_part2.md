@@ -1316,3 +1316,17 @@ Safety verdict: flip recommended but not taken. For: code intent (`TEMP-REPRO: 0
 
 `TEMP`-probe (reverted; note `//` comments are illegal inside the `MV9_*` macro bodies — first attempt broke the ladder `#define`, `1500ms` garbage): gate the rolled-loop shade-compute on the `ADVANCE` condition (`accumulatedOpacity <= kExitAcc`, one-line, `LOOP`-form only, falls through to the existing ambient path, damped weights so `thr`-class by construction). `NIFTI`-fine `8.70/7.94 avg 8.32` vs unmodified `8.30/8.54/8.78 avg 8.54` (`-2.6%`, variance-dominated — consistent, unproven), parity `0.031` vs `0.035` keep, metal-metal `max1`, `DICOM` inert (`5.91`, `14.55`, gate never fires on unsaturated rays). Proof needs a same-binary env-gated `A/B`; per-sample `break` instead is not recommended (reintroduces the `SIMT` desync `§4.2` latched away) and narrower batches already lost (`§26.8` `F16 -4.4%` vs `F8`). Landing shape, if wanted: the one-line gate + full matrix (presets/views/`4096`) + `iOS` check.
 
+---
+
+## 33. Saturation-overshoot shade gate landed (2026-09-03, `§32` fix)
+
+One-line gate in `MV9_COMPOSITE_LOOP`'s shade guard (`:5885`, rolled `16/8` rungs only — pasted coarse rungs overshoot ≤1 sample, nothing to gain): `opa > 0.02h` now also requires `accumulatedOpacity <= kExitAcc` (the `ADVANCE` exit condition), with an `|| fc_exitTheta` carve-out so the investigation knob keeps legacy behavior at zero default-path cost. Post-saturation overshoot samples fall to the existing ambient path; their accumulation stays damped by `w=(1-acc)`, so `thr`-class by construction (`kExitAcc = 1-1/255` default).
+
+```
+NIFTI SD0.5 1024: 8.09/8.11/7.65 avg 7.95 vs pre-fix 8.30/8.54/8.78 avg 8.54 -6.9%, distributions non-overlapping (fix max 8.11 < baseline min 8.30); now beats mv0 (8.12-8.41) too — the §31 +4% is removed with margin
+NIFTI SD4: 7.55/6.61 neutral (pasted form untouched) | DICOM SD4 6.03/6.07 tie | DICOM SD0.5 14.44/14.21 tie (gate inert on unsaturated rays)
+Parity 512: NIFTI 2999.400/0.000 identical to pre-fix, SD0.5 0.031 keep (probe agreed to 3 decimals) | DICOM 0.000/0.000 | VRC 0.182 exact | presets byte-identical to §29 (SkinOnBlue 1590.735, DarkBone 1618.545) | all blends 0.000 (MinIP 0.295, Avg 718, Add 364, MIP 1283)
+```
+
+`§27.1` ledger closed: `#1` ✅ `#2` ✅, `#3` altering (out). `mv9`-default flip (`§31`) now has no known perf cost anywhere measured — sole remaining items on that decision are the sub-threshold pixel shifts, `iOS` data, and unmeasured paths.
+

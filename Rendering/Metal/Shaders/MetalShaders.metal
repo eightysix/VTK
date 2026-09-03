@@ -5882,7 +5882,7 @@ inline half4 marchVolumeUnified(
         } \
       } \
       if (!skip && fc_shading) { \
-        if (opa > 0.02h && maskLabel == 0.0h) { \
+        if (opa > 0.02h && maskLabel == 0.0h && (accumulatedOpacity <= kExitAcc || fc_exitTheta)) { \
           half3 n; \
           if (fc_normalTexture) { \
             half4 ns = half4(normalTexture.sample(sVolume, rPosC, level(0))); \
