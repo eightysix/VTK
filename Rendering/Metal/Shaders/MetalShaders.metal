@@ -6538,6 +6538,9 @@ inline half4 marchVolumeUnified(
           }
         } else {
           // coarse SD4: only 2 and 1, dead-strip 48/32/16/8/4 rungs for I$ and registers, thr0
+          // NOTE (2026-09-03): rolled-loop version tried here regressed +10%
+          // (tiny body: the trip-2 loop unrolls anyway, leaving only the
+          // sBuf round-trip as pure overhead) — keep pastes.
           if (batchCap >= 2 && i + 2 <= steps)
           {
             MV9_FETCH(0)

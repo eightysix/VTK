@@ -1179,6 +1179,8 @@ DICOM 2048 SD4:  F8 14.02 vs F16 14.50 +3.4% (F8 cooler — weak, ABBA not repea
 
 No single cap is within `2-3%` everywhere (coarse wants `1-2`, fine wants `16`; lean splits the same way) — **unification fails its own bar**, past verdicts reproduce. But both splits move: **`shadeCap 8:2 → 16:2`** (`F16 -4.4% ABBA` at fine, coarse keeps `2`) and **lean flat-`16` → `16:8`** (`F8 -11.6% ABBA` at coarse, fine keeps `16`). Landed (`:5932-5935`); per-`PSO` fold keeps the `I$` diet (coarse-lean sheds `16/32/48`, fine-shade sheds `32/48`).
 
+**Rolled 2-rung tried and reverted (`+8-10%`):** same recipe on the coarse-shade 2-rung regressed `7.08→7.66 ABBA` (restored on revert, same hot machine). Theory: below some body×trip size the trip-2 loop unrolls anyway, leaving only the `sBuf` round-trip as pure overhead — the decay curve (`16: -15%`, `8: -4-12%`, `2: +10%`) is non-monotonic. `2` stays pasted (noted in situ `:6540`).
+
 ```
 After (defaults): NIFTI 1024 SD0.5 DEF(16) 9.25/8.74/9.04 avg 9.01 (vs forced-F16 8.90 tie, vs old DEF(8) 9.31 -3.2%)
                   DICOM 1024 SD4 DEF(8) 8.64/8.32/8.73 avg 8.56 (vs forced-F8 8.59 tie, vs old DEF(16) ~9.72 -12%)
