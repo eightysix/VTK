@@ -1087,3 +1087,48 @@ eval "env $BASE VTK_METAL_TEST_MARCH_VARIANT=0 $BIN --scene DICOMVolume --dicom 
 python3 -c "from PIL import Image;import numpy as np,pathlib;a=np.array(Image.open(list(pathlib.Path('/tmp/p_w1').glob('*.metal.png'))[0])).astype(int);b=np.array(Image.open(list(pathlib.Path('/tmp/p_v0').glob('*.metal.png'))[0])).astype(int);d=np.abs(a-b);print(f'mean {d.mean():.6f} max {d.max()} >0 {100*(d>0).mean():.4f}% >1 {100*(d>1).mean():.4f}%')"
 # expect mean ~0.015 max4 >0 ~1.5% >1 ~0.02% thr0
 ```
+
+---
+
+## 26. Wide-width revival — rolled 16-composite loop + `half` scalars + `§22` retest (2026-09-03, `metal-cleanup-1`)
+
+Goal: make `16`-wide viable at fine (`§7` `f16 1.14 FAIL`, `§22` `9.26 vs 10.98 +18%`), zero byte delta. All numbers `arm64 Release` `M2` `BASE` as `§1` + `MARCH_VARIANT=9`, `20f/5w @1024` `15f/5w @2048` `eval`, vs same-protocol `ABBA` (thermal-proof); absolutes carry `~+5%` warm offset — see `§26.5`.
+
+### 26.1 Changes (`Rendering/Metal/Shaders/MetalShaders.metal`, `+329/-17`, all byte-verified `max0`)
+
+1. **`half s##_j` (`MV9_FETCH:5312`).** Audit: sole use is `:5424 `half(s_j)*scalarScale+scalarBias`` with scale/bias already `half` (`:4321-4322`), so `half(half(x))==half(x)` — narrowing the 16-wide scalar carry `64B→32B` is bit-exact. Alone `~0` (kept as enabler, 1 word). All other `float`s load-bearing (texture coords, accumulators).
+2. **`MV9_COMPOSITE_LOOP(mvk)` (`:5610`) + shade-gated 16-rung (`:6431`).** The 16-rung pasted the `~300`-line composite body 16× (`f8 +0% f16 +15% f32 +38%` superlinear = `I$`). New macro is the de-suffixed body (`##_j`→plain, `(float)_j`→`(float)(mvk)`, `s##_j`→`sBuf[mvk]`; script-verified, no `return`/`goto`/`break` inside); rung keeps batched `FETCH(0..15)` (issue overlap) then `#pragma unroll 1 for(mvk<16)` loop. `if(fc_shading||fc_gradientOpacity)` selects loop vs original pastes per-`PSO` — shade gets `I$`, lean keeps unrolled scheduling. `AIR 1602032→1437552 -10%`, `xcrun` stays `2 warnings`.
+3. **Tried and reverted (byte-max `0` both):** block/super cache hoist above `while(i<steps)` — neutral (texture cache already dedups same-texel re-fetch); fetch+composite interleave in 16-rung — `-18-25%` (kills fetch-issue overlap, `§v39` was right). Default-vs-forced-`f2` gap investigated by `ABBA` — not real (`7.37` vs `7.41`, earlier `6.78` outlier).
+
+Byte-identity argument: identical IEEE ops in identical per-sample order (`0→15`), fetches side-effect-free, no early exits inside body, loop-carried state (`accumulated*`, MIP, `firstOpaquePos`) updated in same sequence.
+
+### 26.2 Parity — zero delta everywhere
+
+```
+NIFTI 512 SD4 2999 thr 0.000 byte-max 0 vs pre-change; SD0.5 4158 thr 0.035 (= baseline .034)
+NIFTI 512 SD0.5 forced-f16 4155 thr 0.035 keep; DICOM 512 y 1122 thr 0.000 keep
+```
+
+### 26.3 Perf — `F16` revived, `DEF` neutral, DICOM records
+
+```
+1024 SD0.5: F16/DEF 11.23/9.93 (+13%) -> 9.88/10.07 (-2%)  M/GL 0.54 (GL 18.27)
+2048 SD0.5: F16/DEF 31.70/27.71 (+14%) -> 25.75/27.46 (-6%) M/GL 0.49 (GL 53.05)
+NIFTI SD4 DEF 7.37 = exact pre-change mean (coarse-shade 2/1 rungs untouched)
+DICOM 1024 SD4 F16 10.63 -> 10.08 -5% (half carry); F8 9.27 -> 9.04 tie; SD0.5 DEF/F16 16.26/16.45 +1.2% (normal §21 pattern)
+```
+
+`§7`'s `1.14 FAIL` is gone at `1024` (`0.98×DEF`); `§22` `9.26 vs 10.98` verdict superseded — `16`-wide now ties-or-beats `8` at fine.
+
+### 26.4 `§22` retest — reproductions and errata (`~150` runs, current tree)
+
+- **SD/MINMAX table ran `mv0`, not `mv9`.** Its `BASE` (`§19.3:860`) has no `MARCH_VARIANT`; mapper default is `0` (`mm:380-384`). SD4 cells accidentally valid (`mv0≈mv9` coarse); SD0.5 cells `~2×` stale (fine-step gap). True `mv9` (default view): `1024 RAW X 14.51/28.17 MM X 10.02/14.97`, `2048 RAW X 22.80/59.05 MM X 15.35/39.23`; `mv0` spot-check `2048 SD0.5 RAW X 109.96` (doc-implied `151.82`, residual likely their-session thermal).
+- **Airways SD0.5 MM rows (`9.63`/`14.13`) are SD4 duplicates** (`9.64`/`14.11` pairs — `5×` steps at identical ms impossible; `§19.3`-class env bug). First real numbers: blocks-0 `108.42` (plain cell-walk yields ~nothing at fine) vs blocks-on `39.8` (`2.7×`). "Airways tie, keep `NO` default" is unsupported.
+- **Blocks are default-ON** (`VolumeMinMaxBlocksWanted mm:1408-1416` returns true, fine-gate removed) — opt-in framing obsolete, SkinOnBlue `-52-56%` win is the default. `DOLLY 1.5-3.0` reproduces exactly (`-56/-54/-49/-41%` vs `-55/-52/-49/-41%`); `=0` is the true off (`Skin 77.54` ≈ doc `69.34` warm).
+- **Bisection reproduces** (`DENSE +49/+50%` vs `+46/+48%`, `FRAG16` tie `+1.4% ABBA`, `YTIE` direction); **NIFTI on/off reproduces** except `FRAG16`-fine fixed above; `DENSE`-coarse same direction (`-7%/-10%` vs `-7.6%/-16.9%`).
+- **26-view uniform reproduces at SD4 exactly** (`X 9.60/geo 9.22 vs Y 8.90/8.55, 20/26 -7.3%` vs doc `9.59/9.17 vs 8.86/8.52, 19/26 -7.6%`); doc's SD0.5 row is the SD4 duplicate (fake tie) — genuine SD0.5: `X 13.82 vs Y 12.96, 20/26 -6.2%`. `Y wins ~7%` holds at both `SD`.
+
+### 26.5 Thermal note (checkout recheck pending)
+
+Absolutes run `~+5%` (short runs) to `+8-14%` (long fine runs: `NIFTI 2048 SD0.5 27.44 vs 25.82`, `4096 95.42 vs 87.24`) over doc after `~150` back-to-back benches; ratios/percentages reproduce exactly. To rule out a real regression hiding in the offset, `§26.6` rechecks key cells on a cold machine at `3293a9a14a` vs this commit.
+
