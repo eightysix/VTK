@@ -1272,3 +1272,21 @@ Parity 512 thr-exact: VRC 1150/0.182, DICOM 1122/0.000, NIFTI 2999/0.000 (== §2
 
 `§27.1` status after this: `#1` ✅, `#2` ✅, `#3` `GRAD_NEAREST` open but visual-altering (`thr 0.000→~1.9`, spends the thr budget) — deliberately not taken on this visual-neutral pass.
 
+---
+
+## 30. Output-neutral audit — nothing left with positive expectation (2026-09-03)
+
+Survey of every open/sketched thread against the visual-neutral constraint (`byte-max 0` or `thr`-exact, no new validation debt):
+
+- `GRAD_NEAREST` (`§27.1 #3`): spends `thr` by design. Out.
+- `TF`-cull `0.02h` (`§13.3`): alters shaded samples by construction (never re-measured post-`§14` seam fix, needs full ABBA). Closest near-neutral item if the constraint ever relaxes to a `thr` budget — not taken here.
+- `FRAG_BATCH=16` default (`§39.7`): dead on mechanism, no probe needed. Forcing `16` overrides the landed `shade 16:2` / `lean 16:8` splits (`:5941`), and the `§26.9` `MINMAX=0` ablation proved the lean-coarse `+11.6%` gap is skip-resolution, "no code shape recovers it" — the `I$`/register diet `frag16` buys is already captured per-`PSO` by the splits. Would regress lean-coarse structurally.
+- Viewport-aware batch (`§23.1#1`): cap-class `thr` effects on a `§27.2`-closed thread. Out.
+- `DEPTH`/`CAMERA_INSIDE` default: misunderstanding — `fc=false` already dead-strips both blocks; the envs *enable* correctness paths. Zero win available.
+- Quad-grad / precomp / pow-LUT / `GRAD4`-coarse / `VOLUME_NEAREST` / `MM_EPS` / exit-theta / interleave / mid-batch-exit / extent-`96` / remaining `half` audit: altering or refuted per `§27.2`/`§9-11`. Out.
+- Supers / `segHop`: parity unknown, investigation-only. Not output-neutral-proven.
+- Coverage gap observed (not recommended): `fragment_volume_fullscreen_main`, both selection entries march the raw `marchVolume` (`:7706`, no `useMinMax`/caps/preamble) while main/fullscreen-`RTT` share `marchVolumeUnified` — every landed opt covers all measured paths. Selection is likely intentionally raw (picking-id exactness vs the `±1`-step landing class); fullscreen camera-inside is rare and unmeasured. Porting either is a project with parity risk, not a quick win.
+- One-times (`[dense]` recompute, `PSO` pre-warm): no steady-state effect.
+
+Verdict: the `0`-degradation tier is exhausted (`§10` said the same pre-cleanup; `§28`+`§29` landed its last two items). Next wins live behind `thr` budget (`GRAD_NEAREST`, `TF`-cull) or new investigations.
+
