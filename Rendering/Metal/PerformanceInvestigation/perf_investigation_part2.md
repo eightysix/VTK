@@ -1120,6 +1120,8 @@ DICOM 1024 SD4 F16 10.63 -> 10.08 -5% (half carry); F8 9.27 -> 9.04 tie; SD0.5 D
 
 `§7`'s `1.14 FAIL` is gone at `1024` (`0.98×DEF`); `§22` `9.26 vs 10.98` verdict superseded — `16`-wide now ties-or-beats `8` at fine.
 
+**32/48 re-check (current tree, pasted rungs + `half` scalars):** still catastrophically slower — `NIFTI 1024 SD0.5 F8 9.35 F16 9.37 F32 17.22 +84% F48 24.04 +157%`, `2048 F16 23.62 vs F32 52.30 +121%`, `DICOM 2048 SD0.5 F16 36.59 vs F32 39.18 +7%` (same `§21` lean verdict). The `f16→f32` step (`+84-121%`) dwarfs any loop-dedup win (`-12-19%` on the smaller body), so rolling `32/48` cannot close it — caps `8:2`/`16` stand. Next: roll the `8`-rung the same way (moves `DEF` itself) + re-sweep `shadeCap`.
+
 ### 26.4 `§22` retest — reproductions and errata (`~150` runs, current tree)
 
 - **SD/MINMAX table ran `mv0`, not `mv9`.** Its `BASE` (`§19.3:860`) has no `MARCH_VARIANT`; mapper default is `0` (`mm:380-384`). SD4 cells accidentally valid (`mv0≈mv9` coarse); SD0.5 cells `~2×` stale (fine-step gap). True `mv9` (default view): `1024 RAW X 14.51/28.17 MM X 10.02/14.97`, `2048 RAW X 22.80/59.05 MM X 15.35/39.23`; `mv0` spot-check `2048 SD0.5 RAW X 109.96` (doc-implied `151.82`, residual likely their-session thermal).
@@ -1145,4 +1147,17 @@ DICOM obl 1024 PROD   9.86   9.69      9.51       10.36      -1.9% neutral
 ```
 
 Old-cool reproduces doc to `<1%` (`Skin OFF 69.40 vs 69.34`, `ON 29.52 vs 30.41` likewise) — machine/harness/protocol chain validated, so the earlier `+6-8%` is quantified sustained-bench throttling, not code. `DEF` neutrality holds cold; `F16` win is thermal-proof (beats old-cool even warm). Bonus findings from the checkout: blocks default-ON already works at `3293a9a14a` (`Airways 2048 SD0.5` unset≈ON `36.06/35.99`, OFF `95.13`) — plain cell-walk never leapt at fine in either era, and doc's `14.13/14.08` matches neither, corroborating `§26.4` mislabel verdict.
+
+### 26.7 Rolled 8-rung (moves `DEF`) + `shadeCap` re-sweep — keep `8:2` (2026-09-03)
+
+Same recipe on the 8-rung (`sBuf[8]`, same `MV9_COMPOSITE_LOOP`, `fc_shading`-gated, lean keeps pastes): `AIR 1437552→1620464 +13%` pre-specialization (both variants carried; per-`PSO` folds), `xcrun 2 warnings`, parity byte-max `0` (`2999 thr 0.000`, `SD0.5 0.035`).
+
+```
+NIFTI 1024 SD0.5 (cool): DEF 9.47 -> 9.12 -3.7%, F16 9.12 tie, F8-forced 9.37 +2.7% (PSO noise, cf. §26 def-vs-f2)
+NIFTI 2048 SD0.5 (cool): DEF 25.47 -> 22.48 -11.7%, F16 22.29 tie (-0.8%)
+NIFTI 1024 SD4: DEF 6.84, forced-F8 (rolled-8 at coarse) 6.97 +1.9% noise (DEF uses 2-rung)
+DICOM 1024 (lean pastes): SD4 9.87 SD0.5 14.79 — unchanged
+```
+
+Bigger win at `2048` than `1024` fits `I$` contention scaling with thread count. Re-sweep verdict: fine `DEF(8)` vs `F16` is now a tie at both resolutions (`9.12/9.12`, `22.48/22.29`) — no basis to move the default, **`shadeCap 8:2` stays**. `F32/F48` re-confirmed dead (`+84%/+157%`, `§26.3`).
 

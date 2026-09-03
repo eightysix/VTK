@@ -6488,14 +6488,25 @@ inline half4 marchVolumeUnified(
             MV9_FETCH(5)
             MV9_FETCH(6)
             MV9_FETCH(7)
-            MV9_COMPOSITE(0)
-            MV9_COMPOSITE(1)
-            MV9_COMPOSITE(2)
-            MV9_COMPOSITE(3)
-            MV9_COMPOSITE(4)
-            MV9_COMPOSITE(5)
-            MV9_COMPOSITE(6)
-            MV9_COMPOSITE(7)
+            if (fc_shading || fc_gradientOpacity)
+            {
+              // Shaded 8-wide: same rolled-loop treatment as the 16-rung
+              // (single composite body in I$). Moves the default fine path.
+              half sBuf[8] = { s0, s1, s2, s3, s4, s5, s6, s7 };
+              #pragma unroll 1
+              for (int mvk = 0; mvk < 8; ++mvk) { MV9_COMPOSITE_LOOP(mvk) }
+            }
+            else
+            {
+              MV9_COMPOSITE(0)
+              MV9_COMPOSITE(1)
+              MV9_COMPOSITE(2)
+              MV9_COMPOSITE(3)
+              MV9_COMPOSITE(4)
+              MV9_COMPOSITE(5)
+              MV9_COMPOSITE(6)
+              MV9_COMPOSITE(7)
+            }
             MV9_ADVANCE(8)
           }
           else if (batchCap >= 4 && i + 4 <= steps)
