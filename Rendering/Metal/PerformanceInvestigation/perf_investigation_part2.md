@@ -1185,3 +1185,7 @@ After (defaults): NIFTI 1024 SD0.5 DEF(16) 9.25/8.74/9.04 avg 9.01 (vs forced-F1
                   NIFTI SD4 DEF 7.04 keep, DICOM SD0.5 DEF 14.96 keep (lean-16 path), parity byte-max 0
 ```
 
+### 26.9 Unified cap evaluated — splits are structural, not tunable (2026-09-03)
+
+Cost of unified-`16` today: shade-coarse `+1-3%` (inside a `3-4%` bar) but lean-coarse `+11.6%` (`ABBA`) — the blocker. Ablation `DICOM 1024 SD4 MINMAX=0`: `F8 7.40/7.43 vs F16 7.44/7.29` **tie** — the gap vanishes with the preamble off. So the `11.6%` is 100% skip-resolution, not registers/`I$`/scheduling (rolled-loop null + `half` results already ruled those out): `8`-wide batches re-run the skip-walk twice as often as `16`-wide, finding leaps the wide batch marches through as empty composites. Commit width *is* skip granularity — no code shape recovers it (rolled/pasted/halves all dispatch the same `N`). Unify-at-`8` is worse (lean-fine `+13%`, shade-fine `+4-5%`). Verdict: the two splits (`shade 16:2`, `lean 16:8`) are the minimal-complexity optimum; width effects now attribute cleanly — `I$` fixed by rolling, registers by `half`, skip-resolution intrinsic. Reopening unification needs mid-batch empty-exit (per-sample consults, `thr`-risk, likely negative ROI) — not recommended.
+
