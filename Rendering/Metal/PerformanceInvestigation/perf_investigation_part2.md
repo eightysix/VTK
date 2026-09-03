@@ -1213,3 +1213,27 @@ Extent `48→smaller` (as first sketched) is backwards: smaller extent re-runs w
 
 Instead, temp-edit `useMinMax = fc_minmax && !fc_dense` (reverted after; committed state keeps `&& !fc_fineSD`) to test the `:4699` claim ("fine dense keeps minMax, still benefits from leaps") for dense-fine: `NIFTI 1024 SD0.5 DENSE 9.13 -> 8.12 -11.1% ABBA`, `thr 0.035` keep. Refuted — at fine-dense the leaps never fire and `25` batches/ray of preamble is pure overhead, so full bypass beats even `W1PRE`-fine (`-1.7%`). Consequence for `§13.4`/`#2` auto-dense: cover **all** `SD`, not just coarse (projected `NIFTI SD0.5 ~9.0->~8.1` with `thr0`, on top of coarse `-7-17%`). `W1PRE`-dense-gating (`|| fc_dense`) rejected meanwhile: with manual `DENSE` it would arm `w1` for sparse-fine accidents (`+120%` class) — only safe under auto-dense.
 
+---
+
+## 27. Recommended optimization plan (2026-09-03, status of all threads)
+
+Landed this session (`metal-cleanup-1`): `half s_j`, rolled `16/8` shade loops, `shadeCap 16:2`, `leanCap 16:8`, `W1PRE` env (coarse-gated), `§22` errata (`§26.4`), cold recheck (`§26.6`). All zero-delta (byte-max `0` or `thr`-exact).
+
+### 27.1 Open, ranked
+
+1. **Auto-dense with volume-occupancy metric, all `SD`.** Manual `DENSE=1`: coarse `-7-17%`; temp all-`SD`: fine `-11.1% thr0` (`§26.11`). Design: at `TF` build, subsample volume (every 16th voxel), apply `TF` on CPU, opaque fraction → `denseMode` uniform/`fc` (mapper, `~20` lines); widen `:4700` to `!fc_dense`. Metric MUST be volume occupancy, not `TF` shape — `TF`-entry fraction misfires on `SkinOnBlue` (dense `TF`, but blocks win `-56%` on its background air). `DICOM`-safe by construction (sparse → never triggers). Unlocks `W1PRE`-dense combo as follow-up.
+2. **`W1PRE` to default (coarse).** `NIFTI -4-5%`, `DICOM -19-25%`, `Skin -9%`, fine neutral by gate, parities clean (`§26.10`). Needs: `4096` + app-`TF` validation, then flip (one-line default + remove env or keep as opt-out).
+3. **`GRAD_NEAREST` at coarse (`thr<5` tier).** `§17 -17%`, `thr 1.89`. Separate contract (spends `thr` budget `0.000→~1.9`); only if (1)+(2) land and more is wanted.
+
+### 27.2 Closed (do not reopen)
+
+- Width/cap tuning: splits `shade 16:2` / `lean 16:8` optimal within `~1%`; single cap dead (`§26.8-26.9`); `F32/F48` dead (`+84-157%`); coarse-`2` stays (`§26.7`, `F1` = preamble effect).
+- Loop structure: roll `16/8` shade (won), roll `2` (`+10%`, unroll-threshold), interleave (`-20%`, `MLP`), block-cache hoist (neutral, texture-cache), `half` audit (only `s_j` safe).
+- Preamble: extent scaling (backwards as sketched; larger `~1%` at best — skipped); mid-batch empty-exit (negative ROI); quad-grad (`thr69`), precomp (`+188%`), pow-LUT (`+21%`) per `§9-11`.
+- `§22` data errata: SD/MINMAX table ran `mv0` (SD0.5 cells `~2×` stale); Airways-SD0.5-MM rows are SD4 duplicates; MM_BLOCKS opt-in framing obsolete (blocks default-ON); 26-view SD0.5 row was SD4-duplicate, genuine `13.82/12.96 Y -6.2%` (`§26.4`).
+
+### 27.3 Hygiene debt
+
+- `MV9_COMPOSITE_LOOP` is a de-suffixed twin of `MV9_COMPOSITE` — keep in sync; long-term graduate the loop form to all shade rungs or generate one from the other.
+- `fc_w1preamble:50` / `1u<<21` / `VTK_METAL_TEST_W1PRE` reserved; `39/40/52+` still free (`§26.10`).
+
