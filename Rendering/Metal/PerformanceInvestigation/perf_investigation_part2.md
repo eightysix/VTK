@@ -1161,3 +1161,5 @@ DICOM 1024 (lean pastes): SD4 9.87 SD0.5 14.79 — unchanged
 
 Bigger win at `2048` than `1024` fits `I$` contention scaling with thread count. Re-sweep verdict: fine `DEF(8)` vs `F16` is now a tie at both resolutions (`9.12/9.12`, `22.48/22.29`) — no basis to move the default, **`shadeCap 8:2` stays**. `F32/F48` re-confirmed dead (`+84%/+157%`, `§26.3`).
 
+**Coarse `2`-cap re-check — keep it (`ABBA`, cool):** `1024 SD4 DEF(2) 6.99 F1 6.71 -4.0% F2 6.97 -0.3% F4 7.11 +1.7% F8 7.09 +1.4%`; `2048 SD4 DEF 10.26 F1 9.92 -3.3% F4 10.25 tie`. Widening never wins — the narrow cap stays as the upper bound. The `F1` signal is a *preamble* effect, not width: forced-`F1` takes the `w1`-lean preamble (`fc_fragBatch==1`, no warp/block/super consults) while a hypothetical `cap-1` default would keep the `48`-walk preamble with `1`-dispatch — an unmeasured combo, so do not conflate into a cap change. Follow-up if wanted: decouple preamble selection from dispatch width (`w1`-preamble + `2`-dispatch).
+
