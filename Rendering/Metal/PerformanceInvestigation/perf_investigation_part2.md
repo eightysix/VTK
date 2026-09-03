@@ -1191,3 +1191,19 @@ After (defaults): NIFTI 1024 SD0.5 DEF(16) 9.25/8.74/9.04 avg 9.01 (vs forced-F1
 
 Cost of unified-`16` today: shade-coarse `+1-3%` (inside a `3-4%` bar) but lean-coarse `+11.6%` (`ABBA`) — the blocker. Ablation `DICOM 1024 SD4 MINMAX=0`: `F8 7.40/7.43 vs F16 7.44/7.29` **tie** — the gap vanishes with the preamble off. So the `11.6%` is 100% skip-resolution, not registers/`I$`/scheduling (rolled-loop null + `half` results already ruled those out): `8`-wide batches re-run the skip-walk twice as often as `16`-wide, finding leaps the wide batch marches through as empty composites. Commit width *is* skip granularity — no code shape recovers it (rolled/pasted/halves all dispatch the same `N`). Unify-at-`8` is worse (lean-fine `+13%`, shade-fine `+4-5%`). Verdict: the two splits (`shade 16:2`, `lean 16:8`) are the minimal-complexity optimum; width effects now attribute cleanly — `I$` fixed by rolling, registers by `half`, skip-resolution intrinsic. Reopening unification needs mid-batch empty-exit (per-sample consults, `thr`-risk, likely negative ROI) — not recommended.
 
+### 26.10 w1-preamble decoupled from dispatch (`W1PRE`, coarse-gated) (2026-09-03)
+
+The `F1 -3-4%` coarse signal (`§26.7`) is a *preamble* effect: forced-`F1` takes the `w1`-lean preamble (per-cell taps, no warp/block/super machinery) while the 48-walk preamble pays consults + solves per batch. New env `VTK_METAL_TEST_W1PRE=1` → `1u<<21` → `fc_w1preamble:50` (`mm:7769`, `:7990`; shader decl `:2813`, gate `:6050 `fc_fragBatch==1 || (fc_w1preamble && !fc_fineSD)``); dispatch ladder untouched, so width effects stay separated.
+
+```
+NIFTI 1024 SD4: DEF 7.02 -> 6.67 -5.0% | SD0.5: 8.80 -> 8.65 -1.7%
+NIFTI 2048 SD4: 10.15 -> 9.71 -4.3%
+DICOM 1024 SD4: 8.81 -> 6.62 -24.9% | 2048 SD4: 13.41 -> 10.90 -18.7%
+Skin 1024 SD4: 6.31 -> 5.75 -8.9%
+DICOM 1024 SD0.5: 15.31 -> 33.72 +120% VETO — per-cell crawl loses block leaps at fine, hence the !fineSD gate (forced-F1 stays ungated)
+NIFTI axy SD4 scare (+7.7% single) -> ABBA tie 3.01/2.98 — noise, no view regress
+Parity: NIFTI SD4 byte-max 0 (preambles land identically), SD0.5 thr 0.035 keep, DICOM y 0.000, VRC y thr 0.182 exact (SD4-active path)
+```
+
+At coarse steps the warp/block/super consults cost more than they yield (blocks-0 cell-walk already beat blocks-on `7.65 vs 10.23`); at fine the leaps are everything. Env-landed; default candidate (wins everywhere coarse, neutral fine, parities clean) pending app-side validation — `VRC`/axis views done, `4096`/app TFs open.
+

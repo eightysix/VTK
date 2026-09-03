@@ -2810,6 +2810,9 @@ constant bool fc_dense [[function_constant(48)]];
 constant bool fc_volumeNearestCoarse [[function_constant(49)]];
 // Quad-coop grad §13.5: 4 sC share 24->4 fetches via quad_shuffle, ~30% SD0.5 thr0 if pos+dx coherence
 constant bool fc_quadGrad [[function_constant(51)]];
+// w1-lean preamble decoupled from dispatch width (§26.10): per-cell
+// incremental walk without warp/block/super machinery for any batch width
+constant bool fc_w1preamble [[function_constant(50)]];
 
 // Map an original-orientation sample position into texture space for the live
 // transposed representation (no-op when clear).
@@ -6044,9 +6047,11 @@ inline half4 marchVolumeUnified(
           // (latch/tEnd breaks); inactive-lane contributions only risk
           // disabling a skip (garbage <= 0 falls through), never corrupting
           // output — verified by byte-compare when the feature is on.
-          if (fc_fragBatch==1)
+          if (fc_fragBatch==1 || (fc_w1preamble && !fc_fineSD))
           {
             // w1 lean: per-cell walk only, no warp/super/block state (incremental mmPos)
+            // (fc_w1preamble gated to coarse: at fine the per-cell crawl loses
+            // block leaps, +120% DICOM SD0.5; forced w1 stays ungated)
             int w = 0;
             const int extent = min(48, steps - i);
             float3 curMMPos = clamp(evalPoint, float3(0.0), float3(1.0));

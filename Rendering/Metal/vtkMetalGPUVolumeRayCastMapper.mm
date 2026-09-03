@@ -7767,6 +7767,8 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
       ((std::getenv("VTK_METAL_TEST_DENSE") != nullptr) ? (1u<<18) : 0u) |
       ((std::getenv("VTK_METAL_TEST_VOLUME_NEAREST") != nullptr) ? (1u<<19) : 0u) |
       ((std::getenv("VTK_METAL_TEST_QUAD_GRAD") != nullptr) ? (1u<<20) : 0u) |
+      // w1-lean preamble decoupled from dispatch width (§26.10)
+      ((std::getenv("VTK_METAL_TEST_W1PRE") != nullptr) ? (1u<<21) : 0u) |
       // Fragment compile-time batch specialization — encode width in
       // featureMaskExtra bits [10:15] so each compile-time width gets its
       // own PSO (occupancy probe for register pressure).
@@ -7988,6 +7990,8 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     [constants setConstantValue:&volumeNearestCoarse type:MTLDataTypeBool withName:@"fc_volumeNearestCoarse"];
     BOOL quadGrad = (std::getenv("VTK_METAL_TEST_QUAD_GRAD") != nullptr) ? YES : NO;
     [constants setConstantValue:&quadGrad type:MTLDataTypeBool withName:@"fc_quadGrad"];
+    BOOL w1preamble = (std::getenv("VTK_METAL_TEST_W1PRE") != nullptr) ? YES : NO;
+    [constants setConstantValue:&w1preamble type:MTLDataTypeBool withName:@"fc_w1preamble"];
 
     // §38.15/38.16 block-summary tap bisects (fc_mmNoTap / fc_mmRead).
 
