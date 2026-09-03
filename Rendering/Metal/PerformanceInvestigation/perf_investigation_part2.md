@@ -1290,3 +1290,21 @@ Survey of every open/sketched thread against the visual-neutral constraint (`byt
 
 Verdict: the `0`-degradation tier is exhausted (`§10` said the same pre-cleanup; `§28`+`§29` landed its last two items). Next wins live behind `thr` budget (`GRAD_NEAREST`, `TF`-cull) or new investigations.
 
+---
+
+## 31. Optimal config per scene + `mv9`-default safety review (2026-09-03, not flipped)
+
+Optimal measured config (`M2`, `1024` unless noted) is `mv9` + current defaults (`MINMAX/ACCEL` on, dense auto, `W1PRE` default, blue-noise jitter) with scene extras: `NIFTI` transpose identity (= argmin policy, nothing to set), `DICOM` `VOLTRANSPOSE_AXIS=y` (view-dependent — `y` loses raw axis-y `+27%`, doc `§38`, so the argmin/`X`-tie policy stays and `y` remains a workload knob, not a default).
+
+Gap `mv9`-vs-`mv0` (current default) on current tree, `ABBA 15f/5w`:
+
+```
+DICOM SD4: 5.90 vs 10.16 -42% | DICOM SD0.5: 14.08 vs 39.97 -65% (mv0 misses the §26 fine revamp: rolled loops/caps live in the mv9 ladder)
+NIFTI SD4: 7.85 vs 8.30 -5% | NIFTI SD0.5: 8.42-8.78 vs 8.12-8.38 +4% mv9 slower, real 3/3 rounds (dense-bypassed raw march; open item, see below)
+DICOM 2048 SD4: 10.74 vs 13.16 -18% | 4096: 27.77 vs 33.95 -18%
+```
+
+Parity `mv9`-vs-`mv0` holds the vs-`GL` contract everywhere measured: `512` `NIFTI 0.000/0.035-class`, `DICOM 0.000`, `VRC 0.182` exact, both presets `0.000`, all four axis views `0.000`, `DICOM 2048 0.000`. Metal-metal tails exist (means `0.01-0.11`, max `4-10` typical; one 3px cluster hit `61LSB` at `DICOM 2048`, `0.0001%` of frame, edge-landing class, vs-`GL` clean) — sub-threshold shifts, not byte-identity (`§25` established the class).
+
+Safety verdict: flip recommended but not taken. For: code intent (`TEMP-REPRO: 0 … revert to 9`), `42-65%` sparse wins, contract holds. Against: `NIFTI`-fine `+4%` real cost; pixels change sub-threshold (strict output-neutrality fails); `iOS` GPUs unmeasured; partitioned/camera-inside/selection paths share the unified march but weren't in the flip matrix. Flip = one-line default + `=0` opt-out (`DENSE`/`W1PRE` pattern) when approved.
+
