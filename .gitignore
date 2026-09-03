@@ -30,3 +30,6 @@ __pycache__/
 # Local investigation reference artifacts (large binaries, regenerable data).
 Metal-Shading-Language-Specification.pdf
 Rendering/Metal/PerformanceInvestigation/dicom.u8
+
+# Visual comparison output images (regenerable test artifacts).
+visual_compare/*.png
