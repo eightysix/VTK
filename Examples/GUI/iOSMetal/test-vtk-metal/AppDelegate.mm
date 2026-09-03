@@ -20,8 +20,9 @@
 @interface AppDelegate ()
 @property (nonatomic, readwrite) BOOL benchmarkAutoStarted;
 // Runtime render-config toggles (Rendering menu). Defaults mirror the
-// mapper/env defaults: transpose on, minmax accel on, IGN (not blue-noise)
-// jitter.
+// mapper/env defaults: transpose on, minmax accel on, block summary on,
+// IGN (not blue-noise) jitter on the DICOM/NIFTI scenes (those VCs set it;
+// other scenes run the mapper-default blue-noise tile).
 @property (nonatomic) BOOL volumeTransposeEnabled;
 @property (nonatomic) BOOL minMaxAccelerationEnabled;
 @property (nonatomic) BOOL blueNoiseJitterEnabled;
@@ -30,9 +31,10 @@
 // at launch so toggling off restores it, not just the 0 default.
 @property (nonatomic) BOOL marchVariant9Enabled;
 @property (nonatomic, copy) NSString* marchVariantEnvAtLaunch;
-// Two-level occupancy summary (HARNESS_VS_APP_GAP §34): 8³-cell all-empty
-// block summary of the dilated macrocell lattice; the minmax walk leaps whole
-// empty blocks. Mapper-gated to the fine-SD tier (sampleDistance < 1.5).
+// Two-level occupancy summary (HARNESS_VS_APP_GAP §34, default-ON §37.5):
+// 8³-cell all-empty block summary of the dilated macrocell lattice; the
+// minmax walk leaps whole empty blocks. Default-ON whenever the GPU minmax
+// lattice is active (env VTK_METAL_TEST_MM_BLOCKS=0 opts out).
 @property (nonatomic) BOOL minMaxBlocksEnabled;
 // Fragment compile-time batch specialization (HARNESS_VS_APP_GAP §39):
 // fc_fragBatch [[function_constant(41)]] - 0=shipped runtime 32 heavy,
@@ -87,8 +89,9 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
     self.marchVariant9Enabled = std::atoi(v) == 9;
   }
 
-  // Mirrors the mapper env default: block summary off unless opted in.
-  self.minMaxBlocksEnabled = NO;
+  // Mirrors the mapper default: block summary on whenever the GPU minmax
+  // lattice is active (env VTK_METAL_TEST_MM_BLOCKS=0 opts out).
+  self.minMaxBlocksEnabled = YES;
   if (const char* v = std::getenv("VTK_METAL_TEST_MM_BLOCKS"))
     self.minMaxBlocksEnabled = std::atoi(v) != 0;
 
@@ -287,7 +290,7 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
       modifiers:NSEventModifierFlagCommand | NSEventModifierFlagOption
           target:self
           toMenu:renderingMenu];
-  [self addItem:@"MinMax Block Summary (fine SD)"
+  [self addItem:@"MinMax Block Summary"
          action:@selector(toggleMinMaxBlocks:)
            key:@"l"
       modifiers:NSEventModifierFlagCommand | NSEventModifierFlagOption
@@ -665,16 +668,14 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
   [self renderCurrentWindow];
 }
 
-// Two-level occupancy summary (HARNESS_VS_APP_GAP §34): the mapper re-reads
-// VTK_METAL_TEST_MM_BLOCKS per lattice build and pipeline specialization, and
-// the lattice cache key carries the block wish — so flipping the env rebuilds
-// (or drops) the summary texture on the next frame and respecializes the
-// march pipelines via their featureMaskExtra bit. No resource re-upload is
-// needed. Since 2026-08-23 VolumeMinMaxBlocksWanted() no longer gates to
-// fine-SD (sampleDistance <1.5) — it returns true whenever gpuMinMax is on
-// (sampleDistance kept for call-site stability) mm:1403; re-add
-// if(sampleDistance>=1.5) return false; to restore fine-only and avoid the
-// 1024 SD4 dense +10% 6.52->7.23 §22.
+// Two-level occupancy summary (HARNESS_VS_APP_GAP §34, default-ON §37.5):
+// the mapper re-reads VTK_METAL_TEST_MM_BLOCKS per lattice build and
+// pipeline specialization, and the lattice cache key carries the block
+// wish — so flipping the env rebuilds (or drops) the summary texture on
+// the next frame and respecializes the march pipelines via their
+// featureMaskExtra bit. No resource re-upload is needed. Auto-dense (§28)
+// bypasses the minmax preamble (blocks included) for dense volumes, so
+// this toggle only affects sparse volumes.
 - (void)toggleMinMaxBlocks:(id)sender
 {
   self.minMaxBlocksEnabled = !self.minMaxBlocksEnabled;
