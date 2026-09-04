@@ -3490,6 +3490,19 @@ inline float sampleIGNJitter(float2 st, float blockSize) {
   return fract(52.9829189 * fract(dot(blockCenter, float2(0.06711056, 0.00583715))));
 }
 
+// Jitter phase quantization (§35, VTK_METAL_TEST_JQUANT=N): reduce the number
+// of distinct ray-start phases per warp while keeping the per-pixel blue-noise
+// spatial pattern (unlike JBLOCK, which coarsens space, or JSCALE, which
+// compresses amplitude). Maps j in [0,1) to N midpoint levels
+// (floor(j*N)+0.5)/N so a warp holds at most N distinct fetch planes instead
+// of up to 32. levels < 1.5 disables (default). Clamped to [2,64].
+inline float quantizeJitterPhase(float j, float levels) {
+  if (levels < 1.5f) return j;
+  float N = clamp(floor(levels + 0.5f), 2.0f, 64.0f);
+  float c = clamp(j, 0.0f, 0.9999f);
+  return (floor(c * N) + 0.5f) / N;
+}
+
 
 inline float safeRecip(float x) {
   return 1.0 / (abs(x) < 1e-8 ? copysign(1e-8, x) : x);
@@ -7750,6 +7763,10 @@ inline half4 marchVolume(
             ? sampleIGNJitter(screenPos, volumeUniforms.jitterBlockSize)
             : sampleJitterNoise(screenPos, volumeUniforms.viewportSize.y, volumeUniforms.jitterBlockSize))
       : 1.0f);
+  // JQUANT probe (§35, _padCropFlags[5]): quantize the sampled phase to N
+  // midpoint levels; guarded to jittered pixels only so J0 (jSel=1.0) is exact.
+  if (volumeUniforms.useJittering > 0.5f)
+    jSel = quantizeJitterPhase(jSel, volumeUniforms._padCropFlags[5]);
   // JSCALE probe (_padCropFlags[1], env VTK_METAL_TEST_JSCALE): shrink the
   // per-pixel phase spread toward the coherent j0 lattice via
   // 1 + s*(noise-1), keeping the noise tap/ALU and trip counts identical.
@@ -8240,6 +8257,9 @@ fragment VolumeFragmentOutRTT fragment_volume_rtt_main(
             ? sampleIGNJitter(in.position.xy, volumeUniforms.jitterBlockSize)
             : sampleJitterNoise(in.position.xy, volumeUniforms.viewportSize.y, volumeUniforms.jitterBlockSize))
       : 1.0) * stepSize;
+  // JQUANT (§35): quantize the jittered phase only; J0 (1.0 fallback) is exact.
+  if (volumeUniforms.useJittering > 0.5f)
+    jitter = quantizeJitterPhase(jitter / stepSize, volumeUniforms._padCropFlags[5]) * stepSize;
   float tStart = parallel ? 0.0 : dot(s.entryPoint - cameraPos, rayDir);
   MarchParams p = {rayOrigin, rayDir, tStart, s.totalBoxT, stepSize, jitter, s.tTerminateMax,
       blockMinGlobal, blockMaxGlobal, texMinGlobal, texMaxGlobal, true};
@@ -8535,6 +8555,9 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
               ? sampleIGNJitter(in.position.xy + float2(0.5, 0.5), volumeUniforms.jitterBlockSize) * stepSize
               : sampleJitterNoise(in.position.xy, volumeUniforms.viewportSize.y, volumeUniforms.jitterBlockSize) * stepSize)
         : 1.0 * stepSize;
+    // JQUANT (§35): quantize the jittered phase only.
+    if (volumeUniforms.useJittering > 0.5f)
+      jitter = quantizeJitterPhase(jitter / stepSize, volumeUniforms._padCropFlags[5]) * stepSize;
 
     // Grid traversal loop
     half3 color = 0.0h;
@@ -8669,6 +8692,9 @@ fragment VolumeAtlasOut fragment_volume_ray_atlas(
             ? sampleIGNJitter(in.position.xy, volumeUniforms.jitterBlockSize)
             : sampleJitterNoise(in.position.xy, volumeUniforms.viewportSize.y, volumeUniforms.jitterBlockSize))
       : 1.0f);
+  // JQUANT (§35): keep segment-builder lattice identical to the march above.
+  if (volumeUniforms.useJittering > 0.5f)
+    jSel = quantizeJitterPhase(jSel, volumeUniforms._padCropFlags[5]);
   float jScale = volumeUniforms._padCropFlags[1];
   jScale = (jScale >= 0.0f && jScale <= 1.0f) ? jScale : 1.0f;
   float jitter = mix(1.0f, jSel, jScale) * stepSize;
@@ -8804,6 +8830,9 @@ inline bool synthesizeAtlasRay(
             : sampleJitterNoise(screenPos, volumeUniforms.viewportSize.y,
                                 volumeUniforms.jitterBlockSize))
       : 1.0f);
+  // JQUANT (§35): keep builder lattice identical to the march.
+  if (volumeUniforms.useJittering > 0.5f)
+    jSel = quantizeJitterPhase(jSel, volumeUniforms._padCropFlags[5]);
   float jScale = volumeUniforms._padCropFlags[1];
   jScale = (jScale >= 0.0f && jScale <= 1.0f) ? jScale : 1.0f;
   float jitter = mix(1.0f, jSel, jScale) * stepSize;

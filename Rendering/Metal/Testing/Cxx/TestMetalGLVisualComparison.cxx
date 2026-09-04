@@ -171,6 +171,7 @@ const SceneSpec kScenes[] = {
   { "VolumeRayCast", vtkMetalScenes::BuildVolumeScene, 400, 400 },
   { "DICOMVolume", vtkMetalScenes::BuildDICOMVolumeScene, 400, 400 },
   { "NIFTIVolume", vtkMetalScenes::BuildNIFTIVolumeScene, 400, 400 },
+  { "SynthVolume", vtkMetalScenes::BuildSynthVolumeScene, 400, 400 },
   { "CellColor", [](vtkRenderer* r, vtkMetalScenes::BackendKind b) {
       vtkMetalScenes::BuildCellColorGridScene(r, b, 4, 30);
     }, 800, 800 },

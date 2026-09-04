@@ -1350,3 +1350,152 @@ Quality-constrained follow-up (dithering kept): the `GL` side resolves every loo
 
 Why the advantage grows with `J0`: `GL` responds too (`9.21→5.80`, `1.59×`), so scatter pathology is shared hardware (same `M2`), not Metal magic. In absolute terms both pay ~equally (`M +4.02ms`, `G +3.41ms`); Metal's ratio looks bigger (`1.98×` vs `1.59×`) because its coherent baseline is lower. Like-for-like `M/GL 0.88→0.71`; `M-J0` vs stock `GL-J1 0.44`. `F1`-dispatch (overlap-1) reproduces the full `2×` (`7.96` vs `4.19`), killing batch-amplification — the collapse lives in the shared substrate (cache-line sharing + exit coherence), present in `mv0`/`mv9`/narrow alike. Residual `+0.6ms` Metal-extra second-order (batch-2 `ADVANCE` drag); not pursued.
 
+---
+
+## 35. Jitter-tax structural follow-up — phase quantization probe + dense/coarse nearest (2026-09-03)
+
+Continuation of `§34`: baseline re-reproduced on current tree (identity, `1024`, `20f/5w` class): `J1 ~8.1-9.0` vs `J0 ~4.1-4.5` (`8.06/4.50`, `8.68/4.29` single runs), `~2×`, `J1`-vs-`GL` `thr 0.000`. `J0` stills keep the `§34` wood-grain (concentric striping, `/tmp/banding/nifti1024_tileJ0.metal.png`) vs `J1` dither (`tileJ1`) — `J0` stays unlandable on banding, not on `thr`. Machine noise is `±1ms` on this cell, so only `>10%` with non-overlapping `ABBA` rounds is trusted below.
+
+New probe landed in tree (default-off, zero output impact): `VTK_METAL_TEST_JQUANT=N` phase quantization (`MetalShaders.metal:quantizeJitterPhase`, `_padCropFlags[5]`, mapper fill; all 5 jitter sites — fullscreen, `RTT`, grid, segment-builder ×2 — quantized identically so the builder lattice matches the march; `JITTER=0` fallback `1.0` explicitly unquantized). Unlike `JBLOCK` (coarsens space) or `JSCALE` (compresses amplitude), `JQUANT` keeps the per-pixel blue-noise spatial pattern and maps `j∈[0,1)` to `N` midpoint levels `(floor(j·N)+0.5)/N`, so a warp holds at most `N` fetch planes instead of up to `32`.
+
+`512` `thr` (vs `GL-J1`, gate `§40.3 <5`) and `1024` `20f/5w` perf for the full candidate set (`NIFTI SD4` unless noted):
+
+```
+J1 baseline:            thr 0.000 | bench ~8.4 (noisy 6.8-9.2)
+JQ8  (quantize 8):      thr 1.102 | ~8.6-8.8 (tie, noise)
+JQ4  (quantize 4):      thr 2.190 | ~8.0-8.1 (-4-9%, variance-dominated)
+JQ16:                   thr 0.216 | tie (no coherence gain, extra ALU pointless)
+JB2  (2x2 blocks):      thr 3.750 | ~7.9-8.0 (-11%, noisy)
+JB4  (4x4 blocks):      thr 8.758 FAIL | ~7.3 (-16%, noisy)
+JSCALE=0.5:             thr 11.29 FAIL | ~7.1 (single, noisy)
+JSCALE=0 (coherent):    thr 26.10 FAIL | — (== J0 metal vs dithered GL)
+VOLNEAREST (1 vs 8 texels): thr 2.022 | 6.19 vs 7.01 -12%, 3/3 rounds, non-overlapping
+JQ8+VN stacked:         thr 3.837 | 6.15, ties VN (quant adds nothing once bytes cut)
+JB2+VN stacked:         thr 6.022 FAIL | — (budgets don't stack)
+NOPREFETCH:             thr 15284 BROKEN (0.35ms, blank) — stale probe, dropped
+```
+
+`1024` `thr` runs hotter for every field-changing variant (`JQ8 5.04`, `JQ4 13.28`, `JB2 21.54`) while `J1` stays `0.000` — `thr` (threshold `20` after `±2` shift/`3×3`) measures pattern distance from `GL`'s field, not visual degradation. Eyeball `1024` stills (`/tmp/banding_q8`, `/tmp/banding_q4`, `/tmp/banding_b2` `NIFTIVolume.metal.png`): all three stay dithered with no `J0`-class wood-grain and no visible `2px` quilting — perceptually quality-kept, metrically pattern-moved. `thr` can gate same-field changes (`VOLNEAREST 2.02`) but cannot rank dithering variants; banding eyeball is the quality gate there.
+
+Mechanism insight (why quantization disappoints): the texture cache shares within the `2×2` fragment quad. Blue-noise neighbors differ regardless of level count, so quads stay divergent under `JQUANT` (`N=4` still spreads 4 random levels over each quad); only spatial coherence (`JBLOCK`) makes quads lockstep. So the structural axis that pays is spatial (`JB2` quad-sized blocks, `-11%`), not amplitude (`JQ`, `~0`). But `JB2` pays `thr 3.75→21.5` pattern distance for it, while `VOLNEAREST` attacks the orthogonal axis — bytes per scattered fetch (`8→1` texels, scalar + gradient via `sampleVolumeScalar`) — with the field's dithering untouched (`thr 2.02`, stills identical class). Per-fetch-byte reduction is the only `thr`-valid lever because the scatter itself is the dithering.
+
+Cross-scene safety: `VOLNEAREST` at `DICOM SD4` is `thr 5.694` FAIL (binary-`TF` sparse is interpolation-sensitive; bench `-18%` but gated out) and `JQ8` at `NIFTI SD0.5` is `thr 0.026` + bench tie (`8.00` vs `7.91`) — fine is unharmed by either. So `VOLNEAREST` must never go global-coarse; the landable shape is dense-gated (`fc_dense`, the `§28` occupancy auto-flag that already separates `NIFTI`-dense from `DICOM`-sparse) AND coarse-gated (`!fc_fineSD`): `fc_volumeNearestCoarse = env || (fc_dense && !fc_fineSD)` with a `=0` opt-out (`DENSE`/`W1PRE` pattern). `DICOM` (sparse) and `NIFTI`-fine stay bit-exact; `NIFTI`-coarse moves `0.000→2.02`, inside `§40.3`.
+
+Landed in tree this section: `JQUANT` probe only (shader helper + 5 sites + mapper `_padCropFlags[5]` fill, `xcrun metal -c` clean — 2 pre-existing warnings). No default flipped: vs-`GL` quality is unchanged (`thr 0.000` kept everywhere). When the `2048`/presets/views/`iOS` matrix for dense+coarse `VOLNEAREST` is approved, the flip is the one line above; `JQUANT` stays a probe (`JB2` dominates it on perf at worse `thr`, `JQ8` is the only sub-`1.5` spread reduction if pattern-closeness ever outranks absolute `ms`).
+
+---
+
+## 36. Decomposition: the tax is cache-capacity collapse, not exits (2026-09-03)
+
+Ranking item `#1` from the `§35` follow-up. Question: of the `2×` (`§34`), how much is exit-divergence (lanes idling on ragged trips) vs fetch scatter (cache)? Answer in one line: exits are exonerated three ways; the tax follows the volume working set at fixed content (`12×` the bytes → `11-12×` the tax).
+
+HW counters first: a device probe (`counter_probe.mm`, `/tmp`, not landed) shows this `M2` exposes exactly one programmatic counter set — `timestamp`/`GPUTimestamp`. Texture/cache/occupancy counters are Xcode-capture-only, so the decomposition below is software: uniform-trips march (`variant 4`), per-pixel trip histograms (`METAL_ITER`), and synthetic volumes. All benches `1024 SD4 mv9` (`20f/5w` or `12f×3reps` where noted), identity.
+
+Uniform trips AMPLIFY the gap instead of removing it (`NIFTI`, `20f/5w ABBA×3`):
+
+```
+v9 production: J0 4.10/3.99/4.16 (avg 4.08)  J1 8.15/7.36/7.59 (avg 7.70)  tax +3.62 (+89%)
+v4 frame-max latched (trips identical for all lanes by construction):
+               J0 9.30/10.11/9.69 (avg 9.70) J1 24.79/30.16/24.15 (avg 26.37) tax +16.67 (+172%)
+```
+
+If ragged exits drove the cost, latching every lane to the same trip count would erase the gap. It gets `4.6×` bigger instead — because `v4` also multiplies the scattered-fetch count (full chord for every box pixel, fetches unconditional under latch). The tax scales with scattered fetches with exits held at zero, so exits are not the driver. (Fixed-`K` caps agree directionally — `K8/16/32/uncap` tax `+1.18/+3.31/+3.30/+4.42` grows with `K` — but `K32` spans `2.3-4.3` across rounds, so only the `K8≪uncap` inequality is trusted: a `+51%` tax persists at near-uniform 8-step trips.)
+
+Trip histograms bound the exit channel at single digits. `METAL_ITER` is dead on the `mv9` loop (`marchIter` never set there — `red=0`), so the dumps use `mv0`, whose per-sample breaks are a conservative UPPER bound on `mv9`'s batch-quantized trip divergence (`batchCap 2` equalizes mid-batch saturators to the batch end). `NIFTI SD4 1024`:
+
+```
+J0: mean 3.97 iters, work-quad (mean>4) std 0.23 iters, 3.1% of work-quads std>1
+J1: mean 4.21 iters (+6%), work-quad std 0.51 iters, 6.2% std>1 (warp8x4: 0.61/0.79)
+```
+
+Typical quad lanes differ by half an iteration in ~12 — idling explains `~4%`, against a `+89%` gap, and `J0` itself carries half the divergence at twice the speed.
+
+Synthetics isolate content from capacity. New `SynthVolume` scene (`TestMetalScenes.h`, `VTK_METAL_TEST_SYNTH=ramp|noise`, registered in `kScenes`): `320³` default, `SYNTH_BIG=1` → `640×800×576` (`281MB` ≈ `NIFTI 300MB`, same physical size), value band `[9,14]` (`TF` alpha `~0.01-0.10`, so no ray saturates in-chord: trips are chord/steps `±1` for all three volumes by construction; `ramp` = smooth values, `noise` = same-band white noise). `12f×3reps`:
+
+```
+volume (path)          J0            J1             tax        tax%
+NIFTI (raw)            4.59±0.66     10.15±0.17     +5.56      +121%
+NIFTI (prod)           4.44±0.31     8.22±0.46      +3.78      +85%
+ramp 33MB (raw)        4.03±0.45     4.60±0.75      +0.57      +14%
+ramp 33MB (prod)       3.67±0.59     4.57±0.73      +0.90      +25%
+noise 33MB (prod)      4.12±0.84     5.65±0.31      +1.53      +37%
+BIG-ramp 281MB (prod)  6.65±0.49     17.21±1.38     +10.56     +159%
+BIG-noise 281MB (prod) 8.85±0.55     25.63±1.63     +16.78     +190%
+```
+
+Content held constant, `8.5×` the bytes → `11-12×` the tax (`ramp→BIG-ramp`, `noise→BIG-noise`). Value chaos is second-order (`noise` only modestly above `ramp` per size — DRAM compression is not the channel). `NIFTI` sits between the size classes because its rays saturate early (`covered-mean ~9` vs full-chord `~20-40`): fewer scattered fetches, smaller absolute tax at the same set size. Mechanism: `tax = scattered-fetch-count × per-fetch-cost(set size)`, with per-fetch cost exploding once the scattered working set exceeds cache — coherent `J0` streams (prefetchable) while `J1` thrashes. (Side observation: `NIFTI` raw `+121%` > prod `+85%` — `ACCEL=0` also drops the transposed layout, i.e. layout is part of the cache story, consistent.)
+
+Consequences for the `§35` ranking: exit-coherence work is deprioritized (all three legs agree it is single-digit). Fetch-side work stands, mechanism clarified — `#2` preintegration (fewer steps = fewer scattered fetches, direct hit), `#4` brick-resident marching (endgame, makes reuse explicit), `#3` phase-bucketing REFRAMED: its win would come from cache-line sharing within coherent warps, not trip uniformity (bucket width should target shared fetch lines). Landed: the `SynthVolume` fixture (`SYNTH`/`SYNTH_BIG`), which `#3` will need for validation; no mapper/shader default changed.
+
+---
+
+## 37. Preintegration verdict: do not build for the jitter tax (2026-09-03)
+
+Ranking item `#2`. Three questions: ceiling, prize, catch. Verdict up front: the enabling move (bigger steps) is measured SLOWER under jitter, and shading eats the fetch win anyway. The surprise inside is the sign flip — the tax-aware optimum step is FINER, not coarser.
+
+Ceiling: `GL` has no preintegration. The only in-tree hits are unstructured-grid CPU classes (`vtkUnstructuredGridPreIntegration*`); `VolumeOpenGL2` is pure post-classification point sampling. So Metal preintegration would create systematic `thr` distance exactly where `TF`-nonlinearity × large steps is worst (NIFTI-coarse) — landability starts underwater.
+
+Prize (step-scaling bracket, `NIFTI` prod `1024 12f×3reps`; preintegration's win must come from fewer steps, so plain `SD` scaling bounds it with zero code):
+
+```
+SD    M-J0          M-J1          J1/J0    GL-J1         M/GL
+SD8   2.66±0.21     8.67±0.28     3.26×    8.52±0.71     1.02
+SD4   ~4.4          7.71±0.75     ~1.8×    (~9-10)       ~0.8 (§34: 0.81)
+SD2   4.48±0.18     6.74±0.44     1.50×    10.03±0.46    0.67
+SD0.5 (fine)        (~14, §34-era) 1.07× (§34) —         0.44 (§34)
+```
+
+Tax ratio is monotonic in step size (`3.26→1.8→1.50→1.07`): halving the samples more than doubles the per-fetch scatter cost (offset up to a full step: `8mm` at `SD8` ≈ `2×` the voxels apart), so `SD8J1` (half the fetches of `SD4J1`) is SLOWER in absolute terms (`8.67 > 7.71`, `σ`-separated). A segment `LUT` fixes integration error, not locality — it would inherit `SD8`'s scatter extent. Like-for-like parity is already `thr 0.000` at `SD8` and `SD2` (measured this round), so preintegration has no parity role either; `SD8J1` stills (`/tmp/sd8`) show coarser-but-unbanded grain, i.e. acceptable quality that is also slower. Step-doubling is dead for perf on this cell.
+
+Catch (design analysis, no build): the only cell that matters is shaded, and shaded preintegration has no fetch win to give. The composite (`MV9_COMPOSITE_LOOP`) needs a normal per segment: front-sample gradient = same 6 fetches as today +1 `LUT` (slower, not faster); midpoint gradient = same; dropping normals = specular/gradient-opacity gone (`thr` catastrophe on shaded `NIFTI` — shade-off is already a different parity class, `§34`). The batched march (`s_j`, `s_{j+1}` live) would suit segment lookup, but that optimizes the lookup, not the fetches. Unshaded paths (`MIP`/`MinIP`/average) don't integrate segments this way at all.
+
+Redirect: read the table the other way — `SD2J1 6.74 < SD4J1 7.71` with `thr 0.000` and `M/GL 0.67`. Oversampling beats the tax faster than it adds work (tighter scatter → cache-resident fetches: note `SD2J0 4.48` ties `SD4J0 ~4.4` despite `2×` samples — per-fetch cost halved), until fetch count dominates (`SD0.5`). The `J1` absolute minimum sits near `SD2`, i.e. the shipped `SD4` coarse default is tax-pessimal on this cell. CONFIRMED `ABBA×3` interleaved, order-alternated (`12f×3reps`, this round): `SD2J1 5.86/5.88/5.41` (mean `5.72`) vs `SD4J1 7.01/7.75/7.00` (mean `7.25`) — wins `3/3` rounds (`−16/−24/−23%`, mean `−21%`, non-overlapping); `J0` ties every round (`3.95` vs `3.84` mean). Ratios re-anchor the monotonic tax: `SD4 ~1.9×`, `SD2 ~1.45×`. Finer steps are strictly higher fidelity so any default change stays a product call, not a parity call (`thr 0.000` holds either way). Cross-scene matrix (`1024 12f×3reps`) kills the global case and confirms the mechanism a third way — the `SD2` win exists ONLY where a jitter tax exists: `DICOM SD2J1 17.24±0.47 vs SD4J1 10.65±0.12` (`+62%`, tax `1.03×→1.02×` — immune, pure count scaling, `M/GL 0.37`, `thr 0.142`); `VRC SD2J1 1.75±0.04 vs SD4J1 1.46±0.37` (fixed-cost noise around `~1.7ms`, `M/GL 0.68`, `thr 0.182`). No tax → no win, as predicted. `SD2`-as-default would regress `DICOM 62%`: at most a dense-conditional policy (same `fc_dense` family as the `§35 VOLNEAREST` gating), never global. Recommendation: keep `SD4`; do not build preintegration (program closed: `#3` killed `§38`, `#4` killed `§39`).
+
+---
+
+## 38. Phase-bucketing verdict: kill (fragment impossible, compute uneconomic) (2026-09-03)
+
+Ranking item `#3`. Proposal was: keep every pixel's jitter value (`thr`-clean) but execute phase-homogeneous groups so warps share cache lines. Killed on three legs — one postmortem, one proof, one measurement. No code changed (offline analysis + prior art).
+
+Postmortem: the compute-side variant was already built and measured. `HARNESS §38.10.2` healthy-machine verdict on `RAY_BINNED`: `obl 44.3` vs plain `18.2` (`2.4×` worse) — "index indirection + scatter + dead-thread dispatch costs multiples of any divergence saving, and divergence is not this marcher's binding constraint." The vehicle (`Design B`, `~1.7k LOC`) was then deleted citing `+35%` on dense-`NIFTI`-shade (`3293a9a14a`) — exactly our cell family. `§36` has since confirmed the mechanism behind both verdicts (capacity, not divergence), so they stand. The remaining `§38.9.4(a)` handoff (warp-uniform hop schedules) targeted minmax-SKIP coherence, a different channel from jitter exits — and largely harvested already (`§28` dense bypass, `DICOM M/GL 0.11-0.20`); it does not transfer to the jitter tax.
+
+Fragment multipass is impossible by utilization arithmetic, not just overhead. `B` bucket passes × (fullscreen raster + bucket test + march actives): blue noise spreads every bucket everywhere, so no warp is ever skippable — measured on the real `kBlueNoise64` tile at `1024²`, 32-wide row warps: actives/warp `16.0/8.0/4.0` for `B=2/4/8` (utilization `1/B`), fraction of fully-empty warps `0.000/0.000/0.016`. Every pass therefore occupies every warp while marching `1/B` of pixels: cost `≥ B × J0` (coherent-speed floor `4.08`) vs `J1 7.70` — worse for every `B≥2` (`2×4.08=8.16>7.70` before counting raster/test/dispatch). Scattering also stretches co-active screen distance (`B=8`: nearest co-bucket pixel `~1.6px` mean, but only 4 actives per 32-span → ray footprint `~8px` apart), partially undoing the phase-spread gain. Dead without building.
+
+Compute sorting (gather actives into dense warps) fixes utilization but keeps the sibling economics: same classify+indirect overhead class that measured `2.4×`, for a prize bounded by `J1−J0 = 3.6ms` at `1024`. The `JQUANT` probe (`§35`) already measured the sharing-only axis a sorter would harvest — near-zero — because sharing was never the binding constraint either (capacity is: `§36`). Nothing about phase (vs length) bucketing changes the cost class or the bound.
+
+Standing result: spatial coherence without pattern change is compute-only, and compute sorting costs more than its prize on this cell. The `§35` probes (`JB2` spatial at `thr` cost, `JQUANT` phase-only, near-free) already span what fragment-land can do. Reopen bucketing only as a passenger of `#4` (brick cache needs the compute vehicle for independent, SRAM-reuse reasons — a different prize). `SynthVolume` fixture stays for that day. Recommended harvest from the whole jitter program: dense+coarse `VOLNEAREST` gating (`§35`, `−12%`, `thr 2.02`) and the `SD2` operating point (`§37`, pending `ABBA×3`).
+
+---
+
+## 39. Brick-cache P0: byte model kills #4 (no P1) (2026-09-03)
+
+Ranking item `#4`, time-boxed P0 only: offline DRAM-byte ROI for brick-resident marching on the exact `NIFTI` cell. Result: best case is byte-NEUTRAL (`233` vs `245MB`); the win would have to come entirely from streaming efficiency, with every unmodeled term pointing the wrong way. Killed — no P1 microbench, no prototype. No tree changes (camera print reverted; model script out-of-tree).
+
+Model: exact harness camera (one instrumented run, reverted: `pos=(-152.2,-74.3,430.3) focal=(63.1,82.5,57.3) up=(0,1,0) fov=30`, `1024²`), volume `632×826×574 @0.2mm`, per-ray Amanatides-Woo DDA over the brick grid, each ray truncated at its MEASURED trip length (`mv0 J1 ITER` map, same geometry: coverage `0.464`, mean|covered `8.98` — early exit included, not full-chord). Baseline bytes = covered px × trips × `56B` (1 scalar + 6 gradient taps × trilinear-8, upper bound). Bricked bytes = redundancy `R` (per-tile brick-union loads ÷ bricks in volume) × `300MB` × trilinear-halo (`(B+2)³/B³` — border taps need neighbors). Break-even assumes generous `80GB/s` sustained streaming + `1.5ms` structure floor (`§38.9.3`), vs measured `J1 8.22ms`:
+
+```
+B= 8: T32 R=0.55 322MB 5.52ms | T64 R=0.48 281MB 5.01ms | T128 R=0.45 261MB 4.76ms (halo 1.95 kills it)
+B=16: T32 R=0.90 383MB 6.29ms | T64 R=0.66 280MB 5.00ms | T128 R=0.54 233MB 4.41ms (best)
+B=32: T32 R=1.82 655MB 9.69ms | T64 R=1.07 385MB 6.31ms | T128 R=0.76 273MB 4.91ms (naive config worse than baseline)
+```
+
+Why bytes can't win here: early-exit rays (`9` of `~35` steps) already fetch only what they sample — baseline `245MB` is BELOW the volume size, while bricks drag halo + intra-brick unsampled texels + cross-tile redundancy. Brick caching pays for LONG marches (full-chord synths would show byte-win), but no product cell marches that way (`NIFTI` early-exits, `DICOM` leaps over empties — both make bricks load what rays skip). Remaining prize would be `$/byte` alone: best case `4.41ms` vs `8.22` needs the full `80GB/s` + zero occupancy drag + binning inside `1.5ms` — and all three assumptions are one-sided generous (baseline `56B` overcounts culled taps; real streaming < `80GB/s` under contention; brick-list build, fat-TG occupancy drag, and manual-filter ALU all unmodeled, all ≥0). Nowhere near the margin needed to overturn the deletion precedent. Additional nail: TBDR already executes tile-serial — the hardware harvests the easy half of tiling; explicit SRAM buys only cross-tile-eviction immunity. Kill `#4`; ranking exhausted (`#1` mechanism ✓, `#2` steps ✗, `#3` bucketing ✗, `#4` bytes ✗). Program harvest: `§35` dense+coarse `VOLNEAREST` gating, `§37` `SD2` point (pending `ABBA×3`).
+
+---
+
+## 40. DICOM fair-comparison: Metal immune everywhere, GL pays 1.51× (2026-09-03)
+
+Same-session `DICOM SD4 1024 12f×3reps` M/GL with the fairness layers peeled one by one (`ACCEL`/`MINMAX` off = raw both sides; `VOLTRANSPOSE=0`; `FRAG_BATCH=1` = GL-like per-sample dispatch):
+
+```
+Metal production (accel on):       J1 10.65±0.12  J0 10.37±0.29  tax 1.03×
+Metal raw (accel/minmax off):      J1 10.63±0.11  J0 10.22±0.26  tax 1.04×
+Metal raw, NOTRANSPOSE:            J1 10.21±0.14  J0  9.71±0.16  tax 1.05×
+Metal raw, F1 (batch-1):           J1 10.33±0.20  J0 10.13±0.29  tax 1.02×
+GL (identical path; those envs are Metal-only):
+                                   J1 43.39±4.15  J0 28.67±2.25  tax 1.51×
+M/GL: J1 0.245, J0 0.356 (accel on/off moves Metal ~0 — the comparison was already fair)
+```
+
+Correction to the working theory: the `DICOM` scene shades OFF on both sides (`ShadeOn` only via `VTK_METAL_TEST_SHADE`; `TestMetalScenes.h:1315`), so the TF-gradient-cull immunizer story belongs to shaded `NIFTI` only — this cell does ~1 scalar fetch/sample on both backends. Killed as `DICOM` immunizers, in order: shading (off everywhere), minmax skipping (raw immune), transposed layout (still immune with `VOLTRANSPOSE=0`), fetch batching (F1 immune). Fields are identical (`DICOM thr 0.000` would move otherwise, `§34` pattern-distance argument), so the residual is below algorithm level: same march, same fetches, same field — Metal `1.0×`, GL `1.5×`. Ranked remainder: loop-nest codegen under divergent addresses (divergent_tail precedent: `MSL→Air` vs `GLSL→Air` differ measurably on DRAM-resident divergent marches), texture-unit/TLB behavior, or an unaudited unconditionally-executed per-sample chain in the composed `GL` shader. That is a `GL`-side leg (shader-capture analysis), proposed but unopened — and one where Metal already wins (`M/GL 0.25`, tax entirely on `GL`).
+

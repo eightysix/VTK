@@ -9112,6 +9112,16 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // instead of marchIter (R*64/G*16/B*64 decode). Investigation-only.
   if (getenv("MM_PROBE")) uniforms._padCropFlags[4] = 1.0f;
 
+  // JQUANT probe (§35, VTK_METAL_TEST_JQUANT=N): quantize the jitter phase to
+  // N midpoint levels (see quantizeJitterPhase in MetalShaders.metal). Always
+  // written (default 0 = off); the shader clamps to [2,64].
+  uniforms._padCropFlags[5] = 0.0f;
+  if (const char* jq = getenv("VTK_METAL_TEST_JQUANT"))
+  {
+    const float v = static_cast<float>(std::atof(jq));
+    if (v >= 2.0f && v <= 64.0f) uniforms._padCropFlags[5] = v;
+  }
+
   vtkNew<vtkMatrix4x4> modelMatrix;
   vol->GetModelToWorldMatrix(modelMatrix);
 

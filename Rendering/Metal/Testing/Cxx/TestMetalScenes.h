@@ -1763,6 +1763,262 @@ inline void BuildNIFTIVolumeScene(vtkRenderer* renderer, BackendKind b)
   }
 }
 
+// ---- Jitter-tax decomposition synthetic (§36) ------------------------------
+// VTK_METAL_TEST_SYNTH=ramp (default) | noise. 320^3 U8 default (33MB),
+// 0.4mm spacing (128mm cube ≈ NIFTI x-chord, ~32 steps at SD4); SYNTH_BIG=1
+// selects the NIFTI-scale 640x800x576 (281MB, 0.2mm). FLASH25 TF + NIFTI
+// camera/clip/mapper path. Both modes fill the narrow value band [9,14]
+// (TF alpha ~0.01-0.10): per-sample alpha stays low enough that no ray
+// saturates within the chord, so every ray marches full-chord with zero
+// early-termination exits — trips are chord/steps ±1-step phase, and the
+// three volumes (ramp/noise/NIFTI) differ ONLY in value statistics and exit
+// structure. ramp: x-gradient (smooth values, uniform nonzero shading
+// gradient); noise: deterministic white noise over the same band (LCG —
+// chaotic values, same trip structure: isolates the value/compression
+// channel). tax(noise) vs tax(ramp) vs tax(NIFTI) splits value effects from
+// early-exit-content effects; the fixture is also what phase-bucketed
+// dispatch (§35 idea #3) will need for validation.
+inline void BuildSynthVolumeScene(vtkRenderer* renderer, BackendKind b)
+{
+  static vtkSmartPointer<vtkImageData> cachedSynth;
+  static std::string cachedMode;
+  std::string mode = "ramp";
+  if (const char* s = std::getenv("VTK_METAL_TEST_SYNTH"))
+  {
+    mode = s;
+  }
+  if (!cachedSynth || cachedMode != mode)
+  {
+    cachedMode = mode;
+    const int N = 320;
+    // VTK_METAL_TEST_SYNTH_BIG=1: NIFTI-scale working set (640x800x576 U8 =
+    // 281MB ≈ NIFTI 300MB, 0.2mm spacing = same physical size) to test
+    // whether the jitter tax follows the working set (cache capacity) rather
+    // than the content. Default 320^3 (33MB) fits far better in cache.
+    int nx = 320, ny = 320, nz = 320;
+    double sp = 0.4;
+    if (std::getenv("VTK_METAL_TEST_SYNTH_BIG"))
+    {
+      nx = 640;
+      ny = 800;
+      nz = 576;
+      sp = 0.2;
+    }
+    const int lo = 9, hi = 14;
+    vtkNew<vtkImageData> img;
+    img->SetDimensions(nx, ny, nz);
+    img->SetSpacing(sp, sp, sp);
+    img->AllocateScalars(VTK_UNSIGNED_CHAR, 1);
+    unsigned char* p = static_cast<unsigned char*>(img->GetScalarPointer());
+    if (mode == "noise")
+    {
+      unsigned int seed = 0x12345678u;
+      const size_t n = (size_t)nx * ny * nz;
+      for (size_t i = 0; i < n; ++i)
+      {
+        seed = seed * 1664525u + 1013904223u;
+        p[i] = (unsigned char)(lo + (seed >> 24) % (hi - lo + 1));
+      }
+    }
+    else
+    {
+      for (int z = 0; z < nz; ++z)
+      {
+        for (int y = 0; y < ny; ++y)
+        {
+          for (int x = 0; x < nx; ++x)
+          {
+            p[(size_t)(z * ny + y) * nx + x] = (unsigned char)(lo + (x * (hi - lo)) / (N - 1));
+          }
+        }
+      }
+    }
+    cachedSynth = img;
+    std::cerr << "BuildSynthVolumeScene: mode=" << mode << " dims=" << nx << "x" << ny << "x" << nz
+              << " band=[9,14]\n";
+  }
+
+  // FLASH25 TF points (same table as BuildNIFTIVolumeScene); synthetic data is
+  // already U8 0-255 so the rescale is the identity.
+  vtkNew<vtkColorTransferFunction> color;
+  vtkNew<vtkPiecewiseFunction> opacity;
+  const double xs[8] = { 6.5, 10.0, 13.5, 17.0, 21.0, 26.5, 33.0, 45.0 };
+  const double ys[8] = { 0.0, 0.015, 0.07, 0.28, 0.58, 0.82, 0.96, 1.0 };
+  const double rs[8] = { 0.06, 0.18, 0.48, 0.71, 0.90, 0.98, 1.0, 1.0 };
+  const double gs[8] = { 0.08, 0.18, 0.38, 0.62, 0.84, 0.95, 1.0, 0.93 };
+  const double bs[8] = { 0.22, 0.30, 0.42, 0.58, 0.80, 0.90, 1.0, 0.78 };
+  for (int i = 0; i < 8; ++i)
+  {
+    opacity->AddPoint(xs[i], ys[i]);
+    color->AddRGBPoint(xs[i], rs[i], gs[i], bs[i]);
+  }
+
+  vtkNew<vtkVolumeProperty> property;
+  property->SetColor(color);
+  property->SetScalarOpacity(opacity);
+  property->SetInterpolationTypeToLinear();
+  bool useShading = true;
+  if (const char* sh = std::getenv("VTK_METAL_TEST_NIFTI_SHADE"))
+  {
+    useShading = std::atoi(sh) != 0;
+  }
+  else if (const char* sh2 = std::getenv("VTK_METAL_TEST_SHADE"))
+  {
+    useShading = std::atoi(sh2) != 0;
+  }
+  if (useShading)
+  {
+    property->ShadeOn();
+    property->SetAmbient(0.15);
+    property->SetDiffuse(0.85);
+    property->SetSpecular(0.3);
+    property->SetSpecularPower(20.0);
+  }
+  else
+  {
+    property->ShadeOff();
+    property->SetAmbient(1.0);
+    property->SetDiffuse(0.0);
+    property->SetSpecular(0.0);
+  }
+  if (const char* gln = std::getenv("VTK_METAL_TEST_GL_NEAREST"); gln && std::atoi(gln) != 0)
+  {
+    property->SetInterpolationTypeToNearest();
+  }
+
+  vtkSmartPointer<vtkGPUVolumeRayCastMapper> mapper = NewVolumeMapper(b);
+  mapper->SetInputData(cachedSynth);
+  if (const char* bm = std::getenv("VTK_METAL_TEST_BLEND"))
+  {
+    int m = std::atoi(bm);
+    if (m == 1)
+      mapper->SetBlendModeToMaximumIntensity();
+    else if (m == 2)
+      mapper->SetBlendModeToMinimumIntensity();
+    else if (m == 3)
+      mapper->SetBlendModeToAverageIntensity();
+    else if (m == 4)
+      mapper->SetBlendModeToAdditive();
+    else
+      mapper->SetBlendModeToComposite();
+  }
+  if (TempJitter())
+  {
+    mapper->UseJitteringOn();
+  }
+  else
+  {
+    mapper->UseJitteringOff();
+  }
+  mapper->AutoAdjustSampleDistancesOff();
+  mapper->SetSampleDistance(TempSampleDistance());
+  mapper->SetImageSampleDistance(TempImageSampleDistance());
+  if (b == BackendKind::Metal)
+  {
+    if (auto* metal = vtkMetalGPUVolumeRayCastMapper::SafeDownCast(mapper))
+    {
+      if (const char* ign = std::getenv("VTK_METAL_TEST_IGN_JITTER"))
+      {
+        metal->SetUseIGNJitter(std::atoi(ign) != 0);
+      }
+      else
+      {
+        metal->SetUseIGNJitter(TempJitter());
+      }
+      metal->SetJitterBlockSize(TempJitterBlock());
+      metal->SetUseGPUMinMax(TempMinMax());
+      metal->SetUseMinMaxAcceleration(TempMinMaxAccel());
+      metal->SetDisableInstanceRendering(true);
+    }
+  }
+
+  vtkNew<vtkPlane> clipPlane;
+  clipPlane->SetNormal(0, 0, 1);
+  double bounds[6];
+  cachedSynth->GetBounds(bounds);
+  clipPlane->SetOrigin(0, 0, bounds[4]);
+  mapper->AddClippingPlane(clipPlane);
+
+  vtkNew<vtkVolume> volume;
+  volume->SetMapper(mapper);
+  volume->SetProperty(property);
+  renderer->AddVolume(volume);
+
+  renderer->SetBackground(0.0, 0.0, 0.0);
+
+  vtkSmartPointer<vtkCamera> camera = NewCamera(b);
+  renderer->SetActiveCamera(camera);
+  renderer->ResetCamera();
+  const char* camAxis = std::getenv("VTK_METAL_TEST_CAM_AXIS");
+  if (camAxis && camAxis[0] == 'x')
+  {
+    double fp[3] = { 0, 0, 0 };
+    renderer->GetActiveCamera()->GetFocalPoint(fp);
+    renderer->GetActiveCamera()->SetPosition(fp[0] - 1000.0, fp[1], fp[2]);
+    renderer->GetActiveCamera()->SetViewUp(0, 0, 1);
+  }
+  else if (camAxis && camAxis[0] == 'y')
+  {
+    double fp[3] = { 0, 0, 0 };
+    renderer->GetActiveCamera()->GetFocalPoint(fp);
+    renderer->GetActiveCamera()->SetPosition(fp[0], fp[1] - 1000.0, fp[2]);
+    renderer->GetActiveCamera()->SetViewUp(0, 0, 1);
+  }
+  else if (camAxis && camAxis[0] == 'z')
+  {
+    double fp[3] = { 0, 0, 0 };
+    renderer->GetActiveCamera()->GetFocalPoint(fp);
+    renderer->GetActiveCamera()->SetPosition(fp[0], fp[1], fp[2] - 1000.0);
+    renderer->GetActiveCamera()->SetViewUp(0, 1, 0);
+  }
+  else
+  {
+    renderer->GetActiveCamera()->Elevation(20);
+    renderer->GetActiveCamera()->Azimuth(30);
+    renderer->GetActiveCamera()->Elevation(-40);
+    const char* azEnv = std::getenv("VTK_METAL_TEST_CAM_AZ");
+    if (azEnv)
+    {
+      renderer->GetActiveCamera()->Azimuth(std::atof(azEnv));
+    }
+    else
+    {
+      renderer->GetActiveCamera()->Azimuth(-60);
+    }
+  }
+  if (const char* dollyEnv = std::getenv("VTK_METAL_TEST_CAM_DOLLY"))
+  {
+    renderer->GetActiveCamera()->Dolly(std::atof(dollyEnv));
+    renderer->ResetCameraClippingRange();
+  }
+  if (const char* axEnv = std::getenv("VTK_METAL_TEST_CAM_AXIS"))
+  {
+    vtkCamera* cam = renderer->GetActiveCamera();
+    double f[3];
+    cam->GetFocalPoint(f);
+    double p[3];
+    cam->GetPosition(p);
+    double dir[3] = { p[0] - f[0], p[1] - f[1], p[2] - f[2] };
+    double dist = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+    switch (axEnv[0])
+    {
+      case 'x':
+        cam->SetPosition(f[0] + dist, f[1], f[2]);
+        cam->SetViewUp(0, 0, 1);
+        break;
+      case 'y':
+        cam->SetPosition(f[0], f[1] + dist, f[2]);
+        cam->SetViewUp(0, 0, 1);
+        break;
+      case 'z':
+        cam->SetPosition(f[0], f[1], f[2] + dist);
+        cam->SetViewUp(0, 1, 0);
+        break;
+    }
+    renderer->ResetCameraClippingRange();
+  }
+}
+
 // ---- Complexity-scaling benchmark scenes ----------------------------------
 // These are registered in the harness's bench-only list (--complexity) to
 // probe how the Metal/GL timing ratio behaves as a single workload axis
