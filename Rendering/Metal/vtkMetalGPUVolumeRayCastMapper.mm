@@ -5467,15 +5467,18 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
     {
       id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
 
-      // Build 256-entry gradient opacity lookup table.
+      // Build gradient opacity lookup table at the OpenGL backend's width
+      // (vtkOpenGLVolumeLookupTable defaults to 1024): the steep ramp of a
+      // typical gradient TF lives in a handful of texels, so matching the
+      // width keeps the linear sampling identical.
       // Range: [0, 0.25 * scalarRange] — matches the normalization in the shader
       // where gradient magnitude is normalized to [0, 0.25 * dataRange].
 
-      unsigned char gradData[256 * 4]; // RGBA8Unorm (R channel used)
-      double table[256];
-      gradOpacityFunc->GetTable(0.0, gradMax, 256, table);
+      unsigned char gradData[1024 * 4]; // RGBA8Unorm (R channel used)
+      double table[1024];
+      gradOpacityFunc->GetTable(0.0, gradMax, 1024, table);
 
-      for (int i = 0; i < 256; ++i)
+      for (int i = 0; i < 1024; ++i)
       {
         unsigned char val =
           static_cast<unsigned char>(std::max(0.0, std::min(1.0, table[i])) * 255.0);
@@ -5493,7 +5496,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
       id<MTLTexture> tex = NewTexture2D(
         device,
         MTLPixelFormatRGBA8Unorm,
-        256, 1,
+        1024, 1,
         MTLTextureUsageShaderRead,
         MTLStorageModeShared);
       if (!tex)
@@ -5503,11 +5506,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
       }
       AssignMetalObject(this->GradientOpacityTexture, tex);
 
-      MTLRegion region = MTLRegionMake2D(0, 0, 256, 1);
+      MTLRegion region = MTLRegionMake2D(0, 0, 1024, 1);
       [tex replaceRegion:region
             mipmapLevel:0
               withBytes:gradData
-            bytesPerRow:256 * 4];
+            bytesPerRow:1024 * 4];
 
       this->LastGradientOpacityScalarRange[0] = gradRange[0];
       this->LastGradientOpacityScalarRange[1] = gradRange[1];
