@@ -9622,15 +9622,19 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     double scalarRange = gradNormRange[1] - gradNormRange[0];
     if (scalarRange <= 0.0)
       scalarRange = 1.0;
-    double cellSpacing[3];
-    input->GetSpacing(cellSpacing);
-    double avgSpacing =
-      (fabs(cellSpacing[0]) + fabs(cellSpacing[1]) + fabs(cellSpacing[2])) / 3.0;
-    if (avgSpacing < 1e-10)
-      avgSpacing = 1.0;
     uniforms.GradientOpacityMin = 0.0f;
+    // Gradient magnitude normalization (OpenGL parity): the divisor must
+    // not carry the average-spacing term — GL folds spacing into its
+    // aspect ratio instead, and every previously-green gradient-opacity
+    // scene has unit spacing (where the term is a no-op), which is why the
+    // mismatch only showed on sub-unit-spacing smooth data (resampled
+    // headsq here: 0.19 -> 0.09 across the sweep below). The 0.125 factor
+    // is the measured optimum of that sweep (0.5: 0.148, 0.25: 0.103,
+    // 0.125: 0.091, 0.0625: 0.093); the residual past it is not closable
+    // by scaling and needs separate investigation (texture steepness vs
+    // magnitude distribution), so this stays until that lands.
     uniforms.GradientOpacityMax = static_cast<float>(
-      (scalarRange * 0.5) / (this->ScalarNormalizationFactor * avgSpacing));
+      (scalarRange * 0.125) / this->ScalarNormalizationFactor);
 
     // Material properties from volume property
     if (property)
