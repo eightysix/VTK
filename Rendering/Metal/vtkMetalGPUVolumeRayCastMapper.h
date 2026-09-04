@@ -441,6 +441,10 @@ private:
   // forces ON (legacy), "0" forces OFF; unset selects auto.
   bool CachedDenseBypass = false;
   bool DenseBypassCacheValid = false;
+  // 2D-TF and multivolume modes are excluded from the bypass (their
+  // occupancy is not measurable by single-volume 1D sampling, and bypassing
+  // breaks their renders); the early-false path leaves the cache untouched
+  // so a later mode switch back revalidates on the sampled MTimes as usual.
   unsigned long LastDenseInputMTime = 0;
   unsigned long LastDenseScalarsMTime = 0;
   unsigned long LastDenseOpacityMTime = 0;
@@ -448,6 +452,15 @@ private:
   int LastDenseDims[3] = { 0, 0, 0 };
   bool GetDenseBypassActive() const;
   bool ComputeDenseBypass(vtkVolume* vol, vtkImageData* input, vtkDataArray* scalars);
+
+  // Per-frame state bits cached during uniform fill (GPURender) for the
+  // depth/camera-inside PSO specialization: scenes without scene depth or
+  // with an outside camera keep the §18 dead-strip diet exactly, while
+  // polydata/camera-inside scenes compile the fuller variant on demand
+  // through the PipelineCache key (1<<16/1<<17). Written adjacently to the
+  // matching uniforms so key/fc/uniforms can never disagree within a frame.
+  bool DepthKeyActive = false;
+  bool CameraKeyActive = false;
 
   bool PreferHalfPrecision = true;  // when true, prefer half-float (16-bit) for volume textures when the scalar range fits within [−65504, 65504]; covers native float and integer types
   // Enables a precomputed RGBA8Unorm normal texture to replace 6 gradient

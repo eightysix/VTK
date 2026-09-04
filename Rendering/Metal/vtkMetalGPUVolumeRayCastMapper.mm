@@ -1514,6 +1514,20 @@ static bool VolumeW1PreambleWanted()
   return std::atoi(e) != 0;
 }
 
+// Tri-state env override: -1 = unset (auto-derive from render state),
+// otherwise forced (bare presence or nonzero = ON, "0" = OFF). Shared by
+// the auto-derived PSO bits (depth/camera-inside); same migration pattern
+// as VTK_METAL_TEST_DENSE (VolumeDenseEnvOverride).
+static int VolumeEnvTriState(const char* name)
+{
+  const char* e = std::getenv(name);
+  if (!e)
+    return -1;
+  if (e[0] == '\0')
+    return 1;
+  return (std::atoi(e) != 0) ? 1 : 0;
+}
+
 
 // §38.18.1: purge request via VTK_METAL_TEST_PURGE=1 (also accepts
 // VTK_METAL_TEST_METAL_PURGE for foragability). Returns true once per
@@ -2055,6 +2069,29 @@ bool vtkMetalGPUVolumeRayCastMapper::ComputeDenseBypass(
   vtkPiecewiseFunction* opFunc = property ? property->GetScalarOpacity() : nullptr;
   if (!opFunc)
     return false;
+
+  // 2D transfer functions make opacity gradient-dependent, and multivolume
+  // compositing spans several inputs: the single-volume 1D component-0
+  // sampling below cannot measure occupancy for either mode — and bypassing
+  // the lattice breaks their renders (MultiVolumeShade, Transfer2DYScalars
+  // fail grossly while passing with the bypass off). Never bypass there;
+  // the dense win stays for single-volume 1D-TF data. Early return leaves
+  // the cache untouched, so switching back to an eligible mode revalidates
+  // on the sampled inputs' MTimes as usual.
+  int extraVolumeInputs = 0;
+  for (int port = 1; port < this->GetNumberOfInputPorts(); ++port)
+  {
+    extraVolumeInputs += this->GetNumberOfInputConnections(port);
+  }
+  if (property->GetTransferFunction2D() != nullptr || extraVolumeInputs > 0)
+  {
+    if (std::getenv("VTK_METAL_TEST_MARCH_DEBUG"))
+    {
+      fprintf(stderr, "[dense] excluded (2D-TF %s / %d extra inputs) -> sparse\n",
+        (property->GetTransferFunction2D() != nullptr) ? "yes" : "no", extraVolumeInputs);
+    }
+    return false;
+  }
 
   int extents[6];
   input->GetExtent(extents);
@@ -7972,6 +8009,13 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
 {
   if (getenv("VTK_METAL_TEST_MARCH_DEBUG"))
     fprintf(stderr, "[FRAG-ENTER] type=%u feat=0x%x extraPending=%d\n", type, featureMask, VolumeFragBatch());
+  // §17 depth/camera-inside specialization, auto-derived per frame from the
+  // cached uniform-fill state (DepthKeyActive/CameraKeyActive): envs force
+  // the bit for A/B (unset = auto, bare/nonzero = on, "0" = off).
+  const int depthOv = VolumeEnvTriState("VTK_METAL_TEST_DEPTH");
+  const int cameraOv = VolumeEnvTriState("VTK_METAL_TEST_CAMERA_INSIDE");
+  const bool depthKey = (depthOv >= 0) ? (depthOv != 0) : this->DepthKeyActive;
+  const bool cameraKey = (cameraOv >= 0) ? (cameraOv != 0) : this->CameraKeyActive;
   VolumePipelineKey key = { type, colorFormat, depthFormat, sampleCount, featureMask,
     // featureMaskExtra: low bits carry the volume orientation code
     // (VolumeTextureAxisDepth 0/1/2), bit 2 the block-summary walk gate —
@@ -8001,8 +8045,9 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
       ((VolumeExitTheta() > 0.0f) ? 64u : 0u) |
       // §17 dense bypass + volume nearest coarse + quadGrad; dense is §27.1
       // auto (volume occupancy) with VTK_METAL_TEST_DENSE as force override.
-      ((std::getenv("VTK_METAL_TEST_DEPTH") != nullptr) ? (1u<<16) : 0u) |
-      ((std::getenv("VTK_METAL_TEST_CAMERA_INSIDE") != nullptr) ? (1u<<17) : 0u) |
+      // Depth/camera-inside ride the per-frame depthKey/cameraKey locals above.
+      (depthKey ? (1u<<16) : 0u) |
+      (cameraKey ? (1u<<17) : 0u) |
       ((this->GetDenseBypassActive()) ? (1u<<18) : 0u) |
       ((std::getenv("VTK_METAL_TEST_VOLUME_NEAREST") != nullptr) ? (1u<<19) : 0u) |
       ((std::getenv("VTK_METAL_TEST_QUAD_GRAD") != nullptr) ? (1u<<20) : 0u) |
@@ -8220,10 +8265,11 @@ void* vtkMetalGPUVolumeRayCastMapper::GetOrCreateVolumePipeline(
     BOOL gradNearest = (std::getenv("VTK_METAL_TEST_GRAD_NEAREST") != nullptr) ? YES : NO;
     [constants setConstantValue:&gradNearest type:MTLDataTypeBool withName:@"fc_gradNearest"];
     // §17 specializations: depth/cameraInside dead-strip, §27.1 auto-dense
-    // bypass (all SD), volume nearest coarse
-    BOOL useDepthTexture = (std::getenv("VTK_METAL_TEST_DEPTH") != nullptr) ? YES : NO;
+    // bypass (all SD), volume nearest coarse. Depth/camera ride the same
+    // per-frame locals as the key bits above, so PSO and key agree.
+    BOOL useDepthTexture = depthKey ? YES : NO;
     [constants setConstantValue:&useDepthTexture type:MTLDataTypeBool withName:@"fc_useDepthTexture"];
-    BOOL useCameraInside = (std::getenv("VTK_METAL_TEST_CAMERA_INSIDE") != nullptr) ? YES : NO;
+    BOOL useCameraInside = cameraKey ? YES : NO;
     [constants setConstantValue:&useCameraInside type:MTLDataTypeBool withName:@"fc_useCameraInside"];
     BOOL dense = this->GetDenseBypassActive() ? YES : NO;
     [constants setConstantValue:&dense type:MTLDataTypeBool withName:@"fc_dense"];
@@ -9227,7 +9273,10 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
   // expressed in [0,1] normalized volume space (origin via
   // NormalizeToVolumeSpace, normal scaled by the per-axis bounds size) so the
   // per-ray intersection distance is directly comparable to the box t-range.
-  uniforms.UseCameraInsideNearClip = this->IsCameraInside(ren, vol) ? 1.0f : 0.0f;
+  // Cached beside the uniform: the depth/camera PSO key bits (1<<16/1<<17)
+  // derive from these members, so key/fc/uniforms agree within a frame.
+  this->CameraKeyActive = this->IsCameraInside(ren, vol);
+  uniforms.UseCameraInsideNearClip = this->CameraKeyActive ? 1.0f : 0.0f;
   uniforms.UseDataSpaceBoxVertices =
     (uniforms.UseCameraInsideNearClip > 0.5f) ? 0.0f : 1.0f;
   uniforms.CameraInsideNearPlaneOrigin[3] = 1.0f;
@@ -9727,7 +9776,18 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
 
   // Depth texture flag — set to 1 when we have a real scene depth texture.
   // RenderToImage casts against an empty scene, so occlusion is disabled there.
-  uniforms.UseDepthTexture = (this->DepthTextureOcclusion && !this->RenderToImage) ? 1.0f : 0.0f;
+  // Occlusion additionally requires occluders: with no actors the depth
+  // buffer holds its clear value and the setupVolumeRay depth block is dead
+  // weight, so volume-only scenes (harness NIFTI/DICOM) keep the §18 I$ diet
+  // exactly while polydata scenes compile the depth variant. Cached beside
+  // the uniform: the depth PSO key bit (1<<16) derives from this member, so
+  // key/fc/uniforms agree within a frame. (Actors merely present-but-hidden
+  // only cost the fuller variant, never correctness.)
+  const bool hasOccluders = (ren->GetActors() != nullptr) &&
+    (ren->GetActors()->GetNumberOfItems() > 0);
+  this->DepthKeyActive = (this->DepthTextureOcclusion != nullptr) && !this->RenderToImage &&
+    hasOccluders;
+  uniforms.UseDepthTexture = this->DepthKeyActive ? 1.0f : 0.0f;
 
   // Min-max acceleration texture
   uniforms.UseMinMaxAccel = this->MinMaxTexture ? 1.0f : 0.0f;

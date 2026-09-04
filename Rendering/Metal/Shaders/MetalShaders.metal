@@ -5337,14 +5337,23 @@ inline half4 marchVolumeUnified(
   if (fc_cropping) { \
     if ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, rPosC##_j))) == 0u) skip##_j = true; \
   } \
+  if (!skip##_j && fc_mask && (fc_blendMode == 1 || fc_blendMode == 2) && volumeUniforms.maskType > 0.5f) { \
+    float mVal##_j = maskTexture.sample(sNearest, rPosC##_j, level(0)).r * maskScale + maskBias; \
+    if (mVal##_j <= 0.0f) skip##_j = true; \
+  } \
   if (!skip##_j && fc_blanking) { \
     float3 bPos##_j = rPosC##_j + blankHalfStep * (volumeUniforms.blankingMode > 1.5 ? 1.0f : 0.0f); \
-    float bVal##_j = blankingTexture.sample(sNearest, rPosC##_j, level(0)).r; \
-    if (bVal##_j < 0.5f) skip##_j = true; \
-    if (!skip##_j && volumeUniforms.blankingMode > 0.5f) { \
-      float bVal2##_j = blankingTexture.sample(sNearest, bPos##_j, level(0)).r; \
-      if (bVal2##_j < 0.5f) skip##_j = true; \
+    float4 bCur##_j = blankingTexture.sample(sNearest, rPosC##_j, level(0)); \
+    float4 bNbr##_j = blankingTexture.sample(sNearest, bPos##_j, level(0)); \
+    bool blanked##_j; \
+    if (volumeUniforms.blankingMode < 1.5f) { \
+      blanked##_j = (bCur##_j.y > 0.0f || bNbr##_j.y > 0.0f); \
+    } else if (volumeUniforms.blankingMode < 2.5f) { \
+      blanked##_j = (bCur##_j.x > 0.0f || bNbr##_j.x > 0.0f); \
+    } else { \
+      blanked##_j = (bCur##_j.x > 0.0f || bNbr##_j.x > 0.0f || bCur##_j.y > 0.0f || bNbr##_j.y > 0.0f); \
     } \
+    if (blanked##_j) skip##_j = true; \
   } \
   if (fc_independentComponents) { \
     if (!skip##_j) { \
@@ -5634,14 +5643,23 @@ inline half4 marchVolumeUnified(
   if (fc_cropping) { \
     if ((cropBitmask & (1u << computeCropRegion(cropMin, cropMax, rPosC))) == 0u) skip = true; \
   } \
+  if (!skip && fc_mask && (fc_blendMode == 1 || fc_blendMode == 2) && volumeUniforms.maskType > 0.5f) { \
+    float mVal = maskTexture.sample(sNearest, rPosC, level(0)).r * maskScale + maskBias; \
+    if (mVal <= 0.0f) skip = true; \
+  } \
   if (!skip && fc_blanking) { \
     float3 bPos = rPosC + blankHalfStep * (volumeUniforms.blankingMode > 1.5 ? 1.0f : 0.0f); \
-    float bVal = blankingTexture.sample(sNearest, rPosC, level(0)).r; \
-    if (bVal < 0.5f) skip = true; \
-    if (!skip && volumeUniforms.blankingMode > 0.5f) { \
-      float bVal2 = blankingTexture.sample(sNearest, bPos, level(0)).r; \
-      if (bVal2 < 0.5f) skip = true; \
+    float4 bCur = blankingTexture.sample(sNearest, rPosC, level(0)); \
+    float4 bNbr = blankingTexture.sample(sNearest, bPos, level(0)); \
+    bool blanked; \
+    if (volumeUniforms.blankingMode < 1.5f) { \
+      blanked = (bCur.y > 0.0f || bNbr.y > 0.0f); \
+    } else if (volumeUniforms.blankingMode < 2.5f) { \
+      blanked = (bCur.x > 0.0f || bNbr.x > 0.0f); \
+    } else { \
+      blanked = (bCur.x > 0.0f || bNbr.x > 0.0f || bCur.y > 0.0f || bNbr.y > 0.0f); \
     } \
+    if (blanked) skip = true; \
   } \
   if (fc_independentComponents) { \
     if (!skip) { \
