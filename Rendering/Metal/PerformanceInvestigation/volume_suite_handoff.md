@@ -140,6 +140,18 @@ measurement: march-exit 69/70 (already present here — CTP bounds exit in
 all loops, counts match ±8/460), fullscreen-vs-proxy path (identical to
 0.07), R32F-vs-8-bit LUT width (zero movement twice).
 
+## Addendum: float promotions reverted (half suffices)
+
+The float32 items above were reverted after a direct experiment: the
+half-precision stack (8-bit grad LUT, half TF/taps/sampling) with ONLY the
+two root-cause fixes passes the target at **0.00693** (vs 0.00716 float,
+GL 0.00646) and the suite at **97/97 on mv0 and mv9**. The promotions are
+not load-bearing here, and half is the codebase norm (accumulation/color
+intermediates; volumes stay `R16Unorm`/`R32Float`, gradient magnitudes
+stay float). Kept reverted for consistency; revisit only with a failing
+metric in hand (steep-ramp amplifier scenes outside the suite remain the
+known hazard class for 8-bit LUT quantization).
+
 ## Perf recheck (cull removal vs `part2 §13.3`)
 
 NIFTI 1024 mv9 bench (`vtkMetalGLVisualComparison`, FLASH25):
