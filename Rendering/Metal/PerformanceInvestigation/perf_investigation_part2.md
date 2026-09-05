@@ -1499,3 +1499,11 @@ M/GL: J1 0.245, J0 0.356 (accel on/off moves Metal ~0 — the comparison was alr
 
 Correction to the working theory: the `DICOM` scene shades OFF on both sides (`ShadeOn` only via `VTK_METAL_TEST_SHADE`; `TestMetalScenes.h:1315`), so the TF-gradient-cull immunizer story belongs to shaded `NIFTI` only — this cell does ~1 scalar fetch/sample on both backends. Killed as `DICOM` immunizers, in order: shading (off everywhere), minmax skipping (raw immune), transposed layout (still immune with `VOLTRANSPOSE=0`), fetch batching (F1 immune). Fields are identical (`DICOM thr 0.000` would move otherwise, `§34` pattern-distance argument), so the residual is below algorithm level: same march, same fetches, same field — Metal `1.0×`, GL `1.5×`. Ranked remainder: loop-nest codegen under divergent addresses (divergent_tail precedent: `MSL→Air` vs `GLSL→Air` differ measurably on DRAM-resident divergent marches), texture-unit/TLB behavior, or an unaudited unconditionally-executed per-sample chain in the composed `GL` shader. That is a `GL`-side leg (shader-capture analysis), proposed but unopened — and one where Metal already wins (`M/GL 0.25`, tax entirely on `GL`).
 
+---
+
+## 41. `mv9` flipped to default (2026-09-05)
+
+`VolumeMarchVariant()` (`vtkMetalGPUVolumeRayCastMapper.mm:381`) now returns `9` when `VTK_METAL_TEST_MARCH_VARIANT` is unset (was `0 TEMP-REPRO`); opt-out is `VTK_METAL_TEST_MARCH_VARIANT=0` for A/B. App `Rendering -> March mv9` toggle (`AppDelegate.mm:85`) defaults `ON` to mirror it (`=0` opts out).
+
+Decision lands `§31` (flip recommended but not taken: `42-65%` sparse wins, contract holds, open item `NIFTI`-fine `+4%`) + `§33` (saturation-overshoot shade gate removed the `+4%` with margin: `NIFTI SD0.5 8.54 -> 7.95 -6.9%`, now beats `mv0` too; parity `512 NIFTI 0.000 / DICOM 0.000 / VRC 0.182` keep). No known perf cost anywhere measured; remaining caveats unchanged from `§33`: sub-threshold metal-metal pixel shifts (not byte-identity, `vs-GL` contract holds), `iOS` GPUs unmeasured, partitioned/camera-inside/selection paths share the unified march but weren't in the flip matrix. Volume suite `97/97` on both marches pre-flip (`volume_suite_handoff.md:10`); post-flip suite re-run pending.
+

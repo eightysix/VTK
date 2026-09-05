@@ -83,6 +83,7 @@ static NSArray<NSDictionary*>* ViewCommandDefs(void)
   self.blueNoiseJitterEnabled = NO;
 
   self.marchVariantEnvAtLaunch = @"0";
+  self.marchVariant9Enabled = YES; // mirrors mapper default mv9 (opt-out = 0)
   if (const char* v = std::getenv("VTK_METAL_TEST_MARCH_VARIANT"))
   {
     self.marchVariantEnvAtLaunch = [NSString stringWithUTF8String:v];

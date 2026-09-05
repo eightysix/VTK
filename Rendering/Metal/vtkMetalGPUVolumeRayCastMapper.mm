@@ -382,7 +382,7 @@ static int VolumeMarchVariant()
 {
   if (const char* v = getenv("VTK_METAL_TEST_MARCH_VARIANT"))
     return std::atoi(v);
-  return 0; // TEMP-REPRO: 0 = baseline march, no experiment (revert to 9)
+  return 9; // default: 48-wide inline scheduled march (mv9, §§31/33)
 }
 
 // V31 back-edge exit experiment (VTK_METAL_TEST_DOEXIT=1): reshapes the
