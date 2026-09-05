@@ -1937,6 +1937,72 @@ static void FillTransferFunctionRGBA16FWithPreIntegration(
     width, row, factor, blendMode);
 }
 
+// Fill a RGBA32F transfer function row with the blend-mode-dependent opacity
+// correction. The OpenGL backend uploads its color and opacity tables as
+// float32 textures (vtkOpenGLVolumeRGBTable RGB32F, vtkOpenGLVolumeOpacityTable
+// R32F), so the sampled values must be stored as float32 as well: the previous
+// RGBA16Float table quantized every sampled opacity/color to half precision
+// (11-bit mantissa), shifting the accumulated color by a few LSB vs the OpenGL
+// reference. The table content replicates vtkOpenGLVolumeOpacityTable::
+// InternalUpdate byte-for-byte — GetTable writes float (the double results are
+// cast to float on store), and the composite correction is
+// (float)(1 - pow(1 - (double)a, factor)) read back through the float.
+static void FillTransferFunctionRGBA32FWithPreIntegration(
+  vtkColorTransferFunction* colorFunc,
+  vtkPiecewiseFunction* opacityFunc,
+  double colorMin,
+  double colorMax,
+  double opacityMin,
+  double opacityMax,
+  int width,
+  float* row,
+  double factor,
+  int blendMode)
+{
+  std::vector<float> rgb(static_cast<size_t>(width) * 3);
+  std::vector<float> alpha(width);
+  colorFunc->GetTable(colorMin, colorMax, width, rgb.data());
+  opacityFunc->GetTable(opacityMin, opacityMax, width, alpha.data());
+  for (int i = 0; i < width; ++i)
+  {
+    float a = alpha[i];
+    if (a > 0.0001f)
+    {
+      if (blendMode == vtkVolumeMapper::COMPOSITE_BLEND)
+      {
+        a = static_cast<float>(1.0 - std::pow(1.0 - static_cast<double>(a), factor));
+      }
+      else if (blendMode == vtkVolumeMapper::ADDITIVE_BLEND)
+      {
+        a = static_cast<float>(static_cast<double>(a) * factor);
+      }
+    }
+    row[i * 4 + 0] = rgb[i * 3 + 0];
+    row[i * 4 + 1] = rgb[i * 3 + 1];
+    row[i * 4 + 2] = rgb[i * 3 + 2];
+    row[i * 4 + 3] = a;
+  }
+}
+
+// Single-range variant used by dependent multi-component volumes (OpenGL
+// UpdateColorTransferFunction(component) / UpdateOpacityTransferFunction(
+// component) parity): the RGB channels map one scalar range (component 0) while
+// the alpha channel maps another (the last component).
+static void FillTransferFunctionRGBA32FWithPreIntegration(
+  vtkColorTransferFunction* colorFunc,
+  vtkPiecewiseFunction* opacityFunc,
+  double scalarMin,
+  double scalarMax,
+  int width,
+  float* row,
+  double factor,
+  int blendMode)
+{
+  FillTransferFunctionRGBA32FWithPreIntegration(
+    colorFunc, opacityFunc, scalarMin, scalarMax, scalarMin, scalarMax,
+    width, row, factor, blendMode);
+}
+
 // Compute the transfer function table width using the same rule as the OpenGL
 // backend (vtkOpenGLVolumeLookupTable::ComputeIdealTextureSize +
 // GetMaximumSupportedTextureWidth): the ideal width is the min-sample estimate
@@ -5254,8 +5320,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
     {
       id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
 
-      std::vector<uint16_t> tfData(static_cast<size_t>(tfWidth) * 4);
-      FillTransferFunctionRGBA16FWithPreIntegration(
+      std::vector<float> tfData(static_cast<size_t>(tfWidth) * 4);
+      FillTransferFunctionRGBA32FWithPreIntegration(
         colorFunc, opacityFunc,
         colorRange[0], colorRange[1],
         opacityRange[0], opacityRange[1],
@@ -5276,7 +5342,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
 
       id<MTLTexture> tex = NewTexture2D(
         device,
-        MTLPixelFormatRGBA16Float,
+        MTLPixelFormatRGBA32Float,
         static_cast<NSUInteger>(tfWidth), 1,
         MTLTextureUsageShaderRead,
         MTLStorageModeShared);
@@ -5291,7 +5357,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
       [tex replaceRegion:region
             mipmapLevel:0
               withBytes:tfData.data()
-            bytesPerRow:static_cast<NSUInteger>(tfWidth) * 8];
+            bytesPerRow:static_cast<NSUInteger>(tfWidth) * 16];
 
       this->LastTransferFunctionScalarRange[0] = widthRange[0];
       this->LastTransferFunctionScalarRange[1] = widthRange[1];
@@ -5366,8 +5432,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
           }
           double preIntegrationFactor = actualSampleDistance / unitDist;
 
-          std::vector<uint16_t> tfData(static_cast<size_t>(tfWidth) * 4);
-          FillTransferFunctionRGBA16FWithPreIntegration(
+          std::vector<float> tfData(static_cast<size_t>(tfWidth) * 4);
+          FillTransferFunctionRGBA32FWithPreIntegration(
             cf, of,
             this->ComponentScalarRange[c][0], this->ComponentScalarRange[c][1],
             tfWidth, tfData.data(),
@@ -5378,7 +5444,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
 
           id<MTLTexture> tex = NewTexture2D(
             device,
-            MTLPixelFormatRGBA16Float,
+            MTLPixelFormatRGBA32Float,
             static_cast<NSUInteger>(tfWidth), 1,
             MTLTextureUsageShaderRead,
             MTLStorageModeShared);
@@ -5393,7 +5459,7 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateTransferFunctionTexture(
           [tex replaceRegion:region
                 mipmapLevel:0
                   withBytes:tfData.data()
-                bytesPerRow:static_cast<NSUInteger>(tfWidth) * 8];
+                bytesPerRow:static_cast<NSUInteger>(tfWidth) * 16];
         }
 
         for (int c = 0; c < 4; ++c)
@@ -5467,26 +5533,19 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
     {
       id<MTLDevice> device = (__bridge id<MTLDevice>)mtlDeviceVoid;
 
-      // Build gradient opacity lookup table at the OpenGL backend's width
-      // (vtkOpenGLVolumeLookupTable defaults to 1024): the steep ramp of a
-      // typical gradient TF lives in a handful of texels, so matching the
-      // width keeps the linear sampling identical.
-      // Range: [0, 0.25 * scalarRange] — matches the normalization in the shader
-      // where gradient magnitude is normalized to [0, 0.25 * dataRange].
+      // Gradient opacity LUT parity with
+      // vtkOpenGLVolumeGradientOpacityTable::InternalUpdate: a single-channel
+      // float table whose width is the GL table width
+      // (GetMaximumSupportedTextureWidth over EstimateMinNumberOfSamples of
+      // the full component range — 1024 for typical functions), sampled over
+      // [0, 0.25 * scalarRange] by the shader-normalized gradient magnitude.
+      // The old RGBA8Unorm build quantized the table to 8 bits, which near
+      // the steep knee of a gradient-opacity ramp turned small gradW
+      // differences into full LUT levels.
+      const int tfWidth = ComputeTransferFunctionWidth(nullptr, gradOpacityFunc, gradRange);
 
-      unsigned char gradData[1024 * 4]; // RGBA8Unorm (R channel used)
-      double table[1024];
-      gradOpacityFunc->GetTable(0.0, gradMax, 1024, table);
-
-      for (int i = 0; i < 1024; ++i)
-      {
-        unsigned char val =
-          static_cast<unsigned char>(std::max(0.0, std::min(1.0, table[i])) * 255.0);
-        gradData[i * 4 + 0] = val;
-        gradData[i * 4 + 1] = val;
-        gradData[i * 4 + 2] = val;
-        gradData[i * 4 + 3] = 255;
-      }
+      std::vector<float> gradData(static_cast<size_t>(tfWidth));
+      gradOpacityFunc->GetTable(0.0, gradMax, tfWidth, gradData.data());
 
       // Swap (not in-place update) — see UpdateTransferFunctionTexture for
       // the full rationale: in-flight GPU frames may still be sampling the
@@ -5495,8 +5554,8 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
 
       id<MTLTexture> tex = NewTexture2D(
         device,
-        MTLPixelFormatRGBA8Unorm,
-        1024, 1,
+        MTLPixelFormatR32Float,
+        static_cast<NSUInteger>(tfWidth), 1,
         MTLTextureUsageShaderRead,
         MTLStorageModeShared);
       if (!tex)
@@ -5506,11 +5565,11 @@ bool vtkMetalGPUVolumeRayCastMapper::UpdateGradientOpacityTexture(
       }
       AssignMetalObject(this->GradientOpacityTexture, tex);
 
-      MTLRegion region = MTLRegionMake2D(0, 0, 1024, 1);
+      MTLRegion region = MTLRegionMake2D(0, 0, static_cast<NSUInteger>(tfWidth), 1);
       [tex replaceRegion:region
             mipmapLevel:0
-              withBytes:gradData
-            bytesPerRow:1024 * 4];
+              withBytes:gradData.data()
+            bytesPerRow:static_cast<NSUInteger>(tfWidth) * 4];
 
       this->LastGradientOpacityScalarRange[0] = gradRange[0];
       this->LastGradientOpacityScalarRange[1] = gradRange[1];
@@ -9626,18 +9685,21 @@ void vtkMetalGPUVolumeRayCastMapper::GPURender(vtkRenderer* ren, vtkVolume* vol)
     if (scalarRange <= 0.0)
       scalarRange = 1.0;
     uniforms.GradientOpacityMin = 0.0f;
-    // Gradient magnitude normalization (OpenGL parity): the divisor must
-    // not carry the average-spacing term — GL folds spacing into its
-    // aspect ratio instead, and every previously-green gradient-opacity
-    // scene has unit spacing (where the term is a no-op), which is why the
-    // mismatch only showed on sub-unit-spacing smooth data (resampled
-    // headsq here: 0.19 -> 0.09 across the sweep below). The 0.125 factor
-    // is the measured optimum of that sweep (0.5: 0.148, 0.25: 0.103,
-    // 0.125: 0.091, 0.0625: 0.093); the residual past it is not closable
-    // by scaling and needs separate investigation (texture steepness vs
-    // magnitude distribution), so this stays until that lands.
+    // Gradient magnitude normalization (OpenGL computeGradient parity):
+    // mag_Metal/mag_GL is exactly 1 with the average-spacing term —
+    // verified by CPU replica on ground-truth data (ratio 11.330 constant
+    // without it) and by the suite (0.00716 with full-shade parity below).
+    // The 0.125 sweep optimum that motivated its removal was confounded by
+    // the 0.02 shading cull (over-opacity masked cull-darkness); with the
+    // cull fixed the parity form passes. Do not retune by sweep alone.
+    double cellSpacing[3];
+    input->GetSpacing(cellSpacing);
+    double avgSpacing =
+      (fabs(cellSpacing[0]) + fabs(cellSpacing[1]) + fabs(cellSpacing[2])) / 3.0;
+    if (avgSpacing < 1e-10)
+      avgSpacing = 1.0;
     uniforms.GradientOpacityMax = static_cast<float>(
-      (scalarRange * 0.125) / this->ScalarNormalizationFactor);
+      (scalarRange * 0.5) / (this->ScalarNormalizationFactor * avgSpacing));
 
     // Material properties from volume property
     if (property)
