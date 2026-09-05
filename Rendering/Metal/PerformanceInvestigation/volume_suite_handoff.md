@@ -239,3 +239,44 @@ Camera-inside fullscreen (`DOLLY` 1/2/3/5/8): `M/GL` 0.74/0.76/0.60/
 Batch×partitioned: narrow-or-tie (F1 6.30 … F16 6.39, one F4 8.16 run
 shown thermal by repeat). Selection (`VolumePicking` 0.23 s,
 `HardwareSelector` 1.0 s): pass, no perf contract.
+
+### 5. Partition mode post-fix: batch optimum, NIFTI wash, DICOM 2× loss
+
+Batch sweep on the grid path post-fix (1024 SD4, `1,1,4`): `DEF`
+6.02/6.05 best-or-tied (F1 6.25/6.18, F2 6.29, F4 6.23, F8 6.39, F16
+6.23/6.20); at fine `DEF(dense→1)` 15.19/14.40 vs F16 17.27 (−14%).
+Default needs no retune on partitioned — same narrow-or-tie rule.
+
+Partitioned vs single post-fix (NIFTI metal): 1024 SD4 6.06 vs 7.00
+(−13% partitioned); 1024 SD0.5 14.96 vs 14.53 (tie); 2048 SD4 11.09 vs
+9.41 (single −15%). Same directions as pre-fix: the lattice fix moved
+correctness only. Wash across resolutions — default-`1,1,1` stands.
+
+DICOM sparse is a different story. Parity is clean (1133/0.000 vs
+1122/0.000 — the lattice fix generalizes to minmax-active segments) but
+perf is catastrophic: 1024 SD4-y 12.2 vs 5.8 (+108%), 2048 ~19.8 vs
+10.5 (+90%), tight interleaved repeats both. Mechanism is leap
+fragmentation, proven by raw-march inversion (`MINMAX=0/ACCEL=0`:
+partitioned 11.6 vs single 13.2, −12%): the gap exists ONLY when
+skipping is on. Single-brick W1PRE/minmax leaps fly over brick joints
+in one probe; grid segments must stop, re-probe and re-walk at each of
+the 3 joints, fragmenting exactly the long empty runs sparse DICOM
+lives on (cell-walk 108 ms vs leaps 40 ms at fine) — `§26.9`
+skip-resolution at brick scale. Fullscreen-background and program-size
+suspects are exonerated by the same inversion (both would persist raw).
+
+Segment-count scaling (2048 SD4 NIFTI: `1,1,1` 9.47 / `1,1,2` 10.62 /
+`1,1,4` 11.13) is sublinear — ~70% of the gap arrives with merely
+taking the grid path (walker/DDA/occupancy/kernel footprint), ~0.26
+ms per extra brick. That kills the prologue-hoist idea (would recover
+~0.5 of 1.66 ms at refactor-scale risk to shared `marchVolumeUnified`).
+The dense-grid-bypass sketch from the prior session is unaffected (it
+targets dense, where there is nothing to fragment); sparse keeps the
+grid it pays for.
+
+Guidance, now measured: never partition sparse volumes (they fit
+single-brick anyway); partitioning stays a dense/huge-volume tiling
+fallback (0.000, wash-or-better). Fix shapes exist (cross-joint leap
+carry = the shelved segHop vehicle; fewer joints) but are ROI-negative
+with zero users — revisit only with a volume that requires tiling AND
+a capture-backed profile.
