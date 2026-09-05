@@ -174,3 +174,68 @@ test (`...NoShade`, `...NoGradOp`, `...NoTransform`, `...NearPlaneTiny`,
 `...SampleDist0_25/0_5`, `...MaxIP`, ...). Treat the Aug-15 line as
 aspirational; the measured trajectory is 12 image failures → 1 (this test,
 0.1676 → 0.09).
+
+## Follow-up session (Sep 5 2026, `metal-cleanup-1`): cull-removal fallout
+
+Recheck after the two root-cause fixes: suite still **97/97 on mv0 and
+mv9** (`CameraInsideTransformation` mv0 0.00693 / mv9 0.00696, GL floor
+0.00646). Main-matrix perf vs the thr-clean baseline: NIFTI 1024 SD4
+6.93/8.64 0.80, SD0.5 16.40/18.28 0.90; 2048 SD4 9.52/11.75 0.81, SD0.5
+48.69/52.53 0.93; DICOM-y 0.14/0.20; all `<1`. Fine NIFTI returns to the
+pre-cull level by design (the −42% came from skipping work GL does);
+coarse is neutral-to-better, DICOM provably untouched (binary TF).
+
+### 1. Density-gated fine shade cap (landed, zero margin)
+
+Cull removal restored full 6-fetch+pow shade cost, flipping the fine
+optimum back to narrow (forced-F1 stable best-of-round; `F2/F8/F16` tie
+±3%). Flat `16→2` ABBA-tied, so the landed form gates on the occupancy
+auto-flag instead — `shadeCap = fine ? (dense ? 1 : 16) : 2`
+(`MetalShaders.metal`, no new PSOs, both bits already key the cache):
+NIFTI-fine 14.49 (−5%, equals forced-F1), coarse/DICOM-lean ties,
+Skin-fine-shaded-sparse 12.56 vs F16 12.21 (+2.9%, 2v2, watch item).
+Parities identical-class (2986/0.000, 2884/0.067, DICOM 0.000); suite
+97/97 ×2; bit-exact on mv0 (0/96 moved — caps live only in the mv9
+ladder). Rationale in situ: wide amortizes the 48-walk preamble where
+leaps fire (sparse), narrow wins where the march is raw (dense bypass).
+
+### 2. `GRAD_NEAREST` vs `GRAD4` delta recheck (measured, not landed)
+
+NIFTI 512: `GRAD_NEAREST` SD4 1.889 / SD0.5 1.523, `GRAD4` 2.458 / 2.042
+(all `<5`); stacked F1+`GRAD_NEAREST` 1.542 (no stacking penalty). Full
+suite: `GRAD_NEAREST` **97/97** (23 movers, max|d| 0.034, mean 0.0016 —
+but `Cropping` 0.0468, `OrientedVolume` 0.0432, `VolumeUpdate` 0.0420 sit
+within 0.01 of the line: landable, creates watched tests) vs `GRAD4`
+**93/97** (4 near-miss fails 0.052–0.091, 32 movers, mean 3.5× nearest:
+not landable as a default; fine-gating wouldn't save it — failures are
+not fine-only scenes). Target test: nearest bit-identical (0.00693),
+`GRAD4` 0.00786. Deferred: margin-eating by definition, after zero-margin
+items.
+
+### 3. Partition seam fix (landed, `thr 2.93 → 0.000`)
+
+`§14`'s ±1-sample theory was wrong: single-vs-partitioned metal-metal
+diff is 48% px global, RAW (`MINMAX=0/ACCEL=0`) is bit-identical
+3803.779/2.927 (occupancy exonerated), partitioned `JITTER=0` explodes to
+**87.97** (shade-off: 1.22). Mechanism: `marchSegment` passed the raw
+camera-relative jitter with `checkBounds=false`, anchoring the lattice at
+the camera (`jitter+k·step`) while every other path (and GL) anchors at
+the volume entry (`entry+jitter+k·step`) — up to a full step systematic
+shift, dithered to 2.93 by jitter. Fix: `latticePhase = entry+jitter`
+per pixel + entry-guard for the J0 `ceil(−1.0)=−1` knife-edge
+(`MetalShaders.metal` `marchSegment`/grid loop/`firstT`; sole
+`checkBounds=false` user, single-brick paths byte-identical).
+Validation: `1,1,4` and `1,4,1` both `0.000` (J1, J0, shade-off);
+suite 97/97 ×2; partitioned perf intact (5.94 vs 8.74 single at 1024).
+Residual err deltas (3015 vs 2986) are fp accumulation-order noise.
+Per-brick `viewDir` needs no action (shaded J1 exactly 0.000).
+`SetPartitions` doc now records this; default-`1,1,1` guidance stays
+(perf wash), but partitioning is supported tiling, not a known-bad path.
+
+### 4. Special paths recheck (same session)
+
+Camera-inside fullscreen (`DOLLY` 1/2/3/5/8): `M/GL` 0.74/0.76/0.60/
+0.59/0.49, all `<1`, inside more competitive; suite covers 5 such tests.
+Batch×partitioned: narrow-or-tie (F1 6.30 … F16 6.39, one F4 8.16 run
+shown thermal by repeat). Selection (`VolumePicking` 0.23 s,
+`HardwareSelector` 1.0 s): pass, no perf contract.
