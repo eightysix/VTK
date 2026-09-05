@@ -4414,9 +4414,20 @@ inline half4 marchVolumeUnified(
 
   uint cropBitmask = volumeUniforms.croppingBitmask;
 
+  // Grid-segment lattice (checkBounds=false is marchSegment-only): firstT is
+  // the smallest latticePhase + k*step at or after the segment entry, where
+  // latticePhase = volume entry + jitter. The t0<=phase arm matters:
+  // unjittered J0 has jitter==stepSize exactly, so (t0-phase)/step is exactly
+  // -1.0 at the entry segment and ceil(-1.0)=-1 would plant an extra entry
+  // sample the single-brick path never takes (J0 partitioned thr 54.7 with
+  // it, 0.000 without — the J1 case is unaffected since ceil of (-1,0) is 0).
+  // Interior segments keep ceil so lattice-exact brick-boundary samples
+  // (which the exiting segment's tEnd break refused) are taken exactly once.
   float firstT = p.checkBounds
       ? p.jitter
-      : p.jitter + ceil((p.tStart - p.jitter) / p.stepSize) * p.stepSize;
+      : ((p.tStart <= p.jitter)
+          ? p.jitter
+          : p.jitter + ceil((p.tStart - p.jitter) / p.stepSize) * p.stepSize);
   float3 stepVec = p.rayDir * p.stepSize;
   float3 currentPoint = p.rayOrigin + p.rayDir * (p.checkBounds ? p.tStart : 0.0)
                       + p.rayDir * firstT;
@@ -5967,7 +5978,18 @@ inline half4 marchVolumeUnified(
       // 2026-09-03 re-sweep with rolled 8/16 loops: fine shade f16 -4.4%
       // vs f8 ABBA (was tie pre-roll), lean coarse f8 -11.6% vs f16 ABBA;
       // coarse shade keeps 2 (f4/f8 +1.5%), lean fine keeps 16 (-13% vs 8).
-      const int shadeCap = fc_fineSD ? 16 : 2;
+      // 2026-09-05 post-cull-removal re-sweep (cull fix for
+      // CameraInsideTransformation): with full 6-fetch+pow shade cost back,
+      // 1-dispatch leads at fine-DENSE (forced-F1 stable best-of-round;
+      // NIFTI-fine 14.4 vs DEF(16) ~15.2) but costs fine-SPARSE-shaded
+      // (SkinOnBlue-fine 12.45 vs F16 12.21, +2%): wide amortizes the 48-walk
+      // preamble (fewer batches = fewer consults) where leaps fire, narrow
+      // wins where the march is raw (dense bypass, overshoot ≤1 + I$ diet).
+      // Same structural split as §26.9 lean/shade, now along density within
+      // shade-fine — so the occupancy auto-flag picks: dense→1, sparse→16.
+      // Coarse keeps 2 (all-dense win verified §26.7). No new PSOs: both bits
+      // already key the pipeline cache (dense 1<<18, fineSD).
+      const int shadeCap = fc_fineSD ? (fc_dense ? 1 : 16) : 2;
       const int leanCap = fc_fineSD ? 16 : 8;
       const int batchCap = (fc_fragBatch > 0) ? fc_fragBatch
                        : ((fc_shading || fc_gradientOpacity) ? min(shadeCap, max(1, int(volumeUniforms.maxBatchWidth)))
@@ -7824,13 +7846,23 @@ inline half4 marchVolume(
       nullptr, nullptr, segIndexMap, segPool);
 }
 
+// Seam fix (2026-09-05, §14 follow-up): segments must sample the
+// ENTRY-anchored lattice (volume entry + jitter + k*step, as every
+// checkBounds=true path and GL do), not the camera-anchored one. Passing
+// the raw per-pixel jitter with checkBounds=false anchored the lattice at
+// the camera (jitter + k*step), shifting every brick sample by up to a full
+// step vs single-brick (JITTER=0: thr 87.97; JITTER=1 dithers it to 2.93).
+// latticePhase = volume-entry t + jitter, computed once per pixel in the
+// grid loop; the false-branch ceil then restricts the SAME lattice to the
+// brick instead of re-anchoring it. viewDir (entryVolPos) still uses the
+// brick entry — measured negligible after this fix, see below.
 inline void marchSegment(
     float3 rayOrigin,
     float3 rayDir,
     float t0,
     float t1,
     float stepSize,
-    float jitter,
+    float latticePhase,
     float tTerminateMax,
     thread half3& accumulatedColor,
     thread half& accumulatedOpacity,
@@ -7856,7 +7888,9 @@ inline void marchSegment(
 {
   float3 zero = float3(0.0);
   float3 one = float3(1.0);
-  MarchParams p = {rayOrigin, rayDir, t0, t1, stepSize, jitter, tTerminateMax,
+  // checkBounds=false keeps the ceil-restricted global lattice; anchoring it
+  // at latticePhase (not the raw jitter) makes it the entry-anchored one.
+  MarchParams p = {rayOrigin, rayDir, t0, t1, stepSize, latticePhase, tTerminateMax,
       zero, one, zero, one, false};
   half4 result = marchVolumeUnified(p, accumulatedColor, accumulatedOpacity, half4(0.0h),
       volumeUniforms, b, volumeTexture, transferFunctionTexture,
@@ -8588,6 +8622,11 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
     int maxCells = gridDims.x + gridDims.y + gridDims.z + 3;
     int cellsVisited = 0;
 
+    // Entry-anchored sample lattice shared by all bricks of this ray (seam
+    // fix above): the volume-entry t plus this pixel's jitter. Matches the
+    // checkBounds=true paths' (entry + jitter + k*step) lattice exactly.
+    float latticePhase = tStart + jitter;
+
     while (walker.valid && opacity < 0.99h && cellsVisited < maxCells) {
         ++cellsVisited;
         int3 cell = walker.cell;
@@ -8603,7 +8642,7 @@ fragment VolumeFragmentOut fragment_volume_grid_traversal_main(
                 marchSegment(
                     rayOrigin, rayDir,
                     segmentT0, segmentT1,
-                    stepSize, jitter, tTerminateMax,
+                    stepSize, latticePhase, tTerminateMax,
                     color, opacity,
                     volumeUniforms, b,
                     volumeTexture, transferFunctionTexture,

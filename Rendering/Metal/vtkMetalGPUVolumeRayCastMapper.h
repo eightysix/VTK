@@ -217,6 +217,18 @@ public:
    * during rendering. This will force by-block rendering without
    * trying to compute an optimum number of partitions.
    * Useful for volumes exceeding hardware 3D texture size limits.
+   *
+   * Prefer the 1,1,1 default unless tiling is required: partitioned
+   * rendering matches single-brick output up to fp accumulation order
+   * (NIFTI 512: thr 0.000 at 1,1,1, 1,1,4 and 1,4,1, fixed 2026-09-05 —
+   * the grid march used to anchor its sample lattice at the camera
+   * instead of the volume entry, shifting every brick sample by up to a
+   * full step; see marchSegment/latticePhase and
+   * perf_investigation_part2.md section 14). Perf is a wash across
+   * resolutions (partitioned wins 1024, loses 2048). Partitioned shade
+   * marches take the GridTraversal pipeline, where narrow batch widths
+   * tie-or-win as on the default path — no width retune is attached
+   * to partitioning.
    */
   void SetPartitions(unsigned short x, unsigned short y, unsigned short z);
 
