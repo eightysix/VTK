@@ -469,3 +469,72 @@ working set past SLC capacity; Metal's read path degrades more than GL's
 driver-internal tiling. Hence parity (jitter=0) vs 1.31-1.37x (jitter=1) at
 that cell, and why the visual diff and the harness parity cells are jitter=0.
 Full fair matrix: PERFORMANCE_INVESTIGATION.md §21.
+
+## 8. Revisit: slab win is gone on the current stack (2026-09-05)
+
+Re-ran the §1.2 raw recipe plus production/minmax-on and axis views at
+`8a99a9ceb6` (density-gated fine shade cap + partition seam fix; i.e. post
+layout-NO, transpose-default, W1PRE/dense, lean/shade caps, cull removal).
+M2, **AC power** (absolutes ~10% below the battery-era docs; ratios transfer),
+`--frames 20 --warmup 5`, ABBA/repeat-confirmed (first-run-of-new-config rows
+can carry PSO-compile inflation — deltas below are repeat-confirmed).
+Thresholded error 0.000 in every row.
+
+Recipe (swap `NUM_SLABS` 1↔8; axial adds `VOLTRANSPOSE_AXIS=y` + `CAM_AXIS=z`):
+
+```sh
+R="VTK_METAL_TEST_SAMPLE_DISTANCE=4 VTK_METAL_TEST_IMAGE_SAMPLE_DISTANCE=1.0 \
+VTK_METAL_TEST_MINMAX=0 VTK_METAL_TEST_ACCEL=0 VTK_METAL_TEST_MARCH_VARIANT=9 \
+VTK_METAL_TEST_JITTER=0"
+env $R VTK_METAL_TEST_NUM_SLABS=1 build_macos_metal/bin/vtkMetalGLVisualComparison \
+  --bench --backend metal --scene DICOMVolume \
+  --dicom /Users/macair/Public/IMR/CTIMR/IMRToraceAddome \
+  --frames 20 --warmup 5 --size 2048x2048
+```
+
+### 8.1 Raw path (SD4, MINMAX=0, DICOM IMRToraceAddome) — inversion
+
+| config | single (K=1) | slabs=8 | delta | GL | M/GL single | M/GL slabs8 |
+|---|---|---|---|---|---|---|
+| 2048 oblique J0 (mv9; mv0 identical) | 32–33 | 48–50 | **+48–50% loss** | 54.3 | 0.59 win | 0.88 |
+| 2048 oblique J1 | 33.1 | 49.0 | **+48% loss** | 75.8 | 0.44 win | 0.65 |
+| 1024 oblique J0 | 10.2 | 14.3 | +40% loss | — | — | — |
+| 1024 axial-z J0 (y-transpose) | 26.3 | 38.8 | +48% loss | — | — | — |
+| 1024 coronal-y J0 (y-transpose) | 19.2 | 30.8 | +60% loss | — | — | — |
+
+§3.1-era (battery): single 102.1 / slabs8 38.4 J1 oblique (2.66x slab win).
+Now inverted on both marches (mv0 rows: single 31.8/32.4 vs slabs 47.6/49.1 —
+march-independent, jitter now +2–3% on Metal vs +40% on GL).
+
+K-sweep, 1024 oblique J0, default transpose: K=1 9.98 / K=2 11.92 /
+K=4 13.06 / K=8 14.29 / K=16 16.91 — **monotonic loss, no K>1 wins**
+(was: bottom at K=8, K=4 keeps the full win). Spatial mode
+(`SLAB_SPATIAL=1`) 14.66 vs ray-fraction 14.25 — same loss, no rescue.
+
+### 8.2 Production path (SD0.5, MINMAX=1, J1, 1024, mv9)
+
+DICOM single 40.5 vs slabs8 73.2 (**+81% loss**); adaptive `NUM_SLABS=0`
+75.7 (picks 8 on oblique, inherits the loss). NIFTI FLASH25 single 14.9 vs
+slabs8 16.4 (+10% loss).
+
+### 8.3 Mechanism and guidance
+
+The single-pass cache pathology slabs fixed is now fixed at the source —
+layout-NO + transpose short-axis-in-depth killed Metal's jitter tax
+(single J0→J1 now +3% vs §7.2's +57–59%), leaving only slabs' per-pass
+overhead (ping-pong passes, depth clears, feedback traffic, prologue ×K)
+with no cache gain to fund it. Bisect at 1024: transpose helps single −31%
+vs slabs −19% (contributory, not sole — transpose-off is still single 9.9
+vs slabs 14.3); layout flag and `W1PRE=0` now neutral. The two latest
+commits are orthogonal: the density-gated fine cap applies to single and
+slab passes alike (no retune needed), and the seam fix is `SetPartitions`
+grid traversal, a different mechanism from `NUM_SLABS` compositing.
+
+Guidance: default (`NUM_SLABS` unset → 1, single pass) is already optimal
+on all measured configs — no code change. `NUM_SLABS=0` adaptive currently
+picks 8 on oblique and pays +40–80%; keep the path as an opt-in fallback
+for unmeasured huge-volume cases, do not default to it.
+
+Confound note: with the default X-depth transpose, world-z axial single is
+89 ms vs 26 ms with `VOLTRANSPOSE_AXIS=y` — axis-view absolutes now depend
+on transpose orientation (part2 §38 territory). Slabs lose under either.
