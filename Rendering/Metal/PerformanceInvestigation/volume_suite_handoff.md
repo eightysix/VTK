@@ -110,6 +110,47 @@ this branch — worth a look if the mag fields match but exits differ.
   stale binaries, not noise. Always confirm the rebuild compiled (`[1/2]
   Building`, not `no work to do`).
 
+## Resolution (97/97, Sep 5 2026)
+
+`TestGPURayCastCameraInsideTransformation` now passes at **0.00716**
+(GL itself: 0.00646 — interpolator floor). Suite is **97/97 on mv0 and
+mv9**. Root cause was TWO compounding bugs, not gradient magnitude:
+
+1. **0.02 shading cull** (`MetalShaders.metal`, 4 sites): Metal gave
+   ambient-only light to samples with opacity ≤ 0.02 (perf opt from
+   `perf_investigation_part2.md §13.3`, designed for NIFTI FLASH25).
+   GL lights every positive-alpha sample (`a > 0.0`). Dimmed all
+   dim-but-visible boundary samples to ambient — isolated by
+   env-gated `NOGRADOP` (matches, 0.72) vs `NOSHADE` (diverges, 33)
+   probes plus a dim-TF probe (16.2 → 0.14 mean|d| with the cull off).
+   Removed (GL parity).
+2. **Gradient divisor** (`vtkMetalGPUVolumeRayCastMapper.mm`): `2233ef1273`
+   removed the `/avgSpacing` term per a sweep optimum (0.125) that was
+   **confounded by bug 1** — over-opacity masked cull-darkness. CPU
+   replica on ground-truth data plus dumped uniforms proved the parity
+   form `0.5·range/(norm·avgSpacing)` equalizes magnitudes exactly
+   (ratio 11.330 constant); with the cull fixed it passes. Either fix
+   alone still fails (0.199 / 0.089). Restored (reverts `2233ef1273`'s
+   formula; keeps its sweep record above as a confounding warning).
+
+Also ported along the way (principled GL parity, inert on this metric
+but kept): gradient-opacity LUT `RGBA8Unorm→R32Float` (metal-ios update 3),
+gradient taps + TF sampling in float32 (updates 9/10). Rejected after
+measurement: march-exit 69/70 (already present here — CTP bounds exit in
+all loops, counts match ±8/460), fullscreen-vs-proxy path (identical to
+0.07), R32F-vs-8-bit LUT width (zero movement twice).
+
+## Perf recheck (cull removal vs `part2 §13.3`)
+
+NIFTI 1024 mv9 bench (`vtkMetalGLVisualComparison`, FLASH25):
+with-cull 8.52 ms/f (8.92/8.37/8.26) vs without-cull 8.55 (8.05/8.58/9.03)
+at SD0.5; SD4 9.38 vs 8.78; 512 thr 3.29 vs 3.30 (budget <5). The §13.3
+~8% win evaporated under later march restructuring (W1PRE/dense/rolled
+loops) — on the current stack the cull is perf-neutral within DVFS noise
+and correctness-negative. DICOM is provably unaffected (binary 0/1 TF
+never enters the culled band). Do not re-add a shading threshold without
+re-measuring the volume suite.
+
 ## Historical note (97/97 claim)
 
 `d0f4a31066` (Aug 15) closes `Rendering/Metal/Testing/failures.txt` with
